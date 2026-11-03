@@ -7,7 +7,6 @@ import LeanNative.Semantics.Eval
 import LeanNative.Semantics.Refinement
 import LeanNative.Proofs.PeepholeProofs
 import LeanNative.Proofs.LoopOptProofs
-import LeanNative.Proofs.LCNFBridgeProofs
 import LeanNative.Proofs.RealLCNFBridgeProofs
 import LeanNative.Proofs.BackendProofs
 import LeanNative.Proofs.KernelElabProofs
@@ -172,8 +171,6 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Semantics.HeapState.decRefBuf_none_error, ``LeanNative.Semantics.HeapState.incRefBuf_none_error
   , ``LeanNative.Proofs.applyExprRules_sound
   , ``LeanNative.Proofs.applyRewriteTable_sound
-  , ``LeanNative.Proofs.lowerLetValue_sound
-  , ``LeanNative.Proofs.lowerLCNFCode_sound
   , ``LeanNative.Transform.optimizeEqSatCode_sound
   , ``LeanNative.Transform.applyLoopScheduleAux_refines
   , ``LeanNative.Transform.scheduleStructuredLoop_sound

@@ -130,7 +130,7 @@ theorem lowerRealArg_st_eq (ctx : RealBridgeCtx) (st st1 : RealBridgeState)
       · injection h with hp; exact (Prod.mk.inj hp).2.symm
       · exact nomatch h
 
-private theorem lowerRealArgList_st_eq (ctx : RealBridgeCtx) (allowObj : Bool) :
+theorem lowerRealArgList_st_eq (ctx : RealBridgeCtx) (allowObj : Bool) :
     ∀ (args : List (Lean.Compiler.LCNF.Arg .impure)) (st st1 : RealBridgeState) (vids : List VarId),
       lowerRealArgList ctx st allowObj args = .ok (vids, st1) → st1 = st
   | [], st, st1, _, h => by injection h with hp; exact (Prod.mk.inj hp).2.symm
@@ -227,7 +227,8 @@ theorem lowerImpureLetValuePure_st_eq (ctx : RealBridgeCtx) (st st1 : RealBridge
     | error _ => rw [hl] at h; exact nomatch h
     | ok p =>
       rw [hl] at h; dsimp only at h
-      cases hi : lowerCanonicalIntrinsicPure? fn p.1 retTy (p.1.map p.2.getVarType) false ctx.arch <;> rw [hi] at h
+      cases hi : lowerCanonicalIntrinsicPure? fn p.1 retTy (p.1.map p.2.getVarType)
+          (ctx.findLocalCallee? fn).isSome ctx.arch ctx.gfSimdIntrinsics <;> rw [hi] at h
       · exact nomatch h
       · injection h with hp; exact (Prod.mk.inj hp).2.symm.trans (lowerRealArgList_st_eq ctx false args.toList st p.2 p.1 hl)
   | pap _ _ _ => exact nomatch h
@@ -256,7 +257,7 @@ theorem lowerImpureLetValuePure_st_eq (ctx : RealBridgeCtx) (st st1 : RealBridge
         rw [hvt] at h; dsimp only at h
         split at h
         · exact nomatch h
-        · cases hc : st.getActiveCtor? vid with
+        · cases hc : st.resolveHeapCtor? ctx vid x with
           | none => rw [hc] at h; exact nomatch h
           | some cname =>
             rw [hc] at h; dsimp only at h
@@ -278,7 +279,7 @@ theorem lowerImpureLetValuePure_st_eq (ctx : RealBridgeCtx) (st st1 : RealBridge
         rw [hvt] at h; dsimp only at h
         split at h
         · exact nomatch h
-        · cases hc : st.getActiveCtor? vid with
+        · cases hc : st.resolveHeapCtor? ctx vid x with
           | none => rw [hc] at h; exact nomatch h
           | some cname =>
             rw [hc] at h; dsimp only at h
@@ -434,6 +435,43 @@ theorem bridgeInv_setActiveCtor (st : RealBridgeState) (lenv : LEnv) (venv : Var
     injection hy' with hvidEq; rw [← hvidEq]
     simp only [LEnv.withCtor, hyx, getActiveCtor_setActiveCtor, beq_self_eq_true, ↓reduceIte]
 
+theorem bridgeInv_setActiveCtorOpt (st : RealBridgeState) (lenv : LEnv) (venv : VarEnv)
+    (vid : VarId) (cn? : Option Lean.Name) (x : Lean.FVarId)
+    (hinv : BridgeStateInv st lenv venv)
+    (hx : st.lookupFVar? x = some vid) :
+    BridgeStateInv (st.setActiveCtorOpt vid cn?) (lenv.withCtorOpt x cn?) venv := by
+  cases cn? with
+  | some cn => exact bridgeInv_setActiveCtor st lenv venv vid cn x hinv hx
+  | none =>
+    refine ⟨hinv.fvar_lt, hinv.fvar_val, hinv.fvar_ty, fun y v hy => ?_, hinv.fvar_inj, hinv.jp_sync⟩
+    have hy' : st.lookupFVar? y = some v := hy
+    cases hyx : (y == x)
+    · have hne : v ≠ vid := by
+        intro hvEq; rw [hvEq] at hy'
+        have : y = x := hinv.fvar_inj y x vid hy' hx
+        rw [← this, beq_self_eq_true] at hyx; cases hyx
+      dsimp only [LEnv.withCtorOpt, RealBridgeState.setActiveCtorOpt]
+      rw [hyx]; simp only [Bool.false_eq_true, ↓reduceIte]
+      rw [hinv.fvar_ctor y v hy']
+      exact (getActiveCtor_filter_ne st.activeCtor vid v hne).symm
+    · rw [beq_iff_eq.mp hyx] at hy'; rw [hx] at hy'
+      injection hy' with hvidEq; rw [← hvidEq]
+      dsimp only [LEnv.withCtorOpt, RealBridgeState.setActiveCtorOpt]
+      rw [hyx]; simp only [↓reduceIte]
+      unfold RealBridgeState.getActiveCtor?
+      have hnone : ∀ (l : List (VarId × Lean.Name)) (q : VarId),
+          (l.filter (fun (w, _) => w != q)).find? (fun (w, _) => w == q) = none := by
+        intro l q; induction l with
+        | nil => rfl
+        | cons hd tl ih =>
+          rcases hd with ⟨w, c⟩; dsimp only [List.filter]
+          cases hwu : (w != q)
+          · exact ih
+          · dsimp only [List.find?]
+            have hwu' : (w == q) = false := by revert hwu; simp [bne]
+            rw [hwu']; exact ih
+      rw [hnone]; rfl
+
 theorem bridgeInv_setJp (st : RealBridgeState) (lenv : LEnv) (venv : VarEnv)
     (j : Lean.FVarId) (ps : List (Lean.Compiler.LCNF.Param .impure)) (body : Lean.Compiler.LCNF.Code .impure)
     (hinv : BridgeStateInv st lenv venv) :
@@ -448,9 +486,68 @@ theorem bridgeInv_setJp (st : RealBridgeState) (lenv : LEnv) (venv : VarEnv)
     rcases Prod.mk.inj hp with ⟨rfl, rfl⟩
     simp [LEnv.bindJp, hqj]
 
+theorem allocZeroScalarSlotsPure_mono :
+    ∀ (slots : List (Option Nat × LNIRType)) (st : RealBridgeState),
+      let (_, st1) := allocZeroScalarSlotsPure st slots
+      st.nextVarId ≤ st1.nextVarId ∧
+      (∀ u, u < st.nextVarId → st1.getVarType u = st.getVarType u) ∧
+      st1.fvarMap = st.fvarMap ∧
+      st1.activeCtor = st.activeCtor ∧
+      st1.jpDecls = st.jpDecls
+  | [], st => ⟨Nat.le_refl _, fun _ _ => rfl, rfl, rfl, rfl⟩
+  | (_, ty) :: rest, st => by
+    dsimp only [allocZeroScalarSlotsPure]
+    rcases freshVar_spec st ty with ⟨_, hfvNext, hfvTy, _, _, _⟩
+    have hst1Eq : (st.freshVar ty).2.fvarMap = st.fvarMap ∧
+        (st.freshVar ty).2.activeCtor = st.activeCtor ∧
+        (st.freshVar ty).2.jpDecls = st.jpDecls := ⟨rfl, rfl, rfl⟩
+    rcases allocZeroScalarSlotsPure_mono rest (st.freshVar ty).2 with ⟨hnR, htR, hfR, haR, hjR⟩
+    have hbase : st.nextVarId ≤ (st.freshVar ty).2.nextVarId := by rw [hfvNext]; exact Nat.le_succ _
+    refine ⟨Nat.le_trans hbase hnR, fun u hu => ?_, hfR.trans hst1Eq.1, haR.trans hst1Eq.2.1, hjR.trans hst1Eq.2.2⟩
+    rw [htR u (Nat.lt_of_lt_of_le hu hbase), hfvTy u, nat_beq_false (Nat.ne_of_lt hu)]; rfl
+
+theorem lowerCallArgsWithErasedPure_mono (ctx : RealBridgeCtx) :
+    ∀ (args : List (Lean.Compiler.LCNF.Arg .impure)) (st st1 : RealBridgeState)
+      (vs : List VarId) (zs : List (VarId × LNIRType)),
+      lowerCallArgsWithErasedPure ctx st args = .ok (vs, zs, st1) →
+      st.nextVarId ≤ st1.nextVarId ∧
+      (∀ u, u < st.nextVarId → st1.getVarType u = st.getVarType u)
+  | [], st, st1, _, _, h => by
+    injection h with hp; rcases Prod.mk.inj hp with ⟨_, hp2⟩; rcases Prod.mk.inj hp2 with ⟨_, rfl⟩
+    exact ⟨Nat.le_refl _, fun _ _ => rfl⟩
+  | a :: rest, st, st1, vs, zs, h => by
+    unfold lowerCallArgsWithErasedPure at h
+    cases a with
+    | erased | type _ _ =>
+      dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure] at h
+      rcases freshVar_spec st .unit with ⟨_, hfvNext, hfvTy, _, _, _⟩
+      cases hr : lowerCallArgsWithErasedPure ctx (st.freshVar .unit).2 rest with
+      | error _ => rw [hr] at h; exact nomatch h
+      | ok pr =>
+        rw [hr] at h; dsimp only at h; injection h with hp
+        rcases Prod.mk.inj hp with ⟨_, hp2⟩; rcases Prod.mk.inj hp2 with ⟨_, rfl⟩
+        rcases lowerCallArgsWithErasedPure_mono ctx rest (st.freshVar .unit).2 pr.2.2 pr.1 pr.2.1 hr with ⟨hnR, htR⟩
+        have hbase : st.nextVarId ≤ (st.freshVar .unit).2.nextVarId := by rw [hfvNext]; exact Nat.le_succ _
+        refine ⟨Nat.le_trans hbase hnR, fun u hu => ?_⟩
+        rw [htR u (Nat.lt_of_lt_of_le hu hbase), hfvTy u, nat_beq_false (Nat.ne_of_lt hu)]; rfl
+    | fvar x =>
+      dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure] at h
+      cases ha : lowerRealArg ctx st (.fvar x) true with
+      | error _ => rw [ha] at h; exact nomatch h
+      | ok pa =>
+        rw [ha] at h; rcases pa with ⟨v0, stA⟩
+        have hstA := lowerRealArg_st_eq ctx st stA (.fvar x) true v0 ha; subst stA
+        dsimp only at h
+        cases hr : lowerCallArgsWithErasedPure ctx st rest with
+        | error _ => rw [hr] at h; exact nomatch h
+        | ok pr =>
+          rw [hr] at h; dsimp only at h; injection h with hp
+          rcases Prod.mk.inj hp with ⟨_, hp2⟩; rcases Prod.mk.inj hp2 with ⟨_, rfl⟩
+          exact lowerCallArgsWithErasedPure_mono ctx rest st pr.2.2 pr.1 pr.2.1 hr
+
 theorem bindJpCallArgsPure_mono (ctx : RealBridgeCtx) :
     ∀ (ps : List (Lean.Compiler.LCNF.Param .impure)) (as_ : List (Lean.Compiler.LCNF.Arg .impure))
-      (st st1 : RealBridgeState) (binds : List (Lean.FVarId × VarId × LNIRType × VarId)),
+      (st st1 : RealBridgeState) (binds : List (Lean.FVarId × VarId × LNIRType × Option VarId)),
       bindJpCallArgsPure ctx st ps as_ = .ok (binds, st1) →
       st.nextVarId ≤ st1.nextVarId ∧
       (∀ u, u < st.nextVarId → st1.getVarType u = st.getVarType u) ∧
@@ -461,34 +558,59 @@ theorem bindJpCallArgsPure_mono (ctx : RealBridgeCtx) :
   | [], _ :: _, _, _, _, h => by exact nomatch h
   | _ :: _, [], _, _, _, h => by exact nomatch h
   | p :: ps, a :: as_, st, st1, binds, h => by
-    dsimp only [bindJpCallArgsPure, Bind.bind, Except.bind, Pure.pure, Except.pure] at h
-    cases ha : lowerRealArg ctx st a true with
-    | error _ => rw [ha] at h; exact nomatch h
-    | ok pa =>
-      rw [ha] at h; rcases pa with ⟨argVid, stA⟩
-      have hstA := lowerRealArg_st_eq ctx st stA a true argVid ha; subst stA
-      dsimp only at h
-      let pTy := lowerGroundImpureType p.type
-      rcases freshVar_spec st pTy with ⟨hfv1, hfvNext, hfvTy, _, _, _⟩
-      cases hr : bindJpCallArgsPure ctx (st.freshVar pTy).2 ps as_ with
-      | error _ => rw [hr] at h; exact nomatch h
-      | ok pr =>
-        rw [hr] at h; dsimp only at h; injection h with hp
-        rcases Prod.mk.inj hp with ⟨rfl, rfl⟩
-        rcases bindJpCallArgsPure_mono ctx ps as_ (st.freshVar pTy).2 pr.2 pr.1 hr with ⟨hnextR, htyR, hmemR⟩
-        have hbaseSt : st.nextVarId ≤ (st.freshVar pTy).2.nextVarId := by rw [hfvNext]; exact Nat.le_succ _
-        refine ⟨Nat.le_trans hbaseSt hnextR, fun u hu => ?_, fun b hb => ?_⟩
-        · rw [htyR u (Nat.lt_of_lt_of_le hu hbaseSt), hfvTy u, nat_beq_false (Nat.ne_of_lt hu)]; rfl
-        · cases List.mem_cons.mp hb with
-          | inl hhead =>
-            subst hhead; dsimp only; rw [hfv1]
-            exact ⟨Nat.le_refl _, Nat.lt_of_lt_of_le (Nat.lt_succ_self _) hnextR⟩
-          | inr htail =>
-            rcases hmemR b htail with ⟨hlo, hhi⟩
-            exact ⟨Nat.le_trans (Nat.le_succ _) hlo, hhi⟩
+    unfold bindJpCallArgsPure at h
+    let rawPTy := lowerGroundImpureTypeWith ctx p.type
+    have hex : ∃ (pTy : LNIRType) (argOpt : Option VarId)
+        (pr : List (Lean.FVarId × VarId × LNIRType × Option VarId) × RealBridgeState),
+        bindJpCallArgsPure ctx (st.freshVar pTy).2 ps as_ = .ok pr ∧
+        binds = (p.fvarId, (st.freshVar pTy).1, pTy, argOpt) :: pr.1 ∧ st1 = pr.2 := by
+      cases a with
+      | erased =>
+        dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure] at h
+        let pTy := if !ctx.allowStage1DHeap && isHeapPtrType rawPTy then .i64 else rawPTy
+        cases hr : bindJpCallArgsPure ctx (st.freshVar pTy).2 ps as_ with
+        | error _ => rw [hr] at h; exact nomatch h
+        | ok pr =>
+          rw [hr] at h; injection h with hp; rcases Prod.mk.inj hp with ⟨hb, hs⟩
+          exact ⟨pTy, none, pr, hr, hb.symm, hs.symm⟩
+      | type _ _ =>
+        dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure] at h
+        let pTy := if !ctx.allowStage1DHeap && isHeapPtrType rawPTy then .i64 else rawPTy
+        cases hr : bindJpCallArgsPure ctx (st.freshVar pTy).2 ps as_ with
+        | error _ => rw [hr] at h; exact nomatch h
+        | ok pr =>
+          rw [hr] at h; injection h with hp; rcases Prod.mk.inj hp with ⟨hb, hs⟩
+          exact ⟨pTy, none, pr, hr, hb.symm, hs.symm⟩
+      | fvar x =>
+        dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure, Functor.map, Except.map] at h
+        cases ha : lowerRealArg ctx st (.fvar x) true with
+        | error _ => rw [ha] at h; exact nomatch h
+        | ok pa =>
+          rw [ha] at h; rcases pa with ⟨v0, stA⟩
+          have hstA := lowerRealArg_st_eq ctx st stA (.fvar x) true v0 ha; subst stA
+          dsimp only at h
+          let pTy := if isUnboxedScalarOrTuple (st.getVarType v0) && isHeapPtrType rawPTy then st.getVarType v0 else rawPTy
+          cases hr : bindJpCallArgsPure ctx (st.freshVar pTy).2 ps as_ with
+          | error _ => rw [hr] at h; exact nomatch h
+          | ok pr =>
+            rw [hr] at h; injection h with hp; rcases Prod.mk.inj hp with ⟨hb, hs⟩
+            exact ⟨pTy, some v0, pr, hr, hb.symm, hs.symm⟩
+    rcases hex with ⟨pTy, argOpt, pr, hr, rfl, rfl⟩
+    rcases freshVar_spec st pTy with ⟨hfv1, hfvNext, hfvTy, _, _, _⟩
+    have hbaseSt : st.nextVarId ≤ (st.freshVar pTy).2.nextVarId := by rw [hfvNext]; exact Nat.le_succ _
+    rcases bindJpCallArgsPure_mono ctx ps as_ (st.freshVar pTy).2 pr.2 pr.1 hr with ⟨hnextR, htyR, hmemR⟩
+    refine ⟨Nat.le_trans hbaseSt hnextR, fun u hu => ?_, fun b hb => ?_⟩
+    · rw [htyR u (Nat.lt_of_lt_of_le hu hbaseSt), hfvTy u, nat_beq_false (Nat.ne_of_lt hu)]; rfl
+    · cases List.mem_cons.mp hb with
+      | inl hhead =>
+        subst hhead; dsimp only; rw [hfv1]
+        exact ⟨Nat.le_refl _, Nat.lt_of_lt_of_le (Nat.lt_succ_self _) hnextR⟩
+      | inr htail =>
+        rcases hmemR b htail with ⟨hlo, hhi⟩
+        exact ⟨Nat.le_trans (Nat.le_succ _) hlo, hhi⟩
 
 theorem applyJpParamMapPure_mono (base : VarId) :
-    ∀ (binds : List (Lean.FVarId × VarId × LNIRType × VarId)) (st : RealBridgeState),
+    ∀ (binds : List (Lean.FVarId × VarId × LNIRType × Option VarId)) (st : RealBridgeState),
       base ≤ st.nextVarId →
       (∀ b ∈ binds, base ≤ b.2.1) →
       (applyJpParamMapPure st binds).nextVarId = st.nextVarId ∧

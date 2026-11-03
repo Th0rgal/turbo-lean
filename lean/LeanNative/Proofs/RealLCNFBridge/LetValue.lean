@@ -90,8 +90,8 @@ theorem lowerImpureLetValuePure_sound (ctx : RealBridgeCtx) (st : RealBridgeStat
     (v : Val) (ctor? : Option Lean.Name) :
     let expectedTy := match lv with
       | .ctor info args _ | .reuse _ info _ args _ =>
-        if args.isEmpty then (if isUnboxedScalarOrTuple rawTy then rawTy else .i64)
-        else if ctor?.isSome then .objPtr
+        if ctor?.isSome then .objPtr
+        else if args.isEmpty then (if isUnboxedScalarOrTuple rawTy then rawTy else .i64)
         else match ctx.findTupleArity? info.name with
           | some numFields =>
             .tuple ((args.toList.drop (if args.size > numFields then args.size - numFields else 0)).map fun
@@ -125,6 +125,8 @@ theorem lowerImpureLetValuePure_sound (ctx : RealBridgeCtx) (st : RealBridgeStat
         if isUnboxedScalarOrTuple rawTy then rawTy else .i64
       | .pap _ _ _ => rawTy
     let isBox := match lv with | .box _ _ _ => true | _ => false
+    (∀ info args h, lv = .ctor info args h →
+      (ctx.allowStage1DHeap && (info.usize > 0 || info.ssize > 0)) = false) →
     BridgeStateInv st lenv venv →
     lowerImpureLetValuePure ctx st lv rawTy = .ok (expr, st1) →
     evalLetValue ctx lenv hst lv rawTy = .ok (v, hst', ctor?) →
@@ -136,7 +138,7 @@ theorem lowerImpureLetValuePure_sound (ctx : RealBridgeCtx) (st : RealBridgeStat
     (∀ info args h, lv = .ctor info args h →
       lnirTypeEq (inferImpureRhsTypePure st expr rawTy false) .objPtr = true →
       ctor? = some info.name) := by
-  intro expectedTy isBox hinv h_lower h_eval
+  intro expectedTy isBox hnoScCtor hinv h_lower h_eval
   dsimp only [expectedTy, isBox]
   cases lv with
   | lit litVal =>
@@ -178,6 +180,8 @@ theorem lowerImpureLetValuePure_sound (ctx : RealBridgeCtx) (st : RealBridgeStat
   | ctor info args h =>
     dsimp only [lowerImpureLetValuePure] at h_lower
     dsimp only [evalLetValue] at h_eval
+    have hscFalse := hnoScCtor info args h rfl
+    rw [hscFalse] at h_eval; simp only [Bool.false_eq_true, ↓reduceIte] at h_eval
     rcases lowerRealCtor_sound ctx st lenv venv info.name info.cidx args.toList rawTy expr st1 v hst hst' ctor? hinv h_lower h_eval with
       ⟨heval, rfl, hemptyCase, hnonEmptyCase⟩
     have hempEq : args.isEmpty = args.toList.isEmpty := by
@@ -185,7 +189,7 @@ theorem lowerImpureLetValuePure_sound (ctx : RealBridgeCtx) (st : RealBridgeStat
     cases hemp : args.toList.isEmpty
     · rcases hnonEmptyCase hemp with ⟨argVars, rfl, rfl⟩ | ⟨numFields, argVars, hfind, rfl, rfl, hmap⟩
       · refine ⟨rfl, heval, ?_, fun info' _ _ hc _ => by cases hc; rfl⟩
-        simp [inferImpureRhsTypePure, hempEq, hemp]
+        simp [inferImpureRhsTypePure]
       · refine ⟨rfl, heval, ?_, fun _ _ _ _ hty => False.elim (by cases lnirTypeEq_sound _ _ hty)⟩
         have hsize : args.size = args.toList.length := rfl
         dsimp only [inferImpureRhsTypePure, Bool.false_eq_true, ↓reduceIte, Option.isSome]
@@ -210,7 +214,7 @@ theorem lowerImpureLetValuePure_sound (ctx : RealBridgeCtx) (st : RealBridgeStat
           cases args with | mk l => dsimp [Array.isEmpty, Array.size]; cases l <;> rfl
         cases hemp : args.toList.isEmpty
         · rcases hnonEmptyCase hemp with ⟨argVars, rfl, rfl⟩ | ⟨numFields, argVars, hfind, rfl, rfl, hmap⟩
-          · exact ⟨rfl, heval, by simp [inferImpureRhsTypePure, hempEq, hemp], fun _ _ _ hc => nomatch hc⟩
+          · exact ⟨rfl, heval, by simp [inferImpureRhsTypePure], fun _ _ _ hc => nomatch hc⟩
           · have hsize : args.size = args.toList.length := rfl
             refine ⟨rfl, heval, ?_, fun _ _ _ hc => nomatch hc⟩
             dsimp only [inferImpureRhsTypePure, Bool.false_eq_true, ↓reduceIte, Option.isSome]
@@ -284,7 +288,9 @@ theorem lowerImpureLetValuePure_sound (ctx : RealBridgeCtx) (st : RealBridgeStat
         rw [hvt] at h_lower hisTup; dsimp only at h_lower
         split at h_lower
         · exact nomatch h_lower
-        · cases hcname : st.getActiveCtor? vid with
+        · have hresEq : lenv.resolveCtor? ctx x = st.resolveHeapCtor? ctx vid x := by
+            dsimp [LEnv.resolveCtor?, RealBridgeState.resolveHeapCtor?]; rw [hctorL]
+          cases hcname : st.resolveHeapCtor? ctx vid x with
           | none => rw [hcname] at h_lower; exact nomatch h_lower
           | some cname =>
             rw [hcname] at h_lower; dsimp only at h_lower
@@ -301,7 +307,7 @@ theorem lowerImpureLetValuePure_sound (ctx : RealBridgeCtx) (st : RealBridgeStat
                 refine ⟨rfl, ?_, by simp [inferImpureRhsTypePure, htyL, hvt], fun _ _ _ hc => nomatch hc⟩
                 dsimp only [evalExpr]
                 apply evalCtorGet_fieldGet_match venv hst hst' vid val slot false v ctor? hvalV
-                rw [hctorL, hcname] at h_eval; dsimp only [Bind.bind, Option.bind] at h_eval
+                rw [hresEq, hcname] at h_eval; dsimp only [Bind.bind, Option.bind] at h_eval
                 rw [hlay] at h_eval; dsimp only at h_eval
                 rw [hsl] at h_eval; dsimp only at h_eval
                 cases val with
@@ -338,7 +344,9 @@ theorem lowerImpureLetValuePure_sound (ctx : RealBridgeCtx) (st : RealBridgeStat
         rw [hvt] at h_lower hisTup; dsimp only at h_lower
         split at h_lower
         · exact nomatch h_lower
-        · cases hcname : st.getActiveCtor? vid with
+        · have hresEq : lenv.resolveCtor? ctx x = st.resolveHeapCtor? ctx vid x := by
+            dsimp [LEnv.resolveCtor?, RealBridgeState.resolveHeapCtor?]; rw [hctorL]
+          cases hcname : st.resolveHeapCtor? ctx vid x with
           | none => rw [hcname] at h_lower; exact nomatch h_lower
           | some cname =>
             rw [hcname] at h_lower; dsimp only at h_lower
@@ -358,7 +366,7 @@ theorem lowerImpureLetValuePure_sound (ctx : RealBridgeCtx) (st : RealBridgeStat
                   refine ⟨rfl, ?_, by simp [inferImpureRhsTypePure, htyL, hvt], fun _ _ _ hc => nomatch hc⟩
                   dsimp only [evalExpr]
                   apply evalCtorGet_fieldGet_match venv hst hst' vid val slot false v ctor? hvalV
-                  rw [hctorL, hcname] at h_eval; dsimp only [Bind.bind, Option.bind] at h_eval
+                  rw [hresEq, hcname] at h_eval; dsimp only [Bind.bind, Option.bind] at h_eval
                   rw [hlay] at h_eval; dsimp only at h_eval
                   rw [hsl] at h_eval; dsimp only at h_eval
                   cases val with
@@ -373,7 +381,8 @@ theorem lowerImpureLetValuePure_sound (ctx : RealBridgeCtx) (st : RealBridgeStat
     | ok pair =>
       rcases pair with ⟨argVars, stA⟩
       rw [hargL] at h_lower; dsimp only at h_lower
-      cases hintr : lowerCanonicalIntrinsicPure? fn argVars rawTy (argVars.map stA.getVarType) false ctx.arch with
+      cases hintr : lowerCanonicalIntrinsicPure? fn argVars rawTy (argVars.map stA.getVarType)
+          (ctx.findLocalCallee? fn).isSome ctx.arch ctx.gfSimdIntrinsics with
       | none => rw [hintr] at h_lower; exact nomatch h_lower
       | some e0 =>
         rw [hintr] at h_lower; injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, rfl⟩

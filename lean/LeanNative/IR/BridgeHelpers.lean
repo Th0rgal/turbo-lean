@@ -1583,6 +1583,351 @@ def lowerDelM (fvarId : Lean.FVarId) (k : Lean.Compiler.LCNF.Code .impure)
     return .letBind unitVid .unit (.call "lean_native_del_obj" [objVid] .unit false) (← lowerK k)
   lowerRefOp false fvarId 1 (← lowerK k)
 
+/-- Count AST nodes in `Lean.Compiler.LCNF.Code .impure` to size fuel generously for `RealLCNFBridge`. -/
+partial def codeAstFuel (code : Lean.Compiler.LCNF.Code .impure) : Nat :=
+  match code with
+  | .let _ k | .inc _ _ _ _ k _ | .dec _ _ _ _ _ k _ | .del _ k _
+  | .oset _ _ _ k _ | .uset _ _ _ k _ | .sset _ _ _ _ _ k _ | .setTag _ _ k _ =>
+    codeAstFuel k + 2
+  | .fun d k _ => codeAstFuel d.value + codeAstFuel k + 4
+  | .jp d k =>
+    let dFuel := codeAstFuel d.value + 4
+    let kFuel := codeAstFuel k + 4
+    dFuel * kFuel + dFuel + kFuel + 8
+  | .cases c =>
+    c.alts.foldl (fun acc alt => acc + codeAstFuel alt.getCode + 4) (c.alts.size + 4)
+  | .jmp _ _ | .return _ | .unreach _ => 4
+
+private def collectArgFVarsImpure (acc : List Lean.FVarId) : Lean.Compiler.LCNF.Arg .impure → List Lean.FVarId
+  | .fvar id => if acc.contains id then acc else acc ++ [id]
+  | _ => acc
+
+/-- Collect operand `FVarId`s referenced in `LetValue .impure` (for standalone `BridgeM` callers). -/
+def collectLetValueFVarsImpure (acc : List Lean.FVarId) (lv : Lean.Compiler.LCNF.LetValue .impure) : List Lean.FVarId :=
+  let add (xs : List Lean.FVarId) (id : Lean.FVarId) := if xs.contains id then xs else xs ++ [id]
+  match lv with
+  | .lit _ | .erased | .pap .. => acc
+  | .fvar id args => args.foldl collectArgFVarsImpure (add acc id)
+  | .ctor _ args _ | .fap _ args _ => args.foldl collectArgFVarsImpure acc
+  | .reuse slot _ _ args _ => args.foldl collectArgFVarsImpure (add acc slot)
+  | .oproj _ id _ | .uproj _ id _ | .sproj _ _ id _ | .box _ id _ | .unbox id _
+  | .isShared id _ | .reset _ id _ => add acc id
+
+/-- Collect free operand `FVarId`s in `Code .impure` (excluding `.jmp` join-point targets and locally bound vars). -/
+partial def collectFreeCodeFVarsImpure (bound : Std.HashSet Lean.FVarId) (acc : List Lean.FVarId)
+    (code : Lean.Compiler.LCNF.Code .impure) : List Lean.FVarId :=
+  let addIfFree (xs : List Lean.FVarId) (id : Lean.FVarId) :=
+    if bound.contains id || xs.contains id then xs else xs ++ [id]
+  let addArg (xs : List Lean.FVarId) : Lean.Compiler.LCNF.Arg .impure → List Lean.FVarId
+    | .fvar id => addIfFree xs id
+    | _ => xs
+  match code with
+  | .let decl k =>
+    let acc1 := (collectLetValueFVarsImpure [] decl.value).foldl addIfFree acc
+    collectFreeCodeFVarsImpure (bound.insert decl.fvarId) acc1 k
+  | .jp decl k =>
+    let boundJp := decl.params.foldl (fun s p => s.insert p.fvarId) (bound.insert decl.fvarId)
+    let acc1 := collectFreeCodeFVarsImpure boundJp acc decl.value
+    collectFreeCodeFVarsImpure (bound.insert decl.fvarId) acc1 k
+  | .fun decl k _ =>
+    let boundFn := decl.params.foldl (fun s p => s.insert p.fvarId) (bound.insert decl.fvarId)
+    let acc1 := collectFreeCodeFVarsImpure boundFn acc decl.value
+    collectFreeCodeFVarsImpure (bound.insert decl.fvarId) acc1 k
+  | .jmp _ args => args.foldl addArg acc
+  | .inc id _ _ _ k _ | .dec id _ _ _ _ k _ | .del id k _ | .setTag id _ k _ =>
+    collectFreeCodeFVarsImpure bound (addIfFree acc id) k
+  | .oset id _ y k _ =>
+    collectFreeCodeFVarsImpure bound (addArg (addIfFree acc id) y) k
+  | .uset id _ y k _ | .sset id _ _ y _ k _ =>
+    collectFreeCodeFVarsImpure bound (addIfFree (addIfFree acc id) y) k
+  | .cases c =>
+    let acc1 := addIfFree acc c.discr
+    c.alts.foldl (fun a alt =>
+      let bAlt := match alt with
+        | .alt _ ps _ _ => ps.foldl (fun s p => s.insert p.fvarId) bound
+        | _ => bound
+      collectFreeCodeFVarsImpure bAlt a alt.getCode) acc1
+  | .return id => addIfFree acc id
+  | .unreach _ => acc
+
+private partial def collectCodeTypeExprs (acc : List Lean.Expr) (code : Lean.Compiler.LCNF.Code .impure) : List Lean.Expr :=
+  let addExpr (xs : List Lean.Expr) (e : Lean.Expr) := if xs.contains e then xs else xs ++ [e]
+  match code with
+  | .let decl k => collectCodeTypeExprs (addExpr acc decl.type) k
+  | .jp decl k | .fun decl k _ =>
+    let acc1 := decl.params.foldl (fun a p => addExpr a p.type) (addExpr acc decl.type)
+    collectCodeTypeExprs (collectCodeTypeExprs acc1 decl.value) k
+  | .cases c =>
+    c.alts.foldl (fun a alt =>
+      let a1 := match alt with
+        | .alt _ ps _ _ => ps.foldl (fun s p => addExpr s p.type) a
+        | _ => a
+      collectCodeTypeExprs a1 alt.getCode) (addExpr acc c.resultType)
+  | .inc _ _ _ _ k _ | .dec _ _ _ _ _ k _ | .del _ k _
+  | .oset _ _ _ k _ | .uset _ _ _ k _ | .sset _ _ _ _ _ k _ | .setTag _ _ k _ =>
+    collectCodeTypeExprs acc k
+  | .jmp _ _ | .return _ | .unreach _ => acc
+
+private def collectLetValueCtorAndCalleeNames (ctors callees : List Lean.Name)
+    (lv : Lean.Compiler.LCNF.LetValue .impure) : List Lean.Name × List Lean.Name :=
+  let add (xs : List Lean.Name) (n : Lean.Name) := if xs.contains n then xs else xs ++ [n]
+  match lv with
+  | .ctor info _ _ | .reuse _ info _ _ _ => (add ctors info.name, callees)
+  | .fap fn _ _ | .pap fn _ _ => (ctors, add callees fn)
+  | _ => (ctors, callees)
+
+private partial def collectCodeCtorAndCalleeNames (ctors callees : List Lean.Name)
+    (code : Lean.Compiler.LCNF.Code .impure) : List Lean.Name × List Lean.Name :=
+  let add (xs : List Lean.Name) (n : Lean.Name) := if xs.contains n then xs else xs ++ [n]
+  match code with
+  | .let decl k =>
+    let (c1, f1) := collectLetValueCtorAndCalleeNames ctors callees decl.value
+    collectCodeCtorAndCalleeNames c1 f1 k
+  | .jp decl k | .fun decl k _ =>
+    let (c1, f1) := collectCodeCtorAndCalleeNames ctors callees decl.value
+    collectCodeCtorAndCalleeNames c1 f1 k
+  | .cases c =>
+    c.alts.foldl (fun (cs, fs) alt =>
+      let cs' := match alt with
+        | .ctorAlt info _ _ => add cs info.name
+        | .alt cname _ _ _ => add cs cname
+        | .default _ => cs
+      collectCodeCtorAndCalleeNames cs' fs alt.getCode) (ctors, callees)
+  | .inc _ _ _ _ k _ | .dec _ _ _ _ _ k _ | .del _ k _
+  | .oset _ _ _ k _ | .uset _ _ _ k _ | .sset _ _ _ _ _ k _ | .setTag _ _ k _ =>
+    collectCodeCtorAndCalleeNames ctors callees k
+  | .jmp _ _ | .return _ | .unreach _ => (ctors, callees)
+
+/-- Pre-validate `LetDecl .impure` binder types recursively before delegating to `RealLCNFBridge`. -/
+partial def checkImpureLetTypesM (code : Lean.Compiler.LCNF.Code .impure) : BridgeM Unit := do
+  match code with
+  | .let decl k =>
+    let allowHeap := (← get).allowStage1DHeap
+    let hasStage1DScalarLayout := match decl.value with
+      | .ctor info _ _ => allowHeap && (info.usize > 0 || info.ssize > 0)
+      | _ => false
+    if !hasStage1DScalarLayout then
+      let rawDeclTy ← lowerBridgeType decl.type
+      if rawDeclTy != .unit then checkBridgeType s!"let binding `{decl.binderName}`" decl.type rawDeclTy true
+    checkImpureLetTypesM k
+  | .jp decl k =>
+    let jpTy ← lowerBridgeType decl.type
+    checkBridgeType "join-point result" decl.type jpTy true
+    for p in decl.params do
+      let pTy ← lowerBridgeType p.type
+      checkBridgeType "parameter" p.type pTy true
+    checkImpureLetTypesM decl.value
+    checkImpureLetTypesM k
+  | .cases c =>
+    for alt in c.alts do
+      checkImpureLetTypesM alt.getCode
+  | .inc _ _ _ _ k _ | .dec _ _ _ _ _ k _ | .del _ k _
+  | .oset _ _ _ k _ | .uset _ _ _ k _ | .sset _ _ _ _ _ k _ | .setTag _ _ k _ =>
+    checkImpureLetTypesM k
+  | .fun _ _ _ | .jmp _ _ | .return _ | .unreach _ => pure ()
+
+/-- Build a pure `RealBridgeCtx` from `Lean.Environment` and `BridgeState` for `RealLCNFBridge`. -/
+def buildRealBridgeCtxM (typeExprs : List Lean.Expr) (ctorSeeds calleeSeeds : List Lean.Name)
+    (paramTypeMap : List (Lean.FVarId × LNIRType) := [])
+    (knownFVarCtors : List (Lean.FVarId × Lean.Name) := []) : BridgeM RealLCNFBridge.RealBridgeCtx := do
+  let env ← getEnv
+  let st ← get
+  let mut allCtors : List Lean.Name := []
+  let mut ctorSiblings : List (Lean.Name × Nat × Lean.Name) := []
+  for seed in ctorSeeds do
+    if !allCtors.contains seed then allCtors := allCtors ++ [seed]
+    if let some (.ctorInfo cval) := env.find? seed then
+      if let some (.inductInfo ival) := env.find? cval.induct then
+        for sib in ival.ctors do
+          if !allCtors.contains sib then allCtors := allCtors ++ [sib]
+        for (sib, idx) in ival.ctors.zipIdx do
+          if !ctorSiblings.any (fun (c, i, _) => c == seed && i == idx) then
+            ctorSiblings := ctorSiblings ++ [(seed, idx, sib)]
+  let mut ctorLayouts : List (Lean.Name × RcCtorLayoutSpec) := []
+  let mut nullaryCtors : List (Lean.Name × Nat) := []
+  let mut tupleStructCtors : List (Lean.Name × Nat) := []
+  for cname in allCtors do
+    if let some (.ctorInfo cval) := env.find? cname then
+      if cval.numFields == 0 then
+        nullaryCtors := nullaryCtors ++ [(cname, cval.cidx)]
+      if let some (.inductInfo ival) := env.find? cval.induct then
+        if ival.ctors.length == 1 && !ival.isRec && ival.numIndices == 0 && cval.numFields ≥ 1 && cval.numFields ≤ 8 then
+          tupleStructCtors := tupleStructCtors ++ [(cname, cval.numFields)]
+      if st.allowStage1DHeap && cval.numFields ≥ 1 && cval.numFields ≤ 8 then
+        if let some spec ← (try some <$> getRcCtorLayoutSpecM cname catch _ => pure none) then
+          ctorLayouts := ctorLayouts ++ [(cname, spec)]
+  let mut typeOverrides : List (Lean.Expr × LNIRType) := []
+  for e in typeExprs do
+    let tyEnv := lowerImpureType e (some env)
+    let tyPure := RealLCNFBridge.lowerGroundImpureType e
+    if tyEnv != tyPure then
+      typeOverrides := typeOverrides ++ [(e, tyEnv)]
+  let localNames := (st.localDeclNames.push st.selfDeclName).toList.filter (· != .anonymous)
+  let mut gfSimdIntrinsics : List (Lean.Name × BinOp) := []
+  for fn in calleeSeeds do
+    if let some op := trustedGfSimdIntrinsicOp env fn then
+      if !gfSimdIntrinsics.any (fun (n, _) => n == fn) then
+        gfSimdIntrinsics := gfSimdIntrinsics ++ [(fn, op)]
+  let mut localCallees : List (Lean.Name × String) := []
+  for fn in localNames do
+    if !Lean.isExtern env fn &&
+       (RealLCNFBridge.lowerCanonicalIntrinsicPure? fn [0, 1] .i64 [.i64, .i64] true st.arch gfSimdIntrinsics).isNone &&
+       (trustedGfSimdIntrinsicOp env fn).isNone then
+      if !localCallees.any (fun (n, _) => n == fn) then
+        localCallees := localCallees ++ [(fn, mangleDeclNameInEnv env fn)]
+  return {
+    arch := st.arch
+    allowStage1DHeap := st.allowStage1DHeap
+    ctorLayouts := ctorLayouts
+    nullaryCtors := nullaryCtors
+    tupleStructCtors := tupleStructCtors
+    ctorSiblings := ctorSiblings
+    typeOverrides := typeOverrides
+    paramTypeMap := paramTypeMap
+    localCallees := localCallees
+    gfSimdIntrinsics := gfSimdIntrinsics
+    knownFVarCtors := knownFVarCtors
+  }
+
+/-- Convert current `BridgeState` to `RealBridgeState`, pre-interning any free `FVarId`s in `freeFVars`. -/
+def bridgeStateToRealM (freeFVars : List Lean.FVarId) : BridgeM RealLCNFBridge.RealBridgeState := do
+  for fv in freeFVars do
+    if !(← get).localFunMap.contains fv then
+      let _ ← internFVar fv
+  let st ← get
+  return {
+    fvarMap := st.fvarToVar.toList
+    varTypes := st.varTypes.toList
+    activeCtor := st.activeCtor.toList
+    jpDecls := []
+    nextVarId := st.nextVarId
+  }
+
+/-- Synchronize allocated `VarId` counter and bindings back from `RealBridgeState` into `BridgeState`. -/
+def syncRealToBridgeStateM (rst : RealLCNFBridge.RealBridgeState) : BridgeM Unit := do
+  modify fun st => {
+    st with
+    fvarToVar := rst.fvarMap.foldl (fun m (f, v) => m.insert f v) st.fvarToVar
+    varTypes := rst.varTypes.foldl (fun m (v, t) => m.insert v t) st.varTypes
+    activeCtor := rst.activeCtor.foldl (fun m (v, c) => m.insert v c) {}
+    nextVarId := max st.nextVarId rst.nextVarId
+  }
+
+/-- Delegate `LetValue .impure` lowering directly to `RealLCNFBridge.lowerImpureLetValuePure`. -/
+def lowerImpureLetValueViaRealM (lv : Lean.Compiler.LCNF.LetValue .impure) (retTy : LNIRType) : BridgeM LNIRExpr := do
+  if let .fvar fvarId args := lv then
+    if args.isEmpty && (← get).localFunMap.contains fvarId then
+      Lean.throwError "[lean-native] Unsupported escaping local function value"
+  let freeFVars := collectLetValueFVarsImpure [] lv
+  let (ctors, callees) := collectLetValueCtorAndCalleeNames [] [] lv
+  let st ← get
+  let ctx ← buildRealBridgeCtxM [] (ctors ++ st.fvarCtor.toList.map Prod.snd ++ st.activeCtor.toList.map Prod.snd)
+    callees [] st.fvarCtor.toList
+  let rst ← bridgeStateToRealM freeFVars
+  match RealLCNFBridge.lowerImpureLetValuePure ctx rst lv retTy with
+  | .ok (expr, rst') =>
+    syncRealToBridgeStateM rst'
+    return expr
+  | .error msg => Lean.throwError msg
+
+/-- Delegate `Code .impure` lowering directly to `RealLCNFBridge.lowerRealLCNFCode`. -/
+def lowerImpureCodeViaRealM (code : Lean.Compiler.LCNF.Code .impure) : BridgeM LNIRCode := do
+  checkImpureLetTypesM code
+  let freeFVars := collectFreeCodeFVarsImpure {} [] code
+  for fv in freeFVars do
+    if (← get).localFunMap.contains fv then
+      Lean.throwError "[lean-native] Unsupported higher-order / escaping local function value"
+  let typeExprs := collectCodeTypeExprs [] code
+  let (ctors, callees) := collectCodeCtorAndCalleeNames [] [] code
+  let st ← get
+  let knownCtors := (collectFVarCtors code).fold (fun m k v => m.insert k v) st.fvarCtor
+  let ctx ← buildRealBridgeCtxM typeExprs
+    (ctors ++ knownCtors.toList.map Prod.snd ++ st.activeCtor.toList.map Prod.snd)
+    callees [] knownCtors.toList
+  let rst ← bridgeStateToRealM freeFVars
+  let fuel := codeAstFuel code + 64
+  match RealLCNFBridge.lowerRealLCNFCode fuel ctx rst code with
+  | .ok (lnir, rst') =>
+    syncRealToBridgeStateM rst'
+    return lnir
+  | .error msg => Lean.throwError msg
+
+/-- Delegate `Decl .impure` lowering directly to `RealLCNFBridge.lowerRealLCNFDecl` (backed by `lowerRealLCNFDecl_sound`). -/
+def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
+    (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64)
+    (allowRcAdt : Bool := false) : Lean.CoreM LNIRDecl := do
+  let env ← getEnv
+  if ← declUsesSignedScalarTransitively decl then
+    Lean.throwError s!"[lean-native] Unsupported signed integer type (`Int*` / `ISize`) in `{decl.name}`"
+  let metaInfo := getLCNFDeclMetadata env decl.name
+  if metaInfo.isExtern then
+    Lean.throwError s!"[lean-native] Unsupported `@[extern]` declaration `{decl.name}` in Stage 1B"
+  let isExported := (Lean.getExportNameFor? env decl.name).isSome
+  checkEnvConstSignatureM env decl.name arch isExported
+  let isStage1DHeap := allowRcAdt && !isExported && declQualifiesForStage1DHeap env decl.name arch
+  let initSt : BridgeState := {
+    mangledSymbol := metaInfo.mangledSymbol, isSimpleGround := metaInfo.isSimpleGround,
+    selfDeclName := decl.name, localDeclNames := localDeclNames, arch := arch,
+    allowStage1DHeap := isStage1DHeap }
+  let action : BridgeM LNIRDecl := do
+    let envParamTys := collectEnvExplicitParamTypes env decl.name
+    let mut paramTypeMap : List (Lean.FVarId × LNIRType) := []
+    let mut paramTypesList : List LNIRType := []
+    let mut paramIds : List VarId := []
+    let mut pIdx : Nat := 0
+    for p in decl.params do
+      let rawPTy ← lowerBridgeType p.type
+      let pTy :=
+        if !isStage1DHeap && (rawPTy == .objPtr || rawPTy == .taggedPtr) then
+          match envParamTys[pIdx]? with
+          | some (.tuple fs) => .tuple fs
+          | _ => rawPTy
+        else rawPTy
+      checkBridgeType s!"parameter `{p.binderName}` of `{decl.name}`" p.type pTy true
+      let vid ← internFVar p.fvarId pTy true
+      paramTypeMap := paramTypeMap ++ [(p.fvarId, pTy)]
+      paramTypesList := paramTypesList ++ [pTy]
+      paramIds := paramIds ++ [vid]
+      pIdx := pIdx + 1
+    let retTy ← lowerBridgeType decl.type
+    checkBridgeType s!"return type of `{decl.name}`" decl.type retTy true
+    match decl.value with
+    | .extern _ =>
+      Lean.throwError s!"[lean-native] Unsupported `@[extern]` declaration `{decl.name}` in Stage 1B"
+    | .code c =>
+      if let some intrExpr := tryLowerGfSimdIntrinsic env decl.name paramIds retTy paramTypesList then
+        let retVar ← freshBridgeVar retTy
+        let lnirParams := (decl.params.toList.zip (paramIds.zip paramTypesList)).map fun (p, (vid, pTy)) =>
+          { id := vid, name := p.binderName.toString, ty := pTy, borrow := p.borrow : LNIRParam }
+        return {
+          name := metaInfo.mangledSymbol, params := lnirParams, retTy := retTy,
+          body := .letBind retVar retTy intrExpr (.ret retVar), assurance := .tested,
+          isGpuCand := lnirParams.all (fun p => p.ty.isGpuCompatible) && retTy.isGpuCompatible }
+      if codeHasSelfTailCall decl.name c then
+        Lean.throwError s!"[lean-native] unsupported self-tail recursion in {decl.name}: no qualified loop lowering"
+      checkImpureLetTypesM c
+      let knownCtors := collectFVarCtors c
+      let typeExprs := decl.type :: (decl.params.toList.map (·.type) ++ collectCodeTypeExprs [] c)
+      let (ctors, callees) := collectCodeCtorAndCalleeNames [] [] c
+      let ctx ← buildRealBridgeCtxM typeExprs (ctors ++ knownCtors.toList.map Prod.snd)
+        callees paramTypeMap knownCtors.toList
+      let fuel := codeAstFuel c + decl.params.size + 64
+      match RealLCNFBridge.lowerRealLCNFDecl fuel ctx decl metaInfo.mangledSymbol with
+      | .ok d =>
+        let rstAfter := (RealLCNFBridge.internRealParams ctx {} decl.params.toList).2
+        let nextAfter := match RealLCNFBridge.lowerRealLCNFCode fuel ctx rstAfter c with
+          | .ok (_, rstEnd) => rstEnd.nextVarId
+          | .error _ => d.params.length + 16
+        modify fun s => { s with nextVarId := max s.nextVarId (nextAfter + 4) }
+        let compressedBody ← compressScalarCode d.body
+        let effRetTy := match inferReturnedType compressedBody with | some (.tuple fs) => .tuple fs | _ => d.retTy
+        return { d with
+          body := compressedBody
+          retTy := effRetTy
+          isGpuCand := d.params.all (fun p => p.ty.isGpuCompatible) && effRetTy.isGpuCompatible }
+      | .error msg => Lean.throwError msg
+  Prod.fst <$> action.run initSt
+
 def ingestModuleDeclsWith (ingestImpure : Lean.Compiler.LCNF.Decl .impure → Array Lean.Name → TargetArch → Lean.CoreM LNIRDecl)
     (ingestMono : Lean.Compiler.LCNF.Decl .pure → Array Lean.Name → TargetArch → Lean.CoreM LNIRDecl)
     (declNames : Array Lean.Name) (moduleName : String := "LeanNative.Ingested")

@@ -43,20 +43,48 @@ def LEnv.bind (env : LEnv) (x : Lean.FVarId) (v : Val) (ctor? : Option Lean.Name
     tys   := fun y => if y == x then ty? else env.tys y
     ctors := fun y => if y == x then ctor? else env.ctors y }
 
-def bindParams (env : LEnv) :
+def bindParams (ctx : RealBridgeCtx) (isTopLevel : Bool) (env : LEnv) :
     List (Lean.Compiler.LCNF.Param .impure) → List Val → Except UBError LEnv
   | [], [] => .ok env
   | p :: ps, v :: vs =>
-    let pTy := lowerGroundImpureType p.type
+    let pTy := if isTopLevel then ctx.lowerParamType p else lowerGroundImpureTypeWith ctx p.type
     let env1 : LEnv := { env with
       vals  := fun y => if y == p.fvarId then some v else env.vals y
       tys   := fun y => if y == p.fvarId then some pTy else env.tys y
       ctors := fun y => if y == p.fvarId then none else env.ctors y }
-    bindParams env1 ps vs
+    bindParams ctx isTopLevel env1 ps vs
   | _, _ => .error (.typeError "join point arity mismatch")
+
+def jpParamType (ctx : RealBridgeCtx) (origTys : Lean.FVarId → Option LNIRType)
+    (p : Lean.Compiler.LCNF.Param .impure) (a : Lean.Compiler.LCNF.Arg .impure) : LNIRType :=
+  let rawPTy := lowerGroundImpureTypeWith ctx p.type
+  match a with
+  | .fvar x =>
+    let vt := (origTys x).getD .objPtr
+    if isUnboxedScalarOrTuple vt && isHeapPtrType rawPTy then vt else rawPTy
+  | .erased | .type .. =>
+    if !ctx.allowStage1DHeap && isHeapPtrType rawPTy then .i64 else rawPTy
+
+def bindJpParams (ctx : RealBridgeCtx) (origTys : Lean.FVarId → Option LNIRType) (env : LEnv) :
+    List (Lean.Compiler.LCNF.Param .impure) → List (Lean.Compiler.LCNF.Arg .impure) → List Val → Except UBError LEnv
+  | [], [], [] => .ok env
+  | p :: ps, a :: as_, v :: vs =>
+    let pTy := jpParamType ctx origTys p a
+    let env1 : LEnv := { env with
+      vals  := fun y => if y == p.fvarId then some v else env.vals y
+      tys   := fun y => if y == p.fvarId then some pTy else env.tys y
+      ctors := fun y => if y == p.fvarId then none else env.ctors y }
+    bindJpParams ctx origTys env1 ps as_ vs
+  | _, _, _ => .error (.typeError "join point arity mismatch")
 
 def LEnv.withCtor (env : LEnv) (x : Lean.FVarId) (ctorName : Lean.Name) : LEnv :=
   { env with ctors := fun y => if y == x then some ctorName else env.ctors y }
+
+def LEnv.withCtorOpt (env : LEnv) (x : Lean.FVarId) (ctor? : Option Lean.Name) : LEnv :=
+  { env with ctors := fun y => if y == x then ctor? else env.ctors y }
+
+def LEnv.resolveCtor? (ctx : RealBridgeCtx) (env : LEnv) (x : Lean.FVarId) : Option Lean.Name :=
+  env.ctors x <|> ctx.findKnownFVarCtor? x
 
 def LEnv.bindJp (env : LEnv) (x : Lean.FVarId) (body : JpBody) : LEnv :=
   { env with jps := fun y => if y == x then some body else env.jps y }
@@ -296,6 +324,39 @@ def evalArgs (env : Lean.FVarId → Option Val) :
     | .ok v, .ok vs => .ok (v :: vs)
     | .error e, _ | _, .error e => .error e
 
+def evalJpArg (env : Lean.FVarId → Option Val) (arg : Lean.Compiler.LCNF.Arg .impure) : Except UBError Val :=
+  match arg with
+  | .erased | .type .. => .ok (.u64 0)
+  | .fvar x => match env x with | some v => .ok v | none => .error (.unboundVar 0)
+
+def evalJpArgs (env : Lean.FVarId → Option Val) :
+    List (Lean.Compiler.LCNF.Arg .impure) → Except UBError (List Val)
+  | [] => .ok []
+  | a :: as_ =>
+    match evalJpArg env a, evalJpArgs env as_ with
+    | .ok v, .ok vs => .ok (v :: vs)
+    | .error e, _ | _, .error e => .error e
+
+def evalGfSimd (op : BinOp) (va vb : Val) : Except UBError Val :=
+  match op with
+  | .clmul64 =>
+    match va, vb with
+    | .u64 a, .u64 b => .ok (.u64 (clmul64 a b))
+    | _, _ => .error (.typeError "evalBinOp: clmul64/clmul64Hi/gf2Affine/eor3 require u64")
+  | .clmul64Hi =>
+    match va, vb with
+    | .u64 a, .u64 b => .ok (.u64 (clmul64Hi a b))
+    | _, _ => .error (.typeError "evalBinOp: clmul64/clmul64Hi/gf2Affine/eor3 require u64")
+  | .gf2Affine =>
+    match va, vb with
+    | .u64 a, .u64 b => .ok (.u64 (gf2Affine a b))
+    | _, _ => .error (.typeError "evalBinOp: clmul64/clmul64Hi/gf2Affine/eor3 require u64")
+  | .eor3 =>
+    match va, vb with
+    | .u64 a, .u64 b => .ok (.u64 (eor3 a b))
+    | _, _ => .error (.typeError "evalBinOp: clmul64/clmul64Hi/gf2Affine/eor3 require u64")
+  | _ => .error (.unsupportedCall "non-gfSimd op")
+
 def fieldGet (fs : List Val) (idx : Nat) : Except UBError Val :=
   match fs[idx]? with
   | some v => .ok v
@@ -376,7 +437,25 @@ def evalLetValue (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
     if !args.isEmpty then .error (.unsupportedCall "higher-order fvar")
     else match env.vals x with | some v => .ok (v, st, none) | none => .error (.unboundVar 0)
   | .ctor info args _ =>
-    evalCtorVal ctx env st info.name info.cidx args.toList ty
+    if ctx.allowStage1DHeap && (info.usize > 0 || info.ssize > 0) then
+      match ctx.findLayout? info.name with
+      | none => .error (.unsupportedCall s!"unknown layout {info.name}")
+      | some spec =>
+        if args.size != spec.objSlots then
+          .error (.typeError "ctor object arity mismatch")
+        else
+          match evalArgs env.vals args.toList with
+          | .error e => .error e
+          | .ok vs =>
+            let zeros := spec.scalarSlots.map fun _ => Val.u64 0
+            if vs.isEmpty && zeros.isEmpty then .ok (.tuple [.u64 spec.cidx.toUInt64], st, some info.name)
+            else if !vs.all Val.wfField then
+              .error (.typeError "allocCtor: object field is a tuple owning an edge")
+            else
+              let (objId, st') := st.allocHeapCtor spec.cidx vs zeros
+              .ok (.objPtr objId, st', some info.name)
+    else
+      evalCtorVal ctx env st info.name info.cidx args.toList ty
   | .reuse _ info _ args _ =>
     evalCtorVal ctx env st info.name info.cidx args.toList ty
   | .oproj idx x _ =>
@@ -400,7 +479,7 @@ def evalLetValue (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
     | some (.tuple vs) =>
       if isTupleSrc then (fieldGet vs idx).map (·, st, none)
       else
-        let slot := match env.ctors x >>= ctx.findLayout? >>= (·.usizeSlot? idx) with
+        let slot := match env.resolveCtor? ctx x >>= ctx.findLayout? >>= (·.usizeSlot? idx) with
           | some (s, _) => s
           | none => idx
         match vs with
@@ -409,7 +488,7 @@ def evalLetValue (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
     | some (.objPtr objId) =>
       if isTupleSrc then .error (.typeError "projTuple expects tuple value")
       else
-        let slot := match env.ctors x >>= ctx.findLayout? >>= (·.usizeSlot? idx) with
+        let slot := match env.resolveCtor? ctx x >>= ctx.findLayout? >>= (·.usizeSlot? idx) with
           | some (s, _) => s
           | none => idx
         (st.liveHeapObj objId).bind fun o => (fieldGet o.scalarFields slot).map (·, st, none)
@@ -423,7 +502,7 @@ def evalLetValue (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
     | some (.tuple vs) =>
       if isTupleSrc then (fieldGet vs off).map (·, st, none)
       else
-        let slot := match env.ctors x >>= ctx.findLayout? >>= (·.scalarSlot? n off) with
+        let slot := match env.resolveCtor? ctx x >>= ctx.findLayout? >>= (·.scalarSlot? n off) with
           | some (s, _) => s
           | none => off
         match vs with
@@ -432,7 +511,7 @@ def evalLetValue (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
     | some (.objPtr objId) =>
       if isTupleSrc then .error (.typeError "projTuple expects tuple value")
       else
-        let slot := match env.ctors x >>= ctx.findLayout? >>= (·.scalarSlot? n off) with
+        let slot := match env.resolveCtor? ctx x >>= ctx.findLayout? >>= (·.scalarSlot? n off) with
           | some (s, _) => s
           | none => off
         (st.liveHeapObj objId).bind fun o => (fieldGet o.scalarFields slot).map (·, st, none)
@@ -441,20 +520,29 @@ def evalLetValue (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
       else .error (.typeError "ctorGet expects heap constructor or constructor tuple")
     | none => .error (.unboundVar 0)
   | .fap fn args _ =>
+    if (ctx.findLocalCallee? fn).isSome then
+      .error (.unsupportedCall fn.toString)
+    else
     match args.toList with
     | [a, b] =>
       match evalArg env.vals a, evalArg env.vals b with
       | .ok va, .ok vb =>
         let tA := match a with | .fvar x => (env.tys x).getD .objPtr | _ => .objPtr
         let tB := match b with | .fvar x => (env.tys x).getD .objPtr | _ => .objPtr
-        match lookupCanonicalTypedBinOp? fn with
-        | some (opTy, op) =>
-          if lnirTypeEq tA opTy && lnirTypeEq tB opTy then (wordBin ctx.arch op opTy ty va vb).map (·, st, none)
-          else .error (.typeError "binary intrinsic operand type mismatch")
+        match ctx.findGfSimd? fn with
+        | some gfOp =>
+          if lnirTypeEq ty .i64 && lnirTypeEq tA .i64 && lnirTypeEq tB .i64 then
+            (evalGfSimd gfOp va vb).map (·, st, none)
+          else .error (.typeError "GF/SIMD intrinsic operand type mismatch")
         | none =>
-          match evalBoolBinCall? fn va vb tA tB ty with
-          | some r => r.map (·, st, none)
-          | none => .error (.unsupportedCall fn.toString)
+          match lookupCanonicalTypedBinOp? fn with
+          | some (opTy, op) =>
+            if lnirTypeEq tA opTy && lnirTypeEq tB opTy then (wordBin ctx.arch op opTy ty va vb).map (·, st, none)
+            else .error (.typeError "binary intrinsic operand type mismatch")
+          | none =>
+            match evalBoolBinCall? fn va vb tA tB ty with
+            | some r => r.map (·, st, none)
+            | none => .error (.unsupportedCall fn.toString)
       | .error e, _ | _, .error e => .error e
     | [a] =>
       match evalArg env.vals a with
@@ -560,13 +648,13 @@ def evalStep (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
     | .inl code =>
       match code with
       | .let decl k =>
-        let rawTy := lowerGroundImpureType decl.type
+        let rawTy := lowerGroundImpureTypeWith ctx decl.type
         match evalLetValue ctx env st decl.value rawTy with
         | .ok (v, st', ctor?) =>
           let storedTy := match decl.value with
             | .ctor info args _ | .reuse _ info _ args _ =>
-              if args.isEmpty then (if isUnboxedScalarOrTuple rawTy then rawTy else .i64)
-              else if ctor?.isSome then .objPtr
+              if ctor?.isSome then .objPtr
+              else if args.isEmpty then (if isUnboxedScalarOrTuple rawTy then rawTy else .i64)
               else match ctx.findTupleArity? info.name with
                 | some numFields =>
                   let dropCnt := if args.size > numFields then args.size - numFields else 0
@@ -643,8 +731,13 @@ def evalStep (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
       | .setTag x cidx k _ =>
         match env.vals x with
         | some (.objPtr objId) =>
+          let nextCtor? := match env.resolveCtor? ctx x with
+            | some cur =>
+              if ctx.hasSiblingEntry cur then ctx.findSiblingCtor? cur cidx
+              else none
+            | none => none
           match st.setHeapObjTagExclusive objId (cidx.toUInt64).toNat with
-          | .ok st' => evalStep fuel ctx env st' (.inl k)
+          | .ok st' => evalStep fuel ctx (env.withCtorOpt x nextCtor?) st' (.inl k)
           | .error e => .error e
         | none => .error (.unboundVar 0)
         | _ => .error (.typeError "lean_native_ctor_set_tag expects (objPtr, u64)")
@@ -666,7 +759,7 @@ def evalStep (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
       | .uset x i y k _ =>
         match env.vals x, env.vals y with
         | some (.objPtr objId), some v =>
-          let slot := match env.ctors x >>= ctx.findLayout? >>= (·.usizeSlot? i) with
+          let slot := match env.resolveCtor? ctx x >>= ctx.findLayout? >>= (·.usizeSlot? i) with
             | some (s, _) => s
             | none => i
           match writeField st objId (slot.toUInt64).toNat v false with
@@ -677,7 +770,7 @@ def evalStep (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
       | .sset x n off y _ k _ =>
         match env.vals x, env.vals y with
         | some (.objPtr objId), some v =>
-          let slot := match env.ctors x >>= ctx.findLayout? >>= (·.scalarSlot? n off) with
+          let slot := match env.resolveCtor? ctx x >>= ctx.findLayout? >>= (·.scalarSlot? n off) with
             | some (s, _) => s
             | none => off
           match writeField st objId (slot.toUInt64).toNat v false with
@@ -690,7 +783,7 @@ def evalStep (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
         | none => .error (.unboundVar 0)
         | some v =>
           let ordered := orderAltsPure c.alts.toList
-          if ctx.allowStage1DHeap && c.typeName != ``Bool && env.isHeapVar c.discr then
+          if (ctx.allowStage1DHeap || c.typeName == ``Bool) && env.isHeapVar c.discr then
             match tagOf v st with
             | .ok tag => evalStep fuel ctx env st (.inr (tag, false, 0, some c.discr, ordered))
             | .error e => .error e
@@ -710,10 +803,10 @@ def evalStep (fuel : Nat) (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
         match env.jps fvarId with
         | none => .error (.unsupportedCall "unmapped join point")
         | some body =>
-          match evalArgs env.vals args.toList with
+          match evalJpArgs env.vals args.toList with
           | .error e => .error e
           | .ok vs =>
-            match bindParams env body.params vs with
+            match bindJpParams ctx env.tys env body.params args.toList vs with
             | .ok env' => evalStep fuel ctx env' st (.inl body.code)
             | .error e => .error e
       | .fun decl _ _ => .error (.unsupportedCall s!"local function {decl.binderName}")
@@ -728,7 +821,7 @@ def evalRealLCNFDecl (fuel : Nat) (ctx : RealBridgeCtx)
   match decl.value with
   | .extern _ => .error (.unsupportedCall s!"extern {decl.name}")
   | .code c =>
-    match bindParams LEnv.empty decl.params.toList args with
+    match bindParams ctx true LEnv.empty decl.params.toList args with
     | .ok env => evalRealLCNFCode fuel ctx env st c
     | .error e => .error e
 

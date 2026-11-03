@@ -52,37 +52,8 @@ def lowerFVarCall (fvarId : Lean.FVarId) (args : Array (Lean.Compiler.LCNF.Arg p
     Lean.throwError "[lean-native] Unsupported escaping local function value"
   return .scalar (.var (← internFVar fvarId))
 
-def lowerImpureLetValue (lv : Lean.Compiler.LCNF.LetValue .impure) (retTy : LNIRType) : BridgeM LNIRExpr := do
-  match lv with
-  | .lit litVal => lowerLitValueM litVal retTy true
-  | .erased => return .scalar (.constU64 0)
-  | .fvar fvarId args => lowerFVarCall fvarId args retTy
-  | .ctor ctorInfo args _ =>
-    lowerTupleOrEnumCtor ctorInfo.name ctorInfo.cidx args retTy
-  | .reuse slotFVar ctorInfo _ args _ =>
-    if isUnboxedScalarOrTuple (← getVarType (← internFVar slotFVar)) then
-      return ← lowerTupleOrEnumCtor ctorInfo.name ctorInfo.cidx args retTy
-    Lean.throwError "[lean-native] Unsupported legacy heap reuse instruction in Stage 1B"
-  | .oproj idx fvarId _ => lowerTupleProj fvarId idx retTy true
-  | .uproj idx fvarId _ => lowerScalarProjM fvarId true idx 0 retTy
-  | .sproj n off fvarId _ => lowerScalarProjM fvarId false n off retTy
-  | .fap fnName args _ => lowerNamedCall fnName args retTy
-  | .pap fnName _ _ => Lean.throwError s!"[lean-native] Unsupported partial application (`pap {fnName}`) in Stage 1B"
-  | .box _ fvarId _ | .unbox fvarId _ =>
-    let v ← internFVar fvarId
-    let vt ← getVarType v
-    if isUnboxedScalarOrTuple vt || vt == .objPtr || vt == .taggedPtr then return .scalar (.var v)
-    else Lean.throwError s!"[lean-native] Unsupported boxing/unboxing of `{reprStr vt}` in Stage 1B"
-  | .isShared fvarId _ =>
-    let v ← internFVar fvarId
-    let vt ← getVarType v
-    if isUnboxedScalarOrTuple vt then return .scalar (.constBool true)
-    if (← get).allowStage1DHeap && (vt == .objPtr || vt == .taggedPtr) then return .isExclusive v
-    Lean.throwError "[lean-native] internal bridge error: unintercepted isShared"
-  | .reset _ fvarId _ =>
-    let v ← internFVar fvarId
-    if isUnboxedScalarOrTuple (← getVarType v) then return .scalar (.var v)
-    Lean.throwError "[lean-native] Unsupported heap reset instruction in Stage 1B"
+def lowerImpureLetValue (lv : Lean.Compiler.LCNF.LetValue .impure) (retTy : LNIRType) : BridgeM LNIRExpr :=
+  lowerImpureLetValueViaRealM lv retTy
 
 def lowerTagBranch (condVar : VarId) (cidx : Nat) (isBool : Bool) (yes no : LNIRCode) : BridgeM LNIRCode := do
   let condTy ← getVarType condVar
@@ -91,76 +62,8 @@ def lowerTagBranch (condVar : VarId) (cidx : Nat) (isBool : Bool) (yes no : LNIR
   let cmpVar ← freshBridgeVar .i1
   return (RealLCNFBridge.lowerTagBranchPure condVar condTy cidx isBool cmpVar yes no).1
 
-mutual
-partial def lowerImpureAlts (condVar : VarId) (isBool : Bool) (idx : Nat) (alts : List (Lean.Compiler.LCNF.Alt .impure))
-    (discr? : Option VarId := none) : BridgeM LNIRCode := do
-  -- C1.2: inside a heap `cases` alt the scrutinee's ctor (hence its `getCtorLayout` slots) is known
-  match alts with
-  | [] => return .unreachable
-  | [.alt ctorName params code _] =>
-    if !params.isEmpty then Lean.throwError s!"[lean-native] unsupported constructor payload pattern in {ctorName}"
-    lowerImpureCode code
-  | [.ctorAlt info code _] => withActiveCtor? discr? info.name (lowerImpureCode code)
-  | [.default code] => lowerImpureCode code
-  | alt :: rest =>
-    match alt with
-    | .ctorAlt info code _ =>
-      lowerTagBranch condVar info.cidx isBool (← withActiveCtor? discr? info.name (lowerImpureCode code))
-        (← lowerImpureAlts condVar isBool (idx + 1) rest discr?)
-    | .default code => lowerImpureCode code
-    | .alt ctorName params code _ =>
-      if !params.isEmpty then
-        Lean.throwError s!"[lean-native] unsupported constructor payload pattern in {ctorName}"
-      let cidx ← lookupCtorIdx ctorName idx
-      lowerTagBranch condVar cidx isBool (← lowerImpureCode code) (← lowerImpureAlts condVar isBool (idx + 1) rest)
-
-partial def lowerImpureCode (code : Lean.Compiler.LCNF.Code .impure) : BridgeM LNIRCode := do
-  match code with
-  | .let decl k =>
-    if let .ctor info args _ := decl.value then
-      if (← get).allowStage1DHeap && (info.usize > 0 || info.ssize > 0) then
-        return ← lowerRcCtorWithScalarsM decl.fvarId info.name args k lowerImpureCode
-    let rawDeclTy ← lowerBridgeType decl.type
-    if rawDeclTy != .unit then checkBridgeType s!"let binding `{decl.binderName}`" decl.type rawDeclTy true
-    let rhs ← lowerImpureLetValue decl.value rawDeclTy
-    let isBox := match decl.value with | .box _ _ _ => true | _ => false
-    let ty ← inferImpureRhsType rhs rawDeclTy isBox
-    let dst ← internFVar decl.fvarId ty true
-    match rhs with
-    | .isExclusive _ =>
-      let exclVar ← freshBridgeVar .i1
-      let kCode ← lowerImpureCode k
-      return .letBind exclVar .i1 rhs (.letBind dst .i1 (.scalar (.unaryOp .not (.var exclVar))) kCode)
-    | _ =>
-      return .letBind dst ty rhs (← lowerImpureCode k)
-  | .jp decl k => lowerJoinPoint decl k lowerImpureCode
-  | .jmp fvarId args => lowerJmpInstr fvarId args
-  | .inc fvarId n _ _ k _ => lowerRefOp true fvarId n (← lowerImpureCode k)
-  | .dec fvarId n _ _ _ k _ => lowerRefOp false fvarId n (← lowerImpureCode k)
-  | .del fvarId k _ => lowerDelM fvarId k lowerImpureCode
-  | .setTag fvarId cidx k _ => lowerSetTagM fvarId cidx k lowerImpureCode
-  | .oset fvarId idx y k _ => lowerOsetInstr fvarId idx y k lowerImpureCode
-  | .uset fvarId i y k _ => lowerScalarSetM fvarId true i 0 y k lowerImpureCode
-  | .sset fvarId n off y _ k _ => lowerScalarSetM fvarId false n off y k lowerImpureCode
-  | .cases c =>
-    let condVar ← internFVar c.discr
-    let condTy ← getVarType condVar
-    let st ← get
-    if st.allowStage1DHeap && c.typeName != ``Bool && (condTy == .objPtr || condTy == .taggedPtr) then
-      let tagVar ← freshBridgeVar .i64
-      let altsCode ← lowerImpureAlts tagVar false 0 (orderAlts c.alts.toList) (some condVar)
-      return .letBind tagVar .i64 (.call "lean_native_ctor_tag" [condVar] .i64 false) altsCode
-    else if !isSupportedStage1BScalarType condTy st.arch &&
-        !(c.typeName == ``Bool && st.inJoinPointBody && (condTy == .objPtr || condTy == .taggedPtr)) then
-      Lean.throwError s!"[lean-native] Unsupported cases scrutinee type `{c.typeName}`"
-    else
-      lowerImpureAlts condVar (c.typeName == ``Bool) 0 (orderAlts c.alts.toList)
-  | .return fvarId =>
-    if (← get).localFunMap.contains fvarId then
-      Lean.throwError "[lean-native] Unsupported returning local closure"
-    return .ret (← internFVar fvarId)
-  | .unreach _ => return .unreachable
-end
+def lowerImpureCode (code : Lean.Compiler.LCNF.Code .impure) : BridgeM LNIRCode :=
+  lowerImpureCodeViaRealM code
 
 def lowerPureLetValue (lv : Lean.Compiler.LCNF.LetValue .pure) (retTy : LNIRType) : BridgeM LNIRExpr := do
   match lv with
@@ -285,8 +188,7 @@ def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
 
 def ingestLCNFImpureDecl (decl : Lean.Compiler.LCNF.Decl .impure)
     (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : Lean.CoreM LNIRDecl :=
-  ingestLCNFDeclGeneric decl (fun c => do modify ({ · with fvarCtor := collectFVarCtors c }); lowerImpureCode c)
-    localDeclNames arch true allowRcAdt
+  ingestImpureDeclViaReal decl localDeclNames arch allowRcAdt
 
 def ingestLCNFMonoDecl (decl : Lean.Compiler.LCNF.Decl .pure)
     (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64) : Lean.CoreM LNIRDecl :=

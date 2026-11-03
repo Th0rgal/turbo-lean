@@ -99,12 +99,12 @@ private theorem bridgeInv_applyJpOne (st_m : RealBridgeState) (lenv_m : LEnv) (v
 theorem bindJpCallArgsPure_rel (ctx : RealBridgeCtx) (venv0 : VarEnv) (base : VarId)
     (ps : List (Lean.Compiler.LCNF.Param .impure)) (as_ : List (Lean.Compiler.LCNF.Arg .impure))
     (st0 st1 : RealBridgeState) (lenv : LEnv)
-    (binds : List (Lean.FVarId × VarId × LNIRType × VarId))
+    (binds : List (Lean.FVarId × VarId × LNIRType × Option VarId))
     (hbase : base ≤ st0.nextVarId)
     (hfvarBase : ∀ y vid, st0.lookupFVar? y = some vid → vid < base)
     (hinv : BridgeStateInv st0 lenv venv0)
     (h : bindJpCallArgsPure ctx st0 ps as_ = .ok (binds, st1)) :
-    ∃ vs, evalArgs lenv.vals as_ = .ok vs ∧
+    ∃ vs, evalJpArgs lenv.vals as_ = .ok vs ∧
       st1.fvarMap = st0.fvarMap ∧ st1.activeCtor = st0.activeCtor ∧ st1.jpDecls = st0.jpDecls ∧
       st0.nextVarId ≤ st1.nextVarId ∧
       (∀ u, u < st0.nextVarId → st1.getVarType u = st0.getVarType u) ∧
@@ -115,7 +115,7 @@ theorem bindJpCallArgsPure_rel (ctx : RealBridgeCtx) (venv0 : VarEnv) (base : Va
         (∀ x vid, st_m.lookupFVar? x = some vid → vid < cur) →
         (∀ u, u < base → venv_m u = venv0 u) →
         ∃ lenv' venv',
-          bindParams lenv_m ps vs = .ok lenv' ∧
+          bindJpParams ctx lenv.tys lenv_m ps as_ vs = .ok lenv' ∧
           BridgeStateInv (applyJpParamMapPure st_m binds) lenv' venv' ∧
           evalCode fuel venv_m hst (wrapJpCallBindsPure binds body) = evalCode fuel venv' hst body) := by
   induction ps generalizing as_ st0 st1 binds with
@@ -131,74 +131,122 @@ theorem bindJpCallArgsPure_rel (ctx : RealBridgeCtx) (venv0 : VarEnv) (base : Va
     cases as_ with
     | nil => exact nomatch h
     | cons a as_ =>
-      dsimp only [bindJpCallArgsPure, Bind.bind, Except.bind, Pure.pure, Except.pure] at h
-      cases ha : lowerRealArg ctx st0 a true with
-      | error _ => rw [ha] at h; exact nomatch h
-      | ok pa =>
-        rw [ha] at h; rcases pa with ⟨argVid, stA⟩
-        rcases lowerRealArg_sound ctx st0 lenv venv0 a true argVid stA hinv ha with
-          ⟨x, v, rfl, hluX, hevalA, hvArg, _, hstA⟩
-        subst stA; dsimp only at h
-        let pTy := lowerGroundImpureType p.type
-        rcases freshVar_spec st0 pTy with ⟨hfv1, hfvNext, hfvTy, hfvLu, hfvCtor, _⟩
-        let st2 := (st0.freshVar pTy).2
-        have hbase2 : base ≤ st2.nextVarId := Nat.le_trans hbase (by rw [hfvNext]; exact Nat.le_succ _)
-        have hfvarBase2 : ∀ y vid, st2.lookupFVar? y = some vid → vid < base := by
-          intro y vid hy; rw [hfvLu] at hy; exact hfvarBase y vid hy
-        have hinv2 : BridgeStateInv st2 lenv venv0 :=
-          bridgeInv_ext st0 st2 lenv venv0 hinv (by rw [hfvNext]; exact Nat.le_succ _)
-            (fun u hu => by rw [hfvTy u, nat_beq_false (Nat.ne_of_lt hu)]; rfl) rfl (fun u _ => hfvCtor u) rfl
-        cases hr : bindJpCallArgsPure ctx st2 ps as_ with
-        | error _ => rw [hr] at h; exact nomatch h
-        | ok pr =>
-          rw [hr] at h; dsimp only at h
-          injection h with hp; rcases Prod.mk.inj hp with ⟨rfl, rfl⟩
-          rcases ih as_ st2 pr.2 pr.1 hbase2 hfvarBase2 hinv2 hr with
-            ⟨vs, hevalRest, hfm, hac, hjp, hnextR, htyR, hstepRest⟩
-          refine ⟨v :: vs, by simp [evalArgs, hevalA, hevalRest], hfm, hac, hjp,
-            Nat.le_trans (by rw [hfvNext]; exact Nat.le_succ _) hnextR,
-            fun u hu => by
-              rw [htyR u (by rw [hfvNext]; exact Nat.lt_succ_of_lt hu), hfvTy u, nat_beq_false (Nat.ne_of_lt hu)]
-              rfl,
-            ?_⟩
-          intro st_m lenv_m venv_m cur fuel hst body hinv_m hcurGe hcurLe hstmNext hstmLt hvenvBase
-          have hargLtBase : argVid < base := hfvarBase x argVid hluX
-          have hvArg_m : venv_m argVid = some v := (hvenvBase argVid hargLtBase).trans hvArg
-          let freshVid := (st0.freshVar pTy).1
-          have hfreshEq : freshVid = st0.nextVarId := hfv1
-          have hfreshLtStm : freshVid < st_m.nextVarId := by
-            rw [hfreshEq, hstmNext]
-            exact Nat.lt_of_lt_of_le (by rw [hfvNext]; exact Nat.lt_succ_self _) hnextR
-          have hfreshGtStm : ∀ y vid, st_m.lookupFVar? y = some vid → vid < freshVid := by
-            intro y vid hy; rw [hfreshEq]; exact Nat.lt_of_lt_of_le (hstmLt y vid hy) hcurLe
-          let st_m1 : RealBridgeState :=
-            { (st_m.setVarType freshVid pTy) with
-              fvarMap := (p.fvarId, freshVid) :: st_m.fvarMap.filter (fun (f, _) => f != p.fvarId)
-              activeCtor := st_m.activeCtor.filter (fun (w, _) => w != freshVid) }
-          let lenv_m1 := lenv_m.bind p.fvarId v none (some pTy)
-          let venv_m1 := venv_m.bind freshVid v
-          have hinv_m1 : BridgeStateInv st_m1 lenv_m1 venv_m1 :=
-            bridgeInv_applyJpOne st_m lenv_m venv_m p.fvarId freshVid pTy v hinv_m hfreshLtStm hfreshGtStm
-          have hcur1Ge : base ≤ st2.nextVarId := hbase2
-          have hstm1Lt : ∀ y vid, st_m1.lookupFVar? y = some vid → vid < st2.nextVarId := by
-            intro y vid hy
-            have hlu1 := lookupFVar_cons st_m.fvarMap p.fvarId y freshVid
-            change st_m1.lookupFVar? y = _ at hlu1; rw [hlu1] at hy
-            cases hyp : (y == p.fvarId) <;> rw [hyp] at hy
-            · simp only [Bool.false_eq_true, ↓reduceIte] at hy
-              rw [hfvNext]; exact Nat.lt_succ_of_lt (Nat.lt_of_lt_of_le (hstmLt y vid hy) hcurLe)
-            · simp only [↓reduceIte] at hy; injection hy with hvEq; rw [← hvEq, hfreshEq, hfvNext]
-              exact Nat.lt_succ_self _
-          have hvenv1Base : ∀ u, u < base → venv_m1 u = venv0 u := by
-            intro u hu
-            have huLtFresh : u < freshVid := by rw [hfreshEq]; exact Nat.lt_of_lt_of_le hu hbase
-            exact (venv_bind_fresh venv_m freshVid u huLtFresh v).trans (hvenvBase u hu)
-          rcases hstepRest st_m1 lenv_m1 venv_m1 st2.nextVarId fuel hst body
-              hinv_m1 hbase2 (Nat.le_refl _) hstmNext hstm1Lt hvenv1Base with
-            ⟨lenv', venv', hbindRest, hinvFinal, hevalWrap⟩
-          refine ⟨lenv', venv', hbindRest, hinvFinal, ?_⟩
-          dsimp only [wrapJpCallBindsPure, evalCode, evalExpr, evalScalarExpr]
-          rw [hvArg_m]; exact hevalWrap
+      let rawPTy := lowerGroundImpureTypeWith ctx p.type
+      have hArgOpt : ∃ (pTy : LNIRType) (argVid? : Option VarId) (v : Val)
+          (rest : List (Lean.FVarId × VarId × LNIRType × Option VarId)),
+          bindJpCallArgsPure ctx (st0.freshVar pTy).2 ps as_ = .ok (rest, st1) ∧
+          binds = (p.fvarId, (st0.freshVar pTy).1, pTy, argVid?) :: rest ∧
+          evalJpArg lenv.vals a = .ok v ∧
+          pTy = jpParamType ctx lenv.tys p a ∧
+          (∀ venv_m : VarEnv, (∀ u, u < base → venv_m u = venv0 u) →
+            match argVid? with
+            | some argVid => venv_m argVid = some v
+            | none => v = .u64 0) := by
+        cases a with
+        | erased =>
+          dsimp only [bindJpCallArgsPure, Bind.bind, Except.bind, Pure.pure, Except.pure] at h
+          let pTy := if !ctx.allowStage1DHeap && isHeapPtrType rawPTy then .i64 else rawPTy
+          cases hr : bindJpCallArgsPure ctx (st0.freshVar pTy).2 ps as_ with
+          | error _ => rw [hr] at h; exact nomatch h
+          | ok pr =>
+            rw [hr] at h; injection h with hp
+            rcases Prod.mk.inj hp with ⟨hb, hs⟩; subst hs
+            exact ⟨pTy, none, .u64 0, pr.1, hr, hb.symm, rfl, rfl, fun _ _ => rfl⟩
+        | type _ _ =>
+          dsimp only [bindJpCallArgsPure, Bind.bind, Except.bind, Pure.pure, Except.pure] at h
+          let pTy := if !ctx.allowStage1DHeap && isHeapPtrType rawPTy then .i64 else rawPTy
+          cases hr : bindJpCallArgsPure ctx (st0.freshVar pTy).2 ps as_ with
+          | error _ => rw [hr] at h; exact nomatch h
+          | ok pr =>
+            rw [hr] at h; injection h with hp
+            rcases Prod.mk.inj hp with ⟨hb, hs⟩; subst hs
+            exact ⟨pTy, none, .u64 0, pr.1, hr, hb.symm, rfl, rfl, fun _ _ => rfl⟩
+        | fvar x =>
+          dsimp only [bindJpCallArgsPure, Bind.bind, Except.bind, Pure.pure, Except.pure, Functor.map, Except.map] at h
+          cases ha : lowerRealArg ctx st0 (.fvar x) true with
+          | error _ => rw [ha] at h; exact nomatch h
+          | ok pa =>
+            rw [ha] at h; rcases pa with ⟨argVid, stA⟩
+            rcases lowerRealArg_sound ctx st0 lenv venv0 (.fvar x) true argVid stA hinv ha with
+              ⟨x', v, hxEq, hluX, hevalA, hvArg, htyX, hstA⟩
+            injection hxEq with hx'; subst hx'
+            subst stA; dsimp only at h
+            let pTy :=
+              if isUnboxedScalarOrTuple (st0.getVarType argVid) && isHeapPtrType rawPTy then
+                st0.getVarType argVid
+              else rawPTy
+            cases hr : bindJpCallArgsPure ctx (st0.freshVar pTy).2 ps as_ with
+            | error _ => rw [hr] at h; exact nomatch h
+            | ok pr =>
+              rw [hr] at h; injection h with hp
+              rcases Prod.mk.inj hp with ⟨hb, hs⟩; subst hs
+              refine ⟨pTy, some argVid, v, pr.1, hr, hb.symm, ?_, ?_, fun venv_m hvenvBase => ?_⟩
+              · dsimp only [evalArg] at hevalA; dsimp only [evalJpArg]; exact hevalA
+              · dsimp only [jpParamType, pTy, rawPTy]; rw [htyX]
+              · exact (hvenvBase argVid (hfvarBase x argVid hluX)).trans hvArg
+      rcases hArgOpt with ⟨pTy, argVid?, v, rest, hr, rfl, hevalA, hpTyEq, hvOpt⟩
+      rcases freshVar_spec st0 pTy with ⟨hfv1, hfvNext, hfvTy, hfvLu, hfvCtor, _⟩
+      let st2 := (st0.freshVar pTy).2
+      have hbase2 : base ≤ st2.nextVarId := Nat.le_trans hbase (by rw [hfvNext]; exact Nat.le_succ _)
+      have hfvarBase2 : ∀ y vid, st2.lookupFVar? y = some vid → vid < base := by
+        intro y vid hy; rw [hfvLu] at hy; exact hfvarBase y vid hy
+      have hinv2 : BridgeStateInv st2 lenv venv0 :=
+        bridgeInv_ext st0 st2 lenv venv0 hinv (by rw [hfvNext]; exact Nat.le_succ _)
+          (fun u hu => by rw [hfvTy u, nat_beq_false (Nat.ne_of_lt hu)]; rfl) rfl (fun u _ => hfvCtor u) rfl
+      rcases ih as_ st2 st1 rest hbase2 hfvarBase2 hinv2 hr with
+        ⟨vs, hevalRest, hfm, hac, hjp, hnextR, htyR, hstepRest⟩
+      refine ⟨v :: vs, by simp [evalJpArgs, hevalA, hevalRest], hfm, hac, hjp,
+        Nat.le_trans (by rw [hfvNext]; exact Nat.le_succ _) hnextR,
+        fun u hu => by
+          rw [htyR u (by rw [hfvNext]; exact Nat.lt_succ_of_lt hu), hfvTy u, nat_beq_false (Nat.ne_of_lt hu)]
+          rfl,
+        ?_⟩
+      intro st_m lenv_m venv_m cur fuel hst body hinv_m hcurGe hcurLe hstmNext hstmLt hvenvBase
+      let freshVid := (st0.freshVar pTy).1
+      have hfreshEq : freshVid = st0.nextVarId := hfv1
+      have hfreshLtStm : freshVid < st_m.nextVarId := by
+        rw [hfreshEq, hstmNext]
+        exact Nat.lt_of_lt_of_le (by rw [hfvNext]; exact Nat.lt_succ_self _) hnextR
+      have hfreshGtStm : ∀ y vid, st_m.lookupFVar? y = some vid → vid < freshVid := by
+        intro y vid hy; rw [hfreshEq]; exact Nat.lt_of_lt_of_le (hstmLt y vid hy) hcurLe
+      let st_m1 : RealBridgeState :=
+        { (st_m.setVarType freshVid pTy) with
+          fvarMap := (p.fvarId, freshVid) :: st_m.fvarMap.filter (fun (f, _) => f != p.fvarId)
+          activeCtor := st_m.activeCtor.filter (fun (w, _) => w != freshVid) }
+      let lenv_m1 := lenv_m.bind p.fvarId v none (some pTy)
+      let venv_m1 := venv_m.bind freshVid v
+      have hinv_m1 : BridgeStateInv st_m1 lenv_m1 venv_m1 :=
+        bridgeInv_applyJpOne st_m lenv_m venv_m p.fvarId freshVid pTy v hinv_m hfreshLtStm hfreshGtStm
+      have hstm1Lt : ∀ y vid, st_m1.lookupFVar? y = some vid → vid < st2.nextVarId := by
+        intro y vid hy
+        have hlu1 := lookupFVar_cons st_m.fvarMap p.fvarId y freshVid
+        change st_m1.lookupFVar? y = _ at hlu1; rw [hlu1] at hy
+        cases hyp : (y == p.fvarId) <;> rw [hyp] at hy
+        · simp only [Bool.false_eq_true, ↓reduceIte] at hy
+          rw [hfvNext]; exact Nat.lt_succ_of_lt (Nat.lt_of_lt_of_le (hstmLt y vid hy) hcurLe)
+        · simp only [↓reduceIte] at hy; injection hy with hvEq; rw [← hvEq, hfreshEq, hfvNext]
+          exact Nat.lt_succ_self _
+      have hvenv1Base : ∀ u, u < base → venv_m1 u = venv0 u := by
+        intro u hu
+        have huLtFresh : u < freshVid := by rw [hfreshEq]; exact Nat.lt_of_lt_of_le hu hbase
+        exact (venv_bind_fresh venv_m freshVid u huLtFresh v).trans (hvenvBase u hu)
+      rcases hstepRest st_m1 lenv_m1 venv_m1 st2.nextVarId fuel hst body
+          hinv_m1 hbase2 (Nat.le_refl _) hstmNext hstm1Lt hvenv1Base with
+        ⟨lenv', venv', hbindRest, hinvFinal, hevalWrap⟩
+      have hbindHead : bindJpParams ctx lenv.tys lenv_m (p :: ps) (a :: as_) (v :: vs) = .ok lenv' := by
+        dsimp only [bindJpParams]
+        rw [← hpTyEq]
+        exact hbindRest
+      refine ⟨lenv', venv', hbindHead, hinvFinal, ?_⟩
+      have hvM := hvOpt venv_m hvenvBase
+      cases argVid? with
+      | none =>
+        subst hvM
+        dsimp only [wrapJpCallBindsPure, evalCode, evalExpr, evalScalarExpr]
+        exact hevalWrap
+      | some argVid =>
+        dsimp only [wrapJpCallBindsPure, evalCode, evalExpr, evalScalarExpr]
+        rw [hvM]; exact hevalWrap
 
 theorem bridgeInv_venv_agree (st : RealBridgeState) (lenv : LEnv) (venv venv' : VarEnv)
     (hinv : BridgeStateInv st lenv venv) (hagree : ∀ u, u < st.nextVarId → venv' u = venv u) :
@@ -298,12 +346,12 @@ theorem bridgeInv_empty : BridgeStateInv {} LEnv.empty VarEnv.empty where
   fvar_inj _ _ _ h _ := nomatch h
   jp_sync _ _ _ h := nomatch h
 
-theorem internRealParams_sound (ps : List (Lean.Compiler.LCNF.Param .impure)) :
+theorem internRealParams_sound (ctx : RealBridgeCtx) (ps : List (Lean.Compiler.LCNF.Param .impure)) :
     ∀ (args : List Val) (st : RealBridgeState) (lenv lenv' : LEnv) (venv : VarEnv),
       BridgeStateInv st lenv venv →
-      bindParams lenv ps args = .ok lenv' →
-      BridgeStateInv (internRealParams st ps).2 lenv'
-        (((internRealParams st ps).1.zip args).foldl (fun acc (p, val) => acc.bind p.id val) venv) := by
+      bindParams ctx true lenv ps args = .ok lenv' →
+      BridgeStateInv (internRealParams ctx st ps).2 lenv'
+        (((internRealParams ctx st ps).1.zip args).foldl (fun acc (p, val) => acc.bind p.id val) venv) := by
   induction ps with
   | nil =>
     intro args st lenv lenv' venv hinv hbind
@@ -316,11 +364,11 @@ theorem internRealParams_sound (ps : List (Lean.Compiler.LCNF.Param .impure)) :
     | nil => exact nomatch hbind
     | cons a as_ =>
       dsimp only [internRealParams, RealBridgeState.internFVar, ↓reduceIte, List.zip, List.zipWith, List.foldl]
-      dsimp only [bindParams] at hbind
-      exact ih as_ (st.allocFreshFVar p.fvarId (lowerGroundImpureType p.type)).2
-        (lenv.bind p.fvarId a none (some (lowerGroundImpureType p.type))) lenv'
+      dsimp only [bindParams, ↓reduceIte] at hbind
+      exact ih as_ (st.allocFreshFVar p.fvarId (ctx.lowerParamType p)).2
+        (lenv.bind p.fvarId a none (some (ctx.lowerParamType p))) lenv'
         (venv.bind st.nextVarId a)
-        (bridgeInv_bind_fresh st lenv venv p.fvarId (lowerGroundImpureType p.type) a hinv) hbind
+        (bridgeInv_bind_fresh st lenv venv p.fvarId (ctx.lowerParamType p) a hinv) hbind
 
 theorem discr_env_inv (st : RealBridgeState) (lenv : LEnv) (venv : VarEnv)
     (discr? : Option Lean.FVarId) (cname : Lean.Name) :

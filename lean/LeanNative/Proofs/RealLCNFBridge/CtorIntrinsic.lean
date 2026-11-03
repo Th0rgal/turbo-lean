@@ -255,7 +255,7 @@ theorem lowerRealCtor_sound (ctx : RealBridgeCtx) (st : RealBridgeState) (lenv :
                 simp only [evalExpr, hvarList, evalVarList, hvsNe, Bool.false_and, hwf, Bool.false_eq_true, ↓reduceIte]
               · simp [hwf] at h_eval'
 
-/-- `lowerCanonicalIntrinsicPure?` agrees with `.fap` evaluation on all binary, boolean, unary, and cast intrinsics. -/
+/-- `lowerCanonicalIntrinsicPure?` agrees with `.fap` evaluation on all binary, GF/SIMD, boolean, unary, and cast intrinsics. -/
 theorem lowerCanonicalIntrinsicPure_sound (ctx : RealBridgeCtx) (st : RealBridgeState) (lenv : LEnv)
     (venv : VarEnv) (hst hst' : HeapState) (fn : Lean.Name)
     (args : Array (Lean.Compiler.LCNF.Arg .impure)) (himp : Lean.Compiler.LCNF.Purity.impure = .impure)
@@ -263,157 +263,199 @@ theorem lowerCanonicalIntrinsicPure_sound (ctx : RealBridgeCtx) (st : RealBridge
     (retTy : LNIRType) (expr : LNIRExpr) (v : Val) (ctor? : Option Lean.Name)
     (hinv : BridgeStateInv st lenv venv)
     (hargL : lowerRealArgList ctx st false args.toList = .ok (argVars, st1))
-    (hs : lowerCanonicalIntrinsicPure? fn argVars retTy (argVars.map st1.getVarType) false ctx.arch = some expr)
+    (hs : lowerCanonicalIntrinsicPure? fn argVars retTy (argVars.map st1.getVarType)
+      (ctx.findLocalCallee? fn).isSome ctx.arch ctx.gfSimdIntrinsics = some expr)
     (ho : evalLetValue ctx lenv hst (.fap fn args himp) retTy = .ok (v, hst', ctor?)) :
     evalExpr venv hst expr = .ok (v, hst') ∧ st1 = st ∧ hst' = hst ∧ ctor? = none ∧
       (∃ se, expr = .scalar se ∧ ∀ u, se ≠ .var u) := by
   rcases lowerRealArgList_sound ctx st lenv venv false args.toList argVars st1 hinv hargL with
     ⟨vs, hevalArgs, hvarList, hlen, rfl, hmap⟩
   unfold lowerCanonicalIntrinsicPure? at hs
-  simp only [Bool.false_eq_true, ↓reduceIte] at hs
   dsimp only [evalLetValue] at ho
-  cases hlist : args.toList with
-  | nil => rw [hlist] at hlen; cases argVars <;> simp at hlen hs
-  | cons a rest1 =>
-    cases rest1 with
-    | nil =>
-      rw [hlist] at hlen hmap hevalArgs ho hargL
-      cases argVars with
-      | nil => simp at hlen
-      | cons varg restV =>
-        cases restV with
-        | cons _ _ => simp at hlen
-        | nil =>
-          dsimp only [List.map] at hmap
-          injection hmap with htyA _
-          cases a with
-          | type _ => dsimp [lowerRealArgList, lowerRealArg] at hargL; exact nomatch hargL
-          | erased => dsimp [lowerRealArgList, lowerRealArg] at hargL; exact nomatch hargL
-          | fvar xA =>
-            have htyA' : st1.getVarType varg = (lenv.tys xA).getD .objPtr := htyA
-            simp only [List.map, htyA'] at hs
-            dsimp only at ho; dsimp only [evalArgs] at hevalArgs
-            cases heA : evalArg lenv.vals (.fvar xA) with
-            | error _ => simp [heA] at hevalArgs
-            | ok va =>
-              rw [heA] at ho; dsimp only at ho
-              simp only [heA] at hevalArgs; injection hevalArgs with hvsEq
-              subst hvsEq
-              dsimp only [evalVarList] at hvarList
-              cases hvA : venv varg with
-              | none => simp [hvA] at hvarList
-              | some va' =>
-                simp only [hvA] at hvarList; injection hvarList with hvaEq
-                rcases List.cons.inj hvaEq with ⟨hva, _⟩; subst hva
-                cases hcall : evalUnaryOrCastCall? ctx.arch fn va' ((lenv.tys xA).getD .objPtr) retTy with
-                | none => rw [hcall] at ho; exact nomatch ho
-                | some res =>
-                  rw [hcall] at ho; dsimp only [Functor.map, Except.map] at ho
-                  cases res with
-                  | error _ => exact nomatch ho
-                  | ok v0 =>
-                    injection ho with hp2; rcases Prod.mk.inj hp2 with ⟨rfl, hp3⟩; rcases Prod.mk.inj hp3 with ⟨rfl, rfl⟩
-                    rcases lowerUnaryAndCast_sound venv hst ctx.arch fn varg _ retTy va' expr v0 hvA hs hcall with ⟨he, hse⟩
-                    exact ⟨he, rfl, rfl, rfl, hse⟩
-    | cons b rest2 =>
-      cases rest2 with
-      | cons _ _ =>
-        rw [hlist] at hlen
-        cases argVars with
-        | nil => simp at hlen
-        | cons _ r1 => cases r1 with | nil => simp at hlen | cons _ r2 => cases r2 <;> simp at hlen hs
+  cases hloc : (ctx.findLocalCallee? fn).isSome
+  · rw [hloc] at hs ho; simp only [Bool.false_eq_true, ↓reduceIte] at hs ho
+    cases hlist : args.toList with
+    | nil => rw [hlist] at hlen; cases argVars <;> simp at hlen hs
+    | cons a rest1 =>
+      cases rest1 with
       | nil =>
         rw [hlist] at hlen hmap hevalArgs ho hargL
         cases argVars with
         | nil => simp at hlen
-        | cons vl r1 =>
-          cases r1 with
+        | cons varg restV =>
+          cases restV with
+          | cons _ _ => simp at hlen
+          | nil =>
+            dsimp only [List.map] at hmap
+            injection hmap with htyA _
+            cases a with
+            | type _ => dsimp [lowerRealArgList, lowerRealArg] at hargL; exact nomatch hargL
+            | erased => dsimp [lowerRealArgList, lowerRealArg] at hargL; exact nomatch hargL
+            | fvar xA =>
+              have htyA' : st1.getVarType varg = (lenv.tys xA).getD .objPtr := htyA
+              simp only [List.map, htyA'] at hs
+              dsimp only at ho; dsimp only [evalArgs] at hevalArgs
+              cases heA : evalArg lenv.vals (.fvar xA) with
+              | error _ => simp [heA] at hevalArgs
+              | ok va =>
+                rw [heA] at ho; dsimp only at ho
+                simp only [heA] at hevalArgs; injection hevalArgs with hvsEq
+                subst hvsEq
+                dsimp only [evalVarList] at hvarList
+                cases hvA : venv varg with
+                | none => simp [hvA] at hvarList
+                | some va' =>
+                  simp only [hvA] at hvarList; injection hvarList with hvaEq
+                  rcases List.cons.inj hvaEq with ⟨hva, _⟩; subst hva
+                  cases hcall : evalUnaryOrCastCall? ctx.arch fn va' ((lenv.tys xA).getD .objPtr) retTy with
+                  | none => rw [hcall] at ho; exact nomatch ho
+                  | some res =>
+                    rw [hcall] at ho; dsimp only [Functor.map, Except.map] at ho
+                    cases res with
+                    | error _ => exact nomatch ho
+                    | ok v0 =>
+                      injection ho with hp2; rcases Prod.mk.inj hp2 with ⟨rfl, hp3⟩; rcases Prod.mk.inj hp3 with ⟨rfl, rfl⟩
+                      rcases lowerUnaryAndCast_sound venv hst ctx.arch fn varg _ retTy va' expr v0 hvA hs hcall with ⟨he, hse⟩
+                      exact ⟨he, rfl, rfl, rfl, hse⟩
+      | cons b rest2 =>
+        cases rest2 with
+        | cons _ _ =>
+          rw [hlist] at hlen
+          cases argVars with
           | nil => simp at hlen
-          | cons vr r2 =>
-            cases r2 with
-            | cons _ _ => simp at hlen
-            | nil =>
-              dsimp only [List.map] at hmap
-              injection hmap with htA hmap2; injection hmap2 with htB _
-              cases a with
-              | type _ => dsimp [lowerRealArgList, lowerRealArg] at hargL; exact nomatch hargL
-              | erased => dsimp [lowerRealArgList, lowerRealArg] at hargL; exact nomatch hargL
-              | fvar xA =>
-                cases b with
-                | type _ =>
-                  dsimp [evalArgs, evalArg] at hevalArgs
-                  cases hvx : lenv.vals xA <;>
-                    (rw [hvx] at hevalArgs; exact nomatch hevalArgs)
-                | erased =>
-                  dsimp [evalArgs, evalArg] at hevalArgs
-                  cases hvx : lenv.vals xA <;>
-                    (rw [hvx] at hevalArgs; exact nomatch hevalArgs)
-                | fvar xB =>
-                  have htA' : st1.getVarType vl = (lenv.tys xA).getD .objPtr := htA
-                  have htB' : st1.getVarType vr = (lenv.tys xB).getD .objPtr := htB
-                  simp only [List.map, htA', htB'] at hs
-                  dsimp only [evalArgs] at hevalArgs
-                  cases heA : evalArg lenv.vals (.fvar xA) with
-                  | error _ => simp [heA] at hevalArgs
-                  | ok va =>
-                    cases heB : evalArg lenv.vals (.fvar xB) with
-                    | error _ => simp [heA, heB] at hevalArgs
-                    | ok vb =>
-                      simp only [heA, heB] at hevalArgs ho; injection hevalArgs with hvsEq
-                      subst hvsEq
-                      dsimp only [evalVarList] at hvarList
-                      cases hvL : venv vl with
-                      | none => simp [hvL] at hvarList
-                      | some va' =>
-                        cases hvR : venv vr with
-                        | none => simp [hvL, hvR] at hvarList
-                        | some vb' =>
-                          simp only [hvL, hvR] at hvarList; injection hvarList with hvEq
-                          rcases List.cons.inj hvEq with ⟨hva, hvEq2⟩
-                          rcases List.cons.inj hvEq2 with ⟨hvb, _⟩
-                          subst hva; subst hvb
-                          cases hbin : lookupCanonicalTypedBinOp? fn with
-                          | some pairOp =>
-                            rcases pairOp with ⟨opTy, op⟩
-                            rw [hbin] at hs ho; dsimp only at hs ho
-                            cases hteq : (lnirTypeEq ((lenv.tys xA).getD .objPtr) opTy && lnirTypeEq ((lenv.tys xB).getD .objPtr) opTy)
-                            · rw [hteq] at ho; exact nomatch ho
-                            · rw [hteq] at ho; simp only [↓reduceIte] at ho
-                              have hlistEq :
-                                  lnirTypeListEq [(lenv.tys xA).getD .objPtr, (lenv.tys xB).getD .objPtr]
-                                    [opTy, opTy] = true := by
-                                dsimp [lnirTypeListEq]; simp [hteq]
-                              rw [hlistEq] at hs; simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte, Functor.map, Option.map] at hs
-                              cases hse : lowerScalarIntrinsicExpr? op vl vr opTy retTy ctx.arch with
-                              | none => rw [hse] at hs; exact nomatch hs
-                              | some se =>
-                                rw [hse] at hs; injection hs with hseEq; subst hseEq
-                                cases hwb : wordBin ctx.arch op opTy retTy va' vb' with
-                                | error _ => rw [hwb] at ho; exact nomatch ho
+          | cons _ r1 => cases r1 with | nil => simp at hlen | cons _ r2 => cases r2 <;> simp at hlen hs
+        | nil =>
+          rw [hlist] at hlen hmap hevalArgs ho hargL
+          cases argVars with
+          | nil => simp at hlen
+          | cons vl r1 =>
+            cases r1 with
+            | nil => simp at hlen
+            | cons vr r2 =>
+              cases r2 with
+              | cons _ _ => simp at hlen
+              | nil =>
+                dsimp only [List.map] at hmap
+                injection hmap with htA hmap2; injection hmap2 with htB _
+                cases a with
+                | type _ => dsimp [lowerRealArgList, lowerRealArg] at hargL; exact nomatch hargL
+                | erased => dsimp [lowerRealArgList, lowerRealArg] at hargL; exact nomatch hargL
+                | fvar xA =>
+                  cases b with
+                  | type _ =>
+                    dsimp [evalArgs, evalArg] at hevalArgs
+                    cases hvx : lenv.vals xA <;>
+                      (rw [hvx] at hevalArgs; exact nomatch hevalArgs)
+                  | erased =>
+                    dsimp [evalArgs, evalArg] at hevalArgs
+                    cases hvx : lenv.vals xA <;>
+                      (rw [hvx] at hevalArgs; exact nomatch hevalArgs)
+                  | fvar xB =>
+                    have htA' : st1.getVarType vl = (lenv.tys xA).getD .objPtr := htA
+                    have htB' : st1.getVarType vr = (lenv.tys xB).getD .objPtr := htB
+                    simp only [List.map, htA', htB'] at hs
+                    dsimp only [evalArgs] at hevalArgs
+                    cases heA : evalArg lenv.vals (.fvar xA) with
+                    | error _ => simp [heA] at hevalArgs
+                    | ok va =>
+                      cases heB : evalArg lenv.vals (.fvar xB) with
+                      | error _ => simp [heA, heB] at hevalArgs
+                      | ok vb =>
+                        simp only [heA, heB] at hevalArgs ho; injection hevalArgs with hvsEq
+                        subst hvsEq
+                        dsimp only [evalVarList] at hvarList
+                        cases hvL : venv vl with
+                        | none => simp [hvL] at hvarList
+                        | some va' =>
+                          cases hvR : venv vr with
+                          | none => simp [hvL, hvR] at hvarList
+                          | some vb' =>
+                            simp only [hvL, hvR] at hvarList; injection hvarList with hvEq
+                            rcases List.cons.inj hvEq with ⟨hva, hvEq2⟩
+                            rcases List.cons.inj hvEq2 with ⟨hvb, _⟩
+                            subst hva; subst hvb
+                            have hgfEq : (ctx.gfSimdIntrinsics.find? (fun (n, _) => n == fn)).map Prod.snd =
+                                ctx.findGfSimd? fn := rfl
+                            rw [hgfEq] at hs
+                            cases hgf : ctx.findGfSimd? fn with
+                            | some gfOp =>
+                              rw [hgf] at hs ho; dsimp only at hs ho
+                              cases hgfTy : (lnirTypeEq retTy .i64 && lnirTypeEq ((lenv.tys xA).getD .objPtr) .i64 &&
+                                  lnirTypeEq ((lenv.tys xB).getD .objPtr) .i64)
+                              · rw [hgfTy] at ho; exact nomatch ho
+                              · rw [hgfTy] at ho; simp only [↓reduceIte] at ho
+                                rcases Bool.and_eq_true_iff.mp hgfTy with ⟨hretA, htBi64⟩
+                                rcases Bool.and_eq_true_iff.mp hretA with ⟨hreti64, htAi64⟩
+                                have hgfCond : (lnirTypeEq retTy .i64 &&
+                                    ([((lenv.tys xA).getD .objPtr), ((lenv.tys xB).getD .objPtr)].isEmpty ||
+                                      lnirTypeListEq [((lenv.tys xA).getD .objPtr), ((lenv.tys xB).getD .objPtr)]
+                                        [.i64, .i64])) = true := by
+                                  dsimp [lnirTypeListEq]; simp [hreti64, htAi64, htBi64]
+                                rw [hgfCond] at hs; simp only [↓reduceIte] at hs
+                                injection hs with hexp; subst hexp
+                                cases hgfev : evalGfSimd gfOp va' vb' with
+                                | error _ => rw [hgfev] at ho; exact nomatch ho
                                 | ok v0 =>
-                                  rw [hwb] at ho; dsimp only [Functor.map, Except.map] at ho
+                                  rw [hgfev] at ho; dsimp only [Functor.map, Except.map] at ho
                                   injection ho with hp2
                                   rcases Prod.mk.inj hp2 with ⟨rfl, hp3⟩
                                   rcases Prod.mk.inj hp3 with ⟨rfl, rfl⟩
-                                  rcases lowerScalarIntrinsicExpr_sound venv ctx.arch op opTy retTy
-                                      vl vr va' vb' se v0 hvL hvR hse hwb with ⟨hevalS, hnv⟩
-                                  exact ⟨evalExpr_scalar venv hst se v0 hevalS, rfl, rfl, rfl, se, rfl, hnv⟩
-                          | none =>
-                            rw [hbin] at hs ho; dsimp only at hs ho
-                            cases hbb : evalBoolBinCall? fn va' vb' ((lenv.tys xA).getD .objPtr) ((lenv.tys xB).getD .objPtr) retTy with
-                            | none => rw [hbb] at ho; exact nomatch ho
-                            | some res =>
-                              rw [hbb] at ho; dsimp only at ho
-                              cases res with
-                              | error _ => exact nomatch ho
-                              | ok v0 =>
-                                dsimp only [Functor.map, Except.map] at ho
-                                injection ho with hp2
-                                rcases Prod.mk.inj hp2 with ⟨rfl, hp3⟩
-                                rcases Prod.mk.inj hp3 with ⟨rfl, rfl⟩
-                                rcases lowerBoolBinIntrinsic_sound venv hst fn vl vr _ _ retTy
-                                    va' vb' expr v0 hvL hvR hs hbb with ⟨he, hse⟩
-                                exact ⟨he, rfl, rfl, rfl, hse⟩
+                                  have hevalS : evalScalarExpr venv (.binOp gfOp (.var vl) (.var vr)) = .ok v0 := by
+                                    rw [evalScalar_binOp venv gfOp (.var vl) (.var vr) va' vb'
+                                      (evalScalar_var venv vl va' hvL) (evalScalar_var venv vr vb' hvR)]
+                                    cases gfOp with
+                                    | clmul64 | clmul64Hi | gf2Affine | eor3 =>
+                                      dsimp [evalGfSimd, evalBinOp] at hgfev ⊢
+                                      cases va' <;> cases vb' <;> first | exact hgfev | exact nomatch hgfev
+                                    | _ => exact nomatch hgfev
+                                  exact ⟨evalExpr_scalar venv hst _ v0 hevalS, rfl, rfl, rfl,
+                                    .binOp gfOp (.var vl) (.var vr), rfl, fun _ h => nomatch h⟩
+                            | none =>
+                              rw [hgf] at hs ho; dsimp only at hs ho
+                              cases hbin : lookupCanonicalTypedBinOp? fn with
+                              | some pairOp =>
+                                rcases pairOp with ⟨opTy, op⟩
+                                rw [hbin] at hs ho; dsimp only at hs ho
+                                cases hteq : (lnirTypeEq ((lenv.tys xA).getD .objPtr) opTy && lnirTypeEq ((lenv.tys xB).getD .objPtr) opTy)
+                                · rw [hteq] at ho; exact nomatch ho
+                                · rw [hteq] at ho; simp only [↓reduceIte] at ho
+                                  have hlistEq :
+                                      lnirTypeListEq [(lenv.tys xA).getD .objPtr, (lenv.tys xB).getD .objPtr]
+                                        [opTy, opTy] = true := by
+                                    dsimp [lnirTypeListEq]; simp [hteq]
+                                  rw [hlistEq] at hs
+                                  simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte, Functor.map, Option.map] at hs
+                                  cases hse : lowerScalarIntrinsicExpr? op vl vr opTy retTy ctx.arch with
+                                  | none => rw [hse] at hs; exact nomatch hs
+                                  | some se =>
+                                    rw [hse] at hs; injection hs with hseEq; subst hseEq
+                                    cases hwb : wordBin ctx.arch op opTy retTy va' vb' with
+                                    | error _ => rw [hwb] at ho; exact nomatch ho
+                                    | ok v0 =>
+                                      rw [hwb] at ho; dsimp only [Functor.map, Except.map] at ho
+                                      injection ho with hp2
+                                      rcases Prod.mk.inj hp2 with ⟨rfl, hp3⟩
+                                      rcases Prod.mk.inj hp3 with ⟨rfl, rfl⟩
+                                      rcases lowerScalarIntrinsicExpr_sound venv ctx.arch op opTy retTy
+                                          vl vr va' vb' se v0 hvL hvR hse hwb with ⟨hevalS, hnv⟩
+                                      exact ⟨evalExpr_scalar venv hst se v0 hevalS, rfl, rfl, rfl, se, rfl, hnv⟩
+                              | none =>
+                                rw [hbin] at hs ho; dsimp only at hs ho
+                                cases hbb : evalBoolBinCall? fn va' vb' ((lenv.tys xA).getD .objPtr) ((lenv.tys xB).getD .objPtr) retTy with
+                                | none => rw [hbb] at ho; exact nomatch ho
+                                | some res =>
+                                  rw [hbb] at ho; dsimp only at ho
+                                  cases res with
+                                  | error _ => exact nomatch ho
+                                  | ok v0 =>
+                                    dsimp only [Functor.map, Except.map] at ho
+                                    injection ho with hp2
+                                    rcases Prod.mk.inj hp2 with ⟨rfl, hp3⟩
+                                    rcases Prod.mk.inj hp3 with ⟨rfl, rfl⟩
+                                    rcases lowerBoolBinIntrinsic_sound venv hst fn vl vr _ _ retTy
+                                        va' vb' expr v0 hvL hvR hs hbb with ⟨he, hse⟩
+                                    exact ⟨he, rfl, rfl, rfl, hse⟩
+  · rw [hloc] at hs; simp at hs
 
 
 end LeanNative.Proofs

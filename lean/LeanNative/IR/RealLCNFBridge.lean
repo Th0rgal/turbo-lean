@@ -292,15 +292,21 @@ def lowerUnaryScalarIntrinsic? (fnName : Lean.Name) (arg : VarId) (argTys : List
 /-- Pure canonical intrinsic lowering (shared verbatim by `Bridge.tryLowerIntrinsicCall`). -/
 def lowerCanonicalIntrinsicPure? (fnName : Lean.Name) (argVars : List VarId)
     (retTy : LNIRType) (argTys : List LNIRType := []) (isLocal : Bool := false)
-    (arch : TargetArch := .x86_64) : Option LNIRExpr :=
+    (arch : TargetArch := .x86_64) (gfSimd : List (Lean.Name × BinOp) := []) : Option LNIRExpr :=
   if isLocal then none
   else match argVars with
   | [lhs, rhs] =>
-    match lookupCanonicalTypedBinOp? fnName with
-    | some (opTy, op) =>
-      if !lnirTypeListEq argTys [opTy, opTy] then none
-      else .scalar <$> lowerScalarIntrinsicExpr? op lhs rhs opTy retTy arch
-    | none => lowerBoolBinIntrinsic? fnName lhs rhs argTys retTy
+    match (gfSimd.find? (fun (n, _) => n == fnName)).map Prod.snd with
+    | some op =>
+      if lnirTypeEq retTy .i64 && (argTys.isEmpty || lnirTypeListEq argTys [.i64, .i64]) then
+        some (.scalar (.binOp op (.var lhs) (.var rhs)))
+      else none
+    | none =>
+      match lookupCanonicalTypedBinOp? fnName with
+      | some (opTy, op) =>
+        if !lnirTypeListEq argTys [opTy, opTy] then none
+        else .scalar <$> lowerScalarIntrinsicExpr? op lhs rhs opTy retTy arch
+      | none => lowerBoolBinIntrinsic? fnName lhs rhs argTys retTy
   | [arg] =>
     match canonicalUIntCastMask? fnName argTys retTy arch with
     | some effMask => some (.scalar (.binOp .bitAnd (.var arg) (.constU64 effMask)))
@@ -411,6 +417,12 @@ structure RealBridgeCtx where
   ctorLayouts      : List (Lean.Name × RcCtorLayoutSpec) := []
   nullaryCtors     : List (Lean.Name × Nat) := []
   tupleStructCtors : List (Lean.Name × Nat) := []
+  ctorSiblings     : List (Lean.Name × Nat × Lean.Name) := []
+  typeOverrides    : List (Lean.Expr × LNIRType) := []
+  paramTypeMap     : List (Lean.FVarId × LNIRType) := []
+  localCallees     : List (Lean.Name × String) := []
+  gfSimdIntrinsics : List (Lean.Name × BinOp) := []
+  knownFVarCtors   : List (Lean.FVarId × Lean.Name) := []
   deriving Inhabited
 
 def RealBridgeCtx.findLayout? (ctx : RealBridgeCtx) (ctorName : Lean.Name) : Option RcCtorLayoutSpec :=
@@ -422,6 +434,31 @@ def RealBridgeCtx.findNullaryCtor? (ctx : RealBridgeCtx) (ctorName : Lean.Name) 
 def RealBridgeCtx.findTupleArity? (ctx : RealBridgeCtx) (ctorName : Lean.Name) : Option Nat :=
   if ctorName == ``Prod.mk || ctorName == ``MProd.mk || ctorName == ``PProd.mk then some 2
   else (ctx.tupleStructCtors.find? (fun (n, _) => n == ctorName)).map Prod.snd
+
+def RealBridgeCtx.findSiblingCtor? (ctx : RealBridgeCtx) (curCtor : Lean.Name) (cidx : Nat) : Option Lean.Name :=
+  (ctx.ctorSiblings.find? (fun (c, i, _) => c == curCtor && i == cidx)).map fun (_, _, n) => n
+
+def RealBridgeCtx.hasSiblingEntry (ctx : RealBridgeCtx) (curCtor : Lean.Name) : Bool :=
+  ctx.ctorSiblings.any (fun (c, _, _) => c == curCtor)
+
+def RealBridgeCtx.findLocalCallee? (ctx : RealBridgeCtx) (fnName : Lean.Name) : Option String :=
+  (ctx.localCallees.find? (fun (n, _) => n == fnName)).map Prod.snd
+
+def RealBridgeCtx.findGfSimd? (ctx : RealBridgeCtx) (fnName : Lean.Name) : Option BinOp :=
+  (ctx.gfSimdIntrinsics.find? (fun (n, _) => n == fnName)).map Prod.snd
+
+def RealBridgeCtx.findKnownFVarCtor? (ctx : RealBridgeCtx) (fvarId : Lean.FVarId) : Option Lean.Name :=
+  (ctx.knownFVarCtors.find? (fun (f, _) => f == fvarId)).map Prod.snd
+
+def lowerGroundImpureTypeWith (ctx : RealBridgeCtx) (e : Lean.Expr) : LNIRType :=
+  match ctx.typeOverrides.find? (fun (ex, _) => ex == e) with
+  | some (_, ty) => ty
+  | none => lowerGroundImpureType e
+
+def RealBridgeCtx.lowerParamType (ctx : RealBridgeCtx) (p : Lean.Compiler.LCNF.Param .impure) : LNIRType :=
+  match ctx.paramTypeMap.find? (fun (f, _) => f == p.fvarId) with
+  | some (_, ty) => ty
+  | none => lowerGroundImpureTypeWith ctx p.type
 
 /-- Pure deterministic state for lowering real `Lean.Compiler.LCNF.Code .impure` to `LNIRCode`.
     Uses association lists so proofs over variable interning and fresh SSA allocation are elementary. -/
@@ -455,6 +492,14 @@ def setVarType (st : RealBridgeState) (vid : VarId) (ty : LNIRType) : RealBridge
 
 def setActiveCtor (st : RealBridgeState) (vid : VarId) (ctorName : Lean.Name) : RealBridgeState :=
   { st with activeCtor := (vid, ctorName) :: st.activeCtor.filter (fun (v, _) => v != vid) }
+
+def setActiveCtorOpt (st : RealBridgeState) (vid : VarId) : Option Lean.Name → RealBridgeState
+  | some ctorName => st.setActiveCtor vid ctorName
+  | none => { st with activeCtor := st.activeCtor.filter (fun (v, _) => v != vid) }
+
+def resolveHeapCtor? (ctx : RealBridgeCtx) (st : RealBridgeState) (vid : VarId) (fvarId : Lean.FVarId) :
+    Option Lean.Name :=
+  st.getActiveCtor? vid <|> ctx.findKnownFVarCtor? fvarId
 
 def setJpDecl (st : RealBridgeState) (fvarId : Lean.FVarId)
     (params : List (Lean.Compiler.LCNF.Param .impure)) (code : Lean.Compiler.LCNF.Code .impure) :
@@ -595,7 +640,7 @@ def lowerImpureLetValuePure (ctx : RealBridgeCtx) (st : RealBridgeState)
     | vt =>
       if !(ctx.allowStage1DHeap && isHeapPtrType vt) then
         throw s!"[lean-native] Unsupported scalar projection on `{reprStr vt}` in Stage 1B"
-      let some cname := st.getActiveCtor? v
+      let some cname := st.resolveHeapCtor? ctx v fvarId
         | throw "[lean-native] Unsupported scalar projection: constructor of the heap object is not statically known (C1.2)"
       let some spec := ctx.findLayout? cname
         | throw s!"[lean-native] Unknown constructor layout `{cname}`"
@@ -609,7 +654,7 @@ def lowerImpureLetValuePure (ctx : RealBridgeCtx) (st : RealBridgeState)
     | vt =>
       if !(ctx.allowStage1DHeap && isHeapPtrType vt) then
         throw s!"[lean-native] Unsupported scalar projection on `{reprStr vt}` in Stage 1B"
-      let some cname := st.getActiveCtor? v
+      let some cname := st.resolveHeapCtor? ctx v fvarId
         | throw "[lean-native] Unsupported scalar projection: constructor of the heap object is not statically known (C1.2)"
       let some spec := ctx.findLayout? cname
         | throw s!"[lean-native] Unknown constructor layout `{cname}`"
@@ -619,9 +664,10 @@ def lowerImpureLetValuePure (ctx : RealBridgeCtx) (st : RealBridgeState)
         throw s!"[lean-native] Scalar projection type `{reprStr retTy}` ≠ slot type `{reprStr ty}` of `{cname}` (C1.2)"
       return (.ctorGetScalar v slot ty, st)
   | .fap fnName args _ =>
+    let isLocal := (ctx.findLocalCallee? fnName).isSome
     let (argVars, st1) ← lowerRealArgList ctx st false args.toList
     let argTys := argVars.map st1.getVarType
-    match lowerCanonicalIntrinsicPure? fnName argVars retTy argTys false ctx.arch with
+    match lowerCanonicalIntrinsicPure? fnName argVars retTy argTys isLocal ctx.arch ctx.gfSimdIntrinsics with
     | some intr => return (intr, st1)
     | none => throw s!"[lean-native] Unsupported external or non-scalar call `{fnName}` in Stage 1B"
   | .pap fnName _ _ =>
@@ -696,22 +742,58 @@ def hasJmpToPure (fuel : Nat) (targetFVar : Lean.FVarId)
       | .cases c => hasJmpToPure fuel targetFVar (.inr c.alts.toList)
       | .return _ | .unreach _ => false
 
-/-- Allocate fresh SSA variables for a join-point call site, returning `(paramFVar, freshVid, pTy, argVid)` tuples. -/
+/-- Allocate fresh zero-initialized SSA variables for C1.2 scalar slots (`lowerRcCtorWithScalarsPure`). -/
+def allocZeroScalarSlotsPure (st : RealBridgeState) :
+    List (Option Nat × LNIRType) → List (VarId × LNIRType) × RealBridgeState
+  | [] => ([], st)
+  | (_, ty) :: rest =>
+    let (z, st1) := st.freshVar ty
+    let (zs, st2) := allocZeroScalarSlotsPure st1 rest
+    ((z, ty) :: zs, st2)
+
+def wrapZeroScalarSlotsPure : List (VarId × LNIRType) → LNIRCode → LNIRCode
+  | [], body => body
+  | (z, ty) :: rest, body => .letBind z ty (.scalar (.constU64 0)) (wrapZeroScalarSlotsPure rest body)
+
+/-- Lower runtime/erased call arguments for local `.fap` helper calls. -/
+def lowerCallArgsWithErasedPure (ctx : RealBridgeCtx) (st : RealBridgeState) :
+    List (Lean.Compiler.LCNF.Arg .impure) →
+    Except String (List VarId × List (VarId × LNIRType) × RealBridgeState)
+  | [] => .ok ([], [], st)
+  | a :: rest =>
+    match a with
+    | .erased | .type .. => do
+      let (zv, st1) := st.freshVar .unit
+      let (vs, zs, st2) ← lowerCallArgsWithErasedPure ctx st1 rest
+      return (zv :: vs, (zv, .unit) :: zs, st2)
+    | _ => do
+      let (v, st1) ← lowerRealArg ctx st a true
+      let (vs, zs, st2) ← lowerCallArgsWithErasedPure ctx st1 rest
+      return (v :: vs, zs, st2)
+
+/-- Allocate fresh SSA variables for a join-point call site, returning `(paramFVar, freshVid, pTy, argVid?)` tuples. -/
 def bindJpCallArgsPure (ctx : RealBridgeCtx) (st : RealBridgeState) :
     List (Lean.Compiler.LCNF.Param .impure) → List (Lean.Compiler.LCNF.Arg .impure) →
-    Except String (List (Lean.FVarId × VarId × LNIRType × VarId) × RealBridgeState)
+    Except String (List (Lean.FVarId × VarId × LNIRType × Option VarId) × RealBridgeState)
   | [], [] => .ok ([], st)
   | p :: ps, a :: as_ => do
-    let pTy := lowerGroundImpureType p.type
-    let (argVid, st1) ← lowerRealArg ctx st a true
+    let rawPTy := lowerGroundImpureTypeWith ctx p.type
+    let (argVid?, st1) ← match a with
+      | .erased | .type .. => .ok ((none : Option VarId), st)
+      | _ => (lowerRealArg ctx st a true).map fun (v, s1) => (some v, s1)
+    let pTy := match argVid? with
+      | some v =>
+        let vt := st1.getVarType v
+        if isUnboxedScalarOrTuple vt && isHeapPtrType rawPTy then vt else rawPTy
+      | none => if !ctx.allowStage1DHeap && isHeapPtrType rawPTy then .i64 else rawPTy
     let (freshVid, st2) := st1.freshVar pTy
     let (rest, st3) ← bindJpCallArgsPure ctx st2 ps as_
-    return ((p.fvarId, freshVid, pTy, argVid) :: rest, st3)
+    return ((p.fvarId, freshVid, pTy, argVid?) :: rest, st3)
   | _, _ => .error "[lean-native] join point arity mismatch"
 
 /-- Apply `(paramFVar ↦ freshVid)` overrides in `RealBridgeState.fvarMap` (clearing stale `activeCtor` on `freshVid`). -/
 def applyJpParamMapPure (st : RealBridgeState) :
-    List (Lean.FVarId × VarId × LNIRType × VarId) → RealBridgeState
+    List (Lean.FVarId × VarId × LNIRType × Option VarId) → RealBridgeState
   | [] => st
   | (fvarId, freshVid, pTy, _) :: rest =>
     let st1 := { (st.setVarType freshVid pTy) with
@@ -719,11 +801,13 @@ def applyJpParamMapPure (st : RealBridgeState) :
       activeCtor := st.activeCtor.filter (fun (v, _) => v != freshVid) }
     applyJpParamMapPure st1 rest
 
-/-- Prepend `let freshVid : pTy := argVid` bindings before a lowered join-point body. -/
-def wrapJpCallBindsPure : List (Lean.FVarId × VarId × LNIRType × VarId) → LNIRCode → LNIRCode
+/-- Prepend `let freshVid : pTy := argVid` (or `0` for `.erased`/`.type`) bindings before a lowered join-point body. -/
+def wrapJpCallBindsPure : List (Lean.FVarId × VarId × LNIRType × Option VarId) → LNIRCode → LNIRCode
   | [], body => body
-  | (_, freshVid, pTy, argVid) :: rest, body =>
+  | (_, freshVid, pTy, some argVid) :: rest, body =>
     .letBind freshVid pTy (.scalar (.var argVid)) (wrapJpCallBindsPure rest body)
+  | (_, freshVid, pTy, none) :: rest, body =>
+    .letBind freshVid pTy (.scalar (.constU64 0)) (wrapJpCallBindsPure rest body)
 
 /-- Single-`def` fuel-bounded lowering of real `Lean.Compiler.LCNF.Code .impure` and `Alt .impure` lists
     (mode `Sum`: `Sum.inl code` lowers a code block; `Sum.inr (condVar, isBool, idx, discr?, alts)` lowers
@@ -793,22 +877,58 @@ def lowerImpureStepPure (fuel : Nat) (ctx : RealBridgeCtx) (st : RealBridgeState
     | .inl code =>
       match code with
       | .let decl k => do
-        let rawDeclTy := lowerGroundImpureType decl.type
-        let (rhs, st1) ← lowerImpureLetValuePure ctx st decl.value rawDeclTy
-        let isBox := match decl.value with | .box _ _ _ => true | _ => false
-        let ty := inferImpureRhsTypePure st1 rhs rawDeclTy isBox
-        let (dst, st2) := st1.allocFreshFVar decl.fvarId ty
-        let st2' := match decl.value with
-          | .ctor info _ _ => if lnirTypeEq ty .objPtr then st2.setActiveCtor dst info.name else st2
-          | _ => st2
-        match rhs with
-        | .isExclusive _ =>
-          let (exclVar, st3) := st2'.freshVar .i1
-          let (kCode, st4) ← lowerImpureStepPure fuel ctx st3 (.inl k)
-          return (.letBind exclVar .i1 rhs (.letBind dst .i1 (.scalar (.unaryOp .not (.var exclVar))) kCode), st4)
+        let rawDeclTy := lowerGroundImpureTypeWith ctx decl.type
+        match decl.value with
+        | .ctor info args _ =>
+          if ctx.allowStage1DHeap && (info.usize > 0 || info.ssize > 0) then
+            let some spec := ctx.findLayout? info.name
+              | throw s!"[lean-native] Unknown constructor layout `{info.name}`"
+            if args.size != spec.objSlots then
+              throw s!"[lean-native] Ctor `{info.name}` expected {spec.objSlots} object args, got {args.size}"
+            let (objVars, st1) ← lowerRealArgList ctx st true args.toList
+            let objTys := objVars.map st1.getVarType
+            if !(objTys.all fun t => isSupportedStage1BScalarOrTuple t ctx.arch || isHeapPtrType t) then
+              throw s!"[lean-native] Unsupported object field type in `{info.name}`"
+            let (zeros, stZ) := allocZeroScalarSlotsPure st1 spec.scalarSlots
+            let (dst, st2) := stZ.allocFreshFVar decl.fvarId .objPtr
+            let st2' := st2.setActiveCtor dst info.name
+            let (kCode, st3) ← lowerImpureStepPure fuel ctx st2' (.inl k)
+            return (wrapZeroScalarSlotsPure zeros
+              (.letBind dst .objPtr (.allocCtor spec.cidx objVars (zeros.map Prod.fst)) kCode), st3)
+          else
+            let (rhs, st1) ← lowerImpureLetValuePure ctx st decl.value rawDeclTy
+            let ty := inferImpureRhsTypePure st1 rhs rawDeclTy false
+            let (dst, st2) := st1.allocFreshFVar decl.fvarId ty
+            let st2' := if lnirTypeEq ty .objPtr then st2.setActiveCtor dst info.name else st2
+            let (kCode, st3) ← lowerImpureStepPure fuel ctx st2' (.inl k)
+            return (.letBind dst ty rhs kCode, st3)
+        | .fap fnName args _ =>
+          match ctx.findLocalCallee? fnName with
+          | some sym =>
+            let (argVars, zeroBinds, st1) ← lowerCallArgsWithErasedPure ctx st args.toList
+            let (dst, st2) := st1.allocFreshFVar decl.fvarId rawDeclTy
+            let (kCode, st3) ← lowerImpureStepPure fuel ctx st2 (.inl k)
+            return (wrapZeroScalarSlotsPure zeroBinds
+              (.letBind dst rawDeclTy (.call sym argVars rawDeclTy false) kCode), st3)
+          | none =>
+            let (rhs, st1) ← lowerImpureLetValuePure ctx st decl.value rawDeclTy
+            let ty := inferImpureRhsTypePure st1 rhs rawDeclTy false
+            let (dst, st2) := st1.allocFreshFVar decl.fvarId ty
+            let (kCode, st3) ← lowerImpureStepPure fuel ctx st2 (.inl k)
+            return (.letBind dst ty rhs kCode, st3)
         | _ =>
-          let (kCode, st3) ← lowerImpureStepPure fuel ctx st2' (.inl k)
-          return (.letBind dst ty rhs kCode, st3)
+          let (rhs, st1) ← lowerImpureLetValuePure ctx st decl.value rawDeclTy
+          let isBox := match decl.value with | .box _ _ _ => true | _ => false
+          let ty := inferImpureRhsTypePure st1 rhs rawDeclTy isBox
+          let (dst, st2) := st1.allocFreshFVar decl.fvarId ty
+          match rhs with
+          | .isExclusive _ =>
+            let (exclVar, st3) := st2.freshVar .i1
+            let (kCode, st4) ← lowerImpureStepPure fuel ctx st3 (.inl k)
+            return (.letBind exclVar .i1 rhs (.letBind dst .i1 (.scalar (.unaryOp .not (.var exclVar))) kCode), st4)
+          | _ =>
+            let (kCode, st3) ← lowerImpureStepPure fuel ctx st2 (.inl k)
+            return (.letBind dst ty rhs kCode, st3)
       | .inc fvarId n _ _ k _ => do
         let v ← st.lookupBoundFVar fvarId
         let vt := st.getVarType v
@@ -837,7 +957,16 @@ def lowerImpureStepPure (fuel : Nat) (ctx : RealBridgeCtx) (st : RealBridgeState
         let vt := st.getVarType objVid
         if !(ctx.allowStage1DHeap && isHeapPtrType vt) then
           throw "[lean-native] unsupported constructor tag mutation"
-        let (tagVid, st2) := st.freshVar .i64
+        let nextCtor? ← match st.resolveHeapCtor? ctx objVid fvarId with
+          | some cur =>
+            if ctx.hasSiblingEntry cur then
+              match ctx.findSiblingCtor? cur cidx with
+              | some nextC => .ok (some nextC)
+              | none => .error s!"[lean-native] setTag {cidx} out of range for `{cur}`"
+            else .ok none
+          | none => .ok none
+        let st1 := st.setActiveCtorOpt objVid nextCtor?
+        let (tagVid, st2) := st1.freshVar .i64
         let (unitVid, st3) := st2.freshVar .unit
         let (kCode, st4) ← lowerImpureStepPure fuel ctx st3 (.inl k)
         return (.letBind tagVid .i64 (.scalar (.constU64 cidx.toUInt64))
@@ -861,7 +990,7 @@ def lowerImpureStepPure (fuel : Nat) (ctx : RealBridgeCtx) (st : RealBridgeState
         let objTy := st.getVarType objVid
         if isUnboxedScalarOrTuple objTy || !ctx.allowStage1DHeap || !isHeapPtrType objTy then
           throw "[lean-native] Unsupported heap field mutation in Stage 1B"
-        let some cname := st.getActiveCtor? objVid
+        let some cname := st.resolveHeapCtor? ctx objVid fvarId
           | throw "[lean-native] Unsupported scalar field mutation: constructor of the heap object is not statically known (C1.2)"
         let some spec := ctx.findLayout? cname
           | throw s!"[lean-native] Unknown constructor layout `{cname}`"
@@ -878,7 +1007,7 @@ def lowerImpureStepPure (fuel : Nat) (ctx : RealBridgeCtx) (st : RealBridgeState
         let objTy := st.getVarType objVid
         if isUnboxedScalarOrTuple objTy || !ctx.allowStage1DHeap || !isHeapPtrType objTy then
           throw "[lean-native] Unsupported heap field mutation in Stage 1B"
-        let some cname := st.getActiveCtor? objVid
+        let some cname := st.resolveHeapCtor? ctx objVid fvarId
           | throw "[lean-native] Unsupported scalar field mutation: constructor of the heap object is not statically known (C1.2)"
         let some spec := ctx.findLayout? cname
           | throw s!"[lean-native] Unknown constructor layout `{cname}`"
@@ -894,7 +1023,7 @@ def lowerImpureStepPure (fuel : Nat) (ctx : RealBridgeCtx) (st : RealBridgeState
         let condVar ← st.lookupBoundFVar c.discr
         let condTy := st.getVarType condVar
         let ordered := orderAltsPure c.alts.toList
-        if ctx.allowStage1DHeap && c.typeName != ``Bool && isHeapPtrType condTy then
+        if (ctx.allowStage1DHeap || c.typeName == ``Bool) && isHeapPtrType condTy then
           let (tagVar, st2) := st.freshVar .i64
           let (altsCode, st3) ← lowerImpureStepPure fuel ctx st2 (.inr (tagVar, false, 0, some c.discr, ordered))
           return (.letBind tagVar .i64 (.call "lean_native_ctor_tag" [condVar] .i64 false) altsCode, st3)
@@ -932,15 +1061,27 @@ def lowerRealLCNFCode (fuel : Nat) (ctx : RealBridgeCtx) (st : RealBridgeState)
     (code : Lean.Compiler.LCNF.Code .impure) : Except String (LNIRCode × RealBridgeState) :=
   lowerImpureStepPure fuel ctx st (.inl code)
 
+/-- Infer the returned LNIRType of a lowered `LNIRCode` block when a `.tuple` is returned. -/
+def inferReturnedTypePure : Nat → LNIRCode → Option LNIRType
+  | 0, _ => none
+  | _ + 1, .letBind dst ty _ (.ret rv) => if dst == rv then some ty else none
+  | fuel + 1, .letBind _ _ _ k => inferReturnedTypePure fuel k
+  | fuel + 1, .rawStore _ _ _ _ k => inferReturnedTypePure fuel k
+  | fuel + 1, .incRef _ _ k => inferReturnedTypePure fuel k
+  | fuel + 1, .decRef _ _ k => inferReturnedTypePure fuel k
+  | fuel + 1, .parFor _ _ _ _ _ k => inferReturnedTypePure fuel k
+  | fuel + 1, .ite _ t e => inferReturnedTypePure fuel t <|> inferReturnedTypePure fuel e
+  | _, _ => none
+
 /-- Intern parameter list of a real `Lean.Compiler.LCNF.Decl .impure` left-to-right. -/
-def internRealParams (st : RealBridgeState) :
+def internRealParams (ctx : RealBridgeCtx) (st : RealBridgeState) :
     List (Lean.Compiler.LCNF.Param .impure) → List LNIRParam × RealBridgeState
   | [] => ([], st)
   | p :: ps =>
-    let pTy := lowerGroundImpureType p.type
+    let pTy := ctx.lowerParamType p
     let (vid, st1) := st.internFVar p.fvarId pTy true
     let param : LNIRParam := { id := vid, name := p.binderName.toString, ty := pTy, borrow := p.borrow }
-    let (rest, st2) := internRealParams st1 ps
+    let (rest, st2) := internRealParams ctx st1 ps
     (param :: rest, st2)
 
 /-- Lower a real `Lean.Compiler.LCNF.Decl .impure` in pure `RealBridgeState` (`lowerRealDecl`). -/
@@ -950,16 +1091,19 @@ def lowerRealLCNFDecl (fuel : Nat) (ctx : RealBridgeCtx) (decl : Lean.Compiler.L
   | .extern _ =>
     throw s!"[lean-native] Unsupported `@[extern]` declaration `{decl.name}` in Stage 1B"
   | .code c =>
-    let (lnirParams, stParams) := internRealParams {} decl.params.toList
-    let retTy := lowerGroundImpureType decl.type
+    let (lnirParams, stParams) := internRealParams ctx {} decl.params.toList
+    let retTy := lowerGroundImpureTypeWith ctx decl.type
     let (body, _) ← lowerRealLCNFCode fuel ctx stParams c
+    let effRetTy := match inferReturnedTypePure (fuel + 16) body with
+      | some (.tuple fs) => .tuple fs
+      | _ => retTy
     return {
       name := mangledName
       params := lnirParams
-      retTy := retTy
+      retTy := effRetTy
       body := body
       assurance := .tested
-      isGpuCand := lnirParams.all (fun p => p.ty.isGpuCompatible) && retTy.isGpuCompatible
+      isGpuCand := lnirParams.all (fun p => p.ty.isGpuCompatible) && effRetTy.isGpuCompatible
     }
 
 end LeanNative.IR.RealLCNFBridge
