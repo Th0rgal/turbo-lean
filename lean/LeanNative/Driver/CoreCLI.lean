@@ -23,6 +23,8 @@ import LeanNative.Backend.MLIRGPU
 import LeanNative.Backend.Metal
 import LeanNative.Backend.Hybrid
 import LeanNative.Backend.FastCheck
+import LeanNative.Backend.GPUEmitVerify
+import LeanNative.Backend.LLVMEmitVerify
 import LeanNative.Driver.Worker
 import LeanNative.Driver.CAbiEmit
 import LeanNative.Driver.EvalBatch
@@ -806,6 +808,8 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
     tvReport.allPassed && superoptOk && pluginsOk && law5Ok &&
     fcPropOk && fcNaiveVacuousOk && relSamplingOk && gpuHeadroomOk &&
     metalValid && fcMetalValid && blake3Ok && tpuCodegenOk && mulDivOk && telOk && axiomOk && slotTypeRegressionOk &&
+    LeanNative.Backend.GPUEmitVerify.verifyGPUEmitters &&
+    LeanNative.Backend.LLVMEmitVerify.verifyLLVMEmitter &&
     llvmX86.length > 500 && ptxTxt.length > 500 && fcLlvm.length > 200 && fcPtx.length > 200
   if allOk then
     IO.println s!"=== ALL {tag.toUpper} v0.5.0 SELF-TESTS PASSED ==="

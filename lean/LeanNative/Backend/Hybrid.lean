@@ -908,7 +908,7 @@ def declMetalBindingSpec (d : LNIRDecl) : MetalKernelBindingSpec :=
     match extractParForRegions d.body with
     | [(_, _, _, .i64, .saxpy _)] =>
       { kernelName := fnName, inputBufferNames := ["x", "y"], outputBufferName := "out", lenParamName := "n", elemBytes := 8 }
-    | [(_, _, _, .i64, .mapScaleAdd _ _)] =>
+    | [(_, _, _, .i64, .mapScaleAdd _ _)] | [(_, _, _, .i64, .stencil1D3Pt _ _ _)] =>
       { kernelName := fnName, inputBufferNames := ["in0"], outputBufferName := "out", lenParamName := "n", elemBytes := 8 }
     | [(_, _, _, .i64, .zipAdd)] | [(_, _, _, .i64, .zipMul)] =>
       { kernelName := fnName, inputBufferNames := ["in0", "in1"], outputBufferName := "out", lenParamName := "n", elemBytes := 8 }

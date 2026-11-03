@@ -1,11 +1,15 @@
 import LeanNative.IR.Types
 import LeanNative.IR.AST
 import LeanNative.Backend.GPUIR
+import LeanNative.Backend.MetalAst
+import LeanNative.Backend.MetalLower
 
 namespace LeanNative.Backend.Metal
 
 open LeanNative.IR
 open LeanNative.Backend.GPUIR
+open LeanNative.Backend.MetalAst
+open LeanNative.Backend.MetalLower
 
 /-- Convert an `LNIRType` into an Apple Metal Shading Language (MSL 3.0) type string. -/
 def toMSLType : LNIRType → String
@@ -126,7 +130,7 @@ def emitMetalMatMulTiledKernel (fnName : String) : String :=
     "    if (row < dim && col < dim) {\n        C[row * dim + col] = acc;\n    }\n}"
   ]
 
-partial def emitMetalScalarExpr (e : ScalarExpr) : String :=
+def emitMetalScalarExpr (e : ScalarExpr) : String :=
   match e with
   | .constU64 v => s!"{v}UL"
   | .constBool b => if b then "1UL" else "0UL"
@@ -164,7 +168,7 @@ partial def emitMetalScalarExpr (e : ScalarExpr) : String :=
   | .fma a b c =>
     s!"(({emitMetalScalarExpr a}) * ({emitMetalScalarExpr b}) + ({emitMetalScalarExpr c}))"
 
-partial def emitMetalCodeBody (c : LNIRCode) (indent : String := "    ") : Option String :=
+def emitMetalCodeBody (c : LNIRCode) (indent : String := "    ") : Option String :=
   match c with
   | .letBind dst _ (.scalar e) k => do
     let rest ← emitMetalCodeBody k indent
@@ -200,15 +204,19 @@ def emitMetalDeclKernel (d : LNIRDecl) : Option String :=
   else
     match extractParForRegions d.body with
     | [(_, _, _, .i64, .saxpy alpha)] =>
-      some (emitMetal1DKernel fnName ["device const ulong* x", "device const ulong* y", "device ulong* out", "constant ulong& n"] s!"out[gid] = {alpha}UL * x[gid] + y[gid];")
+      some (ppMSLKernel (lowerSaxpyNamed fnName alpha))
     | [(_, _, _, .i64, .mapScaleAdd scale bias)] =>
-      some (emitMetal1DKernel fnName ["device const ulong* in0", "device ulong* out", "constant ulong& n"] s!"out[gid] = in0[gid] * {scale}UL + {bias}UL;")
+      some (ppMSLKernel (lowerKind fnName (.mapScaleAdd scale bias)))
     | [(_, _, _, .i64, .zipAdd)] =>
-      some (emitMetal1DKernel fnName ["device const ulong* in0", "device const ulong* in1", "device ulong* out", "constant ulong& n"] "out[gid] = in0[gid] + in1[gid];")
+      some (ppMSLKernel (lowerKind fnName .zipAdd))
     | [(_, _, _, .i64, .zipMul)] =>
-      some (emitMetal1DKernel fnName ["device const ulong* in0", "device const ulong* in1", "device ulong* out", "constant ulong& n"] "out[gid] = in0[gid] * in1[gid];")
+      some (ppMSLKernel (lowerKind fnName .zipMul))
+    | [(_, _, _, .i64, .stencil1D3Pt wl wc wr)] =>
+      some (ppMSLKernel (lowerKind fnName (.stencil1D3Pt wl wc wr)))
     | _ =>
-      if d.retTy == .i64 && !d.params.isEmpty && d.params.all (fun p => p.ty == .i64) && !(d.name.endsWith "___boxed") then
+      let isI64Ty : LNIRType → Bool | .i64 => true | _ => false
+      if isI64Ty d.retTy && !d.params.isEmpty && d.params.all (fun p => isI64Ty p.ty) &&
+          (d.name.toList.reverse.take 8 != "___boxed".toList.reverse) then
         match emitMetalCodeBody d.body "    " with
         | some bodyStr =>
           let paramSig := String.intercalate ", " (d.params.map fun p => s!"ulong v{p.id}")

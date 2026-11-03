@@ -29,6 +29,14 @@ import LeanNative.Proofs.SliceViewProofs
 import LeanNative.Proofs.HeapObjAbiProofs
 import LeanNative.Proofs.LLVMLowerProofs
 import LeanNative.Proofs.StableHLOLowerProofs
+import LeanNative.Proofs.PTXLowerProofs
+import LeanNative.Proofs.PTXMutantProofs
+import LeanNative.Proofs.PTXDeclProofs
+import LeanNative.Proofs.MetalLowerSpec
+import LeanNative.Proofs.MetalLowerProofs
+import LeanNative.Proofs.MetalMutantProofs
+import LeanNative.Proofs.MetalDeclProofs
+import LeanNative.Proofs.GPUEmitterMutantProofs
 import LeanNative.Backend.LLVMAst
 import LeanNative.Backend.PTXAst
 import LeanNative.Backend.MetalAst
@@ -333,6 +341,26 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.hlo_mutant_h1_killed
   , ``LeanNative.Proofs.hlo_mutant_h2_killed
   , ``LeanNative.Proofs.hlo_mutant_h3_killed
+  , ``LeanNative.Proofs.PTXLowerProofs.lowerToPTX_evalPTXKernel_sound
+  , ``LeanNative.Proofs.PTXMutantProofs.lowerToPTX_nonvacuous
+  , ``LeanNative.Proofs.PTXMutantProofs.ptx_mutant_m7_killed
+  , ``LeanNative.Proofs.PTXMutantProofs.ptx_mutant_m8_killed
+  , ``LeanNative.Proofs.PTXDeclProofs.lowerToPTX_sound
+  , ``LeanNative.Proofs.PTXDeclProofs.lowerToPTX_decl_nonvacuous
+  , ``LeanNative.Proofs.MetalLowerProofs.lowerScalar_inferExprType
+  , ``LeanNative.Proofs.MetalLowerProofs.lowerScalar_eval_sound
+  , ``LeanNative.Proofs.MetalLowerProofs.lowerToMetal_evalMSLKernel_sound
+  , ``LeanNative.Proofs.MetalMutantProofs.lowerToMetal_nonvacuous
+  , ``LeanNative.Proofs.MetalMutantProofs.metal_mutant_m9_killed
+  , ``LeanNative.Proofs.MetalMutantProofs.metal_mutant_m10_killed
+  , ``LeanNative.Proofs.MetalDeclProofs.lowerToMetal_sound
+  , ``LeanNative.Proofs.MetalDeclProofs.lowerToMetal_decl_nonvacuous
+  , ``LeanNative.Proofs.GPUEmitterMutantProofs.kill_emitter_mutant_M6
+  , ``LeanNative.Proofs.GPUEmitterMutantProofs.kill_emitter_mutant_M7
+  , ``LeanNative.Proofs.GPUEmitterMutantProofs.kill_emitter_mutant_M8
+  , ``LeanNative.Proofs.GPUEmitterMutantProofs.kill_emitter_mutant_M9
+  , ``LeanNative.Proofs.GPUEmitterMutantProofs.kill_emitter_mutant_M10
+  , ``LeanNative.Proofs.GPUEmitterMutantProofs.production_decl_emitters_wired
   , ``LeanNative.Proofs.normSymBinOpStep_u64_denotes, ``LeanNative.Proofs.normSymExpr_pureU64_denotes
   , ``LeanNative.Proofs.symEvalScalarRes_pureU64_sound
   , ``LeanNative.Proofs.symExecCode_pureU64_denotes, ``LeanNative.Proofs.symExecCode_pureU64_eval_eq

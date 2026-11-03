@@ -8,6 +8,7 @@ import TurboLean.Spec
 import LeanNative.Spec
 import LeanNative.Backend.Metal
 import LeanNative.Backend.Hybrid
+import LeanNative.Backend.GPUEmitVerify
 
 namespace TurboLean.Orchestrator
 
@@ -281,7 +282,8 @@ def runSelfTest : IO UInt32 := do
     contractsOk
   let parCexOk := parCexResults.size == 4 && parCexResults.all id && !microResults.isEmpty && microResults.all id &&
     !tensorResults.isEmpty && tensorResults.all id &&
-    modCacheOk && routeGpuOk && glueHasObjcDispatch
+    modCacheOk && routeGpuOk && glueHasObjcDispatch &&
+    LeanNative.Backend.GPUEmitVerify.verifyGPUEmitters
   if allModulesOk && shardsOk && storeOk && parCexOk then
     IO.println s!"TURBO_LEAN_NATIVE_SELF_TEST_OK waves={waves.size} modules={waveResults.size} chunks={chunkCount} cas_verified={storeOk} cex_certified={parCexOk}"
     return 0

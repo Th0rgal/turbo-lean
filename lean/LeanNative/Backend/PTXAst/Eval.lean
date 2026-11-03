@@ -58,7 +58,7 @@ def setAssoc {α : Type} (xs : List (String × α)) (k : String) (v : α) :
   | (k', v') :: rest =>
     if k' == k then (k, v) :: rest else (k', v') :: setAssoc rest k v
 
-private def expandSingleRegDecl (d : PTXRegDecl) : List (String × PTXType) :=
+def expandSingleRegDecl (d : PTXRegDecl) : List (String × PTXType) :=
   if d.count == 0 then
     [(d.prefixName, d.ty)]
   else
@@ -105,7 +105,7 @@ def zeros (numBytes : Nat) : ByteMemory :=
 def size (m : ByteMemory) : Nat :=
   m.bytes.size
 
-private def readLittleEndianAux (m : ByteMemory) (addr : Nat) : Nat → Option (BitVec 64)
+def readLittleEndianAux (m : ByteMemory) (addr : Nat) : Nat → Option (BitVec 64)
   | 0 => some 0#64
   | k + 1 =>
     match m.bytes[addr + k]?, readLittleEndianAux m addr k with
@@ -122,7 +122,7 @@ def loadBits (m : ByteMemory) (addr : Nat) (width : Nat) : Option (BitVec 64) :=
   else
     none
 
-private def writeLittleEndianAux (bs : Array UInt8) (addr : Nat) (val : BitVec 64) : Nat → Array UInt8
+def writeLittleEndianAux (bs : Array UInt8) (addr : Nat) (val : BitVec 64) : Nat → Array UInt8
   | 0 => bs
   | k + 1 =>
     let byteVal : UInt8 := UInt8.ofNat ((val >>> (k * 8)).toNat % 256)
@@ -136,7 +136,7 @@ def storeBits (m : ByteMemory) (addr : Nat) (width : Nat) (val : BitVec 64) : Op
   else
     none
 
-private def fillU64Words (bs : Array UInt8) (idx : Nat) : List (BitVec 64) → Array UInt8
+def fillU64Words (bs : Array UInt8) (idx : Nat) : List (BitVec 64) → Array UInt8
   | [] => bs
   | w :: rest => fillU64Words (writeLittleEndianAux bs (idx * 8) w 8) (idx + 1) rest
 
@@ -1543,7 +1543,7 @@ def findCrossCTARace? (prior : List MemAccessLog) (entry : MemAccessLog) : Optio
     else
       findCrossCTARace? rest entry
 
-private def checkCrossCTAGlobalLog (prior : List MemAccessLog) :
+def checkCrossCTAGlobalLog (prior : List MemAccessLog) :
     List MemAccessLog → PTXOutcome Unit
   | [] => .ok ()
   | entry :: rest =>
@@ -1580,7 +1580,7 @@ def runCTAWithGlobalLog (fuel : Nat) (stmts : List PTXStmt) (cta : PTXCTAState)
       else
         runCTAWithGlobalLog f stmts cta' saved'
 
-private def evalPTXKernelLoop (fuelPerCTA : Nat) (k : PTXKernel) (gridDim blockDim : Dim3)
+def evalPTXKernelLoop (fuelPerCTA : Nat) (k : PTXKernel) (gridDim blockDim : Dim3)
     (paramMem : ParamMemory) (constMem : ByteMemory) (gMem : ByteMemory)
     (priorGlobalLog : List MemAccessLog) :
     List Dim3 → PTXOutcome ByteMemory
