@@ -19,6 +19,9 @@ import LeanNative.Proofs.HybridCAbiProofs
 import LeanNative.Proofs.KernelFusionProofs
 import LeanNative.Proofs.ClosureADTProofs
 import LeanNative.Proofs.SliceViewProofs
+import LeanNative.Proofs.HeapObjAbiProofs
+import LeanNative.Proofs.LLVMLowerProofs
+import LeanNative.Proofs.StableHLOLowerProofs
 import LeanNative.Transform.Pass
 import LeanNative.Transform.EqSat
 import LeanNative.Transform.LoopSchedule
@@ -31,10 +34,15 @@ import LeanNative.Transform.KernelFusion
 import LeanNative.Transform.Superopt
 import LeanNative.Transform.Plugins
 import LeanNative.Backend.LLVM
+import LeanNative.Backend.LLVMAst
+import LeanNative.Backend.LLVMLower
 import LeanNative.Backend.GPUIR
 import LeanNative.Backend.MLIRGPU
+import LeanNative.Backend.PTXAst
 import LeanNative.Backend.StableHLOAst
+import LeanNative.Backend.StableHLOLower
 import LeanNative.Backend.Metal
+import LeanNative.Backend.MetalAst
 import LeanNative.Backend.Hybrid
 import LeanNative.Backend.FastCheck
 import LeanNative.Driver.EvalBatch
