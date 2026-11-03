@@ -5,8 +5,8 @@ Status of `turbo-lean` verification-boundary hardening (Track A), the completed
 superseding the earlier `eth-act/clifv` / B2 ISA prototype), the Next-Gen
 `D0`–`D5` roadmap (`Proof-Carrying LCNF`, `Unboxed Regions`, `Certifying
 Stochastic Superoptimizer`, `Hardware-in-the-Loop Cost Autotuning`, and
-`Zero-Alloc Stackless Async`), and open soundness PRs as of `main` at `28a4384`
-(after [#334](https://github.com/Th0rgal/turbo-lean/pull/334) `28a4384`).
+`Zero-Alloc Stackless Async`), and open soundness PRs as of `main` at `092ffc5`
+(after [#334](https://github.com/Th0rgal/turbo-lean/pull/334) `28a4384` and [#344](https://github.com/Th0rgal/turbo-lean/pull/344) `092ffc5`).
 This is a status ledger, not a contract: the locked goals and validation
 contracts remain [`roadmap/GOALS.md`](../roadmap/GOALS.md) and
 [`roadmap/VALIDATION_CONTRACTS.md`](../roadmap/VALIDATION_CONTRACTS.md), which
@@ -49,6 +49,7 @@ tips; they are not restated guarantees.
 | Untrusted write-containment | [#323](https://github.com/Th0rgal/turbo-lean/pull/323) | `048ff6d` | Skip untrusted write-containment test only when the toolchain is missing. |
 | Lake v4.35.0 `.trace` parity | [#324](https://github.com/Th0rgal/turbo-lean/pull/324) | `1e6922f` | Restore bit-exact Lake v4.35.0 `.trace`, missing-`.c` outputs, and `precompileModules` parity. |
 | Toolchain & warm `.olean` gate | [#341](https://github.com/Th0rgal/turbo-lean/pull/341) | `7a08c45` | Fail-closed toolchain gate, warm `.olean` adoption, and target-cone scoping. |
+| Critical-path scheduler & audit | [#344](https://github.com/Th0rgal/turbo-lean/pull/344) | `092ffc5` | Dynamic critical-path module scheduler and concurrent micro-batched audit. |
 
 ## Track B — Merged infrastructure & historical baselines
 
@@ -94,7 +95,6 @@ Building on the completed `C1`–`C8` `Lean 4 -> Target IR` foundation, Tracks `
 | PR | Head | Title |
 | --- | --- | --- |
 | [#320](https://github.com/Th0rgal/turbo-lean/pull/320) | `3ff77b4` | fix(fastcheck): certify counterexamples only via statement re-evaluation |
-| [#340](https://github.com/Th0rgal/turbo-lean/pull/340) | `fe7ef7b` | feat(cli): Boat/Orb toolchain gate, file-target build, check --emit-olean, and mtime-immune hydrate-traces |
-| [#342](https://github.com/Th0rgal/turbo-lean/pull/342) | `f26cb27` | feat(wave8): proof-only early cutoff, impact, check --allow-sorry, cone export, and gate |
-| [#343](https://github.com/Th0rgal/turbo-lean/pull/343) | `7c1c1e1` | feat(pr-verify): fast proof-only overlay, prebuilt dep closure, and disposable snapshot seeding |
-| [#344](https://github.com/Th0rgal/turbo-lean/pull/344) | `e0171d8` | feat(speed2): dynamic critical-path module scheduler and concurrent micro-batched audit |
+| [#340](https://github.com/Th0rgal/turbo-lean/pull/340) | `28bd465` | feat(cli): Boat/Orb toolchain gate, file-target build, check --emit-olean, and mtime-immune hydrate-traces |
+| [#342](https://github.com/Th0rgal/turbo-lean/pull/342) | `ce27407` | feat(wave8): proof-only early cutoff, impact, check --allow-sorry, cone export, and gate |
+| [#343](https://github.com/Th0rgal/turbo-lean/pull/343) | `b4726cc` | feat(pr-verify): fast proof-only overlay, prebuilt dep closure, and disposable snapshot seeding |
