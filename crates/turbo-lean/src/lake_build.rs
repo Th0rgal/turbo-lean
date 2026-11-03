@@ -3387,7 +3387,8 @@ struct StandaloneModuleSpec {
 }
 
 struct ProjectDependentClosure {
-    seeds: Vec<String>,
+    dag_seeds: Vec<String>,
+    lake_seeds: Vec<String>,
     dag_modules: Option<Vec<String>>,
     dag_files: Option<Vec<PathBuf>>,
     standalone_modules: Vec<StandaloneModuleSpec>,
@@ -3522,11 +3523,22 @@ fn compute_project_dependent_closure(
 ) -> Result<ProjectDependentClosure> {
     let cfg = crate::module_builder::resolve_project_config_with_trust(canon_dir, is_untrusted)?;
     let roots = package_source_roots(canon_dir, &cfg.root_pkg);
-    let mut seeds: Vec<String> = cfg.root_pkg.libs.iter().map(|l| l.name.clone()).collect();
+    let root_base = crate::module_builder::pkg_target_base_name(&cfg.root_pkg);
+    let mut dag_seeds: Vec<String> = cfg
+        .root_pkg
+        .libs
+        .iter()
+        .map(|l| format!("@{}/{}", root_base, l.name))
+        .collect();
+    let mut lake_seeds: Vec<String> = cfg.root_pkg.libs.iter().map(|l| l.name.clone()).collect();
     for exe in &cfg.root_pkg.exes {
-        let exe_target = format!("@{}/{}:exe", cfg.root_pkg.name, exe.name);
-        if !seeds.contains(&exe_target) {
-            seeds.push(exe_target);
+        let exe_dag_target = format!("@{}/{}:default", root_base, exe.name);
+        if !dag_seeds.contains(&exe_dag_target) {
+            dag_seeds.push(exe_dag_target);
+        }
+        let exe_lake_target = format!("@{}/{}:exe", root_base, exe.name);
+        if !lake_seeds.contains(&exe_lake_target) {
+            lake_seeds.push(exe_lake_target);
         }
     }
     let edited: HashSet<PathBuf> = edits
@@ -3553,10 +3565,10 @@ fn compute_project_dependent_closure(
 
     let dag_opt = if is_untrusted {
         Some(crate::module_builder::build_module_dag_with_trust(
-            &cfg, &seeds, true,
+            &cfg, &dag_seeds, true,
         )?)
     } else {
-        crate::module_builder::build_module_dag_with_trust(&cfg, &seeds, false).ok()
+        crate::module_builder::build_module_dag_with_trust(&cfg, &dag_seeds, false).ok()
     };
     let standalone_all = discover_standalone_project_modules(
         canon_dir,
@@ -3634,7 +3646,8 @@ fn compute_project_dependent_closure(
         let standalone_specs =
             topologically_order_standalone_modules(&standalone_all, &standalone_closure)?;
         Ok(ProjectDependentClosure {
-            seeds,
+            dag_seeds,
+            lake_seeds,
             dag_modules: Some(dag_closure.into_iter().collect()),
             dag_files: Some(files),
             standalone_modules: standalone_specs,
@@ -3645,7 +3658,8 @@ fn compute_project_dependent_closure(
         let standalone_specs =
             topologically_order_standalone_modules(&standalone_all, &standalone_closure)?;
         Ok(ProjectDependentClosure {
-            seeds,
+            dag_seeds,
+            lake_seeds,
             dag_modules: None,
             dag_files: None,
             standalone_modules: standalone_specs,
@@ -4225,8 +4239,10 @@ pub(crate) fn recheck_dependents_if_nonlocal(
         );
     } else if lake_inputs_changed_since_manifest(&dir) {
         if let Ok(cfg) = crate::module_builder::resolve_project_config(&dir) {
+            let root_base = crate::module_builder::pkg_target_base_name(&cfg.root_pkg);
             let mut input_libs: Vec<String> = Vec::new();
             let mut input_exes: Vec<String> = Vec::new();
+            let mut input_exe_dag_seeds: Vec<String> = Vec::new();
             if !cfg.root_pkg.inputs.is_empty() {
                 input_libs.extend(
                     cfg.root_pkg
@@ -4235,56 +4251,71 @@ pub(crate) fn recheck_dependents_if_nonlocal(
                         .filter(|l| !l.needs.is_empty())
                         .map(|l| l.name.clone()),
                 );
-                input_exes.extend(
-                    cfg.root_pkg
-                        .exes
-                        .iter()
-                        .filter(|e| !e.needs.is_empty())
-                        .map(|e| format!("@{}/{}:exe", cfg.root_pkg.name, e.name)),
-                );
+                for e in cfg.root_pkg.exes.iter().filter(|e| !e.needs.is_empty()) {
+                    input_exes.push(format!("@{}/{}:exe", root_base, e.name));
+                    input_exe_dag_seeds.push(format!("@{}/{}:default", root_base, e.name));
+                }
             }
             for dp in &cfg.dep_pkgs {
                 if !dp.inputs.is_empty() {
+                    let dp_base = crate::module_builder::pkg_target_base_name(dp);
                     input_libs.extend(
                         dp.libs
                             .iter()
                             .filter(|l| !l.needs.is_empty())
-                            .map(|l| format!("{}/{}", dp.name, l.name)),
+                            .map(|l| format!("{}/{}", dp_base, l.name)),
                     );
-                    input_exes.extend(
-                        dp.exes
-                            .iter()
-                            .filter(|e| !e.needs.is_empty())
-                            .map(|e| format!("@{}/{}:exe", dp.name, e.name)),
-                    );
+                    for e in dp.exes.iter().filter(|e| !e.needs.is_empty()) {
+                        input_exes.push(format!("@{}/{}:exe", dp_base, e.name));
+                        input_exe_dag_seeds.push(format!("@{}/{}:default", dp_base, e.name));
+                    }
                 }
             }
             input_libs.sort();
             input_libs.dedup();
             input_exes.sort();
             input_exes.dedup();
+            input_exe_dag_seeds.sort();
+            input_exe_dag_seeds.dedup();
             if (!input_libs.is_empty() || !input_exes.is_empty()) && has_lake_config(&dir) {
-                let mut seeds: Vec<String> =
+                let mut lib_seeds: Vec<String> =
                     cfg.root_pkg.libs.iter().map(|l| l.name.clone()).collect();
-                seeds.extend(input_libs.iter().cloned());
-                seeds.sort();
-                seeds.dedup();
-                let mut exe_seeds: Vec<String> = cfg
+                lib_seeds.extend(input_libs.iter().cloned());
+                lib_seeds.sort();
+                lib_seeds.dedup();
+
+                let mut dag_seeds: Vec<String> = cfg
+                    .root_pkg
+                    .libs
+                    .iter()
+                    .map(|l| format!("@{}/{}", root_base, l.name))
+                    .collect();
+                dag_seeds.extend(input_libs.iter().cloned());
+                dag_seeds.extend(
+                    cfg.root_pkg
+                        .exes
+                        .iter()
+                        .map(|e| format!("@{}/{}:default", root_base, e.name)),
+                );
+                dag_seeds.extend(input_exe_dag_seeds);
+                dag_seeds.sort();
+                dag_seeds.dedup();
+
+                let mut lake_exe_seeds: Vec<String> = cfg
                     .root_pkg
                     .exes
                     .iter()
-                    .map(|e| format!("@{}/{}:exe", cfg.root_pkg.name, e.name))
+                    .map(|e| format!("@{}/{}:exe", root_base, e.name))
                     .collect();
-                exe_seeds.extend(input_exes.iter().cloned());
-                exe_seeds.sort();
-                exe_seeds.dedup();
-                seeds.extend(exe_seeds);
+                lake_exe_seeds.extend(input_exes.iter().cloned());
+                lake_exe_seeds.sort();
+                lake_exe_seeds.dedup();
 
                 let mut ordered_targets = input_libs.clone();
                 let closure_files: Vec<PathBuf>;
                 let closure_mods: Vec<String>;
                 if let Ok(dag) =
-                    crate::module_builder::build_module_dag_with_trust(&cfg, &seeds, false)
+                    crate::module_builder::build_module_dag_with_trust(&cfg, &dag_seeds, false)
                 {
                     let mut closure: std::collections::BTreeSet<String> = dag
                         .nodes
@@ -4325,7 +4356,7 @@ pub(crate) fn recheck_dependents_if_nonlocal(
                         }
                     }
                 } else {
-                    for t in seeds {
+                    for t in lib_seeds.into_iter().chain(lake_exe_seeds) {
                         if !ordered_targets.contains(&t) {
                             ordered_targets.push(t);
                         }
@@ -4400,7 +4431,7 @@ pub(crate) fn lake_recheck_dependents_with_store(
         }
         (Some(_), Some(_)) => (0, Vec::new(), Vec::new()),
         _ => {
-            lake_build_modules(canon_dir, &closure.seeds, rev)?;
+            lake_build_modules(canon_dir, &closure.lake_seeds, rev)?;
             let all_files = collect_project_lean_files(canon_dir, false, None);
             let fallback_mods: Vec<String> = all_files
                 .iter()
@@ -4483,7 +4514,7 @@ pub(crate) fn untrusted_recheck_dependents(
             (mods, n, false)
         }
         Some(_) => (Vec::new(), 0, false),
-        None => (closure.seeds, 0, true),
+        None => (closure.dag_seeds, 0, true),
     };
     if !built_all {
         for imp in standalone_target_imports {
@@ -4544,14 +4575,15 @@ pub(crate) fn build_imported_standalone_modules_overlay(
             Err(_) if !is_untrusted => return Ok(None),
             Err(e) => return Err(e),
         };
-    let mut seeds: Vec<String> = cfg.root_pkg.libs.iter().map(|l| l.name.clone()).collect();
+    let root_base = crate::module_builder::pkg_target_base_name(&cfg.root_pkg);
+    let mut seeds: Vec<String> = cfg
+        .root_pkg
+        .libs
+        .iter()
+        .map(|l| format!("@{}/{}", root_base, l.name))
+        .collect();
     for exe in &cfg.root_pkg.exes {
-        let root_mod = exe.root.trim();
-        let target = if !root_mod.is_empty() {
-            root_mod.to_string()
-        } else {
-            exe.name.clone()
-        };
+        let target = format!("@{}/{}:default", root_base, exe.name);
         if !seeds.contains(&target) {
             seeds.push(target);
         }

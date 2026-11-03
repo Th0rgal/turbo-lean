@@ -3436,6 +3436,9 @@ fn run_lean_temp_file(
             "LEAN_PATH",
             &compile_lean_path_env,
             "--setenv",
+            "LEAN_NUM_THREADS",
+            "4",
+            "--setenv",
             "LEAN_STACK_SIZE_KB",
             "262144",
             "--setenv",
@@ -3473,7 +3476,7 @@ fn run_lean_temp_file(
         cmd.arg("--chdir").arg(&cfg.root_pkg.pkg_root);
         cmd.arg(&cfg.lean_bin);
         crate::module_builder::scrub_untrusted_env(&mut cmd);
-        cmd.args(["-M", "4096"]);
+        cmd.args(["-M", "4096", "-j", "4"]);
         // The owning target's flags (the same ones the shard key digests), already in Lake's
         // weakLeanArgs < moreLeanArgs < leanOptions order; the hardening flags come last to win.
         for arg in crate::module_builder::filter_allowed_lean_args(lean_args) {
@@ -4850,10 +4853,10 @@ fn statement_toolchain_command(
             "/tmp",
             "--setenv",
             "LEAN_NUM_THREADS",
-            "4",
+            "2",
             "--setenv",
             "LEAN_STACK_SIZE_KB",
-            "262144",
+            "65536",
             "--setenv",
             "PATH",
         ])
@@ -5316,12 +5319,13 @@ fn stock_statement_build_with_trust(project: &Path, is_untrusted: bool) -> Resul
                     input_targets.push(lib.name.clone());
                 }
             }
+            let pkg_base = crate::module_builder::pkg_target_base_name(&pkg);
             for exe in pkg
                 .exes
                 .iter()
                 .filter(|exe| !exe.needs.is_empty() && exe.root == name)
             {
-                let exe_target = format!("@{}/{}:exe", pkg.name, exe.name);
+                let exe_target = format!("@{}/{}:exe", pkg_base, exe.name);
                 if !input_targets.contains(&exe_target) {
                     input_targets.push(exe_target);
                 }
@@ -12758,6 +12762,163 @@ end ParityNs
         .unwrap_err();
         assert_stale_error(&err);
         assert_eq!(snapshot(&tree.project)?, before);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_untrusted_pr_verify_altered_interface_with_lean_exe_and_manifest_renamed_dep(
+    ) -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_pr_verify_exe_and_renamed_dep_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        let dep_dir = proj.join("deps/dep_orig_dir");
+        fs::create_dir_all(proj.join("App"))?;
+        fs::create_dir_all(dep_dir.join("DepLib"))?;
+        fs::create_dir_all(dep_dir.join("Data"))?;
+
+        let toolchain = include_str!("../../../lean/lean-toolchain");
+        fs::write(proj.join("lean-toolchain"), toolchain)?;
+        fs::write(proj.join(".gitignore"), ".lake/\n")?;
+
+        fs::write(dep_dir.join("Data/info.txt"), "v1\n")?;
+        fs::write(
+            dep_dir.join("lakefile.lean"),
+            concat!(
+                "import Lake\nopen Lake DSL\n",
+                "package «dep_orig»\n",
+                "input_dir depData where\n  path := \"Data\"\n",
+                "lean_lib «DepLib» where\n  globs := #[.submodules `DepLib]\n  needs := #[depData]\n",
+                "lean_exe «dep-tool» where\n  root := `DepMain\n  needs := #[depData]\n",
+            ),
+        )?;
+        fs::write(dep_dir.join("DepLib/Core.lean"), "def depVal : Nat := 10\n")?;
+        fs::write(
+            dep_dir.join("DepMain.lean"),
+            "import DepLib.Core\ndef main : IO Unit := IO.println s!\"{depVal}\"\n",
+        )?;
+
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{
+  "version": "1.1.0",
+  "packagesDir": ".lake/packages",
+  "packages": [
+    {"type": "path", "scope": "", "name": "«dep-alias»", "inherited": false, "dir": "deps/dep_orig_dir", "configFile": "lakefile.lean"}
+  ]
+}
+"#,
+        )?;
+        fs::write(
+            proj.join("lakefile.lean"),
+            concat!(
+                "import Lake\nopen Lake DSL\n",
+                "package «my-proofs»\n",
+                "require «dep-alias» from \"deps\" / \"dep_orig_dir\"\n",
+                "@[default_target]\n",
+                "lean_lib «App» where\n",
+                "  globs := #[.submodules `App]\n",
+                "@[default_target]\n",
+                "lean_exe «turbo-zygote» where\n",
+                "  root := `ZygoteMain\n",
+            ),
+        )?;
+        fs::write(
+            proj.join("App/Base.lean"),
+            "import DepLib.Core\ndef baseVal : Nat := depVal + 1\ntheorem base_ok : baseVal = 11 := rfl\n",
+        )?;
+        fs::write(
+            proj.join("ZygoteMain.lean"),
+            "import App.Base\ndef main : IO Unit := IO.println s!\"{baseVal}\"\n",
+        )?;
+        git_init_and_commit(&proj, "base with lean_exe and manifest-renamed dep")?;
+
+        let canon_proj = proj.canonicalize()?;
+        let cfg = crate::module_builder::resolve_project_config_with_trust(&canon_proj, true)?;
+        assert_eq!(cfg.dep_pkgs.len(), 1);
+        assert_eq!(cfg.dep_pkgs[0].name, "dep_orig");
+        assert_eq!(cfg.dep_pkgs[0].base_name, "dep-alias");
+        assert_eq!(
+            crate::module_builder::input_bearing_libs_for_module(&cfg, "DepLib.Core"),
+            vec!["dep-alias/DepLib".to_string()]
+        );
+        assert_eq!(
+            crate::module_builder::exe_targets_for_module(&cfg, "DepMain"),
+            vec!["@dep-alias/dep-tool:exe".to_string()]
+        );
+        assert_eq!(
+            crate::module_builder::input_bearing_exes_for_module(&cfg, "DepMain"),
+            vec!["@dep-alias/dep-tool:exe".to_string()]
+        );
+        assert_eq!(
+            crate::module_builder::exe_targets_for_module(&cfg, "ZygoteMain"),
+            vec!["@my-proofs/turbo-zygote:exe".to_string()]
+        );
+        crate::module_builder::build_module_dag_with_trust(
+            &cfg,
+            &[
+                "dep-alias/DepLib".to_string(),
+                "@dep-alias/dep-tool:default".to_string(),
+                "@my-proofs/turbo-zygote:default".to_string(),
+            ],
+            true,
+        )?;
+
+        let fake_bwrap =
+            crate::module_builder::ScopedTestBwrapOverride::write_fake_bwrap_script(&dir)?;
+        let _bwrap =
+            crate::module_builder::ScopedTestBwrapOverride::set(fake_bwrap.to_string_lossy());
+        let mut store = TurboStore::open(Some(&dir.join("cache")))?;
+
+        let exe_err = crate::module_builder::build_project_modules_native(
+            &mut store,
+            &canon_proj,
+            &["turbo-zygote:exe".to_string()],
+            "untrusted-pr",
+            1,
+            true,
+            true,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            exe_err.contains("fail-closed"),
+            "direct `:exe` facet on build_project_modules_native must still fail closed: {exe_err}"
+        );
+
+        fs::write(
+            proj.join("App/Base.lean"),
+            "import DepLib.Core\ndef baseVal : Nat := depVal + 1\ndef extraHelper : Nat := baseVal + 2\ntheorem base_ok : baseVal = 11 := rfl\ntheorem extra_ok : extraHelper = 13 := rfl\n",
+        )?;
+        run_pr_verify_command(
+            &mut store,
+            true,
+            proj.clone(),
+            "HEAD".to_string(),
+            "untrusted".to_string(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            false,
+            0,
+            None,
+        )?;
+
+        drop(store);
+        let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 }

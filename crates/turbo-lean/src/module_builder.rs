@@ -6787,6 +6787,14 @@ fn expand_glob_in_dir(
 /// Every such library is returned, not just the last one, for the same reason
 /// [`module_lake_input_digest`] folds the union: either attribution has to be covered, and building
 /// one library too many only costs time.
+pub(crate) fn pkg_target_base_name(pkg: &PackageConfig) -> &str {
+    if pkg.base_name.is_empty() {
+        &pkg.name
+    } else {
+        &pkg.base_name
+    }
+}
+
 pub(crate) fn input_bearing_libs_for_module(cfg: &ProjectConfig, mod_name: &str) -> Vec<String> {
     let mut out = Vec::new();
     if !cfg.root_pkg.inputs.is_empty() {
@@ -6800,9 +6808,10 @@ pub(crate) fn input_bearing_libs_for_module(cfg: &ProjectConfig, mod_name: &str)
         if dp.inputs.is_empty() {
             continue;
         }
+        let dp_base = pkg_target_base_name(dp);
         for lib in &dp.libs {
             if !lib.needs.is_empty() && lib_can_build_module(lib, mod_name) {
-                out.push(format!("{}/{}", dp.name, lib.name));
+                out.push(format!("{}/{}", dp_base, lib.name));
             }
         }
     }
@@ -6817,15 +6826,17 @@ pub(crate) fn input_bearing_libs_for_module(cfg: &ProjectConfig, mod_name: &str)
 /// `extraDep` (`needs`) trace and relinks the executable binary.
 pub(crate) fn exe_targets_for_module(cfg: &ProjectConfig, mod_name: &str) -> Vec<String> {
     let mut out = Vec::new();
+    let root_base = pkg_target_base_name(&cfg.root_pkg);
     for exe in &cfg.root_pkg.exes {
         if exe.root == mod_name {
-            out.push(format!("@{}/{}:exe", cfg.root_pkg.name, exe.name));
+            out.push(format!("@{}/{}:exe", root_base, exe.name));
         }
     }
     for dp in &cfg.dep_pkgs {
+        let dp_base = pkg_target_base_name(dp);
         for exe in &dp.exes {
             if exe.root == mod_name {
-                out.push(format!("@{}/{}:exe", dp.name, exe.name));
+                out.push(format!("@{}/{}:exe", dp_base, exe.name));
             }
         }
     }
@@ -6836,10 +6847,11 @@ pub(crate) fn exe_targets_for_module(cfg: &ProjectConfig, mod_name: &str) -> Vec
 /// whose root module is `mod_name`.
 pub(crate) fn input_bearing_exes_for_module(cfg: &ProjectConfig, mod_name: &str) -> Vec<String> {
     let mut out = Vec::new();
+    let root_base = pkg_target_base_name(&cfg.root_pkg);
     if !cfg.root_pkg.inputs.is_empty() {
         for exe in &cfg.root_pkg.exes {
             if !exe.needs.is_empty() && exe.root == mod_name {
-                out.push(format!("@{}/{}:exe", cfg.root_pkg.name, exe.name));
+                out.push(format!("@{}/{}:exe", root_base, exe.name));
             }
         }
     }
@@ -6847,9 +6859,10 @@ pub(crate) fn input_bearing_exes_for_module(cfg: &ProjectConfig, mod_name: &str)
         if dp.inputs.is_empty() {
             continue;
         }
+        let dp_base = pkg_target_base_name(dp);
         for exe in &dp.exes {
             if !exe.needs.is_empty() && exe.root == mod_name {
-                out.push(format!("@{}/{}:exe", dp.name, exe.name));
+                out.push(format!("@{}/{}:exe", dp_base, exe.name));
             }
         }
     }
@@ -14979,6 +14992,9 @@ fn build_module_compile_command(
             "LEAN_PATH",
             lean_path_env,
             "--setenv",
+            "LEAN_NUM_THREADS",
+            "4",
+            "--setenv",
             "LEAN_STACK_SIZE_KB",
             &stack_kb,
         ]);
@@ -15019,10 +15035,11 @@ fn build_module_compile_command(
             .env("LEAN_STACK_SIZE_KB", &stack_kb);
         c
     };
-    // When `is_untrusted`, pass Lean's `-M 4096` (4096 MB internal allocator limit) after `cfg.lean_bin`
-    // in addition to the OS-level `RLIMIT_DATA` enforced in `run_command_with_timeout`.
+    // When `is_untrusted`, pass Lean's `-M 4096 -j 4` (4096 MB internal allocator limit and 4
+    // task threads so 256 MB per-thread stacks fit inside the 8 GiB `RLIMIT_DATA` cap on ≥8-core hosts)
+    // after `cfg.lean_bin` in addition to the OS-level `RLIMIT_DATA` enforced in `run_command_with_timeout`.
     if is_untrusted {
-        cmd.arg("-M").arg("4096");
+        cmd.args(["-M", "4096", "-j", "4"]);
     }
     // Lake passes `weakLeanArgs` before `moreLeanArgs`.
     for arg in &node.weak_args {
