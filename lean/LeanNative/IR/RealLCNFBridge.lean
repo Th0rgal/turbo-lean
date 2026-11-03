@@ -746,7 +746,7 @@ def lowerImpureStepPure (fuel : Nat) (ctx : RealBridgeCtx) (st : RealBridgeState
         let savedFVars := st.fvarMap
         let savedActive := st.activeCtor
         let savedJps := st.jpDecls
-        let stIn := match discr? >>= st.lookupFVar? with | some dv => st.setActiveCtor dv info.name | none => st
+        let stIn := match discr?.bind st.lookupFVar? with | some dv => st.setActiveCtor dv info.name | none => st
         match lowerImpureStepPure fuel ctx stIn (.inl code) with
         | .ok (c, stOut) => .ok (c, { stOut with fvarMap := savedFVars, activeCtor := savedActive, jpDecls := savedJps })
         | .error e => .error e
@@ -761,7 +761,7 @@ def lowerImpureStepPure (fuel : Nat) (ctx : RealBridgeCtx) (st : RealBridgeState
           let savedFVars := st.fvarMap
           let savedActive := st.activeCtor
           let savedJps := st.jpDecls
-          let stIn := match discr? >>= st.lookupFVar? with | some dv => st.setActiveCtor dv info.name | none => st
+          let stIn := match discr?.bind st.lookupFVar? with | some dv => st.setActiveCtor dv info.name | none => st
           let (yesCode, st1) ← lowerImpureStepPure fuel ctx stIn (.inl code)
           let st1Restored := { st1 with fvarMap := savedFVars, activeCtor := savedActive, jpDecls := savedJps }
           let (noCode, st2) ← lowerImpureStepPure fuel ctx st1Restored (.inr (condVar, isBool, idx + 1, discr?, rest))
@@ -797,7 +797,7 @@ def lowerImpureStepPure (fuel : Nat) (ctx : RealBridgeCtx) (st : RealBridgeState
         let (rhs, st1) ← lowerImpureLetValuePure ctx st decl.value rawDeclTy
         let isBox := match decl.value with | .box _ _ _ => true | _ => false
         let ty := inferImpureRhsTypePure st1 rhs rawDeclTy isBox
-        let (dst, st2) := st1.internFVar decl.fvarId ty true
+        let (dst, st2) := st1.allocFreshFVar decl.fvarId ty
         let st2' := match decl.value with
           | .ctor info _ _ => if lnirTypeEq ty .objPtr then st2.setActiveCtor dst info.name else st2
           | _ => st2

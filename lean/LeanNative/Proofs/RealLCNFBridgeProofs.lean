@@ -1357,57 +1357,57 @@ private theorem evalCtorGet_fieldGet_match (venv : VarEnv) (hst hst' : HeapState
 theorem lowerImpureLetValuePure_sound (ctx : RealBridgeCtx) (st : RealBridgeState) (lenv : LEnv)
     (venv : VarEnv) (hst hst' : HeapState) (lv : Lean.Compiler.LCNF.LetValue .impure)
     (rawTy : LNIRType) (expr : LNIRExpr) (st1 : RealBridgeState)
-    (v : Val) (ctor? : Option Lean.Name)
-    (hinv : BridgeStateInv st lenv venv)
-    (h_lower : lowerImpureLetValuePure ctx st lv rawTy = .ok (expr, st1))
-    (h_eval : evalLetValue ctx lenv hst lv rawTy = .ok (v, hst', ctor?)) :
+    (v : Val) (ctor? : Option Lean.Name) :
+    let expectedTy := match lv with
+      | .ctor info args _ | .reuse _ info _ args _ =>
+        if args.isEmpty then (if isUnboxedScalarOrTuple rawTy then rawTy else .i64)
+        else if ctor?.isSome then .objPtr
+        else match ctx.findTupleArity? info.name with
+          | some numFields =>
+            .tuple ((args.toList.drop (if args.size > numFields then args.size - numFields else 0)).map fun
+              | .fvar x => (lenv.tys x).getD .objPtr
+              | _ => .objPtr)
+          | none => rawTy
+      | .box _ x _ =>
+        if isUnboxedScalarOrTuple ((lenv.tys x).getD .objPtr) then (lenv.tys x).getD .objPtr else .i64
+      | .fvar x _ | .unbox x _ | .reset _ x _ =>
+        if isUnboxedScalarOrTuple rawTy then rawTy
+        else if isUnboxedScalarOrTuple ((lenv.tys x).getD .objPtr) then (lenv.tys x).getD .objPtr else rawTy
+      | .oproj idx x _ =>
+        match (lenv.tys x).getD .objPtr with
+        | .tuple fs => if isUnboxedScalarOrTuple rawTy then rawTy else fs[idx]?.getD .i64
+        | _ => rawTy
+      | .uproj idx x _ =>
+        match (lenv.tys x).getD .objPtr with
+        | .tuple fs => if isUnboxedScalarOrTuple rawTy then rawTy else fs[idx]?.getD .i64
+        | _ => rawTy
+      | .sproj _ off x _ =>
+        match (lenv.tys x).getD .objPtr with
+        | .tuple fs => if isUnboxedScalarOrTuple rawTy then rawTy else fs[off]?.getD .i64
+        | _ => rawTy
+      | .isShared x _ =>
+        if isUnboxedScalarOrTuple ((lenv.tys x).getD .objPtr) then
+          if isUnboxedScalarOrTuple rawTy then rawTy else .i64
+        else .i1
+      | .lit _ | .erased =>
+        if isUnboxedScalarOrTuple rawTy then rawTy else .i64
+      | .fap _ _ _ =>
+        if isUnboxedScalarOrTuple rawTy then rawTy else .i64
+      | .pap _ _ _ => rawTy
+    let isBox := match lv with | .box _ _ _ => true | _ => false
+    BridgeStateInv st lenv venv →
+    lowerImpureLetValuePure ctx st lv rawTy = .ok (expr, st1) →
+    evalLetValue ctx lenv hst lv rawTy = .ok (v, hst', ctor?) →
     st1 = st ∧
     (match expr with
      | .isExclusive _ => ∃ b, evalExpr venv hst expr = .ok (.bool b, hst') ∧ v = .bool (!b)
      | _ => evalExpr venv hst expr = .ok (v, hst')) ∧
-    inferImpureRhsTypePure st expr rawTy (match lv with | .box _ _ _ => true | _ => false) =
-      (match lv with
-       | .ctor info args _ | .reuse _ info _ args _ =>
-         if args.isEmpty then (if isUnboxedScalarOrTuple rawTy then rawTy else .i64)
-         else if ctor?.isSome then .objPtr
-         else match ctx.findTupleArity? info.name with
-           | some numFields =>
-             let dropCnt := if args.size > numFields then args.size - numFields else 0
-             .tuple ((args.toList.drop dropCnt).map fun
-               | .fvar x => (lenv.tys x).getD .objPtr
-               | _ => .objPtr)
-           | none => rawTy
-       | .box _ x _ =>
-         let sty := (lenv.tys x).getD .objPtr
-         if isUnboxedScalarOrTuple sty then sty else .i64
-       | .fvar x _ | .unbox x _ | .reset _ x _ =>
-         let sty := (lenv.tys x).getD .objPtr
-         if isUnboxedScalarOrTuple rawTy then rawTy
-         else if isUnboxedScalarOrTuple sty then sty else rawTy
-       | .oproj idx x _ =>
-         match (lenv.tys x).getD .objPtr with
-         | .tuple fs => if isUnboxedScalarOrTuple rawTy then rawTy else fs[idx]?.getD .i64
-         | _ => rawTy
-       | .uproj idx x _ =>
-         match (lenv.tys x).getD .objPtr with
-         | .tuple fs => if isUnboxedScalarOrTuple rawTy then rawTy else fs[idx]?.getD .i64
-         | _ => rawTy
-       | .sproj _ off x _ =>
-         match (lenv.tys x).getD .objPtr with
-         | .tuple fs => if isUnboxedScalarOrTuple rawTy then rawTy else fs[off]?.getD .i64
-         | _ => rawTy
-       | .isShared x _ =>
-         if isUnboxedScalarOrTuple ((lenv.tys x).getD .objPtr) then
-           if isUnboxedScalarOrTuple rawTy then rawTy else .i64
-         else .i1
-       | .lit _ | .erased =>
-         if isUnboxedScalarOrTuple rawTy then rawTy else .i64
-       | .fap _ _ _ =>
-         if isUnboxedScalarOrTuple rawTy then rawTy else .i64
-       | .pap _ _ _ => rawTy) ∧
+    inferImpureRhsTypePure st expr rawTy isBox = expectedTy ∧
     (∀ info args h, lv = .ctor info args h →
       lnirTypeEq (inferImpureRhsTypePure st expr rawTy false) .objPtr = true →
       ctor? = some info.name) := by
+  intro expectedTy isBox hinv h_lower h_eval
+  dsimp only [expectedTy, isBox]
   cases lv with
   | lit litVal =>
     dsimp only [lowerImpureLetValuePure, Bind.bind, Except.bind, Pure.pure, Except.pure] at h_lower
@@ -2370,11 +2370,9 @@ theorem lowerImpureStepPure_mono (fuel : Nat) (ctx : RealBridgeCtx) (st st' : Re
           have hst1 := lowerImpureLetValuePure_st_eq ctx st st1 decl.value (lowerGroundImpureType decl.type) rhs hl; subst st1
           dsimp only at h
           have hInternMono : ∀ (t : LNIRType),
-              (st.internFVar decl.fvarId t true).2.nextVarId = st.nextVarId + 1 ∧
-              ∀ u, u < st.nextVarId → (st.internFVar decl.fvarId t true).2.getVarType u = st.getVarType u := fun t => by
-            change (st.allocFreshFVar decl.fvarId t).2.nextVarId = st.nextVarId + 1 ∧
-              ∀ u, u < st.nextVarId → (st.allocFreshFVar decl.fvarId t).2.getVarType u = st.getVarType u
-            exact ⟨rfl, fun u hu => by rw [getVarType_allocFresh, nat_beq_false (Nat.ne_of_lt hu)]; rfl⟩
+              (st.allocFreshFVar decl.fvarId t).2.nextVarId = st.nextVarId + 1 ∧
+              ∀ u, u < st.nextVarId → (st.allocFreshFVar decl.fvarId t).2.getVarType u = st.getVarType u := fun t =>
+            ⟨rfl, fun u hu => by rw [getVarType_allocFresh, nat_beq_false (Nat.ne_of_lt hu)]; rfl⟩
           have hStepMono : ∀ (stM : RealBridgeState),
               (stM.nextVarId = st.nextVarId + 1 ∧ ∀ u, u < st.nextVarId → stM.getVarType u = st.getVarType u) →
               (stM.nextVarId ≤ st'.nextVarId ∧ ∀ u, u < stM.nextVarId → st'.getVarType u = stM.getVarType u) →
@@ -2629,20 +2627,1287 @@ theorem lowerImpureStepPure_mono (fuel : Nat) (ctx : RealBridgeCtx) (st st' : Re
               have huIn : u < stIn.nextVarId := by rw [hnextIn]; exact Nat.lt_of_lt_of_le hu hnextB
               rw [htyOut u huIn, htyIn u hu, htyB u hu]
 
-theorem lowerImpureStepPure_sound (fuel : Nat) (ctx : RealBridgeCtx) (st : RealBridgeState)
+private theorem getActiveCtor_clear (st : RealBridgeState) (vid w : VarId) :
+    RealBridgeState.getActiveCtor? { activeCtor := st.activeCtor.filter (fun (v, _) => v != vid) } w =
+      if w == vid then none else st.getActiveCtor? w := by
+  by_cases h : w = vid
+  · subst h
+    unfold RealBridgeState.getActiveCtor?
+    have hnone : ∀ (l : List (VarId × Lean.Name)) (q : VarId), (l.filter (fun (v, _) => v != q)).find? (fun (v, _) => v == q) = none := by
+      intro l q; induction l with
+      | nil => rfl
+      | cons hd tl ih =>
+        rcases hd with ⟨v, c⟩; dsimp only [List.filter]
+        cases hvu : (v != q)
+        · exact ih
+        · dsimp only [List.find?]
+          have hvu' : (v == q) = false := by revert hvu; simp [bne]
+          rw [hvu']; exact ih
+    simp only [beq_self_eq_true, ↓reduceIte]; rw [hnone]; rfl
+  · simp only [nat_beq_false h, Bool.false_eq_true, ↓reduceIte]
+    exact getActiveCtor_filter_ne st.activeCtor vid w h
+
+private theorem bridgeInv_applyJpOne (st_m : RealBridgeState) (lenv_m : LEnv) (venv_m : VarEnv)
+    (fvarId : Lean.FVarId) (freshVid : VarId) (pTy : LNIRType) (v : Val)
+    (hinv_m : BridgeStateInv st_m lenv_m venv_m)
+    (hfreshLt : freshVid < st_m.nextVarId)
+    (hfreshGt : ∀ y vid, st_m.lookupFVar? y = some vid → vid < freshVid) :
+    BridgeStateInv
+      { (st_m.setVarType freshVid pTy) with
+        fvarMap := (fvarId, freshVid) :: st_m.fvarMap.filter (fun (f, _) => f != fvarId)
+        activeCtor := st_m.activeCtor.filter (fun (w, _) => w != freshVid) }
+      (lenv_m.bind fvarId v none (some pTy))
+      (venv_m.bind freshVid v) := by
+  let st_next : RealBridgeState :=
+    { (st_m.setVarType freshVid pTy) with
+      fvarMap := (fvarId, freshVid) :: st_m.fvarMap.filter (fun (f, _) => f != fvarId)
+      activeCtor := st_m.activeCtor.filter (fun (w, _) => w != freshVid) }
+  have hluEq : ∀ y, st_next.lookupFVar? y = if y == fvarId then some freshVid else st_m.lookupFVar? y :=
+    fun y => lookupFVar_cons st_m.fvarMap fvarId y freshVid
+  have htyEq : ∀ w, st_next.getVarType w = if w == freshVid then pTy else st_m.getVarType w :=
+    fun w => getVarType_setVarType st_m freshVid w pTy
+  have hctorEq : ∀ w, st_next.getActiveCtor? w = if w == freshVid then none else st_m.getActiveCtor? w :=
+    fun w => getActiveCtor_clear st_m freshVid w
+  refine ⟨fun y vid hy => ?_, fun y vid hy => ?_, fun y vid hy => ?_, fun y vid hy => ?_,
+    fun y1 y2 vid hy1 hy2 => ?_, fun j ps body hj => hinv_m.jp_sync j ps body hj⟩
+  · rw [hluEq] at hy
+    cases hyx : (y == fvarId) <;> rw [hyx] at hy
+    · simp only [Bool.false_eq_true, ↓reduceIte] at hy; exact hinv_m.fvar_lt y vid hy
+    · simp only [↓reduceIte] at hy; injection hy with hvid; rw [← hvid]; exact hfreshLt
+  · rw [hluEq] at hy
+    cases hyx : (y == fvarId) <;> rw [hyx] at hy
+    · simp only [Bool.false_eq_true, ↓reduceIte] at hy
+      have hlt : vid < freshVid := hfreshGt y vid hy
+      rcases hinv_m.fvar_val y vid hy with ⟨hL, hV⟩
+      dsimp only [LEnv.bind]; rw [hyx, venv_bind_fresh venv_m freshVid vid hlt v]
+      exact ⟨hL, hV⟩
+    · simp only [↓reduceIte] at hy; injection hy with hvid; rw [← hvid]
+      dsimp only [LEnv.bind]; rw [hyx, VarEnv.bind_self]
+      exact ⟨rfl, rfl⟩
+  · rw [hluEq] at hy
+    cases hyx : (y == fvarId) <;> rw [hyx] at hy
+    · simp only [Bool.false_eq_true, ↓reduceIte] at hy
+      have hlt : vid < freshVid := hfreshGt y vid hy
+      dsimp only [LEnv.bind]; rw [hyx, htyEq, nat_beq_false (Nat.ne_of_lt hlt)]; simp only [Bool.false_eq_true, ↓reduceIte]
+      exact hinv_m.fvar_ty y vid hy
+    · simp only [↓reduceIte] at hy; injection hy with hvid; rw [← hvid]
+      dsimp only [LEnv.bind]; rw [hyx, htyEq, beq_self_eq_true]; rfl
+  · rw [hluEq] at hy
+    cases hyx : (y == fvarId) <;> rw [hyx] at hy
+    · simp only [Bool.false_eq_true, ↓reduceIte] at hy
+      have hlt : vid < freshVid := hfreshGt y vid hy
+      dsimp only [LEnv.bind]; rw [hyx, hctorEq, nat_beq_false (Nat.ne_of_lt hlt)]; simp only [Bool.false_eq_true, ↓reduceIte]
+      exact hinv_m.fvar_ctor y vid hy
+    · simp only [↓reduceIte] at hy; injection hy with hvid; rw [← hvid]
+      dsimp only [LEnv.bind]; rw [hyx, hctorEq, beq_self_eq_true]; rfl
+  · rw [hluEq] at hy1 hy2
+    cases hy1x : (y1 == fvarId) <;> rw [hy1x] at hy1
+    · simp only [Bool.false_eq_true, ↓reduceIte] at hy1
+      cases hy2x : (y2 == fvarId) <;> rw [hy2x] at hy2
+      · simp only [Bool.false_eq_true, ↓reduceIte] at hy2
+        exact hinv_m.fvar_inj y1 y2 vid hy1 hy2
+      · simp only [↓reduceIte] at hy2; injection hy2 with hvid; rw [← hvid] at hy1
+        exact False.elim (Nat.lt_irrefl _ (hfreshGt y1 freshVid hy1))
+    · simp only [↓reduceIte] at hy1; injection hy1 with hvid; rw [← hvid] at hy2
+      cases hy2x : (y2 == fvarId) <;> rw [hy2x] at hy2
+      · simp only [Bool.false_eq_true, ↓reduceIte] at hy2
+        exact False.elim (Nat.lt_irrefl _ (hfreshGt y2 freshVid hy2))
+      · exact (beq_iff_eq.mp hy1x).trans (beq_iff_eq.mp hy2x).symm
+
+private theorem bindJpCallArgsPure_rel (ctx : RealBridgeCtx) (venv0 : VarEnv) (base : VarId)
+    (ps : List (Lean.Compiler.LCNF.Param .impure)) (as_ : List (Lean.Compiler.LCNF.Arg .impure))
+    (st0 st1 : RealBridgeState) (lenv : LEnv)
+    (binds : List (Lean.FVarId × VarId × LNIRType × VarId))
+    (hbase : base ≤ st0.nextVarId)
+    (hfvarBase : ∀ y vid, st0.lookupFVar? y = some vid → vid < base)
+    (hinv : BridgeStateInv st0 lenv venv0)
+    (h : bindJpCallArgsPure ctx st0 ps as_ = .ok (binds, st1)) :
+    ∃ vs, evalArgs lenv.vals as_ = .ok vs ∧
+      st1.fvarMap = st0.fvarMap ∧ st1.activeCtor = st0.activeCtor ∧ st1.jpDecls = st0.jpDecls ∧
+      st0.nextVarId ≤ st1.nextVarId ∧
+      (∀ u, u < st0.nextVarId → st1.getVarType u = st0.getVarType u) ∧
+      (∀ (st_m : RealBridgeState) (lenv_m : LEnv) (venv_m : VarEnv) (cur : VarId)
+         (fuel : Nat) (hst : HeapState) (body : LNIRCode),
+        BridgeStateInv st_m lenv_m venv_m →
+        base ≤ cur → cur ≤ st0.nextVarId → st_m.nextVarId = st1.nextVarId →
+        (∀ x vid, st_m.lookupFVar? x = some vid → vid < cur) →
+        (∀ u, u < base → venv_m u = venv0 u) →
+        ∃ lenv' venv',
+          bindParams lenv_m ps vs = .ok lenv' ∧
+          BridgeStateInv (applyJpParamMapPure st_m binds) lenv' venv' ∧
+          evalCode fuel venv_m hst (wrapJpCallBindsPure binds body) = evalCode fuel venv' hst body) := by
+  induction ps generalizing as_ st0 st1 binds with
+  | nil =>
+    cases as_ with
+    | cons _ _ => exact nomatch h
+    | nil =>
+      injection h with hp; rcases Prod.mk.inj hp with ⟨rfl, rfl⟩
+      refine ⟨[], rfl, rfl, rfl, rfl, Nat.le_refl _, fun _ _ => rfl, ?_⟩
+      intro st_m lenv_m venv_m _ _ _ _ hinv_m _ _ _ _ _
+      exact ⟨lenv_m, venv_m, rfl, hinv_m, rfl⟩
+  | cons p ps ih =>
+    cases as_ with
+    | nil => exact nomatch h
+    | cons a as_ =>
+      dsimp only [bindJpCallArgsPure, Bind.bind, Except.bind, Pure.pure, Except.pure] at h
+      cases ha : lowerRealArg ctx st0 a true with
+      | error _ => rw [ha] at h; exact nomatch h
+      | ok pa =>
+        rw [ha] at h; rcases pa with ⟨argVid, stA⟩
+        rcases lowerRealArg_sound ctx st0 lenv venv0 a true argVid stA hinv ha with
+          ⟨x, v, rfl, hluX, hevalA, hvArg, _, hstA⟩
+        subst stA; dsimp only at h
+        let pTy := lowerGroundImpureType p.type
+        rcases freshVar_spec st0 pTy with ⟨hfv1, hfvNext, hfvTy, hfvLu, hfvCtor, _⟩
+        let st2 := (st0.freshVar pTy).2
+        have hbase2 : base ≤ st2.nextVarId := Nat.le_trans hbase (by rw [hfvNext]; exact Nat.le_succ _)
+        have hfvarBase2 : ∀ y vid, st2.lookupFVar? y = some vid → vid < base := by
+          intro y vid hy; rw [hfvLu] at hy; exact hfvarBase y vid hy
+        have hinv2 : BridgeStateInv st2 lenv venv0 :=
+          bridgeInv_ext st0 st2 lenv venv0 hinv (by rw [hfvNext]; exact Nat.le_succ _)
+            (fun u hu => by rw [hfvTy u, nat_beq_false (Nat.ne_of_lt hu)]; rfl) rfl (fun u _ => hfvCtor u) rfl
+        cases hr : bindJpCallArgsPure ctx st2 ps as_ with
+        | error _ => rw [hr] at h; exact nomatch h
+        | ok pr =>
+          rw [hr] at h; dsimp only at h; injection h with hp; rcases Prod.mk.inj hp with ⟨rfl, rfl⟩
+          rcases ih as_ st2 pr.2 pr.1 hbase2 hfvarBase2 hinv2 hr with
+            ⟨vs, hevalRest, hfm, hac, hjp, hnextR, htyR, hstepRest⟩
+          refine ⟨v :: vs, by simp [evalArgs, hevalA, hevalRest], hfm, hac, hjp,
+            Nat.le_trans (by rw [hfvNext]; exact Nat.le_succ _) hnextR,
+            fun u hu => by
+              rw [htyR u (by rw [hfvNext]; exact Nat.lt_succ_of_lt hu), hfvTy u, nat_beq_false (Nat.ne_of_lt hu)]
+              rfl,
+            ?_⟩
+          intro st_m lenv_m venv_m cur fuel hst body hinv_m hcurGe hcurLe hstmNext hstmLt hvenvBase
+          have hargLtBase : argVid < base := hfvarBase x argVid hluX
+          have hvArg_m : venv_m argVid = some v := (hvenvBase argVid hargLtBase).trans hvArg
+          let freshVid := (st0.freshVar pTy).1
+          have hfreshEq : freshVid = st0.nextVarId := hfv1
+          have hfreshLtStm : freshVid < st_m.nextVarId := by
+            rw [hfreshEq, hstmNext]
+            exact Nat.lt_of_lt_of_le (by rw [hfvNext]; exact Nat.lt_succ_self _) hnextR
+          have hfreshGtStm : ∀ y vid, st_m.lookupFVar? y = some vid → vid < freshVid := by
+            intro y vid hy; rw [hfreshEq]; exact Nat.lt_of_lt_of_le (hstmLt y vid hy) hcurLe
+          let st_m1 : RealBridgeState :=
+            { (st_m.setVarType freshVid pTy) with
+              fvarMap := (p.fvarId, freshVid) :: st_m.fvarMap.filter (fun (f, _) => f != p.fvarId)
+              activeCtor := st_m.activeCtor.filter (fun (w, _) => w != freshVid) }
+          let lenv_m1 := lenv_m.bind p.fvarId v none (some pTy)
+          let venv_m1 := venv_m.bind freshVid v
+          have hinv_m1 : BridgeStateInv st_m1 lenv_m1 venv_m1 :=
+            bridgeInv_applyJpOne st_m lenv_m venv_m p.fvarId freshVid pTy v hinv_m hfreshLtStm hfreshGtStm
+          have hcur1Ge : base ≤ st2.nextVarId := hbase2
+          have hstm1Lt : ∀ y vid, st_m1.lookupFVar? y = some vid → vid < st2.nextVarId := by
+            intro y vid hy
+            have hlu1 := lookupFVar_cons st_m.fvarMap p.fvarId y freshVid
+            change st_m1.lookupFVar? y = _ at hlu1; rw [hlu1] at hy
+            cases hyp : (y == p.fvarId) <;> rw [hyp] at hy
+            · simp only [Bool.false_eq_true, ↓reduceIte] at hy
+              rw [hfvNext]; exact Nat.lt_succ_of_lt (Nat.lt_of_lt_of_le (hstmLt y vid hy) hcurLe)
+            · simp only [↓reduceIte] at hy; injection hy with hvEq; rw [← hvEq, hfreshEq, hfvNext]
+              exact Nat.lt_succ_self _
+          have hvenv1Base : ∀ u, u < base → venv_m1 u = venv0 u := by
+            intro u hu
+            have huLtFresh : u < freshVid := by rw [hfreshEq]; exact Nat.lt_of_lt_of_le hu hbase
+            exact (venv_bind_fresh venv_m freshVid u huLtFresh v).trans (hvenvBase u hu)
+          rcases hstepRest st_m1 lenv_m1 venv_m1 st2.nextVarId fuel hst body
+              hinv_m1 hbase2 (Nat.le_refl _) hstmNext hstm1Lt hvenv1Base with
+            ⟨lenv', venv', hbindRest, hinvFinal, hevalWrap⟩
+          refine ⟨lenv', venv', hbindRest, hinvFinal, ?_⟩
+          dsimp only [wrapJpCallBindsPure, evalCode, evalExpr, evalScalarExpr]
+          rw [hvArg_m]; exact hevalWrap
+
+private theorem bridgeInv_venv_agree (st : RealBridgeState) (lenv : LEnv) (venv venv' : VarEnv)
+    (hinv : BridgeStateInv st lenv venv) (hagree : ∀ u, u < st.nextVarId → venv' u = venv u) :
+    BridgeStateInv st lenv venv' := by
+  refine ⟨hinv.fvar_lt, fun x vid hx => ?_, hinv.fvar_ty, hinv.fvar_ctor, hinv.fvar_inj, hinv.jp_sync⟩
+  rw [hagree vid (hinv.fvar_lt x vid hx)]; exact hinv.fvar_val x vid hx
+
+private theorem bridgeInv_freshVar (st : RealBridgeState) (lenv : LEnv) (venv : VarEnv)
+    (ty : LNIRType) (val : Val) (hinv : BridgeStateInv st lenv venv) :
+    BridgeStateInv (st.freshVar ty).2 lenv (venv.bind (st.freshVar ty).1 val) := by
+  rcases freshVar_spec st ty with ⟨hfv1, hfvNext, hfvTy, _, hfvCtor, _⟩
+  rw [hfv1]
+  exact bridgeInv_ext st (st.freshVar ty).2 lenv (venv.bind st.nextVarId val)
+    (bridgeInv_venv_agree st lenv venv (venv.bind st.nextVarId val) hinv
+      (fun u hu => venv_bind_fresh venv st.nextVarId u hu val))
+    (by rw [hfvNext]; exact Nat.le_succ _)
+    (fun u hu => by rw [hfvTy u, nat_beq_false (Nat.ne_of_lt hu)]; rfl) rfl (fun u _ => hfvCtor u) rfl
+
+private theorem varEnv_bind_comm (venv : VarEnv) (a b : VarId) (va vb : Val) (hne : a ≠ b) :
+    (venv.bind a va).bind b vb = (venv.bind b vb).bind a va := by
+  funext u
+  dsimp only [VarEnv.bind]
+  cases hub : (u == b)
+  · cases hua : (u == a) <;> rfl
+  · have hb : u = b := beq_iff_eq.mp hub; subst hb
+    rw [nat_beq_false hne.symm]; rfl
+
+private theorem lenv_bind_withCtor (lenv : LEnv) (x : Lean.FVarId) (val : Val)
+    (c : Lean.Name) (ty : LNIRType) :
+    (lenv.bind x val none (some ty)).withCtor x c = lenv.bind x val (some c) (some ty) := by
+  cases lenv; dsimp only [LEnv.bind, LEnv.withCtor]; congr 1; funext y; cases y == x <;> rfl
+
+private theorem lowerRefOpPure_sound (fuel : Nat) (isInc : Bool) (vid : VarId) (vt : LNIRType)
+    (n : Nat) (kCode code' : LNIRCode) (lenv : LEnv) (venv : VarEnv) (hst hst1 hst' : HeapState)
+    (x : Lean.FVarId) (val v : Val)
+    (hty : lenv.tys x = some vt) (hvalL : lenv.vals x = some val) (hvalV : venv vid = some val)
+    (hrop : lowerRefOpPure isInc vid vt n kCode = .ok code')
+    (hrc : applyRc isInc lenv hst x n = .ok hst1)
+    (hk : evalCode fuel venv hst1 kCode = .ok (v, hst')) :
+    evalCode fuel venv hst code' = .ok (v, hst') := by
+  unfold lowerRefOpPure at hrop; unfold applyRc at hrc
+  have hisHeap : lenv.isHeapVar x = isHeapPtrType vt := by dsimp only [LEnv.isHeapVar]; rw [hty]
+  cases hunb : isUnboxedScalarOrTuple vt
+  · rw [hunb] at hrop
+    cases hhp : isHeapPtrType vt
+    · rw [hhp] at hrop; exact nomatch hrop
+    · rw [hhp] at hrop hisHeap
+      rw [hisHeap] at hrc; simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte, hvalL] at hrc
+      cases isInc
+      · injection hrop with hc; subst code'
+        change (match hst.evalDecRef venv vid n with
+          | .ok st' => evalCode fuel venv st' kCode
+          | .error err => .error err) = .ok (v, hst')
+        unfold HeapState.evalDecRef; rw [hvalV]
+        cases val with
+        | objPtr objId => simp only [Bool.false_eq_true, ↓reduceIte] at hrc ⊢; rw [hrc]; exact hk
+        | sarrayId bufId => simp only [Bool.false_eq_true, ↓reduceIte] at hrc ⊢; rw [hrc]; exact hk
+        | _ => dsimp only at hrc ⊢; injection hrc with hs; subst hst1; exact hk
+      · injection hrop with hc; subst code'
+        change (match hst.evalIncRef venv vid n with
+          | .ok st' => evalCode fuel venv st' kCode
+          | .error err => .error err) = .ok (v, hst')
+        unfold HeapState.evalIncRef; rw [hvalV]
+        cases val with
+        | objPtr objId => simp only [↓reduceIte] at hrc ⊢; rw [hrc]; exact hk
+        | sarrayId bufId => simp only [↓reduceIte] at hrc ⊢; rw [hrc]; exact hk
+        | _ => dsimp only at hrc ⊢; injection hrc with hs; subst hst1; exact hk
+  · rw [hunb] at hrop; injection hrop with hc; subst code'
+    rw [hisHeap, unboxed_not_heap vt hunb] at hrc
+    injection hrc with hs; subst hst1; exact hk
+
+private theorem evalCode_ite_asBool (fuel : Nat) (venv : VarEnv) (hst : HeapState)
+    (condVar : VarId) (cond : Val) (b : Bool) (thenB elseB : LNIRCode)
+    (hcond : venv condVar = some cond) (hb : asBool cond = .ok b) :
+    evalCode fuel venv hst (.ite condVar thenB elseB) =
+      if b then evalCode fuel venv hst thenB else evalCode fuel venv hst elseB := by
+  dsimp only [evalCode]; rw [hcond]
+  cases cond with
+  | bool b0 => injection hb with heq; subst b0; cases b <;> rfl
+  | u64 n => injection hb with heq; subst b; rfl
+  | u256 w => injection hb with heq; subst b; rfl
+  | _ => exact nomatch hb
+
+private theorem bridgeInv_empty : BridgeStateInv {} LEnv.empty VarEnv.empty where
+  fvar_lt _ _ h := nomatch h
+  fvar_val _ _ h := nomatch h
+  fvar_ty _ _ h := nomatch h
+  fvar_ctor _ _ h := nomatch h
+  fvar_inj _ _ _ h _ := nomatch h
+  jp_sync _ _ _ h := nomatch h
+
+private theorem internRealParams_sound (ps : List (Lean.Compiler.LCNF.Param .impure)) :
+    ∀ (args : List Val) (st : RealBridgeState) (lenv lenv' : LEnv) (venv : VarEnv),
+      BridgeStateInv st lenv venv →
+      bindParams lenv ps args = .ok lenv' →
+      BridgeStateInv (internRealParams st ps).2 lenv'
+        (((internRealParams st ps).1.zip args).foldl (fun acc (p, val) => acc.bind p.id val) venv) := by
+  induction ps with
+  | nil =>
+    intro args st lenv lenv' venv hinv hbind
+    cases args with
+    | nil => injection hbind with he; subst lenv'; exact hinv
+    | cons _ _ => exact nomatch hbind
+  | cons p ps ih =>
+    intro args st lenv lenv' venv hinv hbind
+    cases args with
+    | nil => exact nomatch hbind
+    | cons a as_ =>
+      dsimp only [internRealParams, RealBridgeState.internFVar, ↓reduceIte, List.zip, List.zipWith, List.foldl]
+      dsimp only [bindParams] at hbind
+      exact ih as_ (st.allocFreshFVar p.fvarId (lowerGroundImpureType p.type)).2
+        (lenv.bind p.fvarId a none (some (lowerGroundImpureType p.type))) lenv'
+        (venv.bind st.nextVarId a)
+        (bridgeInv_bind_fresh st lenv venv p.fvarId (lowerGroundImpureType p.type) a hinv) hbind
+
+private theorem discr_env_inv (st : RealBridgeState) (lenv : LEnv) (venv : VarEnv)
+    (discr? : Option Lean.FVarId) (cname : Lean.Name) :
+    BridgeStateInv st lenv venv →
+    (∀ dx, discr? = some dx → (st.lookupFVar? dx).isSome = true) →
+    let stIn := match discr?.bind st.lookupFVar? with
+      | some dv => st.setActiveCtor dv cname | none => st
+    let envIn := match discr? with
+      | some dx => if (lenv.vals dx).isSome then lenv.withCtor dx cname else lenv
+      | none => lenv
+    BridgeStateInv stIn envIn venv ∧ stIn.nextVarId = st.nextVarId ∧
+      (∀ u, stIn.getVarType u = st.getVarType u) := by
+  intro hinv hdiscr
+  cases discr? with
+  | none => exact ⟨hinv, rfl, fun _ => rfl⟩
+  | some dx =>
+    have hsome := hdiscr dx rfl
+    cases hlu : st.lookupFVar? dx with
+    | none => rw [hlu] at hsome; cases hsome
+    | some dv =>
+      rcases hinv.fvar_val dx dv hlu with ⟨hveq, hvSome⟩
+      have his : (lenv.vals dx).isSome = true := by rw [hveq]; exact hvSome
+      dsimp only [Option.bind]; rw [hlu, his]; dsimp only [↓reduceIte]
+      exact ⟨bridgeInv_setActiveCtor st lenv venv dv cname dx hinv hlu, rfl, fun _ => rfl⟩
+
+private theorem tag_branch_sound (fuel : Nat) (ctx : RealBridgeCtx) (lenv envIn : LEnv)
+    (venv : VarEnv) (hst hst' : HeapState) (v cond : Val)
+    (condVar : VarId) (condTy : LNIRType) (cidx : Nat) (isBool : Bool) (idx : Nat)
+    (discr? : Option Lean.FVarId) (rest : List (Lean.Compiler.LCNF.Alt .impure))
+    (altCode : Lean.Compiler.LCNF.Code .impure)
+    (yesCode noCode code : LNIRCode) (st2 st' : RealBridgeState)
+    (hi1 : lnirTypeEq condTy .i1 = true → isBool = true)
+    (hcondV : venv condVar = some cond)
+    (hyes : ∀ venvY, (∀ u, u < st2.nextVarId → venvY u = venv u) →
+      evalStep fuel ctx envIn hst (.inl altCode) = .ok (v, hst') →
+      evalCode (fuel + 1) venvY hst yesCode = .ok (v, hst'))
+    (hno : ∀ venvN, (∀ u, u < st2.nextVarId → venvN u = venv u) →
+      evalStep fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, rest)) = .ok (v, hst') →
+      evalCode (fuel + 1) venvN hst noCode = .ok (v, hst'))
+    (hbr : (if isBool || lnirTypeEq condTy .i1 then
+        (Except.ok ((lowerTagBranchPure condVar condTy cidx isBool 0 yesCode noCode).1, st2) :
+          Except String (LNIRCode × RealBridgeState))
+      else
+        Except.ok ((lowerTagBranchPure condVar condTy cidx isBool (st2.freshVar .i1).1 yesCode noCode).1,
+          (st2.freshVar .i1).2)) = Except.ok (code, st'))
+     (hev : (if isBool then
+         match asBool cond with
+         | .ok b =>
+           if cidx == 0 then
+             if b then evalStep fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, rest))
+             else evalStep fuel ctx envIn hst (.inl altCode)
+           else if cidx == 1 then
+             if b then evalStep fuel ctx envIn hst (.inl altCode)
+             else evalStep fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, rest))
+           else evalStep fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, rest))
+         | .error e => .error e
+       else
+         match cond with
+         | .u64 n =>
+           if n == cidx.toUInt64 then evalStep fuel ctx envIn hst (.inl altCode)
+           else evalStep fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, rest))
+         | _ => .error (.typeError "evalBinOp: invalid operand types")) = .ok (v, hst')) :
+     evalCode (fuel + 1) venv hst code = .ok (v, hst') := by
+  cases isBool
+  · have hnotI1 : lnirTypeEq condTy .i1 = false := by
+      cases h : lnirTypeEq condTy .i1
+      · rfl
+      · exact nomatch hi1 h
+    rw [hnotI1] at hbr
+    simp only [Bool.or_false, Bool.false_eq_true, ↓reduceIte, lowerTagBranchPure, hnotI1] at hbr hev
+    injection hbr with hp; rcases Prod.mk.inj hp with ⟨rfl, rfl⟩
+    cases cond with
+    | u64 n =>
+      change (match evalExpr venv hst (.scalar (.binOp .eq (.var condVar) (.constU64 cidx.toUInt64))) with
+        | .ok (b, hst1) => evalCode (fuel + 1) (venv.bind (st2.freshVar .i1).1 b) hst1 (.ite (st2.freshVar .i1).1 yesCode noCode)
+        | .error err => .error err) = .ok (v, hst')
+      rw [(freshVar_spec st2 .i1).1]
+      dsimp only [evalExpr, evalScalarExpr]; rw [hcondV]; dsimp only [evalBinOp, ↓reduceIte]
+      let cmpVar := st2.nextVarId
+      cases hn : (n == cidx.toUInt64) <;> simp only [hn, Bool.false_eq_true, ↓reduceIte] at hev ⊢
+      · dsimp only [evalCode]; rw [VarEnv.bind_self]
+        exact hno (venv.bind cmpVar (.bool false))
+          (fun u hu => venv_bind_fresh venv cmpVar u hu (.bool false)) hev
+      · dsimp only [evalCode]; rw [VarEnv.bind_self]
+        exact hyes (venv.bind cmpVar (.bool true))
+          (fun u hu => venv_bind_fresh venv cmpVar u hu (.bool true)) hev
+    | _ => exact nomatch hev
+  · simp only [Bool.true_or, ↓reduceIte, lowerTagBranchPure] at hbr hev
+    injection hbr with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
+    cases hab : asBool cond with
+    | error _ => rw [hab] at hev; exact nomatch hev
+    | ok b =>
+      rw [hab] at hev
+      cases hc0 : (cidx == 0)
+      · simp only [hc0, Bool.false_eq_true, ↓reduceIte] at hev ⊢
+        cases hc1 : (cidx == 1)
+        · simp only [hc1, Bool.false_eq_true, ↓reduceIte] at hev ⊢
+          exact hno venv (fun _ _ => rfl) hev
+        · simp only [hc1, ↓reduceIte] at hev ⊢
+          rw [evalCode_ite_asBool (fuel + 1) venv hst condVar cond b yesCode noCode hcondV hab]
+          cases b <;> simp only [↓reduceIte, Bool.false_eq_true] at hev ⊢
+          · exact hno venv (fun _ _ => rfl) hev
+          · exact hyes venv (fun _ _ => rfl) hev
+      · simp only [hc0, ↓reduceIte] at hev ⊢
+        rw [evalCode_ite_asBool (fuel + 1) venv hst condVar cond b noCode yesCode hcondV hab]
+        cases b <;> simp only [↓reduceIte, Bool.false_eq_true] at hev ⊢
+        · exact hyes venv (fun _ _ => rfl) hev
+        · exact hno venv (fun _ _ => rfl) hev
+
+private theorem lowerImpureStepPure_sound_aux (fuel : Nat) (ctx : RealBridgeCtx) :
+    ∀ (st st' : RealBridgeState) (lenv : LEnv) (venv : VarEnv) (hst hst' : HeapState) (v : Val)
+      (target : Lean.Compiler.LCNF.Code .impure ⊕
+        (VarId × Bool × Nat × Option Lean.FVarId × List (Lean.Compiler.LCNF.Alt .impure)))
+      (code : LNIRCode),
+      BridgeStateInv st lenv venv →
+      lowerImpureStepPure fuel ctx st target = .ok (code, st') →
+      (match target with
+       | .inl c => evalStep fuel ctx lenv hst (.inl c) = .ok (v, hst')
+       | .inr (condVar, isBool, idx, discr?, alts) =>
+         condVar < st.nextVarId ∧
+         (∀ dx, discr? = some dx → (st.lookupFVar? dx).isSome = true) ∧
+         (lnirTypeEq (st.getVarType condVar) .i1 = true → isBool = true) ∧
+         ∃ cond, venv condVar = some cond ∧
+           evalStep fuel ctx lenv hst (.inr (cond, isBool, idx, discr?, alts)) = .ok (v, hst')) →
+      evalCode fuel venv hst code = .ok (v, hst') := by
+  induction fuel with
+  | zero => intro _ _ _ _ _ _ _ _ _ _ h; exact nomatch h
+  | succ fuel ih =>
+    intro st st' lenv venv hst hst' v target code hinv h_lower h_side
+    dsimp only [lowerImpureStepPure] at h_lower
+    cases target with
+    | inr t =>
+      rcases t with ⟨condVar, isBool, idx, discr?, alts⟩
+      rcases h_side with ⟨hcondLt, hdiscr, hi1, cond, hcondV, h_eval⟩
+      dsimp only [evalStep] at h_eval
+      cases alts with
+      | nil => exact nomatch h_eval
+      | cons alt rest =>
+        cases rest with
+        | nil =>
+          cases alt with
+          | alt cn ps c _ =>
+            dsimp only at h_lower h_eval
+            cases hemp : (!ps.isEmpty) <;> simp only [hemp, ↓reduceIte, Bool.false_eq_true] at h_lower
+            · exact evalCode_fuel_mono_step fuel code venv hst v hst'
+                (ih st st' lenv venv hst hst' v (.inl c) code hinv h_lower h_eval)
+            · exact nomatch h_lower
+          | ctorAlt info c _ =>
+            dsimp only at h_lower h_eval
+            rcases discr_env_inv st lenv venv discr? info.name hinv hdiscr with ⟨hinvIn, _⟩
+            change (match lowerImpureStepPure fuel ctx
+                (match discr?.bind st.lookupFVar? with
+                 | some dv => st.setActiveCtor dv info.name | none => st)
+                (.inl c) with
+              | Except.ok (c0, stOut) =>
+                Except.ok (c0, ({ stOut with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls } : RealBridgeState))
+              | Except.error e => Except.error e) = Except.ok (code, st') at h_lower
+            cases hc : lowerImpureStepPure fuel ctx
+                (match discr?.bind st.lookupFVar? with
+                 | some dv => st.setActiveCtor dv info.name | none => st)
+                (.inl c) with
+            | error _ => rw [hc] at h_lower; exact nomatch h_lower
+            | ok pr =>
+              rw [hc] at h_lower; injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
+              exact evalCode_fuel_mono_step fuel pr.1 venv hst v hst'
+                (ih _ pr.2 _ venv hst hst' v (.inl c) pr.1 hinvIn hc h_eval)
+          | default c =>
+            exact evalCode_fuel_mono_step fuel code venv hst v hst'
+              (ih st st' lenv venv hst hst' v (.inl c) code hinv h_lower h_eval)
+        | cons alt2 rest2 =>
+          cases alt with
+          | default c =>
+            exact evalCode_fuel_mono_step fuel code venv hst v hst'
+              (ih st st' lenv venv hst hst' v (.inl c) code hinv h_lower h_eval)
+          | ctorAlt info c _ =>
+            dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure] at h_lower
+            dsimp only at h_eval
+            rcases discr_env_inv st lenv venv discr? info.name hinv hdiscr with ⟨hinvIn, hnextIn, htyIn⟩
+            cases hD : discr?.bind st.lookupFVar? with
+            | none =>
+              rw [hD] at h_lower hinvIn hnextIn htyIn; dsimp only at h_lower hinvIn hnextIn htyIn
+              cases h1 : lowerImpureStepPure fuel ctx st (.inl c) with
+              | error _ => rw [h1] at h_lower; exact nomatch h_lower
+              | ok p1 =>
+                rw [h1] at h_lower; rcases p1 with ⟨yesCode, st1⟩; dsimp only at h_lower
+                rcases lowerImpureStepPure_mono fuel ctx st st1 (.inl c) yesCode h1 with ⟨hn1, ht1⟩
+                have hinv1R : BridgeStateInv
+                    { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                    lenv venv :=
+                  bridgeInv_ext st _ lenv venv hinv hn1 (fun u hu => ht1 u hu) rfl (fun _ _ => rfl) rfl
+                cases h2 : lowerImpureStepPure fuel ctx
+                    { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                    (.inr (condVar, isBool, idx + 1, discr?, alt2 :: rest2)) with
+                | error _ => rw [h2] at h_lower; exact nomatch h_lower
+                | ok p2 =>
+                  rw [h2] at h_lower; rcases p2 with ⟨noCode, st2⟩; dsimp only at h_lower
+                  rcases lowerImpureStepPure_mono fuel ctx
+                      { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                      st2 (.inr (condVar, isBool, idx + 1, discr?, alt2 :: rest2)) noCode h2 with ⟨hn2, _⟩
+                  have hgeBase : st.nextVarId ≤ st2.nextVarId := Nat.le_trans hn1 hn2
+                  have hyes : ∀ venvY, (∀ u, u < st2.nextVarId → venvY u = venv u) →
+                      evalStep fuel ctx
+                        (match discr? with
+                         | some dx => if (lenv.vals dx).isSome then lenv.withCtor dx info.name else lenv
+                         | none => lenv)
+                        hst (.inl c) = .ok (v, hst') →
+                      evalCode (fuel + 1) venvY hst yesCode = .ok (v, hst') := by
+                    intro venvY hge hev
+                    exact evalCode_fuel_mono_step fuel yesCode venvY hst v hst'
+                      (ih st st1 _ venvY hst hst' v (.inl c) yesCode
+                        (bridgeInv_venv_agree st _ venv venvY hinvIn
+                          (fun u hu => hge u (Nat.lt_of_lt_of_le hu hgeBase))) h1 hev)
+                  have hno : ∀ venvN, (∀ u, u < st2.nextVarId → venvN u = venv u) →
+                      evalStep fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, alt2 :: rest2)) =
+                        .ok (v, hst') →
+                      evalCode (fuel + 1) venvN hst noCode = .ok (v, hst') := by
+                    intro venvN hge hev
+                    exact evalCode_fuel_mono_step fuel noCode venvN hst v hst'
+                      (ih { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                        st2 lenv venvN hst hst' v
+                        (.inr (condVar, isBool, idx + 1, discr?, alt2 :: rest2)) noCode
+                        (bridgeInv_venv_agree _ lenv venv venvN hinv1R
+                          (fun u hu => hge u (Nat.lt_of_lt_of_le hu hn2))) h2
+                        ⟨Nat.lt_of_lt_of_le hcondLt hn1, fun dx hdx => by
+                          have := hdiscr dx hdx
+                          change (st.lookupFVar? dx).isSome = true at this
+                          simp only [RealBridgeState.lookupFVar?]; exact this,
+                         fun h => hi1 (by
+                           have hty1R : st1.getVarType condVar = st.getVarType condVar := ht1 condVar hcondLt
+                           change lnirTypeEq (st1.getVarType condVar) .i1 = true at h
+                           rw [hty1R] at h; exact h),
+                         cond, by rw [hge condVar (Nat.lt_of_lt_of_le hcondLt hgeBase)]; exact hcondV, hev⟩)
+                  exact tag_branch_sound fuel ctx lenv
+                    (match discr? with
+                     | some dx => if (lenv.vals dx).isSome then lenv.withCtor dx info.name else lenv
+                     | none => lenv)
+                    venv hst hst' v cond condVar
+                    (st.getVarType condVar) info.cidx isBool idx discr? (alt2 :: rest2) c
+                    yesCode noCode code st2 st' hi1 hcondV hyes hno h_lower h_eval
+            | some dv =>
+              rw [hD] at h_lower hinvIn hnextIn htyIn; dsimp only at h_lower hinvIn hnextIn htyIn
+              let stIn := st.setActiveCtor dv info.name
+              cases h1 : lowerImpureStepPure fuel ctx stIn (.inl c) with
+              | error _ => rw [h1] at h_lower; exact nomatch h_lower
+              | ok p1 =>
+                rw [h1] at h_lower; rcases p1 with ⟨yesCode, st1⟩; dsimp only at h_lower
+                rcases lowerImpureStepPure_mono fuel ctx stIn st1 (.inl c) yesCode h1 with ⟨hn1, ht1⟩
+                have hbase1 : st.nextVarId ≤ st1.nextVarId := hn1
+                have hinv1R : BridgeStateInv
+                    { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                    lenv venv :=
+                  bridgeInv_ext st _ lenv venv hinv hbase1
+                    (fun u hu => ht1 u hu) rfl (fun _ _ => rfl) rfl
+                cases h2 : lowerImpureStepPure fuel ctx
+                    { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                    (.inr (condVar, isBool, idx + 1, discr?, alt2 :: rest2)) with
+                | error _ => rw [h2] at h_lower; exact nomatch h_lower
+                | ok p2 =>
+                  rw [h2] at h_lower; rcases p2 with ⟨noCode, st2⟩; dsimp only at h_lower
+                  rcases lowerImpureStepPure_mono fuel ctx
+                      { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                      st2 (.inr (condVar, isBool, idx + 1, discr?, alt2 :: rest2)) noCode h2 with ⟨hn2, _⟩
+                  have hgeBase : st.nextVarId ≤ st2.nextVarId := Nat.le_trans hbase1 hn2
+                  have hyes : ∀ venvY, (∀ u, u < st2.nextVarId → venvY u = venv u) →
+                      evalStep fuel ctx
+                        (match discr? with
+                         | some dx => if (lenv.vals dx).isSome then lenv.withCtor dx info.name else lenv
+                         | none => lenv)
+                        hst (.inl c) = .ok (v, hst') →
+                      evalCode (fuel + 1) venvY hst yesCode = .ok (v, hst') := by
+                    intro venvY hge hev
+                    exact evalCode_fuel_mono_step fuel yesCode venvY hst v hst'
+                      (ih stIn st1 _ venvY hst hst' v (.inl c) yesCode
+                        (bridgeInv_venv_agree stIn _ venv venvY hinvIn
+                          (fun u hu => hge u (Nat.lt_of_lt_of_le hu hgeBase))) h1 hev)
+                  have hno : ∀ venvN, (∀ u, u < st2.nextVarId → venvN u = venv u) →
+                      evalStep fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, alt2 :: rest2)) =
+                        .ok (v, hst') →
+                      evalCode (fuel + 1) venvN hst noCode = .ok (v, hst') := by
+                    intro venvN hge hev
+                    exact evalCode_fuel_mono_step fuel noCode venvN hst v hst'
+                      (ih { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                        st2 lenv venvN hst hst' v
+                        (.inr (condVar, isBool, idx + 1, discr?, alt2 :: rest2)) noCode
+                        (bridgeInv_venv_agree _ lenv venv venvN hinv1R
+                          (fun u hu => hge u (Nat.lt_of_lt_of_le hu hn2))) h2
+                        ⟨Nat.lt_of_lt_of_le hcondLt hbase1, fun dx hdx => by
+                          have := hdiscr dx hdx
+                          change (st.lookupFVar? dx).isSome = true at this
+                          simp only [RealBridgeState.lookupFVar?]; exact this,
+                         fun h => hi1 (by
+                           have hty1R : st1.getVarType condVar = st.getVarType condVar := ht1 condVar hcondLt
+                           change lnirTypeEq (st1.getVarType condVar) .i1 = true at h
+                           rw [hty1R] at h; exact h),
+                         cond, by rw [hge condVar (Nat.lt_of_lt_of_le hcondLt hgeBase)]; exact hcondV, hev⟩)
+                  exact tag_branch_sound fuel ctx lenv
+                    (match discr? with
+                     | some dx => if (lenv.vals dx).isSome then lenv.withCtor dx info.name else lenv
+                     | none => lenv)
+                    venv hst hst' v cond condVar
+                    (st.getVarType condVar) info.cidx isBool idx discr? (alt2 :: rest2) c
+                    yesCode noCode code st2 st' hi1 hcondV hyes hno h_lower h_eval
+          | alt ctorName params c _ =>
+            dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure, MonadExcept.throw,
+              MonadExceptOf.throw, throwThe] at h_lower
+            dsimp only at h_eval
+            cases hemp : (!params.isEmpty) <;> simp only [hemp, ↓reduceIte, Bool.false_eq_true] at h_lower
+            · cases h1 : lowerImpureStepPure fuel ctx st (.inl c) with
+              | error _ => rw [h1] at h_lower; exact nomatch h_lower
+              | ok p1 =>
+                rw [h1] at h_lower; rcases p1 with ⟨yesCode, st1⟩; dsimp only at h_lower
+                rcases lowerImpureStepPure_mono fuel ctx st st1 (.inl c) yesCode h1 with ⟨hn1, ht1⟩
+                have hinv1R : BridgeStateInv
+                    { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                    lenv venv :=
+                  bridgeInv_ext st _ lenv venv hinv hn1
+                    (fun u hu => by change st1.getVarType u = st.getVarType u; exact ht1 u hu) rfl
+                    (fun _ _ => rfl) rfl
+                cases h2 : lowerImpureStepPure fuel ctx
+                    { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                    (.inr (condVar, isBool, idx + 1, discr?, alt2 :: rest2)) with
+                | error _ => rw [h2] at h_lower; exact nomatch h_lower
+                | ok p2 =>
+                  rw [h2] at h_lower; rcases p2 with ⟨noCode, st2⟩; dsimp only at h_lower
+                  rcases lowerImpureStepPure_mono fuel ctx
+                      { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                      st2 (.inr (condVar, isBool, idx + 1, discr?, alt2 :: rest2)) noCode h2 with ⟨hn2, ht2⟩
+                  have hcondLt2 : condVar < st2.nextVarId := Nat.lt_of_lt_of_le hcondLt (Nat.le_trans hn1 hn2)
+                  have hgeBase : st.nextVarId ≤ st2.nextVarId := Nat.le_trans hn1 hn2
+                  have hyes : ∀ venvY, (∀ u, u < st2.nextVarId → venvY u = venv u) →
+                      evalStep fuel ctx lenv hst (.inl c) = .ok (v, hst') →
+                      evalCode (fuel + 1) venvY hst yesCode = .ok (v, hst') := by
+                    intro venvY hge hev
+                    exact evalCode_fuel_mono_step fuel yesCode venvY hst v hst'
+                      (ih st st1 lenv venvY hst hst' v (.inl c) yesCode
+                        (bridgeInv_venv_agree st lenv venv venvY hinv
+                          (fun u hu => hge u (Nat.lt_of_lt_of_le hu hgeBase))) h1 hev)
+                  have hno : ∀ venvN, (∀ u, u < st2.nextVarId → venvN u = venv u) →
+                      evalStep fuel ctx lenv hst (.inr (cond, isBool, idx + 1, discr?, alt2 :: rest2)) =
+                        .ok (v, hst') →
+                      evalCode (fuel + 1) venvN hst noCode = .ok (v, hst') := by
+                    intro venvN hge hev
+                    exact evalCode_fuel_mono_step fuel noCode venvN hst v hst'
+                      (ih { st1 with fvarMap := st.fvarMap, activeCtor := st.activeCtor, jpDecls := st.jpDecls }
+                        st2 lenv venvN hst hst' v
+                        (.inr (condVar, isBool, idx + 1, discr?, alt2 :: rest2)) noCode
+                        (bridgeInv_venv_agree _ lenv venv venvN hinv1R
+                          (fun u hu => hge u (Nat.lt_of_lt_of_le hu hn2))) h2
+                        ⟨Nat.lt_of_lt_of_le hcondLt hn1, fun dx hdx => by
+                          have := hdiscr dx hdx
+                          change (st.lookupFVar? dx).isSome = true at this
+                          simp only [RealBridgeState.lookupFVar?]; exact this,
+                         fun h => hi1 (by
+                           have hty1R : st1.getVarType condVar = st.getVarType condVar := ht1 condVar hcondLt
+                           change lnirTypeEq (st1.getVarType condVar) .i1 = true at h
+                           rw [hty1R] at h; exact h),
+                         cond, by rw [hge condVar (Nat.lt_of_lt_of_le hcondLt hgeBase)]; exact hcondV, hev⟩)
+                  exact tag_branch_sound fuel ctx lenv lenv venv hst hst' v cond condVar
+                    (st.getVarType condVar) ((ctx.findNullaryCtor? ctorName).getD idx) isBool idx discr?
+                    (alt2 :: rest2) c yesCode noCode code st2 st' hi1 hcondV hyes hno
+                    h_lower h_eval
+            · exact nomatch h_lower
+    | inl c =>
+      have h_eval : evalStep (fuel + 1) ctx lenv hst (.inl c) = .ok (v, hst') := h_side
+      cases c with
+      | «return» x =>
+        dsimp only [evalStep] at h_eval
+        dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure] at h_lower
+        cases hv : st.lookupBoundFVar x <;> rw [hv] at h_lower
+        · exact nomatch h_lower
+        · rename_i vid; injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
+          rcases lookupBoundFVar_inv st lenv venv x vid hinv hv with ⟨_, _, ⟨val, hvalL, hvalV⟩, _, _⟩
+          rw [hvalL] at h_eval; injection h_eval with hpv; rcases Prod.mk.inj hpv with ⟨rfl, rfl⟩
+          dsimp only [evalCode]; rw [hvalV]
+      | unreach _ => dsimp only [evalStep] at h_eval; exact nomatch h_eval
+      | «fun» _ _ _ => dsimp only [evalStep] at h_eval; exact nomatch h_eval
+      | «let» decl k =>
+        dsimp only [evalStep] at h_eval
+        dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure] at h_lower
+        cases hl : lowerImpureLetValuePure ctx st decl.value (lowerGroundImpureType decl.type) with
+        | error _ => rw [hl] at h_lower; exact nomatch h_lower
+        | ok pl =>
+          rw [hl] at h_lower; rcases pl with ⟨rhs, st1⟩
+          cases hev : evalLetValue ctx lenv hst decl.value (lowerGroundImpureType decl.type) with
+          | error _ => rw [hev] at h_eval; exact nomatch h_eval
+          | ok pev =>
+            rw [hev] at h_eval; rcases pev with ⟨val, hst1, ctor?⟩; dsimp only at h_eval h_lower
+            have hst1Eq := lowerImpureLetValuePure_st_eq ctx st st1 decl.value (lowerGroundImpureType decl.type) rhs hl
+            subst st1
+            rcases lowerImpureLetValuePure_sound ctx st lenv venv hst hst1 decl.value (lowerGroundImpureType decl.type) rhs st val ctor?
+                hinv hl hev with ⟨_, hrhsEval, htyEq, hctorEq⟩
+            let ty := inferImpureRhsTypePure st rhs (lowerGroundImpureType decl.type)
+              (match decl.value with | .box _ _ _ => true | _ => false)
+            have hEvalK : evalStep fuel ctx
+                (lenv.bind decl.fvarId val
+                  (match decl.value with | .ctor _ _ _ => if lnirTypeEq ty .objPtr then ctor? else none | _ => none)
+                  (some ty))
+                hst1 (.inl k) = .ok (v, hst') := by
+              dsimp only [ty]
+              simp only [htyEq]
+              exact h_eval
+            let st2 := (st.allocFreshFVar decl.fvarId ty).2
+            let dst := (st.allocFreshFVar decl.fvarId ty).1
+            have hinv2 : BridgeStateInv st2 (lenv.bind decl.fvarId val none (some ty)) (venv.bind dst val) :=
+              bridgeInv_bind_fresh st lenv venv decl.fvarId ty val hinv
+            let st2' := match decl.value with
+              | .ctor info _ _ => if lnirTypeEq ty .objPtr then st2.setActiveCtor dst info.name else st2
+              | _ => st2
+            let storedCtor := match decl.value with
+              | .ctor _ _ _ => if lnirTypeEq ty .objPtr then ctor? else none
+              | _ => none
+            have hinv2' : BridgeStateInv st2' (lenv.bind decl.fvarId val storedCtor (some ty)) (venv.bind dst val) := by
+              dsimp only [st2', storedCtor]
+              cases hdv : decl.value with
+              | ctor info args hh =>
+                dsimp only
+                cases hobj : lnirTypeEq ty .objPtr
+                · simp only [Bool.false_eq_true, ↓reduceIte]; exact hinv2
+                · simp only [↓reduceIte]
+                  have hct : ctor? = some info.name := by
+                    apply hctorEq info args hh hdv
+                    dsimp only [ty] at hobj; rw [hdv] at hobj; exact hobj
+                  rw [hct, ← lenv_bind_withCtor]
+                  have hluDst : st2.lookupFVar? decl.fvarId = some dst := by
+                    dsimp only [st2, dst]; rw [lookupFVar_allocFresh, beq_self_eq_true]; rfl
+                  exact bridgeInv_setActiveCtor st2 (lenv.bind decl.fvarId val none (some ty))
+                    (venv.bind dst val) dst info.name decl.fvarId hinv2 hluDst
+              | _ => exact hinv2
+            have hst2Next : st2'.nextVarId = st.nextVarId + 1 := by
+              dsimp only [st2']; cases decl.value <;> try rfl
+              cases lnirTypeEq ty .objPtr <;> rfl
+            clear hl htyEq hctorEq
+            cases rhs with
+            | isExclusive objVar =>
+              dsimp only at h_lower hrhsEval
+              rcases hrhsEval with ⟨b, hexclEval, rfl⟩
+              split at h_lower
+              · exact nomatch h_lower
+              · rename_i pk hk
+                injection h_lower with hp; rcases Prod.mk.inj hp with ⟨hcodeEq, _⟩
+                have hkClean : lowerImpureStepPure fuel ctx (st2'.freshVar .i1).2 (.inl k) = .ok pk := hk
+                have hexclId : (st2'.freshVar .i1).1 = st2'.nextVarId := (freshVar_spec st2' .i1).1
+                have hne : st2'.nextVarId ≠ dst := by
+                  change st2'.nextVarId ≠ st.nextVarId
+                  rw [hst2Next]; exact Nat.ne_of_gt (Nat.lt_succ_self _)
+                have hinv3 : BridgeStateInv (st2'.freshVar .i1).2
+                    (lenv.bind decl.fvarId (.bool (!b)) storedCtor (some ty))
+                    ((venv.bind (st2'.freshVar .i1).1 (.bool b)).bind dst (.bool (!b))) := by
+                  rw [hexclId, varEnv_bind_comm venv st2'.nextVarId dst (.bool b) (.bool (!b)) hne]
+                  rw [← hexclId]
+                  exact bridgeInv_freshVar st2' _ (venv.bind dst (.bool (!b))) .i1 (.bool b) hinv2'
+                have hkEval := evalCode_fuel_mono_step fuel pk.1 _ hst1 v hst'
+                  (ih (st2'.freshVar .i1).2 pk.2 _ _ hst1 hst' v (.inl k) pk.1 hinv3 hkClean hEvalK)
+                have hcodeClean : code = .letBind (st2'.freshVar .i1).1 .i1 (.isExclusive objVar)
+                    (.letBind dst .i1 (.scalar (.unaryOp .not (.var (st2'.freshVar .i1).1))) pk.1) := hcodeEq.symm
+                rw [hcodeClean]
+                dsimp only [evalCode]
+                rw [hexclEval]
+                dsimp only [evalCode, evalExpr, evalScalarExpr]
+                rw [VarEnv.bind_self]; dsimp only [evalUnaryOp]
+                exact hkEval
+            | _ =>
+              dsimp only at h_lower hrhsEval
+              split at h_lower
+              · exact nomatch h_lower
+              · rename_i pk hk
+                injection h_lower with hp; rcases Prod.mk.inj hp with ⟨hcodeEq, _⟩
+                have hkClean : lowerImpureStepPure fuel ctx st2' (.inl k) = .ok pk := hk
+                have hkEval := evalCode_fuel_mono_step fuel pk.1 (venv.bind dst val) hst1 v hst'
+                  (ih st2' pk.2 _ (venv.bind dst val) hst1 hst' v (.inl k) pk.1 hinv2' hkClean hEvalK)
+                rw [← hcodeEq]; dsimp only [evalCode]; rw [hrhsEval]; exact hkEval
+      | inc x n _ _ k _ =>
+        dsimp only [evalStep] at h_eval
+        dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure] at h_lower
+        cases hv : st.lookupBoundFVar x <;> rw [hv] at h_lower
+        · exact nomatch h_lower
+        · rename_i vid; dsimp only at h_lower
+          rcases lookupBoundFVar_inv st lenv venv x vid hinv hv with ⟨_, _, ⟨val, hvalL, hvalV⟩, htyL, _⟩
+          cases hrc : applyRc true lenv hst x n with
+          | error _ => rw [hrc] at h_eval; exact nomatch h_eval
+          | ok hst1 =>
+            rw [hrc] at h_eval
+            cases hk : lowerImpureStepPure fuel ctx st (.inl k) with
+            | error _ => rw [hk] at h_lower; exact nomatch h_lower
+            | ok pk =>
+              rw [hk] at h_lower; dsimp only at h_lower
+              cases hrop : lowerRefOpPure true vid (st.getVarType vid) n pk.1 <;> rw [hrop] at h_lower
+              · exact nomatch h_lower
+              · injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
+                exact lowerRefOpPure_sound (fuel + 1) true vid (st.getVarType vid) n pk.1 _ lenv venv hst hst1 hst'
+                  x val v htyL hvalL hvalV hrop hrc
+                  (evalCode_fuel_mono_step fuel pk.1 venv hst1 v hst' (ih st pk.2 lenv venv hst1 hst' v (.inl k) pk.1 hinv hk h_eval))
+      | dec x n _ _ _ k _ =>
+        dsimp only [evalStep] at h_eval
+        dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure] at h_lower
+        cases hv : st.lookupBoundFVar x <;> rw [hv] at h_lower
+        · exact nomatch h_lower
+        · rename_i vid; dsimp only at h_lower
+          rcases lookupBoundFVar_inv st lenv venv x vid hinv hv with ⟨_, _, ⟨val, hvalL, hvalV⟩, htyL, _⟩
+          cases hrc : applyRc false lenv hst x n with
+          | error _ => rw [hrc] at h_eval; exact nomatch h_eval
+          | ok hst1 =>
+            rw [hrc] at h_eval
+            cases hk : lowerImpureStepPure fuel ctx st (.inl k) with
+            | error _ => rw [hk] at h_lower; exact nomatch h_lower
+            | ok pk =>
+              rw [hk] at h_lower; dsimp only at h_lower
+              cases hrop : lowerRefOpPure false vid (st.getVarType vid) n pk.1 <;> rw [hrop] at h_lower
+              · exact nomatch h_lower
+              · injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
+                exact lowerRefOpPure_sound (fuel + 1) false vid (st.getVarType vid) n pk.1 _ lenv venv hst hst1 hst'
+                  x val v htyL hvalL hvalV hrop hrc
+                  (evalCode_fuel_mono_step fuel pk.1 venv hst1 v hst' (ih st pk.2 lenv venv hst1 hst' v (.inl k) pk.1 hinv hk h_eval))
+      | del x k _ =>
+        dsimp only [evalStep] at h_eval
+        dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure] at h_lower
+        cases hv : st.lookupBoundFVar x <;> rw [hv] at h_lower
+        · exact nomatch h_lower
+        · rename_i objVid; dsimp only at h_lower
+          rcases lookupBoundFVar_inv st lenv venv x objVid hinv hv with ⟨_, _, ⟨val, hvalL, hvalV⟩, htyL, _⟩
+          have hisHeap : lenv.isHeapVar x = isHeapPtrType (st.getVarType objVid) := by
+            dsimp only [LEnv.isHeapVar]; rw [htyL]
+          rw [hvalL, hisHeap] at h_eval
+          cases hhp : (ctx.allowStage1DHeap && isHeapPtrType (st.getVarType objVid)) <;>
+            simp only [hhp, ↓reduceIte, Bool.false_eq_true] at h_lower h_eval
+          · cases hk : lowerImpureStepPure fuel ctx st (.inl k) with
+            | error _ => rw [hk] at h_lower; exact nomatch h_lower
+            | ok pk =>
+              rw [hk] at h_lower; dsimp only at h_lower
+              cases hrop : lowerRefOpPure false objVid (st.getVarType objVid) 1 pk.1 <;> rw [hrop] at h_lower
+              · exact nomatch h_lower
+              · injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
+                have hrcEq : ∃ hst1, applyRc false lenv hst x 1 = .ok hst1 ∧
+                    evalStep fuel ctx lenv hst1 (.inl k) = .ok (v, hst') := by
+                  unfold applyRc; rw [hisHeap, hvalL]
+                  cases hih : isHeapPtrType (st.getVarType objVid) <;>
+                    simp only [hih, Bool.not_true, Bool.not_false, Bool.false_eq_true, ↓reduceIte] at h_eval ⊢
+                  · cases val <;> exact ⟨hst, rfl, h_eval⟩
+                  · cases val with
+                    | objPtr objId =>
+                      dsimp only at h_eval ⊢
+                      cases hd : hst.decRefObj objId 1 with
+                      | error _ => rw [hd] at h_eval; exact nomatch h_eval
+                      | ok hst1 => rw [hd] at h_eval; exact ⟨hst1, rfl, h_eval⟩
+                    | sarrayId bufId =>
+                      dsimp only at h_eval ⊢
+                      cases hd : hst.decRefBuf bufId 1 with
+                      | error _ => rw [hd] at h_eval; exact nomatch h_eval
+                      | ok hst1 => rw [hd] at h_eval; exact ⟨hst1, rfl, h_eval⟩
+                    | _ => exact ⟨hst, rfl, h_eval⟩
+                rcases hrcEq with ⟨hst1, hrc, h_eval1⟩
+                exact lowerRefOpPure_sound (fuel + 1) false objVid (st.getVarType objVid) 1 pk.1 _ lenv venv hst hst1 hst'
+                  x val v htyL hvalL hvalV hrop hrc
+                  (evalCode_fuel_mono_step fuel pk.1 venv hst1 v hst' (ih st pk.2 lenv venv hst1 hst' v (.inl k) pk.1 hinv hk h_eval1))
+          · cases val with
+            | objPtr objId =>
+              dsimp only at h_eval
+              cases hdel : hst.delObjShell objId with
+              | error _ => rw [hdel] at h_eval; exact nomatch h_eval
+              | ok hst1 =>
+                rw [hdel] at h_eval
+                cases hk : lowerImpureStepPure fuel ctx (st.freshVar .unit).2 (.inl k) with
+                | error _ => rw [hk] at h_lower; exact nomatch h_lower
+                | ok pk =>
+                  rw [hk] at h_lower; injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
+                  have hinv2 := bridgeInv_freshVar st lenv venv .unit .unit hinv
+                  have hkEval := evalCode_fuel_mono_step fuel pk.1 _ hst1 v hst'
+                    (ih (st.freshVar .unit).2 pk.2 lenv _ hst1 hst' v (.inl k) pk.1 hinv2 hk h_eval)
+                  have hcall : evalExpr venv hst (.call "lean_native_del_obj" [objVid] .unit false) = .ok (.unit, hst1) := by
+                    unfold evalExpr; dsimp only [evalVarList]; rw [hvalV]; dsimp only [↓reduceIte, Bool.false_eq_true]
+                    rw [hdel]; rfl
+                  dsimp only [evalCode]; rw [hcall]; exact hkEval
+            | _ => exact nomatch h_eval
+      | setTag x cidx k _ =>
+        dsimp only [evalStep] at h_eval
+        dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure, MonadExcept.throw, MonadExceptOf.throw, throwThe] at h_lower
+        cases hv : st.lookupBoundFVar x <;> rw [hv] at h_lower
+        · exact nomatch h_lower
+        · rename_i objVid; dsimp only at h_lower
+          rcases lookupBoundFVar_inv st lenv venv x objVid hinv hv with ⟨_, hobjLt, ⟨val, hvalL, hvalV⟩, _, _⟩
+          rw [hvalL] at h_eval
+          cases hhp : (!(ctx.allowStage1DHeap && isHeapPtrType (st.getVarType objVid))) <;>
+            simp only [hhp, ↓reduceIte, Bool.false_eq_true] at h_lower
+          · cases val with
+            | objPtr objId =>
+              dsimp only at h_eval
+              cases hset : hst.setHeapObjTagExclusive objId (cidx.toUInt64).toNat with
+              | error _ => rw [hset] at h_eval; exact nomatch h_eval
+              | ok hst1 =>
+                rw [hset] at h_eval
+                let st2 := (st.freshVar .i64).2
+                let st3 := (st2.freshVar .unit).2
+                cases hk : lowerImpureStepPure fuel ctx st3 (.inl k) with
+                | error _ => rw [hk] at h_lower; exact nomatch h_lower
+                | ok pk =>
+                  rw [hk] at h_lower; injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
+                  let venv1 := venv.bind (st.freshVar .i64).1 (.u64 cidx.toUInt64)
+                  let venv2 := venv1.bind (st2.freshVar .unit).1 .unit
+                  have hinv3 : BridgeStateInv st3 lenv venv2 :=
+                    bridgeInv_freshVar st2 lenv venv1 .unit .unit
+                      (bridgeInv_freshVar st lenv venv .i64 (.u64 cidx.toUInt64) hinv)
+                  have hkEval := evalCode_fuel_mono_step fuel pk.1 venv2 hst1 v hst'
+                    (ih st3 pk.2 lenv venv2 hst1 hst' v (.inl k) pk.1 hinv3 hk h_eval)
+                  have htagId : (st.freshVar .i64).1 = st.nextVarId := (freshVar_spec st .i64).1
+                  have hobjV1 : (venv.bind (st.freshVar .i64).1 (.u64 cidx.toUInt64)) objVid = some (.objPtr objId) := by
+                    rw [htagId, venv_bind_fresh venv st.nextVarId objVid hobjLt]; exact hvalV
+                  have htagV1 : (venv.bind (st.freshVar .i64).1 (.u64 cidx.toUInt64)) (st.freshVar .i64).1 = some (.u64 cidx.toUInt64) :=
+                    VarEnv.bind_self _ _ _
+                  have hcall : evalExpr (venv.bind (st.freshVar .i64).1 (.u64 cidx.toUInt64)) hst
+                      (.call "lean_native_ctor_set_tag" [objVid, (st.freshVar .i64).1] .unit false) =
+                      .ok (.unit, hst1) := by
+                    have hvl : evalVarList (venv.bind (st.freshVar .i64).1 (.u64 cidx.toUInt64))
+                        [objVid, (st.freshVar .i64).1] = .ok [.objPtr objId, .u64 cidx.toUInt64] := by
+                      simp only [evalVarList, hobjV1, htagV1]
+                    dsimp only [evalExpr]; rw [hvl]
+                    change (hst.setHeapObjTagExclusive objId (cidx.toUInt64).toNat).map (Val.unit, ·) = .ok (Val.unit, hst1)
+                    rw [hset]; rfl
+                  change (match evalExpr venv hst (.scalar (.constU64 cidx.toUInt64)) with
+                    | .ok (tv, hst0) => evalCode (fuel + 1) (venv.bind (st.freshVar .i64).1 tv) hst0
+                        (.letBind (st2.freshVar .unit).1 .unit
+                          (.call "lean_native_ctor_set_tag" [objVid, (st.freshVar .i64).1] .unit false) pk.1)
+                    | .error e => .error e) = .ok (v, hst')
+                  dsimp only [evalExpr, evalScalarExpr]
+                  dsimp only [evalCode]; rw [hcall]; exact hkEval
+            | _ => exact nomatch h_eval
+          · exact nomatch h_lower
+      | oset x idx y k _ =>
+        dsimp only [evalStep] at h_eval
+        dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure, MonadExcept.throw, MonadExceptOf.throw, throwThe] at h_lower
+        cases hv : st.lookupBoundFVar x <;> rw [hv] at h_lower
+        · exact nomatch h_lower
+        · rename_i objVid; dsimp only at h_lower
+          rcases lookupBoundFVar_inv st lenv venv x objVid hinv hv with ⟨_, hobjLt, ⟨val, hvalL, hvalV⟩, htyL, _⟩
+          have hisHeap : lenv.isHeapVar x = isHeapPtrType (st.getVarType objVid) := by
+            dsimp only [LEnv.isHeapVar]; rw [htyL]
+          cases hhp : (ctx.allowStage1DHeap && isHeapPtrType (st.getVarType objVid)) <;>
+            simp only [hhp, ↓reduceIte, Bool.false_eq_true] at h_lower
+          · cases hunb : isUnboxedScalarOrTuple (st.getVarType objVid) <;>
+              simp only [hunb, ↓reduceIte, Bool.false_eq_true] at h_lower
+            · exact nomatch h_lower
+            · rw [hisHeap, unboxed_not_heap _ hunb] at h_eval
+              simp only [Bool.not_false, ↓reduceIte] at h_eval
+              exact evalCode_fuel_mono_step fuel code venv hst v hst'
+                (ih st st' lenv venv hst hst' v (.inl k) code hinv h_lower h_eval)
+          · have hhp2 : isHeapPtrType (st.getVarType objVid) = true := (Bool.and_eq_true _ _).mp hhp |>.2
+            rw [hisHeap, hhp2, hvalL] at h_eval
+            simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h_eval
+            cases hy : lowerRealArg ctx st y true with
+            | error _ => rw [hy] at h_lower; exact nomatch h_lower
+            | ok py =>
+              rw [hy] at h_lower; rcases py with ⟨valVid, stY⟩
+              rcases lowerRealArg_sound ctx st lenv venv y true valVid stY hinv hy with
+                ⟨yx, yVal, rfl, hluY, hevalY, hyValV, _, hstY⟩
+              subst stY; dsimp only at h_lower
+              have hvalLt : valVid < st.nextVarId := hinv.fvar_lt yx valVid hluY
+              cases val with
+              | objPtr objId =>
+                dsimp only at h_eval; rw [hevalY] at h_eval; dsimp only at h_eval
+                cases hwf : writeField hst objId (idx.toUInt64).toNat yVal true with
+                | error _ => rw [hwf] at h_eval; exact nomatch h_eval
+                | ok hst1 =>
+                  rw [hwf] at h_eval
+                  let st3 := (st.freshVar .i64).2
+                  let st4 := (st3.freshVar .unit).2
+                  cases hk : lowerImpureStepPure fuel ctx st4 (.inl k) with
+                  | error _ => rw [hk] at h_lower; exact nomatch h_lower
+                  | ok pk =>
+                    rw [hk] at h_lower; injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
+                    let venv1 := venv.bind (st.freshVar .i64).1 (.u64 idx.toUInt64)
+                    let venv2 := venv1.bind (st3.freshVar .unit).1 .unit
+                    have hinv4 : BridgeStateInv st4 lenv venv2 :=
+                      bridgeInv_freshVar st3 lenv venv1 .unit .unit
+                        (bridgeInv_freshVar st lenv venv .i64 (.u64 idx.toUInt64) hinv)
+                    have hkEval := evalCode_fuel_mono_step fuel pk.1 venv2 hst1 v hst'
+                      (ih st4 pk.2 lenv venv2 hst1 hst' v (.inl k) pk.1 hinv4 hk h_eval)
+                    have hidxId : (st.freshVar .i64).1 = st.nextVarId := (freshVar_spec st .i64).1
+                    have hobjV1 : (venv.bind (st.freshVar .i64).1 (.u64 idx.toUInt64)) objVid = some (.objPtr objId) := by
+                      rw [hidxId, venv_bind_fresh venv st.nextVarId objVid hobjLt]; exact hvalV
+                    have hvalV1 : (venv.bind (st.freshVar .i64).1 (.u64 idx.toUInt64)) valVid = some yVal := by
+                      rw [hidxId, venv_bind_fresh venv st.nextVarId valVid hvalLt]; exact hyValV
+                    have hidxV1 : (venv.bind (st.freshVar .i64).1 (.u64 idx.toUInt64)) (st.freshVar .i64).1 = some (.u64 idx.toUInt64) :=
+                      VarEnv.bind_self _ _ _
+                    have hcall : evalExpr (venv.bind (st.freshVar .i64).1 (.u64 idx.toUInt64)) hst
+                        (.call "lean_native_ctor_set" [objVid, (st.freshVar .i64).1, valVid] .unit false) =
+                        .ok (.unit, hst1) := by
+                      have hvl : evalVarList (venv.bind (st.freshVar .i64).1 (.u64 idx.toUInt64))
+                          [objVid, (st.freshVar .i64).1, valVid] = .ok [.objPtr objId, .u64 idx.toUInt64, yVal] := by
+                        simp only [evalVarList, hobjV1, hidxV1, hvalV1]
+                      dsimp only [evalExpr]; rw [hvl]
+                      change (hst.writeHeapObjFieldExclusive objId (idx.toUInt64).toNat yVal true).map (Val.unit, ·) = .ok (Val.unit, hst1)
+                      unfold writeField at hwf; rw [hwf]; rfl
+                    change (match evalExpr venv hst (.scalar (.constU64 idx.toUInt64)) with
+                      | .ok (iv, hst0) => evalCode (fuel + 1) (venv.bind (st.freshVar .i64).1 iv) hst0
+                          (.letBind (st3.freshVar .unit).1 .unit
+                            (.call "lean_native_ctor_set" [objVid, (st.freshVar .i64).1, valVid] .unit false) pk.1)
+                      | .error e => .error e) = .ok (v, hst')
+                    dsimp only [evalExpr, evalScalarExpr]
+                    dsimp only [evalCode]; rw [hcall]; exact hkEval
+              | _ => rw [hevalY] at h_eval; exact nomatch h_eval
+      | uset x i y k _ =>
+        dsimp only [evalStep] at h_eval
+        dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure, MonadExcept.throw, MonadExceptOf.throw, throwThe] at h_lower
+        cases hv : st.lookupBoundFVar x <;> rw [hv] at h_lower
+        · exact nomatch h_lower
+        · rename_i objVid; dsimp only at h_lower
+          rcases lookupBoundFVar_inv st lenv venv x objVid hinv hv with ⟨_, hobjLt, ⟨val, hvalL, hvalV⟩, _, hctorL⟩
+          split at h_lower
+          · exact nomatch h_lower
+          · cases hc : st.getActiveCtor? objVid <;> rw [hc] at h_lower
+            · exact nomatch h_lower
+            · rename_i cname; dsimp only at h_lower
+              cases hlay : ctx.findLayout? cname <;> rw [hlay] at h_lower
+              · exact nomatch h_lower
+              · rename_i spec; dsimp only at h_lower
+                cases hsl : spec.usizeSlot? i <;> rw [hsl] at h_lower
+                · exact nomatch h_lower
+                · rename_i slp; rcases slp with ⟨slot, slotTy⟩; dsimp only at h_lower
+                  cases hy : st.lookupBoundFVar y <;> rw [hy] at h_lower
+                  · exact nomatch h_lower
+                  · rename_i valVid; dsimp only at h_lower
+                    rcases lookupBoundFVar_inv st lenv venv y valVid hinv hy with ⟨_, hvalLt, ⟨yVal, hyValL, hyValV⟩, _, _⟩
+                    rw [hvalL, hyValL] at h_eval
+                    cases val with
+                    | objPtr objId =>
+                      have hslEq : (lenv.ctors x >>= ctx.findLayout? >>= (·.usizeSlot? i)) = some (slot, slotTy) := by
+                        rw [hctorL, hc]; dsimp only [Bind.bind, Option.bind]; rw [hlay]; dsimp only; exact hsl
+                      dsimp only at h_eval; rw [hslEq] at h_eval; dsimp only at h_eval
+                      cases hwf : writeField hst objId (slot.toUInt64).toNat yVal false with
+                      | error _ => rw [hwf] at h_eval; exact nomatch h_eval
+                      | ok hst1 =>
+                        rw [hwf] at h_eval
+                        let st3 := (st.freshVar .i64).2
+                        let st4 := (st3.freshVar .unit).2
+                        cases hk : lowerImpureStepPure fuel ctx st4 (.inl k) with
+                        | error _ => rw [hk] at h_lower; exact nomatch h_lower
+                        | ok pk =>
+                          rw [hk] at h_lower; injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
+                          let venv1 := venv.bind (st.freshVar .i64).1 (.u64 slot.toUInt64)
+                          let venv2 := venv1.bind (st3.freshVar .unit).1 .unit
+                          have hinv4 : BridgeStateInv st4 lenv venv2 :=
+                            bridgeInv_freshVar st3 lenv venv1 .unit .unit
+                              (bridgeInv_freshVar st lenv venv .i64 (.u64 slot.toUInt64) hinv)
+                          have hkEval := evalCode_fuel_mono_step fuel pk.1 venv2 hst1 v hst'
+                            (ih st4 pk.2 lenv venv2 hst1 hst' v (.inl k) pk.1 hinv4 hk h_eval)
+                          have hidxId : (st.freshVar .i64).1 = st.nextVarId := (freshVar_spec st .i64).1
+                          have hobjV1 : (venv.bind (st.freshVar .i64).1 (.u64 slot.toUInt64)) objVid = some (.objPtr objId) := by
+                            rw [hidxId, venv_bind_fresh venv st.nextVarId objVid hobjLt]; exact hvalV
+                          have hvalV1 : (venv.bind (st.freshVar .i64).1 (.u64 slot.toUInt64)) valVid = some yVal := by
+                            rw [hidxId, venv_bind_fresh venv st.nextVarId valVid hvalLt]; exact hyValV
+                          have hidxV1 : (venv.bind (st.freshVar .i64).1 (.u64 slot.toUInt64)) (st.freshVar .i64).1 = some (.u64 slot.toUInt64) :=
+                            VarEnv.bind_self _ _ _
+                          have hcall : evalExpr (venv.bind (st.freshVar .i64).1 (.u64 slot.toUInt64)) hst
+                              (.call "lean_native_ctor_set_scalar" [objVid, (st.freshVar .i64).1, valVid] .unit false) =
+                              .ok (.unit, hst1) := by
+                            have hvl : evalVarList (venv.bind (st.freshVar .i64).1 (.u64 slot.toUInt64))
+                                [objVid, (st.freshVar .i64).1, valVid] = .ok [.objPtr objId, .u64 slot.toUInt64, yVal] := by
+                              simp only [evalVarList, hobjV1, hidxV1, hvalV1]
+                            dsimp only [evalExpr]; rw [hvl]
+                            change (hst.writeHeapObjFieldExclusive objId (slot.toUInt64).toNat yVal false).map (Val.unit, ·) = .ok (Val.unit, hst1)
+                            unfold writeField at hwf; rw [hwf]; rfl
+                          change (match evalExpr venv hst (.scalar (.constU64 slot.toUInt64)) with
+                            | .ok (iv, hst0) => evalCode (fuel + 1) (venv.bind (st.freshVar .i64).1 iv) hst0
+                                (.letBind (st3.freshVar .unit).1 .unit
+                                  (.call "lean_native_ctor_set_scalar" [objVid, (st.freshVar .i64).1, valVid] .unit false) pk.1)
+                            | .error e => .error e) = .ok (v, hst')
+                          dsimp only [evalExpr, evalScalarExpr]
+                          dsimp only [evalCode]; rw [hcall]; exact hkEval
+                    | _ => exact nomatch h_eval
+      | sset x n off y _ k _ =>
+        dsimp only [evalStep] at h_eval
+        dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure, MonadExcept.throw, MonadExceptOf.throw, throwThe] at h_lower
+        cases hv : st.lookupBoundFVar x <;> rw [hv] at h_lower
+        · exact nomatch h_lower
+        · rename_i objVid; dsimp only at h_lower
+          rcases lookupBoundFVar_inv st lenv venv x objVid hinv hv with ⟨_, hobjLt, ⟨val, hvalL, hvalV⟩, _, hctorL⟩
+          split at h_lower
+          · exact nomatch h_lower
+          · cases hc : st.getActiveCtor? objVid <;> rw [hc] at h_lower
+            · exact nomatch h_lower
+            · rename_i cname; dsimp only at h_lower
+              cases hlay : ctx.findLayout? cname <;> rw [hlay] at h_lower
+              · exact nomatch h_lower
+              · rename_i spec; dsimp only at h_lower
+                cases hsl : spec.scalarSlot? n off <;> rw [hsl] at h_lower
+                · exact nomatch h_lower
+                · rename_i slp; rcases slp with ⟨slot, sfTy⟩; dsimp only at h_lower
+                  cases hy : st.lookupBoundFVar y <;> rw [hy] at h_lower
+                  · exact nomatch h_lower
+                  · rename_i valVid; dsimp only at h_lower
+                    rcases lookupBoundFVar_inv st lenv venv y valVid hinv hy with ⟨_, hvalLt, ⟨yVal, hyValL, hyValV⟩, _, _⟩
+                    rw [hvalL, hyValL] at h_eval
+                    cases val with
+                    | objPtr objId =>
+                      have hslEq : (lenv.ctors x >>= ctx.findLayout? >>= (·.scalarSlot? n off)) = some (slot, sfTy) := by
+                        rw [hctorL, hc]; dsimp only [Bind.bind, Option.bind]; rw [hlay]; dsimp only; exact hsl
+                      dsimp only at h_eval; rw [hslEq] at h_eval; dsimp only at h_eval
+                      cases hwf : writeField hst objId (slot.toUInt64).toNat yVal false with
+                      | error _ => rw [hwf] at h_eval; exact nomatch h_eval
+                      | ok hst1 =>
+                        rw [hwf] at h_eval
+                        let st3 := (st.freshVar .i64).2
+                        let st4 := (st3.freshVar .unit).2
+                        cases hk : lowerImpureStepPure fuel ctx st4 (.inl k) with
+                        | error _ => rw [hk] at h_lower; exact nomatch h_lower
+                        | ok pk =>
+                          rw [hk] at h_lower; injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
+                          let venv1 := venv.bind (st.freshVar .i64).1 (.u64 slot.toUInt64)
+                          let venv2 := venv1.bind (st3.freshVar .unit).1 .unit
+                          have hinv4 : BridgeStateInv st4 lenv venv2 :=
+                            bridgeInv_freshVar st3 lenv venv1 .unit .unit
+                              (bridgeInv_freshVar st lenv venv .i64 (.u64 slot.toUInt64) hinv)
+                          have hkEval := evalCode_fuel_mono_step fuel pk.1 venv2 hst1 v hst'
+                            (ih st4 pk.2 lenv venv2 hst1 hst' v (.inl k) pk.1 hinv4 hk h_eval)
+                          have hidxId : (st.freshVar .i64).1 = st.nextVarId := (freshVar_spec st .i64).1
+                          have hobjV1 : (venv.bind (st.freshVar .i64).1 (.u64 slot.toUInt64)) objVid = some (.objPtr objId) := by
+                            rw [hidxId, venv_bind_fresh venv st.nextVarId objVid hobjLt]; exact hvalV
+                          have hvalV1 : (venv.bind (st.freshVar .i64).1 (.u64 slot.toUInt64)) valVid = some yVal := by
+                            rw [hidxId, venv_bind_fresh venv st.nextVarId valVid hvalLt]; exact hyValV
+                          have hidxV1 : (venv.bind (st.freshVar .i64).1 (.u64 slot.toUInt64)) (st.freshVar .i64).1 = some (.u64 slot.toUInt64) :=
+                            VarEnv.bind_self _ _ _
+                          have hcall : evalExpr (venv.bind (st.freshVar .i64).1 (.u64 slot.toUInt64)) hst
+                              (.call "lean_native_ctor_set_scalar" [objVid, (st.freshVar .i64).1, valVid] .unit false) =
+                              .ok (.unit, hst1) := by
+                            have hvl : evalVarList (venv.bind (st.freshVar .i64).1 (.u64 slot.toUInt64))
+                                [objVid, (st.freshVar .i64).1, valVid] = .ok [.objPtr objId, .u64 slot.toUInt64, yVal] := by
+                              simp only [evalVarList, hobjV1, hidxV1, hvalV1]
+                            dsimp only [evalExpr]; rw [hvl]
+                            change (hst.writeHeapObjFieldExclusive objId (slot.toUInt64).toNat yVal false).map (Val.unit, ·) = .ok (Val.unit, hst1)
+                            unfold writeField at hwf; rw [hwf]; rfl
+                          change (match evalExpr venv hst (.scalar (.constU64 slot.toUInt64)) with
+                            | .ok (iv, hst0) => evalCode (fuel + 1) (venv.bind (st.freshVar .i64).1 iv) hst0
+                                (.letBind (st3.freshVar .unit).1 .unit
+                                  (.call "lean_native_ctor_set_scalar" [objVid, (st.freshVar .i64).1, valVid] .unit false) pk.1)
+                            | .error e => .error e) = .ok (v, hst')
+                          dsimp only [evalExpr, evalScalarExpr]
+                          dsimp only [evalCode]; rw [hcall]; exact hkEval
+                    | _ => exact nomatch h_eval
+      | cases cs =>
+        dsimp only [evalStep] at h_eval
+        dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure, MonadExcept.throw, MonadExceptOf.throw, throwThe] at h_lower
+        cases hv : st.lookupBoundFVar cs.discr <;> rw [hv] at h_lower
+        · exact nomatch h_lower
+        · rename_i condVar; dsimp only at h_lower
+          rcases lookupBoundFVar_inv st lenv venv cs.discr condVar hinv hv with
+            ⟨hluC, hcondLt, ⟨discrVal, hvalL, hvalV⟩, htyL, _⟩
+          have hisHeap : lenv.isHeapVar cs.discr = isHeapPtrType (st.getVarType condVar) := by
+            dsimp only [LEnv.isHeapVar]; rw [htyL]
+          rw [hvalL, hisHeap] at h_eval; dsimp only at h_eval
+          cases hhp : (ctx.allowStage1DHeap && cs.typeName != ``Bool && isHeapPtrType (st.getVarType condVar)) <;>
+            simp only [hhp, ↓reduceIte, Bool.false_eq_true] at h_lower h_eval
+          · cases hsc : (!isSupportedStage1BScalarType (st.getVarType condVar) ctx.arch) <;>
+              simp only [hsc, ↓reduceIte, Bool.false_eq_true] at h_lower
+            · rw [htyL] at h_eval; dsimp only [Option.getD] at h_eval
+              have hsideSc : condVar < st.nextVarId ∧
+                  (∀ dx, (none : Option Lean.FVarId) = some dx → (st.lookupFVar? dx).isSome = true) ∧
+                  (lnirTypeEq (st.getVarType condVar) .i1 = true →
+                    (cs.typeName == ``Bool || lnirTypeEq (st.getVarType condVar) .i1) = true) ∧
+                  ∃ cond, venv condVar = some cond ∧
+                    evalStep fuel ctx lenv hst
+                      (.inr (cond, cs.typeName == ``Bool || lnirTypeEq (st.getVarType condVar) .i1, 0, none,
+                        orderAltsPure cs.alts.toList)) = .ok (v, hst') := by
+                refine ⟨hcondLt, ?_, ?_, discrVal, hvalV, h_eval⟩
+                · intro _ h; cases h
+                · intro hi1; rw [hi1, Bool.or_true]
+              exact evalCode_fuel_mono_step fuel code venv hst v hst'
+                (ih st st' lenv venv hst hst' v
+                  (.inr (condVar, cs.typeName == ``Bool || lnirTypeEq (st.getVarType condVar) .i1, 0, none, orderAltsPure cs.alts.toList))
+                  code hinv h_lower hsideSc)
+            · exact nomatch h_lower
+          · cases htag : tagOf discrVal hst with
+            | error _ => rw [htag] at h_eval; exact nomatch h_eval
+            | ok tag =>
+              rw [htag] at h_eval
+              rcases freshVar_spec st .i64 with ⟨htagId, hfn2, hft2, hflu2, _, _⟩
+              cases hk : lowerImpureStepPure fuel ctx (st.freshVar .i64).2
+                  (.inr ((st.freshVar .i64).1, false, 0, some cs.discr, orderAltsPure cs.alts.toList)) with
+              | error _ => rw [hk] at h_lower; exact nomatch h_lower
+              | ok pk =>
+                rw [hk] at h_lower; injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
+                have hinv2 : BridgeStateInv (st.freshVar .i64).2 lenv (venv.bind (st.freshVar .i64).1 tag) :=
+                  bridgeInv_freshVar st lenv venv .i64 tag hinv
+                have hsideHp : (st.freshVar .i64).1 < (st.freshVar .i64).2.nextVarId ∧
+                    (∀ dx, some cs.discr = some dx → ((st.freshVar .i64).2.lookupFVar? dx).isSome = true) ∧
+                    (lnirTypeEq ((st.freshVar .i64).2.getVarType (st.freshVar .i64).1) .i1 = true → false = true) ∧
+                    ∃ cond, (venv.bind (st.freshVar .i64).1 tag) (st.freshVar .i64).1 = some cond ∧
+                      evalStep fuel ctx lenv hst
+                        (.inr (cond, false, 0, some cs.discr, orderAltsPure cs.alts.toList)) = .ok (v, hst') := by
+                  refine ⟨?_, ?_, ?_, tag, VarEnv.bind_self _ _ _, h_eval⟩
+                  · rw [htagId, hfn2]; exact Nat.lt_succ_self _
+                  · intro dx hdx; injection hdx with hd; subst dx; rw [hflu2, hluC]; rfl
+                  · intro hi1; simp only [htagId, hft2 st.nextVarId, beq_self_eq_true, ↓reduceIte, lnirTypeEq, lnirTypeEqFuel] at hi1; exact hi1
+                have hkEval := evalCode_fuel_mono_step fuel pk.1 (venv.bind (st.freshVar .i64).1 tag) hst v hst'
+                  (ih (st.freshVar .i64).2 pk.2 lenv (venv.bind (st.freshVar .i64).1 tag) hst hst' v
+                    (.inr ((st.freshVar .i64).1, false, 0, some cs.discr, orderAltsPure cs.alts.toList))
+                    pk.1 hinv2 hk hsideHp)
+                have hcall : evalExpr venv hst (.call "lean_native_ctor_tag" [condVar] .i64 false) = .ok (tag, hst) := by
+                  unfold evalExpr; dsimp only [evalVarList]; rw [hvalV]; dsimp only [↓reduceIte, Bool.false_eq_true]
+                  unfold tagOf at htag
+                  cases discrVal with
+                  | objPtr objId =>
+                    dsimp only [Functor.map, Except.map] at htag ⊢
+                    cases hl : hst.liveHeapObj objId with
+                    | error _ => rw [hl] at htag; exact nomatch htag
+                    | ok o => rw [hl] at htag; injection htag with ht; subst tag; rfl
+                  | u64 n => injection htag with ht; subst tag; rfl
+                  | bool b => injection htag with ht; subst tag; rfl
+                  | tuple vs =>
+                    cases vs with
+                    | nil => exact nomatch htag
+                    | cons v0 rest =>
+                      cases v0 with
+                      | u64 n => injection htag with ht; subst tag; rfl
+                      | _ => exact nomatch htag
+                  | _ => exact nomatch htag
+                dsimp only [evalCode]; rw [hcall]; exact hkEval
+      | jp decl k =>
+        dsimp only [evalStep] at h_eval
+        cases hrec : hasJmpToPure fuel decl.fvarId (.inl decl.value) <;>
+          simp only [hrec, ↓reduceIte, Bool.false_eq_true] at h_lower h_eval
+        · exact evalCode_fuel_mono_step fuel code venv hst v hst'
+            (ih (st.setJpDecl decl.fvarId decl.params.toList decl.value) st'
+              (lenv.bindJp decl.fvarId { params := decl.params.toList, code := decl.value })
+              venv hst hst' v (.inl k) code
+              (bridgeInv_setJp st lenv venv decl.fvarId decl.params.toList decl.value hinv) h_lower h_eval)
+        · exact nomatch h_lower
+      | jmp fvarId args =>
+        dsimp only [evalStep] at h_eval
+        dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure, MonadExcept.throw, MonadExceptOf.throw, throwThe] at h_lower
+        cases hjp : st.lookupJp? fvarId <;> rw [hjp] at h_lower
+        · exact nomatch h_lower
+        · rename_i jpPair; rcases jpPair with ⟨jpParams, jpBody⟩; dsimp only at h_lower
+          rw [hinv.jp_sync fvarId jpParams jpBody hjp] at h_eval; dsimp only at h_eval
+          cases hb : bindJpCallArgsPure ctx st jpParams args.toList with
+          | error _ => rw [hb] at h_lower; exact nomatch h_lower
+          | ok pb =>
+            rw [hb] at h_lower; rcases pb with ⟨binds, st1⟩; dsimp only at h_lower
+            rcases bindJpCallArgsPure_rel ctx venv st.nextVarId jpParams args.toList st st1 lenv binds
+                (Nat.le_refl _) (fun y vid hy => hinv.fvar_lt y vid hy) hinv hb with
+              ⟨vs, hevalArgs, hfm1, hac1, hjp1, hnext1, hty1, hstepJp⟩
+            rw [hevalArgs] at h_eval; dsimp only at h_eval
+            have hinvSt1 : BridgeStateInv st1 lenv venv :=
+              bridgeInv_ext st st1 lenv venv hinv hnext1 hty1 hfm1
+                (fun u _ => by simp only [RealBridgeState.getActiveCtor?, hac1]) hjp1
+            have hst1Lt : ∀ x vid, st1.lookupFVar? x = some vid → vid < st.nextVarId := by
+              intro x vid hx
+              have hx' : st.lookupFVar? x = some vid := by simp only [RealBridgeState.lookupFVar?, hfm1] at hx; exact hx
+              exact hinv.fvar_lt x vid hx'
+            rcases hstepJp st1 lenv venv st.nextVarId (fuel + 1) hst
+                (match lowerImpureStepPure fuel ctx (applyJpParamMapPure st1 binds) (.inl jpBody) with
+                 | .ok (bc, _) => bc | .error _ => .unreachable)
+                hinvSt1 (Nat.le_refl _) (Nat.le_refl _) rfl hst1Lt (fun _ _ => rfl) with
+              ⟨lenv', venv', hbindP, hinvIn, hevalWrap⟩
+            rw [hbindP] at h_eval; dsimp only at h_eval
+            cases hbody : lowerImpureStepPure fuel ctx (applyJpParamMapPure st1 binds) (.inl jpBody) with
+            | error _ => rw [hbody] at h_lower; exact nomatch h_lower
+            | ok pbody =>
+              rw [hbody] at h_lower hevalWrap; injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, _⟩
+              rw [hevalWrap]
+              exact evalCode_fuel_mono_step fuel pbody.1 venv' hst v hst'
+                (ih (applyJpParamMapPure st1 binds) pbody.2 lenv' venv' hst hst' v (.inl jpBody) pbody.1 hinvIn hbody h_eval)
+
+theorem lowerImpureStepPure_sound (fuel : Nat) (ctx : RealBridgeCtx) (st st' : RealBridgeState)
     (lenv : LEnv) (venv : VarEnv) (hst hst' : HeapState) (v : Val)
     (target : Lean.Compiler.LCNF.Code .impure ⊕
       (VarId × Bool × Nat × Option Lean.FVarId × List (Lean.Compiler.LCNF.Alt .impure)))
-    (code : LNIRCode) (st' : RealBridgeState)
-    (hinv : BridgeStateInv st lenv venv)
-    (h_lower : lowerImpureStepPure fuel ctx st target = .ok (code, st'))
-    (h_eval : evalStep fuel ctx lenv hst (match target with
-      | .inl c => .inl c
+    (code : LNIRCode) :
+    BridgeStateInv st lenv venv →
+    lowerImpureStepPure fuel ctx st target = .ok (code, st') →
+    (match target with
+      | .inl c => evalStep fuel ctx lenv hst (.inl c) = .ok (v, hst')
       | .inr (condVar, isBool, idx, discr?, alts) =>
-        .inr (match venv condVar with | some cv => cv | none => .unit, isBool, idx, discr?, alts)) =
-      .ok (v, hst')) :
-    evalCode fuel venv hst code = .ok (v, hst') := by
-  sorry
+        condVar < st.nextVarId ∧
+        (∀ dx, discr? = some dx → (st.lookupFVar? dx).isSome = true) ∧
+        (lnirTypeEq (st.getVarType condVar) .i1 = true → isBool = true) ∧
+        ∃ cond, venv condVar = some cond ∧
+          evalStep fuel ctx lenv hst (.inr (cond, isBool, idx, discr?, alts)) = .ok (v, hst')) →
+    evalCode fuel venv hst code = .ok (v, hst') :=
+  lowerImpureStepPure_sound_aux fuel ctx st st' lenv venv hst hst' v target code
 
 theorem lowerRealLCNFCode_sound (fuel : Nat) (ctx : RealBridgeCtx) (st : RealBridgeState)
     (lenv : LEnv) (venv : VarEnv) (hst hst' : HeapState) (v : Val)
@@ -2650,8 +3915,8 @@ theorem lowerRealLCNFCode_sound (fuel : Nat) (ctx : RealBridgeCtx) (st : RealBri
     (hinv : BridgeStateInv st lenv venv)
     (h_lower : lowerRealLCNFCode fuel ctx st code = .ok (lnir, st'))
     (h_eval : evalRealLCNFCode fuel ctx lenv hst code = .ok (v, hst')) :
-    evalCode fuel venv hst lnir = .ok (v, hst') := by
-  exact lowerImpureStepPure_sound fuel ctx st lenv venv hst hst' v (.inl code) lnir st' hinv h_lower h_eval
+    evalCode fuel venv hst lnir = .ok (v, hst') :=
+  lowerImpureStepPure_sound fuel ctx st st' lenv venv hst hst' v (.inl code) lnir hinv h_lower h_eval
 
 theorem lowerRealLCNFDecl_sound (fuel : Nat) (ctx : RealBridgeCtx)
     (decl : Lean.Compiler.LCNF.Decl .impure) (args : List Val) (hst hst' : HeapState) (v : Val)
@@ -2660,6 +3925,23 @@ theorem lowerRealLCNFDecl_sound (fuel : Nat) (ctx : RealBridgeCtx)
     (h_eval : evalRealLCNFDecl fuel ctx decl args hst = .ok (v, hst')) :
     evalCode fuel ((d.params.zip args).foldl (fun acc (p, val) => acc.bind p.id val) VarEnv.empty) hst d.body =
       .ok (v, hst') := by
-  sorry
+  unfold lowerRealLCNFDecl at h_lower; unfold evalRealLCNFDecl at h_eval
+  cases hdv : decl.value with
+  | extern _ => rw [hdv] at h_eval; exact nomatch h_eval
+  | code c =>
+    rw [hdv] at h_lower h_eval
+    dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure] at h_lower h_eval
+    cases hbp : bindParams LEnv.empty decl.params.toList args with
+    | error _ => rw [hbp] at h_eval; exact nomatch h_eval
+    | ok lenv =>
+      rw [hbp] at h_eval
+      cases hlc : lowerRealLCNFCode fuel ctx (internRealParams {} decl.params.toList).2 c with
+      | error _ => rw [hlc] at h_lower; exact nomatch h_lower
+      | ok plc =>
+        rw [hlc] at h_lower; injection h_lower with hd; subst d; dsimp only
+        exact lowerRealLCNFCode_sound fuel ctx (internRealParams {} decl.params.toList).2 lenv _
+          hst hst' v c plc.1 plc.2
+          (internRealParams_sound decl.params.toList args {} LEnv.empty lenv VarEnv.empty bridgeInv_empty hbp)
+          hlc h_eval
 
 end LeanNative.Proofs
