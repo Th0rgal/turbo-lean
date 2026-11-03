@@ -1279,6 +1279,37 @@ pub(crate) fn parse_olean_header_version_and_githash(bytes: &[u8]) -> Option<(St
     Some((version, githash))
 }
 
+pub(crate) fn read_olean_header_version_and_githash_confined(
+    base_root: &Path,
+    path: &Path,
+) -> Option<(String, String)> {
+    let canon_base = base_root.canonicalize().ok()?;
+    let rel = path.strip_prefix(&canon_base).ok()?;
+    if rel.as_os_str().is_empty() {
+        return None;
+    }
+    let mut cur = canon_base;
+    let comps: Vec<_> = rel.components().collect();
+    for (idx, comp) in comps.iter().enumerate() {
+        let std::path::Component::Normal(seg) = comp else {
+            return None;
+        };
+        cur.push(seg);
+        let meta = fs::symlink_metadata(&cur).ok()?;
+        if meta.file_type().is_symlink() {
+            return None;
+        }
+        if idx + 1 == comps.len() {
+            if !meta.is_file() {
+                return None;
+            }
+        } else if !meta.is_dir() {
+            return None;
+        }
+    }
+    read_olean_header_version_and_githash(&cur)
+}
+
 pub(crate) fn read_olean_header_version_and_githash(path: &Path) -> Option<(String, String)> {
     use std::io::Read;
     let mut opts = fs::OpenOptions::new();
@@ -6885,7 +6916,7 @@ pub(crate) struct DiscoveredModuleSpec {
     /// The target Lake attributes the module to: the *last* `lean_lib` that can build it.
     pub(crate) target_name: String,
     is_root_pkg: bool,
-    pkg_root: PathBuf,
+    pub(crate) pkg_root: PathBuf,
     src_root: PathBuf,
     pub(crate) src_path: PathBuf,
     pub(crate) build_lib_lean_dir: PathBuf,
@@ -31078,6 +31109,28 @@ globs = ["Down.+"]
                     &fake_tc.join("SymlinkDir/Base.olean")
                 ),
                 "is_verified_toolchain_olean_file must reject symlinked directory inside toolchain_lib_lean"
+            );
+            let canon_fake = fake_tc.canonicalize()?;
+            assert!(read_olean_header_version_and_githash_confined(
+                &canon_fake,
+                &canon_fake.join("RealBase.olean")
+            )
+            .is_some());
+            assert!(
+                read_olean_header_version_and_githash_confined(
+                    &canon_fake,
+                    &canon_fake.join("SymlinkDir/Base.olean")
+                )
+                .is_none(),
+                "read_olean_header_version_and_githash_confined must reject intermediate directory symlinks"
+            );
+            assert!(
+                read_olean_header_version_and_githash_confined(
+                    &canon_fake,
+                    &canon_fake.join("Init/SymlinkLeaf.olean")
+                )
+                .is_none(),
+                "read_olean_header_version_and_githash_confined must reject symlinked leaf .olean"
             );
         }
 

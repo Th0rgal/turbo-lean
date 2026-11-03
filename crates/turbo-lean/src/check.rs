@@ -2131,33 +2131,28 @@ fn run_check_command_inner(
                     build_rep.modules_total
                 );
             }
-            if !fs::symlink_metadata(&olean_path).is_ok_and(|m| m.is_file()) {
+            let (_, emitted_gh) =
+                crate::module_builder::read_olean_header_version_and_githash_confined(
+                    &mod_spec.pkg_root,
+                    &olean_path,
+                )
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "`--emit-olean` failed to materialize confined regular `.olean` artifact at `{}`",
+                        olean_path.display()
+                    )
+                })?;
+            let exp_gh = cfg.lean_githash.trim();
+            if !exp_gh.is_empty()
+                && exp_gh != "lean-not-installed"
+                && !emitted_gh.eq_ignore_ascii_case(exp_gh)
+            {
                 anyhow::bail!(
-                    "`--emit-olean` failed to materialize regular `.olean` artifact at `{}`",
+                    "`--emit-olean` emitted `.olean` githash `{}` != active compiler `{}` at `{}`",
+                    emitted_gh,
+                    exp_gh,
                     olean_path.display()
                 );
-            }
-            let (_, emitted_gh) =
-                crate::module_builder::read_olean_header_version_and_githash(&olean_path)
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "`--emit-olean` emitted invalid `.olean` header at `{}`",
-                            olean_path.display()
-                        )
-                    })?;
-            if let Ok(cfg) = crate::module_builder::resolve_project_config(&canon_dir) {
-                let exp_gh = cfg.lean_githash.trim();
-                if !exp_gh.is_empty()
-                    && exp_gh != "lean-not-installed"
-                    && !emitted_gh.eq_ignore_ascii_case(exp_gh)
-                {
-                    anyhow::bail!(
-                        "`--emit-olean` emitted `.olean` githash `{}` != active compiler `{}` at `{}`",
-                        emitted_gh,
-                        exp_gh,
-                        olean_path.display()
-                    );
-                }
             }
             let total_ms = t0.elapsed().as_millis() as i64;
             if let Some(obj) = out_json.as_object_mut() {
