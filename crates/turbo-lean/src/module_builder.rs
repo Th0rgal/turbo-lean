@@ -353,6 +353,8 @@ pub struct NativeBuildReport {
     pub config_digest: String,
     pub compiled_modules: Vec<String>,
     pub cached_modules: Vec<String>,
+    #[serde(default)]
+    pub cone_source_paths: Vec<PathBuf>,
     pub bwrap_used: bool,
 }
 
@@ -9371,6 +9373,100 @@ pub(crate) fn global_emit_c_enabled() -> bool {
         })
 }
 
+pub(crate) fn targets_include_exe_link_target(cfg: &ProjectConfig, targets: &[String]) -> bool {
+    let root_pkg = &cfg.root_pkg;
+    let ws_pkgs = || std::iter::once(root_pkg).chain(cfg.dep_pkgs.iter());
+    for raw_target in targets {
+        let raw_trimmed = raw_target.trim();
+        let explicit_pkg = raw_trimmed.starts_with('@');
+        let explicit_workspace_module = !explicit_pkg && raw_trimmed.starts_with('+');
+        let t = raw_trimmed.strip_prefix('@').unwrap_or(raw_trimmed);
+        if t.matches(':').count() > 1 {
+            continue;
+        }
+        let (target_base, facet_opt) = match t.split_once(':') {
+            Some((b, f)) => (b.trim(), Some(f.trim())),
+            None => (t.trim(), None),
+        };
+        if facet_opt == Some("exe") {
+            return true;
+        }
+        if facet_opt.is_some_and(|f| f != "default") {
+            continue;
+        }
+        let slash_parts: Vec<&str> = target_base.split('/').collect();
+        let (pkg_filter, item_raw, explicit_pkg_item_mod) = match slash_parts.as_slice() {
+            [only] => (None, *only, false),
+            [pkg, item] => (
+                Some((*pkg).trim()),
+                (*item).trim(),
+                (*item).trim().starts_with('+'),
+            ),
+            _ => continue,
+        };
+        if explicit_workspace_module || explicit_pkg_item_mod {
+            continue;
+        }
+        let item_body = item_raw.strip_prefix('+').unwrap_or(item_raw);
+        let item_name = clean_lake_ident(item_body);
+        if let Some(pf) = pkg_filter {
+            let base = clean_lake_ident(pf.strip_prefix('@').unwrap_or(pf));
+            let pkg_opt = if base.is_empty() {
+                Some(root_pkg)
+            } else {
+                ws_pkgs().find(|p| p.base_name == base)
+            };
+            if let Some(pkg) = pkg_opt {
+                if item_raw.is_empty() {
+                    if pkg
+                        .default_targets
+                        .iter()
+                        .any(|dt| pkg.exes.iter().any(|e| e.name == clean_lake_ident(dt)))
+                    {
+                        return true;
+                    }
+                } else if pkg.exes.iter().any(|e| e.name == item_name) {
+                    return true;
+                }
+            }
+        } else if explicit_pkg {
+            let pkg_opt = if item_name.is_empty() {
+                Some(root_pkg)
+            } else {
+                ws_pkgs().find(|p| p.base_name == item_name)
+            };
+            if let Some(pkg) = pkg_opt {
+                if pkg
+                    .default_targets
+                    .iter()
+                    .any(|dt| pkg.exes.iter().any(|e| e.name == clean_lake_ident(dt)))
+                {
+                    return true;
+                }
+            }
+        } else if item_name.is_empty() {
+            if root_pkg
+                .default_targets
+                .iter()
+                .any(|dt| root_pkg.exes.iter().any(|e| e.name == clean_lake_ident(dt)))
+            {
+                return true;
+            }
+        } else if ws_pkgs().any(|p| p.exes.iter().any(|e| e.name == item_name)) {
+            return true;
+        } else if let Some(pkg) = ws_pkgs().find(|p| p.base_name == item_name) {
+            if pkg
+                .default_targets
+                .iter()
+                .any(|dt| pkg.exes.iter().any(|e| e.name == clean_lake_ident(dt)))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub fn build_module_dag_with_trust(
     cfg: &ProjectConfig,
     targets: &[String],
@@ -10642,8 +10738,23 @@ pub fn build_module_dag_with_trust(
             }
             out.push(m.to_string());
         }
-        for (m, _) in expand_lib_configured_modules(pkg, lib)? {
-            rec_collect_local(&m, lib_name, &nodes, &mut visited_local, &mut local_modules);
+        if targets.is_empty()
+            || expanded_shared_libs.contains(&(pkg_root.clone(), lib_name.clone()))
+        {
+            for (m, _) in expand_lib_configured_modules(pkg, lib)? {
+                rec_collect_local(&m, lib_name, &nodes, &mut visited_local, &mut local_modules);
+            }
+        } else {
+            for m in nodes
+                .values()
+                .filter(|n| {
+                    !n.is_exe_target && &n.pkg_root == pkg_root && &n.target_name == lib_name
+                })
+                .map(|n| n.module_name.clone())
+                .collect::<Vec<_>>()
+            {
+                rec_collect_local(&m, lib_name, &nodes, &mut visited_local, &mut local_modules);
+            }
         }
         if local_modules.is_empty() {
             continue;
@@ -16316,6 +16427,7 @@ pub fn build_project_modules_native(
         config_digest: cfg.canonical_config_digest.clone(),
         compiled_modules: Vec::new(),
         cached_modules: Vec::new(),
+        cone_source_paths: dag.nodes.values().map(|n| n.src_path.clone()).collect(),
         bwrap_used: false,
     };
     if dag.nodes.is_empty() {
@@ -27580,6 +27692,149 @@ root = "Main"
                 .contains(&"Warm.Base".to_string()),
             "Warm.Base with tampered githash must recompile: {:?}",
             rep_bad_hdr.compiled_modules
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_target_cone_scoping_skips_unrelated_libs_and_module_full_cas() -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("target_cone_scoping");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("LibA"))?;
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        // Declare two libraries: `LibA` (present) and `LibB` whose `LibB.+` directory does not
+        // exist unless walked, plus later a broken `LibB/Broken.lean` that would fail `split_lean_source`
+        // or compilation if `LibB` were eagerly walked or compiled.
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"two_libs\"\ndefaultTargets = [\"LibA\", \"LibB\"]\n[[lean_lib]]\nname = \"LibA\"\nglobs = [\"LibA.+\"]\n[[lean_lib]]\nname = \"LibB\"\nglobs = [\"LibB.+\"]\n",
+        )?;
+        fs::write(
+            proj_dir.join("LibA/Core.lean"),
+            "namespace LibA\ndef val : Nat := 42\ntheorem val_eq : val = 42 := rfl\nend LibA\n",
+        )?;
+
+        // 1. Even before `LibB/` exists on disk (which would fail `expand_lib_configured_modules`
+        //    if `LibB.+` were walked), `build_module_dag_with_trust(..., &["LibA"], ...)` and
+        //    `run_build_command(..., vec!["LibA"])` succeed and build only `LibA.Core`.
+        let cfg = resolve_project_config(&proj_dir)?;
+        let dag_a = build_module_dag_with_trust(&cfg, &["LibA".to_string()], false)?;
+        assert_eq!(
+            dag_a.nodes.keys().cloned().collect::<Vec<_>>(),
+            vec!["LibA.Core".to_string()]
+        );
+
+        // Now populate `LibB/Broken.lean` with an invalid Lean proof/header that must never be
+        // compiled or walked when building target `LibA`.
+        fs::create_dir_all(proj_dir.join("LibB"))?;
+        fs::write(
+            proj_dir.join("LibB/Broken.lean"),
+            "import NonExistent.Module\ndef broken : Nat := \"type_mismatch\"\n",
+        )?;
+
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        crate::lake_build::run_build_command(
+            &mut store,
+            true,
+            vec!["LibA".to_string()],
+            proj_dir.clone(),
+            "trusted".to_string(),
+            1,
+            true,
+        )?;
+        assert!(
+            proj_dir
+                .join(".lake/build/lib/lean/LibA/Core.olean")
+                .is_file(),
+            "LibA.Core.olean must be built"
+        );
+        assert!(
+            !proj_dir
+                .join(".lake/build/lib/lean/LibB/Broken.olean")
+                .exists(),
+            "LibB.Broken.olean must never be built when targeting LibA"
+        );
+        let module_full_count: i64 = store.conn.query_row(
+            "SELECT COUNT(*) FROM actions WHERE kind = 'module_full'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            module_full_count, 0,
+            "target-scoped build must publish zero `module_full` actions"
+        );
+        let module_unit_count: i64 = store.conn.query_row(
+            "SELECT COUNT(*) FROM actions WHERE kind = 'module_unit'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            module_unit_count, 1,
+            "target-scoped build must populate `module_unit` CAS for LibA.Core"
+        );
+
+        // 2. Clean `.lake/build` into a fresh worktree `proj2` (still keeping broken `LibB/Broken.lean`)
+        //    and verify `run_build_command(..., vec!["LibA"])` restores `LibA.Core` from `module_unit` CAS
+        //    without touching `LibB` or publishing `module_full`.
+        let proj2 = dir.join("proj2");
+        fs::create_dir_all(proj2.join("LibA"))?;
+        fs::create_dir_all(proj2.join("LibB"))?;
+        for rel in [
+            "lean-toolchain",
+            "lakefile.toml",
+            "LibA/Core.lean",
+            "LibB/Broken.lean",
+        ] {
+            fs::copy(proj_dir.join(rel), proj2.join(rel))?;
+        }
+        crate::lake_build::run_build_command(
+            &mut store,
+            true,
+            vec!["LibA".to_string()],
+            proj2.clone(),
+            "trusted".to_string(),
+            1,
+            false,
+        )?;
+        assert!(
+            proj2.join(".lake/build/lib/lean/LibA/Core.olean").is_file(),
+            "proj2 LibA.Core.olean must be restored from module_unit CAS"
+        );
+        let module_full_count_after: i64 = store.conn.query_row(
+            "SELECT COUNT(*) FROM actions WHERE kind = 'module_full'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(module_full_count_after, 0);
+
+        // 3. Whole-repo build (`targets = []`) once `LibB/Broken.lean` is fixed still publishes `module_full`.
+        fs::write(
+            proj_dir.join("LibB/Broken.lean"),
+            "namespace LibB\ndef okVal : Nat := 7\nend LibB\n",
+        )?;
+        crate::lake_build::run_build_command(
+            &mut store,
+            true,
+            Vec::new(),
+            proj_dir.clone(),
+            "trusted".to_string(),
+            1,
+            false,
+        )?;
+        let module_full_whole: i64 = store.conn.query_row(
+            "SELECT COUNT(*) FROM actions WHERE kind = 'module_full'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!(
+            module_full_whole, 1,
+            "whole-repo build (`targets = []`) must still publish `module_full`"
         );
 
         let _ = fs::remove_dir_all(&dir);
