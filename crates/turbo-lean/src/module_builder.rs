@@ -1151,15 +1151,18 @@ fn path_is_elan_proxy_bin(path: &Path) -> bool {
     path_has_elan_bin_component(path)
 }
 
+fn allow_toolchain_fallback_opt_in() -> bool {
+    std::env::var("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 fn is_toolchain_eligible_for_fleet_fallback(toolchain: &str) -> bool {
     let trimmed = toolchain.trim();
     if trimmed.is_empty() || trimmed == "unknown" {
         return true;
     }
-    if std::env::var("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-    {
+    if allow_toolchain_fallback_opt_in() {
         if let Some(ver) = extract_toolchain_version_token(trimmed) {
             let mut parts = ver.split('.');
             if let (Some(major_str), Some(minor_raw)) = (parts.next(), parts.next()) {
@@ -1217,6 +1220,15 @@ pub fn resolve_toolchain_compiler_with_trust(
     toolchain: &str,
     is_untrusted: bool,
 ) -> Result<(PathBuf, String, PathBuf, PathBuf)> {
+    resolve_toolchain_compiler_with_roots(project_dir, toolchain, is_untrusted, None)
+}
+
+fn resolve_toolchain_compiler_with_roots(
+    project_dir: &Path,
+    toolchain: &str,
+    is_untrusted: bool,
+    explicit_elan_roots: Option<&[PathBuf]>,
+) -> Result<(PathBuf, String, PathBuf, PathBuf)> {
     let canon_proj = project_dir
         .canonicalize()
         .unwrap_or_else(|_| project_dir.to_path_buf());
@@ -1237,63 +1249,78 @@ pub fn resolve_toolchain_compiler_with_trust(
         }
     }
     let mut elan_roots: Vec<PathBuf> = Vec::new();
-    if !is_untrusted {
-        if let Ok(extra_roots) = std::env::var("TURBO_LEAN_ELAN_ROOTS") {
-            for r in std::env::split_paths(&extra_roots) {
-                if r.is_dir() {
-                    elan_roots.push(r);
+    if let Some(roots) = explicit_elan_roots {
+        elan_roots.extend_from_slice(roots);
+    } else {
+        if !is_untrusted {
+            if let Ok(extra_roots) = std::env::var("TURBO_LEAN_ELAN_ROOTS") {
+                for r in std::env::split_paths(&extra_roots) {
+                    if r.is_dir() {
+                        elan_roots.push(r);
+                    }
                 }
             }
         }
-    }
-    if let Ok(eh) = std::env::var("ELAN_HOME") {
-        elan_roots.push(PathBuf::from(eh));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let home_path = PathBuf::from(&home);
-        elan_roots.push(home_path.join(".elan"));
-        let mut anc = home_path.parent();
-        for _ in 0..3 {
-            if let Some(p) = anc {
-                elan_roots.push(p.join(".elan"));
-                elan_roots.push(p.join("caches/elan"));
-                anc = p.parent();
-            }
+        if let Ok(eh) = std::env::var("ELAN_HOME") {
+            elan_roots.push(PathBuf::from(eh));
         }
-    }
-    for sys_elan in [
-        "/root/.elan",
-        "/var/lib/sandboxed-node/.elan",
-        "/var/lib/sandboxed-node/caches/elan",
-    ] {
-        let p = PathBuf::from(sys_elan);
-        if p.is_dir() && !elan_roots.contains(&p) {
-            elan_roots.push(p);
-        }
-    }
-    if !is_untrusted {
-        if let Ok(cwd) = std::env::current_dir() {
-            let mut anc = Some(cwd.as_path());
-            for _ in 0..4 {
+        if let Ok(home) = std::env::var("HOME") {
+            let home_path = PathBuf::from(&home);
+            elan_roots.push(home_path.join(".elan"));
+            let mut anc = home_path.parent();
+            for _ in 0..3 {
                 if let Some(p) = anc {
-                    if p.join(".elan/toolchains").is_dir() {
-                        elan_roots.push(p.join(".elan"));
-                    }
-                    if p.join("caches/elan/toolchains").is_dir() {
-                        elan_roots.push(p.join("caches/elan"));
-                    }
+                    elan_roots.push(p.join(".elan"));
+                    elan_roots.push(p.join("caches/elan"));
                     anc = p.parent();
                 }
             }
         }
-        if let Ok(path_var) = std::env::var("PATH") {
-            for dir in std::env::split_paths(&path_var) {
-                if let Some(parent) = dir.parent() {
-                    if parent.join("toolchains").is_dir() {
-                        elan_roots.push(parent.to_path_buf());
-                    } else if let Some(gp) = parent.parent().and_then(|p| p.parent()) {
-                        if gp.join("toolchains").is_dir() {
-                            elan_roots.push(gp.to_path_buf());
+        for sys_elan in [
+            "/root/.elan",
+            "/var/lib/sandboxed-node/.elan",
+            "/var/lib/sandboxed-node/caches/elan",
+        ] {
+            let p = PathBuf::from(sys_elan);
+            if p.is_dir() && !elan_roots.contains(&p) {
+                elan_roots.push(p);
+            }
+        }
+        if !is_untrusted {
+            for orb_elan in [
+                "/var/lib/orb-node/caches/elan",
+                "/var/lib/orb-node/.elan",
+                "/var/lib/orb-node/work/caches/elan",
+                "/opt/orb/elan",
+            ] {
+                let p = PathBuf::from(orb_elan);
+                if p.is_dir() && !elan_roots.contains(&p) {
+                    elan_roots.push(p);
+                }
+            }
+            if let Ok(cwd) = std::env::current_dir() {
+                let mut anc = Some(cwd.as_path());
+                for _ in 0..4 {
+                    if let Some(p) = anc {
+                        if p.join(".elan/toolchains").is_dir() {
+                            elan_roots.push(p.join(".elan"));
+                        }
+                        if p.join("caches/elan/toolchains").is_dir() {
+                            elan_roots.push(p.join("caches/elan"));
+                        }
+                        anc = p.parent();
+                    }
+                }
+            }
+            if let Ok(path_var) = std::env::var("PATH") {
+                for dir in std::env::split_paths(&path_var) {
+                    if let Some(parent) = dir.parent() {
+                        if parent.join("toolchains").is_dir() {
+                            elan_roots.push(parent.to_path_buf());
+                        } else if let Some(gp) = parent.parent().and_then(|p| p.parent()) {
+                            if gp.join("toolchains").is_dir() {
+                                elan_roots.push(gp.to_path_buf());
+                            }
                         }
                     }
                 }
@@ -1311,10 +1338,9 @@ pub fn resolve_toolchain_compiler_with_trust(
         || std::env::var("TURBO_LEAN_STRICT_TOOLCHAIN")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+    let allow_explicit_fallback = allow_toolchain_fallback_opt_in() && !strict_tc;
     let mut used_fallback_tc = false;
-    if candidate_bins.is_empty() && !strict_tc {
-        // Fallback 1: Prefer canonical fleet toolchain `leanprover/lean4:v4.35.0` when a project's
-        // `lean-toolchain` still references an older version (e.g. `v4.31.0`, `v4.33.1`) not installed locally.
+    if candidate_bins.is_empty() && allow_explicit_fallback {
         for root in &elan_roots {
             let v435 = root
                 .join("toolchains")
@@ -1326,26 +1352,15 @@ pub fn resolve_toolchain_compiler_with_trust(
             }
         }
     }
-    if candidate_bins.is_empty() && !is_untrusted {
+    if candidate_bins.is_empty() && !is_untrusted && (!has_specific_tc || allow_explicit_fallback) {
         if let Ok(path_var) = std::env::var("PATH") {
             for dir in std::env::split_paths(&path_var) {
                 let cand = dir.join("lean");
                 if cand.is_file() {
-                    if strict_tc
-                        && has_specific_tc
-                        && (path_is_elan_proxy_bin(&cand)
-                            || (path_is_inside_any_toolchains_dir(&cand)
-                                && !path_has_toolchain_component(&cand, &tc_dir_name)))
-                    {
-                        continue;
-                    }
                     if path_is_elan_proxy_bin(&cand) {
                         continue;
                     }
-                    if !strict_tc
-                        && has_specific_tc
-                        && !path_has_toolchain_component(&cand, &tc_dir_name)
-                    {
+                    if has_specific_tc && !path_has_toolchain_component(&cand, &tc_dir_name) {
                         used_fallback_tc = true;
                     }
                     candidate_bins.push(cand);
@@ -1353,7 +1368,7 @@ pub fn resolve_toolchain_compiler_with_trust(
             }
         }
     }
-    if candidate_bins.is_empty() && (!has_specific_tc || !strict_tc) {
+    if candidate_bins.is_empty() && (!has_specific_tc || allow_explicit_fallback) {
         for root in &elan_roots {
             let tc_dir = root.join("toolchains");
             if let Ok(entries) = fs::read_dir(&tc_dir) {
@@ -6486,7 +6501,7 @@ pub fn resolve_project_config_with_trust(
         .unwrap_or_else(|_| project_dir.to_path_buf());
     let toolchain = lake_build::detect_toolchain(&canon_dir);
     let (lean_bin, lean_githash, toolchain_lib_lean, toolchain_lib) =
-        match resolve_toolchain_compiler_with_trust(&canon_dir, &toolchain, true) {
+        match resolve_toolchain_compiler_with_trust(&canon_dir, &toolchain, is_untrusted) {
             Ok(resolved) => resolved,
             Err(e) => {
                 let strict_tc = is_untrusted
@@ -7071,6 +7086,60 @@ fn resolve_module_in_package_mode(
     }
     None
 }
+pub(crate) fn lean_githash_for_bin(lean_bin: &Path) -> Option<String> {
+    let canon_bin = lean_bin.canonicalize().ok()?;
+    let cache = LEAN_INFO_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = cache.lock() {
+        if let Some((gh, _, _)) = guard.get(&canon_bin) {
+            return Some(gh.clone());
+        }
+    }
+    let out = Command::new(&canon_bin)
+        .env("PATH", "/usr/bin:/bin")
+        .arg("--githash")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let gh = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if gh.is_empty() {
+        return None;
+    }
+    let prefix_root = canon_bin
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|p| p.to_path_buf())
+        .filter(|p| p.join("lib/lean").is_dir());
+    if let Some(root) = prefix_root {
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(
+                canon_bin,
+                (gh.clone(), root.join("lib/lean"), root.join("lib")),
+            );
+        }
+    }
+    Some(gh)
+}
+
+pub(crate) fn lean_githash_for_sysroot_lib_lean(dir: &Path) -> Option<String> {
+    let check_root = |p: &Path| -> Option<PathBuf> {
+        if !p.ends_with("lib/lean") {
+            return None;
+        }
+        let tc = p.parent()?.parent()?;
+        for cand in [tc.join("bin/lean"), tc.join("bin/lean.exe")] {
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+        None
+    };
+    let lean_bin =
+        check_root(dir).or_else(|| fs::canonicalize(dir).ok().and_then(|c| check_root(&c)))?;
+    lean_githash_for_bin(&lean_bin)
+}
+
 pub(crate) fn is_verified_toolchain_olean_file(
     toolchain_lib_lean: &Path,
     lean_githash: Option<&str>,
@@ -7079,6 +7148,12 @@ pub(crate) fn is_verified_toolchain_olean_file(
     if toolchain_lib_lean.as_os_str().is_empty() || !olean_path.is_file() {
         return false;
     }
+    let Some(expected_gh) = lean_githash
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "lean-not-installed")
+    else {
+        return false;
+    };
     let Ok(canon_tc) = toolchain_lib_lean.canonicalize() else {
         return false;
     };
@@ -7088,12 +7163,6 @@ pub(crate) fn is_verified_toolchain_olean_file(
     if !canon_olean.starts_with(&canon_tc) {
         return false;
     }
-    let Some(expected_gh) = lean_githash
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && *s != "lean-not-installed")
-    else {
-        return true;
-    };
     let Ok(mut f) = fs::File::open(&canon_olean) else {
         return false;
     };
@@ -7104,20 +7173,27 @@ pub(crate) fn is_verified_toolchain_olean_file(
     &hdr[0..5] == b"olean" && hdr[5] == 2 && &hdr[40..80] == expected_gh.as_bytes()
 }
 
+pub(crate) fn is_builtin_toolchain_prefix_name(mod_name: &str) -> bool {
+    mod_name == "Init"
+        || mod_name.starts_with("Init.")
+        || mod_name == "Std"
+        || mod_name.starts_with("Std.")
+        || mod_name == "Lean"
+        || mod_name.starts_with("Lean.")
+        || mod_name == "Lake"
+        || mod_name.starts_with("Lake.")
+}
+
 pub(crate) fn is_builtin_toolchain_module(
     toolchain_lib_lean: &Path,
     lean_githash: Option<&str>,
     mod_name: &str,
 ) -> bool {
     if toolchain_lib_lean.as_os_str().is_empty() {
-        return mod_name == "Init"
-            || mod_name.starts_with("Init.")
-            || mod_name == "Std"
-            || mod_name.starts_with("Std.")
-            || mod_name == "Lean"
-            || mod_name.starts_with("Lean.")
-            || mod_name == "Lake"
-            || mod_name.starts_with("Lake.");
+        let is_zero_compiler = lean_githash
+            .map(str::trim)
+            .is_none_or(|s| s.is_empty() || s == "lean-not-installed");
+        return is_zero_compiler && is_builtin_toolchain_prefix_name(mod_name);
     }
     let rel_slash = module_name_to_rel_slash(mod_name);
     let cand = toolchain_lib_lean.join(format!("{}.olean", rel_slash));
@@ -7147,7 +7223,11 @@ pub(crate) fn is_unshadowed_toolchain_olean_import(
     let Some(first_hit) = all_dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
         return !is_untrusted
             && cfg.toolchain_lib_lean.as_os_str().is_empty()
-            && is_builtin_toolchain_module(&cfg.toolchain_lib_lean, None, mod_name);
+            && is_builtin_toolchain_module(
+                &cfg.toolchain_lib_lean,
+                Some(&cfg.lean_githash),
+                mod_name,
+            );
     };
     is_verified_toolchain_olean_file(&cfg.toolchain_lib_lean, Some(&cfg.lean_githash), &first_hit)
 }
@@ -22891,6 +22971,138 @@ globs = ["Demo.+"]
                 path_is_elan_proxy_bin(&sym_lean),
                 "symlink pointing into .elan/bin/lean must be detected as elan proxy"
             );
+        }
+
+        // 4. `v4.31.0` with only `v4.35.0` installed fails closed unless `TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK=1`
+        {
+            let _env_guard = native_build_env_guard();
+            let _bwrap_guard = BWRAP_TEST_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev_fallback = std::env::var_os("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK");
+            let prev_strict = std::env::var_os("TURBO_LEAN_STRICT_TOOLCHAIN");
+            let prev_elan = std::env::var_os("ELAN_HOME");
+            let prev_extra = std::env::var_os("TURBO_LEAN_ELAN_ROOTS");
+
+            let (_, _, real_lib_lean, _) =
+                resolve_toolchain_compiler_with_trust(&dir, "leanprover/lean4:v4.35.0", false)
+                    .expect("resolve installed v4.35.0 toolchain");
+            let real_elan_root = real_lib_lean
+                .ancestors()
+                .nth(4)
+                .expect("elan root from lib/lean")
+                .to_path_buf();
+
+            let isolated_elan = dir.join("only_v435_elan");
+            fs::create_dir_all(isolated_elan.join("toolchains")).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(
+                real_elan_root.join("toolchains/leanprover--lean4---v4.35.0"),
+                isolated_elan.join("toolchains/leanprover--lean4---v4.35.0"),
+            )
+            .unwrap();
+            let isolated_home = dir.join("isolated/a/b/home");
+            fs::create_dir_all(&isolated_home).unwrap();
+            let prev_home = std::env::var_os("HOME");
+            let prev_path = std::env::var_os("PATH");
+
+            unsafe {
+                std::env::remove_var("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK");
+                std::env::remove_var("TURBO_LEAN_STRICT_TOOLCHAIN");
+                std::env::set_var("ELAN_HOME", &isolated_elan);
+                std::env::set_var("HOME", &isolated_home);
+                std::env::set_var("PATH", "/usr/bin:/bin");
+                std::env::remove_var("TURBO_LEAN_ELAN_ROOTS");
+            }
+
+            let isolated_roots = vec![isolated_elan.clone()];
+            let err_v431 = resolve_toolchain_compiler_with_roots(
+                &dir,
+                "leanprover/lean4:v4.31.0",
+                false,
+                Some(&isolated_roots),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err_v431.contains(
+                    "Could not locate installed `lean` compiler binary matching toolchain"
+                ) && err_v431.contains("v4.31.0")
+                    && err_v431.contains("fail-closed"),
+                "expected v4.31.0 without fallback opt-in to fail closed, got: {err_v431}"
+            );
+
+            unsafe {
+                std::env::set_var("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK", "1");
+            }
+            let (fb_bin, fb_gh, _, _) = resolve_toolchain_compiler_with_roots(
+                &dir,
+                "leanprover/lean4:v4.31.0",
+                false,
+                Some(&isolated_roots),
+            )
+            .expect("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK=1 restores fleet fallback");
+            assert!(
+                fb_bin
+                    .to_string_lossy()
+                    .contains("leanprover--lean4---v4.35.0"),
+                "expected v4.35.0 fallback binary, got: {}",
+                fb_bin.display()
+            );
+
+            // 5. Hard-block `.olean` v2 githash skew and missing/sentinel githashes
+            let init_olean = real_lib_lean.join("Init.olean");
+            assert!(
+                is_verified_toolchain_olean_file(&real_lib_lean, Some(&fb_gh), &init_olean),
+                "matching real githash must verify toolchain Init.olean"
+            );
+            assert!(
+                !is_verified_toolchain_olean_file(&real_lib_lean, None, &init_olean),
+                "None githash must fail closed"
+            );
+            assert!(
+                !is_verified_toolchain_olean_file(
+                    &real_lib_lean,
+                    Some("lean-not-installed"),
+                    &init_olean
+                ),
+                "sentinel githash must fail closed"
+            );
+            assert!(
+                !is_verified_toolchain_olean_file(
+                    &real_lib_lean,
+                    Some("0000000000000000000000000000000000000000"),
+                    &init_olean
+                ),
+                "mismatched githash must fail closed"
+            );
+
+            unsafe {
+                match prev_fallback {
+                    Some(v) => std::env::set_var("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK", v),
+                    None => std::env::remove_var("TURBO_LEAN_ALLOW_TOOLCHAIN_FALLBACK"),
+                }
+                match prev_strict {
+                    Some(v) => std::env::set_var("TURBO_LEAN_STRICT_TOOLCHAIN", v),
+                    None => std::env::remove_var("TURBO_LEAN_STRICT_TOOLCHAIN"),
+                }
+                match prev_elan {
+                    Some(v) => std::env::set_var("ELAN_HOME", v),
+                    None => std::env::remove_var("ELAN_HOME"),
+                }
+                match prev_extra {
+                    Some(v) => std::env::set_var("TURBO_LEAN_ELAN_ROOTS", v),
+                    None => std::env::remove_var("TURBO_LEAN_ELAN_ROOTS"),
+                }
+                match prev_home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match prev_path {
+                    Some(v) => std::env::set_var("PATH", v),
+                    None => std::env::remove_var("PATH"),
+                }
+            }
         }
 
         let _ = fs::remove_dir_all(&dir);
