@@ -3785,4 +3785,20 @@ theorem eor3_bv_eq_u64 (a b : UInt64) :
   rw [h]; generalize a.toBitVec = x; generalize b.toBitVec = y
   bv_decide
 
+
+theorem bne_zero_bv_iff (x : UInt64) : (x.toBitVec != 0#64) = (x != 0) := by
+  cases h : (x != 0)
+  · have hx0 : x = 0 := by simpa [bne_iff_ne] using h
+    subst hx0; rfl
+  · cases h2 : (x.toBitVec != 0#64)
+    · have hx0 : x = 0 := UInt64.eq_of_toBitVec_eq (by simpa [bne_iff_ne] using h2)
+      subst hx0; cases h
+    · rfl
+
+theorem bool_bv_beq (bl br : Bool) :
+    ((if bl then (1#64 : BitVec 64) else 0#64) == (if br then 1#64 else 0#64)) = (bl == br) := by
+  cases bl
+  · cases br <;> rfl
+  · cases br <;> rfl
+
 end LeanNative.Backend.MetalAst

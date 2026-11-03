@@ -9,90 +9,63 @@ open LeanNative.Semantics
 open LeanNative.Backend
 open LeanNative.Backend.MetalLower
 
-theorem lowerScalar_inferExprType
-    (g : MetalAst.MSLGroupState)
-    (ls : MetalAst.MSLLocals)
-    (idxName : String) (idxVar : Nat) (boundVars : List Nat)
-    (e : ScalarExpr) (s : Bool)
+theorem lowerScalar_inferExprType (g : MetalAst.MSLGroupState) (ls : MetalAst.MSLLocals)
+    (idxName : String) (idxVar : Nat) (boundVars : List Nat) (e : ScalarExpr) (s : Bool)
     (hsort : inferScalarSort boundVars e = some s)
-    (hty : ∀ id ∈ boundVars,
-      ls.lookupType? (if id == idxVar then idxName else s!"v{id}") = some .ulong) :
+    (hty : ∀ id ∈ boundVars, ls.lookupType? (if id == idxVar then idxName else s!"v{id}") = some .ulong) :
     MetalAst.inferExprType g ls (lowerScalar idxName idxVar e) = .ulong := by
   induction e generalizing s with
-  | constU64 _ => rfl
-  | constBool _ => rfl
+  | constU64 _ | constBool _ => rfl
   | var id =>
     simp only [inferScalarSort] at hsort
     split at hsort
-    · rename_i hmem
-      have hl := hty id hmem
-      unfold lowerScalar v
-      cases hidx : id == idxVar
-      · simp only [hidx, Bool.false_eq_true, ite_false] at hl ⊢
-        simp only [MetalAst.inferExprType, hl]
-      · simp only [hidx, ite_true] at hl ⊢
+    · rename_i hmem; have hl := hty id hmem; unfold lowerScalar v
+      cases hidx : id == idxVar <;> simp only [hidx, Bool.false_eq_true, ite_false, ite_true] at hl ⊢ <;>
         simp only [MetalAst.inferExprType, hl]
     · cases hsort
   | binOp op l r ihl ihr =>
     simp only [inferScalarSort] at hsort
     cases hsl : inferScalarSort boundVars l <;> simp only [hsl] at hsort
     · cases hsort
-    · rename_i sl
-      cases hsr : inferScalarSort boundVars r <;> simp only [hsr] at hsort
+    · cases hsr : inferScalarSort boundVars r <;> simp only [hsr] at hsort
       · cases hsort
-      · rename_i sr
-        have tl := ihl sl hsl
-        have tr := ihr sr hsr
-        cases sl
-        · cases sr
-          · cases op <;> simp [inferBinOpU64] at hsort <;>
-              dsimp only [lowerScalar, u, m63, MetalAst.inferExprType] <;>
-              simp only [MetalAst.promoteMSLArithType_ulong, tl, tr]
-          · simp at hsort
-        · cases sr
-          · simp at hsort
-          · cases op <;> simp [inferBinOpBool] at hsort <;>
-              dsimp only [lowerScalar, u, m63, MetalAst.inferExprType] <;>
-              simp only [MetalAst.promoteMSLArithType_ulong, tl, tr]
+      · rename_i sl sr; have tl := ihl sl hsl; have tr := ihr sr hsr
+        cases sl <;> cases sr <;> try simp at hsort
+        · cases op <;> simp [inferBinOpU64] at hsort <;>
+            dsimp only [lowerScalar, u, m63, MetalAst.inferExprType] <;>
+            simp only [MetalAst.promoteMSLArithType_ulong, tl, tr]
+        · cases op <;> simp [inferBinOpBool] at hsort <;>
+            dsimp only [lowerScalar, u, m63, MetalAst.inferExprType] <;>
+            simp only [MetalAst.promoteMSLArithType_ulong, tl, tr]
   | unaryOp op a iha =>
     simp only [inferScalarSort] at hsort
     cases hsa : inferScalarSort boundVars a <;> simp only [hsa] at hsort
     · cases hsort
-    · rename_i sa
-      have ta := iha sa hsa
-      cases sa
-      · cases op <;> simp [inferUnaryOpU64] at hsort <;>
-          dsimp only [lowerScalar, u, MetalAst.inferExprType] <;>
-          simp only [MetalAst.promoteMSLArithType_ulong, ta]
-      · simp at hsort
-  | select c t f ihc iht ihf =>
+    · rename_i sa; have ta := iha sa hsa
+      cases sa <;> try simp at hsort
+      cases op <;> simp [inferUnaryOpU64] at hsort <;>
+        dsimp only [lowerScalar, u, MetalAst.inferExprType] <;>
+        simp only [MetalAst.promoteMSLArithType_ulong, ta]
+  | select c t f _ iht _ =>
     simp only [inferScalarSort] at hsort
     cases hsc : inferScalarSort boundVars c <;> simp only [hsc] at hsort
     · cases hsort
     · cases hst : inferScalarSort boundVars t <;> simp only [hst] at hsort
       · cases hsort
-      · rename_i st
-        cases hsf : inferScalarSort boundVars f <;> simp only [hsf] at hsort
+      · rename_i st; cases hsf : inferScalarSort boundVars f <;> simp only [hsf] at hsort
         · cases hsort
-        · have tt := iht st hst
-          simp only [lowerScalar, MetalAst.inferExprType, tt]
+        · simp only [lowerScalar, MetalAst.inferExprType, iht st hst]
   | fma a b c iha ihb ihc =>
     simp only [inferScalarSort] at hsort
     cases hsa : inferScalarSort boundVars a <;> simp only [hsa] at hsort
     · cases hsort
-    · rename_i sa
-      cases hsb : inferScalarSort boundVars b <;> simp only [hsb] at hsort
+    · cases hsb : inferScalarSort boundVars b <;> simp only [hsb] at hsort
       · cases hsort
-      · rename_i sb
-        cases hsc : inferScalarSort boundVars c <;> simp only [hsc] at hsort
+      · cases hsc : inferScalarSort boundVars c <;> simp only [hsc] at hsort
         · cases hsort
-        · rename_i sc
-          have ta := iha sa hsa
-          have tb := ihb sb hsb
-          have tc := ihc sc hsc
-          simp only [lowerScalar, MetalAst.inferExprType,
-            MetalAst.promoteMSLArithType_ulong, ta, tb, tc]
-
+        · rename_i sa sb sc
+          simp only [lowerScalar, MetalAst.inferExprType, MetalAst.promoteMSLArithType_ulong,
+            iha sa hsa, ihb sb hsb, ihc sc hsc]
 theorem varEnvMatchesLocals_mem (env : VarEnv) (ls : MetalAst.MSLLocals)
     (idxName : String) (idxVar : Nat) (boundVars : List Nat)
     (hmatch : varEnvMatchesLocals env ls idxName idxVar boundVars)
@@ -119,330 +92,211 @@ private theorem valOfSort_true {v : Val} {bv : BitVec 64} (h : valOfSort true v 
   exact ⟨_, rfl, h.symm⟩
 
 private theorem lowerBinOpU64_eval
-    (callEval : Nat → MetalAst.MSLGroupState →
-      MetalAst.Dim3 → MetalAst.MSLLocals →
-      List MetalAst.MSLAccess → String →
-      MetalAst.MSLExprList →
-      MetalAst.MSLOutcome MetalAst.MSLEval)
+    (callEval : Nat → MetalAst.MSLGroupState → MetalAst.Dim3 → MetalAst.MSLLocals →
+      List MetalAst.MSLAccess → String → MetalAst.MSLExprList → MetalAst.MSLOutcome MetalAst.MSLEval)
     (env : VarEnv) (idxName : String) (idxVar : Nat) (l r : ScalarExpr)
-    (op : BinOp) (s : Bool) (xl xr : UInt64)
-    (hsort : inferBinOpU64 op = some s)
+    (op : BinOp) (s : Bool) (xl xr : UInt64) (hsort : inferBinOpU64 op = some s)
     (hevl : evalScalarExpr env l = .ok (.u64 xl)) (hevr : evalScalarExpr env r = .ok (.u64 xr)) :
     ∃ (val : Val) (bv : BitVec 64),
-      evalScalarExpr env (.binOp op l r) = .ok val ∧
-      valOfSort s val = some bv ∧
-      ∀ (fuel : Nat) (g : MetalAst.MSLGroupState)
-        (tid : MetalAst.Dim3) (ls : MetalAst.MSLLocals)
-        (log : List MetalAst.MSLAccess),
-        MetalAst.evalExprWithCall callEval fuel g tid ls log (lowerScalar idxName idxVar l) =
-          .ok { value := xl.toBitVec, fields := [], locals := ls, log := log } →
-        MetalAst.evalExprWithCall callEval fuel g tid ls log (lowerScalar idxName idxVar r) =
-          .ok { value := xr.toBitVec, fields := [], locals := ls, log := log } →
+      evalScalarExpr env (.binOp op l r) = .ok val ∧ valOfSort s val = some bv ∧
+      ∀ (f : Nat) (g : MetalAst.MSLGroupState) (t : MetalAst.Dim3) (ls : MetalAst.MSLLocals)
+        (lg : List MetalAst.MSLAccess),
+        MetalAst.evalExprWithCall callEval f g t ls lg (lowerScalar idxName idxVar l) =
+          .ok { value := xl.toBitVec, fields := [], locals := ls, log := lg } →
+        MetalAst.evalExprWithCall callEval f g t ls lg (lowerScalar idxName idxVar r) =
+          .ok { value := xr.toBitVec, fields := [], locals := ls, log := lg } →
         MetalAst.inferExprType g ls (lowerScalar idxName idxVar l) = .ulong →
         MetalAst.inferExprType g ls (lowerScalar idxName idxVar r) = .ulong →
-        MetalAst.evalExprWithCall callEval fuel g tid ls log
-          (lowerScalar idxName idxVar (.binOp op l r)) =
-          .ok { value := bv, fields := [], locals := ls, log := log } := by
+        MetalAst.evalExprWithCall callEval f g t ls lg (lowerScalar idxName idxVar (.binOp op l r)) =
+          .ok { value := bv, fields := [], locals := ls, log := lg } := by
   cases op with
   | addChecked256 | subChecked256 | mulChecked256 | clmul64 | clmul64Hi | gf2Affine => cases hsort
-  | add =>
-    injection hsort with hs; subst hs
-    exact ⟨.u64 (xl + xr), (xl + xr).toBitVec, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
-      fun f g t ls lg hl hr htl htr => MetalAst.ev_add_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr⟩
-  | sub =>
-    injection hsort with hs; subst hs
-    exact ⟨.u64 (xl - xr), (xl - xr).toBitVec, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
-      fun f g t ls lg hl hr htl htr => MetalAst.ev_sub_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr⟩
-  | mul =>
-    injection hsort with hs; subst hs
-    exact ⟨.u64 (xl * xr), (xl * xr).toBitVec, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
-      fun f g t ls lg hl hr htl htr => MetalAst.ev_mul_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr⟩
-  | bitAnd =>
-    injection hsort with hs; subst hs
-    exact ⟨.u64 (xl &&& xr), (xl &&& xr).toBitVec, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
-      fun f g t ls lg hl hr htl htr => MetalAst.ev_bitand_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr⟩
-  | bitOr =>
-    injection hsort with hs; subst hs
-    exact ⟨.u64 (xl ||| xr), (xl ||| xr).toBitVec, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
-      fun f g t ls lg hl hr htl htr => MetalAst.ev_bitor_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr⟩
-  | bitXor =>
-    injection hsort with hs; subst hs
-    exact ⟨.u64 (xl ^^^ xr), (xl ^^^ xr).toBitVec, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
-      fun f g t ls lg hl hr htl htr => MetalAst.ev_bitxor_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr⟩
-  | div =>
-    injection hsort with hs; subst hs
-    exact ⟨.u64 (xl / xr), (xl / xr).toBitVec, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
-      fun f g t ls lg hl hr htl htr => MetalAst.ev_div_guarded_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr⟩
-  | mod =>
-    injection hsort with hs; subst hs
-    exact ⟨.u64 (xl % xr), (xl % xr).toBitVec, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
-      fun f g t ls lg hl hr htl htr => MetalAst.ev_mod_guarded_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr⟩
+  | add => rcases hsort with ⟨rfl⟩; exact ⟨_, _, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
+      fun f g t ls lg => MetalAst.ev_add_ulong callEval f g t ls lg _ _ _ _⟩
+  | sub => rcases hsort with ⟨rfl⟩; exact ⟨_, _, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
+      fun f g t ls lg => MetalAst.ev_sub_ulong callEval f g t ls lg _ _ _ _⟩
+  | mul => rcases hsort with ⟨rfl⟩; exact ⟨_, _, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
+      fun f g t ls lg => MetalAst.ev_mul_ulong callEval f g t ls lg _ _ _ _⟩
+  | bitAnd => rcases hsort with ⟨rfl⟩; exact ⟨_, _, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
+      fun f g t ls lg => MetalAst.ev_bitand_ulong callEval f g t ls lg _ _ _ _⟩
+  | bitOr => rcases hsort with ⟨rfl⟩; exact ⟨_, _, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
+      fun f g t ls lg => MetalAst.ev_bitor_ulong callEval f g t ls lg _ _ _ _⟩
+  | bitXor => rcases hsort with ⟨rfl⟩; exact ⟨_, _, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
+      fun f g t ls lg => MetalAst.ev_bitxor_ulong callEval f g t ls lg _ _ _ _⟩
+  | div => rcases hsort with ⟨rfl⟩; exact ⟨_, _, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
+      fun f g t ls lg => MetalAst.ev_div_guarded_ulong callEval f g t ls lg _ _ _ _⟩
+  | mod => rcases hsort with ⟨rfl⟩; exact ⟨_, _, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
+      fun f g t ls lg => MetalAst.ev_mod_guarded_ulong callEval f g t ls lg _ _ _ _⟩
   | shl =>
-    injection hsort with hs; subst hs
-    refine ⟨.u64 (xl <<< xr), (xl <<< xr).toBitVec, ?_, rfl, fun f g t ls lg hl hr htl htr => ?_⟩
-    · simp [evalScalarExpr, hevl, hevr]; rfl
-    have h := MetalAst.ev_shl_masked_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr
-    rw [MetalAst.shl_bv_eq_u64] at h; exact h
+    rcases hsort with ⟨rfl⟩; refine ⟨_, _, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl, fun f g t ls lg hl hr htl htr => ?_⟩
+    rw [← MetalAst.shl_bv_eq_u64]; exact MetalAst.ev_shl_masked_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr
   | shr =>
-    injection hsort with hs; subst hs
-    refine ⟨.u64 (xl >>> xr), (xl >>> xr).toBitVec, ?_, rfl, fun f g t ls lg hl hr htl htr => ?_⟩
-    · simp [evalScalarExpr, hevl, hevr]; rfl
-    have h := MetalAst.ev_shr_masked_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr
-    rw [MetalAst.shr_bv_eq_u64] at h; exact h
+    rcases hsort with ⟨rfl⟩; refine ⟨_, _, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl, fun f g t ls lg hl hr htl htr => ?_⟩
+    rw [← MetalAst.shr_bv_eq_u64]; exact MetalAst.ev_shr_masked_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr
   | sar =>
-    injection hsort with hs; subst hs
-    have hev : evalScalarExpr env (.binOp .sar l r) = .ok (
-        let sh := xr &&& 63
-        let signBit := (xl >>> 63) &&& 1
-        let shifted := xl >>> sh
-        .u64 (if signBit != 0 && sh != 0 then shifted ||| (0xffffffffffffffff <<< (64 - sh)) else shifted)) := by
-      simp only [evalScalarExpr, hevl, hevr]; rfl
-    refine ⟨_, _, hev, rfl, fun f g t ls lg hl hr htl htr => ?_⟩
-    have h := MetalAst.ev_sar_masked_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr
-    rw [MetalAst.sar_bv_eq_u64] at h; exact h
+    rcases hsort with ⟨rfl⟩; refine ⟨_, _, by simp only [evalScalarExpr, hevl, hevr]; rfl, rfl, fun f g t ls lg hl hr htl htr => ?_⟩
+    rw [← MetalAst.sar_bv_eq_u64]; exact MetalAst.ev_sar_masked_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr
   | eor3 =>
-    injection hsort with hs; subst hs
-    refine ⟨.u64 ((xl ^^^ (xr >>> 32)) ^^^ (xr &&& 0xffffffff)), _, ?_, rfl,
+    rcases hsort with ⟨rfl⟩
+    refine ⟨.u64 ((xl ^^^ (xr >>> 32)) ^^^ (xr &&& 0xffffffff)), _, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
       fun f g t ls lg hl hr htl htr => ?_⟩
-    · simp [evalScalarExpr, hevl, hevr]; rfl
-    have h := MetalAst.ev_eor3_compound_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr
-    rw [MetalAst.eor3_bv_eq_u64] at h
-    exact h
+    rw [← MetalAst.eor3_bv_eq_u64]; exact MetalAst.ev_eor3_compound_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr
   | eq =>
-    injection hsort with hs; subst hs
-    refine ⟨.bool (xl == xr), if xl == xr then 1#64 else 0#64, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
-      fun f g t ls lg hl hr htl htr => ?_⟩
-    have h := MetalAst.ev_eq_cast_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr
-    rw [MetalAst.eq_bv_iff] at h; exact h
-  | lt =>
-    injection hsort with hs; subst hs
-    exact ⟨.bool (decide (xl < xr)), if decide (xl < xr) then 1#64 else 0#64, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
-      fun f g t ls lg hl hr htl htr => MetalAst.ev_lt_cast_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr⟩
-  | le =>
-    injection hsort with hs; subst hs
-    exact ⟨.bool (decide (xl ≤ xr)), if decide (xl ≤ xr) then 1#64 else 0#64, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
-      fun f g t ls lg hl hr htl htr => MetalAst.ev_le_cast_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr⟩
+    rcases hsort with ⟨rfl⟩; refine ⟨_, _, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl, fun f g t ls lg hl hr htl htr => ?_⟩
+    rw [← MetalAst.eq_bv_iff]; exact MetalAst.ev_eq_cast_ulong callEval f g t ls lg _ _ _ _ hl hr htl htr
+  | lt => rcases hsort with ⟨rfl⟩; exact ⟨_, _, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
+      fun f g t ls lg => MetalAst.ev_lt_cast_ulong callEval f g t ls lg _ _ _ _⟩
+  | le => rcases hsort with ⟨rfl⟩; exact ⟨_, _, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
+      fun f g t ls lg => MetalAst.ev_le_cast_ulong callEval f g t ls lg _ _ _ _⟩
 
 private theorem lowerScalar_eval_core
-    (callEval : Nat → MetalAst.MSLGroupState →
-      MetalAst.Dim3 → MetalAst.MSLLocals →
-      List MetalAst.MSLAccess → String →
-      MetalAst.MSLExprList →
-      MetalAst.MSLOutcome MetalAst.MSLEval)
+    (callEval : Nat → MetalAst.MSLGroupState → MetalAst.Dim3 → MetalAst.MSLLocals →
+      List MetalAst.MSLAccess → String → MetalAst.MSLExprList → MetalAst.MSLOutcome MetalAst.MSLEval)
     (env : VarEnv) (idxName : String) (idxVar : Nat) (boundVars : List Nat)
     (henv : ∀ id ∈ boundVars, ∃ x : UInt64, env id = some (.u64 x))
     (e : ScalarExpr) (s : Bool) (hsort : inferScalarSort boundVars e = some s) :
-    ∃ (val : Val) (bv : BitVec 64),
-      evalScalarExpr env e = .ok val ∧
-      valOfSort s val = some bv ∧
-      ∀ (fuel : Nat) (g : MetalAst.MSLGroupState)
-        (tid : MetalAst.Dim3) (ls : MetalAst.MSLLocals)
-        (log : List MetalAst.MSLAccess),
-        varEnvMatchesLocals env ls idxName idxVar boundVars →
-        MetalAst.evalExprWithCall callEval fuel g tid ls log
-          (lowerScalar idxName idxVar e) =
+    ∃ (val : Val) (bv : BitVec 64), evalScalarExpr env e = .ok val ∧ valOfSort s val = some bv ∧
+      ∀ (fuel : Nat) (g : MetalAst.MSLGroupState) (tid : MetalAst.Dim3) (ls : MetalAst.MSLLocals)
+        (log : List MetalAst.MSLAccess), varEnvMatchesLocals env ls idxName idxVar boundVars →
+        MetalAst.evalExprWithCall callEval fuel g tid ls log (lowerScalar idxName idxVar e) =
           .ok { value := bv, fields := [], locals := ls, log := log } := by
-  have htyM : ∀ (ls : MetalAst.MSLLocals),
-      varEnvMatchesLocals env ls idxName idxVar boundVars →
-      ∀ id ∈ boundVars, ls.lookupType? (if id == idxVar then idxName else s!"v{id}") = some .ulong := by
-    intro ls hm id hmem
+  have htyM (ls : MetalAst.MSLLocals) (hm : varEnvMatchesLocals env ls idxName idxVar boundVars)
+      (id : Nat) (hmem : id ∈ boundVars) :
+      ls.lookupType? (if id == idxVar then idxName else s!"v{id}") = some .ulong := by
     rcases varEnvMatchesLocals_mem env ls idxName idxVar boundVars hm hmem with ⟨_, _, _, ht⟩
     exact ht
   induction e generalizing s with
   | constU64 n =>
-    injection hsort with hs; subst hs
-    refine ⟨.u64 n, n.toBitVec, rfl, rfl, fun _ _ _ _ _ _ => ?_⟩
+    rcases hsort with ⟨rfl⟩; refine ⟨.u64 n, n.toBitVec, rfl, rfl, fun _ _ _ _ _ _ => ?_⟩
     unfold lowerScalar; rw [MetalAst.evalExprWithCall]
   | constBool b =>
-    injection hsort with hs; subst hs
-    refine ⟨.bool b, if b then 1#64 else 0#64, rfl, rfl, fun _ _ _ _ _ _ => ?_⟩
-    cases b <;> rfl
+    rcases hsort with ⟨rfl⟩; exact ⟨.bool b, if b then 1#64 else 0#64, rfl, rfl, fun _ _ _ _ _ _ => by cases b <;> rfl⟩
   | var id =>
-    simp only [inferScalarSort] at hsort
-    split at hsort
-    · rename_i hmem
-      injection hsort with hs; subst hs
-      rcases henv id hmem with ⟨x, hx⟩
+    simp only [inferScalarSort] at hsort; split at hsort
+    · rename_i hmem; rcases hsort with ⟨rfl⟩; rcases henv id hmem with ⟨x, hx⟩
       refine ⟨.u64 x, x.toBitVec, by simp only [evalScalarExpr, hx], rfl, fun fuel g tid ls log hm => ?_⟩
       rcases varEnvMatchesLocals_mem env ls idxName idxVar boundVars hm hmem with ⟨x', hx', hlk, hlt⟩
-      have hxeq : x' = x := by
-        have hsome : (some (.u64 x) : Option Val) = some (.u64 x') := hx.symm.trans hx'
-        injection hsome with hv; injection hv with heq; exact heq.symm
-      subst x'; unfold lowerScalar v
-      cases hidx : id == idxVar
-      · simp only [hidx, Bool.false_eq_true, ite_false] at hlk hlt ⊢
-        exact MetalAst.ev_var_bound callEval fuel g tid ls log s!"v{id}" x.toBitVec hlk hlt
-      · simp only [hidx, ite_true] at hlk hlt ⊢
-        exact MetalAst.ev_var_bound callEval fuel g tid ls log idxName x.toBitVec hlk hlt
+      obtain ⟨rfl⟩ : Val.u64 x = Val.u64 x' := Option.some.inj (hx.symm.trans hx')
+      unfold lowerScalar v
+      cases hidx : id == idxVar <;> simp only [hidx, Bool.false_eq_true, ite_false, ite_true] at hlk hlt ⊢ <;>
+        exact MetalAst.ev_var_bound callEval fuel g tid ls log _ x.toBitVec hlk hlt
     · cases hsort
   | unaryOp op a iha =>
     simp only [inferScalarSort] at hsort
-    cases hsa : inferScalarSort boundVars a with
-    | none => simp [hsa] at hsort
-    | some sa =>
-      rw [hsa] at hsort
-      cases sa
-      · simp only [Bool.not_false, ite_true] at hsort
-        rcases iha false hsa with ⟨va, _, heva, hva, haAll⟩
-        rcases valOfSort_false hva with ⟨xa, rfl, rfl⟩
-        cases op with
-        | clz256 => cases hsort
-        | not =>
-          injection hsort with hs; subst hs
-          exact ⟨.u64 (~~~xa), (~~~xa).toBitVec, by simp [evalScalarExpr, heva]; rfl, rfl, fun f g t ls lg hm =>
-            MetalAst.ev_bitnot_ulong callEval f g t ls lg _ _ (haAll f g t ls lg hm)
-              (lowerScalar_inferExprType g ls idxName idxVar boundVars a false hsa (htyM ls hm))⟩
-        | neg =>
-          injection hsort with hs; subst hs
-          exact ⟨.u64 (0 - xa), (0 - xa).toBitVec, by simp [evalScalarExpr, heva]; rfl, rfl, fun f g t ls lg hm =>
-            MetalAst.ev_neg_zero_sub_ulong callEval f g t ls lg _ _ (haAll f g t ls lg hm)
-              (lowerScalar_inferExprType g ls idxName idxVar boundVars a false hsa (htyM ls hm))⟩
-      · simp at hsort
+    cases hsa : inferScalarSort boundVars a <;> simp only [hsa] at hsort
+    · cases hsort
+    · rename_i sa; cases sa <;> simp at hsort
+      rcases iha false hsa with ⟨_, _, heva, hva, haAll⟩
+      rcases valOfSort_false hva with ⟨xa, rfl, rfl⟩
+      cases op with
+      | clz256 => cases hsort
+      | not => rcases hsort with ⟨rfl⟩; exact ⟨.u64 (~~~xa), _, by simp [evalScalarExpr, heva]; rfl, rfl,
+          fun f g t ls lg hm => MetalAst.ev_bitnot_ulong callEval f g t ls lg _ _ (haAll f g t ls lg hm)
+            (lowerScalar_inferExprType g ls idxName idxVar boundVars a false hsa (htyM ls hm))⟩
+      | neg => rcases hsort with ⟨rfl⟩; exact ⟨.u64 (0 - xa), _, by simp [evalScalarExpr, heva]; rfl, rfl,
+          fun f g t ls lg hm => MetalAst.ev_neg_zero_sub_ulong callEval f g t ls lg _ _ (haAll f g t ls lg hm)
+            (lowerScalar_inferExprType g ls idxName idxVar boundVars a false hsa (htyM ls hm))⟩
   | fma a b c iha ihb ihc =>
     simp only [inferScalarSort] at hsort
-    cases hsa : inferScalarSort boundVars a with
-    | none => simp [hsa] at hsort
-    | some sa =>
-      cases hsb : inferScalarSort boundVars b with
-      | none => simp [hsa, hsb] at hsort
-      | some sb =>
-        cases hsc : inferScalarSort boundVars c with
-        | none => simp [hsa, hsb, hsc] at hsort
-        | some sc =>
-          rw [hsa, hsb, hsc] at hsort
-          cases sa
-          · cases sb
-            · cases sc
-              · simp only [Bool.not_false, Bool.and_self, ite_true, Option.some.injEq] at hsort; subst hsort
-                rcases iha false hsa with ⟨va, _, heva, hva, haAll⟩
-                rcases ihb false hsb with ⟨vb, _, hevb, hvb, hbAll⟩
-                rcases ihc false hsc with ⟨vc, _, hevc, hvc, hcAll⟩
-                rcases valOfSort_false hva with ⟨xa, rfl, rfl⟩
-                rcases valOfSort_false hvb with ⟨xb, rfl, rfl⟩
-                rcases valOfSort_false hvc with ⟨xc, rfl, rfl⟩
-                exact ⟨.u64 (xa * xb + xc), (xa * xb + xc).toBitVec,
-                  by simp [evalScalarExpr, heva, hevb, hevc]; rfl, rfl, fun f g t ls lg hm =>
-                    MetalAst.ev_fma_compound_ulong callEval f g t ls lg _ _ _ _ _ _
-                      (haAll f g t ls lg hm) (hbAll f g t ls lg hm) (hcAll f g t ls lg hm)
-                      (lowerScalar_inferExprType g ls idxName idxVar boundVars a false hsa (htyM ls hm))
-                      (lowerScalar_inferExprType g ls idxName idxVar boundVars b false hsb (htyM ls hm))
-                      (lowerScalar_inferExprType g ls idxName idxVar boundVars c false hsc (htyM ls hm))⟩
-              · simp at hsort
-            · simp at hsort
-          · simp at hsort
+    cases hsa : inferScalarSort boundVars a <;> simp only [hsa] at hsort
+    · cases hsort
+    · cases hsb : inferScalarSort boundVars b <;> simp only [hsb] at hsort
+      · cases hsort
+      · cases hsc : inferScalarSort boundVars c <;> simp only [hsc] at hsort
+        · cases hsort
+        · rename_i sa sb sc
+          cases sa <;> simp at hsort
+          cases sb <;> simp at hsort
+          cases sc <;> simp at hsort
+          subst hsort
+          rcases iha false hsa with ⟨_, _, heva, hva, haAll⟩
+          rcases ihb false hsb with ⟨_, _, hevb, hvb, hbAll⟩
+          rcases ihc false hsc with ⟨_, _, hevc, hvc, hcAll⟩
+          rcases valOfSort_false hva with ⟨xa, rfl, rfl⟩
+          rcases valOfSort_false hvb with ⟨xb, rfl, rfl⟩
+          rcases valOfSort_false hvc with ⟨xc, rfl, rfl⟩
+          exact ⟨.u64 (xa * xb + xc), (xa * xb + xc).toBitVec,
+            by simp [evalScalarExpr, heva, hevb, hevc]; rfl, rfl, fun f g t ls lg hm =>
+              MetalAst.ev_fma_compound_ulong callEval f g t ls lg _ _ _ _ _ _
+                (haAll f g t ls lg hm) (hbAll f g t ls lg hm) (hcAll f g t ls lg hm)
+                (lowerScalar_inferExprType g ls idxName idxVar boundVars a false hsa (htyM ls hm))
+                (lowerScalar_inferExprType g ls idxName idxVar boundVars b false hsb (htyM ls hm))
+                (lowerScalar_inferExprType g ls idxName idxVar boundVars c false hsc (htyM ls hm))⟩
   | select c t f ihc iht ihf =>
     simp only [inferScalarSort] at hsort
-    cases hsc : inferScalarSort boundVars c with
-    | none => simp [hsc] at hsort
-    | some sc =>
-      cases hst : inferScalarSort boundVars t with
-      | none => simp [hsc, hst] at hsort
-      | some st =>
-        cases hsf : inferScalarSort boundVars f with
-        | none => simp [hsc, hst, hsf] at hsort
-        | some sf =>
-          rw [hsc, hst, hsf] at hsort
+    cases hsc : inferScalarSort boundVars c <;> simp only [hsc] at hsort
+    · cases hsort
+    · cases hst : inferScalarSort boundVars t <;> simp only [hst] at hsort
+      · cases hsort
+      · cases hsf : inferScalarSort boundVars f <;> simp only [hsf] at hsort
+        · cases hsort
+        · rename_i sc st sf
           cases heq : (st == sf)
           · simp [heq] at hsort
           · simp only [heq, ite_true, Option.some.injEq] at hsort
             have hstf : st = sf := eq_of_beq heq
             subst hstf hsort
-            rcases ihc sc hsc with ⟨vc, bvc, hevc, hvc, hcAll⟩
-            rcases iht st hst with ⟨vt, bvt, hevt, hvt, htAll⟩
-            rcases ihf st hsf with ⟨vf, bvf, hevf, hvf, hfAll⟩
-            cases sc with
-            | true =>
-              rcases valOfSort_true hvc with ⟨bc, rfl, rfl⟩
+            rcases ihc sc hsc with ⟨_, _, hevc, hvc, hcAll⟩
+            rcases iht st hst with ⟨vt, bvt, hevt, _, htAll⟩
+            rcases ihf st hsf with ⟨vf, bvf, hevf, _, hfAll⟩
+            cases sc
+            · rcases valOfSort_false hvc with ⟨xc, rfl, rfl⟩
+              refine ⟨if xc != 0 then vt else vf, if xc != 0 then bvt else bvf, ?_,
+                by cases (xc != 0) <;> assumption, fun fl g td ls lg hm => ?_⟩
+              · cases hxc : (xc != 0) <;> simp [evalScalarExpr, hevc, hxc, hevt, hevf]
+              · rw [← MetalAst.bne_zero_bv_iff]
+                exact MetalAst.ev_select_ne_zero callEval fl g td ls lg _ _ _ _ _ _
+                  (hcAll fl g td ls lg hm) (htAll fl g td ls lg hm) (hfAll fl g td ls lg hm)
+                  (lowerScalar_inferExprType g ls idxName idxVar boundVars c false hsc (htyM ls hm))
+            · rcases valOfSort_true hvc with ⟨bc, rfl, rfl⟩
               refine ⟨if bc then vt else vf, if bc then bvt else bvf, ?_, by cases bc <;> assumption, fun fl g td ls lg hm => ?_⟩
               · cases bc <;> simp [evalScalarExpr, hevc, hevt, hevf]
               · have h := MetalAst.ev_select_ne_zero callEval fl g td ls lg _ _ _ _ _ _
                   (hcAll fl g td ls lg hm) (htAll fl g td ls lg hm) (hfAll fl g td ls lg hm)
                   (lowerScalar_inferExprType g ls idxName idxVar boundVars c true hsc (htyM ls hm))
                 cases bc <;> exact h
-            | false =>
-              rcases valOfSort_false hvc with ⟨xc, rfl, rfl⟩
-              have hnzEq : (xc.toBitVec != 0#64) = (xc != 0) := by
-                cases h : (xc != 0)
-                · have hx0 : xc = 0 := by simpa [bne_iff_ne] using h
-                  subst hx0; rfl
-                · cases h2 : (xc.toBitVec != 0#64)
-                  · have hx0 : xc = 0 := UInt64.eq_of_toBitVec_eq (by simpa [bne_iff_ne] using h2)
-                    subst hx0; cases h
-                  · rfl
-              refine ⟨if xc != 0 then vt else vf, if xc != 0 then bvt else bvf, ?_,
-                by cases (xc != 0) <;> assumption, fun fl g td ls lg hm => ?_⟩
-              · cases hxc : (xc != 0) <;> simp [evalScalarExpr, hevc, hxc, hevt, hevf]
-              · have h := MetalAst.ev_select_ne_zero callEval fl g td ls lg _ _ _ _ _ _
-                  (hcAll fl g td ls lg hm) (htAll fl g td ls lg hm) (hfAll fl g td ls lg hm)
-                  (lowerScalar_inferExprType g ls idxName idxVar boundVars c false hsc (htyM ls hm))
-                rw [hnzEq] at h; exact h
   | binOp op l r ihl ihr =>
     simp only [inferScalarSort] at hsort
-    cases hsl : inferScalarSort boundVars l with
-    | none => simp [hsl] at hsort
-    | some sl =>
-      cases hsr : inferScalarSort boundVars r with
-      | none => simp [hsl, hsr] at hsort
-      | some sr =>
-        rw [hsl, hsr] at hsort
-        cases sl
-        · cases sr
-          · simp only [Bool.not_false, Bool.and_self, ite_true] at hsort
-            rcases ihl false hsl with ⟨vl, _, hevl, hvl, hlAll⟩
-            rcases ihr false hsr with ⟨vr, _, hevr, hvr, hrAll⟩
-            rcases valOfSort_false hvl with ⟨xl, rfl, rfl⟩
-            rcases valOfSort_false hvr with ⟨xr, rfl, rfl⟩
-            obtain ⟨val, bv, hev, hvs, hmsl⟩ := lowerBinOpU64_eval callEval env idxName idxVar l r op s xl xr hsort hevl hevr
-            exact ⟨val, bv, hev, hvs, fun fl g td ls lg hm => hmsl fl g td ls lg (hlAll fl g td ls lg hm) (hrAll fl g td ls lg hm)
-              (lowerScalar_inferExprType g ls idxName idxVar boundVars l false hsl (htyM ls hm))
-              (lowerScalar_inferExprType g ls idxName idxVar boundVars r false hsr (htyM ls hm))⟩
-          · simp at hsort
-        · cases sr
-          · simp at hsort
-          · simp only [Bool.not_true, Bool.false_eq_true, ite_false, Bool.and_self, ite_true] at hsort
-            rcases ihl true hsl with ⟨vl, _, hevl, hvl, hlAll⟩
-            rcases ihr true hsr with ⟨vr, _, hevr, hvr, hrAll⟩
-            rcases valOfSort_true hvl with ⟨bl, rfl, rfl⟩
-            rcases valOfSort_true hvr with ⟨br, rfl, rfl⟩
-            cases op <;> simp [inferBinOpBool] at hsort
-            subst hsort
-            refine ⟨.bool (bl == br), if bl == br then 1#64 else 0#64, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
-              fun fl g td ls lg hm => ?_⟩
-            have h := MetalAst.ev_eq_cast_ulong callEval fl g td ls lg _ _ _ _
-              (hlAll fl g td ls lg hm) (hrAll fl g td ls lg hm)
-              (lowerScalar_inferExprType g ls idxName idxVar boundVars l true hsl (htyM ls hm))
-              (lowerScalar_inferExprType g ls idxName idxVar boundVars r true hsr (htyM ls hm))
-            have hbeq : ((if bl then (1#64 : BitVec 64) else 0#64) == (if br then 1#64 else 0#64)) = (bl == br) := by
-              cases bl
-              · cases br <;> rfl
-              · cases br <;> rfl
-            rw [hbeq] at h; exact h
-
+    cases hsl : inferScalarSort boundVars l <;> simp only [hsl] at hsort
+    · cases hsort
+    · cases hsr : inferScalarSort boundVars r <;> simp only [hsr] at hsort
+      · cases hsort
+      · rename_i sl sr
+        cases sl <;> cases sr <;> try simp at hsort
+        · rcases ihl false hsl with ⟨_, _, hevl, hvl, hlAll⟩
+          rcases ihr false hsr with ⟨_, _, hevr, hvr, hrAll⟩
+          rcases valOfSort_false hvl with ⟨xl, rfl, rfl⟩
+          rcases valOfSort_false hvr with ⟨xr, rfl, rfl⟩
+          obtain ⟨val, bv, hev, hvs, hmsl⟩ := lowerBinOpU64_eval callEval env idxName idxVar l r op s xl xr hsort hevl hevr
+          exact ⟨val, bv, hev, hvs, fun fl g td ls lg hm => hmsl fl g td ls lg (hlAll fl g td ls lg hm) (hrAll fl g td ls lg hm)
+            (lowerScalar_inferExprType g ls idxName idxVar boundVars l false hsl (htyM ls hm))
+            (lowerScalar_inferExprType g ls idxName idxVar boundVars r false hsr (htyM ls hm))⟩
+        · rcases ihl true hsl with ⟨_, _, hevl, hvl, hlAll⟩
+          rcases ihr true hsr with ⟨_, _, hevr, hvr, hrAll⟩
+          rcases valOfSort_true hvl with ⟨bl, rfl, rfl⟩
+          rcases valOfSort_true hvr with ⟨br, rfl, rfl⟩
+          cases op <;> simp [inferBinOpBool] at hsort
+          subst hsort
+          refine ⟨.bool (bl == br), if bl == br then 1#64 else 0#64, by simp [evalScalarExpr, hevl, hevr]; rfl, rfl,
+            fun fl g td ls lg hm => ?_⟩
+          rw [← MetalAst.bool_bv_beq]
+          exact MetalAst.ev_eq_cast_ulong callEval fl g td ls lg _ _ _ _ (hlAll fl g td ls lg hm) (hrAll fl g td ls lg hm)
+            (lowerScalar_inferExprType g ls idxName idxVar boundVars l true hsl (htyM ls hm))
+            (lowerScalar_inferExprType g ls idxName idxVar boundVars r true hsr (htyM ls hm))
 /-- Expression-level soundness of `MetalLower.lowerScalar`: every well-sorted `LNIR.ScalarExpr`
 evaluates in `MetalAst.evalExprWithCall` to the exact bitvector encoding of `LNIR.evalScalarExpr`,
 preserving `MSLLocals` and `MSLAccess` epoch logs. -/
 theorem lowerScalar_eval_sound
-    (callEval : Nat → MetalAst.MSLGroupState →
-      MetalAst.Dim3 → MetalAst.MSLLocals →
-      List MetalAst.MSLAccess → String →
-      MetalAst.MSLExprList →
-      MetalAst.MSLOutcome MetalAst.MSLEval)
-    (fuel : Nat) (g : MetalAst.MSLGroupState)
-    (tid : MetalAst.Dim3)
-    (ls : MetalAst.MSLLocals)
-    (log : List MetalAst.MSLAccess)
-    (env : VarEnv) (idxName : String) (idxVar : Nat) (boundVars : List Nat)
-    (e : ScalarExpr) (s : Bool)
-    (hsort : inferScalarSort boundVars e = some s)
+    (callEval : Nat → MetalAst.MSLGroupState → MetalAst.Dim3 → MetalAst.MSLLocals →
+      List MetalAst.MSLAccess → String → MetalAst.MSLExprList → MetalAst.MSLOutcome MetalAst.MSLEval)
+    (fuel : Nat) (g : MetalAst.MSLGroupState) (tid : MetalAst.Dim3) (ls : MetalAst.MSLLocals)
+    (log : List MetalAst.MSLAccess) (env : VarEnv) (idxName : String) (idxVar : Nat) (boundVars : List Nat)
+    (e : ScalarExpr) (s : Bool) (hsort : inferScalarSort boundVars e = some s)
     (hmatch : varEnvMatchesLocals env ls idxName idxVar boundVars) :
-    ∃ (val : Val) (bv : BitVec 64),
-      evalScalarExpr env e = .ok val ∧
-      valOfSort s val = some bv ∧
-      MetalAst.evalExprWithCall callEval fuel g tid ls log
-        (lowerScalar idxName idxVar e) =
+    ∃ (val : Val) (bv : BitVec 64), evalScalarExpr env e = .ok val ∧ valOfSort s val = some bv ∧
+      MetalAst.evalExprWithCall callEval fuel g tid ls log (lowerScalar idxName idxVar e) =
         .ok { value := bv, fields := [], locals := ls, log := log } := by
-  have henv : ∀ id ∈ boundVars, ∃ x : UInt64, env id = some (.u64 x) := by
-    intro id hmem
+  have henv : ∀ id ∈ boundVars, ∃ x : UInt64, env id = some (.u64 x) := fun id hmem => by
     rcases varEnvMatchesLocals_mem env ls idxName idxVar boundVars hmatch hmem with ⟨x, hx, _, _⟩
     exact ⟨x, hx⟩
   obtain ⟨val, bv, hev, hvs, hmsl⟩ := lowerScalar_eval_core callEval env idxName idxVar boundVars henv e s hsort
@@ -451,17 +305,14 @@ theorem lowerScalar_eval_sound
 private theorem packInputDeviceBuffersGo_props (env : VarEnv) (st : HeapState) (len : Nat) :
     ∀ (inputs : List VarId) (idx : Nat) (bufs : List (Nat × MetalAst.ByteMemory)),
       packInputDeviceBuffersGo env st len idx inputs = some bufs →
-      (∀ k, k < idx → bufs.lookup k = none) ∧
       (∀ k, idx + inputs.length ≤ k → bufs.lookup k = none) ∧
       (∀ j < inputs.length, ∃ (words : List (BitVec 64)),
-        bufs.lookup (idx + j) = some (MetalAst.ByteMemory.ofU64Words words) ∧
-        words.length = len ∧
+        bufs.lookup (idx + j) = some (MetalAst.ByteMemory.ofU64Words words) ∧ words.length = len ∧
         ∀ i (_ : i < len) (hwi : i < words.length),
           ∃ x : UInt64, readParInput env st inputs j i = .ok x ∧ words[i] = x.toBitVec)
-  | [], idx, bufs, h => by
-    simp only [packInputDeviceBuffersGo, Option.some.injEq] at h
-    subst h
-    exact ⟨fun _ _ => rfl, fun _ _ => rfl, fun _ hj => absurd hj (Nat.not_lt_zero _)⟩
+  | [], _, bufs, h => by
+    simp only [packInputDeviceBuffersGo, Option.some.injEq] at h; subst h
+    exact ⟨fun _ _ => rfl, fun _ hj => absurd hj (Nat.not_lt_zero _)⟩
   | v :: rest, idx, bufs, h => by
     unfold packInputDeviceBuffersGo at h
     cases hv : env v with
@@ -473,72 +324,44 @@ private theorem packInputDeviceBuffersGo_props (env : VarEnv) (st : HeapState) (
         cases ht : packInputDeviceBuffersGo env st len (idx + 1) rest with
         | none => simp [ht] at h
         | some tail =>
-          rw [ht] at h
-          dsimp only at h
+          rw [ht] at h; dsimp only at h
           cases hfind : st.findBuffer bid with
           | none => simp [hfind] at h
           | some buf =>
-            rw [hfind] at h
-            dsimp only at h
+            rw [hfind] at h; dsimp only at h
             split at h
             · rename_i hlenLe
-              simp only [Option.some.injEq] at h
-              subst h
-              rcases packInputDeviceBuffersGo_props env st len rest (idx + 1) tail ht with ⟨hlo, hhi, hmid⟩
-              refine ⟨?_, ?_, ?_⟩
-              · intro k hk
-                have hne : (k == idx) = false := beq_eq_false_iff_ne.mpr (by omega)
-                simp only [List.lookup, hne]
-                exact hlo k (by omega)
-              · intro k hk
-                simp only [List.length_cons] at hk
-                have hne : (k == idx) = false := beq_eq_false_iff_ne.mpr (by omega)
-                simp only [List.lookup, hne]
+              simp only [Option.some.injEq] at h; subst h
+              rcases packInputDeviceBuffersGo_props env st len rest (idx + 1) tail ht with ⟨hhi, hmid⟩
+              refine ⟨fun k hk => ?_, fun j hj => ?_⟩
+              · simp only [List.length_cons] at hk
+                simp only [List.lookup, beq_eq_false_iff_ne.mpr (by omega : k ≠ idx)]
                 exact hhi k (by omega)
-              · intro j hj
-                cases j with
+              · cases j with
                 | zero =>
                   let words := (List.range len).map fun i => (buf.data[i]?.getD 0).toBitVec
-                  refine ⟨words, ?_, by simp [words], ?_⟩
-                  · simp [Nat.add_zero, List.lookup, words]
-                  · intro i hi hwi
-                    have hiBuf : i < buf.data.size := Nat.lt_of_lt_of_le hi hlenLe
-                    refine ⟨buf.data[i], ?_, ?_⟩
-                    · unfold readParInput
-                      simp only [List.getElem?_cons_zero]
-                      simp [hv, HeapState.readElem, hfind, hiBuf]
-                    · simp [words, Array.getElem?_eq_getElem hiBuf]
+                  refine ⟨words, by simp [Nat.add_zero, List.lookup, words], by simp [words], fun i hi _ => ?_⟩
+                  have hiBuf : i < buf.data.size := Nat.lt_of_lt_of_le hi hlenLe
+                  refine ⟨buf.data[i], ?_, by simp [words, Array.getElem?_eq_getElem hiBuf]⟩
+                  unfold readParInput; simp [hv, HeapState.readElem, hfind, hiBuf]
                 | succ j' =>
                   simp only [List.length_cons] at hj
-                  have hj' : j' < rest.length := by omega
-                  rcases hmid j' hj' with ⟨words, hlk, hwlen, hread⟩
+                  rcases hmid j' (by omega) with ⟨words, hlk, hwlen, hread⟩
                   have hadd : idx + (j' + 1) = (idx + 1) + j' := by omega
                   have hne : ((idx + 1) + j' == idx) = false := beq_eq_false_iff_ne.mpr (by omega)
-                  refine ⟨words, ?_, hwlen, ?_⟩
-                  · simp only [List.lookup]
-                    rw [hadd, hne]
-                    exact hlk
-                  · intro i hi hwi
-                    rcases hread i hi hwi with ⟨x, hr, hw⟩
-                    refine ⟨x, ?_, hw⟩
-                    unfold readParInput at hr ⊢
-                    simp only [List.getElem?_cons_succ]
-                    cases hget : rest[j']? with
-                    | none =>
-                      rw [hget] at hr
-                      cases hr
-                    | some vv =>
-                      rw [hget] at hr
-                      exact hr
+                  refine ⟨words, by simp only [List.lookup]; rw [hadd, hne]; exact hlk, hwlen, fun i hi hwi => ?_⟩
+                  rcases hread i hi hwi with ⟨x, hr, hw⟩
+                  refine ⟨x, ?_, hw⟩
+                  unfold readParInput at hr ⊢; simp only [List.getElem?_cons_succ]
+                  cases hget : rest[j']? with
+                  | none => rw [hget] at hr; cases hr
+                  | some _ => rw [hget] at hr; exact hr
             · cases h
 
 private theorem varEnvMatchesLocals_append_one (curEnv : VarEnv) (ls : MetalAst.MSLLocals)
-    (idxName : String) (idxVar iv : VarId) (x : UInt64)
-    (hivNe : iv ≠ idxVar)
-    (hlk : ls.lookup? s!"v{iv}" = some x.toBitVec)
-    (hty : ls.lookupType? s!"v{iv}" = some .ulong) :
-    ∀ (vs : List VarId), iv ∉ vs →
-      varEnvMatchesLocals curEnv ls idxName idxVar vs →
+    (idxName : String) (idxVar iv : VarId) (x : UInt64) (hivNe : iv ≠ idxVar)
+    (hlk : ls.lookup? s!"v{iv}" = some x.toBitVec) (hty : ls.lookupType? s!"v{iv}" = some .ulong) :
+    ∀ (vs : List VarId), iv ∉ vs → varEnvMatchesLocals curEnv ls idxName idxVar vs →
       varEnvMatchesLocals (curEnv.bind iv (.u64 x)) ls idxName idxVar (vs ++ [iv])
   | [], _, _ => by
     have hbeq : (iv == idxVar) = false := beq_eq_false_iff_ne.mpr hivNe
@@ -547,11 +370,8 @@ private theorem varEnvMatchesLocals_append_one (curEnv : VarEnv) (ls : MetalAst.
     · simp only [hbeq, Bool.false_eq_true, ite_false]; exact hty
   | u :: us, hnot, ⟨⟨xu, hu, hlku, htyu⟩, htl⟩ => by
     have hne : u ≠ iv := fun heq => hnot (heq ▸ .head us)
-    have hnotTl : iv ∉ us := fun hm => hnot (.tail u hm)
-    refine ⟨⟨xu, ?_, hlku, htyu⟩,
-      varEnvMatchesLocals_append_one curEnv ls idxName idxVar iv x hivNe hlk hty us hnotTl htl⟩
-    rw [VarEnv.bind_ne curEnv iv u (.u64 x) (beq_eq_false_iff_ne.mpr hne)]
-    exact hu
+    refine ⟨⟨xu, (VarEnv.bind_ne curEnv iv u (.u64 x) (beq_eq_false_iff_ne.mpr hne)).trans hu, hlku, htyu⟩,
+      varEnvMatchesLocals_append_one curEnv ls idxName idxVar iv x hivNe hlk hty us (fun hm => hnot (.tail u hm)) htl⟩
 
 private theorem bindCustomParInputs_props (env : VarEnv) (st : HeapState) (inputs : List VarId)
     (cx : Nat) (inWords : Nat → List (BitVec 64))
@@ -559,74 +379,49 @@ private theorem bindCustomParInputs_props (env : VarEnv) (st : HeapState) (input
       readParInput env st inputs j cx = .ok x ∧ (inWords j)[cx] = x.toBitVec) :
     ∀ (rem : List VarId) (k0 : Nat) (curEnv : VarEnv) (ls : MetalAst.MSLLocals)
       (idxVar : VarId) (prior : List VarId),
-      k0 + rem.length = inputs.length →
-      (idxVar :: (prior ++ rem)).Nodup →
+      k0 + rem.length = inputs.length → (idxVar :: (prior ++ rem)).Nodup →
       varEnvMatchesLocals curEnv ls "gid64" idxVar (idxVar :: prior) →
       (∀ m (hm : m < rem.length), ∃ (hc : cx < (inWords (k0 + m)).length),
         ls.lookup? s!"v{rem[m]'hm}" = some ((inWords (k0 + m))[cx]) ∧
         ls.lookupType? s!"v{rem[m]'hm}" = some .ulong) →
-      ∃ kEnv : VarEnv,
-        bindCustomParInputs env st inputs cx curEnv k0 rem = .ok kEnv ∧
+      ∃ kEnv : VarEnv, bindCustomParInputs env st inputs cx curEnv k0 rem = .ok kEnv ∧
         varEnvMatchesLocals kEnv ls "gid64" idxVar (idxVar :: (prior ++ rem))
-  | [], _, curEnv, _, _, prior, _, _, hcur, _ => by
-    simp only [List.append_nil, bindCustomParInputs]
-    exact ⟨curEnv, rfl, hcur⟩
+  | [], _, curEnv, _, _, _, _, _, hcur, _ => by simp only [List.append_nil, bindCustomParInputs]; exact ⟨curEnv, rfl, hcur⟩
   | iv :: rest, k0, curEnv, ls, idxVar, prior, hklen, hnd, hcur, hrem => by
     simp only [List.length_cons] at hklen
-    have hk0Lt : k0 < inputs.length := by omega
-    rcases hread k0 hk0Lt with ⟨hc0, x0, hr0, hw0⟩
-    rcases hrem 0 (by simp) with ⟨hc0', hlk0, hty0⟩
+    rcases hread k0 (by omega) with ⟨_, x0, hr0, hw0⟩
+    rcases hrem 0 (by simp) with ⟨_, hlk0, hty0⟩
     simp only [Nat.add_zero, List.getElem_cons_zero] at hlk0 hty0
     rw [hw0] at hlk0
-    have hndCons : idxVar ∉ prior ++ (iv :: rest) ∧ (prior ++ (iv :: rest)).Nodup :=
-      List.nodup_cons.mp hnd
-    have hivNeIdx : iv ≠ idxVar := fun heq =>
-      hndCons.1 (heq ▸ List.mem_append_right prior (.head rest))
-    have hivNotPrior : iv ∉ prior := by
-      rcases List.nodup_append.mp hndCons.2 with ⟨_, _, hdisj⟩
-      exact fun hm => hdisj iv hm iv (.head rest) rfl
+    have hndCons := List.nodup_cons.mp hnd
+    have hivNeIdx : iv ≠ idxVar := fun heq => hndCons.1 (heq ▸ List.mem_append_right prior (.head rest))
     have hivNotHead : iv ∉ (idxVar :: prior) := by
-      intro hm
-      rcases List.mem_cons.mp hm with h1 | h2
+      rcases List.nodup_append.mp hndCons.2 with ⟨_, _, hdisj⟩
+      intro hm; rcases List.mem_cons.mp hm with h1 | h2
       · exact hivNeIdx h1
-      · exact hivNotPrior h2
+      · exact hdisj iv h2 iv (.head rest) rfl
     have hnextMatch := varEnvMatchesLocals_append_one curEnv ls "gid64" idxVar iv x0
       hivNeIdx hlk0 hty0 (idxVar :: prior) hivNotHead hcur
     simp only [List.cons_append] at hnextMatch
     have happEq : prior ++ (iv :: rest) = (prior ++ [iv]) ++ rest := by simp
     rw [happEq] at hnd ⊢
-    have hremNext : ∀ m (hm : m < rest.length), ∃ (hc : cx < (inWords ((k0 + 1) + m)).length),
-        ls.lookup? s!"v{rest[m]'hm}" = some ((inWords ((k0 + 1) + m))[cx]) ∧
-        ls.lookupType? s!"v{rest[m]'hm}" = some .ulong := by
-      intro m hm
-      have hm1 : m + 1 < (iv :: rest).length := by simp; omega
-      rcases hrem (m + 1) hm1 with ⟨hcm, hlkm, htym⟩
-      have hadd : k0 + (m + 1) = (k0 + 1) + m := by omega
-      simp only [List.getElem_cons_succ, hadd] at hcm hlkm htym
-      exact ⟨hcm, hlkm, htym⟩
-    obtain ⟨kEnv, hbindRest, hmatchFinal⟩ :=
-      bindCustomParInputs_props env st inputs cx inWords hread rest (k0 + 1)
-        (curEnv.bind iv (.u64 x0)) ls idxVar (prior ++ [iv]) (by omega) hnd hnextMatch hremNext
-    refine ⟨kEnv, ?_, hmatchFinal⟩
-    unfold bindCustomParInputs
-    rw [hr0]
-    exact hbindRest
+    obtain ⟨kEnv, hbindRest, hmatchFinal⟩ := bindCustomParInputs_props env st inputs cx inWords hread rest (k0 + 1)
+      (curEnv.bind iv (.u64 x0)) ls idxVar (prior ++ [iv]) (by omega) hnd hnextMatch (fun m hm => by
+        rcases hrem (m + 1) (by simp; omega) with ⟨hcm, hlkm, htym⟩
+        have hadd : k0 + (m + 1) = (k0 + 1) + m := by omega
+        simp only [List.getElem_cons_succ, hadd] at hcm hlkm htym
+        exact ⟨hcm, hlkm, htym⟩)
+    exact ⟨kEnv, by unfold bindCustomParInputs; rw [hr0]; exact hbindRest, hmatchFinal⟩
 
 private theorem evalParKernelLoop_of_all (env : VarEnv) (st : HeapState) (inputs : List VarId)
     (len : Nat) (k : ParallelKernelKind) (specU64 : Nat → UInt64) :
-    ∀ (idxs : List Nat),
-      (∀ i ∈ idxs, evalParKernelElem env st inputs len k i = .ok (specU64 i)) →
-      ∃ elems : List UInt64,
-        evalParKernelLoop env st inputs len k idxs = .ok elems ∧
-        elems = idxs.map specU64
+    ∀ (idxs : List Nat), (∀ i ∈ idxs, evalParKernelElem env st inputs len k i = .ok (specU64 i)) →
+      ∃ elems : List UInt64, evalParKernelLoop env st inputs len k idxs = .ok elems ∧ elems = idxs.map specU64
   | [], _ => ⟨[], rfl, rfl⟩
   | i :: is, hall => by
-    have hi := hall i (.head is)
-    obtain ⟨xs, hxs, hmap⟩ := evalParKernelLoop_of_all env st inputs len k specU64 is
-      (fun j hj => hall j (.tail i hj))
+    obtain ⟨xs, hxs, hmap⟩ := evalParKernelLoop_of_all env st inputs len k specU64 is (fun j hj => hall j (.tail i hj))
     refine ⟨specU64 i :: xs, ?_, by simp [hmap]⟩
-    unfold evalParKernelLoop
-    rw [hi, hxs]
+    unfold evalParKernelLoop; rw [hall i (.head is), hxs]
 
 /-- End-to-end 1D SIMT lowering soundness (`LNIR.ParallelKernelKind` -> `MetalAst.MSLModule`):
 for every well-formed `wfMetalKernel k` whose input array buffers are packed via
@@ -635,36 +430,26 @@ for every well-formed `wfMetalKernel k` whose input array buffers are packed via
 data races or undefined behavior, writing the exact 64-bit word `elems[i].toBitVec` at every
 output element `i < len`. -/
 theorem lowerToMetal_evalMSLKernel_sound
-    (env : VarEnv) (st : HeapState) (inputs : List VarId)
-    (name : String) (k : ParallelKernelKind)
-    (len nGroups groupSize : Nat)
-    (inBufs : List (Nat × MetalAst.ByteMemory))
-    (hwf : wfMetalKernel k = true)
-    (harity : inputs.length = kernelArity k)
+    (env : VarEnv) (st : HeapState) (inputs : List VarId) (name : String) (k : ParallelKernelKind)
+    (len nGroups groupSize : Nat) (inBufs : List (Nat × MetalAst.ByteMemory))
+    (hwf : wfMetalKernel k = true) (harity : inputs.length = kernelArity k)
     (hpack : packInputDeviceBuffers env st inputs len = some inBufs)
-    (hlenCov : len ≤ nGroups * groupSize)
-    (hgrid32 : nGroups * groupSize < 2 ^ 32) :
+    (hlenCov : len ≤ nGroups * groupSize) (hgrid32 : nGroups * groupSize < 2 ^ 32) :
     ∃ (elems : List UInt64) (kern : MetalAst.MSLKernelDecl)
-      (devBufsF : List (Nat × MetalAst.ByteMemory))
-      (outMemF : MetalAst.ByteMemory),
+      (devBufsF : List (Nat × MetalAst.ByteMemory)) (outMemF : MetalAst.ByteMemory),
       (lowerToMetal name k).kernels = [kern] ∧
-      evalParKernelLoop env st inputs len k (List.range len) = .ok elems ∧
-      elems.length = len ∧
+      evalParKernelLoop env st inputs len k (List.range len) = .ok elems ∧ elems.length = len ∧
       MetalAst.evalMSLKernel (groupStepsForKind groupSize k) kern
         { x := nGroups, y := 1, z := 1 } { x := groupSize, y := 1, z := 1 }
         (mkDeviceBuffers inBufs (kernelArity k) len)
         (mkConstLenBuffers (kernelArity k) len) [] [] = .ok devBufsF ∧
       devBufsF.lookup (kernelArity k) = some outMemF ∧
-      (∀ (i : Nat) (hi : i < elems.length),
-        outMemF.readU64Word? i = some (elems[i]'hi).toBitVec) := by
+      (∀ (i : Nat) (hi : i < elems.length), outMemF.readU64Word? i = some (elems[i]'hi).toBitVec) := by
   have hlen64 : len * 8 ≤ 2 ^ 64 := by omega
-  rcases packInputDeviceBuffersGo_props env st len inputs 0 inBufs hpack with ⟨_, hhi, hmid⟩
+  rcases packInputDeviceBuffersGo_props env st len inputs 0 inBufs hpack with ⟨hhi, hmid⟩
   have hinOutNone : inBufs.lookup (kernelArity k) = none := hhi (kernelArity k) (by omega)
   let inWords : Nat → List (BitVec 64) := fun j =>
-    (List.range len).map fun i =>
-      match readParInput env st inputs j i with
-      | .ok x => x.toBitVec
-      | .error _ => 0#64
+    (List.range len).map fun i => match readParInput env st inputs j i with | .ok x => x.toBitVec | .error _ => 0#64
   have hinWordsLen : ∀ j, (inWords j).length = len := fun _ => by simp [inWords]
   have hinLookup : ∀ j < kernelArity k,
       inBufs.lookup j = some (MetalAst.ByteMemory.ofU64Words (inWords j)) ∧
@@ -714,96 +499,72 @@ theorem lowerToMetal_evalMSLKernel_sound
         rcases hreadElem 0 (by simp [kernelArity]) i hi with ⟨_, x, hrx, _⟩
         simp [specU64, evalParKernelElem, hrx]
     | zipAdd =>
-      refine ⟨1, [storeOut (.add (elem "in0") (elem "in1"))],
-        rfl, rfl, rfl, by simp [groupStepsForKind]; omega, ?_, ?_⟩
-      · refine MetalAst.laneInnerSpec_congr (MetalAst.laneInner_zipAdd len inWords) ?_
-        intro cx hcx
-        rcases hreadElem 0 (by simp [kernelArity]) cx hcx with ⟨hc0, x, hrx, hwx⟩
+      refine ⟨1, [storeOut (.add (elem "in0") (elem "in1"))], rfl, rfl, rfl, by simp [groupStepsForKind]; omega,
+        MetalAst.laneInnerSpec_congr (MetalAst.laneInner_zipAdd len inWords) fun cx hcx => ?_, fun i hi => ?_⟩
+      · rcases hreadElem 0 (by simp [kernelArity]) cx hcx with ⟨hc0, x, hrx, hwx⟩
         rcases hreadElem 1 (by simp [kernelArity]) cx hcx with ⟨hc1, y, hry, hwy⟩
-        simp [specU64, evalParKernelElem, hrx, hry,
-          dite_eq_left_of_eq_true (eq_true hc0), dite_eq_left_of_eq_true (eq_true hc1), hwx, hwy]
-      · intro i hi
-        rcases hreadElem 0 (by simp [kernelArity]) i hi with ⟨_, x, hrx, _⟩
+        simp [specU64, evalParKernelElem, hrx, hry, dite_eq_left_of_eq_true (eq_true hc0),
+          dite_eq_left_of_eq_true (eq_true hc1), hwx, hwy]
+      · rcases hreadElem 0 (by simp [kernelArity]) i hi with ⟨_, x, hrx, _⟩
         rcases hreadElem 1 (by simp [kernelArity]) i hi with ⟨_, y, hry, _⟩
         simp [specU64, evalParKernelElem, hrx, hry]
-    | zipMul =>
-      refine ⟨1, [storeOut (.mul (elem "in0") (elem "in1"))],
-        rfl, rfl, rfl, by simp [groupStepsForKind]; omega, ?_, ?_⟩
-      · refine MetalAst.laneInnerSpec_congr (MetalAst.laneInner_zipMul len inWords) ?_
-        intro cx hcx
-        rcases hreadElem 0 (by simp [kernelArity]) cx hcx with ⟨hc0, x, hrx, hwx⟩
+    | zipMul | dotProduct =>
+      refine ⟨1, [storeOut (.mul (elem "in0") (elem "in1"))], rfl, rfl, rfl, by simp [groupStepsForKind]; omega,
+        MetalAst.laneInnerSpec_congr (MetalAst.laneInner_zipMul len inWords) fun cx hcx => ?_, fun i hi => ?_⟩
+      · rcases hreadElem 0 (by simp [kernelArity]) cx hcx with ⟨hc0, x, hrx, hwx⟩
         rcases hreadElem 1 (by simp [kernelArity]) cx hcx with ⟨hc1, y, hry, hwy⟩
-        simp [specU64, evalParKernelElem, hrx, hry,
-          dite_eq_left_of_eq_true (eq_true hc0), dite_eq_left_of_eq_true (eq_true hc1), hwx, hwy]
-      · intro i hi
-        rcases hreadElem 0 (by simp [kernelArity]) i hi with ⟨_, x, hrx, _⟩
-        rcases hreadElem 1 (by simp [kernelArity]) i hi with ⟨_, y, hry, _⟩
-        simp [specU64, evalParKernelElem, hrx, hry]
-    | dotProduct =>
-      refine ⟨1, [storeOut (.mul (elem "in0") (elem "in1"))],
-        rfl, rfl, rfl, by simp [groupStepsForKind]; omega, ?_, ?_⟩
-      · refine MetalAst.laneInnerSpec_congr (MetalAst.laneInner_zipMul len inWords) ?_
-        intro cx hcx
-        rcases hreadElem 0 (by simp [kernelArity]) cx hcx with ⟨hc0, x, hrx, hwx⟩
-        rcases hreadElem 1 (by simp [kernelArity]) cx hcx with ⟨hc1, y, hry, hwy⟩
-        simp [specU64, evalParKernelElem, hrx, hry,
-          dite_eq_left_of_eq_true (eq_true hc0), dite_eq_left_of_eq_true (eq_true hc1), hwx, hwy]
-      · intro i hi
-        rcases hreadElem 0 (by simp [kernelArity]) i hi with ⟨_, x, hrx, _⟩
+        simp [specU64, evalParKernelElem, hrx, hry, dite_eq_left_of_eq_true (eq_true hc0),
+          dite_eq_left_of_eq_true (eq_true hc1), hwx, hwy]
+      · rcases hreadElem 0 (by simp [kernelArity]) i hi with ⟨_, x, hrx, _⟩
         rcases hreadElem 1 (by simp [kernelArity]) i hi with ⟨_, y, hry, _⟩
         simp [specU64, evalParKernelElem, hrx, hry]
     | saxpy alpha =>
-      refine ⟨1, [storeOut (.add (.mul (.immU64 alpha.toBitVec) (elem "in0")) (elem "in1"))],
-        rfl, rfl, rfl, by simp [groupStepsForKind]; omega, ?_, ?_⟩
-      · refine MetalAst.laneInnerSpec_congr (MetalAst.laneInner_saxpy len alpha.toBitVec inWords) ?_
-        intro cx hcx
-        rcases hreadElem 0 (by simp [kernelArity]) cx hcx with ⟨hc0, x, hrx, hwx⟩
+      refine ⟨1, [storeOut (.add (.mul (.immU64 alpha.toBitVec) (elem "in0")) (elem "in1"))], rfl, rfl, rfl,
+        by simp [groupStepsForKind]; omega,
+        MetalAst.laneInnerSpec_congr (MetalAst.laneInner_saxpy len alpha.toBitVec inWords) fun cx hcx => ?_, fun i hi => ?_⟩
+      · rcases hreadElem 0 (by simp [kernelArity]) cx hcx with ⟨hc0, x, hrx, hwx⟩
         rcases hreadElem 1 (by simp [kernelArity]) cx hcx with ⟨hc1, y, hry, hwy⟩
-        simp [specU64, evalParKernelElem, hrx, hry,
-          dite_eq_left_of_eq_true (eq_true hc0), dite_eq_left_of_eq_true (eq_true hc1), hwx, hwy]
-      · intro i hi
-        rcases hreadElem 0 (by simp [kernelArity]) i hi with ⟨_, x, hrx, _⟩
+        simp [specU64, evalParKernelElem, hrx, hry, dite_eq_left_of_eq_true (eq_true hc0),
+          dite_eq_left_of_eq_true (eq_true hc1), hwx, hwy]
+      · rcases hreadElem 0 (by simp [kernelArity]) i hi with ⟨_, x, hrx, _⟩
         rcases hreadElem 1 (by simp [kernelArity]) i hi with ⟨_, y, hry, _⟩
         simp [specU64, evalParKernelElem, hrx, hry]
     | stencil1D3Pt wL wC wR =>
-      let ii := MetalAst.MSLExpr.cast .ulong (.var "gid")
-      let edge := MetalAst.MSLExpr.logOr (.eq ii (u 0)) (.ge (.add ii (u 1)) (.var "n"))
-      let center := elem "in0"
-      let interior := MetalAst.MSLExpr.add (.add
-        (.mul (.immU64 wL.toBitVec) (.index "in0" (.sub ii (u 1))))
-        (.mul (.immU64 wC.toBitVec) center))
-        (.mul (.immU64 wR.toBitVec) (.index "in0" (.add ii (u 1))))
-      refine ⟨2, [.ifElse edge (.cons (storeOut center) .nil) (.cons (storeOut interior) .nil)],
-        rfl, rfl, rfl, by simp [groupStepsForKind]; omega, ?_, ?_⟩
-      · refine MetalAst.laneInnerSpec_congr
-          (MetalAst.laneInner_stencil1D3Pt len wL.toBitVec wC.toBitVec wR.toBitVec inWords) ?_
+      have hst : ∀ cx < len, ∃ v : UInt64, evalParKernelElem env st inputs len (.stencil1D3Pt wL wC wR) cx = .ok v ∧
+          (if (cx == 0 || decide (len ≤ cx + 1)) = true then
+            if h0 : cx < (inWords 0).length then (inWords 0)[cx] else 0#64
+          else if hL : cx - 1 < (inWords 0).length then
+            if hC : cx < (inWords 0).length then
+              if hR : cx + 1 < (inWords 0).length then
+                wL.toBitVec * (inWords 0)[cx - 1] + wC.toBitVec * (inWords 0)[cx] + wR.toBitVec * (inWords 0)[cx + 1]
+              else 0#64 else 0#64 else 0#64) = v.toBitVec := by
         intro cx hcx
         rcases hreadElem 0 (by simp [kernelArity]) cx hcx with ⟨hcC, xC, hrC, hwC⟩
         cases hedge : (cx == 0 || decide (cx + 1 ≥ len))
         · have hcxPos : 0 < cx := by cases cx with | zero => simp at hedge | succ _ => omega
           have hcx1Lt : cx + 1 < len := by
-            rcases Bool.or_eq_false_iff.mp hedge with ⟨_, h2⟩
-            simp only [decide_eq_false_iff_not] at h2; omega
+            rcases Bool.or_eq_false_iff.mp hedge with ⟨_, h2⟩; simp only [decide_eq_false_iff_not] at h2; omega
           rcases hreadElem 0 (by simp [kernelArity]) (cx - 1) (by omega) with ⟨hcL, xL, hrL, hwL⟩
           rcases hreadElem 0 (by simp [kernelArity]) (cx + 1) hcx1Lt with ⟨hcR, xR, hrR, hwR⟩
-          simp only [specU64, evalParKernelElem, ge_iff_le] at hedge ⊢
-          simp [hedge, hrL, hrC, hrR, dite_eq_left_of_eq_true (eq_true hcL),
-            dite_eq_left_of_eq_true (eq_true hcC), dite_eq_left_of_eq_true (eq_true hcR), hwL, hwC, hwR]
-        · simp only [specU64, evalParKernelElem, ge_iff_le] at hedge ⊢
-          simp [hedge, hrC, dite_eq_left_of_eq_true (eq_true hcC), hwC]
+          simp only [ge_iff_le] at hedge
+          exact ⟨wL * xL + wC * xC + wR * xR, by simp [evalParKernelElem, hedge, hrL, hrC, hrR],
+            by rw [ite_eq_right Bool.false_ne_true, dite_eq_left hcL, dite_eq_left hcC, dite_eq_left hcR, hwL, hwC, hwR]; rfl⟩
+        · simp only [ge_iff_le] at hedge
+          exact ⟨xC, by simp [evalParKernelElem, hedge, hrC],
+            by rw [ite_eq_left rfl, dite_eq_left hcC, hwC]⟩
+      let ii := MetalAst.MSLExpr.cast .ulong (.var "gid")
+      let edge := MetalAst.MSLExpr.logOr (.eq ii (u 0)) (.ge (.add ii (u 1)) (.var "n"))
+      let interior := MetalAst.MSLExpr.add (.add (.mul (.immU64 wL.toBitVec) (.index "in0" (.sub ii (u 1))))
+        (.mul (.immU64 wC.toBitVec) (elem "in0"))) (.mul (.immU64 wR.toBitVec) (.index "in0" (.add ii (u 1))))
+      refine ⟨2, [.ifElse edge (.cons (storeOut (elem "in0")) .nil) (.cons (storeOut interior) .nil)],
+        rfl, rfl, rfl, by simp [groupStepsForKind]; omega, ?_, ?_⟩
+      · refine MetalAst.laneInnerSpec_congr
+          (MetalAst.laneInner_stencil1D3Pt len wL.toBitVec wC.toBitVec wR.toBitVec inWords) (fun cx hcx => ?_)
+        rcases hst cx hcx with ⟨v, hv, hsw⟩
+        dsimp only [specU64]; rw [hv]; exact hsw
       · intro i hi
-        rcases hreadElem 0 (by simp [kernelArity]) i hi with ⟨_, xC, hrC, _⟩
-        cases hedge : (i == 0 || decide (i + 1 ≥ len))
-        · have hiPos : 0 < i := by cases i with | zero => simp at hedge | succ _ => omega
-          have hi1Lt : i + 1 < len := by
-            rcases Bool.or_eq_false_iff.mp hedge with ⟨_, h2⟩
-            simp only [decide_eq_false_iff_not] at h2; omega
-          rcases hreadElem 0 (by simp [kernelArity]) (i - 1) (by omega) with ⟨_, xL, hrL, _⟩
-          rcases hreadElem 0 (by simp [kernelArity]) (i + 1) hi1Lt with ⟨_, xR, hrR, _⟩
-          simp only [specU64, evalParKernelElem, ge_iff_le] at hedge ⊢
-          simp [hedge, hrL, hrC, hrR]
-        · simp only [specU64, evalParKernelElem, ge_iff_le] at hedge ⊢
-          simp [hedge, hrC]
+        rcases hst i hi with ⟨v, hv, _⟩
+        dsimp only [specU64]; rw [hv]
     | customScalar idxVar inVars body =>
       simp only [wfMetalKernel, Bool.and_eq_true, decide_eq_true_eq, Option.isSome_iff_exists] at hwf
       rcases hwf with ⟨⟨hnodup, hnotMem⟩, ⟨s, hsort⟩⟩
@@ -813,37 +574,26 @@ theorem lowerToMetal_evalMSLKernel_sound
           bindCustomParInputs env st inputs cx (env.bind idxVar (.u64 cx.toUInt64)) 0 inVars = .ok kEnv ∧
           (∀ id ∈ idxVar :: inVars, ∃ x : UInt64, kEnv id = some (.u64 x)) := by
         intro cx hcx
-        have h32 : cx < 2 ^ 32 := by omega
-        have haux : ∀ (rem : List VarId) (k0 : Nat) (cur : VarEnv),
-            k0 + rem.length = inputs.length →
+        suffices h : ∀ (rem : List VarId) (k0 : Nat) (cur : VarEnv), k0 + rem.length = inputs.length →
             ∃ kEnv, bindCustomParInputs env st inputs cx cur k0 rem = .ok kEnv ∧
-              ∀ id, (∃ x, cur id = some (.u64 x)) ∨ id ∈ rem → ∃ x, kEnv id = some (.u64 x) := by
-          intro rem
-          induction rem with
-          | nil =>
-            intro k0 cur _
-            refine ⟨cur, rfl, fun id hid => ?_⟩
-            rcases hid with h1 | h2
-            · exact h1
-            · nomatch h2
-          | cons iv rest ih =>
-            intro k0 cur hk
-            simp only [List.length_cons] at hk
-            rcases hreadElem k0 (by omega) cx hcx with ⟨_, x0, hr0, _⟩
-            obtain ⟨kEnv, hbRest, hall⟩ := ih (k0 + 1) (cur.bind iv (.u64 x0)) (by omega)
-            refine ⟨kEnv, by unfold bindCustomParInputs; rw [hr0]; exact hbRest, fun id hid => hall id ?_⟩
-            rcases hid with ⟨x, hx⟩ | hmem
-            · by_cases heq : id = iv
-              · subst heq; exact Or.inl ⟨x0, VarEnv.bind_self cur id (.u64 x0)⟩
-              · exact Or.inl ⟨x, (VarEnv.bind_ne cur iv id (.u64 x0) (beq_eq_false_iff_ne.mpr heq)).trans hx⟩
-            · rcases List.mem_cons.mp hmem with rfl | htl
-              · exact Or.inl ⟨x0, VarEnv.bind_self cur id (.u64 x0)⟩
-              · exact Or.inr htl
-        obtain ⟨kEnv, hb, hall⟩ := haux inVars 0 (env.bind idxVar (.u64 cx.toUInt64)) (by omega)
-        refine ⟨kEnv, hb, fun id hid => hall id ?_⟩
-        rcases List.mem_cons.mp hid with rfl | htl
-        · exact Or.inl ⟨cx.toUInt64, VarEnv.bind_self env id (.u64 cx.toUInt64)⟩
-        · exact Or.inr htl
+              ∀ id, (∃ x, cur id = some (.u64 x)) ∨ id ∈ rem → ∃ x, kEnv id = some (.u64 x) from by
+          rcases h inVars 0 (env.bind idxVar (.u64 cx.toUInt64)) (by omega) with ⟨kEnv, hb, hall⟩
+          refine ⟨kEnv, hb, fun id hid => hall id ?_⟩
+          rcases List.mem_cons.mp hid with rfl | htl
+          · exact Or.inl ⟨cx.toUInt64, VarEnv.bind_self env id (.u64 cx.toUInt64)⟩
+          · exact Or.inr htl
+        intro rem; induction rem with
+        | nil => intro _ cur _; exact ⟨cur, rfl, fun _ hid => hid.elim id (fun h => nomatch h)⟩
+        | cons iv rest ih =>
+          intro k0 cur hk; simp only [List.length_cons] at hk
+          rcases hreadElem k0 (by omega) cx hcx with ⟨_, x0, hr0, _⟩
+          rcases ih (k0 + 1) (cur.bind iv (.u64 x0)) (by omega) with ⟨kEnv, hbRest, hall⟩
+          refine ⟨kEnv, by unfold bindCustomParInputs; rw [hr0]; exact hbRest, fun id hid => hall id ?_⟩
+          rcases hid with ⟨x, hx⟩ | hmem
+          · by_cases heq : id = iv
+            · subst heq; exact Or.inl ⟨x0, VarEnv.bind_self cur id (.u64 x0)⟩
+            · exact Or.inl ⟨x, (VarEnv.bind_ne cur iv id (.u64 x0) (beq_eq_false_iff_ne.mpr heq)).trans hx⟩
+          · exact (List.mem_cons.mp hmem).elim (fun h => Or.inl ⟨x0, h ▸ VarEnv.bind_self cur iv (.u64 x0)⟩) Or.inr
       let loads := (List.range inVars.length).map fun m =>
         MetalAst.MSLStmt.varDecl .ulong s!"v{inVars[m]?.getD 0}" (elem s!"in{m}")
       refine ⟨inVars.length + 2,
@@ -855,22 +605,18 @@ theorem lowerToMetal_evalMSLKernel_sound
       · apply MetalAst.laneInner_varDecls_storeOut inVars len inWords
           (fun i => (specU64 i).toBitVec) (lowerScalar "gid64" idxVar body) hnodup
         intro g tid ls cx hcxLen hcx32 hgidV hgidT hvars
-        have hreadCx : ∀ j < inputs.length, ∃ (hc : cx < (inWords j).length) (x : UInt64),
-            readParInput env st inputs j cx = .ok x ∧ (inWords j)[cx]'hc = x.toBitVec := by
-          intro j hj; exact hreadElem j (by omega) cx hcxLen
-        have hcur0 : varEnvMatchesLocals (env.bind idxVar (.u64 cx.toUInt64)) ls "gid64" idxVar [idxVar] := by
-          refine ⟨⟨cx.toUInt64, VarEnv.bind_self env idxVar _, ?_, ?_⟩, trivial⟩
-          · simp [MetalAst.u64_ofNat_toBitVec cx hcx32, hgidV]
-          · simp [hgidT]
+        have hcur0 : varEnvMatchesLocals (env.bind idxVar (.u64 cx.toUInt64)) ls "gid64" idxVar [idxVar] :=
+          ⟨⟨cx.toUInt64, VarEnv.bind_self env idxVar _, by simp [MetalAst.u64_ofNat_toBitVec cx hcx32, hgidV],
+            by simp [hgidT]⟩, trivial⟩
         have hrem0 : ∀ m (hm : m < inVars.length), ∃ (hc : cx < (inWords (0 + m)).length),
             ls.lookup? s!"v{inVars[m]'hm}" = some ((inWords (0 + m))[cx]'hc) ∧
             ls.lookupType? s!"v{inVars[m]'hm}" = some .ulong := by
           intro m hm
           have hc : cx < (inWords m).length := by rw [hinWordsLen]; exact hcxLen
           have ⟨hv, ht⟩ := hvars m hm hc
-          simp only [Nat.zero_add]
-          exact ⟨hc, hv, ht⟩
-        obtain ⟨kEnv, hbind, hmatch⟩ := bindCustomParInputs_props env st inputs cx inWords hreadCx
+          simp only [Nat.zero_add]; exact ⟨hc, hv, ht⟩
+        obtain ⟨kEnv, hbind, hmatch⟩ := bindCustomParInputs_props env st inputs cx inWords
+          (fun j hj => hreadElem j (by omega) cx hcxLen)
           inVars 0 (env.bind idxVar (.u64 cx.toUInt64)) ls idxVar [] (by omega) hndAll hcur0 hrem0
         simp only [List.nil_append] at hmatch
         obtain ⟨val, bv, hevBody, hvs, hmsl⟩ :=
