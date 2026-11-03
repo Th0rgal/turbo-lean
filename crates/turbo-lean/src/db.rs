@@ -868,10 +868,10 @@ impl TurboStore {
     }
 
     /// Compute the deterministic BLAKE3 cache key for `file_split_cache` from an existing
-    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v11:" + src_blake3_hex)`).
+    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v12:" + src_blake3_hex)`).
     pub fn compute_file_split_key_from_src_hash(src_blake3_hex: &str) -> String {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"file-split:v11:");
+        hasher.update(b"file-split:v12:");
         hasher.update(src_blake3_hex.as_bytes());
         hasher.finalize().to_hex().to_string()
     }
@@ -4803,6 +4803,7 @@ fn open_unique_staging_file(dir: &Path, stem: &str, mode: u32) -> std::io::Resul
 /// `populate`, optionally stamp immutable CAS ownership + `chmod 0o444`, `fsync` its bytes, run
 /// `publish` to install `dest` (`rename` or `link` + race resolution), `fsync` `dest`'s parent plus
 /// `created` ancestors, and unlink any leftover staging link on exit.
+#[allow(clippy::too_many_arguments)]
 fn stage_and_publish_durable_ext<T, P, Pub>(
     stage_dir: &Path,
     stem: &str,

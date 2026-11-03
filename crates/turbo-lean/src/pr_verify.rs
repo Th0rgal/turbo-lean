@@ -328,9 +328,10 @@ fn git_head_tree_cache_paths(
 ) -> Option<(PathBuf, PathBuf)> {
     let lake_inputs_tag = crate::module_builder::try_project_lake_inputs_tag(canon_dir).ok()?;
     let mut h = blake3::Hasher::new();
-    // v14: folds verifier provenance versions (`ZYGOTE_SCANNER_VERSION`, `ZYGOTE_REPLAY_VERSION`),
-    // workspace config digest, and Lake declarative input tag unconditionally.
-    h.update(b"git-head-tree:v14:");
+    // v16: folds verifier provenance versions (`ZYGOTE_SCANNER_VERSION`, `ZYGOTE_REPLAY_VERSION`),
+    // `theorem-shard-v8` keys, 3-byte docstring/module-doc split hashes, workspace config digest,
+    // and Lake declarative input tag unconditionally.
+    h.update(b"git-head-tree:v16:");
     h.update(&crate::zygote::ZYGOTE_SCANNER_VERSION.to_le_bytes());
     h.update(&crate::zygote::ZYGOTE_REPLAY_VERSION.to_le_bytes());
     h.update(repo_root.to_string_lossy().as_bytes());
@@ -357,8 +358,8 @@ fn git_head_tree_cache_paths(
     let short_key = &key_hex[..24];
     let staging = store.fast_staging_dir();
     Some((
-        staging.join(format!("git_head_tree_v14_{}.json", short_key)),
-        staging.join(format!("git_head_tree_stats_v14_{}.json", short_key)),
+        staging.join(format!("git_head_tree_v16_{}.json", short_key)),
+        staging.join(format!("git_head_tree_stats_v16_{}.json", short_key)),
     ))
 }
 
@@ -3219,7 +3220,7 @@ fn to_batch_req_item(
 ) -> pack::CheckShardBatchItem {
     pack::CheckShardBatchItem {
         shard_key: k.clone(),
-        decl_name: sh.decl_name().to_string(),
+        decl_name: sh.rooted_name(),
         prefix_env_hash: sh.prefix_env_hash.clone(),
         stmt_hash: sh.stmt_hash.clone(),
         proof_hash: sh.proof_hash.clone(),
@@ -3255,6 +3256,7 @@ fn make_batch_zreq(
     toolchain: &str,
     lean_path: &str,
     lean_args: Vec<String>,
+    targets: Vec<String>,
 ) -> pack::CheckShardHttpRequest {
     pack::CheckShardHttpRequest {
         decl: "__batch__".to_string(),
@@ -3270,6 +3272,7 @@ fn make_batch_zreq(
         skip_cas_lock: true,
         allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
         lean_args,
+        targets,
     }
 }
 
@@ -6247,7 +6250,7 @@ pub fn run_pr_verify_command(
                 }
                 let uncached_names: std::collections::HashSet<String> = file_uncached
                     .iter()
-                    .map(|(_, sh, _)| sh.decl_name().to_string())
+                    .map(|(_, sh, _)| sh.rooted_name())
                     .collect();
                 if let Some(mod_imp) =
                     resolve_replayed_prebuilt_module_import(store, &canon_dir, &abs_file)
@@ -6328,6 +6331,10 @@ pub fn run_pr_verify_command(
                     &toolchain,
                     &lean_path_str,
                     cross_args.clone(),
+                    uncached_by_file
+                        .iter()
+                        .flat_map(|(_, fu, _)| fu.iter().map(|(_, sh, _)| sh.rooted_name()))
+                        .collect(),
                 );
                 let cross_res = if let Some(ref z_url) = fast_local_zygote_url {
                     pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
@@ -6381,37 +6388,35 @@ pub fn run_pr_verify_command(
                         inflight_tx_open = false;
                     }
                     batch_to_publish.clear();
-                    cross_res
-                        .context("Zygote kernel gate rejected the cross-file PR shard batch")?;
-                    if !is_untrusted && env_vars.is_empty() {
-                        if let Ok((ev, _)) = resolve_lake_env(store, &canon_dir) {
-                            env_vars = ev;
+                    if matches!(cross_res, Ok(None)) {
+                        if !is_untrusted && env_vars.is_empty() {
+                            if let Ok((ev, _)) = resolve_lake_env(store, &canon_dir) {
+                                env_vars = ev;
+                            }
                         }
+                        let lb = if env_vars.is_empty() {
+                            lean_bin.clone()
+                        } else {
+                            resolve_lean_bin(&canon_dir)?
+                        };
+                        let cross_names: std::collections::HashSet<String> = uncached_by_file
+                            .iter()
+                            .flat_map(|(_, fu, _)| fu.iter().map(|(_, sh, _)| sh.rooted_name()))
+                            .collect();
+                        cross_ok = run_lean_temp_file(
+                            store,
+                            &lb,
+                            &cross_src,
+                            &canon_dir,
+                            &env_vars,
+                            &verification_trust,
+                            &cross_names,
+                            &cross_expected_types,
+                            &cross_args,
+                        )?
+                        .status
+                        .success();
                     }
-                    let lb = if env_vars.is_empty() {
-                        lean_bin.clone()
-                    } else {
-                        resolve_lean_bin(&canon_dir)?
-                    };
-                    let cross_names: std::collections::HashSet<String> = uncached_by_file
-                        .iter()
-                        .flat_map(|(_, fu, _)| {
-                            fu.iter().map(|(_, sh, _)| sh.decl_name().to_string())
-                        })
-                        .collect();
-                    cross_ok = run_lean_temp_file(
-                        store,
-                        &lb,
-                        &cross_src,
-                        &canon_dir,
-                        &env_vars,
-                        &verification_trust,
-                        &cross_names,
-                        &cross_expected_types,
-                        &cross_args,
-                    )?
-                    .status
-                    .success();
                 }
                 if cross_ok {
                     cross_batch_done = true;
@@ -6443,7 +6448,7 @@ pub fn run_pr_verify_command(
                     let file_lean_args = resolve_file_args(&canon_lf);
                     let uncached_names: std::collections::HashSet<String> = file_uncached
                         .iter()
-                        .map(|(_, sh, _)| sh.decl_name().to_string())
+                        .map(|(_, sh, _)| sh.rooted_name())
                         .collect();
                     let req_items: Vec<pack::CheckShardBatchItem> =
                         file_uncached.iter().map(to_batch_req_item).collect();
@@ -6571,7 +6576,7 @@ pub fn run_pr_verify_command(
                     };
                     let uncached_names: std::collections::HashSet<String> = file_uncached
                         .iter()
-                        .map(|(_, sh, _)| sh.decl_name().to_string())
+                        .map(|(_, sh, _)| sh.rooted_name())
                         .collect();
                     let file_expected_types: Vec<(String, String)> = file_uncached
                         .iter()
@@ -6601,6 +6606,7 @@ pub fn run_pr_verify_command(
                                 )
                             };
                             if let Some(fast_src) = fast_src_opt {
+                                let mut fast_unavailable = true;
                                 if let Some(z_url) = local_zygote_url.as_deref() {
                                     let zreq = make_batch_zreq(
                                         format!("pr_verify_fast_{}_{}", pid, f_idx),
@@ -6608,6 +6614,7 @@ pub fn run_pr_verify_command(
                                         &toolchain,
                                         &lean_path_str,
                                         file_lean_args.clone(),
+                                        uncached_names.iter().cloned().collect(),
                                     );
                                     let fast_res =
                                         pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
@@ -6657,6 +6664,7 @@ pub fn run_pr_verify_command(
                                     if matches!(fast_res, Ok(Some(_))) {
                                         verified_ok = true;
                                         local_fast_olean = true;
+                                        fast_unavailable = false;
                                     } else {
                                         if local_tx_open {
                                             if let Some(st) = inflight_store {
@@ -6665,15 +6673,13 @@ pub fn run_pr_verify_command(
                                             local_tx_open = false;
                                         }
                                         local_publish.clear();
-                                        fast_res.with_context(|| {
-                                            format!(
-                                                "Zygote kernel gate rejected PR shards in {}",
-                                                rel_path
-                                            )
-                                        })?;
+                                        if fast_res.is_err() {
+                                            fast_unavailable = false;
+                                        }
                                     }
                                 }
                                 if !verified_ok
+                                    && fast_unavailable
                                     && run_lean_temp_file(
                                         worker_store,
                                         &lean_bin,
@@ -6705,6 +6711,7 @@ pub fn run_pr_verify_command(
                                 &toolchain,
                                 &lean_path_str,
                                 file_lean_args.clone(),
+                                uncached_names.iter().cloned().collect(),
                             );
                             if let Some(reply) =
                                 pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
@@ -6768,10 +6775,10 @@ pub fn run_pr_verify_command(
                         if let Some(pruned_src) =
                             splitter::build_pruned_imports_shard_source(&src, &uncached_names)
                         {
-                            if try_zygote_or_cli_batch(
+                            if let Ok(true) = try_zygote_or_cli_batch(
                                 &pruned_src,
                                 format!("pr_verify_{}_{}", pid, f_idx),
-                            )? {
+                            ) {
                                 verified_ok = true;
                                 local_fast_olean = true;
                             }
@@ -6802,22 +6809,24 @@ pub fn run_pr_verify_command(
                         let now = crate::db::now_unix();
                         for (k, sh, kth) in file_uncached.iter() {
                             let s_t0 = Instant::now();
-                            let single_src: std::borrow::Cow<'_, str> =
-                                if sh.shard_source.is_empty() {
-                                    let reconstructed = splitter::reconstruct_single_shard_source(
-                                        &src,
-                                        sh.decl_name(),
-                                    )?
-                                    .unwrap_or_else(|| {
-                                        let mut single_set =
-                                            std::collections::HashSet::with_capacity(1);
-                                        single_set.insert(sh.decl_name().to_string());
-                                        splitter::build_coalesced_shard_source(&src, &single_set)
-                                    });
-                                    std::borrow::Cow::Owned(reconstructed)
-                                } else {
-                                    std::borrow::Cow::Borrowed(sh.shard_source.as_str())
-                                };
+                            let rooted_target = sh.rooted_name();
+                            let single_src: std::borrow::Cow<'_, str> = if sh
+                                .shard_source
+                                .is_empty()
+                            {
+                                let reconstructed = splitter::reconstruct_single_shard_source(
+                                    &src,
+                                    &rooted_target,
+                                )?
+                                .unwrap_or_else(|| {
+                                    let single_set =
+                                        std::collections::HashSet::from([rooted_target.clone()]);
+                                    splitter::build_coalesced_shard_source(&src, &single_set)
+                                });
+                                std::borrow::Cow::Owned(reconstructed)
+                            } else {
+                                std::borrow::Cow::Borrowed(sh.shard_source.as_str())
+                            };
                             let single_expected_types = [(sh.decl_name().to_string(), kth.clone())];
                             let mut single_ok = false;
                             if let Some(z_url) = local_zygote_url.as_deref() {
@@ -6835,6 +6844,7 @@ pub fn run_pr_verify_command(
                                     skip_cas_lock: true,
                                     allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
                                     lean_args: file_lean_args.clone(),
+                                    targets: vec![rooted_target.clone()],
                                 };
                                 let single_res =
                                     pack::try_zygote_url_check_shard_inner_with_inflight_detailed(
@@ -6906,7 +6916,7 @@ pub fn run_pr_verify_command(
                                     &canon_dir,
                                     &env_vars,
                                     &verification_trust,
-                                    &std::iter::once(sh.decl_name().to_string()).collect(),
+                                    &std::collections::HashSet::from([rooted_target]),
                                     &single_expected_types,
                                     &file_lean_args,
                                 )?;
@@ -9077,6 +9087,26 @@ end Fixture
                 && changed_files.len() == 1
                 && changed_files["Demo/A.lean"].len() < 512
         );
+
+        // Literal whitespace edit inside theorem statement must classify as statement edit + interface drift.
+        fs::write(
+            canon_dir.join("Demo/B.lean"),
+            "namespace Demo\ntheorem t_b : \"a b\" = \"a b\" := by\n  rfl\nend Demo\n",
+        )?;
+        git_init_and_commit(&repo_dir, "add string theorem")?;
+        let (splits2, _) = load_and_split_files_cached(&store, &lean_paths)?;
+        warm_git_head_tree_cache(&store, &canon_dir, &lean_paths, tc, Some(&splits2));
+        fs::write(
+            canon_dir.join("Demo/B.lean"),
+            "namespace Demo\ntheorem t_b : \"a  b\" = \"a b\" := by\n  rfl\nend Demo\n",
+        )?;
+        let (cls_lit, to_verify_lit, _, _) =
+            load_and_classify_pr_from_git(&store, &canon_dir, "HEAD", tc)?;
+        assert!(cls_lit.interface_drift);
+        assert_eq!(cls_lit.statement_edited_theorems, vec!["Demo/B.lean::t_b"]);
+        assert_eq!(to_verify_lit["Demo/B.lean"].len(), 1);
+        assert!(!to_verify_lit["Demo/B.lean"][0].2);
+
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
@@ -12423,7 +12453,7 @@ end ParityNs
         );
         assert!(!store.has_attested_decl_receipt(&shard_key, "trusted", "Demo.thm", "deadbeef"));
 
-        // 3. `to_batch_req_item` preserves the full namespace-qualified declaration name.
+        // 3. `to_batch_req_item` preserves the full root-anchored namespace-qualified declaration name.
         let ns_split = splitter::split_lean_source(
             "namespace Outer.Inner\ntheorem same_name : True := True.intro\nend Outer.Inner\n",
             &[],
@@ -12433,7 +12463,7 @@ end ParityNs
             ns_split.shards[0].clone(),
             "abcd".repeat(16),
         ));
-        assert_eq!(ns_item.decl_name, "Outer.Inner.same_name");
+        assert_eq!(ns_item.decl_name, "_root_.Outer.Inner.same_name");
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())

@@ -32,7 +32,7 @@ pub fn decode_hex_fixed<const N: usize>(hex: &str) -> Result<[u8; N]> {
         );
     }
     let mut out = [0u8; N];
-    for (i, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
+    for (i, chunk) in s.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let pair = std::str::from_utf8(chunk).context("Invalid UTF-8 in hex")?;
         out[i] = u8::from_str_radix(pair, 16).context("Invalid hex byte")?;
     }
@@ -255,6 +255,10 @@ pub struct CheckShardHttpRequest {
     pub allowed_axioms: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lean_args: Vec<String>,
+    /// Batch requests: the declarations under check (never `sorry`-stub exempt). When empty, every
+    /// declaration of `shard_source` is treated as a target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub targets: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_kernel_type_hash: Option<String>,
 }
@@ -3508,8 +3512,12 @@ pub fn offload_check_shards_batch_http(
         items
             .iter()
             .filter_map(|item| {
+                let clean_decl = item
+                    .decl_name
+                    .strip_prefix("_root_.")
+                    .unwrap_or(&item.decl_name);
                 let mut receipt_obj = serde_json::json!({
-                    "decl": item.decl_name,
+                    "decl": clean_decl,
                     "prefix_env_hash": item.prefix_env_hash,
                     "stmt_hash": item.stmt_hash,
                     "proof_hash": item.proof_hash,
@@ -3536,7 +3544,7 @@ pub fn offload_check_shards_batch_http(
                 let receipt = serde_json::to_vec(&receipt_obj).ok()?;
                 Some((
                     item.shard_key.clone(),
-                    item.decl_name.clone(),
+                    clean_decl.to_string(),
                     receipt,
                     dur_ms,
                 ))
@@ -4503,6 +4511,7 @@ pub(crate) mod tests {
             skip_cas_lock: false,
             allowed_axioms: None,
             lean_args: Vec::new(),
+            targets: Vec::new(),
         };
         let body = serde_json::to_vec(&req)?;
         let resp1: serde_json::Value =
@@ -4536,6 +4545,7 @@ pub(crate) mod tests {
             skip_cas_lock: false,
             allowed_axioms: Some(Vec::new()),
             lean_args: Vec::new(),
+            targets: Vec::new(),
         };
         let strict_res = http_request(
             "POST",
@@ -4621,21 +4631,10 @@ pub(crate) mod tests {
             resp1.ok && resp1.verified_count == 2 && resp1.cache_hits == 0 && resp1.exit_code == 0
         );
 
-        let store_srv_check = TurboStore::open(Some(&dir_server))?;
         let both_keys = [
             "batch_shard_key_1".to_string(),
             "batch_shard_key_2".to_string(),
         ];
-        for _ in 0..20 {
-            if store_srv_check
-                .batch_get_theorem_shards(&both_keys, "trusted")?
-                .len()
-                == 2
-            {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
         assert_eq!(
             store_client
                 .batch_get_theorem_shards(&both_keys, "trusted")?
@@ -4675,7 +4674,8 @@ pub(crate) mod tests {
             mk_item("batch_shard_key_1", "batch_thm_1", "p1", "s1", "pr1"),
             mk_item("batch_shard_key_3", "batch_thm_3", "p3", "s3", "pr3"),
         ];
-        let partial_fast_src = "theorem _turbo_verify_1_batch_thm_1 : 2 + 2 = 4 := rfl\ntheorem _turbo_verify_2_batch_thm_3 : 4 + 4 = 8 := rfl\n";
+        let partial_fast_src =
+            "theorem batch_thm_1 : 2 + 2 = 4 := rfl\ntheorem batch_thm_3 : 4 + 4 = 8 := rfl\n";
         let resp3 = offload_check_shards_batch_http(
             &mut store_client3,
             &endpoint,
@@ -4860,6 +4860,7 @@ pub(crate) mod tests {
             skip_cas_lock: false,
             allowed_axioms: None,
             lean_args: Vec::new(),
+            targets: Vec::new(),
         };
         let post = |req: &CheckShardHttpRequest| -> Result<serde_json::Value> {
             Ok(serde_json::from_slice(&http_request(
@@ -4965,6 +4966,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_local_daemon_request_rejects_named_sorry_target() -> Result<()> {
+        // The local daemon helpers send `skip_cas_lock: true`; a named target's own `sorry` is
+        // still rejected (P0-1), before any elaboration, and nothing is cached for it.
+        let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("turbo_lean_daemon_sorry_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&dir);
+        let mut store = TurboStore::open(Some(&dir))?;
+        let req = CheckShardHttpRequest {
+            decl: "bad".into(),
+            shard_key: "shard_key_daemon_sorry".into(),
+            shard_source: "theorem good : 1 + 1 = 2 := sorry\ntheorem bad : False := sorry\n"
+                .into(),
+            interface_hash: String::new(),
+            prefix_env_hash: String::new(),
+            stmt_hash: String::new(),
+            proof_hash: String::new(),
+            expected_kernel_type_hash: None,
+            toolchain: "leanprover/lean4:v4.35.0".into(),
+            lean_path: String::new(),
+            skip_cas_lock: true,
+            allowed_axioms: None,
+            lean_args: Vec::new(),
+            targets: Vec::new(),
+        };
+        let err = execute_check_shard_payload(&mut store, &req).unwrap_err();
+        assert!(
+            err.to_string().contains("Soundness hygiene violation"),
+            "{err}"
+        );
+        assert!(!store.has_cached_action_readonly(&req.shard_key, "trusted")?);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
     fn test_zygote_parallel_cross_file_shard_eval() -> Result<()> {
         let _env_guard = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let dir =
@@ -4976,7 +5012,7 @@ pub(crate) mod tests {
         let req = CheckShardHttpRequest {
             decl: "__batch__".into(),
             shard_key: "shard_key_par_cross_1".into(),
-            shard_source: "import Init\n-- namespace _TurboCrossFileShard_0\n-- end _TurboCrossFileShard_0\ntheorem _turbo_verify_10000_par1 (a b : Nat) : a + b = b + a := Nat.add_comm a b\n-- namespace _TurboCrossFileShard_1\n-- end _TurboCrossFileShard_1\ntheorem _turbo_verify_20000_par2 (x : Nat) : x + 0 = x := rfl\n".into(),
+            shard_source: "import Init\n-- namespace _TurboCrossFileShard_0\n-- end _TurboCrossFileShard_0\ntheorem par1 (a b : Nat) : a + b = b + a := Nat.add_comm a b\n-- namespace _TurboCrossFileShard_1\n-- end _TurboCrossFileShard_1\ntheorem par2 (x : Nat) : x + 0 = x := rfl\n".into(),
             interface_hash: String::new(),
             prefix_env_hash: String::new(),
             stmt_hash: String::new(),
@@ -4987,6 +5023,7 @@ pub(crate) mod tests {
             skip_cas_lock: true,
             allowed_axioms: None,
             lean_args: Vec::new(),
+            targets: Vec::new(),
         };
         let res1 = execute_check_shard_payload(&mut store, &req)?;
         assert_eq!(

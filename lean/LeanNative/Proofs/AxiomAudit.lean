@@ -18,6 +18,9 @@ import LeanNative.Transform.LoopSchedule
 import LeanNative.Transform.OwnershipRC
 import LeanNative.Backend.FastCheck
 import LeanNative.Proofs.HybridCAbiProofs
+import LeanNative.Proofs.KernelFusionProofs
+import LeanNative.Proofs.ClosureADTProofs
+import LeanNative.Proofs.SliceViewProofs
 import LeanNative.Proofs.HeapObjAbiProofs
 import LeanNative.Proofs.LLVMLowerProofs
 import LeanNative.Proofs.StableHLOLowerProofs
@@ -157,6 +160,7 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Spec.backend_choice_gate_sound, ``LeanNative.Spec.backend_choice_rejects_misaligned_or_small_metal
   , ``LeanNative.Spec.low_twiddle_zmm_ntt_gate_sound, ``LeanNative.Spec.nonzero_tw_hi_rejects_low_twiddle_3clmul
   , ``LeanNative.Spec.trineon_fold_four_gate_sound, ``LeanNative.Spec.gpr_fmov_or_misaligned_rejects_trineon_fold_four
+  , ``LeanNative.Spec.zero_copy_slice_io_gate_sound, ``LeanNative.Spec.overlap_or_overflow_rejects_zero_copy_slice_io
   , ``LeanNative.Proofs.evalParKernelLoop_append, ``LeanNative.Proofs.parFor_chunk_partition_sound
   , ``LeanNative.Semantics.HeapState.decRefBuf_one_frees_buffer
   , ``LeanNative.Semantics.HeapState.decRefBuf_none_error, ``LeanNative.Semantics.HeapState.incRefBuf_none_error
@@ -236,6 +240,39 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.HybridCAbi.buffersOwned_implies_rcConserved
   , ``LeanNative.Proofs.HybridCAbi.globalThreadId_bijection
   , ``LeanNative.Proofs.HybridCAbi.validateHybridDispatch_sound
+  , ``LeanNative.Proofs.HybridCAbi.validateZeroCopySliceIoCall_sound
+  , ``LeanNative.Proofs.HybridCAbi.zeroCopySpanFitsU64_iff_addrLimit
+  , ``LeanNative.Proofs.HybridCAbi.spliceOutputSlice_size
+  , ``LeanNative.Proofs.HybridCAbi.spliceOutputSlice_extract_written
+  , ``LeanNative.Proofs.HybridCAbi.spliceOutputSlice_preserves_prefix
+  , ``LeanNative.Proofs.HybridCAbi.spliceOutputSlice_preserves_suffix_outside_cap
+  , ``LeanNative.Proofs.HybridCAbi.execZeroCopySliceIoHostCall_failure_preserves_mem
+  , ``LeanNative.Proofs.HybridCAbi.execZeroCopySliceIoHostCall_ok_sound
+  , ``LeanNative.Proofs.contractKernelScalar_sound
+  , ``LeanNative.Proofs.specializeKernelCode_refines
+  , ``LeanNative.Proofs.fuseMapScaleAddPair_algebra
+  , ``LeanNative.Proofs.fuseMapScaleAdd_loop_sound
+  , ``LeanNative.Proofs.fuseParForKernels_sound
+  , ``LeanNative.Proofs.fuseCustomScalar1_elem_sound
+  , ``LeanNative.Proofs.fuseCustomScalar1_bool_coerced_elem_sound
+  , ``LeanNative.Proofs.ctorTag_obj_sound
+  , ``LeanNative.Proofs.ctorTag_tuple_sound
+  , ``LeanNative.Proofs.ctorGetObj_sound
+  , ``LeanNative.Proofs.lowerClosureAlloc_sound
+  , ``LeanNative.Proofs.specializeKnownClosure_sound
+  , ``LeanNative.Proofs.lowerClosureSeqFor_step1_sound
+  , ``LeanNative.Proofs.adtMatchArm_taken
+  , ``LeanNative.Proofs.adtMatchArm_fallthrough
+  , ``LeanNative.Proofs.defunctionalizeClosure_sound
+  , ``LeanNative.Proofs.lowerAdtMatch_sound
+  , ``LeanNative.Proofs.checkedSubSlice_valid
+  , ``LeanNative.Proofs.checkedSubSlice_oob_rejects
+  , ``LeanNative.Proofs.subSliceBounds_no_oob
+  , ``LeanNative.Proofs.lowerSliceGet_sound
+  , ``LeanNative.Proofs.lowerSliceRawLoad_sound
+  , ``LeanNative.Proofs.sliceFoldStep_sound
+  , ``LeanNative.Proofs.sliceFoldLoop_sound
+  , ``LeanNative.Proofs.lowerSliceFold_sound
   , ``LeanNative.Proofs.HeapObjAbi.unbox_box_id
   , ``LeanNative.Proofs.HeapObjAbi.unbox_box_eq_iff
   , ``LeanNative.Proofs.HeapObjAbi.box_ne_aligned_ptr

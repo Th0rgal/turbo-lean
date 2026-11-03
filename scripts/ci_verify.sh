@@ -124,6 +124,11 @@ grep -q "module TurboLeanCABI" /tmp/ln_cabi_check.modulemap
 rm -f /tmp/ln_cabi_check.rs /tmp/ln_cabi_check.swift /tmp/ln_cabi_check.modulemap
 ./lean/.lake/build/bin/turbo-lean-native self-test
 
+echo "[3a-c8/3] Auditing C8 proof modules under strict-proofs policy..."
+for pf in lean/LeanNative/Proofs/KernelFusionProofs.lean lean/LeanNative/Proofs/ClosureADTProofs.lean lean/LeanNative/Proofs/SliceViewProofs.lean; do
+  "$TURBO_BIN" --json audit-spec "$pf" --policy strict-proofs | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['ok'] and d['vacuous_specs']==0 and d['trivial_specs']==0 and d['tight_specs']==d['total_specs_audited'] and len(d.get('droppable_hypotheses',[]))==0 and len(d.get('horizontal_packing_warnings',[]))==0, d; print(f'{d[\"file\"]}: {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} strict-proofs ok')"
+done
+
 echo "[3a/3] Running C7 Hybrid C-ABI C11 positive & negative cross-width clang conformance suite..."
 (cd lean && lake env lean --stdin) <<'LEAN'
 import LeanNative.Tests.HybridCAbiTests

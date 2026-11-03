@@ -725,10 +725,10 @@ pub(crate) fn compute_shard_key_with_args(
     lean_args: &[String],
 ) -> String {
     let mut key_hasher = blake3::Hasher::new();
-    // v3: replay-audited verdicts. v2: v1 receipts may come from Zygote replies vetted without the stderr panic scan.
-    // The verifier provenance versions are bound too, so v2 (pre-replay) receipts never match
+    // v8: replay-audited verdicts + 3-byte `/--` and `/-!` docstring/module-doc opener fix.
+    // The verifier provenance versions are bound too, so pre-replay receipts never match
     // and any later scanner/replay bump retires every older receipt.
-    key_hasher.update(b"theorem-shard-v3:");
+    key_hasher.update(b"theorem-shard-v8:");
     key_hasher.update(&crate::zygote::ZYGOTE_SCANNER_VERSION.to_le_bytes());
     key_hasher.update(&crate::zygote::ZYGOTE_REPLAY_VERSION.to_le_bytes());
     key_hasher.update(toolchain.as_bytes());
@@ -1196,7 +1196,7 @@ pub(crate) struct ShmProjectStatSummary {
 }
 
 pub(crate) fn shm_file_splits_dir(store: &TurboStore) -> PathBuf {
-    let dir = store.fast_staging_dir().join("file_splits_v4");
+    let dir = store.fast_staging_dir().join("file_splits_v8");
     let _ = fs::create_dir_all(&dir);
     dir
 }
@@ -1206,7 +1206,8 @@ pub(crate) fn compute_single_stat_hash(pk: &str, ms: i64, mn: i64, sz: i64) -> S
     // v4 rebuilds legacy shards without qualified declaration identities.
     // v9 invalidates declaration scopes computed before lossless dotted-component canonicalization.
     // v10 includes checking-weakening hygiene fields in cached file splits.
-    h.update(b"single-stat-split:v10\n");
+    // v11 invalidates splits computed before 3-byte `/--`/`/-!` docstring & raw/interp lexing fixes.
+    h.update(b"single-stat-split:v11\n");
     h.update(pk.as_bytes());
     h.update(b":");
     h.update(&ms.to_le_bytes());
@@ -1232,7 +1233,7 @@ pub(crate) fn compact_split_for_shm_cache(split: &splitter::SplitResult) -> spli
 
 pub(crate) fn compute_stat_slice_hash(stats: &[(String, i64, i64, i64)]) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"project-stat-splits:v8\n");
+    h.update(b"project-stat-splits:v9\n");
     for (pk, ms, mn, sz) in stats {
         h.update(pk.as_bytes());
         h.update(b":");
@@ -1291,7 +1292,7 @@ pub(crate) fn load_project_stat_summary_cached(
         let stat_hash = key_h.finalize().to_hex().to_string();
         let p = store
             .fast_staging_dir()
-            .join(format!("project_stat_summary_v3_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_summary_v7_{}.json", &stat_hash[..24]));
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(summary) = serde_json::from_slice::<ShmProjectStatSummary>(&bytes) {
                 if summary.total_files == paths.len() {
@@ -1388,7 +1389,8 @@ pub(crate) fn compute_project_interface_key_fast_summary(
     let mut hasher = blake3::Hasher::new();
     // v3: `module_full` outputs must come from kernel-replayed (non-toolchain) modules; v2
     // outputs predate the replay. The provenance versions retire outputs across later bumps.
-    hasher.update(b"turbo-lean-build-v3\n");
+    // v6: 3-byte docstring/module-doc & raw/interp string split hashes.
+    hasher.update(b"turbo-lean-build-v6\n");
     hasher.update(&crate::zygote::ZYGOTE_SCANNER_VERSION.to_le_bytes());
     hasher.update(&crate::zygote::ZYGOTE_REPLAY_VERSION.to_le_bytes());
     hasher.update(toolchain.as_bytes());
@@ -1477,7 +1479,7 @@ pub(crate) fn load_and_split_files_with_hashes_cached(
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let p = store
             .fast_staging_dir()
-            .join(format!("project_stat_splits_v3_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_splits_v9_{}.json", &stat_hash[..24]));
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(cached_entries) = serde_json::from_slice::<Vec<ShmCachedFileSplit>>(&bytes) {
                 if cached_entries.len() == paths.len()
@@ -1653,13 +1655,13 @@ pub(crate) fn split_and_audit_with_hashes_cached(
 
     let shm_proj_path = if files.len() <= 128 {
         let mut ch = blake3::Hasher::new();
-        ch.update(b"project-content-splits:v3\n");
+        ch.update(b"project-content-splits:v8\n");
         for (_, fk) in &file_keys {
             ch.update(fk.as_bytes());
             ch.update(b"\n");
         }
         let p = store.fast_staging_dir().join(format!(
-            "project_splits_v3_{}.json",
+            "project_splits_v8_{}.json",
             &ch.finalize().to_hex()[..24]
         ));
         if let Ok(bytes) = fs::read(&p) {
@@ -1786,7 +1788,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let stat_p = store
             .fast_staging_dir()
-            .join(format!("project_stat_splits_v3_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_splits_v9_{}.json", &stat_hash[..24]));
         if !stat_p.exists() || !new_splits.is_empty() {
             let compacts: Vec<ShmCachedFileSplit> = results
                 .iter()

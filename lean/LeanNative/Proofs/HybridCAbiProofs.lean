@@ -1,5 +1,6 @@
 import LeanNative.Driver.CAbiEmit
 import LeanNative.Backend.Hybrid
+import LeanNative.Spec
 
 namespace LeanNative.Proofs.HybridCAbi
 
@@ -1090,5 +1091,326 @@ theorem validateHybridDispatch_sound (req : HybridLaunchRequest) (plan : HybridD
           intro gid ht hgid
           have hltGrid : gid < gridThreadsOf req := Nat.lt_of_lt_of_le hgid (htailLe ht)
           exact hsurj gid hltGrid
+
+/-!
+## 7. Width-Aware Zero-Copy Input/Output Byte-Slice C-ABI Soundness & No-Partial-Mutation
+-/
+
+/-- `validateZeroCopySliceIoCall c = true` implies `validZeroCopySliceIoCall c` across both
+    LP64 (`2^64`) and `wasm32` (`2^32`) target address spaces, establishing non-null pointers
+    for non-empty spans, backing & address-space no-overflow, and input/output disjointness. -/
+theorem validateZeroCopySliceIoCall_sound (c : C99ZeroCopySliceIoCall)
+    (h : validateZeroCopySliceIoCall c = true) :
+    validZeroCopySliceIoCall c := by
+  unfold validateZeroCopySliceIoCall at h
+  rcases Bool.and_eq_true_iff.mp h with ⟨hinout, halias⟩
+  rcases Bool.and_eq_true_iff.mp hinout with ⟨hin, hout⟩
+  refine ⟨?_, ?_, ?_⟩
+  · cases hip : c.inPtr with
+    | none =>
+      simp [hip] at hin ⊢
+      exact hin
+    | some ip =>
+      simp [hip] at hin ⊢
+      rcases hin with ⟨⟨⟨⟨⟨⟨hnn, hmx1⟩, hmx2⟩, hm1⟩, hm2⟩, hw1⟩, hw2⟩
+      exact ⟨hnn, hmx1, hmx2, by omega, by omega⟩
+  · cases hop : c.outPtr with
+    | none =>
+      simp [hop] at hout ⊢
+      exact hout
+    | some op =>
+      simp [hop] at hout ⊢
+      rcases hout with ⟨⟨⟨⟨⟨⟨hnn, hmx1⟩, hmx2⟩, hm1⟩, hm2⟩, hw1⟩, hw2⟩
+      exact ⟨hnn, hmx1, hmx2, by omega, by omega⟩
+  · cases hip : c.inPtr <;> cases hop : c.outPtr
+    · trivial
+    · trivial
+    · trivial
+    · simp [hip, hop, Bool.or_eq_true, decide_eq_true_eq] at halias ⊢
+      rcases halias with ((h1 | h2) | h3) | h4
+      · exact Or.inl h1
+      · exact Or.inr (Or.inl h2)
+      · exact Or.inr (Or.inr (Or.inl h3))
+      · exact Or.inr (Or.inr (Or.inr h4))
+
+/-- Exact bridge theorem linking the unboxed `UInt64` C-ABI span gate `LeanNative.Spec.zeroCopySpanFitsU64`
+    to `ArchWidth.maxAddr` (`uintptr_t`/`size_t` representability) and `ArchWidth.addrLimit`
+    (exclusive one-past-the-end address limit `2^32` on `wasm32`, `2^64` on `LP64`). -/
+theorem zeroCopySpanFitsU64_iff_addrLimit (ptr len : UInt64) (is32Bit : UInt8) :
+    let w := if is32Bit == 1 then ArchWidth.bits32 else ArchWidth.bits64
+    LeanNative.Spec.zeroCopySpanFitsU64 ptr len is32Bit = true ↔
+      (ptr.toNat ≤ w.maxAddr ∧ len.toNat ≤ w.maxAddr ∧ ptr.toNat + len.toNat ≤ w.addrLimit) := by
+  dsimp only
+  unfold LeanNative.Spec.zeroCopySpanFitsU64
+  have hp64 : ptr.toNat < 2 ^ 64 := ptr.toBitVec.isLt
+  have hl64 : len.toNat < 2 ^ 64 := len.toBitVec.isLt
+  by_cases hw : is32Bit == 1
+  · simp only [hw, ↓reduceIte, ArchWidth.maxAddr, ArchWidth.addrLimit, Bool.and_eq_true,
+      decide_eq_true_eq, UInt64.le_iff_toNat_le]
+    have hc1 : (0xFFFFFFFF : UInt64).toNat = 2 ^ 32 - 1 := by decide
+    have hc2 : (0x100000000 : UInt64).toNat = 2 ^ 32 := by decide
+    rw [hc1, hc2]
+    constructor
+    · rintro ⟨⟨hp32, hl32⟩, hsum⟩
+      have hadd : (ptr + len).toNat = ptr.toNat + len.toNat := by
+        rw [UInt64.toNat_add, Nat.mod_eq_of_lt (by omega)]
+      rw [hadd] at hsum
+      exact ⟨hp32, hl32, hsum⟩
+    · rintro ⟨hp32, hl32, hsum⟩
+      have hadd : (ptr + len).toNat = ptr.toNat + len.toNat := by
+        rw [UInt64.toNat_add, Nat.mod_eq_of_lt (by omega)]
+      exact ⟨⟨hp32, hl32⟩, by rw [hadd]; exact hsum⟩
+  · simp only [hw, Bool.false_eq_true, ↓reduceIte, ArchWidth.maxAddr, ArchWidth.addrLimit,
+      Bool.or_eq_true, beq_iff_eq, decide_eq_true_eq, UInt64.le_iff_toNat_le]
+    have hcmax : (0xFFFFFFFFFFFFFFFF : UInt64).toNat = 2 ^ 64 - 1 := by decide
+    constructor
+    · intro h
+      refine ⟨by omega, by omega, ?_⟩
+      rcases h with (rfl | rfl) | hsub
+      · change 0 + len.toNat ≤ 2 ^ 64; omega
+      · change ptr.toNat + 0 ≤ 2 ^ 64; omega
+      · by_cases hp0 : ptr = 0
+        · subst hp0; change 0 + len.toNat ≤ 2 ^ 64; omega
+        · have hpPos : (1 : UInt64) ≤ ptr := by
+            rw [UInt64.le_iff_toNat_le]
+            have : ptr.toNat ≠ 0 := fun h0 => hp0 (UInt64.eq_of_toBitVec_eq (BitVec.eq_of_toNat_eq h0))
+            change 1 ≤ ptr.toNat; omega
+          have hlMax : len ≤ 0xFFFFFFFFFFFFFFFF := by
+            rw [UInt64.le_iff_toNat_le, hcmax]; omega
+          rw [UInt64.toNat_sub_of_le ptr 1 hpPos,
+              UInt64.toNat_sub_of_le 0xFFFFFFFFFFFFFFFF len hlMax, hcmax] at hsub
+          change ptr.toNat - 1 ≤ 2 ^ 64 - 1 - len.toNat at hsub
+          omega
+    · rintro ⟨_, _, hsum⟩
+      by_cases hp0 : ptr = 0
+      · exact Or.inl (Or.inl hp0)
+      · by_cases hl0 : len = 0
+        · exact Or.inl (Or.inr hl0)
+        · right
+          have hpPos : (1 : UInt64) ≤ ptr := by
+            rw [UInt64.le_iff_toNat_le]
+            have : ptr.toNat ≠ 0 := fun h0 => hp0 (UInt64.eq_of_toBitVec_eq (BitVec.eq_of_toNat_eq h0))
+            change 1 ≤ ptr.toNat; omega
+          have hlMax : len ≤ 0xFFFFFFFFFFFFFFFF := by
+            rw [UInt64.le_iff_toNat_le, hcmax]; omega
+          rw [UInt64.toNat_sub_of_le ptr 1 hpPos,
+              UInt64.toNat_sub_of_le 0xFFFFFFFFFFFFFFFF len hlMax, hcmax]
+          change ptr.toNat - 1 ≤ 2 ^ 64 - 1 - len.toNat
+          omega
+
+/-- Splicing an output payload into `mem` at `outBase` preserves the total `ByteArray` size
+    whenever `outBase + payload.size ≤ mem.size`. -/
+theorem spliceOutputSlice_size (mem : ByteArray) (outBase : Nat) (payload : ByteArray)
+    (hbound : outBase + payload.size ≤ mem.size) :
+    (spliceOutputSlice mem outBase payload).size = mem.size := by
+  unfold spliceOutputSlice
+  rw [ByteArray.size_append, ByteArray.size_append, ByteArray.size_extract, ByteArray.size_extract]
+  omega
+
+/-- Splicing `payload` into `mem` at `outBase` places `payload` verbatim in `[outBase, outBase + payload.size)`. -/
+theorem spliceOutputSlice_extract_written (mem : ByteArray) (outBase : Nat) (payload : ByteArray)
+    (hbound : outBase + payload.size ≤ mem.size) :
+    (spliceOutputSlice mem outBase payload).extract outBase (outBase + payload.size) = payload := by
+  unfold spliceOutputSlice
+  have hpre : (mem.extract 0 outBase).size = outBase := by
+    rw [ByteArray.size_extract]
+    omega
+  have hex := byteArray_extract_mid (mem.extract 0 outBase) payload
+    (mem.extract (outBase + payload.size) mem.size)
+  rw [hpre] at hex
+  exact hex
+
+/-- Splicing `payload` into `mem` at `outBase` leaves the prefix `[0, outBase)` untouched. -/
+theorem spliceOutputSlice_preserves_prefix (mem : ByteArray) (outBase : Nat) (payload : ByteArray)
+    (hbound : outBase + payload.size ≤ mem.size) :
+    (spliceOutputSlice mem outBase payload).extract 0 outBase = mem.extract 0 outBase := by
+  unfold spliceOutputSlice
+  apply ByteArray.ext
+  have hmsz : mem.size = mem.data.size := rfl
+  have hpre : (mem.data.extract 0 outBase).size = outBase := by
+    simp [Array.size_extract]
+    omega
+  rw [ByteArray.data_extract, ByteArray.data_append, ByteArray.data_append,
+    ByteArray.data_extract, ByteArray.data_extract]
+  ext idx h1 h2
+  · simp [Array.size_extract, Array.size_append]
+    omega
+  · simp [Array.getElem_extract, hpre]
+
+/-- Splicing `payload` into `mem` at `outBase` (`payload.size ≤ outCap`) leaves the suffix
+    `[outBase + outCap, mem.size)` outside the caller's output capacity completely untouched. -/
+theorem spliceOutputSlice_preserves_suffix_outside_cap (mem : ByteArray) (outBase outCap : Nat)
+    (payload : ByteArray)
+    (hcap : payload.size ≤ outCap)
+    (hbound : outBase + outCap ≤ mem.size) :
+    (spliceOutputSlice mem outBase payload).extract (outBase + outCap) mem.size =
+      mem.extract (outBase + outCap) mem.size := by
+  unfold spliceOutputSlice
+  apply ByteArray.ext
+  have hmsz : mem.size = mem.data.size := rfl
+  have hps : payload.size = payload.data.size := rfl
+  have hpre : (mem.data.extract 0 outBase).size = outBase := by
+    simp [Array.size_extract]
+    omega
+  rw [ByteArray.data_extract, ByteArray.data_append, ByteArray.data_append,
+    ByteArray.data_extract, ByteArray.data_extract, ByteArray.data_extract]
+  ext idx h1 h2
+  · simp [Array.size_extract, Array.size_append]
+    omega
+  · simp only [Array.getElem_extract, Array.getElem_append, Array.size_append, hpre]
+    have hnot1 : ¬ (outBase + outCap + idx < outBase + payload.data.size) := by omega
+    split
+    · contradiction
+    · congr 1
+      omega
+
+/-- Every failure path of `execZeroCopySliceIoHostCall` (invalid geometry/aliasing/overflow,
+    kernel/decode failure, or output capacity overflow / encode failure) leaves backing memory
+    `c.mem` completely unmodified (`encode_failure_no_partial_mutation` at the C-ABI boundary). -/
+theorem execZeroCopySliceIoHostCall_failure_preserves_mem
+    (c : C99ZeroCopySliceIoCall) (kernel : ByteArray → Option ByteArray) :
+    (∀ m, execZeroCopySliceIoHostCall c kernel = .errInvalidGeometry m → m = c.mem) ∧
+    (∀ m, execZeroCopySliceIoHostCall c kernel = .errKernelFailed m → m = c.mem) ∧
+    (∀ m need, execZeroCopySliceIoHostCall c kernel = .errOutputOverflow m need →
+      m = c.mem ∧ c.outCap < need) := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro m h
+    unfold execZeroCopySliceIoHostCall at h
+    cases hv : validateZeroCopySliceIoCall c
+    · simp [hv] at h
+      exact h.symm
+    · simp [hv] at h
+      cases hk : kernel (zeroCopyInputBytes c) with
+      | none => simp [hk] at h
+      | some outPayload =>
+        simp only [hk] at h
+        by_cases hcap : outPayload.size ≤ c.outCap
+        · simp only [hcap, ite_true] at h
+          cases hop : c.outPtr with
+          | none => simp [hop] at h
+          | some op =>
+            simp only [hop] at h
+            split at h <;> cases h
+        · simp [hcap] at h
+  · intro m h
+    unfold execZeroCopySliceIoHostCall at h
+    cases hv : validateZeroCopySliceIoCall c
+    · simp [hv] at h
+    · simp [hv] at h
+      cases hk : kernel (zeroCopyInputBytes c) with
+      | none =>
+        simp [hk] at h
+        exact h.symm
+      | some outPayload =>
+        simp only [hk] at h
+        by_cases hcap : outPayload.size ≤ c.outCap
+        · simp only [hcap, ite_true] at h
+          cases hop : c.outPtr with
+          | none => simp [hop] at h
+          | some op =>
+            simp only [hop] at h
+            split at h <;> cases h
+        · simp [hcap] at h
+  · intro m need h
+    unfold execZeroCopySliceIoHostCall at h
+    cases hv : validateZeroCopySliceIoCall c
+    · simp [hv] at h
+    · simp [hv] at h
+      cases hk : kernel (zeroCopyInputBytes c) with
+      | none => simp [hk] at h
+      | some outPayload =>
+        simp only [hk] at h
+        by_cases hcap : outPayload.size ≤ c.outCap
+        · simp only [hcap, ite_true] at h
+          cases hop : c.outPtr with
+          | none => simp [hop] at h
+          | some op =>
+            simp only [hop] at h
+            split at h <;> cases h
+        · simp [hcap] at h
+          rcases h with ⟨hm, hneed⟩
+          exact ⟨hm.symm, by omega⟩
+
+/-- Successful execution of `execZeroCopySliceIoHostCall` guarantees:
+    1. `validZeroCopySliceIoCall c` holds (LP64 / `wasm32` address-space no-overflow, non-null
+       non-empty pointers, and input/output disjointness),
+    2. `writtenLen ≤ c.outCap` and `mem'.size = c.mem.size`, and
+    3. there exists `outPayload` returned by `kernel (zeroCopyInputBytes c)` with
+       `writtenLen = outPayload.size` such that whenever `c.outPtr = some op`, `mem'` contains
+       `outPayload` in `[op, op + writtenLen)` and preserves every byte outside `[op, op + writtenLen)`
+       (`[0, op)`, `[op + writtenLen, c.mem.size)`, and `[op + c.outCap, c.mem.size)`). -/
+theorem execZeroCopySliceIoHostCall_ok_sound
+    (c : C99ZeroCopySliceIoCall) (kernel : ByteArray → Option ByteArray)
+    (mem' : ByteArray) (writtenLen : Nat)
+    (h : execZeroCopySliceIoHostCall c kernel = .ok mem' writtenLen) :
+    validZeroCopySliceIoCall c ∧
+    writtenLen ≤ c.outCap ∧
+    mem'.size = c.mem.size ∧
+    (∃ outPayload,
+      kernel (zeroCopyInputBytes c) = some outPayload ∧
+      writtenLen = outPayload.size ∧
+      (∀ op, c.outPtr = some op →
+        mem'.extract op (op + writtenLen) = outPayload ∧
+        mem'.extract 0 op = c.mem.extract 0 op ∧
+        mem'.extract (op + writtenLen) c.mem.size = c.mem.extract (op + writtenLen) c.mem.size ∧
+        mem'.extract (op + c.outCap) c.mem.size = c.mem.extract (op + c.outCap) c.mem.size)) := by
+  unfold execZeroCopySliceIoHostCall at h
+  cases hv : validateZeroCopySliceIoCall c
+  · simp [hv] at h
+  · simp [hv] at h
+    have hvalid := validateZeroCopySliceIoCall_sound c hv
+    cases hk : kernel (zeroCopyInputBytes c) with
+    | none => simp [hk] at h
+    | some outPayload =>
+      simp only [hk] at h
+      by_cases hcap : outPayload.size ≤ c.outCap
+      · simp only [hcap, ite_true] at h
+        cases hop : c.outPtr with
+        | none =>
+          simp only [hop] at h
+          injection h with hm hw
+          subst hm hw
+          have hoc0 : c.outCap = 0 := by
+            rcases hvalid with ⟨_, houtV, _⟩
+            simpa [hop] using houtV
+          have hps0 : outPayload.size = 0 := by omega
+          refine ⟨hvalid, Nat.zero_le _, rfl, outPayload, rfl, hps0.symm, ?_⟩
+          intro op hop'
+          cases hop'
+        | some op =>
+          simp only [hop] at h
+          have houtBound : op + c.outCap ≤ c.mem.size := by
+            rcases hvalid with ⟨_, houtV, _⟩
+            simp [hop] at houtV
+            exact houtV.2.2.2.1
+          split at h
+          · rename_i hemp
+            injection h with hm hw
+            subst hm hw hemp
+            have hex0 : c.mem.extract op (op + 0) = ByteArray.empty := by
+              apply ByteArray.ext
+              apply Array.eq_empty_of_size_eq_zero
+              rw [ByteArray.size_data, ByteArray.size_extract]
+              omega
+            refine ⟨hvalid, Nat.zero_le _, rfl, ByteArray.empty, rfl, rfl, ?_⟩
+            intro op' hop'
+            injection hop' with heq
+            subst heq
+            exact ⟨hex0, rfl, rfl, rfl⟩
+          · injection h with hm hw
+            subst hm hw
+            have hpBound : op + outPayload.size ≤ c.mem.size := by omega
+            refine ⟨hvalid, hcap, spliceOutputSlice_size c.mem op outPayload hpBound,
+              outPayload, rfl, rfl, ?_⟩
+            intro op' hop'
+            injection hop' with heq
+            subst heq
+            exact ⟨spliceOutputSlice_extract_written c.mem op outPayload hpBound,
+              spliceOutputSlice_preserves_prefix c.mem op outPayload hpBound,
+              spliceOutputSlice_preserves_suffix_outside_cap c.mem op outPayload.size outPayload
+                (Nat.le_refl _) hpBound,
+              spliceOutputSlice_preserves_suffix_outside_cap c.mem op c.outCap outPayload
+                hcap houtBound⟩
+      · simp [hcap] at h
 
 end LeanNative.Proofs.HybridCAbi
