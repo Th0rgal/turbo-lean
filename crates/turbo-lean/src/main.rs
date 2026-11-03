@@ -110,6 +110,12 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         seed_shards: bool,
     },
+    /// Hydrate `.turbo_verified_sources.json` content-addressed manifests from existing `.olean` + Lake `.trace` artifacts (mtime-immune after git checkout/rebase)
+    HydrateTraces {
+        /// Project root directory
+        #[arg(long, default_value = ".")]
+        project_dir: PathBuf,
+    },
     /// Fast theorem-level or declaration-level check using PrefixEnv sharding & direct Lean env
     Check {
         /// Path to the .lean file to check
@@ -135,6 +141,9 @@ enum Commands {
         /// Kernel verification engine (`standard`, `con-leche`, or `both`)
         #[arg(long, default_value = "standard")]
         kernel: String,
+        /// Emit `.olean`, `.ilean`, `.hash`, and Lake `.trace` artifacts into `.lake/build` on 0-sorry module check
+        #[arg(long, default_value_t = false)]
+        emit_olean: bool,
     },
     /// Run native (leanc -O3 Perceus/FBIP), GPU (CUDA), or Google Cloud TPU v5e (MLIR/XLA) fast counterexample search
     FastCheck {
@@ -803,6 +812,9 @@ fn run(cli: Cli) -> Result<()> {
             require_signature,
         );
     }
+    if let Commands::HydrateTraces { project_dir } = cli.command {
+        return lake_build::run_hydrate_traces_command(cli.json, project_dir);
+    }
     if let Commands::FastCheck {
         ref file,
         gpu,
@@ -927,6 +939,7 @@ fn run(cli: Cli) -> Result<()> {
         ref project_dir,
         jobs,
         remote_http: Some(ref remote_url),
+        emit_olean: false,
         ..
     } = cli.command
     {
@@ -1223,6 +1236,10 @@ fn run(cli: Cli) -> Result<()> {
             seed_shards,
         ),
 
+        Commands::HydrateTraces { project_dir } => {
+            lake_build::run_hydrate_traces_command(cli.json, project_dir)
+        }
+
         Commands::Check {
             file,
             decl,
@@ -1232,6 +1249,7 @@ fn run(cli: Cli) -> Result<()> {
             remote_http,
             timeout,
             kernel,
+            emit_olean,
         } => {
             std::env::set_var("TURBO_LEAN_KERNEL_ENGINE", &kernel);
             if timeout > 0 {
@@ -1281,7 +1299,7 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 });
             }
-            let res = check::run_check_command(
+            let res = check::run_check_command_with_opts(
                 &mut store,
                 db_warm_on_open,
                 cli.json,
@@ -1291,6 +1309,7 @@ fn run(cli: Cli) -> Result<()> {
                 jobs,
                 parallel_shards,
                 remote_http,
+                emit_olean,
             );
             done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
             res

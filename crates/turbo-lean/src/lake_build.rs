@@ -1409,7 +1409,8 @@ pub(crate) fn compute_project_interface_key_fast_summary(
         hasher.update(cc_tag.as_bytes());
         hasher.update(b"\n");
     }
-    if has_lake_config(project_dir) {
+    let effective_targets: Vec<String>;
+    let targets_for_hash: &[String] = if has_lake_config(project_dir) {
         let cfg = crate::module_builder::resolve_project_config_with_trust(
             project_dir,
             trust_domain.starts_with("untrusted"),
@@ -1428,9 +1429,13 @@ pub(crate) fn compute_project_interface_key_fast_summary(
             hasher.update(b"ws_inputs:");
             hasher.update(inputs_digest.as_bytes());
         }
-    }
+        effective_targets = crate::module_builder::normalize_build_targets(&cfg, targets);
+        &effective_targets
+    } else {
+        targets
+    };
 
-    for t in targets {
+    for t in targets_for_hash {
         hasher.update(t.as_bytes());
         hasher.update(b",");
     }
@@ -2098,6 +2103,7 @@ pub(crate) fn are_all_project_oleans_up_to_date(
             })
         })
         .max();
+    let opt_out = worktree_auto_link_disabled(canon_dir);
     let mut checked_oleans = 0usize;
 
     for (rel_path, cur_b3) in file_hashes {
@@ -2122,35 +2128,37 @@ pub(crate) fn are_all_project_oleans_up_to_date(
             return false;
         }
         checked_oleans += 1;
-        let src_path = canon_dir.join(rel_path);
-        let src_mtime = fs::metadata(&src_path).and_then(|m| m.modified()).ok();
-        let olean_mtime = olean_meta.modified().ok();
-        let is_mtime_fresh = match (src_mtime, olean_mtime) {
-            (Some(sm), Some(om)) if om >= sm => lakefile_mtime.is_none_or(|lm| om >= lm),
-            _ => false,
-        };
-        if !is_mtime_fresh {
-            return false;
-        }
-        let Some(imps) = read_header_imports_from_file(&src_path) else {
-            return false;
-        };
-        if let Some(om) = olean_mtime {
-            for imp in imps {
-                let imp_slash = crate::module_builder::module_name_to_rel_slash(&imp);
-                if let Some(dep_src) = resolve_project_lean_source(canon_dir, &imp_slash) {
-                    if fs::metadata(&dep_src)
-                        .and_then(|m| m.modified())
-                        .is_ok_and(|dep_sm| om < dep_sm)
-                    {
-                        return false;
-                    }
-                    let dep_olean = lib_lean_dir.join(format!("{}.olean", imp_slash));
-                    if fs::metadata(&dep_olean)
-                        .and_then(|m| m.modified())
-                        .map_or(true, |dep_om| om < dep_om)
-                    {
-                        return false;
+        if opt_out {
+            let src_path = canon_dir.join(rel_path);
+            let src_mtime = fs::metadata(&src_path).and_then(|m| m.modified()).ok();
+            let olean_mtime = olean_meta.modified().ok();
+            let is_mtime_fresh = match (src_mtime, olean_mtime) {
+                (Some(sm), Some(om)) if om >= sm => lakefile_mtime.is_none_or(|lm| om >= lm),
+                _ => false,
+            };
+            if !is_mtime_fresh {
+                return false;
+            }
+            let Some(imps) = read_header_imports_from_file(&src_path) else {
+                return false;
+            };
+            if let Some(om) = olean_mtime {
+                for imp in imps {
+                    let imp_slash = crate::module_builder::module_name_to_rel_slash(&imp);
+                    if let Some(dep_src) = resolve_project_lean_source(canon_dir, &imp_slash) {
+                        if fs::metadata(&dep_src)
+                            .and_then(|m| m.modified())
+                            .is_ok_and(|dep_sm| om < dep_sm)
+                        {
+                            return false;
+                        }
+                        let dep_olean = lib_lean_dir.join(format!("{}.olean", imp_slash));
+                        if fs::metadata(&dep_olean)
+                            .and_then(|m| m.modified())
+                            .map_or(true, |dep_om| om < dep_om)
+                        {
+                            return false;
+                        }
                     }
                 }
             }
@@ -2934,6 +2942,7 @@ fn ensure_project_imports_fresh_inner(
     // without a root manifest.
     let mut closure_cache = crate::module_builder::LakeClosureCache::default();
     closure_cache.post_lake_refresh = verify_only;
+    closure_cache.ignore_mtime_skew = !worktree_auto_link_disabled(canon_dir);
     let mut stale_dep_mods: HashSet<String> = HashSet::new();
     non_root_imports.sort();
     non_root_imports.dedup();
@@ -3043,13 +3052,29 @@ fn ensure_project_imports_fresh_inner(
                     &info.mod_name,
                 )
             });
-        let mtime_stale = match (&olean_meta, &src_meta) {
-            (Some(om), Some(sm)) => match (om.modified(), sm.modified()) {
-                (Ok(ot), Ok(st)) => ot < st,
-                _ => true,
-            },
-            (Some(_), None) => true,
-            (None, _) => has_manifest_entry,
+        let opt_out = worktree_auto_link_disabled(canon_dir);
+        let cryptographically_verified = !opt_out
+            && olean_meta.is_some()
+            && !pkg_inputs_stale
+            && !manifest_stale
+            && !lake_root_stale
+            && !unusable_manifest
+            && (has_manifest_entry
+                || (info.is_lake_target
+                    && root_cfg
+                        .as_ref()
+                        .is_some_and(|cfg| !cfg.lean_bin.as_os_str().is_empty())));
+        let mtime_stale = if cryptographically_verified {
+            false
+        } else {
+            match (&olean_meta, &src_meta) {
+                (Some(om), Some(sm)) => match (om.modified(), sm.modified()) {
+                    (Ok(ot), Ok(st)) => ot < st,
+                    _ => true,
+                },
+                (Some(_), None) => true,
+                (None, _) => has_manifest_entry,
+            }
         };
         let trace_stale = if olean_meta.as_ref().is_some_and(|m| m.is_file()) {
             let trace_path = dep_olean.with_extension("trace");
@@ -3064,9 +3089,21 @@ fn ensure_project_imports_fresh_inner(
         } else {
             false
         };
+        let olean_githash_stale = olean_meta.is_some()
+            && match root_cfg.as_ref() {
+                Some(cfg)
+                    if !cfg.lean_bin.as_os_str().is_empty()
+                        && cfg.lean_githash != "lean-not-installed" =>
+                {
+                    crate::module_builder::read_olean_header_version_and_githash(dep_olean)
+                        .is_none_or(|(_, gh)| !gh.eq_ignore_ascii_case(cfg.lean_githash.trim()))
+                }
+                _ => false,
+            };
         if pkg_inputs_stale
             || manifest_stale
             || lake_root_stale
+            || olean_githash_stale
             || mtime_stale
             || trace_stale
             || (unusable_manifest && olean_meta.is_some())
@@ -3079,6 +3116,7 @@ fn ensure_project_imports_fresh_inner(
     }
 
     stale_mods.extend(stale_dep_mods.iter().cloned());
+    let opt_out_for_prop = worktree_auto_link_disabled(canon_dir);
     // Propagate staleness downstream across the imported workspace subgraph.
     let mut changed = !stale_mods.is_empty();
     while changed {
@@ -3087,6 +3125,20 @@ fn ensure_project_imports_fresh_inner(
             if stale_mods.contains(&info.mod_name) {
                 continue;
             }
+            let dep_rel = info
+                .dep_src
+                .strip_prefix(canon_dir)
+                .unwrap_or(&info.dep_src)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let self_crypto_verified = !opt_out_for_prop
+                && (manifest_opt
+                    .as_ref()
+                    .is_some_and(|m| m.modules.contains_key(&dep_rel))
+                    || (info.is_lake_target
+                        && root_cfg
+                            .as_ref()
+                            .is_some_and(|cfg| !cfg.lean_bin.as_os_str().is_empty())));
             let self_om = fs::metadata(&info.dep_olean)
                 .and_then(|m| m.modified())
                 .ok();
@@ -3097,26 +3149,28 @@ fn ensure_project_imports_fresh_inner(
                         changed = true;
                         break;
                     }
-                    if let Some(&ch_idx) = mod_index.get(ch) {
-                        let ch_info = &ordered_imports[ch_idx];
-                        let ch_om = fs::metadata(&ch_info.dep_olean)
-                            .and_then(|m| m.modified())
-                            .ok();
-                        let ch_sm = fs::metadata(&ch_info.dep_src)
-                            .and_then(|m| m.modified())
-                            .ok();
-                        if let (Some(som), Some(com)) = (self_om, ch_om) {
-                            if som < com {
-                                stale_mods.insert(info.mod_name.clone());
-                                changed = true;
-                                break;
+                    if !self_crypto_verified {
+                        if let Some(&ch_idx) = mod_index.get(ch) {
+                            let ch_info = &ordered_imports[ch_idx];
+                            let ch_om = fs::metadata(&ch_info.dep_olean)
+                                .and_then(|m| m.modified())
+                                .ok();
+                            let ch_sm = fs::metadata(&ch_info.dep_src)
+                                .and_then(|m| m.modified())
+                                .ok();
+                            if let (Some(som), Some(com)) = (self_om, ch_om) {
+                                if som < com {
+                                    stale_mods.insert(info.mod_name.clone());
+                                    changed = true;
+                                    break;
+                                }
                             }
-                        }
-                        if let (Some(som), Some(csm)) = (self_om, ch_sm) {
-                            if som < csm {
-                                stale_mods.insert(info.mod_name.clone());
-                                changed = true;
-                                break;
+                            if let (Some(som), Some(csm)) = (self_om, ch_sm) {
+                                if som < csm {
+                                    stale_mods.insert(info.mod_name.clone());
+                                    changed = true;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -5708,6 +5762,35 @@ pub fn run_build_command(
                 );
             }
         }
+    }
+    Ok(())
+}
+
+pub fn run_hydrate_traces_command(json_output: bool, project_dir: PathBuf) -> Result<()> {
+    let rep = crate::module_builder::hydrate_project_traces(&project_dir)?;
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "status": "hydrated",
+                "packages_scanned": rep.packages_scanned,
+                "packages_updated": rep.packages_updated,
+                "modules_scanned": rep.modules_scanned,
+                "modules_verified": rep.modules_verified,
+                "entries_written": rep.entries_written,
+                "modules_stale_or_unverified": rep.modules_stale_or_unverified,
+                "elapsed_ms": rep.elapsed_ms,
+            }))?
+        );
+    } else {
+        println!(
+            "[turbo-lean] HYDRATED {} verified module traces across {}/{} packages ({} stale/skipped, {} ms)",
+            rep.entries_written,
+            rep.packages_updated,
+            rep.packages_scanned,
+            rep.modules_stale_or_unverified,
+            rep.elapsed_ms
+        );
     }
     Ok(())
 }
