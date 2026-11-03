@@ -118,4 +118,128 @@ def lowerToMetal (name : String) (k : ParallelKernelKind) : MSLModule where
 def ppLowered (name : String) (k : ParallelKernelKind) : String :=
   ppMSLModule (lowerToMetal name k)
 
+def valOfSort : Bool → LeanNative.Semantics.Val → Option (BitVec 64)
+  | false, .u64 x => some x.toBitVec
+  | true, .bool b => some (if b then 1#64 else 0#64)
+  | _, _ => none
+
+def valToU64Bv (v : LeanNative.Semantics.Val) : Option (BitVec 64) :=
+  match valOfSort false v with
+  | some bv => some bv
+  | none => valOfSort true v
+
+def inferBinOpU64 : BinOp → Option Bool
+  | .add => some false | .sub => some false | .mul => some false
+  | .div => some false | .mod => some false | .bitAnd => some false
+  | .bitOr => some false | .bitXor => some false | .shl => some false
+  | .shr => some false | .sar => some false | .eor3 => some false
+  | .eq => some true | .lt => some true | .le => some true
+  | .addChecked256 => none | .subChecked256 => none | .mulChecked256 => none
+  | .clmul64 => none | .clmul64Hi => none | .gf2Affine => none
+
+def inferBinOpBool : BinOp → Option Bool
+  | .eq => some true
+  | .bitAnd => none | .bitOr => none
+  | .add => none | .sub => none | .mul => none | .div => none | .mod => none
+  | .bitXor => none | .shl => none | .shr => none | .sar => none
+  | .lt => none | .le => none
+  | .addChecked256 => none | .subChecked256 => none | .mulChecked256 => none
+  | .clmul64 => none | .clmul64Hi => none | .gf2Affine => none | .eor3 => none
+
+def inferUnaryOpU64 : UnaryOp → Option Bool
+  | .not => some false | .neg => some false | .clz256 => none
+
+def inferScalarSort (boundVars : List Nat) : ScalarExpr → Option Bool
+  | .constU64 _ => some false
+  | .constBool _ => some true
+  | .var id => if id ∈ boundVars then some false else none
+  | .binOp op l r =>
+    match inferScalarSort boundVars l with
+    | some sl =>
+      match inferScalarSort boundVars r with
+      | some sr =>
+        if !sl && !sr then inferBinOpU64 op
+        else if sl && sr then inferBinOpBool op
+        else none
+      | none => none
+    | none => none
+  | .unaryOp op a =>
+    match inferScalarSort boundVars a with
+    | some sa => if !sa then inferUnaryOpU64 op else none
+    | none => none
+  | .select c t f =>
+    match inferScalarSort boundVars c with
+    | some _ =>
+      match inferScalarSort boundVars t with
+      | some st =>
+        match inferScalarSort boundVars f with
+        | some sf => if st == sf then some st else none
+        | none => none
+      | none => none
+    | none => none
+  | .fma a b c =>
+    match inferScalarSort boundVars a with
+    | some sa =>
+      match inferScalarSort boundVars b with
+      | some sb =>
+        match inferScalarSort boundVars c with
+        | some sc => if !sa && !sb && !sc then some false else none
+        | none => none
+      | none => none
+    | none => none
+
+def varEnvMatchesLocals (env : LeanNative.Semantics.VarEnv)
+    (ls : MSLLocals) (idxName : String) (idxVar : Nat) : List Nat → Prop
+  | [] => True
+  | id :: rest =>
+    (∃ x : UInt64, env id = some (.u64 x) ∧
+      ls.lookup? (if id == idxVar then idxName else s!"v{id}") = some x.toBitVec ∧
+      ls.lookupType? (if id == idxVar then idxName else s!"v{id}") = some .ulong) ∧
+    varEnvMatchesLocals env ls idxName idxVar rest
+
+def kernelArity : ParallelKernelKind → Nat
+  | .mapScaleAdd _ _ | .stencil1D3Pt _ _ _ => 1
+  | .zipAdd | .zipMul | .dotProduct | .saxpy _ => 2
+  | .customScalar _ inVars _ => inVars.length
+
+def wfMetalKernel : ParallelKernelKind → Bool
+  | .mapScaleAdd _ _ | .zipAdd | .zipMul | .dotProduct | .saxpy _ | .stencil1D3Pt _ _ _ => true
+  | .customScalar idxVar inVars body =>
+    decide (inVars.Nodup ∧ idxVar ∉ inVars) && (inferScalarSort (idxVar :: inVars) body).isSome
+
+def packInputDeviceBuffersGo (env : LeanNative.Semantics.VarEnv)
+    (st : LeanNative.Semantics.HeapState) (len idx : Nat) :
+    List VarId → Option (List (Nat × ByteMemory))
+  | [] => some []
+  | v :: rest =>
+    match env v, packInputDeviceBuffersGo env st len (idx + 1) rest with
+    | some (.sarrayId bid), some tail | some (.rawPtrId bid), some tail =>
+      match st.findBuffer bid with
+      | some buf =>
+        if len ≤ buf.data.size then
+          let words := (List.range len).map fun i => (buf.data[i]?.getD 0).toBitVec
+          some ((idx, ByteMemory.ofU64Words words) :: tail)
+        else none
+      | none => none
+    | _, _ => none
+
+def packInputDeviceBuffers (env : LeanNative.Semantics.VarEnv)
+    (st : LeanNative.Semantics.HeapState) (inputs : List VarId) (len : Nat) :
+    Option (List (Nat × ByteMemory)) :=
+  packInputDeviceBuffersGo env st len 0 inputs
+
+def mkDeviceBuffers (inBufs : List (Nat × ByteMemory)) (nIn len : Nat) :
+    List (Nat × ByteMemory) :=
+  inBufs ++ [(nIn, ByteMemory.zeros (len * 8))]
+
+def mkConstLenBuffers (nIn len : Nat) : List (Nat × ByteMemory) :=
+  [(nIn + 1, ByteMemory.ofU64Words [BitVec.ofNat 64 len])]
+
+def groupStepsForKind (groupSize : Nat) (k : ParallelKernelKind) : Nat :=
+  let perThread := match k with
+    | .customScalar _ inVars _ => inVars.length + 5
+    | .stencil1D3Pt _ _ _ => 5
+    | _ => 4
+  groupSize * perThread + 2
+
 end LeanNative.Backend.MetalLower
