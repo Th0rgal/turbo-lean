@@ -1,11 +1,15 @@
 import LeanNative.IR.Types
 import LeanNative.IR.AST
 import LeanNative.Backend.GPUIR
+import LeanNative.Backend.PTXAst
+import LeanNative.Backend.PTXLower
 
 namespace LeanNative.Backend.MLIRGPU
 
 open LeanNative.IR
 open LeanNative.Backend.GPUIR
+open LeanNative.Backend.PTXAst
+open LeanNative.Backend.PTXLower
 
 /-- Inspect an `LNIRExpr` for constructs incompatible with GPU execution.
     Delegates to `LeanNative.Backend.GPUIR.checkExprGpuCompatibility`. -/
@@ -45,7 +49,7 @@ def toMLIRType : LNIRType → String
   | _           => "i64"
 
 /-- Lower a `ScalarExpr` to MLIR `arith.*` SSA instructions, returning `(preambleLines, resultSSA)`. -/
-partial def emitMLIRScalarExpr (e : ScalarExpr) (counter : Nat) : List String × String × Nat :=
+def emitMLIRScalarExpr (e : ScalarExpr) (counter : Nat) : List String × String × Nat :=
   match e with
   | .constU64 v =>
     let ssa := s!"%c_{counter}"
@@ -128,7 +132,13 @@ def emitMLIRKernelBody (elemTy : LNIRType) (kernel : ParallelKernelKind) : Strin
       s!"      memref.store %res, %out[%iv] : memref<?x{mlirElem}>"
     ]
   | .zipAdd => emitBinArith "arith.addi"
-  | .zipMul | .dotProduct => emitBinArith "arith.muli"
+  | .zipMul => emitBinArith "arith.muli"
+  | .dotProduct =>
+    String.intercalate "\n" [
+      s!"      %lhs = memref.load %in0[%iv] : memref<?x{mlirElem}>",
+      s!"      %rhs = memref.load %in1[%iv] : memref<?x{mlirElem}>",
+      s!"      %prod = arith.muli %lhs, %rhs : {mlirElem}"
+    ]
   | .saxpy alphaBits =>
     String.intercalate "\n" [
       s!"      %x_val = memref.load %in0[%iv] : memref<?x{mlirElem}>",
@@ -174,15 +184,35 @@ def emitMLIRGpuFunc (declName : String) (regionIdx : Nat) (elemTy : LNIRType)
   let mlirElem := toMLIRType elemTy
   let kName := s!"@{declName}_parfor_{regionIdx}"
   let bodyStr := emitMLIRKernelBody elemTy kernel
-  String.intercalate "\n" [
-    s!"    gpu.func {kName}(%out: memref<?x{mlirElem}>, %in0: memref<?x{mlirElem}>, %in1: memref<?x{mlirElem}>, %n: i64) kernel attributes \{nvvm.maxntid = array<i32: 256, 1, 1>} \{",
-    "      %tidx = nvvm.read.ptx.sreg.tid.x : i32\n      %bidx = nvvm.read.ptx.sreg.ctaid.x : i32\n      %bdim = nvvm.read.ptx.sreg.ntid.x : i32\n      %gdim = nvvm.read.ptx.sreg.nctaid.x : i32",
-    "      %bid_mul = arith.muli %bidx, %bdim : i32\n      %gid_i32 = arith.addi %bid_mul, %tidx : i32\n      %stride_i32 = arith.muli %bdim, %gdim : i32",
-    "      %gid = arith.index_cast %gid_i32 : i32 to index\n      %stride = arith.index_cast %stride_i32 : i32 to index\n      %c0_idx = arith.constant 0 : index\n      %n_idx = arith.index_cast %n : i64 to index",
-    "      scf.parallel (%iv) = (%gid) to (%n_idx) step (%stride) {",
-    bodyStr,
-    "        scf.reduce\n      }\n      gpu.return\n    }"
-  ]
+  match kernel with
+  | .dotProduct =>
+    String.intercalate "\n" [
+      s!"    gpu.func {kName}(%out: memref<?x{mlirElem}>, %in0: memref<?x{mlirElem}>, %in1: memref<?x{mlirElem}>, %n: i64) kernel attributes \{nvvm.maxntid = array<i32: 256, 1, 1>} \{",
+      "      %tidx = nvvm.read.ptx.sreg.tid.x : i32\n      %bidx = nvvm.read.ptx.sreg.ctaid.x : i32\n      %bdim = nvvm.read.ptx.sreg.ntid.x : i32\n      %gdim = nvvm.read.ptx.sreg.nctaid.x : i32",
+      "      %bid_mul = arith.muli %bidx, %bdim : i32\n      %gid_i32 = arith.addi %bid_mul, %tidx : i32\n      %stride_i32 = arith.muli %bdim, %gdim : i32",
+      "      %gid = arith.index_cast %gid_i32 : i32 to index\n      %stride = arith.index_cast %stride_i32 : i32 to index\n      %c0_idx = arith.constant 0 : index\n      %n_idx = arith.index_cast %n : i64 to index",
+      s!"      %zero = arith.constant 0 : {mlirElem}",
+      s!"      %dot_sum = scf.parallel (%iv) = (%gid) to (%n_idx) step (%stride) init (%zero) -> {mlirElem} \{",
+      bodyStr,
+      s!"        scf.reduce(%prod : {mlirElem}) \{",
+      s!"        ^bb0(%acc_l: {mlirElem}, %acc_r: {mlirElem}):",
+      s!"          %acc_sum = arith.addi %acc_l, %acc_r : {mlirElem}",
+      s!"          scf.reduce.return %acc_sum : {mlirElem}",
+      "        }",
+      "      }",
+      s!"      memref.store %dot_sum, %out[%c0_idx] : memref<?x{mlirElem}>",
+      "      gpu.return\n    }"
+    ]
+  | _ =>
+    String.intercalate "\n" [
+      s!"    gpu.func {kName}(%out: memref<?x{mlirElem}>, %in0: memref<?x{mlirElem}>, %in1: memref<?x{mlirElem}>, %n: i64) kernel attributes \{nvvm.maxntid = array<i32: 256, 1, 1>} \{",
+      "      %tidx = nvvm.read.ptx.sreg.tid.x : i32\n      %bidx = nvvm.read.ptx.sreg.ctaid.x : i32\n      %bdim = nvvm.read.ptx.sreg.ntid.x : i32\n      %gdim = nvvm.read.ptx.sreg.nctaid.x : i32",
+      "      %bid_mul = arith.muli %bidx, %bdim : i32\n      %gid_i32 = arith.addi %bid_mul, %tidx : i32\n      %stride_i32 = arith.muli %bdim, %gdim : i32",
+      "      %gid = arith.index_cast %gid_i32 : i32 to index\n      %stride = arith.index_cast %stride_i32 : i32 to index\n      %c0_idx = arith.constant 0 : index\n      %n_idx = arith.index_cast %n : i64 to index",
+      "      scf.parallel (%iv) = (%gid) to (%n_idx) step (%stride) {",
+      bodyStr,
+      "        scf.reduce\n      }\n      gpu.return\n    }"
+    ]
 
 /-- Lower GPU-compatible `LNIRDecl`s and `parFor` kernels in `m` to valid MLIR
     (`gpu.module`, `gpu.func`, `scf.parallel`, `arith.*`, `memref.*`, `nvvm.*`). -/
@@ -319,21 +349,9 @@ private def emitPTXBinaryU64Kernel (fnSymbol p1 p2 doneLbl opLine : String) : St
     s!"{doneLbl}:\n    ret;\n}"
   ]
 
-private def emitPTXUnaryU64Kernel (fnSymbol regDecls opLine outReg : String) : String :=
-  String.intercalate "\n" [
-    s!".visible .entry {fnSymbol}(\n    .param .u64 param_out,\n    .param .u64 param_in0,\n    .param .u64 param_n\n)\n\{",
-    s!"    .reg .pred %p<2>;\n    .reg .b32  %r<4>;\n    .reg .b64  {regDecls};",
-    "    ld.param.u64 %rd1, [param_out];\n    ld.param.u64 %rd2, [param_in0];\n    ld.param.u64 %rd3, [param_n];",
-    "    mov.u32      %r1, %ctaid.x;\n    mov.u32      %r2, %ntid.x;\n    mov.u32      %r3, %tid.x;\n    mul.wide.u32 %rd4, %r1, %r2;\n    cvt.u64.u32  %rd5, %r3;\n    add.u64      %rd6, %rd4, %rd5;",
-    s!"    setp.ge.u64  %p1, %rd6, %rd3;\n    @%p1 bra     $L_done_{fnSymbol};",
-    "    cvta.to.global.u64 %rd1, %rd1;\n    cvta.to.global.u64 %rd2, %rd2;\n    shl.b64      %rd7, %rd6, 3;\n    add.u64      %rd8, %rd2, %rd7;\n    ld.global.u64 %rd9, [%rd8];",
-    s!"    {opLine}\n    add.u64      %rd8, %rd1, %rd7;\n    st.global.u64 [%rd8], {outReg};",
-    s!"$L_done_{fnSymbol}:\n    ret;\n}"
-  ]
-
 /-- Lower a `ScalarExpr` AST to NVIDIA PTX 8.0 `.b64` / `.pred` register instructions,
     returning `(lines, resultReg, nextRd, nextPred)`. -/
-partial def emitPTXScalarExpr (e : ScalarExpr) (varMap : List (VarId × String))
+def emitPTXScalarExpr (e : ScalarExpr) (varMap : List (VarId × String))
     (nextRd : Nat) (nextPred : Nat) : List String × String × Nat × Nat :=
   match e with
   | .constU64 v =>
@@ -467,28 +485,10 @@ def emitPTXDeclKernel (fnSymbol : String) (kernel : ParallelKernelKind) : String
     emitPTXMatMulTiledKernel fnSymbol
   else
   match kernel with
-  | .mapScaleAdd scale bias =>
-    emitPTXUnaryU64Kernel fnSymbol "%rd<11>" s!"mad.lo.u64   %rd10, %rd9, {scale}, {bias};" "%rd10"
-  | .zipAdd =>
-    emitPTXBinaryU64Kernel fnSymbol "param_in0" "param_in1" s!"$L_done_{fnSymbol}" "add.u64      %rd11, %rd11, %rd12;"
+  | .mapScaleAdd _ _ | .zipAdd | .zipMul | .saxpy _ | .stencil1D3Pt _ _ _ =>
+    ppPTXKernel (lowerKind fnSymbol kernel)
   | .dotProduct =>
     emitPTXDotReduceKernel fnSymbol
-  | .zipMul =>
-    emitPTXBinaryU64Kernel fnSymbol "param_in0" "param_in1" s!"$L_done_{fnSymbol}" "mul.lo.u64   %rd11, %rd11, %rd12;"
-  | .saxpy alphaBits =>
-    emitPTXBinaryU64Kernel fnSymbol "param_x" "param_y" s!"$L_done_{fnSymbol}" s!"mad.lo.u64   %rd11, %rd11, {alphaBits}, %rd12;"
-  | .stencil1D3Pt wLeft wCenter wRight =>
-    String.intercalate "\n" [
-      s!".visible .entry {fnSymbol}(\n    .param .u64 param_out,\n    .param .u64 param_in0,\n    .param .u64 param_n\n)\n\{",
-      "    .reg .pred %p<4>;\n    .reg .b32  %r<4>;\n    .reg .b64  %rd<16>;\n",
-      "    ld.param.u64 %rd1, [param_out];\n    ld.param.u64 %rd2, [param_in0];\n    ld.param.u64 %rd3, [param_n];\n",
-      "    mov.u32      %r1, %ctaid.x;\n    mov.u32      %r2, %ntid.x;\n    mov.u32      %r3, %tid.x;\n    mul.wide.u32 %rd4, %r1, %r2;\n    cvt.u64.u32  %rd5, %r3;\n    add.u64      %rd6, %rd4, %rd5;\n",
-      s!"    setp.ge.u64  %p1, %rd6, %rd3;\n    @%p1 bra     $L_done_{fnSymbol};\n",
-      "    cvta.to.global.u64 %rd1, %rd1;\n    cvta.to.global.u64 %rd2, %rd2;\n    shl.b64      %rd7, %rd6, 3;\n    add.u64      %rd8, %rd2, %rd7;\n    add.u64      %rd9, %rd1, %rd7;\n    ld.global.u64 %rd10, [%rd8];\n",
-      s!"    setp.eq.u64  %p2, %rd6, 0;\n    add.u64      %rd11, %rd6, 1;\n    setp.ge.u64  %p3, %rd11, %rd3;\n    or.pred      %p2, %p2, %p3;\n    @%p2 bra     $L_boundary_{fnSymbol};\n",
-      s!"    ld.global.u64 %rd12, [%rd8+-8];\n    ld.global.u64 %rd13, [%rd8+8];\n    mul.lo.u64   %rd14, %rd12, {wLeft};\n    mad.lo.u64   %rd14, %rd10, {wCenter}, %rd14;\n    mad.lo.u64   %rd10, %rd13, {wRight}, %rd14;\n",
-      s!"$L_boundary_{fnSymbol}:\n    st.global.u64 [%rd9], %rd10;\n\n$L_done_{fnSymbol}:\n    ret;\n}"
-    ]
   | .customScalar idxVar inVars body =>
     let rec buildInDecls (k : Nat) : List VarId → List String × List String × List (VarId × String)
       | [] => ([], [], [])

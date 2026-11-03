@@ -68,7 +68,7 @@ def checkExprGpuCompatibility (e : LNIRExpr) : List String :=
     else []
 
 /-- Recursively check an `LNIRCode` block for GPU compatibility violations. -/
-partial def checkCodeGpuCompatibility (code : LNIRCode) : List String :=
+def checkCodeGpuCompatibility (code : LNIRCode) : List String :=
   match code with
   | .letBind dst ty val k =>
     let tyErrs :=
@@ -112,7 +112,7 @@ def codeHasGpuBlocker (code : LNIRCode) : Bool :=
   !(checkCodeGpuCompatibility code).isEmpty
 
 /-- Extract all `(outVar, lenVar, inputs, elemTy, kernel)` regions from an `LNIRCode` tree. -/
-partial def extractParForRegions (code : LNIRCode) :
+def extractParForRegions (code : LNIRCode) :
     List (VarId × VarId × List VarId × LNIRType × ParallelKernelKind) :=
   match code with
   | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k => extractParForRegions k

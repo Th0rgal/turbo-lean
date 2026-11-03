@@ -20,6 +20,8 @@ open LeanNative.Backend.PTXAst
 open LeanNative.Proofs.PTXSIMT
 open LeanNative.Backend.PTXLower
 open LeanNative.Proofs.PTXScalarProofs
+open LeanNative.Proofs.PTXSIMT
+open LeanNative.Proofs.PTXScalarProofs
 open LeanNative.Proofs.PTXLowerProofs
 
 private theorem midBody_loads_pureExec
@@ -136,7 +138,7 @@ theorem lowerToPTX_nonvacuous :
   | none =>
     exfalso
     revert hpack
-    simp [packInputWordLists, env, st, VarEnv.bind, HeapState.findBuffer]
+    simp [packInputWordLists, packOneWordList, env, st, VarEnv.bind, HeapState.findBuffer]
   | some inWords =>
     have harity : ([10, 11, 12] : List VarId).length = kernelArity k := rfl
     rcases lowerToPTX_evalPTXKernel_sound env st [10, 11, 12] "nv_ptx" k 2 1 2 inWords
@@ -183,11 +185,11 @@ theorem ptx_mutant_m7_killed :
   | none =>
     exfalso
     revert hpack
-    simp [packInputWordLists, env, st, VarEnv.bind, HeapState.findBuffer]
+    simp [packInputWordLists, packOneWordList, env, st, VarEnv.bind, HeapState.findBuffer]
   | some inWords' =>
     have hinEq : inWords' = inWords := by
       revert hpack
-      simp [packInputWordLists, env, st, inWords, VarEnv.bind, HeapState.findBuffer]
+      simp [packInputWordLists, packOneWordList, env, st, inWords, VarEnv.bind, HeapState.findBuffer]
       exact Eq.symm
     subst hinEq
     have hwf7 : wfPTXKernel k = true := rfl
@@ -289,11 +291,11 @@ theorem ptx_mutant_m8_killed :
   | none =>
     exfalso
     revert hpack
-    simp [packInputWordLists, env, st, VarEnv.bind, HeapState.findBuffer]
+    simp [packInputWordLists, packOneWordList, env, st, VarEnv.bind, HeapState.findBuffer]
   | some inWords' =>
     have hinEq : inWords' = inWords := by
       revert hpack
-      simp [packInputWordLists, env, st, inWords, VarEnv.bind, HeapState.findBuffer]
+      simp [packInputWordLists, packOneWordList, env, st, inWords, VarEnv.bind, HeapState.findBuffer]
       exact Eq.symm
     subst hinEq
     have hwf8 : wfPTXKernel k = true := rfl

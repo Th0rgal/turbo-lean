@@ -10,6 +10,7 @@ open LeanNative.Backend.MetalAst
 open LeanNative.Backend.MetalLower
 open LeanNative.Proofs
 open LeanNative.Proofs.MetalSIMT
+open LeanNative.Proofs.MetalLowerSpec
 open LeanNative.Proofs.MetalLowerProofs
 
 /-- Non-vacuity witness for `lowerToMetal_evalMSLKernel_sound`: a concrete 2-element
@@ -50,7 +51,7 @@ theorem lowerToMetal_nonvacuous :
   | none =>
     exfalso
     revert hpack
-    simp [packInputDeviceBuffers, packInputDeviceBuffersGo, env, st,
+    simp [packInputDeviceBuffers, packInputDeviceBuffersGo, packOneDeviceBuffer, env, st,
       VarEnv.bind, HeapState.findBuffer]
   | some inBufs =>
     have hlen : ([10, 11, 12] : List VarId).length = kernelArity k := rfl
@@ -97,13 +98,13 @@ theorem metal_mutant_m9_killed :
   | none =>
     exfalso
     revert hpack
-    simp [packInputDeviceBuffers, packInputDeviceBuffersGo, env, st,
+    simp [packInputDeviceBuffers, packInputDeviceBuffersGo, packOneDeviceBuffer, env, st,
       VarEnv.bind, HeapState.findBuffer]
   | some inBufs' =>
   have hinEq : inBufs' = inBufs := by
     revert hpack
-    simp [packInputDeviceBuffers, packInputDeviceBuffersGo, env, st, inBufs,
-      VarEnv.bind, HeapState.findBuffer]
+    simp [packInputDeviceBuffers, packInputDeviceBuffersGo, packOneDeviceBuffer, indexDeviceBuffers,
+      env, st, inBufs, VarEnv.bind, HeapState.findBuffer]
     exact Eq.symm
   subst hinEq
   have hwf9 : wfMetalKernel k = true := rfl
@@ -330,13 +331,13 @@ theorem metal_mutant_m10_killed :
   | none =>
     exfalso
     revert hpack
-    simp [packInputDeviceBuffers, packInputDeviceBuffersGo, env, st,
+    simp [packInputDeviceBuffers, packInputDeviceBuffersGo, packOneDeviceBuffer, env, st,
       VarEnv.bind, HeapState.findBuffer]
   | some inBufs' =>
   have hinEq : inBufs' = inBufs := by
     revert hpack
-    simp [packInputDeviceBuffers, packInputDeviceBuffersGo, env, st, inBufs,
-      VarEnv.bind, HeapState.findBuffer]
+    simp [packInputDeviceBuffers, packInputDeviceBuffersGo, packOneDeviceBuffer, indexDeviceBuffers,
+      env, st, inBufs, VarEnv.bind, HeapState.findBuffer]
     exact Eq.symm
   subst hinEq
   have hwf10 : wfMetalKernel k = true := rfl

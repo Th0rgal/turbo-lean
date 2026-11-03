@@ -1,6 +1,5 @@
 import LeanNative.IR.AST
 import LeanNative.Backend.PTXAst
-import LeanNative.Semantics.Eval
 
 /-!
 # Typed LNIR → PTX 8.0 lowering (`LeanNative.Backend.PTXLower`)
@@ -240,11 +239,14 @@ def lowerKind (name : String) : ParallelKernelKind → PTXKernel
       ins (.add .none .u64 "%rd9" (.reg "%rd7") (.reg "%rd8")),
       ins (.stGlobal .u64 (.regOffset "%rd6" 0) (.reg "%rd9")) ]
     kernelOf name 2 { baseEnv 2 with nextRd := 10 } body
-  | .zipMul | .dotProduct =>
+  | .zipMul =>
     let body := gidSetup s!"$L_done_{name}" ++ loadIn 0 "%rd7" ++ loadIn 1 "%rd8" ++ [
       ins (.mul .lo .u64 "%rd9" (.reg "%rd7") (.reg "%rd8")),
       ins (.stGlobal .u64 (.regOffset "%rd6" 0) (.reg "%rd9")) ]
     kernelOf name 2 { baseEnv 2 with nextRd := 10 } body
+  | .dotProduct =>
+    -- Rejected by `wfPTXKernel` and `lowerDeclToPTX` (dotProduct is a reduction, not 1-D map).
+    { name := name, params := [], regDecls := [], body := [ins .ret] }
   | .saxpy alpha =>
     let body := gidSetup s!"$L_done_{name}" ++ loadIn 0 "%rd7" ++ loadIn 1 "%rd8" ++ [
       ins (.mad .lo .u64 "%rd9" (.reg "%rd7") (.immU64 alpha.toBitVec) (.reg "%rd8")),
@@ -283,11 +285,6 @@ def lowerToPTX (name : String) (k : ParallelKernelKind) : PTXModule where
 
 def ppLowered (name : String) (k : ParallelKernelKind) : String :=
   ppPTXModule (lowerToPTX name k)
-
-def valOfSort : Bool → LeanNative.Semantics.Val → Option (BitVec 64)
-  | false, .u64 x => some x.toBitVec
-  | true, .bool b => some (if b then 1#64 else 0#64)
-  | _, _ => none
 
 def inferBinOpU64 : BinOp → Option Bool
   | .add => some false | .sub => some false | .mul => some false
@@ -355,25 +352,35 @@ def kernelArity : ParallelKernelKind → Nat
   | .customScalar _ inVars _ => inVars.length
 
 def wfPTXKernel : ParallelKernelKind → Bool
-  | .mapScaleAdd _ _ | .zipAdd | .zipMul | .dotProduct | .saxpy _ | .stencil1D3Pt _ _ _ => true
+  | .mapScaleAdd _ _ | .zipAdd | .zipMul | .saxpy _ | .stencil1D3Pt _ _ _ => true
+  | .dotProduct => false
   | .customScalar idxVar inVars body =>
     decide (inVars.Nodup ∧ idxVar ∉ inVars) && (inferScalarSort (idxVar :: inVars) body).isSome
 
-def packInputWordLists (env : LeanNative.Semantics.VarEnv)
-    (st : LeanNative.Semantics.HeapState) (len : Nat) :
-    List VarId → Option (List (List (BitVec 64)))
-  | [] => some []
-  | v :: rest =>
-    match env v, packInputWordLists env st len rest with
-    | some (.sarrayId bid), some tail | some (.rawPtrId bid), some tail =>
-      match st.findBuffer bid with
-      | some buf =>
-        if len ≤ buf.data.size then
-          let words := (List.range len).map fun i => (buf.data[i]?.getD 0).toBitVec
-          some (words :: tail)
-        else none
-      | none => none
-    | _, _ => none
+/-- Extract `(lenVar, inputs, kernel)` from a GPU 1-D `parFor` declaration body
+(`parFor outVar lenVar inputs .i64 k (ret outVar)` or preceded by `let lenVar = sarrayLen arrVar`). -/
+def extractDeclParFor : LNIRCode → Option (Option VarId × VarId × List VarId × ParallelKernelKind)
+  | .parFor outVar lenVar inputs .i64 k (.ret retVar) =>
+    if outVar == retVar then some (none, lenVar, inputs, k) else none
+  | .letBind lenVar .i64 (.sarrayLen arrVar) (.parFor outVar lenVar' inputs .i64 k (.ret retVar)) =>
+    if lenVar == lenVar' && outVar == retVar then some (some arrVar, lenVar, inputs, k) else none
+  | _ => none
+
+/-- Lower a top-level `LNIRDecl` containing a well-formed 1-D `parFor` kernel into a `PTXModule`
+(`.dotProduct` reductions and ill-typed kernels return `none`). -/
+def isSarrayI64 : LNIRType → Bool
+  | .sarray .i64 => true
+  | _ => false
+
+def lowerDeclToPTX (d : LNIRDecl) : Option PTXModule :=
+  if isSarrayI64 d.retTy then
+    match extractDeclParFor d.body with
+    | some (_, _, inputs, k) =>
+      if wfPTXKernel k && inputs.length == kernelArity k then
+        some (lowerToPTX s!"lean_native_decl_{d.name}" k)
+      else none
+    | none => none
+  else none
 
 def concatPTXMems : List ByteMemory → ByteMemory
   | [] => { bytes := #[] }

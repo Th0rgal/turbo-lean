@@ -43,8 +43,12 @@ import LeanNative.Proofs.LLVMLowerProofs
 import LeanNative.Proofs.StableHLOLowerProofs
 import LeanNative.Proofs.PTXLowerProofs
 import LeanNative.Proofs.PTXMutantProofs
+import LeanNative.Proofs.PTXDeclProofs
+import LeanNative.Proofs.MetalLowerSpec
 import LeanNative.Proofs.MetalLowerProofs
 import LeanNative.Proofs.MetalMutantProofs
+import LeanNative.Proofs.MetalDeclProofs
+import LeanNative.Proofs.GPUEmitterMutantProofs
 import LeanNative.Transform.Pass
 import LeanNative.Transform.EqSat
 import LeanNative.Transform.LoopSchedule

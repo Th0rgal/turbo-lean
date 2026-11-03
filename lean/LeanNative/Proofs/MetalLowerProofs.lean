@@ -1,5 +1,6 @@
 import LeanNative.Backend.MetalLower
 import LeanNative.Backend.MetalAst
+import LeanNative.Proofs.MetalLowerSpec
 import LeanNative.Proofs.MetalSIMT6
 
 namespace LeanNative.Proofs.MetalLowerProofs
@@ -9,6 +10,7 @@ open LeanNative.Semantics
 open LeanNative.Backend
 open LeanNative.Backend.MetalLower
 open LeanNative.Proofs
+open LeanNative.Proofs.MetalLowerSpec
 
 theorem lowerScalar_inferExprType (g : MetalAst.MSLGroupState) (ls : MetalAst.MSLLocals)
     (idxName : String) (idxVar : Nat) (boundVars : List Nat) (e : ScalarExpr) (s : Bool)
@@ -319,52 +321,56 @@ private theorem packInputDeviceBuffersGo_props (env : VarEnv) (st : HeapState) (
         ∀ i (_ : i < len) (hwi : i < words.length),
           ∃ x : UInt64, readParInput env st inputs j i = .ok x ∧ words[i] = x.toBitVec)
   | [], _, bufs, h => by
-    simp only [packInputDeviceBuffersGo, Option.some.injEq] at h; subst h
+    simp only [packInputDeviceBuffersGo_nil, Option.some.injEq] at h; subst h
     exact ⟨fun _ _ => rfl, fun _ hj => absurd hj (Nat.not_lt_zero _)⟩
   | v :: rest, idx, bufs, h => by
-    unfold packInputDeviceBuffersGo at h
-    cases hv : env v with
-    | none => simp [hv] at h
-    | some val =>
-      cases val <;> simp [hv] at h
-      all_goals
-        rename_i bid
-        cases ht : packInputDeviceBuffersGo env st len (idx + 1) rest with
-        | none => simp [ht] at h
-        | some tail =>
-          rw [ht] at h; dsimp only at h
-          cases hfind : st.findBuffer bid with
-          | none => simp [hfind] at h
-          | some buf =>
-            rw [hfind] at h; dsimp only at h
-            split at h
-            · rename_i hlenLe
-              simp only [Option.some.injEq] at h; subst h
-              rcases packInputDeviceBuffersGo_props env st len rest (idx + 1) tail ht with ⟨hhi, hmid⟩
-              refine ⟨fun k hk => ?_, fun j hj => ?_⟩
-              · simp only [List.length_cons] at hk
-                simp only [List.lookup, beq_eq_false_iff_ne.mpr (by omega : k ≠ idx)]
-                exact hhi k (by omega)
-              · cases j with
-                | zero =>
-                  let words := (List.range len).map fun i => (buf.data[i]?.getD 0).toBitVec
-                  refine ⟨words, by simp [Nat.add_zero, List.lookup, words], by simp [words], fun i hi _ => ?_⟩
-                  have hiBuf : i < buf.data.size := Nat.lt_of_lt_of_le hi hlenLe
-                  refine ⟨buf.data[i], ?_, by simp [words, Array.getElem?_eq_getElem hiBuf]⟩
-                  unfold readParInput; simp [hv, HeapState.readElem, hfind, hiBuf]
-                | succ j' =>
-                  simp only [List.length_cons] at hj
-                  rcases hmid j' (by omega) with ⟨words, hlk, hwlen, hread⟩
-                  have hadd : idx + (j' + 1) = (idx + 1) + j' := by omega
-                  have hne : ((idx + 1) + j' == idx) = false := beq_eq_false_iff_ne.mpr (by omega)
-                  refine ⟨words, by simp only [List.lookup]; rw [hadd, hne]; exact hlk, hwlen, fun i hi hwi => ?_⟩
-                  rcases hread i hi hwi with ⟨x, hr, hw⟩
-                  refine ⟨x, ?_, hw⟩
-                  unfold readParInput at hr ⊢; simp only [List.getElem?_cons_succ]
-                  cases hget : rest[j']? with
-                  | none => rw [hget] at hr; cases hr
-                  | some _ => rw [hget] at hr; exact hr
-            · cases h
+    rw [packInputDeviceBuffersGo_cons] at h
+    cases hp : packOneDeviceBuffer env st len v with
+    | none => simp [hp] at h
+    | some mem0 =>
+      rw [hp] at h; dsimp only at h
+      cases ht : packInputDeviceBuffersGo env st len (idx + 1) rest with
+      | none => simp [ht] at h
+      | some tail =>
+        rw [ht] at h; simp only [Option.some.injEq] at h; subst h
+        unfold packOneDeviceBuffer at hp
+        cases hv : env v with
+        | none => simp [hv] at hp
+        | some val =>
+          cases val <;> simp only [hv] at hp <;> try cases hp
+          all_goals
+            rename_i bid
+            cases hfind : st.findBuffer bid with
+            | none => simp [hfind] at hp
+            | some buf =>
+              rw [hfind] at hp; dsimp only at hp
+              by_cases hlenLe : len ≤ buf.data.size
+              · simp only [hlenLe, ite_true, Option.some.injEq] at hp; subst hp
+                rcases packInputDeviceBuffersGo_props env st len rest (idx + 1) tail ht with ⟨hhi, hmid⟩
+                refine ⟨fun k hk => ?_, fun j hj => ?_⟩
+                · simp only [List.length_cons] at hk
+                  simp only [List.lookup, beq_eq_false_iff_ne.mpr (by omega : k ≠ idx)]
+                  exact hhi k (by omega)
+                · cases j with
+                  | zero =>
+                    let w0 := (List.range len).map fun i => (buf.data[i]?.getD 0).toBitVec
+                    refine ⟨w0, by simp [Nat.add_zero, List.lookup, w0], by simp [w0], fun i hi _ => ?_⟩
+                    have hiBuf : i < buf.data.size := Nat.lt_of_lt_of_le hi hlenLe
+                    refine ⟨buf.data[i], ?_, by simp [w0, Array.getElem?_eq_getElem hiBuf]⟩
+                    unfold readParInput; simp [hv, HeapState.readElem, hfind, hiBuf]
+                  | succ j' =>
+                    simp only [List.length_cons] at hj
+                    rcases hmid j' (by omega) with ⟨wj, hlk, hwlen, hread⟩
+                    have hadd : idx + (j' + 1) = (idx + 1) + j' := by omega
+                    have hne : ((idx + 1) + j' == idx) = false := beq_eq_false_iff_ne.mpr (by omega)
+                    refine ⟨wj, by simp only [List.lookup]; rw [hadd, hne]; exact hlk, hwlen, fun i hi hwi => ?_⟩
+                    rcases hread i hi hwi with ⟨x, hr, hw⟩
+                    refine ⟨x, ?_, hw⟩
+                    unfold readParInput at hr ⊢; simp only [List.getElem?_cons_succ]
+                    cases hget : rest[j']? with
+                    | none => rw [hget] at hr; cases hr
+                    | some _ => rw [hget] at hr; exact hr
+              · simp [hlenLe] at hp
 
 private theorem varEnvMatchesLocals_append_one (curEnv : VarEnv) (ls : MetalAst.MSLLocals)
     (idxName : String) (idxVar iv : VarId) (x : UInt64) (hivNe : iv ≠ idxVar)
@@ -516,7 +522,9 @@ theorem lowerToMetal_evalMSLKernel_sound
       · rcases hreadElem 0 (by simp [kernelArity]) i hi with ⟨_, x, hrx, _⟩
         rcases hreadElem 1 (by simp [kernelArity]) i hi with ⟨_, y, hry, _⟩
         simp [specU64, evalParKernelElem, hrx, hry]
-    | zipMul | dotProduct =>
+    | dotProduct =>
+      simp [wfMetalKernel] at hwf
+    | zipMul =>
       refine ⟨1, [storeOut (.mul (elem "in0") (elem "in1"))], rfl, rfl, rfl, by simp [groupStepsForKind]; omega,
         MetalSIMT.laneInnerSpec_congr (MetalSIMT.laneInner_zipMul len inWords) fun cx hcx => ?_, fun i hi => ?_⟩
       · rcases hreadElem 0 (by simp [kernelArity]) cx hcx with ⟨hc0, x, hrx, hwx⟩

@@ -364,6 +364,17 @@ def runEmitCall (st : ExecState) (dst? : Option RegName) (_cc : CallingConv)
           | some dst => .inr (bindReg st' dst (.ptr outPtr))
           | none => .inr st'
     | _ => .inl (.ub "ensure_exclusive bad args")
+  else if callee == "malloc" then
+    match argVals with
+    | [.bits .i64 byteLen] =>
+      match st.mem.allocAligned byteLen.toNat 8 true with
+      | none => .inl (.ub "malloc failed")
+      | some (outPtr, mem') =>
+        let st' := { st with mem := mem' }
+        match dst? with
+        | some dst => .inr (bindReg st' dst (.ptr outPtr))
+        | none => .inr st'
+    | _ => .inl (.ub "malloc bad args")
   else
     runCallWith {} 0 st dst? .ccc .void callee argVals
 
@@ -431,18 +442,67 @@ def checkParForDecl (opt : Bool) (elems : List UInt64) : Bool :=
         | _ => false
     | _, _ => false
 
-/-- End-to-end LLVM text emitter verification across baseline and optimized modes (`M1..M5`). -/
+def dotProdProbeDecl : LNIRDecl :=
+  { name := "llvm_emit_parfor_dot"
+    params :=
+      [ { id := 0, name := "n", ty := .i64 }
+      , { id := 1, name := "xs", ty := .sarray .i64 }
+      , { id := 2, name := "ys", ty := .sarray .i64 } ]
+    retTy := .sarray .i64
+    body := .parFor 3 0 [1, 2] .i64 .dotProduct (.ret 3) }
+
+def checkDotProdDecl (opt : Bool) (xs ys : List UInt64) : Bool :=
+  let d := dotProdProbeDecl
+  match parseEmittedFn (emitDeclLLVM opt d .x86_64) with
+  | none => false
+  | some fn =>
+    match fn.blocks, allocSArray {} xs with
+    | entry :: _, some (xPtr, mem1) =>
+      match allocSArray mem1 ys with
+      | some (yPtr, mem2) =>
+        let len := xs.length
+        let args : List LLVMVal := [.bits .i64 (BitVec.ofNat 64 len), .ptr xPtr, .ptr yPtr]
+        match bindArgs { mem := mem2 } fn.params args with
+        | none => false
+        | some st0 =>
+          match execBlockWith runEmitCall fn 128 st0 entry with
+          | .returned (some (.ptr outPtr)) memOut =>
+            let env := ((VarEnv.empty.bind 0 (.u64 len.toUInt64)).bind 1 (.sarrayId 1)).bind 2 (.sarrayId 2)
+            let heap : HeapState :=
+              { buffers :=
+                  [ { id := 1, exclusive := true, data := xs.toArray }
+                  , { id := 2, exclusive := true, data := ys.toArray } ]
+                nextId := 3 }
+            let lnirExp : Option (List UInt64) :=
+              match evalCode 128 env heap d.body with
+              | .ok (.sarrayId bid, hOut) =>
+                (hOut.buffers.find? (·.id == bid)).map (·.data.toList)
+              | _ => none
+            lnirExp.isSome && readSArrayWords memOut outPtr 1 == lnirExp
+          | _ => false
+      | none => false
+    | _, _ => false
+
+/-- End-to-end LLVM text emitter verification across baseline and optimized modes (`M1..M5` + `.dotProduct`). -/
 def verifyLLVMEmitter : Bool :=
   let subDecl := mkScalarProbe "llvm_emit_sub" .sub
+  let shlDecl := mkScalarProbe "llvm_emit_shl" .shl
+  let shrDecl := mkScalarProbe "llvm_emit_shr" .shr
   let ltDecl  := mkScalarProbe "llvm_emit_lt"  .lt
   let divDecl := mkScalarProbe "llvm_emit_div" .div
   let modDecl := mkScalarProbe "llvm_emit_mod" .mod
   [false, true].all fun opt =>
     checkScalarDecl opt subDecl [(10, 3), (3, 10), (0, 1)] &&
+    checkScalarDecl opt shlDecl [(3, 2), (1, 32), (5, 65)] &&
+    checkScalarDecl opt shrDecl [(16, 2), (4294967296, 32), (8, 64)] &&
     checkScalarDecl opt ltDecl  [(3, 3), (0, 0), (2, 5), (5, 2)] &&
     checkScalarDecl opt divDecl [(18, 3), (7, 0), (0, 0)] &&
     checkScalarDecl opt modDecl [(19, 4), (7, 0), (0, 0)] &&
     checkParForDecl opt [11, 22, 33] &&
-    checkParForDecl opt []
+    checkParForDecl opt [] &&
+    checkDotProdDecl opt [2, 3, 5] [7, 11, 13] &&
+    checkDotProdDecl opt [] []
+
+#guard verifyLLVMEmitter = true
 
 end LeanNative.Backend.LLVMEmitVerify

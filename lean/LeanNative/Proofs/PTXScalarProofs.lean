@@ -20,6 +20,47 @@ open LeanNative.Proofs.PTXSIMT
 open LeanNative.Backend.PTXLower
 open LeanNative.Proofs
 
+def valOfSort (s : Bool) : Val → Option (BitVec 64)
+  | .u64 x => if !s then some x.toBitVec else none
+  | .bool b => if s then some (if b then 1#64 else 0#64) else none
+  | _ => none
+
+def packOneWordList (env : VarEnv) (st : HeapState) (len : Nat) (v : VarId) :
+    Option (List (BitVec 64)) :=
+  match env v with
+  | some (.sarrayId bid) | some (.rawPtrId bid) =>
+    match st.findBuffer bid with
+    | some buf =>
+      if len ≤ buf.data.size then
+        some ((List.range len).map fun i => (buf.data[i]?.getD 0).toBitVec)
+      else none
+    | none => none
+  | _ => none
+
+def packInputWordLists (env : VarEnv) (st : HeapState) (len : Nat) (inputs : List VarId) :
+    Option (List (List (BitVec 64))) :=
+  inputs.mapM (packOneWordList env st len)
+
+theorem packInputWordLists_nil (env : VarEnv) (st : HeapState) (len : Nat) :
+    packInputWordLists env st len [] = some [] := rfl
+
+theorem packInputWordLists_cons (env : VarEnv) (st : HeapState) (len : Nat)
+    (v : VarId) (rest : List VarId) :
+    packInputWordLists env st len (v :: rest) =
+      match packOneWordList env st len v with
+      | none => none
+      | some w =>
+        match packInputWordLists env st len rest with
+        | none => none
+        | some ws => some (w :: ws) := by
+  simp only [packInputWordLists, List.mapM_cons]
+  cases packOneWordList env st len v with
+  | none => rfl
+  | some w =>
+    cases List.mapM (packOneWordList env st len) rest with
+    | none => rfl
+    | some ws => rfl
+
 def varEnvMatchesPTX (env : VarEnv) (varOf : Nat → Option PReg) (boundVars : List Nat)
     (rdBound : Nat) (rf : PTXRegFile) : Prop :=
   ∀ id ∈ boundVars, ∃ (k : Nat) (x : UInt64),

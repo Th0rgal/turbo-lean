@@ -1043,11 +1043,20 @@ def emitParForLoop (outVar lenVar : VarId) (inputs : List VarId) (_elemTy : LNIR
   let in1Arr ← loadVarAsPtr in1Var
   emitLine "  ; certified chunk-partition & exclusive output invariant: leannative_verify_parfor_chunk_partition"
   let outArr ← freshTmp "par_out"
-  let allocFn :=
-    match kernel with
-    | .stencil1D3Pt _ _ _ => "@lean_native_ensure_exclusive"
-    | _ => if opt then "@lean_native_ensure_exclusive_uninit" else "@lean_native_ensure_exclusive"
-  emitLine s!"  {outArr} = call ptr {allocFn}(ptr {in0Arr})"
+  let isDot := match kernel with | .dotProduct => true | _ => false
+  if isDot then do
+    let szPtr ← freshTmp "dot_sz_ptr"
+    let capPtr ← freshTmp "dot_cap_ptr"
+    emitLine s!"  {outArr} = call noalias ptr @malloc(i64 32)"
+    emitLine s!"  store i32 1, ptr {outArr}, align 4"
+    emitLine s!"  {szPtr} = getelementptr inbounds i64, ptr {outArr}, i64 1\n  store i64 1, ptr {szPtr}, align 8"
+    emitLine s!"  {capPtr} = getelementptr inbounds i64, ptr {outArr}, i64 2\n  store i64 1, ptr {capPtr}, align 8"
+  else do
+    let allocFn :=
+      match kernel with
+      | .stencil1D3Pt _ _ _ => "@lean_native_ensure_exclusive"
+      | _ => if opt then "@lean_native_ensure_exclusive_uninit" else "@lean_native_ensure_exclusive"
+    emitLine s!"  {outArr} = call ptr {allocFn}(ptr {in0Arr})"
   storePtrToVar outVar outArr
   let outData ← freshTmp "par_out_data"
   let in0Data ← freshTmp "par_in0_data"
@@ -1064,8 +1073,12 @@ def emitParForLoop (outVar lenVar : VarId) (inputs : List VarId) (_elemTy : LNIR
   let ivVal ← freshTmp "par_iv"
   let nextIv ← freshTmp "par_iv_next"
   let cmpVal ← freshTmp "par_cmp"
+  let accVal ← freshTmp "par_acc"
+  let nextAcc ← freshTmp "par_acc_next"
   emitLine s!"  br label %{preHdrLbl}\n{preHdrLbl}:\n  br label %{condLbl}\n{condLbl}:"
   emitLine s!"  {ivVal} = phi i64 [ 0, %{preHdrLbl} ], [ {nextIv}, %{latchLbl} ]"
+  if isDot then
+    emitLine s!"  {accVal} = phi i64 [ 0, %{preHdrLbl} ], [ {nextAcc}, %{latchLbl} ]"
   emitLine s!"  {cmpVal} = icmp ult i64 {ivVal}, {nVal}"
   emitLine s!"  br i1 {cmpVal}, label %{bodyLbl}, label %{exitLbl}"
   emitLine s!"{bodyLbl}:"
@@ -1102,11 +1115,16 @@ def emitParForLoop (outVar lenVar : VarId) (inputs : List VarId) (_elemTy : LNIR
       modify fun s => { s with scalarBindings := bindings ++ saved }
       let value ← emitScalarExprWithWidth "i64" "63" body
       modify fun s => { s with scalarBindings := saved }; pure value
-  let pOut ← freshTmp "p_out"
-  emitLine s!"  {pOut} = getelementptr inbounds i64, ptr {outData}, i64 {ivVal}\n  store i64 {resVal}, ptr {pOut}, align 8"
+  if isDot then do
+    emitLine s!"  {nextAcc} = add i64 {accVal}, {resVal}"
+  else do
+    let pOut ← freshTmp "p_out"
+    emitLine s!"  {pOut} = getelementptr inbounds i64, ptr {outData}, i64 {ivVal}\n  store i64 {resVal}, ptr {pOut}, align 8"
   let addOp := if opt then "add nuw nsw i64" else "add i64"
   let loopMd := if opt then ", !llvm.loop !0" else ", !llvm.loop !3"
   emitLine s!"  br label %{latchLbl}\n{latchLbl}:\n  {nextIv} = {addOp} {ivVal}, 1\n  br label %{condLbl}{loopMd}\n{exitLbl}:"
+  if isDot then
+    emitLine s!"  store i64 {accVal}, ptr {outData}, align 8"
 
 /-- Check if a loop body accesses contiguous memory (`rawLoad`, `rawStore`, `sarrayGet`, `sarraySet`). -/
 partial def loopBodyHasArrayMem : LNIRCode → Bool
@@ -2100,7 +2118,7 @@ private def rcParamOnlyDecl : LNIRDecl where
   retTy := .i64
   body := .incRef 0 1 (.decRef 0 1 (.letBind 1 .i64 (.scalar (.constU64 0)) (.ret 1)))
 
-private def scalarIdDecl : LNIRDecl where
+def scalarIdDecl : LNIRDecl where
   name := "scalar"
   params := [{ id := 0, name := "x", ty := .i64 }]
   retTy := .i64
@@ -2139,7 +2157,7 @@ def slotTypeRegressionOk : Bool :=
 
 /-- C5: every RC-ADT decl is rejected — ctor ops (even though `allocCtor`/`ctorGetObj` have a guarded lowering),
     `ctorGetScalar`, heap calls, and a decl whose only heap use is `isExclusive`/`incRef`/`decRef` on a param. -/
-private def ctorOpsLLVMRegDecls : List (LNIRDecl × Option String) := [
+def ctorOpsLLVMRegDecls : List (LNIRDecl × Option String) := [
   ({ name := "reg_alloc_ctor", params := [{ id := 0, name := "x", ty := .i64 }], retTy := .objPtr,
      body := .letBind 1 .objPtr (.allocCtor 0 [] [0]) (.ret 1) }, some "rc_adt"),
   ({ name := "reg_ctor_get_obj", params := [{ id := 0, name := "p", ty := .objPtr }], retTy := .objPtr,

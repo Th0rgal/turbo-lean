@@ -1,6 +1,5 @@
 import LeanNative.IR.AST
 import LeanNative.Backend.MetalAst
-import LeanNative.Semantics.Eval
 
 /-!
 # Typed LNIR → Metal MSL 3.0 lowering (`LeanNative.Backend.MetalLower`)
@@ -86,7 +85,10 @@ def lowerKind (name : String) : ParallelKernelKind → MSLKernelDecl
   | .mapScaleAdd scale bias =>
     kernelOf name 1 (.add (.mul (elem "in0") (.immU64 scale.toBitVec)) (.immU64 bias.toBitVec))
   | .zipAdd => kernelOf name 2 (.add (elem "in0") (elem "in1"))
-  | .zipMul | .dotProduct => kernelOf name 2 (.mul (elem "in0") (elem "in1"))
+  | .zipMul => kernelOf name 2 (.mul (elem "in0") (elem "in1"))
+  | .dotProduct =>
+    -- Rejected by `wfMetalKernel` and `lowerDeclToMetal` (dotProduct is a reduction, not 1-D map).
+    { name := name, params := [], body := [.returnStmt] }
   | .saxpy alpha =>
     kernelOf name 2 (.add (.mul (.immU64 alpha.toBitVec) (elem "in0")) (elem "in1"))
   | .stencil1D3Pt wL wC wR =>
@@ -118,15 +120,12 @@ def lowerToMetal (name : String) (k : ParallelKernelKind) : MSLModule where
 def ppLowered (name : String) (k : ParallelKernelKind) : String :=
   ppMSLModule (lowerToMetal name k)
 
-def valOfSort : Bool → LeanNative.Semantics.Val → Option (BitVec 64)
-  | false, .u64 x => some x.toBitVec
-  | true, .bool b => some (if b then 1#64 else 0#64)
-  | _, _ => none
-
-def valToU64Bv (v : LeanNative.Semantics.Val) : Option (BitVec 64) :=
-  match valOfSort false v with
-  | some bv => some bv
-  | none => valOfSort true v
+/-- Build the `saxpy` `MSLKernelDecl` with `x [[buffer(0)]]`, `y [[buffer(1)]]` parameter names
+matching `Hybrid.declMetalBindingSpec` while sharing `MetalLower` AST emission. -/
+def lowerSaxpyNamed (name : String) (alpha : UInt64) : MSLKernelDecl where
+  name := name
+  params := [bufParam "x" 0 true, bufParam "y" 1 true, bufParam "out" 2 false, lenParam 3, gidParam]
+  body := guarded [storeOut (.add (.mul (.immU64 alpha.toBitVec) (elem "x")) (elem "y"))]
 
 def inferBinOpU64 : BinOp → Option Bool
   | .add => some false | .sub => some false | .mul => some false
@@ -188,45 +187,41 @@ def inferScalarSort (boundVars : List Nat) : ScalarExpr → Option Bool
       | none => none
     | none => none
 
-def varEnvMatchesLocals (env : LeanNative.Semantics.VarEnv)
-    (ls : MSLLocals) (idxName : String) (idxVar : Nat) : List Nat → Prop
-  | [] => True
-  | id :: rest =>
-    (∃ x : UInt64, env id = some (.u64 x) ∧
-      ls.lookup? (if id == idxVar then idxName else s!"v{id}") = some x.toBitVec ∧
-      ls.lookupType? (if id == idxVar then idxName else s!"v{id}") = some .ulong) ∧
-    varEnvMatchesLocals env ls idxName idxVar rest
-
 def kernelArity : ParallelKernelKind → Nat
   | .mapScaleAdd _ _ | .stencil1D3Pt _ _ _ => 1
   | .zipAdd | .zipMul | .dotProduct | .saxpy _ => 2
   | .customScalar _ inVars _ => inVars.length
 
 def wfMetalKernel : ParallelKernelKind → Bool
-  | .mapScaleAdd _ _ | .zipAdd | .zipMul | .dotProduct | .saxpy _ | .stencil1D3Pt _ _ _ => true
+  | .mapScaleAdd _ _ | .zipAdd | .zipMul | .saxpy _ | .stencil1D3Pt _ _ _ => true
+  | .dotProduct => false
   | .customScalar idxVar inVars body =>
     decide (inVars.Nodup ∧ idxVar ∉ inVars) && (inferScalarSort (idxVar :: inVars) body).isSome
 
-def packInputDeviceBuffersGo (env : LeanNative.Semantics.VarEnv)
-    (st : LeanNative.Semantics.HeapState) (len idx : Nat) :
-    List VarId → Option (List (Nat × ByteMemory))
-  | [] => some []
-  | v :: rest =>
-    match env v, packInputDeviceBuffersGo env st len (idx + 1) rest with
-    | some (.sarrayId bid), some tail | some (.rawPtrId bid), some tail =>
-      match st.findBuffer bid with
-      | some buf =>
-        if len ≤ buf.data.size then
-          let words := (List.range len).map fun i => (buf.data[i]?.getD 0).toBitVec
-          some ((idx, ByteMemory.ofU64Words words) :: tail)
-        else none
-      | none => none
-    | _, _ => none
+/-- Extract `(lenVar, inputs, kernel)` from a GPU 1-D `parFor` declaration body
+(`parFor outVar lenVar inputs .i64 k (ret outVar)` or preceded by `let lenVar = sarrayLen arrVar`). -/
+def extractDeclParFor : LNIRCode → Option (Option VarId × VarId × List VarId × ParallelKernelKind)
+  | .parFor outVar lenVar inputs .i64 k (.ret retVar) =>
+    if outVar == retVar then some (none, lenVar, inputs, k) else none
+  | .letBind lenVar .i64 (.sarrayLen arrVar) (.parFor outVar lenVar' inputs .i64 k (.ret retVar)) =>
+    if lenVar == lenVar' && outVar == retVar then some (some arrVar, lenVar, inputs, k) else none
+  | _ => none
 
-def packInputDeviceBuffers (env : LeanNative.Semantics.VarEnv)
-    (st : LeanNative.Semantics.HeapState) (inputs : List VarId) (len : Nat) :
-    Option (List (Nat × ByteMemory)) :=
-  packInputDeviceBuffersGo env st len 0 inputs
+/-- Lower a top-level `LNIRDecl` containing a well-formed 1-D `parFor` kernel into an `MSLModule`
+(`.dotProduct` reductions and ill-typed kernels return `none`). -/
+def isSarrayI64 : LNIRType → Bool
+  | .sarray .i64 => true
+  | _ => false
+
+def lowerDeclToMetal (d : LNIRDecl) : Option MSLModule :=
+  if isSarrayI64 d.retTy then
+    match extractDeclParFor d.body with
+    | some (_, _, inputs, k) =>
+      if wfMetalKernel k && inputs.length == kernelArity k then
+        some (lowerToMetal s!"lean_native_metal_decl_{d.name}" k)
+      else none
+    | none => none
+  else none
 
 def mkDeviceBuffers (inBufs : List (Nat × ByteMemory)) (nIn len : Nat) :
     List (Nat × ByteMemory) :=
