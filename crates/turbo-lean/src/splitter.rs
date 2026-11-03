@@ -4664,6 +4664,56 @@ pub fn build_coalesced_shard_source(
     chunks.join("\n")
 }
 
+/// Return a copy of `src` with every theorem/lemma proof body replaced byte-for-byte with
+/// spaces/newlines (preserving exact line numbers), leaving all theorem signatures, attributes,
+/// modifiers, definitions, and non-theorem commands intact for `--allow-sorry` hygiene auditing.
+pub fn blank_theorem_proof_bodies(src: &str) -> String {
+    let clean = strip_lean_comments(src);
+    if src.is_empty() || clean.len() != src.len() {
+        return src.to_string();
+    }
+    let spans = parse_command_spans(src, &clean);
+    let mut out = src.as_bytes().to_vec();
+    let src_base = src.as_ptr() as usize;
+    let mut blank_proof = |orig_sub: &str, clean_sub: &str| {
+        if classify_decl_header(clean_sub).is_none() {
+            return;
+        }
+        let Some((sig_orig, proof_orig)) = split_at_top_level_assign(orig_sub) else {
+            return;
+        };
+        if split_at_top_level_assign(clean_sub).is_none() {
+            return;
+        }
+        let sub_off = orig_sub.as_ptr() as usize - src_base;
+        let proof_rel = proof_orig.as_ptr() as usize - orig_sub.as_ptr() as usize;
+        if proof_rel < sig_orig.len() || sub_off + proof_rel + proof_orig.len() > out.len() {
+            return;
+        }
+        for b in &mut out[sub_off + sig_orig.len()..sub_off + proof_rel + proof_orig.len()] {
+            if *b != b'\n' && *b != b'\r' {
+                *b = b' ';
+            }
+        }
+    };
+    for span in &spans {
+        if let Some((_header_orig, inner_spans, _footer_orig)) = split_mutual_block_subspans(span) {
+            let has_inner_thm = inner_spans.iter().any(|sub| {
+                classify_decl_header(sub.clean_text).is_some()
+                    && split_at_top_level_assign(sub.clean_text).is_some()
+            });
+            if has_inner_thm {
+                for sub in &inner_spans {
+                    blank_proof(sub.orig_text, sub.clean_text);
+                }
+                continue;
+            }
+        }
+        blank_proof(span.orig_text, span.clean_text);
+    }
+    String::from_utf8(out).unwrap_or_else(|_| src.to_string())
+}
+
 fn contains_local_decl_ref(haystack: &str, short: &str, full_name: &str) -> bool {
     let mut exact_map = std::collections::HashMap::new();
     let mut non_std_short_map = std::collections::HashMap::new();

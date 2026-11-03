@@ -218,6 +218,51 @@ fn cli_allow_sorry_rejects_broken_trailing_defs_and_def_sorry() {
         String::from_utf8_lossy(&out5.stdout),
         String::from_utf8_lossy(&out5.stderr)
     );
+
+    // 5) [P1] `check --allow-sorry` and `check --decl <d> --allow-sorry` MUST reject `sorry`
+    //    inside theorem signatures/statements (`theorem t1 (h : False := sorry) : False := h`,
+    //    `theorem t1 : sorry := trivial`) and same-line `def bad : Nat := sorry; theorem ok : True := trivial`,
+    //    never poisoning trusted CAS with `clean_false : False := t1` or reporting `decl_sorry` on `t1 : sorry`.
+    for (file_name, bad_src, decls) in [
+        (
+            "W8/StmtParamSorry.lean",
+            "theorem t1 (h : False := sorry) : False := h\ntheorem clean_false : False := t1\n",
+            &["t1", "clean_false"][..],
+        ),
+        (
+            "W8/StmtTypeSorry.lean",
+            "theorem t1 : sorry := trivial\n",
+            &["t1"][..],
+        ),
+        (
+            "W8/SameLineDefSorry.lean",
+            "def bad : Nat := sorry; theorem ok : True := trivial\n",
+            &["ok"][..],
+        ),
+    ] {
+        fs::write(proj.join(file_name), bad_src).unwrap();
+        let whole_out = ws.run(&["--json", "check", file_name, "--allow-sorry"]);
+        assert!(
+            !whole_out.status.success(),
+            "check {file_name} --allow-sorry must fail closed; stdout={} stderr={}",
+            String::from_utf8_lossy(&whole_out.stdout),
+            String::from_utf8_lossy(&whole_out.stderr)
+        );
+        for d in decls {
+            let decl_out = ws.run(&["--json", "check", file_name, "--decl", d, "--allow-sorry"]);
+            assert!(
+                !decl_out.status.success(),
+                "check {file_name} --decl {d} --allow-sorry must fail closed; stdout={} stderr={}",
+                String::from_utf8_lossy(&decl_out.stdout),
+                String::from_utf8_lossy(&decl_out.stderr)
+            );
+            let stdout_str = String::from_utf8_lossy(&decl_out.stdout);
+            assert!(
+                !stdout_str.contains("decl_sorry") && !stdout_str.contains("theorem_verified"),
+                "must never report decl_sorry or theorem_verified on {file_name}::{d}: {stdout_str}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -238,13 +283,50 @@ fn cli_check_withholds_stdout_and_runs_dependent_recheck_on_broken_importer() {
     )
     .unwrap();
 
-    // Initial full build succeeds.
+    // Initial full build succeeds; commit baseline in git so `nonlocal_edits` compares against HEAD
+    // under Git >= 2.46 (where `trusted_tools::git` succeeds instead of failing closed).
     let b_out = ws.run(&["build", "+W8.Downstream"]);
     assert!(
         b_out.status.success(),
         "initial build failed: {}",
         String::from_utf8_lossy(&b_out.stderr)
     );
+    assert!(Command::new("git")
+        .arg("init")
+        .current_dir(&proj)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(&proj)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&proj)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args([
+            "add",
+            "lakefile.toml",
+            "lean-toolchain",
+            "W8/Base.lean",
+            "W8/Downstream.lean"
+        ])
+        .current_dir(&proj)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["commit", "--no-gpg-sign", "-m", "baseline"])
+        .current_dir(&proj)
+        .status()
+        .unwrap()
+        .success());
 
     // Mutate `W8/Base.lean` non-locally (`baseVal := 99`), breaking `W8/Downstream.lean`.
     fs::write(
@@ -288,41 +370,33 @@ fn cli_check_withholds_stdout_and_runs_dependent_recheck_on_broken_importer() {
     .unwrap();
     assert!(ws.run(&["build", "+W8.Downstream"]).status.success());
     assert!(Command::new("git")
-        .arg("init")
+        .args(["add", "W8/Base.lean"])
         .current_dir(&proj)
         .status()
         .unwrap()
         .success());
     assert!(Command::new("git")
-        .args(["config", "user.email", "test@example.com"])
+        .args(["commit", "--no-gpg-sign", "-m", "baseline2"])
         .current_dir(&proj)
         .status()
         .unwrap()
         .success());
-    assert!(Command::new("git")
-        .args(["config", "user.name", "Test"])
-        .current_dir(&proj)
-        .status()
-        .unwrap()
-        .success());
-    assert!(Command::new("git")
-        .args([
-            "add",
-            "lakefile.toml",
-            "lean-toolchain",
-            "W8/Base.lean",
-            "W8/Downstream.lean"
-        ])
-        .current_dir(&proj)
-        .status()
-        .unwrap()
-        .success());
-    assert!(Command::new("git")
-        .args(["commit", "--no-gpg-sign", "-m", "baseline"])
-        .current_dir(&proj)
-        .status()
-        .unwrap()
-        .success());
+
+    // Baseline matches HEAD: `check --decl base_ok --allow-sorry` MUST succeed cleanly.
+    let c_decl_clean = ws.run(&[
+        "--json",
+        "check",
+        "W8/Base.lean",
+        "--decl",
+        "base_ok",
+        "--allow-sorry",
+    ]);
+    assert!(
+        c_decl_clean.status.success(),
+        "0-sorry check --decl --allow-sorry matching HEAD must succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&c_decl_clean.stdout),
+        String::from_utf8_lossy(&c_decl_clean.stderr)
+    );
 
     // Mutate `W8/Base.lean` non-locally (`baseVal := 99`), breaking `W8/Downstream.lean` vs HEAD.
     fs::write(

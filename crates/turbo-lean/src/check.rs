@@ -2967,6 +2967,45 @@ fn target_non_sorry_hygiene_violations(
     items
 }
 
+fn reject_allow_sorry_outside_theorem_proof_bodies(
+    display_path: &Path,
+    src: &str,
+    split: &splitter::SplitResult,
+) -> Result<()> {
+    let mut sig_violations = Vec::new();
+    for s in &split.shards {
+        let items = splitter::audit_hygiene(&splitter::strip_lean_comments(&s.signature_text))
+            .disallowed_items();
+        if !items.is_empty() {
+            sig_violations.push(format!(
+                "{} (L{}): {}",
+                s.decl_name(),
+                s.start_line,
+                items.join(", ")
+            ));
+        }
+    }
+    if !sig_violations.is_empty() {
+        anyhow::bail!(
+            "Cannot run partial `--allow-sorry` check on {}: `sorry`/`admit` or disallowed item appears inside theorem signature/statement ({}); theorem statements must be sorry-free",
+            display_path.display(),
+            sig_violations.join("; ")
+        );
+    }
+    let src_without_proofs = splitter::blank_theorem_proof_bodies(src);
+    let outside_sorry =
+        splitter::audit_hygiene(&splitter::strip_lean_comments(&src_without_proofs))
+            .disallowed_items();
+    if !outside_sorry.is_empty() {
+        anyhow::bail!(
+            "Cannot run partial `--allow-sorry` check on {}: `sorry`/`admit` appears outside theorem shards ({}); definitions, theorem signatures, and non-theorem commands must be sorry-free",
+            display_path.display(),
+            outside_sorry.join(", ")
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn check_single_decl(
     store: &mut TurboStore,
@@ -3092,33 +3131,7 @@ fn check_single_decl(
                     .unwrap_or("module is not eligible for per-declaration sharding")
             );
         }
-        let shard_lines: Vec<(usize, usize)> = split
-            .shards
-            .iter()
-            .map(|s| (s.start_line, s.end_line))
-            .collect();
-        let outside_sorry: Vec<String> = split
-            .hygiene
-            .disallowed_items()
-            .into_iter()
-            .filter(|item| {
-                let ln_opt = item
-                    .strip_prefix('L')
-                    .and_then(|r| r.split_once(": "))
-                    .and_then(|(ln, _)| ln.parse::<usize>().ok());
-                match ln_opt {
-                    Some(ln) => !shard_lines.iter().any(|(st, en)| *st <= ln && ln <= *en),
-                    None => true,
-                }
-            })
-            .collect();
-        if !outside_sorry.is_empty() {
-            anyhow::bail!(
-                "Cannot run partial `--allow-sorry` check on {}: `sorry`/`admit` appears outside theorem shards ({}); definitions and non-theorem commands must be sorry-free",
-                active_file.display(),
-                outside_sorry.join(", ")
-            );
-        }
+        reject_allow_sorry_outside_theorem_proof_bodies(&active_file, &active_src, split)?;
         let (mut skel_env, _) = resolve_lake_env(store, canon_dir)?;
         let default_stack = skel_env
             .get("LEAN_STACK_SIZE_KB")
@@ -4901,33 +4914,7 @@ fn check_single_file_allow_sorry(
                 .unwrap_or("module is not eligible for per-declaration sharding")
         );
     }
-    let shard_lines: Vec<(usize, usize)> = fresh_split
-        .shards
-        .iter()
-        .map(|s| (s.start_line, s.end_line))
-        .collect();
-    let outside_sorry: Vec<String> = fresh_split
-        .hygiene
-        .disallowed_items()
-        .into_iter()
-        .filter(|item| {
-            let ln_opt = item
-                .strip_prefix('L')
-                .and_then(|r| r.split_once(": "))
-                .and_then(|(ln, _)| ln.parse::<usize>().ok());
-            match ln_opt {
-                Some(ln) => !shard_lines.iter().any(|(st, en)| *st <= ln && ln <= *en),
-                None => true,
-            }
-        })
-        .collect();
-    if !outside_sorry.is_empty() {
-        anyhow::bail!(
-            "Cannot run partial `--allow-sorry` check on {}: `sorry`/`admit` appears outside theorem shards ({}); definitions and non-theorem commands must be sorry-free",
-            file.display(),
-            outside_sorry.join(", ")
-        );
-    }
+    reject_allow_sorry_outside_theorem_proof_bodies(file, src, &fresh_split)?;
 
     let file_lean_args = crate::module_builder::try_resolve_lean_args_for_path(
         canon_dir,
@@ -9454,6 +9441,50 @@ def trailingBroken : Nat := \"not_a_nat\"
             trailing_err2.is_err(),
             "zero-sorry file with broken trailing def must fail instead of returning certified_module: true"
         );
+
+        // Phase 7: [P1] `check --allow-sorry` and `check --decl <d> --allow-sorry` reject `sorry`
+        // inside theorem signatures/statements (`theorem t1 (h : False := sorry) : False := h`
+        // and `theorem t1 : sorry := trivial`) and same-line non-theorem `def bad : Nat := sorry; theorem ok : True := trivial`,
+        // preventing trusted CAS poisoning of downstream theorems like `theorem clean_false : False := t1`.
+        for (label, bad_src, decl_target) in [
+            (
+                "default-param sorry in statement",
+                "theorem t1 (h : False := sorry) : False := h\ntheorem clean_false : False := t1\n",
+                "clean_false",
+            ),
+            (
+                "sorry as theorem type",
+                "theorem t1 : sorry := trivial\n",
+                "t1",
+            ),
+            (
+                "same-line def sorry before theorem",
+                "def bad : Nat := sorry; theorem ok : True := trivial\n",
+                "ok",
+            ),
+        ] {
+            fs::write(&dummy_file, bad_src).unwrap();
+            let err_whole = evaluate_check_command_allow_sorry_value(
+                &mut store,
+                dummy_file.clone(),
+                None,
+                proj_dir.clone(),
+            );
+            assert!(
+                err_whole.is_err(),
+                "whole-file --allow-sorry must reject {label}"
+            );
+            let err_decl = evaluate_check_command_allow_sorry_value(
+                &mut store,
+                dummy_file.clone(),
+                Some(decl_target.to_string()),
+                proj_dir.clone(),
+            );
+            assert!(
+                err_decl.is_err(),
+                "--decl {decl_target} --allow-sorry must reject {label}"
+            );
+        }
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }

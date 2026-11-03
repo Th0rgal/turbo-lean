@@ -2958,6 +2958,7 @@ impl TurboStore {
                 || row.environment_digest.is_empty()
                 || row.toolchain_hash.is_empty()
                 || row.module_name.is_empty()
+                || row.replay_version == 0
             {
                 continue;
             }

@@ -33876,6 +33876,35 @@ globs = ["Down.+"]
             "mixed action with unallowed `thm:` output must not bypass ConeExportFilter"
         );
 
+        // 2c) [P2] `import_trusted_kernel_replayed_oleans` skips `replay_version == 0` rows
+        //     without aborting valid rows in the same pack import.
+        let imported_count = dst_mixed.import_trusted_kernel_replayed_oleans(
+            &[
+                crate::pack::PackedKernelReplay {
+                    artifact_digest: "art_zero".to_string(),
+                    environment_digest: "env_zero".to_string(),
+                    replay_version: 0,
+                    toolchain_hash: "tc_hash".to_string(),
+                    module_name: "W8.ZeroReplay".to_string(),
+                },
+                crate::pack::PackedKernelReplay {
+                    artifact_digest: "art_valid".to_string(),
+                    environment_digest: "env_valid".to_string(),
+                    replay_version: 1,
+                    toolchain_hash: "tc_hash".to_string(),
+                    module_name: "W8.ValidReplay".to_string(),
+                },
+            ],
+            "trusted",
+            true,
+        )?;
+        assert_eq!(
+            imported_count, 1,
+            "replay_version == 0 row must be skipped while valid row imports cleanly"
+        );
+        assert!(!dst_mixed.has_kernel_replayed_olean("art_zero", "env_zero", 1, "tc_hash", &[]));
+        assert!(dst_mixed.has_kernel_replayed_olean("art_valid", "env_valid", 1, "tc_hash", &[]));
+
         // 3) [P1-5] `evaluate_gate_report` captures `build_wave_native_artifacts` failures as structured
         //    `GateRootFailure` (`failure_kind == "native_artifact_error"`) with `gate_passed == false`,
         //    and blocks downstream importers!
