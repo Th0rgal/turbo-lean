@@ -65,9 +65,42 @@ inductive SymExpr where
   | tuple     (fields : List SymExpr)
   | bufElem   (space : MemWriteSpace) (bufVar : VarId) (idx : SymExpr)
   | unit
-  deriving Repr, Inhabited, BEq
+  deriving Repr, Inhabited
 
 namespace SymExpr
+
+mutual
+  def beq : SymExpr → SymExpr → Bool
+    | .constU64 a, .constU64 b => a == b
+    | .constU256 a, .constU256 b => a == b
+    | .constBool a, .constBool b => a == b
+    | .symVar a, .symVar b => a == b
+    | .allocTag a, .allocTag b => a == b
+    | .rcSym ea a, .rcSym eb b => ea == eb && a == b
+    | .ctorTag ea a, .ctorTag eb b => ea == eb && a == b
+    | .ctorLen sa ea a, .ctorLen sb eb b => sa == sb && ea == eb && a == b
+    | .sarrayLen a, .sarrayLen b => a == b
+    | .mulDiv256 ua a1 b1 d1, .mulDiv256 ub a2 b2 d2 =>
+      ua == ub && beq a1 a2 && beq b1 b2 && beq d1 d2
+    | .binOp oa l1 r1, .binOp ob l2 r2 =>
+      oa == ob && beq l1 l2 && beq r1 r2
+    | .unaryOp oa a1, .unaryOp ob a2 =>
+      oa == ob && beq a1 a2
+    | .ite c1 t1 e1, .ite c2 t2 e2 =>
+      beq c1 c2 && beq t1 t2 && beq e1 e2
+    | .tuple fs1, .tuple fs2 => beqList fs1 fs2
+    | .bufElem sp1 b1 i1, .bufElem sp2 b2 i2 =>
+      sp1 == sp2 && b1 == b2 && beq i1 i2
+    | .unit, .unit => true
+    | _, _ => false
+
+  def beqList : List SymExpr → List SymExpr → Bool
+    | [], [] => true
+    | a :: as, b :: bs => beq a b && beqList as bs
+    | _, _ => false
+end
+
+instance : BEq SymExpr := ⟨SymExpr.beq⟩
 
 /-- Deterministic structural rank used to canonicalize commutative binary operators.
     Constants receive the highest rank so they are pushed to the right-hand side (`x + c`). -/
@@ -92,7 +125,7 @@ def rank : SymExpr → Nat
 
 /-- Check whether `op` is commutative in `SymExpr`. -/
 def isCommutative : BinOp → Bool
-  | .add | .mul | .bitAnd | .bitOr | .bitXor | .eq | .clmul64 | .clmul64Hi => true
+  | .add | .mul | .bitAnd | .bitOr | .bitXor | .eq => true
   | _ => false
 
 end SymExpr
@@ -104,27 +137,30 @@ structure SymStateVal where
   noUB      : Bool := true
   deriving Repr, Inhabited, BEq
 
-private def pow2ShiftLog2 : UInt64 → Option UInt64
+def pow2ShiftLog2 : UInt64 → Option UInt64
   | 2 => some 1 | 4 => some 2 | 8 => some 3
-  | 16 => some 4 | 32 => some 5 | 64 => some 6
+  | 16 => some 4 | 32 => some 5
   | _ => none
 
-private def exprDefinitely64 (e : SymExpr) : Bool :=
+def exprDefinitely64 (e : SymExpr) : Bool :=
   match e with
   | .constU64 _ | .rcSym _ _ | .ctorTag _ _ | .ctorLen _ _ _ | .sarrayLen _ => true
   | _ => false
 
-/-- Single-step algebraic & strength-reduction normalizer on `SymExpr`. -/
-def normSymBinOpStep (op : BinOp) (lhs rhs : SymExpr) (width64Safe : Bool := false) : SymExpr :=
-  -- Canonicalize operand order for commutative operators so constants migrate right
-  let (l, r) :=
-    if SymExpr.isCommutative op && SymExpr.rank lhs > SymExpr.rank rhs then
-      (rhs, lhs)
-    else
-      (lhs, rhs)
-  let w64 := width64Safe || (exprDefinitely64 l && exprDefinitely64 r)
+/-- Check whether `e` is syntactically guaranteed to evaluate to a `.u64` whenever `w64` holds
+    on an enclosing `.binOp` over `(e ± constU64 a)`: whenever `a != 0`, `evalBinOp (.add/.sub) vx (.u64 a)`
+    succeeds ONLY when `vx` is `.u64`! -/
+def subexprDefinitely64 (w64 : Bool) (a : UInt64) (e : SymExpr) : Bool :=
+  (w64 && (a != 0)) || exprDefinitely64 e
+
+def atomDefinitelyBool : SymExpr → Bool
+  | .constBool _ | .binOp .eq _ _ | .binOp .lt _ _ | .binOp .le _ _ => true
+  | .ite c t (.constBool false) => atomDefinitelyBool c && atomDefinitelyBool t
+  | _ => false
+
+/-- Extract core body of `normSymBinOpStep` after commutativity ordering (`l`, `r`) and width flag (`w64`). -/
+def normSymBinOpCore (op : BinOp) (l r : SymExpr) (w64 : Bool) : SymExpr :=
   match op, l, r with
-  -- Constant folding on UInt64
   | .add, .constU64 a, .constU64 b => .constU64 (a + b)
   | .sub, .constU64 a, .constU64 b => .constU64 (a - b)
   | .mul, .constU64 a, .constU64 b => .constU64 (a * b)
@@ -142,7 +178,6 @@ def normSymBinOpStep (op : BinOp) (lhs rhs : SymExpr) (width64Safe : Bool := fal
   | .lt,     .constU64 a, .constU64 b => .constBool (decide (a < b))
   | .le,     .constU64 a, .constU64 b => .constBool (decide (a ≤ b))
   | .eq,     .constBool a, .constBool b => .constBool (a == b)
-  -- Constant folding on UInt256
   | .add,    .constU256 a, .constU256 b => .constU256 (UInt256.add a b)
   | .sub,    .constU256 a, .constU256 b => .constU256 (UInt256.sub a b)
   | .mul,    .constU256 a, .constU256 b => .constU256 (UInt256.mul a b)
@@ -168,28 +203,26 @@ def normSymBinOpStep (op : BinOp) (lhs rhs : SymExpr) (width64Safe : Bool := fal
     if w == UInt256.ofUInt64 1 then x else .binOp op l r
   | .bitAnd, _, .constU256 w | .bitAnd, .constU256 w, _ =>
     if w == UInt256.zero then .constU256 UInt256.zero else .binOp op l r
-
-  -- Additive identities (`+ 0` / `- 0` hold for all widths; constant reassociation holds ONLY on 64-bit words `w64`!)
   | .add, x, .constU64 0 | .add, .constU64 0, x | .sub, x, .constU64 0 => x
   | .add, .binOp .add x (.constU64 a), .constU64 b =>
-    if w64 || exprDefinitely64 x then
+    if subexprDefinitely64 w64 a x then
       let s := a + b
       if s == 0 then x else .binOp .add x (.constU64 s)
     else .binOp op l r
   | .add, .binOp .sub x (.constU64 a), .constU64 b =>
-    if w64 || exprDefinitely64 x then
+    if subexprDefinitely64 w64 a x then
       if a == b then x
       else if b > a then .binOp .add x (.constU64 (b - a))
       else .binOp .sub x (.constU64 (a - b))
     else .binOp op l r
   | .sub, .binOp .add x (.constU64 a), .constU64 b =>
-    if w64 || exprDefinitely64 x then
+    if subexprDefinitely64 w64 a x then
       if a == b then x
       else if a > b then .binOp .add x (.constU64 (a - b))
       else .binOp .sub x (.constU64 (b - a))
     else .binOp op l r
   | .sub, .binOp .sub x (.constU64 a), .constU64 b =>
-    if w64 || exprDefinitely64 x then
+    if subexprDefinitely64 w64 a x then
       let s := a + b
       if s == 0 then x else .binOp .sub x (.constU64 s)
     else .binOp op l r
@@ -198,27 +231,29 @@ def normSymBinOpStep (op : BinOp) (lhs rhs : SymExpr) (width64Safe : Bool := fal
     else match x with
       | .constU256 _ => if x == y then .constU256 UInt256.zero else .binOp .sub x y
       | _ => .binOp .sub x y
-
-  -- Multiplicative identities & strength reduction (* 2^k -> <<< k on `.constU64` RHS)
   | .mul, x, .constU64 1 | .mul, .constU64 1, x => x
   | .mul, x, .constU64 0 => if w64 || exprDefinitely64 x then .constU64 0 else .binOp .mul x (.constU64 0)
   | .mul, .constU64 0, x => if w64 || exprDefinitely64 x then .constU64 0 else .binOp .mul (.constU64 0) x
   | .mul, x, .constU64 c =>
-    match pow2ShiftLog2 c with
-    | some k => .binOp .shl x (.constU64 k)
-    | none => .binOp .mul x (.constU64 c)
+    if w64 || exprDefinitely64 x then
+      match pow2ShiftLog2 c with
+      | some k => .binOp .shl x (.constU64 k)
+      | none => .binOp .mul x (.constU64 c)
+    else .binOp .mul x (.constU64 c)
   | .mul, .constU64 c, x =>
-    match pow2ShiftLog2 c with
-    | some k => .binOp .shl x (.constU64 k)
-    | none => .binOp .mul (.constU64 c) x
-
-  -- Division & modulo identities & strength reduction (/ 2^k -> >>> k, % 2^k -> &&& (2^k - 1))
+    if w64 || exprDefinitely64 x then
+      match pow2ShiftLog2 c with
+      | some k => .binOp .shl x (.constU64 k)
+      | none => .binOp .mul (.constU64 c) x
+    else .binOp .mul (.constU64 c) x
   | .div, x, .constU64 0 => if w64 || exprDefinitely64 x then .constU64 0 else .binOp .div x (.constU64 0)
   | .div, x, .constU64 1 => x
   | .div, x, .constU64 c =>
-    match pow2ShiftLog2 c with
-    | some k => .binOp .shr x (.constU64 k)
-    | none => .binOp .div x (.constU64 c)
+    if w64 || exprDefinitely64 x then
+      match pow2ShiftLog2 c with
+      | some k => .binOp .shr x (.constU64 k)
+      | none => .binOp .div x (.constU64 c)
+    else .binOp .div x (.constU64 c)
   | .mod, x, .constU64 0 => if w64 || exprDefinitely64 x then x else .binOp .mod x (.constU64 0)
   | .mod, x, .constU64 1 => if w64 || exprDefinitely64 x then .constU64 0 else .binOp .mod x (.constU64 1)
   | .mod, x, .constU64 c =>
@@ -227,8 +262,6 @@ def normSymBinOpStep (op : BinOp) (lhs rhs : SymExpr) (width64Safe : Bool := fal
       | some _ => .binOp .bitAnd x (.constU64 (c - 1))
       | none => .binOp .mod x (.constU64 c)
     else .binOp .mod x (.constU64 c)
-
-  -- Bitwise & shift identities & idempotence
   | .bitXor, x, .constU64 0 | .bitXor, .constU64 0, x => x
   | .bitXor, x, y =>
     if (w64 || exprDefinitely64 x) && x == y then .constU64 0
@@ -241,18 +274,35 @@ def normSymBinOpStep (op : BinOp) (lhs rhs : SymExpr) (width64Safe : Bool := fal
   | .bitAnd, .constU64 0, x => if w64 || exprDefinitely64 x then .constU64 0 else .binOp .bitAnd (.constU64 0) x
   | .bitAnd, x, y => if x == y then x else .binOp .bitAnd x y
   | .shl, x, .constU64 0 | .shr, x, .constU64 0 => x
-
-  -- Boolean equality identities (`b == true -> b`, `b == false -> !b`)
-  | .eq, x, .constBool true | .eq, .constBool true, x => x
-  | .eq, .unaryOp .not x, .constBool false | .eq, .constBool false, .unaryOp .not x => x
-  | .eq, x, .constBool false | .eq, .constBool false, x => .unaryOp .not x
-
-  -- Reflexive comparisons
-  | .eq, x, y => if x == y then .constBool true else .binOp .eq x y
-  | .lt, x, y => if x == y then .constBool false else .binOp .lt x y
-  | .le, x, y => if x == y then .constBool true else .binOp .le x y
-
+  | .eq, x, .constBool true | .eq, .constBool true, x =>
+    if atomDefinitelyBool x then x else .binOp .eq l r
+  | .eq, .unaryOp .not x, .constBool false | .eq, .constBool false, .unaryOp .not x =>
+    if atomDefinitelyBool x then x else .binOp .eq l r
+  | .eq, x, .constBool false | .eq, .constBool false, x =>
+    if atomDefinitelyBool x then .unaryOp .not x else .binOp .eq l r
+  | .eq, x, y =>
+    if x == y && (w64 || exprDefinitely64 x || atomDefinitelyBool x ||
+        (match x with | .constU256 _ => true | _ => false)) then .constBool true
+    else .binOp .eq x y
+  | .lt, x, y =>
+    if x == y && (w64 || exprDefinitely64 x ||
+        (match x with | .constU256 _ => true | _ => false)) then .constBool false
+    else .binOp .lt x y
+  | .le, x, y =>
+    if x == y && (w64 || exprDefinitely64 x ||
+        (match x with | .constU256 _ => true | _ => false)) then .constBool true
+    else .binOp .le x y
   | _, _, _ => .binOp op l r
+
+/-- Single-step algebraic & strength-reduction normalizer on `SymExpr`. -/
+def normSymBinOpStep (op : BinOp) (lhs rhs : SymExpr) (width64Safe : Bool := false) : SymExpr :=
+  let (l, r) :=
+    if SymExpr.isCommutative op && SymExpr.rank lhs > SymExpr.rank rhs then
+      (rhs, lhs)
+    else
+      (lhs, rhs)
+  let w64 := width64Safe || (exprDefinitely64 l && exprDefinitely64 r)
+  normSymBinOpCore op l r w64
 
 /-- Single-step unary normalizer on `SymExpr`. -/
 def normSymUnaryOpStep (op : UnaryOp) (arg : SymExpr) : SymExpr :=
@@ -260,19 +310,24 @@ def normSymUnaryOpStep (op : UnaryOp) (arg : SymExpr) : SymExpr :=
   | .not, .constBool b => .constBool (!b)
   | .not, .constU64 a => .constU64 (~~~a)
   | .not, .constU256 w => .constU256 (UInt256.bitNot w)
-  | .not, .unaryOp .not x => x
+  | .not, .unaryOp .not x =>
+    if exprDefinitely64 x || atomDefinitelyBool x ||
+       (match x with | .constU256 _ => true | _ => false) then x
+    else .unaryOp .not (.unaryOp .not x)
   | .neg, .constU64 a => .constU64 (0 - a)
   | .neg, .constU256 w => .constU256 (UInt256.sub UInt256.zero w)
-  | .neg, .unaryOp .neg x => x
+  | .neg, .unaryOp .neg x =>
+    if exprDefinitely64 x then x
+    else .unaryOp .neg (.unaryOp .neg x)
   | .clz256, .constU64 a => .constU256 (UInt256.clz (UInt256.ofUInt64 a))
   | .clz256, .constU256 w => .constU256 (UInt256.clz w)
   | _, _ => .unaryOp op arg
 
-private def flattenConjAtoms : SymExpr → List SymExpr
+def flattenConjAtoms : SymExpr → List SymExpr
   | .ite c t (.constBool false) => flattenConjAtoms c ++ flattenConjAtoms t
   | e => [e]
 
-private def insertSortedConjAtom (x : SymExpr) : List SymExpr → List SymExpr
+def insertSortedConjAtom (x : SymExpr) : List SymExpr → List SymExpr
   | [] => [x]
   | y :: ys =>
     if x == y then y :: ys
@@ -280,7 +335,7 @@ private def insertSortedConjAtom (x : SymExpr) : List SymExpr → List SymExpr
       x :: y :: ys
     else y :: insertSortedConjAtom x ys
 
-private def foldSortedConj : List SymExpr → SymExpr
+def foldSortedConj : List SymExpr → SymExpr
   | [] => .constBool true
   | [x] => x
   | x :: xs => .ite x (foldSortedConj xs) (.constBool false)
@@ -293,12 +348,8 @@ def normSymIteStep (cond thenVal elseVal : SymExpr) : SymExpr :=
   | .constU64 c => if c != 0 then thenVal else elseVal
   | .constU256 w => if w != UInt256.zero then thenVal else elseVal
   | _ =>
-    if thenVal == elseVal then thenVal
-    else if elseVal == .constBool false &&
-      (match thenVal with
-       | .ite _ _ (.constBool false) | .constBool true
-       | .binOp .eq _ _ | .binOp .lt _ _ | .binOp .le _ _ => true
-       | _ => false) then
+    if thenVal == elseVal && atomDefinitelyBool cond then thenVal
+    else if elseVal == .constBool false && atomDefinitelyBool cond && atomDefinitelyBool thenVal then
       let atoms := (flattenConjAtoms cond ++ flattenConjAtoms thenVal).filter (· != .constBool true)
       if atoms.contains (.constBool false) then .constBool false
       else foldSortedConj (atoms.foldr insertSortedConjAtom [])
@@ -1007,11 +1058,11 @@ end SymExecState
 
 /-- Exact scalar value sort in `Val` (`0` = `.bool`, `1` = `.u64`, `2` = `.u256`)
     so width-sensitive arithmetic (64-bit vs 256-bit) and mixed-width `evalBinOp` checks are exact! -/
-private def sortBool : Nat := 0
-private def sortU64  : Nat := 1
-private def sortU256 : Nat := 2
+def sortBool : Nat := 0
+def sortU64  : Nat := 1
+def sortU256 : Nat := 2
 
-private def symExprScalarSort? (st : SymExecState) : SymExpr → Option Nat
+def symExprScalarSort? (st : SymExecState) : SymExpr → Option Nat
   | .constBool _ => some sortBool
   | .constU64 _ | .rcSym _ _ | .ctorTag _ _ | .ctorLen _ _ _ | .sarrayLen _ => some sortU64
   | .constU256 _ | .mulDiv256 _ _ _ _ => some sortU256
@@ -1048,6 +1099,20 @@ structure SymScalarRes where
   unsupported : Bool := false
   deriving Repr, Inhabited, BEq
 
+/-- Honor `evalBinOp`'s exact concrete identity/idempotence cases before sort-based UB checks. -/
+def symBinOpIdentityShortCircuit? (op : BinOp) (l r : SymExpr) : Option SymExpr :=
+  match op, l, r with
+  | .add, x, .constU64 0 | .add, .constU64 0, x
+  | .sub, x, .constU64 0
+  | .mul, x, .constU64 1 | .mul, .constU64 1, x
+  | .div, x, .constU64 1
+  | .bitOr, x, .constU64 0 | .bitOr, .constU64 0, x
+  | .bitXor, x, .constU64 0 | .bitXor, .constU64 0, x
+  | .shl, x, .constU64 0
+  | .shr, x, .constU64 0 => some x
+  | .bitAnd, x, y | .bitOr, x, y => if x == y then some x else none
+  | _, _, _ => none
+
 /-- Symbolically evaluate a pure `ScalarExpr` with full sort & width tracking (`SymScalarRes`). -/
 def symEvalScalarRes (st : SymExecState) : ScalarExpr → SymScalarRes
   | .constU64 v => { val := { expr := .constU64 v, nonPoison := true, noUB := true } }
@@ -1070,23 +1135,7 @@ def symEvalScalarRes (st : SymExecState) : ScalarExpr → SymScalarRes
     else if rl.ubCond == .constBool false || rr.ubCond == .constBool false then
       { val := { expr := .unit, nonPoison := false, noUB := false }, ubCond := .constBool false }
     else
-      -- Honor `evalBinOp`'s exact concrete identity/idempotence cases BEFORE sort-based UB checks,
-      -- because `evalBinOp` permits `v + 0`, `0 + v`, `v - 0`, `v * 1`, `1 * v`, `v / 1`,
-      -- `v ||| 0`, `0 ||| v`, `v ^^^ 0`, `0 ^^^ v`, `v <<< 0`, `v >>> 0` for any `Val`, and
-      -- `v1 &&& v2` / `v1 ||| v2` whenever `v1 == v2`!
-      let identityShortCircuit? : Option SymExpr :=
-        match op, sl.expr, sr.expr with
-        | .add, x, .constU64 0 | .add, .constU64 0, x
-        | .sub, x, .constU64 0
-        | .mul, x, .constU64 1 | .mul, .constU64 1, x
-        | .div, x, .constU64 1
-        | .bitOr, x, .constU64 0 | .bitOr, .constU64 0, x
-        | .bitXor, x, .constU64 0 | .bitXor, .constU64 0, x
-        | .shl, x, .constU64 0
-        | .shr, x, .constU64 0 => some x
-        | .bitAnd, x, y | .bitOr, x, y => if x == y then some x else none
-        | _, _, _ => none
-      match identityShortCircuit? with
+      match symBinOpIdentityShortCircuit? op sl.expr sr.expr with
       | some idExpr => mkOk idExpr
       | none =>
         let sortL := symExprScalarSort? st sl.expr
@@ -2271,6 +2320,8 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
   match fuel with
   | 0 => (st.markExhausted, .unit)
   | fuel' + 1 =>
+    let loopBound := unrollBound
+    let retExpand := expandRetHeap
     match code with
     | .letBind dst ty val k =>
       match val with
@@ -2712,9 +2763,9 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
           | some 1 => stInit0.markU64Var accVar
           | some 2 => stInit0.markU256Var accVar
           | _ => stInit0
-      let stAfterLoop := symExecLoopUnroll unrollBound 0 idxVar accVar ((stInit.clearVarSortTags idxVar).markU64Var idxVar)
-        (fun s => symExecCode fuel' unrollBound s stepBody false)
-      symExecCode fuel' unrollBound stAfterLoop k expandRetHeap
+      let stAfterLoop := symExecLoopUnroll loopBound 0 idxVar accVar ((stInit.clearVarSortTags idxVar).markU64Var idxVar)
+        (fun s => symExecCode fuel' loopBound s stepBody false)
+      symExecCode fuel' loopBound stAfterLoop k retExpand
     | .parFor outVar _lenVar inputs _elemTy _kernel k =>
       let stInputs := inputs.foldl (fun cur iv =>
         let r := cur.resolveBuf iv
@@ -2785,26 +2836,25 @@ private def maxLNIRCodeVarId : LNIRCode → VarId
   | .ret v => v
   | .unreachable => 0
 
-private def declSynVarBase (d : LNIRDecl) : VarId :=
+def declSynVarBase (d : LNIRDecl) : VarId :=
   let paramMax := d.params.foldl (fun acc p => Nat.max acc p.id) 0
   let codeMax := maxLNIRCodeVarId d.body
   Nat.max 30000 (Nat.max paramMax codeMax + 1024)
 
-def initTupleParamExpr (d : Nat) (nextSubId : VarId) :
-    LNIRType → SymExpr × VarId × List VarId × List VarId × List VarId
-  | .i1 => (.symVar nextSubId, nextSubId + 1, [nextSubId], [], [])
-  | .u256 | .i256 => (.symVar nextSubId, nextSubId + 1, [], [], [nextSubId])
-  | .i8 | .i16 | .i32 | .i64 | .usize | .f32 | .f64 =>
+def initTupleParamExpr (d : Nat) (nextSubId : VarId) (ty : LNIRType) :
+    SymExpr × VarId × List VarId × List VarId × List VarId :=
+  match ty, d with
+  | .i1, _ => (.symVar nextSubId, nextSubId + 1, [nextSubId], [], [])
+  | .u256, _ | .i256, _ => (.symVar nextSubId, nextSubId + 1, [], [], [nextSubId])
+  | .i8, _ | .i16, _ | .i32, _ | .i64, _ | .usize, _ | .f32, _ | .f64, _ =>
     (.symVar nextSubId, nextSubId + 1, [], [nextSubId], [])
-  | .tuple fs =>
-    match d with
-    | 0 => (.symVar nextSubId, nextSubId + 1, [], [], [])
-    | d' + 1 =>
-      let (fExprs, curId, bs, us, ws) := fs.foldl (fun (accE, cid, accB, accU, accW) fTy =>
-        let (fe, cid', b', u', w') := initTupleParamExpr d' cid fTy
-        (accE ++ [fe], cid', accB ++ b', accU ++ u', accW ++ w')) ([], nextSubId, [], [], [])
-      (.tuple fExprs, curId, bs, us, ws)
-  | _ => (.symVar nextSubId, nextSubId + 1, [], [], [])
+  | .tuple _, 0 => (.symVar nextSubId, nextSubId + 1, [], [], [])
+  | .tuple fs, d' + 1 =>
+    let (fExprs, curId, bs, us, ws) := fs.foldl (fun (accE, cid, accB, accU, accW) fTy =>
+      let (fe, cid', b', u', w') := initTupleParamExpr d' cid fTy
+      (accE ++ [fe], cid', accB ++ b', accU ++ u', accW ++ w')) ([], nextSubId, [], [], [])
+    (.tuple fExprs, curId, bs, us, ws)
+  | _, _ => (.symVar nextSubId, nextSubId + 1, [], [], [])
 
 /-- Run symbolic execution on an `LNIRDecl` with initial symbolic parameters. -/
 def symExecDecl (loopUnrollBound : Nat := 4) (d : LNIRDecl) (synBaseOverride? : Option VarId := none) : SymExecSummary :=
@@ -3041,7 +3091,8 @@ def checkSingleSample (fuel : Nat) (env : VarEnv) (st : HeapState) (src tgt : LN
 def checkConcreteSamples (fuel : Nat) (samples : List (VarEnv × HeapState)) (src tgt : LNIRCode) : Bool :=
   samples.all (fun (env, st) => checkSingleSample fuel env st src tgt)
 
-/-- Evaluate `src` and `tgt` declarations across `numSamples` (default 64) concrete input states. -/
+/-- Evaluate `src` and `tgt` declarations across `numSamples` (default 64) concrete input states.
+    Evaluator fuel / RC-release exhaustion on the source (`srcExhausted`) is treated as an incomplete analysis, never source UB. -/
 def checkDeclConcreteRefinement (src tgt : LNIRDecl) (numSamples : Nat := 64) (fuel : Nat := 128) :
     Bool × Nat :=
   let effFuel := Nat.max fuel 256
@@ -3049,7 +3100,6 @@ def checkDeclConcreteRefinement (src tgt : LNIRDecl) (numSamples : Nat := 64) (f
   let (passedCount, nonVacuousCount) := samples.foldl (fun (acc, okSrc) (env, st) =>
     let srcRes := evalCode effFuel env st src.body
     let srcOk := match srcRes with | .ok _ => true | .error _ => false
-    -- C6.3: evaluator fuel / RC-release exhaustion on the source is an incomplete analysis, never "source UB"
     let srcExhausted := match srcRes with | .error .fuelExhausted => true | _ => false
     let stepOk := !srcExhausted && checkSingleSample effFuel env st src.body tgt.body
     (if stepOk then acc + 1 else acc, if srcOk && stepOk then okSrc + 1 else okSrc)) (0, 0)
@@ -3089,6 +3139,7 @@ structure TVModuleReport where
     When `src == tgt` (an unmodified declaration with zero transformation), `CodeRefines.refl` holds
     syntactically, so we need only verify multi-point concrete reflexive behavior unless `src != tgt`. -/
 def validateTranslationDecl (src tgt : LNIRDecl) (numSamples : Nat := 64) : TVDeclResult :=
+  let (concreteOk, passedSamples) := checkDeclConcreteRefinement src tgt numSamples 128
   let sharedSynBase := Nat.max (declSynVarBase src) (declSynVarBase tgt)
   let sSrc := symExecDecl 4 src (some sharedSynBase)
   let sTgt := symExecDecl 4 tgt (some sharedSynBase)
@@ -3118,9 +3169,7 @@ def validateTranslationDecl (src tgt : LNIRDecl) (numSamples : Nat := 64) : TVDe
     normSymExpr sSrc.retVal == normSymExpr sTgt.retVal ||
     normSymExpr (SymExecState.hoistIteTupleFuel 16
       (normSymIteStep scUb (normSymBinOpStep .eq sSrc.retVal sTgt.retVal) (.constBool true))) == .constBool true
-  -- 5. Multi-point concrete refinement across 64 deterministic input states (fail closed when all samples are UB)
-  let (concreteOk, passedSamples) := checkDeclConcreteRefinement src tgt numSamples 128
-  -- 6. Memory / buffer write log & RC-delta equivalence (set-equivalent per `(root, idx)` on all defined source paths)
+  -- 5. Memory / buffer write log & RC-delta equivalence (set-equivalent per `(root, idx)` on all defined source paths)
   let eqOnDefinedPaths (a b : SymExpr) : Bool :=
     let na := normSymExpr a
     let nb := normSymExpr b
