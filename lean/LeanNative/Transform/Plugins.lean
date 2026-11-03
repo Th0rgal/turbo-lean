@@ -121,11 +121,11 @@ def builtinSuperoptPlugin (target : SuperoptTarget) (d : LNIRDecl) : Option (LNI
   else
     some (d', {
       pluginName := "builtin:enumerative-superopt"
-      kind := "builtin_superopt"
-      theoremOrRule := "LeanNative.Spec.untrusted_opt_plugin_tv_gate_sound"
+      kind := "builtin_verified"
+      theoremOrRule := "LeanNative.Proofs.superoptDecl_sound"
       costBefore := declScalarCost target d
       costAfter := declScalarCost target d'
-      notes := s!"Synthesized {rewrites.length} cost-guided rewrites"
+      notes := s!"Synthesized {rewrites.length} kernel-verified cost-guided rewrites"
     })
 
 /-- Check that a `ScalarExpr` contains no division or modulo operations so eager evaluation inside

@@ -1,5 +1,6 @@
 import LeanNative.IR.Types
 import LeanNative.IR.AST
+import LeanNative.Proofs.SymbolicTVRefinesSoundness
 import LeanNative.Transform.Pass
 import LeanNative.Transform.EqSat
 import LeanNative.Transform.LoopSchedule
@@ -257,6 +258,22 @@ def loopVectorizeOptPass : TransformPass where
            changed := inHash != outHash || d != d', assurance := stepAssurance,
            theoremRef := stepThmRef,
            notes := stepNotes })
+
+/-- Verified TV pass contract (`Contract V2`) for `UnboxTupleSROA` gated by `symbolicCodeRefines`. -/
+def verifiedUnboxTupleSROATVContract : VerifiedTVPassContract where
+  name       := "UnboxTupleSROA"
+  theoremRef := "LeanNative.Proofs.SymbolicTVRefinesSoundness.symbolicValidatedDeclOpt_sound"
+  notes      := "Tuple SROA projection forwarding and dead tuple elimination gated by symbolicCodeRefines_sound"
+  run        := LeanNative.Proofs.runSymbolicValidatedDecl unboxTupleSROADecl
+  sound      := LeanNative.Proofs.symbolicValidatedDeclOpt_sound unboxTupleSROADecl
+
+/-- Verified TV pass contract (`Contract V2`) for `LoopVectorizeOpt` gated by `symbolicCodeRefines`. -/
+def verifiedLoopVectorizeTVContract : VerifiedTVPassContract where
+  name       := "LoopVectorizeOpt"
+  theoremRef := "LeanNative.Proofs.SymbolicTVRefinesSoundness.symbolicValidatedDeclOpt_sound"
+  notes      := "Loop FMA contraction and read-only borrow region optimization gated by symbolicCodeRefines_sound"
+  run        := LeanNative.Proofs.runSymbolicValidatedDecl (fun d => (loopVectorizeOptDecl d).1)
+  sound      := LeanNative.Proofs.symbolicValidatedDeclOpt_sound (fun d => (loopVectorizeOptDecl d).1)
 
 /-- Kernel-verified pass pipeline (`Contract V2` / `P3` baseline): every pass is a `VerifiedCodePassContract`
     backed by an unconditional Lean 4 kernel theorem `∀ c, CodeRefines c (runCode c)`. -/

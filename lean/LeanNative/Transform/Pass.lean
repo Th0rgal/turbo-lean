@@ -19,6 +19,24 @@ structure VerifiedCodePassContract where
   runCode    : LNIRCode → LNIRCode
   sound      : ∀ c : LNIRCode, CodeRefines c (runCode c)
 
+/-- Declaration-level proof-carrying transformation contract (`Contract V2`).
+    Requires a machine-checked Lean 4 kernel proof of `∀ d, CodeRefines d.body (run d).body`. -/
+structure VerifiedTransformContract where
+  name       : String
+  theoremRef : String
+  notes      : String
+  run        : LNIRDecl → LNIRDecl
+  sound      : ∀ d : LNIRDecl, CodeRefines d.body (run d).body
+
+/-- Translation-validated partial transformation contract (`Contract V2`).
+    Requires a machine-checked Lean 4 kernel proof of `∀ d d', run d = some d' → CodeRefines d.body d'.body`. -/
+structure VerifiedTVPassContract where
+  name       : String
+  theoremRef : String
+  notes      : String
+  run        : LNIRDecl → Option LNIRDecl
+  sound      : ∀ (d d' : LNIRDecl), run d = some d' → CodeRefines d.body d'.body
+
 /-- Per-declaration transformation step certificate emitted by an optimization pass. -/
 structure PassStepCert where
   passName   : String
@@ -75,6 +93,73 @@ theorem ofVerifiedContract_body_refines (vc : VerifiedCodePassContract) (d : LNI
     CodeRefines d.body ((ofVerifiedContract vc).runDecl d).1.body := by
   simp only [ofVerifiedContract]
   exact vc.sound d.body
+
+/-- Construct a `.verifiedKernelProof` `TransformPass` from a `VerifiedTransformContract`. -/
+def ofVerifiedTransformContract (vc : VerifiedTransformContract) : TransformPass where
+  name := vc.name
+  assurance := .verifiedKernelProof
+  theoremRef := vc.theoremRef
+  runDecl := fun d =>
+    let inHash := d.structuralHash
+    let cand := vc.run d
+    let combinedAssurance := AssuranceLevel.combine d.assurance .verifiedKernelProof
+    let d' : LNIRDecl := { cand with assurance := combinedAssurance }
+    let outHash := d'.structuralHash
+    let changed := inHash != outHash || d.body != d'.body
+    (d', {
+      passName := vc.name, declName := d.name, inputHash := inHash, outputHash := outHash,
+      changed := changed, assurance := combinedAssurance, theoremRef := vc.theoremRef, notes := vc.notes
+    })
+
+theorem ofVerifiedTransformContract_body_refines (vc : VerifiedTransformContract) (d : LNIRDecl) :
+    CodeRefines d.body ((ofVerifiedTransformContract vc).runDecl d).1.body := by
+  simp only [ofVerifiedTransformContract]
+  exact vc.sound d
+
+/-- Construct a `TransformPass` from a kernel-proven `VerifiedTVPassContract` (`Contract V2`).
+    When `vc.run d = some cand`, `vc.sound d cand` discharges `CodeRefines d.body cand.body`;
+    when `vc.run d = none`, the pass falls back to `d` via `CodeRefines.refl`. -/
+def ofVerifiedTVPassContract (vc : VerifiedTVPassContract)
+    (branchAssurance : AssuranceLevel := .translationValidated) : TransformPass where
+  name := vc.name
+  assurance := branchAssurance
+  theoremRef := vc.theoremRef
+  runDecl := fun d =>
+    let inHash := d.structuralHash
+    match vc.run d with
+    | some cand =>
+      let unchanged := cand.body == d.body
+      let stepAssurance := if unchanged then AssuranceLevel.verifiedKernelProof else branchAssurance
+      let stepRef := if unchanged then "LeanNative.Semantics.CodeRefines.refl" else vc.theoremRef
+      let effAssurance := AssuranceLevel.combine d.assurance stepAssurance
+      let d' : LNIRDecl := { cand with assurance := effAssurance }
+      let outHash := d'.structuralHash
+      let changed := inHash != outHash || d.body != d'.body
+      (d', {
+        passName := vc.name, declName := d.name, inputHash := inHash, outputHash := outHash,
+        changed := changed, assurance := effAssurance, theoremRef := stepRef, notes := vc.notes
+      })
+    | none =>
+      let effAssurance := AssuranceLevel.combine d.assurance .verifiedKernelProof
+      let d' : LNIRDecl := { d with assurance := effAssurance }
+      let outHash := d'.structuralHash
+      (d', {
+        passName := vc.name, declName := d.name, inputHash := inHash, outputHash := outHash,
+        changed := false, assurance := effAssurance,
+        theoremRef := "LeanNative.Semantics.CodeRefines.refl",
+        notes := s!"{vc.notes} (TV contract rejected candidate; preserved original via CodeRefines.refl)"
+      })
+
+/-- Machine-checked theorem: every declaration transformed by `TransformPass.ofVerifiedTVPassContract`
+    satisfies `CodeRefines d.body ((ofVerifiedTVPassContract vc branchAssurance).runDecl d).1.body`. -/
+theorem ofVerifiedTVPassContract_body_refines (vc : VerifiedTVPassContract)
+    (branchAssurance : AssuranceLevel) (d : LNIRDecl) :
+    CodeRefines d.body ((ofVerifiedTVPassContract vc branchAssurance).runDecl d).1.body := by
+  unfold ofVerifiedTVPassContract
+  dsimp only []
+  cases hrun : vc.run d with
+  | none => exact CodeRefines.refl d.body
+  | some cand => exact vc.sound d cand hrun
 
 /-- Construct a hybrid verified `TransformPass` backed by a kernel-proven `VerifiedCodePassContract`
     baseline (`vc`) and an extended candidate rewriter (`extCode`) gated by `SymbolicTV.validateTranslationDecl`:

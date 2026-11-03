@@ -11,6 +11,11 @@ import LeanNative.Proofs.LCNFBridgeProofs
 import LeanNative.Proofs.BackendProofs
 import LeanNative.Proofs.KernelElabProofs
 import LeanNative.Proofs.SymbolicTV
+import LeanNative.Proofs.SymbolicTVDenote
+import LeanNative.Proofs.SymbolicTVSoundness
+import LeanNative.Proofs.SymbolicTVCodeSoundness
+import LeanNative.Proofs.SymbolicTVRefinesSoundness
+import LeanNative.Proofs.SuperoptSoundness
 import LeanNative.Proofs.CertChecker
 import LeanNative.Proofs.MutantSuite
 import LeanNative.Transform.EqSat
@@ -330,6 +335,20 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.hlo_mutant_h1_killed
   , ``LeanNative.Proofs.hlo_mutant_h2_killed
   , ``LeanNative.Proofs.hlo_mutant_h3_killed
+  , ``LeanNative.Proofs.normSymBinOpStep_u64_denotes, ``LeanNative.Proofs.normSymExpr_pureU64_denotes
+  , ``LeanNative.Proofs.symEvalScalarRes_pureU64_sound
+  , ``LeanNative.Proofs.symExecCode_pureU64_denotes, ``LeanNative.Proofs.symExecCode_pureU64_eval_eq
+  , ``LeanNative.Proofs.symExecCode_pureU64_codeRefines_on_u64Env
+  , ``LeanNative.Proofs.symbolicCodeRefinesAux_sound, ``LeanNative.Proofs.symbolicCodeRefines_sound
+  , ``LeanNative.Proofs.symbolicValidatedDeclOpt_sound
+  , ``LeanNative.Proofs.validateTranslationDeclSound_of_passed
+  , ``LeanNative.Proofs.checkSingleSample_sound
+  , ``LeanNative.Proofs.checkSuperoptScalarVerified_sound
+  , ``LeanNative.Proofs.superoptScalarExprCore_sound, ``LeanNative.Proofs.superoptScalarExpr_sound
+  , ``LeanNative.Proofs.superoptCodeCore_sound, ``LeanNative.Proofs.superoptCode_sound
+  , ``LeanNative.Proofs.superoptDeclCore_sound, ``LeanNative.Proofs.superoptDecl_sound
+  , ``LeanNative.Proofs.superoptModuleCore_sound, ``LeanNative.Proofs.superoptModule_sound
+  , ``LeanNative.Proofs.superoptModuleWithProfile_sound
   ]
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/
@@ -386,7 +405,7 @@ elab "#verify_lean_native_axioms" : command => do
 
 #verify_lean_native_axioms
 
-private abbrev escapeJsonStr := LeanNative.IR.jsonEscape
+abbrev escapeJsonStr := LeanNative.IR.jsonEscape
 
 def TheoremAxiomAudit.toJson (t : TheoremAxiomAudit) : String :=
   let q (xs : List String) := String.intercalate "," (xs.map (fun a => s!"\"{escapeJsonStr a}\""))

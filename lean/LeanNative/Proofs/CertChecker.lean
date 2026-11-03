@@ -72,7 +72,17 @@ def verifiedTheoremRegistry : List String :=
     "unboxedLoopStep_sound", "unboxedLoopAccumulator_sim", "normSymExpr_constU64",
     "normSymExpr_constBool", "normSymExpr_const_sound", "checkSingleSample_of_codeRefines",
     "checkConcreteSamples_of_codeRefines", "sound_of_checkSingleSample_eq_true",
-    "symbolicTV_refl_sound", "applyExprRules_sound", "applyRewriteTable_sound",
+    "symbolicTV_refl_sound", "validateTranslationDeclSound_of_passed",
+    "symEvalScalarRes_pureU64_sound", "normSymExpr_pureU64_denotes",
+    "symExecCode_pureU64_denotes", "symExecCode_pureU64_eval_eq",
+    "symExecCode_pureU64_codeRefines_on_u64Env",
+    "symbolicCodeRefinesAux_sound", "symbolicCodeRefines_sound",
+    "symbolicValidatedDeclOpt_sound",
+    "checkSuperoptScalarVerified_sound", "superoptScalarExprCore_sound",
+    "superoptScalarExpr_sound", "superoptCodeCore_sound", "superoptCode_sound",
+    "superoptDeclCore_sound", "superoptDecl_sound", "superoptModuleCore_sound",
+    "superoptModule_sound", "superoptModuleWithProfile_sound",
+    "applyExprRules_sound", "applyRewriteTable_sound",
     "scheduleStructuredLoop_sound", "applyLoopScheduleAux_refines",
     "elideAndMutateRC_sound", "rewriteCodeVerified_refines", "rewriteLNIRExprVerified_sound",
     "contractKernelScalar_sound", "specializeKernelCode_refines", "fuseMapScaleAddPair_algebra",
@@ -128,6 +138,16 @@ def verifiedTheoremRegistry : List String :=
   (proofs.map ("LeanNative.Proofs.PeepholeProofs." ++ ·)) ++
   (proofs.map ("LeanNative.Proofs.LoopOptProofs." ++ ·)) ++
   (proofs.map ("LeanNative.Proofs.SymbolicTV." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SymbolicTVUnarySoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SymbolicTVBinOpSoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SymbolicTVSoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SymbolicTVCodeHelpers." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SymbolicTVCodeSoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SymbolicTVRefinesCtxSoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SymbolicTVRefinesDeadSoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SymbolicTVRefinesSoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SuperoptHelpersSoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.SuperoptSoundness." ++ ·)) ++
   (xform.map ("LeanNative.Transform." ++ ·)) ++
   (sem.map ("LeanNative.Semantics." ++ ·)) ++
   (spec.map ("LeanNative.Spec." ++ ·)) ++
@@ -228,7 +248,7 @@ def verifyModuleCerts (moduleName : String) (certs : List OptimizationCert) : Mo
 
 /-! ## JSON Serialization -/
 
-private abbrev escapeJsonString := LeanNative.IR.jsonEscape
+abbrev escapeJsonString := LeanNative.IR.jsonEscape
 
 def OptimizationCert.toJson (c : OptimizationCert) : String :=
   "{" ++
