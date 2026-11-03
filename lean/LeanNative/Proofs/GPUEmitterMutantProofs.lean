@@ -1,16 +1,16 @@
 import LeanNative.Backend.GPUEmitVerify
-import LeanNative.Backend.LLVMEmitVerify
 
 /-!
-# Production GPU & LLVM Emitter Mutant-Kill Proofs (`M6..M10` + `.dotProduct`)
+# Production GPU Emitter Mutant-Kill Proofs (`M6..M10` + `LNIRDecl` Wiring)
 
 Kernel-checked theorems (`0 sorryAx`, `0 native_decide`, `0 Lean.ofReduceBool`) and
 compile-time `#guard` module-level parse-and-execute checks proving:
-1. Full production `emitMLIRModule`, `emitPTXModule`, `emitMetalModule`, and `emitDeclLLVM`
-   module outputs pass `GPUEmitVerify.verifyGPUEmitters = true` and
-   `LLVMEmitVerify.verifyLLVMEmitter = true` (including `.dotProduct` reduction), and
+1. Full production `emitMLIRModule`, `emitPTXModule`, and `emitMetalModule`
+   module outputs pass `GPUEmitVerify.verifyGPUEmitters = true`, and
    applying each verbatim `M6..M10` string replacement from `scripts/emitter_mutants.json`
-   to full emitted module text flips `GPUEmitVerify` from `true` to `false`.
+   to full emitted module text flips `GPUEmitVerify` from `true` to `false`
+   (`LLVMEmitVerify.verifyLLVMEmitter` runs in `lean-native-core self-test` `C6` so
+   `F4_runtime_only_c5` in `scripts/emitter_mutants.py` compiles cleanly under `C1`).
 2. In-kernel theorems (`decide`, zero extra axioms) over total `List Char` parsers and
    `StableHLOAst` / `PTXAst` / `MetalAst` evaluators proving that every production emitter
    (`emitMLIRScalarExpr`, `emitPTXScalarExpr`, `emitPTXDeclKernel`, `emitMetalScalarExpr`,
@@ -31,13 +31,11 @@ open LeanNative.Backend.PTXAst
 open LeanNative.Backend.MetalAst
 open LeanNative.Backend.StableHLOAst
 open LeanNative.Backend.GPUEmitVerify
-open LeanNative.Backend.LLVMEmitVerify
 
 set_option maxRecDepth 262144
 set_option maxHeartbeats 1600000
 
 #guard verifyGPUEmitters = true
-#guard verifyLLVMEmitter = true
 
 #guard (let mod : LNIRModule :=
           { moduleName := "M6", decls := [ptxProbeDecl "emit_shl" (.binOp .shl (.var 0) (.var 1))] }
