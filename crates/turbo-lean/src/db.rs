@@ -1634,6 +1634,24 @@ impl TurboStore {
         Ok(Some(entries))
     }
 
+    pub(crate) fn get_cached_action_duration_ms(
+        &self,
+        action_key: &str,
+        trust_domain: &str,
+    ) -> Option<u64> {
+        let dur: Option<i64> = self
+            .conn
+            .prepare_cached(
+                "SELECT duration_ms
+                 FROM actions
+                 WHERE action_key = ?1 AND trust_domain = ?2 AND status = 'completed' AND kind = 'module_unit'",
+            )
+            .and_then(|mut st| st.query_row(params![action_key, trust_domain], |r| r.get(0)).optional())
+            .ok()
+            .flatten();
+        dur.filter(|&d| d > 0).map(|d| d as u64)
+    }
+
     pub fn get_cached_action(
         &self,
         action_key: &str,

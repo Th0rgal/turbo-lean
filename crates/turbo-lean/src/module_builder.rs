@@ -13,7 +13,8 @@ use crate::lake_build;
 use crate::splitter;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -15310,9 +15311,10 @@ fn build_module_compile_command(
 }
 
 type ModuleCompileOutput = (i64, String, String);
+type StagedModuleCompileOutput = (i64, String, TempDirGuard);
 
 #[allow(clippy::too_many_arguments)]
-fn compile_single_module_direct(
+fn compile_single_module_staged(
     cfg: &ProjectConfig,
     dag: &ModuleDag,
     node: &ModuleNode,
@@ -15321,8 +15323,12 @@ fn compile_single_module_direct(
     is_untrusted: bool,
     bwrap_bin: Option<&Path>,
     preserve_lake: bool,
-) -> Result<ModuleCompileOutput> {
+) -> Result<StagedModuleCompileOutput> {
     let t0 = Instant::now();
+    record_scheduler_test_event(
+        "compile_subprocess_start",
+        std::slice::from_ref(&node.module_name),
+    );
     let pid = std::process::id();
     let seq = crate::pack::next_tmp_id();
     let build_root = node.pkg_root.join(".lake/build");
@@ -15336,7 +15342,7 @@ fn compile_single_module_direct(
     ));
     let _ = fs::remove_dir_all(&tmp_dir);
     fs::create_dir_all(&tmp_dir)?;
-    let _tmp_guard = TempDirGuard(tmp_dir.clone());
+    let tmp_guard = TempDirGuard(tmp_dir.clone());
     let tmp_olean = tmp_dir.join(format!("{}.olean", rel_slash));
     let tmp_ilean = tmp_dir.join(format!("{}.ilean", rel_slash));
     let tmp_c = tmp_dir.join(format!("{}.c", rel_slash));
@@ -15384,6 +15390,10 @@ fn compile_single_module_direct(
             node.module_name
         )
     })?;
+    record_scheduler_test_event(
+        "compile_subprocess_end",
+        std::slice::from_ref(&node.module_name),
+    );
     let stdout_str = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr_str = String::from_utf8_lossy(&output.stderr).to_string();
     if !output.status.success() {
@@ -15395,7 +15405,6 @@ fn compile_single_module_direct(
             stderr_str.trim()
         );
     }
-    // Match the prefix: `pp.*` options change how the `sorry` term itself prints.
     if stdout_str.contains("declaration uses ") || stderr_str.contains("declaration uses ") {
         anyhow::bail!(
             "Native Lean compilation rejected module `{}` ({}) due to `sorry` axiom usage",
@@ -15405,8 +15414,6 @@ fn compile_single_module_direct(
     }
     let tmp_srv = PathBuf::from(format!("{}.server", tmp_olean.display()));
     let tmp_priv = PathBuf::from(format!("{}.private", tmp_olean.display()));
-    let tmp_ir = tmp_olean.with_extension("ir");
-    let tmp_ir_sig = PathBuf::from(format!("{}.sig", tmp_ir.display()));
     let is_regular_nonempty_in_tmp =
         |p: &Path| -> bool { p.starts_with(&tmp_dir) && is_regular_nonempty_file(p) };
     let has_olean = is_regular_nonempty_in_tmp(&tmp_olean);
@@ -15436,8 +15443,26 @@ fn compile_single_module_direct(
             has_c
         );
     }
+    let dur_ms = t0.elapsed().as_millis() as i64;
+    Ok((dur_ms, stdout_str, tmp_guard))
+}
+
+fn publish_staged_module_compile_output(
+    node: &ModuleNode,
+    staged: StagedModuleCompileOutput,
+) -> Result<ModuleCompileOutput> {
+    let (dur_ms, stdout_str, tmp_guard) = staged;
+    let tmp_dir = &tmp_guard.0;
+    let rel_slash = module_name_to_rel_slash(&node.module_name);
+    let tmp_olean = tmp_dir.join(format!("{}.olean", rel_slash));
+    let tmp_ilean = tmp_dir.join(format!("{}.ilean", rel_slash));
+    let tmp_c = tmp_dir.join(format!("{}.c", rel_slash));
+    let tmp_srv = PathBuf::from(format!("{}.server", tmp_olean.display()));
+    let tmp_priv = PathBuf::from(format!("{}.private", tmp_olean.display()));
+    let tmp_ir = tmp_olean.with_extension("ir");
+    let tmp_ir_sig = PathBuf::from(format!("{}.sig", tmp_ir.display()));
     publish_module_artifacts_atomic(
-        &tmp_dir,
+        tmp_dir,
         node,
         &tmp_olean,
         &tmp_ilean,
@@ -15448,7 +15473,6 @@ fn compile_single_module_direct(
         &tmp_c,
     )?;
     let expected_dig = compute_olean_artifact_set_digest(&node.olean_path)?;
-    let dur_ms = t0.elapsed().as_millis() as i64;
     Ok((dur_ms, stdout_str, expected_dig))
 }
 
@@ -15465,6 +15489,7 @@ fn cas_outputs_bound_to_node(outputs: &[BlobEntry], target_root: &Path, node: &M
         .all(|o| expected.contains(&target_root.join(&o.rel_path)))
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn store_module_artifacts_in_cas(
     store: &mut TurboStore,
@@ -15521,33 +15546,6 @@ fn store_module_artifacts_in_cas(
         }
         SingleflightOutcome::CacheHit { outputs, .. } => Ok(outputs),
     }
-}
-
-/// Gate for every compiled or CAS-materialized module before anything may import it: untrusted
-/// builds and root-package modules get the full in-kernel policy audit (which includes the
-/// independent kernel replay); trusted dependency modules get the independent kernel replay.
-/// Toolchain modules never enter the DAG and stay trusted.
-fn audit_or_replay_modules(
-    store: &TurboStore,
-    cfg: &ProjectConfig,
-    dag: &ModuleDag,
-    mod_names: &[String],
-    lean_path_env: &str,
-    is_untrusted: bool,
-) -> Result<()> {
-    let (audit, replay): (Vec<String>, Vec<String>) = mod_names
-        .iter()
-        .cloned()
-        .partition(|m| is_untrusted || dag.nodes.get(m).is_none_or(|n| n.is_root_pkg));
-    crate::zygote::audit_compiled_modules_with_zygote(
-        store,
-        cfg,
-        &audit,
-        lean_path_env,
-        &[],
-        is_untrusted,
-    )?;
-    crate::zygote::kernel_replay_modules_with_zygote(store, cfg, &replay, lean_path_env)
 }
 
 /// `check` / trusted `pr-verify` gate: every non-toolchain `.olean` that `target_files`
@@ -16396,6 +16394,658 @@ fn probe_warm_on_disk_module_candidate(
 /// Orchestrate native Lean module compilation across the resolved DAG without invoking `lake build`.
 /// Uses per-module CAS (`module_unit`), bounded worker parallelism (`jobs`), temporary output
 /// directories, and atomic publication.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct NativeSchedulerTestEvent {
+    pub kind: String,
+    pub modules: Vec<String>,
+    pub at_ns: u64,
+}
+
+#[cfg(test)]
+type NativeSchedulerTestHook = dyn Fn(&str, &[String]) + Send + Sync;
+
+#[cfg(test)]
+static TEST_NATIVE_SCHEDULER_EVENTS: OnceLock<Mutex<Option<Vec<NativeSchedulerTestEvent>>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static TEST_NATIVE_SCHEDULER_HOOK: OnceLock<
+    Mutex<Option<std::sync::Arc<NativeSchedulerTestHook>>>,
+> = OnceLock::new();
+
+#[cfg(test)]
+static TEST_NATIVE_SCHEDULER_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+fn record_scheduler_test_event(kind: &str, modules: &[String]) {
+    #[cfg(test)]
+    {
+        let hook_opt = TEST_NATIVE_SCHEDULER_HOOK
+            .get()
+            .and_then(|l| l.lock().ok().and_then(|g| g.clone()));
+        if let Some(hook) = hook_opt {
+            hook(kind, modules);
+        }
+        let epoch = *TEST_NATIVE_SCHEDULER_EPOCH.get_or_init(Instant::now);
+        let at_ns = epoch.elapsed().as_nanos() as u64;
+        if let Some(lock) = TEST_NATIVE_SCHEDULER_EVENTS.get() {
+            if let Ok(mut guard) = lock.lock() {
+                if let Some(ref mut vec) = *guard {
+                    vec.push(NativeSchedulerTestEvent {
+                        kind: kind.to_string(),
+                        modules: modules.to_vec(),
+                        at_ns,
+                    });
+                }
+            }
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (kind, modules);
+    }
+}
+
+fn compute_dag_schedule_edges(
+    nodes: &BTreeMap<String, ModuleNode>,
+    shared_libs: &[SharedLibSpec],
+) -> (BTreeMap<String, usize>, BTreeMap<String, Vec<String>>) {
+    let mut shared_local_map: HashMap<(PathBuf, String), Vec<String>> = HashMap::new();
+    for s in shared_libs {
+        shared_local_map.insert(
+            (s.pkg_root.clone(), s.lib_name.clone()),
+            s.local_modules.clone(),
+        );
+    }
+    let mut in_degree: BTreeMap<String, usize> = BTreeMap::new();
+    let mut dependents: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (m, node) in nodes {
+        let deg = node
+            .direct_dag_deps
+            .iter()
+            .filter(|d| nodes.contains_key(*d))
+            .count();
+        in_degree.insert(m.clone(), deg);
+        for d in &node.direct_dag_deps {
+            if nodes.contains_key(d) {
+                dependents.entry(d.clone()).or_default().push(m.clone());
+            }
+        }
+    }
+    for list in dependents.values_mut() {
+        list.sort();
+        list.dedup();
+    }
+    for m in nodes.keys().cloned().collect::<Vec<_>>() {
+        let Some(node) = nodes.get(&m) else {
+            continue;
+        };
+        let node_in_shared = shared_libs
+            .iter()
+            .any(|s| s.local_modules.iter().any(|lm| lm == &m));
+        let mut visited_t: HashSet<String> = HashSet::new();
+        let mut stack_t: Vec<String> = node.direct_dag_deps.clone();
+        while let Some(dep_mod) = stack_t.pop() {
+            if !visited_t.insert(dep_mod.clone()) {
+                continue;
+            }
+            let Some(dn) = nodes.get(&dep_mod) else {
+                continue;
+            };
+            stack_t.extend(dn.direct_dag_deps.iter().cloned());
+            if !node.is_exe_target && !dn.is_exe_target && dn.target_name == node.target_name {
+                continue;
+            }
+            let is_direct_dep = node.direct_dag_deps.iter().any(|d| d == &dep_mod);
+            if !(node.precompile_modules
+                || dn.precompile_modules
+                || node_in_shared
+                || (node.needs_dynlib && is_direct_dep))
+                || dn.is_exe_target
+            {
+                continue;
+            }
+            let Some(locals) = shared_local_map.get(&(dn.pkg_root.clone(), dn.target_name.clone()))
+            else {
+                continue;
+            };
+            for local in locals {
+                if local == &m || !nodes.contains_key(local) {
+                    continue;
+                }
+                let already = dependents
+                    .get(local)
+                    .is_some_and(|list| list.iter().any(|c| c == &m));
+                if !already {
+                    *in_degree.entry(m.clone()).or_insert(0) += 1;
+                    dependents.entry(local.clone()).or_default().push(m.clone());
+                }
+            }
+        }
+    }
+    for list in dependents.values_mut() {
+        list.sort();
+        list.dedup();
+    }
+    (in_degree, dependents)
+}
+
+type ModuleDepAndDynlibDigests = (Vec<(String, String)>, Vec<PathBuf>, Vec<(String, String)>);
+
+fn gather_module_dep_digests_and_dynlibs(
+    dag: &ModuleDag,
+    node: &ModuleNode,
+    olean_digests: &HashMap<String, String>,
+) -> Result<ModuleDepAndDynlibDigests> {
+    let mut dep_digests_map: BTreeMap<String, String> = BTreeMap::new();
+    let mut dep_work: VecDeque<&str> = VecDeque::new();
+    for d in &node.direct_dag_deps {
+        dep_work.push_back(d);
+    }
+    for (ext_m, _) in &node.external_olean_deps {
+        if let Some(dig) = olean_digests.get(ext_m) {
+            dep_digests_map.insert(ext_m.clone(), dig.clone());
+        }
+    }
+    while let Some(cur_dep) = dep_work.pop_front() {
+        if dep_digests_map.contains_key(cur_dep) {
+            continue;
+        }
+        let dig = olean_digests.get(cur_dep).cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Internal DAG error: dependency `{}` of `{}` missing olean digest",
+                cur_dep,
+                node.module_name
+            )
+        })?;
+        dep_digests_map.insert(cur_dep.to_string(), dig);
+        if let Some(dep_node) = dag.nodes.get(cur_dep) {
+            for sub_d in &dep_node.direct_dag_deps {
+                if !dep_digests_map.contains_key(sub_d) {
+                    dep_work.push_back(sub_d);
+                }
+            }
+            for (ext_m, _) in &dep_node.external_olean_deps {
+                if let Some(edig) = olean_digests.get(ext_m) {
+                    dep_digests_map
+                        .entry(ext_m.clone())
+                        .or_insert_with(|| edig.clone());
+                }
+            }
+        }
+    }
+    let dep_digests_vec: Vec<(String, String)> = dep_digests_map.into_iter().collect();
+    let raw_imp_dynlibs = compute_module_raw_import_dynlibs(dag, node);
+    let mut dynlib_digests: Vec<(String, String)> = Vec::with_capacity(raw_imp_dynlibs.len());
+    for dp in &raw_imp_dynlibs {
+        let bytes = fs::read(dp).with_context(|| {
+            format!(
+                "Failed to read imported precompiled shared library `{}` for `{}`",
+                dp.display(),
+                node.module_name
+            )
+        })?;
+        let tag = dp
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("dynlib")
+            .to_string();
+        dynlib_digests.push((tag, blake3::hash(&bytes).to_hex().to_string()));
+    }
+    Ok((dep_digests_vec, raw_imp_dynlibs, dynlib_digests))
+}
+
+fn try_compute_initial_module_action_keys(
+    cfg: &ProjectConfig,
+    dag: &ModuleDag,
+    node: &ModuleNode,
+    preserve_project: bool,
+    ext_olean_digests: &HashMap<String, String>,
+    memo_on_disk_digests: &mut HashMap<String, Option<String>>,
+) -> Option<(String, Option<String>)> {
+    let mut dep_digests_map: BTreeMap<String, String> = BTreeMap::new();
+    let mut dep_work: VecDeque<&str> = VecDeque::new();
+    for d in &node.direct_dag_deps {
+        dep_work.push_back(d);
+    }
+    for (ext_m, _) in &node.external_olean_deps {
+        let dig = ext_olean_digests.get(ext_m)?;
+        dep_digests_map.insert(ext_m.clone(), dig.clone());
+    }
+    while let Some(cur_dep) = dep_work.pop_front() {
+        if dep_digests_map.contains_key(cur_dep) {
+            continue;
+        }
+        let dep_node = dag.nodes.get(cur_dep)?;
+        let dig_opt = if let Some(cached) = memo_on_disk_digests.get(cur_dep) {
+            cached.clone()
+        } else {
+            let preserve_dep = preserve_project
+                || crate::lake_build::worktree_auto_link_disabled(&dep_node.pkg_root);
+            let computed = if validate_materialized_module_artifacts(dep_node, preserve_dep) {
+                compute_olean_artifact_set_digest_with_policy(
+                    &dep_node.olean_path,
+                    preserve_project,
+                )
+                .ok()
+            } else {
+                None
+            };
+            memo_on_disk_digests.insert(cur_dep.to_string(), computed.clone());
+            computed
+        };
+        let dig = dig_opt?;
+        dep_digests_map.insert(cur_dep.to_string(), dig);
+        for sub_d in &dep_node.direct_dag_deps {
+            if !dep_digests_map.contains_key(sub_d) {
+                dep_work.push_back(sub_d);
+            }
+        }
+        for (ext_m, _) in &dep_node.external_olean_deps {
+            let edig = ext_olean_digests.get(ext_m)?;
+            dep_digests_map
+                .entry(ext_m.clone())
+                .or_insert_with(|| edig.clone());
+        }
+    }
+    let dep_digests_vec: Vec<(String, String)> = dep_digests_map.into_iter().collect();
+    let raw_imp_dynlibs = compute_module_raw_import_dynlibs(dag, node);
+    let mut dynlib_digests: Vec<(String, String)> = Vec::with_capacity(raw_imp_dynlibs.len());
+    for dp in &raw_imp_dynlibs {
+        let bytes = fs::read(dp).ok()?;
+        let tag = dp
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("dynlib")
+            .to_string();
+        dynlib_digests.push((tag, blake3::hash(&bytes).to_hex().to_string()));
+    }
+    let mod_key = compute_module_cas_key_with_dynlibs(
+        cfg,
+        node,
+        &dep_digests_vec,
+        node.needs_c,
+        &dynlib_digests,
+    )
+    .ok()?;
+    let fallback_c_key = if !node.needs_c {
+        compute_module_cas_key_with_dynlibs(cfg, node, &dep_digests_vec, true, &dynlib_digests).ok()
+    } else {
+        None
+    };
+    Some((mod_key, fallback_c_key))
+}
+
+fn compute_module_b_levels(
+    store: &TurboStore,
+    cfg: &ProjectConfig,
+    dag: &ModuleDag,
+    dependents: &BTreeMap<String, Vec<String>>,
+    trust_domain: &str,
+    preserve_project: bool,
+    ext_olean_digests: &HashMap<String, String>,
+) -> HashMap<String, u64> {
+    let mut memo_on_disk_digests: HashMap<String, Option<String>> = HashMap::new();
+    let mut weights: HashMap<String, u64> = HashMap::with_capacity(dag.nodes.len());
+    for (mod_name, node) in &dag.nodes {
+        let mut cached_dur: Option<u64> = None;
+        if let Some((mod_key, fallback_c_key)) = try_compute_initial_module_action_keys(
+            cfg,
+            dag,
+            node,
+            preserve_project,
+            ext_olean_digests,
+            &mut memo_on_disk_digests,
+        ) {
+            cached_dur = store.get_cached_action_duration_ms(&mod_key, trust_domain);
+            if cached_dur.is_none() {
+                if let Some(ref c_key) = fallback_c_key {
+                    cached_dur = store.get_cached_action_duration_ms(c_key, trust_domain);
+                }
+            }
+        }
+        let weight = cached_dur.unwrap_or_else(|| {
+            fs::metadata(&node.src_path)
+                .map(|m| m.len().max(1))
+                .unwrap_or(1)
+        });
+        weights.insert(mod_name.clone(), weight.max(1));
+    }
+    let mut b_levels: HashMap<String, u64> = HashMap::with_capacity(dag.nodes.len());
+    for mod_name in dag.topological_order.iter().rev() {
+        let w = weights.get(mod_name).copied().unwrap_or(1);
+        let max_dep = dependents
+            .get(mod_name)
+            .map(|deps| {
+                deps.iter()
+                    .filter_map(|v| b_levels.get(v).copied())
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0);
+        b_levels.insert(mod_name.clone(), w.saturating_add(max_dep));
+    }
+    b_levels
+}
+
+#[derive(Deserialize)]
+struct WorkerZygoteAuditReply {
+    ok: bool,
+    #[serde(default)]
+    audited: Option<Vec<String>>,
+    #[serde(default)]
+    violations: Vec<String>,
+}
+
+fn parse_worker_audit_reply(out: &std::process::Output, mod_names: &[String]) -> Result<()> {
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    let json_line = stdout_str
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| l.starts_with('{') && l.ends_with('}'))
+        .unwrap_or("");
+    let parsed: Option<WorkerZygoteAuditReply> = serde_json::from_str(json_line).ok();
+    match parsed {
+        Some(reply)
+            if out.status.success()
+                && reply.ok
+                && reply.violations.is_empty()
+                && reply.audited.as_deref() == Some(mod_names) =>
+        {
+            Ok(())
+        }
+        Some(reply) => {
+            let details = if reply.violations.is_empty() {
+                format!(
+                    "exit={} stdout={} stderr={}",
+                    out.status,
+                    stdout_str.trim(),
+                    stderr_str.trim()
+                )
+            } else {
+                reply.violations.join("\n")
+            };
+            anyhow::bail!(
+                "In-kernel `.olean` soundness audit rejected compiled artifact(s) ({:?}):\n{}",
+                mod_names,
+                details
+            );
+        }
+        None => {
+            anyhow::bail!(
+                "In-kernel `.olean` soundness auditor failed closed (exit={}, modules={:?}):\nstdout: {}\nstderr: {}",
+                out.status,
+                mod_names,
+                stdout_str.trim(),
+                stderr_str.trim()
+            );
+        }
+    }
+}
+
+fn scheduler_audit_batch_size() -> usize {
+    std::env::var("TURBO_LEAN_AUDIT_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(8)
+}
+
+fn run_audit_chunk_subprocess(
+    store_root: &Path,
+    cfg: &ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+    is_untrusted: bool,
+) -> Result<()> {
+    if mod_names.is_empty() || mod_names.iter().any(|m| m.trim().is_empty()) {
+        anyhow::bail!("In-kernel `.olean` audit received an empty module name: fail-closed");
+    }
+    record_scheduler_test_event("audit_subprocess_start", mod_names);
+    let (mut cmd, timeout) =
+        crate::zygote::kernel_reader_command(store_root, cfg, lean_path_env, &[], is_untrusted)?;
+    cmd.arg("--audit-modules");
+    for a in crate::zygote::pinned_ffi_allow_args(cfg, mod_names) {
+        cmd.arg(a);
+    }
+    for m in mod_names {
+        cmd.arg(m);
+    }
+    let out = run_command_with_timeout(&mut cmd, timeout, is_untrusted);
+    record_scheduler_test_event("audit_subprocess_end", mod_names);
+    match out.and_then(|o| parse_worker_audit_reply(&o, mod_names)) {
+        Ok(()) => Ok(()),
+        Err(_) if mod_names.len() > 1 => {
+            let mid = mod_names.len() / 2;
+            run_audit_chunk_subprocess(
+                store_root,
+                cfg,
+                &mod_names[..mid],
+                lean_path_env,
+                is_untrusted,
+            )?;
+            run_audit_chunk_subprocess(
+                store_root,
+                cfg,
+                &mod_names[mid..],
+                lean_path_env,
+                is_untrusted,
+            )
+        }
+        Err(e) => Err(e),
+    }
+}
+
+type AuditBatchWorkerOutcome = (Vec<String>, HashMap<String, Result<()>>);
+
+fn run_audit_or_replay_batch_worker(
+    store_root: &Path,
+    cfg: &ProjectConfig,
+    dag: &ModuleDag,
+    mod_names: &[String],
+    lean_path_env: &str,
+    is_untrusted: bool,
+) -> Result<AuditBatchWorkerOutcome> {
+    let (mut audit, replay): (Vec<String>, Vec<String>) = mod_names
+        .iter()
+        .cloned()
+        .partition(|m| is_untrusted || dag.nodes.get(m).is_none_or(|n| n.is_root_pkg));
+    audit.sort();
+    audit.dedup();
+    let mut replay_sorted = replay;
+    replay_sorted.sort();
+    replay_sorted.dedup();
+
+    let mut per_mod: HashMap<String, Result<()>> = HashMap::with_capacity(mod_names.len());
+    let mut replayed_for_store: Vec<String> = Vec::new();
+
+    for chunk in audit.chunks(scheduler_audit_batch_size()) {
+        match run_audit_chunk_subprocess(store_root, cfg, chunk, lean_path_env, is_untrusted) {
+            Ok(()) => {
+                for m in chunk {
+                    per_mod.insert(m.clone(), Ok(()));
+                    if !is_untrusted {
+                        replayed_for_store.push(m.clone());
+                    }
+                }
+            }
+            Err(chunk_err) => {
+                if chunk.len() == 1 {
+                    per_mod.insert(chunk[0].clone(), Err(chunk_err));
+                } else {
+                    for m in chunk {
+                        match run_audit_chunk_subprocess(
+                            store_root,
+                            cfg,
+                            std::slice::from_ref(m),
+                            lean_path_env,
+                            is_untrusted,
+                        ) {
+                            Ok(()) => {
+                                per_mod.insert(m.clone(), Ok(()));
+                                if !is_untrusted {
+                                    replayed_for_store.push(m.clone());
+                                }
+                            }
+                            Err(e) => {
+                                per_mod.insert(m.clone(), Err(e));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for m in &replay_sorted {
+        if m.trim().is_empty() {
+            per_mod.insert(
+                m.clone(),
+                Err(anyhow::anyhow!(
+                    "Kernel replay received an empty module name: fail-closed"
+                )),
+            );
+            continue;
+        }
+        record_scheduler_test_event("replay_subprocess_start", std::slice::from_ref(m));
+        let res = (|| -> Result<()> {
+            let (mut cmd, timeout) =
+                crate::zygote::kernel_reader_command(store_root, cfg, lean_path_env, &[], false)?;
+            cmd.args(["--kernel-replay-module", m.as_str()]);
+            let out = run_command_with_timeout(&mut cmd, timeout, false).context(
+                "Failed to execute independent kernel replay (`--kernel-replay-module`)",
+            )?;
+            anyhow::ensure!(
+                out.status.success(),
+                "[TurboLean.KernelReplay] independent kernel re-check of dependency `{}` failed (exit={}):\n{}",
+                m,
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+            Ok(())
+        })();
+        record_scheduler_test_event("replay_subprocess_end", std::slice::from_ref(m));
+        if res.is_ok() {
+            replayed_for_store.push(m.clone());
+        }
+        per_mod.insert(m.clone(), res);
+    }
+
+    Ok((replayed_for_store, per_mod))
+}
+
+fn record_replayed_modules_on_caller_thread(
+    store: &TurboStore,
+    cfg: &ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+) -> Result<()> {
+    if mod_names.is_empty() {
+        return Ok(());
+    }
+    let disallowed_roots = project_disallowed_replay_store_roots(cfg);
+    let dirs: Vec<PathBuf> = std::env::split_paths(lean_path_env).collect();
+    for m in mod_names {
+        let rel_slash = module_name_to_rel_slash(m);
+        let rel_olean = format!("{}.olean", rel_slash);
+        let Some(olean_path) = dirs
+            .iter()
+            .map(|d| d.join(&rel_olean))
+            .find(|p| p.is_file())
+        else {
+            continue;
+        };
+        let dig = compute_replayed_olean_ilean_digest(&olean_path).with_context(|| {
+            format!(
+                "Failed to compute post-replay `.olean`+`.ilean` digest for `{}`",
+                m
+            )
+        })?;
+        let env_dig = compute_olean_transitive_env_digest(cfg, lean_path_env, &olean_path)
+            .with_context(|| {
+                format!(
+                    "Failed to compute post-replay transitive import environment digest for `{}`",
+                    m
+                )
+            })?;
+        store.record_kernel_replayed_olean(
+            &dig,
+            &env_dig,
+            crate::zygote::ZYGOTE_REPLAY_VERSION,
+            &cfg.lean_githash,
+            m,
+            &disallowed_roots,
+        )?;
+    }
+    Ok(())
+}
+
+type StagedCasBlobItems = Vec<(String, Vec<u8>, String, String, u64)>;
+
+fn read_consistent_module_cas_blobs_locked(
+    canon_project_dir: &Path,
+    node: &ModuleNode,
+) -> Result<StagedCasBlobItems> {
+    let base_dir = if node.pkg_root.starts_with(canon_project_dir) {
+        canon_project_dir
+    } else {
+        &node.pkg_root
+    };
+    let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
+    let preserve_lake = crate::lake_build::worktree_auto_link_disabled(canon_project_dir)
+        || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
+    let _flock_guard = acquire_publish_flock_mode(&node.pkg_root, false, preserve_lake)?;
+    let artifact_files = collect_module_artifact_paths(node);
+    let paths: Vec<_> = artifact_files.iter().map(|(_, p)| p.clone()).collect();
+    _flock_guard.read_consistent(&paths, || {
+        let mut items = Vec::with_capacity(artifact_files.len());
+        for (kind, abs_path) in artifact_files {
+            let bytes = fs::read(&abs_path)?;
+            let sz = bytes.len() as u64;
+            let rel_path = abs_path
+                .strip_prefix(base_dir)
+                .unwrap_or(&abs_path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            items.push((String::new(), bytes, kind.to_string(), rel_path, sz));
+        }
+        Ok(items)
+    })
+}
+
+fn commit_staged_module_cas_entry(
+    store: &mut TurboStore,
+    mod_action_key: &str,
+    toolchain: &str,
+    trust_domain: &str,
+    pin_level: i64,
+    dur_ms: i64,
+    blob_items: StagedCasBlobItems,
+) -> Result<Vec<BlobEntry>> {
+    match store.acquire_singleflight(mod_action_key, toolchain, "module_unit", trust_domain)? {
+        SingleflightOutcome::Leader(lease) => {
+            let _pub_guard = crate::db::acquire_cas_publication_guard(&store.root)?;
+            let entries =
+                store.batch_store_immutable_blobs(&blob_items, trust_domain, pin_level)?;
+            if let Err(e) = store.publish_action(&lease, &entries, dur_ms, 0, 0, trust_domain) {
+                store.remove_singleflight_done(&lease.action_key);
+                drop(lease);
+                return Err(e);
+            }
+            Ok(entries)
+        }
+        SingleflightOutcome::CacheHit { outputs, .. } => Ok(outputs),
+    }
+}
+
+/// Orchestrate native Lean module compilation across the resolved DAG without invoking `lake build`.
+/// Uses per-module CAS (`module_unit`), bounded worker parallelism (`jobs`), temporary output
+/// directories, and atomic publication.
 #[allow(clippy::too_many_arguments)]
 pub fn build_project_modules_native(
     store: &mut TurboStore,
@@ -16501,279 +17151,654 @@ pub fn build_project_modules_native(
         )
         .context("External dependency `.olean` failed independent kernel replay")?;
     }
-    // Execute topological waves
+    // Pre-warm the Zygote kernel-reader binary on the caller thread before spawning background
+    // audit/replay workers so workers never race to bootstrap it.
+    crate::zygote::ensure_zygote_binary_at(
+        &store.root,
+        &cfg.lean_bin,
+        &crate::zygote::build_auditor_bootstrap_env(&cfg),
+    )?;
+
+    let (mut in_degree, dependents) = compute_dag_schedule_edges(&dag.nodes, &dag.shared_libs);
+    let b_levels = compute_module_b_levels(
+        store,
+        &cfg,
+        &dag,
+        &dependents,
+        trust_domain,
+        preserve_project,
+        &olean_digests,
+    );
+
+    enum PendingAuditOrigin {
+        CasRestored {
+            dig: String,
+            preserve_lake: bool,
+        },
+        WarmAdopted {
+            dig: String,
+            mod_key: String,
+        },
+        Compiled {
+            dig: String,
+            mod_key: String,
+            dur_ms: i64,
+            stdout_str: String,
+        },
+    }
+
+    type AcceptedAuditStep = Option<(String, Option<(String, i64)>)>;
+
+    #[allow(clippy::enum_variant_names)]
+    enum SchedulerEvent {
+        CompileFinished {
+            mod_name: String,
+            mod_key: String,
+            res: Result<StagedModuleCompileOutput>,
+        },
+        AuditBatchFinished {
+            batch_mods: Vec<String>,
+            res: Result<AuditBatchWorkerOutcome>,
+        },
+        CasHashFinished {
+            mod_key: String,
+            dur_ms: i64,
+            res: Result<StagedCasBlobItems>,
+        },
+    }
+
+    struct CasHashJob {
+        mod_name: String,
+        mod_key: String,
+        dur_ms: i64,
+        raw_items: StagedCasBlobItems,
+    }
+
     let mut completed_mods: HashSet<String> = HashSet::new();
     let mut built_shared_libs: HashSet<(PathBuf, String)> = HashSet::new();
-    for wave in &dag.waves {
-        enum WaveHitKind {
-            CasRestored { dig: String, preserve_lake: bool },
-            WarmAdopted { dig: String, mod_key: String },
+    let mut ready_to_evaluate: VecDeque<String> = VecDeque::new();
+    for (mod_name, &deg) in &in_degree {
+        if deg == 0 {
+            ready_to_evaluate.push_back(mod_name.clone());
         }
-        let mut misses_to_compile: Vec<(String, String)> = Vec::new();
-        let mut wave_hits: Vec<(String, WaveHitKind)> = Vec::new();
-        for mod_name in wave {
-            let node = dag.nodes.get(mod_name).expect("wave module in dag");
-            let preserve_lake =
-                preserve_project || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
-            let invalidate = || -> Result<()> {
-                if !preserve_lake {
-                    let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
-                    let _guard = lock.lock().map_err(|_| {
-                        anyhow::anyhow!("Module artifact publication mutex poisoned")
-                    })?;
-                    let _flock_guard = acquire_publish_flock(&node.pkg_root, false)?;
-                    wipe_existing_module_artifacts(node);
-                }
-                Ok(())
-            };
-            // Gather sorted direct + transitive dependency `.olean` digests for this module
-            let mut dep_digests_map: BTreeMap<String, String> = BTreeMap::new();
-            let mut dep_work: VecDeque<&str> = VecDeque::new();
-            for d in &node.direct_dag_deps {
-                dep_work.push_back(d);
-            }
-            for (ext_m, _) in &node.external_olean_deps {
-                if let Some(dig) = olean_digests.get(ext_m) {
-                    dep_digests_map.insert(ext_m.clone(), dig.clone());
-                }
-            }
-            while let Some(cur_dep) = dep_work.pop_front() {
-                if dep_digests_map.contains_key(cur_dep) {
-                    continue;
-                }
-                let dig = olean_digests.get(cur_dep).cloned().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Internal DAG error: dependency `{}` of `{}` missing olean digest",
-                        cur_dep,
-                        mod_name
-                    )
-                })?;
-                dep_digests_map.insert(cur_dep.to_string(), dig);
-                if let Some(dep_node) = dag.nodes.get(cur_dep) {
-                    for sub_d in &dep_node.direct_dag_deps {
-                        if !dep_digests_map.contains_key(sub_d) {
-                            dep_work.push_back(sub_d);
-                        }
+    }
+
+    let mut ready_compile_heap: BinaryHeap<(u64, Reverse<String>)> = BinaryHeap::new();
+    let mut compile_keys: HashMap<String, String> = HashMap::new();
+    let mut pending_audit_queue: VecDeque<String> = VecDeque::new();
+    let mut pending_audit_meta: HashMap<String, PendingAuditOrigin> = HashMap::new();
+
+    let store_root_buf = store.root.clone();
+    let cfg_ref = &cfg;
+    let dag_ref = &dag;
+    let lp_ref = lean_path_env.as_str();
+    let ld_ref = ld_library_path_env.as_str();
+    let bwrap_ref = bwrap_bin.as_deref();
+    let store_root_ref = store_root_buf.as_path();
+
+    let wipe_node_locked = |node: &ModuleNode, preserve_lake: bool| -> Result<()> {
+        if !preserve_lake {
+            let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
+            let _guard = lock
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
+            let _flock_guard = acquire_publish_flock(&node.pkg_root, false)?;
+            wipe_existing_module_artifacts(node);
+        }
+        Ok(())
+    };
+
+    let wipe_unverified_candidates = |meta: &HashMap<String, PendingAuditOrigin>| {
+        let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
+        if let Ok(_guard) = lock.lock() {
+            for (cand_mod, origin) in meta {
+                let preserve_cand = match origin {
+                    PendingAuditOrigin::CasRestored { preserve_lake, .. } => *preserve_lake,
+                    PendingAuditOrigin::WarmAdopted { .. }
+                    | PendingAuditOrigin::Compiled { .. } => {
+                        preserve_project
+                            || dag.nodes.get(cand_mod).is_some_and(|n| {
+                                crate::lake_build::worktree_auto_link_disabled(&n.pkg_root)
+                            })
                     }
-                    for (ext_m, _) in &dep_node.external_olean_deps {
-                        if let Some(edig) = olean_digests.get(ext_m) {
-                            dep_digests_map
-                                .entry(ext_m.clone())
-                                .or_insert_with(|| edig.clone());
-                        }
-                    }
-                }
-            }
-            let dep_digests_vec: Vec<(String, String)> = dep_digests_map.into_iter().collect();
-            let raw_imp_dynlibs = compute_module_raw_import_dynlibs(&dag, node);
-            let mut dynlib_digests: Vec<(String, String)> =
-                Vec::with_capacity(raw_imp_dynlibs.len());
-            for dp in &raw_imp_dynlibs {
-                let bytes = fs::read(dp).with_context(|| {
-                    format!(
-                        "Failed to read imported precompiled shared library `{}` for `{}`",
-                        dp.display(),
-                        mod_name
-                    )
-                })?;
-                let tag = dp
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("dynlib")
-                    .to_string();
-                dynlib_digests.push((tag, blake3::hash(&bytes).to_hex().to_string()));
-            }
-            let mod_key = compute_module_cas_key_with_dynlibs(
-                &cfg,
-                node,
-                &dep_digests_vec,
-                node.needs_c,
-                &dynlib_digests,
-            )?;
-            // Check per-module CAS in TurboStore (`module_unit`), or fallback key with `needs_c=true` when `node.needs_c=false`.
-            // Use `get_cached_action` (read-only lookup) so probing `c_key` or failing compilation does not leave an unreleased Singleflight lease.
-            let mut cas_hit_outputs: Option<Vec<BlobEntry>> = None;
-            if let Some(outputs) = store.get_cached_action(&mod_key, trust_domain)? {
-                cas_hit_outputs = Some(outputs);
-            } else if !node.needs_c {
-                let c_key = compute_module_cas_key_with_dynlibs(
-                    &cfg,
-                    node,
-                    &dep_digests_vec,
-                    true,
-                    &dynlib_digests,
-                )?;
-                if let Some(outputs) = store.get_cached_action(&c_key, trust_domain)? {
-                    cas_hit_outputs = Some(outputs);
-                }
-            }
-            let target_root = if node.pkg_root.starts_with(&canon_dir) {
-                &canon_dir
-            } else {
-                &node.pkg_root
-            };
-            // Recorded output paths come from whichever checkout stored the entry and are not
-            // part of the key: restore only onto this node's own (preflighted) artifact paths.
-            let cas_hit_outputs =
-                cas_hit_outputs.filter(|o| cas_outputs_bound_to_node(o, target_root, node));
-            if let Some(outputs) = cas_hit_outputs {
-                // The invocation's project policy also covers external package roots.
-                // Keep cache-hit validation/auditing, but do not erase artifacts or
-                // regenerate Lake sidecars when automatic materialization is disabled.
-                let cas_restored_dig_opt = {
-                    let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
-                    let _guard = lock.lock().map_err(|_| {
-                        anyhow::anyhow!("Module artifact publication mutex poisoned")
-                    })?;
-                    let _flock_guard =
-                        acquire_publish_flock_mode(&node.pkg_root, !preserve_lake, preserve_lake)?;
-                    if !preserve_lake {
-                        wipe_existing_module_artifacts(node);
-                        store.materialize_into_worktree(target_root, &project_name, &outputs)?;
-                        if !node.needs_c {
-                            let _ = fs::remove_file(&node.c_path);
-                        }
-                    }
-                    let mut paths: Vec<_> = olean_artifact_paths(&node.olean_path)
-                        .into_iter()
-                        .map(|(_, p)| p)
-                        .collect();
-                    let checked_outputs: Vec<BlobEntry> = outputs
-                        .into_iter()
-                        .filter(|e| node.needs_c || e.kind != "c")
-                        .collect();
-                    paths.extend(
-                        checked_outputs
-                            .iter()
-                            .map(|e| target_root.join(&e.rel_path)),
-                    );
-                    let restored = _flock_guard.read_consistent(&paths, || {
-                        if preserve_lake {
-                            crate::db::reuse_worktree_outputs(target_root, &checked_outputs)?;
-                        }
-                        let hashes_ok = validate_materialized_module_artifacts(node, preserve_lake)
-                            && checked_outputs.iter().all(|entry| {
-                                fs::read(target_root.join(&entry.rel_path)).is_ok_and(|bytes| {
-                                    bytes.len() as u64 == entry.size_bytes
-                                        && blake3::hash(&bytes).to_hex().as_str() == entry.blob_hash
-                                })
-                            });
-                        if hashes_ok {
-                            compute_olean_artifact_set_digest_locked(
-                                &node.olean_path,
-                                Some(&_flock_guard),
-                            )
-                            .map(Some)
-                        } else {
-                            Ok(None)
-                        }
-                    })?;
-                    if restored.is_none() && !preserve_lake {
-                        wipe_existing_module_artifacts(node);
-                    }
-                    restored
                 };
-                if let Some(dig) = cas_restored_dig_opt {
-                    wave_hits.push((
-                        mod_name.clone(),
-                        WaveHitKind::CasRestored { dig, preserve_lake },
-                    ));
-                    continue;
-                }
-                anyhow::ensure!(!preserve_lake, "Worktree opt-out prevents rebuilding invalid CAS outputs for `{mod_name}`; build with Lake first");
-            } else {
-                anyhow::ensure!(!preserve_lake, "Worktree opt-out prevents compiling uncached module `{mod_name}`; build with Lake first");
-                if !is_untrusted {
-                    if let Some(warm_dig) = probe_warm_on_disk_module_candidate(
-                        &cfg,
-                        &dag,
-                        node,
-                        preserve_lake,
-                        &olean_digests,
-                        &raw_imp_dynlibs,
-                    ) {
-                        wave_hits.push((
-                            mod_name.clone(),
-                            WaveHitKind::WarmAdopted {
-                                dig: warm_dig,
-                                mod_key,
-                            },
-                        ));
-                        continue;
+                if !preserve_cand {
+                    if let Some(node) = dag.nodes.get(cand_mod) {
+                        if let Ok(_flock) = acquire_publish_flock(&node.pkg_root, false) {
+                            wipe_existing_module_artifacts(node);
+                        }
                     }
                 }
-                invalidate()?;
             }
-            misses_to_compile.push((mod_name.clone(), mod_key));
         }
-        if !wave_hits.is_empty() {
-            // CAS entries and warm on-disk artifacts carry no replay provenance: batch-audit
-            // all wave hits in one Zygote round-trip, falling back per-module if the batch fails
-            // so a rejected warm candidate falls back to clean recompilation while CAS hits fail closed.
-            let hit_names: Vec<String> = wave_hits.iter().map(|(m, _)| m.clone()).collect();
-            let batch_ok = audit_or_replay_modules(
-                store,
-                &cfg,
-                &dag,
-                &hit_names,
-                &lean_path_env,
-                is_untrusted,
-            )
-            .is_ok();
-            for (mod_name, hit_kind) in wave_hits {
-                let node = dag.nodes.get(&mod_name).expect("wave module in dag");
+    };
+
+    let compile_pool_size = max_jobs.min(dag.nodes.len()).max(1);
+    let compile_work_queue: std::sync::Mutex<VecDeque<(String, String)>> =
+        std::sync::Mutex::new(VecDeque::new());
+    let compile_work_cv = std::sync::Condvar::new();
+    let compile_shutdown = std::sync::atomic::AtomicBool::new(false);
+    let compile_work_queue_ref = &compile_work_queue;
+    let compile_work_cv_ref = &compile_work_cv;
+    let compile_shutdown_ref = &compile_shutdown;
+
+    let scheduler_res: Result<()> = std::thread::scope(|s| {
+        let (event_tx, event_rx) = std::sync::mpsc::channel::<SchedulerEvent>();
+
+        for _ in 0..compile_pool_size {
+            let tx = event_tx.clone();
+            s.spawn(move || loop {
+                let job_opt = {
+                    let mut guard = compile_work_queue_ref
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    while guard.is_empty() && !compile_shutdown_ref.load(Ordering::SeqCst) {
+                        guard = compile_work_cv_ref
+                            .wait(guard)
+                            .unwrap_or_else(|e| e.into_inner());
+                    }
+                    if compile_shutdown_ref.load(Ordering::SeqCst) && guard.is_empty() {
+                        None
+                    } else {
+                        guard.pop_front()
+                    }
+                };
+                let Some((mod_name, mod_key)) = job_opt else {
+                    break;
+                };
+                let node = dag_ref.nodes.get(&mod_name).expect("node in dag");
                 let preserve_lake = preserve_project
                     || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
-                let invalidate_node = || -> Result<()> {
-                    if !preserve_lake {
-                        let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
-                        let _guard = lock.lock().map_err(|_| {
-                            anyhow::anyhow!("Module artifact publication mutex poisoned")
-                        })?;
-                        let _flock_guard = acquire_publish_flock(&node.pkg_root, false)?;
-                        wipe_existing_module_artifacts(node);
+                let res = compile_single_module_staged(
+                    cfg_ref,
+                    dag_ref,
+                    node,
+                    lp_ref,
+                    ld_ref,
+                    is_untrusted,
+                    bwrap_ref,
+                    preserve_lake,
+                );
+                let _ = tx.send(SchedulerEvent::CompileFinished {
+                    mod_name,
+                    mod_key,
+                    res,
+                });
+            });
+        }
+
+        let (audit_tx, audit_rx) = std::sync::mpsc::channel::<Vec<String>>();
+        {
+            let tx = event_tx.clone();
+            s.spawn(move || {
+                while let Ok(batch_mods) = audit_rx.recv() {
+                    let res = run_audit_or_replay_batch_worker(
+                        store_root_ref,
+                        cfg_ref,
+                        dag_ref,
+                        &batch_mods,
+                        lp_ref,
+                        is_untrusted,
+                    );
+                    let _ = tx.send(SchedulerEvent::AuditBatchFinished { batch_mods, res });
+                }
+            });
+        }
+
+        let (cas_tx, cas_rx) = std::sync::mpsc::channel::<CasHashJob>();
+        {
+            let tx = event_tx.clone();
+            s.spawn(move || {
+                while let Ok(mut job) = cas_rx.recv() {
+                    record_scheduler_test_event(
+                        "cas_hash_start",
+                        std::slice::from_ref(&job.mod_name),
+                    );
+                    for item in &mut job.raw_items {
+                        item.0 = blake3::hash(&item.1).to_hex().to_string();
                     }
-                    Ok(())
-                };
-                match hit_kind {
-                    WaveHitKind::CasRestored { dig, preserve_lake } => {
-                        if !batch_ok {
-                            if let Err(audit_err) = audit_or_replay_modules(
-                                store,
+                    record_scheduler_test_event(
+                        "cas_hash_end",
+                        std::slice::from_ref(&job.mod_name),
+                    );
+                    let _ = tx.send(SchedulerEvent::CasHashFinished {
+                        mod_key: job.mod_key,
+                        dur_ms: job.dur_ms,
+                        res: Ok(job.raw_items),
+                    });
+                }
+            });
+        }
+
+        drop(event_tx);
+
+        let mut in_flight_compiles: usize = 0;
+        let mut audit_worker_busy = false;
+        let mut in_flight_cas: usize = 0;
+        let mut fatal_err: Option<anyhow::Error> = None;
+
+        loop {
+            if fatal_err.is_none() {
+                while let Some(mod_name) = ready_to_evaluate.pop_front() {
+                    let eval_res: Result<()> = (|| {
+                        let node = dag.nodes.get(&mod_name).expect("ready module in dag");
+                        let preserve_lake = preserve_project
+                            || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
+                        let (dep_digests_vec, raw_imp_dynlibs, dynlib_digests) =
+                            gather_module_dep_digests_and_dynlibs(&dag, node, &olean_digests)?;
+                        let mod_key = compute_module_cas_key_with_dynlibs(
+                            &cfg,
+                            node,
+                            &dep_digests_vec,
+                            node.needs_c,
+                            &dynlib_digests,
+                        )?;
+                        let mut cas_hit_outputs: Option<Vec<BlobEntry>> = None;
+                        if let Some(outputs) = store.get_cached_action(&mod_key, trust_domain)? {
+                            cas_hit_outputs = Some(outputs);
+                        } else if !node.needs_c {
+                            let c_key = compute_module_cas_key_with_dynlibs(
                                 &cfg,
-                                &dag,
-                                std::slice::from_ref(&mod_name),
-                                &lean_path_env,
-                                is_untrusted,
-                            ) {
-                                invalidate_node()?;
-                                return Err(audit_err.context(format!(
-                                    "In-kernel `.olean` audit rejected materialized CAS hit for module `{}`",
-                                    mod_name
-                                )));
+                                node,
+                                &dep_digests_vec,
+                                true,
+                                &dynlib_digests,
+                            )?;
+                            if let Some(outputs) = store.get_cached_action(&c_key, trust_domain)? {
+                                cas_hit_outputs = Some(outputs);
                             }
                         }
-                        let post_audit_dig = compute_olean_artifact_set_digest_with_policy(
-                            &node.olean_path,
-                            preserve_project,
-                        )?;
-                        if post_audit_dig != dig {
-                            invalidate_node()?;
-                            anyhow::bail!(
-                                "Artifact digest mutated during `.olean` kernel audit for `{}`",
-                                mod_name
+                        let target_root = if node.pkg_root.starts_with(&canon_dir) {
+                            &canon_dir
+                        } else {
+                            &node.pkg_root
+                        };
+                        let cas_hit_outputs = cas_hit_outputs
+                            .filter(|o| cas_outputs_bound_to_node(o, target_root, node));
+                        if let Some(outputs) = cas_hit_outputs {
+                            let cas_restored_dig_opt = {
+                                let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
+                                let _guard = lock.lock().map_err(|_| {
+                                    anyhow::anyhow!("Module artifact publication mutex poisoned")
+                                })?;
+                                let _flock_guard = acquire_publish_flock_mode(
+                                    &node.pkg_root,
+                                    !preserve_lake,
+                                    preserve_lake,
+                                )?;
+                                if !preserve_lake {
+                                    wipe_existing_module_artifacts(node);
+                                    store.materialize_into_worktree(
+                                        target_root,
+                                        &project_name,
+                                        &outputs,
+                                    )?;
+                                    if !node.needs_c {
+                                        let _ = fs::remove_file(&node.c_path);
+                                    }
+                                }
+                                let mut paths: Vec<_> = olean_artifact_paths(&node.olean_path)
+                                    .into_iter()
+                                    .map(|(_, p)| p)
+                                    .collect();
+                                let checked_outputs: Vec<BlobEntry> = outputs
+                                    .into_iter()
+                                    .filter(|e| node.needs_c || e.kind != "c")
+                                    .collect();
+                                paths.extend(
+                                    checked_outputs
+                                        .iter()
+                                        .map(|e| target_root.join(&e.rel_path)),
+                                );
+                                let restored = _flock_guard.read_consistent(&paths, || {
+                                    if preserve_lake {
+                                        crate::db::reuse_worktree_outputs(
+                                            target_root,
+                                            &checked_outputs,
+                                        )?;
+                                    }
+                                    let hashes_ok =
+                                        validate_materialized_module_artifacts(node, preserve_lake)
+                                            && checked_outputs.iter().all(|entry| {
+                                                fs::read(target_root.join(&entry.rel_path))
+                                                    .is_ok_and(|bytes| {
+                                                        bytes.len() as u64 == entry.size_bytes
+                                                            && blake3::hash(&bytes)
+                                                                .to_hex()
+                                                                .as_str()
+                                                                == entry.blob_hash
+                                                    })
+                                            });
+                                    if hashes_ok {
+                                        compute_olean_artifact_set_digest_locked(
+                                            &node.olean_path,
+                                            Some(&_flock_guard),
+                                        )
+                                        .map(Some)
+                                    } else {
+                                        Ok(None)
+                                    }
+                                })?;
+                                if restored.is_none() && !preserve_lake {
+                                    wipe_existing_module_artifacts(node);
+                                }
+                                restored
+                            };
+                            if let Some(dig) = cas_restored_dig_opt {
+                                pending_audit_meta.insert(
+                                    mod_name.clone(),
+                                    PendingAuditOrigin::CasRestored { dig, preserve_lake },
+                                );
+                                pending_audit_queue.push_back(mod_name);
+                                return Ok(());
+                            }
+                            anyhow::ensure!(
+                                !preserve_lake,
+                                "Worktree opt-out prevents rebuilding invalid CAS outputs for `{mod_name}`; build with Lake first"
                             );
-                        }
-                        if !preserve_lake {
-                            write_lake_module_hashes_and_trace(
-                                &cfg,
-                                &dag,
-                                node,
-                                &dig,
-                                Some(&post_audit_dig),
-                                true,
-                            )?;
+                        } else {
+                            anyhow::ensure!(
+                                !preserve_lake,
+                                "Worktree opt-out prevents compiling uncached module `{mod_name}`; build with Lake first"
+                            );
                             if !is_untrusted {
+                                if let Some(warm_dig) = probe_warm_on_disk_module_candidate(
+                                    &cfg,
+                                    &dag,
+                                    node,
+                                    preserve_lake,
+                                    &olean_digests,
+                                    &raw_imp_dynlibs,
+                                ) {
+                                    pending_audit_meta.insert(
+                                        mod_name.clone(),
+                                        PendingAuditOrigin::WarmAdopted {
+                                            dig: warm_dig,
+                                            mod_key,
+                                        },
+                                    );
+                                    pending_audit_queue.push_back(mod_name);
+                                    return Ok(());
+                                }
+                            }
+                            wipe_node_locked(node, preserve_lake)?;
+                        }
+                        let prio = b_levels.get(&mod_name).copied().unwrap_or(1);
+                        compile_keys.insert(mod_name.clone(), mod_key);
+                        ready_compile_heap.push((prio, Reverse(mod_name)));
+                        Ok(())
+                    })();
+                    if let Err(e) = eval_res {
+                        fatal_err = Some(e);
+                        break;
+                    }
+                }
+            }
+
+            if fatal_err.is_none() {
+                while in_flight_compiles < max_jobs {
+                    let Some((_, Reverse(mod_name))) = ready_compile_heap.pop() else {
+                        break;
+                    };
+                    let mod_key = compile_keys
+                        .remove(&mod_name)
+                        .expect("compile_keys contains ready module");
+                    if !cfg.lean_bin.is_file() {
+                        fatal_err = Some(anyhow::anyhow!(
+                            "Cannot compile uncached Lean module `{}` for {} because no `lean` compiler binary is installed on this host (requested toolchain `{}`)",
+                            mod_name,
+                            project_dir.display(),
+                            cfg.toolchain
+                        ));
+                        break;
+                    }
+                    if is_untrusted && bwrap_bin.is_none() {
+                        fatal_err = Some(anyhow::anyhow!(
+                            "Untrusted module compilation requires a working bubblewrap (`bwrap`) sandbox: fail-closed sandbox gate"
+                        ));
+                        break;
+                    }
+                    record_scheduler_test_event(
+                        "compile_dispatch",
+                        std::slice::from_ref(&mod_name),
+                    );
+                    {
+                        let mut guard =
+                            compile_work_queue.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.push_back((mod_name, mod_key));
+                    }
+                    compile_work_cv.notify_one();
+                    in_flight_compiles += 1;
+                }
+            }
+
+            if fatal_err.is_none() && !audit_worker_busy && !pending_audit_queue.is_empty() {
+                let batch_limit = scheduler_audit_batch_size();
+                let mut batch_mods = Vec::with_capacity(pending_audit_queue.len().min(batch_limit));
+                while batch_mods.len() < batch_limit {
+                    let Some(m) = pending_audit_queue.pop_front() else {
+                        break;
+                    };
+                    batch_mods.push(m);
+                }
+                if !batch_mods.is_empty() {
+                    if audit_tx.send(batch_mods).is_ok() {
+                        audit_worker_busy = true;
+                    } else {
+                        fatal_err = Some(anyhow::anyhow!(
+                            "Background `.olean` audit worker terminated unexpectedly"
+                        ));
+                    }
+                }
+            }
+
+            if fatal_err.is_some() {
+                ready_to_evaluate.clear();
+                ready_compile_heap.clear();
+                compile_keys.clear();
+                pending_audit_queue.clear();
+                {
+                    let mut guard = compile_work_queue.lock().unwrap_or_else(|e| e.into_inner());
+                    let dropped = guard.len();
+                    guard.clear();
+                    in_flight_compiles = in_flight_compiles.saturating_sub(dropped);
+                }
+            }
+
+            let all_idle = in_flight_compiles == 0
+                && !audit_worker_busy
+                && in_flight_cas == 0
+                && (fatal_err.is_some()
+                    || (ready_to_evaluate.is_empty()
+                        && ready_compile_heap.is_empty()
+                        && pending_audit_queue.is_empty()));
+            if all_idle {
+                break;
+            }
+
+            let ev = match event_rx.recv() {
+                Ok(ev) => ev,
+                Err(_) => {
+                    if fatal_err.is_none() {
+                        fatal_err = Some(anyhow::anyhow!(
+                            "Native scheduler worker event channel closed prematurely"
+                        ));
+                    }
+                    break;
+                }
+            };
+
+            match ev {
+                SchedulerEvent::CompileFinished {
+                    mod_name,
+                    mod_key,
+                    res,
+                } => {
+                    in_flight_compiles = in_flight_compiles.saturating_sub(1);
+                    if fatal_err.is_some() {
+                        continue;
+                    }
+                    match res {
+                        Ok(staged) => {
+                            let node = dag.nodes.get(&mod_name).expect("compiled module in dag");
+                            match publish_staged_module_compile_output(node, staged) {
+                                Ok((dur_ms, stdout_str, dig)) => {
+                                    pending_audit_meta.insert(
+                                        mod_name.clone(),
+                                        PendingAuditOrigin::Compiled {
+                                            dig,
+                                            mod_key,
+                                            dur_ms,
+                                            stdout_str,
+                                        },
+                                    );
+                                    pending_audit_queue.push_back(mod_name);
+                                }
+                                Err(e) => {
+                                    fatal_err = Some(e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            fatal_err = Some(e);
+                        }
+                    }
+                }
+                SchedulerEvent::AuditBatchFinished { batch_mods, res } => {
+                    audit_worker_busy = false;
+                    if fatal_err.is_some() {
+                        continue;
+                    }
+                    let (replayed_for_store, mut per_mod_outcomes) = match res {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            fatal_err = Some(e);
+                            continue;
+                        }
+                    };
+                    if let Err(e) = record_replayed_modules_on_caller_thread(
+                        store,
+                        &cfg,
+                        &replayed_for_store,
+                        &lean_path_env,
+                    ) {
+                        fatal_err = Some(e);
+                        continue;
+                    }
+                    for mod_name in batch_mods {
+                        let Some(origin) = pending_audit_meta.remove(&mod_name) else {
+                            continue;
+                        };
+                        let mod_audit_res =
+                            per_mod_outcomes.remove(&mod_name).unwrap_or_else(|| {
+                                Err(anyhow::anyhow!(
+                                    "Missing per-module audit outcome for `{}`",
+                                    mod_name
+                                ))
+                            });
+                        let node = dag.nodes.get(&mod_name).expect("audited module in dag");
+                        let preserve_lake = preserve_project
+                            || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
+
+                        let step_res: Result<AcceptedAuditStep> = match origin {
+                            PendingAuditOrigin::CasRestored {
+                                dig,
+                                preserve_lake: cas_preserve,
+                            } => (|| {
+                                if let Err(audit_err) = mod_audit_res {
+                                    wipe_node_locked(node, cas_preserve)?;
+                                    return Err(audit_err.context(format!(
+                                            "In-kernel `.olean` audit rejected materialized CAS hit for module `{}`",
+                                            mod_name
+                                        )));
+                                }
+                                let post_audit_dig = compute_olean_artifact_set_digest_with_policy(
+                                    &node.olean_path,
+                                    preserve_project,
+                                )?;
+                                if post_audit_dig != dig {
+                                    wipe_node_locked(node, cas_preserve)?;
+                                    anyhow::bail!(
+                                            "Artifact digest mutated during `.olean` kernel audit for `{}`",
+                                            mod_name
+                                        );
+                                }
+                                if !cas_preserve {
+                                    write_lake_module_hashes_and_trace(
+                                        &cfg,
+                                        &dag,
+                                        node,
+                                        &dig,
+                                        Some(&post_audit_dig),
+                                        true,
+                                    )?;
+                                    if !is_untrusted {
+                                        record_verified_dep_source(
+                                            &cfg,
+                                            node,
+                                            &dig,
+                                            node.is_root_pkg,
+                                            &olean_digests,
+                                        );
+                                    }
+                                    write_file_atomic(
+                                        &module_setup_json_path(node),
+                                        &serde_json::to_vec(&build_setup_json(
+                                            &cfg, &dag, node, None, None,
+                                        )?)?,
+                                    )?;
+                                }
+                                report.modules_cached += 1;
+                                report.cached_modules.push(mod_name.clone());
+                                Ok(Some((dig, None)))
+                            })(),
+                            PendingAuditOrigin::WarmAdopted { dig, mod_key } => (|| {
+                                let post_audit_dig = if mod_audit_res.is_ok() {
+                                    compute_olean_artifact_set_digest_with_policy(
+                                        &node.olean_path,
+                                        preserve_project,
+                                    )
+                                    .ok()
+                                } else {
+                                    None
+                                };
+                                if post_audit_dig.as_deref() != Some(dig.as_str()) {
+                                    record_scheduler_test_event(
+                                        "warm_fallback_to_compile",
+                                        std::slice::from_ref(&mod_name),
+                                    );
+                                    wipe_node_locked(node, preserve_lake)?;
+                                    let prio = b_levels.get(&mod_name).copied().unwrap_or(1);
+                                    compile_keys.insert(mod_name.clone(), mod_key);
+                                    ready_compile_heap.push((prio, Reverse(mod_name.clone())));
+                                    return Ok(None);
+                                }
+                                if !preserve_lake && !node.needs_c {
+                                    let c_hash_path =
+                                        PathBuf::from(format!("{}.hash", node.c_path.display()));
+                                    if fs::symlink_metadata(&node.c_path).is_ok()
+                                        || fs::symlink_metadata(&c_hash_path).is_ok()
+                                    {
+                                        let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
+                                        let _guard = lock.lock().map_err(|_| {
+                                            anyhow::anyhow!(
+                                                "Module artifact publication mutex poisoned"
+                                            )
+                                        })?;
+                                        let _flock_guard =
+                                            acquire_publish_flock(&node.pkg_root, false)?;
+                                        let _ = fs::remove_file(&node.c_path);
+                                        let _ = fs::remove_file(&c_hash_path);
+                                    }
+                                }
+                                write_lake_module_hashes_and_trace(
+                                    &cfg,
+                                    &dag,
+                                    node,
+                                    &dig,
+                                    Some(&dig),
+                                    true,
+                                )?;
                                 record_verified_dep_source(
                                     &cfg,
                                     node,
@@ -16781,308 +17806,200 @@ pub fn build_project_modules_native(
                                     node.is_root_pkg,
                                     &olean_digests,
                                 );
-                            }
-                            write_file_atomic(
-                                &module_setup_json_path(node),
-                                &serde_json::to_vec(&build_setup_json(
-                                    &cfg, &dag, node, None, None,
-                                )?)?,
-                            )?;
-                        }
-                        olean_digests.insert(mod_name.clone(), dig);
-                        report.modules_cached += 1;
-                        report.cached_modules.push(mod_name);
-                    }
-                    WaveHitKind::WarmAdopted { dig, mod_key } => {
-                        let individual_ok = batch_ok
-                            || audit_or_replay_modules(
-                                store,
-                                &cfg,
-                                &dag,
-                                std::slice::from_ref(&mod_name),
-                                &lean_path_env,
-                                is_untrusted,
-                            )
-                            .is_ok();
-                        let post_audit_dig = individual_ok
-                            .then(|| {
-                                compute_olean_artifact_set_digest_with_policy(
+                                write_file_atomic(
+                                    &module_setup_json_path(node),
+                                    &serde_json::to_vec(&build_setup_json(
+                                        &cfg, &dag, node, None, None,
+                                    )?)?,
+                                )?;
+                                report.modules_up_to_date_reused += 1;
+                                Ok(Some((dig, Some((mod_key, 0)))))
+                            })(
+                            ),
+                            PendingAuditOrigin::Compiled {
+                                dig,
+                                mod_key,
+                                dur_ms,
+                                stdout_str,
+                            } => (|| {
+                                if let Err(audit_err) = mod_audit_res {
+                                    wipe_node_locked(node, preserve_lake)?;
+                                    return Err(audit_err);
+                                }
+                                let post_audit_dig = compute_olean_artifact_set_digest_with_policy(
                                     &node.olean_path,
                                     preserve_project,
-                                )
-                                .ok()
-                            })
-                            .flatten();
-                        if post_audit_dig.as_deref() != Some(dig.as_str()) {
-                            invalidate_node()?;
-                            misses_to_compile.push((mod_name, mod_key));
-                            continue;
-                        }
-                        if !preserve_lake && !node.needs_c {
-                            let c_hash_path =
-                                PathBuf::from(format!("{}.hash", node.c_path.display()));
-                            if fs::symlink_metadata(&node.c_path).is_ok()
-                                || fs::symlink_metadata(&c_hash_path).is_ok()
-                            {
-                                let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
-                                let _guard = lock.lock().map_err(|_| {
-                                    anyhow::anyhow!("Module artifact publication mutex poisoned")
-                                })?;
-                                let _flock_guard = acquire_publish_flock(&node.pkg_root, false)?;
-                                let _ = fs::remove_file(&node.c_path);
-                                let _ = fs::remove_file(&c_hash_path);
+                                )?;
+                                if post_audit_dig != dig {
+                                    wipe_node_locked(node, preserve_lake)?;
+                                    anyhow::bail!(
+                                            "Artifact digest mutated during `.olean` kernel audit for `{}`",
+                                            mod_name
+                                        );
+                                }
+                                if !json_output && !stdout_str.trim().is_empty() {
+                                    print!("{}", stdout_str);
+                                }
+                                write_lake_module_hashes_and_trace(
+                                    &cfg,
+                                    &dag,
+                                    node,
+                                    &dig,
+                                    Some(&post_audit_dig),
+                                    true,
+                                )?;
+                                if !is_untrusted {
+                                    record_verified_dep_source(
+                                        &cfg,
+                                        node,
+                                        &dig,
+                                        node.is_root_pkg,
+                                        &olean_digests,
+                                    );
+                                }
+                                report.modules_compiled += 1;
+                                report.compiled_modules.push(mod_name.clone());
+                                Ok(Some((dig, Some((mod_key, dur_ms)))))
+                            })(),
+                        };
+
+                        match step_res {
+                            Ok(Some((accepted_dig, cas_req_opt))) => {
+                                if let Some((cas_key, cas_dur_ms)) = cas_req_opt {
+                                    match read_consistent_module_cas_blobs_locked(&canon_dir, node)
+                                    {
+                                        Ok(raw_items) => {
+                                            if cas_tx
+                                                .send(CasHashJob {
+                                                    mod_name: mod_name.clone(),
+                                                    mod_key: cas_key,
+                                                    dur_ms: cas_dur_ms,
+                                                    raw_items,
+                                                })
+                                                .is_ok()
+                                            {
+                                                in_flight_cas += 1;
+                                            } else {
+                                                fatal_err = Some(anyhow::anyhow!(
+                                                    "Background CAS hashing worker terminated unexpectedly"
+                                                ));
+                                                break;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            fatal_err = Some(e);
+                                            break;
+                                        }
+                                    }
+                                }
+                                olean_digests.insert(mod_name.clone(), accepted_dig);
+                                completed_mods.insert(mod_name.clone());
+                                record_scheduler_test_event(
+                                    "module_accepted",
+                                    std::slice::from_ref(&mod_name),
+                                );
+                                if !is_untrusted {
+                                    if let Err(e) = build_wave_native_artifacts(
+                                        &cfg,
+                                        &dag,
+                                        std::slice::from_ref(&mod_name),
+                                        preserve_project,
+                                        &completed_mods,
+                                        &mut built_shared_libs,
+                                    ) {
+                                        fatal_err = Some(e);
+                                        break;
+                                    }
+                                    record_scheduler_test_event(
+                                        "native_artifacts_ready",
+                                        std::slice::from_ref(&mod_name),
+                                    );
+                                }
+                                if let Some(deps) = dependents.get(&mod_name) {
+                                    for dep_child in deps {
+                                        if let Some(deg) = in_degree.get_mut(dep_child) {
+                                            *deg = deg.saturating_sub(1);
+                                            if *deg == 0 {
+                                                ready_to_evaluate.push_back(dep_child.clone());
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                        }
-                        write_lake_module_hashes_and_trace(
-                            &cfg,
-                            &dag,
-                            node,
-                            &dig,
-                            Some(&dig),
-                            true,
-                        )?;
-                        store_module_artifacts_in_cas(
-                            store,
-                            &canon_dir,
-                            node,
-                            &mod_key,
-                            &cfg.toolchain,
-                            trust_domain,
-                            pin_level,
-                            0,
-                        )?;
-                        record_verified_dep_source(
-                            &cfg,
-                            node,
-                            &dig,
-                            node.is_root_pkg,
-                            &olean_digests,
-                        );
-                        write_file_atomic(
-                            &module_setup_json_path(node),
-                            &serde_json::to_vec(&build_setup_json(&cfg, &dag, node, None, None)?)?,
-                        )?;
-                        olean_digests.insert(mod_name, dig);
-                        report.modules_up_to_date_reused += 1;
-                    }
-                }
-            }
-        }
-        if misses_to_compile.is_empty() {
-            for mod_name in wave {
-                completed_mods.insert(mod_name.clone());
-            }
-            if !is_untrusted {
-                build_wave_native_artifacts(
-                    &cfg,
-                    &dag,
-                    wave,
-                    preserve_project,
-                    &completed_mods,
-                    &mut built_shared_libs,
-                )?;
-            }
-            continue;
-        }
-        if !cfg.lean_bin.is_file() {
-            anyhow::bail!(
-                "Cannot compile {} uncached Lean module(s) for {} because no `lean` compiler binary is installed on this host (requested toolchain `{}`)",
-                misses_to_compile.len(),
-                project_dir.display(),
-                cfg.toolchain
-            );
-        }
-        // Fail closed unconditionally before spawning compilation workers if untrusted and bwrap is unavailable
-        if is_untrusted && bwrap_bin.is_none() {
-            anyhow::bail!(
-                "Untrusted module compilation requires a working bubblewrap (`bwrap`) sandbox: fail-closed sandbox gate"
-            );
-        }
-        // Compile all cache-miss modules in the current wave in parallel (bounded by `max_jobs`).
-        // Fast path: when `workers == 1`, execute directly on the calling thread without thread-spawn overhead.
-        let workers = max_jobs.min(misses_to_compile.len()).max(1);
-        let dag_ref = &dag;
-        let cfg_ref = &cfg;
-        let lp_ref = lean_path_env.as_str();
-        let ld_ref = ld_library_path_env.as_str();
-        let bwrap_ref = bwrap_bin.as_deref();
-        let mut ordered_results: Vec<(usize, Result<ModuleCompileOutput>)> = if workers == 1 {
-            misses_to_compile
-                .iter()
-                .enumerate()
-                .map(|(i, (mod_name, _))| {
-                    let node = dag_ref.nodes.get(mod_name).expect("node in dag");
-                    let res = compile_single_module_direct(
-                        cfg_ref,
-                        dag_ref,
-                        node,
-                        lp_ref,
-                        ld_ref,
-                        is_untrusted,
-                        bwrap_ref,
-                        preserve_project
-                            || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root),
-                    );
-                    (i, res)
-                })
-                .collect()
-        } else {
-            let next_idx = std::sync::atomic::AtomicUsize::new(0);
-            let misses_ref = &misses_to_compile;
-            std::thread::scope(|s| {
-                let mut handles = Vec::with_capacity(workers);
-                for _ in 0..workers {
-                    let idx_ref = &next_idx;
-                    handles.push(s.spawn(move || {
-                        let mut local = Vec::new();
-                        loop {
-                            let i = idx_ref.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            if i >= misses_ref.len() {
+                            Ok(None) => {}
+                            Err(e) => {
+                                fatal_err = Some(e);
                                 break;
                             }
-                            let (ref mod_name, _) = misses_ref[i];
-                            let node = dag_ref.nodes.get(mod_name).expect("node in dag");
-                            let res = compile_single_module_direct(
-                                cfg_ref,
-                                dag_ref,
-                                node,
-                                lp_ref,
-                                ld_ref,
-                                is_untrusted,
-                                bwrap_ref,
-                                preserve_project
-                                    || crate::lake_build::worktree_auto_link_disabled(
-                                        &node.pkg_root,
-                                    ),
-                            );
-                            local.push((i, res));
                         }
-                        local
-                    }));
-                }
-                let mut all = Vec::with_capacity(misses_ref.len());
-                for h in handles {
-                    if let Ok(part) = h.join() {
-                        all.extend(part);
                     }
                 }
-                all
-            })
-        };
-        ordered_results.sort_by_key(|(i, _)| *i);
-        let mut compiled_wave_ok: Vec<(usize, i64, String, String)> =
-            Vec::with_capacity(ordered_results.len());
-        let mut first_compile_err: Option<anyhow::Error> = None;
-        for (i, res) in ordered_results {
-            match res {
-                Ok((dur_ms, stdout_str, dig)) => {
-                    compiled_wave_ok.push((i, dur_ms, stdout_str, dig));
-                }
-                Err(e) => {
-                    if first_compile_err.is_none() {
-                        first_compile_err = Some(e);
+                SchedulerEvent::CasHashFinished {
+                    mod_key,
+                    dur_ms,
+                    res,
+                } => {
+                    in_flight_cas = in_flight_cas.saturating_sub(1);
+                    if fatal_err.is_some() {
+                        continue;
+                    }
+                    match res {
+                        Ok(hashed_items) => {
+                            if let Err(e) = commit_staged_module_cas_entry(
+                                store,
+                                &mod_key,
+                                &cfg.toolchain,
+                                trust_domain,
+                                pin_level,
+                                dur_ms,
+                                hashed_items,
+                            ) {
+                                fatal_err = Some(e);
+                            }
+                        }
+                        Err(e) => {
+                            fatal_err = Some(e);
+                        }
                     }
                 }
             }
         }
-        if let Some(err) = first_compile_err {
-            let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
-            if let Ok(_guard) = lock.lock() {
-                for (i, _, _, _) in &compiled_wave_ok {
-                    let (ref mod_name, _) = misses_to_compile[*i];
-                    if let Some(node) = dag.nodes.get(mod_name) {
-                        if let Ok(_flock) = acquire_publish_flock(&node.pkg_root, false) {
-                            wipe_existing_module_artifacts(node);
-                        }
-                    }
-                }
-            }
+
+        compile_shutdown.store(true, Ordering::SeqCst);
+        compile_work_cv.notify_all();
+        drop(audit_tx);
+        drop(cas_tx);
+
+        if let Some(err) = fatal_err {
             return Err(err);
         }
-        let wave_mod_names: Vec<String> = compiled_wave_ok
-            .iter()
-            .map(|(i, _, _, _)| misses_to_compile[*i].0.clone())
-            .collect();
-        if let Err(audit_err) = audit_or_replay_modules(
-            store,
-            &cfg,
-            &dag,
-            &wave_mod_names,
-            &lean_path_env,
-            is_untrusted,
-        ) {
-            let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
-            if let Ok(_guard) = lock.lock() {
-                for (i, _, _, _) in &compiled_wave_ok {
-                    let (ref mod_name, _) = misses_to_compile[*i];
-                    if let Some(node) = dag.nodes.get(mod_name) {
-                        if let Ok(_flock) = acquire_publish_flock(&node.pkg_root, false) {
-                            wipe_existing_module_artifacts(node);
-                        }
-                    }
-                }
-            }
-            return Err(audit_err);
+        if completed_mods.len() != dag.nodes.len() {
+            anyhow::bail!(
+                "Native module scheduler terminated before completing all DAG modules ({} of {} accepted)",
+                completed_mods.len(),
+                dag.nodes.len()
+            );
         }
-        for (i, dur_ms, stdout_str, dig) in compiled_wave_ok {
-            let (ref mod_name, ref mod_key) = misses_to_compile[i];
-            if !json_output && !stdout_str.trim().is_empty() {
-                print!("{}", stdout_str);
-            }
-            let node = dag.nodes.get(mod_name).expect("node in dag");
-            let post_audit_dig =
-                compute_olean_artifact_set_digest_with_policy(&node.olean_path, preserve_project)?;
-            if post_audit_dig != dig {
-                let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
-                if let Ok(_guard) = lock.lock() {
-                    if let Ok(_flock) = acquire_publish_flock(&node.pkg_root, false) {
-                        wipe_existing_module_artifacts(node);
-                    }
-                }
-                anyhow::bail!(
-                    "Artifact digest mutated during `.olean` kernel audit for `{}`",
-                    mod_name
-                );
-            }
-            write_lake_module_hashes_and_trace(
-                &cfg,
-                &dag,
-                node,
-                &dig,
-                Some(&post_audit_dig),
-                true,
-            )?;
-            store_module_artifacts_in_cas(
-                store,
-                &canon_dir,
-                node,
-                mod_key,
-                &cfg.toolchain,
-                trust_domain,
-                pin_level,
-                dur_ms,
-            )?;
-            if !is_untrusted {
-                record_verified_dep_source(&cfg, node, &dig, node.is_root_pkg, &olean_digests);
-            }
-            olean_digests.insert(mod_name.clone(), dig);
-            report.modules_compiled += 1;
-            report.compiled_modules.push(mod_name.clone());
-        }
-        for mod_name in wave {
-            completed_mods.insert(mod_name.clone());
-        }
-        if !is_untrusted {
-            build_wave_native_artifacts(
-                &cfg,
-                &dag,
-                wave,
-                preserve_project,
-                &completed_mods,
-                &mut built_shared_libs,
-            )?;
-        }
+        Ok(())
+    });
+
+    if let Err(err) = scheduler_res {
+        wipe_unverified_candidates(&pending_audit_meta);
+        return Err(err);
     }
+
+    let topo_rank: HashMap<&str, usize> = dag
+        .topological_order
+        .iter()
+        .enumerate()
+        .map(|(idx, m)| (m.as_str(), idx))
+        .collect();
+    report
+        .compiled_modules
+        .sort_by_key(|m| topo_rank.get(m.as_str()).copied().unwrap_or(usize::MAX));
+    report
+        .cached_modules
+        .sort_by_key(|m| topo_rank.get(m.as_str()).copied().unwrap_or(usize::MAX));
     Ok(report)
 }
 #[cfg(test)]
@@ -27854,6 +28771,629 @@ root = "Main"
         assert_eq!(
             module_full_whole, 1,
             "whole-repo build (`targets = []`) must still publish `module_full`"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    struct ScopedEnvVar {
+        key: &'static str,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedEnvVar {
+        fn set(key: &'static str, val: &str) -> Self {
+            let prev = std::env::var_os(key);
+            std::env::set_var(key, val);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for ScopedEnvVar {
+        fn drop(&mut self) {
+            if let Some(ref p) = self.prev {
+                std::env::set_var(self.key, p);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    struct ScopedSchedulerTrace {
+        _active: (),
+    }
+
+    impl ScopedSchedulerTrace {
+        fn start(hook: Option<std::sync::Arc<NativeSchedulerTestHook>>) -> Self {
+            let ev_lock = TEST_NATIVE_SCHEDULER_EVENTS.get_or_init(|| Mutex::new(None));
+            if let Ok(mut g) = ev_lock.lock() {
+                *g = Some(Vec::new());
+            }
+            let hk_lock = TEST_NATIVE_SCHEDULER_HOOK.get_or_init(|| Mutex::new(None));
+            if let Ok(mut g) = hk_lock.lock() {
+                *g = hook;
+            }
+            Self { _active: () }
+        }
+
+        fn take_events(&self) -> Vec<NativeSchedulerTestEvent> {
+            let mut out = Vec::new();
+            if let Some(lock) = TEST_NATIVE_SCHEDULER_EVENTS.get() {
+                if let Ok(mut g) = lock.lock() {
+                    if let Some(ref mut v) = *g {
+                        std::mem::swap(&mut out, v);
+                    }
+                }
+            }
+            out
+        }
+    }
+
+    impl Drop for ScopedSchedulerTrace {
+        fn drop(&mut self) {
+            if let Some(lock) = TEST_NATIVE_SCHEDULER_HOOK.get() {
+                if let Ok(mut g) = lock.lock() {
+                    *g = None;
+                }
+            }
+            if let Some(lock) = TEST_NATIVE_SCHEDULER_EVENTS.get() {
+                if let Ok(mut g) = lock.lock() {
+                    *g = None;
+                }
+            }
+        }
+    }
+
+    /// Speed-2 (1): Ready-queue prioritizes higher `b_level` critical-path modules over
+    /// lexicographically earlier leaf modules in the same initial wave, using cached
+    /// `actions.duration_ms` when present and source-byte fallback otherwise.
+    #[test]
+    fn test_speed2_critical_path_priority_over_wave_ready_set() -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let _jobs = ScopedEnvVar::set("TURBO_LEAN_JOBS", "1");
+        let dir = make_temp_test_dir("speed2_b_level_prio");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("App"))?;
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"prio\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+        )?;
+        // Wave 0 has `App.ALeaf` (lexicographically first, short leaf) and `App.ZRoot`
+        // (lexicographically last, root of chain `App.ZRoot -> App.ZMid -> App.ZTop`).
+        fs::write(proj_dir.join("App/ALeaf.lean"), "def aLeaf : Nat := 1\n")?;
+        fs::write(proj_dir.join("App/ZRoot.lean"), "def zRoot : Nat := 2\n")?;
+        fs::write(
+            proj_dir.join("App/ZMid.lean"),
+            "import App.ZRoot\ndef zMid : Nat := zRoot + 1\n",
+        )?;
+        fs::write(
+            proj_dir.join("App/ZTop.lean"),
+            "import App.ZMid\ndef zTop : Nat := zMid + 1\n",
+        )?;
+
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        let trace = ScopedSchedulerTrace::start(None);
+        let rep = build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        let events = trace.take_events();
+        assert_eq!(rep.modules_compiled, 4);
+        assert_eq!(rep.waves_count, 3);
+        let dispatches: Vec<String> = events
+            .iter()
+            .filter(|e| e.kind == "compile_dispatch")
+            .flat_map(|e| e.modules.clone())
+            .collect();
+        // Source-byte fallback gives `App.ZRoot` (`w(ZRoot)+w(ZMid)+w(ZTop)`) higher `b_level`
+        // than leaf `App.ALeaf`, so `App.ZRoot` dispatches before `App.ALeaf` despite `A < Z`.
+        assert_eq!(
+            dispatches.first().map(String::as_str),
+            Some("App.ZRoot"),
+            "critical-path root App.ZRoot must dispatch before wave-0 leaf App.ALeaf: {dispatches:?}"
+        );
+
+        // Now boost `App.ALeaf`'s cached `duration_ms` in `actions` (then delete its cached action
+        // row? No: keep `duration_ms` on `App.ALeaf`? Wait: if `App.ALeaf` is in CAS it hits CAS!
+        // Instead, test `compute_module_b_levels` directly with cached `duration_ms`, AND test
+        // rebuilding when `App.ZTop` has a huge cached `duration_ms` vs a second 2-node chain).
+        store.conn.execute(
+            "UPDATE actions SET duration_ms = 500000 WHERE kind = 'module_unit'",
+            [],
+        )?;
+        let cfg = resolve_project_config(&proj_dir)?;
+        let dag = build_module_dag_with_trust(&cfg, &[], false)?;
+        let (_, dependents) = compute_dag_schedule_edges(&dag.nodes, &dag.shared_libs);
+        let b_levels = compute_module_b_levels(
+            &store,
+            &cfg,
+            &dag,
+            &dependents,
+            "trusted",
+            false,
+            &HashMap::new(),
+        );
+        assert!(
+            b_levels["App.ZRoot"] >= 1_500_000 && b_levels["App.ALeaf"] >= 500_000,
+            "cached duration_ms must feed b_level weights: {b_levels:?}"
+        );
+        assert!(b_levels["App.ZRoot"] > b_levels["App.ZMid"]);
+        assert!(b_levels["App.ZMid"] > b_levels["App.ZTop"]);
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Speed-2 (2): A downstream module starts compiling as soon as its own dependencies are
+    /// accepted, without waiting for an unrelated slow module in its dependency's old wave.
+    #[test]
+    fn test_speed2_dependent_starts_before_unrelated_wave_peer_finishes() -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let _jobs = ScopedEnvVar::set("TURBO_LEAN_JOBS", "2");
+        let dir = make_temp_test_dir("speed2_no_wave_barrier");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("Fast"))?;
+        fs::create_dir_all(proj_dir.join("Slow"))?;
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"nobarrier\"\ndefaultTargets = [\"Fast\", \"Slow\"]\n[[lean_lib]]\nname = \"Fast\"\nglobs = [\"Fast.+\"]\n[[lean_lib]]\nname = \"Slow\"\nglobs = [\"Slow.+\"]\n",
+        )?;
+        fs::write(
+            proj_dir.join("Fast/Base.lean"),
+            "def fastBase : Nat := 10\n",
+        )?;
+        fs::write(
+            proj_dir.join("Fast/Child.lean"),
+            "import Fast.Base\ndef fastChild : Nat := fastBase + 1\n",
+        )?;
+        // Pad Slow/Peer.lean with comments so its initial b_level keeps both roots active on 2 workers,
+        // and use the scheduler test hook to hold `Slow.Peer`'s compile until `Fast.Child` starts!
+        let slow_src = format!("-- {}\ndef slowPeer : Nat := 99\n", "x".repeat(512));
+        fs::write(proj_dir.join("Slow/Peer.lean"), slow_src)?;
+
+        let pair = std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let pair_hook = std::sync::Arc::clone(&pair);
+        let hook: std::sync::Arc<NativeSchedulerTestHook> =
+            std::sync::Arc::new(move |kind: &str, mods: &[String]| {
+                if kind == "compile_subprocess_start" && mods.iter().any(|m| m == "Fast.Child") {
+                    let (lk, cv) = &*pair_hook;
+                    if let Ok(mut started) = lk.lock() {
+                        *started = true;
+                        cv.notify_all();
+                    }
+                }
+                if kind == "compile_subprocess_end" && mods.iter().any(|m| m == "Slow.Peer") {
+                    let (lk, cv) = &*pair_hook;
+                    if let Ok(guard) = lk.lock() {
+                        let _ = cv.wait_timeout_while(
+                            guard,
+                            std::time::Duration::from_secs(30),
+                            |started| !*started,
+                        );
+                    }
+                }
+            });
+
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        let trace = ScopedSchedulerTrace::start(Some(hook));
+        let rep = build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        let events = trace.take_events();
+        assert_eq!(rep.modules_compiled, 3);
+        let fast_child_start = events
+            .iter()
+            .find(|e| e.kind == "compile_subprocess_start" && e.modules == ["Fast.Child"])
+            .expect("Fast.Child compile_subprocess_start")
+            .at_ns;
+        let slow_peer_end = events
+            .iter()
+            .find(|e| e.kind == "compile_subprocess_end" && e.modules == ["Slow.Peer"])
+            .expect("Slow.Peer compile_subprocess_end")
+            .at_ns;
+        assert!(
+            fast_child_start <= slow_peer_end,
+            "Fast.Child (wave 1) must start compiling before wave-0 peer Slow.Peer finishes ({fast_child_start} vs {slow_peer_end})"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Speed-2 (3): `precompileModules` module dynlibs and library shared objects are built
+    /// incrementally and exist on disk before any downstream dependent starts compiling.
+    #[test]
+    fn test_speed2_dynlib_and_shared_lib_ready_before_dependents_compile() -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let _jobs = ScopedEnvVar::set("TURBO_LEAN_JOBS", "2");
+        let dir = make_temp_test_dir("speed2_dynlib_ready");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("Pre"))?;
+        fs::create_dir_all(proj_dir.join("Down"))?;
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            r#"name = "dynready"
+defaultTargets = ["Pre", "Down"]
+[[lean_lib]]
+name = "Pre"
+precompileModules = true
+roots = ["Pre.Top"]
+globs = ["Pre.+"]
+[[lean_lib]]
+name = "Down"
+roots = ["Down.Use"]
+globs = ["Down.+"]
+"#,
+        )?;
+        fs::write(proj_dir.join("Pre/A.lean"), "def preA : Nat := 11\n")?;
+        fs::write(proj_dir.join("Pre/B.lean"), "def preB : Nat := 22\n")?;
+        fs::write(
+            proj_dir.join("Pre/Top.lean"),
+            "import Pre.A\ndef preTop : Nat := preA + 1\n",
+        )?;
+        fs::write(
+            proj_dir.join("Down/Use.lean"),
+            "import Pre.Top\ndef usePre : Nat := preTop + 1\n",
+        )?;
+
+        let cfg = resolve_project_config(&proj_dir)?;
+        let tc_spec = query_toolchain_native_spec(&cfg.lean_bin)?;
+        let sh_ext = tc_spec.shared_lib_ext().to_string();
+        let mod_dynlib_a = proj_dir.join(format!(".lake/build/lib/lean/dynready_Pre_A.{sh_ext}"));
+        let co_export_b = proj_dir.join(".lake/build/ir/Pre/B.c.o.export");
+        let shared_lib_pre = proj_dir.join(format!(".lake/build/lib/libdynready_Pre.{sh_ext}"));
+
+        let saw_ready = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_ready_hook = std::sync::Arc::clone(&saw_ready);
+        let mod_a_chk = mod_dynlib_a.clone();
+        let co_b_chk = co_export_b.clone();
+        let sh_pre_chk = shared_lib_pre.clone();
+        let hook: std::sync::Arc<NativeSchedulerTestHook> =
+            std::sync::Arc::new(move |kind: &str, mods: &[String]| {
+                if kind == "compile_subprocess_start"
+                    && mods.iter().any(|m| m == "Down.Use")
+                    && mod_a_chk.is_file()
+                    && co_b_chk.is_file()
+                    && sh_pre_chk.is_file()
+                {
+                    saw_ready_hook.store(true, Ordering::SeqCst);
+                }
+            });
+
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        let _trace = ScopedSchedulerTrace::start(Some(hook));
+        let rep = build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        assert_eq!(rep.modules_compiled, 4);
+        assert!(
+            saw_ready.load(Ordering::SeqCst),
+            "Pre module dynlibs and shared library must already exist on disk when Down.Use starts compiling"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Speed-2 (4): Zygote audit runs in micro-batches (not 1 subprocess per module when multiple
+    /// candidates are ready) and overlaps with ongoing compilation / CAS blob hashing.
+    #[test]
+    fn test_speed2_microbatched_audit_and_cas_overlap() -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let _jobs = ScopedEnvVar::set("TURBO_LEAN_JOBS", "2");
+        let _batch = ScopedEnvVar::set("TURBO_LEAN_AUDIT_BATCH_SIZE", "4");
+        let dir = make_temp_test_dir("speed2_batch_overlap");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("Batch"))?;
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"batchproj\"\ndefaultTargets = [\"Batch\"]\n[[lean_lib]]\nname = \"Batch\"\nglobs = [\"Batch.+\"]\n",
+        )?;
+        for name in ["M1", "M2", "M3", "M4"] {
+            fs::write(
+                proj_dir.join(format!("Batch/{name}.lean")),
+                format!("def val{name} : Nat := 1\n"),
+            )?;
+        }
+
+        // First build populates per-module CAS and exercises concurrent compile + audit + CAS hashing.
+        let overlapped_compile_and_bg =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let overlap_flag = std::sync::Arc::clone(&overlapped_compile_and_bg);
+        let in_audit_or_cas = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bg_counter = std::sync::Arc::clone(&in_audit_or_cas);
+        let hook1: std::sync::Arc<NativeSchedulerTestHook> =
+            std::sync::Arc::new(move |kind: &str, _mods: &[String]| match kind {
+                "audit_subprocess_start" | "cas_hash_start" => {
+                    bg_counter.fetch_add(1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                }
+                "audit_subprocess_end" | "cas_hash_end" => {
+                    bg_counter.fetch_sub(1, Ordering::SeqCst);
+                }
+                "compile_subprocess_start" if bg_counter.load(Ordering::SeqCst) > 0 => {
+                    overlap_flag.store(true, Ordering::SeqCst);
+                }
+                _ => {}
+            });
+
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        let trace1 = ScopedSchedulerTrace::start(Some(hook1));
+        let rep1 = build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        let ev1 = trace1.take_events();
+        assert_eq!(rep1.modules_compiled, 4);
+        assert_eq!(
+            ev1.iter().filter(|e| e.kind == "cas_hash_start").count(),
+            4,
+            "all 4 compiled modules must stream through the background CAS hashing worker"
+        );
+        assert!(
+            overlapped_compile_and_bg.load(Ordering::SeqCst),
+            "compilation of remaining ready modules must overlap with background Zygote audit / CAS hashing"
+        );
+
+        // Second build after wiping `.lake/build`: all 4 CAS hits materialize and are audited in a
+        // single micro-batched Zygote subprocess (`batch_size == 4`), NOT 4 separate subprocesses!
+        fs::remove_dir_all(proj_dir.join(".lake/build"))?;
+        let trace2 = ScopedSchedulerTrace::start(None);
+        let rep2 = build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        let ev2 = trace2.take_events();
+        assert_eq!(rep2.modules_cached, 4);
+        let audit_batches: Vec<&Vec<String>> = ev2
+            .iter()
+            .filter(|e| e.kind == "audit_subprocess_start")
+            .map(|e| &e.modules)
+            .collect();
+        assert_eq!(
+            audit_batches.len(),
+            1,
+            "4 ready CAS hits with batch_size=4 must run in 1 micro-batched Zygote audit subprocess, got: {audit_batches:?}"
+        );
+        assert_eq!(audit_batches[0].len(), 4);
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Speed-2 (5): `CasRestored` audit failure fails closed, wipes the unverified materialized
+    /// outputs on disk, and never accepts or schedules downstream dependents.
+    #[test]
+    fn test_speed2_cas_restored_audit_failure_fails_closed_and_cleans_up() -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("speed2_cas_fail_closed");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("CasFail"))?;
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"casfail\"\ndefaultTargets = [\"CasFail\"]\n[[lean_lib]]\nname = \"CasFail\"\nglobs = [\"CasFail.+\"]\n",
+        )?;
+        fs::write(
+            proj_dir.join("CasFail/Base.lean"),
+            "theorem bad_thm : True := by sorry\n",
+        )?;
+        fs::write(
+            proj_dir.join("CasFail/Child.lean"),
+            "import CasFail.Base\ndef useBase : Nat := 1\n",
+        )?;
+
+        // Build `CasFail.Base` with `lake build` so we get real `.olean` artifacts containing `sorryAx`,
+        // then inject them into `TurboStore` under `CasFail.Base`'s `module_unit` key.
+        let out = Command::new("lake")
+            .args(["build", "CasFail.Base"])
+            .env("LEAN_NUM_THREADS", "2")
+            .current_dir(&proj_dir)
+            .output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "lake build CasFail.Base failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let cfg = resolve_project_config(&proj_dir)?;
+        let dag = build_module_dag_with_trust(&cfg, &[], false)?;
+        let base_node = dag.nodes.get("CasFail.Base").expect("CasFail.Base in dag");
+        let canon_proj = proj_dir.canonicalize()?;
+        let base_key = compute_module_cas_key(&cfg, base_node, &[], base_node.needs_c)?;
+
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        store_module_artifacts_in_cas(
+            &mut store,
+            &canon_proj,
+            base_node,
+            &base_key,
+            &cfg.toolchain,
+            "trusted",
+            1,
+            10,
+        )?;
+        fs::remove_dir_all(proj_dir.join(".lake/build"))?;
+
+        let trace = ScopedSchedulerTrace::start(None);
+        let err = build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        let events = trace.take_events();
+        assert!(
+            err.contains(
+                "In-kernel `.olean` audit rejected materialized CAS hit for module `CasFail.Base`"
+            ),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !base_node.olean_path.exists(),
+            "rejected CasRestored `.olean` must be wiped from `.lake/build`"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.modules.iter().any(|m| m == "CasFail.Child")),
+            "dependent CasFail.Child must never be scheduled or compiled when CasFail.Base fails audit: {events:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// Speed-2 (6): When a `WarmAdopted` on-disk candidate fails Zygote audit (even inside a
+    /// mixed batch with a valid `WarmAdopted` peer), only the rejected candidate is wiped and
+    /// recompiled from clean source before any of its dependents is accepted or compiled.
+    #[test]
+    fn test_speed2_warm_adopted_audit_failure_falls_back_before_dependent_starts() -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let _jobs = ScopedEnvVar::set("TURBO_LEAN_JOBS", "2");
+        let dir = make_temp_test_dir("speed2_warm_fallback");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("WarmFb"))?;
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"warmfb\"\ndefaultTargets = [\"WarmFb\"]\n[[lean_lib]]\nname = \"WarmFb\"\nglobs = [\"WarmFb.+\"]\n",
+        )?;
+        // First build with `sorry` in `WarmFb.Bad` via Lake so `.olean` has `sorryAx`.
+        fs::write(
+            proj_dir.join("WarmFb/Good.lean"),
+            "def goodVal : Nat := 7\n",
+        )?;
+        let sorry_src = "theorem warm_thm : True := by sorry\n";
+        let clean_src = "theorem warm_thm : True := trivial\n";
+        fs::write(proj_dir.join("WarmFb/Bad.lean"), sorry_src)?;
+        fs::write(
+            proj_dir.join("WarmFb/Child.lean"),
+            "import WarmFb.Bad\ntheorem child_thm : True := warm_thm\n",
+        )?;
+        let out = Command::new("lake")
+            .args(["build", "WarmFb.Good", "WarmFb.Bad"])
+            .env("LEAN_NUM_THREADS", "2")
+            .current_dir(&proj_dir)
+            .output()?;
+        anyhow::ensure!(
+            out.status.success(),
+            "lake build failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Now fix `WarmFb/Bad.lean` to clean `trivial` AND rewrite `Bad.trace`'s source hash AND
+        // recompute `depHash = lake_input_hash(&tv["inputs"])` so `probe_warm_on_disk_module_candidate`
+        // treats the stale `sorryAx`-tainted `.olean` as a `WarmAdopted` candidate; Zygote's in-kernel
+        // audit must catch `sorryAx`, wipe `WarmFb.Bad`, fall back to clean compilation of
+        // `WarmFb/Bad.lean`, and only THEN compile `WarmFb.Child`!
+        fs::write(proj_dir.join("WarmFb/Bad.lean"), clean_src)?;
+        let trace_path = proj_dir.join(".lake/build/lib/lean/WarmFb/Bad.trace");
+        let old_src_hash = format!("{:016x}", lake_hash_text(sorry_src));
+        let new_src_hash = format!("{:016x}", lake_hash_text(clean_src));
+        let patched_raw = fs::read_to_string(&trace_path)?.replace(&old_src_hash, &new_src_hash);
+        let mut tv: serde_json::Value = serde_json::from_str(&patched_raw)?;
+        let new_dep_h = format!("{:016x}", lake_input_hash(&tv["inputs"])?);
+        tv["depHash"] = serde_json::Value::String(new_dep_h);
+        fs::write(&trace_path, serde_json::to_vec(&tv)?)?;
+
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        let trace = ScopedSchedulerTrace::start(None);
+        let rep = build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        let events = trace.take_events();
+        assert_eq!(
+            rep.modules_up_to_date_reused, 1,
+            "WarmFb.Good must still be WarmAdopted without recompiling"
+        );
+        assert_eq!(
+            rep.compiled_modules,
+            vec!["WarmFb.Bad".to_string(), "WarmFb.Child".to_string()],
+            "WarmFb.Bad must fall back to source compilation and then unlock WarmFb.Child"
+        );
+        let fb_idx = events
+            .iter()
+            .position(|e| e.kind == "warm_fallback_to_compile" && e.modules == ["WarmFb.Bad"])
+            .expect("warm_fallback_to_compile for WarmFb.Bad");
+        let bad_accept_idx = events
+            .iter()
+            .position(|e| e.kind == "module_accepted" && e.modules == ["WarmFb.Bad"])
+            .expect("module_accepted for WarmFb.Bad");
+        let child_dispatch_idx = events
+            .iter()
+            .position(|e| e.kind == "compile_dispatch" && e.modules == ["WarmFb.Child"])
+            .expect("compile_dispatch for WarmFb.Child");
+        assert!(
+            fb_idx < bad_accept_idx && bad_accept_idx < child_dispatch_idx,
+            "WarmFb.Child must not dispatch until WarmFb.Bad falls back, recompiles, and passes audit (fb={fb_idx}, accept={bad_accept_idx}, child={child_dispatch_idx})"
         );
 
         let _ = fs::remove_dir_all(&dir);
