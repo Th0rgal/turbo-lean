@@ -1684,6 +1684,19 @@ pub fn execute_transpiled_cuda_kernel(
                 }
             }
         }
+        for orb_elan in [
+            "/var/lib/orb-node/.elan",
+            "/var/lib/orb-node/caches/elan",
+            "/var/lib/orb-node/work/caches/elan",
+            "/opt/orb/elan",
+            "/var/lib/sandboxed-node/.elan",
+            "/var/lib/sandboxed-node/caches/elan",
+        ] {
+            let p = Path::new(orb_elan).join("toolchains/leanprover--lean4---v4.35.0/bin/clang");
+            if p.exists() {
+                candidates.push((p, &["-x", "c++", "-O3", "-std=c++17"]));
+            }
+        }
         candidates.extend([
             (
                 PathBuf::from("clang"),
