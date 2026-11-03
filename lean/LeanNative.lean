@@ -3,6 +3,7 @@ import LeanNative.IR.Bridge
 import LeanNative.Driver.BuildExe
 import LeanNative.Proofs.MutantSuite
 import LeanNative.Proofs.AxiomAudit
+import LeanNative.Tests.RealLCNFBridgeTests
 
 namespace LeanNative
 

@@ -7,70 +7,30 @@ namespace LeanNative.IR
 open Lean
 open Lean.Compiler.LCNF
 
-/-- Canonical `Lean.Name` lookup table with explicit operand width (`LNIRType`).
-    Runtime `Nat` is excluded so unbounded integer operations fail closed. -/
-def canonicalScalarBinOpTypedTable : List (Lean.Name × LNIRType × BinOp) := [
-  (``UInt64.add, .i64, .add), (``UInt64.sub, .i64, .sub), (``UInt64.mul, .i64, .mul), (``UInt64.div, .i64, .div), (``UInt64.mod, .i64, .mod),
-  (``UInt64.land, .i64, .bitAnd), (``UInt64.lor, .i64, .bitOr), (``UInt64.xor, .i64, .bitXor), (``UInt64.shiftLeft, .i64, .shl), (``UInt64.shiftRight, .i64, .shr),
-  (``UInt64.decEq, .i64, .eq), (`UInt64.beq, .i64, .eq), (``UInt64.decLt, .i64, .lt), (`UInt64.blt, .i64, .lt), (``UInt64.decLe, .i64, .le), (`UInt64.ble, .i64, .le),
-  (``UInt32.add, .i32, .add), (``UInt32.sub, .i32, .sub), (``UInt32.mul, .i32, .mul), (``UInt32.div, .i32, .div), (``UInt32.mod, .i32, .mod),
-  (``UInt32.land, .i32, .bitAnd), (``UInt32.lor, .i32, .bitOr), (``UInt32.xor, .i32, .bitXor), (``UInt32.shiftLeft, .i32, .shl), (``UInt32.shiftRight, .i32, .shr),
-  (``UInt32.decEq, .i32, .eq), (`UInt32.beq, .i32, .eq), (``UInt32.decLt, .i32, .lt), (`UInt32.blt, .i32, .lt), (``UInt32.decLe, .i32, .le), (`UInt32.ble, .i32, .le),
-  (``UInt16.add, .i16, .add), (``UInt16.sub, .i16, .sub), (``UInt16.mul, .i16, .mul), (``UInt16.div, .i16, .div), (``UInt16.mod, .i16, .mod),
-  (``UInt16.land, .i16, .bitAnd), (``UInt16.lor, .i16, .bitOr), (``UInt16.xor, .i16, .bitXor), (``UInt16.shiftLeft, .i16, .shl), (``UInt16.shiftRight, .i16, .shr),
-  (``UInt16.decEq, .i16, .eq), (`UInt16.beq, .i16, .eq), (``UInt16.decLt, .i16, .lt), (`UInt16.blt, .i16, .lt), (``UInt16.decLe, .i16, .le), (`UInt16.ble, .i16, .le),
-  (``UInt8.add, .i8, .add), (``UInt8.sub, .i8, .sub), (``UInt8.mul, .i8, .mul), (``UInt8.div, .i8, .div), (``UInt8.mod, .i8, .mod),
-  (``UInt8.land, .i8, .bitAnd), (``UInt8.lor, .i8, .bitOr), (``UInt8.xor, .i8, .bitXor), (``UInt8.shiftLeft, .i8, .shl), (``UInt8.shiftRight, .i8, .shr),
-  (``UInt8.decEq, .i8, .eq), (`UInt8.beq, .i8, .eq), (``UInt8.decLt, .i8, .lt), (`UInt8.blt, .i8, .lt), (``UInt8.decLe, .i8, .le), (`UInt8.ble, .i8, .le),
-  (``USize.add, .usize, .add), (``USize.sub, .usize, .sub), (``USize.mul, .usize, .mul), (``USize.div, .usize, .div), (``USize.mod, .usize, .mod),
-  (``USize.land, .usize, .bitAnd), (``USize.lor, .usize, .bitOr), (``USize.xor, .usize, .bitXor), (``USize.shiftLeft, .usize, .shl), (``USize.shiftRight, .usize, .shr),
-  (``USize.decEq, .usize, .eq), (`USize.beq, .usize, .eq), (``USize.decLt, .usize, .lt), (`USize.blt, .usize, .lt), (``USize.decLe, .usize, .le), (`USize.ble, .usize, .le)
-]
+def canonicalScalarBinOpTypedTable : List (Lean.Name × LNIRType × BinOp) :=
+  RealLCNFBridge.canonicalScalarBinOpTypedTable
 
 def canonicalScalarBinOpTable : List (Lean.Name × BinOp) :=
-  canonicalScalarBinOpTypedTable.map fun (n, _, op) => (n, op)
+  RealLCNFBridge.canonicalScalarBinOpTable
 
 def lookupCanonicalTypedBinOp? (fnName : Lean.Name) : Option (LNIRType × BinOp) :=
-  (canonicalScalarBinOpTypedTable.find? (fun (n, _, _) => n == fnName)).map Prod.snd
+  RealLCNFBridge.lookupCanonicalTypedBinOp? fnName
 
 def lookupCanonicalBinOp? (fnName : Lean.Name) : Option BinOp :=
-  (lookupCanonicalTypedBinOp? fnName).map Prod.snd
+  RealLCNFBridge.lookupCanonicalBinOp? fnName
 
-/-- Exact primitive names and types only: unsigned narrowing truncates low bits;
-    widening masks by `min srcMask dstMask` to clamp any unmasked i64 representation. -/
 def canonicalUIntCastMask? (fnName : Lean.Name) (argTys : List LNIRType) (retTy : LNIRType)
-    (arch : TargetArch := .x86_64) : Option UInt64 := do
-  let usizeEntry : List (Lean.Name × LNIRType × UInt64) :=
-    if archSupportsUSize arch then [(``USize, .usize, archUSizeMask arch)] else []
-  let types : List (Lean.Name × LNIRType × UInt64) :=
-    [(``UInt8, .i8, 255), (``UInt16, .i16, 65535),
-     (``UInt32, .i32, 4294967295), (``UInt64, .i64, 18446744073709551615)] ++ usizeEntry
-  types.findSome? fun (src, srcTy, srcMask) => types.findSome? fun (dst, dstTy, dstMask) =>
-    if src != dst && fnName == Lean.Name.str src ("to" ++ dst.toString) &&
-        argTys == [srcTy] && retTy == dstTy then
-      some (min srcMask dstMask)
-    else none
+    (arch : TargetArch := .x86_64) : Option UInt64 :=
+  RealLCNFBridge.canonicalUIntCastMask? fnName argTys retTy arch
 
 def tryLowerIntrinsicCall (env : Lean.Environment) (fnName : Lean.Name) (argVars : List VarId)
     (retTy : LNIRType) (argTys : List LNIRType := []) (isLocal : Bool := false)
     (arch : TargetArch := .x86_64) : Option LNIRExpr :=
   match argVars with
-  | [lhs, rhs] =>
-    match tryLowerGfSimdIntrinsic env fnName argVars retTy argTys with
-    | some intr => some intr
-    | none =>
-      if isLocal then none
-      else match lookupCanonicalTypedBinOp? fnName with
-        | some (opTy, op) =>
-          if argTys != [opTy, opTy] then none
-          else .scalar <$> lowerScalarIntrinsicExpr? op lhs rhs opTy retTy arch
-        | none => lowerBoolBinIntrinsic? fnName lhs rhs argTys retTy
-  | [arg] =>
-    if isLocal then none else
-    match canonicalUIntCastMask? fnName argTys retTy arch with
-    | some effMask => some (.scalar (.binOp .bitAnd (.var arg) (.constU64 effMask)))
-    | none => lowerUnaryScalarIntrinsic? fnName arg argTys retTy arch
-  | _ => none
+  | [_, _] =>
+    (tryLowerGfSimdIntrinsic env fnName argVars retTy argTys).orElse fun _ =>
+      RealLCNFBridge.lowerCanonicalIntrinsicPure? fnName argVars retTy argTys isLocal arch
+  | _ => RealLCNFBridge.lowerCanonicalIntrinsicPure? fnName argVars retTy argTys isLocal arch
 
 def lowerNamedCall (fnName : Lean.Name) (args : Array (Lean.Compiler.LCNF.Arg pu)) (retTy : LNIRType) : BridgeM LNIRExpr := do
   let env ← getEnv
@@ -92,115 +52,18 @@ def lowerFVarCall (fvarId : Lean.FVarId) (args : Array (Lean.Compiler.LCNF.Arg p
     Lean.throwError "[lean-native] Unsupported escaping local function value"
   return .scalar (.var (← internFVar fvarId))
 
-def lowerImpureLetValue (lv : Lean.Compiler.LCNF.LetValue .impure) (retTy : LNIRType) : BridgeM LNIRExpr := do
-  match lv with
-  | .lit litVal => lowerLitValueM litVal retTy true
-  | .erased => return .scalar (.constU64 0)
-  | .fvar fvarId args => lowerFVarCall fvarId args retTy
-  | .ctor ctorInfo args _ =>
-    lowerTupleOrEnumCtor ctorInfo.name ctorInfo.cidx args retTy
-  | .reuse slotFVar ctorInfo _ args _ =>
-    if isUnboxedScalarOrTuple (← getVarType (← internFVar slotFVar)) then
-      return ← lowerTupleOrEnumCtor ctorInfo.name ctorInfo.cidx args retTy
-    Lean.throwError "[lean-native] Unsupported legacy heap reuse instruction in Stage 1B"
-  | .oproj idx fvarId _ => lowerTupleProj fvarId idx retTy true
-  | .uproj idx fvarId _ => lowerScalarProjM fvarId true idx 0 retTy
-  | .sproj n off fvarId _ => lowerScalarProjM fvarId false n off retTy
-  | .fap fnName args _ => lowerNamedCall fnName args retTy
-  | .pap fnName _ _ => Lean.throwError s!"[lean-native] Unsupported partial application (`pap {fnName}`) in Stage 1B"
-  | .box _ fvarId _ | .unbox fvarId _ =>
-    let v ← internFVar fvarId
-    let vt ← getVarType v
-    if isUnboxedScalarOrTuple vt || vt == .objPtr || vt == .taggedPtr then return .scalar (.var v)
-    else Lean.throwError s!"[lean-native] Unsupported boxing/unboxing of `{reprStr vt}` in Stage 1B"
-  | .isShared fvarId _ =>
-    let v ← internFVar fvarId
-    let vt ← getVarType v
-    if isUnboxedScalarOrTuple vt then return .scalar (.constBool true)
-    if (← get).allowStage1DHeap && (vt == .objPtr || vt == .taggedPtr) then return .isExclusive v
-    Lean.throwError "[lean-native] internal bridge error: unintercepted isShared"
-  | .reset _ fvarId _ =>
-    let v ← internFVar fvarId
-    if isUnboxedScalarOrTuple (← getVarType v) then return .scalar (.var v)
-    Lean.throwError "[lean-native] Unsupported heap reset instruction in Stage 1B"
+def lowerImpureLetValue (lv : Lean.Compiler.LCNF.LetValue .impure) (retTy : LNIRType) : BridgeM LNIRExpr :=
+  lowerImpureLetValueViaRealM lv retTy
 
 def lowerTagBranch (condVar : VarId) (cidx : Nat) (isBool : Bool) (yes no : LNIRCode) : BridgeM LNIRCode := do
   let condTy ← getVarType condVar
   if isBool || condTy == .i1 then
-    return if cidx == 0 then .ite condVar no yes else if cidx == 1 then .ite condVar yes no else no
+    return (RealLCNFBridge.lowerTagBranchPure condVar condTy cidx isBool 0 yes no).1
   let cmpVar ← freshBridgeVar .i1
-  return .letBind cmpVar .i1 (.scalar (.binOp .eq (.var condVar) (.constU64 cidx.toUInt64))) (.ite cmpVar yes no)
+  return (RealLCNFBridge.lowerTagBranchPure condVar condTy cidx isBool cmpVar yes no).1
 
-mutual
-partial def lowerImpureAlts (condVar : VarId) (isBool : Bool) (idx : Nat) (alts : List (Lean.Compiler.LCNF.Alt .impure))
-    (discr? : Option VarId := none) : BridgeM LNIRCode := do
-  -- C1.2: inside a heap `cases` alt the scrutinee's ctor (hence its `getCtorLayout` slots) is known
-  match alts with
-  | [] => return .unreachable
-  | [.alt ctorName params code _] =>
-    if !params.isEmpty then Lean.throwError s!"[lean-native] unsupported constructor payload pattern in {ctorName}"
-    lowerImpureCode code
-  | [.ctorAlt info code _] => withActiveCtor? discr? info.name (lowerImpureCode code)
-  | [.default code] => lowerImpureCode code
-  | alt :: rest =>
-    match alt with
-    | .ctorAlt info code _ =>
-      lowerTagBranch condVar info.cidx isBool (← withActiveCtor? discr? info.name (lowerImpureCode code))
-        (← lowerImpureAlts condVar isBool (idx + 1) rest discr?)
-    | .default code => lowerImpureCode code
-    | .alt ctorName params code _ =>
-      if !params.isEmpty then
-        Lean.throwError s!"[lean-native] unsupported constructor payload pattern in {ctorName}"
-      let cidx ← lookupCtorIdx ctorName idx
-      lowerTagBranch condVar cidx isBool (← lowerImpureCode code) (← lowerImpureAlts condVar isBool (idx + 1) rest)
-
-partial def lowerImpureCode (code : Lean.Compiler.LCNF.Code .impure) : BridgeM LNIRCode := do
-  match code with
-  | .let decl k =>
-    if let .ctor info args _ := decl.value then
-      if (← get).allowStage1DHeap && (info.usize > 0 || info.ssize > 0) then
-        return ← lowerRcCtorWithScalarsM decl.fvarId info.name args k lowerImpureCode
-    let rawDeclTy ← lowerBridgeType decl.type
-    if rawDeclTy != .unit then checkBridgeType s!"let binding `{decl.binderName}`" decl.type rawDeclTy true
-    let rhs ← lowerImpureLetValue decl.value rawDeclTy
-    let isBox := match decl.value with | .box _ _ _ => true | _ => false
-    let ty ← inferImpureRhsType rhs rawDeclTy isBox
-    let dst ← internFVar decl.fvarId ty true
-    match rhs with
-    | .isExclusive _ =>
-      let exclVar ← freshBridgeVar .i1
-      let kCode ← lowerImpureCode k
-      return .letBind exclVar .i1 rhs (.letBind dst .i1 (.scalar (.unaryOp .not (.var exclVar))) kCode)
-    | _ =>
-      return .letBind dst ty rhs (← lowerImpureCode k)
-  | .jp decl k => lowerJoinPoint decl k lowerImpureCode
-  | .jmp fvarId args => lowerJmpInstr fvarId args
-  | .inc fvarId n _ _ k _ => lowerRefOp true fvarId n (← lowerImpureCode k)
-  | .dec fvarId n _ _ _ k _ => lowerRefOp false fvarId n (← lowerImpureCode k)
-  | .del fvarId k _ => lowerDelM fvarId k lowerImpureCode
-  | .setTag fvarId cidx k _ => lowerSetTagM fvarId cidx k lowerImpureCode
-  | .oset fvarId idx y k _ => lowerOsetInstr fvarId idx y k lowerImpureCode
-  | .uset fvarId i y k _ => lowerScalarSetM fvarId true i 0 y k lowerImpureCode
-  | .sset fvarId n off y _ k _ => lowerScalarSetM fvarId false n off y k lowerImpureCode
-  | .cases c =>
-    let condVar ← internFVar c.discr
-    let condTy ← getVarType condVar
-    let st ← get
-    if st.allowStage1DHeap && c.typeName != ``Bool && (condTy == .objPtr || condTy == .taggedPtr) then
-      let tagVar ← freshBridgeVar .i64
-      let altsCode ← lowerImpureAlts tagVar false 0 (orderAlts c.alts.toList) (some condVar)
-      return .letBind tagVar .i64 (.call "lean_native_ctor_tag" [condVar] .i64 false) altsCode
-    else if !isSupportedStage1BScalarType condTy st.arch &&
-        !(c.typeName == ``Bool && st.inJoinPointBody && (condTy == .objPtr || condTy == .taggedPtr)) then
-      Lean.throwError s!"[lean-native] Unsupported cases scrutinee type `{c.typeName}`"
-    else
-      lowerImpureAlts condVar (c.typeName == ``Bool) 0 (orderAlts c.alts.toList)
-  | .return fvarId =>
-    if (← get).localFunMap.contains fvarId then
-      Lean.throwError "[lean-native] Unsupported returning local closure"
-    return .ret (← internFVar fvarId)
-  | .unreach _ => return .unreachable
-end
+def lowerImpureCode (code : Lean.Compiler.LCNF.Code .impure) : BridgeM LNIRCode :=
+  lowerImpureCodeViaRealM code
 
 def lowerPureLetValue (lv : Lean.Compiler.LCNF.LetValue .pure) (retTy : LNIRType) : BridgeM LNIRExpr := do
   match lv with
@@ -312,8 +175,17 @@ def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
           pure (.letBind retVar retTy intrExpr (.ret retVar))
         else if codeHasSelfTailCall decl.name c then
           Lean.throwError s!"[lean-native] unsupported self-tail recursion in {decl.name}: no qualified loop lowering"
-        else
-          lowerCodeFn c >>= compressScalarCode
+        else do
+          let rawBody ← lowerCodeFn c
+          let candBody ← compressScalarCode rawBody
+          let rawRetTy := match inferReturnedType rawBody with | some (.tuple fs) => .tuple fs | _ => retTy
+          let candRetTy := match inferReturnedType candBody with | some (.tuple fs) => .tuple fs | _ => retTy
+          let baseDecl : LNIRDecl := { name := metaInfo.mangledSymbol, params := lnirParams, retTy := rawRetTy, body := rawBody }
+          let candDecl : LNIRDecl := { baseDecl with retTy := candRetTy, body := candBody }
+          if candBody != rawBody && (LeanNative.Proofs.validateTranslationDecl baseDecl candDecl 64).passed then
+            pure candBody
+          else
+            pure rawBody
       let effRetTy := match inferReturnedType body with | some (.tuple fs) => .tuple fs | _ => retTy
       return {
         name := metaInfo.mangledSymbol, params := lnirParams, retTy := effRetTy, body := body,
@@ -325,8 +197,7 @@ def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
 
 def ingestLCNFImpureDecl (decl : Lean.Compiler.LCNF.Decl .impure)
     (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : Lean.CoreM LNIRDecl :=
-  ingestLCNFDeclGeneric decl (fun c => do modify ({ · with fvarCtor := collectFVarCtors c }); lowerImpureCode c)
-    localDeclNames arch true allowRcAdt
+  ingestImpureDeclViaReal decl localDeclNames arch allowRcAdt
 
 def ingestLCNFMonoDecl (decl : Lean.Compiler.LCNF.Decl .pure)
     (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64) : Lean.CoreM LNIRDecl :=

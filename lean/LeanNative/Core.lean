@@ -9,7 +9,7 @@ import LeanNative.Semantics.Eval
 import LeanNative.Semantics.Refinement
 import LeanNative.Proofs.PeepholeProofs
 import LeanNative.Proofs.LoopOptProofs
-import LeanNative.Proofs.LCNFBridgeProofs
+import LeanNative.Proofs.RealLCNFBridgeProofs
 import LeanNative.Proofs.BackendProofs
 import LeanNative.Proofs.SymbolicTVExpr
 import LeanNative.Proofs.SymbolicTVState

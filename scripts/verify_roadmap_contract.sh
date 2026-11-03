@@ -107,7 +107,8 @@ names = {r['theoremName'] for r in d['results']}
 required = [
     'LeanNative.Proofs.applyExprRules_sound',
     'LeanNative.Proofs.applyRewriteTable_sound',
-    'LeanNative.Proofs.lowerLCNFCode_sound',
+    'LeanNative.Proofs.lowerRealLCNFCode_sound',
+    'LeanNative.Proofs.lowerRealLCNFDecl_sound',
     'LeanNative.Transform.optimizeEqSatCode_sound',
     'LeanNative.Transform.scheduleStructuredLoop_sound',
     'LeanNative.Transform.elideAndMutateRC_sound',
