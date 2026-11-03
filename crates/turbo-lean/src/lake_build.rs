@@ -3089,9 +3089,21 @@ fn ensure_project_imports_fresh_inner(
         } else {
             false
         };
+        let olean_githash_stale = olean_meta.is_some()
+            && match root_cfg.as_ref() {
+                Some(cfg)
+                    if !cfg.lean_bin.as_os_str().is_empty()
+                        && cfg.lean_githash != "lean-not-installed" =>
+                {
+                    crate::module_builder::read_olean_header_version_and_githash(dep_olean)
+                        .is_none_or(|(_, gh)| !gh.eq_ignore_ascii_case(cfg.lean_githash.trim()))
+                }
+                _ => false,
+            };
         if pkg_inputs_stale
             || manifest_stale
             || lake_root_stale
+            || olean_githash_stale
             || mtime_stale
             || trace_stale
             || (unusable_manifest && olean_meta.is_some())

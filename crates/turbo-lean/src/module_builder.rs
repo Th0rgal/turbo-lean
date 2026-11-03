@@ -1279,31 +1279,49 @@ pub(crate) fn parse_olean_header_version_and_githash(bytes: &[u8]) -> Option<(St
     Some((version, githash))
 }
 
-fn read_olean_header_version_and_githash(path: &Path) -> Option<(String, String)> {
+pub(crate) fn read_olean_header_version_and_githash(path: &Path) -> Option<(String, String)> {
     use std::io::Read;
-    let mut f = fs::File::open(path).ok()?;
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = opts.open(path).ok()?;
+    if !f.metadata().ok()?.is_file() {
+        return None;
+    }
     let mut hdr = [0u8; 80];
     f.read_exact(&mut hdr).ok()?;
     parse_olean_header_version_and_githash(&hdr)
 }
 
-fn detect_project_olean_header_sample(project_dir: &Path) -> Option<(PathBuf, String, String)> {
+fn find_project_olean_header_with<F>(
+    project_dir: &Path,
+    mut pred: F,
+) -> Option<(PathBuf, String, String)>
+where
+    F: FnMut(&str) -> bool,
+{
     let mut lib_dirs: Vec<PathBuf> = vec![project_dir.join(".lake/build/lib/lean")];
     let pkgs_dir = project_dir.join(".lake/packages");
     if let Ok(entries) = fs::read_dir(&pkgs_dir) {
         let mut pkg_paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
         pkg_paths.sort();
         for p in pkg_paths {
-            lib_dirs.push(p.join(".lake/build/lib/lean"));
+            if fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir()) {
+                lib_dirs.push(p.join(".lake/build/lib/lean"));
+            }
         }
     }
-    let mut scanned = 0usize;
     for dir in lib_dirs {
-        if !dir.is_dir() {
+        if !fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
             continue;
         }
         for entry in walkdir::WalkDir::new(&dir)
             .follow_links(false)
+            .sort_by_file_name()
             .into_iter()
             .flatten()
         {
@@ -1313,32 +1331,33 @@ fn detect_project_olean_header_sample(project_dir: &Path) -> Option<(PathBuf, St
             {
                 continue;
             }
-            scanned += 1;
             if let Some((ver, gh)) = read_olean_header_version_and_githash(p) {
-                return Some((p.to_path_buf(), ver, gh));
-            }
-            if scanned >= 32 {
-                return None;
+                if pred(&gh) {
+                    return Some((p.to_path_buf(), ver, gh));
+                }
             }
         }
     }
     None
 }
 
-fn enforce_project_olean_githash_gate(
+fn detect_project_olean_header_sample(project_dir: &Path) -> Option<(PathBuf, String, String)> {
+    find_project_olean_header_with(project_dir, |_| true)
+}
+
+pub(crate) fn enforce_project_olean_githash_gate(
     project_dir: &Path,
     toolchain: &str,
     resolved_bin: &Path,
     resolved_githash: &str,
     elan_roots: &[PathBuf],
 ) -> Result<()> {
-    let Some((olean_path, olean_ver, olean_gh)) = detect_project_olean_header_sample(project_dir)
+    let expected = resolved_githash.trim();
+    let Some((olean_path, olean_ver, olean_gh)) =
+        find_project_olean_header_with(project_dir, |gh| !gh.eq_ignore_ascii_case(expected))
     else {
         return Ok(());
     };
-    if olean_gh.eq_ignore_ascii_case(resolved_githash.trim()) {
-        return Ok(());
-    }
     let roots_str = elan_roots
         .iter()
         .map(|r| r.display().to_string())
@@ -1352,7 +1371,7 @@ fn enforce_project_olean_githash_gate(
         olean_ver,
         olean_gh,
         resolved_bin.display(),
-        resolved_githash.trim(),
+        expected,
         roots_str
     );
 }
@@ -1585,13 +1604,15 @@ fn resolve_toolchain_compiler_with_roots(
             {
                 let (gh, lib_lean, lib) = (gh.clone(), lib_lean.clone(), lib.clone());
                 drop(guard);
-                enforce_project_olean_githash_gate(
-                    &canon_proj,
-                    toolchain,
-                    &canon_bin,
-                    &gh,
-                    &elan_roots,
-                )?;
+                if used_fallback_tc || crate::lake_build::worktree_auto_link_disabled(&canon_proj) {
+                    enforce_project_olean_githash_gate(
+                        &canon_proj,
+                        toolchain,
+                        &canon_bin,
+                        &gh,
+                        &elan_roots,
+                    )?;
+                }
                 return Ok((canon_bin, gh, lib_lean, lib));
             }
         }
@@ -1716,7 +1737,15 @@ fn resolve_toolchain_compiler_with_roots(
             (githash.clone(), lib_lean.clone(), lib.clone()),
         );
     }
-    enforce_project_olean_githash_gate(&canon_proj, toolchain, &canon_bin, &githash, &elan_roots)?;
+    if used_fallback_tc || crate::lake_build::worktree_auto_link_disabled(&canon_proj) {
+        enforce_project_olean_githash_gate(
+            &canon_proj,
+            toolchain,
+            &canon_bin,
+            &githash,
+            &elan_roots,
+        )?;
+    }
     Ok((canon_bin, githash, lib_lean, lib))
 }
 /// Absolute verifier tools from one installed toolchain. Never derive these from Lake's
@@ -8207,8 +8236,13 @@ fn prebuilt_closure_export_info(
     let res = (|| -> Option<LakeModuleExportInfo> {
         let (mut info, is_mod, tv) = prebuilt_artifact_traces(olean_path)?;
         let actual_imports_h = recorded_trace_imports_hash(&tv)?;
-        if !cfg.lean_githash.is_empty() {
-            let expected_gh = format!("{:016x}", lake_hash_bytes(cfg.lean_githash.as_bytes()));
+        if !cfg.lean_githash.is_empty() && cfg.lean_githash != "lean-not-installed" {
+            let expected_bgh = cfg.lean_githash.trim();
+            let (_, actual_bgh) = read_olean_header_version_and_githash(olean_path)?;
+            if !actual_bgh.eq_ignore_ascii_case(expected_bgh) {
+                return None;
+            }
+            let expected_gh = format!("{:016x}", lake_hash_bytes(expected_bgh.as_bytes()));
             let gh_ok = tv
                 .pointer("/inputs/2/1")
                 .and_then(|v| v.as_str())
@@ -8220,7 +8254,7 @@ fn prebuilt_closure_export_info(
             if !gh_ok {
                 return None;
             }
-        } else if cfg.lean_bin.as_os_str().is_empty() {
+        } else if cfg.lean_bin.as_os_str().is_empty() || cfg.lean_githash == "lean-not-installed" {
             return None;
         }
         let specs = prebuilt_import_specs(olean_path)?;
@@ -8404,6 +8438,14 @@ fn lake_closure_export_info_inner(
     let collect_pairs = out_closure_opt.is_some();
     let res = (|| -> Option<LakeModuleExportInfo> {
         let olean_path = spec_olean_path(spec);
+        if !cfg.lean_githash.is_empty() && cfg.lean_githash != "lean-not-installed" {
+            let (_, actual_bgh) = read_olean_header_version_and_githash(&olean_path)?;
+            if !actual_bgh.eq_ignore_ascii_case(cfg.lean_githash.trim()) {
+                return None;
+            }
+        } else if cfg.lean_bin.as_os_str().is_empty() || cfg.lean_githash == "lean-not-installed" {
+            return None;
+        }
         let src_raw = fs::read_to_string(&spec.src_path).ok()?;
         let hdr = parse_header_info(&src_raw);
         if hdr.header_error.is_some() {
@@ -9232,6 +9274,14 @@ fn is_dep_olean_fresh(
     let pkg_root = &spec.pkg_root;
     let src_path = &spec.src_path;
     if !is_regular_nonempty_file(olean_path) {
+        return None;
+    }
+    if !cfg.lean_githash.is_empty() && cfg.lean_githash != "lean-not-installed" {
+        let (_, actual_bgh) = read_olean_header_version_and_githash(olean_path)?;
+        if !actual_bgh.eq_ignore_ascii_case(cfg.lean_githash.trim()) {
+            return None;
+        }
+    } else if cfg.lean_bin.as_os_str().is_empty() || cfg.lean_githash == "lean-not-installed" {
         return None;
     }
     let om = fs::metadata(olean_path).ok()?;
@@ -17444,6 +17494,13 @@ pub fn hydrate_project_traces(project_dir: &Path) -> Result<HydrateTracesReport>
         canon_dir.display(),
         cfg.toolchain
     );
+    enforce_project_olean_githash_gate(
+        &canon_dir,
+        &cfg.toolchain,
+        &cfg.lean_bin,
+        &cfg.lean_githash,
+        &[],
+    )?;
     let expected_lake_inputs = workspace_lake_inputs_digest(&cfg)?;
     let allowed_axioms = crate::splitter::allowed_axioms();
 
@@ -30737,6 +30794,52 @@ globs = ["Down.+"]
             &[],
         )?;
 
+        // Scan-cap regression: place 40 matching `.olean` files (`A00.olean`..`A39.olean`) ahead of
+        // a skewed `Z99.olean` so any 32-file scan cap would miss `Z99.olean`.
+        fs::remove_file(&olean_p)?;
+        let good_hash = "0123456789abcdef0123456789abcdef01234567";
+        let mut good_hdr = hdr.clone();
+        good_hdr[40..80].copy_from_slice(good_hash.as_bytes());
+        for i in 0..40 {
+            fs::write(
+                dir.join(format!(".lake/build/lib/lean/A{:02}.olean", i)),
+                &good_hdr,
+            )?;
+        }
+        let z99 = dir.join(".lake/build/lib/lean/Z99.olean");
+        fs::write(&z99, &hdr)?;
+        let err_late = enforce_project_olean_githash_gate(
+            &dir,
+            "leanprover/lean4:v4.35.0",
+            Path::new("/fake/lean"),
+            good_hash,
+            &[],
+        )
+        .expect_err("skewed .olean past 32 files must still fail closed");
+        assert!(format!("{:#}", err_late).contains("Z99.olean"));
+        fs::remove_file(&z99)?;
+
+        // Symlink leaf regression (`O_NOFOLLOW`): a symlink `.olean` pointing at a skewed external file
+        // must NOT be followed by `read_olean_header_version_and_githash` or poison the scan.
+        #[cfg(unix)]
+        {
+            let ext_skew = dir.join("outside_skew.olean");
+            fs::write(&ext_skew, &hdr)?;
+            let sym_olean = dir.join(".lake/build/lib/lean/Sym.olean");
+            std::os::unix::fs::symlink(&ext_skew, &sym_olean)?;
+            assert!(
+                read_olean_header_version_and_githash(&sym_olean).is_none(),
+                "O_NOFOLLOW must reject symlink .olean leaf"
+            );
+            enforce_project_olean_githash_gate(
+                &dir,
+                "leanprover/lean4:v4.35.0",
+                Path::new("/fake/lean"),
+                good_hash,
+                &[],
+            )?;
+        }
+
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
@@ -30881,6 +30984,35 @@ globs = ["Down.+"]
             "hydrated mtime-skewed imports must require 0 Lake refreshes"
         );
         assert!(t_imp.elapsed().as_millis() < 200);
+
+        // 4) Toolchain-upgrade rebuild regression vs hydrate fail-closed skew gate:
+        // overwrite `W8/Base.olean` with a valid v2 header carrying an old toolchain githash while
+        // the exact requested toolchain (`v4.35.0`) is installed.
+        // - `hydrate_project_traces` MUST fail closed on the githash skew.
+        // - `turbo-lean build` MUST treat the skewed `.olean` as stale and rebuild it cleanly!
+        let mut skewed_bytes = fs::read(&base_olean)?;
+        assert!(skewed_bytes.len() >= 80);
+        skewed_bytes[40..80].copy_from_slice(b"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef");
+        fs::write(&base_olean, &skewed_bytes)?;
+        let hyd_err = hydrate_project_traces(&proj)
+            .expect_err("hydrate-traces must fail closed on skewed .olean githash");
+        assert!(format!("{:#}", hyd_err).contains("Prebuilt `.olean` toolchain/githash skew"));
+
+        crate::lake_build::run_build_command(
+            &mut store,
+            true,
+            vec!["W8/Leaf.lean".to_string()],
+            proj.clone(),
+            "trusted".to_string(),
+            0,
+            false,
+        )?;
+        let (_, rebuilt_gh) = read_olean_header_version_and_githash(&base_olean)
+            .expect("rebuilt Base.olean must have valid v2 header");
+        assert_ne!(
+            rebuilt_gh, "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+            "turbo-lean build must rebuild skewed .olean on toolchain upgrade instead of failing closed"
+        );
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())
