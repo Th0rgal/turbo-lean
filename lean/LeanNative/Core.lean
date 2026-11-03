@@ -1,6 +1,8 @@
 import LeanNative.IR.Types
 import LeanNative.IR.AST
 import LeanNative.IR.Codec
+import LeanNative.IR.ClosureADT
+import LeanNative.IR.SliceView
 import LeanNative.Spec
 import LeanNative.Semantics.Value
 import LeanNative.Semantics.Eval
@@ -14,6 +16,9 @@ import LeanNative.Proofs.CertChecker
 import LeanNative.Proofs.MutantSuite
 import LeanNative.Proofs.AxiomAudit
 import LeanNative.Proofs.HybridCAbiProofs
+import LeanNative.Proofs.KernelFusionProofs
+import LeanNative.Proofs.ClosureADTProofs
+import LeanNative.Proofs.SliceViewProofs
 import LeanNative.Transform.Pass
 import LeanNative.Transform.EqSat
 import LeanNative.Transform.LoopSchedule
@@ -22,6 +27,7 @@ import LeanNative.Transform.AlgebraicOpt
 import LeanNative.Transform.UnboxTupleSROA
 import LeanNative.Transform.HoistExclusivity
 import LeanNative.Transform.LoopVectorizeOpt
+import LeanNative.Transform.KernelFusion
 import LeanNative.Transform.Superopt
 import LeanNative.Transform.Plugins
 import LeanNative.Backend.LLVM
