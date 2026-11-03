@@ -18,6 +18,9 @@ import LeanNative.Transform.LoopSchedule
 import LeanNative.Transform.OwnershipRC
 import LeanNative.Backend.FastCheck
 import LeanNative.Proofs.HybridCAbiProofs
+import LeanNative.Proofs.KernelFusionProofs
+import LeanNative.Proofs.ClosureADTProofs
+import LeanNative.Proofs.SliceViewProofs
 import LeanNative.Backend.StableHLOAst
 
 namespace LeanNative.Proofs
@@ -239,6 +242,31 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.HybridCAbi.spliceOutputSlice_preserves_suffix_outside_cap
   , ``LeanNative.Proofs.HybridCAbi.execZeroCopySliceIoHostCall_failure_preserves_mem
   , ``LeanNative.Proofs.HybridCAbi.execZeroCopySliceIoHostCall_ok_sound
+  , ``LeanNative.Proofs.contractKernelScalar_sound
+  , ``LeanNative.Proofs.specializeKernelCode_refines
+  , ``LeanNative.Proofs.fuseMapScaleAddPair_algebra
+  , ``LeanNative.Proofs.fuseMapScaleAdd_loop_sound
+  , ``LeanNative.Proofs.fuseParForKernels_sound
+  , ``LeanNative.Proofs.fuseCustomScalar1_elem_sound
+  , ``LeanNative.Proofs.fuseCustomScalar1_bool_coerced_elem_sound
+  , ``LeanNative.Proofs.ctorTag_obj_sound
+  , ``LeanNative.Proofs.ctorTag_tuple_sound
+  , ``LeanNative.Proofs.ctorGetObj_sound
+  , ``LeanNative.Proofs.lowerClosureAlloc_sound
+  , ``LeanNative.Proofs.specializeKnownClosure_sound
+  , ``LeanNative.Proofs.lowerClosureSeqFor_step1_sound
+  , ``LeanNative.Proofs.adtMatchArm_taken
+  , ``LeanNative.Proofs.adtMatchArm_fallthrough
+  , ``LeanNative.Proofs.defunctionalizeClosure_sound
+  , ``LeanNative.Proofs.lowerAdtMatch_sound
+  , ``LeanNative.Proofs.checkedSubSlice_valid
+  , ``LeanNative.Proofs.checkedSubSlice_oob_rejects
+  , ``LeanNative.Proofs.subSliceBounds_no_oob
+  , ``LeanNative.Proofs.lowerSliceGet_sound
+  , ``LeanNative.Proofs.lowerSliceRawLoad_sound
+  , ``LeanNative.Proofs.sliceFoldStep_sound
+  , ``LeanNative.Proofs.sliceFoldLoop_sound
+  , ``LeanNative.Proofs.lowerSliceFold_sound
   ]
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/
