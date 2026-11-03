@@ -196,6 +196,28 @@ fn cli_allow_sorry_rejects_broken_trailing_defs_and_def_sorry() {
     );
     let j4: Value = serde_json::from_slice(&out4.stdout).expect("valid JSON");
     assert_eq!(j4["status"], "theorem_verified");
+
+    // 4) [P2] `check --decl <thm> --allow-sorry` MUST reject a broken trailing `def` in the same file
+    //    (cannot pass module-level skeleton mistakes just because `--decl` targeted an earlier theorem).
+    fs::write(
+        proj.join("W8/DeclTrailingBadDef.lean"),
+        "theorem clean_target : 3 + 3 = 6 := rfl\ndef brokenAfter : Nat := \"bad_string\"\n",
+    )
+    .unwrap();
+    let out5 = ws.run(&[
+        "--json",
+        "check",
+        "W8/DeclTrailingBadDef.lean",
+        "--decl",
+        "clean_target",
+        "--allow-sorry",
+    ]);
+    assert!(
+        !out5.status.success(),
+        "check --decl --allow-sorry must reject broken trailing def; stdout={} stderr={}",
+        String::from_utf8_lossy(&out5.stdout),
+        String::from_utf8_lossy(&out5.stderr)
+    );
 }
 
 #[test]
@@ -254,6 +276,73 @@ fn cli_check_withholds_stdout_and_runs_dependent_recheck_on_broken_importer() {
         "0-sorry check --allow-sorry must fail when non-local edit breaks downstream importer; stdout={} stderr={}",
         String::from_utf8_lossy(&c_allow.stdout),
         String::from_utf8_lossy(&c_allow.stderr)
+    );
+
+    // 3) [P2] In a git repo with a committed baseline, `check --decl base_ok --allow-sorry` on a
+    //    0-sorry file with a non-local signature/def edit that breaks `W8.Downstream` must ALSO
+    //    run `recheck_dependents_if_nonlocal` and fail!
+    fs::write(
+        proj.join("W8/Base.lean"),
+        "def baseVal : Nat := 10\ntheorem base_ok : baseVal = 10 := rfl\n",
+    )
+    .unwrap();
+    assert!(ws.run(&["build", "+W8.Downstream"]).status.success());
+    assert!(Command::new("git")
+        .arg("init")
+        .current_dir(&proj)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(&proj)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&proj)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args([
+            "add",
+            "lakefile.toml",
+            "lean-toolchain",
+            "W8/Base.lean",
+            "W8/Downstream.lean"
+        ])
+        .current_dir(&proj)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["commit", "--no-gpg-sign", "-m", "baseline"])
+        .current_dir(&proj)
+        .status()
+        .unwrap()
+        .success());
+
+    // Mutate `W8/Base.lean` non-locally (`baseVal := 99`), breaking `W8/Downstream.lean` vs HEAD.
+    fs::write(
+        proj.join("W8/Base.lean"),
+        "def baseVal : Nat := 99\ntheorem base_ok : baseVal = 99 := rfl\n",
+    )
+    .unwrap();
+    let c_decl_allow = ws.run(&[
+        "--json",
+        "check",
+        "W8/Base.lean",
+        "--decl",
+        "base_ok",
+        "--allow-sorry",
+    ]);
+    assert!(
+        !c_decl_allow.status.success(),
+        "0-sorry check --decl --allow-sorry must fail when non-local edit vs HEAD breaks downstream importer; stdout={} stderr={}",
+        String::from_utf8_lossy(&c_decl_allow.stdout),
+        String::from_utf8_lossy(&c_decl_allow.stderr)
     );
 }
 
@@ -439,5 +528,116 @@ fn cli_gate_reports_native_artifact_error_and_cone_export_isolates_same_decl_nam
             .iter()
             .any(|b| b["module"] == "NatW8.Top"),
         "expected NatW8.Top in blocked_downstream: {gate_json}"
+    );
+}
+
+#[test]
+fn cli_acc_rec_subsingleton_proof_change_invalidates_downstream_shard_cache_and_fails() {
+    let ws = TestWorkspace::new("acc_rec_soundness");
+    let proj = ws.proj();
+
+    // Upstream `W8/U.lean` v1: proves `accProof` constructively (`Acc.intro () (fun _ h => False.elim h)`),
+    // so `g` reduces to `5` in Lean's kernel via `Acc.rec` subsingleton elimination!
+    let u_constructive = "\
+theorem accProof : Acc (fun _ _ : Unit => False) () :=
+  Acc.intro () (fun _ h => False.elim h)
+
+def g : Nat :=
+  Acc.rec (motive := fun _ _ => Nat) (fun _ _ _ => 5) accProof
+";
+    // Upstream `W8/U.lean` v2: proves the EXACT SAME theorem type non-constructively via `Classical.choice`,
+    // so `g` gets stuck in the kernel (`Reduction got stuck` / definitional equality failure)!
+    let u_nonconstructive = "\
+theorem accProof : Acc (fun _ _ : Unit => False) () :=
+  Classical.choice ⟨Acc.intro () (fun _ h => False.elim h)⟩
+
+def g : Nat :=
+  Acc.rec (motive := fun _ _ => Nat) (fun _ _ _ => 5) accProof
+";
+    let d3_src = "\
+import W8.U
+theorem t : g = 5 := by decide +kernel
+";
+
+    fs::write(proj.join("W8/U.lean"), u_constructive).unwrap();
+    fs::write(proj.join("W8/D3.lean"), d3_src).unwrap();
+
+    // 1) Build `W8.U` and run `check` on `W8/D3.lean` (both `--decl t` and whole-file check) to populate shard CAS.
+    let b1 = ws.run(&["build", "+W8.U"]);
+    assert!(
+        b1.status.success(),
+        "initial build +W8.U failed: {}",
+        String::from_utf8_lossy(&b1.stderr)
+    );
+
+    let c1_decl = ws.run(&["--json", "check", "W8/D3.lean", "--decl", "t"]);
+    assert!(
+        c1_decl.status.success(),
+        "D3 check --decl t must succeed under constructive U.lean: stdout={} stderr={}",
+        String::from_utf8_lossy(&c1_decl.stdout),
+        String::from_utf8_lossy(&c1_decl.stderr)
+    );
+    let j1_decl: Value = serde_json::from_slice(&c1_decl.stdout).unwrap();
+    assert_eq!(j1_decl["status"], "theorem_verified");
+    let shard_key_v1 = j1_decl["shard_key"].as_str().unwrap().to_string();
+
+    // Repeat check to confirm shard CAS hit works when `U.olean` is unchanged.
+    let c1_hit = ws.run(&["--json", "check", "W8/D3.lean", "--decl", "t"]);
+    assert!(c1_hit.status.success());
+    let j1_hit: Value = serde_json::from_slice(&c1_hit.stdout).unwrap();
+    assert_eq!(j1_hit["status"], "theorem_cache_hit");
+    assert_eq!(j1_hit["shard_key"].as_str().unwrap(), shard_key_v1);
+
+    let c1_file = ws.run(&["--json", "check", "W8/D3.lean"]);
+    assert!(
+        c1_file.status.success(),
+        "whole-file D3 check must succeed under constructive U.lean"
+    );
+
+    // 2) Mutate `W8/U.lean` proof of `accProof` to `Classical.choice ⟨Acc.intro ...⟩` and rebuild `W8.U`.
+    fs::write(proj.join("W8/U.lean"), u_nonconstructive).unwrap();
+    let b2 = ws.run(&["build", "+W8.U"]);
+    assert!(
+        b2.status.success(),
+        "rebuild +W8.U failed: {}",
+        String::from_utf8_lossy(&b2.stderr)
+    );
+
+    // 3) Downstream `turbo-lean check` on `W8/D3.lean` MUST NOT hit the stale v1 shard cache and MUST FAIL!
+    let c2_decl = ws.run(&["--json", "check", "W8/D3.lean", "--decl", "t"]);
+    assert!(
+        !c2_decl.status.success(),
+        "SOUNDNESS BUG: `check W8/D3.lean --decl t` falsely certified stuck Acc.rec reduction after non-constructive proof edit! stdout={} stderr={}",
+        String::from_utf8_lossy(&c2_decl.stdout),
+        String::from_utf8_lossy(&c2_decl.stderr)
+    );
+
+    let c2_file = ws.run(&["--json", "check", "W8/D3.lean"]);
+    assert!(
+        !c2_file.status.success(),
+        "SOUNDNESS BUG: `check W8/D3.lean` falsely certified stuck Acc.rec reduction after non-constructive proof edit! stdout={} stderr={}",
+        String::from_utf8_lossy(&c2_file.stdout),
+        String::from_utf8_lossy(&c2_file.stderr)
+    );
+
+    let c2_allow = ws.run(&["--json", "check", "W8/D3.lean", "--allow-sorry"]);
+    assert!(
+        !c2_allow.status.success(),
+        "SOUNDNESS BUG: `check W8/D3.lean --allow-sorry` falsely certified stuck Acc.rec reduction! stdout={} stderr={}",
+        String::from_utf8_lossy(&c2_allow.stdout),
+        String::from_utf8_lossy(&c2_allow.stderr)
+    );
+
+    // Also verify module-level build (`build +W8.D3`): even if `W8.D3` had been built under v1,
+    // rebuilding `+W8.D3` under v2 MUST fail closed via `audit_or_replay_modules`!
+    fs::write(proj.join("W8/U.lean"), u_constructive).unwrap();
+    assert!(ws.run(&["build", "+W8.D3"]).status.success());
+    fs::write(proj.join("W8/U.lean"), u_nonconstructive).unwrap();
+    let b_d3_stuck = ws.run(&["build", "+W8.D3"]);
+    assert!(
+        !b_d3_stuck.status.success(),
+        "module-level early cutoff must also fail closed via kernel replay when Acc.rec reduction gets stuck! stdout={} stderr={}",
+        String::from_utf8_lossy(&b_d3_stuck.stdout),
+        String::from_utf8_lossy(&b_d3_stuck.stderr)
     );
 }

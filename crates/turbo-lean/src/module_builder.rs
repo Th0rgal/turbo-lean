@@ -1151,7 +1151,13 @@ pub fn parse_olean_binary_imports(bytes: &[u8]) -> Option<(Vec<ParsedImport>, bo
 }
 
 fn is_compiler_private_proof_helper_name(name: &str) -> bool {
-    name.starts_with("_private.") && name.contains("._proof_")
+    let Some(rest) = name.strip_prefix("_private.") else {
+        return false;
+    };
+    let Some((_, after_zero)) = rest.split_once(".0.") else {
+        return false;
+    };
+    after_zero.contains("._proof_")
 }
 
 const OLEAN_COMPACT_MAX_DEPTH: usize = 4096;
@@ -1168,18 +1174,25 @@ fn hash_olean_compact_graph(
             ptr: u64,
             depth: usize,
         },
-        FinishCtor {
+        StepCtor {
             ptr: u64,
+            depth: usize,
             m_tag: u8,
             m_other: u8,
-            children: Vec<u64>,
+            fields_start: usize,
+            num_objs: usize,
+            next_child_idx: usize,
             scalars_start: usize,
             obj_end: usize,
+            hasher: Box<blake3::Hasher>,
         },
-        FinishArray {
+        StepArray {
             ptr: u64,
-            m_other: u8,
-            elems: Vec<u64>,
+            depth: usize,
+            elems_start: usize,
+            sz: usize,
+            next_child_idx: usize,
+            hasher: Box<blake3::Hasher>,
         },
         FinishThunk {
             ptr: u64,
@@ -1248,29 +1261,20 @@ fn hash_olean_compact_graph(
                         if obj_end > bytes.len() || scalars_start > obj_end {
                             return None;
                         }
-                        let mut children = Vec::with_capacity(num_objs);
-                        for i in 0..num_objs {
-                            children.push(read_le_u64_at(bytes, fields_start + i * 8)?);
-                        }
-                        stack.push(WorkFrame::FinishCtor {
+                        let mut hasher = Box::new(blake3::Hasher::new());
+                        hasher.update(&[m_tag, m_other]);
+                        stack.push(WorkFrame::StepCtor {
                             ptr,
+                            depth,
                             m_tag,
                             m_other,
-                            children: children.clone(),
+                            fields_start,
+                            num_objs,
+                            next_child_idx: 0,
                             scalars_start,
                             obj_end,
+                            hasher,
                         });
-                        for &child_ptr in children.iter().rev() {
-                            if (child_ptr & 1) == 0
-                                && child_ptr != 0
-                                && !memo.contains_key(&child_ptr)
-                            {
-                                stack.push(WorkFrame::Enter {
-                                    ptr: child_ptr,
-                                    depth: depth + 1,
-                                });
-                            }
-                        }
                     }
                     246 => {
                         let sz =
@@ -1283,24 +1287,17 @@ fn hash_olean_compact_graph(
                         if elems_end > bytes.len() {
                             return None;
                         }
-                        let mut elems = Vec::with_capacity(sz);
-                        for i in 0..sz {
-                            elems.push(read_le_u64_at(bytes, elems_start + i * 8)?);
-                        }
-                        stack.push(WorkFrame::FinishArray {
+                        let mut hasher = Box::new(blake3::Hasher::new());
+                        hasher.update(&[246, m_other]);
+                        hasher.update(&(sz as u64).to_le_bytes());
+                        stack.push(WorkFrame::StepArray {
                             ptr,
-                            m_other,
-                            elems: elems.clone(),
+                            depth,
+                            elems_start,
+                            sz,
+                            next_child_idx: 0,
+                            hasher,
                         });
-                        for &elem_ptr in elems.iter().rev() {
-                            if (elem_ptr & 1) == 0 && elem_ptr != 0 && !memo.contains_key(&elem_ptr)
-                            {
-                                stack.push(WorkFrame::Enter {
-                                    ptr: elem_ptr,
-                                    depth: depth + 1,
-                                });
-                            }
-                        }
                     }
                     248 => {
                         if !matches!(m_other, 1 | 2 | 4 | 8) {
@@ -1353,36 +1350,86 @@ fn hash_olean_compact_graph(
                     _ => return None,
                 }
             }
-            WorkFrame::FinishCtor {
+            WorkFrame::StepCtor {
                 ptr,
+                depth,
                 m_tag,
                 m_other,
-                children,
+                fields_start,
+                num_objs,
+                mut next_child_idx,
                 scalars_start,
                 obj_end,
+                mut hasher,
             } => {
-                let mut h = blake3::Hasher::new();
-                h.update(&[m_tag, m_other]);
-                for child_ptr in children {
-                    h.update(&lookup_or_scalar(child_ptr, memo)?);
+                let mut pushed_unmemoized = false;
+                while next_child_idx < num_objs {
+                    let child_ptr = read_le_u64_at(bytes, fields_start + next_child_idx * 8)?;
+                    if let Some(dig) = lookup_or_scalar(child_ptr, memo) {
+                        hasher.update(&dig);
+                        next_child_idx += 1;
+                    } else {
+                        stack.push(WorkFrame::StepCtor {
+                            ptr,
+                            depth,
+                            m_tag,
+                            m_other,
+                            fields_start,
+                            num_objs,
+                            next_child_idx,
+                            scalars_start,
+                            obj_end,
+                            hasher: hasher.clone(),
+                        });
+                        stack.push(WorkFrame::Enter {
+                            ptr: child_ptr,
+                            depth: depth + 1,
+                        });
+                        pushed_unmemoized = true;
+                        break;
+                    }
                 }
-                h.update(bytes.get(scalars_start..obj_end)?);
-                in_progress.remove(&ptr);
-                memo.insert(ptr, *h.finalize().as_bytes());
+                if !pushed_unmemoized {
+                    hasher.update(bytes.get(scalars_start..obj_end)?);
+                    in_progress.remove(&ptr);
+                    memo.insert(ptr, *hasher.finalize().as_bytes());
+                }
             }
-            WorkFrame::FinishArray {
+            WorkFrame::StepArray {
                 ptr,
-                m_other,
-                elems,
+                depth,
+                elems_start,
+                sz,
+                mut next_child_idx,
+                mut hasher,
             } => {
-                let mut h = blake3::Hasher::new();
-                h.update(&[246, m_other]);
-                h.update(&(elems.len() as u64).to_le_bytes());
-                for elem_ptr in elems {
-                    h.update(&lookup_or_scalar(elem_ptr, memo)?);
+                let mut pushed_unmemoized = false;
+                while next_child_idx < sz {
+                    let elem_ptr = read_le_u64_at(bytes, elems_start + next_child_idx * 8)?;
+                    if let Some(dig) = lookup_or_scalar(elem_ptr, memo) {
+                        hasher.update(&dig);
+                        next_child_idx += 1;
+                    } else {
+                        stack.push(WorkFrame::StepArray {
+                            ptr,
+                            depth,
+                            elems_start,
+                            sz,
+                            next_child_idx,
+                            hasher: hasher.clone(),
+                        });
+                        stack.push(WorkFrame::Enter {
+                            ptr: elem_ptr,
+                            depth: depth + 1,
+                        });
+                        pushed_unmemoized = true;
+                        break;
+                    }
                 }
-                in_progress.remove(&ptr);
-                memo.insert(ptr, *h.finalize().as_bytes());
+                if !pushed_unmemoized {
+                    in_progress.remove(&ptr);
+                    memo.insert(ptr, *hasher.finalize().as_bytes());
+                }
             }
             WorkFrame::FinishThunk {
                 ptr,
@@ -33179,16 +33226,27 @@ globs = ["Down.+"]
         );
         assert_eq!(r2.early_cutoff_modules, vec!["W8.Leaf".to_string()]);
 
-        // `check W8/Leaf.lean --decl leaf_eq` must still hit the cached theorem shard (`theorem_cache_hit`)
-        // with the exact same `shard_key`!
+        // `check W8/Leaf.lean --decl leaf_eq` must NOT reuse `c1_shard_key` blindly because
+        // theorem-shard CAS hits skip kernel replay and subsingleton elimination (`Acc.rec`) can
+        // observe imported proof terms; instead it computes a new `shard_key` over `W8/Base.olean`'s
+        // raw bytes and re-verifies cleanly (`theorem_verified`), then hits CAS on repeat!
         let c2 = crate::check::evaluate_check_command_value(
             &mut store,
             PathBuf::from("W8/Leaf.lean"),
             Some("leaf_eq".to_string()),
             proj.clone(),
         )?;
-        assert_eq!(c2["status"], "theorem_cache_hit");
-        assert_eq!(c2["shard_key"].as_str().unwrap(), c1_shard_key);
+        assert_eq!(c2["status"], "theorem_verified");
+        let c2_shard_key = c2["shard_key"].as_str().unwrap().to_string();
+        assert_ne!(c2_shard_key, c1_shard_key);
+        let c2_hit = crate::check::evaluate_check_command_value(
+            &mut store,
+            PathBuf::from("W8/Leaf.lean"),
+            Some("leaf_eq".to_string()),
+            proj.clone(),
+        )?;
+        assert_eq!(c2_hit["status"], "theorem_cache_hit");
+        assert_eq!(c2_hit["shard_key"].as_str().unwrap(), c2_shard_key);
 
         // 3) Signature/def edit in `W8/Base.lean`: `evaluate_impact_report` marks `early_cutoff_eligible = false`,
         // populates `affected_downstream_modules = ["W8.Leaf"]`, and identifies `leaf_eq` in `downstream_decl_impacts`.
@@ -33516,12 +33574,45 @@ globs = ["Down.+"]
             "_private.W8.Base.0.W8.base_eq._proof_1"
         ));
         assert!(
+            !is_compiler_private_proof_helper_name("_private.Foo._proof_1"),
+            "user theorem in `namespace _private.Foo` without `.0.` hygiene marker must NOT be treated as a compiler private helper"
+        );
+        assert!(
             !is_compiler_private_proof_helper_name("Foo._proof_1"),
             "public user theorem containing `._proof_` must NOT be treated as a compiler private helper"
         );
         assert!(!is_compiler_private_proof_helper_name(
             "my_thm._proof_helper"
         ));
+
+        // 4b) Wide array (`sz = 50_000`) of distinct child objects hashes deterministically on a
+        //     tiny 128 KB thread stack without eager O(sz) stack-frame expansion.
+        let arr_sz: usize = 50_000;
+        let arr_bytes_len = 24 + arr_sz * 8;
+        let mut wide_buf = vec![0u8; arr_bytes_len + arr_sz * 16];
+        wide_buf[6] = 0;
+        wide_buf[7] = 246;
+        wide_buf[8..16].copy_from_slice(&(arr_sz as u64).to_le_bytes());
+        wide_buf[16..24].copy_from_slice(&(arr_sz as u64).to_le_bytes());
+        for i in 0..arr_sz {
+            let child_off = arr_bytes_len + i * 16;
+            let child_ptr = base_addr + child_off as u64;
+            wide_buf[24 + i * 8..24 + (i + 1) * 8].copy_from_slice(&child_ptr.to_le_bytes());
+            wide_buf[child_off + 4..child_off + 6].copy_from_slice(&16u16.to_le_bytes());
+            wide_buf[child_off + 6] = 1;
+            wide_buf[child_off + 7] = 0;
+            let leaf_scalar = ((i as u64) << 1) | 1;
+            wide_buf[child_off + 8..child_off + 16].copy_from_slice(&leaf_scalar.to_le_bytes());
+        }
+        let wide_res = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                let mut memo = HashMap::new();
+                hash_olean_compact_graph(&wide_buf, base_addr, base_addr, &mut memo)
+            })?
+            .join()
+            .expect("wide array thread must not overflow");
+        assert!(wide_res.is_some(), "wide array must hash cleanly");
 
         // 5) [P1-4a] Crafted `.olean` v2 binary missing `exportedAxiomsExt` in `entries` must return `None`
         //    from `compute_olean_theorem_interface_digest` (fail-closed fallback to full `.olean` BLAKE3).
@@ -33616,6 +33707,47 @@ globs = ["Down.+"]
             "signature change to public theorem `Foo._proof_1` must change theorem-interface digest"
         );
 
+        // 1b) [P2] User theorem in `namespace _private.Foo` (`_private.Foo._proof_1`) MUST NOT be
+        //     elided by `is_compiler_private_proof_helper_name`!
+        let u_priv = proj.join("W8/UserPrivateNs.lean");
+        fs::write(
+            &u_priv,
+            "namespace _private.Foo\ntheorem _proof_1 : 1 + 1 = 2 := rfl\nend _private.Foo\n",
+        )?;
+        build_project_modules_native(
+            &mut store,
+            &proj,
+            &["+W8.UserPrivateNs".to_string()],
+            "trusted",
+            0,
+            false,
+            true,
+            None,
+        )?;
+        let u_priv_olean = proj.join(".lake/build/lib/lean/W8/UserPrivateNs.olean");
+        let dig_p1 = compute_olean_theorem_interface_digest(&fs::read(&u_priv_olean)?)
+            .expect("valid compiled olean must produce theorem-interface digest");
+        fs::write(
+            &u_priv,
+            "namespace _private.Foo\ntheorem _proof_1 : 2 + 2 = 4 := rfl\nend _private.Foo\n",
+        )?;
+        build_project_modules_native(
+            &mut store,
+            &proj,
+            &["+W8.UserPrivateNs".to_string()],
+            "trusted",
+            0,
+            false,
+            true,
+            None,
+        )?;
+        let dig_p2 = compute_olean_theorem_interface_digest(&fs::read(&u_priv_olean)?)
+            .expect("valid compiled olean must produce theorem-interface digest");
+        assert_ne!(
+            dig_p1, dig_p2,
+            "signature change to `_private.Foo._proof_1` must change theorem-interface digest"
+        );
+
         // 2) [P1-6] `export --cone +W8.ConeA` must include `W8/ConeA.lean`'s `theorem foo` shard
         //    and EXCLUDE `W8/ConeB.lean`'s identically named `theorem foo` shard!
         fs::write(
@@ -33692,6 +33824,58 @@ globs = ["Down.+"]
             "ConeB's `theorem foo` shard must NOT leak into `--cone +W8.ConeA` export"
         );
 
+        // 2b) Mixed action output hardening: an action mixing an allowed file `rel_path` with a
+        //     `thm:` output whose `action_key` is NOT in `allowed_thm_action_keys` must be rejected!
+        let mixed_key = "mixed_action_not_in_thm_allowlist".to_string();
+        let existing_bh = store
+            .get_cached_action(&key_b, "trusted")?
+            .and_then(|outs| outs.into_iter().next())
+            .expect("key_b must have a cached blob")
+            .blob_hash;
+        let allowed_sample_rel = cone_filter
+            .allowed_rel_paths
+            .iter()
+            .next()
+            .expect("ConeA must have at least one allowed rel_path")
+            .clone();
+        store.conn.execute(
+            "INSERT INTO actions (action_key, toolchain_githash, kind, status, fencing_token, output_manifest_hash, duration_ms, peak_pss_bytes, heartbeats, trust_domain, updated_at, hit_count)
+             VALUES (?1, 'tc', 'module_unit', 'completed', 1, 'mh', 1, 0, 0, 'trusted', 0, 0)",
+            rusqlite::params![&mixed_key],
+        )?;
+        store.conn.execute(
+            "INSERT INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, ?2, ?3)",
+            rusqlite::params![&mixed_key, &allowed_sample_rel, &existing_bh],
+        )?;
+        store.conn.execute(
+            "INSERT INTO action_outputs (action_key, rel_path, blob_hash) VALUES (?1, 'thm:foo', ?2)",
+            rusqlite::params![&mixed_key, &existing_bh],
+        )?;
+        let mixed_pack = dir.join("conea_mixed_test.tlpack");
+        crate::pack::export_pack_filtered_with_signing_key_and_cone(
+            &store,
+            &mixed_pack,
+            true,
+            &HashSet::new(),
+            &HashSet::new(),
+            Some(sk_hex),
+            Some(&cone_filter),
+        )?;
+        let mut dst_mixed = TurboStore::open(Some(&dir.join("dst_mixed")))?;
+        crate::pack::import_pack_with_policy(
+            &mut dst_mixed,
+            &mixed_pack,
+            Some("trusted"),
+            Some(&vk_hex),
+            false,
+        )?;
+        assert!(
+            dst_mixed
+                .get_cached_action(&mixed_key, "trusted")?
+                .is_none(),
+            "mixed action with unallowed `thm:` output must not bypass ConeExportFilter"
+        );
+
         // 3) [P1-5] `evaluate_gate_report` captures `build_wave_native_artifacts` failures as structured
         //    `GateRootFailure` (`failure_kind == "native_artifact_error"`) with `gate_passed == false`,
         //    and blocks downstream importers!
@@ -33749,6 +33933,101 @@ globs = ["Down.+"]
                     && b.blocked_by.contains(&"NatMod.Base".to_string())),
             "expected NatMod.Top blocked by NatMod.Base, got: {:?}",
             gate_nat.blocked_downstream
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_wave8_acc_rec_subsingleton_proof_change_invalidates_prefix_env_hash() -> Result<()> {
+        let _env_lock_guard = native_build_env_guard();
+        let _bwrap_guard = BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo-w8-acc-rec-{}-{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let proj = dir.join("proj");
+        fs::create_dir_all(proj.join("W8"))?;
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"w8accrec\"\ndefaultTargets = [\"W8\"]\n[[lean_lib]]\nname = \"W8\"\nglobs = [\"W8.+\"]\n",
+        )?;
+
+        let u_v1 = "theorem accProof : Acc (fun _ _ : Unit => False) () :=\n  Acc.intro () (fun _ h => False.elim h)\ndef g : Nat := Acc.rec (motive := fun _ _ => Nat) (fun _ _ _ => 5) accProof\n";
+        let u_v2 = "theorem accProof : Acc (fun _ _ : Unit => False) () :=\n  Classical.choice ⟨Acc.intro () (fun _ h => False.elim h)⟩\ndef g : Nat := Acc.rec (motive := fun _ _ => Nat) (fun _ _ _ => 5) accProof\n";
+        let d3_src = "import W8.U\ntheorem t : g = 5 := by decide +kernel\n";
+
+        fs::write(proj.join("W8/U.lean"), u_v1)?;
+        fs::write(proj.join("W8/D3.lean"), d3_src)?;
+
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        build_project_modules_native(
+            &mut store,
+            &proj,
+            &["+W8.U".to_string()],
+            "trusted",
+            0,
+            false,
+            true,
+            None,
+        )?;
+        let canon_proj = proj.canonicalize().unwrap_or_else(|_| proj.clone());
+        let deps_v1 =
+            crate::lake_build::compute_imported_olean_interface_hashes(d3_src, &canon_proj, None);
+        let c1 = crate::check::evaluate_check_command_value(
+            &mut store,
+            PathBuf::from("W8/D3.lean"),
+            Some("t".to_string()),
+            proj.clone(),
+        )?;
+        assert_eq!(c1["status"], "theorem_verified");
+
+        // Rebuild `W8.U` with non-constructive `Classical.choice` proof of `accProof`:
+        // `compute_olean_theorem_interface_digest` on `U.olean` is equal, yet `lake_build.rs`
+        // `compute_imported_olean_interface_hashes` MUST change and `check W8/D3.lean --decl t` MUST fail!
+        let u_olean = canon_proj.join(".lake/build/lib/lean/W8/U.olean");
+        let iface_v1 = compute_olean_theorem_interface_digest(&fs::read(&u_olean)?)
+            .expect("U1.olean must have valid theorem-interface digest");
+
+        fs::write(proj.join("W8/U.lean"), u_v2)?;
+        build_project_modules_native(
+            &mut store,
+            &proj,
+            &["+W8.U".to_string()],
+            "trusted",
+            0,
+            false,
+            true,
+            None,
+        )?;
+        let iface_v2 = compute_olean_theorem_interface_digest(&fs::read(&u_olean)?)
+            .expect("U2.olean must have valid theorem-interface digest");
+        assert_eq!(
+            iface_v1, iface_v2,
+            "module-level theorem-interface digest masks theorem proof terms"
+        );
+
+        let deps_v2 =
+            crate::lake_build::compute_imported_olean_interface_hashes(d3_src, &canon_proj, None);
+        assert_ne!(
+            deps_v1, deps_v2,
+            "shard-level imported olean digest (`olean-full:v4:`) MUST distinguish U1.olean vs U2.olean"
+        );
+
+        let c2_err = crate::check::evaluate_check_command_value(
+            &mut store,
+            PathBuf::from("W8/D3.lean"),
+            Some("t".to_string()),
+            proj.clone(),
+        );
+        assert!(
+            c2_err.is_err(),
+            "check W8/D3.lean --decl t must fail when Acc.rec reduction gets stuck after Classical.choice proof edit"
         );
 
         let _ = fs::remove_dir_all(&dir);

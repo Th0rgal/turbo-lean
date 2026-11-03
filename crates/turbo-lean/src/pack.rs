@@ -1592,14 +1592,14 @@ pub fn export_pack_filtered_with_mode_signing_and_cone(
             return;
         }
         if let Some(cf) = cone_filter {
-            let matches_cone = outputs.iter().any(|o| !o.rel_path.starts_with("thm:"))
-                && outputs
-                    .iter()
-                    .filter(|o| !o.rel_path.starts_with("thm:"))
-                    .all(|o| cf.allowed_rel_paths.contains(&o.rel_path));
-            let matches_thm = outputs.iter().all(|o| o.rel_path.starts_with("thm:"))
-                && cf.allowed_thm_action_keys.contains(&meta.0);
-            if !matches_cone && !matches_thm {
+            let all_outputs_allowed = outputs.iter().all(|o| {
+                if o.rel_path.starts_with("thm:") {
+                    cf.allowed_thm_action_keys.contains(&meta.0)
+                } else {
+                    cf.allowed_rel_paths.contains(&o.rel_path)
+                }
+            });
+            if !all_outputs_allowed {
                 return;
             }
         }

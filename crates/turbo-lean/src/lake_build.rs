@@ -854,14 +854,8 @@ fn compute_single_olean_digest_and_imports(olean_path: &Path) -> Option<(String,
         .map(|(imps, _)| imps.into_iter().map(|i| i.module).collect::<Vec<String>>())
         .unwrap_or_default();
     let mut h = blake3::Hasher::new();
-    h.update(b"olean-iface:v4:");
-    if let Some(iface_dig) = crate::module_builder::compute_olean_theorem_interface_digest(&bytes) {
-        h.update(b"thm-iface:");
-        h.update(iface_dig.as_bytes());
-    } else {
-        h.update(b"raw:");
-        h.update(blake3::hash(&bytes).as_bytes());
-    }
+    h.update(b"olean-full:v4:");
+    h.update(blake3::hash(&bytes).as_bytes());
     let companions = [
         (
             "srv",
@@ -884,18 +878,7 @@ fn compute_single_olean_digest_and_imports(olean_path: &Path) -> Option<(String,
             Ok(cm) if cm.is_file() => {
                 let comp_bytes = fs::read(&comp_path).ok()?;
                 h.update(&[1u8]);
-                if (tag == "srv" || tag == "priv")
-                    && crate::module_builder::compute_olean_theorem_interface_digest(&comp_bytes)
-                        .map(|idig| {
-                            h.update(b"thm-iface:");
-                            h.update(idig.as_bytes());
-                        })
-                        .is_some()
-                {
-                } else {
-                    h.update(b"raw:");
-                    h.update(blake3::hash(&comp_bytes).as_bytes());
-                }
+                h.update(blake3::hash(&comp_bytes).as_bytes());
             }
             Ok(_) => return None,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

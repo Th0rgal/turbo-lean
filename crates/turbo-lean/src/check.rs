@@ -3082,6 +3082,16 @@ fn check_single_decl(
                 non_sorry.join(", ")
             );
         }
+        if !split.eligible_for_sharding {
+            anyhow::bail!(
+                "Cannot run partial `--allow-sorry` check on {}: {}",
+                active_file.display(),
+                split
+                    .fallback_reason
+                    .as_deref()
+                    .unwrap_or("module is not eligible for per-declaration sharding")
+            );
+        }
         let shard_lines: Vec<(usize, usize)> = split
             .shards
             .iter()
@@ -3107,6 +3117,38 @@ fn check_single_decl(
                 "Cannot run partial `--allow-sorry` check on {}: `sorry`/`admit` appears outside theorem shards ({}); definitions and non-theorem commands must be sorry-free",
                 active_file.display(),
                 outside_sorry.join(", ")
+            );
+        }
+        let (mut skel_env, _) = resolve_lake_env(store, canon_dir)?;
+        let default_stack = skel_env
+            .get("LEAN_STACK_SIZE_KB")
+            .cloned()
+            .or_else(|| std::env::var("LEAN_STACK_SIZE_KB").ok())
+            .unwrap_or_else(|| "262144".to_string());
+        skel_env.insert("LEAN_STACK_SIZE_KB".to_string(), default_stack);
+        let skel_lean_bin = resolve_lean_bin(canon_dir)?;
+        let skel_args =
+            crate::module_builder::try_resolve_lean_args_for_path(canon_dir, Some(&active_file))?;
+        let empty_uncached: HashSet<String> = HashSet::new();
+        let skeleton_src = splitter::build_coalesced_shard_source(&active_src, &empty_uncached);
+        let skel_out = crate::zygote::run_audited_lean_shard(
+            store,
+            Path::new(&skel_lean_bin),
+            &skel_env,
+            Some(canon_dir),
+            &skeleton_src,
+            &empty_uncached,
+            &skel_args,
+            Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+        )?;
+        if !skel_out.status.success() {
+            let stderr = String::from_utf8_lossy(&skel_out.stderr);
+            let stdout = String::from_utf8_lossy(&skel_out.stdout);
+            anyhow::bail!(
+                "Module definitions/signatures failed verification in {} under `--allow-sorry`:\n{}\n{}",
+                active_file.display(),
+                stdout.trim(),
+                stderr.trim()
             );
         }
     }
@@ -3258,7 +3300,9 @@ fn check_single_decl(
                 &attested.kernel_type_hash,
             )
         {
-            if !allow_sorry {
+            let file_is_sorry_free = !split.hygiene.has_checking_weakening
+                && split.hygiene.disallowed_items().is_empty();
+            if !allow_sorry || file_is_sorry_free {
                 crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, &active_file)?;
             }
             let elapsed_ms = t0.elapsed().as_millis();
@@ -3541,7 +3585,9 @@ fn check_single_decl(
             )?;
         }
 
-        if !allow_sorry {
+        let file_is_sorry_free =
+            !split.hygiene.has_checking_weakening && split.hygiene.disallowed_items().is_empty();
+        if !allow_sorry || file_is_sorry_free {
             crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, &active_file)?;
         }
         let (_, out_json) = emit_remote_decl_result(
@@ -3580,7 +3626,9 @@ fn check_single_decl(
 
     match singleflight_outcome {
         SingleflightOutcome::CacheHit { coalesced, .. } => {
-            if !allow_sorry {
+            let file_is_sorry_free = !split.hygiene.has_checking_weakening
+                && split.hygiene.disallowed_items().is_empty();
+            if !allow_sorry || file_is_sorry_free {
                 crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, &active_file)?;
             }
             let elapsed_ms = t0.elapsed().as_millis();
@@ -4751,7 +4799,9 @@ fn check_single_decl(
                 }
                 store.batch_put_theorem_shards(toolchain, &seed_items)?;
             }
-            if !allow_sorry {
+            let file_is_sorry_free = !split.hygiene.has_checking_weakening
+                && split.hygiene.disallowed_items().is_empty();
+            if !allow_sorry || file_is_sorry_free {
                 crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, &active_file)?;
             }
             if emit_stdout {
