@@ -99,12 +99,16 @@ def verifiedTheoremRegistry : List String :=
     "lowerAsyncPollStep_arm1_sound", "lowerAsyncPollStep_spec_sound",
     "lowerAsyncEventLoop_sound", "lowerAsyncEventLoop_threeStep_sound",
     "lowerAsyncAwaitChain_sound", "asyncStateMachinePass_sound",
-    "checkNonEscapingAsync_rejects_closure", "asyncStateMachine_zeroAlloc_nonvacuous"
+    "checkNonEscapingAsync_rejects_closure", "asyncStateMachine_zeroAlloc_nonvacuous",
+    "elideMarkMtAndZeroRc_sound", "optimizeThreadLocalOwnershipRC_sound",
+    "elideBorrowedAndThreadLocalRC_sound"
   ]
   let xform := [
     "optimizeEqSatCode_sound", "applyLoopScheduleAux_refines",
     "scheduleStructuredLoop_sound", "elideAndMutateRC_sound",
-    "evalSeqLoop_async_refines", "optimizeAsyncStateMachine_refines"
+    "evalSeqLoop_async_refines", "optimizeAsyncStateMachine_refines",
+    "elideMarkMtAndZeroRc_sound", "optimizeThreadLocalOwnershipRC_sound",
+    "elideBorrowedAndThreadLocalRC_sound"
   ]
   let sem := [
     "ScalarExprEquiv.refl", "ScalarExprEquiv.symm", "ScalarExprEquiv.trans",

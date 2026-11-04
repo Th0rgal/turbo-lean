@@ -403,14 +403,25 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.asyncStateMachinePass_sound
   , ``LeanNative.Proofs.checkNonEscapingAsync_rejects_closure
   , ``LeanNative.Proofs.asyncStateMachine_zeroAlloc_nonvacuous
-  , ``LeanNative.Proofs.elideMarkMtAndZeroRc_sound
+  , ``LeanNative.Transform.elideMarkMtAndZeroRc_sound
+  , ``LeanNative.Transform.optimizeThreadLocalOwnershipRC_sound
+  , ``LeanNative.Transform.elideBorrowedAndThreadLocalRC_sound
+  , ``LeanNative.Transform.evalIncRef_obj_uaf
+  , ``LeanNative.Transform.evalDecRef_obj_uaf
   , ``LeanNative.Proofs.unboxedStructLayout_disjoint_aligned
   , ``LeanNative.Proofs.lowerUnboxedRegionRcFree_true
   , ``LeanNative.Proofs.lowerUnboxedRegionCode_sound
   , ``LeanNative.Proofs.borrowedSliceSub_valid
+  , ``LeanNative.Proofs.evalBorrowedObjPair_cancel
+  , ``LeanNative.Proofs.elideMarkMtAndZeroRc_preserves_nonEscape
+  , ``LeanNative.Proofs.elideBorrowed_preserves_nonEscape
   , ``LeanNative.Proofs.threadLocalEscape_no_mark_mt_sound
+  , ``LeanNative.Proofs.headerRc_atomic_threadLocal_inc_equiv
+  , ``LeanNative.Proofs.headerRc_atomic_threadLocal_dec_equiv
   , ``LeanNative.Proofs.sendableTransfer_unique_sound
   , ``LeanNative.Proofs.portableSimdVec_lane_roundtrip_sound
+  , ``LeanNative.Proofs.portableSimdVec_oob_poison
+  , ``LeanNative.Proofs.disjoint_fields_storeInt_noninterference
   , ``LeanNative.Proofs.unboxedRegion_pipeline_nonvacuous
   ]
 

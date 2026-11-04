@@ -230,43 +230,22 @@ def ownershipRCPass : TransformPass :=
 /-- Drop `incRef`/`decRef` on `v` and replace `lean_mark_mt` calls by a scalar zero.
     Sound only for environments where `v` is non-owning; the verified contract below keeps
     the unconditionally refining fragment (zero-delta RC plus `lean_mark_mt` deletion). -/
-def elideBorrowedAndThreadLocalRC (v : VarId) (code : LNIRCode) : LNIRCode :=
-  match code with
-  | .letBind dst ty val k =>
-    match val with
-    | .call fn args rty ext =>
-      if fn == "lean_mark_mt" then
-        .letBind dst ty (.scalar (.constU64 0)) (elideBorrowedAndThreadLocalRC v k)
-      else
-        .letBind dst ty (.call fn args rty ext) (elideBorrowedAndThreadLocalRC v k)
-    | other =>
-      .letBind dst ty other (elideBorrowedAndThreadLocalRC v k)
-  | .rawStore pv iv vv ty k =>
-    .rawStore pv iv vv ty (elideBorrowedAndThreadLocalRC v k)
-  | .incRef ov c k =>
-    if ov == v || c == 0 then elideBorrowedAndThreadLocalRC v k
-    else .incRef ov c (elideBorrowedAndThreadLocalRC v k)
-  | .decRef ov c k =>
-    if ov == v || c == 0 then elideBorrowedAndThreadLocalRC v k
-    else .decRef ov c (elideBorrowedAndThreadLocalRC v k)
-  | .ite cv t e =>
-    .ite cv (elideBorrowedAndThreadLocalRC v t) (elideBorrowedAndThreadLocalRC v e)
-  | .seqFor iv lv hv av ai aty step k =>
-    .seqFor iv lv hv av ai aty (elideBorrowedAndThreadLocalRC v step) (elideBorrowedAndThreadLocalRC v k)
-  | .parFor ov lv ins ety kern k =>
-    .parFor ov lv ins ety kern (elideBorrowedAndThreadLocalRC v k)
-  | .ret r => .ret r
-  | .unreachable => .unreachable
+def valIsNonOwning (val : Val) : Bool :=
+  match val with
+  | .sarrayId _ | .objPtr _ => false
+  | _ => true
+
+def isMarkMtCall (e : LNIRExpr) : Bool :=
+  match e with
+  | .call fn _ _ _ => fn == "lean_mark_mt"
+  | _ => false
 
 /-- Unconditionally `CodeRefines` fragment: delete `lean_mark_mt` lets and zero-delta RC. -/
 def elideMarkMtAndZeroRc (code : LNIRCode) : LNIRCode :=
   match code with
   | .letBind dst ty val k =>
-    match val with
-    | .call fn args rty ext =>
-      if fn == "lean_mark_mt" then elideMarkMtAndZeroRc k
-      else .letBind dst ty (.call fn args rty ext) (elideMarkMtAndZeroRc k)
-    | other => .letBind dst ty other (elideMarkMtAndZeroRc k)
+    if isMarkMtCall val then elideMarkMtAndZeroRc k
+    else .letBind dst ty val (elideMarkMtAndZeroRc k)
   | .rawStore pv iv vv ty k => .rawStore pv iv vv ty (elideMarkMtAndZeroRc k)
   | .incRef ov c k =>
     if c == 0 then elideMarkMtAndZeroRc k else .incRef ov c (elideMarkMtAndZeroRc k)
@@ -279,64 +258,72 @@ def elideMarkMtAndZeroRc (code : LNIRCode) : LNIRCode :=
   | .ret r => .ret r
   | .unreachable => .unreachable
 
-theorem markMt_eval_error (env : VarEnv) (st : HeapState) (args : List VarId) (retTy : LNIRType)
-    (ext : Bool) (vals : List Val) (hargs : evalVarList env args = .ok vals) :
-    evalExpr env st (.call "lean_mark_mt" args retTy ext) = .error (.unsupportedCall "lean_mark_mt") := by
-  simp only [evalExpr, hargs]
-  have hbox : ("lean_mark_mt" == "lean_native_box_u64") = false := by decide
-  have hunbox : ("lean_mark_mt" == "lean_native_unbox_u64") = false := by decide
-  have hexcl : ("lean_mark_mt" == "lean_native_ensure_exclusive") = false := by decide
-  have hlen : ("lean_mark_mt" == "lean_native_sarray_len") = false := by decide
-  have hset : ("lean_mark_mt" == "lean_native_ctor_set") = false := by decide
-  have hsets : ("lean_mark_mt" == "lean_native_ctor_set_scalar") = false := by decide
-  have htag : ("lean_mark_mt" == "lean_native_ctor_set_tag") = false := by decide
-  have hdel : ("lean_mark_mt" == "lean_native_del_obj") = false := by decide
-  have hctag : ("lean_mark_mt" == "lean_native_ctor_tag") = false := by decide
-  cases ext <;>
-    simp [hbox, hunbox, hexcl, hlen, hset, hsets, htag, hdel, hctag]
+/-- Scope-aware borrowed/non-owning RC elision on `v` plus `lean_mark_mt` deletion. -/
+def elideBorrowedAndThreadLocalRC (v : VarId) (code : LNIRCode) : LNIRCode :=
+  match code with
+  | .letBind dst ty val k =>
+    let tail := if dst == v then elideMarkMtAndZeroRc k else elideBorrowedAndThreadLocalRC v k
+    if isMarkMtCall val then tail else .letBind dst ty val tail
+  | .rawStore pv iv vv ty k =>
+    .rawStore pv iv vv ty (elideBorrowedAndThreadLocalRC v k)
+  | .incRef ov c k =>
+    if ov == v || c == 0 then elideBorrowedAndThreadLocalRC v k
+    else .incRef ov c (elideBorrowedAndThreadLocalRC v k)
+  | .decRef ov c k =>
+    if ov == v || c == 0 then elideBorrowedAndThreadLocalRC v k
+    else .decRef ov c (elideBorrowedAndThreadLocalRC v k)
+  | .ite cv t e =>
+    .ite cv (elideBorrowedAndThreadLocalRC v t) (elideBorrowedAndThreadLocalRC v e)
+  | .seqFor iv lv hv av ai aty step k =>
+    let step' :=
+      if iv == v || av == v then elideMarkMtAndZeroRc step
+      else elideBorrowedAndThreadLocalRC v step
+    let k' := if av == v then elideMarkMtAndZeroRc k else elideBorrowedAndThreadLocalRC v k
+    .seqFor iv lv hv av ai aty step' k'
+  | .parFor ov lv ins ety kern k =>
+    let k' := if ov == v then elideMarkMtAndZeroRc k else elideBorrowedAndThreadLocalRC v k
+    .parFor ov lv ins ety kern k'
+  | .ret r => .ret r
+  | .unreachable => .unreachable
+
+theorem markMt_eval_not_ok (env : VarEnv) (st : HeapState) (e : LNIRExpr)
+    (hmt : isMarkMtCall e = true) (pair : Val × HeapState) :
+    evalExpr env st e ≠ .ok pair := by
+  cases e with
+  | call fn args retTy ext =>
+    have hfn : fn = "lean_mark_mt" := of_decide_eq_true hmt
+    subst hfn
+    intro hok
+    cases hargs : evalVarList env args with
+    | error _ => simp [evalExpr, hargs] at hok
+    | ok vals =>
+      have hbox : ("lean_mark_mt" == "lean_native_box_u64") = false := by decide
+      have hunbox : ("lean_mark_mt" == "lean_native_unbox_u64") = false := by decide
+      have hexcl : ("lean_mark_mt" == "lean_native_ensure_exclusive") = false := by decide
+      have hlen : ("lean_mark_mt" == "lean_native_sarray_len") = false := by decide
+      have hset : ("lean_mark_mt" == "lean_native_ctor_set") = false := by decide
+      have hsets : ("lean_mark_mt" == "lean_native_ctor_set_scalar") = false := by decide
+      have htag : ("lean_mark_mt" == "lean_native_ctor_set_tag") = false := by decide
+      have hdel : ("lean_mark_mt" == "lean_native_del_obj") = false := by decide
+      have hctag : ("lean_mark_mt" == "lean_native_ctor_tag") = false := by decide
+      cases ext <;>
+        simp [evalExpr, hargs, hbox, hunbox, hexcl, hlen, hset, hsets, htag, hdel, hctag] at hok
+  | _ => cases hmt
 
 theorem elideMarkMtAndZeroRc_sound (code : LNIRCode) :
     CodeRefines code (elideMarkMtAndZeroRc code) := by
   induction code with
   | letBind dst ty val k ih =>
-    cases val with
-    | call fn args retTy ext =>
-      by_cases hmt : (fn == "lean_mark_mt") = true
-      · have hfn : fn = "lean_mark_mt" := of_decide_eq_true hmt
-        subst hfn
-        intro fuel env st v st' hsrc
-        dsimp only [elideMarkMtAndZeroRc]
-        simp only [beq_self_eq_true, ↓reduceIte]
-        dsimp only [evalCode] at hsrc
-        cases hargs : evalVarList env args with
-        | error err => simp [evalExpr, hargs] at hsrc
-        | ok vals =>
-          rw [markMt_eval_error env st args retTy ext vals hargs] at hsrc
-          contradiction
-      · dsimp only [elideMarkMtAndZeroRc]
-        rw [ite_eq_right hmt]
-        exact CodeRefines.letBind_congr (ExprRefines.refl _) ih
-    | scalar e => exact CodeRefines.letBind_congr (ExprRefines.refl (.scalar e)) ih
-    | constU256 w => exact CodeRefines.letBind_congr (ExprRefines.refl (.constU256 w)) ih
-    | mulDivDown a b d => exact CodeRefines.letBind_congr (ExprRefines.refl (.mulDivDown a b d)) ih
-    | mulDivUp a b d => exact CodeRefines.letBind_congr (ExprRefines.refl (.mulDivUp a b d)) ih
-    | storageLoad a b => exact CodeRefines.letBind_congr (ExprRefines.refl (.storageLoad a b)) ih
-    | storageStore a b c => exact CodeRefines.letBind_congr (ExprRefines.refl (.storageStore a b c)) ih
-    | mkTuple fs => exact CodeRefines.letBind_congr (ExprRefines.refl (.mkTuple fs)) ih
-    | projTuple a i => exact CodeRefines.letBind_congr (ExprRefines.refl (.projTuple a i)) ih
-    | allocCtor t o s => exact CodeRefines.letBind_congr (ExprRefines.refl (.allocCtor t o s)) ih
-    | ctorGetObj a i => exact CodeRefines.letBind_congr (ExprRefines.refl (.ctorGetObj a i)) ih
-    | ctorGetScalar a i t => exact CodeRefines.letBind_congr (ExprRefines.refl (.ctorGetScalar a i t)) ih
-    | isExclusive a => exact CodeRefines.letBind_congr (ExprRefines.refl (.isExclusive a)) ih
-    | sarrayLen a => exact CodeRefines.letBind_congr (ExprRefines.refl (.sarrayLen a)) ih
-    | sarrayDataPtr a t => exact CodeRefines.letBind_congr (ExprRefines.refl (.sarrayDataPtr a t)) ih
-    | sarrayEnsureExclusive a t =>
-      exact CodeRefines.letBind_congr (ExprRefines.refl (.sarrayEnsureExclusive a t)) ih
-    | sarrayGet a i t => exact CodeRefines.letBind_congr (ExprRefines.refl (.sarrayGet a i t)) ih
-    | sarraySet a i x t => exact CodeRefines.letBind_congr (ExprRefines.refl (.sarraySet a i x t)) ih
-    | rawLoad a i t => exact CodeRefines.letBind_congr (ExprRefines.refl (.rawLoad a i t)) ih
-    | boxScalar a t => exact CodeRefines.letBind_congr (ExprRefines.refl (.boxScalar a t)) ih
-    | unboxScalar a t => exact CodeRefines.letBind_congr (ExprRefines.refl (.unboxScalar a t)) ih
+    dsimp only [elideMarkMtAndZeroRc]
+    by_cases hmt : isMarkMtCall val = true
+    · rw [ite_eq_left hmt]
+      intro fuel env st v st' hsrc
+      dsimp only [evalCode] at hsrc
+      cases he : evalExpr env st val with
+      | error _ => rw [he] at hsrc; contradiction
+      | ok pair => exact False.elim (markMt_eval_not_ok env st val hmt pair he)
+    · rw [ite_eq_right hmt]
+      exact CodeRefines.letBind_congr (ExprRefines.refl val) ih
   | rawStore pv iv vv ty k ih => exact CodeRefines.rawStore_congr ih
   | incRef ov c k ih =>
     dsimp only [elideMarkMtAndZeroRc]
@@ -406,6 +393,277 @@ theorem elideMarkMtAndZeroRc_sound (code : LNIRCode) :
   | ret r => exact CodeRefines.refl (.ret r)
   | unreachable => exact CodeRefines.refl .unreachable
 
+theorem evalIncRef_nonOwning (st : HeapState) (env : VarEnv) (v : VarId) (c : Nat)
+    (val : Val) (hv : env v = some val) (hown : valIsNonOwning val = true) :
+    st.evalIncRef env v c = .ok st := by
+  unfold HeapState.evalIncRef
+  rw [hv]
+  cases val <;> simp_all [valIsNonOwning]
+
+theorem evalDecRef_nonOwning (st : HeapState) (env : VarEnv) (v : VarId) (c : Nat)
+    (val : Val) (hv : env v = some val) (hown : valIsNonOwning val = true) :
+    st.evalDecRef env v c = .ok st := by
+  unfold HeapState.evalDecRef
+  rw [hv]
+  cases val <;> simp_all [valIsNonOwning]
+
+theorem evalIncRef_obj_uaf (st : HeapState) (env : VarEnv) (v : VarId) (objId c : Nat)
+    (hv : env v = some (.objPtr objId)) (hdead : st.getObjRefCount objId = 0) :
+    st.evalIncRef env v c = .error (.useAfterFree objId) := by
+  unfold HeapState.evalIncRef HeapState.incRefObj
+  rw [hv]
+  simp [hdead]
+
+theorem evalDecRef_obj_uaf (st : HeapState) (env : VarEnv) (v : VarId) (objId c : Nat)
+    (hv : env v = some (.objPtr objId)) (hdead : st.getObjRefCount objId = 0) :
+    st.evalDecRef env v c = .error (.useAfterFree objId) := by
+  unfold HeapState.evalDecRef HeapState.decRefObj HeapState.decRefObjFuel
+  rw [hv]
+  simp [hdead]
+
+theorem bind_other_eq {env : VarEnv} {v dst : VarId} {bound val : Val}
+    (hshadow : ¬(dst == v) = true) (hv : env v = some val) :
+    (env.bind dst bound) v = some val := by
+  have hne : (v == dst) = false := by
+    cases hvd : (v == dst) with
+    | false => rfl
+    | true =>
+      have heq : v = dst := of_decide_eq_true hvd
+      subst heq
+      simp at hshadow
+  simpa [VarEnv.bind, hne] using hv
+
+theorem evalSeqLoop_borrowed_rc (count curIdx : Nat) (iv av v : VarId)
+    (vinit val : Val) (env : VarEnv) (st : HeapState) (finalAcc : Val) (st1 : HeapState)
+    (fuel : Nat) (step : LNIRCode) (hv : env v = some val)
+    (hiv : ¬(iv == v) = true) (hav : ¬(av == v) = true)
+    (ihs : ∀ senv sst, senv v = some val → ∀ outV st',
+      evalCode fuel senv sst step = .ok (outV, st') →
+      evalCode fuel senv sst (elideBorrowedAndThreadLocalRC v step) = .ok (outV, st'))
+    (hloop : evalSeqLoop count curIdx iv av vinit env st
+      (fun stepEnv stepSt => evalCode fuel stepEnv stepSt step) = .ok (finalAcc, st1)) :
+    evalSeqLoop count curIdx iv av vinit env st
+      (fun stepEnv stepSt => evalCode fuel stepEnv stepSt (elideBorrowedAndThreadLocalRC v step)) =
+        .ok (finalAcc, st1) := by
+  induction count generalizing curIdx vinit st with
+  | zero => exact hloop
+  | succ count' ih =>
+    simp only [evalSeqLoop] at hloop ⊢
+    cases hs1 : evalCode fuel ((env.bind iv (.u64 curIdx.toUInt64)).bind av vinit) st step with
+    | error _ => rw [hs1] at hloop; contradiction
+    | ok spair =>
+      rcases spair with ⟨nextAcc, sst1⟩
+      rw [hs1] at hloop
+      have hvStep : ((env.bind iv (.u64 curIdx.toUInt64)).bind av vinit) v = some val :=
+        bind_other_eq hav (bind_other_eq hiv hv)
+      rw [ihs _ st hvStep nextAcc sst1 hs1]
+      exact ih (curIdx + 1) nextAcc sst1 hloop
+
+/-- Forward simulation for `elideBorrowedAndThreadLocalRC` whenever `v` is bound in `env`
+    to a non-owning runtime value (such as a borrowed `.rawPtrId` region pointer or scalar). -/
+theorem elideBorrowedAndThreadLocalRC_sound (v : VarId) (code : LNIRCode)
+    (fuel : Nat) (env : VarEnv) (st : HeapState) (outV : Val) (st' : HeapState)
+    (val : Val) (hv : env v = some val) (hown : valIsNonOwning val = true)
+    (hsrc : evalCode fuel env st code = .ok (outV, st')) :
+    evalCode fuel env st (elideBorrowedAndThreadLocalRC v code) = .ok (outV, st') := by
+  induction code generalizing env st outV st' with
+  | letBind dst ty expr k ih =>
+    dsimp only [elideBorrowedAndThreadLocalRC]
+    by_cases hmt : isMarkMtCall expr = true
+    · dsimp only [evalCode] at hsrc
+      cases he : evalExpr env st expr with
+      | error _ => rw [he] at hsrc; contradiction
+      | ok pair => exact False.elim (markMt_eval_not_ok env st expr hmt pair he)
+    · rw [ite_eq_right hmt]
+      dsimp only [evalCode] at hsrc ⊢
+      cases he : evalExpr env st expr with
+      | error _ => rw [he] at hsrc; contradiction
+      | ok pair =>
+        rcases pair with ⟨bound, st1⟩
+        rw [he] at hsrc
+        by_cases hsh : (dst == v) = true
+        · rw [ite_eq_left hsh]
+          exact elideMarkMtAndZeroRc_sound k fuel (env.bind dst bound) st1 outV st' hsrc
+        · rw [ite_eq_right hsh]
+          exact ih (env.bind dst bound) st1 outV st' (bind_other_eq hsh hv) hsrc
+  | rawStore pv iv vv ty k ih =>
+    dsimp only [elideBorrowedAndThreadLocalRC, evalCode] at hsrc ⊢
+    cases hp : env pv with
+    | none => rw [hp] at hsrc; contradiction
+    | some vp =>
+      rw [hp] at hsrc
+      cases hi : env iv with
+      | none => rw [hi] at hsrc; cases vp <;> contradiction
+      | some vi =>
+        rw [hi] at hsrc
+        cases hvv : env vv with
+        | none =>
+          rw [hvv] at hsrc
+          cases vp <;> cases vi <;> contradiction
+        | some vv1 =>
+          rw [hvv] at hsrc
+          cases vp <;> cases vi
+          all_goals (cases vv1 <;> try contradiction)
+          all_goals
+            dsimp only at hsrc ⊢
+            cases hw : st.writeElemExclusive _ _ _ with
+            | error _ => rw [hw] at hsrc; contradiction
+            | ok st1 =>
+              rw [hw] at hsrc
+              exact ih env st1 outV st' hv hsrc
+  | incRef ov c k ih =>
+    dsimp only [elideBorrowedAndThreadLocalRC]
+    by_cases hdrop : (ov == v || c == 0) = true
+    · rw [ite_eq_left hdrop]
+      dsimp only [evalCode] at hsrc
+      cases hov : (ov == v) with
+      | true =>
+        have heq : ov = v := of_decide_eq_true hov
+        subst heq
+        rw [evalIncRef_nonOwning st env ov c val hv hown] at hsrc
+        exact ih env st outV st' hv hsrc
+      | false =>
+        have hc0 : c = 0 := by simpa [hov] using hdrop
+        subst hc0
+        cases hinc : st.evalIncRef env ov 0 with
+        | error _ => rw [hinc] at hsrc; contradiction
+        | ok st1 =>
+          rw [hinc] at hsrc
+          have hst : st1 = st := evalIncRef_zero_ok st st1 env ov hinc
+          subst hst
+          exact ih env st1 outV st' hv hsrc
+    · rw [ite_eq_right hdrop]
+      dsimp only [evalCode] at hsrc ⊢
+      cases hinc : st.evalIncRef env ov c with
+      | error _ => rw [hinc] at hsrc; contradiction
+      | ok st1 =>
+        rw [hinc] at hsrc
+        exact ih env st1 outV st' hv hsrc
+  | decRef ov c k ih =>
+    dsimp only [elideBorrowedAndThreadLocalRC]
+    by_cases hdrop : (ov == v || c == 0) = true
+    · rw [ite_eq_left hdrop]
+      dsimp only [evalCode] at hsrc
+      cases hov : (ov == v) with
+      | true =>
+        have heq : ov = v := of_decide_eq_true hov
+        subst heq
+        rw [evalDecRef_nonOwning st env ov c val hv hown] at hsrc
+        exact ih env st outV st' hv hsrc
+      | false =>
+        have hc0 : c = 0 := by simpa [hov] using hdrop
+        subst hc0
+        cases hdec : st.evalDecRef env ov 0 with
+        | error _ => rw [hdec] at hsrc; contradiction
+        | ok st1 =>
+          rw [hdec] at hsrc
+          have hst : st1 = st := evalDecRef_zero_ok st st1 env ov hdec
+          subst hst
+          exact ih env st1 outV st' hv hsrc
+    · rw [ite_eq_right hdrop]
+      dsimp only [evalCode] at hsrc ⊢
+      cases hdec : st.evalDecRef env ov c with
+      | error _ => rw [hdec] at hsrc; contradiction
+      | ok st1 =>
+        rw [hdec] at hsrc
+        exact ih env st1 outV st' hv hsrc
+  | ite cv t e iht ihe =>
+    dsimp only [elideBorrowedAndThreadLocalRC, evalCode] at hsrc ⊢
+    cases hc : env cv with
+    | none => rw [hc] at hsrc; contradiction
+    | some vc =>
+      rw [hc] at hsrc
+      cases vc with
+      | bool b =>
+        cases b
+        · exact ihe env st outV st' hv hsrc
+        · exact iht env st outV st' hv hsrc
+      | u64 n =>
+        dsimp only at hsrc ⊢
+        by_cases hn : (n != 0) = true
+        · rw [ite_eq_left hn] at hsrc ⊢; exact iht env st outV st' hv hsrc
+        · rw [ite_eq_right hn] at hsrc ⊢; exact ihe env st outV st' hv hsrc
+      | u256 w =>
+        dsimp only at hsrc ⊢
+        by_cases hw : (w != UInt256.zero) = true
+        · rw [ite_eq_left hw] at hsrc ⊢; exact iht env st outV st' hv hsrc
+        · rw [ite_eq_right hw] at hsrc ⊢; exact ihe env st outV st' hv hsrc
+      | _ => contradiction
+  | seqFor iv lv hi av ai aty step k ihs ihk =>
+    dsimp only [elideBorrowedAndThreadLocalRC, evalCode] at hsrc ⊢
+    cases hlo : env lv with
+    | none => rw [hlo] at hsrc; contradiction
+    | some vlo =>
+      cases hhi : env hi with
+      | none => rw [hlo, hhi] at hsrc; cases vlo <;> contradiction
+      | some vhi =>
+        cases hinit : env ai with
+        | none =>
+          rw [hlo, hhi, hinit] at hsrc
+          cases vlo <;> cases vhi <;> contradiction
+        | some vinit =>
+          rw [hlo, hhi, hinit] at hsrc
+          cases vlo with
+          | u64 lo =>
+            cases vhi with
+            | u64 hiVal =>
+              simp only at hsrc ⊢
+              cases hloop : evalSeqLoop (hiVal.toNat - lo.toNat) lo.toNat iv av vinit env st
+                  (fun stepEnv stepSt => evalCode fuel stepEnv stepSt step) with
+              | error _ => rw [hloop] at hsrc; contradiction
+              | ok pair =>
+                rcases pair with ⟨finalAcc, st1⟩
+                rw [hloop] at hsrc
+                have hloop2 : evalSeqLoop (hiVal.toNat - lo.toNat) lo.toNat iv av vinit env st
+                    (fun stepEnv stepSt => evalCode fuel stepEnv stepSt
+                      (if iv == v || av == v then elideMarkMtAndZeroRc step
+                       else elideBorrowedAndThreadLocalRC v step)) = .ok (finalAcc, st1) := by
+                  by_cases hsh : (iv == v || av == v) = true
+                  · simp only [hsh, ↓reduceIte]
+                    exact evalSeqLoop_refines_rc (hiVal.toNat - lo.toNat) lo.toNat iv av vinit
+                      env st finalAcc st1
+                      (fun stepEnv stepSt => evalCode fuel stepEnv stepSt step)
+                      (fun stepEnv stepSt =>
+                        evalCode fuel stepEnv stepSt (elideMarkMtAndZeroRc step))
+                      (fun senv sst sv sst' hs =>
+                        elideMarkMtAndZeroRc_sound step fuel senv sst sv sst' hs)
+                      hloop
+                  · simp only [hsh, Bool.false_eq_true, ↓reduceIte]
+                    have hiv : ¬(iv == v) = true := by intro h; simp [h] at hsh
+                    have hav : ¬(av == v) = true := by intro h; simp [h] at hsh
+                    exact evalSeqLoop_borrowed_rc (hiVal.toNat - lo.toNat) lo.toNat iv av v
+                      vinit val env st finalAcc st1 fuel step hv hiv hav
+                      (fun senv sst hvs sv sst' hs => ihs senv sst sv sst' hvs hs) hloop
+                rw [hloop2]
+                by_cases hav : (av == v) = true
+                · rw [ite_eq_left hav]
+                  exact elideMarkMtAndZeroRc_sound k fuel (env.bind av finalAcc) st1 outV st' hsrc
+                · rw [ite_eq_right hav]
+                  exact ihk (env.bind av finalAcc) st1 outV st' (bind_other_eq hav hv) hsrc
+            | _ => contradiction
+          | _ => cases vhi <;> contradiction
+  | parFor ov lv ins ety kern k ih =>
+    dsimp only [elideBorrowedAndThreadLocalRC, evalCode] at hsrc ⊢
+    cases hpar : evalParFor fuel env st lv ins kern with
+    | error _ => rw [hpar] at hsrc; contradiction
+    | ok pair =>
+      rcases pair with ⟨resVal, st1⟩
+      rw [hpar] at hsrc
+      by_cases hov : (ov == v) = true
+      · rw [ite_eq_left hov]
+        exact elideMarkMtAndZeroRc_sound k fuel (env.bind ov resVal) st1 outV st' hsrc
+      · rw [ite_eq_right hov]
+        exact ih (env.bind ov resVal) st1 outV st' (bind_other_eq hov hv) hsrc
+  | ret r => exact hsrc
+  | unreachable => exact hsrc
+
+def optimizeThreadLocalOwnershipRC (code : LNIRCode) : LNIRCode :=
+  elideMarkMtAndZeroRc code
+
+theorem optimizeThreadLocalOwnershipRC_sound (code : LNIRCode) :
+    CodeRefines code (optimizeThreadLocalOwnershipRC code) :=
+  elideMarkMtAndZeroRc_sound code
+
 def verifiedThreadLocalRCContract : VerifiedCodePassContract where
   name       := "ThreadLocalRC"
   theoremRef := "LeanNative.Proofs.elideMarkMtAndZeroRc_sound"
@@ -419,7 +677,15 @@ namespace LeanNative.Proofs
   abbrev CodeRefinesWithRC := LeanNative.Transform.CodeRefinesWithRC
   abbrev optimizeOwnershipRC := LeanNative.Transform.optimizeOwnershipRC
   abbrev elideAndMutateRC_sound := @LeanNative.Transform.elideAndMutateRC_sound
+  abbrev valIsNonOwning := LeanNative.Transform.valIsNonOwning
   abbrev elideBorrowedAndThreadLocalRC := LeanNative.Transform.elideBorrowedAndThreadLocalRC
+  abbrev elideBorrowedAndThreadLocalRC_sound :=
+    @LeanNative.Transform.elideBorrowedAndThreadLocalRC_sound
   abbrev elideMarkMtAndZeroRc := LeanNative.Transform.elideMarkMtAndZeroRc
   abbrev elideMarkMtAndZeroRc_sound := @LeanNative.Transform.elideMarkMtAndZeroRc_sound
+  abbrev optimizeThreadLocalOwnershipRC := LeanNative.Transform.optimizeThreadLocalOwnershipRC
+  abbrev optimizeThreadLocalOwnershipRC_sound :=
+    @LeanNative.Transform.optimizeThreadLocalOwnershipRC_sound
+  abbrev evalIncRef_obj_uaf := @LeanNative.Transform.evalIncRef_obj_uaf
+  abbrev evalDecRef_obj_uaf := @LeanNative.Transform.evalDecRef_obj_uaf
 end LeanNative.Proofs
