@@ -126,6 +126,7 @@ private theorem heap_state (env : VarEnv) (st st' : HeapState) (e : LNIRExpr) (v
             show ("lean_native_ctor_tag" == "lean_native_unbox_u64") = false from rfl,
             show ("lean_native_ctor_tag" == "lean_native_ensure_exclusive") = false from rfl,
             show ("lean_native_ctor_tag" == "lean_native_sarray_len") = false from rfl,
+            show ("lean_native_ctor_tag" == "lean_mark_mt") = false from rfl,
             show ("lean_native_ctor_tag" == "lean_native_ctor_set") = false from rfl,
             show ("lean_native_ctor_tag" == "lean_native_ctor_set_scalar") = false from rfl,
             show ("lean_native_ctor_tag" == "lean_native_ctor_set_tag") = false from rfl,
