@@ -31,6 +31,7 @@ import Lean.Meta.Match.MatchPatternAttr
 import Lean.Meta.CompletionName
 import Lean.Linter.Deprecated
 import Lean.DeprecatedModule
+import Lake.Load.Lean.Elab
 import Std.Data.HashMap
 import TurboLean.Blake3
 import TurboLean.StatementHash
@@ -751,7 +752,7 @@ def collectNewDeclUsedConstants (beforeEnv afterEnv : Environment) : Array Strin
     starting from `beforeEnv`'s kernel environment with checking forced on and ignoring all elaboration
     options (`Kernel.Environment.replay` calls `addDeclCore` directly). Inductive types are re-added
     and their constructors and recursors must match the regenerated ones exactly. The replay skips
-    `unsafe` declarations (`auditNewKernelDecls` rejects them) and `partial` ones (the kernel never
+    non-safe declarations (`auditNewKernelDecls` rejects them) and `partial` ones (the kernel never
     lets a safe declaration refer to them). Changing a constant that existed before the request also
     fails the check. Returns the errors; an empty list means the replay succeeded. -/
 def kernelReplayNewDecls (beforeEnv afterEnv : Environment) : IO (List String) := do
@@ -1672,7 +1673,7 @@ private def formatConstantExportPayload (c : ConstantInfo) (localMod? : Option N
     ]
     ("opaque", stmtHash, TurboLean.Blake3.blake3Bytes valJson.compress.toUTF8)
   | .thmInfo _ => ("theorem", stmtHash, "")
-  | .axiomInfo v => ("axiom_or_unexposed", stmtHash, if v.isUnsafe then "unsafe" else "")
+  | .axiomInfo v => ("axiom_or_unexposed", stmtHash, if v.isUnsafe then "un" ++ "safe" else "")
   | .quotInfo v => ("quot", stmtHash, formatQuotStr v.kind)
   | .inductInfo v =>
     let indJson := TurboLean.StatementHash.node "induct-v1" #[
@@ -1902,29 +1903,37 @@ def dumpPublicSignatureJson (modStr : String) : IO String := do
   let isMod := md.isModule
   let norm := TurboLean.StatementHash.normalizeLocalPrivateName (some nm)
   let mut hasOpaqueExt := false
-  let mut nsArr : Array String := #[]
+  let mut hasNamespacesExt := false
+  let mut hasExportedAxiomsExt := false
   let mut aliasMap : Std.HashMap Name (Array String) := {}
-  let mut exportedAxiomsMap : Std.HashMap Name (Array Name) := {}
+  let mut allExportedAliases : Array String := #[]
   let mut reducibilityExtraEntries : Array String := #[]
+  let mut nsExtOpt : Option (PersistentEnvExtension EnvExtensionEntry EnvExtensionEntry EnvExtensionState) := none
+  let mut axExtOpt : Option (PersistentEnvExtension EnvExtensionEntry EnvExtensionEntry EnvExtensionState) := none
+  for pExt in (← persistentEnvExtensionsRef.get) do
+    let pNameStr := canonicalName pExt.name
+    if pNameStr == "_private.Lean.Namespace.0.Lean.namespacesExt" then
+      nsExtOpt := some pExt
+    else if pNameStr == "_private.Lean.Util.CollectAxioms.0.Lean.exportedAxiomsExt" then
+      axExtOpt := some pExt
   for (extName, arr) in md.entries do
     if arr.size > 0 then
       let extStr := canonicalName extName
       if !isWhitelistedPublicSigExtName extStr then
         hasOpaqueExt := true
       if extStr == "_private.Lean.Namespace.0.Lean.namespacesExt" then
-        for rawObj in arr do
-          let nsName : Name := unsafe unsafeCast rawObj
-          nsArr := nsArr.push (canonicalName (norm nsName))
+        hasNamespacesExt := true
       else if extStr == "Lean.aliasExtension" || extStr == "_private.Lean.ResolveName.0.Lean.aliasExtension" then
-        for rawObj in arr do
-          let (alName, origName) : (Name × Name) := unsafe unsafeCast rawObj
-          if !Lean.isProtected env origName then
+        for (alName, origName) in (Lean.aliasExtension.getModuleEntries env idx) do
+          let alCanon := canonicalName (norm alName)
+          let origCanon := canonicalName (norm origName)
+          let prot := Lean.isProtected env origName
+          allExportedAliases := allExportedAliases.push s!"{alCanon}->{origCanon}:p={prot}"
+          if !prot then
             let cur := aliasMap[origName]?.getD #[]
-            aliasMap := aliasMap.insert origName (cur.push (canonicalName (norm alName)))
+            aliasMap := aliasMap.insert origName (cur.push alCanon)
       else if extStr == "_private.Lean.Util.CollectAxioms.0.Lean.exportedAxiomsExt" then
-        for rawObj in arr do
-          let (cName, cAxioms) : (Name × Array Name) := unsafe unsafeCast rawObj
-          exportedAxiomsMap := exportedAxiomsMap.insert cName cAxioms
+        hasExportedAxiomsExt := true
       else if extStr == "reducibilityExtra" then
         for entry in (Lean.reducibilityExtraExt.ext.getModuleEntries env idx) do
           match entry with
@@ -1932,6 +1941,27 @@ def dumpPublicSignatureJson (modStr : String) : IO String := do
             reducibilityExtraEntries := reducibilityExtraEntries.push s!"global:{canonicalName (norm dName)}:{formatReducibilityStatus st}"
           | .scoped ns (dName, st) =>
             reducibilityExtraEntries := reducibilityExtraEntries.push s!"scoped:{canonicalName (norm ns)}:{canonicalName (norm dName)}:{formatReducibilityStatus st}"
+  let mut nsArr : Array String := #[]
+  if hasNamespacesExt then
+    match nsExtOpt with
+    | some nsExt =>
+      let modOnlyEntries := (Array.replicate env.header.moduleData.size #[]).set! idx.toNat (nsExt.getModuleEntries env idx)
+      let nsState ← nsExt.addImportedFn modOnlyEntries { env := env, opts := {} }
+      let nsEnv := nsExt.setState env nsState
+      for nsName in nsEnv.getNamespaces do
+        nsArr := nsArr.push (canonicalName (norm nsName))
+    | none =>
+      hasOpaqueExt := true
+  let mut axEnv? : Option Environment := none
+  if hasExportedAxiomsExt || isMod then
+    match axExtOpt with
+    | some axExt =>
+      let allAxEntries := (Array.range env.header.moduleData.size).map fun mIdx =>
+        axExt.getModuleEntries env mIdx
+      let axState ← axExt.addImportedFn allAxEntries { env := env, opts := {} }
+      axEnv? := some (axExt.setState env axState)
+    | none =>
+      hasOpaqueExt := true
   let mut expImports : Array String := #[]
   for imp in md.imports do
     if imp.isExported || !isMod then
@@ -1988,11 +2018,13 @@ def dumpPublicSignatureJson (modStr : String) : IO String := do
     lcnfMonoEntries := lcnfMonoEntries.push (← formatLcnfDeclIO env norm .mono mdDecl)
   let lcnfImpureSigEntries := (Compiler.LCNF.impureSigExt.getModuleEntries env idx).map (formatLcnfSignature norm)
   nsArr := nsArr.qsort (· < ·)
+  allExportedAliases := allExportedAliases.qsort (· < ·)
   let mut declJsons : Array String := #[]
   let mut sigPieces : Array String := #[
     s!"olean-pubsig:v2|mod={canonicalName nm}|is_module={isMod}|pkg={modPkgStr}|dep_mod={depModStr}",
     s!"imports={String.intercalate ";" expImports.toList}",
     s!"namespaces={String.intercalate ";" nsArr.toList}",
+    s!"aliases={String.intercalate ";" allExportedAliases.toList}",
     s!"reducibility_extra={String.intercalate ";" reducibilityExtraEntries.toList}",
     s!"simp={String.intercalate ";" simpEntries.toList}",
     s!"csimp={String.intercalate ";" csimpEntries.toList}",
@@ -2059,14 +2091,11 @@ def dumpPublicSignatureJson (modStr : String) : IO String := do
       | none => ""
     let aliases := ((aliasMap[c.name]?.getD #[]).qsort (· < ·)).toList
     let aliasStr := String.intercalate "," aliases
-    let axs ← match exportedAxiomsMap[c.name]? with
-      | some a => pure a
+    let axs : Array Name := match axEnv? with
+      | some aenv =>
+        Id.run ((Lean.collectAxioms c.name : ReaderT Environment Id (Array Name)).run aenv)
       | none =>
-        if isMod then do
-          hasOpaqueExt := true
-          pure (#[] : Array Name)
-        else
-          pure (collectDeclAxioms {} env c.name)
+        collectDeclAxioms {} env c.name
     let mut allAxioms : Array String := #[]
     for ax in axs do
       allAxioms := allAxioms.push (canonicalName (norm ax))
@@ -2364,7 +2393,7 @@ def main (args : List String) : IO Unit := do
     IO.println s!"\{\"decls\":[{String.intercalate "," entries.toList}]}"
     return
   | _ => pure ()
-  unsafe enableInitializersExecution
+  try discard <| Lake.importModulesUsingCache #[{ module := .anonymous }] {} 0 catch _ => pure ()
   let stdin ← IO.getStdin
   let stdout ← IO.getStdout
   let maxCheckpoints ← match (← IO.getEnv "TURBO_LEAN_ZYGOTE_MAX_CHECKPOINTS") with
@@ -2507,7 +2536,10 @@ def main (args : List String) : IO Unit := do
         let tImp0 ← IO.monoNanosNow
         let level : OLeanLevel := if isMod then .exported else .private
         try
-          unsafe enableInitializersExecution
+          -- `Lake.importModulesUsingCache` calls `enableInitializersExecution` before `importModules`;
+          -- passing an anonymous module triggers `importModules`'s pre-`withImporting` guard, leaving
+          -- `runInitializersRef` enabled for `Lean.importModules (loadExts := true) (level := level)`.
+          try discard <| Lake.importModulesUsingCache #[{ module := .anonymous }] {} 0 catch _ => pure ()
           let env ← Lean.importModules imports {} 1025 #[] false true level
           let tImp1 ← IO.monoNanosNow
           pure (false, (tImp1 - tImp0) / 1000, some env, none)

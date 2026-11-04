@@ -6875,6 +6875,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                 || after_prefixes.starts_with("open ")
                 || after_prefixes.starts_with("include ")
                 || after_prefixes.starts_with("omit ")
+                || after_prefixes == "omit"
             {
                 return;
             }
@@ -6904,6 +6905,9 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             || after_p.starts_with("universes ")
             || after_p.starts_with("open ")
             || after_p.starts_with("set_option ")
+            || after_p.starts_with("include ")
+            || after_p.starts_with("omit ")
+            || after_p == "omit"
         {
             active_context_vars.push(normalize_whitespace(trimmed));
         }
@@ -8813,6 +8817,38 @@ public theorem pub_thm (n : Nat) : n + 0 = n := by
             "colons inside string literals or block comments must not masquerade as an explicit return type"
         );
         assert_ne!(tc1.public_signature_digest, tc2.public_signature_digest);
+
+        // 3. `include` and `omit` section-variable inclusion directives MUST alter the
+        //    recorded `context` of subsequent public/meta declarations and `public_signature_digest`.
+        let inc_none = "\
+module
+variable (h : True)
+public theorem uses_ctx : True := trivial
+";
+        let inc_added = "\
+module
+variable (h : True)
+include h
+public theorem uses_ctx : True := trivial
+";
+        let inc_omitted = "\
+module
+variable (h : True)
+include h
+omit h
+public theorem uses_ctx : True := trivial
+";
+        let s_none = extract_public_signature(inc_none);
+        let s_inc = extract_public_signature(inc_added);
+        let s_omit = extract_public_signature(inc_omitted);
+        assert_ne!(
+            s_none.public_signature_digest, s_inc.public_signature_digest,
+            "adding `include h` before a public theorem must change public_signature_digest"
+        );
+        assert_ne!(
+            s_inc.public_signature_digest, s_omit.public_signature_digest,
+            "adding `omit h` before a public theorem must change public_signature_digest"
+        );
     }
 }
 

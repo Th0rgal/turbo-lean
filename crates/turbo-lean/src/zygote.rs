@@ -3340,6 +3340,7 @@ pub(crate) fn ensure_zygote_binary_at(
     }
     link_cmd
         .arg("-lleanshared")
+        .arg("-lLake_shared")
         .arg("-o")
         .arg(&tmp_bin)
         .current_dir(&scratch_dir)

@@ -9697,17 +9697,21 @@ public theorem pub_thm (n : Nat) : n + 0 = n := by
         //        so Stage-2 cutoff fails closed instead of trusting partial metadata projection!
         let inst_v1 = "\
 module
+namespace SmokeA
 public class MyTag (α : Type) where
   tag : Nat
 public def mkTag100 : MyTag Nat := { tag := 1 }
 attribute [instance 100] mkTag100
+end SmokeA
 ";
         let inst_v2 = "\
 module
+namespace SmokeA
 public class MyTag (α : Type) where
   tag : Nat
 public def mkTag100 : MyTag Nat := { tag := 1 }
 attribute [instance 200] mkTag100
+end SmokeA
 ";
         fs::write(proj.join("Smoke/A.lean"), inst_v1)?;
         lake_build_modules(&canon_proj, &["Smoke.A".to_string()], None)?;
@@ -9741,6 +9745,48 @@ attribute [instance 200] mkTag100
         assert_ne!(
             sig_inst_100.public_sig_digest, sig_inst_200.public_sig_digest,
             "instance priority change in Meta.instanceExtension must alter olean public_sig_digest"
+        );
+
+        //    (b) Exporting an alias for an imported declaration (`export SmokeA (mkTag100)`)
+        //        where `origName` is NOT in `Smoke.B`'s `md.constants` MUST alter `Smoke.B`'s
+        //        `public_sig_digest` when added or removed.
+        let b_no_export = "\
+module
+public import Smoke.A
+public def bVal : Nat := 1
+";
+        let b_with_imported_export = "\
+module
+public import Smoke.A
+export SmokeA (mkTag100)
+public def bVal : Nat := 1
+";
+        fs::write(proj.join("Smoke/B.lean"), b_no_export)?;
+        lake_build_modules(&canon_proj, &["Smoke.B".to_string()], None)?;
+        let sig_b_no_export = crate::zygote::read_module_public_signature_with_zygote(
+            &store.root,
+            &cfg,
+            "Smoke.B",
+            &replay_lp,
+            &[],
+            false,
+        )?;
+        assert!(!sig_b_no_export.has_opaque_ext);
+
+        fs::write(proj.join("Smoke/B.lean"), b_with_imported_export)?;
+        lake_build_modules(&canon_proj, &["Smoke.B".to_string()], None)?;
+        let sig_b_with_export = crate::zygote::read_module_public_signature_with_zygote(
+            &store.root,
+            &cfg,
+            "Smoke.B",
+            &replay_lp,
+            &[],
+            false,
+        )?;
+        assert!(!sig_b_with_export.has_opaque_ext);
+        assert_ne!(
+            sig_b_no_export.public_sig_digest, sig_b_with_export.public_sig_digest,
+            "re-exporting an imported declaration via `export N (foo)` must alter olean public_sig_digest"
         );
 
         let opaque_ext_src = "\
