@@ -1,0 +1,147 @@
+import LeanNative.Core
+
+set_option autoImplicit false
+
+namespace LeanNative.Tests.AsyncStateMachineTests
+
+open LeanNative.IR
+open LeanNative.Semantics
+open LeanNative.Transform
+
+/-- Helper checking whether an `LNIRCode` tree contains any `.mkTuple` allocation. -/
+def codeHasMkTuple : LNIRCode → Bool
+  | .letBind _ _ (.mkTuple _) _ => true
+  | .letBind _ _ _ k => codeHasMkTuple k
+  | .ret _ => false
+  | .incRef _ _ k => codeHasMkTuple k
+  | .decRef _ _ k => codeHasMkTuple k
+  | .ite _ t e => codeHasMkTuple t || codeHasMkTuple e
+  | .rawStore _ _ _ _ k => codeHasMkTuple k
+  | .seqFor _ _ _ _ _ _ s k => codeHasMkTuple s || codeHasMkTuple k
+  | .parFor _ _ _ _ _ k => codeHasMkTuple k
+  | .unreachable => false
+
+/-- Check whether `evalCode` succeeded with exact value `v` and heap state `st`. -/
+def evalOkEq (res : Except UBError (Val × HeapState)) (v : Val) (st : HeapState) : Bool :=
+  match res with
+  | .ok (v', st') => v' == v && st' == st
+  | .error _ => false
+
+/-- Non-escaping async frame declaration eligible for scalar register unboxing. -/
+def nonEscapingFrameDecl : LNIRDecl := {
+  name := "d5_unbox_frame"
+  params := [{ id := 0, name := "seed", ty := .i64, borrow := false }]
+  retTy := .i64
+  assurance := .verifiedKernelProof
+  isGpuCand := false
+  body :=
+    .letBind 1 .i64 (.scalar (.constU64 1))
+      (.letBind 2 .i64 (.scalar (.constU64 3))
+        (.letBind 3 .i64 (.scalar (.binOp .add (.var 0) (.constU64 21)))
+          (.letBind 4 (.tuple [.i64, .i64, .i64]) (.mkTuple [1, 2, 3])
+            (.letBind 5 .i64 (.projTuple 4 0)
+              (.letBind 6 .i64 (.projTuple 4 1)
+                (.letBind 7 .i64 (.projTuple 4 2)
+                  (.letBind 8 .i64 (.scalar (.binOp .add (.var 5) (.var 6)))
+                    (.letBind 9 .i64 (.scalar (.binOp .add (.var 8) (.var 7)))
+                      (.ret 9)))))))))
+}
+
+/-- Escaping async frame declaration whose continuation returns the frame tuple directly. -/
+def escapingRetFrameDecl : LNIRDecl := {
+  name := "d5_escape_ret_frame"
+  params := [{ id := 0, name := "seed", ty := .i64, borrow := false }]
+  retTy := .tuple [.i64, .i64, .i64]
+  assurance := .verifiedKernelProof
+  isGpuCand := false
+  body :=
+    .letBind 1 .i64 (.scalar (.constU64 0))
+      (.letBind 2 .i64 (.scalar (.constU64 1))
+        (.letBind 3 (.tuple [.i64, .i64, .i64]) (.mkTuple [1, 2, 0])
+          (.ret 3)))
+}
+
+/-- Escaping async frame declaration that projects fields 0..2 AND boxes the frame into a closure. -/
+def escapingClosureFrameDecl : LNIRDecl := {
+  name := "d5_escape_closure_frame"
+  params := [{ id := 0, name := "seed", ty := .i64, borrow := false }]
+  retTy := .objPtr
+  assurance := .verifiedKernelProof
+  isGpuCand := false
+  body :=
+    .letBind 1 .i64 (.scalar (.constU64 0))
+      (.letBind 2 .i64 (.scalar (.constU64 1))
+        (.letBind 3 (.tuple [.i64, .i64, .i64]) (.mkTuple [1, 2, 0])
+          (.letBind 4 .i64 (.projTuple 3 0)
+            (.letBind 5 .i64 (.projTuple 3 1)
+              (.letBind 6 .i64 (.projTuple 3 2)
+                (.letBind 7 .objPtr (.allocCtor 0 [3] [])
+                  (.ret 7)))))))
+}
+
+-- 1. Multi-yield `Pending → Pending → Ready` transitions via `evalCode 64`:
+#guard evalOkEq
+  (evalCode 64 (VarEnv.empty.bind 0 (.u64 10)) HeapState.empty
+    (lowerAsyncEventLoop (mkThreeStepAsyncSpec 0 10 1 5 7 9)))
+  (.tuple [.u64 0, .u64 1, .u64 15]) HeapState.empty
+
+#guard evalOkEq
+  (evalCode 64 (VarEnv.empty.bind 0 (.u64 10)) HeapState.empty
+    (lowerAsyncEventLoop (mkThreeStepAsyncSpec 0 10 2 5 7 9)))
+  (.tuple [.u64 0, .u64 2, .u64 22]) HeapState.empty
+
+#guard evalOkEq
+  (evalCode 64 (VarEnv.empty.bind 0 (.u64 10)) HeapState.empty
+    (lowerAsyncEventLoop (mkThreeStepAsyncSpec 0 10 3 5 7 9)))
+  (.tuple [.u64 1, .u64 3, .u64 31]) HeapState.empty
+
+#guard evalOkEq
+  (evalCode 64 (VarEnv.empty.bind 0 (.tuple [.u64 1, .u64 3, .u64 31])) HeapState.empty
+    (lowerAsyncPollStep 0 10 (mkThreeStepAsyncSpec 0 10 3 5 7 9).steps))
+  (.tuple [.u64 1, .u64 3, .u64 31]) HeapState.empty
+
+-- 2. Bounded `lean-sys`-style poll loops (16+ polls) with `nextId = 0` vs heap closure `nextId > 0`:
+#guard (match evalCode 64 (VarEnv.empty.bind 0 (.u64 10)) HeapState.empty
+          (lowerAsyncEventLoop (mkThreeStepAsyncSpec 0 10 16 5 7 9)) with
+  | .ok (.tuple [.u64 1, .u64 3, .u64 31], st) => st.nextId == 0 && st == HeapState.empty
+  | _ => false)
+
+#guard (match evalCode 64 (VarEnv.empty.bind 0 (.u64 10)) HeapState.empty
+          (lowerAsyncEventLoop (mkThreeStepAsyncSpec 0 10 24 5 7 9)) with
+  | .ok (.tuple [.u64 1, .u64 3, .u64 31], st) => st.nextId == 0 && st == HeapState.empty
+  | _ => false)
+
+#guard (match evalCode 64 (VarEnv.empty.bind 0 (.u64 10)) HeapState.empty
+          (lowerHeapClosureAsync3 0 10 5 7 9) with
+  | .ok (.u64 31, st) => st.nextId > 0 && st.nextId == 3
+  | _ => false)
+
+-- 3. `checkNonEscapingAsync` rejects escaping continuations and accepts `.projTuple`:
+#guard checkNonEscapingAsync 4 (.ret 4) == false
+#guard checkNonEscapingAsync 4 (.letBind 5 .objPtr (.allocCtor 0 [4] []) (.ret 5)) == false
+#guard checkNonEscapingAsync 4 (.letBind 5 .i64 (.call "spawn_task" [4] .i64) (.ret 5)) == false
+#guard checkNonEscapingAsync 4
+    (.letBind 5 (.tuple [.i64, .i64]) (.mkTuple [4, 0]) (.ret 5)) == false
+#guard checkNonEscapingAsync 4
+    (.letBind 5 .i64 (.projTuple 4 0)
+      (.letBind 6 .i64 (.projTuple 4 2)
+        (.letBind 7 .i64 (.scalar (.binOp .add (.var 5) (.var 6)))
+          (.ret 7)))) == true
+
+-- 4. `optimizeAsyncStateMachine` / `asyncStateMachinePass` unbox non-escaping 3-tuple frames:
+#guard codeHasMkTuple nonEscapingFrameDecl.body == true
+#guard codeHasMkTuple (optimizeAsyncStateMachine nonEscapingFrameDecl.body) == false
+#guard (let (d', cert) := asyncStateMachinePass.runDecl nonEscapingFrameDecl
+        cert.changed == true && codeHasMkTuple d'.body == false &&
+        evalOkEq (evalCode 64 (VarEnv.empty.bind 0 (.u64 10)) HeapState.empty d'.body)
+          (.u64 35) HeapState.empty &&
+        evalOkEq (evalCode 64 (VarEnv.empty.bind 0 (.u64 10)) HeapState.empty
+          nonEscapingFrameDecl.body) (.u64 35) HeapState.empty)
+
+#guard (let (d', cert) := asyncStateMachinePass.runDecl escapingRetFrameDecl
+        cert.changed == false && d'.body == escapingRetFrameDecl.body)
+
+#guard (let (d', cert) := asyncStateMachinePass.runDecl escapingClosureFrameDecl
+        cert.changed == false && d'.body == escapingClosureFrameDecl.body)
+
+end LeanNative.Tests.AsyncStateMachineTests

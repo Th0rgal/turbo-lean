@@ -41,6 +41,8 @@ import LeanNative.Backend.LLVMAst
 import LeanNative.Backend.PTXAst
 import LeanNative.Backend.MetalAst
 import LeanNative.Backend.StableHLOAst
+import LeanNative.Transform.AsyncStateMachine
+import LeanNative.Proofs.AsyncStateMachineProofs
 
 namespace LeanNative.Proofs
 
@@ -388,6 +390,14 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.lowerImpureStepPure_sound
   , ``LeanNative.Proofs.lowerRealLCNFCode_sound
   , ``LeanNative.Proofs.lowerRealLCNFDecl_sound
+  , ``LeanNative.Transform.optimizeAsyncStateMachine_refines
+  , ``LeanNative.Proofs.lowerAsyncPollStep_ready_sound
+  , ``LeanNative.Proofs.lowerAsyncPollStep_sound
+  , ``LeanNative.Proofs.lowerAsyncPollStep_arm1_sound
+  , ``LeanNative.Proofs.lowerAsyncEventLoop_sound
+  , ``LeanNative.Proofs.asyncStateMachinePass_sound
+  , ``LeanNative.Proofs.checkNonEscapingAsync_rejects_closure
+  , ``LeanNative.Proofs.asyncStateMachine_zeroAlloc_nonvacuous
   ]
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/

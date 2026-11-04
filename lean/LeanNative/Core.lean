@@ -78,6 +78,8 @@ import LeanNative.Backend.Hybrid
 import LeanNative.Backend.FastCheck
 import LeanNative.Driver.EvalBatch
 import LeanNative.Driver.CoreCLI
+import LeanNative.Transform.AsyncStateMachine
+import LeanNative.Proofs.AsyncStateMachineProofs
 
 namespace LeanNative.Core
 
