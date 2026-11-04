@@ -135,6 +135,26 @@ enum Commands {
         /// Kernel verification engine (`standard`, `con-leche`, or `both`)
         #[arg(long, default_value = "standard")]
         kernel: String,
+        /// Trusted-only interactive proof-sketching mode: permit `sorry`/`sorryAx` without polluting verified caches
+        #[arg(long, default_value_t = false)]
+        allow_sorry: bool,
+        /// Verification mode (`trusted` or `untrusted`; `--untrusted` / `--mode untrusted` is incompatible with `--allow-sorry`)
+        #[arg(long, default_value = "trusted")]
+        mode: String,
+        /// Run in untrusted mode (alias for `--mode untrusted`)
+        #[arg(long, default_value_t = false)]
+        untrusted: bool,
+    },
+    /// Read-only public-signature & dependent blast-radius analyzer (`turbo-lean impact <file>`)
+    Impact {
+        /// Path to the `.lean` file to inspect
+        file: PathBuf,
+        /// Optional Lean project root directory (defaults to auto-detected project root)
+        #[arg(long, visible_alias = "dir")]
+        project_dir: Option<PathBuf>,
+        /// Optional git baseline revision to diff public/meta signatures against (defaults to `HEAD` in git repos)
+        #[arg(long, visible_alias = "base")]
+        rev: Option<String>,
     },
     /// Run native (leanc -O3 Perceus/FBIP), GPU (CUDA), or Google Cloud TPU v5e (MLIR/XLA) fast counterexample search
     FastCheck {
@@ -504,13 +524,20 @@ fn main() -> Result<()> {
     }
     let _lifecycle = if matches!(
         &cli.command,
-        Commands::Serve { .. } | Commands::Mcp { .. } | Commands::Gc { .. }
+        Commands::Serve { .. }
+            | Commands::Mcp { .. }
+            | Commands::Gc { .. }
+            | Commands::Impact { .. }
     ) {
         None
     } else {
         Some(zygote::lifecycle_lock(false)?)
     };
-    let _one_shot = zygote::OneShotGuard::new(cli.no_daemon)?;
+    let _one_shot = if matches!(&cli.command, Commands::Impact { .. }) {
+        None
+    } else {
+        Some(zygote::OneShotGuard::new(cli.no_daemon)?)
+    };
     run(cli)
 }
 
@@ -535,6 +562,42 @@ fn run(cli: Cli) -> Result<()> {
             serde_json::json!({"status": "stopped", "processes": stopped})
         );
         return Ok(());
+    }
+
+    if let Commands::Check {
+        allow_sorry,
+        ref mode,
+        untrusted,
+        ..
+    } = cli.command
+    {
+        let env_trust_untrusted = std::env::var("TURBO_LEAN_TRUST_DOMAIN")
+            .ok()
+            .map(|v| {
+                let t = v.trim();
+                t.eq_ignore_ascii_case("untrusted") || t.starts_with("untrusted:")
+            })
+            .unwrap_or(false);
+        let is_untrusted = untrusted
+            || env_trust_untrusted
+            || mode.eq_ignore_ascii_case("untrusted")
+            || mode.starts_with("untrusted:");
+        if !untrusted && !mode.eq_ignore_ascii_case("trusted") && !is_untrusted {
+            anyhow::bail!(
+                "Invalid `--mode {}` for `turbo-lean check`: expected `trusted` or `untrusted`",
+                mode
+            );
+        }
+        if allow_sorry && is_untrusted {
+            anyhow::bail!(
+                "`--allow-sorry` is strictly restricted to trusted interactive `turbo-lean check` and cannot be combined with `--untrusted` or `--mode untrusted`"
+            );
+        }
+        if is_untrusted {
+            anyhow::bail!(
+                "`turbo-lean check` is an interactive trusted command; for untrusted verification use `turbo-lean pr-verify --mode untrusted` or `turbo-lean ci-verify --mode untrusted`"
+            );
+        }
     }
 
     let (tel_dir, trust_proj_toml) = match &cli.command {
@@ -605,6 +668,17 @@ fn run(cli: Cli) -> Result<()> {
     } = cli.command
     {
         return mcp::run_telemetry_command(action, project_dir.as_deref(), cli.json);
+    }
+
+    if matches!(cli.command, Commands::Impact { .. }) {
+        if let Commands::Impact {
+            file,
+            project_dir,
+            rev,
+        } = cli.command
+        {
+            return lake_build::run_impact_command(cli.json, file, project_dir, rev);
+        }
     }
 
     // Project settings from `turbo-lean.toml` (at `--base` for PR/CI verification),
@@ -713,6 +787,14 @@ fn run(cli: Cli) -> Result<()> {
     }
 
     // Fast stateless paths that do not need to open SQLite (`state.db`):
+    if let Commands::Impact {
+        file,
+        project_dir,
+        rev,
+    } = cli.command
+    {
+        return lake_build::run_impact_command(cli.json, file, project_dir, rev);
+    }
     if let Commands::ClusterStatus { bench_cabi } = cli.command {
         return cluster::run_cluster_status_command(bench_cabi, cli.json);
     }
@@ -933,10 +1015,14 @@ fn run(cli: Cli) -> Result<()> {
         ref project_dir,
         jobs,
         remote_http: Some(ref remote_url),
+        allow_sorry: false,
+        ref mode,
+        untrusted: false,
         ..
     } = cli.command
     {
-        if !db_warm_on_open
+        if mode == "trusted"
+            && !db_warm_on_open
             && check::try_stateless_remote_check(
                 &resolved_cache_root,
                 cli.json,
@@ -1238,7 +1324,37 @@ fn run(cli: Cli) -> Result<()> {
             remote_http,
             timeout,
             kernel,
+            allow_sorry,
+            mode,
+            untrusted,
         } => {
+            let env_trust_untrusted = std::env::var("TURBO_LEAN_TRUST_DOMAIN")
+                .ok()
+                .map(|v| {
+                    let t = v.trim();
+                    t.eq_ignore_ascii_case("untrusted") || t.starts_with("untrusted:")
+                })
+                .unwrap_or(false);
+            let is_untrusted = untrusted
+                || env_trust_untrusted
+                || mode.eq_ignore_ascii_case("untrusted")
+                || mode.starts_with("untrusted:");
+            if !untrusted && !mode.eq_ignore_ascii_case("trusted") && !is_untrusted {
+                anyhow::bail!(
+                    "Invalid `--mode {}` for `turbo-lean check`: expected `trusted` or `untrusted`",
+                    mode
+                );
+            }
+            if allow_sorry && is_untrusted {
+                anyhow::bail!(
+                    "`--allow-sorry` is strictly restricted to trusted interactive `turbo-lean check` and cannot be combined with `--untrusted` or `--mode untrusted`"
+                );
+            }
+            if is_untrusted {
+                anyhow::bail!(
+                    "`turbo-lean check` is an interactive trusted command; for untrusted verification use `turbo-lean pr-verify --mode untrusted` or `turbo-lean ci-verify --mode untrusted`"
+                );
+            }
             std::env::set_var("TURBO_LEAN_KERNEL_ENGINE", &kernel);
             if timeout > 0 {
                 let file_disp = file.display().to_string();
@@ -1287,7 +1403,7 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 });
             }
-            let res = check::run_check_command(
+            let res = check::run_check_command_with_options(
                 &mut store,
                 db_warm_on_open,
                 cli.json,
@@ -1297,10 +1413,13 @@ fn run(cli: Cli) -> Result<()> {
                 jobs,
                 parallel_shards,
                 remote_http,
+                allow_sorry,
             );
             done_flag.store(true, std::sync::atomic::Ordering::Relaxed);
             res
         }
+
+        Commands::Impact { .. } => unreachable!("handled before opening SQLite store"),
 
         Commands::FastCheck {
             file,

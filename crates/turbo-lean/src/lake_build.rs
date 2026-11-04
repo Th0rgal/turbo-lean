@@ -2,6 +2,7 @@
 //! `.olean` freshness tracking, CAS artifact staging, and `turbo-lean build` execution.
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -1929,27 +1930,27 @@ pub(crate) fn load_verified_project_manifest(
 fn entry_import_pins_current(
     manifest: &crate::module_builder::VerifiedDepManifest,
     entry: &crate::module_builder::VerifiedDepModuleEntry,
-    imports: &[String],
+    hdr: &crate::module_builder::HeaderInfo,
 ) -> bool {
     let Some(cfg) = manifest.cfg.as_ref() else {
         return false;
     };
-    crate::module_builder::verified_entry_imports_current(entry, imports, |imp, pin| {
-        crate::module_builder::import_pin_current(cfg, &manifest.dep_import_memo, imp, pin)
+    crate::module_builder::verified_entry_imports_current_for_header(entry, hdr, |imp, pin_spec| {
+        crate::module_builder::import_pin_current(cfg, &manifest.dep_import_memo, imp, pin_spec)
     })
 }
 
 fn entry_import_pins_fresh_for_build(
     manifest: &crate::module_builder::VerifiedDepManifest,
     entry: &crate::module_builder::VerifiedDepModuleEntry,
-    imports: &[String],
+    hdr: &crate::module_builder::HeaderInfo,
     cache: &mut crate::module_builder::LakeClosureCache,
 ) -> bool {
     let Some(cfg) = manifest.cfg.as_ref() else {
         return false;
     };
-    crate::module_builder::verified_entry_imports_current(entry, imports, |imp, pin| {
-        crate::module_builder::import_pin_fresh_for_build(cfg, cache, imp, pin)
+    crate::module_builder::verified_entry_imports_current_for_header(entry, hdr, |imp, pin_spec| {
+        crate::module_builder::import_pin_fresh_for_build(cfg, cache, imp, pin_spec)
     })
 }
 
@@ -2035,7 +2036,7 @@ fn verify_project_module_entry_and_sidecars(
         true,
         true,
         true,
-        entry_import_pins_current(manifest, entry, &hdr.imports),
+        entry_import_pins_current(manifest, entry, &hdr),
         true,
     ) {
         return false;
@@ -2132,25 +2133,35 @@ pub(crate) fn are_all_project_oleans_up_to_date(
         if !is_mtime_fresh {
             return false;
         }
-        let Some(imps) = read_header_imports_from_file(&src_path) else {
+        let Ok(src_raw) = fs::read_to_string(&src_path) else {
             return false;
         };
-        if let Some(om) = olean_mtime {
-            for imp in imps {
-                let imp_slash = crate::module_builder::module_name_to_rel_slash(&imp);
-                if let Some(dep_src) = resolve_project_lean_source(canon_dir, &imp_slash) {
-                    if fs::metadata(&dep_src)
-                        .and_then(|m| m.modified())
-                        .is_ok_and(|dep_sm| om < dep_sm)
-                    {
-                        return false;
-                    }
-                    let dep_olean = lib_lean_dir.join(format!("{}.olean", imp_slash));
-                    if fs::metadata(&dep_olean)
-                        .and_then(|m| m.modified())
-                        .map_or(true, |dep_om| om < dep_om)
-                    {
-                        return false;
+        let hdr = crate::module_builder::parse_header_info(&src_raw);
+        if hdr.header_error.is_some() {
+            return false;
+        }
+        let tier_pins_exempt_mtime = hdr.is_module
+            && manifest.modules.get(rel_path).is_some_and(|e| {
+                !e.import_export_digests.is_empty() || !e.import_meta_digests.is_empty()
+            });
+        if !tier_pins_exempt_mtime {
+            if let Some(om) = olean_mtime {
+                for imp in &hdr.imports {
+                    let imp_slash = crate::module_builder::module_name_to_rel_slash(imp);
+                    if let Some(dep_src) = resolve_project_lean_source(canon_dir, &imp_slash) {
+                        if fs::metadata(&dep_src)
+                            .and_then(|m| m.modified())
+                            .is_ok_and(|dep_sm| om < dep_sm)
+                        {
+                            return false;
+                        }
+                        let dep_olean = lib_lean_dir.join(format!("{}.olean", imp_slash));
+                        if fs::metadata(&dep_olean)
+                            .and_then(|m| m.modified())
+                            .map_or(true, |dep_om| om < dep_om)
+                        {
+                            return false;
+                        }
                     }
                 }
             }
@@ -2869,6 +2880,7 @@ fn ensure_project_imports_fresh_inner(
     let mut ordered_imports: Vec<DiscoveredRootImportMod> = Vec::new();
     let mut mod_index: HashMap<String, usize> = HashMap::new();
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    let mut hdr_by_mod: HashMap<String, crate::module_builder::HeaderInfo> = HashMap::new();
     let mut non_root_imports: Vec<String> = Vec::new();
     let mut standalone_tc_lib_lean: Option<PathBuf> = None;
     while let Some(mod_name) = worklist.pop() {
@@ -2877,18 +2889,23 @@ fn ensure_project_imports_fresh_inner(
         }
         let imp_slash = crate::module_builder::module_name_to_rel_slash(&mod_name);
         if let Some(info) = resolve_root_import(&mod_name, &imp_slash) {
-            let sub_imps = read_header_imports_from_file(&info.dep_src).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Unparseable or unreadable import header in `{}`: fail-closed import freshness gate",
-                    info.dep_src.display()
-                )
-            })?;
-            for sub_imp in &sub_imps {
+            let hdr = fs::read_to_string(&info.dep_src)
+                .ok()
+                .map(|src| crate::module_builder::parse_header_info(&src))
+                .filter(|h| h.header_error.is_none())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Unparseable or unreadable import header in `{}`: fail-closed import freshness gate",
+                        info.dep_src.display()
+                    )
+                })?;
+            for sub_imp in &hdr.imports {
                 if !visited.contains(sub_imp) {
                     worklist.push(sub_imp.clone());
                 }
             }
-            adj.insert(mod_name.clone(), sub_imps);
+            adj.insert(mod_name.clone(), hdr.imports.clone());
+            hdr_by_mod.insert(mod_name.clone(), hdr);
             mod_index.insert(mod_name, ordered_imports.len());
             ordered_imports.push(info);
         } else if let Some(cfg) = root_cfg.as_ref() {
@@ -2960,6 +2977,7 @@ fn ensure_project_imports_fresh_inner(
         .as_ref()
         .is_some_and(|cfg| !cfg.root_pkg.inputs.is_empty());
     let mut stale_mods: HashSet<String> = HashSet::new();
+    let mut tier_pin_exempt_mods: HashSet<String> = HashSet::new();
     for info in &ordered_imports {
         let dep_olean = &info.dep_olean;
         let olean_meta = fs::metadata(dep_olean).ok();
@@ -3016,12 +3034,9 @@ fn ensure_project_imports_fresh_inner(
                                             cfg,
                                             &info.mod_name,
                                         ))
-                                }) && entry_import_pins_fresh_for_build(
-                                    m,
-                                    e,
-                                    adj.get(&info.mod_name).map_or(&[][..], Vec::as_slice),
-                                    &mut closure_cache,
-                                )))
+                                }) && hdr_by_mod.get(&info.mod_name).is_some_and(|hdr| {
+                                    entry_import_pins_fresh_for_build(m, e, hdr, &mut closure_cache)
+                                })))
                     }
                     None => {
                         !verify_only
@@ -3075,18 +3090,33 @@ fn ensure_project_imports_fresh_inner(
                 && !olean_meta.as_ref().is_some_and(|m| m.is_file()))
         {
             stale_mods.insert(info.mod_name.clone());
+        } else if olean_meta.is_some()
+            && hdr_by_mod.get(&info.mod_name).is_some_and(|h| h.is_module)
+            && ((has_manifest_entry
+                && manifest_opt
+                    .as_ref()
+                    .and_then(|m| m.modules.get(&dep_rel))
+                    .is_some_and(|e| {
+                        !e.import_export_digests.is_empty() || !e.import_meta_digests.is_empty()
+                    }))
+                || (!has_manifest_entry && info.is_lake_target && root_cfg.is_some()))
+        {
+            tier_pin_exempt_mods.insert(info.mod_name.clone());
         }
     }
 
     stale_mods.extend(stale_dep_mods.iter().cloned());
     // Propagate staleness downstream across the imported workspace subgraph.
-    let mut changed = !stale_mods.is_empty();
+    // Force at least one pass even when `stale_mods` is initially empty so mtime inversions
+    // between non-manifest modules are still caught.
+    let mut changed = true;
     while changed {
         changed = false;
         for info in &ordered_imports {
             if stale_mods.contains(&info.mod_name) {
                 continue;
             }
+            let skip_mtime_for_parent = tier_pin_exempt_mods.contains(&info.mod_name);
             let self_om = fs::metadata(&info.dep_olean)
                 .and_then(|m| m.modified())
                 .ok();
@@ -3097,26 +3127,28 @@ fn ensure_project_imports_fresh_inner(
                         changed = true;
                         break;
                     }
-                    if let Some(&ch_idx) = mod_index.get(ch) {
-                        let ch_info = &ordered_imports[ch_idx];
-                        let ch_om = fs::metadata(&ch_info.dep_olean)
-                            .and_then(|m| m.modified())
-                            .ok();
-                        let ch_sm = fs::metadata(&ch_info.dep_src)
-                            .and_then(|m| m.modified())
-                            .ok();
-                        if let (Some(som), Some(com)) = (self_om, ch_om) {
-                            if som < com {
-                                stale_mods.insert(info.mod_name.clone());
-                                changed = true;
-                                break;
+                    if !skip_mtime_for_parent {
+                        if let Some(&ch_idx) = mod_index.get(ch) {
+                            let ch_info = &ordered_imports[ch_idx];
+                            let ch_om = fs::metadata(&ch_info.dep_olean)
+                                .and_then(|m| m.modified())
+                                .ok();
+                            let ch_sm = fs::metadata(&ch_info.dep_src)
+                                .and_then(|m| m.modified())
+                                .ok();
+                            if let (Some(som), Some(com)) = (self_om, ch_om) {
+                                if som < com {
+                                    stale_mods.insert(info.mod_name.clone());
+                                    changed = true;
+                                    break;
+                                }
                             }
-                        }
-                        if let (Some(som), Some(csm)) = (self_om, ch_sm) {
-                            if som < csm {
-                                stale_mods.insert(info.mod_name.clone());
-                                changed = true;
-                                break;
+                            if let (Some(som), Some(csm)) = (self_om, ch_sm) {
+                                if som < csm {
+                                    stale_mods.insert(info.mod_name.clone());
+                                    changed = true;
+                                    break;
+                                }
                             }
                         }
                     }
@@ -3383,14 +3415,21 @@ struct StandaloneModuleSpec {
     module_name: String,
     src_path: PathBuf,
     src_root: PathBuf,
+    is_module: bool,
     imports: Vec<String>,
+    import_visibilities: HashMap<String, crate::module_builder::DepImportVisibility>,
 }
 
 struct ProjectDependentClosure {
+    cfg: crate::module_builder::ProjectConfig,
+    dag: Option<crate::module_builder::ModuleDag>,
     dag_seeds: Vec<String>,
     lake_seeds: Vec<String>,
+    edited_dag_modules: Vec<String>,
+    deleted_modules: Vec<String>,
     dag_modules: Option<Vec<String>>,
     dag_files: Option<Vec<PathBuf>>,
+    standalone_all: BTreeMap<String, StandaloneModuleSpec>,
     standalone_modules: Vec<StandaloneModuleSpec>,
 }
 
@@ -3496,13 +3535,16 @@ fn discover_standalone_project_modules(
             }
             continue;
         }
+        let import_visibilities = crate::module_builder::header_direct_import_visibilities(&hdr);
         if let Some(prev) = out.insert(
             mod_name.clone(),
             StandaloneModuleSpec {
                 module_name: mod_name.clone(),
                 src_path: canon_src,
                 src_root: root,
+                is_module: hdr.is_module,
                 imports: hdr.imports,
+                import_visibilities,
             },
         ) {
             anyhow::bail!(
@@ -3579,7 +3621,7 @@ fn compute_project_dependent_closure(
     )?;
 
     if let Some(dag) = dag_opt {
-        let mut dag_closure: std::collections::BTreeSet<String> = dag
+        let edited_dag_modules: Vec<String> = dag
             .nodes
             .iter()
             .filter(|(_, n)| {
@@ -3587,6 +3629,8 @@ fn compute_project_dependent_closure(
             })
             .map(|(m, _)| m.clone())
             .collect();
+        let mut dag_closure: std::collections::BTreeSet<String> =
+            edited_dag_modules.iter().cloned().collect();
         let mut standalone_closure: std::collections::BTreeSet<String> = standalone_all
             .iter()
             .filter(|(_, s)| edited.contains(&s.src_path))
@@ -3646,10 +3690,15 @@ fn compute_project_dependent_closure(
         let standalone_specs =
             topologically_order_standalone_modules(&standalone_all, &standalone_closure)?;
         Ok(ProjectDependentClosure {
+            cfg,
+            dag: Some(dag),
             dag_seeds,
             lake_seeds,
+            edited_dag_modules,
+            deleted_modules: deleted,
             dag_modules: Some(dag_closure.into_iter().collect()),
             dag_files: Some(files),
+            standalone_all,
             standalone_modules: standalone_specs,
         })
     } else {
@@ -3658,10 +3707,15 @@ fn compute_project_dependent_closure(
         let standalone_specs =
             topologically_order_standalone_modules(&standalone_all, &standalone_closure)?;
         Ok(ProjectDependentClosure {
+            cfg,
+            dag: None,
             dag_seeds,
             lake_seeds,
+            edited_dag_modules: Vec::new(),
+            deleted_modules: deleted,
             dag_modules: None,
             dag_files: None,
+            standalone_all,
             standalone_modules: standalone_specs,
         })
     }
@@ -3711,6 +3765,7 @@ pub struct StandaloneOleanOverlay {
     _scratch: crate::check::PrivateScratchDir,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_and_audit_standalone_modules(
     store_opt: Option<&TurboStore>,
     canon_dir: &Path,
@@ -3719,6 +3774,7 @@ fn check_and_audit_standalone_modules(
     verified_target_modules: Option<&HashSet<String>>,
     rev: Option<&str>,
     retain_oleans: bool,
+    allow_sorry: bool,
 ) -> Result<(Vec<PathBuf>, Option<StandaloneOleanOverlay>)> {
     if standalone_modules.is_empty() {
         return Ok((Vec::new(), None));
@@ -3816,7 +3872,26 @@ fn check_and_audit_standalone_modules(
                 lake_build_modules(canon_dir, &targets, rev)?;
             }
         }
-        ensure_modules_and_imports_replayed(store, canon_dir, &standalone_files, &target_imports)?;
+        if allow_sorry {
+            let mut allowed = splitter::allowed_axioms();
+            if !allowed.iter().any(|a| a == "sorryAx") {
+                allowed.push("sorryAx".to_string());
+            }
+            crate::module_builder::ensure_imported_oleans_replayed_with_roots_and_axioms(
+                store,
+                canon_dir,
+                &standalone_files,
+                &target_imports,
+                &allowed,
+            )?;
+        } else {
+            ensure_modules_and_imports_replayed(
+                store,
+                canon_dir,
+                &standalone_files,
+                &target_imports,
+            )?;
+        }
     }
 
     // Elaborate standalone modules in topological order into an isolated staging directory outside `.lake`
@@ -4129,13 +4204,17 @@ fn check_and_audit_standalone_modules(
             for arg in crate::module_builder::filter_allowed_lean_args(&file_args) {
                 cmd.arg(arg);
             }
-            cmd.arg("-Dwarn.sorry=true")
-                .arg("-Ddebug.skipKernelTC=false")
-                .arg(&spec.src_path)
-                .arg("-R")
-                .arg(&spec.src_root)
-                .arg("-o")
-                .arg(&published_olean);
+            cmd.arg(if allow_sorry {
+                "-Dwarn.sorry=false"
+            } else {
+                "-Dwarn.sorry=true"
+            })
+            .arg("-Ddebug.skipKernelTC=false")
+            .arg(&spec.src_path)
+            .arg("-R")
+            .arg(&spec.src_root)
+            .arg("-o")
+            .arg(&published_olean);
             let out = crate::module_builder::run_command_with_timeout(
                 &mut cmd,
                 std::time::Duration::from_secs(300),
@@ -4151,7 +4230,9 @@ fn check_and_audit_standalone_modules(
             }
             let stdout_str = String::from_utf8_lossy(&out.stdout);
             let stderr_str = String::from_utf8_lossy(&out.stderr);
-            if stdout_str.contains("declaration uses ") || stderr_str.contains("declaration uses ")
+            if !allow_sorry
+                && (stdout_str.contains("declaration uses ")
+                    || stderr_str.contains("declaration uses "))
             {
                 anyhow::bail!(
                     "Standalone module `{}` rejected due to `sorry` axiom usage",
@@ -4174,13 +4255,14 @@ fn check_and_audit_standalone_modules(
             .iter()
             .map(|s| s.module_name.clone())
             .collect();
-        crate::zygote::audit_compiled_modules_with_zygote(
+        crate::zygote::audit_compiled_modules_with_zygote_options(
             store,
             &cfg,
             &mod_names,
             &combined_lp,
             std::slice::from_ref(&olean_out_dir),
             false,
+            allow_sorry,
         )
         .context("Standalone module `.olean` failed in-kernel soundness & replay audit")?;
     }
@@ -4206,6 +4288,15 @@ pub(crate) fn recheck_dependents_if_nonlocal(
     canon_dir: &Path,
     target: &Path,
 ) -> Result<()> {
+    recheck_dependents_if_nonlocal_with_options(store, canon_dir, target, false)
+}
+
+pub(crate) fn recheck_dependents_if_nonlocal_with_options(
+    store: &TurboStore,
+    canon_dir: &Path,
+    target: &Path,
+    allow_sorry: bool,
+) -> Result<()> {
     let lake_root = target.canonicalize().ok().and_then(|f| {
         f.ancestors()
             .find(|a| has_lake_config(a) || a.join("lake-manifest.json").is_file())
@@ -4230,9 +4321,99 @@ pub(crate) fn recheck_dependents_if_nonlocal(
             "[turbo-lean] non-local edit in {}: re-checking dependents with Lake",
             edits.join(", ")
         );
-        let (n, rechecked_files, rechecked_mods, _overlay) =
-            lake_recheck_dependents_with_store(Some(store), &dir, &edits, None, false)?;
-        ensure_modules_and_imports_replayed(store, &dir, &rechecked_files, &rechecked_mods)?;
+        let has_sorry_edit = allow_sorry
+            && edits.iter().any(|e| {
+                let p = dir.join(e);
+                fs::read_to_string(&p)
+                    .map(|s| splitter::audit_hygiene(&splitter::strip_lean_comments(&s)).has_sorry)
+                    .unwrap_or(false)
+            });
+        let (n, rechecked_files, rechecked_mods, _overlay) = if has_sorry_edit {
+            lake_recheck_dependents_with_store_and_options(None, &dir, &edits, None, false, true)?
+        } else {
+            lake_recheck_dependents_with_store(Some(store), &dir, &edits, None, false)?
+        };
+        if has_sorry_edit {
+            // Replay only clean modules; purge Lake `.olean` artifacts of any module whose
+            // source contains `sorry` (or transitively imports a sorry-bearing rechecked module)
+            // so `.lake/build` and `.turbo_verified_sources.json` never retain modulo-sorry artifacts.
+            let mut sorry_mod_set: HashSet<String> = HashSet::new();
+            for (rf, rm) in rechecked_files.iter().zip(rechecked_mods.iter()) {
+                let is_sorry = fs::read_to_string(rf)
+                    .map(|s| splitter::audit_hygiene(&splitter::strip_lean_comments(&s)).has_sorry)
+                    .unwrap_or(false);
+                if is_sorry {
+                    sorry_mod_set.insert(rm.clone());
+                }
+            }
+            for e in &edits {
+                let p = dir.join(e);
+                let is_sorry = fs::read_to_string(&p)
+                    .map(|s| splitter::audit_hygiene(&splitter::strip_lean_comments(&s)).has_sorry)
+                    .unwrap_or(false);
+                if is_sorry {
+                    let mod_guess = e
+                        .strip_suffix(".lean")
+                        .unwrap_or(e)
+                        .replace('\\', "/")
+                        .replace('/', ".");
+                    sorry_mod_set.insert(mod_guess);
+                }
+            }
+            // Purge `.olean` artifacts of sorry-bearing rechecked modules and strip them from manifest
+            let manifest_path = verified_sources_manifest_path(&dir);
+            let mut manifest_opt: Option<crate::module_builder::VerifiedDepManifest> =
+                fs::read(&manifest_path)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok());
+            for (rf, rm) in rechecked_files.iter().zip(rechecked_mods.iter()) {
+                let rf_imports_sorry = fs::read_to_string(rf)
+                    .map(|s| {
+                        crate::module_builder::parse_header_info(&s)
+                            .imports
+                            .iter()
+                            .any(|imp| sorry_mod_set.contains(imp))
+                    })
+                    .unwrap_or(false);
+                if sorry_mod_set.contains(rm) || rf_imports_sorry {
+                    sorry_mod_set.insert(rm.clone());
+                }
+            }
+            for rm in &sorry_mod_set {
+                let imp_slash = crate::module_builder::module_name_to_rel_slash(rm);
+                remove_module_build_artifacts(&dir, &imp_slash);
+            }
+            let mut clean_files = Vec::new();
+            let mut clean_mods = Vec::new();
+            for (rf, rm) in rechecked_files.iter().zip(rechecked_mods.iter()) {
+                if !sorry_mod_set.contains(rm) {
+                    clean_files.push(rf.clone());
+                    clean_mods.push(rm.clone());
+                }
+            }
+            if !clean_files.is_empty() {
+                ensure_modules_and_imports_replayed(store, &dir, &clean_files, &clean_mods)?;
+            }
+            if let Some(ref mut manifest) = manifest_opt {
+                for rf in &rechecked_files {
+                    let rel = rf
+                        .strip_prefix(&dir)
+                        .unwrap_or(rf)
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    if sorry_mod_set.iter().any(|sm| {
+                        crate::module_builder::module_name_to_rel_slash(sm) + ".lean" == rel
+                    }) {
+                        manifest.modules.remove(&rel);
+                    }
+                }
+                if let Ok(json_bytes) = serde_json::to_vec(manifest) {
+                    let _ = fs::write(&manifest_path, json_bytes);
+                }
+            }
+        } else {
+            ensure_modules_and_imports_replayed(store, &dir, &rechecked_files, &rechecked_mods)?;
+        }
         eprintln!(
             "[turbo-lean] Lake re-checked {} modules (0: all libraries)",
             n
@@ -4389,6 +4570,663 @@ pub(crate) fn recheck_dependents_if_nonlocal(
     Ok(())
 }
 
+fn read_git_baseline_source(src_path: &Path, rev: &str) -> Option<String> {
+    let name = src_path.file_name()?.to_string_lossy();
+    let parent = src_path.parent().unwrap_or(Path::new("."));
+    let mut git = crate::trusted_tools::git(parent).ok()?;
+    git.arg("-C")
+        .arg(parent)
+        .args(["show", "--no-textconv", "--no-ext-diff"])
+        .arg(format!("{}:./{}", rev, name))
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+}
+
+#[derive(Clone, Debug)]
+struct PreRebuildModuleBaseline {
+    export_dig: String,
+    meta_dig: String,
+    ir_pair_dig: Option<([u8; 32], [u8; 32])>,
+    olean_pub_sig: crate::zygote::OleanPublicSignatureReply,
+    base_pub_sig_digest: Option<String>,
+    base_meta_sig_digest: Option<String>,
+    cur_pub_sig_digest: String,
+    cur_meta_sig_digest: String,
+}
+
+fn read_module_ir_pair_digest(olean_path: &Path) -> Option<([u8; 32], [u8; 32])> {
+    let ir_path = olean_path.with_extension("ir");
+    let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
+    let ir_bytes = fs::read(&ir_path).ok()?;
+    let ir_sig_bytes = fs::read(&ir_sig_path).ok()?;
+    Some((
+        *blake3::hash(&ir_bytes).as_bytes(),
+        *blake3::hash(&ir_sig_bytes).as_bytes(),
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ModuleCutoffVerdict {
+    cuts_off_public: bool,
+    cuts_off_meta: bool,
+}
+
+fn capture_pre_rebuild_module_baselines(
+    store_root: &Path,
+    cfg: &crate::module_builder::ProjectConfig,
+    dag: &crate::module_builder::ModuleDag,
+    edited_dag_modules: &[String],
+    rev: Option<&str>,
+    is_untrusted: bool,
+) -> Option<HashMap<String, PreRebuildModuleBaseline>> {
+    if edited_dag_modules.is_empty() {
+        return None;
+    }
+    let (lean_path_env, _) = crate::module_builder::build_lean_search_path(cfg, is_untrusted);
+    let mut out = HashMap::new();
+    for m in edited_dag_modules {
+        let node = dag.nodes.get(m)?;
+        if !node.is_module
+            || node.precompile_modules
+            || node.is_exe_target
+            || node.needs_dynlib
+            || !node.olean_path.is_file()
+        {
+            return None;
+        }
+        let cur_src = fs::read_to_string(&node.src_path).ok()?;
+        let cur_sig = splitter::extract_public_signature(&cur_src);
+        if !cur_sig.is_module
+            || cur_sig
+                .public_signature_digest
+                .starts_with("pubsig-invalid:")
+        {
+            return None;
+        }
+        let (base_pub_sig_digest, base_meta_sig_digest) = if let Some(r) = rev {
+            let base_src = read_git_baseline_source(&node.src_path, r)?;
+            let base_sig = splitter::extract_public_signature(&base_src);
+            if !base_sig.is_module
+                || base_sig
+                    .public_signature_digest
+                    .starts_with("pubsig-invalid:")
+                || base_sig.public_signature_digest != cur_sig.public_signature_digest
+            {
+                return None;
+            }
+            (
+                Some(base_sig.public_signature_digest),
+                Some(base_sig.meta_signature_digest),
+            )
+        } else {
+            (None, None)
+        };
+        let tiers = crate::module_builder::compute_module_artifact_tier_digests_with_policy(
+            &node.olean_path,
+            true,
+        )
+        .ok()?;
+        let ir_pair_dig = read_module_ir_pair_digest(&node.olean_path);
+        let olean_pub_sig = crate::zygote::read_module_public_signature_with_zygote(
+            store_root,
+            cfg,
+            m,
+            &lean_path_env,
+            &[],
+            is_untrusted,
+        )
+        .ok()?;
+        if !olean_pub_sig.is_module {
+            return None;
+        }
+        out.insert(
+            m.clone(),
+            PreRebuildModuleBaseline {
+                export_dig: tiers.dep_export,
+                meta_dig: tiers.dep_meta,
+                ir_pair_dig,
+                olean_pub_sig,
+                base_pub_sig_digest,
+                base_meta_sig_digest,
+                cur_pub_sig_digest: cur_sig.public_signature_digest,
+                cur_meta_sig_digest: cur_sig.meta_signature_digest,
+            },
+        );
+    }
+    Some(out)
+}
+
+fn evaluate_post_rebuild_module_cutoffs(
+    store_root: &Path,
+    cfg: &crate::module_builder::ProjectConfig,
+    dag: &crate::module_builder::ModuleDag,
+    baselines: &HashMap<String, PreRebuildModuleBaseline>,
+    is_untrusted: bool,
+) -> HashMap<String, ModuleCutoffVerdict> {
+    let (lean_path_env, _) = crate::module_builder::build_lean_search_path(cfg, is_untrusted);
+    let mut verdicts = HashMap::new();
+    for (m, pre) in baselines {
+        let Some(node) = dag.nodes.get(m) else {
+            continue;
+        };
+        let Ok(tiers) = crate::module_builder::compute_module_artifact_tier_digests_with_policy(
+            &node.olean_path,
+            true,
+        ) else {
+            continue;
+        };
+        let _ = &pre.export_dig;
+        let Ok(post_pub_sig) = crate::zygote::read_module_public_signature_with_zygote(
+            store_root,
+            cfg,
+            m,
+            &lean_path_env,
+            &[],
+            is_untrusted,
+        ) else {
+            continue;
+        };
+        if post_pub_sig != pre.olean_pub_sig {
+            continue;
+        }
+        let base_pub_ok = pre
+            .base_pub_sig_digest
+            .as_ref()
+            .is_none_or(|b| b == &pre.cur_pub_sig_digest);
+        if !base_pub_ok {
+            continue;
+        }
+        let base_meta_ok = pre
+            .base_meta_sig_digest
+            .as_ref()
+            .is_none_or(|b| b == &pre.cur_meta_sig_digest);
+        let ir_pair_unchanged = match (
+            pre.ir_pair_dig,
+            read_module_ir_pair_digest(&node.olean_path),
+        ) {
+            (Some(pre_ir), Some(post_ir)) => pre_ir == post_ir,
+            _ => false,
+        };
+        let cuts_off_meta = (tiers.dep_meta == pre.meta_dig || ir_pair_unchanged) && base_meta_ok;
+        verdicts.insert(
+            m.clone(),
+            ModuleCutoffVerdict {
+                cuts_off_public: true,
+                cuts_off_meta,
+            },
+        );
+    }
+    verdicts
+}
+
+fn compute_stage2_dependent_closure_after_cutoff(
+    canon_dir: &Path,
+    closure: &ProjectDependentClosure,
+    dag: &crate::module_builder::ModuleDag,
+    edited_standalone: &std::collections::BTreeSet<String>,
+    verdicts: &HashMap<String, ModuleCutoffVerdict>,
+    require_kernel_audited: Option<&TurboStore>,
+) -> Result<(Vec<String>, Vec<PathBuf>, Vec<StandaloneModuleSpec>)> {
+    use crate::module_builder::DepImportVisibility;
+
+    let edited_dag_set: HashSet<&str> = closure
+        .edited_dag_modules
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let matches_deleted = |dep: &str| -> bool {
+        closure
+            .deleted_modules
+            .iter()
+            .any(|x| dep == x || x.ends_with(&format!(".{}", dep)))
+    };
+    let shared_lib_mods: HashSet<&str> = dag
+        .shared_libs
+        .iter()
+        .flat_map(|sl| sl.local_modules.iter().map(String::as_str))
+        .collect();
+
+    let node_has_current_on_disk_olean = |node: &crate::module_builder::ModuleNode| -> bool {
+        if !node.olean_path.is_file() {
+            return false;
+        }
+        let Ok(src_raw) = fs::read_to_string(&node.src_path) else {
+            return false;
+        };
+        if blake3::hash(src_raw.as_bytes()).to_hex().as_str() != node.src_blake3 {
+            return false;
+        }
+        let rel_slash = crate::module_builder::module_name_to_rel_slash(&node.module_name);
+        let ir_dir = node
+            .c_path
+            .to_string_lossy()
+            .strip_suffix(&format!("{rel_slash}.c"))
+            .map(|s| PathBuf::from(s.trim_end_matches('/')));
+        if crate::module_builder::verify_module_lake_sidecars(
+            &node.olean_path,
+            ir_dir.as_deref(),
+            &rel_slash,
+            &src_raw,
+            node.is_module,
+            node.needs_c,
+        )
+        .is_err()
+        {
+            return false;
+        }
+        if require_kernel_audited.is_some()
+            && !is_file_hash_verified_in_lake_build(canon_dir, &node.src_path, &node.src_blake3)
+        {
+            return false;
+        }
+        true
+    };
+
+    let dep_requires_rebuild_for_vis = |dep: &str,
+                                        vis: DepImportVisibility,
+                                        dag_dirty: &std::collections::BTreeSet<String>,
+                                        standalone_dirty: &std::collections::BTreeSet<String>|
+     -> bool {
+        if matches_deleted(dep) || standalone_dirty.contains(dep) {
+            return true;
+        }
+        if !dag_dirty.contains(dep) {
+            return false;
+        }
+        // If `dep` is only dirty because it was an edited Stage-1 module with a verified cutoff,
+        // check whether `vis` is shielded by that cutoff.
+        if edited_dag_set.contains(dep) {
+            if let Some(v) = verdicts.get(dep) {
+                return match vis {
+                    DepImportVisibility::PublicExport => !v.cuts_off_public,
+                    DepImportVisibility::MetaExport => !v.cuts_off_meta,
+                    DepImportVisibility::All => true,
+                };
+            }
+        }
+        true
+    };
+
+    let _ = canon_dir;
+    let mut dag_dirty: std::collections::BTreeSet<String> =
+        closure.edited_dag_modules.iter().cloned().collect();
+    let mut standalone_dirty: std::collections::BTreeSet<String> = edited_standalone.clone();
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (m, n) in &dag.nodes {
+            if dag_dirty.contains(m) {
+                continue;
+            }
+            let (vis_map, _dep_is_mod_map) =
+                crate::module_builder::compute_node_dep_visibility_map(&closure.cfg, dag, n);
+            let mut dep_triggers = false;
+            for d in &n.direct_dag_deps {
+                let vis = if !n.is_module
+                    || n.precompile_modules
+                    || n.is_exe_target
+                    || n.needs_dynlib
+                    || shared_lib_mods.contains(m.as_str())
+                {
+                    DepImportVisibility::All
+                } else {
+                    vis_map.get(d).copied().unwrap_or(DepImportVisibility::All)
+                };
+                if dep_requires_rebuild_for_vis(d, vis, &dag_dirty, &standalone_dirty) {
+                    dep_triggers = true;
+                    break;
+                }
+            }
+            if !dep_triggers
+                && (!node_has_current_on_disk_olean(n)
+                    || n.direct_dag_deps.iter().any(|d| {
+                        (dag_dirty.contains(d) || standalone_dirty.contains(d))
+                            && !node_has_current_on_disk_olean(n)
+                    }))
+            {
+                // Keep cutoff-shielded modules clean only when their own `.olean` + Lake sidecars
+                // are already current on disk; otherwise Stage 2 must build them so downstream
+                // standalone/DAG importers have verified `.olean`s.
+                if n.direct_dag_deps
+                    .iter()
+                    .any(|d| dag_dirty.contains(d) || standalone_dirty.contains(d))
+                {
+                    dep_triggers = true;
+                }
+            }
+            if dep_triggers {
+                dag_dirty.insert(m.clone());
+                changed = true;
+            }
+        }
+        for (m, s) in &closure.standalone_all {
+            if standalone_dirty.contains(m) {
+                continue;
+            }
+            let dep_triggers = s.imports.iter().any(|d| {
+                let vis = if !s.is_module {
+                    DepImportVisibility::All
+                } else {
+                    s.import_visibilities
+                        .get(d)
+                        .copied()
+                        .unwrap_or(DepImportVisibility::All)
+                };
+                dep_requires_rebuild_for_vis(d, vis, &dag_dirty, &standalone_dirty)
+            });
+            if dep_triggers {
+                standalone_dirty.insert(m.clone());
+                changed = true;
+            }
+        }
+    }
+
+    let mut up_changed = true;
+    while up_changed {
+        up_changed = false;
+        let current: Vec<String> = standalone_dirty.iter().cloned().collect();
+        for m in current {
+            if let Some(spec) = closure.standalone_all.get(&m) {
+                for imp in &spec.imports {
+                    if closure.standalone_all.contains_key(imp)
+                        && standalone_dirty.insert(imp.clone())
+                    {
+                        up_changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    let stage2_dag_mods: Vec<String> = dag_dirty
+        .iter()
+        .filter(|m| !edited_dag_set.contains(m.as_str()))
+        .cloned()
+        .collect();
+    let all_rechecked_mods: Vec<String> = dag_dirty.into_iter().collect();
+    let all_rechecked_files: Vec<PathBuf> = all_rechecked_mods
+        .iter()
+        .filter_map(|m| dag.nodes.get(m).map(|n| n.src_path.clone()))
+        .collect();
+    let standalone_specs =
+        topologically_order_standalone_modules(&closure.standalone_all, &standalone_dirty)?;
+    let _ = stage2_dag_mods;
+    Ok((all_rechecked_mods, all_rechecked_files, standalone_specs))
+}
+
+fn refresh_cutoff_shielded_manifest_and_traces(
+    canon_dir: &Path,
+    cfg: &crate::module_builder::ProjectConfig,
+    dag: &crate::module_builder::ModuleDag,
+    rebuilt_mods: &[String],
+    verdicts: &HashMap<String, ModuleCutoffVerdict>,
+    pre_manifest_opt: Option<&crate::module_builder::VerifiedDepManifest>,
+) {
+    use crate::module_builder::DepImportVisibility;
+    if verdicts.is_empty() || worktree_auto_link_disabled(canon_dir) {
+        return;
+    }
+    let Some(pre_manifest) = pre_manifest_opt else {
+        return;
+    };
+    let rebuilt_set: HashSet<&str> = rebuilt_mods.iter().map(String::as_str).collect();
+    let shared_lib_mods: HashSet<&str> = dag
+        .shared_libs
+        .iter()
+        .flat_map(|sl| sl.local_modules.iter().map(String::as_str))
+        .collect();
+    let mut olean_digests: HashMap<String, String> = HashMap::new();
+    let mut tier_digests: HashMap<String, crate::module_builder::ModuleArtifactTierDigests> =
+        HashMap::new();
+    fn ensure_dep_digest(
+        olean_digests: &mut HashMap<String, String>,
+        tier_digests: &mut HashMap<String, crate::module_builder::ModuleArtifactTierDigests>,
+        dep_name: &str,
+        dep_olean: &Path,
+    ) -> Option<()> {
+        if !olean_digests.contains_key(dep_name) {
+            let td = crate::module_builder::compute_module_artifact_tier_digests_with_policy(
+                dep_olean, true,
+            )
+            .ok()?;
+            olean_digests.insert(dep_name.to_string(), td.full.clone());
+            tier_digests.insert(dep_name.to_string(), td);
+        }
+        Some(())
+    }
+
+    for m in &dag.topological_order {
+        if rebuilt_set.contains(m.as_str()) {
+            continue;
+        }
+        let Some(node) = dag.nodes.get(m) else {
+            continue;
+        };
+        if !node.is_root_pkg
+            || !node.is_module
+            || node.precompile_modules
+            || node.is_exe_target
+            || node.needs_dynlib
+            || shared_lib_mods.contains(m.as_str())
+        {
+            continue;
+        }
+        let touches_cutoff_dep = node
+            .direct_dag_deps
+            .iter()
+            .any(|d| verdicts.contains_key(d));
+        if !touches_cutoff_dep {
+            continue;
+        }
+        let (vis_map, _dep_is_mod_map) =
+            crate::module_builder::compute_node_dep_visibility_map(cfg, dag, node);
+        let all_deps_shielded = node.direct_dag_deps.iter().all(|d| {
+            if !rebuilt_set.contains(d.as_str()) {
+                return true;
+            }
+            let Some(v) = verdicts.get(d) else {
+                return false;
+            };
+            match vis_map.get(d).copied().unwrap_or(DepImportVisibility::All) {
+                DepImportVisibility::PublicExport => v.cuts_off_public,
+                DepImportVisibility::MetaExport => v.cuts_off_meta,
+                DepImportVisibility::All => false,
+            }
+        });
+        if !all_deps_shielded {
+            continue;
+        }
+        let rel_src = node
+            .src_path
+            .strip_prefix(&node.pkg_root)
+            .unwrap_or(&node.src_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let Some(pre_entry) = pre_manifest.modules.get(&rel_src) else {
+            continue;
+        };
+        if !pre_entry.kernel_audited
+            || pre_entry.lake_inputs_digest != pre_manifest.lake_inputs_digest
+        {
+            continue;
+        }
+        let Ok(src_now) = fs::read_to_string(&node.src_path) else {
+            continue;
+        };
+        let actual_src_b3 = blake3::hash(src_now.as_bytes()).to_hex().to_string();
+        if actual_src_b3 != pre_entry.src_blake3 || actual_src_b3 != node.src_blake3 {
+            continue;
+        }
+        let rel_slash = crate::module_builder::module_name_to_rel_slash(&node.module_name);
+        let ir_dir = node
+            .c_path
+            .to_string_lossy()
+            .strip_suffix(&format!("{rel_slash}.c"))
+            .map(|s| PathBuf::from(s.trim_end_matches('/')));
+        if crate::module_builder::verify_module_lake_sidecars(
+            &node.olean_path,
+            ir_dir.as_deref(),
+            &rel_slash,
+            &src_now,
+            node.is_module,
+            node.needs_c,
+        )
+        .is_err()
+        {
+            continue;
+        }
+        if ensure_dep_digest(&mut olean_digests, &mut tier_digests, m, &node.olean_path).is_none() {
+            continue;
+        }
+        let Some(actual_full_dig) = olean_digests.get(m).cloned() else {
+            continue;
+        };
+        if actual_full_dig != pre_entry.olean_artifact_digest {
+            continue;
+        }
+        let mut deps_ok = true;
+        for d in &node.direct_dag_deps {
+            if let Some(dn) = dag.nodes.get(d) {
+                if ensure_dep_digest(&mut olean_digests, &mut tier_digests, d, &dn.olean_path)
+                    .is_none()
+                {
+                    deps_ok = false;
+                    break;
+                }
+            } else {
+                deps_ok = false;
+                break;
+            }
+        }
+        for (ext_m, ext_p) in &node.external_olean_deps {
+            if ensure_dep_digest(&mut olean_digests, &mut tier_digests, ext_m, ext_p).is_none() {
+                deps_ok = false;
+                break;
+            }
+        }
+        if !deps_ok {
+            continue;
+        }
+        if crate::module_builder::write_lake_module_hashes_and_trace(
+            cfg,
+            dag,
+            node,
+            &actual_full_dig,
+            Some(&actual_full_dig),
+            true,
+        )
+        .is_ok()
+        {
+            crate::module_builder::record_verified_dep_source(
+                cfg,
+                dag,
+                node,
+                &actual_full_dig,
+                true,
+                &olean_digests,
+                &tier_digests,
+            );
+        }
+    }
+}
+
+fn stamp_manifest_after_lake_cutoff_rebuild(
+    store: &TurboStore,
+    canon_dir: &Path,
+    cfg: &crate::module_builder::ProjectConfig,
+    dag: &crate::module_builder::ModuleDag,
+    rebuilt_mods: &[String],
+) -> Result<()> {
+    if rebuilt_mods.is_empty() || worktree_auto_link_disabled(canon_dir) {
+        return Ok(());
+    }
+    let manifest_path = verified_sources_manifest_path(canon_dir);
+    if !manifest_path.is_file() {
+        return Ok(());
+    }
+    let rebuilt_files: Vec<PathBuf> = rebuilt_mods
+        .iter()
+        .filter_map(|m| dag.nodes.get(m).map(|n| n.src_path.clone()))
+        .collect();
+    ensure_modules_and_imports_replayed(store, canon_dir, &rebuilt_files, rebuilt_mods)?;
+    let mut olean_digests: HashMap<String, String> = HashMap::new();
+    let mut tier_digests: HashMap<String, crate::module_builder::ModuleArtifactTierDigests> =
+        HashMap::new();
+    for m in rebuilt_mods {
+        let Some(node) = dag.nodes.get(m) else {
+            continue;
+        };
+        let hygiene = splitter::audit_hygiene(&splitter::strip_lean_comments(
+            &fs::read_to_string(&node.src_path).unwrap_or_default(),
+        ));
+        if hygiene.has_sorry
+            || hygiene.has_axiom
+            || hygiene.native_violation()
+            || hygiene.has_trust_compiler
+            || hygiene.has_checking_weakening
+        {
+            return Ok(());
+        }
+        let mut record_dep = |dep_name: &str, dep_olean: &Path| -> Option<()> {
+            if !olean_digests.contains_key(dep_name) {
+                let td = crate::module_builder::compute_module_artifact_tier_digests_with_policy(
+                    dep_olean, true,
+                )
+                .ok()?;
+                olean_digests.insert(dep_name.to_string(), td.full.clone());
+                tier_digests.insert(dep_name.to_string(), td);
+            }
+            Some(())
+        };
+        if record_dep(m, &node.olean_path).is_none() {
+            return Ok(());
+        }
+        for d in &node.direct_dag_deps {
+            if let Some(dn) = dag.nodes.get(d) {
+                if record_dep(d, &dn.olean_path).is_none() {
+                    return Ok(());
+                }
+            }
+        }
+        for (ext_m, ext_p) in &node.external_olean_deps {
+            if record_dep(ext_m, ext_p).is_none() {
+                return Ok(());
+            }
+        }
+    }
+    for m in rebuilt_mods {
+        if let Some(node) = dag.nodes.get(m) {
+            let mut fresh_node = node.clone();
+            if let Ok(src_now) = fs::read_to_string(&fresh_node.src_path) {
+                fresh_node.src_blake3 = blake3::hash(src_now.as_bytes()).to_hex().to_string();
+            }
+            if let Some(full_dig) = olean_digests.get(m).cloned() {
+                crate::module_builder::record_verified_dep_source(
+                    cfg,
+                    dag,
+                    &fresh_node,
+                    &full_dig,
+                    fresh_node.is_root_pkg,
+                    &olean_digests,
+                    &tier_digests,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn node_is_kernel_audited_in_untrusted(
+    _store: &TurboStore,
+    canon_dir: &Path,
+    node: &crate::module_builder::ModuleNode,
+) -> bool {
+    is_file_hash_verified_in_lake_build(canon_dir, &node.src_path, &node.src_blake3)
+}
+
 #[cfg(test)]
 pub(crate) fn lake_recheck_dependents(
     canon_dir: &Path,
@@ -4413,6 +5251,30 @@ pub(crate) fn lake_recheck_dependents_with_store(
     Vec<String>,
     Option<StandaloneOleanOverlay>,
 )> {
+    lake_recheck_dependents_with_store_and_options(
+        store_opt,
+        canon_dir,
+        edits,
+        rev,
+        retain_standalone_oleans,
+        false,
+    )
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn lake_recheck_dependents_with_store_and_options(
+    store_opt: Option<&TurboStore>,
+    canon_dir: &Path,
+    edits: &[String],
+    rev: Option<&str>,
+    retain_standalone_oleans: bool,
+    allow_sorry: bool,
+) -> Result<(
+    usize,
+    Vec<PathBuf>,
+    Vec<String>,
+    Option<StandaloneOleanOverlay>,
+)> {
     if !has_lake_config(canon_dir) {
         anyhow::bail!(
             "non-local edit in {} needs its dependents re-checked, but {} has no Lake config: refusing to pass",
@@ -4421,13 +5283,158 @@ pub(crate) fn lake_recheck_dependents_with_store(
         );
     }
     let closure = compute_project_dependent_closure(canon_dir, edits, false)?;
-    let (dag_count, files, mods) = match (closure.dag_modules, closure.dag_files) {
+    let edited_set: HashSet<PathBuf> = edits
+        .iter()
+        .map(|e| canon_dir.join(e))
+        .map(|p| p.canonicalize().unwrap_or(p))
+        .collect();
+    let edited_standalone: std::collections::BTreeSet<String> = closure
+        .standalone_all
+        .iter()
+        .filter(|(_, s)| edited_set.contains(&s.src_path))
+        .map(|(m, _)| m.clone())
+        .collect();
+
+    let mut effective_standalone = closure.standalone_modules.clone();
+    let (dag_count, files, mods) = match (closure.dag_modules.clone(), closure.dag_files.clone()) {
         // As in `ensure_project_imports_fresh_for_check`: a module whose input-bearing library is
         // not the one Lake attributes it to has to be asked for by library name, or Lake compares
         // an input-blind trace and reports it up to date.
         (Some(mods), Some(files)) if !mods.is_empty() => {
-            lake_build_modules(canon_dir, &lake_refresh_targets(canon_dir, &mods), rev)?;
-            (mods.len(), files, mods)
+            let mut store_root_buf: Option<PathBuf> = None;
+            let store_root: Option<&Path> = match store_opt {
+                Some(s) => Some(s.root.as_path()),
+                None => {
+                    let p = std::env::temp_dir().join(format!(
+                        "turbo_cutoff_probe_{}_{}",
+                        std::process::id(),
+                        pack::next_tmp_id()
+                    ));
+                    let _ = fs::create_dir_all(&p);
+                    store_root_buf = Some(p);
+                    store_root_buf.as_deref()
+                }
+            };
+            let cutoff_attempted = if let (Some(sr), Some(dag)) = (store_root, closure.dag.as_ref())
+            {
+                let stage1_targets = lake_refresh_targets(canon_dir, &closure.edited_dag_modules);
+                let stage1_only_modules = !closure.edited_dag_modules.is_empty()
+                    && closure.deleted_modules.is_empty()
+                    && stage1_targets == closure.edited_dag_modules;
+                if stage1_only_modules {
+                    capture_pre_rebuild_module_baselines(
+                        sr,
+                        &closure.cfg,
+                        dag,
+                        &closure.edited_dag_modules,
+                        rev,
+                        false,
+                    )
+                    .map(|baselines| (sr, dag, baselines))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some((sr, dag, baselines)) = cutoff_attempted {
+                let pre_manifest = load_verified_project_manifest(canon_dir);
+                if let Some(s) = store_opt {
+                    let mut mut_store = TurboStore::open(Some(&s.root))?;
+                    crate::module_builder::build_project_modules_native(
+                        &mut mut_store,
+                        canon_dir,
+                        &closure.edited_dag_modules,
+                        "trusted",
+                        0,
+                        false,
+                        true,
+                        None,
+                    )?;
+                } else {
+                    lake_build_modules(canon_dir, &closure.edited_dag_modules, rev)?;
+                }
+                let verdicts =
+                    evaluate_post_rebuild_module_cutoffs(sr, &closure.cfg, dag, &baselines, false);
+                let (rechecked_mods, rechecked_files, stage2_standalone) =
+                    compute_stage2_dependent_closure_after_cutoff(
+                        canon_dir,
+                        &closure,
+                        dag,
+                        &edited_standalone,
+                        &verdicts,
+                        None,
+                    )?;
+                let edited_dag_set: HashSet<&str> = closure
+                    .edited_dag_modules
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                let stage2_only_mods: Vec<String> = rechecked_mods
+                    .iter()
+                    .filter(|m| !edited_dag_set.contains(m.as_str()))
+                    .cloned()
+                    .collect();
+                if !stage2_only_mods.is_empty() {
+                    if let Some(s) = store_opt {
+                        let mut mut_store = TurboStore::open(Some(&s.root))?;
+                        crate::module_builder::build_project_modules_native(
+                            &mut mut_store,
+                            canon_dir,
+                            &stage2_only_mods,
+                            "trusted",
+                            0,
+                            false,
+                            true,
+                            None,
+                        )?;
+                    } else {
+                        lake_build_modules(
+                            canon_dir,
+                            &lake_refresh_targets(canon_dir, &stage2_only_mods),
+                            rev,
+                        )?;
+                    }
+                }
+                if let Some(s) = store_opt {
+                    stamp_manifest_after_lake_cutoff_rebuild(
+                        s,
+                        canon_dir,
+                        &closure.cfg,
+                        dag,
+                        &rechecked_mods,
+                    )?;
+                }
+                refresh_cutoff_shielded_manifest_and_traces(
+                    canon_dir,
+                    &closure.cfg,
+                    dag,
+                    &rechecked_mods,
+                    &verdicts,
+                    pre_manifest.as_ref(),
+                );
+                if let Some(ref tmp_p) = store_root_buf {
+                    let _ = fs::remove_dir_all(tmp_p);
+                }
+                effective_standalone = stage2_standalone;
+                (rechecked_mods.len(), rechecked_files, rechecked_mods)
+            } else {
+                lake_build_modules(canon_dir, &lake_refresh_targets(canon_dir, &mods), rev)?;
+                if let (Some(s), Some(dag)) = (store_opt, closure.dag.as_ref()) {
+                    let _ = stamp_manifest_after_lake_cutoff_rebuild(
+                        s,
+                        canon_dir,
+                        &closure.cfg,
+                        dag,
+                        &mods,
+                    );
+                }
+                if let Some(ref tmp_p) = store_root_buf {
+                    let _ = fs::remove_dir_all(tmp_p);
+                }
+                (mods.len(), files, mods)
+            }
         }
         (Some(_), Some(_)) => (0, Vec::new(), Vec::new()),
         _ => {
@@ -4441,18 +5448,18 @@ pub(crate) fn lake_recheck_dependents_with_store(
             (0, all_files, fallback_mods)
         }
     };
-    let (_standalone_files, _overlay) = check_and_audit_standalone_modules(
+    let (_standalone_files, overlay) = check_and_audit_standalone_modules(
         store_opt,
         canon_dir,
-        &closure.standalone_modules,
+        &effective_standalone,
         false,
         None,
         rev,
-        false,
+        retain_standalone_oleans,
+        allow_sorry,
     )?;
-    let _ = retain_standalone_oleans;
-    let standalone_count = closure.standalone_modules.len();
-    Ok((dag_count + standalone_count, files, mods, None))
+    let standalone_count = effective_standalone.len();
+    Ok((dag_count + standalone_count, files, mods, overlay))
 }
 
 pub(crate) fn ensure_modules_and_imports_replayed(
@@ -4484,75 +5491,716 @@ pub(crate) fn untrusted_recheck_dependents(
         );
     }
     let closure = compute_project_dependent_closure(canon_dir, edits, true)?;
-    let standalone_names: HashSet<&str> = closure
-        .standalone_modules
+    let edited_set: HashSet<PathBuf> = edits
         .iter()
-        .map(|s| s.module_name.as_str())
+        .map(|e| canon_dir.join(e))
+        .map(|p| p.canonicalize().unwrap_or(p))
         .collect();
-    let cfg = crate::module_builder::resolve_project_config_with_trust(canon_dir, true)?;
-    let mut standalone_target_imports: Vec<String> = Vec::new();
-    for spec in &closure.standalone_modules {
-        for imp in &spec.imports {
-            if standalone_names.contains(imp.as_str()) {
-                continue;
-            }
-            if crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, imp).is_some()
-                || cfg.dep_pkgs.iter().any(|dp| {
-                    crate::module_builder::resolve_module_in_package(dp, false, imp).is_some()
-                })
-            {
-                standalone_target_imports.push(imp.clone());
-            }
-        }
-    }
-    standalone_target_imports.sort();
-    standalone_target_imports.dedup();
+    let edited_standalone: std::collections::BTreeSet<String> = closure
+        .standalone_all
+        .iter()
+        .filter(|(_, s)| edited_set.contains(&s.src_path))
+        .map(|(m, _)| m.clone())
+        .collect();
 
-    let (mut targets, dag_count, built_all) = match closure.dag_modules {
-        Some(mods) if !mods.is_empty() => {
-            let n = mods.len();
-            (mods, n, false)
+    let cfg = closure.cfg.clone();
+    let cutoff_baselines = if let Some(ref dag) = closure.dag {
+        if !closure.edited_dag_modules.is_empty() && closure.deleted_modules.is_empty() {
+            capture_pre_rebuild_module_baselines(
+                &store.root,
+                &cfg,
+                dag,
+                &closure.edited_dag_modules,
+                None,
+                true,
+            )
+        } else {
+            None
         }
-        Some(_) => (Vec::new(), 0, false),
-        None => (closure.dag_seeds, 0, true),
+    } else {
+        None
     };
-    if !built_all {
-        for imp in standalone_target_imports {
-            if !targets.contains(&imp) {
-                targets.push(imp);
-            }
-        }
-    }
+
     let mut verified_targets = HashSet::new();
-    if built_all || !targets.is_empty() {
+    let (dag_count, built_all, effective_standalone) = if let (Some(dag), Some(baselines)) =
+        (closure.dag.as_ref(), cutoff_baselines.as_ref())
+    {
+        let pre_manifest = load_verified_project_manifest(canon_dir);
         crate::module_builder::build_project_modules_native(
             store,
             canon_dir,
-            &targets,
+            &closure.edited_dag_modules,
             trust_domain,
             1,
             true,
             json,
             None,
         )
-        .map_err(|e| e.context("Untrusted PR dependent re-check failed"))?;
-        let built_dag = crate::module_builder::build_module_dag_with_trust(&cfg, &targets, true)?;
-        verified_targets.extend(built_dag.nodes.into_keys());
-    }
-    let (_standalone_files, _overlay) = check_and_audit_standalone_modules(
+        .map_err(|e| e.context("Untrusted PR Stage-1 dependent re-check failed"))?;
+        let built_stage1 = crate::module_builder::build_module_dag_with_trust(
+            &cfg,
+            &closure.edited_dag_modules,
+            true,
+        )?;
+        verified_targets.extend(built_stage1.nodes.into_keys());
+
+        let verdicts =
+            evaluate_post_rebuild_module_cutoffs(&store.root, &cfg, dag, baselines, true);
+        // Refresh `.turbo_verified_sources.json` tier pins on any unedited DAG modules whose
+        // upstream edited module cut off (`export_tier_digest` / `meta_tier_digest` or verified
+        // public signature unchanged) before `is_file_hash_verified_in_lake_build` checks pins.
+        let _ = stamp_manifest_after_lake_cutoff_rebuild(
+            store,
+            canon_dir,
+            &cfg,
+            dag,
+            &closure.edited_dag_modules,
+        );
+        refresh_cutoff_shielded_manifest_and_traces(
+            canon_dir,
+            &cfg,
+            dag,
+            &closure.edited_dag_modules,
+            &verdicts,
+            pre_manifest.as_ref(),
+        );
+        let (rechecked_mods, _rechecked_files, stage2_standalone) =
+            compute_stage2_dependent_closure_after_cutoff(
+                canon_dir,
+                &closure,
+                dag,
+                &edited_standalone,
+                &verdicts,
+                Some(store),
+            )?;
+        for (m, n) in &dag.nodes {
+            if !rechecked_mods.contains(m)
+                && node_is_kernel_audited_in_untrusted(store, canon_dir, n)
+            {
+                verified_targets.insert(m.clone());
+            }
+        }
+
+        let standalone_names: HashSet<&str> = stage2_standalone
+            .iter()
+            .map(|s| s.module_name.as_str())
+            .collect();
+        let mut standalone_target_imports: Vec<String> = Vec::new();
+        for spec in &stage2_standalone {
+            for imp in &spec.imports {
+                if standalone_names.contains(imp.as_str()) {
+                    continue;
+                }
+                if crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, imp)
+                    .is_some()
+                    || cfg.dep_pkgs.iter().any(|dp| {
+                        crate::module_builder::resolve_module_in_package(dp, false, imp).is_some()
+                    })
+                {
+                    standalone_target_imports.push(imp.clone());
+                }
+            }
+        }
+        standalone_target_imports.sort();
+        standalone_target_imports.dedup();
+
+        let edited_dag_set: HashSet<&str> = closure
+            .edited_dag_modules
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let mut stage2_targets: Vec<String> = rechecked_mods
+            .iter()
+            .filter(|m| !edited_dag_set.contains(m.as_str()))
+            .cloned()
+            .collect();
+        for imp in standalone_target_imports {
+            if !stage2_targets.contains(&imp) && !verified_targets.contains(&imp) {
+                stage2_targets.push(imp);
+            }
+        }
+        if !stage2_targets.is_empty() {
+            crate::module_builder::build_project_modules_native(
+                store,
+                canon_dir,
+                &stage2_targets,
+                trust_domain,
+                1,
+                true,
+                json,
+                None,
+            )
+            .map_err(|e| e.context("Untrusted PR Stage-2 dependent re-check failed"))?;
+            let built_stage2 =
+                crate::module_builder::build_module_dag_with_trust(&cfg, &stage2_targets, true)?;
+            verified_targets.extend(built_stage2.nodes.into_keys());
+        }
+        (rechecked_mods.len(), false, stage2_standalone)
+    } else {
+        let standalone_names: HashSet<&str> = closure
+            .standalone_modules
+            .iter()
+            .map(|s| s.module_name.as_str())
+            .collect();
+        let mut standalone_target_imports: Vec<String> = Vec::new();
+        for spec in &closure.standalone_modules {
+            for imp in &spec.imports {
+                if standalone_names.contains(imp.as_str()) {
+                    continue;
+                }
+                if crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, imp)
+                    .is_some()
+                    || cfg.dep_pkgs.iter().any(|dp| {
+                        crate::module_builder::resolve_module_in_package(dp, false, imp).is_some()
+                    })
+                {
+                    standalone_target_imports.push(imp.clone());
+                }
+            }
+        }
+        standalone_target_imports.sort();
+        standalone_target_imports.dedup();
+
+        let (mut targets, dag_count, built_all) = match closure.dag_modules {
+            Some(mods) if !mods.is_empty() => {
+                let n = mods.len();
+                (mods, n, false)
+            }
+            Some(_) => (Vec::new(), 0, false),
+            None => (closure.dag_seeds, 0, true),
+        };
+        if !built_all {
+            for imp in standalone_target_imports {
+                if !targets.contains(&imp) {
+                    targets.push(imp);
+                }
+            }
+        }
+        if built_all || !targets.is_empty() {
+            crate::module_builder::build_project_modules_native(
+                store,
+                canon_dir,
+                &targets,
+                trust_domain,
+                1,
+                true,
+                json,
+                None,
+            )
+            .map_err(|e| e.context("Untrusted PR dependent re-check failed"))?;
+            let built_dag =
+                crate::module_builder::build_module_dag_with_trust(&cfg, &targets, true)?;
+            verified_targets.extend(built_dag.nodes.into_keys());
+        }
+        (dag_count, built_all, closure.standalone_modules)
+    };
+
+    let (_standalone_files, overlay) = check_and_audit_standalone_modules(
         Some(store),
         canon_dir,
-        &closure.standalone_modules,
+        &effective_standalone,
         true,
         Some(&verified_targets),
         None,
+        true,
         false,
     )?;
-    Ok((
-        dag_count + closure.standalone_modules.len(),
-        built_all,
-        None,
-    ))
+    Ok((dag_count + effective_standalone.len(), built_all, overlay))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImpactReport {
+    pub file: String,
+    pub module_name: Option<String>,
+    pub base_rev: Option<String>,
+    pub is_module: bool,
+    pub edit_class: String,
+    pub public_signature_changed: bool,
+    pub meta_signature_changed: bool,
+    pub public_signature_digest: String,
+    pub meta_signature_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_public_signature_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_meta_signature_digest: Option<String>,
+    pub direct_dependents: Vec<String>,
+    pub transitive_dependents: Vec<String>,
+    pub pruned_dependents: Vec<String>,
+    pub affected_modules: Vec<String>,
+    pub affected_files: Vec<String>,
+    pub estimated_declarations: usize,
+    pub total_downstream_declarations: usize,
+}
+
+pub fn compute_impact_report(
+    file: PathBuf,
+    project_dir: Option<PathBuf>,
+    rev: Option<String>,
+) -> Result<ImpactReport> {
+    let target_canon = file
+        .canonicalize()
+        .with_context(|| format!("Target file does not exist: {}", file.display()))?;
+    anyhow::ensure!(
+        target_canon.is_file(),
+        "`turbo-lean impact` expects a `.lean` file path, got directory: {}",
+        target_canon.display()
+    );
+    let root_guess = match project_dir {
+        Some(p) => p,
+        None => find_project_root(&target_canon),
+    };
+    let canon_dir = root_guess
+        .canonicalize()
+        .unwrap_or_else(|_| root_guess.clone());
+    let rel_file = target_canon
+        .strip_prefix(&canon_dir)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| target_canon.to_string_lossy().replace('\\', "/"));
+
+    let cur_src = fs::read_to_string(&target_canon)
+        .with_context(|| format!("Failed to read {}", target_canon.display()))?;
+    let cur_sig = splitter::extract_public_signature(&cur_src);
+    let cur_split = split_lean_source(&cur_src, &[]);
+
+    let effective_rev = match rev {
+        Some(r) => Some(r),
+        None => {
+            if canon_dir.join(".git").exists()
+                || target_canon.ancestors().any(|a| a.join(".git").exists())
+            {
+                Some("HEAD".to_string())
+            } else {
+                None
+            }
+        }
+    };
+    let baseline_src = effective_rev
+        .as_deref()
+        .and_then(|r| read_git_baseline_source(&target_canon, r));
+
+    let (
+        edit_class,
+        pub_changed,
+        meta_changed,
+        base_pub_dig,
+        base_meta_dig,
+        cuts_off_pub,
+        cuts_off_meta,
+    ) = if let Some(ref b_src) = baseline_src {
+        if b_src == &cur_src {
+            (
+                "unchanged".to_string(),
+                false,
+                false,
+                Some(cur_sig.public_signature_digest.clone()),
+                Some(cur_sig.meta_signature_digest.clone()),
+                true,
+                true,
+            )
+        } else {
+            let base_split = split_lean_source(b_src, &[]);
+            let base_sig = splitter::extract_public_signature(b_src);
+            let proof_body_only = base_split.interface_hash == cur_split.interface_hash
+                && base_split.shards.len() == cur_split.shards.len()
+                && base_split
+                    .shards
+                    .iter()
+                    .zip(cur_split.shards.iter())
+                    .all(|(a, b)| a.decl_name() == b.decl_name() && a.stmt_hash == b.stmt_hash);
+            if proof_body_only {
+                (
+                    "proof_body_only".to_string(),
+                    false,
+                    false,
+                    Some(base_sig.public_signature_digest),
+                    Some(base_sig.meta_signature_digest),
+                    true,
+                    true,
+                )
+            } else if cur_sig.is_module
+                && base_sig.is_module
+                && !cur_sig
+                    .public_signature_digest
+                    .starts_with("pubsig-invalid:")
+                && !base_sig
+                    .public_signature_digest
+                    .starts_with("pubsig-invalid:")
+                && cur_sig.public_signature_digest == base_sig.public_signature_digest
+            {
+                let meta_same = cur_sig.meta_signature_digest == base_sig.meta_signature_digest;
+                let cls = if meta_same {
+                    "private_module_edit"
+                } else {
+                    "meta_only_module_edit"
+                };
+                (
+                    cls.to_string(),
+                    false,
+                    !meta_same,
+                    Some(base_sig.public_signature_digest),
+                    Some(base_sig.meta_signature_digest),
+                    true,
+                    meta_same,
+                )
+            } else {
+                let pub_diff = cur_sig.public_signature_digest != base_sig.public_signature_digest;
+                let meta_diff = cur_sig.meta_signature_digest != base_sig.meta_signature_digest;
+                let cls = if cur_sig.is_module {
+                    "public_signature_edit"
+                } else {
+                    "non_module_interface_edit"
+                };
+                (
+                    cls.to_string(),
+                    pub_diff || !cur_sig.is_module,
+                    meta_diff || !cur_sig.is_module,
+                    Some(base_sig.public_signature_digest),
+                    Some(base_sig.meta_signature_digest),
+                    false,
+                    false,
+                )
+            }
+        }
+    } else {
+        let cls = if cur_sig.is_module {
+            "unbaselined_module"
+        } else {
+            "unbaselined_non_module"
+        };
+        (cls.to_string(), true, true, None, None, false, false)
+    };
+
+    let mut module_name: Option<String> = None;
+    let mut direct_dependents: Vec<String> = Vec::new();
+    let mut full_dependents: Vec<String> = Vec::new();
+    let mut active_dependents: Vec<String> = Vec::new();
+    let mut pruned_dependents: Vec<String> = Vec::new();
+    let mut affected_modules: Vec<String> = Vec::new();
+    let mut affected_files: Vec<String> = Vec::new();
+    let mut mod_to_path: HashMap<String, PathBuf> = HashMap::new();
+
+    if has_lake_config(&canon_dir) {
+        if let Ok(closure) =
+            compute_project_dependent_closure(&canon_dir, std::slice::from_ref(&rel_file), false)
+        {
+            if let Some(m) = closure.edited_dag_modules.first() {
+                module_name = Some(m.clone());
+            } else {
+                for (m, s) in &closure.standalone_all {
+                    if s.src_path == target_canon {
+                        module_name = Some(m.clone());
+                        break;
+                    }
+                }
+            }
+            if let Some(ref dag) = closure.dag {
+                for (m, n) in &dag.nodes {
+                    mod_to_path.insert(m.clone(), n.src_path.clone());
+                }
+            }
+            for (m, s) in &closure.standalone_all {
+                mod_to_path
+                    .entry(m.clone())
+                    .or_insert_with(|| s.src_path.clone());
+            }
+
+            let target_mod_opt = module_name.clone();
+            if let Some(ref target_mod) = target_mod_opt {
+                if let Some(ref dag) = closure.dag {
+                    for (m, n) in &dag.nodes {
+                        if m != target_mod && n.direct_dag_deps.iter().any(|d| d == target_mod) {
+                            direct_dependents.push(m.clone());
+                        }
+                    }
+                }
+                for (m, s) in &closure.standalone_all {
+                    if m != target_mod && s.imports.iter().any(|d| d == target_mod) {
+                        direct_dependents.push(m.clone());
+                    }
+                }
+                direct_dependents.sort();
+                direct_dependents.dedup();
+            }
+
+            let mut full_set: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            if let Some(ref mods) = closure.dag_modules {
+                for m in mods {
+                    if module_name.as_deref() != Some(m.as_str()) {
+                        full_set.insert(m.clone());
+                    }
+                }
+            }
+            for s in &closure.standalone_modules {
+                if module_name.as_deref() != Some(s.module_name.as_str()) {
+                    full_set.insert(s.module_name.clone());
+                }
+            }
+            full_dependents = full_set.iter().cloned().collect();
+
+            if edit_class == "unchanged" {
+                pruned_dependents = full_dependents.clone();
+            } else if edit_class == "proof_body_only" {
+                if let Some(ref tm) = target_mod_opt {
+                    affected_modules.push(tm.clone());
+                }
+                affected_files.push(rel_file.clone());
+                pruned_dependents = full_dependents.clone();
+            } else if let Some(dag) = closure
+                .dag
+                .as_ref()
+                .filter(|_| cuts_off_pub && !closure.edited_dag_modules.is_empty())
+            {
+                let mut verdicts = HashMap::new();
+                for m in &closure.edited_dag_modules {
+                    verdicts.insert(
+                        m.clone(),
+                        ModuleCutoffVerdict {
+                            cuts_off_public: cuts_off_pub,
+                            cuts_off_meta,
+                        },
+                    );
+                }
+                // For static blast-radius prediction in `impact`, evaluate import-visibility graph
+                // pruning purely from source headers (without requiring prebuilt on-disk `.olean`s).
+                let shared_lib_mods: HashSet<&str> = dag
+                    .shared_libs
+                    .iter()
+                    .flat_map(|sl| sl.local_modules.iter().map(String::as_str))
+                    .collect();
+                let edited_dag_set: HashSet<&str> = closure
+                    .edited_dag_modules
+                    .iter()
+                    .map(String::as_str)
+                    .collect();
+                let mut dag_dirty: std::collections::BTreeSet<String> =
+                    closure.edited_dag_modules.iter().cloned().collect();
+                let mut standalone_dirty: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                let mut changed = true;
+                while changed {
+                    changed = false;
+                    for (m, n) in &dag.nodes {
+                        if dag_dirty.contains(m) {
+                            continue;
+                        }
+                        let (vis_map, _) = crate::module_builder::compute_node_dep_visibility_map(
+                            &closure.cfg,
+                            dag,
+                            n,
+                        );
+                        let trig = n.direct_dag_deps.iter().any(|d| {
+                            if standalone_dirty.contains(d) {
+                                return true;
+                            }
+                            if !dag_dirty.contains(d) {
+                                return false;
+                            }
+                            let vis = if !n.is_module
+                                || n.precompile_modules
+                                || n.is_exe_target
+                                || n.needs_dynlib
+                                || shared_lib_mods.contains(m.as_str())
+                            {
+                                crate::module_builder::DepImportVisibility::All
+                            } else {
+                                vis_map
+                                    .get(d)
+                                    .copied()
+                                    .unwrap_or(crate::module_builder::DepImportVisibility::All)
+                            };
+                            if edited_dag_set.contains(d.as_str()) {
+                                if let Some(v) = verdicts.get(d) {
+                                    return match vis {
+                                        crate::module_builder::DepImportVisibility::PublicExport => {
+                                            !v.cuts_off_public
+                                        }
+                                        crate::module_builder::DepImportVisibility::MetaExport => {
+                                            !v.cuts_off_meta
+                                        }
+                                        crate::module_builder::DepImportVisibility::All => true,
+                                    };
+                                }
+                            }
+                            true
+                        });
+                        if trig {
+                            dag_dirty.insert(m.clone());
+                            changed = true;
+                        }
+                    }
+                    for (m, s) in &closure.standalone_all {
+                        if standalone_dirty.contains(m) {
+                            continue;
+                        }
+                        let trig = s.imports.iter().any(|d| {
+                            if standalone_dirty.contains(d) {
+                                return true;
+                            }
+                            if !dag_dirty.contains(d) {
+                                return false;
+                            }
+                            let vis = if !s.is_module {
+                                crate::module_builder::DepImportVisibility::All
+                            } else {
+                                s.import_visibilities
+                                    .get(d)
+                                    .copied()
+                                    .unwrap_or(crate::module_builder::DepImportVisibility::All)
+                            };
+                            if edited_dag_set.contains(d.as_str()) {
+                                if let Some(v) = verdicts.get(d) {
+                                    return match vis {
+                                        crate::module_builder::DepImportVisibility::PublicExport => {
+                                            !v.cuts_off_public
+                                        }
+                                        crate::module_builder::DepImportVisibility::MetaExport => {
+                                            !v.cuts_off_meta
+                                        }
+                                        crate::module_builder::DepImportVisibility::All => true,
+                                    };
+                                }
+                            }
+                            true
+                        });
+                        if trig {
+                            standalone_dirty.insert(m.clone());
+                            changed = true;
+                        }
+                    }
+                }
+                let mut active_set: std::collections::BTreeSet<String> =
+                    std::collections::BTreeSet::new();
+                for m in dag_dirty.into_iter().chain(standalone_dirty) {
+                    affected_modules.push(m.clone());
+                    if module_name.as_deref() != Some(m.as_str()) {
+                        active_set.insert(m);
+                    }
+                }
+                affected_modules.sort();
+                affected_modules.dedup();
+                active_dependents = active_set.iter().cloned().collect();
+                pruned_dependents = full_set.difference(&active_set).cloned().collect();
+            } else {
+                if let Some(ref tm) = target_mod_opt {
+                    affected_modules.push(tm.clone());
+                }
+                for d in &full_dependents {
+                    affected_modules.push(d.clone());
+                }
+                affected_modules.sort();
+                affected_modules.dedup();
+                active_dependents = full_dependents.clone();
+            }
+        }
+    } else if edit_class != "unchanged" {
+        affected_files.push(rel_file.clone());
+    }
+
+    if affected_files.is_empty() && !affected_modules.is_empty() {
+        for m in &affected_modules {
+            if let Some(p) = mod_to_path.get(m) {
+                let rel = p
+                    .strip_prefix(&canon_dir)
+                    .map(|r| r.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| p.to_string_lossy().replace('\\', "/"));
+                affected_files.push(rel);
+            }
+        }
+        affected_files.sort();
+        affected_files.dedup();
+    }
+
+    let count_decls_in_path = |p: &Path| -> usize {
+        fs::read_to_string(p)
+            .ok()
+            .map(|s| split_lean_source(&s, &[]).shards.len())
+            .unwrap_or(0)
+    };
+    let mut total_downstream_declarations = 0usize;
+    for m in &full_dependents {
+        if let Some(p) = mod_to_path.get(m) {
+            total_downstream_declarations += count_decls_in_path(p);
+        }
+    }
+    let estimated_declarations = if edit_class == "unchanged" {
+        0
+    } else if edit_class == "proof_body_only" {
+        if let Some(ref b_src) = baseline_src {
+            let base_split = split_lean_source(b_src, &[]);
+            base_split
+                .shards
+                .iter()
+                .zip(cur_split.shards.iter())
+                .filter(|(a, b)| a.proof_hash != b.proof_hash)
+                .count()
+        } else {
+            cur_split.shards.len()
+        }
+    } else if !affected_modules.is_empty() {
+        affected_modules
+            .iter()
+            .filter_map(|m| mod_to_path.get(m))
+            .map(|p| count_decls_in_path(p))
+            .sum()
+    } else {
+        cur_split.shards.len()
+    };
+
+    Ok(ImpactReport {
+        file: rel_file,
+        module_name,
+        base_rev: effective_rev,
+        is_module: cur_sig.is_module,
+        edit_class,
+        public_signature_changed: pub_changed,
+        meta_signature_changed: meta_changed,
+        public_signature_digest: cur_sig.public_signature_digest,
+        meta_signature_digest: cur_sig.meta_signature_digest,
+        baseline_public_signature_digest: base_pub_dig,
+        baseline_meta_signature_digest: base_meta_dig,
+        direct_dependents,
+        transitive_dependents: active_dependents,
+        pruned_dependents,
+        affected_modules,
+        affected_files,
+        estimated_declarations,
+        total_downstream_declarations,
+    })
+}
+
+/// Strictly read-only blast-radius and public-signature impact analyzer (`turbo-lean impact <file>`).
+/// Never mutates the worktree, `.lake/build`, or `TurboStore`.
+pub fn run_impact_command(
+    json: bool,
+    file: PathBuf,
+    project_dir: Option<PathBuf>,
+    rev: Option<String>,
+) -> Result<()> {
+    let report = compute_impact_report(file, project_dir, rev)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "[turbo-lean] impact: {} (module: {}, edit_class: {})",
+            report.file,
+            report.module_name.as_deref().unwrap_or("<standalone>"),
+            report.edit_class
+        );
+        println!(
+            "  public_signature_changed: {} | meta_signature_changed: {} | is_module: {}",
+            report.public_signature_changed, report.meta_signature_changed, report.is_module
+        );
+        println!(
+            "  dependents: {} direct, {} active transitive ({} pruned by cutoff), ~{} declarations affected ({} total downstream)",
+            report.direct_dependents.len(),
+            report.transitive_dependents.len(),
+            report.pruned_dependents.len(),
+            report.estimated_declarations,
+            report.total_downstream_declarations
+        );
+    }
+    Ok(())
 }
 
 /// Build any standalone (non-target) project modules transitively imported by `target_files`
@@ -4705,6 +6353,7 @@ pub(crate) fn build_imported_standalone_modules_overlay(
         verified_targets_opt.as_ref(),
         rev,
         true,
+        false,
     )?;
     Ok(overlay)
 }
@@ -6193,6 +7842,7 @@ mod tests {
                         kernel_audited: true,
                         import_olean_digests: Default::default(),
                         artifact_stat_fingerprint: String::new(),
+                        ..Default::default()
                     },
                 )]),
                 ..Default::default()
@@ -6472,6 +8122,7 @@ mod tests {
             kernel_audited: true,
             import_olean_digests: BTreeMap::new(),
             artifact_stat_fingerprint: String::new(),
+            ..Default::default()
         };
         let verdict = || {
             crate::module_builder::reset_lake_inputs_tag_memo();
@@ -7401,6 +9052,7 @@ mod tests {
                         kernel_audited: true,
                         import_olean_digests: Default::default(),
                         artifact_stat_fingerprint: String::new(),
+                        ..Default::default()
                     },
                 )]),
                 ..Default::default()
@@ -7479,6 +9131,179 @@ mod tests {
             Some(v) => std::env::set_var("TURBO_LEAN_NO_WORKTREE_LINK", v),
             None => std::env::remove_var("TURBO_LEAN_NO_WORKTREE_LINK"),
         }
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_speed4_public_signature_early_cutoff_and_readonly_impact() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_speed4_pubsig_impact_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let proj = tmp_dir.join("proj");
+        let cache = tmp_dir.join("cache");
+        fs::create_dir_all(proj.join("Smoke"))?;
+        fs::write(
+            proj.join("lean-toolchain"),
+            include_str!("../../../lean/lean-toolchain"),
+        )?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"smoke\"\n[[lean_lib]]\nname = \"Smoke\"\nglobs = [\"Smoke.+\"]\n",
+        )?;
+
+        let a_v1 = "\
+module
+private def privHelper (n : Nat) : Nat := n + 1
+@[noinline] public def pubApi (n : Nat) : Nat := privHelper n
+public theorem pub_thm (n : Nat) : n + 0 = n := by
+  exact Nat.add_zero n
+";
+        let b_src = "\
+module
+public import Smoke.A
+public theorem downstream_b (n : Nat) : n + 0 = n := pub_thm n
+";
+        let c_src = "\
+module
+import Smoke.B
+public theorem downstream_c (n : Nat) : n + 0 = n := downstream_b n
+";
+        fs::write(proj.join("Smoke/A.lean"), a_v1)?;
+        fs::write(proj.join("Smoke/B.lean"), b_src)?;
+        fs::write(proj.join("Smoke/C.lean"), c_src)?;
+
+        let git_bin = std::env::var("TURBO_LEAN_GIT").unwrap_or_else(|_| "git".to_string());
+        let run_git = |args: &[&str]| -> Result<()> {
+            let st = Command::new(&git_bin)
+                .current_dir(&proj)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .status()?;
+            anyhow::ensure!(st.success(), "git {:?} failed", args);
+            Ok(())
+        };
+        run_git(&["init"])?;
+        run_git(&["add", "."])?;
+        run_git(&["commit", "-m", "init"])?;
+
+        // 1. `compute_impact_report` BEFORE any build or store open: strictly read-only, no `.lake` or `.turbo-lean` created.
+        let rep_unchanged = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_unchanged.edit_class, "unchanged");
+        assert!(!rep_unchanged.public_signature_changed);
+        assert_eq!(rep_unchanged.direct_dependents, vec!["Smoke.B".to_string()]);
+        assert!(rep_unchanged.transitive_dependents.is_empty());
+        assert_eq!(
+            rep_unchanged.pruned_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+        assert!(!proj.join(".lake").exists());
+        assert!(!proj.join(".turbo-lean").exists());
+
+        // Initial native build of the DAG so `Smoke.A`, `Smoke.B`, and `Smoke.C` have verified `.olean` baselines.
+        let mut store = TurboStore::open(Some(&cache))?;
+        crate::module_builder::build_project_modules_native(
+            &mut store,
+            &proj,
+            &["Smoke.C".to_string()],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        let canon_proj = proj.canonicalize().unwrap_or_else(|_| proj.clone());
+
+        // 2. Private-only module edit (new private helper + changed unexposed public body):
+        //    - `impact` classifies `private_module_edit`, `public_signature_changed == false`, prunes `Smoke.B` & `Smoke.C`.
+        //    - `lake_recheck_dependents_with_store` rebuilds ONLY `Smoke.A` (1 module, NOT 3!).
+        let a_priv_edit = "\
+module
+private def privHelper (n : Nat) : Nat := (n + 1) + 0
+private def privExtra (n : Nat) : Nat := n * 2
+@[noinline] public def pubApi (n : Nat) : Nat := privHelper (n + 0)
+public theorem pub_thm (n : Nat) : n + 0 = n := by
+  omega
+";
+        fs::write(proj.join("Smoke/A.lean"), a_priv_edit)?;
+        let rep_priv = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_priv.edit_class, "private_module_edit");
+        assert!(!rep_priv.public_signature_changed);
+        assert!(!rep_priv.meta_signature_changed);
+        assert!(rep_priv.transitive_dependents.is_empty());
+        assert_eq!(
+            rep_priv.pruned_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+
+        let (rechecked_n, _files, rechecked_mods, _) = lake_recheck_dependents_with_store(
+            Some(&store),
+            &canon_proj,
+            &["Smoke/A.lean".to_string()],
+            Some("HEAD"),
+            false,
+        )?;
+        assert_eq!(
+            rechecked_n, 1,
+            "public-signature early cutoff must stop at Smoke.A on private module edit, got {:?}",
+            rechecked_mods
+        );
+        assert_eq!(rechecked_mods, vec!["Smoke.A".to_string()]);
+
+        // 3. Public theorem type / attribute edit (`@[simp]` added on `pub_thm`):
+        //    - `impact` classifies `public_signature_edit`, `public_signature_changed == true`, lists full downstream cone `Smoke.B` & `Smoke.C`.
+        //    - `lake_recheck_dependents_with_store` does NOT cut off and rechecks all 3 modules (`Smoke.A`, `Smoke.B`, `Smoke.C`).
+        let a_pub_edit = a_v1.replace("public theorem pub_thm", "@[simp] public theorem pub_thm");
+        fs::write(proj.join("Smoke/A.lean"), &a_pub_edit)?;
+        let rep_pub = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_pub.edit_class, "public_signature_edit");
+        assert!(rep_pub.public_signature_changed);
+        assert_eq!(
+            rep_pub.transitive_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+        assert!(rep_pub.pruned_dependents.is_empty());
+
+        let (rechecked_pub_n, _pub_files, mut rechecked_pub_mods, _) =
+            lake_recheck_dependents_with_store(
+                Some(&store),
+                &canon_proj,
+                &["Smoke/A.lean".to_string()],
+                Some("HEAD"),
+                false,
+            )?;
+        rechecked_pub_mods.sort();
+        assert_eq!(rechecked_pub_n, 3);
+        assert_eq!(
+            rechecked_pub_mods,
+            vec![
+                "Smoke.A".to_string(),
+                "Smoke.B".to_string(),
+                "Smoke.C".to_string()
+            ]
+        );
+
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }

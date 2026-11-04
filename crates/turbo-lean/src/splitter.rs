@@ -209,9 +209,27 @@ pub fn blocking_items(items: &[String]) -> Vec<String> {
     blocking_items_under(items, &allowed_axioms())
 }
 
+/// Hygiene items that block under `--allow-sorry` (trusted interactive proof sketching only):
+/// admits `sorry/admit token` items while still rejecting axioms, `native_decide`/`bv_decide`
+/// violations, `trustCompiler`, `unsafe`, `extern`/`implemented_by`/`csimp`, and checking-weakening.
+pub fn blocking_items_modulo_sorry(items: &[String]) -> Vec<String> {
+    blocking_items(items)
+        .into_iter()
+        .filter(|i| item_kind(i) != "sorry/admit token")
+        .collect()
+}
+
 impl HygieneReport {
     pub fn is_clean_for_certification(&self) -> bool {
         self.disallowed_items().is_empty()
+    }
+
+    pub fn is_clean_modulo_sorry(&self) -> bool {
+        self.disallowed_items_modulo_sorry().is_empty()
+    }
+
+    pub fn disallowed_items_modulo_sorry(&self) -> Vec<String> {
+        blocking_items_modulo_sorry(&self.flagged_items)
     }
 
     /// `native_decide`/`bv_decide` use that the axiom allowlist does not admit.
@@ -6242,6 +6260,663 @@ pub fn audit_source_declarations(
     (shadowed, unused_private, horiz)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicDeclSig {
+    pub const_name: String,
+    pub kind: String,
+    pub sig_hash: String,
+    pub simp_attrs: Vec<String>,
+    pub reducibility: String,
+    pub inline_attrs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposed_body_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicSignatureSummary {
+    pub is_module: bool,
+    pub exported_imports: Vec<String>,
+    pub meta_exported_imports: Vec<String>,
+    pub declarations: Vec<PublicDeclSig>,
+    pub public_directives_hash: String,
+    pub public_signature_digest: String,
+    pub meta_signature_digest: String,
+}
+
+fn split_attr_items(attr_block: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let bytes = attr_block.as_bytes();
+    let mut start = 0usize;
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = scan_lean_norm_literal_end(attr_block, i) {
+            i = end;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            b',' if paren == 0 && bracket == 0 && brace == 0 => {
+                let piece = normalize_whitespace(&attr_block[start..i]);
+                if !piece.is_empty() {
+                    items.push(piece);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let tail = normalize_whitespace(&attr_block[start..]);
+    if !tail.is_empty() {
+        items.push(tail);
+    }
+    items
+}
+
+fn parse_decl_modifiers_and_attrs(clean_cmd: &str) -> (Vec<String>, Vec<String>) {
+    const MODS: &[&str] = &[
+        "private",
+        "protected",
+        "noncomputable",
+        "scoped",
+        "local",
+        "unsafe",
+        "partial",
+        "nonrec",
+        "public",
+        "meta",
+    ];
+    let mut mods = Vec::new();
+    let mut attrs = Vec::new();
+    let mut rest = clean_cmd.trim_start();
+    loop {
+        if let Some((end, is_doc)) = scan_lean_block_comment_end(rest, 0) {
+            if is_doc {
+                rest = rest[end..].trim_start();
+                continue;
+            }
+        }
+        if let Some(after_attr) = strip_leading_attr_block(rest) {
+            let attr_block_len = rest.len() - after_attr.len();
+            let inner = rest[2..attr_block_len - 1].trim();
+            for item in split_attr_items(inner) {
+                attrs.push(item);
+            }
+            rest = after_attr.trim_start();
+            continue;
+        }
+        if let Some(after_opt) = strip_leading_set_option_in(rest) {
+            rest = after_opt.trim_start();
+            continue;
+        }
+        let mut stripped = false;
+        for &m in MODS {
+            if let Some(after_m) = rest.strip_prefix(m) {
+                if after_m.is_empty() || after_m.starts_with(char::is_whitespace) {
+                    let trimmed_after = after_m.trim_start();
+                    if matches!(m, "noncomputable" | "public" | "meta")
+                        && (trimmed_after == "section"
+                            || trimmed_after.starts_with("section ")
+                            || trimmed_after.starts_with("import "))
+                    {
+                        break;
+                    }
+                    mods.push(m.to_string());
+                    rest = trimmed_after;
+                    stripped = true;
+                    break;
+                }
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    (mods, attrs)
+}
+
+fn section_header_visibility(trimmed_clean: &str) -> (bool, bool, bool) {
+    let mut after = trimmed_clean;
+    let mut has_expose = false;
+    while let Some(next) = strip_leading_attr_block(after) {
+        let len = after.len() - next.len();
+        let inner = after[2..len - 1].trim();
+        if split_attr_items(inner)
+            .iter()
+            .any(|a| a == "expose" || a.starts_with("expose "))
+        {
+            has_expose = true;
+        }
+        after = next.trim_start();
+    }
+    let mut is_public = false;
+    let mut is_meta = false;
+    loop {
+        if let Some(next) = after.strip_prefix("noncomputable ") {
+            after = next.trim_start();
+            continue;
+        }
+        if let Some(next) = after.strip_prefix("public ") {
+            is_public = true;
+            after = next.trim_start();
+            continue;
+        }
+        if let Some(next) = after.strip_prefix("meta ") {
+            is_meta = true;
+            after = next.trim_start();
+            continue;
+        }
+        break;
+    }
+    (is_public, is_meta, has_expose)
+}
+
+#[derive(Clone, Debug)]
+struct PubScopeFrame {
+    kind: ScopeKind,
+    name: String,
+    is_public_section: bool,
+    is_meta_section: bool,
+    section_has_expose: bool,
+}
+
+fn update_pub_scope_stack(stack: &mut Vec<PubScopeFrame>, orig_chunk: &str) {
+    let masked = mask_lean_lexemes(orig_chunk, true);
+    for (line, orig_line) in masked.lines().zip(orig_chunk.lines()) {
+        let trimmed = line.trim();
+        let orig_trimmed = orig_line.trim();
+        if let Some(rest) = trimmed.strip_prefix("namespace ") {
+            let orig_rest = orig_trimmed.strip_prefix("namespace ").unwrap_or(rest);
+            let name = take_leading_lean_ident(orig_rest.trim_start())
+                .map(|(n, _)| n)
+                .unwrap_or("");
+            let inh_pub = stack.iter().any(|f| f.is_public_section);
+            let inh_meta = stack.iter().any(|f| f.is_meta_section);
+            let inh_exp = stack.iter().any(|f| f.section_has_expose);
+            for seg in split_lean_name_components(name) {
+                stack.push(PubScopeFrame {
+                    kind: ScopeKind::Namespace,
+                    name: seg.to_string(),
+                    is_public_section: inh_pub,
+                    is_meta_section: inh_meta,
+                    section_has_expose: inh_exp,
+                });
+            }
+        } else if is_section_header_line(trimmed) {
+            let (sec_pub, sec_meta, sec_exp) = section_header_visibility(trimmed);
+            let inh_pub = sec_pub || stack.iter().any(|f| f.is_public_section);
+            let inh_meta = sec_meta || stack.iter().any(|f| f.is_meta_section);
+            let inh_exp = sec_exp || stack.iter().any(|f| f.section_has_expose);
+            let name = extract_section_header_name(orig_trimmed);
+            if name.is_empty() {
+                stack.push(PubScopeFrame {
+                    kind: ScopeKind::Section,
+                    name: String::new(),
+                    is_public_section: inh_pub,
+                    is_meta_section: inh_meta,
+                    section_has_expose: inh_exp,
+                });
+            } else {
+                for seg in split_lean_name_components(&name) {
+                    stack.push(PubScopeFrame {
+                        kind: ScopeKind::Section,
+                        name: seg.to_string(),
+                        is_public_section: inh_pub,
+                        is_meta_section: inh_meta,
+                        section_has_expose: inh_exp,
+                    });
+                }
+            }
+        } else if trimmed == "mutual" || trimmed.starts_with("mutual ") {
+            let inh_pub = stack.iter().any(|f| f.is_public_section);
+            let inh_meta = stack.iter().any(|f| f.is_meta_section);
+            let inh_exp = stack.iter().any(|f| f.section_has_expose);
+            stack.push(PubScopeFrame {
+                kind: ScopeKind::Mutual,
+                name: String::new(),
+                is_public_section: inh_pub,
+                is_meta_section: inh_meta,
+                section_has_expose: inh_exp,
+            });
+        } else if trimmed == "end" || trimmed.starts_with("end ") {
+            let orig_rest = orig_trimmed
+                .strip_prefix("end")
+                .unwrap_or_else(|| trimmed.strip_prefix("end").unwrap_or(""));
+            let name = take_leading_lean_ident(orig_rest.trim_start())
+                .map(|(n, _)| n)
+                .unwrap_or("");
+            if name.is_empty() {
+                stack.pop();
+            } else {
+                for seg in split_lean_name_components(name).into_iter().rev() {
+                    let canon = canonical_lean_name_component(seg);
+                    if let Some(pos) = stack
+                        .iter()
+                        .rposition(|f| canonical_lean_name_component(&f.name) == canon)
+                    {
+                        stack.truncate(pos);
+                    } else {
+                        stack.pop();
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn pub_qualified_name(name: &str, stack: &[PubScopeFrame]) -> String {
+    if let Some(root_name) = name.strip_prefix("_root_.") {
+        return canonicalize_lean_name(root_name);
+    }
+    stack
+        .iter()
+        .filter(|f| matches!(f.kind, ScopeKind::Namespace))
+        .map(|f| canonical_lean_name_component(f.name.as_str()))
+        .chain(
+            split_lean_name_components(name)
+                .into_iter()
+                .map(canonical_lean_name_component),
+        )
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// Extract the public signature tuples and public/meta interface digests of a Lean 4 file.
+/// For `module` files, private items (outside `public section` without `public` modifier, or marked
+/// `private`) and unexposed `public def`/`public theorem` bodies are excluded from `public_signature_digest`,
+/// matching Lean 4's `.olean` / `.olean.private` module system boundary.
+pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
+    let hdr = crate::module_builder::parse_header_info(src);
+    let is_module = hdr.is_module && hdr.header_error.is_none();
+    let mut exported_imports = Vec::new();
+    let mut meta_exported_imports = Vec::new();
+    for spec in &hdr.import_specs {
+        if spec.is_exported {
+            let entry = if spec.import_all {
+                format!("{}:all", spec.module)
+            } else {
+                spec.module.clone()
+            };
+            if spec.is_meta {
+                meta_exported_imports.push(entry);
+            } else {
+                exported_imports.push(entry);
+            }
+        }
+    }
+    exported_imports.sort();
+    exported_imports.dedup();
+    meta_exported_imports.sort();
+    meta_exported_imports.dedup();
+
+    if hdr.header_error.is_some() {
+        let raw_hash = blake3::hash(src.as_bytes()).to_hex().to_string();
+        return PublicSignatureSummary {
+            is_module: false,
+            exported_imports,
+            meta_exported_imports,
+            declarations: Vec::new(),
+            public_directives_hash: raw_hash.clone(),
+            public_signature_digest: format!("pubsig-invalid:{}", raw_hash),
+            meta_signature_digest: format!("metasig-invalid:{}", raw_hash),
+        };
+    }
+
+    let clean = strip_lean_comments(src);
+    let spans = parse_command_spans(src, &clean);
+    let mut stack: Vec<PubScopeFrame> = Vec::new();
+    let mut declarations: Vec<PublicDeclSig> = Vec::new();
+    let mut meta_declarations: Vec<PublicDeclSig> = Vec::new();
+    let mut directives_hasher = blake3::Hasher::new();
+    directives_hasher.update(b"pub-directives:v1\n");
+    let mut meta_directives_hasher = blake3::Hasher::new();
+    meta_directives_hasher.update(b"meta-directives:v1\n");
+    let mut active_context_vars: Vec<String> = Vec::new();
+
+    let process_decl_cmd =
+        |sub_clean: &str,
+         stack: &[PubScopeFrame],
+         active_vars: &[String],
+         declarations: &mut Vec<PublicDeclSig>,
+         meta_declarations: &mut Vec<PublicDeclSig>,
+         directives_hasher: &mut blake3::Hasher,
+         meta_directives_hasher: &mut blake3::Hasher| {
+            let trimmed = sub_clean.trim();
+            if trimmed.is_empty()
+                || trimmed == "module"
+                || trimmed.starts_with("module ")
+                || trimmed == "prelude"
+                || trimmed.starts_with("import ")
+                || trimmed.starts_with("public import ")
+                || trimmed.starts_with("meta import ")
+                || trimmed.starts_with("public meta import ")
+            {
+                return;
+            }
+            let in_pub_sec = stack.iter().any(|f| f.is_public_section);
+            let in_meta_sec = stack.iter().any(|f| f.is_meta_section);
+            let in_expose_sec = stack.iter().any(|f| f.section_has_expose);
+
+            let (mods, attrs) = parse_decl_modifiers_and_attrs(trimmed);
+            let is_priv_mod = mods.iter().any(|m| m == "private");
+            let is_pub_mod = mods.iter().any(|m| m == "public");
+            let is_meta_mod = mods.iter().any(|m| m == "meta") || in_meta_sec;
+            let is_local_mod = mods.iter().any(|m| m == "local");
+
+            let is_public_visible = if is_module {
+                !is_priv_mod && (is_pub_mod || in_pub_sec)
+            } else {
+                true
+            };
+
+            if let Some((kw, raw_name)) = classify_any_decl_header(trimmed) {
+                if !is_public_visible {
+                    return;
+                }
+                let const_name = if raw_name.is_empty() {
+                    format!(
+                        "<anon:{}:{}>",
+                        kw,
+                        &hash_normalized_whitespace_hex(trimmed)[..12]
+                    )
+                } else {
+                    pub_qualified_name(&raw_name, stack)
+                };
+                let mut simp_attrs = Vec::new();
+                let mut inline_attrs = Vec::new();
+                let mut reducibility = if kw == "abbrev" {
+                    "reducible".to_string()
+                } else if kw == "opaque" {
+                    "irreducible".to_string()
+                } else {
+                    "semireducible".to_string()
+                };
+                let mut has_expose_attr = in_expose_sec;
+                let mut other_exported_attrs = Vec::new();
+
+                for a in &attrs {
+                    if a.starts_with("local ") || a == "local" {
+                        continue;
+                    }
+                    if a == "expose" || a.starts_with("expose ") {
+                        has_expose_attr = true;
+                    } else if a == "simp"
+                        || a.starts_with("simp ")
+                        || a.starts_with("simp,")
+                        || a.contains("simproc")
+                        || a == "csimp"
+                        || a.starts_with("csimp ")
+                    {
+                        simp_attrs.push(a.clone());
+                    } else if a == "reducible" {
+                        reducibility = "reducible".to_string();
+                    } else if a == "irreducible" {
+                        reducibility = "irreducible".to_string();
+                    } else if a == "semireducible" {
+                        reducibility = "semireducible".to_string();
+                    } else if matches!(
+                        a.as_str(),
+                        "inline"
+                            | "noinline"
+                            | "macro_inline"
+                            | "always_inline"
+                            | "inline_if_reduce"
+                    ) {
+                        inline_attrs.push(a.clone());
+                    } else {
+                        other_exported_attrs.push(a.clone());
+                    }
+                }
+                simp_attrs.sort();
+                inline_attrs.sort();
+                other_exported_attrs.sort();
+
+                let stripped_decl = strip_decl_prefixes(trimmed);
+                let (sig_part, body_part_opt) =
+                    if matches!(kw, "structure" | "class" | "inductive" | "coinductive") {
+                        (stripped_decl, Some(stripped_decl))
+                    } else if let Some((sig, body)) = split_at_top_level_assign(stripped_decl) {
+                        (sig, Some(body))
+                    } else {
+                        (stripped_decl, None)
+                    };
+
+                let mut sig_h = blake3::Hasher::new();
+                sig_h.update(b"decl-sig:v1\n");
+                for v in active_vars {
+                    sig_h.update(b"ctx:");
+                    sig_h.update(v.as_bytes());
+                    sig_h.update(b"\n");
+                }
+                for m in &mods {
+                    if m != "public" {
+                        sig_h.update(b"mod:");
+                        sig_h.update(m.as_bytes());
+                        sig_h.update(b"\n");
+                    }
+                }
+                for oa in &other_exported_attrs {
+                    sig_h.update(b"attr:");
+                    sig_h.update(oa.as_bytes());
+                    sig_h.update(b"\n");
+                }
+                hash_normalized_whitespace(&mut sig_h, sig_part, b"\n");
+                let sig_hash = sig_h.finalize().to_hex().to_string();
+
+                let is_thm_like = matches!(kw, "theorem" | "lemma");
+                let body_exposed = if is_thm_like {
+                    // Proof irrelevance: theorem proof bodies never affect downstream typing unless `@[expose]` is present in `module` mode (which still elaborates to Prop).
+                    false
+                } else if is_module {
+                    is_meta_mod
+                        || has_expose_attr
+                        || reducibility == "reducible"
+                        || inline_attrs.iter().any(|a| a != "noinline")
+                        || matches!(
+                            kw,
+                            "abbrev"
+                                | "structure"
+                                | "class"
+                                | "inductive"
+                                | "coinductive"
+                                | "instance"
+                                | "simproc"
+                                | "dsimproc"
+                                | "simproc_decl"
+                                | "dsimproc_decl"
+                                | "builtin_simproc"
+                                | "builtin_dsimproc"
+                        )
+                        || !other_exported_attrs.is_empty()
+                } else {
+                    true
+                };
+
+                let exposed_body_hash = if body_exposed {
+                    body_part_opt.map(hash_normalized_whitespace_hex)
+                } else {
+                    None
+                };
+
+                let entry = PublicDeclSig {
+                    const_name,
+                    kind: kw.to_string(),
+                    sig_hash,
+                    simp_attrs,
+                    reducibility,
+                    inline_attrs,
+                    exposed_body_hash,
+                };
+                if is_meta_mod && is_module {
+                    meta_declarations.push(entry);
+                } else {
+                    declarations.push(entry);
+                }
+                return;
+            }
+
+            // Scope/context or standalone commands (`variable`, `open`, `universe`, `attribute`, `notation`, `macro`, `elab`, `syntax`, `export`, etc.)
+            let after_prefixes = strip_decl_prefixes(trimmed);
+            if after_prefixes.starts_with("variable ")
+                || after_prefixes.starts_with("variables ")
+                || after_prefixes.starts_with("universe ")
+                || after_prefixes.starts_with("universes ")
+                || after_prefixes.starts_with("open ")
+                || after_prefixes.starts_with("include ")
+                || after_prefixes.starts_with("omit ")
+            {
+                return;
+            }
+            if trimmed.starts_with("namespace ")
+                || is_section_header_line(trimmed)
+                || trimmed == "end"
+                || trimmed.starts_with("end ")
+            {
+                return;
+            }
+            if is_module && (is_priv_mod || is_local_mod || (!is_pub_mod && !in_pub_sec)) {
+                return;
+            }
+            if is_module && is_meta_mod {
+                hash_normalized_whitespace(meta_directives_hasher, trimmed, b"\n");
+            } else {
+                hash_normalized_whitespace(directives_hasher, trimmed, b"\n");
+            }
+        };
+
+    for span in &spans {
+        let trimmed = span.clean_text.trim();
+        let after_p = strip_decl_prefixes(trimmed);
+        if after_p.starts_with("variable ")
+            || after_p.starts_with("variables ")
+            || after_p.starts_with("universe ")
+            || after_p.starts_with("universes ")
+            || after_p.starts_with("open ")
+            || after_p.starts_with("set_option ")
+        {
+            active_context_vars.push(normalize_whitespace(trimmed));
+        }
+
+        if let Some((_, inner_spans, _)) = split_mutual_block_subspans(span) {
+            stack.push(PubScopeFrame {
+                kind: ScopeKind::Mutual,
+                name: String::new(),
+                is_public_section: stack.iter().any(|f| f.is_public_section),
+                is_meta_section: stack.iter().any(|f| f.is_meta_section),
+                section_has_expose: stack.iter().any(|f| f.section_has_expose),
+            });
+            for sub in &inner_spans {
+                process_decl_cmd(
+                    sub.clean_text,
+                    &stack,
+                    &active_context_vars,
+                    &mut declarations,
+                    &mut meta_declarations,
+                    &mut directives_hasher,
+                    &mut meta_directives_hasher,
+                );
+            }
+            stack.pop();
+        } else {
+            process_decl_cmd(
+                span.clean_text,
+                &stack,
+                &active_context_vars,
+                &mut declarations,
+                &mut meta_declarations,
+                &mut directives_hasher,
+                &mut meta_directives_hasher,
+            );
+            update_pub_scope_stack(&mut stack, span.orig_text);
+        }
+    }
+
+    let public_directives_hash = directives_hasher.finalize().to_hex().to_string();
+    let meta_directives_hash = meta_directives_hasher.finalize().to_hex().to_string();
+
+    let hash_sig_list = |tag: &[u8],
+                         is_mod: bool,
+                         imps: &[String],
+                         decls: &[PublicDeclSig],
+                         dir_hash: &str|
+     -> String {
+        let mut h = blake3::Hasher::new();
+        h.update(tag);
+        h.update(if is_mod { b"module:1\n" } else { b"module:0\n" });
+        for imp in imps {
+            h.update(b"imp:");
+            h.update(imp.as_bytes());
+            h.update(b"\n");
+        }
+        for d in decls {
+            h.update(b"decl:");
+            h.update(d.const_name.as_bytes());
+            h.update(b"|");
+            h.update(d.kind.as_bytes());
+            h.update(b"|");
+            h.update(d.sig_hash.as_bytes());
+            h.update(b"|red=");
+            h.update(d.reducibility.as_bytes());
+            h.update(b"|simp=");
+            for s in &d.simp_attrs {
+                h.update(s.as_bytes());
+                h.update(b",");
+            }
+            h.update(b"|inl=");
+            for inl in &d.inline_attrs {
+                h.update(inl.as_bytes());
+                h.update(b",");
+            }
+            if let Some(ref bh) = d.exposed_body_hash {
+                h.update(b"|body=");
+                h.update(bh.as_bytes());
+            }
+            h.update(b"\n");
+        }
+        h.update(b"directives:");
+        h.update(dir_hash.as_bytes());
+        h.update(b"\n");
+        h.finalize().to_hex().to_string()
+    };
+
+    let public_signature_digest = hash_sig_list(
+        b"turbo-lean-pubsig:v1\n",
+        is_module,
+        &exported_imports,
+        &declarations,
+        &public_directives_hash,
+    );
+    let mut combined_imps = exported_imports.clone();
+    combined_imps.extend(meta_exported_imports.iter().cloned());
+    let mut combined_decls = declarations.clone();
+    combined_decls.extend(meta_declarations);
+    let meta_signature_digest = hash_sig_list(
+        b"turbo-lean-metasig:v1\n",
+        is_module,
+        &combined_imps,
+        &combined_decls,
+        &format!("{}:{}", public_directives_hash, meta_directives_hash),
+    );
+
+    PublicSignatureSummary {
+        is_module,
+        exported_imports,
+        meta_exported_imports,
+        declarations,
+        public_directives_hash,
+        public_signature_digest,
+        meta_signature_digest,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7904,6 +8579,86 @@ end MathlibEdgeCases
             fission_theorem_have_blocks(decl_shadow, "sig_shadow").is_empty(),
             "fission must skip cuts whose identifier shadows a binder/constant in the theorem signature"
         );
+    }
+
+    #[test]
+    fn test_speed4_extract_public_signature_module_vs_non_module_and_hygiene_modulo_sorry() {
+        let mod_v1 = "\
+module
+public import Init
+private def secretHelper (n : Nat) : Nat := n + 1
+public def pubFn (n : Nat) : Nat := secretHelper n
+public theorem pub_thm (n : Nat) : n + 0 = n := by
+  exact Nat.add_zero n
+";
+        let mod_v2_priv_edit = "\
+module
+public import Init
+private def secretHelper (n : Nat) : Nat := (n + 1) + 0
+private theorem extra_priv_lemma : 1 + 1 = 2 := rfl
+public def pubFn (n : Nat) : Nat := secretHelper (n + 0)
+public theorem pub_thm (n : Nat) : n + 0 = n := by
+  omega
+";
+        let sig1 = extract_public_signature(mod_v1);
+        let sig2 = extract_public_signature(mod_v2_priv_edit);
+        assert!(sig1.is_module && sig2.is_module);
+        assert_eq!(
+            sig1.public_signature_digest, sig2.public_signature_digest,
+            "private helpers, private theorems, and unexposed public def/theorem bodies must not alter public_signature_digest"
+        );
+        assert_eq!(sig1.meta_signature_digest, sig2.meta_signature_digest);
+
+        // Changing a public theorem type MUST change public_signature_digest.
+        let mod_type_changed = mod_v1.replace("n + 0 = n", "0 + n = n");
+        assert_ne!(
+            sig1.public_signature_digest,
+            extract_public_signature(&mod_type_changed).public_signature_digest
+        );
+
+        // Changing a public theorem name MUST change public_signature_digest.
+        let mod_name_changed = mod_v1.replace("pub_thm", "pub_thm_renamed");
+        assert_ne!(
+            sig1.public_signature_digest,
+            extract_public_signature(&mod_name_changed).public_signature_digest
+        );
+
+        // Adding `@[simp]` to a public theorem MUST change public_signature_digest.
+        let mod_simp_added =
+            mod_v1.replace("public theorem pub_thm", "@[simp] public theorem pub_thm");
+        assert_ne!(
+            sig1.public_signature_digest,
+            extract_public_signature(&mod_simp_added).public_signature_digest
+        );
+
+        // Changing an `@[expose] public def` body MUST change public_signature_digest.
+        let mod_exposed_v1 = "module\n@[expose] public def exposedVal : Nat := 1 + 2\n";
+        let mod_exposed_v2 = "module\n@[expose] public def exposedVal : Nat := 2 + 1\n";
+        assert_ne!(
+            extract_public_signature(mod_exposed_v1).public_signature_digest,
+            extract_public_signature(mod_exposed_v2).public_signature_digest
+        );
+
+        // Changing a `public meta def` body MUST preserve public_signature_digest while changing meta_signature_digest.
+        let mod_meta_v1 =
+            "module\npublic def keepMe : Nat := 7\npublic meta def metaHelper : Nat := 1\n";
+        let mod_meta_v2 =
+            "module\npublic def keepMe : Nat := 7\npublic meta def metaHelper : Nat := 2\n";
+        let sm1 = extract_public_signature(mod_meta_v1);
+        let sm2 = extract_public_signature(mod_meta_v2);
+        assert_eq!(sm1.public_signature_digest, sm2.public_signature_digest);
+        assert_ne!(sm1.meta_signature_digest, sm2.meta_signature_digest);
+
+        // Hygiene modulo sorry: `sorry` is permitted ONLY in modulo-sorry hygiene, whereas custom axioms and native_decide remain rejected.
+        let sorry_only = audit_hygiene("theorem t : True := by sorry\n");
+        assert!(!sorry_only.is_clean_for_certification());
+        assert!(sorry_only.is_clean_modulo_sorry());
+        assert!(sorry_only.disallowed_items_modulo_sorry().is_empty());
+
+        let sorry_and_axiom =
+            audit_hygiene("axiom my_bad_ax : False\ntheorem t : False := by sorry\n");
+        assert!(!sorry_and_axiom.is_clean_modulo_sorry());
+        assert!(!sorry_and_axiom.disallowed_items_modulo_sorry().is_empty());
     }
 }
 
