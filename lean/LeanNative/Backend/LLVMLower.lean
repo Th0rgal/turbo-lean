@@ -375,6 +375,137 @@ def ppLoweredDecl (d : LNIRDecl) : Option String := do
   let m ← lowerModule d
   some (PP.ppModule m)
 
+def overflowFlagsOf (nsw nuw : Bool) : OverflowFlags :=
+  if nsw && nuw then .nswNuw else if nsw then .nsw else if nuw then .nuw else .none
+
+def overflowOf (facts : FactEnv) (isMul : Bool) (a b : VarId) : OverflowFlags :=
+  match facts with
+  | [] => .none
+  | .noOverflowAdd l r nsw nuw :: rest =>
+    if !isMul && l == a && r == b then overflowFlagsOf nsw nuw
+    else overflowOf rest isMul a b
+  | .noOverflowMul l r nsw nuw :: rest =>
+    if isMul && l == a && r == b then overflowFlagsOf nsw nuw
+    else overflowOf rest isMul a b
+  | _ :: rest => overflowOf rest isMul a b
+
+def subFlagsOf (facts : FactEnv) (a b : VarId) : OverflowFlags :=
+  match facts with
+  | [] => .none
+  | .noOverflowSub l r nsw nuw :: rest =>
+    if l == a && r == b then overflowFlagsOf nsw nuw else subFlagsOf rest a b
+  | _ :: rest => subFlagsOf rest a b
+
+def llvmRegOf (v : VarId) : String := "v" ++ ppInt v
+
+def mergeFlags (old fresh : OverflowFlags) : OverflowFlags :=
+  match old, fresh with
+  | .none, f => f
+  | f, .none => f
+  | .nsw, .nuw | .nuw, .nsw | .nswNuw, _ | _, .nswNuw => .nswNuw
+  | .nsw, .nsw => .nsw
+  | .nuw, .nuw => .nuw
+
+def attachOverflow (facts : FactEnv) (ins : LLVMInstr) : LLVMInstr :=
+  match ins with
+  | .add dst old .i64 (.reg x) (.reg y) =>
+    match factOperands facts x y with
+    | some (a, b) => .add dst (mergeFlags old (overflowOf facts false a b)) .i64 (.reg x) (.reg y)
+    | none => ins
+  | .sub dst old .i64 (.reg x) (.reg y) =>
+    match factOperands facts x y with
+    | some (a, b) => .sub dst (mergeFlags old (subFlagsOf facts a b)) .i64 (.reg x) (.reg y)
+    | none => ins
+  | .mul dst old .i64 (.reg x) (.reg y) =>
+    match factOperands facts x y with
+    | some (a, b) => .mul dst (mergeFlags old (overflowOf facts true a b)) .i64 (.reg x) (.reg y)
+    | none => ins
+  | _ => ins
+where
+  factOperands (facts : FactEnv) (x y : String) : Option (VarId × VarId) :=
+    match facts with
+    | [] => none
+    | .noOverflowAdd a b _ _ :: rest | .noOverflowSub a b _ _ :: rest
+    | .noOverflowMul a b _ _ :: rest =>
+      if x == llvmRegOf a && y == llvmRegOf b then some (a, b)
+      else factOperands rest x y
+    | _ :: rest => factOperands rest x y
+
+def alignOfFact (facts : FactEnv) (ptrVar : VarId) (ty : LLVMType) (fallback : Nat) : Nat :=
+  match facts with
+  | [] => fallback
+  | .alignedPtr p n :: rest =>
+    let eff := effectiveAlign ty fallback
+    if p == ptrVar && isPow2 n && isPow2 eff && eff < n && n % eff == 0 then n
+    else alignOfFact rest ptrVar ty fallback
+  | _ :: rest => alignOfFact rest ptrVar ty fallback
+
+def attachLoadStoreAlign (facts : FactEnv) (ptrVar : VarId) (ins : LLVMInstr) : LLVMInstr :=
+  match ins with
+  | .load dst vol ty (.reg r) al as_ =>
+    if r == llvmRegOf ptrVar then .load dst vol ty (.reg r) (alignOfFact facts ptrVar ty al) as_
+    else ins
+  | .store vol ty valOp (.reg r) al as_ =>
+    if r == llvmRegOf ptrVar then .store vol ty valOp (.reg r) (alignOfFact facts ptrVar ty al) as_
+    else ins
+  | other => other
+
+def emitVerifiedLLVMWithFacts (facts : FactEnv) (a b : VarId)
+    (insns : List LLVMInstr) (ptrVar : VarId := 0) : List LLVMInstr :=
+  match insns with
+  | [] => []
+  | ins :: rest =>
+    attachLoadStoreAlign facts ptrVar (attachOverflow facts ins) ::
+      emitVerifiedLLVMWithFacts facts a b rest ptrVar
+
+def withNoAlias (disjoint : Bool) (p : LLVMParam) : LLVMParam :=
+  if !disjoint then p
+  else if p.attrs.contains .noalias then p
+  else { p with attrs := .noalias :: p.attrs }
+
+def noaliasParams (facts : FactEnv) (ptrA ptrB lenA lenB : VarId)
+    (ps : List LLVMParam) : List LLVMParam :=
+  if !factMember facts (.disjointSlices ptrA ptrB lenA lenB) then ps
+  else ps.map fun p =>
+    match p.ty with
+    | .ptr _ =>
+      if p.name == llvmRegOf ptrA || p.name == llvmRegOf ptrB then withNoAlias true p else p
+    | _ => p
+
+def emitVerifiedLLVMFnWithFacts (facts : FactEnv) (ptrA ptrB lenA lenB : VarId)
+    (a b : VarId) (fn : LLVMFn) (ptrVar : VarId := 0) : LLVMFn :=
+  { fn with
+    params := noaliasParams facts ptrA ptrB lenA lenB fn.params
+    blocks := fn.blocks.map fun blk =>
+      { blk with body := emitVerifiedLLVMWithFacts facts a b blk.body ptrVar } }
+
+def applyRetainedFactsLLVMFn (facts : FactEnv) (fn : LLVMFn) : LLVMFn :=
+  if facts.isEmpty then fn
+  else
+    let params' := facts.foldl (fun ps f =>
+      match f with
+      | .disjointSlices ptrA ptrB lenA lenB => noaliasParams facts ptrA ptrB lenA lenB ps
+      | _ => ps) fn.params
+    let stepInstr (ins : LLVMInstr) : LLVMInstr :=
+      let ins1 := attachOverflow facts ins
+      facts.foldl (fun acc f =>
+        match f with
+        | .alignedPtr ptrVar _ => attachLoadStoreAlign facts ptrVar acc
+        | _ => acc) ins1
+    { fn with
+      params := params'
+      blocks := fn.blocks.map fun blk => { blk with body := blk.body.map stepInstr } }
+
+def lowerDeclWithFacts (d : LNIRDecl) : Option LLVMFn :=
+  (lowerDecl d).map (applyRetainedFactsLLVMFn d.retainedFacts)
+
+def lowerModuleWithFacts (d : LNIRDecl) : Option LLVMModule :=
+  (lowerDeclWithFacts d).map modOfFn
+
+def ppLoweredDeclWithFacts (d : LNIRDecl) : Option String := do
+  let m ← lowerModuleWithFacts d
+  some (PP.ppModule m)
+
 /-- Wrap a single `ScalarExpr` over two `i64` parameters (`%v0`, `%v1`) as an `LNIRDecl`. -/
 def mkBinScalarDecl (name : String) (retTy : LNIRType) (se : ScalarExpr) : LNIRDecl :=
   { name := name

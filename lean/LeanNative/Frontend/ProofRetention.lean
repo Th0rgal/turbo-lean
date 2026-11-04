@@ -1,8 +1,7 @@
 import Lean.Compiler.LCNF.Basic
 import LeanNative.IR.AST
 import LeanNative.Transform.Pass
-import LeanNative.Backend.LLVMAst.Syntax
-import LeanNative.Backend.LLVMAst.Eval
+import LeanNative.Backend.LLVMLower
 import LeanNative.Backend.PTXAst.Syntax
 import LeanNative.Backend.MetalAst.Syntax
 
@@ -83,7 +82,11 @@ def internFVarList (st : RetentionState) (fvs : List Lean.FVarId) :
 def litNat? (e : Lean.Expr) : Option Nat :=
   match e with
   | .lit (.natVal n) => some n
-  | _ => none
+  | _ =>
+    match e.getAppFnArgs with
+    | (``OfNat.ofNat, #[t, .lit (.natVal n), _]) =>
+      if t == Lean.mkConst ``Nat then some n else none
+    | _ => none
 
 /-- Peel `Fin.val` / `UInt64.toNat` / `USize.toNat` with explicit structural fuel. -/
 def unwrapOperandAux (fuel : Nat) (e : Lean.Expr) : Lean.Expr :=
@@ -129,15 +132,21 @@ def twoOperands (st : RetentionState) (a b : Lean.Expr) :
     | none => none
     | some (vb, st2) => some (va, vb, st2)
 
-/-- `a + b` or `a * b` as a pair of operands, unwrapping `Fin.val` / `UInt64.toNat`. -/
+/-- `a + b` or `a * b` on `Nat`. Heterogeneous `HAdd`/`HMul` (e.g. `UInt64`) is rejected:
+only the outer `Fin.val` is peeled, never `UInt64.toNat` around a wrapping add. -/
 def binApp? (e : Lean.Expr) (add : Bool) : Option (Lean.Expr × Lean.Expr) :=
-  match (unwrapOperand e).getAppFnArgs with
+  let e' := match e.getAppFnArgs with
+    | (``Fin.val, #[_, x]) => x
+    | _ => e
+  match e'.getAppFnArgs with
   | (n, args) =>
+    let natTy := args.size >= 6 && args[0]! == Lean.mkConst ``Nat &&
+      args[1]! == Lean.mkConst ``Nat && args[2]! == Lean.mkConst ``Nat
     if add then
-      if (n == ``HAdd.hAdd || n == ``Nat.add) && args.size >= 2 then
+      if (n == ``HAdd.hAdd && natTy) || (n == ``Nat.add && args.size == 2) then
         some (args[args.size - 2]!, args[args.size - 1]!)
       else none
-    else if (n == ``HMul.hMul || n == ``Nat.mul) && args.size >= 2 then
+    else if (n == ``HMul.hMul && natTy) || (n == ``Nat.mul && args.size == 2) then
       some (args[args.size - 2]!, args[args.size - 1]!)
     else none
 
@@ -145,23 +154,25 @@ def binApp? (e : Lean.Expr) (add : Bool) : Option (Lean.Expr × Lean.Expr) :=
 def isWidthBound (n : Nat) : Bool :=
   n == 2 ^ 63 || n == 2 ^ 64
 
-/-- `(a + b < 2^63 | 2^64)` or `(a * b < 2^63 | 2^64)`. -/
+/-- `(a + b < 2^63 | 2^64)` or `(a * b < 2^63 | 2^64)`.
+`2^63` justifies `nsw` (and `nuw`); `2^64` justifies `nuw` only. -/
 def overflowFact? (st : RetentionState) (lhs bound : Lean.Expr) : Option (RetainedFact × RetentionState) :=
   match litNat? (unwrapOperand bound) with
   | none => none
   | some n =>
     if !isWidthBound n then none
     else
+      let nsw := n == 2 ^ 63
       match binApp? lhs true with
       | some (a, b) =>
         match twoOperands st a b with
-        | some (va, vb, st2) => some (.noOverflowAdd va vb true true, st2)
+        | some (va, vb, st2) => some (.noOverflowAdd va vb nsw true, st2)
         | none => none
       | none =>
         match binApp? lhs false with
         | some (a, b) =>
           match twoOperands st a b with
-          | some (va, vb, st2) => some (.noOverflowMul va vb true true, st2)
+          | some (va, vb, st2) => some (.noOverflowMul va vb nsw true, st2)
           | none => none
         | none => none
 
@@ -439,12 +450,48 @@ def collectBranchStep (fuel : Nat) (st : RetentionState)
       let st2 := collectBranchStep fuel st1 known (.inl alt.getCode)
       collectBranchStep fuel st2 known (.inr rest)
 
+/-- Extract parameter facts from a kernel `forallE` telescope before LCNF `lcErased` erasure.
+Each binder pushes a fresh synthetic `FVarId` mapped to the corresponding `VarId` in `paramVars`
+(or a fresh `nextVar` slot once `paramVars` is exhausted), instantiating loose bound variables. -/
+def retainedForallParamFactsAux (fuel : Nat) (st : RetentionState) (paramVars : List VarId)
+    (ty : Lean.Expr) : RetentionState :=
+  match fuel, ty with
+  | 0, _ => st
+  | fuel + 1, .forallE _ dom body _ =>
+    let fv : Lean.FVarId := { name := .num `_sig_param fuel }
+    let (st1, restVars) := match paramVars with
+      | v :: vs => ({ st with fvarMap := (fv, v) :: st.fvarMap }, vs)
+      | [] =>
+        let (_, s) := internFVar st fv
+        (s, [])
+    let st2 := match factOfType st1 dom with
+      | some (f, s) => pushFactOpt s (some f)
+      | none => st1
+    retainedForallParamFactsAux fuel st2 restVars (body.instantiate1 (.fvar fv))
+  | _, _ => st
+
+def retainedForallParamFacts (paramVars : List VarId) (nextVar : VarId) (ty : Lean.Expr) : FactEnv :=
+  (retainedForallParamFactsAux (paramVars.length + 32) { nextVar := nextVar } paramVars ty).facts
+
+def retainedPureFactsWithSeed (fuel : Nat) (seedMap : List (Lean.FVarId × VarId))
+    (nextVar : VarId) (params : List (Lean.Compiler.LCNF.Param .pure))
+    (code : Lean.Compiler.LCNF.Code .pure) : FactEnv :=
+  let st0 := internParams { fvarMap := seedMap, nextVar := nextVar } params
+  let st1 := extractParamFacts st0 params
+  (collectBranchStep fuel st1 [] (.inl code)).facts
+
+def retainedPureDeclFactsWithSeed (fuel : Nat) (seedMap : List (Lean.FVarId × VarId))
+    (nextVar : VarId) (decl : Lean.Compiler.LCNF.Decl .pure) : FactEnv :=
+  match decl.value with
+  | .code c => retainedPureFactsWithSeed fuel seedMap nextVar decl.params.toList c
+  | .extern _ =>
+    let st0 := internParams { fvarMap := seedMap, nextVar := nextVar } decl.params.toList
+    (extractParamFacts st0 decl.params.toList).facts
+
 def retainedPureFactsWithParams (fuel : Nat)
     (params : List (Lean.Compiler.LCNF.Param .pure))
     (code : Lean.Compiler.LCNF.Code .pure) : FactEnv :=
-  let st0 := internParams {} params
-  let st1 := extractParamFacts st0 params
-  (collectBranchStep fuel st1 [] (.inl code)).facts
+  retainedPureFactsWithSeed fuel [] 0 params code
 
 def retainedPureDeclFacts (fuel : Nat) (decl : Lean.Compiler.LCNF.Decl .pure) : FactEnv :=
   match decl.value with
@@ -577,119 +624,11 @@ was justified by a fact the pass itself introduced. -/
 def dischargeLocalExclusivity (code : LNIRCode) : LNIRCode :=
   dischargeRetainedExclusivity [] code
 
-def overflowFlagsOf (nsw nuw : Bool) : OverflowFlags :=
-  if nsw && nuw then .nswNuw else if nsw then .nsw else if nuw then .nuw else .none
-
-/-- Flags for an `add`/`mul` whose *register operands* are exactly `v{a}` and `v{b}`. -/
-def overflowOf (facts : FactEnv) (isMul : Bool) (a b : VarId) : OverflowFlags :=
-  match facts with
-  | [] => .none
-  | .noOverflowAdd l r nsw nuw :: rest =>
-    if !isMul && l == a && r == b then overflowFlagsOf nsw nuw
-    else overflowOf rest isMul a b
-  | .noOverflowMul l r nsw nuw :: rest =>
-    if isMul && l == a && r == b then overflowFlagsOf nsw nuw
-    else overflowOf rest isMul a b
-  | _ :: rest => overflowOf rest isMul a b
-
-/-- Flags for a `sub` justified by a matching `noOverflowSub` fact. -/
-def subFlagsOf (facts : FactEnv) (a b : VarId) : OverflowFlags :=
-  match facts with
-  | [] => .none
-  | .noOverflowSub l r nsw nuw :: rest =>
-    if l == a && r == b then overflowFlagsOf nsw nuw else subFlagsOf rest a b
-  | _ :: rest => subFlagsOf rest a b
-
-/-- SSA register name of LNIR variable `v` (`"v"` + its decimal digits). -/
-def llvmRegOf (v : VarId) : String := "v" ++ ppInt v
-
-/-- Merge a fact's flags into flags the instruction already carries. -/
-def mergeFlags (old fresh : OverflowFlags) : OverflowFlags :=
-  match old, fresh with
-  | .none, f => f
-  | f, .none => f
-  | .nsw, .nuw | .nuw, .nsw | .nswNuw, _ | _, .nswNuw => .nswNuw
-  | .nsw, .nsw => .nsw
-  | .nuw, .nuw => .nuw
-
-/-- Attach `nsw`/`nuw` to an `.i64` `add`/`sub`/`mul` only when both operands are the
-registers named by the matching fact. -/
-def attachOverflow (facts : FactEnv) (ins : LLVMInstr) : LLVMInstr :=
-  match ins with
-  | .add dst old .i64 (.reg x) (.reg y) =>
-    match factOperands facts x y with
-    | some (a, b) => .add dst (mergeFlags old (overflowOf facts false a b)) .i64 (.reg x) (.reg y)
-    | none => ins
-  | .sub dst old .i64 (.reg x) (.reg y) =>
-    match factOperands facts x y with
-    | some (a, b) => .sub dst (mergeFlags old (subFlagsOf facts a b)) .i64 (.reg x) (.reg y)
-    | none => ins
-  | .mul dst old .i64 (.reg x) (.reg y) =>
-    match factOperands facts x y with
-    | some (a, b) => .mul dst (mergeFlags old (overflowOf facts true a b)) .i64 (.reg x) (.reg y)
-    | none => ins
-  | _ => ins
-where
-  factOperands (facts : FactEnv) (x y : String) : Option (VarId × VarId) :=
-    match facts with
-    | [] => none
-    | .noOverflowAdd a b _ _ :: rest | .noOverflowSub a b _ _ :: rest
-    | .noOverflowMul a b _ _ :: rest =>
-      if x == llvmRegOf a && y == llvmRegOf b then some (a, b)
-      else factOperands rest x y
-    | _ :: rest => factOperands rest x y
-
-/-- The alignment a fact gives `ptrVar`, raised only when it strictly dominates `fallback`
-and `fallback` divides it. -/
-def alignOfFact (facts : FactEnv) (ptrVar : VarId) (ty : LLVMType) (fallback : Nat) : Nat :=
-  match facts with
-  | [] => fallback
-  | .alignedPtr p n :: rest =>
-    let eff := effectiveAlign ty fallback
-    if p == ptrVar && isPow2 n && isPow2 eff && eff < n && n % eff == 0 then n
-    else alignOfFact rest ptrVar ty fallback
-  | _ :: rest => alignOfFact rest ptrVar ty fallback
-
-/-- Raise a load/store alignment when its pointer operand is exactly `v{ptrVar}`. -/
-def attachLoadStoreAlign (facts : FactEnv) (ptrVar : VarId) (ins : LLVMInstr) : LLVMInstr :=
-  match ins with
-  | .load dst vol ty (.reg r) al as_ =>
-    if r == llvmRegOf ptrVar then .load dst vol ty (.reg r) (alignOfFact facts ptrVar ty al) as_
-    else ins
-  | .store vol ty valOp (.reg r) al as_ =>
-    if r == llvmRegOf ptrVar then .store vol ty valOp (.reg r) (alignOfFact facts ptrVar ty al) as_
-    else ins
-  | other => other
-
-def emitVerifiedLLVMWithFacts (facts : FactEnv) (a b : VarId)
-    (insns : List LLVMInstr) (ptrVar : VarId := 0) : List LLVMInstr :=
-  match insns with
-  | [] => []
-  | ins :: rest =>
-    attachLoadStoreAlign facts ptrVar (attachOverflow facts ins) ::
-      emitVerifiedLLVMWithFacts facts a b rest ptrVar
-
-def withNoAlias (disjoint : Bool) (p : LLVMParam) : LLVMParam :=
-  if !disjoint then p
-  else if p.attrs.contains .noalias then p
-  else { p with attrs := .noalias :: p.attrs }
-
-/-- Add `noalias` only to `.ptr` parameters whose name is `v{ptrA}` or `v{ptrB}`. -/
-def noaliasParams (facts : FactEnv) (ptrA ptrB : VarId) (lenA lenB : Nat)
-    (ps : List LLVMParam) : List LLVMParam :=
-  if !factMember facts (.disjointSlices ptrA ptrB lenA lenB) then ps
-  else ps.map fun p =>
-    match p.ty with
-    | .ptr _ =>
-      if p.name == llvmRegOf ptrA || p.name == llvmRegOf ptrB then withNoAlias true p else p
-    | _ => p
-
-def emitVerifiedLLVMFnWithFacts (facts : FactEnv) (ptrA ptrB : VarId) (lenA lenB : Nat)
-    (a b : VarId) (fn : LLVMFn) (ptrVar : VarId := 0) : LLVMFn :=
-  { fn with
-    params := noaliasParams facts ptrA ptrB lenA lenB fn.params
-    blocks := fn.blocks.map fun blk =>
-      { blk with body := emitVerifiedLLVMWithFacts facts a b blk.body ptrVar } }
+export LeanNative.Backend.LLVMLower (
+  overflowFlagsOf overflowOf subFlagsOf llvmRegOf mergeFlags attachOverflow
+  alignOfFact attachLoadStoreAlign emitVerifiedLLVMWithFacts
+  withNoAlias noaliasParams emitVerifiedLLVMFnWithFacts applyRetainedFactsLLVMFn
+)
 
 /-- A bounds check stays unless `idxLt` was retained. The unchecked form is sound
 for states in which `idxLt` holds. -/

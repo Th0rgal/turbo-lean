@@ -103,14 +103,35 @@ inductive LNIRCode where
   | unreachable
   deriving Repr, Inhabited, BEq
 
+/-- A refinement fact retained from the pure LCNF phase. Defined above `LNIRDecl` so a
+declaration can carry it; backends consume it without importing `LeanNative.Semantics`. -/
+inductive RetainedFact where
+  | idxLt (idxVar lenVar : VarId)
+  | noOverflowAdd (lhs rhs : VarId) (nsw nuw : Bool)
+  | noOverflowSub (lhs rhs : VarId) (nsw nuw : Bool)
+  | noOverflowMul (lhs rhs : VarId) (nsw nuw : Bool)
+  | alignedPtr (ptrVar : VarId) (alignBytes : Nat)
+  | disjointSlices (ptrA ptrB lenA lenB : VarId)
+  | exclusiveObj (objVar : VarId)
+  deriving Repr, DecidableEq, Inhabited
+
+abbrev FactEnv := List RetainedFact
+
+def factMember (facts : FactEnv) (f : RetainedFact) : Bool :=
+  facts.contains f
+
+def consFact (facts : FactEnv) (f : RetainedFact) : FactEnv :=
+  if factMember facts f then facts else f :: facts
+
 /-- Top-level function declaration in LNIR. -/
 structure LNIRDecl where
-  name       : String
-  params     : List LNIRParam
-  retTy      : LNIRType
-  body       : LNIRCode
-  assurance  : AssuranceLevel := .verifiedKernelProof
-  isGpuCand  : Bool := false
+  name          : String
+  params        : List LNIRParam
+  retTy         : LNIRType
+  body          : LNIRCode
+  assurance     : AssuranceLevel := .verifiedKernelProof
+  isGpuCand     : Bool := false
+  retainedFacts : FactEnv := []
   deriving Repr, Inhabited, BEq
 
 /-- Complete compilation module in LNIR. -/
@@ -205,12 +226,29 @@ def LNIRCode.canonicalDeBruijn (ctx : List VarId) : LNIRCode → LNIRCode
   | .ret v => .ret (lookupDeBruijn ctx v)
   | .unreachable => .unreachable
 
+def RetainedFact.canonicalDeBruijn (ctx : List VarId) : RetainedFact → RetainedFact
+  | .idxLt i n => .idxLt (lookupDeBruijn ctx i) (lookupDeBruijn ctx n)
+  | .noOverflowAdd a b nsw nuw =>
+    .noOverflowAdd (lookupDeBruijn ctx a) (lookupDeBruijn ctx b) nsw nuw
+  | .noOverflowSub a b nsw nuw =>
+    .noOverflowSub (lookupDeBruijn ctx a) (lookupDeBruijn ctx b) nsw nuw
+  | .noOverflowMul a b nsw nuw =>
+    .noOverflowMul (lookupDeBruijn ctx a) (lookupDeBruijn ctx b) nsw nuw
+  | .alignedPtr p n => .alignedPtr (lookupDeBruijn ctx p) n
+  | .disjointSlices a b la lb =>
+    .disjointSlices (lookupDeBruijn ctx a) (lookupDeBruijn ctx b)
+      (lookupDeBruijn ctx la) (lookupDeBruijn ctx lb)
+  | .exclusiveObj o => .exclusiveObj (lookupDeBruijn ctx o)
+
 /-- Alpha-canonicalized de Bruijn representation of an `LNIRDecl` for `modded-nanogpt` training. -/
 def LNIRDecl.canonicalDeBruijn (d : LNIRDecl) : LNIRDecl :=
   let initCtx := (d.params.map (·.id)).reverse
   let params' := (List.range d.params.length).zip d.params |>.map fun (idx, p) =>
     { p with id := idx, name := s!"p{idx}" }
-  { d with params := params', body := d.body.canonicalDeBruijn initCtx }
+  { d with
+    params := params'
+    body := d.body.canonicalDeBruijn initCtx
+    retainedFacts := d.retainedFacts.map (RetainedFact.canonicalDeBruijn initCtx) }
 
 /-- Structural features `(nInstr, nBlocks, nLoops, maxLoopDepth, u64Count, u256Count, boolCount)`
     extracted from an `LNIRDecl` for telemetry and cost/value head conditioning. -/
@@ -244,31 +282,6 @@ def LNIRDecl.telemetryFeaturesJson (d : LNIRDecl) : String :=
     | .ret _ | .unreachable => (1, 1, 0, depth, 0, 0, 0)
   let (nInstr, nBlocks, nLoops, maxDepth, u64c, u256c, bc) := go 0 d.body
   s!"\{\"n_instr\":{nInstr},\"n_blocks\":{nBlocks},\"n_loops\":{nLoops},\"max_loop_depth\":{maxDepth},\"width_histogram\":\{\"u64\":{u64c},\"u256\":{u256c},\"bool\":{bc}}}"
-
-/-! ## D1 retained refinement facts
-
-Facts extracted from pre-erasure `Lean.Compiler.LCNF.Code .pure` and consumed by the
-LLVM / PTX / Metal specializers. Defined here so `LeanNative.Backend.*` never imports
-`LeanNative.Semantics`. -/
-
-/-- A refinement fact retained from the pure LCNF phase. -/
-inductive RetainedFact where
-  | idxLt (idxVar lenVar : VarId)
-  | noOverflowAdd (lhs rhs : VarId) (nsw nuw : Bool)
-  | noOverflowSub (lhs rhs : VarId) (nsw nuw : Bool)
-  | noOverflowMul (lhs rhs : VarId) (nsw nuw : Bool)
-  | alignedPtr (ptrVar : VarId) (alignBytes : Nat)
-  | disjointSlices (ptrA ptrB : VarId) (lenA lenB : Nat)
-  | exclusiveObj (objVar : VarId)
-  deriving Repr, DecidableEq, Inhabited
-
-abbrev FactEnv := List RetainedFact
-
-def factMember (facts : FactEnv) (f : RetainedFact) : Bool :=
-  facts.contains f
-
-def consFact (facts : FactEnv) (f : RetainedFact) : FactEnv :=
-  if factMember facts f then facts else f :: facts
 
 /-- RC-ADT (Stage 1D heap) expressions: ctor ops, heap boxes, exclusivity tests, and the heap runtime calls. -/
 def LNIRExpr.isRcAdtExpr : LNIRExpr → Bool

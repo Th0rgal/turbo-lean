@@ -71,10 +71,11 @@ def guarded (inner : List MSLStmt) : List MSLStmt :=
   [ .ifElse (.lt (.cast .ulong (.var "gid")) (.var "n")) (MSLBlock.ofList inner) .nil
   , .returnStmt ]
 
-/-- `facts = []` is `guarded`. A retained `idxLt` drops the `gid < n` test;
+/-- `facts = []` is `guarded`. A retained `idxLt idxVar lenVar` drops the `gid < n` test;
 the launch contract is then `grid.x * block.x ≤ n`. -/
-def guardedWithFacts (inner : List MSLStmt) (facts : List RetainedFact) : List MSLStmt :=
-  if facts.isEmpty then guarded inner else inner ++ [.returnStmt]
+def guardedWithFacts (inner : List MSLStmt) (facts : List RetainedFact)
+    (idxVar : VarId := 0) (lenVar : VarId := 1) : List MSLStmt :=
+  if !factMember facts (.idxLt idxVar lenVar) then guarded inner else inner ++ [.returnStmt]
 
 def elem (name : String) : MSLExpr := .index name (.var "gid")
 
@@ -87,8 +88,8 @@ def kernelOf (name : String) (nIn : Nat) (compute : MSLExpr) : MSLKernelDecl whe
   body := guarded [storeOut compute]
 
 def kernelOfWithFacts (name : String) (nIn : Nat) (compute : MSLExpr)
-    (facts : List RetainedFact) : MSLKernelDecl :=
-  { kernelOf name nIn compute with body := guardedWithFacts [storeOut compute] facts }
+    (facts : List RetainedFact) (idxVar : VarId := 0) (lenVar : VarId := 1) : MSLKernelDecl :=
+  { kernelOf name nIn compute with body := guardedWithFacts [storeOut compute] facts idxVar lenVar }
 
 def lowerKind (name : String) : ParallelKernelKind → MSLKernelDecl
   | .mapScaleAdd scale bias =>
@@ -127,19 +128,21 @@ def lowerToMetal (name : String) (k : ParallelKernelKind) : MSLModule where
   kernels := [lowerKind name k]
 
 /-- Fact-carrying twin of `lowerKind`. Empty facts reproduce `lowerKind` exactly. -/
-def lowerKindWithFacts (name : String) (facts : List RetainedFact) :
-    ParallelKernelKind → MSLKernelDecl
+def lowerKindWithFacts (name : String) (facts : List RetainedFact)
+    (k : ParallelKernelKind) (idxVar : VarId := 0) (lenVar : VarId := 1) : MSLKernelDecl :=
+  match k with
   | .mapScaleAdd scale bias =>
     kernelOfWithFacts name 1
-      (.add (.mul (elem "in0") (.immU64 scale.toBitVec)) (.immU64 bias.toBitVec)) facts
-  | .zipAdd => kernelOfWithFacts name 2 (.add (elem "in0") (elem "in1")) facts
-  | .zipMul => kernelOfWithFacts name 2 (.mul (elem "in0") (elem "in1")) facts
+      (.add (.mul (elem "in0") (.immU64 scale.toBitVec)) (.immU64 bias.toBitVec)) facts idxVar lenVar
+  | .zipAdd => kernelOfWithFacts name 2 (.add (elem "in0") (elem "in1")) facts idxVar lenVar
+  | .zipMul => kernelOfWithFacts name 2 (.mul (elem "in0") (elem "in1")) facts idxVar lenVar
   | .dotProduct => lowerKind name .dotProduct
   | .saxpy alpha =>
-    kernelOfWithFacts name 2 (.add (.mul (.immU64 alpha.toBitVec) (elem "in0")) (elem "in1")) facts
+    kernelOfWithFacts name 2 (.add (.mul (.immU64 alpha.toBitVec) (elem "in0")) (elem "in1"))
+      facts idxVar lenVar
   | .stencil1D3Pt wL wC wR =>
     let base := lowerKind name (.stencil1D3Pt wL wC wR)
-    if facts.isEmpty then base
+    if !factMember facts (.idxLt idxVar lenVar) then base
     else
       let i := .cast .ulong (.var "gid")
       let edge := .logOr (.eq i (u 0)) (.ge (.add i (u 1)) (.var "n"))
@@ -149,21 +152,21 @@ def lowerKindWithFacts (name : String) (facts : List RetainedFact) :
         (.mul (.immU64 wC.toBitVec) center))
         (.mul (.immU64 wR.toBitVec) (.index "in0" (.add i (u 1))))
       let inner := [.ifElse edge (.cons (storeOut center) .nil) (.cons (storeOut interior) .nil)]
-      { base with body := guardedWithFacts inner facts }
-  | .customScalar idxVar inVars body =>
-    let base := lowerKind name (.customScalar idxVar inVars body)
-    if facts.isEmpty then base
+      { base with body := guardedWithFacts inner facts idxVar lenVar }
+  | .customScalar iv inVars body =>
+    let base := lowerKind name (.customScalar iv inVars body)
+    if !factMember facts (.idxLt iv lenVar) then base
     else
       let loads := (List.range inVars.length).map fun k =>
         let id := inVars[k]?.getD 0
         .varDecl .ulong s!"v{id}" (elem s!"in{k}")
-      let rhs := lowerScalar "gid64" idxVar body
+      let rhs := lowerScalar "gid64" iv body
       let inner := [.varDecl .ulong "gid64" (.cast .ulong (.var "gid"))] ++ loads ++ [storeOut rhs]
-      { base with body := guardedWithFacts inner facts }
+      { base with body := guardedWithFacts inner facts iv lenVar }
 
 def lowerToMetalWithFacts (name : String) (facts : List RetainedFact)
-    (k : ParallelKernelKind) : MSLModule where
-  kernels := [lowerKindWithFacts name facts k]
+    (k : ParallelKernelKind) (idxVar : VarId := 0) (lenVar : VarId := 1) : MSLModule where
+  kernels := [lowerKindWithFacts name facts k idxVar lenVar]
 
 def ppLowered (name : String) (k : ParallelKernelKind) : String :=
   ppMSLModule (lowerToMetal name k)
@@ -174,6 +177,12 @@ def lowerSaxpyNamed (name : String) (alpha : UInt64) : MSLKernelDecl where
   name := name
   params := [bufParam "x" 0 true, bufParam "y" 1 true, bufParam "out" 2 false, lenParam 3, gidParam]
   body := guarded [storeOut (.add (.mul (.immU64 alpha.toBitVec) (elem "x")) (elem "y"))]
+
+def lowerSaxpyNamedWithFacts (name : String) (alpha : UInt64) (facts : List RetainedFact)
+    (idxVar : VarId := 0) (lenVar : VarId := 1) : MSLKernelDecl :=
+  { lowerSaxpyNamed name alpha with
+    body := guardedWithFacts [storeOut (.add (.mul (.immU64 alpha.toBitVec) (elem "x")) (elem "y"))]
+      facts idxVar lenVar }
 
 def inferBinOpU64 : BinOp → Option Bool
   | .add => some false | .sub => some false | .mul => some false
@@ -267,6 +276,16 @@ def lowerDeclToMetal (d : LNIRDecl) : Option MSLModule :=
     | some (_, _, inputs, k) =>
       if wfMetalKernel k && inputs.length == kernelArity k then
         some (lowerToMetal s!"lean_native_metal_decl_{d.name}" k)
+      else none
+    | none => none
+  else none
+
+def lowerDeclToMetalWithFacts (d : LNIRDecl) (idxVar : VarId := 0) : Option MSLModule :=
+  if isSarrayI64 d.retTy then
+    match extractDeclParFor d.body with
+    | some (_, lenVar, inputs, k) =>
+      if wfMetalKernel k && inputs.length == kernelArity k then
+        some (lowerToMetalWithFacts s!"lean_native_metal_decl_{d.name}" d.retainedFacts k idxVar lenVar)
       else none
     | none => none
   else none

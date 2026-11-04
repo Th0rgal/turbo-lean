@@ -203,9 +203,10 @@ def gidSetup (doneLbl : String) : List PTXStmt :=
   , ins (.add .none .u64 "%rd6" (.reg "%rd4") (.reg "%rd5")) ]
 
 /-- Same preamble as `gidSetup`, but the `setp.ge` / `bra` guard is omitted when a
-retained `idxLt` covers every launched lane (`grid.x * block.x ≤ n`). -/
-def gidSetupWithFacts (doneLbl : String) (facts : List RetainedFact) : List PTXStmt :=
-  if facts.isEmpty then gidSetup doneLbl
+retained `idxLt idxVar lenVar` covers every launched lane (`grid.x * block.x ≤ n`). -/
+def gidSetupWithFacts (doneLbl : String) (facts : List RetainedFact)
+    (idxVar : VarId := 0) (lenVar : VarId := 1) : List PTXStmt :=
+  if !factMember facts (.idxLt idxVar lenVar) then gidSetup doneLbl
   else
     [ ins (.mov .u32 "%r0" (.sreg .ctaidX))
     , ins (.mov .u32 "%r1" (.sreg .ntidX))
@@ -300,19 +301,21 @@ def lowerKind (name : String) : ParallelKernelKind → PTXKernel
 def lowerToPTX (name : String) (k : ParallelKernelKind) : PTXModule where
   kernels := [lowerKind name k]
 
-/-- Fact-carrying twin of `lowerKind`: a non-empty fact list drops the lane guard. -/
-def lowerKindWithFacts (name : String) (facts : List RetainedFact) :
-    ParallelKernelKind → PTXKernel
+/-- Fact-carrying twin of `lowerKind`: a retained `idxLt idxVar lenVar` drops the lane guard. -/
+def lowerKindWithFacts (name : String) (facts : List RetainedFact)
+    (k : ParallelKernelKind) (idxVar : VarId := 0) (lenVar : VarId := 1) : PTXKernel :=
+  match k with
   | .dotProduct => lowerKind name .dotProduct
-  | k =>
+  | _ =>
     let base := lowerKind name k
-    if facts.isEmpty then base
-    else { base with body := gidSetupWithFacts s!"$L_done_{name}" facts ++
+    let effIdx := match k with | .customScalar iv _ _ => iv | _ => idxVar
+    if !factMember facts (.idxLt effIdx lenVar) then base
+    else { base with body := gidSetupWithFacts s!"$L_done_{name}" facts effIdx lenVar ++
         (base.body.drop (gidSetup s!"$L_done_{name}").length) }
 
 def lowerToPTXWithFacts (name : String) (facts : List RetainedFact)
-    (k : ParallelKernelKind) : PTXModule where
-  kernels := [lowerKindWithFacts name facts k]
+    (k : ParallelKernelKind) (idxVar : VarId := 0) (lenVar : VarId := 1) : PTXModule where
+  kernels := [lowerKindWithFacts name facts k idxVar lenVar]
 
 def ppLowered (name : String) (k : ParallelKernelKind) : String :=
   ppPTXModule (lowerToPTX name k)
@@ -409,6 +412,16 @@ def lowerDeclToPTX (d : LNIRDecl) : Option PTXModule :=
     | some (_, _, inputs, k) =>
       if wfPTXKernel k && inputs.length == kernelArity k then
         some (lowerToPTX s!"lean_native_decl_{d.name}" k)
+      else none
+    | none => none
+  else none
+
+def lowerDeclToPTXWithFacts (d : LNIRDecl) (idxVar : VarId := 0) : Option PTXModule :=
+  if isSarrayI64 d.retTy then
+    match extractDeclParFor d.body with
+    | some (_, lenVar, inputs, k) =>
+      if wfPTXKernel k && inputs.length == kernelArity k then
+        some (lowerToPTXWithFacts s!"lean_native_decl_{d.name}" d.retainedFacts k idxVar lenVar)
       else none
     | none => none
   else none

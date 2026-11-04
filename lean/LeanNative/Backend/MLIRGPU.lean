@@ -478,7 +478,8 @@ def emitPTXScalarExpr (e : ScalarExpr) (varMap : List (VarId × String))
     ], dst, r3 + 1, p3)
 
 /-- Emit a specialized per-declaration PTX entry point for a `ParallelKernelKind`. -/
-def emitPTXDeclKernel (fnSymbol : String) (kernel : ParallelKernelKind) : String :=
+def emitPTXDeclKernel (fnSymbol : String) (kernel : ParallelKernelKind)
+    (facts : FactEnv := []) (idxVar : VarId := 0) (lenVar : VarId := 1) : String :=
   if fnSymbol == "lean_native_decl_dot_product_u64" then
     emitPTXDotReduceKernel fnSymbol
   else if fnSymbol == "lean_native_decl_matmul_tiled_u64" then
@@ -486,10 +487,11 @@ def emitPTXDeclKernel (fnSymbol : String) (kernel : ParallelKernelKind) : String
   else
   match kernel with
   | .mapScaleAdd _ _ | .zipAdd | .zipMul | .saxpy _ | .stencil1D3Pt _ _ _ =>
-    ppPTXKernel (lowerKind fnSymbol kernel)
+    if !factMember facts (.idxLt idxVar lenVar) then ppPTXKernel (lowerKind fnSymbol kernel)
+    else ppPTXKernel (lowerKindWithFacts fnSymbol facts kernel idxVar lenVar)
   | .dotProduct =>
     emitPTXDotReduceKernel fnSymbol
-  | .customScalar idxVar inVars body =>
+  | .customScalar iv inVars body =>
     let rec buildInDecls (k : Nat) : List VarId → List String × List String × List (VarId × String)
       | [] => ([], [], [])
       | vId :: rest =>
@@ -504,18 +506,21 @@ def emitPTXDeclKernel (fnSymbol : String) (kernel : ParallelKernelKind) : String
         ]
         (s!"    .param .u64 {pName}," :: pDecls, loadSeq ++ lLines, (vId, rName) :: vMap)
     let (inParamDecls, inLoadLines, inVarMap) := buildInDecls 0 inVars
-    let fullVarMap := (idxVar, "%rd5") :: inVarMap
+    let fullVarMap := (iv, "%rd5") :: inVarMap
     let (exprLines, resReg, maxRd, maxPred) := emitPTXScalarExpr body fullVarMap (8 + inVars.length) 2
     let paramHeader := String.intercalate "\n" (
       ["    .param .u64 param_out,"] ++ inParamDecls ++ ["    .param .u64 param_n"]
     )
+    let guardLines :=
+      if factMember facts (.idxLt iv lenVar) then []
+      else [s!"    setp.ge.u64  %p1, %rd5, %rd2;\n    @%p1 bra     $L_done_{fnSymbol};"]
     String.intercalate "\n" ([
       s!".visible .entry {fnSymbol}(\n{paramHeader}\n)\n\{",
       s!"    .reg .pred %p<{maxPred}>;\n    .reg .b32  %r<5>;\n    .reg .b64  %rd<{maxRd}>;",
       "    ld.param.u64 %rd1, [param_out];\n    ld.param.u64 %rd2, [param_n];",
       "    mov.u32      %r1, %ctaid.x;\n    mov.u32      %r2, %ntid.x;\n    mov.u32      %r3, %tid.x;",
-      "    mul.wide.u32 %rd3, %r1, %r2;\n    cvt.u64.u32  %rd4, %r3;\n    add.u64      %rd5, %rd3, %rd4;",
-      s!"    setp.ge.u64  %p1, %rd5, %rd2;\n    @%p1 bra     $L_done_{fnSymbol};",
+      "    mul.wide.u32 %rd3, %r1, %r2;\n    cvt.u64.u32  %rd4, %r3;\n    add.u64      %rd5, %rd3, %rd4;"
+    ] ++ guardLines ++ [
       "    cvta.to.global.u64 %rd1, %rd1;\n    shl.b64      %rd6, %rd5, 3;"
     ] ++ inLoadLines ++ exprLines ++ [
       s!"    add.u64      %rd7, %rd1, %rd6;\n    st.global.u64 [%rd7], {resReg};",
@@ -624,13 +629,14 @@ def emitPTXModule (m : LNIRModule) (smArch : String := "sm_90") : String :=
       let regions := extractParForRegions d.body
       match regions with
       | [] => (acc, names)
-      | (_, _, _, _, firstK) :: rest =>
-        let primary := emitPTXDeclKernel sym firstK
+      | (_, firstLen, _, _, firstK) :: rest =>
+        let primary := emitPTXDeclKernel sym firstK d.retainedFacts 0 firstLen
         let rec emitExtraRegions (idx : Nat) :
             List (VarId × VarId × List VarId × LNIRType × ParallelKernelKind) → List String
           | [] => []
-          | (_, _, _, _, k) :: tail =>
-            emitPTXDeclKernel s!"lean_native_decl_{d.name}_region_{idx}" k :: emitExtraRegions (idx + 1) tail
+          | (_, lenVar, _, _, k) :: tail =>
+            emitPTXDeclKernel s!"lean_native_decl_{d.name}_region_{idx}" k d.retainedFacts 0 lenVar ::
+              emitExtraRegions (idx + 1) tail
         (acc ++ [primary] ++ emitExtraRegions 1 rest, names ++ [sym])
   ) ([], [])
 

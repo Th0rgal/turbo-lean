@@ -7,6 +7,11 @@ import LeanNative.Backend.PTXAst
 import LeanNative.Backend.MetalAst
 import LeanNative.Backend.PTXLower
 import LeanNative.Backend.MetalLower
+import LeanNative.Backend.MLIRGPU
+import LeanNative.Backend.Metal
+import LeanNative.Backend.LLVM
+import LeanNative.IR.Codec
+import LeanNative.IR.Bridge
 import LeanNative.Transform.LoopVectorizeOpt
 
 /-!
@@ -195,13 +200,19 @@ def subTy : Expr := mkApp2 (mkConst ``Nat.le) (fve 2) (fve 1)
 def alignTy : Expr :=
   mkApp3 (mkConst ``Eq [.succ .zero]) natE (mkApp2 (mkConst ``Nat.mod) (fve 1) (litE 8)) (litE 0)
 
-def disjTy : Expr := mkApp4 (mkConst ``SlicesDisjoint) (fve 1) (litE 16) (fve 2) (litE 32)
+def disjTy : Expr := mkApp4 (mkConst ``SlicesDisjoint) (fve 1) (fve 3) (fve 2) (fve 4)
+
+def wrapAddTy : Expr :=
+  let u64E := mkConst ``UInt64
+  let haddU64 := mkAppN (mkConst ``HAdd.hAdd [0, 0, 0])
+    #[u64E, u64E, u64E, mkConst `instHAddUInt64, fve 1, fve 2]
+  mkApp2 (mkConst ``Nat.lt) (mkApp (mkConst ``UInt64.toNat) haddU64) (litE (2 ^ 64))
 
 def propFacts : FactEnv :=
   retainedPureFactsWithParams 16
-    [ mkParam 1 natE, mkParam 2 natE
+    [ mkParam 1 natE, mkParam 2 natE, mkParam 3 natE, mkParam 4 natE
     , mkParam 10 addTy, mkParam 11 mulTy, mkParam 12 subTy
-    , mkParam 13 alignTy, mkParam 14 disjTy ]
+    , mkParam 13 alignTy, mkParam 14 disjTy, mkParam 15 wrapAddTy ]
     (.return (fv 1))
 
 def exclCode : Code .pure :=
@@ -250,8 +261,23 @@ def specFnLenMismatch : LLVMFn :=
   emitVerifiedLLVMFnWithFacts [.disjointSlices 3 4 16 32] 3 4 16 64 1 2 (loadFn 8) 0
 
 def ptxFacts : FactEnv := [.idxLt 0 1]
+def ptxIrrelevantFacts : FactEnv := [.noOverflowAdd 0 1 true true, .alignedPtr 0 16, .idxLt 5 6]
 def ptxEmpty : FactEnv := []
 def ptxKind : ParallelKernelKind := .zipAdd
+
+def e2eScalarDecl : LNIRDecl :=
+  { name := "checked_add_u64"
+    params := [{ id := 0, name := "a", ty := .i64 }, { id := 1, name := "b", ty := .i64 }]
+    retTy := .i64
+    retainedFacts := [.noOverflowAdd 0 1 true true]
+    body := .letBind 2 .i64 (.scalar (.binOp .add (.var 0) (.var 1))) (.ret 2) }
+
+def e2eGpuDecl (facts : FactEnv) : LNIRDecl :=
+  { name := "zip_add_k"
+    params := [{ id := 0, name := "x", ty := .sarray .i64 }, { id := 1, name := "y", ty := .sarray .i64 }]
+    retTy := .sarray .i64
+    retainedFacts := facts
+    body := .letBind 2 .i64 (.sarrayLen 0) (.parFor 3 2 [0, 1] .i64 .zipAdd (.ret 3)) }
 
 def passOut : LNIRDecl × LeanNative.Transform.PassStepCert :=
   proofRetentionPass.runDecl
@@ -266,10 +292,12 @@ def passCert : OptimizationCert :=
 -- idxLt, overflow, alignment, disjointness and exclusivity survive pure LCNF.
 #guard hasFact idxFacts (.idxLt 1 2)
 #guard hasFact propFacts (.noOverflowAdd 0 1 true true)
-#guard hasFact propFacts (.noOverflowMul 0 1 true true)
+#guard hasFact propFacts (.noOverflowMul 0 1 false true)
+#guard !hasFact propFacts (.noOverflowMul 0 1 true true)
 #guard hasFact propFacts (.noOverflowSub 0 1 false true)
 #guard hasFact propFacts (.alignedPtr 0 8)
-#guard hasFact propFacts (.disjointSlices 0 1 7 8)
+#guard hasFact propFacts (.disjointSlices 0 1 2 3)
+#guard !hasFact propFacts (.noOverflowAdd 0 1 false true)
 #guard hasFact exclFacts (.exclusiveObj 1)
 #guard idxBranchFacts == []
 #guard hasFact idxArmFacts (.idxLt 1 2)
@@ -333,6 +361,8 @@ def passCert : OptimizationCert :=
 #guard hasSubstr (ppPTXKernel (boundsFreePTXKernel ptxFacts 0 1)) "%tid.x"
 #guard (LeanNative.Backend.PTXLower.lowerKindWithFacts "k" ptxFacts ptxKind).body.length <
   (LeanNative.Backend.PTXLower.lowerKind "k" ptxKind).body.length
+#guard (LeanNative.Backend.PTXLower.lowerKindWithFacts "k" ptxIrrelevantFacts ptxKind).body ==
+  (LeanNative.Backend.PTXLower.lowerKind "k" ptxKind).body
 #guard runBoundsPTX ptxFacts 64 2 2 16 48 [42#64, 77#64] == some [42#64, 77#64]
 #guard runBoundsPTX ptxEmpty 64 2 2 16 48 [42#64, 77#64] == some [42#64, 77#64]
 #guard runBoundsPTX ptxEmpty 64 2 1 16 48 [42#64, 77#64] == some [42#64, 0#64]
@@ -346,10 +376,74 @@ def passCert : OptimizationCert :=
 #guard !hasSubstr (ppMSLKernel (boundsFreeMetalKernel ptxFacts 0 1)) "if ("
 #guard hasSubstr (ppMSLKernel (boundsFreeMetalKernel ptxFacts 0 1)) "thread_position_in_grid"
 #guard !hasSubstr (ppMSLKernel (LeanNative.Backend.MetalLower.lowerKindWithFacts "k" ptxFacts ptxKind)) "if ("
+#guard hasSubstr (ppMSLKernel (LeanNative.Backend.MetalLower.lowerKindWithFacts "k" ptxIrrelevantFacts ptxKind)) "if ("
 #guard hasSubstr (ppMSLKernel (LeanNative.Backend.MetalLower.lowerKind "k" ptxKind)) "if ("
 #guard runBoundsMSL ptxFacts 16 2 2 [99#64, 55#64] == some [99#64, 55#64]
 #guard runBoundsMSL ptxEmpty 16 2 2 [99#64, 55#64] == some [99#64, 55#64]
 #guard runBoundsMSL ptxEmpty 16 2 1 [99#64, 55#64] == some [99#64, 0#64]
 #guard runBoundsMSL ptxEmpty 16 2 0 [99#64, 55#64] == some [0#64, 0#64]
+
+#guard LNIRModule.fromWire? ({ moduleName := "m", decls := [e2eScalarDecl] } : LNIRModule).toWire ==
+  some { moduleName := "m", decls := [e2eScalarDecl] }
+#guard (runVerifiedKernelPipeline { moduleName := "m", decls := [e2eScalarDecl] }).1.decls.map (·.retainedFacts) ==
+  [[.noOverflowAdd 0 1 true true]]
+#guard match LeanNative.Backend.LLVMLower.ppLoweredDeclWithFacts e2eScalarDecl with
+  | some s => hasSubstr s "add nsw nuw i64 %v0, %v1"
+  | none => false
+#guard hasSubstr (LeanNative.Backend.LLVM.emitLLVMOptimized { moduleName := "m", decls := [e2eScalarDecl] })
+  "add nsw nuw i64"
+#guard !hasSubstr (LeanNative.Backend.LLVM.emitLLVMOptimized { moduleName := "m", decls := [{ e2eScalarDecl with retainedFacts := [] }] })
+  "add nsw nuw i64"
+#guard hasSubstr (LeanNative.Backend.LLVM.emitLLVMBaseline { moduleName := "m", decls :=
+  [{ name := "disj_fn", params := [{ id := 0, name := "p", ty := .rawPtr .i64 }, { id := 1, name := "q", ty := .rawPtr .i64 },
+     { id := 2, name := "la", ty := .i64 }, { id := 3, name := "lb", ty := .i64 }],
+     retTy := .i64, retainedFacts := [.disjointSlices 0 1 2 3],
+     body := .letBind 4 .i64 (.scalar (.constU64 0)) (.ret 4) }] })
+  "ptr noalias %arg_v0, ptr noalias %arg_v1"
+#guard !hasSubstr (LeanNative.Backend.MLIRGPU.emitPTXModule { moduleName := "m", decls := [e2eGpuDecl [.idxLt 0 2]] })
+  "@%p0 bra $L_done_lean_native_decl_zip_add_k;"
+#guard hasSubstr (LeanNative.Backend.MLIRGPU.emitPTXModule { moduleName := "m", decls := [e2eGpuDecl ptxIrrelevantFacts] })
+  "@%p0 bra $L_done_lean_native_decl_zip_add_k;"
+#guard match LeanNative.Backend.Metal.emitMetalDeclKernel (e2eGpuDecl [.idxLt 0 2]) with
+  | some s => !hasSubstr s "if ("
+  | none => false
+#guard match LeanNative.Backend.Metal.emitMetalDeclKernel (e2eGpuDecl ptxIrrelevantFacts) with
+  | some s => hasSubstr s "if ("
+  | none => false
+
+@[noinline] def realCheckedAddU64 (a b : UInt64) (_h : a.toNat + b.toNat < 9223372036854775808) : UInt64 :=
+  a + b
+
+@[noinline] def realCheckedMulU64 (a b : UInt64) (_h : a.toNat * b.toNat < 18446744073709551616) : UInt64 :=
+  a * b
+
+@[noinline] def realWrappingAddU64 (a b : UInt64) (_h : (a + b).toNat < 18446744073709551616) : UInt64 :=
+  a + b
+
+def checkRealPipelineEndToEnd : Lean.CoreM Bool := do
+  let m ← LeanNative.IR.ingestModuleDecls
+    #[``realCheckedAddU64, ``realCheckedMulU64, ``realWrappingAddU64] "ProofRetentionE2E" .x86_64 false
+  let (optMod, _) := LeanNative.Transform.runDefaultPipeline m
+  let some dAdd := optMod.decls.find? (fun d => hasSubstr d.name "realCheckedAddU64") | return false
+  let some dMul := optMod.decls.find? (fun d => hasSubstr d.name "realCheckedMulU64") | return false
+  let some dWrap := optMod.decls.find? (fun d => hasSubstr d.name "realWrappingAddU64") | return false
+  let wireOk := LNIRModule.fromWire? optMod.toWire == some optMod
+  let addIr := LeanNative.Backend.LLVM.emitDeclLLVM true dAdd .x86_64
+  let mulIr := LeanNative.Backend.LLVM.emitDeclLLVM true dMul .x86_64
+  let wrapIr := LeanNative.Backend.LLVM.emitDeclLLVM true dWrap .x86_64
+  return wireOk &&
+    hasFact dAdd.retainedFacts (.noOverflowAdd 0 1 true true) &&
+    hasFact dMul.retainedFacts (.noOverflowMul 0 1 false true) &&
+    !hasFact dMul.retainedFacts (.noOverflowMul 0 1 true true) &&
+    dWrap.retainedFacts.isEmpty &&
+    hasSubstr addIr "add nsw nuw i64" &&
+    hasSubstr mulIr "mul nuw i64" &&
+    !hasSubstr mulIr "mul nsw" &&
+    !hasSubstr wrapIr "add nsw" &&
+    !hasSubstr wrapIr "add nuw"
+
+/-- info: true -/
+#guard_msgs in
+#eval checkRealPipelineEndToEnd
 
 end LeanNative.Tests.ProofRetentionTests
