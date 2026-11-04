@@ -7,6 +7,7 @@
   reload or process startup overhead, leaving `baseEnv` completely unmutated.
 -/
 import Lean.Elab.Frontend
+import Lean.Elab.App
 import Lean.Data.Json
 import Lean.Util.CollectAxioms
 import Lean.Replay
@@ -14,9 +15,22 @@ import Lean.Compiler.ImplementedByAttr
 import Lean.Compiler.ExternAttr
 import Lean.Compiler.CSimpAttr
 import Lean.Compiler.InlineAttrs
+import Lean.Compiler.Specialize
+import Lean.Compiler.ExportAttr
+import Lean.Compiler.NoncomputableAttr
+import Lean.Compiler.ModPkgExt
 import Lean.Compiler.LCNF.PhaseExt
+import Lean.Compiler.LCNF.PrettyPrinter
 import Lean.Compiler.IR.CompilerM
 import Lean.Meta.Tactic.Simp.SimpTheorems
+import Lean.Meta.Instances
+import Lean.Meta.CoeAttr
+import Lean.Meta.Tactic.Ext
+import Lean.Meta.Tactic.Grind.Attr
+import Lean.Meta.Match.MatchPatternAttr
+import Lean.Meta.CompletionName
+import Lean.Linter.Deprecated
+import Lean.DeprecatedModule
 import Std.Data.HashMap
 import TurboLean.Blake3
 import TurboLean.StatementHash
@@ -1699,55 +1713,370 @@ private def formatConstantExportPayload (c : ConstantInfo) (localMod? : Option N
     ]
     ("rec", stmtHash, TurboLean.Blake3.blake3Bytes recJson.compress.toUTF8)
 
+private def formatAttrKind : AttributeKind → String
+  | .global => "global"
+  | .local => "local"
+  | .scoped => "scoped"
+
+private def formatDiscrKey (norm : Name → Name) : Meta.DiscrTree.Key → String
+  | .star => "*"
+  | .other => "other"
+  | .arrow => "->"
+  | .lit (.natVal n) => s!"nat:{n}"
+  | .lit (.strVal s) => s!"str:{jsonEscape s}"
+  | .fvar fid a => s!"fvar:{canonicalName (norm fid.name)}/{a}"
+  | .const n a => s!"const:{canonicalName (norm n)}/{a}"
+  | .proj s i a => s!"proj:{canonicalName (norm s)}.{i}/{a}"
+
+private def formatInstanceEntry (norm : Name → Name) (scopeTag : String) (e : Meta.InstanceEntry) : String :=
+  let gname := match e.globalName? with
+    | some n => canonicalName (norm n)
+    | none => ""
+  let valStr := (TurboLean.StatementHash.exprJson norm e.val).compress
+  let valHash := TurboLean.Blake3.blake3Bytes valStr.toUTF8
+  let keysStr := String.intercalate "," (e.keys.toList.map (formatDiscrKey norm))
+  let ordStr := String.intercalate "," (e.synthOrder.toList.map toString)
+  s!"{scopeTag}:g={gname}:p={e.priority}:k={formatAttrKind e.attrKind}:ord=[{ordStr}]:keys=[{keysStr}]:val={valHash}"
+
+private def formatSimpEntry (norm : Name → Name) (scopeTag : String) (se : Meta.SimpEntry) : String :=
+  match se with
+  | .thm t =>
+    let origStr := match t.origin with
+      | .decl n ph inv => s!"decl:{canonicalName (norm n)}:{reprStr ph}:{inv}"
+      | .fvar fid => s!"fvar:{canonicalName (norm fid.name)}"
+      | .stx id _ => s!"stx:{canonicalName (norm id)}"
+      | .other n => s!"other:{canonicalName (norm n)}"
+    let proofHash := TurboLean.Blake3.blake3Bytes (TurboLean.StatementHash.exprJson norm t.proof).compress.toUTF8
+    let keysStr := String.intercalate "," (t.keys.toList.map (formatDiscrKey norm))
+    let lparams := String.intercalate "," (t.levelParams.toList.map (fun u => canonicalName (norm u)))
+    s!"{scopeTag}:thm:{origStr}:prio={t.priority}:post={t.post}:perm={t.perm}:rfl={t.rfl}:lvls=[{lparams}]:keys=[{keysStr}]:pf={proofHash}"
+  | .toUnfold d => s!"{scopeTag}:unfold:{canonicalName (norm d)}"
+  | .toUnfoldThms n thms =>
+    s!"{scopeTag}:unfoldThms:{canonicalName (norm n)}:{String.intercalate "," (thms.toList.map (fun x => canonicalName (norm x)))}"
+
+private def formatExternEntry (e : ExternEntry) : String :=
+  match e with
+  | .adhoc b => s!"adhoc:{canonicalName b}"
+  | .inline b pat => s!"inline:{canonicalName b}:{jsonEscape pat}"
+  | .standard b fn => s!"std:{canonicalName b}:{jsonEscape fn}"
+  | .opaque => "opaque"
+
+private def formatConstKind : ConstantKind → String
+  | .defn => "defn"
+  | .thm => "thm"
+  | .axiom => "axiom"
+  | .opaque => "opaque"
+  | .quot => "quot"
+  | .induct => "induct"
+  | .ctor => "ctor"
+  | .recursor => "rec"
+
+private def formatCoeFnType : Meta.CoeFnType → String
+  | .coe => "coe"
+  | .coeFun => "coeFun"
+  | .coeSort => "coeSort"
+
+private def formatHeadIndex (norm : Name → Name) : HeadIndex → String
+  | .fvar id => s!"fvar:{canonicalName id.name}"
+  | .mvar id => s!"mvar:{canonicalName id.name}"
+  | .const nm => s!"const:{canonicalName (norm nm)}"
+  | .proj sn idx => s!"proj:{canonicalName (norm sn)}:{idx}"
+  | .lit (.natVal n) => s!"nat:{n}"
+  | .lit (.strVal s) => s!"str:{jsonEscape s}"
+  | .sort => "sort"
+  | .lam => "lam"
+  | .forallE => "forallE"
+
+private def formatGrindEntry (norm : Name → Name) (scopeTag : String) (e : Meta.Grind.Entry) : String :=
+  match e with
+  | .ext d => s!"{scopeTag}:ext:{canonicalName (norm d)}"
+  | .funCC d => s!"{scopeTag}:funCC:{canonicalName (norm d)}"
+  | .cases d eager => s!"{scopeTag}:cases:{canonicalName (norm d)}:{eager}"
+  | .ematch thm =>
+    let orig := canonicalName (norm thm.origin.key)
+    let pfHash := TurboLean.Blake3.blake3Bytes (TurboLean.StatementHash.exprJson norm thm.proof).compress.toUTF8
+    let pats := String.intercalate "," (thm.patterns.map fun p =>
+      TurboLean.Blake3.blake3Bytes (TurboLean.StatementHash.exprJson norm p).compress.toUTF8)
+    let syms := String.intercalate "," (thm.symbols.map (formatHeadIndex norm))
+    s!"{scopeTag}:ematch:{orig}:np={thm.numParams}:min={thm.minIndexable}:kind={reprStr thm.kind}:syms=[{syms}]:pats=[{pats}]:pf={pfHash}"
+  | .inj thm =>
+    let orig := canonicalName (norm thm.origin.key)
+    let pfHash := TurboLean.Blake3.blake3Bytes (TurboLean.StatementHash.exprJson norm thm.proof).compress.toUTF8
+    let syms := String.intercalate "," (thm.symbols.map (formatHeadIndex norm))
+    s!"{scopeTag}:inj:{orig}:syms=[{syms}]:pf={pfHash}"
+
+private def formatLcnfSignature {pu : Compiler.LCNF.Purity} (norm : Name → Name) (sig : Compiler.LCNF.Signature pu) : String :=
+  let lvls := String.intercalate "," (sig.levelParams.map (fun u => canonicalName (norm u)))
+  let tyHash := TurboLean.Blake3.blake3Bytes (TurboLean.StatementHash.exprJson norm sig.type).compress.toUTF8
+  let paramsStr := String.intercalate "," (sig.params.toList.map fun p =>
+    let pTy := TurboLean.Blake3.blake3Bytes (TurboLean.StatementHash.exprJson norm p.type).compress.toUTF8
+    s!"{pTy}:{p.borrow}")
+  s!"{canonicalName (norm sig.name)}:lvls=[{lvls}]:ty={tyHash}:safe={sig.safe}:params=[{paramsStr}]"
+
+private def formatLcnfDeclIO (env : Environment) (norm : Name → Name) (phase : Compiler.LCNF.Phase) (d : Compiler.LCNF.Decl .pure) : IO String := do
+  let sigPart := formatLcnfSignature norm d.toSignature
+  let inl := formatInlineAttr d.inlineAttr?
+  let valTag ← match d.value with
+    | .extern ex =>
+      let ents := String.intercalate "," (ex.entries.map formatExternEntry)
+      pure s!"extern:[{ents}]"
+    | .code _ =>
+      let coreCtx : Core.Context := { fileName := "<pubsig>", fileMap := FileMap.ofString "" }
+      let coreState : Core.State := { env := env }
+      try
+        let (fmt, _) ← (Compiler.LCNF.ppDecl' d phase).toIO coreCtx coreState
+        let txt := fmt.pretty
+        pure s!"code:{TurboLean.Blake3.blake3Bytes txt.toUTF8}"
+      catch e =>
+        throw (IO.userError s!"failed to format LCNF decl `{d.name}`: {e.toString}")
+  return s!"{sigPart}:rec={d.recursive}:inl={inl}:{valTag}"
+
+private def isWhitelistedPublicSigExtName (extStr : String) : Bool :=
+  extStr == "Lean.Meta.simpExtension"
+  || extStr == "Lean.Compiler.CSimp.ext"
+  || extStr == "Lean.Meta.instanceExtension"
+  || extStr == "Lean.Meta.defaultInstanceExtension"
+  || extStr == "Lean.classExtension"
+  || extStr == "_private.Lean.Structure.0.Lean.structureExt"
+  || extStr == "Lean.projectionFnInfoExt"
+  || extStr == "Lean.protectedExt"
+  || extStr == "Lean.noConfusionExt"
+  || extStr == "Lean.auxRecExt"
+  || extStr == "_private.Lean.AuxRecursor.0.Lean.sparseCasesOnExt"
+  || extStr == "recExt"
+  || extStr == "reducibilityCore"
+  || extStr == "reducibilityExtra"
+  || extStr == "Lean.defeqAttr"
+  || extStr == "Lean.backwardDefeqAttr"
+  || extStr == "Lean.Compiler.inlineAttrs"
+  || extStr == "Lean.externAttr"
+  || extStr == "Lean.Compiler.implementedByAttr"
+  || extStr == "Lean.exportAttr"
+  || extStr == "Lean.Compiler.specializeAttrs"
+  || extStr == "Lean.matchPatternAttr"
+  || extStr == "Lean.Linter.deprecatedAttr"
+  || extStr == "Lean.deprecatedModuleExt"
+  || extStr == "Lean.Elab.Term.elabAsElim"
+  || extStr == "Lean.Meta.Ext.extExtension"
+  || extStr == "Lean.Meta.coeExt"
+  || extStr == "Lean.Meta.Grind.grindExt"
+  || extStr == "Lean.Meta.completionBlackListExt"
+  || extStr == "_private.Lean.OriginalConstKind.0.Lean.privateConstKindsExt"
+  || extStr == "_private.Lean.Compiler.NoncomputableAttr.0.Lean.noncomputableExt"
+  || extStr == "Lean.aliasExtension"
+  || extStr == "_private.Lean.ResolveName.0.Lean.aliasExtension"
+  || extStr == "_private.Lean.Namespace.0.Lean.namespacesExt"
+  || extStr == "_private.Lean.Compiler.ModPkgExt.0.Lean.modPkgExt"
+  || extStr == "Lean.IR.declMapExt"
+  || extStr == "Lean.Compiler.LCNF.baseExt"
+  || extStr == "Lean.Compiler.LCNF.monoExt"
+  || extStr == "Lean.Compiler.LCNF.impureSigExt"
+  || extStr == "Lean.Compiler.LCNF.monoTypeExt"
+  || extStr == "_private.Lean.Compiler.LCNF.MonoTypes.0.Lean.Compiler.LCNF.trivialStructureInfoExt"
+  || extStr == "Lean.Compiler.LCNF.impureTypeExt"
+  || extStr == "_private.Lean.Compiler.LCNF.ToImpureType.0.Lean.Compiler.LCNF.impureTypeExt"
+  || extStr == "Lean.Compiler.LCNF.impureTrivialStructureInfoExt"
+  || extStr == "_private.Lean.Compiler.LCNF.ToImpureType.0.Lean.Compiler.LCNF.impureTrivialStructureInfoExt"
+  || extStr == "Lean.Compiler.LCNF.ctorLayoutExt"
+  || extStr == "_private.Lean.Compiler.LCNF.ToImpureType.0.Lean.Compiler.LCNF.ctorLayoutExt"
+  || extStr == "_private.Lean.Util.CollectAxioms.0.Lean.exportedAxiomsExt"
+
 def dumpPublicSignatureJson (modStr : String) : IO String := do
   let nm := parseModuleName modStr
   if nm.isAnonymous then
     throw (IO.userError s!"invalid module name `{modStr}`")
-  let env ← Lean.importModules #[{ module := nm, isExported := true, importAll := false }] {} 0 #[] true false .exported
+  let oleanPath ← Lean.findOLean nm
+  let srvPath := System.FilePath.mk (oleanPath.toString ++ ".server")
+  let irPath := oleanPath.withExtension "ir"
+  let irSigPath := System.FilePath.mk (irPath.toString ++ ".sig")
+  let hasSrv ← srvPath.pathExists
+  let hasIrSig ← irSigPath.pathExists
+  let hasIr ← irPath.pathExists
+  let oleanParts := if hasSrv then #[oleanPath, srvPath] else #[oleanPath]
+  let irParts := if hasIrSig then (if hasIr then #[irSigPath, irPath] else #[irSigPath]) else #[]
+  let arts : NameMap ImportArtifacts :=
+    (∅ : NameMap ImportArtifacts).insert nm (ImportArtifacts.ofArrays #[oleanParts, irParts])
+  let env ← Lean.importModules #[{ module := nm, isExported := true, importAll := false }] {} 0 #[] true false .exported arts
   let some idx := env.getModuleIdx? nm | throw (IO.userError s!"module `{modStr}` not imported")
   let md := env.header.moduleData[idx.toNat]!
   let isMod := md.isModule
+  let norm := TurboLean.StatementHash.normalizeLocalPrivateName (some nm)
+  let mut hasOpaqueExt := false
+  let mut nsArr : Array String := #[]
+  let mut aliasMap : Std.HashMap Name (Array String) := {}
+  let mut exportedAxiomsMap : Std.HashMap Name (Array Name) := {}
+  let mut reducibilityExtraEntries : Array String := #[]
+  for (extName, arr) in md.entries do
+    if arr.size > 0 then
+      let extStr := canonicalName extName
+      if !isWhitelistedPublicSigExtName extStr then
+        hasOpaqueExt := true
+      if extStr == "_private.Lean.Namespace.0.Lean.namespacesExt" then
+        for rawObj in arr do
+          let nsName : Name := unsafe unsafeCast rawObj
+          nsArr := nsArr.push (canonicalName (norm nsName))
+      else if extStr == "Lean.aliasExtension" || extStr == "_private.Lean.ResolveName.0.Lean.aliasExtension" then
+        for rawObj in arr do
+          let (alName, origName) : (Name × Name) := unsafe unsafeCast rawObj
+          if !Lean.isProtected env origName then
+            let cur := aliasMap[origName]?.getD #[]
+            aliasMap := aliasMap.insert origName (cur.push (canonicalName (norm alName)))
+      else if extStr == "_private.Lean.Util.CollectAxioms.0.Lean.exportedAxiomsExt" then
+        for rawObj in arr do
+          let (cName, cAxioms) : (Name × Array Name) := unsafe unsafeCast rawObj
+          exportedAxiomsMap := exportedAxiomsMap.insert cName cAxioms
+      else if extStr == "reducibilityExtra" then
+        for entry in (Lean.reducibilityExtraExt.ext.getModuleEntries env idx) do
+          match entry with
+          | .global (dName, st) =>
+            reducibilityExtraEntries := reducibilityExtraEntries.push s!"global:{canonicalName (norm dName)}:{formatReducibilityStatus st}"
+          | .scoped ns (dName, st) =>
+            reducibilityExtraEntries := reducibilityExtraEntries.push s!"scoped:{canonicalName (norm ns)}:{canonicalName (norm dName)}:{formatReducibilityStatus st}"
   let mut expImports : Array String := #[]
   for imp in md.imports do
     if imp.isExported || !isMod then
       let tag := s!"{canonicalName imp.module}:e={imp.isExported}:m={imp.isMeta}:a={imp.importAll}"
       expImports := expImports.push tag
+  let modPkgStr := match env.getModulePackageByIdx? idx with
+    | some pkg => pkg
+    | none => ""
+  let depModStr := match env.getDeprecatedModuleByIdx? idx with
+    | some dm => s!"some:{jsonEscape (dm.message?.getD "")}:{jsonEscape (dm.since?.getD "")}"
+    | none => "none"
   let simpEntries := (Meta.simpExtension.ext.getModuleEntries env idx).map fun entry =>
     match entry with
-    | .global se =>
-      match se with
-      | .thm t => s!"global:thm:{t.origin.key}:{t.priority}:{t.post}:{t.rfl}"
-      | .toUnfold d => s!"global:unfold:{canonicalName d}"
-      | .toUnfoldThms n thms => s!"global:unfoldThms:{canonicalName n}:{String.intercalate "," (thms.toList.map canonicalName)}"
-    | .scoped ns se =>
-      match se with
-      | .thm t => s!"scoped:{canonicalName ns}:thm:{t.origin.key}:{t.priority}:{t.post}:{t.rfl}"
-      | .toUnfold d => s!"scoped:{canonicalName ns}:unfold:{canonicalName d}"
-      | .toUnfoldThms n thms => s!"scoped:{canonicalName ns}:unfoldThms:{canonicalName n}:{String.intercalate "," (thms.toList.map canonicalName)}"
+    | .global se => formatSimpEntry norm "global" se
+    | .scoped ns se => formatSimpEntry norm s!"scoped:{canonicalName (norm ns)}" se
   let csimpEntries := (Compiler.CSimp.ext.ext.getModuleEntries env idx).map fun entry =>
     match entry with
-    | .global e => s!"global:{canonicalName e.fromDeclName}->{canonicalName e.toDeclName}:{canonicalName e.thmName}"
-    | .scoped ns e => s!"scoped:{canonicalName ns}:{canonicalName e.fromDeclName}->{canonicalName e.toDeclName}:{canonicalName e.thmName}"
+    | .global e => s!"global:{canonicalName (norm e.fromDeclName)}->{canonicalName (norm e.toDeclName)}:{canonicalName (norm e.thmName)}"
+    | .scoped ns e => s!"scoped:{canonicalName (norm ns)}:{canonicalName (norm e.fromDeclName)}->{canonicalName (norm e.toDeclName)}:{canonicalName (norm e.thmName)}"
+  let instEntries := (Meta.instanceExtension.ext.getModuleEntries env idx).map fun entry =>
+    match entry with
+    | .global ie => formatInstanceEntry norm "global" ie
+    | .scoped ns ie => formatInstanceEntry norm s!"scoped:{canonicalName (norm ns)}" ie
+  let defInstEntries := (Meta.defaultInstanceExtension.getModuleEntries env idx).map fun di =>
+    s!"{canonicalName (norm di.className)}:{canonicalName (norm di.instanceName)}:{di.priority}"
+  let clsEntries := (Lean.classExtension.getModuleEntries env idx).map fun ce =>
+    let op := String.intercalate "," (ce.outParams.toList.map toString)
+    let olp := String.intercalate "," (ce.outLevelParams.toList.map toString)
+    s!"{canonicalName (norm ce.name)}:out=[{op}]:outLvl=[{olp}]"
+  let extThmEntries := (Meta.Ext.extExtension.ext.getModuleEntries env idx).map fun entry =>
+    match entry with
+    | .global et =>
+      let ks := String.intercalate "," (et.keys.toList.map (formatDiscrKey norm))
+      s!"global:{canonicalName (norm et.declName)}:p={et.priority}:keys=[{ks}]"
+    | .scoped ns et =>
+      let ks := String.intercalate "," (et.keys.toList.map (formatDiscrKey norm))
+      s!"scoped:{canonicalName (norm ns)}:{canonicalName (norm et.declName)}:p={et.priority}:keys=[{ks}]"
+  let coeEntries := (Meta.coeExt.ext.getModuleEntries env idx).map fun entry =>
+    match entry with
+    | .global (fn, ci) => s!"global:{canonicalName (norm fn)}:{ci.numArgs}:{ci.coercee}:{formatCoeFnType ci.type}"
+    | .scoped ns (fn, ci) => s!"scoped:{canonicalName (norm ns)}:{canonicalName (norm fn)}:{ci.numArgs}:{ci.coercee}:{formatCoeFnType ci.type}"
+  let grindEntries := (Meta.Grind.grindExt.ext.getModuleEntries env idx).map fun entry =>
+    match entry with
+    | .global ge => formatGrindEntry norm "global" ge
+    | .scoped ns ge => formatGrindEntry norm s!"scoped:{canonicalName (norm ns)}" ge
+  let irDeclEntries := (IR.declMapExt.getModuleEntries env idx).map fun d =>
+    let irHash := TurboLean.Blake3.blake3Bytes (toString d).toUTF8
+    s!"{canonicalName (norm d.name)}:{irHash}"
+  let mut lcnfBaseEntries : Array String := #[]
+  for bd in Compiler.LCNF.baseExt.getModuleEntries env idx do
+    lcnfBaseEntries := lcnfBaseEntries.push (← formatLcnfDeclIO env norm .base bd)
+  let mut lcnfMonoEntries : Array String := #[]
+  for mdDecl in Compiler.LCNF.monoExt.getModuleEntries env idx do
+    lcnfMonoEntries := lcnfMonoEntries.push (← formatLcnfDeclIO env norm .mono mdDecl)
+  let lcnfImpureSigEntries := (Compiler.LCNF.impureSigExt.getModuleEntries env idx).map (formatLcnfSignature norm)
+  nsArr := nsArr.qsort (· < ·)
   let mut declJsons : Array String := #[]
   let mut sigPieces : Array String := #[
-    s!"olean-pubsig:v1|mod={canonicalName nm}|is_module={isMod}",
+    s!"olean-pubsig:v2|mod={canonicalName nm}|is_module={isMod}|pkg={modPkgStr}|dep_mod={depModStr}",
     s!"imports={String.intercalate ";" expImports.toList}",
+    s!"namespaces={String.intercalate ";" nsArr.toList}",
+    s!"reducibility_extra={String.intercalate ";" reducibilityExtraEntries.toList}",
     s!"simp={String.intercalate ";" simpEntries.toList}",
-    s!"csimp={String.intercalate ";" csimpEntries.toList}"
+    s!"csimp={String.intercalate ";" csimpEntries.toList}",
+    s!"instances={String.intercalate ";" instEntries.toList}",
+    s!"default_instances={String.intercalate ";" defInstEntries.toList}",
+    s!"classes={String.intercalate ";" clsEntries.toList}",
+    s!"ext_thms={String.intercalate ";" extThmEntries.toList}",
+    s!"coes={String.intercalate ";" coeEntries.toList}",
+    s!"grind={String.intercalate ";" grindEntries.toList}",
+    s!"ir_decls={String.intercalate ";" irDeclEntries.toList}",
+    s!"lcnf_base={String.intercalate ";" lcnfBaseEntries.toList}",
+    s!"lcnf_mono={String.intercalate ";" lcnfMonoEntries.toList}",
+    s!"lcnf_impure_sig={String.intercalate ";" lcnfImpureSigEntries.toList}"
   ]
   for c in md.constants do
     let cname := canonicalName c.name
     let (kind, stmtHash, bodyHash) := formatConstantExportPayload c (some nm)
     let red := formatReducibilityStatus (Lean.getReducibilityStatusCore env c.name)
     let inl := formatInlineAttr (Compiler.getInlineAttribute? env c.name)
-    let extFlag := Lean.isExtern env c.name
-    let implBy := match Compiler.getImplementedBy? env c.name with
-      | some tgt => canonicalName tgt
+    let extDataStr := match Lean.getExternAttrData? env c.name with
+      | some ed => String.intercalate "," (ed.entries.map formatExternEntry)
       | none => ""
-    sigPieces := sigPieces.push s!"c:{cname}|{kind}|{stmtHash}|{bodyHash}|red={red}|inl={inl}|ext={extFlag}|impl={implBy}"
+    let expNameStr := match Lean.getExportNameFor? env c.name with
+      | some en => canonicalName en
+      | none => ""
+    let implBy := match Compiler.getImplementedBy? env c.name with
+      | some tgt => canonicalName (norm tgt)
+      | none => ""
+    let specFlags := s!"{Compiler.hasSpecializeAttribute env c.name}:{Compiler.hasNospecializeAttribute env c.name}"
+    let protFlag := Lean.isProtected env c.name
+    let noConfFlag := Lean.isNoConfusion env c.name
+    let auxRecFlag := Lean.isAuxRecursor env c.name
+    let sparseCasesFlag := Lean.isSparseCasesOn env c.name
+    let recCoreFlag := Lean.isRecCore env c.name
+    let noncompFlag := Lean.isNoncomputable env c.name
+    let matchPatFlag := Lean.hasMatchPatternAttribute env c.name
+    let elabElimFlag := Elab.Term.elabAsElim.hasTag env c.name
+    let defeqFlag := Lean.defeqAttr.hasTag env c.name
+    let bwdDefeqFlag := Lean.backwardDefeqAttr.hasTag env c.name
+    let compBlFlag := Meta.completionBlackListExt.isTagged env c.name
+    let origKindStr := match Lean.getOriginalConstKind? env c.name with
+      | some ck => formatConstKind ck
+      | none => ""
+    let projStr := match env.getProjectionFnInfo? c.name with
+      | some pi => s!"{canonicalName (norm pi.ctorName)}:{pi.numParams}:{pi.i}:{pi.fromClass}"
+      | none => ""
+    let structStr := match Lean.getStructureInfo? env c.name with
+      | some si =>
+        let fnames := String.intercalate "," (si.fieldNames.toList.map canonicalName)
+        let finfos := String.intercalate "," (si.fieldInfo.toList.map fun (fi : StructureFieldInfo) =>
+          let sub := match fi.subobject? with | some sn => canonicalName (norm sn) | none => ""
+          let ap := match fi.autoParam? with
+            | some e => TurboLean.Blake3.blake3Bytes (TurboLean.StatementHash.exprJson norm e).compress.toUTF8
+            | none => ""
+          s!"{canonicalName fi.fieldName}:{canonicalName (norm fi.projFn)}:{sub}:{reprStr fi.binderInfo}:{ap}")
+        let pinfos := String.intercalate "," (si.parentInfo.toList.map fun (pi : StructureParentInfo) =>
+          s!"{canonicalName (norm pi.structName)}:{pi.subobject}:{canonicalName (norm pi.projFn)}")
+        s!"fn=[{fnames}]:fi=[{finfos}]:pi=[{pinfos}]"
+      | none => ""
+    let deprStr := match Linter.deprecatedAttr.getParam? env c.name with
+      | some de =>
+        let nn := match de.newName? with | some x => canonicalName (norm x) | none => ""
+        s!"some:{nn}:{jsonEscape (de.text?.getD "")}:{jsonEscape (de.since?.getD "")}"
+      | none => ""
+    let aliases := ((aliasMap[c.name]?.getD #[]).qsort (· < ·)).toList
+    let aliasStr := String.intercalate "," aliases
+    let axs ← match exportedAxiomsMap[c.name]? with
+      | some a => pure a
+      | none =>
+        if isMod then do
+          hasOpaqueExt := true
+          pure (#[] : Array Name)
+        else
+          pure (collectDeclAxioms {} env c.name)
+    let mut allAxioms : Array String := #[]
+    for ax in axs do
+      allAxioms := allAxioms.push (canonicalName (norm ax))
+      if !isAllowedStandardAxiom ax then
+        hasOpaqueExt := true
+    let allAxStr := String.intercalate "," (allAxioms.qsort (· < ·)).toList
+    sigPieces := sigPieces.push s!"c:{cname}|{kind}|{stmtHash}|{bodyHash}|red={red}|inl={inl}|ext=[{extDataStr}]|exp={expNameStr}|impl={implBy}|spec={specFlags}|flags={protFlag},{noConfFlag},{auxRecFlag},{sparseCasesFlag},{recCoreFlag},{noncompFlag},{matchPatFlag},{elabElimFlag},{defeqFlag},{bwdDefeqFlag},{compBlFlag}|orig={origKindStr}|proj={projStr}|struct={structStr}|depr={deprStr}|alias=[{aliasStr}]|axioms=[{allAxStr}]"
     declJsons := declJsons.push s!"\{\"name\":\"{jsonEscape cname}\",\"kind\":\"{jsonEscape kind}\",\"type_hash\":\"{jsonEscape stmtHash}\",\"body_hash\":\"{jsonEscape bodyHash}\",\"reducibility\":\"{jsonEscape red}\",\"inline\":\"{jsonEscape inl}\"}"
   let pubDigest := TurboLean.Blake3.blake3Bytes (String.intercalate "\n" sigPieces.toList).toUTF8
-  return s!"\{\"ok\":true,\"module\":\"{jsonEscape (canonicalName nm)}\",\"is_module\":{isMod},\"public_sig_digest\":\"{pubDigest}\",\"exported_imports\":[{jsonStrList expImports.toList}],\"simp_entries\":[{jsonStrList simpEntries.toList}],\"csimp_entries\":[{jsonStrList csimpEntries.toList}],\"decls\":[{String.intercalate "," declJsons.toList}]}"
+  return s!"\{\"ok\":true,\"module\":\"{jsonEscape (canonicalName nm)}\",\"is_module\":{isMod},\"has_opaque_ext\":{hasOpaqueExt},\"public_sig_digest\":\"{pubDigest}\",\"exported_imports\":[{jsonStrList expImports.toList}],\"simp_entries\":[{jsonStrList simpEntries.toList}],\"csimp_entries\":[{jsonStrList csimpEntries.toList}],\"instance_entries\":[{jsonStrList instEntries.toList}],\"decls\":[{String.intercalate "," declJsons.toList}]}"
 
 structure TimeoutHotspotEntry where
   kind : String

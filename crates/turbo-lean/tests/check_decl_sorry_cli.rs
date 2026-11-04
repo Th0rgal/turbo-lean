@@ -963,3 +963,179 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
     );
     assert!(!out2.status.success());
 }
+
+#[test]
+fn test_speed4_allow_sorry_srcdir_transitive_purge_and_zero_cas_taint() {
+    if !lean_available() {
+        return;
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "turbo_speed4_srcdir_sorry_purge_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let cache = root.join("cache");
+    let proj = root.join("proj");
+    fs::create_dir_all(proj.join("src/Chain")).unwrap();
+    fs::write(
+        proj.join("lean-toolchain"),
+        include_str!("../../../lean/lean-toolchain"),
+    )
+    .unwrap();
+    fs::write(
+        proj.join("lakefile.toml"),
+        "name = \"chainsmoke\"\nsrcDir = \"src\"\n[[lean_lib]]\nname = \"Chain\"\nglobs = [\"Chain.+\"]\n",
+    )
+    .unwrap();
+
+    // Clean initial 3-hop chain `Chain.A -> Chain.B -> Chain.C` under `srcDir = "src"`.
+    let a_clean = "\
+def baseVal : Nat := 7
+theorem a_thm : baseVal = 7 := rfl
+";
+    let b_src = "\
+import Chain.A
+theorem b_thm : baseVal = 7 := a_thm
+";
+    let c_src = "\
+import Chain.B
+theorem c_thm : baseVal = 7 := b_thm
+";
+    fs::write(proj.join("src/Chain/A.lean"), a_clean).unwrap();
+    fs::write(proj.join("src/Chain/B.lean"), b_src).unwrap();
+    fs::write(proj.join("src/Chain/C.lean"), c_src).unwrap();
+
+    let git_bin = std::env::var("TURBO_LEAN_GIT").unwrap_or_else(|_| "git".to_string());
+    for args in [
+        &["init"][..],
+        &["add", "."][..],
+        &["commit", "-m", "clean baseline"][..],
+    ] {
+        let st = Command::new(&git_bin)
+            .current_dir(&proj)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {:?} failed", args);
+    }
+
+    let run_cli = |args: &[&str]| -> Output {
+        Command::new(env!("CARGO_BIN_EXE_turbo-lean"))
+            .current_dir(&proj)
+            .arg("--json")
+            .arg("--cache-dir")
+            .arg(&cache)
+            .args(args)
+            .env("TURBO_LEAN_NO_DAEMON", "1")
+            .env("TURBO_LEAN_TELEMETRY", "off")
+            .output()
+            .unwrap()
+    };
+
+    // Build clean baseline so `.lake/build/lib/lean/Chain/{A,B,C}.olean` exist initially.
+    let build_clean = run_cli(&["build"]);
+    assert!(
+        build_clean.status.success(),
+        "initial clean build failed:\n{}{}",
+        String::from_utf8_lossy(&build_clean.stdout),
+        String::from_utf8_lossy(&build_clean.stderr)
+    );
+    let lib_dir = proj.join(".lake/build/lib/lean/Chain");
+    assert!(lib_dir.join("A.olean").exists());
+    assert!(lib_dir.join("B.olean").exists());
+    assert!(lib_dir.join("C.olean").exists());
+
+    // Now edit `src/Chain/A.lean` to replace `a_thm`'s proof AND signature with a `sorry`-backed false lemma,
+    // and update `B.lean` + `C.lean` to rely on `a_thm` (without lexical `sorry` in `B.lean` or `C.lean`!).
+    fs::write(
+        proj.join("src/Chain/A.lean"),
+        "def baseVal : Nat := 7\ntheorem a_thm : baseVal = 99 := by\n  sorry\n",
+    )
+    .unwrap();
+    fs::write(
+        proj.join("src/Chain/B.lean"),
+        "import Chain.A\ntheorem b_thm : baseVal = 99 := a_thm\n",
+    )
+    .unwrap();
+    fs::write(
+        proj.join("src/Chain/C.lean"),
+        "import Chain.B\ntheorem c_thm : baseVal = 99 := b_thm\n",
+    )
+    .unwrap();
+
+    // 1. `check src/Chain/A.lean --allow-sorry` triggers `recheck_dependents_if_nonlocal_with_options`,
+    //    which refreshes `Chain.A`, `Chain.B`, `Chain.C` via Lake and MUST purge ALL 3 sorry-tainted
+    //    `.olean` artifacts across `srcDir = "src"` and the 2-hop transitive cone (`A -> B -> C`)!
+    let chk_a_mod = run_cli(&["check", "src/Chain/A.lean", "--allow-sorry"]);
+    assert!(
+        chk_a_mod.status.success(),
+        "check A --allow-sorry failed:\n{}{}",
+        String::from_utf8_lossy(&chk_a_mod.stdout),
+        String::from_utf8_lossy(&chk_a_mod.stderr)
+    );
+    let chk_a_json: Value = serde_json::from_slice(&chk_a_mod.stdout).unwrap();
+    assert_eq!(chk_a_json["status"], "verified_modulo_sorry");
+    assert_eq!(chk_a_json["used_sorry"], true);
+    assert!(
+        !lib_dir.join("A.olean").exists(),
+        "sorry-bearing Chain/A.olean under srcDir=\"src\" must be purged after --allow-sorry"
+    );
+    assert!(
+        !lib_dir.join("B.olean").exists(),
+        "1-hop dependent Chain/B.olean tainted by Chain.A sorry must be purged"
+    );
+    assert!(
+        !lib_dir.join("C.olean").exists(),
+        "2-hop transitive dependent Chain/C.olean tainted by Chain.A sorry must be purged"
+    );
+
+    // 2. Checking downstream `src/Chain/C.lean --allow-sorry` (whose own text has ZERO `sorry` tokens,
+    //    while `ensure_project_imports_fresh_for_check` builds `Chain.A` and `Chain.B`) MUST:
+    //    - report `verified_modulo_sorry` (`used_sorry == true`, NOT `file_verified`!),
+    //    - NEVER cache `c_thm` in `TheoremProofCAS`,
+    //    - purge `A.olean`, `B.olean`, and `C.olean` afterward so strict `check` fails closed!
+    let chk_c_mod = run_cli(&["check", "src/Chain/C.lean", "--allow-sorry"]);
+    assert!(
+        chk_c_mod.status.success(),
+        "check C --allow-sorry failed:\n{}{}",
+        String::from_utf8_lossy(&chk_c_mod.stdout),
+        String::from_utf8_lossy(&chk_c_mod.stderr)
+    );
+    let chk_c_json: Value = serde_json::from_slice(&chk_c_mod.stdout).unwrap();
+    assert_eq!(
+        chk_c_json["status"], "verified_modulo_sorry",
+        "downstream C.lean transitively using Chain.A's sorryAx must report verified_modulo_sorry: {chk_c_json}"
+    );
+    assert_eq!(chk_c_json["used_sorry"], true);
+    assert!(!lib_dir.join("A.olean").exists());
+    assert!(!lib_dir.join("B.olean").exists());
+    assert!(!lib_dir.join("C.olean").exists());
+
+    // 3. Subsequent strict `check` on `A.lean`, `B.lean`, `C.lean`, and `--decl c_thm` MUST ALL fail closed!
+    for strict_args in [
+        &["check", "src/Chain/A.lean"][..],
+        &["check", "src/Chain/B.lean"][..],
+        &["check", "src/Chain/C.lean"][..],
+        &["check", "src/Chain/C.lean", "--decl", "c_thm"][..],
+    ] {
+        let out = run_cli(strict_args);
+        let st = status(&out);
+        assert!(
+            !out.status.success() && !st.contains("verified") && !st.contains("cache_hit"),
+            "strict {:?} must fail closed after --allow-sorry:\n{}{}",
+            strict_args,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}

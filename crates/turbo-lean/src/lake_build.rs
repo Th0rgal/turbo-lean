@@ -2606,6 +2606,264 @@ pub(crate) fn resolve_replayed_prebuilt_module_import(
     Some(mod_name)
 }
 
+fn remove_module_node_artifacts(node: &crate::module_builder::ModuleNode) {
+    let rel_slash = crate::module_builder::module_name_to_rel_slash(&node.module_name);
+    let olean_suffix = format!("{rel_slash}.olean");
+    let c_suffix = format!("{rel_slash}.c");
+    if let Some(lib_base) = node
+        .olean_path
+        .to_string_lossy()
+        .strip_suffix(&olean_suffix)
+    {
+        let lib_lean_dir = PathBuf::from(lib_base.trim_end_matches('/'));
+        for suffix in [
+            ".olean",
+            ".olean.hash",
+            ".olean.server",
+            ".olean.server.hash",
+            ".olean.private",
+            ".olean.private.hash",
+            ".ilean",
+            ".ilean.hash",
+            ".ir",
+            ".ir.hash",
+            ".ir.sig",
+            ".ir.sig.hash",
+            ".trace",
+        ] {
+            let _ = fs::remove_file(lib_lean_dir.join(format!("{rel_slash}{suffix}")));
+        }
+    } else {
+        let _ = fs::remove_file(&node.olean_path);
+    }
+    if let Some(ir_base) = node.c_path.to_string_lossy().strip_suffix(&c_suffix) {
+        let ir_dir = PathBuf::from(ir_base.trim_end_matches('/'));
+        for suffix in [
+            ".c",
+            ".c.hash",
+            ".ltar",
+            ".ltar.hash",
+            ".bc",
+            ".bc.hash",
+            ".setup.json",
+            ".ilean",
+            ".ilean.hash",
+            ".trace",
+        ] {
+            let _ = fs::remove_file(ir_dir.join(format!("{rel_slash}{suffix}")));
+        }
+    } else {
+        let _ = fs::remove_file(&node.c_path);
+    }
+}
+
+pub(crate) fn purge_sorry_artifacts_after_allow_sorry_failure(
+    canon_dir: &Path,
+    seed_files: &[PathBuf],
+) {
+    if !worktree_auto_link_disabled(canon_dir) {
+        let _ = purge_workspace_sorry_artifacts_and_manifest(canon_dir, seed_files, &[]);
+    }
+}
+
+/// Purge modulo-`sorry` build artifacts and `.turbo_verified_sources.json` entries across the
+/// full workspace DAG + standalone graph (covering non-root `srcDir`, multi-hop transitive
+/// dependents `A -> B -> C`, and pre-existing sorry-bearing imports).
+fn purge_workspace_sorry_artifacts_and_manifest(
+    canon_dir: &Path,
+    extra_seed_files: &[PathBuf],
+    extra_seed_mods: &[String],
+) -> HashSet<String> {
+    let file_has_sorry = |p: &Path| -> bool {
+        fs::read_to_string(p)
+            .map(|s| splitter::audit_hygiene(&splitter::strip_lean_comments(&s)).has_sorry)
+            .unwrap_or(false)
+    };
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+
+    let mut sorry_mod_set: HashSet<String> = HashSet::new();
+    let mut sorry_canon_paths: HashSet<PathBuf> = HashSet::new();
+
+    for (rf, rm) in extra_seed_files.iter().zip(extra_seed_mods.iter()) {
+        if file_has_sorry(rf) {
+            sorry_mod_set.insert(rm.clone());
+            sorry_canon_paths.insert(canon(rf));
+        }
+    }
+    for rf in extra_seed_files {
+        if file_has_sorry(rf) {
+            sorry_canon_paths.insert(canon(rf));
+        }
+    }
+
+    let closure_opt = compute_project_dependent_closure(canon_dir, &[], false).ok();
+    let roots_fallback = closure_opt
+        .as_ref()
+        .map(|c| package_source_roots(canon_dir, &c.cfg.root_pkg))
+        .unwrap_or_else(|| vec![canon(canon_dir)]);
+
+    if let Some(ref closure) = closure_opt {
+        if let Some(ref dag) = closure.dag {
+            for (m, node) in &dag.nodes {
+                let cpath = canon(&node.src_path);
+                if sorry_canon_paths.contains(&cpath) || file_has_sorry(&node.src_path) {
+                    sorry_mod_set.insert(m.clone());
+                    sorry_canon_paths.insert(cpath);
+                }
+            }
+        }
+        for (m, spec) in &closure.standalone_all {
+            let cpath = canon(&spec.src_path);
+            if sorry_canon_paths.contains(&cpath) || file_has_sorry(&spec.src_path) {
+                sorry_mod_set.insert(m.clone());
+                sorry_canon_paths.insert(cpath);
+            }
+        }
+    } else {
+        for lf in collect_project_lean_files(canon_dir, false, None) {
+            let cpath = canon(&lf);
+            if sorry_canon_paths.contains(&cpath) || file_has_sorry(&lf) {
+                sorry_canon_paths.insert(cpath.clone());
+                if let Some(r) = roots_fallback.iter().find(|r| cpath.starts_with(r)) {
+                    if let Ok(rel) = cpath.strip_prefix(r) {
+                        let m = crate::module_builder::format_lean_module_name_from_parts(
+                            rel.with_extension("")
+                                .components()
+                                .filter_map(|c| c.as_os_str().to_str()),
+                        );
+                        if !m.is_empty() {
+                            sorry_mod_set.insert(m);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if sorry_mod_set.is_empty() && sorry_canon_paths.is_empty() {
+        return sorry_mod_set;
+    }
+
+    // Fixed-point transitive dependent closure across DAG nodes, standalone modules, and rechecked files.
+    if let Some(ref closure) = closure_opt {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            if let Some(ref dag) = closure.dag {
+                for (m, node) in &dag.nodes {
+                    if !sorry_mod_set.contains(m)
+                        && node
+                            .direct_dag_deps
+                            .iter()
+                            .any(|d| sorry_mod_set.contains(d))
+                    {
+                        sorry_mod_set.insert(m.clone());
+                        sorry_canon_paths.insert(canon(&node.src_path));
+                        changed = true;
+                    }
+                }
+            }
+            for (m, spec) in &closure.standalone_all {
+                if !sorry_mod_set.contains(m)
+                    && spec.imports.iter().any(|d| sorry_mod_set.contains(d))
+                {
+                    sorry_mod_set.insert(m.clone());
+                    sorry_canon_paths.insert(canon(&spec.src_path));
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    let mut recheck_changed = true;
+    while recheck_changed {
+        recheck_changed = false;
+        for (rf, rm) in extra_seed_files.iter().zip(extra_seed_mods.iter()) {
+            if sorry_mod_set.contains(rm) {
+                sorry_canon_paths.insert(canon(rf));
+                continue;
+            }
+            let imports_sorry = fs::read_to_string(rf)
+                .map(|s| {
+                    crate::module_builder::parse_header_info(&s)
+                        .imports
+                        .iter()
+                        .any(|imp| sorry_mod_set.contains(imp))
+                })
+                .unwrap_or(false);
+            if imports_sorry {
+                sorry_mod_set.insert(rm.clone());
+                sorry_canon_paths.insert(canon(rf));
+                recheck_changed = true;
+            }
+        }
+    }
+
+    // Purge all build artifacts for tainted modules.
+    if let Some(ref closure) = closure_opt {
+        if let Some(ref dag) = closure.dag {
+            for m in &sorry_mod_set {
+                if let Some(node) = dag.nodes.get(m) {
+                    remove_module_node_artifacts(node);
+                }
+            }
+        }
+    }
+    for m in &sorry_mod_set {
+        let rel_slash = crate::module_builder::module_name_to_rel_slash(m);
+        remove_module_build_artifacts(canon_dir, &rel_slash);
+    }
+
+    // Remove tainted `pkg_root`-relative keys from `.turbo_verified_sources.json`.
+    let manifest_path = verified_sources_manifest_path(canon_dir);
+    if let Some(mut manifest) = fs::read(&manifest_path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<crate::module_builder::VerifiedDepManifest>(&b).ok())
+    {
+        let mut keys_to_remove: HashSet<String> = HashSet::new();
+        if let Some(ref closure) = closure_opt {
+            if let Some(ref dag) = closure.dag {
+                for m in &sorry_mod_set {
+                    if let Some(node) = dag.nodes.get(m) {
+                        let rel = node
+                            .src_path
+                            .strip_prefix(&node.pkg_root)
+                            .unwrap_or(&node.src_path)
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        keys_to_remove.insert(rel);
+                    }
+                }
+            }
+        }
+        let canon_root = canon(canon_dir);
+        for cp in &sorry_canon_paths {
+            let rel = cp
+                .strip_prefix(&canon_root)
+                .or_else(|_| cp.strip_prefix(canon_dir))
+                .unwrap_or(cp)
+                .to_string_lossy()
+                .replace('\\', "/");
+            keys_to_remove.insert(rel);
+        }
+        let mut modified = false;
+        for k in keys_to_remove {
+            if manifest.modules.remove(&k).is_some() {
+                modified = true;
+            }
+        }
+        if modified {
+            if let Ok(json_bytes) = serde_json::to_vec(&manifest) {
+                let _ = fs::write(&manifest_path, json_bytes);
+            } else {
+                let _ = fs::remove_file(&manifest_path);
+            }
+        }
+    }
+
+    sorry_mod_set
+}
+
 fn remove_module_build_artifacts(canon_dir: &Path, rel_slash: &str) {
     let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
     let ir_dir = canon_dir.join(".lake/build/ir");
@@ -3345,11 +3603,19 @@ fn ensure_project_imports_fresh_inner(
     Ok(stale_mods.len())
 }
 
+pub(crate) fn ensure_project_imports_fresh_for_check_with_options(
+    canon_dir: &Path,
+    target_files: &[PathBuf],
+    build_missing: bool,
+) -> Result<usize> {
+    ensure_project_imports_fresh(canon_dir, target_files, None, build_missing)
+}
+
 pub(crate) fn ensure_project_imports_fresh_for_check(
     canon_dir: &Path,
     target_files: &[PathBuf],
 ) -> Result<usize> {
-    ensure_project_imports_fresh(canon_dir, target_files, None, false)
+    ensure_project_imports_fresh_for_check_with_options(canon_dir, target_files, false)
 }
 
 /// Verification rebuilds always use stock Lake. Project build_command wrappers may
@@ -4368,68 +4634,22 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
             "[turbo-lean] non-local edit in {}: re-checking dependents with Lake",
             edits.join(", ")
         );
-        let has_sorry_edit = allow_sorry
-            && edits.iter().any(|e| {
-                let p = dir.join(e);
-                fs::read_to_string(&p)
-                    .map(|s| splitter::audit_hygiene(&splitter::strip_lean_comments(&s)).has_sorry)
-                    .unwrap_or(false)
-            });
-        let (n, rechecked_files, rechecked_mods, _overlay) = if has_sorry_edit {
+        let (n, rechecked_files, rechecked_mods, _overlay) = if allow_sorry {
             lake_recheck_dependents_with_store_and_options(None, &dir, &edits, None, false, true)?
         } else {
             lake_recheck_dependents_with_store(Some(store), &dir, &edits, None, false)?
         };
-        if has_sorry_edit {
-            // Replay only clean modules; purge Lake `.olean` artifacts of any module whose
-            // source contains `sorry` (or transitively imports a sorry-bearing rechecked module)
-            // so `.lake/build` and `.turbo_verified_sources.json` never retain modulo-sorry artifacts.
-            let mut sorry_mod_set: HashSet<String> = HashSet::new();
-            for (rf, rm) in rechecked_files.iter().zip(rechecked_mods.iter()) {
-                let is_sorry = fs::read_to_string(rf)
-                    .map(|s| splitter::audit_hygiene(&splitter::strip_lean_comments(&s)).has_sorry)
-                    .unwrap_or(false);
-                if is_sorry {
-                    sorry_mod_set.insert(rm.clone());
-                }
-            }
+        if allow_sorry {
+            // Replay only clean modules; purge Lake `.olean` / `.ir` / `.c` artifacts and manifest
+            // entries for any module whose source contains `sorry` (or transitively imports a
+            // sorry-bearing module across the full DAG + standalone graph, including non-root `srcDir`).
+            let mut seed_files = rechecked_files.clone();
+            seed_files.push(file.clone());
             for e in &edits {
-                let p = dir.join(e);
-                let is_sorry = fs::read_to_string(&p)
-                    .map(|s| splitter::audit_hygiene(&splitter::strip_lean_comments(&s)).has_sorry)
-                    .unwrap_or(false);
-                if is_sorry {
-                    let mod_guess = e
-                        .strip_suffix(".lean")
-                        .unwrap_or(e)
-                        .replace('\\', "/")
-                        .replace('/', ".");
-                    sorry_mod_set.insert(mod_guess);
-                }
+                seed_files.push(dir.join(e));
             }
-            // Purge `.olean` artifacts of sorry-bearing rechecked modules and strip them from manifest
-            let manifest_path = verified_sources_manifest_path(&dir);
-            let mut manifest_opt: Option<crate::module_builder::VerifiedDepManifest> =
-                fs::read(&manifest_path)
-                    .ok()
-                    .and_then(|b| serde_json::from_slice(&b).ok());
-            for (rf, rm) in rechecked_files.iter().zip(rechecked_mods.iter()) {
-                let rf_imports_sorry = fs::read_to_string(rf)
-                    .map(|s| {
-                        crate::module_builder::parse_header_info(&s)
-                            .imports
-                            .iter()
-                            .any(|imp| sorry_mod_set.contains(imp))
-                    })
-                    .unwrap_or(false);
-                if sorry_mod_set.contains(rm) || rf_imports_sorry {
-                    sorry_mod_set.insert(rm.clone());
-                }
-            }
-            for rm in &sorry_mod_set {
-                let imp_slash = crate::module_builder::module_name_to_rel_slash(rm);
-                remove_module_build_artifacts(&dir, &imp_slash);
-            }
+            let sorry_mod_set =
+                purge_workspace_sorry_artifacts_and_manifest(&dir, &seed_files, &rechecked_mods);
             let mut clean_files = Vec::new();
             let mut clean_mods = Vec::new();
             for (rf, rm) in rechecked_files.iter().zip(rechecked_mods.iter()) {
@@ -4440,23 +4660,6 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
             }
             if !clean_files.is_empty() {
                 ensure_modules_and_imports_replayed(store, &dir, &clean_files, &clean_mods)?;
-            }
-            if let Some(ref mut manifest) = manifest_opt {
-                for rf in &rechecked_files {
-                    let rel = rf
-                        .strip_prefix(&dir)
-                        .unwrap_or(rf)
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    if sorry_mod_set.iter().any(|sm| {
-                        crate::module_builder::module_name_to_rel_slash(sm) + ".lean" == rel
-                    }) {
-                        manifest.modules.remove(&rel);
-                    }
-                }
-                if let Ok(json_bytes) = serde_json::to_vec(manifest) {
-                    let _ = fs::write(&manifest_path, json_bytes);
-                }
             }
         } else {
             ensure_modules_and_imports_replayed(store, &dir, &rechecked_files, &rechecked_mods)?;
@@ -4602,7 +4805,36 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                     ordered_targets.join(", ")
                 );
                 lake_build_modules(&dir, &ordered_targets, None)?;
-                ensure_modules_and_imports_replayed(store, &dir, &closure_files, &closure_mods)?;
+                if allow_sorry {
+                    let sorry_mod_set = purge_workspace_sorry_artifacts_and_manifest(
+                        &dir,
+                        &closure_files,
+                        &closure_mods,
+                    );
+                    let mut clean_files = Vec::new();
+                    let mut clean_mods = Vec::new();
+                    for (rf, rm) in closure_files.iter().zip(closure_mods.iter()) {
+                        if !sorry_mod_set.contains(rm) {
+                            clean_files.push(rf.clone());
+                            clean_mods.push(rm.clone());
+                        }
+                    }
+                    if !clean_files.is_empty() {
+                        ensure_modules_and_imports_replayed(
+                            store,
+                            &dir,
+                            &clean_files,
+                            &clean_mods,
+                        )?;
+                    }
+                } else {
+                    ensure_modules_and_imports_replayed(
+                        store,
+                        &dir,
+                        &closure_files,
+                        &closure_mods,
+                    )?;
+                }
                 let _ = fs::remove_file(verified_sources_manifest_path(&dir));
                 for dp in &cfg.dep_pkgs {
                     let _ = fs::remove_file(
@@ -4613,6 +4845,12 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                 }
             }
         }
+    } else if allow_sorry && !worktree_auto_link_disabled(&dir) {
+        // Even when `nonlocal_edits` is empty (e.g. a sorry-bearing upstream import was
+        // already committed at `HEAD` and refreshed by `ensure_project_imports_fresh_for_check`),
+        // purge any sorry-tainted workspace `.olean` / `.ir` / `.c` artifacts and manifest entries.
+        let _ =
+            purge_workspace_sorry_artifacts_and_manifest(&dir, std::slice::from_ref(&file), &[]);
     }
     Ok(())
 }
@@ -4796,11 +5034,19 @@ fn evaluate_post_rebuild_module_cutoffs(
             (Some(pre_ir), Some(post_ir)) => pre_ir == post_ir,
             _ => false,
         };
-        let cuts_off_meta = (tiers.dep_meta == pre.meta_dig || ir_pair_unchanged) && base_meta_ok;
+        let export_exact = tiers.dep_export == pre.export_dig;
+        let has_opaque_ext = pre.olean_pub_sig.has_opaque_ext || post_pub_sig.has_opaque_ext;
+        let cuts_off_public = export_exact || (!has_opaque_ext && ir_pair_unchanged);
+        if !cuts_off_public {
+            continue;
+        }
+        let cuts_off_meta = (tiers.dep_meta == pre.meta_dig
+            || (!has_opaque_ext && ir_pair_unchanged))
+            && base_meta_ok;
         verdicts.insert(
             m.clone(),
             ModuleCutoffVerdict {
-                cuts_off_public: true,
+                cuts_off_public,
                 cuts_off_meta,
             },
         );
@@ -5362,22 +5608,26 @@ pub(crate) fn lake_recheck_dependents_with_store_and_options(
                     store_root_buf.as_deref()
                 }
             };
-            let cutoff_attempted = if let (Some(sr), Some(dag)) = (store_root, closure.dag.as_ref())
-            {
-                let stage1_targets = lake_refresh_targets(canon_dir, &closure.edited_dag_modules);
-                let stage1_only_modules = !closure.edited_dag_modules.is_empty()
-                    && closure.deleted_modules.is_empty()
-                    && stage1_targets == closure.edited_dag_modules;
-                if stage1_only_modules {
-                    capture_pre_rebuild_module_baselines(
-                        sr,
-                        &closure.cfg,
-                        dag,
-                        &closure.edited_dag_modules,
-                        rev,
-                        false,
-                    )
-                    .map(|baselines| (sr, dag, baselines))
+            let cutoff_attempted = if !allow_sorry {
+                if let (Some(sr), Some(dag)) = (store_root, closure.dag.as_ref()) {
+                    let stage1_targets =
+                        lake_refresh_targets(canon_dir, &closure.edited_dag_modules);
+                    let stage1_only_modules = !closure.edited_dag_modules.is_empty()
+                        && closure.deleted_modules.is_empty()
+                        && stage1_targets == closure.edited_dag_modules;
+                    if stage1_only_modules {
+                        capture_pre_rebuild_module_baselines(
+                            sr,
+                            &closure.cfg,
+                            dag,
+                            &closure.edited_dag_modules,
+                            rev,
+                            false,
+                        )
+                        .map(|baselines| (sr, dag, baselines))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -5444,23 +5694,25 @@ pub(crate) fn lake_recheck_dependents_with_store_and_options(
                         )?;
                     }
                 }
-                if let Some(s) = store_opt {
-                    stamp_manifest_after_lake_cutoff_rebuild(
-                        s,
+                if !allow_sorry {
+                    if let Some(s) = store_opt {
+                        stamp_manifest_after_lake_cutoff_rebuild(
+                            s,
+                            canon_dir,
+                            &closure.cfg,
+                            dag,
+                            &rechecked_mods,
+                        )?;
+                    }
+                    refresh_cutoff_shielded_manifest_and_traces(
                         canon_dir,
                         &closure.cfg,
                         dag,
                         &rechecked_mods,
-                    )?;
+                        &verdicts,
+                        pre_manifest.as_ref(),
+                    );
                 }
-                refresh_cutoff_shielded_manifest_and_traces(
-                    canon_dir,
-                    &closure.cfg,
-                    dag,
-                    &rechecked_mods,
-                    &verdicts,
-                    pre_manifest.as_ref(),
-                );
                 if let Some(ref tmp_p) = store_root_buf {
                     let _ = fs::remove_dir_all(tmp_p);
                 }
@@ -5468,14 +5720,16 @@ pub(crate) fn lake_recheck_dependents_with_store_and_options(
                 (rechecked_mods.len(), rechecked_files, rechecked_mods)
             } else {
                 lake_build_modules(canon_dir, &lake_refresh_targets(canon_dir, &mods), rev)?;
-                if let (Some(s), Some(dag)) = (store_opt, closure.dag.as_ref()) {
-                    let _ = stamp_manifest_after_lake_cutoff_rebuild(
-                        s,
-                        canon_dir,
-                        &closure.cfg,
-                        dag,
-                        &mods,
-                    );
+                if !allow_sorry {
+                    if let (Some(s), Some(dag)) = (store_opt, closure.dag.as_ref()) {
+                        let _ = stamp_manifest_after_lake_cutoff_rebuild(
+                            s,
+                            canon_dir,
+                            &closure.cfg,
+                            dag,
+                            &mods,
+                        );
+                    }
                 }
                 if let Some(ref tmp_p) = store_root_buf {
                     let _ = fs::remove_dir_all(tmp_p);
@@ -9303,18 +9557,18 @@ public theorem downstream_c (n : Nat) : n + 0 = n := downstream_b n
         )?;
         let canon_proj = proj.canonicalize().unwrap_or_else(|_| proj.clone());
 
-        // 2. Private-only module edit (new private helper + changed unexposed public body):
-        //    - `impact` classifies `private_module_edit`, `public_signature_changed == false`, prunes `Smoke.B` & `Smoke.C`.
-        //    - `lake_recheck_dependents_with_store` rebuilds ONLY `Smoke.A` (1 module, NOT 3!).
-        let a_priv_edit = "\
+        // 2. Private theorem + proof-only edit on `pub_thm` (preserving exported axiom footprint `[]`):
+        //    - `.ir` and `.ir.sig` remain byte-identical and `dumpPublicSignatureJson` matches -> cuts off at `Smoke.A` (1 module, NOT 3!).
+        let a_proof_only_edit = "\
 module
-private def privHelper (n : Nat) : Nat := (n + 1) + 0
-private def privExtra (n : Nat) : Nat := n * 2
-@[noinline] public def pubApi (n : Nat) : Nat := privHelper (n + 0)
+private def privHelper (n : Nat) : Nat := n + 1
+private theorem priv_extra_lemma : 1 + 1 = 2 := rfl
+@[noinline] public def pubApi (n : Nat) : Nat := privHelper n
 public theorem pub_thm (n : Nat) : n + 0 = n := by
-  omega
+  have _unused : 1 + 1 = 2 := rfl
+  exact Nat.add_zero n
 ";
-        fs::write(proj.join("Smoke/A.lean"), a_priv_edit)?;
+        fs::write(proj.join("Smoke/A.lean"), a_proof_only_edit)?;
         let rep_priv = compute_impact_report(
             proj.join("Smoke/A.lean"),
             Some(proj.clone()),
@@ -9338,10 +9592,67 @@ public theorem pub_thm (n : Nat) : n + 0 = n := by
         )?;
         assert_eq!(
             rechecked_n, 1,
-            "public-signature early cutoff must stop at Smoke.A on private module edit, got {:?}",
+            "public-signature early cutoff must stop at Smoke.A on theorem proof / private theorem edit, got {:?}",
             rechecked_mods
         );
         assert_eq!(rechecked_mods, vec!["Smoke.A".to_string()]);
+
+        // 2a. Blocking 2 regression: proof-only edit that introduces `propext`/`Quot.sound` via `omega`
+        //     mutates `exportedAxiomsExt` in `Smoke/A.olean`, so Stage-2 cutoff MUST recheck `Smoke.B`/`Smoke.C`!
+        let a_axiom_footprint_edit = "\
+module
+private def privHelper (n : Nat) : Nat := n + 1
+@[noinline] public def pubApi (n : Nat) : Nat := privHelper n
+public theorem pub_thm (n : Nat) : n + 0 = n := by
+  omega
+";
+        fs::write(proj.join("Smoke/A.lean"), a_axiom_footprint_edit)?;
+        let (rechecked_ax_n, _ax_files, mut rechecked_ax_mods, _) =
+            lake_recheck_dependents_with_store(
+                Some(&store),
+                &canon_proj,
+                &["Smoke/A.lean".to_string()],
+                Some("HEAD"),
+                false,
+            )?;
+        rechecked_ax_mods.sort();
+        assert_eq!(
+            rechecked_ax_n, 3,
+            "proof edit changing exportedAxiomsExt footprint (`[]` -> `[propext, Quot.sound]`) must not cut off downstream modules"
+        );
+
+        // 2b. Blocking 1 regression: mutating a `private def` body alters `Smoke/A.ir` (which Lean 4.35
+        //     `PublicExport` passes via `importArts`), so Stage-2 cutoff MUST NOT skip `Smoke.B`/`Smoke.C`
+        //     and must recheck all 3 modules so downstream `.trace` input hashes stay synchronized!
+        let a_ir_mutating_edit = "\
+module
+private def privHelper (n : Nat) : Nat := n + 42
+@[noinline] public def pubApi (n : Nat) : Nat := privHelper n
+public theorem pub_thm (n : Nat) : n + 0 = n := by
+  exact Nat.add_zero n
+";
+        fs::write(proj.join("Smoke/A.lean"), a_ir_mutating_edit)?;
+        let (rechecked_ir_n, _ir_files, mut rechecked_ir_mods, _) =
+            lake_recheck_dependents_with_store(
+                Some(&store),
+                &canon_proj,
+                &["Smoke/A.lean".to_string()],
+                Some("HEAD"),
+                false,
+            )?;
+        rechecked_ir_mods.sort();
+        assert_eq!(
+            rechecked_ir_n, 3,
+            "`.ir`-mutating private def edit must not unsoundly cut off downstream modules in Lean 4.35 PublicExport"
+        );
+        assert_eq!(
+            rechecked_ir_mods,
+            vec![
+                "Smoke.A".to_string(),
+                "Smoke.B".to_string(),
+                "Smoke.C".to_string()
+            ]
+        );
 
         // 3. Public theorem type / attribute edit (`@[simp]` added on `pub_thm`):
         //    - `impact` classifies `public_signature_edit`, `public_signature_changed == true`, lists full downstream cone `Smoke.B` & `Smoke.C`.
@@ -9378,6 +9689,93 @@ public theorem pub_thm (n : Nat) : n + 0 = n := by
                 "Smoke.B".to_string(),
                 "Smoke.C".to_string()
             ]
+        );
+
+        // 4. Blocking 2 regressions on `dumpPublicSignatureJson` (`olean-pubsig:v2`):
+        //    (a) Instance priority change (`@[instance 100]` vs `@[instance 200]`) MUST alter `public_sig_digest`.
+        //    (b) Non-whitelisted persistent extension (`register_simp_attr` custom ext) MUST set `has_opaque_ext = true`
+        //        so Stage-2 cutoff fails closed instead of trusting partial metadata projection!
+        let inst_v1 = "\
+module
+public class MyTag (α : Type) where
+  tag : Nat
+public def mkTag100 : MyTag Nat := { tag := 1 }
+attribute [instance 100] mkTag100
+";
+        let inst_v2 = "\
+module
+public class MyTag (α : Type) where
+  tag : Nat
+public def mkTag100 : MyTag Nat := { tag := 1 }
+attribute [instance 200] mkTag100
+";
+        fs::write(proj.join("Smoke/A.lean"), inst_v1)?;
+        lake_build_modules(&canon_proj, &["Smoke.A".to_string()], None)?;
+        let cfg = crate::module_builder::resolve_project_config(&canon_proj)?;
+        let replay_lp = format!(
+            "{}:{}",
+            resolve_remote_lean_path(&canon_proj, None),
+            cfg.toolchain_lib_lean.display()
+        );
+        let sig_inst_100 = crate::zygote::read_module_public_signature_with_zygote(
+            &store.root,
+            &cfg,
+            "Smoke.A",
+            &replay_lp,
+            &[],
+            false,
+        )?;
+        assert!(!sig_inst_100.has_opaque_ext);
+        assert!(!sig_inst_100.instance_entries.is_empty());
+
+        fs::write(proj.join("Smoke/A.lean"), inst_v2)?;
+        lake_build_modules(&canon_proj, &["Smoke.A".to_string()], None)?;
+        let sig_inst_200 = crate::zygote::read_module_public_signature_with_zygote(
+            &store.root,
+            &cfg,
+            "Smoke.A",
+            &replay_lp,
+            &[],
+            false,
+        )?;
+        assert_ne!(
+            sig_inst_100.public_sig_digest, sig_inst_200.public_sig_digest,
+            "instance priority change in Meta.instanceExtension must alter olean public_sig_digest"
+        );
+
+        let opaque_ext_src = "\
+module
+public meta import Lean
+public meta initialize myOpaqueExt : Lean.SimplePersistentEnvExtension Lean.Name (Array Lean.Name) ←
+  Lean.registerSimplePersistentEnvExtension {
+    addImportedFn := fun _ => #[]
+    addEntryFn := Array.push
+  }
+";
+        let opaque_user_src = "\
+module
+public meta import Smoke.A
+run_cmd Lean.Elab.Command.liftCoreM <| Lean.modifyEnv (fun env => myOpaqueExt.addEntry env `hello)
+public theorem trivial_ok : 1 + 1 = 2 := rfl
+";
+        fs::write(proj.join("Smoke/A.lean"), opaque_ext_src)?;
+        fs::write(proj.join("Smoke/B.lean"), opaque_user_src)?;
+        lake_build_modules(
+            &canon_proj,
+            &["Smoke.A".to_string(), "Smoke.B".to_string()],
+            None,
+        )?;
+        let sig_opaque = crate::zygote::read_module_public_signature_with_zygote(
+            &store.root,
+            &cfg,
+            "Smoke.B",
+            &replay_lp,
+            &[],
+            false,
+        )?;
+        assert!(
+            sig_opaque.has_opaque_ext,
+            "unrecognized persistent environment extension entry must trip `has_opaque_ext = true` fail-closed guard"
         );
 
         let _ = fs::remove_dir_all(&tmp_dir);

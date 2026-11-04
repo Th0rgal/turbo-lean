@@ -6512,6 +6512,99 @@ fn update_pub_scope_stack(stack: &mut Vec<PubScopeFrame>, orig_chunk: &str) {
     }
 }
 
+fn split_at_top_level_where(cmd: &str) -> Option<(&str, &str)> {
+    let bytes = cmd.as_bytes();
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut strict_brace = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(cmd, i) {
+            i = span.end;
+            continue;
+        }
+        if bytes[i..].starts_with("⦃".as_bytes()) {
+            strict_brace += 1;
+            i += "⦃".len();
+            continue;
+        }
+        if bytes[i..].starts_with("⦄".as_bytes()) {
+            strict_brace = (strict_brace - 1).max(0);
+            i += "⦄".len();
+            continue;
+        }
+        if paren == 0
+            && bracket == 0
+            && brace == 0
+            && strict_brace == 0
+            && i + 5 <= bytes.len()
+            && &bytes[i..i + 5] == b"where"
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            && (i + 5 == bytes.len() || bytes[i + 5].is_ascii_whitespace())
+        {
+            return Some((&cmd[..i], &cmd[i + 5..]));
+        }
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn decl_header_has_explicit_type_annotation(sig_part: &str) -> bool {
+    let bytes = sig_part.as_bytes();
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut strict_brace = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(sig_part, i) {
+            i = span.end;
+            continue;
+        }
+        if bytes[i..].starts_with("⦃".as_bytes()) {
+            strict_brace += 1;
+            i += "⦃".len();
+            continue;
+        }
+        if bytes[i..].starts_with("⦄".as_bytes()) {
+            strict_brace = (strict_brace - 1).max(0);
+            i += "⦄".len();
+            continue;
+        }
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            b':' if paren == 0 && bracket == 0 && brace == 0 && strict_brace == 0 => {
+                let prev = if i > 0 { Some(bytes[i - 1]) } else { None };
+                let next = bytes.get(i + 1).copied();
+                let is_op = matches!(prev, Some(b':' | b'=' | b'<' | b'>' | b'!'))
+                    || matches!(next, Some(b':' | b'=' | b'>'));
+                if !is_op {
+                    let after_colon = sig_part[i + 1..].trim();
+                    return !after_colon.is_empty();
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 fn pub_qualified_name(name: &str, stack: &[PubScopeFrame]) -> String {
     if let Some(root_name) = name.strip_prefix("_root_.") {
         return canonicalize_lean_name(root_name);
@@ -6685,12 +6778,14 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                         (stripped_decl, Some(stripped_decl))
                     } else if let Some((sig, body)) = split_at_top_level_assign(stripped_decl) {
                         (sig, Some(body))
+                    } else if let Some((sig, body)) = split_at_top_level_where(stripped_decl) {
+                        (sig, Some(body))
                     } else {
                         (stripped_decl, None)
                     };
 
                 let mut sig_h = blake3::Hasher::new();
-                sig_h.update(b"decl-sig:v1\n");
+                sig_h.update(b"decl-sig:v2\n");
                 for v in active_vars {
                     sig_h.update(b"ctx:");
                     sig_h.update(v.as_bytes());
@@ -6712,9 +6807,15 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                 let sig_hash = sig_h.finalize().to_hex().to_string();
 
                 let is_thm_like = matches!(kw, "theorem" | "lemma");
-                let body_exposed = if is_thm_like {
-                    // Proof irrelevance: theorem proof bodies never affect downstream typing unless `@[expose]` is present in `module` mode (which still elaborates to Prop).
+                let has_explicit_type = matches!(
+                    kw,
+                    "structure" | "class" | "inductive" | "coinductive" | "axiom" | "constant"
+                ) || decl_header_has_explicit_type_annotation(sig_part);
+                let body_exposed = if is_thm_like && has_explicit_type {
+                    // Proof irrelevance: theorem proof bodies never affect downstream typing when an explicit Prop statement is given.
                     false
+                } else if !has_explicit_type {
+                    true
                 } else if is_module {
                     is_meta_mod
                         || has_expose_attr
@@ -6741,7 +6842,9 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                 };
 
                 let exposed_body_hash = if body_exposed {
-                    body_part_opt.map(hash_normalized_whitespace_hex)
+                    Some(hash_normalized_whitespace_hex(
+                        body_part_opt.unwrap_or(stripped_decl),
+                    ))
                 } else {
                     None
                 };
@@ -6888,7 +6991,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
     };
 
     let public_signature_digest = hash_sig_list(
-        b"turbo-lean-pubsig:v1\n",
+        b"turbo-lean-pubsig:v2\n",
         is_module,
         &exported_imports,
         &declarations,
@@ -6899,7 +7002,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
     let mut combined_decls = declarations.clone();
     combined_decls.extend(meta_declarations);
     let meta_signature_digest = hash_sig_list(
-        b"turbo-lean-metasig:v1\n",
+        b"turbo-lean-metasig:v2\n",
         is_module,
         &combined_imps,
         &combined_decls,
@@ -8659,6 +8762,57 @@ public theorem pub_thm (n : Nat) : n + 0 = n := by
             audit_hygiene("axiom my_bad_ax : False\ntheorem t : False := by sorry\n");
         assert!(!sorry_and_axiom.is_clean_modulo_sorry());
         assert!(!sorry_and_axiom.disallowed_items_modulo_sorry().is_empty());
+
+        // Blocking 4 regressions:
+        // 1. Inferred-type `public def` (`:=` body, equation arms, and `where` clause) MUST mark
+        //    `body_exposed = true` and alter `public_signature_digest` whenever the body changes.
+        let inferred_assign_v1 = "module\npublic def f (x : Nat) := x + 1\n";
+        let inferred_assign_v2 = "module\npublic def f (x : Nat) := true\n";
+        let ia1 = extract_public_signature(inferred_assign_v1);
+        let ia2 = extract_public_signature(inferred_assign_v2);
+        assert!(ia1.declarations[0].exposed_body_hash.is_some());
+        assert_ne!(
+            ia1.public_signature_digest, ia2.public_signature_digest,
+            "inferred-type `public def` must change public_signature_digest when body changes"
+        );
+
+        let inferred_eqns_v1 = "module\npublic def g\n  | 0 => 1\n  | n + 1 => g n\n";
+        let inferred_eqns_v2 = "module\npublic def g\n  | 0 => true\n  | n + 1 => g n\n";
+        let ie1 = extract_public_signature(inferred_eqns_v1);
+        let ie2 = extract_public_signature(inferred_eqns_v2);
+        assert!(ie1.declarations[0].exposed_body_hash.is_some());
+        assert_ne!(ie1.public_signature_digest, ie2.public_signature_digest);
+
+        let inferred_where_v1 = "module\npublic def hw (n : Nat) where\n  val := n + 1\n";
+        let inferred_where_v2 = "module\npublic def hw (n : Nat) where\n  val := n + 2\n";
+        let iw1 = extract_public_signature(inferred_where_v1);
+        let iw2 = extract_public_signature(inferred_where_v2);
+        assert!(iw1.declarations[0].exposed_body_hash.is_some());
+        assert_ne!(iw1.public_signature_digest, iw2.public_signature_digest);
+
+        // 2. Explicit-type `public def` with `where` helper or binders/strings/comments containing `:`
+        //    must keep `exposed_body_hash.is_none()` when an outer `: RetType` annotation IS present,
+        //    while colons inside strings/comments/`::`/`:=` without outer `: RetType` expose the body.
+        let explicit_where_v1 =
+            "module\npublic def ew (n : Nat) : Nat := helper n where\n  helper (k : Nat) : Nat := k + 1\n";
+        let explicit_where_v2 =
+            "module\npublic def ew (n : Nat) : Nat := helper n where\n  helper (k : Nat) : Nat := k + 2\n";
+        let ew1 = extract_public_signature(explicit_where_v1);
+        let ew2 = extract_public_signature(explicit_where_v2);
+        assert!(ew1.declarations[0].exposed_body_hash.is_none());
+        assert_eq!(ew1.public_signature_digest, ew2.public_signature_digest);
+
+        let tricky_colon_inferred_v1 =
+            "module\npublic def tc (s := \"a : b\") /- : Nat -/ := s.length + 1\n";
+        let tricky_colon_inferred_v2 =
+            "module\npublic def tc (s := \"a : b\") /- : Nat -/ := s.length + 2\n";
+        let tc1 = extract_public_signature(tricky_colon_inferred_v1);
+        let tc2 = extract_public_signature(tricky_colon_inferred_v2);
+        assert!(
+            tc1.declarations[0].exposed_body_hash.is_some(),
+            "colons inside string literals or block comments must not masquerade as an explicit return type"
+        );
+        assert_ne!(tc1.public_signature_digest, tc2.public_signature_digest);
     }
 }
 

@@ -7599,7 +7599,7 @@ pub(crate) struct VerifiedDepModuleEntry {
     /// Artifact-set digests of the direct imports this `.olean` was elaborated against.
     /// Deliberately not `#[serde(default)]`: legacy entries without it fail closed.
     pub import_olean_digests: BTreeMap<String, String>,
-    /// Export-tier (`.olean` + `.ir.sig`) digests of direct `module` imports when recorded.
+    /// Export-tier (`.olean` + `.ir` + `.ir.sig`) digests of direct `module` imports when recorded.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub import_export_digests: BTreeMap<String, String>,
     /// Meta-tier (`.olean` + `.ir` + `.ir.sig`) digests of direct `module` imports when recorded.
@@ -11936,8 +11936,14 @@ fn olean_artifact_paths(olean_path: &Path) -> [(&'static str, PathBuf); 6] {
     ]
 }
 
-fn dep_export_olean_artifact_paths(olean_path: &Path) -> [(&'static str, PathBuf); 1] {
-    [("olean", olean_path.to_path_buf())]
+fn dep_export_olean_artifact_paths(olean_path: &Path) -> [(&'static str, PathBuf); 3] {
+    let ir_path = olean_path.with_extension("ir");
+    let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
+    [
+        ("olean", olean_path.to_path_buf()),
+        ("ir", ir_path),
+        ("ir_sig", ir_sig_path),
+    ]
 }
 
 fn dep_meta_olean_artifact_paths(olean_path: &Path) -> [(&'static str, PathBuf); 3] {
@@ -12003,7 +12009,7 @@ pub(crate) fn compute_dep_export_olean_digest_with_policy(
         None
     };
     read_tagged_olean_artifact_digest(
-        b"olean-export-v1\n",
+        b"olean-export-v2\n",
         &dep_export_olean_artifact_paths(olean_path),
         _flock_guard.as_ref(),
         |p| Ok(fs::read(p)?),
@@ -12104,7 +12110,7 @@ fn compute_module_artifact_tier_digests_locked(
         };
         Ok(ModuleArtifactTierDigests {
             full: fold_subset(b"olean-art-v2\n", &[0, 1, 2, 3, 4, 5]),
-            dep_export: fold_subset(b"olean-export-v1\n", &[0]),
+            dep_export: fold_subset(b"olean-export-v2\n", &[0, 4, 5]),
             dep_meta: fold_subset(b"olean-meta-v1\n", &[0, 4, 5]),
         })
     };
@@ -12872,7 +12878,7 @@ pub fn compute_module_cas_key_with_dynlibs(
         );
     }
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean-module-cas-v5\n");
+    h.update(b"turbo-lean-module-cas-v6\n");
     update_lp(&mut h, b"toolchain", cfg.toolchain.as_bytes());
     update_lp(&mut h, b"githash", cfg.lean_githash.as_bytes());
     update_lp(
@@ -19698,8 +19704,12 @@ fn compute_cas_outputs_artifact_and_replay_digests(
         ],
     )?;
     let dep_export = fold_tier(
-        b"olean-export-v1\n",
-        &[("olean", Some(olean_hex)), ("ir_sig", ir_sig_hex)],
+        b"olean-export-v2\n",
+        &[
+            ("olean", Some(olean_hex)),
+            ("ir", ir_hex),
+            ("ir_sig", ir_sig_hex),
+        ],
     )?;
     let dep_meta = fold_tier(
         b"olean-meta-v1\n",
@@ -31610,15 +31620,15 @@ globs = ["Down.+"]
         )?;
         fs::write(
             proj_dir.join("App/A.lean"),
-            "module\nprivate def secretHelper : Nat := 1\n@[noinline] public def pubFn (x : Nat) : Nat := secretHelper + x\n@[inline] public def inlineFn (x : Nat) : Nat := x + 10\n",
+            "module\nprivate def secretHelper : Nat := 1\nprivate theorem secretThm (x : Nat) : x + 0 = x := Nat.add_zero x\n@[noinline] public def pubFn (x : Nat) : Nat := secretHelper + x\npublic def polyFn (f : Nat → Nat) (x : Nat) : Nat := f x + 1\n@[inline] public def inlineFn (x : Nat) : Nat := x + 10\n",
         )?;
         fs::write(
             proj_dir.join("App/B.lean"),
-            "module\npublic import App.A\npublic def useA : Nat := pubFn 5 + inlineFn 2\n",
+            "module\npublic import App.A\npublic def useA : Nat := pubFn 5 + inlineFn 2 + polyFn (fun z => z + 3) 4\n",
         )?;
         fs::write(
             proj_dir.join("App/AllConsumer.lean"),
-            "module\nimport all App.A\npublic def peekSecret : Nat := secretHelper\n",
+            "module\nimport all App.A\npublic def peekSecret : Nat := secretHelper\npublic theorem useSecretThm (x : Nat) : x + 0 = x := secretThm x\n",
         )?;
         fs::write(
             proj_dir.join("App/MetaConsumer.lean"),
@@ -31643,24 +31653,27 @@ globs = ["Down.+"]
         let meta1 = compute_dep_meta_olean_digest(&a_olean)?;
         let full1 = compute_olean_artifact_set_digest(&a_olean)?;
 
-        // 1. Edit private def in App/A.lean (and non-inline public def body via secretHelper):
-        //    A.olean + A.ir.sig stay byte-identical -> App.B hits Module CAS without recompiling!
-        //    Meanwhile A.ir & A.olean.private mutate -> MetaConsumer and AllConsumer recompile.
+        // 1. Edit private theorem/proof in App/A.lean:
+        //    A.olean + A.ir + A.ir.sig stay byte-identical -> App.B and App.MetaConsumer hit Module CAS!
+        //    Meanwhile A.olean.private & A.ilean mutate -> AllConsumer (`import all`) recompiles.
         fs::write(
             proj_dir.join("App/A.lean"),
-            "module\nprivate def secretHelper : Nat := 999\n@[noinline] public def pubFn (x : Nat) : Nat := secretHelper + x\n@[inline] public def inlineFn (x : Nat) : Nat := x + 10\n",
+            "module\nprivate def secretHelper : Nat := 1\nprivate theorem secretThm (x : Nat) : x + 0 = x := by exact Nat.add_zero x\nprivate theorem extraSecretThm : True := trivial\n@[noinline] public def pubFn (x : Nat) : Nat := secretHelper + x\npublic def polyFn (f : Nat → Nat) (x : Nat) : Nat := f x + 1\n@[inline] public def inlineFn (x : Nat) : Nat := x + 10\n",
         )?;
-        // Wipe B's on-disk artifacts to prove B is satisfied purely from Module CAS (not warm on-disk).
-        for ext in [
-            "olean",
-            "olean.server",
-            "olean.private",
-            "ilean",
-            "ir",
-            "ir.sig",
-            "trace",
-        ] {
-            let _ = fs::remove_file(proj_dir.join(format!(".lake/build/lib/lean/App/B.{ext}")));
+        // Wipe B's and MetaConsumer's on-disk artifacts to prove they are satisfied purely from Module CAS.
+        for mod_rel in ["App/B", "App/MetaConsumer"] {
+            for ext in [
+                "olean",
+                "olean.server",
+                "olean.private",
+                "ilean",
+                "ir",
+                "ir.sig",
+                "trace",
+            ] {
+                let _ =
+                    fs::remove_file(proj_dir.join(format!(".lake/build/lib/lean/{mod_rel}.{ext}")));
+            }
         }
         let rep2 = build_project_modules_native(
             &mut store,
@@ -31677,33 +31690,66 @@ globs = ["Down.+"]
         let full2 = compute_olean_artifact_set_digest(&a_olean)?;
         assert_eq!(
             export1, export2,
-            "private edit in `module` must keep dep_export_olean_digest identical"
+            "private theorem edit in `module` must keep dep_export_olean_digest identical"
+        );
+        assert_eq!(
+            meta1, meta2,
+            "private theorem edit in `module` must keep dep_meta_olean_digest identical"
         );
         assert_ne!(
             full1, full2,
-            "private edit must change full 6-artifact digest"
-        );
-        assert_ne!(
-            meta1, meta2,
-            "private body edit affecting IR must change dep_meta_olean_digest"
+            "private theorem edit must change full 6-artifact digest"
         );
         assert!(
             rep2.cached_modules.contains(&"App.B".to_string())
-                && !rep2.compiled_modules.contains(&"App.B".to_string()),
-            "App.B (`public import App.A`) must hit Module CAS after private edit in App.A: {rep2:?}"
+                && !rep2.compiled_modules.contains(&"App.B".to_string())
+                && rep2.cached_modules.contains(&"App.MetaConsumer".to_string())
+                && !rep2.compiled_modules.contains(&"App.MetaConsumer".to_string()),
+            "App.B (`public import App.A`) and App.MetaConsumer (`meta import App.A`) must hit Module CAS after private theorem edit in App.A: {rep2:?}"
         );
         assert!(
             rep2.compiled_modules.contains(&"App.A".to_string())
-                && rep2.compiled_modules.contains(&"App.AllConsumer".to_string())
-                && rep2.compiled_modules.contains(&"App.MetaConsumer".to_string()),
-            "App.A, App.AllConsumer (`import all`), and App.MetaConsumer (`meta import`) must recompile: {rep2:?}"
+                && rep2
+                    .compiled_modules
+                    .contains(&"App.AllConsumer".to_string()),
+            "App.A and App.AllConsumer (`import all`) must recompile: {rep2:?}"
         );
 
-        // 2. Edit `@[inline] public def inlineFn` body in App/A.lean:
+        // 2. Edit higher-order `public def polyFn` body in App/A.lean:
+        //    A.olean and A.ir.sig stay byte-identical, while A.ir mutates (specializable IR exported in `.ir`)
+        //    -> `dep_export_olean_digest` MUST change and App.B MUST miss CAS and recompile its C codegen!
+        fs::write(
+            proj_dir.join("App/A.lean"),
+            "module\nprivate def secretHelper : Nat := 1\nprivate theorem secretThm (x : Nat) : x + 0 = x := by exact Nat.add_zero x\nprivate theorem extraSecretThm : True := trivial\n@[noinline] public def pubFn (x : Nat) : Nat := secretHelper + x\npublic def polyFn (f : Nat → Nat) (x : Nat) : Nat := f x + 999\n@[inline] public def inlineFn (x : Nat) : Nat := x + 10\n",
+        )?;
+        let rep2_ir = build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted",
+            0,
+            false,
+            true,
+            None,
+        )?;
+        let export2_ir = compute_dep_export_olean_digest(&a_olean)?;
+        assert_ne!(
+            export2, export2_ir,
+            "higher-order `public def` body edit mutating `.ir` must change dep_export_olean_digest"
+        );
+        assert!(
+            rep2_ir.compiled_modules.contains(&"App.B".to_string())
+                && rep2_ir
+                    .compiled_modules
+                    .contains(&"App.MetaConsumer".to_string()),
+            "App.B and App.MetaConsumer must recompile when App.A `.ir` changes: {rep2_ir:?}"
+        );
+
+        // 3. Edit `@[inline] public def inlineFn` body in App/A.lean:
         //    A.olean changes -> App.B MUST miss CAS and recompile!
         fs::write(
             proj_dir.join("App/A.lean"),
-            "module\nprivate def secretHelper : Nat := 999\n@[noinline] public def pubFn (x : Nat) : Nat := secretHelper + x\n@[inline] public def inlineFn (x : Nat) : Nat := x + 42\n",
+            "module\nprivate def secretHelper : Nat := 1\nprivate theorem secretThm (x : Nat) : x + 0 = x := by exact Nat.add_zero x\nprivate theorem extraSecretThm : True := trivial\n@[noinline] public def pubFn (x : Nat) : Nat := secretHelper + x\npublic def polyFn (f : Nat → Nat) (x : Nat) : Nat := f x + 999\n@[inline] public def inlineFn (x : Nat) : Nat := x + 42\n",
         )?;
         let rep3 = build_project_modules_native(
             &mut store,
@@ -31717,7 +31763,7 @@ globs = ["Down.+"]
         )?;
         let export3 = compute_dep_export_olean_digest(&a_olean)?;
         assert_ne!(
-            export2, export3,
+            export2_ir, export3,
             "`@[inline] public def` body edit must change dep_export_olean_digest"
         );
         assert!(

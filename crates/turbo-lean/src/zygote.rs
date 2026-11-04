@@ -3907,6 +3907,8 @@ pub struct OleanPublicSignatureReply {
     pub ok: bool,
     pub module: String,
     pub is_module: bool,
+    #[serde(default)]
+    pub has_opaque_ext: bool,
     pub public_sig_digest: String,
     #[serde(default)]
     pub exported_imports: Vec<String>,
@@ -3914,6 +3916,8 @@ pub struct OleanPublicSignatureReply {
     pub simp_entries: Vec<String>,
     #[serde(default)]
     pub csimp_entries: Vec<String>,
+    #[serde(default)]
+    pub instance_entries: Vec<String>,
     #[serde(default)]
     pub decls: Vec<OleanPublicDeclSig>,
 }
