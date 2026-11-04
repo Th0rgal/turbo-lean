@@ -8,6 +8,7 @@ import LeanNative.Transform.OwnershipRC
 import LeanNative.Transform.AlgebraicOpt
 import LeanNative.Transform.UnboxTupleSROA
 import LeanNative.Transform.HoistExclusivity
+import LeanNative.Transform.AsyncStateMachine
 
 namespace LeanNative.Transform
 
@@ -278,7 +279,7 @@ def verifiedLoopVectorizeTVContract : VerifiedTVPassContract where
 /-- Kernel-verified pass pipeline (`Contract V2` / `P3` baseline): every pass is a `VerifiedCodePassContract`
     backed by an unconditional Lean 4 kernel theorem `∀ c, CodeRefines c (runCode c)`. -/
 def verifiedKernelPasses : List TransformPass :=
-  [eqSatPass, loopSchedulePass, ownershipRCPass]
+  [eqSatPass, loopSchedulePass, ownershipRCPass, asyncStateMachinePass]
 
 /-- Extended TV-validated pass pipeline (`UnboxTupleSROA`, `HoistExclusivity`, `LoopVectorizeOpt`,
     and extended `AlgebraicOpt` rules gated by `SymbolicTV.validateTranslationDecl`). -/

@@ -94,11 +94,17 @@ def verifiedTheoremRegistry : List String :=
     "checkedSubSlice_valid", "checkedSubSlice_oob_rejects", "subSliceBounds_no_oob",
     "lowerSliceGet_sound", "lowerSliceRawLoad_sound", "sliceFoldStep_sound",
     "sliceFoldLoop_sound", "lowerSliceFold_sound",
-    "lowerRealLCNFCode_sound", "lowerRealLCNFDecl_sound"
+    "lowerRealLCNFCode_sound", "lowerRealLCNFDecl_sound",
+    "lowerAsyncPollStep_ready_sound", "lowerAsyncPollStep_sound",
+    "lowerAsyncPollStep_arm1_sound", "lowerAsyncPollStep_spec_sound",
+    "lowerAsyncEventLoop_sound", "lowerAsyncEventLoop_threeStep_sound",
+    "lowerAsyncAwaitChain_sound", "asyncStateMachinePass_sound",
+    "checkNonEscapingAsync_rejects_closure", "asyncStateMachine_zeroAlloc_nonvacuous"
   ]
   let xform := [
     "optimizeEqSatCode_sound", "applyLoopScheduleAux_refines",
-    "scheduleStructuredLoop_sound", "elideAndMutateRC_sound"
+    "scheduleStructuredLoop_sound", "elideAndMutateRC_sound",
+    "evalSeqLoop_async_refines", "optimizeAsyncStateMachine_refines"
   ]
   let sem := [
     "ScalarExprEquiv.refl", "ScalarExprEquiv.symm", "ScalarExprEquiv.trans",
