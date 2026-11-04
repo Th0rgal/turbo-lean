@@ -1105,6 +1105,7 @@ pub fn run_check_command_value(
         db_warm_on_open,
         false,
         false,
+        false,
         file,
         decl,
         project_dir,
@@ -1125,6 +1126,7 @@ pub fn evaluate_check_command_value(
     run_check_command_inner(
         store,
         true,
+        false,
         false,
         false,
         file,
@@ -1723,7 +1725,7 @@ pub fn try_stateless_remote_single_decl_check(
 }
 
 /// Execute `turbo-lean check` on a directory, a single file, or a specific `--decl` theorem.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub fn run_check_command(
     store: &mut TurboStore,
     db_warm_on_open: bool,
@@ -1735,6 +1737,33 @@ pub fn run_check_command(
     parallel_shards: bool,
     remote_http: Option<String>,
 ) -> Result<()> {
+    run_check_command_with_opts(
+        store,
+        db_warm_on_open,
+        json_output,
+        file,
+        decl,
+        project_dir,
+        jobs,
+        parallel_shards,
+        remote_http,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_check_command_with_opts(
+    store: &mut TurboStore,
+    db_warm_on_open: bool,
+    json_output: bool,
+    file: PathBuf,
+    decl: Option<String>,
+    project_dir: PathBuf,
+    jobs: Option<usize>,
+    parallel_shards: bool,
+    remote_http: Option<String>,
+    emit_olean: bool,
+) -> Result<()> {
     // One top-level command, one Lake-input memo window.
     crate::module_builder::reset_lake_inputs_tag_memo();
     run_check_command_inner(
@@ -1742,6 +1771,7 @@ pub fn run_check_command(
         db_warm_on_open,
         json_output,
         true,
+        emit_olean,
         file,
         decl,
         project_dir,
@@ -1758,6 +1788,7 @@ fn run_check_command_inner(
     db_warm_on_open: bool,
     json_output: bool,
     emit_stdout: bool,
+    emit_olean: bool,
     file: PathBuf,
     decl: Option<String>,
     project_dir: PathBuf,
@@ -1765,6 +1796,11 @@ fn run_check_command_inner(
     parallel_shards: bool,
     remote_http: Option<String>,
 ) -> Result<serde_json::Value> {
+    if emit_olean && decl.is_some() {
+        anyhow::bail!(
+            "`--emit-olean` cannot be combined with `--decl` (must check a full module file)"
+        );
+    }
     let _lifecycle = crate::zygote::lifecycle_lock(false)?;
     let t0 = Instant::now();
     let canon_dir = project_dir
@@ -1783,6 +1819,12 @@ fn run_check_command_inner(
     };
 
     if resolved_file.is_dir() && decl.is_none() {
+        if emit_olean {
+            anyhow::bail!(
+                "`--emit-olean` requires a single `.lean` module file, not directory `{}`",
+                resolved_file.display()
+            );
+        }
         return check_directory(
             store,
             json_output,
@@ -2011,11 +2053,11 @@ fn run_check_command_inner(
             remote_http.as_deref(),
         )?
     } else {
-        check_single_file(
+        let mut out_json = check_single_file(
             store,
             db_warm_on_open,
             json_output,
-            emit_stdout,
+            emit_stdout && !emit_olean,
             &t0,
             &file,
             &resolved_file,
@@ -2029,9 +2071,126 @@ fn run_check_command_inner(
             jobs,
             parallel_shards,
             remote_http.as_deref(),
-        )?
+        )?;
+        if emit_olean {
+            anyhow::ensure!(
+                !crate::lake_build::worktree_auto_link_disabled(&canon_dir),
+                "Worktree opt-out prevents `--emit-olean` from writing `.lake/build` artifacts in {}",
+                canon_dir.display()
+            );
+            anyhow::ensure!(
+                split.hygiene.is_clean_for_certification(),
+                "Refusing `--emit-olean` for `{}`: source is not clean for certification (contains sorry/axiom/weakening directives)",
+                file.display()
+            );
+            let cfg =
+                crate::module_builder::resolve_project_config(&canon_dir).with_context(|| {
+                    format!(
+                        "`--emit-olean` requires a valid Lake workspace in {}",
+                        canon_dir.display()
+                    )
+                })?;
+            let (target_spec, mod_spec) =
+                crate::module_builder::resolve_lean_file_to_workspace_target(
+                    &cfg,
+                    &canon_resolved_initial,
+                )
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "`--emit-olean` could not resolve `{}` to a Lake library/executable module in `{}`",
+                        file.display(),
+                        canon_dir.display()
+                    )
+                })?;
+            let olean_path = mod_spec.build_lib_lean_dir.join(format!(
+                "{}.olean",
+                crate::module_builder::module_name_to_rel_slash(&mod_spec.module_name)
+            ));
+            crate::lake_build::recheck_dependents_if_nonlocal(store, &canon_dir, &resolved_file)?;
+            // Re-run `build_project_modules_native` after any Lake dependent refresh so the target's
+            // `.turbo_verified_sources.json` entry (`kernel_audited = true` + exact `.olean` digest)
+            // stays synchronized with the final on-disk artifact set.
+            let build_rep = crate::module_builder::build_project_modules_native(
+                store,
+                &canon_dir,
+                std::slice::from_ref(&target_spec),
+                "trusted",
+                1,
+                false,
+                true,
+                None,
+            )?;
+            let built_count = build_rep.modules_compiled
+                + build_rep.modules_cached
+                + build_rep.modules_up_to_date_reused;
+            if build_rep.modules_total == 0 || built_count != build_rep.modules_total {
+                anyhow::bail!(
+                    "`--emit-olean` target `{}` resolved an incomplete module build ({}/{} modules materialized)",
+                    target_spec,
+                    built_count,
+                    build_rep.modules_total
+                );
+            }
+            let (_, emitted_gh) =
+                crate::module_builder::read_olean_header_version_and_githash_confined(
+                    &mod_spec.pkg_root,
+                    &olean_path,
+                )
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "`--emit-olean` failed to materialize confined regular `.olean` artifact at `{}`",
+                        olean_path.display()
+                    )
+                })?;
+            let exp_gh = cfg.lean_githash.trim();
+            if !exp_gh.is_empty()
+                && exp_gh != "lean-not-installed"
+                && !emitted_gh.eq_ignore_ascii_case(exp_gh)
+            {
+                anyhow::bail!(
+                    "`--emit-olean` emitted `.olean` githash `{}` != active compiler `{}` at `{}`",
+                    emitted_gh,
+                    exp_gh,
+                    olean_path.display()
+                );
+            }
+            let total_ms = t0.elapsed().as_millis() as i64;
+            if let Some(obj) = out_json.as_object_mut() {
+                obj.insert("olean_emitted".to_string(), serde_json::json!(true));
+                obj.insert(
+                    "olean_path".to_string(),
+                    serde_json::json!(olean_path.display().to_string()),
+                );
+                obj.insert(
+                    "module_name".to_string(),
+                    serde_json::json!(mod_spec.module_name),
+                );
+                obj.insert(
+                    "olean_cached".to_string(),
+                    serde_json::json!(
+                        build_rep.modules_cached > 0 && build_rep.modules_compiled == 0
+                    ),
+                );
+                obj.insert("elapsed_ms".to_string(), serde_json::json!(total_ms));
+            }
+            if emit_stdout {
+                if json_output {
+                    println!("{}", serde_json::to_string_pretty(&out_json)?);
+                } else {
+                    println!(
+                        "[turbo-lean] VERIFIED & EMITTED OLEAN {} -> {} ({} ms)",
+                        file.display(),
+                        olean_path.display(),
+                        total_ms
+                    );
+                }
+            }
+        }
+        out_json
     };
-    crate::lake_build::recheck_dependents_if_nonlocal(store, &canon_dir, &resolved_file)?;
+    if !emit_olean {
+        crate::lake_build::recheck_dependents_if_nonlocal(store, &canon_dir, &resolved_file)?;
+    }
     Ok(res)
 }
 
