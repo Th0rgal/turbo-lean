@@ -6674,6 +6674,33 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
     meta_directives_hasher.update(b"meta-directives:v1\n");
     let mut active_context_vars: Vec<String> = Vec::new();
 
+    let is_all_local_attribute_cmd = |after_prefixes: &str| -> bool {
+        after_prefixes
+            .strip_prefix("attribute")
+            .and_then(|rest| rest.trim_start().strip_prefix('['))
+            .and_then(|rest| rest.find(']').map(|end| &rest[..end]))
+            .map(|inner| {
+                let items = split_attr_items(inner);
+                !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|a| a == "local" || a.starts_with("local "))
+            })
+            .unwrap_or(false)
+    };
+    let has_any_local_attribute_cmd = |after_prefixes: &str| -> bool {
+        after_prefixes
+            .strip_prefix("attribute")
+            .and_then(|rest| rest.trim_start().strip_prefix('['))
+            .and_then(|rest| rest.find(']').map(|end| &rest[..end]))
+            .map(|inner| {
+                split_attr_items(inner)
+                    .iter()
+                    .any(|a| a == "local" || a.starts_with("local "))
+            })
+            .unwrap_or(false)
+    };
+
     let process_decl_cmd =
         |sub_clean: &str,
          stack: &[PubScopeFrame],
@@ -6705,7 +6732,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             let is_local_mod = mods.iter().any(|m| m == "local");
 
             let is_public_visible = if is_module {
-                !is_priv_mod && (is_pub_mod || in_pub_sec)
+                !is_priv_mod && !is_local_mod && (is_pub_mod || in_pub_sec)
             } else {
                 true
             };
@@ -6785,7 +6812,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                     };
 
                 let mut sig_h = blake3::Hasher::new();
-                sig_h.update(b"decl-sig:v2\n");
+                sig_h.update(b"decl-sig:v3\n");
                 for v in active_vars {
                     sig_h.update(b"ctx:");
                     sig_h.update(v.as_bytes());
@@ -6886,7 +6913,12 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             {
                 return;
             }
-            if is_module && (is_priv_mod || is_local_mod || (!is_pub_mod && !in_pub_sec)) {
+            if is_module
+                && (is_priv_mod
+                    || is_local_mod
+                    || is_all_local_attribute_cmd(after_prefixes)
+                    || (!is_pub_mod && !in_pub_sec))
+            {
                 return;
             }
             if is_module && is_meta_mod {
@@ -6899,6 +6931,13 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
     for span in &spans {
         let trimmed = span.clean_text.trim();
         let after_p = strip_decl_prefixes(trimmed);
+        let (span_mods, span_attrs) = parse_decl_modifiers_and_attrs(trimmed);
+        let has_local_mod = span_mods.iter().any(|m| m == "local");
+        let has_local_attr = span_attrs
+            .iter()
+            .any(|a| a == "local" || a.starts_with("local "));
+        let records_local_elab_ctx =
+            has_local_mod || has_local_attr || has_any_local_attribute_cmd(after_p);
         if after_p.starts_with("variable ")
             || after_p.starts_with("variables ")
             || after_p.starts_with("universe ")
@@ -6930,6 +6969,17 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                     &mut directives_hasher,
                     &mut meta_directives_hasher,
                 );
+                let sub_trimmed = sub.clean_text.trim();
+                let sub_after_p = strip_decl_prefixes(sub_trimmed);
+                let (sub_mods, sub_attrs) = parse_decl_modifiers_and_attrs(sub_trimmed);
+                if sub_mods.iter().any(|m| m == "local")
+                    || sub_attrs
+                        .iter()
+                        .any(|a| a == "local" || a.starts_with("local "))
+                    || has_any_local_attribute_cmd(sub_after_p)
+                {
+                    active_context_vars.push(normalize_whitespace(sub_trimmed));
+                }
             }
             stack.pop();
         } else {
@@ -6942,6 +6992,9 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                 &mut directives_hasher,
                 &mut meta_directives_hasher,
             );
+            if records_local_elab_ctx {
+                active_context_vars.push(normalize_whitespace(trimmed));
+            }
             update_pub_scope_stack(&mut stack, span.orig_text);
         }
     }
@@ -8848,6 +8901,87 @@ public theorem uses_ctx : True := trivial
         assert_ne!(
             s_inc.public_signature_digest, s_omit.public_signature_digest,
             "adding `omit h` before a public theorem must change public_signature_digest"
+        );
+
+        // 4. Local elaboration-affecting setup (`local notation`, `local macro`, `local elab`,
+        //    `local syntax`, `local instance`, `local abbrev`, `local def`, `attribute [local ...]`)
+        //    MUST be recorded in `active_context_vars` so editing a local directive alters the
+        //    signature digest of subsequent public/meta declarations.
+        for (label, v1_cmd, v2_cmd) in [
+            (
+                "local notation",
+                "local notation \"MYOP\" x => x + 1",
+                "local notation \"MYOP\" x => x + 2",
+            ),
+            (
+                "local macro",
+                "local macro \"mymac\" x:term : term => `($x + 1)",
+                "local macro \"mymac\" x:term : term => `($x + 2)",
+            ),
+            (
+                "local elab",
+                "local elab \"myelab\" : term => Lean.Elab.Term.elabTerm (Lean.mkNatLit 1) none",
+                "local elab \"myelab\" : term => Lean.Elab.Term.elabTerm (Lean.mkNatLit 2) none",
+            ),
+            (
+                "local syntax",
+                "local syntax \"mystx1\" : term",
+                "local syntax \"mystx2\" : term",
+            ),
+            (
+                "local instance",
+                "local instance : Inhabited Nat := ⟨0⟩",
+                "local instance : Inhabited Nat := ⟨1⟩",
+            ),
+            (
+                "local abbrev",
+                "local abbrev LocalTy := Nat",
+                "local abbrev LocalTy := Bool",
+            ),
+            (
+                "local def",
+                "local def localConst : Nat := 1",
+                "local def localConst : Nat := 2",
+            ),
+            (
+                "attribute [local ...]",
+                "attribute [local reducible] helperDef",
+                "attribute [local irreducible] helperDef",
+            ),
+            (
+                "@[local ...] on private decl",
+                "@[local simp] private theorem localSimpHelper (x : Nat) : x + 0 = x := Nat.add_zero x",
+                "@[local simp] private theorem localSimpHelper (x : Nat) : 0 + x = x := Nat.zero_add x",
+            ),
+        ] {
+            let src_v1 = format!(
+                "module\nprivate def helperDef : Nat := 0\n{v1_cmd}\npublic theorem after_local (x : Nat) : x = x := rfl\n"
+            );
+            let src_v2 = format!(
+                "module\nprivate def helperDef : Nat := 0\n{v2_cmd}\npublic theorem after_local (x : Nat) : x = x := rfl\n"
+            );
+            let d1 = extract_public_signature(&src_v1);
+            let d2 = extract_public_signature(&src_v2);
+            assert_eq!(d1.declarations.len(), 1, "{label}: declarations count");
+            assert_eq!(d2.declarations.len(), 1, "{label}: declarations count");
+            assert_ne!(
+                d1.declarations[0].sig_hash, d2.declarations[0].sig_hash,
+                "{label}: changing local elaboration context before a public declaration must alter its sig_hash"
+            );
+            assert_ne!(
+                d1.public_signature_digest, d2.public_signature_digest,
+                "{label}: changing local elaboration context before a public declaration must alter public_signature_digest"
+            );
+        }
+
+        // Trailing local setup AFTER all public declarations must NOT pollute `public_directives_hash`
+        // or `declarations` (only subsequent declarations can observe it).
+        let trailing_local_v1 = "module\npublic theorem before_local : True := trivial\nlocal notation \"AFTER\" => 1\n";
+        let trailing_local_v2 = "module\npublic theorem before_local : True := trivial\nlocal notation \"AFTER\" => 2\n";
+        assert_eq!(
+            extract_public_signature(trailing_local_v1).public_signature_digest,
+            extract_public_signature(trailing_local_v2).public_signature_digest,
+            "trailing local notation after all public declarations must not alter public_signature_digest"
         );
     }
 }

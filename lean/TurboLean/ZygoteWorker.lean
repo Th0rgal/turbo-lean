@@ -29,6 +29,9 @@ import Lean.Meta.Tactic.Ext
 import Lean.Meta.Tactic.Grind.Attr
 import Lean.Meta.Match.MatchPatternAttr
 import Lean.Meta.CompletionName
+import Lean.Meta.RecExt
+import Lean.Compiler.LCNF.MonoTypes
+import Lean.Compiler.LCNF.ToImpureType
 import Lean.Linter.Deprecated
 import Lean.DeprecatedModule
 import Lake.Load.Lean.Elab
@@ -1832,6 +1835,25 @@ private def formatLcnfDeclIO (env : Environment) (norm : Name → Name) (phase :
         throw (IO.userError s!"failed to format LCNF decl `{d.name}`: {e.toString}")
   return s!"{sigPart}:rec={d.recursive}:inl={inl}:{valTag}"
 
+private def formatNoConfusionInfo : NoConfusionInfo → String
+  | .regular arity lhs rhs => s!"reg:{arity}:{lhs}:{rhs}"
+  | .perCtor arity fields => s!"ctor:{arity}:{fields}"
+
+private def formatTrivialStructOpt (norm : Name → Name) : Option Compiler.LCNF.TrivialStructureInfo → String
+  | none => "none"
+  | some tsi => s!"some:{canonicalName (norm tsi.ctorName)}:{tsi.numParams}:{tsi.fieldIdx}"
+
+private def formatCtorFieldInfo (norm : Name → Name) : Compiler.LCNF.CtorFieldInfo → String
+  | .erased => "erased"
+  | .void => "void"
+  | .usize i => s!"usize:{i}"
+  | .object i ty =>
+    let tyH := TurboLean.Blake3.blake3Bytes (TurboLean.StatementHash.exprJson norm ty).compress.toUTF8
+    s!"obj:{i}:{tyH}"
+  | .scalar sz off ty =>
+    let tyH := TurboLean.Blake3.blake3Bytes (TurboLean.StatementHash.exprJson norm ty).compress.toUTF8
+    s!"scalar:{sz}:{off}:{tyH}"
+
 private def isWhitelistedPublicSigExtName (extStr : String) : Bool :=
   extStr == "Lean.Meta.simpExtension"
   || extStr == "Lean.Compiler.CSimp.ext"
@@ -1853,7 +1875,9 @@ private def isWhitelistedPublicSigExtName (extStr : String) : Bool :=
   || extStr == "Lean.externAttr"
   || extStr == "Lean.Compiler.implementedByAttr"
   || extStr == "Lean.exportAttr"
-  || extStr == "Lean.Compiler.specializeAttrs"
+  || extStr == "Lean.Compiler.specializeAttr"
+  || extStr == "Lean.Compiler.nospecializeAttr"
+  || extStr == "Lean.Compiler.weakSpecializeAttr"
   || extStr == "Lean.matchPatternAttr"
   || extStr == "Lean.Linter.deprecatedAttr"
   || extStr == "Lean.deprecatedModuleExt"
@@ -1863,7 +1887,7 @@ private def isWhitelistedPublicSigExtName (extStr : String) : Bool :=
   || extStr == "Lean.Meta.Grind.grindExt"
   || extStr == "Lean.Meta.completionBlackListExt"
   || extStr == "_private.Lean.OriginalConstKind.0.Lean.privateConstKindsExt"
-  || extStr == "_private.Lean.Compiler.NoncomputableAttr.0.Lean.noncomputableExt"
+  || extStr == "Lean.noncomputableExt"
   || extStr == "Lean.aliasExtension"
   || extStr == "_private.Lean.ResolveName.0.Lean.aliasExtension"
   || extStr == "_private.Lean.Namespace.0.Lean.namespacesExt"
@@ -1874,11 +1898,8 @@ private def isWhitelistedPublicSigExtName (extStr : String) : Bool :=
   || extStr == "Lean.Compiler.LCNF.impureSigExt"
   || extStr == "Lean.Compiler.LCNF.monoTypeExt"
   || extStr == "_private.Lean.Compiler.LCNF.MonoTypes.0.Lean.Compiler.LCNF.trivialStructureInfoExt"
-  || extStr == "Lean.Compiler.LCNF.impureTypeExt"
   || extStr == "_private.Lean.Compiler.LCNF.ToImpureType.0.Lean.Compiler.LCNF.impureTypeExt"
-  || extStr == "Lean.Compiler.LCNF.impureTrivialStructureInfoExt"
   || extStr == "_private.Lean.Compiler.LCNF.ToImpureType.0.Lean.Compiler.LCNF.impureTrivialStructureInfoExt"
-  || extStr == "Lean.Compiler.LCNF.ctorLayoutExt"
   || extStr == "_private.Lean.Compiler.LCNF.ToImpureType.0.Lean.Compiler.LCNF.ctorLayoutExt"
   || extStr == "_private.Lean.Util.CollectAxioms.0.Lean.exportedAxiomsExt"
 
@@ -1916,11 +1937,20 @@ def dumpPublicSignatureJson (modStr : String) : IO String := do
       nsExtOpt := some pExt
     else if pNameStr == "_private.Lean.Util.CollectAxioms.0.Lean.exportedAxiomsExt" then
       axExtOpt := some pExt
+  let mut privExtCounts : Array String := #[]
   for (extName, arr) in md.entries do
     if arr.size > 0 then
       let extStr := canonicalName extName
       if !isWhitelistedPublicSigExtName extStr then
         hasOpaqueExt := true
+      if extStr == "_private.Lean.Structure.0.Lean.structureExt"
+        || extStr == "_private.Lean.AuxRecursor.0.Lean.sparseCasesOnExt"
+        || extStr == "_private.Lean.OriginalConstKind.0.Lean.privateConstKindsExt"
+        || extStr == "_private.Lean.Compiler.LCNF.MonoTypes.0.Lean.Compiler.LCNF.trivialStructureInfoExt"
+        || extStr == "_private.Lean.Compiler.LCNF.ToImpureType.0.Lean.Compiler.LCNF.impureTypeExt"
+        || extStr == "_private.Lean.Compiler.LCNF.ToImpureType.0.Lean.Compiler.LCNF.impureTrivialStructureInfoExt"
+        || extStr == "_private.Lean.Compiler.LCNF.ToImpureType.0.Lean.Compiler.LCNF.ctorLayoutExt" then
+        privExtCounts := privExtCounts.push s!"{extStr}:{arr.size}"
       if extStr == "_private.Lean.Namespace.0.Lean.namespacesExt" then
         hasNamespacesExt := true
       else if extStr == "Lean.aliasExtension" || extStr == "_private.Lean.ResolveName.0.Lean.aliasExtension" then
@@ -2016,15 +2046,72 @@ def dumpPublicSignatureJson (modStr : String) : IO String := do
   let mut lcnfMonoEntries : Array String := #[]
   for mdDecl in Compiler.LCNF.monoExt.getModuleEntries env idx do
     lcnfMonoEntries := lcnfMonoEntries.push (← formatLcnfDeclIO env norm .mono mdDecl)
-  let lcnfImpureSigEntries := (Compiler.LCNF.impureSigExt.getModuleEntries env idx).map (formatLcnfSignature norm)
+  let lcnfImpureSigEntries := ((Compiler.LCNF.impureSigExt.getModuleEntries env idx).map (formatLcnfSignature norm)).qsort (· < ·)
+  let lcnfMonoTypeEntries := ((Compiler.LCNF.monoTypeExt.getModuleEntries env idx).map fun (dName, mTy) =>
+    let mTyHash := TurboLean.Blake3.blake3Bytes (TurboLean.StatementHash.exprJson norm mTy).compress.toUTF8
+    s!"{canonicalName (norm dName)}:{mTyHash}").qsort (· < ·)
+  let matchPatEntries := ((Lean.matchPatternAttr.ext.getModuleEntries env idx).map (fun dName => canonicalName (norm dName))).qsort (· < ·)
+  let defeqEntries := ((Lean.defeqAttr.ext.getModuleEntries env idx).map (fun dName => canonicalName (norm dName))).qsort (· < ·)
+  let bwdDefeqEntries := ((Lean.backwardDefeqAttr.ext.getModuleEntries env idx).map (fun dName => canonicalName (norm dName))).qsort (· < ·)
+  let inlineEntries := ((Compiler.inlineAttrs.ext.getModuleEntries env idx).map fun (dName, ik) =>
+    s!"{canonicalName (norm dName)}:{formatInlineAttr (some ik)}").qsort (· < ·)
+  let externEntries := ((Lean.externAttr.ext.getModuleEntries env idx).map fun (dName, ed) =>
+    s!"{canonicalName (norm dName)}:[{String.intercalate "," (ed.entries.map formatExternEntry)}]").qsort (· < ·)
+  let implByEntries := ((Compiler.implementedByAttr.ext.getModuleEntries env idx).map fun (dName, tgt) =>
+    s!"{canonicalName (norm dName)}->{canonicalName (norm tgt)}").qsort (· < ·)
+  let exportEntries := ((Lean.exportAttr.ext.getModuleEntries env idx).map fun (dName, expNm) =>
+    s!"{canonicalName (norm dName)}->{canonicalName expNm}").qsort (· < ·)
+  let specEntries := ((Compiler.specializeAttr.ext.getModuleEntries env idx).map fun (dName, args) =>
+    s!"{canonicalName (norm dName)}:[{String.intercalate "," (args.toList.map toString)}]").qsort (· < ·)
+  let nospecEntries := ((Compiler.nospecializeAttr.ext.getModuleEntries env idx).map (fun dName => canonicalName (norm dName))).qsort (· < ·)
+  let weakSpecEntries := ((Compiler.weakSpecializeAttr.ext.getModuleEntries env idx).map (fun dName => canonicalName (norm dName))).qsort (· < ·)
+  let deprEntries := ((Linter.deprecatedAttr.ext.getModuleEntries env idx).map fun (dName, de) =>
+    let nn := match de.newName? with | some x => canonicalName (norm x) | none => ""
+    s!"{canonicalName (norm dName)}:{nn}:{jsonEscape (de.text?.getD "")}:{jsonEscape (de.since?.getD "")}").qsort (· < ·)
+  let elabElimEntries := ((Elab.Term.elabAsElim.ext.getModuleEntries env idx).map (fun dName => canonicalName (norm dName))).qsort (· < ·)
+  let compBlEntries := ((PersistentEnvExtension.getModuleEntries Meta.completionBlackListExt env idx).map (fun dName => canonicalName (norm dName))).qsort (· < ·)
+  let protEntries := ((PersistentEnvExtension.getModuleEntries Lean.protectedExt env idx).map (fun dName => canonicalName (norm dName))).qsort (· < ·)
+  let noConfEntries := ((Lean.noConfusionExt.getModuleEntries env idx).map fun (dName, nci) =>
+    s!"{canonicalName (norm dName)}:{formatNoConfusionInfo nci}").qsort (· < ·)
+  let auxRecEntries := ((PersistentEnvExtension.getModuleEntries Lean.auxRecExt env idx).map (fun dName => canonicalName (norm dName))).qsort (· < ·)
+  let recExtEntries := ((PersistentEnvExtension.getModuleEntries Meta.recExt env idx).map (fun dName => canonicalName (norm dName))).qsort (· < ·)
+  let redCoreEntries := ((Lean.reducibilityCoreExt.getModuleEntries env idx).map fun (dName, st) =>
+    s!"{canonicalName (norm dName)}:{formatReducibilityStatus st}").qsort (· < ·)
+  let noncompEntries := ((PersistentEnvExtension.getModuleEntries Lean.noncomputableExt env idx).map (fun dName => canonicalName (norm dName))).qsort (· < ·)
+  let projFnEntries := ((Lean.projectionFnInfoExt.getModuleEntries env idx).map fun (dName, pi) =>
+    s!"{canonicalName (norm dName)}:{canonicalName (norm pi.ctorName)}:{pi.numParams}:{pi.i}:{pi.fromClass}").qsort (· < ·)
+  reducibilityExtraEntries := reducibilityExtraEntries.qsort (· < ·)
+  privExtCounts := privExtCounts.qsort (· < ·)
+  let mut matchedStructureCount : Nat := 0
+  let mut matchedSparseCasesCount : Nat := 0
+  let mut matchedPrivConstKindCount : Nat := 0
+  for c in md.constants do
+    if (Lean.getStructureInfo? env c.name).isSome then
+      matchedStructureCount := matchedStructureCount + 1
+    if Lean.isSparseCasesOn env c.name then
+      matchedSparseCasesCount := matchedSparseCasesCount + 1
+    if (Lean.getOriginalConstKind? env c.name).isSome then
+      matchedPrivConstKindCount := matchedPrivConstKindCount + 1
+  for (extName, arr) in md.entries do
+    if arr.size > 0 then
+      let extStr := canonicalName extName
+      if extStr == "_private.Lean.Structure.0.Lean.structureExt" && arr.size != matchedStructureCount then
+        hasOpaqueExt := true
+      else if extStr == "_private.Lean.AuxRecursor.0.Lean.sparseCasesOnExt" && arr.size != matchedSparseCasesCount then
+        hasOpaqueExt := true
+      else if extStr == "_private.Lean.OriginalConstKind.0.Lean.privateConstKindsExt" && arr.size > matchedPrivConstKindCount then
+        hasOpaqueExt := true
   nsArr := nsArr.qsort (· < ·)
   allExportedAliases := allExportedAliases.qsort (· < ·)
   let mut declJsons : Array String := #[]
+  let coreCtxPub : Core.Context := { fileName := "<pubsig>", fileMap := FileMap.ofString "" }
+  let coreStatePub : Core.State := { env := env }
   let mut sigPieces : Array String := #[
     s!"olean-pubsig:v2|mod={canonicalName nm}|is_module={isMod}|pkg={modPkgStr}|dep_mod={depModStr}",
     s!"imports={String.intercalate ";" expImports.toList}",
     s!"namespaces={String.intercalate ";" nsArr.toList}",
     s!"aliases={String.intercalate ";" allExportedAliases.toList}",
+    s!"reducibility_core={String.intercalate ";" redCoreEntries.toList}",
     s!"reducibility_extra={String.intercalate ";" reducibilityExtraEntries.toList}",
     s!"simp={String.intercalate ";" simpEntries.toList}",
     s!"csimp={String.intercalate ";" csimpEntries.toList}",
@@ -2034,10 +2121,31 @@ def dumpPublicSignatureJson (modStr : String) : IO String := do
     s!"ext_thms={String.intercalate ";" extThmEntries.toList}",
     s!"coes={String.intercalate ";" coeEntries.toList}",
     s!"grind={String.intercalate ";" grindEntries.toList}",
+    s!"match_pattern={String.intercalate ";" matchPatEntries.toList}",
+    s!"defeq={String.intercalate ";" defeqEntries.toList}",
+    s!"bwd_defeq={String.intercalate ";" bwdDefeqEntries.toList}",
+    s!"inline_attrs={String.intercalate ";" inlineEntries.toList}",
+    s!"extern_attrs={String.intercalate ";" externEntries.toList}",
+    s!"implemented_by={String.intercalate ";" implByEntries.toList}",
+    s!"export_attrs={String.intercalate ";" exportEntries.toList}",
+    s!"specialize={String.intercalate ";" specEntries.toList}",
+    s!"nospecialize={String.intercalate ";" nospecEntries.toList}",
+    s!"weak_specialize={String.intercalate ";" weakSpecEntries.toList}",
+    s!"deprecated={String.intercalate ";" deprEntries.toList}",
+    s!"elab_as_elim={String.intercalate ";" elabElimEntries.toList}",
+    s!"completion_blacklist={String.intercalate ";" compBlEntries.toList}",
+    s!"protected={String.intercalate ";" protEntries.toList}",
+    s!"no_confusion={String.intercalate ";" noConfEntries.toList}",
+    s!"aux_rec={String.intercalate ";" auxRecEntries.toList}",
+    s!"rec_ext={String.intercalate ";" recExtEntries.toList}",
+    s!"noncomputable={String.intercalate ";" noncompEntries.toList}",
+    s!"proj_fns={String.intercalate ";" projFnEntries.toList}",
     s!"ir_decls={String.intercalate ";" irDeclEntries.toList}",
     s!"lcnf_base={String.intercalate ";" lcnfBaseEntries.toList}",
     s!"lcnf_mono={String.intercalate ";" lcnfMonoEntries.toList}",
-    s!"lcnf_impure_sig={String.intercalate ";" lcnfImpureSigEntries.toList}"
+    s!"lcnf_impure_sig={String.intercalate ";" lcnfImpureSigEntries.toList}",
+    s!"lcnf_mono_type={String.intercalate ";" lcnfMonoTypeEntries.toList}",
+    s!"priv_ext_counts={String.intercalate ";" privExtCounts.toList}"
   ]
   for c in md.constants do
     let cname := canonicalName c.name
@@ -2089,6 +2197,26 @@ def dumpPublicSignatureJson (modStr : String) : IO String := do
         let nn := match de.newName? with | some x => canonicalName (norm x) | none => ""
         s!"some:{nn}:{jsonEscape (de.text?.getD "")}:{jsonEscape (de.since?.getD "")}"
       | none => ""
+    let mut lcnfTypeInfoStr := ""
+    match c with
+    | .inductInfo _ =>
+      let (trivMono, _) ← (Compiler.LCNF.hasTrivialStructure? c.name).toIO coreCtxPub coreStatePub
+      let (trivImp, _) ← (Compiler.LCNF.hasTrivialImpureStructure? c.name).toIO coreCtxPub coreStatePub
+      let impTyStr ← try
+          let (impTy, _) ← (Compiler.LCNF.nameToImpureType c.name).toIO coreCtxPub coreStatePub
+          pure (TurboLean.Blake3.blake3Bytes (TurboLean.StatementHash.exprJson norm impTy).compress.toUTF8)
+        catch _ =>
+          pure "uncompiled"
+      lcnfTypeInfoStr := s!"ind:{formatTrivialStructOpt norm trivMono}:{formatTrivialStructOpt norm trivImp}:{impTyStr}"
+    | .ctorInfo _ =>
+      let ctorLayStr ← try
+          let (cl, _) ← (Compiler.LCNF.getCtorLayout c.name).toIO coreCtxPub coreStatePub
+          let fStr := String.intercalate "," (cl.fieldInfo.toList.map (formatCtorFieldInfo norm))
+          pure s!"{canonicalName (norm cl.ctorInfo.name)}:{cl.ctorInfo.cidx}:{cl.ctorInfo.size}:{cl.ctorInfo.usize}:{cl.ctorInfo.ssize}:[{fStr}]"
+        catch _ =>
+          pure "uncompiled"
+      lcnfTypeInfoStr := s!"ctor:{ctorLayStr}"
+    | _ => pure ()
     let aliases := ((aliasMap[c.name]?.getD #[]).qsort (· < ·)).toList
     let aliasStr := String.intercalate "," aliases
     let axs : Array Name := match axEnv? with
@@ -2102,7 +2230,7 @@ def dumpPublicSignatureJson (modStr : String) : IO String := do
       if !isAllowedStandardAxiom ax then
         hasOpaqueExt := true
     let allAxStr := String.intercalate "," (allAxioms.qsort (· < ·)).toList
-    sigPieces := sigPieces.push s!"c:{cname}|{kind}|{stmtHash}|{bodyHash}|red={red}|inl={inl}|ext=[{extDataStr}]|exp={expNameStr}|impl={implBy}|spec={specFlags}|flags={protFlag},{noConfFlag},{auxRecFlag},{sparseCasesFlag},{recCoreFlag},{noncompFlag},{matchPatFlag},{elabElimFlag},{defeqFlag},{bwdDefeqFlag},{compBlFlag}|orig={origKindStr}|proj={projStr}|struct={structStr}|depr={deprStr}|alias=[{aliasStr}]|axioms=[{allAxStr}]"
+    sigPieces := sigPieces.push s!"c:{cname}|{kind}|{stmtHash}|{bodyHash}|red={red}|inl={inl}|ext=[{extDataStr}]|exp={expNameStr}|impl={implBy}|spec={specFlags}|flags={protFlag},{noConfFlag},{auxRecFlag},{sparseCasesFlag},{recCoreFlag},{noncompFlag},{matchPatFlag},{elabElimFlag},{defeqFlag},{bwdDefeqFlag},{compBlFlag}|orig={origKindStr}|proj={projStr}|struct={structStr}|depr={deprStr}|lcnfty={lcnfTypeInfoStr}|alias=[{aliasStr}]|axioms=[{allAxStr}]"
     declJsons := declJsons.push s!"\{\"name\":\"{jsonEscape cname}\",\"kind\":\"{jsonEscape kind}\",\"type_hash\":\"{jsonEscape stmtHash}\",\"body_hash\":\"{jsonEscape bodyHash}\",\"reducibility\":\"{jsonEscape red}\",\"inline\":\"{jsonEscape inl}\"}"
   let pubDigest := TurboLean.Blake3.blake3Bytes (String.intercalate "\n" sigPieces.toList).toUTF8
   return s!"\{\"ok\":true,\"module\":\"{jsonEscape (canonicalName nm)}\",\"is_module\":{isMod},\"has_opaque_ext\":{hasOpaqueExt},\"public_sig_digest\":\"{pubDigest}\",\"exported_imports\":[{jsonStrList expImports.toList}],\"simp_entries\":[{jsonStrList simpEntries.toList}],\"csimp_entries\":[{jsonStrList csimpEntries.toList}],\"instance_entries\":[{jsonStrList instEntries.toList}],\"decls\":[{String.intercalate "," declJsons.toList}]}"

@@ -9789,6 +9789,76 @@ public def bVal : Nat := 1
             "re-exporting an imported declaration via `export N (foo)` must alter olean public_sig_digest"
         );
 
+        //    (c) Adding an entry to a whitelisted attribute/tag extension (`Lean.matchPatternAttr` /
+        //        `Lean.Compiler.specializeAttr`) targeting an IMPORTED declaration from `Smoke.A`
+        //        (so `Smoke.B`'s `md.constants` does NOT contain `SmokeA.mkTag100`) MUST alter
+        //        `Smoke.B`'s `public_sig_digest` without setting `has_opaque_ext = true`.
+        let b_imported_match_pat = "\
+module
+public import Smoke.A
+meta import Lean
+run_cmd Lean.Elab.Command.liftCoreM <| Lean.modifyEnv (fun env => Lean.matchPatternAttr.ext.addEntry env `SmokeA.mkTag100)
+public def bVal : Nat := 1
+";
+        fs::write(proj.join("Smoke/B.lean"), b_imported_match_pat)?;
+        lake_build_modules(&canon_proj, &["Smoke.B".to_string()], None)?;
+        let sig_b_imported_match_pat = crate::zygote::read_module_public_signature_with_zygote(
+            &store.root,
+            &cfg,
+            "Smoke.B",
+            &replay_lp,
+            &[],
+            false,
+        )?;
+        assert!(
+            !sig_b_imported_match_pat.has_opaque_ext,
+            "whitelisted matchPatternAttr entry must not set has_opaque_ext"
+        );
+        assert_ne!(
+            sig_b_no_export.public_sig_digest, sig_b_imported_match_pat.public_sig_digest,
+            "whitelisted tag/attribute extension entry targeting an imported declaration outside md.constants must alter public_sig_digest"
+        );
+
+        let b_spec_arg1 = "\
+module
+public def polyFn (f : Nat → Nat) (g : Nat → Nat) (x : Nat) : Nat := f (g x)
+attribute [specialize 1] polyFn
+";
+        let b_spec_arg2 = "\
+module
+public def polyFn (f : Nat → Nat) (g : Nat → Nat) (x : Nat) : Nat := f (g x)
+attribute [specialize 2] polyFn
+";
+        fs::write(proj.join("Smoke/B.lean"), b_spec_arg1)?;
+        lake_build_modules(&canon_proj, &["Smoke.B".to_string()], None)?;
+        let sig_b_spec_arg1 = crate::zygote::read_module_public_signature_with_zygote(
+            &store.root,
+            &cfg,
+            "Smoke.B",
+            &replay_lp,
+            &[],
+            false,
+        )?;
+        assert!(
+            !sig_b_spec_arg1.has_opaque_ext,
+            "`@[specialize 1]` (`Lean.Compiler.specializeAttr`) must be whitelisted and decoded"
+        );
+        fs::write(proj.join("Smoke/B.lean"), b_spec_arg2)?;
+        lake_build_modules(&canon_proj, &["Smoke.B".to_string()], None)?;
+        let sig_b_spec_arg2 = crate::zygote::read_module_public_signature_with_zygote(
+            &store.root,
+            &cfg,
+            "Smoke.B",
+            &replay_lp,
+            &[],
+            false,
+        )?;
+        assert!(!sig_b_spec_arg2.has_opaque_ext);
+        assert_ne!(
+            sig_b_spec_arg1.public_sig_digest, sig_b_spec_arg2.public_sig_digest,
+            "changing `@[specialize 1]` to `@[specialize 2]` must alter public_sig_digest"
+        );
+
         let opaque_ext_src = "\
 module
 public meta import Lean
@@ -9822,6 +9892,46 @@ public theorem trivial_ok : 1 + 1 = 2 := rfl
         assert!(
             sig_opaque.has_opaque_ext,
             "unrecognized persistent environment extension entry must trip `has_opaque_ext = true` fail-closed guard"
+        );
+
+        //    (d) End-to-end `compute_impact_report` check for `local notation`: editing a `local notation`
+        //        before a public declaration whose type uses that notation MUST mark
+        //        `public_signature_changed = true` and classify as `public_signature_edit`.
+        let a_local_not_v1 = "\
+module
+local notation \"MYTYPE\" => Nat
+public def localNotVal : MYTYPE := 0
+";
+        let a_local_not_v2 = "\
+module
+local notation \"MYTYPE\" => Bool
+public def localNotVal : MYTYPE := true
+";
+        fs::write(proj.join("Smoke/A.lean"), a_local_not_v1)?;
+        fs::write(
+            proj.join("Smoke/B.lean"),
+            "module\npublic import Smoke.A\npublic def useIt := localNotVal\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/C.lean"),
+            "module\nimport Smoke.B\npublic def useItC := useIt\n",
+        )?;
+        run_git(&["add", "."])?;
+        run_git(&["commit", "-m", "local notation baseline"])?;
+        fs::write(proj.join("Smoke/A.lean"), a_local_not_v2)?;
+        let rep_local_not = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_local_not.edit_class, "public_signature_edit");
+        assert!(
+            rep_local_not.public_signature_changed,
+            "`local notation` edit before a public declaration must mark `public_signature_changed = true`"
+        );
+        assert_eq!(
+            rep_local_not.transitive_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
         );
 
         let _ = fs::remove_dir_all(&tmp_dir);
