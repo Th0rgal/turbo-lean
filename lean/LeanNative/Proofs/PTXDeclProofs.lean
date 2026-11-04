@@ -19,18 +19,6 @@ open LeanNative.Backend.PTXLower
 open LeanNative.Proofs.PTXScalarProofs
 open LeanNative.Proofs.PTXLowerProofs
 
-/-- Effective `VarEnv` after evaluating the optional `let lenVar = sarrayLen arrVar` prologue
-extracted by `PTXLower.extractDeclParFor`. -/
-def declRunEnv (env : VarEnv) (st : HeapState) : Option VarId → VarId → Option VarEnv
-  | none, _ => some env
-  | some arrVar, lenVar =>
-    match env arrVar with
-    | some (.sarrayId bid) =>
-      match st.findBuffer bid with
-      | some buf => some (env.bind lenVar (.u64 buf.data.size.toUInt64))
-      | none => none
-    | _ => none
-
 private theorem evalVarList_of_packInputWordLists (env : VarEnv) (st : HeapState) (len : Nat) :
     ∀ (inputs : List VarId) (ws : List (List (BitVec 64))),
       packInputWordLists env st len inputs = some ws →
@@ -58,22 +46,28 @@ private theorem evalVarList_of_packInputWordLists (env : VarEnv) (st : HeapState
             exact ⟨val :: vs, by simp [evalVarList, hv, hvs]⟩
           }
 
-private def outDataOfKind (k : ParallelKernelKind) (elems : List UInt64) : Array UInt64 :=
-  match k with
-  | .dotProduct => #[elems.foldl (· + ·) 0]
-  | _ => elems.toArray
-
-private theorem not_dotProduct_of_wf {k : ParallelKernelKind} (elems : List UInt64)
+private theorem not_dotProduct_of_wf {k : ParallelKernelKind}
     (hwf : wfPTXKernel k = true) :
-    outDataOfKind k elems = elems.toArray := by
-  cases k <;> first | rfl | (simp [wfPTXKernel] at hwf)
+    k ≠ .dotProduct := by
+  intro hEq
+  subst hEq
+  simp [wfPTXKernel] at hwf
 
 private theorem extractDeclParFor_sound {code : LNIRCode}
     {arrOpt : Option VarId} {lenVar : VarId} {inputs : List VarId} {k : ParallelKernelKind}
     (hex : extractDeclParFor code = some (arrOpt, lenVar, inputs, k))
     (hwf : wfPTXKernel k = true)
     (fuel : Nat) (env env' : VarEnv) (st : HeapState) (n : UInt64)
-    (henv' : declRunEnv env st arrOpt lenVar = some env')
+    (henv' :
+      (match (motive := Option VarId → Option VarEnv) arrOpt with
+       | none => some env
+       | some arrVar =>
+         match env arrVar with
+         | some (.sarrayId bid) =>
+           match st.findBuffer bid with
+           | some buf => some (env.bind lenVar (.u64 buf.data.size.toUInt64))
+           | none => none
+         | _ => none) = some env')
     (hlen : env' lenVar = some (.u64 n))
     (hfuel : n.toNat ≤ fuel)
     (ws : List (List (BitVec 64)))
@@ -86,7 +80,7 @@ private theorem extractDeclParFor_sound {code : LNIRCode}
       outBuf.data = elems.toArray := by
   have hnotFuel : ¬ (n.toNat > fuel) := by omega
   rcases evalVarList_of_packInputWordLists env' st n.toNat inputs ws hpack with ⟨vals, hvals⟩
-  have houtData : outDataOfKind k elems = elems.toArray := not_dotProduct_of_wf elems hwf
+  have hNotDot : k ≠ .dotProduct := not_dotProduct_of_wf hwf
   cases code with
   | parFor outVar lv ins elemTy kern cont =>
     cases elemTy <;> try (unfold extractDeclParFor at hex; cases hex)
@@ -96,7 +90,7 @@ private theorem extractDeclParFor_sound {code : LNIRCode}
     split at hex <;> simp at hex
     rename_i houtEq
     rcases hex with ⟨rfl, rfl, rfl, rfl⟩
-    simp only [declRunEnv, Option.some.injEq] at henv'
+    simp only [Option.some.injEq] at henv'
     subst henv'
     have heqOut : retVar = outVar := (beq_iff_eq.mp houtEq).symm
     subst heqOut
@@ -104,13 +98,11 @@ private theorem extractDeclParFor_sound {code : LNIRCode}
         buffers := { id := st.nextId + 1, exclusive := true, data := elems.toArray } :: st.buffers
         nextId := st.nextId + 1 },
       { id := st.nextId + 1, exclusive := true, data := elems.toArray }, ?_, ?_, rfl⟩
-    · simp only [evalCode, evalParFor, hlen, hnotFuel, ite_false, hvals, hloop]
-      simp only [VarEnv.bind, beq_self_eq_true, ite_true]
-      change Except.ok (Val.sarrayId (st.nextId + 1),
-        { st with
-          buffers := { id := st.nextId + 1, exclusive := true, data := outDataOfKind kern elems } :: st.buffers
-          nextId := st.nextId + 1 }) = _
-      rw [houtData]
+    · cases kern with
+      | dotProduct => exact False.elim (hNotDot rfl)
+      | _ =>
+        simp only [evalCode, evalParFor, hlen, hnotFuel, ite_false, hvals, hloop]
+        simp only [VarEnv.bind, beq_self_eq_true, ite_true]
     · simp [HeapState.findBuffer]
   | letBind lv ty valExpr body =>
     cases ty <;> try (unfold extractDeclParFor at hex; cases hex)
@@ -128,7 +120,7 @@ private theorem extractDeclParFor_sound {code : LNIRCode}
     have hlv : lv' = lv := (beq_iff_eq.mp hlvEq).symm
     have hout : retVar = outVar := (beq_iff_eq.mp houtEq).symm
     subst hlv; subst hout
-    unfold declRunEnv at henv'
+    dsimp only at henv'
     cases harr : env arrVar with
     | none => simp [harr] at henv'
     | some aval =>
@@ -143,13 +135,11 @@ private theorem extractDeclParFor_sound {code : LNIRCode}
             buffers := { id := st.nextId + 1, exclusive := true, data := elems.toArray } :: st.buffers
             nextId := st.nextId + 1 },
           { id := st.nextId + 1, exclusive := true, data := elems.toArray }, ?_, ?_, rfl⟩
-        · simp only [evalCode, evalExpr, harr, hbuf, evalParFor, hlen, hnotFuel, ite_false, hvals, hloop]
-          simp only [VarEnv.bind, beq_self_eq_true, ite_true]
-          change Except.ok (Val.sarrayId (st.nextId + 1),
-            { st with
-              buffers := { id := st.nextId + 1, exclusive := true, data := outDataOfKind kern elems } :: st.buffers
-              nextId := st.nextId + 1 }) = _
-          rw [houtData]
+        · cases kern with
+          | dotProduct => exact False.elim (hNotDot rfl)
+          | _ =>
+            simp only [evalCode, evalExpr, harr, hbuf, evalParFor, hlen, hnotFuel, ite_false, hvals, hloop]
+            simp only [VarEnv.bind, beq_self_eq_true, ite_true]
         · simp [HeapState.findBuffer]
   | _ => simp [extractDeclParFor] at hex
 
@@ -164,7 +154,16 @@ theorem lowerToPTX_sound
     (nBlocks blockSize : Nat) (inWords : List (List (BitVec 64)))
     (hlowDecl : lowerDeclToPTX d = some ptxMod)
     (hex : extractDeclParFor d.body = some (arrOpt, lenVar, inputs, k))
-    (henv' : declRunEnv env st arrOpt lenVar = some env')
+    (henv' :
+      (match (motive := Option VarId → Option VarEnv) arrOpt with
+       | none => some env
+       | some arrVar =>
+         match env arrVar with
+         | some (.sarrayId bid) =>
+           match st.findBuffer bid with
+           | some buf => some (env.bind lenVar (.u64 buf.data.size.toUInt64))
+           | none => none
+         | _ => none) = some env')
     (hlen : env' lenVar = some (.u64 n))
     (hfuel : n.toNat ≤ fuel)
     (hpack : packInputWordLists env' st n.toNat inputs = some inWords)
@@ -247,7 +246,16 @@ theorem lowerToPTX_decl_nonvacuous :
     simp [lowerDeclToPTX, isSarrayI64, d, ptxMod, extractDeclParFor, wfPTXKernel, kernelArity]
     rfl
   have hex : extractDeclParFor d.body = some (some 0, 2, [0, 1], .saxpy 5) := rfl
-  have henv' : declRunEnv env st (some 0) 2 = some env' := rfl
+  have henv' :
+      (match (motive := Option VarId → Option VarEnv) some (0 : VarId) with
+       | none => some env
+       | some arrVar =>
+         match env arrVar with
+         | some (.sarrayId bid) =>
+           match st.findBuffer bid with
+           | some buf => some (env.bind (2 : VarId) (.u64 buf.data.size.toUInt64))
+           | none => none
+         | _ => none) = some env' := rfl
   have hlen : env' 2 = some (.u64 3) := rfl
   cases hpack : packInputWordLists env' st 3 [0, 1] with
   | none =>
@@ -275,5 +283,304 @@ theorem lowerToPTX_decl_nonvacuous :
     simp only [hdata] at hw0 hw1 hw2
     exact ⟨d, ptxMod, env, st, stOut, outId, outBuf, inWords, kern, gFinal,
       hlow, hkerns, heval, hfind, hdata, hptx, hw0, hw1, hw2⟩
+
+/-! ## Track `D6` — `.dotProduct` via `atom.add.global.u64` & sequential multi-kernel visibility -/
+
+set_option maxRecDepth 65536
+
+/-- Concrete LNIR `.dotProduct` reduction (`D6`):
+    `evalParKernelElem` computes elementwise `x[i] * y[i]` (matching `evalParKernelElem` for
+    `.zipMul`/`.dotProduct` at `Semantics/Eval.lean:465–469`) and `evalParFor` folds the sum into a
+    length-1 `sarray` (`match k with | .dotProduct => ...` at `Semantics/Eval.lean:521`). The
+    corresponding multi-CTA PTX kernel (`gridDim.x = 2`,
+    `blockDim.x = 2`, `n = 3`) computes the same `UInt64` sum via cross-CTA `atom.add.global.u64` of
+    `x[gid] * y[gid]`, with out-of-range thread `(ctaid.x = 1, tid.x = 1, gid = 3 >= n)` taking an
+    early predicated `ret` before `bar.sync 0` while active threads synchronize on `bar.sync 0`,
+    yielding `0` UB/race traps and final `.global` accumulator word `10*2 + 20*3 + 30*5 = 230`. -/
+theorem ptx_dotProduct_atom_add_matches_lnir_fold :
+    let d : LNIRDecl :=
+      { name := "dot_decl"
+      , params :=
+          [ { id := 0, name := "x", ty := .sarray .i64 }
+          , { id := 1, name := "y", ty := .sarray .i64 } ]
+      , retTy := .sarray .i64
+      , body := .letBind 2 .i64 (.sarrayLen 0) (.parFor 3 2 [0, 1] .i64 .dotProduct (.ret 3)) }
+    let env : VarEnv := (VarEnv.empty.bind 0 (.sarrayId 1)).bind 1 (.sarrayId 2)
+    let st : HeapState :=
+      { buffers :=
+          [ { id := 1, exclusive := true, data := #[10, 20, 30] }
+          , { id := 2, exclusive := true, data := #[2, 3, 5] } ]
+      , nextId := 2 }
+    let k : PTXKernel :=
+      { name := "ptx_dot_product_atom"
+      , params :=
+          [ { ty := .u64, name := "x" }
+          , { ty := .u64, name := "y" }
+          , { ty := .u64, name := "acc" }
+          , { ty := .u64, name := "n" } ]
+      , regDecls :=
+          [ { ty := .u32, prefixName := "%r", count := 3 }
+          , { ty := .u64, prefixName := "%rd", count := 10 }
+          , { ty := .pred, prefixName := "%p", count := 1 } ]
+      , body :=
+          [ .instr none (.mov .u32 "%r0" (.sreg .ctaidX))
+          , .instr none (.mov .u32 "%r1" (.sreg .ntidX))
+          , .instr none (.mov .u32 "%r2" (.sreg .tidX))
+          , .instr none (.mul .wide .u32 "%rd0" (.reg "%r0") (.reg "%r1"))
+          , .instr none (.cvt .none .u64 .u32 "%rd1" (.reg "%r2"))
+          , .instr none (.add .none .u64 "%rd2" (.reg "%rd0") (.reg "%rd1"))
+          , .instr none (.ldParam .u64 "%rd3" "n")
+          , .instr none (.setp .ge .u64 "%p0" (.reg "%rd2") (.reg "%rd3"))
+          , .instr (some { predReg := "%p0" }) .ret
+          , .instr none (.barSync 0)
+          , .instr none (.shl .b64 "%rd4" (.reg "%rd2") (.immU64 3#64))
+          , .instr none (.ldParam .u64 "%rd5" "x")
+          , .instr none (.add .none .u64 "%rd5" (.reg "%rd5") (.reg "%rd4"))
+          , .instr none (.ldGlobal .u64 "%rd5" (.regOffset "%rd5" 0))
+          , .instr none (.ldParam .u64 "%rd6" "y")
+          , .instr none (.add .none .u64 "%rd6" (.reg "%rd6") (.reg "%rd4"))
+          , .instr none (.ldGlobal .u64 "%rd6" (.regOffset "%rd6" 0))
+          , .instr none (.mul .lo .u64 "%rd7" (.reg "%rd5") (.reg "%rd6"))
+          , .instr none (.ldParam .u64 "%rd8" "acc")
+          , .instr none (.atomAdd .global .u64 "%rd9" (.regOffset "%rd8" 0) (.reg "%rd7"))
+          , .instr none .ret ] }
+    let g0 := ByteMemory.ofU64Words [ 10#64, 20#64, 30#64, 2#64, 3#64, 5#64, 0#64 ]
+    let pm : ParamMemory := { params := [ ("x", 0#64), ("y", 24#64), ("acc", 48#64), ("n", 3#64) ] }
+    (∃ (outId : Nat) (stOut : HeapState) (outBuf : ArrayBuffer),
+      evalCode 8 env st d.body = .ok (.sarrayId outId, stOut) ∧
+      stOut.findBuffer outId = some outBuf ∧
+      outBuf.data = #[230]) ∧
+    (∃ gFinal evs,
+      evalPTXKernelWithOracle none 128 k { x := 2 } { x := 2 } g0 pm = .ok (gFinal, evs) ∧
+      gFinal.loadBits 48 8 = some (230 : UInt64).toBitVec ∧
+      sumAtomAddDeltas (evs.filter (fun e => e.isAtomic)) = 230#64 ∧
+      (evs.filter (fun e => e.isAtomic)).length = 3) := by
+  dsimp only
+  refine ⟨?_, ?_⟩
+  · refine ⟨3,
+      { buffers :=
+          [ { id := 3, exclusive := true, data := #[230] }
+          , { id := 1, exclusive := true, data := #[10, 20, 30] }
+          , { id := 2, exclusive := true, data := #[2, 3, 5] } ]
+        nextId := 3 },
+      { id := 3, exclusive := true, data := #[230] }, ?_, ?_, rfl⟩
+    · simp [evalCode, evalExpr, VarEnv.bind, HeapState.findBuffer,
+        evalParFor, evalVarList, List.range, List.range.loop,
+        evalParKernelLoop, evalParKernelElem, readParInput, HeapState.readElem]
+    · simp [HeapState.findBuffer]
+  · have hchk :
+        (match evalPTXKernelWithOracle none 128
+            { name := "ptx_dot_product_atom"
+            , params :=
+                [ { ty := .u64, name := "x" }
+                , { ty := .u64, name := "y" }
+                , { ty := .u64, name := "acc" }
+                , { ty := .u64, name := "n" } ]
+            , regDecls :=
+                [ { ty := .u32, prefixName := "%r", count := 3 }
+                , { ty := .u64, prefixName := "%rd", count := 10 }
+                , { ty := .pred, prefixName := "%p", count := 1 } ]
+            , body :=
+                [ .instr none (.mov .u32 "%r0" (.sreg .ctaidX))
+                , .instr none (.mov .u32 "%r1" (.sreg .ntidX))
+                , .instr none (.mov .u32 "%r2" (.sreg .tidX))
+                , .instr none (.mul .wide .u32 "%rd0" (.reg "%r0") (.reg "%r1"))
+                , .instr none (.cvt .none .u64 .u32 "%rd1" (.reg "%r2"))
+                , .instr none (.add .none .u64 "%rd2" (.reg "%rd0") (.reg "%rd1"))
+                , .instr none (.ldParam .u64 "%rd3" "n")
+                , .instr none (.setp .ge .u64 "%p0" (.reg "%rd2") (.reg "%rd3"))
+                , .instr (some { predReg := "%p0" }) .ret
+                , .instr none (.barSync 0)
+                , .instr none (.shl .b64 "%rd4" (.reg "%rd2") (.immU64 3#64))
+                , .instr none (.ldParam .u64 "%rd5" "x")
+                , .instr none (.add .none .u64 "%rd5" (.reg "%rd5") (.reg "%rd4"))
+                , .instr none (.ldGlobal .u64 "%rd5" (.regOffset "%rd5" 0))
+                , .instr none (.ldParam .u64 "%rd6" "y")
+                , .instr none (.add .none .u64 "%rd6" (.reg "%rd6") (.reg "%rd4"))
+                , .instr none (.ldGlobal .u64 "%rd6" (.regOffset "%rd6" 0))
+                , .instr none (.mul .lo .u64 "%rd7" (.reg "%rd5") (.reg "%rd6"))
+                , .instr none (.ldParam .u64 "%rd8" "acc")
+                , .instr none (.atomAdd .global .u64 "%rd9" (.regOffset "%rd8" 0) (.reg "%rd7"))
+                , .instr none .ret ] }
+            { x := 2 } { x := 2 }
+            (ByteMemory.ofU64Words [ 10#64, 20#64, 30#64, 2#64, 3#64, 5#64, 0#64 ])
+            { params := [ ("x", 0#64), ("y", 24#64), ("acc", 48#64), ("n", 3#64) ] } with
+         | .ok (gFinal, evs) =>
+           gFinal.loadBits 48 8 == some (230 : UInt64).toBitVec &&
+           sumAtomAddDeltas (evs.filter (fun e => e.isAtomic)) == 230#64 &&
+           (evs.filter (fun e => e.isAtomic)).length == 3
+         | _ => false) = true := rfl
+    revert hchk
+    generalize evalPTXKernelWithOracle none 128 _ { x := 2 } { x := 2 } _ _ = runRes
+    intro hchk
+    cases runRes <;> try contradiction
+    rename_i res
+    rcases res with ⟨gFinal, evs⟩
+    dsimp only at hchk
+    rcases Bool.and_eq_true_iff.mp hchk with ⟨h12, h3⟩
+    rcases Bool.and_eq_true_iff.mp h12 with ⟨h1, h2⟩
+    exact ⟨gFinal, evs, rfl, beq_iff_eq.mp h1, beq_iff_eq.mp h2, beq_iff_eq.mp h3⟩
+
+/-- Sequential multi-kernel host stream (`D6`):
+    `k_0` (`lowerKind "lean_native_decl_dot_mul" .zipMul`, multi-CTA `gridDim.x = 2, blockDim.x = 2`)
+    performs elementwise `zipMul` (`x[i] * y[i]`) into `.global` scratch words `[20, 60, 150]`, and
+    `k_1` performs a multi-CTA `atom.add.global.u64` reduction (with early `ret` + `bar.sync 0` on
+    the out-of-range lane) of those scratch words into `.global` accumulator address `72`. Inter-kernel
+    host stream ordering threads `globalMem` from `k_0` into `k_1` without false cross-launch race
+    traps, matching LNIR `.dotProduct` (`#[230]`) with `0` UB traps. -/
+theorem ptx_seq_zipMul_then_atom_add_eq_dotProduct :
+    let d : LNIRDecl :=
+      { name := "dot_decl"
+      , params :=
+          [ { id := 0, name := "x", ty := .sarray .i64 }
+          , { id := 1, name := "y", ty := .sarray .i64 } ]
+      , retTy := .sarray .i64
+      , body := .letBind 2 .i64 (.sarrayLen 0) (.parFor 3 2 [0, 1] .i64 .dotProduct (.ret 3)) }
+    let env : VarEnv := (VarEnv.empty.bind 0 (.sarrayId 1)).bind 1 (.sarrayId 2)
+    let st : HeapState :=
+      { buffers :=
+          [ { id := 1, exclusive := true, data := #[10, 20, 30] }
+          , { id := 2, exclusive := true, data := #[2, 3, 5] } ]
+      , nextId := 2 }
+    let kMul : PTXKernel := lowerKind "lean_native_decl_dot_mul" .zipMul
+    let kAdd : PTXKernel :=
+      { name := "ptx_atom_add_reduce"
+      , params :=
+          [ { ty := .u64, name := "scratch" }
+          , { ty := .u64, name := "acc" }
+          , { ty := .u64, name := "n" } ]
+      , regDecls :=
+          [ { ty := .u32, prefixName := "%r", count := 3 }
+          , { ty := .u64, prefixName := "%rd", count := 8 }
+          , { ty := .pred, prefixName := "%p", count := 1 } ]
+      , body :=
+          [ .instr none (.mov .u32 "%r0" (.sreg .ctaidX))
+          , .instr none (.mov .u32 "%r1" (.sreg .ntidX))
+          , .instr none (.mov .u32 "%r2" (.sreg .tidX))
+          , .instr none (.mul .wide .u32 "%rd0" (.reg "%r0") (.reg "%r1"))
+          , .instr none (.cvt .none .u64 .u32 "%rd1" (.reg "%r2"))
+          , .instr none (.add .none .u64 "%rd2" (.reg "%rd0") (.reg "%rd1"))
+          , .instr none (.ldParam .u64 "%rd3" "n")
+          , .instr none (.setp .ge .u64 "%p0" (.reg "%rd2") (.reg "%rd3"))
+          , .instr (some { predReg := "%p0" }) .ret
+          , .instr none (.barSync 0)
+          , .instr none (.shl .b64 "%rd4" (.reg "%rd2") (.immU64 3#64))
+          , .instr none (.ldParam .u64 "%rd5" "scratch")
+          , .instr none (.add .none .u64 "%rd5" (.reg "%rd5") (.reg "%rd4"))
+          , .instr none (.ldGlobal .u64 "%rd5" (.regOffset "%rd5" 0))
+          , .instr none (.ldParam .u64 "%rd6" "acc")
+          , .instr none (.atomAdd .global .u64 "%rd7" (.regOffset "%rd6" 0) (.reg "%rd5"))
+          , .instr none .ret ] }
+    let g0 := ByteMemory.ofU64Words
+      [ 10#64, 20#64, 30#64, 2#64, 3#64, 5#64, 0#64, 0#64, 0#64, 0#64 ]
+    let launches : List PTXKernelLaunchSpec :=
+      [ { fuelPerCTA := 128
+        , kernel := kMul
+        , gridDim := { x := 2 }
+        , blockDim := { x := 2 }
+        , paramMem :=
+            { params :=
+                [ ("param_out", 48#64), ("param_in0", 0#64), ("param_in1", 24#64), ("param_n", 3#64) ] } }
+      , { fuelPerCTA := 128
+        , kernel := kAdd
+        , gridDim := { x := 2 }
+        , blockDim := { x := 2 }
+        , paramMem := { params := [ ("scratch", 48#64), ("acc", 72#64), ("n", 3#64) ] } } ]
+    (∃ (outId : Nat) (stOut : HeapState) (outBuf : ArrayBuffer),
+      evalCode 8 env st d.body = .ok (.sarrayId outId, stOut) ∧
+      stOut.findBuffer outId = some outBuf ∧
+      outBuf.data = #[230]) ∧
+    (∃ gFinal evs,
+      evalPTXMultiKernelSeq launches g0 = .ok (gFinal, evs) ∧
+      gFinal.loadBits 48 8 = some 20#64 ∧
+      gFinal.loadBits 56 8 = some 60#64 ∧
+      gFinal.loadBits 64 8 = some 150#64 ∧
+      gFinal.loadBits 72 8 = some (230 : UInt64).toBitVec ∧
+      (evs.filter (fun e => e.kernelIdx == 0 && e.isWrite)).length = 3 ∧
+      (evs.filter (fun e => e.kernelIdx == 1 && e.isAtomic)).length = 3 ∧
+      sumAtomAddDeltas (evs.filter (fun e => e.kernelIdx == 1 && e.isAtomic)) = 230#64) := by
+  dsimp only
+  refine ⟨?_, ?_⟩
+  · refine ⟨3,
+      { buffers :=
+          [ { id := 3, exclusive := true, data := #[230] }
+          , { id := 1, exclusive := true, data := #[10, 20, 30] }
+          , { id := 2, exclusive := true, data := #[2, 3, 5] } ]
+        nextId := 3 },
+      { id := 3, exclusive := true, data := #[230] }, ?_, ?_, rfl⟩
+    · simp [evalCode, evalExpr, VarEnv.bind, HeapState.findBuffer,
+        evalParFor, evalVarList, List.range, List.range.loop,
+        evalParKernelLoop, evalParKernelElem, readParInput, HeapState.readElem]
+    · simp [HeapState.findBuffer]
+  · have hchk :
+        (match evalPTXMultiKernelSeq
+            [ { fuelPerCTA := 128
+              , kernel := lowerKind "lean_native_decl_dot_mul" .zipMul
+              , gridDim := { x := 2 }
+              , blockDim := { x := 2 }
+              , paramMem :=
+                  { params :=
+                      [ ("param_out", 48#64)
+                      , ("param_in0", 0#64)
+                      , ("param_in1", 24#64)
+                      , ("param_n", 3#64) ] } }
+            , { fuelPerCTA := 128
+              , kernel :=
+                  { name := "ptx_atom_add_reduce"
+                  , params :=
+                      [ { ty := .u64, name := "scratch" }
+                      , { ty := .u64, name := "acc" }
+                      , { ty := .u64, name := "n" } ]
+                  , regDecls :=
+                      [ { ty := .u32, prefixName := "%r", count := 3 }
+                      , { ty := .u64, prefixName := "%rd", count := 8 }
+                      , { ty := .pred, prefixName := "%p", count := 1 } ]
+                  , body :=
+                      [ .instr none (.mov .u32 "%r0" (.sreg .ctaidX))
+                      , .instr none (.mov .u32 "%r1" (.sreg .ntidX))
+                      , .instr none (.mov .u32 "%r2" (.sreg .tidX))
+                      , .instr none (.mul .wide .u32 "%rd0" (.reg "%r0") (.reg "%r1"))
+                      , .instr none (.cvt .none .u64 .u32 "%rd1" (.reg "%r2"))
+                      , .instr none (.add .none .u64 "%rd2" (.reg "%rd0") (.reg "%rd1"))
+                      , .instr none (.ldParam .u64 "%rd3" "n")
+                      , .instr none (.setp .ge .u64 "%p0" (.reg "%rd2") (.reg "%rd3"))
+                      , .instr (some { predReg := "%p0" }) .ret
+                      , .instr none (.barSync 0)
+                      , .instr none (.shl .b64 "%rd4" (.reg "%rd2") (.immU64 3#64))
+                      , .instr none (.ldParam .u64 "%rd5" "scratch")
+                      , .instr none (.add .none .u64 "%rd5" (.reg "%rd5") (.reg "%rd4"))
+                      , .instr none (.ldGlobal .u64 "%rd5" (.regOffset "%rd5" 0))
+                      , .instr none (.ldParam .u64 "%rd6" "acc")
+                      , .instr none (.atomAdd .global .u64 "%rd7" (.regOffset "%rd6" 0) (.reg "%rd5"))
+                      , .instr none .ret ] }
+              , gridDim := { x := 2 }
+              , blockDim := { x := 2 }
+              , paramMem := { params := [ ("scratch", 48#64), ("acc", 72#64), ("n", 3#64) ] } } ]
+            (ByteMemory.ofU64Words
+              [ 10#64, 20#64, 30#64, 2#64, 3#64, 5#64, 0#64, 0#64, 0#64, 0#64 ]) with
+         | .ok (gFinal, evs) =>
+           gFinal.loadBits 48 8 == some 20#64 &&
+           gFinal.loadBits 56 8 == some 60#64 &&
+           gFinal.loadBits 64 8 == some 150#64 &&
+           gFinal.loadBits 72 8 == some (230 : UInt64).toBitVec &&
+           (evs.filter (fun e => e.kernelIdx == 0 && e.isWrite)).length == 3 &&
+           (evs.filter (fun e => e.kernelIdx == 1 && e.isAtomic)).length == 3 &&
+           sumAtomAddDeltas (evs.filter (fun e => e.kernelIdx == 1 && e.isAtomic)) == 230#64
+         | _ => false) = true := rfl
+    revert hchk
+    generalize evalPTXMultiKernelSeq _ _ = rr
+    intro hchk
+    cases rr <;> try contradiction
+    rename_i res
+    rcases res with ⟨gFinal, evs⟩
+    dsimp only at hchk
+    rcases Bool.and_eq_true_iff.mp hchk with ⟨h16, h7⟩
+    rcases Bool.and_eq_true_iff.mp h16 with ⟨h15, h6⟩
+    rcases Bool.and_eq_true_iff.mp h15 with ⟨h14, h5⟩
+    rcases Bool.and_eq_true_iff.mp h14 with ⟨h13, h4⟩
+    rcases Bool.and_eq_true_iff.mp h13 with ⟨h12, h3⟩
+    rcases Bool.and_eq_true_iff.mp h12 with ⟨h1, h2⟩
+    exact ⟨gFinal, evs, rfl, beq_iff_eq.mp h1, beq_iff_eq.mp h2, beq_iff_eq.mp h3,
+      beq_iff_eq.mp h4, beq_iff_eq.mp h5, beq_iff_eq.mp h6, beq_iff_eq.mp h7⟩
 
 end LeanNative.Proofs.PTXDeclProofs
