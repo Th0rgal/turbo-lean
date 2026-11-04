@@ -6664,7 +6664,11 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
     }
 
     let clean = strip_lean_comments(src);
-    let spans = parse_command_spans(src, &clean);
+    let body_spans = if hdr.body_byte_offset >= src.len() {
+        Vec::new()
+    } else {
+        parse_command_spans(&src[hdr.body_byte_offset..], &clean[hdr.body_byte_offset..])
+    };
     let mut stack: Vec<PubScopeFrame> = Vec::new();
     let mut declarations: Vec<PublicDeclSig> = Vec::new();
     let mut meta_declarations: Vec<PublicDeclSig> = Vec::new();
@@ -6673,6 +6677,21 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
     let mut meta_directives_hasher = blake3::Hasher::new();
     meta_directives_hasher.update(b"meta-directives:v1\n");
     let mut active_context_vars: Vec<String> = Vec::new();
+    for spec in &hdr.import_specs {
+        if !spec.is_exported {
+            let cmd = match (spec.is_meta, spec.import_all) {
+                (false, false) => format!("import {}", spec.module),
+                (false, true) => format!("import all {}", spec.module),
+                (true, false) => format!("meta import {}", spec.module),
+                (true, true) => format!("meta import all {}", spec.module),
+            };
+            active_context_vars.push(cmd);
+        }
+    }
+
+    let is_non_exported_import_cmd = |cmd_trimmed: &str| -> bool {
+        cmd_trimmed.starts_with("import ") || cmd_trimmed.starts_with("meta import ")
+    };
 
     let is_all_local_attribute_cmd = |after_prefixes: &str| -> bool {
         after_prefixes
@@ -6812,7 +6831,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                     };
 
                 let mut sig_h = blake3::Hasher::new();
-                sig_h.update(b"decl-sig:v3\n");
+                sig_h.update(b"decl-sig:v4\n");
                 for v in active_vars {
                     sig_h.update(b"ctx:");
                     sig_h.update(v.as_bytes());
@@ -6928,7 +6947,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             }
         };
 
-    for span in &spans {
+    for span in &body_spans {
         let trimmed = span.clean_text.trim();
         let after_p = strip_decl_prefixes(trimmed);
         let (span_mods, span_attrs) = parse_decl_modifiers_and_attrs(trimmed);
@@ -6936,8 +6955,11 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
         let has_local_attr = span_attrs
             .iter()
             .any(|a| a == "local" || a.starts_with("local "));
-        let records_local_elab_ctx =
-            has_local_mod || has_local_attr || has_any_local_attribute_cmd(after_p);
+        let records_local_elab_ctx = has_local_mod
+            || has_local_attr
+            || has_any_local_attribute_cmd(after_p)
+            || is_non_exported_import_cmd(trimmed)
+            || is_non_exported_import_cmd(after_p);
         if after_p.starts_with("variable ")
             || after_p.starts_with("variables ")
             || after_p.starts_with("universe ")
@@ -6977,6 +6999,8 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                         .iter()
                         .any(|a| a == "local" || a.starts_with("local "))
                     || has_any_local_attribute_cmd(sub_after_p)
+                    || is_non_exported_import_cmd(sub_trimmed)
+                    || is_non_exported_import_cmd(sub_after_p)
                 {
                     active_context_vars.push(normalize_whitespace(sub_trimmed));
                 }
@@ -8982,6 +9006,79 @@ public theorem uses_ctx : True := trivial
             extract_public_signature(trailing_local_v1).public_signature_digest,
             extract_public_signature(trailing_local_v2).public_signature_digest,
             "trailing local notation after all public declarations must not alter public_signature_digest"
+        );
+
+        for (label, imp1, imp2) in [
+            ("plain import", "import Smoke.A", "import Smoke.B"),
+            ("meta import", "meta import Smoke.A", "meta import Smoke.B"),
+            ("import all", "import all Smoke.A", "import all Smoke.B"),
+            (
+                "meta import all",
+                "meta import all Smoke.A",
+                "meta import all Smoke.B",
+            ),
+        ] {
+            let s1 = format!("module\n{imp1}\npublic def api := foo\n");
+            let s2 = format!("module\n{imp2}\npublic def api := foo\n");
+            let sig_a = extract_public_signature(&s1);
+            let sig_b = extract_public_signature(&s2);
+            assert_eq!(sig_a.declarations.len(), 1, "{label}: declarations count");
+            assert_eq!(sig_b.declarations.len(), 1, "{label}: declarations count");
+            assert_ne!(
+                sig_a.declarations[0].sig_hash, sig_b.declarations[0].sig_hash,
+                "{label}: changing non-exported import before public decl must change sig_hash"
+            );
+            assert_ne!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: changing non-exported import before public decl must change public_signature_digest"
+            );
+
+            let meta_s1 = format!("module\n{imp1}\npublic meta def metaApi := foo\n");
+            let meta_s2 = format!("module\n{imp2}\npublic meta def metaApi := foo\n");
+            let msig_a = extract_public_signature(&meta_s1);
+            let msig_b = extract_public_signature(&meta_s2);
+            assert_ne!(
+                msig_a.meta_signature_digest, msig_b.meta_signature_digest,
+                "{label}: changing non-exported import before public meta decl must change meta_signature_digest"
+            );
+        }
+
+        let no_pub_decl_imp1 = "module\nimport Smoke.A\nprivate def privOnly : Nat := 1\n";
+        let no_pub_decl_imp2 = "module\nimport Smoke.B\nprivate def privOnly : Nat := 1\n";
+        assert_eq!(
+            extract_public_signature(no_pub_decl_imp1).public_signature_digest,
+            extract_public_signature(no_pub_decl_imp2).public_signature_digest,
+            "non-exported import change with no subsequent public declarations must not alter public_signature_digest"
+        );
+
+        let trailing_imp_v1 = "module\npublic def api : Nat := 1\nimport Smoke.A\n";
+        let trailing_imp_v2 = "module\npublic def api : Nat := 1\nimport Smoke.B\n";
+        let ts1 = extract_public_signature(trailing_imp_v1);
+        let ts2 = extract_public_signature(trailing_imp_v2);
+        assert_eq!(
+            ts1.public_directives_hash, ts2.public_directives_hash,
+            "trailing non-exported import after all public decls must not pollute public_directives_hash"
+        );
+        assert_eq!(
+            ts1.public_signature_digest, ts2.public_signature_digest,
+            "trailing non-exported import after all public decls must not alter public_signature_digest"
+        );
+
+        let exp_imp_v1 = "module\npublic import Smoke.A\n";
+        let exp_imp_v2 = "module\npublic import Smoke.B\n";
+        assert_ne!(
+            extract_public_signature(exp_imp_v1).public_signature_digest,
+            extract_public_signature(exp_imp_v2).public_signature_digest,
+            "exported public import change must still alter public_signature_digest even without declarations"
+        );
+        let meta_exp_imp_v1 = "module\npublic meta import Smoke.A\n";
+        let meta_exp_imp_v2 = "module\npublic meta import Smoke.B\n";
+        let mex1 = extract_public_signature(meta_exp_imp_v1);
+        let mex2 = extract_public_signature(meta_exp_imp_v2);
+        assert_eq!(mex1.public_signature_digest, mex2.public_signature_digest);
+        assert_ne!(
+            mex1.meta_signature_digest, mex2.meta_signature_digest,
+            "exported public meta import change must alter meta_signature_digest"
         );
     }
 }

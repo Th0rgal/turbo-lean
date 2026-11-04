@@ -9934,6 +9934,48 @@ public def localNotVal : MYTYPE := true
             vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
         );
 
+        fs::write(
+            proj.join("Smoke/Provider1.lean"),
+            "module\npublic def foo : Nat := 0\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/Provider2.lean"),
+            "module\npublic def foo : Bool := true\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\nimport Smoke.Provider1\npublic def api := foo\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/B.lean"),
+            "module\npublic import Smoke.A\npublic def useApi := api\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/C.lean"),
+            "module\nimport Smoke.B\npublic def useApiC := useApi\n",
+        )?;
+        run_git(&["add", "."])?;
+        run_git(&["commit", "-m", "non-exported import baseline"])?;
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\nimport Smoke.Provider2\npublic def api := foo\n",
+        )?;
+        let rep_nonexp_imp = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_nonexp_imp.edit_class, "public_signature_edit");
+        assert!(
+            rep_nonexp_imp.public_signature_changed,
+            "non-exported import change before a public declaration must mark `public_signature_changed = true`"
+        );
+        assert_eq!(
+            rep_nonexp_imp.transitive_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+        assert!(rep_nonexp_imp.pruned_dependents.is_empty());
+
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
