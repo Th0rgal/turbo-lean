@@ -196,6 +196,12 @@ enum Commands {
         /// Optional Ed25519 private signing key (32-byte hex seed; falls back to TURBO_LEAN_PACK_SIGNING_KEY)
         #[arg(long)]
         signing_key: Option<String>,
+        /// Optional target module or library whose transitive DAG cone should be exported
+        #[arg(long)]
+        cone: Option<String>,
+        /// Optional Lean project directory used to resolve `--cone` (defaults to current working directory)
+        #[arg(short = 'p', long)]
+        project_dir: Option<PathBuf>,
     },
     /// Import and BLAKE3-verify a .tlpack CAS bundle into local SQLite & CAS
     Import {
@@ -1400,7 +1406,17 @@ fn run(cli: Cli) -> Result<()> {
             output,
             portable_only,
             signing_key,
-        } => pack::run_export_command(&store, cli.json, output, portable_only, signing_key),
+            cone,
+            project_dir,
+        } => pack::run_export_command(
+            &store,
+            cli.json,
+            output,
+            portable_only,
+            signing_key,
+            cone,
+            project_dir,
+        ),
 
         Commands::Import {
             input,

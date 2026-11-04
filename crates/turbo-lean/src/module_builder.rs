@@ -7181,6 +7181,96 @@ pub(crate) fn lean_githash_for_bin(lean_bin: &Path) -> Option<String> {
     Some(gh)
 }
 
+pub(crate) fn discover_host_installed_lean_githashes() -> HashSet<String> {
+    let mut githashes = HashSet::new();
+    let mut elan_roots: Vec<PathBuf> = Vec::new();
+    if let Ok(extra_roots) = std::env::var("TURBO_LEAN_ELAN_ROOTS") {
+        for r in std::env::split_paths(&extra_roots) {
+            if r.is_dir() && !elan_roots.contains(&r) {
+                elan_roots.push(r);
+            }
+        }
+    }
+    if let Ok(eh) = std::env::var("ELAN_HOME") {
+        let p = PathBuf::from(eh);
+        if p.is_dir() && !elan_roots.contains(&p) {
+            elan_roots.push(p);
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let home_path = PathBuf::from(&home);
+        let p = home_path.join(".elan");
+        if p.is_dir() && !elan_roots.contains(&p) {
+            elan_roots.push(p);
+        }
+        let mut anc = home_path.parent();
+        for _ in 0..3 {
+            if let Some(a) = anc {
+                for cand in [a.join(".elan"), a.join("caches/elan")] {
+                    if cand.is_dir() && !elan_roots.contains(&cand) {
+                        elan_roots.push(cand);
+                    }
+                }
+                anc = a.parent();
+            }
+        }
+    }
+    for sys_elan in [
+        "/root/.elan",
+        "/var/lib/sandboxed-node/.elan",
+        "/var/lib/sandboxed-node/caches/elan",
+        "/var/lib/orb-node/caches/elan",
+        "/var/lib/orb-node/.elan",
+        "/var/lib/orb-node/work/caches/elan",
+        "/opt/orb/elan",
+    ] {
+        let p = PathBuf::from(sys_elan);
+        if p.is_dir() && !elan_roots.contains(&p) {
+            elan_roots.push(p);
+        }
+    }
+    if let Ok(path_var) = std::env::var("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            for bin_name in ["lean", "lean.exe"] {
+                let cand = dir.join(bin_name);
+                if cand.is_file() {
+                    if let Some(gh) = lean_githash_for_bin(&cand) {
+                        githashes.insert(gh);
+                    }
+                }
+            }
+            if let Some(parent) = dir.parent() {
+                if parent.join("toolchains").is_dir() && !elan_roots.contains(&parent.to_path_buf())
+                {
+                    elan_roots.push(parent.to_path_buf());
+                } else if let Some(gp) = parent.parent().and_then(|p| p.parent()) {
+                    if gp.join("toolchains").is_dir() && !elan_roots.contains(&gp.to_path_buf()) {
+                        elan_roots.push(gp.to_path_buf());
+                    }
+                }
+            }
+        }
+    }
+    for root in elan_roots {
+        let tc_dir = root.join("toolchains");
+        let Ok(entries) = fs::read_dir(&tc_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            for bin_rel in ["bin/lean", "bin/lean.exe"] {
+                let cand = p.join(bin_rel);
+                if cand.is_file() {
+                    if let Some(gh) = lean_githash_for_bin(&cand) {
+                        githashes.insert(gh);
+                    }
+                }
+            }
+        }
+    }
+    githashes
+}
+
 pub(crate) fn lean_githash_for_sysroot_lib_lean(dir: &Path) -> Option<String> {
     let check_root = |p: &Path| -> Option<PathBuf> {
         if !p.ends_with("lib/lean") {
@@ -16845,6 +16935,7 @@ fn run_audit_or_replay_batch_worker(
     cfg: &ProjectConfig,
     dag: &ModuleDag,
     mod_names: &[String],
+    already_replayed: &HashSet<String>,
     lean_path_env: &str,
     is_untrusted: bool,
 ) -> Result<AuditBatchWorkerOutcome> {
@@ -16907,6 +16998,10 @@ fn run_audit_or_replay_batch_worker(
                     "Kernel replay received an empty module name: fail-closed"
                 )),
             );
+            continue;
+        }
+        if !is_untrusted && already_replayed.contains(m) {
+            per_mod.insert(m.clone(), Ok(()));
             continue;
         }
         record_scheduler_test_event("replay_subprocess_start", std::slice::from_ref(m));
@@ -17201,6 +17296,7 @@ pub fn build_project_modules_native(
             res: Result<AuditBatchWorkerOutcome>,
         },
         CasHashFinished {
+            mod_name: String,
             mod_key: String,
             dur_ms: i64,
             res: Result<StagedCasBlobItems>,
@@ -17227,6 +17323,9 @@ pub fn build_project_modules_native(
     let mut compile_keys: HashMap<String, String> = HashMap::new();
     let mut pending_audit_queue: VecDeque<String> = VecDeque::new();
     let mut pending_audit_meta: HashMap<String, PendingAuditOrigin> = HashMap::new();
+    let remote_cache_url = crate::pack::resolve_remote_cache_url();
+    let remote_cache_token = crate::pack::resolve_remote_cache_token();
+    let mut remote_manifest_cache: Option<crate::pack::DeltaManifest> = None;
 
     let store_root_buf = store.root.clone();
     let cfg_ref = &cfg;
@@ -17327,16 +17426,17 @@ pub fn build_project_modules_native(
             });
         }
 
-        let (audit_tx, audit_rx) = std::sync::mpsc::channel::<Vec<String>>();
+        let (audit_tx, audit_rx) = std::sync::mpsc::channel::<(Vec<String>, HashSet<String>)>();
         {
             let tx = event_tx.clone();
             s.spawn(move || {
-                while let Ok(batch_mods) = audit_rx.recv() {
+                while let Ok((batch_mods, already_replayed)) = audit_rx.recv() {
                     let res = run_audit_or_replay_batch_worker(
                         store_root_ref,
                         cfg_ref,
                         dag_ref,
                         &batch_mods,
+                        &already_replayed,
                         lp_ref,
                         is_untrusted,
                     );
@@ -17362,6 +17462,7 @@ pub fn build_project_modules_native(
                         std::slice::from_ref(&job.mod_name),
                     );
                     let _ = tx.send(SchedulerEvent::CasHashFinished {
+                        mod_name: job.mod_name,
                         mod_key: job.mod_key,
                         dur_ms: job.dur_ms,
                         res: Ok(job.raw_items),
@@ -17393,19 +17494,54 @@ pub fn build_project_modules_native(
                             node.needs_c,
                             &dynlib_digests,
                         )?;
-                        let mut cas_hit_outputs: Option<Vec<BlobEntry>> = None;
-                        if let Some(outputs) = store.get_cached_action(&mod_key, trust_domain)? {
-                            cas_hit_outputs = Some(outputs);
-                        } else if !node.needs_c {
-                            let c_key = compute_module_cas_key_with_dynlibs(
+                        let fallback_c_key_opt = if !node.needs_c {
+                            Some(compute_module_cas_key_with_dynlibs(
                                 &cfg,
                                 node,
                                 &dep_digests_vec,
                                 true,
                                 &dynlib_digests,
-                            )?;
-                            if let Some(outputs) = store.get_cached_action(&c_key, trust_domain)? {
+                            )?)
+                        } else {
+                            None
+                        };
+                        let mut cas_hit_outputs: Option<Vec<BlobEntry>> = None;
+                        if let Some(outputs) = store.get_cached_action(&mod_key, trust_domain)? {
+                            cas_hit_outputs = Some(outputs);
+                        } else if let Some(ref c_key) = fallback_c_key_opt {
+                            if let Some(outputs) = store.get_cached_action(c_key, trust_domain)? {
                                 cas_hit_outputs = Some(outputs);
+                            }
+                        }
+                        if cas_hit_outputs.is_none() {
+                            if let Some(ref rem_url) = remote_cache_url {
+                                let mut wanted = vec![mod_key.clone()];
+                                if let Some(ref c_key) = fallback_c_key_opt {
+                                    wanted.push(c_key.clone());
+                                }
+                                if crate::pack::try_pull_remote_module_action(
+                                    store,
+                                    rem_url,
+                                    remote_cache_token.as_deref(),
+                                    &mut remote_manifest_cache,
+                                    &wanted,
+                                    trust_domain,
+                                    is_untrusted,
+                                )
+                                .unwrap_or(false)
+                                {
+                                    if let Some(outputs) =
+                                        store.get_cached_action(&mod_key, trust_domain)?
+                                    {
+                                        cas_hit_outputs = Some(outputs);
+                                    } else if let Some(ref c_key) = fallback_c_key_opt {
+                                        if let Some(outputs) =
+                                            store.get_cached_action(c_key, trust_domain)?
+                                        {
+                                            cas_hit_outputs = Some(outputs);
+                                        }
+                                    }
+                                }
                             }
                         }
                         let target_root = if node.pkg_root.starts_with(&canon_dir) {
@@ -17582,7 +17718,24 @@ pub fn build_project_modules_native(
                     batch_mods.push(m);
                 }
                 if !batch_mods.is_empty() {
-                    if audit_tx.send(batch_mods).is_ok() {
+                    let mut already_replayed = HashSet::new();
+                    if !is_untrusted {
+                        for m in &batch_mods {
+                            if let Some(node) = dag.nodes.get(m) {
+                                if !node.is_root_pkg
+                                    && is_olean_replayed_in_store(
+                                        store,
+                                        &cfg,
+                                        &lean_path_env,
+                                        &node.olean_path,
+                                    )
+                                {
+                                    already_replayed.insert(m.clone());
+                                }
+                            }
+                        }
+                    }
+                    if audit_tx.send((batch_mods, already_replayed)).is_ok() {
                         audit_worker_busy = true;
                     } else {
                         fatal_err = Some(anyhow::anyhow!(
@@ -17935,6 +18088,7 @@ pub fn build_project_modules_native(
                     }
                 }
                 SchedulerEvent::CasHashFinished {
+                    mod_name,
                     mod_key,
                     dur_ms,
                     res,
@@ -17955,6 +18109,23 @@ pub fn build_project_modules_native(
                                 hashed_items,
                             ) {
                                 fatal_err = Some(e);
+                            } else if !is_untrusted && trust_domain == "trusted" {
+                                if let Some(ref rem_url) = remote_cache_url {
+                                    let replay_dig = dag.nodes.get(&mod_name).and_then(|n| {
+                                        compute_replayed_olean_ilean_digest(&n.olean_path).ok()
+                                    });
+                                    let _ = crate::pack::try_push_remote_module_action(
+                                        store,
+                                        rem_url,
+                                        remote_cache_token.as_deref(),
+                                        &mut remote_manifest_cache,
+                                        &mod_key,
+                                        &mod_name,
+                                        replay_dig.as_deref(),
+                                        trust_domain,
+                                        is_untrusted,
+                                    );
+                                }
                             }
                         }
                         Err(e) => {
@@ -18001,6 +18172,183 @@ pub fn build_project_modules_native(
         .cached_modules
         .sort_by_key(|m| topo_rank.get(m.as_str()).copied().unwrap_or(usize::MAX));
     Ok(report)
+}
+
+fn compute_cas_outputs_artifact_and_replay_digests(
+    outputs: &[BlobEntry],
+) -> Option<(String, String)> {
+    let find_hash = |suffix: &str| -> Option<&str> {
+        outputs
+            .iter()
+            .find(|e| {
+                e.rel_path == suffix.trim_start_matches('/')
+                    || e.rel_path.ends_with(suffix)
+                    || e.rel_path.ends_with(&suffix.replace('/', "\\"))
+            })
+            .map(|e| e.blob_hash.as_str())
+    };
+    let olean_hex = find_hash(".olean")?;
+    let srv_hex = find_hash(".olean.server");
+    let priv_hex = find_hash(".olean.private");
+    let ilean_hex = find_hash(".ilean");
+    let ir_hex = find_hash(".ir");
+    let ir_sig_hex = find_hash(".ir.sig");
+
+    let mut art_h = blake3::Hasher::new();
+    art_h.update(b"olean-art-v2\n");
+    for (tag, hex_opt) in [
+        ("olean", Some(olean_hex)),
+        ("srv", srv_hex),
+        ("priv", priv_hex),
+        ("ilean", ilean_hex),
+        ("ir", ir_hex),
+        ("ir_sig", ir_sig_hex),
+    ] {
+        let present = hex_opt.is_some();
+        if tag != "olean" {
+            art_h.update(&[u8::from(present)]);
+        }
+        if let Some(hex_str) = hex_opt {
+            let raw_hash = crate::pack::decode_hex_fixed::<32>(hex_str).ok()?;
+            update_lp(&mut art_h, tag.as_bytes(), &raw_hash);
+        } else {
+            update_lp(&mut art_h, tag.as_bytes(), b"");
+        }
+    }
+
+    let mut rep_h = blake3::Hasher::new();
+    rep_h.update(b"turbo-lean-replayed-olean-ilean-v1\n");
+    for (tag, hex_opt) in [
+        ("olean", Some(olean_hex)),
+        ("ilean", ilean_hex),
+        ("srv", srv_hex),
+        ("priv", priv_hex),
+    ] {
+        let present = hex_opt.is_some();
+        rep_h.update(&[u8::from(present)]);
+        if let Some(hex_str) = hex_opt {
+            let raw_hash = crate::pack::decode_hex_fixed::<32>(hex_str).ok()?;
+            update_lp(&mut rep_h, tag.as_bytes(), &raw_hash);
+        } else {
+            update_lp(&mut rep_h, tag.as_bytes(), b"");
+        }
+    }
+
+    Some((
+        art_h.finalize().to_hex().to_string(),
+        rep_h.finalize().to_hex().to_string(),
+    ))
+}
+
+pub fn build_cone_export_filter(
+    store: &TurboStore,
+    project_dir: &Path,
+    cone_target: &str,
+) -> Result<crate::pack::ExportInclusionFilter> {
+    let target = cone_target.trim();
+    anyhow::ensure!(
+        !target.is_empty(),
+        "`--cone` target must be a non-empty module or library name"
+    );
+    let canon_dir = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let cfg = resolve_project_config_with_trust(&canon_dir, false)?;
+    // Use `is_untrusted = true` solely during cone DAG expansion so dependency-package
+    // modules with fresh `.olean`s on disk are expanded as explicit `ModuleNode`s in
+    // `dag.topological_order` (rather than pruned into `external_olean_deps`), ensuring
+    // `--cone <Target>` exports portable `module_unit` actions for a cold destination machine.
+    let dag = build_module_dag_with_trust(&cfg, &[target.to_string()], true)?;
+    let preserve_project = crate::lake_build::worktree_auto_link_disabled(&canon_dir);
+
+    let mut olean_digests: HashMap<String, String> = HashMap::new();
+    let mut allowed_actions: HashSet<String> = HashSet::new();
+    let mut allowed_replay_modules: HashSet<String> = HashSet::new();
+    let mut allowed_replay_artifact_digests: HashSet<String> = HashSet::new();
+
+    for node in dag.nodes.values() {
+        allowed_replay_modules.insert(node.module_name.clone());
+        for (ext_mod, ext_path) in &node.external_olean_deps {
+            allowed_replay_modules.insert(ext_mod.clone());
+            if !olean_digests.contains_key(ext_mod) {
+                if let Ok(d) =
+                    compute_olean_artifact_set_digest_with_policy(ext_path, preserve_project)
+                {
+                    olean_digests.insert(ext_mod.clone(), d);
+                }
+                if let Ok(rd) = compute_replayed_olean_ilean_digest(ext_path) {
+                    allowed_replay_artifact_digests.insert(rd);
+                }
+            }
+        }
+    }
+
+    for mod_name in &dag.topological_order {
+        let Some(node) = dag.nodes.get(mod_name) else {
+            continue;
+        };
+        let Ok((dep_digests_vec, _, dynlib_digests)) =
+            gather_module_dep_digests_and_dynlibs(&dag, node, &olean_digests)
+        else {
+            if let Ok(disk_dig) =
+                compute_olean_artifact_set_digest_with_policy(&node.olean_path, preserve_project)
+            {
+                olean_digests.insert(mod_name.clone(), disk_dig);
+            }
+            if let Ok(rd) = compute_replayed_olean_ilean_digest(&node.olean_path) {
+                allowed_replay_artifact_digests.insert(rd);
+            }
+            continue;
+        };
+        let key_no_c = compute_module_cas_key_with_dynlibs(
+            &cfg,
+            node,
+            &dep_digests_vec,
+            false,
+            &dynlib_digests,
+        )?;
+        let key_with_c = compute_module_cas_key_with_dynlibs(
+            &cfg,
+            node,
+            &dep_digests_vec,
+            true,
+            &dynlib_digests,
+        )?;
+        let mut resolved_dig: Option<String> = None;
+        for cand_key in [&key_no_c, &key_with_c] {
+            if let Ok(Some(outputs)) = store.get_cached_action(cand_key, "trusted") {
+                allowed_actions.insert(cand_key.clone());
+                if let Some((art_dig, rep_dig)) =
+                    compute_cas_outputs_artifact_and_replay_digests(&outputs)
+                {
+                    let preferred_key = if node.needs_c { &key_with_c } else { &key_no_c };
+                    if resolved_dig.is_none() || cand_key == preferred_key {
+                        resolved_dig = Some(art_dig);
+                    }
+                    allowed_replay_artifact_digests.insert(rep_dig);
+                }
+            }
+        }
+        if resolved_dig.is_none() {
+            if let Ok(disk_dig) =
+                compute_olean_artifact_set_digest_with_policy(&node.olean_path, preserve_project)
+            {
+                resolved_dig = Some(disk_dig);
+            }
+        }
+        if let Ok(rd) = compute_replayed_olean_ilean_digest(&node.olean_path) {
+            allowed_replay_artifact_digests.insert(rd);
+        }
+        if let Some(dig) = resolved_dig {
+            olean_digests.insert(mod_name.clone(), dig);
+        }
+    }
+
+    Ok(crate::pack::ExportInclusionFilter {
+        allowed_actions: Some(allowed_actions),
+        allowed_replay_modules: Some(allowed_replay_modules),
+        allowed_replay_artifact_digests: Some(allowed_replay_artifact_digests),
+    })
 }
 #[cfg(test)]
 pub(crate) static BWRAP_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -29395,6 +29743,346 @@ globs = ["Down.+"]
             fb_idx < bad_accept_idx && bad_accept_idx < child_dispatch_idx,
             "WarmFb.Child must not dispatch until WarmFb.Bad falls back, recompiles, and passes audit (fb={fb_idx}, accept={bad_accept_idx}, child={child_dispatch_idx})"
         );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_speed3_attested_replay_transfer_and_cone_export_skip_dep_replay() -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("speed3_replay_and_cone");
+        let sk_hex = "7777777777777777777777777777777777777777777777777777777777777777";
+        let pk_hex = crate::receipt::ed25519_verifying_key_hex(&[0x77u8; 32]);
+
+        let build_workspace = |root: &Path| -> Result<()> {
+            let dep_dir = root.join(".lake/packages/dep_pkg");
+            fs::create_dir_all(dep_dir.join("Dep"))?;
+            fs::create_dir_all(root.join("ConeA"))?;
+            fs::create_dir_all(root.join("ConeB"))?;
+            fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+            fs::write(dep_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+            fs::write(
+                dep_dir.join("lakefile.toml"),
+                "name = \"dep_pkg\"\ndefaultTargets = [\"Dep\"]\n[[lean_lib]]\nname = \"Dep\"\nglobs = [\"Dep.+\"]\n",
+            )?;
+            fs::write(dep_dir.join("Dep/Base.lean"), "def depBase : Nat := 42\n")?;
+            fs::write(
+                root.join("lake-manifest.json"),
+                r#"{"version":"1.1.0","packagesDir":".lake/packages","packages":[{"type":"path","name":"dep_pkg","dir":".lake/packages/dep_pkg"}]}"#,
+            )?;
+            fs::write(
+                root.join("lakefile.toml"),
+                "name = \"cone_root\"\ndefaultTargets = [\"ConeA\", \"ConeB\"]\n[[lean_lib]]\nname = \"ConeA\"\nglobs = [\"ConeA.+\"]\n[[lean_lib]]\nname = \"ConeB\"\nglobs = [\"ConeB.+\"]\n",
+            )?;
+            fs::write(
+                root.join("ConeA/Main.lean"),
+                "import Dep.Base\ndef coneAVal : Nat := depBase + 1\n",
+            )?;
+            fs::write(
+                root.join("ConeB/Unrelated.lean"),
+                "def coneBVal : Nat := 999\n",
+            )?;
+            Ok(())
+        };
+
+        let proj_src = dir.join("proj_src");
+        build_workspace(&proj_src)?;
+        let mut store_src = TurboStore::open(Some(&dir.join("store_src")))?;
+        let rep_src = build_project_modules_native(
+            &mut store_src,
+            &proj_src,
+            &[],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        assert_eq!(rep_src.modules_compiled, 3);
+
+        // Export `--cone ConeA.Main` signed with `sk_hex`; verify `ConeB.Unrelated` is excluded
+        // from both `actions` and `replayed_oleans`, while `Dep.Base` + `ConeA.Main` are included.
+        let cone_pack = dir.join("cone_a.tlpack");
+        crate::pack::run_export_command(
+            &store_src,
+            true,
+            cone_pack.clone(),
+            true,
+            Some(sk_hex.to_string()),
+            Some("ConeA.Main".to_string()),
+            Some(proj_src.clone()),
+        )?;
+        let raw_cone = fs::read(&cone_pack)?;
+        assert_eq!(&raw_cone[..8], b"TLPK\x00\x00\x00\x02");
+        let hlen = u64::from_le_bytes(raw_cone[8..16].try_into()?) as usize;
+        let cone_manifest: crate::pack::PackManifest =
+            serde_json::from_slice(&raw_cone[16..16 + hlen])?;
+        assert_eq!(
+            cone_manifest.actions.len(),
+            2,
+            "cone pack must contain only Dep.Base and ConeA.Main actions"
+        );
+        let replay_mods: BTreeSet<&str> = cone_manifest
+            .replayed_oleans
+            .iter()
+            .map(|r| r.module_name.as_str())
+            .collect();
+        assert!(
+            replay_mods.contains("Dep.Base") && !replay_mods.contains("ConeB.Unrelated"),
+            "cone replayed_oleans must include Dep.Base and exclude ConeB.Unrelated: {replay_mods:?}"
+        );
+
+        // Import into a cold destination store (`store_dst`) with a separate `.verifier_replay_hmac_key`
+        // and verify `ConeA.Main` restores from CAS WITHOUT spawning `--kernel-replay-module` for `Dep.Base`.
+        let proj_dst = dir.join("proj_dst");
+        build_workspace(&proj_dst)?;
+        let mut store_dst = TurboStore::open(Some(&dir.join("store_dst")))?;
+        crate::pack::import_pack_with_policy(
+            &mut store_dst,
+            &cone_pack,
+            Some("trusted"),
+            Some(&pk_hex),
+            false,
+        )?;
+        let trace = ScopedSchedulerTrace::start(None);
+        let rep_dst = build_project_modules_native(
+            &mut store_dst,
+            &proj_dst,
+            &["ConeA.Main".to_string()],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        let events = trace.take_events();
+        assert_eq!(rep_dst.modules_compiled, 0);
+        assert_eq!(rep_dst.modules_cached, 2);
+        assert!(
+            !events.iter().any(|e| e.kind == "replay_subprocess_start"),
+            "attested non-root Dep.Base must skip --kernel-replay-module subprocess: {events:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_speed3_remote_cache_pull_push_tamper_fail_closed_and_untrusted_no_push() -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let _bwrap_guard = BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = make_temp_test_dir("speed3_remote_cache");
+        let sk_hex = "8888888888888888888888888888888888888888888888888888888888888888";
+        let pk_hex = crate::receipt::ed25519_verifying_key_hex(&[0x88u8; 32]);
+        let _sk = ScopedEnvVar::set("TURBO_LEAN_PACK_SIGNING_KEY", sk_hex);
+        let _pk = ScopedEnvVar::set("TURBO_LEAN_PACK_TRUSTED_PUBKEY", &pk_hex);
+
+        let srv_dir = dir.join("srv_store");
+        let _ = TurboStore::open(Some(&srv_dir))?;
+        let srv_url = format!(
+            "http://{}",
+            crate::pack::tests::spawn_test_server(&srv_dir)?
+        );
+
+        let write_proj = |p: &Path, val: u32| -> Result<()> {
+            fs::create_dir_all(p.join("Rem"))?;
+            fs::write(p.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+            fs::write(
+                p.join("lakefile.toml"),
+                "name = \"rem_proj\"\ndefaultTargets = [\"Rem\"]\n[[lean_lib]]\nname = \"Rem\"\nglobs = [\"Rem.+\"]\n",
+            )?;
+            fs::write(
+                p.join("Rem/Mod.lean"),
+                format!("def remVal : Nat := {val}\n"),
+            )?;
+            Ok(())
+        };
+
+        // 1. Trusted build with `TURBO_LEAN_REMOTE_CACHE` pushes `module_unit` to remote coordinator.
+        {
+            let _rc = ScopedEnvVar::set("TURBO_LEAN_REMOTE_CACHE", &srv_url);
+            let proj1 = dir.join("proj1");
+            write_proj(&proj1, 101)?;
+            let mut store1 = TurboStore::open(Some(&dir.join("store1")))?;
+            let rep1 = build_project_modules_native(
+                &mut store1,
+                &proj1,
+                &[],
+                "trusted",
+                1,
+                false,
+                true,
+                None,
+            )?;
+            assert_eq!(rep1.modules_compiled, 1);
+
+            let dm = crate::pack::fetch_remote_cache_manifest(&srv_url, None)?;
+            assert_eq!(
+                dm.action_keys.len(),
+                1,
+                "trusted compile must push module_unit to remote cache"
+            );
+
+            // 2. Cold store pulls `module_unit` on demand and skips local compilation.
+            let proj2 = dir.join("proj2");
+            write_proj(&proj2, 101)?;
+            let mut store2 = TurboStore::open(Some(&dir.join("store2")))?;
+            let rep2 = build_project_modules_native(
+                &mut store2,
+                &proj2,
+                &[],
+                "trusted",
+                1,
+                false,
+                true,
+                None,
+            )?;
+            assert_eq!(
+                rep2.modules_compiled, 0,
+                "cold local store must satisfy module_unit from remote cache"
+            );
+            assert_eq!(rep2.modules_cached, 1);
+        }
+
+        // 3. Untrusted build (`is_untrusted = true`) MUST NEVER push to `TURBO_LEAN_REMOTE_CACHE`.
+        if probe_bwrap_sandbox(&dir).is_some() {
+            let srv_ut_dir = dir.join("srv_ut_store");
+            let _ = TurboStore::open(Some(&srv_ut_dir))?;
+            let srv_ut_url = format!(
+                "http://{}",
+                crate::pack::tests::spawn_test_server(&srv_ut_dir)?
+            );
+            let _rc = ScopedEnvVar::set("TURBO_LEAN_REMOTE_CACHE", &srv_ut_url);
+            let proj_ut = dir.join("proj_ut");
+            write_proj(&proj_ut, 202)?;
+            let mut store_ut = TurboStore::open(Some(&dir.join("store_ut")))?;
+            let rep_ut = build_project_modules_native(
+                &mut store_ut,
+                &proj_ut,
+                &[],
+                "untrusted",
+                0,
+                true,
+                true,
+                None,
+            )?;
+            assert_eq!(rep_ut.modules_compiled, 1);
+            let dm_ut = crate::pack::fetch_remote_cache_manifest(&srv_ut_url, None)?;
+            assert!(
+                dm_ut.action_keys.is_empty() && dm_ut.blob_hashes.is_empty(),
+                "untrusted mode must never push actions or blobs to remote cache"
+            );
+        }
+
+        // 4. Remote cache serving a corrupted blob digest fails closed (populates zero CAS entries)
+        //    and falls back cleanly to local compilation.
+        {
+            let dm_good = crate::pack::fetch_remote_cache_manifest(&srv_url, None)?;
+            let target_key = dm_good.action_keys[0].clone();
+            let bad_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let bad_addr = bad_listener.local_addr()?;
+            let sk_owned = sk_hex.to_string();
+            let bad_handle = std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                for _ in 0..2 {
+                    let Ok((mut stream, _)) = bad_listener.accept() else {
+                        break;
+                    };
+                    let mut buf = [0u8; 4096];
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    let req_str = String::from_utf8_lossy(&buf[..n]);
+                    if req_str.starts_with("GET /manifest") {
+                        let body = serde_json::to_vec(&crate::pack::DeltaManifest {
+                            action_keys: vec![target_key.clone()],
+                            blob_hashes: vec!["aa".repeat(32)],
+                        })
+                        .unwrap();
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(hdr.as_bytes());
+                        let _ = stream.write_all(&body);
+                    } else {
+                        let claimed_hash = "aa".repeat(32);
+                        let corrupt_bytes = b"corrupted-remote-olean-payload";
+                        let mut m = crate::pack::PackManifest {
+                            format_version: 2,
+                            host_arch: std::env::consts::ARCH.into(),
+                            created_at: 1,
+                            ed25519_pubkey: None,
+                            ed25519_signature: None,
+                            actions: vec![crate::db::ActionRecord {
+                                action_key: target_key.clone(),
+                                toolchain_githash: "v4.35.0".into(),
+                                kind: "module_unit".into(),
+                                status: "done".into(),
+                                fencing_token: 1,
+                                output_manifest_hash: "00".repeat(32),
+                                duration_ms: 1,
+                                peak_pss_bytes: 0,
+                                heartbeats: 1,
+                                trust_domain: "trusted".into(),
+                                outputs: vec![BlobEntry {
+                                    blob_hash: claimed_hash.clone(),
+                                    kind: "olean".into(),
+                                    size_bytes: corrupt_bytes.len() as u64,
+                                    rel_path: ".lake/build/lib/lean/Rem/Mod.olean".into(),
+                                }],
+                            }],
+                            blobs: vec![crate::pack::PackedBlob {
+                                blob_hash: claimed_hash,
+                                kind: "olean".into(),
+                                size_bytes: corrupt_bytes.len() as u64,
+                                portable: true,
+                                data_hex_or_base64: Vec::new(),
+                            }],
+                            replayed_oleans: Vec::new(),
+                        };
+                        crate::pack::sign_pack_manifest_ed25519(&mut m, &sk_owned).unwrap();
+                        let mbytes = serde_json::to_vec(&m).unwrap();
+                        let mut raw_tlpk = Vec::new();
+                        raw_tlpk.extend_from_slice(b"TLPK\x00\x00\x00\x02");
+                        raw_tlpk.extend_from_slice(&(mbytes.len() as u64).to_le_bytes());
+                        raw_tlpk.extend_from_slice(&mbytes);
+                        raw_tlpk.extend_from_slice(corrupt_bytes);
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            raw_tlpk.len()
+                        );
+                        let _ = stream.write_all(hdr.as_bytes());
+                        let _ = stream.write_all(&raw_tlpk);
+                    }
+                }
+            });
+
+            let bad_url = format!("http://{bad_addr}");
+            let mut store_bad_only = TurboStore::open(Some(&dir.join("store_bad_only")))?;
+            let mut rem_man = None;
+            assert!(
+                crate::pack::try_pull_remote_module_action(
+                    &mut store_bad_only,
+                    &bad_url,
+                    None,
+                    &mut rem_man,
+                    std::slice::from_ref(&dm_good.action_keys[0]),
+                    "trusted",
+                    false,
+                )
+                .is_err(),
+                "BLAKE3 digest mismatch from remote cache must fail closed"
+            );
+            assert!(
+                store_bad_only
+                    .get_cached_action(&dm_good.action_keys[0], "trusted")?
+                    .is_none(),
+                "corrupted remote pack must never populate local CAS"
+            );
+            let _ = bad_handle.join();
+        }
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())
