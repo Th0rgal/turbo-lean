@@ -1,73 +1,67 @@
 import LeanNative.Frontend.ProofRetention
 import LeanNative.Backend.LLVMAst.SemanticsProofs
 import LeanNative.Proofs.LoopOptProofs
-import LeanNative.Proofs.PTXSIMT2
-import LeanNative.Proofs.MetalSIMT1
+import LeanNative.Proofs.PTXLowerProofs
+import LeanNative.Proofs.MetalLowerProofs
 
 namespace LeanNative.Proofs
 
 open LeanNative.IR LeanNative.Semantics LeanNative.Frontend.ProofRetention
 open LeanNative.Backend LeanNative.Backend.TargetIR
-open LeanNative.Backend.LLVMAst LeanNative.Backend.PTXAst LeanNative.Backend.MetalAst
+open LeanNative.Backend.LLVMAst
+open LeanNative.Backend.PTXAst hiding ByteMemory Dim3
+open LeanNative.Backend.MetalAst hiding ByteMemory Dim3
+open LeanNative.Proofs.PTXSIMT LeanNative.Proofs.MetalSIMT
+open LeanNative.Backend.PTXLower LeanNative.Backend.MetalLower
 
 set_option autoImplicit false
 
-def ObjIsExclusive (env : VarEnv) (st : HeapState) (objVar : VarId) : Prop :=
-  match env objVar with
-  | some (.sarrayId bufId) =>
-    (∃ buf, st.findBuffer bufId = some buf ∧ buf.exclusive = true) ∧ BuffersExclusiveFor st.buffers bufId
-  | some (.objPtr objId) => st.getObjRefCount objId = 1
-  | some _ => True
-  | none => False
+-- Fact interpretation. Every helper below is a theorem: this module declares no `def`.
 
-def FactHolds (env : VarEnv) (st : HeapState) (f : RetainedFact) : Prop :=
-  match f with
-  | .idxLt i n => ∃ iv nv : UInt64, env i = some (.u64 iv) ∧ env n = some (.u64 nv) ∧ iv.toNat < nv.toNat
-  | .noOverflowAdd a b nsw nuw =>
-    ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
-      (nsw = true → addOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
-      (nuw = true → addOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
-  | .noOverflowMul a b nsw nuw =>
-    ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
-      (nsw = true → mulOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
-      (nuw = true → mulOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
-  | .alignedPtr p n => 0 < n ∧ ∃ pv : UInt64, env p = some (.u64 pv) ∧ pv.toNat % n = 0
-  | .disjointSlices a b => ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧ av ≠ bv
-  | .exclusiveObj o => ObjIsExclusive env st o
-
-def FactEnvHolds (env : VarEnv) (st : HeapState) (facts : FactEnv) : Prop :=
-  ∀ f, factMember facts f = true → FactHolds env st f
-
-theorem evalExpr_isExclusive_of_obj (env : VarEnv) (st : HeapState) (objVar : VarId)
-    (h : ObjIsExclusive env st objVar) : evalExpr env st (.isExclusive objVar) = .ok (.bool true, st) := by
-  unfold ObjIsExclusive at h; simp only [evalExpr]
-  cases henv : env objVar with
+theorem evalExpr_isExclusive_of_obj (env : VarEnv) (st : HeapState) (o : VarId)
+    (h : match env o with
+      | some (.sarrayId b) =>
+        (∃ buf, st.findBuffer b = some buf ∧ buf.exclusive = true) ∧ BuffersExclusiveFor st.buffers b
+      | some (.objPtr i) => st.getObjRefCount i = 1
+      | some _ => True
+      | none => False) :
+    evalExpr env st (.isExclusive o) = .ok (.bool true, st) := by
+  simp only [evalExpr]
+  cases henv : env o with
   | none => simp [henv] at h
   | some v =>
     cases v with
-    | sarrayId bufId => simp only [henv] at h; rcases h with ⟨⟨buf, hfind, hex⟩, _⟩; simp [hfind, hex]
-    | objPtr objId => simp only [henv] at h; simp [h]
+    | sarrayId b => simp only [henv] at h; rcases h with ⟨⟨buf, hf, he⟩, _⟩; simp [hf, he]
+    | objPtr i => simp only [henv] at h; simp [h]
     | u64 _ | u256 _ | bool _ | tuple _ | rawPtrId _ | storageMapId _ | unit => simp
 
-theorem evalExpr_ensureExclusive_of_obj (env : VarEnv) (st st1 : HeapState) (objVar : VarId)
-    (ty : LNIRType) (vv : Val) (h : ObjIsExclusive env st objVar)
-    (heval : evalExpr env st (.sarrayEnsureExclusive objVar ty) = .ok (vv, st1)) :
-    st1 = st ∧ evalExpr env st (.scalar (.var objVar)) = .ok (vv, st) := by
-  unfold ObjIsExclusive at h; simp only [evalExpr] at heval
-  cases henv : env objVar with
-  | none => simp [henv] at heval
+theorem evalExpr_ensureExclusive_of_obj (env : VarEnv) (st st1 : HeapState) (o : VarId)
+    (ty : LNIRType) (vv : Val)
+    (h : match env o with
+      | some (.sarrayId b) =>
+        (∃ buf, st.findBuffer b = some buf ∧ buf.exclusive = true) ∧ BuffersExclusiveFor st.buffers b
+      | some (.objPtr i) => st.getObjRefCount i = 1
+      | some _ => True
+      | none => False)
+    (he : evalExpr env st (.sarrayEnsureExclusive o ty) = .ok (vv, st1)) :
+    st1 = st ∧ evalExpr env st (.scalar (.var o)) = .ok (vv, st) := by
+  simp only [evalExpr] at he
+  cases henv : env o with
+  | none => simp [henv] at he
   | some v =>
     cases v with
-    | sarrayId bufId =>
-      simp only [henv] at h heval; rcases h with ⟨⟨buf, hfind, _⟩, hexcl⟩
-      rw [ensureExclusive_of_exclusive st bufId buf hfind hexcl] at heval; cases heval
+    | sarrayId b =>
+      simp only [henv] at h he; rcases h with ⟨⟨buf, hf, _⟩, hx⟩
+      rw [ensureExclusive_of_exclusive st b buf hf hx] at he; cases he
       exact ⟨rfl, by simp [evalExpr, evalScalarExpr, henv]⟩
-    | u64 _ | u256 _ | bool _ | tuple _ | objPtr _ | rawPtrId _ | storageMapId _ | unit => simp [henv] at heval
+    | u64 _ | u256 _ | bool _ | tuple _ | objPtr _ | rawPtrId _ | storageMapId _ | unit =>
+      simp [henv] at he
 
-private theorem constBool_true_eval (env : VarEnv) (st : HeapState) :
-    evalExpr env st (.scalar (.constBool true)) = .ok (.bool true, st) := by simp [evalExpr, evalScalarExpr]
+private theorem true_eval (env : VarEnv) (st : HeapState) :
+    evalExpr env st (.scalar (.constBool true)) = .ok (.bool true, st) := by
+  simp [evalExpr, evalScalarExpr]
 
-private theorem evalCtorGet_state (env : VarEnv) (st st' : HeapState) (c : VarId) (i : Nat)
+private theorem ctorGet_state (env : VarEnv) (st st' : HeapState) (c : VarId) (i : Nat)
     (isObj : Bool) (v : Val) (he : evalCtorGet env st c i isObj = .ok (v, st')) : st' = st := by
   cases vc : env c with
   | none => simp [evalCtorGet, vc] at he
@@ -85,55 +79,382 @@ private theorem evalCtorGet_state (env : VarEnv) (st st' : HeapState) (c : VarId
       | cons _ _ =>
         simp only [evalCtorGet, vc] at he
         split at he <;> cases he <;> rfl
-    | u64 _ | u256 _ | bool _ | sarrayId _ | rawPtrId _ | storageMapId _ | unit => simp [evalCtorGet, vc] at he
+    | u64 _ | u256 _ | bool _ | sarrayId _ | rawPtrId _ | storageMapId _ | unit =>
+      simp [evalCtorGet, vc] at he
 
-private theorem exprPreservesHeap_state (env : VarEnv) (st st' : HeapState)
-    (e : LNIRExpr) (v : Val) (hp : exprPreservesHeap e = true)
-    (he : evalExpr env st e = .ok (v, st')) : st' = st := by
+private theorem heap_state (env : VarEnv) (st st' : HeapState) (e : LNIRExpr) (v : Val)
+    (hp : exprPreservesHeap e = true) (he : evalExpr env st e = .ok (v, st')) : st' = st := by
   cases e with
-  | ctorGetObj c i => exact evalCtorGet_state env st st' c i true v he
-  | ctorGetScalar c i _ => exact evalCtorGet_state env st st' c i false v he
+  | ctorGetObj c i => exact ctorGet_state env st st' c i true v he
+  | ctorGetScalar c i _ => exact ctorGet_state env st st' c i false v he
   | constU256 _ => cases he <;> rfl
   | storageStore _ _ _ | allocCtor _ _ _ | sarrayEnsureExclusive _ _
-  | sarraySet _ _ _ _ | call _ _ _ _ => simp [exprPreservesHeap] at hp
+  | sarraySet _ _ _ _ => simp [exprPreservesHeap] at hp
+  | call fn args retTy isExt =>
+    simp only [exprPreservesHeap, Bool.or_eq_true, beq_iff_eq] at hp
+    simp only [evalExpr] at he
+    cases hvl : evalVarList env args with
+    | error _ => simp [hvl] at he
+    | ok vals =>
+      simp only [hvl] at he
+      cases isExt with
+      | true => simp at he
+      | false =>
+        rcases hp with ((rfl | rfl) | rfl) | rfl
+        · simp only [beq_self_eq_true, Bool.true_or, ite_true] at he
+          cases vals with
+          | nil => simp at he
+          | cons v0 rest =>
+            cases rest with
+            | nil => cases he; rfl
+            | cons _ _ => simp at he
+        · simp only [beq_self_eq_true, Bool.or_true, ite_true] at he
+          cases vals with
+          | nil => simp at he
+          | cons v0 rest =>
+            cases rest with
+            | nil => cases he; rfl
+            | cons _ _ => simp at he
+        · simp only [show ("lean_native_sarray_len" == "lean_native_box_u64") = false from rfl,
+            show ("lean_native_sarray_len" == "lean_native_unbox_u64") = false from rfl,
+            show ("lean_native_sarray_len" == "lean_native_ensure_exclusive") = false from rfl,
+            beq_self_eq_true, Bool.false_or, Bool.false_eq_true, ite_false, ite_true] at he
+          split at he
+          · split at he <;> cases he <;> rfl
+          · cases he
+        · simp only [show ("lean_native_ctor_tag" == "lean_native_box_u64") = false from rfl,
+            show ("lean_native_ctor_tag" == "lean_native_unbox_u64") = false from rfl,
+            show ("lean_native_ctor_tag" == "lean_native_ensure_exclusive") = false from rfl,
+            show ("lean_native_ctor_tag" == "lean_native_sarray_len") = false from rfl,
+            show ("lean_native_ctor_tag" == "lean_native_ctor_set") = false from rfl,
+            show ("lean_native_ctor_tag" == "lean_native_ctor_set_scalar") = false from rfl,
+            show ("lean_native_ctor_tag" == "lean_native_ctor_set_tag") = false from rfl,
+            show ("lean_native_ctor_tag" == "lean_native_del_obj") = false from rfl,
+            beq_self_eq_true, Bool.false_or, Bool.false_eq_true, ite_false, ite_true] at he
+          split at he
+          · rename_i objId
+            cases ho : st.liveHeapObj objId with
+            | error _ => simp [ho, Except.map] at he
+            | ok o => simp only [ho, Except.map] at he; cases he; rfl
+          · cases he; rfl
+          · cases he; rfl
+          · cases he; rfl
+          · cases he
   | scalar _ | mulDivDown _ _ _ | mulDivUp _ _ _ | storageLoad _ _ | mkTuple _ | projTuple _ _
   | isExclusive _ | sarrayLen _ | sarrayDataPtr _ _ | sarrayGet _ _ _ | rawLoad _ _ _
   | boxScalar _ _ | unboxScalar _ _ =>
     revert he; simp only [evalExpr]; repeat split
-    all_goals
-      intro he; try split at he
-      all_goals try split at he
-      all_goals simp at he
-      all_goals exact he.2.symm
+    all_goals intro he; try split at he; all_goals try split at he
+    all_goals simp at he; all_goals exact he.2.symm
 
-private theorem fact_survives_bind (env : VarEnv) (st : HeapState) (dst : VarId) (v : Val)
-    (f : RetainedFact) (hmention : factMentions dst f = false) (hf : FactHolds env st f) :
-    FactHolds (env.bind dst v) st f := by
+private theorem survives_bind (env : VarEnv) (st : HeapState) (dst : VarId) (v : Val)
+    (f : RetainedFact) (hm : factMentions dst f = false)
+    (hf : match f with
+      | .idxLt i n => ∃ iv nv : UInt64, env i = some (.u64 iv) ∧ env n = some (.u64 nv) ∧ iv.toNat < nv.toNat
+      | .noOverflowAdd a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → addOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → addOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowSub a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → subOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → subOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowMul a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → mulOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → mulOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .alignedPtr p n => 0 < n ∧ ∃ pv : UInt64, env p = some (.u64 pv) ∧ pv.toNat % n = 0
+      | .disjointSlices a b la lb =>
+        ∃ av bv lav lbv : UInt64,
+          env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          env la = some (.u64 lav) ∧ env lb = some (.u64 lbv) ∧
+          rangesDisjoint av.toNat (lav.toNat * 8) bv.toNat (lbv.toNat * 8) = true
+      | .exclusiveObj o =>
+        match env o with
+        | some (.sarrayId b) =>
+          (∃ buf, st.findBuffer b = some buf ∧ buf.exclusive = true) ∧ BuffersExclusiveFor st.buffers b
+        | some (.objPtr i) => st.getObjRefCount i = 1
+        | some _ => True
+        | none => False) :
+    match f with
+    | .idxLt i n =>
+      ∃ iv nv : UInt64, (env.bind dst v) i = some (.u64 iv) ∧ (env.bind dst v) n = some (.u64 nv) ∧
+        iv.toNat < nv.toNat
+    | .noOverflowAdd a b nsw nuw =>
+      ∃ av bv : UInt64, (env.bind dst v) a = some (.u64 av) ∧ (env.bind dst v) b = some (.u64 bv) ∧
+        (nsw = true → addOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+        (nuw = true → addOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+    | .noOverflowSub a b nsw nuw =>
+      ∃ av bv : UInt64, (env.bind dst v) a = some (.u64 av) ∧ (env.bind dst v) b = some (.u64 bv) ∧
+        (nsw = true → subOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+        (nuw = true → subOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+    | .noOverflowMul a b nsw nuw =>
+      ∃ av bv : UInt64, (env.bind dst v) a = some (.u64 av) ∧ (env.bind dst v) b = some (.u64 bv) ∧
+        (nsw = true → mulOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+        (nuw = true → mulOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+    | .alignedPtr p n => 0 < n ∧ ∃ pv : UInt64, (env.bind dst v) p = some (.u64 pv) ∧ pv.toNat % n = 0
+    | .disjointSlices a b la lb =>
+      ∃ av bv lav lbv : UInt64,
+        (env.bind dst v) a = some (.u64 av) ∧ (env.bind dst v) b = some (.u64 bv) ∧
+        (env.bind dst v) la = some (.u64 lav) ∧ (env.bind dst v) lb = some (.u64 lbv) ∧
+        rangesDisjoint av.toNat (lav.toNat * 8) bv.toNat (lbv.toNat * 8) = true
+    | .exclusiveObj o =>
+      match (env.bind dst v) o with
+      | some (.sarrayId b) =>
+        (∃ buf, st.findBuffer b = some buf ∧ buf.exclusive = true) ∧ BuffersExclusiveFor st.buffers b
+      | some (.objPtr i) => st.getObjRefCount i = 1
+      | some _ => True
+      | none => False := by
   cases f with
-  | idxLt i n | disjointSlices i n =>
-    simp only [factMentions, Bool.or_eq_false_iff] at hmention; rcases hmention with ⟨hi, hn⟩
+  | idxLt i n =>
+    simp only [factMentions, Bool.or_eq_false_iff] at hm; rcases hm with ⟨hi, hn⟩
     rcases hf with ⟨iv, nv, h1, h2, hr⟩
     exact ⟨iv, nv, by simpa [VarEnv.bind, hi] using h1, by simpa [VarEnv.bind, hn] using h2, hr⟩
-  | noOverflowAdd a b nsw nuw | noOverflowMul a b nsw nuw =>
-    simp only [factMentions, Bool.or_eq_false_iff] at hmention; rcases hmention with ⟨ha, hb⟩
+  | noOverflowAdd a b nsw nuw | noOverflowSub a b nsw nuw | noOverflowMul a b nsw nuw =>
+    simp only [factMentions, Bool.or_eq_false_iff] at hm; rcases hm with ⟨ha, hb⟩
     rcases hf with ⟨av, bv, h1, h2, hnsw, hnuw⟩
     exact ⟨av, bv, by simpa [VarEnv.bind, ha] using h1, by simpa [VarEnv.bind, hb] using h2, hnsw, hnuw⟩
   | alignedPtr p n =>
-    simp only [factMentions] at hmention; rcases hf with ⟨hn, pv, hp, hmod⟩
-    exact ⟨hn, pv, by simpa [VarEnv.bind, hmention] using hp, hmod⟩
+    simp only [factMentions] at hm; rcases hf with ⟨hn, pv, hp, hmod⟩
+    exact ⟨hn, pv, by simpa [VarEnv.bind, hm] using hp, hmod⟩
+  | disjointSlices a b la lb =>
+    simp only [factMentions, Bool.or_eq_false_iff] at hm
+    rcases hm with ⟨⟨⟨ha, hb⟩, hla⟩, hlb⟩
+    rcases hf with ⟨av, bv, lav, lbv, h1, h2, h3, h4, hr⟩
+    exact ⟨av, bv, lav, lbv, by simpa [VarEnv.bind, ha] using h1,
+      by simpa [VarEnv.bind, hb] using h2, by simpa [VarEnv.bind, hla] using h3,
+      by simpa [VarEnv.bind, hlb] using h4, hr⟩
   | exclusiveObj o =>
-    simp only [factMentions] at hmention; simpa [FactHolds, ObjIsExclusive, VarEnv.bind, hmention] using hf
+    simp only [factMentions] at hm
+    simpa [VarEnv.bind, hm] using hf
 
-private theorem envHolds_killVar (env : VarEnv) (st : HeapState) (dst : VarId) (v : Val)
-    (facts : FactEnv) (hf : FactEnvHolds env st facts) :
-    FactEnvHolds (env.bind dst v) st (killVarFacts dst facts) := by
+private theorem holds_kill (env : VarEnv) (st : HeapState) (dst : VarId) (v : Val)
+    (facts : FactEnv)
+    (hf : ∀ f, factMember facts f = true →
+      match f with
+      | .idxLt i n => ∃ iv nv : UInt64, env i = some (.u64 iv) ∧ env n = some (.u64 nv) ∧ iv.toNat < nv.toNat
+      | .noOverflowAdd a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → addOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → addOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowSub a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → subOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → subOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowMul a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → mulOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → mulOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .alignedPtr p n => 0 < n ∧ ∃ pv : UInt64, env p = some (.u64 pv) ∧ pv.toNat % n = 0
+      | .disjointSlices a b la lb =>
+        ∃ av bv lav lbv : UInt64,
+          env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          env la = some (.u64 lav) ∧ env lb = some (.u64 lbv) ∧
+          rangesDisjoint av.toNat (lav.toNat * 8) bv.toNat (lbv.toNat * 8) = true
+      | .exclusiveObj o =>
+        match env o with
+        | some (.sarrayId b) =>
+          (∃ buf, st.findBuffer b = some buf ∧ buf.exclusive = true) ∧ BuffersExclusiveFor st.buffers b
+        | some (.objPtr i) => st.getObjRefCount i = 1
+        | some _ => True
+        | none => False) :
+    ∀ f, factMember (killVarFacts dst facts) f = true →
+      match f with
+      | .idxLt i n =>
+        ∃ iv nv : UInt64, (env.bind dst v) i = some (.u64 iv) ∧ (env.bind dst v) n = some (.u64 nv) ∧
+          iv.toNat < nv.toNat
+      | .noOverflowAdd a b nsw nuw =>
+        ∃ av bv : UInt64, (env.bind dst v) a = some (.u64 av) ∧ (env.bind dst v) b = some (.u64 bv) ∧
+          (nsw = true → addOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → addOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowSub a b nsw nuw =>
+        ∃ av bv : UInt64, (env.bind dst v) a = some (.u64 av) ∧ (env.bind dst v) b = some (.u64 bv) ∧
+          (nsw = true → subOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → subOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowMul a b nsw nuw =>
+        ∃ av bv : UInt64, (env.bind dst v) a = some (.u64 av) ∧ (env.bind dst v) b = some (.u64 bv) ∧
+          (nsw = true → mulOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → mulOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .alignedPtr p n => 0 < n ∧ ∃ pv : UInt64, (env.bind dst v) p = some (.u64 pv) ∧ pv.toNat % n = 0
+      | .disjointSlices a b la lb =>
+        ∃ av bv lav lbv : UInt64,
+          (env.bind dst v) a = some (.u64 av) ∧ (env.bind dst v) b = some (.u64 bv) ∧
+          (env.bind dst v) la = some (.u64 lav) ∧ (env.bind dst v) lb = some (.u64 lbv) ∧
+          rangesDisjoint av.toNat (lav.toNat * 8) bv.toNat (lbv.toNat * 8) = true
+      | .exclusiveObj o =>
+        match (env.bind dst v) o with
+        | some (.sarrayId b) =>
+          (∃ buf, st.findBuffer b = some buf ∧ buf.exclusive = true) ∧ BuffersExclusiveFor st.buffers b
+        | some (.objPtr i) => st.getObjRefCount i = 1
+        | some _ => True
+        | none => False := by
   intro f hmem; unfold killVarFacts factMember at hmem
-  have h1 := List.mem_filter.mp (List.mem_of_elem_eq_true hmem)
-  exact fact_survives_bind env st dst v f (by simpa using h1.2)
-    (hf f (List.elem_eq_true_of_mem h1.1))
+  rw [List.contains_eq_mem] at hmem
+  rcases List.mem_filter.mp (of_decide_eq_true hmem) with ⟨hin, hm⟩
+  have hmem0 : factMember facts f = true := by
+    unfold factMember; rw [List.contains_eq_mem]; exact decide_eq_true hin
+  have hm0 : factMentions dst f = false := by simpa using hm
+  have h0 := hf f hmem0
+  cases f with
+  | idxLt i n => exact survives_bind env st dst v (.idxLt i n) hm0 h0
+  | noOverflowAdd a b nsw nuw => exact survives_bind env st dst v (.noOverflowAdd a b nsw nuw) hm0 h0
+  | noOverflowSub a b nsw nuw => exact survives_bind env st dst v (.noOverflowSub a b nsw nuw) hm0 h0
+  | noOverflowMul a b nsw nuw => exact survives_bind env st dst v (.noOverflowMul a b nsw nuw) hm0 h0
+  | alignedPtr p n => exact survives_bind env st dst v (.alignedPtr p n) hm0 h0
+  | disjointSlices a b la lb => exact survives_bind env st dst v (.disjointSlices a b la lb) hm0 h0
+  | exclusiveObj o => exact survives_bind env st dst v (.exclusiveObj o) hm0 h0
 
-private theorem envHolds_cons (env : VarEnv) (st : HeapState) (f0 : RetainedFact) (facts : FactEnv)
-    (hf0 : FactHolds env st f0) (hf : FactEnvHolds env st facts) : FactEnvHolds env st (consFact facts f0) := by
+private theorem holds_clear (env : VarEnv) (st st' : HeapState) (facts : FactEnv)
+    (hf : ∀ f, factMember facts f = true →
+      match f with
+      | .idxLt i n => ∃ iv nv : UInt64, env i = some (.u64 iv) ∧ env n = some (.u64 nv) ∧ iv.toNat < nv.toNat
+      | .noOverflowAdd a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → addOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → addOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowSub a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → subOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → subOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowMul a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → mulOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → mulOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .alignedPtr p n => 0 < n ∧ ∃ pv : UInt64, env p = some (.u64 pv) ∧ pv.toNat % n = 0
+      | .disjointSlices a b la lb =>
+        ∃ av bv lav lbv : UInt64,
+          env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          env la = some (.u64 lav) ∧ env lb = some (.u64 lbv) ∧
+          rangesDisjoint av.toNat (lav.toNat * 8) bv.toNat (lbv.toNat * 8) = true
+      | .exclusiveObj o =>
+        match env o with
+        | some (.sarrayId b) =>
+          (∃ buf, st.findBuffer b = some buf ∧ buf.exclusive = true) ∧ BuffersExclusiveFor st.buffers b
+        | some (.objPtr i) => st.getObjRefCount i = 1
+        | some _ => True
+        | none => False) :
+    ∀ f, factMember (clearHeapFacts facts) f = true →
+      match f with
+      | .idxLt i n => ∃ iv nv : UInt64, env i = some (.u64 iv) ∧ env n = some (.u64 nv) ∧ iv.toNat < nv.toNat
+      | .noOverflowAdd a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → addOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → addOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowSub a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → subOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → subOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowMul a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → mulOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → mulOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .alignedPtr p n => 0 < n ∧ ∃ pv : UInt64, env p = some (.u64 pv) ∧ pv.toNat % n = 0
+      | .disjointSlices a b la lb =>
+        ∃ av bv lav lbv : UInt64,
+          env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          env la = some (.u64 lav) ∧ env lb = some (.u64 lbv) ∧
+          rangesDisjoint av.toNat (lav.toNat * 8) bv.toNat (lbv.toNat * 8) = true
+      | .exclusiveObj o =>
+        match env o with
+        | some (.sarrayId b) =>
+          (∃ buf, st'.findBuffer b = some buf ∧ buf.exclusive = true) ∧ BuffersExclusiveFor st'.buffers b
+        | some (.objPtr i) => st'.getObjRefCount i = 1
+        | some _ => True
+        | none => False := by
+  intro f hmem; unfold clearHeapFacts factMember at hmem
+  rw [List.contains_eq_mem] at hmem
+  rcases List.mem_filter.mp (of_decide_eq_true hmem) with ⟨hin, hkeep⟩
+  have hmem0 : factMember facts f = true := by
+    unfold factMember; rw [List.contains_eq_mem]; exact decide_eq_true hin
+  have h0 := hf f hmem0
+  cases f with
+  | exclusiveObj _ => simp at hkeep
+  | _ => exact h0
+
+private theorem holds_cons (env : VarEnv) (st : HeapState) (f0 : RetainedFact) (facts : FactEnv)
+    (hf0 : match f0 with
+      | .idxLt i n => ∃ iv nv : UInt64, env i = some (.u64 iv) ∧ env n = some (.u64 nv) ∧ iv.toNat < nv.toNat
+      | .noOverflowAdd a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → addOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → addOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowSub a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → subOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → subOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowMul a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → mulOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → mulOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .alignedPtr p n => 0 < n ∧ ∃ pv : UInt64, env p = some (.u64 pv) ∧ pv.toNat % n = 0
+      | .disjointSlices a b la lb =>
+        ∃ av bv lav lbv : UInt64,
+          env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          env la = some (.u64 lav) ∧ env lb = some (.u64 lbv) ∧
+          rangesDisjoint av.toNat (lav.toNat * 8) bv.toNat (lbv.toNat * 8) = true
+      | .exclusiveObj o =>
+        match env o with
+        | some (.sarrayId b) =>
+          (∃ buf, st.findBuffer b = some buf ∧ buf.exclusive = true) ∧ BuffersExclusiveFor st.buffers b
+        | some (.objPtr i) => st.getObjRefCount i = 1
+        | some _ => True
+        | none => False)
+    (hf : ∀ f, factMember facts f = true →
+      match f with
+      | .idxLt i n => ∃ iv nv : UInt64, env i = some (.u64 iv) ∧ env n = some (.u64 nv) ∧ iv.toNat < nv.toNat
+      | .noOverflowAdd a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → addOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → addOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowSub a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → subOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → subOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowMul a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → mulOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → mulOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .alignedPtr p n => 0 < n ∧ ∃ pv : UInt64, env p = some (.u64 pv) ∧ pv.toNat % n = 0
+      | .disjointSlices a b la lb =>
+        ∃ av bv lav lbv : UInt64,
+          env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          env la = some (.u64 lav) ∧ env lb = some (.u64 lbv) ∧
+          rangesDisjoint av.toNat (lav.toNat * 8) bv.toNat (lbv.toNat * 8) = true
+      | .exclusiveObj o =>
+        match env o with
+        | some (.sarrayId b) =>
+          (∃ buf, st.findBuffer b = some buf ∧ buf.exclusive = true) ∧ BuffersExclusiveFor st.buffers b
+        | some (.objPtr i) => st.getObjRefCount i = 1
+        | some _ => True
+        | none => False) :
+    ∀ f, factMember (consFact facts f0) f = true →
+      match f with
+      | .idxLt i n => ∃ iv nv : UInt64, env i = some (.u64 iv) ∧ env n = some (.u64 nv) ∧ iv.toNat < nv.toNat
+      | .noOverflowAdd a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → addOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → addOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowSub a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → subOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → subOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowMul a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → mulOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → mulOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .alignedPtr p n => 0 < n ∧ ∃ pv : UInt64, env p = some (.u64 pv) ∧ pv.toNat % n = 0
+      | .disjointSlices a b la lb =>
+        ∃ av bv lav lbv : UInt64,
+          env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          env la = some (.u64 lav) ∧ env lb = some (.u64 lbv) ∧
+          rangesDisjoint av.toNat (lav.toNat * 8) bv.toNat (lbv.toNat * 8) = true
+      | .exclusiveObj o =>
+        match env o with
+        | some (.sarrayId b) =>
+          (∃ buf, st.findBuffer b = some buf ∧ buf.exclusive = true) ∧ BuffersExclusiveFor st.buffers b
+        | some (.objPtr i) => st.getObjRefCount i = 1
+        | some _ => True
+        | none => False := by
   intro f hmem; unfold consFact at hmem; split at hmem
   · exact hf f hmem
   · simp only [factMember, List.contains_eq_mem, List.decide_mem_cons, Bool.or_eq_true, beq_iff_eq] at hmem
@@ -143,8 +464,66 @@ private theorem envHolds_cons (env : VarEnv) (st : HeapState) (f0 : RetainedFact
 
 private theorem intro_holds (env : VarEnv) (st st1 : HeapState) (dst : VarId) (val : LNIRExpr)
     (vv : Val) (facts : FactEnv) (hval : evalExpr env st val = .ok (vv, st1))
-    (hf : FactEnvHolds (env.bind dst vv) st1 facts) :
-    FactEnvHolds (env.bind dst vv) st1 (introExprFact dst val facts) := by
+    (hf : ∀ f, factMember facts f = true →
+      match f with
+      | .idxLt i n =>
+        ∃ iv nv : UInt64, (env.bind dst vv) i = some (.u64 iv) ∧ (env.bind dst vv) n = some (.u64 nv) ∧
+          iv.toNat < nv.toNat
+      | .noOverflowAdd a b nsw nuw =>
+        ∃ av bv : UInt64, (env.bind dst vv) a = some (.u64 av) ∧ (env.bind dst vv) b = some (.u64 bv) ∧
+          (nsw = true → addOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → addOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowSub a b nsw nuw =>
+        ∃ av bv : UInt64, (env.bind dst vv) a = some (.u64 av) ∧ (env.bind dst vv) b = some (.u64 bv) ∧
+          (nsw = true → subOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → subOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowMul a b nsw nuw =>
+        ∃ av bv : UInt64, (env.bind dst vv) a = some (.u64 av) ∧ (env.bind dst vv) b = some (.u64 bv) ∧
+          (nsw = true → mulOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → mulOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .alignedPtr p n => 0 < n ∧ ∃ pv : UInt64, (env.bind dst vv) p = some (.u64 pv) ∧ pv.toNat % n = 0
+      | .disjointSlices a b la lb =>
+        ∃ av bv lav lbv : UInt64,
+          (env.bind dst vv) a = some (.u64 av) ∧ (env.bind dst vv) b = some (.u64 bv) ∧
+          (env.bind dst vv) la = some (.u64 lav) ∧ (env.bind dst vv) lb = some (.u64 lbv) ∧
+          rangesDisjoint av.toNat (lav.toNat * 8) bv.toNat (lbv.toNat * 8) = true
+      | .exclusiveObj o =>
+        match (env.bind dst vv) o with
+        | some (.sarrayId b) =>
+          (∃ buf, st1.findBuffer b = some buf ∧ buf.exclusive = true) ∧ BuffersExclusiveFor st1.buffers b
+        | some (.objPtr i) => st1.getObjRefCount i = 1
+        | some _ => True
+        | none => False) :
+    ∀ f, factMember (introExprFact dst val facts) f = true →
+      match f with
+      | .idxLt i n =>
+        ∃ iv nv : UInt64, (env.bind dst vv) i = some (.u64 iv) ∧ (env.bind dst vv) n = some (.u64 nv) ∧
+          iv.toNat < nv.toNat
+      | .noOverflowAdd a b nsw nuw =>
+        ∃ av bv : UInt64, (env.bind dst vv) a = some (.u64 av) ∧ (env.bind dst vv) b = some (.u64 bv) ∧
+          (nsw = true → addOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → addOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowSub a b nsw nuw =>
+        ∃ av bv : UInt64, (env.bind dst vv) a = some (.u64 av) ∧ (env.bind dst vv) b = some (.u64 bv) ∧
+          (nsw = true → subOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → subOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowMul a b nsw nuw =>
+        ∃ av bv : UInt64, (env.bind dst vv) a = some (.u64 av) ∧ (env.bind dst vv) b = some (.u64 bv) ∧
+          (nsw = true → mulOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → mulOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .alignedPtr p n => 0 < n ∧ ∃ pv : UInt64, (env.bind dst vv) p = some (.u64 pv) ∧ pv.toNat % n = 0
+      | .disjointSlices a b la lb =>
+        ∃ av bv lav lbv : UInt64,
+          (env.bind dst vv) a = some (.u64 av) ∧ (env.bind dst vv) b = some (.u64 bv) ∧
+          (env.bind dst vv) la = some (.u64 lav) ∧ (env.bind dst vv) lb = some (.u64 lbv) ∧
+          rangesDisjoint av.toNat (lav.toNat * 8) bv.toNat (lbv.toNat * 8) = true
+      | .exclusiveObj o =>
+        match (env.bind dst vv) o with
+        | some (.sarrayId b) =>
+          (∃ buf, st1.findBuffer b = some buf ∧ buf.exclusive = true) ∧ BuffersExclusiveFor st1.buffers b
+        | some (.objPtr i) => st1.getObjRefCount i = 1
+        | some _ => True
+        | none => False := by
   cases val with
   | sarrayEnsureExclusive arrVar _ =>
     simp only [evalExpr] at hval
@@ -163,13 +542,66 @@ private theorem intro_holds (env : VarEnv) (st st1 : HeapState) (dst : VarId) (v
           have hb1 : s'.buffers.find? (fun b => b.id == bid) = some buf1 := hfind1
           have hid := List.find?_some hb1
           have hex1 := hexcl buf1 (List.mem_of_find?_eq_some hb1) hid
-          exact envHolds_cons _ _ _ _ (by simp [FactHolds, ObjIsExclusive, VarEnv.bind, hfind1, hex1, hexcl]) hf
-      | u64 _ | u256 _ | bool _ | tuple _ | objPtr _ | rawPtrId _ | storageMapId _ | unit => simp [ha] at hval
+          exact holds_cons _ _ _ _ (by simp [VarEnv.bind, hfind1, hex1, hexcl]) hf
+      | u64 _ | u256 _ | bool _ | tuple _ | objPtr _ | rawPtrId _ | storageMapId _ | unit =>
+        simp [ha] at hval
+  | allocCtor tag objFields scalarFields =>
+    simp only [evalExpr] at hval
+    cases hobj : evalVarList env objFields with
+    | error _ => simp [hobj] at hval
+    | ok objs =>
+      cases hsc : evalVarList env scalarFields with
+      | error _ => simp [hobj, hsc] at hval
+      | ok scalars =>
+        simp only [hobj, hsc] at hval
+        by_cases hemp : (objs.isEmpty && scalars.isEmpty) = true
+        · simp only [hemp, ite_true] at hval
+          injection hval with hpair; injection hpair with hvv hs
+          subst hvv; subst hs
+          exact holds_cons _ _ _ _ (by simp [VarEnv.bind]) hf
+        · have hemp0 : (objs.isEmpty && scalars.isEmpty) = false := Bool.eq_false_iff.mpr hemp
+          simp only [hemp0, Bool.false_eq_true, ite_false] at hval
+          by_cases hwf : (!objs.all Val.wfField) = true
+          · simp [hwf] at hval
+          · have hwf0 : (!objs.all Val.wfField) = false := Bool.eq_false_iff.mpr hwf
+            simp only [hwf0, Bool.false_eq_true, ite_false, HeapState.allocHeapCtor] at hval
+            injection hval with hpair; injection hpair with hvv hs
+            subst hvv; subst hs
+            exact holds_cons _ _ _ _
+              (by simp [VarEnv.bind, HeapState.getObjRefCount]) hf
   | _ => exact hf
 
 theorem dischargeRetainedExclusivity_sound
     (fuel : Nat) (env : VarEnv) (st : HeapState) (facts : FactEnv) (code : LNIRCode)
-    (hfacts : FactEnvHolds env st facts) (v : Val) (st' : HeapState)
+    (hfacts : ∀ f, factMember facts f = true →
+      match f with
+      | .idxLt i n => ∃ iv nv : UInt64, env i = some (.u64 iv) ∧ env n = some (.u64 nv) ∧ iv.toNat < nv.toNat
+      | .noOverflowAdd a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → addOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → addOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowSub a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → subOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → subOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowMul a b nsw nuw =>
+        ∃ av bv : UInt64, env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          (nsw = true → mulOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → mulOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .alignedPtr p n => 0 < n ∧ ∃ pv : UInt64, env p = some (.u64 pv) ∧ pv.toNat % n = 0
+      | .disjointSlices a b la lb =>
+        ∃ av bv lav lbv : UInt64,
+          env a = some (.u64 av) ∧ env b = some (.u64 bv) ∧
+          env la = some (.u64 lav) ∧ env lb = some (.u64 lbv) ∧
+          rangesDisjoint av.toNat (lav.toNat * 8) bv.toNat (lbv.toNat * 8) = true
+      | .exclusiveObj o =>
+        match env o with
+        | some (.sarrayId b) =>
+          (∃ buf, st.findBuffer b = some buf ∧ buf.exclusive = true) ∧ BuffersExclusiveFor st.buffers b
+        | some (.objPtr i) => st.getObjRefCount i = 1
+        | some _ => True
+        | none => False)
+    (v : Val) (st' : HeapState)
     (heval : evalCode fuel env st code = .ok (v, st')) :
     evalCode fuel env st (dischargeRetainedExclusivity facts code) = .ok (v, st') := by
   induction code generalizing fuel env st facts v st' with
@@ -183,23 +615,27 @@ theorem dischargeRetainedExclusivity_sound
       · have hstep : st1 = st ∧ evalExpr env st (specializeExclExpr facts val) = .ok (vv, st) := by
           cases val with
           | isExclusive objVar =>
-            have hst := exprPreservesHeap_state env st st1 _ vv rfl hval
+            have hst := heap_state env st st1 _ vv rfl hval
             by_cases hmem : factMember facts (.exclusiveObj objVar) = true
-            · have hobj : ObjIsExclusive env st objVar := by simpa [FactHolds] using hfacts _ hmem
+            · have hobj := hfacts _ hmem
+              simp only at hobj
               rw [evalExpr_isExclusive_of_obj env st objVar hobj] at hval; cases hval; rw [hst]
-              exact ⟨rfl, by simp [specializeExclExpr, hmem, constBool_true_eval]⟩
+              exact ⟨rfl, by simp [specializeExclExpr, hmem, true_eval]⟩
             · exact ⟨hst, by simp [specializeExclExpr, hmem, hst, hval]⟩
           | sarrayEnsureExclusive objVar ety =>
-            have hmem : factMember facts (.exclusiveObj objVar) = true := by simpa [exprPreservesExcl] using hp
-            have hobj : ObjIsExclusive env st objVar := by simpa [FactHolds] using hfacts _ hmem
+            have hmem : factMember facts (.exclusiveObj objVar) = true := by
+              simpa [exprPreservesExcl] using hp
+            have hobj := hfacts _ hmem
+            simp only at hobj
             rcases evalExpr_ensureExclusive_of_obj env st st1 objVar ety vv hobj hval with ⟨hst, hev⟩
             exact ⟨hst, by simp [specializeExclExpr, hmem, hev]⟩
           | _ =>
-            have hst := exprPreservesHeap_state env st st1 _ vv (by simpa [exprPreservesExcl] using hp) hval
+            have hst := heap_state env st st1 _ vv (by simpa [exprPreservesExcl] using hp) hval
             exact ⟨hst, by simp [specializeExclExpr, hst, hval]⟩
         rcases hstep with ⟨hst, hev'⟩; rw [hst] at hval heval
         simp only [dischargeRetainedExclusivity, hp, ite_true, evalCode, hev']
-        exact ih fuel _ st _ (intro_holds env st st dst val vv _ hval (envHolds_killVar env st dst vv facts hfacts)) v st' heval
+        exact ih fuel _ st _
+          (intro_holds env st st dst val vv _ hval (holds_kill env st dst vv facts hfacts)) v st' heval
       · have hp0 : exprPreservesExcl facts val = false := Bool.eq_false_iff.mpr hp
         have hvm : specializeExclExpr facts val = val := by
           cases val with
@@ -207,26 +643,73 @@ theorem dischargeRetainedExclusivity_sound
           | sarrayEnsureExclusive _ _ => simp only [exprPreservesExcl] at hp0; simp [specializeExclExpr, hp0]
           | _ => rfl
         simp only [dischargeRetainedExclusivity, hp0, Bool.false_eq_true, ite_false, hvm, evalCode, hval]
-        exact ih fuel _ st1 _ (intro_holds env st st1 dst val vv [] hval (fun _ hm => nomatch hm)) v st' heval
-  | rawStore _ _ _ _ _ ih =>
-    exact CodeRefines.rawStore_congr (fun fl e s r sr h => ih fl e s [] (fun _ hm => nomatch hm) r sr h) fuel env st v st' heval
-  | incRef _ _ _ ih =>
-    exact CodeRefines.incRef_congr (fun fl e s r sr h => ih fl e s [] (fun _ hm => nomatch hm) r sr h) fuel env st v st' heval
-  | decRef _ _ _ ih =>
-    exact CodeRefines.decRef_congr (fun fl e s r sr h => ih fl e s [] (fun _ hm => nomatch hm) r sr h) fuel env st v st' heval
-  | parFor _ _ _ _ _ _ ih =>
-    exact CodeRefines.parFor_congr (fun fl e s r sr h => ih fl e s [] (fun _ hm => nomatch hm) r sr h) fuel env st v st' heval
-  | seqFor idx lo hi acc init _ body _ _ ihk =>
+        exact ih fuel _ st1 _
+          (intro_holds env st st1 dst val vv _ hval
+            (holds_kill env st1 dst vv _ (holds_clear env st st1 facts hfacts))) v st' heval
+  | rawStore ptrVar idxVar valVar _ _ ih =>
+    simp only [dischargeRetainedExclusivity, evalCode] at heval ⊢
+    cases hp : env ptrVar <;> cases hi : env idxVar <;> cases hv : env valVar
+    all_goals simp only [hp, hi, hv] at heval ⊢; try exact heval
+    rename_i pv iv vv
+    cases pv <;> cases iv
+    all_goals cases vv <;> try exact heval
+    all_goals
+      simp only at heval ⊢
+      cases hw : st.writeElemExclusive _ _ _ with
+      | error _ => rw [hw] at heval; exact heval
+      | ok s1 => rw [hw] at heval; exact ih fuel env s1 _ (holds_clear env st s1 facts hfacts) v st' heval
+  | incRef objVar cnt _ ih =>
+    simp only [dischargeRetainedExclusivity, evalCode] at heval ⊢
+    cases hinc : st.evalIncRef env objVar cnt with
+    | error _ => rw [hinc] at heval; exact heval
+    | ok s1 => rw [hinc] at heval; exact ih fuel env s1 _ (holds_clear env st s1 facts hfacts) v st' heval
+  | decRef objVar cnt _ ih =>
+    simp only [dischargeRetainedExclusivity, evalCode] at heval ⊢
+    cases hdec : st.evalDecRef env objVar cnt with
+    | error _ => rw [hdec] at heval; exact heval
+    | ok s1 => rw [hdec] at heval; exact ih fuel env s1 _ (holds_clear env st s1 facts hfacts) v st' heval
+  | parFor out _ _ _ _ _ ih =>
+    simp only [dischargeRetainedExclusivity, evalCode] at heval ⊢
+    cases hpar : evalParFor fuel env st _ _ _ with
+    | error _ => simp [hpar] at heval
+    | ok pr =>
+      simp only [hpar] at heval
+      exact ih fuel _ pr.2 _ (holds_kill env pr.2 out pr.1 _ (holds_clear env st pr.2 facts hfacts))
+        v st' heval
+  | seqFor idx lo hi acc init _ body _ ihb ihk =>
     simp only [dischargeRetainedExclusivity, evalCode] at heval ⊢
     cases hlo : env lo <;> cases hhi : env hi
     all_goals cases hinit : env init <;> simp only [hlo, hhi, hinit] at heval ⊢
     all_goals try exact heval
     rename_i vlo vhi vinit
     cases vlo <;> cases vhi <;> try exact heval
-    simp only at heval ⊢
-    cases hl : evalSeqLoop _ _ idx acc vinit env st (fun e s => evalCode fuel e s body) with
-    | error _ => simp [hl] at heval
-    | ok pr => simp only [hl] at heval; exact ihk fuel _ pr.2 [] (fun _ hm => nomatch hm) v st' heval
+    rename_i uLo uHi
+    dsimp only at heval ⊢
+    have hloop : ∀ cnt cur av s0 pr,
+        evalSeqLoop cnt cur idx acc av env s0 (fun e s => evalCode fuel e s body) = .ok pr →
+        evalSeqLoop cnt cur idx acc av env s0
+          (fun e s => evalCode fuel e s (dischargeRetainedExclusivity [] body)) = .ok pr := by
+      intro cnt
+      induction cnt with
+      | zero => intro cur av s0 pr h; exact h
+      | succ c ihc =>
+        intro cur av s0 pr h
+        simp only [evalSeqLoop] at h ⊢
+        cases hs : evalCode fuel ((env.bind idx (.u64 cur.toUInt64)).bind acc av) s0 body with
+        | error _ => simp [hs] at h
+        | ok p1 =>
+          simp only [hs] at h
+          have hs' := ihb fuel _ s0 [] (fun _ hm => nomatch hm) p1.1 p1.2 hs
+          simp only [hs']
+          exact ihc (cur + 1) p1.1 p1.2 pr h
+    cases hl : evalSeqLoop (uHi.toNat - uLo.toNat) uLo.toNat idx acc vinit env st
+        (fun e s => evalCode fuel e s body) with
+    | error _ => rw [hl] at heval; cases heval
+    | ok pr =>
+      rw [hl] at heval
+      rw [hloop (uHi.toNat - uLo.toNat) uLo.toNat vinit st pr hl]
+      exact ihk fuel _ pr.2 _ (holds_kill env pr.2 acc pr.1 _ (holds_clear env st pr.2 facts hfacts))
+        v st' heval
   | ite c _ _ iht ihe =>
     simp only [dischargeRetainedExclusivity, evalCode] at heval ⊢
     cases hc : env c with
@@ -249,392 +732,980 @@ theorem dischargeRetainedExclusivity_sound
   | ret _ => simpa [dischargeRetainedExclusivity] using heval
   | unreachable => simp [evalCode] at heval
 
-theorem dischargeLocalExclusivity_refines (code : LNIRCode) : CodeRefines code (dischargeRetainedExclusivity [] code) :=
-  fun fuel env st v st' h => dischargeRetainedExclusivity_sound fuel env st [] code (fun _ hm => nomatch hm) v st' h
-def proofRetentionContract : LeanNative.Transform.VerifiedCodePassContract :=
-  verifiedProofRetentionContract dischargeLocalExclusivity_refines
-def proofRetentionPass : LeanNative.Transform.TransformPass :=
-  LeanNative.Transform.TransformPass.ofVerifiedContract proofRetentionContract
+theorem dischargeLocalExclusivity_refines (code : LNIRCode) :
+    CodeRefines code (dischargeRetainedExclusivity [] code) :=
+  fun fuel env st v st' h =>
+    dischargeRetainedExclusivity_sound fuel env st [] code (fun _ hm => nomatch hm) v st' h
 
-def llvmFactEnv (st : ExecState) : VarEnv := fun v => match st.regs.lookup s!"v{v}" with
-  | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
-  | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x)) | _ => none
+-- LLVM specialization.
 
-private theorem llvmFactEnv_lookup_u64 (st : ExecState) (v : VarId) (u u' : UInt64)
-    (hreg : st.regs.lookup s!"v{v}" = some (.bits .i64 u.toBitVec))
-    (henv : llvmFactEnv st v = some (Val.u64 u')) : u' = u := by
-  unfold llvmFactEnv at henv
+private theorem llvm_lookup (st : ExecState) (v : VarId) (u u' : UInt64)
+    (hreg : st.regs.lookup (llvmRegOf v) = some (.bits .i64 u.toBitVec))
+    (henv : (match st.regs.lookup (llvmRegOf v) with
+      | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+      | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+      | _ => none) = some (Val.u64 u')) : u' = u := by
   rw [hreg] at henv; cases henv; rfl
 
 theorem llvmAlignedPtr_of_fact_sound (st : ExecState) (facts : FactEnv) (ptrVar : VarId)
-    (ptr : BitVec 64) (ty : LLVMType) (fb : Nat) (hreg : st.regs.lookup s!"v{ptrVar}" = some (.ptr ptr))
-    (hfb : isAligned ptr (effectiveAlign ty fb) = true) (hf : FactEnvHolds (llvmFactEnv st) .empty facts) :
-    stepInstr {} 1 st (.load "dst" false ty (.reg s!"v{ptrVar}") (alignOfFact facts ptrVar fb)) =
-      stepInstr {} 1 st (.load "dst" false ty (.reg s!"v{ptrVar}") fb) := by
-  have hal : isAligned ptr (effectiveAlign ty (alignOfFact facts ptrVar fb)) = true := by
+    (ptr : BitVec 64) (ty : LLVMType) (fb : Nat)
+    (hreg : st.regs.lookup (llvmRegOf ptrVar) = some (.ptr ptr))
+    (hfb : isAligned ptr (effectiveAlign ty fb) = true)
+    (hf : ∀ f, factMember facts f = true →
+      match f with
+      | .idxLt i n =>
+        ∃ iv nv : UInt64,
+          (match st.regs.lookup (llvmRegOf i) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 iv) ∧
+          (match st.regs.lookup (llvmRegOf n) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 nv) ∧ iv.toNat < nv.toNat
+      | .noOverflowAdd a b nsw nuw =>
+        ∃ av bv : UInt64,
+          (match st.regs.lookup (llvmRegOf a) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 av) ∧
+          (match st.regs.lookup (llvmRegOf b) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 bv) ∧
+          (nsw = true → addOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → addOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowSub a b nsw nuw =>
+        ∃ av bv : UInt64,
+          (match st.regs.lookup (llvmRegOf a) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 av) ∧
+          (match st.regs.lookup (llvmRegOf b) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 bv) ∧
+          (nsw = true → subOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → subOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .noOverflowMul a b nsw nuw =>
+        ∃ av bv : UInt64,
+          (match st.regs.lookup (llvmRegOf a) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 av) ∧
+          (match st.regs.lookup (llvmRegOf b) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 bv) ∧
+          (nsw = true → mulOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+          (nuw = true → mulOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+      | .alignedPtr p n =>
+        0 < n ∧ ∃ pv : UInt64,
+          (match st.regs.lookup (llvmRegOf p) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 pv) ∧ pv.toNat % n = 0
+      | .disjointSlices a b la lb =>
+        ∃ av bv lav lbv : UInt64,
+          (match st.regs.lookup (llvmRegOf a) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 av) ∧
+          (match st.regs.lookup (llvmRegOf b) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 bv) ∧
+          (match st.regs.lookup (llvmRegOf la) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 lav) ∧
+          (match st.regs.lookup (llvmRegOf lb) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 lbv) ∧
+          rangesDisjoint av.toNat (lav.toNat * 8) bv.toNat (lbv.toNat * 8) = true
+      | .exclusiveObj _ => True) :
+    stepInstr {} 1 st (.load "dst" false ty (.reg (llvmRegOf ptrVar)) (alignOfFact facts ptrVar ty fb)) =
+      stepInstr {} 1 st (.load "dst" false ty (.reg (llvmRegOf ptrVar)) fb) := by
+  have hal : isAligned ptr (effectiveAlign ty (alignOfFact facts ptrVar ty fb)) = true := by
     induction facts with
     | nil => exact hfb
     | cons f rest ih =>
-      have htail : FactEnvHolds (llvmFactEnv st) .empty rest :=
+      have htail : ∀ g, factMember rest g = true →
+          match g with
+          | .idxLt i n =>
+            ∃ iv nv : UInt64,
+              (match st.regs.lookup (llvmRegOf i) with
+                | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+                | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+                | _ => none) = some (.u64 iv) ∧
+              (match st.regs.lookup (llvmRegOf n) with
+                | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+                | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+                | _ => none) = some (.u64 nv) ∧ iv.toNat < nv.toNat
+          | .noOverflowAdd a b nsw nuw =>
+            ∃ av bv : UInt64,
+              (match st.regs.lookup (llvmRegOf a) with
+                | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+                | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+                | _ => none) = some (.u64 av) ∧
+              (match st.regs.lookup (llvmRegOf b) with
+                | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+                | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+                | _ => none) = some (.u64 bv) ∧
+              (nsw = true → addOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+              (nuw = true → addOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+          | .noOverflowSub a b nsw nuw =>
+            ∃ av bv : UInt64,
+              (match st.regs.lookup (llvmRegOf a) with
+                | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+                | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+                | _ => none) = some (.u64 av) ∧
+              (match st.regs.lookup (llvmRegOf b) with
+                | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+                | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+                | _ => none) = some (.u64 bv) ∧
+              (nsw = true → subOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+              (nuw = true → subOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+          | .noOverflowMul a b nsw nuw =>
+            ∃ av bv : UInt64,
+              (match st.regs.lookup (llvmRegOf a) with
+                | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+                | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+                | _ => none) = some (.u64 av) ∧
+              (match st.regs.lookup (llvmRegOf b) with
+                | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+                | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+                | _ => none) = some (.u64 bv) ∧
+              (nsw = true → mulOverflowNSW .i64 av.toBitVec bv.toBitVec = false) ∧
+              (nuw = true → mulOverflowNUW .i64 av.toBitVec bv.toBitVec = false)
+          | .alignedPtr p n =>
+            0 < n ∧ ∃ pv : UInt64,
+              (match st.regs.lookup (llvmRegOf p) with
+                | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+                | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+                | _ => none) = some (.u64 pv) ∧ pv.toNat % n = 0
+          | .disjointSlices a b la lb =>
+            ∃ av bv lav lbv : UInt64,
+              (match st.regs.lookup (llvmRegOf a) with
+                | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+                | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+                | _ => none) = some (.u64 av) ∧
+              (match st.regs.lookup (llvmRegOf b) with
+                | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+                | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+                | _ => none) = some (.u64 bv) ∧
+              (match st.regs.lookup (llvmRegOf la) with
+                | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+                | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+                | _ => none) = some (.u64 lav) ∧
+              (match st.regs.lookup (llvmRegOf lb) with
+                | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+                | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+                | _ => none) = some (.u64 lbv) ∧
+              rangesDisjoint av.toNat (lav.toNat * 8) bv.toNat (lbv.toNat * 8) = true
+          | .exclusiveObj _ => True :=
         fun g hg => hf g (by simp [factMember, List.contains_eq_mem] at hg ⊢; exact Or.inr hg)
       cases f with
       | alignedPtr p n =>
         simp only [alignOfFact]; split
         · next hp =>
-          simp only [Bool.and_eq_true, beq_iff_eq] at hp; rcases hp with ⟨rfl, hp2⟩
+          simp only [Bool.and_eq_true, beq_iff_eq, decide_eq_true_eq] at hp
+          rcases hp with ⟨⟨⟨⟨rfl, hp2⟩, _⟩, _⟩, _⟩
           rcases hf (.alignedPtr p n) (by simp [factMember]) with ⟨hpos, pv, hpv, hmod⟩
-          unfold llvmFactEnv at hpv; rw [hreg] at hpv; cases hpv
-          have hnz : n ≠ 0 := by omega
+          rw [hreg] at hpv; cases hpv
+          have hnz : (n == 0) = false := beq_eq_false_iff_ne.mpr (by omega)
           simpa [effectiveAlign, hnz, isAligned, hp2] using hmod
         · exact ih htail
       | _ => exact ih htail
-  have h1 : isPow2 (effectiveAlign ty (alignOfFact facts ptrVar fb)) = true := (Bool.and_eq_true_iff.mp hal).1
+  have h1 : isPow2 (effectiveAlign ty (alignOfFact facts ptrVar ty fb)) = true :=
+    (Bool.and_eq_true_iff.mp hal).1
   have h2 : isPow2 (effectiveAlign ty fb) = true := (Bool.and_eq_true_iff.mp hfb).1
-  simp only [stepInstr, stepInstrWith, LLVMAst.evalOperand, lookupReg, hreg, Option.getD_some, accessCheck, hal, hfb, h1, h2]
+  simp only [stepInstr, stepInstrWith, LLVMAst.evalOperand, lookupReg, hreg,
+    Option.getD_some, accessCheck, hal, hfb, h1, h2]
 
-private theorem overflowOf_no_overflow (st : ExecState) (facts : FactEnv) (isMul : Bool) (a b : VarId)
-    (av bv : UInt64) (ha : st.regs.lookup s!"v{a}" = some (.bits .i64 av.toBitVec))
-    (hb : st.regs.lookup s!"v{b}" = some (.bits .i64 bv.toBitVec))
-    (hf : FactEnvHolds (llvmFactEnv st) .empty facts) :
+private theorem overflow_no (st : ExecState) (facts : FactEnv) (isMul : Bool) (a b : VarId)
+    (av bv : UInt64) (ha : st.regs.lookup (llvmRegOf a) = some (.bits .i64 av.toBitVec))
+    (hb : st.regs.lookup (llvmRegOf b) = some (.bits .i64 bv.toBitVec))
+    (hf : ∀ f, factMember facts f = true →
+      match f with
+      | .idxLt i n =>
+        ∃ iv nv : UInt64,
+          (match st.regs.lookup (llvmRegOf i) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 iv) ∧
+          (match st.regs.lookup (llvmRegOf n) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 nv) ∧ iv.toNat < nv.toNat
+      | .noOverflowAdd x y nsw nuw =>
+        ∃ xv yv : UInt64,
+          (match st.regs.lookup (llvmRegOf x) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 xv) ∧
+          (match st.regs.lookup (llvmRegOf y) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 yv) ∧
+          (nsw = true → addOverflowNSW .i64 xv.toBitVec yv.toBitVec = false) ∧
+          (nuw = true → addOverflowNUW .i64 xv.toBitVec yv.toBitVec = false)
+      | .noOverflowSub x y nsw nuw =>
+        ∃ xv yv : UInt64,
+          (match st.regs.lookup (llvmRegOf x) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 xv) ∧
+          (match st.regs.lookup (llvmRegOf y) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 yv) ∧
+          (nsw = true → subOverflowNSW .i64 xv.toBitVec yv.toBitVec = false) ∧
+          (nuw = true → subOverflowNUW .i64 xv.toBitVec yv.toBitVec = false)
+      | .noOverflowMul x y nsw nuw =>
+        ∃ xv yv : UInt64,
+          (match st.regs.lookup (llvmRegOf x) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 xv) ∧
+          (match st.regs.lookup (llvmRegOf y) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 yv) ∧
+          (nsw = true → mulOverflowNSW .i64 xv.toBitVec yv.toBitVec = false) ∧
+          (nuw = true → mulOverflowNUW .i64 xv.toBitVec yv.toBitVec = false)
+      | .alignedPtr p n =>
+        0 < n ∧ ∃ pv : UInt64,
+          (match st.regs.lookup (llvmRegOf p) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 pv) ∧ pv.toNat % n = 0
+      | .disjointSlices x y la lb =>
+        ∃ xv yv lav lbv : UInt64,
+          (match st.regs.lookup (llvmRegOf x) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 xv) ∧
+          (match st.regs.lookup (llvmRegOf y) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 yv) ∧
+          (match st.regs.lookup (llvmRegOf la) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 lav) ∧
+          (match st.regs.lookup (llvmRegOf lb) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 lbv) ∧
+          rangesDisjoint xv.toNat (lav.toNat * 8) yv.toNat (lbv.toNat * 8) = true
+      | .exclusiveObj _ => True) :
     flagsOverflow (overflowOf facts isMul a b)
       (if isMul then mulOverflowNSW .i64 av.toBitVec bv.toBitVec else addOverflowNSW .i64 av.toBitVec bv.toBitVec)
-      (if isMul then mulOverflowNUW .i64 av.toBitVec bv.toBitVec else addOverflowNUW .i64 av.toBitVec bv.toBitVec) = false := by
-  have himp : ∀ (pickNsw : Bool) f, f ∈ facts →
-      (match f with
-        | .noOverflowAdd l r nsw nuw => !isMul && l == a && r == b && (if pickNsw then nsw else nuw)
-        | .noOverflowMul l r nsw nuw => isMul && l == a && r == b && (if pickNsw then nsw else nuw)
-        | _ => false) = true →
-      (if pickNsw then if isMul then mulOverflowNSW .i64 av.toBitVec bv.toBitVec else addOverflowNSW .i64 av.toBitVec bv.toBitVec
-       else if isMul then mulOverflowNUW .i64 av.toBitVec bv.toBitVec else addOverflowNUW .i64 av.toBitVec bv.toBitVec) = false := by
-    intro pickNsw f hmem hp
-    have hfact := hf f (List.elem_eq_true_of_mem hmem)
+      (if isMul then mulOverflowNUW .i64 av.toBitVec bv.toBitVec else addOverflowNUW .i64 av.toBitVec bv.toBitVec) =
+      false := by
+  induction facts with
+  | nil => rfl
+  | cons f rest ih =>
+    have hrest : flagsOverflow (overflowOf rest isMul a b)
+        (if isMul then mulOverflowNSW .i64 av.toBitVec bv.toBitVec
+         else addOverflowNSW .i64 av.toBitVec bv.toBitVec)
+        (if isMul then mulOverflowNUW .i64 av.toBitVec bv.toBitVec
+         else addOverflowNUW .i64 av.toBitVec bv.toBitVec) = false :=
+      ih fun g hg => hf g (by
+        simp only [factMember, List.contains_eq_mem, List.decide_mem_cons, Bool.or_eq_true] at hg ⊢
+        exact Or.inr hg)
     cases f with
-    | noOverflowAdd l r nsw nuw | noOverflowMul l r nsw nuw =>
-      simp only [Bool.and_eq_true, beq_iff_eq] at hp; rcases hp with ⟨⟨⟨hm, hl⟩, hr⟩, hn⟩
-      rw [hl, hr] at hfact; rcases hfact with ⟨av', bv', hav', hbv', h1, h2⟩
-      cases llvmFactEnv_lookup_u64 st a av av' ha hav'
-      cases llvmFactEnv_lookup_u64 st b bv bv' hb hbv'
-      cases pickNsw <;> cases isMul <;> simp_all
-    | idxLt _ _ | alignedPtr _ _ | disjointSlices _ _ | exclusiveObj _ => simp at hp
-  unfold overflowOf; dsimp only; split
-  · rfl
-  · next hnhit =>
-    rw [Bool.not_eq_true'] at hnhit; rw [Bool.eq_false_iff, Classical.not_not] at hnhit
-    split
-    · next hboth =>
-      rw [Bool.and_eq_true] at hboth
-      rcases List.any_eq_true.mp hboth.1 with ⟨f1, hm1, hp1⟩
-      rcases List.any_eq_true.mp hboth.2 with ⟨f2, hm2, hp2⟩
-      have h1 := himp true f1 hm1 hp1; have h2 := himp false f2 hm2 hp2
-      simp only [ite_true, Bool.false_eq_true, ite_false] at h1 h2; simp [flagsOverflow, h1, h2]
-    · split
-      · next hs =>
-        rcases List.any_eq_true.mp hs with ⟨f1, hm1, hp1⟩
-        simpa [flagsOverflow] using himp true f1 hm1 hp1
-      · next hns =>
-        have hu : (facts.any fun f =>
-            match f with
-            | .noOverflowAdd l r _ nuw => !isMul && l == a && r == b && nuw
-            | .noOverflowMul l r _ nuw => isMul && l == a && r == b && nuw
-            | _ => false) = true := by
-          rcases List.any_eq_true.mp hnhit with ⟨f, hmem, hp⟩
-          cases f with
-          | noOverflowAdd l r nsw nuw | noOverflowMul l r nsw nuw =>
-            simp only [Bool.and_eq_true, Bool.or_eq_true] at hp
-            rcases hp with ⟨⟨⟨hm, hl⟩, hr⟩, hn | hn⟩
-            · exact absurd (List.any_eq_true.mpr ⟨_, hmem, by simp [hm, hl, hr, hn]⟩) hns
-            · exact List.any_eq_true.mpr ⟨_, hmem, by simp [hm, hl, hr, hn]⟩
-          | idxLt _ _ | alignedPtr _ _ | disjointSlices _ _ | exclusiveObj _ => simp at hp
-        rcases List.any_eq_true.mp hu with ⟨f2, hm2, hp2⟩
-        simpa [flagsOverflow] using himp false f2 hm2 hp2
+    | noOverflowAdd l r nsw nuw =>
+      simp only [overflowOf]
+      by_cases hhit : (!isMul && l == a && r == b) = true
+      · simp only [hhit, ite_true]
+        simp only [Bool.and_eq_true, Bool.not_eq_true', beq_iff_eq] at hhit
+        rcases hhit with ⟨⟨rfl, hl⟩, hr⟩
+        have hmem0 : factMember (.noOverflowAdd l r nsw nuw :: rest) (.noOverflowAdd l r nsw nuw) = true := by
+          simp [factMember]
+        have hfact := hf (.noOverflowAdd l r nsw nuw) hmem0
+        simp only at hfact; rw [hl, hr] at hfact
+        rcases hfact with ⟨av', bv', hav', hbv', h1, h2⟩
+        cases llvm_lookup st a av av' ha hav'
+        cases llvm_lookup st b bv bv' hb hbv'
+        cases nsw <;> cases nuw
+        all_goals
+          simp [overflowFlagsOf, flagsOverflow] at h1 h2 ⊢
+          try simp [h1, h2]
+      · simp [Bool.eq_false_iff.mpr hhit, hrest]
+    | noOverflowMul l r nsw nuw =>
+      simp only [overflowOf]
+      by_cases hhit : (isMul && l == a && r == b) = true
+      · simp only [hhit, ite_true]
+        simp only [Bool.and_eq_true, beq_iff_eq] at hhit
+        rcases hhit with ⟨⟨rfl, hl⟩, hr⟩
+        have hmem0 : factMember (.noOverflowMul l r nsw nuw :: rest) (.noOverflowMul l r nsw nuw) = true := by
+          simp [factMember]
+        have hfact := hf (.noOverflowMul l r nsw nuw) hmem0
+        simp only at hfact; rw [hl, hr] at hfact
+        rcases hfact with ⟨av', bv', hav', hbv', h1, h2⟩
+        cases llvm_lookup st a av av' ha hav'
+        cases llvm_lookup st b bv bv' hb hbv'
+        cases nsw <;> cases nuw
+        all_goals
+          simp [overflowFlagsOf, flagsOverflow] at h1 h2 ⊢
+          try simp [h1, h2]
+      · simp [Bool.eq_false_iff.mpr hhit, hrest]
+    | idxLt _ _ | noOverflowSub _ _ _ _ | alignedPtr _ _
+    | disjointSlices _ _ _ _ | exclusiveObj _ => exact hrest
 
 theorem llvmOverflowFlags_of_fact_sound (st : ExecState) (facts : FactEnv) (a b : VarId)
-    (av bv : UInt64) (ha : st.regs.lookup s!"v{a}" = some (.bits .i64 av.toBitVec))
-    (hb : st.regs.lookup s!"v{b}" = some (.bits .i64 bv.toBitVec))
-    (hf : FactEnvHolds (llvmFactEnv st) .empty facts) :
-    stepInstr {} 1 st (.add "dst" (overflowOf facts false a b) .i64 (.reg s!"v{a}") (.reg s!"v{b}")) =
+    (av bv : UInt64) (ha : st.regs.lookup (llvmRegOf a) = some (.bits .i64 av.toBitVec))
+    (hb : st.regs.lookup (llvmRegOf b) = some (.bits .i64 bv.toBitVec))
+    (hf : ∀ f, factMember facts f = true →
+      match f with
+      | .idxLt i n =>
+        ∃ iv nv : UInt64,
+          (match st.regs.lookup (llvmRegOf i) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 iv) ∧
+          (match st.regs.lookup (llvmRegOf n) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 nv) ∧ iv.toNat < nv.toNat
+      | .noOverflowAdd x y nsw nuw =>
+        ∃ xv yv : UInt64,
+          (match st.regs.lookup (llvmRegOf x) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 xv) ∧
+          (match st.regs.lookup (llvmRegOf y) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 yv) ∧
+          (nsw = true → addOverflowNSW .i64 xv.toBitVec yv.toBitVec = false) ∧
+          (nuw = true → addOverflowNUW .i64 xv.toBitVec yv.toBitVec = false)
+      | .noOverflowSub x y nsw nuw =>
+        ∃ xv yv : UInt64,
+          (match st.regs.lookup (llvmRegOf x) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 xv) ∧
+          (match st.regs.lookup (llvmRegOf y) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 yv) ∧
+          (nsw = true → subOverflowNSW .i64 xv.toBitVec yv.toBitVec = false) ∧
+          (nuw = true → subOverflowNUW .i64 xv.toBitVec yv.toBitVec = false)
+      | .noOverflowMul x y nsw nuw =>
+        ∃ xv yv : UInt64,
+          (match st.regs.lookup (llvmRegOf x) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 xv) ∧
+          (match st.regs.lookup (llvmRegOf y) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 yv) ∧
+          (nsw = true → mulOverflowNSW .i64 xv.toBitVec yv.toBitVec = false) ∧
+          (nuw = true → mulOverflowNUW .i64 xv.toBitVec yv.toBitVec = false)
+      | .alignedPtr p n =>
+        0 < n ∧ ∃ pv : UInt64,
+          (match st.regs.lookup (llvmRegOf p) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 pv) ∧ pv.toNat % n = 0
+      | .disjointSlices x y la lb =>
+        ∃ xv yv lav lbv : UInt64,
+          (match st.regs.lookup (llvmRegOf x) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 xv) ∧
+          (match st.regs.lookup (llvmRegOf y) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 yv) ∧
+          (match st.regs.lookup (llvmRegOf la) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 lav) ∧
+          (match st.regs.lookup (llvmRegOf lb) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 lbv) ∧
+          rangesDisjoint xv.toNat (lav.toNat * 8) yv.toNat (lbv.toNat * 8) = true
+      | .exclusiveObj _ => True) :
+    stepInstr {} 1 st (.add "dst" (overflowOf facts false a b) .i64
+        (.reg (llvmRegOf a)) (.reg (llvmRegOf b))) =
       .inr (bindReg st "dst" (.bits .i64 (av.toBitVec + bv.toBitVec))) := by
-  have hov := overflowOf_no_overflow st facts false a b av bv ha hb hf
+  have hov := overflow_no st facts false a b av bv ha hb hf
   simp only [Bool.false_eq_true, ite_false] at hov
   simp only [stepInstr, stepInstrWith, LLVMAst.evalOperand, lookupReg, ha, hb, Option.getD_some]
   simp [binResult, hov]; rfl
 
 theorem llvmMulOverflowFlags_of_fact_sound (st : ExecState) (facts : FactEnv) (a b : VarId)
-    (av bv : UInt64) (ha : st.regs.lookup s!"v{a}" = some (.bits .i64 av.toBitVec))
-    (hb : st.regs.lookup s!"v{b}" = some (.bits .i64 bv.toBitVec))
-    (hf : FactEnvHolds (llvmFactEnv st) .empty facts) :
-    stepInstr {} 1 st (.mul "dst" (overflowOf facts true a b) .i64 (.reg s!"v{a}") (.reg s!"v{b}")) =
+    (av bv : UInt64) (ha : st.regs.lookup (llvmRegOf a) = some (.bits .i64 av.toBitVec))
+    (hb : st.regs.lookup (llvmRegOf b) = some (.bits .i64 bv.toBitVec))
+    (hf : ∀ f, factMember facts f = true →
+      match f with
+      | .idxLt i n =>
+        ∃ iv nv : UInt64,
+          (match st.regs.lookup (llvmRegOf i) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 iv) ∧
+          (match st.regs.lookup (llvmRegOf n) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 nv) ∧ iv.toNat < nv.toNat
+      | .noOverflowAdd x y nsw nuw =>
+        ∃ xv yv : UInt64,
+          (match st.regs.lookup (llvmRegOf x) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 xv) ∧
+          (match st.regs.lookup (llvmRegOf y) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 yv) ∧
+          (nsw = true → addOverflowNSW .i64 xv.toBitVec yv.toBitVec = false) ∧
+          (nuw = true → addOverflowNUW .i64 xv.toBitVec yv.toBitVec = false)
+      | .noOverflowSub x y nsw nuw =>
+        ∃ xv yv : UInt64,
+          (match st.regs.lookup (llvmRegOf x) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 xv) ∧
+          (match st.regs.lookup (llvmRegOf y) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 yv) ∧
+          (nsw = true → subOverflowNSW .i64 xv.toBitVec yv.toBitVec = false) ∧
+          (nuw = true → subOverflowNUW .i64 xv.toBitVec yv.toBitVec = false)
+      | .noOverflowMul x y nsw nuw =>
+        ∃ xv yv : UInt64,
+          (match st.regs.lookup (llvmRegOf x) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 xv) ∧
+          (match st.regs.lookup (llvmRegOf y) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 yv) ∧
+          (nsw = true → mulOverflowNSW .i64 xv.toBitVec yv.toBitVec = false) ∧
+          (nuw = true → mulOverflowNUW .i64 xv.toBitVec yv.toBitVec = false)
+      | .alignedPtr p n =>
+        0 < n ∧ ∃ pv : UInt64,
+          (match st.regs.lookup (llvmRegOf p) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 pv) ∧ pv.toNat % n = 0
+      | .disjointSlices x y la lb =>
+        ∃ xv yv lav lbv : UInt64,
+          (match st.regs.lookup (llvmRegOf x) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 xv) ∧
+          (match st.regs.lookup (llvmRegOf y) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 yv) ∧
+          (match st.regs.lookup (llvmRegOf la) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 lav) ∧
+          (match st.regs.lookup (llvmRegOf lb) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 lbv) ∧
+          rangesDisjoint xv.toNat (lav.toNat * 8) yv.toNat (lbv.toNat * 8) = true
+      | .exclusiveObj _ => True) :
+    stepInstr {} 1 st (.mul "dst" (overflowOf facts true a b) .i64
+        (.reg (llvmRegOf a)) (.reg (llvmRegOf b))) =
       .inr (bindReg st "dst" (.bits .i64 (av.toBitVec * bv.toBitVec))) := by
-  have hov := overflowOf_no_overflow st facts true a b av bv ha hb hf; simp only [ite_true] at hov
+  have hov := overflow_no st facts true a b av bv ha hb hf; simp only [ite_true] at hov
   simp only [stepInstr, stepInstrWith, LLVMAst.evalOperand, lookupReg, ha, hb, Option.getD_some]
   simp [binResult, hov]; rfl
 
 theorem llvmSubOverflowFlags_of_fact_sound (st : ExecState) (facts : FactEnv) (a b : VarId)
-    (av bv : UInt64) (ha : st.regs.lookup s!"v{a}" = some (.bits .i64 av.toBitVec))
-    (hb : st.regs.lookup s!"v{b}" = some (.bits .i64 bv.toBitVec))
-    (hf : FactEnvHolds (llvmFactEnv st) .empty facts) :
-    stepInstr {} 1 st (.sub "dst" (subOverflowOf facts a b) .i64 (.reg s!"v{a}") (.reg s!"v{b}")) =
+    (av bv : UInt64) (ha : st.regs.lookup (llvmRegOf a) = some (.bits .i64 av.toBitVec))
+    (hb : st.regs.lookup (llvmRegOf b) = some (.bits .i64 bv.toBitVec))
+    (hf : ∀ f, factMember facts f = true →
+      match f with
+      | .idxLt i n =>
+        ∃ iv nv : UInt64,
+          (match st.regs.lookup (llvmRegOf i) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 iv) ∧
+          (match st.regs.lookup (llvmRegOf n) with
+            | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+            | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x))
+            | _ => none) = some (.u64 nv) ∧ iv.toNat < nv.toNat
+      | .noOverflowAdd x y nsw nuw =>
+        ∃ xv yv : UInt64,
+          (match st.regs.lookup (llvmRegOf x) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 xv) ∧
+          (match st.regs.lookup (llvmRegOf y) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 yv) ∧
+          (nsw = true → addOverflowNSW .i64 xv.toBitVec yv.toBitVec = false) ∧
+          (nuw = true → addOverflowNUW .i64 xv.toBitVec yv.toBitVec = false)
+      | .noOverflowSub x y nsw nuw =>
+        ∃ xv yv : UInt64,
+          (match st.regs.lookup (llvmRegOf x) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 xv) ∧
+          (match st.regs.lookup (llvmRegOf y) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 yv) ∧
+          (nsw = true → subOverflowNSW .i64 xv.toBitVec yv.toBitVec = false) ∧
+          (nuw = true → subOverflowNUW .i64 xv.toBitVec yv.toBitVec = false)
+      | .noOverflowMul x y nsw nuw =>
+        ∃ xv yv : UInt64,
+          (match st.regs.lookup (llvmRegOf x) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 xv) ∧
+          (match st.regs.lookup (llvmRegOf y) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 yv) ∧
+          (nsw = true → mulOverflowNSW .i64 xv.toBitVec yv.toBitVec = false) ∧
+          (nuw = true → mulOverflowNUW .i64 xv.toBitVec yv.toBitVec = false)
+      | .alignedPtr p n =>
+        0 < n ∧ ∃ pv : UInt64,
+          (match st.regs.lookup (llvmRegOf p) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 pv) ∧ pv.toNat % n = 0
+      | .disjointSlices x y la lb =>
+        ∃ xv yv lav lbv : UInt64,
+          (match st.regs.lookup (llvmRegOf x) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 xv) ∧
+          (match st.regs.lookup (llvmRegOf y) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 yv) ∧
+          (match st.regs.lookup (llvmRegOf la) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 lav) ∧
+          (match st.regs.lookup (llvmRegOf lb) with
+            | some (.bits .i64 z) => some (Val.u64 (UInt64.ofBitVec z))
+            | some (.ptr z) => some (Val.u64 (UInt64.ofBitVec z))
+            | _ => none) = some (.u64 lbv) ∧
+          rangesDisjoint xv.toNat (lav.toNat * 8) yv.toNat (lbv.toNat * 8) = true
+      | .exclusiveObj _ => True) :
+    stepInstr {} 1 st (.sub "dst" (subFlagsOf facts a b) .i64
+        (.reg (llvmRegOf a)) (.reg (llvmRegOf b))) =
       .inr (bindReg st "dst" (.bits .i64 (av.toBitVec - bv.toBitVec))) := by
   simp only [stepInstr, stepInstrWith, LLVMAst.evalOperand, lookupReg, ha, hb, Option.getD_some]
-  unfold subOverflowOf binResult
-  by_cases hmem : factMember facts (.idxLt b a) = true
-  · rcases hf (.idxLt b a) hmem with ⟨bv', av', hbv', hav', hlt⟩
-    cases llvmFactEnv_lookup_u64 st a av av' ha hav'
-    cases llvmFactEnv_lookup_u64 st b bv bv' hb hbv'
-    have hnuw : subOverflowNUW .i64 av.toBitVec bv.toBitVec = false := by
-      unfold subOverflowNUW; exact decide_eq_false (by change ¬ av.toNat < bv.toNat; omega)
-    simp [flagsOverflow, hmem, hnuw]; rfl
-  · simp [flagsOverflow, hmem]; rfl
+  have hsub : flagsOverflow (subFlagsOf facts a b) (subOverflowNSW .i64 av.toBitVec bv.toBitVec)
+      (subOverflowNUW .i64 av.toBitVec bv.toBitVec) = false := by
+    induction facts with
+    | nil => rfl
+    | cons f rest ih =>
+      cases f with
+      | noOverflowSub l r nsw nuw =>
+        simp only [subFlagsOf]
+        by_cases hhit : (l == a && r == b) = true
+        · simp only [hhit, ite_true]
+          simp only [Bool.and_eq_true, beq_iff_eq] at hhit
+          rcases hhit with ⟨hl, hr⟩; subst hl; subst hr
+          have hmem0 : factMember (.noOverflowSub l r nsw nuw :: rest) (.noOverflowSub l r nsw nuw) = true := by
+            simp [factMember]
+          rcases hf (.noOverflowSub l r nsw nuw) hmem0 with ⟨av', bv', hav', hbv', h1, h2⟩
+          cases llvm_lookup st l av av' ha hav'
+          cases llvm_lookup st r bv bv' hb hbv'
+          cases nsw <;> cases nuw
+          all_goals
+            simp [overflowFlagsOf, flagsOverflow] at h1 h2 ⊢
+            try simp [h1, h2]
+        · have hhit0 : (l == a && r == b) = false := Bool.eq_false_iff.mpr hhit
+          simp only [hhit0, Bool.false_eq_true, ite_false]
+          exact ih fun g hg => hf g (by
+            simp only [factMember, List.contains_eq_mem, List.decide_mem_cons, Bool.or_eq_true] at hg ⊢
+            exact Or.inr hg)
+      | idxLt _ _ | noOverflowAdd _ _ _ _ | noOverflowMul _ _ _ _ | alignedPtr _ _
+      | disjointSlices _ _ _ _ | exclusiveObj _ =>
+        exact ih fun g hg => hf g (by
+          simp only [factMember, List.contains_eq_mem, List.decide_mem_cons,
+            Bool.or_eq_true] at hg ⊢
+          exact Or.inr hg)
+  simp only [binResult, hsub, Bool.false_eq_true, ite_false]; rfl
 
 theorem add_nsw_poison_witness :
-    stepInstr {} 1 {} (.add "r" .nsw .i64 (.constInt .i64 0x7FFF_FFFF_FFFF_FFFF#64) (.constInt .i64 1#64)) =
-      .inr (bindReg {} "r" .poison) := add_nsw_overflow_poison .i64 _ _ (by decide)
+    stepInstr {} 1 {} (.add "r" .nsw .i64
+        (.constInt .i64 0x7FFF_FFFF_FFFF_FFFF#64) (.constInt .i64 1#64)) =
+      .inr (bindReg {} "r" .poison) :=
+  add_nsw_overflow_poison .i64 _ _ (by decide)
 
-private theorem bindArgs_noalias_invariant (st : ExecState) (ps : List LLVMParam) (args : List LLVMVal) :
-    bindArgs st (ps.map (withNoAlias true)) args = bindArgs st ps args := by
-  induction ps generalizing st args with
-  | nil => cases args <;> rfl
-  | cons p ps ih =>
-    cases args with
-    | nil => rfl
-    | cons v vs =>
-      have hname : (withNoAlias true p).name = p.name := by
-        simp only [withNoAlias, Bool.not_true, Bool.false_eq_true, ite_false]; split <;> rfl
-      simp only [List.map_cons, bindArgs, hname]; exact ih (bindReg st p.name v) vs
+private theorem bind_noalias (st : ExecState) (facts : FactEnv) (ptrA ptrB : VarId)
+    (lenA lenB : Nat) (ps : List LLVMParam) (args : List LLVMVal) :
+    bindArgs st (noaliasParams facts ptrA ptrB lenA lenB ps) args = bindArgs st ps args := by
+  by_cases hmem : factMember facts (.disjointSlices ptrA ptrB lenA lenB) = true
+  · simp only [noaliasParams, hmem, Bool.not_true, Bool.false_eq_true, ite_false]
+    induction ps generalizing st args with
+    | nil => cases args <;> rfl
+    | cons p ps ih =>
+      cases args with
+      | nil => rfl
+      | cons v vs =>
+        let f : LLVMParam → LLVMParam := fun p => match p.ty with
+          | .ptr _ => if p.name == llvmRegOf ptrA || p.name == llvmRegOf ptrB then
+              withNoAlias true p else p
+          | _ => p
+        have hname : (f p).name = p.name := by
+          dsimp only [f]
+          cases p.ty with
+          | ptr _ =>
+            by_cases hc : (p.name == llvmRegOf ptrA || p.name == llvmRegOf ptrB) = true
+            · simp only [hc, ite_true, withNoAlias, Bool.not_true, Bool.false_eq_true, ite_false]
+              split <;> rfl
+            · simp [Bool.eq_false_iff.mpr hc]
+          | _ => rfl
+        change bindArgs st ((f p) :: ps.map f) (v :: vs) = bindArgs st (p :: ps) (v :: vs)
+        simp only [bindArgs, hname]
+        exact ih (bindReg st p.name v) vs
+  · have hmem0 : factMember facts (.disjointSlices ptrA ptrB lenA lenB) = false :=
+      Bool.eq_false_iff.mpr hmem
+    simp [noaliasParams, hmem0]
 
-theorem llvmNoAliasParam_of_disjoint_sound (st : ExecState) (facts : FactEnv) (ptrA ptrB : VarId)
-    (p0 : LLVMParam) (ps : List LLVMParam) (args : List LLVMVal) (hmem : factMember facts (.disjointSlices ptrA ptrB) = true) :
-    (noaliasParams facts ptrA ptrB (p0 :: ps)).any (fun p => p.attrs.contains .noalias) = true ∧
-      (noaliasParams facts ptrA ptrB (p0 :: ps)).all (fun p => p.attrs.contains .noalias) = true ∧
-      bindArgs st (noaliasParams facts ptrA ptrB (p0 :: ps)) args = bindArgs st (p0 :: ps) args := by
-  have hna (p : LLVMParam) : (withNoAlias true p).attrs.contains .noalias = true := by
-    simp only [withNoAlias, Bool.not_true, Bool.false_eq_true, ite_false]; by_cases hc : .noalias ∈ p.attrs <;> simp [hc]
-  have hall : (noaliasParams facts ptrA ptrB (p0 :: ps)).all (fun p => p.attrs.contains .noalias) = true := by
-    simp only [noaliasParams, hmem, Bool.not_true, Bool.false_eq_true, ite_false, List.all_map]
-    exact List.all_eq_true.mpr fun p _ => hna p
-  refine ⟨?_, hall, by simp only [noaliasParams, hmem, Bool.not_true, Bool.false_eq_true, ite_false]
-                       exact bindArgs_noalias_invariant st (p0 :: ps) args⟩
-  simp only [noaliasParams, hmem, Bool.not_true, Bool.false_eq_true, ite_false, List.map_cons, List.any_cons, hna p0, Bool.true_or]
+theorem llvmNoAliasParam_of_disjoint_sound (st : ExecState) (facts : FactEnv)
+    (ptrA ptrB : VarId) (lenA lenB : Nat) (as0 : Nat) (attrs0 : List ParamAttr)
+    (ps : List LLVMParam) (args : List LLVMVal)
+    (hmem : factMember facts (.disjointSlices ptrA ptrB lenA lenB) = true) :
+    let p0 : LLVMParam := { name := llvmRegOf ptrA, ty := .ptr as0, attrs := attrs0 }
+    (noaliasParams facts ptrA ptrB lenA lenB (p0 :: ps)).any (fun p => p.attrs.contains .noalias) = true ∧
+      bindArgs st (noaliasParams facts ptrA ptrB lenA lenB (p0 :: ps)) args =
+        bindArgs st (p0 :: ps) args := by
+  intro p0
+  have hna : (withNoAlias true p0).attrs.contains .noalias = true := by
+    simp only [withNoAlias, Bool.not_true, Bool.false_eq_true, ite_false]
+    by_cases hc : .noalias ∈ p0.attrs <;> simp [hc]
+  refine ⟨?_, bind_noalias st facts ptrA ptrB lenA lenB (p0 :: ps) args⟩
+  simp only [noaliasParams, hmem, Bool.not_true, Bool.false_eq_true, ite_false,
+    List.map_cons, List.any_cons, p0, beq_self_eq_true, Bool.true_or, ite_true, hna]
 
-theorem readBytesAt_disjoint_of_fact (m : ByteMem) (base addr width : Nat) (bs : List MemByte) (hb : base + bs.length ≤ addr) :
+theorem readBytesAt_disjoint_of_fact (m : ByteMem) (base addr width : Nat) (bs : List MemByte)
+    (hb : base + bs.length ≤ addr) :
     (m.writeBytesAt base bs).readBytesAt addr width = m.readBytesAt addr width :=
-  ByteMem.readBytesAt_writeBytesAt_disjoint m base bs addr width (by unfold rangesDisjoint; exact decide_eq_true (Or.inl hb))
+  ByteMem.readBytesAt_writeBytesAt_disjoint m base bs addr width
+    (by unfold rangesDisjoint; exact decide_eq_true (Or.inl hb))
 
-private theorem vreg0 : (s!"v{0}" = "v0") ∧ (s!"v{1}" = "v1") := by decide
+-- PTX: a retained fact replaces the guarded gid prefix by the unguarded one.
 
-theorem ptxBoundsFreeLoad_sound (iv nv base outBase : Nat) (raw : BitVec 64)
-    (g g' : PTXAst.ByteMemory) (pMem : ParamMemory) (hiv : iv < nv) (hnv : nv < 2 ^ 64)
-    (hbase : base < 2 ^ 64) (hout : outBase < 2 ^ 64) (halign : base % 8 = 0) (hoalign : outBase % 8 = 0)
-    (hpIdx : pMem.lookupParam? "param_idx" = some (BitVec.ofNat 64 iv))
-    (hpLen : pMem.lookupParam? "param_len" = some (BitVec.ofNat 64 nv))
-    (hpAddr : pMem.lookupParam? "param_addr" = some (BitVec.ofNat 64 base))
-    (hpOut : pMem.lookupParam? "param_out" = some (BitVec.ofNat 64 outBase))
-    (hload : g.loadBits base 8 = some raw) (hstore : g.storeBits outBase 8 raw = some g') :
-    let grid : PTXAst.Dim3 := ⟨1, 1, 1⟩
-    evalPTXKernel 9 (boundsFreePTXKernel [.idxLt 0 1] 0 1) grid grid g pMem = .ok g' ∧
-      evalPTXKernel 12 (boundsFreePTXKernel [] 0 1) grid grid g pMem = .ok g' := by
-  intro grid
-  have hcmp : evalPTXCmp .ge .u64 (BitVec.ofNat 64 iv) (BitVec.ofNat 64 nv) = false := by
-    simp [evalPTXCmp, PTXAst.maskForType, BitVec.ule, BitVec.toNat_ofNat, Nat.mod_eq_of_lt hnv,
-      Nat.mod_eq_of_lt (Nat.lt_trans hiv hnv), hiv]
-  have hbNat : (BitVec.ofNat 64 base).toNat = base := by simp [BitVec.toNat_ofNat, Nat.mod_eq_of_lt hbase]
-  have hoNat : (BitVec.ofNat 64 outBase).toNat = outBase := by simp [BitVec.toNat_ofNat, Nat.mod_eq_of_lt hout]
-  have hnnB : ¬ ((base : Int) < 0) := Int.not_lt.mpr (Int.natCast_nonneg base)
-  have hnnO : ¬ ((outBase : Int) < 0) := Int.not_lt.mpr (Int.natCast_nonneg outBase)
-  have hu64w : PTXType.u64.bitWidth = 64 := rfl
-  have hu64b : PTXType.u64.byteWidth = 8 := rfl
-  have hu64p : (PTXType.u64 == PTXType.pred) = false := rfl
-  have hpredNe : (PTXType.pred != PTXType.pred) = false := rfl
-  have hglobEq : (StateSpace.global == StateSpace.global) = true := rfl
-  have hglobNe : (StateSpace.global != StateSpace.global) = false := rfl
-  have htidNe : (({ x := 0, y := 0, z := 0 } : PTXAst.Dim3) != { x := 0, y := 0, z := 0 }) = false := rfl
-  have hrace : ∀ e, findCrossCTARace? [] e = none := fun _ => rfl
-  let rf0 := PTXRegFile.ofRegDecls (boundsFreePTXKernel [] 0 1).regDecls
-  have hrf0 : rf0 = { regs := [("%p0", .uninit), ("%v0", .uninit), ("%v1", .uninit), ("%addr", .uninit),
-      ("%out", .uninit), ("%dst", .uninit)], decls := [("%p0", .pred), ("%v0", .u64), ("%v1", .u64),
-      ("%addr", .u64), ("%out", .u64), ("%dst", .u64)], enforceDecls := true } := by decide
-  let rf1 := rf0.setScalarRaw "%dst" 0#64
-  let rf2 := rf1.setScalarRaw "%v0" (BitVec.ofNat 64 iv)
-  let rf3 := rf2.setScalarRaw "%v1" (BitVec.ofNat 64 nv)
-  let rf4 := rf3.setScalarRaw "%addr" (BitVec.ofNat 64 base)
-  let rf5 := rf4.setScalarRaw "%out" (BitVec.ofNat 64 outBase)
-  let log1 : List MemAccessLog :=
-    [{ tid := ⟨0, 0, 0⟩, space := .global, addr := base, width := 8, isWrite := false, isAtomic := false }]
-  let log2 : List MemAccessLog :=
-    { tid := ⟨0, 0, 0⟩, space := .global, addr := outBase, width := 8, isWrite := true, isAtomic := false } :: log1
-  let thAt (pc : Nat) (rf : PTXRegFile) (h : Bool := false) : PTXThreadState :=
-    { tid := ⟨0, 0, 0⟩, pc := pc, regs := rf, localMem := PTXAst.ByteMemory.zeros 0, halted := h }
-  let ctaAt (th : PTXThreadState) (gm : PTXAst.ByteMemory) (lg : List MemAccessLog) : PTXCTAState :=
-    { gridDim := grid, blockDim := grid, ctaId := ⟨0, 0, 0⟩, threads := [th], globalMem := gm
-    , sharedMem := PTXAst.ByteMemory.zeros 0, constMem := PTXAst.ByteMemory.zeros 0
-    , paramMem := pMem, sharedLayout := { offsets := [], totalSize := 0 }, epochLog := lg }
-  let okIns (ins : PTXInstr) : Bool := match ins with | .barSync _ | .shflSyncBfly .. => false | _ => true
-  have hpure (f pc : Nat) (stmts : List PTXStmt) (rf rf' : PTXRegFile) (ins : PTXInstr)
-      (hpc : stmts[pc]? = some (.instr none ins)) (hok : okIns ins = true)
-      (hex : execNonBarrierInstr stmts (ctaAt (thAt pc rf) g []) (thAt pc rf) ins =
-        .ok (thAt (pc + 1) rf', g, PTXAst.ByteMemory.zeros 0, [])) :
-      runCTAWithGlobalLog (f + 1) stmts (ctaAt (thAt pc rf) g []) [] =
-        runCTAWithGlobalLog f stmts (ctaAt (thAt (pc + 1) rf') g []) [] :=
-    PTXSIMT.runCTA_pure_instr f stmts (ctaAt (thAt pc rf) g []) [] (thAt pc rf) [] ins rf' []
-      rfl (fun _ h => nomatch h) rfl hpc (by intro b h; subst h; cases hok)
-      (by intro d s o c m h; subst h; cases hok) hex
-  have hmemStep (f pc : Nat) (stmts : List PTXStmt) (rf rf' : PTXRegFile)
-      (gm gm' : PTXAst.ByteMemory) (lg lg' : List MemAccessLog) (gd : Option PTXPredGuard)
-      (ins : PTXInstr) (hpc : stmts[pc]? = some (.instr gd ins)) (hok : okIns ins = true)
-      (hex : execPredicatedInstr stmts (ctaAt (thAt pc rf) gm lg) (thAt pc rf) gd ins =
-        .ok (thAt (pc + 1) rf', gm', PTXAst.ByteMemory.zeros 0, lg')) (hnc : lg = [] ∨ lg' ≠ []) :
-      runCTAWithGlobalLog (f + 1) stmts (ctaAt (thAt pc rf) gm lg) [] =
-        runCTAWithGlobalLog f stmts (ctaAt (thAt (pc + 1) rf') gm' lg') [] :=
-    PTXSIMT.runCTAWithGlobalLog_step_no_clear f stmts _ _ []
-      (PTXSIMT.step_non_barrier_instr stmts (ctaAt (thAt pc rf) gm lg) [] (thAt pc rf) [] gd ins
-        (thAt (pc + 1) rf') gm' (PTXAst.ByteMemory.zeros 0) lg' rfl (fun _ h => nomatch h) rfl hpc
-        (by intro b h; subst h; cases hok)
-        (by intro d s o c m h; subst h; cases hok) hex) hnc
-  have hlbl (f pc : Nat) (stmts : List PTXStmt) (rf : PTXRegFile) (gm : PTXAst.ByteMemory)
-      (lg : List MemAccessLog) (lbl : String) (hpc : stmts[pc]? = some (.label lbl)) :
-      runCTAWithGlobalLog (f + 1) stmts (ctaAt (thAt pc rf) gm lg) [] =
-        runCTAWithGlobalLog f stmts (ctaAt (thAt (pc + 1) rf) gm lg) [] :=
-    PTXSIMT.runCTA_label_step f stmts (ctaAt (thAt pc rf) gm lg) [] (thAt pc rf) [] lbl []
-      rfl (fun _ h => nomatch h) rfl hpc
-  have hret (f pc : Nat) (stmts : List PTXStmt) (rf : PTXRegFile) (gm : PTXAst.ByteMemory)
-      (lg : List MemAccessLog) (hpc : stmts[pc]? = some (.instr none .ret)) :
-      runCTAWithGlobalLog (f + 1) stmts (ctaAt (thAt pc rf) gm lg) [] =
-        runCTAWithGlobalLog f stmts (ctaAt (thAt (pc + 1) rf true) gm lg) [] :=
-    PTXSIMT.runCTA_ret_step f stmts (ctaAt (thAt pc rf) gm lg) [] (thAt pc rf) [] []
-      rfl (fun _ h => nomatch h) rfl hpc
-  have hpre (f : Nat) (mid : List PTXStmt) :
-      let stmts := [ PTXStmt.instr none (.mov .u64 "%dst" (.immU64 0#64))
-        , .instr none (.ldParam .u64 "%v0" "param_idx"), .instr none (.ldParam .u64 "%v1" "param_len")
-        , .instr none (.ldParam .u64 "%addr" "param_addr"), .instr none (.ldParam .u64 "%out" "param_out") ] ++ mid
-      runCTAWithGlobalLog (f + 5) stmts (ctaAt (thAt 0 rf0) g []) [] =
-        runCTAWithGlobalLog f stmts (ctaAt (thAt 5 rf5) g []) [] := by
-    intro stmts; rw [show f + 5 = ((((f + 1) + 1) + 1) + 1) + 1 by omega]
-    rw [hpure _ 0 stmts rf0 rf1 _ rfl rfl (by simp [thAt, ctaAt, rf1, hrf0, execNonBarrierInstr, PTXAst.evalOperand,
-      PTXRegFile.setScalar, PTXRegFile.setScalarRaw, List.lookup, hu64w, hu64p, PTXAst.maskForType, PTXOutcome.bind])]
-    rw [hpure _ 1 stmts rf1 rf2 _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, hrf0, hpIdx, execNonBarrierInstr,
-      PTXRegFile.setScalar, PTXRegFile.setScalarRaw, List.lookup, hu64w, hu64p, PTXAst.maskForType, PTXOutcome.bind])]
-    rw [hpure _ 2 stmts rf2 rf3 _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, rf3, hrf0, hpLen, execNonBarrierInstr,
-      PTXRegFile.setScalar, PTXRegFile.setScalarRaw, List.lookup, hu64w, hu64p, PTXAst.maskForType, PTXOutcome.bind])]
-    rw [hpure _ 3 stmts rf3 rf4 _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, hrf0, hpAddr, execNonBarrierInstr,
-      PTXRegFile.setScalar, PTXRegFile.setScalarRaw, List.lookup, hu64w, hu64p, PTXAst.maskForType, PTXOutcome.bind])]
-    exact hpure _ 4 stmts rf4 rf5 _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, rf5, hrf0, hpOut,
-      execNonBarrierInstr, PTXRegFile.setScalar, PTXRegFile.setScalarRaw, List.lookup, hu64w, hu64p, PTXAst.maskForType, PTXOutcome.bind])
-  refine ⟨?_, ?_⟩
-  · have hrun : runCTAWithGlobalLog 9 (boundsFreePTXKernel [.idxLt 0 1] 0 1).body
-        (ctaAt (thAt 0 rf0) g []) [] = .ok (ctaAt (thAt 8 (rf5.setScalarRaw "%dst" raw) true) g' log2, log2) := by
-      have hb : (boundsFreePTXKernel [.idxLt 0 1] 0 1).body =
-          [ .instr none (.mov .u64 "%dst" (.immU64 0#64)), .instr none (.ldParam .u64 "%v0" "param_idx")
-          , .instr none (.ldParam .u64 "%v1" "param_len"), .instr none (.ldParam .u64 "%addr" "param_addr")
-          , .instr none (.ldParam .u64 "%out" "param_out") ] ++
-          [ .instr none (.ldGlobal .u64 "%dst" (.regOffset "%addr" 0))
-          , .instr none (.stGlobal .u64 (.regOffset "%out" 0) (.reg "%dst")), .instr none .ret ] := by decide
-      rw [hb, show (9 : Nat) = 4 + 5 from rfl, hpre 4]
-      rw [hmemStep 3 5 _ rf5 (rf5.setScalarRaw "%dst" raw) g g [] log1 none _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2,
-        rf3, rf4, rf5, hrf0, log1, execPredicatedInstr, evalPredGuard, execNonBarrierInstr, PTXAst.evalAddr,
-        PTXRegFile.readScalarChecked, PTXRegFile.setScalar, PTXRegFile.setScalarRaw, PTXRegFile.setAssoc, List.lookup,
-        hu64w, hu64b, hu64p, hbNat, hnnB, checkAligned, halign, PTXAst.recordEpochAccess, PTXAst.findDataRace?,
-        hload, PTXAst.maskForType, PTXOutcome.bind]) (Or.inl rfl)]
-      rw [hmemStep 2 6 _ (rf5.setScalarRaw "%dst" raw) (rf5.setScalarRaw "%dst" raw) g g' log1 log2 none _ rfl rfl
-        (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, rf5, hrf0, log1, log2, execPredicatedInstr, evalPredGuard,
-          execNonBarrierInstr, PTXAst.evalAddr, PTXAst.evalOperand, PTXRegFile.readScalarChecked, PTXRegFile.setScalarRaw,
-          PTXRegFile.setAssoc, List.lookup, hu64w, hu64b, hu64p, hoNat, hnnO, checkAligned, hoalign, PTXAst.recordEpochAccess,
-          PTXAst.findDataRace?, htidNe, hglobEq, hstore, PTXAst.maskForType, PTXOutcome.bind]) (Or.inr (by simp [log2]))]
-      rw [hret 1 7 _ _ _ _ rfl]
-      simpa [ctaAt, thAt, log2, log1, hglobEq] using PTXSIMT.runCTAWithGlobalLog_done_halted 0 _
-        (ctaAt (thAt 8 (rf5.setScalarRaw "%dst" raw) true) g' log2) [] rfl
-    have hcta : initCTAState (boundsFreePTXKernel [.idxLt 0 1] 0 1) grid grid ⟨0, 0, 0⟩ g pMem = ctaAt (thAt 0 rf0) g [] := by
-      simp [initCTAState, buildSharedLayout, boundsFreePTXKernel, rf0, ctaAt, thAt, show grid.coords = [⟨0, 0, 0⟩] from rfl]
-    simp [evalPTXKernel, show grid.coords = [⟨0, 0, 0⟩] from rfl, evalPTXKernelLoop, hcta, hrun,
-      ctaAt, log2, log1, checkCrossCTAGlobalLog, hrace, hglobNe, PTXOutcome.bind]
-  · let rfP := rf5.setPredRaw "%p0" false
-    let rfD := rfP.setScalarRaw "%dst" raw
-    have hrun : runCTAWithGlobalLog 12 (boundsFreePTXKernel [] 0 1).body
-        (ctaAt (thAt 0 rf0) g []) [] = .ok (ctaAt (thAt 11 rfD true) g' log2, log2) := by
-      have hb : (boundsFreePTXKernel [] 0 1).body =
-          [ .instr none (.mov .u64 "%dst" (.immU64 0#64)), .instr none (.ldParam .u64 "%v0" "param_idx")
-          , .instr none (.ldParam .u64 "%v1" "param_len"), .instr none (.ldParam .u64 "%addr" "param_addr")
-          , .instr none (.ldParam .u64 "%out" "param_out") ] ++
-          [ .instr none (.setp .ge .u64 "%p0" (.reg "%v0") (.reg "%v1"))
-          , .instr (some { predReg := "%p0", negated := false }) (.bra "$L_done")
-          , .instr none (.ldGlobal .u64 "%dst" (.regOffset "%addr" 0)), .label "$L_done"
-          , .instr none (.stGlobal .u64 (.regOffset "%out" 0) (.reg "%dst")), .instr none .ret ] := by decide
-      rw [hb, show (12 : Nat) = 7 + 5 from rfl, hpre 7]
-      rw [hpure 6 5 _ rf5 rfP _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, rf5, rfP, hrf0, hcmp,
-        execNonBarrierInstr, PTXAst.evalOperand, PTXRegFile.readScalarChecked, PTXRegFile.setPred, PTXRegFile.setPredRaw,
-        PTXRegFile.setScalarRaw, PTXRegFile.setAssoc, List.lookup, hu64w, hu64p, hpredNe, PTXOutcome.bind])]
-      rw [hmemStep 5 6 _ rfP rfP g g [] [] (some { predReg := "%p0", negated := false }) _ rfl rfl (by simp [thAt, ctaAt,
-        rf1, rf2, rf3, rf4, rf5, rfP, hrf0, execPredicatedInstr, evalPredGuard, PTXRegFile.readPredChecked,
-        PTXRegFile.setPredRaw, PTXRegFile.setScalarRaw, PTXRegFile.setAssoc, hpredNe, PTXOutcome.bind]) (Or.inl rfl)]
-      rw [hmemStep 4 7 _ rfP rfD g g [] log1 none _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, rf5, rfP, rfD,
-        hrf0, log1, execPredicatedInstr, evalPredGuard, execNonBarrierInstr, PTXAst.evalAddr, PTXRegFile.readScalarChecked,
-        PTXRegFile.setScalar, PTXRegFile.setPredRaw, PTXRegFile.setScalarRaw, PTXRegFile.setAssoc, List.lookup, hu64w,
-        hu64b, hu64p, hbNat, hnnB, checkAligned, halign, PTXAst.recordEpochAccess, PTXAst.findDataRace?, hload,
-        PTXAst.maskForType, PTXOutcome.bind]) (Or.inl rfl)]
-      rw [hlbl 3 8 _ rfD g log1 "$L_done" rfl]
-      rw [hmemStep 2 9 _ rfD rfD g g' log1 log2 none _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, rf5, rfP, rfD,
-        hrf0, log1, log2, execPredicatedInstr, evalPredGuard, execNonBarrierInstr, PTXAst.evalAddr, PTXAst.evalOperand,
-        PTXRegFile.readScalarChecked, PTXRegFile.setPredRaw, PTXRegFile.setScalarRaw, PTXRegFile.setAssoc, List.lookup,
-        hu64w, hu64b, hu64p, hoNat, hnnO, checkAligned, hoalign, PTXAst.recordEpochAccess, PTXAst.findDataRace?,
-        htidNe, hglobEq, hstore, PTXAst.maskForType, PTXOutcome.bind]) (Or.inr (by simp [log2]))]
-      rw [hret 1 10 _ _ _ _ rfl]
-      simpa [ctaAt, thAt, log2, log1, hglobEq] using PTXSIMT.runCTAWithGlobalLog_done_halted 0 _ (ctaAt (thAt 11 rfD true) g' log2) [] rfl
-    have hcta : initCTAState (boundsFreePTXKernel [] 0 1) grid grid ⟨0, 0, 0⟩ g pMem = ctaAt (thAt 0 rf0) g [] := by
-      simp [initCTAState, buildSharedLayout, boundsFreePTXKernel, rf0, ctaAt, thAt, show grid.coords = [⟨0, 0, 0⟩] from rfl]
-    simp [evalPTXKernel, show grid.coords = [⟨0, 0, 0⟩] from rfl, evalPTXKernelLoop, hcta, hrun,
-      ctaAt, log2, log1, checkCrossCTAGlobalLog, hrace, hglobNe, PTXOutcome.bind]
+theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
+    (suf : List PTXStmt) (cta : PTXCTAState) (done todo : List PTXThreadState)
+    (blockSize : Nat) (ctaId : PTXAst.Dim3)
+    {rf : PTXRegFile} {nP nR nRd : Nat} (hrt : RegTyped rf nP nR nRd)
+    (localBytes tx len : Nat) (hr : 2 < nR) (hrd : 3 < nRd)
+    (hcta : cta.ctaId = ctaId) (hblk : cta.blockDim = { x := blockSize, y := 1, z := 1 })
+    (htx : tx < 2 ^ 32) (hctaX : ctaId.x < 2 ^ 32) (hblkX : blockSize < 2 ^ 32)
+    (hdone : ∀ t ∈ done, t.halted = true) (saved : List MemAccessLog)
+    (hn : cta.paramMem.lookupParam? "param_n" = some (BitVec.ofNat 64 len))
+    (hfacts : facts ≠ []) :
+    runCTAWithGlobalLog (f + 7) (gidSetupWithFacts doneLbl facts ++ suf)
+      { cta with threads := done ++ (laneAt localBytes tx 0 rf false :: todo) } saved =
+    runCTAWithGlobalLog f (gidSetupWithFacts doneLbl facts ++ suf)
+      { cta with threads := done ++
+        (laneAt localBytes tx 7 (rf7 blockSize ctaId rf tx len) false :: todo) } saved := by
+  let stmts := gidSetupWithFacts doneLbl facts ++ suf
+  have hgid64 := laneOf1D_lt ctaId.x blockSize tx hctaX hblkX htx
+  have hcta64 : ctaId.x < 2 ^ 64 := by omega
+  have hblk64 : blockSize < 2 ^ 64 := by omega
+  have hprod : ctaId.x * blockSize < 2 ^ 64 := by omega
+  let r1 := rfSet rf "%r0" (BitVec.ofNat 64 ctaId.x)
+  let r2 := rfSet r1 "%r1" (BitVec.ofNat 64 blockSize)
+  let r3 := rfSet r2 "%r2" (BitVec.ofNat 64 tx)
+  let r4 := rfSet r3 "%rd0" (BitVec.ofNat 64 (ctaId.x * blockSize))
+  let r5 := rfSet r4 "%rd1" (BitVec.ofNat 64 tx)
+  let r6 := rfSet r5 "%rd2" (BitVec.ofNat 64 (ctaId.x * blockSize + tx))
+  have hs0 : runCTAWithGlobalLog ((f + 6) + 1) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 0 rf false :: todo) } saved =
+    runCTAWithGlobalLog (f + 6) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 1 r1 false :: todo) } saved := by
+    apply pure_lane_step (f + 6) stmts cta done todo localBytes tx 0 rf r1
+      (.mov .u32 "%r0" (.sreg .ctaidX)) saved hdone (by simp [stmts, gidSetupWithFacts, hfacts, ins])
+      (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
+    have hex := exec_mov_sreg_r stmts
+      { cta with threads := done ++ (laneAt localBytes tx 0 rf false :: todo) }
+      (laneAt localBytes tx 0 rf false) hrt 0 (by omega) .ctaidX
+      (BitVec.ofNat 64 ctaId.x) (by simp [evalSpecialReg, hcta]) (fit32_ofNat ctaId.x hctaX)
+    rw [mask32_ofNat ctaId.x hctaX] at hex; exact hex
+  have hs1 : runCTAWithGlobalLog ((f + 5) + 1) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 1 r1 false :: todo) } saved =
+    runCTAWithGlobalLog (f + 5) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 2 r2 false :: todo) } saved := by
+    apply pure_lane_step (f + 5) stmts cta done todo localBytes tx 1 r1 r2
+      (.mov .u32 "%r1" (.sreg .ntidX)) saved hdone (by simp [stmts, gidSetupWithFacts, hfacts, ins])
+      (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
+    have hex := exec_mov_sreg_r stmts
+      { cta with threads := done ++ (laneAt localBytes tx 1 r1 false :: todo) }
+      (laneAt localBytes tx 1 r1 false) hrt 1 (by omega) .ntidX
+      (BitVec.ofNat 64 blockSize) (by simp [evalSpecialReg, hblk]) (fit32_ofNat blockSize hblkX)
+    rw [mask32_ofNat blockSize hblkX] at hex; exact hex
+  have hs2 : runCTAWithGlobalLog ((f + 4) + 1) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 2 r2 false :: todo) } saved =
+    runCTAWithGlobalLog (f + 4) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 3 r3 false :: todo) } saved := by
+    apply pure_lane_step (f + 4) stmts cta done todo localBytes tx 2 r2 r3
+      (.mov .u32 "%r2" (.sreg .tidX)) saved hdone (by simp [stmts, gidSetupWithFacts, hfacts, ins])
+      (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
+    have hex := exec_mov_sreg_r stmts
+      { cta with threads := done ++ (laneAt localBytes tx 2 r2 false :: todo) }
+      (laneAt localBytes tx 2 r2 false) hrt 2 (by omega) .tidX
+      (BitVec.ofNat 64 tx) (by simp [evalSpecialReg, laneAt]) (fit32_ofNat tx htx)
+    rw [mask32_ofNat tx htx] at hex; exact hex
+  have hs3 : runCTAWithGlobalLog ((f + 3) + 1) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 3 r3 false :: todo) } saved =
+    runCTAWithGlobalLog (f + 3) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 4 r4 false :: todo) } saved := by
+    apply pure_lane_step (f + 3) stmts cta done todo localBytes tx 3 r3 r4
+      (.mul .wide .u32 "%rd0" (.reg "%r0") (.reg "%r1")) saved hdone
+      (by simp [stmts, gidSetupWithFacts, hfacts, ins])
+      (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
+    have hlk0 : r3.regs.lookup "%r0" = some (.scalar (BitVec.ofNat 64 ctaId.x)) := by
+      dsimp only [r3, r2, r1]
+      rw [lookup_rfSet_ne _ "%r2" "%r0" _ (by decide),
+          lookup_rfSet_ne _ "%r1" "%r0" _ (by decide), lookup_rfSet_self]
+    have hlk1 : r3.regs.lookup "%r1" = some (.scalar (BitVec.ofNat 64 blockSize)) := by
+      dsimp only [r3, r2]; rw [lookup_rfSet_ne _ "%r2" "%r1" _ (by decide), lookup_rfSet_self]
+    have hex := exec_mul_wide_u32 stmts
+      { cta with threads := done ++ (laneAt localBytes tx 3 r3 false :: todo) }
+      (laneAt localBytes tx 3 r3 false) hrt 0 0 1 (by omega) (by omega) (by omega)
+      (BitVec.ofNat 64 ctaId.x) (BitVec.ofNat 64 blockSize)
+      (fit32_ofNat ctaId.x hctaX) (fit32_ofNat blockSize hblkX) hlk0 hlk1
+    have hmul : BitVec.ofNat 64 ctaId.x * BitVec.ofNat 64 blockSize =
+        BitVec.ofNat 64 (ctaId.x * blockSize) := by
+      apply BitVec.eq_of_toNat_eq
+      simp only [BitVec.toNat_mul, BitVec.toNat_ofNat]
+      rw [Nat.mod_eq_of_lt hcta64, Nat.mod_eq_of_lt hblk64, Nat.mod_eq_of_lt hprod]
+    rw [hmul] at hex; exact hex
+  have hs4 : runCTAWithGlobalLog ((f + 2) + 1) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 4 r4 false :: todo) } saved =
+    runCTAWithGlobalLog (f + 2) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 5 r5 false :: todo) } saved := by
+    apply pure_lane_step (f + 2) stmts cta done todo localBytes tx 4 r4 r5
+      (.cvt .none .u64 .u32 "%rd1" (.reg "%r2")) saved hdone
+      (by simp [stmts, gidSetupWithFacts, hfacts, ins])
+      (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
+    have hlk2 : r4.regs.lookup "%r2" = some (.scalar (BitVec.ofNat 64 tx)) := by
+      dsimp only [r4, r3]; rw [lookup_rfSet_ne _ "%rd0" "%r2" _ (by decide), lookup_rfSet_self]
+    exact exec_cvt_u64_u32 stmts
+      { cta with threads := done ++ (laneAt localBytes tx 4 r4 false :: todo) }
+      (laneAt localBytes tx 4 r4 false) hrt 1 2 (by omega) (by omega)
+      (BitVec.ofNat 64 tx) (fit32_ofNat tx htx) hlk2
+  have hs5 : runCTAWithGlobalLog ((f + 1) + 1) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 5 r5 false :: todo) } saved =
+    runCTAWithGlobalLog (f + 1) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 6 r6 false :: todo) } saved := by
+    apply pure_lane_step (f + 1) stmts cta done todo localBytes tx 5 r5 r6
+      (.add .none .u64 "%rd2" (.reg "%rd0") (.reg "%rd1")) saved hdone
+      (by simp [stmts, gidSetupWithFacts, hfacts, ins])
+      (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
+    have hlk0 : r5.regs.lookup "%rd0" = some (.scalar (BitVec.ofNat 64 (ctaId.x * blockSize))) := by
+      dsimp only [r5, r4]; rw [lookup_rfSet_ne _ "%rd1" "%rd0" _ (by decide), lookup_rfSet_self]
+    have hlk1 : r5.regs.lookup "%rd1" = some (.scalar (BitVec.ofNat 64 tx)) :=
+      lookup_rfSet_self r4 "%rd1" _
+    have hex := exec_add_rd stmts
+      { cta with threads := done ++ (laneAt localBytes tx 5 r5 false :: todo) }
+      (laneAt localBytes tx 5 r5 false) hrt 2 0 1 (by omega) (by omega) (by omega)
+      (BitVec.ofNat 64 (ctaId.x * blockSize)) (BitVec.ofNat 64 tx) hlk0 hlk1
+    rw [add_ofNat64 (ctaId.x * blockSize) tx hgid64] at hex; exact hex
+  have hs6 : runCTAWithGlobalLog (f + 1) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 6 r6 false :: todo) } saved =
+    runCTAWithGlobalLog f stmts
+      { cta with threads := done ++
+        (laneAt localBytes tx 7 (rf7 blockSize ctaId rf tx len) false :: todo) } saved := by
+    apply pure_lane_step f stmts cta done todo localBytes tx 6 r6
+      (rf7 blockSize ctaId rf tx len) (.ldParam .u64 "%rd3" "param_n") saved hdone
+      (by simp [stmts, gidSetupWithFacts, hfacts, ins])
+      (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
+    exact exec_ldParam_rd stmts
+      { cta with threads := done ++ (laneAt localBytes tx 6 r6 false :: todo) }
+      (laneAt localBytes tx 6 r6 false) hrt 3 (by omega) "param_n" (BitVec.ofNat 64 len) hn
+  have hf7 : f + 7 = (f + 6) + 1 := by omega
+  have hf6 : f + 6 = (f + 5) + 1 := by omega
+  have hf5 : f + 5 = (f + 4) + 1 := by omega
+  have hf4 : f + 4 = (f + 3) + 1 := by omega
+  have hf3 : f + 3 = (f + 2) + 1 := by omega
+  have hf2 : f + 2 = (f + 1) + 1 := by omega
+  rw [hf7, hs0, hf6, hs1, hf5, hs2, hf4, hs3, hf3, hs4, hf2, hs5, hs6]
 
-theorem metalBoundsFreeLoad_sound (iv nv : Nat) (word : BitVec 64)
-    (bufMem outMem outMem' : MetalAst.ByteMemory) (hiv : iv < nv) (hnv : nv < 2 ^ 64)
-    (hload : bufMem.loadBits (iv * 8) 8 = some word) (hstore : outMem.storeBits 0 8 word = some outMem') :
-    let grid : MetalAst.Dim3 := ⟨1, 1, 1⟩
-    let devBufs : List (Nat × MetalAst.ByteMemory) := [(0, bufMem), (1, outMem)]
-    let constBufs : List (Nat × MetalAst.ByteMemory) :=
-      [(2, MetalAst.ByteMemory.ofU64Words [BitVec.ofNat 64 iv]), (3, MetalAst.ByteMemory.ofU64Words [BitVec.ofNat 64 nv])]
-    let devOut : List (Nat × MetalAst.ByteMemory) := [(0, bufMem), (1, outMem')]
-    evalMSLKernel 6 (boundsFreeMetalKernel [.idxLt 0 1] 0 1) grid grid devBufs constBufs = .ok devOut ∧
-      evalMSLKernel 7 (boundsFreeMetalKernel [] 0 1) grid grid devBufs constBufs = .ok devOut := by
-  intro grid devBufs constBufs devOut
-  have hci : (MetalAst.ByteMemory.ofU64Words [BitVec.ofNat 64 iv]).loadBits 0 8 = some (BitVec.ofNat 64 iv) := by
-    simpa [MetalAst.ByteMemory.readU64Word?] using MetalSIMT.ofU64Words_readU64Word [BitVec.ofNat 64 iv] 0 (by simp)
-  have hcn : (MetalAst.ByteMemory.ofU64Words [BitVec.ofNat 64 nv]).loadBits 0 8 = some (BitVec.ofNat 64 nv) := by
-    simpa [MetalAst.ByteMemory.readU64Word?] using MetalSIMT.ofU64Words_readU64Word [BitVec.ofNat 64 nv] 0 (by simp)
-  have hivNat : (BitVec.ofNat 64 iv).toNat = iv := by simp [BitVec.toNat_ofNat, Nat.mod_eq_of_lt (Nat.lt_trans hiv hnv)]
-  have hlt : BitVec.ult (BitVec.ofNat 64 iv) (BitVec.ofNat 64 nv) = true := by
-    simp [BitVec.ult, BitVec.toNat_ofNat, Nat.mod_eq_of_lt hnv, Nat.mod_eq_of_lt (Nat.lt_trans hiv hnv), hiv]
-  have hcoords : grid.coords = [⟨0, 0, 0⟩] := rfl
-  have htidNe : (({ x := 0, y := 0, z := 0 } : MetalAst.Dim3) != { x := 0, y := 0, z := 0 }) = false := rfl
-  have hrace : ∀ t a w wr at_, findCrossGroupRace? t a w wr at_ [] = none := fun _ _ _ _ _ => rfl
-  unfold evalMSLKernel boundsFreeMetalKernel lowerBoundsFreeMetalLoad; simp only [vreg0]
-  refine ⟨?_, ?_⟩ <;>
-    simp [factMember, hcoords, evalMSLKernelLoop, initGroupState, buildKernelBindings, initThreadLocals,
-      runGroupWithDeviceLog, stepGroup, MetalAst.stepFirstReadyThread, threadAtBarrier, threadAtSimdOp,
-      execNonBarrierStmt, execStmtWithCall, evalExprWithCall, bindEval, finishCmp, inferExprType,
-      evalTypedCmp, MSLBlock.toList, readBoundElement, execIndexWrite, writeDeviceBuffer, loadTypedElem,
-      storeTypedElem, structFieldNames, aggregateByteWidth, MSLType.byteWidth, MetalAst.maskForType,
-      bindValue, MSLLocals.empty, MSLLocals.setTyped, MSLLocals.setAssoc, MSLLocals.setTypeAssoc,
-      MSLLocals.lookup?, MSLLocals.lookupType?, MSLLocals.lookupArray?, List.lookup, devBufs, constBufs,
-      devOut, setIndexedMem, MetalAst.recordEpochAccess, MetalAst.findDataRace?, findDataRaceGo,
-      isDeviceAccess, checkCrossGroupDeviceLog, hrace, List.filter, hci, hcn, hivNat, hlt, hload, hstore,
-      htidNe, show evalMSLCast .ulong .ulong (BitVec.ofNat 64 iv) = .ok (BitVec.ofNat 64 iv) from rfl,
-      show evalMSLCast .ulong .ulong (BitVec.ofNat 64 nv) = .ok (BitVec.ofNat 64 nv) from rfl,
-      show promoteMSLArithType .ulong .ulong = .ulong from rfl]
+-- Metal: a retained fact emits the inner body with no guard.
+
+private theorem metal_body (facts : FactEnv) (inner : List MSLStmt) (h : facts ≠ []) :
+    guardedWithFacts inner facts = inner ++ [.returnStmt] := by
+  simp [guardedWithFacts, h]
+
+theorem metalBoundsFreeLoad_sound (nIn len groupSize gx stepsInner : Nat)
+    (inWords : Nat → List (BitVec 64)) (specWord : Nat → BitVec 64)
+    (inner : List MSLStmt) (facts : FactEnv)
+    (hInner : LaneInnerSpec nIn len stepsInner inWords specWord inner)
+    (hlen64 : len * 8 ≤ 2 ^ 64) (hfacts : facts ≠ [])
+    (hcov : (gx + 1) * groupSize ≤ len) :
+    let body := guardedWithFacts inner facts
+    let mkLane := fun tx => ({
+      tid := { x := tx, y := 0, z := 0 }
+      locals := initBuiltinLocal MSLLocals.empty "gid" .uint (gx * groupSize + tx, 0, 0)
+      stmts := body
+      halted := false } : MSLThreadState)
+    ∀ (rem tx0 f : Nat) (g : MSLGroupState) (done : List MSLThreadState)
+      (outMem0 outMem : MetalAst.ByteMemory),
+      tx0 + rem = groupSize →
+      (gx + 1) * groupSize < 2 ^ 32 →
+      rem * (stepsInner + 1) ≤ f →
+      g.structs = [] → g.funcs = [] → g.bindings = stdBindings nIn →
+      g.constantBuffers = [(nIn + 1, MetalAst.ByteMemory.ofU64Words [BitVec.ofNat 64 len])] →
+      (∀ j < nIn, g.deviceBuffers.lookup j =
+        some (MetalAst.ByteMemory.ofU64Words (inWords j)) ∧ (inWords j).length = len) →
+      g.deviceBuffers.lookup nIn = some outMem →
+      outMem.bytes.size = len * 8 →
+      (∀ i < len,
+        (gx * groupSize ≤ i ∧ i < gx * groupSize + tx0 →
+          outMem.readU64Word? i = some (specWord i)) ∧
+        (¬ (gx * groupSize ≤ i ∧ i < gx * groupSize + tx0) →
+          outMem.readU64Word? i = outMem0.readU64Word? i)) →
+      (∀ a ∈ g.epochLog, SimtLogInv nIn (min len (gx * groupSize)) (min len (gx * groupSize + tx0)) a) →
+      (∀ d ∈ done, d.halted = true) →
+      g.threads = done ++ (List.range rem).map (fun d => mkLane (tx0 + d)) →
+      ∃ (gFinal : MSLGroupState) (outMemFinal : MetalAst.ByteMemory),
+        runGroupWithDeviceLog f g [] = .ok (gFinal, gFinal.epochLog.filter isDeviceAccess) ∧
+        (∀ j < nIn, gFinal.deviceBuffers.lookup j =
+          some (MetalAst.ByteMemory.ofU64Words (inWords j))) ∧
+        gFinal.deviceBuffers.lookup nIn = some outMemFinal ∧
+        outMemFinal.bytes.size = len * 8 ∧
+        (∀ i < len,
+          (gx * groupSize ≤ i ∧ i < (gx + 1) * groupSize →
+            outMemFinal.readU64Word? i = some (specWord i)) ∧
+          (¬ (gx * groupSize ≤ i ∧ i < (gx + 1) * groupSize) →
+            outMemFinal.readU64Word? i = outMem0.readU64Word? i)) ∧
+        (∀ a ∈ gFinal.epochLog.filter isDeviceAccess,
+          SimtLogInv nIn (min len (gx * groupSize)) (min len ((gx + 1) * groupSize)) a) := by
+  intro body mkLane
+  have hbody : body = inner ++ [.returnStmt] := metal_body facts inner hfacts
+  intro rem
+  induction rem with
+  | zero =>
+    intro tx0 f g done outMem0 outMem htx _ _ hst hfn hbd hcb hin hout hsize hwords hlog hdone hthreads
+    have htxEq : tx0 = groupSize := by omega
+    have hcxEq : gx * groupSize + tx0 = (gx + 1) * groupSize := by
+      rw [htxEq, Nat.succ_mul]
+    have hallH : g.threads.all (·.halted) = true := by
+      rw [hthreads, List.range_zero, List.map_nil, List.append_nil, List.all_eq_true]
+      exact hdone
+    have hinG : ∀ j < nIn, g.deviceBuffers.lookup j =
+        some (MetalAst.ByteMemory.ofU64Words (inWords j)) := fun j hj => (hin j hj).1
+    refine ⟨g, outMem, runGroupWithDeviceLog_all_halted f g hallH, hinG, hout, hsize, ?_, ?_⟩
+    · intro i hi
+      rw [← hcxEq]
+      exact hwords i hi
+    · intro a ha
+      have ha' : a ∈ g.epochLog := by
+        rcases List.mem_filter.mp ha with ⟨hm, _⟩; exact hm
+      rw [← hcxEq]
+      exact hlog a ha'
+  | succ r ih =>
+    intro tx0 f g done outMem0 outMem htx hgrid hfuel hst hfn hbd hcb hin hout hsize hwords hlog hdone hthreads
+    have hltGrp : gx * groupSize + tx0 < (gx + 1) * groupSize := by
+      rw [Nat.succ_mul]; omega
+    have hcx : gx * groupSize + tx0 < len := Nat.lt_of_lt_of_le hltGrp hcov
+    have hcx32 : gx * groupSize + tx0 < 2 ^ 32 := Nat.lt_trans hltGrp hgrid
+    have hfuel' : stepsInner + 1 ≤ f := by
+      have : 1 * (stepsInner + 1) ≤ (r + 1) * (stepsInner + 1) := Nat.mul_le_mul_right _ (by omega)
+      omega
+    let todo := (List.range r).map (fun d => mkLane ((tx0 + 1) + d))
+    have hmapSplit : (List.range (r + 1)).map (fun d => mkLane (tx0 + d)) = mkLane tx0 :: todo := by
+      rw [List.range_succ_eq_map, List.map_cons, List.map_map]
+      simp only [Nat.add_zero]
+      congr 1
+      apply List.map_congr_left
+      intro d _
+      dsimp only [Function.comp, Nat.succ_eq_add_one]
+      have ha : tx0 + (d + 1) = (tx0 + 1) + d := by omega
+      rw [ha]
+    have hmk0 : mkLane tx0 = {
+        tid := { x := tx0, y := 0, z := 0 }
+        locals := initBuiltinLocal MSLLocals.empty "gid" .uint (gx * groupSize + tx0, 0, 0)
+        stmts := inner ++ [.returnStmt]
+        halted := false } := by
+      dsimp only [mkLane]; rw [hbody]
+    have hsplit : g.threads = done ++ ({
+        tid := { x := tx0, y := 0, z := 0 }
+        locals := initBuiltinLocal MSLLocals.empty "gid" .uint (gx * groupSize + tx0, 0, 0)
+        stmts := inner ++ [.returnStmt]
+        halted := false } :: todo) := by
+      rw [hthreads, hmapSplit, hmk0]
+    have hminLo : min len (gx * groupSize) = gx * groupSize :=
+      Nat.min_eq_right (Nat.le_of_lt hcx |> fun h => by omega)
+    have hminCx : min len (gx * groupSize + tx0) = gx * groupSize + tx0 :=
+      Nat.min_eq_right (Nat.le_of_lt hcx)
+    have hminCx1 : min len (gx * groupSize + (tx0 + 1)) = gx * groupSize + tx0 + 1 := by
+      have heq : gx * groupSize + (tx0 + 1) = gx * groupSize + tx0 + 1 := by omega
+      rw [heq]; exact Nat.min_eq_right (by omega)
+    have hlogIn : ∀ a ∈ g.epochLog, SimtLogInv nIn (gx * groupSize) (gx * groupSize + tx0) a := by
+      intro a ha
+      have h0 := hlog a ha
+      rwa [hminLo, hminCx] at h0
+    obtain ⟨f', thH, g', outMem', hrun, hf', hhalt, hth, hst', hfn', hbd', hcb', hin', hout', hsize',
+        hword, hother, hlog'⟩ :=
+      hInner g done todo (gx * groupSize + tx0) tx0 (gx * groupSize) f outMem
+        hcx hcx32 hlen64 (by omega) hfuel' hst hfn hbd hcb hin hout hsize hlogIn hdone hsplit
+    have hfNext : r * (stepsInner + 1) ≤ f' := by
+      have : (r + 1) * (stepsInner + 1) = r * (stepsInner + 1) + (stepsInner + 1) :=
+        Nat.succ_mul r (stepsInner + 1)
+      omega
+    have hdoneNext : ∀ d ∈ done ++ [thH], d.halted = true := by
+      intro d hd
+      rcases List.mem_append.mp hd with h1 | h2
+      · exact hdone d h1
+      · rw [List.mem_singleton.mp h2]; exact hhalt
+    have hthreadsNext : g'.threads = (done ++ [thH]) ++ todo := by
+      rw [hth, List.append_assoc]; rfl
+    have hlogNext : ∀ a ∈ g'.epochLog,
+        SimtLogInv nIn (min len (gx * groupSize)) (min len (gx * groupSize + (tx0 + 1))) a := by
+      rw [hminLo, hminCx1]
+      exact hlog'
+    have hrest := ih (tx0 + 1) f' g' (done ++ [thH]) outMem0 outMem' (by omega) hgrid
+      hfNext hst' hfn' hbd' (hcb'.trans hcb) (fun j hj => ⟨hin' j hj, (hin j hj).2⟩) hout' hsize'
+      (by
+        intro i hi; constructor
+        · intro hrange
+          by_cases hc : i = gx * groupSize + tx0
+          · subst hc; exact hword
+          · rw [hother i hc]; exact (hwords i hi).1 (by omega)
+        · intro hrange
+          rw [hother i (by omega)]; exact (hwords i hi).2 (by omega))
+      hlogNext hdoneNext hthreadsNext
+    rcases hrest with ⟨gF, outF, hrun2, hinF, houtF, hsizeF, hwordsF, hlogF⟩
+    refine ⟨gF, outF, by rw [hrun]; exact hrun2, hinF, houtF, hsizeF, hwordsF, hlogF⟩
 
 theorem proofRetention_pipeline_nonvacuous :
-    let facts : FactEnv := [.exclusiveObj 0, .noOverflowAdd 1 2 true true, .disjointSlices 3 4, .idxLt 5 6]
+    let facts : FactEnv := [.exclusiveObj 0, .noOverflowAdd 1 2 true true, .disjointSlices 3 4 16 32, .idxLt 5 6]
     let st : HeapState := { buffers := [{ id := 1, exclusive := true, data := #[42] }], nextId := 2 }
     let env := (VarEnv.empty).bind 0 (.sarrayId 1)
-    let rawCode : LNIRCode := .letBind 7 .i1 (.isExclusive 0) (.letBind 8 (.sarray .i64) (.sarrayEnsureExclusive 0 .i64) (.ret 8))
+    let rawCode : LNIRCode := .letBind 7 .i1 (.isExclusive 0)
+      (.letBind 8 (.sarray .i64) (.sarrayEnsureExclusive 0 .i64) (.ret 8))
     let specCode := dischargeRetainedExclusivity facts rawCode
-    let llvmIns := emitVerifiedLLVMWithFacts facts 1 2 [.add "s" .none .i64 (.constInt .i64 4#64) (.constInt .i64 5#64)]
-    let ps := noaliasParams facts 3 4 [{ ty := .ptr 0, name := "p" }]
-    specCode = .letBind 7 .i1 (.scalar (.constBool true)) (.letBind 8 (.sarray .i64) (.scalar (.var 0)) (.ret 8)) ∧
+    let llvmSt := bindReg (bindReg {} "v1" (.bits .i64 4#64)) "v2" (.bits .i64 5#64)
+    let llvmIns := emitVerifiedLLVMWithFacts facts 1 2
+      [.add "s" .none .i64 (.reg "v1") (.reg "v2")]
+    let ps := noaliasParams facts 3 4 16 32 [{ ty := .ptr 0, name := "v3" }]
+    specCode = .letBind 7 .i1 (.scalar (.constBool true))
+        (.letBind 8 (.sarray .i64) (.scalar (.var 0)) (.ret 8)) ∧
       evalCode 3 env st specCode = .ok (.sarrayId 1, st) ∧
-      execInstrs {} 1 {} llvmIns = .inr (bindReg {} "s" (.bits .i64 9#64)) ∧
-      bindArgs {} ps [.ptr 8#64] = some (bindReg {} "p" (.ptr 8#64)) ∧
+      execInstrs {} 1 llvmSt llvmIns = .inr (bindReg llvmSt "s" (.bits .i64 9#64)) ∧
+      bindArgs {} ps [.ptr 8#64] = some (bindReg {} "v3" (.ptr 8#64)) ∧
       (lowerBoundsFreePTXLoad facts 5 6 .u64 "%d" (.regOffset "%a" 0)).length = 1 ∧
       (lowerBoundsFreeMetalLoad facts 5 6 "buf").length = 1 := by
   refine ⟨rfl, rfl, ?_, rfl, rfl, rfl⟩
-  simp [emitVerifiedLLVMWithFacts, attachLoadStoreAlign, attachOverflow, overflowOf, execInstrs,
-    execInstrsWith, stepInstrWith, LLVMAst.evalOperand, binResult, flagsOverflow]; decide
+  decide
 
 end LeanNative.Proofs

@@ -71,6 +71,11 @@ def guarded (inner : List MSLStmt) : List MSLStmt :=
   [ .ifElse (.lt (.cast .ulong (.var "gid")) (.var "n")) (MSLBlock.ofList inner) .nil
   , .returnStmt ]
 
+/-- `facts = []` is `guarded`. A retained `idxLt` drops the `gid < n` test;
+the launch contract is then `grid.x * block.x ≤ n`. -/
+def guardedWithFacts (inner : List MSLStmt) (facts : List RetainedFact) : List MSLStmt :=
+  if facts.isEmpty then guarded inner else inner ++ [.returnStmt]
+
 def elem (name : String) : MSLExpr := .index name (.var "gid")
 
 def storeOut (rhs : MSLExpr) : MSLStmt := .indexAssign "out" (.var "gid") rhs
@@ -80,6 +85,10 @@ def kernelOf (name : String) (nIn : Nat) (compute : MSLExpr) : MSLKernelDecl whe
   params := (List.range nIn).map (fun i => bufParam s!"in{i}" i true) ++
     [bufParam "out" nIn false, lenParam (nIn + 1), gidParam]
   body := guarded [storeOut compute]
+
+def kernelOfWithFacts (name : String) (nIn : Nat) (compute : MSLExpr)
+    (facts : List RetainedFact) : MSLKernelDecl :=
+  { kernelOf name nIn compute with body := guardedWithFacts [storeOut compute] facts }
 
 def lowerKind (name : String) : ParallelKernelKind → MSLKernelDecl
   | .mapScaleAdd scale bias =>
@@ -116,6 +125,45 @@ def lowerKind (name : String) : ParallelKernelKind → MSLKernelDecl
 
 def lowerToMetal (name : String) (k : ParallelKernelKind) : MSLModule where
   kernels := [lowerKind name k]
+
+/-- Fact-carrying twin of `lowerKind`. Empty facts reproduce `lowerKind` exactly. -/
+def lowerKindWithFacts (name : String) (facts : List RetainedFact) :
+    ParallelKernelKind → MSLKernelDecl
+  | .mapScaleAdd scale bias =>
+    kernelOfWithFacts name 1
+      (.add (.mul (elem "in0") (.immU64 scale.toBitVec)) (.immU64 bias.toBitVec)) facts
+  | .zipAdd => kernelOfWithFacts name 2 (.add (elem "in0") (elem "in1")) facts
+  | .zipMul => kernelOfWithFacts name 2 (.mul (elem "in0") (elem "in1")) facts
+  | .dotProduct => lowerKind name .dotProduct
+  | .saxpy alpha =>
+    kernelOfWithFacts name 2 (.add (.mul (.immU64 alpha.toBitVec) (elem "in0")) (elem "in1")) facts
+  | .stencil1D3Pt wL wC wR =>
+    let base := lowerKind name (.stencil1D3Pt wL wC wR)
+    if facts.isEmpty then base
+    else
+      let i := .cast .ulong (.var "gid")
+      let edge := .logOr (.eq i (u 0)) (.ge (.add i (u 1)) (.var "n"))
+      let center := elem "in0"
+      let interior := .add (.add
+        (.mul (.immU64 wL.toBitVec) (.index "in0" (.sub i (u 1))))
+        (.mul (.immU64 wC.toBitVec) center))
+        (.mul (.immU64 wR.toBitVec) (.index "in0" (.add i (u 1))))
+      let inner := [.ifElse edge (.cons (storeOut center) .nil) (.cons (storeOut interior) .nil)]
+      { base with body := guardedWithFacts inner facts }
+  | .customScalar idxVar inVars body =>
+    let base := lowerKind name (.customScalar idxVar inVars body)
+    if facts.isEmpty then base
+    else
+      let loads := (List.range inVars.length).map fun k =>
+        let id := inVars[k]?.getD 0
+        .varDecl .ulong s!"v{id}" (elem s!"in{k}")
+      let rhs := lowerScalar "gid64" idxVar body
+      let inner := [.varDecl .ulong "gid64" (.cast .ulong (.var "gid"))] ++ loads ++ [storeOut rhs]
+      { base with body := guardedWithFacts inner facts }
+
+def lowerToMetalWithFacts (name : String) (facts : List RetainedFact)
+    (k : ParallelKernelKind) : MSLModule where
+  kernels := [lowerKindWithFacts name facts k]
 
 def ppLowered (name : String) (k : ParallelKernelKind) : String :=
   ppMSLModule (lowerToMetal name k)

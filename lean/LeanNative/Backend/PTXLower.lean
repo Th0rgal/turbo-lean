@@ -202,6 +202,23 @@ def gidSetup (doneLbl : String) : List PTXStmt :=
   , ins (.shl .b64 "%rd5" (.reg "%rd2") (i64 3))
   , ins (.add .none .u64 "%rd6" (.reg "%rd4") (.reg "%rd5")) ]
 
+/-- Same preamble as `gidSetup`, but the `setp.ge` / `bra` guard is omitted when a
+retained `idxLt` covers every launched lane (`grid.x * block.x ≤ n`). -/
+def gidSetupWithFacts (doneLbl : String) (facts : List RetainedFact) : List PTXStmt :=
+  if facts.isEmpty then gidSetup doneLbl
+  else
+    [ ins (.mov .u32 "%r0" (.sreg .ctaidX))
+    , ins (.mov .u32 "%r1" (.sreg .ntidX))
+    , ins (.mov .u32 "%r2" (.sreg .tidX))
+    , ins (.mul .wide .u32 "%rd0" (.reg "%r0") (.reg "%r1"))
+    , ins (.cvt .none .u64 .u32 "%rd1" (.reg "%r2"))
+    , ins (.add .none .u64 "%rd2" (.reg "%rd0") (.reg "%rd1"))
+    , ins (.ldParam .u64 "%rd3" "param_n")
+    , ins (.ldParam .u64 "%rd4" "param_out")
+    , ins (.cvtaToGlobal .u64 "%rd4" (.reg "%rd4"))
+    , ins (.shl .b64 "%rd5" (.reg "%rd2") (i64 3))
+    , ins (.add .none .u64 "%rd6" (.reg "%rd4") (.reg "%rd5")) ]
+
 def loadIn (k : Nat) (reg : String) : List PTXStmt :=
   [ ins (.ldParam .u64 reg s!"param_in{k}")
   , ins (.cvtaToGlobal .u64 reg (.reg reg))
@@ -282,6 +299,20 @@ def lowerKind (name : String) : ParallelKernelKind → PTXKernel
 
 def lowerToPTX (name : String) (k : ParallelKernelKind) : PTXModule where
   kernels := [lowerKind name k]
+
+/-- Fact-carrying twin of `lowerKind`: a non-empty fact list drops the lane guard. -/
+def lowerKindWithFacts (name : String) (facts : List RetainedFact) :
+    ParallelKernelKind → PTXKernel
+  | .dotProduct => lowerKind name .dotProduct
+  | k =>
+    let base := lowerKind name k
+    if facts.isEmpty then base
+    else { base with body := gidSetupWithFacts s!"$L_done_{name}" facts ++
+        (base.body.drop (gidSetup s!"$L_done_{name}").length) }
+
+def lowerToPTXWithFacts (name : String) (facts : List RetainedFact)
+    (k : ParallelKernelKind) : PTXModule where
+  kernels := [lowerKindWithFacts name facts k]
 
 def ppLowered (name : String) (k : ParallelKernelKind) : String :=
   ppPTXModule (lowerToPTX name k)

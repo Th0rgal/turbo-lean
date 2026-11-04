@@ -245,6 +245,31 @@ def LNIRDecl.telemetryFeaturesJson (d : LNIRDecl) : String :=
   let (nInstr, nBlocks, nLoops, maxDepth, u64c, u256c, bc) := go 0 d.body
   s!"\{\"n_instr\":{nInstr},\"n_blocks\":{nBlocks},\"n_loops\":{nLoops},\"max_loop_depth\":{maxDepth},\"width_histogram\":\{\"u64\":{u64c},\"u256\":{u256c},\"bool\":{bc}}}"
 
+/-! ## D1 retained refinement facts
+
+Facts extracted from pre-erasure `Lean.Compiler.LCNF.Code .pure` and consumed by the
+LLVM / PTX / Metal specializers. Defined here so `LeanNative.Backend.*` never imports
+`LeanNative.Semantics`. -/
+
+/-- A refinement fact retained from the pure LCNF phase. -/
+inductive RetainedFact where
+  | idxLt (idxVar lenVar : VarId)
+  | noOverflowAdd (lhs rhs : VarId) (nsw nuw : Bool)
+  | noOverflowSub (lhs rhs : VarId) (nsw nuw : Bool)
+  | noOverflowMul (lhs rhs : VarId) (nsw nuw : Bool)
+  | alignedPtr (ptrVar : VarId) (alignBytes : Nat)
+  | disjointSlices (ptrA ptrB : VarId) (lenA lenB : Nat)
+  | exclusiveObj (objVar : VarId)
+  deriving Repr, DecidableEq, Inhabited
+
+abbrev FactEnv := List RetainedFact
+
+def factMember (facts : FactEnv) (f : RetainedFact) : Bool :=
+  facts.contains f
+
+def consFact (facts : FactEnv) (f : RetainedFact) : FactEnv :=
+  if factMember facts f then facts else f :: facts
+
 /-- RC-ADT (Stage 1D heap) expressions: ctor ops, heap boxes, exclusivity tests, and the heap runtime calls. -/
 def LNIRExpr.isRcAdtExpr : LNIRExpr → Bool
   | .allocCtor _ _ _ | .ctorGetObj _ _ | .ctorGetScalar _ _ _ | .isExclusive _

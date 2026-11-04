@@ -59,6 +59,8 @@ import LeanNative.Transform.AlgebraicOpt
 import LeanNative.Transform.UnboxTupleSROA
 import LeanNative.Transform.HoistExclusivity
 import LeanNative.Transform.AsyncStateMachine
+import LeanNative.Frontend.ProofRetention
+import LeanNative.Proofs.ProofRetentionProofs
 import LeanNative.Transform.LoopVectorizeOpt
 import LeanNative.Transform.KernelFusion
 import LeanNative.Transform.Superopt
@@ -82,8 +84,6 @@ import LeanNative.Backend.FastCheck
 import LeanNative.Driver.EvalBatch
 import LeanNative.Driver.CoreCLI
 import LeanNative.Proofs.AsyncStateMachineProofs
-import LeanNative.Frontend.ProofRetention
-import LeanNative.Proofs.ProofRetentionProofs
 
 namespace LeanNative.Core
 
