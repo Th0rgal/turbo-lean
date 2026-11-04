@@ -82,6 +82,8 @@ import LeanNative.Backend.FastCheck
 import LeanNative.Driver.EvalBatch
 import LeanNative.Driver.CoreCLI
 import LeanNative.Proofs.AsyncStateMachineProofs
+import LeanNative.Frontend.ProofRetention
+import LeanNative.Proofs.ProofRetentionProofs
 
 namespace LeanNative.Core
 

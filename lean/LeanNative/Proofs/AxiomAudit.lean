@@ -44,6 +44,7 @@ import LeanNative.Backend.MetalAst
 import LeanNative.Backend.StableHLOAst
 import LeanNative.Transform.AsyncStateMachine
 import LeanNative.Proofs.AsyncStateMachineProofs
+import LeanNative.Proofs.ProofRetentionProofs
 
 namespace LeanNative.Proofs
 
@@ -453,6 +454,20 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.optimizeThreadLocalOwnershipRC_preserves_escaping_mark_mt
   , ``LeanNative.Proofs.optimizeThreadLocalOwnershipRC_mark_mt_nonvacuous
   , ``LeanNative.Proofs.sendableRecv_preserves_disjoint
+  , ``LeanNative.Proofs.evalExpr_isExclusive_of_obj
+  , ``LeanNative.Proofs.evalExpr_ensureExclusive_of_obj
+  , ``LeanNative.Proofs.dischargeRetainedExclusivity_sound
+  , ``LeanNative.Proofs.dischargeLocalExclusivity_refines
+  , ``LeanNative.Proofs.llvmAlignedPtr_of_fact_sound
+  , ``LeanNative.Proofs.llvmOverflowFlags_of_fact_sound
+  , ``LeanNative.Proofs.llvmMulOverflowFlags_of_fact_sound
+  , ``LeanNative.Proofs.llvmSubOverflowFlags_of_fact_sound
+  , ``LeanNative.Proofs.add_nsw_poison_witness
+  , ``LeanNative.Proofs.llvmNoAliasParam_of_disjoint_sound
+  , ``LeanNative.Proofs.readBytesAt_disjoint_of_fact
+  , ``LeanNative.Proofs.ptxBoundsFreeLoad_sound
+  , ``LeanNative.Proofs.metalBoundsFreeLoad_sound
+  , ``LeanNative.Proofs.proofRetention_pipeline_nonvacuous
   ]
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/
