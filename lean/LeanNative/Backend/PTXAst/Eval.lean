@@ -8,28 +8,6 @@ namespace LeanNative.Backend.PTXAst
 
 /-! ## 2. Independent SIMT Operational Semantics -/
 
-/-- 3D grid or CTA (thread-block) dimensions / coordinates. -/
-structure Dim3 where
-  x : Nat := 1
-  y : Nat := 1
-  z : Nat := 1
-  deriving Repr, DecidableEq, Inhabited, BEq
-
-namespace Dim3
-
-def totalThreads (d : Dim3) : Nat :=
-  d.x * d.y * d.z
-
-def coords (d : Dim3) : List Dim3 :=
-  (List.range d.z).flatMap fun z =>
-    (List.range d.y).flatMap fun y =>
-      (List.range d.x).map fun x => { x, y, z }
-
-def linearTid (blockDim tid : Dim3) : Nat :=
-  (tid.z * blockDim.y + tid.y) * blockDim.x + tid.x
-
-end Dim3
-
 /-- Per-thread register values: `uninit` for declared-but-unwritten registers, `pred` (`Bool`) for
     `.pred`, and `scalar` (`BitVec 64`, masked per register width) for scalar integer & IEEE
     bit-pattern registers. -/
@@ -230,6 +208,7 @@ structure PTXCTAState where
   paramMem     : ParamMemory
   sharedLayout : SharedLayout
   epochLog     : List MemAccessLog := []
+  barrierGen   : List (Nat × Nat) := []
   deriving Repr, DecidableEq, Inhabited, BEq
 
 /-- Explicit operational outcome of PTX SIMT execution, distinguishing normal completion from
@@ -1339,6 +1318,63 @@ def stepCTABarrier (bid : Nat) (states : List (Option Nat)) (cta : PTXCTAState) 
   else
     .barrierDivergence bid
 
+/-- Lookup the current generation counter of barrier `bid` in `gens` (`0` if not yet reached). -/
+def getBarrierGen (gens : List (Nat × Nat)) (bid : Nat) : Nat :=
+  lookupBarrierEpoch gens bid
+
+/-- Increment the generation counter of barrier `bid` by `1` in `gens`. -/
+def bumpBarrierGen (gens : List (Nat × Nat)) (bid : Nat) : List (Nat × Nat) :=
+  match gens with
+  | [] => [(bid, 1)]
+  | (b, g) :: rest =>
+    if b == bid then (bid, g + 1) :: rest
+    else (b, g) :: bumpBarrierGen rest bid
+
+/-- True iff thread `th` has legally exited via an explicit `ret` instruction (`th.halted = true`,
+    `th.pc > 0`, and `stmts[th.pc - 1]?` is a `.ret` instruction), distinguishing explicit PTX 8.0
+    `ret` exit from falling off the end of `stmts` without `ret`. -/
+def threadExitedByRet (stmts : List PTXStmt) (th : PTXThreadState) : Bool :=
+  th.halted && th.pc > 0 &&
+    match stmts[th.pc - 1]? with
+    | some (.instr _ .ret) => true
+    | _ => false
+
+/-- Check whether `threads` and their collected `states` converge on `bar.sync bid` under PTX 8.0
+    barrier-generation semantics (`D6`): every thread is either parked at active `bar.sync bid`
+    (`st == some bid` and `!th.halted`) or has already legally exited via `ret`. -/
+def barrierParticipantsConverged (stmts : List PTXStmt) (bid : Nat) :
+    List PTXThreadState → List (Option Nat) → Bool
+  | [], [] => true
+  | th :: ths, st :: sts =>
+    ((st == some bid && !th.halted) || (st == none && threadExitedByRet stmts th)) &&
+      barrierParticipantsConverged stmts bid ths sts
+  | _, _ => false
+
+/-- Advance `pc` by `1` for active barrier participants (`st == some bid`), leaving `ret`-exited
+    threads untouched (`halted = true`, `pc` unchanged). -/
+def advanceBarrierParticipants (bid : Nat) :
+    List PTXThreadState → List (Option Nat) → List PTXThreadState
+  | th :: ths, st :: sts =>
+    let th' := if st == some bid && !th.halted then { th with pc := th.pc + 1 } else th
+    th' :: advanceBarrierParticipants bid ths sts
+  | ths, _ => ths
+
+/-- Synchronize a CTA at `bar.sync bid` with per-barrier generation tracking (`D6`):
+    threads that have already legally exited via `ret` are exempt from arriving at `bar.sync bid`,
+    while threads at a different barrier `bid' ≠ bid`, stuck at a warp shuffle, or halted by
+    falling off the end without `ret` trap with `PTXOutcome.barrierDivergence bid`. On convergence,
+    active participants advance `pc + 1`, `barrierGen` for `bid` increments by `1`, and `epochLog`
+    is cleared for the new barrier generation. -/
+def stepCTABarrierGen (stmts : List PTXStmt) (bid : Nat) (states : List (Option Nat))
+    (cta : PTXCTAState) : PTXOutcome PTXCTAState :=
+  if barrierParticipantsConverged stmts bid cta.threads states then
+    .ok { cta with
+      threads := advanceBarrierParticipants bid cta.threads states
+      epochLog := []
+      barrierGen := bumpBarrierGen cta.barrierGen bid }
+  else
+    .barrierDivergence bid
+
 private def evalShflParticipants (stmts : List PTXStmt) (cta : PTXCTAState) (shflPc : Nat)
     (threads : List PTXThreadState) :
     PTXOutcome (List (Nat × PTXThreadState × String × BitVec 64 × Nat × Nat × Nat)) :=
@@ -1493,7 +1529,7 @@ def stepCTA (stmts : List PTXStmt) (cta : PTXCTAState) : PTXOutcome (Bool × PTX
             PTXOutcome.bind (collectBarrierStates stmts cta'.threads) fun barStates =>
               match barStates.findSome? id with
               | some bid =>
-                PTXOutcome.bind (stepCTABarrier bid barStates cta') fun synced =>
+                PTXOutcome.bind (stepCTABarrierGen stmts bid barStates cta') fun synced =>
                   .ok (false, synced)
               | none => .ok (true, cta')
 
@@ -1599,6 +1635,395 @@ def evalPTXKernel (fuelPerCTA : Nat) (k : PTXKernel) (gridDim blockDim : Dim3)
     (globalMem : ByteMemory) (paramMem : ParamMemory)
     (constMem : ByteMemory := ByteMemory.zeros 0) : PTXOutcome ByteMemory :=
   evalPTXKernelLoop fuelPerCTA k gridDim blockDim paramMem constMem globalMem [] gridDim.coords
+
+/-! ## 2b. Optional Read-Oracle & Axiomatic Weak-Memory Trace Semantics (`D6`) -/
+
+/-- Per-CTA trace accumulator used by `evalPTXKernelWithOracle` / `evalPTXMultiKernelSeq`. -/
+structure PTXOracleTrace where
+  nextEventId : Nat := 0
+  kernelIdx   : Nat := 0
+  threadOrd   : List (Dim3 × Nat) := []
+  eventsRev   : List PTXMemEvent := []
+  deriving Repr, DecidableEq, Inhabited, BEq
+
+def getThreadAccessOrd (ords : List (Dim3 × Nat)) (tid : Dim3) : Nat :=
+  match ords with
+  | [] => 0
+  | (t, n) :: rest => if t == tid then n else getThreadAccessOrd rest tid
+
+def bumpThreadAccessOrd (ords : List (Dim3 × Nat)) (tid : Dim3) : List (Dim3 × Nat) :=
+  match ords with
+  | [] => [(tid, 1)]
+  | (t, n) :: rest => if t == tid then (tid, n + 1) :: rest else (t, n) :: bumpThreadAccessOrd rest tid
+
+def recordMemEvent (tr : PTXOracleTrace) (cta : PTXCTAState) (tid : Dim3) (sp : StateSpace)
+    (byteAddr width : Nat) (isRead isWrite isAtomic : Bool)
+    (valRead valWritten : BitVec 64) : PTXOracleTrace :=
+  let ev : PTXMemEvent :=
+    { eventId := tr.nextEventId
+      kernelIdx := tr.kernelIdx
+      ctaId := cta.ctaId
+      tid := tid
+      barrierEpoch := cta.barrierGen
+      space := sp
+      addr := byteAddr
+      width := width
+      isRead := isRead
+      isWrite := isWrite
+      isAtomic := isAtomic
+      valRead := valRead
+      valWritten := valWritten }
+  { tr with
+    nextEventId := tr.nextEventId + 1
+    threadOrd := bumpThreadAccessOrd tr.threadOrd tid
+    eventsRev := ev :: tr.eventsRev }
+
+def resolveOracleRead (oracle? : Option PTXReadOracle) (cta : PTXCTAState) (tid : Dim3)
+    (ord : Nat) (sp : StateSpace) (byteAddr width : Nat) (fallback : BitVec 64) : BitVec 64 :=
+  match oracle? with
+  | none => fallback
+  | some orc =>
+    match orc cta.ctaId tid ord sp byteAddr width with
+    | some v => v
+    | none => fallback
+
+/-- Execute a single non-barrier instruction under an optional `PTXReadOracle`, preserving every
+    existing `PTXOutcome` UB/alignment/OOB/data-race trap and recording `PTXMemEvent`s on
+    `.global`/`.shared` loads, stores, and atomic RMWs. When `oracle? = none`, all values and traps
+    match `execNonBarrierInstr` bit-for-bit. -/
+def execNonBarrierInstrOracle (oracle? : Option PTXReadOracle) (stmts : List PTXStmt)
+    (cta : PTXCTAState) (th : PTXThreadState) (tr : PTXOracleTrace) (ins : PTXInstr) :
+    PTXOutcome (PTXThreadState × ByteMemory × ByteMemory × List MemAccessLog × PTXOracleTrace) :=
+  let nextPc := th.pc + 1
+  let ord := getThreadAccessOrd tr.threadOrd th.tid
+  match ins with
+  | .ldGlobal ty dst addr =>
+    PTXOutcome.bind (evalAddr cta th addr) fun byteAddr =>
+      let w := ty.byteWidth
+      PTXOutcome.bind (checkAligned .global byteAddr w) fun () =>
+        PTXOutcome.bind (recordEpochAccess cta.epochLog th.tid .global byteAddr w false false) fun log' =>
+          match cta.globalMem.loadBits byteAddr w with
+          | some memRaw =>
+            let raw := resolveOracleRead oracle? cta th.tid ord .global byteAddr w memRaw
+            let v := maskForType ty raw
+            PTXOutcome.bind (th.regs.setScalar dst v (some ty.bitWidth)) fun rf' =>
+              let tr' := recordMemEvent tr cta th.tid .global byteAddr w true false false v 0#64
+              .ok ({ th with pc := nextPc, regs := rf' }, cta.globalMem, cta.sharedMem, log', tr')
+          | none => .outOfBoundsLoad .global byteAddr
+  | .ldShared ty dst addr =>
+    PTXOutcome.bind (evalAddr cta th addr) fun byteAddr =>
+      let w := ty.byteWidth
+      PTXOutcome.bind (checkAligned .shared byteAddr w) fun () =>
+        PTXOutcome.bind (recordEpochAccess cta.epochLog th.tid .shared byteAddr w false false) fun log' =>
+          match cta.sharedMem.loadBits byteAddr w with
+          | some memRaw =>
+            let raw := resolveOracleRead oracle? cta th.tid ord .shared byteAddr w memRaw
+            let v := maskForType ty raw
+            PTXOutcome.bind (th.regs.setScalar dst v (some ty.bitWidth)) fun rf' =>
+              let tr' := recordMemEvent tr cta th.tid .shared byteAddr w true false false v 0#64
+              .ok ({ th with pc := nextPc, regs := rf' }, cta.globalMem, cta.sharedMem, log', tr')
+          | none => .outOfBoundsLoad .shared byteAddr
+  | .stGlobal ty addr src =>
+    PTXOutcome.bind (evalAddr cta th addr) fun byteAddr =>
+      PTXOutcome.bind (evalOperand cta th src (some ty.bitWidth)) fun v =>
+        let w := ty.byteWidth
+        let wVal := maskForType ty v
+        PTXOutcome.bind (checkAligned .global byteAddr w) fun () =>
+          PTXOutcome.bind (recordEpochAccess cta.epochLog th.tid .global byteAddr w true false) fun log' =>
+            match cta.globalMem.storeBits byteAddr w wVal with
+            | some g' =>
+              let tr' := recordMemEvent tr cta th.tid .global byteAddr w false true false 0#64 wVal
+              .ok ({ th with pc := nextPc }, g', cta.sharedMem, log', tr')
+            | none => .outOfBoundsStore .global byteAddr
+  | .stShared ty addr src =>
+    PTXOutcome.bind (evalAddr cta th addr) fun byteAddr =>
+      PTXOutcome.bind (evalOperand cta th src (some ty.bitWidth)) fun v =>
+        let w := ty.byteWidth
+        let wVal := maskForType ty v
+        PTXOutcome.bind (checkAligned .shared byteAddr w) fun () =>
+          PTXOutcome.bind (recordEpochAccess cta.epochLog th.tid .shared byteAddr w true false) fun log' =>
+            match cta.sharedMem.storeBits byteAddr w wVal with
+            | some s' =>
+              let tr' := recordMemEvent tr cta th.tid .shared byteAddr w false true false 0#64 wVal
+              .ok ({ th with pc := nextPc }, cta.globalMem, s', log', tr')
+            | none => .outOfBoundsStore .shared byteAddr
+  | .atomAdd sp ty dst addr src =>
+    if sp != .global && sp != .shared then
+      .invalidOperand "atom.add requires .global or .shared state space"
+    else
+      PTXOutcome.bind (evalAddr cta th addr) fun byteAddr =>
+        PTXOutcome.bind (evalOperand cta th src (some ty.bitWidth)) fun v =>
+          let w := ty.byteWidth
+          PTXOutcome.bind (checkAligned sp byteAddr w) fun () =>
+            PTXOutcome.bind (recordEpochAccess cta.epochLog th.tid sp byteAddr w true true) fun log' =>
+              let mem := if sp == .global then cta.globalMem else cta.sharedMem
+              match mem.loadBits byteAddr w with
+              | none => .outOfBoundsStore sp byteAddr
+              | some memRaw =>
+                let oldRaw := resolveOracleRead oracle? cta th.tid ord sp byteAddr w memRaw
+                let oldVal := maskForType ty oldRaw
+                let addResOutcome : PTXOutcome (BitVec 64) :=
+                  match ty with
+                  | .f32 => .ok (f32ToBv (bvToF32 oldRaw + bvToF32 v))
+                  | .f64 => .ok (f64ToBv (bvToF64 oldRaw + bvToF64 v))
+                  | .u32 | .b32 | .s32 | .u64 | .b64 | .s64 =>
+                    .ok (maskForType ty (maskForType ty oldRaw + maskForType ty v))
+                  | _ => .invalidOperand "atom.add unsupported data type"
+                PTXOutcome.bind addResOutcome fun newVal =>
+                  match mem.storeBits byteAddr w newVal with
+                  | none => .outOfBoundsStore sp byteAddr
+                  | some mem' =>
+                    PTXOutcome.bind (th.regs.setScalar dst oldVal (some ty.bitWidth)) fun rf' =>
+                      let th' := { th with pc := nextPc, regs := rf' }
+                      let tr' := recordMemEvent tr cta th.tid sp byteAddr w true true true oldVal newVal
+                      if sp == .global then
+                        .ok (th', mem', cta.sharedMem, log', tr')
+                      else
+                        .ok (th', cta.globalMem, mem', log', tr')
+  | .atomCas sp ty dst addr cmpOp srcOp =>
+    if sp != .global && sp != .shared then
+      .invalidOperand "atom.cas requires .global or .shared state space"
+    else if ty != .b32 && ty != .u32 && ty != .b64 && ty != .u64 then
+      .typeMismatch "atom.cas requires .b32/.u32/.b64/.u64 type"
+    else
+      PTXOutcome.bind (evalAddr cta th addr) fun byteAddr =>
+        PTXOutcome.bind (evalOperand cta th cmpOp (some ty.bitWidth)) fun vCmp =>
+          PTXOutcome.bind (evalOperand cta th srcOp (some ty.bitWidth)) fun vSrc =>
+            let w := ty.byteWidth
+            PTXOutcome.bind (checkAligned sp byteAddr w) fun () =>
+              PTXOutcome.bind (recordEpochAccess cta.epochLog th.tid sp byteAddr w true true) fun log' =>
+                let mem := if sp == .global then cta.globalMem else cta.sharedMem
+                match mem.loadBits byteAddr w with
+                | none => .outOfBoundsStore sp byteAddr
+                | some memRaw =>
+                  let oldRaw := resolveOracleRead oracle? cta th.tid ord sp byteAddr w memRaw
+                  let oldVal := maskForType ty oldRaw
+                  let cmpMasked := maskForType ty vCmp
+                  let nextStoreVal := if oldVal == cmpMasked then maskForType ty vSrc else oldVal
+                  match mem.storeBits byteAddr w nextStoreVal with
+                  | none => .outOfBoundsStore sp byteAddr
+                  | some mem' =>
+                    PTXOutcome.bind (th.regs.setScalar dst oldVal (some ty.bitWidth)) fun rf' =>
+                      let th' := { th with pc := nextPc, regs := rf' }
+                      let tr' :=
+                        recordMemEvent tr cta th.tid sp byteAddr w true true true oldVal nextStoreVal
+                      if sp == .global then
+                        .ok (th', mem', cta.sharedMem, log', tr')
+                      else
+                        .ok (th', cta.globalMem, mem', log', tr')
+  | _ =>
+    PTXOutcome.bind (execNonBarrierInstr stmts cta th ins) fun (th', gMem', sMem', log') =>
+      .ok (th', gMem', sMem', log', tr)
+
+def execPredicatedInstrOracle (oracle? : Option PTXReadOracle) (stmts : List PTXStmt)
+    (cta : PTXCTAState) (th : PTXThreadState) (tr : PTXOracleTrace)
+    (guard : Option PTXPredGuard) (ins : PTXInstr) :
+    PTXOutcome (PTXThreadState × ByteMemory × ByteMemory × List MemAccessLog × PTXOracleTrace) :=
+  PTXOutcome.bind (evalPredGuard th guard) fun active =>
+    if active then
+      execNonBarrierInstrOracle oracle? stmts cta th tr ins
+    else
+      .ok ({ th with pc := th.pc + 1 }, cta.globalMem, cta.sharedMem, cta.epochLog, tr)
+
+def stepFirstReadyThreadOracle (oracle? : Option PTXReadOracle) (stmts : List PTXStmt)
+    (cta : PTXCTAState) (tr : PTXOracleTrace) :
+    List PTXThreadState → List PTXThreadState → PTXOutcome (Bool × PTXCTAState × PTXOracleTrace)
+  | _, [] => .ok (false, cta, tr)
+  | prefixRev, th :: suffix =>
+    if th.halted then
+      stepFirstReadyThreadOracle oracle? stmts cta tr (th :: prefixRev) suffix
+    else
+      match stmts[th.pc]? with
+      | none =>
+        let th' := { th with halted := true }
+        .ok (true, { cta with threads := prefixRev.reverse ++ (th' :: suffix) }, tr)
+      | some (.label _) =>
+        let th' := { th with pc := th.pc + 1 }
+        .ok (true, { cta with threads := prefixRev.reverse ++ (th' :: suffix) }, tr)
+      | some (.instr guard (.barSync _)) =>
+        PTXOutcome.bind (evalPredGuard th guard) fun active =>
+          if active then
+            stepFirstReadyThreadOracle oracle? stmts cta tr (th :: prefixRev) suffix
+          else
+            let th' := { th with pc := th.pc + 1 }
+            .ok (true, { cta with threads := prefixRev.reverse ++ (th' :: suffix) }, tr)
+      | some (.instr guard (.shflSyncBfly _ _ _ _ _)) =>
+        PTXOutcome.bind (evalPredGuard th guard) fun active =>
+          if active then
+            stepFirstReadyThreadOracle oracle? stmts cta tr (th :: prefixRev) suffix
+          else
+            let th' := { th with pc := th.pc + 1 }
+            .ok (true, { cta with threads := prefixRev.reverse ++ (th' :: suffix) }, tr)
+      | some (.instr guard ins) =>
+        PTXOutcome.bind (execPredicatedInstrOracle oracle? stmts cta th tr guard ins)
+          fun (th', gMem', sMem', log', tr') =>
+            .ok (true, { cta with
+              threads := prefixRev.reverse ++ (th' :: suffix)
+              globalMem := gMem'
+              sharedMem := sMem'
+              epochLog := log' }, tr')
+
+def stepCTAOracle (oracle? : Option PTXReadOracle) (stmts : List PTXStmt)
+    (cta : PTXCTAState) (tr : PTXOracleTrace) : PTXOutcome (Bool × PTXCTAState × PTXOracleTrace) :=
+  if cta.threads.all (·.halted) then
+    .ok (true, cta, tr)
+  else
+    PTXOutcome.bind (stepFirstReadyThreadOracle oracle? stmts cta tr [] cta.threads)
+      fun (progressed, cta', tr') =>
+        if progressed then
+          .ok (false, cta', tr')
+        else
+          PTXOutcome.bind (findWaitingShflWarp? stmts cta'.blockDim cta'.threads) fun shflOpt =>
+            match shflOpt with
+            | some (warpId, shflPc) =>
+              PTXOutcome.bind (stepWarpShfl stmts cta' warpId shflPc) fun afterShfl =>
+                .ok (false, afterShfl, tr')
+            | none =>
+              PTXOutcome.bind (collectBarrierStates stmts cta'.threads) fun barStates =>
+                match barStates.findSome? id with
+                | some bid =>
+                  PTXOutcome.bind (stepCTABarrierGen stmts bid barStates cta') fun synced =>
+                    .ok (false, synced, tr')
+                | none => .ok (true, cta', tr')
+
+def runCTAWithOracle (oracle? : Option PTXReadOracle) (fuel : Nat) (stmts : List PTXStmt)
+    (cta : PTXCTAState) (tr : PTXOracleTrace) (savedGlobal : List MemAccessLog := []) :
+    PTXOutcome (PTXCTAState × List MemAccessLog × PTXOracleTrace) :=
+  match fuel with
+  | 0 =>
+    if cta.threads.all (·.halted) then
+      let curGlobal := cta.epochLog.filter (fun e => e.space == .global)
+      .ok (cta, curGlobal ++ savedGlobal, tr)
+    else
+      .fuelExhausted
+  | f + 1 =>
+    let preGlobal := cta.epochLog.filter (fun e => e.space == .global)
+    PTXOutcome.bind (stepCTAOracle oracle? stmts cta tr) fun (done, cta', tr') =>
+      let saved' :=
+        if !cta.epochLog.isEmpty && cta'.epochLog.isEmpty then
+          preGlobal ++ savedGlobal
+        else
+          savedGlobal
+      if done then
+        let postGlobal := cta'.epochLog.filter (fun e => e.space == .global)
+        .ok (cta', postGlobal ++ saved', tr')
+      else
+        runCTAWithOracle oracle? f stmts cta' tr' saved'
+
+def evalPTXKernelOracleLoop (oracle? : Option PTXReadOracle) (fuelPerCTA : Nat) (k : PTXKernel)
+    (gridDim blockDim : Dim3) (paramMem : ParamMemory) (constMem : ByteMemory)
+    (gMem : ByteMemory) (priorGlobalLog : List MemAccessLog)
+    (nextEventId kernelIdx : Nat) (eventsRev : List PTXMemEvent) :
+    List Dim3 → PTXOutcome (ByteMemory × Nat × List PTXMemEvent)
+  | [] => .ok (gMem, nextEventId, eventsRev)
+  | ctaId :: rest =>
+    let cta0 := initCTAState k gridDim blockDim ctaId gMem paramMem constMem
+    let tr0 : PTXOracleTrace :=
+      { nextEventId := nextEventId, kernelIdx := kernelIdx, threadOrd := [], eventsRev := eventsRev }
+    PTXOutcome.bind (runCTAWithOracle oracle? fuelPerCTA k.body cta0 tr0 [])
+      fun (ctaFinal, ctaGlobalLog, trFinal) =>
+        PTXOutcome.bind (checkCrossCTAGlobalLog priorGlobalLog ctaGlobalLog) fun () =>
+          evalPTXKernelOracleLoop oracle? fuelPerCTA k gridDim blockDim paramMem constMem
+            ctaFinal.globalMem (ctaGlobalLog ++ priorGlobalLog)
+            trFinal.nextEventId kernelIdx trFinal.eventsRev rest
+
+/-- Launch a single `PTXKernel` under an optional `PTXReadOracle`, returning `(finalGlobalMem, events)`
+    in execution order while preserving every `PTXOutcome` UB/alignment/OOB/data-race trap. -/
+def evalPTXKernelWithOracle (oracle? : Option PTXReadOracle) (fuelPerCTA : Nat) (k : PTXKernel)
+    (gridDim blockDim : Dim3) (globalMem : ByteMemory) (paramMem : ParamMemory)
+    (constMem : ByteMemory := ByteMemory.zeros 0) :
+    PTXOutcome (ByteMemory × List PTXMemEvent) :=
+  PTXOutcome.bind
+    (evalPTXKernelOracleLoop oracle? fuelPerCTA k gridDim blockDim paramMem constMem
+      globalMem [] 0 0 [] gridDim.coords)
+    fun (gFinal, _, eventsRev) => .ok (gFinal, eventsRev.reverse)
+
+/-- Launch configuration for one kernel in a sequential host stream (`evalPTXMultiKernelSeq`). -/
+structure PTXKernelLaunchSpec where
+  fuelPerCTA : Nat
+  kernel     : PTXKernel
+  gridDim    : Dim3
+  blockDim   : Dim3
+  paramMem   : ParamMemory
+  constMem   : ByteMemory := ByteMemory.zeros 0
+  oracle?    : Option PTXReadOracle := none
+
+def evalPTXMultiKernelLoop (gMem : ByteMemory) (nextEventId kernelIdx : Nat)
+    (eventsRev : List PTXMemEvent) :
+    List PTXKernelLaunchSpec → PTXOutcome (ByteMemory × List PTXMemEvent)
+  | [] => .ok (gMem, eventsRev.reverse)
+  | spec :: rest =>
+    PTXOutcome.bind
+      (evalPTXKernelOracleLoop spec.oracle? spec.fuelPerCTA spec.kernel spec.gridDim spec.blockDim
+        spec.paramMem spec.constMem gMem [] nextEventId kernelIdx eventsRev spec.gridDim.coords)
+      fun (gNext, nextEid, eventsRevNext) =>
+        evalPTXMultiKernelLoop gNext nextEid (kernelIdx + 1) eventsRevNext rest
+
+/-- Execute a sequential stream of PTX kernel launches (`k_0, k_1, ...`), threading `globalMem` from
+    each completed grid launch into the next (resetting intra-launch cross-CTA race logs at host
+    stream boundaries while tagging `PTXMemEvent.kernelIdx` for inter-kernel `sw`/`hb` reasoning). -/
+def evalPTXMultiKernelSeq (launches : List PTXKernelLaunchSpec) (initGlobalMem : ByteMemory) :
+    PTXOutcome (ByteMemory × List PTXMemEvent) :=
+  evalPTXMultiKernelLoop initGlobalMem 0 0 [] launches
+
+/-- Initial-memory lookup helper over a `ByteMemory` for `PTXAxiomaticConsistent`. -/
+def initMemOfGlobal (g0 : ByteMemory) (addr : Nat) (sp : StateSpace) (width : Nat) :
+    Option (BitVec 64) :=
+  match sp with
+  | .global => g0.loadBits addr width
+  | .shared => some 0#64
+  | _ => none
+
+/-- Sum of 64-bit little-endian words over a list (modulo `2^64`). -/
+def sumBitVec64 (xs : List (BitVec 64)) : BitVec 64 :=
+  xs.foldl (· + ·) 0#64
+
+/-- Sum of `valWritten - valRead` increments across a list of `atom.add` events. -/
+def sumAtomAddDeltas (evs : List PTXMemEvent) : BitVec 64 :=
+  evs.foldl (fun acc e => acc + (e.valWritten - e.valRead)) 0#64
+
+/-- Predicate stating that `chain` is a strictly `co`-ordered chain of atomic RMW events whose
+    immediate-`co`-predecessor condition holds at each step (`co` adjacent pairs have no
+    intervening `co` store). -/
+def isImmediateCoChain (cand : PTXCandidateExecution) : List PTXMemEvent → Prop
+  | [] => True
+  | [_] => True
+  | e1 :: e2 :: rest =>
+    cand.co e1.eventId e2.eventId ∧
+      (¬ ∃ wMid : Nat, cand.co e1.eventId wMid ∧ cand.co wMid e2.eventId) ∧
+      isImmediateCoChain cand (e2 :: rest)
+
+/-- Build the canonical sequential `PTXCandidateExecution` for a recorded `events` list in execution
+    order (`eventId = 0, 1, ...`), relating same-thread events by `po`, same-CTA cross-barrier events
+    and sequential multi-kernel `.global` events by `sw`, same-location stores in trace order by `co`,
+    and linking each read to the latest preceding same-location write in `events` by `rf`. -/
+def sequentialCandidateOfEvents (events : List PTXMemEvent) : PTXCandidateExecution :=
+  let findEv? (eid : Nat) : Option PTXMemEvent := events.find? (fun e => e.eventId == eid)
+  let sameLocB (e1 e2 : PTXMemEvent) : Bool :=
+    e1.space == e2.space && e1.addr == e2.addr && e1.width == e2.width &&
+      (e1.space == .global || (e1.space == .shared && e1.ctaId == e2.ctaId))
+  let latestPriorWrite? (r : PTXMemEvent) : Option Nat :=
+    (events.filter fun w =>
+      w.isWrite && sameLocB w r && decide (w.eventId < r.eventId)).getLast?.map PTXMemEvent.eventId
+  { events := events
+    po := fun a b =>
+      ∃ ea eb : PTXMemEvent,
+        findEv? a = some ea ∧ findEv? b = some eb ∧
+        ea.kernelIdx = eb.kernelIdx ∧ ea.ctaId = eb.ctaId ∧ ea.tid = eb.tid ∧ a < b
+    sw := fun a b =>
+      ∃ ea eb : PTXMemEvent,
+        findEv? a = some ea ∧ findEv? b = some eb ∧
+        ((ea.kernelIdx = eb.kernelIdx ∧ ea.ctaId = eb.ctaId ∧ ea.tid ≠ eb.tid ∧
+            ∃ bid : Nat, lookupBarrierEpoch ea.barrierEpoch bid < lookupBarrierEpoch eb.barrierEpoch bid) ∨
+         (ea.space = .global ∧ eb.space = .global ∧ ea.isWrite = true ∧ ea.kernelIdx < eb.kernelIdx))
+    co := fun w1 w2 =>
+      ∃ e1 e2 : PTXMemEvent,
+        findEv? w1 = some e1 ∧ findEv? w2 = some e2 ∧
+        e1.isWrite = true ∧ e2.isWrite = true ∧
+        PTXCandidateExecution.sameLoc e1 e2 ∧ w1 < w2
+    rf := fun w r =>
+      ∃ er : PTXMemEvent,
+        findEv? r = some er ∧ er.isRead = true ∧ latestPriorWrite? er = some w }
 
 /-! ## 3. 1:1 Structural Pretty-Printer -/
 

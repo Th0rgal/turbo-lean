@@ -314,6 +314,13 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Backend.PTXAst.ppPTXType_injective
   , ``LeanNative.Backend.PTXAst.ptx_div_zero_traps
   , ``LeanNative.Backend.PTXAst.ptx_sdiv64_min_neg1_traps
+  , ``LeanNative.Backend.PTXAst.stepCTABarrier_allows_ret_exited_threads
+  , ``LeanNative.Backend.PTXAst.stepCTABarrier_divergent_barriers_trap
+  , ``LeanNative.Backend.PTXAst.stepCTABarrier_advances_generation_and_clears_epoch
+  , ``LeanNative.Backend.PTXAst.ptx_relaxed_atom_add_co_no_lost_updates
+  , ``LeanNative.Backend.PTXAst.ptx_relaxed_cross_cta_atom_add_commutes
+  , ``LeanNative.Backend.PTXAst.ptx_seq_kernel_global_write_visible
+  , ``LeanNative.Backend.PTXAst.ptx_cta_barrier_gen_write_visible
   , ``LeanNative.Backend.MetalAst.exec_preserves_constant_buffers
   , ``LeanNative.Backend.MetalAst.constant_write_rejected
   , ``LeanNative.Backend.MetalAst.device_const_write_rejected
@@ -350,6 +357,8 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.PTXMutantProofs.ptx_mutant_m8_killed
   , ``LeanNative.Proofs.PTXDeclProofs.lowerToPTX_sound
   , ``LeanNative.Proofs.PTXDeclProofs.lowerToPTX_decl_nonvacuous
+  , ``LeanNative.Proofs.PTXDeclProofs.ptx_dotProduct_atom_add_matches_lnir_fold
+  , ``LeanNative.Proofs.PTXDeclProofs.ptx_seq_zipMul_then_atom_add_eq_dotProduct
   , ``LeanNative.Proofs.MetalLowerProofs.lowerScalar_inferExprType
   , ``LeanNative.Proofs.MetalLowerProofs.lowerScalar_eval_sound
   , ``LeanNative.Proofs.MetalLowerProofs.lowerToMetal_evalMSLKernel_sound

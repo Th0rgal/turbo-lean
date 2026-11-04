@@ -157,7 +157,7 @@ def ptxDivergentKernel : PTXKernel where
     [ .instr none (.mov .u32 "%r0" (.sreg .tidX))
     , .instr none (.setp .eq .u32 "%p0" (.reg "%r0") (.immU64 0#64))
     , .instr (some { predReg := "%p0" }) (.barSync 0)
-    , .instr none .ret ]
+    , .instr none (.barSync 1) ]
 
 def ptxDivergentResult : PTXRes :=
   evalPTXKernel 32 ptxDivergentKernel { x := 1 } { x := 2 }
@@ -1269,5 +1269,76 @@ theorem msl_sample_module_header_checked :
       ppMSLModuleHeader.toList
       (ppMSLModule mslSampleModule).toList = true :=
   ppMSLModule_header_prefix mslSampleModule
+
+/-! ## 16. Track `D6` — early-`ret` barrier generations, read-oracle atomics, and multi-kernel seq -/
+
+def ptxEarlyRetBarSyncKernel : PTXKernel where
+  name := "ptx_early_ret_bar_sync"
+  params := [ { ty := .u64, name := "out" } ]
+  regDecls := [ { ty := .u32, prefixName := "%r", count := 1 }
+              , { ty := .u64, prefixName := "%rd", count := 1 }
+              , { ty := .pred, prefixName := "%p", count := 1 } ]
+  body :=
+    [ .instr none (.mov .u32 "%r0" (.sreg .tidX))
+    , .instr none (.setp .eq .u32 "%p0" (.reg "%r0") (.immU64 0#64))
+    , .instr (some { predReg := "%p0" }) .ret
+    , .instr none (.barSync 0)
+    , .instr none (.ldParam .u64 "%rd0" "out")
+    , .instr none (.stGlobal .u64 (.regOffset "%rd0" 0) (.immU64 99#64))
+    , .instr none .ret ]
+
+def ptxEarlyRetBarSyncResult : PTXRes :=
+  evalPTXKernel 32 ptxEarlyRetBarSyncKernel { x := 1 } { x := 2 }
+    (LeanNative.Backend.PTXAst.ByteMemory.ofU64Words [ 0#64 ])
+    { params := [ ("out", 0#64) ] }
+
+#guard ptxReadWord? ptxEarlyRetBarSyncResult 0 == some 99#64
+
+theorem ptx_early_ret_bar_sync_checked :
+    ptxReadWord? ptxEarlyRetBarSyncResult 0 = some 99#64 := rfl
+
+def ptxD6MultiKernelWriteKernel : PTXKernel where
+  name := "ptx_d6_multi_write"
+  params := [ { ty := .u64, name := "buf" } ]
+  regDecls := [ { ty := .u64, prefixName := "%rd", count := 1 } ]
+  body :=
+    [ .instr none (.ldParam .u64 "%rd0" "buf")
+    , .instr none (.stGlobal .u64 (.regOffset "%rd0" 0) (.immU64 41#64))
+    , .instr none .ret ]
+
+def ptxD6MultiKernelIncKernel : PTXKernel where
+  name := "ptx_d6_multi_inc"
+  params := [ { ty := .u64, name := "buf" } ]
+  regDecls := [ { ty := .u64, prefixName := "%rd", count := 2 } ]
+  body :=
+    [ .instr none (.ldParam .u64 "%rd0" "buf")
+    , .instr none (.ldGlobal .u64 "%rd1" (.regOffset "%rd0" 0))
+    , .instr none (.add .none .u64 "%rd1" (.reg "%rd1") (.immU64 1#64))
+    , .instr none (.stGlobal .u64 (.regOffset "%rd0" 0) (.reg "%rd1"))
+    , .instr none .ret ]
+
+def ptxD6MultiKernelResult : Option (BitVec 64 × Nat) :=
+  match evalPTXMultiKernelSeq
+      [ { fuelPerCTA := 16
+        , kernel := ptxD6MultiKernelWriteKernel
+        , gridDim := { x := 1 }
+        , blockDim := { x := 1 }
+        , paramMem := { params := [ ("buf", 0#64) ] } }
+      , { fuelPerCTA := 16
+        , kernel := ptxD6MultiKernelIncKernel
+        , gridDim := { x := 1 }
+        , blockDim := { x := 1 }
+        , paramMem := { params := [ ("buf", 0#64) ] } } ]
+      (LeanNative.Backend.PTXAst.ByteMemory.ofU64Words [ 0#64 ]) with
+  | .ok (gFinal, evs) =>
+    match gFinal.readU64Word? 0 with
+    | some w => some (w, evs.length)
+    | none => none
+  | _ => none
+
+#guard ptxD6MultiKernelResult == some (42#64, 3)
+
+theorem ptx_d6_multi_kernel_seq_checked :
+    ptxD6MultiKernelResult = some (42#64, 3) := rfl
 
 end LeanNative.Tests.GpuAstTests
