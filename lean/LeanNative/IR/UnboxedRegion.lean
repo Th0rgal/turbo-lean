@@ -191,39 +191,151 @@ def lowerSimdBuildVec (dst : RegName) (kind : PortableSimdKind) (elems : List Op
 
 def byteOffsetToWord (byteOff : Nat) : Nat := byteOff / 8
 
+def fieldFitsInWord (f : PlacedUnboxedField) : Bool :=
+  decide ((f.offset % 8) + f.size ≤ 8)
+
+def wordSliceValid (s : BorrowedRegionSlice) (elemBytes : Nat) : Bool :=
+  borrowedSliceValid s && decide (s.view.offset % 8 = 0) && decide (elemBytes = 8)
+
 def alignedWordIndex (base byteOff : Nat) : Bool :=
   decide (base % 8 = 0 ∧ byteOff % 8 = 0)
 
+def fieldBitOff (f : PlacedUnboxedField) : UInt64 := ((f.offset % 8) * 8).toUInt64
+
+def fieldMask (f : PlacedUnboxedField) : UInt64 :=
+  if 8 ≤ f.size then 0xffffffffffffffff
+  else ((1 : UInt64) <<< (f.size * 8).toUInt64) - 1
+
+def scalarMaxVar (se : ScalarExpr) : VarId :=
+  match se with
+  | .constU64 _ | .constBool _ => 0
+  | .var id => id
+  | .binOp _ l r => Nat.max (scalarMaxVar l) (scalarMaxVar r)
+  | .unaryOp _ a => scalarMaxVar a
+  | .select c t e => Nat.max (scalarMaxVar c) (Nat.max (scalarMaxVar t) (scalarMaxVar e))
+  | .fma a b c => Nat.max (scalarMaxVar a) (Nat.max (scalarMaxVar b) (scalarMaxVar c))
+
+def listMaxVar (vs : List VarId) : VarId :=
+  vs.foldl Nat.max 0
+
+def exprMaxVar (e : LNIRExpr) : VarId :=
+  match e with
+  | .scalar se => scalarMaxVar se
+  | .constU256 _ => 0
+  | .mulDivDown a b d | .mulDivUp a b d | .storageStore a b d => Nat.max a (Nat.max b d)
+  | .storageLoad a b | .sarrayGet a b _ | .rawLoad a b _ => Nat.max a b
+  | .sarraySet a i v _ => Nat.max a (Nat.max i v)
+  | .mkTuple fs => listMaxVar fs
+  | .allocCtor _ os ss => Nat.max (listMaxVar os) (listMaxVar ss)
+  | .projTuple v _ | .ctorGetObj v _ | .ctorGetScalar v _ _ | .isExclusive v
+  | .sarrayLen v | .sarrayDataPtr v _ | .sarrayEnsureExclusive v _
+  | .boxScalar v _ | .unboxScalar v _ => v
+  | .call _ args _ _ => listMaxVar args
+
+def codeMaxVar (code : LNIRCode) : VarId :=
+  match code with
+  | .letBind dst _ val k => Nat.max dst (Nat.max (exprMaxVar val) (codeMaxVar k))
+  | .rawStore p i v _ k => Nat.max (Nat.max p (Nat.max i v)) (codeMaxVar k)
+  | .incRef v _ k | .decRef v _ k => Nat.max v (codeMaxVar k)
+  | .ite c t e => Nat.max c (Nat.max (codeMaxVar t) (codeMaxVar e))
+  | .seqFor iv lo hi av ai _ step k =>
+    Nat.max (listMaxVar [iv, lo, hi, av, ai]) (Nat.max (codeMaxVar step) (codeMaxVar k))
+  | .parFor ov lv ins _ _ k =>
+    Nat.max (Nat.max ov lv) (Nat.max (listMaxVar ins) (codeMaxVar k))
+  | .ret r => r
+  | .unreachable => 0
+
+def freshAbove (base : Nat) (used : List VarId) : VarId :=
+  (used.foldl Nat.max base) + 1
+
 def lowerBorrowedSliceLoad (dst idxVar posVar : VarId) (s : BorrowedRegionSlice) (k : LNIRCode) :
-    LNIRCode :=
-  .letBind posVar .i64
-      (.scalar (.binOp .add (.constU64 (byteOffsetToWord s.view.offset).toUInt64)
-        (.binOp .shr (.var idxVar) (.constU64 3))))
-    (.letBind dst .i64 (.rawLoad s.ptrVar posVar .i64) k)
+    Option LNIRCode :=
+  if wordSliceValid s 8 then
+    let alignTmp := freshAbove (codeMaxVar k) [dst, idxVar, posVar, s.ptrVar]
+    some (.letBind alignTmp .i64 (.scalar (.binOp .bitAnd (.var idxVar) (.constU64 7)))
+      (.ite alignTmp .unreachable
+        (.letBind posVar .i64
+          (.scalar (.binOp .add (.constU64 (byteOffsetToWord s.view.offset).toUInt64)
+            (.binOp .shr (.var idxVar) (.constU64 3))))
+          (.letBind dst .i64 (.rawLoad s.ptrVar posVar .i64) k))))
+  else none
 
 def lowerUnboxedFieldLoad (dst baseVar idxVar posVar : VarId) (field : PlacedUnboxedField)
-    (k : LNIRCode) : LNIRCode :=
-  .letBind posVar .i64
-      (.scalar (.binOp .add (.binOp .shr (.var idxVar) (.constU64 3))
-        (.constU64 (byteOffsetToWord field.offset).toUInt64)))
-    (.letBind dst field.field.kind.lnirType (.rawLoad baseVar posVar field.field.kind.lnirType) k)
+    (k : LNIRCode) : Option LNIRCode :=
+  if fieldFitsInWord field then
+    let alignTmp := freshAbove (codeMaxVar k) [dst, baseVar, idxVar, posVar]
+    let word := alignTmp + 1
+    let loadSeq :=
+      if field.size == 8 && field.offset % 8 == 0 then
+        .letBind dst field.field.kind.lnirType (.rawLoad baseVar posVar .i64) k
+      else
+        .letBind word .i64 (.rawLoad baseVar posVar .i64)
+          (.letBind dst field.field.kind.lnirType
+            (.scalar (.binOp .bitAnd
+              (.binOp .shr (.var word) (.constU64 (fieldBitOff field)))
+              (.constU64 (fieldMask field)))) k)
+    some (.letBind alignTmp .i64 (.scalar (.binOp .bitAnd (.var idxVar) (.constU64 7)))
+      (.ite alignTmp .unreachable
+        (.letBind posVar .i64
+          (.scalar (.binOp .add (.binOp .shr (.var idxVar) (.constU64 3))
+            (.constU64 (byteOffsetToWord field.offset).toUInt64)))
+          loadSeq)))
+  else none
 
 def lowerUnboxedFieldStore (baseVar idxVar posVar valVar : VarId) (field : PlacedUnboxedField)
-    (k : LNIRCode) : LNIRCode :=
-  .letBind posVar .i64
-      (.scalar (.binOp .add (.binOp .shr (.var idxVar) (.constU64 3))
-        (.constU64 (byteOffsetToWord field.offset).toUInt64)))
-    (.rawStore baseVar posVar valVar field.field.kind.lnirType k)
+    (k : LNIRCode) : Option LNIRCode :=
+  if fieldFitsInWord field then
+    let alignTmp := freshAbove (codeMaxVar k) [baseVar, idxVar, posVar, valVar]
+    let word := alignTmp + 1
+    let masked := alignTmp + 2
+    let shifted := alignTmp + 3
+    let cleared := alignTmp + 4
+    let newWord := alignTmp + 5
+    let storeSeq :=
+      if field.size == 8 && field.offset % 8 == 0 then
+        .rawStore baseVar posVar valVar .i64 k
+      else
+        .letBind word .i64 (.rawLoad baseVar posVar .i64)
+          (.letBind masked .i64
+            (.scalar (.binOp .bitAnd (.var valVar) (.constU64 (fieldMask field))))
+            (.letBind shifted .i64
+              (.scalar (.binOp .shl (.var masked) (.constU64 (fieldBitOff field))))
+              (.letBind cleared .i64
+                (.scalar (.binOp .bitAnd (.var word)
+                  (.unaryOp .not (.binOp .shl (.constU64 (fieldMask field))
+                    (.constU64 (fieldBitOff field))))))
+                (.letBind newWord .i64
+                  (.scalar (.binOp .bitOr (.var cleared) (.var shifted)))
+                  (.rawStore baseVar posVar newWord .i64 k)))))
+    some (.letBind alignTmp .i64 (.scalar (.binOp .bitAnd (.var idxVar) (.constU64 7)))
+      (.ite alignTmp .unreachable
+        (.letBind posVar .i64
+          (.scalar (.binOp .add (.binOp .shr (.var idxVar) (.constU64 3))
+            (.constU64 (byteOffsetToWord field.offset).toUInt64)))
+          storeSeq)))
+  else none
+
+def lowerUnboxedStructStoreAux (baseVar idxVar posVar : VarId) :
+    List PlacedUnboxedField → List VarId → LNIRCode → Option LNIRCode
+  | f :: fs, valVar :: vs, k => do
+    let rest ← lowerUnboxedStructStoreAux baseVar idxVar posVar fs vs k
+    lowerUnboxedFieldStore baseVar idxVar posVar valVar f rest
+  | _, _, k => some k
 
 def lowerUnboxedStructStore (baseVar idxVar posVar : VarId) (layout : UnboxedStructLayout)
-    (valVars : List VarId) (k : LNIRCode) : LNIRCode :=
-  (layout.fields.zip valVars).foldr
-    (fun (f, valVar) acc => lowerUnboxedFieldStore baseVar idxVar posVar valVar f acc) k
+    (valVars : List VarId) (k : LNIRCode) : Option LNIRCode :=
+  lowerUnboxedStructStoreAux baseVar idxVar posVar layout.fields valVars k
+
+def lowerUnboxedStructLoadsAux (baseVar idxVar posVar : VarId) :
+    List PlacedUnboxedField → List VarId → LNIRCode → Option LNIRCode
+  | f :: fs, dst :: ds, k => do
+    let rest ← lowerUnboxedStructLoadsAux baseVar idxVar posVar fs ds k
+    lowerUnboxedFieldLoad dst baseVar idxVar posVar f rest
+  | _, _, k => some k
 
 def lowerUnboxedStructLoads (baseVar idxVar posVar : VarId) (layout : UnboxedStructLayout)
-    (dstVars : List VarId) (k : LNIRCode) : LNIRCode :=
-  (layout.fields.zip dstVars).foldr
-    (fun (f, dst) acc => lowerUnboxedFieldLoad dst baseVar idxVar posVar f acc) k
+    (dstVars : List VarId) (k : LNIRCode) : Option LNIRCode :=
+  lowerUnboxedStructLoadsAux baseVar idxVar posVar layout.fields dstVars k
 
 def codeHasHeapRc (code : LNIRCode) : Bool :=
   match code with
@@ -239,14 +351,18 @@ def codeHasHeapRc (code : LNIRCode) : Bool :=
   | .ret _ | .unreachable => false
 
 def lowerUnboxedRegionCode (dst posVar idxVar : VarId) (layout : UnboxedStructLayout)
-    (slice : BorrowedRegionSlice) (baseVar : VarId) (k : LNIRCode) : LNIRCode :=
+    (slice : BorrowedRegionSlice) (baseVar : VarId) (k : LNIRCode) : Option LNIRCode :=
   match layout.fields with
   | [] => lowerBorrowedSliceLoad dst idxVar posVar slice k
-  | f :: _ => lowerUnboxedFieldLoad dst baseVar idxVar posVar f k
+  | fs =>
+    let dsts := (List.range fs.length).map (fun i => dst + i)
+    lowerUnboxedStructLoads baseVar idxVar posVar layout dsts k
 
 def lowerUnboxedRegionRcFree (dst posVar idxVar : VarId) (layout : UnboxedStructLayout)
     (slice : BorrowedRegionSlice) (baseVar : VarId) : Bool :=
-  !(codeHasHeapRc (lowerUnboxedRegionCode dst posVar idxVar layout slice baseVar (.ret dst)))
+  match lowerUnboxedRegionCode dst posVar idxVar layout slice baseVar (.ret dst) with
+  | some code => !(codeHasHeapRc code)
+  | none => false
 
 def emitLLVMFieldStore (ptrReg : RegName) (base : Operand) (field : PlacedUnboxedField)
     (val : Operand) : List LLVMInstr :=
@@ -281,26 +397,33 @@ def scalarMentions (aliases : List VarId) (se : ScalarExpr) : Bool :=
 def exprMayAlias (aliases : List VarId) (e : LNIRExpr) : Bool :=
   match e with
   | .scalar se => scalarMentions aliases se
-  | .unboxScalar boxVar _ => aliases.contains boxVar
+  | .boxScalar v _ | .unboxScalar v _ | .projTuple v _ | .ctorGetObj v _
+  | .ctorGetScalar v _ _ | .sarrayDataPtr v _ | .sarrayEnsureExclusive v _ =>
+    aliases.contains v
+  | .mkTuple vs => vs.any aliases.contains
+  | .allocCtor _ os ss => os.any aliases.contains || ss.any aliases.contains
+  | .sarraySet a _ v _ | .storageStore a _ v => aliases.contains a || aliases.contains v
   | .call fn args _ isExtern =>
-    !isExtern && fn == "lean_native_unbox_u64" && args.any aliases.contains
+    !isExtern &&
+      (fn == "lean_native_ensure_exclusive" || fn == "lean_native_box_u64" ||
+        fn == "lean_native_unbox_u64" || fn == "lean_native_ctor_set" ||
+        fn == "lean_native_ctor_set_scalar") &&
+      args.any aliases.contains
   | _ => false
 
 def isMarkMtExpr (e : LNIRExpr) : Bool :=
   match e with
-  | .call fn _ _ _ => fn == "lean_mark_mt"
+  | .call fn _ _ isExtern => !isExtern && fn == "lean_mark_mt"
   | _ => false
 
 def exprEscapesWith (aliases : List VarId) (e : LNIRExpr) : Bool :=
   match e with
   | .allocCtor _ os ss => os.any aliases.contains || ss.any aliases.contains
-  | .mkTuple fs => fs.any aliases.contains
-  | .sarraySet _ _ x _ => aliases.contains x
-  | .storageStore _ _ x => aliases.contains x
-  | .boxScalar x _ => aliases.contains x
+  | .sarraySet _ _ x _ | .storageStore _ _ x => aliases.contains x
   | .call fn args _ isExtern =>
-    if fn == "lean_mark_mt" || (!isExtern && (fn == "lean_native_sarray_len" ||
-        fn == "lean_native_unbox_u64" || fn == "lean_native_ctor_tag")) then
+    if !isExtern && (fn == "lean_mark_mt" || fn == "lean_native_sarray_len" ||
+        fn == "lean_native_ctor_tag" || fn == "lean_native_ensure_exclusive" ||
+        fn == "lean_native_box_u64" || fn == "lean_native_unbox_u64") then
       false
     else
       args.any aliases.contains
@@ -309,15 +432,18 @@ def exprEscapesWith (aliases : List VarId) (e : LNIRExpr) : Bool :=
 def exprEscapes (v : VarId) (e : LNIRExpr) : Bool :=
   exprEscapesWith [v] e
 
+def kernelMentions (aliases : List VarId) (kern : ParallelKernelKind) : Bool :=
+  match kern with
+  | .customScalar idxVar inVars body =>
+    scalarMentions (aliases.filter (fun x => x != idxVar && !(inVars.contains x))) body
+  | _ => false
+
 def codeEscapesWith (aliases : List VarId) (code : LNIRCode) : Bool :=
   match code with
   | .letBind dst _ val k =>
-    if isMarkMtExpr val then
-      codeEscapesWith aliases k
-    else
-      let rest := aliases.filter (· != dst)
-      let nextAliases := if exprMayAlias aliases val then dst :: rest else rest
-      exprEscapesWith aliases val || codeEscapesWith nextAliases k
+    let rest := aliases.filter (· != dst)
+    let nextAliases := if exprMayAlias aliases val then dst :: rest else rest
+    exprEscapesWith aliases val || codeEscapesWith nextAliases k
   | .rawStore _ _ x _ k => aliases.contains x || codeEscapesWith aliases k
   | .incRef _ _ k | .decRef _ _ k => codeEscapesWith aliases k
   | .ite _ t e => codeEscapesWith aliases t || codeEscapesWith aliases e
@@ -325,8 +451,9 @@ def codeEscapesWith (aliases : List VarId) (code : LNIRCode) : Bool :=
     let stepAliases := aliases.filter (fun x => x != iv && x != av)
     let kAliases := aliases.filter (· != av)
     aliases.contains init || codeEscapesWith stepAliases step || codeEscapesWith kAliases k
-  | .parFor ov _ ins _ _ k =>
-    ins.any aliases.contains || codeEscapesWith (aliases.filter (· != ov)) k
+  | .parFor ov lv ins _ kern k =>
+    aliases.contains lv || ins.any aliases.contains || kernelMentions aliases kern ||
+      codeEscapesWith (aliases.filter (· != ov)) k
   | .ret r => aliases.contains r
   | .unreachable => false
 

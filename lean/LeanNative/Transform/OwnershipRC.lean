@@ -227,25 +227,99 @@ def verifiedOwnershipRCContract : VerifiedCodePassContract where
 def ownershipRCPass : TransformPass :=
   TransformPass.ofVerifiedContract verifiedOwnershipRCContract
 
-/-- Drop `incRef`/`decRef` on `v` and replace `lean_mark_mt` calls by a scalar zero.
-    Sound only for environments where `v` is non-owning; the verified contract below keeps
-    the unconditionally refining fragment (zero-delta RC plus `lean_mark_mt` deletion). -/
+/-- Drop `incRef`/`decRef` on `v` and replace non-escaping `lean_mark_mt` calls by scalar zero.
+    Sound on non-owning `v` (`elideBorrowedAndThreadLocalRC_sound`) and unconditionally `CodeRefines`
+    on escape-gated `lean_mark_mt` + zero-delta RC (`optimizeThreadLocalOwnershipRC_sound`). -/
 def valIsNonOwning (val : Val) : Bool :=
   match val with
   | .sarrayId _ | .objPtr _ => false
   | _ => true
 
-def isMarkMtCall (e : LNIRExpr) : Bool :=
+def tlScalarMentions (aliases : List VarId) (se : ScalarExpr) : Bool :=
+  match se with
+  | .constU64 _ | .constBool _ => false
+  | .var id => aliases.contains id
+  | .binOp _ l r => tlScalarMentions aliases l || tlScalarMentions aliases r
+  | .unaryOp _ a => tlScalarMentions aliases a
+  | .select c t e =>
+    tlScalarMentions aliases c || tlScalarMentions aliases t || tlScalarMentions aliases e
+  | .fma a b c =>
+    tlScalarMentions aliases a || tlScalarMentions aliases b || tlScalarMentions aliases c
+
+def tlExprMayAlias (aliases : List VarId) (e : LNIRExpr) : Bool :=
   match e with
-  | .call fn _ _ _ => fn == "lean_mark_mt"
+  | .scalar se => tlScalarMentions aliases se
+  | .boxScalar v _ | .unboxScalar v _ | .projTuple v _ | .ctorGetObj v _
+  | .ctorGetScalar v _ _ | .sarrayDataPtr v _ | .sarrayEnsureExclusive v _ =>
+    aliases.contains v
+  | .mkTuple vs => vs.any aliases.contains
+  | .allocCtor _ os ss => os.any aliases.contains || ss.any aliases.contains
+  | .sarraySet a _ v _ | .storageStore a _ v => aliases.contains a || aliases.contains v
+  | .call fn args _ isExtern =>
+    !isExtern &&
+      (fn == "lean_native_ensure_exclusive" || fn == "lean_native_box_u64" ||
+        fn == "lean_native_unbox_u64" || fn == "lean_native_ctor_set" ||
+        fn == "lean_native_ctor_set_scalar") &&
+      args.any aliases.contains
   | _ => false
 
-/-- Unconditionally `CodeRefines` fragment: delete `lean_mark_mt` lets and zero-delta RC. -/
+def tlExprEscapesWith (aliases : List VarId) (e : LNIRExpr) : Bool :=
+  match e with
+  | .allocCtor _ os ss => os.any aliases.contains || ss.any aliases.contains
+  | .sarraySet _ _ x _ | .storageStore _ _ x => aliases.contains x
+  | .call fn args _ isExtern =>
+    if !isExtern && (fn == "lean_mark_mt" || fn == "lean_native_sarray_len" ||
+        fn == "lean_native_ctor_tag" || fn == "lean_native_ensure_exclusive" ||
+        fn == "lean_native_box_u64" || fn == "lean_native_unbox_u64") then
+      false
+    else
+      args.any aliases.contains
+  | _ => false
+
+def tlKernelMentions (aliases : List VarId) (kern : ParallelKernelKind) : Bool :=
+  match kern with
+  | .customScalar idxVar inVars body =>
+    tlScalarMentions (aliases.filter (fun x => x != idxVar && !(inVars.contains x))) body
+  | _ => false
+
+def tlCodeEscapesWith (aliases : List VarId) (code : LNIRCode) : Bool :=
+  match code with
+  | .letBind dst _ val k =>
+    let rest := aliases.filter (· != dst)
+    let nextAliases := if tlExprMayAlias aliases val then dst :: rest else rest
+    tlExprEscapesWith aliases val || tlCodeEscapesWith nextAliases k
+  | .rawStore _ _ x _ k => aliases.contains x || tlCodeEscapesWith aliases k
+  | .incRef _ _ k | .decRef _ _ k => tlCodeEscapesWith aliases k
+  | .ite _ t e => tlCodeEscapesWith aliases t || tlCodeEscapesWith aliases e
+  | .seqFor iv _ _ av init _ step k =>
+    let stepAliases := aliases.filter (fun x => x != iv && x != av)
+    let kAliases := aliases.filter (· != av)
+    aliases.contains init || tlCodeEscapesWith stepAliases step || tlCodeEscapesWith kAliases k
+  | .parFor ov lv ins _ kern k =>
+    aliases.contains lv || ins.any aliases.contains || tlKernelMentions aliases kern ||
+      tlCodeEscapesWith (aliases.filter (· != ov)) k
+  | .ret r => aliases.contains r
+  | .unreachable => false
+
+def tlCheckNonEscaping (v : VarId) (code : LNIRCode) : Bool :=
+  !(tlCodeEscapesWith [v] code)
+
+def isMarkMtCall (e : LNIRExpr) : Bool :=
+  match e with
+  | .call fn _ _ isExtern => !isExtern && fn == "lean_mark_mt"
+  | _ => false
+
+def canElideMarkMt (e : LNIRExpr) (k : LNIRCode) : Bool :=
+  match e with
+  | .call fn [arg] _ false => fn == "lean_mark_mt" && tlCheckNonEscaping arg k
+  | _ => false
+
+/-- Escape-gated `lean_mark_mt` elision (replacing with scalar `0`) plus zero-delta RC elision. -/
 def elideMarkMtAndZeroRc (code : LNIRCode) : LNIRCode :=
   match code with
   | .letBind dst ty val k =>
-    if isMarkMtCall val then elideMarkMtAndZeroRc k
-    else .letBind dst ty val (elideMarkMtAndZeroRc k)
+    let rhs := if canElideMarkMt val k then .scalar (.constU64 0) else val
+    .letBind dst ty rhs (elideMarkMtAndZeroRc k)
   | .rawStore pv iv vv ty k => .rawStore pv iv vv ty (elideMarkMtAndZeroRc k)
   | .incRef ov c k =>
     if c == 0 then elideMarkMtAndZeroRc k else .incRef ov c (elideMarkMtAndZeroRc k)
@@ -258,12 +332,13 @@ def elideMarkMtAndZeroRc (code : LNIRCode) : LNIRCode :=
   | .ret r => .ret r
   | .unreachable => .unreachable
 
-/-- Scope-aware borrowed/non-owning RC elision on `v` plus `lean_mark_mt` deletion. -/
+/-- Scope-aware borrowed/non-owning RC elision on `v` plus escape-gated `lean_mark_mt` elision. -/
 def elideBorrowedAndThreadLocalRC (v : VarId) (code : LNIRCode) : LNIRCode :=
   match code with
   | .letBind dst ty val k =>
+    let rhs := if canElideMarkMt val k then .scalar (.constU64 0) else val
     let tail := if dst == v then elideMarkMtAndZeroRc k else elideBorrowedAndThreadLocalRC v k
-    if isMarkMtCall val then tail else .letBind dst ty val tail
+    .letBind dst ty rhs tail
   | .rawStore pv iv vv ty k =>
     .rawStore pv iv vv ty (elideBorrowedAndThreadLocalRC v k)
   | .incRef ov c k =>
@@ -286,43 +361,79 @@ def elideBorrowedAndThreadLocalRC (v : VarId) (code : LNIRCode) : LNIRCode :=
   | .ret r => .ret r
   | .unreachable => .unreachable
 
-theorem markMt_eval_not_ok (env : VarEnv) (st : HeapState) (e : LNIRExpr)
-    (hmt : isMarkMtCall e = true) (pair : Val × HeapState) :
-    evalExpr env st e ≠ .ok pair := by
+theorem evalMarkMt_ok_eq (env : VarEnv) (st : HeapState) (e : LNIRExpr) (k : LNIRCode)
+    (hcan : canElideMarkMt e k = true) (bound : Val) (st1 : HeapState)
+    (he : evalExpr env st e = .ok (bound, st1)) :
+    bound = .u64 0 ∧ st1 = st := by
   cases e with
   | call fn args retTy ext =>
-    have hfn : fn = "lean_mark_mt" := of_decide_eq_true hmt
-    subst hfn
-    intro hok
-    cases hargs : evalVarList env args with
-    | error _ => simp [evalExpr, hargs] at hok
-    | ok vals =>
-      have hbox : ("lean_mark_mt" == "lean_native_box_u64") = false := by decide
-      have hunbox : ("lean_mark_mt" == "lean_native_unbox_u64") = false := by decide
-      have hexcl : ("lean_mark_mt" == "lean_native_ensure_exclusive") = false := by decide
-      have hlen : ("lean_mark_mt" == "lean_native_sarray_len") = false := by decide
-      have hset : ("lean_mark_mt" == "lean_native_ctor_set") = false := by decide
-      have hsets : ("lean_mark_mt" == "lean_native_ctor_set_scalar") = false := by decide
-      have htag : ("lean_mark_mt" == "lean_native_ctor_set_tag") = false := by decide
-      have hdel : ("lean_mark_mt" == "lean_native_del_obj") = false := by decide
-      have hctag : ("lean_mark_mt" == "lean_native_ctor_tag") = false := by decide
-      cases ext <;>
-        simp [evalExpr, hargs, hbox, hunbox, hexcl, hlen, hset, hsets, htag, hdel, hctag] at hok
-  | _ => cases hmt
+    cases ext
+    · cases args with
+      | nil => simp [canElideMarkMt] at hcan
+      | cons arg rest =>
+        cases rest with
+        | cons _ _ => simp [canElideMarkMt] at hcan
+        | nil =>
+          dsimp only [canElideMarkMt] at hcan
+          have hfn : fn = "lean_mark_mt" := of_decide_eq_true ((Bool.and_eq_true _ _).mp hcan).1
+          subst hfn
+          have hbox : ("lean_mark_mt" == "lean_native_box_u64") = false := by decide
+          have hunbox : ("lean_mark_mt" == "lean_native_unbox_u64") = false := by decide
+          have hexcl : ("lean_mark_mt" == "lean_native_ensure_exclusive") = false := by decide
+          have hlen : ("lean_mark_mt" == "lean_native_sarray_len") = false := by decide
+          cases harg : env arg with
+          | none => simp [evalExpr, evalVarList, harg] at he
+          | some vArg =>
+            simp only [evalExpr, evalVarList, harg, hbox, hunbox, hexcl, hlen,
+              Bool.false_or, Bool.false_eq_true, ↓reduceIte, beq_self_eq_true] at he
+            cases vArg with
+            | sarrayId bufId =>
+              dsimp only at he
+              cases hbuf : st.findBuffer bufId with
+              | none => rw [hbuf] at he; contradiction
+              | some _ =>
+                rw [hbuf] at he
+                injection he with hp
+                exact ⟨(Prod.mk.inj hp).1.symm, (Prod.mk.inj hp).2.symm⟩
+            | objPtr objId =>
+              by_cases hrc : (st.getObjRefCount objId == 0) = true
+              · simp [hrc] at he
+              · simp only [hrc, Bool.false_eq_true, ↓reduceIte] at he
+                injection he with hp
+                exact ⟨(Prod.mk.inj hp).1.symm, (Prod.mk.inj hp).2.symm⟩
+            | u64 _ | u256 _ | bool _ | unit | tuple _ | rawPtrId _ | storageMapId _ =>
+              injection he with hp
+              exact ⟨(Prod.mk.inj hp).1.symm, (Prod.mk.inj hp).2.symm⟩
+    · simp [canElideMarkMt] at hcan
+  | _ => simp [canElideMarkMt] at hcan
+
+theorem evalMarkMt_obj_uaf (st : HeapState) (env : VarEnv) (arg : VarId) (objId : Nat)
+    (retTy : LNIRType) (hv : env arg = some (.objPtr objId)) (hdead : st.getObjRefCount objId = 0) :
+    evalExpr env st (.call "lean_mark_mt" [arg] retTy false) = .error (.useAfterFree objId) := by
+  have hbox : ("lean_mark_mt" == "lean_native_box_u64") = false := by decide
+  have hunbox : ("lean_mark_mt" == "lean_native_unbox_u64") = false := by decide
+  have hexcl : ("lean_mark_mt" == "lean_native_ensure_exclusive") = false := by decide
+  have hlen : ("lean_mark_mt" == "lean_native_sarray_len") = false := by decide
+  simp [evalExpr, evalVarList, hv, hbox, hunbox, hexcl, hlen, hdead]
 
 theorem elideMarkMtAndZeroRc_sound (code : LNIRCode) :
     CodeRefines code (elideMarkMtAndZeroRc code) := by
   induction code with
   | letBind dst ty val k ih =>
     dsimp only [elideMarkMtAndZeroRc]
-    by_cases hmt : isMarkMtCall val = true
-    · rw [ite_eq_left hmt]
+    by_cases hcan : canElideMarkMt val k = true
+    · rw [ite_eq_left hcan]
       intro fuel env st v st' hsrc
-      dsimp only [evalCode] at hsrc
+      dsimp only [evalCode] at hsrc ⊢
       cases he : evalExpr env st val with
       | error _ => rw [he] at hsrc; contradiction
-      | ok pair => exact False.elim (markMt_eval_not_ok env st val hmt pair he)
-    · rw [ite_eq_right hmt]
+      | ok pair =>
+        rcases pair with ⟨bound, st1⟩
+        rw [he] at hsrc
+        have ⟨hb, hst⟩ := evalMarkMt_ok_eq env st val k hcan bound st1 he
+        subst hb; subst hst
+        exact ih fuel (env.bind dst (.u64 0)) st1 v st' hsrc
+    · rw [ite_eq_right hcan]
       exact CodeRefines.letBind_congr (ExprRefines.refl val) ih
   | rawStore pv iv vv ty k ih => exact CodeRefines.rawStore_congr ih
   | incRef ov c k ih =>
@@ -468,24 +579,26 @@ theorem elideBorrowedAndThreadLocalRC_sound (v : VarId) (code : LNIRCode)
     evalCode fuel env st (elideBorrowedAndThreadLocalRC v code) = .ok (outV, st') := by
   induction code generalizing env st outV st' with
   | letBind dst ty expr k ih =>
-    dsimp only [elideBorrowedAndThreadLocalRC]
-    by_cases hmt : isMarkMtCall expr = true
-    · dsimp only [evalCode] at hsrc
-      cases he : evalExpr env st expr with
-      | error _ => rw [he] at hsrc; contradiction
-      | ok pair => exact False.elim (markMt_eval_not_ok env st expr hmt pair he)
-    · rw [ite_eq_right hmt]
-      dsimp only [evalCode] at hsrc ⊢
-      cases he : evalExpr env st expr with
-      | error _ => rw [he] at hsrc; contradiction
-      | ok pair =>
-        rcases pair with ⟨bound, st1⟩
-        rw [he] at hsrc
-        by_cases hsh : (dst == v) = true
-        · rw [ite_eq_left hsh]
-          exact elideMarkMtAndZeroRc_sound k fuel (env.bind dst bound) st1 outV st' hsrc
-        · rw [ite_eq_right hsh]
-          exact ih (env.bind dst bound) st1 outV st' (bind_other_eq hsh hv) hsrc
+    dsimp only [elideBorrowedAndThreadLocalRC, evalCode] at hsrc ⊢
+    cases he : evalExpr env st expr with
+    | error _ => rw [he] at hsrc; contradiction
+    | ok pair =>
+      rcases pair with ⟨bound, st1⟩
+      rw [he] at hsrc
+      have hrhs : evalExpr env st
+          (if canElideMarkMt expr k then .scalar (.constU64 0) else expr) =
+          .ok (bound, st1) := by
+        by_cases hcan : canElideMarkMt expr k = true
+        · rw [ite_eq_left hcan]
+          have ⟨hb, hst⟩ := evalMarkMt_ok_eq env st expr k hcan bound st1 he
+          subst hb; subst hst; rfl
+        · rw [ite_eq_right hcan]; exact he
+      rw [hrhs]
+      by_cases hsh : (dst == v) = true
+      · rw [ite_eq_left hsh]
+        exact elideMarkMtAndZeroRc_sound k fuel (env.bind dst bound) st1 outV st' hsrc
+      · rw [ite_eq_right hsh]
+        exact ih (env.bind dst bound) st1 outV st' (bind_other_eq hsh hv) hsrc
   | rawStore pv iv vv ty k ih =>
     dsimp only [elideBorrowedAndThreadLocalRC, evalCode] at hsrc ⊢
     cases hp : env pv with
@@ -658,18 +771,19 @@ theorem elideBorrowedAndThreadLocalRC_sound (v : VarId) (code : LNIRCode)
   | unreachable => exact hsrc
 
 def optimizeThreadLocalOwnershipRC (code : LNIRCode) : LNIRCode :=
-  elideMarkMtAndZeroRc code
+  optimizeOwnershipRC (elideMarkMtAndZeroRc code)
 
 theorem optimizeThreadLocalOwnershipRC_sound (code : LNIRCode) :
     CodeRefines code (optimizeThreadLocalOwnershipRC code) :=
-  elideMarkMtAndZeroRc_sound code
+  CodeRefines.trans (elideMarkMtAndZeroRc_sound code)
+    (elideAndMutateRC_sound (elideMarkMtAndZeroRc code))
 
 def verifiedThreadLocalRCContract : VerifiedCodePassContract where
   name       := "ThreadLocalRC"
-  theoremRef := "LeanNative.Proofs.elideMarkMtAndZeroRc_sound"
-  notes      := "Delete unsupported lean_mark_mt and zero-delta incRef/decRef"
-  runCode    := elideMarkMtAndZeroRc
-  sound      := elideMarkMtAndZeroRc_sound
+  theoremRef := "LeanNative.Proofs.optimizeThreadLocalOwnershipRC_sound"
+  notes      := "Escape-gated lean_mark_mt elision and zero-delta incRef/decRef pass"
+  runCode    := optimizeThreadLocalOwnershipRC
+  sound      := optimizeThreadLocalOwnershipRC_sound
 
 end LeanNative.Transform
 
@@ -688,4 +802,5 @@ namespace LeanNative.Proofs
     @LeanNative.Transform.optimizeThreadLocalOwnershipRC_sound
   abbrev evalIncRef_obj_uaf := @LeanNative.Transform.evalIncRef_obj_uaf
   abbrev evalDecRef_obj_uaf := @LeanNative.Transform.evalDecRef_obj_uaf
+  abbrev evalMarkMt_obj_uaf := @LeanNative.Transform.evalMarkMt_obj_uaf
 end LeanNative.Proofs
