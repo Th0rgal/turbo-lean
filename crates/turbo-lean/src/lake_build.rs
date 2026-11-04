@@ -9562,11 +9562,11 @@ public theorem downstream_c (n : Nat) : n + 0 = n := downstream_b n
         let a_proof_only_edit = "\
 module
 private def privHelper (n : Nat) : Nat := n + 1
-private theorem priv_extra_lemma : 1 + 1 = 2 := rfl
 @[noinline] public def pubApi (n : Nat) : Nat := privHelper n
 public theorem pub_thm (n : Nat) : n + 0 = n := by
   have _unused : 1 + 1 = 2 := rfl
   exact Nat.add_zero n
+private theorem priv_extra_lemma : 1 + 1 = 2 := rfl
 ";
         fs::write(proj.join("Smoke/A.lean"), a_proof_only_edit)?;
         let rep_priv = compute_impact_report(
@@ -9975,6 +9975,113 @@ public def localNotVal : MYTYPE := true
             vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
         );
         assert!(rep_nonexp_imp.pruned_dependents.is_empty());
+
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\nprivate def helper := (0 : Nat)\npublic def api := helper\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/B.lean"),
+            "module\npublic import Smoke.A\npublic def useApi := api\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/C.lean"),
+            "module\nimport Smoke.B\npublic def useApiC := useApi\n",
+        )?;
+        run_git(&["add", "."])?;
+        run_git(&[
+            "commit",
+            "-m",
+            "private helper inferred public def baseline",
+        ])?;
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\nprivate def helper := true\npublic def api := helper\n",
+        )?;
+        let rep_priv_helper = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_priv_helper.edit_class, "public_signature_edit");
+        assert!(
+            rep_priv_helper.public_signature_changed,
+            "private helper edit before `public def api := helper` must mark `public_signature_changed = true`"
+        );
+        assert_eq!(
+            rep_priv_helper.transitive_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+        assert!(rep_priv_helper.pruned_dependents.is_empty());
+
+        for (commit_msg, base_a, edited_a) in [
+            (
+                "private abbrev in public theorem baseline",
+                "module\nprivate abbrev MyProp := (1 = 1)\npublic theorem apiThm : MyProp := rfl\n",
+                "module\nprivate abbrev MyProp := (2 = 2)\npublic theorem apiThm : MyProp := rfl\n",
+            ),
+            (
+                "private def in public theorem baseline",
+                "module\nprivate def targetVal : Nat := 1\npublic theorem apiThm : targetVal = targetVal := rfl\n",
+                "module\nprivate def targetVal : Nat := 2\npublic theorem apiThm : targetVal = targetVal := rfl\n",
+            ),
+        ] {
+            fs::write(proj.join("Smoke/A.lean"), base_a)?;
+            fs::write(
+                proj.join("Smoke/B.lean"),
+                "module\npublic import Smoke.A\npublic theorem useThm : True := trivial\n",
+            )?;
+            fs::write(
+                proj.join("Smoke/C.lean"),
+                "module\nimport Smoke.B\npublic theorem useThmC : True := useThm\n",
+            )?;
+            run_git(&["add", "."])?;
+            run_git(&["commit", "-m", commit_msg])?;
+            fs::write(proj.join("Smoke/A.lean"), edited_a)?;
+            let rep_thm_priv = compute_impact_report(
+                proj.join("Smoke/A.lean"),
+                Some(proj.clone()),
+                Some("HEAD".to_string()),
+            )?;
+            assert_eq!(rep_thm_priv.edit_class, "public_signature_edit");
+            assert!(rep_thm_priv.public_signature_changed);
+            assert_eq!(
+                rep_thm_priv.transitive_dependents,
+                vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+            );
+            assert!(rep_thm_priv.pruned_dependents.is_empty());
+        }
+
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\npublic def api : Nat := 1\nprivate def trailingHelper := (0 : Nat)\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/B.lean"),
+            "module\npublic import Smoke.A\npublic def useApi := api\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/C.lean"),
+            "module\nimport Smoke.B\npublic def useApiC := useApi\n",
+        )?;
+        run_git(&["add", "."])?;
+        run_git(&["commit", "-m", "trailing private helper baseline"])?;
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\npublic def api : Nat := 1\nprivate def trailingHelper := true\n",
+        )?;
+        let rep_trailing_priv = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_trailing_priv.edit_class, "private_module_edit");
+        assert!(!rep_trailing_priv.public_signature_changed);
+        assert!(rep_trailing_priv.transitive_dependents.is_empty());
+        assert_eq!(
+            rep_trailing_priv.pruned_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
 
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())

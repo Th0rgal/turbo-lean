@@ -6831,7 +6831,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                     };
 
                 let mut sig_h = blake3::Hasher::new();
-                sig_h.update(b"decl-sig:v4\n");
+                sig_h.update(b"decl-sig:v5\n");
                 for v in active_vars {
                     sig_h.update(b"ctx:");
                     sig_h.update(v.as_bytes());
@@ -6947,20 +6947,8 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             }
         };
 
-    for span in &body_spans {
-        let trimmed = span.clean_text.trim();
-        let after_p = strip_decl_prefixes(trimmed);
-        let (span_mods, span_attrs) = parse_decl_modifiers_and_attrs(trimmed);
-        let has_local_mod = span_mods.iter().any(|m| m == "local");
-        let has_local_attr = span_attrs
-            .iter()
-            .any(|a| a == "local" || a.starts_with("local "));
-        let records_local_elab_ctx = has_local_mod
-            || has_local_attr
-            || has_any_local_attribute_cmd(after_p)
-            || is_non_exported_import_cmd(trimmed)
-            || is_non_exported_import_cmd(after_p);
-        if after_p.starts_with("variable ")
+    let is_scope_ctx_cmd = |after_p: &str| -> bool {
+        after_p.starts_with("variable ")
             || after_p.starts_with("variables ")
             || after_p.starts_with("universe ")
             || after_p.starts_with("universes ")
@@ -6969,7 +6957,109 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             || after_p.starts_with("include ")
             || after_p.starts_with("omit ")
             || after_p == "omit"
+    };
+
+    let non_public_decl_ctx_entry = |sub_clean: &str, stack: &[PubScopeFrame]| -> Option<String> {
+        let trimmed = sub_clean.trim();
+        if trimmed.is_empty()
+            || trimmed == "module"
+            || trimmed.starts_with("module ")
+            || trimmed == "prelude"
+            || trimmed.starts_with("import ")
+            || trimmed.starts_with("public import ")
+            || trimmed.starts_with("meta import ")
+            || trimmed.starts_with("public meta import ")
         {
+            return None;
+        }
+        let in_pub_sec = stack.iter().any(|f| f.is_public_section);
+        let in_meta_sec = stack.iter().any(|f| f.is_meta_section);
+        let (mods, _) = parse_decl_modifiers_and_attrs(trimmed);
+        let is_priv_mod = mods.iter().any(|m| m == "private");
+        let is_pub_mod = mods.iter().any(|m| m == "public");
+        let is_meta_mod = mods.iter().any(|m| m == "meta") || in_meta_sec;
+        let is_local_mod = mods.iter().any(|m| m == "local");
+        let is_public_visible = if is_module {
+            !is_priv_mod && !is_local_mod && (is_pub_mod || in_pub_sec)
+        } else {
+            true
+        };
+        if is_public_visible {
+            return None;
+        }
+        let (kw, raw_name) = classify_any_decl_header(trimmed)?;
+        let const_name = if raw_name.is_empty() {
+            format!(
+                "<anon:{}:{}>",
+                kw,
+                &hash_normalized_whitespace_hex(trimmed)[..12]
+            )
+        } else {
+            pub_qualified_name(&raw_name, stack)
+        };
+        let phase = if is_meta_mod { "meta" } else { "reg" };
+        Some(format!(
+            "priv-decl:{phase}:{const_name}:{}",
+            normalize_whitespace(trimmed)
+        ))
+    };
+
+    let post_cmd_elab_ctx_entry = |sub_clean: &str, stack: &[PubScopeFrame]| -> Option<String> {
+        let trimmed = sub_clean.trim();
+        if trimmed.is_empty()
+            || trimmed == "module"
+            || trimmed.starts_with("module ")
+            || trimmed == "prelude"
+            || trimmed.starts_with("public import ")
+            || trimmed.starts_with("public meta import ")
+        {
+            return None;
+        }
+        let after_p = strip_decl_prefixes(trimmed);
+        if is_non_exported_import_cmd(trimmed) || is_non_exported_import_cmd(after_p) {
+            return Some(normalize_whitespace(trimmed));
+        }
+        if is_scope_ctx_cmd(after_p)
+            || trimmed.starts_with("namespace ")
+            || is_section_header_line(trimmed)
+            || trimmed == "end"
+            || trimmed.starts_with("end ")
+        {
+            return None;
+        }
+        let in_pub_sec = stack.iter().any(|f| f.is_public_section);
+        let (mods, attrs) = parse_decl_modifiers_and_attrs(trimmed);
+        let is_priv_mod = mods.iter().any(|m| m == "private");
+        let is_pub_mod = mods.iter().any(|m| m == "public");
+        let is_local_mod = mods.iter().any(|m| m == "local");
+        let has_local_attr = attrs
+            .iter()
+            .any(|a| a == "local" || a.starts_with("local "));
+        if classify_any_decl_header(trimmed).is_some() {
+            if has_local_attr || is_local_mod {
+                return Some(normalize_whitespace(trimmed));
+            }
+            return None;
+        }
+        let non_exported_in_module = is_module
+            && (is_priv_mod
+                || is_local_mod
+                || is_all_local_attribute_cmd(after_p)
+                || (!is_pub_mod && !in_pub_sec));
+        if non_exported_in_module
+            || is_local_mod
+            || has_local_attr
+            || has_any_local_attribute_cmd(after_p)
+        {
+            return Some(normalize_whitespace(trimmed));
+        }
+        None
+    };
+
+    for span in &body_spans {
+        let trimmed = span.clean_text.trim();
+        let after_p = strip_decl_prefixes(trimmed);
+        if is_scope_ctx_cmd(after_p) {
             active_context_vars.push(normalize_whitespace(trimmed));
         }
 
@@ -6982,6 +7072,16 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                 section_has_expose: stack.iter().any(|f| f.section_has_expose),
             });
             for sub in &inner_spans {
+                if let Some(entry) = non_public_decl_ctx_entry(sub.clean_text, &stack) {
+                    active_context_vars.push(entry);
+                }
+            }
+            for sub in &inner_spans {
+                let sub_trimmed = sub.clean_text.trim();
+                let sub_after_p = strip_decl_prefixes(sub_trimmed);
+                if is_scope_ctx_cmd(sub_after_p) {
+                    active_context_vars.push(normalize_whitespace(sub_trimmed));
+                }
                 process_decl_cmd(
                     sub.clean_text,
                     &stack,
@@ -6991,18 +7091,10 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                     &mut directives_hasher,
                     &mut meta_directives_hasher,
                 );
-                let sub_trimmed = sub.clean_text.trim();
-                let sub_after_p = strip_decl_prefixes(sub_trimmed);
-                let (sub_mods, sub_attrs) = parse_decl_modifiers_and_attrs(sub_trimmed);
-                if sub_mods.iter().any(|m| m == "local")
-                    || sub_attrs
-                        .iter()
-                        .any(|a| a == "local" || a.starts_with("local "))
-                    || has_any_local_attribute_cmd(sub_after_p)
-                    || is_non_exported_import_cmd(sub_trimmed)
-                    || is_non_exported_import_cmd(sub_after_p)
-                {
-                    active_context_vars.push(normalize_whitespace(sub_trimmed));
+                if non_public_decl_ctx_entry(sub.clean_text, &stack).is_none() {
+                    if let Some(entry) = post_cmd_elab_ctx_entry(sub.clean_text, &stack) {
+                        active_context_vars.push(entry);
+                    }
                 }
             }
             stack.pop();
@@ -7016,8 +7108,10 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                 &mut directives_hasher,
                 &mut meta_directives_hasher,
             );
-            if records_local_elab_ctx {
-                active_context_vars.push(normalize_whitespace(trimmed));
+            if let Some(entry) = non_public_decl_ctx_entry(span.clean_text, &stack) {
+                active_context_vars.push(entry);
+            } else if let Some(entry) = post_cmd_elab_ctx_entry(span.clean_text, &stack) {
+                active_context_vars.push(entry);
             }
             update_pub_scope_stack(&mut stack, span.orig_text);
         }
@@ -8774,22 +8868,24 @@ private def secretHelper (n : Nat) : Nat := n + 1
 public def pubFn (n : Nat) : Nat := secretHelper n
 public theorem pub_thm (n : Nat) : n + 0 = n := by
   exact Nat.add_zero n
+private def trailingHelper (n : Nat) : Nat := n + 2
 ";
         let mod_v2_priv_edit = "\
 module
 public import Init
-private def secretHelper (n : Nat) : Nat := (n + 1) + 0
-private theorem extra_priv_lemma : 1 + 1 = 2 := rfl
+private def secretHelper (n : Nat) : Nat := n + 1
 public def pubFn (n : Nat) : Nat := secretHelper (n + 0)
 public theorem pub_thm (n : Nat) : n + 0 = n := by
   omega
+private def trailingHelper (n : Nat) : Nat := (n + 2) + 0
+private theorem extra_priv_lemma : 1 + 1 = 2 := rfl
 ";
         let sig1 = extract_public_signature(mod_v1);
         let sig2 = extract_public_signature(mod_v2_priv_edit);
         assert!(sig1.is_module && sig2.is_module);
         assert_eq!(
             sig1.public_signature_digest, sig2.public_signature_digest,
-            "private helpers, private theorems, and unexposed public def/theorem bodies must not alter public_signature_digest"
+            "trailing private helpers, trailing private theorems, and unexposed public def/theorem bodies must not alter public_signature_digest"
         );
         assert_eq!(sig1.meta_signature_digest, sig2.meta_signature_digest);
 
@@ -9079,6 +9175,109 @@ public theorem uses_ctx : True := trivial
         assert_ne!(
             mex1.meta_signature_digest, mex2.meta_signature_digest,
             "exported public meta import change must alter meta_signature_digest"
+        );
+
+        let priv_helper_v1 = "module\nprivate def helper := (0 : Nat)\npublic def api := helper\n";
+        let priv_helper_v2 = "module\nprivate def helper := true\npublic def api := helper\n";
+        let ph1 = extract_public_signature(priv_helper_v1);
+        let ph2 = extract_public_signature(priv_helper_v2);
+        assert_eq!(ph1.declarations.len(), 1);
+        assert_eq!(ph2.declarations.len(), 1);
+        assert_eq!(ph1.declarations[0].const_name, "api");
+        assert_ne!(
+            ph1.declarations[0].sig_hash, ph2.declarations[0].sig_hash,
+            "private helper edit before inferred-type public def must change api sig_hash"
+        );
+        assert_ne!(
+            ph1.public_signature_digest, ph2.public_signature_digest,
+            "private helper edit before inferred-type public def must change public_signature_digest"
+        );
+
+        let priv_helper_ws =
+            "module\nprivate   def   helper  :=  (0 : Nat) -- comment\npublic def api := helper\n";
+        let ph_ws = extract_public_signature(priv_helper_ws);
+        assert_eq!(ph1.declarations[0].sig_hash, ph_ws.declarations[0].sig_hash);
+        assert_eq!(ph1.public_signature_digest, ph_ws.public_signature_digest);
+
+        for (label, s1, s2) in [
+            (
+                "private abbrev in public theorem type",
+                "module\nprivate abbrev MyProp := (1 = 1)\npublic theorem thm : MyProp := rfl\n",
+                "module\nprivate abbrev MyProp := (2 = 2)\npublic theorem thm : MyProp := rfl\n",
+            ),
+            (
+                "private def in public theorem type",
+                "module\nprivate def targetVal : Nat := 1\npublic theorem thm : targetVal = targetVal := rfl\n",
+                "module\nprivate def targetVal : Nat := 2\npublic theorem thm : targetVal = targetVal := rfl\n",
+            ),
+            (
+                "non-public-section def before public def",
+                "module\ndef helper := (0 : Nat)\npublic def api := helper\n",
+                "module\ndef helper := true\npublic def api := helper\n",
+            ),
+            (
+                "private def inside public section before public def",
+                "module\npublic section\nprivate def helper := (0 : Nat)\ndef api := helper\nend\n",
+                "module\npublic section\nprivate def helper := true\ndef api := helper\nend\n",
+            ),
+            (
+                "mutual block with trailing private sibling",
+                "module\nmutual\n  public def api := helper\n  private def helper := (0 : Nat)\nend\n",
+                "module\nmutual\n  public def api := helper\n  private def helper := true\nend\n",
+            ),
+            (
+                "non-public notation before public def",
+                "module\nnotation \"MYTY\" => Nat\npublic def api : MYTY := 0\n",
+                "module\nnotation \"MYTY\" => Bool\npublic def api : MYTY := true\n",
+            ),
+            (
+                "namespace-scoped private def rename via namespace",
+                "module\nnamespace A\nprivate def helper := (0 : Nat)\nend A\npublic def api := A.helper\n",
+                "module\nnamespace B\nprivate def helper := (0 : Nat)\nend B\npublic def api := A.helper\n",
+            ),
+        ] {
+            let a = extract_public_signature(s1);
+            let b = extract_public_signature(s2);
+            assert_eq!(a.declarations.len(), 1, "{label}: only public decl exported");
+            assert_eq!(b.declarations.len(), 1, "{label}: only public decl exported");
+            assert_ne!(
+                a.declarations[0].sig_hash, b.declarations[0].sig_hash,
+                "{label}: sig_hash must change"
+            );
+            assert_ne!(
+                a.public_signature_digest, b.public_signature_digest,
+                "{label}: public_signature_digest must change"
+            );
+        }
+
+        let priv_before_meta_v1 =
+            "module\npublic def keepPub : Nat := 1\nprivate def metaDep := (0 : Nat)\npublic meta def metaApi := metaDep\n";
+        let priv_before_meta_v2 =
+            "module\npublic def keepPub : Nat := 1\nprivate def metaDep := true\npublic meta def metaApi := metaDep\n";
+        let pbm1 = extract_public_signature(priv_before_meta_v1);
+        let pbm2 = extract_public_signature(priv_before_meta_v2);
+        assert_eq!(
+            pbm1.public_signature_digest, pbm2.public_signature_digest,
+            "private decl after last non-meta public decl must not change public_signature_digest"
+        );
+        assert_ne!(
+            pbm1.meta_signature_digest, pbm2.meta_signature_digest,
+            "private decl before public meta decl must change meta_signature_digest"
+        );
+
+        let trailing_priv_v1 =
+            "module\npublic def api : Nat := 1\nprivate def afterHelper := (0 : Nat)\n";
+        let trailing_priv_v2 =
+            "module\npublic def api : Nat := 1\nprivate def afterHelper := true\ndef alsoAfter : Bool := false\n";
+        let tp1 = extract_public_signature(trailing_priv_v1);
+        let tp2 = extract_public_signature(trailing_priv_v2);
+        assert_eq!(
+            tp1.public_directives_hash, tp2.public_directives_hash,
+            "trailing private decls after last public decl must not change public_directives_hash"
+        );
+        assert_eq!(
+            tp1.public_signature_digest, tp2.public_signature_digest,
+            "trailing private decls after last public decl must not change public_signature_digest"
         );
     }
 }
