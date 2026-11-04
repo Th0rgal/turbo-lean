@@ -18,9 +18,12 @@ open LeanNative.Semantics
 
 A coroutine is a non-escaping `(pollTag, stateWord, payloadWord)` triple.
 `lowerAsyncPollStep` dispatches on the state word with `ite`; `Ready` (`tag = 1`)
-is idempotent. `lowerAsyncEventLoop` wraps that step in a bounded `seqFor`.
-The heap-closure baseline `.allocCtor`s once per poll. `optimizeAsyncStateMachine`
-unboxes a non-escaping 3-tuple frame into three scalar bindings.
+is idempotent. `lowerAsyncEventLoop` wraps that step in a bounded `seqFor`, and
+`lowerAsyncAwaitChain` composes sequential stackless poll steps across await
+boundaries. The heap-closure baseline `.allocCtor`s once per poll.
+`optimizeAsyncStateMachine` eliminates intermediate non-escaping 3-tuple frames
+across await chains and inside `lowerAsyncEventLoop` / `lowerAsyncStepArms`
+(`seqFor` accumulator init forwarding and tail-return copy forwarding).
 -/
 
 /-- Outcome of one stackless poll (`Pending = 0`, `Ready = 1`). -/
@@ -53,6 +56,59 @@ structure AsyncCoroutineSpec where
   regBase : VarId
   steps : List AsyncStep
   deriving Repr, DecidableEq, Inhabited, BEq
+
+/-- Mathematical single-poll transition of `steps` on unboxed `(tag, state, payload)`:
+`Ready` (`tag == 1`) is idempotent; otherwise the first arm matching `curState == arm.fromState.toUInt64`
+transitions to `(arm.outcome.tagBits, arm.toState.toUInt64, payload + arm.stepDelta)`,
+or leaves the frame unchanged when no arm matches. -/
+def stepSpecPoll (steps : List AsyncStep) (tag curState payload : UInt64) :
+    UInt64 × UInt64 × UInt64 :=
+  if tag == 1 then
+    (tag, curState, payload)
+  else
+    match steps.find? (fun s => curState == s.fromState.toUInt64) with
+    | some s => (s.outcome.tagBits, s.toState.toUInt64, payload + s.stepDelta)
+    | none => (tag, curState, payload)
+
+/-- Mathematical `maxPolls`-step execution of `steps` from `(tag, curState, payload)`. -/
+def runSpecPollsLoop (steps : List AsyncStep) (maxPolls : Nat)
+    (tag curState payload : UInt64) : UInt64 × UInt64 × UInt64 :=
+  match maxPolls with
+  | 0 => (tag, curState, payload)
+  | n + 1 =>
+    let (nt, ns, np) := stepSpecPoll steps tag curState payload
+    runSpecPollsLoop steps n nt ns np
+
+/-- Mathematical poll-loop specification for `spec : AsyncCoroutineSpec` starting in `Pending` (`tag = 0`)
+at `spec.initState.toUInt64` with initial `payload`. -/
+def runSpecPolls (spec : AsyncCoroutineSpec) (maxPolls : Nat)
+    (initPayload : UInt64) : UInt64 × UInt64 × UInt64 :=
+  runSpecPollsLoop spec.steps maxPolls
+    AsyncPollResult.Pending.tagBits spec.initState.toUInt64 initPayload
+
+/-- Convert a mathematical `(tag, state, payload)` triple to its LNIR `Val.tuple` representation. -/
+def asyncFrameVal (f : UInt64 × UInt64 × UInt64) : Val :=
+  let (t, s, p) := f
+  .tuple [.u64 t, .u64 s, .u64 p]
+
+/-- Mathematical sequential execution of `steps` across await suspension points:
+each `step :: rest` leaves a `Ready` (`tag == 1`) frame untouched, advances `(tag, curState, payload)`
+when `curState == step.fromState.toUInt64`, or passes `(tag, curState, payload)` unchanged otherwise,
+finally returning the `u64` payload. -/
+def runAwaitStepsPayload (steps : List AsyncStep) (tag curState payload : UInt64) : UInt64 :=
+  match steps with
+  | [] => payload
+  | step :: rest =>
+    if tag == 1 then
+      runAwaitStepsPayload rest tag curState payload
+    else if curState == step.fromState.toUInt64 then
+      runAwaitStepsPayload rest step.outcome.tagBits step.toState.toUInt64 (payload + step.stepDelta)
+    else
+      runAwaitStepsPayload rest tag curState payload
+
+/-- Mathematical payload specification of `lowerAsyncAwaitChain spec` on `initPayload`. -/
+def runAwaitChainPayload (spec : AsyncCoroutineSpec) (initPayload : UInt64) : UInt64 :=
+  runAwaitStepsPayload spec.steps AsyncPollResult.Pending.tagBits spec.initState.toUInt64 initPayload
 
 /-- True when `cont` is stored, returned, aliased, or passed to a call.
 A `.projTuple` of `cont` is a local read and does not escape. -/
@@ -143,6 +199,67 @@ def lowerAsyncEventLoop (spec : AsyncCoroutineSpec) : LNIRCode :=
               (lowerAsyncPollStep accVar (b + 7) spec.steps)
               (.ret accVar))))))
 
+/-- Lower a sequential chain of async suspension steps starting from `(tagV, stV, valV)`,
+materializing an intermediate `(tag, state, payload)` 3-tuple frame at each await point
+and projecting it into the next suspension step before returning the final payload.
+`optimizeAsyncStateMachine` eliminates every intermediate 3-tuple frame allocation in this chain. -/
+def lowerAsyncAwaitSteps (tagV stV valV base : VarId) (steps : List AsyncStep) : LNIRCode :=
+  match steps with
+  | [] => .ret valV
+  | step :: rest =>
+    let doneV := base
+    let condV := base + 1
+    let rTag := base + 2
+    let rSt := base + 3
+    let rVal := base + 4
+    let nTag := base + 5
+    let nSt := base + 6
+    let nVal := base + 7
+    let nextFrm := base + 8
+    let pTag := base + 9
+    let pSt := base + 10
+    let pVal := base + 11
+    let cont :=
+      .letBind pTag .i64 (.projTuple nextFrm 0)
+        (.letBind pSt .i64 (.projTuple nextFrm 1)
+          (.letBind pVal .i64 (.projTuple nextFrm 2)
+            (lowerAsyncAwaitSteps pTag pSt pVal (base + 12) rest)))
+    .letBind doneV .i1 (.scalar (.binOp .eq (.var tagV) (.constU64 1)))
+      (.ite doneV
+        (.letBind nextFrm (.tuple [.i64, .i64, .i64]) (.mkTuple [tagV, stV, valV]) cont)
+        (.letBind condV .i1
+          (.scalar (.binOp .eq (.var stV) (.constU64 step.fromState.toUInt64)))
+          (.ite condV
+            (.letBind rTag .i64 (.scalar (.constU64 step.outcome.tagBits))
+              (.letBind rSt .i64 (.scalar (.constU64 step.toState.toUInt64))
+                (.letBind rVal .i64
+                  (.scalar (.binOp .add (.var valV) (.constU64 step.stepDelta)))
+                  (.letBind nextFrm (.tuple [.i64, .i64, .i64]) (.mkTuple [rTag, rSt, rVal])
+                    cont))))
+            (.letBind nTag .i64 (.scalar (.var tagV))
+              (.letBind nSt .i64 (.scalar (.var stV))
+                (.letBind nVal .i64 (.scalar (.var valV))
+                  (.letBind nextFrm (.tuple [.i64, .i64, .i64]) (.mkTuple [nTag, nSt, nVal])
+                    cont)))))))
+
+/-- Lower a sequential async await chain for `spec`, initializing the initial `(Pending, initState, input)`
+frame and threading `spec.steps` across await boundaries to produce the final `u64` payload. -/
+def lowerAsyncAwaitChain (spec : AsyncCoroutineSpec) : LNIRCode :=
+  let b := spec.regBase
+  let initTag := b
+  let initSt := b + 1
+  let initFrm := b + 2
+  let t0 := b + 3
+  let s0 := b + 4
+  let v0 := b + 5
+  .letBind initTag .i64 (.scalar (.constU64 AsyncPollResult.Pending.tagBits))
+    (.letBind initSt .i64 (.scalar (.constU64 spec.initState.toUInt64))
+      (.letBind initFrm (.tuple [.i64, .i64, .i64]) (.mkTuple [initTag, initSt, spec.inputVar])
+        (.letBind t0 .i64 (.projTuple initFrm 0)
+          (.letBind s0 .i64 (.projTuple initFrm 1)
+            (.letBind v0 .i64 (.projTuple initFrm 2)
+              (lowerAsyncAwaitSteps t0 s0 v0 (b + 6) spec.steps))))))
+
 /-- Three-step `Pending → Pending → Ready` coroutine used by the zero-alloc witness. -/
 def mkThreeStepAsyncSpec (inputVar regBase pollBudget : Nat)
     (d0 d1 d2 : UInt64) : AsyncCoroutineSpec :=
@@ -189,8 +306,19 @@ def canUnboxAsyncFrame3 (dst stV valV dstTag dstState dstVal : VarId)
     !(dstTag == stV) && !(dstTag == valV) && !(dstState == valV) &&
     checkNonEscapingAsync dst tail && !codeUsesVar dst tail
 
-/-- Replace `.letBind dst ty (.mkTuple [tagV, stV, valV]) k` by three scalar copies
-when `k` immediately projects `0, 1, 2` out of `dst` and never escapes `dst`. -/
+/-- Guard for coalescing a single-use initial async frame `.letBind dst ty (.mkTuple ...) (.seqFor ... init ...)`
+directly into the `seqFor` accumulator variable `accVar`. -/
+def canForwardAsyncSeqInit (dst idxVar loVar hiVar accVar initVar : VarId)
+    (step k : LNIRCode) : Bool :=
+  initVar == dst && !(accVar == dst) && !(loVar == dst) && !(hiVar == dst) &&
+    !(accVar == loVar) && !(accVar == hiVar) &&
+    (idxVar == dst || !codeUsesVar dst step) && !codeUsesVar dst k
+
+/-- Coalesce non-escaping async frame bindings at the head of a block:
+1. Unbox `.letBind dst ty (.mkTuple [tagV, stV, valV])` followed by `0, 1, 2` tuple projections
+   into three direct scalar register bindings (eliminating the `.mkTuple` allocation across await points).
+2. Forward `.letBind dst ty (.mkTuple [tagV, stV, valV]) (.seqFor idx lo hi acc dst ...)` directly into
+   `acc` when `dst` does not escape into bounds, step body, or continuation (firing on `lowerAsyncEventLoop`). -/
 def unboxAsyncFrameHead (dst : VarId) (ty : LNIRType) (val : LNIRExpr)
     (k : LNIRCode) : LNIRCode :=
   match val with
@@ -204,6 +332,12 @@ def unboxAsyncFrameHead (dst : VarId) (ty : LNIRType) (val : LNIRExpr)
         .letBind dstTag tyTag (.scalar (.var tagV))
           (.letBind dstState tyState (.scalar (.var stV))
             (.letBind dstVal tyVal (.scalar (.var valV)) tail))
+      else
+        .letBind dst ty (.mkTuple [tagV, stV, valV]) k
+    | .seqFor idxVar loVar hiVar accVar initVar accTy step tail =>
+      if canForwardAsyncSeqInit dst idxVar loVar hiVar accVar initVar step tail then
+        .letBind accVar ty (.mkTuple [tagV, stV, valV])
+          (.seqFor idxVar loVar hiVar accVar accVar accTy step tail)
       else
         .letBind dst ty (.mkTuple [tagV, stV, valV]) k
     | _ => .letBind dst ty (.mkTuple [tagV, stV, valV]) k
@@ -244,7 +378,96 @@ theorem evalSeqLoop_async_refines (count curIdx : Nat) (idxVar accVar : VarId)
       rw [hstep _ st nextAcc st1 hs1]
       exact ih (curIdx + 1) nextAcc st1 hsrc
 
-/-- `unboxAsyncFrameHead` refines `.letBind dst ty val k`. -/
+/-- `canForwardAsyncSeqInit` refines `.letBind dst ty (.mkTuple [tagV, stV, valV]) (.seqFor ...)`. -/
+private theorem forwardAsyncSeqInit_refines (dst tagV stV valV : VarId) (ty : LNIRType)
+    (idxVar loVar hiVar accVar initVar : VarId) (accTy : LNIRType) (step tail : LNIRCode)
+    (hcond : canForwardAsyncSeqInit dst idxVar loVar hiVar accVar initVar step tail = true) :
+    CodeRefines
+      (.letBind dst ty (.mkTuple [tagV, stV, valV])
+        (.seqFor idxVar loVar hiVar accVar initVar accTy step tail))
+      (.letBind accVar ty (.mkTuple [tagV, stV, valV])
+        (.seqFor idxVar loVar hiVar accVar accVar accTy step tail)) := by
+  unfold canForwardAsyncSeqInit at hcond
+  simp only [Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, Bool.not_eq_true'] at hcond
+  rcases hcond with ⟨⟨⟨⟨⟨⟨⟨hinit, hacc_dst⟩, hlo_dst⟩, hhi_dst⟩, hacc_lo⟩, hacc_hi⟩, hstep_dst⟩, htail_dst⟩
+  rw [hinit]
+  intro fuel env st v st' hsrc
+  dsimp only [evalCode, evalExpr] at hsrc ⊢
+  cases hevl : evalVarList env [tagV, stV, valV] with
+  | error _ => rw [hevl] at hsrc; contradiction
+  | ok vals =>
+    rw [hevl] at hsrc
+    dsimp only [evalCode] at hsrc ⊢
+    have hlo_ne_dst : (loVar == dst) = false := hlo_dst
+    have hhi_ne_dst : (hiVar == dst) = false := hhi_dst
+    have hlo_ne_acc : (loVar == accVar) = false :=
+      beq_eq_false_iff_ne.mpr (Ne.symm (beq_eq_false_iff_ne.mp hacc_lo))
+    have hhi_ne_acc : (hiVar == accVar) = false :=
+      beq_eq_false_iff_ne.mpr (Ne.symm (beq_eq_false_iff_ne.mp hacc_hi))
+    rw [VarEnv.bind_ne env dst loVar (.tuple vals) hlo_ne_dst,
+        VarEnv.bind_ne env dst hiVar (.tuple vals) hhi_ne_dst,
+        VarEnv.bind_self] at hsrc
+    rw [VarEnv.bind_ne env accVar loVar (.tuple vals) hlo_ne_acc,
+        VarEnv.bind_ne env accVar hiVar (.tuple vals) hhi_ne_acc,
+        VarEnv.bind_self]
+    cases hlo : env loVar with
+    | none => rw [hlo] at hsrc; contradiction
+    | some vlo =>
+      cases hhi : env hiVar with
+      | none => rw [hlo, hhi] at hsrc; cases vlo <;> contradiction
+      | some vhi =>
+        rw [hlo, hhi] at hsrc
+        cases vlo with
+        | u64 loN =>
+          cases vhi with
+          | u64 hiN =>
+            dsimp only at hsrc ⊢
+            have hloop_eq :
+                evalSeqLoop (hiN.toNat - loN.toNat) loN.toNat idxVar accVar (.tuple vals)
+                  (env.bind dst (.tuple vals)) st
+                  (fun stepEnv stepSt => evalCode fuel stepEnv stepSt step) =
+                evalSeqLoop (hiN.toNat - loN.toNat) loN.toNat idxVar accVar (.tuple vals)
+                  (env.bind accVar (.tuple vals)) st
+                  (fun stepEnv stepSt => evalCode fuel stepEnv stepSt step) := by
+              apply LeanNative.Proofs.evalSeqLoop_congr_step
+              intro i av sSt
+              have hrhs :
+                  (((env.bind accVar (.tuple vals)).bind idxVar (.u64 i)).bind accVar av) =
+                  ((env.bind idxVar (.u64 i)).bind accVar av) := by
+                by_cases hia : idxVar = accVar
+                · subst hia
+                  rw [LeanNative.Proofs.VarEnv.bind_overwrite (env.bind idxVar (.tuple vals)) idxVar (.u64 i) av,
+                      LeanNative.Proofs.VarEnv.bind_overwrite env idxVar (.tuple vals) av,
+                      LeanNative.Proofs.VarEnv.bind_overwrite env idxVar (.u64 i) av]
+                · rw [LeanNative.Proofs.VarEnv.bind_comm env accVar idxVar (.tuple vals) (.u64 i) (Ne.symm hia),
+                      LeanNative.Proofs.VarEnv.bind_overwrite]
+              rw [hrhs]
+              rcases hstep_dst with hidx_eq | hnu_step
+              · rw [hidx_eq,
+                    LeanNative.Proofs.VarEnv.bind_overwrite env dst (.tuple vals) (.u64 i)]
+              · have hne_da : dst ≠ accVar := Ne.symm (beq_eq_false_iff_ne.mp hacc_dst)
+                by_cases hdi : dst = idxVar
+                · rw [hdi,
+                      LeanNative.Proofs.VarEnv.bind_overwrite env idxVar (.tuple vals) (.u64 i)]
+                · rw [LeanNative.Proofs.VarEnv.bind_comm env dst idxVar (.tuple vals) (.u64 i) hdi,
+                      LeanNative.Proofs.VarEnv.bind_comm (env.bind idxVar (.u64 i)) dst accVar (.tuple vals) av hne_da]
+                  exact LeanNative.Proofs.evalCode_bind_not_uses fuel step _ sSt dst (.tuple vals) hnu_step
+            rw [hloop_eq] at hsrc
+            cases hloop : evalSeqLoop (hiN.toNat - loN.toNat) loN.toNat idxVar accVar (.tuple vals)
+                (env.bind accVar (.tuple vals)) st
+                (fun stepEnv stepSt => evalCode fuel stepEnv stepSt step) with
+            | error _ => rw [hloop] at hsrc; contradiction
+            | ok pair =>
+              rcases pair with ⟨finalAcc, st1⟩
+              rw [hloop] at hsrc
+              dsimp only at hsrc ⊢
+              have hne_da : dst ≠ accVar := Ne.symm (beq_eq_false_iff_ne.mp hacc_dst)
+              rw [LeanNative.Proofs.VarEnv.bind_comm env dst accVar (.tuple vals) finalAcc hne_da,
+                  LeanNative.Proofs.evalCode_bind_not_uses fuel tail _ st1 dst (.tuple vals) htail_dst] at hsrc
+              rw [LeanNative.Proofs.VarEnv.bind_overwrite]
+              exact hsrc
+          | _ => contradiction
+        | _ => contradiction
 theorem unboxAsyncFrameHead_refines (dst : VarId) (ty : LNIRType)
     (val : LNIRExpr) (k : LNIRCode) :
     CodeRefines (.letBind dst ty val k) (unboxAsyncFrameHead dst ty val k) := by
@@ -336,6 +559,11 @@ theorem unboxAsyncFrameHead_refines (dst : VarId) (ty : LNIRType)
               rw [hvalRead]
               dsimp only
               exact hsrc
+      · exact CodeRefines.refl _
+    · next idxVar loVar hiVar accVar initVar accTy step tail =>
+      split
+      · next hcond =>
+        exact forwardAsyncSeqInit_refines dst tagV stV valV ty idxVar loVar hiVar accVar initVar accTy step tail hcond
       · exact CodeRefines.refl _
     · exact CodeRefines.refl _
   · exact CodeRefines.refl _

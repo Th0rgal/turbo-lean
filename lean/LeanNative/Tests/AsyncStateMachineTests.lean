@@ -79,6 +79,42 @@ def escapingClosureFrameDecl : LNIRDecl := {
                   (.ret 7)))))))
 }
 
+/-- Lowered 3-await coroutine chain produced by `lowerAsyncAwaitChain`; contains intermediate
+`(tag, state, payload)` `.mkTuple` frames across suspension points that `asyncStateMachinePass`
+unboxes to zero `.mkTuple` allocations (`changed == true`). -/
+def loweredAsyncChainDecl : LNIRDecl := {
+  name := "d5_lowered_async_chain"
+  params := [{ id := 0, name := "seed", ty := .i64, borrow := false }]
+  retTy := .i64
+  assurance := .verifiedKernelProof
+  isGpuCand := false
+  body := lowerAsyncAwaitChain (mkThreeStepAsyncSpec 0 10 16 5 7 9)
+}
+
+/-- Lowered bounded event-loop coroutine produced by `lowerAsyncEventLoop`; `asyncStateMachinePass`
+forwards the initial `.mkTuple` frame binding directly into the `seqFor` accumulator (`changed == true`). -/
+def loweredAsyncLoopDecl : LNIRDecl := {
+  name := "d5_lowered_async_loop"
+  params := [{ id := 0, name := "seed", ty := .i64, borrow := false }]
+  retTy := .tuple [.i64, .i64, .i64]
+  assurance := .verifiedKernelProof
+  isGpuCand := false
+  body := lowerAsyncEventLoop (mkThreeStepAsyncSpec 0 10 16 5 7 9)
+}
+
+/-- Arbitrary 4-step non-hardcoded `AsyncCoroutineSpec` testing `runSpecPolls` equivalence. -/
+def fourStepCustomSpec : AsyncCoroutineSpec := {
+  inputVar := 0
+  initState := 10
+  pollBudget := 6
+  regBase := 20
+  steps :=
+    [ { fromState := 10, toState := 20, stepDelta := 3, outcome := .Pending }
+    , { fromState := 20, toState := 30, stepDelta := 11, outcome := .Pending }
+    , { fromState := 30, toState := 40, stepDelta := 13, outcome := .Pending }
+    , { fromState := 40, toState := 50, stepDelta := 17, outcome := .Ready } ]
+}
+
 -- 1. Multi-yield `Pending → Pending → Ready` transitions via `evalCode 64`:
 #guard evalOkEq
   (evalCode 64 (VarEnv.empty.bind 0 (.u64 10)) HeapState.empty
@@ -175,5 +211,50 @@ def escapingClosureFrameDecl : LNIRDecl := {
           rep.overallAssurance == .verifiedKernelProof &&
           optCerts.any (fun c => c.passName == "AsyncStateMachine" && c.changed == true) &&
           (match m'.decls with | [d'] => codeHasMkTuple d'.body == false | _ => false))
+
+-- 6. `asyncStateMachinePass` genuinely fires (`changed == true`) on lowered async coroutines/chains:
+#guard codeHasMkTuple loweredAsyncChainDecl.body == true
+#guard (asyncStateMachinePass.runDecl loweredAsyncChainDecl).2.changed == true
+#guard (let (d', cert) := asyncStateMachinePass.runDecl loweredAsyncChainDecl
+        let optCert : LeanNative.Proofs.OptimizationCert := {
+          passName := cert.passName, declName := cert.declName,
+          inputHash := cert.inputHash, outputHash := cert.outputHash,
+          changed := cert.changed, assurance := cert.assurance,
+          theoremRef := cert.theoremRef, notes := cert.notes }
+        let res := LeanNative.Proofs.verifySingleCert optCert
+        cert.changed == true && codeHasMkTuple d'.body == false &&
+          res.1 == true && res.2 == [] &&
+          evalOkEq (evalCode 64 (VarEnv.empty.bind 0 (.u64 10)) HeapState.empty d'.body)
+            (.u64 31) HeapState.empty &&
+          evalOkEq (evalCode 64 (VarEnv.empty.bind 0 (.u64 10)) HeapState.empty
+            loweredAsyncChainDecl.body) (.u64 31) HeapState.empty)
+
+#guard (asyncStateMachinePass.runDecl loweredAsyncLoopDecl).2.changed == true
+#guard (let (d', cert) := asyncStateMachinePass.runDecl loweredAsyncLoopDecl
+        let optCert : LeanNative.Proofs.OptimizationCert := {
+          passName := cert.passName, declName := cert.declName,
+          inputHash := cert.inputHash, outputHash := cert.outputHash,
+          changed := cert.changed, assurance := cert.assurance,
+          theoremRef := cert.theoremRef, notes := cert.notes }
+        let res := LeanNative.Proofs.verifySingleCert optCert
+        cert.changed == true && res.1 == true && res.2 == [] &&
+          evalOkEq (evalCode 64 (VarEnv.empty.bind 0 (.u64 10)) HeapState.empty d'.body)
+            (.tuple [.u64 1, .u64 3, .u64 31]) HeapState.empty)
+
+-- 7. General `lowerAsyncEventLoop` matches `asyncFrameVal (runSpecPolls ...)` on arbitrary 4-step spec:
+#guard evalOkEq
+  (evalCode 64 (VarEnv.empty.bind 0 (.u64 100)) HeapState.empty
+    (lowerAsyncEventLoop fourStepCustomSpec))
+  (asyncFrameVal (runSpecPolls fourStepCustomSpec fourStepCustomSpec.pollBudget 100))
+  HeapState.empty
+#guard asyncFrameVal (runSpecPolls fourStepCustomSpec fourStepCustomSpec.pollBudget 100) ==
+  .tuple [.u64 1, .u64 50, .u64 144]
+
+-- 8. All new/updated D5 theorems are registered in `verifiedTheoremRegistry`:
+#guard LeanNative.Proofs.isRegisteredTheorem "LeanNative.Proofs.lowerAsyncEventLoop_sound" == true
+#guard LeanNative.Proofs.isRegisteredTheorem "LeanNative.Proofs.lowerAsyncEventLoop_threeStep_sound" == true
+#guard LeanNative.Proofs.isRegisteredTheorem "LeanNative.Proofs.lowerAsyncPollStep_spec_sound" == true
+#guard LeanNative.Proofs.isRegisteredTheorem "LeanNative.Proofs.lowerAsyncAwaitChain_sound" == true
+#guard LeanNative.Proofs.isRegisteredTheorem "LeanNative.Transform.optimizeAsyncStateMachine_refines" == true
 
 end LeanNative.Tests.AsyncStateMachineTests

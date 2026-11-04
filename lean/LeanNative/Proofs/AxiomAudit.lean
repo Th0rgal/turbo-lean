@@ -390,11 +390,15 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.lowerImpureStepPure_sound
   , ``LeanNative.Proofs.lowerRealLCNFCode_sound
   , ``LeanNative.Proofs.lowerRealLCNFDecl_sound
+  , ``LeanNative.Transform.evalSeqLoop_async_refines
   , ``LeanNative.Transform.optimizeAsyncStateMachine_refines
   , ``LeanNative.Proofs.lowerAsyncPollStep_ready_sound
   , ``LeanNative.Proofs.lowerAsyncPollStep_sound
   , ``LeanNative.Proofs.lowerAsyncPollStep_arm1_sound
+  , ``LeanNative.Proofs.lowerAsyncPollStep_spec_sound
   , ``LeanNative.Proofs.lowerAsyncEventLoop_sound
+  , ``LeanNative.Proofs.lowerAsyncEventLoop_threeStep_sound
+  , ``LeanNative.Proofs.lowerAsyncAwaitChain_sound
   , ``LeanNative.Proofs.asyncStateMachinePass_sound
   , ``LeanNative.Proofs.checkNonEscapingAsync_rejects_closure
   , ``LeanNative.Proofs.asyncStateMachine_zeroAlloc_nonvacuous
