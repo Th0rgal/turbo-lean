@@ -1350,18 +1350,22 @@ theorem add_nsw_poison_witness :
 private theorem bind_noalias (st : ExecState) (facts : FactEnv) (ptrA ptrB : VarId)
     (lenA lenB : Nat) (ps : List LLVMParam) (args : List LLVMVal) :
     bindArgs st (noaliasParams facts ptrA ptrB lenA lenB ps) args = bindArgs st ps args := by
-  by_cases hmem : factMember facts (.disjointSlices ptrA ptrB lenA lenB) = true
-  · simp only [noaliasParams, hmem, Bool.not_true, Bool.false_eq_true, ite_false]
-    induction ps generalizing st args with
-    | nil => cases args <;> rfl
-    | cons p ps ih =>
-      cases args with
+  let f : LLVMParam → LLVMParam := fun p => match p.ty with
+    | .ptr _ => if p.name == llvmRegOf ptrA || p.name == llvmRegOf ptrB then
+        withNoAlias true p else p
+    | _ => p
+  have hmap : ∀ (st0 : ExecState) (qs : List LLVMParam) (vs : List LLVMVal),
+      bindArgs st0 (qs.map f) vs = bindArgs st0 qs vs := by
+    intro st0 qs
+    induction qs generalizing st0 with
+    | nil =>
+      intro vs
+      cases vs <;> rfl
+    | cons p qs ih =>
+      intro vs
+      cases vs with
       | nil => rfl
       | cons v vs =>
-        let f : LLVMParam → LLVMParam := fun p => match p.ty with
-          | .ptr _ => if p.name == llvmRegOf ptrA || p.name == llvmRegOf ptrB then
-              withNoAlias true p else p
-          | _ => p
         have hname : (f p).name = p.name := by
           dsimp only [f]
           cases p.ty with
@@ -1371,17 +1375,20 @@ private theorem bind_noalias (st : ExecState) (facts : FactEnv) (ptrA ptrB : Var
               split <;> rfl
             · simp [Bool.eq_false_iff.mpr hc]
           | _ => rfl
-        change bindArgs st ((f p) :: ps.map f) (v :: vs) = bindArgs st (p :: ps) (v :: vs)
-        simp only [bindArgs, hname]
-        exact ih (bindReg st p.name v) vs
-  · have hmem0 : factMember facts (.disjointSlices ptrA ptrB lenA lenB) = false :=
-      Bool.eq_false_iff.mpr hmem
-    simp [noaliasParams, hmem0]
+        simp only [List.map_cons, bindArgs, hname]
+        exact ih (bindReg st0 p.name v) vs
+  unfold noaliasParams
+  dsimp only
+  split
+  · rfl
+  · exact hmap st ps args
 
 theorem llvmNoAliasParam_of_disjoint_sound (st : ExecState) (facts : FactEnv)
     (ptrA ptrB lenA lenB : VarId) (as0 : Nat) (attrs0 : List ParamAttr)
     (ps : List LLVMParam) (args : List LLVMVal)
     (pa pb : BitVec 64) (la lb : UInt64)
+    (hne : ptrA ≠ ptrB)
+    (hall : ps.all (isCertifiedPtrParam ptrA ptrB) = true)
     (hpa : st.regs.lookup (llvmRegOf ptrA) = some (.ptr pa))
     (hpb : st.regs.lookup (llvmRegOf ptrB) = some (.ptr pb))
     (hla : st.regs.lookup (llvmRegOf lenA) = some (.bits .i64 la.toBitVec))
@@ -1389,7 +1396,8 @@ theorem llvmNoAliasParam_of_disjoint_sound (st : ExecState) (facts : FactEnv)
     (hmem : factMember facts (.disjointSlices ptrA ptrB lenA lenB) = true)
     (hdisj : rangesDisjoint pa.toNat (la.toNat * 8) pb.toNat (lb.toNat * 8) = true) :
     let p0 : LLVMParam := { name := llvmRegOf ptrA, ty := .ptr as0, attrs := attrs0 }
-    (noaliasParams facts ptrA ptrB lenA lenB (p0 :: ps)).any (fun p => p.attrs.contains .noalias) = true ∧
+    (noaliasParams facts ptrA ptrB lenA lenB (p0 :: ps)).any
+        (fun p => p.attrs.contains .noalias) = true ∧
       bindArgs st (noaliasParams facts ptrA ptrB lenA lenB (p0 :: ps)) args =
         bindArgs st (p0 :: ps) args ∧
       ∃ av bv : BitVec 64, ∃ lav lbv : UInt64,
@@ -1404,6 +1412,7 @@ theorem llvmNoAliasParam_of_disjoint_sound (st : ExecState) (facts : FactEnv)
           (m.writeBytesAt (av.toNat + offA) bs).readBytesAt (bv.toNat + offB) width =
             m.readBytesAt (bv.toNat + offB) width := by
   intro p0
+  have hneb : (ptrA != ptrB) = true := bne_iff_ne.mpr hne
   have hna : (withNoAlias true p0).attrs.contains .noalias = true := by
     simp only [withNoAlias, Bool.not_true, Bool.false_eq_true, ite_false]
     by_cases hc : .noalias ∈ p0.attrs <;> simp [hc]
@@ -1421,8 +1430,14 @@ theorem llvmNoAliasParam_of_disjoint_sound (st : ExecState) (facts : FactEnv)
     exact ByteMem.readBytesAt_writeBytesAt_disjoint m (pa.toNat + offA) bs (pb.toNat + offB) width hsubDisj
   refine ⟨?_, bind_noalias st facts ptrA ptrB lenA lenB (p0 :: ps) args,
     pa, pb, la, lb, hpa, hpb, hla, hlb, hdisj, hsub⟩
-  simp only [noaliasParams, hmem, Bool.not_true, Bool.false_eq_true, ite_false,
-    List.map_cons, List.any_cons, p0, beq_self_eq_true, Bool.true_or, ite_true, hna]
+  dsimp only [p0] at hna ⊢
+  unfold noaliasParams
+  rw [List.all_cons]
+  have hp0 : isCertifiedPtrParam ptrA ptrB { name := llvmRegOf ptrA, ty := .ptr as0, attrs := attrs0 } = true := by
+    simp [isCertifiedPtrParam]
+  rw [hp0, Bool.true_and, hall, hneb, hmem]
+  simp only [Bool.and_self, Bool.not_true, Bool.false_eq_true, ite_false,
+    List.map_cons, beq_self_eq_true, Bool.true_or, ite_true, List.any_cons, hna]
 
 theorem readBytesAt_disjoint_of_fact (m : ByteMem) (base addr width : Nat) (bs : List MemByte)
     (hb : base + bs.length ≤ addr) :
@@ -1430,12 +1445,12 @@ theorem readBytesAt_disjoint_of_fact (m : ByteMem) (base addr width : Nat) (bs :
   ByteMem.readBytesAt_writeBytesAt_disjoint m base bs addr width
     (by unfold rangesDisjoint; exact decide_eq_true (Or.inl hb))
 
--- PTX: a retained fact replaces the guarded gid prefix by the unguarded 11-instruction preamble.
--- Coverage (`(ctaId.x + 1) * blockSize ≤ len`) keeps `gid * 8` and `nIn * len * 8 + gid * 8`
--- non-wrapping in 64 bits across `shl.b64` and `add.u64`.
+-- PTX: with an explicit `LaunchBoundsCert` and retained `idxLt`, the guarded gid prefix becomes
+-- the unguarded 11-instruction preamble. Coverage (`(ctaId.x + 1) * blockSize ≤ len`) keeps
+-- `gid * 8` and `nIn * len * 8 + gid * 8` non-wrapping in 64 bits across `shl.b64` and `add.u64`.
 
 theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
-    (gidVar lenVar : VarId) (suf : List PTXStmt) (cta : PTXCTAState)
+    (gidVar lenVar : VarId) (cert : LaunchBoundsCert) (suf : List PTXStmt) (cta : PTXCTAState)
     (done todo : List PTXThreadState) (blockSize : Nat) (ctaId : PTXAst.Dim3)
     {rf : PTXRegFile} {nP nR nRd : Nat} (hrt : RegTyped rf nP nR nRd)
     (localBytes tx len nIn : Nat) (hr : 2 < nR) (hrd : 6 < nRd)
@@ -1445,10 +1460,11 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
     (hdone : ∀ t ∈ done, t.halted = true) (saved : List MemAccessLog)
     (hn : cta.paramMem.lookupParam? "param_n" = some (BitVec.ofNat 64 len))
     (hout : cta.paramMem.lookupParam? "param_out" = some (BitVec.ofNat 64 (nIn * len * 8)))
+    (hcert : launchCertCovers (some cert) gidVar lenVar = true)
     (hmem : factMember facts (.idxLt gidVar lenVar) = true) :
-    runCTAWithGlobalLog (f + 11) (gidSetupWithFacts doneLbl facts gidVar lenVar ++ suf)
+    runCTAWithGlobalLog (f + 11) (gidSetupWithFacts doneLbl facts gidVar lenVar (some cert) ++ suf)
       { cta with threads := done ++ (laneAt localBytes tx 0 rf false :: todo) } saved =
-    runCTAWithGlobalLog f (gidSetupWithFacts doneLbl facts gidVar lenVar ++ suf)
+    runCTAWithGlobalLog f (gidSetupWithFacts doneLbl facts gidVar lenVar (some cert) ++ suf)
       { cta with threads := done ++
         (laneAt localBytes tx 11
           (rfSet (rfSet (rfSet (rf7 blockSize ctaId rf tx len)
@@ -1456,7 +1472,7 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
             "%rd5" (BitVec.ofNat 64 ((ctaId.x * blockSize + tx) * 8)))
             "%rd6" (BitVec.ofNat 64 (nIn * len * 8 + (ctaId.x * blockSize + tx) * 8)))
           false :: todo) } saved := by
-  let stmts := gidSetupWithFacts doneLbl facts gidVar lenVar ++ suf
+  let stmts := gidSetupWithFacts doneLbl facts gidVar lenVar (some cert) ++ suf
   let gid := ctaId.x * blockSize + tx
   have htx32 : tx < 2 ^ 32 := Nat.lt_trans htx hblkX
   have hgid64 := laneOf1D_lt ctaId.x blockSize tx hctaX hblkX htx32
@@ -1488,7 +1504,7 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
     runCTAWithGlobalLog (f + 10) stmts
       { cta with threads := done ++ (laneAt localBytes tx 1 r1 false :: todo) } saved := by
     apply pure_lane_step (f + 10) stmts cta done todo localBytes tx 0 rf r1
-      (.mov .u32 "%r0" (.sreg .ctaidX)) saved hdone (by simp [stmts, gidSetupWithFacts, hmem, ins])
+      (.mov .u32 "%r0" (.sreg .ctaidX)) saved hdone (by simp [stmts, gidSetupWithFacts, hcert, hmem, ins])
       (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
     have hex := exec_mov_sreg_r stmts
       { cta with threads := done ++ (laneAt localBytes tx 0 rf false :: todo) }
@@ -1500,7 +1516,7 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
     runCTAWithGlobalLog (f + 9) stmts
       { cta with threads := done ++ (laneAt localBytes tx 2 r2 false :: todo) } saved := by
     apply pure_lane_step (f + 9) stmts cta done todo localBytes tx 1 r1 r2
-      (.mov .u32 "%r1" (.sreg .ntidX)) saved hdone (by simp [stmts, gidSetupWithFacts, hmem, ins])
+      (.mov .u32 "%r1" (.sreg .ntidX)) saved hdone (by simp [stmts, gidSetupWithFacts, hcert, hmem, ins])
       (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
     have hex := exec_mov_sreg_r stmts
       { cta with threads := done ++ (laneAt localBytes tx 1 r1 false :: todo) }
@@ -1512,7 +1528,7 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
     runCTAWithGlobalLog (f + 8) stmts
       { cta with threads := done ++ (laneAt localBytes tx 3 r3 false :: todo) } saved := by
     apply pure_lane_step (f + 8) stmts cta done todo localBytes tx 2 r2 r3
-      (.mov .u32 "%r2" (.sreg .tidX)) saved hdone (by simp [stmts, gidSetupWithFacts, hmem, ins])
+      (.mov .u32 "%r2" (.sreg .tidX)) saved hdone (by simp [stmts, gidSetupWithFacts, hcert, hmem, ins])
       (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
     have hex := exec_mov_sreg_r stmts
       { cta with threads := done ++ (laneAt localBytes tx 2 r2 false :: todo) }
@@ -1525,7 +1541,7 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
       { cta with threads := done ++ (laneAt localBytes tx 4 r4 false :: todo) } saved := by
     apply pure_lane_step (f + 7) stmts cta done todo localBytes tx 3 r3 r4
       (.mul .wide .u32 "%rd0" (.reg "%r0") (.reg "%r1")) saved hdone
-      (by simp [stmts, gidSetupWithFacts, hmem, ins])
+      (by simp [stmts, gidSetupWithFacts, hcert, hmem, ins])
       (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
     have hlk0 : r3.regs.lookup "%r0" = some (.scalar (BitVec.ofNat 64 ctaId.x)) := by
       dsimp only [r3, r2, r1]
@@ -1550,7 +1566,7 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
       { cta with threads := done ++ (laneAt localBytes tx 5 r5 false :: todo) } saved := by
     apply pure_lane_step (f + 6) stmts cta done todo localBytes tx 4 r4 r5
       (.cvt .none .u64 .u32 "%rd1" (.reg "%r2")) saved hdone
-      (by simp [stmts, gidSetupWithFacts, hmem, ins])
+      (by simp [stmts, gidSetupWithFacts, hcert, hmem, ins])
       (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
     have hlk2 : r4.regs.lookup "%r2" = some (.scalar (BitVec.ofNat 64 tx)) := by
       dsimp only [r4, r3]; rw [lookup_rfSet_ne _ "%rd0" "%r2" _ (by decide), lookup_rfSet_self]
@@ -1564,7 +1580,7 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
       { cta with threads := done ++ (laneAt localBytes tx 6 r6 false :: todo) } saved := by
     apply pure_lane_step (f + 5) stmts cta done todo localBytes tx 5 r5 r6
       (.add .none .u64 "%rd2" (.reg "%rd0") (.reg "%rd1")) saved hdone
-      (by simp [stmts, gidSetupWithFacts, hmem, ins])
+      (by simp [stmts, gidSetupWithFacts, hcert, hmem, ins])
       (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
     have hlk0 : r5.regs.lookup "%rd0" = some (.scalar (BitVec.ofNat 64 (ctaId.x * blockSize))) := by
       dsimp only [r5, r4]; rw [lookup_rfSet_ne _ "%rd1" "%rd0" _ (by decide), lookup_rfSet_self]
@@ -1581,7 +1597,7 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
       { cta with threads := done ++ (laneAt localBytes tx 7 r7 false :: todo) } saved := by
     apply pure_lane_step (f + 4) stmts cta done todo localBytes tx 6 r6 r7
       (.ldParam .u64 "%rd3" "param_n") saved hdone
-      (by simp [stmts, gidSetupWithFacts, hmem, ins])
+      (by simp [stmts, gidSetupWithFacts, hcert, hmem, ins])
       (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
     exact exec_ldParam_rd stmts
       { cta with threads := done ++ (laneAt localBytes tx 6 r6 false :: todo) }
@@ -1592,7 +1608,7 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
       { cta with threads := done ++ (laneAt localBytes tx 8 r8 false :: todo) } saved := by
     apply pure_lane_step (f + 3) stmts cta done todo localBytes tx 7 r7 r8
       (.ldParam .u64 "%rd4" "param_out") saved hdone
-      (by simp [stmts, gidSetupWithFacts, hmem, ins])
+      (by simp [stmts, gidSetupWithFacts, hcert, hmem, ins])
       (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
     exact exec_ldParam_rd stmts
       { cta with threads := done ++ (laneAt localBytes tx 7 r7 false :: todo) }
@@ -1604,7 +1620,7 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
       { cta with threads := done ++ (laneAt localBytes tx 9 r9 false :: todo) } saved := by
     apply pure_lane_step (f + 2) stmts cta done todo localBytes tx 8 r8 r9
       (.cvtaToGlobal .u64 "%rd4" (.reg "%rd4")) saved hdone
-      (by simp [stmts, gidSetupWithFacts, hmem, ins])
+      (by simp [stmts, gidSetupWithFacts, hcert, hmem, ins])
       (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
     exact exec_cvta_rd stmts
       { cta with threads := done ++ (laneAt localBytes tx 8 r8 false :: todo) }
@@ -1616,7 +1632,7 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
       { cta with threads := done ++ (laneAt localBytes tx 10 r10 false :: todo) } saved := by
     apply pure_lane_step (f + 1) stmts cta done todo localBytes tx 9 r9 r10
       (.shl .b64 "%rd5" (.reg "%rd2") (i64 3)) saved hdone
-      (by simp [stmts, gidSetupWithFacts, hmem, ins])
+      (by simp [stmts, gidSetupWithFacts, hcert, hmem, ins])
       (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
     have hlk2 : r9.regs.lookup "%rd2" = some (.scalar (BitVec.ofNat 64 gid)) := by
       dsimp only [r9, r8, r7, rf7]
@@ -1655,7 +1671,7 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
     apply pure_lane_step f stmts cta done todo localBytes tx 10 r10
       (rfSet r10 "%rd6" (BitVec.ofNat 64 (nIn * len * 8 + gid * 8)))
       (.add .none .u64 "%rd6" (.reg "%rd4") (.reg "%rd5")) saved hdone
-      (by simp [stmts, gidSetupWithFacts, hmem, ins])
+      (by simp [stmts, gidSetupWithFacts, hcert, hmem, ins])
       (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
     have hlk4 : r10.regs.lookup "%rd4" = some (.scalar (BitVec.ofNat 64 (nIn * len * 8))) := by
       dsimp only [r10, r9]; rw [lookup_rfSet_ne _ "%rd5" "%rd4" _ (by decide), lookup_rfSet_self]
@@ -1679,20 +1695,24 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
   rw [hf11, hs0, hf10, hs1, hf9, hs2, hf8, hs3, hf7, hs4, hf6, hs5, hf5, hs6,
       hf4, hs7, hf3, hs8, hf2, hs9, hs10]
 
--- Metal: a retained fact emits the inner body with no guard.
+-- Metal: an explicit `LaunchBoundsCert` plus retained `idxLt` emits the inner body with no guard.
 
-private theorem metal_body (facts : FactEnv) (idxVar lenVar : VarId) (inner : List MSLStmt)
+private theorem metal_body (facts : FactEnv) (idxVar lenVar : VarId) (cert : LaunchBoundsCert)
+    (inner : List MSLStmt)
+    (hcert : launchCertCovers (some cert) idxVar lenVar = true)
     (h : factMember facts (.idxLt idxVar lenVar) = true) :
-    guardedWithFacts inner facts idxVar lenVar = inner ++ [.returnStmt] := by
-  simp [guardedWithFacts, h]
+    guardedWithFacts inner facts idxVar lenVar (some cert) = inner ++ [.returnStmt] := by
+  simp [guardedWithFacts, hcert, h]
 
 theorem metalBoundsFreeLoad_sound (nIn len groupSize gx stepsInner : Nat)
     (inWords : Nat → List (BitVec 64)) (specWord : Nat → BitVec 64)
-    (inner : List MSLStmt) (facts : FactEnv) (idxVar lenVar : VarId)
+    (inner : List MSLStmt) (facts : FactEnv) (idxVar lenVar : VarId) (cert : LaunchBoundsCert)
     (hInner : LaneInnerSpec nIn len stepsInner inWords specWord inner)
-    (hlen64 : len * 8 ≤ 2 ^ 64) (hmem : factMember facts (.idxLt idxVar lenVar) = true)
+    (hlen64 : len * 8 ≤ 2 ^ 64)
+    (hcert : launchCertCovers (some cert) idxVar lenVar = true)
+    (hmem : factMember facts (.idxLt idxVar lenVar) = true)
     (hcov : (gx + 1) * groupSize ≤ len) :
-    let body := guardedWithFacts inner facts idxVar lenVar
+    let body := guardedWithFacts inner facts idxVar lenVar (some cert)
     let mkLane := fun tx => ({
       tid := { x := tx, y := 0, z := 0 }
       locals := initBuiltinLocal MSLLocals.empty "gid" .uint (gx * groupSize + tx, 0, 0)
@@ -1731,7 +1751,7 @@ theorem metalBoundsFreeLoad_sound (nIn len groupSize gx stepsInner : Nat)
         (∀ a ∈ gFinal.epochLog.filter isDeviceAccess,
           SimtLogInv nIn (min len (gx * groupSize)) (min len ((gx + 1) * groupSize)) a) := by
   intro body mkLane
-  have hbody : body = inner ++ [.returnStmt] := metal_body facts idxVar lenVar inner hmem
+  have hbody : body = inner ++ [.returnStmt] := metal_body facts idxVar lenVar cert inner hcert hmem
   intro rem
   induction rem with
   | zero =>

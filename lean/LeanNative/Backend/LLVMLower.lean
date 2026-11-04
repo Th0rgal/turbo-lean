@@ -450,22 +450,97 @@ def attachLoadStoreAlign (facts : FactEnv) (ptrVar : VarId) (ins : LLVMInstr) : 
     else ins
   | other => other
 
+def instrDstReg? : LLVMInstr → Option RegName
+  | .alloca dst _ _ | .load dst _ _ _ _ _
+  | .add dst _ _ _ _ | .sub dst _ _ _ _ | .mul dst _ _ _ _
+  | .udiv dst _ _ _ _ | .sdiv dst _ _ _ _ | .urem dst _ _ _ | .srem dst _ _ _
+  | .and_ dst _ _ _ | .or_ dst _ _ _ | .xor dst _ _ _
+  | .shl dst _ _ _ _ | .lshr dst _ _ _ _ | .ashr dst _ _ _ _
+  | .icmp dst _ _ _ _
+  | .fadd dst _ _ _ | .fsub dst _ _ _ | .fmul dst _ _ _ | .fdiv dst _ _ _
+  | .fcmp dst _ _ _ _
+  | .zext dst _ _ _ | .sext dst _ _ _ | .trunc dst _ _ _
+  | .bitcast dst _ _ _ | .inttoptr dst _ _ _ | .ptrtoint dst _ _ _
+  | .getelementptr dst _ _ _ _ _ | .select dst _ _ _ _
+  | .atomicrmw dst _ _ _ _ _ _ _
+  | .insertelement dst _ _ _ _ _ _ | .extractelement dst _ _ _ _ _
+  | .shufflevector dst _ _ _ _ _ _
+  | .insertvalue dst _ _ _ _ _ | .extractvalue dst _ _ _ => some dst
+  | .call dst? _ _ _ _ => dst?
+  | .store _ _ _ _ _ _ => none
+
+def factVarIds : RetainedFact → List VarId
+  | .idxLt i n => [i, n]
+  | .noOverflowAdd a b _ _ | .noOverflowSub a b _ _ | .noOverflowMul a b _ _ => [a, b]
+  | .alignedPtr p _ => [p]
+  | .disjointSlices a b la lb => [a, b, la, lb]
+  | .exclusiveObj o => [o]
+
+def killRegFacts (facts : FactEnv) (r : RegName) : FactEnv :=
+  facts.filter fun f => !(factVarIds f).any (fun v => llvmRegOf v == r)
+
+def termTargets : Terminator → List BlockLabel
+  | .br lbl => [lbl]
+  | .condBr _ tLbl eLbl => [tLbl, eLbl]
+  | .switch _ _ defLbl cases => defLbl :: cases.map Prod.snd
+  | .ret _ | .unreachable => []
+
+def fnDefinesReg (fn : LLVMFn) (r : RegName) : Bool :=
+  fn.blocks.any fun blk =>
+    blk.phis.any (fun p => p.dst == r) ||
+    blk.body.any (fun ins => instrDstReg? ins == some r)
+
+def immutableParamFacts (fn : LLVMFn) (facts : FactEnv) : FactEnv :=
+  facts.filter fun f =>
+    (factVarIds f).all fun v =>
+      let r := llvmRegOf v
+      fn.params.any (·.name == r) && !fnDefinesReg fn r
+
+def entryIsStraight (fn : LLVMFn) : Bool :=
+  match fn.blocks with
+  | [] => false
+  | blk :: _ =>
+    blk.phis.isEmpty && fn.blocks.all fun b => !(termTargets b.term).contains blk.label
+
 def emitVerifiedLLVMWithFacts (facts : FactEnv) (a b : VarId)
     (insns : List LLVMInstr) (ptrVar : VarId := 0) : List LLVMInstr :=
   match insns with
   | [] => []
   | ins :: rest =>
-    attachLoadStoreAlign facts ptrVar (attachOverflow facts ins) ::
-      emitVerifiedLLVMWithFacts facts a b rest ptrVar
+    let ins' := attachLoadStoreAlign facts ptrVar (attachOverflow facts ins)
+    let facts' := match instrDstReg? ins with
+      | some dst => killRegFacts facts dst
+      | none => facts
+    ins' :: emitVerifiedLLVMWithFacts facts' a b rest ptrVar
+
+def emitBlockBodyWithFacts (facts : FactEnv) (insns : List LLVMInstr) : List LLVMInstr :=
+  match insns with
+  | [] => []
+  | ins :: rest =>
+    let ins1 := attachOverflow facts ins
+    let ins' := facts.foldl (fun acc f =>
+      match f with
+      | .alignedPtr ptrVar _ => attachLoadStoreAlign facts ptrVar acc
+      | _ => acc) ins1
+    let facts' := match instrDstReg? ins with
+      | some dst => killRegFacts facts dst
+      | none => facts
+    ins' :: emitBlockBodyWithFacts facts' rest
 
 def withNoAlias (disjoint : Bool) (p : LLVMParam) : LLVMParam :=
   if !disjoint then p
   else if p.attrs.contains .noalias then p
   else { p with attrs := .noalias :: p.attrs }
 
+def isCertifiedPtrParam (ptrA ptrB : VarId) (p : LLVMParam) : Bool :=
+  match p.ty with
+  | .ptr _ => p.name == llvmRegOf ptrA || p.name == llvmRegOf ptrB
+  | _ => true
+
 def noaliasParams (facts : FactEnv) (ptrA ptrB lenA lenB : VarId)
     (ps : List LLVMParam) : List LLVMParam :=
-  if !factMember facts (.disjointSlices ptrA ptrB lenA lenB) then ps
+  let allPtrCertified := ps.all (isCertifiedPtrParam ptrA ptrB)
+  if !(ptrA != ptrB && factMember facts (.disjointSlices ptrA ptrB lenA lenB) && allPtrCertified) then ps
   else ps.map fun p =>
     match p.ty with
     | .ptr _ =>
@@ -474,27 +549,30 @@ def noaliasParams (facts : FactEnv) (ptrA ptrB lenA lenB : VarId)
 
 def emitVerifiedLLVMFnWithFacts (facts : FactEnv) (ptrA ptrB lenA lenB : VarId)
     (a b : VarId) (fn : LLVMFn) (ptrVar : VarId := 0) : LLVMFn :=
+  let entryFacts := if entryIsStraight fn then facts else immutableParamFacts fn facts
+  let tailFacts := immutableParamFacts fn facts
+  let blocks' := match fn.blocks with
+    | [] => []
+    | blk :: rest =>
+      { blk with body := emitVerifiedLLVMWithFacts entryFacts a b blk.body ptrVar } ::
+        rest.map fun blk' => { blk' with body := emitVerifiedLLVMWithFacts tailFacts a b blk'.body ptrVar }
   { fn with
     params := noaliasParams facts ptrA ptrB lenA lenB fn.params
-    blocks := fn.blocks.map fun blk =>
-      { blk with body := emitVerifiedLLVMWithFacts facts a b blk.body ptrVar } }
+    blocks := blocks' }
 
 def applyRetainedFactsLLVMFn (facts : FactEnv) (fn : LLVMFn) : LLVMFn :=
   if facts.isEmpty then fn
   else
-    let params' := facts.foldl (fun ps f =>
-      match f with
-      | .disjointSlices ptrA ptrB lenA lenB => noaliasParams facts ptrA ptrB lenA lenB ps
-      | _ => ps) fn.params
-    let stepInstr (ins : LLVMInstr) : LLVMInstr :=
-      let ins1 := attachOverflow facts ins
-      facts.foldl (fun acc f =>
-        match f with
-        | .alignedPtr ptrVar _ => attachLoadStoreAlign facts ptrVar acc
-        | _ => acc) ins1
-    { fn with
-      params := params'
-      blocks := fn.blocks.map fun blk => { blk with body := blk.body.map stepInstr } }
+    let paramFacts := facts.filter fun f =>
+      (factVarIds f).all fun v => fn.params.any (·.name == llvmRegOf v)
+    let entryFacts := if entryIsStraight fn then paramFacts else immutableParamFacts fn facts
+    let tailFacts := immutableParamFacts fn facts
+    let blocks' := match fn.blocks with
+      | [] => []
+      | blk :: rest =>
+        { blk with body := emitBlockBodyWithFacts entryFacts blk.body } ::
+          rest.map fun b => { b with body := emitBlockBodyWithFacts tailFacts b.body }
+    { fn with blocks := blocks' }
 
 def lowerDeclWithFacts (d : LNIRDecl) : Option LLVMFn :=
   (lowerDecl d).map (applyRetainedFactsLLVMFn d.retainedFacts)

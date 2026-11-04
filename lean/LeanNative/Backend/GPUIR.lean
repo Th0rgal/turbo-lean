@@ -39,6 +39,20 @@ structure GPUKernelDescriptor where
   bufferCount    : Nat
   deriving Repr, DecidableEq, Inhabited, BEq
 
+/-- Explicit host launch-geometry witness certifying that every launched SIMT lane satisfies
+`gridDim.x * blockDim.x ≤ len` for kernel lane index `gidVar` and bound `lenVar`.
+Top-level `LNIRDecl` emitters round grids up to `blockThreads = 256` and never construct a
+`LaunchBoundsCert` from declaration scalar parameters. -/
+structure LaunchBoundsCert where
+  gidVar : VarId
+  lenVar : VarId
+  deriving Repr, DecidableEq, Inhabited, BEq
+
+def launchCertCovers (launch? : Option LaunchBoundsCert) (gidVar lenVar : VarId) : Bool :=
+  match launch? with
+  | some cert => cert.gidVar == gidVar && cert.lenVar == lenVar
+  | none => false
+
 /-- Check whether an `LNIRType` is supported for GPU kernel parameters, locals, or buffers. -/
 def isTypeGpuSupported (ty : LNIRType) : Bool :=
   ty.isGpuCompatible

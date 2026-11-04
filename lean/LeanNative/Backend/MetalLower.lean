@@ -1,4 +1,5 @@
 import LeanNative.IR.AST
+import LeanNative.Backend.GPUIR
 import LeanNative.Backend.MetalAst
 
 /-!
@@ -13,6 +14,7 @@ result (`0` / dividend) through short-circuit `?:` so the evaluator never traps.
 namespace LeanNative.Backend.MetalLower
 
 open LeanNative.IR
+open LeanNative.Backend.GPUIR
 open LeanNative.Backend.MetalAst
 
 def u (n : Nat) : MSLExpr := .immU64 (BitVec.ofNat 64 n)
@@ -71,12 +73,13 @@ def guarded (inner : List MSLStmt) : List MSLStmt :=
   [ .ifElse (.lt (.cast .ulong (.var "gid")) (.var "n")) (MSLBlock.ofList inner) .nil
   , .returnStmt ]
 
-/-- `facts = []` is `guarded`. A retained `idxLt gidVar lenVar` drops the `gid < n` test
-when `gidVar` is the kernel index; the launch contract is then `grid.x * block.x ≤ n`.
-A decl scalar param is never `gidVar`. -/
+/-- `guarded` unless `launch?` explicitly certifies `gridDim.x * blockDim.x ≤ n` for
+`(gidVar, lenVar)` and `idxLt gidVar lenVar` is retained in `facts`. -/
 def guardedWithFacts (inner : List MSLStmt) (facts : List RetainedFact)
-    (gidVar lenVar : VarId) : List MSLStmt :=
-  if !factMember facts (.idxLt gidVar lenVar) then guarded inner else inner ++ [.returnStmt]
+    (gidVar lenVar : VarId) (launch? : Option LaunchBoundsCert := none) : List MSLStmt :=
+  if !(launchCertCovers launch? gidVar lenVar && factMember facts (.idxLt gidVar lenVar)) then
+    guarded inner
+  else inner ++ [.returnStmt]
 
 def elem (name : String) : MSLExpr := .index name (.var "gid")
 
@@ -89,8 +92,10 @@ def kernelOf (name : String) (nIn : Nat) (compute : MSLExpr) : MSLKernelDecl whe
   body := guarded [storeOut compute]
 
 def kernelOfWithFacts (name : String) (nIn : Nat) (compute : MSLExpr)
-    (facts : List RetainedFact) (idxVar lenVar : VarId) : MSLKernelDecl :=
-  { kernelOf name nIn compute with body := guardedWithFacts [storeOut compute] facts idxVar lenVar }
+    (facts : List RetainedFact) (idxVar lenVar : VarId)
+    (launch? : Option LaunchBoundsCert := none) : MSLKernelDecl :=
+  { kernelOf name nIn compute with
+    body := guardedWithFacts [storeOut compute] facts idxVar lenVar launch? }
 
 def lowerKind (name : String) : ParallelKernelKind → MSLKernelDecl
   | .mapScaleAdd scale bias =>
@@ -128,23 +133,25 @@ def lowerKind (name : String) : ParallelKernelKind → MSLKernelDecl
 def lowerToMetal (name : String) (k : ParallelKernelKind) : MSLModule where
   kernels := [lowerKind name k]
 
-/-- Fact-carrying twin of `lowerKind`. Empty facts reproduce `lowerKind` exactly.
-`idxVar` must be the kernel index; a decl scalar param never drops the guard. -/
+/-- Fact-carrying twin of `lowerKind`: SIMT `gid < n` elision requires both an explicit
+`LaunchBoundsCert` certifying `gridDim.x * blockDim.x ≤ n` and a retained `idxLt`. -/
 def lowerKindWithFacts (name : String) (facts : List RetainedFact)
-    (k : ParallelKernelKind) (idxVar lenVar : VarId) : MSLKernelDecl :=
+    (k : ParallelKernelKind) (idxVar lenVar : VarId)
+    (launch? : Option LaunchBoundsCert := none) : MSLKernelDecl :=
   match k with
   | .mapScaleAdd scale bias =>
     kernelOfWithFacts name 1
-      (.add (.mul (elem "in0") (.immU64 scale.toBitVec)) (.immU64 bias.toBitVec)) facts idxVar lenVar
-  | .zipAdd => kernelOfWithFacts name 2 (.add (elem "in0") (elem "in1")) facts idxVar lenVar
-  | .zipMul => kernelOfWithFacts name 2 (.mul (elem "in0") (elem "in1")) facts idxVar lenVar
+      (.add (.mul (elem "in0") (.immU64 scale.toBitVec)) (.immU64 bias.toBitVec))
+      facts idxVar lenVar launch?
+  | .zipAdd => kernelOfWithFacts name 2 (.add (elem "in0") (elem "in1")) facts idxVar lenVar launch?
+  | .zipMul => kernelOfWithFacts name 2 (.mul (elem "in0") (elem "in1")) facts idxVar lenVar launch?
   | .dotProduct => lowerKind name .dotProduct
   | .saxpy alpha =>
     kernelOfWithFacts name 2 (.add (.mul (.immU64 alpha.toBitVec) (elem "in0")) (elem "in1"))
-      facts idxVar lenVar
+      facts idxVar lenVar launch?
   | .stencil1D3Pt wL wC wR =>
     let base := lowerKind name (.stencil1D3Pt wL wC wR)
-    if !factMember facts (.idxLt idxVar lenVar) then base
+    if !(launchCertCovers launch? idxVar lenVar && factMember facts (.idxLt idxVar lenVar)) then base
     else
       let i := .cast .ulong (.var "gid")
       let edge := .logOr (.eq i (u 0)) (.ge (.add i (u 1)) (.var "n"))
@@ -154,21 +161,22 @@ def lowerKindWithFacts (name : String) (facts : List RetainedFact)
         (.mul (.immU64 wC.toBitVec) center))
         (.mul (.immU64 wR.toBitVec) (.index "in0" (.add i (u 1))))
       let inner := [.ifElse edge (.cons (storeOut center) .nil) (.cons (storeOut interior) .nil)]
-      { base with body := guardedWithFacts inner facts idxVar lenVar }
+      { base with body := guardedWithFacts inner facts idxVar lenVar launch? }
   | .customScalar iv inVars body =>
     let base := lowerKind name (.customScalar iv inVars body)
-    if !factMember facts (.idxLt iv lenVar) then base
+    if !(launchCertCovers launch? iv lenVar && factMember facts (.idxLt iv lenVar)) then base
     else
       let loads := (List.range inVars.length).map fun k =>
         let id := inVars[k]?.getD 0
         .varDecl .ulong s!"v{id}" (elem s!"in{k}")
       let rhs := lowerScalar "gid64" iv body
       let inner := [.varDecl .ulong "gid64" (.cast .ulong (.var "gid"))] ++ loads ++ [storeOut rhs]
-      { base with body := guardedWithFacts inner facts iv lenVar }
+      { base with body := guardedWithFacts inner facts iv lenVar launch? }
 
 def lowerToMetalWithFacts (name : String) (facts : List RetainedFact)
-    (k : ParallelKernelKind) (idxVar lenVar : VarId) : MSLModule where
-  kernels := [lowerKindWithFacts name facts k idxVar lenVar]
+    (k : ParallelKernelKind) (idxVar lenVar : VarId)
+    (launch? : Option LaunchBoundsCert := none) : MSLModule where
+  kernels := [lowerKindWithFacts name facts k idxVar lenVar launch?]
 
 def ppLowered (name : String) (k : ParallelKernelKind) : String :=
   ppMSLModule (lowerToMetal name k)
@@ -181,10 +189,10 @@ def lowerSaxpyNamed (name : String) (alpha : UInt64) : MSLKernelDecl where
   body := guarded [storeOut (.add (.mul (.immU64 alpha.toBitVec) (elem "x")) (elem "y"))]
 
 def lowerSaxpyNamedWithFacts (name : String) (alpha : UInt64) (facts : List RetainedFact)
-    (idxVar lenVar : VarId) : MSLKernelDecl :=
+    (idxVar lenVar : VarId) (launch? : Option LaunchBoundsCert := none) : MSLKernelDecl :=
   { lowerSaxpyNamed name alpha with
     body := guardedWithFacts [storeOut (.add (.mul (.immU64 alpha.toBitVec) (elem "x")) (elem "y"))]
-      facts idxVar lenVar }
+      facts idxVar lenVar launch? }
 
 def inferBinOpU64 : BinOp → Option Bool
   | .add => some false | .sub => some false | .mul => some false
@@ -282,15 +290,10 @@ def lowerDeclToMetal (d : LNIRDecl) : Option MSLModule :=
     | none => none
   else none
 
+/-- Top-level `LNIRDecl` entry kernels use rounded-up grid launches (`blockThreads = 256`) and
+therefore never synthesize a `LaunchBoundsCert` from `d.params`; the SIMT `gid < n` guard stays. -/
 def lowerDeclToMetalWithFacts (d : LNIRDecl) : Option MSLModule :=
-  if isSarrayI64 d.retTy then
-    match extractDeclParFor d.body with
-    | some (_, _, inputs, k) =>
-      if wfMetalKernel k && inputs.length == kernelArity k then
-        some (lowerToMetal s!"lean_native_metal_decl_{d.name}" k)
-      else none
-    | none => none
-  else none
+  lowerDeclToMetal d
 
 def mkDeviceBuffers (inBufs : List (Nat × ByteMemory)) (nIn len : Nat) :
     List (Nat × ByteMemory) :=

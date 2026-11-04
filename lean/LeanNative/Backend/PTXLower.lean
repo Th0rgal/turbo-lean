@@ -1,4 +1,5 @@
 import LeanNative.IR.AST
+import LeanNative.Backend.GPUIR
 import LeanNative.Backend.PTXAst
 
 /-!
@@ -14,6 +15,7 @@ shifts, and `clz256` follow `LeanNative.Semantics.evalBinOp` / `evalUnaryOp`.
 namespace LeanNative.Backend.PTXLower
 
 open LeanNative.IR
+open LeanNative.Backend.GPUIR
 open LeanNative.Backend.PTXAst
 
 inductive PReg where
@@ -202,12 +204,13 @@ def gidSetup (doneLbl : String) : List PTXStmt :=
   , ins (.shl .b64 "%rd5" (.reg "%rd2") (i64 3))
   , ins (.add .none .u64 "%rd6" (.reg "%rd4") (.reg "%rd5")) ]
 
-/-- Same preamble as `gidSetup`, but the `setp.ge` / `bra` guard is omitted when
-`gidVar` is the kernel index and a retained `idxLt gidVar lenVar` covers every launched lane
-(`grid.x * block.x ≤ n`). A decl scalar param is never `gidVar`. -/
+/-- Same preamble as `gidSetup`, except the SIMT `setp.ge` / `bra` lane guard is omitted
+only when `launch?` explicitly certifies `gridDim.x * blockDim.x ≤ n` for `(gidVar, lenVar)`
+and `idxLt gidVar lenVar` is retained in `facts`. -/
 def gidSetupWithFacts (doneLbl : String) (facts : List RetainedFact)
-    (gidVar lenVar : VarId) : List PTXStmt :=
-  if !factMember facts (.idxLt gidVar lenVar) then gidSetup doneLbl
+    (gidVar lenVar : VarId) (launch? : Option LaunchBoundsCert := none) : List PTXStmt :=
+  if !(launchCertCovers launch? gidVar lenVar && factMember facts (.idxLt gidVar lenVar)) then
+    gidSetup doneLbl
   else
     [ ins (.mov .u32 "%r0" (.sreg .ctaidX))
     , ins (.mov .u32 "%r1" (.sreg .ntidX))
@@ -302,22 +305,24 @@ def lowerKind (name : String) : ParallelKernelKind → PTXKernel
 def lowerToPTX (name : String) (k : ParallelKernelKind) : PTXModule where
   kernels := [lowerKind name k]
 
-/-- Fact-carrying twin of `lowerKind`: a retained `idxLt idxVar lenVar` drops the lane guard
-only when `idxVar` is the kernel's own index, never a decl scalar param. -/
+/-- Fact-carrying twin of `lowerKind`: SIMT lane-guard elision requires both an explicit
+`LaunchBoundsCert` certifying `gridDim.x * blockDim.x ≤ n` and a retained `idxLt effIdx lenVar`. -/
 def lowerKindWithFacts (name : String) (facts : List RetainedFact)
-    (k : ParallelKernelKind) (idxVar lenVar : VarId) : PTXKernel :=
+    (k : ParallelKernelKind) (idxVar lenVar : VarId)
+    (launch? : Option LaunchBoundsCert := none) : PTXKernel :=
   match k with
   | .dotProduct => lowerKind name .dotProduct
   | _ =>
     let base := lowerKind name k
     let effIdx := match k with | .customScalar iv _ _ => iv | _ => idxVar
-    if !factMember facts (.idxLt effIdx lenVar) then base
-    else { base with body := gidSetupWithFacts s!"$L_done_{name}" facts effIdx lenVar ++
+    if !(launchCertCovers launch? effIdx lenVar && factMember facts (.idxLt effIdx lenVar)) then base
+    else { base with body := gidSetupWithFacts s!"$L_done_{name}" facts effIdx lenVar launch? ++
         (base.body.drop (gidSetup s!"$L_done_{name}").length) }
 
 def lowerToPTXWithFacts (name : String) (facts : List RetainedFact)
-    (k : ParallelKernelKind) (idxVar lenVar : VarId) : PTXModule where
-  kernels := [lowerKindWithFacts name facts k idxVar lenVar]
+    (k : ParallelKernelKind) (idxVar lenVar : VarId)
+    (launch? : Option LaunchBoundsCert := none) : PTXModule where
+  kernels := [lowerKindWithFacts name facts k idxVar lenVar launch?]
 
 def ppLowered (name : String) (k : ParallelKernelKind) : String :=
   ppPTXModule (lowerToPTX name k)
@@ -418,15 +423,10 @@ def lowerDeclToPTX (d : LNIRDecl) : Option PTXModule :=
     | none => none
   else none
 
+/-- Top-level `LNIRDecl` entry kernels use rounded-up grid launches (`blockThreads = 256`) and
+therefore never synthesize a `LaunchBoundsCert` from `d.params`; the SIMT lane guard is retained. -/
 def lowerDeclToPTXWithFacts (d : LNIRDecl) : Option PTXModule :=
-  if isSarrayI64 d.retTy then
-    match extractDeclParFor d.body with
-    | some (_, _, inputs, k) =>
-      if wfPTXKernel k && inputs.length == kernelArity k then
-        some (lowerToPTX s!"lean_native_decl_{d.name}" k)
-      else none
-    | none => none
-  else none
+  lowerDeclToPTX d
 
 def concatPTXMems : List ByteMemory → ByteMemory
   | [] => { bytes := #[] }

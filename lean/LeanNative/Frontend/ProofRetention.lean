@@ -1,6 +1,7 @@
 import Lean.Compiler.LCNF.Basic
 import LeanNative.IR.AST
 import LeanNative.Transform.Pass
+import LeanNative.Backend.GPUIR
 import LeanNative.Backend.LLVMLower
 import LeanNative.Backend.PTXAst.Syntax
 import LeanNative.Backend.MetalAst.Syntax
@@ -15,12 +16,14 @@ and the verified specializations they justify on `LNIRCode`, `LLVMAst`, `PTXAst`
 namespace LeanNative.Frontend.ProofRetention
 
 open LeanNative.IR
+open LeanNative.Backend.GPUIR
 open LeanNative.Backend.TargetIR
 open LeanNative.Backend.LLVMAst
 open LeanNative.Backend.PTXAst
 open LeanNative.Backend.MetalAst
 
 export LeanNative.IR (RetainedFact FactEnv factMember consFact)
+export LeanNative.Backend.GPUIR (LaunchBoundsCert launchCertCovers)
 
 set_option autoImplicit false
 
@@ -762,12 +765,15 @@ def dischargeLocalExclusivity (code : LNIRCode) : LNIRCode :=
 
 export LeanNative.Backend.LLVMLower (
   overflowFlagsOf overflowOf subFlagsOf llvmRegOf mergeFlags attachOverflow
-  alignOfFact attachLoadStoreAlign emitVerifiedLLVMWithFacts
-  withNoAlias noaliasParams emitVerifiedLLVMFnWithFacts applyRetainedFactsLLVMFn
+  alignOfFact attachLoadStoreAlign instrDstReg? factVarIds killRegFacts
+  immutableParamFacts entryIsStraight emitVerifiedLLVMWithFacts emitBlockBodyWithFacts
+  withNoAlias isCertifiedPtrParam noaliasParams emitVerifiedLLVMFnWithFacts applyRetainedFactsLLVMFn
 )
 
-/-- A bounds check stays unless `idxLt` was retained. The unchecked form is sound
-for states in which `idxLt` holds. -/
+/-- Intra-kernel scalar array load bounds-check elimination on PTX: inside a thread body,
+a retained `idxLt idxVar lenVar` directly discharges the scalar `setp.ge %v{idxVar}, %v{lenVar}`
+check before `ld.global`. Distinct from SIMT lane-guard specialization, which additionally
+requires a host `LaunchBoundsCert` certifying `gridDim.x * blockDim.x ≤ len`. -/
 def lowerBoundsFreePTXLoad (facts : FactEnv) (idxVar lenVar : VarId) (ty : PTXType)
     (dst : String) (addr : PTXAddr) : List PTXStmt :=
   if factMember facts (.idxLt idxVar lenVar) then
@@ -778,6 +784,9 @@ def lowerBoundsFreePTXLoad (facts : FactEnv) (idxVar lenVar : VarId) (ty : PTXTy
     , .instr none (.ldGlobal ty dst addr)
     , .label "$L_done" ]
 
+/-- Intra-kernel scalar array load bounds-check elimination on Metal MSL: inside a thread body,
+a retained `idxLt idxVar lenVar` directly discharges `if (v{idxVar} < v{lenVar})` before indexing
+`buf[v{idxVar}]`. Distinct from SIMT lane-guard specialization (`boundsFreeMetalKernel`). -/
 def lowerBoundsFreeMetalLoad (facts : FactEnv) (idxVar lenVar : VarId)
     (buf : String) : List MSLStmt :=
   let idx := MSLExpr.var s!"v{idxVar}"
@@ -789,12 +798,14 @@ def lowerBoundsFreeMetalLoad (facts : FactEnv) (idxVar lenVar : VarId)
 /-- 64-bit byte length of one element. -/
 def elemBytes : Nat := 8
 
-/-- A 1-D SIMT kernel: every launched lane `gid = ctaid.x * ntid.x + tid.x` that
-satisfies `gid < len` loads `buf[gid]` (8 bytes) and stores it. When `idxLt` is
-retained the per-lane guard is dropped; the launch contract is `grid.x * block.x ≤ len`. -/
-def boundsFreePTXKernel (facts : FactEnv) (idxVar lenVar : VarId) : PTXKernel :=
+/-- Launch-geometry-certified 1-D SIMT PTX kernel: every launched lane
+`gid = ctaid.x * ntid.x + tid.x` satisfying `gid < len` loads `buf[gid]` and stores it.
+Dropping the per-lane `setp.ge.u64` / `@%p0 bra` guard requires BOTH an explicit `LaunchBoundsCert`
+certifying `gridDim.x * blockDim.x ≤ len` for `(idxVar, lenVar)` AND a retained `idxLt`. -/
+def boundsFreePTXKernel (facts : FactEnv) (idxVar lenVar : VarId)
+    (launch? : Option LaunchBoundsCert := none) : PTXKernel :=
   let lenReg := s!"%v{lenVar}"
-  let guarded := !factMember facts (.idxLt idxVar lenVar)
+  let guarded := !(launchCertCovers launch? idxVar lenVar && factMember facts (.idxLt idxVar lenVar))
   let gid : List PTXStmt :=
     [ .instr none (.mov .u32 "%r0" (.sreg .ctaidX))
     , .instr none (.mov .u32 "%r1" (.sreg .ntidX))
@@ -832,10 +843,12 @@ def boundsFreePTXKernel (facts : FactEnv) (idxVar lenVar : VarId) : PTXKernel :=
       , { ty := .u64, prefixName := lenReg, count := 0 } ]
   , body := gid ++ guard ++ body }
 
-/-- The Metal twin of `boundsFreePTXKernel`: one thread per `gid`, guarded unless the
-retained `idxLt` covers every launched lane. -/
-def boundsFreeMetalKernel (facts : FactEnv) (idxVar lenVar : VarId) : MSLKernelDecl :=
-  let guarded := !factMember facts (.idxLt idxVar lenVar)
+/-- Launch-geometry-certified Metal twin of `boundsFreePTXKernel`: one thread per `gid`,
+retaining `if ((ulong)gid < len)` unless both an explicit `LaunchBoundsCert` certifying
+`gridDim.x * blockDim.x ≤ len` for `(idxVar, lenVar)` and a retained `idxLt` are present. -/
+def boundsFreeMetalKernel (facts : FactEnv) (idxVar lenVar : VarId)
+    (launch? : Option LaunchBoundsCert := none) : MSLKernelDecl :=
+  let guarded := !(launchCertCovers launch? idxVar lenVar && factMember facts (.idxLt idxVar lenVar))
   let load := MSLStmt.indexAssign "out" (.var "gid") (.index "buf" (.var "gid"))
   let inner := if guarded then
       [.ifElse (.lt (.cast .ulong (.var "gid")) (.var "len")) (.cons load .nil) .nil]

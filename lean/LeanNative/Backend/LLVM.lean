@@ -279,11 +279,6 @@ def retainedAlignForPtr (facts : FactEnv) (ptrVar : VarId) (fallback : Nat := 8)
     | _ :: rest => go rest
   go facts
 
-def retainedParamDisjoint (facts : FactEnv) (paramVar : VarId) : Bool :=
-  facts.any fun
-    | .disjointSlices a b _ _ => a == paramVar || b == paramVar
-    | _ => false
-
 abbrev EmitM := StateM EmitState
 
 def freshTmp (prefixStr : String := "t") : EmitM String := do
@@ -1412,8 +1407,7 @@ def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_
     let pTy := if rawPTy == "void" then "ptr" else rawPTy
     let zAttr := sigLLVMAttr target p.ty
     let attrs :=
-      if pTy == "ptr" && (optimized || retainedParamDisjoint initFacts p.id) then
-        if optimized then " noalias noundef" else " noalias"
+      if optimized && pTy == "ptr" then " noalias noundef"
       else if optimized && (pTy == "i8" || pTy == "i16" || pTy == "i32" || pTy == "i64" || pTy == "i256") then
         " " ++ zAttr ++ "noundef"
       else if zAttr != "" then " zeroext"

@@ -478,11 +478,9 @@ def emitPTXScalarExpr (e : ScalarExpr) (varMap : List (VarId × String))
     ], dst, r3 + 1, p3)
 
 /-- Emit a specialized per-declaration PTX entry point for a `ParallelKernelKind`.
-Top-level entry points keep the SIMT tail-lane guard unless an explicit `gidVar? = some gidVar`
-and `lenVar? = some lenVar` certify `grid.x * block.x ≤ n`; decl scalar params never do. -/
-def emitPTXDeclKernel (fnSymbol : String) (kernel : ParallelKernelKind)
-    (facts : FactEnv := []) (gidVar? : Option VarId := none)
-    (lenVar? : Option VarId := none) : String :=
+Top-level entry points unconditionally retain the SIMT tail-lane guard (`setp.ge.u64` / `@%p bra`)
+because host launches round grids up to `blockThreads = 256` (`gridDim.x * blockDim.x ≥ n`). -/
+def emitPTXDeclKernel (fnSymbol : String) (kernel : ParallelKernelKind) : String :=
   if fnSymbol == "lean_native_decl_dot_product_u64" then
     emitPTXDotReduceKernel fnSymbol
   else if fnSymbol == "lean_native_decl_matmul_tiled_u64" then
@@ -490,11 +488,7 @@ def emitPTXDeclKernel (fnSymbol : String) (kernel : ParallelKernelKind)
   else
   match kernel with
   | .mapScaleAdd _ _ | .zipAdd | .zipMul | .saxpy _ | .stencil1D3Pt _ _ _ =>
-    match gidVar?, lenVar? with
-    | some gidVar, some lenVar =>
-      if !factMember facts (.idxLt gidVar lenVar) then ppPTXKernel (lowerKind fnSymbol kernel)
-      else ppPTXKernel (lowerKindWithFacts fnSymbol facts kernel gidVar lenVar)
-    | _, _ => ppPTXKernel (lowerKind fnSymbol kernel)
+    ppPTXKernel (lowerKind fnSymbol kernel)
   | .dotProduct =>
     emitPTXDotReduceKernel fnSymbol
   | .customScalar iv inVars body =>
@@ -517,12 +511,7 @@ def emitPTXDeclKernel (fnSymbol : String) (kernel : ParallelKernelKind)
     let paramHeader := String.intercalate "\n" (
       ["    .param .u64 param_out,"] ++ inParamDecls ++ ["    .param .u64 param_n"]
     )
-    let guardLines :=
-      match gidVar?, lenVar? with
-      | some gidVar, some lenVar =>
-        if gidVar == iv && factMember facts (.idxLt iv lenVar) then []
-        else [s!"    setp.ge.u64  %p1, %rd5, %rd2;\n    @%p1 bra     $L_done_{fnSymbol};"]
-      | _, _ => [s!"    setp.ge.u64  %p1, %rd5, %rd2;\n    @%p1 bra     $L_done_{fnSymbol};"]
+    let guardLines := [s!"    setp.ge.u64  %p1, %rd5, %rd2;\n    @%p1 bra     $L_done_{fnSymbol};"]
     String.intercalate "\n" ([
       s!".visible .entry {fnSymbol}(\n{paramHeader}\n)\n\{",
       s!"    .reg .pred %p<{maxPred}>;\n    .reg .b32  %r<5>;\n    .reg .b64  %rd<{maxRd}>;",
