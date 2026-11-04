@@ -19,18 +19,6 @@ open LeanNative.Backend.PTXLower
 open LeanNative.Proofs.PTXScalarProofs
 open LeanNative.Proofs.PTXLowerProofs
 
-/-- Effective `VarEnv` after evaluating the optional `let lenVar = sarrayLen arrVar` prologue
-extracted by `PTXLower.extractDeclParFor`. -/
-def declRunEnv (env : VarEnv) (st : HeapState) : Option VarId → VarId → Option VarEnv
-  | none, _ => some env
-  | some arrVar, lenVar =>
-    match env arrVar with
-    | some (.sarrayId bid) =>
-      match st.findBuffer bid with
-      | some buf => some (env.bind lenVar (.u64 buf.data.size.toUInt64))
-      | none => none
-    | _ => none
-
 private theorem evalVarList_of_packInputWordLists (env : VarEnv) (st : HeapState) (len : Nat) :
     ∀ (inputs : List VarId) (ws : List (List (BitVec 64))),
       packInputWordLists env st len inputs = some ws →
@@ -58,22 +46,28 @@ private theorem evalVarList_of_packInputWordLists (env : VarEnv) (st : HeapState
             exact ⟨val :: vs, by simp [evalVarList, hv, hvs]⟩
           }
 
-private def outDataOfKind (k : ParallelKernelKind) (elems : List UInt64) : Array UInt64 :=
-  match k with
-  | .dotProduct => #[elems.foldl (· + ·) 0]
-  | _ => elems.toArray
-
-private theorem not_dotProduct_of_wf {k : ParallelKernelKind} (elems : List UInt64)
+private theorem not_dotProduct_of_wf {k : ParallelKernelKind}
     (hwf : wfPTXKernel k = true) :
-    outDataOfKind k elems = elems.toArray := by
-  cases k <;> first | rfl | (simp [wfPTXKernel] at hwf)
+    k ≠ .dotProduct := by
+  intro hEq
+  subst hEq
+  simp [wfPTXKernel] at hwf
 
 private theorem extractDeclParFor_sound {code : LNIRCode}
     {arrOpt : Option VarId} {lenVar : VarId} {inputs : List VarId} {k : ParallelKernelKind}
     (hex : extractDeclParFor code = some (arrOpt, lenVar, inputs, k))
     (hwf : wfPTXKernel k = true)
     (fuel : Nat) (env env' : VarEnv) (st : HeapState) (n : UInt64)
-    (henv' : declRunEnv env st arrOpt lenVar = some env')
+    (henv' :
+      (match (motive := Option VarId → Option VarEnv) arrOpt with
+       | none => some env
+       | some arrVar =>
+         match env arrVar with
+         | some (.sarrayId bid) =>
+           match st.findBuffer bid with
+           | some buf => some (env.bind lenVar (.u64 buf.data.size.toUInt64))
+           | none => none
+         | _ => none) = some env')
     (hlen : env' lenVar = some (.u64 n))
     (hfuel : n.toNat ≤ fuel)
     (ws : List (List (BitVec 64)))
@@ -86,7 +80,7 @@ private theorem extractDeclParFor_sound {code : LNIRCode}
       outBuf.data = elems.toArray := by
   have hnotFuel : ¬ (n.toNat > fuel) := by omega
   rcases evalVarList_of_packInputWordLists env' st n.toNat inputs ws hpack with ⟨vals, hvals⟩
-  have houtData : outDataOfKind k elems = elems.toArray := not_dotProduct_of_wf elems hwf
+  have hNotDot : k ≠ .dotProduct := not_dotProduct_of_wf hwf
   cases code with
   | parFor outVar lv ins elemTy kern cont =>
     cases elemTy <;> try (unfold extractDeclParFor at hex; cases hex)
@@ -96,7 +90,7 @@ private theorem extractDeclParFor_sound {code : LNIRCode}
     split at hex <;> simp at hex
     rename_i houtEq
     rcases hex with ⟨rfl, rfl, rfl, rfl⟩
-    simp only [declRunEnv, Option.some.injEq] at henv'
+    simp only [Option.some.injEq] at henv'
     subst henv'
     have heqOut : retVar = outVar := (beq_iff_eq.mp houtEq).symm
     subst heqOut
@@ -104,13 +98,11 @@ private theorem extractDeclParFor_sound {code : LNIRCode}
         buffers := { id := st.nextId + 1, exclusive := true, data := elems.toArray } :: st.buffers
         nextId := st.nextId + 1 },
       { id := st.nextId + 1, exclusive := true, data := elems.toArray }, ?_, ?_, rfl⟩
-    · simp only [evalCode, evalParFor, hlen, hnotFuel, ite_false, hvals, hloop]
-      simp only [VarEnv.bind, beq_self_eq_true, ite_true]
-      change Except.ok (Val.sarrayId (st.nextId + 1),
-        { st with
-          buffers := { id := st.nextId + 1, exclusive := true, data := outDataOfKind kern elems } :: st.buffers
-          nextId := st.nextId + 1 }) = _
-      rw [houtData]
+    · cases kern with
+      | dotProduct => exact False.elim (hNotDot rfl)
+      | _ =>
+        simp only [evalCode, evalParFor, hlen, hnotFuel, ite_false, hvals, hloop]
+        simp only [VarEnv.bind, beq_self_eq_true, ite_true]
     · simp [HeapState.findBuffer]
   | letBind lv ty valExpr body =>
     cases ty <;> try (unfold extractDeclParFor at hex; cases hex)
@@ -128,7 +120,7 @@ private theorem extractDeclParFor_sound {code : LNIRCode}
     have hlv : lv' = lv := (beq_iff_eq.mp hlvEq).symm
     have hout : retVar = outVar := (beq_iff_eq.mp houtEq).symm
     subst hlv; subst hout
-    unfold declRunEnv at henv'
+    dsimp only at henv'
     cases harr : env arrVar with
     | none => simp [harr] at henv'
     | some aval =>
@@ -143,13 +135,11 @@ private theorem extractDeclParFor_sound {code : LNIRCode}
             buffers := { id := st.nextId + 1, exclusive := true, data := elems.toArray } :: st.buffers
             nextId := st.nextId + 1 },
           { id := st.nextId + 1, exclusive := true, data := elems.toArray }, ?_, ?_, rfl⟩
-        · simp only [evalCode, evalExpr, harr, hbuf, evalParFor, hlen, hnotFuel, ite_false, hvals, hloop]
-          simp only [VarEnv.bind, beq_self_eq_true, ite_true]
-          change Except.ok (Val.sarrayId (st.nextId + 1),
-            { st with
-              buffers := { id := st.nextId + 1, exclusive := true, data := outDataOfKind kern elems } :: st.buffers
-              nextId := st.nextId + 1 }) = _
-          rw [houtData]
+        · cases kern with
+          | dotProduct => exact False.elim (hNotDot rfl)
+          | _ =>
+            simp only [evalCode, evalExpr, harr, hbuf, evalParFor, hlen, hnotFuel, ite_false, hvals, hloop]
+            simp only [VarEnv.bind, beq_self_eq_true, ite_true]
         · simp [HeapState.findBuffer]
   | _ => simp [extractDeclParFor] at hex
 
@@ -164,7 +154,16 @@ theorem lowerToPTX_sound
     (nBlocks blockSize : Nat) (inWords : List (List (BitVec 64)))
     (hlowDecl : lowerDeclToPTX d = some ptxMod)
     (hex : extractDeclParFor d.body = some (arrOpt, lenVar, inputs, k))
-    (henv' : declRunEnv env st arrOpt lenVar = some env')
+    (henv' :
+      (match (motive := Option VarId → Option VarEnv) arrOpt with
+       | none => some env
+       | some arrVar =>
+         match env arrVar with
+         | some (.sarrayId bid) =>
+           match st.findBuffer bid with
+           | some buf => some (env.bind lenVar (.u64 buf.data.size.toUInt64))
+           | none => none
+         | _ => none) = some env')
     (hlen : env' lenVar = some (.u64 n))
     (hfuel : n.toNat ≤ fuel)
     (hpack : packInputWordLists env' st n.toNat inputs = some inWords)
@@ -247,7 +246,16 @@ theorem lowerToPTX_decl_nonvacuous :
     simp [lowerDeclToPTX, isSarrayI64, d, ptxMod, extractDeclParFor, wfPTXKernel, kernelArity]
     rfl
   have hex : extractDeclParFor d.body = some (some 0, 2, [0, 1], .saxpy 5) := rfl
-  have henv' : declRunEnv env st (some 0) 2 = some env' := rfl
+  have henv' :
+      (match (motive := Option VarId → Option VarEnv) some (0 : VarId) with
+       | none => some env
+       | some arrVar =>
+         match env arrVar with
+         | some (.sarrayId bid) =>
+           match st.findBuffer bid with
+           | some buf => some (env.bind (2 : VarId) (.u64 buf.data.size.toUInt64))
+           | none => none
+         | _ => none) = some env' := rfl
   have hlen : env' 2 = some (.u64 3) := rfl
   cases hpack : packInputWordLists env' st 3 [0, 1] with
   | none =>
@@ -283,7 +291,8 @@ set_option maxRecDepth 65536
 /-- Concrete LNIR `.dotProduct` reduction (`D6`):
     `evalParKernelElem` computes elementwise `x[i] * y[i]` (matching `evalParKernelElem` for
     `.zipMul`/`.dotProduct` at `Semantics/Eval.lean:465–469`) and `evalParFor` folds the sum into a
-    length-1 `sarray` (`outDataOfKind` at `:521`). The corresponding multi-CTA PTX kernel (`gridDim.x = 2`,
+    length-1 `sarray` (`match k with | .dotProduct => ...` at `Semantics/Eval.lean:521`). The
+    corresponding multi-CTA PTX kernel (`gridDim.x = 2`,
     `blockDim.x = 2`, `n = 3`) computes the same `UInt64` sum via cross-CTA `atom.add.global.u64` of
     `x[gid] * y[gid]`, with out-of-range thread `(ctaid.x = 1, tid.x = 1, gid = 3 >= n)` taking an
     early predicated `ret` before `bar.sync 0` while active threads synchronize on `bar.sync 0`,

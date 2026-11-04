@@ -246,6 +246,7 @@ structure PTXMemEvent where
   isAtomic     : Bool := false
   valRead      : BitVec 64 := 0#64
   valWritten   : BitVec 64 := 0#64
+  poSeq        : Nat := 0
   deriving Repr, DecidableEq, Inhabited, BEq
 
 /-- Transitive closure `(po ∪ sw)+` over event identifiers. -/
@@ -301,7 +302,13 @@ structure PTXAxiomaticConsistent (initMem : Nat → StateSpace → Nat → Optio
   po_wf : ∀ {a b : Nat}, cand.po a b →
     ∃ ea eb : PTXMemEvent,
       cand.hasEvent a = some ea ∧ cand.hasEvent b = some eb ∧
-      ea.kernelIdx = eb.kernelIdx ∧ ea.ctaId = eb.ctaId ∧ ea.tid = eb.tid ∧ a < b
+      ea.kernelIdx = eb.kernelIdx ∧ ea.ctaId = eb.ctaId ∧ ea.tid = eb.tid ∧ ea.poSeq < eb.poSeq
+  po_irrefl : ∀ (a : Nat), ¬ cand.po a a
+  po_trans : ∀ {a b c : Nat}, cand.po a b → cand.po b c → cand.po a c
+  po_complete : ∀ (ea eb : PTXMemEvent),
+    ea ∈ cand.events → eb ∈ cand.events →
+    ea.kernelIdx = eb.kernelIdx → ea.ctaId = eb.ctaId → ea.tid = eb.tid →
+    ea.poSeq < eb.poSeq → cand.po ea.eventId eb.eventId
   sw_cta_barrier : ∀ (ea eb : PTXMemEvent) (bid : Nat),
     ea ∈ cand.events → eb ∈ cand.events →
     ea.kernelIdx = eb.kernelIdx → ea.ctaId = eb.ctaId → ea.tid ≠ eb.tid →

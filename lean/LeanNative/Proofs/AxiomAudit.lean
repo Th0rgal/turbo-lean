@@ -315,10 +315,14 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Backend.PTXAst.ptx_div_zero_traps
   , ``LeanNative.Backend.PTXAst.ptx_sdiv64_min_neg1_traps
   , ``LeanNative.Backend.PTXAst.stepCTABarrier_allows_ret_exited_threads
+  , ``LeanNative.Backend.PTXAst.stepCTABarrier_skipped_pred_ret_falloff_traps
   , ``LeanNative.Backend.PTXAst.stepCTABarrier_divergent_barriers_trap
   , ``LeanNative.Backend.PTXAst.stepCTABarrier_advances_generation_and_clears_epoch
+  , ``LeanNative.Backend.PTXAst.sequentialCandidateOfEvents_consistent
+  , ``LeanNative.Backend.PTXAst.sequentialCandidateOfEvents_multi_event_nonvacuous
   , ``LeanNative.Backend.PTXAst.ptx_relaxed_atom_add_co_no_lost_updates
   , ``LeanNative.Backend.PTXAst.ptx_relaxed_cross_cta_atom_add_commutes
+  , ``LeanNative.Backend.PTXAst.ptx_relaxed_cross_cta_atom_add_exec
   , ``LeanNative.Backend.PTXAst.ptx_seq_kernel_global_write_visible
   , ``LeanNative.Backend.PTXAst.ptx_cta_barrier_gen_write_visible
   , ``LeanNative.Backend.MetalAst.exec_preserves_constant_buffers

@@ -1297,6 +1297,103 @@ def ptxEarlyRetBarSyncResult : PTXRes :=
 theorem ptx_early_ret_bar_sync_checked :
     ptxReadWord? ptxEarlyRetBarSyncResult 0 = some 99#64 := rfl
 
+def ptxSkippedPredRetFalloffKernel : PTXKernel where
+  name := "skipped_pred_ret_falloff"
+  params := []
+  regDecls := [ { ty := .u32, prefixName := "%r", count := 1 }
+              , { ty := .pred, prefixName := "%p", count := 2 } ]
+  body :=
+    [ .instr none (.mov .u32 "%r0" (.sreg .tidX))
+    , .instr none (.setp .eq .u32 "%p0" (.reg "%r0") (.immU64 0#64))
+    , .instr (some { predReg := "%p0", negated := true }) (.bra "AT_BAR")
+    , .instr none (.bra "END_SKIP_RET")
+    , .label "AT_BAR"
+    , .instr none (.barSync 0)
+    , .instr none .ret
+    , .label "END_SKIP_RET"
+    , .instr none (.setp .eq .u32 "%p1" (.immU64 1#64) (.immU64 0#64))
+    , .instr (some { predReg := "%p1" }) .ret ]
+
+def ptxSkippedPredRetFalloffResult : PTXRes :=
+  evalPTXKernel 32 ptxSkippedPredRetFalloffKernel { x := 1 } { x := 2 }
+    (LeanNative.Backend.PTXAst.ByteMemory.zeros 0) { params := [] }
+
+def ptxSkippedPredRetFalloffOracleResult :
+    PTXOutcome (PTXMem × List PTXMemEvent) :=
+  evalPTXKernelWithOracle none 32 ptxSkippedPredRetFalloffKernel { x := 1 } { x := 2 }
+    (LeanNative.Backend.PTXAst.ByteMemory.zeros 0) { params := [] }
+
+#guard ptxSkippedPredRetFalloffResult == .barrierDivergence 0
+#guard ptxSkippedPredRetFalloffOracleResult == .barrierDivergence 0
+
+theorem ptx_skipped_pred_ret_falloff_checked :
+    ptxSkippedPredRetFalloffResult = .barrierDivergence 0 ∧
+      ptxSkippedPredRetFalloffOracleResult = .barrierDivergence 0 := by
+  exact ⟨rfl, rfl⟩
+
+def ptxCrossCtaAtomAddKernel : PTXKernel where
+  name := "cross_cta_atom_add"
+  params := [ { ty := .u64, name := "acc" } ]
+  regDecls := [ { ty := .u32, prefixName := "%r", count := 1 }
+              , { ty := .u64, prefixName := "%rd", count := 3 }
+              , { ty := .pred, prefixName := "%p", count := 1 } ]
+  body :=
+    [ .instr none (.mov .u32 "%r0" (.sreg .ctaidX))
+    , .instr none (.setp .eq .u32 "%p0" (.reg "%r0") (.immU64 0#64))
+    , .instr none (.selp .u64 "%rd1" (.immU64 19#64) (.immU64 23#64) "%p0")
+    , .instr none (.ldParam .u64 "%rd0" "acc")
+    , .instr none (.atomAdd .global .u64 "%rd2" (.regOffset "%rd0" 0) (.reg "%rd1"))
+    , .instr none .ret ]
+
+def ptxCrossCtaAtomAddInit : PTXMem :=
+  LeanNative.Backend.PTXAst.ByteMemory.ofU64Words [ 5#64 ]
+
+def ptxCrossCtaAtomAddRevOracle : PTXReadOracle := fun ctaId _ ord sp addr width =>
+  if sp == .global && addr == 0 && width == 8 && ord == 0 then
+    if ctaId.x == 0 then some 28#64 else some 5#64
+  else
+    none
+
+def ptxCrossCtaAtomAddSeq :
+    PTXOutcome (PTXMem × List PTXMemEvent) :=
+  evalPTXKernelWithOracle none 8 ptxCrossCtaAtomAddKernel { x := 2 } { x := 1 }
+    ptxCrossCtaAtomAddInit { params := [ ("acc", 0#64) ] }
+
+def ptxCrossCtaAtomAddRev :
+    PTXOutcome (PTXMem × List PTXMemEvent) :=
+  evalPTXKernelWithOracle (some ptxCrossCtaAtomAddRevOracle) 8 ptxCrossCtaAtomAddKernel
+    { x := 2 } { x := 1 } ptxCrossCtaAtomAddInit { params := [ ("acc", 0#64) ] }
+
+def ptxCrossCtaAtomAddCtaOrder :
+    PTXOutcome (PTXMem × List PTXMemEvent) :=
+  evalPTXKernelWithCTAOrder none 8 ptxCrossCtaAtomAddKernel { x := 2 } { x := 1 }
+    [{ x := 1, y := 0, z := 0 }, { x := 0, y := 0, z := 0 }]
+    ptxCrossCtaAtomAddInit { params := [ ("acc", 0#64) ] }
+
+def ptxCrossCtaAtomAddWord? (r : PTXOutcome (PTXMem × List PTXMemEvent)) :
+    Option (BitVec 64) :=
+  match r with
+  | .ok (m, _) => m.loadBits 0 8
+  | _ => none
+
+def ptxCrossCtaAtomAddRevReplay? : Option (BitVec 64) :=
+  match ptxCrossCtaAtomAddRev with
+  | .ok (_, evs) =>
+    match replayCoherentGlobalWrites ptxCrossCtaAtomAddInit evs.reverse with
+    | some m => m.loadBits 0 8
+    | none => none
+  | _ => none
+
+#guard ptxCrossCtaAtomAddWord? ptxCrossCtaAtomAddSeq == some 47#64
+#guard ptxCrossCtaAtomAddWord? ptxCrossCtaAtomAddCtaOrder == some 47#64
+#guard ptxCrossCtaAtomAddRevReplay? == some 47#64
+
+theorem ptx_cross_cta_atom_add_exec_checked :
+    ptxCrossCtaAtomAddWord? ptxCrossCtaAtomAddSeq = some 47#64 ∧
+      ptxCrossCtaAtomAddWord? ptxCrossCtaAtomAddCtaOrder = some 47#64 ∧
+      ptxCrossCtaAtomAddRevReplay? = some 47#64 := by
+  exact ⟨rfl, rfl, rfl⟩
+
 def ptxD6MultiKernelWriteKernel : PTXKernel where
   name := "ptx_d6_multi_write"
   params := [ { ty := .u64, name := "buf" } ]

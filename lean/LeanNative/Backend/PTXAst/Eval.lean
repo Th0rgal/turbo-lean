@@ -188,11 +188,12 @@ def findDataRace? (logs : List MemAccessLog) (tid : Dim3) (space : StateSpace)
 
 /-- Per-thread execution state inside a CTA, including per-thread `.local` private memory. -/
 structure PTXThreadState where
-  tid      : Dim3
-  pc       : Nat := 0
-  regs     : PTXRegFile := PTXRegFile.empty
-  localMem : ByteMemory := ByteMemory.zeros 0
-  halted   : Bool := false
+  tid         : Dim3
+  pc          : Nat := 0
+  regs        : PTXRegFile := PTXRegFile.empty
+  localMem    : ByteMemory := ByteMemory.zeros 0
+  halted      : Bool := false
+  fellOffEnd  : Bool := false
   deriving Repr, DecidableEq, Inhabited, BEq
 
 /-- Complete CTA (Cooperative Thread Array) SIMT state with separated address spaces and
@@ -1258,7 +1259,8 @@ def execNonBarrierInstr (stmts : List PTXStmt) (cta : PTXCTAState) (th : PTXThre
     | some targetPc => .ok ({ th with pc := targetPc }, cta.globalMem, cta.sharedMem, cta.epochLog)
     | none => .unboundLabel targetLbl
   | .ret =>
-    .ok ({ th with pc := nextPc, halted := true }, cta.globalMem, cta.sharedMem, cta.epochLog)
+    .ok ({ th with pc := nextPc, halted := true },
+      cta.globalMem, cta.sharedMem, cta.epochLog)
 
 /-- Execute a single predicated instruction (`@p` / `@!p`) for thread `th`.
     When the evaluated guard is `false`, the instruction is a pure PC-advancing no-op. -/
@@ -1330,24 +1332,21 @@ def bumpBarrierGen (gens : List (Nat × Nat)) (bid : Nat) : List (Nat × Nat) :=
     if b == bid then (bid, g + 1) :: rest
     else (b, g) :: bumpBarrierGen rest bid
 
-/-- True iff thread `th` has legally exited via an explicit `ret` instruction (`th.halted = true`,
-    `th.pc > 0`, and `stmts[th.pc - 1]?` is a `.ret` instruction), distinguishing explicit PTX 8.0
-    `ret` exit from falling off the end of `stmts` without `ret`. -/
-def threadExitedByRet (stmts : List PTXStmt) (th : PTXThreadState) : Bool :=
-  th.halted && th.pc > 0 &&
-    match stmts[th.pc - 1]? with
-    | some (.instr _ .ret) => true
-    | _ => false
+/-- True iff thread `th` has legally exited via an explicit `ret` instruction that actually
+    executed (`halted = true` and `fellOffEnd = false`, since falling off the end of `stmts` —
+    including after skipping a predicated `@!%p ret` — sets `fellOffEnd := true`). -/
+def threadExitedByRet (th : PTXThreadState) : Bool :=
+  th.halted && !th.fellOffEnd
 
 /-- Check whether `threads` and their collected `states` converge on `bar.sync bid` under PTX 8.0
     barrier-generation semantics (`D6`): every thread is either parked at active `bar.sync bid`
     (`st == some bid` and `!th.halted`) or has already legally exited via `ret`. -/
-def barrierParticipantsConverged (stmts : List PTXStmt) (bid : Nat) :
+def barrierParticipantsConverged (bid : Nat) :
     List PTXThreadState → List (Option Nat) → Bool
   | [], [] => true
   | th :: ths, st :: sts =>
-    ((st == some bid && !th.halted) || (st == none && threadExitedByRet stmts th)) &&
-      barrierParticipantsConverged stmts bid ths sts
+    ((st == some bid && !th.halted) || (st == none && threadExitedByRet th)) &&
+      barrierParticipantsConverged bid ths sts
   | _, _ => false
 
 /-- Advance `pc` by `1` for active barrier participants (`st == some bid`), leaving `ret`-exited
@@ -1365,9 +1364,9 @@ def advanceBarrierParticipants (bid : Nat) :
     falling off the end without `ret` trap with `PTXOutcome.barrierDivergence bid`. On convergence,
     active participants advance `pc + 1`, `barrierGen` for `bid` increments by `1`, and `epochLog`
     is cleared for the new barrier generation. -/
-def stepCTABarrierGen (stmts : List PTXStmt) (bid : Nat) (states : List (Option Nat))
+def stepCTABarrierGen (bid : Nat) (states : List (Option Nat))
     (cta : PTXCTAState) : PTXOutcome PTXCTAState :=
-  if barrierParticipantsConverged stmts bid cta.threads states then
+  if barrierParticipantsConverged bid cta.threads states then
     .ok { cta with
       threads := advanceBarrierParticipants bid cta.threads states
       epochLog := []
@@ -1479,7 +1478,7 @@ def stepFirstReadyThread (stmts : List PTXStmt) (cta : PTXCTAState) :
     else
       match stmts[th.pc]? with
       | none =>
-        let th' := { th with halted := true }
+        let th' := { th with halted := true, fellOffEnd := true }
         .ok (true, { cta with threads := prefixRev.reverse ++ (th' :: suffix) })
       | some (.label _) =>
         let th' := { th with pc := th.pc + 1 }
@@ -1529,7 +1528,7 @@ def stepCTA (stmts : List PTXStmt) (cta : PTXCTAState) : PTXOutcome (Bool × PTX
             PTXOutcome.bind (collectBarrierStates stmts cta'.threads) fun barStates =>
               match barStates.findSome? id with
               | some bid =>
-                PTXOutcome.bind (stepCTABarrierGen stmts bid barStates cta') fun synced =>
+                PTXOutcome.bind (stepCTABarrierGen bid barStates cta') fun synced =>
                   .ok (false, synced)
               | none => .ok (true, cta')
 
@@ -1672,7 +1671,8 @@ def recordMemEvent (tr : PTXOracleTrace) (cta : PTXCTAState) (tid : Dim3) (sp : 
       isWrite := isWrite
       isAtomic := isAtomic
       valRead := valRead
-      valWritten := valWritten }
+      valWritten := valWritten
+      poSeq := getThreadAccessOrd tr.threadOrd tid }
   { tr with
     nextEventId := tr.nextEventId + 1
     threadOrd := bumpThreadAccessOrd tr.threadOrd tid
@@ -1835,7 +1835,7 @@ def stepFirstReadyThreadOracle (oracle? : Option PTXReadOracle) (stmts : List PT
     else
       match stmts[th.pc]? with
       | none =>
-        let th' := { th with halted := true }
+        let th' := { th with halted := true, fellOffEnd := true }
         .ok (true, { cta with threads := prefixRev.reverse ++ (th' :: suffix) }, tr)
       | some (.label _) =>
         let th' := { th with pc := th.pc + 1 }
@@ -1882,7 +1882,7 @@ def stepCTAOracle (oracle? : Option PTXReadOracle) (stmts : List PTXStmt)
               PTXOutcome.bind (collectBarrierStates stmts cta'.threads) fun barStates =>
                 match barStates.findSome? id with
                 | some bid =>
-                  PTXOutcome.bind (stepCTABarrierGen stmts bid barStates cta') fun synced =>
+                  PTXOutcome.bind (stepCTABarrierGen bid barStates cta') fun synced =>
                     .ok (false, synced, tr')
                 | none => .ok (true, cta', tr')
 
@@ -1927,16 +1927,39 @@ def evalPTXKernelOracleLoop (oracle? : Option PTXReadOracle) (fuelPerCTA : Nat) 
             ctaFinal.globalMem (ctaGlobalLog ++ priorGlobalLog)
             trFinal.nextEventId kernelIdx trFinal.eventsRev rest
 
+/-- Launch a single `PTXKernel` across an explicit CTA schedule `ctaOrder` under an optional
+    `PTXReadOracle`, returning `(finalGlobalMem, events)` in execution order while preserving
+    every `PTXOutcome` UB/alignment/OOB/data-race trap. -/
+def evalPTXKernelWithCTAOrder (oracle? : Option PTXReadOracle) (fuelPerCTA : Nat) (k : PTXKernel)
+    (gridDim blockDim : Dim3) (ctaOrder : List Dim3) (globalMem : ByteMemory)
+    (paramMem : ParamMemory) (constMem : ByteMemory := ByteMemory.zeros 0) :
+    PTXOutcome (ByteMemory × List PTXMemEvent) :=
+  PTXOutcome.bind
+    (evalPTXKernelOracleLoop oracle? fuelPerCTA k gridDim blockDim paramMem constMem
+      globalMem [] 0 0 [] ctaOrder)
+    fun (gFinal, _, eventsRev) => .ok (gFinal, eventsRev.reverse)
+
 /-- Launch a single `PTXKernel` under an optional `PTXReadOracle`, returning `(finalGlobalMem, events)`
     in execution order while preserving every `PTXOutcome` UB/alignment/OOB/data-race trap. -/
 def evalPTXKernelWithOracle (oracle? : Option PTXReadOracle) (fuelPerCTA : Nat) (k : PTXKernel)
     (gridDim blockDim : Dim3) (globalMem : ByteMemory) (paramMem : ParamMemory)
     (constMem : ByteMemory := ByteMemory.zeros 0) :
     PTXOutcome (ByteMemory × List PTXMemEvent) :=
-  PTXOutcome.bind
-    (evalPTXKernelOracleLoop oracle? fuelPerCTA k gridDim blockDim paramMem constMem
-      globalMem [] 0 0 [] gridDim.coords)
-    fun (gFinal, _, eventsRev) => .ok (gFinal, eventsRev.reverse)
+  evalPTXKernelWithCTAOrder oracle? fuelPerCTA k gridDim blockDim gridDim.coords
+    globalMem paramMem constMem
+
+/-- Replay an ordered list of `.global` write events onto `g0` (`co`-ordered store commit),
+    leaving non-`.global` or non-write events as no-ops and returning `none` if any `.global`
+    store is out of bounds. -/
+def replayCoherentGlobalWrites (g0 : ByteMemory) : List PTXMemEvent → Option ByteMemory
+  | [] => some g0
+  | ev :: rest =>
+    if ev.space == .global && ev.isWrite then
+      match g0.storeBits ev.addr ev.width ev.valWritten with
+      | some gNext => replayCoherentGlobalWrites gNext rest
+      | none => none
+    else
+      replayCoherentGlobalWrites g0 rest
 
 /-- Launch configuration for one kernel in a sequential host stream (`evalPTXMultiKernelSeq`). -/
 structure PTXKernelLaunchSpec where
@@ -1993,23 +2016,76 @@ def isImmediateCoChain (cand : PTXCandidateExecution) : List PTXMemEvent → Pro
       (¬ ∃ wMid : Nat, cand.co e1.eventId wMid ∧ cand.co wMid e2.eventId) ∧
       isImmediateCoChain cand (e2 :: rest)
 
+/-- Same-location decidable equality on two `PTXMemEvent`s (`PTXCandidateExecution.sameLoc`). -/
+def sameLocBool (e1 e2 : PTXMemEvent) : Bool :=
+  e1.space == e2.space && e1.addr == e2.addr && e1.width == e2.width &&
+    (e1.space == .global || (e1.space == .shared && e1.ctaId == e2.ctaId))
+
+/-- Event identifier of the latest preceding same-location write in `events` (`w.eventId < r.eventId`),
+    if any. -/
+def latestPriorWriteId? (events : List PTXMemEvent) (r : PTXMemEvent) : Option Nat :=
+  (events.filter fun w =>
+    w.isWrite && sameLocBool w r && decide (w.eventId < r.eventId)).getLast?.map PTXMemEvent.eventId
+
+/-- Well-formedness of a sequential `PTXMemEvent` trace relative to initial memory `initMem`:
+    event IDs are unique, causal `po` / intra-CTA `bar.sync` / inter-kernel `.global` store-to-access
+    steps increase `eventId` in execution order, and every read's `valRead` matches either the latest
+    preceding same-location write's `valWritten` or `initMem` when no prior write exists. -/
+def wfSequentialEventTrace (initMem : Nat → StateSpace → Nat → Option (BitVec 64))
+    (events : List PTXMemEvent) : Prop :=
+  (events.map PTXMemEvent.eventId).Nodup ∧
+  (∀ ea eb : PTXMemEvent,
+    ea ∈ events → eb ∈ events →
+    ea.kernelIdx = eb.kernelIdx → ea.ctaId = eb.ctaId → ea.tid = eb.tid →
+    ea.poSeq < eb.poSeq → ea.eventId < eb.eventId) ∧
+  (∀ (ea eb : PTXMemEvent) (bid : Nat),
+    ea ∈ events → eb ∈ events →
+    ea.kernelIdx = eb.kernelIdx → ea.ctaId = eb.ctaId → ea.tid ≠ eb.tid →
+    lookupBarrierEpoch ea.barrierEpoch bid < lookupBarrierEpoch eb.barrierEpoch bid →
+    ea.eventId < eb.eventId) ∧
+  (∀ ea eb : PTXMemEvent,
+    ea ∈ events → eb ∈ events →
+    ea.space = .global → eb.space = .global →
+    ea.isWrite = true → ea.kernelIdx < eb.kernelIdx →
+    ea.eventId < eb.eventId) ∧
+  (∀ er : PTXMemEvent,
+    er ∈ events → er.isRead = true →
+    match latestPriorWriteId? events er with
+    | some wId =>
+      ∃ ew : PTXMemEvent,
+        events.find? (fun e => e.eventId == wId) = some ew ∧
+        ew.isWrite = true ∧ PTXCandidateExecution.sameLoc ew er ∧
+        ew.valWritten = er.valRead ∧ wId < er.eventId ∧
+        ∀ em : PTXMemEvent,
+          em ∈ events → em.isWrite = true → PTXCandidateExecution.sameLoc em er →
+          em.eventId < er.eventId → em.eventId ≤ wId
+    | none =>
+      initMem er.addr er.space er.width = some er.valRead ∧
+        ∀ em : PTXMemEvent,
+          em ∈ events → em.isWrite = true → PTXCandidateExecution.sameLoc em er →
+          ¬ (em.eventId < er.eventId))
+
+/-- Build a coherent reversed 2-event cross-CTA atomic RMW `PTXCandidateExecution` (`evFirst` from
+    CTA 1 ordered before `evSecond` from CTA 0 in `co`, with `rf` linking `evFirst -> evSecond` and
+    empty `po`/`sw`). -/
+def twoEventReversedRmwCandidate (evSecond evFirst : PTXMemEvent) : PTXCandidateExecution :=
+  { events := [evSecond, evFirst]
+    po := fun _ _ => False
+    sw := fun _ _ => False
+    co := fun w1 w2 => w1 = evFirst.eventId ∧ w2 = evSecond.eventId
+    rf := fun w r => w = evFirst.eventId ∧ r = evSecond.eventId }
+
 /-- Build the canonical sequential `PTXCandidateExecution` for a recorded `events` list in execution
     order (`eventId = 0, 1, ...`), relating same-thread events by `po`, same-CTA cross-barrier events
     and sequential multi-kernel `.global` events by `sw`, same-location stores in trace order by `co`,
     and linking each read to the latest preceding same-location write in `events` by `rf`. -/
 def sequentialCandidateOfEvents (events : List PTXMemEvent) : PTXCandidateExecution :=
   let findEv? (eid : Nat) : Option PTXMemEvent := events.find? (fun e => e.eventId == eid)
-  let sameLocB (e1 e2 : PTXMemEvent) : Bool :=
-    e1.space == e2.space && e1.addr == e2.addr && e1.width == e2.width &&
-      (e1.space == .global || (e1.space == .shared && e1.ctaId == e2.ctaId))
-  let latestPriorWrite? (r : PTXMemEvent) : Option Nat :=
-    (events.filter fun w =>
-      w.isWrite && sameLocB w r && decide (w.eventId < r.eventId)).getLast?.map PTXMemEvent.eventId
   { events := events
     po := fun a b =>
       ∃ ea eb : PTXMemEvent,
         findEv? a = some ea ∧ findEv? b = some eb ∧
-        ea.kernelIdx = eb.kernelIdx ∧ ea.ctaId = eb.ctaId ∧ ea.tid = eb.tid ∧ a < b
+        ea.kernelIdx = eb.kernelIdx ∧ ea.ctaId = eb.ctaId ∧ ea.tid = eb.tid ∧ ea.poSeq < eb.poSeq
     sw := fun a b =>
       ∃ ea eb : PTXMemEvent,
         findEv? a = some ea ∧ findEv? b = some eb ∧
@@ -2023,7 +2099,7 @@ def sequentialCandidateOfEvents (events : List PTXMemEvent) : PTXCandidateExecut
         PTXCandidateExecution.sameLoc e1 e2 ∧ w1 < w2
     rf := fun w r =>
       ∃ er : PTXMemEvent,
-        findEv? r = some er ∧ er.isRead = true ∧ latestPriorWrite? er = some w }
+        findEv? r = some er ∧ er.isRead = true ∧ latestPriorWriteId? events er = some w }
 
 /-! ## 3. 1:1 Structural Pretty-Printer -/
 
