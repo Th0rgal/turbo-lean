@@ -465,6 +465,7 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.add_nsw_poison_witness
   , ``LeanNative.Proofs.llvmNoAliasParam_of_disjoint_sound
   , ``LeanNative.Proofs.readBytesAt_disjoint_of_fact
+  , ``LeanNative.Proofs.launchBoundsCert_gid_lt_len
   , ``LeanNative.Proofs.ptxBoundsFreeLoad_sound
   , ``LeanNative.Proofs.metalBoundsFreeLoad_sound
   , ``LeanNative.Proofs.proofRetention_pipeline_nonvacuous

@@ -1348,8 +1348,8 @@ theorem add_nsw_poison_witness :
   add_nsw_overflow_poison .i64 _ _ (by decide)
 
 private theorem bind_noalias (st : ExecState) (facts : FactEnv) (ptrA ptrB : VarId)
-    (lenA lenB : Nat) (ps : List LLVMParam) (args : List LLVMVal) :
-    bindArgs st (noaliasParams facts ptrA ptrB lenA lenB ps) args = bindArgs st ps args := by
+    (lenA lenB : Nat) (ps : List LLVMParam) (blocks : List LLVMBlock) (args : List LLVMVal) :
+    bindArgs st (noaliasParams facts ptrA ptrB lenA lenB ps blocks) args = bindArgs st ps args := by
   let f : LLVMParam → LLVMParam := fun p => match p.ty with
     | .ptr _ => if p.name == llvmRegOf ptrA || p.name == llvmRegOf ptrB then
         withNoAlias true p else p
@@ -1383,22 +1383,66 @@ private theorem bind_noalias (st : ExecState) (facts : FactEnv) (ptrA ptrB : Var
   · rfl
   · exact hmap st ps args
 
+private theorem scalar_noalias_serialize_len (ty : LLVMType) (v : LLVMVal)
+    (hs : isScalarNoAliasTy ty = true) :
+    (serializeTypedVal ty v).length = ty.byteSize := by
+  cases ty with
+  | void => rfl
+  | int w =>
+    cases v with
+    | bits w' bv =>
+      by_cases hw : w' = w
+      · subst hw
+        simp [serializeTypedVal, serializeTypedValAux, LLVMType.byteSize,
+          ByteMem.initBytes_length, ByteMem.bvToLEBytes, ByteMem.natToLEBytes_length]
+      · simp [serializeTypedVal, serializeTypedValAux, LLVMType.byteSize,
+          hw, ByteMem.poisonBytes_length]
+    | ptr _ | floatBits _ _ | aggNil | aggCons _ _ | poison =>
+      simp [serializeTypedVal, serializeTypedValAux, LLVMType.byteSize,
+        ByteMem.poisonBytes_length]
+  | float fw =>
+    cases v with
+    | floatBits fw' fb =>
+      by_cases hfw : fw' = fw
+      · subst hfw
+        simp [serializeTypedVal, serializeTypedValAux, LLVMType.byteSize,
+          ByteMem.initBytes_length, ByteMem.bvToLEBytes, ByteMem.natToLEBytes_length]
+      · simp [serializeTypedVal, serializeTypedValAux, LLVMType.byteSize,
+          hfw, ByteMem.poisonBytes_length]
+    | bits _ _ | ptr _ | aggNil | aggCons _ _ | poison =>
+      simp [serializeTypedVal, serializeTypedValAux, LLVMType.byteSize,
+        ByteMem.poisonBytes_length]
+  | ptr _ =>
+    cases v with
+    | ptr p =>
+      simp [serializeTypedVal, serializeTypedValAux, LLVMType.byteSize,
+        ByteMem.initBytes_length, ByteMem.bvToLEBytes, ByteMem.natToLEBytes_length]
+    | bits _ _ | floatBits _ _ | aggNil | aggCons _ _ | poison =>
+      simp [serializeTypedVal, serializeTypedValAux, LLVMType.byteSize,
+        ByteMem.poisonBytes_length]
+  | structFields _ _ | array _ _ | vec _ _ =>
+    simp [isScalarNoAliasTy] at hs
+
 theorem llvmNoAliasParam_of_disjoint_sound (st : ExecState) (facts : FactEnv)
     (ptrA ptrB lenA lenB : VarId) (as0 : Nat) (attrs0 : List ParamAttr)
-    (ps : List LLVMParam) (args : List LLVMVal)
+    (ps : List LLVMParam) (blocks : List LLVMBlock) (args : List LLVMVal)
     (pa pb : BitVec 64) (la lb : UInt64)
     (hne : ptrA ≠ ptrB)
     (hall : ps.all (isCertifiedPtrParam ptrA ptrB) = true)
+    (hsafe : blocksNoAliasSafe facts ptrA ptrB lenA lenB blocks = true)
     (hpa : st.regs.lookup (llvmRegOf ptrA) = some (.ptr pa))
     (hpb : st.regs.lookup (llvmRegOf ptrB) = some (.ptr pb))
     (hla : st.regs.lookup (llvmRegOf lenA) = some (.bits .i64 la.toBitVec))
     (hlb : st.regs.lookup (llvmRegOf lenB) = some (.bits .i64 lb.toBitVec))
+    (hfIdx : ∀ i n, factMember facts (.idxLt i n) = true →
+      (n = lenA → ∃ iv : UInt64, iv.toNat < la.toNat) ∧
+      (n = lenB → ∃ iv : UInt64, iv.toNat < lb.toNat))
     (hmem : factMember facts (.disjointSlices ptrA ptrB lenA lenB) = true)
     (hdisj : rangesDisjoint pa.toNat (la.toNat * 8) pb.toNat (lb.toNat * 8) = true) :
     let p0 : LLVMParam := { name := llvmRegOf ptrA, ty := .ptr as0, attrs := attrs0 }
-    (noaliasParams facts ptrA ptrB lenA lenB (p0 :: ps)).any
+    (noaliasParams facts ptrA ptrB lenA lenB (p0 :: ps) blocks).any
         (fun p => p.attrs.contains .noalias) = true ∧
-      bindArgs st (noaliasParams facts ptrA ptrB lenA lenB (p0 :: ps)) args =
+      bindArgs st (noaliasParams facts ptrA ptrB lenA lenB (p0 :: ps) blocks) args =
         bindArgs st (p0 :: ps) args ∧
       ∃ av bv : BitVec 64, ∃ lav lbv : UInt64,
         st.regs.lookup (llvmRegOf ptrA) = some (.ptr av) ∧
@@ -1406,6 +1450,14 @@ theorem llvmNoAliasParam_of_disjoint_sound (st : ExecState) (facts : FactEnv)
         st.regs.lookup (llvmRegOf lenA) = some (.bits .i64 lav.toBitVec) ∧
         st.regs.lookup (llvmRegOf lenB) = some (.bits .i64 lbv.toBitVec) ∧
         rangesDisjoint av.toNat (lav.toNat * 8) bv.toNat (lbv.toNat * 8) = true ∧
+        (∀ blk ∈ blocks, ∀ ins ∈ blk.body,
+          instrSafeForNoAlias (llvmRegOf ptrA) (llvmRegOf ptrB) ins = true) ∧
+        (∀ (m : ByteMem) (blkW blkR : LLVMBlock) (volW volR : Bool) (tyW tyR : LLVMType)
+            (valOp : Operand) (alW alR asW asR : Nat) (dstR : RegName) (v : LLVMVal),
+          blkW ∈ blocks → blkR ∈ blocks →
+          LLVMInstr.store volW tyW valOp (.reg (llvmRegOf ptrA)) alW asW ∈ blkW.body →
+          LLVMInstr.load dstR volR tyR (.reg (llvmRegOf ptrB)) alR asR ∈ blkR.body →
+          loadVal (storeTypedVal m av tyW v) bv tyR = loadVal m bv tyR) ∧
         ∀ (m : ByteMem) (bs : List MemByte) (offA offB width : Nat),
           offA + bs.length ≤ lav.toNat * 8 →
           offB + width ≤ lbv.toNat * 8 →
@@ -1416,6 +1468,47 @@ theorem llvmNoAliasParam_of_disjoint_sound (st : ExecState) (facts : FactEnv)
   have hna : (withNoAlias true p0).attrs.contains .noalias = true := by
     simp only [withNoAlias, Bool.not_true, Bool.false_eq_true, ite_false]
     by_cases hc : .noalias ∈ p0.attrs <;> simp [hc]
+  have hsafeSplit : blocks.all (blockSafeForNoAlias (llvmRegOf ptrA) (llvmRegOf ptrB)) = true ∧
+      ((!blocksDerefReg (llvmRegOf ptrA) blocks || hasPositiveSliceBound facts lenA) = true) ∧
+      ((!blocksDerefReg (llvmRegOf ptrB) blocks || hasPositiveSliceBound facts lenB) = true) := by
+    unfold blocksNoAliasSafe at hsafe
+    simp only [Bool.and_eq_true] at hsafe
+    exact ⟨hsafe.1.1, hsafe.1.2, hsafe.2⟩
+  have hinsSafe : ∀ blk ∈ blocks, ∀ ins ∈ blk.body,
+      instrSafeForNoAlias (llvmRegOf ptrA) (llvmRegOf ptrB) ins = true := by
+    intro blk hblk ins hins
+    have hb := List.all_eq_true.mp hsafeSplit.1 blk hblk
+    unfold blockSafeForNoAlias at hb
+    simp only [Bool.and_eq_true] at hb
+    exact List.all_eq_true.mp hb.1.2 ins hins
+  have hposFromBoundA : hasPositiveSliceBound facts lenA = true → 1 ≤ la.toNat := by
+    intro hpos
+    unfold hasPositiveSliceBound at hpos
+    rcases List.any_eq_true.mp hpos with ⟨f, hfmem, hpred⟩
+    cases f with
+    | idxLt i n =>
+      have hn : n = lenA := beq_iff_eq.mp hpred
+      have hfm : factMember facts (.idxLt i n) = true := by
+        simpa [factMember, List.contains_iff_mem] using hfmem
+      rcases (hfIdx i n hfm).1 hn with ⟨iv, hlt⟩
+      omega
+    | noOverflowAdd _ _ _ _ | noOverflowSub _ _ _ _ | noOverflowMul _ _ _ _
+    | alignedPtr _ _ | disjointSlices _ _ _ _ | exclusiveObj _ =>
+      simp at hpred
+  have hposFromBoundB : hasPositiveSliceBound facts lenB = true → 1 ≤ lb.toNat := by
+    intro hpos
+    unfold hasPositiveSliceBound at hpos
+    rcases List.any_eq_true.mp hpos with ⟨f, hfmem, hpred⟩
+    cases f with
+    | idxLt i n =>
+      have hn : n = lenB := beq_iff_eq.mp hpred
+      have hfm : factMember facts (.idxLt i n) = true := by
+        simpa [factMember, List.contains_iff_mem] using hfmem
+      rcases (hfIdx i n hfm).2 hn with ⟨iv, hlt⟩
+      omega
+    | noOverflowAdd _ _ _ _ | noOverflowSub _ _ _ _ | noOverflowMul _ _ _ _
+    | alignedPtr _ _ | disjointSlices _ _ _ _ | exclusiveObj _ =>
+      simp at hpred
   have hsub : ∀ (m : ByteMem) (bs : List MemByte) (offA offB width : Nat),
       offA + bs.length ≤ la.toNat * 8 →
       offB + width ≤ lb.toNat * 8 →
@@ -1428,14 +1521,50 @@ theorem llvmNoAliasParam_of_disjoint_sound (st : ExecState) (facts : FactEnv)
       unfold rangesDisjoint
       exact decide_eq_true (by omega)
     exact ByteMem.readBytesAt_writeBytesAt_disjoint m (pa.toNat + offA) bs (pb.toNat + offB) width hsubDisj
-  refine ⟨?_, bind_noalias st facts ptrA ptrB lenA lenB (p0 :: ps) args,
-    pa, pb, la, lb, hpa, hpb, hla, hlb, hdisj, hsub⟩
+  have hnoninterf : ∀ (m : ByteMem) (blkW blkR : LLVMBlock) (volW volR : Bool) (tyW tyR : LLVMType)
+      (valOp : Operand) (alW alR asW asR : Nat) (dstR : RegName) (v : LLVMVal),
+      blkW ∈ blocks → blkR ∈ blocks →
+      LLVMInstr.store volW tyW valOp (.reg (llvmRegOf ptrA)) alW asW ∈ blkW.body →
+      LLVMInstr.load dstR volR tyR (.reg (llvmRegOf ptrB)) alR asR ∈ blkR.body →
+      loadVal (storeTypedVal m pa tyW v) pb tyR = loadVal m pb tyR := by
+    intro m blkW blkR volW volR tyW tyR valOp alW alR asW asR dstR v hblkW hblkR hst hld
+    have hderefA : blocksDerefReg (llvmRegOf ptrA) blocks = true :=
+      List.any_eq_true.mpr ⟨blkW, hblkW, List.any_eq_true.mpr
+        ⟨_, hst, by simp [instrDerefsReg]⟩⟩
+    have hderefB : blocksDerefReg (llvmRegOf ptrB) blocks = true :=
+      List.any_eq_true.mpr ⟨blkR, hblkR, List.any_eq_true.mpr
+        ⟨_, hld, by simp [instrDerefsReg]⟩⟩
+    have hboundA : hasPositiveSliceBound facts lenA = true := by
+      have h := hsafeSplit.2.1
+      rw [hderefA] at h
+      simpa using h
+    have hboundB : hasPositiveSliceBound facts lenB = true := by
+      have h := hsafeSplit.2.2
+      rw [hderefB] at h
+      simpa using h
+    have hla1 : 1 ≤ la.toNat := hposFromBoundA hboundA
+    have hlb1 : 1 ≤ lb.toNat := hposFromBoundB hboundB
+    have hsafeW := hinsSafe blkW hblkW _ hst
+    have hsafeR := hinsSafe blkR hblkR _ hld
+    simp only [instrSafeForNoAlias, beq_self_eq_true, Bool.true_or, Bool.or_true, ite_true,
+      Bool.and_eq_true, decide_eq_true_eq] at hsafeW hsafeR
+    have hlenW : (serializeTypedVal tyW v).length = tyW.byteSize :=
+      scalar_noalias_serialize_len tyW v hsafeW.2.1
+    have hszW : tyW.byteSize ≤ 8 := hsafeW.2.2
+    have hszR : tyR.byteSize ≤ 8 := hsafeR.2.2
+    unfold loadVal storeTypedVal
+    have hrw := hsub m (serializeTypedVal tyW v) 0 0 tyR.byteSize
+      (by omega) (by omega)
+    simp only [Nat.add_zero] at hrw
+    rw [hrw]
+  refine ⟨?_, bind_noalias st facts ptrA ptrB lenA lenB (p0 :: ps) blocks args,
+    pa, pb, la, lb, hpa, hpb, hla, hlb, hdisj, hinsSafe, hnoninterf, hsub⟩
   dsimp only [p0] at hna ⊢
   unfold noaliasParams
   rw [List.all_cons]
   have hp0 : isCertifiedPtrParam ptrA ptrB { name := llvmRegOf ptrA, ty := .ptr as0, attrs := attrs0 } = true := by
     simp [isCertifiedPtrParam]
-  rw [hp0, Bool.true_and, hall, hneb, hmem]
+  rw [hp0, Bool.true_and, hall, hneb, hmem, hsafe]
   simp only [Bool.and_self, Bool.not_true, Bool.false_eq_true, ite_false,
     List.map_cons, beq_self_eq_true, Bool.true_or, ite_true, List.any_cons, hna]
 
@@ -1445,18 +1574,40 @@ theorem readBytesAt_disjoint_of_fact (m : ByteMem) (base addr width : Nat) (bs :
   ByteMem.readBytesAt_writeBytesAt_disjoint m base bs addr width
     (by unfold rangesDisjoint; exact decide_eq_true (Or.inl hb))
 
+theorem launchBoundsCert_gid_lt_len (cert : LaunchBoundsCert) (gidVar lenVar : VarId)
+    (gridDimX blockDimX runtimeLen ctaIdX tx : Nat)
+    (hcert : launchCertCovers (some cert) gidVar lenVar = true)
+    (hlaunch : launchCertMatchesLaunch cert gridDimX blockDimX runtimeLen = true)
+    (hcta : ctaIdX < gridDimX) (htx : tx < blockDimX) :
+    ctaIdX * blockDimX + tx < runtimeLen := by
+  unfold launchCertCovers at hcert
+  unfold launchCertMatchesLaunch at hlaunch
+  simp only [beq_iff_eq, Bool.and_eq_true, decide_eq_true_eq] at hcert hlaunch
+  rcases hcert with ⟨⟨⟨⟨_, _⟩, _⟩, hposC⟩, hminC⟩
+  rcases hlaunch with ⟨⟨hg, hb⟩, hlen⟩
+  have hposB : 0 < blockDimX := by rw [hb]; exact hposC
+  have hstep : ctaIdX * blockDimX + tx < (ctaIdX + 1) * blockDimX := by
+    rw [Nat.succ_mul]; omega
+  have hctaGrid : (ctaIdX + 1) * blockDimX ≤ gridDimX * blockDimX :=
+    Nat.mul_le_mul_right blockDimX (by omega)
+  have hgridMin : gridDimX * blockDimX ≤ cert.minLen := by
+    rw [hg, hb]; exact hminC
+  omega
+
 -- PTX: with an explicit `LaunchBoundsCert` and retained `idxLt`, the guarded gid prefix becomes
 -- the unguarded 11-instruction preamble. Coverage (`(ctaId.x + 1) * blockSize ≤ len`) keeps
 -- `gid * 8` and `nIn * len * 8 + gid * 8` non-wrapping in 64 bits across `shl.b64` and `add.u64`.
 
 theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
     (gidVar lenVar : VarId) (cert : LaunchBoundsCert) (suf : List PTXStmt) (cta : PTXCTAState)
-    (done todo : List PTXThreadState) (blockSize : Nat) (ctaId : PTXAst.Dim3)
+    (done todo : List PTXThreadState) (blockSize gridDimX : Nat) (ctaId : PTXAst.Dim3)
     {rf : PTXRegFile} {nP nR nRd : Nat} (hrt : RegTyped rf nP nR nRd)
     (localBytes tx len nIn : Nat) (hr : 2 < nR) (hrd : 6 < nRd)
     (hcta : cta.ctaId = ctaId) (hblk : cta.blockDim = { x := blockSize, y := 1, z := 1 })
     (htx : tx < blockSize) (hctaX : ctaId.x < 2 ^ 32) (hblkX : blockSize < 2 ^ 32)
-    (hcov : (ctaId.x + 1) * blockSize ≤ len) (houn : (nIn + 1) * len * 8 ≤ 2 ^ 64)
+    (hgrid : ctaId.x < gridDimX)
+    (hlaunch : launchCertMatchesLaunch cert gridDimX blockSize len = true)
+    (houn : (nIn + 1) * len * 8 ≤ 2 ^ 64)
     (hdone : ∀ t ∈ done, t.halted = true) (saved : List MemAccessLog)
     (hn : cta.paramMem.lookupParam? "param_n" = some (BitVec.ofNat 64 len))
     (hout : cta.paramMem.lookupParam? "param_out" = some (BitVec.ofNat 64 (nIn * len * 8)))
@@ -1479,10 +1630,9 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
   have hcta64 : ctaId.x < 2 ^ 64 := by omega
   have hblk64 : blockSize < 2 ^ 64 := by omega
   have hprod : ctaId.x * blockSize < 2 ^ 64 := by omega
-  have hgidLt : gid < len := by
-    have hstep : ctaId.x * blockSize + tx < (ctaId.x + 1) * blockSize := by
-      rw [Nat.succ_mul]; omega
-    exact Nat.lt_of_lt_of_le hstep hcov
+  have hgidLt : gid < len :=
+    launchBoundsCert_gid_lt_len cert gidVar lenVar gridDimX blockSize len ctaId.x tx
+      hcert hlaunch hgrid htx
   have hlen8 : nIn * len * 8 + len * 8 ≤ 2 ^ 64 := by
     have : (nIn + 1) * len * 8 = nIn * len * 8 + len * 8 := by simp [Nat.add_mul, Nat.one_mul]
     omega
@@ -1704,14 +1854,15 @@ private theorem metal_body (facts : FactEnv) (idxVar lenVar : VarId) (cert : Lau
     guardedWithFacts inner facts idxVar lenVar (some cert) = inner ++ [.returnStmt] := by
   simp [guardedWithFacts, hcert, h]
 
-theorem metalBoundsFreeLoad_sound (nIn len groupSize gx stepsInner : Nat)
+theorem metalBoundsFreeLoad_sound (nIn len groupSize gridDimX gx stepsInner : Nat)
     (inWords : Nat → List (BitVec 64)) (specWord : Nat → BitVec 64)
     (inner : List MSLStmt) (facts : FactEnv) (idxVar lenVar : VarId) (cert : LaunchBoundsCert)
     (hInner : LaneInnerSpec nIn len stepsInner inWords specWord inner)
     (hlen64 : len * 8 ≤ 2 ^ 64)
     (hcert : launchCertCovers (some cert) idxVar lenVar = true)
     (hmem : factMember facts (.idxLt idxVar lenVar) = true)
-    (hcov : (gx + 1) * groupSize ≤ len) :
+    (hgx : gx < gridDimX)
+    (hlaunch : launchCertMatchesLaunch cert gridDimX groupSize len = true) :
     let body := guardedWithFacts inner facts idxVar lenVar (some cert)
     let mkLane := fun tx => ({
       tid := { x := tx, y := 0, z := 0 }
@@ -1777,7 +1928,9 @@ theorem metalBoundsFreeLoad_sound (nIn len groupSize gx stepsInner : Nat)
     intro tx0 f g done outMem0 outMem htx hgrid hfuel hst hfn hbd hcb hin hout hsize hwords hlog hdone hthreads
     have hltGrp : gx * groupSize + tx0 < (gx + 1) * groupSize := by
       rw [Nat.succ_mul]; omega
-    have hcx : gx * groupSize + tx0 < len := Nat.lt_of_lt_of_le hltGrp hcov
+    have hcx : gx * groupSize + tx0 < len :=
+      launchBoundsCert_gid_lt_len cert idxVar lenVar gridDimX groupSize len gx tx0
+        hcert hlaunch hgx (by omega)
     have hcx32 : gx * groupSize + tx0 < 2 ^ 32 := Nat.lt_trans hltGrp hgrid
     have hfuel' : stepsInner + 1 ≤ f := by
       have : 1 * (stepsInner + 1) ≤ (r + 1) * (stepsInner + 1) := Nat.mul_le_mul_right _ (by omega)
@@ -1849,7 +2002,9 @@ theorem metalBoundsFreeLoad_sound (nIn len groupSize gx stepsInner : Nat)
     refine ⟨gF, outF, by rw [hrun]; exact hrun2, hinF, houtF, hsizeF, hwordsF, hlogF⟩
 
 theorem proofRetention_pipeline_nonvacuous :
-    let facts : FactEnv := [.exclusiveObj 0, .noOverflowAdd 1 2 true true, .disjointSlices 3 4 16 32, .idxLt 5 6]
+    let facts : FactEnv :=
+      [ .exclusiveObj 0, .noOverflowAdd 1 2 true true, .disjointSlices 3 4 16 32
+      , .idxLt 5 6, .idxLt 0 16 ]
     let st : HeapState := { buffers := [{ id := 1, exclusive := true, data := #[42] }], nextId := 2 }
     let env := (VarEnv.empty).bind 0 (.sarrayId 1)
     let rawCode : LNIRCode := .letBind 7 .i1 (.isExclusive 0)
@@ -1858,15 +2013,20 @@ theorem proofRetention_pipeline_nonvacuous :
     let llvmSt := bindReg (bindReg {} "v1" (.bits .i64 4#64)) "v2" (.bits .i64 5#64)
     let llvmIns := emitVerifiedLLVMWithFacts facts 1 2
       [.add "s" .none .i64 (.reg "v1") (.reg "v2")]
-    let ps := noaliasParams facts 3 4 16 32 [{ ty := .ptr 0, name := "v3" }]
+    let blk : LLVMBlock :=
+      { label := "entry"
+      , body := [.load "r" false (.int .i64) (.reg "v3") 8]
+      , term := .ret (some (.int .i64, .reg "r")) }
+    let ps := noaliasParams facts 3 4 16 32 [{ ty := .ptr 0, name := "v3" }] [blk]
     specCode = .letBind 7 .i1 (.scalar (.constBool true))
         (.letBind 8 (.sarray .i64) (.scalar (.var 0)) (.ret 8)) ∧
       evalCode 3 env st specCode = .ok (.sarrayId 1, st) ∧
       execInstrs {} 1 llvmSt llvmIns = .inr (bindReg llvmSt "s" (.bits .i64 9#64)) ∧
+      ps.any (fun p => p.attrs.contains .noalias) = true ∧
       bindArgs {} ps [.ptr 8#64] = some (bindReg {} "v3" (.ptr 8#64)) ∧
       (lowerBoundsFreePTXLoad facts 5 6 .u64 "%d" (.regOffset "%a" 0)).length = 1 ∧
       (lowerBoundsFreeMetalLoad facts 5 6 "buf").length = 1 := by
-  refine ⟨rfl, rfl, ?_, rfl, rfl, rfl⟩
+  refine ⟨rfl, rfl, ?_, rfl, rfl, rfl, rfl⟩
   decide
 
 end LeanNative.Proofs

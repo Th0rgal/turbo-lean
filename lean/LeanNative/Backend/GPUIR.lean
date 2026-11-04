@@ -40,18 +40,36 @@ structure GPUKernelDescriptor where
   deriving Repr, DecidableEq, Inhabited, BEq
 
 /-- Explicit host launch-geometry witness certifying that every launched SIMT lane satisfies
-`gridDim.x * blockDim.x ≤ len` for kernel lane index `gidVar` and bound `lenVar`.
+`gridDim.x * blockDim.x ≤ minLen ≤ runtimeLen` for kernel lane index `gidVar` and bound `lenVar`.
 Top-level `LNIRDecl` emitters round grids up to `blockThreads = 256` and never construct a
 `LaunchBoundsCert` from declaration scalar parameters. -/
 structure LaunchBoundsCert where
-  gidVar : VarId
-  lenVar : VarId
+  gidVar    : VarId
+  lenVar    : VarId
+  gridDimX  : Nat
+  blockDimX : Nat
+  minLen    : Nat
   deriving Repr, DecidableEq, Inhabited, BEq
 
 def launchCertCovers (launch? : Option LaunchBoundsCert) (gidVar lenVar : VarId) : Bool :=
   match launch? with
-  | some cert => cert.gidVar == gidVar && cert.lenVar == lenVar
+  | some cert =>
+    cert.gidVar == gidVar && cert.lenVar == lenVar &&
+    0 < cert.gridDimX && 0 < cert.blockDimX &&
+    cert.gridDimX * cert.blockDimX <= cert.minLen
   | none => false
+
+/-- Host launch contract checking that the runtime `(gridDimX, blockDimX, runtimeLen)` launch
+matches the `LaunchBoundsCert` under which SIMT lane guards were specialized. -/
+def launchCertMatchesLaunch (cert : LaunchBoundsCert)
+    (gridDimX blockDimX runtimeLen : Nat) : Bool :=
+  gridDimX == cert.gridDimX && blockDimX == cert.blockDimX && cert.minLen <= runtimeLen
+
+def launchOptMatchesLaunch (launch? : Option LaunchBoundsCert)
+    (gridDimX blockDimX runtimeLen : Nat) : Bool :=
+  match launch? with
+  | some cert => launchCertMatchesLaunch cert gridDimX blockDimX runtimeLen
+  | none => true
 
 /-- Check whether an `LNIRType` is supported for GPU kernel parameters, locals, or buffers. -/
 def isTypeGpuSupported (ty : LNIRType) : Bool :=

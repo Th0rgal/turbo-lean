@@ -537,10 +537,97 @@ def isCertifiedPtrParam (ptrA ptrB : VarId) (p : LLVMParam) : Bool :=
   | .ptr _ => p.name == llvmRegOf ptrA || p.name == llvmRegOf ptrB
   | _ => true
 
+def operandMentionsReg (r : RegName) : Operand → Bool
+  | .reg r' => r' == r
+  | .aggCons h t => operandMentionsReg r h || operandMentionsReg r t
+  | _ => false
+
+def instrDerefsReg (r : RegName) : LLVMInstr → Bool
+  | .load _ _ _ ptrOp _ _ | .store _ _ _ ptrOp _ _ => ptrOp == .reg r
+  | _ => false
+
+def blocksDerefReg (r : RegName) (blocks : List LLVMBlock) : Bool :=
+  blocks.any fun blk => blk.body.any (instrDerefsReg r)
+
+def isScalarNoAliasTy : LLVMType → Bool
+  | .void => true
+  | .int w => w.byteSize <= 8
+  | .float fw => fw.byteSize <= 8
+  | .ptr _ => true
+  | .structFields _ _ | .array _ _ | .vec _ _ => false
+
+def instrSafeForNoAlias (rA rB : RegName) : LLVMInstr → Bool
+  | .load dst _ ty ptrOp _ _ =>
+    dst != rA && dst != rB &&
+    (if ptrOp == .reg rA || ptrOp == .reg rB then isScalarNoAliasTy ty && ty.byteSize <= 8
+     else !operandMentionsReg rA ptrOp && !operandMentionsReg rB ptrOp)
+  | .store _ ty valOp ptrOp _ _ =>
+    !operandMentionsReg rA valOp && !operandMentionsReg rB valOp &&
+    (if ptrOp == .reg rA || ptrOp == .reg rB then isScalarNoAliasTy ty && ty.byteSize <= 8
+     else !operandMentionsReg rA ptrOp && !operandMentionsReg rB ptrOp)
+  | ins =>
+    let noMention (op : Operand) : Bool :=
+      !operandMentionsReg rA op && !operandMentionsReg rB op
+    let dstOk := instrDstReg? ins != some rA && instrDstReg? ins != some rB
+    dstOk && match ins with
+    | .alloca _ _ _ => true
+    | .add _ _ _ l r | .sub _ _ _ l r | .mul _ _ _ l r
+    | .udiv _ _ _ l r | .sdiv _ _ _ l r | .urem _ _ l r | .srem _ _ l r
+    | .and_ _ _ l r | .or_ _ _ l r | .xor _ _ l r
+    | .shl _ _ _ l r | .lshr _ _ _ l r | .ashr _ _ _ l r
+    | .icmp _ _ _ l r
+    | .fadd _ _ l r | .fsub _ _ l r | .fmul _ _ l r | .fdiv _ _ l r
+    | .fcmp _ _ _ l r
+    | .shufflevector _ _ _ _ l r _
+    | .insertvalue _ _ l _ r _ => noMention l && noMention r
+    | .zext _ _ a _ | .sext _ _ a _ | .trunc _ _ a _
+    | .bitcast _ _ a _ | .inttoptr _ _ a _ | .ptrtoint _ _ a _
+    | .extractvalue _ _ a _ => noMention a
+    | .select _ c _ t f | .insertelement _ _ _ c t _ f =>
+      noMention c && noMention t && noMention f
+    | .extractelement _ _ _ v _ idx => noMention v && noMention idx
+    | .getelementptr _ _ _ base idxs _ =>
+      noMention base && idxs.all fun (_, idxOp) => noMention idxOp
+    | .call _ _ _ args _ => args.all fun (_, argOp) => noMention argOp
+    | .atomicrmw _ _ ptrOp _ valOp _ _ _ => noMention ptrOp && noMention valOp
+    | .load _ _ _ _ _ _ | .store _ _ _ _ _ _ => false
+
+def termSafeForNoAlias (rA rB : RegName) : Terminator → Bool
+  | .br _ | .unreachable => true
+  | .condBr c _ _ | .switch _ c _ _ =>
+    !operandMentionsReg rA c && !operandMentionsReg rB c
+  | .ret none => true
+  | .ret (some (_, op)) =>
+    !operandMentionsReg rA op && !operandMentionsReg rB op
+
+def phiSafeForNoAlias (rA rB : RegName) (p : PhiNode) : Bool :=
+  p.dst != rA && p.dst != rB &&
+  p.incomings.all fun (op, _) => !operandMentionsReg rA op && !operandMentionsReg rB op
+
+def blockSafeForNoAlias (rA rB : RegName) (blk : LLVMBlock) : Bool :=
+  blk.phis.all (phiSafeForNoAlias rA rB) &&
+  blk.body.all (instrSafeForNoAlias rA rB) &&
+  termSafeForNoAlias rA rB blk.term
+
+def hasPositiveSliceBound (facts : FactEnv) (lenVar : VarId) : Bool :=
+  facts.any fun
+    | .idxLt _ n => n == lenVar
+    | _ => false
+
+def blocksNoAliasSafe (facts : FactEnv) (ptrA ptrB lenA lenB : VarId)
+    (blocks : List LLVMBlock) : Bool :=
+  let rA := llvmRegOf ptrA
+  let rB := llvmRegOf ptrB
+  blocks.all (blockSafeForNoAlias rA rB) &&
+  (!blocksDerefReg rA blocks || hasPositiveSliceBound facts lenA) &&
+  (!blocksDerefReg rB blocks || hasPositiveSliceBound facts lenB)
+
 def noaliasParams (facts : FactEnv) (ptrA ptrB lenA lenB : VarId)
-    (ps : List LLVMParam) : List LLVMParam :=
+    (ps : List LLVMParam) (blocks : List LLVMBlock := []) : List LLVMParam :=
   let allPtrCertified := ps.all (isCertifiedPtrParam ptrA ptrB)
-  if !(ptrA != ptrB && factMember facts (.disjointSlices ptrA ptrB lenA lenB) && allPtrCertified) then ps
+  let bodySafe := blocksNoAliasSafe facts ptrA ptrB lenA lenB blocks
+  if !(ptrA != ptrB && factMember facts (.disjointSlices ptrA ptrB lenA lenB) &&
+      allPtrCertified && bodySafe) then ps
   else ps.map fun p =>
     match p.ty with
     | .ptr _ =>
@@ -557,7 +644,7 @@ def emitVerifiedLLVMFnWithFacts (facts : FactEnv) (ptrA ptrB lenA lenB : VarId)
       { blk with body := emitVerifiedLLVMWithFacts entryFacts a b blk.body ptrVar } ::
         rest.map fun blk' => { blk' with body := emitVerifiedLLVMWithFacts tailFacts a b blk'.body ptrVar }
   { fn with
-    params := noaliasParams facts ptrA ptrB lenA lenB fn.params
+    params := noaliasParams facts ptrA ptrB lenA lenB fn.params blocks'
     blocks := blocks' }
 
 def applyRetainedFactsLLVMFn (facts : FactEnv) (fn : LLVMFn) : LLVMFn :=

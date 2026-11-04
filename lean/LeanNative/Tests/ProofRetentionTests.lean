@@ -169,30 +169,34 @@ def ptxParams (nv base outBase : Nat) : ParamMemory :=
 def runBoundsPTX (facts : FactEnv) (fuel lanes nv base outBase : Nat) (words : List (BitVec 64))
     (launch? : Option LaunchBoundsCert := none) :
     Option (List (BitVec 64)) :=
-  let g := wordMem base outBase words
-  match evalPTXKernel fuel (boundsFreePTXKernel facts 0 1 launch?)
-      ({ x := 1, y := 1, z := 1 } : LeanNative.Backend.PTXAst.Dim3)
-      { x := lanes, y := 1, z := 1 } g
-      (ptxParams nv base outBase) with
-  | .ok g' =>
-    (List.range words.length).mapM fun i => g'.loadBits (outBase + i * 8) 8
-  | _ => none
+  if !launchOptMatchesLaunch launch? 1 lanes nv then none
+  else
+    let g := wordMem base outBase words
+    match evalPTXKernel fuel (boundsFreePTXKernel facts 0 1 launch?)
+        ({ x := 1, y := 1, z := 1 } : LeanNative.Backend.PTXAst.Dim3)
+        { x := lanes, y := 1, z := 1 } g
+        (ptxParams nv base outBase) with
+    | .ok g' =>
+      (List.range words.length).mapM fun i => g'.loadBits (outBase + i * 8) 8
+    | _ => none
 
 def runBoundsMSL (facts : FactEnv) (fuel lanes nv : Nat) (words : List (BitVec 64))
     (launch? : Option LaunchBoundsCert := none) :
     Option (List (BitVec 64)) :=
-  let buf := LeanNative.Backend.MetalAst.ByteMemory.ofU64Words words
-  let out := LeanNative.Backend.MetalAst.ByteMemory.zeros (words.length * 8)
-  let dev := [(0, buf), (1, out)]
-  let cst := [(2, LeanNative.Backend.MetalAst.ByteMemory.ofU64Words [BitVec.ofNat 64 nv])]
-  match evalMSLKernel fuel (boundsFreeMetalKernel facts 0 1 launch?)
-      ({ x := 1, y := 1, z := 1 } : LeanNative.Backend.MetalAst.Dim3)
-      { x := lanes, y := 1, z := 1 } dev cst with
-  | .ok dev' =>
-    match dev'.lookup 1 with
-    | some m => (List.range words.length).mapM fun i => m.loadBits (i * 8) 8
-    | none => none
-  | _ => none
+  if !launchOptMatchesLaunch launch? 1 lanes nv then none
+  else
+    let buf := LeanNative.Backend.MetalAst.ByteMemory.ofU64Words words
+    let out := LeanNative.Backend.MetalAst.ByteMemory.zeros (words.length * 8)
+    let dev := [(0, buf), (1, out)]
+    let cst := [(2, LeanNative.Backend.MetalAst.ByteMemory.ofU64Words [BitVec.ofNat 64 nv])]
+    match evalMSLKernel fuel (boundsFreeMetalKernel facts 0 1 launch?)
+        ({ x := 1, y := 1, z := 1 } : LeanNative.Backend.MetalAst.Dim3)
+        { x := lanes, y := 1, z := 1 } dev cst with
+    | .ok dev' =>
+      match dev'.lookup 1 with
+      | some m => (List.range words.length).mapM fun i => m.loadBits (i * 8) 8
+      | none => none
+    | _ => none
 
 def idxCode : Code .pure :=
   .let (constLet 3 (mkConst ``Bool) ``UInt64.decLt [.fvar (fv 1), .fvar (fv 2)])
@@ -201,6 +205,10 @@ def idxCode : Code .pure :=
 def idxBranchCode : Code .pure :=
   .let (constLet 3 (mkConst ``Bool) ``UInt64.decLt [.fvar (fv 1), .fvar (fv 2)])
     (boolCases (fv 3) [trueRetAlt (fv 1), falseRetAlt (fv 2)])
+
+def idxFalseOnlyCode : Code .pure :=
+  .let (constLet 3 (mkConst ``Bool) ``UInt64.decLt [.fvar (fv 1), .fvar (fv 2)])
+    (boolCases (fv 3) [unreachAlt ``Bool.true, falseRetAlt (fv 2)])
 
 def natIdxCode : Code .pure :=
   .let (constLet 3 (mkConst ``Bool) ``Nat.blt [.fvar (fv 1), .fvar (fv 2)])
@@ -280,8 +288,40 @@ def specLoadWrongReg : LLVMInstr :=
   attachLoadStoreAlign [.alignedPtr 0 16] 0 (.load "r" false (.int .i64) (.reg "p") 1)
 def specStore : LLVMInstr :=
   attachLoadStoreAlign [.alignedPtr 0 16] 0 (.store false (.int .i64) (i64v 1) (.reg "v0") 1)
+def loadGepFn : LLVMFn :=
+  { name := "ld_gep", retTy := .int .i64
+  , params :=
+      [ { name := "v3", ty := .ptr 0 }
+      , { name := "v4", ty := .ptr 0 }
+      , { name := "len", ty := .int .i64 } ]
+  , blocks := [{ label := "entry", body :=
+      [ .getelementptr "p" true (.int .i64) (.reg "v3") [(.i64, i64v 8)] 0
+      , .load "r" false (.int .i64) (.reg "p") 8 ], term := .ret (some (.int .i64, .reg "r")) }] }
+
+def loadDerefV3Fn : LLVMFn :=
+  { name := "ld_v3", retTy := .int .i64
+  , params :=
+      [ { name := "v3", ty := .ptr 0 }
+      , { name := "v4", ty := .ptr 0 }
+      , { name := "len", ty := .int .i64 } ]
+  , blocks := [{ label := "entry", body :=
+      [.load "r" false (.int .i64) (.reg "v3") 8], term := .ret (some (.int .i64, .reg "r")) }] }
+
+def ptrEscapeRetFn : LLVMFn :=
+  { name := "ret_v3", retTy := .ptr 0
+  , params := [ { name := "v3", ty := .ptr 0 }, { name := "v4", ty := .ptr 0 } ]
+  , blocks := [{ label := "entry", body := [], term := .ret (some (.ptr 0, .reg "v3")) }] }
+
 def specFn : LLVMFn :=
   emitVerifiedLLVMFnWithFacts [.disjointSlices 3 4 16 32, .alignedPtr 0 16] 3 4 16 32 1 2 (loadFn 8) 0
+def specFnGep : LLVMFn :=
+  emitVerifiedLLVMFnWithFacts [.disjointSlices 3 4 16 32, .idxLt 0 16] 3 4 16 32 1 2 loadGepFn 0
+def specFnDerefNoPos : LLVMFn :=
+  emitVerifiedLLVMFnWithFacts [.disjointSlices 3 4 16 32] 3 4 16 32 1 2 loadDerefV3Fn 0
+def specFnDerefPos : LLVMFn :=
+  emitVerifiedLLVMFnWithFacts [.disjointSlices 3 4 16 32, .idxLt 0 16] 3 4 16 32 1 2 loadDerefV3Fn 0
+def specFnPtrEscape : LLVMFn :=
+  emitVerifiedLLVMFnWithFacts [.disjointSlices 3 4 16 32, .idxLt 0 16] 3 4 16 32 1 2 ptrEscapeRetFn 0
 def specFnLenMismatch : LLVMFn :=
   emitVerifiedLLVMFnWithFacts [.disjointSlices 3 4 16 32] 3 4 16 64 1 2 (loadFn 8) 0
 def specFn3Ptr : LLVMFn :=
@@ -315,8 +355,29 @@ def ptxFacts : FactEnv := [.idxLt 0 1]
 def ptxIrrelevantFacts : FactEnv := [.noOverflowAdd 0 1 true true, .alignedPtr 0 16, .idxLt 5 6]
 def ptxEmpty : FactEnv := []
 def ptxKind : ParallelKernelKind := .zipAdd
-def ptxCert : Option LaunchBoundsCert := some { gidVar := 0, lenVar := 1 }
-def ptxWrongCert : Option LaunchBoundsCert := some { gidVar := 9, lenVar := 1 }
+def ptxCert : Option LaunchBoundsCert :=
+  some { gidVar := 0, lenVar := 1, gridDimX := 1, blockDimX := 2, minLen := 2 }
+def ptxWrongCert : Option LaunchBoundsCert :=
+  some { gidVar := 9, lenVar := 1, gridDimX := 1, blockDimX := 2, minLen := 2 }
+def ptxOverGridCert : Option LaunchBoundsCert :=
+  some { gidVar := 0, lenVar := 1, gridDimX := 1, blockDimX := 256, minLen := 1 }
+def ptxCert256 : LaunchBoundsCert :=
+  { gidVar := 0, lenVar := 1, gridDimX := 1, blockDimX := 256, minLen := 256 }
+
+def customShadowDecl : LNIRDecl :=
+  { name := "custom_shadow_add"
+    params :=
+      [ { id := 0, name := "a", ty := .i64 }
+      , { id := 1, name := "b", ty := .i64 }
+      , { id := 2, name := "arrA", ty := .sarray .i64 }
+      , { id := 3, name := "arrB", ty := .sarray .i64 } ]
+    retTy := .sarray .i64
+    retainedFacts := [.noOverflowAdd 0 1 true true]
+    body :=
+      .letBind 4 .i64 (.sarrayLen 2)
+        (.parFor 5 4 [2, 3] .i64
+          (.customScalar 9 [0, 1] (.binOp .add (.var 0) (.var 1)))
+          (.ret 5)) }
 
 def e2eScalarDecl : LNIRDecl :=
   { name := "checked_add_u64"
@@ -364,6 +425,10 @@ def passCert : OptimizationCert :=
 #guard hasFact exclFacts (.exclusiveObj 1)
 #guard idxBranchFacts == []
 #guard hasFact idxArmFacts (.idxLt 1 2)
+#guard retainedPureFacts 8 idxFalseOnlyCode == []
+#guard retainedBranchFacts 8 idxFalseOnlyCode == []
+#guard !hasFact (retainedPureFacts 8 idxFalseOnlyCode) (.idxLt 1 2)
+#guard !hasFact (retainedBranchFacts 8 idxFalseOnlyCode) (.idxLt 1 2)
 #guard !hasFact idxFacts (.idxLt 2 1)
 #guard !hasFact propFacts (.noOverflowAdd 0 1 false false)
 #guard vidOf exclFacts (.exclusiveObj 1) == some 1
@@ -409,6 +474,10 @@ def passCert : OptimizationCert :=
 #guard specStore == .store false (.int .i64) (i64v 1) (.reg "v0") 16
 #guard hasSubstr (PP.ppInstr specLoad) ", align 16"
 #guard specFn.params.map (fun p => p.attrs.contains .noalias) == [true, true, false]
+#guard specFnGep.params.map (fun p => p.attrs.contains .noalias) == [false, false, false]
+#guard specFnDerefNoPos.params.map (fun p => p.attrs.contains .noalias) == [false, false, false]
+#guard specFnDerefPos.params.map (fun p => p.attrs.contains .noalias) == [true, true, false]
+#guard specFnPtrEscape.params.map (fun p => p.attrs.contains .noalias) == [false, false]
 #guard specFnLenMismatch.params.map (fun p => p.attrs.contains .noalias) == [false, false, false]
 #guard specFn3Ptr.params.map (fun p => p.attrs.contains .noalias) == [false, false, false]
 #guard specFnSelfDisjoint.params.map (fun p => p.attrs.contains .noalias) == [false, false, false]
@@ -438,6 +507,7 @@ def passCert : OptimizationCert :=
 #guard !hasSubstr (ppPTXKernel (boundsFreePTXKernel ptxFacts 0 1 ptxCert)) "setp.ge.u64"
 #guard hasSubstr (ppPTXKernel (boundsFreePTXKernel ptxFacts 0 1 none)) "setp.ge.u64"
 #guard hasSubstr (ppPTXKernel (boundsFreePTXKernel ptxFacts 0 1 ptxWrongCert)) "setp.ge.u64"
+#guard hasSubstr (ppPTXKernel (boundsFreePTXKernel ptxFacts 0 1 ptxOverGridCert)) "setp.ge.u64"
 #guard hasSubstr (ppPTXKernel (boundsFreePTXKernel ptxEmpty 0 1 ptxCert)) "setp.ge.u64"
 #guard hasSubstr (ppPTXKernel (boundsFreePTXKernel ptxFacts 0 1 ptxCert)) "%ctaid.x"
 #guard hasSubstr (ppPTXKernel (boundsFreePTXKernel ptxFacts 0 1 ptxCert)) "%tid.x"
@@ -448,6 +518,11 @@ def passCert : OptimizationCert :=
 #guard (LeanNative.Backend.PTXLower.lowerKindWithFacts "k" ptxIrrelevantFacts ptxKind 0 1 ptxCert).body ==
   (LeanNative.Backend.PTXLower.lowerKind "k" ptxKind).body
 #guard runBoundsPTX ptxFacts 64 2 2 16 48 [42#64, 77#64] ptxCert == some [42#64, 77#64]
+#guard runBoundsPTX ptxFacts 64 2 1 16 48 [42#64, 77#64] ptxCert == none
+#guard runBoundsPTX ptxFacts 64 256 256 16 48 [42#64, 77#64] ptxCert == none
+#guard !launchCertMatchesLaunch ptxCert256 1 256 1
+#guard !launchCertMatchesLaunch { gidVar := 0, lenVar := 1, gridDimX := 1, blockDimX := 2, minLen := 2 } 1 256 256
+#guard launchCertMatchesLaunch ptxCert256 1 256 256
 #guard runBoundsPTX ptxFacts 64 2 1 16 48 [42#64, 77#64] none == some [42#64, 0#64]
 #guard runBoundsPTX ptxEmpty 64 2 2 16 48 [42#64, 77#64] == some [42#64, 77#64]
 #guard runBoundsPTX ptxEmpty 64 2 1 16 48 [42#64, 77#64] == some [42#64, 0#64]
@@ -461,6 +536,7 @@ def passCert : OptimizationCert :=
 #guard !hasSubstr (ppMSLKernel (boundsFreeMetalKernel ptxFacts 0 1 ptxCert)) "if ("
 #guard hasSubstr (ppMSLKernel (boundsFreeMetalKernel ptxFacts 0 1 none)) "if ("
 #guard hasSubstr (ppMSLKernel (boundsFreeMetalKernel ptxFacts 0 1 ptxWrongCert)) "if ("
+#guard hasSubstr (ppMSLKernel (boundsFreeMetalKernel ptxFacts 0 1 ptxOverGridCert)) "if ("
 #guard hasSubstr (ppMSLKernel (boundsFreeMetalKernel ptxEmpty 0 1 ptxCert)) "if ("
 #guard hasSubstr (ppMSLKernel (boundsFreeMetalKernel ptxFacts 0 1 ptxCert)) "thread_position_in_grid"
 #guard !hasSubstr (ppMSLKernel (LeanNative.Backend.MetalLower.lowerKindWithFacts "k" ptxFacts ptxKind 0 1 ptxCert)) "if ("
@@ -468,6 +544,8 @@ def passCert : OptimizationCert :=
 #guard hasSubstr (ppMSLKernel (LeanNative.Backend.MetalLower.lowerKindWithFacts "k" ptxIrrelevantFacts ptxKind 0 1 ptxCert)) "if ("
 #guard hasSubstr (ppMSLKernel (LeanNative.Backend.MetalLower.lowerKind "k" ptxKind)) "if ("
 #guard runBoundsMSL ptxFacts 16 2 2 [99#64, 55#64] ptxCert == some [99#64, 55#64]
+#guard runBoundsMSL ptxFacts 16 2 1 [99#64, 55#64] ptxCert == none
+#guard runBoundsMSL ptxFacts 16 256 256 [99#64, 55#64] ptxCert == none
 #guard runBoundsMSL ptxFacts 16 2 1 [99#64, 55#64] none == some [99#64, 0#64]
 #guard runBoundsMSL ptxEmpty 16 2 2 [99#64, 55#64] == some [99#64, 55#64]
 #guard runBoundsMSL ptxEmpty 16 2 1 [99#64, 55#64] == some [99#64, 0#64]
@@ -484,6 +562,11 @@ def passCert : OptimizationCert :=
   "add nsw nuw i64"
 #guard !hasSubstr (LeanNative.Backend.LLVM.emitLLVMOptimized { moduleName := "m", decls := [{ e2eScalarDecl with retainedFacts := [] }] })
   "add nsw nuw i64"
+#guard
+  let ir := LeanNative.Backend.LLVM.emitDeclLLVM true customShadowDecl .x86_64
+  hasSubstr ir "cs_value" && hasSubstr ir "= add i64 %cs_value" &&
+    !hasSubstr ir "= add nsw nuw i64" && !hasSubstr ir "nsw i64 %cs_value" &&
+    !hasSubstr ir "nuw i64 %cs_value"
 #guard !hasSubstr (LeanNative.Backend.LLVM.emitLLVMBaseline { moduleName := "m", decls :=
   [{ name := "disj_fn", params := [{ id := 0, name := "p", ty := .rawPtr .i64 }, { id := 1, name := "q", ty := .rawPtr .i64 },
      { id := 2, name := "la", ty := .i64 }, { id := 3, name := "lb", ty := .i64 }],

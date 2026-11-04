@@ -23,7 +23,9 @@ open LeanNative.Backend.PTXAst
 open LeanNative.Backend.MetalAst
 
 export LeanNative.IR (RetainedFact FactEnv factMember consFact)
-export LeanNative.Backend.GPUIR (LaunchBoundsCert launchCertCovers)
+export LeanNative.Backend.GPUIR (
+  LaunchBoundsCert launchCertCovers launchCertMatchesLaunch launchOptMatchesLaunch
+)
 
 set_option autoImplicit false
 
@@ -495,12 +497,13 @@ def altIsUnreach (alt : Lean.Compiler.LCNF.Alt .pure) : Bool :=
   | _ => false
 
 def onlyTrueReachable (alts : List (Lean.Compiler.LCNF.Alt .pure)) : Bool :=
-  alts.any altIsTrue && alts.all fun a => altIsTrue a || altIsUnreach a
+  alts.any (fun a => altIsTrue a && !altIsUnreach a) &&
+    alts.all fun a => altIsTrue a || altIsUnreach a
 
-/-- Facts contributed by the `true` arm of a recognized test. -/
+/-- Facts contributed by a reachable `true` arm of a recognized test. -/
 def trueArmFact (fact : Option RetainedFact) (alt : Lean.Compiler.LCNF.Alt .pure) :
     Option RetainedFact :=
-  if altIsTrue alt then fact else none
+  if altIsTrue alt && !altIsUnreach alt then fact else none
 
 def collectPureStep (fuel : Nat) (st : RetentionState)
     (work : Lean.Compiler.LCNF.Code .pure ⊕ List (Lean.Compiler.LCNF.Alt .pure)) :
@@ -568,14 +571,14 @@ def collectBranchStep (fuel : Nat) (st : RetentionState)
         match known.find? (fun e => e.1 == c.discr) with
         | some (_, fact) => c.alts.toList.filterMap (trueArmFact fact)
         | none => []
-      let reachable := c.alts.toList.filter fun a => !altIsUnreach a
-      let promote := reachable.length <= 1
+      let promote := onlyTrueReachable c.alts.toList
       let st2 := extra.foldl (fun acc f =>
         if promote then pushFactOpt acc (some f) else pushBranchFact acc (some f)) st1
+      let reachableAlts := c.alts.toList.filter fun a => !altIsUnreach a
       if promote then
-        collectBranchStep fuel st2 known (.inr c.alts.toList)
+        collectBranchStep fuel st2 known (.inr reachableAlts)
       else
-        let stArms := collectBranchStep fuel { st2 with facts := [] } known (.inr c.alts.toList)
+        let stArms := collectBranchStep fuel { st2 with facts := [] } known (.inr reachableAlts)
         { st2 with branchFacts := stArms.facts ++ stArms.branchFacts }
     | .inl (.return fv) => (internFVar st fv).2
     | .inl (.jmp fv args) =>
@@ -767,7 +770,10 @@ export LeanNative.Backend.LLVMLower (
   overflowFlagsOf overflowOf subFlagsOf llvmRegOf mergeFlags attachOverflow
   alignOfFact attachLoadStoreAlign instrDstReg? factVarIds killRegFacts
   immutableParamFacts entryIsStraight emitVerifiedLLVMWithFacts emitBlockBodyWithFacts
-  withNoAlias isCertifiedPtrParam noaliasParams emitVerifiedLLVMFnWithFacts applyRetainedFactsLLVMFn
+  withNoAlias isCertifiedPtrParam operandMentionsReg instrDerefsReg blocksDerefReg
+  isScalarNoAliasTy instrSafeForNoAlias termSafeForNoAlias phiSafeForNoAlias
+  blockSafeForNoAlias hasPositiveSliceBound blocksNoAliasSafe noaliasParams
+  emitVerifiedLLVMFnWithFacts applyRetainedFactsLLVMFn
 )
 
 /-- Intra-kernel scalar array load bounds-check elimination on PTX: inside a thread body,

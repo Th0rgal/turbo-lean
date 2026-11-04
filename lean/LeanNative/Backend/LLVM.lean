@@ -1143,14 +1143,29 @@ def emitParForLoop (outVar lenVar : VarId) (inputs : List VarId) (_elemTy : LNIR
       let m ← freshTmp "st_mul"; emitLine s!"  {m} = mul i64 {v0}, {wCenter}"; pure m
     | .customScalar idxVar inVars body => do
       let saved := (← get).scalarBindings
+      let savedFacts := (← get).retainedFacts
+      let shadowed := idxVar :: inVars
+      let keepFact (f : RetainedFact) : Bool :=
+        match f with
+        | .idxLt i n => !shadowed.contains i && !shadowed.contains n
+        | .noOverflowAdd a b _ _ | .noOverflowSub a b _ _ | .noOverflowMul a b _ _ =>
+          !shadowed.contains a && !shadowed.contains b
+        | .alignedPtr p _ => !shadowed.contains p
+        | .disjointSlices a b la lb =>
+          !shadowed.contains a && !shadowed.contains b &&
+          !shadowed.contains la && !shadowed.contains lb
+        | .exclusiveObj o => !shadowed.contains o
       let mut bindings := [(idxVar, ivVal)]
       for (bound, input) in inVars.zip inputs do
         let arr ← loadVarAsPtr input; let ptr ← freshTmp "cs_ptr"; let elemPtr ← freshTmp "cs_at"; let value ← freshTmp "cs_value"
         emitLine s!"  {ptr} = getelementptr inbounds i64, ptr {arr}, i64 3\n  {elemPtr} = getelementptr inbounds i64, ptr {ptr}, i64 {ivVal}\n  {value} = load i64, ptr {elemPtr}, align 8"
         bindings := bindings ++ [(bound, value)]
-      modify fun s => { s with scalarBindings := bindings ++ saved }
+      modify fun s => {
+        s with
+        scalarBindings := bindings ++ saved
+        retainedFacts := savedFacts.filter keepFact }
       let value ← emitScalarExprWithWidth "i64" "63" body
-      modify fun s => { s with scalarBindings := saved }; pure value
+      modify fun s => { s with scalarBindings := saved, retainedFacts := savedFacts }; pure value
   if isDot then do
     emitLine s!"  {nextAcc} = add i64 {accVal}, {resVal}"
   else do
