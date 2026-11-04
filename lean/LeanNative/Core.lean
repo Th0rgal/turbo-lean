@@ -56,6 +56,7 @@ import LeanNative.Transform.OwnershipRC
 import LeanNative.Transform.AlgebraicOpt
 import LeanNative.Transform.UnboxTupleSROA
 import LeanNative.Transform.HoistExclusivity
+import LeanNative.Transform.AsyncStateMachine
 import LeanNative.Transform.LoopVectorizeOpt
 import LeanNative.Transform.KernelFusion
 import LeanNative.Transform.Superopt
@@ -78,7 +79,6 @@ import LeanNative.Backend.Hybrid
 import LeanNative.Backend.FastCheck
 import LeanNative.Driver.EvalBatch
 import LeanNative.Driver.CoreCLI
-import LeanNative.Transform.AsyncStateMachine
 import LeanNative.Proofs.AsyncStateMachineProofs
 
 namespace LeanNative.Core

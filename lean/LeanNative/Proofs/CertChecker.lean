@@ -94,7 +94,8 @@ def verifiedTheoremRegistry : List String :=
     "checkedSubSlice_valid", "checkedSubSlice_oob_rejects", "subSliceBounds_no_oob",
     "lowerSliceGet_sound", "lowerSliceRawLoad_sound", "sliceFoldStep_sound",
     "sliceFoldLoop_sound", "lowerSliceFold_sound",
-    "lowerRealLCNFCode_sound", "lowerRealLCNFDecl_sound"
+    "lowerRealLCNFCode_sound", "lowerRealLCNFDecl_sound",
+    "asyncStateMachinePass_sound"
   ]
   let xform := [
     "optimizeEqSatCode_sound", "applyLoopScheduleAux_refines",

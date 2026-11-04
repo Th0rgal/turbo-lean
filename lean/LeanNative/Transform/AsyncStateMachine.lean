@@ -281,7 +281,7 @@ theorem unboxAsyncFrameHead_refines (dst : VarId) (ty : LNIRType)
               rw [htag, hst, hval] at hsrc
               dsimp only [evalCode, evalExpr, evalVarList, evalScalarExpr] at hsrc ⊢
               rw [VarEnv.bind_self] at hsrc
-              simp only [List.getElem?_cons_zero, List.getElem?_cons_succ] at hsrc
+              simp only [List.getElem?_cons_zero] at hsrc
               have hne_td : dst ≠ dstTag :=
                 Ne.symm (beq_eq_false_iff_ne.mp htd)
               have hne_sd : dst ≠ dstState :=
@@ -292,14 +292,14 @@ theorem unboxAsyncFrameHead_refines (dst : VarId) (ty : LNIRType)
                   ((env.bind dst (.tuple [vt, vs, vv])).bind dstTag vt) dst =
                     some (.tuple [vt, vs, vv]) := by
                 rw [VarEnv.bind_apply, beq_eq_false_iff_ne.mpr hne_td,
-                  if_neg Bool.noConfusion, VarEnv.bind_self]
+                  ite_eq_right Bool.noConfusion, VarEnv.bind_self]
               rw [hproj1] at hsrc
               simp only [List.getElem?_cons_zero, List.getElem?_cons_succ] at hsrc
               have hproj2 :
                   (((env.bind dst (.tuple [vt, vs, vv])).bind dstTag vt).bind dstState vs) dst =
                     some (.tuple [vt, vs, vv]) := by
                 rw [VarEnv.bind_apply, beq_eq_false_iff_ne.mpr hne_sd,
-                  if_neg Bool.noConfusion, hproj1]
+                  ite_eq_right Bool.noConfusion, hproj1]
               rw [hproj2] at hsrc
               simp only [List.getElem?_cons_zero, List.getElem?_cons_succ] at hsrc
               have henvSrc :
@@ -326,7 +326,7 @@ theorem unboxAsyncFrameHead_refines (dst : VarId) (ty : LNIRType)
                 rw [VarEnv.bind_apply]
                 have hsw1 : (valV == dstState) = false :=
                   beq_eq_false_iff_ne.mpr (Ne.symm (beq_eq_false_iff_ne.mp hs2))
-                rw [hsw1, if_neg Bool.noConfusion, VarEnv.bind_apply]
+                rw [hsw1, ite_eq_right Bool.noConfusion, VarEnv.bind_apply]
                 have hsw2 : (valV == dstTag) = false :=
                   beq_eq_false_iff_ne.mpr (Ne.symm (beq_eq_false_iff_ne.mp ht2))
                 rw [hsw2]

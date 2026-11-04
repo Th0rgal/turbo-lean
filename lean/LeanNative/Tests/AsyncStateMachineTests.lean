@@ -144,4 +144,36 @@ def escapingClosureFrameDecl : LNIRDecl := {
 #guard (let (d', cert) := asyncStateMachinePass.runDecl escapingClosureFrameDecl
         cert.changed == false && d'.body == escapingClosureFrameDecl.body)
 
+-- 5. The verified kernel contract is registered and its emitted certificate verifies:
+#guard LeanNative.Proofs.isRegisteredTheorem verifiedAsyncStateMachineContract.theoremRef == true
+#guard LeanNative.Proofs.isRegisteredTheorem "LeanNative.Proofs.asyncStateMachinePass_sound" == true
+#guard (LeanNative.Proofs.verifySingleCert
+  { passName := "AsyncStateMachine", declName := "d5_unbox_frame",
+    inputHash := "h1", outputHash := "h2", changed := true,
+    assurance := .verifiedKernelProof,
+    theoremRef := "LeanNative.Proofs.unregistered_fake_theorem", notes := "" }).1 == false
+
+#guard (let (d', cert) := asyncStateMachinePass.runDecl nonEscapingFrameDecl
+        let optCert : LeanNative.Proofs.OptimizationCert := {
+          passName := cert.passName, declName := cert.declName,
+          inputHash := cert.inputHash, outputHash := cert.outputHash,
+          changed := cert.changed, assurance := cert.assurance,
+          theoremRef := cert.theoremRef, notes := cert.notes }
+        let res := LeanNative.Proofs.verifySingleCert optCert
+        cert.changed == true && codeHasMkTuple d'.body == false &&
+          res.1 == true && res.2 == [])
+
+#guard (let (m', stepCerts) := runVerifiedKernelPipeline
+          { moduleName := "d5_async_pipeline_test", decls := [nonEscapingFrameDecl] }
+        let optCerts := stepCerts.map fun c => ({
+          passName := c.passName, declName := c.declName,
+          inputHash := c.inputHash, outputHash := c.outputHash,
+          changed := c.changed, assurance := c.assurance,
+          theoremRef := c.theoremRef, notes := c.notes } : LeanNative.Proofs.OptimizationCert)
+        let rep := LeanNative.Proofs.verifyModuleCerts "d5_async_pipeline_test" optCerts
+        rep.verified == true && rep.errors == [] &&
+          rep.overallAssurance == .verifiedKernelProof &&
+          optCerts.any (fun c => c.passName == "AsyncStateMachine" && c.changed == true) &&
+          (match m'.decls with | [d'] => codeHasMkTuple d'.body == false | _ => false))
+
 end LeanNative.Tests.AsyncStateMachineTests
