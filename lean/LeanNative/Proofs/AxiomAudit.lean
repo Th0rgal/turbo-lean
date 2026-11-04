@@ -525,7 +525,7 @@ elab "#verify_lean_native_axioms" : command => do
       for j in [:pairs] do
         let l := chunks[2 * j]!
         let r := chunks[2 * j + 1]!
-        next := next.push (mkApp3 (mkConst ``List.append [levelZero]) (mkConst ``TheoremAxiomAudit) l r)
+        next := next.push (mkApp3 (mkConst ``List.append [Level.zero]) (mkConst ``TheoremAxiomAudit) l r)
       if chunks.size % 2 == 1 then
         next := next.push chunks[chunks.size - 1]!
       chunks := next
