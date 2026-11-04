@@ -26,6 +26,7 @@ import LeanNative.Proofs.HybridCAbiProofs
 import LeanNative.Proofs.KernelFusionProofs
 import LeanNative.Proofs.ClosureADTProofs
 import LeanNative.Proofs.SliceViewProofs
+import LeanNative.Proofs.UnboxedRegionProofs
 import LeanNative.Proofs.HeapObjAbiProofs
 import LeanNative.Proofs.LLVMLowerProofs
 import LeanNative.Proofs.StableHLOLowerProofs
@@ -402,6 +403,15 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.asyncStateMachinePass_sound
   , ``LeanNative.Proofs.checkNonEscapingAsync_rejects_closure
   , ``LeanNative.Proofs.asyncStateMachine_zeroAlloc_nonvacuous
+  , ``LeanNative.Proofs.elideMarkMtAndZeroRc_sound
+  , ``LeanNative.Proofs.unboxedStructLayout_disjoint_aligned
+  , ``LeanNative.Proofs.lowerUnboxedRegionRcFree_true
+  , ``LeanNative.Proofs.lowerUnboxedRegionCode_sound
+  , ``LeanNative.Proofs.borrowedSliceSub_valid
+  , ``LeanNative.Proofs.threadLocalEscape_no_mark_mt_sound
+  , ``LeanNative.Proofs.sendableTransfer_unique_sound
+  , ``LeanNative.Proofs.portableSimdVec_lane_roundtrip_sound
+  , ``LeanNative.Proofs.unboxedRegion_pipeline_nonvacuous
   ]
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/
