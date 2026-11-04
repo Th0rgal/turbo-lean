@@ -26,6 +26,7 @@ import LeanNative.Proofs.HybridCAbiProofs
 import LeanNative.Proofs.KernelFusionProofs
 import LeanNative.Proofs.ClosureADTProofs
 import LeanNative.Proofs.SliceViewProofs
+import LeanNative.Proofs.UnboxedRegionProofs
 import LeanNative.Proofs.HeapObjAbiProofs
 import LeanNative.Proofs.LLVMLowerProofs
 import LeanNative.Proofs.StableHLOLowerProofs
@@ -402,6 +403,43 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.asyncStateMachinePass_sound
   , ``LeanNative.Proofs.checkNonEscapingAsync_rejects_closure
   , ``LeanNative.Proofs.asyncStateMachine_zeroAlloc_nonvacuous
+  , ``LeanNative.Transform.elideMarkMtAndZeroRc_sound
+  , ``LeanNative.Transform.optimizeThreadLocalOwnershipRC_sound
+  , ``LeanNative.Transform.elideBorrowedAndThreadLocalRC_sound
+  , ``LeanNative.Transform.evalIncRef_obj_uaf
+  , ``LeanNative.Transform.evalDecRef_obj_uaf
+  , ``LeanNative.Proofs.unboxedStructLayout_disjoint_aligned
+  , ``LeanNative.Proofs.lowerUnboxedRegionRcFree_true
+  , ``LeanNative.Proofs.lowerUnboxedRegionCode_sound
+  , ``LeanNative.Proofs.borrowedSliceSub_valid
+  , ``LeanNative.Proofs.evalBorrowedObjPair_cancel
+  , ``LeanNative.Proofs.elideMarkMtAndZeroRc_preserves_nonEscape
+  , ``LeanNative.Proofs.elideBorrowed_preserves_nonEscape
+  , ``LeanNative.Proofs.threadLocalEscape_no_mark_mt_sound
+  , ``LeanNative.Proofs.headerRc_atomic_threadLocal_inc_equiv
+  , ``LeanNative.Proofs.headerRc_atomic_threadLocal_dec_equiv
+  , ``LeanNative.Proofs.sendableTransfer_unique_sound
+  , ``LeanNative.Proofs.portableSimdVec_lane_roundtrip_sound
+  , ``LeanNative.Proofs.portableSimdVec_oob_poison
+  , ``LeanNative.Proofs.disjoint_fields_storeInt_noninterference
+  , ``LeanNative.Proofs.unboxedRegion_pipeline_nonvacuous
+  , ``LeanNative.Proofs.rmw_subword_roundtrip_u64
+  , ``LeanNative.Proofs.rmw_subword_disjoint_u64
+  , ``LeanNative.Proofs.lowerBorrowedSliceLoad_unaligned_slice_none
+  , ``LeanNative.Proofs.lowerBorrowedSliceLoad_unaligned_idx_traps
+  , ``LeanNative.Proofs.lowerUnboxedFieldLoad_unaligned_idx_traps
+  , ``LeanNative.Proofs.lowerUnboxedFieldStore_unaligned_idx_traps
+  , ``LeanNative.Proofs.lowerUnboxedFieldStore_eval_subword
+  , ``LeanNative.Proofs.lowerUnboxedFieldLoad_eval_subword
+  , ``LeanNative.Proofs.lnir_packed_u32_pair_store_load_sound
+  , ``LeanNative.Proofs.loadVal_storeTypedVal_same_scalar
+  , ``LeanNative.Proofs.disjoint_fields_store_noninterference
+  , ``LeanNative.Proofs.emitLLVMFieldStore_load_roundtrip_sound
+  , ``LeanNative.Proofs.tlCheckNonEscaping_eq_checkThreadLocalNonEscaping
+  , ``LeanNative.Proofs.checkThreadLocalNonEscaping_rejects_alias_escapes
+  , ``LeanNative.Proofs.optimizeThreadLocalOwnershipRC_preserves_escaping_mark_mt
+  , ``LeanNative.Proofs.optimizeThreadLocalOwnershipRC_mark_mt_nonvacuous
+  , ``LeanNative.Proofs.sendableRecv_preserves_disjoint
   ]
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/

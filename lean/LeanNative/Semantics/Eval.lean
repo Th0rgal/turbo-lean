@@ -402,6 +402,17 @@ def evalExpr (env : VarEnv) (st : HeapState) (e : LNIRExpr) : Except UBError (Va
           | some buf => .ok (.u64 buf.data.size.toUInt64, st)
           | none => .error (.typeError s!"unknown sarray buffer {bufId}")
         | _ => .error (.typeError "lean_native_sarray_len expects 1 sarrayId argument")
+      else if fnName == "lean_mark_mt" then
+        match vals with
+        | [.sarrayId bufId] =>
+          match st.findBuffer bufId with
+          | some _ => .ok (.u64 0, st)
+          | none => .error (.useAfterFree bufId)
+        | [.objPtr objId] =>
+          if st.getObjRefCount objId == 0 then .error (.useAfterFree objId)
+          else .ok (.u64 0, st)
+        | [_] => .ok (.u64 0, st)
+        | _ => .error (.typeError "lean_mark_mt expects 1 argument")
       else if fnName == "lean_native_ctor_set" || fnName == "lean_native_ctor_set_scalar" then
         -- C4.2: `Code.oset` (object slot) / `Code.uset`·`Code.sset` (scalar slot, `scalarFields` index)
         match vals with

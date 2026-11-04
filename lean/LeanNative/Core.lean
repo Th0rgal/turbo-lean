@@ -3,6 +3,7 @@ import LeanNative.IR.AST
 import LeanNative.IR.Codec
 import LeanNative.IR.ClosureADT
 import LeanNative.IR.SliceView
+import LeanNative.IR.UnboxedRegion
 import LeanNative.Spec
 import LeanNative.Semantics.Value
 import LeanNative.Semantics.Eval
@@ -38,6 +39,7 @@ import LeanNative.Proofs.HybridCAbiProofs
 import LeanNative.Proofs.KernelFusionProofs
 import LeanNative.Proofs.ClosureADTProofs
 import LeanNative.Proofs.SliceViewProofs
+import LeanNative.Proofs.UnboxedRegionProofs
 import LeanNative.Proofs.HeapObjAbiProofs
 import LeanNative.Proofs.LLVMLowerProofs
 import LeanNative.Proofs.StableHLOLowerProofs
