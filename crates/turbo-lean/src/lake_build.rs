@@ -2128,10 +2128,15 @@ pub(crate) fn are_all_project_oleans_up_to_date(
             return false;
         }
         checked_oleans += 1;
+        let olean_mtime = olean_meta.modified().ok();
+        if let (Some(om), Some(lm)) = (olean_mtime, lakefile_mtime) {
+            if om < lm {
+                return false;
+            }
+        }
         if opt_out {
             let src_path = canon_dir.join(rel_path);
             let src_mtime = fs::metadata(&src_path).and_then(|m| m.modified()).ok();
-            let olean_mtime = olean_meta.modified().ok();
             let is_mtime_fresh = match (src_mtime, olean_mtime) {
                 (Some(sm), Some(om)) if om >= sm => lakefile_mtime.is_none_or(|lm| om >= lm),
                 _ => false,
