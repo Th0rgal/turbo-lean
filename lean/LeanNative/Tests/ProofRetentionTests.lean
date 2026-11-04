@@ -312,8 +312,21 @@ def ptrEscapeRetFn : LLVMFn :=
   , params := [ { name := "v3", ty := .ptr 0 }, { name := "v4", ty := .ptr 0 } ]
   , blocks := [{ label := "entry", body := [], term := .ret (some (.ptr 0, .reg "v3")) }] }
 
+def loadIntToPtrFn : LLVMFn :=
+  { name := "ld_inttoptr", retTy := .int .i64
+  , params :=
+      [ { name := "v3", ty := .ptr 0 }
+      , { name := "v4", ty := .ptr 0 }
+      , { name := "v8", ty := .int .i64 } ]
+  , blocks := [{ label := "entry", body :=
+      [ .store false (.int .i64) (i64v 7) (.reg "v3") 8
+      , .inttoptr "q" .i64 (.reg "v8") 0
+      , .load "r" false (.int .i64) (.reg "q") 8 ], term := .ret (some (.int .i64, .reg "r")) }] }
+
 def specFn : LLVMFn :=
   emitVerifiedLLVMFnWithFacts [.disjointSlices 3 4 16 32, .alignedPtr 0 16] 3 4 16 32 1 2 (loadFn 8) 0
+def specFnIntToPtr : LLVMFn :=
+  emitVerifiedLLVMFnWithFacts [.disjointSlices 3 4 16 32, .idxLt 0 16, .idxLt 0 32] 3 4 16 32 1 2 loadIntToPtrFn 3
 def specFnGep : LLVMFn :=
   emitVerifiedLLVMFnWithFacts [.disjointSlices 3 4 16 32, .idxLt 0 16] 3 4 16 32 1 2 loadGepFn 0
 def specFnDerefNoPos : LLVMFn :=
@@ -473,7 +486,8 @@ def passCert : OptimizationCert :=
 #guard specLoadWrongReg == .load "r" false (.int .i64) (.reg "p") 1
 #guard specStore == .store false (.int .i64) (i64v 1) (.reg "v0") 16
 #guard hasSubstr (PP.ppInstr specLoad) ", align 16"
-#guard specFn.params.map (fun p => p.attrs.contains .noalias) == [true, true, false]
+#guard specFn.params.map (fun p => p.attrs.contains .noalias) == [false, false, false]
+#guard specFnIntToPtr.params.map (fun p => p.attrs.contains .noalias) == [false, false, false]
 #guard specFnGep.params.map (fun p => p.attrs.contains .noalias) == [false, false, false]
 #guard specFnDerefNoPos.params.map (fun p => p.attrs.contains .noalias) == [false, false, false]
 #guard specFnDerefPos.params.map (fun p => p.attrs.contains .noalias) == [true, true, false]
@@ -483,7 +497,7 @@ def passCert : OptimizationCert :=
 #guard specFnSelfDisjoint.params.map (fun p => p.attrs.contains .noalias) == [false, false, false]
 #guard (applyRetainedFactsLLVMFn [.disjointSlices 3 4 16 32] (loadFn 8)).params.map
   (fun p => p.attrs.contains .noalias) == [false, false, false]
-#guard hasSubstr (PP.ppFn specFn) "noalias"
+#guard hasSubstr (PP.ppFn specFnDerefPos) "noalias"
 #guard specFn.blocks.head?.map (fun b => b.body.head?) ==
   some (some (.load "r" false (.int .i64) (.reg "v0") 16))
 #guard rebindAddSeq ==

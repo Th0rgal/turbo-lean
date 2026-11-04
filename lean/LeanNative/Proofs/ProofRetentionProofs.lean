@@ -1451,7 +1451,11 @@ theorem llvmNoAliasParam_of_disjoint_sound (st : ExecState) (facts : FactEnv)
         st.regs.lookup (llvmRegOf lenB) = some (.bits .i64 lbv.toBitVec) ∧
         rangesDisjoint av.toNat (lav.toNat * 8) bv.toNat (lbv.toNat * 8) = true ∧
         (∀ blk ∈ blocks, ∀ ins ∈ blk.body,
-          instrSafeForNoAlias (llvmRegOf ptrA) (llvmRegOf ptrB) ins = true) ∧
+          instrSafeForNoAlias (llvmRegOf ptrA) (llvmRegOf ptrB) ins = true ∧
+          (∀ dst vol ty ptrOp al as0, ins = .load dst vol ty ptrOp al as0 →
+            ptrOp = .reg (llvmRegOf ptrA) ∨ ptrOp = .reg (llvmRegOf ptrB)) ∧
+          (∀ vol ty valOp ptrOp al as0, ins = .store vol ty valOp ptrOp al as0 →
+            ptrOp = .reg (llvmRegOf ptrA) ∨ ptrOp = .reg (llvmRegOf ptrB))) ∧
         (∀ (m : ByteMem) (blkW blkR : LLVMBlock) (volW volR : Bool) (tyW tyR : LLVMType)
             (valOp : Operand) (alW alR asW asR : Nat) (dstR : RegName) (v : LLVMVal),
           blkW ∈ blocks → blkR ∈ blocks →
@@ -1546,19 +1550,36 @@ theorem llvmNoAliasParam_of_disjoint_sound (st : ExecState) (facts : FactEnv)
     have hlb1 : 1 ≤ lb.toNat := hposFromBoundB hboundB
     have hsafeW := hinsSafe blkW hblkW _ hst
     have hsafeR := hinsSafe blkR hblkR _ hld
-    simp only [instrSafeForNoAlias, beq_self_eq_true, Bool.true_or, Bool.or_true, ite_true,
+    simp only [instrSafeForNoAlias, beq_self_eq_true, Bool.true_or, Bool.or_true,
       Bool.and_eq_true, decide_eq_true_eq] at hsafeW hsafeR
     have hlenW : (serializeTypedVal tyW v).length = tyW.byteSize :=
-      scalar_noalias_serialize_len tyW v hsafeW.2.1
-    have hszW : tyW.byteSize ≤ 8 := hsafeW.2.2
-    have hszR : tyR.byteSize ≤ 8 := hsafeR.2.2
+      scalar_noalias_serialize_len tyW v hsafeW.1.2
+    have hszW : tyW.byteSize ≤ 8 := hsafeW.2
+    have hszR : tyR.byteSize ≤ 8 := hsafeR.2
     unfold loadVal storeTypedVal
     have hrw := hsub m (serializeTypedVal tyW v) 0 0 tyR.byteSize
       (by omega) (by omega)
     simp only [Nat.add_zero] at hrw
     rw [hrw]
+  have hinsAll : ∀ blk ∈ blocks, ∀ ins ∈ blk.body,
+      instrSafeForNoAlias (llvmRegOf ptrA) (llvmRegOf ptrB) ins = true ∧
+      (∀ dst vol ty ptrOp al as0, ins = .load dst vol ty ptrOp al as0 →
+        ptrOp = .reg (llvmRegOf ptrA) ∨ ptrOp = .reg (llvmRegOf ptrB)) ∧
+      (∀ vol ty valOp ptrOp al as0, ins = .store vol ty valOp ptrOp al as0 →
+        ptrOp = .reg (llvmRegOf ptrA) ∨ ptrOp = .reg (llvmRegOf ptrB)) := by
+    intro blk hblk ins hins
+    have hs := hinsSafe blk hblk ins hins
+    refine ⟨hs, ?_, ?_⟩
+    · intro dst vol ty ptrOp al as0 heq
+      subst heq
+      simp only [instrSafeForNoAlias, Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq] at hs
+      exact hs.1.1.2
+    · intro vol ty valOp ptrOp al as0 heq
+      subst heq
+      simp only [instrSafeForNoAlias, Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq] at hs
+      exact hs.1.1.2
   refine ⟨?_, bind_noalias st facts ptrA ptrB lenA lenB (p0 :: ps) blocks args,
-    pa, pb, la, lb, hpa, hpb, hla, hlb, hdisj, hinsSafe, hnoninterf, hsub⟩
+    pa, pb, la, lb, hpa, hpb, hla, hlb, hdisj, hinsAll, hnoninterf, hsub⟩
   dsimp only [p0] at hna ⊢
   unfold noaliasParams
   rw [List.all_cons]

@@ -559,18 +559,15 @@ def isScalarNoAliasTy : LLVMType → Bool
 def instrSafeForNoAlias (rA rB : RegName) : LLVMInstr → Bool
   | .load dst _ ty ptrOp _ _ =>
     dst != rA && dst != rB &&
-    (if ptrOp == .reg rA || ptrOp == .reg rB then isScalarNoAliasTy ty && ty.byteSize <= 8
-     else !operandMentionsReg rA ptrOp && !operandMentionsReg rB ptrOp)
+    (ptrOp == .reg rA || ptrOp == .reg rB) && isScalarNoAliasTy ty && ty.byteSize <= 8
   | .store _ ty valOp ptrOp _ _ =>
     !operandMentionsReg rA valOp && !operandMentionsReg rB valOp &&
-    (if ptrOp == .reg rA || ptrOp == .reg rB then isScalarNoAliasTy ty && ty.byteSize <= 8
-     else !operandMentionsReg rA ptrOp && !operandMentionsReg rB ptrOp)
+    (ptrOp == .reg rA || ptrOp == .reg rB) && isScalarNoAliasTy ty && ty.byteSize <= 8
   | ins =>
     let noMention (op : Operand) : Bool :=
       !operandMentionsReg rA op && !operandMentionsReg rB op
     let dstOk := instrDstReg? ins != some rA && instrDstReg? ins != some rB
     dstOk && match ins with
-    | .alloca _ _ _ => true
     | .add _ _ _ l r | .sub _ _ _ l r | .mul _ _ _ l r
     | .udiv _ _ _ l r | .sdiv _ _ _ l r | .urem _ _ l r | .srem _ _ l r
     | .and_ _ _ l r | .or_ _ _ l r | .xor _ _ l r
@@ -581,16 +578,13 @@ def instrSafeForNoAlias (rA rB : RegName) : LLVMInstr → Bool
     | .shufflevector _ _ _ _ l r _
     | .insertvalue _ _ l _ r _ => noMention l && noMention r
     | .zext _ _ a _ | .sext _ _ a _ | .trunc _ _ a _
-    | .bitcast _ _ a _ | .inttoptr _ _ a _ | .ptrtoint _ _ a _
-    | .extractvalue _ _ a _ => noMention a
+    | .bitcast _ _ a _ | .extractvalue _ _ a _ => noMention a
     | .select _ c _ t f | .insertelement _ _ _ c t _ f =>
       noMention c && noMention t && noMention f
     | .extractelement _ _ _ v _ idx => noMention v && noMention idx
-    | .getelementptr _ _ _ base idxs _ =>
-      noMention base && idxs.all fun (_, idxOp) => noMention idxOp
-    | .call _ _ _ args _ => args.all fun (_, argOp) => noMention argOp
-    | .atomicrmw _ _ ptrOp _ valOp _ _ _ => noMention ptrOp && noMention valOp
-    | .load _ _ _ _ _ _ | .store _ _ _ _ _ _ => false
+    | .alloca _ _ _ | .inttoptr _ _ _ _ | .ptrtoint _ _ _ _
+    | .getelementptr _ _ _ _ _ _ | .call _ _ _ _ _
+    | .atomicrmw _ _ _ _ _ _ _ _ | .load _ _ _ _ _ _ | .store _ _ _ _ _ _ => false
 
 def termSafeForNoAlias (rA rB : RegName) : Terminator → Bool
   | .br _ | .unreachable => true
