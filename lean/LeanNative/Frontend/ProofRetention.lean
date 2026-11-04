@@ -185,8 +185,7 @@ def retainedPureFactsWithParams (fuel : Nat)
 def retainedPureFacts (fuel : Nat) (code : Lean.Compiler.LCNF.Code .pure) : FactEnv :=
   (collectPureStep fuel {} (.inl code)).facts
 
-/-- True when evaluating `e` cannot change the heap. Exclusivity facts stay live
-only across these expressions. -/
+/-- True when evaluating `e` cannot invalidate retained heap exclusivity facts. -/
 def exprPreservesHeap (e : LNIRExpr) : Bool :=
   match e with
   | .scalar _ | .constU256 _ | .mulDivDown _ _ _ | .mulDivUp _ _ _ | .storageLoad _ _
@@ -195,6 +194,11 @@ def exprPreservesHeap (e : LNIRExpr) : Bool :=
   | .rawLoad _ _ _ | .boxScalar _ _ | .unboxScalar _ _ => true
   | .storageStore _ _ _ | .allocCtor _ _ _ | .sarrayEnsureExclusive _ _ | .sarraySet _ _ _ _
   | .call _ _ _ _ => false
+
+def exprPreservesExcl (facts : FactEnv) (e : LNIRExpr) : Bool :=
+  match e with
+  | .sarrayEnsureExclusive objVar _ => factMember facts (.exclusiveObj objVar)
+  | _ => exprPreservesHeap e
 
 def factMentions (v : VarId) (f : RetainedFact) : Bool :=
   match f with
@@ -208,17 +212,21 @@ def factMentions (v : VarId) (f : RetainedFact) : Bool :=
 def killVarFacts (v : VarId) (facts : FactEnv) : FactEnv :=
   facts.filter fun f => !factMentions v f
 
-/-- Replace a retained `lean_is_exclusive` test by `true`, killing facts when a
-binding shadows a variable or a heap-mutating instruction runs. -/
+def specializeExclExpr (facts : FactEnv) (val : LNIRExpr) : LNIRExpr :=
+  match val with
+  | .isExclusive objVar =>
+    if factMember facts (.exclusiveObj objVar) then .scalar (.constBool true) else val
+  | .sarrayEnsureExclusive objVar _ =>
+    if factMember facts (.exclusiveObj objVar) then .scalar (.var objVar) else val
+  | _ => val
+
+/-- Replace a retained `lean_is_exclusive` test by `true` and elide redundant
+`sarrayEnsureExclusive`, killing facts on shadowing or heap-mutating ops. -/
 def dischargeRetainedExclusivity (facts : FactEnv) (code : LNIRCode) : LNIRCode :=
   match code with
   | .letBind dst ty val k =>
-    let val' :=
-      match val with
-      | .isExclusive objVar =>
-        if factMember facts (.exclusiveObj objVar) then .scalar (.constBool true) else val
-      | _ => val
-    let facts' := if exprPreservesHeap val then killVarFacts dst facts else []
+    let val' := specializeExclExpr facts val
+    let facts' := if exprPreservesExcl facts val then killVarFacts dst facts else []
     .letBind dst ty val' (dischargeRetainedExclusivity facts' k)
   | .rawStore p i v ty k =>
     .rawStore p i v ty (dischargeRetainedExclusivity [] k)
@@ -304,5 +312,46 @@ def lowerBoundsFreeMetalLoad (facts : FactEnv) (idxVar lenVar : VarId)
   let load := MSLStmt.assign "loaded" (.index buf idx)
   if factMember facts (.idxLt idxVar lenVar) then [load]
   else [.ifElse (.lt idx len) (.cons load .nil) .nil]
+
+/-- One-thread PTX kernel: load index, length and pointers, then the bounds-free load. -/
+def boundsFreePTXKernel (facts : FactEnv) (idxVar lenVar : VarId) : PTXKernel :=
+  let idxReg := s!"%v{idxVar}"
+  let lenReg := s!"%v{lenVar}"
+  { name := "ln_bounds_free_load"
+  , params :=
+      [ { ty := .u64, name := "param_idx" }, { ty := .u64, name := "param_len" }
+      , { ty := .u64, name := "param_addr" }, { ty := .u64, name := "param_out" } ]
+  , regDecls :=
+      [ { ty := .pred, prefixName := "%p0", count := 0 }
+      , { ty := .u64, prefixName := idxReg, count := 0 }
+      , { ty := .u64, prefixName := lenReg, count := 0 }
+      , { ty := .u64, prefixName := "%addr", count := 0 }
+      , { ty := .u64, prefixName := "%out", count := 0 }
+      , { ty := .u64, prefixName := "%dst", count := 0 } ]
+  , body :=
+      [ .instr none (.mov .u64 "%dst" (.immU64 0#64))
+      , .instr none (.ldParam .u64 idxReg "param_idx")
+      , .instr none (.ldParam .u64 lenReg "param_len")
+      , .instr none (.ldParam .u64 "%addr" "param_addr")
+      , .instr none (.ldParam .u64 "%out" "param_out") ] ++
+      lowerBoundsFreePTXLoad facts idxVar lenVar .u64 "%dst" (.regOffset "%addr" 0) ++
+      [ .instr none (.stGlobal .u64 (.regOffset "%out" 0) (.reg "%dst"))
+      , .instr none .ret ] }
+
+/-- One-thread Metal kernel storing the bounds-free load into `out`. -/
+def boundsFreeMetalKernel (facts : FactEnv) (idxVar lenVar : VarId) : MSLKernelDecl :=
+  { name := "ln_bounds_free_load"
+  , params :=
+      [ { ty := .pointer .device true .ulong, name := "buf", attr := some (.buffer 0) }
+      , { ty := .pointer .device false .ulong, name := "out", attr := some (.buffer 1) }
+      , { ty := .ref .constant .ulong, name := "idx", attr := some (.buffer 2) }
+      , { ty := .ref .constant .ulong, name := "len", attr := some (.buffer 3) } ]
+  , body :=
+      [ .varDecl .ulong "loaded" (.immU64 0#64)
+      , .varDecl .ulong s!"v{idxVar}" (.var "idx")
+      , .varDecl .ulong s!"v{lenVar}" (.var "len") ] ++
+      lowerBoundsFreeMetalLoad facts idxVar lenVar "buf" ++
+      [ .indexAssign "out" (.immU64 0#64) (.var "loaded")
+      , .returnStmt ] }
 
 end LeanNative.Frontend.ProofRetention
