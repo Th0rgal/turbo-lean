@@ -15,6 +15,7 @@ and the verified specializations they justify on `LNIRCode`, `LLVMAst`, `PTXAst`
 namespace LeanNative.Frontend.ProofRetention
 
 open LeanNative.IR
+open LeanNative.Backend.TargetIR
 open LeanNative.Backend.LLVMAst
 open LeanNative.Backend.PTXAst
 open LeanNative.Backend.MetalAst
@@ -277,12 +278,28 @@ def attachOverflow (facts : FactEnv) (a b : VarId) (ins : LLVMInstr) : LLVMInstr
   | .mul dst _ w x y => .mul dst (overflowOf facts true a b) w x y
   | other => other
 
+def alignOfFact (facts : FactEnv) (ptrVar : VarId) (fallback : Nat) : Nat :=
+  match facts with
+  | [] => fallback
+  | .alignedPtr p n :: rest =>
+    if p == ptrVar && isPow2 n then n else alignOfFact rest ptrVar fallback
+  | _ :: rest => alignOfFact rest ptrVar fallback
+
+def attachLoadStoreAlign (facts : FactEnv) (ptrVar : VarId) (ins : LLVMInstr) : LLVMInstr :=
+  match ins with
+  | .load dst vol ty ptrOp al as_ =>
+    .load dst vol ty ptrOp (alignOfFact facts ptrVar al) as_
+  | .store vol ty valOp ptrOp al as_ =>
+    .store vol ty valOp ptrOp (alignOfFact facts ptrVar al) as_
+  | other => other
+
 def emitVerifiedLLVMWithFacts (facts : FactEnv) (a b : VarId)
-    (insns : List LLVMInstr) : List LLVMInstr :=
+    (insns : List LLVMInstr) (ptrVar : VarId := 0) : List LLVMInstr :=
   match insns with
   | [] => []
   | ins :: rest =>
-    attachOverflow facts a b ins :: emitVerifiedLLVMWithFacts facts a b rest
+    attachLoadStoreAlign facts ptrVar (attachOverflow facts a b ins) ::
+      emitVerifiedLLVMWithFacts facts a b rest ptrVar
 
 def withNoAlias (disjoint : Bool) (p : LLVMParam) : LLVMParam :=
   if !disjoint then p
@@ -294,11 +311,11 @@ def noaliasParams (facts : FactEnv) (ptrA ptrB : VarId) (ps : List LLVMParam) : 
   else ps.map (withNoAlias true)
 
 def emitVerifiedLLVMFnWithFacts (facts : FactEnv) (ptrA ptrB a b : VarId)
-    (fn : LLVMFn) : LLVMFn :=
+    (fn : LLVMFn) (ptrVar : VarId := 0) : LLVMFn :=
   { fn with
     params := noaliasParams facts ptrA ptrB fn.params
     blocks := fn.blocks.map fun blk =>
-      { blk with body := emitVerifiedLLVMWithFacts facts a b blk.body } }
+      { blk with body := emitVerifiedLLVMWithFacts facts a b blk.body ptrVar } }
 
 /-- A bounds check stays unless `idxLt` was retained. The unchecked form is sound
 for states in which `idxLt` holds. -/

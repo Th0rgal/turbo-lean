@@ -257,13 +257,40 @@ def proofRetentionPass : LeanNative.Transform.TransformPass :=
   LeanNative.Transform.TransformPass.ofVerifiedContract proofRetentionContract
 
 def llvmFactEnv (st : ExecState) : VarEnv := fun v => match st.regs.lookup s!"v{v}" with
-  | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x)) | _ => none
+  | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
+  | some (.ptr x) => some (Val.u64 (UInt64.ofBitVec x)) | _ => none
 
 private theorem llvmFactEnv_lookup_u64 (st : ExecState) (v : VarId) (u u' : UInt64)
     (hreg : st.regs.lookup s!"v{v}" = some (.bits .i64 u.toBitVec))
     (henv : llvmFactEnv st v = some (Val.u64 u')) : u' = u := by
   unfold llvmFactEnv at henv
   rw [hreg] at henv; cases henv; rfl
+
+theorem llvmAlignedPtr_of_fact_sound (st : ExecState) (facts : FactEnv) (ptrVar : VarId)
+    (ptr : BitVec 64) (ty : LLVMType) (fb : Nat) (hreg : st.regs.lookup s!"v{ptrVar}" = some (.ptr ptr))
+    (hfb : isAligned ptr (effectiveAlign ty fb) = true) (hf : FactEnvHolds (llvmFactEnv st) .empty facts) :
+    stepInstr {} 1 st (.load "dst" false ty (.reg s!"v{ptrVar}") (alignOfFact facts ptrVar fb)) =
+      stepInstr {} 1 st (.load "dst" false ty (.reg s!"v{ptrVar}") fb) := by
+  have hal : isAligned ptr (effectiveAlign ty (alignOfFact facts ptrVar fb)) = true := by
+    induction facts with
+    | nil => exact hfb
+    | cons f rest ih =>
+      have htail : FactEnvHolds (llvmFactEnv st) .empty rest :=
+        fun g hg => hf g (by simp [factMember, List.contains_eq_mem] at hg ⊢; exact Or.inr hg)
+      cases f with
+      | alignedPtr p n =>
+        simp only [alignOfFact]; split
+        · next hp =>
+          simp only [Bool.and_eq_true, beq_iff_eq] at hp; rcases hp with ⟨rfl, hp2⟩
+          rcases hf (.alignedPtr p n) (by simp [factMember]) with ⟨hpos, pv, hpv, hmod⟩
+          unfold llvmFactEnv at hpv; rw [hreg] at hpv; cases hpv
+          have hnz : n ≠ 0 := by omega
+          simpa [effectiveAlign, hnz, isAligned, hp2] using hmod
+        · exact ih htail
+      | _ => exact ih htail
+  have h1 : isPow2 (effectiveAlign ty (alignOfFact facts ptrVar fb)) = true := (Bool.and_eq_true_iff.mp hal).1
+  have h2 : isPow2 (effectiveAlign ty fb) = true := (Bool.and_eq_true_iff.mp hfb).1
+  simp only [stepInstr, stepInstrWith, LLVMAst.evalOperand, lookupReg, hreg, Option.getD_some, accessCheck, hal, hfb, h1, h2]
 
 private theorem overflowOf_no_overflow (st : ExecState) (facts : FactEnv) (isMul : Bool) (a b : VarId)
     (av bv : UInt64) (ha : st.regs.lookup s!"v{a}" = some (.bits .i64 av.toBitVec))
@@ -482,52 +509,41 @@ theorem ptxBoundsFreeLoad_sound (iv nv base outBase : Nat) (raw : BitVec 64)
       runCTAWithGlobalLog (f + 5) stmts (ctaAt (thAt 0 rf0) g []) [] =
         runCTAWithGlobalLog f stmts (ctaAt (thAt 5 rf5) g []) [] := by
     intro stmts; rw [show f + 5 = ((((f + 1) + 1) + 1) + 1) + 1 by omega]
-    rw [hpure _ 0 stmts rf0 rf1 _ rfl rfl (by simp [thAt, ctaAt, rf1, hrf0, execNonBarrierInstr,
-      PTXAst.evalOperand, PTXRegFile.setScalar, PTXRegFile.setScalarRaw, List.lookup, hu64w, hu64p,
-      PTXAst.maskForType, PTXOutcome.bind])]
-    rw [hpure _ 1 stmts rf1 rf2 _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, hrf0, hpIdx,
-      execNonBarrierInstr, PTXRegFile.setScalar, PTXRegFile.setScalarRaw, List.lookup, hu64w, hu64p,
-      PTXAst.maskForType, PTXOutcome.bind])]
-    rw [hpure _ 2 stmts rf2 rf3 _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, rf3, hrf0, hpLen,
-      execNonBarrierInstr, PTXRegFile.setScalar, PTXRegFile.setScalarRaw, List.lookup, hu64w, hu64p,
-      PTXAst.maskForType, PTXOutcome.bind])]
-    rw [hpure _ 3 stmts rf3 rf4 _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, hrf0, hpAddr,
-      execNonBarrierInstr, PTXRegFile.setScalar, PTXRegFile.setScalarRaw, List.lookup, hu64w, hu64p,
-      PTXAst.maskForType, PTXOutcome.bind])]
-    exact hpure _ 4 stmts rf4 rf5 _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, rf5, hrf0,
-      hpOut, execNonBarrierInstr, PTXRegFile.setScalar, PTXRegFile.setScalarRaw, List.lookup, hu64w,
-      hu64p, PTXAst.maskForType, PTXOutcome.bind])
+    rw [hpure _ 0 stmts rf0 rf1 _ rfl rfl (by simp [thAt, ctaAt, rf1, hrf0, execNonBarrierInstr, PTXAst.evalOperand,
+      PTXRegFile.setScalar, PTXRegFile.setScalarRaw, List.lookup, hu64w, hu64p, PTXAst.maskForType, PTXOutcome.bind])]
+    rw [hpure _ 1 stmts rf1 rf2 _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, hrf0, hpIdx, execNonBarrierInstr,
+      PTXRegFile.setScalar, PTXRegFile.setScalarRaw, List.lookup, hu64w, hu64p, PTXAst.maskForType, PTXOutcome.bind])]
+    rw [hpure _ 2 stmts rf2 rf3 _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, rf3, hrf0, hpLen, execNonBarrierInstr,
+      PTXRegFile.setScalar, PTXRegFile.setScalarRaw, List.lookup, hu64w, hu64p, PTXAst.maskForType, PTXOutcome.bind])]
+    rw [hpure _ 3 stmts rf3 rf4 _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, hrf0, hpAddr, execNonBarrierInstr,
+      PTXRegFile.setScalar, PTXRegFile.setScalarRaw, List.lookup, hu64w, hu64p, PTXAst.maskForType, PTXOutcome.bind])]
+    exact hpure _ 4 stmts rf4 rf5 _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, rf5, hrf0, hpOut,
+      execNonBarrierInstr, PTXRegFile.setScalar, PTXRegFile.setScalarRaw, List.lookup, hu64w, hu64p, PTXAst.maskForType, PTXOutcome.bind])
   refine ⟨?_, ?_⟩
   · have hrun : runCTAWithGlobalLog 9 (boundsFreePTXKernel [.idxLt 0 1] 0 1).body
         (ctaAt (thAt 0 rf0) g []) [] = .ok (ctaAt (thAt 8 (rf5.setScalarRaw "%dst" raw) true) g' log2, log2) := by
       have hb : (boundsFreePTXKernel [.idxLt 0 1] 0 1).body =
-          [ .instr none (.mov .u64 "%dst" (.immU64 0#64))
-          , .instr none (.ldParam .u64 "%v0" "param_idx"), .instr none (.ldParam .u64 "%v1" "param_len")
-          , .instr none (.ldParam .u64 "%addr" "param_addr"), .instr none (.ldParam .u64 "%out" "param_out") ] ++
+          [ .instr none (.mov .u64 "%dst" (.immU64 0#64)), .instr none (.ldParam .u64 "%v0" "param_idx")
+          , .instr none (.ldParam .u64 "%v1" "param_len"), .instr none (.ldParam .u64 "%addr" "param_addr")
+          , .instr none (.ldParam .u64 "%out" "param_out") ] ++
           [ .instr none (.ldGlobal .u64 "%dst" (.regOffset "%addr" 0))
           , .instr none (.stGlobal .u64 (.regOffset "%out" 0) (.reg "%dst")), .instr none .ret ] := by decide
       rw [hb, show (9 : Nat) = 4 + 5 from rfl, hpre 4]
-      rw [hmemStep 3 5 _ rf5 (rf5.setScalarRaw "%dst" raw) g g [] log1 none _ rfl rfl
-        (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, rf5, hrf0, log1, execPredicatedInstr,
-          evalPredGuard, execNonBarrierInstr, PTXAst.evalAddr, PTXRegFile.readScalarChecked,
-          PTXRegFile.setScalar, PTXRegFile.setScalarRaw, PTXRegFile.setAssoc, List.lookup, hu64w,
-          hu64b, hu64p, hbNat, hnnB, checkAligned, halign, PTXAst.recordEpochAccess,
-          PTXAst.findDataRace?, hload, PTXAst.maskForType, PTXOutcome.bind]) (Or.inl rfl)]
-      rw [hmemStep 2 6 _ (rf5.setScalarRaw "%dst" raw) (rf5.setScalarRaw "%dst" raw)
-        g g' log1 log2 none _ rfl rfl
-        (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, rf5, hrf0, log1, log2, execPredicatedInstr,
-          evalPredGuard, execNonBarrierInstr, PTXAst.evalAddr, PTXAst.evalOperand,
-          PTXRegFile.readScalarChecked, PTXRegFile.setScalarRaw, PTXRegFile.setAssoc, List.lookup,
-          hu64w, hu64b, hu64p, hoNat, hnnO, checkAligned, hoalign, PTXAst.recordEpochAccess,
-          PTXAst.findDataRace?, htidNe, hglobEq, hstore, PTXAst.maskForType, PTXOutcome.bind])
-        (Or.inr (by simp [log2]))]
+      rw [hmemStep 3 5 _ rf5 (rf5.setScalarRaw "%dst" raw) g g [] log1 none _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2,
+        rf3, rf4, rf5, hrf0, log1, execPredicatedInstr, evalPredGuard, execNonBarrierInstr, PTXAst.evalAddr,
+        PTXRegFile.readScalarChecked, PTXRegFile.setScalar, PTXRegFile.setScalarRaw, PTXRegFile.setAssoc, List.lookup,
+        hu64w, hu64b, hu64p, hbNat, hnnB, checkAligned, halign, PTXAst.recordEpochAccess, PTXAst.findDataRace?,
+        hload, PTXAst.maskForType, PTXOutcome.bind]) (Or.inl rfl)]
+      rw [hmemStep 2 6 _ (rf5.setScalarRaw "%dst" raw) (rf5.setScalarRaw "%dst" raw) g g' log1 log2 none _ rfl rfl
+        (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, rf5, hrf0, log1, log2, execPredicatedInstr, evalPredGuard,
+          execNonBarrierInstr, PTXAst.evalAddr, PTXAst.evalOperand, PTXRegFile.readScalarChecked, PTXRegFile.setScalarRaw,
+          PTXRegFile.setAssoc, List.lookup, hu64w, hu64b, hu64p, hoNat, hnnO, checkAligned, hoalign, PTXAst.recordEpochAccess,
+          PTXAst.findDataRace?, htidNe, hglobEq, hstore, PTXAst.maskForType, PTXOutcome.bind]) (Or.inr (by simp [log2]))]
       rw [hret 1 7 _ _ _ _ rfl]
       simpa [ctaAt, thAt, log2, log1, hglobEq] using PTXSIMT.runCTAWithGlobalLog_done_halted 0 _
         (ctaAt (thAt 8 (rf5.setScalarRaw "%dst" raw) true) g' log2) [] rfl
-    have hcta : initCTAState (boundsFreePTXKernel [.idxLt 0 1] 0 1) grid grid ⟨0, 0, 0⟩ g pMem =
-        ctaAt (thAt 0 rf0) g [] := by
-      simp [initCTAState, buildSharedLayout, boundsFreePTXKernel, rf0, ctaAt, thAt,
-        show grid.coords = [⟨0, 0, 0⟩] from rfl]
+    have hcta : initCTAState (boundsFreePTXKernel [.idxLt 0 1] 0 1) grid grid ⟨0, 0, 0⟩ g pMem = ctaAt (thAt 0 rf0) g [] := by
+      simp [initCTAState, buildSharedLayout, boundsFreePTXKernel, rf0, ctaAt, thAt, show grid.coords = [⟨0, 0, 0⟩] from rfl]
     simp [evalPTXKernel, show grid.coords = [⟨0, 0, 0⟩] from rfl, evalPTXKernelLoop, hcta, hrun,
       ctaAt, log2, log1, checkCrossCTAGlobalLog, hrace, hglobNe, PTXOutcome.bind]
   · let rfP := rf5.setPredRaw "%p0" false
@@ -535,44 +551,35 @@ theorem ptxBoundsFreeLoad_sound (iv nv base outBase : Nat) (raw : BitVec 64)
     have hrun : runCTAWithGlobalLog 12 (boundsFreePTXKernel [] 0 1).body
         (ctaAt (thAt 0 rf0) g []) [] = .ok (ctaAt (thAt 11 rfD true) g' log2, log2) := by
       have hb : (boundsFreePTXKernel [] 0 1).body =
-          [ .instr none (.mov .u64 "%dst" (.immU64 0#64))
-          , .instr none (.ldParam .u64 "%v0" "param_idx"), .instr none (.ldParam .u64 "%v1" "param_len")
-          , .instr none (.ldParam .u64 "%addr" "param_addr"), .instr none (.ldParam .u64 "%out" "param_out") ] ++
+          [ .instr none (.mov .u64 "%dst" (.immU64 0#64)), .instr none (.ldParam .u64 "%v0" "param_idx")
+          , .instr none (.ldParam .u64 "%v1" "param_len"), .instr none (.ldParam .u64 "%addr" "param_addr")
+          , .instr none (.ldParam .u64 "%out" "param_out") ] ++
           [ .instr none (.setp .ge .u64 "%p0" (.reg "%v0") (.reg "%v1"))
           , .instr (some { predReg := "%p0", negated := false }) (.bra "$L_done")
           , .instr none (.ldGlobal .u64 "%dst" (.regOffset "%addr" 0)), .label "$L_done"
           , .instr none (.stGlobal .u64 (.regOffset "%out" 0) (.reg "%dst")), .instr none .ret ] := by decide
       rw [hb, show (12 : Nat) = 7 + 5 from rfl, hpre 7]
-      rw [hpure 6 5 _ rf5 rfP _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, rf5, rfP, hrf0,
-        hcmp, execNonBarrierInstr, PTXAst.evalOperand, PTXRegFile.readScalarChecked,
-        PTXRegFile.setPred, PTXRegFile.setPredRaw, PTXRegFile.setScalarRaw, PTXRegFile.setAssoc,
-        List.lookup, hu64w, hu64p, hpredNe, PTXOutcome.bind])]
-      rw [hmemStep 5 6 _ rfP rfP g g [] [] (some { predReg := "%p0", negated := false }) _ rfl rfl
-        (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, rf5, rfP, hrf0, execPredicatedInstr,
-          evalPredGuard, PTXRegFile.readPredChecked, PTXRegFile.setPredRaw,
-          PTXRegFile.setScalarRaw, PTXRegFile.setAssoc, hpredNe, PTXOutcome.bind]) (Or.inl rfl)]
-      rw [hmemStep 4 7 _ rfP rfD g g [] log1 none _ rfl rfl
-        (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, rf5, rfP, rfD, hrf0, log1, execPredicatedInstr,
-          evalPredGuard, execNonBarrierInstr, PTXAst.evalAddr, PTXRegFile.readScalarChecked,
-          PTXRegFile.setScalar, PTXRegFile.setPredRaw, PTXRegFile.setScalarRaw,
-          PTXRegFile.setAssoc, List.lookup, hu64w, hu64b, hu64p, hbNat, hnnB, checkAligned, halign,
-          PTXAst.recordEpochAccess, PTXAst.findDataRace?, hload, PTXAst.maskForType,
-          PTXOutcome.bind]) (Or.inl rfl)]
+      rw [hpure 6 5 _ rf5 rfP _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, rf5, rfP, hrf0, hcmp,
+        execNonBarrierInstr, PTXAst.evalOperand, PTXRegFile.readScalarChecked, PTXRegFile.setPred, PTXRegFile.setPredRaw,
+        PTXRegFile.setScalarRaw, PTXRegFile.setAssoc, List.lookup, hu64w, hu64p, hpredNe, PTXOutcome.bind])]
+      rw [hmemStep 5 6 _ rfP rfP g g [] [] (some { predReg := "%p0", negated := false }) _ rfl rfl (by simp [thAt, ctaAt,
+        rf1, rf2, rf3, rf4, rf5, rfP, hrf0, execPredicatedInstr, evalPredGuard, PTXRegFile.readPredChecked,
+        PTXRegFile.setPredRaw, PTXRegFile.setScalarRaw, PTXRegFile.setAssoc, hpredNe, PTXOutcome.bind]) (Or.inl rfl)]
+      rw [hmemStep 4 7 _ rfP rfD g g [] log1 none _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, rf5, rfP, rfD,
+        hrf0, log1, execPredicatedInstr, evalPredGuard, execNonBarrierInstr, PTXAst.evalAddr, PTXRegFile.readScalarChecked,
+        PTXRegFile.setScalar, PTXRegFile.setPredRaw, PTXRegFile.setScalarRaw, PTXRegFile.setAssoc, List.lookup, hu64w,
+        hu64b, hu64p, hbNat, hnnB, checkAligned, halign, PTXAst.recordEpochAccess, PTXAst.findDataRace?, hload,
+        PTXAst.maskForType, PTXOutcome.bind]) (Or.inl rfl)]
       rw [hlbl 3 8 _ rfD g log1 "$L_done" rfl]
-      rw [hmemStep 2 9 _ rfD rfD g g' log1 log2 none _ rfl rfl
-        (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, rf5, rfP, rfD, hrf0, log1, log2,
-          execPredicatedInstr, evalPredGuard, execNonBarrierInstr, PTXAst.evalAddr,
-          PTXAst.evalOperand, PTXRegFile.readScalarChecked, PTXRegFile.setPredRaw,
-          PTXRegFile.setScalarRaw, PTXRegFile.setAssoc, List.lookup, hu64w, hu64b, hu64p, hoNat,
-          hnnO, checkAligned, hoalign, PTXAst.recordEpochAccess, PTXAst.findDataRace?, htidNe,
-          hglobEq, hstore, PTXAst.maskForType, PTXOutcome.bind]) (Or.inr (by simp [log2]))]
+      rw [hmemStep 2 9 _ rfD rfD g g' log1 log2 none _ rfl rfl (by simp [thAt, ctaAt, rf1, rf2, rf3, rf4, rf5, rfP, rfD,
+        hrf0, log1, log2, execPredicatedInstr, evalPredGuard, execNonBarrierInstr, PTXAst.evalAddr, PTXAst.evalOperand,
+        PTXRegFile.readScalarChecked, PTXRegFile.setPredRaw, PTXRegFile.setScalarRaw, PTXRegFile.setAssoc, List.lookup,
+        hu64w, hu64b, hu64p, hoNat, hnnO, checkAligned, hoalign, PTXAst.recordEpochAccess, PTXAst.findDataRace?,
+        htidNe, hglobEq, hstore, PTXAst.maskForType, PTXOutcome.bind]) (Or.inr (by simp [log2]))]
       rw [hret 1 10 _ _ _ _ rfl]
-      simpa [ctaAt, thAt, log2, log1, hglobEq] using
-        PTXSIMT.runCTAWithGlobalLog_done_halted 0 _ (ctaAt (thAt 11 rfD true) g' log2) [] rfl
-    have hcta : initCTAState (boundsFreePTXKernel [] 0 1) grid grid ⟨0, 0, 0⟩ g pMem =
-        ctaAt (thAt 0 rf0) g [] := by
-      simp [initCTAState, buildSharedLayout, boundsFreePTXKernel, rf0, ctaAt, thAt,
-        show grid.coords = [⟨0, 0, 0⟩] from rfl]
+      simpa [ctaAt, thAt, log2, log1, hglobEq] using PTXSIMT.runCTAWithGlobalLog_done_halted 0 _ (ctaAt (thAt 11 rfD true) g' log2) [] rfl
+    have hcta : initCTAState (boundsFreePTXKernel [] 0 1) grid grid ⟨0, 0, 0⟩ g pMem = ctaAt (thAt 0 rf0) g [] := by
+      simp [initCTAState, buildSharedLayout, boundsFreePTXKernel, rf0, ctaAt, thAt, show grid.coords = [⟨0, 0, 0⟩] from rfl]
     simp [evalPTXKernel, show grid.coords = [⟨0, 0, 0⟩] from rfl, evalPTXKernelLoop, hcta, hrun,
       ctaAt, log2, log1, checkCrossCTAGlobalLog, hrace, hglobNe, PTXOutcome.bind]
 
@@ -582,8 +589,7 @@ theorem metalBoundsFreeLoad_sound (iv nv : Nat) (word : BitVec 64)
     let grid : MetalAst.Dim3 := ⟨1, 1, 1⟩
     let devBufs : List (Nat × MetalAst.ByteMemory) := [(0, bufMem), (1, outMem)]
     let constBufs : List (Nat × MetalAst.ByteMemory) :=
-      [(2, MetalAst.ByteMemory.ofU64Words [BitVec.ofNat 64 iv]),
-       (3, MetalAst.ByteMemory.ofU64Words [BitVec.ofNat 64 nv])]
+      [(2, MetalAst.ByteMemory.ofU64Words [BitVec.ofNat 64 iv]), (3, MetalAst.ByteMemory.ofU64Words [BitVec.ofNat 64 nv])]
     let devOut : List (Nat × MetalAst.ByteMemory) := [(0, bufMem), (1, outMem')]
     evalMSLKernel 6 (boundsFreeMetalKernel [.idxLt 0 1] 0 1) grid grid devBufs constBufs = .ok devOut ∧
       evalMSLKernel 7 (boundsFreeMetalKernel [] 0 1) grid grid devBufs constBufs = .ok devOut := by
@@ -592,38 +598,24 @@ theorem metalBoundsFreeLoad_sound (iv nv : Nat) (word : BitVec 64)
     simpa [MetalAst.ByteMemory.readU64Word?] using MetalSIMT.ofU64Words_readU64Word [BitVec.ofNat 64 iv] 0 (by simp)
   have hcn : (MetalAst.ByteMemory.ofU64Words [BitVec.ofNat 64 nv]).loadBits 0 8 = some (BitVec.ofNat 64 nv) := by
     simpa [MetalAst.ByteMemory.readU64Word?] using MetalSIMT.ofU64Words_readU64Word [BitVec.ofNat 64 nv] 0 (by simp)
-  have hivNat : (BitVec.ofNat 64 iv).toNat = iv := by
-    simp [BitVec.toNat_ofNat, Nat.mod_eq_of_lt (Nat.lt_trans hiv hnv)]
+  have hivNat : (BitVec.ofNat 64 iv).toNat = iv := by simp [BitVec.toNat_ofNat, Nat.mod_eq_of_lt (Nat.lt_trans hiv hnv)]
   have hlt : BitVec.ult (BitVec.ofNat 64 iv) (BitVec.ofNat 64 nv) = true := by
     simp [BitVec.ult, BitVec.toNat_ofNat, Nat.mod_eq_of_lt hnv, Nat.mod_eq_of_lt (Nat.lt_trans hiv hnv), hiv]
   have hcoords : grid.coords = [⟨0, 0, 0⟩] := rfl
   have htidNe : (({ x := 0, y := 0, z := 0 } : MetalAst.Dim3) != { x := 0, y := 0, z := 0 }) = false := rfl
   have hrace : ∀ t a w wr at_, findCrossGroupRace? t a w wr at_ [] = none := fun _ _ _ _ _ => rfl
-  refine ⟨?_, ?_⟩
-  · unfold evalMSLKernel boundsFreeMetalKernel lowerBoundsFreeMetalLoad; simp only [vreg0]
-    simp [factMember, hcoords, evalMSLKernelLoop, initGroupState, buildKernelBindings,
-      initThreadLocals, runGroupWithDeviceLog, stepGroup, MetalAst.stepFirstReadyThread,
-      threadAtBarrier, threadAtSimdOp, execNonBarrierStmt, execStmtWithCall, evalExprWithCall,
-      bindEval, readBoundElement, execIndexWrite, writeDeviceBuffer, loadTypedElem, storeTypedElem,
-      structFieldNames, aggregateByteWidth, MSLType.byteWidth, MetalAst.maskForType, bindValue,
-      MSLLocals.empty, MSLLocals.setTyped, MSLLocals.setAssoc, MSLLocals.setTypeAssoc,
-      MSLLocals.lookup?, MSLLocals.lookupType?, MSLLocals.lookupArray?, List.lookup,
-      devBufs, constBufs, devOut, setIndexedMem, MetalAst.recordEpochAccess,
-      MetalAst.findDataRace?, findDataRaceGo, isDeviceAccess, checkCrossGroupDeviceLog,
-      hrace, List.filter, hci, hcn, hivNat, hload, hstore, htidNe]
-  · unfold evalMSLKernel boundsFreeMetalKernel lowerBoundsFreeMetalLoad; simp only [vreg0]
-    simp [factMember, hcoords, evalMSLKernelLoop, initGroupState, buildKernelBindings,
-      initThreadLocals, runGroupWithDeviceLog, stepGroup, MetalAst.stepFirstReadyThread,
-      threadAtBarrier, threadAtSimdOp, execNonBarrierStmt, execStmtWithCall, evalExprWithCall,
-      bindEval, finishCmp, inferExprType, evalTypedCmp, MSLBlock.toList, readBoundElement,
-      execIndexWrite, writeDeviceBuffer, loadTypedElem, storeTypedElem, structFieldNames,
-      aggregateByteWidth, MSLType.byteWidth, MetalAst.maskForType, bindValue, MSLLocals.empty,
-      MSLLocals.setTyped, MSLLocals.setAssoc, MSLLocals.setTypeAssoc, MSLLocals.lookup?,
-      MSLLocals.lookupType?, MSLLocals.lookupArray?, List.lookup, devBufs, constBufs, devOut,
-      setIndexedMem, MetalAst.recordEpochAccess, MetalAst.findDataRace?, findDataRaceGo,
-      isDeviceAccess, checkCrossGroupDeviceLog, hrace, List.filter, hci, hcn, hivNat, hlt,
-      hload, hstore, htidNe,
-      show evalMSLCast .ulong .ulong (BitVec.ofNat 64 iv) = .ok (BitVec.ofNat 64 iv) from rfl,
+  unfold evalMSLKernel boundsFreeMetalKernel lowerBoundsFreeMetalLoad; simp only [vreg0]
+  refine ⟨?_, ?_⟩ <;>
+    simp [factMember, hcoords, evalMSLKernelLoop, initGroupState, buildKernelBindings, initThreadLocals,
+      runGroupWithDeviceLog, stepGroup, MetalAst.stepFirstReadyThread, threadAtBarrier, threadAtSimdOp,
+      execNonBarrierStmt, execStmtWithCall, evalExprWithCall, bindEval, finishCmp, inferExprType,
+      evalTypedCmp, MSLBlock.toList, readBoundElement, execIndexWrite, writeDeviceBuffer, loadTypedElem,
+      storeTypedElem, structFieldNames, aggregateByteWidth, MSLType.byteWidth, MetalAst.maskForType,
+      bindValue, MSLLocals.empty, MSLLocals.setTyped, MSLLocals.setAssoc, MSLLocals.setTypeAssoc,
+      MSLLocals.lookup?, MSLLocals.lookupType?, MSLLocals.lookupArray?, List.lookup, devBufs, constBufs,
+      devOut, setIndexedMem, MetalAst.recordEpochAccess, MetalAst.findDataRace?, findDataRaceGo,
+      isDeviceAccess, checkCrossGroupDeviceLog, hrace, List.filter, hci, hcn, hivNat, hlt, hload, hstore,
+      htidNe, show evalMSLCast .ulong .ulong (BitVec.ofNat 64 iv) = .ok (BitVec.ofNat 64 iv) from rfl,
       show evalMSLCast .ulong .ulong (BitVec.ofNat 64 nv) = .ok (BitVec.ofNat 64 nv) from rfl,
       show promoteMSLArithType .ulong .ulong = .ulong from rfl]
 
@@ -642,7 +634,7 @@ theorem proofRetention_pipeline_nonvacuous :
       (lowerBoundsFreePTXLoad facts 5 6 .u64 "%d" (.regOffset "%a" 0)).length = 1 ∧
       (lowerBoundsFreeMetalLoad facts 5 6 "buf").length = 1 := by
   refine ⟨rfl, rfl, ?_, rfl, rfl, rfl⟩
-  simp [emitVerifiedLLVMWithFacts, attachOverflow, overflowOf, execInstrs, execInstrsWith,
-    stepInstrWith, LLVMAst.evalOperand, binResult, flagsOverflow]; decide
+  simp [emitVerifiedLLVMWithFacts, attachLoadStoreAlign, attachOverflow, overflowOf, execInstrs,
+    execInstrsWith, stepInstrWith, LLVMAst.evalOperand, binResult, flagsOverflow]; decide
 
 end LeanNative.Proofs
