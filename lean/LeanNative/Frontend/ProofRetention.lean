@@ -1,5 +1,6 @@
 import Lean.Compiler.LCNF.Basic
 import LeanNative.IR.AST
+import LeanNative.Transform.Pass
 import LeanNative.Backend.LLVMAst.Syntax
 import LeanNative.Backend.PTXAst.Syntax
 import LeanNative.Backend.MetalAst.Syntax
@@ -220,13 +221,20 @@ def specializeExclExpr (facts : FactEnv) (val : LNIRExpr) : LNIRExpr :=
     if factMember facts (.exclusiveObj objVar) then .scalar (.var objVar) else val
   | _ => val
 
+def introExprFact (dst : VarId) (val : LNIRExpr) (facts : FactEnv) : FactEnv :=
+  match val with
+  | .sarrayEnsureExclusive _ _ => consFact facts (.exclusiveObj dst)
+  | _ => facts
+
 /-- Replace a retained `lean_is_exclusive` test by `true` and elide redundant
 `sarrayEnsureExclusive`, killing facts on shadowing or heap-mutating ops. -/
 def dischargeRetainedExclusivity (facts : FactEnv) (code : LNIRCode) : LNIRCode :=
   match code with
   | .letBind dst ty val k =>
     let val' := specializeExclExpr facts val
-    let facts' := if exprPreservesExcl facts val then killVarFacts dst facts else []
+    let facts' :=
+      if exprPreservesExcl facts val then introExprFact dst val (killVarFacts dst facts)
+      else introExprFact dst val []
     .letBind dst ty val' (dischargeRetainedExclusivity facts' k)
   | .rawStore p i v ty k =>
     .rawStore p i v ty (dischargeRetainedExclusivity [] k)
@@ -235,8 +243,7 @@ def dischargeRetainedExclusivity (facts : FactEnv) (code : LNIRCode) : LNIRCode 
   | .ite c t e =>
     .ite c (dischargeRetainedExclusivity facts t) (dischargeRetainedExclusivity facts e)
   | .seqFor idx lo hi acc init ty body k =>
-    .seqFor idx lo hi acc init ty
-      (dischargeRetainedExclusivity [] body) (dischargeRetainedExclusivity [] k)
+    .seqFor idx lo hi acc init ty body (dischargeRetainedExclusivity [] k)
   | .parFor out len ins ty ker k =>
     .parFor out len ins ty ker (dischargeRetainedExclusivity [] k)
   | .ret v => .ret v
@@ -353,5 +360,11 @@ def boundsFreeMetalKernel (facts : FactEnv) (idxVar lenVar : VarId) : MSLKernelD
       lowerBoundsFreeMetalLoad facts idxVar lenVar "buf" ++
       [ .indexAssign "out" (.immU64 0#64) (.var "loaded")
       , .returnStmt ] }
+
+def verifiedProofRetentionContract (sound : ∀ c : LNIRCode, LeanNative.Semantics.CodeRefines c (dischargeRetainedExclusivity [] c)) :
+    LeanNative.Transform.VerifiedCodePassContract :=
+  { name := "ProofRetention", theoremRef := "LeanNative.Proofs.dischargeLocalExclusivity_refines"
+  , notes := "D1 retained exclusivity specialization pass"
+  , runCode := dischargeRetainedExclusivity [], sound := sound }
 
 end LeanNative.Frontend.ProofRetention

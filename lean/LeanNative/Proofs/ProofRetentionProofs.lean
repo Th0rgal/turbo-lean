@@ -69,26 +69,23 @@ private theorem constBool_true_eval (env : VarEnv) (st : HeapState) :
 
 private theorem evalCtorGet_state (env : VarEnv) (st st' : HeapState) (c : VarId) (i : Nat)
     (isObj : Bool) (v : Val) (he : evalCtorGet env st c i isObj = .ok (v, st')) : st' = st := by
-  unfold evalCtorGet at he
-  cases hc : env c with
-  | none => simp [hc] at he
-  | some vc =>
-    cases vc with
+  cases vc : env c with
+  | none => simp [evalCtorGet, vc] at he
+  | some val =>
+    cases val with
     | objPtr oid =>
-      simp only [hc] at he
       cases ho : st.liveHeapObj oid with
-      | error _ => simp [ho, Except.bind] at he
+      | error _ => simp [evalCtorGet, vc, ho, Except.bind] at he
       | ok o =>
-        simp only [ho, Except.bind] at he
+        simp only [evalCtorGet, vc, ho, Except.bind] at he
         split at he <;> cases he <;> rfl
     | tuple xs =>
       cases xs with
-      | nil => simp [hc] at he
+      | nil => simp [evalCtorGet, vc] at he
       | cons _ _ =>
-        simp only [hc] at he
+        simp only [evalCtorGet, vc] at he
         split at he <;> cases he <;> rfl
-    | u64 _ | u256 _ | bool _ | sarrayId _ | rawPtrId _ | storageMapId _ | unit =>
-      simp [hc] at he
+    | u64 _ | u256 _ | bool _ | sarrayId _ | rawPtrId _ | storageMapId _ | unit => simp [evalCtorGet, vc] at he
 
 private theorem exprPreservesHeap_state (env : VarEnv) (st st' : HeapState)
     (e : LNIRExpr) (v : Val) (hp : exprPreservesHeap e = true)
@@ -113,25 +110,19 @@ private theorem fact_survives_bind (env : VarEnv) (st : HeapState) (dst : VarId)
     (f : RetainedFact) (hmention : factMentions dst f = false) (hf : FactHolds env st f) :
     FactHolds (env.bind dst v) st f := by
   cases f with
-  | idxLt i n =>
+  | idxLt i n | disjointSlices i n =>
     simp only [factMentions, Bool.or_eq_false_iff] at hmention; rcases hmention with ⟨hi, hn⟩
-    rcases hf with ⟨iv, nv, h1, h2, hlt⟩
-    exact ⟨iv, nv, by simpa [VarEnv.bind, hi] using h1, by simpa [VarEnv.bind, hn] using h2, hlt⟩
+    rcases hf with ⟨iv, nv, h1, h2, hr⟩
+    exact ⟨iv, nv, by simpa [VarEnv.bind, hi] using h1, by simpa [VarEnv.bind, hn] using h2, hr⟩
   | noOverflowAdd a b nsw nuw | noOverflowMul a b nsw nuw =>
     simp only [factMentions, Bool.or_eq_false_iff] at hmention; rcases hmention with ⟨ha, hb⟩
     rcases hf with ⟨av, bv, h1, h2, hnsw, hnuw⟩
-    exact ⟨av, bv, by simpa [VarEnv.bind, ha] using h1,
-      by simpa [VarEnv.bind, hb] using h2, hnsw, hnuw⟩
+    exact ⟨av, bv, by simpa [VarEnv.bind, ha] using h1, by simpa [VarEnv.bind, hb] using h2, hnsw, hnuw⟩
   | alignedPtr p n =>
     simp only [factMentions] at hmention; rcases hf with ⟨hn, pv, hp, hmod⟩
     exact ⟨hn, pv, by simpa [VarEnv.bind, hmention] using hp, hmod⟩
-  | disjointSlices a b =>
-    simp only [factMentions, Bool.or_eq_false_iff] at hmention; rcases hmention with ⟨ha, hb⟩
-    rcases hf with ⟨av, bv, h1, h2, hne⟩
-    exact ⟨av, bv, by simpa [VarEnv.bind, ha] using h1, by simpa [VarEnv.bind, hb] using h2, hne⟩
   | exclusiveObj o =>
-    simp only [factMentions] at hmention; simp only [FactHolds, ObjIsExclusive] at hf ⊢
-    simpa [VarEnv.bind, hmention] using hf
+    simp only [factMentions] at hmention; simpa [FactHolds, ObjIsExclusive, VarEnv.bind, hmention] using hf
 
 private theorem envHolds_killVar (env : VarEnv) (st : HeapState) (dst : VarId) (v : Val)
     (facts : FactEnv) (hf : FactEnvHolds env st facts) :
@@ -141,23 +132,47 @@ private theorem envHolds_killVar (env : VarEnv) (st : HeapState) (dst : VarId) (
   exact fact_survives_bind env st dst v f (by simpa using h1.2)
     (hf f (List.elem_eq_true_of_mem h1.1))
 
-private theorem discharge_empty (code : LNIRCode) : dischargeRetainedExclusivity [] code = code := by
-  induction code with
-  | letBind _ _ val _ ih =>
-    cases val <;> simp [dischargeRetainedExclusivity, specializeExclExpr, factMember,
-      exprPreservesExcl, exprPreservesHeap, killVarFacts, ih]
-  | rawStore _ _ _ _ _ ih | incRef _ _ _ ih | decRef _ _ _ ih | parFor _ _ _ _ _ _ ih =>
-    simp [dischargeRetainedExclusivity, ih]
-  | ite _ _ _ iht ihe | seqFor _ _ _ _ _ _ _ _ iht ihe =>
-    simp [dischargeRetainedExclusivity, iht, ihe]
-  | ret _ | unreachable => rfl
+private theorem envHolds_cons (env : VarEnv) (st : HeapState) (f0 : RetainedFact) (facts : FactEnv)
+    (hf0 : FactHolds env st f0) (hf : FactEnvHolds env st facts) : FactEnvHolds env st (consFact facts f0) := by
+  intro f hmem; unfold consFact at hmem; split at hmem
+  · exact hf f hmem
+  · simp only [factMember, List.contains_eq_mem, List.decide_mem_cons, Bool.or_eq_true, beq_iff_eq] at hmem
+    rcases hmem with rfl | hm
+    · exact hf0
+    · exact hf f (decide_eq_true hm)
+
+private theorem intro_holds (env : VarEnv) (st st1 : HeapState) (dst : VarId) (val : LNIRExpr)
+    (vv : Val) (facts : FactEnv) (hval : evalExpr env st val = .ok (vv, st1))
+    (hf : FactEnvHolds (env.bind dst vv) st1 facts) :
+    FactEnvHolds (env.bind dst vv) st1 (introExprFact dst val facts) := by
+  cases val with
+  | sarrayEnsureExclusive arrVar _ =>
+    simp only [evalExpr] at hval
+    cases ha : env arrVar with
+    | none => simp [ha] at hval
+    | some av =>
+      cases av with
+      | sarrayId bid =>
+        simp only [ha] at hval
+        cases hens : st.ensureExclusive bid with
+        | error _ => simp [hens] at hval
+        | ok s' =>
+          simp only [hens] at hval; injection hval with hpair
+          injection hpair with hvv hs; subst hvv; subst hs
+          rcases ensureExclusive_post st s' bid hens with ⟨hexcl, buf1, hfind1⟩
+          have hb1 : s'.buffers.find? (fun b => b.id == bid) = some buf1 := hfind1
+          have hid := List.find?_some hb1
+          have hex1 := hexcl buf1 (List.mem_of_find?_eq_some hb1) hid
+          exact envHolds_cons _ _ _ _ (by simp [FactHolds, ObjIsExclusive, VarEnv.bind, hfind1, hex1, hexcl]) hf
+      | u64 _ | u256 _ | bool _ | tuple _ | objPtr _ | rawPtrId _ | storageMapId _ | unit => simp [ha] at hval
+  | _ => exact hf
 
 theorem dischargeRetainedExclusivity_sound
     (fuel : Nat) (env : VarEnv) (st : HeapState) (facts : FactEnv) (code : LNIRCode)
     (hfacts : FactEnvHolds env st facts) (v : Val) (st' : HeapState)
     (heval : evalCode fuel env st code = .ok (v, st')) :
     evalCode fuel env st (dischargeRetainedExclusivity facts code) = .ok (v, st') := by
-  induction code generalizing env st facts with
+  induction code generalizing fuel env st facts v st' with
   | letBind dst _ val _ ih =>
     simp only [evalCode] at heval
     cases hval : evalExpr env st val with
@@ -170,65 +185,79 @@ theorem dischargeRetainedExclusivity_sound
           | isExclusive objVar =>
             have hst := exprPreservesHeap_state env st st1 _ vv rfl hval
             by_cases hmem : factMember facts (.exclusiveObj objVar) = true
-            · have hobj : ObjIsExclusive env st objVar := by
-                simpa [FactHolds] using hfacts (.exclusiveObj objVar) hmem
-              have htrue := evalExpr_isExclusive_of_obj env st objVar hobj
-              rw [htrue] at hval; cases hval; rw [hst]
+            · have hobj : ObjIsExclusive env st objVar := by simpa [FactHolds] using hfacts _ hmem
+              rw [evalExpr_isExclusive_of_obj env st objVar hobj] at hval; cases hval; rw [hst]
               exact ⟨rfl, by simp [specializeExclExpr, hmem, constBool_true_eval]⟩
             · exact ⟨hst, by simp [specializeExclExpr, hmem, hst, hval]⟩
           | sarrayEnsureExclusive objVar ety =>
-            have hmem : factMember facts (.exclusiveObj objVar) = true := by
-              simpa [exprPreservesExcl] using hp
-            have hobj : ObjIsExclusive env st objVar := by
-              simpa [FactHolds] using hfacts (.exclusiveObj objVar) hmem
+            have hmem : factMember facts (.exclusiveObj objVar) = true := by simpa [exprPreservesExcl] using hp
+            have hobj : ObjIsExclusive env st objVar := by simpa [FactHolds] using hfacts _ hmem
             rcases evalExpr_ensureExclusive_of_obj env st st1 objVar ety vv hobj hval with ⟨hst, hev⟩
             exact ⟨hst, by simp [specializeExclExpr, hmem, hev]⟩
           | _ =>
             have hst := exprPreservesHeap_state env st st1 _ vv (by simpa [exprPreservesExcl] using hp) hval
             exact ⟨hst, by simp [specializeExclExpr, hst, hval]⟩
-        rcases hstep with ⟨hst, hev'⟩; rw [hst] at heval
+        rcases hstep with ⟨hst, hev'⟩; rw [hst] at hval heval
         simp only [dischargeRetainedExclusivity, hp, ite_true, evalCode, hev']
-        exact ih (env.bind dst vv) st (killVarFacts dst facts)
-          (envHolds_killVar env st dst vv facts hfacts) heval
+        exact ih fuel _ st _ (intro_holds env st st dst val vv _ hval (envHolds_killVar env st dst vv facts hfacts)) v st' heval
       · have hp0 : exprPreservesExcl facts val = false := Bool.eq_false_iff.mpr hp
         have hvm : specializeExclExpr facts val = val := by
           cases val with
           | isExclusive _ => simp [exprPreservesExcl, exprPreservesHeap] at hp0
-          | sarrayEnsureExclusive objVar _ =>
-            simp only [exprPreservesExcl] at hp0; simp [specializeExclExpr, hp0]
+          | sarrayEnsureExclusive _ _ => simp only [exprPreservesExcl] at hp0; simp [specializeExclExpr, hp0]
           | _ => rfl
-        simp only [dischargeRetainedExclusivity, hp0, Bool.false_eq_true, ite_false,
-          hvm, discharge_empty, evalCode, hval]
-        exact heval
-  | rawStore _ _ _ _ _ | incRef _ _ _ | decRef _ _ _
-  | seqFor _ _ _ _ _ _ _ _ _ _ | parFor _ _ _ _ _ _ _ =>
-    simpa [dischargeRetainedExclusivity, discharge_empty] using heval
+        simp only [dischargeRetainedExclusivity, hp0, Bool.false_eq_true, ite_false, hvm, evalCode, hval]
+        exact ih fuel _ st1 _ (intro_holds env st st1 dst val vv [] hval (fun _ hm => nomatch hm)) v st' heval
+  | rawStore _ _ _ _ _ ih =>
+    exact CodeRefines.rawStore_congr (fun fl e s r sr h => ih fl e s [] (fun _ hm => nomatch hm) r sr h) fuel env st v st' heval
+  | incRef _ _ _ ih =>
+    exact CodeRefines.incRef_congr (fun fl e s r sr h => ih fl e s [] (fun _ hm => nomatch hm) r sr h) fuel env st v st' heval
+  | decRef _ _ _ ih =>
+    exact CodeRefines.decRef_congr (fun fl e s r sr h => ih fl e s [] (fun _ hm => nomatch hm) r sr h) fuel env st v st' heval
+  | parFor _ _ _ _ _ _ ih =>
+    exact CodeRefines.parFor_congr (fun fl e s r sr h => ih fl e s [] (fun _ hm => nomatch hm) r sr h) fuel env st v st' heval
+  | seqFor idx lo hi acc init _ body _ _ ihk =>
+    simp only [dischargeRetainedExclusivity, evalCode] at heval ⊢
+    cases hlo : env lo <;> cases hhi : env hi
+    all_goals cases hinit : env init <;> simp only [hlo, hhi, hinit] at heval ⊢
+    all_goals try exact heval
+    rename_i vlo vhi vinit
+    cases vlo <;> cases vhi <;> try exact heval
+    simp only at heval ⊢
+    cases hl : evalSeqLoop _ _ idx acc vinit env st (fun e s => evalCode fuel e s body) with
+    | error _ => simp [hl] at heval
+    | ok pr => simp only [hl] at heval; exact ihk fuel _ pr.2 [] (fun _ hm => nomatch hm) v st' heval
   | ite c _ _ iht ihe =>
-    simp only [evalCode] at heval; simp only [dischargeRetainedExclusivity, evalCode]
+    simp only [dischargeRetainedExclusivity, evalCode] at heval ⊢
     cases hc : env c with
     | none => simp [hc] at heval
     | some cv =>
       cases cv with
       | bool b =>
-        cases b
-        · simp [hc] at heval ⊢; exact ihe env st facts hfacts heval
-        · simp [hc] at heval ⊢; exact iht env st facts hfacts heval
+        cases b <;> simp [hc] at heval ⊢
+        · exact ihe fuel env st facts hfacts v st' heval
+        · exact iht fuel env st facts hfacts v st' heval
       | u64 n =>
-        by_cases hn : n = 0
-        · simp [hc, hn] at heval ⊢; exact ihe env st facts hfacts heval
-        · simp [hc, hn] at heval ⊢; exact iht env st facts hfacts heval
+        by_cases hn : n = 0 <;> simp [hc, hn] at heval ⊢
+        · exact ihe fuel env st facts hfacts v st' heval
+        · exact iht fuel env st facts hfacts v st' heval
       | u256 w =>
-        by_cases hw : w = UInt256.zero
-        · simp [hc, hw] at heval ⊢; exact ihe env st facts hfacts heval
-        · simp [hc, hw] at heval ⊢; exact iht env st facts hfacts heval
+        by_cases hw : w = UInt256.zero <;> simp [hc, hw] at heval ⊢
+        · exact ihe fuel env st facts hfacts v st' heval
+        · exact iht fuel env st facts hfacts v st' heval
       | tuple _ | objPtr _ | sarrayId _ | rawPtrId _ | storageMapId _ | unit => simp [hc] at heval
   | ret _ => simpa [dischargeRetainedExclusivity] using heval
   | unreachable => simp [evalCode] at heval
 
-def llvmFactEnv (st : ExecState) : VarEnv :=
-  fun v => match st.regs.lookup s!"v{v}" with
-    | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x))
-    | _ => none
+theorem dischargeLocalExclusivity_refines (code : LNIRCode) : CodeRefines code (dischargeRetainedExclusivity [] code) :=
+  fun fuel env st v st' h => dischargeRetainedExclusivity_sound fuel env st [] code (fun _ hm => nomatch hm) v st' h
+def proofRetentionContract : LeanNative.Transform.VerifiedCodePassContract :=
+  verifiedProofRetentionContract dischargeLocalExclusivity_refines
+def proofRetentionPass : LeanNative.Transform.TransformPass :=
+  LeanNative.Transform.TransformPass.ofVerifiedContract proofRetentionContract
+
+def llvmFactEnv (st : ExecState) : VarEnv := fun v => match st.regs.lookup s!"v{v}" with
+  | some (.bits .i64 x) => some (Val.u64 (UInt64.ofBitVec x)) | _ => none
 
 private theorem llvmFactEnv_lookup_u64 (st : ExecState) (v : VarId) (u u' : UInt64)
     (hreg : st.regs.lookup s!"v{v}" = some (.bits .i64 u.toBitVec))
@@ -236,27 +265,20 @@ private theorem llvmFactEnv_lookup_u64 (st : ExecState) (v : VarId) (u u' : UInt
   unfold llvmFactEnv at henv
   rw [hreg] at henv; cases henv; rfl
 
-private theorem overflowOf_no_overflow
-    (st : ExecState) (facts : FactEnv) (isMul : Bool) (a b : VarId) (av bv : UInt64)
-    (ha : st.regs.lookup s!"v{a}" = some (.bits .i64 av.toBitVec))
+private theorem overflowOf_no_overflow (st : ExecState) (facts : FactEnv) (isMul : Bool) (a b : VarId)
+    (av bv : UInt64) (ha : st.regs.lookup s!"v{a}" = some (.bits .i64 av.toBitVec))
     (hb : st.regs.lookup s!"v{b}" = some (.bits .i64 bv.toBitVec))
     (hf : FactEnvHolds (llvmFactEnv st) .empty facts) :
     flagsOverflow (overflowOf facts isMul a b)
-      (if isMul then mulOverflowNSW .i64 av.toBitVec bv.toBitVec
-       else addOverflowNSW .i64 av.toBitVec bv.toBitVec)
-      (if isMul then mulOverflowNUW .i64 av.toBitVec bv.toBitVec
-       else addOverflowNUW .i64 av.toBitVec bv.toBitVec) = false := by
+      (if isMul then mulOverflowNSW .i64 av.toBitVec bv.toBitVec else addOverflowNSW .i64 av.toBitVec bv.toBitVec)
+      (if isMul then mulOverflowNUW .i64 av.toBitVec bv.toBitVec else addOverflowNUW .i64 av.toBitVec bv.toBitVec) = false := by
   have himp : ∀ (pickNsw : Bool) f, f ∈ facts →
       (match f with
         | .noOverflowAdd l r nsw nuw => !isMul && l == a && r == b && (if pickNsw then nsw else nuw)
         | .noOverflowMul l r nsw nuw => isMul && l == a && r == b && (if pickNsw then nsw else nuw)
         | _ => false) = true →
-      (if pickNsw then
-        if isMul then mulOverflowNSW .i64 av.toBitVec bv.toBitVec
-        else addOverflowNSW .i64 av.toBitVec bv.toBitVec
-       else
-        if isMul then mulOverflowNUW .i64 av.toBitVec bv.toBitVec
-        else addOverflowNUW .i64 av.toBitVec bv.toBitVec) = false := by
+      (if pickNsw then if isMul then mulOverflowNSW .i64 av.toBitVec bv.toBitVec else addOverflowNSW .i64 av.toBitVec bv.toBitVec
+       else if isMul then mulOverflowNUW .i64 av.toBitVec bv.toBitVec else addOverflowNUW .i64 av.toBitVec bv.toBitVec) = false := by
     intro pickNsw f hmem hp
     have hfact := hf f (List.elem_eq_true_of_mem hmem)
     cases f with
@@ -338,10 +360,8 @@ theorem llvmSubOverflowFlags_of_fact_sound (st : ExecState) (facts : FactEnv) (a
   · simp [flagsOverflow, hmem]; rfl
 
 theorem add_nsw_poison_witness :
-    stepInstr {} 1 {}
-      (.add "r" .nsw .i64 (.constInt .i64 0x7FFF_FFFF_FFFF_FFFF#64) (.constInt .i64 1#64)) =
-      .inr (bindReg {} "r" .poison) :=
-  add_nsw_overflow_poison .i64 _ _ (by decide)
+    stepInstr {} 1 {} (.add "r" .nsw .i64 (.constInt .i64 0x7FFF_FFFF_FFFF_FFFF#64) (.constInt .i64 1#64)) =
+      .inr (bindReg {} "r" .poison) := add_nsw_overflow_poison .i64 _ _ (by decide)
 
 private theorem bindArgs_noalias_invariant (st : ExecState) (ps : List LLVMParam) (args : List LLVMVal) :
     bindArgs st (ps.map (withNoAlias true)) args = bindArgs st ps args := by
@@ -356,39 +376,28 @@ private theorem bindArgs_noalias_invariant (st : ExecState) (ps : List LLVMParam
       simp only [List.map_cons, bindArgs, hname]; exact ih (bindReg st p.name v) vs
 
 theorem llvmNoAliasParam_of_disjoint_sound (st : ExecState) (facts : FactEnv) (ptrA ptrB : VarId)
-    (p0 : LLVMParam) (ps : List LLVMParam) (args : List LLVMVal)
-    (hmem : factMember facts (.disjointSlices ptrA ptrB) = true) :
+    (p0 : LLVMParam) (ps : List LLVMParam) (args : List LLVMVal) (hmem : factMember facts (.disjointSlices ptrA ptrB) = true) :
     (noaliasParams facts ptrA ptrB (p0 :: ps)).any (fun p => p.attrs.contains .noalias) = true ∧
       (noaliasParams facts ptrA ptrB (p0 :: ps)).all (fun p => p.attrs.contains .noalias) = true ∧
       bindArgs st (noaliasParams facts ptrA ptrB (p0 :: ps)) args = bindArgs st (p0 :: ps) args := by
   have hna (p : LLVMParam) : (withNoAlias true p).attrs.contains .noalias = true := by
-    simp only [withNoAlias, Bool.not_true, Bool.false_eq_true, ite_false]
-    by_cases hc : .noalias ∈ p.attrs <;> simp [hc]
+    simp only [withNoAlias, Bool.not_true, Bool.false_eq_true, ite_false]; by_cases hc : .noalias ∈ p.attrs <;> simp [hc]
   have hall : (noaliasParams facts ptrA ptrB (p0 :: ps)).all (fun p => p.attrs.contains .noalias) = true := by
     simp only [noaliasParams, hmem, Bool.not_true, Bool.false_eq_true, ite_false, List.all_map]
     exact List.all_eq_true.mpr fun p _ => hna p
-  have hbind : bindArgs st (noaliasParams facts ptrA ptrB (p0 :: ps)) args = bindArgs st (p0 :: ps) args := by
-    simp only [noaliasParams, hmem, Bool.not_true, Bool.false_eq_true, ite_false]
-    exact bindArgs_noalias_invariant st (p0 :: ps) args
-  refine ⟨?_, hall, hbind⟩
-  simp only [noaliasParams, hmem, Bool.not_true, Bool.false_eq_true, ite_false, List.map_cons,
-    List.any_cons, hna p0, Bool.true_or]
+  refine ⟨?_, hall, by simp only [noaliasParams, hmem, Bool.not_true, Bool.false_eq_true, ite_false]
+                       exact bindArgs_noalias_invariant st (p0 :: ps) args⟩
+  simp only [noaliasParams, hmem, Bool.not_true, Bool.false_eq_true, ite_false, List.map_cons, List.any_cons, hna p0, Bool.true_or]
 
-theorem readBytesAt_disjoint_of_fact
-    (m : ByteMem) (base addr width : Nat) (bs : List MemByte)
-    (hb : base + bs.length ≤ addr) :
-    (m.writeBytesAt base bs).readBytesAt addr width = m.readBytesAt addr width := by
-  have hdisj : rangesDisjoint base bs.length addr width = true := by
-    unfold rangesDisjoint; exact decide_eq_true (Or.inl hb)
-  exact ByteMem.readBytesAt_writeBytesAt_disjoint m base bs addr width hdisj
+theorem readBytesAt_disjoint_of_fact (m : ByteMem) (base addr width : Nat) (bs : List MemByte) (hb : base + bs.length ≤ addr) :
+    (m.writeBytesAt base bs).readBytesAt addr width = m.readBytesAt addr width :=
+  ByteMem.readBytesAt_writeBytesAt_disjoint m base bs addr width (by unfold rangesDisjoint; exact decide_eq_true (Or.inl hb))
 
 private theorem vreg0 : (s!"v{0}" = "v0") ∧ (s!"v{1}" = "v1") := by decide
 
-theorem ptxBoundsFreeLoad_sound
-    (iv nv base outBase : Nat) (raw : BitVec 64)
-    (g g' : PTXAst.ByteMemory) (pMem : ParamMemory)
-    (hiv : iv < nv) (hnv : nv < 2 ^ 64) (hbase : base < 2 ^ 64) (hout : outBase < 2 ^ 64)
-    (halign : base % 8 = 0) (hoalign : outBase % 8 = 0)
+theorem ptxBoundsFreeLoad_sound (iv nv base outBase : Nat) (raw : BitVec 64)
+    (g g' : PTXAst.ByteMemory) (pMem : ParamMemory) (hiv : iv < nv) (hnv : nv < 2 ^ 64)
+    (hbase : base < 2 ^ 64) (hout : outBase < 2 ^ 64) (halign : base % 8 = 0) (hoalign : outBase % 8 = 0)
     (hpIdx : pMem.lookupParam? "param_idx" = some (BitVec.ofNat 64 iv))
     (hpLen : pMem.lookupParam? "param_len" = some (BitVec.ofNat 64 nv))
     (hpAddr : pMem.lookupParam? "param_addr" = some (BitVec.ofNat 64 base))
@@ -399,8 +408,8 @@ theorem ptxBoundsFreeLoad_sound
       evalPTXKernel 12 (boundsFreePTXKernel [] 0 1) grid grid g pMem = .ok g' := by
   intro grid
   have hcmp : evalPTXCmp .ge .u64 (BitVec.ofNat 64 iv) (BitVec.ofNat 64 nv) = false := by
-    simp [evalPTXCmp, PTXAst.maskForType, BitVec.ule, BitVec.toNat_ofNat,
-      Nat.mod_eq_of_lt hnv, Nat.mod_eq_of_lt (Nat.lt_trans hiv hnv), hiv]
+    simp [evalPTXCmp, PTXAst.maskForType, BitVec.ule, BitVec.toNat_ofNat, Nat.mod_eq_of_lt hnv,
+      Nat.mod_eq_of_lt (Nat.lt_trans hiv hnv), hiv]
   have hbNat : (BitVec.ofNat 64 base).toNat = base := by simp [BitVec.toNat_ofNat, Nat.mod_eq_of_lt hbase]
   have hoNat : (BitVec.ofNat 64 outBase).toNat = outBase := by simp [BitVec.toNat_ofNat, Nat.mod_eq_of_lt hout]
   have hnnB : ¬ ((base : Int) < 0) := Int.not_lt.mpr (Int.natCast_nonneg base)
@@ -414,11 +423,9 @@ theorem ptxBoundsFreeLoad_sound
   have htidNe : (({ x := 0, y := 0, z := 0 } : PTXAst.Dim3) != { x := 0, y := 0, z := 0 }) = false := rfl
   have hrace : ∀ e, findCrossCTARace? [] e = none := fun _ => rfl
   let rf0 := PTXRegFile.ofRegDecls (boundsFreePTXKernel [] 0 1).regDecls
-  have hrf0 : rf0 =
-      { regs := [("%p0", .uninit), ("%v0", .uninit), ("%v1", .uninit),
-          ("%addr", .uninit), ("%out", .uninit), ("%dst", .uninit)]
-      , decls := [("%p0", .pred), ("%v0", .u64), ("%v1", .u64),
-          ("%addr", .u64), ("%out", .u64), ("%dst", .u64)], enforceDecls := true } := by decide
+  have hrf0 : rf0 = { regs := [("%p0", .uninit), ("%v0", .uninit), ("%v1", .uninit), ("%addr", .uninit),
+      ("%out", .uninit), ("%dst", .uninit)], decls := [("%p0", .pred), ("%v0", .u64), ("%v1", .u64),
+      ("%addr", .u64), ("%out", .u64), ("%dst", .u64)], enforceDecls := true } := by decide
   let rf1 := rf0.setScalarRaw "%dst" 0#64
   let rf2 := rf1.setScalarRaw "%v0" (BitVec.ofNat 64 iv)
   let rf3 := rf2.setScalarRaw "%v1" (BitVec.ofNat 64 nv)
@@ -624,22 +631,18 @@ theorem proofRetention_pipeline_nonvacuous :
     let facts : FactEnv := [.exclusiveObj 0, .noOverflowAdd 1 2 true true, .disjointSlices 3 4, .idxLt 5 6]
     let st : HeapState := { buffers := [{ id := 1, exclusive := true, data := #[42] }], nextId := 2 }
     let env := (VarEnv.empty).bind 0 (.sarrayId 1)
-    let rawCode : LNIRCode :=
-      .letBind 7 .i1 (.isExclusive 0) (.letBind 8 (.sarray .i64) (.sarrayEnsureExclusive 0 .i64) (.ret 8))
+    let rawCode : LNIRCode := .letBind 7 .i1 (.isExclusive 0) (.letBind 8 (.sarray .i64) (.sarrayEnsureExclusive 0 .i64) (.ret 8))
     let specCode := dischargeRetainedExclusivity facts rawCode
-    let llvmIns := emitVerifiedLLVMWithFacts facts 1 2
-      [.add "s" .none .i64 (.constInt .i64 4#64) (.constInt .i64 5#64)]
+    let llvmIns := emitVerifiedLLVMWithFacts facts 1 2 [.add "s" .none .i64 (.constInt .i64 4#64) (.constInt .i64 5#64)]
     let ps := noaliasParams facts 3 4 [{ ty := .ptr 0, name := "p" }]
-    specCode = .letBind 7 .i1 (.scalar (.constBool true))
-        (.letBind 8 (.sarray .i64) (.scalar (.var 0)) (.ret 8)) ∧
+    specCode = .letBind 7 .i1 (.scalar (.constBool true)) (.letBind 8 (.sarray .i64) (.scalar (.var 0)) (.ret 8)) ∧
       evalCode 3 env st specCode = .ok (.sarrayId 1, st) ∧
       execInstrs {} 1 {} llvmIns = .inr (bindReg {} "s" (.bits .i64 9#64)) ∧
       bindArgs {} ps [.ptr 8#64] = some (bindReg {} "p" (.ptr 8#64)) ∧
       (lowerBoundsFreePTXLoad facts 5 6 .u64 "%d" (.regOffset "%a" 0)).length = 1 ∧
       (lowerBoundsFreeMetalLoad facts 5 6 "buf").length = 1 := by
   refine ⟨rfl, rfl, ?_, rfl, rfl, rfl⟩
-  simp [emitVerifiedLLVMWithFacts, attachOverflow, overflowOf, execInstrs,
-    execInstrsWith, stepInstrWith, LLVMAst.evalOperand, binResult, flagsOverflow]
-  decide
+  simp [emitVerifiedLLVMWithFacts, attachOverflow, overflowOf, execInstrs, execInstrsWith,
+    stepInstrWith, LLVMAst.evalOperand, binResult, flagsOverflow]; decide
 
 end LeanNative.Proofs
