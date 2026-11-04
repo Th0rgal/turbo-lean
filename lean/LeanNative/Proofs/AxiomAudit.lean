@@ -513,11 +513,29 @@ elab "#verify_lean_native_axioms" : command => do
     let report ← auditAllProofsCoreM auditedTheoremNames
     if !report.passed then
       throwError s!"[AxiomAudit] Kernel axiom audit FAILED! Forbidden/non-standard axioms found: {report.forbiddenAxiomsFound}"
+    let arr := report.results.toArray
+    let numChunks := (arr.size + 31) / 32
+    let mut chunks : Array Expr := #[]
+    for i in [:numChunks] do
+      let chunk := (arr.extract (i * 32) (min arr.size ((i + 1) * 32))).toList
+      chunks := chunks.push (toExpr chunk)
+    while chunks.size > 1 do
+      let mut next : Array Expr := #[]
+      let pairs := chunks.size / 2
+      for j in [:pairs] do
+        let l := chunks[2 * j]!
+        let r := chunks[2 * j + 1]!
+        next := next.push (mkApp3 (mkConst ``List.append [levelZero]) (mkConst ``TheoremAxiomAudit) l r)
+      if chunks.size % 2 == 1 then
+        next := next.push chunks[chunks.size - 1]!
+      chunks := next
+    let resultsExpr := chunks[0]?.getD (toExpr ([] : List TheoremAxiomAudit))
+    let reportExpr := mkApp4 (mkConst ``AxiomAuditReport.mk) (toExpr report.passed) (toExpr report.theoremsAudited) resultsExpr (toExpr report.forbiddenAxiomsFound)
     addAndCompile (Declaration.defnDecl {
       name := `LeanNative.Proofs.verifiedAxiomAuditReport
       levelParams := []
       type := mkConst ``AxiomAuditReport
-      value := toExpr report
+      value := reportExpr
       hints := ReducibilityHints.abbrev
       safety := DefinitionSafety.safe
     })
