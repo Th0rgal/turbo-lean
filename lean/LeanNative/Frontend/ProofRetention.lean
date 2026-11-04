@@ -27,6 +27,7 @@ set_option autoImplicit false
 /-- Mapping from LCNF `FVarId`s to LNIR `VarId`s threaded during pure-phase fact extraction. -/
 structure RetentionState where
   fvarMap : List (Lean.FVarId × VarId) := []
+  fvarTypes : List (Lean.FVarId × Lean.Expr) := []
   nextVar : VarId := 0
   facts : FactEnv := []
   branchFacts : FactEnv := []
@@ -39,12 +40,22 @@ def internFVar (st : RetentionState) (fv : Lean.FVarId) : VarId × RetentionStat
     let vid := st.nextVar
     (vid, { st with fvarMap := (fv, vid) :: st.fvarMap, nextVar := vid + 1 })
 
+def noteFVarType (st : RetentionState) (fv : Lean.FVarId) (ty : Lean.Expr) : RetentionState :=
+  match st.fvarTypes.find? (fun p => p.1 == fv) with
+  | some _ => st
+  | none => { st with fvarTypes := (fv, ty) :: st.fvarTypes }
+
+def internTypedFVar (st : RetentionState) (fv : Lean.FVarId) (ty : Lean.Expr) :
+    VarId × RetentionState :=
+  let (vid, st1) := internFVar st fv
+  (vid, noteFVarType st1 fv ty)
+
 def internParams (st : RetentionState)
     (ps : List (Lean.Compiler.LCNF.Param .pure)) : RetentionState :=
   match ps with
   | [] => st
   | p :: rest =>
-    let (_, st1) := internFVar st p.fvarId
+    let (_, st1) := internTypedFVar st p.fvarId p.type
     internParams st1 rest
 
 def pushFactOpt (st : RetentionState) (opt : Option RetainedFact) : RetentionState :=
@@ -79,22 +90,62 @@ def internFVarList (st : RetentionState) (fvs : List Lean.FVarId) :
     let (vs, st2) := internFVarList st1 rest
     (v :: vs, st2)
 
+def isCanonicalHPowInst (inst : Lean.Expr) : Bool :=
+  inst == Lean.mkApp
+    (Lean.mkApp
+      (Lean.mkApp (Lean.mkConst ``instHPow [Lean.Level.zero, Lean.Level.zero]) (Lean.mkConst ``Nat))
+      (Lean.mkConst ``Nat))
+    (Lean.mkApp
+      (Lean.mkApp (Lean.mkConst ``instPowNat [Lean.Level.zero]) (Lean.mkConst ``Nat))
+      (Lean.mkConst ``instNatPowNat))
+
+/-- `OfNat.ofNat` on `Nat` (`instOfNatNat n`), a non-wrapping `UInt64.instOfNat` /
+`USize.instOfNat` (`n < 2^64` / `n < 2^32`), or a bare nat literal.
+A custom `OfNat` instance, or `2^64` elaborated as `UInt64` (which wraps to `0`), is rejected. -/
 def litNat? (e : Lean.Expr) : Option Nat :=
   match e with
   | .lit (.natVal n) => some n
   | _ =>
     match e.getAppFnArgs with
-    | (``OfNat.ofNat, #[t, .lit (.natVal n), _]) =>
-      if t == Lean.mkConst ``Nat then some n else none
+    | (``OfNat.ofNat, #[t, .lit (.natVal n), inst]) =>
+      if t == Lean.mkConst ``Nat &&
+          inst == Lean.mkApp (Lean.mkConst ``instOfNatNat) (.lit (.natVal n)) then
+        some n
+      else if t == Lean.mkConst ``UInt64 &&
+          inst == Lean.mkApp (Lean.mkConst ``UInt64.instOfNat) (.lit (.natVal n)) &&
+          n < 2 ^ 64 then
+        some n
+      else if t == Lean.mkConst ``USize &&
+          inst == Lean.mkApp (Lean.mkConst ``USize.instOfNat) (.lit (.natVal n)) &&
+          n < 2 ^ 32 then
+        some n
+      else none
+    | (``HPow.hPow, #[t1, t2, t3, inst, .lit (.natVal b), .lit (.natVal k)]) =>
+      if t1 == Lean.mkConst ``Nat && t2 == Lean.mkConst ``Nat && t3 == Lean.mkConst ``Nat &&
+          isCanonicalHPowInst inst && b == 2 && (k == 63 || k == 64) then
+        some (2 ^ k)
+      else none
+    | (``HPow.hPow, #[t1, t2, t3, inst, base, exp]) =>
+      if t1 == Lean.mkConst ``Nat && t2 == Lean.mkConst ``Nat && t3 == Lean.mkConst ``Nat &&
+          isCanonicalHPowInst inst then
+        match base.getAppFnArgs, exp.getAppFnArgs with
+        | (``OfNat.ofNat, #[tb, .lit (.natVal b), ib]), (``OfNat.ofNat, #[te, .lit (.natVal k), ie]) =>
+          if tb == Lean.mkConst ``Nat && te == Lean.mkConst ``Nat &&
+              ib == Lean.mkApp (Lean.mkConst ``instOfNatNat) (.lit (.natVal b)) &&
+              ie == Lean.mkApp (Lean.mkConst ``instOfNatNat) (.lit (.natVal k)) &&
+              b == 2 && (k == 63 || k == 64) then
+            some (2 ^ k)
+          else none
+        | _, _ => none
+      else none
     | _ => none
 
-/-- Peel `Fin.val` / `UInt64.toNat` / `USize.toNat` with explicit structural fuel. -/
+/-- Peel `UInt64.toNat` / `USize.toNat` with explicit structural fuel. -/
 def unwrapOperandAux (fuel : Nat) (e : Lean.Expr) : Lean.Expr :=
   match fuel with
   | 0 => e
   | fuel + 1 =>
     match e.getAppFnArgs with
-    | (``Fin.val, #[_, x]) => unwrapOperandAux fuel x
     | (``UInt64.toNat, #[x]) => unwrapOperandAux fuel x
     | (``USize.toNat, #[x]) => unwrapOperandAux fuel x
     | _ => e
@@ -108,20 +159,39 @@ def isSortZero (e : Lean.Expr) : Bool :=
 
 /-- A retained fact is a comparison, divisibility, equality, or conjunction, never `Sort 0`. -/
 def isRetainedPropHead (n : Lean.Name) : Bool :=
-  n == ``LT.lt || n == ``Nat.lt || n == ``UInt64.lt ||
-  n == ``LE.le || n == ``Nat.le || n == ``UInt64.le ||
+  n == ``LT.lt || n == ``Nat.lt || n == ``UInt64.lt || n == ``USize.lt ||
+  n == ``LE.le || n == ``Nat.le || n == ``UInt64.le || n == ``USize.le ||
   n == ``Dvd.dvd || n == ``Eq ||
   n == ``And || n == ``SlicesDisjoint
 
 def isPropType (ty : Lean.Expr) : Bool :=
   isRetainedPropHead (ty.getAppFnArgs).1
 
-/-- A fvar operand, or a literal `Nat` interned as a fresh variable. -/
+/-- Unboxed machine-word carriers (`UInt64`, `USize`). Runtime `Nat` / `Fin` (tagged pointers),
+signed integers, `BitVec`, and custom structures are rejected. -/
+def isOperandCarrier (n : Lean.Name) : Bool :=
+  n == ``UInt64 || n == ``USize
+
+def isOperandTy (e : Lean.Expr) : Bool :=
+  match e.getAppFn.constName? with
+  | some n => isOperandCarrier n
+  | none => false
+
+/-- A machine-word fvar operand, or a literal `Nat` interned as a fresh variable.
+When `fv` has a recorded type in `st.fvarTypes`, that type must be `UInt64` or `USize`;
+when `fv` has no recorded type, `UInt64.toNat` / `USize.toNat` must have been peeled. -/
 def operandVar? (st : RetentionState) (e : Lean.Expr) : Option (VarId × RetentionState) :=
-  match unwrapOperand e with
-  | .fvar fv => some (internFVar st fv)
-  | .lit (.natVal n) => some (internFVar st { name := .num `lit n })
-  | _ => none
+  match litNat? (unwrapOperand e) with
+  | some n => some (internFVar st { name := .num `lit n })
+  | none =>
+    let peeled := unwrapOperand e != e
+    match unwrapOperand e with
+    | .fvar fv =>
+      let ok := match st.fvarTypes.find? (fun p => p.1 == fv) with
+        | some (_, ty) => isOperandTy ty
+        | none => peeled
+      if ok then some (internFVar st fv) else none
+    | _ => none
 
 def twoOperands (st : RetentionState) (a b : Lean.Expr) :
     Option (VarId × VarId × RetentionState) :=
@@ -132,23 +202,69 @@ def twoOperands (st : RetentionState) (a b : Lean.Expr) :
     | none => none
     | some (vb, st2) => some (va, vb, st2)
 
-/-- `a + b` or `a * b` on `Nat`. Heterogeneous `HAdd`/`HMul` (e.g. `UInt64`) is rejected:
-only the outer `Fin.val` is peeled, never `UInt64.toNat` around a wrapping add. -/
+/-- `@instHAdd Nat instAddNat`, or the bare `instAddNat` instance. -/
+def isCanonicalNatAddInst (inst : Lean.Expr) : Bool :=
+  inst == Lean.mkConst ``instAddNat ||
+    inst.getAppFnArgs == (``instHAdd, #[Lean.mkConst ``Nat, Lean.mkConst ``instAddNat])
+
+/-- `@instHMul Nat instMulNat`, or the bare `instMulNat` instance. -/
+def isCanonicalNatMulInst (inst : Lean.Expr) : Bool :=
+  inst == Lean.mkConst ``instMulNat ||
+    inst.getAppFnArgs == (``instHMul, #[Lean.mkConst ``Nat, Lean.mkConst ``instMulNat])
+
+/-- `a + b` or `a * b` on `Nat` with the standard-library instance.
+Heterogeneous `HAdd`/`HMul` (e.g. `UInt64`) and custom instances are rejected:
+`UInt64.toNat` around a wrapping add is never peeled. -/
 def binApp? (e : Lean.Expr) (add : Bool) : Option (Lean.Expr × Lean.Expr) :=
-  let e' := match e.getAppFnArgs with
-    | (``Fin.val, #[_, x]) => x
-    | _ => e
-  match e'.getAppFnArgs with
-  | (n, args) =>
-    let natTy := args.size >= 6 && args[0]! == Lean.mkConst ``Nat &&
-      args[1]! == Lean.mkConst ``Nat && args[2]! == Lean.mkConst ``Nat
-    if add then
-      if (n == ``HAdd.hAdd && natTy) || (n == ``Nat.add && args.size == 2) then
-        some (args[args.size - 2]!, args[args.size - 1]!)
-      else none
-    else if (n == ``HMul.hMul && natTy) || (n == ``Nat.mul && args.size == 2) then
-      some (args[args.size - 2]!, args[args.size - 1]!)
+  match e.getAppFnArgs with
+  | (``Nat.add, #[a, b]) => if add then some (a, b) else none
+  | (``Nat.mul, #[a, b]) => if add then none else some (a, b)
+  | (``HAdd.hAdd, #[t1, t2, t3, inst, a, b]) =>
+    if add && t1 == Lean.mkConst ``Nat && t2 == Lean.mkConst ``Nat && t3 == Lean.mkConst ``Nat &&
+        isCanonicalNatAddInst inst then some (a, b) else none
+  | (``HMul.hMul, #[t1, t2, t3, inst, a, b]) =>
+    if !add && t1 == Lean.mkConst ``Nat && t2 == Lean.mkConst ``Nat && t3 == Lean.mkConst ``Nat &&
+        isCanonicalNatMulInst inst then some (a, b) else none
+  | _ => none
+
+/-- A canonical `<` or `≤` on `Nat`, `UInt64`, or `USize`. Custom instances and every other
+carrier (`Int`, `BitVec`, structures) are rejected. -/
+def isCanonicalRelApp? (e : Lean.Expr) (wantLt : Bool) : Option (Lean.Name × Lean.Expr × Lean.Expr) :=
+  match e.getAppFnArgs with
+  | (``Nat.lt, #[lhs, rhs]) => if wantLt then some (``Nat, lhs, rhs) else none
+  | (``UInt64.lt, #[lhs, rhs]) => if wantLt then some (``UInt64, lhs, rhs) else none
+  | (``USize.lt, #[lhs, rhs]) => if wantLt then some (``USize, lhs, rhs) else none
+  | (``Nat.le, #[lhs, rhs]) => if wantLt then none else some (``Nat, lhs, rhs)
+  | (``UInt64.le, #[lhs, rhs]) => if wantLt then none else some (``UInt64, lhs, rhs)
+  | (``USize.le, #[lhs, rhs]) => if wantLt then none else some (``USize, lhs, rhs)
+  | (``LT.lt, #[ty, inst, lhs, rhs]) =>
+    if !wantLt then none
+    else if ty == Lean.mkConst ``Nat && inst == Lean.mkConst ``instLTNat then some (``Nat, lhs, rhs)
+    else if ty == Lean.mkConst ``UInt64 && inst == Lean.mkConst ``instLTUInt64 then some (``UInt64, lhs, rhs)
+    else if ty == Lean.mkConst ``USize && inst == Lean.mkConst ``instLTUSize then some (``USize, lhs, rhs)
     else none
+  | (``LE.le, #[ty, inst, lhs, rhs]) =>
+    if wantLt then none
+    else if ty == Lean.mkConst ``Nat && inst == Lean.mkConst ``instLENat then some (``Nat, lhs, rhs)
+    else if ty == Lean.mkConst ``UInt64 && inst == Lean.mkConst ``instLEUInt64 then some (``UInt64, lhs, rhs)
+    else if ty == Lean.mkConst ``USize && inst == Lean.mkConst ``instLEUSize then some (``USize, lhs, rhs)
+    else none
+  | _ => none
+
+/-- `@instHMod Nat Nat.instMod`, or the bare `Nat.instMod`. -/
+def isCanonicalNatModInst (inst : Lean.Expr) : Bool :=
+  inst == Lean.mkConst ``Nat.instMod ||
+    inst.getAppFnArgs == (``instHMod, #[Lean.mkConst ``Nat, Lean.mkConst ``Nat.instMod])
+
+/-- `@instHMod UInt64 instModUInt64`, or the bare `instModUInt64`. -/
+def isCanonicalUInt64ModInst (inst : Lean.Expr) : Bool :=
+  inst == Lean.mkConst ``instModUInt64 ||
+    inst.getAppFnArgs == (``instHMod, #[Lean.mkConst ``UInt64, Lean.mkConst ``instModUInt64])
+
+/-- `@instHMod USize instModUSize`, or the bare `instModUSize`. -/
+def isCanonicalUSizeModInst (inst : Lean.Expr) : Bool :=
+  inst == Lean.mkConst ``instModUSize ||
+    inst.getAppFnArgs == (``instHMod, #[Lean.mkConst ``USize, Lean.mkConst ``instModUSize])
 
 /-- `n` is `2^63` or `2^64`. -/
 def isWidthBound (n : Nat) : Bool :=
@@ -197,40 +313,39 @@ def alignedFact? (st : RetentionState) (ptr align : Lean.Expr) : Option (Retaine
     | some (vp, st2) => some (.alignedPtr vp al, st2)
     | none => none
 
-/-- `p + len ≤ 2^64` as a pointer and a length. -/
+/-- `p + len ≤ 2^64` as a pointer and a length, on the canonical `Nat` order. -/
 def sliceEnd? (st : RetentionState) (e : Lean.Expr) : Option (VarId × VarId × RetentionState) :=
-  match (unwrapOperand e).getAppFnArgs with
-  | (n, args) =>
-    if (n == ``LE.le || n == ``Nat.le) && args.size >= 2 then
-      match litNat? (unwrapOperand (args[args.size - 1]!)) with
-      | some m =>
-        if m != 2 ^ 64 then none
-        else
-          match binApp? (args[args.size - 2]!) true with
-          | some (p, len) =>
-            match twoOperands st p len with
-            | some (vp, vl, st2) => some (vp, vl, st2)
-            | none => none
-          | none => none
-      | none => none
-    else none
-
-/-- `a + lenA ≤ b` or `b + lenB ≤ a` as the two pointers and their lengths. -/
-def sliceOrder? (st : RetentionState) (e : Lean.Expr) :
-    Option (VarId × VarId × VarId × VarId × RetentionState) :=
-  match (unwrapOperand e).getAppFnArgs with
-  | (n, args) =>
-    if (n == ``LE.le || n == ``Nat.le) && args.size >= 2 then
-      match binApp? (args[args.size - 2]!) true with
-      | some (p, len) =>
-        match twoOperands st p len with
-        | some (vp, vl, st1) =>
-          match operandVar? st1 (args[args.size - 1]!) with
-          | some (vq, st2) => some (vp, vl, vq, 0, st2)
+  match isCanonicalRelApp? (unwrapOperand e) false with
+  | some (``Nat, lhs, rhs) =>
+    match litNat? (unwrapOperand rhs) with
+    | some m =>
+      if m != 2 ^ 64 then none
+      else
+        match binApp? lhs true with
+        | some (p, len) =>
+          match twoOperands st p len with
+          | some (vp, vl, st2) => some (vp, vl, st2)
           | none => none
         | none => none
+    | none => none
+  | _ => none
+
+/-- `a + lenA ≤ b` or `b + lenB ≤ a` as the two pointers and their lengths,
+on the canonical `Nat` order. -/
+def sliceOrder? (st : RetentionState) (e : Lean.Expr) :
+    Option (VarId × VarId × VarId × VarId × RetentionState) :=
+  match isCanonicalRelApp? (unwrapOperand e) false with
+  | some (``Nat, lhs, rhs) =>
+    match binApp? lhs true with
+    | some (p, len) =>
+      match twoOperands st p len with
+      | some (vp, vl, st1) =>
+        match operandVar? st1 rhs with
+        | some (vq, st2) => some (vp, vl, vq, 0, st2)
+        | none => none
       | none => none
-    else none
+    | none => none
+  | _ => none
 
 /-- `` `SlicesDisjoint `` is `a+lenA ≤ 2^64 ∧ b+lenB ≤ 2^64 ∧ (a+lenA ≤ b ∨ b+lenB ≤ a)`. -/
 def disjointFact? (st : RetentionState) (e : Lean.Expr) : Option (RetainedFact × RetentionState) :=
@@ -268,36 +383,56 @@ def disjointFact? (st : RetentionState) (e : Lean.Expr) : Option (RetainedFact �
     | _ => none
   | _ => none
 
-/-- A fact justified by a `Prop` type, matched on the kernel constant's exact `Name`. -/
+/-- A modulus on a canonical `Nat`/`UInt64`/`USize` instance. -/
+def modApp? (e : Lean.Expr) : Option (Lean.Expr × Lean.Expr) :=
+  match e.getAppFnArgs with
+  | (``Nat.mod, #[ptr, al]) => some (ptr, al)
+  | (``UInt64.mod, #[ptr, al]) => some (ptr, al)
+  | (``USize.mod, #[ptr, al]) => some (ptr, al)
+  | (``HMod.hMod, #[t1, t2, t3, inst, ptr, al]) =>
+    let ok :=
+      (t1 == Lean.mkConst ``Nat && t2 == Lean.mkConst ``Nat && t3 == Lean.mkConst ``Nat &&
+        isCanonicalNatModInst inst) ||
+      (t1 == Lean.mkConst ``UInt64 && t2 == Lean.mkConst ``UInt64 && t3 == Lean.mkConst ``UInt64 &&
+        isCanonicalUInt64ModInst inst) ||
+      (t1 == Lean.mkConst ``USize && t2 == Lean.mkConst ``USize && t3 == Lean.mkConst ``USize &&
+        isCanonicalUSizeModInst inst)
+    if ok then some (ptr, al) else none
+  | _ => none
+
+/-- A fact justified by a `Prop` type, matched on the kernel constant's exact `Name`
+and its canonical standard-library instance. -/
 def factOfType (st : RetentionState) (ty : Lean.Expr) : Option (RetainedFact × RetentionState) :=
   if !isPropType ty then none
   else
-    match ty.getAppFnArgs with
-    | (n, args) =>
-      if (n == ``LT.lt || n == ``Nat.lt || n == ``UInt64.lt) && args.size >= 2 then
-        let lhs := args[args.size - 2]!
-        let rhs := args[args.size - 1]!
-        match overflowFact? st lhs rhs with
-        | some r => some r
-        | none =>
-          match twoOperands st lhs rhs with
-          | some (a, b, st2) => some (.idxLt a b, st2)
-          | none => none
-      else if (n == ``LE.le || n == ``Nat.le || n == ``UInt64.le) && args.size >= 2 then
-        subFact? st (args[args.size - 2]!) (args[args.size - 1]!)
-      else if n == ``Dvd.dvd && args.size >= 2 then
-        alignedFact? st (args[args.size - 1]!) (args[args.size - 2]!)
-      else if n == ``Eq && args.size >= 3 then
-        let (m, margs) := (unwrapOperand (args[args.size - 2]!)).getAppFnArgs
-        if (m == ``HMod.hMod || m == ``Nat.mod) && margs.size >= 2 then
-          let ptr := margs[margs.size - 2]!
-          let al := margs[margs.size - 1]!
-          match litNat? (unwrapOperand (args[args.size - 1]!)) with
-          | some 0 => alignedFact? st ptr al
-          | _ => none
-        else none
-      else if n == ``And || n == ``SlicesDisjoint then disjointFact? st ty
-      else none
+    match isCanonicalRelApp? ty true with
+    | some (_, lhs, rhs) =>
+      match overflowFact? st lhs rhs with
+      | some r => some r
+      | none =>
+        match twoOperands st lhs rhs with
+        | some (a, b, st2) => some (.idxLt a b, st2)
+        | none => none
+    | none =>
+      match isCanonicalRelApp? ty false with
+      | some (_, lhs, rhs) => subFact? st lhs rhs
+      | none =>
+        match ty.getAppFnArgs with
+        | (``Dvd.dvd, #[ty, inst, align, ptr]) =>
+          if ty == Lean.mkConst ``Nat && inst == Lean.mkConst ``Nat.instDvd then
+            alignedFact? st ptr align
+          else none
+        | (``Eq, #[eqTy, lhs, rhs]) =>
+          if eqTy == Lean.mkConst ``Nat || eqTy == Lean.mkConst ``UInt64 ||
+              eqTy == Lean.mkConst ``USize then
+            match modApp? (unwrapOperand lhs) with
+            | some (ptr, al) =>
+              match litNat? (unwrapOperand rhs) with
+              | some 0 => alignedFact? st ptr al
+              | _ => none
+            | none => none
+          else none
+        | (n, _) => if n == ``And || n == ``SlicesDisjoint then disjointFact? st ty else none
 
 def extractParamFacts (st : RetentionState)
     (ps : List (Lean.Compiler.LCNF.Param .pure)) : RetentionState :=
@@ -320,13 +455,13 @@ def extractLetFact (st : RetentionState) (ty : Lean.Expr)
     | none => st
   | _ => st
 
-/-- A recognized `Bool`-producing test: `Nat.blt`, `UInt64.decLt`, `lean_is_exclusive`,
+/-- A recognized `Bool`-producing test: `UInt64.decLt`, `USize.decLt`, `lean_is_exclusive`,
 or `Decidable.decide` whose proposition is a retained fact. -/
 def testOfLet (st : RetentionState) (lv : Lean.Compiler.LCNF.LetValue .pure) :
     Option (Option RetainedFact × RetentionState) :=
   match lv with
   | .const fnName _ args _ =>
-    if fnName == ``Nat.blt || fnName == ``UInt64.decLt then
+    if fnName == ``UInt64.decLt || fnName == ``USize.decLt then
       let (vids, st1) := internFVarList st (fvarsOfArgs args.toList)
       match vids with
       | a :: b :: _ => some (some (.idxLt a b), st1)
@@ -372,7 +507,7 @@ def collectPureStep (fuel : Nat) (st : RetentionState)
   | fuel + 1 =>
     match work with
     | .inl (.let decl k) =>
-      let (dst, st1) := internFVar st decl.fvarId
+      let (dst, st1) := internTypedFVar st decl.fvarId decl.type
       let st2 := extractLetFact st1 decl.type decl.value dst
       collectPureStep fuel st2 (.inl k)
     | .inl (.fun decl k _) =>
@@ -409,7 +544,7 @@ def collectBranchStep (fuel : Nat) (st : RetentionState)
   | fuel + 1 =>
     match work with
     | .inl (.let decl k) =>
-      let (dst, st1) := internFVar st decl.fvarId
+      let (dst, st1) := internTypedFVar st decl.fvarId decl.type
       let st2 := extractLetFact st1 decl.type decl.value dst
       let known' :=
         match testOfLet st2 decl.value with
@@ -451,8 +586,9 @@ def collectBranchStep (fuel : Nat) (st : RetentionState)
       collectBranchStep fuel st2 known (.inr rest)
 
 /-- Extract parameter facts from a kernel `forallE` telescope before LCNF `lcErased` erasure.
-Each binder pushes a fresh synthetic `FVarId` mapped to the corresponding `VarId` in `paramVars`
-(or a fresh `nextVar` slot once `paramVars` is exhausted), instantiating loose bound variables. -/
+LCNF lowers every leading `forallE` binder 1-to-1 to a parameter in `d.params` (with `.unit`
+for erased `Sort`/`Prop` binders), so each binder consumes one `VarId` in `paramVars` (or a
+fresh `nextVar` slot once `paramVars` is exhausted) and records its kernel binder type. -/
 def retainedForallParamFactsAux (fuel : Nat) (st : RetentionState) (paramVars : List VarId)
     (ty : Lean.Expr) : RetentionState :=
   match fuel, ty with
@@ -460,9 +596,9 @@ def retainedForallParamFactsAux (fuel : Nat) (st : RetentionState) (paramVars : 
   | fuel + 1, .forallE _ dom body _ =>
     let fv : Lean.FVarId := { name := .num `_sig_param fuel }
     let (st1, restVars) := match paramVars with
-      | v :: vs => ({ st with fvarMap := (fv, v) :: st.fvarMap }, vs)
+      | v :: vs => (noteFVarType { st with fvarMap := (fv, v) :: st.fvarMap } fv dom, vs)
       | [] =>
-        let (_, s) := internFVar st fv
+        let (_, s) := internTypedFVar st fv dom
         (s, [])
     let st2 := match factOfType st1 dom with
       | some (f, s) => pushFactOpt s (some f)

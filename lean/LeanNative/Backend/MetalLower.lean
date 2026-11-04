@@ -71,11 +71,12 @@ def guarded (inner : List MSLStmt) : List MSLStmt :=
   [ .ifElse (.lt (.cast .ulong (.var "gid")) (.var "n")) (MSLBlock.ofList inner) .nil
   , .returnStmt ]
 
-/-- `facts = []` is `guarded`. A retained `idxLt idxVar lenVar` drops the `gid < n` test;
-the launch contract is then `grid.x * block.x ≤ n`. -/
+/-- `facts = []` is `guarded`. A retained `idxLt gidVar lenVar` drops the `gid < n` test
+when `gidVar` is the kernel index; the launch contract is then `grid.x * block.x ≤ n`.
+A decl scalar param is never `gidVar`. -/
 def guardedWithFacts (inner : List MSLStmt) (facts : List RetainedFact)
-    (idxVar : VarId := 0) (lenVar : VarId := 1) : List MSLStmt :=
-  if !factMember facts (.idxLt idxVar lenVar) then guarded inner else inner ++ [.returnStmt]
+    (gidVar lenVar : VarId) : List MSLStmt :=
+  if !factMember facts (.idxLt gidVar lenVar) then guarded inner else inner ++ [.returnStmt]
 
 def elem (name : String) : MSLExpr := .index name (.var "gid")
 
@@ -88,7 +89,7 @@ def kernelOf (name : String) (nIn : Nat) (compute : MSLExpr) : MSLKernelDecl whe
   body := guarded [storeOut compute]
 
 def kernelOfWithFacts (name : String) (nIn : Nat) (compute : MSLExpr)
-    (facts : List RetainedFact) (idxVar : VarId := 0) (lenVar : VarId := 1) : MSLKernelDecl :=
+    (facts : List RetainedFact) (idxVar lenVar : VarId) : MSLKernelDecl :=
   { kernelOf name nIn compute with body := guardedWithFacts [storeOut compute] facts idxVar lenVar }
 
 def lowerKind (name : String) : ParallelKernelKind → MSLKernelDecl
@@ -127,9 +128,10 @@ def lowerKind (name : String) : ParallelKernelKind → MSLKernelDecl
 def lowerToMetal (name : String) (k : ParallelKernelKind) : MSLModule where
   kernels := [lowerKind name k]
 
-/-- Fact-carrying twin of `lowerKind`. Empty facts reproduce `lowerKind` exactly. -/
+/-- Fact-carrying twin of `lowerKind`. Empty facts reproduce `lowerKind` exactly.
+`idxVar` must be the kernel index; a decl scalar param never drops the guard. -/
 def lowerKindWithFacts (name : String) (facts : List RetainedFact)
-    (k : ParallelKernelKind) (idxVar : VarId := 0) (lenVar : VarId := 1) : MSLKernelDecl :=
+    (k : ParallelKernelKind) (idxVar lenVar : VarId) : MSLKernelDecl :=
   match k with
   | .mapScaleAdd scale bias =>
     kernelOfWithFacts name 1
@@ -165,7 +167,7 @@ def lowerKindWithFacts (name : String) (facts : List RetainedFact)
       { base with body := guardedWithFacts inner facts iv lenVar }
 
 def lowerToMetalWithFacts (name : String) (facts : List RetainedFact)
-    (k : ParallelKernelKind) (idxVar : VarId := 0) (lenVar : VarId := 1) : MSLModule where
+    (k : ParallelKernelKind) (idxVar lenVar : VarId) : MSLModule where
   kernels := [lowerKindWithFacts name facts k idxVar lenVar]
 
 def ppLowered (name : String) (k : ParallelKernelKind) : String :=
@@ -179,7 +181,7 @@ def lowerSaxpyNamed (name : String) (alpha : UInt64) : MSLKernelDecl where
   body := guarded [storeOut (.add (.mul (.immU64 alpha.toBitVec) (elem "x")) (elem "y"))]
 
 def lowerSaxpyNamedWithFacts (name : String) (alpha : UInt64) (facts : List RetainedFact)
-    (idxVar : VarId := 0) (lenVar : VarId := 1) : MSLKernelDecl :=
+    (idxVar lenVar : VarId) : MSLKernelDecl :=
   { lowerSaxpyNamed name alpha with
     body := guardedWithFacts [storeOut (.add (.mul (.immU64 alpha.toBitVec) (elem "x")) (elem "y"))]
       facts idxVar lenVar }
@@ -280,12 +282,12 @@ def lowerDeclToMetal (d : LNIRDecl) : Option MSLModule :=
     | none => none
   else none
 
-def lowerDeclToMetalWithFacts (d : LNIRDecl) (idxVar : VarId := 0) : Option MSLModule :=
+def lowerDeclToMetalWithFacts (d : LNIRDecl) : Option MSLModule :=
   if isSarrayI64 d.retTy then
     match extractDeclParFor d.body with
-    | some (_, lenVar, inputs, k) =>
+    | some (_, _, inputs, k) =>
       if wfMetalKernel k && inputs.length == kernelArity k then
-        some (lowerToMetalWithFacts s!"lean_native_metal_decl_{d.name}" d.retainedFacts k idxVar lenVar)
+        some (lowerToMetal s!"lean_native_metal_decl_{d.name}" k)
       else none
     | none => none
   else none

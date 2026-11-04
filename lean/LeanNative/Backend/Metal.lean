@@ -203,31 +203,16 @@ def emitMetalDeclKernel (d : LNIRDecl) : Option String :=
   else if d.name == "matmul_tiled_u64" then some (emitMetalMatMulTiledKernel fnName)
   else
     match extractParForRegions d.body with
-    | [(_, lenVar, _, .i64, .saxpy alpha)] =>
-      if !factMember d.retainedFacts (.idxLt 0 lenVar) then
-        some (ppMSLKernel (lowerSaxpyNamed fnName alpha))
-      else
-        some (ppMSLKernel (lowerSaxpyNamedWithFacts fnName alpha d.retainedFacts 0 lenVar))
-    | [(_, lenVar, _, .i64, .mapScaleAdd scale bias)] =>
-      if !factMember d.retainedFacts (.idxLt 0 lenVar) then
-        some (ppMSLKernel (lowerKind fnName (.mapScaleAdd scale bias)))
-      else
-        some (ppMSLKernel (lowerKindWithFacts fnName d.retainedFacts (.mapScaleAdd scale bias) 0 lenVar))
-    | [(_, lenVar, _, .i64, .zipAdd)] =>
-      if !factMember d.retainedFacts (.idxLt 0 lenVar) then
-        some (ppMSLKernel (lowerKind fnName .zipAdd))
-      else
-        some (ppMSLKernel (lowerKindWithFacts fnName d.retainedFacts .zipAdd 0 lenVar))
-    | [(_, lenVar, _, .i64, .zipMul)] =>
-      if !factMember d.retainedFacts (.idxLt 0 lenVar) then
-        some (ppMSLKernel (lowerKind fnName .zipMul))
-      else
-        some (ppMSLKernel (lowerKindWithFacts fnName d.retainedFacts .zipMul 0 lenVar))
-    | [(_, lenVar, _, .i64, .stencil1D3Pt wl wc wr)] =>
-      if !factMember d.retainedFacts (.idxLt 0 lenVar) then
-        some (ppMSLKernel (lowerKind fnName (.stencil1D3Pt wl wc wr)))
-      else
-        some (ppMSLKernel (lowerKindWithFacts fnName d.retainedFacts (.stencil1D3Pt wl wc wr) 0 lenVar))
+    | [(_, _, _, .i64, .saxpy alpha)] =>
+      some (ppMSLKernel (lowerSaxpyNamed fnName alpha))
+    | [(_, _, _, .i64, .mapScaleAdd scale bias)] =>
+      some (ppMSLKernel (lowerKind fnName (.mapScaleAdd scale bias)))
+    | [(_, _, _, .i64, .zipAdd)] =>
+      some (ppMSLKernel (lowerKind fnName .zipAdd))
+    | [(_, _, _, .i64, .zipMul)] =>
+      some (ppMSLKernel (lowerKind fnName .zipMul))
+    | [(_, _, _, .i64, .stencil1D3Pt wl wc wr)] =>
+      some (ppMSLKernel (lowerKind fnName (.stencil1D3Pt wl wc wr)))
     | _ =>
       let isI64Ty : LNIRType → Bool | .i64 => true | _ => false
       if isI64Ty d.retTy && !d.params.isEmpty && d.params.all (fun p => isI64Ty p.ty) &&

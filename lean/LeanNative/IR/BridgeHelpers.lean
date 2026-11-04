@@ -1898,37 +1898,60 @@ partial def pureCodeAstFuel : Lean.Compiler.LCNF.Code .pure → Nat
   | .cases c => 1 + c.alts.foldl (fun acc a => acc + pureCodeAstFuel a.getCode) 0
   | .return _ | .jmp .. | .unreach _ => 1
 
-def factVarsInScope (liveVars : List VarId) : RetainedFact → Bool
-  | .idxLt i n => liveVars.contains i && liveVars.contains n
-  | .noOverflowAdd a b _ _ | .noOverflowSub a b _ _ | .noOverflowMul a b _ _ =>
-    liveVars.contains a && liveVars.contains b
-  | .alignedPtr p _ => liveVars.contains p
-  | .disjointSlices a b la lb =>
-    liveVars.contains a && liveVars.contains b &&
-    liveVars.contains la && liveVars.contains lb
-  | .exclusiveObj o => liveVars.contains o
+def isWordFactTy : LNIRType → Bool
+  | .i64 | .usize => true
+  | _ => false
 
-partial def collectDeclVars (acc : List VarId) : LNIRCode → List VarId
-  | .letBind dst _ e k =>
-    collectDeclVars (dst :: LeanNative.Frontend.ProofRetention.exprVars e ++ acc) k
-  | .rawStore p i v _ k => collectDeclVars (p :: i :: v :: acc) k
-  | .incRef v _ k | .decRef v _ k => collectDeclVars (v :: acc) k
-  | .ite c t e => collectDeclVars (collectDeclVars (c :: acc) t) e
-  | .seqFor idx lo hi accV init _ body k =>
-    collectDeclVars (collectDeclVars (idx :: lo :: hi :: accV :: init :: acc) body) k
-  | .parFor out len ins _ _ k => collectDeclVars (out :: len :: ins ++ acc) k
-  | .ret v => v :: acc
-  | .unreachable => acc
+def isRawPtrFactTy : LNIRType → Bool
+  | .rawPtr _ => true
+  | _ => false
+
+def isExclFactTy : LNIRType → Bool
+  | .sarray _ | .objPtr => true
+  | _ => false
+
+def factVarsInScope (varTys : List (VarId × LNIRType)) : RetainedFact → Bool
+  | .idxLt i n =>
+    match varTys.lookup i, varTys.lookup n with
+    | some ti, some tn => isWordFactTy ti && isWordFactTy tn
+    | _, _ => false
+  | .noOverflowAdd a b _ _ | .noOverflowSub a b _ _ | .noOverflowMul a b _ _ =>
+    match varTys.lookup a, varTys.lookup b with
+    | some ta, some tb => isWordFactTy ta && isWordFactTy tb
+    | _, _ => false
+  | .alignedPtr p _ =>
+    match varTys.lookup p with
+    | some tp => isRawPtrFactTy tp || isWordFactTy tp
+    | none => false
+  | .disjointSlices a b la lb =>
+    match varTys.lookup a, varTys.lookup b, varTys.lookup la, varTys.lookup lb with
+    | some ta, some tb, some tla, some tlb =>
+      isRawPtrFactTy ta && isRawPtrFactTy tb && isWordFactTy tla && isWordFactTy tlb
+    | _, _, _, _ => false
+  | .exclusiveObj o =>
+    match varTys.lookup o with
+    | some to => isExclFactTy to
+    | none => false
+
+partial def collectDeclVarTys (acc : List (VarId × LNIRType)) : LNIRCode → List (VarId × LNIRType)
+  | .letBind dst ty _ k => collectDeclVarTys ((dst, ty) :: acc) k
+  | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k => collectDeclVarTys acc k
+  | .ite _ t e => collectDeclVarTys (collectDeclVarTys acc t) e
+  | .seqFor idx _ _ accV _ accTy body k =>
+    collectDeclVarTys (collectDeclVarTys ((idx, .i64) :: (accV, accTy) :: acc) body) k
+  | .parFor out _ _ elemTy _ k => collectDeclVarTys ((out, .sarray elemTy) :: acc) k
+  | .ret _ | .unreachable => acc
 
 def attachBaseDeclFactsM (declName : Lean.Name) (d : LNIRDecl) : Lean.CoreM LNIRDecl := do
   let env ← getEnv
   let paramVars := d.params.map (·.id)
+  let paramTys := d.params.map fun p => (p.id, p.ty)
   let nextVar := paramVars.foldl max 0 + 64
   let sigFacts := match env.find? declName with
     | none => []
     | some cinfo =>
       (LeanNative.Frontend.ProofRetention.retainedForallParamFacts paramVars nextVar cinfo.type).filter
-        (factVarsInScope paramVars)
+        (factVarsInScope paramTys)
   let baseFacts ← match ← Lean.Compiler.LCNF.getBaseDecl? declName with
     | none => pure []
     | some baseDecl =>
@@ -1942,7 +1965,7 @@ def attachBaseDeclFactsM (declName : Lean.Name) (d : LNIRDecl) : Lean.CoreM LNIR
           (match baseDecl.value with | .code c => pureCodeAstFuel c | .extern _ => 0) + 128
         let rawFacts := LeanNative.Frontend.ProofRetention.retainedPureDeclFactsWithSeed
           fuel paramSeed nextVar baseDecl
-        pure (rawFacts.filter (factVarsInScope paramVars))
+        pure (rawFacts.filter (factVarsInScope paramTys))
   let merged := (sigFacts ++ baseFacts).foldl LeanNative.IR.consFact d.retainedFacts
   return { d with retainedFacts := merged }
 
@@ -1951,9 +1974,9 @@ def extractPureDeclFactsWithBridgeState (decl : Lean.Compiler.LCNF.Decl .pure)
   let seedMap := st.fvarToVar.toList
   let fuel := decl.params.size +
     (match decl.value with | .code c => pureCodeAstFuel c | .extern _ => 0) + 128
-  let liveVars := collectDeclVars (d.params.map (·.id)) d.body
+  let liveVarTys := collectDeclVarTys (d.params.map fun p => (p.id, p.ty)) d.body
   let facts := (LeanNative.Frontend.ProofRetention.retainedPureDeclFactsWithSeed
-    fuel seedMap st.nextVarId decl).filter (factVarsInScope liveVars)
+    fuel seedMap st.nextVarId decl).filter (factVarsInScope liveVarTys)
   let merged := facts.foldl LeanNative.IR.consFact d.retainedFacts
   { d with retainedFacts := merged }
 

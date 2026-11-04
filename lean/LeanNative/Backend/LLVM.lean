@@ -1388,12 +1388,31 @@ def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_
     (localScalarSigs : List (String × List LNIRType × LNIRType) := []) (isaOverride? : Option IsaLevel := none) : String :=
   let fnSym := sanitizeSymbol d.name
   let retTypeStr := sigLLVMAttr target d.retTy ++ sigLLVMType target d.retTy
+  let isWordParam (id : VarId) : Bool :=
+    match d.params.find? (·.id == id) with
+    | some p => p.ty == .i64 || (p.ty == .usize && !target.isWasm)
+    | none => false
+  let isRawPtrParam (id : VarId) : Bool :=
+    match d.params.find? (·.id == id) with
+    | some p => match p.ty with | .rawPtr _ => true | _ => false
+    | none => false
+  let initFacts := d.retainedFacts.filter fun
+    | .idxLt i n => isWordParam i && isWordParam n
+    | .noOverflowAdd a b _ _ | .noOverflowSub a b _ _ | .noOverflowMul a b _ _ =>
+      isWordParam a && isWordParam b
+    | .alignedPtr p _ => isRawPtrParam p || isWordParam p
+    | .disjointSlices a b la lb =>
+      isRawPtrParam a && isRawPtrParam b && isWordParam la && isWordParam lb
+    | .exclusiveObj o =>
+      match d.params.find? (·.id == o) with
+      | some p => match p.ty with | .sarray _ | .objPtr => true | _ => false
+      | none => false
   let paramSigs := d.params.map fun p =>
     let rawPTy := sigLLVMType target p.ty
     let pTy := if rawPTy == "void" then "ptr" else rawPTy
     let zAttr := sigLLVMAttr target p.ty
     let attrs :=
-      if pTy == "ptr" && (optimized || retainedParamDisjoint d.retainedFacts p.id) then
+      if pTy == "ptr" && (optimized || retainedParamDisjoint initFacts p.id) then
         if optimized then " noalias noundef" else " noalias"
       else if optimized && (pTy == "i8" || pTy == "i16" || pTy == "i32" || pTy == "i64" || pTy == "i256") then
         " " ++ zAttr ++ "noundef"
@@ -1431,15 +1450,6 @@ def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_
   let rcMode := selectDeclRcMode d
   let targetIsa := isaOverride?.getD target.isaLevel
   let declIsa := codegenRequires d targetIsa
-  let paramIds := d.params.map (·.id)
-  let initFacts := d.retainedFacts.filter fun
-    | .idxLt i n => paramIds.contains i && paramIds.contains n
-    | .noOverflowAdd a b _ _ | .noOverflowSub a b _ _ | .noOverflowMul a b _ _ =>
-      paramIds.contains a && paramIds.contains b
-    | .alignedPtr p _ => paramIds.contains p
-    | .disjointSlices a b la lb =>
-      paramIds.contains a && paramIds.contains b && paramIds.contains la && paramIds.contains lb
-    | .exclusiveObj o => paramIds.contains o
   let (_, finalState) := (emitCode d.body d.retTy none).run {
     optimized, target, isa := declIsa, rcMode, localScalarSigs,
     retainedFacts := initFacts, varTypes := allVars

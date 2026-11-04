@@ -477,9 +477,12 @@ def emitPTXScalarExpr (e : ScalarExpr) (varMap : List (VarId × String))
       s!"    mad.lo.u64   {dst}, {aReg}, {bReg}, {cReg};"
     ], dst, r3 + 1, p3)
 
-/-- Emit a specialized per-declaration PTX entry point for a `ParallelKernelKind`. -/
+/-- Emit a specialized per-declaration PTX entry point for a `ParallelKernelKind`.
+Top-level entry points keep the SIMT tail-lane guard unless an explicit `gidVar? = some gidVar`
+and `lenVar? = some lenVar` certify `grid.x * block.x ≤ n`; decl scalar params never do. -/
 def emitPTXDeclKernel (fnSymbol : String) (kernel : ParallelKernelKind)
-    (facts : FactEnv := []) (idxVar : VarId := 0) (lenVar : VarId := 1) : String :=
+    (facts : FactEnv := []) (gidVar? : Option VarId := none)
+    (lenVar? : Option VarId := none) : String :=
   if fnSymbol == "lean_native_decl_dot_product_u64" then
     emitPTXDotReduceKernel fnSymbol
   else if fnSymbol == "lean_native_decl_matmul_tiled_u64" then
@@ -487,8 +490,11 @@ def emitPTXDeclKernel (fnSymbol : String) (kernel : ParallelKernelKind)
   else
   match kernel with
   | .mapScaleAdd _ _ | .zipAdd | .zipMul | .saxpy _ | .stencil1D3Pt _ _ _ =>
-    if !factMember facts (.idxLt idxVar lenVar) then ppPTXKernel (lowerKind fnSymbol kernel)
-    else ppPTXKernel (lowerKindWithFacts fnSymbol facts kernel idxVar lenVar)
+    match gidVar?, lenVar? with
+    | some gidVar, some lenVar =>
+      if !factMember facts (.idxLt gidVar lenVar) then ppPTXKernel (lowerKind fnSymbol kernel)
+      else ppPTXKernel (lowerKindWithFacts fnSymbol facts kernel gidVar lenVar)
+    | _, _ => ppPTXKernel (lowerKind fnSymbol kernel)
   | .dotProduct =>
     emitPTXDotReduceKernel fnSymbol
   | .customScalar iv inVars body =>
@@ -512,8 +518,11 @@ def emitPTXDeclKernel (fnSymbol : String) (kernel : ParallelKernelKind)
       ["    .param .u64 param_out,"] ++ inParamDecls ++ ["    .param .u64 param_n"]
     )
     let guardLines :=
-      if factMember facts (.idxLt iv lenVar) then []
-      else [s!"    setp.ge.u64  %p1, %rd5, %rd2;\n    @%p1 bra     $L_done_{fnSymbol};"]
+      match gidVar?, lenVar? with
+      | some gidVar, some lenVar =>
+        if gidVar == iv && factMember facts (.idxLt iv lenVar) then []
+        else [s!"    setp.ge.u64  %p1, %rd5, %rd2;\n    @%p1 bra     $L_done_{fnSymbol};"]
+      | _, _ => [s!"    setp.ge.u64  %p1, %rd5, %rd2;\n    @%p1 bra     $L_done_{fnSymbol};"]
     String.intercalate "\n" ([
       s!".visible .entry {fnSymbol}(\n{paramHeader}\n)\n\{",
       s!"    .reg .pred %p<{maxPred}>;\n    .reg .b32  %r<5>;\n    .reg .b64  %rd<{maxRd}>;",
@@ -629,13 +638,13 @@ def emitPTXModule (m : LNIRModule) (smArch : String := "sm_90") : String :=
       let regions := extractParForRegions d.body
       match regions with
       | [] => (acc, names)
-      | (_, firstLen, _, _, firstK) :: rest =>
-        let primary := emitPTXDeclKernel sym firstK d.retainedFacts 0 firstLen
+      | (_, _, _, _, firstK) :: rest =>
+        let primary := emitPTXDeclKernel sym firstK
         let rec emitExtraRegions (idx : Nat) :
             List (VarId × VarId × List VarId × LNIRType × ParallelKernelKind) → List String
           | [] => []
-          | (_, lenVar, _, _, k) :: tail =>
-            emitPTXDeclKernel s!"lean_native_decl_{d.name}_region_{idx}" k d.retainedFacts 0 lenVar ::
+          | (_, _, _, _, k) :: tail =>
+            emitPTXDeclKernel s!"lean_native_decl_{d.name}_region_{idx}" k ::
               emitExtraRegions (idx + 1) tail
         (acc ++ [primary] ++ emitExtraRegions 1 rest, names ++ [sym])
   ) ([], [])

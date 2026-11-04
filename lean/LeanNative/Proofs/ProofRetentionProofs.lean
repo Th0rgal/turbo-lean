@@ -1430,39 +1430,64 @@ theorem readBytesAt_disjoint_of_fact (m : ByteMem) (base addr width : Nat) (bs :
   ByteMem.readBytesAt_writeBytesAt_disjoint m base bs addr width
     (by unfold rangesDisjoint; exact decide_eq_true (Or.inl hb))
 
--- PTX: a retained fact replaces the guarded gid prefix by the unguarded one.
+-- PTX: a retained fact replaces the guarded gid prefix by the unguarded 11-instruction preamble.
+-- Coverage (`(ctaId.x + 1) * blockSize ≤ len`) keeps `gid * 8` and `nIn * len * 8 + gid * 8`
+-- non-wrapping in 64 bits across `shl.b64` and `add.u64`.
 
 theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
-    (idxVar lenVar : VarId) (suf : List PTXStmt) (cta : PTXCTAState) (done todo : List PTXThreadState)
-    (blockSize : Nat) (ctaId : PTXAst.Dim3)
+    (gidVar lenVar : VarId) (suf : List PTXStmt) (cta : PTXCTAState)
+    (done todo : List PTXThreadState) (blockSize : Nat) (ctaId : PTXAst.Dim3)
     {rf : PTXRegFile} {nP nR nRd : Nat} (hrt : RegTyped rf nP nR nRd)
-    (localBytes tx len : Nat) (hr : 2 < nR) (hrd : 3 < nRd)
+    (localBytes tx len nIn : Nat) (hr : 2 < nR) (hrd : 6 < nRd)
     (hcta : cta.ctaId = ctaId) (hblk : cta.blockDim = { x := blockSize, y := 1, z := 1 })
-    (htx : tx < 2 ^ 32) (hctaX : ctaId.x < 2 ^ 32) (hblkX : blockSize < 2 ^ 32)
+    (htx : tx < blockSize) (hctaX : ctaId.x < 2 ^ 32) (hblkX : blockSize < 2 ^ 32)
+    (hcov : (ctaId.x + 1) * blockSize ≤ len) (houn : (nIn + 1) * len * 8 ≤ 2 ^ 64)
     (hdone : ∀ t ∈ done, t.halted = true) (saved : List MemAccessLog)
     (hn : cta.paramMem.lookupParam? "param_n" = some (BitVec.ofNat 64 len))
-    (hmem : factMember facts (.idxLt idxVar lenVar) = true) :
-    runCTAWithGlobalLog (f + 7) (gidSetupWithFacts doneLbl facts idxVar lenVar ++ suf)
+    (hout : cta.paramMem.lookupParam? "param_out" = some (BitVec.ofNat 64 (nIn * len * 8)))
+    (hmem : factMember facts (.idxLt gidVar lenVar) = true) :
+    runCTAWithGlobalLog (f + 11) (gidSetupWithFacts doneLbl facts gidVar lenVar ++ suf)
       { cta with threads := done ++ (laneAt localBytes tx 0 rf false :: todo) } saved =
-    runCTAWithGlobalLog f (gidSetupWithFacts doneLbl facts idxVar lenVar ++ suf)
+    runCTAWithGlobalLog f (gidSetupWithFacts doneLbl facts gidVar lenVar ++ suf)
       { cta with threads := done ++
-        (laneAt localBytes tx 7 (rf7 blockSize ctaId rf tx len) false :: todo) } saved := by
-  let stmts := gidSetupWithFacts doneLbl facts idxVar lenVar ++ suf
-  have hgid64 := laneOf1D_lt ctaId.x blockSize tx hctaX hblkX htx
+        (laneAt localBytes tx 11
+          (rfSet (rfSet (rfSet (rf7 blockSize ctaId rf tx len)
+            "%rd4" (BitVec.ofNat 64 (nIn * len * 8)))
+            "%rd5" (BitVec.ofNat 64 ((ctaId.x * blockSize + tx) * 8)))
+            "%rd6" (BitVec.ofNat 64 (nIn * len * 8 + (ctaId.x * blockSize + tx) * 8)))
+          false :: todo) } saved := by
+  let stmts := gidSetupWithFacts doneLbl facts gidVar lenVar ++ suf
+  let gid := ctaId.x * blockSize + tx
+  have htx32 : tx < 2 ^ 32 := Nat.lt_trans htx hblkX
+  have hgid64 := laneOf1D_lt ctaId.x blockSize tx hctaX hblkX htx32
   have hcta64 : ctaId.x < 2 ^ 64 := by omega
   have hblk64 : blockSize < 2 ^ 64 := by omega
   have hprod : ctaId.x * blockSize < 2 ^ 64 := by omega
+  have hgidLt : gid < len := by
+    have hstep : ctaId.x * blockSize + tx < (ctaId.x + 1) * blockSize := by
+      rw [Nat.succ_mul]; omega
+    exact Nat.lt_of_lt_of_le hstep hcov
+  have hlen8 : nIn * len * 8 + len * 8 ≤ 2 ^ 64 := by
+    have : (nIn + 1) * len * 8 = nIn * len * 8 + len * 8 := by simp [Nat.add_mul, Nat.one_mul]
+    omega
+  have hgid8 : gid * 8 < len * 8 := Nat.mul_lt_mul_of_pos_right hgidLt (by omega)
+  have hgid61 : gid < 2 ^ 61 := by omega
   let r1 := rfSet rf "%r0" (BitVec.ofNat 64 ctaId.x)
   let r2 := rfSet r1 "%r1" (BitVec.ofNat 64 blockSize)
   let r3 := rfSet r2 "%r2" (BitVec.ofNat 64 tx)
   let r4 := rfSet r3 "%rd0" (BitVec.ofNat 64 (ctaId.x * blockSize))
   let r5 := rfSet r4 "%rd1" (BitVec.ofNat 64 tx)
-  let r6 := rfSet r5 "%rd2" (BitVec.ofNat 64 (ctaId.x * blockSize + tx))
-  have hs0 : runCTAWithGlobalLog ((f + 6) + 1) stmts
+  let r6 := rfSet r5 "%rd2" (BitVec.ofNat 64 gid)
+  let r7 := rf7 blockSize ctaId rf tx len
+  let r8 := rfSet r7 "%rd4" (BitVec.ofNat 64 (nIn * len * 8))
+  let r9 := rfSet r8 "%rd4" (BitVec.ofNat 64 (nIn * len * 8))
+  let r10 := rfSet r9 "%rd5" (BitVec.ofNat 64 (gid * 8))
+  have hr8eq : r9 = r8 := rfSet_overwrite r7 "%rd4" _ _
+  have hs0 : runCTAWithGlobalLog ((f + 10) + 1) stmts
       { cta with threads := done ++ (laneAt localBytes tx 0 rf false :: todo) } saved =
-    runCTAWithGlobalLog (f + 6) stmts
+    runCTAWithGlobalLog (f + 10) stmts
       { cta with threads := done ++ (laneAt localBytes tx 1 r1 false :: todo) } saved := by
-    apply pure_lane_step (f + 6) stmts cta done todo localBytes tx 0 rf r1
+    apply pure_lane_step (f + 10) stmts cta done todo localBytes tx 0 rf r1
       (.mov .u32 "%r0" (.sreg .ctaidX)) saved hdone (by simp [stmts, gidSetupWithFacts, hmem, ins])
       (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
     have hex := exec_mov_sreg_r stmts
@@ -1470,11 +1495,11 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
       (laneAt localBytes tx 0 rf false) hrt 0 (by omega) .ctaidX
       (BitVec.ofNat 64 ctaId.x) (by simp [evalSpecialReg, hcta]) (fit32_ofNat ctaId.x hctaX)
     rw [mask32_ofNat ctaId.x hctaX] at hex; exact hex
-  have hs1 : runCTAWithGlobalLog ((f + 5) + 1) stmts
+  have hs1 : runCTAWithGlobalLog ((f + 9) + 1) stmts
       { cta with threads := done ++ (laneAt localBytes tx 1 r1 false :: todo) } saved =
-    runCTAWithGlobalLog (f + 5) stmts
+    runCTAWithGlobalLog (f + 9) stmts
       { cta with threads := done ++ (laneAt localBytes tx 2 r2 false :: todo) } saved := by
-    apply pure_lane_step (f + 5) stmts cta done todo localBytes tx 1 r1 r2
+    apply pure_lane_step (f + 9) stmts cta done todo localBytes tx 1 r1 r2
       (.mov .u32 "%r1" (.sreg .ntidX)) saved hdone (by simp [stmts, gidSetupWithFacts, hmem, ins])
       (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
     have hex := exec_mov_sreg_r stmts
@@ -1482,23 +1507,23 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
       (laneAt localBytes tx 1 r1 false) hrt 1 (by omega) .ntidX
       (BitVec.ofNat 64 blockSize) (by simp [evalSpecialReg, hblk]) (fit32_ofNat blockSize hblkX)
     rw [mask32_ofNat blockSize hblkX] at hex; exact hex
-  have hs2 : runCTAWithGlobalLog ((f + 4) + 1) stmts
+  have hs2 : runCTAWithGlobalLog ((f + 8) + 1) stmts
       { cta with threads := done ++ (laneAt localBytes tx 2 r2 false :: todo) } saved =
-    runCTAWithGlobalLog (f + 4) stmts
+    runCTAWithGlobalLog (f + 8) stmts
       { cta with threads := done ++ (laneAt localBytes tx 3 r3 false :: todo) } saved := by
-    apply pure_lane_step (f + 4) stmts cta done todo localBytes tx 2 r2 r3
+    apply pure_lane_step (f + 8) stmts cta done todo localBytes tx 2 r2 r3
       (.mov .u32 "%r2" (.sreg .tidX)) saved hdone (by simp [stmts, gidSetupWithFacts, hmem, ins])
       (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
     have hex := exec_mov_sreg_r stmts
       { cta with threads := done ++ (laneAt localBytes tx 2 r2 false :: todo) }
       (laneAt localBytes tx 2 r2 false) hrt 2 (by omega) .tidX
-      (BitVec.ofNat 64 tx) (by simp [evalSpecialReg, laneAt]) (fit32_ofNat tx htx)
-    rw [mask32_ofNat tx htx] at hex; exact hex
-  have hs3 : runCTAWithGlobalLog ((f + 3) + 1) stmts
+      (BitVec.ofNat 64 tx) (by simp [evalSpecialReg, laneAt]) (fit32_ofNat tx htx32)
+    rw [mask32_ofNat tx htx32] at hex; exact hex
+  have hs3 : runCTAWithGlobalLog ((f + 7) + 1) stmts
       { cta with threads := done ++ (laneAt localBytes tx 3 r3 false :: todo) } saved =
-    runCTAWithGlobalLog (f + 3) stmts
+    runCTAWithGlobalLog (f + 7) stmts
       { cta with threads := done ++ (laneAt localBytes tx 4 r4 false :: todo) } saved := by
-    apply pure_lane_step (f + 3) stmts cta done todo localBytes tx 3 r3 r4
+    apply pure_lane_step (f + 7) stmts cta done todo localBytes tx 3 r3 r4
       (.mul .wide .u32 "%rd0" (.reg "%r0") (.reg "%r1")) saved hdone
       (by simp [stmts, gidSetupWithFacts, hmem, ins])
       (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
@@ -1519,11 +1544,11 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
       simp only [BitVec.toNat_mul, BitVec.toNat_ofNat]
       rw [Nat.mod_eq_of_lt hcta64, Nat.mod_eq_of_lt hblk64, Nat.mod_eq_of_lt hprod]
     rw [hmul] at hex; exact hex
-  have hs4 : runCTAWithGlobalLog ((f + 2) + 1) stmts
+  have hs4 : runCTAWithGlobalLog ((f + 6) + 1) stmts
       { cta with threads := done ++ (laneAt localBytes tx 4 r4 false :: todo) } saved =
-    runCTAWithGlobalLog (f + 2) stmts
+    runCTAWithGlobalLog (f + 6) stmts
       { cta with threads := done ++ (laneAt localBytes tx 5 r5 false :: todo) } saved := by
-    apply pure_lane_step (f + 2) stmts cta done todo localBytes tx 4 r4 r5
+    apply pure_lane_step (f + 6) stmts cta done todo localBytes tx 4 r4 r5
       (.cvt .none .u64 .u32 "%rd1" (.reg "%r2")) saved hdone
       (by simp [stmts, gidSetupWithFacts, hmem, ins])
       (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
@@ -1532,12 +1557,12 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
     exact exec_cvt_u64_u32 stmts
       { cta with threads := done ++ (laneAt localBytes tx 4 r4 false :: todo) }
       (laneAt localBytes tx 4 r4 false) hrt 1 2 (by omega) (by omega)
-      (BitVec.ofNat 64 tx) (fit32_ofNat tx htx) hlk2
-  have hs5 : runCTAWithGlobalLog ((f + 1) + 1) stmts
+      (BitVec.ofNat 64 tx) (fit32_ofNat tx htx32) hlk2
+  have hs5 : runCTAWithGlobalLog ((f + 5) + 1) stmts
       { cta with threads := done ++ (laneAt localBytes tx 5 r5 false :: todo) } saved =
-    runCTAWithGlobalLog (f + 1) stmts
+    runCTAWithGlobalLog (f + 5) stmts
       { cta with threads := done ++ (laneAt localBytes tx 6 r6 false :: todo) } saved := by
-    apply pure_lane_step (f + 1) stmts cta done todo localBytes tx 5 r5 r6
+    apply pure_lane_step (f + 5) stmts cta done todo localBytes tx 5 r5 r6
       (.add .none .u64 "%rd2" (.reg "%rd0") (.reg "%rd1")) saved hdone
       (by simp [stmts, gidSetupWithFacts, hmem, ins])
       (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
@@ -1550,25 +1575,109 @@ theorem ptxBoundsFreeLoad_sound (f : Nat) (doneLbl : String) (facts : FactEnv)
       (laneAt localBytes tx 5 r5 false) hrt 2 0 1 (by omega) (by omega) (by omega)
       (BitVec.ofNat 64 (ctaId.x * blockSize)) (BitVec.ofNat 64 tx) hlk0 hlk1
     rw [add_ofNat64 (ctaId.x * blockSize) tx hgid64] at hex; exact hex
-  have hs6 : runCTAWithGlobalLog (f + 1) stmts
+  have hs6 : runCTAWithGlobalLog ((f + 4) + 1) stmts
       { cta with threads := done ++ (laneAt localBytes tx 6 r6 false :: todo) } saved =
-    runCTAWithGlobalLog f stmts
-      { cta with threads := done ++
-        (laneAt localBytes tx 7 (rf7 blockSize ctaId rf tx len) false :: todo) } saved := by
-    apply pure_lane_step f stmts cta done todo localBytes tx 6 r6
-      (rf7 blockSize ctaId rf tx len) (.ldParam .u64 "%rd3" "param_n") saved hdone
+    runCTAWithGlobalLog (f + 4) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 7 r7 false :: todo) } saved := by
+    apply pure_lane_step (f + 4) stmts cta done todo localBytes tx 6 r6 r7
+      (.ldParam .u64 "%rd3" "param_n") saved hdone
       (by simp [stmts, gidSetupWithFacts, hmem, ins])
       (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
     exact exec_ldParam_rd stmts
       { cta with threads := done ++ (laneAt localBytes tx 6 r6 false :: todo) }
       (laneAt localBytes tx 6 r6 false) hrt 3 (by omega) "param_n" (BitVec.ofNat 64 len) hn
+  have hs7 : runCTAWithGlobalLog ((f + 3) + 1) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 7 r7 false :: todo) } saved =
+    runCTAWithGlobalLog (f + 3) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 8 r8 false :: todo) } saved := by
+    apply pure_lane_step (f + 3) stmts cta done todo localBytes tx 7 r7 r8
+      (.ldParam .u64 "%rd4" "param_out") saved hdone
+      (by simp [stmts, gidSetupWithFacts, hmem, ins])
+      (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
+    exact exec_ldParam_rd stmts
+      { cta with threads := done ++ (laneAt localBytes tx 7 r7 false :: todo) }
+      (laneAt localBytes tx 7 r7 false) hrt 4 (by omega) "param_out"
+      (BitVec.ofNat 64 (nIn * len * 8)) hout
+  have hs8 : runCTAWithGlobalLog ((f + 2) + 1) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 8 r8 false :: todo) } saved =
+    runCTAWithGlobalLog (f + 2) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 9 r9 false :: todo) } saved := by
+    apply pure_lane_step (f + 2) stmts cta done todo localBytes tx 8 r8 r9
+      (.cvtaToGlobal .u64 "%rd4" (.reg "%rd4")) saved hdone
+      (by simp [stmts, gidSetupWithFacts, hmem, ins])
+      (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
+    exact exec_cvta_rd stmts
+      { cta with threads := done ++ (laneAt localBytes tx 8 r8 false :: todo) }
+      (laneAt localBytes tx 8 r8 false) hrt 4 4 (by omega) (by omega)
+      (BitVec.ofNat 64 (nIn * len * 8)) (lookup_rfSet_self r7 "%rd4" _)
+  have hs9 : runCTAWithGlobalLog ((f + 1) + 1) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 9 r9 false :: todo) } saved =
+    runCTAWithGlobalLog (f + 1) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 10 r10 false :: todo) } saved := by
+    apply pure_lane_step (f + 1) stmts cta done todo localBytes tx 9 r9 r10
+      (.shl .b64 "%rd5" (.reg "%rd2") (i64 3)) saved hdone
+      (by simp [stmts, gidSetupWithFacts, hmem, ins])
+      (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
+    have hlk2 : r9.regs.lookup "%rd2" = some (.scalar (BitVec.ofNat 64 gid)) := by
+      dsimp only [r9, r8, r7, rf7]
+      rw [lookup_rfSet_ne _ "%rd4" "%rd2" _ (by decide),
+          lookup_rfSet_ne _ "%rd4" "%rd2" _ (by decide),
+          lookup_rfSet_ne _ "%rd3" "%rd2" _ (by decide), lookup_rfSet_self]
+    have hex := exec_shl_imm stmts
+      { cta with threads := done ++ (laneAt localBytes tx 9 r9 false :: todo) }
+      (laneAt localBytes tx 9 r9 false) hrt 5 2 3 (by omega) (by omega) (by omega)
+      (BitVec.ofNat 64 gid) hlk2
+    have hshl : BitVec.ofNat 64 gid <<< 3 = BitVec.ofNat 64 (gid * 8) := by
+      apply BitVec.eq_of_toNat_eq
+      simp only [BitVec.toNat_shiftLeft, BitVec.toNat_ofNat, Nat.mod_eq_of_lt (by omega : gid < 2 ^ 64)]
+      have h8 : gid * 8 < 2 ^ 64 := by omega
+      rw [Nat.mod_eq_of_lt h8]
+      change gid <<< 3 % 2 ^ 64 = gid * 8
+      rw [Nat.shiftLeft_eq, Nat.mul_comm]
+      have h8' : 2 ^ 3 * gid < 2 ^ 64 := by rw [Nat.mul_comm]; exact h8
+      exact Nat.mod_eq_of_lt h8'
+    rw [hshl] at hex; exact hex
+  have hs10 : runCTAWithGlobalLog (f + 1) stmts
+      { cta with threads := done ++ (laneAt localBytes tx 10 r10 false :: todo) } saved =
+    runCTAWithGlobalLog f stmts
+      { cta with threads := done ++
+        (laneAt localBytes tx 11
+          (rfSet (rfSet (rfSet r7 "%rd4" (BitVec.ofNat 64 (nIn * len * 8)))
+            "%rd5" (BitVec.ofNat 64 (gid * 8)))
+            "%rd6" (BitVec.ofNat 64 (nIn * len * 8 + gid * 8)))
+          false :: todo) } saved := by
+    have hr10eq : rfSet r10 "%rd6" (BitVec.ofNat 64 (nIn * len * 8 + gid * 8)) =
+        rfSet (rfSet (rfSet r7 "%rd4" (BitVec.ofNat 64 (nIn * len * 8)))
+          "%rd5" (BitVec.ofNat 64 (gid * 8)))
+          "%rd6" (BitVec.ofNat 64 (nIn * len * 8 + gid * 8)) := by
+      dsimp only [r10]; rw [hr8eq]
+    rw [← hr10eq]
+    apply pure_lane_step f stmts cta done todo localBytes tx 10 r10
+      (rfSet r10 "%rd6" (BitVec.ofNat 64 (nIn * len * 8 + gid * 8)))
+      (.add .none .u64 "%rd6" (.reg "%rd4") (.reg "%rd5")) saved hdone
+      (by simp [stmts, gidSetupWithFacts, hmem, ins])
+      (fun _ h => nomatch h) (fun _ _ _ _ _ h => nomatch h)
+    have hlk4 : r10.regs.lookup "%rd4" = some (.scalar (BitVec.ofNat 64 (nIn * len * 8))) := by
+      dsimp only [r10, r9]; rw [lookup_rfSet_ne _ "%rd5" "%rd4" _ (by decide), lookup_rfSet_self]
+    have hlk5 : r10.regs.lookup "%rd5" = some (.scalar (BitVec.ofNat 64 (gid * 8))) :=
+      lookup_rfSet_self r9 "%rd5" _
+    have hex := exec_add_rd stmts
+      { cta with threads := done ++ (laneAt localBytes tx 10 r10 false :: todo) }
+      (laneAt localBytes tx 10 r10 false) hrt 6 4 5 (by omega) (by omega) (by omega)
+      (BitVec.ofNat 64 (nIn * len * 8)) (BitVec.ofNat 64 (gid * 8)) hlk4 hlk5
+    rw [add_ofNat64 (nIn * len * 8) (gid * 8) (by omega)] at hex; exact hex
+  have hf11 : f + 11 = (f + 10) + 1 := by omega
+  have hf10 : f + 10 = (f + 9) + 1 := by omega
+  have hf9 : f + 9 = (f + 8) + 1 := by omega
+  have hf8 : f + 8 = (f + 7) + 1 := by omega
   have hf7 : f + 7 = (f + 6) + 1 := by omega
   have hf6 : f + 6 = (f + 5) + 1 := by omega
   have hf5 : f + 5 = (f + 4) + 1 := by omega
   have hf4 : f + 4 = (f + 3) + 1 := by omega
   have hf3 : f + 3 = (f + 2) + 1 := by omega
   have hf2 : f + 2 = (f + 1) + 1 := by omega
-  rw [hf7, hs0, hf6, hs1, hf5, hs2, hf4, hs3, hf3, hs4, hf2, hs5, hs6]
+  rw [hf11, hs0, hf10, hs1, hf9, hs2, hf8, hs3, hf7, hs4, hf6, hs5, hf5, hs6,
+      hf4, hs7, hf3, hs8, hf2, hs9, hs10]
 
 -- Metal: a retained fact emits the inner body with no guard.
 
