@@ -28,7 +28,7 @@ inductive RetainedFact where
   | alignedPtr (ptrVar : VarId) (alignBytes : Nat)
   | disjointSlices (ptrA ptrB : VarId)
   | exclusiveObj (objVar : VarId)
-  deriving Repr, DecidableEq, Inhabited, BEq
+  deriving Repr, DecidableEq, Inhabited
 
 abbrev FactEnv := List RetainedFact
 
@@ -185,30 +185,52 @@ def retainedPureFactsWithParams (fuel : Nat)
 def retainedPureFacts (fuel : Nat) (code : Lean.Compiler.LCNF.Code .pure) : FactEnv :=
   (collectPureStep fuel {} (.inl code)).facts
 
-/-- Replace a retained `lean_is_exclusive` test by `true`. Sound for states in which
-every `.exclusiveObj` fact in `facts` holds; `sarrayEnsureExclusive` is preserved
-because it is the operation that establishes exclusivity. -/
+/-- True when evaluating `e` cannot change the heap. Exclusivity facts stay live
+only across these expressions. -/
+def exprPreservesHeap (e : LNIRExpr) : Bool :=
+  match e with
+  | .scalar _ | .constU256 _ | .mulDivDown _ _ _ | .mulDivUp _ _ _ | .storageLoad _ _
+  | .mkTuple _ | .projTuple _ _ | .ctorGetObj _ _ | .ctorGetScalar _ _ _
+  | .isExclusive _ | .sarrayLen _ | .sarrayDataPtr _ _ | .sarrayGet _ _ _
+  | .rawLoad _ _ _ | .boxScalar _ _ | .unboxScalar _ _ => true
+  | .storageStore _ _ _ | .allocCtor _ _ _ | .sarrayEnsureExclusive _ _ | .sarraySet _ _ _ _
+  | .call _ _ _ _ => false
+
+def factMentions (v : VarId) (f : RetainedFact) : Bool :=
+  match f with
+  | .idxLt i n => i == v || n == v
+  | .noOverflowAdd a b _ _ => a == v || b == v
+  | .noOverflowMul a b _ _ => a == v || b == v
+  | .alignedPtr p _ => p == v
+  | .disjointSlices a b => a == v || b == v
+  | .exclusiveObj o => o == v
+
+def killVarFacts (v : VarId) (facts : FactEnv) : FactEnv :=
+  facts.filter fun f => !factMentions v f
+
+/-- Replace a retained `lean_is_exclusive` test by `true`, killing facts when a
+binding shadows a variable or a heap-mutating instruction runs. -/
 def dischargeRetainedExclusivity (facts : FactEnv) (code : LNIRCode) : LNIRCode :=
   match code with
   | .letBind dst ty val k =>
-    let k' := dischargeRetainedExclusivity facts k
-    match val with
-    | .isExclusive objVar =>
-      if factMember facts (.exclusiveObj objVar) then
-        .letBind dst ty (.scalar (.constBool true)) k'
-      else .letBind dst ty val k'
-    | _ => .letBind dst ty val k'
+    let val' :=
+      match val with
+      | .isExclusive objVar =>
+        if factMember facts (.exclusiveObj objVar) then .scalar (.constBool true) else val
+      | _ => val
+    let facts' := if exprPreservesHeap val then killVarFacts dst facts else []
+    .letBind dst ty val' (dischargeRetainedExclusivity facts' k)
   | .rawStore p i v ty k =>
-    .rawStore p i v ty (dischargeRetainedExclusivity facts k)
-  | .incRef v n k => .incRef v n (dischargeRetainedExclusivity facts k)
-  | .decRef v n k => .decRef v n (dischargeRetainedExclusivity facts k)
+    .rawStore p i v ty (dischargeRetainedExclusivity [] k)
+  | .incRef v n k => .incRef v n (dischargeRetainedExclusivity [] k)
+  | .decRef v n k => .decRef v n (dischargeRetainedExclusivity [] k)
   | .ite c t e =>
     .ite c (dischargeRetainedExclusivity facts t) (dischargeRetainedExclusivity facts e)
   | .seqFor idx lo hi acc init ty body k =>
     .seqFor idx lo hi acc init ty
-      (dischargeRetainedExclusivity facts body) (dischargeRetainedExclusivity facts k)
+      (dischargeRetainedExclusivity [] body) (dischargeRetainedExclusivity [] k)
   | .parFor out len ins ty ker k =>
-    .parFor out len ins ty ker (dischargeRetainedExclusivity facts k)
+    .parFor out len ins ty ker (dischargeRetainedExclusivity [] k)
   | .ret v => .ret v
   | .unreachable => .unreachable
 
