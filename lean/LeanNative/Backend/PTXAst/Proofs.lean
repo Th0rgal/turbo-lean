@@ -524,4 +524,1219 @@ theorem ptx_bitwise_non_bittype_traps (stmts : List PTXStmt) (cta : PTXCTAState)
       .typeMismatch "bitwise and requires .pred or .b* type, got .u64" := by
   rfl
 
+/-! ## 5. Track `D6` — barrier generations and axiomatic weak memory -/
+
+/-- `stepCTABarrierGen` succeeds when every thread in the CTA either arrives at active `bar.sync bid`
+    or has already legally exited via `ret`: active participants advance `pc + 1`, `ret`-exited
+    threads remain halted at their exit PC, `epochLog` clears, and `barrierGen` bumps `bid`. -/
+theorem stepCTABarrier_allows_ret_exited_threads (bid : Nat)
+    (thRet thBar : PTXThreadState) (cta : PTXCTAState)
+    (hThreads : cta.threads = [thRet, thBar])
+    (hRet : threadExitedByRet thRet = true)
+    (hBarUnhalted : thBar.halted = false) :
+    stepCTABarrierGen bid [none, some bid] cta =
+      .ok { cta with
+        threads := [thRet, { thBar with pc := thBar.pc + 1 }]
+        epochLog := []
+        barrierGen := bumpBarrierGen cta.barrierGen bid } ∧
+      (evalPTXKernel 32
+        { name := "early_ret_bar_sync"
+        , params := [ { ty := .u64, name := "out" } ]
+        , regDecls := [ { ty := .u32, prefixName := "%r", count := 1 }
+                      , { ty := .u64, prefixName := "%rd", count := 1 }
+                      , { ty := .pred, prefixName := "%p", count := 1 } ]
+        , body :=
+            [ .instr none (.mov .u32 "%r0" (.sreg .tidX))
+            , .instr none (.setp .eq .u32 "%p0" (.reg "%r0") (.immU64 0#64))
+            , .instr (some { predReg := "%p0" }) .ret
+            , .instr none (.barSync 0)
+            , .instr none (.ldParam .u64 "%rd0" "out")
+            , .instr none (.stGlobal .u64 (.regOffset "%rd0" 0) (.immU64 99#64))
+            , .instr none .ret ] }
+        { x := 1 } { x := 2 }
+        (ByteMemory.ofU64Words [ 0#64 ])
+        { params := [ ("out", 0#64) ] } =
+        .ok (ByteMemory.ofU64Words [ 99#64 ])) := by
+  refine ⟨?_, rfl⟩
+  unfold stepCTABarrierGen
+  rw [hThreads]
+  simp [barrierParticipantsConverged, advanceBarrierParticipants, hRet, hBarUnhalted]
+
+/-- Skipping a predicated `@%p0 ret` (`%p0 = false`) at the end of `stmts` causes the thread to
+    fall off the end (`fellOffEnd = true`, `threadExitedByRet = false`), so `stepCTABarrierGen`
+    traps with `.barrierDivergence bid` instead of treating the fallen-off thread as `ret`-exited;
+    verified both symbolically and on a concrete 2-thread kernel under `evalPTXKernel` and
+    `evalPTXKernelWithOracle`. -/
+theorem stepCTABarrier_skipped_pred_ret_falloff_traps (bid : Nat)
+    (thFell thBar : PTXThreadState) (cta : PTXCTAState)
+    (hThreads : cta.threads = [thFell, thBar])
+    (hFell : thFell.fellOffEnd = true) :
+    stepCTABarrierGen bid [none, some bid] cta = .barrierDivergence bid ∧
+      evalPTXKernel 32
+        { name := "skipped_pred_ret_falloff"
+        , params := []
+        , regDecls := [ { ty := .u32, prefixName := "%r", count := 1 }
+                      , { ty := .pred, prefixName := "%p", count := 2 } ]
+        , body :=
+            [ .instr none (.mov .u32 "%r0" (.sreg .tidX))
+            , .instr none (.setp .eq .u32 "%p0" (.reg "%r0") (.immU64 0#64))
+            , .instr (some { predReg := "%p0", negated := true }) (.bra "AT_BAR")
+            , .instr none (.bra "END_SKIP_RET")
+            , .label "AT_BAR"
+            , .instr none (.barSync 0)
+            , .instr none .ret
+            , .label "END_SKIP_RET"
+            , .instr none (.setp .eq .u32 "%p1" (.immU64 1#64) (.immU64 0#64))
+            , .instr (some { predReg := "%p1" }) .ret ] }
+        { x := 1 } { x := 2 }
+        (ByteMemory.zeros 0)
+        { params := [] } = .barrierDivergence 0 ∧
+      evalPTXKernelWithOracle none 32
+        { name := "skipped_pred_ret_falloff"
+        , params := []
+        , regDecls := [ { ty := .u32, prefixName := "%r", count := 1 }
+                      , { ty := .pred, prefixName := "%p", count := 2 } ]
+        , body :=
+            [ .instr none (.mov .u32 "%r0" (.sreg .tidX))
+            , .instr none (.setp .eq .u32 "%p0" (.reg "%r0") (.immU64 0#64))
+            , .instr (some { predReg := "%p0", negated := true }) (.bra "AT_BAR")
+            , .instr none (.bra "END_SKIP_RET")
+            , .label "AT_BAR"
+            , .instr none (.barSync 0)
+            , .instr none .ret
+            , .label "END_SKIP_RET"
+            , .instr none (.setp .eq .u32 "%p1" (.immU64 1#64) (.immU64 0#64))
+            , .instr (some { predReg := "%p1" }) .ret ] }
+        { x := 1 } { x := 2 }
+        (ByteMemory.zeros 0)
+        { params := [] } = .barrierDivergence 0 := by
+  refine ⟨?_, rfl, rfl⟩
+  unfold stepCTABarrierGen
+  rw [hThreads]
+  simp [barrierParticipantsConverged, threadExitedByRet, hFell]
+
+/-- Divergent barrier IDs (`b1 ≠ b2`) across active CTA threads trap with `.barrierDivergence b1`. -/
+theorem stepCTABarrier_divergent_barriers_trap (b1 b2 : Nat)
+    (th1 th2 : PTXThreadState) (cta : PTXCTAState)
+    (hNe : b1 ≠ b2)
+    (hThreads : cta.threads = [th1, th2]) :
+    stepCTABarrierGen b1 [some b1, some b2] cta = .barrierDivergence b1 := by
+  have hBeqFalse : (b2 == b1) = false := beq_false_of_ne hNe.symm
+  unfold stepCTABarrierGen
+  rw [hThreads]
+  simp [barrierParticipantsConverged, hBeqFalse]
+
+private theorem lookup_bumpBarrierGen_same (gens : List (Nat × Nat)) (bid : Nat) :
+    lookupBarrierEpoch (bumpBarrierGen gens bid) bid = lookupBarrierEpoch gens bid + 1 := by
+  induction gens with
+  | nil =>
+    simp [bumpBarrierGen, lookupBarrierEpoch]
+  | cons hd rest ih =>
+    rcases hd with ⟨b, g⟩
+    by_cases hb : b == bid
+    · simp [bumpBarrierGen, lookupBarrierEpoch, hb]
+    · simp [bumpBarrierGen, lookupBarrierEpoch, hb, ih]
+
+/-- Converging on `bar.sync bid` increments `bid`'s barrier generation counter by `1` and clears
+    `epochLog` to open a fresh data-race-free barrier generation. -/
+theorem stepCTABarrier_advances_generation_and_clears_epoch (bid : Nat)
+    (states : List (Option Nat)) (cta : PTXCTAState)
+    (hConv : barrierParticipantsConverged bid cta.threads states = true) :
+    ∃ cta' : PTXCTAState,
+      stepCTABarrierGen bid states cta = .ok cta' ∧
+      cta'.epochLog = [] ∧
+      lookupBarrierEpoch cta'.barrierGen bid = lookupBarrierEpoch cta.barrierGen bid + 1 := by
+  refine ⟨{ cta with
+    threads := advanceBarrierParticipants bid cta.threads states
+    epochLog := []
+    barrierGen := bumpBarrierGen cta.barrierGen bid }, ?_, rfl, ?_⟩
+  · unfold stepCTABarrierGen
+    simp [hConv]
+  · exact lookup_bumpBarrierGen_same cta.barrierGen bid
+
+private theorem find_eventId_mem_and_eq :
+    ∀ {evs : List PTXMemEvent} {eid : Nat} {ev : PTXMemEvent},
+      evs.find? (fun e => e.eventId == eid) = some ev →
+      ev ∈ evs ∧ ev.eventId = eid
+  | [], _, _, h => nomatch h
+  | hd :: tl, eid, ev, h => by
+    unfold List.find? at h
+    cases hb : hd.eventId == eid
+    · rw [hb] at h
+      rcases find_eventId_mem_and_eq h with ⟨hMem, hEq⟩
+      exact ⟨List.Mem.tail _ hMem, hEq⟩
+    · rw [hb] at h
+      cases h
+      exact ⟨List.Mem.head _, LawfulBEq.eq_of_beq hb⟩
+
+private theorem hasEvent_mem_of_some {cand : PTXCandidateExecution} {eid : Nat} {ev : PTXMemEvent}
+    (h : cand.hasEvent eid = some ev) :
+    ev ∈ cand.events ∧ ev.eventId = eid :=
+  find_eventId_mem_and_eq h
+
+private theorem hasEvent_eq_self_of_nodup {evs : List PTXMemEvent}
+    (hNodup : (evs.map PTXMemEvent.eventId).Nodup) :
+    ∀ {e : PTXMemEvent}, e ∈ evs → evs.find? (fun x => x.eventId == e.eventId) = some e := by
+  induction evs with
+  | nil =>
+    intro _ hMem
+    nomatch hMem
+  | cons hd tl ih =>
+    rcases List.nodup_cons.mp hNodup with ⟨hNotMem, hTlNodup⟩
+    intro e hMem
+    rcases List.mem_cons.mp hMem with rfl | hInTl
+    · simp
+    · have hNe : hd.eventId ≠ e.eventId := by
+        intro hEq
+        exact hNotMem (hEq ▸ List.mem_map_of_mem hInTl)
+      have hBeqFalse : (hd.eventId == e.eventId) = false := beq_false_of_ne hNe
+      simp [List.find?, hBeqFalse, ih hTlNodup hInTl]
+
+private theorem sameLoc_symm {e1 e2 : PTXMemEvent}
+    (h : PTXCandidateExecution.sameLoc e1 e2) :
+    PTXCandidateExecution.sameLoc e2 e1 := by
+  rcases h with ⟨hs, ha, hw, hg | ⟨hsh, hcta⟩⟩
+  · exact ⟨hs.symm, ha.symm, hw.symm, Or.inl (hs.symm.trans hg)⟩
+  · exact ⟨hs.symm, ha.symm, hw.symm, Or.inr ⟨hs.symm.trans hsh, hcta.symm⟩⟩
+
+private theorem sameLoc_trans {e1 e2 e3 : PTXMemEvent}
+    (h12 : PTXCandidateExecution.sameLoc e1 e2)
+    (h23 : PTXCandidateExecution.sameLoc e2 e3) :
+    PTXCandidateExecution.sameLoc e1 e3 := by
+  rcases h12 with ⟨hs1, ha1, hw1, hg1 | ⟨hsh1, hcta1⟩⟩
+  · rcases h23 with ⟨hs2, ha2, hw2, _⟩
+    exact ⟨hs1.trans hs2, ha1.trans ha2, hw1.trans hw2, Or.inl hg1⟩
+  · rcases h23 with ⟨hs2, ha2, hw2, hg2 | ⟨_, hcta2⟩⟩
+    · rw [hs1] at hsh1
+      rw [hg2] at hsh1
+      nomatch hsh1
+    · exact ⟨hs1.trans hs2, ha1.trans ha2, hw1.trans hw2, Or.inr ⟨hsh1, hcta1.trans hcta2⟩⟩
+
+private theorem seqCand_step_lt
+    {initMem : Nat → StateSpace → Nat → Option (BitVec 64)}
+    {evs : List PTXMemEvent}
+    (hWf : wfSequentialEventTrace initMem evs)
+    {a b : Nat}
+    (hStep : (sequentialCandidateOfEvents evs).poOrSw a b) :
+    a < b := by
+  rcases hWf with ⟨_, hPoLt, hBarLt, hKernLt, _⟩
+  rcases hStep with hPo | hSw
+  · rcases hPo with ⟨ea, eb, hFa, hFb, hK, hC, hT, hSeq⟩
+    rcases find_eventId_mem_and_eq hFa with ⟨hMa, hEaId⟩
+    rcases find_eventId_mem_and_eq hFb with ⟨hMb, hEbId⟩
+    rw [← hEaId, ← hEbId]
+    exact hPoLt ea eb hMa hMb hK hC hT hSeq
+  · rcases hSw with ⟨ea, eb, hFa, hFb, hKind⟩
+    rcases find_eventId_mem_and_eq hFa with ⟨hMa, hEaId⟩
+    rcases find_eventId_mem_and_eq hFb with ⟨hMb, hEbId⟩
+    rw [← hEaId, ← hEbId]
+    rcases hKind with ⟨hK, hC, hDiff, bid, hEpoch⟩ | ⟨hSpA, hSpB, hWrA, hKLt⟩
+    · exact hBarLt ea eb bid hMa hMb hK hC hDiff hEpoch
+    · exact hKernLt ea eb hMa hMb hSpA hSpB hWrA hKLt
+
+private theorem seqCand_hb_lt
+    {initMem : Nat → StateSpace → Nat → Option (BitVec 64)}
+    {evs : List PTXMemEvent}
+    (hWf : wfSequentialEventTrace initMem evs)
+    {a b : Nat}
+    (hHb : (sequentialCandidateOfEvents evs).hb a b) :
+    a < b := by
+  induction hHb with
+  | single hs => exact seqCand_step_lt hWf hs
+  | tail _ hs ih => exact Nat.lt_trans ih (seqCand_step_lt hWf hs)
+
+/-- Canonical `sequentialCandidateOfEvents` soundness (`D6`):
+    every well-formed sequential `PTXMemEvent` trace `evs` satisfies `PTXAxiomaticConsistent`
+    (including `po_wf` on `poSeq`, `po_irrefl`, `po_trans`, `po_complete`, `hb_irrefl`, `rf`/`co`/`fr`
+    coherence, and RMW atomicity). -/
+theorem sequentialCandidateOfEvents_consistent
+    (initMem : Nat → StateSpace → Nat → Option (BitVec 64))
+    (evs : List PTXMemEvent)
+    (hWf : wfSequentialEventTrace initMem evs) :
+    PTXAxiomaticConsistent initMem (sequentialCandidateOfEvents evs) := by
+  have hWfCopy := hWf
+  rcases hWf with ⟨hNodup, _, _, _, hReadWf⟩
+  refine
+    { eventIds_nodup := hNodup
+      po_wf := ?_
+      po_irrefl := ?_
+      po_trans := ?_
+      po_complete := ?_
+      sw_cta_barrier := ?_
+      sw_inter_kernel := ?_
+      hb_irrefl := ?_
+      rf_wf := ?_
+      rf_complete := ?_
+      co_wf := ?_
+      co_irrefl := ?_
+      co_trans := ?_
+      co_total := ?_
+      coh_ww := ?_
+      coh_wr := ?_
+      coh_rw := ?_
+      coh_vrw := ?_
+      rmw_atomicity := ?_ }
+  · intro a b hPo
+    exact hPo
+  · intro a hPo
+    rcases hPo with ⟨ea, eb, hFa, hFb, _, _, _, hSeq⟩
+    have hEq : ea = eb := Option.some.inj (hFa.symm.trans hFb)
+    rw [hEq] at hSeq
+    exact Nat.lt_irrefl _ hSeq
+  · intro a b c hAB hBC
+    rcases hAB with ⟨ea, eb, hFa, hFb, hK1, hC1, hT1, hS1⟩
+    rcases hBC with ⟨eb', ec, hFb', hFc, hK2, hC2, hT2, hS2⟩
+    have hEbEq : eb' = eb := Option.some.inj (hFb'.symm.trans hFb)
+    rw [hEbEq] at hK2 hC2 hT2 hS2
+    exact ⟨ea, ec, hFa, hFc, hK1.trans hK2, hC1.trans hC2, hT1.trans hT2, Nat.lt_trans hS1 hS2⟩
+  · intro ea eb hMa hMb hK hC hT hSeq
+    exact ⟨ea, eb, hasEvent_eq_self_of_nodup hNodup hMa,
+      hasEvent_eq_self_of_nodup hNodup hMb, hK, hC, hT, hSeq⟩
+  · intro ea eb bid hMa hMb hK hC hDiff hGen
+    exact ⟨ea, eb, hasEvent_eq_self_of_nodup hNodup hMa,
+      hasEvent_eq_self_of_nodup hNodup hMb, Or.inl ⟨hK, hC, hDiff, bid, hGen⟩⟩
+  · intro ea eb hMa hMb hSpA hSpB hWrA hKLt
+    exact ⟨ea, eb, hasEvent_eq_self_of_nodup hNodup hMa,
+      hasEvent_eq_self_of_nodup hNodup hMb, Or.inr ⟨hSpA, hSpB, hWrA, hKLt⟩⟩
+  · intro a hHb
+    exact Nat.lt_irrefl a (seqCand_hb_lt hWfCopy hHb)
+  · intro w r hRf
+    rcases hRf with ⟨er, hFr, hRd, hLatest⟩
+    rcases find_eventId_mem_and_eq hFr with ⟨hMr, hErId⟩
+    have hRw := hReadWf er hMr hRd
+    rw [hLatest] at hRw
+    rcases hRw with ⟨ew, hFw, hWrW, hSame, hVal, hLt, _⟩
+    rw [hErId] at hLt
+    exact ⟨ew, er, hFw, hFr, hWrW, hRd, hSame, hVal, Nat.ne_of_lt hLt⟩
+  · intro er hMr hRd
+    have hFr : evs.find? (fun x => x.eventId == er.eventId) = some er :=
+      hasEvent_eq_self_of_nodup hNodup hMr
+    have hRw := hReadWf er hMr hRd
+    cases hLat : latestPriorWriteId? evs er with
+    | some wId =>
+      left
+      refine ⟨wId, ⟨er, hFr, hRd, hLat⟩, ?_⟩
+      intro w' hRf'
+      rcases hRf' with ⟨er', hFr', _, hLat'⟩
+      have hEq : er' = er := Option.some.inj (hFr'.symm.trans hFr)
+      rw [hEq, hLat] at hLat'
+      exact (Option.some.inj hLat').symm
+    | none =>
+      rw [hLat] at hRw
+      right
+      refine ⟨?_, hRw.1⟩
+      rintro ⟨w, er', hFr', _, hLat'⟩
+      have hEq : er' = er := Option.some.inj (hFr'.symm.trans hFr)
+      rw [hEq, hLat] at hLat'
+      nomatch hLat'
+  · intro w1 w2 hCo
+    rcases hCo with ⟨e1, e2, hF1, hF2, hW1, hW2, hSame, hLt⟩
+    exact ⟨e1, e2, hF1, hF2, hW1, hW2, hSame, Nat.ne_of_lt hLt⟩
+  · intro w hCo
+    rcases hCo with ⟨_, _, _, _, _, _, _, hLt⟩
+    exact Nat.lt_irrefl _ hLt
+  · intro w1 w2 w3 h12 h23
+    rcases h12 with ⟨e1, e2, hF1, hF2, hW1, _, hS12, hLt12⟩
+    rcases h23 with ⟨e2', e3, hF2', hF3, _, hW3, hS23, hLt23⟩
+    have hE2Eq : e2' = e2 := Option.some.inj (hF2'.symm.trans hF2)
+    rw [hE2Eq] at hS23
+    exact ⟨e1, e3, hF1, hF3, hW1, hW3, sameLoc_trans hS12 hS23, Nat.lt_trans hLt12 hLt23⟩
+  · intro e1 e2 hM1 hM2 hW1 hW2 hSame hNe
+    have hF1 := hasEvent_eq_self_of_nodup hNodup hM1
+    have hF2 := hasEvent_eq_self_of_nodup hNodup hM2
+    rcases Nat.lt_or_gt_of_ne hNe with hLt | hGt
+    · exact Or.inl ⟨e1, e2, hF1, hF2, hW1, hW2, hSame, hLt⟩
+    · exact Or.inr ⟨e2, e1, hF2, hF1, hW2, hW1, sameLoc_symm hSame, hGt⟩
+  · intro w1 w2 hWrites hHb
+    rcases hWrites with ⟨e1, e2, hF1, hF2, hW1, hW2, hSame⟩
+    exact ⟨e1, e2, hF1, hF2, hW1, hW2, hSame, seqCand_hb_lt hWfCopy hHb⟩
+  · intro w r hRf hHb
+    rcases hRf with ⟨er, hFr, hRd, hLat⟩
+    rcases find_eventId_mem_and_eq hFr with ⟨hMr, hErId⟩
+    have hRw := hReadWf er hMr hRd
+    rw [hLat] at hRw
+    rcases hRw with ⟨_, _, _, _, _, hLtWR, _⟩
+    rw [hErId] at hLtWR
+    exact Nat.lt_asymm hLtWR (seqCand_hb_lt hWfCopy hHb)
+  · intro r w hFrRel hHb
+    have hLtWR : w < r := seqCand_hb_lt hWfCopy hHb
+    rcases hFrRel with ⟨w0, hRf0, hCo0⟩ | ⟨hNoRf, er, ew, hFr, hFw, hRd, hWrW, hSameRW, _⟩
+    · rcases hRf0 with ⟨er, hFr, hRd, hLat⟩
+      rcases find_eventId_mem_and_eq hFr with ⟨hMr, hErId⟩
+      rcases hCo0 with ⟨ew0, ew, hFw0, hFw, _, hWrW, hSame0W, hLt0W⟩
+      rcases find_eventId_mem_and_eq hFw with ⟨hMw, hEwId⟩
+      have hRw := hReadWf er hMr hRd
+      rw [hLat] at hRw
+      rcases hRw with ⟨ew0', hFw0', _, hSame0R, _, _, hMax⟩
+      have hEw0Eq : ew0' = ew0 := Option.some.inj (hFw0'.symm.trans hFw0)
+      rw [hEw0Eq] at hSame0R
+      have hSameWR : PTXCandidateExecution.sameLoc ew er :=
+        sameLoc_trans (sameLoc_symm hSame0W) hSame0R
+      have hEwLtEr : ew.eventId < er.eventId := by omega
+      have hLe : ew.eventId ≤ w0 := hMax ew hMw hWrW hSameWR hEwLtEr
+      omega
+    · rcases find_eventId_mem_and_eq hFr with ⟨hMr, hErId⟩
+      rcases find_eventId_mem_and_eq hFw with ⟨hMw, hEwId⟩
+      have hRw := hReadWf er hMr hRd
+      cases hLat : latestPriorWriteId? evs er with
+      | some wId =>
+        have hFrSelf : evs.find? (fun x => x.eventId == er.eventId) = some er :=
+          hasEvent_eq_self_of_nodup hNodup hMr
+        have hRfEx : (sequentialCandidateOfEvents evs).rf wId r := by
+          rw [← hErId]
+          exact ⟨er, hFrSelf, hRd, hLat⟩
+        exact hNoRf ⟨wId, hRfEx⟩
+      | none =>
+        rw [hLat] at hRw
+        have hEwLtEr : ew.eventId < er.eventId := by omega
+        exact hRw.2 ew hMw hWrW (sameLoc_symm hSameRW) hEwLtEr
+  · intro w1 w2 r hRf hCo hHb
+    have hLtW2R : w2 < r := seqCand_hb_lt hWfCopy hHb
+    rcases hRf with ⟨er, hFr, hRd, hLat⟩
+    rcases find_eventId_mem_and_eq hFr with ⟨hMr, hErId⟩
+    rcases hCo with ⟨ew1, ew2, hFw1, hFw2, _, hWrW2, hSame12, hLt12⟩
+    rcases find_eventId_mem_and_eq hFw2 with ⟨hMw2, hEw2Id⟩
+    have hRw := hReadWf er hMr hRd
+    rw [hLat] at hRw
+    rcases hRw with ⟨ew1', hFw1', _, hSame1R, _, _, hMax⟩
+    have hEw1Eq : ew1' = ew1 := Option.some.inj (hFw1'.symm.trans hFw1)
+    rw [hEw1Eq] at hSame1R
+    have hSame2R : PTXCandidateExecution.sameLoc ew2 er :=
+      sameLoc_trans (sameLoc_symm hSame12) hSame1R
+    have hEw2LtEr : ew2.eventId < er.eventId := by omega
+    have hLe : ew2.eventId ≤ w1 := hMax ew2 hMw2 hWrW2 hSame2R hEw2LtEr
+    omega
+  · intro e hMe _ hRd hWr
+    have hFe : evs.find? (fun x => x.eventId == e.eventId) = some e :=
+      hasEvent_eq_self_of_nodup hNodup hMe
+    have hRw := hReadWf e hMe hRd
+    refine ⟨?_, ?_⟩
+    · intro w hRf
+      rcases hRf with ⟨er', hFr', _, hLat⟩
+      have hEq : er' = e := Option.some.inj (hFr'.symm.trans hFe)
+      rw [hEq] at hLat
+      rw [hLat] at hRw
+      rcases hRw with ⟨ew, hFw, hWrW, hSame, _, hLt, hMax⟩
+      refine ⟨⟨ew, e, hFw, hFe, hWrW, hWr, hSame, hLt⟩, ?_⟩
+      rintro ⟨wMid, hCo1, hCo2⟩
+      rcases hCo1 with ⟨_, eMid, _, hFMid, _, hWrMid, _, hLt1⟩
+      rcases hCo2 with ⟨eMid', e', hFMid', hFe', _, _, hSameMidE, hLt2⟩
+      have hMidEq : eMid' = eMid := Option.some.inj (hFMid'.symm.trans hFMid)
+      have hEEq : e' = e := Option.some.inj (hFe'.symm.trans hFe)
+      rw [hMidEq, hEEq] at hSameMidE
+      rcases find_eventId_mem_and_eq hFMid with ⟨hMMid, hMidId⟩
+      have hMidLtE : eMid.eventId < e.eventId := by omega
+      have hLe : eMid.eventId ≤ w := hMax eMid hMMid hWrMid hSameMidE hMidLtE
+      omega
+    · intro hNoRf ⟨wPre, hCoPre⟩
+      cases hLat : latestPriorWriteId? evs e with
+      | some wId =>
+        exact hNoRf ⟨wId, e, hFe, hRd, hLat⟩
+      | none =>
+        rw [hLat] at hRw
+        rcases hCoPre with ⟨ePre, e', hFPre, hFe', hWrPre, _, hSamePre, hLtPre⟩
+        have hEEq : e' = e := Option.some.inj (hFe'.symm.trans hFe)
+        rw [hEEq] at hSamePre
+        rcases find_eventId_mem_and_eq hFPre with ⟨hMPre, hPreId⟩
+        have hPreLt : ePre.eventId < e.eventId := by omega
+        exact hRw.2 ePre hMPre hWrPre hSamePre hPreLt
+
+/-- Concrete multi-event `sequentialCandidateOfEvents` consistency witness (`D6`):
+    executing a 2-thread CTA kernel where thread 0 writes `41#64` to `.shared`, synchronizes via
+    `bar.sync 0`, and thread 1 reads `.shared` (`poSeq = 0`) then writes `42#64` to `.global`
+    (`poSeq = 1`) produces a 3-event trace `evs` whose `sequentialCandidateOfEvents evs` satisfies
+    `PTXAxiomaticConsistent` with non-empty `po` (`1 -> 2`) and `sw` (`0 -> 1`, `0 -> 2`). -/
+theorem sequentialCandidateOfEvents_multi_event_nonvacuous :
+    let k : PTXKernel :=
+      { name := "seq_cand_po_sw_demo"
+      , params := [ { ty := .u64, name := "out" } ]
+      , sharedDecls := [ { align := 8, elemTy := .u64, name := "smem", count := 1 } ]
+      , regDecls := [ { ty := .u32, prefixName := "%r", count := 1 }
+                    , { ty := .u64, prefixName := "%rd", count := 2 }
+                    , { ty := .pred, prefixName := "%p", count := 2 } ]
+      , body :=
+          [ .instr none (.mov .u32 "%r0" (.sreg .tidX))
+          , .instr none (.setp .eq .u32 "%p0" (.reg "%r0") (.immU64 0#64))
+          , .instr (some { predReg := "%p0" })
+              (.stShared .u64 (.symOffset "smem" 0) (.immU64 41#64))
+          , .instr none (.barSync 0)
+          , .instr none (.setp .eq .u32 "%p1" (.reg "%r0") (.immU64 1#64))
+          , .instr (some { predReg := "%p1", negated := true }) .ret
+          , .instr none (.ldShared .u64 "%rd0" (.symOffset "smem" 0))
+          , .instr none (.add .none .u64 "%rd0" (.reg "%rd0") (.immU64 1#64))
+          , .instr none (.ldParam .u64 "%rd1" "out")
+          , .instr none (.stGlobal .u64 (.regOffset "%rd1" 0) (.reg "%rd0"))
+          , .instr none .ret ] }
+    let g0 := ByteMemory.ofU64Words [ 0#64 ]
+    ∃ gFinal evs,
+      evalPTXKernelWithOracle none 32 k { x := 1 } { x := 2 } g0
+        { params := [ ("out", 0#64) ] } = .ok (gFinal, evs) ∧
+      gFinal.loadBits 0 8 = some 42#64 ∧
+      evs.length = 3 ∧
+      PTXAxiomaticConsistent (initMemOfGlobal g0) (sequentialCandidateOfEvents evs) ∧
+      (sequentialCandidateOfEvents evs).po 1 2 ∧
+      (sequentialCandidateOfEvents evs).sw 0 1 := by
+  dsimp only
+  let e0 : PTXMemEvent :=
+    { eventId := 0
+      kernelIdx := 0
+      ctaId := { x := 0, y := 0, z := 0 }
+      tid := { x := 0, y := 0, z := 0 }
+      barrierEpoch := []
+      space := .shared
+      addr := 0
+      width := 8
+      isRead := false
+      isWrite := true
+      isAtomic := false
+      valRead := 0#64
+      valWritten := 41#64
+      poSeq := 0 }
+  let e1 : PTXMemEvent :=
+    { eventId := 1
+      kernelIdx := 0
+      ctaId := { x := 0, y := 0, z := 0 }
+      tid := { x := 1, y := 0, z := 0 }
+      barrierEpoch := [(0, 1)]
+      space := .shared
+      addr := 0
+      width := 8
+      isRead := true
+      isWrite := false
+      isAtomic := false
+      valRead := 41#64
+      valWritten := 0#64
+      poSeq := 0 }
+  let e2 : PTXMemEvent :=
+    { eventId := 2
+      kernelIdx := 0
+      ctaId := { x := 0, y := 0, z := 0 }
+      tid := { x := 1, y := 0, z := 0 }
+      barrierEpoch := [(0, 1)]
+      space := .global
+      addr := 0
+      width := 8
+      isRead := false
+      isWrite := true
+      isAtomic := false
+      valRead := 0#64
+      valWritten := 42#64
+      poSeq := 1 }
+  refine ⟨ByteMemory.ofU64Words [ 42#64 ], [e0, e1, e2], rfl, rfl, rfl, ?_, ?_, ?_⟩
+  · apply sequentialCandidateOfEvents_consistent
+    refine ⟨by decide, ?_, ?_, ?_, ?_⟩
+    · intro ea eb hMa hMb hK hC hT hSeq
+      rcases List.mem_cons.mp hMa with rfl | hMa1
+      · rcases List.mem_cons.mp hMb with rfl | hMb1
+        · exfalso; revert hSeq; decide
+        · rcases List.mem_cons.mp hMb1 with rfl | hMb2
+          · decide
+          · rcases List.mem_singleton.mp hMb2 with rfl
+            decide
+      · rcases List.mem_cons.mp hMa1 with rfl | hMa2
+        · rcases List.mem_cons.mp hMb with rfl | hMb1
+          · exfalso; revert hT; decide
+          · rcases List.mem_cons.mp hMb1 with rfl | hMb2
+            · exfalso; revert hSeq; decide
+            · rcases List.mem_singleton.mp hMb2 with rfl
+              decide
+        · rcases List.mem_singleton.mp hMa2 with rfl
+          rcases List.mem_cons.mp hMb with rfl | hMb1
+          · exfalso; revert hT; decide
+          · rcases List.mem_cons.mp hMb1 with rfl | hMb2
+            · exfalso; revert hSeq; decide
+            · rcases List.mem_singleton.mp hMb2 with rfl
+              exfalso; revert hSeq; decide
+    · intro ea eb bid hMa hMb _ _ hDiff hGen
+      rcases List.mem_cons.mp hMa with rfl | hMa1
+      · rcases List.mem_cons.mp hMb with rfl | hMb1
+        · exact False.elim (hDiff rfl)
+        · rcases List.mem_cons.mp hMb1 with rfl | hMb2
+          · decide
+          · rcases List.mem_singleton.mp hMb2 with rfl
+            decide
+      · rcases List.mem_cons.mp hMa1 with rfl | hMa2
+        · rcases List.mem_cons.mp hMb with rfl | hMb1
+          · exfalso
+            simp [e0, e1, lookupBarrierEpoch] at hGen
+          · rcases List.mem_cons.mp hMb1 with rfl | hMb2
+            · exact False.elim (hDiff rfl)
+            · rcases List.mem_singleton.mp hMb2 with rfl
+              exact False.elim (hDiff rfl)
+        · rcases List.mem_singleton.mp hMa2 with rfl
+          rcases List.mem_cons.mp hMb with rfl | hMb1
+          · exfalso
+            simp [e0, e2, lookupBarrierEpoch] at hGen
+          · rcases List.mem_cons.mp hMb1 with rfl | hMb2
+            · exact False.elim (hDiff rfl)
+            · rcases List.mem_singleton.mp hMb2 with rfl
+              exact False.elim (hDiff rfl)
+    · intro ea eb hMa hMb _ _ _ hKLt
+      have hKa : ea.kernelIdx = 0 := by
+        rcases List.mem_cons.mp hMa with rfl | h1
+        · rfl
+        · rcases List.mem_cons.mp h1 with rfl | h2
+          · rfl
+          · rw [List.mem_singleton.mp h2]
+      have hKb : eb.kernelIdx = 0 := by
+        rcases List.mem_cons.mp hMb with rfl | h1
+        · rfl
+        · rcases List.mem_cons.mp h1 with rfl | h2
+          · rfl
+          · rw [List.mem_singleton.mp h2]
+      omega
+    · intro er hMr hRd
+      rcases List.mem_cons.mp hMr with rfl | hMr1
+      · nomatch hRd
+      · rcases List.mem_cons.mp hMr1 with rfl | hMr2
+        · refine ⟨e0, rfl, rfl, ⟨rfl, rfl, rfl, Or.inr ⟨rfl, rfl⟩⟩, rfl, by decide, ?_⟩
+          intro em hMm hWrM _ hLtM
+          rcases List.mem_cons.mp hMm with rfl | hMm1
+          · decide
+          · rcases List.mem_cons.mp hMm1 with rfl | hMm2
+            · nomatch hWrM
+            · rcases List.mem_singleton.mp hMm2 with rfl
+              exfalso; revert hLtM; decide
+        · rcases List.mem_singleton.mp hMr2 with rfl
+          nomatch hRd
+  · exact ⟨e1, e2, rfl, rfl, rfl, rfl, rfl, by decide⟩
+  · exact ⟨e0, e1, rfl, rfl, Or.inl ⟨rfl, rfl, by decide, 0, by decide⟩⟩
+
+private theorem foldl_atomAddDeltas_shift (xs : List PTXMemEvent) (base : BitVec 64) :
+    xs.foldl (fun acc e => acc + (e.valWritten - e.valRead)) base =
+      base + sumAtomAddDeltas xs := by
+  induction xs generalizing base with
+  | nil =>
+    simp [sumAtomAddDeltas]
+  | cons x rest ih =>
+    unfold sumAtomAddDeltas at ih ⊢
+    simp only [List.foldl_cons, BitVec.zero_add]
+    rw [ih (base + (x.valWritten - x.valRead)), ih (x.valWritten - x.valRead)]
+    ac_rfl
+
+private theorem sumAtomAddDeltas_cons (x : PTXMemEvent) (xs : List PTXMemEvent) :
+    sumAtomAddDeltas (x :: xs) = (x.valWritten - x.valRead) + sumAtomAddDeltas xs := by
+  unfold sumAtomAddDeltas
+  simp only [List.foldl_cons, BitVec.zero_add]
+  exact foldl_atomAddDeltas_shift xs (x.valWritten - x.valRead)
+
+private theorem bv64_add_sub_cancel_left (a d : BitVec 64) :
+    a + (d - a) = d := by
+  have h1 : a + (d - a) = d + (a + -a) := by
+    rw [BitVec.sub_eq_add_neg]
+    ac_rfl
+  rw [h1, BitVec.add_right_neg, BitVec.add_zero]
+
+private theorem atomAddChain_telescope :
+    ∀ (chain : List PTXMemEvent) (initVal : BitVec 64) (hNe : chain ≠ []),
+      (chain.head hNe).valRead = initVal →
+      (∀ (xs : List PTXMemEvent) (a b : PTXMemEvent) (ys : List PTXMemEvent),
+        chain = xs ++ a :: b :: ys → a.valWritten = b.valRead) →
+      (chain.getLast hNe).valWritten = initVal + sumAtomAddDeltas chain
+  | [], _, hNe, _, _ => absurd rfl hNe
+  | [hd], initVal, _, hHead, _ => by
+    simp only [List.head_cons, List.getLast_singleton] at hHead ⊢
+    rw [sumAtomAddDeltas_cons]
+    simp only [sumAtomAddDeltas, List.foldl_nil, BitVec.add_zero, hHead]
+    exact (bv64_add_sub_cancel_left initVal hd.valWritten).symm
+  | hd :: m :: rest, initVal, _, hHead, hAdj => by
+    simp only [List.head_cons, List.getLast_cons_cons] at hHead ⊢
+    have hAdjHead : hd.valWritten = m.valRead :=
+      hAdj [] hd m rest rfl
+    have hAdjTail : ∀ (xs : List PTXMemEvent) (a b : PTXMemEvent) (ys : List PTXMemEvent),
+        m :: rest = xs ++ a :: b :: ys → a.valWritten = b.valRead := by
+      intro xs a b ys hEq
+      exact hAdj (hd :: xs) a b ys (by simp [hEq])
+    have ih := atomAddChain_telescope (m :: rest) hd.valWritten (by simp)
+      (by simp [hAdjHead]) hAdjTail
+    rw [ih, sumAtomAddDeltas_cons hd (m :: rest), ← hHead]
+    have hAssoc : hd.valRead + ((hd.valWritten - hd.valRead) + sumAtomAddDeltas (m :: rest)) =
+        (hd.valRead + (hd.valWritten - hd.valRead)) + sumAtomAddDeltas (m :: rest) := by
+      ac_rfl
+    rw [hAssoc, bv64_add_sub_cancel_left]
+
+private theorem isImmediateCoChain_tail {cand : PTXCandidateExecution}
+    {a b : PTXMemEvent} {rest : List PTXMemEvent}
+    (h : isImmediateCoChain cand (a :: b :: rest)) :
+    cand.co a.eventId b.eventId ∧
+      (¬ ∃ wMid : Nat, cand.co a.eventId wMid ∧ cand.co wMid b.eventId) ∧
+      isImmediateCoChain cand (b :: rest) :=
+  h
+
+private theorem adj_valWritten_eq_valRead_of_consistent
+    {initMem : Nat → StateSpace → Nat → Option (BitVec 64)}
+    {cand : PTXCandidateExecution}
+    (hCons : PTXAxiomaticConsistent initMem cand)
+    (chain : List PTXMemEvent)
+    (hSub : ∀ e ∈ chain, e ∈ cand.events ∧ e.isAtomic = true ∧ e.isRead = true ∧ e.isWrite = true)
+    (hImm : isImmediateCoChain cand chain) :
+    ∀ (xs : List PTXMemEvent) (a b : PTXMemEvent) (ys : List PTXMemEvent),
+      chain = xs ++ a :: b :: ys → a.valWritten = b.valRead := by
+  induction chain with
+  | nil =>
+    intro xs a b ys hEq
+    cases xs <;> nomatch hEq
+  | cons hd tl ih =>
+    intro xs a b ys hEq
+    cases xs with
+    | nil =>
+      simp only [List.nil_append, List.cons.injEq] at hEq
+      rcases hEq with ⟨hHdEq, hTlEq⟩
+      rw [hHdEq, hTlEq] at hImm hSub
+      rcases isImmediateCoChain_tail hImm with ⟨hCoAB, hNoMid, _⟩
+      rcases hSub a (List.Mem.head _) with ⟨hMemA, _, _, _⟩
+      rcases hSub b (List.Mem.tail _ (List.Mem.head _)) with ⟨hMemB, hAtB, hRdB, hWrB⟩
+      rcases hCons.rmw_atomicity b hMemB hAtB hRdB hWrB with ⟨hRmwRf, hRmwNoRf⟩
+      rcases hCons.rf_complete b hMemB hRdB with ⟨w, hRfWB, _⟩ | ⟨hNoRf, _⟩
+      · rcases hRmwRf hRfWB with ⟨hCoWB, hNoMidWB⟩
+        rcases hCons.rf_wf hRfWB with ⟨ew, eb, hHasW, hHasB, hWrW, _, hSameWB, hValEq, _⟩
+        rcases hCons.co_wf hCoAB with ⟨ea', eb', hHasA', hHasB', hWrA', _, hSameAB, _⟩
+        have hFindA : cand.hasEvent a.eventId = some a :=
+          hasEvent_eq_self_of_nodup hCons.eventIds_nodup hMemA
+        have hFindB : cand.hasEvent b.eventId = some b :=
+          hasEvent_eq_self_of_nodup hCons.eventIds_nodup hMemB
+        have hEqA : ea' = a := Option.some.inj (hHasA'.symm.trans hFindA)
+        have hEqB1 : eb = b := Option.some.inj (hHasB.symm.trans hFindB)
+        have hEqB2 : eb' = b := Option.some.inj (hHasB'.symm.trans hFindB)
+        rw [hEqA, hEqB2] at hSameAB
+        rw [hEqA] at hWrA'
+        rw [hEqB1] at hSameWB hValEq
+        rcases hasEvent_mem_of_some hHasW with ⟨hMemW, hWidEq⟩
+        by_cases hWA : a.eventId = w
+        · have hHasAW : cand.hasEvent w = some a := hWA ▸ hFindA
+          have hEwEqA : ew = a := Option.some.inj (hHasW.symm.trans hHasAW)
+          rw [← hEwEqA]
+          exact hValEq
+        · have hSameAW : PTXCandidateExecution.sameLoc a ew :=
+            sameLoc_trans hSameAB (sameLoc_symm hSameWB)
+          have hAwNe : a.eventId ≠ ew.eventId := by rw [hWidEq]; exact hWA
+          rcases hCons.co_total a ew hMemA hMemW hWrA' hWrW hSameAW hAwNe with hCoAW | hCoWA
+          · rw [hWidEq] at hCoAW
+            exact False.elim (hNoMid ⟨w, hCoAW, hCoWB⟩)
+          · rw [hWidEq] at hCoWA
+            exact False.elim (hNoMidWB ⟨a.eventId, hCoWA, hCoAB⟩)
+      · exact False.elim (hRmwNoRf hNoRf ⟨a.eventId, hCoAB⟩)
+    | cons x xs' =>
+      simp only [List.cons_append, List.cons.injEq] at hEq
+      rcases hEq with ⟨_, hTlEq⟩
+      cases tl with
+      | nil => cases xs' <;> nomatch hTlEq
+      | cons t2 tl' =>
+        rcases isImmediateCoChain_tail hImm with ⟨_, _, hImmTl⟩
+        exact ih (fun e he => hSub e (List.Mem.tail _ he)) hImmTl xs' a b ys hTlEq
+
+/-- Relaxed cross-CTA `atom.add.global.u64` coherence & commutativity (`D6`):
+    in any `PTXAxiomaticConsistent` execution `cand`, for every non-empty immediate-`co`-ordered
+    chain `chain` of atomic RMW events whose head has no prior `co` store to that location (so
+    RMW atomicity + `rf_complete` force the head to read `initVal` from `initMem`), no update is
+    ever lost: the final event's `valWritten` equals `initVal + sumAtomAddDeltas chain` modulo
+    `2^64`, regardless of CTA scheduling order. -/
+theorem ptx_relaxed_atom_add_co_no_lost_updates
+    (initMem : Nat → StateSpace → Nat → Option (BitVec 64))
+    (cand : PTXCandidateExecution)
+    (hCons : PTXAxiomaticConsistent initMem cand)
+    (chain : List PTXMemEvent) (hNe : chain ≠ [])
+    (initVal : BitVec 64)
+    (hSub : ∀ e ∈ chain, e ∈ cand.events ∧ e.isAtomic = true ∧ e.isRead = true ∧ e.isWrite = true)
+    (hImm : isImmediateCoChain cand chain)
+    (hHeadInit : initMem (chain.head hNe).addr (chain.head hNe).space (chain.head hNe).width =
+      some initVal)
+    (hHeadFirst : ¬ ∃ wPre : Nat, cand.co wPre (chain.head hNe).eventId) :
+    (chain.getLast hNe).valWritten = initVal + sumAtomAddDeltas chain := by
+  let hd := chain.head hNe
+  rcases hSub hd (List.head_mem hNe) with ⟨hMemHd, hAtHd, hRdHd, hWrHd⟩
+  rcases hCons.rmw_atomicity hd hMemHd hAtHd hRdHd hWrHd with ⟨hRmwRf, _⟩
+  have hHdValRead : hd.valRead = initVal := by
+    rcases hCons.rf_complete hd hMemHd hRdHd with ⟨w, hRfWHd, _⟩ | ⟨_, hInitEq⟩
+    · rcases hRmwRf hRfWHd with ⟨hCoWHd, _⟩
+      exact False.elim (hHeadFirst ⟨w, hCoWHd⟩)
+    · exact Option.some.inj (hInitEq.symm.trans hHeadInit)
+  have hAdj := adj_valWritten_eq_valRead_of_consistent hCons chain hSub hImm
+  exact atomAddChain_telescope chain initVal hNe hHdValRead hAdj
+
+private theorem twoEventRev_no_hb {eSec eFst : PTXMemEvent} {a b : Nat}
+    (hHb : (twoEventReversedRmwCandidate eSec eFst).hb a b) : False := by
+  induction hHb with
+  | single hs =>
+    rcases hs with hPo | hSw
+    · exact hPo
+    · exact hSw
+  | tail _ _ ih =>
+    exact ih
+
+/-- Concrete cross-CTA relaxed `atom.add.global.u64` non-vacuity & commutativity witness (`D6`):
+    the recorded RMW events of the sequential schedule (`5#64 → 24#64`, `24#64 → 47#64`) and of the
+    reversed read-oracle schedule (`28#64 → 47#64`, `5#64 → 28#64`) are `PTXAxiomaticConsistent`
+    (`sequentialCandidateOfEvents` and `twoEventReversedRmwCandidate`). Both immediate `co` chains
+    instantiate `ptx_relaxed_atom_add_co_no_lost_updates` to write `5#64 + 19#64 + 23#64 = 47#64`.
+    The matching `evalPTXKernelWithOracle` / `evalPTXKernelWithCTAOrder` runs (fuel `8`) are
+    `ptx_relaxed_cross_cta_atom_add_exec`. -/
+theorem ptx_relaxed_cross_cta_atom_add_commutes :
+    let g0 := ByteMemory.ofU64Words [ 5#64 ]
+    let e0Seq : PTXMemEvent :=
+      { eventId := 0, kernelIdx := 0, ctaId := { x := 0, y := 0, z := 0 }
+      , tid := { x := 0, y := 0, z := 0 }, barrierEpoch := [], space := .global
+      , addr := 0, width := 8, isRead := true, isWrite := true, isAtomic := true
+      , valRead := 5#64, valWritten := 24#64, poSeq := 0 }
+    let e1Seq : PTXMemEvent :=
+      { eventId := 1, kernelIdx := 0, ctaId := { x := 1, y := 0, z := 0 }
+      , tid := { x := 0, y := 0, z := 0 }, barrierEpoch := [], space := .global
+      , addr := 0, width := 8, isRead := true, isWrite := true, isAtomic := true
+      , valRead := 24#64, valWritten := 47#64, poSeq := 0 }
+    let e0Rev : PTXMemEvent :=
+      { eventId := 0, kernelIdx := 0, ctaId := { x := 0, y := 0, z := 0 }
+      , tid := { x := 0, y := 0, z := 0 }, barrierEpoch := [], space := .global
+      , addr := 0, width := 8, isRead := true, isWrite := true, isAtomic := true
+      , valRead := 28#64, valWritten := 47#64, poSeq := 0 }
+    let e1Rev : PTXMemEvent :=
+      { eventId := 1, kernelIdx := 0, ctaId := { x := 1, y := 0, z := 0 }
+      , tid := { x := 0, y := 0, z := 0 }, barrierEpoch := [], space := .global
+      , addr := 0, width := 8, isRead := true, isWrite := true, isAtomic := true
+      , valRead := 5#64, valWritten := 28#64, poSeq := 0 }
+    (PTXAxiomaticConsistent (initMemOfGlobal g0) (sequentialCandidateOfEvents [e0Seq, e1Seq]) ∧
+      isImmediateCoChain (sequentialCandidateOfEvents [e0Seq, e1Seq]) [e0Seq, e1Seq] ∧
+      e1Seq.valWritten = 5#64 + sumAtomAddDeltas [e0Seq, e1Seq] ∧
+      e1Seq.valWritten = 47#64) ∧
+    (PTXAxiomaticConsistent (initMemOfGlobal g0) (twoEventReversedRmwCandidate e0Rev e1Rev) ∧
+      isImmediateCoChain (twoEventReversedRmwCandidate e0Rev e1Rev) [e1Rev, e0Rev] ∧
+      e0Rev.valWritten = 5#64 + sumAtomAddDeltas [e1Rev, e0Rev] ∧
+      e0Rev.valWritten = 47#64) := by
+  have hInit5 : initMemOfGlobal (ByteMemory.ofU64Words [ 5#64 ]) 0 .global 8 = some 5#64 := rfl
+  let g0 := ByteMemory.ofU64Words [ 5#64 ]
+  let e0Seq : PTXMemEvent :=
+    { eventId := 0
+      kernelIdx := 0
+      ctaId := { x := 0, y := 0, z := 0 }
+      tid := { x := 0, y := 0, z := 0 }
+      barrierEpoch := []
+      space := .global
+      addr := 0
+      width := 8
+      isRead := true
+      isWrite := true
+      isAtomic := true
+      valRead := 5#64
+      valWritten := 24#64
+      poSeq := 0 }
+  let e1Seq : PTXMemEvent :=
+    { eventId := 1
+      kernelIdx := 0
+      ctaId := { x := 1, y := 0, z := 0 }
+      tid := { x := 0, y := 0, z := 0 }
+      barrierEpoch := []
+      space := .global
+      addr := 0
+      width := 8
+      isRead := true
+      isWrite := true
+      isAtomic := true
+      valRead := 24#64
+      valWritten := 47#64
+      poSeq := 0 }
+  let e0Rev : PTXMemEvent :=
+    { eventId := 0
+      kernelIdx := 0
+      ctaId := { x := 0, y := 0, z := 0 }
+      tid := { x := 0, y := 0, z := 0 }
+      barrierEpoch := []
+      space := .global
+      addr := 0
+      width := 8
+      isRead := true
+      isWrite := true
+      isAtomic := true
+      valRead := 28#64
+      valWritten := 47#64
+      poSeq := 0 }
+  let e1Rev : PTXMemEvent :=
+    { eventId := 1
+      kernelIdx := 0
+      ctaId := { x := 1, y := 0, z := 0 }
+      tid := { x := 0, y := 0, z := 0 }
+      barrierEpoch := []
+      space := .global
+      addr := 0
+      width := 8
+      isRead := true
+      isWrite := true
+      isAtomic := true
+      valRead := 5#64
+      valWritten := 28#64
+      poSeq := 0 }
+  refine ⟨?_, ?_⟩
+  · have hConsSeq : PTXAxiomaticConsistent (initMemOfGlobal g0)
+        (sequentialCandidateOfEvents [e0Seq, e1Seq]) := by
+      apply sequentialCandidateOfEvents_consistent
+      refine ⟨by decide, ?_, ?_, ?_, ?_⟩
+      · intro ea eb hMa hMb _ _ _ hSeq
+        have hPa : ea.poSeq = 0 := by
+          rcases List.mem_cons.mp hMa with rfl | h1
+          · rfl
+          · rw [List.mem_singleton.mp h1]
+        have hPb : eb.poSeq = 0 := by
+          rcases List.mem_cons.mp hMb with rfl | h1
+          · rfl
+          · rw [List.mem_singleton.mp h1]
+        omega
+      · intro ea eb _ hMa hMb _ hC hDiff _
+        rcases List.mem_cons.mp hMa with rfl | hMa1
+        · rcases List.mem_cons.mp hMb with rfl | hMb1
+          · exact False.elim (hDiff rfl)
+          · rcases List.mem_singleton.mp hMb1 with rfl
+            nomatch hC
+        · rcases List.mem_singleton.mp hMa1 with rfl
+          rcases List.mem_cons.mp hMb with rfl | hMb1
+          · nomatch hC
+          · rcases List.mem_singleton.mp hMb1 with rfl
+            exact False.elim (hDiff rfl)
+      · intro ea eb hMa hMb _ _ _ hKLt
+        have hKa : ea.kernelIdx = 0 := by
+          rcases List.mem_cons.mp hMa with rfl | h1
+          · rfl
+          · rw [List.mem_singleton.mp h1]
+        have hKb : eb.kernelIdx = 0 := by
+          rcases List.mem_cons.mp hMb with rfl | h1
+          · rfl
+          · rw [List.mem_singleton.mp h1]
+        omega
+      · intro er hMr _
+        rcases List.mem_cons.mp hMr with rfl | hMr1
+        · refine ⟨hInit5, ?_⟩
+          intro em hMm _ _ hLtM
+          rcases List.mem_cons.mp hMm with rfl | hMm1
+          · exfalso; revert hLtM; decide
+          · rcases List.mem_singleton.mp hMm1 with rfl
+            exfalso; revert hLtM; decide
+        · rcases List.mem_singleton.mp hMr1 with rfl
+          refine ⟨e0Seq, rfl, rfl, ⟨rfl, rfl, rfl, Or.inl rfl⟩, rfl, by decide, ?_⟩
+          intro em hMm _ _ hLtM
+          rcases List.mem_cons.mp hMm with rfl | hMm1
+          · decide
+          · rcases List.mem_singleton.mp hMm1 with rfl
+            exfalso; revert hLtM; decide
+    have hImmSeq : isImmediateCoChain (sequentialCandidateOfEvents [e0Seq, e1Seq])
+        [e0Seq, e1Seq] := by
+      refine ⟨⟨e0Seq, e1Seq, rfl, rfl, rfl, rfl, ⟨rfl, rfl, rfl, Or.inl rfl⟩, by decide⟩, ?_, trivial⟩
+      rintro ⟨wMid, ⟨_, _, _, _, _, _, _, hLt1⟩, ⟨_, _, _, _, _, _, _, hLt2⟩⟩
+      change 0 < wMid at hLt1
+      change wMid < 1 at hLt2
+      omega
+    have hSubSeq : ∀ e ∈ [e0Seq, e1Seq],
+        e ∈ (sequentialCandidateOfEvents [e0Seq, e1Seq]).events ∧
+          e.isAtomic = true ∧ e.isRead = true ∧ e.isWrite = true := by
+      intro e hMe
+      rcases List.mem_cons.mp hMe with rfl | h1
+      · exact ⟨List.Mem.head _, rfl, rfl, rfl⟩
+      · rcases List.mem_singleton.mp h1 with rfl
+        exact ⟨List.Mem.tail _ (List.Mem.head _), rfl, rfl, rfl⟩
+    have hNoLostSeq : e1Seq.valWritten = 5#64 + sumAtomAddDeltas [e0Seq, e1Seq] :=
+      ptx_relaxed_atom_add_co_no_lost_updates (initMemOfGlobal g0)
+        (sequentialCandidateOfEvents [e0Seq, e1Seq]) hConsSeq [e0Seq, e1Seq] (by simp) 5#64
+        hSubSeq hImmSeq hInit5
+        (by
+          rintro ⟨wPre, _, _, _, _, _, _, _, hLt⟩
+          change wPre < 0 at hLt
+          omega)
+    exact ⟨hConsSeq, hImmSeq, hNoLostSeq, rfl⟩
+  · have hConsRev : PTXAxiomaticConsistent (initMemOfGlobal g0)
+        (twoEventReversedRmwCandidate e0Rev e1Rev) := by
+      refine
+        { eventIds_nodup := by decide
+          po_wf := fun h => False.elim h
+          po_irrefl := fun _ h => h
+          po_trans := fun h _ => False.elim h
+          po_complete := ?_
+          sw_cta_barrier := ?_
+          sw_inter_kernel := ?_
+          hb_irrefl := fun _ hHb => twoEventRev_no_hb hHb
+          rf_wf := ?_
+          rf_complete := ?_
+          co_wf := ?_
+          co_irrefl := ?_
+          co_trans := ?_
+          co_total := ?_
+          coh_ww := fun _ hHb => False.elim (twoEventRev_no_hb hHb)
+          coh_wr := fun _ hHb => twoEventRev_no_hb hHb
+          coh_rw := fun _ hHb => twoEventRev_no_hb hHb
+          coh_vrw := fun _ _ hHb => twoEventRev_no_hb hHb
+          rmw_atomicity := ?_ }
+      · intro ea eb hMa hMb _ _ _ hSeq
+        have hPa : ea.poSeq = 0 := by
+          rcases List.mem_cons.mp hMa with rfl | h1
+          · rfl
+          · rw [List.mem_singleton.mp h1]
+        have hPb : eb.poSeq = 0 := by
+          rcases List.mem_cons.mp hMb with rfl | h1
+          · rfl
+          · rw [List.mem_singleton.mp h1]
+        omega
+      · intro ea eb _ hMa hMb _ hC hDiff _
+        rcases List.mem_cons.mp hMa with rfl | hMa1
+        · rcases List.mem_cons.mp hMb with rfl | hMb1
+          · exact False.elim (hDiff rfl)
+          · rcases List.mem_singleton.mp hMb1 with rfl
+            nomatch hC
+        · rcases List.mem_singleton.mp hMa1 with rfl
+          rcases List.mem_cons.mp hMb with rfl | hMb1
+          · nomatch hC
+          · rcases List.mem_singleton.mp hMb1 with rfl
+            exact False.elim (hDiff rfl)
+      · intro ea eb hMa hMb _ _ _ hKLt
+        have hKa : ea.kernelIdx = 0 := by
+          rcases List.mem_cons.mp hMa with rfl | h1
+          · rfl
+          · rw [List.mem_singleton.mp h1]
+        have hKb : eb.kernelIdx = 0 := by
+          rcases List.mem_cons.mp hMb with rfl | h1
+          · rfl
+          · rw [List.mem_singleton.mp h1]
+        omega
+      · intro w r ⟨hW, hR⟩
+        rw [hW, hR]
+        exact ⟨e1Rev, e0Rev, rfl, rfl, rfl, rfl, ⟨rfl, rfl, rfl, Or.inl rfl⟩, rfl, by decide⟩
+      · intro er hMr _
+        rcases List.mem_cons.mp hMr with rfl | hMr1
+        · left
+          exact ⟨1, ⟨rfl, rfl⟩, fun _ ⟨hW, _⟩ => hW⟩
+        · rcases List.mem_singleton.mp hMr1 with rfl
+          right
+          refine ⟨?_, hInit5⟩
+          rintro ⟨_, _, hR⟩
+          change 1 = 0 at hR
+          omega
+      · intro w1 w2 ⟨hW1, hW2⟩
+        rw [hW1, hW2]
+        exact ⟨e1Rev, e0Rev, rfl, rfl, rfl, rfl, ⟨rfl, rfl, rfl, Or.inl rfl⟩, by decide⟩
+      · intro w ⟨hW1, hW2⟩
+        change w = 1 at hW1
+        change w = 0 at hW2
+        omega
+      · intro w1 w2 w3 ⟨_, h2⟩ ⟨h2', _⟩
+        change w2 = 0 at h2
+        change w2 = 1 at h2'
+        omega
+      · intro e1 e2 hM1 hM2 _ _ _ hNe
+        rcases List.mem_cons.mp hM1 with rfl | h1
+        · rcases List.mem_cons.mp hM2 with rfl | h2
+          · exact False.elim (hNe rfl)
+          · rcases List.mem_singleton.mp h2 with rfl
+            exact Or.inr ⟨rfl, rfl⟩
+        · rcases List.mem_singleton.mp h1 with rfl
+          rcases List.mem_cons.mp hM2 with rfl | h2
+          · exact Or.inl ⟨rfl, rfl⟩
+          · rcases List.mem_singleton.mp h2 with rfl
+            exact False.elim (hNe rfl)
+      · intro e hMe _ _ _
+        rcases List.mem_cons.mp hMe with rfl | h1
+        · refine ⟨?_, ?_⟩
+          · intro w ⟨hW, _⟩
+            refine ⟨⟨hW, rfl⟩, ?_⟩
+            rintro ⟨wMid, ⟨_, hM1⟩, ⟨hM2, _⟩⟩
+            change wMid = 0 at hM1
+            change wMid = 1 at hM2
+            omega
+          · intro hNoRf
+            exact False.elim (hNoRf ⟨1, rfl, rfl⟩)
+        · rcases List.mem_singleton.mp h1 with rfl
+          refine ⟨?_, ?_⟩
+          · intro _ ⟨_, hR⟩
+            change 1 = 0 at hR
+            omega
+          · intro _ ⟨_, _, h2⟩
+            change 1 = 0 at h2
+            omega
+    have hImmRev : isImmediateCoChain (twoEventReversedRmwCandidate e0Rev e1Rev)
+        [e1Rev, e0Rev] := by
+      refine ⟨⟨rfl, rfl⟩, ?_, trivial⟩
+      rintro ⟨wMid, ⟨_, hM1⟩, ⟨hM2, _⟩⟩
+      change wMid = 0 at hM1
+      change wMid = 1 at hM2
+      omega
+    have hSubRev : ∀ e ∈ [e1Rev, e0Rev],
+        e ∈ (twoEventReversedRmwCandidate e0Rev e1Rev).events ∧
+          e.isAtomic = true ∧ e.isRead = true ∧ e.isWrite = true := by
+      intro e hMe
+      rcases List.mem_cons.mp hMe with rfl | h1
+      · exact ⟨List.Mem.tail _ (List.Mem.head _), rfl, rfl, rfl⟩
+      · rcases List.mem_singleton.mp h1 with rfl
+        exact ⟨List.Mem.head _, rfl, rfl, rfl⟩
+    have hNoLostRev : e0Rev.valWritten = 5#64 + sumAtomAddDeltas [e1Rev, e0Rev] :=
+      ptx_relaxed_atom_add_co_no_lost_updates (initMemOfGlobal g0)
+        (twoEventReversedRmwCandidate e0Rev e1Rev) hConsRev [e1Rev, e0Rev] (by simp) 5#64
+        hSubRev hImmRev hInit5
+        (by
+          rintro ⟨_, _, h2⟩
+          change 1 = 0 at h2
+          omega)
+    exact ⟨hConsRev, hImmRev, hNoLostRev, rfl⟩
+
+/-- Executable kernel trace equality (`evalPTXKernelWithOracle`, `evalPTXKernelWithCTAOrder`, and
+    `replayCoherentGlobalWrites`) for `ptx_relaxed_cross_cta_atom_add_commutes` (`D6`). -/
+theorem ptx_relaxed_cross_cta_atom_add_exec :
+    let k : PTXKernel :=
+      { name := "cross_cta_atom_add"
+      , params := [ { ty := .u64, name := "acc" } ]
+      , regDecls := [ { ty := .u32, prefixName := "%r", count := 1 }
+                    , { ty := .u64, prefixName := "%rd", count := 3 }
+                    , { ty := .pred, prefixName := "%p", count := 1 } ]
+      , body :=
+          [ .instr none (.mov .u32 "%r0" (.sreg .ctaidX))
+          , .instr none (.setp .eq .u32 "%p0" (.reg "%r0") (.immU64 0#64))
+          , .instr none (.selp .u64 "%rd1" (.immU64 19#64) (.immU64 23#64) "%p0")
+          , .instr none (.ldParam .u64 "%rd0" "acc")
+          , .instr none (.atomAdd .global .u64 "%rd2" (.regOffset "%rd0" 0) (.reg "%rd1"))
+          , .instr none .ret ] }
+    let g0 := ByteMemory.ofU64Words [ 5#64 ]
+    let revOracle : PTXReadOracle := fun ctaId _ ord sp addr width =>
+      if sp == .global && addr == 0 && width == 8 && ord == 0 then
+        if ctaId.x == 0 then some 28#64 else some 5#64
+      else
+        none
+    let e0Seq : PTXMemEvent :=
+      { eventId := 0, kernelIdx := 0, ctaId := { x := 0, y := 0, z := 0 }
+      , tid := { x := 0, y := 0, z := 0 }, barrierEpoch := [], space := .global
+      , addr := 0, width := 8, isRead := true, isWrite := true, isAtomic := true
+      , valRead := 5#64, valWritten := 24#64, poSeq := 0 }
+    let e1Seq : PTXMemEvent :=
+      { eventId := 1, kernelIdx := 0, ctaId := { x := 1, y := 0, z := 0 }
+      , tid := { x := 0, y := 0, z := 0 }, barrierEpoch := [], space := .global
+      , addr := 0, width := 8, isRead := true, isWrite := true, isAtomic := true
+      , valRead := 24#64, valWritten := 47#64, poSeq := 0 }
+    let e0Rev : PTXMemEvent :=
+      { eventId := 0, kernelIdx := 0, ctaId := { x := 0, y := 0, z := 0 }
+      , tid := { x := 0, y := 0, z := 0 }, barrierEpoch := [], space := .global
+      , addr := 0, width := 8, isRead := true, isWrite := true, isAtomic := true
+      , valRead := 28#64, valWritten := 47#64, poSeq := 0 }
+    let e1Rev : PTXMemEvent :=
+      { eventId := 1, kernelIdx := 0, ctaId := { x := 1, y := 0, z := 0 }
+      , tid := { x := 0, y := 0, z := 0 }, barrierEpoch := [], space := .global
+      , addr := 0, width := 8, isRead := true, isWrite := true, isAtomic := true
+      , valRead := 5#64, valWritten := 28#64, poSeq := 0 }
+    (∃ gSeq,
+      evalPTXKernelWithOracle none 8 k { x := 2 } { x := 1 } g0
+        { params := [ ("acc", 0#64) ] } = .ok (gSeq, [e0Seq, e1Seq]) ∧
+      gSeq.loadBits 0 8 = some 47#64) ∧
+    (∃ gRaw gCoh gCtaOrd evsCtaOrd,
+      evalPTXKernelWithOracle (some revOracle) 8 k { x := 2 } { x := 1 } g0
+        { params := [ ("acc", 0#64) ] } = .ok (gRaw, [e0Rev, e1Rev]) ∧
+      evalPTXKernelWithCTAOrder none 8 k { x := 2 } { x := 1 }
+        [{ x := 1, y := 0, z := 0 }, { x := 0, y := 0, z := 0 }] g0
+        { params := [ ("acc", 0#64) ] } = .ok (gCtaOrd, evsCtaOrd) ∧
+      replayCoherentGlobalWrites g0 [e1Rev, e0Rev] = some gCoh ∧
+      gCoh.loadBits 0 8 = some 47#64 ∧
+      gCtaOrd.loadBits 0 8 = some 47#64) := by
+  exact ⟨⟨_, rfl, rfl⟩, ⟨_, _, _, _, rfl, rfl, rfl, rfl, rfl⟩⟩
+
+/-- Inter-kernel sequential host-stream visibility (`D6`):
+    in any `PTXAxiomaticConsistent` execution `cand`, if kernel `k_i` (`ew.kernelIdx < er.kernelIdx`)
+    writes `ew.valWritten` to `.global` location `(addr, width)`, no other write to that location
+    intervenes (`co`-maximality of `ew`), and kernel `k_j` reads that location in `er`, then
+    inter-kernel `sw` (`ew →_sw er`, hence `ew →_hb er`) and `fr`/`coh_rw` coherence force
+    `er.valRead = ew.valWritten`. -/
+theorem ptx_seq_kernel_global_write_visible
+    (initMem : Nat → StateSpace → Nat → Option (BitVec 64))
+    (cand : PTXCandidateExecution)
+    (hCons : PTXAxiomaticConsistent initMem cand)
+    (ew er : PTXMemEvent)
+    (hMemW : ew ∈ cand.events) (hMemR : er ∈ cand.events)
+    (hSpW : ew.space = .global) (hSpR : er.space = .global)
+    (hWrW : ew.isWrite = true) (hRdR : er.isRead = true)
+    (hAddr : ew.addr = er.addr) (hWidth : ew.width = er.width)
+    (hKernLt : ew.kernelIdx < er.kernelIdx)
+    (hCoMax : ¬ ∃ wPost : Nat, cand.co ew.eventId wPost) :
+    cand.sw ew.eventId er.eventId ∧ er.valRead = ew.valWritten := by
+  have hSw : cand.sw ew.eventId er.eventId :=
+    hCons.sw_inter_kernel ew er hMemW hMemR hSpW hSpR hWrW hKernLt
+  have hHb : cand.hb ew.eventId er.eventId :=
+    PTXHappensBefore.single (Or.inr hSw)
+  refine ⟨hSw, ?_⟩
+  have hFindW : cand.hasEvent ew.eventId = some ew :=
+    hasEvent_eq_self_of_nodup hCons.eventIds_nodup hMemW
+  have hFindR : cand.hasEvent er.eventId = some er :=
+    hasEvent_eq_self_of_nodup hCons.eventIds_nodup hMemR
+  have hNeId : er.eventId ≠ ew.eventId := by
+    intro hEq
+    have hEvEq : er = ew := Option.some.inj (hFindR.symm.trans (hEq ▸ hFindW))
+    rw [hEvEq] at hKernLt
+    exact Nat.lt_irrefl _ hKernLt
+  have hSameRW : PTXCandidateExecution.sameLoc er ew :=
+    ⟨hSpR.trans hSpW.symm, hAddr.symm, hWidth.symm, Or.inl hSpR⟩
+  rcases hCons.rf_complete er hMemR hRdR with ⟨w0, hRf0, _⟩ | ⟨hNoRf, _⟩
+  · rcases hCons.rf_wf hRf0 with ⟨ew0, er0, hHasW0, hHasR0, hWrW0, _, hSame0R, hVal0, _⟩
+    have hEr0Eq : er0 = er := Option.some.inj (hHasR0.symm.trans hFindR)
+    rw [hEr0Eq] at hSame0R hVal0
+    rcases hasEvent_mem_of_some hHasW0 with ⟨hMemW0, hW0Id⟩
+    by_cases hEqW : w0 = ew.eventId
+    · have hHasWW0 : cand.hasEvent w0 = some ew := hEqW ▸ hFindW
+      have hEw0Eq : ew0 = ew := Option.some.inj (hHasW0.symm.trans hHasWW0)
+      rw [hEw0Eq] at hVal0
+      exact hVal0.symm
+    · have hSame0W : PTXCandidateExecution.sameLoc ew0 ew :=
+        sameLoc_trans hSame0R hSameRW
+      have hNe0W : ew0.eventId ≠ ew.eventId := by rw [hW0Id]; exact hEqW
+      rcases hCons.co_total ew0 ew hMemW0 hMemW hWrW0 hWrW hSame0W hNe0W with hCo0W | hCoW0
+      · rw [hW0Id] at hCo0W
+        have hFr : cand.fr er.eventId ew.eventId := Or.inl ⟨w0, hRf0, hCo0W⟩
+        exact False.elim (hCons.coh_rw hFr hHb)
+      · exact False.elim (hCoMax ⟨ew0.eventId, hCoW0⟩)
+  · have hFr : cand.fr er.eventId ew.eventId :=
+      Or.inr ⟨hNoRf, er, ew, hFindR, hFindW, hRdR, hWrW, hSameRW, hNeId⟩
+    exact False.elim (hCons.coh_rw hFr hHb)
+
+/-- Intra-CTA `bar.sync` generation release-acquire visibility (`D6`):
+    in any `PTXAxiomaticConsistent` execution `cand`, if thread `ew.tid` in `(kernelIdx, ctaId)`
+    writes `ew.valWritten` to `.shared` or `.global` location `(addr, width)` before barrier `bid`
+    advances (`lookupBarrierEpoch ew.barrierEpoch bid < lookupBarrierEpoch er.barrierEpoch bid`),
+    no later store overwrites that location (`co`-maximality of `ew`), and distinct thread `er.tid`
+    in the same CTA reads that location after `bar.sync bid`, then `ew →_sw er` and
+    `er.valRead = ew.valWritten`. -/
+theorem ptx_cta_barrier_gen_write_visible
+    (initMem : Nat → StateSpace → Nat → Option (BitVec 64))
+    (cand : PTXCandidateExecution)
+    (hCons : PTXAxiomaticConsistent initMem cand)
+    (ew er : PTXMemEvent) (bid : Nat)
+    (hMemW : ew ∈ cand.events) (hMemR : er ∈ cand.events)
+    (hKern : ew.kernelIdx = er.kernelIdx) (hCta : ew.ctaId = er.ctaId)
+    (hDiffTid : ew.tid ≠ er.tid)
+    (hGenLt : lookupBarrierEpoch ew.barrierEpoch bid < lookupBarrierEpoch er.barrierEpoch bid)
+    (hSameLoc : PTXCandidateExecution.sameLoc er ew)
+    (hWrW : ew.isWrite = true) (hRdR : er.isRead = true)
+    (hCoMax : ¬ ∃ wPost : Nat, cand.co ew.eventId wPost) :
+    cand.sw ew.eventId er.eventId ∧ er.valRead = ew.valWritten := by
+  have hSw : cand.sw ew.eventId er.eventId :=
+    hCons.sw_cta_barrier ew er bid hMemW hMemR hKern hCta hDiffTid hGenLt
+  have hHb : cand.hb ew.eventId er.eventId :=
+    PTXHappensBefore.single (Or.inr hSw)
+  refine ⟨hSw, ?_⟩
+  have hFindW : cand.hasEvent ew.eventId = some ew :=
+    hasEvent_eq_self_of_nodup hCons.eventIds_nodup hMemW
+  have hFindR : cand.hasEvent er.eventId = some er :=
+    hasEvent_eq_self_of_nodup hCons.eventIds_nodup hMemR
+  have hNeId : er.eventId ≠ ew.eventId := by
+    intro hEq
+    have hEvEq : er = ew := Option.some.inj (hFindR.symm.trans (hEq ▸ hFindW))
+    rw [hEvEq] at hDiffTid
+    exact hDiffTid rfl
+  rcases hCons.rf_complete er hMemR hRdR with ⟨w0, hRf0, _⟩ | ⟨hNoRf, _⟩
+  · rcases hCons.rf_wf hRf0 with ⟨ew0, er0, hHasW0, hHasR0, hWrW0, _, hSame0R, hVal0, _⟩
+    have hEr0Eq : er0 = er := Option.some.inj (hHasR0.symm.trans hFindR)
+    rw [hEr0Eq] at hSame0R hVal0
+    rcases hasEvent_mem_of_some hHasW0 with ⟨hMemW0, hW0Id⟩
+    by_cases hEqW : w0 = ew.eventId
+    · have hHasWW0 : cand.hasEvent w0 = some ew := hEqW ▸ hFindW
+      have hEw0Eq : ew0 = ew := Option.some.inj (hHasW0.symm.trans hHasWW0)
+      rw [hEw0Eq] at hVal0
+      exact hVal0.symm
+    · have hSame0W : PTXCandidateExecution.sameLoc ew0 ew :=
+        sameLoc_trans hSame0R hSameLoc
+      have hNe0W : ew0.eventId ≠ ew.eventId := by rw [hW0Id]; exact hEqW
+      rcases hCons.co_total ew0 ew hMemW0 hMemW hWrW0 hWrW hSame0W hNe0W with hCo0W | hCoW0
+      · rw [hW0Id] at hCo0W
+        have hFr : cand.fr er.eventId ew.eventId := Or.inl ⟨w0, hRf0, hCo0W⟩
+        exact False.elim (hCons.coh_rw hFr hHb)
+      · exact False.elim (hCoMax ⟨ew0.eventId, hCoW0⟩)
+  · have hFr : cand.fr er.eventId ew.eventId :=
+      Or.inr ⟨hNoRf, er, ew, hFindR, hFindW, hRdR, hWrW, hSameLoc, hNeId⟩
+    exact False.elim (hCons.coh_rw hFr hHb)
+
 end LeanNative.Backend.PTXAst
