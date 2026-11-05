@@ -10485,26 +10485,26 @@ public def localNotVal : MYTYPE := true
 
         fs::write(
             proj.join("Smoke/A.lean"),
-            "module\npublic meta import Smoke.Provider1\npublic meta import Smoke.Provider2\npublic def pubConst : Nat := 1\n",
+            "module\npublic meta import Smoke.Provider1\npublic meta import Smoke.Provider2\npublic meta def metaConst : Nat := 1\n",
         )?;
         fs::write(
             proj.join("Smoke/B.lean"),
-            "module\npublic import Smoke.A\npublic def usePubConst : Nat := pubConst\n",
+            "module\npublic import Smoke.A\npublic def usePubOnly : Nat := 1\n",
         )?;
         fs::write(
             proj.join("Smoke/C.lean"),
-            "module\nimport Smoke.B\npublic def usePubConstC : Nat := usePubConst\n",
+            "module\nimport Smoke.B\npublic def usePubOnlyC : Nat := usePubOnly\n",
         )?;
         fs::write(
             proj.join("Smoke/M.lean"),
-            "module\nmeta import Smoke.A\npublic meta def useMeta : Nat := p1 + p2\n",
+            "module\nmeta import Smoke.A\nmeta def useMeta : Nat := p1 + p2 + metaConst\n",
         )?;
         run_git(&["add", "."])?;
         run_git(&["commit", "-m", "public meta import order baseline"])?;
 
         fs::write(
             proj.join("Smoke/A.lean"),
-            "module\npublic meta import Smoke.Provider2\npublic meta import Smoke.Provider1\npublic def pubConst : Nat := 1\n",
+            "module\npublic meta import Smoke.Provider2\npublic meta import Smoke.Provider1\npublic meta def metaConst : Nat := 1\n",
         )?;
         let rep_meta_imp_swap = compute_impact_report(
             proj.join("Smoke/A.lean"),
@@ -10538,7 +10538,7 @@ public def localNotVal : MYTYPE := true
 
         fs::write(
             proj.join("Smoke/A.lean"),
-            "module\n  /- meta cmt -/ public  meta  import  Smoke.Provider1 -- m1\n  public  meta  import  Smoke.Provider2\npublic def pubConst : Nat := 1\n",
+            "module\n  /- meta cmt -/ public  meta  import  Smoke.Provider1 -- m1\n  public  meta  import  Smoke.Provider2\npublic meta def metaConst : Nat := 1\n",
         )?;
         let rep_meta_imp_ws = compute_impact_report(
             proj.join("Smoke/A.lean"),
@@ -10560,6 +10560,107 @@ public def localNotVal : MYTYPE := true
                 "Smoke.M".to_string()
             ]
         );
+
+        fs::write(
+            proj.join("Smoke/Provider1.lean"),
+            "module\nsyntax \"makeVal\" : term\nmacro_rules | `(makeVal) => `((0 : Nat))\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/Provider2.lean"),
+            "module\nsyntax \"makeVal\" : term\nmacro_rules | `(makeVal) => `(true)\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\npublic meta import Smoke.Provider1\npublic def api := makeVal\npublic meta def helperMeta : Nat := 1\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/B.lean"),
+            "module\npublic import Smoke.A\npublic def useApi : Nat := api + 1\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/C.lean"),
+            "module\nimport Smoke.B\npublic def useApiC : Nat := useApi\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/M.lean"),
+            "module\nmeta import Smoke.A\nmeta def useMeta : Nat := helperMeta\n",
+        )?;
+        run_git(&["add", "-A"])?;
+        run_git(&["commit", "-m", "public meta import macro provider baseline"])?;
+        crate::module_builder::build_project_modules_native(
+            &mut store,
+            &proj,
+            &["Smoke.C".to_string(), "Smoke.M".to_string()],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\npublic meta import Smoke.Provider1\npublic def api := makeVal\npublic meta def helperMeta : Nat := 2\n",
+        )?;
+        let rep_meta_def_only = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_meta_def_only.edit_class, "meta_only_module_edit");
+        assert!(!rep_meta_def_only.public_signature_changed);
+        assert!(rep_meta_def_only.meta_signature_changed);
+        assert_eq!(
+            rep_meta_def_only.transitive_dependents,
+            vec!["Smoke.M".to_string()]
+        );
+        assert_eq!(
+            rep_meta_def_only.pruned_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\npublic meta import Smoke.Provider2\npublic def api := makeVal\npublic meta def helperMeta : Nat := 1\n",
+        )?;
+        let rep_pub_meta_macro = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_pub_meta_macro.edit_class, "public_signature_edit");
+        assert!(rep_pub_meta_macro.public_signature_changed);
+        assert!(rep_pub_meta_macro.meta_signature_changed);
+        assert_eq!(
+            rep_pub_meta_macro.transitive_dependents,
+            vec![
+                "Smoke.B".to_string(),
+                "Smoke.C".to_string(),
+                "Smoke.M".to_string()
+            ]
+        );
+        assert!(rep_pub_meta_macro.pruned_dependents.is_empty());
+        let err_pub_meta_macro = lake_recheck_dependents_with_store(
+            Some(&store),
+            &canon_proj,
+            &["Smoke/A.lean".to_string()],
+            Some("HEAD"),
+            false,
+        );
+        assert!(err_pub_meta_macro.is_err());
+
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\npublic meta import all Smoke.Provider2\npublic def api := makeVal\npublic meta def helperMeta : Nat := 1\n",
+        )?;
+        let rep_pub_meta_all = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert!(rep_pub_meta_all.public_signature_changed);
+        assert!(rep_pub_meta_all.meta_signature_changed);
+        assert!(rep_pub_meta_all.pruned_dependents.is_empty());
 
         let a_trail_attr_v1 = "\
 module

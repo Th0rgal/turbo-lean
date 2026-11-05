@@ -7727,22 +7727,17 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
     meta_directives_hasher.update(b"meta-directives:v1\n");
     let mut active_context_vars: Vec<String> = Vec::new();
     for spec in &hdr.import_specs {
-        if !spec.is_exported {
-            let cmd = match (spec.is_meta, spec.import_all) {
-                (false, false) => format!("import {}", spec.module),
-                (false, true) => format!("import all {}", spec.module),
-                (true, false) => format!("meta import {}", spec.module),
-                (true, true) => format!("meta import all {}", spec.module),
-            };
-            active_context_vars.push(cmd);
-        } else if !spec.is_meta {
-            let cmd = if spec.import_all {
-                format!("public import all {}", spec.module)
-            } else {
-                format!("public import {}", spec.module)
-            };
-            active_context_vars.push(cmd);
-        }
+        let cmd = match (spec.is_exported, spec.is_meta, spec.import_all) {
+            (false, false, false) => format!("import {}", spec.module),
+            (false, false, true) => format!("import all {}", spec.module),
+            (false, true, false) => format!("meta import {}", spec.module),
+            (false, true, true) => format!("meta import all {}", spec.module),
+            (true, false, false) => format!("public import {}", spec.module),
+            (true, false, true) => format!("public import all {}", spec.module),
+            (true, true, false) => format!("public meta import {}", spec.module),
+            (true, true, true) => format!("public meta import all {}", spec.module),
+        };
+        active_context_vars.push(cmd);
     }
     active_context_vars.dedup();
 
@@ -8221,15 +8216,19 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             || trimmed == "module"
             || trimmed.starts_with("module ")
             || trimmed == "prelude"
-            || trimmed.starts_with("public import ")
-            || trimmed.starts_with("public meta import ")
         {
             return None;
         }
         let mut cmd_in_prefixes = collect_decl_in_prefixes(trimmed);
         local_in_prefixes.append(&mut cmd_in_prefixes);
         let after_p = strip_decl_and_in_prefixes(trimmed);
-        if is_non_exported_import_cmd(trimmed) || is_non_exported_import_cmd(after_p) {
+        if is_non_exported_import_cmd(trimmed)
+            || is_non_exported_import_cmd(after_p)
+            || trimmed.starts_with("public import ")
+            || trimmed.starts_with("public meta import ")
+            || after_p.starts_with("public import ")
+            || after_p.starts_with("public meta import ")
+        {
             return Some(normalize_whitespace(trimmed));
         }
         if is_scope_boundary_cmd_core(trimmed) || is_scope_boundary_cmd_core(after_p) {
@@ -10760,18 +10759,41 @@ public theorem uses_ctx : True := trivial
                 "Smoke.A".to_string()
             ]
         );
-        assert_eq!(
+        assert_ne!(
+            mo_ab.declarations[0].sig_hash, mo_ba.declarations[0].sig_hash,
+            "swapping `public meta import` order before a public declaration must change its sig_hash"
+        );
+        assert_ne!(
             mo_ab.public_signature_digest, mo_ba.public_signature_digest,
-            "swapping `public meta import` order without non-meta public import change keeps public_signature_digest equal"
+            "swapping `public meta import` order before a public declaration must change public_signature_digest"
         );
         assert_ne!(
             mo_ab.meta_signature_digest, mo_ba.meta_signature_digest,
             "swapping `public meta import` order must change meta_signature_digest"
         );
 
+        let meta_order_no_pub_ab =
+            "module\npublic meta import Smoke.A\npublic meta import Smoke.B\npublic meta def keepMeta : Nat := 1\n";
+        let meta_order_no_pub_ba =
+            "module\npublic meta import Smoke.B\npublic meta import Smoke.A\npublic meta def keepMeta : Nat := 1\n";
+        let monp_ab = extract_public_signature(meta_order_no_pub_ab);
+        let monp_ba = extract_public_signature(meta_order_no_pub_ba);
+        assert_eq!(
+            monp_ab.public_signature_digest, monp_ba.public_signature_digest,
+            "swapping `public meta import` order without non-meta public declarations or exported directives keeps public_signature_digest equal"
+        );
+        assert_ne!(
+            monp_ab.meta_signature_digest, monp_ba.meta_signature_digest,
+            "swapping `public meta import` order must change meta_signature_digest"
+        );
+
         let meta_order_dup = "module\npublic meta import Smoke.B\npublic meta import Smoke.B\npublic meta import Smoke.A\npublic def keep : Nat := 1\n";
         let mo_dup = extract_public_signature(meta_order_dup);
         assert_eq!(mo_dup.meta_exported_imports, mo_ba.meta_exported_imports);
+        assert_eq!(
+            mo_dup.public_signature_digest,
+            mo_ba.public_signature_digest
+        );
         assert_eq!(mo_dup.meta_signature_digest, mo_ba.meta_signature_digest);
 
         let meta_order_ws_cmt = "module\n  /- c1 -/ public  meta  import  Smoke.A -- c2\n\n  public   meta   import   Smoke.B\npublic def keep : Nat := 1\n";
@@ -10779,6 +10801,57 @@ public theorem uses_ctx : True := trivial
         assert_eq!(mo_ws.meta_exported_imports, mo_ab.meta_exported_imports);
         assert_eq!(mo_ws.public_signature_digest, mo_ab.public_signature_digest);
         assert_eq!(mo_ws.meta_signature_digest, mo_ab.meta_signature_digest);
+
+        let pub_meta_provider_v1 =
+            "module\npublic meta import Smoke.MacroNat\npublic def api := makeVal\n";
+        let pub_meta_provider_v2 =
+            "module\npublic meta import Smoke.MacroBool\npublic def api := makeVal\n";
+        let pmp1 = extract_public_signature(pub_meta_provider_v1);
+        let pmp2 = extract_public_signature(pub_meta_provider_v2);
+        assert_ne!(
+            pmp1.declarations[0].sig_hash, pmp2.declarations[0].sig_hash,
+            "switching `public meta import` provider before `public def api := makeVal` must change sig_hash"
+        );
+        assert_ne!(
+            pmp1.public_signature_digest, pmp2.public_signature_digest,
+            "switching `public meta import` provider before `public def api := makeVal` must change public_signature_digest"
+        );
+
+        let pub_meta_dir_v1 =
+            "module\npublic meta import Smoke.MacroNat\nnotation \"PUB_OP\" => makeVal\n";
+        let pub_meta_dir_v2 =
+            "module\npublic meta import Smoke.MacroBool\nnotation \"PUB_OP\" => makeVal\n";
+        let pmd1 = extract_public_signature(pub_meta_dir_v1);
+        let pmd2 = extract_public_signature(pub_meta_dir_v2);
+        assert_ne!(pmd1.public_directives_hash, pmd2.public_directives_hash);
+        assert_ne!(pmd1.public_signature_digest, pmd2.public_signature_digest);
+
+        let pub_meta_import_all_v1 =
+            "module\npublic meta import all Smoke.MacroNat\npublic def api := makeVal\n";
+        let pub_meta_import_all_v2 =
+            "module\npublic meta import all Smoke.MacroBool\npublic def api := makeVal\n";
+        let pmia1 = extract_public_signature(pub_meta_import_all_v1);
+        let pmia2 = extract_public_signature(pub_meta_import_all_v2);
+        assert!(!pmia1.is_module && !pmia2.is_module);
+        assert!(pmia1.public_signature_digest.starts_with("pubsig-invalid:"));
+        assert!(pmia2.public_signature_digest.starts_with("pubsig-invalid:"));
+        assert_ne!(pmia1.public_signature_digest, pmia2.public_signature_digest);
+        assert_ne!(pmia1.public_signature_digest, pmp1.public_signature_digest);
+
+        let mid_file_pub_meta_all_v1 =
+            "module\nprivate def pre : Nat := 0\npublic meta import all Smoke.MacroNat\npublic def api := makeVal\n";
+        let mid_file_pub_meta_all_v2 =
+            "module\nprivate def pre : Nat := 0\npublic meta import all Smoke.MacroBool\npublic def api := makeVal\n";
+        let mfpma1 = extract_public_signature(mid_file_pub_meta_all_v1);
+        let mfpma2 = extract_public_signature(mid_file_pub_meta_all_v2);
+        assert_ne!(
+            mfpma1.declarations[0].sig_hash,
+            mfpma2.declarations[0].sig_hash
+        );
+        assert_ne!(
+            mfpma1.public_signature_digest,
+            mfpma2.public_signature_digest
+        );
 
         let mixed_order_v1 = "module\npublic import Smoke.A\npublic meta import Smoke.B\n";
         let mixed_order_v2 = "module\npublic meta import Smoke.B\npublic import Smoke.A\n";
