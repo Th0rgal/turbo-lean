@@ -31,6 +31,7 @@ pub mod remote_prebuild;
 pub mod server;
 pub mod shm_cache;
 mod splitter;
+pub mod superopt_evolve;
 mod trusted_tools;
 pub mod verify;
 #[cfg(all(test, unix))]
@@ -517,6 +518,7 @@ enum Commands {
         #[arg(long)]
         allow_dirty: bool,
     },
+    SuperoptEvolve(superopt_evolve::SuperoptEvolveArgs),
 }
 
 #[derive(Subcommand)]
@@ -2001,6 +2003,10 @@ fn run(cli: Cli) -> Result<()> {
             action,
             project_dir,
         } => mcp::run_telemetry_command(&action, project_dir.as_deref(), cli.json),
+
+        Commands::SuperoptEvolve(args) => {
+            superopt_evolve::run_superopt_evolve_command(&mut store, cli.json, args)
+        }
 
         Commands::Daemon { .. } => unreachable!("handled before opening SQLite store"),
         Commands::RemotePrebuild { .. } => unreachable!("handled before opening SQLite store"),

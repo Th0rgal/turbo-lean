@@ -78,37 +78,7 @@ theorem checkSuperoptScalarVerified_sound :
                 subst hop'
                 have ihl := checkSuperoptScalarVerified_sound l l' hl
                 have ihr := checkSuperoptScalarVerified_sound r r' hr
-                intro env st v st' heval
-                simp only [evalExpr, evalScalarExpr] at heval ⊢
-                cases hel : evalScalarExpr env l with
-                | error _ => simp [hel] at heval
-                | ok vl =>
-                  rw [hel] at heval
-                  have hel' : evalExpr env st (.scalar l') = .ok (vl, st) :=
-                    ihl env st vl st (by simp [evalExpr, hel])
-                  simp only [evalExpr] at hel'
-                  cases hl' : evalScalarExpr env l' with
-                  | error _ => simp [hl'] at hel'
-                  | ok vl' =>
-                    rw [hl'] at hel'
-                    injection hel' with hpl
-                    injection hpl with hvl
-                    subst vl'
-                    cases her : evalScalarExpr env r with
-                    | error _ => simp [her] at heval
-                    | ok vr =>
-                      rw [her] at heval
-                      have her' : evalExpr env st (.scalar r') = .ok (vr, st) :=
-                        ihr env st vr st (by simp [evalExpr, her])
-                      simp only [evalExpr] at her'
-                      cases hr' : evalScalarExpr env r' with
-                      | error _ => simp [hr'] at her'
-                      | ok vr' =>
-                        rw [hr'] at her'
-                        injection her' with hpr
-                        injection hpr with hvr
-                        subst vr'
-                        exact heval
+                exact ExprRefines.scalar_binOp_congr ihl ihr
               | fma a' b' c' =>
                 cases op with
                 | add =>
@@ -121,55 +91,16 @@ theorem checkSuperoptScalarVerified_sound :
                       have ihl1 := checkSuperoptScalarVerified_sound l1 a' hl1
                       have ihr1 := checkSuperoptScalarVerified_sound r1 b' hr1
                       have ihr := checkSuperoptScalarVerified_sound r c' hr
-                      intro env st v st' heval
-                      simp only [evalExpr, evalScalarExpr] at heval ⊢
-                      cases hel1 : evalScalarExpr env l1 with
-                      | error _ => simp [hel1] at heval
-                      | ok vl1 =>
-                        rw [hel1] at heval
-                        have ha' : evalExpr env st (.scalar a') = .ok (vl1, st) :=
-                          ihl1 env st vl1 st (by simp [evalExpr, hel1])
-                        simp only [evalExpr] at ha'
-                        cases ha'' : evalScalarExpr env a' with
-                        | error _ => simp [ha''] at ha'
-                        | ok va' =>
-                          rw [ha''] at ha'
-                          injection ha' with hpa
-                          injection hpa with hva
-                          subst va'
-                          cases her1 : evalScalarExpr env r1 with
-                          | error _ => simp [her1] at heval
-                          | ok vr1 =>
-                            rw [her1] at heval
-                            have hb' : evalExpr env st (.scalar b') = .ok (vr1, st) :=
-                              ihr1 env st vr1 st (by simp [evalExpr, her1])
-                            simp only [evalExpr] at hb'
-                            cases hb'' : evalScalarExpr env b' with
-                            | error _ => simp [hb''] at hb'
-                            | ok vb' =>
-                              rw [hb''] at hb'
-                              injection hb' with hpb
-                              injection hpb with hvb
-                              subst vb'
-                              cases hmul : evalBinOp .mul vl1 vr1 with
-                              | error err => simp [hmul] at heval
-                              | ok vab =>
-                                simp [hmul] at heval ⊢
-                                cases her : evalScalarExpr env r with
-                                | error _ => simp [her] at heval
-                                | ok vr =>
-                                  rw [her] at heval
-                                  have hc' : evalExpr env st (.scalar c') = .ok (vr, st) :=
-                                    ihr env st vr st (by simp [evalExpr, her])
-                                  simp only [evalExpr] at hc'
-                                  cases hc'' : evalScalarExpr env c' with
-                                  | error _ => simp [hc''] at hc'
-                                  | ok vc' =>
-                                    rw [hc''] at hc'
-                                    injection hc' with hpc
-                                    injection hpc with hvc
-                                    subst vc'
-                                    exact heval
+                      apply ExprRefines.scalar_of_eval
+                      intro env v hv
+                      simp only [evalScalarExpr] at hv ⊢
+                      split at hv <;> try contradiction
+                      next xy z hxy hz =>
+                        split at hxy <;> try contradiction
+                        next x y hx hy =>
+                          simpa only [ExprRefines.scalar_eval ihl1 _ _ hx,
+                            ExprRefines.scalar_eval ihr1 _ _ hy, hxy,
+                            ExprRefines.scalar_eval ihr _ _ hz] using hv
                     | _ => cases hcheck
                   | _ => cases hcheck
                 | _ => cases hcheck
@@ -181,23 +112,7 @@ theorem checkSuperoptScalarVerified_sound :
                 have hop' := UnaryOp_eq_of_beq hop
                 subst hop'
                 have iha := checkSuperoptScalarVerified_sound a a' ha
-                intro env st v st' heval
-                simp only [evalExpr, evalScalarExpr] at heval ⊢
-                cases hea : evalScalarExpr env a with
-                | error _ => simp [hea] at heval
-                | ok va =>
-                  rw [hea] at heval
-                  have hea' : evalExpr env st (.scalar a') = .ok (va, st) :=
-                    iha env st va st (by simp [evalExpr, hea])
-                  simp only [evalExpr] at hea'
-                  cases ha' : evalScalarExpr env a' with
-                  | error _ => simp [ha'] at hea'
-                  | ok va' =>
-                    rw [ha'] at hea'
-                    injection hea' with hpa
-                    injection hpa with hva
-                    subst va'
-                    exact heval
+                exact ExprRefines.scalar_unaryOp_congr iha
               | _ => cases hcheck
             | select c t f =>
               cases cand with
@@ -207,40 +122,7 @@ theorem checkSuperoptScalarVerified_sound :
                 have ihc := checkSuperoptScalarVerified_sound c c' hc
                 have iht := checkSuperoptScalarVerified_sound t t' ht
                 have ihf := checkSuperoptScalarVerified_sound f f' hf
-                intro env st v st' heval
-                simp only [evalExpr, evalScalarExpr] at heval ⊢
-                cases hec : evalScalarExpr env c with
-                | error _ => simp [hec] at heval
-                | ok vc =>
-                  rw [hec] at heval
-                  have hec' : evalExpr env st (.scalar c') = .ok (vc, st) :=
-                    ihc env st vc st (by simp [evalExpr, hec])
-                  simp only [evalExpr] at hec'
-                  cases hc' : evalScalarExpr env c' with
-                  | error _ => simp [hc'] at hec'
-                  | ok vc' =>
-                    rw [hc'] at hec'
-                    injection hec' with hpc
-                    injection hpc with hvc
-                    subst vc'
-                    cases vc with
-                    | bool b =>
-                      cases b
-                      · exact ihf env st v st' (by simpa [evalExpr] using heval)
-                      · exact iht env st v st' (by simpa [evalExpr] using heval)
-                    | u64 n =>
-                      by_cases hn : (n != 0) = true
-                      · simp only [hn, ↓reduceIte] at heval ⊢
-                        exact iht env st v st' (by simpa [evalExpr] using heval)
-                      · simp only [hn, Bool.false_eq_true, ↓reduceIte] at heval ⊢
-                        exact ihf env st v st' (by simpa [evalExpr] using heval)
-                    | u256 w =>
-                      by_cases hw : (w != UInt256.zero) = true
-                      · simp only [hw, ↓reduceIte] at heval ⊢
-                        exact iht env st v st' (by simpa [evalExpr] using heval)
-                      · simp only [hw, Bool.false_eq_true, ↓reduceIte] at heval ⊢
-                        exact ihf env st v st' (by simpa [evalExpr] using heval)
-                    | _ => exact heval
+                exact ExprRefines.scalar_select_congr ihc iht ihf
               | _ => cases hcheck
             | fma a b c =>
               cases cand with
@@ -250,55 +132,7 @@ theorem checkSuperoptScalarVerified_sound :
                 have iha := checkSuperoptScalarVerified_sound a a' ha
                 have ihb := checkSuperoptScalarVerified_sound b b' hb
                 have ihc := checkSuperoptScalarVerified_sound c c' hc
-                intro env st v st' heval
-                simp only [evalExpr, evalScalarExpr] at heval ⊢
-                cases hea : evalScalarExpr env a with
-                | error _ => simp [hea] at heval
-                | ok va =>
-                  rw [hea] at heval
-                  have hea' : evalExpr env st (.scalar a') = .ok (va, st) :=
-                    iha env st va st (by simp [evalExpr, hea])
-                  simp only [evalExpr] at hea'
-                  cases ha' : evalScalarExpr env a' with
-                  | error _ => simp [ha'] at hea'
-                  | ok va' =>
-                    rw [ha'] at hea'
-                    injection hea' with hpa
-                    injection hpa with hva
-                    subst va'
-                    cases heb : evalScalarExpr env b with
-                    | error _ => simp [heb] at heval
-                    | ok vb =>
-                      rw [heb] at heval
-                      have heb' : evalExpr env st (.scalar b') = .ok (vb, st) :=
-                        ihb env st vb st (by simp [evalExpr, heb])
-                      simp only [evalExpr] at heb'
-                      cases hb' : evalScalarExpr env b' with
-                      | error _ => simp [hb'] at heb'
-                      | ok vb' =>
-                        rw [hb'] at heb'
-                        injection heb' with hpb
-                        injection hpb with hvb
-                        subst vb'
-                        cases hmul : evalBinOp .mul va vb with
-                        | error err => simp [hmul] at heval
-                        | ok vab =>
-                          simp [hmul] at heval ⊢
-                          cases hec : evalScalarExpr env c with
-                          | error _ => simp [hec] at heval
-                          | ok vc =>
-                            rw [hec] at heval
-                            have hec' : evalExpr env st (.scalar c') = .ok (vc, st) :=
-                              ihc env st vc st (by simp [evalExpr, hec])
-                            simp only [evalExpr] at hec'
-                            cases hc' : evalScalarExpr env c' with
-                            | error _ => simp [hc'] at hec'
-                            | ok vc' =>
-                              rw [hc'] at hec'
-                              injection hec' with hpc
-                              injection hpc with hvc
-                              subst vc'
-                              exact heval
+                exact ExprRefines.scalar_fma_congr iha ihb ihc
               | binOp op l r =>
                 cases op with
                 | add =>
@@ -311,55 +145,16 @@ theorem checkSuperoptScalarVerified_sound :
                       have iha := checkSuperoptScalarVerified_sound a l1 ha
                       have ihb := checkSuperoptScalarVerified_sound b r1 hb
                       have ihc := checkSuperoptScalarVerified_sound c r hc
-                      intro env st v st' heval
-                      simp only [evalExpr, evalScalarExpr] at heval ⊢
-                      cases hea : evalScalarExpr env a with
-                      | error _ => simp [hea] at heval
-                      | ok va =>
-                        rw [hea] at heval
-                        have hl1 : evalExpr env st (.scalar l1) = .ok (va, st) :=
-                          iha env st va st (by simp [evalExpr, hea])
-                        simp only [evalExpr] at hl1
-                        cases hl1' : evalScalarExpr env l1 with
-                        | error _ => simp [hl1'] at hl1
-                        | ok vl1 =>
-                          rw [hl1'] at hl1
-                          injection hl1 with hpl1
-                          injection hpl1 with hvl1
-                          subst vl1
-                          cases heb : evalScalarExpr env b with
-                          | error _ => simp [heb] at heval
-                          | ok vb =>
-                            rw [heb] at heval
-                            have hr1 : evalExpr env st (.scalar r1) = .ok (vb, st) :=
-                              ihb env st vb st (by simp [evalExpr, heb])
-                            simp only [evalExpr] at hr1
-                            cases hr1' : evalScalarExpr env r1 with
-                            | error _ => simp [hr1'] at hr1
-                            | ok vr1 =>
-                              rw [hr1'] at hr1
-                              injection hr1 with hpr1
-                              injection hpr1 with hvr1
-                              subst vr1
-                              cases hmul : evalBinOp .mul va vb with
-                              | error err => simp [hmul] at heval
-                              | ok vab =>
-                                simp [hmul] at heval ⊢
-                                cases hec : evalScalarExpr env c with
-                                | error _ => simp [hec] at heval
-                                | ok vc =>
-                                  rw [hec] at heval
-                                  have hr : evalExpr env st (.scalar r) = .ok (vc, st) :=
-                                    ihc env st vc st (by simp [evalExpr, hec])
-                                  simp only [evalExpr] at hr
-                                  cases hr' : evalScalarExpr env r with
-                                  | error _ => simp [hr'] at hr
-                                  | ok vr =>
-                                    rw [hr'] at hr
-                                    injection hr with hpr
-                                    injection hpr with hvr
-                                    subst vr
-                                    exact heval
+                      apply ExprRefines.scalar_of_eval
+                      intro env v hv
+                      simp only [evalScalarExpr] at hv ⊢
+                      split at hv <;> try contradiction
+                      next x y hx hy =>
+                        split at hv <;> try contradiction
+                        next xy z hxy hz =>
+                          simpa only [ExprRefines.scalar_eval iha _ _ hx,
+                            ExprRefines.scalar_eval ihb _ _ hy, hxy,
+                            ExprRefines.scalar_eval ihc _ _ hz] using hv
                     | _ => cases hcheck
                   | _ => cases hcheck
                 | _ => cases hcheck
@@ -534,6 +329,20 @@ theorem evalSeqLoop_refines (count curIdx : Nat) (idxVar accVar : VarId)
       rw [hs2]
       exact ih (curIdx + 1) nextAcc st1 hsrc
 
+/-- Simultaneous refinement of a sequential loop body and its continuation. -/
+theorem CodeRefines.seqFor_congr {iv lv hv av ai : VarId} {aty : LNIRType}
+    {step1 step2 k1 k2 : LNIRCode} (hstep : CodeRefines step1 step2) (hk : CodeRefines k1 k2) :
+    CodeRefines (.seqFor iv lv hv av ai aty step1 k1) (.seqFor iv lv hv av ai aty step2 k2) := by
+  intro fuel env st v st' hsrc
+  simp only [evalCode] at hsrc ⊢
+  split at hsrc <;> try contradiction
+  next lo hi initVal hlo hhi hinit =>
+    split at hsrc
+    next acc st1 hloop =>
+      rw [evalSeqLoop_refines _ _ _ _ _ _ _ _ _ _ (hstep fuel) hloop]
+      exact hk fuel _ _ _ _ hsrc
+    next => contradiction
+
 /-- Code-level superoptimizer preserves operational semantics (`CodeRefines`). -/
 theorem superoptCodeCore_sound (p : HardwareCostProfile) (targetLabel declName : String)
     (code : LNIRCode) :
@@ -559,36 +368,7 @@ theorem superoptCodeCore_sound (p : HardwareCostProfile) (targetLabel declName :
   | ite cv t e iht ihe =>
     simp only [superoptCodeCore]
     exact CodeRefines.ite_congr iht ihe
-  | seqFor iv lv hv av ai aty step k ihs ihk =>
-    intro fuel env st v st' hsrc
-    simp only [superoptCodeCore, evalCode] at hsrc ⊢
-    cases hlo : env lv with
-    | none => simp [hlo] at hsrc
-    | some vlo =>
-      cases hhi : env hv with
-      | none => simp [hlo, hhi] at hsrc
-      | some vhi =>
-        cases hinit : env ai with
-        | none => simp [hlo, hhi, hinit] at hsrc
-        | some vinit =>
-          simp only [hlo, hhi, hinit] at hsrc ⊢
-          cases vlo <;> cases vhi <;> try simp at hsrc
-          rename_i lo hi
-          dsimp only [] at hsrc ⊢
-          cases hloop :
-              evalSeqLoop (hi.toNat - lo.toNat) lo.toNat iv av vinit env st
-                (fun stepEnv stepSt => evalCode fuel stepEnv stepSt step) with
-          | error err => simp [hloop] at hsrc
-          | ok pair =>
-            rw [hloop] at hsrc
-            have hloop' :=
-              evalSeqLoop_refines (hi.toNat - lo.toNat) lo.toNat iv av vinit env st
-                (fun stepEnv stepSt => evalCode fuel stepEnv stepSt step)
-                (fun stepEnv stepSt =>
-                  evalCode fuel stepEnv stepSt (superoptCodeCore p targetLabel declName step).1)
-                pair (fun sEnv sSt sv sSt' hs => ihs fuel sEnv sSt sv sSt' hs) hloop
-            rw [hloop']
-            exact ihk fuel (env.bind av pair.1) pair.2 v st' hsrc
+  | seqFor _ _ _ _ _ _ _ _ ihs ihk => exact CodeRefines.seqFor_congr ihs ihk
   | parFor ov lv ins ety kern k ih =>
     cases kern with
     | customScalar idxVar inVars body =>
