@@ -104,6 +104,22 @@ def verifyHygieneItemAdmitted
     (itemKind : UInt8) (admitsNativeDecide admitsBvDecide : Bool) : Bool :=
   (itemKind == 1 && admitsNativeDecide) || (itemKind == 2 && admitsBvDecide)
 
+/-- Pluggable kernel engine router (`requestedEngine`: `0 = auto`, `1 = standard`,
+    `2 = con-leche`, `3 = both`; returns `0 = rejected_fail_closed`, `1 = standard`,
+    `2 = con-leche`, `3 = both`). -/
+@[inline]
+def routeKernelEngine (requestedEngine : UInt8) (conLecheSupported : Bool) : UInt8 :=
+  if requestedEngine == 0 then (if conLecheSupported then 2 else 1)
+  else if requestedEngine == 1 then 1
+  else if requestedEngine == 2 then (if conLecheSupported then 2 else 0)
+  else if requestedEngine == 3 then (if conLecheSupported then 3 else 0)
+  else 0
+
+@[inline]
+def verifyKernelEngineRoute
+    (requestedEngine resolvedEngine : UInt8) (conLecheSupported : Bool) : Bool :=
+  resolvedEngine != 0 && routeKernelEngine requestedEngine conLecheSupported == resolvedEngine
+
 /-- Tier-aware Matryoshka cascade router (`0 = pass`, `1 = prune_stop`, `2 = abstain_escalate`). -/
 @[inline]
 def matryoshkaTierRouterSpec (survPermille pruneFloorPermille escalateBandPermille epsTierPermille : UInt64)
@@ -330,6 +346,10 @@ def verifyPackTrustAdmissionC
 def verifyHygieneItemAdmittedC
     (itemKind : UInt8) (admitsNativeDecide admitsBvDecide : Bool) : Bool :=
   verifyHygieneItemAdmitted itemKind admitsNativeDecide admitsBvDecide
+
+@[inline, export turbo_spec_route_kernel_engine]
+def routeKernelEngineC (requestedEngine : UInt8) (conLecheSupported : Bool) : UInt8 :=
+  routeKernelEngine requestedEngine conLecheSupported
 
 @[export turbo_spec_combined_step]
 def combinedStepC (i : UInt64) : UInt64 :=

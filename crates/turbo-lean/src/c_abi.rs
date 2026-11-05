@@ -168,6 +168,7 @@ extern "C" {
         admits_native_decide: u8,
         admits_bv_decide: u8,
     ) -> u8;
+    pub fn turbo_spec_route_kernel_engine(requested_engine: u8, con_leche_supported: u8) -> u8;
     pub fn leansys_verify_slice_bounds(off: u64, len: u64, cap: u64) -> u8;
     pub fn leansys_verify_wal_frame(
         magic: u32,
@@ -805,6 +806,11 @@ pub fn verify_pack_trust_admission(
             allow_unattested_trusted as u8,
         ) != 0
     }
+}
+
+#[inline(always)]
+pub fn route_kernel_engine(requested_engine: u8, con_leche_supported: bool) -> u8 {
+    unsafe { turbo_spec_route_kernel_engine(requested_engine, con_leche_supported as u8) }
 }
 
 #[inline(always)]
@@ -1904,12 +1910,24 @@ mod tests {
     fn test_verify_e2e_gain_u64_c_abi_gate() {
         for baseline in [0, 1, 99, 100, 101, 1000, u64::MAX - 99, u64::MAX] {
             let threshold = baseline - (baseline / 100 + u64::from(baseline % 100 != 0));
-            for candidate in [0, 1, threshold, threshold.saturating_add(1), baseline, u64::MAX] {
+            for candidate in [
+                0,
+                1,
+                threshold,
+                threshold.saturating_add(1),
+                baseline,
+                u64::MAX,
+            ] {
                 for hits in [0, 1, u64::MAX] {
-                    let expected = baseline > 0 && candidate > 0 && hits > 0
+                    let expected = baseline > 0
+                        && candidate > 0
+                        && hits > 0
                         && u128::from(candidate) * 100 <= u128::from(baseline) * 99;
-                    assert_eq!(verify_e2e_gain_u64(baseline, candidate, hits), expected,
-                        "baseline={baseline}, candidate={candidate}, hits={hits}");
+                    assert_eq!(
+                        verify_e2e_gain_u64(baseline, candidate, hits),
+                        expected,
+                        "baseline={baseline}, candidate={candidate}, hits={hits}"
+                    );
                 }
             }
         }
@@ -1971,5 +1989,28 @@ mod tests {
             unsafe { leannative_verify_zero_copy_slice_io(4096, 64, 8192, 128, 64, 2) },
             0
         );
+    }
+
+    #[test]
+    fn test_route_kernel_engine_c_abi_gate() {
+        for requested in 0u8..=u8::MAX {
+            for supported in [false, true] {
+                let expected = match (requested, supported) {
+                    (0, false) => 1,
+                    (0, true) => 2,
+                    (1, _) => 1,
+                    (2, true) => 2,
+                    (2, false) => 0,
+                    (3, true) => 3,
+                    (3, false) => 0,
+                    _ => 0,
+                };
+                assert_eq!(
+                    route_kernel_engine(requested, supported),
+                    expected,
+                    "requested={requested}, supported={supported}"
+                );
+            }
+        }
     }
 }

@@ -336,7 +336,9 @@ fn pr_and_ci_verify_base_policy_isolation_and_receipt_verification() {
     assert_err(&pr_both_fail, "pr-verify --kernel both fails closed");
     assert!(!missing_receipt.exists());
 
-    // 3. `verify-receipt` succeeds on valid receipts and fails closed on tampered provenance.
+    // 3. `verify-receipt` succeeds on valid v2 receipts and fails closed on tampered provenance.
+    let pr_rec_val: Value = serde_json::from_slice(&fs::read(&pr_receipt_path).unwrap()).unwrap();
+    assert_eq!(pr_rec_val["schema_version"], 2);
     let vr_ok = f
         .cli("vr")
         .args([
@@ -351,9 +353,70 @@ fn pr_and_ci_verify_base_policy_isolation_and_receipt_verification() {
     assert_ok(&vr_ok, "verify-receipt on valid pr+ci receipts");
     let vr_json: Value = serde_json::from_slice(&vr_ok.stdout).unwrap();
     assert_eq!(vr_json["status"], "receipt_verified");
+    assert_eq!(vr_json["schema_version"], 2);
     assert_eq!(vr_json["kernel_engine"], "standard");
     assert_eq!(vr_json["lean_toolchain"], toolchain);
     assert!(vr_json["con_leche_rev"].is_null());
+
+    // Legacy `schema_version = 1` receipts remain verifiable standalone AND as `--baseline-receipt`
+    // for a `schema_version = 2` receipt.
+    let per_file = pr_rec_val["per_file_interfaces"].as_object().unwrap();
+    let mut v1_payload = format!(
+        "turbo-lean-verification-receipt-v1\nschema_version:1\nmode:{}\ninterface_hash:{}\naction_key:legacy-v1-act\nfiles_audited:{}\ntheorem_shards:{}\nforbidden_constructs_found:0\n",
+        pr_rec_val["mode"].as_str().unwrap(),
+        pr_rec_val["interface_hash"].as_str().unwrap(),
+        pr_rec_val["files_audited"].as_u64().unwrap(),
+        pr_rec_val["theorem_shards"].as_u64().unwrap(),
+    );
+    for (rel_path, ih_val) in per_file {
+        v1_payload.push_str(&format!("file:{rel_path}={}\n", ih_val.as_str().unwrap()));
+    }
+    let v1_blake3 = blake3::hash(v1_payload.as_bytes()).to_hex().to_string();
+    let legacy_v1_path = f.root.join("legacy-v1-receipt.json");
+    let legacy_v1_json = serde_json::json!({
+        "schema_version": 1,
+        "mode": pr_rec_val["mode"],
+        "interface_hash": pr_rec_val["interface_hash"],
+        "action_key": "legacy-v1-act",
+        "files_audited": pr_rec_val["files_audited"],
+        "theorem_shards": pr_rec_val["theorem_shards"],
+        "forbidden_constructs_found": 0,
+        "per_file_interfaces": pr_rec_val["per_file_interfaces"],
+        "receipt_blake3": v1_blake3,
+    });
+    fs::write(
+        &legacy_v1_path,
+        serde_json::to_vec_pretty(&legacy_v1_json).unwrap(),
+    )
+    .unwrap();
+    let vr_v1_ok = f
+        .cli("vr")
+        .args(["--json", "verify-receipt", legacy_v1_path.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert_ok(&vr_v1_ok, "verify-receipt accepts legacy v1 receipt");
+    let vr_v1_json: Value = serde_json::from_slice(&vr_v1_ok.stdout).unwrap();
+    assert_eq!(vr_v1_json["status"], "receipt_verified");
+    assert_eq!(vr_v1_json["schema_version"], 1);
+    assert!(vr_v1_json["kernel_engine"].is_null());
+    assert!(vr_v1_json["lean_toolchain"].is_null());
+    assert!(vr_v1_json["con_leche_rev"].is_null());
+
+    let vr_v2_vs_v1_base = f
+        .cli("vr")
+        .args([
+            "--json",
+            "verify-receipt",
+            pr_receipt_path.to_str().unwrap(),
+            "--baseline-receipt",
+            legacy_v1_path.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_ok(
+        &vr_v2_vs_v1_base,
+        "verify-receipt accepts legacy v1 baseline for v2 receipt",
+    );
 
     // Tamper `lean_toolchain` without recomputing `receipt_blake3` -> BLAKE3 mismatch rejected.
     let mut tampered: Value = serde_json::from_slice(&fs::read(&pr_receipt_path).unwrap()).unwrap();

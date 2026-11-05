@@ -74,6 +74,8 @@ export TurboLean.PolicyGates (
   verifyAuditMaterializeGate
   verifyPackTrustAdmission
   verifyHygieneItemAdmitted
+  routeKernelEngine
+  verifyKernelEngineRoute
   matryoshkaTierRouterSpec
   isClosedSectionNeededC
   cAbiIsClosedSectionNeeded
@@ -118,6 +120,7 @@ export TurboLean.PolicyGates (
   verifyAuditMaterializeGateC
   verifyPackTrustAdmissionC
   verifyHygieneItemAdmittedC
+  routeKernelEngineC
   combinedStepC
 )
 
@@ -1317,5 +1320,34 @@ theorem hygiene_item_admission_rejects_sorry_and_trust_compiler
     (h_non_native : s.itemKind ≠ 1 ∧ s.itemKind ≠ 2) :
     verifyHygieneItemAdmitted s.itemKind s.admitsNativeDecide s.admitsBvDecide = false :=
   hygieneItemAdmissionMetaSpec.rejects_unsafe s (by simp [h_non_native.1, h_non_native.2])
+
+structure KernelEngineRouteState where
+  requestedEngine   : UInt8
+  resolvedEngine    : UInt8
+  conLecheSupported : Bool
+  deriving Repr, DecidableEq, BEq
+
+def kernelEngineRouteMetaSpec : MetaGateSpec KernelEngineRouteState
+    (fun s => s.resolvedEngine ≠ 0 ∧
+      routeKernelEngine s.requestedEngine s.conLecheSupported = s.resolvedEngine) where
+  gate := fun s =>
+    verifyKernelEngineRoute s.requestedEngine s.resolvedEngine s.conLecheSupported
+  sound := fun s h => by
+    simpa [verifyKernelEngineRoute, Bool.and_eq_true, bne_iff_ne, beq_iff_eq] using h
+  complete := fun s h => by
+    simpa [verifyKernelEngineRoute, Bool.and_eq_true, bne_iff_ne, beq_iff_eq] using h
+  posWitness := ⟨0, 1, false⟩
+  negWitness := ⟨2, 1, false⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem kernel_engine_route_fails_closed_without_con_leche
+    (s : KernelEngineRouteState)
+    (h_req : s.requestedEngine = 2 ∨ s.requestedEngine = 3)
+    (h_unsupported : s.conLecheSupported = false) :
+    verifyKernelEngineRoute s.requestedEngine s.resolvedEngine s.conLecheSupported = false :=
+  kernelEngineRouteMetaSpec.rejects_unsafe s fun ⟨h_ne, h_eq⟩ => by
+    rcases h_req with h | h <;> simp [routeKernelEngine, h, h_unsupported] at h_eq
+    all_goals exact h_ne h_eq.symm
 
 end TurboLean.Spec

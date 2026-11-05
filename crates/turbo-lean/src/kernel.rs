@@ -25,6 +25,16 @@ impl KernelEngineSelection {
         }
     }
 
+    #[inline(always)]
+    pub const fn to_c_abi_tag(self) -> u8 {
+        match self {
+            Self::Auto => 0,
+            Self::Standard => 1,
+            Self::ConLeche => 2,
+            Self::Both => 3,
+        }
+    }
+
     pub fn parse_selection(raw: &str) -> Result<Self> {
         let trimmed = raw.trim();
         if trimmed.eq_ignore_ascii_case("auto") {
@@ -92,6 +102,16 @@ impl ResolvedKernelEngine {
             Self::Standard => "standard",
             Self::ConLeche => "con-leche",
             Self::Both => "both",
+        }
+    }
+
+    #[inline(always)]
+    pub const fn from_c_abi_tag(tag: u8) -> Option<Self> {
+        match tag {
+            1 => Some(Self::Standard),
+            2 => Some(Self::ConLeche),
+            3 => Some(Self::Both),
+            _ => None,
         }
     }
 
@@ -217,54 +237,43 @@ pub fn resolve_kernel_engine(
     lean_toolchain: &str,
 ) -> Result<KernelProvenance> {
     let lean_toolchain = normalize_lean_toolchain(lean_toolchain);
-    match requested {
-        KernelEngineSelection::Standard => Ok(KernelProvenance {
-            requested_engine: requested,
-            kernel_engine: ResolvedKernelEngine::Standard,
-            lean_toolchain,
-            con_leche_rev: None,
-            fallback_reason: None,
-        }),
-        KernelEngineSelection::Auto => match probe_con_leche_support(&lean_toolchain) {
-            Some(rev) => Ok(KernelProvenance {
-                requested_engine: requested,
-                kernel_engine: ResolvedKernelEngine::ConLeche,
-                lean_toolchain,
-                con_leche_rev: Some(rev),
-                fallback_reason: None,
-            }),
-            None => Ok(KernelProvenance {
-                requested_engine: requested,
-                kernel_engine: ResolvedKernelEngine::Standard,
-                lean_toolchain: lean_toolchain.clone(),
-                con_leche_rev: None,
-                fallback_reason: Some(format!(
+    let probed_con_leche_rev = probe_con_leche_support(&lean_toolchain);
+    let routed_tag =
+        crate::c_abi::route_kernel_engine(requested.to_c_abi_tag(), probed_con_leche_rev.is_some());
+    let Some(kernel_engine) = ResolvedKernelEngine::from_c_abi_tag(routed_tag) else {
+        anyhow::bail!(
+            "Requested kernel engine `{}` cannot verify target toolchain `{}`: verified `con-leche` export/replay backend is not provisioned (fail-closed kernel gate)",
+            requested.as_str(),
+            lean_toolchain
+        );
+    };
+    let (con_leche_rev, fallback_reason) = match kernel_engine {
+        ResolvedKernelEngine::Standard => {
+            let fallback = (requested == KernelEngineSelection::Auto).then(|| {
+                format!(
                     "con-leche backend is not provisioned or supported for toolchain `{}`; using standard Lean kernel",
                     lean_toolchain
-                )),
-            }),
-        },
-        KernelEngineSelection::ConLeche | KernelEngineSelection::Both => {
-            match probe_con_leche_support(&lean_toolchain) {
-                Some(rev) => Ok(KernelProvenance {
-                    requested_engine: requested,
-                    kernel_engine: if requested == KernelEngineSelection::ConLeche {
-                        ResolvedKernelEngine::ConLeche
-                    } else {
-                        ResolvedKernelEngine::Both
-                    },
-                    lean_toolchain,
-                    con_leche_rev: Some(rev),
-                    fallback_reason: None,
-                }),
-                None => anyhow::bail!(
-                    "Requested kernel engine `{}` cannot verify target toolchain `{}`: verified `con-leche` export/replay backend is not provisioned (fail-closed kernel gate)",
-                    requested.as_str(),
-                    lean_toolchain
-                ),
-            }
+                )
+            });
+            (None, fallback)
         }
-    }
+        ResolvedKernelEngine::ConLeche | ResolvedKernelEngine::Both => {
+            let rev = probed_con_leche_rev.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Kernel routing invariant violated: `{}` resolved without `con_leche_rev`",
+                    kernel_engine.as_str()
+                )
+            })?;
+            (Some(rev), None)
+        }
+    };
+    Ok(KernelProvenance {
+        requested_engine: requested,
+        kernel_engine,
+        lean_toolchain,
+        con_leche_rev,
+        fallback_reason,
+    })
 }
 
 pub fn resolve_project_kernel_provenance(
