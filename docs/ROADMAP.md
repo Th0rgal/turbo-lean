@@ -6,10 +6,8 @@ superseding the earlier `eth-act/clifv` / B2 ISA prototype), the Next-Gen
 `D0`–`D6` roadmap (`Proof-Carrying LCNF`, `Unboxed Regions`, `Certifying
 Stochastic Superoptimizer`, `Hardware-in-the-Loop Cost Autotuning`,
 `Zero-Alloc Stackless Async`, and `PTX Weak-Memory & Barrier-Generation
-Semantics`), and open soundness PRs as of `main` at `661f85b`
-(after [#346](https://github.com/Th0rgal/turbo-lean/pull/346) `38f49fd`,
-[#348](https://github.com/Th0rgal/turbo-lean/pull/348) `af35cc6`, and
-[#340](https://github.com/Th0rgal/turbo-lean/pull/340) `661f85b`).
+Semantics`), and open soundness PRs as of `main` at `a95e505`, with all
+seven D0–D6 tracks merged (merge receipts below).
 This is a status ledger, not a contract: the locked goals and validation
 contracts remain [`roadmap/GOALS.md`](../roadmap/GOALS.md) and
 [`roadmap/VALIDATION_CONTRACTS.md`](../roadmap/VALIDATION_CONTRACTS.md), which
@@ -89,18 +87,26 @@ Building on the completed `C1`–`C8` `Lean 4 -> Target IR` foundation, Tracks `
 | Track | Status | Scope & Module Ownership | Key deliverables & acceptance gates |
 | --- | --- | --- | --- |
 | **`D0`** | **Merged** [#345](https://github.com/Th0rgal/turbo-lean/pull/345) `365a095` | Roadmap & Assurance Sync (`docs/ROADMAP.md`, `README.md`) | Record `C1`–`C8` completion (`437` unique `AxiomAudit`-verified theorems, `10/10` B-3 emitter mutant kills, `0` shadow-allowlist entries) and lock `D1`–`D5` scope and module boundaries (`scripts/sync_docs_inventory.py --check` green). |
-| **`D1`** | In flight | Proof-Carrying LCNF (`lean/LeanNative/Frontend/ProofRetention.lean`) | Before `.mono` proof erasure, extract `Prop` invariants (`i < n`, pointer alignment, slice disjointness, exclusivity) as `LNIR` refinement facts; statically discharge `lean_is_exclusive` branches and emit verified `noalias`/`nsw`/`nuw` flags on `LLVMAst` plus bounds-free `PTXAst`/`MetalAst` loads with kernel-checked refinement proofs in `AxiomAudit.lean`. |
-| **`D2`** | Open [#347](https://github.com/Th0rgal/turbo-lean/pull/347) `0dfee45` | Unboxed Regions & Thread-Local Ownership (`lean/LeanNative/IR/UnboxedRegion.lean`, `Transform/OwnershipRC.lean`) | Add flat header-free `@[unboxed_region]` `repr(C)` structs, borrowed slices, and portable SIMD vector types; extend `OwnershipRC.lean` with single-owner and sendable escape proofs to eliminate 8-byte `lean_object` RC headers and `lean_mark_mt` atomic RC traffic. |
-| **`D3`** | Planned (Wave 2) | Certifying Stochastic Superoptimizer (`lean/LeanNative/Transform/StochasticCert.lean`, `turbo-lean superopt-evolve`) | Offline/CI evolutionary rewrite proposer pairing untrusted LLM/`egglog` search with `1.4B states/s` `fast-check` counterexample falsification behind `SpeculativeGate`, emitting deterministic Lean kernel proof certificates (`VerifiedExprRule` / `SymbolicTV` witness / `LoopScheduleSpec`) into `.tlpack` CAS (`0` build/runtime non-determinism, `0` external solver TCB). |
-| **`D4`** | Planned (Wave 2) | Hardware-in-the-Loop Cost Autotuning (`Transform/CostAutotune.lean` / `D3` profile calibration) | Replace static `HardwareCostProfile` guesses during `D3` offline search with measured wall-clock microbenchmarks across Zen 5 CPU, CUDA (`rtx4090`), and Scaleway targets; enforce `AGENTS.md` Rule 7 by pruning any candidate rule failing `ΔE2E >= 1%` on the canonical corpus. |
+| **`D1`** | **Merged** [#352](https://github.com/Th0rgal/turbo-lean/pull/352) `ade1318` | Proof-Carrying LCNF (`lean/LeanNative/Frontend/ProofRetention.lean`) | Retained facts, local exclusivity discharge, and typed LLVM `noalias`/`nsw`/`nuw` plus PTX/Metal bounds specialization with audited refinement proofs. |
+| **`D2`** | **Merged** [#347](https://github.com/Th0rgal/turbo-lean/pull/347) `e175ab0` | Unboxed Regions & Thread-Local Ownership (`lean/LeanNative/IR/UnboxedRegion.lean`, `Transform/OwnershipRC.lean`) | Header-free `repr(C)` layouts, borrowed slices, portable SIMD and guarded thread-local ownership/RC transformations. |
+| **`D3`** | **Merged** [#359](https://github.com/Th0rgal/turbo-lean/pull/359) `d4197ad` | Certifying Stochastic Superoptimizer (`lean/LeanNative/Transform/StochasticCert.lean`, `turbo-lean superopt-evolve`) | Seeded offline proposal, checked certificates, deterministic bundle serialization and fail-closed external proposals; model costs are not measured wall-clock speedups. |
+| **`D4`** | **Merged** [#358](https://github.com/Th0rgal/turbo-lean/pull/358) `a95e505` | Hardware-in-the-Loop Cost Autotuning (`Transform/CostAutotune.lean` / `D3` profile calibration) | Host calibration and compiled canonical-corpus leave-one-out pruning under Rule 7 (`ΔE2E >= 1%`); cross-target evidence requires matching hardware or supplied samples. |
 | **`D5`** | **Merged** [#348](https://github.com/Th0rgal/turbo-lean/pull/348) `af35cc6` | Zero-Alloc Stackless Async (`lean/LeanNative/Transform/AsyncStateMachine.lean`) | Lower non-escaping `IO` / `lean-sys` event loops and coroutines into flat unboxed state-machine structs with `0` heap-allocated RC closures per poll and kernel-checked state-transition equivalence. |
-| **`D6`** | Planned (after `D1` PR open & `D2` v3 push) | PTX Weak-Memory & Barrier-Generation Semantics (`lean/LeanNative/Backend/PTXAst`, `Proofs/PTXDeclProofs.lean`) | Port barrier generations (exempting already-exited threads in `stepCTABarrier`) plus an optional per-thread oracle and axiomatic `po`/`rf`/`co`/`sw` consistency over `BitVec 64` and `PTXOutcome` UB/race traps so `.dotProduct`, relaxed cross-CTA atomics, and sequential multi-kernel launches become provable without vendoring SF Tensor or Mathlib. |
+| **`D6`** | **Merged** [#354](https://github.com/Th0rgal/turbo-lean/pull/354) `1d3e36d` | PTX Weak-Memory & Barrier-Generation Semantics (`lean/LeanNative/Backend/PTXAst`, `Proofs/PTXDeclProofs.lean`) | Barrier generations plus optional read oracle and axiomatic `po`/`rf`/`co`/`sw` consistency over `BitVec 64`, preserving UB/race traps; scope and non-goals below. |
+
+### Wave 3 native parity measurements
+
+[`BENCH_RUST_PARITY.md`](BENCH_RUST_PARITY.md): eight actual canonical kernels,
+optimized LeanNative/Rust time geomean **0.875412×** on Boat Zen 5, with
+algorithm-sensitive EVM wins and array-kernel gaps. Includes D1/D2/D5 limited
+isolation and real D3/D4 receipts; missing requested kernels and measurement
+gaps are explicit. Reproduce: `python3 scripts/bench_rust_parity.py --trials 7 --json /tmp/bench_rust_parity.json`.
 
 ### Track `D6` Scope & Explicit Non-Goals (`PTXAst` & `PTXDeclProofs.lean`)
 
 `D6` is a `PTXAst` operational/axiomatic semantics repair — not a BendRT item and not a vendor of SF Tensor (closed source, Mathlib-dependent, models floats as `ℝ`, and assumes UB away). Scoped strictly to `lean/LeanNative/Backend/PTXAst` and `lean/LeanNative/Proofs/PTXDeclProofs.lean`, `D6` ports only:
 
-1. **Barrier generations exempting exited threads:** Track per-barrier generation epochs so threads that have already legally executed `ret` are exempt at `bar.sync`, fixing `stepCTABarrier` (`lean/LeanNative/Backend/PTXAst/Eval.lean:1333–1341`), which currently traps legal early-`ret` kernels with `PTXOutcome.barrierDivergence`.
+1. **Barrier generations exempting exited threads:** Merged per-barrier generation epochs exempt threads that have already legally executed `ret` at `bar.sync`, repairing the earlier `stepCTABarrier` early-`ret` divergence behavior in `lean/LeanNative/Backend/PTXAst/Eval.lean`.
 2. **Optional per-thread oracle + axiomatic `po`/`rf`/`co`/`sw` consistency:** Layer an optional per-thread read oracle and `po`/`rf`/`co`/`sw` consistency predicate while preserving `BitVec 64` values and every existing `PTXOutcome` UB/data-race trap, making `.dotProduct` (currently rejected by `wfPTXKernel` at `lean/LeanNative/Backend/PTXLower.lean:354–356`, `kernelArity` at `:351–352`), relaxed cross-CTA atomics, and sequential multi-kernel launches provable.
 3. **Explicit non-goals:** IEEE-754 bit-exactness stays; zero Mathlib dependency; zero claims below `ptxas`; and `D6` does not by itself wire `lowerDeclToPTX` into `emitPTXModule` (`lean/LeanNative/Backend/MLIRGPU.lean:527`) — unifying that split remains a separate item.
 
@@ -115,6 +121,7 @@ Once [#349](https://github.com/Th0rgal/turbo-lean/pull/349) merges, align `roadm
 | PR | Head | Title |
 | --- | --- | --- |
 | [#320](https://github.com/Th0rgal/turbo-lean/pull/320) | `3ff77b4` | fix(fastcheck): certify counterexamples only via statement re-evaluation |
-| [#343](https://github.com/Th0rgal/turbo-lean/pull/343) | `4166e54` | feat(pr-verify): fast proof-only overlay, prebuilt dep closure, and disposable snapshot seeding |
-| [#347](https://github.com/Th0rgal/turbo-lean/pull/347) | `0dfee45` | feat(d2): unboxed repr(C) regions, portable SIMD layouts & thread-local RC ownership |
+| [#343](https://github.com/Th0rgal/turbo-lean/pull/343) | `db3732f` | feat(pr-verify): fast proof-only overlay, prebuilt dep closure, and disposable snapshot seeding |
 | [#349](https://github.com/Th0rgal/turbo-lean/pull/349) | `32b9311` | docs(roadmap): add BendRT exploration proposal (B0-B6) *(docs-only; outside the `D`-track critical path)* |
+| [#353](https://github.com/Th0rgal/turbo-lean/pull/353) | `ea165f0` | feat(speed4): public-signature early cutoff, impact, check --allow-sorry, and timeout hotspots |
+| [#360](https://github.com/Th0rgal/turbo-lean/pull/360) | `cb726fe` | feat(bridge,driver): C8 ByteArray/FloatArray slice bridge lowering & standalone libleanrt.a build |

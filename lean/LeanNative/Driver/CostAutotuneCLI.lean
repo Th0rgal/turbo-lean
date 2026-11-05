@@ -4,6 +4,10 @@ import LeanNative.Semantics.Eval
 import LeanNative.Backend.LLVM
 import LeanNative.Transform.Superopt
 import LeanNative.Transform.CostAutotune
+import LeanNative.Transform.AsyncStateMachine
+import LeanNative.Transform.Pass
+import LeanNative.Transform.Plugins
+import LeanNative.Frontend.ProofRetention
 
 namespace LeanNative.Driver.CostAutotuneCLI
 
@@ -358,7 +362,22 @@ def verifyAndAccumulateCorpus (baseMod candMod : LNIRModule) (iters : Nat) :
     throw "canonical corpus rolling checksum diverged"
   return (checksumB, checksumC)
 
-private def nativeHarnessCSource : String :=
+private def renderCanonicalHarnessC (paired : Bool) : String :=
+  let variants := if paired then ["r_", "b_", "o_"] else [""]
+  let declarations := String.join (variants.map fun p =>
+    ("extern uint64_t $collatz_steps(uint64_t,uint64_t), $tuple_accum_sum(uint64_t,uint64_t);
+extern void *$sarray_scale_bias(void*,uint64_t,uint64_t), *$dot_product_u64(void*,void*), *$saxpy_kernel(void*,void*), *$matmul_tiled_u64(void*,void*,void*);
+extern void $bench_erc20(void*,void*,const void*,const void*,const void*), $bench_muldiv(void*,const void*,const void*,const void*);
+".replace "$" p))
+  let entries := variants.map fun p =>
+    let features := if !paired then "0,0,0" else if p == "r_" then "r_d5,r_d1,r_d2"
+      else if p == "b_" then "d5_heap,d1_base,d2_base" else "d5_stackless,d1_opt,d2_opt"
+    "{" ++ String.intercalate "," ((["collatz_steps", "tuple_accum_sum", "sarray_scale_bias",
+      "dot_product_u64", "saxpy_kernel", "matmul_tiled_u64", "bench_erc20", "bench_muldiv"].map (p ++ ·)) ++
+      [features]) ++ "}"
+  "#define PAIRED " ++ (if paired then "1\n" else "0\n") ++
+  "static const char *names[] = {" ++ String.intercalate "," (canonicalCorpusDeclNames.map (fun n => "\"" ++ n ++ "\"")) ++ "};\n" ++
+  "#include <stdint.h>\n" ++ declarations ++
 "#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -399,206 +418,81 @@ uint64_t lean_native_trm_matryoshka_parity_u64(uint64_t x) {
   return (uint64_t)(__builtin_popcountll(x) & 1);
 }
 
-extern uint64_t collatz_steps(uint64_t n, uint64_t steps);
-extern uint64_t tuple_accum_sum(uint64_t n, uint64_t seed);
-extern void *sarray_scale_bias(void *arr, uint64_t scale, uint64_t bias);
-extern void *dot_product_u64(void *xs, void *ys);
-extern void *saxpy_kernel(void *xs, void *ys);
-extern void *matmul_tiled_u64(void *a, void *b, void *c);
-extern void bench_erc20(void *out, void *m, const void *s, const void *r, const void *amt);
-extern void bench_muldiv(void *out, const void *a, const void *b, const void *wad);
-
-static u256_t evm_erc20_transfer_u256(void *m, u256_t s, u256_t r, u256_t amt) {
-  u256_t out;
-  bench_erc20(&out, m, &s, &r, &amt);
-  return out;
+#if PAIRED
+extern uint64_t d5_stackless(uint64_t), d5_heap(uint64_t), r_d5(uint64_t);
+extern void *d1_base(void*), *d1_opt(void*), *r_d1(void*);
+extern uint64_t d2_base(void*), d2_opt(void*), r_d2(void*);
+#endif
+typedef struct {
+  uint64_t (*collatz)(uint64_t,uint64_t), (*tuple)(uint64_t,uint64_t);
+  void *(*scale)(void*,uint64_t,uint64_t), *(*dot)(void*,void*), *(*saxpy)(void*,void*), *(*matmul)(void*,void*,void*);
+  void (*erc20)(void*,void*,const void*,const void*,const void*), (*muldiv)(void*,const void*,const void*,const void*);
+  uint64_t (*async)(uint64_t); void *(*exclusive)(void*); uint64_t (*rc)(void*);
+} variant_t;
+static const variant_t variants[] = {" ++ String.intercalate "," entries ++ "};
+/* Small mode exactly mirrors mkDeclBenchState; timing mode uses larger inputs. */
+static uint64_t run_canonical_kernel(int variant, int k, uint64_t seed, int small) {
+  const variant_t *v = &variants[variant];
+  if(k==8) return v->async(seed);
+  if(k>=9) {
+    uint64_t a[4] = {(k==10 && variant==1)?0xffffffff:1,1,1,seed};
+    if(k==10) return v->rc(a);
+    void *out=v->exclusive(a); uint64_t h=((uint64_t*)out)[3];
+    if(out!=a) free(out); return h;
+  }
+  if(k==0) return v->collatz(17+(seed&7),small?16:128);
+  if(k==1) return v->tuple(small?16:128,seed+1);
+  if(k<6) {
+    size_t n=small?4:256;
+    uint64_t a[259]={1,n,n}, b[259]={1,n,n}, c[259]={1,n,n};
+    for(size_t i=0;i<n;i++) {
+      a[i+3]=seed+1+i*((small && k==2)?2:1);
+      b[i+3]=small?((k==5?3:2)+2*i):(2*i+3); c[i+3]=small?1:i+1;
+    }
+    void *out=k==2?v->scale(a,3,5):k==3?v->dot(a,b):k==4?v->saxpy(a,b):v->matmul(a,b,c);
+    uint64_t *raw=out,h=14695981039346656037ULL;
+    for(size_t i=0;i<raw[1];i++) h=(h^raw[i+3])*1099511628211ULL;
+    if(out!=a && out!=b && out!=c) free(out); return h;
+  }
+  u256_t out=0,a=1000+(small?(seed&15):seed),b=3000,d=100,s=10,r=20,amt=5+(seed&3);
+  evm_map_t m={.keys={10,20},.vals={1000,250},.len=2};
+  if(k==6) v->erc20(&out,&m,&s,&r,&amt); else v->muldiv(&out,&a,&b,&d);
+  uint64_t h=(uint64_t)out^(uint64_t)(out>>64)^(uint64_t)(out>>128)^(uint64_t)(out>>192);
+  return (!small && k==6)?h^(uint64_t)m.vals[0]^((uint64_t)m.vals[1]<<32):h;
 }
-
-static u256_t evm_muldiv_wad_u256(u256_t a, u256_t b, u256_t wad) {
-  u256_t out;
-  bench_muldiv(&out, &a, &b, &wad);
-  return out;
-}
-
-static void *alloc_sarray(size_t n, uint64_t seed) {
-  uint64_t *raw = (uint64_t *)malloc(24 + n * sizeof(uint64_t));
-  *(int32_t *)raw = 1;
-  *((int32_t *)raw + 1) = 0;
-  raw[1] = (uint64_t)n;
-  raw[2] = (uint64_t)n;
-  for (size_t i = 0; i < n; ++i) raw[3 + i] = seed + (uint64_t)(i * 3 + 1);
-  return raw;
-}
-
-static uint64_t hash_sarray(void *p) {
-  uint64_t *raw = (uint64_t *)p;
-  size_t n = (size_t)raw[1];
-  uint64_t h = 14695981039346656037ULL;
-  for (size_t i = 0; i < n; ++i) h = (h ^ raw[3 + i]) * 1099511628211ULL;
-  return h;
-}
-
 static uint64_t now_ns(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+  struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+  return (uint64_t)t.tv_sec*1000000000ULL+t.tv_nsec;
 }
-
-int main(void) {
-  uint64_t parity = 14695981039346656037ULL;
-  for (uint64_t seed = 0; seed < 4; ++seed) {
-    uint64_t results[8];
-    results[0] = collatz_steps(17 + (seed & 7), 16);
-    results[1] = tuple_accum_sum(16, seed + 1);
-    for (int k = 2; k < 6; ++k) {
-      void *a = alloc_sarray(4, 0), *b = alloc_sarray(4, 0), *c = alloc_sarray(4, 0);
-      for (int i = 0; i < 4; ++i) {
-        ((uint64_t *)a)[3+i] = seed + 1 + i * (k == 2 ? 2 : 1);
-        ((uint64_t *)b)[3+i] = (k == 5 ? 3 : 2) + 2*i;
-        ((uint64_t *)c)[3+i] = 1;
+int main(int argc,char **argv) {
+  int trials=1, count=PAIRED?11:8, nv=PAIRED?3:1;
+  if(PAIRED) {
+    if(argc!=2 || (trials=atoi(argv[1]))<7) return 1;
+    for(int small=0;small<2;small++) for(int k=0;k<(small?8:count);k++) for(int s=0;s<128;s++)
+      for(int v=1;v<nv;v++) if(run_canonical_kernel(v,k,s,small)!=run_canonical_kernel(0,k,s,small)) {
+        fprintf(stderr,\"parity failure kernel=%d seed=%d variant=%d small=%d\\n\",k,s,v,small); return 2;
       }
-      void *out = k == 2 ? sarray_scale_bias(a, 3, 5) :
-        k == 3 ? dot_product_u64(a, b) : k == 4 ? saxpy_kernel(a, b) : matmul_tiled_u64(a, b, c);
-      results[k] = hash_sarray(out);
-      if (out != a && out != b && out != c) free(out);
-      free(a); free(b); free(c);
-    }
-    evm_map_t mp = { .keys = {10, 20}, .vals = {1000, 250}, .len = 2 };
-    u256_t words[2] = {
-      evm_erc20_transfer_u256(&mp, 10, 20, 5 + (seed & 3)),
-      evm_muldiv_wad_u256(1000 + (seed & 15), 3000, 100)
-    };
-    for (int i = 0; i < 2; ++i) {
-      u256_t w = words[i];
-      results[6+i] = (uint64_t)w ^ (uint64_t)(w >> 64) ^ (uint64_t)(w >> 128) ^ (uint64_t)(w >> 192);
-    }
-    for (int i = 0; i < 8; ++i) parity = (((parity ^ results[i]) * 1099511628211ULL) ^ seed) * 1099511628211ULL;
+  } else {
+    uint64_t parity=14695981039346656037ULL;
+    for(int s=0;s<4;s++) for(int k=0;k<8;k++)
+      parity=((parity^run_canonical_kernel(0,k,s,1))*1099511628211ULL^s)*1099511628211ULL;
+    printf(\"PARITY_HASH %llu\\n\",(unsigned long long)parity);
   }
-  printf(\"PARITY_HASH %llu\\n\", (unsigned long long)parity);
-  const size_t N = 256;
-  uint64_t total_hash = 14695981039346656037ULL;
-
-  {
-    volatile uint64_t sink = collatz_steps(19, 64);
-    uint64_t t0 = now_ns();
-    uint64_t acc = 0;
-    for (uint64_t i = 0; i < 4000; ++i) acc += collatz_steps(17 + (i & 7), 128);
-    uint64_t dt = now_ns() - t0;
-    if (dt == 0) dt = 1;
-    total_hash = total_hash * 1099511628211ULL + acc + sink;
-    printf(\"collatz_steps %llu\\n\", (unsigned long long)dt);
+  uint64_t checksum=14695981039346656037ULL;
+  for(int t=-1;t<trials;t++) for(int k=0;k<count;k++) for(int j=0;j<nv;j++) {
+    int v=(j+t+nv)%nv; uint64_t h=0,start=now_ns();
+    for(int i=0;i<2000;i++) h=(h^run_canonical_kernel(v,k,i&127,0))*1099511628211ULL;
+    uint64_t elapsed=now_ns()-start; checksum=(checksum^h)*1099511628211ULL;
+    if(t<0) continue;
+    if(PAIRED) printf(\"%d %d %d %llu %llu\\n\",t,k,v,(unsigned long long)elapsed,(unsigned long long)h);
+    else printf(\"%s %llu\\n\",names[k],(unsigned long long)(elapsed?elapsed:1));
   }
-  {
-    volatile uint64_t sink = tuple_accum_sum(32, 3);
-    uint64_t t0 = now_ns();
-    uint64_t acc = 0;
-    for (uint64_t i = 0; i < 4000; ++i) acc += tuple_accum_sum(128, i + 1);
-    uint64_t dt = now_ns() - t0;
-    if (dt == 0) dt = 1;
-    total_hash = total_hash * 1099511628211ULL + acc + sink;
-    printf(\"tuple_accum_sum %llu\\n\", (unsigned long long)dt);
-  }
-  {
-    void *arr = alloc_sarray(N, 7);
-    arr = sarray_scale_bias(arr, 3, 5);
-    uint64_t t0 = now_ns();
-    for (uint64_t i = 0; i < 2000; ++i) arr = sarray_scale_bias(arr, 3, (i & 7) + 1);
-    uint64_t dt = now_ns() - t0;
-    if (dt == 0) dt = 1;
-    total_hash = total_hash * 1099511628211ULL + hash_sarray(arr);
-    free(arr);
-    printf(\"sarray_scale_bias %llu\\n\", (unsigned long long)dt);
-  }
-  {
-    void *xs = alloc_sarray(N, 11);
-    void *ys = alloc_sarray(N, 23);
-    void *w = dot_product_u64(xs, ys);
-    free(w);
-    uint64_t t0 = now_ns();
-    uint64_t acc = 0;
-    for (uint64_t i = 0; i < 2000; ++i) {
-      void *out = dot_product_u64(xs, ys);
-      acc += ((uint64_t *)out)[3];
-      free(out);
-    }
-    uint64_t dt = now_ns() - t0;
-    if (dt == 0) dt = 1;
-    total_hash = total_hash * 1099511628211ULL + acc;
-    free(xs); free(ys);
-    printf(\"dot_product_u64 %llu\\n\", (unsigned long long)dt);
-  }
-  {
-    void *xs = alloc_sarray(N, 5);
-    void *ys = alloc_sarray(N, 9);
-    xs = saxpy_kernel(xs, ys);
-    uint64_t t0 = now_ns();
-    for (uint64_t i = 0; i < 2000; ++i) xs = saxpy_kernel(xs, ys);
-    uint64_t dt = now_ns() - t0;
-    if (dt == 0) dt = 1;
-    total_hash = total_hash * 1099511628211ULL + hash_sarray(xs);
-    free(xs); free(ys);
-    printf(\"saxpy_kernel %llu\\n\", (unsigned long long)dt);
-  }
-  {
-    void *a = alloc_sarray(N, 3);
-    void *b = alloc_sarray(N, 7);
-    void *c = alloc_sarray(N, 13);
-    a = matmul_tiled_u64(a, b, c);
-    uint64_t t0 = now_ns();
-    for (uint64_t i = 0; i < 2000; ++i) a = matmul_tiled_u64(a, b, c);
-    uint64_t dt = now_ns() - t0;
-    if (dt == 0) dt = 1;
-    total_hash = total_hash * 1099511628211ULL + hash_sarray(a);
-    free(a); free(b); free(c);
-    printf(\"matmul_tiled_u64 %llu\\n\", (unsigned long long)dt);
-  }
-  {
-    evm_map_t mp;
-    mp.len = 2;
-    mp.keys[0] = (u256_t)10; mp.vals[0] = (u256_t)1000000000ULL;
-    mp.keys[1] = (u256_t)20; mp.vals[1] = (u256_t)500ULL;
-    (void)evm_erc20_transfer_u256(&mp, (u256_t)10, (u256_t)20, (u256_t)1);
-    uint64_t t0 = now_ns();
-    u256_t last = 0;
-    for (uint64_t i = 0; i < 4000; ++i) {
-      last = evm_erc20_transfer_u256(&mp, (u256_t)10, (u256_t)20, (u256_t)1);
-    }
-    uint64_t dt = now_ns() - t0;
-    if (dt == 0) dt = 1;
-    total_hash = total_hash * 1099511628211ULL + (uint64_t)last;
-    printf(\"evm_erc20_transfer_u256 %llu\\n\", (unsigned long long)dt);
-  }
-  {
-    volatile u256_t sink = evm_muldiv_wad_u256((u256_t)1000, (u256_t)3000, (u256_t)100);
-    uint64_t t0 = now_ns();
-    uint64_t acc = 0;
-    for (uint64_t i = 0; i < 4000; ++i) {
-      u256_t r = evm_muldiv_wad_u256((u256_t)(1000 + (i & 15)), (u256_t)3000, (u256_t)100);
-      acc += (uint64_t)r;
-    }
-    uint64_t dt = now_ns() - t0;
-    if (dt == 0) dt = 1;
-    total_hash = total_hash * 1099511628211ULL + acc + (uint64_t)sink;
-    printf(\"evm_muldiv_wad_u256 %llu\\n\", (unsigned long long)dt);
-  }
-
-  printf(\"CHECKSUM %llu\\n\", (unsigned long long)total_hash);
+  if(!PAIRED) printf(\"CHECKSUM %llu\\n\",(unsigned long long)checksum);
   return 0;
 }
 "
 
-private def removeIfExists (p : System.FilePath) : IO Unit := do
-  try IO.FS.removeFile p catch _ => pure ()
-
-private def compileAndRunModuleHarness (mod : LNIRModule) (hostArch : TargetArch)
-    (tag : String) : IO (List (String × Nat) × UInt64) := do
-  let stamp ← IO.monoNanosNow
-  let stem := s!"/tmp/turbo_lean_d4_{tag}_{stamp}"
-  let llPath : System.FilePath := s!"{stem}.ll"
-  let cPath : System.FilePath := s!"{stem}.c"
-  let binPath : System.FilePath := s!"{stem}.bin"
-  try
-    let wrappers := "
+private def evmAbiWrappersLLVM : String := "
 define void @bench_erc20(ptr %out, ptr %m, ptr %s, ptr %r, ptr %amt) {
 entry:
   %sv = load i256, ptr %s, align 1
@@ -618,9 +512,57 @@ entry:
   ret void
 }
 "
-    let ir := emitLLVMOptimized mod hostArch ++ wrappers
+private def featureModule : LNIRModule := Id.run do
+  let decl := fun name body => ({
+    name := name, body := body
+    params := [{id := 0, name := "seed", ty := .i64, borrow := false}],
+    retTy := .i64, assurance := .verifiedKernelProof } : LNIRDecl)
+  let ptrDecl := fun name body retTy => { (decl name body) with
+    params := [{id := 0, name := "arr", ty := .sarray .i64, borrow := false}], retTy }
+  let ex := LNIRCode.letBind 1 (.sarray .i64) (.sarrayEnsureExclusive 0 .i64)
+    (.letBind 2 (.sarray .i64) (.sarrayEnsureExclusive 1 .i64) (.ret 2))
+  let rc := LNIRCode.incRef 0 1 (.decRef 0 1 (.letBind 1 .i64 (.sarrayLen 0) (.ret 1)))
+  return { moduleName := "Wave3Features", decls := [
+    decl "d5_stackless" (optimizeAsyncStateMachine (lowerAsyncAwaitChain (mkThreeStepAsyncSpec 0 10 16 5 7 9))),
+    decl "d5_heap" (lowerHeapClosureAsync3 0 10 5 7 9),
+    ptrDecl "d1_base" ex (.sarray .i64),
+    ptrDecl "d1_opt" (LeanNative.Frontend.ProofRetention.dischargeLocalExclusivity ex) (.sarray .i64),
+    ptrDecl "d2_base" rc .i64, ptrDecl "d2_opt" (elideBorrowedAndThreadLocalRC 0 rc) .i64] }
+
+/-- Namespace definitions and their references, preserving external runtime ABI symbols. -/
+private def namespaceLLVM (pfx ir : String) : String :=
+  let names := (ir.splitOn "\n").filterMap fun line => do
+    if !line.startsWith "define " then none else
+      let after ← (line.splitOn "@")[1]?
+      pure ((after.splitOn "(").headD "")
+  names.foldl (fun text name => text.replace ("@" ++ name ++ "(") ("@" ++ pfx ++ name ++ "(")) ir
+
+private def emitParityHarness (dir : System.FilePath) : IO Unit := do
+  let _ ← checkHost "x86_64" (HardwareCostProfile.forTarget .x86_64)
+  IO.FS.createDirAll dir
+  let m := mkCanonicalBenchmarkModule8
+  for (pfx, ir) in [("b_", emitLLVMBaseline m .x86_64),
+      ("o_", emitLLVMOptimized (runDefaultPipeline m).1 .x86_64)] do
+    IO.FS.writeFile (dir / s!"{pfx}module.ll") (namespaceLLVM pfx (ir ++ evmAbiWrappersLLVM))
+  IO.FS.writeFile (dir / "features.ll") (emitLLVMOptimized featureModule .x86_64)
+  IO.FS.writeFile (dir / "harness.c") (renderCanonicalHarnessC true)
+  IO.FS.writeFile (dir / "names.json") (toJson (canonicalCorpusDeclNames ++
+    ["d5_async_three_await", "d1_local_exclusivity", "d2_thread_local_rc"])).compress
+
+private def removeIfExists (p : System.FilePath) : IO Unit := do
+  try IO.FS.removeFile p catch _ => pure ()
+
+private def compileAndRunModuleHarness (mod : LNIRModule) (hostArch : TargetArch)
+    (tag : String) : IO (List (String × Nat) × UInt64) := do
+  let stamp ← IO.monoNanosNow
+  let stem := s!"/tmp/turbo_lean_d4_{tag}_{stamp}"
+  let llPath : System.FilePath := s!"{stem}.ll"
+  let cPath : System.FilePath := s!"{stem}.c"
+  let binPath : System.FilePath := s!"{stem}.bin"
+  try
+    let ir := emitLLVMOptimized mod hostArch ++ evmAbiWrappersLLVM
     IO.FS.writeFile llPath ir
-    IO.FS.writeFile cPath nativeHarnessCSource
+    IO.FS.writeFile cPath (renderCanonicalHarnessC false)
     let cc ← IO.Process.output {
       cmd := "clang"
       args := #["-O2", "-Wno-override-module", llPath.toString, cPath.toString, "-o", binPath.toString]
@@ -723,6 +665,10 @@ def validateFlagValues (flags : List String) : List String → IO Unit
 
 def run (args : List String) : IO UInt32 := do
   try
+    if let ["--emit-parity-harness", dir] := args then
+      if dir.isEmpty || dir.startsWith "-" then throw <| IO.userError "--emit-parity-harness requires a directory"
+      emitParityHarness dir
+      return 0
     let opts ← IO.ofExcept (parseOptions args)
     let some base := calibrationPreset opts.target
       | throw <| IO.userError s!"unknown calibration target '{opts.target}'"
