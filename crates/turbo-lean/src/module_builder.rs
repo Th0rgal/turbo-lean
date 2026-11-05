@@ -7651,8 +7651,17 @@ impl Clone for DepImportMemo {
 }
 
 pub(crate) struct CachedPkgManifest {
-    raw: Option<Result<VerifiedDepManifest, ()>>,
-    validated: Option<VerifiedDepManifest>,
+    pub(crate) raw: Option<Result<VerifiedDepManifest, ()>>,
+    pub(crate) validated: Option<VerifiedDepManifest>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CutoffPinBaseline {
+    pub(crate) full_dig: String,
+    pub(crate) export_dig: String,
+    pub(crate) meta_dig: String,
+    pub(crate) cuts_off_public: bool,
+    pub(crate) cuts_off_meta: bool,
 }
 
 #[derive(Default)]
@@ -7661,8 +7670,98 @@ pub(crate) struct LakeClosureCache {
     exp_memo: HashMap<(PathBuf, String, bool), Option<LakeModuleExportInfo>>,
     pb_exp_memo: HashMap<(PathBuf, bool), Option<LakeModuleExportInfo>>,
     pinned_memo: HashSet<(PathBuf, String, String, bool)>,
+    cutoff_pins: HashMap<(PathBuf, String), CutoffPinBaseline>,
     pub(crate) post_lake_refresh: bool,
     pub(crate) ignore_mtime_skew: bool,
+}
+
+impl LakeClosureCache {
+    pub(crate) fn seed_module_export_info(
+        &mut self,
+        pkg_root: PathBuf,
+        module_name: String,
+        strict_policy: bool,
+        info: LakeModuleExportInfo,
+    ) {
+        self.exp_memo
+            .insert((pkg_root, module_name, strict_policy), Some(info));
+    }
+
+    pub(crate) fn seed_cutoff_module_pin(
+        &mut self,
+        pkg_root: PathBuf,
+        module_name: String,
+        baseline: CutoffPinBaseline,
+    ) {
+        self.cutoff_pins.insert((pkg_root, module_name), baseline);
+    }
+
+    pub(crate) fn matches_cutoff_pin(
+        &self,
+        pkg_root: &Path,
+        module_name: &str,
+        req: &ImportPinSpec<'_>,
+    ) -> Option<bool> {
+        let base = self
+            .cutoff_pins
+            .get(&(pkg_root.to_path_buf(), module_name.to_string()))?;
+        let ok = match req.tier_pin {
+            Some((DepImportVisibility::PublicExport, exp)) => {
+                base.cuts_off_public
+                    && !exp.is_empty()
+                    && (exp == base.export_dig || req.full_pin == base.full_dig)
+            }
+            Some((DepImportVisibility::MetaExport, meta)) => {
+                base.cuts_off_meta
+                    && !meta.is_empty()
+                    && (meta == base.meta_dig || req.full_pin == base.full_dig)
+            }
+            _ => false,
+        };
+        Some(ok)
+    }
+
+    pub(crate) fn allows_cutoff_parsed_import(
+        &self,
+        pkg_root: &Path,
+        module_name: &str,
+        is_importer_module: bool,
+        sub_imp: &ParsedImport,
+    ) -> Option<bool> {
+        let base = self
+            .cutoff_pins
+            .get(&(pkg_root.to_path_buf(), module_name.to_string()))?;
+        if !is_importer_module || sub_imp.import_all {
+            return Some(false);
+        }
+        Some(if sub_imp.is_meta {
+            base.cuts_off_meta
+        } else {
+            base.cuts_off_public
+        })
+    }
+
+    pub(crate) fn load_pkg_manifest<'a>(
+        &'a mut self,
+        cfg: &ProjectConfig,
+        spec: &DiscoveredModuleSpec,
+        strict_policy: bool,
+    ) -> Option<&'a CachedPkgManifest> {
+        load_cached_pkg_manifest(&mut self.manifests, cfg, spec, strict_policy)
+    }
+
+    pub(crate) fn insert_pre_pkg_manifest(
+        &mut self,
+        pkg_root: PathBuf,
+        strict_policy: bool,
+        raw: Option<Result<VerifiedDepManifest, ()>>,
+        validated: Option<VerifiedDepManifest>,
+    ) {
+        self.manifests.insert(
+            (pkg_root, strict_policy),
+            CachedPkgManifest { raw, validated },
+        );
+    }
 }
 
 fn load_cached_pkg_manifest<'a>(
@@ -7763,14 +7862,14 @@ pub(crate) fn resolve_import_site(cfg: &ProjectConfig, imp: &str) -> ImportSite 
     }
 }
 
-fn spec_olean_path(spec: &DiscoveredModuleSpec) -> PathBuf {
+pub(crate) fn spec_olean_path(spec: &DiscoveredModuleSpec) -> PathBuf {
     spec.build_lib_lean_dir.join(format!(
         "{}.olean",
         module_name_to_rel_slash(&spec.module_name)
     ))
 }
 
-fn spec_rel_src(spec: &DiscoveredModuleSpec) -> String {
+pub(crate) fn spec_rel_src(spec: &DiscoveredModuleSpec) -> String {
     spec.src_path
         .strip_prefix(&spec.pkg_root)
         .unwrap_or(&spec.src_path)
@@ -7913,7 +8012,7 @@ pub(crate) fn import_pin_fresh_for_build(
     import_pin_current_with_policy(cfg, &non_strict_memo, cache, imp, pin, false)
 }
 
-fn import_pin_current_with_policy(
+pub(crate) fn import_pin_current_with_policy(
     cfg: &ProjectConfig,
     memo: &DepImportMemo,
     cache: &mut LakeClosureCache,
@@ -7985,7 +8084,7 @@ fn entry_matches_import_pin_spec(
 }
 
 /// Whether `olean`'s artifact set digests to `pin`, read-only (never creating `.turbo_publish.lock`).
-fn olean_digest_is(_cfg: &ProjectConfig, olean: &Path, pin: &str) -> bool {
+pub(crate) fn olean_digest_is(_cfg: &ProjectConfig, olean: &Path, pin: &str) -> bool {
     compute_olean_artifact_set_digest_with_policy(olean, true).is_ok_and(|d| d == pin)
 }
 
@@ -8510,6 +8609,15 @@ fn prebuilt_closure_export_info(
                     )?
                 }
                 ImportSite::Module(sub_spec) => {
+                    if cache.allows_cutoff_parsed_import(
+                        &sub_spec.pkg_root,
+                        &sub_spec.module_name,
+                        is_mod,
+                        sub_imp,
+                    ) == Some(false)
+                    {
+                        return None;
+                    }
                     if collect_pairs {
                         local_pairs.push((sub_imp.module.clone(), spec_olean_path(&sub_spec)));
                     }
@@ -8567,7 +8675,7 @@ fn prebuilt_closure_export_info(
     res
 }
 
-fn prebuilt_olean_export_info(
+pub(crate) fn prebuilt_olean_export_info(
     cfg: &ProjectConfig,
     strict_policy: bool,
     olean_path: &Path,
@@ -8612,7 +8720,7 @@ fn collect_fresh_prebuilt_closure(
 /// Fail-closed Lake/turbo closure verifier for `spec`, returning its `LakeModuleExportInfo` only
 /// when `spec` and every transitive import are proven current against sources, toolchain/options,
 /// sidecars, and import export hashes (or turbo manifest pins).
-fn lake_closure_export_info(
+pub(crate) fn lake_closure_export_info(
     cfg: &ProjectConfig,
     spec: &DiscoveredModuleSpec,
     strict_policy: bool,
@@ -8816,32 +8924,47 @@ fn lake_closure_export_info_inner(
                 ImportSite::Module(sub_spec) => {
                     let sub_olean = spec_olean_path(&sub_spec);
                     if let Some(pin_spec) = recorded_pin_spec {
-                        let pin_matches = olean_digest_is(cfg, &sub_olean, pin_spec.full_pin)
-                            || fs::read_to_string(&sub_spec.src_path)
-                                .ok()
-                                .map(|s| parse_header_info(&s))
-                                .filter(|sh| sh.header_error.is_none() && sh.is_module)
-                                .is_some_and(|_| match pin_spec.tier_pin {
-                                    Some((DepImportVisibility::PublicExport, exp)) => {
-                                        !exp.is_empty()
-                                            && compute_dep_export_olean_digest_with_policy(
-                                                &sub_olean, true,
-                                            )
-                                            .is_ok_and(|d| d == exp)
-                                    }
-                                    Some((DepImportVisibility::MetaExport, meta)) => {
-                                        !meta.is_empty()
-                                            && compute_dep_meta_olean_digest_with_policy(
-                                                &sub_olean, true,
-                                            )
-                                            .is_ok_and(|d| d == meta)
-                                    }
-                                    _ => false,
-                                });
+                        let pin_matches = if let Some(cutoff_ok) = cache.matches_cutoff_pin(
+                            &sub_spec.pkg_root,
+                            &sub_spec.module_name,
+                            &pin_spec,
+                        ) {
+                            cutoff_ok
+                        } else {
+                            olean_digest_is(cfg, &sub_olean, pin_spec.full_pin)
+                                || fs::read_to_string(&sub_spec.src_path)
+                                    .ok()
+                                    .map(|s| parse_header_info(&s))
+                                    .filter(|sh| sh.header_error.is_none() && sh.is_module)
+                                    .is_some_and(|_| match pin_spec.tier_pin {
+                                        Some((DepImportVisibility::PublicExport, exp)) => {
+                                            !exp.is_empty()
+                                                && compute_dep_export_olean_digest_with_policy(
+                                                    &sub_olean, true,
+                                                )
+                                                .is_ok_and(|d| d == exp)
+                                        }
+                                        Some((DepImportVisibility::MetaExport, meta)) => {
+                                            !meta.is_empty()
+                                                && compute_dep_meta_olean_digest_with_policy(
+                                                    &sub_olean, true,
+                                                )
+                                                .is_ok_and(|d| d == meta)
+                                        }
+                                        _ => false,
+                                    })
+                        };
                         if !pin_matches {
                             return None;
                         }
-                    } else if manifest_entry.is_some() {
+                    } else if manifest_entry.is_some()
+                        || cache.allows_cutoff_parsed_import(
+                            &sub_spec.pkg_root,
+                            &sub_spec.module_name,
+                            is_mod,
+                            sub_imp,
+                        ) == Some(false)
+                    {
                         return None;
                     }
                     if collect_pairs {
@@ -9043,20 +9166,20 @@ fn lake_closure_export_info_inner(
 /// dependency-package modules recursively, root ones kernel-audited under `strict_policy`;
 /// prebuilt imports re-digested).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct OwnedImportPinSpec {
-    full_pin: String,
-    tier_pin: Option<(DepImportVisibility, String)>,
+pub(crate) struct OwnedImportPinSpec {
+    pub(crate) full_pin: String,
+    pub(crate) tier_pin: Option<(DepImportVisibility, String)>,
 }
 
 impl OwnedImportPinSpec {
-    fn from_spec(spec: ImportPinSpec<'_>) -> Self {
+    pub(crate) fn from_spec(spec: ImportPinSpec<'_>) -> Self {
         Self {
             full_pin: spec.full_pin.to_string(),
             tier_pin: spec.tier_pin.map(|(v, d)| (v, d.to_string())),
         }
     }
 
-    fn as_spec(&self) -> ImportPinSpec<'_> {
+    pub(crate) fn as_spec(&self) -> ImportPinSpec<'_> {
         ImportPinSpec {
             full_pin: &self.full_pin,
             tier_pin: self.tier_pin.as_ref().map(|(v, d)| (*v, d.as_str())),
@@ -9064,7 +9187,7 @@ impl OwnedImportPinSpec {
     }
 }
 
-fn dep_pkg_import_pins_consistent(
+pub(crate) fn dep_pkg_import_pins_consistent(
     cfg: &ProjectConfig,
     memo: &DepImportMemo,
     cache: &mut LakeClosureCache,
@@ -9077,8 +9200,16 @@ fn dep_pkg_import_pins_consistent(
     };
     let mut seen: HashMap<(PathBuf, String), String> = HashMap::new();
     let mut stack = vec![(spec, OwnedImportPinSpec::from_spec(pin_spec))];
+    let use_global_memo = cache.cutoff_pins.is_empty();
     while let Some((cur, req)) = stack.pop() {
         let key = (cur.pkg_root.clone(), cur.module_name.clone());
+        let req_spec = req.as_spec();
+        if let Some(cutoff_ok) = cache.matches_cutoff_pin(&key.0, &key.1, &req_spec) {
+            if !cutoff_ok {
+                return false;
+            }
+            continue;
+        }
         let rel_src = spec_rel_src(&cur);
         let Some(cached_manifest) =
             load_cached_pkg_manifest(&mut cache.manifests, cfg, &cur, strict_policy)
@@ -9155,7 +9286,9 @@ fn dep_pkg_import_pins_consistent(
             strict_policy,
         );
         if cache.pinned_memo.contains(&cache_pin_key)
-            || (strict_policy && memo.0.lock().is_ok_and(|m| m.contains(&memo_key)))
+            || (strict_policy
+                && use_global_memo
+                && memo.0.lock().is_ok_and(|m| m.contains(&memo_key)))
         {
             continue;
         }
@@ -9207,7 +9340,7 @@ fn dep_pkg_import_pins_consistent(
             .pinned_memo
             .insert((pkg.clone(), module.clone(), pin.clone(), strict_policy));
     }
-    if strict_policy {
+    if strict_policy && use_global_memo {
         if let Ok(mut m) = memo.0.lock() {
             m.extend(
                 seen.into_iter()
@@ -13260,14 +13393,14 @@ fn lake_input_hash(val: &serde_json::Value) -> Result<u64> {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct LakeModuleExportInfo {
-    arts_trace: u64,
-    meta_arts_trace: u64,
-    all_arts_trace: u64,
-    trans_trace: u64,
-    meta_trans_trace: u64,
-    all_trans_trace: u64,
-    legacy_trans_trace: u64,
+pub(crate) struct LakeModuleExportInfo {
+    pub(crate) arts_trace: u64,
+    pub(crate) meta_arts_trace: u64,
+    pub(crate) all_arts_trace: u64,
+    pub(crate) trans_trace: u64,
+    pub(crate) meta_trans_trace: u64,
+    pub(crate) all_trans_trace: u64,
+    pub(crate) legacy_trans_trace: u64,
 }
 
 fn verify_and_hash_artifact_bytes(
@@ -13318,7 +13451,7 @@ fn verify_and_hash_artifact_bytes(
     Ok(actual_h)
 }
 
-fn compute_lake_export_info(
+pub(crate) fn compute_lake_export_info(
     cfg: &ProjectConfig,
     dag: &ModuleDag,
     requester: &ModuleNode,
@@ -14017,7 +14150,10 @@ pub fn write_lake_module_hashes_and_trace(
     Ok(())
 }
 
-fn compute_module_raw_import_dynlibs(dag: &ModuleDag, node: &ModuleNode) -> Vec<PathBuf> {
+pub(crate) fn compute_module_raw_import_dynlibs(
+    dag: &ModuleDag,
+    node: &ModuleNode,
+) -> Vec<PathBuf> {
     let imps = if node.precompile_modules {
         compute_ordered_trans_imports(dag, node)
     } else {
