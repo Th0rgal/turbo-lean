@@ -1,9 +1,10 @@
 # Wave 3: Rust versus LeanNative native parity
 
-Measured on main **`a95e5051ab3b4ce5611872b7bccd173c74995381`**, after D0–D6
-merged. The eight **actual canonical LNIR** workloads have optimized
-LeanNative/Rust time geomean **0.872236×** (1.14648× reciprocal speedup,
-114.65% relative throughput); baseline emission is **2.228345×** Rust time.
+Measured on the shared-harness refactor atop **`afdc92bf71ef9faca83fe2711871554f9e4473da`**,
+after D0–D6 merged (JSON records that parent HEAD; measurements include this
+commit's working-tree refactor). The eight **actual canonical LNIR** workloads have
+optimized LeanNative/Rust time geomean **0.875412×** (1.14232× reciprocal speedup,
+114.23% relative throughput); baseline emission is **2.184793×** Rust time.
 All 11 measured workloads passed the pre-timing checksum gate on all 128 seeds.
 This is a native-call pipeline measurement, **not** compilation latency or a
 general claim that Lean is faster than Rust. The EVM division result depends
@@ -15,18 +16,18 @@ slower than Rust. No measurements have been dropped from the final run.
 ```bash
 source /var/lib/orb-node/orb-warm/env.sh # Boat toolchain setup
 export TURBO_LEAN_TELEMETRY=off
-(cd lean && lake build lean-native-core lean-native turbo-zygote LeanNative.Proofs.AxiomAudit)
+(cd lean && lake build lean-native-core lean-native turbo-zygote LeanNative.Proofs.AxiomAudit LeanNative.Tests.CostAutotuneTests LeanNative.Tests.ProofRetentionTests)
 cargo build --release --bin turbo-lean
 python3 scripts/bench_rust_parity.py --trials 7 --json /tmp/bench_rust_parity.json
 ```
 
 The Python runner uses only the standard library. Required external tools are
-the built binaries, Lake/Lean, rustc, clang, git and lscpu. Temporary generated
+the built binaries, Lean (version reporting), rustc, clang, git and lscpu. Temporary generated
 sources/objects are removed automatically. JSON includes all seven samples,
 median, inclusive-quartile IQR, min/max, calls/s, ratios, checksums, full lscpu,
 compiler versions, source HEAD, and live D3/D4 receipts.
 
-* Boat KVM guest: AMD EPYC **4585PX 16-Core Processor**, family 26/model 68
+* Boat KVM guest: AMD **Ryzen 9 9950X 16-Core Processor**, family 26/model 68
   (Zen 5); **8 exposed vCPUs**, one thread/core, one socket. The model string
   does not mean this guest owns all 16 physical cores.
 * Linux **6.8.0-117-generic**, x86_64, glibc 2.39.
@@ -36,13 +37,21 @@ compiler versions, source HEAD, and live D3/D4 receipts.
 
 ## Methodology and coverage
 
-`lean-native-core compile --canonical-benchmark --emit-llvm [--baseline]`
-emits both production variants. Defined symbols are namespaced so both link
-with the independent Rust static library into **one executable**. The C harness
+`lean-native-core calibrate-cost --emit-parity-harness <dir>` emits baseline and
+default-pipeline optimized LLVM modules, the feature module, names manifest and
+shared C harness directly from `CostAutotuneCLI.lean`. Defined symbols are namespaced
+so both link with the independent Rust static library into **one executable**.
+There is no source-string extraction or temporary `lean --run` driver. Every
+runner subprocess receives `TURBO_LEAN_TELEMETRY=off` and the absolute checkout
+`LEAN_NATIVE_CORE_BIN`; missing binaries fail with build instructions. The C harness
 uses the same `CLOCK_MONOTONIC` timer, rotates variant order by trial, executes
 one full warmup then seven trials of 2,000 calls, and keeps rolling checksums.
 Before any timing it compares each workload's 64-bit output digest for 128
 deterministic seeds across all three variants, aborting on any mismatch.
+The shared `run_canonical_kernel` also checks eight kernels on 128 small-input seeds.
+Calibration uses the same small inputs for seeds 0–3, 16 scalar steps and four-element
+arrays matching `mkDeclBenchState`; its `PARITY_HASH` must match
+`verifyAndAccumulateCorpus mod mod 4` exactly.
 Timed checksums must also match. This is bit-exact **checksum parity on this
 input set**, not an exhaustive equivalence proof; hash collisions and uncovered
 inputs remain outside this empirical gate.
@@ -93,15 +102,15 @@ nanosecond-scale deltas and sub-percent differences are not significant wins.
 
 | Canonical workload | Rust | LN baseline | LN optimized | Ratio | Relative throughput |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `collatz_steps` | 63.4545 (1.2520) | 121.8930 (0.7438) | 63.4490 (1.7608) | 0.9999 | 100.01% |
-| `tuple_accum_sum` | 2.1440 (0.0478) | 156.2025 (1.8185) | 2.1440 (0.1500) | 1.0000 | 100.00% |
-| `sarray_scale_bias` | 260.7540 (3.7328) | 806.6710 (10.8898) | 259.3860 (4.6160) | 0.9948 | 100.53% |
-| `dot_product_u64` | 73.9385 (1.9310) | 157.9460 (2.0840) | 91.7720 (4.7138) | 1.2412 | 80.57% |
-| `saxpy_kernel` | 260.6635 (1.7028) | 323.1055 (6.1045) | 294.3820 (2.8525) | 1.1294 | 88.55% |
-| `matmul_tiled_u64` | 267.0205 (1.2298) | 360.3060 (12.6335) | 302.3875 (2.5348) | 1.1325 | 88.30% |
-| `evm_erc20_transfer_u256` | 21.0090 (0.1510) | 26.2850 (0.1450) | 15.3290 (0.0830) | 0.7296 | 137.05% |
-| `evm_muldiv_wad_u256` | 975.8485 (11.4115) | 306.5240 (1.6453) | 283.7775 (2.4323) | 0.2908 | 343.88% |
-| **8-kernel geometric mean ratio** | **1.0000** | **2.228345** | **0.872236** | **0.872236** | **114.65%** |
+| `collatz_steps` | 62.6030 (1.4773) | 120.2710 (2.8420) | 62.4925 (2.0692) | 0.9982 | 100.18% |
+| `tuple_accum_sum` | 2.2495 (0.0348) | 150.2425 (6.1743) | 2.2440 (0.0152) | 0.9976 | 100.25% |
+| `sarray_scale_bias` | 255.5200 (5.4775) | 783.0260 (15.3567) | 255.1990 (7.0940) | 0.9987 | 100.13% |
+| `dot_product_u64` | 78.0365 (3.0508) | 156.2885 (6.7978) | 92.6340 (3.3942) | 1.1871 | 84.24% |
+| `saxpy_kernel` | 258.4255 (2.4823) | 315.8080 (9.3980) | 288.2360 (6.1212) | 1.1154 | 89.66% |
+| `matmul_tiled_u64` | 261.0500 (3.6623) | 348.0335 (5.9638) | 297.9695 (3.1808) | 1.1414 | 87.61% |
+| `evm_erc20_transfer_u256` | 20.4135 (0.1620) | 26.0090 (0.5240) | 16.0050 (1.5832) | 0.7840 | 127.54% |
+| `evm_muldiv_wad_u256` | 950.4755 (2.5415) | 301.8415 (1.7885) | 278.1930 (1.6857) | 0.2927 | 341.66% |
+| **8-kernel geometric mean ratio** | **1.0000** | **2.184793** | **0.875412** | **0.875412** | **114.23%** |
 
 The geometric mean weights every kernel equally, not by total execution time.
 The EVM muldiv algorithm gap materially affects the summary; it must accompany
@@ -109,15 +118,15 @@ any citation of the geomean. Input setup and hashing can mask compute-only gaps.
 
 ## D1 / D2 / D5 feature isolation
 
-These are emitted by a temporary Lean driver importing the actual merged
+These are emitted by `CostAutotuneCLI.featureModule` using the actual merged
 implementations, not handwritten C substitutes for LeanNative. They are
 excluded from the eight-kernel geomean. Same timer, parity gate and trials.
 
 | Feature case | Rust ns (IQR) | LN control ns (IQR) | LN transformed ns (IQR) | LN/Rust |
 | --- | ---: | ---: | ---: | ---: |
-| D1 local exclusivity discharge | 2.4895 (0.3683) | 2.1240 (0.3780) | 2.1690 (0.3683) | 0.8713 |
-| D2 thread-local RC elision | 2.1190 (0.3808) | 2.1185 (0.3765) | 2.1190 (0.3830) | 1.0000 |
-| D5 three-await micro-pipeline | 2.1340 (0.0200) | 36.3275 (1.3925) | 2.1285 (0.0103) | 0.9974 |
+| D1 local exclusivity discharge | 2.4445 (0.0428) | 2.4595 (0.0402) | 2.4340 (0.0250) | 0.9957 |
+| D2 thread-local RC elision | 2.3740 (0.0105) | 2.3695 (0.0275) | 2.3845 (0.0752) | 1.0044 |
+| D5 three-await micro-pipeline | 2.0735 (0.0148) | 33.9190 (2.4273) | 2.0745 (0.0152) | 1.0005 |
 
 * **D1:** repeated `sarrayEnsureExclusive` versus
   `dischargeLocalExclusivity`, with an already-unique stack buffer. Both reduce
@@ -133,7 +142,7 @@ excluded from the eight-kernel geomean. Same timer, parity gate and trials.
   `lean_mark_mt` traversal. Such claims remain unmeasured here.
 * **D5:** `lowerHeapClosureAsync3` (three allocCtor/decRef pairs) versus
   `optimizeAsyncStateMachine (lowerAsyncAwaitChain ...)`, with deltas 5/7/9.
-  The stackless case simplifies to seed+21 and matches Rust. Its ~17.07×
+  The stackless case simplifies to seed+21 and matches Rust. Its ~16.35×
   control/transformed ratio is specific to a three-step statically known chain;
   it is not an event-loop or I/O throughput claim.
 * **D6:** `PTXAst` barrier generations and optional axiomatic memory witnesses
@@ -145,6 +154,7 @@ The runner also executes these real commands after the timed suite:
 
 ```bash
 ./lean/.lake/build/bin/lean-native-core calibrate-cost --target x86_64 --json
+export LEAN_NATIVE_CORE_BIN="$PWD/lean/.lake/build/bin/lean-native-core"
 ./target/release/turbo-lean superopt-evolve --help
 ./target/release/turbo-lean superopt-evolve --generations 2 --seed 1 --input canonical --json --no-telemetry
 ```
@@ -159,7 +169,7 @@ No LLM/solver was used in this smoke run.
 Report-run D4 `amdahlReceipt`:
 
 ```json
-{"accepted":true,"baselineNs":2038197,"candidateNs":2000549,
+{"accepted":true,"baselineNs":3338869,"candidateNs":3104929,
  "hits":1,"sitesConsidered":1,"sitesPruned":0}
 ```
 
@@ -171,21 +181,22 @@ Each operation sample ran 2,000,000 dependency-chain iterations:
 
 | Operation | elapsed ns |
 | --- | ---: |
-| add | 26,554,458 |
-| bitwise | 26,704,962 |
-| shift | 27,145,646 |
-| cmp | 30,955,837 |
-| mul | 34,480,932 |
-| div | 38,265,263 |
-| fma | 41,963,805 |
-| select | 28,821,998 |
+| add | 25,612,486 |
+| bitwise | 25,875,902 |
+| shift | 26,976,207 |
+| cmp | 31,066,279 |
+| mul | 34,606,760 |
+| div | 38,816,536 |
+| fma | 42,485,318 |
+| select | 28,903,417 |
 
 [`CostAutotuneCLI.lean`](../lean/LeanNative/Driver/CostAutotuneCLI.lean)
 actually calls `ablateSitesLeaveOneOut`, verifies compiled/evaluator parity,
-and selects retained sites. Its internal compiler uses **`clang -O2`**, separate
-executables and one timing per configuration, not this report's paired `-O3`
-seven-trial harness. The JSON exposes the aggregate receipt, not individual
-leave-one-out pairs. The accepted 1.85% aggregate time reduction is noisy;
+and selects retained sites. Both modes now share generated dispatch, input setup,
+digest and timing loops (one warmup, 2,000 calls per kernel). Calibration still uses
+**`clang -O2`**, separate executables and one timing per configuration; the paired
+report uses `-O3` and seven trials. The JSON exposes the aggregate receipt, not
+individual leave-one-out pairs. The accepted 7.01% aggregate time reduction is noisy;
 it is not an independently replicated `-O3` Amdahl result.
 
 Rule 7 requires nonzero hits and **ΔE2E ≥ 1%**, so algebraically valid scalar
@@ -193,9 +204,11 @@ rewrites should be pruned when LLVM `-O3` already canonicalizes both forms and
 their leave-one-out measurements show no benefit. That preserves the verified
 target-level equivalence while rejecting unjustified performance complexity.
 **The report run pruned zero sites.** A subsequent mandatory verification rerun
-passed all checksums and measured geomeans 2.274297× baseline / **0.868770×**
-optimized, versus 2.228345× / 0.872236× in the table. Its D4 receipt instead
-reported `accepted=false`, `baselineNs=2118333`, `candidateNs=2118333`,
+passed all checksums and measured geomeans 2.081038× baseline / **0.845106×**
+optimized, versus 2.184793× / 0.875412× in the table. It ran from `/tmp/opencode`
+with a deliberately failing core first on PATH and in inherited `LEAN_NATIVE_CORE_BIN`;
+the runner overrode both correctly. Its D4 receipt instead reported `accepted=false`,
+`baselineNs=3044237`, `candidateNs=3044237`, `hits=0`,
 `sitesConsidered=1`, `sitesPruned=1`: the lone site was pruned. Both outcomes
 are disclosed rather than selecting the favorable receipt. This variation
 reinforces the need for repeated per-site timing. We do not invent an `-O3` pruning receipt or

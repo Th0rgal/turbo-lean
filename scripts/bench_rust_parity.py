@@ -10,41 +10,14 @@ import math
 import os
 from pathlib import Path
 import platform
-import re
 import statistics
 import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 CORE = ROOT / 'lean/.lake/build/bin/lean-native-core'
-NAMES = ['collatz_steps', 'tuple_accum_sum', 'sarray_scale_bias',
-         'dot_product_u64', 'saxpy_kernel', 'matmul_tiled_u64',
-         'evm_erc20_transfer_u256', 'evm_muldiv_wad_u256']
-
-FEATURE_EMITTER = r'''
-import LeanNative.Core
-open LeanNative.IR LeanNative.Transform LeanNative.Backend
-def decl (name : String) (body : LNIRCode) : LNIRDecl := {
-  name, body, params := [{id := 0, name := "seed", ty := .i64, borrow := false}]
-  retTy := .i64, assurance := .verifiedKernelProof }
-def main (args : List String) : IO Unit := do
-  let chain := lowerAsyncAwaitChain (mkThreeStepAsyncSpec 0 10 16 5 7 9)
-  let heap := lowerHeapClosureAsync3 0 10 5 7 9
-  let ex : LNIRCode := .letBind 1 (.sarray .i64) (.sarrayEnsureExclusive 0 .i64)
-    (.letBind 2 (.sarray .i64) (.sarrayEnsureExclusive 1 .i64) (.ret 2))
-  let rc : LNIRCode := .incRef 0 1 (.decRef 0 1
-    (.letBind 1 .i64 (.sarrayLen 0) (.ret 1)))
-  let ptrDecl := fun name body retTy => { (decl name body) with
-    params := [{id := 0, name := "arr", ty := .sarray .i64, borrow := false}], retTy }
-  let m : LNIRModule := { moduleName := "Wave3Features", decls := [
-    decl "d5_stackless" (optimizeAsyncStateMachine chain),
-    decl "d5_heap" heap,
-    ptrDecl "d1_base" ex (.sarray .i64),
-    ptrDecl "d1_opt" (LeanNative.Frontend.ProofRetention.dischargeLocalExclusivity ex) (.sarray .i64),
-    ptrDecl "d2_base" rc .i64,
-    ptrDecl "d2_opt" (elideBorrowedAndThreadLocalRC 0 rc) .i64] }
-  IO.FS.writeFile (args.headD "/tmp/features.ll") (emitLLVMOptimized m .x86_64)
-'''
+TURBO = ROOT / 'target/release/turbo-lean'
+ENV = {**os.environ, 'TURBO_LEAN_TELEMETRY': 'off', 'LEAN_NATIVE_CORE_BIN': str(CORE)}
 
 RUST = r'''
 use std::ffi::c_void;
@@ -104,81 +77,18 @@ fn lean_native_evm_sstore(m:*mut c_void,s:*const W,v:*const W); }
 
 
 def run(args, **kw):
-    return subprocess.check_output(list(map(str, args)), text=True, cwd=ROOT, **kw)
+    return subprocess.check_output(list(map(str, args)), text=True, cwd=ROOT, env=ENV, **kw)
 
 
 def build(tmp):
-    # Reuse the production calibration's storage ABI and i256 pointer adapters.
-    source = (ROOT / 'lean/LeanNative/Driver/CostAutotuneCLI.lean').read_text()
-    support = source.split('private def nativeHarnessCSource : String :=\n"', 1)[1].split('extern uint64_t collatz_steps', 1)[0]
-    wrappers = source.split('let wrappers := "', 1)[1].split('"\n    let ir', 1)[0]
-    objects = []
-    emitter = tmp / 'Features.lean'
-    emitter.write_text(FEATURE_EMITTER)
-    features = tmp / 'features.ll'
-    subprocess.check_call(['lake', 'env', 'lean', '--run', str(emitter), str(features)], cwd=ROOT / 'lean')
-    feature_obj = tmp / 'features.o'
-    run(['clang', '-O3', '-march=native', '-Wno-override-module', '-c', features, '-o', feature_obj])
-    objects.append(feature_obj)
-    for prefix, flags in [('b', ['--baseline']), ('o', [])]:
-        ll = tmp / (prefix + '.ll')
-        run([CORE, 'compile', '--canonical-benchmark', '--emit-llvm', *flags, '-o', ll])
-        text = ll.read_text() + wrappers
-        # Namespace every defined symbol (including helpers), leaving external ABI alone.
-        symbols = re.findall(r'^define[^\n]*@([\w.]+)\(', text, re.M)
-        for name in sorted(set(symbols), key=len, reverse=True):
-            text = re.sub(r'@' + re.escape(name) + r'(?=\()', '@' + prefix + '_' + name, text)
-        ll.write_text(text)
-        obj = tmp / (prefix + '.o')
-        run(['clang', '-O3', '-march=native', '-Wno-override-module', '-c', ll, '-o', obj])
-        objects.append(obj)
+    run([CORE, 'calibrate-cost', '--emit-parity-harness', tmp])
     rs = tmp / 'kernels.rs'
     rs.write_text(RUST)
     lib = tmp / 'rust.a'
     run(['rustc', '-C', 'opt-level=3', '-C', 'target-cpu=native', '--crate-type=staticlib', rs, '-o', lib])
-    c = support + '\nextern uint64_t d5_stackless(uint64_t), d5_heap(uint64_t), r_d5(uint64_t);\n'
-    c += 'extern void *d1_base(void*), *d1_opt(void*), *r_d1(void*);\nextern uint64_t d2_base(void*), d2_opt(void*), r_d2(void*);\n'
-    for p in ['b', 'o', 'r']:
-        c += f'''
-extern uint64_t {p}_collatz_steps(uint64_t,uint64_t), {p}_tuple_accum_sum(uint64_t,uint64_t);
-extern void *{p}_sarray_scale_bias(void*,uint64_t,uint64_t), *{p}_dot_product_u64(void*,void*), *{p}_saxpy_kernel(void*,void*), *{p}_matmul_tiled_u64(void*,void*,void*);
-extern void {p}_bench_erc20(void*,void*,const void*,const void*,const void*), {p}_bench_muldiv(void*,const void*,const void*,const void*);
-static uint64_t {p}_run(int k,uint64_t seed) {{
- if(k==8) return {dict(b='d5_heap', o='d5_stackless', r='r_d5')[p]}(seed);
- if(k==9) {{ uint64_t a[4]={{1,1,1,seed}};void *out={dict(b='d1_base',o='d1_opt',r='r_d1')[p]}(a);uint64_t x=((uint64_t*)out)[3];if(out!=a)free(out);return x; }}
- if(k==10) {{ uint64_t a[4]={{{'0xffffffff' if p == 'b' else '1'},1,1,seed}};return {dict(b='d2_base',o='d2_opt',r='r_d2')[p]}(a); }}
- if(k==0) return {p}_collatz_steps(17+(seed&7),128);
- if(k==1) return {p}_tuple_accum_sum(128,seed+1);
- if(k<6) {{
- uint64_t a[259]={{1,256,256}}, b[259]={{1,256,256}}, c[259]={{1,256,256}};
- for(int i=0;i<256;i++){{a[i+3]=seed+i+1;b[i+3]=2*i+3;c[i+3]=i+1;}}
- void *out=k==2?{p}_sarray_scale_bias(a,3,5):k==3?{p}_dot_product_u64(a,b):k==4?{p}_saxpy_kernel(a,b):{p}_matmul_tiled_u64(a,b,c);
- uint64_t *v=out,h=14695981039346656037ULL;for(size_t i=0;i<v[1];i++)h=(h^v[i+3])*1099511628211ULL;
- if(out!=a && out!=b && out!=c)free(out);return h;
- }}
- u256_t out=0,a=1000+seed,b=3000,d=100,s=10,r=20,amt=5+(seed&3);
- if(k==6){{evm_map_t m={{.keys={{10,20}},.vals={{1000,250}},.len=2}};{p}_bench_erc20(&out,&m,&s,&r,&amt);
- return (uint64_t)out ^ (uint64_t)m.vals[0] ^ ((uint64_t)m.vals[1]<<32);}}
- {p}_bench_muldiv(&out,&a,&b,&d);return (uint64_t)out^(uint64_t)(out>>64)^(uint64_t)(out>>128)^(uint64_t)(out>>192);
-}}
-'''
-    c += r'''
-static uint64_t now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1000000000ULL+t.tv_nsec;}
-int main(int argc,char **argv){
- int trials=atoi(argv[1]);uint64_t (*f[3])(int,uint64_t)={r_run,b_run,o_run};
- /* Fail closed across every kernel and seed BEFORE any timing. */
- for(int k=0;k<11;k++)for(int s=0;s<128;s++){uint64_t x=f[0](k,s);
- for(int v=1;v<3;v++)if(f[v](k,s)!=x){fprintf(stderr,"parity failure kernel=%d seed=%d variant=%d\n",k,s,v);return 2;}}
- for(int t=-1;t<trials;t++)for(int k=0;k<11;k++)for(int j=0;j<3;j++){
- int v=(j+t+3)%3;uint64_t h=0,start=now();
- for(int i=0;i<2000;i++)h=(h^f[v](k,i&127))*1099511628211ULL;
- uint64_t elapsed=now()-start;if(t>=0)printf("%d %d %d %llu %llu\n",t,k,v,(unsigned long long)elapsed,(unsigned long long)h);
- }return 0;}
-'''
-    src = tmp / 'harness.c'
-    src.write_text(c)
     exe = tmp / 'bench'
-    run(['clang', '-O3', '-march=native', src, *objects, lib, '-ldl', '-lpthread', '-lm', '-o', exe])
+    run(['clang', '-O3', '-march=native', '-Wno-override-module', tmp / 'harness.c',
+         *sorted(tmp.glob('*.ll')), lib, '-ldl', '-lpthread', '-lm', '-o', exe])
     return exe
 
 
@@ -189,11 +99,13 @@ def main():
     args = parser.parse_args()
     if args.trials < 7:
         parser.error('at least seven trials required')
-    os.environ['TURBO_LEAN_TELEMETRY'] = 'off'
+    if not CORE.is_file() or not TURBO.is_file():
+        parser.error('missing checkout binaries; run (cd lean && lake build lean-native-core) '
+                     'and cargo build --release --bin turbo-lean')
     with tempfile.TemporaryDirectory(prefix='rust-parity-') as directory:
         exe = build(Path(directory))
         lines = run([exe, args.trials]).splitlines()
-    names = NAMES + ['d5_async_three_await', 'd1_local_exclusivity', 'd2_thread_local_rc']
+        names = json.loads((Path(directory) / 'names.json').read_text())
     samples = {(k, v): [] for k in range(len(names)) for v in range(3)}
     checksums = {}
     seen = set()
@@ -230,7 +142,7 @@ def main():
               'geomean_ratio': {label: math.exp(statistics.mean(math.log(r[label]['ratio']) for r in rows[:8]))
                                 for label in ['baseline', 'optimized']}}
     result['calibration'] = json.loads(run([CORE, 'calibrate-cost', '--target', 'x86_64', '--json']))
-    result['evolution'] = json.loads(run([ROOT / 'target/release/turbo-lean', 'superopt-evolve',
+    result['evolution'] = json.loads(run([TURBO, 'superopt-evolve',
                                         '--generations', '2', '--seed', '1', '--input', 'canonical',
                                         '--json', '--no-telemetry']))
     print(json.dumps(result, indent=2))
