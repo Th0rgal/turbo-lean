@@ -344,65 +344,88 @@ theorem CodeRefines.seqFor_congr {iv lv hv av ai : VarId} {aty : LNIRType}
     next => contradiction
 
 /-- Code-level superoptimizer preserves operational semantics (`CodeRefines`). -/
-theorem superoptCodeCore_sound (p : HardwareCostProfile) (targetLabel declName : String)
-    (code : LNIRCode) :
-    CodeRefines code (superoptCodeCore p targetLabel declName code).1 := by
-  induction code with
+theorem superoptCodeSelective_sound (p : HardwareCostProfile) (targetLabel declName : String)
+    (keepIdx : Nat → Bool) (code : LNIRCode) (nextIdx : Nat) :
+    CodeRefines code (superoptCodeSelective p targetLabel declName keepIdx code nextIdx).1 := by
+  have choose (e e' : ScalarExpr) (keep : Bool) (h : ExprRefines (.scalar e) (.scalar e')) :
+      ExprRefines (.scalar e) (.scalar (if keep then e' else e)) := by
+    split <;> first | exact h | exact ExprRefines.refl _
+  induction code generalizing nextIdx with
   | letBind dst ty val k ih =>
     cases val with
     | scalar se =>
-      simp only [superoptCodeCore]
-      exact CodeRefines.letBind_congr (superoptScalarExprCore_sound p targetLabel declName se) ih
+      simp only [superoptCodeSelective]
+      have hs := superoptScalarExprCore_sound p targetLabel declName se
+      cases he : superoptScalarExprCore p targetLabel declName se with
+      | mk se' recOpt =>
+        rw [he] at hs
+        cases recOpt with
+        | none => exact CodeRefines.letBind_congr (ExprRefines.refl _) (ih nextIdx)
+        | some r => exact CodeRefines.letBind_congr (choose se se' _ hs) (ih (nextIdx + 1))
     | _ =>
-      simp only [superoptCodeCore]
-      exact CodeRefines.letBind_congr (ExprRefines.refl _) ih
+      simp only [superoptCodeSelective]
+      exact CodeRefines.letBind_congr (ExprRefines.refl _) (ih nextIdx)
   | rawStore pv iv vv ety k ih =>
-    simp only [superoptCodeCore]
-    exact CodeRefines.rawStore_congr ih
+    simp only [superoptCodeSelective]
+    exact CodeRefines.rawStore_congr (ih nextIdx)
   | incRef ov c k ih =>
-    simp only [superoptCodeCore]
-    exact CodeRefines.incRef_congr ih
+    simp only [superoptCodeSelective]
+    exact CodeRefines.incRef_congr (ih nextIdx)
   | decRef ov c k ih =>
-    simp only [superoptCodeCore]
-    exact CodeRefines.decRef_congr ih
+    simp only [superoptCodeSelective]
+    exact CodeRefines.decRef_congr (ih nextIdx)
   | ite cv t e iht ihe =>
-    simp only [superoptCodeCore]
-    exact CodeRefines.ite_congr iht ihe
-  | seqFor _ _ _ _ _ _ _ _ ihs ihk => exact CodeRefines.seqFor_congr ihs ihk
+    simp only [superoptCodeSelective]
+    exact CodeRefines.ite_congr (iht nextIdx) (ihe _)
+  | seqFor _ _ _ _ _ _ _ _ ihs ihk =>
+    exact CodeRefines.seqFor_congr (ihs nextIdx) (ihk _)
   | parFor ov lv ins ety kern k ih =>
     cases kern with
     | customScalar idxVar inVars body =>
-      intro fuel env st v st' hsrc
-      simp only [superoptCodeCore, evalCode] at hsrc ⊢
-      cases hpar : evalParFor fuel env st lv ins (.customScalar idxVar inVars body) with
-      | error err => simp [hpar] at hsrc
-      | ok pair =>
-        rw [hpar] at hsrc
-        have hbody := superoptScalarExprCore_sound p targetLabel declName body
-        have hpar' :=
-          evalParFor_customScalar_refines fuel env st lv ins idxVar inVars body
-            (superoptScalarExprCore p targetLabel declName body).1 pair hbody hpar
-        rw [hpar']
-        exact ih fuel (env.bind ov pair.1) pair.2 v st' hsrc
+      have lift (body' : ScalarExpr) (k' : LNIRCode)
+          (hb : ExprRefines (.scalar body) (.scalar body')) (hk : CodeRefines k k') :
+          CodeRefines (.parFor ov lv ins ety (.customScalar idxVar inVars body) k)
+            (.parFor ov lv ins ety (.customScalar idxVar inVars body') k') := by
+        intro fuel env st v st' hsrc
+        simp only [evalCode] at hsrc ⊢
+        split at hsrc <;> try contradiction
+        next out heap hpar =>
+          rw [evalParFor_customScalar_refines _ _ _ _ _ _ _ _ _ (out, heap) hb hpar]
+          exact hk fuel _ _ v st' hsrc
+      simp only [superoptCodeSelective]
+      have hs := superoptScalarExprCore_sound p targetLabel declName body
+      cases he : superoptScalarExprCore p targetLabel declName body with
+      | mk body' recOpt =>
+        rw [he] at hs
+        cases recOpt with
+        | none => exact CodeRefines.parFor_congr (ih nextIdx)
+        | some r => exact lift _ _ (choose body body' _ hs) (ih (nextIdx + 1))
     | _ =>
-      simp only [superoptCodeCore]
-      exact CodeRefines.parFor_congr ih
+      simp only [superoptCodeSelective]
+      exact CodeRefines.parFor_congr (ih nextIdx)
   | ret _ =>
-    simp only [superoptCodeCore]
+    simp only [superoptCodeSelective]
     exact CodeRefines.refl _
   | unreachable =>
-    simp only [superoptCodeCore]
+    simp only [superoptCodeSelective]
     exact CodeRefines.refl _
+
+theorem superoptCodeCore_sound (p : HardwareCostProfile) (targetLabel declName : String)
+    (code : LNIRCode) : CodeRefines code (superoptCodeCore p targetLabel declName code).1 :=
+  superoptCodeSelective_sound p targetLabel declName (fun _ => true) code 0
 
 theorem superoptCode_sound (target : SuperoptTarget) (declName : String) (code : LNIRCode) :
     CodeRefines code (superoptCode target declName code).1 :=
   superoptCodeCore_sound (HardwareCostProfile.forTarget target) target.toString declName code
 
+theorem superoptDeclSelective_sound (p : HardwareCostProfile) (targetLabel : String)
+    (keepIdx : Nat → Bool) (d : LNIRDecl) (nextIdx : Nat) :
+    CodeRefines d.body (superoptDeclSelective p targetLabel keepIdx d nextIdx).1.body :=
+  superoptCodeSelective_sound p targetLabel d.name keepIdx d.body 0
+
 theorem superoptDeclCore_sound (p : HardwareCostProfile) (targetLabel : String) (d : LNIRDecl) :
-    CodeRefines d.body (superoptDeclCore p targetLabel d).1.body := by
-  unfold superoptDeclCore
-  simp only []
-  exact superoptCodeCore_sound p targetLabel d.name d.body
+    CodeRefines d.body (superoptDeclCore p targetLabel d).1.body :=
+  superoptDeclSelective_sound p targetLabel (fun _ => true) d 0
 
 /-- Declaration-level superoptimizer soundness (`superoptDecl_sound`). -/
 theorem superoptDecl_sound (target : SuperoptTarget) (d : LNIRDecl) :
@@ -410,57 +433,60 @@ theorem superoptDecl_sound (target : SuperoptTarget) (d : LNIRDecl) :
   superoptDeclCore_sound (HardwareCostProfile.forTarget target) target.toString d
 
 theorem foldl_decls_mem_acc (p : HardwareCostProfile) (targetLabel : String)
+    (keepIdx : String → Nat → Bool) (idx : Nat)
     (ds : List LNIRDecl) (dAcc : List LNIRDecl) (rAcc : List SuperoptRewriteRecord)
     (x : LNIRDecl) (hx : x ∈ dAcc) :
-    x ∈ (ds.foldl (fun (accD, accR) d =>
-      let (d', recs) := superoptDeclCore p targetLabel d
-      (accD ++ [d'], accR ++ recs)) (dAcc, rAcc)).1 := by
-  induction ds generalizing dAcc rAcc with
+    x ∈ (ds.foldl (fun (accD, accR, idx) d =>
+      let (d', recs, idx') := superoptDeclSelective p targetLabel (keepIdx d.name) d idx
+      (accD ++ [d'], accR ++ recs, idx')) (dAcc, rAcc, idx)).1 := by
+  induction ds generalizing dAcc rAcc idx with
   | nil => exact hx
   | cons d0 rest ih =>
     simp only [List.foldl]
-    exact ih (dAcc ++ [(superoptDeclCore p targetLabel d0).1])
-      (rAcc ++ (superoptDeclCore p targetLabel d0).2) (List.mem_append_left _ hx)
+    exact ih _ (dAcc ++ [(superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).1])
+      (rAcc ++ (superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).2.1)
+      (List.mem_append_left _ hx)
 
 theorem foldl_decls_refines (p : HardwareCostProfile) (targetLabel : String)
+    (keepIdx : String → Nat → Bool) (idx : Nat)
     (ds : List LNIRDecl) (dAcc : List LNIRDecl) (rAcc : List SuperoptRewriteRecord) :
-    ∀ d ∈ ds, ∃ d' ∈ (ds.foldl (fun (accD, accR) d =>
-      let (d', recs) := superoptDeclCore p targetLabel d
-      (accD ++ [d'], accR ++ recs)) (dAcc, rAcc)).1, CodeRefines d.body d'.body := by
+    ∀ d ∈ ds, ∃ d' ∈ (ds.foldl (fun (accD, accR, idx) d =>
+      let (d', recs, idx') := superoptDeclSelective p targetLabel (keepIdx d.name) d idx
+      (accD ++ [d'], accR ++ recs, idx')) (dAcc, rAcc, idx)).1, CodeRefines d.body d'.body := by
   intro d hd
-  induction ds generalizing dAcc rAcc with
+  induction ds generalizing dAcc rAcc idx with
   | nil => cases hd
   | cons d0 rest ih =>
     simp only [List.foldl, List.mem_cons] at hd ⊢
     cases hd with
     | inl heq =>
       subst d
-      refine ⟨(superoptDeclCore p targetLabel d0).1, ?_, superoptDeclCore_sound p targetLabel d0⟩
-      exact foldl_decls_mem_acc p targetLabel rest
-        (dAcc ++ [(superoptDeclCore p targetLabel d0).1])
-        (rAcc ++ (superoptDeclCore p targetLabel d0).2)
-        (superoptDeclCore p targetLabel d0).1
+      refine ⟨(superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).1, ?_,
+        superoptDeclSelective_sound p targetLabel (keepIdx d0.name) d0 idx⟩
+      exact foldl_decls_mem_acc p targetLabel keepIdx _ rest
+        (dAcc ++ [(superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).1])
+        (rAcc ++ (superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).2.1)
+        (superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).1
         (List.mem_append_right _ (List.mem_singleton.mpr rfl))
     | inr hmem =>
-      exact ih (dAcc ++ [(superoptDeclCore p targetLabel d0).1])
-        (rAcc ++ (superoptDeclCore p targetLabel d0).2) hmem
+      exact ih _ (dAcc ++ [(superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).1])
+        (rAcc ++ (superoptDeclSelective p targetLabel (keepIdx d0.name) d0 idx).2.1) hmem
+
+theorem superoptModuleSelective_sound (p : HardwareCostProfile) (keepIdx : String → Nat → Bool)
+    (m : LNIRModule) (targetLabel : String := s!"{p.target.toString}:{p.profileId}") :
+    ∀ d ∈ m.decls, ∃ d' ∈ (superoptModuleSelective p keepIdx m targetLabel).1.decls,
+      CodeRefines d.body d'.body :=
+  foldl_decls_refines p targetLabel keepIdx 0 m.decls [] []
 
 /-- Module-level superoptimizer soundness (`superoptModuleCore_sound`). -/
 theorem superoptModuleCore_sound (p : HardwareCostProfile) (targetLabel : String) (m : LNIRModule) :
     ∀ d ∈ m.decls, ∃ d' ∈ (superoptModuleCore p targetLabel m).1.decls,
-      CodeRefines d.body d'.body := by
-  intro d hd
-  unfold superoptModuleCore
-  exact foldl_decls_refines p targetLabel m.decls [] [] d hd
+      CodeRefines d.body d'.body :=
+  superoptModuleSelective_sound p (fun _ _ => true) m targetLabel
 
 /-- Module-level superoptimizer soundness (`superoptModule_sound`). -/
 theorem superoptModule_sound (target : SuperoptTarget) (m : LNIRModule) :
     ∀ d ∈ m.decls, ∃ d' ∈ (superoptModule target m).1.decls, CodeRefines d.body d'.body :=
   superoptModuleCore_sound (HardwareCostProfile.forTarget target) target.toString m
-
-/-- Profile-guided module-level superoptimizer soundness (`superoptModuleWithProfile_sound`). -/
-theorem superoptModuleWithProfile_sound (p : HardwareCostProfile) (m : LNIRModule) :
-    ∀ d ∈ m.decls, ∃ d' ∈ (superoptModuleWithProfile p m).1.decls, CodeRefines d.body d'.body :=
-  superoptModuleCore_sound p s!"{p.target.toString}:{p.profileId}" m
 
 end LeanNative.Proofs

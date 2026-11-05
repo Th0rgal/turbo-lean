@@ -80,6 +80,7 @@ const TURBO_EXPORTS: &[&str] = &[
     "leannative_verify_rc_mode_safe",
     "leannative_verify_backend_choice",
     "leannative_verify_zero_copy_slice_io",
+    "leannative_verify_e2e_gain_u64",
     "lean_native_ntt_butterfly_fused_2layer_slice",
 ];
 
