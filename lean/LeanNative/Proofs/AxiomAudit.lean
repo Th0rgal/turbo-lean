@@ -44,6 +44,7 @@ import LeanNative.Backend.MetalAst
 import LeanNative.Backend.StableHLOAst
 import LeanNative.Transform.AsyncStateMachine
 import LeanNative.Proofs.AsyncStateMachineProofs
+import LeanNative.Proofs.ProofRetentionProofs
 
 namespace LeanNative.Proofs
 
@@ -453,6 +454,21 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.optimizeThreadLocalOwnershipRC_preserves_escaping_mark_mt
   , ``LeanNative.Proofs.optimizeThreadLocalOwnershipRC_mark_mt_nonvacuous
   , ``LeanNative.Proofs.sendableRecv_preserves_disjoint
+  , ``LeanNative.Proofs.evalExpr_isExclusive_of_obj
+  , ``LeanNative.Proofs.evalExpr_ensureExclusive_of_obj
+  , ``LeanNative.Proofs.dischargeRetainedExclusivity_sound
+  , ``LeanNative.Proofs.dischargeLocalExclusivity_refines
+  , ``LeanNative.Proofs.llvmAlignedPtr_of_fact_sound
+  , ``LeanNative.Proofs.llvmOverflowFlags_of_fact_sound
+  , ``LeanNative.Proofs.llvmMulOverflowFlags_of_fact_sound
+  , ``LeanNative.Proofs.llvmSubOverflowFlags_of_fact_sound
+  , ``LeanNative.Proofs.add_nsw_poison_witness
+  , ``LeanNative.Proofs.llvmNoAliasParam_of_disjoint_sound
+  , ``LeanNative.Proofs.readBytesAt_disjoint_of_fact
+  , ``LeanNative.Proofs.launchBoundsCert_gid_lt_len
+  , ``LeanNative.Proofs.ptxBoundsFreeLoad_sound
+  , ``LeanNative.Proofs.metalBoundsFreeLoad_sound
+  , ``LeanNative.Proofs.proofRetention_pipeline_nonvacuous
   ]
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/
@@ -498,11 +514,29 @@ elab "#verify_lean_native_axioms" : command => do
     let report ← auditAllProofsCoreM auditedTheoremNames
     if !report.passed then
       throwError s!"[AxiomAudit] Kernel axiom audit FAILED! Forbidden/non-standard axioms found: {report.forbiddenAxiomsFound}"
+    let arr := report.results.toArray
+    let numChunks := (arr.size + 31) / 32
+    let mut chunks : Array Expr := #[]
+    for i in [:numChunks] do
+      let chunk := (arr.extract (i * 32) (min arr.size ((i + 1) * 32))).toList
+      chunks := chunks.push (toExpr chunk)
+    while chunks.size > 1 do
+      let mut next : Array Expr := #[]
+      let pairs := chunks.size / 2
+      for j in [:pairs] do
+        let l := chunks[2 * j]!
+        let r := chunks[2 * j + 1]!
+        next := next.push (mkApp3 (mkConst ``List.append [Level.zero]) (mkConst ``TheoremAxiomAudit) l r)
+      if chunks.size % 2 == 1 then
+        next := next.push chunks[chunks.size - 1]!
+      chunks := next
+    let resultsExpr := chunks[0]?.getD (toExpr ([] : List TheoremAxiomAudit))
+    let reportExpr := mkApp4 (mkConst ``AxiomAuditReport.mk) (toExpr report.passed) (toExpr report.theoremsAudited) resultsExpr (toExpr report.forbiddenAxiomsFound)
     addAndCompile (Declaration.defnDecl {
       name := `LeanNative.Proofs.verifiedAxiomAuditReport
       levelParams := []
       type := mkConst ``AxiomAuditReport
-      value := toExpr report
+      value := reportExpr
       hints := ReducibilityHints.abbrev
       safety := DefinitionSafety.safe
     })

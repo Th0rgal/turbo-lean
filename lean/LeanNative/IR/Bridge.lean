@@ -129,10 +129,10 @@ partial def lowerPureCode (code : Lean.Compiler.LCNF.Code .pure) : BridgeM LNIRC
   | .unreach _ => return .unreachable
 end
 
-def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
+def ingestLCNFDeclGenericWithState {pu} (decl : Lean.Compiler.LCNF.Decl pu)
     (lowerCodeFn : Lean.Compiler.LCNF.Code pu → BridgeM LNIRCode)
     (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64)
-    (allowInternalObj : Bool := false) (allowRcAdt : Bool := false) : Lean.CoreM LNIRDecl := do
+    (allowInternalObj : Bool := false) (allowRcAdt : Bool := false) : Lean.CoreM (LNIRDecl × BridgeState) := do
   let env ← getEnv
   if ← declUsesSignedScalarTransitively decl then
     Lean.throwError s!"[lean-native] Unsupported signed integer type (`Int*` / `ISize`) in `{decl.name}`"
@@ -193,15 +193,21 @@ def ingestLCNFDeclGeneric {pu} (decl : Lean.Compiler.LCNF.Decl pu)
         isGpuCand := lnirParams.all (fun p => p.ty.isGpuCompatible) && effRetTy.isGpuCompatible }
     | .extern _ =>
       Lean.throwError s!"[lean-native] Unsupported `@[extern]` declaration `{decl.name}` in Stage 1B"
-  Prod.fst <$> action.run initSt
+  action.run initSt
+
+def ingestLCNFDeclGeneric (decl : Lean.Compiler.LCNF.Decl pu) (lowerCodeFn : Lean.Compiler.LCNF.Code pu → BridgeM LNIRCode)
+    (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64)
+    (allowInternalObj : Bool := false) (allowRcAdt : Bool := false) : Lean.CoreM LNIRDecl :=
+  Prod.fst <$> ingestLCNFDeclGenericWithState decl lowerCodeFn localDeclNames arch allowInternalObj allowRcAdt
 
 def ingestLCNFImpureDecl (decl : Lean.Compiler.LCNF.Decl .impure)
     (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : Lean.CoreM LNIRDecl :=
   ingestImpureDeclViaReal decl localDeclNames arch allowRcAdt
 
 def ingestLCNFMonoDecl (decl : Lean.Compiler.LCNF.Decl .pure)
-    (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64) : Lean.CoreM LNIRDecl :=
-  ingestLCNFDeclGeneric decl lowerPureCode localDeclNames arch false
+    (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64) : Lean.CoreM LNIRDecl := do
+  let (d, endSt) ← ingestLCNFDeclGenericWithState decl lowerPureCode localDeclNames arch false
+  attachBaseDeclFactsM decl.name (extractPureDeclFactsWithBridgeState decl endSt d)
 
 def ingestModuleDecls (declNames : Array Lean.Name) (moduleName : String := "LeanNative.Ingested")
     (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : Lean.CoreM LNIRModule :=

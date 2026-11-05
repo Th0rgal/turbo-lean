@@ -1,4 +1,5 @@
 import LeanNative.IR.AST
+import LeanNative.Backend.GPUIR
 import LeanNative.Backend.PTXAst
 
 /-!
@@ -14,6 +15,7 @@ shifts, and `clz256` follow `LeanNative.Semantics.evalBinOp` / `evalUnaryOp`.
 namespace LeanNative.Backend.PTXLower
 
 open LeanNative.IR
+open LeanNative.Backend.GPUIR
 open LeanNative.Backend.PTXAst
 
 inductive PReg where
@@ -202,6 +204,26 @@ def gidSetup (doneLbl : String) : List PTXStmt :=
   , ins (.shl .b64 "%rd5" (.reg "%rd2") (i64 3))
   , ins (.add .none .u64 "%rd6" (.reg "%rd4") (.reg "%rd5")) ]
 
+/-- Same preamble as `gidSetup`, except the SIMT `setp.ge` / `bra` lane guard is omitted
+only when `launch?` explicitly certifies `gridDim.x * blockDim.x ≤ n` for `(gidVar, lenVar)`
+and `idxLt gidVar lenVar` is retained in `facts`. -/
+def gidSetupWithFacts (doneLbl : String) (facts : List RetainedFact)
+    (gidVar lenVar : VarId) (launch? : Option LaunchBoundsCert := none) : List PTXStmt :=
+  if !(launchCertCovers launch? gidVar lenVar && factMember facts (.idxLt gidVar lenVar)) then
+    gidSetup doneLbl
+  else
+    [ ins (.mov .u32 "%r0" (.sreg .ctaidX))
+    , ins (.mov .u32 "%r1" (.sreg .ntidX))
+    , ins (.mov .u32 "%r2" (.sreg .tidX))
+    , ins (.mul .wide .u32 "%rd0" (.reg "%r0") (.reg "%r1"))
+    , ins (.cvt .none .u64 .u32 "%rd1" (.reg "%r2"))
+    , ins (.add .none .u64 "%rd2" (.reg "%rd0") (.reg "%rd1"))
+    , ins (.ldParam .u64 "%rd3" "param_n")
+    , ins (.ldParam .u64 "%rd4" "param_out")
+    , ins (.cvtaToGlobal .u64 "%rd4" (.reg "%rd4"))
+    , ins (.shl .b64 "%rd5" (.reg "%rd2") (i64 3))
+    , ins (.add .none .u64 "%rd6" (.reg "%rd4") (.reg "%rd5")) ]
+
 def loadIn (k : Nat) (reg : String) : List PTXStmt :=
   [ ins (.ldParam .u64 reg s!"param_in{k}")
   , ins (.cvtaToGlobal .u64 reg (.reg reg))
@@ -282,6 +304,25 @@ def lowerKind (name : String) : ParallelKernelKind → PTXKernel
 
 def lowerToPTX (name : String) (k : ParallelKernelKind) : PTXModule where
   kernels := [lowerKind name k]
+
+/-- Fact-carrying twin of `lowerKind`: SIMT lane-guard elision requires both an explicit
+`LaunchBoundsCert` certifying `gridDim.x * blockDim.x ≤ n` and a retained `idxLt effIdx lenVar`. -/
+def lowerKindWithFacts (name : String) (facts : List RetainedFact)
+    (k : ParallelKernelKind) (idxVar lenVar : VarId)
+    (launch? : Option LaunchBoundsCert := none) : PTXKernel :=
+  match k with
+  | .dotProduct => lowerKind name .dotProduct
+  | _ =>
+    let base := lowerKind name k
+    let effIdx := match k with | .customScalar iv _ _ => iv | _ => idxVar
+    if !(launchCertCovers launch? effIdx lenVar && factMember facts (.idxLt effIdx lenVar)) then base
+    else { base with body := gidSetupWithFacts s!"$L_done_{name}" facts effIdx lenVar launch? ++
+        (base.body.drop (gidSetup s!"$L_done_{name}").length) }
+
+def lowerToPTXWithFacts (name : String) (facts : List RetainedFact)
+    (k : ParallelKernelKind) (idxVar lenVar : VarId)
+    (launch? : Option LaunchBoundsCert := none) : PTXModule where
+  kernels := [lowerKindWithFacts name facts k idxVar lenVar launch?]
 
 def ppLowered (name : String) (k : ParallelKernelKind) : String :=
   ppPTXModule (lowerToPTX name k)
@@ -381,6 +422,11 @@ def lowerDeclToPTX (d : LNIRDecl) : Option PTXModule :=
       else none
     | none => none
   else none
+
+/-- Top-level `LNIRDecl` entry kernels use rounded-up grid launches (`blockThreads = 256`) and
+therefore never synthesize a `LaunchBoundsCert` from `d.params`; the SIMT lane guard is retained. -/
+def lowerDeclToPTXWithFacts (d : LNIRDecl) : Option PTXModule :=
+  lowerDeclToPTX d
 
 def concatPTXMems : List ByteMemory → ByteMemory
   | [] => { bytes := #[] }
