@@ -13803,66 +13803,6 @@ pub(crate) fn compute_olean_artifact_set_digest_preserve_lake(olean_path: &Path)
     compute_olean_artifact_set_digest_with_policy(olean_path, true)
 }
 
-pub(crate) fn compute_olean_artifact_set_digest_parallel_safe(
-    olean_path: &Path,
-    preserve_caller: bool,
-) -> Result<String> {
-    let window = current_memo_window();
-    let art_paths = olean_artifact_paths(olean_path);
-    let cur_stats = [
-        path_olean_stat_sig(&art_paths[0].1),
-        path_olean_stat_sig(&art_paths[1].1),
-        path_olean_stat_sig(&art_paths[2].1),
-        path_olean_stat_sig(&art_paths[3].1),
-        path_olean_stat_sig(&art_paths[4].1),
-        path_olean_stat_sig(&art_paths[5].1),
-    ];
-    let memo = OLEAN_ARTIFACT_SET_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
-    if olean_stat_bundle6_trusted_for_reuse(&cur_stats) {
-        if let Ok(g) = memo.lock() {
-            if let Some((w, cached_stats, hit)) = g.get(olean_path) {
-                if *w == window && *cached_stats == cur_stats {
-                    return Ok(hit.clone());
-                }
-            }
-        }
-    }
-    let _flock_guard = if let Some(pkg_root) = infer_pkg_root_from_artifact_path(olean_path) {
-        Some(acquire_publish_flock_mode(
-            &pkg_root,
-            false,
-            preserve_caller || crate::lake_build::worktree_auto_link_disabled(&pkg_root),
-        )?)
-    } else {
-        None
-    };
-    let read_started_ns = crate::zygote::wall_clock_ns();
-    let (res, bound_stats) =
-        compute_olean_artifact_set_digest_bound(olean_path, _flock_guard.as_ref())?;
-    let post_stats = [
-        path_olean_stat_sig(&art_paths[0].1),
-        path_olean_stat_sig(&art_paths[1].1),
-        path_olean_stat_sig(&art_paths[2].1),
-        path_olean_stat_sig(&art_paths[3].1),
-        path_olean_stat_sig(&art_paths[4].1),
-        path_olean_stat_sig(&art_paths[5].1),
-    ];
-    if let Some(fd_stats) = bound_stats {
-        if post_stats == fd_stats && olean_stat_bundle6_trusted_to_store(&fd_stats, read_started_ns)
-        {
-            if let Ok(mut g) = memo.lock() {
-                if current_memo_window() == window {
-                    if g.len() >= 65536 {
-                        g.clear();
-                    }
-                    g.insert(olean_path.to_path_buf(), (window, fd_stats, res.clone()));
-                }
-            }
-        }
-    }
-    Ok(res)
-}
-
 pub(crate) fn compute_olean_artifact_set_digest_with_policy(
     olean_path: &Path,
     preserve_caller: bool,
@@ -28669,7 +28609,15 @@ lean_lib Smoke where
         .unwrap();
         let dep_b_pin_post = &dep_manifest_post.modules["DepPkg/B.lean"].olean_artifact_digest;
         assert!(
-            !import_pin_current(&cfg_post, &memo_post, "DepPkg.B", Some(dep_b_pin_post)),
+            !import_pin_current(
+                &cfg_post,
+                &memo_post,
+                "DepPkg.B",
+                Some(ImportPinSpec {
+                    full_pin: dep_b_pin_post,
+                    tier_pin: None,
+                }),
+            ),
             "`import_pin_current` accepted stale `kernel_policy_digest` in `load_cached_pkg_manifest`"
         );
         hydrate_project_traces(&canon).unwrap();
@@ -37648,7 +37596,15 @@ globs = ["Down.+"]
             let cfg = resolve_project_config(&canon)?;
             let memo = DepImportMemo::default();
             assert!(
-                !import_pin_current(&cfg, &memo, "DepPkg.A", Some(&orig_dig)),
+                !import_pin_current(
+                    &cfg,
+                    &memo,
+                    "DepPkg.A",
+                    Some(ImportPinSpec {
+                        full_pin: &orig_dig,
+                        tier_pin: None,
+                    }),
+                ),
                 "in-place sub-window dep `.olean` mutation must invalidate `import_pin_current`"
             );
             {

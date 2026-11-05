@@ -5344,9 +5344,9 @@ fn check_single_file(
     for (idx, shard) in split.shards.iter().enumerate() {
         let shard_key = file_shard_keys[idx].clone();
         let is_attested_hit = if allow_sorry {
-            (hygiene_strictly_clean
+            hygiene_strictly_clean
                 || (split.hygiene.is_clean_modulo_sorry()
-                    && !shard_text_contains_sorry_or_admit(shard)))
+                    && !shard_text_contains_sorry_or_admit(shard))
         } else {
             hygiene_strictly_clean
         } && cached_map.contains_key(&shard_key)
@@ -9403,6 +9403,7 @@ theorem after_macro : ext_magic = 7 := rfl
                 None,
                 false,
                 Some(remote_url.clone()),
+                false,
             )
             .expect_err(
                 "check_single_file --remote-http must reject disallowed trailing axiom locally",
@@ -9431,6 +9432,7 @@ theorem after_macro : ext_magic = 7 := rfl
                 None,
                 false,
                 Some(remote_url.clone()),
+                false,
             );
             assert_eq!(
                 hits.load(Ordering::SeqCst),
@@ -9460,6 +9462,7 @@ theorem after_macro : ext_magic = 7 := rfl
                 None,
                 false,
                 Some(remote_url.clone()),
+                false,
             )
             .expect("check_single_file --remote-http should pass locally for allowedRemoteAx");
             assert_eq!(ok_val["status"], "file_verified");
