@@ -375,6 +375,296 @@ def ppLoweredDecl (d : LNIRDecl) : Option String := do
   let m ← lowerModule d
   some (PP.ppModule m)
 
+def overflowFlagsOf (nsw nuw : Bool) : OverflowFlags :=
+  if nsw && nuw then .nswNuw else if nsw then .nsw else if nuw then .nuw else .none
+
+def overflowOf (facts : FactEnv) (isMul : Bool) (a b : VarId) : OverflowFlags :=
+  match facts with
+  | [] => .none
+  | .noOverflowAdd l r nsw nuw :: rest =>
+    if !isMul && l == a && r == b then overflowFlagsOf nsw nuw
+    else overflowOf rest isMul a b
+  | .noOverflowMul l r nsw nuw :: rest =>
+    if isMul && l == a && r == b then overflowFlagsOf nsw nuw
+    else overflowOf rest isMul a b
+  | _ :: rest => overflowOf rest isMul a b
+
+def subFlagsOf (facts : FactEnv) (a b : VarId) : OverflowFlags :=
+  match facts with
+  | [] => .none
+  | .noOverflowSub l r nsw nuw :: rest =>
+    if l == a && r == b then overflowFlagsOf nsw nuw else subFlagsOf rest a b
+  | _ :: rest => subFlagsOf rest a b
+
+def llvmRegOf (v : VarId) : String := "v" ++ ppInt v
+
+def mergeFlags (old fresh : OverflowFlags) : OverflowFlags :=
+  match old, fresh with
+  | .none, f => f
+  | f, .none => f
+  | .nsw, .nuw | .nuw, .nsw | .nswNuw, _ | _, .nswNuw => .nswNuw
+  | .nsw, .nsw => .nsw
+  | .nuw, .nuw => .nuw
+
+def attachOverflow (facts : FactEnv) (ins : LLVMInstr) : LLVMInstr :=
+  match ins with
+  | .add dst old .i64 (.reg x) (.reg y) =>
+    match factOperands facts x y with
+    | some (a, b) => .add dst (mergeFlags old (overflowOf facts false a b)) .i64 (.reg x) (.reg y)
+    | none => ins
+  | .sub dst old .i64 (.reg x) (.reg y) =>
+    match factOperands facts x y with
+    | some (a, b) => .sub dst (mergeFlags old (subFlagsOf facts a b)) .i64 (.reg x) (.reg y)
+    | none => ins
+  | .mul dst old .i64 (.reg x) (.reg y) =>
+    match factOperands facts x y with
+    | some (a, b) => .mul dst (mergeFlags old (overflowOf facts true a b)) .i64 (.reg x) (.reg y)
+    | none => ins
+  | _ => ins
+where
+  factOperands (facts : FactEnv) (x y : String) : Option (VarId × VarId) :=
+    match facts with
+    | [] => none
+    | .noOverflowAdd a b _ _ :: rest | .noOverflowSub a b _ _ :: rest
+    | .noOverflowMul a b _ _ :: rest =>
+      if x == llvmRegOf a && y == llvmRegOf b then some (a, b)
+      else factOperands rest x y
+    | _ :: rest => factOperands rest x y
+
+def alignOfFact (facts : FactEnv) (ptrVar : VarId) (ty : LLVMType) (fallback : Nat) : Nat :=
+  match facts with
+  | [] => fallback
+  | .alignedPtr p n :: rest =>
+    let eff := effectiveAlign ty fallback
+    if p == ptrVar && isPow2 n && isPow2 eff && eff < n && n % eff == 0 then n
+    else alignOfFact rest ptrVar ty fallback
+  | _ :: rest => alignOfFact rest ptrVar ty fallback
+
+def attachLoadStoreAlign (facts : FactEnv) (ptrVar : VarId) (ins : LLVMInstr) : LLVMInstr :=
+  match ins with
+  | .load dst vol ty (.reg r) al as_ =>
+    if r == llvmRegOf ptrVar then .load dst vol ty (.reg r) (alignOfFact facts ptrVar ty al) as_
+    else ins
+  | .store vol ty valOp (.reg r) al as_ =>
+    if r == llvmRegOf ptrVar then .store vol ty valOp (.reg r) (alignOfFact facts ptrVar ty al) as_
+    else ins
+  | other => other
+
+def instrDstReg? : LLVMInstr → Option RegName
+  | .alloca dst _ _ | .load dst _ _ _ _ _
+  | .add dst _ _ _ _ | .sub dst _ _ _ _ | .mul dst _ _ _ _
+  | .udiv dst _ _ _ _ | .sdiv dst _ _ _ _ | .urem dst _ _ _ | .srem dst _ _ _
+  | .and_ dst _ _ _ | .or_ dst _ _ _ | .xor dst _ _ _
+  | .shl dst _ _ _ _ | .lshr dst _ _ _ _ | .ashr dst _ _ _ _
+  | .icmp dst _ _ _ _
+  | .fadd dst _ _ _ | .fsub dst _ _ _ | .fmul dst _ _ _ | .fdiv dst _ _ _
+  | .fcmp dst _ _ _ _
+  | .zext dst _ _ _ | .sext dst _ _ _ | .trunc dst _ _ _
+  | .bitcast dst _ _ _ | .inttoptr dst _ _ _ | .ptrtoint dst _ _ _
+  | .getelementptr dst _ _ _ _ _ | .select dst _ _ _ _
+  | .atomicrmw dst _ _ _ _ _ _ _
+  | .insertelement dst _ _ _ _ _ _ | .extractelement dst _ _ _ _ _
+  | .shufflevector dst _ _ _ _ _ _
+  | .insertvalue dst _ _ _ _ _ | .extractvalue dst _ _ _ => some dst
+  | .call dst? _ _ _ _ => dst?
+  | .store _ _ _ _ _ _ => none
+
+def factVarIds : RetainedFact → List VarId
+  | .idxLt i n => [i, n]
+  | .noOverflowAdd a b _ _ | .noOverflowSub a b _ _ | .noOverflowMul a b _ _ => [a, b]
+  | .alignedPtr p _ => [p]
+  | .disjointSlices a b la lb => [a, b, la, lb]
+  | .exclusiveObj o => [o]
+
+def killRegFacts (facts : FactEnv) (r : RegName) : FactEnv :=
+  facts.filter fun f => !(factVarIds f).any (fun v => llvmRegOf v == r)
+
+def termTargets : Terminator → List BlockLabel
+  | .br lbl => [lbl]
+  | .condBr _ tLbl eLbl => [tLbl, eLbl]
+  | .switch _ _ defLbl cases => defLbl :: cases.map Prod.snd
+  | .ret _ | .unreachable => []
+
+def fnDefinesReg (fn : LLVMFn) (r : RegName) : Bool :=
+  fn.blocks.any fun blk =>
+    blk.phis.any (fun p => p.dst == r) ||
+    blk.body.any (fun ins => instrDstReg? ins == some r)
+
+def immutableParamFacts (fn : LLVMFn) (facts : FactEnv) : FactEnv :=
+  facts.filter fun f =>
+    (factVarIds f).all fun v =>
+      let r := llvmRegOf v
+      fn.params.any (·.name == r) && !fnDefinesReg fn r
+
+def entryIsStraight (fn : LLVMFn) : Bool :=
+  match fn.blocks with
+  | [] => false
+  | blk :: _ =>
+    blk.phis.isEmpty && fn.blocks.all fun b => !(termTargets b.term).contains blk.label
+
+def emitVerifiedLLVMWithFacts (facts : FactEnv) (a b : VarId)
+    (insns : List LLVMInstr) (ptrVar : VarId := 0) : List LLVMInstr :=
+  match insns with
+  | [] => []
+  | ins :: rest =>
+    let ins' := attachLoadStoreAlign facts ptrVar (attachOverflow facts ins)
+    let facts' := match instrDstReg? ins with
+      | some dst => killRegFacts facts dst
+      | none => facts
+    ins' :: emitVerifiedLLVMWithFacts facts' a b rest ptrVar
+
+def emitBlockBodyWithFacts (facts : FactEnv) (insns : List LLVMInstr) : List LLVMInstr :=
+  match insns with
+  | [] => []
+  | ins :: rest =>
+    let ins1 := attachOverflow facts ins
+    let ins' := facts.foldl (fun acc f =>
+      match f with
+      | .alignedPtr ptrVar _ => attachLoadStoreAlign facts ptrVar acc
+      | _ => acc) ins1
+    let facts' := match instrDstReg? ins with
+      | some dst => killRegFacts facts dst
+      | none => facts
+    ins' :: emitBlockBodyWithFacts facts' rest
+
+def withNoAlias (disjoint : Bool) (p : LLVMParam) : LLVMParam :=
+  if !disjoint then p
+  else if p.attrs.contains .noalias then p
+  else { p with attrs := .noalias :: p.attrs }
+
+def isCertifiedPtrParam (ptrA ptrB : VarId) (p : LLVMParam) : Bool :=
+  match p.ty with
+  | .ptr _ => p.name == llvmRegOf ptrA || p.name == llvmRegOf ptrB
+  | _ => true
+
+def operandMentionsReg (r : RegName) : Operand → Bool
+  | .reg r' => r' == r
+  | .aggCons h t => operandMentionsReg r h || operandMentionsReg r t
+  | _ => false
+
+def instrDerefsReg (r : RegName) : LLVMInstr → Bool
+  | .load _ _ _ ptrOp _ _ | .store _ _ _ ptrOp _ _ => ptrOp == .reg r
+  | _ => false
+
+def blocksDerefReg (r : RegName) (blocks : List LLVMBlock) : Bool :=
+  blocks.any fun blk => blk.body.any (instrDerefsReg r)
+
+def isScalarNoAliasTy : LLVMType → Bool
+  | .void => true
+  | .int w => w.byteSize <= 8
+  | .float fw => fw.byteSize <= 8
+  | .ptr _ => true
+  | .structFields _ _ | .array _ _ | .vec _ _ => false
+
+def instrSafeForNoAlias (rA rB : RegName) : LLVMInstr → Bool
+  | .load dst _ ty ptrOp _ _ =>
+    dst != rA && dst != rB &&
+    (ptrOp == .reg rA || ptrOp == .reg rB) && isScalarNoAliasTy ty && ty.byteSize <= 8
+  | .store _ ty valOp ptrOp _ _ =>
+    !operandMentionsReg rA valOp && !operandMentionsReg rB valOp &&
+    (ptrOp == .reg rA || ptrOp == .reg rB) && isScalarNoAliasTy ty && ty.byteSize <= 8
+  | ins =>
+    let noMention (op : Operand) : Bool :=
+      !operandMentionsReg rA op && !operandMentionsReg rB op
+    let dstOk := instrDstReg? ins != some rA && instrDstReg? ins != some rB
+    dstOk && match ins with
+    | .add _ _ _ l r | .sub _ _ _ l r | .mul _ _ _ l r
+    | .udiv _ _ _ l r | .sdiv _ _ _ l r | .urem _ _ l r | .srem _ _ l r
+    | .and_ _ _ l r | .or_ _ _ l r | .xor _ _ l r
+    | .shl _ _ _ l r | .lshr _ _ _ l r | .ashr _ _ _ l r
+    | .icmp _ _ _ l r
+    | .fadd _ _ l r | .fsub _ _ l r | .fmul _ _ l r | .fdiv _ _ l r
+    | .fcmp _ _ _ l r
+    | .shufflevector _ _ _ _ l r _
+    | .insertvalue _ _ l _ r _ => noMention l && noMention r
+    | .zext _ _ a _ | .sext _ _ a _ | .trunc _ _ a _
+    | .bitcast _ _ a _ | .extractvalue _ _ a _ => noMention a
+    | .select _ c _ t f | .insertelement _ _ _ c t _ f =>
+      noMention c && noMention t && noMention f
+    | .extractelement _ _ _ v _ idx => noMention v && noMention idx
+    | .alloca _ _ _ | .inttoptr _ _ _ _ | .ptrtoint _ _ _ _
+    | .getelementptr _ _ _ _ _ _ | .call _ _ _ _ _
+    | .atomicrmw _ _ _ _ _ _ _ _ | .load _ _ _ _ _ _ | .store _ _ _ _ _ _ => false
+
+def termSafeForNoAlias (rA rB : RegName) : Terminator → Bool
+  | .br _ | .unreachable => true
+  | .condBr c _ _ | .switch _ c _ _ =>
+    !operandMentionsReg rA c && !operandMentionsReg rB c
+  | .ret none => true
+  | .ret (some (_, op)) =>
+    !operandMentionsReg rA op && !operandMentionsReg rB op
+
+def phiSafeForNoAlias (rA rB : RegName) (p : PhiNode) : Bool :=
+  p.dst != rA && p.dst != rB &&
+  p.incomings.all fun (op, _) => !operandMentionsReg rA op && !operandMentionsReg rB op
+
+def blockSafeForNoAlias (rA rB : RegName) (blk : LLVMBlock) : Bool :=
+  blk.phis.all (phiSafeForNoAlias rA rB) &&
+  blk.body.all (instrSafeForNoAlias rA rB) &&
+  termSafeForNoAlias rA rB blk.term
+
+def hasPositiveSliceBound (facts : FactEnv) (lenVar : VarId) : Bool :=
+  facts.any fun
+    | .idxLt _ n => n == lenVar
+    | _ => false
+
+def blocksNoAliasSafe (facts : FactEnv) (ptrA ptrB lenA lenB : VarId)
+    (blocks : List LLVMBlock) : Bool :=
+  let rA := llvmRegOf ptrA
+  let rB := llvmRegOf ptrB
+  blocks.all (blockSafeForNoAlias rA rB) &&
+  (!blocksDerefReg rA blocks || hasPositiveSliceBound facts lenA) &&
+  (!blocksDerefReg rB blocks || hasPositiveSliceBound facts lenB)
+
+def noaliasParams (facts : FactEnv) (ptrA ptrB lenA lenB : VarId)
+    (ps : List LLVMParam) (blocks : List LLVMBlock := []) : List LLVMParam :=
+  let allPtrCertified := ps.all (isCertifiedPtrParam ptrA ptrB)
+  let bodySafe := blocksNoAliasSafe facts ptrA ptrB lenA lenB blocks
+  if !(ptrA != ptrB && factMember facts (.disjointSlices ptrA ptrB lenA lenB) &&
+      allPtrCertified && bodySafe) then ps
+  else ps.map fun p =>
+    match p.ty with
+    | .ptr _ =>
+      if p.name == llvmRegOf ptrA || p.name == llvmRegOf ptrB then withNoAlias true p else p
+    | _ => p
+
+def emitVerifiedLLVMFnWithFacts (facts : FactEnv) (ptrA ptrB lenA lenB : VarId)
+    (a b : VarId) (fn : LLVMFn) (ptrVar : VarId := 0) : LLVMFn :=
+  let entryFacts := if entryIsStraight fn then facts else immutableParamFacts fn facts
+  let tailFacts := immutableParamFacts fn facts
+  let blocks' := match fn.blocks with
+    | [] => []
+    | blk :: rest =>
+      { blk with body := emitVerifiedLLVMWithFacts entryFacts a b blk.body ptrVar } ::
+        rest.map fun blk' => { blk' with body := emitVerifiedLLVMWithFacts tailFacts a b blk'.body ptrVar }
+  { fn with
+    params := noaliasParams facts ptrA ptrB lenA lenB fn.params blocks'
+    blocks := blocks' }
+
+def applyRetainedFactsLLVMFn (facts : FactEnv) (fn : LLVMFn) : LLVMFn :=
+  if facts.isEmpty then fn
+  else
+    let paramFacts := facts.filter fun f =>
+      (factVarIds f).all fun v => fn.params.any (·.name == llvmRegOf v)
+    let entryFacts := if entryIsStraight fn then paramFacts else immutableParamFacts fn facts
+    let tailFacts := immutableParamFacts fn facts
+    let blocks' := match fn.blocks with
+      | [] => []
+      | blk :: rest =>
+        { blk with body := emitBlockBodyWithFacts entryFacts blk.body } ::
+          rest.map fun b => { b with body := emitBlockBodyWithFacts tailFacts b.body }
+    { fn with blocks := blocks' }
+
+def lowerDeclWithFacts (d : LNIRDecl) : Option LLVMFn :=
+  (lowerDecl d).map (applyRetainedFactsLLVMFn d.retainedFacts)
+
+def lowerModuleWithFacts (d : LNIRDecl) : Option LLVMModule :=
+  (lowerDeclWithFacts d).map modOfFn
+
+def ppLoweredDeclWithFacts (d : LNIRDecl) : Option String := do
+  let m ← lowerModuleWithFacts d
+  some (PP.ppModule m)
+
 /-- Wrap a single `ScalarExpr` over two `i64` parameters (`%v0`, `%v1`) as an `LNIRDecl`. -/
 def mkBinScalarDecl (name : String) (retTy : LNIRType) (se : ScalarExpr) : LNIRDecl :=
   { name := name

@@ -101,7 +101,8 @@ def verifiedTheoremRegistry : List String :=
     "lowerAsyncAwaitChain_sound", "asyncStateMachinePass_sound",
     "checkNonEscapingAsync_rejects_closure", "asyncStateMachine_zeroAlloc_nonvacuous",
     "elideMarkMtAndZeroRc_sound", "optimizeThreadLocalOwnershipRC_sound",
-    "elideBorrowedAndThreadLocalRC_sound"
+    "elideBorrowedAndThreadLocalRC_sound",
+    "dischargeLocalExclusivity_refines"
   ]
   let xform := [
     "optimizeEqSatCode_sound", "applyLoopScheduleAux_refines",

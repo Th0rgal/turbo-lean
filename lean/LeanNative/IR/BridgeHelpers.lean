@@ -14,6 +14,7 @@ import LeanNative.IR.Codec
 import LeanNative.IR.LCNF
 import LeanNative.IR.RealLCNFBridge
 import LeanNative.Transform.EqSat
+import LeanNative.Frontend.ProofRetention
 
 set_option autoImplicit true
 
@@ -149,6 +150,24 @@ export LeanNative.IR.RealLCNFBridge (
   isFlatUnboxedScalar isUnboxedScalarOrTuple
 )
 
+def exprCodomainIsProp (env? : Option Lean.Environment) (e : Lean.Expr) : Bool :=
+  let fn := e.getAppFn
+  match fn with
+  | .const declName _ =>
+    if declName == ``LT.lt || declName == ``LE.le || declName == ``GT.gt || declName == ``GE.ge ||
+       declName == ``Eq || declName == ``Ne || declName == ``Dvd.dvd ||
+       declName == ``And || declName == ``Or || declName == ``Not || declName == ``Iff ||
+       declName == ``True || declName == ``False then true
+    else match env?.bind (·.find? declName) with
+      | some cinfo =>
+        let rec returnsProp : Lean.Expr → Bool
+          | .forallE _ _ b _ => returnsProp b
+          | .sort u => u.isZero
+          | _ => false
+        returnsProp cinfo.type
+      | none => false
+  | _ => false
+
 partial def lowerImpureType (e : Lean.Expr) (env? : Option Lean.Environment := none) : LNIRType :=
   if e == ImpureType.uint8 then .i8
   else if e == ImpureType.uint16 then .i16
@@ -160,6 +179,7 @@ partial def lowerImpureType (e : Lean.Expr) (env? : Option Lean.Environment := n
   else if e == ImpureType.object then .objPtr
   else if e == ImpureType.tagged || e == ImpureType.tobject then .taggedPtr
   else if e == ImpureType.erased || e == ImpureType.void then .unit
+  else if exprCodomainIsProp env? e then .unit
   else if isSignedScalarTypeExpr e then .objPtr
   else
     let fn := e.getAppFn
@@ -1872,6 +1892,94 @@ def lowerImpureCodeViaRealM (code : Lean.Compiler.LCNF.Code .impure) : BridgeM L
     return lnir
   | .error msg => Lean.throwError msg
 
+partial def pureCodeAstFuel : Lean.Compiler.LCNF.Code .pure → Nat
+  | .let _ k => 1 + pureCodeAstFuel k
+  | .fun d k _ | .jp d k => 1 + pureCodeAstFuel d.value + pureCodeAstFuel k
+  | .cases c => 1 + c.alts.foldl (fun acc a => acc + pureCodeAstFuel a.getCode) 0
+  | .return _ | .jmp .. | .unreach _ => 1
+
+def isWordFactTy : LNIRType → Bool
+  | .i64 | .usize => true
+  | _ => false
+
+def isRawPtrFactTy : LNIRType → Bool
+  | .rawPtr _ => true
+  | _ => false
+
+def isExclFactTy : LNIRType → Bool
+  | .sarray _ | .objPtr => true
+  | _ => false
+
+def factVarsInScope (varTys : List (VarId × LNIRType)) : RetainedFact → Bool
+  | .idxLt i n =>
+    match varTys.lookup i, varTys.lookup n with
+    | some ti, some tn => isWordFactTy ti && isWordFactTy tn
+    | _, _ => false
+  | .noOverflowAdd a b _ _ | .noOverflowSub a b _ _ | .noOverflowMul a b _ _ =>
+    match varTys.lookup a, varTys.lookup b with
+    | some ta, some tb => isWordFactTy ta && isWordFactTy tb
+    | _, _ => false
+  | .alignedPtr p _ =>
+    match varTys.lookup p with
+    | some tp => isRawPtrFactTy tp || isWordFactTy tp
+    | none => false
+  | .disjointSlices a b la lb =>
+    match varTys.lookup a, varTys.lookup b, varTys.lookup la, varTys.lookup lb with
+    | some ta, some tb, some tla, some tlb =>
+      isRawPtrFactTy ta && isRawPtrFactTy tb && isWordFactTy tla && isWordFactTy tlb
+    | _, _, _, _ => false
+  | .exclusiveObj o =>
+    match varTys.lookup o with
+    | some to => isExclFactTy to
+    | none => false
+
+partial def collectDeclVarTys (acc : List (VarId × LNIRType)) : LNIRCode → List (VarId × LNIRType)
+  | .letBind dst ty _ k => collectDeclVarTys ((dst, ty) :: acc) k
+  | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k => collectDeclVarTys acc k
+  | .ite _ t e => collectDeclVarTys (collectDeclVarTys acc t) e
+  | .seqFor idx _ _ accV _ accTy body k =>
+    collectDeclVarTys (collectDeclVarTys ((idx, .i64) :: (accV, accTy) :: acc) body) k
+  | .parFor out _ _ elemTy _ k => collectDeclVarTys ((out, .sarray elemTy) :: acc) k
+  | .ret _ | .unreachable => acc
+
+def attachBaseDeclFactsM (declName : Lean.Name) (d : LNIRDecl) : Lean.CoreM LNIRDecl := do
+  let env ← getEnv
+  let paramVars := d.params.map (·.id)
+  let paramTys := d.params.map fun p => (p.id, p.ty)
+  let nextVar := paramVars.foldl max 0 + 64
+  let sigFacts := match env.find? declName with
+    | none => []
+    | some cinfo =>
+      (LeanNative.Frontend.ProofRetention.retainedForallParamFacts paramVars nextVar cinfo.type).filter
+        (factVarsInScope paramTys)
+  let baseFacts ← match ← Lean.Compiler.LCNF.getBaseDecl? declName with
+    | none => pure []
+    | some baseDecl =>
+      let paramSeed :=
+        if baseDecl.params.size == d.params.length then
+          (baseDecl.params.toList.zip d.params).map fun (bp, lp) => (bp.fvarId, lp.id)
+        else []
+      if paramSeed.isEmpty then pure []
+      else
+        let fuel := baseDecl.params.size +
+          (match baseDecl.value with | .code c => pureCodeAstFuel c | .extern _ => 0) + 128
+        let rawFacts := LeanNative.Frontend.ProofRetention.retainedPureDeclFactsWithSeed
+          fuel paramSeed nextVar baseDecl
+        pure (rawFacts.filter (factVarsInScope paramTys))
+  let merged := (sigFacts ++ baseFacts).foldl LeanNative.IR.consFact d.retainedFacts
+  return { d with retainedFacts := merged }
+
+def extractPureDeclFactsWithBridgeState (decl : Lean.Compiler.LCNF.Decl .pure)
+    (st : BridgeState) (d : LNIRDecl) : LNIRDecl :=
+  let seedMap := st.fvarToVar.toList
+  let fuel := decl.params.size +
+    (match decl.value with | .code c => pureCodeAstFuel c | .extern _ => 0) + 128
+  let liveVarTys := collectDeclVarTys (d.params.map fun p => (p.id, p.ty)) d.body
+  let facts := (LeanNative.Frontend.ProofRetention.retainedPureDeclFactsWithSeed
+    fuel seedMap st.nextVarId decl).filter (factVarsInScope liveVarTys)
+  let merged := facts.foldl LeanNative.IR.consFact d.retainedFacts
+  { d with retainedFacts := merged }
+
 /-- Delegate `Decl .impure` lowering directly to `RealLCNFBridge.lowerRealLCNFDecl` (backed by `lowerRealLCNFDecl_sound`). -/
 def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
     (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64)
@@ -1953,18 +2061,29 @@ def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
         let effRetTy := if useCompressed then candRetTy else baseRetTy
         let effAssurance :=
           if useCompressed then AssuranceLevel.combine d.assurance .translationValidated else d.assurance
-        return { d with
+        let dOut : LNIRDecl := { d with
           body := finalBody
           retTy := effRetTy
           assurance := effAssurance
           isGpuCand := d.params.all (fun p => p.ty.isGpuCompatible) && effRetTy.isGpuCompatible }
+        attachBaseDeclFactsM decl.name dOut
       | .error msg => Lean.throwError msg
   Prod.fst <$> action.run initSt
 
+def expandCompilerAuxDecls (declNames : Array Lean.Name) : Lean.CoreM (Array Lean.Name) := do
+  let mut out := declNames
+  for name in declNames do
+    let red := Lean.Name.str name "_redArg"
+    if !out.contains red then
+      if (← Lean.Compiler.LCNF.getLocalImpureDecl? red).isSome || (← Lean.Compiler.LCNF.getMonoDecl? red).isSome then
+        out := out.push red
+  return out
+
 def ingestModuleDeclsWith (ingestImpure : Lean.Compiler.LCNF.Decl .impure → Array Lean.Name → TargetArch → Lean.CoreM LNIRDecl)
     (ingestMono : Lean.Compiler.LCNF.Decl .pure → Array Lean.Name → TargetArch → Lean.CoreM LNIRDecl)
-    (declNames : Array Lean.Name) (moduleName : String := "LeanNative.Ingested")
+    (rawDeclNames : Array Lean.Name) (moduleName : String := "LeanNative.Ingested")
     (arch : TargetArch := .x86_64) : Lean.CoreM LNIRModule := do
+  let declNames ← expandCompilerAuxDecls rawDeclNames
   let env ← getEnv
   let mut callGraph : Std.HashMap Lean.Name (List Lean.Name) := {}
   let mut decls : List LNIRDecl := []

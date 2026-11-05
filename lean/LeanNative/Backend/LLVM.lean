@@ -245,12 +245,39 @@ structure EmitState where
   isa       : IsaLevel := IsaLevel.arm64Baseline
   rcMode    : RcMode := .atomic
   localScalarSigs : List (String × List LNIRType × LNIRType) := []
+  retainedFacts : FactEnv := []
   varTypes  : List (VarId × LNIRType)
   nextTmp   : Nat := 0
   scalarBindings : List (VarId × String) := []
   ptrBindings    : List (VarId × String) := []
   lines     : List String := []
   deriving Inhabited
+
+def retainedOverflowFlagsStr (facts : FactEnv) (op : BinOp) (lhs rhs : ScalarExpr) : String :=
+  let fmt (nsw nuw : Bool) : String :=
+    if nsw && nuw then " nsw nuw" else if nsw then " nsw" else if nuw then " nuw" else ""
+  match lhs, rhs with
+  | .var a, .var b =>
+    let rec go : FactEnv → String
+      | [] => ""
+      | .noOverflowAdd l r s u :: rest =>
+        if op == .add && l == a && r == b then fmt s u else go rest
+      | .noOverflowSub l r s u :: rest =>
+        if op == .sub && l == a && r == b then fmt s u else go rest
+      | .noOverflowMul l r s u :: rest =>
+        if op == .mul && l == a && r == b then fmt s u else go rest
+      | _ :: rest => go rest
+    go facts
+  | _, _ => ""
+
+def retainedAlignForPtr (facts : FactEnv) (ptrVar : VarId) (fallback : Nat := 8) : Nat :=
+  let rec go : FactEnv → Nat
+    | [] => fallback
+    | .alignedPtr p n :: rest =>
+      if p == ptrVar && n > fallback && (n &&& (n - 1)) == 0 && n % fallback == 0 then n
+      else go rest
+    | _ :: rest => go rest
+  go facts
 
 abbrev EmitM := StateM EmitState
 
@@ -526,10 +553,17 @@ partial def emitScalarExprWithWidth (tyStr : String) (shiftMask : String) (e : L
       emitLine s!"  {cmp} = icmp {pred} {tyStr} {lVal}, {rVal}"
       emitLine s!"  {res} = zext i1 {cmp} to {tyStr}"
       return res
+    let curFacts := (← get).retainedFacts
     match op with
-    | .add    => emitLine s!"  {res} = add {tyStr} {lVal}, {rVal}"; return res
-    | .sub    => emitLine s!"  {res} = sub {tyStr} {lVal}, {rVal}"; return res
-    | .mul    => emitLine s!"  {res} = mul {tyStr} {lVal}, {rVal}"; return res
+    | .add    =>
+      let fl := if is256 then "" else retainedOverflowFlagsStr curFacts .add lhs rhs
+      emitLine s!"  {res} = add{fl} {tyStr} {lVal}, {rVal}"; return res
+    | .sub    =>
+      let fl := if is256 then "" else retainedOverflowFlagsStr curFacts .sub lhs rhs
+      emitLine s!"  {res} = sub{fl} {tyStr} {lVal}, {rVal}"; return res
+    | .mul    =>
+      let fl := if is256 then "" else retainedOverflowFlagsStr curFacts .mul lhs rhs
+      emitLine s!"  {res} = mul{fl} {tyStr} {lVal}, {rVal}"; return res
     | .bitAnd => emitLine s!"  {res} = and {tyStr} {lVal}, {rVal}"; return res
     | .bitOr  => emitLine s!"  {res} = or {tyStr} {lVal}, {rVal}"; return res
     | .bitXor => emitLine s!"  {res} = xor {tyStr} {lVal}, {rVal}"; return res
@@ -873,8 +907,10 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
     let idxVal ← loadVarAsI64 idxVar
     let elemPtr ← freshTmp "rld_gep"
     let elemVal ← freshTmp "rld_val"
+    let curFacts := (← get).retainedFacts
+    let al := if idxVal == "0" then retainedAlignForPtr curFacts ptrVar 8 else 8
     emitLine s!"  {elemPtr} = getelementptr inbounds i64, ptr {rawPtr}, i64 {idxVal}"
-    emitLine s!"  {elemVal} = load i64, ptr {elemPtr}, align 8"
+    emitLine s!"  {elemVal} = load i64, ptr {elemPtr}, align {al}"
     storeI64ToVar dst elemVal
   | .boxScalar valVar bty =>
     let v ← loadVarAsI64 valVar
@@ -1107,14 +1143,29 @@ def emitParForLoop (outVar lenVar : VarId) (inputs : List VarId) (_elemTy : LNIR
       let m ← freshTmp "st_mul"; emitLine s!"  {m} = mul i64 {v0}, {wCenter}"; pure m
     | .customScalar idxVar inVars body => do
       let saved := (← get).scalarBindings
+      let savedFacts := (← get).retainedFacts
+      let shadowed := idxVar :: inVars
+      let keepFact (f : RetainedFact) : Bool :=
+        match f with
+        | .idxLt i n => !shadowed.contains i && !shadowed.contains n
+        | .noOverflowAdd a b _ _ | .noOverflowSub a b _ _ | .noOverflowMul a b _ _ =>
+          !shadowed.contains a && !shadowed.contains b
+        | .alignedPtr p _ => !shadowed.contains p
+        | .disjointSlices a b la lb =>
+          !shadowed.contains a && !shadowed.contains b &&
+          !shadowed.contains la && !shadowed.contains lb
+        | .exclusiveObj o => !shadowed.contains o
       let mut bindings := [(idxVar, ivVal)]
       for (bound, input) in inVars.zip inputs do
         let arr ← loadVarAsPtr input; let ptr ← freshTmp "cs_ptr"; let elemPtr ← freshTmp "cs_at"; let value ← freshTmp "cs_value"
         emitLine s!"  {ptr} = getelementptr inbounds i64, ptr {arr}, i64 3\n  {elemPtr} = getelementptr inbounds i64, ptr {ptr}, i64 {ivVal}\n  {value} = load i64, ptr {elemPtr}, align 8"
         bindings := bindings ++ [(bound, value)]
-      modify fun s => { s with scalarBindings := bindings ++ saved }
+      modify fun s => {
+        s with
+        scalarBindings := bindings ++ saved
+        retainedFacts := savedFacts.filter keepFact }
       let value ← emitScalarExprWithWidth "i64" "63" body
-      modify fun s => { s with scalarBindings := saved }; pure value
+      modify fun s => { s with scalarBindings := saved, retainedFacts := savedFacts }; pure value
   if isDot then do
     emitLine s!"  {nextAcc} = add i64 {accVal}, {resVal}"
   else do
@@ -1157,6 +1208,13 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
   let opt := (← get).optimized
   match code with
   | .letBind dst ty val k =>
+    let killVarFacts (v : VarId) : EmitM Unit :=
+      modify fun s => { s with retainedFacts := s.retainedFacts.filter fun
+        | .idxLt i n => i != v && n != v
+        | .noOverflowAdd a b _ _ | .noOverflowSub a b _ _ | .noOverflowMul a b _ _ => a != v && b != v
+        | .alignedPtr p _ => p != v
+        | .disjointSlices a b la lb => a != v && b != v && la != v && lb != v
+        | .exclusiveObj o => o != v }
     match collectSwitchChain none code with
     | some (discrVar, rawCases, defaultBranch) =>
       let dedupCases := rawCases.foldl (fun acc item@(_, tagVal, _) =>
@@ -1172,12 +1230,14 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
         emitLine "  ]"
         for (caseLbl, _, brCode) in labeledCases do
           let savedPtrs := (← get).ptrBindings
+          let savedFacts := (← get).retainedFacts
           emitLine s!"{caseLbl}:"; emitCode brCode retTy loopAccTarget
-          modify fun s => { s with ptrBindings := savedPtrs }
+          modify fun s => { s with ptrBindings := savedPtrs, retainedFacts := savedFacts }
         let savedPtrs := (← get).ptrBindings
+        let savedFacts := (← get).retainedFacts
         emitLine s!"{defLbl}:"; emitCode defaultBranch retTy loopAccTarget
-        modify fun s => { s with ptrBindings := savedPtrs }
-      else emitLetExpr dst ty val; emitCode k retTy loopAccTarget
+        modify fun s => { s with ptrBindings := savedPtrs, retainedFacts := savedFacts }
+      else emitLetExpr dst ty val; killVarFacts dst; emitCode k retTy loopAccTarget
     | none =>
       let st ← get
       let isArm := st.optimized && st.target.isAArch64 && st.isa.sha3
@@ -1191,16 +1251,18 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
           let x1 ← freshTmp "xor_pair"
           emitLine s!"  {x1} = xor i64 {aVal}, {bVal}"
           storeI64ToVar dst x1
+          killVarFacts dst
           let cVal ← loadVarAsI64 thirdVar
           let va ← freshTmp "eor3_va"; let vb ← freshTmp "eor3_vb"; let vc ← freshTmp "eor3_vc"
           let vp ← freshTmp "eor3_vp"; let res ← freshTmp "eor3_res"
           emitLine s!"  {va} = insertelement <2 x i64> zeroinitializer, i64 {aVal}, i64 0\n  {vb} = insertelement <2 x i64> zeroinitializer, i64 {bVal}, i64 0\n  {vc} = insertelement <2 x i64> zeroinitializer, i64 {cVal}, i64 0\n  {vp} = call <2 x i64> @llvm.aarch64.crypto.eor3u.v2i64(<2 x i64> {va}, <2 x i64> {vb}, <2 x i64> {vc})\n  {res} = extractelement <2 x i64> {vp}, i64 0"
           storeI64ToVar dst2 res
+          killVarFacts dst2
           emitCode k2 retTy loopAccTarget
         else
-          emitLetExpr dst ty val; emitCode k retTy loopAccTarget
+          emitLetExpr dst ty val; killVarFacts dst; emitCode k retTy loopAccTarget
       | _, _, _, _ =>
-        emitLetExpr dst ty val; emitCode k retTy loopAccTarget
+        emitLetExpr dst ty val; killVarFacts dst; emitCode k retTy loopAccTarget
   | .rawStore ptrVar idxVar valVar _ k =>
     let rawPtr ← loadVarAsPtr ptrVar
     let idxVal ← loadVarAsI64 idxVar
@@ -1228,12 +1290,13 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
       emitLine s!"  {cBool} = icmp ne i64 {cVal}, 0"
     emitLine s!"  br i1 {cBool}, label %{thenLbl}, label %{elseLbl}"
     let savedPtrs := (← get).ptrBindings
+    let savedFacts := (← get).retainedFacts
     emitLine s!"{thenLbl}:"
     emitCode thenBranch retTy loopAccTarget
-    modify fun s => { s with ptrBindings := savedPtrs }
+    modify fun s => { s with ptrBindings := savedPtrs, retainedFacts := savedFacts }
     emitLine s!"{elseLbl}:"
     emitCode elseBranch retTy loopAccTarget
-    modify fun s => { s with ptrBindings := savedPtrs }
+    modify fun s => { s with ptrBindings := savedPtrs, retainedFacts := savedFacts }
   | .seqFor idxVar loVar hiVar accVar accInit _ stepBody k =>
     let loVal ← loadVarAsI64 loVar
     let hiVal ← loadVarAsI64 hiVar
@@ -1252,9 +1315,22 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
     emitLine s!"  {cmp} = icmp ult i64 {curIdx}, {hiVal}"
     emitLine s!"  br i1 {cmp}, label %{bodyLbl}, label %{exitLbl}"
     let savedPtrs := (← get).ptrBindings
+    let savedFacts := (← get).retainedFacts
+    modify fun s => { s with retainedFacts := [] }
     emitLine s!"{bodyLbl}:"
     emitCode stepBody retTy (some (accVar, latchLbl))
-    modify fun s => { s with ptrBindings := savedPtrs.filter (·.1 != accVar) }
+    modify fun s => {
+      s with
+      ptrBindings := savedPtrs.filter (·.1 != accVar)
+      retainedFacts := savedFacts.filter fun
+        | .idxLt i n => i != accVar && i != idxVar && n != accVar && n != idxVar
+        | .noOverflowAdd a b _ _ | .noOverflowSub a b _ _ | .noOverflowMul a b _ _ =>
+          a != accVar && a != idxVar && b != accVar && b != idxVar
+        | .alignedPtr p _ => p != accVar && p != idxVar
+        | .disjointSlices a b la lb =>
+          a != accVar && a != idxVar && b != accVar && b != idxVar &&
+          la != accVar && la != idxVar && lb != accVar && lb != idxVar
+        | .exclusiveObj o => o != accVar && o != idxVar }
     emitLine s!"{latchLbl}:"
     let addOp := if opt then "add nuw nsw i64" else "add i64"
     emitLine s!"  {idxNext} = {addOp} {curIdx}, 1"
@@ -1268,6 +1344,14 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
     emitCode k retTy loopAccTarget
   | .parFor outVar lenVar inputs elemTy kernel k =>
     emitParForLoop outVar lenVar inputs elemTy kernel
+    modify fun s => { s with retainedFacts := s.retainedFacts.filter fun
+      | .idxLt i n => i != outVar && n != outVar
+      | .noOverflowAdd a b _ _ | .noOverflowSub a b _ _ | .noOverflowMul a b _ _ =>
+        a != outVar && b != outVar
+      | .alignedPtr p _ => p != outVar
+      | .disjointSlices a b la lb =>
+        a != outVar && b != outVar && la != outVar && lb != outVar
+      | .exclusiveObj _ => false }
     emitCode k retTy loopAccTarget
   | .ret v =>
     match loopAccTarget with
@@ -1314,6 +1398,25 @@ def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_
     (localScalarSigs : List (String × List LNIRType × LNIRType) := []) (isaOverride? : Option IsaLevel := none) : String :=
   let fnSym := sanitizeSymbol d.name
   let retTypeStr := sigLLVMAttr target d.retTy ++ sigLLVMType target d.retTy
+  let isWordParam (id : VarId) : Bool :=
+    match d.params.find? (·.id == id) with
+    | some p => p.ty == .i64 || (p.ty == .usize && !target.isWasm)
+    | none => false
+  let isRawPtrParam (id : VarId) : Bool :=
+    match d.params.find? (·.id == id) with
+    | some p => match p.ty with | .rawPtr _ => true | _ => false
+    | none => false
+  let initFacts := d.retainedFacts.filter fun
+    | .idxLt i n => isWordParam i && isWordParam n
+    | .noOverflowAdd a b _ _ | .noOverflowSub a b _ _ | .noOverflowMul a b _ _ =>
+      isWordParam a && isWordParam b
+    | .alignedPtr p _ => isRawPtrParam p || isWordParam p
+    | .disjointSlices a b la lb =>
+      isRawPtrParam a && isRawPtrParam b && isWordParam la && isWordParam lb
+    | .exclusiveObj o =>
+      match d.params.find? (·.id == o) with
+      | some p => match p.ty with | .sarray _ | .objPtr => true | _ => false
+      | none => false
   let paramSigs := d.params.map fun p =>
     let rawPTy := sigLLVMType target p.ty
     let pTy := if rawPTy == "void" then "ptr" else rawPTy
@@ -1357,7 +1460,8 @@ def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_
   let targetIsa := isaOverride?.getD target.isaLevel
   let declIsa := codegenRequires d targetIsa
   let (_, finalState) := (emitCode d.body d.retTy none).run {
-    optimized, target, isa := declIsa, rcMode, localScalarSigs, varTypes := allVars
+    optimized, target, isa := declIsa, rcMode, localScalarSigs,
+    retainedFacts := initFacts, varTypes := allVars
   }
   String.intercalate "\n" ([
     s!"; LNIRDecl: {d.name} (assurance={d.assurance}, isGpuCand={d.isGpuCand}, rcMode={repr rcMode}, isaMask={declIsa.hwcapMask})",

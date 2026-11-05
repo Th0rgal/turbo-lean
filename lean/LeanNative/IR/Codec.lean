@@ -563,8 +563,50 @@ private def decodeParamList (fuel : Nat) : Nat → List String → Option (List 
     let (ps, rest2) ← decodeParamList fuel n rest1
     some (p :: ps, rest2)
 
+private def encodeFactTokens : RetainedFact → List String
+  | .idxLt i n => ["F_lt", encodeNat i, encodeNat n]
+  | .noOverflowAdd a b nsw nuw =>
+    ["F_add", encodeNat a, encodeNat b, encodeBool nsw, encodeBool nuw]
+  | .noOverflowSub a b nsw nuw =>
+    ["F_sub", encodeNat a, encodeNat b, encodeBool nsw, encodeBool nuw]
+  | .noOverflowMul a b nsw nuw =>
+    ["F_mul", encodeNat a, encodeNat b, encodeBool nsw, encodeBool nuw]
+  | .alignedPtr p n => ["F_aln", encodeNat p, encodeNat n]
+  | .disjointSlices a b la lb =>
+    ["F_disj", encodeNat a, encodeNat b, encodeNat la, encodeNat lb]
+  | .exclusiveObj o => ["F_excl", encodeNat o]
+
+private def decodeFactTokens (toks : List String) : Option (RetainedFact × List String) :=
+  match toks with
+  | "F_lt" :: iT :: nT :: r => do
+    some (.idxLt (← decodeNat iT) (← decodeNat nT), r)
+  | "F_add" :: aT :: bT :: sT :: uT :: r => do
+    some (.noOverflowAdd (← decodeNat aT) (← decodeNat bT) (← decodeBool sT) (← decodeBool uT), r)
+  | "F_sub" :: aT :: bT :: sT :: uT :: r => do
+    some (.noOverflowSub (← decodeNat aT) (← decodeNat bT) (← decodeBool sT) (← decodeBool uT), r)
+  | "F_mul" :: aT :: bT :: sT :: uT :: r => do
+    some (.noOverflowMul (← decodeNat aT) (← decodeNat bT) (← decodeBool sT) (← decodeBool uT), r)
+  | "F_aln" :: pT :: nT :: r => do
+    some (.alignedPtr (← decodeNat pT) (← decodeNat nT), r)
+  | "F_disj" :: aT :: bT :: laT :: lbT :: r => do
+    some (.disjointSlices (← decodeNat aT) (← decodeNat bT) (← decodeNat laT) (← decodeNat lbT), r)
+  | "F_excl" :: oT :: r => do
+    some (.exclusiveObj (← decodeNat oT), r)
+  | _ => none
+
+private def decodeFactList : Nat → List String → Option (FactEnv × List String)
+  | 0, toks => some ([], toks)
+  | n + 1, toks => do
+    let (f, rest1) ← decodeFactTokens toks
+    let (fs, rest2) ← decodeFactList n rest1
+    some (f :: fs, rest2)
+
 private def encodeDeclTokens (d : LNIRDecl) : List String :=
   let paramToks := d.params.foldr (fun p acc => encodeParamTokens p ++ acc) []
+  let factToks :=
+    if d.retainedFacts.isEmpty then []
+    else "F_facts" :: encodeNat d.retainedFacts.length ::
+      d.retainedFacts.foldr (fun f acc => encodeFactTokens f ++ acc) []
   "D_decl" ::
     hexEncodeString d.name ::
     encodeAssurance d.assurance ::
@@ -572,7 +614,8 @@ private def encodeDeclTokens (d : LNIRDecl) : List String :=
     encodeNat d.params.length ::
     paramToks ++
     encodeTypeTokens d.retTy ++
-    encodeCodeTokens d.body
+    encodeCodeTokens d.body ++
+    factToks
 
 private def decodeDeclTokens (fuel : Nat) (toks : List String) : Option (LNIRDecl × List String) :=
   match toks with
@@ -584,7 +627,12 @@ private def decodeDeclTokens (fuel : Nat) (toks : List String) : Option (LNIRDec
     let (params, rest1) ← decodeParamList fuel pLen rest
     let (retTy, rest2) ← decodeTypeTokens fuel rest1
     let (body, rest3) ← decodeCodeTokens fuel rest2
-    some ({ name, params, retTy, body, assurance, isGpuCand }, rest3)
+    match rest3 with
+    | "F_facts" :: fLenT :: rest4 => do
+      let fLen ← decodeNat fLenT
+      let (retainedFacts, rest5) ← decodeFactList fLen rest4
+      some ({ name, params, retTy, body, assurance, isGpuCand, retainedFacts }, rest5)
+    | _ => some ({ name, params, retTy, body, assurance, isGpuCand, retainedFacts := [] }, rest3)
   | _ => none
 
 private def decodeDeclList (fuel : Nat) : Nat → List String → Option (List LNIRDecl × List String)
