@@ -83,6 +83,11 @@ def verifiedTheoremRegistry : List String :=
     "superoptDeclCore_sound", "superoptDecl_sound", "superoptModuleCore_sound",
     "superoptModule_sound", "superoptModuleWithProfile_sound",
     "applyExprRules_sound", "applyRewriteTable_sound",
+    "certifyScalarPair_sound", "applyCertifiedScalarRewrite_sound", "stochasticProposerGate_sound",
+    "applyCertToScalar_sound", "foldCertifiedScalars_sound", "scalarRefines_eval",
+    "scalarRefines_of_eval", "applyCertsToScalar_sound",
+    "applyCertifiedBundleCode_sound", "CodeRefines.seqFor_congr", "stochasticCert_kills_unsound_mutant",
+    "stochasticCert_strict_cost_improvement", "stochasticCert_nonvacuous_pipeline",
     "scheduleStructuredLoop_sound", "applyLoopScheduleAux_refines",
     "elideAndMutateRC_sound", "rewriteCodeVerified_refines", "rewriteLNIRExprVerified_sound",
     "contractKernelScalar_sound", "specializeKernelCode_refines", "fuseMapScaleAddPair_algebra",
@@ -114,6 +119,9 @@ def verifiedTheoremRegistry : List String :=
   let sem := [
     "ScalarExprEquiv.refl", "ScalarExprEquiv.symm", "ScalarExprEquiv.trans",
     "ExprRefines.refl", "ExprRefines.trans", "ExprRefines.of_scalar_equiv",
+    "ExprRefines.scalar_eval", "ExprRefines.scalar_of_eval",
+    "ExprRefines.scalar_unaryOp_congr", "ExprRefines.scalar_binOp_congr",
+    "ExprRefines.scalar_select_congr", "ExprRefines.scalar_fma_congr",
     "ExprEquiv.refl", "ExprEquiv.symm", "ExprEquiv.trans", "ExprEquiv.toRefines",
     "CodeRefines.refl", "CodeRefines.trans", "CodeRefines.letBind_congr",
     "CodeRefines.rawStore_congr", "CodeRefines.incRef_congr", "CodeRefines.decRef_congr",
@@ -160,6 +168,7 @@ def verifiedTheoremRegistry : List String :=
   (proofs.map ("LeanNative.Proofs.SymbolicTVRefinesSoundness." ++ ·)) ++
   (proofs.map ("LeanNative.Proofs.SuperoptHelpersSoundness." ++ ·)) ++
   (proofs.map ("LeanNative.Proofs.SuperoptSoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.StochasticCertSoundness." ++ ·)) ++
   (xform.map ("LeanNative.Transform." ++ ·)) ++
   (sem.map ("LeanNative.Semantics." ++ ·)) ++
   (spec.map ("LeanNative.Spec." ++ ·)) ++

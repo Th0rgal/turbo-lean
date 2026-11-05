@@ -28,6 +28,7 @@ import LeanNative.Backend.LLVMEmitVerify
 import LeanNative.Driver.Worker
 import LeanNative.Driver.CAbiEmit
 import LeanNative.Driver.EvalBatch
+import LeanNative.Driver.StochasticEvolve
 import LeanSys.Posix
 import LeanSys.Codec
 
@@ -56,7 +57,7 @@ def valueTakingFlags : List String :=
    "--emit-fixtures", "--fixtures", "--emit-asm", "--asm", "--telemetry-spool",
    "--decl", "--args", "--cases-file", "--batch-file", "--fuel", "--clang-bin", "--ar-bin", "--emit-swift",
    "--swift", "--emit-modulemap", "--modulemap", "--emit-xcframework", "--xcframework",
-   "--emit-swift-package-skeleton", "--base", "--artifact-bundle"]
+    "--emit-swift-package-skeleton", "--base", "--artifact-bundle", "--stochastic-bundle"]
 
 def validateValueTakingFlags : List String → IO Unit
   | [] => return ()
@@ -263,7 +264,7 @@ def runCompileMode (tag : String) (elaborateHook? : Option (String → TargetArc
   if hasTelemetryOptIn args then
     let telCfg ← TelemetryConfig.probe args
     let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
-  let (optMod, _) := if opts.isBaseline then (baseMod, []) else runDefaultPipeline baseMod
+  let (optMod, _) ← if opts.isBaseline then pure (baseMod, []) else runOptPipelineWithArgs args false baseMod
   if !opts.emitCABI && !opts.emitPTX && !opts.emitMetal then
     if let some (dName, callee) := findUnsupportedLLVMCall? optMod then
       throw <| IO.userError s!"[{tag}] Unsupported external or non-scalar call '{callee}' in '{dName}'"
@@ -288,7 +289,7 @@ def runCompileLLVM (tag : String) (elaborateHook? : Option (String → TargetArc
   if hasTelemetryOptIn args then
     let telCfg ← TelemetryConfig.probe args
     let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
-  let (modToEmit, _) := if isBaseline then (baseMod, []) else runDefaultPipeline baseMod
+  let (modToEmit, _) ← if isBaseline then pure (baseMod, []) else runOptPipelineWithArgs args false baseMod
   -- `--slot-regression` is the fixed in-tree slot-typing fixture (its `ptr` slots are the point of the test)
   if let some (dName, callee) := if hasFlag args "--slot-regression" then none else findUnsupportedLLVMCall? modToEmit then
     throw <| IO.userError s!"[{tag}] Unsupported external or non-scalar call '{callee}' in '{dName}'"
@@ -319,7 +320,7 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → Targ
   let sel ← resolveInput args
   rejectLeanSourceWithoutFrontend tag "compile-static-lib" elaborateHook? args
   let baseMod ← loadInputModule elaborateHook? args (sel? := some sel)
-  let (optMod, _) := runDefaultPipeline baseMod
+  let (optMod, _) ← runOptPipelineWithArgs args false baseMod
   if let some (dName, callee) := findUnsupportedLLVMCall? optMod then
     throw <| IO.userError s!"[{tag}] Unsupported external or non-scalar call '{callee}' in '{dName}'"
   let (sigs, guards) ←
@@ -419,7 +420,7 @@ def runCompileMLIR (tag : String) (elaborateHook? : Option (String → TargetArc
   let (outPath, baseMod) := (findFlagValue args "-o" "", ← loadInputModule elaborateHook? args)
   let isStableHLO := hasFlag args "--tpu" || hasFlag args "--stablehlo" || hasFlag args "--tpu-stablehlo"
   let isPallas := hasFlag args "--pallas" || hasFlag args "--tpu-pallas"
-  let (optMod, _) := runDefaultPipeline baseMod
+  let (optMod, _) ← runOptPipelineWithArgs args false baseMod
   let mlirText := if isPallas then emitTPUPallasModule optMod else if isStableHLO then emitStableHLOModule optMod else emitMLIRModule optMod
   let kind := if isPallas then "TPU Pallas" else if isStableHLO then "TPU v5e StableHLO" else "GPU MLIR"
   writeOrPrint outPath mlirText (some s!"[{tag}] Wrote {kind} module to {outPath}")
@@ -427,13 +428,13 @@ def runCompileMLIR (tag : String) (elaborateHook? : Option (String → TargetArc
 def runCompilePTX (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let (smArch, outPath, isFastCheck) := (findFlagValue args "--sm" "sm_90", findFlagValue args "-o" "", hasFlag args "--fastcheck")
   let baseMod ← loadInputModule elaborateHook? args isFastCheck
-  let ptxText := if isFastCheck then emitFastCheckPTX baseMod smArch else emitPTXModule (runDefaultPipeline baseMod).1 smArch
+  let ptxText ← if isFastCheck then pure (emitFastCheckPTX baseMod smArch) else pure (emitPTXModule (← runOptPipelineWithArgs args false baseMod).1 smArch)
   writeOrPrint outPath ptxText (some s!"[{tag}] Wrote NVIDIA PTX 8.0 ({smArch}, fastcheck={isFastCheck}) to {outPath}")
 
 def runCompileMetal (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let (outPath, isFastCheck) := (findFlagValue args "-o" "", hasFlag args "--fastcheck")
   let baseMod ← loadInputModule elaborateHook? args isFastCheck
-  let mslText := if isFastCheck then emitFastCheckMetal baseMod else emitMetalModule (runDefaultPipeline baseMod).1
+  let mslText ← if isFastCheck then pure (emitFastCheckMetal baseMod) else pure (emitMetalModule (← runOptPipelineWithArgs args false baseMod).1)
   let (valid, errs) := validateMetalShader mslText
   if !valid then IO.eprintln s!"[{tag}] Metal shader validation errors: {errs}"; return 1
   writeOrPrint outPath mslText (some s!"[{tag}] Wrote Apple Metal Shading Language 3.0 (fastcheck={isFastCheck}, valid={valid}) to {outPath}")
@@ -468,7 +469,7 @@ def runCompileHybrid (tag : String) (elaborateHook? : Option (String → TargetA
     | some p => minGpuElems := p.minGpuElements
     | none => throw <| IO.userError s!"[{tag}] Failed to parse hardware profile from '{profilePath}'"
   let baseMod ← loadInputModule elaborateHook? args
-  let (optMod, _) := runDefaultPipeline baseMod
+  let (optMod, _) ← runOptPipelineWithArgs args false baseMod
   let plan := partitionModule optMod minGpuElems
   let glueText := emitHybridHostGlue plan
   writeOrPrint outPath glueText
@@ -530,18 +531,21 @@ def runPRVerify (tag : String) (args : List String) : IO UInt32 := do
   let baseRef := findFlagValue args "--base" "HEAD"
   let jsonFlag := hasFlag args "--json"
   let outPath := findFlagValue args "-o" ""
-  let specExists ← System.FilePath.pathExists "LeanNative/Spec.lean"
-  let testExists ← System.FilePath.pathExists "tests/test_runner.lean"
-  let specHashHex := blake3Hex (← if specExists then IO.FS.readFile "LeanNative/Spec.lean" else pure "")
-  let testHashHex := blake3Hex (← if testExists then IO.FS.readFile "tests/test_runner.lean" else pure "")
+  let root := if ← System.FilePath.pathExists "lean/LeanNative/Spec.lean" then "" else "../"
+  let specPath := root ++ "lean/LeanNative/Spec.lean"
+  let testPath := root ++ "scripts/ci_verify.sh"
+  let specExists ← System.FilePath.pathExists specPath
+  let testExists ← System.FilePath.pathExists testPath
+  let specHashHex := blake3Hex (← if specExists then IO.FS.readFile specPath else pure "")
+  let testHashHex := blake3Hex (← if testExists then IO.FS.readFile testPath else pure "")
   let disallowSpecChanges := hasFlag args "--disallow-spec-changes"
   let mut specUnchanged := specExists
   let mut testUnchanged := testExists
   if disallowSpecChanges then
     try
-      let changedFiles := (← IO.Process.output { cmd := "git", args := #["diff", "--name-only", baseRef, "--", "LeanNative/Spec.lean", "tests/test_runner.lean"] }).stdout.trimAscii.toString
+      let changedFiles := (← IO.Process.output { cmd := "git", args := #["diff", "--name-only", baseRef, "--", specPath, testPath] }).stdout.trimAscii.toString
       if changedFiles.contains "LeanNative/Spec.lean" then specUnchanged := false
-      if changedFiles.contains "tests/test_runner.lean" then testUnchanged := false
+      if changedFiles.contains "scripts/ci_verify.sh" then testUnchanged := false
     catch _ => pure ()
   let baseMod := mkCanonicalBenchmarkModule
   let (optMod, pluginReport) := runSegregatedPluginPipeline .x86_64 true baseMod
@@ -569,7 +573,7 @@ def runPRVerify (tag : String) (args : List String) : IO UInt32 := do
 def runVerifyCerts (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   let baseMod ← loadInputModule elaborateHook? args false false true
   let useVerifiedOnly := hasFlag args "--verified-kernel-only"
-  let (_, stepCerts) := if useVerifiedOnly then runVerifiedKernelPipeline baseMod else runDefaultPipeline baseMod
+  let (_, stepCerts) ← runOptPipelineWithArgs args useVerifiedOnly baseMod
   let report := verifyModuleCerts baseMod.moduleName (stepCerts.map toOptimizationCert)
   let summaryText := s!"[{tag}] Certificate Verification for {report.moduleName}:\n  Total pass certificates : {report.certs.length}\n  Declarations verified   : {report.declSummaries.length}\n  Overall assurance level : {report.overallAssurance}\n  Hash chains & theorems  : {if report.verified then "VALID" else "FAILED"}"
   writeAndPrintJsonOrSummary (findFlagValue args "-o" "") report.toJson summaryText (hasFlag args "--json")
@@ -579,7 +583,7 @@ def runValidateTV (elaborateHook? : Option (String → TargetArch → IO LNIRMod
   let outPath := findFlagValue args "-o" ""
   let jsonFlag := hasFlag args "--json"
   let baseMod ← loadInputModule elaborateHook? args false false true
-  let (optMod, _) := runDefaultPipeline baseMod
+  let (optMod, _) ← runOptPipelineWithArgs args false baseMod
   let tvReport := validateTranslationModule baseMod optMod
   writeAndPrintJsonOrSummary outPath tvReport.toJson tvReport.formatSummary jsonFlag
   return if tvReport.allPassed then 0 else 1
@@ -873,10 +877,7 @@ def runEvalLNIR (elaborateHook? : Option (String → TargetArch → IO LNIRModul
   let useVerifiedOnly := hasFlag args "--verified-kernel-only"
   let batchJson := hasFlag args "--batch-json"
   let baseMod ← loadInputModule elaborateHook? args false false true
-  let (mod, _) :=
-    if !useOpt then (baseMod, [])
-    else if useVerifiedOnly then runVerifiedKernelPipeline baseMod
-    else runDefaultPipeline baseMod
+  let (mod, _) ← if !useOpt then pure (baseMod, []) else runOptPipelineWithArgs args useVerifiedOnly baseMod
   if !casesFile.isEmpty then
     return (← runEvalCasesFile fuel arch mod casesFile)
   let findUniqueDecl (name : String) : IO LNIRDecl := do
@@ -934,6 +935,7 @@ def rcAdtSupportedCommands : List String := ["emit-lnir", "eval-lnir", "validate
 /-- Shared CLI dispatcher for both `lean-native-core` (`elaborateHook? = none`) and `lean-native` (`elaborateHook? = some ...`). -/
 def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule))
     (args : List String) : IO (Option UInt32) := do
+  if let "superopt-evolve" :: rest := args then return some (← runSuperoptEvolve elaborateHook? rest)
   validateValueTakingFlags args
   let isCabiFallback := !(args.headD "").startsWith "compile" && (hasFlag args "--c-abi" || hasFlag args "--emit-c-abi")
   if hasFlag args "--allow-rc-adt" && (!(rcAdtSupportedCommands.contains (args.headD "")) || isCabiFallback) then

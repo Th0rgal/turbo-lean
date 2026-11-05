@@ -47,6 +47,76 @@ theorem of_scalar_equiv {s1 s2 : ScalarExpr} (h : ScalarExprEquiv s1 s2) :
   simp only [evalExpr, ← h env]
   exact heval
 
+theorem scalar_eval {a b : ScalarExpr} (h : ExprRefines (.scalar a) (.scalar b))
+    (env : VarEnv) (v : Val) (hv : evalScalarExpr env a = .ok v) : evalScalarExpr env b = .ok v := by
+  have hh := h env HeapState.empty v HeapState.empty (by simp [evalExpr, hv])
+  cases he : evalScalarExpr env b <;> simp_all [evalExpr]
+
+theorem scalar_of_eval {a b : ScalarExpr}
+    (h : ∀ env v, evalScalarExpr env a = .ok v → evalScalarExpr env b = .ok v) :
+    ExprRefines (.scalar a) (.scalar b) := by
+  intro env st v st' hv
+  cases he : evalScalarExpr env a with
+  | error err => simp [evalExpr, he] at hv
+  | ok w => simpa [evalExpr, he, h env w he] using hv
+
+theorem scalar_unaryOp_congr {op : UnaryOp} {a a' : ScalarExpr}
+    (ha : ExprRefines (.scalar a) (.scalar a')) :
+    ExprRefines (.scalar (.unaryOp op a)) (.scalar (.unaryOp op a')) := by
+  apply scalar_of_eval
+  intro env v hv
+  simp only [evalScalarExpr] at hv ⊢
+  split at hv
+  next w hw => simpa only [scalar_eval ha env w hw] using hv
+  next => contradiction
+
+theorem scalar_binOp_congr {op : BinOp} {a a' b b' : ScalarExpr}
+    (ha : ExprRefines (.scalar a) (.scalar a')) (hb : ExprRefines (.scalar b) (.scalar b')) :
+    ExprRefines (.scalar (.binOp op a b)) (.scalar (.binOp op a' b')) := by
+  apply scalar_of_eval
+  intro env v hv
+  simp only [evalScalarExpr] at hv ⊢
+  split at hv
+  next x y hx hy => simpa only [scalar_eval ha env x hx, scalar_eval hb env y hy] using hv
+  next => contradiction
+  next => contradiction
+
+theorem scalar_select_congr {c c' t t' f f' : ScalarExpr}
+    (hc : ExprRefines (.scalar c) (.scalar c')) (ht : ExprRefines (.scalar t) (.scalar t'))
+    (hf : ExprRefines (.scalar f) (.scalar f')) :
+    ExprRefines (.scalar (.select c t f)) (.scalar (.select c' t' f')) := by
+  apply scalar_of_eval
+  intro env v hv
+  simp only [evalScalarExpr] at hv ⊢
+  split at hv
+  next h => simpa only [scalar_eval hc _ _ h] using scalar_eval ht env v hv
+  next h => simpa only [scalar_eval hc _ _ h] using scalar_eval hf env v hv
+  next n h =>
+    simp only [scalar_eval hc _ _ h]
+    split at hv <;> rename_i hn
+    · simpa only [hn, ↓reduceIte] using scalar_eval ht env v hv
+    · simpa [hn] using scalar_eval hf env v hv
+  next n h =>
+    simp only [scalar_eval hc _ _ h]
+    split at hv <;> rename_i hn
+    · simpa only [hn, ↓reduceIte] using scalar_eval ht env v hv
+    · simpa [hn] using scalar_eval hf env v hv
+  next => contradiction
+  next => contradiction
+
+theorem scalar_fma_congr {a a' b b' c c' : ScalarExpr}
+    (ha : ExprRefines (.scalar a) (.scalar a')) (hb : ExprRefines (.scalar b) (.scalar b'))
+    (hc : ExprRefines (.scalar c) (.scalar c')) :
+    ExprRefines (.scalar (.fma a b c)) (.scalar (.fma a' b' c')) := by
+  apply scalar_of_eval
+  intro env v hv
+  simp only [evalScalarExpr] at hv ⊢
+  split at hv <;> try contradiction
+  next x y hx hy =>
+    simp only [scalar_eval ha env x hx, scalar_eval hb env y hy]
+    split at hv <;> try contradiction
+    next xy z hxy hz => simpa only [hxy, scalar_eval hc env z hz] using hv
+
 end ExprRefines
 
 /-- Strong denotational equivalence on `LNIRExpr`. -/

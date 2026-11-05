@@ -16,6 +16,7 @@ import LeanNative.Proofs.SymbolicTVSoundness
 import LeanNative.Proofs.SymbolicTVCodeSoundness
 import LeanNative.Proofs.SymbolicTVRefinesSoundness
 import LeanNative.Proofs.SuperoptSoundness
+import LeanNative.Proofs.StochasticCertSoundness
 import LeanNative.Proofs.CertChecker
 import LeanNative.Proofs.MutantSuite
 import LeanNative.Transform.EqSat
@@ -66,6 +67,11 @@ def auditedTheoremNames : List Name :=
   [ ``LeanNative.Semantics.ScalarExprEquiv.refl, ``LeanNative.Semantics.ScalarExprEquiv.symm
   , ``LeanNative.Semantics.ScalarExprEquiv.trans, ``LeanNative.Semantics.ExprRefines.refl
   , ``LeanNative.Semantics.ExprRefines.trans, ``LeanNative.Semantics.ExprRefines.of_scalar_equiv
+  , ``LeanNative.Semantics.ExprRefines.scalar_eval, ``LeanNative.Semantics.ExprRefines.scalar_of_eval
+  , ``LeanNative.Semantics.ExprRefines.scalar_unaryOp_congr
+  , ``LeanNative.Semantics.ExprRefines.scalar_binOp_congr
+  , ``LeanNative.Semantics.ExprRefines.scalar_select_congr
+  , ``LeanNative.Semantics.ExprRefines.scalar_fma_congr
   , ``LeanNative.Semantics.ExprEquiv.refl, ``LeanNative.Semantics.ExprEquiv.symm
   , ``LeanNative.Semantics.ExprEquiv.trans, ``LeanNative.Semantics.ExprEquiv.toRefines
   , ``LeanNative.Semantics.CodeRefines.refl, ``LeanNative.Semantics.CodeRefines.trans
@@ -469,6 +475,17 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.ptxBoundsFreeLoad_sound
   , ``LeanNative.Proofs.metalBoundsFreeLoad_sound
   , ``LeanNative.Proofs.proofRetention_pipeline_nonvacuous
+  , ``LeanNative.Proofs.certifyScalarPair_sound
+  , ``LeanNative.Proofs.applyCertToScalar_sound, ``LeanNative.Proofs.foldCertifiedScalars_sound
+  , ``LeanNative.Proofs.scalarRefines_eval, ``LeanNative.Proofs.scalarRefines_of_eval
+  , ``LeanNative.Proofs.applyCertsToScalar_sound
+  , ``LeanNative.Proofs.applyCertifiedScalarRewrite_sound
+  , ``LeanNative.Proofs.stochasticProposerGate_sound
+  , ``LeanNative.Proofs.applyCertifiedBundleCode_sound
+  , ``LeanNative.Proofs.CodeRefines.seqFor_congr
+  , ``LeanNative.Proofs.stochasticCert_kills_unsound_mutant
+  , ``LeanNative.Proofs.stochasticCert_strict_cost_improvement
+  , ``LeanNative.Proofs.stochasticCert_nonvacuous_pipeline
   ]
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/
