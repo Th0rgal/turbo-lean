@@ -757,7 +757,7 @@ theorem elideBorrowedAndThreadLocalRC_sound (v : VarId) (code : LNIRCode)
           | _ => cases vhi <;> contradiction
   | parFor ov lv ins ety kern k ih =>
     dsimp only [elideBorrowedAndThreadLocalRC, evalCode] at hsrc ⊢
-    cases hpar : evalParFor fuel env st lv ins kern with
+    cases hpar : evalParFor fuel env st lv ins kern ety with
     | error _ => rw [hpar] at hsrc; contradiction
     | ok pair =>
       rcases pair with ⟨resVal, st1⟩

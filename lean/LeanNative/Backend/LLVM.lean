@@ -30,6 +30,7 @@ def sigLLVMType (target : TargetArch := .x86_64) : LNIRType → String
   | .i1 | .i8 => "i8"
   | .i16 => "i16"
   | .i32 => "i32"
+  | .f64 => "double"
   | .usize => if target.isWasm then "i32" else "i64"
   | ty => slotLLVMType ty
 
@@ -451,6 +452,169 @@ def heapBoxWidth? : LNIRType → Option Nat
   | .f32 => some 4
   | _ => none
 
+/-- Byte shift (`0` for 1B, `1` for 2B, `2` for 4B, `3` for 8B) and helper suffix for scalar-array elements. -/
+private def sarrayElemSuffix : LNIRType → String
+  | .i1 | .i8 => "_e1"
+  | .i16 => "_e2"
+  | .i32 | .f32 => "_e4"
+  | _ => ""
+
+/-- Emit target-aware `lean_sarray_object.m_size` load (byte offset 8, `size_t` = `i32` on `wasm32`, `i64` on 64-bit). -/
+private def emitSarraySizeLoad (pfx arrPtr : String) : EmitM String := do
+  let target := (← get).target
+  let szPtr ← freshTmp (pfx ++ "_ptr")
+  emitLine s!"  {szPtr} = getelementptr inbounds i8, ptr {arrPtr}, i64 8"
+  if target.isWasm then
+    let sz32 ← freshTmp (pfx ++ "_u32")
+    let szVal ← freshTmp (pfx ++ "_val")
+    emitLine s!"  {sz32} = load i32, ptr {szPtr}, align 4"
+    emitLine s!"  {szVal} = zext i32 {sz32} to i64"
+    return szVal
+  else
+    let szVal ← freshTmp (pfx ++ "_val")
+    emitLine s!"  {szVal} = load i64, ptr {szPtr}, align 8"
+    return szVal
+
+/-- Element byte width stored in `lean_sarray_object.m_header.m_other` (`1`, `2`, `4`, or `8`). -/
+private def sarrayElemByteSize : LNIRType → Nat
+  | .i1 | .i8 => 1
+  | .i16 => 2
+  | .i32 | .f32 => 4
+  | _ => 8
+
+/-- Emit complete `lean_sarray_object` header (`m_rc = 1`, `m_cs_sz = 0`, `m_other = elemBytes`,
+    `m_tag = LeanScalarArray = 248`) and target-aware `m_size`/`m_capacity` writes. -/
+private def emitSarrayHeaderStores (pfx outArr nVal : String) (elemBytes : Nat) : EmitM Unit := do
+  let target := (← get).target
+  let csPtr ← freshTmp (pfx ++ "_cs_ptr")
+  let otPtr ← freshTmp (pfx ++ "_ot_ptr")
+  let tgPtr ← freshTmp (pfx ++ "_tg_ptr")
+  let szPtr ← freshTmp (pfx ++ "_sz_ptr")
+  let capPtr ← freshTmp (pfx ++ "_cap_ptr")
+  emitLine s!"  store i32 1, ptr {outArr}, align 4"
+  emitLine s!"  {csPtr} = getelementptr inbounds i8, ptr {outArr}, i64 4"
+  emitLine s!"  store i16 0, ptr {csPtr}, align 2"
+  emitLine s!"  {otPtr} = getelementptr inbounds i8, ptr {outArr}, i64 6"
+  emitLine s!"  store i8 {elemBytes}, ptr {otPtr}, align 1"
+  emitLine s!"  {tgPtr} = getelementptr inbounds i8, ptr {outArr}, i64 7"
+  emitLine s!"  store i8 248, ptr {tgPtr}, align 1"
+  emitLine s!"  {szPtr} = getelementptr inbounds i8, ptr {outArr}, i64 8"
+  if target.isWasm then
+    let n32 ← freshTmp (pfx ++ "_n32")
+    emitLine s!"  {n32} = trunc i64 {nVal} to i32"
+    emitLine s!"  store i32 {n32}, ptr {szPtr}, align 4"
+    emitLine s!"  {capPtr} = getelementptr inbounds i8, ptr {outArr}, i64 12"
+    emitLine s!"  store i32 {n32}, ptr {capPtr}, align 4"
+  else
+    emitLine s!"  store i64 {nVal}, ptr {szPtr}, align 8"
+    emitLine s!"  {capPtr} = getelementptr inbounds i8, ptr {outArr}, i64 16"
+    emitLine s!"  store i64 {nVal}, ptr {capPtr}, align 8"
+
+/-- Byte offset of `lean_sarray_object.m_data[]` (`16` on 32-bit `wasm32`, `24` on 64-bit targets). -/
+private def sarrayDataByteOffset (target : TargetArch) : Nat :=
+  if target.isWasm then 16 else 24
+
+private def emitSarrayDataPtr (pfx arrPtr : String) : EmitM String := do
+  let target := (← get).target
+  let dataPtr ← freshTmp pfx
+  emitLine s!"  {dataPtr} = getelementptr inbounds i8, ptr {arrPtr}, i64 {sarrayDataByteOffset target}"
+  return dataPtr
+
+/-- Emit target-ABI `@malloc` (`i32` on `wasm32`, `i64` on 64-bit) with `size_t` overflow trap. -/
+private def emitTargetMalloc (pfx outArr bytesVal : String) (elemBound? : Option (String × UInt64) := none) : EmitM Unit := do
+  let target := (← get).target
+  let emitTrapIf (ovfCond : String) : EmitM Unit := do
+    let trapLbl ← freshLabel (pfx ++ "_alloc_trap")
+    let okLbl ← freshLabel (pfx ++ "_alloc_ok")
+    emitLine s!"  br i1 {ovfCond}, label %{trapLbl}, label %{okLbl}"
+    emitLine s!"{trapLbl}:\n  call void @llvm.trap()\n  unreachable\n{okLbl}:"
+  if target.isWasm then
+    let ovfBytes ← freshTmp (pfx ++ "_ovf_b")
+    let ovfCond ← match elemBound? with
+      | some (nVal, maxElems) =>
+        let ovfN ← freshTmp (pfx ++ "_ovf_n")
+        let ovfAny ← freshTmp (pfx ++ "_ovf")
+        emitLine s!"  {ovfN} = icmp ugt i64 {nVal}, {maxElems}"
+        emitLine s!"  {ovfBytes} = icmp ugt i64 {bytesVal}, 4294967295"
+        emitLine s!"  {ovfAny} = or i1 {ovfN}, {ovfBytes}"
+        pure ovfAny
+      | none =>
+        emitLine s!"  {ovfBytes} = icmp ugt i64 {bytesVal}, 4294967295"
+        pure ovfBytes
+    emitTrapIf ovfCond
+    let sz32 ← freshTmp (pfx ++ "_sz32")
+    emitLine s!"  {sz32} = trunc i64 {bytesVal} to i32"
+    emitLine s!"  {outArr} = call noalias ptr @malloc(i32 {sz32})"
+  else
+    match elemBound? with
+    | some (nVal, maxElems) =>
+      let ovfN ← freshTmp (pfx ++ "_ovf_n")
+      emitLine s!"  {ovfN} = icmp ugt i64 {nVal}, {maxElems}"
+      emitTrapIf ovfN
+    | none => pure ()
+    emitLine s!"  {outArr} = call noalias ptr @malloc(i64 {bytesVal})"
+
+/-- Emit an element-width `getelementptr inbounds` + `load` (zero-extended to `i64`) at `idxVal` from `basePtr`. -/
+private def emitTypedArrayLoadValue (pfx basePtr idxVal : String) (elemTy : LNIRType)
+    (defaultAlign : Nat := 8) (valPfx? : Option String := none) : EmitM String := do
+  let elemPtr ← freshTmp (pfx ++ "_gep")
+  let vPfx := valPfx?.getD (pfx ++ "_val")
+  match elemTy with
+  | .i1 | .i8 =>
+    let rawVal ← freshTmp (pfx ++ "_i8")
+    let elemVal ← freshTmp vPfx
+    emitLine s!"  {elemPtr} = getelementptr inbounds i8, ptr {basePtr}, i64 {idxVal}"
+    emitLine s!"  {rawVal} = load i8, ptr {elemPtr}, align 1"
+    emitLine s!"  {elemVal} = zext i8 {rawVal} to i64"
+    return elemVal
+  | .i16 =>
+    let rawVal ← freshTmp (pfx ++ "_i16")
+    let elemVal ← freshTmp vPfx
+    emitLine s!"  {elemPtr} = getelementptr inbounds i16, ptr {basePtr}, i64 {idxVal}"
+    emitLine s!"  {rawVal} = load i16, ptr {elemPtr}, align 2"
+    emitLine s!"  {elemVal} = zext i16 {rawVal} to i64"
+    return elemVal
+  | .i32 | .f32 =>
+    let rawVal ← freshTmp (pfx ++ "_i32")
+    let elemVal ← freshTmp vPfx
+    emitLine s!"  {elemPtr} = getelementptr inbounds i32, ptr {basePtr}, i64 {idxVal}"
+    emitLine s!"  {rawVal} = load i32, ptr {elemPtr}, align 4"
+    emitLine s!"  {elemVal} = zext i32 {rawVal} to i64"
+    return elemVal
+  | _ =>
+    let elemVal ← freshTmp vPfx
+    emitLine s!"  {elemPtr} = getelementptr inbounds i64, ptr {basePtr}, i64 {idxVal}"
+    emitLine s!"  {elemVal} = load i64, ptr {elemPtr}, align {defaultAlign}"
+    return elemVal
+
+private def emitTypedArrayLoad (dst : VarId) (pfx basePtr idxVal : String) (elemTy : LNIRType)
+    (defaultAlign : Nat := 8) : EmitM Unit := do
+  let elemVal ← emitTypedArrayLoadValue pfx basePtr idxVal elemTy defaultAlign
+  storeI64ToVar dst elemVal
+
+/-- Emit an element-width `getelementptr inbounds` + `store` (truncated from `i64`) at `idxVal` into `basePtr`. -/
+private def emitTypedArrayStore (pfx basePtr idxVal valI64 : String) (elemTy : LNIRType) : EmitM Unit := do
+  let elemPtr ← freshTmp (pfx ++ "_gep")
+  match elemTy with
+  | .i1 | .i8 =>
+    let tr ← freshTmp (pfx ++ "_tr8")
+    emitLine s!"  {elemPtr} = getelementptr inbounds i8, ptr {basePtr}, i64 {idxVal}"
+    emitLine s!"  {tr} = trunc i64 {valI64} to i8"
+    emitLine s!"  store i8 {tr}, ptr {elemPtr}, align 1"
+  | .i16 =>
+    let tr ← freshTmp (pfx ++ "_tr16")
+    emitLine s!"  {elemPtr} = getelementptr inbounds i16, ptr {basePtr}, i64 {idxVal}"
+    emitLine s!"  {tr} = trunc i64 {valI64} to i16"
+    emitLine s!"  store i16 {tr}, ptr {elemPtr}, align 2"
+  | .i32 | .f32 =>
+    let tr ← freshTmp (pfx ++ "_tr32")
+    emitLine s!"  {elemPtr} = getelementptr inbounds i32, ptr {basePtr}, i64 {idxVal}"
+    emitLine s!"  {tr} = trunc i64 {valI64} to i32"
+    emitLine s!"  store i32 {tr}, ptr {elemPtr}, align 4"
+  | _ =>
+    emitLine s!"  {elemPtr} = getelementptr inbounds i64, ptr {basePtr}, i64 {idxVal}"
+    emitLine s!"  store i64 {valI64}, ptr {elemPtr}, align 8"
+
 private def emitChecked256Op (opName pfx lVal rVal res : String) : EmitM String := do
   let ov ← freshTmp (pfx ++ "_ov")
   let flag ← freshTmp (pfx ++ "_flag")
@@ -836,20 +1000,15 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
     emitLine s!"  br label %{joinLbl}\n{joinLbl}:"
   | .sarrayLen arrVar =>
     let arrPtr ← loadVarAsPtr arrVar
-    -- Offset 8 bytes (1 x i64) is `size_t m_size` in `lean_native_sarray_u64`
-    let szPtr ← freshTmp "sz_ptr"
-    let szVal ← freshTmp "sz_val"
-    emitLine s!"  {szPtr} = getelementptr inbounds i64, ptr {arrPtr}, i64 1"
-    emitLine s!"  {szVal} = load i64, ptr {szPtr}, align 8"
+    let szVal ← emitSarraySizeLoad "sz" arrPtr
     storeI64ToVar dst szVal
   | .sarrayDataPtr arrVar _ =>
     let arrPtr ← loadVarAsPtr arrVar
-    -- Offset 24 bytes (3 x i64) is `uint64_t m_data[]` in `lean_native_sarray_u64`
-    let dataPtr ← freshTmp "data_ptr"
-    emitLine s!"  {dataPtr} = getelementptr inbounds i64, ptr {arrPtr}, i64 3"
+    let dataPtr ← emitSarrayDataPtr "data_ptr" arrPtr
     storePtrToVar dst dataPtr
-  | .sarrayEnsureExclusive arrVar _ =>
+  | .sarrayEnsureExclusive arrVar elemTy =>
     let arrPtr ← loadVarAsPtr arrVar
+    let cowFn := "@lean_native_ensure_exclusive" ++ sarrayElemSuffix elemTy
     if opt then
       -- Inline fast-path exclusivity check with @llvm.expect.i1
       let rcVal ← freshTmp "cow_rc"
@@ -867,51 +1026,40 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
       storePtrToVar dst arrPtr
       emitLine s!"  br label %{mergeLbl}"
       emitLine s!"{slowLbl}:"
-      emitLine s!"  {clonedPtr} = call ptr @lean_native_ensure_exclusive(ptr {arrPtr})"
+      emitLine s!"  {clonedPtr} = call ptr {cowFn}(ptr {arrPtr})"
       storePtrToVar dst clonedPtr
       emitLine s!"  br label %{mergeLbl}"
       emitLine s!"{mergeLbl}:"
     else
       let exclPtr ← freshTmp "cow_base"
-      emitLine s!"  {exclPtr} = call ptr @lean_native_ensure_exclusive(ptr {arrPtr})"
+      emitLine s!"  {exclPtr} = call ptr {cowFn}(ptr {arrPtr})"
       storePtrToVar dst exclPtr
-  | .sarrayGet arrVar idxVar _ =>
+  | .sarrayGet arrVar idxVar elemTy =>
     let arrPtr ← loadVarAsPtr arrVar
     let idxVal ← loadVarAsI64 idxVar
-    let dataPtr ← freshTmp "sget_data"
-    let elemPtr ← freshTmp "sget_gep"
-    let elemVal ← freshTmp "sget_val"
-    emitLine s!"  {dataPtr} = getelementptr inbounds i64, ptr {arrPtr}, i64 3"
-    emitLine s!"  {elemPtr} = getelementptr inbounds i64, ptr {dataPtr}, i64 {idxVal}"
-    emitLine s!"  {elemVal} = load i64, ptr {elemPtr}, align 8"
-    storeI64ToVar dst elemVal
-  | .sarraySet arrVar idxVar valVar _ =>
+    let dataPtr ← emitSarrayDataPtr "sget_data" arrPtr
+    emitTypedArrayLoad dst "sget" dataPtr idxVal elemTy
+  | .sarraySet arrVar idxVar valVar elemTy =>
     let arrPtr ← loadVarAsPtr arrVar
     let idxVal ← loadVarAsI64 idxVar
     let valI64 ← loadVarAsI64 valVar
+    let cowFn := "@lean_native_ensure_exclusive" ++ sarrayElemSuffix elemTy
     let targetArr ←
       if opt then
         pure arrPtr
       else do
         let excl ← freshTmp "sset_excl"
-        emitLine s!"  {excl} = call ptr @lean_native_ensure_exclusive(ptr {arrPtr})"
+        emitLine s!"  {excl} = call ptr {cowFn}(ptr {arrPtr})"
         pure excl
-    let dataPtr ← freshTmp "sset_data"
-    let elemPtr ← freshTmp "sset_gep"
-    emitLine s!"  {dataPtr} = getelementptr inbounds i64, ptr {targetArr}, i64 3"
-    emitLine s!"  {elemPtr} = getelementptr inbounds i64, ptr {dataPtr}, i64 {idxVal}"
-    emitLine s!"  store i64 {valI64}, ptr {elemPtr}, align 8"
+    let dataPtr ← emitSarrayDataPtr "sset_data" targetArr
+    emitTypedArrayStore "sset" dataPtr idxVal valI64 elemTy
     storePtrToVar dst targetArr
-  | .rawLoad ptrVar idxVar _ =>
+  | .rawLoad ptrVar idxVar elemTy =>
     let rawPtr ← loadVarAsPtr ptrVar
     let idxVal ← loadVarAsI64 idxVar
-    let elemPtr ← freshTmp "rld_gep"
-    let elemVal ← freshTmp "rld_val"
     let curFacts := (← get).retainedFacts
     let al := if idxVal == "0" then retainedAlignForPtr curFacts ptrVar 8 else 8
-    emitLine s!"  {elemPtr} = getelementptr inbounds i64, ptr {rawPtr}, i64 {idxVal}"
-    emitLine s!"  {elemVal} = load i64, ptr {elemPtr}, align {al}"
-    storeI64ToVar dst elemVal
+    emitTypedArrayLoad dst "rld" rawPtr idxVal elemTy al
   | .boxScalar valVar bty =>
     let v ← loadVarAsI64 valVar
     if let some w := heapBoxWidth? bty then
@@ -973,16 +1121,19 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
       emitLine s!"  {uVal} = call i64 @lean_native_unbox_u64(ptr {p})"
       storeI64ToVar dst uVal
     else if !isExt && callee == "lean_native_ensure_exclusive" && args.length == 1 && slotLLVMType ty == "ptr" then
-      let p ← loadVarAsPtr args.head!
+      let argVar := args.head!
+      let elemTy := match (← getVarSlotType argVar), ty with
+        | .sarray eTy, _ => eTy
+        | _, .sarray eTy => eTy
+        | _, _ => .i64
+      let cowFn := "@lean_native_ensure_exclusive" ++ sarrayElemSuffix elemTy
+      let p ← loadVarAsPtr argVar
       let excl ← freshTmp "call_excl"
-      emitLine s!"  {excl} = call ptr @lean_native_ensure_exclusive(ptr {p})"
+      emitLine s!"  {excl} = call ptr {cowFn}(ptr {p})"
       storePtrToVar dst excl
     else if !isExt && callee == "lean_native_sarray_len" && args.length == 1 && slotLLVMType ty == "i64" then
       let arrPtr ← loadVarAsPtr args.head!
-      let szPtr ← freshTmp "sz_ptr"
-      let szVal ← freshTmp "sz_val"
-      emitLine s!"  {szPtr} = getelementptr inbounds i64, ptr {arrPtr}, i64 1"
-      emitLine s!"  {szVal} = load i64, ptr {szPtr}, align 8"
+      let szVal ← emitSarraySizeLoad "sz" arrPtr
       storeI64ToVar dst szVal
     else if !isExt && slotLLVMType ty == "i64" then
       match localSig? with
@@ -990,21 +1141,28 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
         let argVals ← (args.zip paramTys).mapM fun (argVar, pTy) => do
           let llvmPTy := sigLLVMType st.target pTy
           let pAttr := sigLLVMAttr st.target pTy
-          if llvmPTy == "void" then
-            pure "ptr null"
-          else
-            let v64 ← loadVarAsI64 argVar
-            let v64' ← if pTy == .i1 then do
-              let m ← freshTmp "call_bmask"
-              emitLine s!"  {m} = and i64 {v64}, 1"
-              pure m
-            else pure v64
-            if llvmPTy == "i64" then
-              pure s!"i64 {v64'}"
+            if llvmPTy == "void" then
+              pure "ptr null"
+            else if llvmPTy == "ptr" then
+              let p ← loadVarAsPtr argVar
+              pure s!"ptr {p}"
             else
-              let tr ← freshTmp "call_tr"
-              emitLine s!"  {tr} = trunc i64 {v64'} to {llvmPTy}"
-              pure s!"{llvmPTy} {pAttr}{tr}"
+              let v64 ← loadVarAsI64 argVar
+              let v64' ← if pTy == .i1 then do
+                let m ← freshTmp "call_bmask"
+                emitLine s!"  {m} = and i64 {v64}, 1"
+                pure m
+              else pure v64
+              if llvmPTy == "i64" then
+                pure s!"i64 {v64'}"
+              else if llvmPTy == "double" then
+                let bc ← freshTmp "call_dbc"
+                emitLine s!"  {bc} = bitcast i64 {v64'} to double"
+                pure s!"double {bc}"
+              else
+                let tr ← freshTmp "call_tr"
+                emitLine s!"  {tr} = trunc i64 {v64'} to {llvmPTy}"
+                pure s!"{llvmPTy} {pAttr}{tr}"
         let argSig := String.intercalate ", " argVals
         let llvmRTy := sigLLVMType st.target retSigTy
         let rAttr := sigLLVMAttr st.target retSigTy
@@ -1014,10 +1172,15 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
         else
           let callRes ← freshTmp "call"
           emitLine s!"  {callRes} = call {rAttr}{llvmRTy} @{sanitizeSymbol callee}({argSig})"
-          let callRes64 ← if llvmRTy == "i64" then pure callRes else do
-            let zx ← freshTmp "call_zx"
-            emitLine s!"  {zx} = zext {llvmRTy} {callRes} to i64"
-            pure zx
+          let callRes64 ← if llvmRTy == "i64" then pure callRes
+            else if llvmRTy == "double" then do
+              let bc ← freshTmp "call_rbc"
+              emitLine s!"  {bc} = bitcast double {callRes} to i64"
+              pure bc
+            else do
+              let zx ← freshTmp "call_zx"
+              emitLine s!"  {zx} = zext {llvmRTy} {callRes} to i64"
+              pure zx
           storeI64ToVar dst callRes64
       | none =>
         emitLine "  call void @llvm.trap()"
@@ -1067,8 +1230,8 @@ def emitRefCountOp (isInc : Bool) (objVar : VarId) (count : Nat) : EmitM Unit :=
     emitLine s!"  call void {fn}(ptr {objPtr}, i64 {count})"
 
 /-- Emit a `parFor` data-parallel loop in LLVM IR with direct SSA `phi` induction variable
-    and uninitialized output allocation when every index is overwritten (`kernel != .stencil1D3Pt`). -/
-def emitParForLoop (outVar lenVar : VarId) (inputs : List VarId) (_elemTy : LNIRType)
+    and fresh output `sarray` allocation of exact length `nVal` (matching `evalParFor` fresh-buffer semantics). -/
+def emitParForLoop (outVar lenVar : VarId) (inputs : List VarId) (elemTy : LNIRType)
     (kernel : ParallelKernelKind) : EmitM Unit := do
   let st ← get
   let opt := st.optimized
@@ -1077,29 +1240,43 @@ def emitParForLoop (outVar lenVar : VarId) (inputs : List VarId) (_elemTy : LNIR
   let in1Var := inputs[1]?.getD in0Var
   let in0Arr ← loadVarAsPtr in0Var
   let in1Arr ← loadVarAsPtr in1Var
+  let in0ElemTy := match (← getVarSlotType in0Var) with | .sarray eTy => eTy | _ => elemTy
+  let in1ElemTy := match (← getVarSlotType in1Var) with | .sarray eTy => eTy | _ => elemTy
   emitLine "  ; certified chunk-partition & exclusive output invariant: leannative_verify_parfor_chunk_partition"
   let outArr ← freshTmp "par_out"
   let isDot := match kernel with | .dotProduct => true | _ => false
   if isDot then do
-    let szPtr ← freshTmp "dot_sz_ptr"
-    let capPtr ← freshTmp "dot_cap_ptr"
-    emitLine s!"  {outArr} = call noalias ptr @malloc(i64 32)"
-    emitLine s!"  store i32 1, ptr {outArr}, align 4"
-    emitLine s!"  {szPtr} = getelementptr inbounds i64, ptr {outArr}, i64 1\n  store i64 1, ptr {szPtr}, align 8"
-    emitLine s!"  {capPtr} = getelementptr inbounds i64, ptr {outArr}, i64 2\n  store i64 1, ptr {capPtr}, align 8"
+    let dotElemBytes := sarrayElemByteSize elemTy
+    let dotAllocBytes := sarrayDataByteOffset st.target + dotElemBytes
+    emitTargetMalloc "dot" outArr s!"{dotAllocBytes}"
+    emitSarrayHeaderStores "dot" outArr "1" dotElemBytes
   else do
-    let allocFn :=
-      match kernel with
-      | .stencil1D3Pt _ _ _ => "@lean_native_ensure_exclusive"
-      | _ => if opt then "@lean_native_ensure_exclusive_uninit" else "@lean_native_ensure_exclusive"
-    emitLine s!"  {outArr} = call ptr {allocFn}(ptr {in0Arr})"
+    let (bytesData, elemShift) ←
+      match elemTy with
+      | .i1 | .i8 => pure (nVal, 0)
+      | .i16 =>
+        let b ← freshTmp "par_b16"
+        emitLine s!"  {b} = shl i64 {nVal}, 1"
+        pure (b, 1)
+      | .i32 | .f32 =>
+        let b ← freshTmp "par_b32"
+        emitLine s!"  {b} = shl i64 {nVal}, 2"
+        pure (b, 2)
+      | _ =>
+        let b ← freshTmp "par_b64"
+        emitLine s!"  {b} = shl i64 {nVal}, 3"
+        pure (b, 3)
+    let totalBytes ← freshTmp "par_tot_bytes"
+    let hdrBytes := sarrayDataByteOffset st.target
+    emitLine s!"  {totalBytes} = add i64 {bytesData}, {hdrBytes}"
+    let maxAllocBytes : UInt64 := if st.target.isWasm then 4294967295 else (0 : UInt64) - 1
+    let maxElems : UInt64 := (maxAllocBytes - hdrBytes.toUInt64) >>> elemShift.toUInt64
+    emitTargetMalloc "par" outArr totalBytes (some (nVal, maxElems))
+    emitSarrayHeaderStores "par" outArr nVal (sarrayElemByteSize elemTy)
   storePtrToVar outVar outArr
-  let outData ← freshTmp "par_out_data"
-  let in0Data ← freshTmp "par_in0_data"
-  let in1Data ← freshTmp "par_in1_data"
-  emitLine s!"  {outData} = getelementptr inbounds i64, ptr {outArr}, i64 3"
-  emitLine s!"  {in0Data} = getelementptr inbounds i64, ptr {in0Arr}, i64 3"
-  emitLine s!"  {in1Data} = getelementptr inbounds i64, ptr {in1Arr}, i64 3"
+  let outData ← emitSarrayDataPtr "par_out_data" outArr
+  let in0Data ← emitSarrayDataPtr "par_in0_data" in0Arr
+  let in1Data ← emitSarrayDataPtr "par_in1_data" in1Arr
 
   let preHdrLbl ← freshLabel "par_prehdr"
   let condLbl ← freshLabel "par_cond"
@@ -1119,28 +1296,54 @@ def emitParForLoop (outVar lenVar : VarId) (inputs : List VarId) (_elemTy : LNIR
   emitLine s!"  br i1 {cmpVal}, label %{bodyLbl}, label %{exitLbl}"
   emitLine s!"{bodyLbl}:"
 
-  let p0 ← freshTmp "p_in0"
-  let v0 ← freshTmp "v_in0"
-  emitLine s!"  {p0} = getelementptr inbounds i64, ptr {in0Data}, i64 {ivVal}\n  {v0} = load i64, ptr {p0}, align 8"
-  let loadIn1 : EmitM String := do
-    let p1 ← freshTmp "p_in1"; let v1 ← freshTmp "v_in1"
-    emitLine s!"  {p1} = getelementptr inbounds i64, ptr {in1Data}, i64 {ivVal}\n  {v1} = load i64, ptr {p1}, align 8"
-    return v1
+  let loadIn0 : EmitM String := emitTypedArrayLoadValue "p_in0" in0Data ivVal in0ElemTy
+  let loadIn1 : EmitM String := emitTypedArrayLoadValue "p_in1" in1Data ivVal in1ElemTy
   let resVal ← match kernel with
     | .mapScaleAdd scale bias => do
-      let m ← freshTmp "msa_mul"; let a ← freshTmp "msa_add"
+      let v0 ← loadIn0; let m ← freshTmp "msa_mul"; let a ← freshTmp "msa_add"
       emitLine s!"  {m} = mul i64 {v0}, {scale}\n  {a} = add i64 {m}, {bias}"; pure a
     | .zipAdd => do
-      let v1 ← loadIn1; let a ← freshTmp "za_add"
+      let v0 ← loadIn0; let v1 ← loadIn1; let a ← freshTmp "za_add"
       emitLine s!"  {a} = add i64 {v0}, {v1}"; pure a
     | .zipMul | .dotProduct => do
-      let v1 ← loadIn1; let m ← freshTmp "zm_mul"
+      let v0 ← loadIn0; let v1 ← loadIn1; let m ← freshTmp "zm_mul"
       emitLine s!"  {m} = mul i64 {v0}, {v1}"; pure m
     | .saxpy alphaBits => do
-      let v1 ← loadIn1; let m ← freshTmp "sax_mul"; let a ← freshTmp "sax_add"
+      let v0 ← loadIn0; let v1 ← loadIn1; let m ← freshTmp "sax_mul"; let a ← freshTmp "sax_add"
       emitLine s!"  {m} = mul i64 {v0}, {alphaBits}\n  {a} = add i64 {m}, {v1}"; pure a
-    | .stencil1D3Pt _ wCenter _ => do
-      let m ← freshTmp "st_mul"; emitLine s!"  {m} = mul i64 {v0}, {wCenter}"; pure m
+    | .stencil1D3Pt wLeft wCenter wRight => do
+      let vCenter ← loadIn0
+      let stPreLbl ← freshLabel "st_pre"
+      let stIntLbl ← freshLabel "st_int"
+      let stJoinLbl ← freshLabel "st_join"
+      let isZero ← freshTmp "st_iz"
+      let ivPlus1 ← freshTmp "st_ip1"
+      let atEnd ← freshTmp "st_end"
+      let isBnd ← freshTmp "st_bnd"
+      let ivMinus1 ← freshTmp "st_im1"
+      let mL ← freshTmp "st_ml"
+      let mC ← freshTmp "st_mc"
+      let mR ← freshTmp "st_mr"
+      let sLC ← freshTmp "st_slc"
+      let sAll ← freshTmp "st_sall"
+      let stRes ← freshTmp "st_res"
+      emitLine s!"  br label %{stPreLbl}\n{stPreLbl}:"
+      emitLine s!"  {isZero} = icmp eq i64 {ivVal}, 0"
+      emitLine s!"  {ivPlus1} = add i64 {ivVal}, 1"
+      emitLine s!"  {atEnd} = icmp uge i64 {ivPlus1}, {nVal}"
+      emitLine s!"  {isBnd} = or i1 {isZero}, {atEnd}"
+      emitLine s!"  br i1 {isBnd}, label %{stJoinLbl}, label %{stIntLbl}\n{stIntLbl}:"
+      emitLine s!"  {ivMinus1} = sub i64 {ivVal}, 1"
+      let vLeft ← emitTypedArrayLoadValue "p_st_l" in0Data ivMinus1 in0ElemTy
+      let vRight ← emitTypedArrayLoadValue "p_st_r" in0Data ivPlus1 in0ElemTy
+      emitLine s!"  {mL} = mul i64 {vLeft}, {wLeft}"
+      emitLine s!"  {mC} = mul i64 {vCenter}, {wCenter}"
+      emitLine s!"  {mR} = mul i64 {vRight}, {wRight}"
+      emitLine s!"  {sLC} = add i64 {mL}, {mC}"
+      emitLine s!"  {sAll} = add i64 {sLC}, {mR}"
+      emitLine s!"  br label %{stJoinLbl}\n{stJoinLbl}:"
+      emitLine s!"  {stRes} = phi i64 [ {vCenter}, %{stPreLbl} ], [ {sAll}, %{stIntLbl} ]"
+      pure stRes
     | .customScalar idxVar inVars body => do
       let saved := (← get).scalarBindings
       let savedFacts := (← get).retainedFacts
@@ -1157,8 +1360,10 @@ def emitParForLoop (outVar lenVar : VarId) (inputs : List VarId) (_elemTy : LNIR
         | .exclusiveObj o => !shadowed.contains o
       let mut bindings := [(idxVar, ivVal)]
       for (bound, input) in inVars.zip inputs do
-        let arr ← loadVarAsPtr input; let ptr ← freshTmp "cs_ptr"; let elemPtr ← freshTmp "cs_at"; let value ← freshTmp "cs_value"
-        emitLine s!"  {ptr} = getelementptr inbounds i64, ptr {arr}, i64 3\n  {elemPtr} = getelementptr inbounds i64, ptr {ptr}, i64 {ivVal}\n  {value} = load i64, ptr {elemPtr}, align 8"
+        let arr ← loadVarAsPtr input
+        let inETy := match (← getVarSlotType input) with | .sarray eTy => eTy | _ => elemTy
+        let ptr ← emitSarrayDataPtr "cs_ptr" arr
+        let value ← emitTypedArrayLoadValue "cs_at" ptr ivVal inETy 8 (some "cs_value")
         bindings := bindings ++ [(bound, value)]
       modify fun s => {
         s with
@@ -1169,13 +1374,12 @@ def emitParForLoop (outVar lenVar : VarId) (inputs : List VarId) (_elemTy : LNIR
   if isDot then do
     emitLine s!"  {nextAcc} = add i64 {accVal}, {resVal}"
   else do
-    let pOut ← freshTmp "p_out"
-    emitLine s!"  {pOut} = getelementptr inbounds i64, ptr {outData}, i64 {ivVal}\n  store i64 {resVal}, ptr {pOut}, align 8"
+    emitTypedArrayStore "p_out" outData ivVal resVal elemTy
   let addOp := if opt then "add nuw nsw i64" else "add i64"
   let loopMd := if opt then ", !llvm.loop !0" else ", !llvm.loop !3"
   emitLine s!"  br label %{latchLbl}\n{latchLbl}:\n  {nextIv} = {addOp} {ivVal}, 1\n  br label %{condLbl}{loopMd}\n{exitLbl}:"
   if isDot then
-    emitLine s!"  store i64 {accVal}, ptr {outData}, align 8"
+    emitTypedArrayStore "dot_out" outData "0" accVal elemTy
 
 /-- Check if a loop body accesses contiguous memory (`rawLoad`, `rawStore`, `sarrayGet`, `sarraySet`). -/
 partial def loopBodyHasArrayMem : LNIRCode → Bool
@@ -1263,13 +1467,11 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
           emitLetExpr dst ty val; killVarFacts dst; emitCode k retTy loopAccTarget
       | _, _, _, _ =>
         emitLetExpr dst ty val; killVarFacts dst; emitCode k retTy loopAccTarget
-  | .rawStore ptrVar idxVar valVar _ k =>
+  | .rawStore ptrVar idxVar valVar elemTy k =>
     let rawPtr ← loadVarAsPtr ptrVar
     let idxVal ← loadVarAsI64 idxVar
     let valI64 ← loadVarAsI64 valVar
-    let gep ← freshTmp "rst_gep"
-    emitLine s!"  {gep} = getelementptr inbounds i64, ptr {rawPtr}, i64 {idxVal}"
-    emitLine s!"  store i64 {valI64}, ptr {gep}, align 8"
+    emitTypedArrayStore "rst" rawPtr idxVal valI64 elemTy
     emitCode k retTy loopAccTarget
   | .incRef objVar count k =>
     emitRefCountOp true objVar count
@@ -1370,6 +1572,10 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
           let b64 ← freshTmp "ret_bmask"
           emitLine s!"  {b64} = and i64 {raw64}, 1\n  ret i64 {b64}"
         else emitLine s!"  ret i64 {raw64}"
+      else if llvmRet == "double" then
+        let raw64 ← loadVarAsI64 v
+        let dbl ← freshTmp "ret_dbl"
+        emitLine s!"  {dbl} = bitcast i64 {raw64} to double\n  ret double {dbl}"
       else if llvmRet == "i8" || llvmRet == "i16" || llvmRet == "i32" then
         let raw64 ← loadVarAsI64 v
         let src64 ← if retTy == .i1 then do
@@ -1390,6 +1596,7 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
       let llvmRet := sigLLVMType (← get).target retTy
       emitLine (if llvmRet == "void" then "  ret void" else if llvmRet == "ptr" then "  ret ptr null"
                 else if llvmRet == "i256" then "  ret i256 0"
+                else if llvmRet == "double" then "  ret double 0.0"
                 else if llvmRet == "i8" || llvmRet == "i16" || llvmRet == "i32" || llvmRet == "i64" then s!"  ret {llvmRet} 0"
                 else s!"  ret {llvmRet} zeroinitializer")
 
@@ -1423,7 +1630,7 @@ def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_
     let zAttr := sigLLVMAttr target p.ty
     let attrs :=
       if optimized && pTy == "ptr" then " noalias noundef"
-      else if optimized && (pTy == "i8" || pTy == "i16" || pTy == "i32" || pTy == "i64" || pTy == "i256") then
+      else if optimized && (pTy == "i8" || pTy == "i16" || pTy == "i32" || pTy == "i64" || pTy == "i256" || pTy == "double") then
         " " ++ zAttr ++ "noundef"
       else if zAttr != "" then " zeroext"
       else ""
@@ -1441,6 +1648,8 @@ def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_
     let sTy := slotLLVMType p.ty
     if sigTy == "void" then
       s!"  store {sTy} 0, ptr %slot_v{p.id}, align 8"
+    else if sigTy == "double" then
+      s!"  %arg_bc_v{p.id} = bitcast double %arg_v{p.id} to i64\n  store i64 %arg_bc_v{p.id}, ptr %slot_v{p.id}, align 8"
     else if isNarrowSigType target p.ty then
       let extLines :=
         if p.ty == .i1 then
@@ -1571,15 +1780,39 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
       s!"{lbl}:\n  %c32 = trunc i64 %count to i32\n  %rc_prev = atomicrmw {op} ptr %obj, i32 %c32 {ord}, align 4\n  br label %done",
       "done:\n  ret void\n}"
     ]
-  let mkEnsureExclFn (fnName : String) (copyPayload : Bool) : String :=
-    let copyBytes := if copyPayload then "%total_bytes" else "24"
+  let mkEnsureExclFn (fnName : String) (copyPayload : Bool) (elemShift : Nat := 3) : String :=
+    let hdrBytes := sarrayDataByteOffset target
+    let copyBytes := if copyPayload then "%total_bytes" else s!"{hdrBytes}"
+    let maxWasmElems : UInt64 := (4294967295 - 16) >>> elemShift.toUInt64
+    let max64Elems : UInt64 := (((0 : UInt64) - 1) - 24) >>> elemShift.toUInt64
+    let bytesLine :=
+      if elemShift == 0 then "  %bytes_data = add i64 %sz, 0"
+      else s!"  %bytes_data = shl i64 %sz, {elemShift}"
+    let loadSzAndStoreCap :=
+      if target.isWasm then
+        "  %sz_ptr = getelementptr inbounds i8, ptr %arr, i64 8\n" ++
+        "  %sz32 = load i32, ptr %sz_ptr, align 4\n" ++
+        "  %sz = zext i32 %sz32 to i64\n" ++
+        s!"{bytesLine}\n  %total_bytes = add i64 %bytes_data, {hdrBytes}\n" ++
+        s!"  %n_ovf = icmp ugt i64 %sz, {maxWasmElems}\n  %b_ovf = icmp ugt i64 %total_bytes, 4294967295\n  %m_ovf = or i1 %n_ovf, %b_ovf\n  br i1 %m_ovf, label %alloc_trap, label %alloc_ok\n" ++
+        "alloc_trap:\n  call void @llvm.trap()\n  unreachable\nalloc_ok:\n" ++
+        "  %alloc_sz32 = trunc i64 %total_bytes to i32\n" ++
+        s!"  %new_arr = call noalias ptr @malloc(i32 %alloc_sz32)\n  call void @llvm.memcpy.p0.p0.i64(ptr align 4 %new_arr, ptr align 4 %arr, i64 {copyBytes}, i1 false)\n" ++
+        "  %cap_ptr = getelementptr inbounds i8, ptr %new_arr, i64 12\n  store i32 %sz32, ptr %cap_ptr, align 4\n  store i32 1, ptr %new_arr, align 4"
+      else
+        "  %sz_ptr = getelementptr inbounds i8, ptr %arr, i64 8\n" ++
+        "  %sz = load i64, ptr %sz_ptr, align 8\n" ++
+        s!"{bytesLine}\n  %total_bytes = add i64 %bytes_data, {hdrBytes}\n" ++
+        s!"  %m_ovf = icmp ugt i64 %sz, {max64Elems}\n  br i1 %m_ovf, label %alloc_trap, label %alloc_ok\n" ++
+        "alloc_trap:\n  call void @llvm.trap()\n  unreachable\nalloc_ok:\n" ++
+        s!"  %new_arr = call noalias ptr @malloc(i64 %total_bytes)\n  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %new_arr, ptr align 8 %arr, i64 {copyBytes}, i1 false)\n" ++
+        "  %cap_ptr = getelementptr inbounds i8, ptr %new_arr, i64 16\n  store i64 %sz, ptr %cap_ptr, align 8\n  store i32 1, ptr %new_arr, align 4"
     String.intercalate "\n" [
       s!"define weak_odr dso_local ptr @{fnName}(ptr %arr) {attr} \{",
       "entry:\n  %is_null = icmp eq ptr %arr, null\n  br i1 %is_null, label %ret_same, label %chk_rc",
       "chk_rc:\n  %rc = load i32, ptr %arr, align 4\n  %is_excl = icmp eq i32 %rc, 1\n  %exp = call i1 @llvm.expect.i1(i1 %is_excl, i1 true)\n  br i1 %exp, label %ret_same, label %clone",
       "ret_same:\n  ret ptr %arr",
-      "clone:\n  %sz_ptr = getelementptr inbounds i64, ptr %arr, i64 1\n  %sz = load i64, ptr %sz_ptr, align 8\n  %bytes_data = shl i64 %sz, 3\n  %total_bytes = add i64 %bytes_data, 24",
-      s!"  %new_arr = call noalias ptr @malloc(i64 %total_bytes)\n  call void @llvm.memcpy.p0.p0.i64(ptr align 8 %new_arr, ptr align 8 %arr, i64 {copyBytes}, i1 false)\n  store i32 1, ptr %new_arr, align 4",
+      s!"clone:\n{loadSzAndStoreCap}",
       "  %gt1 = icmp sgt i32 %rc, 1\n  br i1 %gt1, label %dec_old, label %done_clone",
       "dec_old:\n  %rc_prev = atomicrmw sub ptr %arr, i32 1 acq_rel, align 4\n  br label %done_clone\ndone_clone:\n  ret ptr %new_arr\n}"
     ]
@@ -1735,7 +1968,8 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
       "declare { i256, i1 } @llvm.uadd.with.overflow.i256(i256, i256) #2\ndeclare { i256, i1 } @llvm.usub.with.overflow.i256(i256, i256) #2\ndeclare { i256, i1 } @llvm.umul.with.overflow.i256(i256, i256) #2",
       "declare i256 @llvm.ctlz.i256(i256, i1 immarg) #2\ndeclare void @llvm.trap()",
       "declare void @lean_native_evm_sload(ptr, ptr, ptr)\ndeclare void @lean_native_evm_sstore(ptr, ptr, ptr)\ndeclare i64 @lean_native_trm_matryoshka_parity_u64(i64)",
-      "declare noalias ptr @malloc(i64 noundef)\ndeclare void @free(ptr noundef)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg)"
+      (if target.isWasm then "declare noalias ptr @malloc(i32 noundef)" else "declare noalias ptr @malloc(i64 noundef)") ++
+        "\ndeclare void @free(ptr noundef)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg)"
     ],
     mkU256LimbOpFn "lean_native_u256_uadd_limbs" "uadd",
     mkU256LimbOpFn "lean_native_u256_usub_limbs" "usub",
@@ -1744,16 +1978,29 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
     -- `lean_alloc_ctor(tag, numObjs, scalarSz)` fallback (C1.1 header: `m_rc = 1`, `m_cs_sz`, `m_other = numObjs`,
     -- `m_tag`); a strong definition from the Lean runtime takes precedence at link time.
     s!"define weak_odr dso_local ptr @lean_alloc_ctor(i32 %tag, i32 %nobjs, i32 %ssz) {attr} \{\nentry:\n" ++
-      "  %w = shl i32 %nobjs, 3\n  %b0 = add i32 %w, %ssz\n  %b = add i32 %b0, 8\n  %b64 = zext i32 %b to i64\n" ++
-      "  %o = call noalias ptr @malloc(i64 %b64)\n  store i32 1, ptr %o, align 4\n" ++
-      "  %cs = getelementptr inbounds i8, ptr %o, i64 4\n  %b16 = trunc i32 %b to i16\n  store i16 %b16, ptr %cs, align 2\n" ++
+      "  %n64 = zext i32 %nobjs to i64\n  %s64 = zext i32 %ssz to i64\n" ++
+      (if target.isWasm then
+        "  %w64 = shl i64 %n64, 2\n  %b0 = add i64 %w64, %s64\n  %b64 = add i64 %b0, 8\n" ++
+        "  %c_ovf = icmp ugt i64 %b64, 4294967295\n  br i1 %c_ovf, label %ctor_trap, label %ctor_ok\n" ++
+        "ctor_trap:\n  call void @llvm.trap()\n  unreachable\nctor_ok:\n  %b = trunc i64 %b64 to i32\n" ++
+        "  %o = call noalias ptr @malloc(i32 %b)\n  store i32 1, ptr %o, align 4\n"
+      else
+        "  %w64 = shl i64 %n64, 3\n  %b0 = add i64 %w64, %s64\n  %b64 = add i64 %b0, 8\n  %b = trunc i64 %b64 to i32\n" ++
+        "  %o = call noalias ptr @malloc(i64 %b64)\n  store i32 1, ptr %o, align 4\n") ++
+      "  %cs = getelementptr inbounds i8, ptr %o, i64 4\n  %b16 = trunc i64 %b64 to i16\n  store i16 %b16, ptr %cs, align 2\n" ++
       "  %ot = getelementptr inbounds i8, ptr %o, i64 6\n  %n8 = trunc i32 %nobjs to i8\n  store i8 %n8, ptr %ot, align 1\n" ++
       "  %tg = getelementptr inbounds i8, ptr %o, i64 7\n  %t8 = trunc i32 %tag to i8\n  store i8 %t8, ptr %tg, align 1\n" ++
       "  ret ptr %o\n}",
     s!"define weak_odr dso_local ptr @lean_native_box_u64(i64 %val) {attr} \{\nentry:\n  %sh = shl i64 %val, 1\n  %tagged = or i64 %sh, 1\n  %p = inttoptr i64 %tagged to ptr\n  ret ptr %p\n}",
     s!"define weak_odr dso_local i64 @lean_native_unbox_u64(ptr %boxed) {attr} \{\nentry:\n  %i = ptrtoint ptr %boxed to i64\n  %v = lshr i64 %i, 1\n  ret i64 %v\n}",
-    mkEnsureExclFn "lean_native_ensure_exclusive" true,
-    mkEnsureExclFn "lean_native_ensure_exclusive_uninit" false,
+    mkEnsureExclFn "lean_native_ensure_exclusive" true 3,
+    mkEnsureExclFn "lean_native_ensure_exclusive_uninit" false 3,
+    mkEnsureExclFn "lean_native_ensure_exclusive_e1" true 0,
+    mkEnsureExclFn "lean_native_ensure_exclusive_uninit_e1" false 0,
+    mkEnsureExclFn "lean_native_ensure_exclusive_e2" true 1,
+    mkEnsureExclFn "lean_native_ensure_exclusive_uninit_e2" false 1,
+    mkEnsureExclFn "lean_native_ensure_exclusive_e4" true 2,
+    mkEnsureExclFn "lean_native_ensure_exclusive_uninit_e4" false 2,
     mkCpuLoopFn "lean_native_cpu_saxpy_u64(ptr noalias %out, ptr noalias %x, ptr noalias %y, i64 %alpha, i64 %n)" saxpyBody,
     mkCpuLoopFn "lean_native_cpu_map_scale_add_u64(ptr noalias %out, ptr noalias %in0, i64 %scale, i64 %bias, i64 %n)" [
       "  %pi = getelementptr inbounds i64, ptr %in0, i64 %i\n  %po = getelementptr inbounds i64, ptr %out, i64 %i",
@@ -2156,8 +2403,10 @@ def emitLLVMABIWrapperDecl (d : LNIRDecl) (target : TargetArch := .x86_64) : Str
     ] ++ unboxLines ++ callAndRetLines ++ ["}"])
 
 def localScalarSigsOfModule (m : LNIRModule) : List (String × List LNIRType × LNIRType) :=
+  let isLocalParamTy (ty : LNIRType) : Bool :=
+    isABIScalarIntType ty || ty == .f64 || (match ty with | .sarray _ => true | _ => false)
   m.decls.filterMap fun d =>
-    if !isExternDecl d && isABIScalarIntType d.retTy && d.params.all (fun p => isABIScalarIntType p.ty) then
+    if !isExternDecl d && (isABIScalarIntType d.retTy || d.retTy == .f64) && d.params.all (fun p => isLocalParamTy p.ty) then
       some (d.name, d.params.map (·.ty), d.retTy)
     else none
 
@@ -2183,13 +2432,17 @@ private partial def findUnsupportedLLVMCallInCodeAux (localSigs : List (String �
 def findUnsupportedLLVMCallInCode (localSigs : List (String × List LNIRType × LNIRType)) (c : LNIRCode) : Option String :=
   findUnsupportedLLVMCallInCodeAux localSigs c <|> (if c.containsRcAdt [] then some "rc_adt" else none)
 
-/-- Decl-level C5 gate: also rejects heap-typed params/return and `incRef`/`decRef` on a heap param. -/
-def findUnsupportedLLVMCallInDecl (localSigs : List (String × List LNIRType × LNIRType)) (d : LNIRDecl) : Option String :=
-  findUnsupportedLLVMCallInCode localSigs d.body <|> (if d.containsRcAdt then some "rc_adt" else none)
+/-- Decl-level C5 + element-type gate: rejects heap-typed params/return, `incRef`/`decRef` on heap params,
+    and mismatched `.sarray`/`.rawPtr` element widths. -/
+def findUnsupportedLLVMCallInDecl (localSigs : List (String × List LNIRType × LNIRType)) (d : LNIRDecl)
+    (_target : TargetArch := .x86_64) : Option String :=
+  findUnsupportedLLVMCallInCode localSigs d.body <|>
+    (if d.containsRcAdt then some "rc_adt" else none) <|>
+    d.checkElemTypes localSigs
 
-def findUnsupportedLLVMCall? (m : LNIRModule) : Option (String × String) :=
+def findUnsupportedLLVMCall? (m : LNIRModule) (target : TargetArch := .x86_64) : Option (String × String) :=
   let sigs := localScalarSigsOfModule m
-  m.decls.findSome? fun d => (findUnsupportedLLVMCallInDecl sigs d).map (d.name, ·)
+  m.decls.findSome? fun d => (findUnsupportedLLVMCallInDecl sigs d target).map (d.name, ·)
 
 def emitLLVMModule (optimized : Bool) (m : LNIRModule) (target : TargetArch := .x86_64)
     (isaOverride? : Option IsaLevel := none) (wasmSimd128 : Bool := false) : String :=

@@ -335,21 +335,21 @@ def evalExpr (env : VarEnv) (st : HeapState) (e : LNIRExpr) : Except UBError (Va
       | .error err => .error err
     | some _ => .error (.typeError "sarrayEnsureExclusive expects sarrayId")
     | none => .error (.unboundVar arrVar)
-  | .sarrayGet arrVar idxVar _elemTy =>
+  | .sarrayGet arrVar idxVar elemTy =>
     match env arrVar, env idxVar with
     | some (.sarrayId bufId), some (.u64 idx) =>
       match st.readElem bufId idx.toNat with
-      | .ok v => .ok (.u64 v, st)
+      | .ok v => .ok (.u64 (maskElemVal elemTy v), st)
       | .error err => .error err
     | none, _ => .error (.unboundVar arrVar)
     | _, none => .error (.unboundVar idxVar)
     | _, _ => .error (.typeError "sarrayGet expects sarrayId and u64 index")
-  | .sarraySet arrVar idxVar valVar _elemTy =>
+  | .sarraySet arrVar idxVar valVar elemTy =>
     match env arrVar, env idxVar, env valVar with
     | some (.sarrayId bufId), some (.u64 idx), some (.u64 val) =>
       match st.ensureExclusive bufId with
       | .ok st1 =>
-        match st1.writeElemExclusive bufId idx.toNat val with
+        match st1.writeElemExclusive bufId idx.toNat (maskElemVal elemTy val) with
         | .ok st2 => .ok (.sarrayId bufId, st2)
         | .error err => .error err
       | .error err => .error err
@@ -357,15 +357,15 @@ def evalExpr (env : VarEnv) (st : HeapState) (e : LNIRExpr) : Except UBError (Va
     | _, none, _ => .error (.unboundVar idxVar)
     | _, _, none => .error (.unboundVar valVar)
     | _, _, _ => .error (.typeError "sarraySet expects sarrayId, u64 index, and u64 value")
-  | .rawLoad ptrVar idxVar _elemTy =>
+  | .rawLoad ptrVar idxVar elemTy =>
     match env ptrVar, env idxVar with
     | some (.rawPtrId bufId), some (.u64 idx) =>
       match st.readElem bufId idx.toNat with
-      | .ok v => .ok (.u64 v, st)
+      | .ok v => .ok (.u64 (maskElemVal elemTy v), st)
       | .error err => .error err
     | some (.sarrayId bufId), some (.u64 idx) =>
       match st.readElem bufId idx.toNat with
-      | .ok v => .ok (.u64 v, st)
+      | .ok v => .ok (.u64 (maskElemVal elemTy v), st)
       | .error err => .error err
     | none, _ => .error (.unboundVar ptrVar)
     | _, none => .error (.unboundVar idxVar)
@@ -513,9 +513,11 @@ def evalParKernelLoop (env : VarEnv) (st : HeapState) (inputs : List VarId) (len
     | .error err, _ => .error err
     | _, .error err => .error err
 
-/-- Deterministic parallel loop evaluator allocating a fresh output `ArrayBuffer` (`st.nextId + 1`) in `HeapState`. -/
+/-- Deterministic parallel loop evaluator allocating a fresh output `ArrayBuffer` (`st.nextId + 1`) in `HeapState`.
+    Both parallel input buffer reads (`stIn`) and element results are normalized to `elemTy`'s storage width via
+    `maskElemVal` so narrow `.parFor` kernels match packed `emitTypedArrayLoadValue` / `emitTypedArrayStore` in `LLVM.lean`. -/
 def evalParFor (fuel : Nat) (env : VarEnv) (st : HeapState) (lenVar : VarId) (inputs : List VarId)
-    (kernel : ParallelKernelKind) : Except UBError (Val × HeapState) :=
+    (kernel : ParallelKernelKind) (elemTy : LNIRType := .i64) : Except UBError (Val × HeapState) :=
   match env lenVar with
   | none => .error (.unboundVar lenVar)
   | some (.u64 n) =>
@@ -525,12 +527,15 @@ def evalParFor (fuel : Nat) (env : VarEnv) (st : HeapState) (lenVar : VarId) (in
       match evalVarList env inputs with
       | .error err => .error err
       | .ok _ =>
-        match evalParKernelLoop env st inputs len kernel (List.range len) with
+        let stIn : HeapState :=
+          if maskElemVal elemTy 0xFFFFFFFFFFFFFFFF == 0xFFFFFFFFFFFFFFFF then st
+          else { st with buffers := st.buffers.map (fun b => { b with data := b.data.map (maskElemVal elemTy) }) }
+        match evalParKernelLoop env stIn inputs len kernel (List.range len) with
         | .error err => .error err
         | .ok elems =>
           let outData := match kernel with
-            | .dotProduct => #[elems.foldl (· + ·) 0]
-            | _ => elems.toArray
+            | .dotProduct => #[maskElemVal elemTy (elems.foldl (· + ·) 0)]
+            | _ => (elems.map (maskElemVal elemTy)).toArray
           let outId := st.nextId + 1
           let outBuf : ArrayBuffer := { id := outId, exclusive := true, data := outData }
           .ok (.sarrayId outId, { st with buffers := outBuf :: st.buffers, nextId := outId })
@@ -558,14 +563,14 @@ def evalCode (fuel : Nat) : VarEnv → HeapState → LNIRCode → Except UBError
     match evalExpr env st val with
     | .ok (v, st') => evalCode fuel (env.bind dst v) st' k
     | .error err => .error err
-  | env, st, .rawStore ptrVar idxVar valVar _elemTy k =>
+  | env, st, .rawStore ptrVar idxVar valVar elemTy k =>
     match env ptrVar, env idxVar, env valVar with
     | some (.rawPtrId bufId), some (.u64 idx), some (.u64 val) =>
-      match st.writeElemExclusive bufId idx.toNat val with
+      match st.writeElemExclusive bufId idx.toNat (maskElemVal elemTy val) with
       | .ok st' => evalCode fuel env st' k
       | .error err => .error err
     | some (.sarrayId bufId), some (.u64 idx), some (.u64 val) =>
-      match st.writeElemExclusive bufId idx.toNat val with
+      match st.writeElemExclusive bufId idx.toNat (maskElemVal elemTy val) with
       | .ok st' => evalCode fuel env st' k
       | .error err => .error err
     | none, _, _ => .error (.unboundVar ptrVar)
@@ -604,8 +609,8 @@ def evalCode (fuel : Nat) : VarEnv → HeapState → LNIRCode → Except UBError
     | _, none, _ => .error (.unboundVar hiVar)
     | _, _, none => .error (.unboundVar accInit)
     | _, _, _ => .error (.typeError "seqFor bounds must be u64")
-  | env, st, .parFor outVar lenVar inputs _elemTy kernel k =>
-    match evalParFor fuel env st lenVar inputs kernel with
+  | env, st, .parFor outVar lenVar inputs elemTy kernel k =>
+    match evalParFor fuel env st lenVar inputs kernel elemTy with
     | .ok (outVal, st') => evalCode fuel (env.bind outVar outVal) st' k
     | .error err => .error err
   | env, st, .ret v =>

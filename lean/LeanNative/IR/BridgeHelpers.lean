@@ -147,8 +147,14 @@ export LeanNative.IR.RealLCNFBridge (
   archSupportsUSize archUSizeMask archUSizeShiftMask
   scalarWidthMask? scalarShiftMask?
   isSupportedStage1BScalarType isSupportedStage1BScalarOrTuple
-  isFlatUnboxedScalar isUnboxedScalarOrTuple
+  isFlatUnboxedScalar isUnboxedScalarOrTuple isSupportedSliceType
 )
+
+def isSupportedScalarOrFloat (ty : LNIRType) (arch : TargetArch) : Bool :=
+  isSupportedStage1BScalarType ty arch || ty == .f64
+
+def isSupportedParamOrRetType (ty : LNIRType) (arch : TargetArch) (allowSlice : Bool := false) : Bool :=
+  isSupportedStage1BScalarOrTuple ty arch || ty == .f64 || (allowSlice && isSupportedSliceType ty)
 
 def exprCodomainIsProp (env? : Option Lean.Environment) (e : Lean.Expr) : Bool :=
   let fn := e.getAppFn
@@ -330,12 +336,15 @@ def declQualifiesForStage1DHeap (env : Lean.Environment) (declName : Lean.Name) 
       go false cinfo.type
 
 def validateSupportedTypeM (ctx : String) (rawTy : Lean.Expr) (ty : LNIRType) (arch : TargetArch)
-    (allowInternalObj : Bool := false) : Lean.CoreM Unit := do
+    (allowInternalObj : Bool := false) (allowSlice : Bool := false) (allowFloat : Bool := true) : Lean.CoreM Unit := do
   if isClosureOrRuntimeNatExpr rawTy && !(allowInternalObj && (rawTy == ImpureType.tobject || rawTy == ImpureType.tagged)) then
     Lean.throwError s!"[lean-native] Unsupported {ctx} type `{rawTy}` (runtime Nat, tagged object, or function/closure type)"
   if tyContainsUSize ty && !archSupportsUSize arch then
     Lean.throwError s!"[lean-native] Unsupported USize in {ctx} on target `{reprStr arch}`"
-  if !(isSupportedStage1BScalarOrTuple ty arch || (allowInternalObj && (ty == .objPtr || ty == .taggedPtr))) then
+  let scalarTupleSliceOk :=
+    isSupportedStage1BScalarOrTuple ty arch || (allowFloat && ty == .f64) ||
+      (allowSlice && !arch.isWasm && isSupportedSliceType ty)
+  if !(scalarTupleSliceOk || (allowInternalObj && (ty == .objPtr || ty == .taggedPtr))) then
     Lean.throwError s!"[lean-native] Unsupported non-scalar {ctx} type `{rawTy}` (lowered as `{reprStr ty}`)"
 
 abbrev RcCtorLayoutSpec := LeanNative.IR.RealLCNFBridge.RcCtorLayoutSpec
@@ -362,21 +371,21 @@ def checkEnvConstSignatureM (env : Lean.Environment) (declName : Lean.Name) (arc
       else
         let dTy := lowerImpureType dom (some env)
         if isExported then
-          validateSupportedTypeM s!"exported parameter `{pName}` of `{declName}`" dom dTy arch false
+          validateSupportedTypeM s!"exported parameter `{pName}` of `{declName}`" dom dTy arch false false false
           if dTy matches (.tuple _) then
             Lean.throwError s!"[lean-native] Unsupported exported tuple parameter `{pName}` in `{declName}`"
         else if !(isStage1D && isSupportedStage1DHeapAdtExpr env arch dom) then
-          validateSupportedTypeM s!"parameter `{pName}` of `{declName}`" dom dTy arch false
+          validateSupportedTypeM s!"parameter `{pName}` of `{declName}`" dom dTy arch false true true
         go (idx + 1) body
     | retExpr =>
       if !retExpr.hasLooseBVars then
         let rTy := lowerImpureType retExpr (some env)
         if isExported then
-          validateSupportedTypeM s!"exported return type of `{declName}`" retExpr rTy arch false
+          validateSupportedTypeM s!"exported return type of `{declName}`" retExpr rTy arch false false false
           if rTy matches (.tuple _) then
             Lean.throwError s!"[lean-native] Unsupported exported tuple return type in `{declName}`"
         else if !(isStage1D && isSupportedStage1DHeapAdtExpr env arch retExpr) then
-          validateSupportedTypeM s!"return type of `{declName}`" retExpr rTy arch false
+          validateSupportedTypeM s!"return type of `{declName}`" retExpr rTy arch false false true
   go 0 cinfo.type
 
 def collectEnvExplicitParamTypes (env : Lean.Environment) (declName : Lean.Name) : List LNIRType :=
@@ -390,6 +399,13 @@ def collectEnvExplicitParamTypes (env : Lean.Environment) (declName : Lean.Name)
         else go (acc ++ [lowerImpureType dom (some env)]) body
       | _ => acc
     go [] cinfo.type
+
+def collectDeclExplicitParamTypesM (env : Lean.Environment) (declName : Lean.Name) : Lean.CoreM (List LNIRType) := do
+  let fromEnv := collectEnvExplicitParamTypes env declName
+  if !fromEnv.isEmpty then return fromEnv
+  match ← Lean.Compiler.LCNF.getMonoDecl? declName with
+  | some md => return md.params.toList.map (fun p => lowerImpureType p.type (some env))
+  | none => return []
 
 structure BridgeState where
   fvarToVar        : Std.HashMap Lean.FVarId VarId := {}
@@ -417,8 +433,9 @@ abbrev BridgeM := StateRefT BridgeState Lean.CoreM
 def lowerBridgeType (e : Lean.Expr) : BridgeM LNIRType := do
   return lowerImpureType e (some (← getEnv))
 
-def checkBridgeType (ctx : String) (rawTy : Lean.Expr) (ty : LNIRType) (allowInternalObj : Bool := false) : BridgeM Unit := do
-  validateSupportedTypeM ctx rawTy ty (← get).arch allowInternalObj
+def checkBridgeType (ctx : String) (rawTy : Lean.Expr) (ty : LNIRType)
+    (allowInternalObj : Bool := false) (allowSlice : Bool := false) : BridgeM Unit := do
+  validateSupportedTypeM ctx rawTy ty (← get).arch allowInternalObj allowSlice true
 
 def internFVar (fvarId : Lean.FVarId) (ty : LNIRType := .objPtr) (authoritative : Bool := false) : BridgeM VarId := do
   let st ← get
@@ -451,7 +468,7 @@ def lowerArg (arg : Lean.Compiler.LCNF.Arg pu) (allowInternalObj : Bool := false
       Lean.throwError "[lean-native] Unsupported higher-order / escaping local function value"
     let vid ← internFVar fvarId
     let vTy ← getVarType vid
-    if !(isSupportedStage1BScalarOrTuple vTy (← get).arch || (allowInternalObj && (vTy == .objPtr || vTy == .taggedPtr))) then
+    if !(isSupportedParamOrRetType vTy (← get).arch true || (allowInternalObj && (vTy == .objPtr || vTy == .taggedPtr))) then
       Lean.throwError s!"[lean-native] Unsupported non-scalar argument of type `{reprStr vTy}`"
     return vid
   | .erased => freshBridgeVar .unit
@@ -1405,19 +1422,23 @@ def filterNonInternalHelperDecls (env : Lean.Environment) (rawPairs : List (Lean
     match mod.decls.find? (·.name == mangled) with
     | none => return none
     | some d =>
-      let hasObjOrTupleSig :=
+      let hasExportedNonScalarSig :=
         d.params.any (fun p => !isSupportedStage1BScalarType p.ty arch) ||
         !isSupportedStage1BScalarType d.retTy arch ||
         (inferReturnedType d.body |>.any (fun rt => !isSupportedStage1BScalarType rt arch))
+      let hasUserUnsupportedSig :=
+        d.params.any (fun p => !(isSupportedScalarOrFloat p.ty arch || (p.borrow && isSupportedSliceType p.ty))) ||
+        !isSupportedScalarOrFloat d.retTy arch ||
+        (inferReturnedType d.body |>.any (fun rt => !isSupportedScalarOrFloat rt arch))
       if isExported then
-        if hasObjOrTupleSig || codeHasResidualHeapOrTupleAbiOp d.body then
+        if hasExportedNonScalarSig || codeHasResidualHeapOrTupleAbiOp d.body then
           Lean.throwError s!"[lean-native] Exported function `{origName}` has unsupported non-scalar signature or unlowered tuple/heap operations"
         return some mangled
       else if stage1DMangled.contains mangled then
         if d.params.any (fun p => !isStage1DParamOrRet p.ty) || !isStage1DParamOrRet d.retTy then
           Lean.throwError s!"[lean-native] Stage 1D helper `{origName}` has unsupported signature"
         return some mangled
-      else if hasObjOrTupleSig then
+      else if hasUserUnsupportedSig then
         return none
       else
         if codeHasResidualHeapOrTupleAbiOp d.body then
@@ -1438,8 +1459,8 @@ def filterNonInternalHelperDecls (env : Lean.Environment) (rawPairs : List (Lean
     if stage1DMangled.contains d.name then
       if d.params.any (fun p => !isStage1DParamOrRet p.ty) || !isStage1DParamOrRet d.retTy then
         Lean.throwError s!"[lean-native] Live Stage 1D declaration `{d.name}` has unsupported signature"
-    else if d.params.any (fun p => !isSupportedStage1BScalarType p.ty arch) ||
-       !isSupportedStage1BScalarType d.retTy arch ||
+    else if d.params.any (fun p => !(isSupportedScalarOrFloat p.ty arch || (p.borrow && isSupportedSliceType p.ty))) ||
+       !isSupportedScalarOrFloat d.retTy arch ||
        codeHasResidualHeapOrTupleAbiOp d.body then
       Lean.throwError s!"[lean-native] Live declaration `{d.name}` retains non-scalar signature or unlowered object operations"
   return { mod with decls := filteredDecls }
@@ -1998,7 +2019,7 @@ def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
     selfDeclName := decl.name, localDeclNames := localDeclNames, arch := arch,
     allowStage1DHeap := isStage1DHeap }
   let action : BridgeM LNIRDecl := do
-    let envParamTys := collectEnvExplicitParamTypes env decl.name
+    let envParamTys ← collectDeclExplicitParamTypesM env decl.name
     let mut paramTypeMap : List (Lean.FVarId × LNIRType) := []
     let mut paramTypesList : List LNIRType := []
     let mut paramIds : List VarId := []
@@ -2009,9 +2030,13 @@ def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
         if !isStage1DHeap && (rawPTy == .objPtr || rawPTy == .taggedPtr) then
           match envParamTys[pIdx]? with
           | some (.tuple fs) => .tuple fs
+          | some (.sarray .i8) => .sarray .i8
+          | some (.sarray .f64) => .sarray .f64
           | _ => rawPTy
         else rawPTy
-      checkBridgeType s!"parameter `{p.binderName}` of `{decl.name}`" p.type pTy true
+      if isSupportedSliceType pTy && !p.borrow then
+        Lean.throwError s!"[lean-native] Non-borrowed slice parameter `{p.binderName}` in `{decl.name}` requires borrow (@&)"
+      checkBridgeType s!"parameter `{p.binderName}` of `{decl.name}`" p.type pTy true (!isExported)
       let vid ← internFVar p.fvarId pTy true
       paramTypeMap := paramTypeMap ++ [(p.fvarId, pTy)]
       paramTypesList := paramTypesList ++ [pTy]

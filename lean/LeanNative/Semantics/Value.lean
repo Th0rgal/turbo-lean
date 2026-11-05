@@ -539,4 +539,19 @@ theorem storageLoad_after_storageStore_ne (st : HeapState) (mapId : Nat) (slot1 
 
 end HeapState
 
+/-- Normalize a 64-bit scalar word to the storage width of `elemTy` when read or written in a packed
+    scalar array (`.i1`/`.i8` → 8-bit, `.i16` → 16-bit, `.i32`/`.f32` → 32-bit, 64-bit otherwise),
+    matching LLVM's element-width `trunc` / `zext` in `LLVM.lean`. -/
+@[inline] def maskElemVal (elemTy : LNIRType) (v : UInt64) : UInt64 :=
+  match elemTy with
+  | .i1 | .i8 => v &&& 0xff
+  | .i16 => v &&& 0xffff
+  | .i32 | .f32 => v &&& 0xffffffff
+  | _ => v
+
+@[simp] theorem maskElemVal_i64_fun : maskElemVal .i64 = id := rfl
+@[simp] theorem maskElemVal_i64 (v : UInt64) : maskElemVal .i64 v = v := rfl
+@[simp] theorem maskElemVal_f64_fun : maskElemVal .f64 = id := rfl
+@[simp] theorem maskElemVal_f64 (v : UInt64) : maskElemVal .f64 v = v := rfl
+
 end LeanNative.Semantics

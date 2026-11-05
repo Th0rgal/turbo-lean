@@ -376,20 +376,31 @@ theorem lowerImpureLetValuePure_sound (ctx : RealBridgeCtx) (st : RealBridgeStat
                 · rw [hteq] at h_lower; exact nomatch h_lower
   | fap fn args h =>
     dsimp only [lowerImpureLetValuePure, Bind.bind, Except.bind, Pure.pure, Except.pure] at h_lower
-    cases hargL : lowerRealArgList ctx st false args.toList with
-    | error _ => rw [hargL] at h_lower; exact nomatch h_lower
-    | ok pair =>
-      rcases pair with ⟨argVars, stA⟩
-      rw [hargL] at h_lower; dsimp only at h_lower
-      cases hintr : lowerCanonicalIntrinsicPure? fn argVars rawTy (argVars.map stA.getVarType)
-          (ctx.findLocalCallee? fn).isSome ctx.arch ctx.gfSimdIntrinsics with
-      | none => rw [hintr] at h_lower; exact nomatch h_lower
-      | some e0 =>
-        rw [hintr] at h_lower; injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, rfl⟩
-        rcases lowerCanonicalIntrinsicPure_sound ctx st lenv venv hst hst' fn args h argVars stA
-            rawTy e0 v ctor? hinv hargL hintr h_eval with
-          ⟨heval, rfl, rfl, rfl, se, rfl, hnv⟩
-        exact ⟨rfl, heval, inferRhs_scalar_nonVar stA se rawTy hnv, fun _ _ _ hc => nomatch hc⟩
+    cases hslice : lowerSliceCallPure? st fn args.toList rawTy (ctx.findLocalCallee? fn).isSome ctx.arch with
+    | some sliceExpr =>
+      rw [hslice] at h_lower; injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, rfl⟩
+      rcases lowerSliceCallPure_sound ctx st lenv venv hst hst' fn args h rawTy sliceExpr v ctor?
+          hinv hslice h_eval with
+        ⟨heval, rfl, rfl, hdisj⟩
+      rcases hdisj with ⟨arrVar, rfl⟩ | ⟨arrVar, idxVar, elemTy, rfl⟩
+      · exact ⟨rfl, heval, rfl, fun _ _ _ hc => nomatch hc⟩
+      · exact ⟨rfl, heval, rfl, fun _ _ _ hc => nomatch hc⟩
+    | none =>
+      rw [hslice] at h_lower; dsimp only at h_lower
+      cases hargL : lowerRealArgList ctx st false args.toList with
+      | error _ => rw [hargL] at h_lower; exact nomatch h_lower
+      | ok pair =>
+        rcases pair with ⟨argVars, stA⟩
+        rw [hargL] at h_lower; dsimp only at h_lower
+        cases hintr : lowerCanonicalIntrinsicPure? fn argVars rawTy (argVars.map stA.getVarType)
+            (ctx.findLocalCallee? fn).isSome ctx.arch ctx.gfSimdIntrinsics with
+        | none => rw [hintr] at h_lower; exact nomatch h_lower
+        | some e0 =>
+          rw [hintr] at h_lower; injection h_lower with hp; rcases Prod.mk.inj hp with ⟨rfl, rfl⟩
+          rcases lowerCanonicalIntrinsicPure_sound ctx st lenv venv hst hst' fn args h argVars stA
+              rawTy e0 v ctor? hinv hargL hintr h_eval with
+            ⟨heval, rfl, rfl, rfl, se, rfl, hnv⟩
+          exact ⟨rfl, heval, inferRhs_scalar_nonVar stA se rawTy hnv, fun _ _ _ hc => nomatch hc⟩
   | pap fn _ _ =>
     dsimp only [evalLetValue] at h_eval; exact nomatch h_eval
   | proj _ _ _ h | const _ _ _ h => cases h

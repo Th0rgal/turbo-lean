@@ -119,14 +119,22 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
           nonPoison := sa.nonPoison && sb.nonPoison && sd.nonPoison
           noUB := true }
         { stB with ubCond := stReq.ubCond, noUB := false }
-  | .storageLoad mapVar slotVar | .sarrayGet mapVar slotVar _ | .rawLoad mapVar slotVar _ =>
+  | .storageLoad mapVar slotVar =>
     let slotSv := st.lookupVar slotVar
-    let isStorage := match e with | .storageLoad _ _ => true | _ => false
-    let slotExpr := if isStorage then (match slotSv.expr with | .constU64 u => .constU256 (UInt256.ofUInt64 u) | x => x) else slotSv.expr
+    let slotExpr := match slotSv.expr with | .constU64 u => .constU256 (UInt256.ofUInt64 u) | x => x
     let elemExpr := st.readBufSym .sarray mapVar slotExpr
-    let stSorted :=
-      let c0 := (st.clearAlias dst).unmarkTypedTuple dst
-      if isStorage then c0.markU256Var dst else c0.markU64Var dst
+    let stSorted := ((st.clearAlias dst).unmarkTypedTuple dst).markU256Var dst
+    stSorted.bindVar dst { expr := elemExpr, nonPoison := slotSv.nonPoison, noUB := slotSv.noUB }
+  | .sarrayGet mapVar slotVar elemTy | .rawLoad mapVar slotVar elemTy =>
+    let slotSv := st.lookupVar slotVar
+    let rawElemExpr := st.readBufSym .sarray mapVar slotSv.expr
+    let elemExpr : SymExpr :=
+      match elemTy with
+      | .i1 | .i8 => normSymBinOpStep .bitAnd rawElemExpr (.constU64 0xff)
+      | .i16 => normSymBinOpStep .bitAnd rawElemExpr (.constU64 0xffff)
+      | .i32 | .f32 => normSymBinOpStep .bitAnd rawElemExpr (.constU64 0xffffffff)
+      | _ => rawElemExpr
+    let stSorted := ((st.clearAlias dst).unmarkTypedTuple dst).markU64Var dst
     stSorted.bindVar dst { expr := elemExpr, nonPoison := slotSv.nonPoison, noUB := slotSv.noUB }
   | .storageStore mapVar slotVar valVar =>
     let root := st.resolveBuf mapVar
@@ -441,11 +449,17 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
       { stBound with noUB := stBound.noUB && liveC == .constBool true }
     else
       (((st.clearAlias dst).unmarkTypedTuple dst).markUnsupported).bindVar dst { expr := .unit, nonPoison := false, noUB := false }
-  | .sarraySet arrVar idxVar valVar _elemTy =>
+  | .sarraySet arrVar idxVar valVar elemTy =>
     let root := st.resolveBuf arrVar
     let arrSv := st.lookupVar arrVar
     let idxSv := st.lookupVar idxVar
     let valSv := st.lookupVar valVar
+    let maskedVal : SymExpr :=
+      match elemTy with
+      | .i1 | .i8 => normSymBinOpStep .bitAnd valSv.expr (.constU64 0xff)
+      | .i16 => normSymBinOpStep .bitAnd valSv.expr (.constU64 0xffff)
+      | .i32 | .f32 => normSymBinOpStep .bitAnd valSv.expr (.constU64 0xffffffff)
+      | _ => valSv.expr
     if st.isImmediateScalarObj root || st.typedTuples.contains root ||
        st.boolVars.contains root || st.u64Vars.contains root || st.u256Vars.contains root ||
        st.objPtrVars.contains root ||
@@ -454,7 +468,7 @@ def symEvalExpr (st : SymExecState) (dst : VarId) (dstTy : LNIRType := .i64) (e 
     else if st.sarrayVars.contains root then
       let liveC := st.liveRcCond root
       let stLive := ((st.noteExtRoot root).requireUbCond liveC).noteExtLiveRoot root
-      let st3 := (((stLive.markExclusive root).writeBufSym .sarray root idxSv.expr valSv.expr true).aliasBuf dst root).markSarrayVar dst
+      let st3 := (((stLive.markExclusive root).writeBufSym .sarray root idxSv.expr maskedVal true).aliasBuf dst root).markSarrayVar dst
       let stBound := st3.bindVar dst {
         expr := .symVar root
         nonPoison := arrSv.nonPoison && idxSv.nonPoison && valSv.nonPoison

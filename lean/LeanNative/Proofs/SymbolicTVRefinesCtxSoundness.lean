@@ -75,6 +75,11 @@ theorem varIdListEq_sound (xs ys : List VarId) (h : varIdListEq xs ys = true) :
       simp only [varIdListEq, Bool.and_eq_true, beq_iff_eq] at h
       rw [h.1, ih ys h.2]
 
+theorem maskElemVal_eq_of_allOnes_eq (ty1 ty2 : LNIRType)
+    (h : maskElemVal ty1 0xffffffffffffffff = maskElemVal ty2 0xffffffffffffffff) (v : UInt64) :
+    maskElemVal ty1 v = maskElemVal ty2 v := by
+  cases ty1 <;> cases ty2 <;> first | rfl | exact nomatch h
+
 theorem lnirExprEvalEq_sound (env : VarEnv) (st : HeapState) (e1 e2 : LNIRExpr)
     (h : lnirExprEvalEq e1 e2 = true) :
     evalExpr env st e1 = evalExpr env st e2 := by
@@ -95,11 +100,20 @@ theorem lnirExprEvalEq_sound (env : VarEnv) (st : HeapState) (e1 e2 : LNIRExpr)
   case ctorGetScalar.ctorGetScalar => rcases h with ⟨rfl, rfl⟩; rfl
   case isExclusive.isExclusive => rw [h]
   case sarrayLen.sarrayLen => rw [h]
-  case sarrayDataPtr.sarrayDataPtr => rw [h]; rfl
-  case sarrayEnsureExclusive.sarrayEnsureExclusive => rw [h]; rfl
-  case sarrayGet.sarrayGet => rcases h with ⟨rfl, rfl⟩; rfl
-  case sarraySet.sarraySet => rcases h with ⟨⟨rfl, rfl⟩, rfl⟩; rfl
-  case rawLoad.rawLoad => rcases h with ⟨rfl, rfl⟩; rfl
+  case sarrayDataPtr.sarrayDataPtr => rcases h with ⟨rfl, _⟩; rfl
+  case sarrayEnsureExclusive.sarrayEnsureExclusive => rcases h with ⟨rfl, _⟩; rfl
+  case sarrayGet.sarrayGet a1 i1 ty1 a2 i2 ty2 =>
+    rcases h with ⟨⟨rfl, rfl⟩, hmask⟩
+    have hm : ∀ w, maskElemVal ty1 w = maskElemVal ty2 w := maskElemVal_eq_of_allOnes_eq ty1 ty2 hmask
+    simp only [evalExpr, hm]
+  case sarraySet.sarraySet a1 i1 v1 ty1 a2 i2 v2 ty2 =>
+    rcases h with ⟨⟨⟨rfl, rfl⟩, rfl⟩, hmask⟩
+    have hm : ∀ w, maskElemVal ty1 w = maskElemVal ty2 w := maskElemVal_eq_of_allOnes_eq ty1 ty2 hmask
+    simp only [evalExpr, hm]
+  case rawLoad.rawLoad p1 i1 ty1 p2 i2 ty2 =>
+    rcases h with ⟨⟨rfl, rfl⟩, hmask⟩
+    have hm : ∀ w, maskElemVal ty1 w = maskElemVal ty2 w := maskElemVal_eq_of_allOnes_eq ty1 ty2 hmask
+    simp only [evalExpr, hm]
   case boxScalar.boxScalar => rw [h]; rfl
   case unboxScalar.unboxScalar => rw [h]; rfl
   case call.call f1 as1 _ ext1 f2 as2 _ ext2 =>
