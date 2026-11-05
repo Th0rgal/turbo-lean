@@ -13,6 +13,8 @@ import LeanNative.Frontend.ProofRetention
 import LeanNative.Proofs.ProofRetentionProofs
 import LeanNative.Transform.StochasticCert
 import LeanNative.Proofs.StochasticCertSoundness
+import LeanNative.Transform.CostAutotune
+import LeanNative.Proofs.CostAutotuneSoundness
 
 namespace LeanNative.Transform
 
@@ -288,6 +290,24 @@ def proofRetentionContract : VerifiedCodePassContract :=
 
 def proofRetentionPass : TransformPass :=
   TransformPass.ofVerifiedContract proofRetentionContract
+
+def costAutotuneContract : VerifiedCodePassContract :=
+  verifiedCostAutotuneContract (HardwareCostProfile.forTarget .x86_64) [] [] []
+    (LeanNative.Proofs.autotuneCodeWithAmdahl_sound
+      (HardwareCostProfile.forTarget .x86_64) [] [] [])
+
+def costAutotunePassFor (base : HardwareCostProfile) (samples : List OpTimingSample)
+    (corpus : List CorpusTimingSample) (ablations : List CandidateAblationSample := []) :
+    TransformPass :=
+  TransformPass.ofVerifiedTransformContract {
+    name := "CostAutotune"
+    theoremRef := "LeanNative.Proofs.autotuneDeclWithAmdahl_sound"
+    notes := "Declaration-bound calibration and ablation evidence"
+    run := fun d => (autotuneDeclWithAmdahl base samples corpus d ablations).1
+    sound := fun d => LeanNative.Proofs.autotuneDeclWithAmdahl_sound base samples corpus d ablations }
+
+def costAutotunePass : TransformPass :=
+  TransformPass.ofVerifiedContract costAutotuneContract
 
 def verifiedKernelPasses : List TransformPass :=
   [eqSatPass, loopSchedulePass, ownershipRCPass, asyncStateMachinePass, proofRetentionPass]

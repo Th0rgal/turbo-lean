@@ -107,7 +107,19 @@ def verifiedTheoremRegistry : List String :=
     "checkNonEscapingAsync_rejects_closure", "asyncStateMachine_zeroAlloc_nonvacuous",
     "elideMarkMtAndZeroRc_sound", "optimizeThreadLocalOwnershipRC_sound",
     "elideBorrowedAndThreadLocalRC_sound",
-    "dischargeLocalExclusivity_refines"
+    "dischargeLocalExclusivity_refines",
+    "calibrateHardwareProfile_preserves_target", "meetsOnePercentE2EGain_iff",
+    "meetsOnePercentE2EGain_rejects_subthreshold",
+    "meetsCorpusGeomeanOnePercentGain_iff",
+    "meetsCorpusGeomeanOnePercentGain_rejects_summed_false_positive",
+    "superoptModuleWithCalibratedProfile_sound",
+    "superoptCodeSelective_sound",
+    "foldl_decls_mem_acc", "foldl_decls_refines",
+    "superoptDeclSelective_sound",
+    "superoptModuleSelective_sound",
+    "autotuneCodeWithAmdahl_sound", "autotuneCodeWithAmdahl_uncalibrated_preserves",
+    "autotuneDeclWithAmdahl_sound",
+    "autotuneSuperoptModule_sound", "costAutotune_amdahl_gate_nonvacuous", "ablateSitesLeaveOneOut_sound"
   ]
   let xform := [
     "optimizeEqSatCode_sound", "applyLoopScheduleAux_refines",
@@ -130,6 +142,7 @@ def verifiedTheoremRegistry : List String :=
     "HeapState.storageLoad_after_storageStore_same", "HeapState.storageLoad_after_storageStore_ne"
   ]
   let spec := [
+    "e2e_gain_gate_sound", "insufficient_gain_rejects_e2e",
     "untrusted_opt_plugin_tv_gate_sound", "untrusted_opt_plugin_code_refines",
     "untrusted_opt_plugin_timeout_fallback", "untrusted_opt_plugin_reject_fallback",
     "opt_pipeline_two_step_refines", "opt_pipeline_chain_refines",
@@ -169,6 +182,7 @@ def verifiedTheoremRegistry : List String :=
   (proofs.map ("LeanNative.Proofs.SuperoptHelpersSoundness." ++ ·)) ++
   (proofs.map ("LeanNative.Proofs.SuperoptSoundness." ++ ·)) ++
   (proofs.map ("LeanNative.Proofs.StochasticCertSoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.CostAutotuneSoundness." ++ ·)) ++
   (xform.map ("LeanNative.Transform." ++ ·)) ++
   (sem.map ("LeanNative.Semantics." ++ ·)) ++
   (spec.map ("LeanNative.Spec." ++ ·)) ++
