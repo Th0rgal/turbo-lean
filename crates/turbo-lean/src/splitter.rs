@@ -2037,6 +2037,7 @@ fn is_pattern_match_arm_at(cmd: &str, pipe_idx: usize) -> bool {
     let mut paren = 0i32;
     let mut bracket = 0i32;
     let mut brace = 0i32;
+    let mut strict_brace = 0i32;
     let mut j = pipe_idx + 1;
     while j < bytes.len() {
         let c = bytes[j];
@@ -2055,6 +2056,16 @@ fn is_pattern_match_arm_at(cmd: &str, pipe_idx: usize) -> bool {
             j = end;
             continue;
         }
+        if bytes[j..].starts_with("⦃".as_bytes()) {
+            strict_brace += 1;
+            j += "⦃".len();
+            continue;
+        }
+        if bytes[j..].starts_with("⦄".as_bytes()) {
+            strict_brace = (strict_brace - 1).max(0);
+            j += "⦄".len();
+            continue;
+        }
         match c {
             b'(' => paren += 1,
             b')' => paren = (paren - 1).max(0),
@@ -2062,7 +2073,7 @@ fn is_pattern_match_arm_at(cmd: &str, pipe_idx: usize) -> bool {
             b']' => bracket = (bracket - 1).max(0),
             b'{' => brace += 1,
             b'}' => brace = (brace - 1).max(0),
-            b'=' if paren == 0 && bracket == 0 && brace == 0 => {
+            b'=' if paren == 0 && bracket == 0 && brace == 0 && strict_brace == 0 => {
                 if j + 1 < bytes.len() && bytes[j + 1] == b'>' {
                     return true;
                 }
@@ -2070,6 +2081,7 @@ fn is_pattern_match_arm_at(cmd: &str, pipe_idx: usize) -> bool {
             b':' if paren == 0
                 && bracket == 0
                 && brace == 0
+                && strict_brace == 0
                 && j + 1 < bytes.len()
                 && bytes[j + 1] == b'=' =>
             {
@@ -2123,6 +2135,7 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
     let mut paren = 0i32;
     let mut bracket = 0i32;
     let mut brace = 0i32;
+    let mut strict_brace = 0i32;
     let mut i = 0usize;
     let mut pending_let_assigns = 0usize;
     let mut seen_top_level_colon = false;
@@ -2146,9 +2159,20 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
             i = end;
             continue;
         }
+        if bytes[i..].starts_with("⦃".as_bytes()) {
+            strict_brace += 1;
+            i += "⦃".len();
+            continue;
+        }
+        if bytes[i..].starts_with("⦄".as_bytes()) {
+            strict_brace = (strict_brace - 1).max(0);
+            i += "⦄".len();
+            continue;
+        }
         if paren == 0
             && bracket == 0
             && brace == 0
+            && strict_brace == 0
             && i + 3 < bytes.len()
             && &bytes[i..i + 3] == b"let"
             && (i == 0 || bytes[i - 1].is_ascii_whitespace())
@@ -2161,6 +2185,7 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
         if paren == 0
             && bracket == 0
             && brace == 0
+            && strict_brace == 0
             && seen_top_level_colon
             && i + 5 <= bytes.len()
             && &bytes[i..i + 5] == b"where"
@@ -2173,6 +2198,7 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
         if paren == 0
             && bracket == 0
             && brace == 0
+            && strict_brace == 0
             && seen_top_level_colon
             && i + 5 < bytes.len()
             && &bytes[i..i + 5] == b"match"
@@ -2190,7 +2216,7 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
             b']' => bracket = (bracket - 1).max(0),
             b'{' => brace += 1,
             b'}' => brace = (brace - 1).max(0),
-            b':' if paren == 0 && bracket == 0 && brace == 0 => {
+            b':' if paren == 0 && bracket == 0 && brace == 0 && strict_brace == 0 => {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
                     if pending_let_assigns > 0 {
                         pending_let_assigns -= 1;
@@ -2199,10 +2225,21 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
                     }
                     return Some((&cmd[..i], &cmd[i + 2..]));
                 } else {
-                    seen_top_level_colon = true;
+                    let prev = if i > 0 { Some(bytes[i - 1]) } else { None };
+                    let next = bytes.get(i + 1).copied();
+                    let is_op = matches!(prev, Some(b':' | b'=' | b'<' | b'>' | b'!'))
+                        || matches!(next, Some(b':' | b'>'));
+                    if !is_op {
+                        seen_top_level_colon = true;
+                    }
                 }
             }
-            b'|' if paren == 0 && bracket == 0 && brace == 0 && seen_top_level_colon => {
+            b'|' if paren == 0
+                && bracket == 0
+                && brace == 0
+                && strict_brace == 0
+                && seen_top_level_colon =>
+            {
                 let next_ok =
                     i + 1 >= bytes.len() || (bytes[i + 1] != b'|' && bytes[i + 1] != b'>');
                 let prev_ok = i == 0 || (bytes[i - 1] != b'|' && bytes[i - 1] != b'<');
@@ -7001,15 +7038,251 @@ fn split_at_top_level_where(cmd: &str) -> Option<(&str, &str)> {
     None
 }
 
-fn decl_header_has_explicit_type_annotation(sig_part: &str) -> bool {
-    let bytes = sig_part.as_bytes();
+fn is_standalone_colon_op(s: &str, i: usize) -> bool {
+    let bytes = s.as_bytes();
+    let prev_ascii = if i > 0 { Some(bytes[i - 1]) } else { None };
+    let next_ascii = bytes.get(i + 1).copied();
+    if matches!(prev_ascii, Some(b':' | b'=' | b'<' | b'>' | b'!'))
+        || matches!(next_ascii, Some(b':' | b'=' | b'>'))
+    {
+        return false;
+    }
+    let prev_char = s[..i].chars().next_back();
+    let next_char = s[i + 1..].chars().next();
+    // Exclude custom operators like `∈:` / `:∈` or `∷` (`\::`), while allowing identifier/closing-bracket adjacency (`(x:Nat)`, `):Nat`).
+    let is_custom_sym = |c: char| {
+        !c.is_whitespace()
+            && !is_lean_id_rest(c)
+            && !matches!(
+                c,
+                '(' | ')' | '[' | ']' | '{' | '}' | '⦃' | '⦄' | '«' | '»' | ',' | ';' | '"' | '\''
+            )
+    };
+    !prev_char.is_some_and(is_custom_sym) && !next_char.is_some_and(is_custom_sym)
+}
+
+fn lean_expr_has_non_comment_tokens(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(s, i) {
+            if !span.is_comment {
+                return true;
+            }
+            i = span.end;
+            continue;
+        }
+        let ch = s[i..].chars().next().unwrap_or(' ');
+        if !ch.is_whitespace() {
+            return true;
+        }
+        i += ch.len_utf8();
+    }
+    false
+}
+
+fn lean_expr_has_hole_or_incomplete_binder(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(s, i) {
+            i = span.end;
+            continue;
+        }
+        let prev_char = s[..i].chars().next_back();
+        let prev_is_ident = prev_char.is_some_and(|c| is_lean_id_rest(c) || c == '»');
+        let ch = s[i..].chars().next().unwrap_or('\0');
+        let ch_len = ch.len_utf8();
+        if ch == '_' && !prev_is_ident {
+            let next_char = s[i + ch_len..].chars().next();
+            let next_is_ident = next_char.is_some_and(is_lean_id_rest);
+            if !next_is_ident {
+                return true;
+            }
+        }
+        if ch == '?' && !prev_is_ident {
+            let next_char = s[i + ch_len..].chars().next();
+            if next_char.is_some_and(|c| is_lean_id_first(c) || c == '«') {
+                return true;
+            }
+        }
+        if !prev_is_ident
+            && s[i..].starts_with("by")
+            && s[i + 2..]
+                .chars()
+                .next()
+                .is_none_or(|c| !is_lean_id_rest(c))
+        {
+            return true;
+        }
+        if ch == '∀'
+            || (!prev_is_ident
+                && s[i..].starts_with("forall")
+                && s[i + 6..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !is_lean_id_rest(c)))
+            || (!prev_is_ident
+                && s[i..].starts_with("fun")
+                && s[i + 3..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !is_lean_id_rest(c)))
+            || ch == 'λ'
+        {
+            let kw_len = if ch == '∀' || ch == 'λ' {
+                ch_len
+            } else if s[i..].starts_with("forall") {
+                6
+            } else {
+                3
+            };
+            let is_forall = ch == '∀' || s[i..].starts_with("forall");
+            let mut j = i + kw_len;
+            let mut p = 0i32;
+            let mut b = 0i32;
+            let mut br = 0i32;
+            let mut sb = 0i32;
+            let mut binder_end = None;
+            while j < bytes.len() {
+                if let Some(span) = skip_lean_lexeme(s, j) {
+                    j = span.end;
+                    continue;
+                }
+                if bytes[j..].starts_with("⦃".as_bytes()) {
+                    sb += 1;
+                    j += "⦃".len();
+                    continue;
+                }
+                if bytes[j..].starts_with("⦄".as_bytes()) {
+                    sb = (sb - 1).max(0);
+                    j += "⦄".len();
+                    continue;
+                }
+                if p == 0 && b == 0 && br == 0 && sb == 0 {
+                    if is_forall && bytes[j] == b',' {
+                        binder_end = Some(j);
+                        break;
+                    }
+                    if !is_forall
+                        && ((j + 1 < bytes.len() && bytes[j] == b'=' && bytes[j + 1] == b'>')
+                            || bytes[j..].starts_with("↦".as_bytes()))
+                    {
+                        binder_end = Some(j);
+                        break;
+                    }
+                }
+                match bytes[j] {
+                    b'(' => p += 1,
+                    b')' if p == 0 && b == 0 && br == 0 && sb == 0 => break,
+                    b')' => p = (p - 1).max(0),
+                    b'[' => b += 1,
+                    b']' if p == 0 && b == 0 && br == 0 && sb == 0 => break,
+                    b']' => b = (b - 1).max(0),
+                    b'{' => br += 1,
+                    b'}' if p == 0 && b == 0 && br == 0 && sb == 0 => break,
+                    b'}' => br = (br - 1).max(0),
+                    _ => {}
+                }
+                j += s[j..].chars().next().map_or(1, char::len_utf8);
+            }
+            let Some(b_end) = binder_end else {
+                return true;
+            };
+            if !decl_binders_all_explicitly_typed(&s[i + kw_len..b_end], false) {
+                return true;
+            }
+            i += kw_len;
+            continue;
+        }
+        i += ch_len;
+    }
+    false
+}
+
+fn scan_balanced_binder_group_end(
+    s: &str,
+    open_pos: usize,
+    open_str: &str,
+    close_str: &str,
+) -> Option<(usize, usize)> {
+    let bytes = s.as_bytes();
+    let inner_start = open_pos + open_str.len();
+    let mut depth = 1i32;
+    let mut i = inner_start;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(s, i) {
+            i = span.end;
+            continue;
+        }
+        if bytes[i..].starts_with(open_str.as_bytes()) {
+            depth += 1;
+            i += open_str.len();
+            continue;
+        }
+        if bytes[i..].starts_with(close_str.as_bytes()) {
+            depth -= 1;
+            if depth == 0 {
+                return Some((i, i + close_str.len()));
+            }
+            i += close_str.len();
+            continue;
+        }
+        i += s[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    None
+}
+
+fn binder_lhs_all_valid_binder_names(lhs: &str) -> bool {
+    let bytes = lhs.as_bytes();
+    let mut i = 0usize;
+    let mut count = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(lhs, i) {
+            if span.is_comment {
+                i = span.end;
+                continue;
+            }
+            if span.is_literal {
+                return false;
+            }
+        }
+        let ch = lhs[i..].chars().next().unwrap_or(' ');
+        if ch.is_whitespace() {
+            i += ch.len_utf8();
+            continue;
+        }
+        if ch == '_'
+            && lhs[i + 1..]
+                .chars()
+                .next()
+                .is_none_or(|c| !is_lean_id_rest(c))
+        {
+            count += 1;
+            i += 1;
+            continue;
+        }
+        let Some((ident, rest)) = take_leading_lean_ident(&lhs[i..]) else {
+            return false;
+        };
+        if ident.contains('.') {
+            return false;
+        }
+        count += 1;
+        i = lhs.len() - rest.len();
+    }
+    count > 0
+}
+
+fn binder_group_has_complete_explicit_type(inner: &str) -> bool {
+    let bytes = inner.as_bytes();
     let mut paren = 0i32;
     let mut bracket = 0i32;
     let mut brace = 0i32;
     let mut strict_brace = 0i32;
     let mut i = 0usize;
     while i < bytes.len() {
-        if let Some(span) = skip_lean_lexeme(sig_part, i) {
+        if let Some(span) = skip_lean_lexeme(inner, i) {
             i = span.end;
             continue;
         }
@@ -7031,18 +7304,373 @@ fn decl_header_has_explicit_type_annotation(sig_part: &str) -> bool {
             b'{' => brace += 1,
             b'}' => brace = (brace - 1).max(0),
             b':' if paren == 0 && bracket == 0 && brace == 0 && strict_brace == 0 => {
-                let prev = if i > 0 { Some(bytes[i - 1]) } else { None };
-                let next = bytes.get(i + 1).copied();
-                let is_op = matches!(prev, Some(b':' | b'=' | b'<' | b'>' | b'!'))
-                    || matches!(next, Some(b':' | b'=' | b'>'));
-                if !is_op {
-                    let after_colon = sig_part[i + 1..].trim();
-                    return !after_colon.is_empty();
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    // Unannotated default-value binder `(x := val)` reaches `:=` before any `:`!
+                    return false;
+                }
+                if is_standalone_colon_op(inner, i) {
+                    let lhs = &inner[..i];
+                    let rhs = &inner[i + 1..];
+                    // Split off optional `:= default_val` at top level of the binder group.
+                    let (ty_slice, def_opt) = split_at_top_level_assign(rhs)
+                        .map_or((rhs, None), |(ty, def_v)| (ty, Some(def_v)));
+                    if !binder_lhs_all_valid_binder_names(lhs) {
+                        return false;
+                    }
+                    if !lean_expr_has_non_comment_tokens(ty_slice)
+                        || lean_expr_has_hole_or_incomplete_binder(ty_slice)
+                    {
+                        return false;
+                    }
+                    if let Some(def_val) = def_opt {
+                        if !lean_expr_has_non_comment_tokens(def_val)
+                            || lean_expr_has_hole_or_incomplete_binder(def_val)
+                        {
+                            return false;
+                        }
+                    }
+                    return true;
                 }
             }
             _ => {}
         }
-        i += sig_part[i..].chars().next().map_or(1, char::len_utf8);
+        i += inner[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+fn instance_bracket_binder_is_complete(inner: &str) -> bool {
+    let bytes = inner.as_bytes();
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut strict_brace = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(inner, i) {
+            i = span.end;
+            continue;
+        }
+        if bytes[i..].starts_with("⦃".as_bytes()) {
+            strict_brace += 1;
+            i += "⦃".len();
+            continue;
+        }
+        if bytes[i..].starts_with("⦄".as_bytes()) {
+            strict_brace = (strict_brace - 1).max(0);
+            i += "⦄".len();
+            continue;
+        }
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            b':' if paren == 0 && bracket == 0 && brace == 0 && strict_brace == 0 => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    return false;
+                }
+                if is_standalone_colon_op(inner, i) {
+                    let lhs = &inner[..i];
+                    let rhs = &inner[i + 1..];
+                    return binder_lhs_all_valid_binder_names(lhs)
+                        && lean_expr_has_non_comment_tokens(rhs)
+                        && !lean_expr_has_hole_or_incomplete_binder(rhs);
+                }
+            }
+            _ => {}
+        }
+        i += inner[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    lean_expr_has_non_comment_tokens(inner) && !lean_expr_has_hole_or_incomplete_binder(inner)
+}
+
+fn is_instance_priority_binder(inner: &str) -> bool {
+    let bytes = inner.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(inner, i) {
+            if !span.is_comment {
+                break;
+            }
+            i = span.end;
+            continue;
+        }
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let Some(after_prio) = inner[i..].strip_prefix("priority") else {
+        return false;
+    };
+    let mut j = 0usize;
+    let abytes = after_prio.as_bytes();
+    while j < abytes.len() {
+        if let Some(span) = skip_lean_lexeme(after_prio, j) {
+            if !span.is_comment {
+                break;
+            }
+            j = span.end;
+            continue;
+        }
+        if abytes[j].is_ascii_whitespace() {
+            j += 1;
+            continue;
+        }
+        break;
+    }
+    let Some(rhs) = after_prio[j..].strip_prefix(":=") else {
+        return false;
+    };
+    lean_expr_has_non_comment_tokens(rhs)
+}
+
+fn decl_binders_all_explicitly_typed(binders_slice: &str, mut allow_instance_prio: bool) -> bool {
+    let bytes = binders_slice.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(binders_slice, i) {
+            if !span.is_comment {
+                // Any bare guillemet identifier or literal outside binder groups is not an annotated binder.
+                return false;
+            }
+            i = span.end;
+            continue;
+        }
+        let ch = binders_slice[i..].chars().next().unwrap_or(' ');
+        if ch.is_whitespace() {
+            i += ch.len_utf8();
+            continue;
+        }
+        if binders_slice[i..].starts_with("⦃") {
+            let Some((inner_end, next_i)) =
+                scan_balanced_binder_group_end(binders_slice, i, "⦃", "⦄")
+            else {
+                return false;
+            };
+            let inner = &binders_slice[i + "⦃".len()..inner_end];
+            if !binder_group_has_complete_explicit_type(inner) {
+                return false;
+            }
+            allow_instance_prio = false;
+            i = next_i;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => {
+                let Some((inner_end, next_i)) =
+                    scan_balanced_binder_group_end(binders_slice, i, "(", ")")
+                else {
+                    return false;
+                };
+                let inner = &binders_slice[i + 1..inner_end];
+                if allow_instance_prio && is_instance_priority_binder(inner) {
+                    if lean_expr_has_hole_or_incomplete_binder(inner) {
+                        return false;
+                    }
+                    allow_instance_prio = false;
+                    i = next_i;
+                    continue;
+                }
+                if !binder_group_has_complete_explicit_type(inner) {
+                    return false;
+                }
+                allow_instance_prio = false;
+                i = next_i;
+            }
+            b'{' => {
+                let Some((inner_end, next_i)) =
+                    scan_balanced_binder_group_end(binders_slice, i, "{", "}")
+                else {
+                    return false;
+                };
+                let inner = &binders_slice[i + 1..inner_end];
+                if !binder_group_has_complete_explicit_type(inner) {
+                    return false;
+                }
+                allow_instance_prio = false;
+                i = next_i;
+            }
+            b'[' => {
+                let Some((inner_end, next_i)) =
+                    scan_balanced_binder_group_end(binders_slice, i, "[", "]")
+                else {
+                    return false;
+                };
+                let inner = &binders_slice[i + 1..inner_end];
+                if !instance_bracket_binder_is_complete(inner) {
+                    return false;
+                }
+                allow_instance_prio = false;
+                i = next_i;
+            }
+            _ => {
+                // Any bare identifier (`def foo x : Nat`), `_`, pattern, or unrecognized token before `:`.
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn skip_decl_header_kw_and_name(sig_part: &str) -> Option<(&'static str, &str, bool)> {
+    const KWS: &[&str] = &[
+        "theorem",
+        "lemma",
+        "def",
+        "abbrev",
+        "structure",
+        "class",
+        "inductive",
+        "coinductive",
+        "instance",
+        "axiom",
+        "opaque",
+        "constant",
+        "simproc_decl",
+        "dsimproc_decl",
+        "simproc",
+        "dsimproc",
+        "builtin_simproc",
+        "builtin_dsimproc",
+    ];
+    let rest = strip_decl_and_in_prefixes(sig_part);
+    for &kw in KWS {
+        let Some(mut after) = rest.strip_prefix(kw) else {
+            continue;
+        };
+        if !(after.is_empty()
+            || after.starts_with(char::is_whitespace)
+            || after.starts_with('[')
+            || after.starts_with('/')
+            || after.starts_with('-'))
+        {
+            continue;
+        }
+        // Skip whitespace / comments after declaration keyword.
+        loop {
+            after = after.trim_start();
+            if let Some(span) = skip_lean_lexeme(after, 0) {
+                if span.is_comment {
+                    after = &after[span.end..];
+                    continue;
+                }
+            }
+            break;
+        }
+        // Optional `[...]` attribute/priority on `simproc` / `instance` immediately after keyword.
+        if kw != "instance" && after.starts_with('[') {
+            let (_, next_i) = scan_balanced_binder_group_end(after, 0, "[", "]")?;
+            after = &after[next_i..];
+            loop {
+                after = after.trim_start();
+                if let Some(span) = skip_lean_lexeme(after, 0) {
+                    if span.is_comment {
+                        after = &after[span.end..];
+                        continue;
+                    }
+                }
+                break;
+            }
+        }
+        let mut allow_instance_prio = kw == "instance";
+        if kw == "instance" && after.starts_with('(') {
+            if let Some((inner_end, next_i)) = scan_balanced_binder_group_end(after, 0, "(", ")") {
+                let inner = &after[1..inner_end];
+                if is_instance_priority_binder(inner) {
+                    if lean_expr_has_hole_or_incomplete_binder(inner) {
+                        return None;
+                    }
+                    allow_instance_prio = false;
+                    after = &after[next_i..];
+                    loop {
+                        after = after.trim_start();
+                        if let Some(span) = skip_lean_lexeme(after, 0) {
+                            if span.is_comment {
+                                after = &after[span.end..];
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        // Optional declaration name (always required except for anonymous `instance`).
+        if let Some((_, after_ident)) = take_leading_lean_ident(after) {
+            allow_instance_prio = false;
+            after = after_ident;
+        } else if kw != "instance" {
+            return None;
+        }
+        // Optional universe parameter list `.{u, v}` attached to the declaration (or anonymous `instance.{u}`).
+        if after.starts_with(".{") {
+            let (_, next_i) = scan_balanced_binder_group_end(after, 1, "{", "}")?;
+            let univ_inner = &after[2..next_i - 1];
+            if !lean_expr_has_non_comment_tokens(univ_inner)
+                || lean_expr_has_hole_or_incomplete_binder(univ_inner)
+            {
+                return None;
+            }
+            after = &after[next_i..];
+        }
+        return Some((kw, after, allow_instance_prio));
+    }
+    None
+}
+
+fn decl_header_has_explicit_type_annotation(sig_part: &str) -> bool {
+    let Some((_kw, after_name, allow_instance_prio)) = skip_decl_header_kw_and_name(sig_part)
+    else {
+        return false;
+    };
+    let bytes = after_name.as_bytes();
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut strict_brace = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(after_name, i) {
+            i = span.end;
+            continue;
+        }
+        if bytes[i..].starts_with("⦃".as_bytes()) {
+            strict_brace += 1;
+            i += "⦃".len();
+            continue;
+        }
+        if bytes[i..].starts_with("⦄".as_bytes()) {
+            strict_brace = (strict_brace - 1).max(0);
+            i += "⦄".len();
+            continue;
+        }
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            b':' if paren == 0
+                && bracket == 0
+                && brace == 0
+                && strict_brace == 0
+                && is_standalone_colon_op(after_name, i) =>
+            {
+                let binders_slice = &after_name[..i];
+                let ret_type = &after_name[i + 1..];
+                return decl_binders_all_explicitly_typed(binders_slice, allow_instance_prio)
+                    && lean_expr_has_non_comment_tokens(ret_type)
+                    && !lean_expr_has_hole_or_incomplete_binder(ret_type);
+            }
+            _ => {}
+        }
+        i += after_name[i..].chars().next().map_or(1, char::len_utf8);
     }
     false
 }
@@ -11618,6 +12246,150 @@ public theorem uses_ctx : True := trivial
             assert_eq!(
                 sig_a.meta_signature_digest, sig_b.meta_signature_digest,
                 "{label}: safe cutoff must preserve meta_signature_digest"
+            );
+        }
+    }
+
+    #[test]
+    fn test_speed4_extract_public_signature_placeholder_and_unannotated_binder_soundness() {
+        for (label, s1, s2) in [
+            (
+                "result-type bare hole `_`",
+                "module\npublic def api : _ := (0 : Nat)\n",
+                "module\npublic def api : _ := true\n",
+            ),
+            (
+                "partial result-type hole `List _`",
+                "module\npublic def api : List _ := [0]\n",
+                "module\npublic def api : List _ := [true]\n",
+            ),
+            (
+                "anonymous named hole `?_`",
+                "module\npublic def api : ?_ := 0\n",
+                "module\npublic def api : ?_ := true\n",
+            ),
+            (
+                "named hole `?m`",
+                "module\npublic def api : ?m := 0\n",
+                "module\npublic def api : ?m := true\n",
+            ),
+            (
+                "nested named hole `Option (?a)`",
+                "module\npublic def api : Option (?a) := some 0\n",
+                "module\npublic def api : Option (?a) := some true\n",
+            ),
+            (
+                "theorem with placeholder statement `: _`",
+                "module\npublic theorem thm : _ := True.intro\n",
+                "module\npublic theorem thm : _ := (rfl : 0 = 0)\n",
+            ),
+            (
+                "binder type placeholder `(x : _)`",
+                "module\npublic def api (x : _) : Nat := x + 1\n",
+                "module\npublic def api (x : _) : Nat := if x then 1 else 0\n",
+            ),
+            (
+                "unannotated parenthesized binder `(x)`",
+                "module\npublic def api (x) : Nat := x + 1\n",
+                "module\npublic def api (x) : Nat := if x then 1 else 0\n",
+            ),
+            (
+                "unannotated multi-var parenthesized binder `(x y)`",
+                "module\npublic def api (x y) : Nat := x + y\n",
+                "module\npublic def api (x y) : Nat := if x && y then 1 else 0\n",
+            ),
+            (
+                "bare identifier binder `x`",
+                "module\npublic def api x : Nat := x + 1\n",
+                "module\npublic def api x : Nat := if x then 1 else 0\n",
+            ),
+            (
+                "unannotated implicit binder `{x}`",
+                "module\npublic def api {x} : Nat := x + 1\n",
+                "module\npublic def api {x} : Nat := if x then 1 else 0\n",
+            ),
+            (
+                "unannotated strict-implicit binder `⦃x⦄`",
+                "module\npublic def api ⦃x⦄ : Nat := x + 1\n",
+                "module\npublic def api ⦃x⦄ : Nat := if x then 1 else 0\n",
+            ),
+            (
+                "placeholder strict-implicit binder `⦃x : _⦄` with explicit return type",
+                "module\npublic def api ⦃x : _⦄ : Nat := x + 1\n",
+                "module\npublic def api ⦃x : _⦄ : Nat := if x then 1 else 0\n",
+            ),
+            (
+                "strict-implicit binder `⦃x : Nat⦄` with NO top-level return type",
+                "module\npublic def api ⦃x : Nat⦄ := x + 1\n",
+                "module\npublic def api ⦃x : Nat⦄ := true\n",
+            ),
+            (
+                "strict-implicit binder `⦃x : Nat⦄` equation arms with NO top-level return type",
+                "module\npublic def api ⦃x : Nat⦄\n  | 0 => x\n  | n + 1 => api n\n",
+                "module\npublic def api ⦃x : Nat⦄\n  | 0 => true\n  | n + 1 => api n\n",
+            ),
+            (
+                "placeholder instance bracket `[ _ ]`",
+                "module\npublic def api [ _ ] : Nat := 0\n",
+                "module\npublic def api [ _ ] : Nat := 1\n",
+            ),
+            (
+                "default-value unannotated binder `(x := 0)`",
+                "module\npublic def api (x := 0) : Nat := x + 1\n",
+                "module\npublic def api (x := 0) : Nat := x + 2\n",
+            ),
+            (
+                "tactic-generated return type `: by exact _`",
+                "module\npublic def api : by exact Nat := 0\n",
+                "module\npublic def api : by exact Nat := 1\n",
+            ),
+            (
+                "forall unannotated binder in return type `: ∀ x, x = x`",
+                "module\npublic theorem thm : ∀ x, x = x := fun (x : Nat) => rfl\n",
+                "module\npublic theorem thm : ∀ x, x = x := fun (x : Bool) => rfl\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert!(
+                sig_a.declarations[0].exposed_body_hash.is_some(),
+                "{label}: body_exposed must be true (exposed_body_hash must be Some)"
+            );
+            assert_ne!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: public_signature_digest must change when body changes"
+            );
+            assert_ne!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: meta_signature_digest must change when body changes"
+            );
+        }
+
+        for (label, s1, s2) in [
+            (
+                "universe binders, `_root_.Nat`, underscored ident `x_1`, and strict-implicit `⦃y_1 : Nat⦄`",
+                "module\npublic def api.{u} {α : Type u} [Inhabited α] ⦃y_1 : Nat⦄ (x_1 : _root_.Nat) (_ : String := \"_ ?a\") : Nat := x_1 + y_1 + 1\n",
+                "module\npublic def api.{u} {α : Type u} [Inhabited α] ⦃y_1 : Nat⦄ (x_1 : _root_.Nat) (_ : String := \"_ ?a\") : Nat := 1 + y_1 + x_1\n",
+            ),
+            (
+                "fully annotated public theorem with underscored ident `x_1` and `?`-suffixed helper ident",
+                "module\npublic theorem thm (x_1 : Nat) (ok? : Bool) : x_1 = x_1 ∧ ok? = ok? := ⟨rfl, rfl⟩\n",
+                "module\npublic theorem thm (x_1 : Nat) (ok? : Bool) : x_1 = x_1 ∧ ok? = ok? := by exact ⟨rfl, rfl⟩\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert!(
+                sig_a.declarations[0].exposed_body_hash.is_none(),
+                "{label}: fully annotated declaration must keep exposed_body_hash == None"
+            );
+            assert_eq!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: fully annotated declaration must preserve public_signature_digest"
+            );
+            assert_eq!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: fully annotated declaration must preserve meta_signature_digest"
             );
         }
     }

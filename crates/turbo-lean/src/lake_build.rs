@@ -6485,7 +6485,15 @@ pub fn compute_impact_report(
                     .shards
                     .iter()
                     .zip(cur_split.shards.iter())
-                    .all(|(a, b)| a.decl_name() == b.decl_name() && a.stmt_hash == b.stmt_hash);
+                    .all(|(a, b)| a.decl_name() == b.decl_name() && a.stmt_hash == b.stmt_hash)
+                && !cur_sig
+                    .public_signature_digest
+                    .starts_with("pubsig-invalid:")
+                && !base_sig
+                    .public_signature_digest
+                    .starts_with("pubsig-invalid:")
+                && cur_sig.public_signature_digest == base_sig.public_signature_digest
+                && cur_sig.meta_signature_digest == base_sig.meta_signature_digest;
             if proof_body_only {
                 (
                     "proof_body_only".to_string(),
@@ -11279,6 +11287,136 @@ macro \"SEC_VAL\" : term => `(macVal)
         assert!(rep_trail_priv_def.transitive_dependents.is_empty());
         assert_eq!(
             rep_trail_priv_def.pruned_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+
+        // Placeholder return-type / binder-type / unannotated-binder declarations MUST classify
+        // body edits as `public_signature_edit` (NOT `private_module_edit` or `proof_body_only`)
+        // and retain downstream dependents (`Smoke.B`, `Smoke.C`), while fully annotated public
+        // definitions and theorems preserve `private_module_edit` / `proof_body_only` cutoff.
+        for (commit_msg, base_a, edited_a) in [
+            (
+                "placeholder return type `_` baseline",
+                "module\npublic def api : _ := (0 : Nat)\n",
+                "module\npublic def api : _ := true\n",
+            ),
+            (
+                "partial placeholder return type `List _` baseline",
+                "module\npublic def api : List _ := [0]\n",
+                "module\npublic def api : List _ := [true]\n",
+            ),
+            (
+                "named hole return type `?_` baseline",
+                "module\npublic def api : ?_ := 0\n",
+                "module\npublic def api : ?_ := true\n",
+            ),
+            (
+                "placeholder theorem statement `: _` baseline",
+                "module\npublic theorem thm : _ := True.intro\n",
+                "module\npublic theorem thm : _ := (rfl : 0 = 0)\n",
+            ),
+            (
+                "placeholder binder `(x : _)` baseline",
+                "module\npublic def api (x : _) : Nat := x + 1\n",
+                "module\npublic def api (x : _) : Nat := if x then 1 else 0\n",
+            ),
+            (
+                "unannotated binder `(x)` baseline",
+                "module\npublic def api (x) : Nat := x + 1\n",
+                "module\npublic def api (x) : Nat := if x then 1 else 0\n",
+            ),
+            (
+                "bare binder `x` baseline",
+                "module\npublic def api x : Nat := x + 1\n",
+                "module\npublic def api x : Nat := if x then 1 else 0\n",
+            ),
+            (
+                "unannotated implicit binder `{x}` baseline",
+                "module\npublic def api {x} : Nat := x + 1\n",
+                "module\npublic def api {x} : Nat := if x then 1 else 0\n",
+            ),
+            (
+                "placeholder strict-implicit binder `⦃x : _⦄` baseline",
+                "module\npublic def api ⦃x : _⦄ : Nat := x + 1\n",
+                "module\npublic def api ⦃x : _⦄ : Nat := if x then 1 else 0\n",
+            ),
+            (
+                "strict-implicit binder `⦃x : Nat⦄` without top-level return type baseline",
+                "module\npublic def api ⦃x : Nat⦄ := x + 1\n",
+                "module\npublic def api ⦃x : Nat⦄ := true\n",
+            ),
+        ] {
+            fs::write(proj.join("Smoke/A.lean"), base_a)?;
+            fs::write(
+                proj.join("Smoke/B.lean"),
+                "module\npublic import Smoke.A\npublic def useB : Nat := 1\n",
+            )?;
+            fs::write(
+                proj.join("Smoke/C.lean"),
+                "module\npublic import Smoke.B\npublic def useC : Nat := useB\n",
+            )?;
+            run_git(&["add", "-A"])?;
+            run_git(&["commit", "-m", commit_msg])?;
+            fs::write(proj.join("Smoke/A.lean"), edited_a)?;
+            let rep_hole = compute_impact_report(
+                proj.join("Smoke/A.lean"),
+                Some(proj.clone()),
+                Some("HEAD".to_string()),
+            )?;
+            assert_eq!(
+                rep_hole.edit_class, "public_signature_edit",
+                "{commit_msg}: body edit on placeholder/unannotated-binder decl must be public_signature_edit"
+            );
+            assert!(
+                rep_hole.public_signature_changed,
+                "{commit_msg}: public_signature_changed must be true"
+            );
+            assert_eq!(
+                rep_hole.transitive_dependents,
+                vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+            );
+            assert!(rep_hole.pruned_dependents.is_empty());
+        }
+
+        // Fully annotated `public def api.{u} (x_1 : _root_.Nat) : Nat` and `public theorem thm (x_1 : Nat) : x_1 = x_1`
+        // keep `private_module_edit` / `proof_body_only` cutoff intact.
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\npublic def api.{u} (x_1 : _root_.Nat) : Nat := x_1 + 1\npublic theorem thm (x_1 : Nat) : x_1 = x_1 := rfl\n",
+        )?;
+        run_git(&["add", "-A"])?;
+        run_git(&["commit", "-m", "fully annotated def and thm baseline"])?;
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\npublic def api.{u} (x_1 : _root_.Nat) : Nat := 1 + x_1\npublic theorem thm (x_1 : Nat) : x_1 = x_1 := rfl\n",
+        )?;
+        let rep_annot_def = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_annot_def.edit_class, "private_module_edit");
+        assert!(!rep_annot_def.public_signature_changed);
+        assert!(rep_annot_def.transitive_dependents.is_empty());
+        assert_eq!(
+            rep_annot_def.pruned_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\npublic def api.{u} (x_1 : _root_.Nat) : Nat := x_1 + 1\npublic theorem thm (x_1 : Nat) : x_1 = x_1 := Eq.refl x_1\n",
+        )?;
+        let rep_annot_thm = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_annot_thm.edit_class, "proof_body_only");
+        assert!(!rep_annot_thm.public_signature_changed);
+        assert!(rep_annot_thm.transitive_dependents.is_empty());
+        assert_eq!(
+            rep_annot_thm.pruned_dependents,
             vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
         );
 
