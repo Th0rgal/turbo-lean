@@ -7634,6 +7634,121 @@ fn unwrap_span_for_mutual_subspans<'a>(span: &CmdSpan<'a>) -> Option<CmdSpan<'a>
     None
 }
 
+fn has_unrecognized_command_indent_line<'a>(spans: &[CmdSpan<'a>]) -> bool {
+    let check_span = |span: &CmdSpan<'a>| -> bool {
+        let span_src = span.orig_text;
+        let mut lexical_cursor = 0usize;
+        let mut literal_end = 0usize;
+        let mut first_non_empty_idx: Option<usize> = None;
+        let mut base_indent = 0usize;
+        let mut line_byte_start = 0usize;
+        for (idx, (orig_line, clean_line)) in
+            span_src.lines().zip(span.clean_text.lines()).enumerate()
+        {
+            let trimmed_clean = clean_line.trim_start();
+            let trimmed_orig = orig_line.trim_start();
+            let token_start = line_byte_start + clean_line.len() - trimmed_clean.len();
+            while lexical_cursor < token_start {
+                if let Some(lex_span) = skip_lean_lexeme(span_src, lexical_cursor) {
+                    if lex_span.is_literal {
+                        literal_end = lex_span.end;
+                    }
+                    lexical_cursor = lex_span.end;
+                } else {
+                    lexical_cursor += span_src[lexical_cursor..]
+                        .chars()
+                        .next()
+                        .map_or(1, char::len_utf8);
+                }
+            }
+            line_byte_start += orig_line.len() + 1;
+            if token_start < literal_end {
+                continue;
+            }
+            if trimmed_clean.is_empty() && trimmed_orig.is_empty() {
+                continue;
+            }
+            if first_non_empty_idx.is_none() {
+                first_non_empty_idx = Some(idx);
+                base_indent = orig_line.len() - trimmed_orig.len();
+                if !trimmed_clean.is_empty() && !is_top_level_command_start(trimmed_clean) {
+                    let starts_doc = matches!(
+                        scan_lean_block_comment_end(trimmed_orig, 0),
+                        Some((_, true))
+                    );
+                    if !starts_doc {
+                        return true;
+                    }
+                }
+                continue;
+            }
+            if trimmed_clean.is_empty() {
+                continue;
+            }
+            let indent = orig_line.len() - trimmed_orig.len();
+            if indent <= base_indent {
+                let prev_clean = span
+                    .clean_text
+                    .lines()
+                    .take(idx)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let prev_orig = span_src.lines().take(idx).collect::<Vec<_>>().join("\n");
+                if is_incomplete_prefix_only_span(&prev_orig, &prev_clean) {
+                    if !is_top_level_command_start(trimmed_clean) {
+                        return true;
+                    }
+                    continue;
+                }
+                let prev_unwrapped = unwrap_scope_line_wrappers(prev_clean.trim());
+                let is_split_scope_ident = (prev_unwrapped == "namespace"
+                    || (is_section_header_line(prev_unwrapped)
+                        && extract_section_header_name(prev_unwrapped).is_empty())
+                    || unwrap_end_line_wrappers(prev_clean.trim()) == "end")
+                    && take_leading_lean_ident(trimmed_clean).is_some();
+                if is_split_scope_ident {
+                    continue;
+                }
+                if trimmed_clean.starts_with("| ")
+                    || trimmed_clean.starts_with("|\t")
+                    || trimmed_clean == "|"
+                    || trimmed_clean == "where"
+                    || trimmed_clean.starts_with("where ")
+                    || trimmed_clean.starts_with("deriving ")
+                    || trimmed_clean.starts_with(":=")
+                    || trimmed_clean == ")"
+                    || trimmed_clean.starts_with(") ")
+                    || trimmed_clean == "]"
+                    || trimmed_clean.starts_with("] ")
+                    || trimmed_clean == "}"
+                    || trimmed_clean.starts_with("} ")
+                {
+                    continue;
+                }
+                return true;
+            }
+        }
+        false
+    };
+
+    for span in spans {
+        if let Some(mutual_span) = unwrap_span_for_mutual_subspans(span) {
+            if let Some((_, inner_spans, _)) = split_mutual_block_subspans(&mutual_span) {
+                for sub in &inner_spans {
+                    if check_span(sub) {
+                        return true;
+                    }
+                }
+                continue;
+            }
+        }
+        if check_span(span) {
+            return true;
+        }
+    }
+    false
+}
+
 fn is_visibility_gated_module_cmd(after_prefixes: &str) -> bool {
     let core = strip_leading_in_command_prefixes(after_prefixes);
     if core
@@ -7718,6 +7833,20 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
     } else {
         parse_command_spans(&src[hdr.body_byte_offset..], &clean[hdr.body_byte_offset..])
     };
+    if has_unrecognized_command_indent_line(&body_spans) {
+        let doc_src = strip_non_doc_lean_comments(src);
+        let norm_src = normalize_whitespace(&doc_src);
+        let raw_hash = blake3::hash(norm_src.as_bytes()).to_hex().to_string();
+        return PublicSignatureSummary {
+            is_module,
+            exported_imports,
+            meta_exported_imports,
+            declarations: Vec::new(),
+            public_directives_hash: raw_hash.clone(),
+            public_signature_digest: format!("pubsig-custom-cmd:{}", raw_hash),
+            meta_signature_digest: format!("metasig-custom-cmd:{}", raw_hash),
+        };
+    }
     let mut stack: Vec<PubScopeFrame> = Vec::new();
     let mut declarations: Vec<PublicDeclSig> = Vec::new();
     let mut meta_declarations: Vec<PublicDeclSig> = Vec::new();
@@ -7753,15 +7882,6 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                     && items
                         .iter()
                         .all(|a| a == "local" || a.starts_with("local "))
-            })
-            .unwrap_or(false)
-    };
-    let has_any_local_attribute_cmd = |after_prefixes: &str| -> bool {
-        extract_attribute_cmd_bracket_inner(after_prefixes)
-            .map(|inner| {
-                split_attr_items(inner)
-                    .iter()
-                    .any(|a| a == "local" || a.starts_with("local "))
             })
             .unwrap_or(false)
     };
@@ -8171,7 +8291,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
         } else {
             true
         };
-        if is_public_visible {
+        if is_public_visible && !(is_module && is_meta_mod) {
             return None;
         }
         let (kw, raw_name) = classify_decl_in_pub_sig(trimmed)?;
@@ -8184,6 +8304,11 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
         } else {
             pub_qualified_name(&raw_name, stack)
         };
+        let tag_kind = if is_public_visible {
+            "pub-meta-decl"
+        } else {
+            "priv-decl"
+        };
         let phase = if is_meta_mod { "meta" } else { "reg" };
         let nc_tag = if is_noncomp_mod { ":nc" } else { "" };
         let we_tag = if with_exporting { ":we" } else { "" };
@@ -8193,7 +8318,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             format!(":in=[{}]", local_in_prefixes.join(";"))
         };
         Some(format!(
-            "priv-decl:{phase}{nc_tag}{we_tag}{in_tag}:{const_name}:{}",
+            "{tag_kind}:{phase}{nc_tag}{we_tag}{in_tag}:{const_name}:{}",
             normalize_whitespace(trimmed)
         ))
     };
@@ -8251,10 +8376,8 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                 format!("{} {}", prefix_parts.join(" "), norm)
             }
         };
-        let in_pub_sec = stack.iter().any(|f| f.is_public_section);
+        let _ = stack;
         let (mods, attrs) = parse_decl_modifiers_and_attrs(trimmed);
-        let is_priv_mod = mods.iter().any(|m| m == "private");
-        let is_pub_mod = mods.iter().any(|m| m == "public");
         let is_local_mod = mods.iter().any(|m| m == "local");
         let has_local_attr = attrs
             .iter()
@@ -8265,20 +8388,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             }
             return None;
         }
-        let non_exported_in_module = is_module
-            && (is_priv_mod
-                || is_local_mod
-                || is_all_local_attribute_cmd(after_p)
-                || (is_visibility_gated_module_cmd(after_p) && !is_pub_mod && !in_pub_sec));
-        if non_exported_in_module
-            || is_local_mod
-            || has_local_attr
-            || has_any_local_attribute_cmd(after_p)
-            || !is_visibility_gated_module_cmd(after_p)
-        {
-            return Some(format_ctx(normalize_whitespace(trimmed)));
-        }
-        None
+        Some(format_ctx(normalize_whitespace(trimmed)))
     };
 
     let mut pending_in_prefixes: Vec<String> = Vec::new();
@@ -10989,6 +11099,90 @@ public theorem uses_ctx : True := trivial
                 "{label}: non-exported trailing command must not alter meta_signature_digest"
             );
         }
+
+        for (label, s1, s2) in [
+            (
+                "public meta def controlling macro before public def",
+                "module\npublic meta def useNat : Bool := true\nmacro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+                "module\npublic meta def useNat : Bool := false\nmacro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+            ),
+            (
+                "public meta def controlling local macro before public def",
+                "module\npublic meta def useNat : Bool := true\nlocal macro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+                "module\npublic meta def useNat : Bool := false\nlocal macro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+            ),
+            (
+                "public meta section def controlling local macro before public def",
+                "module\npublic meta section\ndef useNat : Bool := true\nend\nlocal macro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+                "module\npublic meta section\ndef useNat : Bool := false\nend\nlocal macro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+            ),
+            (
+                "mutual public meta def controlling macro before public def",
+                "module\nmutual\n  public meta def useNat : Bool := helper\n  public meta def helper : Bool := true\nend\nlocal macro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+                "module\nmutual\n  public meta def useNat : Bool := helper\n  public meta def helper : Bool := false\nend\nlocal macro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+            ),
+            (
+                "#time wrapped public meta def controlling local macro before public def",
+                "module\n#time public meta def useNat : Bool := true\nlocal macro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+                "module\n#time public meta def useNat : Bool := false\nlocal macro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+            ),
+            (
+                "public meta def controlling command macro emitting exported attribute",
+                "module\npublic class Tag (α : Type) where val : Nat\n@[expose, instance_reducible] public def inst1 : Tag Nat := ⟨1⟩\n@[expose, instance_reducible] public def inst2 : Tag Nat := ⟨2⟩\npublic meta def pickFirst : Bool := true\nlocal macro \"applyChosenInst\" : command => if pickFirst then `(attribute [instance 200] inst1) else `(attribute [instance 200] inst2)\napplyChosenInst\n",
+                "module\npublic class Tag (α : Type) where val : Nat\n@[expose, instance_reducible] public def inst1 : Tag Nat := ⟨1⟩\n@[expose, instance_reducible] public def inst2 : Tag Nat := ⟨2⟩\npublic meta def pickFirst : Bool := false\nlocal macro \"applyChosenInst\" : command => if pickFirst then `(attribute [instance 200] inst1) else `(attribute [instance 200] inst2)\napplyChosenInst\n",
+            ),
+            (
+                "public syntax category abbrev before local macro and public def",
+                "module\npublic syntax myStx := \"tok1\"\nlocal macro \"useStx\" myStx : term => `(0)\npublic def api := useStx tok1\n",
+                "module\npublic syntax myStx := \"tok2\"\nlocal macro \"useStx\" myStx : term => `(0)\npublic def api := useStx tok2\n",
+            ),
+            (
+                "public class abbrev before public def",
+                "module\npublic class C1 (α : Type) where a : Nat\npublic class C2 (α : Type) where b : Nat\npublic class abbrev CA (α : Type) := C1 α, C2 α\npublic def f [CA α] : Nat := 0\n",
+                "module\npublic class C1 (α : Type) where a : Nat\npublic class C2 (α : Type) where b : Nat\npublic class abbrev CA (α : Type) := C1 α\npublic def f [CA α] : Nat := 0\n",
+            ),
+            (
+                "public meta initialize before public theorem referencing ref",
+                "module\npublic meta initialize myRef : IO.Ref Nat ← IO.mkRef 1\npublic theorem t : myRef = myRef := rfl\n",
+                "module\npublic meta initialize myRef : IO.Ref Bool ← IO.mkRef true\npublic theorem t : myRef = myRef := rfl\n",
+            ),
+            (
+                "imported command macro invocation generating public def",
+                "module\nimport MacroProvider\npublic def keep : Nat := 1\ngenPub generatedApi\n",
+                "module\nimport MacroProvider\npublic def keep : Nat := 1\n",
+            ),
+            (
+                "multiline string containing col-0 text does not trigger false custom-command fallback",
+                "module\npublic def s : String := \"\nnot_a_cmd\n\"\npublic def api : Nat := 1\n",
+                "module\npublic def s : String := \"\nnot_a_cmd\n\"\npublic def api : Bool := true\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert_ne!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: preceding elaboration context change must alter public_signature_digest"
+            );
+            assert_ne!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: preceding elaboration context change must alter meta_signature_digest"
+            );
+        }
+
+        let mutual_meta_v1 =
+            "module\npublic def keep : Nat := 1\nmutual\n  public meta def a := b\n  public meta def b := (0 : Nat)\nend\n";
+        let mutual_meta_v2 =
+            "module\npublic def keep : Nat := 1\nmutual\n  public meta def a := b\n  public meta def b := true\nend\n";
+        let mm1 = extract_public_signature(mutual_meta_v1);
+        let mm2 = extract_public_signature(mutual_meta_v2);
+        assert_eq!(
+            mm1.public_signature_digest, mm2.public_signature_digest,
+            "trailing mutual public meta def edit after all non-meta public decls preserves public_signature_digest"
+        );
+        assert_ne!(
+            mm1.meta_signature_digest, mm2.meta_signature_digest,
+            "mutual public meta sibling edit must alter meta_signature_digest"
+        );
     }
 
     #[test]

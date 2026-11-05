@@ -10662,6 +10662,79 @@ public def localNotVal : MYTYPE := true
         assert!(rep_pub_meta_all.meta_signature_changed);
         assert!(rep_pub_meta_all.pruned_dependents.is_empty());
 
+        let a_pub_meta_ctx_v1 = "\
+module
+public meta def useNat : Bool := true
+macro \"makeVal\" : term => if useNat then `((0 : Nat)) else `(true)
+public def api := makeVal
+";
+        let a_pub_meta_ctx_v2 = "\
+module
+public meta def useNat : Bool := false
+macro \"makeVal\" : term => if useNat then `((0 : Nat)) else `(true)
+public def api := makeVal
+";
+        fs::write(proj.join("Smoke/A.lean"), a_pub_meta_ctx_v1)?;
+        fs::write(
+            proj.join("Smoke/B.lean"),
+            "module\npublic import Smoke.A\npublic def useApi : Nat := api + 1\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/C.lean"),
+            "module\nimport Smoke.B\npublic def useApiC : Nat := useApi\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/M.lean"),
+            "module\nmeta import Smoke.A\nmeta def useMeta : Bool := useNat\n",
+        )?;
+        run_git(&["add", "-A"])?;
+        run_git(&["commit", "-m", "public meta def macro context baseline"])?;
+        crate::module_builder::build_project_modules_native(
+            &mut store,
+            &proj,
+            &["Smoke.C".to_string(), "Smoke.M".to_string()],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        fs::write(proj.join("Smoke/A.lean"), a_pub_meta_ctx_v2)?;
+        let rep_pub_meta_ctx = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_pub_meta_ctx.edit_class, "public_signature_edit");
+        assert!(
+            rep_pub_meta_ctx.public_signature_changed,
+            "preceding `public meta def` controlling macro before `public def` must mark `public_signature_changed = true`"
+        );
+        assert!(rep_pub_meta_ctx.meta_signature_changed);
+        assert_eq!(
+            rep_pub_meta_ctx.transitive_dependents,
+            vec![
+                "Smoke.B".to_string(),
+                "Smoke.C".to_string(),
+                "Smoke.M".to_string()
+            ]
+        );
+        assert!(
+            rep_pub_meta_ctx.pruned_dependents.is_empty(),
+            "ordinary public importers must NOT be pruned when preceding `public meta def` changes `api` from `Nat` to `Bool`"
+        );
+        let err_pub_meta_ctx = lake_recheck_dependents_with_store(
+            Some(&store),
+            &canon_proj,
+            &["Smoke/A.lean".to_string()],
+            Some("HEAD"),
+            false,
+        );
+        assert!(
+            err_pub_meta_ctx.is_err(),
+            "downstream ordinary consumer Smoke.B must be rechecked and fail when `useNat` flips `api` from `Nat` to `Bool`"
+        );
+
         let a_trail_attr_v1 = "\
 module
 namespace SmokeA
