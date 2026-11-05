@@ -10753,6 +10753,279 @@ end SmokeA
         );
         assert!(rep_gm.pruned_dependents.is_empty());
 
+        // Moving a scope boundary (`end`) before vs after a `public def` (changing whether
+        // section-local `variable (x : Nat)` / `open` applies to `public def`) must mark
+        // `public_signature_changed = true`, retain downstream consumers in `compute_impact_report`,
+        // and refuse early cutoff in `lake_recheck_dependents_with_store` (catching real downstream breakage).
+        let a_sec_v1 = "module\nsection\nvariable (x : Nat)\npublic def secApi : Nat := x\nend\n";
+        let a_sec_v2 = "module\nsection\nvariable (x : Nat)\nend\npublic def secApi : Nat := 0\n";
+        fs::write(proj.join("Smoke/A.lean"), a_sec_v1)?;
+        fs::write(
+            proj.join("Smoke/B.lean"),
+            "module\npublic import Smoke.A\npublic def useSec : Nat := secApi 42\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/C.lean"),
+            "module\npublic import Smoke.B\npublic def useSecC : Nat := useSec\n",
+        )?;
+        run_git(&["add", "-A"])?;
+        run_git(&["commit", "-m", "section boundary baseline"])?;
+        crate::module_builder::build_project_modules_native(
+            &mut store,
+            &proj,
+            &["Smoke.C".to_string()],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        fs::write(proj.join("Smoke/A.lean"), a_sec_v2)?;
+        let rep_sec = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_sec.edit_class, "public_signature_edit");
+        assert!(
+            rep_sec.public_signature_changed,
+            "moving `end` before `public def` must mark `public_signature_changed = true`"
+        );
+        assert!(rep_sec.meta_signature_changed);
+        assert_eq!(
+            rep_sec.transitive_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+        assert!(
+            rep_sec.pruned_dependents.is_empty(),
+            "downstream consumers must NOT be pruned when `section ... end` boundary shifts across `public def`"
+        );
+        let err_sec_recheck = lake_recheck_dependents_with_store(
+            Some(&store),
+            &canon_proj,
+            &["Smoke/A.lean".to_string()],
+            Some("HEAD"),
+            false,
+        );
+        assert!(
+            err_sec_recheck.is_err(),
+            "downstream consumer Smoke.B (`secApi 42`) must be rechecked and fail when `end` moves before `secApi` (0-ary `Nat`)"
+        );
+
+        // Moving `end` before vs after an exported `attribute [instance ...]` directive where a
+        // section-scoped `open` selects which candidate receives `[instance 200]` must mark
+        // `public_signature_changed = true` and fail downstream recheck instead of falsely cutting off.
+        let a_dir_sec_v1 = "\
+module
+public class Tag (α : Type) where val : Nat
+@[expose, instance_reducible] public def instTag : Tag Nat := { val := 22 }
+namespace Foo
+@[expose, instance_reducible] public def instTag : Tag Nat := { val := 11 }
+attribute [instance 200] instTag
+end Foo
+";
+        let a_dir_sec_v2 = "\
+module
+public class Tag (α : Type) where val : Nat
+@[expose, instance_reducible] public def instTag : Tag Nat := { val := 22 }
+namespace Foo
+@[expose, instance_reducible] public def instTag : Tag Nat := { val := 11 }
+end Foo
+attribute [instance 200] instTag
+";
+        fs::write(proj.join("Smoke/A.lean"), a_dir_sec_v1)?;
+        fs::write(
+            proj.join("Smoke/B.lean"),
+            "module\npublic import Smoke.A\nattribute [instance 150] _root_.instTag\npublic theorem useDirSec : (inferInstance : Tag Nat).val = 11 := rfl\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/C.lean"),
+            "module\npublic import Smoke.B\npublic theorem useDirSecC : (inferInstance : Tag Nat).val = 11 := useDirSec\n",
+        )?;
+        run_git(&["add", "-A"])?;
+        run_git(&["commit", "-m", "directive section boundary baseline"])?;
+        crate::module_builder::build_project_modules_native(
+            &mut store,
+            &proj,
+            &["Smoke.C".to_string()],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        fs::write(proj.join("Smoke/A.lean"), a_dir_sec_v2)?;
+        let rep_dir_sec = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_dir_sec.edit_class, "public_signature_edit");
+        assert!(
+            rep_dir_sec.public_signature_changed,
+            "moving `end` before exported `notation` must mark `public_signature_changed = true`"
+        );
+        assert_eq!(
+            rep_dir_sec.transitive_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+        assert!(rep_dir_sec.pruned_dependents.is_empty());
+        let err_dir_sec_recheck = lake_recheck_dependents_with_store(
+            Some(&store),
+            &canon_proj,
+            &["Smoke/A.lean".to_string()],
+            Some("HEAD"),
+            false,
+        );
+        assert!(
+            err_dir_sec_recheck.is_err(),
+            "downstream consumer Smoke.B must be rechecked and fail when `end` moves before `attribute [instance 200] instTag`"
+        );
+
+        // Moving `end` before vs after an exported `macro` directive where a section-scoped
+        // `set_option hygiene false` governs macro hygiene must mark `public_signature_changed = true`
+        // and fail downstream recheck instead of falsely cutting off.
+        let a_sec_macro_v1 = "\
+module
+section
+set_option hygiene false
+macro \"SEC_VAL\" : term => `(macVal)
+end
+";
+        let a_sec_macro_v2 = "\
+module
+section
+set_option hygiene false
+end
+macro \"SEC_VAL\" : term => `(macVal)
+";
+        fs::write(proj.join("Smoke/A.lean"), a_sec_macro_v1)?;
+        fs::write(
+            proj.join("Smoke/B.lean"),
+            "module\npublic import Smoke.A\n@[expose] public def macVal : Nat := 11\npublic theorem useSecMacro : SEC_VAL = 11 := rfl\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/C.lean"),
+            "module\npublic import Smoke.B\npublic theorem useSecMacroC : SEC_VAL = 11 := useSecMacro\n",
+        )?;
+        run_git(&["add", "-A"])?;
+        run_git(&["commit", "-m", "section macro boundary baseline"])?;
+        crate::module_builder::build_project_modules_native(
+            &mut store,
+            &proj,
+            &["Smoke.C".to_string()],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        fs::write(proj.join("Smoke/A.lean"), a_sec_macro_v2)?;
+        let rep_sec_macro = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_sec_macro.edit_class, "public_signature_edit");
+        assert!(
+            rep_sec_macro.public_signature_changed,
+            "moving unnamed `section ... end` before exported `macro` must mark `public_signature_changed = true`"
+        );
+        assert_eq!(
+            rep_sec_macro.transitive_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+        assert!(rep_sec_macro.pruned_dependents.is_empty());
+        let err_sec_macro_recheck = lake_recheck_dependents_with_store(
+            Some(&store),
+            &canon_proj,
+            &["Smoke/A.lean".to_string()],
+            Some("HEAD"),
+            false,
+        );
+        assert!(
+            err_sec_macro_recheck.is_err(),
+            "downstream consumer Smoke.B (`SEC_VAL = 11`) must be rechecked and fail when unnamed `end` moves before `macro \"SEC_VAL\"`"
+        );
+
+        // Editing or renaming a trailing private `section ... end` containing private theorems
+        // after all public declarations must classify as `private_module_edit`
+        // (`public_signature_changed = false`), prune downstream dependents `Smoke.B` and `Smoke.C`
+        // in `compute_impact_report`, and cut off Stage-2 native recheck after `Smoke.A` (since
+        // `.ir`/`.ir.sig` and `dumpPublicSignatureJson` stay unchanged).
+        let a_trail_sec_v1 =
+            "module\npublic def apiStable : Nat := 7\nsection Priv1\nvariable (k : Nat)\nprivate theorem p : k = k := rfl\nend Priv1\n";
+        let a_trail_sec_v2 =
+            "module\npublic def apiStable : Nat := 7\nsection Priv2\nvariable (b : Bool)\nprivate theorem p2 : b = b := rfl\nend Priv2\n";
+        fs::write(proj.join("Smoke/A.lean"), a_trail_sec_v1)?;
+        fs::write(
+            proj.join("Smoke/B.lean"),
+            "module\npublic import Smoke.A\npublic def useStable : Nat := apiStable\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/C.lean"),
+            "module\npublic import Smoke.B\npublic def useStableC : Nat := useStable\n",
+        )?;
+        let _ = fs::remove_file(proj.join("Smoke/Provider1.lean"));
+        let _ = fs::remove_file(proj.join("Smoke/Provider2.lean"));
+        crate::module_builder::build_project_modules_native(
+            &mut store,
+            &proj,
+            &["Smoke.C".to_string()],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        run_git(&["add", "-A"])?;
+        run_git(&["commit", "-m", "trailing private section baseline"])?;
+        fs::write(proj.join("Smoke/A.lean"), a_trail_sec_v2)?;
+        let rep_trail_sec = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_trail_sec.edit_class, "private_module_edit");
+        assert!(
+            !rep_trail_sec.public_signature_changed,
+            "trailing private `section ... end` edit must NOT mark `public_signature_changed = true`"
+        );
+        assert!(!rep_trail_sec.meta_signature_changed);
+        assert!(rep_trail_sec.transitive_dependents.is_empty());
+        assert_eq!(
+            rep_trail_sec.pruned_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+        let (n_trail_sec, _, mods_trail_sec, _) = lake_recheck_dependents_with_store(
+            Some(&store),
+            &canon_proj,
+            &["Smoke/A.lean".to_string()],
+            Some("HEAD"),
+            false,
+        )?;
+        assert_eq!(n_trail_sec, 1);
+        assert_eq!(mods_trail_sec, vec!["Smoke.A".to_string()]);
+
+        // Also verify compute_impact_report prunes downstream dependents even when the trailing
+        // private section contains `private def` items.
+        let a_trail_priv_def =
+            "module\npublic def apiStable : Nat := 7\nsection Priv3\nvariable (m : Nat)\nprivate def pDef : Nat := m + 1\nend Priv3\n";
+        fs::write(proj.join("Smoke/A.lean"), a_trail_priv_def)?;
+        let rep_trail_priv_def = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_trail_priv_def.edit_class, "private_module_edit");
+        assert!(!rep_trail_priv_def.public_signature_changed);
+        assert!(!rep_trail_priv_def.meta_signature_changed);
+        assert!(rep_trail_priv_def.transitive_dependents.is_empty());
+        assert_eq!(
+            rep_trail_priv_def.pruned_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }

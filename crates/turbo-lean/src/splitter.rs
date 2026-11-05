@@ -1259,7 +1259,7 @@ fn is_top_level_command_start(trimmed: &str) -> bool {
         "import ",
         "public import ",
         "public section",
-        "namespace ",
+        "namespace",
         "section",
         "noncomputable section",
         "meta section",
@@ -1504,8 +1504,17 @@ fn is_mutual_line_start(trimmed_clean: &str) -> bool {
 }
 
 fn is_end_line_start(trimmed_clean: &str) -> bool {
+    let base = unwrap_end_line_wrappers(trimmed_clean);
+    base == "end"
+        || base
+            .strip_prefix("end")
+            .is_some_and(|r| r.starts_with(char::is_whitespace))
+}
+
+fn is_namespace_header_span(trimmed_clean: &str) -> bool {
     let base = unwrap_scope_line_wrappers(trimmed_clean);
-    base == "end" || base.starts_with("end ")
+    base.strip_prefix("namespace")
+        .is_some_and(|r| r.starts_with(char::is_whitespace))
 }
 
 pub(crate) fn is_section_header_line(trimmed_clean: &str) -> bool {
@@ -1513,12 +1522,34 @@ pub(crate) fn is_section_header_line(trimmed_clean: &str) -> bool {
     while let Some(next) = strip_leading_attr_block(after) {
         after = next.trim_start();
     }
-    for m in ["noncomputable ", "public ", "meta "] {
-        if let Some(next) = after.strip_prefix(m) {
+    loop {
+        if let Some(next) = after
+            .strip_prefix("noncomputable")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
             after = next.trim_start();
+            continue;
         }
+        if let Some(next) = after
+            .strip_prefix("public")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
+            after = next.trim_start();
+            continue;
+        }
+        if let Some(next) = after
+            .strip_prefix("meta")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
+            after = next.trim_start();
+            continue;
+        }
+        break;
     }
-    after == "section" || after.starts_with("section ")
+    after == "section"
+        || after
+            .strip_prefix("section")
+            .is_some_and(|r| r.starts_with(char::is_whitespace))
 }
 
 /// Zero-copy segmentation of `(src, clean)` into top-level `CmdSpan`s.
@@ -1610,12 +1641,24 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
         let prev_orig = &src[cur_byte_start..cur_byte_end];
         let prev_clean = &clean[cur_byte_start..cur_byte_end];
         let prev_trimmed = prev_clean.trim();
-        let prev_is_section_or_ns_header = is_section_header_line(prev_trimmed)
-            || prev_trimmed.starts_with("namespace ")
+        let prev_unwrapped = unwrap_scope_line_wrappers(prev_trimmed);
+        let prev_is_section_or_ns_header = is_section_header_line(prev_unwrapped)
+            || is_namespace_header_span(prev_trimmed)
             || is_end_line_start(prev_trimmed);
 
-        let can_start_at_indent =
-            at_command_indent || (scope_depth > 0 && prev_is_section_or_ns_header);
+        let prev_incomplete_ns = prev_unwrapped == "namespace";
+        let prev_incomplete_section_name = (is_section_header_line(prev_unwrapped)
+            && extract_section_header_name(prev_unwrapped).is_empty()
+            || unwrap_end_line_wrappers(prev_trimmed) == "end")
+            && !trimmed.is_empty()
+            && !starts_doc_comment
+            && !is_top_level_command_start(trimmed)
+            && take_leading_lean_ident(trimmed).is_some();
+
+        let can_start_at_indent = (at_command_indent
+            || (scope_depth > 0 && prev_is_section_or_ns_header))
+            && !prev_incomplete_ns
+            && !prev_incomplete_section_name;
 
         if line_num > 1
             && can_start_at_indent
@@ -1637,8 +1680,15 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
             cur_cmd_indent = Some(indent);
         }
 
-        if can_start_at_indent {
-            if is_section_header_line(trimmed) || trimmed.starts_with("namespace ") {
+        let cur_span_clean = &clean[cur_byte_start..line_end_no_cr];
+        let cur_span_unwrapped = unwrap_scope_line_wrappers(cur_span_clean.trim());
+        if prev_incomplete_ns && is_namespace_header_span(cur_span_unwrapped) {
+            scope_depth += 1;
+        } else if can_start_at_indent {
+            if is_section_header_line(unwrap_scope_line_wrappers(trimmed))
+                || is_section_header_line(cur_span_unwrapped)
+                || is_namespace_header_span(trimmed)
+            {
                 scope_depth += 1;
             } else if is_end_line_start(trimmed) && scope_depth > 0 {
                 scope_depth -= 1;
@@ -2507,10 +2557,29 @@ fn extract_section_header_name(trimmed: &str) -> String {
     while let Some(next) = strip_leading_attr_block(after_sec) {
         after_sec = next.trim_start();
     }
-    for m in ["noncomputable ", "public ", "meta "] {
-        if let Some(next) = after_sec.strip_prefix(m) {
+    loop {
+        if let Some(next) = after_sec
+            .strip_prefix("noncomputable")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
             after_sec = next.trim_start();
+            continue;
         }
+        if let Some(next) = after_sec
+            .strip_prefix("public")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
+            after_sec = next.trim_start();
+            continue;
+        }
+        if let Some(next) = after_sec
+            .strip_prefix("meta")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
+            after_sec = next.trim_start();
+            continue;
+        }
+        break;
     }
     let rest = after_sec.strip_prefix("section").unwrap_or("").trim_start();
     take_leading_lean_ident(rest)
@@ -6380,7 +6449,7 @@ fn parse_decl_modifiers_and_attrs(clean_cmd: &str) -> (Vec<String>, Vec<String>)
     (mods, attrs)
 }
 
-fn section_header_visibility(trimmed_clean: &str) -> (bool, bool, bool) {
+fn section_header_visibility(trimmed_clean: &str) -> (bool, bool, bool, bool) {
     let mut after = trimmed_clean;
     let mut has_expose = false;
     while let Some(next) = strip_leading_attr_block(after) {
@@ -6396,24 +6465,35 @@ fn section_header_visibility(trimmed_clean: &str) -> (bool, bool, bool) {
     }
     let mut is_public = false;
     let mut is_meta = false;
+    let mut is_noncomputable = false;
     loop {
-        if let Some(next) = after.strip_prefix("noncomputable ") {
+        if let Some(next) = after
+            .strip_prefix("noncomputable")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
+            is_noncomputable = true;
             after = next.trim_start();
             continue;
         }
-        if let Some(next) = after.strip_prefix("public ") {
+        if let Some(next) = after
+            .strip_prefix("public")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
             is_public = true;
             after = next.trim_start();
             continue;
         }
-        if let Some(next) = after.strip_prefix("meta ") {
+        if let Some(next) = after
+            .strip_prefix("meta")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
             is_meta = true;
             after = next.trim_start();
             continue;
         }
         break;
     }
-    (is_public, is_meta, has_expose)
+    (is_public, is_meta, has_expose, is_noncomputable)
 }
 
 #[derive(Clone, Debug)]
@@ -6423,114 +6503,355 @@ struct PubScopeFrame {
     is_public_section: bool,
     is_meta_section: bool,
     section_has_expose: bool,
+    is_noncomputable_section: bool,
+}
+
+fn strip_leading_comments_and_ws(s: &str) -> &str {
+    let mut rest = s.trim_start();
+    loop {
+        if let Some((end, _)) = scan_lean_block_comment_end(rest, 0) {
+            rest = rest[end..].trim_start();
+            continue;
+        }
+        if rest.starts_with("--") {
+            match rest.find('\n') {
+                Some(nl) => rest = rest[nl + 1..].trim_start(),
+                None => return "",
+            }
+            continue;
+        }
+        break;
+    }
+    rest
 }
 
 fn unwrap_scope_line_wrappers(s: &str) -> &str {
-    let trimmed = s.trim();
-    let mut cur = trimmed;
+    let mut cur = strip_leading_comments_and_ws(s);
     loop {
-        if let Some(after_time) = cur
-            .strip_prefix("#time")
-            .filter(|r| r.starts_with(char::is_whitespace))
-        {
-            cur = after_time.trim_start();
+        if let Some(after_time) = cur.strip_prefix("#time").filter(|r| {
+            r.starts_with(char::is_whitespace) || r.starts_with("/-") || r.starts_with("--")
+        }) {
+            cur = strip_leading_comments_and_ws(after_time);
             continue;
         }
         if let Some(after_gm) = strip_leading_guard_msgs_in(cur).filter(|r| !r.trim().is_empty()) {
-            cur = after_gm.trim_start();
+            cur = strip_leading_comments_and_ws(after_gm);
             continue;
         }
         if let Some(after_gp) =
             strip_leading_simple_in_wrapper(cur, "#guard_panic").filter(|r| !r.trim().is_empty())
         {
-            cur = after_gp.trim_start();
+            cur = strip_leading_comments_and_ws(after_gp);
             continue;
         }
         if let Some(after_it) =
             strip_leading_simple_in_wrapper(cur, "#info_trees").filter(|r| !r.trim().is_empty())
         {
-            cur = after_it.trim_start();
+            cur = strip_leading_comments_and_ws(after_it);
             continue;
         }
-        if let Some(after_we) = cur
-            .strip_prefix("#with_exporting")
-            .filter(|r| r.starts_with(char::is_whitespace))
-        {
-            cur = after_we.trim_start();
+        if let Some(after_we) = cur.strip_prefix("#with_exporting").filter(|r| {
+            r.starts_with(char::is_whitespace) || r.starts_with("/-") || r.starts_with("--")
+        }) {
+            cur = strip_leading_comments_and_ws(after_we);
             continue;
         }
         break;
     }
-    cur
+    cur.trim()
 }
 
-fn update_pub_scope_stack(stack: &mut Vec<PubScopeFrame>, orig_chunk: &str) {
-    let masked = mask_lean_lexemes(orig_chunk, true);
-    for (line, orig_line) in masked.lines().zip(orig_chunk.lines()) {
-        let trimmed = unwrap_scope_line_wrappers(line.trim());
-        let orig_trimmed = unwrap_scope_line_wrappers(orig_line.trim());
-        if let Some(rest) = trimmed.strip_prefix("namespace ") {
-            let orig_rest = orig_trimmed.strip_prefix("namespace ").unwrap_or(rest);
-            let name = take_leading_lean_ident(orig_rest.trim_start())
-                .map(|(n, _)| n)
-                .unwrap_or("");
-            let inh_pub = stack.iter().any(|f| f.is_public_section);
-            let inh_meta = stack.iter().any(|f| f.is_meta_section);
-            let inh_exp = stack.iter().any(|f| f.section_has_expose);
-            for seg in split_lean_name_components(name) {
+fn unwrap_end_line_wrappers(s: &str) -> &str {
+    let mut cur = strip_leading_comments_and_ws(s);
+    loop {
+        let (after_in, in_list) = strip_leading_in_command_prefixes_with_list(cur);
+        if !in_list.is_empty() && !after_in.trim().is_empty() {
+            cur = strip_leading_comments_and_ws(after_in);
+            continue;
+        }
+        let next = unwrap_scope_line_wrappers(cur);
+        if next.len() < cur.trim().len() {
+            cur = next;
+            continue;
+        }
+        break;
+    }
+    cur.trim()
+}
+
+fn is_scope_boundary_cmd_core(trimmed: &str) -> bool {
+    trimmed
+        .strip_prefix("namespace")
+        .is_some_and(|r| r.starts_with(char::is_whitespace))
+        || is_section_header_line(trimmed)
+        || trimmed == "end"
+        || trimmed
+            .strip_prefix("end")
+            .is_some_and(|r| r.starts_with(char::is_whitespace))
+}
+
+fn apply_pub_scope_transition(
+    stack: &mut Vec<PubScopeFrame>,
+    active_context_vars: &mut Vec<String>,
+    directives_hasher: &mut blake3::Hasher,
+    orig_chunk: &str,
+    clean_chunk: &str,
+    inherited_in_prefixes: &[String],
+    inherited_with_exporting: bool,
+) {
+    let mut all_in_prefixes: Vec<String> = inherited_in_prefixes.to_vec();
+    if let CommandBearingWrapperUnwrap::Inner { in_prefixes, .. } =
+        unwrap_command_bearing_diagnostic_wrappers(clean_chunk.trim())
+    {
+        all_in_prefixes.extend(in_prefixes);
+    } else {
+        let (_, in_list) = strip_leading_in_command_prefixes_with_list(
+            strip_leading_doc_comments_only(clean_chunk),
+        );
+        all_in_prefixes.extend(in_list);
+    }
+    let with_exporting = inherited_with_exporting
+        || matches!(
+            unwrap_command_bearing_diagnostic_wrappers(clean_chunk.trim()),
+            CommandBearingWrapperUnwrap::Inner {
+                with_exporting: true,
+                ..
+            }
+        )
+        || strip_leading_doc_comments_only(clean_chunk)
+            .strip_prefix("#with_exporting")
+            .is_some_and(|r| r.starts_with(char::is_whitespace));
+
+    let has_invalid_decl_doc =
+        scan_lean_block_comment_end(orig_chunk.trim_start(), 0).is_some_and(|(_, is_doc)| is_doc);
+    let end_clean_core = unwrap_end_line_wrappers(clean_chunk);
+    let end_orig_core = unwrap_end_line_wrappers(orig_chunk);
+    if end_clean_core == "end"
+        || end_clean_core
+            .strip_prefix("end")
+            .is_some_and(|r| r.starts_with(char::is_whitespace))
+    {
+        if has_invalid_decl_doc {
+            directives_hasher.update(b"invalid-decl-doc-on-scope:end\n");
+            active_context_vars.push("scope-invalid-doc:end".to_string());
+        }
+        let orig_rest = end_orig_core
+            .strip_prefix("end")
+            .unwrap_or_else(|| end_clean_core.strip_prefix("end").unwrap_or(""));
+        let name = take_leading_lean_ident(orig_rest.trim_start())
+            .map(|(n, _)| n)
+            .unwrap_or("");
+        let wrap_tag = if all_in_prefixes.is_empty() && !with_exporting {
+            String::new()
+        } else {
+            format!(":in=[{}]:we={with_exporting}", all_in_prefixes.join(";"))
+        };
+        if name.is_empty() {
+            match stack.last() {
+                Some(top) if top.name.is_empty() => {
+                    let popped = stack.pop().unwrap();
+                    let kind_tag = match popped.kind {
+                        ScopeKind::Section => "sec",
+                        ScopeKind::Namespace => "ns",
+                        ScopeKind::Mutual => "mut",
+                    };
+                    active_context_vars.push(format!("scope-close:{kind_tag}{wrap_tag}"));
+                }
+                Some(top) => {
+                    directives_hasher.update(b"mismatched-unnamed-end:");
+                    directives_hasher.update(top.name.as_bytes());
+                    directives_hasher.update(b"\n");
+                    active_context_vars.push(format!(
+                        "scope-close-mismatch:unnamed:{}{wrap_tag}",
+                        top.name
+                    ));
+                    stack.pop();
+                }
+                None => {
+                    directives_hasher.update(b"unmatched-end:unnamed\n");
+                    active_context_vars.push(format!("scope-close-unmatched:unnamed{wrap_tag}"));
+                }
+            }
+        } else {
+            for seg in split_lean_name_components(name).into_iter().rev() {
+                let canon = canonical_lean_name_component(seg);
+                match stack.last() {
+                    Some(top) if canonical_lean_name_component(&top.name) == canon => {
+                        let popped = stack.pop().unwrap();
+                        let kind_tag = match popped.kind {
+                            ScopeKind::Section => "sec",
+                            ScopeKind::Namespace => "ns",
+                            ScopeKind::Mutual => "mut",
+                        };
+                        active_context_vars
+                            .push(format!("scope-close:{kind_tag}:{canon}{wrap_tag}"));
+                    }
+                    Some(_) => {
+                        directives_hasher.update(b"mismatched-named-end:");
+                        directives_hasher.update(canon.as_bytes());
+                        directives_hasher.update(b"\n");
+                        active_context_vars.push(format!("scope-close-mismatch:{canon}{wrap_tag}"));
+                        if let Some(pos) = stack
+                            .iter()
+                            .rposition(|f| canonical_lean_name_component(&f.name) == canon)
+                        {
+                            stack.truncate(pos);
+                        } else {
+                            stack.pop();
+                        }
+                    }
+                    None => {
+                        directives_hasher.update(b"unmatched-end:");
+                        directives_hasher.update(canon.as_bytes());
+                        directives_hasher.update(b"\n");
+                        active_context_vars
+                            .push(format!("scope-close-unmatched:{canon}{wrap_tag}"));
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    if !all_in_prefixes.is_empty() {
+        let after_all_core = end_clean_core;
+        if after_all_core
+            .strip_prefix("namespace")
+            .is_some_and(|r| r.starts_with(char::is_whitespace))
+            || is_section_header_line(after_all_core)
+        {
+            // In Lean 4, `open/set_option/variable/... in section` runs `section` inside a
+            // temporary `in`-command scope that immediately closes (so `public section` does NOT
+            // stay open for subsequent declarations!), and `... in namespace Foo` errors with
+            // `Missing name after end`. Record in context & directives_hasher without pushing a
+            // persistent scope frame.
+            directives_hasher.update(b"transient-in-scope-header:");
+            for p in &all_in_prefixes {
+                directives_hasher.update(p.as_bytes());
+                directives_hasher.update(b"|");
+            }
+            hash_normalized_whitespace(directives_hasher, after_all_core, b"\n");
+            active_context_vars.push(format!(
+                "scope-transient-in:[{}]:we={with_exporting}:{}",
+                all_in_prefixes.join(";"),
+                normalize_whitespace(after_all_core)
+            ));
+            return;
+        }
+    }
+
+    let clean_core = unwrap_scope_line_wrappers(clean_chunk);
+    let orig_core = unwrap_scope_line_wrappers(orig_chunk);
+
+    if let Some(rest) = clean_core
+        .strip_prefix("namespace")
+        .filter(|r| r.starts_with(char::is_whitespace))
+    {
+        if has_invalid_decl_doc {
+            directives_hasher.update(b"invalid-decl-doc-on-scope:ns\n");
+            active_context_vars.push("scope-invalid-doc:ns".to_string());
+        }
+        let orig_rest = orig_core
+            .strip_prefix("namespace")
+            .filter(|r| r.starts_with(char::is_whitespace))
+            .unwrap_or(rest);
+        let name = take_leading_lean_ident(orig_rest.trim_start())
+            .map(|(n, _)| n)
+            .unwrap_or("");
+        let inh_pub = stack.iter().any(|f| f.is_public_section);
+        let inh_meta = stack.iter().any(|f| f.is_meta_section);
+        let inh_exp = stack.iter().any(|f| f.section_has_expose);
+        let inh_noncomp = stack.iter().any(|f| f.is_noncomputable_section);
+        let segs = split_lean_name_components(name);
+        if segs.is_empty() {
+            directives_hasher.update(b"malformed-empty-namespace\n");
+            active_context_vars.push("scope-open-malformed:ns".to_string());
+        } else {
+            let we_tag = if with_exporting { ":we" } else { "" };
+            for seg in segs {
+                let canon = canonical_lean_name_component(seg);
                 stack.push(PubScopeFrame {
                     kind: ScopeKind::Namespace,
                     name: seg.to_string(),
                     is_public_section: inh_pub,
                     is_meta_section: inh_meta,
                     section_has_expose: inh_exp,
+                    is_noncomputable_section: inh_noncomp,
                 });
+                active_context_vars.push(format!("scope-open:ns:{canon}{we_tag}"));
             }
-        } else if is_section_header_line(trimmed) {
-            let (sec_pub, sec_meta, sec_exp) = section_header_visibility(trimmed);
-            let inh_pub = sec_pub || stack.iter().any(|f| f.is_public_section);
-            let inh_meta = sec_meta || stack.iter().any(|f| f.is_meta_section);
-            let inh_exp = sec_exp || stack.iter().any(|f| f.section_has_expose);
-            let name = extract_section_header_name(orig_trimmed);
-            if name.is_empty() {
-                stack.push(PubScopeFrame {
-                    kind: ScopeKind::Section,
-                    name: String::new(),
-                    is_public_section: inh_pub,
-                    is_meta_section: inh_meta,
-                    section_has_expose: inh_exp,
-                });
-            } else {
-                for seg in split_lean_name_components(&name) {
-                    stack.push(PubScopeFrame {
-                        kind: ScopeKind::Section,
-                        name: seg.to_string(),
-                        is_public_section: inh_pub,
-                        is_meta_section: inh_meta,
-                        section_has_expose: inh_exp,
-                    });
-                }
-            }
-        } else if trimmed == "mutual" || trimmed.starts_with("mutual ") {
-            let inh_pub = stack.iter().any(|f| f.is_public_section);
-            let inh_meta = stack.iter().any(|f| f.is_meta_section);
-            let inh_exp = stack.iter().any(|f| f.section_has_expose);
+        }
+        return;
+    }
+
+    if is_section_header_line(clean_core) {
+        if has_invalid_decl_doc {
+            directives_hasher.update(b"invalid-decl-doc-on-scope:sec\n");
+            active_context_vars.push("scope-invalid-doc:sec".to_string());
+        }
+        let (sec_pub, sec_meta, sec_exp, sec_noncomp) = section_header_visibility(clean_core);
+        let inh_pub = sec_pub || stack.iter().any(|f| f.is_public_section);
+        let inh_meta = sec_meta || stack.iter().any(|f| f.is_meta_section);
+        let inh_exp = sec_exp || stack.iter().any(|f| f.section_has_expose);
+        let inh_noncomp = sec_noncomp || stack.iter().any(|f| f.is_noncomputable_section);
+        let name = extract_section_header_name(orig_core);
+        let flags = format!(
+            "p={}:m={}:e={}:nc={}:we={}",
+            u8::from(sec_pub),
+            u8::from(sec_meta),
+            u8::from(sec_exp),
+            u8::from(sec_noncomp),
+            u8::from(with_exporting),
+        );
+        if name.is_empty() {
             stack.push(PubScopeFrame {
-                kind: ScopeKind::Mutual,
+                kind: ScopeKind::Section,
                 name: String::new(),
                 is_public_section: inh_pub,
                 is_meta_section: inh_meta,
                 section_has_expose: inh_exp,
+                is_noncomputable_section: inh_noncomp,
             });
-        } else if trimmed == "end" || trimmed.starts_with("end ") {
-            let orig_rest = orig_trimmed
+            active_context_vars.push(format!("scope-open:sec::{flags}"));
+        } else {
+            for seg in split_lean_name_components(&name) {
+                let canon = canonical_lean_name_component(seg);
+                stack.push(PubScopeFrame {
+                    kind: ScopeKind::Section,
+                    name: seg.to_string(),
+                    is_public_section: inh_pub,
+                    is_meta_section: inh_meta,
+                    section_has_expose: inh_exp,
+                    is_noncomputable_section: inh_noncomp,
+                });
+                active_context_vars.push(format!("scope-open:sec:{canon}:{flags}"));
+            }
+        }
+        return;
+    }
+
+    let masked = mask_lean_lexemes(orig_chunk, true);
+    for (line, orig_line) in masked.lines().zip(orig_chunk.lines()) {
+        let end_trimmed = unwrap_end_line_wrappers(line.trim());
+        let end_orig_trimmed = unwrap_end_line_wrappers(orig_line.trim());
+        if end_trimmed == "end" || end_trimmed.starts_with("end ") {
+            let orig_rest = end_orig_trimmed
                 .strip_prefix("end")
-                .unwrap_or_else(|| trimmed.strip_prefix("end").unwrap_or(""));
+                .unwrap_or_else(|| end_trimmed.strip_prefix("end").unwrap_or(""));
             let name = take_leading_lean_ident(orig_rest.trim_start())
                 .map(|(n, _)| n)
                 .unwrap_or("");
             if name.is_empty() {
-                stack.pop();
+                if let Some(popped) = stack.pop() {
+                    let kind_tag = match popped.kind {
+                        ScopeKind::Section => "sec",
+                        ScopeKind::Namespace => "ns",
+                        ScopeKind::Mutual => "mut",
+                    };
+                    active_context_vars.push(format!("scope-close:{kind_tag}"));
+                } else {
+                    active_context_vars.push("scope-close-unmatched:unnamed".to_string());
+                }
             } else {
                 for seg in split_lean_name_components(name).into_iter().rev() {
                     let canon = canonical_lean_name_component(seg);
@@ -6539,11 +6860,96 @@ fn update_pub_scope_stack(stack: &mut Vec<PubScopeFrame>, orig_chunk: &str) {
                         .rposition(|f| canonical_lean_name_component(&f.name) == canon)
                     {
                         stack.truncate(pos);
+                        active_context_vars.push(format!("scope-close:named:{canon}"));
                     } else {
                         stack.pop();
+                        active_context_vars.push(format!("scope-close-mismatch:{canon}"));
                     }
                 }
             }
+            continue;
+        }
+        let trimmed = unwrap_scope_line_wrappers(line.trim());
+        let orig_trimmed = unwrap_scope_line_wrappers(orig_line.trim());
+        if let Some(rest) = trimmed
+            .strip_prefix("namespace")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
+            let orig_rest = orig_trimmed
+                .strip_prefix("namespace")
+                .filter(|r| r.starts_with(char::is_whitespace))
+                .unwrap_or(rest);
+            let name = take_leading_lean_ident(orig_rest.trim_start())
+                .map(|(n, _)| n)
+                .unwrap_or("");
+            let inh_pub = stack.iter().any(|f| f.is_public_section);
+            let inh_meta = stack.iter().any(|f| f.is_meta_section);
+            let inh_exp = stack.iter().any(|f| f.section_has_expose);
+            let inh_noncomp = stack.iter().any(|f| f.is_noncomputable_section);
+            for seg in split_lean_name_components(name) {
+                let canon = canonical_lean_name_component(seg);
+                stack.push(PubScopeFrame {
+                    kind: ScopeKind::Namespace,
+                    name: seg.to_string(),
+                    is_public_section: inh_pub,
+                    is_meta_section: inh_meta,
+                    section_has_expose: inh_exp,
+                    is_noncomputable_section: inh_noncomp,
+                });
+                active_context_vars.push(format!("scope-open:ns:{canon}"));
+            }
+        } else if is_section_header_line(trimmed) {
+            let (sec_pub, sec_meta, sec_exp, sec_noncomp) = section_header_visibility(trimmed);
+            let inh_pub = sec_pub || stack.iter().any(|f| f.is_public_section);
+            let inh_meta = sec_meta || stack.iter().any(|f| f.is_meta_section);
+            let inh_exp = sec_exp || stack.iter().any(|f| f.section_has_expose);
+            let inh_noncomp = sec_noncomp || stack.iter().any(|f| f.is_noncomputable_section);
+            let name = extract_section_header_name(orig_trimmed);
+            let flags = format!(
+                "p={}:m={}:e={}:nc={}",
+                u8::from(sec_pub),
+                u8::from(sec_meta),
+                u8::from(sec_exp),
+                u8::from(sec_noncomp),
+            );
+            if name.is_empty() {
+                stack.push(PubScopeFrame {
+                    kind: ScopeKind::Section,
+                    name: String::new(),
+                    is_public_section: inh_pub,
+                    is_meta_section: inh_meta,
+                    section_has_expose: inh_exp,
+                    is_noncomputable_section: inh_noncomp,
+                });
+                active_context_vars.push(format!("scope-open:sec::{flags}"));
+            } else {
+                for seg in split_lean_name_components(&name) {
+                    let canon = canonical_lean_name_component(seg);
+                    stack.push(PubScopeFrame {
+                        kind: ScopeKind::Section,
+                        name: seg.to_string(),
+                        is_public_section: inh_pub,
+                        is_meta_section: inh_meta,
+                        section_has_expose: inh_exp,
+                        is_noncomputable_section: inh_noncomp,
+                    });
+                    active_context_vars.push(format!("scope-open:sec:{canon}:{flags}"));
+                }
+            }
+        } else if trimmed == "mutual" || trimmed.starts_with("mutual ") {
+            let inh_pub = stack.iter().any(|f| f.is_public_section);
+            let inh_meta = stack.iter().any(|f| f.is_meta_section);
+            let inh_exp = stack.iter().any(|f| f.section_has_expose);
+            let inh_noncomp = stack.iter().any(|f| f.is_noncomputable_section);
+            stack.push(PubScopeFrame {
+                kind: ScopeKind::Mutual,
+                name: String::new(),
+                is_public_section: inh_pub,
+                is_meta_section: inh_meta,
+                section_has_expose: inh_exp,
+                is_noncomputable_section: inh_noncomp,
+            });
+            active_context_vars.push("scope-open:mut".to_string());
         }
     }
 }
@@ -7473,12 +7879,14 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
         let in_pub_sec = stack.iter().any(|f| f.is_public_section);
         let in_meta_sec = stack.iter().any(|f| f.is_meta_section);
         let in_expose_sec = stack.iter().any(|f| f.section_has_expose);
+        let in_noncomp_sec = stack.iter().any(|f| f.is_noncomputable_section);
 
         let (mods, attrs) = parse_decl_modifiers_and_attrs(trimmed);
         let is_priv_mod = mods.iter().any(|m| m == "private");
         let is_pub_mod = mods.iter().any(|m| m == "public");
         let is_meta_mod = mods.iter().any(|m| m == "meta") || in_meta_sec;
         let is_local_mod = mods.iter().any(|m| m == "local");
+        let is_noncomp_mod = mods.iter().any(|m| m == "noncomputable") || in_noncomp_sec;
 
         let is_public_visible = if is_module {
             !is_priv_mod && !is_local_mod && (is_pub_mod || in_pub_sec)
@@ -7575,11 +7983,14 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                 sig_h.update(b"ctx:#with_exporting\n");
             }
             for m in &mods {
-                if m != "public" {
+                if m != "public" && m != "noncomputable" {
                     sig_h.update(b"mod:");
                     sig_h.update(m.as_bytes());
                     sig_h.update(b"\n");
                 }
+            }
+            if is_noncomp_mod {
+                sig_h.update(b"mod:noncomputable\n");
             }
             for oa in &other_exported_attrs {
                 sig_h.update(b"attr:");
@@ -7670,13 +8081,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
         if is_pure_diagnostic_or_example_cmd(after_prefixes) {
             return;
         }
-        if local_in_prefixes.is_empty()
-            && !with_exporting
-            && (trimmed.starts_with("namespace ")
-                || is_section_header_line(trimmed)
-                || trimmed == "end"
-                || trimmed.starts_with("end "))
-        {
+        if is_scope_boundary_cmd_core(trimmed) || is_scope_boundary_cmd_core(after_prefixes) {
             return;
         }
         let is_exit = is_exit_cmd(after_prefixes);
@@ -7759,11 +8164,13 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
         }
         let in_pub_sec = stack.iter().any(|f| f.is_public_section);
         let in_meta_sec = stack.iter().any(|f| f.is_meta_section);
+        let in_noncomp_sec = stack.iter().any(|f| f.is_noncomputable_section);
         let (mods, _) = parse_decl_modifiers_and_attrs(trimmed);
         let is_priv_mod = mods.iter().any(|m| m == "private");
         let is_pub_mod = mods.iter().any(|m| m == "public");
         let is_meta_mod = mods.iter().any(|m| m == "meta") || in_meta_sec;
         let is_local_mod = mods.iter().any(|m| m == "local");
+        let is_noncomp_mod = mods.iter().any(|m| m == "noncomputable") || in_noncomp_sec;
         let is_public_visible = if is_module {
             !is_priv_mod && !is_local_mod && (is_pub_mod || in_pub_sec)
         } else {
@@ -7783,6 +8190,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             pub_qualified_name(&raw_name, stack)
         };
         let phase = if is_meta_mod { "meta" } else { "reg" };
+        let nc_tag = if is_noncomp_mod { ":nc" } else { "" };
         let we_tag = if with_exporting { ":we" } else { "" };
         let in_tag = if local_in_prefixes.is_empty() {
             String::new()
@@ -7790,7 +8198,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             format!(":in=[{}]", local_in_prefixes.join(";"))
         };
         Some(format!(
-            "priv-decl:{phase}{we_tag}{in_tag}:{const_name}:{}",
+            "priv-decl:{phase}{nc_tag}{we_tag}{in_tag}:{const_name}:{}",
             normalize_whitespace(trimmed)
         ))
     };
@@ -7824,14 +8232,10 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
         if is_non_exported_import_cmd(trimmed) || is_non_exported_import_cmd(after_p) {
             return Some(normalize_whitespace(trimmed));
         }
-        if local_in_prefixes.is_empty()
-            && !with_exporting
-            && (is_scope_ctx_cmd(after_p)
-                || trimmed.starts_with("namespace ")
-                || is_section_header_line(trimmed)
-                || trimmed == "end"
-                || trimmed.starts_with("end "))
-        {
+        if is_scope_boundary_cmd_core(trimmed) || is_scope_boundary_cmd_core(after_p) {
+            return None;
+        }
+        if local_in_prefixes.is_empty() && !with_exporting && is_scope_ctx_cmd(after_p) {
             return None;
         }
         if is_pure_diagnostic_or_example_cmd(after_p) {
@@ -7944,7 +8348,17 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                     is_public_section: stack.iter().any(|f| f.is_public_section),
                     is_meta_section: stack.iter().any(|f| f.is_meta_section),
                     section_has_expose: stack.iter().any(|f| f.section_has_expose),
+                    is_noncomputable_section: stack.iter().any(|f| f.is_noncomputable_section),
                 });
+                let mut_in_tag = if combined_mutual_in.is_empty() && !combined_mutual_we {
+                    String::new()
+                } else {
+                    format!(
+                        ":in=[{}]:we={combined_mutual_we}",
+                        combined_mutual_in.join(";")
+                    )
+                };
+                active_context_vars.push(format!("scope-open:mut{mut_in_tag}"));
                 {
                     let mut sub_pending_in = Vec::new();
                     let mut sub_pending_we = false;
@@ -8041,6 +8455,15 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                             active_context_vars.push(entry);
                         }
                     }
+                    apply_pub_scope_transition(
+                        &mut stack,
+                        &mut active_context_vars,
+                        &mut directives_hasher,
+                        sub.orig_text,
+                        sub.clean_text,
+                        &eff_in,
+                        eff_we,
+                    );
                 }
                 if !sub_pending_in.is_empty() || sub_pending_we {
                     directives_hasher.update(b"dangling-mutual-prefix:");
@@ -8054,6 +8477,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                     directives_hasher.update(b"\n");
                 }
                 stack.pop();
+                active_context_vars.push(format!("scope-close:mut{mut_in_tag}"));
                 continue;
             }
         }
@@ -8083,9 +8507,15 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
         ) {
             active_context_vars.push(entry);
         }
-        if span_in_prefixes.is_empty() && span_wrap_in_prefixes.is_empty() {
-            update_pub_scope_stack(&mut stack, span.orig_text);
-        }
+        apply_pub_scope_transition(
+            &mut stack,
+            &mut active_context_vars,
+            &mut directives_hasher,
+            span.orig_text,
+            span.clean_text,
+            &span_in_prefixes,
+            span_with_exporting,
+        );
     }
     if pending_wrapper || !pending_in_prefixes.is_empty() || pending_with_exporting {
         directives_hasher.update(b"dangling-eof-prefix:");
@@ -10733,6 +11163,194 @@ public theorem uses_ctx : True := trivial
             assert_eq!(
                 sig_a.meta_signature_digest, sig_b.meta_signature_digest,
                 "{label}: pure diagnostic or private/body-only edit under wrapper must preserve meta_signature_digest"
+            );
+        }
+    }
+
+    #[test]
+    fn test_speed4_extract_public_signature_scope_boundary_soundness() {
+        for (label, s1, s2) in [
+            (
+                "moving end before vs after public def with section variable",
+                "module\nsection\nvariable (x : Nat)\npublic def f : Nat := 1\nend\n",
+                "module\nsection\nvariable (x : Nat)\nend\npublic def f : Nat := 1\n",
+            ),
+            (
+                "moving end before vs after public theorem with section universe",
+                "module\nsection\nuniverse u\npublic theorem t : Sort u → True := fun _ => trivial\nend\n",
+                "module\nsection\nuniverse u\nend\npublic theorem t : Sort u → True := fun _ => trivial\n",
+            ),
+            (
+                "moving end before vs after public def with section open",
+                "module\nnamespace Foo\npublic def x : Nat := 1\nend Foo\npublic def x : Bool := true\nsection\nopen Foo\npublic def f := x\nend\n",
+                "module\nnamespace Foo\npublic def x : Nat := 1\nend Foo\npublic def x : Bool := true\nsection\nopen Foo\nend\npublic def f := x\n",
+            ),
+            (
+                "moving end before vs after public def with section set_option autoImplicit",
+                "module\nsection\nset_option autoImplicit false\npublic def f (x : Nat) : Nat := x\nend\n",
+                "module\nsection\nset_option autoImplicit false\nend\npublic def f (x : Nat) : Nat := x\n",
+            ),
+            (
+                "moving end before vs after public def with section include",
+                "module\nvariable (h : True)\nsection\ninclude h\npublic theorem f : True := trivial\nend\n",
+                "module\nvariable (h : True)\nsection\ninclude h\nend\npublic theorem f : True := trivial\n",
+            ),
+            (
+                "moving end before vs after public def with section omit",
+                "module\nvariable (h : True)\ninclude h\nsection\nomit h\npublic theorem f : True := trivial\nend\n",
+                "module\nvariable (h : True)\ninclude h\nsection\nomit h\nend\npublic theorem f : True := trivial\n",
+            ),
+            (
+                "moving end before vs after public def with section local notation",
+                "module\nsection\nlocal notation \"MY_C\" => (1 : Nat)\npublic def f := MY_C\nend\n",
+                "module\nsection\nlocal notation \"MY_C\" => (1 : Nat)\nend\npublic def f := 1\n",
+            ),
+            (
+                "moving end before vs after public def with section local instance",
+                "module\npublic class Tag where v : Nat\nsection\nlocal instance : Tag := ⟨10⟩\n@[expose] public def f : Nat := Tag.v\nend\n",
+                "module\npublic class Tag where v : Nat\nsection\nlocal instance : Tag := ⟨10⟩\nend\n@[expose] public def f : Nat := Tag.v\n",
+            ),
+            (
+                "moving end before vs after public theorem with section attribute [local simp]",
+                "module\npublic def g (x : Nat) : Nat := x\npublic theorem g_eq (x : Nat) : g x = x := rfl\nsection\nattribute [local simp] g_eq\npublic def f (x : Nat) : Nat := g x\nend\n",
+                "module\npublic def g (x : Nat) : Nat := x\npublic theorem g_eq (x : Nat) : g x = x := rfl\nsection\nattribute [local simp] g_eq\nend\npublic def f (x : Nat) : Nat := g x\n",
+            ),
+            (
+                "moving section opener above vs below variable",
+                "module\nvariable (x : Nat)\nsection\nend\npublic def f : Nat := 1\n",
+                "module\nsection\nvariable (x : Nat)\nend\npublic def f : Nat := 1\n",
+            ),
+            (
+                "named section S ... end S boundary shift",
+                "module\nsection S\nvariable (x : Nat)\npublic def f : Nat := 1\nend S\n",
+                "module\nsection S\nvariable (x : Nat)\nend S\npublic def f : Nat := 1\n",
+            ),
+            (
+                "multi-segment section A.B partial close end B vs full close end A.B",
+                "module\nsection A\nvariable (a : Nat)\nsection B\nvariable (b : Bool)\nend B\npublic def f : Nat := 1\nend A\n",
+                "module\nsection A.B\nvariable (a : Nat)\nvariable (b : Bool)\nend A.B\npublic def f : Nat := 1\n",
+            ),
+            (
+                "multi-segment namespace A.B partial close end B keeps A open vs end A.B",
+                "module\nnamespace A.B\nvariable (x : Nat)\nend B\npublic def f : Nat := 1\nend A\n",
+                "module\nnamespace A.B\nvariable (x : Nat)\nend A.B\npublic def A.f : Nat := 1\n",
+            ),
+            (
+                "re-entering namespace Foo vs qualified _root_.Foo.f for scoped lookup",
+                "module\nnamespace Foo\nprivate def y : Nat := 42\nend Foo\nnamespace Foo\npublic def f := y\nend Foo\n",
+                "module\nnamespace Foo\nprivate def y : Nat := 42\nend Foo\npublic def Foo.f := y\n",
+            ),
+            (
+                "noncomputable section boundary shift",
+                "module\nnoncomputable section\npublic def f : Nat := 1\nend\n",
+                "module\nnoncomputable section\nend\npublic def f : Nat := 1\n",
+            ),
+            (
+                "multiline modifiers on section header (public\\nsection and @[expose]\\npublic\\nsection)",
+                "module\n@[expose]\npublic\nsection\nvariable (x : Nat)\ndef f : Nat := 1\nend\n",
+                "module\n@[expose]\npublic\nsection\nvariable (x : Nat)\nend\n@[expose] public def f : Nat := 1\n",
+            ),
+            (
+                "multiline namespace and end headers",
+                "module\nnamespace\n  Foo.Bar\nvariable (x : Nat)\nend\n  Bar\npublic def f : Nat := 1\nend\n  Foo\n",
+                "module\nnamespace\n  Foo.Bar\nvariable (x : Nat)\npublic def f : Nat := 1\nend\n  Foo.Bar\n",
+            ),
+            (
+                "wrapped #time section and #time end boundary shift",
+                "module\n#time section\nvariable (x : Nat)\npublic def f : Nat := 1\n#time end\n",
+                "module\n#time section\nvariable (x : Nat)\n#time end\npublic def f : Nat := 1\n",
+            ),
+            (
+                "wrapped #guard_msgs in section and #with_exporting end boundary shift",
+                "module\n#guard_msgs (drop info) in\nsection\nvariable (x : Nat)\npublic def f : Nat := 1\n#with_exporting\nend\n",
+                "module\n#guard_msgs (drop info) in\nsection\nvariable (x : Nat)\n#with_exporting\nend\npublic def f : Nat := 1\n",
+            ),
+            (
+                "open ... in end closes enclosing section",
+                "module\nsection\nvariable (x : Nat)\nopen Nat in\nend\npublic def f : Nat := 1\n",
+                "module\nsection\nvariable (x : Nat)\npublic def f : Nat := 1\nopen Nat in\nend\n",
+            ),
+            (
+                "transient open ... in public section does NOT persist for subsequent def",
+                "module\nopen Nat in\npublic section\ndef f : Nat := 1\n",
+                "module\npublic section\ndef f : Nat := 1\nend\n",
+            ),
+            (
+                "mutual ... end scopes inner variable away from subsequent public def",
+                "module\nmutual\n  variable (x : Nat)\n  public def g : Nat := 1\nend\npublic def f : Nat := 2\n",
+                "module\nvariable (x : Nat)\nmutual\n  public def g : Nat := 1\nend\npublic def f : Nat := 2\n",
+            ),
+            (
+                "moving end before vs after exported attribute [instance] directive",
+                "module\nnamespace Foo\npublic class C (α : Type) where v : Nat\n@[expose, instance_reducible] public def mkTag : C Nat := ⟨10⟩\nend Foo\nnamespace Bar\n@[expose, instance_reducible] public def mkTag : Foo.C Nat := ⟨20⟩\nend Bar\nopen Bar\nsection\nopen Foo\nattribute [instance 100] mkTag\nend\n",
+                "module\nnamespace Foo\npublic class C (α : Type) where v : Nat\n@[expose, instance_reducible] public def mkTag : C Nat := ⟨10⟩\nend Foo\nnamespace Bar\n@[expose, instance_reducible] public def mkTag : Foo.C Nat := ⟨20⟩\nend Bar\nopen Bar\nsection\nopen Foo\nend\nattribute [instance 100] mkTag\n",
+            ),
+            (
+                "moving end before vs after exported notation directive",
+                "module\nnamespace Foo\npublic def target : Nat := 1\nend Foo\npublic def target : Nat := 2\nsection\nopen Foo\nnotation \"EXP_TOK\" => target\nend\n",
+                "module\nnamespace Foo\npublic def target : Nat := 1\nend Foo\npublic def target : Nat := 2\nsection\nopen Foo\nend\nnotation \"EXP_TOK\" => target\n",
+            ),
+            (
+                "module doc /-! -/ before named section preserves section name across end",
+                "module\n/-! module doc -/\nsection S\nvariable (x : Nat)\npublic def f : Nat := 1\nend S\n",
+                "module\n/-! module doc -/\nsection S\nvariable (x : Nat)\nend S\npublic def f : Nat := 1\n",
+            ),
+            (
+                "invalid /-- docstring before section invalidates public signature",
+                "module\nsection S\npublic def f : Nat := 1\nend S\n",
+                "module\n/-- bad doc -/\nsection S\npublic def f : Nat := 1\nend S\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert_ne!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: public_signature_digest must change on scope boundary shift"
+            );
+            assert_ne!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: meta_signature_digest must change on scope boundary shift"
+            );
+        }
+
+        // Meta-only scope boundary shift: moving `end` before vs after `public meta def` changes `meta_signature_digest`.
+        let meta_in_sec =
+            "module\npublic def keep : Nat := 1\nsection\nvariable (x : Nat)\npublic meta def m : Nat := 1\nend\n";
+        let meta_out_sec =
+            "module\npublic def keep : Nat := 1\nsection\nvariable (x : Nat)\nend\npublic meta def m : Nat := 1\n";
+        let ms_in = extract_public_signature(meta_in_sec);
+        let ms_out = extract_public_signature(meta_out_sec);
+        assert_eq!(
+            ms_in.public_signature_digest, ms_out.public_signature_digest,
+            "scope shift after all non-meta public decls preserves public_signature_digest"
+        );
+        assert_ne!(
+            ms_in.meta_signature_digest, ms_out.meta_signature_digest,
+            "scope shift across public meta def must change meta_signature_digest"
+        );
+
+        // Safe cutoff preserved inside sections and namespaces for unexposed bodies, theorem proofs, and trailing private sections!
+        for (label, s1, s2) in [
+            (
+                "unexposed public def body edit and theorem proof edit inside section with variable",
+                "module\nsection S\nvariable (x : Nat)\npublic def f : Nat := x + 1\npublic theorem thm : x + 0 = x := Nat.add_zero x\nend S\n",
+                "module\nsection S\nvariable (x : Nat)\npublic def f : Nat := 1 + x\npublic theorem thm : x + 0 = x := by omega\nend S\n",
+            ),
+            (
+                "trailing private section after all public declarations",
+                "module\npublic def api : Nat := 1\nsection PrivWork\nvariable (z : Nat)\nprivate def p : Nat := z + 1\nend PrivWork\n",
+                "module\npublic def api : Nat := 1\nsection OtherPriv\nvariable (w : Bool)\nprivate def p2 : Bool := w\nend OtherPriv\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert_eq!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: safe cutoff must preserve public_signature_digest"
+            );
+            assert_eq!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: safe cutoff must preserve meta_signature_digest"
             );
         }
     }
