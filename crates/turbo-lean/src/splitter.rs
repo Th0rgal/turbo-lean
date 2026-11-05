@@ -209,9 +209,27 @@ pub fn blocking_items(items: &[String]) -> Vec<String> {
     blocking_items_under(items, &allowed_axioms())
 }
 
+/// Hygiene items that block under `--allow-sorry` (trusted interactive proof sketching only):
+/// admits `sorry/admit token` items while still rejecting axioms, `native_decide`/`bv_decide`
+/// violations, `trustCompiler`, `unsafe`, `extern`/`implemented_by`/`csimp`, and checking-weakening.
+pub fn blocking_items_modulo_sorry(items: &[String]) -> Vec<String> {
+    blocking_items(items)
+        .into_iter()
+        .filter(|i| item_kind(i) != "sorry/admit token")
+        .collect()
+}
+
 impl HygieneReport {
     pub fn is_clean_for_certification(&self) -> bool {
         self.disallowed_items().is_empty()
+    }
+
+    pub fn is_clean_modulo_sorry(&self) -> bool {
+        self.disallowed_items_modulo_sorry().is_empty()
+    }
+
+    pub fn disallowed_items_modulo_sorry(&self) -> Vec<String> {
+        blocking_items_modulo_sorry(&self.flagged_items)
     }
 
     /// `native_decide`/`bv_decide` use that the axiom allowlist does not admit.
@@ -1241,7 +1259,7 @@ fn is_top_level_command_start(trimmed: &str) -> bool {
         "import ",
         "public import ",
         "public section",
-        "namespace ",
+        "namespace",
         "section",
         "noncomputable section",
         "meta section",
@@ -1282,6 +1300,7 @@ fn is_top_level_command_start(trimmed: &str) -> bool {
         "example ",
         "alias ",
         "assert_not_exists ",
+        "assert_not_imported",
         "library_note ",
         "add_decl_doc ",
         "grind_pattern ",
@@ -1299,6 +1318,19 @@ fn is_top_level_command_start(trimmed: &str) -> bool {
         "#eval",
         "#print",
         "#guard_msgs",
+        "#guard_panic",
+        "#guard",
+        "#info_trees",
+        "#time",
+        "#with_exporting",
+        "#exit",
+        "#where",
+        "#version",
+        "#recall",
+        "#show_deprecated_modules",
+        "#import_path",
+        "#discr_tree_key",
+        "#discr_tree_simp_key",
         "#reduce",
         "#synth",
         "run_cmd",
@@ -1372,30 +1404,7 @@ fn strip_leading_attr_block(s: &str) -> Option<&str> {
 
 /// Strip a leading `set_option <opt> <val> in` prefix attached to a declaration.
 fn strip_leading_set_option_in(s: &str) -> Option<&str> {
-    let after_kw = s.strip_prefix("set_option")?;
-    if !after_kw.starts_with(char::is_whitespace) {
-        return None;
-    }
-    let first_line_end = s.find('\n').unwrap_or(s.len());
-    let first_line = &s[..first_line_end];
-    let trimmed_line = first_line.trim_end();
-    if let Some(before_in) = trimmed_line.strip_suffix(" in") {
-        if before_in.len() > "set_option".len() {
-            return Some(&s[trimmed_line.len()..]);
-        }
-        return None;
-    }
-    let mut rest = after_kw.trim_start();
-    let opt_end = rest.find(char::is_whitespace)?;
-    rest = rest[opt_end..].trim_start();
-    let val_end = rest.find(char::is_whitespace)?;
-    rest = rest[val_end..].trim_start();
-    let after_in = rest.strip_prefix("in")?;
-    if after_in.is_empty() || after_in.starts_with(char::is_whitespace) {
-        Some(after_in)
-    } else {
-        None
-    }
+    strip_leading_set_option_in_robust(s)
 }
 
 /// Strip leading attributes (`@[...]`), `set_option ... in`, and declaration modifiers (`private`,
@@ -1482,7 +1491,11 @@ fn is_incomplete_prefix_only_span(orig_chunk: &str, clean_chunk: &str) -> bool {
 }
 
 fn is_mutual_line_start(trimmed_clean: &str) -> bool {
-    let after = strip_decl_prefixes(trimmed_clean);
+    let base = match unwrap_command_bearing_diagnostic_wrappers(trimmed_clean) {
+        CommandBearingWrapperUnwrap::Inner { inner, .. } => inner,
+        _ => trimmed_clean,
+    };
+    let after = strip_decl_and_in_prefixes(base);
     after == "mutual"
         || after
             .strip_prefix("mutual")
@@ -1491,7 +1504,17 @@ fn is_mutual_line_start(trimmed_clean: &str) -> bool {
 }
 
 fn is_end_line_start(trimmed_clean: &str) -> bool {
-    trimmed_clean == "end" || trimmed_clean.starts_with("end ")
+    let base = unwrap_end_line_wrappers(trimmed_clean);
+    base == "end"
+        || base
+            .strip_prefix("end")
+            .is_some_and(|r| r.starts_with(char::is_whitespace))
+}
+
+fn is_namespace_header_span(trimmed_clean: &str) -> bool {
+    let base = unwrap_scope_line_wrappers(trimmed_clean);
+    base.strip_prefix("namespace")
+        .is_some_and(|r| r.starts_with(char::is_whitespace))
 }
 
 pub(crate) fn is_section_header_line(trimmed_clean: &str) -> bool {
@@ -1499,12 +1522,34 @@ pub(crate) fn is_section_header_line(trimmed_clean: &str) -> bool {
     while let Some(next) = strip_leading_attr_block(after) {
         after = next.trim_start();
     }
-    for m in ["noncomputable ", "public ", "meta "] {
-        if let Some(next) = after.strip_prefix(m) {
+    loop {
+        if let Some(next) = after
+            .strip_prefix("noncomputable")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
             after = next.trim_start();
+            continue;
         }
+        if let Some(next) = after
+            .strip_prefix("public")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
+            after = next.trim_start();
+            continue;
+        }
+        if let Some(next) = after
+            .strip_prefix("meta")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
+            after = next.trim_start();
+            continue;
+        }
+        break;
     }
-    after == "section" || after.starts_with("section ")
+    after == "section"
+        || after
+            .strip_prefix("section")
+            .is_some_and(|r| r.starts_with(char::is_whitespace))
 }
 
 /// Zero-copy segmentation of `(src, clean)` into top-level `CmdSpan`s.
@@ -1596,12 +1641,24 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
         let prev_orig = &src[cur_byte_start..cur_byte_end];
         let prev_clean = &clean[cur_byte_start..cur_byte_end];
         let prev_trimmed = prev_clean.trim();
-        let prev_is_section_or_ns_header = is_section_header_line(prev_trimmed)
-            || prev_trimmed.starts_with("namespace ")
+        let prev_unwrapped = unwrap_scope_line_wrappers(prev_trimmed);
+        let prev_is_section_or_ns_header = is_section_header_line(prev_unwrapped)
+            || is_namespace_header_span(prev_trimmed)
             || is_end_line_start(prev_trimmed);
 
-        let can_start_at_indent =
-            at_command_indent || (scope_depth > 0 && prev_is_section_or_ns_header);
+        let prev_incomplete_ns = prev_unwrapped == "namespace";
+        let prev_incomplete_section_name = (is_section_header_line(prev_unwrapped)
+            && extract_section_header_name(prev_unwrapped).is_empty()
+            || unwrap_end_line_wrappers(prev_trimmed) == "end")
+            && !trimmed.is_empty()
+            && !starts_doc_comment
+            && !is_top_level_command_start(trimmed)
+            && take_leading_lean_ident(trimmed).is_some();
+
+        let can_start_at_indent = (at_command_indent
+            || (scope_depth > 0 && prev_is_section_or_ns_header))
+            && !prev_incomplete_ns
+            && !prev_incomplete_section_name;
 
         if line_num > 1
             && can_start_at_indent
@@ -1623,8 +1680,15 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
             cur_cmd_indent = Some(indent);
         }
 
-        if can_start_at_indent {
-            if is_section_header_line(trimmed) || trimmed.starts_with("namespace ") {
+        let cur_span_clean = &clean[cur_byte_start..line_end_no_cr];
+        let cur_span_unwrapped = unwrap_scope_line_wrappers(cur_span_clean.trim());
+        if prev_incomplete_ns && is_namespace_header_span(cur_span_unwrapped) {
+            scope_depth += 1;
+        } else if can_start_at_indent {
+            if is_section_header_line(unwrap_scope_line_wrappers(trimmed))
+                || is_section_header_line(cur_span_unwrapped)
+                || is_namespace_header_span(trimmed)
+            {
                 scope_depth += 1;
             } else if is_end_line_start(trimmed) && scope_depth > 0 {
                 scope_depth -= 1;
@@ -1973,6 +2037,7 @@ fn is_pattern_match_arm_at(cmd: &str, pipe_idx: usize) -> bool {
     let mut paren = 0i32;
     let mut bracket = 0i32;
     let mut brace = 0i32;
+    let mut strict_brace = 0i32;
     let mut j = pipe_idx + 1;
     while j < bytes.len() {
         let c = bytes[j];
@@ -1991,6 +2056,16 @@ fn is_pattern_match_arm_at(cmd: &str, pipe_idx: usize) -> bool {
             j = end;
             continue;
         }
+        if bytes[j..].starts_with("⦃".as_bytes()) {
+            strict_brace += 1;
+            j += "⦃".len();
+            continue;
+        }
+        if bytes[j..].starts_with("⦄".as_bytes()) {
+            strict_brace = (strict_brace - 1).max(0);
+            j += "⦄".len();
+            continue;
+        }
         match c {
             b'(' => paren += 1,
             b')' => paren = (paren - 1).max(0),
@@ -1998,7 +2073,7 @@ fn is_pattern_match_arm_at(cmd: &str, pipe_idx: usize) -> bool {
             b']' => bracket = (bracket - 1).max(0),
             b'{' => brace += 1,
             b'}' => brace = (brace - 1).max(0),
-            b'=' if paren == 0 && bracket == 0 && brace == 0 => {
+            b'=' if paren == 0 && bracket == 0 && brace == 0 && strict_brace == 0 => {
                 if j + 1 < bytes.len() && bytes[j + 1] == b'>' {
                     return true;
                 }
@@ -2006,6 +2081,7 @@ fn is_pattern_match_arm_at(cmd: &str, pipe_idx: usize) -> bool {
             b':' if paren == 0
                 && bracket == 0
                 && brace == 0
+                && strict_brace == 0
                 && j + 1 < bytes.len()
                 && bytes[j + 1] == b'=' =>
             {
@@ -2059,6 +2135,7 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
     let mut paren = 0i32;
     let mut bracket = 0i32;
     let mut brace = 0i32;
+    let mut strict_brace = 0i32;
     let mut i = 0usize;
     let mut pending_let_assigns = 0usize;
     let mut seen_top_level_colon = false;
@@ -2082,9 +2159,20 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
             i = end;
             continue;
         }
+        if bytes[i..].starts_with("⦃".as_bytes()) {
+            strict_brace += 1;
+            i += "⦃".len();
+            continue;
+        }
+        if bytes[i..].starts_with("⦄".as_bytes()) {
+            strict_brace = (strict_brace - 1).max(0);
+            i += "⦄".len();
+            continue;
+        }
         if paren == 0
             && bracket == 0
             && brace == 0
+            && strict_brace == 0
             && i + 3 < bytes.len()
             && &bytes[i..i + 3] == b"let"
             && (i == 0 || bytes[i - 1].is_ascii_whitespace())
@@ -2097,6 +2185,7 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
         if paren == 0
             && bracket == 0
             && brace == 0
+            && strict_brace == 0
             && seen_top_level_colon
             && i + 5 <= bytes.len()
             && &bytes[i..i + 5] == b"where"
@@ -2109,6 +2198,7 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
         if paren == 0
             && bracket == 0
             && brace == 0
+            && strict_brace == 0
             && seen_top_level_colon
             && i + 5 < bytes.len()
             && &bytes[i..i + 5] == b"match"
@@ -2126,7 +2216,7 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
             b']' => bracket = (bracket - 1).max(0),
             b'{' => brace += 1,
             b'}' => brace = (brace - 1).max(0),
-            b':' if paren == 0 && bracket == 0 && brace == 0 => {
+            b':' if paren == 0 && bracket == 0 && brace == 0 && strict_brace == 0 => {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
                     if pending_let_assigns > 0 {
                         pending_let_assigns -= 1;
@@ -2135,10 +2225,21 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
                     }
                     return Some((&cmd[..i], &cmd[i + 2..]));
                 } else {
-                    seen_top_level_colon = true;
+                    let prev = if i > 0 { Some(bytes[i - 1]) } else { None };
+                    let next = bytes.get(i + 1).copied();
+                    let is_op = matches!(prev, Some(b':' | b'=' | b'<' | b'>' | b'!'))
+                        || matches!(next, Some(b':' | b'>'));
+                    if !is_op {
+                        seen_top_level_colon = true;
+                    }
                 }
             }
-            b'|' if paren == 0 && bracket == 0 && brace == 0 && seen_top_level_colon => {
+            b'|' if paren == 0
+                && bracket == 0
+                && brace == 0
+                && strict_brace == 0
+                && seen_top_level_colon =>
+            {
                 let next_ok =
                     i + 1 >= bytes.len() || (bytes[i + 1] != b'|' && bytes[i + 1] != b'>');
                 let prev_ok = i == 0 || (bytes[i - 1] != b'|' && bytes[i - 1] != b'<');
@@ -2493,10 +2594,29 @@ fn extract_section_header_name(trimmed: &str) -> String {
     while let Some(next) = strip_leading_attr_block(after_sec) {
         after_sec = next.trim_start();
     }
-    for m in ["noncomputable ", "public ", "meta "] {
-        if let Some(next) = after_sec.strip_prefix(m) {
+    loop {
+        if let Some(next) = after_sec
+            .strip_prefix("noncomputable")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
             after_sec = next.trim_start();
+            continue;
         }
+        if let Some(next) = after_sec
+            .strip_prefix("public")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
+            after_sec = next.trim_start();
+            continue;
+        }
+        if let Some(next) = after_sec
+            .strip_prefix("meta")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
+            after_sec = next.trim_start();
+            continue;
+        }
+        break;
     }
     let rest = after_sec.strip_prefix("section").unwrap_or("").trim_start();
     take_leading_lean_ident(rest)
@@ -6242,6 +6362,3030 @@ pub fn audit_source_declarations(
     (shadowed, unused_private, horiz)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicDeclSig {
+    pub const_name: String,
+    pub kind: String,
+    pub sig_hash: String,
+    pub simp_attrs: Vec<String>,
+    pub reducibility: String,
+    pub inline_attrs: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposed_body_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicSignatureSummary {
+    pub is_module: bool,
+    pub exported_imports: Vec<String>,
+    pub meta_exported_imports: Vec<String>,
+    pub declarations: Vec<PublicDeclSig>,
+    pub public_directives_hash: String,
+    pub public_signature_digest: String,
+    pub meta_signature_digest: String,
+}
+
+fn split_attr_items(attr_block: &str) -> Vec<String> {
+    let mut items = Vec::new();
+    let bytes = attr_block.as_bytes();
+    let mut start = 0usize;
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = scan_lean_norm_literal_end(attr_block, i) {
+            i = end;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            b',' if paren == 0 && bracket == 0 && brace == 0 => {
+                let piece = normalize_whitespace(&attr_block[start..i]);
+                if !piece.is_empty() {
+                    items.push(piece);
+                }
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    let tail = normalize_whitespace(&attr_block[start..]);
+    if !tail.is_empty() {
+        items.push(tail);
+    }
+    items
+}
+
+fn parse_decl_modifiers_and_attrs(clean_cmd: &str) -> (Vec<String>, Vec<String>) {
+    const MODS: &[&str] = &[
+        "private",
+        "protected",
+        "noncomputable",
+        "scoped",
+        "local",
+        "unsafe",
+        "partial",
+        "nonrec",
+        "public",
+        "meta",
+    ];
+    let mut mods = Vec::new();
+    let mut attrs = Vec::new();
+    let mut rest = clean_cmd.trim_start();
+    loop {
+        if let Some((end, is_doc)) = scan_lean_block_comment_end(rest, 0) {
+            if is_doc {
+                rest = rest[end..].trim_start();
+                continue;
+            }
+        }
+        if let Some(after_attr) = strip_leading_attr_block(rest) {
+            let attr_block_len = rest.len() - after_attr.len();
+            let inner = rest[2..attr_block_len - 1].trim();
+            for item in split_attr_items(inner) {
+                attrs.push(item);
+            }
+            rest = after_attr.trim_start();
+            continue;
+        }
+        let (after_in, in_list) = strip_leading_in_command_prefixes_with_list(rest);
+        if !in_list.is_empty() {
+            rest = after_in.trim_start();
+            continue;
+        }
+        let mut stripped = false;
+        for &m in MODS {
+            if let Some(after_m) = rest.strip_prefix(m) {
+                if after_m.is_empty() || after_m.starts_with(char::is_whitespace) {
+                    let trimmed_after = after_m.trim_start();
+                    if matches!(m, "noncomputable" | "public" | "meta")
+                        && (trimmed_after == "section"
+                            || trimmed_after.starts_with("section ")
+                            || trimmed_after.starts_with("import "))
+                    {
+                        break;
+                    }
+                    mods.push(m.to_string());
+                    rest = trimmed_after;
+                    stripped = true;
+                    break;
+                }
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    (mods, attrs)
+}
+
+fn section_header_visibility(trimmed_clean: &str) -> (bool, bool, bool, bool) {
+    let mut after = trimmed_clean;
+    let mut has_expose = false;
+    while let Some(next) = strip_leading_attr_block(after) {
+        let len = after.len() - next.len();
+        let inner = after[2..len - 1].trim();
+        if split_attr_items(inner)
+            .iter()
+            .any(|a| a == "expose" || a.starts_with("expose "))
+        {
+            has_expose = true;
+        }
+        after = next.trim_start();
+    }
+    let mut is_public = false;
+    let mut is_meta = false;
+    let mut is_noncomputable = false;
+    loop {
+        if let Some(next) = after
+            .strip_prefix("noncomputable")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
+            is_noncomputable = true;
+            after = next.trim_start();
+            continue;
+        }
+        if let Some(next) = after
+            .strip_prefix("public")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
+            is_public = true;
+            after = next.trim_start();
+            continue;
+        }
+        if let Some(next) = after
+            .strip_prefix("meta")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
+            is_meta = true;
+            after = next.trim_start();
+            continue;
+        }
+        break;
+    }
+    (is_public, is_meta, has_expose, is_noncomputable)
+}
+
+#[derive(Clone, Debug)]
+struct PubScopeFrame {
+    kind: ScopeKind,
+    name: String,
+    is_public_section: bool,
+    is_meta_section: bool,
+    section_has_expose: bool,
+    is_noncomputable_section: bool,
+}
+
+fn strip_leading_comments_and_ws(s: &str) -> &str {
+    let mut rest = s.trim_start();
+    loop {
+        if let Some((end, _)) = scan_lean_block_comment_end(rest, 0) {
+            rest = rest[end..].trim_start();
+            continue;
+        }
+        if rest.starts_with("--") {
+            match rest.find('\n') {
+                Some(nl) => rest = rest[nl + 1..].trim_start(),
+                None => return "",
+            }
+            continue;
+        }
+        break;
+    }
+    rest
+}
+
+fn unwrap_scope_line_wrappers(s: &str) -> &str {
+    let mut cur = strip_leading_comments_and_ws(s);
+    loop {
+        if let Some(after_time) = cur.strip_prefix("#time").filter(|r| {
+            r.starts_with(char::is_whitespace) || r.starts_with("/-") || r.starts_with("--")
+        }) {
+            cur = strip_leading_comments_and_ws(after_time);
+            continue;
+        }
+        if let Some(after_gm) = strip_leading_guard_msgs_in(cur).filter(|r| !r.trim().is_empty()) {
+            cur = strip_leading_comments_and_ws(after_gm);
+            continue;
+        }
+        if let Some(after_gp) =
+            strip_leading_simple_in_wrapper(cur, "#guard_panic").filter(|r| !r.trim().is_empty())
+        {
+            cur = strip_leading_comments_and_ws(after_gp);
+            continue;
+        }
+        if let Some(after_it) =
+            strip_leading_simple_in_wrapper(cur, "#info_trees").filter(|r| !r.trim().is_empty())
+        {
+            cur = strip_leading_comments_and_ws(after_it);
+            continue;
+        }
+        if let Some(after_we) = cur.strip_prefix("#with_exporting").filter(|r| {
+            r.starts_with(char::is_whitespace) || r.starts_with("/-") || r.starts_with("--")
+        }) {
+            cur = strip_leading_comments_and_ws(after_we);
+            continue;
+        }
+        break;
+    }
+    cur.trim()
+}
+
+fn unwrap_end_line_wrappers(s: &str) -> &str {
+    let mut cur = strip_leading_comments_and_ws(s);
+    loop {
+        let (after_in, in_list) = strip_leading_in_command_prefixes_with_list(cur);
+        if !in_list.is_empty() && !after_in.trim().is_empty() {
+            cur = strip_leading_comments_and_ws(after_in);
+            continue;
+        }
+        let next = unwrap_scope_line_wrappers(cur);
+        if next.len() < cur.trim().len() {
+            cur = next;
+            continue;
+        }
+        break;
+    }
+    cur.trim()
+}
+
+fn is_scope_boundary_cmd_core(trimmed: &str) -> bool {
+    trimmed
+        .strip_prefix("namespace")
+        .is_some_and(|r| r.starts_with(char::is_whitespace))
+        || is_section_header_line(trimmed)
+        || trimmed == "end"
+        || trimmed
+            .strip_prefix("end")
+            .is_some_and(|r| r.starts_with(char::is_whitespace))
+}
+
+fn apply_pub_scope_transition(
+    stack: &mut Vec<PubScopeFrame>,
+    active_context_vars: &mut Vec<String>,
+    directives_hasher: &mut blake3::Hasher,
+    orig_chunk: &str,
+    clean_chunk: &str,
+    inherited_in_prefixes: &[String],
+    inherited_with_exporting: bool,
+) {
+    let mut all_in_prefixes: Vec<String> = inherited_in_prefixes.to_vec();
+    if let CommandBearingWrapperUnwrap::Inner { in_prefixes, .. } =
+        unwrap_command_bearing_diagnostic_wrappers(clean_chunk.trim())
+    {
+        all_in_prefixes.extend(in_prefixes);
+    } else {
+        let (_, in_list) = strip_leading_in_command_prefixes_with_list(
+            strip_leading_doc_comments_only(clean_chunk),
+        );
+        all_in_prefixes.extend(in_list);
+    }
+    let with_exporting = inherited_with_exporting
+        || matches!(
+            unwrap_command_bearing_diagnostic_wrappers(clean_chunk.trim()),
+            CommandBearingWrapperUnwrap::Inner {
+                with_exporting: true,
+                ..
+            }
+        )
+        || strip_leading_doc_comments_only(clean_chunk)
+            .strip_prefix("#with_exporting")
+            .is_some_and(|r| r.starts_with(char::is_whitespace));
+
+    let has_invalid_decl_doc =
+        scan_lean_block_comment_end(orig_chunk.trim_start(), 0).is_some_and(|(_, is_doc)| is_doc);
+    let end_clean_core = unwrap_end_line_wrappers(clean_chunk);
+    let end_orig_core = unwrap_end_line_wrappers(orig_chunk);
+    if end_clean_core == "end"
+        || end_clean_core
+            .strip_prefix("end")
+            .is_some_and(|r| r.starts_with(char::is_whitespace))
+    {
+        if has_invalid_decl_doc {
+            directives_hasher.update(b"invalid-decl-doc-on-scope:end\n");
+            active_context_vars.push("scope-invalid-doc:end".to_string());
+        }
+        let orig_rest = end_orig_core
+            .strip_prefix("end")
+            .unwrap_or_else(|| end_clean_core.strip_prefix("end").unwrap_or(""));
+        let name = take_leading_lean_ident(orig_rest.trim_start())
+            .map(|(n, _)| n)
+            .unwrap_or("");
+        let wrap_tag = if all_in_prefixes.is_empty() && !with_exporting {
+            String::new()
+        } else {
+            format!(":in=[{}]:we={with_exporting}", all_in_prefixes.join(";"))
+        };
+        if name.is_empty() {
+            match stack.last() {
+                Some(top) if top.name.is_empty() => {
+                    let popped = stack.pop().unwrap();
+                    let kind_tag = match popped.kind {
+                        ScopeKind::Section => "sec",
+                        ScopeKind::Namespace => "ns",
+                        ScopeKind::Mutual => "mut",
+                    };
+                    active_context_vars.push(format!("scope-close:{kind_tag}{wrap_tag}"));
+                }
+                Some(top) => {
+                    directives_hasher.update(b"mismatched-unnamed-end:");
+                    directives_hasher.update(top.name.as_bytes());
+                    directives_hasher.update(b"\n");
+                    active_context_vars.push(format!(
+                        "scope-close-mismatch:unnamed:{}{wrap_tag}",
+                        top.name
+                    ));
+                    stack.pop();
+                }
+                None => {
+                    directives_hasher.update(b"unmatched-end:unnamed\n");
+                    active_context_vars.push(format!("scope-close-unmatched:unnamed{wrap_tag}"));
+                }
+            }
+        } else {
+            for seg in split_lean_name_components(name).into_iter().rev() {
+                let canon = canonical_lean_name_component(seg);
+                match stack.last() {
+                    Some(top) if canonical_lean_name_component(&top.name) == canon => {
+                        let popped = stack.pop().unwrap();
+                        let kind_tag = match popped.kind {
+                            ScopeKind::Section => "sec",
+                            ScopeKind::Namespace => "ns",
+                            ScopeKind::Mutual => "mut",
+                        };
+                        active_context_vars
+                            .push(format!("scope-close:{kind_tag}:{canon}{wrap_tag}"));
+                    }
+                    Some(_) => {
+                        directives_hasher.update(b"mismatched-named-end:");
+                        directives_hasher.update(canon.as_bytes());
+                        directives_hasher.update(b"\n");
+                        active_context_vars.push(format!("scope-close-mismatch:{canon}{wrap_tag}"));
+                        if let Some(pos) = stack
+                            .iter()
+                            .rposition(|f| canonical_lean_name_component(&f.name) == canon)
+                        {
+                            stack.truncate(pos);
+                        } else {
+                            stack.pop();
+                        }
+                    }
+                    None => {
+                        directives_hasher.update(b"unmatched-end:");
+                        directives_hasher.update(canon.as_bytes());
+                        directives_hasher.update(b"\n");
+                        active_context_vars
+                            .push(format!("scope-close-unmatched:{canon}{wrap_tag}"));
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    if !all_in_prefixes.is_empty() {
+        let after_all_core = end_clean_core;
+        if after_all_core
+            .strip_prefix("namespace")
+            .is_some_and(|r| r.starts_with(char::is_whitespace))
+            || is_section_header_line(after_all_core)
+        {
+            // In Lean 4, `open/set_option/variable/... in section` runs `section` inside a
+            // temporary `in`-command scope that immediately closes (so `public section` does NOT
+            // stay open for subsequent declarations!), and `... in namespace Foo` errors with
+            // `Missing name after end`. Record in context & directives_hasher without pushing a
+            // persistent scope frame.
+            directives_hasher.update(b"transient-in-scope-header:");
+            for p in &all_in_prefixes {
+                directives_hasher.update(p.as_bytes());
+                directives_hasher.update(b"|");
+            }
+            hash_normalized_whitespace(directives_hasher, after_all_core, b"\n");
+            active_context_vars.push(format!(
+                "scope-transient-in:[{}]:we={with_exporting}:{}",
+                all_in_prefixes.join(";"),
+                normalize_whitespace(after_all_core)
+            ));
+            return;
+        }
+    }
+
+    let clean_core = unwrap_scope_line_wrappers(clean_chunk);
+    let orig_core = unwrap_scope_line_wrappers(orig_chunk);
+
+    if let Some(rest) = clean_core
+        .strip_prefix("namespace")
+        .filter(|r| r.starts_with(char::is_whitespace))
+    {
+        if has_invalid_decl_doc {
+            directives_hasher.update(b"invalid-decl-doc-on-scope:ns\n");
+            active_context_vars.push("scope-invalid-doc:ns".to_string());
+        }
+        let orig_rest = orig_core
+            .strip_prefix("namespace")
+            .filter(|r| r.starts_with(char::is_whitespace))
+            .unwrap_or(rest);
+        let name = take_leading_lean_ident(orig_rest.trim_start())
+            .map(|(n, _)| n)
+            .unwrap_or("");
+        let inh_pub = stack.iter().any(|f| f.is_public_section);
+        let inh_meta = stack.iter().any(|f| f.is_meta_section);
+        let inh_exp = stack.iter().any(|f| f.section_has_expose);
+        let inh_noncomp = stack.iter().any(|f| f.is_noncomputable_section);
+        let segs = split_lean_name_components(name);
+        if segs.is_empty() {
+            directives_hasher.update(b"malformed-empty-namespace\n");
+            active_context_vars.push("scope-open-malformed:ns".to_string());
+        } else {
+            let we_tag = if with_exporting { ":we" } else { "" };
+            for seg in segs {
+                let canon = canonical_lean_name_component(seg);
+                stack.push(PubScopeFrame {
+                    kind: ScopeKind::Namespace,
+                    name: seg.to_string(),
+                    is_public_section: inh_pub,
+                    is_meta_section: inh_meta,
+                    section_has_expose: inh_exp,
+                    is_noncomputable_section: inh_noncomp,
+                });
+                active_context_vars.push(format!("scope-open:ns:{canon}{we_tag}"));
+            }
+        }
+        return;
+    }
+
+    if is_section_header_line(clean_core) {
+        if has_invalid_decl_doc {
+            directives_hasher.update(b"invalid-decl-doc-on-scope:sec\n");
+            active_context_vars.push("scope-invalid-doc:sec".to_string());
+        }
+        let (sec_pub, sec_meta, sec_exp, sec_noncomp) = section_header_visibility(clean_core);
+        let inh_pub = sec_pub || stack.iter().any(|f| f.is_public_section);
+        let inh_meta = sec_meta || stack.iter().any(|f| f.is_meta_section);
+        let inh_exp = sec_exp || stack.iter().any(|f| f.section_has_expose);
+        let inh_noncomp = sec_noncomp || stack.iter().any(|f| f.is_noncomputable_section);
+        let name = extract_section_header_name(orig_core);
+        let flags = format!(
+            "p={}:m={}:e={}:nc={}:we={}",
+            u8::from(sec_pub),
+            u8::from(sec_meta),
+            u8::from(sec_exp),
+            u8::from(sec_noncomp),
+            u8::from(with_exporting),
+        );
+        if name.is_empty() {
+            stack.push(PubScopeFrame {
+                kind: ScopeKind::Section,
+                name: String::new(),
+                is_public_section: inh_pub,
+                is_meta_section: inh_meta,
+                section_has_expose: inh_exp,
+                is_noncomputable_section: inh_noncomp,
+            });
+            active_context_vars.push(format!("scope-open:sec::{flags}"));
+        } else {
+            for seg in split_lean_name_components(&name) {
+                let canon = canonical_lean_name_component(seg);
+                stack.push(PubScopeFrame {
+                    kind: ScopeKind::Section,
+                    name: seg.to_string(),
+                    is_public_section: inh_pub,
+                    is_meta_section: inh_meta,
+                    section_has_expose: inh_exp,
+                    is_noncomputable_section: inh_noncomp,
+                });
+                active_context_vars.push(format!("scope-open:sec:{canon}:{flags}"));
+            }
+        }
+        return;
+    }
+
+    let masked = mask_lean_lexemes(orig_chunk, true);
+    for (line, orig_line) in masked.lines().zip(orig_chunk.lines()) {
+        let end_trimmed = unwrap_end_line_wrappers(line.trim());
+        let end_orig_trimmed = unwrap_end_line_wrappers(orig_line.trim());
+        if end_trimmed == "end" || end_trimmed.starts_with("end ") {
+            let orig_rest = end_orig_trimmed
+                .strip_prefix("end")
+                .unwrap_or_else(|| end_trimmed.strip_prefix("end").unwrap_or(""));
+            let name = take_leading_lean_ident(orig_rest.trim_start())
+                .map(|(n, _)| n)
+                .unwrap_or("");
+            if name.is_empty() {
+                if let Some(popped) = stack.pop() {
+                    let kind_tag = match popped.kind {
+                        ScopeKind::Section => "sec",
+                        ScopeKind::Namespace => "ns",
+                        ScopeKind::Mutual => "mut",
+                    };
+                    active_context_vars.push(format!("scope-close:{kind_tag}"));
+                } else {
+                    active_context_vars.push("scope-close-unmatched:unnamed".to_string());
+                }
+            } else {
+                for seg in split_lean_name_components(name).into_iter().rev() {
+                    let canon = canonical_lean_name_component(seg);
+                    if let Some(pos) = stack
+                        .iter()
+                        .rposition(|f| canonical_lean_name_component(&f.name) == canon)
+                    {
+                        stack.truncate(pos);
+                        active_context_vars.push(format!("scope-close:named:{canon}"));
+                    } else {
+                        stack.pop();
+                        active_context_vars.push(format!("scope-close-mismatch:{canon}"));
+                    }
+                }
+            }
+            continue;
+        }
+        let trimmed = unwrap_scope_line_wrappers(line.trim());
+        let orig_trimmed = unwrap_scope_line_wrappers(orig_line.trim());
+        if let Some(rest) = trimmed
+            .strip_prefix("namespace")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
+            let orig_rest = orig_trimmed
+                .strip_prefix("namespace")
+                .filter(|r| r.starts_with(char::is_whitespace))
+                .unwrap_or(rest);
+            let name = take_leading_lean_ident(orig_rest.trim_start())
+                .map(|(n, _)| n)
+                .unwrap_or("");
+            let inh_pub = stack.iter().any(|f| f.is_public_section);
+            let inh_meta = stack.iter().any(|f| f.is_meta_section);
+            let inh_exp = stack.iter().any(|f| f.section_has_expose);
+            let inh_noncomp = stack.iter().any(|f| f.is_noncomputable_section);
+            for seg in split_lean_name_components(name) {
+                let canon = canonical_lean_name_component(seg);
+                stack.push(PubScopeFrame {
+                    kind: ScopeKind::Namespace,
+                    name: seg.to_string(),
+                    is_public_section: inh_pub,
+                    is_meta_section: inh_meta,
+                    section_has_expose: inh_exp,
+                    is_noncomputable_section: inh_noncomp,
+                });
+                active_context_vars.push(format!("scope-open:ns:{canon}"));
+            }
+        } else if is_section_header_line(trimmed) {
+            let (sec_pub, sec_meta, sec_exp, sec_noncomp) = section_header_visibility(trimmed);
+            let inh_pub = sec_pub || stack.iter().any(|f| f.is_public_section);
+            let inh_meta = sec_meta || stack.iter().any(|f| f.is_meta_section);
+            let inh_exp = sec_exp || stack.iter().any(|f| f.section_has_expose);
+            let inh_noncomp = sec_noncomp || stack.iter().any(|f| f.is_noncomputable_section);
+            let name = extract_section_header_name(orig_trimmed);
+            let flags = format!(
+                "p={}:m={}:e={}:nc={}",
+                u8::from(sec_pub),
+                u8::from(sec_meta),
+                u8::from(sec_exp),
+                u8::from(sec_noncomp),
+            );
+            if name.is_empty() {
+                stack.push(PubScopeFrame {
+                    kind: ScopeKind::Section,
+                    name: String::new(),
+                    is_public_section: inh_pub,
+                    is_meta_section: inh_meta,
+                    section_has_expose: inh_exp,
+                    is_noncomputable_section: inh_noncomp,
+                });
+                active_context_vars.push(format!("scope-open:sec::{flags}"));
+            } else {
+                for seg in split_lean_name_components(&name) {
+                    let canon = canonical_lean_name_component(seg);
+                    stack.push(PubScopeFrame {
+                        kind: ScopeKind::Section,
+                        name: seg.to_string(),
+                        is_public_section: inh_pub,
+                        is_meta_section: inh_meta,
+                        section_has_expose: inh_exp,
+                        is_noncomputable_section: inh_noncomp,
+                    });
+                    active_context_vars.push(format!("scope-open:sec:{canon}:{flags}"));
+                }
+            }
+        } else if trimmed == "mutual" || trimmed.starts_with("mutual ") {
+            let inh_pub = stack.iter().any(|f| f.is_public_section);
+            let inh_meta = stack.iter().any(|f| f.is_meta_section);
+            let inh_exp = stack.iter().any(|f| f.section_has_expose);
+            let inh_noncomp = stack.iter().any(|f| f.is_noncomputable_section);
+            stack.push(PubScopeFrame {
+                kind: ScopeKind::Mutual,
+                name: String::new(),
+                is_public_section: inh_pub,
+                is_meta_section: inh_meta,
+                section_has_expose: inh_exp,
+                is_noncomputable_section: inh_noncomp,
+            });
+            active_context_vars.push("scope-open:mut".to_string());
+        }
+    }
+}
+
+fn split_at_top_level_where(cmd: &str) -> Option<(&str, &str)> {
+    let bytes = cmd.as_bytes();
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut strict_brace = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(cmd, i) {
+            i = span.end;
+            continue;
+        }
+        if bytes[i..].starts_with("⦃".as_bytes()) {
+            strict_brace += 1;
+            i += "⦃".len();
+            continue;
+        }
+        if bytes[i..].starts_with("⦄".as_bytes()) {
+            strict_brace = (strict_brace - 1).max(0);
+            i += "⦄".len();
+            continue;
+        }
+        if paren == 0
+            && bracket == 0
+            && brace == 0
+            && strict_brace == 0
+            && i + 5 <= bytes.len()
+            && &bytes[i..i + 5] == b"where"
+            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            && (i + 5 == bytes.len() || bytes[i + 5].is_ascii_whitespace())
+        {
+            return Some((&cmd[..i], &cmd[i + 5..]));
+        }
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            _ => {}
+        }
+        i += cmd[i..].chars().next()?.len_utf8();
+    }
+    None
+}
+
+fn is_standalone_colon_op(s: &str, i: usize) -> bool {
+    let bytes = s.as_bytes();
+    let prev_ascii = if i > 0 { Some(bytes[i - 1]) } else { None };
+    let next_ascii = bytes.get(i + 1).copied();
+    if matches!(prev_ascii, Some(b':' | b'=' | b'<' | b'>' | b'!'))
+        || matches!(next_ascii, Some(b':' | b'=' | b'>'))
+    {
+        return false;
+    }
+    let prev_char = s[..i].chars().next_back();
+    let next_char = s[i + 1..].chars().next();
+    // Exclude custom operators like `∈:` / `:∈` or `∷` (`\::`), while allowing identifier/closing-bracket adjacency (`(x:Nat)`, `):Nat`).
+    let is_custom_sym = |c: char| {
+        !c.is_whitespace()
+            && !is_lean_id_rest(c)
+            && !matches!(
+                c,
+                '(' | ')' | '[' | ']' | '{' | '}' | '⦃' | '⦄' | '«' | '»' | ',' | ';' | '"' | '\''
+            )
+    };
+    !prev_char.is_some_and(is_custom_sym) && !next_char.is_some_and(is_custom_sym)
+}
+
+fn lean_expr_has_non_comment_tokens(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(s, i) {
+            if !span.is_comment {
+                return true;
+            }
+            i = span.end;
+            continue;
+        }
+        let ch = s[i..].chars().next().unwrap_or(' ');
+        if !ch.is_whitespace() {
+            return true;
+        }
+        i += ch.len_utf8();
+    }
+    false
+}
+
+fn lean_expr_has_hole_or_incomplete_binder(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(s, i) {
+            i = span.end;
+            continue;
+        }
+        let prev_char = s[..i].chars().next_back();
+        let prev_is_ident = prev_char.is_some_and(|c| is_lean_id_rest(c) || c == '»');
+        let ch = s[i..].chars().next().unwrap_or('\0');
+        let ch_len = ch.len_utf8();
+        if ch == '_' && !prev_is_ident {
+            let next_char = s[i + ch_len..].chars().next();
+            let next_is_ident = next_char.is_some_and(is_lean_id_rest);
+            if !next_is_ident {
+                return true;
+            }
+        }
+        if ch == '?' && !prev_is_ident {
+            let next_char = s[i + ch_len..].chars().next();
+            if next_char.is_some_and(|c| is_lean_id_first(c) || c == '«') {
+                return true;
+            }
+        }
+        if !prev_is_ident
+            && s[i..].starts_with("by")
+            && s[i + 2..]
+                .chars()
+                .next()
+                .is_none_or(|c| !is_lean_id_rest(c))
+        {
+            return true;
+        }
+        if ch == '∀'
+            || (!prev_is_ident
+                && s[i..].starts_with("forall")
+                && s[i + 6..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !is_lean_id_rest(c)))
+            || (!prev_is_ident
+                && s[i..].starts_with("fun")
+                && s[i + 3..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !is_lean_id_rest(c)))
+            || ch == 'λ'
+        {
+            let kw_len = if ch == '∀' || ch == 'λ' {
+                ch_len
+            } else if s[i..].starts_with("forall") {
+                6
+            } else {
+                3
+            };
+            let is_forall = ch == '∀' || s[i..].starts_with("forall");
+            let mut j = i + kw_len;
+            let mut p = 0i32;
+            let mut b = 0i32;
+            let mut br = 0i32;
+            let mut sb = 0i32;
+            let mut binder_end = None;
+            while j < bytes.len() {
+                if let Some(span) = skip_lean_lexeme(s, j) {
+                    j = span.end;
+                    continue;
+                }
+                if bytes[j..].starts_with("⦃".as_bytes()) {
+                    sb += 1;
+                    j += "⦃".len();
+                    continue;
+                }
+                if bytes[j..].starts_with("⦄".as_bytes()) {
+                    sb = (sb - 1).max(0);
+                    j += "⦄".len();
+                    continue;
+                }
+                if p == 0 && b == 0 && br == 0 && sb == 0 {
+                    if is_forall && bytes[j] == b',' {
+                        binder_end = Some(j);
+                        break;
+                    }
+                    if !is_forall
+                        && ((j + 1 < bytes.len() && bytes[j] == b'=' && bytes[j + 1] == b'>')
+                            || bytes[j..].starts_with("↦".as_bytes()))
+                    {
+                        binder_end = Some(j);
+                        break;
+                    }
+                }
+                match bytes[j] {
+                    b'(' => p += 1,
+                    b')' if p == 0 && b == 0 && br == 0 && sb == 0 => break,
+                    b')' => p = (p - 1).max(0),
+                    b'[' => b += 1,
+                    b']' if p == 0 && b == 0 && br == 0 && sb == 0 => break,
+                    b']' => b = (b - 1).max(0),
+                    b'{' => br += 1,
+                    b'}' if p == 0 && b == 0 && br == 0 && sb == 0 => break,
+                    b'}' => br = (br - 1).max(0),
+                    _ => {}
+                }
+                j += s[j..].chars().next().map_or(1, char::len_utf8);
+            }
+            let Some(b_end) = binder_end else {
+                return true;
+            };
+            if !decl_binders_all_explicitly_typed(&s[i + kw_len..b_end], false) {
+                return true;
+            }
+            i += kw_len;
+            continue;
+        }
+        i += ch_len;
+    }
+    false
+}
+
+fn scan_balanced_binder_group_end(
+    s: &str,
+    open_pos: usize,
+    open_str: &str,
+    close_str: &str,
+) -> Option<(usize, usize)> {
+    let bytes = s.as_bytes();
+    let inner_start = open_pos + open_str.len();
+    let mut depth = 1i32;
+    let mut i = inner_start;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(s, i) {
+            i = span.end;
+            continue;
+        }
+        if bytes[i..].starts_with(open_str.as_bytes()) {
+            depth += 1;
+            i += open_str.len();
+            continue;
+        }
+        if bytes[i..].starts_with(close_str.as_bytes()) {
+            depth -= 1;
+            if depth == 0 {
+                return Some((i, i + close_str.len()));
+            }
+            i += close_str.len();
+            continue;
+        }
+        i += s[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    None
+}
+
+fn binder_lhs_all_valid_binder_names(lhs: &str) -> bool {
+    let bytes = lhs.as_bytes();
+    let mut i = 0usize;
+    let mut count = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(lhs, i) {
+            if span.is_comment {
+                i = span.end;
+                continue;
+            }
+            if span.is_literal {
+                return false;
+            }
+        }
+        let ch = lhs[i..].chars().next().unwrap_or(' ');
+        if ch.is_whitespace() {
+            i += ch.len_utf8();
+            continue;
+        }
+        if ch == '_'
+            && lhs[i + 1..]
+                .chars()
+                .next()
+                .is_none_or(|c| !is_lean_id_rest(c))
+        {
+            count += 1;
+            i += 1;
+            continue;
+        }
+        let Some((ident, rest)) = take_leading_lean_ident(&lhs[i..]) else {
+            return false;
+        };
+        if ident.contains('.') {
+            return false;
+        }
+        count += 1;
+        i = lhs.len() - rest.len();
+    }
+    count > 0
+}
+
+fn binder_group_has_complete_explicit_type(inner: &str) -> bool {
+    let bytes = inner.as_bytes();
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut strict_brace = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(inner, i) {
+            i = span.end;
+            continue;
+        }
+        if bytes[i..].starts_with("⦃".as_bytes()) {
+            strict_brace += 1;
+            i += "⦃".len();
+            continue;
+        }
+        if bytes[i..].starts_with("⦄".as_bytes()) {
+            strict_brace = (strict_brace - 1).max(0);
+            i += "⦄".len();
+            continue;
+        }
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            b':' if paren == 0 && bracket == 0 && brace == 0 && strict_brace == 0 => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    // Unannotated default-value binder `(x := val)` reaches `:=` before any `:`!
+                    return false;
+                }
+                if is_standalone_colon_op(inner, i) {
+                    let lhs = &inner[..i];
+                    let rhs = &inner[i + 1..];
+                    // Split off optional `:= default_val` at top level of the binder group.
+                    let (ty_slice, def_opt) = split_at_top_level_assign(rhs)
+                        .map_or((rhs, None), |(ty, def_v)| (ty, Some(def_v)));
+                    if !binder_lhs_all_valid_binder_names(lhs) {
+                        return false;
+                    }
+                    if !lean_expr_has_non_comment_tokens(ty_slice)
+                        || lean_expr_has_hole_or_incomplete_binder(ty_slice)
+                    {
+                        return false;
+                    }
+                    if let Some(def_val) = def_opt {
+                        if !lean_expr_has_non_comment_tokens(def_val)
+                            || lean_expr_has_hole_or_incomplete_binder(def_val)
+                        {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += inner[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+fn instance_bracket_binder_is_complete(inner: &str) -> bool {
+    let bytes = inner.as_bytes();
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut strict_brace = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(inner, i) {
+            i = span.end;
+            continue;
+        }
+        if bytes[i..].starts_with("⦃".as_bytes()) {
+            strict_brace += 1;
+            i += "⦃".len();
+            continue;
+        }
+        if bytes[i..].starts_with("⦄".as_bytes()) {
+            strict_brace = (strict_brace - 1).max(0);
+            i += "⦄".len();
+            continue;
+        }
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            b':' if paren == 0 && bracket == 0 && brace == 0 && strict_brace == 0 => {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
+                    return false;
+                }
+                if is_standalone_colon_op(inner, i) {
+                    let lhs = &inner[..i];
+                    let rhs = &inner[i + 1..];
+                    return binder_lhs_all_valid_binder_names(lhs)
+                        && lean_expr_has_non_comment_tokens(rhs)
+                        && !lean_expr_has_hole_or_incomplete_binder(rhs);
+                }
+            }
+            _ => {}
+        }
+        i += inner[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    lean_expr_has_non_comment_tokens(inner) && !lean_expr_has_hole_or_incomplete_binder(inner)
+}
+
+fn is_instance_priority_binder(inner: &str) -> bool {
+    let bytes = inner.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(inner, i) {
+            if !span.is_comment {
+                break;
+            }
+            i = span.end;
+            continue;
+        }
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let Some(after_prio) = inner[i..].strip_prefix("priority") else {
+        return false;
+    };
+    let mut j = 0usize;
+    let abytes = after_prio.as_bytes();
+    while j < abytes.len() {
+        if let Some(span) = skip_lean_lexeme(after_prio, j) {
+            if !span.is_comment {
+                break;
+            }
+            j = span.end;
+            continue;
+        }
+        if abytes[j].is_ascii_whitespace() {
+            j += 1;
+            continue;
+        }
+        break;
+    }
+    let Some(rhs) = after_prio[j..].strip_prefix(":=") else {
+        return false;
+    };
+    lean_expr_has_non_comment_tokens(rhs)
+}
+
+fn decl_binders_all_explicitly_typed(binders_slice: &str, mut allow_instance_prio: bool) -> bool {
+    let bytes = binders_slice.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(binders_slice, i) {
+            if !span.is_comment {
+                // Any bare guillemet identifier or literal outside binder groups is not an annotated binder.
+                return false;
+            }
+            i = span.end;
+            continue;
+        }
+        let ch = binders_slice[i..].chars().next().unwrap_or(' ');
+        if ch.is_whitespace() {
+            i += ch.len_utf8();
+            continue;
+        }
+        if binders_slice[i..].starts_with("⦃") {
+            let Some((inner_end, next_i)) =
+                scan_balanced_binder_group_end(binders_slice, i, "⦃", "⦄")
+            else {
+                return false;
+            };
+            let inner = &binders_slice[i + "⦃".len()..inner_end];
+            if !binder_group_has_complete_explicit_type(inner) {
+                return false;
+            }
+            allow_instance_prio = false;
+            i = next_i;
+            continue;
+        }
+        match bytes[i] {
+            b'(' => {
+                let Some((inner_end, next_i)) =
+                    scan_balanced_binder_group_end(binders_slice, i, "(", ")")
+                else {
+                    return false;
+                };
+                let inner = &binders_slice[i + 1..inner_end];
+                if allow_instance_prio && is_instance_priority_binder(inner) {
+                    if lean_expr_has_hole_or_incomplete_binder(inner) {
+                        return false;
+                    }
+                    allow_instance_prio = false;
+                    i = next_i;
+                    continue;
+                }
+                if !binder_group_has_complete_explicit_type(inner) {
+                    return false;
+                }
+                allow_instance_prio = false;
+                i = next_i;
+            }
+            b'{' => {
+                let Some((inner_end, next_i)) =
+                    scan_balanced_binder_group_end(binders_slice, i, "{", "}")
+                else {
+                    return false;
+                };
+                let inner = &binders_slice[i + 1..inner_end];
+                if !binder_group_has_complete_explicit_type(inner) {
+                    return false;
+                }
+                allow_instance_prio = false;
+                i = next_i;
+            }
+            b'[' => {
+                let Some((inner_end, next_i)) =
+                    scan_balanced_binder_group_end(binders_slice, i, "[", "]")
+                else {
+                    return false;
+                };
+                let inner = &binders_slice[i + 1..inner_end];
+                if !instance_bracket_binder_is_complete(inner) {
+                    return false;
+                }
+                allow_instance_prio = false;
+                i = next_i;
+            }
+            _ => {
+                // Any bare identifier (`def foo x : Nat`), `_`, pattern, or unrecognized token before `:`.
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn skip_decl_header_kw_and_name(sig_part: &str) -> Option<(&'static str, &str, bool)> {
+    const KWS: &[&str] = &[
+        "theorem",
+        "lemma",
+        "def",
+        "abbrev",
+        "structure",
+        "class",
+        "inductive",
+        "coinductive",
+        "instance",
+        "axiom",
+        "opaque",
+        "constant",
+        "simproc_decl",
+        "dsimproc_decl",
+        "simproc",
+        "dsimproc",
+        "builtin_simproc",
+        "builtin_dsimproc",
+    ];
+    let rest = strip_decl_and_in_prefixes(sig_part);
+    for &kw in KWS {
+        let Some(mut after) = rest.strip_prefix(kw) else {
+            continue;
+        };
+        if !(after.is_empty()
+            || after.starts_with(char::is_whitespace)
+            || after.starts_with('[')
+            || after.starts_with('/')
+            || after.starts_with('-'))
+        {
+            continue;
+        }
+        // Skip whitespace / comments after declaration keyword.
+        loop {
+            after = after.trim_start();
+            if let Some(span) = skip_lean_lexeme(after, 0) {
+                if span.is_comment {
+                    after = &after[span.end..];
+                    continue;
+                }
+            }
+            break;
+        }
+        // Optional `[...]` attribute/priority on `simproc` / `instance` immediately after keyword.
+        if kw != "instance" && after.starts_with('[') {
+            let (_, next_i) = scan_balanced_binder_group_end(after, 0, "[", "]")?;
+            after = &after[next_i..];
+            loop {
+                after = after.trim_start();
+                if let Some(span) = skip_lean_lexeme(after, 0) {
+                    if span.is_comment {
+                        after = &after[span.end..];
+                        continue;
+                    }
+                }
+                break;
+            }
+        }
+        let mut allow_instance_prio = kw == "instance";
+        if kw == "instance" && after.starts_with('(') {
+            if let Some((inner_end, next_i)) = scan_balanced_binder_group_end(after, 0, "(", ")") {
+                let inner = &after[1..inner_end];
+                if is_instance_priority_binder(inner) {
+                    if lean_expr_has_hole_or_incomplete_binder(inner) {
+                        return None;
+                    }
+                    allow_instance_prio = false;
+                    after = &after[next_i..];
+                    loop {
+                        after = after.trim_start();
+                        if let Some(span) = skip_lean_lexeme(after, 0) {
+                            if span.is_comment {
+                                after = &after[span.end..];
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        // Optional declaration name (always required except for anonymous `instance`).
+        if let Some((_, after_ident)) = take_leading_lean_ident(after) {
+            allow_instance_prio = false;
+            after = after_ident;
+        } else if kw != "instance" {
+            return None;
+        }
+        // Optional universe parameter list `.{u, v}` attached to the declaration (or anonymous `instance.{u}`).
+        if after.starts_with(".{") {
+            let (_, next_i) = scan_balanced_binder_group_end(after, 1, "{", "}")?;
+            let univ_inner = &after[2..next_i - 1];
+            if !lean_expr_has_non_comment_tokens(univ_inner)
+                || lean_expr_has_hole_or_incomplete_binder(univ_inner)
+            {
+                return None;
+            }
+            after = &after[next_i..];
+        }
+        return Some((kw, after, allow_instance_prio));
+    }
+    None
+}
+
+fn decl_header_has_explicit_type_annotation(sig_part: &str) -> bool {
+    let Some((_kw, after_name, allow_instance_prio)) = skip_decl_header_kw_and_name(sig_part)
+    else {
+        return false;
+    };
+    let bytes = after_name.as_bytes();
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut strict_brace = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(after_name, i) {
+            i = span.end;
+            continue;
+        }
+        if bytes[i..].starts_with("⦃".as_bytes()) {
+            strict_brace += 1;
+            i += "⦃".len();
+            continue;
+        }
+        if bytes[i..].starts_with("⦄".as_bytes()) {
+            strict_brace = (strict_brace - 1).max(0);
+            i += "⦄".len();
+            continue;
+        }
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            b':' if paren == 0
+                && bracket == 0
+                && brace == 0
+                && strict_brace == 0
+                && is_standalone_colon_op(after_name, i) =>
+            {
+                let binders_slice = &after_name[..i];
+                let ret_type = &after_name[i + 1..];
+                return decl_binders_all_explicitly_typed(binders_slice, allow_instance_prio)
+                    && lean_expr_has_non_comment_tokens(ret_type)
+                    && !lean_expr_has_hole_or_incomplete_binder(ret_type);
+            }
+            _ => {}
+        }
+        i += after_name[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+fn pub_qualified_name(name: &str, stack: &[PubScopeFrame]) -> String {
+    if let Some(root_name) = name.strip_prefix("_root_.") {
+        return canonicalize_lean_name(root_name);
+    }
+    stack
+        .iter()
+        .filter(|f| matches!(f.kind, ScopeKind::Namespace))
+        .map(|f| canonical_lean_name_component(f.name.as_str()))
+        .chain(
+            split_lean_name_components(name)
+                .into_iter()
+                .map(canonical_lean_name_component),
+        )
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn strip_leading_in_command_prefixes(s: &str) -> &str {
+    strip_leading_in_command_prefixes_with_list(s).0
+}
+
+fn strip_leading_in_command_prefixes_with_list(s: &str) -> (&str, Vec<String>) {
+    let mut rest = s.trim_start();
+    let mut prefixes = Vec::new();
+    loop {
+        if let Some(after_opt) = strip_leading_set_option_in_robust(rest) {
+            let consumed = rest.len() - after_opt.len();
+            prefixes.push(normalize_whitespace(&rest[..consumed]));
+            rest = after_opt.trim_start();
+            continue;
+        }
+        if let Some(after_open) = strip_leading_open_in(rest) {
+            let consumed = rest.len() - after_open.len();
+            prefixes.push(normalize_whitespace(&rest[..consumed]));
+            rest = after_open.trim_start();
+            continue;
+        }
+        if let Some((after_gen_in, prefix_str)) = strip_leading_other_ctx_cmd_in(rest) {
+            prefixes.push(prefix_str);
+            rest = after_gen_in.trim_start();
+            continue;
+        }
+        break;
+    }
+    (rest, prefixes)
+}
+
+fn strip_leading_other_ctx_cmd_in(s: &str) -> Option<(&str, String)> {
+    const CTX_KWS: &[&str] = &[
+        "variable",
+        "variables",
+        "universe",
+        "universes",
+        "include",
+        "omit",
+    ];
+    let matched_kw = CTX_KWS.iter().find(|&&kw| {
+        s.strip_prefix(kw)
+            .is_some_and(|r| r.starts_with(char::is_whitespace))
+    })?;
+    let bytes = s.as_bytes();
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut strict_brace = 0i32;
+    let mut i = matched_kw.len();
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(s, i) {
+            i = span.end;
+            continue;
+        }
+        if bytes[i..].starts_with("⦃".as_bytes()) {
+            strict_brace += 1;
+            i += "⦃".len();
+            continue;
+        }
+        if bytes[i..].starts_with("⦄".as_bytes()) {
+            strict_brace = (strict_brace - 1).max(0);
+            i += "⦄".len();
+            continue;
+        }
+        if paren == 0
+            && bracket == 0
+            && brace == 0
+            && strict_brace == 0
+            && i + 2 <= bytes.len()
+            && &bytes[i..i + 2] == b"in"
+            && bytes[i - 1].is_ascii_whitespace()
+            && (i + 2 == bytes.len() || bytes[i + 2].is_ascii_whitespace())
+        {
+            let consumed = i + 2;
+            return Some((&s[consumed..], normalize_whitespace(&s[..consumed])));
+        }
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            _ => {}
+        }
+        i += s[i..].chars().next()?.len_utf8();
+    }
+    None
+}
+
+fn strip_leading_set_option_in_robust(s: &str) -> Option<&str> {
+    let after_kw = s.strip_prefix("set_option")?;
+    if !after_kw.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut i = "set_option".len();
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    // Option name (identifier / dotted identifier, possibly guillemet-escaped).
+    let name_start = i;
+    while i < bytes.len() {
+        if let Some(end) = scan_lean_guillemet_ident_end(s, i) {
+            i = end;
+            continue;
+        }
+        if bytes[i].is_ascii_whitespace() {
+            break;
+        }
+        i += s[i..].chars().next()?.len_utf8();
+    }
+    if i == name_start || i >= bytes.len() {
+        return None;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    // Option value: string literal, raw string literal, or non-whitespace token (`true`/`false`/numeral).
+    if let Some(end) = scan_lean_norm_literal_end(s, i) {
+        i = end;
+    } else {
+        let val_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += s[i..].chars().next()?.len_utf8();
+        }
+        if i == val_start {
+            return None;
+        }
+    }
+    let before_ws = i;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i == before_ws {
+        return None;
+    }
+    let after_in = s[i..].strip_prefix("in")?;
+    if after_in.is_empty() || after_in.starts_with(char::is_whitespace) {
+        Some(after_in)
+    } else {
+        None
+    }
+}
+
+fn strip_leading_guard_msgs_in(s: &str) -> Option<&str> {
+    let after_kw = s.strip_prefix("#guard_msgs")?;
+    if !after_kw.starts_with(char::is_whitespace) && !after_kw.starts_with('(') {
+        return None;
+    }
+    let mut rest = after_kw.trim_start();
+    if rest.starts_with('(') {
+        let bytes = rest.as_bytes();
+        let mut paren = 0i32;
+        let mut bracket = 0i32;
+        let mut brace = 0i32;
+        let mut i = 0usize;
+        let mut close_end = None;
+        while i < bytes.len() {
+            if let Some(span) = skip_lean_lexeme(rest, i) {
+                i = span.end;
+                continue;
+            }
+            match bytes[i] {
+                b'(' => paren += 1,
+                b')' => {
+                    paren -= 1;
+                    if paren == 0 && bracket == 0 && brace == 0 {
+                        close_end = Some(i + 1);
+                        break;
+                    }
+                }
+                b'[' => bracket += 1,
+                b']' => bracket = (bracket - 1).max(0),
+                b'{' => brace += 1,
+                b'}' => brace = (brace - 1).max(0),
+                _ => {}
+            }
+            i += rest[i..].chars().next()?.len_utf8();
+        }
+        rest = rest[close_end?..].trim_start();
+    }
+    let after_in = rest.strip_prefix("in")?;
+    if after_in.is_empty() || after_in.starts_with(char::is_whitespace) {
+        Some(after_in)
+    } else {
+        None
+    }
+}
+
+fn strip_leading_simple_in_wrapper<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+    let after_kw = s.strip_prefix(kw)?;
+    if !after_kw.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = after_kw.trim_start();
+    let after_in = rest.strip_prefix("in")?;
+    if after_in.is_empty() || after_in.starts_with(char::is_whitespace) {
+        Some(after_in)
+    } else {
+        None
+    }
+}
+
+enum CommandBearingWrapperUnwrap<'a> {
+    NotWrapper,
+    EmptyInner {
+        in_prefixes: Vec<String>,
+        with_exporting: bool,
+    },
+    Inner {
+        inner: &'a str,
+        in_prefixes: Vec<String>,
+        with_exporting: bool,
+    },
+}
+
+fn unwrap_command_bearing_diagnostic_wrappers(s: &str) -> CommandBearingWrapperUnwrap<'_> {
+    let mut cur = s.trim_start();
+    let mut unwrapped_any = false;
+    let mut in_prefixes = Vec::new();
+    let mut with_exporting = false;
+    loop {
+        let cur_no_doc = strip_leading_doc_comments_only(cur);
+        let (after_in_prefixes, mut stripped_here) =
+            strip_leading_in_command_prefixes_with_list(cur_no_doc);
+        let after_in_no_doc = strip_leading_doc_comments_only(after_in_prefixes);
+        if let Some(after_time) = after_in_no_doc
+            .strip_prefix("#time")
+            .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+        {
+            unwrapped_any = true;
+            in_prefixes.append(&mut stripped_here);
+            cur = after_time.trim_start();
+            continue;
+        }
+        if let Some(after_gm) = strip_leading_guard_msgs_in(after_in_no_doc) {
+            unwrapped_any = true;
+            in_prefixes.append(&mut stripped_here);
+            cur = after_gm.trim_start();
+            continue;
+        }
+        if let Some(after_gp) = strip_leading_simple_in_wrapper(after_in_no_doc, "#guard_panic") {
+            unwrapped_any = true;
+            in_prefixes.append(&mut stripped_here);
+            cur = after_gp.trim_start();
+            continue;
+        }
+        if let Some(after_it) = strip_leading_simple_in_wrapper(after_in_no_doc, "#info_trees") {
+            unwrapped_any = true;
+            in_prefixes.append(&mut stripped_here);
+            cur = after_it.trim_start();
+            continue;
+        }
+        if let Some(after_we) = after_in_no_doc
+            .strip_prefix("#with_exporting")
+            .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+        {
+            unwrapped_any = true;
+            with_exporting = true;
+            in_prefixes.append(&mut stripped_here);
+            cur = after_we.trim_start();
+            continue;
+        }
+        if !unwrapped_any {
+            return CommandBearingWrapperUnwrap::NotWrapper;
+        }
+        if after_in_no_doc.is_empty() {
+            in_prefixes.append(&mut stripped_here);
+            return CommandBearingWrapperUnwrap::EmptyInner {
+                in_prefixes,
+                with_exporting,
+            };
+        }
+        in_prefixes.append(&mut stripped_here);
+        return CommandBearingWrapperUnwrap::Inner {
+            inner: after_in_no_doc,
+            in_prefixes,
+            with_exporting,
+        };
+    }
+}
+
+fn strip_leading_doc_comments_only(s: &str) -> &str {
+    let mut rest = s.trim_start();
+    while let Some((end, is_doc)) = scan_lean_block_comment_end(rest, 0) {
+        if is_doc {
+            rest = rest[end..].trim_start();
+        } else {
+            break;
+        }
+    }
+    rest
+}
+
+fn is_malformed_command_bearing_wrapper_start(s: &str) -> bool {
+    let core = strip_leading_in_command_prefixes(s);
+    ["#guard_msgs", "#guard_panic", "#info_trees"]
+        .iter()
+        .any(|kw| {
+            core.strip_prefix(kw).is_some_and(|r| {
+                r.is_empty() || r.starts_with(char::is_whitespace) || r.starts_with('(')
+            })
+        })
+}
+
+fn is_exit_cmd(after_prefixes: &str) -> bool {
+    let core = strip_leading_in_command_prefixes(after_prefixes);
+    core.strip_prefix("#exit")
+        .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+}
+
+fn strip_leading_open_in(s: &str) -> Option<&str> {
+    let after_kw = s.strip_prefix("open")?;
+    if !after_kw.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut i = "open".len();
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(s, i) {
+            i = span.end;
+            continue;
+        }
+        if paren == 0
+            && bracket == 0
+            && brace == 0
+            && i + 2 <= bytes.len()
+            && &bytes[i..i + 2] == b"in"
+            && bytes[i - 1].is_ascii_whitespace()
+            && (i + 2 == bytes.len() || bytes[i + 2].is_ascii_whitespace())
+        {
+            return Some(&s[i + 2..]);
+        }
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            _ => {}
+        }
+        i += s[i..].chars().next()?.len_utf8();
+    }
+    None
+}
+
+fn extract_attribute_cmd_bracket_inner(after_prefixes: &str) -> Option<&str> {
+    let core = strip_leading_in_command_prefixes(after_prefixes);
+    let after_attr = core.strip_prefix("attribute")?;
+    if !after_attr.starts_with(char::is_whitespace) && !after_attr.starts_with('[') {
+        return None;
+    }
+    let rest = after_attr.trim_start();
+    if !rest.starts_with('[') {
+        return None;
+    }
+    let bytes = rest.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(rest, i) {
+            i = span.end;
+            continue;
+        }
+        match bytes[i] {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&rest[1..i]);
+                }
+            }
+            _ => {}
+        }
+        i += rest[i..].chars().next()?.len_utf8();
+    }
+    None
+}
+
+fn is_pure_diagnostic_or_example_cmd(after_prefixes: &str) -> bool {
+    let core = strip_leading_in_command_prefixes(after_prefixes);
+    if core
+        .strip_prefix("example")
+        .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace) || r.starts_with(':'))
+    {
+        return true;
+    }
+    [
+        "#check",
+        "#check_failure",
+        "#check_assertions",
+        "#check_simp",
+        "#check_tactic",
+        "#check_tactic_failure",
+        "#print",
+        "#reduce",
+        "#synth",
+        "#guard",
+        "#guard_expr",
+        "#where",
+        "#version",
+        "#recall",
+        "#show_deprecated_modules",
+        "#import_path",
+        "#discr_tree_key",
+        "#discr_tree_simp_key",
+    ]
+    .iter()
+    .any(|kw| {
+        core.strip_prefix(kw).is_some_and(|r| {
+            r.is_empty() || r.starts_with(char::is_whitespace) || r.starts_with('!')
+        })
+    })
+}
+
+fn collect_decl_in_prefixes(clean_cmd: &str) -> Vec<String> {
+    const MODS: &[&str] = &[
+        "private",
+        "protected",
+        "noncomputable",
+        "scoped",
+        "local",
+        "unsafe",
+        "partial",
+        "nonrec",
+        "public",
+        "meta",
+    ];
+    let mut out = Vec::new();
+    let mut rest = clean_cmd.trim_start();
+    loop {
+        if let Some((end, is_doc)) = scan_lean_block_comment_end(rest, 0) {
+            if is_doc {
+                rest = rest[end..].trim_start();
+                continue;
+            }
+        }
+        if let Some(after_attr) = strip_leading_attr_block(rest) {
+            rest = after_attr.trim_start();
+            continue;
+        }
+        let (after_in, mut in_list) = strip_leading_in_command_prefixes_with_list(rest);
+        if !in_list.is_empty() {
+            out.append(&mut in_list);
+            rest = after_in.trim_start();
+            continue;
+        }
+        let mut stripped = false;
+        for &m in MODS {
+            if let Some(after_m) = rest.strip_prefix(m) {
+                if after_m.is_empty() || after_m.starts_with(char::is_whitespace) {
+                    let trimmed_after = after_m.trim_start();
+                    if matches!(m, "noncomputable" | "public" | "meta")
+                        && (trimmed_after == "section"
+                            || trimmed_after.starts_with("section ")
+                            || trimmed_after.starts_with("import "))
+                    {
+                        break;
+                    }
+                    rest = trimmed_after;
+                    stripped = true;
+                    break;
+                }
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    out
+}
+
+fn strip_decl_and_in_prefixes(clean_cmd: &str) -> &str {
+    const MODS: &[&str] = &[
+        "private",
+        "protected",
+        "noncomputable",
+        "scoped",
+        "local",
+        "unsafe",
+        "partial",
+        "nonrec",
+        "public",
+        "meta",
+    ];
+    let mut rest = clean_cmd.trim_start();
+    loop {
+        if let Some((end, is_doc)) = scan_lean_block_comment_end(rest, 0) {
+            if is_doc {
+                rest = rest[end..].trim_start();
+                continue;
+            }
+        }
+        if let Some(after_attr) = strip_leading_attr_block(rest) {
+            rest = after_attr.trim_start();
+            continue;
+        }
+        let (after_in, in_list) = strip_leading_in_command_prefixes_with_list(rest);
+        if !in_list.is_empty() {
+            rest = after_in.trim_start();
+            continue;
+        }
+        let mut stripped = false;
+        for &m in MODS {
+            if let Some(after_m) = rest.strip_prefix(m) {
+                if after_m.is_empty() || after_m.starts_with(char::is_whitespace) {
+                    let trimmed_after = after_m.trim_start();
+                    if matches!(m, "noncomputable" | "public" | "meta")
+                        && (trimmed_after == "section"
+                            || trimmed_after.starts_with("section ")
+                            || trimmed_after.starts_with("import "))
+                    {
+                        break;
+                    }
+                    rest = trimmed_after;
+                    stripped = true;
+                    break;
+                }
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    rest
+}
+
+fn unwrap_span_for_mutual_subspans<'a>(span: &CmdSpan<'a>) -> Option<CmdSpan<'a>> {
+    let orig = span.orig_text;
+    let clean = span.clean_text;
+    if orig.len() != clean.len() {
+        return None;
+    }
+    let trimmed_clean = clean.trim_start();
+    if let CommandBearingWrapperUnwrap::Inner { inner, .. } =
+        unwrap_command_bearing_diagnostic_wrappers(trimmed_clean)
+    {
+        if is_mutual_line_start(inner) {
+            let inner_offset = inner.as_ptr() as usize - clean.as_ptr() as usize;
+            if inner_offset < orig.len() {
+                let line_delta = clean[..inner_offset]
+                    .bytes()
+                    .filter(|&b| b == b'\n')
+                    .count();
+                return Some(CmdSpan {
+                    start_line: span.start_line + line_delta,
+                    end_line: span.end_line,
+                    orig_text: &orig[inner_offset..],
+                    clean_text: &clean[inner_offset..],
+                });
+            }
+        }
+    }
+    if is_mutual_line_start(trimmed_clean) {
+        return Some(*span);
+    }
+    None
+}
+
+fn has_unrecognized_command_indent_line<'a>(spans: &[CmdSpan<'a>]) -> bool {
+    let check_span = |span: &CmdSpan<'a>| -> bool {
+        let span_src = span.orig_text;
+        let mut lexical_cursor = 0usize;
+        let mut literal_end = 0usize;
+        let mut first_non_empty_idx: Option<usize> = None;
+        let mut base_indent = 0usize;
+        let mut line_byte_start = 0usize;
+        for (idx, (orig_line, clean_line)) in
+            span_src.lines().zip(span.clean_text.lines()).enumerate()
+        {
+            let trimmed_clean = clean_line.trim_start();
+            let trimmed_orig = orig_line.trim_start();
+            let token_start = line_byte_start + clean_line.len() - trimmed_clean.len();
+            while lexical_cursor < token_start {
+                if let Some(lex_span) = skip_lean_lexeme(span_src, lexical_cursor) {
+                    if lex_span.is_literal {
+                        literal_end = lex_span.end;
+                    }
+                    lexical_cursor = lex_span.end;
+                } else {
+                    lexical_cursor += span_src[lexical_cursor..]
+                        .chars()
+                        .next()
+                        .map_or(1, char::len_utf8);
+                }
+            }
+            line_byte_start += orig_line.len() + 1;
+            if token_start < literal_end {
+                continue;
+            }
+            if trimmed_clean.is_empty() && trimmed_orig.is_empty() {
+                continue;
+            }
+            if first_non_empty_idx.is_none() {
+                first_non_empty_idx = Some(idx);
+                base_indent = orig_line.len() - trimmed_orig.len();
+                if !trimmed_clean.is_empty() && !is_top_level_command_start(trimmed_clean) {
+                    let starts_doc = matches!(
+                        scan_lean_block_comment_end(trimmed_orig, 0),
+                        Some((_, true))
+                    );
+                    if !starts_doc {
+                        return true;
+                    }
+                }
+                continue;
+            }
+            if trimmed_clean.is_empty() {
+                continue;
+            }
+            let indent = orig_line.len() - trimmed_orig.len();
+            if indent <= base_indent {
+                let prev_clean = span
+                    .clean_text
+                    .lines()
+                    .take(idx)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let prev_orig = span_src.lines().take(idx).collect::<Vec<_>>().join("\n");
+                if is_incomplete_prefix_only_span(&prev_orig, &prev_clean) {
+                    if !is_top_level_command_start(trimmed_clean) {
+                        return true;
+                    }
+                    continue;
+                }
+                let prev_unwrapped = unwrap_scope_line_wrappers(prev_clean.trim());
+                let is_split_scope_ident = (prev_unwrapped == "namespace"
+                    || (is_section_header_line(prev_unwrapped)
+                        && extract_section_header_name(prev_unwrapped).is_empty())
+                    || unwrap_end_line_wrappers(prev_clean.trim()) == "end")
+                    && take_leading_lean_ident(trimmed_clean).is_some();
+                if is_split_scope_ident {
+                    continue;
+                }
+                if trimmed_clean.starts_with("| ")
+                    || trimmed_clean.starts_with("|\t")
+                    || trimmed_clean == "|"
+                    || trimmed_clean == "where"
+                    || trimmed_clean.starts_with("where ")
+                    || trimmed_clean.starts_with("deriving ")
+                    || trimmed_clean.starts_with(":=")
+                    || trimmed_clean == ")"
+                    || trimmed_clean.starts_with(") ")
+                    || trimmed_clean == "]"
+                    || trimmed_clean.starts_with("] ")
+                    || trimmed_clean == "}"
+                    || trimmed_clean.starts_with("} ")
+                {
+                    continue;
+                }
+                return true;
+            }
+        }
+        false
+    };
+
+    for span in spans {
+        if let Some(mutual_span) = unwrap_span_for_mutual_subspans(span) {
+            if let Some((_, inner_spans, _)) = split_mutual_block_subspans(&mutual_span) {
+                for sub in &inner_spans {
+                    if check_span(sub) {
+                        return true;
+                    }
+                }
+                continue;
+            }
+        }
+        if check_span(span) {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_visibility_gated_module_cmd(after_prefixes: &str) -> bool {
+    let core = strip_leading_in_command_prefixes(after_prefixes);
+    if core
+        .strip_prefix("initialize")
+        .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+        || core
+            .strip_prefix("builtin_initialize")
+            .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+    {
+        return true;
+    }
+    if let Some(rest) = core.strip_prefix("class") {
+        if rest.starts_with(char::is_whitespace) {
+            let r2 = rest.trim_start();
+            if r2
+                .strip_prefix("abbrev")
+                .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+            {
+                return true;
+            }
+        }
+    }
+    if let Some(rest) = core.strip_prefix("syntax") {
+        if rest.starts_with(char::is_whitespace) {
+            let r2 = rest.trim_start();
+            if let Some((_, after_ident)) = take_leading_lean_ident(r2) {
+                if after_ident.trim_start().starts_with(":=") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Extract the public signature tuples and public/meta interface digests of a Lean 4 file.
+/// For `module` files, private items (outside `public section` without `public` modifier, or marked
+/// `private`) and unexposed `public def`/`public theorem` bodies are excluded from `public_signature_digest`,
+/// matching Lean 4's `.olean` / `.olean.private` module system boundary.
+pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
+    let hdr = crate::module_builder::parse_header_info(src);
+    let is_module = hdr.is_module && hdr.header_error.is_none();
+    let mut exported_imports = Vec::new();
+    let mut meta_exported_imports = Vec::new();
+    let mut combined_exported_imports = Vec::new();
+    for spec in &hdr.import_specs {
+        if spec.is_exported {
+            let entry = if spec.import_all {
+                format!("{}:all", spec.module)
+            } else {
+                spec.module.clone()
+            };
+            if spec.is_meta {
+                combined_exported_imports.push(format!("meta:{entry}"));
+                meta_exported_imports.push(entry);
+            } else {
+                combined_exported_imports.push(entry.clone());
+                exported_imports.push(entry);
+            }
+        }
+    }
+    exported_imports.dedup();
+    meta_exported_imports.dedup();
+    combined_exported_imports.dedup();
+
+    if hdr.header_error.is_some() {
+        let raw_hash = blake3::hash(src.as_bytes()).to_hex().to_string();
+        return PublicSignatureSummary {
+            is_module: false,
+            exported_imports,
+            meta_exported_imports,
+            declarations: Vec::new(),
+            public_directives_hash: raw_hash.clone(),
+            public_signature_digest: format!("pubsig-invalid:{}", raw_hash),
+            meta_signature_digest: format!("metasig-invalid:{}", raw_hash),
+        };
+    }
+
+    let clean = strip_lean_comments(src);
+    let body_spans = if hdr.body_byte_offset >= src.len() {
+        Vec::new()
+    } else {
+        parse_command_spans(&src[hdr.body_byte_offset..], &clean[hdr.body_byte_offset..])
+    };
+    if has_unrecognized_command_indent_line(&body_spans) {
+        let doc_src = strip_non_doc_lean_comments(src);
+        let norm_src = normalize_whitespace(&doc_src);
+        let raw_hash = blake3::hash(norm_src.as_bytes()).to_hex().to_string();
+        return PublicSignatureSummary {
+            is_module,
+            exported_imports,
+            meta_exported_imports,
+            declarations: Vec::new(),
+            public_directives_hash: raw_hash.clone(),
+            public_signature_digest: format!("pubsig-custom-cmd:{}", raw_hash),
+            meta_signature_digest: format!("metasig-custom-cmd:{}", raw_hash),
+        };
+    }
+    let mut stack: Vec<PubScopeFrame> = Vec::new();
+    let mut declarations: Vec<PublicDeclSig> = Vec::new();
+    let mut meta_declarations: Vec<PublicDeclSig> = Vec::new();
+    let mut directives_hasher = blake3::Hasher::new();
+    directives_hasher.update(b"pub-directives:v1\n");
+    let mut meta_directives_hasher = blake3::Hasher::new();
+    meta_directives_hasher.update(b"meta-directives:v1\n");
+    let mut active_context_vars: Vec<String> = Vec::new();
+    for spec in &hdr.import_specs {
+        let cmd = match (spec.is_exported, spec.is_meta, spec.import_all) {
+            (false, false, false) => format!("import {}", spec.module),
+            (false, false, true) => format!("import all {}", spec.module),
+            (false, true, false) => format!("meta import {}", spec.module),
+            (false, true, true) => format!("meta import all {}", spec.module),
+            (true, false, false) => format!("public import {}", spec.module),
+            (true, false, true) => format!("public import all {}", spec.module),
+            (true, true, false) => format!("public meta import {}", spec.module),
+            (true, true, true) => format!("public meta import all {}", spec.module),
+        };
+        active_context_vars.push(cmd);
+    }
+    active_context_vars.dedup();
+
+    let is_non_exported_import_cmd = |cmd_trimmed: &str| -> bool {
+        cmd_trimmed.starts_with("import ") || cmd_trimmed.starts_with("meta import ")
+    };
+
+    let is_all_local_attribute_cmd = |after_prefixes: &str| -> bool {
+        extract_attribute_cmd_bracket_inner(after_prefixes)
+            .map(|inner| {
+                let items = split_attr_items(inner);
+                !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|a| a == "local" || a.starts_with("local "))
+            })
+            .unwrap_or(false)
+    };
+
+    let classify_decl_in_pub_sig = |trimmed: &str| -> Option<(&'static str, String)> {
+        const KWS: &[&str] = &[
+            "theorem",
+            "lemma",
+            "def",
+            "abbrev",
+            "structure",
+            "class",
+            "inductive",
+            "coinductive",
+            "instance",
+            "axiom",
+            "opaque",
+            "constant",
+            "simproc_decl",
+            "dsimproc_decl",
+            "simproc",
+            "dsimproc",
+            "builtin_simproc",
+            "builtin_dsimproc",
+        ];
+        let rest = strip_decl_and_in_prefixes(trimmed);
+        for &kw in KWS {
+            if let Some(mut after) = rest.strip_prefix(kw) {
+                if after.is_empty()
+                    || after.starts_with(char::is_whitespace)
+                    || after.starts_with('[')
+                {
+                    after = after.trim_start();
+                    if after.starts_with('[') {
+                        if let Some(close_idx) = after.find(']') {
+                            after = after[close_idx + 1..].trim_start();
+                        }
+                    }
+                    let name = take_leading_lean_ident(after)
+                        .map(|(n, _)| n.to_string())
+                        .unwrap_or_default();
+                    return Some((kw, name));
+                }
+            }
+        }
+        None
+    };
+
+    fn unwrap_pub_sig_cmd(raw_clean: &str) -> (&str, Vec<String>, bool, bool) {
+        let raw_trimmed = raw_clean.trim();
+        match unwrap_command_bearing_diagnostic_wrappers(raw_trimmed) {
+            CommandBearingWrapperUnwrap::NotWrapper => (raw_trimmed, Vec::new(), false, false),
+            CommandBearingWrapperUnwrap::EmptyInner {
+                in_prefixes,
+                with_exporting,
+            } => (raw_trimmed, in_prefixes, with_exporting, true),
+            CommandBearingWrapperUnwrap::Inner {
+                inner,
+                in_prefixes,
+                with_exporting,
+            } => (inner.trim(), in_prefixes, with_exporting, false),
+        }
+    }
+
+    let is_scope_ctx_cmd = |after_p: &str| -> bool {
+        (after_p.starts_with("variable ") && strip_leading_other_ctx_cmd_in(after_p).is_none())
+            || (after_p.starts_with("variables ")
+                && strip_leading_other_ctx_cmd_in(after_p).is_none())
+            || (after_p.starts_with("universe ")
+                && strip_leading_other_ctx_cmd_in(after_p).is_none())
+            || (after_p.starts_with("universes ")
+                && strip_leading_other_ctx_cmd_in(after_p).is_none())
+            || (after_p.starts_with("open ") && strip_leading_open_in(after_p).is_none())
+            || (after_p.starts_with("set_option ")
+                && strip_leading_set_option_in_robust(after_p).is_none())
+            || (after_p.starts_with("include ")
+                && strip_leading_other_ctx_cmd_in(after_p).is_none())
+            || (after_p.starts_with("omit ") && strip_leading_other_ctx_cmd_in(after_p).is_none())
+            || after_p == "omit"
+    };
+
+    let process_decl_cmd = |sub_clean: &str,
+                            inherited_in_prefixes: &[String],
+                            inherited_with_exporting: bool,
+                            stack: &[PubScopeFrame],
+                            active_vars: &[String],
+                            declarations: &mut Vec<PublicDeclSig>,
+                            meta_declarations: &mut Vec<PublicDeclSig>,
+                            directives_hasher: &mut blake3::Hasher| {
+        let (trimmed, mut wrapper_in_prefixes, span_with_exporting, wrapper_empty_inner) =
+            unwrap_pub_sig_cmd(sub_clean);
+        if wrapper_empty_inner {
+            return;
+        }
+        let with_exporting = inherited_with_exporting || span_with_exporting;
+        let mut local_in_prefixes: Vec<String> = inherited_in_prefixes.to_vec();
+        local_in_prefixes.append(&mut wrapper_in_prefixes);
+
+        if trimmed.is_empty()
+            || trimmed == "module"
+            || trimmed.starts_with("module ")
+            || trimmed == "prelude"
+            || trimmed.starts_with("import ")
+            || trimmed.starts_with("public import ")
+            || trimmed.starts_with("meta import ")
+            || trimmed.starts_with("public meta import ")
+        {
+            return;
+        }
+        let in_pub_sec = stack.iter().any(|f| f.is_public_section);
+        let in_meta_sec = stack.iter().any(|f| f.is_meta_section);
+        let in_expose_sec = stack.iter().any(|f| f.section_has_expose);
+        let in_noncomp_sec = stack.iter().any(|f| f.is_noncomputable_section);
+
+        let (mods, attrs) = parse_decl_modifiers_and_attrs(trimmed);
+        let is_priv_mod = mods.iter().any(|m| m == "private");
+        let is_pub_mod = mods.iter().any(|m| m == "public");
+        let is_meta_mod = mods.iter().any(|m| m == "meta") || in_meta_sec;
+        let is_local_mod = mods.iter().any(|m| m == "local");
+        let is_noncomp_mod = mods.iter().any(|m| m == "noncomputable") || in_noncomp_sec;
+
+        let is_public_visible = if is_module {
+            !is_priv_mod && !is_local_mod && (is_pub_mod || in_pub_sec)
+        } else {
+            true
+        };
+
+        if let Some((kw, raw_name)) = classify_decl_in_pub_sig(trimmed) {
+            if !is_public_visible {
+                return;
+            }
+            let mut decl_in_prefixes = collect_decl_in_prefixes(trimmed);
+            local_in_prefixes.append(&mut decl_in_prefixes);
+
+            let const_name = if raw_name.is_empty() {
+                format!(
+                    "<anon:{}:{}>",
+                    kw,
+                    &hash_normalized_whitespace_hex(trimmed)[..12]
+                )
+            } else {
+                pub_qualified_name(&raw_name, stack)
+            };
+            let mut simp_attrs = Vec::new();
+            let mut inline_attrs = Vec::new();
+            let mut reducibility = if kw == "abbrev" {
+                "reducible".to_string()
+            } else if kw == "opaque" {
+                "irreducible".to_string()
+            } else {
+                "semireducible".to_string()
+            };
+            let mut has_expose_attr = in_expose_sec;
+            let mut other_exported_attrs = Vec::new();
+
+            for a in &attrs {
+                if a.starts_with("local ") || a == "local" {
+                    continue;
+                }
+                if a == "expose" || a.starts_with("expose ") {
+                    has_expose_attr = true;
+                } else if a == "simp"
+                    || a.starts_with("simp ")
+                    || a.starts_with("simp,")
+                    || a.contains("simproc")
+                    || a == "csimp"
+                    || a.starts_with("csimp ")
+                {
+                    simp_attrs.push(a.clone());
+                } else if a == "reducible" {
+                    reducibility = "reducible".to_string();
+                } else if a == "irreducible" {
+                    reducibility = "irreducible".to_string();
+                } else if a == "semireducible" {
+                    reducibility = "semireducible".to_string();
+                } else if matches!(
+                    a.as_str(),
+                    "inline" | "noinline" | "macro_inline" | "always_inline" | "inline_if_reduce"
+                ) {
+                    inline_attrs.push(a.clone());
+                } else {
+                    other_exported_attrs.push(a.clone());
+                }
+            }
+            simp_attrs.sort();
+            inline_attrs.sort();
+            other_exported_attrs.sort();
+
+            let stripped_decl = strip_decl_and_in_prefixes(trimmed);
+            let (sig_part, body_part_opt) =
+                if matches!(kw, "structure" | "class" | "inductive" | "coinductive") {
+                    (stripped_decl, Some(stripped_decl))
+                } else if let Some((sig, body)) = split_at_top_level_assign(stripped_decl) {
+                    (sig, Some(body))
+                } else if let Some((sig, body)) = split_at_top_level_where(stripped_decl) {
+                    (sig, Some(body))
+                } else {
+                    (stripped_decl, None)
+                };
+
+            let mut sig_h = blake3::Hasher::new();
+            sig_h.update(b"decl-sig:v5\n");
+            for v in active_vars {
+                sig_h.update(b"ctx:");
+                sig_h.update(v.as_bytes());
+                sig_h.update(b"\n");
+            }
+            for lp in &local_in_prefixes {
+                sig_h.update(b"ctx:");
+                sig_h.update(lp.as_bytes());
+                sig_h.update(b"\n");
+            }
+            if with_exporting {
+                sig_h.update(b"ctx:#with_exporting\n");
+            }
+            for m in &mods {
+                if m != "public" && m != "noncomputable" {
+                    sig_h.update(b"mod:");
+                    sig_h.update(m.as_bytes());
+                    sig_h.update(b"\n");
+                }
+            }
+            if is_noncomp_mod {
+                sig_h.update(b"mod:noncomputable\n");
+            }
+            for oa in &other_exported_attrs {
+                sig_h.update(b"attr:");
+                sig_h.update(oa.as_bytes());
+                sig_h.update(b"\n");
+            }
+            hash_normalized_whitespace(&mut sig_h, sig_part, b"\n");
+            let sig_hash = sig_h.finalize().to_hex().to_string();
+
+            let is_thm_like = matches!(kw, "theorem" | "lemma");
+            let has_explicit_type = matches!(
+                kw,
+                "structure" | "class" | "inductive" | "coinductive" | "axiom" | "constant"
+            ) || decl_header_has_explicit_type_annotation(sig_part);
+            let body_exposed = if is_thm_like && has_explicit_type {
+                // Proof irrelevance: theorem proof bodies never affect downstream typing when an explicit Prop statement is given.
+                false
+            } else if !has_explicit_type {
+                true
+            } else if is_module {
+                with_exporting
+                    || is_meta_mod
+                    || has_expose_attr
+                    || reducibility == "reducible"
+                    || inline_attrs.iter().any(|a| a != "noinline")
+                    || matches!(
+                        kw,
+                        "abbrev"
+                            | "structure"
+                            | "class"
+                            | "inductive"
+                            | "coinductive"
+                            | "instance"
+                            | "simproc"
+                            | "dsimproc"
+                            | "simproc_decl"
+                            | "dsimproc_decl"
+                            | "builtin_simproc"
+                            | "builtin_dsimproc"
+                    )
+                    || !other_exported_attrs.is_empty()
+            } else {
+                true
+            };
+
+            let exposed_body_hash = if body_exposed {
+                Some(hash_normalized_whitespace_hex(
+                    body_part_opt.unwrap_or(stripped_decl),
+                ))
+            } else {
+                None
+            }
+            .map(|bh| {
+                if with_exporting {
+                    let mut h = blake3::Hasher::new();
+                    h.update(b"with_exporting:");
+                    h.update(bh.as_bytes());
+                    h.finalize().to_hex().to_string()
+                } else {
+                    bh
+                }
+            });
+
+            let entry = PublicDeclSig {
+                const_name,
+                kind: kw.to_string(),
+                sig_hash,
+                simp_attrs,
+                reducibility,
+                inline_attrs,
+                exposed_body_hash,
+            };
+            if is_meta_mod && is_module {
+                meta_declarations.push(entry);
+            } else {
+                declarations.push(entry);
+            }
+            return;
+        }
+
+        // Scope/context or standalone commands (`variable`, `open`, `universe`, `attribute`, `notation`, `macro`, `elab`, `syntax`, `export`, etc.)
+        let mut cmd_in_prefixes = collect_decl_in_prefixes(trimmed);
+        local_in_prefixes.append(&mut cmd_in_prefixes);
+        let after_prefixes = strip_decl_and_in_prefixes(trimmed);
+        if local_in_prefixes.is_empty() && !with_exporting && is_scope_ctx_cmd(after_prefixes) {
+            return;
+        }
+        if is_pure_diagnostic_or_example_cmd(after_prefixes) {
+            return;
+        }
+        if is_scope_boundary_cmd_core(trimmed) || is_scope_boundary_cmd_core(after_prefixes) {
+            return;
+        }
+        let is_exit = is_exit_cmd(after_prefixes);
+        let is_malformed_wrapper = is_malformed_command_bearing_wrapper_start(after_prefixes);
+        if !is_exit
+            && !is_malformed_wrapper
+            && is_module
+            && (is_priv_mod
+                || is_local_mod
+                || is_all_local_attribute_cmd(after_prefixes)
+                || (is_visibility_gated_module_cmd(after_prefixes) && !is_pub_mod && !in_pub_sec))
+        {
+            return;
+        }
+        let ns_prefix = stack
+            .iter()
+            .filter(|f| matches!(f.kind, ScopeKind::Namespace))
+            .map(|f| canonical_lean_name_component(f.name.as_str()))
+            .collect::<Vec<_>>()
+            .join(".");
+        let decl_pos_tag = if is_exit {
+            Some(format!(
+                "exit-pos:{}:{}",
+                declarations.len(),
+                meta_declarations.len()
+            ))
+        } else {
+            None
+        };
+        let hash_exported_directive = |h: &mut blake3::Hasher| {
+            h.update(b"dir:");
+            h.update(ns_prefix.as_bytes());
+            h.update(b"|");
+            for v in active_vars {
+                h.update(b"ctx:");
+                h.update(v.as_bytes());
+                h.update(b"|");
+            }
+            for lp in &local_in_prefixes {
+                h.update(b"ctx:");
+                h.update(lp.as_bytes());
+                h.update(b"|");
+            }
+            if with_exporting {
+                h.update(b"ctx:#with_exporting|");
+            }
+            if let Some(ref pos_tag) = decl_pos_tag {
+                h.update(pos_tag.as_bytes());
+                h.update(b"|");
+            }
+            hash_normalized_whitespace(h, trimmed, b"\n");
+        };
+        hash_exported_directive(directives_hasher);
+    };
+
+    let elab_decl_ctx_entry = |sub_clean: &str,
+                               inherited_in_prefixes: &[String],
+                               inherited_with_exporting: bool,
+                               stack: &[PubScopeFrame]|
+     -> Option<String> {
+        let (trimmed, mut wrapper_in_prefixes, span_with_exporting, wrapper_empty_inner) =
+            unwrap_pub_sig_cmd(sub_clean);
+        if wrapper_empty_inner {
+            return None;
+        }
+        let with_exporting = inherited_with_exporting || span_with_exporting;
+        let mut local_in_prefixes: Vec<String> = inherited_in_prefixes.to_vec();
+        local_in_prefixes.append(&mut wrapper_in_prefixes);
+
+        if trimmed.is_empty()
+            || trimmed == "module"
+            || trimmed.starts_with("module ")
+            || trimmed == "prelude"
+            || trimmed.starts_with("import ")
+            || trimmed.starts_with("public import ")
+            || trimmed.starts_with("meta import ")
+            || trimmed.starts_with("public meta import ")
+        {
+            return None;
+        }
+        let in_pub_sec = stack.iter().any(|f| f.is_public_section);
+        let in_meta_sec = stack.iter().any(|f| f.is_meta_section);
+        let in_expose_sec = stack.iter().any(|f| f.section_has_expose);
+        let in_noncomp_sec = stack.iter().any(|f| f.is_noncomputable_section);
+        let (mods, attrs) = parse_decl_modifiers_and_attrs(trimmed);
+        let is_priv_mod = mods.iter().any(|m| m == "private");
+        let is_pub_mod = mods.iter().any(|m| m == "public");
+        let is_meta_mod = mods.iter().any(|m| m == "meta") || in_meta_sec;
+        let is_local_mod = mods.iter().any(|m| m == "local");
+        let is_noncomp_mod = mods.iter().any(|m| m == "noncomputable") || in_noncomp_sec;
+        let is_public_visible = if is_module {
+            !is_priv_mod && !is_local_mod && (is_pub_mod || in_pub_sec)
+        } else {
+            true
+        };
+        let (kw, raw_name) = classify_decl_in_pub_sig(trimmed)?;
+        let mut decl_in_prefixes = collect_decl_in_prefixes(trimmed);
+        local_in_prefixes.append(&mut decl_in_prefixes);
+        let const_name = if raw_name.is_empty() {
+            format!(
+                "<anon:{}:{}>",
+                kw,
+                &hash_normalized_whitespace_hex(trimmed)[..12]
+            )
+        } else {
+            pub_qualified_name(&raw_name, stack)
+        };
+        let phase = if is_meta_mod { "meta" } else { "reg" };
+        let nc_tag = if is_noncomp_mod { ":nc" } else { "" };
+        let we_tag = if with_exporting { ":we" } else { "" };
+        let in_tag = if local_in_prefixes.is_empty() {
+            String::new()
+        } else {
+            format!(":in=[{}]", local_in_prefixes.join(";"))
+        };
+        if is_public_visible && !(is_module && is_meta_mod) {
+            let stripped_decl = strip_decl_and_in_prefixes(trimmed);
+            let sig_part = if matches!(kw, "structure" | "class" | "inductive" | "coinductive") {
+                stripped_decl
+            } else if let Some((sig, _)) = split_at_top_level_assign(stripped_decl) {
+                sig
+            } else if let Some((sig, _)) = split_at_top_level_where(stripped_decl) {
+                sig
+            } else {
+                stripped_decl
+            };
+            if matches!(kw, "theorem" | "lemma")
+                && decl_header_has_explicit_type_annotation(sig_part)
+            {
+                let mut norm_mods: Vec<String> = mods
+                    .iter()
+                    .filter(|m| m.as_str() != "public" && m.as_str() != "noncomputable")
+                    .cloned()
+                    .collect();
+                norm_mods.sort();
+                let mut norm_attrs: Vec<String> =
+                    attrs.iter().map(|a| normalize_whitespace(a)).collect();
+                if in_expose_sec
+                    && !norm_attrs
+                        .iter()
+                        .any(|a| a == "expose" || a.starts_with("expose "))
+                {
+                    norm_attrs.push("expose".to_string());
+                }
+                norm_attrs.sort();
+                return Some(format!(
+                    "pub-thm-hdr:{phase}{nc_tag}{we_tag}{in_tag}:mods=[{}]:attrs=[{}]:{const_name}:{}",
+                    norm_mods.join(","),
+                    norm_attrs.join(";"),
+                    normalize_whitespace(sig_part)
+                ));
+            }
+            return Some(format!(
+                "pub-decl:{phase}{nc_tag}{we_tag}{in_tag}:{const_name}:{}",
+                normalize_whitespace(trimmed)
+            ));
+        }
+        let tag_kind = if is_public_visible {
+            "pub-meta-decl"
+        } else {
+            "priv-decl"
+        };
+        Some(format!(
+            "{tag_kind}:{phase}{nc_tag}{we_tag}{in_tag}:{const_name}:{}",
+            normalize_whitespace(trimmed)
+        ))
+    };
+
+    let post_cmd_elab_ctx_entry = |sub_clean: &str,
+                                   inherited_in_prefixes: &[String],
+                                   inherited_with_exporting: bool,
+                                   stack: &[PubScopeFrame]|
+     -> Option<String> {
+        let (trimmed, mut wrapper_in_prefixes, span_with_exporting, wrapper_empty_inner) =
+            unwrap_pub_sig_cmd(sub_clean);
+        if wrapper_empty_inner {
+            return None;
+        }
+        let with_exporting = inherited_with_exporting || span_with_exporting;
+        let mut local_in_prefixes: Vec<String> = inherited_in_prefixes.to_vec();
+        local_in_prefixes.append(&mut wrapper_in_prefixes);
+
+        if trimmed.is_empty()
+            || trimmed == "module"
+            || trimmed.starts_with("module ")
+            || trimmed == "prelude"
+        {
+            return None;
+        }
+        let mut cmd_in_prefixes = collect_decl_in_prefixes(trimmed);
+        local_in_prefixes.append(&mut cmd_in_prefixes);
+        let after_p = strip_decl_and_in_prefixes(trimmed);
+        if is_non_exported_import_cmd(trimmed)
+            || is_non_exported_import_cmd(after_p)
+            || trimmed.starts_with("public import ")
+            || trimmed.starts_with("public meta import ")
+            || after_p.starts_with("public import ")
+            || after_p.starts_with("public meta import ")
+        {
+            return Some(normalize_whitespace(trimmed));
+        }
+        if is_scope_boundary_cmd_core(trimmed) || is_scope_boundary_cmd_core(after_p) {
+            return None;
+        }
+        if local_in_prefixes.is_empty() && !with_exporting && is_scope_ctx_cmd(after_p) {
+            return None;
+        }
+        if is_pure_diagnostic_or_example_cmd(after_p) {
+            return None;
+        }
+        let format_ctx = |norm: String| -> String {
+            let mut prefix_parts = local_in_prefixes.clone();
+            if with_exporting {
+                prefix_parts.push("#with_exporting".to_string());
+            }
+            if prefix_parts.is_empty() {
+                norm
+            } else {
+                format!("{} {}", prefix_parts.join(" "), norm)
+            }
+        };
+        let _ = stack;
+        let (mods, attrs) = parse_decl_modifiers_and_attrs(trimmed);
+        let is_local_mod = mods.iter().any(|m| m == "local");
+        let has_local_attr = attrs
+            .iter()
+            .any(|a| a == "local" || a.starts_with("local "));
+        if classify_decl_in_pub_sig(trimmed).is_some() {
+            if has_local_attr || is_local_mod {
+                return Some(format_ctx(normalize_whitespace(trimmed)));
+            }
+            return None;
+        }
+        Some(format_ctx(normalize_whitespace(trimmed)))
+    };
+
+    let mut pending_in_prefixes: Vec<String> = Vec::new();
+    let mut pending_with_exporting = false;
+    let mut pending_wrapper = false;
+
+    for span in &body_spans {
+        let raw_trimmed = span.clean_text.trim();
+        if raw_trimmed.is_empty() {
+            continue;
+        }
+
+        // Check if this span is a standalone prefix line whose inner command was split into the next `CmdSpan`
+        // (e.g. `#time\npublic def api := 1`, `#guard_msgs in\npublic def api := 1`, or `open Foo in\npublic def api := 1`).
+        match unwrap_command_bearing_diagnostic_wrappers(raw_trimmed) {
+            CommandBearingWrapperUnwrap::EmptyInner {
+                mut in_prefixes,
+                with_exporting,
+            } => {
+                pending_in_prefixes.append(&mut in_prefixes);
+                pending_with_exporting |= with_exporting;
+                pending_wrapper = true;
+                continue;
+            }
+            CommandBearingWrapperUnwrap::NotWrapper => {
+                let no_doc = strip_leading_doc_comments_only(raw_trimmed);
+                let (after_in_only, mut in_only_list) =
+                    strip_leading_in_command_prefixes_with_list(no_doc);
+                if !in_only_list.is_empty()
+                    && strip_leading_doc_comments_only(after_in_only).is_empty()
+                {
+                    pending_in_prefixes.append(&mut in_only_list);
+                    continue;
+                }
+            }
+            CommandBearingWrapperUnwrap::Inner { .. } => {}
+        }
+
+        let span_in_prefixes = std::mem::take(&mut pending_in_prefixes);
+        let span_with_exporting = std::mem::replace(&mut pending_with_exporting, false);
+        let _had_pending_wrapper = std::mem::replace(&mut pending_wrapper, false);
+
+        let (unwrapped_trimmed, span_wrap_in_prefixes, inner_we, _) =
+            unwrap_pub_sig_cmd(raw_trimmed);
+        let after_p = strip_decl_and_in_prefixes(unwrapped_trimmed);
+        if span_in_prefixes.is_empty()
+            && span_wrap_in_prefixes.is_empty()
+            && is_scope_ctx_cmd(after_p)
+        {
+            let norm_ctx = normalize_whitespace(unwrapped_trimmed);
+            if span_with_exporting || inner_we {
+                active_context_vars.push(format!("#with_exporting {norm_ctx}"));
+            } else {
+                active_context_vars.push(norm_ctx);
+            }
+        }
+
+        if let Some(mutual_span) = unwrap_span_for_mutual_subspans(span) {
+            if let Some((_, inner_spans, _)) = split_mutual_block_subspans(&mutual_span) {
+                let mut combined_mutual_in = span_in_prefixes.clone();
+                combined_mutual_in.extend(span_wrap_in_prefixes.clone());
+                let combined_mutual_we = span_with_exporting || inner_we;
+                stack.push(PubScopeFrame {
+                    kind: ScopeKind::Mutual,
+                    name: String::new(),
+                    is_public_section: stack.iter().any(|f| f.is_public_section),
+                    is_meta_section: stack.iter().any(|f| f.is_meta_section),
+                    section_has_expose: stack.iter().any(|f| f.section_has_expose),
+                    is_noncomputable_section: stack.iter().any(|f| f.is_noncomputable_section),
+                });
+                let mut_in_tag = if combined_mutual_in.is_empty() && !combined_mutual_we {
+                    String::new()
+                } else {
+                    format!(
+                        ":in=[{}]:we={combined_mutual_we}",
+                        combined_mutual_in.join(";")
+                    )
+                };
+                active_context_vars.push(format!("scope-open:mut{mut_in_tag}"));
+                {
+                    let mut sub_pending_in = Vec::new();
+                    let mut sub_pending_we = false;
+                    for sub in &inner_spans {
+                        let st = sub.clean_text.trim();
+                        if st.is_empty() {
+                            continue;
+                        }
+                        if let CommandBearingWrapperUnwrap::EmptyInner {
+                            mut in_prefixes,
+                            with_exporting,
+                        } = unwrap_command_bearing_diagnostic_wrappers(st)
+                        {
+                            sub_pending_in.append(&mut in_prefixes);
+                            sub_pending_we |= with_exporting;
+                            continue;
+                        }
+                        let no_doc = strip_leading_doc_comments_only(st);
+                        let (after_in_only, mut in_only_list) =
+                            strip_leading_in_command_prefixes_with_list(no_doc);
+                        if !in_only_list.is_empty()
+                            && strip_leading_doc_comments_only(after_in_only).is_empty()
+                        {
+                            sub_pending_in.append(&mut in_only_list);
+                            continue;
+                        }
+                        let mut eff_in = combined_mutual_in.clone();
+                        eff_in.append(&mut sub_pending_in);
+                        let eff_we =
+                            combined_mutual_we || std::mem::replace(&mut sub_pending_we, false);
+                        if let Some(entry) =
+                            elab_decl_ctx_entry(sub.clean_text, &eff_in, eff_we, &stack)
+                        {
+                            active_context_vars.push(entry);
+                        }
+                    }
+                }
+                let mut sub_pending_in = Vec::new();
+                let mut sub_pending_we = false;
+                for sub in &inner_spans {
+                    let sub_trimmed = sub.clean_text.trim();
+                    if sub_trimmed.is_empty() {
+                        continue;
+                    }
+                    if let CommandBearingWrapperUnwrap::EmptyInner {
+                        mut in_prefixes,
+                        with_exporting,
+                    } = unwrap_command_bearing_diagnostic_wrappers(sub_trimmed)
+                    {
+                        sub_pending_in.append(&mut in_prefixes);
+                        sub_pending_we |= with_exporting;
+                        continue;
+                    }
+                    let no_doc = strip_leading_doc_comments_only(sub_trimmed);
+                    let (after_in_only, mut in_only_list) =
+                        strip_leading_in_command_prefixes_with_list(no_doc);
+                    if !in_only_list.is_empty()
+                        && strip_leading_doc_comments_only(after_in_only).is_empty()
+                    {
+                        sub_pending_in.append(&mut in_only_list);
+                        continue;
+                    }
+                    let mut eff_in = combined_mutual_in.clone();
+                    eff_in.append(&mut sub_pending_in);
+                    let eff_we =
+                        combined_mutual_we || std::mem::replace(&mut sub_pending_we, false);
+                    let (sub_unwrapped, sub_wrap_in, sub_inner_we, _) =
+                        unwrap_pub_sig_cmd(sub_trimmed);
+                    let sub_after_p = strip_decl_and_in_prefixes(sub_unwrapped);
+                    if eff_in.is_empty() && sub_wrap_in.is_empty() && is_scope_ctx_cmd(sub_after_p)
+                    {
+                        let norm_ctx = normalize_whitespace(sub_unwrapped);
+                        if eff_we || sub_inner_we {
+                            active_context_vars.push(format!("#with_exporting {norm_ctx}"));
+                        } else {
+                            active_context_vars.push(norm_ctx);
+                        }
+                    }
+                    process_decl_cmd(
+                        sub.clean_text,
+                        &eff_in,
+                        eff_we,
+                        &stack,
+                        &active_context_vars,
+                        &mut declarations,
+                        &mut meta_declarations,
+                        &mut directives_hasher,
+                    );
+                    if elab_decl_ctx_entry(sub.clean_text, &eff_in, eff_we, &stack).is_none() {
+                        if let Some(entry) =
+                            post_cmd_elab_ctx_entry(sub.clean_text, &eff_in, eff_we, &stack)
+                        {
+                            active_context_vars.push(entry);
+                        }
+                    }
+                    apply_pub_scope_transition(
+                        &mut stack,
+                        &mut active_context_vars,
+                        &mut directives_hasher,
+                        sub.orig_text,
+                        sub.clean_text,
+                        &eff_in,
+                        eff_we,
+                    );
+                }
+                if !sub_pending_in.is_empty() || sub_pending_we {
+                    directives_hasher.update(b"dangling-mutual-prefix:");
+                    for p in &sub_pending_in {
+                        directives_hasher.update(p.as_bytes());
+                        directives_hasher.update(b"|");
+                    }
+                    if sub_pending_we {
+                        directives_hasher.update(b"#with_exporting|");
+                    }
+                    directives_hasher.update(b"\n");
+                }
+                stack.pop();
+                active_context_vars.push(format!("scope-close:mut{mut_in_tag}"));
+                continue;
+            }
+        }
+
+        process_decl_cmd(
+            span.clean_text,
+            &span_in_prefixes,
+            span_with_exporting,
+            &stack,
+            &active_context_vars,
+            &mut declarations,
+            &mut meta_declarations,
+            &mut directives_hasher,
+        );
+        if let Some(entry) = elab_decl_ctx_entry(
+            span.clean_text,
+            &span_in_prefixes,
+            span_with_exporting,
+            &stack,
+        ) {
+            active_context_vars.push(entry);
+        } else if let Some(entry) = post_cmd_elab_ctx_entry(
+            span.clean_text,
+            &span_in_prefixes,
+            span_with_exporting,
+            &stack,
+        ) {
+            active_context_vars.push(entry);
+        }
+        apply_pub_scope_transition(
+            &mut stack,
+            &mut active_context_vars,
+            &mut directives_hasher,
+            span.orig_text,
+            span.clean_text,
+            &span_in_prefixes,
+            span_with_exporting,
+        );
+    }
+    if pending_wrapper || !pending_in_prefixes.is_empty() || pending_with_exporting {
+        directives_hasher.update(b"dangling-eof-prefix:");
+        for p in &pending_in_prefixes {
+            directives_hasher.update(p.as_bytes());
+            directives_hasher.update(b"|");
+        }
+        if pending_with_exporting {
+            directives_hasher.update(b"#with_exporting|");
+        }
+        if pending_wrapper {
+            directives_hasher.update(b"wrapper|");
+        }
+        directives_hasher.update(b"\n");
+    }
+
+    let public_directives_hash = directives_hasher.finalize().to_hex().to_string();
+    let meta_directives_hash = meta_directives_hasher.finalize().to_hex().to_string();
+
+    let hash_sig_list = |tag: &[u8],
+                         is_mod: bool,
+                         imps: &[String],
+                         decls: &[PublicDeclSig],
+                         dir_hash: &str|
+     -> String {
+        let mut h = blake3::Hasher::new();
+        h.update(tag);
+        h.update(if is_mod { b"module:1\n" } else { b"module:0\n" });
+        for imp in imps {
+            h.update(b"imp:");
+            h.update(imp.as_bytes());
+            h.update(b"\n");
+        }
+        for d in decls {
+            h.update(b"decl:");
+            h.update(d.const_name.as_bytes());
+            h.update(b"|");
+            h.update(d.kind.as_bytes());
+            h.update(b"|");
+            h.update(d.sig_hash.as_bytes());
+            h.update(b"|red=");
+            h.update(d.reducibility.as_bytes());
+            h.update(b"|simp=");
+            for s in &d.simp_attrs {
+                h.update(s.as_bytes());
+                h.update(b",");
+            }
+            h.update(b"|inl=");
+            for inl in &d.inline_attrs {
+                h.update(inl.as_bytes());
+                h.update(b",");
+            }
+            if let Some(ref bh) = d.exposed_body_hash {
+                h.update(b"|body=");
+                h.update(bh.as_bytes());
+            }
+            h.update(b"\n");
+        }
+        h.update(b"directives:");
+        h.update(dir_hash.as_bytes());
+        h.update(b"\n");
+        h.finalize().to_hex().to_string()
+    };
+
+    let public_signature_digest = hash_sig_list(
+        b"turbo-lean-pubsig:v2\n",
+        is_module,
+        &exported_imports,
+        &declarations,
+        &public_directives_hash,
+    );
+    let mut combined_decls = declarations.clone();
+    combined_decls.extend(meta_declarations);
+    let meta_signature_digest = hash_sig_list(
+        b"turbo-lean-metasig:v2\n",
+        is_module,
+        &combined_exported_imports,
+        &combined_decls,
+        &format!("{}:{}", public_directives_hash, meta_directives_hash),
+    );
+
+    PublicSignatureSummary {
+        is_module,
+        exported_imports,
+        meta_exported_imports,
+        declarations,
+        public_directives_hash,
+        public_signature_digest,
+        meta_signature_digest,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7904,6 +11048,1586 @@ end MathlibEdgeCases
             fission_theorem_have_blocks(decl_shadow, "sig_shadow").is_empty(),
             "fission must skip cuts whose identifier shadows a binder/constant in the theorem signature"
         );
+    }
+
+    #[test]
+    fn test_speed4_extract_public_signature_module_vs_non_module_and_hygiene_modulo_sorry() {
+        let mod_v1 = "\
+module
+public import Init
+private def secretHelper (n : Nat) : Nat := n + 1
+public theorem pub_thm (n : Nat) : n + 0 = n := by
+  exact Nat.add_zero n
+public def pubFn (n : Nat) : Nat := secretHelper n
+private def trailingHelper (n : Nat) : Nat := n + 2
+";
+        let mod_v2_priv_edit = "\
+module
+public import Init
+private def secretHelper (n : Nat) : Nat := n + 1
+public theorem pub_thm (n : Nat) : n + 0 = n := by
+  omega
+public def pubFn (n : Nat) : Nat := secretHelper (n + 0)
+private def trailingHelper (n : Nat) : Nat := (n + 2) + 0
+private theorem extra_priv_lemma : 1 + 1 = 2 := rfl
+";
+        let sig1 = extract_public_signature(mod_v1);
+        let sig2 = extract_public_signature(mod_v2_priv_edit);
+        assert!(sig1.is_module && sig2.is_module);
+        assert_eq!(
+            sig1.public_signature_digest, sig2.public_signature_digest,
+            "trailing private helpers, trailing private theorems, and unexposed public def/theorem bodies must not alter public_signature_digest"
+        );
+        assert_eq!(sig1.meta_signature_digest, sig2.meta_signature_digest);
+
+        // Changing a public theorem type MUST change public_signature_digest.
+        let mod_type_changed = mod_v1.replace("n + 0 = n", "0 + n = n");
+        assert_ne!(
+            sig1.public_signature_digest,
+            extract_public_signature(&mod_type_changed).public_signature_digest
+        );
+
+        // Changing a public theorem name MUST change public_signature_digest.
+        let mod_name_changed = mod_v1.replace("pub_thm", "pub_thm_renamed");
+        assert_ne!(
+            sig1.public_signature_digest,
+            extract_public_signature(&mod_name_changed).public_signature_digest
+        );
+
+        // Adding `@[simp]` to a public theorem MUST change public_signature_digest.
+        let mod_simp_added =
+            mod_v1.replace("public theorem pub_thm", "@[simp] public theorem pub_thm");
+        assert_ne!(
+            sig1.public_signature_digest,
+            extract_public_signature(&mod_simp_added).public_signature_digest
+        );
+
+        // Changing an `@[expose] public def` body MUST change public_signature_digest.
+        let mod_exposed_v1 = "module\n@[expose] public def exposedVal : Nat := 1 + 2\n";
+        let mod_exposed_v2 = "module\n@[expose] public def exposedVal : Nat := 2 + 1\n";
+        assert_ne!(
+            extract_public_signature(mod_exposed_v1).public_signature_digest,
+            extract_public_signature(mod_exposed_v2).public_signature_digest
+        );
+
+        // Changing a `public meta def` body MUST preserve public_signature_digest while changing meta_signature_digest.
+        let mod_meta_v1 =
+            "module\npublic def keepMe : Nat := 7\npublic meta def metaHelper : Nat := 1\n";
+        let mod_meta_v2 =
+            "module\npublic def keepMe : Nat := 7\npublic meta def metaHelper : Nat := 2\n";
+        let sm1 = extract_public_signature(mod_meta_v1);
+        let sm2 = extract_public_signature(mod_meta_v2);
+        assert_eq!(sm1.public_signature_digest, sm2.public_signature_digest);
+        assert_ne!(sm1.meta_signature_digest, sm2.meta_signature_digest);
+
+        // Hygiene modulo sorry: `sorry` is permitted ONLY in modulo-sorry hygiene, whereas custom axioms and native_decide remain rejected.
+        let sorry_only = audit_hygiene("theorem t : True := by sorry\n");
+        assert!(!sorry_only.is_clean_for_certification());
+        assert!(sorry_only.is_clean_modulo_sorry());
+        assert!(sorry_only.disallowed_items_modulo_sorry().is_empty());
+
+        let sorry_and_axiom =
+            audit_hygiene("axiom my_bad_ax : False\ntheorem t : False := by sorry\n");
+        assert!(!sorry_and_axiom.is_clean_modulo_sorry());
+        assert!(!sorry_and_axiom.disallowed_items_modulo_sorry().is_empty());
+
+        // Blocking 4 regressions:
+        // 1. Inferred-type `public def` (`:=` body, equation arms, and `where` clause) MUST mark
+        //    `body_exposed = true` and alter `public_signature_digest` whenever the body changes.
+        let inferred_assign_v1 = "module\npublic def f (x : Nat) := x + 1\n";
+        let inferred_assign_v2 = "module\npublic def f (x : Nat) := true\n";
+        let ia1 = extract_public_signature(inferred_assign_v1);
+        let ia2 = extract_public_signature(inferred_assign_v2);
+        assert!(ia1.declarations[0].exposed_body_hash.is_some());
+        assert_ne!(
+            ia1.public_signature_digest, ia2.public_signature_digest,
+            "inferred-type `public def` must change public_signature_digest when body changes"
+        );
+
+        let inferred_eqns_v1 = "module\npublic def g\n  | 0 => 1\n  | n + 1 => g n\n";
+        let inferred_eqns_v2 = "module\npublic def g\n  | 0 => true\n  | n + 1 => g n\n";
+        let ie1 = extract_public_signature(inferred_eqns_v1);
+        let ie2 = extract_public_signature(inferred_eqns_v2);
+        assert!(ie1.declarations[0].exposed_body_hash.is_some());
+        assert_ne!(ie1.public_signature_digest, ie2.public_signature_digest);
+
+        let inferred_where_v1 = "module\npublic def hw (n : Nat) where\n  val := n + 1\n";
+        let inferred_where_v2 = "module\npublic def hw (n : Nat) where\n  val := n + 2\n";
+        let iw1 = extract_public_signature(inferred_where_v1);
+        let iw2 = extract_public_signature(inferred_where_v2);
+        assert!(iw1.declarations[0].exposed_body_hash.is_some());
+        assert_ne!(iw1.public_signature_digest, iw2.public_signature_digest);
+
+        // 2. Explicit-type `public def` with `where` helper or binders/strings/comments containing `:`
+        //    must keep `exposed_body_hash.is_none()` when an outer `: RetType` annotation IS present,
+        //    while colons inside strings/comments/`::`/`:=` without outer `: RetType` expose the body.
+        let explicit_where_v1 =
+            "module\npublic def ew (n : Nat) : Nat := helper n where\n  helper (k : Nat) : Nat := k + 1\n";
+        let explicit_where_v2 =
+            "module\npublic def ew (n : Nat) : Nat := helper n where\n  helper (k : Nat) : Nat := k + 2\n";
+        let ew1 = extract_public_signature(explicit_where_v1);
+        let ew2 = extract_public_signature(explicit_where_v2);
+        assert!(ew1.declarations[0].exposed_body_hash.is_none());
+        assert_eq!(ew1.public_signature_digest, ew2.public_signature_digest);
+
+        let tricky_colon_inferred_v1 =
+            "module\npublic def tc (s := \"a : b\") /- : Nat -/ := s.length + 1\n";
+        let tricky_colon_inferred_v2 =
+            "module\npublic def tc (s := \"a : b\") /- : Nat -/ := s.length + 2\n";
+        let tc1 = extract_public_signature(tricky_colon_inferred_v1);
+        let tc2 = extract_public_signature(tricky_colon_inferred_v2);
+        assert!(
+            tc1.declarations[0].exposed_body_hash.is_some(),
+            "colons inside string literals or block comments must not masquerade as an explicit return type"
+        );
+        assert_ne!(tc1.public_signature_digest, tc2.public_signature_digest);
+
+        // 3. `include` and `omit` section-variable inclusion directives MUST alter the
+        //    recorded `context` of subsequent public/meta declarations and `public_signature_digest`.
+        let inc_none = "\
+module
+variable (h : True)
+public theorem uses_ctx : True := trivial
+";
+        let inc_added = "\
+module
+variable (h : True)
+include h
+public theorem uses_ctx : True := trivial
+";
+        let inc_omitted = "\
+module
+variable (h : True)
+include h
+omit h
+public theorem uses_ctx : True := trivial
+";
+        let s_none = extract_public_signature(inc_none);
+        let s_inc = extract_public_signature(inc_added);
+        let s_omit = extract_public_signature(inc_omitted);
+        assert_ne!(
+            s_none.public_signature_digest, s_inc.public_signature_digest,
+            "adding `include h` before a public theorem must change public_signature_digest"
+        );
+        assert_ne!(
+            s_inc.public_signature_digest, s_omit.public_signature_digest,
+            "adding `omit h` before a public theorem must change public_signature_digest"
+        );
+
+        // 4. Local elaboration-affecting setup (`local notation`, `local macro`, `local elab`,
+        //    `local syntax`, `local instance`, `local abbrev`, `local def`, `attribute [local ...]`)
+        //    MUST be recorded in `active_context_vars` so editing a local directive alters the
+        //    signature digest of subsequent public/meta declarations.
+        for (label, v1_cmd, v2_cmd) in [
+            (
+                "local notation",
+                "local notation \"MYOP\" x => x + 1",
+                "local notation \"MYOP\" x => x + 2",
+            ),
+            (
+                "local macro",
+                "local macro \"mymac\" x:term : term => `($x + 1)",
+                "local macro \"mymac\" x:term : term => `($x + 2)",
+            ),
+            (
+                "local elab",
+                "local elab \"myelab\" : term => Lean.Elab.Term.elabTerm (Lean.mkNatLit 1) none",
+                "local elab \"myelab\" : term => Lean.Elab.Term.elabTerm (Lean.mkNatLit 2) none",
+            ),
+            (
+                "local syntax",
+                "local syntax \"mystx1\" : term",
+                "local syntax \"mystx2\" : term",
+            ),
+            (
+                "local instance",
+                "local instance : Inhabited Nat := ⟨0⟩",
+                "local instance : Inhabited Nat := ⟨1⟩",
+            ),
+            (
+                "local abbrev",
+                "local abbrev LocalTy := Nat",
+                "local abbrev LocalTy := Bool",
+            ),
+            (
+                "local def",
+                "local def localConst : Nat := 1",
+                "local def localConst : Nat := 2",
+            ),
+            (
+                "attribute [local ...]",
+                "attribute [local reducible] helperDef",
+                "attribute [local irreducible] helperDef",
+            ),
+            (
+                "@[local ...] on private decl",
+                "@[local simp] private theorem localSimpHelper (x : Nat) : x + 0 = x := Nat.add_zero x",
+                "@[local simp] private theorem localSimpHelper (x : Nat) : 0 + x = x := Nat.zero_add x",
+            ),
+        ] {
+            let src_v1 = format!(
+                "module\nprivate def helperDef : Nat := 0\n{v1_cmd}\npublic theorem after_local (x : Nat) : x = x := rfl\n"
+            );
+            let src_v2 = format!(
+                "module\nprivate def helperDef : Nat := 0\n{v2_cmd}\npublic theorem after_local (x : Nat) : x = x := rfl\n"
+            );
+            let d1 = extract_public_signature(&src_v1);
+            let d2 = extract_public_signature(&src_v2);
+            assert_eq!(d1.declarations.len(), 1, "{label}: declarations count");
+            assert_eq!(d2.declarations.len(), 1, "{label}: declarations count");
+            assert_ne!(
+                d1.declarations[0].sig_hash, d2.declarations[0].sig_hash,
+                "{label}: changing local elaboration context before a public declaration must alter its sig_hash"
+            );
+            assert_ne!(
+                d1.public_signature_digest, d2.public_signature_digest,
+                "{label}: changing local elaboration context before a public declaration must alter public_signature_digest"
+            );
+        }
+
+        // Trailing local setup AFTER all public declarations must NOT pollute `public_directives_hash`
+        // or `declarations` (only subsequent declarations can observe it).
+        let trailing_local_v1 = "module\npublic theorem before_local : True := trivial\nlocal notation \"AFTER\" => 1\n";
+        let trailing_local_v2 = "module\npublic theorem before_local : True := trivial\nlocal notation \"AFTER\" => 2\n";
+        assert_eq!(
+            extract_public_signature(trailing_local_v1).public_signature_digest,
+            extract_public_signature(trailing_local_v2).public_signature_digest,
+            "trailing local notation after all public declarations must not alter public_signature_digest"
+        );
+
+        for (label, imp1, imp2) in [
+            ("plain import", "import Smoke.A", "import Smoke.B"),
+            ("meta import", "meta import Smoke.A", "meta import Smoke.B"),
+            ("import all", "import all Smoke.A", "import all Smoke.B"),
+            (
+                "meta import all",
+                "meta import all Smoke.A",
+                "meta import all Smoke.B",
+            ),
+        ] {
+            let s1 = format!("module\n{imp1}\npublic def api := foo\n");
+            let s2 = format!("module\n{imp2}\npublic def api := foo\n");
+            let sig_a = extract_public_signature(&s1);
+            let sig_b = extract_public_signature(&s2);
+            assert_eq!(sig_a.declarations.len(), 1, "{label}: declarations count");
+            assert_eq!(sig_b.declarations.len(), 1, "{label}: declarations count");
+            assert_ne!(
+                sig_a.declarations[0].sig_hash, sig_b.declarations[0].sig_hash,
+                "{label}: changing non-exported import before public decl must change sig_hash"
+            );
+            assert_ne!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: changing non-exported import before public decl must change public_signature_digest"
+            );
+
+            let meta_s1 = format!("module\n{imp1}\npublic meta def metaApi := foo\n");
+            let meta_s2 = format!("module\n{imp2}\npublic meta def metaApi := foo\n");
+            let msig_a = extract_public_signature(&meta_s1);
+            let msig_b = extract_public_signature(&meta_s2);
+            assert_ne!(
+                msig_a.meta_signature_digest, msig_b.meta_signature_digest,
+                "{label}: changing non-exported import before public meta decl must change meta_signature_digest"
+            );
+        }
+
+        let no_pub_decl_imp1 = "module\nimport Smoke.A\nprivate def privOnly : Nat := 1\n";
+        let no_pub_decl_imp2 = "module\nimport Smoke.B\nprivate def privOnly : Nat := 1\n";
+        assert_eq!(
+            extract_public_signature(no_pub_decl_imp1).public_signature_digest,
+            extract_public_signature(no_pub_decl_imp2).public_signature_digest,
+            "non-exported import change with no subsequent public declarations must not alter public_signature_digest"
+        );
+
+        let trailing_imp_v1 = "module\npublic def api : Nat := 1\nimport Smoke.A\n";
+        let trailing_imp_v2 = "module\npublic def api : Nat := 1\nimport Smoke.B\n";
+        let ts1 = extract_public_signature(trailing_imp_v1);
+        let ts2 = extract_public_signature(trailing_imp_v2);
+        assert_eq!(
+            ts1.public_directives_hash, ts2.public_directives_hash,
+            "trailing non-exported import after all public decls must not pollute public_directives_hash"
+        );
+        assert_eq!(
+            ts1.public_signature_digest, ts2.public_signature_digest,
+            "trailing non-exported import after all public decls must not alter public_signature_digest"
+        );
+
+        let exp_imp_v1 = "module\npublic import Smoke.A\n";
+        let exp_imp_v2 = "module\npublic import Smoke.B\n";
+        assert_ne!(
+            extract_public_signature(exp_imp_v1).public_signature_digest,
+            extract_public_signature(exp_imp_v2).public_signature_digest,
+            "exported public import change must still alter public_signature_digest even without declarations"
+        );
+        let meta_exp_imp_v1 = "module\npublic meta import Smoke.A\n";
+        let meta_exp_imp_v2 = "module\npublic meta import Smoke.B\n";
+        let mex1 = extract_public_signature(meta_exp_imp_v1);
+        let mex2 = extract_public_signature(meta_exp_imp_v2);
+        assert_eq!(mex1.public_signature_digest, mex2.public_signature_digest);
+        assert_ne!(
+            mex1.meta_signature_digest, mex2.meta_signature_digest,
+            "exported public meta import change must alter meta_signature_digest"
+        );
+
+        let priv_helper_v1 = "module\nprivate def helper := (0 : Nat)\npublic def api := helper\n";
+        let priv_helper_v2 = "module\nprivate def helper := true\npublic def api := helper\n";
+        let ph1 = extract_public_signature(priv_helper_v1);
+        let ph2 = extract_public_signature(priv_helper_v2);
+        assert_eq!(ph1.declarations.len(), 1);
+        assert_eq!(ph2.declarations.len(), 1);
+        assert_eq!(ph1.declarations[0].const_name, "api");
+        assert_ne!(
+            ph1.declarations[0].sig_hash, ph2.declarations[0].sig_hash,
+            "private helper edit before inferred-type public def must change api sig_hash"
+        );
+        assert_ne!(
+            ph1.public_signature_digest, ph2.public_signature_digest,
+            "private helper edit before inferred-type public def must change public_signature_digest"
+        );
+
+        let priv_helper_ws =
+            "module\nprivate   def   helper  :=  (0 : Nat) -- comment\npublic def api := helper\n";
+        let ph_ws = extract_public_signature(priv_helper_ws);
+        assert_eq!(ph1.declarations[0].sig_hash, ph_ws.declarations[0].sig_hash);
+        assert_eq!(ph1.public_signature_digest, ph_ws.public_signature_digest);
+
+        for (label, s1, s2) in [
+            (
+                "private abbrev in public theorem type",
+                "module\nprivate abbrev MyProp := (1 = 1)\npublic theorem thm : MyProp := rfl\n",
+                "module\nprivate abbrev MyProp := (2 = 2)\npublic theorem thm : MyProp := rfl\n",
+            ),
+            (
+                "private def in public theorem type",
+                "module\nprivate def targetVal : Nat := 1\npublic theorem thm : targetVal = targetVal := rfl\n",
+                "module\nprivate def targetVal : Nat := 2\npublic theorem thm : targetVal = targetVal := rfl\n",
+            ),
+            (
+                "non-public-section def before public def",
+                "module\ndef helper := (0 : Nat)\npublic def api := helper\n",
+                "module\ndef helper := true\npublic def api := helper\n",
+            ),
+            (
+                "private def inside public section before public def",
+                "module\npublic section\nprivate def helper := (0 : Nat)\ndef api := helper\nend\n",
+                "module\npublic section\nprivate def helper := true\ndef api := helper\nend\n",
+            ),
+            (
+                "mutual block with trailing private sibling",
+                "module\nmutual\n  public def api := helper\n  private def helper := (0 : Nat)\nend\n",
+                "module\nmutual\n  public def api := helper\n  private def helper := true\nend\n",
+            ),
+            (
+                "non-public notation before public def",
+                "module\nnotation \"MYTY\" => Nat\npublic def api : MYTY := 0\n",
+                "module\nnotation \"MYTY\" => Bool\npublic def api : MYTY := true\n",
+            ),
+            (
+                "namespace-scoped private def rename via namespace",
+                "module\nnamespace A\nprivate def helper := (0 : Nat)\nend A\npublic def api := A.helper\n",
+                "module\nnamespace B\nprivate def helper := (0 : Nat)\nend B\npublic def api := A.helper\n",
+            ),
+        ] {
+            let a = extract_public_signature(s1);
+            let b = extract_public_signature(s2);
+            assert_eq!(a.declarations.len(), 1, "{label}: only public decl exported");
+            assert_eq!(b.declarations.len(), 1, "{label}: only public decl exported");
+            assert_ne!(
+                a.declarations[0].sig_hash, b.declarations[0].sig_hash,
+                "{label}: sig_hash must change"
+            );
+            assert_ne!(
+                a.public_signature_digest, b.public_signature_digest,
+                "{label}: public_signature_digest must change"
+            );
+        }
+
+        let priv_before_meta_v1 =
+            "module\npublic def keepPub : Nat := 1\nprivate def metaDep := (0 : Nat)\npublic meta def metaApi := metaDep\n";
+        let priv_before_meta_v2 =
+            "module\npublic def keepPub : Nat := 1\nprivate def metaDep := true\npublic meta def metaApi := metaDep\n";
+        let pbm1 = extract_public_signature(priv_before_meta_v1);
+        let pbm2 = extract_public_signature(priv_before_meta_v2);
+        assert_eq!(
+            pbm1.public_signature_digest, pbm2.public_signature_digest,
+            "private decl after last non-meta public decl must not change public_signature_digest"
+        );
+        assert_ne!(
+            pbm1.meta_signature_digest, pbm2.meta_signature_digest,
+            "private decl before public meta decl must change meta_signature_digest"
+        );
+
+        let trailing_priv_v1 =
+            "module\npublic def api : Nat := 1\nprivate def afterHelper := (0 : Nat)\n";
+        let trailing_priv_v2 =
+            "module\npublic def api : Nat := 1\nprivate def afterHelper := true\ndef alsoAfter : Bool := false\n";
+        let tp1 = extract_public_signature(trailing_priv_v1);
+        let tp2 = extract_public_signature(trailing_priv_v2);
+        assert_eq!(
+            tp1.public_directives_hash, tp2.public_directives_hash,
+            "trailing private decls after last public decl must not change public_directives_hash"
+        );
+        assert_eq!(
+            tp1.public_signature_digest, tp2.public_signature_digest,
+            "trailing private decls after last public decl must not change public_signature_digest"
+        );
+
+        let pub_order_ab = "module\npublic import Smoke.A\npublic import Smoke.B\n";
+        let pub_order_ba = "module\npublic import Smoke.B\npublic import Smoke.A\n";
+        let po_ab = extract_public_signature(pub_order_ab);
+        let po_ba = extract_public_signature(pub_order_ba);
+        assert_eq!(
+            po_ab.exported_imports,
+            vec![
+                "Init".to_string(),
+                "Smoke.A".to_string(),
+                "Smoke.B".to_string()
+            ]
+        );
+        assert_eq!(
+            po_ba.exported_imports,
+            vec![
+                "Init".to_string(),
+                "Smoke.B".to_string(),
+                "Smoke.A".to_string()
+            ]
+        );
+        assert_ne!(
+            po_ab.public_signature_digest, po_ba.public_signature_digest,
+            "swapping `public import` order must change public_signature_digest"
+        );
+        assert_ne!(
+            po_ab.meta_signature_digest, po_ba.meta_signature_digest,
+            "swapping `public import` order must change meta_signature_digest"
+        );
+
+        let pub_order_dup =
+            "module\npublic import Smoke.B\npublic import Smoke.B\npublic import Smoke.A\n";
+        let po_dup = extract_public_signature(pub_order_dup);
+        assert_eq!(po_dup.exported_imports, po_ba.exported_imports);
+        assert_eq!(
+            po_dup.public_signature_digest,
+            po_ba.public_signature_digest
+        );
+        assert_eq!(po_dup.meta_signature_digest, po_ba.meta_signature_digest);
+
+        let pub_order_ws_cmt = "-- leading comment\nmodule /- block comment -/\n\n  public   import   Smoke.A  -- line comment\n  /- comment between imports -/\n  public   import   «Smoke».«B»\n";
+        let po_ws = extract_public_signature(pub_order_ws_cmt);
+        assert_eq!(po_ws.exported_imports, po_ab.exported_imports);
+        assert_eq!(po_ws.public_signature_digest, po_ab.public_signature_digest);
+        assert_eq!(po_ws.meta_signature_digest, po_ab.meta_signature_digest);
+
+        let meta_order_ab =
+            "module\npublic meta import Smoke.A\npublic meta import Smoke.B\npublic def keep : Nat := 1\n";
+        let meta_order_ba =
+            "module\npublic meta import Smoke.B\npublic meta import Smoke.A\npublic def keep : Nat := 1\n";
+        let mo_ab = extract_public_signature(meta_order_ab);
+        let mo_ba = extract_public_signature(meta_order_ba);
+        assert_eq!(
+            mo_ab.meta_exported_imports,
+            vec![
+                "Init".to_string(),
+                "Smoke.A".to_string(),
+                "Smoke.B".to_string()
+            ]
+        );
+        assert_eq!(
+            mo_ba.meta_exported_imports,
+            vec![
+                "Init".to_string(),
+                "Smoke.B".to_string(),
+                "Smoke.A".to_string()
+            ]
+        );
+        assert_ne!(
+            mo_ab.declarations[0].sig_hash, mo_ba.declarations[0].sig_hash,
+            "swapping `public meta import` order before a public declaration must change its sig_hash"
+        );
+        assert_ne!(
+            mo_ab.public_signature_digest, mo_ba.public_signature_digest,
+            "swapping `public meta import` order before a public declaration must change public_signature_digest"
+        );
+        assert_ne!(
+            mo_ab.meta_signature_digest, mo_ba.meta_signature_digest,
+            "swapping `public meta import` order must change meta_signature_digest"
+        );
+
+        let meta_order_no_pub_ab =
+            "module\npublic meta import Smoke.A\npublic meta import Smoke.B\npublic meta def keepMeta : Nat := 1\n";
+        let meta_order_no_pub_ba =
+            "module\npublic meta import Smoke.B\npublic meta import Smoke.A\npublic meta def keepMeta : Nat := 1\n";
+        let monp_ab = extract_public_signature(meta_order_no_pub_ab);
+        let monp_ba = extract_public_signature(meta_order_no_pub_ba);
+        assert_eq!(
+            monp_ab.public_signature_digest, monp_ba.public_signature_digest,
+            "swapping `public meta import` order without non-meta public declarations or exported directives keeps public_signature_digest equal"
+        );
+        assert_ne!(
+            monp_ab.meta_signature_digest, monp_ba.meta_signature_digest,
+            "swapping `public meta import` order must change meta_signature_digest"
+        );
+
+        let meta_order_dup = "module\npublic meta import Smoke.B\npublic meta import Smoke.B\npublic meta import Smoke.A\npublic def keep : Nat := 1\n";
+        let mo_dup = extract_public_signature(meta_order_dup);
+        assert_eq!(mo_dup.meta_exported_imports, mo_ba.meta_exported_imports);
+        assert_eq!(
+            mo_dup.public_signature_digest,
+            mo_ba.public_signature_digest
+        );
+        assert_eq!(mo_dup.meta_signature_digest, mo_ba.meta_signature_digest);
+
+        let meta_order_ws_cmt = "module\n  /- c1 -/ public  meta  import  Smoke.A -- c2\n\n  public   meta   import   Smoke.B\npublic def keep : Nat := 1\n";
+        let mo_ws = extract_public_signature(meta_order_ws_cmt);
+        assert_eq!(mo_ws.meta_exported_imports, mo_ab.meta_exported_imports);
+        assert_eq!(mo_ws.public_signature_digest, mo_ab.public_signature_digest);
+        assert_eq!(mo_ws.meta_signature_digest, mo_ab.meta_signature_digest);
+
+        let pub_meta_provider_v1 =
+            "module\npublic meta import Smoke.MacroNat\npublic def api := makeVal\n";
+        let pub_meta_provider_v2 =
+            "module\npublic meta import Smoke.MacroBool\npublic def api := makeVal\n";
+        let pmp1 = extract_public_signature(pub_meta_provider_v1);
+        let pmp2 = extract_public_signature(pub_meta_provider_v2);
+        assert_ne!(
+            pmp1.declarations[0].sig_hash, pmp2.declarations[0].sig_hash,
+            "switching `public meta import` provider before `public def api := makeVal` must change sig_hash"
+        );
+        assert_ne!(
+            pmp1.public_signature_digest, pmp2.public_signature_digest,
+            "switching `public meta import` provider before `public def api := makeVal` must change public_signature_digest"
+        );
+
+        let pub_meta_dir_v1 =
+            "module\npublic meta import Smoke.MacroNat\nnotation \"PUB_OP\" => makeVal\n";
+        let pub_meta_dir_v2 =
+            "module\npublic meta import Smoke.MacroBool\nnotation \"PUB_OP\" => makeVal\n";
+        let pmd1 = extract_public_signature(pub_meta_dir_v1);
+        let pmd2 = extract_public_signature(pub_meta_dir_v2);
+        assert_ne!(pmd1.public_directives_hash, pmd2.public_directives_hash);
+        assert_ne!(pmd1.public_signature_digest, pmd2.public_signature_digest);
+
+        let pub_meta_import_all_v1 =
+            "module\npublic meta import all Smoke.MacroNat\npublic def api := makeVal\n";
+        let pub_meta_import_all_v2 =
+            "module\npublic meta import all Smoke.MacroBool\npublic def api := makeVal\n";
+        let pmia1 = extract_public_signature(pub_meta_import_all_v1);
+        let pmia2 = extract_public_signature(pub_meta_import_all_v2);
+        assert!(!pmia1.is_module && !pmia2.is_module);
+        assert!(pmia1.public_signature_digest.starts_with("pubsig-invalid:"));
+        assert!(pmia2.public_signature_digest.starts_with("pubsig-invalid:"));
+        assert_ne!(pmia1.public_signature_digest, pmia2.public_signature_digest);
+        assert_ne!(pmia1.public_signature_digest, pmp1.public_signature_digest);
+
+        let mid_file_pub_meta_all_v1 =
+            "module\nprivate def pre : Nat := 0\npublic meta import all Smoke.MacroNat\npublic def api := makeVal\n";
+        let mid_file_pub_meta_all_v2 =
+            "module\nprivate def pre : Nat := 0\npublic meta import all Smoke.MacroBool\npublic def api := makeVal\n";
+        let mfpma1 = extract_public_signature(mid_file_pub_meta_all_v1);
+        let mfpma2 = extract_public_signature(mid_file_pub_meta_all_v2);
+        assert_ne!(
+            mfpma1.declarations[0].sig_hash,
+            mfpma2.declarations[0].sig_hash
+        );
+        assert_ne!(
+            mfpma1.public_signature_digest,
+            mfpma2.public_signature_digest
+        );
+
+        let mixed_order_v1 = "module\npublic import Smoke.A\npublic meta import Smoke.B\n";
+        let mixed_order_v2 = "module\npublic meta import Smoke.B\npublic import Smoke.A\n";
+        let mx1 = extract_public_signature(mixed_order_v1);
+        let mx2 = extract_public_signature(mixed_order_v2);
+        assert_eq!(mx1.public_signature_digest, mx2.public_signature_digest);
+        assert_ne!(
+            mx1.meta_signature_digest, mx2.meta_signature_digest,
+            "swapping `public import` and `public meta import` must change meta_signature_digest"
+        );
+
+        let mixed_priv_imp_v1 =
+            "module\npublic import Smoke.A\nimport Smoke.B\npublic def api := foo\n";
+        let mixed_priv_imp_v2 =
+            "module\nimport Smoke.B\npublic import Smoke.A\npublic def api := foo\n";
+        assert_ne!(
+            extract_public_signature(mixed_priv_imp_v1).public_signature_digest,
+            extract_public_signature(mixed_priv_imp_v2).public_signature_digest,
+            "swapping `public import` and non-exported `import` before an inferred-type public def must change public_signature_digest"
+        );
+
+        for (label, s1, s2) in [
+            (
+                "trailing non-local attribute [instance 100] -> 200 outside public section",
+                "module\nnamespace SmokeA\npublic class MyTag (α : Type) where\n  tag : Nat\n@[expose, instance_reducible] public def mkTag100 : MyTag Nat := { tag := 1 }\nattribute [instance 100] mkTag100\nend SmokeA\n",
+                "module\nnamespace SmokeA\npublic class MyTag (α : Type) where\n  tag : Nat\n@[expose, instance_reducible] public def mkTag100 : MyTag Nat := { tag := 1 }\nattribute [instance 200] mkTag100\nend SmokeA\n",
+            ),
+            (
+                "trailing attribute [simp] target swap outside public section",
+                "module\n@[expose] public def f (x : Nat) : Nat := x + 1\npublic theorem f_eq1 (x : Nat) : f x = x + 1 := rfl\npublic theorem f_eq2 (x : Nat) : f x = 1 + x := Nat.add_comm x 1\nattribute [simp] f_eq1\n",
+                "module\n@[expose] public def f (x : Nat) : Nat := x + 1\npublic theorem f_eq1 (x : Nat) : f x = x + 1 := rfl\npublic theorem f_eq2 (x : Nat) : f x = 1 + x := Nat.add_comm x 1\nattribute [simp] f_eq2\n",
+            ),
+            (
+                "trailing mixed local + non-local attribute command",
+                "module\npublic class C (α : Type) where v : Nat\n@[expose, instance_reducible] public def c1 : C Nat := ⟨1⟩\nattribute [local instance 50, instance 100] c1\n",
+                "module\npublic class C (α : Type) where v : Nat\n@[expose, instance_reducible] public def c1 : C Nat := ⟨1⟩\nattribute [local instance 50, instance 200] c1\n",
+            ),
+            (
+                "trailing attribute with bracket inside string argument",
+                "module\npublic def oldFn : Nat := 1\npublic def newFn : Nat := 1\nattribute [deprecated newFn \"use [newFn] v1\" (since := \"2026-01-01\")] oldFn\n",
+                "module\npublic def oldFn : Nat := 1\npublic def newFn : Nat := 1\nattribute [deprecated newFn \"use [newFn] v2\" (since := \"2026-01-01\")] oldFn\n",
+            ),
+            (
+                "open scope change before trailing non-local attribute",
+                "module\nnamespace Foo\npublic class C (α : Type) where v : Nat\n@[expose, instance_reducible] public def mkTag : C Nat := ⟨10⟩\nend Foo\nnamespace Bar\n@[expose, instance_reducible] public def mkTag : Foo.C Nat := ⟨20⟩\nend Bar\nsection\nopen Foo\nattribute [instance 100] mkTag\nend\n",
+                "module\nnamespace Foo\npublic class C (α : Type) where v : Nat\n@[expose, instance_reducible] public def mkTag : C Nat := ⟨10⟩\nend Foo\nnamespace Bar\n@[expose, instance_reducible] public def mkTag : Foo.C Nat := ⟨20⟩\nend Bar\nsection\nopen Bar\nattribute [instance 100] mkTag\nend\n",
+            ),
+            (
+                "open ... in prefix on trailing non-local attribute",
+                "module\nnamespace Foo\npublic class C (α : Type) where v : Nat\n@[expose, instance_reducible] public def mkTag : C Nat := ⟨10⟩\nend Foo\nnamespace Bar\n@[expose, instance_reducible] public def mkTag : Foo.C Nat := ⟨20⟩\nend Bar\nopen Foo in\nattribute [instance 100] mkTag\n",
+                "module\nnamespace Foo\npublic class C (α : Type) where v : Nat\n@[expose, instance_reducible] public def mkTag : C Nat := ⟨10⟩\nend Foo\nnamespace Bar\n@[expose, instance_reducible] public def mkTag : Foo.C Nat := ⟨20⟩\nend Bar\nopen Bar in\nattribute [instance 100] mkTag\n",
+            ),
+            (
+                "trailing non-local notation outside public section",
+                "module\npublic def api : Nat := 1\nnotation \"TRAIL_OP\" => 10\n",
+                "module\npublic def api : Nat := 1\nnotation \"TRAIL_OP\" => 20\n",
+            ),
+            (
+                "trailing scoped notation outside public section",
+                "module\nnamespace SmokeA\npublic def api : Nat := 1\nscoped notation \"SCOPED_OP\" => 10\nend SmokeA\n",
+                "module\nnamespace SmokeA\npublic def api : Nat := 1\nscoped notation \"SCOPED_OP\" => 20\nend SmokeA\n",
+            ),
+            (
+                "trailing macro and syntax outside public section",
+                "module\nsyntax \"my_tok\" : term\nmacro_rules | `(my_tok) => `(1)\n",
+                "module\nsyntax \"my_tok\" : term\nmacro_rules | `(my_tok) => `(2)\n",
+            ),
+            (
+                "trailing export outside public section",
+                "module\nnamespace SmokeA\npublic def a : Nat := 1\npublic def b : Nat := 2\nend SmokeA\nexport SmokeA (a)\n",
+                "module\nnamespace SmokeA\npublic def a : Nat := 1\npublic def b : Nat := 2\nend SmokeA\nexport SmokeA (b)\n",
+            ),
+            (
+                "trailing deriving instance outside public section",
+                "module\npublic structure S where x : Nat\nderiving instance Repr for S\n",
+                "module\npublic structure S where x : Nat\nderiving instance DecidableEq for S\n",
+            ),
+            (
+                "non-local directive inside meta section affects non-meta importers",
+                "module\npublic class C (α : Type) where v : Nat\n@[expose, instance_reducible] public def c1 : C Nat := ⟨1⟩\nmeta section\nattribute [instance 100] c1\nend\n",
+                "module\npublic class C (α : Type) where v : Nat\n@[expose, instance_reducible] public def c1 : C Nat := ⟨1⟩\nmeta section\nattribute [instance 200] c1\nend\n",
+            ),
+            (
+                "public meta initialize affects public import + meta import consumers",
+                "module\npublic meta import Lean\npublic def x : Nat := 1\npublic meta initialize myExt : IO.Ref Nat ← IO.mkRef 42\n",
+                "module\npublic meta import Lean\npublic def x : Nat := 1\npublic meta initialize myExt : IO.Ref Nat ← IO.mkRef 99\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert_ne!(
+                sig_a.public_directives_hash, sig_b.public_directives_hash,
+                "{label}: public_directives_hash must change"
+            );
+            assert_ne!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: public_signature_digest must change"
+            );
+            assert_ne!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: meta_signature_digest must change"
+            );
+        }
+
+        for (label, s1, s2) in [
+            (
+                "trailing all-local attribute [local instance ...] outside public section",
+                "module\npublic class C (α : Type) where v : Nat\n@[expose, instance_reducible] public def c1 : C Nat := ⟨1⟩\nattribute [local instance 100] c1\n",
+                "module\npublic class C (α : Type) where v : Nat\n@[expose, instance_reducible] public def c1 : C Nat := ⟨1⟩\nattribute [local instance 200] c1\n",
+            ),
+            (
+                "trailing example and #check inside and outside public section",
+                "module\npublic section\ndef api : Nat := 1\nexample : 1 = 1 := rfl\n#check Nat.add\nset_option maxHeartbeats 200000\nend\n",
+                "module\npublic section\ndef api : Nat := 1\nexample : 2 = 2 := rfl\n#check Nat.mul\nset_option maxHeartbeats 300000\nend\n",
+            ),
+            (
+                "trailing non-public initialize outside public section",
+                "module\npublic def api : Nat := 1\ninitialize privRef : IO.Ref Nat ← IO.mkRef 1\n",
+                "module\npublic def api : Nat := 1\ninitialize privRef : IO.Ref Nat ← IO.mkRef 2\n",
+            ),
+            (
+                "trailing non-public syntax abbrev and class abbrev outside public section",
+                "module\npublic class C1 (α : Type)\npublic class C2 (α : Type)\nsyntax privStx := \"tok1\"\nclass abbrev PrivCA (α : Type) := C1 α, C2 α\n",
+                "module\npublic class C1 (α : Type)\npublic class C2 (α : Type)\nsyntax privStx := \"tok2\"\nclass abbrev PrivCA (α : Type) := C1 α\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert_eq!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: non-exported trailing command must not alter public_signature_digest"
+            );
+            assert_eq!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: non-exported trailing command must not alter meta_signature_digest"
+            );
+        }
+
+        for (label, s1, s2) in [
+            (
+                "public meta def controlling macro before public def",
+                "module\npublic meta def useNat : Bool := true\nmacro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+                "module\npublic meta def useNat : Bool := false\nmacro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+            ),
+            (
+                "public meta def controlling local macro before public def",
+                "module\npublic meta def useNat : Bool := true\nlocal macro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+                "module\npublic meta def useNat : Bool := false\nlocal macro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+            ),
+            (
+                "public meta section def controlling local macro before public def",
+                "module\npublic meta section\ndef useNat : Bool := true\nend\nlocal macro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+                "module\npublic meta section\ndef useNat : Bool := false\nend\nlocal macro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+            ),
+            (
+                "mutual public meta def controlling macro before public def",
+                "module\nmutual\n  public meta def useNat : Bool := helper\n  public meta def helper : Bool := true\nend\nlocal macro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+                "module\nmutual\n  public meta def useNat : Bool := helper\n  public meta def helper : Bool := false\nend\nlocal macro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+            ),
+            (
+                "#time wrapped public meta def controlling local macro before public def",
+                "module\n#time public meta def useNat : Bool := true\nlocal macro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+                "module\n#time public meta def useNat : Bool := false\nlocal macro \"makeVal\" : term => if useNat then `(0) else `(true)\npublic def api := makeVal\n",
+            ),
+            (
+                "public meta def controlling command macro emitting exported attribute",
+                "module\npublic class Tag (α : Type) where val : Nat\n@[expose, instance_reducible] public def inst1 : Tag Nat := ⟨1⟩\n@[expose, instance_reducible] public def inst2 : Tag Nat := ⟨2⟩\npublic meta def pickFirst : Bool := true\nlocal macro \"applyChosenInst\" : command => if pickFirst then `(attribute [instance 200] inst1) else `(attribute [instance 200] inst2)\napplyChosenInst\n",
+                "module\npublic class Tag (α : Type) where val : Nat\n@[expose, instance_reducible] public def inst1 : Tag Nat := ⟨1⟩\n@[expose, instance_reducible] public def inst2 : Tag Nat := ⟨2⟩\npublic meta def pickFirst : Bool := false\nlocal macro \"applyChosenInst\" : command => if pickFirst then `(attribute [instance 200] inst1) else `(attribute [instance 200] inst2)\napplyChosenInst\n",
+            ),
+            (
+                "public syntax category abbrev before local macro and public def",
+                "module\npublic syntax myStx := \"tok1\"\nlocal macro \"useStx\" myStx : term => `(0)\npublic def api := useStx tok1\n",
+                "module\npublic syntax myStx := \"tok2\"\nlocal macro \"useStx\" myStx : term => `(0)\npublic def api := useStx tok2\n",
+            ),
+            (
+                "public class abbrev before public def",
+                "module\npublic class C1 (α : Type) where a : Nat\npublic class C2 (α : Type) where b : Nat\npublic class abbrev CA (α : Type) := C1 α, C2 α\npublic def f [CA α] : Nat := 0\n",
+                "module\npublic class C1 (α : Type) where a : Nat\npublic class C2 (α : Type) where b : Nat\npublic class abbrev CA (α : Type) := C1 α\npublic def f [CA α] : Nat := 0\n",
+            ),
+            (
+                "public meta initialize before public theorem referencing ref",
+                "module\npublic meta initialize myRef : IO.Ref Nat ← IO.mkRef 1\npublic theorem t : myRef = myRef := rfl\n",
+                "module\npublic meta initialize myRef : IO.Ref Bool ← IO.mkRef true\npublic theorem t : myRef = myRef := rfl\n",
+            ),
+            (
+                "imported command macro invocation generating public def",
+                "module\nimport MacroProvider\npublic def keep : Nat := 1\ngenPub generatedApi\n",
+                "module\nimport MacroProvider\npublic def keep : Nat := 1\n",
+            ),
+            (
+                "multiline string containing col-0 text does not trigger false custom-command fallback",
+                "module\npublic def s : String := \"\nnot_a_cmd\n\"\npublic def api : Nat := 1\n",
+                "module\npublic def s : String := \"\nnot_a_cmd\n\"\npublic def api : Bool := true\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert_ne!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: preceding elaboration context change must alter public_signature_digest"
+            );
+            assert_ne!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: preceding elaboration context change must alter meta_signature_digest"
+            );
+        }
+
+        let mutual_meta_v1 =
+            "module\npublic def keep : Nat := 1\nmutual\n  public meta def a := b\n  public meta def b := (0 : Nat)\nend\n";
+        let mutual_meta_v2 =
+            "module\npublic def keep : Nat := 1\nmutual\n  public meta def a := b\n  public meta def b := true\nend\n";
+        let mm1 = extract_public_signature(mutual_meta_v1);
+        let mm2 = extract_public_signature(mutual_meta_v2);
+        assert_eq!(
+            mm1.public_signature_digest, mm2.public_signature_digest,
+            "trailing mutual public meta def edit after all non-meta public decls preserves public_signature_digest"
+        );
+        assert_ne!(
+            mm1.meta_signature_digest, mm2.meta_signature_digest,
+            "mutual public meta sibling edit must alter meta_signature_digest"
+        );
+    }
+
+    #[test]
+    fn test_speed4_extract_public_signature_command_bearing_and_non_pure_diagnostics() {
+        // 1. Single-line and multiline (indented & unindented) command-bearing wrappers on public decls.
+        for (label, s1, s2) in [
+            (
+                "#time single-line public def type change",
+                "module\n#time public def api : Nat := 1\n",
+                "module\n#time public def api : Bool := true\n",
+            ),
+            (
+                "#time unindented multiline public def type change",
+                "module\n#time\npublic def api : Nat := 1\n",
+                "module\n#time\npublic def api : Bool := true\n",
+            ),
+            (
+                "#time indented multiline public def type change",
+                "module\n#time\n  public def api : Nat := 1\n",
+                "module\n#time\n  public def api : Bool := true\n",
+            ),
+            (
+                "#time @[expose] public def body change",
+                "module\n#time @[expose] public def api : Nat := 1\n",
+                "module\n#time @[expose] public def api : Nat := 2\n",
+            ),
+            (
+                "#guard_msgs in public def type change",
+                "module\n/-- warning: unused -/\n#guard_msgs in\npublic def api : Nat := 1\n",
+                "module\n/-- warning: unused -/\n#guard_msgs in\npublic def api : Bool := true\n",
+            ),
+            (
+                "#guard_msgs(warning) in (no space before paren) public def type change",
+                "module\n#guard_msgs(warning) in public def api : Nat := 1\n",
+                "module\n#guard_msgs(warning) in public def api : Bool := true\n",
+            ),
+            (
+                "#guard_msgs multiline spec in public def type change",
+                "module\n#guard_msgs (\n  drop info\n) in\npublic def api : Nat := 1\n",
+                "module\n#guard_msgs (\n  drop info\n) in\npublic def api : Bool := true\n",
+            ),
+            (
+                "#guard_panic in public def type change",
+                "module\n#guard_panic in public def api : Nat := 1\n",
+                "module\n#guard_panic in public def api : Bool := true\n",
+            ),
+            (
+                "#info_trees in public def type change",
+                "module\n/-- info -/\n#info_trees in\npublic def api : Nat := 1\n",
+                "module\n/-- info -/\n#info_trees in\npublic def api : Bool := true\n",
+            ),
+            (
+                "#with_exporting public def body change",
+                "module\n#with_exporting public def api : Nat := 1\n",
+                "module\n#with_exporting public def api : Nat := 2\n",
+            ),
+            (
+                "nested #time + #guard_msgs + #info_trees on public def",
+                "module\n#time #guard_msgs (drop info) in #info_trees in public def api : Nat := 1\n",
+                "module\n#time #guard_msgs (drop info) in #info_trees in public def api : Bool := true\n",
+            ),
+            (
+                "nested multiline #time + #guard_msgs on public def",
+                "module\n#time\n#guard_msgs (drop info) in\npublic def api : Nat := 1\n",
+                "module\n#time\n#guard_msgs (drop info) in\npublic def api : Bool := true\n",
+            ),
+            (
+                "#time inside public section without explicit public modifier",
+                "module\npublic section\n#time def api : Nat := 1\nend\n",
+                "module\npublic section\n#time def api : Bool := true\nend\n",
+            ),
+            (
+                "open ... in #time public def changes name resolution",
+                "module\nnamespace Foo\npublic def x : Nat := 1\nend Foo\nnamespace Bar\npublic def x : Bool := true\nend Bar\nopen Foo in #time public def api := x\n",
+                "module\nnamespace Foo\npublic def x : Nat := 1\nend Foo\nnamespace Bar\npublic def x : Bool := true\nend Bar\nopen Bar in #time public def api := x\n",
+            ),
+            (
+                "multiline open ... in before #time public def changes name resolution",
+                "module\nnamespace Foo\npublic def x : Nat := 1\nend Foo\nnamespace Bar\npublic def x : Bool := true\nend Bar\nopen Foo in\n#time\npublic def api := x\n",
+                "module\nnamespace Foo\npublic def x : Nat := 1\nend Foo\nnamespace Bar\npublic def x : Bool := true\nend Bar\nopen Bar in\n#time\npublic def api := x\n",
+            ),
+            (
+                "set_option autoImplicit in #time public def changes implicit binder elaboration",
+                "module\nset_option autoImplicit true in #time public def api (x : α) : α := x\n",
+                "module\nset_option autoImplicit false in #time public def api (x : α) : α := x\n",
+            ),
+            (
+                "set_option with quoted string value containing spaces in #time public def",
+                "module\nset_option linter.opt \"val one\" in #time public def api := 1\n",
+                "module\nset_option linter.opt \"val two\" in #time public def api := 1\n",
+            ),
+            (
+                "variable ... in #time public def changes implicit binder elaboration",
+                "module\nvariable (n : Nat) in #time public def api : Nat := n\n",
+                "module\nvariable (n : Bool) in #time public def api : Bool := n\n",
+            ),
+            (
+                "#time private helper before inferred-type public def",
+                "module\n#time private def helper := (0 : Nat)\npublic def api := helper\n",
+                "module\n#time private def helper := true\npublic def api := helper\n",
+            ),
+            (
+                "#guard_msgs in private helper before inferred-type public def",
+                "module\n#guard_msgs in\nprivate def helper := (0 : Nat)\npublic def api := helper\n",
+                "module\n#guard_msgs in\nprivate def helper := true\npublic def api := helper\n",
+            ),
+            (
+                "#time mutual ... end block with public def",
+                "module\n#time mutual\n  public def api : Nat := 1\nend\n",
+                "module\n#time mutual\n  public def api : Bool := true\nend\n",
+            ),
+            (
+                "#time scope commands (public section / namespace / end)",
+                "module\n#time namespace Foo\n#time public section\ndef api : Nat := 1\n#time end\n#time end Foo\n",
+                "module\n#time namespace Bar\n#time public section\ndef api : Nat := 1\n#time end\n#time end Bar\n",
+            ),
+            (
+                "#time wrapping exported attribute directive",
+                "module\npublic class C (α : Type) where v : Nat\n@[expose, instance_reducible] public def c1 : C Nat := ⟨1⟩\n#time attribute [instance 100] c1\n",
+                "module\npublic class C (α : Type) where v : Nat\n@[expose, instance_reducible] public def c1 : C Nat := ⟨1⟩\n#time attribute [instance 200] c1\n",
+            ),
+            (
+                "#guard_msgs in wrapping exported notation directive",
+                "module\npublic def api : Nat := 1\n#guard_msgs in notation \"MY_OP\" => 10\n",
+                "module\npublic def api : Nat := 1\n#guard_msgs in notation \"MY_OP\" => 20\n",
+            ),
+            (
+                "#eval command mutating environment via CommandElabM",
+                "module\npublic def api : Nat := 1\n#eval (pure 1 : IO Nat)\n",
+                "module\npublic def api : Nat := 1\n#eval (pure 2 : IO Nat)\n",
+            ),
+            (
+                "#eval! command mutating environment via CommandElabM",
+                "module\npublic def api : Nat := 1\n#eval! (pure 1 : IO Nat)\n",
+                "module\npublic def api : Nat := 1\n#eval! (pure 2 : IO Nat)\n",
+            ),
+            (
+                "assert_not_exists persists into assertExistsExt",
+                "module\npublic def api : Nat := 1\nassert_not_exists Foo.bar\n",
+                "module\npublic def api : Nat := 1\nassert_not_exists Foo.baz\n",
+            ),
+            (
+                "assert_not_imported persists into assertExistsExt",
+                "module\npublic def api : Nat := 1\nassert_not_imported Smoke.ForbiddenA\n",
+                "module\npublic def api : Nat := 1\nassert_not_imported Smoke.ForbiddenB\n",
+            ),
+            (
+                "adding or removing #exit truncates elaborated declarations",
+                "module\npublic def a : Nat := 1\npublic def b : Nat := 2\n",
+                "module\npublic def a : Nat := 1\n#exit\npublic def b : Nat := 2\n",
+            ),
+            (
+                "moving #exit across explicit-type public declarations changes exported prefix",
+                "module\npublic def a : Nat := 1\n#exit\npublic def b : Nat := 2\n",
+                "module\n#exit\npublic def a : Nat := 1\npublic def b : Nat := 2\n",
+            ),
+            (
+                "dangling #time at EOF fails closed",
+                "module\npublic def a : Nat := 1\n",
+                "module\npublic def a : Nat := 1\n#time\n",
+            ),
+            (
+                "#guard_msgs multiline spec mutual ... end block with public def",
+                "module\n#guard_msgs (\n  drop info\n) in mutual\n  public def api : Nat := 1\nend\n",
+                "module\n#guard_msgs (\n  drop info\n) in mutual\n  public def api : Bool := true\nend\n",
+            ),
+            (
+                "#with_exporting variable scope command recorded in active context",
+                "module\nvariable (x : Nat)\npublic def a := x\n",
+                "module\n#with_exporting variable (x : Nat)\npublic def a := x\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert_ne!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: public_signature_digest must change"
+            );
+            assert_ne!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: meta_signature_digest must change"
+            );
+        }
+
+        // 2. `public meta def` under `#time` / `#guard_msgs in` updates `meta_signature_digest` while keeping `public_signature_digest` stable.
+        for (label, s1, s2) in [
+            (
+                "#time public meta def change",
+                "module\npublic def keep : Nat := 1\n#time public meta def m : Nat := 1\n",
+                "module\npublic def keep : Nat := 1\n#time public meta def m : Nat := 2\n",
+            ),
+            (
+                "#guard_msgs in public meta def change",
+                "module\npublic def keep : Nat := 1\n#guard_msgs in\npublic meta def m : Nat := 1\n",
+                "module\npublic def keep : Nat := 1\n#guard_msgs in\npublic meta def m : Nat := 2\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert_eq!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: non-meta public_signature_digest stays unchanged"
+            );
+            assert_ne!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: meta_signature_digest must change"
+            );
+        }
+
+        // 3. Proof irrelevance and unexposed public def bodies still cut off under `#time` / `#guard_msgs`,
+        //    and wrappers around genuinely pure diagnostics (`#time #check`, `#guard_msgs in example`) still cut off!
+        for (label, s1, s2) in [
+            (
+                "#time public theorem proof-only edit",
+                "module\n#time public theorem t (n : Nat) : n + 0 = n := by exact Nat.add_zero n\n",
+                "module\n#time public theorem t (n : Nat) : n + 0 = n := Nat.add_zero n\n",
+            ),
+            (
+                "#time unexposed public def body-only edit",
+                "module\n#time public def f (n : Nat) : Nat := n + 1\n",
+                "module\n#time public def f (n : Nat) : Nat := 1 + n\n",
+            ),
+            (
+                "#time wrapping pure #check and example",
+                "module\npublic def api : Nat := 1\n#time #check Nat.add\n#guard_msgs in\nexample : 1 = 1 := rfl\n#info_trees in #reduce 1 + 1\n",
+                "module\npublic def api : Nat := 1\n#time #check Nat.mul\n#guard_msgs in\nexample : 2 = 2 := rfl\n#info_trees in #reduce 2 + 2\n",
+            ),
+            (
+                "open ... in after wrapper on pure #check",
+                "module\npublic def api : Nat := 1\n#time open Nat in #check succ\n",
+                "module\npublic def api : Nat := 1\n#time open Nat in #check pred\n",
+            ),
+            (
+                "trailing #time private def after all public decls",
+                "module\npublic def api : Nat := 1\n#time private def privHelper : Nat := 10\n",
+                "module\npublic def api : Nat := 1\n#time private def privHelper : Bool := true\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert_eq!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: pure diagnostic or private/body-only edit under wrapper must preserve public_signature_digest"
+            );
+            assert_eq!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: pure diagnostic or private/body-only edit under wrapper must preserve meta_signature_digest"
+            );
+        }
+    }
+
+    #[test]
+    fn test_speed4_extract_public_signature_scope_boundary_soundness() {
+        for (label, s1, s2) in [
+            (
+                "moving end before vs after public def with section variable",
+                "module\nsection\nvariable (x : Nat)\npublic def f : Nat := 1\nend\n",
+                "module\nsection\nvariable (x : Nat)\nend\npublic def f : Nat := 1\n",
+            ),
+            (
+                "moving end before vs after public theorem with section universe",
+                "module\nsection\nuniverse u\npublic theorem t : Sort u → True := fun _ => trivial\nend\n",
+                "module\nsection\nuniverse u\nend\npublic theorem t : Sort u → True := fun _ => trivial\n",
+            ),
+            (
+                "moving end before vs after public def with section open",
+                "module\nnamespace Foo\npublic def x : Nat := 1\nend Foo\npublic def x : Bool := true\nsection\nopen Foo\npublic def f := x\nend\n",
+                "module\nnamespace Foo\npublic def x : Nat := 1\nend Foo\npublic def x : Bool := true\nsection\nopen Foo\nend\npublic def f := x\n",
+            ),
+            (
+                "moving end before vs after public def with section set_option autoImplicit",
+                "module\nsection\nset_option autoImplicit false\npublic def f (x : Nat) : Nat := x\nend\n",
+                "module\nsection\nset_option autoImplicit false\nend\npublic def f (x : Nat) : Nat := x\n",
+            ),
+            (
+                "moving end before vs after public def with section include",
+                "module\nvariable (h : True)\nsection\ninclude h\npublic theorem f : True := trivial\nend\n",
+                "module\nvariable (h : True)\nsection\ninclude h\nend\npublic theorem f : True := trivial\n",
+            ),
+            (
+                "moving end before vs after public def with section omit",
+                "module\nvariable (h : True)\ninclude h\nsection\nomit h\npublic theorem f : True := trivial\nend\n",
+                "module\nvariable (h : True)\ninclude h\nsection\nomit h\nend\npublic theorem f : True := trivial\n",
+            ),
+            (
+                "moving end before vs after public def with section local notation",
+                "module\nsection\nlocal notation \"MY_C\" => (1 : Nat)\npublic def f := MY_C\nend\n",
+                "module\nsection\nlocal notation \"MY_C\" => (1 : Nat)\nend\npublic def f := 1\n",
+            ),
+            (
+                "moving end before vs after public def with section local instance",
+                "module\npublic class Tag where v : Nat\nsection\nlocal instance : Tag := ⟨10⟩\n@[expose] public def f : Nat := Tag.v\nend\n",
+                "module\npublic class Tag where v : Nat\nsection\nlocal instance : Tag := ⟨10⟩\nend\n@[expose] public def f : Nat := Tag.v\n",
+            ),
+            (
+                "moving end before vs after public theorem with section attribute [local simp]",
+                "module\npublic def g (x : Nat) : Nat := x\npublic theorem g_eq (x : Nat) : g x = x := rfl\nsection\nattribute [local simp] g_eq\npublic def f (x : Nat) : Nat := g x\nend\n",
+                "module\npublic def g (x : Nat) : Nat := x\npublic theorem g_eq (x : Nat) : g x = x := rfl\nsection\nattribute [local simp] g_eq\nend\npublic def f (x : Nat) : Nat := g x\n",
+            ),
+            (
+                "moving section opener above vs below variable",
+                "module\nvariable (x : Nat)\nsection\nend\npublic def f : Nat := 1\n",
+                "module\nsection\nvariable (x : Nat)\nend\npublic def f : Nat := 1\n",
+            ),
+            (
+                "named section S ... end S boundary shift",
+                "module\nsection S\nvariable (x : Nat)\npublic def f : Nat := 1\nend S\n",
+                "module\nsection S\nvariable (x : Nat)\nend S\npublic def f : Nat := 1\n",
+            ),
+            (
+                "multi-segment section A.B partial close end B vs full close end A.B",
+                "module\nsection A\nvariable (a : Nat)\nsection B\nvariable (b : Bool)\nend B\npublic def f : Nat := 1\nend A\n",
+                "module\nsection A.B\nvariable (a : Nat)\nvariable (b : Bool)\nend A.B\npublic def f : Nat := 1\n",
+            ),
+            (
+                "multi-segment namespace A.B partial close end B keeps A open vs end A.B",
+                "module\nnamespace A.B\nvariable (x : Nat)\nend B\npublic def f : Nat := 1\nend A\n",
+                "module\nnamespace A.B\nvariable (x : Nat)\nend A.B\npublic def A.f : Nat := 1\n",
+            ),
+            (
+                "re-entering namespace Foo vs qualified _root_.Foo.f for scoped lookup",
+                "module\nnamespace Foo\nprivate def y : Nat := 42\nend Foo\nnamespace Foo\npublic def f := y\nend Foo\n",
+                "module\nnamespace Foo\nprivate def y : Nat := 42\nend Foo\npublic def Foo.f := y\n",
+            ),
+            (
+                "noncomputable section boundary shift",
+                "module\nnoncomputable section\npublic def f : Nat := 1\nend\n",
+                "module\nnoncomputable section\nend\npublic def f : Nat := 1\n",
+            ),
+            (
+                "multiline modifiers on section header (public\\nsection and @[expose]\\npublic\\nsection)",
+                "module\n@[expose]\npublic\nsection\nvariable (x : Nat)\ndef f : Nat := 1\nend\n",
+                "module\n@[expose]\npublic\nsection\nvariable (x : Nat)\nend\n@[expose] public def f : Nat := 1\n",
+            ),
+            (
+                "multiline namespace and end headers",
+                "module\nnamespace\n  Foo.Bar\nvariable (x : Nat)\nend\n  Bar\npublic def f : Nat := 1\nend\n  Foo\n",
+                "module\nnamespace\n  Foo.Bar\nvariable (x : Nat)\npublic def f : Nat := 1\nend\n  Foo.Bar\n",
+            ),
+            (
+                "wrapped #time section and #time end boundary shift",
+                "module\n#time section\nvariable (x : Nat)\npublic def f : Nat := 1\n#time end\n",
+                "module\n#time section\nvariable (x : Nat)\n#time end\npublic def f : Nat := 1\n",
+            ),
+            (
+                "wrapped #guard_msgs in section and #with_exporting end boundary shift",
+                "module\n#guard_msgs (drop info) in\nsection\nvariable (x : Nat)\npublic def f : Nat := 1\n#with_exporting\nend\n",
+                "module\n#guard_msgs (drop info) in\nsection\nvariable (x : Nat)\n#with_exporting\nend\npublic def f : Nat := 1\n",
+            ),
+            (
+                "open ... in end closes enclosing section",
+                "module\nsection\nvariable (x : Nat)\nopen Nat in\nend\npublic def f : Nat := 1\n",
+                "module\nsection\nvariable (x : Nat)\npublic def f : Nat := 1\nopen Nat in\nend\n",
+            ),
+            (
+                "transient open ... in public section does NOT persist for subsequent def",
+                "module\nopen Nat in\npublic section\ndef f : Nat := 1\n",
+                "module\npublic section\ndef f : Nat := 1\nend\n",
+            ),
+            (
+                "mutual ... end scopes inner variable away from subsequent public def",
+                "module\nmutual\n  variable (x : Nat)\n  public def g : Nat := 1\nend\npublic def f : Nat := 2\n",
+                "module\nvariable (x : Nat)\nmutual\n  public def g : Nat := 1\nend\npublic def f : Nat := 2\n",
+            ),
+            (
+                "moving end before vs after exported attribute [instance] directive",
+                "module\nnamespace Foo\npublic class C (α : Type) where v : Nat\n@[expose, instance_reducible] public def mkTag : C Nat := ⟨10⟩\nend Foo\nnamespace Bar\n@[expose, instance_reducible] public def mkTag : Foo.C Nat := ⟨20⟩\nend Bar\nopen Bar\nsection\nopen Foo\nattribute [instance 100] mkTag\nend\n",
+                "module\nnamespace Foo\npublic class C (α : Type) where v : Nat\n@[expose, instance_reducible] public def mkTag : C Nat := ⟨10⟩\nend Foo\nnamespace Bar\n@[expose, instance_reducible] public def mkTag : Foo.C Nat := ⟨20⟩\nend Bar\nopen Bar\nsection\nopen Foo\nend\nattribute [instance 100] mkTag\n",
+            ),
+            (
+                "moving end before vs after exported notation directive",
+                "module\nnamespace Foo\npublic def target : Nat := 1\nend Foo\npublic def target : Nat := 2\nsection\nopen Foo\nnotation \"EXP_TOK\" => target\nend\n",
+                "module\nnamespace Foo\npublic def target : Nat := 1\nend Foo\npublic def target : Nat := 2\nsection\nopen Foo\nend\nnotation \"EXP_TOK\" => target\n",
+            ),
+            (
+                "module doc /-! -/ before named section preserves section name across end",
+                "module\n/-! module doc -/\nsection S\nvariable (x : Nat)\npublic def f : Nat := 1\nend S\n",
+                "module\n/-! module doc -/\nsection S\nvariable (x : Nat)\nend S\npublic def f : Nat := 1\n",
+            ),
+            (
+                "invalid /-- docstring before section invalidates public signature",
+                "module\nsection S\npublic def f : Nat := 1\nend S\n",
+                "module\n/-- bad doc -/\nsection S\npublic def f : Nat := 1\nend S\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert_ne!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: public_signature_digest must change on scope boundary shift"
+            );
+            assert_ne!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: meta_signature_digest must change on scope boundary shift"
+            );
+        }
+
+        // Meta-only scope boundary shift: moving `end` before vs after `public meta def` changes `meta_signature_digest`.
+        let meta_in_sec =
+            "module\npublic def keep : Nat := 1\nsection\nvariable (x : Nat)\npublic meta def m : Nat := 1\nend\n";
+        let meta_out_sec =
+            "module\npublic def keep : Nat := 1\nsection\nvariable (x : Nat)\nend\npublic meta def m : Nat := 1\n";
+        let ms_in = extract_public_signature(meta_in_sec);
+        let ms_out = extract_public_signature(meta_out_sec);
+        assert_eq!(
+            ms_in.public_signature_digest, ms_out.public_signature_digest,
+            "scope shift after all non-meta public decls preserves public_signature_digest"
+        );
+        assert_ne!(
+            ms_in.meta_signature_digest, ms_out.meta_signature_digest,
+            "scope shift across public meta def must change meta_signature_digest"
+        );
+
+        // Safe cutoff preserved inside sections and namespaces for unexposed bodies, theorem proofs, and trailing private sections!
+        for (label, s1, s2) in [
+            (
+                "theorem proof edit before unexposed public def body edit inside section with variable",
+                "module\nsection S\nvariable (x : Nat)\npublic theorem thm : x + 0 = x := Nat.add_zero x\npublic def f : Nat := x + 1\nend S\n",
+                "module\nsection S\nvariable (x : Nat)\npublic theorem thm : x + 0 = x := by omega\npublic def f : Nat := 1 + x\nend S\n",
+            ),
+            (
+                "trailing private section after all public declarations",
+                "module\npublic def api : Nat := 1\nsection PrivWork\nvariable (z : Nat)\nprivate def p : Nat := z + 1\nend PrivWork\n",
+                "module\npublic def api : Nat := 1\nsection OtherPriv\nvariable (w : Bool)\nprivate def p2 : Bool := w\nend OtherPriv\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert_eq!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: safe cutoff must preserve public_signature_digest"
+            );
+            assert_eq!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: safe cutoff must preserve meta_signature_digest"
+            );
+        }
+    }
+
+    #[test]
+    fn test_speed4_extract_public_signature_placeholder_and_unannotated_binder_soundness() {
+        for (label, s1, s2) in [
+            (
+                "result-type bare hole `_`",
+                "module\npublic def api : _ := (0 : Nat)\n",
+                "module\npublic def api : _ := true\n",
+            ),
+            (
+                "partial result-type hole `List _`",
+                "module\npublic def api : List _ := [0]\n",
+                "module\npublic def api : List _ := [true]\n",
+            ),
+            (
+                "anonymous named hole `?_`",
+                "module\npublic def api : ?_ := 0\n",
+                "module\npublic def api : ?_ := true\n",
+            ),
+            (
+                "named hole `?m`",
+                "module\npublic def api : ?m := 0\n",
+                "module\npublic def api : ?m := true\n",
+            ),
+            (
+                "nested named hole `Option (?a)`",
+                "module\npublic def api : Option (?a) := some 0\n",
+                "module\npublic def api : Option (?a) := some true\n",
+            ),
+            (
+                "theorem with placeholder statement `: _`",
+                "module\npublic theorem thm : _ := True.intro\n",
+                "module\npublic theorem thm : _ := (rfl : 0 = 0)\n",
+            ),
+            (
+                "binder type placeholder `(x : _)`",
+                "module\npublic def api (x : _) : Nat := x + 1\n",
+                "module\npublic def api (x : _) : Nat := if x then 1 else 0\n",
+            ),
+            (
+                "unannotated parenthesized binder `(x)`",
+                "module\npublic def api (x) : Nat := x + 1\n",
+                "module\npublic def api (x) : Nat := if x then 1 else 0\n",
+            ),
+            (
+                "unannotated multi-var parenthesized binder `(x y)`",
+                "module\npublic def api (x y) : Nat := x + y\n",
+                "module\npublic def api (x y) : Nat := if x && y then 1 else 0\n",
+            ),
+            (
+                "bare identifier binder `x`",
+                "module\npublic def api x : Nat := x + 1\n",
+                "module\npublic def api x : Nat := if x then 1 else 0\n",
+            ),
+            (
+                "unannotated implicit binder `{x}`",
+                "module\npublic def api {x} : Nat := x + 1\n",
+                "module\npublic def api {x} : Nat := if x then 1 else 0\n",
+            ),
+            (
+                "unannotated strict-implicit binder `⦃x⦄`",
+                "module\npublic def api ⦃x⦄ : Nat := x + 1\n",
+                "module\npublic def api ⦃x⦄ : Nat := if x then 1 else 0\n",
+            ),
+            (
+                "placeholder strict-implicit binder `⦃x : _⦄` with explicit return type",
+                "module\npublic def api ⦃x : _⦄ : Nat := x + 1\n",
+                "module\npublic def api ⦃x : _⦄ : Nat := if x then 1 else 0\n",
+            ),
+            (
+                "strict-implicit binder `⦃x : Nat⦄` with NO top-level return type",
+                "module\npublic def api ⦃x : Nat⦄ := x + 1\n",
+                "module\npublic def api ⦃x : Nat⦄ := true\n",
+            ),
+            (
+                "strict-implicit binder `⦃x : Nat⦄` equation arms with NO top-level return type",
+                "module\npublic def api ⦃x : Nat⦄\n  | 0 => x\n  | n + 1 => api n\n",
+                "module\npublic def api ⦃x : Nat⦄\n  | 0 => true\n  | n + 1 => api n\n",
+            ),
+            (
+                "placeholder instance bracket `[ _ ]`",
+                "module\npublic def api [ _ ] : Nat := 0\n",
+                "module\npublic def api [ _ ] : Nat := 1\n",
+            ),
+            (
+                "default-value unannotated binder `(x := 0)`",
+                "module\npublic def api (x := 0) : Nat := x + 1\n",
+                "module\npublic def api (x := 0) : Nat := x + 2\n",
+            ),
+            (
+                "tactic-generated return type `: by exact _`",
+                "module\npublic def api : by exact Nat := 0\n",
+                "module\npublic def api : by exact Nat := 1\n",
+            ),
+            (
+                "forall unannotated binder in return type `: ∀ x, x = x`",
+                "module\npublic theorem thm : ∀ x, x = x := fun (x : Nat) => rfl\n",
+                "module\npublic theorem thm : ∀ x, x = x := fun (x : Bool) => rfl\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert!(
+                sig_a.declarations[0].exposed_body_hash.is_some(),
+                "{label}: body_exposed must be true (exposed_body_hash must be Some)"
+            );
+            assert_ne!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: public_signature_digest must change when body changes"
+            );
+            assert_ne!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: meta_signature_digest must change when body changes"
+            );
+        }
+
+        for (label, s1, s2) in [
+            (
+                "universe binders, `_root_.Nat`, underscored ident `x_1`, and strict-implicit `⦃y_1 : Nat⦄`",
+                "module\npublic def api.{u} {α : Type u} [Inhabited α] ⦃y_1 : Nat⦄ (x_1 : _root_.Nat) (_ : String := \"_ ?a\") : Nat := x_1 + y_1 + 1\n",
+                "module\npublic def api.{u} {α : Type u} [Inhabited α] ⦃y_1 : Nat⦄ (x_1 : _root_.Nat) (_ : String := \"_ ?a\") : Nat := 1 + y_1 + x_1\n",
+            ),
+            (
+                "fully annotated public theorem with underscored ident `x_1` and `?`-suffixed helper ident",
+                "module\npublic theorem thm (x_1 : Nat) (ok? : Bool) : x_1 = x_1 ∧ ok? = ok? := ⟨rfl, rfl⟩\n",
+                "module\npublic theorem thm (x_1 : Nat) (ok? : Bool) : x_1 = x_1 ∧ ok? = ok? := by exact ⟨rfl, rfl⟩\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert!(
+                sig_a.declarations[0].exposed_body_hash.is_none(),
+                "{label}: fully annotated declaration must keep exposed_body_hash == None"
+            );
+            assert_eq!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: fully annotated declaration must preserve public_signature_digest"
+            );
+            assert_eq!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: fully annotated declaration must preserve meta_signature_digest"
+            );
+        }
+    }
+
+    #[test]
+    fn test_speed4_extract_public_signature_intra_module_public_decl_context_soundness() {
+        // P2 4481733184 exact reproducer: within a `module`, an unexposed `public def` is reducible
+        // to subsequent declarations inside the same module, so editing `flag`'s body MUST alter
+        // subsequent `api.sig_hash` and `public_signature_digest`.
+        let p2_v1 = "\
+module
+public def flag : Bool := true
+public def api := by
+  first
+  | have h : flag = true := rfl
+    exact (0 : Nat)
+  | exact false
+";
+        let p2_v2 = "\
+module
+public def flag : Bool := false
+public def api := by
+  first
+  | have h : flag = true := rfl
+    exact (0 : Nat)
+  | exact false
+";
+        let sig_p2_v1 = extract_public_signature(p2_v1);
+        let sig_p2_v2 = extract_public_signature(p2_v2);
+        assert_eq!(sig_p2_v1.declarations.len(), 2);
+        assert_eq!(sig_p2_v2.declarations.len(), 2);
+        assert_eq!(sig_p2_v1.declarations[0].const_name, "flag");
+        assert!(sig_p2_v1.declarations[0].exposed_body_hash.is_none());
+        assert_eq!(
+            sig_p2_v1.declarations[0].sig_hash,
+            sig_p2_v2.declarations[0].sig_hash
+        );
+        assert_eq!(sig_p2_v1.declarations[1].const_name, "api");
+        assert_ne!(
+            sig_p2_v1.declarations[1].sig_hash, sig_p2_v2.declarations[1].sig_hash,
+            "editing preceding unexposed `public def flag` body must alter subsequent `api.sig_hash`"
+        );
+        assert_ne!(
+            sig_p2_v1.public_signature_digest,
+            sig_p2_v2.public_signature_digest
+        );
+        assert_ne!(
+            sig_p2_v1.meta_signature_digest,
+            sig_p2_v2.meta_signature_digest
+        );
+
+        for (label, s1, s2) in [
+            (
+                "preceding public def type alias `ty : Type := Nat` -> `Bool` before `public def useTy (x : ty) : ty := x`",
+                "module\npublic def ty : Type := Nat\npublic def useTy (x : ty) : ty := x\n",
+                "module\npublic def ty : Type := Bool\npublic def useTy (x : ty) : ty := x\n",
+            ),
+            (
+                "preceding public def before public theorem referencing it",
+                "module\npublic def target : Nat := 1\npublic theorem thm : target = target := rfl\n",
+                "module\npublic def target : Nat := 2\npublic theorem thm : target = target := rfl\n",
+            ),
+            (
+                "preceding unannotated def inside `public section` before subsequent def",
+                "module\npublic section\ndef flag : Bool := true\ndef api := flag\nend\n",
+                "module\npublic section\ndef flag : Bool := false\ndef api := flag\nend\n",
+            ),
+            (
+                "mutual block with unexposed `public def` sibling body edit",
+                "module\nmutual\n  public def a := if b then (0 : Nat) else 1\n  public def b : Bool := true\nend\n",
+                "module\nmutual\n  public def a := if b then (0 : Nat) else 1\n  public def b : Bool := false\nend\n",
+            ),
+            (
+                "preceding unexposed `public def` before exported `notation` directive",
+                "module\npublic def flag : Bool := true\nnotation \"MY_CONST\" => flag\n",
+                "module\npublic def flag : Bool := false\nnotation \"MY_CONST\" => flag\n",
+            ),
+            (
+                "preceding unexposed `public def` before exported `macro` directive",
+                "module\npublic def flag : Bool := true\nmacro \"myMac\" : term => `(flag)\n",
+                "module\npublic def flag : Bool := false\nmacro \"myMac\" : term => `(flag)\n",
+            ),
+            (
+                "preceding unexposed `public def` before exported `attribute` directive",
+                "module\npublic class C (α : Type) where v : Nat\npublic def mkTag : C Nat := ⟨1⟩\nattribute [instance 100] mkTag\n",
+                "module\npublic class C (α : Type) where v : Nat\npublic def mkTag : C Nat := ⟨2⟩\nattribute [instance 100] mkTag\n",
+            ),
+            (
+                "preceding unannotated `public theorem` without `: Prop` before `public def`",
+                "module\npublic theorem inferredProp := True.intro\npublic def api : Nat := 1\n",
+                "module\npublic theorem inferredProp := (rfl : 0 = 0)\npublic def api : Nat := 1\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert_ne!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: public_signature_digest must change"
+            );
+            assert_ne!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: meta_signature_digest must change"
+            );
+        }
+
+        // Preceding unexposed `public def` edit before a `public meta def` (with no subsequent
+        // non-meta public decl or exported directive) keeps `public_signature_digest` identical
+        // while updating `meta_signature_digest`!
+        let before_meta_v1 =
+            "module\npublic def flag : Bool := true\npublic meta def metaApi : Bool := flag\n";
+        let before_meta_v2 =
+            "module\npublic def flag : Bool := false\npublic meta def metaApi : Bool := flag\n";
+        let bm1 = extract_public_signature(before_meta_v1);
+        let bm2 = extract_public_signature(before_meta_v2);
+        assert_eq!(
+            bm1.public_signature_digest, bm2.public_signature_digest,
+            "unexposed `public def` edit followed only by `public meta def` keeps non-meta public_signature_digest identical"
+        );
+        assert_ne!(
+            bm1.meta_signature_digest, bm2.meta_signature_digest,
+            "unexposed `public def` edit before `public meta def` must alter meta_signature_digest"
+        );
+
+        // Preceding explicitly-typed `public theorem` header change before `public meta def` also updates `meta_signature_digest`.
+        let thm_hdr_meta_v1 =
+            "module\npublic theorem lem : 1 + 1 = 2 := rfl\npublic meta def metaCheck : Nat := 1\n";
+        let thm_hdr_meta_v2 =
+            "module\npublic theorem lem : 2 + 2 = 4 := rfl\npublic meta def metaCheck : Nat := 1\n";
+        let thm_m1 = extract_public_signature(thm_hdr_meta_v1);
+        let thm_m2 = extract_public_signature(thm_hdr_meta_v2);
+        assert_ne!(
+            thm_m1.public_signature_digest,
+            thm_m2.public_signature_digest
+        );
+        assert_ne!(thm_m1.meta_signature_digest, thm_m2.meta_signature_digest);
+
+        // Positive cutoff preservation:
+        // 1. Unexposed `public def` body edit with NO subsequent public declarations (or followed only by `private` decls)
+        //    keeps `public_signature_digest` and `meta_signature_digest` identical.
+        // 2. Explicitly-typed `public theorem` / `public lemma` proof-body edit BEFORE a subsequent `public def`,
+        //    `public meta def`, exported directive, or inside a `mutual` block keeps `api.sig_hash`,
+        //    `public_signature_digest`, and `meta_signature_digest` 100% identical (proof irrelevance!).
+        for (label, s1, s2) in [
+            (
+                "unexposed public def body edit at end of module",
+                "module\npublic def api : Nat := 1\n",
+                "module\npublic def api : Nat := 2\n",
+            ),
+            (
+                "unexposed public def body edit followed only by private declarations",
+                "module\npublic def api : Nat := 1\nprivate def helper : Nat := api + 10\nprivate theorem helper_eq : helper = api + 10 := rfl\n",
+                "module\npublic def api : Nat := 2\nprivate def helper : Nat := api + 20\nprivate theorem helper_eq : helper = api + 20 := rfl\n",
+            ),
+            (
+                "explicitly-typed public theorem proof edit before subsequent public def and public meta def",
+                "module\npublic theorem lem : 1 + 1 = 2 := rfl\npublic def api : Nat := 1\npublic meta def metaApi : Nat := 1\n",
+                "module\npublic theorem lem : 1 + 1 = 2 := by decide\npublic def api : Nat := 1\npublic meta def metaApi : Nat := 1\n",
+            ),
+            (
+                "explicitly-typed public lemma proof edit with `where` clause before subsequent public def and exported notation",
+                "module\npublic lemma lem (n : Nat) : n + 0 = n := pf where\n  pf : n + 0 = n := Nat.add_zero n\npublic def api : Nat := 1\nnotation \"K_API\" => api\n",
+                "module\npublic lemma lem (n : Nat) : n + 0 = n := pf2 where\n  pf2 : n + 0 = n := by exact Nat.add_zero n\npublic def api : Nat := 1\nnotation \"K_API\" => api\n",
+            ),
+            (
+                "mutual block of explicitly-typed public theorems proof-only edit",
+                "module\nmutual\n  public theorem t1 : 1 + 1 = 2 := rfl\n  public theorem t2 : 2 + 2 = 4 := rfl\nend\npublic def api : Nat := 1\n",
+                "module\nmutual\n  public theorem t1 : 1 + 1 = 2 := by decide\n  public theorem t2 : 2 + 2 = 4 := by decide\nend\npublic def api : Nat := 1\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert_eq!(
+                sig_a.declarations.len(),
+                sig_b.declarations.len(),
+                "{label}: decl count"
+            );
+            for (da, db) in sig_a.declarations.iter().zip(sig_b.declarations.iter()) {
+                assert_eq!(da.sig_hash, db.sig_hash, "{label}: sig_hash for {}", da.const_name);
+                assert_eq!(
+                    da.exposed_body_hash, db.exposed_body_hash,
+                    "{label}: exposed_body_hash for {}",
+                    da.const_name
+                );
+            }
+            assert_eq!(
+                sig_a.public_directives_hash, sig_b.public_directives_hash,
+                "{label}: public_directives_hash must stay identical"
+            );
+            assert_eq!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: public_signature_digest must stay identical"
+            );
+            assert_eq!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: meta_signature_digest must stay identical"
+            );
+        }
     }
 }
 

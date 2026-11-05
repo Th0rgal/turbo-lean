@@ -727,3 +727,415 @@ theorem check_all_edge_docs : True := verify_edge_docs
         );
     }
 }
+
+#[test]
+fn test_speed4_allow_sorry_cli_isolation_and_untrusted_rejection() {
+    if !lean_available() {
+        return;
+    }
+
+    let p = Project::new(false);
+
+    // 1. Fail-closed CLI rejection on untrusted / non-iteration commands:
+    //    - `check --allow-sorry --untrusted`
+    //    - `check --allow-sorry --mode untrusted`
+    //    - `ci-verify --allow-sorry`
+    //    - `pr-verify --allow-sorry`
+    //    - `verify-receipt --allow-sorry`
+    for forbidden_args in [
+        &["check", "F.lean", "--allow-sorry", "--untrusted"][..],
+        &["check", "F.lean", "--allow-sorry", "--mode", "untrusted"][..],
+        &["check", "F.lean", "--allow-sorry", "--mode", "untrusted:ci"][..],
+        &["ci-verify", "--allow-sorry"][..],
+        &["pr-verify", "--allow-sorry"][..],
+        &["verify-receipt", "--allow-sorry"][..],
+    ] {
+        let out = p.run(forbidden_args, false);
+        assert!(
+            !out.status.success(),
+            "forbidden args {:?} must fail closed, got exit {:?}",
+            forbidden_args,
+            out.status.code()
+        );
+    }
+
+    for env_trust in ["untrusted", "untrusted:pr"] {
+        let env_out = Command::new(env!("CARGO_BIN_EXE_turbo-lean"))
+            .current_dir(&p.0)
+            .args(["--json", "--cache-dir"])
+            .arg(p.0.join("cache"))
+            .args(["check", "F.lean", "--allow-sorry"])
+            .env("TURBO_LEAN_TRUST_DOMAIN", env_trust)
+            .env("TURBO_LEAN_TELEMETRY", "off")
+            .env("TURBO_LEAN_NO_DAEMON", "1")
+            .output()
+            .unwrap();
+        assert!(
+            !env_out.status.success(),
+            "TURBO_LEAN_TRUST_DOMAIN={env_trust} with --allow-sorry must fail closed"
+        );
+    }
+
+    // 2. Write a multi-shard file with:
+    //    - `clean_sib`: clean theorem (0 sorryAx)
+    //    - `sketch_thm`: sorry-bearing theorem
+    //    - `uses_sorry_def`: clean theorem text that references a `sorry`-bearing `def helper`
+    fs::write(
+        p.0.join("Sketch.lean"),
+        "\
+def cleanHelper (n : Nat) : Nat := n + 1
+
+theorem clean_sib (n : Nat) : cleanHelper n = n + 1 := rfl
+
+theorem sketch_thm (n : Nat) : n + n = 2 * n := by
+  sorry
+
+def sorryHelper : Nat := by
+  sorry
+
+theorem uses_sorry_def : sorryHelper = sorryHelper := rfl
+",
+    )
+    .unwrap();
+
+    // Default `check` MUST reject `sketch_thm` and whole-file `Sketch.lean`.
+    assert_rejected(&p, "Sketch.lean", "sketch_thm", false);
+    let strict_before = p.run(&["check", "Sketch.lean"], false);
+    assert!(!strict_before.status.success());
+
+    // `check Sketch.lean --decl sketch_thm --allow-sorry` MUST report `verified_modulo_sorry` with `used_sorry == true`.
+    let mod_decl = p.run(
+        &[
+            "check",
+            "Sketch.lean",
+            "--decl",
+            "sketch_thm",
+            "--allow-sorry",
+        ],
+        false,
+    );
+    assert!(
+        mod_decl.status.success(),
+        "check --decl sketch_thm --allow-sorry failed:\n{}{}",
+        String::from_utf8_lossy(&mod_decl.stdout),
+        String::from_utf8_lossy(&mod_decl.stderr)
+    );
+    let mod_decl_json: Value = serde_json::from_slice(&mod_decl.stdout).unwrap();
+    assert_eq!(mod_decl_json["status"], "verified_modulo_sorry");
+    assert_eq!(mod_decl_json["allow_sorry"], true);
+    assert_eq!(mod_decl_json["used_sorry"], true);
+
+    // Subsequent strict `check --decl sketch_thm` MUST still fail (zero CAS pollution!).
+    assert_rejected(&p, "Sketch.lean", "sketch_thm", false);
+
+    // Whole-file `check Sketch.lean --allow-sorry` MUST report `verified_modulo_sorry`,
+    // cache `clean_sib` in `TheoremProofCAS`, and NEVER cache `sketch_thm` or `uses_sorry_def`!
+    let mod_file = p.run(&["check", "Sketch.lean", "--allow-sorry"], false);
+    assert!(
+        mod_file.status.success(),
+        "check Sketch.lean --allow-sorry failed:\n{}{}",
+        String::from_utf8_lossy(&mod_file.stdout),
+        String::from_utf8_lossy(&mod_file.stderr)
+    );
+    let mod_file_json: Value = serde_json::from_slice(&mod_file.stdout).unwrap();
+    assert_eq!(mod_file_json["status"], "verified_modulo_sorry");
+    assert_eq!(mod_file_json["allow_sorry"], true);
+    assert_eq!(mod_file_json["used_sorry"], true);
+
+    // Clean sibling `clean_sib` MUST hit `TheoremProofCAS` (`theorem_cache_hit`) on strict `check`!
+    let strict_clean_sib = p.check("Sketch.lean", "clean_sib", false);
+    assert!(
+        strict_clean_sib.status.success(),
+        "strict check --decl clean_sib failed:\n{}{}",
+        String::from_utf8_lossy(&strict_clean_sib.stdout),
+        String::from_utf8_lossy(&strict_clean_sib.stderr)
+    );
+    assert_eq!(status(&strict_clean_sib), "theorem_cache_hit");
+
+    // Both `sketch_thm` and `uses_sorry_def` (whose proof text has no `sorry`, but whose kernel closure
+    // depends on `sorryHelper` -> `sorryAx`) MUST still be rejected by strict `check`!
+    assert_rejected(&p, "Sketch.lean", "sketch_thm", false);
+    assert_rejected(&p, "Sketch.lean", "uses_sorry_def", false);
+    let strict_after = p.run(&["check", "Sketch.lean"], false);
+    assert!(!strict_after.status.success());
+
+    // Custom `axiom` and real type errors MUST still be rejected even with `--allow-sorry`!
+    fs::write(
+        p.0.join("BadAxiom.lean"),
+        "axiom bad_ax : False\ntheorem bad_t : False := bad_ax\n",
+    )
+    .unwrap();
+    let bad_ax_out = p.run(&["check", "BadAxiom.lean", "--allow-sorry"], false);
+    assert!(!bad_ax_out.status.success());
+
+    fs::write(p.0.join("TypeErr.lean"), "theorem bad_ty : 1 = 2 := rfl\n").unwrap();
+    let bad_ty_out = p.run(&["check", "TypeErr.lean", "--allow-sorry"], false);
+    assert!(!bad_ty_out.status.success());
+
+    // 3. `turbo-lean impact` CLI read-only check: must succeed without creating `cache` or `.turbo-lean`.
+    let fresh_root = std::env::temp_dir().join(format!(
+        "turbo_speed4_impact_cli_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&fresh_root).unwrap();
+    fs::write(
+        fresh_root.join("Sample.lean"),
+        "module\npublic theorem sample_ok : 1 + 1 = 2 := rfl\n",
+    )
+    .unwrap();
+    let non_existent_cache = fresh_root.join("never_created_cache");
+    let imp_out = Command::new(env!("CARGO_BIN_EXE_turbo-lean"))
+        .current_dir(&fresh_root)
+        .args(["--json", "--cache-dir"])
+        .arg(&non_existent_cache)
+        .args(["impact", "Sample.lean"])
+        .env("TURBO_LEAN_TELEMETRY", "off")
+        .output()
+        .unwrap();
+    assert!(
+        imp_out.status.success(),
+        "impact CLI failed:\n{}{}",
+        String::from_utf8_lossy(&imp_out.stdout),
+        String::from_utf8_lossy(&imp_out.stderr)
+    );
+    let imp_json: Value = serde_json::from_slice(&imp_out.stdout).unwrap();
+    assert_eq!(imp_json["is_module"], true);
+    assert!(
+        !non_existent_cache.exists() && !fresh_root.join(".turbo-lean").exists(),
+        "`turbo-lean impact` must not create cache/state.db or .turbo-lean"
+    );
+    let _ = fs::remove_dir_all(&fresh_root);
+}
+
+#[test]
+fn test_speed4_timeout_hotspot_attribution_without_accepting_unverified() {
+    if !lean_available() {
+        return;
+    }
+
+    let p = Project::new(false);
+    // Construct a theorem that deterministically trips `maxHeartbeats` during `simp` loop so the
+    // Zygote worker fails closed AND emits `[hotspot]` diagnostics (`timeout_hotspots` / `simp_hotspots`).
+    fs::write(
+        p.0.join("HotspotTimeout.lean"),
+        "\
+def stepId (n : Nat) : Nat := n
+@[simp] theorem loop_step (n : Nat) : stepId n = stepId (stepId n) := rfl
+
+set_option maxHeartbeats 500 in
+theorem simp_blowup (n : Nat) : stepId n = 1 := by
+  simp [loop_step]
+",
+    )
+    .unwrap();
+
+    let out = p.run(
+        &["check", "HotspotTimeout.lean", "--decl", "simp_blowup"],
+        false,
+    );
+    let st = status(&out);
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.status.success() && !st.contains("verified") && !st.contains("cache_hit"),
+        "heartbeat timeout must fail closed and never accept an unverified verdict:\n{combined}"
+    );
+    assert!(
+        combined.contains("[hotspot]"),
+        "heartbeat timeout error must attach [hotspot] diagnostics:\n{combined}"
+    );
+    assert!(
+        combined.contains("loop_step") || combined.contains("simp_blowup"),
+        "hotspot attribution must identify the looping simp lemma or declaration:\n{combined}"
+    );
+
+    // Re-running must ALSO fail (never cached).
+    let out2 = p.run(
+        &["check", "HotspotTimeout.lean", "--decl", "simp_blowup"],
+        false,
+    );
+    assert!(!out2.status.success());
+}
+
+#[test]
+fn test_speed4_allow_sorry_srcdir_transitive_purge_and_zero_cas_taint() {
+    if !lean_available() {
+        return;
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "turbo_speed4_srcdir_sorry_purge_{}_{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let cache = root.join("cache");
+    let proj = root.join("proj");
+    fs::create_dir_all(proj.join("src/Chain")).unwrap();
+    fs::write(
+        proj.join("lean-toolchain"),
+        include_str!("../../../lean/lean-toolchain"),
+    )
+    .unwrap();
+    fs::write(
+        proj.join("lakefile.toml"),
+        "name = \"chainsmoke\"\nsrcDir = \"src\"\n[[lean_lib]]\nname = \"Chain\"\nglobs = [\"Chain.+\"]\n",
+    )
+    .unwrap();
+
+    // Clean initial 3-hop chain `Chain.A -> Chain.B -> Chain.C` under `srcDir = "src"`.
+    let a_clean = "\
+def baseVal : Nat := 7
+theorem a_thm : baseVal = 7 := rfl
+";
+    let b_src = "\
+import Chain.A
+theorem b_thm : baseVal = 7 := a_thm
+";
+    let c_src = "\
+import Chain.B
+theorem c_thm : baseVal = 7 := b_thm
+";
+    fs::write(proj.join("src/Chain/A.lean"), a_clean).unwrap();
+    fs::write(proj.join("src/Chain/B.lean"), b_src).unwrap();
+    fs::write(proj.join("src/Chain/C.lean"), c_src).unwrap();
+
+    let git_bin = std::env::var("TURBO_LEAN_GIT").unwrap_or_else(|_| "git".to_string());
+    for args in [
+        &["init"][..],
+        &["add", "."][..],
+        &["commit", "-m", "clean baseline"][..],
+    ] {
+        let st = Command::new(&git_bin)
+            .current_dir(&proj)
+            .args(args)
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@example.com")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@example.com")
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {:?} failed", args);
+    }
+
+    let run_cli = |args: &[&str]| -> Output {
+        Command::new(env!("CARGO_BIN_EXE_turbo-lean"))
+            .current_dir(&proj)
+            .arg("--json")
+            .arg("--cache-dir")
+            .arg(&cache)
+            .args(args)
+            .env("TURBO_LEAN_NO_DAEMON", "1")
+            .env("TURBO_LEAN_TELEMETRY", "off")
+            .output()
+            .unwrap()
+    };
+
+    // Build clean baseline so `.lake/build/lib/lean/Chain/{A,B,C}.olean` exist initially.
+    let build_clean = run_cli(&["build"]);
+    assert!(
+        build_clean.status.success(),
+        "initial clean build failed:\n{}{}",
+        String::from_utf8_lossy(&build_clean.stdout),
+        String::from_utf8_lossy(&build_clean.stderr)
+    );
+    let lib_dir = proj.join(".lake/build/lib/lean/Chain");
+    assert!(lib_dir.join("A.olean").exists());
+    assert!(lib_dir.join("B.olean").exists());
+    assert!(lib_dir.join("C.olean").exists());
+
+    // Now edit `src/Chain/A.lean` to replace `a_thm`'s proof AND signature with a `sorry`-backed false lemma,
+    // and update `B.lean` + `C.lean` to rely on `a_thm` (without lexical `sorry` in `B.lean` or `C.lean`!).
+    fs::write(
+        proj.join("src/Chain/A.lean"),
+        "def baseVal : Nat := 7\ntheorem a_thm : baseVal = 99 := by\n  sorry\n",
+    )
+    .unwrap();
+    fs::write(
+        proj.join("src/Chain/B.lean"),
+        "import Chain.A\ntheorem b_thm : baseVal = 99 := a_thm\n",
+    )
+    .unwrap();
+    fs::write(
+        proj.join("src/Chain/C.lean"),
+        "import Chain.B\ntheorem c_thm : baseVal = 99 := b_thm\n",
+    )
+    .unwrap();
+
+    // 1. `check src/Chain/A.lean --allow-sorry` triggers `recheck_dependents_if_nonlocal_with_options`,
+    //    which refreshes `Chain.A`, `Chain.B`, `Chain.C` via Lake and MUST purge ALL 3 sorry-tainted
+    //    `.olean` artifacts across `srcDir = "src"` and the 2-hop transitive cone (`A -> B -> C`)!
+    let chk_a_mod = run_cli(&["check", "src/Chain/A.lean", "--allow-sorry"]);
+    assert!(
+        chk_a_mod.status.success(),
+        "check A --allow-sorry failed:\n{}{}",
+        String::from_utf8_lossy(&chk_a_mod.stdout),
+        String::from_utf8_lossy(&chk_a_mod.stderr)
+    );
+    let chk_a_json: Value = serde_json::from_slice(&chk_a_mod.stdout).unwrap();
+    assert_eq!(chk_a_json["status"], "verified_modulo_sorry");
+    assert_eq!(chk_a_json["used_sorry"], true);
+    assert!(
+        !lib_dir.join("A.olean").exists(),
+        "sorry-bearing Chain/A.olean under srcDir=\"src\" must be purged after --allow-sorry"
+    );
+    assert!(
+        !lib_dir.join("B.olean").exists(),
+        "1-hop dependent Chain/B.olean tainted by Chain.A sorry must be purged"
+    );
+    assert!(
+        !lib_dir.join("C.olean").exists(),
+        "2-hop transitive dependent Chain/C.olean tainted by Chain.A sorry must be purged"
+    );
+
+    // 2. Checking downstream `src/Chain/C.lean --allow-sorry` (whose own text has ZERO `sorry` tokens,
+    //    while `ensure_project_imports_fresh_for_check` builds `Chain.A` and `Chain.B`) MUST:
+    //    - report `verified_modulo_sorry` (`used_sorry == true`, NOT `file_verified`!),
+    //    - NEVER cache `c_thm` in `TheoremProofCAS`,
+    //    - purge `A.olean`, `B.olean`, and `C.olean` afterward so strict `check` fails closed!
+    let chk_c_mod = run_cli(&["check", "src/Chain/C.lean", "--allow-sorry"]);
+    assert!(
+        chk_c_mod.status.success(),
+        "check C --allow-sorry failed:\n{}{}",
+        String::from_utf8_lossy(&chk_c_mod.stdout),
+        String::from_utf8_lossy(&chk_c_mod.stderr)
+    );
+    let chk_c_json: Value = serde_json::from_slice(&chk_c_mod.stdout).unwrap();
+    assert_eq!(
+        chk_c_json["status"], "verified_modulo_sorry",
+        "downstream C.lean transitively using Chain.A's sorryAx must report verified_modulo_sorry: {chk_c_json}"
+    );
+    assert_eq!(chk_c_json["used_sorry"], true);
+    assert!(!lib_dir.join("A.olean").exists());
+    assert!(!lib_dir.join("B.olean").exists());
+    assert!(!lib_dir.join("C.olean").exists());
+
+    // 3. Subsequent strict `check` on `A.lean`, `B.lean`, `C.lean`, and `--decl c_thm` MUST ALL fail closed!
+    for strict_args in [
+        &["check", "src/Chain/A.lean"][..],
+        &["check", "src/Chain/B.lean"][..],
+        &["check", "src/Chain/C.lean"][..],
+        &["check", "src/Chain/C.lean", "--decl", "c_thm"][..],
+    ] {
+        let out = run_cli(strict_args);
+        let st = status(&out);
+        assert!(
+            !out.status.success() && !st.contains("verified") && !st.contains("cache_hit"),
+            "strict {:?} must fail closed after --allow-sorry:\n{}{}",
+            strict_args,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let _ = fs::remove_dir_all(&root);
+}

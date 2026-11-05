@@ -8893,6 +8893,7 @@ end Fixture
                 kernel_audited: true,
                 import_olean_digests,
                 artifact_stat_fingerprint: String::new(),
+                ..Default::default()
             },
         );
         fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;

@@ -1099,6 +1099,32 @@ pub fn run_check_command_value(
     parallel_shards: bool,
     remote_http: Option<String>,
 ) -> Result<serde_json::Value> {
+    run_check_command_value_with_options(
+        store,
+        db_warm_on_open,
+        file,
+        decl,
+        project_dir,
+        jobs,
+        parallel_shards,
+        remote_http,
+        false,
+    )
+}
+
+/// Execute `turbo-lean check` in-process with `allow_sorry` control and return structured JSON without printing.
+#[allow(dead_code, clippy::too_many_arguments)]
+pub fn run_check_command_value_with_options(
+    store: &mut TurboStore,
+    db_warm_on_open: bool,
+    file: PathBuf,
+    decl: Option<String>,
+    project_dir: PathBuf,
+    jobs: Option<usize>,
+    parallel_shards: bool,
+    remote_http: Option<String>,
+    allow_sorry: bool,
+) -> Result<serde_json::Value> {
     crate::module_builder::reset_lake_inputs_tag_memo();
     run_check_command_inner(
         store,
@@ -1112,6 +1138,7 @@ pub fn run_check_command_value(
         jobs,
         parallel_shards,
         remote_http,
+        allow_sorry,
     )
 }
 
@@ -1135,6 +1162,7 @@ pub fn evaluate_check_command_value(
         None,
         true,
         None,
+        false,
     )
 }
 
@@ -1523,7 +1551,7 @@ pub fn try_stateless_remote_single_decl_check(
     };
     let shard = &split.shards[shard_idx];
     // The full `check --decl` path reports (rejects) a target that fails its hygiene gate.
-    if !target_hygiene_violations(&split, shard).is_empty() {
+    if !target_hygiene_violations(&split, shard, false).is_empty() {
         return Ok(false);
     }
     let target_decl = shard.decl_name();
@@ -1737,7 +1765,7 @@ pub fn run_check_command(
     parallel_shards: bool,
     remote_http: Option<String>,
 ) -> Result<()> {
-    run_check_command_with_opts(
+    run_check_command_with_options(
         store,
         db_warm_on_open,
         json_output,
@@ -1748,10 +1776,11 @@ pub fn run_check_command(
         parallel_shards,
         remote_http,
         false,
+        false,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub fn run_check_command_with_opts(
     store: &mut TurboStore,
     db_warm_on_open: bool,
@@ -1763,6 +1792,35 @@ pub fn run_check_command_with_opts(
     parallel_shards: bool,
     remote_http: Option<String>,
     emit_olean: bool,
+) -> Result<()> {
+    run_check_command_with_options(
+        store,
+        db_warm_on_open,
+        json_output,
+        file,
+        decl,
+        project_dir,
+        jobs,
+        parallel_shards,
+        remote_http,
+        emit_olean,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_check_command_with_options(
+    store: &mut TurboStore,
+    db_warm_on_open: bool,
+    json_output: bool,
+    file: PathBuf,
+    decl: Option<String>,
+    project_dir: PathBuf,
+    jobs: Option<usize>,
+    parallel_shards: bool,
+    remote_http: Option<String>,
+    emit_olean: bool,
+    allow_sorry: bool,
 ) -> Result<()> {
     // One top-level command, one Lake-input memo window.
     crate::module_builder::reset_lake_inputs_tag_memo();
@@ -1778,6 +1836,7 @@ pub fn run_check_command_with_opts(
         jobs,
         parallel_shards,
         remote_http,
+        allow_sorry,
     )
     .map(|_| ())
 }
@@ -1795,6 +1854,7 @@ fn run_check_command_inner(
     jobs: Option<usize>,
     parallel_shards: bool,
     remote_http: Option<String>,
+    allow_sorry: bool,
 ) -> Result<serde_json::Value> {
     if emit_olean && decl.is_some() {
         anyhow::bail!(
@@ -1836,6 +1896,7 @@ fn run_check_command_inner(
             &toolchain,
             jobs,
             remote_http.as_deref(),
+            allow_sorry,
         );
     }
 
@@ -1843,15 +1904,30 @@ fn run_check_command_inner(
         .canonicalize()
         .unwrap_or_else(|_| resolved_file.clone());
     if canon_resolved_initial.is_file() {
-        crate::lake_build::ensure_project_imports_fresh_for_check(
+        let fresh_res = crate::lake_build::ensure_project_imports_fresh_for_check_with_options(
             &canon_dir,
             std::slice::from_ref(&canon_resolved_initial),
-        )?;
-        crate::module_builder::ensure_imported_oleans_replayed(
+            allow_sorry,
+        );
+        if fresh_res.is_err() && allow_sorry {
+            crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(
+                &canon_dir,
+                std::slice::from_ref(&canon_resolved_initial),
+            );
+        }
+        fresh_res?;
+        let import_res = crate::module_builder::ensure_imported_oleans_replayed(
             store,
             &canon_dir,
             std::slice::from_ref(&canon_resolved_initial),
-        )?;
+        );
+        if import_res.is_err() && allow_sorry {
+            crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(
+                &canon_dir,
+                std::slice::from_ref(&canon_resolved_initial),
+            );
+        }
+        import_res?;
     }
     let file_stat_tuple: Option<(i64, i64, i64)> = fs::metadata(&canon_resolved_initial)
         .ok()
@@ -2032,164 +2108,191 @@ fn run_check_command_inner(
 
     drop(held_split_lock);
 
-    let res = if let Some(target_decl) = decl {
-        check_single_decl(
-            store,
-            db_warm_on_open,
-            json_output,
-            emit_stdout,
-            &t0,
-            &file,
-            &resolved_file,
-            &canon_resolved_initial,
-            &canon_dir,
-            &toolchain,
-            &target_decl,
-            src,
-            &mut cached_file_blake3,
-            &mut split,
-            known_modified_vs_head,
-            single_split_hits,
-            remote_http.as_deref(),
-        )?
-    } else {
-        let mut out_json = check_single_file(
-            store,
-            db_warm_on_open,
-            json_output,
-            emit_stdout && !emit_olean,
-            &t0,
-            &file,
-            &resolved_file,
-            &canon_resolved_initial,
-            &canon_dir,
-            &toolchain,
-            &mut src,
-            cached_file_blake3.as_deref(),
-            &split,
-            single_split_hits,
-            jobs,
-            parallel_shards,
-            remote_http.as_deref(),
-        )?;
-        if emit_olean {
-            anyhow::ensure!(
-                !crate::lake_build::worktree_auto_link_disabled(&canon_dir),
-                "Worktree opt-out prevents `--emit-olean` from writing `.lake/build` artifacts in {}",
-                canon_dir.display()
-            );
-            anyhow::ensure!(
-                split.hygiene.is_clean_for_certification(),
-                "Refusing `--emit-olean` for `{}`: source is not clean for certification (contains sorry/axiom/weakening directives)",
-                file.display()
-            );
-            let cfg =
-                crate::module_builder::resolve_project_config(&canon_dir).with_context(|| {
-                    format!(
-                        "`--emit-olean` requires a valid Lake workspace in {}",
-                        canon_dir.display()
-                    )
-                })?;
-            let (target_spec, mod_spec) =
-                crate::module_builder::resolve_lean_file_to_workspace_target(
-                    &cfg,
-                    &canon_resolved_initial,
-                )
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "`--emit-olean` could not resolve `{}` to a Lake library/executable module in `{}`",
-                        file.display(),
-                        canon_dir.display()
-                    )
-                })?;
-            let olean_path = mod_spec.build_lib_lean_dir.join(format!(
-                "{}.olean",
-                crate::module_builder::module_name_to_rel_slash(&mod_spec.module_name)
-            ));
-            crate::lake_build::recheck_dependents_if_nonlocal(store, &canon_dir, &resolved_file)?;
-            // Re-run `build_project_modules_native` after any Lake dependent refresh so the target's
-            // `.turbo_verified_sources.json` entry (`kernel_audited = true` + exact `.olean` digest)
-            // stays synchronized with the final on-disk artifact set.
-            let build_rep = crate::module_builder::build_project_modules_native(
+    let res_or_err: Result<serde_json::Value> = (|| {
+        if let Some(target_decl) = decl {
+            check_single_decl(
                 store,
+                db_warm_on_open,
+                json_output,
+                emit_stdout,
+                &t0,
+                &file,
+                &resolved_file,
+                &canon_resolved_initial,
                 &canon_dir,
-                std::slice::from_ref(&target_spec),
-                "trusted",
-                1,
-                false,
-                true,
-                None,
+                &toolchain,
+                &target_decl,
+                src,
+                &mut cached_file_blake3,
+                &mut split,
+                known_modified_vs_head,
+                single_split_hits,
+                remote_http.as_deref(),
+                allow_sorry,
+            )
+        } else {
+            if emit_olean {
+                anyhow::ensure!(
+                    !allow_sorry,
+                    "`--emit-olean` cannot be combined with `--allow-sorry`"
+                );
+            }
+            let mut out_json = check_single_file(
+                store,
+                db_warm_on_open,
+                json_output,
+                emit_stdout && !emit_olean,
+                &t0,
+                &file,
+                &resolved_file,
+                &canon_resolved_initial,
+                &canon_dir,
+                &toolchain,
+                &mut src,
+                cached_file_blake3.as_deref(),
+                &split,
+                single_split_hits,
+                jobs,
+                parallel_shards,
+                remote_http.as_deref(),
+                allow_sorry,
             )?;
-            let built_count = build_rep.modules_compiled
-                + build_rep.modules_cached
-                + build_rep.modules_up_to_date_reused;
-            if build_rep.modules_total == 0 || built_count != build_rep.modules_total {
-                anyhow::bail!(
-                    "`--emit-olean` target `{}` resolved an incomplete module build ({}/{} modules materialized)",
-                    target_spec,
-                    built_count,
-                    build_rep.modules_total
+            if emit_olean {
+                anyhow::ensure!(
+                    !crate::lake_build::worktree_auto_link_disabled(&canon_dir),
+                    "Worktree opt-out prevents `--emit-olean` from writing `.lake/build` artifacts in {}",
+                    canon_dir.display()
                 );
-            }
-            let (_, emitted_gh) =
-                crate::module_builder::read_olean_header_version_and_githash_confined(
-                    &mod_spec.pkg_root,
-                    &olean_path,
-                )
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "`--emit-olean` failed to materialize confined regular `.olean` artifact at `{}`",
-                        olean_path.display()
+                anyhow::ensure!(
+                    split.hygiene.is_clean_for_certification(),
+                    "Refusing `--emit-olean` for `{}`: source is not clean for certification (contains sorry/axiom/weakening directives)",
+                    file.display()
+                );
+                let cfg = crate::module_builder::resolve_project_config(&canon_dir).with_context(
+                    || {
+                        format!(
+                            "`--emit-olean` requires a valid Lake workspace in {}",
+                            canon_dir.display()
+                        )
+                    },
+                )?;
+                let (target_spec, mod_spec) =
+                    crate::module_builder::resolve_lean_file_to_workspace_target(
+                        &cfg,
+                        &canon_resolved_initial,
                     )
-                })?;
-            let exp_gh = cfg.lean_githash.trim();
-            if !exp_gh.is_empty()
-                && exp_gh != "lean-not-installed"
-                && !emitted_gh.eq_ignore_ascii_case(exp_gh)
-            {
-                anyhow::bail!(
-                    "`--emit-olean` emitted `.olean` githash `{}` != active compiler `{}` at `{}`",
-                    emitted_gh,
-                    exp_gh,
-                    olean_path.display()
-                );
-            }
-            let total_ms = t0.elapsed().as_millis() as i64;
-            if let Some(obj) = out_json.as_object_mut() {
-                obj.insert("olean_emitted".to_string(), serde_json::json!(true));
-                obj.insert(
-                    "olean_path".to_string(),
-                    serde_json::json!(olean_path.display().to_string()),
-                );
-                obj.insert(
-                    "module_name".to_string(),
-                    serde_json::json!(mod_spec.module_name),
-                );
-                obj.insert(
-                    "olean_cached".to_string(),
-                    serde_json::json!(
-                        build_rep.modules_cached > 0 && build_rep.modules_compiled == 0
-                    ),
-                );
-                obj.insert("elapsed_ms".to_string(), serde_json::json!(total_ms));
-            }
-            if emit_stdout {
-                if json_output {
-                    println!("{}", serde_json::to_string_pretty(&out_json)?);
-                } else {
-                    println!(
-                        "[turbo-lean] VERIFIED & EMITTED OLEAN {} -> {} ({} ms)",
-                        file.display(),
-                        olean_path.display(),
-                        total_ms
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "`--emit-olean` could not resolve `{}` to a Lake library/executable module in `{}`",
+                            file.display(),
+                            canon_dir.display()
+                        )
+                    })?;
+                let olean_path = mod_spec.build_lib_lean_dir.join(format!(
+                    "{}.olean",
+                    crate::module_builder::module_name_to_rel_slash(&mod_spec.module_name)
+                ));
+                crate::lake_build::recheck_dependents_if_nonlocal(
+                    store,
+                    &canon_dir,
+                    &resolved_file,
+                )?;
+                // Re-run `build_project_modules_native` after any Lake dependent refresh so the target's
+                // `.turbo_verified_sources.json` entry (`kernel_audited = true` + exact `.olean` digest)
+                // stays synchronized with the final on-disk artifact set.
+                let build_rep = crate::module_builder::build_project_modules_native(
+                    store,
+                    &canon_dir,
+                    std::slice::from_ref(&target_spec),
+                    "trusted",
+                    1,
+                    false,
+                    true,
+                    None,
+                )?;
+                let built_count = build_rep.modules_compiled
+                    + build_rep.modules_cached
+                    + build_rep.modules_up_to_date_reused;
+                if build_rep.modules_total == 0 || built_count != build_rep.modules_total {
+                    anyhow::bail!(
+                        "`--emit-olean` target `{}` resolved an incomplete module build ({}/{} modules materialized)",
+                        target_spec,
+                        built_count,
+                        build_rep.modules_total
                     );
                 }
+                let (_, emitted_gh) =
+                    crate::module_builder::read_olean_header_version_and_githash_confined(
+                        &mod_spec.pkg_root,
+                        &olean_path,
+                    )
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "`--emit-olean` failed to materialize confined regular `.olean` artifact at `{}`",
+                            olean_path.display()
+                        )
+                    })?;
+                let exp_gh = cfg.lean_githash.trim();
+                if !exp_gh.is_empty()
+                    && exp_gh != "lean-not-installed"
+                    && !emitted_gh.eq_ignore_ascii_case(exp_gh)
+                {
+                    anyhow::bail!(
+                        "`--emit-olean` emitted `.olean` githash `{}` != active compiler `{}` at `{}`",
+                        emitted_gh,
+                        exp_gh,
+                        olean_path.display()
+                    );
+                }
+                let total_ms = t0.elapsed().as_millis() as i64;
+                if let Some(obj) = out_json.as_object_mut() {
+                    obj.insert("olean_emitted".to_string(), serde_json::json!(true));
+                    obj.insert(
+                        "olean_path".to_string(),
+                        serde_json::json!(olean_path.display().to_string()),
+                    );
+                    obj.insert(
+                        "module_name".to_string(),
+                        serde_json::json!(mod_spec.module_name),
+                    );
+                    obj.insert(
+                        "olean_cached".to_string(),
+                        serde_json::json!(
+                            build_rep.modules_cached > 0 && build_rep.modules_compiled == 0
+                        ),
+                    );
+                    obj.insert("elapsed_ms".to_string(), serde_json::json!(total_ms));
+                }
+                if emit_stdout {
+                    if json_output {
+                        println!("{}", serde_json::to_string_pretty(&out_json)?);
+                    } else {
+                        println!(
+                            "[turbo-lean] VERIFIED & EMITTED OLEAN {} -> {} ({} ms)",
+                            file.display(),
+                            olean_path.display(),
+                            total_ms
+                        );
+                    }
+                }
             }
+            Ok(out_json)
         }
-        out_json
-    };
+    })();
+    if res_or_err.is_err() && allow_sorry {
+        crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(
+            &canon_dir,
+            std::slice::from_ref(&canon_resolved_initial),
+        );
+    }
+    let res = res_or_err?;
     if !emit_olean {
-        crate::lake_build::recheck_dependents_if_nonlocal(store, &canon_dir, &resolved_file)?;
+        crate::lake_build::recheck_dependents_if_nonlocal_with_options(
+            store,
+            &canon_dir,
+            &resolved_file,
+            allow_sorry,
+        )?;
     }
     Ok(res)
 }
@@ -2206,10 +2309,24 @@ fn check_directory(
     toolchain: &str,
     jobs: Option<usize>,
     remote_http: Option<&str>,
+    allow_sorry: bool,
 ) -> Result<serde_json::Value> {
     let dir_files = collect_lean_files(resolved_file);
-    crate::lake_build::ensure_project_imports_fresh_for_check(canon_dir, &dir_files)?;
-    crate::module_builder::ensure_imported_oleans_replayed(store, canon_dir, &dir_files)?;
+    let fresh_res = crate::lake_build::ensure_project_imports_fresh_for_check_with_options(
+        canon_dir,
+        &dir_files,
+        allow_sorry,
+    );
+    if fresh_res.is_err() && allow_sorry {
+        crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(canon_dir, &dir_files);
+    }
+    fresh_res?;
+    let import_res =
+        crate::module_builder::ensure_imported_oleans_replayed(store, canon_dir, &dir_files);
+    if import_res.is_err() && allow_sorry {
+        crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(canon_dir, &dir_files);
+    }
+    import_res?;
     let mut dir_hasher = blake3::Hasher::new();
     dir_hasher.update(toolchain.as_bytes());
 
@@ -2218,6 +2335,7 @@ fn check_directory(
         load_and_split_files_with_hashes_cached(store, &dir_files)?;
     let mut parsed_files = Vec::with_capacity(split_entries.len());
     let mut all_shard_keys = Vec::new();
+    let mut sorry_files: Vec<PathBuf> = Vec::new();
 
     for (lf, src_blake3, src, split) in split_entries {
         anyhow::ensure!(
@@ -2231,6 +2349,11 @@ fn check_directory(
         dir_hasher.update(b":");
         dir_hasher.update(split.interface_hash.as_bytes());
         dir_hasher.update(b"\n");
+
+        if allow_sorry && split.hygiene.is_clean_modulo_sorry() {
+            sorry_files.push(lf);
+            continue;
+        }
 
         let file_lean_args = dir_pkg_cfg
             .as_ref()
@@ -2248,18 +2371,93 @@ fn check_directory(
     let dir_interface_hash = dir_hasher.finalize().to_hex().to_string();
     let dirty: Vec<String> = parsed_files
         .iter()
-        .filter(|(_, _, _, split, _, _)| !split.hygiene.is_clean_for_certification())
+        .filter(|(_, _, _, split, _, _)| {
+            if allow_sorry {
+                !split.hygiene.is_clean_modulo_sorry()
+            } else {
+                !split.hygiene.is_clean_for_certification()
+            }
+        })
         .map(|(lf, _, _, split, _, _)| {
-            format!(
-                "{}: {}",
-                lf.display(),
-                split.hygiene.disallowed_items().join(", ")
-            )
+            let items = if allow_sorry {
+                split.hygiene.disallowed_items_modulo_sorry()
+            } else {
+                split.hygiene.disallowed_items()
+            };
+            format!("{}: {}", lf.display(), items.join(", "))
         })
         .collect();
     if !dirty.is_empty() {
+        if allow_sorry {
+            crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(
+                canon_dir, &dir_files,
+            );
+        }
         anyhow::bail!("Soundness hygiene violation in {}", dirty.join("; "));
     }
+
+    let mut dir_used_sorry = false;
+    let mut dir_sorry_decls: Vec<String> = Vec::new();
+    let mut dir_sorry_hits = 0usize;
+    let mut dir_sorry_misses = 0usize;
+    for sf in &sorry_files {
+        let mut sf_src =
+            fs::read_to_string(sf).with_context(|| format!("Failed to read {}", sf.display()))?;
+        let sf_canon = sf.canonicalize().unwrap_or_else(|_| sf.clone());
+        let sf_deps = compute_imported_olean_interface_hashes(&sf_src, canon_dir, None);
+        let sf_split = split_lean_source(&sf_src, &sf_deps);
+        let sf_b3 = blake3::hash(sf_src.as_bytes()).to_hex().to_string();
+        let sf_res = check_single_file(
+            store,
+            true,
+            false,
+            false,
+            t0,
+            sf,
+            sf,
+            &sf_canon,
+            canon_dir,
+            toolchain,
+            &mut sf_src,
+            Some(sf_b3.as_str()),
+            &sf_split,
+            0,
+            jobs,
+            true,
+            remote_http,
+            true,
+        );
+        if sf_res.is_err() && allow_sorry {
+            crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(
+                canon_dir, &dir_files,
+            );
+        }
+        let sf_json = sf_res?;
+        dir_sorry_hits += sf_json
+            .get("shard_hits")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        dir_sorry_misses += sf_json
+            .get("shard_misses")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        if sf_json
+            .get("used_sorry")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            dir_used_sorry = true;
+        }
+        if let Some(arr) = sf_json.get("sorry_decls").and_then(|v| v.as_array()) {
+            for item in arr.iter().filter_map(|x| x.as_str()) {
+                let s = item.to_string();
+                if !dir_sorry_decls.contains(&s) {
+                    dir_sorry_decls.push(s);
+                }
+            }
+        }
+    }
+
     let cached_map = store.batch_get_theorem_shards(&all_shard_keys, "trusted")?;
 
     let mut total_hits = 0usize;
@@ -2287,23 +2485,58 @@ fn check_directory(
     let total_misses: usize = uncached_files.iter().map(|(_, _, _, u, _)| u.len()).sum();
     if total_misses == 0 {
         let elapsed_ms = t0.elapsed().as_millis();
-        let out_json = serde_json::json!({
-            "status": "all_shards_cached",
+        let combined_hits = total_hits + dir_sorry_hits;
+        let combined_misses = dir_sorry_misses;
+        let mut out_json = serde_json::json!({
+            "status": if dir_used_sorry {
+                "verified_modulo_sorry"
+            } else if dir_sorry_misses > 0 {
+                "file_verified"
+            } else {
+                "all_shards_cached"
+            },
             "file": file.display().to_string(),
             "files_checked": dir_files.len(),
             "file_split_cache_hits": split_cache_hits,
-            "shard_hits": total_hits,
-            "shard_misses": 0,
+            "shard_hits": combined_hits,
+            "shard_misses": combined_misses,
             "interface_hash": dir_interface_hash,
             "elapsed_ms": elapsed_ms
         });
+        if allow_sorry {
+            if let Some(obj) = out_json.as_object_mut() {
+                obj.insert("allow_sorry".to_string(), serde_json::Value::Bool(true));
+                obj.insert(
+                    "used_sorry".to_string(),
+                    serde_json::Value::Bool(dir_used_sorry),
+                );
+                obj.insert(
+                    "sorry_count".to_string(),
+                    serde_json::json!(dir_sorry_decls.len()),
+                );
+                obj.insert(
+                    "sorry_decls".to_string(),
+                    serde_json::json!(dir_sorry_decls),
+                );
+            }
+        }
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
+            } else if dir_used_sorry {
+                println!(
+                    "[turbo-lean] VERIFIED MODULO SORRY {} files in {} ({} sorry decl(s): [{}], {} clean hits, {} ms)",
+                    dir_files.len(),
+                    file.display(),
+                    dir_sorry_decls.len(),
+                    dir_sorry_decls.join(", "),
+                    combined_hits,
+                    elapsed_ms
+                );
             } else {
                 println!(
                     "[turbo-lean] ALL {} THEOREM SHARDS CACHED across {} files in {} ({} ms)",
-                    total_hits,
+                    combined_hits,
                     dir_files.len(),
                     file.display(),
                     elapsed_ms
@@ -2318,7 +2551,12 @@ fn check_directory(
             );
             pack::warm_local_zygote_daemon_nonblocking(store, &fast_ev);
         }
-        crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, resolved_file)?;
+        crate::lake_build::recheck_dependents_if_nonlocal_with_options(
+            store,
+            canon_dir,
+            resolved_file,
+            allow_sorry,
+        )?;
         return Ok(out_json);
     }
 
@@ -2661,11 +2899,42 @@ fn check_directory(
                                 if !out.status.success() {
                                     let stderr = String::from_utf8_lossy(&out.stderr);
                                     let stdout = String::from_utf8_lossy(&out.stdout);
+                                    let combined = format!("{}\n{}", stdout, stderr);
+                                    let hotspot_suffix =
+                                        if crate::zygote::text_indicates_timeout_or_heartbeat(
+                                            &combined,
+                                        ) {
+                                            crate::zygote::diagnose_hotspots_with_zygote_pool(
+                                                &worker_store,
+                                                tc_ref,
+                                                lp_ref,
+                                                env_ref,
+                                                Path::new(lean_bin_ref),
+                                                &coal_src,
+                                                Some(&lf.to_string_lossy()),
+                                                None,
+                                                file_lean_args,
+                                            )
+                                            .map(|(th, sh)| {
+                                                let fmt =
+                                                    crate::zygote::format_hotspot_diagnostics(
+                                                        &th, &sh,
+                                                    );
+                                                if fmt.is_empty() {
+                                                    String::new()
+                                                } else {
+                                                    format!("\n{fmt}")
+                                                }
+                                            })
+                                            .unwrap_or_default()
+                                        } else {
+                                            String::new()
+                                        };
                                     anyhow::bail!(
-                                        "Directory check failed in {}:\n{}\n{}",
+                                        "Directory check failed in {}:\n{}{}",
                                         lf.display(),
-                                        stdout,
-                                        stderr
+                                        combined,
+                                        hotspot_suffix
                                     );
                                 }
                             }
@@ -2708,28 +2977,58 @@ fn check_directory(
     store.batch_publish_theorem_shards(toolchain, "trusted", &all_batch_items)?;
 
     let elapsed_ms = t0.elapsed().as_millis();
-    let out_json = serde_json::json!({
-        "status": "file_verified",
+    let combined_hits = total_hits + dir_sorry_hits;
+    let combined_misses = total_misses + dir_sorry_misses;
+    let mut out_json = serde_json::json!({
+        "status": if dir_used_sorry { "verified_modulo_sorry" } else { "file_verified" },
         "mode": dir_verify_mode,
         "file": file.display().to_string(),
         "files_checked": dir_files.len(),
-        "shard_hits": total_hits,
-        "shard_misses": total_misses,
+        "shard_hits": combined_hits,
+        "shard_misses": combined_misses,
         "parallel_jobs": effective_jobs,
         "lake_env_cache_hit": env_cache_hit,
         "interface_hash": dir_interface_hash,
         "elapsed_ms": elapsed_ms
     });
+    if allow_sorry {
+        if let Some(obj) = out_json.as_object_mut() {
+            obj.insert("allow_sorry".to_string(), serde_json::Value::Bool(true));
+            obj.insert(
+                "used_sorry".to_string(),
+                serde_json::Value::Bool(dir_used_sorry),
+            );
+            obj.insert(
+                "sorry_count".to_string(),
+                serde_json::json!(dir_sorry_decls.len()),
+            );
+            obj.insert(
+                "sorry_decls".to_string(),
+                serde_json::json!(dir_sorry_decls),
+            );
+        }
+    }
     if emit_stdout {
         if json_output {
             println!("{}", serde_json::to_string_pretty(&out_json)?);
+        } else if dir_used_sorry {
+            println!(
+                "[turbo-lean] VERIFIED MODULO SORRY {} files in {} ({} sorry decl(s): [{}], {} clean hits, {} clean misses cached, {} ms)",
+                dir_files.len(),
+                file.display(),
+                dir_sorry_decls.len(),
+                dir_sorry_decls.join(", "),
+                combined_hits,
+                total_misses,
+                elapsed_ms
+            );
         } else {
             println!(
                 "[turbo-lean] VERIFIED {} files in {} ({} hits, {} misses cached, {} ms)",
                 dir_files.len(),
                 file.display(),
-                total_hits,
-                total_misses,
+                combined_hits,
+                combined_misses,
                 elapsed_ms
             );
         }
@@ -2753,7 +3052,12 @@ fn check_directory(
         };
         pack::warm_local_zygote_daemon_nonblocking(store, &ev);
     }
-    crate::lake_build::recheck_dependents_if_nonlocal(store, canon_dir, resolved_file)?;
+    crate::lake_build::recheck_dependents_if_nonlocal_with_options(
+        store,
+        canon_dir,
+        resolved_file,
+        allow_sorry,
+    )?;
     Ok(out_json)
 }
 
@@ -2845,6 +3149,7 @@ fn extract_decl_source_from_file(active_src: &str, shard: &splitter::TheoremShar
 fn target_hygiene_violations(
     split: &splitter::SplitResult,
     shard: &splitter::TheoremShard,
+    allow_sorry: bool,
 ) -> Vec<String> {
     let on_shard_lines = |item: &String| {
         item.strip_prefix('L')
@@ -2852,13 +3157,67 @@ fn target_hygiene_violations(
             .and_then(|(ln, _)| ln.parse::<usize>().ok())
             .is_some_and(|ln| shard.start_line <= ln && ln <= shard.end_line)
     };
-    let mut items: Vec<String> = split.hygiene.disallowed_items();
+    let mut items: Vec<String> = if allow_sorry {
+        split.hygiene.disallowed_items_modulo_sorry()
+    } else {
+        split.hygiene.disallowed_items()
+    };
     items.retain(on_shard_lines);
     if items.is_empty() {
         let text = format!("{}\n{}", shard.signature_text, shard.proof_text);
-        items = splitter::audit_hygiene(&splitter::strip_lean_comments(&text)).disallowed_items();
+        let fresh = splitter::audit_hygiene(&splitter::strip_lean_comments(&text));
+        items = if allow_sorry {
+            fresh.disallowed_items_modulo_sorry()
+        } else {
+            fresh.disallowed_items()
+        };
     }
     items
+}
+
+fn shard_text_contains_sorry_or_admit(shard: &splitter::TheoremShard) -> bool {
+    let text = format!("{}\n{}", shard.signature_text, shard.proof_text);
+    let rep = splitter::audit_hygiene(&splitter::strip_lean_comments(&text));
+    rep.has_sorry
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_append_hotspot_diagnostics_for_source(
+    store: &TurboStore,
+    toolchain: &str,
+    local_lean_path: &str,
+    env_vars: &HashMap<String, String>,
+    lean_bin: &Path,
+    source: &str,
+    file_name: Option<&str>,
+    lean_args: &[String],
+    err_text: &str,
+) -> String {
+    if !crate::zygote::text_indicates_timeout_or_heartbeat(err_text)
+        || err_text.contains("[hotspot] ")
+    {
+        return String::new();
+    }
+    crate::zygote::diagnose_hotspots_with_zygote_pool(
+        store,
+        toolchain,
+        local_lean_path,
+        env_vars,
+        lean_bin,
+        source,
+        file_name,
+        None,
+        lean_args,
+    )
+    .map(|(th, sh)| {
+        let fmt = crate::zygote::format_hotspot_diagnostics(&th, &sh);
+        if fmt.is_empty() {
+            String::new()
+        } else {
+            format!("\n{fmt}")
+        }
+    })
+    .unwrap_or_default()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2880,6 +3239,7 @@ fn check_single_decl(
     known_modified_vs_head: bool,
     _single_split_hits: usize,
     remote_http: Option<&str>,
+    allow_sorry: bool,
 ) -> Result<serde_json::Value> {
     let mut active_src = src;
     let mut active_file = resolved_file.to_path_buf();
@@ -2999,7 +3359,7 @@ fn check_single_decl(
     let resolved_decl = split.shards[shard_idx].decl_name().to_string();
     let target_decl = resolved_decl.as_str();
     let shard = &split.shards[shard_idx];
-    let target_violations = target_hygiene_violations(split, shard);
+    let target_violations = target_hygiene_violations(split, shard, allow_sorry);
     if !target_violations.is_empty() {
         anyhow::bail!(
             "Soundness hygiene violation in `{}` ({}): {}",
@@ -3008,6 +3368,7 @@ fn check_single_decl(
             target_violations.join(", ")
         );
     }
+    let shard_has_sorry = shard_text_contains_sorry_or_admit(shard);
     // Stat/split caches are not evidence of the identity in the current source.
     if active_src.is_empty() {
         active_src = fs::read_to_string(&active_file)?;
@@ -3044,7 +3405,7 @@ fn check_single_decl(
                 &shard.proof_text,
             )
         });
-        serde_json::json!({
+        let mut hit_json = serde_json::json!({
             "status": "theorem_cache_hit",
             "decl": target_decl,
             "coalesced": coalesced,
@@ -3062,8 +3423,330 @@ fn check_single_decl(
             "compact_summary": format!("OK decl={} ms={} stage=cache_hit", target_decl, elapsed_ms),
             "estimated_tokens": 18,
             "elapsed_ms": elapsed_ms
-        })
+        });
+        if allow_sorry {
+            if let Some(obj) = hit_json.as_object_mut() {
+                obj.insert("allow_sorry".to_string(), serde_json::Value::Bool(true));
+                obj.insert("used_sorry".to_string(), serde_json::Value::Bool(false));
+                obj.insert("sorry_count".to_string(), serde_json::json!(0));
+                obj.insert("sorry_decls".to_string(), serde_json::json!([]));
+            }
+        }
+        hit_json
     };
+
+    if allow_sorry {
+        // Under `--allow-sorry`, a clean sibling shard may still hit `TheoremProofCAS`,
+        // whereas any modulo-sorry check runs in-process without touching singleflight or CAS.
+        // Always route `allow_sorry` through this branch even when `file` itself is lexically
+        // `sorry`-free so a transitive `sorryAx` dependency from an imported workspace module
+        // is reported as `verified_modulo_sorry` (and never cached in `TheoremProofCAS`).
+        if !shard_has_sorry
+            && db_warm_on_open
+            && store.has_attested_decl_receipt(
+                &shard_key,
+                "trusted",
+                target_decl,
+                &attested.kernel_type_hash,
+            )
+        {
+            let elapsed_ms = t0.elapsed().as_millis();
+            let out_json = make_cache_hit_json(false, elapsed_ms);
+            if emit_stdout {
+                if json_output {
+                    println!("{}", serde_json::to_string_pretty(&out_json)?);
+                } else {
+                    println!(
+                        "[turbo-lean] SHARD CACHE HIT `{}` (coalesced=false, {} ms)",
+                        target_decl, elapsed_ms
+                    );
+                }
+            }
+            return Ok(out_json);
+        }
+
+        let rooted_target = shard.rooted_name();
+        let single_set = HashSet::from([rooted_target.clone()]);
+        let full_shard_src = if !shard.shard_source.is_empty() {
+            shard.shard_source.clone()
+        } else {
+            splitter::reconstruct_single_shard_source(&active_src, &rooted_target)?
+                .unwrap_or_default()
+        };
+        let (env_vars, env_cache_hit) = resolve_lake_env(store, canon_dir)?;
+        let lean_bin = resolve_lean_bin(canon_dir)?;
+        let local_lean_path = resolve_remote_lean_path(canon_dir, Some(&env_vars));
+        let mut stub_targets: Vec<String> = single_set.iter().cloned().collect();
+        stub_targets.sort();
+
+        let mut verified_via_zygote = false;
+        let mut zygote_env_cache_hit = false;
+        let mut zygote_import_us = 0u64;
+        let mut zygote_elab_us = 0u64;
+        let mut heartbeats_used = 0u64;
+        let mut proof_term_nodes = 0u64;
+        let mut rss_delta_mb = 0i64;
+        let mut peak_rss_mb = crate::zygote::measure_process_rss_mb(std::process::id());
+        let mut used_constants: Vec<String> = Vec::new();
+        let mut used_sorry = shard_has_sorry;
+        let mut sorry_decls: Vec<String> = Vec::new();
+
+        let reply = crate::zygote::eval_with_zygote_pool_for_targets_modulo_sorry(
+            store,
+            toolchain,
+            &local_lean_path,
+            &env_vars,
+            Path::new(&lean_bin),
+            &full_shard_src,
+            &stub_targets,
+            Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+            &file_lean_args,
+            true,
+        )
+        .with_context(|| {
+            format!(
+                "Zygote check failed for `{}` in {} (lines {}..={})",
+                target_decl,
+                file.display(),
+                shard.start_line,
+                shard.end_line
+            )
+        })?;
+        let c_abi_sound = unsafe {
+            crate::splitter::turbo_spec_is_sound_decl_summary(0, 0, 0, if reply.ok { 0 } else { 1 })
+                != 0
+        };
+        if reply.import_ok && reply.ok && !reply.crashed && !reply.timed_out && c_abi_sound {
+            crate::zygote::verify_attested_decl_types(&reply.decl_types, &expected_type_pair)?;
+            verified_via_zygote = true;
+            zygote_env_cache_hit = reply.env_cache_hit;
+            zygote_import_us = reply.import_us;
+            zygote_elab_us = reply.elab_us;
+            heartbeats_used = reply.heartbeats;
+            proof_term_nodes = reply.proof_term_nodes;
+            rss_delta_mb = reply.rss_delta_mb;
+            peak_rss_mb = peak_rss_mb.max(reply.peak_rss_mb);
+            used_constants = reply.used_constants;
+            used_sorry |= reply.used_sorry || !reply.sorry_decls.is_empty();
+            sorry_decls = reply.sorry_decls;
+        } else if reply.crashed || reply.timed_out || reply.import_ok {
+            let orig_display = file.display().to_string();
+            let raw_err = reply
+                .errors
+                .join("\n")
+                .replace("<zygote-decl>", &orig_display)
+                .replace("<zygote-shard>", &orig_display);
+            let m_diags = extract_mismatch_diagnostics(&raw_err);
+            let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+            let h_fmt = crate::zygote::format_hotspot_diagnostics(
+                &reply.timeout_hotspots,
+                &reply.simp_hotspots,
+            );
+            let h_suffix = if h_fmt.is_empty() {
+                String::new()
+            } else {
+                format!("\n{h_fmt}")
+            };
+            anyhow::bail!(
+                "lean check failed for `{}` in {} (lines {}..={}):\n{}{}{}",
+                target_decl,
+                file.display(),
+                shard.start_line,
+                shard.end_line,
+                raw_err,
+                m_suffix,
+                h_suffix
+            );
+        }
+
+        if !verified_via_zygote {
+            let default_stack = env_vars
+                .get("LEAN_STACK_SIZE_KB")
+                .cloned()
+                .or_else(|| std::env::var("LEAN_STACK_SIZE_KB").ok())
+                .unwrap_or_else(|| "262144".to_string());
+            let mut fallback_env = env_vars.clone();
+            fallback_env.insert("LEAN_STACK_SIZE_KB".to_string(), default_stack);
+            let (out, audit_rep) = crate::zygote::run_audited_lean_shard_with_sorry_report(
+                store,
+                Path::new(&lean_bin),
+                &fallback_env,
+                Some(canon_dir),
+                &full_shard_src,
+                &single_set,
+                &expected_type_pair,
+                &file_lean_args,
+                Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                true,
+            )
+            .with_context(|| {
+                format!(
+                    "Shard check failed for `{}` in {} (lines {}..={})",
+                    target_decl,
+                    file.display(),
+                    shard.start_line,
+                    shard.end_line
+                )
+            })?;
+            if !out.status.success() {
+                let orig_display = file.display().to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+                let combined_err = format!("{}\n{}", stdout, stderr);
+                let m_diags = extract_mismatch_diagnostics(&combined_err);
+                let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                let h_suffix = maybe_append_hotspot_diagnostics_for_source(
+                    store,
+                    toolchain,
+                    &local_lean_path,
+                    &fallback_env,
+                    Path::new(&lean_bin),
+                    &full_shard_src,
+                    Some(&orig_display),
+                    &file_lean_args,
+                    &combined_err,
+                );
+                anyhow::bail!(
+                    "Shard check failed for `{}` in {} (lines {}..={}):\n{}{}{}",
+                    target_decl,
+                    orig_display,
+                    shard.start_line,
+                    shard.end_line,
+                    combined_err,
+                    m_suffix,
+                    h_suffix
+                );
+            }
+            used_sorry |= audit_rep.used_sorry || !audit_rep.sorry_decls.is_empty();
+            sorry_decls = audit_rep.sorry_decls;
+        }
+
+        if used_sorry && sorry_decls.is_empty() {
+            sorry_decls.push(target_decl.to_string());
+        }
+        sorry_decls.sort();
+        sorry_decls.dedup();
+
+        let dur_ms = t0.elapsed().as_millis() as i64;
+        if !used_sorry && !shard_has_sorry && sorry_decls.is_empty() {
+            let receipt = make_attested_shard_receipt_bytes(
+                target_decl,
+                &shard.prefix_env_hash,
+                &shard.stmt_hash,
+                &shard.proof_hash,
+                db::now_unix(),
+                Some(&attested.kernel_type_hash),
+            )?;
+            store.batch_publish_theorem_shards(
+                toolchain,
+                "trusted",
+                &[(
+                    shard_key.clone(),
+                    target_decl.to_string(),
+                    receipt,
+                    dur_ms.max(1),
+                )],
+            )?;
+        }
+
+        if proof_term_nodes == 0 {
+            proof_term_nodes = crate::matryoshka::estimate_decl_proof_term_nodes(
+                target_decl,
+                &shard.signature_text,
+                &shard.proof_text,
+            );
+        }
+        let stmt_feats =
+            crate::matryoshka::parse_lean_stmt_features(target_decl, &shard.signature_text);
+        let tactic_skeleton = crate::matryoshka::extract_tactic_skeleton(&shard.proof_text);
+        let status_str = if used_sorry {
+            "verified_modulo_sorry"
+        } else {
+            "theorem_verified"
+        };
+        let compact_summary = if used_sorry {
+            format!(
+                "MODULO_SORRY decl={} sorry_count={} ms={} hbs={}",
+                target_decl,
+                sorry_decls.len(),
+                dur_ms,
+                heartbeats_used
+            )
+        } else {
+            format!(
+                "OK decl={} ms={} hbs={} stage={}",
+                target_decl,
+                dur_ms,
+                heartbeats_used,
+                if verified_via_zygote {
+                    "zygote"
+                } else {
+                    "lean"
+                }
+            )
+        };
+        let out_json = serde_json::json!({
+            "status": status_str,
+            "allow_sorry": true,
+            "used_sorry": used_sorry,
+            "sorry_count": sorry_decls.len(),
+            "sorry_decls": sorry_decls,
+            "decl": target_decl,
+            "shard_key": shard_key,
+            "lake_env_cache_hit": env_cache_hit,
+            "fast_olean_import": false,
+            "zygote_used": verified_via_zygote,
+            "zygote_env_cache_hit": zygote_env_cache_hit,
+            "zygote_import_us": zygote_import_us,
+            "zygote_elab_us": zygote_elab_us,
+            "heartbeats_used": heartbeats_used,
+            "proof_term_nodes": proof_term_nodes,
+            "used_constants": used_constants,
+            "stmt_nodes": stmt_feats.stmt_nodes,
+            "stmt_depth": stmt_feats.stmt_depth,
+            "num_binders": stmt_feats.num_binders,
+            "goal_head": stmt_feats.goal_head,
+            "stmt_consts": stmt_feats.stmt_consts,
+            "tactic_skeleton": tactic_skeleton,
+            "rss_delta_mb": rss_delta_mb,
+            "peak_rss_mb": peak_rss_mb,
+            "accelerator_assisted": false,
+            "winning_accelerator": serde_json::Value::Null,
+            "fission_cached_subshards": 0,
+            "fission_verified_subshards": 0,
+            "interface_hash": split.interface_hash,
+            "prefix_env_hash": shard.prefix_env_hash,
+            "total_shards_in_file": split.shards.len(),
+            "compact_summary": compact_summary,
+            "estimated_tokens": 18,
+            "elapsed_ms": dur_ms
+        });
+        if emit_stdout {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&out_json)?);
+            } else if used_sorry {
+                println!(
+                    "[turbo-lean] VERIFIED MODULO SORRY `{}` ({} sorry decl(s): [{}], {} ms)",
+                    target_decl,
+                    sorry_decls.len(),
+                    sorry_decls.join(", "),
+                    dur_ms
+                );
+            } else {
+                println!(
+                    "[turbo-lean] SHARD VERIFIED `{}` ({}/{} shards in file, env_cache_hit={}, fast_olean=false, zygote={}, interface_hash={}.., {} ms)",
+                    target_decl,
+                    1,
+                    split.shards.len(),
+                    env_cache_hit,
+                    verified_via_zygote,
+                    &split.interface_hash[..12],
+                    dur_ms
+                );
+            }
+        }
+        return Ok(out_json);
+    }
 
     if let Some(remote_url) = remote_http {
         if db_warm_on_open
@@ -4151,14 +4834,26 @@ fn check_single_decl(
                             .replace("<zygote-shard>", &orig_display);
                         let m_diags = extract_mismatch_diagnostics(&raw_err);
                         let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                        let h_suffix = maybe_append_hotspot_diagnostics_for_source(
+                            store,
+                            toolchain,
+                            &local_lean_path,
+                            &env_vars,
+                            Path::new(&lean_bin),
+                            &full_shard_src,
+                            Some(&orig_display),
+                            &file_lean_args,
+                            &raw_err,
+                        );
                         anyhow::bail!(
-                            "lean check failed for `{}` in {} (lines {}..={}):\n{}{}",
+                            "lean check failed for `{}` in {} (lines {}..={}):\n{}{}{}",
                             target_decl,
                             file.display(),
                             shard.start_line,
                             shard.end_line,
                             raw_err,
-                            m_suffix
+                            m_suffix,
+                            h_suffix
                         );
                     }
                     if env_vars.len() <= 1 {
@@ -4217,14 +4912,24 @@ fn check_single_decl(
                             .replace("<zygote-shard>", &orig_display);
                         let m_diags = extract_mismatch_diagnostics(&raw_err);
                         let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                        let h_fmt = crate::zygote::format_hotspot_diagnostics(
+                            &reply.timeout_hotspots,
+                            &reply.simp_hotspots,
+                        );
+                        let h_suffix = if h_fmt.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\n{h_fmt}")
+                        };
                         anyhow::bail!(
-                            "lean check failed for `{}` in {} (lines {}..={}):\n{}{}",
+                            "lean check failed for `{}` in {} (lines {}..={}):\n{}{}{}",
                             target_decl,
                             file.display(),
                             shard.start_line,
                             shard.end_line,
                             raw_err,
-                            m_suffix
+                            m_suffix,
+                            h_suffix
                         );
                     }
                 }
@@ -4264,14 +4969,26 @@ fn check_single_decl(
                         let combined_err = format!("{}\n{}", stdout, stderr);
                         let m_diags = extract_mismatch_diagnostics(&combined_err);
                         let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                        let h_suffix = maybe_append_hotspot_diagnostics_for_source(
+                            store,
+                            toolchain,
+                            &local_lean_path,
+                            &fallback_env,
+                            Path::new(&lean_bin),
+                            &full_shard_src,
+                            Some(&orig_display),
+                            &file_lean_args,
+                            &combined_err,
+                        );
                         anyhow::bail!(
-                            "Shard check failed for `{}` in {} (lines {}..={}):\n{}{}",
+                            "Shard check failed for `{}` in {} (lines {}..={}):\n{}{}{}",
                             target_decl,
                             orig_display,
                             shard.start_line,
                             shard.end_line,
                             combined_err,
-                            m_suffix
+                            m_suffix,
+                            h_suffix
                         );
                     }
                 }
@@ -4396,6 +5113,14 @@ fn check_single_decl(
                     );
                 }
             }
+            if allow_sorry {
+                if let Some(obj) = out_json.as_object_mut() {
+                    obj.insert("allow_sorry".to_string(), serde_json::Value::Bool(true));
+                    obj.insert("used_sorry".to_string(), serde_json::Value::Bool(false));
+                    obj.insert("sorry_count".to_string(), serde_json::json!(0));
+                    obj.insert("sorry_decls".to_string(), serde_json::json!([]));
+                }
+            }
             if inflight_tx_open {
                 store.commit_inflight_publish_for_lease(&lease.action_key)?;
             } else {
@@ -4513,6 +5238,7 @@ fn check_single_file(
     jobs: Option<usize>,
     _parallel_shards: bool,
     remote_http: Option<&str>,
+    allow_sorry: bool,
 ) -> Result<serde_json::Value> {
     let file_lean_args = crate::module_builder::try_resolve_lean_args_for_path(
         canon_dir,
@@ -4532,10 +5258,12 @@ fn check_single_file(
     let mut hits = 0usize;
     let mut uncached_shards = Vec::new();
     let mut attested_kths: HashMap<String, String> = HashMap::new();
-    if split.eligible_for_sharding
-        && split.hygiene.is_clean_for_certification()
-        && !split.shards.is_empty()
-    {
+    let hygiene_ok_for_split = if allow_sorry {
+        split.hygiene.is_clean_modulo_sorry()
+    } else {
+        split.hygiene.is_clean_for_certification()
+    };
+    if split.eligible_for_sharding && hygiene_ok_for_split && !split.shards.is_empty() {
         if src.is_empty() {
             *src = fs::read_to_string(resolved_file)
                 .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
@@ -4555,7 +5283,8 @@ fn check_single_file(
     }
     for (idx, shard) in split.shards.iter().enumerate() {
         let shard_key = file_shard_keys[idx].clone();
-        let is_attested_hit = cached_map.contains_key(&shard_key)
+        let is_attested_hit = (!allow_sorry || !shard_text_contains_sorry_or_admit(shard))
+            && cached_map.contains_key(&shard_key)
             && attested_kths.get(&shard_key).is_some_and(|kth| {
                 store.has_attested_decl_receipt(&shard_key, "trusted", shard.decl_name(), kth)
             });
@@ -4569,6 +5298,485 @@ fn check_single_file(
         }
     }
     let misses = uncached_shards.len();
+
+    if allow_sorry {
+        if !split.hygiene.is_clean_modulo_sorry() {
+            let items = split.hygiene.disallowed_items_modulo_sorry();
+            anyhow::bail!(
+                "Soundness hygiene violation in {}: {}",
+                file.display(),
+                if items.is_empty() {
+                    "file contains forbidden axioms or checking-weakening options".to_string()
+                } else {
+                    items.join(", ")
+                }
+            );
+        }
+        if misses == 0 && split.hygiene.is_clean_for_certification() && !split.shards.is_empty() {
+            let elapsed_ms = t0.elapsed().as_millis() as i64;
+            let out_json = serde_json::json!({
+                "status": "all_shards_cached",
+                "allow_sorry": true,
+                "used_sorry": false,
+                "sorry_count": 0,
+                "sorry_decls": [],
+                "file": file.display().to_string(),
+                "shard_hits": hits,
+                "shard_misses": 0,
+                "interface_hash": split.interface_hash,
+                "elapsed_ms": elapsed_ms
+            });
+            if emit_stdout {
+                if json_output {
+                    println!("{}", serde_json::to_string_pretty(&out_json)?);
+                } else {
+                    println!(
+                        "[turbo-lean] ALL {} THEOREM SHARDS CACHED in {} (interface_hash={}.., {} ms)",
+                        hits,
+                        file.display(),
+                        &split.interface_hash[..12],
+                        elapsed_ms
+                    );
+                }
+            }
+            return Ok(out_json);
+        }
+        if src.is_empty() {
+            *src = fs::read_to_string(resolved_file)
+                .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
+        }
+        let (env_vars, env_cache_hit) = resolve_lake_env(store, canon_dir)?;
+        let lean_bin = resolve_lean_bin(canon_dir)?;
+        let local_lean_path = resolve_remote_lean_path(canon_dir, Some(&env_vars));
+        let orig_display = file.display().to_string();
+        let mut file_used_sorry = split.hygiene.has_sorry;
+        let mut file_sorry_decls: Vec<String> = Vec::new();
+        let mut clean_batch_items: Vec<(String, String, Vec<u8>, i64)> = Vec::new();
+
+        if split.eligible_for_sharding && !split.shards.is_empty() {
+            let now = db::now_unix();
+            for (shard_key, shard) in &uncached_shards {
+                let shard_has_sorry = shard_text_contains_sorry_or_admit(shard);
+                let rooted_target = shard.rooted_name();
+                let single_set = HashSet::from([rooted_target.clone()]);
+                let shard_src_owned = if shard.shard_source.is_empty() {
+                    splitter::build_coalesced_shard_source(src, &single_set)
+                } else {
+                    shard.shard_source.clone()
+                };
+                let expected_pair: Vec<(String, String)> = attested_kths
+                    .get(shard_key)
+                    .map(|k| vec![(shard.decl_name().to_string(), k.clone())])
+                    .unwrap_or_default();
+                let shard_t0 = Instant::now();
+                let targets_vec = vec![rooted_target.clone()];
+
+                if !shard_has_sorry {
+                    // Try strict verification first so clean sibling shards with `0 sorryAx`
+                    // in their kernel closure can be certified and cached in `TheoremProofCAS`.
+                    let strict_reply = crate::zygote::eval_with_zygote_pool_for_targets(
+                        store,
+                        toolchain,
+                        &local_lean_path,
+                        &env_vars,
+                        Path::new(&lean_bin),
+                        &shard_src_owned,
+                        &targets_vec,
+                        Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                        &file_lean_args,
+                    )?;
+                    let c_abi_sound = unsafe {
+                        crate::splitter::turbo_spec_is_sound_decl_summary(
+                            0,
+                            0,
+                            0,
+                            if strict_reply.ok { 0 } else { 1 },
+                        ) != 0
+                    };
+                    if strict_reply.import_ok
+                        && strict_reply.ok
+                        && !strict_reply.crashed
+                        && !strict_reply.timed_out
+                        && c_abi_sound
+                    {
+                        if !expected_pair.is_empty() {
+                            crate::zygote::verify_attested_decl_types(
+                                &strict_reply.decl_types,
+                                &expected_pair,
+                            )?;
+                        }
+                        let shard_dur_ms = (shard_t0.elapsed().as_millis() as i64).max(1);
+                        let receipt = make_attested_shard_receipt_bytes(
+                            shard.decl_name(),
+                            &shard.prefix_env_hash,
+                            &shard.stmt_hash,
+                            &shard.proof_hash,
+                            now,
+                            attested_kths.get(shard_key).map(String::as_str),
+                        )?;
+                        clean_batch_items.push((
+                            shard_key.clone(),
+                            shard.decl_name().to_string(),
+                            receipt,
+                            shard_dur_ms,
+                        ));
+                        continue;
+                    }
+                }
+
+                // Modulo-sorry check for sorry-bearing shards or clean-text shards that depend
+                // on an upstream `sorry`-bearing helper definition. Never cached in CAS!
+                let mut shard_verified_modulo = false;
+                let mod_reply = crate::zygote::eval_with_zygote_pool_for_targets_modulo_sorry(
+                    store,
+                    toolchain,
+                    &local_lean_path,
+                    &env_vars,
+                    Path::new(&lean_bin),
+                    &shard_src_owned,
+                    &targets_vec,
+                    Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                    &file_lean_args,
+                    true,
+                )?;
+                let c_abi_sound = unsafe {
+                    crate::splitter::turbo_spec_is_sound_decl_summary(
+                        0,
+                        0,
+                        0,
+                        if mod_reply.ok { 0 } else { 1 },
+                    ) != 0
+                };
+                if mod_reply.import_ok
+                    && mod_reply.ok
+                    && !mod_reply.crashed
+                    && !mod_reply.timed_out
+                    && c_abi_sound
+                {
+                    if !expected_pair.is_empty() {
+                        crate::zygote::verify_attested_decl_types(
+                            &mod_reply.decl_types,
+                            &expected_pair,
+                        )?;
+                    }
+                    shard_verified_modulo = true;
+                    let this_used_sorry = shard_has_sorry
+                        || mod_reply.used_sorry
+                        || !mod_reply.sorry_decls.is_empty();
+                    file_used_sorry |= this_used_sorry;
+                    for sd in mod_reply.sorry_decls {
+                        if !file_sorry_decls.contains(&sd) {
+                            file_sorry_decls.push(sd);
+                        }
+                    }
+                    if this_used_sorry && !file_sorry_decls.iter().any(|d| d == shard.decl_name()) {
+                        file_sorry_decls.push(shard.decl_name().to_string());
+                    }
+                } else if mod_reply.crashed || mod_reply.timed_out || mod_reply.import_ok {
+                    let raw_err = mod_reply
+                        .errors
+                        .join("\n")
+                        .replace("<zygote-decl>", &orig_display)
+                        .replace("<zygote-shard>", &orig_display);
+                    let m_diags = extract_mismatch_diagnostics(&raw_err);
+                    let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                    let h_fmt = crate::zygote::format_hotspot_diagnostics(
+                        &mod_reply.timeout_hotspots,
+                        &mod_reply.simp_hotspots,
+                    );
+                    let h_suffix = if h_fmt.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n{h_fmt}")
+                    };
+                    anyhow::bail!(
+                        "Check failed for `{}` in {} (lines {}..={}):\n{}{}{}",
+                        shard.decl_name(),
+                        orig_display,
+                        shard.start_line,
+                        shard.end_line,
+                        raw_err,
+                        m_suffix,
+                        h_suffix
+                    );
+                }
+
+                if !shard_verified_modulo {
+                    let (out, audit_rep) = crate::zygote::run_audited_lean_shard_with_sorry_report(
+                        store,
+                        Path::new(&lean_bin),
+                        &env_vars,
+                        Some(canon_dir),
+                        &shard_src_owned,
+                        &single_set,
+                        &expected_pair,
+                        &file_lean_args,
+                        Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                        true,
+                    )?;
+                    if !out.status.success() {
+                        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+                        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+                        let combined_err = format!("{}\n{}", stdout, stderr);
+                        let m_diags = extract_mismatch_diagnostics(&combined_err);
+                        let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                        let h_suffix = maybe_append_hotspot_diagnostics_for_source(
+                            store,
+                            toolchain,
+                            &local_lean_path,
+                            &env_vars,
+                            Path::new(&lean_bin),
+                            &shard_src_owned,
+                            Some(&orig_display),
+                            &file_lean_args,
+                            &combined_err,
+                        );
+                        anyhow::bail!(
+                            "Check failed for `{}` in {} (lines {}..={}):\n{}{}{}",
+                            shard.decl_name(),
+                            orig_display,
+                            shard.start_line,
+                            shard.end_line,
+                            combined_err,
+                            m_suffix,
+                            h_suffix
+                        );
+                    }
+                    if !shard_has_sorry && !audit_rep.used_sorry && audit_rep.sorry_decls.is_empty()
+                    {
+                        let shard_dur_ms = (shard_t0.elapsed().as_millis() as i64).max(1);
+                        let receipt = make_attested_shard_receipt_bytes(
+                            shard.decl_name(),
+                            &shard.prefix_env_hash,
+                            &shard.stmt_hash,
+                            &shard.proof_hash,
+                            now,
+                            attested_kths.get(shard_key).map(String::as_str),
+                        )?;
+                        clean_batch_items.push((
+                            shard_key.clone(),
+                            shard.decl_name().to_string(),
+                            receipt,
+                            shard_dur_ms,
+                        ));
+                    } else {
+                        file_used_sorry = true;
+                        for sd in audit_rep.sorry_decls {
+                            if !file_sorry_decls.contains(&sd) {
+                                file_sorry_decls.push(sd);
+                            }
+                        }
+                        if !file_sorry_decls.iter().any(|d| d == shard.decl_name()) {
+                            file_sorry_decls.push(shard.decl_name().to_string());
+                        }
+                    }
+                }
+            }
+
+            if !clean_batch_items.is_empty() {
+                store.batch_publish_theorem_shards(toolchain, "trusted", &clean_batch_items)?;
+            }
+            file_sorry_decls.sort();
+            file_sorry_decls.dedup();
+            let dur_ms = t0.elapsed().as_millis() as i64;
+            let status_str = if file_used_sorry {
+                "verified_modulo_sorry"
+            } else {
+                "file_verified"
+            };
+            let out_json = serde_json::json!({
+                "status": status_str,
+                "allow_sorry": true,
+                "used_sorry": file_used_sorry,
+                "sorry_count": file_sorry_decls.len(),
+                "sorry_decls": file_sorry_decls,
+                "mode": "modulo_sorry_shards",
+                "file": file.display().to_string(),
+                "shard_hits": hits,
+                "shard_misses": misses,
+                "clean_shards_cached": clean_batch_items.len(),
+                "lake_env_cache_hit": env_cache_hit,
+                "interface_hash": split.interface_hash,
+                "elapsed_ms": dur_ms
+            });
+            if emit_stdout {
+                if json_output {
+                    println!("{}", serde_json::to_string_pretty(&out_json)?);
+                } else if file_used_sorry {
+                    println!(
+                        "[turbo-lean] VERIFIED MODULO SORRY {} ({} sorry decl(s): [{}], {} clean hits, {} clean misses cached, interface_hash={}.., {} ms)",
+                        file.display(),
+                        file_sorry_decls.len(),
+                        file_sorry_decls.join(", "),
+                        hits,
+                        clean_batch_items.len(),
+                        &split.interface_hash[..12],
+                        dur_ms
+                    );
+                } else {
+                    println!(
+                        "[turbo-lean] VERIFIED {} ({} hits, {} misses cached, interface_hash={}.., {} ms)",
+                        file.display(),
+                        hits,
+                        clean_batch_items.len(),
+                        &split.interface_hash[..12],
+                        dur_ms
+                    );
+                }
+            }
+            return Ok(out_json);
+        }
+
+        // Whole-file modulo-sorry path when the file is not eligible for per-theorem sharding:
+        // never publish any shard or file receipt to `TheoremProofCAS`.
+        let mut zygote_env = env_vars.clone();
+        zygote_env
+            .entry("TURBO_LEAN_CALLER_CWD".to_string())
+            .or_insert_with(|| canon_dir.to_string_lossy().to_string());
+        let can_audit_in_zygote = !src.contains("IO.Process.exit")
+            && !src.lines().take(20).any(|l| {
+                let t = l.split("--").next().unwrap_or(l).trim();
+                t == "module" || t.starts_with("module ")
+            });
+        let mut whole_verified = false;
+        let mut eval_stdout_text = String::new();
+        let mut eval_messages: Vec<String> = Vec::new();
+        if can_audit_in_zygote {
+            let rep = crate::zygote::eval_with_zygote_pool_audit_all_modulo_sorry(
+                store,
+                toolchain,
+                &local_lean_path,
+                &zygote_env,
+                Path::new(&lean_bin),
+                src,
+                Some(&canon_resolved_initial.to_string_lossy()),
+                Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                &file_lean_args,
+                true,
+            )?;
+            if rep.import_ok && rep.ok && !rep.crashed && !rep.timed_out {
+                whole_verified = true;
+                eval_stdout_text = rep.stdout;
+                eval_messages = rep.messages;
+                file_used_sorry |= rep.used_sorry || !rep.sorry_decls.is_empty();
+                for sd in rep.sorry_decls {
+                    if !file_sorry_decls.contains(&sd) {
+                        file_sorry_decls.push(sd);
+                    }
+                }
+            } else if rep.crashed || rep.timed_out || rep.import_ok {
+                let raw_err = rep
+                    .errors
+                    .join("\n")
+                    .replace("<zygote-decl>", &orig_display)
+                    .replace("<zygote-shard>", &orig_display);
+                let m_diags = extract_mismatch_diagnostics(&raw_err);
+                let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                let h_fmt = crate::zygote::format_hotspot_diagnostics(
+                    &rep.timeout_hotspots,
+                    &rep.simp_hotspots,
+                );
+                let h_suffix = if h_fmt.is_empty() {
+                    String::new()
+                } else {
+                    format!("\n{h_fmt}")
+                };
+                anyhow::bail!(
+                    "lean check failed for {orig_display}:\n{raw_err}{m_suffix}{h_suffix}"
+                );
+            }
+        }
+        if !whole_verified {
+            let names: HashSet<String> = split.shards.iter().map(|s| s.rooted_name()).collect();
+            let (out, audit_rep) = crate::zygote::run_audited_lean_shard_at_with_full_report(
+                &store.root,
+                &store.fast_staging_dir(),
+                Path::new(&lean_bin),
+                &env_vars,
+                Some(canon_dir),
+                Some(canon_resolved_initial),
+                src,
+                &names,
+                false,
+                true,
+                &[],
+                &file_lean_args,
+                Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+            )
+            .with_context(|| format!("Check failed for {}", file.display()))?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                let combined_err = format!("{}\n{}", stdout, stderr);
+                let h_suffix = maybe_append_hotspot_diagnostics_for_source(
+                    store,
+                    toolchain,
+                    &local_lean_path,
+                    &env_vars,
+                    Path::new(&lean_bin),
+                    src,
+                    Some(&orig_display),
+                    &file_lean_args,
+                    &combined_err,
+                );
+                anyhow::bail!(
+                    "Check failed for {}:\n{}{}",
+                    file.display(),
+                    combined_err,
+                    h_suffix
+                );
+            }
+            eval_stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
+            file_used_sorry |= audit_rep.used_sorry || !audit_rep.sorry_decls.is_empty();
+            file_sorry_decls = audit_rep.sorry_decls;
+        }
+        file_sorry_decls.sort();
+        file_sorry_decls.dedup();
+        let dur_ms = t0.elapsed().as_millis() as i64;
+        let status_str = if file_used_sorry {
+            "verified_modulo_sorry"
+        } else {
+            "file_verified"
+        };
+        let out_json = serde_json::json!({
+            "status": status_str,
+            "allow_sorry": true,
+            "used_sorry": file_used_sorry,
+            "sorry_count": file_sorry_decls.len(),
+            "sorry_decls": file_sorry_decls,
+            "mode": "whole_file_modulo_sorry",
+            "file": file.display().to_string(),
+            "shard_hits": hits,
+            "shard_misses": misses,
+            "lake_env_cache_hit": env_cache_hit,
+            "interface_hash": split.interface_hash,
+            "stdout": eval_stdout_text,
+            "messages": eval_messages,
+            "elapsed_ms": dur_ms
+        });
+        if emit_stdout {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&out_json)?);
+            } else if file_used_sorry {
+                println!(
+                    "[turbo-lean] VERIFIED MODULO SORRY {} ({} sorry decl(s): [{}], interface_hash={}.., {} ms)",
+                    file.display(),
+                    file_sorry_decls.len(),
+                    file_sorry_decls.join(", "),
+                    &split.interface_hash[..12],
+                    dur_ms
+                );
+            } else {
+                println!(
+                    "[turbo-lean] VERIFIED {} (interface_hash={}.., {} ms)",
+                    file.display(),
+                    &split.interface_hash[..12],
+                    dur_ms
+                );
+            }
+        }
+        return Ok(out_json);
+    }
 
     if !split.hygiene.is_clean_for_certification() {
         if !crate::zygote::daemon_disabled() {
@@ -4610,7 +5818,7 @@ fn check_single_file(
 
     if misses == 0 && !split.shards.is_empty() && split.eligible_for_sharding {
         let elapsed_ms = t0.elapsed().as_millis();
-        let out_json = serde_json::json!({
+        let mut out_json = serde_json::json!({
             "status": "all_shards_cached",
             "file": file.display().to_string(),
             "shard_hits": hits,
@@ -4618,6 +5826,14 @@ fn check_single_file(
             "interface_hash": split.interface_hash,
             "elapsed_ms": elapsed_ms
         });
+        if allow_sorry {
+            if let Some(obj) = out_json.as_object_mut() {
+                obj.insert("allow_sorry".to_string(), serde_json::Value::Bool(true));
+                obj.insert("used_sorry".to_string(), serde_json::Value::Bool(false));
+                obj.insert("sorry_count".to_string(), serde_json::json!(0));
+                obj.insert("sorry_decls".to_string(), serde_json::json!([]));
+            }
+        }
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -4961,23 +6177,38 @@ fn check_single_file(
                     .replace("<zygote-shard>", &orig_display);
                 let m_diags = extract_mismatch_diagnostics(&raw_err);
                 let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                let coalesced_src_for_diag =
+                    splitter::build_coalesced_shard_source(src, &uncached_names);
+                let h_suffix = maybe_append_hotspot_diagnostics_for_source(
+                    store,
+                    toolchain,
+                    &local_lean_path,
+                    &env_vars,
+                    Path::new(&lean_bin),
+                    &coalesced_src_for_diag,
+                    Some(&orig_display),
+                    &file_lean_args,
+                    &raw_err,
+                );
                 if uncached_shards.len() == 1 {
                     let (_, shard) = uncached_shards[0];
                     anyhow::bail!(
-                        "Check failed for `{}` in {} (lines {}..={}):\n{}{}",
+                        "Check failed for `{}` in {} (lines {}..={}):\n{}{}{}",
                         shard.name,
                         orig_display,
                         shard.start_line,
                         shard.end_line,
                         raw_err,
-                        m_suffix
+                        m_suffix,
+                        h_suffix
                     );
                 }
                 anyhow::bail!(
-                    "Check failed for {}:\n{}{}",
+                    "Check failed for {}:\n{}{}{}",
                     orig_display,
                     raw_err,
-                    m_suffix
+                    m_suffix,
+                    h_suffix
                 );
             }
         }
@@ -5107,14 +6338,26 @@ fn check_single_file(
                                                 .replace("<zygote-shard>", &file_display);
                                             let m_diags = extract_mismatch_diagnostics(&raw_err);
                                             let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                                            let h_suffix = maybe_append_hotspot_diagnostics_for_source(
+                                                &worker_store,
+                                                tc_ref,
+                                                lp_ref,
+                                                env_ref,
+                                                Path::new(lean_bin_ref),
+                                                &shard_src_owned,
+                                                Some(&file_display),
+                                                args_ref,
+                                                &raw_err,
+                                            );
                                             anyhow::bail!(
-                                                "Parallel shard check failed for `{}` in {} (lines {}..={}):\n{}{}",
+                                                "Parallel shard check failed for `{}` in {} (lines {}..={}):\n{}{}{}",
                                                 shard.decl_name(),
                                                 file_display,
                                                 shard.start_line,
                                                 shard.end_line,
                                                 raw_err,
-                                                m_suffix
+                                                m_suffix,
+                                                h_suffix
                                             );
                                         }
                                     }
@@ -5153,14 +6396,26 @@ fn check_single_file(
                                     let combined_err = format!("{}\n{}", stdout, stderr);
                                     let m_diags = extract_mismatch_diagnostics(&combined_err);
                                     let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                                    let h_suffix = maybe_append_hotspot_diagnostics_for_source(
+                                        &worker_store,
+                                        tc_ref,
+                                        lp_ref,
+                                        env_ref,
+                                        Path::new(lean_bin_ref),
+                                        &shard_src_owned,
+                                        Some(&file_display),
+                                        args_ref,
+                                        &combined_err,
+                                    );
                                     anyhow::bail!(
-                                        "Parallel shard check failed for `{}` in {} (lines {}..={}):\n{}{}",
+                                        "Parallel shard check failed for `{}` in {} (lines {}..={}):\n{}{}{}",
                                         shard.name,
                                         file_display,
                                         shard.start_line,
                                         shard.end_line,
                                         combined_err,
-                                        m_suffix
+                                        m_suffix,
+                                        h_suffix
                                     );
                                 }
                                 let shard_dur_ms = shard_t0.elapsed().as_millis() as i64;
@@ -5238,7 +6493,7 @@ fn check_single_file(
         }
         store.batch_publish_theorem_shards(toolchain, "trusted", &batch_items)?;
         let dur_ms = t0.elapsed().as_millis() as i64;
-        let out_json = serde_json::json!({
+        let mut out_json = serde_json::json!({
             "status": "file_verified",
             "mode": verify_mode,
             "file": file.display().to_string(),
@@ -5249,6 +6504,14 @@ fn check_single_file(
             "interface_hash": split.interface_hash,
             "elapsed_ms": dur_ms
         });
+        if allow_sorry {
+            if let Some(obj) = out_json.as_object_mut() {
+                obj.insert("allow_sorry".to_string(), serde_json::Value::Bool(true));
+                obj.insert("used_sorry".to_string(), serde_json::Value::Bool(false));
+                obj.insert("sorry_count".to_string(), serde_json::json!(0));
+                obj.insert("sorry_decls".to_string(), serde_json::json!([]));
+            }
+        }
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -5374,11 +6637,31 @@ fn check_single_file(
                         .replace("<zygote-shard>", &orig_display);
                     let m_diags = extract_mismatch_diagnostics(&raw_err);
                     let m_suffix = format_mismatch_diagnostics_summary(&m_diags);
+                    let h_fmt = crate::zygote::format_hotspot_diagnostics(
+                        &rep.timeout_hotspots,
+                        &rep.simp_hotspots,
+                    );
+                    let h_suffix = if h_fmt.is_empty() {
+                        maybe_append_hotspot_diagnostics_for_source(
+                            store,
+                            toolchain,
+                            &local_lean_path,
+                            &zygote_env,
+                            Path::new(&lean_bin),
+                            src,
+                            Some(&orig_display),
+                            &file_lean_args,
+                            &raw_err,
+                        )
+                    } else {
+                        format!("\n{h_fmt}")
+                    };
                     anyhow::bail!(
-                        "Check failed for {}:\n{}{}",
+                        "Check failed for {}:\n{}{}{}",
                         orig_display,
                         raw_err,
-                        m_suffix
+                        m_suffix,
+                        h_suffix
                     );
                 }
             }
@@ -5406,11 +6689,23 @@ fn check_single_file(
             if !out.status.success() {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 let stdout = String::from_utf8_lossy(&out.stdout);
+                let combined_err = format!("{}\n{}", stdout, stderr);
+                let h_suffix = maybe_append_hotspot_diagnostics_for_source(
+                    store,
+                    toolchain,
+                    &local_lean_path,
+                    &env_vars,
+                    Path::new(&lean_bin),
+                    src,
+                    Some(&orig_display),
+                    &file_lean_args,
+                    &combined_err,
+                );
                 anyhow::bail!(
-                    "Check failed for {}:\n{}\n{}",
+                    "Check failed for {}:\n{}{}",
                     file.display(),
-                    stdout,
-                    stderr
+                    combined_err,
+                    h_suffix
                 );
             }
             eval_stdout_text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -5453,12 +6748,24 @@ fn check_single_file(
                     whole_verified_types = rep.decl_types;
                     kernel_audited = true;
                 } else if rep.crashed || rep.timed_out || rep.import_ok {
+                    let raw_err = rep
+                        .errors
+                        .join("\n")
+                        .replace("<zygote-shard>", &orig_display);
+                    let h_fmt = crate::zygote::format_hotspot_diagnostics(
+                        &rep.timeout_hotspots,
+                        &rep.simp_hotspots,
+                    );
+                    let h_suffix = if h_fmt.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n{h_fmt}")
+                    };
                     anyhow::bail!(
-                        "Soundness audit failed for {}:\n{}",
+                        "Soundness audit failed for {}:\n{}{}",
                         file.display(),
-                        rep.errors
-                            .join("\n")
-                            .replace("<zygote-shard>", &orig_display)
+                        raw_err,
+                        h_suffix
                     );
                 }
             }
@@ -5480,11 +6787,27 @@ fn check_single_file(
                 )
                 .with_context(|| format!("Soundness audit failed for {}", file.display()))?;
                 if !out.status.success() {
-                    anyhow::bail!(
-                        "Soundness audit failed for {}:\n{}\n{}",
-                        file.display(),
+                    let combined_err = format!(
+                        "{}\n{}",
                         String::from_utf8_lossy(&out.stdout),
                         String::from_utf8_lossy(&out.stderr)
+                    );
+                    let h_suffix = maybe_append_hotspot_diagnostics_for_source(
+                        store,
+                        toolchain,
+                        &local_lean_path,
+                        &env_vars,
+                        Path::new(&lean_bin),
+                        src,
+                        Some(&orig_display),
+                        &file_lean_args,
+                        &combined_err,
+                    );
+                    anyhow::bail!(
+                        "Soundness audit failed for {}:\n{}{}",
+                        file.display(),
+                        combined_err,
+                        h_suffix
                     );
                 }
                 whole_verified_types = cli_types;
@@ -5537,7 +6860,7 @@ fn check_single_file(
                 }
             }
         }
-        let out_json = serde_json::json!({
+        let mut out_json = serde_json::json!({
             "status": "file_verified",
             "mode": if verified_via_zygote_eval { "zygote_whole_file" } else { "whole_file" },
             "file": file.display().to_string(),
@@ -5549,6 +6872,14 @@ fn check_single_file(
             "messages": eval_messages,
             "elapsed_ms": dur_ms
         });
+        if allow_sorry {
+            if let Some(obj) = out_json.as_object_mut() {
+                obj.insert("allow_sorry".to_string(), serde_json::Value::Bool(true));
+                obj.insert("used_sorry".to_string(), serde_json::Value::Bool(false));
+                obj.insert("sorry_count".to_string(), serde_json::json!(0));
+                obj.insert("sorry_decls".to_string(), serde_json::json!([]));
+            }
+        }
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -6054,6 +7385,7 @@ but is expected to have type
                 true,
                 0,
                 None,
+                false,
             );
             (res, split)
         };
@@ -7783,6 +9115,7 @@ theorem after_macro : ext_magic = 7 := rfl
             true,
             0,
             None,
+            false,
         )
         .is_err());
 
@@ -7809,6 +9142,7 @@ theorem after_macro : ext_magic = 7 := rfl
             true,
             0,
             None,
+            false,
         )
         .unwrap();
         assert_eq!(ok_json["status"], "theorem_verified");

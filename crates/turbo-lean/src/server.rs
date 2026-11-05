@@ -1232,6 +1232,10 @@ pub fn serve_cas_http_with_auth(
                                     "scanner_version": zreply.scanner_version,
                                     "replay_version": zreply.replay_version,
                                     "decl_types": zreply.decl_types,
+                                    "used_sorry": zreply.used_sorry,
+                                    "sorry_decls": zreply.sorry_decls,
+                                    "timeout_hotspots": zreply.timeout_hotspots,
+                                    "simp_hotspots": zreply.simp_hotspots,
                                     "executed_execution_identity": executed_identity,
                                     "binding_ok": executed_binding == crate::zygote::ClosureBinding::Bound,
                                     "deterministic": deterministic
@@ -1913,11 +1917,24 @@ fn execute_check_shard_payload_deferred_with_domain(
     ) {
         Ok(zreply) if zreply.import_ok && !zreply.crashed && !zreply.timed_out => {
             if !zreply.ok {
-                anyhow::bail!(
-                    "Remote `lean` shard verification failed for `{}`:\n{}",
-                    req.decl,
-                    zreply.errors.join("\n")
+                let diag = crate::zygote::format_hotspot_diagnostics(
+                    &zreply.timeout_hotspots,
+                    &zreply.simp_hotspots,
                 );
+                if diag.is_empty() {
+                    anyhow::bail!(
+                        "Remote `lean` shard verification failed for `{}`:\n{}",
+                        req.decl,
+                        zreply.errors.join("\n")
+                    );
+                } else {
+                    anyhow::bail!(
+                        "Remote `lean` shard verification failed for `{}`:\n{}\n{}",
+                        req.decl,
+                        zreply.errors.join("\n"),
+                        diag
+                    );
+                }
             }
             if !expected_types.is_empty() {
                 crate::zygote::verify_attested_decl_types(&zreply.decl_types, &expected_types)?;
@@ -1934,11 +1951,24 @@ fn execute_check_shard_payload_deferred_with_domain(
             verified_decl_types = zreply.decl_types;
         }
         Ok(zreply) if zreply.crashed || zreply.timed_out => {
-            anyhow::bail!(
-                "Remote `lean` shard verification failed for `{}`:\n{}",
-                req.decl,
-                zreply.errors.join("\n")
+            let diag = crate::zygote::format_hotspot_diagnostics(
+                &zreply.timeout_hotspots,
+                &zreply.simp_hotspots,
             );
+            if diag.is_empty() {
+                anyhow::bail!(
+                    "Remote `lean` shard verification failed for `{}`:\n{}",
+                    req.decl,
+                    zreply.errors.join("\n")
+                );
+            } else {
+                anyhow::bail!(
+                    "Remote `lean` shard verification failed for `{}`:\n{}\n{}",
+                    req.decl,
+                    zreply.errors.join("\n"),
+                    diag
+                );
+            }
         }
         Ok(_) if req.skip_cas_lock => {
             return Err(crate::zygote::ZygoteImportUnavailable(req.decl.clone()).into());

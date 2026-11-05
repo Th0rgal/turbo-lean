@@ -12,6 +12,22 @@ const BLAKE3_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/Blake3.lean"
 const STATEMENT_HASH_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/StatementHash.lean");
 const ZYGOTE_WORKER_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/ZygoteWorker.lean");
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TimeoutHotspot {
+    pub kind: String,
+    pub label: String,
+    pub line: usize,
+    pub elapsed_ms: u64,
+    pub heartbeats: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SimpHotspot {
+    pub lemma: String,
+    pub attempts: u64,
+    pub succeeded: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ZygoteEvalReply {
     pub ok: bool,
@@ -70,6 +86,14 @@ pub struct ZygoteEvalReply {
     /// kernel type hash (`TurboLean.StatementHash` / `ZygoteWorker.kernelStatementHash`).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub decl_types: std::collections::BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub used_sorry: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sorry_decls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timeout_hotspots: Vec<TimeoutHotspot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub simp_hotspots: Vec<SimpHotspot>,
 }
 
 /// Version of the host-side reply vetting (`StderrScan` + `mark_runtime_panic` + `decl_types`).
@@ -420,9 +444,9 @@ fn owned_lifecycle_process(pid: u32, staging: Option<&Path>, parent: Option<u32>
     let worker = (name.starts_with("turbo_zygote_") || name == "turbo-zygote")
         && !args.is_empty()
         && !env.is_empty()
-        && !args
-            .split(|b| *b == 0)
-            .any(|arg| arg == b"--audit-modules" || arg == b"--decl-identity");
+        && !args.split(|b| *b == 0).any(|arg| {
+            arg == b"--audit-modules" || arg == b"--decl-identity" || arg == b"--public-sig"
+        });
     let server = name.trim_end_matches(" (deleted)") == "turbo-lean"
         && is_serve_command(&args)
         && env.split(|b| *b == 0).any(|v| v == b"TURBO_LEAN_DAEMON=1");
@@ -3316,6 +3340,7 @@ pub(crate) fn ensure_zygote_binary_at(
     }
     link_cmd
         .arg("-lleanshared")
+        .arg("-lLake_shared")
         .arg("-o")
         .arg(&tmp_bin)
         .current_dir(&scratch_dir)
@@ -3365,6 +3390,10 @@ struct ZygoteAuditModulesReply {
     /// `--shard` mode: newly declared non-stub theorems mapped to `statement-v1` kernel type hash.
     #[serde(default)]
     pub decl_types: Option<std::collections::BTreeMap<String, String>>,
+    #[serde(default)]
+    pub used_sorry: bool,
+    #[serde(default)]
+    pub sorry_decls: Vec<String>,
 }
 
 /// Verify that every expected `(decl_name, expected_kernel_type_hash)` pair was elaborated in the
@@ -3511,6 +3540,26 @@ pub(crate) fn audit_compiled_modules_with_zygote(
     extra_ro_binds: &[PathBuf],
     is_untrusted: bool,
 ) -> Result<()> {
+    audit_compiled_modules_with_zygote_options(
+        store,
+        cfg,
+        mod_names,
+        lean_path_env,
+        extra_ro_binds,
+        is_untrusted,
+        false,
+    )
+}
+
+pub(crate) fn audit_compiled_modules_with_zygote_options(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+    extra_ro_binds: &[PathBuf],
+    is_untrusted: bool,
+    allow_sorry_axiom: bool,
+) -> Result<()> {
     if mod_names.is_empty() {
         return Ok(());
     }
@@ -3525,6 +3574,7 @@ pub(crate) fn audit_compiled_modules_with_zygote(
             lean_path_env,
             extra_ro_binds,
             is_untrusted,
+            allow_sorry_axiom,
         )?;
     }
     Ok(())
@@ -3774,6 +3824,7 @@ fn audit_compiled_module_batch(
     lean_path_env: &str,
     extra_ro_binds: &[PathBuf],
     is_untrusted: bool,
+    allow_sorry_axiom: bool,
 ) -> Result<()> {
     if mod_names.is_empty() || mod_names.iter().any(|m| m.trim().is_empty()) {
         anyhow::bail!("In-kernel `.olean` audit received an empty module name: fail-closed");
@@ -3785,6 +3836,13 @@ fn audit_compiled_module_batch(
         extra_ro_binds,
         is_untrusted,
     )?;
+    if allow_sorry_axiom && !is_untrusted {
+        let mut allowed = crate::splitter::allowed_axioms();
+        if !allowed.iter().any(|a| a == "sorryAx") {
+            allowed.push("sorryAx".to_string());
+        }
+        cmd.env(crate::splitter::ALLOWED_AXIOMS_ENV, allowed.join(","));
+    }
     cmd.arg("--audit-modules");
     for a in pinned_ffi_allow_args(cfg, mod_names) {
         cmd.arg(a);
@@ -3805,6 +3863,7 @@ fn audit_compiled_module_batch(
                 lean_path_env,
                 extra_ro_binds,
                 is_untrusted,
+                allow_sorry_axiom,
             )?;
             audit_compiled_module_batch(
                 store,
@@ -3813,12 +3872,13 @@ fn audit_compiled_module_batch(
                 lean_path_env,
                 extra_ro_binds,
                 is_untrusted,
+                allow_sorry_axiom,
             )?;
             return Ok(());
         }
         Err(e) => return Err(e),
     }
-    if !is_untrusted && extra_ro_binds.is_empty() {
+    if !is_untrusted && !allow_sorry_axiom && extra_ro_binds.is_empty() {
         let dirs: Vec<PathBuf> = std::env::split_paths(lean_path_env).collect();
         let all_on_lean_path = mod_names.iter().all(|m| {
             let rel_slash = crate::module_builder::module_name_to_rel_slash(m);
@@ -3830,6 +3890,82 @@ fn audit_compiled_module_batch(
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OleanPublicDeclSig {
+    pub name: String,
+    pub kind: String,
+    pub type_hash: String,
+    #[serde(default)]
+    pub body_hash: String,
+    pub reducibility: String,
+    pub inline: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OleanPublicSignatureReply {
+    pub ok: bool,
+    pub module: String,
+    pub is_module: bool,
+    #[serde(default)]
+    pub has_opaque_ext: bool,
+    pub public_sig_digest: String,
+    #[serde(default)]
+    pub exported_imports: Vec<String>,
+    #[serde(default)]
+    pub simp_entries: Vec<String>,
+    #[serde(default)]
+    pub csimp_entries: Vec<String>,
+    #[serde(default)]
+    pub instance_entries: Vec<String>,
+    #[serde(default)]
+    pub decls: Vec<OleanPublicDeclSig>,
+}
+
+pub(crate) fn read_module_public_signature_with_zygote(
+    store_root: &Path,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_name: &str,
+    lean_path_env: &str,
+    extra_ro_binds: &[PathBuf],
+    is_untrusted: bool,
+) -> Result<OleanPublicSignatureReply> {
+    let trimmed = mod_name.trim();
+    anyhow::ensure!(
+        !trimmed.is_empty(),
+        "Cannot read `.olean` public signature for empty module name"
+    );
+    let (mut cmd, timeout) =
+        kernel_reader_command(store_root, cfg, lean_path_env, extra_ro_binds, is_untrusted)?;
+    cmd.arg("--public-sig").arg(trimmed);
+    let out = crate::module_builder::run_command_with_timeout(&mut cmd, timeout, is_untrusted)
+        .with_context(|| format!("Failed to run `--public-sig` reader for `{trimmed}`"))?;
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let stderr_str = String::from_utf8_lossy(&out.stderr);
+    let json_line = stdout_str
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| l.starts_with('{') && l.ends_with('}'))
+        .unwrap_or("");
+    let parsed: OleanPublicSignatureReply =
+        serde_json::from_str(json_line).with_context(|| {
+            format!(
+                "`--public-sig` reader failed closed for `{trimmed}` (exit={}):\nstdout: {}\nstderr: {}",
+                out.status,
+                stdout_str.trim(),
+                stderr_str.trim()
+            )
+        })?;
+    anyhow::ensure!(
+        out.status.success() && parsed.ok && parsed.public_sig_digest.len() == 64,
+        "`--public-sig` reader rejected `{trimmed}` (exit={}):\nstdout: {}\nstderr: {}",
+        out.status,
+        stdout_str.trim(),
+        stderr_str.trim()
+    );
+    Ok(parsed)
 }
 
 /// The auditor's verdict on `mod_names`: its JSON reply when every module passed, else an error.
@@ -3943,6 +4079,13 @@ pub(crate) fn run_audited_lean_shard_with_types(
     .map(|(out, _)| out)
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AuditedShardReport {
+    pub decl_types: std::collections::BTreeMap<String, String>,
+    pub used_sorry: bool,
+    pub sorry_decls: Vec<String>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_audited_lean_shard_with_types_report(
     store: &TurboStore,
@@ -3968,6 +4111,36 @@ pub(crate) fn run_audited_lean_shard_with_types_report(
         source,
         audit,
         true,
+        expected_types,
+        lean_args,
+        timeout_ms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_audited_lean_shard_with_sorry_report(
+    store: &TurboStore,
+    lean_bin: &Path,
+    env_vars: &std::collections::HashMap<String, String>,
+    cwd: Option<&Path>,
+    source: &str,
+    audit: &std::collections::HashSet<String>,
+    expected_types: &[(String, String)],
+    lean_args: &[String],
+    timeout_ms: Option<u64>,
+    allow_sorry: bool,
+) -> Result<(std::process::Output, AuditedShardReport)> {
+    run_audited_lean_shard_at_with_full_report(
+        &store.root,
+        &store.fast_staging_dir(),
+        lean_bin,
+        env_vars,
+        cwd,
+        None,
+        source,
+        audit,
+        true,
+        allow_sorry,
         expected_types,
         lean_args,
         timeout_ms,
@@ -4024,6 +4197,40 @@ pub(crate) fn run_audited_lean_shard_at_with_types_report(
     std::process::Output,
     std::collections::BTreeMap<String, String>,
 )> {
+    run_audited_lean_shard_at_with_full_report(
+        store_root,
+        staging_dir,
+        lean_bin,
+        env_vars,
+        cwd,
+        source_path,
+        source,
+        audit,
+        allow_prefix_stubs,
+        false,
+        expected_types,
+        lean_args,
+        timeout_ms,
+    )
+    .map(|(out, rep)| (out, rep.decl_types))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_audited_lean_shard_at_with_full_report(
+    store_root: &Path,
+    staging_dir: &Path,
+    lean_bin: &Path,
+    env_vars: &std::collections::HashMap<String, String>,
+    cwd: Option<&Path>,
+    source_path: Option<&Path>,
+    source: &str,
+    audit: &std::collections::HashSet<String>,
+    allow_prefix_stubs: bool,
+    allow_sorry: bool,
+    expected_types: &[(String, String)],
+    lean_args: &[String],
+    timeout_ms: Option<u64>,
+) -> Result<(std::process::Output, AuditedShardReport)> {
     crate::module_builder::validate_lean_args(lean_args)?;
     let started = std::time::Instant::now();
     let nonce = format!("{}_{}", std::process::id(), next_tmp_id());
@@ -4143,7 +4350,7 @@ pub(crate) fn run_audited_lean_shard_at_with_types_report(
         }
     }
     if !out.status.success() {
-        return Ok((out, std::collections::BTreeMap::new()));
+        return Ok((out, AuditedShardReport::default()));
     }
     crate::check::freeze_private_dir(&out_dir.path)?;
     crate::check::stage_isolated_module_artifacts(&out_dir.path, &reader_dir.path, &mod_name)
@@ -4244,6 +4451,9 @@ pub(crate) fn run_audited_lean_shard_at_with_types_report(
             hex_encode_bytes(entry.gen_rooted.as_bytes())
         ));
     }
+    if allow_sorry {
+        auditor.arg("--allow-sorry");
+    }
     if allow_prefix_stubs {
         for sh in &parsed_shards {
             if crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry"
@@ -4294,7 +4504,16 @@ pub(crate) fn run_audited_lean_shard_at_with_types_report(
     if !expected_types.is_empty() {
         verify_attested_decl_types(&decl_types, expected_types)?;
     }
-    Ok((out, decl_types))
+    let sorry_decls = parsed_reply.sorry_decls;
+    let used_sorry = parsed_reply.used_sorry || !sorry_decls.is_empty();
+    Ok((
+        out,
+        AuditedShardReport {
+            decl_types,
+            used_sorry,
+            sorry_decls,
+        },
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4679,21 +4898,39 @@ fn stub_mode_flag(allow_stub: bool, stub_targets: &[String], shard_source: &str)
 /// `stub_mode` for one cross-file block of a request: every target still counts for ownership (never
 /// exempt), but the block must declare only the targets and fast-verify mappings its own text declares.
 fn block_stub_mode(stub_mode: &str, stub_targets: &[String], blk: &str) -> Result<String> {
+    let (allow_sorry_prefix, inner_mode) = if stub_mode == "allow_sorry" {
+        (true, "strict_all")
+    } else if let Some(rest) = stub_mode.strip_prefix("allow_sorry+") {
+        (true, rest)
+    } else {
+        (false, stub_mode)
+    };
+    let wrap = |m: String| {
+        if allow_sorry_prefix {
+            if m == "strict_all" {
+                "allow_sorry".to_string()
+            } else {
+                format!("allow_sorry+{m}")
+            }
+        } else {
+            m
+        }
+    };
     let shards = crate::splitter::split_lean_source(blk, &[]).shards;
     let blk_map = crate::splitter::FastVerifyMap::parse_and_validate(blk, &shards)?;
-    if !stub_mode.starts_with("allow_stub:") && !stub_mode.starts_with("strict:") {
+    if !inner_mode.starts_with("allow_stub:") && !inner_mode.starts_with("strict:") {
         if blk_map.is_empty() {
-            return Ok(stub_mode.to_string());
+            return Ok(wrap(inner_mode.to_string()));
         }
-        let prefix = if stub_mode == "allow_stub" {
+        let prefix = if inner_mode == "allow_stub" {
             "allow_stub"
         } else {
             "strict"
         };
         let fmap_hex = hex_encode_bytes(encode_fast_map_lines(blk_map.entries()).as_bytes());
-        return Ok(format!("{}::::{}", prefix, fmap_hex));
+        return Ok(wrap(format!("{}::::{}", prefix, fmap_hex)));
     }
-    let parts: Vec<&str> = stub_mode.split(':').collect();
+    let parts: Vec<&str> = inner_mode.split(':').collect();
     let base_prefix = parts.first().copied().unwrap_or("strict");
     let targets_hex = parts.get(1).copied().unwrap_or("");
     let stubs_hex = parts.get(2).copied().unwrap_or("");
@@ -4709,16 +4946,16 @@ fn block_stub_mode(stub_mode: &str, stub_targets: &[String], blk: &str) -> Resul
         .collect();
     let req_hex = hex_encode_bytes(required.join("\n").as_bytes());
     if blk_map.is_empty() {
-        Ok(format!(
+        Ok(wrap(format!(
             "{}:{}:{}:{}",
             base_prefix, targets_hex, stubs_hex, req_hex
-        ))
+        )))
     } else {
         let fmap_hex = hex_encode_bytes(encode_fast_map_lines(blk_map.entries()).as_bytes());
-        Ok(format!(
+        Ok(wrap(format!(
             "{}:{}:{}:{}:{}",
             base_prefix, targets_hex, stubs_hex, req_hex, fmap_hex
-        ))
+        )))
     }
 }
 
@@ -4735,7 +4972,34 @@ pub fn eval_with_zygote_pool_for_targets(
     timeout_ms: Option<u64>,
     lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
-    eval_with_zygote_pool_inner(
+    eval_with_zygote_pool_for_targets_modulo_sorry(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        shard_source,
+        stub_targets,
+        timeout_ms,
+        lean_args,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn eval_with_zygote_pool_for_targets_modulo_sorry(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    shard_source: &str,
+    stub_targets: &[String],
+    timeout_ms: Option<u64>,
+    lean_args: &[String],
+    allow_sorry: bool,
+) -> Result<ZygoteEvalReply> {
+    eval_with_zygote_pool_inner_ext(
         store,
         toolchain,
         req_lean_path,
@@ -4749,6 +5013,8 @@ pub fn eval_with_zygote_pool_for_targets(
         None,
         lean_args,
         stub_targets,
+        false,
+        allow_sorry,
         false,
     )
 }
@@ -4767,7 +5033,34 @@ pub fn eval_with_zygote_pool_audit_all(
     timeout_ms: Option<u64>,
     lean_args: &[String],
 ) -> Result<ZygoteEvalReply> {
-    eval_with_zygote_pool_inner(
+    eval_with_zygote_pool_audit_all_modulo_sorry(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        shard_source,
+        file_name,
+        timeout_ms,
+        lean_args,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn eval_with_zygote_pool_audit_all_modulo_sorry(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    shard_source: &str,
+    file_name: Option<&str>,
+    timeout_ms: Option<u64>,
+    lean_args: &[String],
+    allow_sorry: bool,
+) -> Result<ZygoteEvalReply> {
+    eval_with_zygote_pool_inner_ext(
         store,
         toolchain,
         req_lean_path,
@@ -4782,7 +5075,110 @@ pub fn eval_with_zygote_pool_audit_all(
         lean_args,
         &[],
         true,
+        allow_sorry,
+        false,
     )
+}
+
+pub fn reply_indicates_timeout_or_heartbeat(rep: &ZygoteEvalReply) -> bool {
+    if rep.ok {
+        return false;
+    }
+    if rep.timed_out {
+        return true;
+    }
+    let matches_text = |s: &str| {
+        let lower = s.to_ascii_lowercase();
+        lower.contains("deterministic timeout")
+            || lower.contains("maximum number of heartbeats")
+            || lower.contains("heartbeats")
+            || lower.contains("maximum recursion depth")
+    };
+    rep.errors.iter().any(|e| matches_text(e))
+        || rep.messages.iter().any(|m| matches_text(m))
+        || matches_text(&rep.stderr_tail)
+}
+
+pub fn text_indicates_timeout_or_heartbeat(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("timed out")
+        || lower.contains("deterministic timeout")
+        || lower.contains("maximum number of heartbeats")
+        || lower.contains("heartbeats")
+        || lower.contains("maximum recursion depth")
+}
+
+pub fn format_hotspot_diagnostics(
+    timeout_hotspots: &[TimeoutHotspot],
+    simp_hotspots: &[SimpHotspot],
+) -> String {
+    if timeout_hotspots.is_empty() && simp_hotspots.is_empty() {
+        return String::new();
+    }
+    let mut lines = Vec::new();
+    lines.push("[hotspot] timeout/heartbeat hotspot attribution:".to_string());
+    for h in timeout_hotspots.iter().take(5) {
+        if h.line > 0 {
+            lines.push(format!(
+                "  - line {} [{}]: {} ({} ms, {} heartbeats)",
+                h.line, h.kind, h.label, h.elapsed_ms, h.heartbeats
+            ));
+        } else {
+            lines.push(format!(
+                "  - [{}]: {} ({} ms, {} heartbeats)",
+                h.kind, h.label, h.elapsed_ms, h.heartbeats
+            ));
+        }
+    }
+    if !simp_hotspots.is_empty() {
+        lines.push("[hotspot] top `simp` lemma attempts:".to_string());
+        for s in simp_hotspots.iter().take(5) {
+            lines.push(format!(
+                "  - {}: {} attempts ({} succeeded)",
+                s.lemma, s.attempts, s.succeeded
+            ));
+        }
+    }
+    lines.join("\n")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn diagnose_hotspots_with_zygote_pool(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    shard_source: &str,
+    file_name: Option<&str>,
+    timeout_ms: Option<u64>,
+    lean_args: &[String],
+) -> Option<(Vec<TimeoutHotspot>, Vec<SimpHotspot>)> {
+    let bounded_ms = timeout_ms.unwrap_or(2_500).clamp(250, 4_000);
+    let rep = eval_with_zygote_pool_inner_ext(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        shard_source,
+        true,
+        false,
+        file_name,
+        Some(bounded_ms),
+        None,
+        lean_args,
+        &[],
+        false,
+        false,
+        true,
+    )
+    .ok()?;
+    if rep.timeout_hotspots.is_empty() && rep.simp_hotspots.is_empty() {
+        None
+    } else {
+        Some((rep.timeout_hotspots, rep.simp_hotspots))
+    }
 }
 
 fn attach_host_closure_digest(req_line: &str, host_closure_digest: &str) -> String {
@@ -4992,7 +5388,7 @@ pub(crate) fn eval_with_resolved_context_opts_with_args(
     lean_args: &[String],
     initial_context: Option<&ResolvedZygoteContext>,
 ) -> Result<(ZygoteEvalReply, ClosureBinding, String)> {
-    eval_with_zygote_pool_inner_with_context(
+    eval_with_zygote_pool_inner_with_context_ext(
         store,
         toolchain,
         req_lean_path,
@@ -5006,6 +5402,8 @@ pub(crate) fn eval_with_resolved_context_opts_with_args(
         None,
         lean_args,
         &[],
+        false,
+        false,
         false,
         initial_context,
     )
@@ -5031,7 +5429,7 @@ fn eval_with_zygote_pool_inner(
     stub_targets: &[String],
     audit_all: bool,
 ) -> Result<ZygoteEvalReply> {
-    eval_with_zygote_pool_inner_with_context(
+    eval_with_zygote_pool_inner_ext(
         store,
         toolchain,
         req_lean_path,
@@ -5046,6 +5444,47 @@ fn eval_with_zygote_pool_inner(
         lean_args,
         stub_targets,
         audit_all,
+        false,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn eval_with_zygote_pool_inner_ext(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    shard_source: &str,
+    allow_stub: bool,
+    eval_mode: bool,
+    file_name: Option<&str>,
+    timeout_ms: Option<u64>,
+    batch_fission_override: Option<(String, String, String)>,
+    lean_args: &[String],
+    stub_targets: &[String],
+    audit_all: bool,
+    allow_sorry: bool,
+    diagnose_hotspots: bool,
+) -> Result<ZygoteEvalReply> {
+    eval_with_zygote_pool_inner_with_context_ext(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        shard_source,
+        allow_stub,
+        eval_mode,
+        file_name,
+        timeout_ms,
+        batch_fission_override,
+        lean_args,
+        stub_targets,
+        audit_all,
+        allow_sorry,
+        diagnose_hotspots,
         None,
     )
     .map(|(rep, _, _)| rep)
@@ -5082,7 +5521,7 @@ fn encode_mode_with_file_and_cwd(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn eval_with_zygote_pool_inner_with_context(
+fn eval_with_zygote_pool_inner_with_context_ext(
     store: &TurboStore,
     toolchain: &str,
     req_lean_path: &str,
@@ -5097,14 +5536,18 @@ fn eval_with_zygote_pool_inner_with_context(
     lean_args: &[String],
     stub_targets: &[String],
     audit_all: bool,
+    allow_sorry: bool,
+    diagnose_hotspots: bool,
     initial_context: Option<&ResolvedZygoteContext>,
 ) -> Result<(ZygoteEvalReply, ClosureBinding, String)> {
-    if !eval_mode {
+    if !eval_mode && !diagnose_hotspots {
         crate::splitter::reject_checking_weakening(shard_source)?;
     }
     let request_started = std::time::Instant::now();
     crate::module_builder::validate_lean_args(lean_args)?;
-    let stub_mode = if eval_mode {
+    let base_stub_mode = if diagnose_hotspots {
+        encode_mode_with_file_and_cwd("diagnose_hotspots", env_vars, file_name)
+    } else if eval_mode {
         "eval".to_string()
     } else if audit_all {
         let shards = crate::splitter::split_lean_source(shard_source, &[]).shards;
@@ -5118,8 +5561,19 @@ fn eval_with_zygote_pool_inner_with_context(
     } else {
         stub_mode_flag(allow_stub, stub_targets, shard_source)?
     };
-    let attempt = |timeout_ms: Option<u64>, ctx: Option<&ResolvedZygoteContext>| {
-        eval_with_zygote_pool_attempt(
+    let stub_mode = if !eval_mode && !diagnose_hotspots && allow_sorry {
+        if base_stub_mode == "strict_all" {
+            "allow_sorry".to_string()
+        } else {
+            format!("allow_sorry+{base_stub_mode}")
+        }
+    } else {
+        base_stub_mode
+    };
+    let attempt = |timeout_ms: Option<u64>,
+                   ctx: Option<&ResolvedZygoteContext>|
+     -> Result<(ZygoteEvalReply, ClosureBinding, String)> {
+        let (mut rep, binding, identity) = eval_with_zygote_pool_attempt(
             store,
             toolchain,
             req_lean_path,
@@ -5136,7 +5590,30 @@ fn eval_with_zygote_pool_inner_with_context(
             stub_targets,
             request_started,
             ctx,
-        )
+        )?;
+        if !eval_mode
+            && !diagnose_hotspots
+            && rep.timeout_hotspots.is_empty()
+            && rep.simp_hotspots.is_empty()
+            && reply_indicates_timeout_or_heartbeat(&rep)
+        {
+            let probe_ms = timeout_ms.map(|ms| ms.clamp(250, 2_500)).or(Some(2_500));
+            if let Some((th, sh)) = diagnose_hotspots_with_zygote_pool(
+                store,
+                toolchain,
+                req_lean_path,
+                env_vars,
+                lean_bin,
+                shard_source,
+                file_name,
+                probe_ms,
+                lean_args,
+            ) {
+                rep.timeout_hotspots = th;
+                rep.simp_hotspots = sh;
+            }
+        }
+        Ok((rep, binding, identity))
     };
     let (rep, binding, identity) = attempt(timeout_ms, initial_context)?;
     if binding != ClosureBinding::Changed {
@@ -5178,7 +5655,7 @@ fn eval_with_zygote_pool_attempt(
     pre_resolved_context: Option<&ResolvedZygoteContext>,
 ) -> Result<(ZygoteEvalReply, ClosureBinding, String)> {
     crate::module_builder::validate_lean_args(lean_args)?;
-    let default_timeout_ms = if eval_mode { 900_000 } else { 30_000 };
+    let default_timeout_ms = if eval_mode { 900_000 } else { 90_000 };
     let effective_timeout_ms = timeout_ms.unwrap_or_else(|| {
         std::env::var("TURBO_LEAN_TIMEOUT_MS")
             .ok()
@@ -5240,7 +5717,12 @@ fn eval_with_zygote_pool_attempt(
             std::collections::HashMap<(String, String, String, String), ZygoteEvalReply>,
         >,
     > = std::sync::OnceLock::new();
+    let is_allow_sorry_mode = stub_mode == "allow_sorry" || stub_mode.starts_with("allow_sorry+");
+    let is_diagnose_mode =
+        stub_mode == "diagnose_hotspots" || stub_mode.starts_with("diagnose_hotspots:");
     let verified_cache_key = if !eval_mode
+        && !is_allow_sorry_mode
+        && !is_diagnose_mode
         && !lake_inputs_uncacheable
         && batch_fission_override.is_none()
         && closure.label().is_some()
@@ -5442,6 +5924,7 @@ fn eval_with_zygote_pool_attempt(
         .max(4)
         .min(max_global_idle);
 
+    #[allow(clippy::large_enum_variant)]
     enum WorkerReqOutcome {
         Reply(ZygoteEvalReply),
         TimedOut {
@@ -5629,7 +6112,8 @@ fn eval_with_zygote_pool_attempt(
     let pool_mutex =
         ZYGOTE_POOL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 
-    if !eval_mode && body_code.contains("-- namespace _TurboCrossFileShard_1") {
+    if !eval_mode && !is_diagnose_mode && body_code.contains("-- namespace _TurboCrossFileShard_1")
+    {
         let blocks: Vec<String> = body_code
             .split("-- namespace _TurboCrossFileShard_")
             .filter_map(|part| {
@@ -5813,16 +6297,33 @@ fn eval_with_zygote_pool_attempt(
             let mut errors = Vec::new();
             let mut used_constants = Vec::new();
             let mut decl_types = std::collections::BTreeMap::new();
+            let mut used_sorry = false;
+            let mut sorry_decls = Vec::new();
+            let mut timeout_hotspots = Vec::new();
+            let mut simp_hotspots = Vec::new();
             for r in replies {
                 stdout.push_str(&r.stdout);
                 messages.extend(r.messages);
                 errors.extend(r.errors);
                 decl_types.extend(r.decl_types);
+                if r.used_sorry {
+                    used_sorry = true;
+                }
+                for sd in r.sorry_decls {
+                    if !sorry_decls.contains(&sd) {
+                        sorry_decls.push(sd);
+                    }
+                }
+                timeout_hotspots.extend(r.timeout_hotspots);
+                simp_hotspots.extend(r.simp_hotspots);
                 for c in r.used_constants {
                     if used_constants.len() < 32 && !used_constants.contains(&c) {
                         used_constants.push(c);
                     }
                 }
+            }
+            if !sorry_decls.is_empty() {
+                used_sorry = true;
             }
             let combined_rep = ZygoteEvalReply {
                 ok,
@@ -5844,13 +6345,22 @@ fn eval_with_zygote_pool_attempt(
                 errors,
                 used_constants,
                 decl_types,
+                used_sorry,
+                sorry_decls,
+                timeout_hotspots,
+                simp_hotspots,
                 scanner_version,
                 replay_version,
                 timed_out: false,
                 crashed: false,
                 ..Default::default()
             };
-            if combined_rep.import_ok && combined_rep.ok && binding == ClosureBinding::Bound {
+            if combined_rep.import_ok
+                && combined_rep.ok
+                && !combined_rep.used_sorry
+                && combined_rep.sorry_decls.is_empty()
+                && binding == ClosureBinding::Bound
+            {
                 if let Some(vkey) = verified_cache_key {
                     let vcache = ZYGOTE_VERIFIED_SHARD_CACHE
                         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -5877,7 +6387,7 @@ fn eval_with_zygote_pool_attempt(
                 })
             };
             (rl, warm_pk, None)
-        } else if !eval_mode {
+        } else if !eval_mode && !is_diagnose_mode {
             if let Some((prefix_code, decl_code, prefix_key)) =
                 split_body_into_prefix_and_decl(&body_code)
             {
@@ -5917,6 +6427,17 @@ fn eval_with_zygote_pool_attempt(
                 };
                 (rl, None, None)
             }
+        } else if is_diagnose_mode {
+            let hex_body = hex_encode_bytes(body_code.as_bytes());
+            let rl = if hex_opts.is_empty() {
+                format!("{}\t{}\t{}\n", imports_csv, hex_body, stub_mode)
+            } else {
+                format!(
+                    "{}\t{}\t{}\t\t\t{}\n",
+                    imports_csv, hex_body, stub_mode, hex_opts
+                )
+            };
+            (rl, None, None)
         } else {
             let mode_flag = encode_mode_with_file_and_cwd("eval", env_vars, file_name);
             if let Some((prefix_key, prefix_code, decl_code)) =
@@ -6134,7 +6655,12 @@ fn eval_with_zygote_pool_attempt(
                     }
                     w.warm_prefix_tree.push((warm_imports_tag.clone(), p_code));
                 }
-                if rep.ok && !rep.timed_out && !rep.crashed {
+                if rep.ok
+                    && !rep.timed_out
+                    && !rep.crashed
+                    && !rep.used_sorry
+                    && rep.sorry_decls.is_empty()
+                {
                     if let Some(vkey) = verified_cache_key {
                         let vcache = ZYGOTE_VERIFIED_SHARD_CACHE.get_or_init(|| {
                             std::sync::Mutex::new(std::collections::HashMap::new())
@@ -6552,7 +7078,7 @@ pub(crate) fn remaining_timeout_ms(timeout_ms: Option<u64>, started: std::time::
     timeout_ms
         .or_else(invocation_timeout_ms)
         .filter(|ms| *ms > 0)
-        .unwrap_or(30_000)
+        .unwrap_or(90_000)
         .saturating_sub(started.elapsed().as_millis().min(u64::MAX as u128) as u64)
 }
 
@@ -6570,7 +7096,7 @@ pub(crate) fn run_lean_command(
             timeout_ms
                 .or_else(invocation_timeout_ms)
                 .filter(|ms| *ms > 0)
-                .unwrap_or(30_000),
+                .unwrap_or(90_000),
         ),
         false,
     )
@@ -7068,6 +7594,8 @@ fn eval_reply_cacheable(rep: &ZygoteEvalReply) -> bool {
         && rep.import_ok
         && !rep.crashed
         && !rep.timed_out
+        && !rep.used_sorry
+        && rep.sorry_decls.is_empty()
         && verifier_provenance_ok(rep.scanner_version, rep.replay_version)
 }
 
@@ -12591,5 +13119,71 @@ theorem uncached_tail : 2 + 2 = 4 := rfl
             );
         }
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_speed4_zygote_eval_reply_attaches_timeout_hotspots_while_failing_closed() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_speed4_zygote_hotspots_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        std::fs::write(
+            tmp_dir.join("lean-toolchain"),
+            include_str!("../../../lean/lean-toolchain"),
+        )
+        .unwrap();
+        std::fs::write(
+            tmp_dir.join("lakefile.toml"),
+            "name = \"hot\"\n[[lean_lib]]\nname = \"Hot\"\n",
+        )
+        .unwrap();
+        let Ok(cfg) = crate::module_builder::resolve_project_config(&tmp_dir) else {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return;
+        };
+        let store = crate::TurboStore::open(Some(&tmp_dir.join("store"))).unwrap();
+        let env_vars = build_auditor_bootstrap_env(&cfg);
+
+        let src = "\
+def stepId (n : Nat) : Nat := n
+@[simp] theorem loop_step (n : Nat) : stepId n = stepId (stepId n) := rfl
+
+set_option maxHeartbeats 500 in
+theorem simp_blowup (n : Nat) : stepId n = 1 := by
+  simp [loop_step]
+";
+        let rep = eval_with_zygote_pool(
+            &store,
+            &cfg.toolchain,
+            &cfg.toolchain_lib_lean.to_string_lossy(),
+            &env_vars,
+            &cfg.lean_bin,
+            src,
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            !rep.ok,
+            "heartbeat timeout must fail closed (`rep.ok == false`), got {:?}",
+            rep
+        );
+        assert!(
+            !rep.timeout_hotspots.is_empty() || !rep.simp_hotspots.is_empty(),
+            "`ZygoteEvalReply` must directly carry `timeout_hotspots` or `simp_hotspots` on heartbeat timeout: {:?}",
+            rep
+        );
+        let formatted = format_hotspot_diagnostics(&rep.timeout_hotspots, &rep.simp_hotspots);
+        assert!(
+            formatted.contains("[hotspot]"),
+            "formatted hotspot diagnostics must include `[hotspot]`: {formatted}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 }

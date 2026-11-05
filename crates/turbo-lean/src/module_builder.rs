@@ -7599,6 +7599,18 @@ pub(crate) struct VerifiedDepModuleEntry {
     /// Artifact-set digests of the direct imports this `.olean` was elaborated against.
     /// Deliberately not `#[serde(default)]`: legacy entries without it fail closed.
     pub import_olean_digests: BTreeMap<String, String>,
+    /// Export-tier (`.olean` + `.ir` + `.ir.sig`) digests of direct `module` imports when recorded.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub import_export_digests: BTreeMap<String, String>,
+    /// Meta-tier (`.olean` + `.ir` + `.ir.sig`) digests of direct `module` imports when recorded.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub import_meta_digests: BTreeMap<String, String>,
+    /// Export-tier digest of this module's own artifacts when `is_module == true`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub olean_export_digest: String,
+    /// Meta-tier digest of this module's own artifacts when `is_module == true`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub olean_meta_digest: String,
     /// `olean_artifact_stat_fingerprint` when recorded (empty: always re-hash on use).
     #[serde(default)]
     pub artifact_stat_fingerprint: String,
@@ -7639,8 +7651,17 @@ impl Clone for DepImportMemo {
 }
 
 pub(crate) struct CachedPkgManifest {
-    raw: Option<Result<VerifiedDepManifest, ()>>,
-    validated: Option<VerifiedDepManifest>,
+    pub(crate) raw: Option<Result<VerifiedDepManifest, ()>>,
+    pub(crate) validated: Option<VerifiedDepManifest>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CutoffPinBaseline {
+    pub(crate) full_dig: String,
+    pub(crate) export_dig: String,
+    pub(crate) meta_dig: String,
+    pub(crate) cuts_off_public: bool,
+    pub(crate) cuts_off_meta: bool,
 }
 
 #[derive(Default)]
@@ -7649,8 +7670,98 @@ pub(crate) struct LakeClosureCache {
     exp_memo: HashMap<(PathBuf, String, bool), Option<LakeModuleExportInfo>>,
     pb_exp_memo: HashMap<(PathBuf, bool), Option<LakeModuleExportInfo>>,
     pinned_memo: HashSet<(PathBuf, String, String, bool)>,
+    cutoff_pins: HashMap<(PathBuf, String), CutoffPinBaseline>,
     pub(crate) post_lake_refresh: bool,
     pub(crate) ignore_mtime_skew: bool,
+}
+
+impl LakeClosureCache {
+    pub(crate) fn seed_module_export_info(
+        &mut self,
+        pkg_root: PathBuf,
+        module_name: String,
+        strict_policy: bool,
+        info: LakeModuleExportInfo,
+    ) {
+        self.exp_memo
+            .insert((pkg_root, module_name, strict_policy), Some(info));
+    }
+
+    pub(crate) fn seed_cutoff_module_pin(
+        &mut self,
+        pkg_root: PathBuf,
+        module_name: String,
+        baseline: CutoffPinBaseline,
+    ) {
+        self.cutoff_pins.insert((pkg_root, module_name), baseline);
+    }
+
+    pub(crate) fn matches_cutoff_pin(
+        &self,
+        pkg_root: &Path,
+        module_name: &str,
+        req: &ImportPinSpec<'_>,
+    ) -> Option<bool> {
+        let base = self
+            .cutoff_pins
+            .get(&(pkg_root.to_path_buf(), module_name.to_string()))?;
+        let ok = match req.tier_pin {
+            Some((DepImportVisibility::PublicExport, exp)) => {
+                base.cuts_off_public
+                    && !exp.is_empty()
+                    && (exp == base.export_dig || req.full_pin == base.full_dig)
+            }
+            Some((DepImportVisibility::MetaExport, meta)) => {
+                base.cuts_off_meta
+                    && !meta.is_empty()
+                    && (meta == base.meta_dig || req.full_pin == base.full_dig)
+            }
+            _ => false,
+        };
+        Some(ok)
+    }
+
+    pub(crate) fn allows_cutoff_parsed_import(
+        &self,
+        pkg_root: &Path,
+        module_name: &str,
+        is_importer_module: bool,
+        sub_imp: &ParsedImport,
+    ) -> Option<bool> {
+        let base = self
+            .cutoff_pins
+            .get(&(pkg_root.to_path_buf(), module_name.to_string()))?;
+        if !is_importer_module || sub_imp.import_all {
+            return Some(false);
+        }
+        Some(if sub_imp.is_meta {
+            base.cuts_off_meta
+        } else {
+            base.cuts_off_public
+        })
+    }
+
+    pub(crate) fn load_pkg_manifest<'a>(
+        &'a mut self,
+        cfg: &ProjectConfig,
+        spec: &DiscoveredModuleSpec,
+        strict_policy: bool,
+    ) -> Option<&'a CachedPkgManifest> {
+        load_cached_pkg_manifest(&mut self.manifests, cfg, spec, strict_policy)
+    }
+
+    pub(crate) fn insert_pre_pkg_manifest(
+        &mut self,
+        pkg_root: PathBuf,
+        strict_policy: bool,
+        raw: Option<Result<VerifiedDepManifest, ()>>,
+        validated: Option<VerifiedDepManifest>,
+    ) {
+        self.manifests.insert(
+            (pkg_root, strict_policy),
+            CachedPkgManifest { raw, validated },
+        );
+    }
 }
 
 fn load_cached_pkg_manifest<'a>(
@@ -7751,19 +7862,85 @@ pub(crate) fn resolve_import_site(cfg: &ProjectConfig, imp: &str) -> ImportSite 
     }
 }
 
-fn spec_olean_path(spec: &DiscoveredModuleSpec) -> PathBuf {
+pub(crate) fn spec_olean_path(spec: &DiscoveredModuleSpec) -> PathBuf {
     spec.build_lib_lean_dir.join(format!(
         "{}.olean",
         module_name_to_rel_slash(&spec.module_name)
     ))
 }
 
-fn spec_rel_src(spec: &DiscoveredModuleSpec) -> String {
+pub(crate) fn spec_rel_src(spec: &DiscoveredModuleSpec) -> String {
     spec.src_path
         .strip_prefix(&spec.pkg_root)
         .unwrap_or(&spec.src_path)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+/// Required pin for a direct import of a verified module entry:
+/// `full_pin` is always present for non-toolchain imports; `tier_pin` is optional
+/// `(visibility, expected_tier_digest)` when a `module` importer recorded export/meta tier pins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportPinSpec<'a> {
+    pub full_pin: &'a str,
+    pub tier_pin: Option<(DepImportVisibility, &'a str)>,
+}
+
+/// Aggregate required visibility for each direct import of `hdr`.
+pub(crate) fn header_direct_import_visibilities(
+    hdr: &HeaderInfo,
+) -> HashMap<String, DepImportVisibility> {
+    let mut map: HashMap<String, DepImportVisibility> = HashMap::new();
+    if !hdr.is_module {
+        for imp in &hdr.imports {
+            map.insert(imp.clone(), DepImportVisibility::All);
+        }
+        return map;
+    }
+    for spec in &hdr.import_specs {
+        let vis = if spec.import_all {
+            DepImportVisibility::All
+        } else if spec.is_meta {
+            DepImportVisibility::MetaExport
+        } else {
+            DepImportVisibility::PublicExport
+        };
+        map.entry(spec.module.clone())
+            .and_modify(|cur| *cur = (*cur).max(vis))
+            .or_insert(vis);
+    }
+    map
+}
+
+pub(crate) fn entry_import_pin_spec<'a>(
+    entry: &'a VerifiedDepModuleEntry,
+    hdr: &HeaderInfo,
+    vis_map: &HashMap<String, DepImportVisibility>,
+    imp: &str,
+) -> Option<ImportPinSpec<'a>> {
+    let full_pin = entry.import_olean_digests.get(imp)?.as_str();
+    let tier_pin = if hdr.is_module {
+        match vis_map
+            .get(imp)
+            .copied()
+            .unwrap_or(DepImportVisibility::All)
+        {
+            DepImportVisibility::PublicExport => entry
+                .import_export_digests
+                .get(imp)
+                .filter(|s| !s.is_empty())
+                .map(|s| (DepImportVisibility::PublicExport, s.as_str())),
+            DepImportVisibility::MetaExport => entry
+                .import_meta_digests
+                .get(imp)
+                .filter(|s| !s.is_empty())
+                .map(|s| (DepImportVisibility::MetaExport, s.as_str())),
+            DepImportVisibility::All => None,
+        }
+    } else {
+        None
+    };
+    Some(ImportPinSpec { full_pin, tier_pin })
 }
 
 /// P0-4: whether `entry`'s `.olean` was elaborated against the current artifacts of its direct
@@ -7783,6 +7960,32 @@ pub(crate) fn verified_entry_imports_current(
             .all(|imp| pin_current(imp, entry.import_olean_digests.get(imp).map(String::as_str)))
 }
 
+/// Visibility-aware counterpart of [`verified_entry_imports_current`]: when `hdr.is_module`,
+/// direct imports at `PublicExport` or `MetaExport` visibility carry their recorded tier pin.
+pub(crate) fn verified_entry_imports_current_for_header(
+    entry: &VerifiedDepModuleEntry,
+    hdr: &HeaderInfo,
+    mut pin_current: impl FnMut(&str, Option<ImportPinSpec<'_>>) -> bool,
+) -> bool {
+    let vis_map = header_direct_import_visibilities(hdr);
+    entry
+        .import_olean_digests
+        .keys()
+        .all(|k| hdr.imports.contains(k))
+        && entry
+            .import_export_digests
+            .keys()
+            .all(|k| hdr.imports.contains(k))
+        && entry
+            .import_meta_digests
+            .keys()
+            .all(|k| hdr.imports.contains(k))
+        && hdr
+            .imports
+            .iter()
+            .all(|imp| pin_current(imp, entry_import_pin_spec(entry, hdr, &vis_map, imp)))
+}
+
 /// Check-time judgement of an import pinned at `pin` from the root package, resolved as at build
 /// time (root package first): prebuilt `.olean`s are re-digested; root- and dependency-package
 /// modules must have a consistent closure (`dep_pkg_import_pins_consistent`), memoized per
@@ -7791,7 +7994,7 @@ pub(crate) fn import_pin_current(
     cfg: &ProjectConfig,
     memo: &DepImportMemo,
     imp: &str,
-    pin: Option<&str>,
+    pin: Option<ImportPinSpec<'_>>,
 ) -> bool {
     let mut cache = LakeClosureCache::default();
     import_pin_current_with_policy(cfg, memo, &mut cache, imp, pin, true)
@@ -7803,18 +8006,18 @@ pub(crate) fn import_pin_fresh_for_build(
     cfg: &ProjectConfig,
     cache: &mut LakeClosureCache,
     imp: &str,
-    pin: Option<&str>,
+    pin: Option<ImportPinSpec<'_>>,
 ) -> bool {
     let non_strict_memo = DepImportMemo::default();
     import_pin_current_with_policy(cfg, &non_strict_memo, cache, imp, pin, false)
 }
 
-fn import_pin_current_with_policy(
+pub(crate) fn import_pin_current_with_policy(
     cfg: &ProjectConfig,
     memo: &DepImportMemo,
     cache: &mut LakeClosureCache,
     imp: &str,
-    pin: Option<&str>,
+    pin: Option<ImportPinSpec<'_>>,
     strict_policy: bool,
 ) -> bool {
     let site = match resolve_module_in_package(&cfg.root_pkg, true, imp) {
@@ -7823,19 +8026,65 @@ fn import_pin_current_with_policy(
     };
     match (site, pin) {
         (ImportSite::Toolchain, None) => true,
-        (ImportSite::Prebuilt(olean), Some(pin)) => {
-            olean_digest_is(cfg, &olean, pin)
+        (ImportSite::Prebuilt(olean), Some(pin_spec)) => {
+            olean_digest_is(cfg, &olean, pin_spec.full_pin)
                 && prebuilt_olean_export_info(cfg, strict_policy, &olean, cache).is_some()
         }
-        (ImportSite::Module(spec), Some(pin)) => {
-            dep_pkg_import_pins_consistent(cfg, memo, cache, *spec, pin, strict_policy)
+        (ImportSite::Module(spec), Some(pin_spec)) => {
+            dep_pkg_import_pins_consistent(cfg, memo, cache, *spec, pin_spec, strict_policy)
         }
         _ => false,
     }
 }
 
+/// Check whether `entry` (whose full artifact set was already verified current at `olean_path`)
+/// satisfies `pin_spec` for a module whose current header has `target_is_module`.
+fn entry_matches_import_pin_spec(
+    olean_path: &Path,
+    entry: &VerifiedDepModuleEntry,
+    target_is_module: bool,
+    pin_spec: &ImportPinSpec<'_>,
+) -> bool {
+    if entry.olean_artifact_digest == pin_spec.full_pin {
+        return true;
+    }
+    if !target_is_module {
+        return false;
+    }
+    let Some((vis, expected_tier)) = pin_spec.tier_pin else {
+        return false;
+    };
+    if expected_tier.is_empty() {
+        return false;
+    }
+    match vis {
+        DepImportVisibility::PublicExport => {
+            if !entry.olean_export_digest.is_empty() && entry.olean_export_digest != expected_tier {
+                return false;
+            }
+            if !entry.artifact_stat_fingerprint.is_empty() && !entry.olean_export_digest.is_empty()
+            {
+                return true;
+            }
+            compute_dep_export_olean_digest_with_policy(olean_path, true)
+                .is_ok_and(|d| d == expected_tier)
+        }
+        DepImportVisibility::MetaExport => {
+            if !entry.olean_meta_digest.is_empty() && entry.olean_meta_digest != expected_tier {
+                return false;
+            }
+            if !entry.artifact_stat_fingerprint.is_empty() && !entry.olean_meta_digest.is_empty() {
+                return true;
+            }
+            compute_dep_meta_olean_digest_with_policy(olean_path, true)
+                .is_ok_and(|d| d == expected_tier)
+        }
+        DepImportVisibility::All => false,
+    }
+}
+
 /// Whether `olean`'s artifact set digests to `pin`, read-only (never creating `.turbo_publish.lock`).
-fn olean_digest_is(_cfg: &ProjectConfig, olean: &Path, pin: &str) -> bool {
+pub(crate) fn olean_digest_is(_cfg: &ProjectConfig, olean: &Path, pin: &str) -> bool {
     compute_olean_artifact_set_digest_with_policy(olean, true).is_ok_and(|d| d == pin)
 }
 
@@ -7951,7 +8200,10 @@ pub(crate) fn forget_refreshed_dep_module(cfg: &ProjectConfig, imp: &str) {
                     &DepImportMemo::default(),
                     &mut cache,
                     spec.clone(),
-                    &entry.olean_artifact_digest,
+                    ImportPinSpec {
+                        full_pin: &entry.olean_artifact_digest,
+                        tier_pin: None,
+                    },
                     false,
                 )
         });
@@ -8050,7 +8302,10 @@ pub(crate) fn dep_pkg_module_stale(
                 memo,
                 cache,
                 *spec,
-                &entry.olean_artifact_digest,
+                ImportPinSpec {
+                    full_pin: &entry.olean_artifact_digest,
+                    tier_pin: None,
+                },
                 false,
             );
     }
@@ -8354,6 +8609,15 @@ fn prebuilt_closure_export_info(
                     )?
                 }
                 ImportSite::Module(sub_spec) => {
+                    if cache.allows_cutoff_parsed_import(
+                        &sub_spec.pkg_root,
+                        &sub_spec.module_name,
+                        is_mod,
+                        sub_imp,
+                    ) == Some(false)
+                    {
+                        return None;
+                    }
                     if collect_pairs {
                         local_pairs.push((sub_imp.module.clone(), spec_olean_path(&sub_spec)));
                     }
@@ -8411,7 +8675,7 @@ fn prebuilt_closure_export_info(
     res
 }
 
-fn prebuilt_olean_export_info(
+pub(crate) fn prebuilt_olean_export_info(
     cfg: &ProjectConfig,
     strict_policy: bool,
     olean_path: &Path,
@@ -8456,7 +8720,7 @@ fn collect_fresh_prebuilt_closure(
 /// Fail-closed Lake/turbo closure verifier for `spec`, returning its `LakeModuleExportInfo` only
 /// when `spec` and every transitive import are proven current against sources, toolchain/options,
 /// sidecars, and import export hashes (or turbo manifest pins).
-fn lake_closure_export_info(
+pub(crate) fn lake_closure_export_info(
     cfg: &ProjectConfig,
     spec: &DiscoveredModuleSpec,
     strict_policy: bool,
@@ -8606,25 +8870,24 @@ fn lake_closure_export_info_inner(
         let mut meta_trans_trace = 1723u64;
         let mut all_trans_trace = 1723u64;
         let mut legacy_trans_trace = 1723u64;
+        let hdr_vis_map = header_direct_import_visibilities(&hdr);
         for sub_imp in &hdr.import_specs {
             let site = match resolve_module_in_package(&cfg.root_pkg, true, &sub_imp.module) {
                 Some(root_spec) => ImportSite::Module(Box::new(root_spec)),
                 None => resolve_import_site(cfg, &sub_imp.module),
             };
-            let recorded_pin = manifest_entry.as_ref().and_then(|e| {
-                e.import_olean_digests
-                    .get(&sub_imp.module)
-                    .map(String::as_str)
-            });
+            let recorded_pin_spec = manifest_entry
+                .as_ref()
+                .and_then(|e| entry_import_pin_spec(e, &hdr, &hdr_vis_map, &sub_imp.module));
             match site {
                 ImportSite::Toolchain => {
-                    if manifest_entry.is_some() && recorded_pin.is_some() {
+                    if manifest_entry.is_some() && recorded_pin_spec.is_some() {
                         return None;
                     }
                 }
                 ImportSite::Prebuilt(pb_olean) => {
-                    if let Some(pin) = recorded_pin {
-                        if !olean_digest_is(cfg, &pb_olean, pin) {
+                    if let Some(pin_spec) = recorded_pin_spec {
+                        if !olean_digest_is(cfg, &pb_olean, pin_spec.full_pin) {
                             return None;
                         }
                     } else if manifest_entry.is_some() {
@@ -8659,15 +8922,53 @@ fn lake_closure_export_info_inner(
                     );
                 }
                 ImportSite::Module(sub_spec) => {
-                    if let Some(pin) = recorded_pin {
-                        if !olean_digest_is(cfg, &spec_olean_path(&sub_spec), pin) {
+                    let sub_olean = spec_olean_path(&sub_spec);
+                    if let Some(pin_spec) = recorded_pin_spec {
+                        let pin_matches = if let Some(cutoff_ok) = cache.matches_cutoff_pin(
+                            &sub_spec.pkg_root,
+                            &sub_spec.module_name,
+                            &pin_spec,
+                        ) {
+                            cutoff_ok
+                        } else {
+                            olean_digest_is(cfg, &sub_olean, pin_spec.full_pin)
+                                || fs::read_to_string(&sub_spec.src_path)
+                                    .ok()
+                                    .map(|s| parse_header_info(&s))
+                                    .filter(|sh| sh.header_error.is_none() && sh.is_module)
+                                    .is_some_and(|_| match pin_spec.tier_pin {
+                                        Some((DepImportVisibility::PublicExport, exp)) => {
+                                            !exp.is_empty()
+                                                && compute_dep_export_olean_digest_with_policy(
+                                                    &sub_olean, true,
+                                                )
+                                                .is_ok_and(|d| d == exp)
+                                        }
+                                        Some((DepImportVisibility::MetaExport, meta)) => {
+                                            !meta.is_empty()
+                                                && compute_dep_meta_olean_digest_with_policy(
+                                                    &sub_olean, true,
+                                                )
+                                                .is_ok_and(|d| d == meta)
+                                        }
+                                        _ => false,
+                                    })
+                        };
+                        if !pin_matches {
                             return None;
                         }
-                    } else if manifest_entry.is_some() {
+                    } else if manifest_entry.is_some()
+                        || cache.allows_cutoff_parsed_import(
+                            &sub_spec.pkg_root,
+                            &sub_spec.module_name,
+                            is_mod,
+                            sub_imp,
+                        ) == Some(false)
+                    {
                         return None;
                     }
                     if collect_pairs {
-                        local_pairs.push((sub_imp.module.clone(), spec_olean_path(&sub_spec)));
+                        local_pairs.push((sub_imp.module.clone(), sub_olean));
                     }
                     let sub_exp = lake_closure_export_info_inner(
                         cfg,
@@ -8702,6 +9003,14 @@ fn lake_closure_export_info_inner(
                 .import_olean_digests
                 .keys()
                 .all(|k| hdr.imports.contains(k))
+                || !entry
+                    .import_export_digests
+                    .keys()
+                    .all(|k| hdr.imports.contains(k))
+                || !entry
+                    .import_meta_digests
+                    .keys()
+                    .all(|k| hdr.imports.contains(k))
             {
                 return None;
             }
@@ -8856,30 +9165,47 @@ fn lake_closure_export_info_inner(
 /// entry, and every import of that source must be pinned to the current artifacts (root- and
 /// dependency-package modules recursively, root ones kernel-audited under `strict_policy`;
 /// prebuilt imports re-digested).
-fn dep_pkg_import_pins_consistent(
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OwnedImportPinSpec {
+    pub(crate) full_pin: String,
+    pub(crate) tier_pin: Option<(DepImportVisibility, String)>,
+}
+
+impl OwnedImportPinSpec {
+    pub(crate) fn from_spec(spec: ImportPinSpec<'_>) -> Self {
+        Self {
+            full_pin: spec.full_pin.to_string(),
+            tier_pin: spec.tier_pin.map(|(v, d)| (v, d.to_string())),
+        }
+    }
+
+    pub(crate) fn as_spec(&self) -> ImportPinSpec<'_> {
+        ImportPinSpec {
+            full_pin: &self.full_pin,
+            tier_pin: self.tier_pin.as_ref().map(|(v, d)| (*v, d.as_str())),
+        }
+    }
+}
+
+pub(crate) fn dep_pkg_import_pins_consistent(
     cfg: &ProjectConfig,
     memo: &DepImportMemo,
     cache: &mut LakeClosureCache,
     spec: DiscoveredModuleSpec,
-    pin: &str,
+    pin_spec: ImportPinSpec<'_>,
     strict_policy: bool,
 ) -> bool {
     let Ok(expected_lake_inputs) = workspace_lake_inputs_digest(cfg) else {
         return false;
     };
     let mut seen: HashMap<(PathBuf, String), String> = HashMap::new();
-    let mut stack = vec![(spec, pin.to_string())];
-    while let Some((cur, pin)) = stack.pop() {
+    let mut stack = vec![(spec, OwnedImportPinSpec::from_spec(pin_spec))];
+    let use_global_memo = cache.cutoff_pins.is_empty();
+    while let Some((cur, req)) = stack.pop() {
         let key = (cur.pkg_root.clone(), cur.module_name.clone());
-        let memo_key = (key.0.clone(), key.1.clone(), pin.clone());
-        let cache_pin_key = (key.0.clone(), key.1.clone(), pin.clone(), strict_policy);
-        if cache.pinned_memo.contains(&cache_pin_key)
-            || (strict_policy && memo.0.lock().is_ok_and(|m| m.contains(&memo_key)))
-        {
-            continue;
-        }
-        if let Some(prev) = seen.get(&key) {
-            if *prev != pin {
+        let req_spec = req.as_spec();
+        if let Some(cutoff_ok) = cache.matches_cutoff_pin(&key.0, &key.1, &req_spec) {
+            if !cutoff_ok {
                 return false;
             }
             continue;
@@ -8900,6 +9226,25 @@ fn dep_pkg_import_pins_consistent(
             .and_then(|m| m.modules.get(&rel_src))
             .cloned()
         else {
+            let olean_path = spec_olean_path(&cur);
+            let pin_matches_lake = olean_digest_is(cfg, &olean_path, &req.full_pin)
+                || fs::read_to_string(&cur.src_path)
+                    .ok()
+                    .map(|s| parse_header_info(&s))
+                    .filter(|sh| sh.header_error.is_none() && sh.is_module)
+                    .is_some_and(|_| match req.tier_pin.as_ref() {
+                        Some((DepImportVisibility::PublicExport, exp)) => {
+                            !exp.is_empty()
+                                && compute_dep_export_olean_digest_with_policy(&olean_path, true)
+                                    .is_ok_and(|d| d == *exp)
+                        }
+                        Some((DepImportVisibility::MetaExport, meta)) => {
+                            !meta.is_empty()
+                                && compute_dep_meta_olean_digest_with_policy(&olean_path, true)
+                                    .is_ok_and(|d| d == *meta)
+                        }
+                        _ => false,
+                    });
             if strict_policy
                 || raw_has_entry
                 || (!cache.post_lake_refresh
@@ -8907,7 +9252,7 @@ fn dep_pkg_import_pins_consistent(
                     && (cached_manifest.raw.is_some()
                         || package_by_root(cfg, &cur.pkg_root)
                             .is_some_and(|p| !p.inputs.is_empty())))
-                || !olean_digest_is(cfg, &spec_olean_path(&cur), &pin)
+                || !pin_matches_lake
             {
                 return false;
             }
@@ -8915,33 +9260,59 @@ fn dep_pkg_import_pins_consistent(
             if lake_closure_export_info(cfg, &cur, false, cache, &mut visiting).is_none() {
                 return false;
             }
-            seen.insert(key, pin);
+            if let Ok(actual_full) =
+                compute_olean_artifact_set_digest_with_policy(&olean_path, true)
+            {
+                seen.insert(key, actual_full);
+            }
             continue;
         };
         let olean_path = spec_olean_path(&cur);
-        let artifacts_ok = (!strict_policy || !cur.is_root_pkg || entry.kernel_audited)
-            && entry.lake_inputs_digest == expected_lake_inputs
-            && entry_artifacts_current(cfg, &olean_path, &entry);
         let Ok(src) = fs::read_to_string(&cur.src_path) else {
             return false;
         };
-        let src_ok = blake3::hash(src.as_bytes()).to_hex().as_str() == entry.src_blake3;
         let hdr = parse_header_info(&src);
-        let sidecars_ok = hdr.header_error.is_none()
-            && verify_module_lake_sidecars(
-                &olean_path,
-                Some(&cur.build_ir_dir),
-                &module_name_to_rel_slash(&cur.module_name),
-                &src,
-                hdr.is_module,
-                cur.precompile_modules
-                    || cur.emit_c_default
-                    || cur.is_exe_target
-                    || hdr.has_c_export,
-            )
-            .is_ok();
+        if hdr.header_error.is_some()
+            || !entry_matches_import_pin_spec(&olean_path, &entry, hdr.is_module, &req.as_spec())
+        {
+            return false;
+        }
+        let actual_pin = entry.olean_artifact_digest.clone();
+        let memo_key = (key.0.clone(), key.1.clone(), actual_pin.clone());
+        let cache_pin_key = (
+            key.0.clone(),
+            key.1.clone(),
+            actual_pin.clone(),
+            strict_policy,
+        );
+        if cache.pinned_memo.contains(&cache_pin_key)
+            || (strict_policy
+                && use_global_memo
+                && memo.0.lock().is_ok_and(|m| m.contains(&memo_key)))
+        {
+            continue;
+        }
+        if let Some(prev) = seen.get(&key) {
+            if *prev != actual_pin {
+                return false;
+            }
+            continue;
+        }
+        let artifacts_ok = (!strict_policy || !cur.is_root_pkg || entry.kernel_audited)
+            && entry.lake_inputs_digest == expected_lake_inputs
+            && entry_artifacts_current(cfg, &olean_path, &entry);
+        let src_ok = blake3::hash(src.as_bytes()).to_hex().as_str() == entry.src_blake3;
+        let sidecars_ok = verify_module_lake_sidecars(
+            &olean_path,
+            Some(&cur.build_ir_dir),
+            &module_name_to_rel_slash(&cur.module_name),
+            &src,
+            hdr.is_module,
+            cur.precompile_modules || cur.emit_c_default || cur.is_exe_target || hdr.has_c_export,
+        )
+        .is_ok();
         let pins_ok = sidecars_ok
-            && verified_entry_imports_current(&entry, &hdr.imports, |imp, sub_pin| {
+            && verified_entry_imports_current_for_header(&entry, &hdr, |imp, sub_pin| {
                 let site = match resolve_module_in_package(&cfg.root_pkg, true, imp) {
                     Some(root_spec) => ImportSite::Module(Box::new(root_spec)),
                     None => resolve_import_site(cfg, imp),
@@ -8949,33 +9320,27 @@ fn dep_pkg_import_pins_consistent(
                 match (site, sub_pin) {
                     (ImportSite::Toolchain, None) => true,
                     (ImportSite::Prebuilt(o), Some(p)) => {
-                        olean_digest_is(cfg, &o, p)
+                        olean_digest_is(cfg, &o, p.full_pin)
                             && prebuilt_olean_export_info(cfg, strict_policy, &o, cache).is_some()
                     }
                     (ImportSite::Module(sub), Some(p)) => {
-                        stack.push((*sub, p.to_string()));
+                        stack.push((*sub, OwnedImportPinSpec::from_spec(p)));
                         true
                     }
                     _ => false,
                 }
             });
-        if !c_abi::verify_module_cache_key(
-            true,
-            true,
-            src_ok,
-            artifacts_ok && pins_ok && entry.olean_artifact_digest == pin,
-            true,
-        ) {
+        if !c_abi::verify_module_cache_key(true, true, src_ok, artifacts_ok && pins_ok, true) {
             return false;
         }
-        seen.insert(key, pin);
+        seen.insert(key, actual_pin);
     }
     for ((pkg, module), pin) in &seen {
         cache
             .pinned_memo
             .insert((pkg.clone(), module.clone(), pin.clone(), strict_policy));
     }
-    if strict_policy {
+    if strict_policy && use_global_memo {
         if let Ok(mut m) = memo.0.lock() {
             m.extend(
                 seen.into_iter()
@@ -11686,14 +12051,206 @@ pub(crate) fn compute_olean_artifact_set_digest_with_policy(
 }
 
 fn olean_artifact_paths(olean_path: &Path) -> [(&'static str, PathBuf); 6] {
+    let ir_path = olean_path.with_extension("ir");
+    let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
     [
         ("olean", olean_path.to_path_buf()),
-        ("srv", olean_path.with_extension("olean.server")),
-        ("priv", olean_path.with_extension("olean.private")),
+        (
+            "srv",
+            PathBuf::from(format!("{}.server", olean_path.display())),
+        ),
+        (
+            "priv",
+            PathBuf::from(format!("{}.private", olean_path.display())),
+        ),
         ("ilean", olean_path.with_extension("ilean")),
-        ("ir", olean_path.with_extension("ir")),
-        ("ir_sig", olean_path.with_extension("ir.sig")),
+        ("ir", ir_path),
+        ("ir_sig", ir_sig_path),
     ]
+}
+
+fn dep_export_olean_artifact_paths(olean_path: &Path) -> [(&'static str, PathBuf); 3] {
+    let ir_path = olean_path.with_extension("ir");
+    let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
+    [
+        ("olean", olean_path.to_path_buf()),
+        ("ir", ir_path),
+        ("ir_sig", ir_sig_path),
+    ]
+}
+
+fn dep_meta_olean_artifact_paths(olean_path: &Path) -> [(&'static str, PathBuf); 3] {
+    let ir_path = olean_path.with_extension("ir");
+    let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
+    [
+        ("olean", olean_path.to_path_buf()),
+        ("ir", ir_path),
+        ("ir_sig", ir_sig_path),
+    ]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DepImportVisibility {
+    PublicExport,
+    MetaExport,
+    All,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModuleArtifactTierDigests {
+    pub(crate) full: String,
+    pub(crate) dep_export: String,
+    pub(crate) dep_meta: String,
+}
+
+impl ModuleArtifactTierDigests {
+    pub(crate) fn for_visibility(&self, vis: DepImportVisibility, dep_is_module: bool) -> String {
+        if !dep_is_module {
+            return self.full.clone();
+        }
+        match vis {
+            DepImportVisibility::PublicExport => self.dep_export.clone(),
+            DepImportVisibility::MetaExport => self.dep_meta.clone(),
+            DepImportVisibility::All => self.full.clone(),
+        }
+    }
+}
+
+pub fn compute_dep_export_olean_digest(olean_path: &Path) -> Result<String> {
+    compute_dep_export_olean_digest_with_policy(olean_path, false)
+}
+
+pub fn compute_dep_meta_olean_digest(olean_path: &Path) -> Result<String> {
+    compute_dep_meta_olean_digest_with_policy(olean_path, false)
+}
+
+pub(crate) fn compute_dep_export_olean_digest_with_policy(
+    olean_path: &Path,
+    preserve_caller: bool,
+) -> Result<String> {
+    let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
+    let _flock_guard = if let Some(pkg_root) = infer_pkg_root_from_artifact_path(olean_path) {
+        Some(acquire_publish_flock_mode(
+            &pkg_root,
+            false,
+            preserve_caller || crate::lake_build::worktree_auto_link_disabled(&pkg_root),
+        )?)
+    } else {
+        None
+    };
+    read_tagged_olean_artifact_digest(
+        b"olean-export-v2\n",
+        &dep_export_olean_artifact_paths(olean_path),
+        _flock_guard.as_ref(),
+        |p| Ok(fs::read(p)?),
+    )
+}
+
+pub(crate) fn compute_dep_meta_olean_digest_with_policy(
+    olean_path: &Path,
+    preserve_caller: bool,
+) -> Result<String> {
+    let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
+    let _flock_guard = if let Some(pkg_root) = infer_pkg_root_from_artifact_path(olean_path) {
+        Some(acquire_publish_flock_mode(
+            &pkg_root,
+            false,
+            preserve_caller || crate::lake_build::worktree_auto_link_disabled(&pkg_root),
+        )?)
+    } else {
+        None
+    };
+    read_tagged_olean_artifact_digest(
+        b"olean-meta-v1\n",
+        &dep_meta_olean_artifact_paths(olean_path),
+        _flock_guard.as_ref(),
+        |p| Ok(fs::read(p)?),
+    )
+}
+
+pub(crate) fn compute_module_artifact_tier_digests_with_policy(
+    olean_path: &Path,
+    preserve_caller: bool,
+) -> Result<ModuleArtifactTierDigests> {
+    let lock = PUBLISH_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Module artifact publication mutex poisoned"))?;
+    let _flock_guard = if let Some(pkg_root) = infer_pkg_root_from_artifact_path(olean_path) {
+        Some(acquire_publish_flock_mode(
+            &pkg_root,
+            false,
+            preserve_caller || crate::lake_build::worktree_auto_link_disabled(&pkg_root),
+        )?)
+    } else {
+        None
+    };
+    compute_module_artifact_tier_digests_locked(olean_path, _flock_guard.as_ref())
+}
+
+fn compute_module_artifact_tier_digests_locked(
+    olean_path: &Path,
+    guard: Option<&crate::shm_cache::PublishFlockGuard>,
+) -> Result<ModuleArtifactTierDigests> {
+    let artifacts = olean_artifact_paths(olean_path);
+    let paths: Vec<_> = artifacts.iter().map(|(_, p)| p.clone()).collect();
+    let compute = || {
+        let mut present_hashes: [Option<[u8; 32]>; 6] = [None; 6];
+        for (idx, (tag, path)) in artifacts.iter().enumerate() {
+            let present = match fs::metadata(path) {
+                Ok(meta) => {
+                    anyhow::ensure!(
+                        meta.is_file(),
+                        "Artifact path `{}` is not a regular file",
+                        path.display()
+                    );
+                    true
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && *tag != "olean" => false,
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("Failed to stat artifact {}", path.display()))
+                }
+            };
+            if present {
+                let bytes = fs::read(path)
+                    .with_context(|| format!("Failed to read artifact {}", path.display()))?;
+                present_hashes[idx] = Some(*blake3::hash(&bytes).as_bytes());
+            }
+        }
+        let fold_subset = |domain: &[u8], indices: &[usize]| -> String {
+            let mut h = blake3::Hasher::new();
+            h.update(domain);
+            for &idx in indices {
+                let tag = artifacts[idx].0;
+                let hash_opt = present_hashes[idx].as_ref();
+                if tag != "olean" {
+                    h.update(&[u8::from(hash_opt.is_some())]);
+                }
+                if let Some(raw_hash) = hash_opt {
+                    update_lp(&mut h, tag.as_bytes(), raw_hash);
+                } else {
+                    update_lp(&mut h, tag.as_bytes(), b"");
+                }
+            }
+            h.finalize().to_hex().to_string()
+        };
+        Ok(ModuleArtifactTierDigests {
+            full: fold_subset(b"olean-art-v2\n", &[0, 1, 2, 3, 4, 5]),
+            dep_export: fold_subset(b"olean-export-v2\n", &[0, 4, 5]),
+            dep_meta: fold_subset(b"olean-meta-v1\n", &[0, 4, 5]),
+        })
+    };
+    match guard {
+        Some(guard) => guard.read_consistent(&paths, compute),
+        None => compute(),
+    }
 }
 
 fn compute_olean_artifact_set_digest_locked(
@@ -11706,14 +12263,27 @@ fn compute_olean_artifact_set_digest_locked(
 fn read_olean_artifact_set_digest(
     olean_path: &Path,
     guard: Option<&crate::shm_cache::PublishFlockGuard>,
+    read: impl FnMut(&Path) -> Result<Vec<u8>>,
+) -> Result<String> {
+    read_tagged_olean_artifact_digest(
+        b"olean-art-v2\n",
+        &olean_artifact_paths(olean_path),
+        guard,
+        read,
+    )
+}
+
+fn read_tagged_olean_artifact_digest(
+    domain: &[u8],
+    artifacts: &[(&'static str, PathBuf)],
+    guard: Option<&crate::shm_cache::PublishFlockGuard>,
     mut read: impl FnMut(&Path) -> Result<Vec<u8>>,
 ) -> Result<String> {
-    let artifacts = olean_artifact_paths(olean_path);
     let paths: Vec<_> = artifacts.iter().map(|(_, p)| p.clone()).collect();
     let mut digest = || {
         let mut h = blake3::Hasher::new();
-        h.update(b"olean-art-v2\n");
-        for (tag, path) in &artifacts {
+        h.update(domain);
+        for (tag, path) in artifacts {
             let present = match fs::metadata(path) {
                 Ok(meta) => {
                     anyhow::ensure!(
@@ -12441,7 +13011,7 @@ pub fn compute_module_cas_key_with_dynlibs(
         );
     }
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean-module-cas-v4\n");
+    h.update(b"turbo-lean-module-cas-v6\n");
     update_lp(&mut h, b"toolchain", cfg.toolchain.as_bytes());
     update_lp(&mut h, b"githash", cfg.lean_githash.as_bytes());
     update_lp(
@@ -12823,14 +13393,14 @@ fn lake_input_hash(val: &serde_json::Value) -> Result<u64> {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct LakeModuleExportInfo {
-    arts_trace: u64,
-    meta_arts_trace: u64,
-    all_arts_trace: u64,
-    trans_trace: u64,
-    meta_trans_trace: u64,
-    all_trans_trace: u64,
-    legacy_trans_trace: u64,
+pub(crate) struct LakeModuleExportInfo {
+    pub(crate) arts_trace: u64,
+    pub(crate) meta_arts_trace: u64,
+    pub(crate) all_arts_trace: u64,
+    pub(crate) trans_trace: u64,
+    pub(crate) meta_trans_trace: u64,
+    pub(crate) all_trans_trace: u64,
+    pub(crate) legacy_trans_trace: u64,
 }
 
 fn verify_and_hash_artifact_bytes(
@@ -12881,7 +13451,7 @@ fn verify_and_hash_artifact_bytes(
     Ok(actual_h)
 }
 
-fn compute_lake_export_info(
+pub(crate) fn compute_lake_export_info(
     cfg: &ProjectConfig,
     dag: &ModuleDag,
     requester: &ModuleNode,
@@ -13580,7 +14150,10 @@ pub fn write_lake_module_hashes_and_trace(
     Ok(())
 }
 
-fn compute_module_raw_import_dynlibs(dag: &ModuleDag, node: &ModuleNode) -> Vec<PathBuf> {
+pub(crate) fn compute_module_raw_import_dynlibs(
+    dag: &ModuleDag,
+    node: &ModuleNode,
+) -> Vec<PathBuf> {
     let imps = if node.precompile_modules {
         compute_ordered_trans_imports(dag, node)
     } else {
@@ -15923,17 +16496,45 @@ fn publish_staged_module_compile_output(
     Ok((dur_ms, stdout_str, expected_dig))
 }
 
+fn normalize_lexical_path(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in p.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    out.push(comp);
+                }
+            }
+            _ => out.push(comp),
+        }
+    }
+    out
+}
+
 /// Whether every cached file output of a module lands on one of `node`'s artifact paths.
 fn cas_outputs_bound_to_node(outputs: &[BlobEntry], target_root: &Path, node: &ModuleNode) -> bool {
     let expected: Vec<PathBuf> = olean_artifact_paths(&node.olean_path)
         .into_iter()
-        .map(|(_, p)| p)
-        .chain([node.c_path.clone()])
+        .map(|(_, p)| {
+            p.canonicalize()
+                .unwrap_or_else(|_| normalize_lexical_path(&p))
+        })
+        .chain([node
+            .c_path
+            .canonicalize()
+            .unwrap_or_else(|_| normalize_lexical_path(&node.c_path))])
         .collect();
     outputs
         .iter()
         .filter(|o| !o.rel_path.starts_with("thm:"))
-        .all(|o| expected.contains(&target_root.join(&o.rel_path)))
+        .all(|o| {
+            let cand = target_root.join(&o.rel_path);
+            let norm = cand
+                .canonicalize()
+                .unwrap_or_else(|_| normalize_lexical_path(&cand));
+            expected.contains(&norm)
+        })
 }
 
 #[cfg(test)]
@@ -16258,10 +16859,12 @@ pub(crate) fn ensure_imported_oleans_replayed_with_roots_and_axioms(
 
 pub(crate) fn record_verified_dep_source(
     cfg: &ProjectConfig,
+    dag: &ModuleDag,
     node: &ModuleNode,
     olean_artifact_digest: &str,
     kernel_audited: bool,
     olean_digests: &HashMap<String, String>,
+    tier_digests: &HashMap<String, ModuleArtifactTierDigests>,
 ) {
     // Pin the direct imports the `.olean` was elaborated against; skip recording if the
     // source moved on mid-build or a dependency digest is unknown.
@@ -16272,17 +16875,49 @@ pub(crate) fn record_verified_dep_source(
     else {
         return;
     };
-    let direct_imports = node.direct_dag_deps.iter().chain(
-        node.external_olean_deps
-            .iter()
-            .map(|(m, _)| m)
-            .filter(|m| header.imports.contains(m)),
-    );
-    let Some(import_olean_digests) = direct_imports
-        .map(|m| Some((m.clone(), olean_digests.get(m)?.clone())))
+    let direct_import_names: Vec<&String> = node
+        .direct_dag_deps
+        .iter()
+        .chain(
+            node.external_olean_deps
+                .iter()
+                .map(|(m, _)| m)
+                .filter(|m| header.imports.contains(m)),
+        )
+        .collect();
+    let Some(import_olean_digests) = direct_import_names
+        .iter()
+        .map(|&m| Some((m.clone(), olean_digests.get(m)?.clone())))
         .collect::<Option<BTreeMap<_, _>>>()
     else {
         return;
+    };
+    let mut import_export_digests = BTreeMap::new();
+    let mut import_meta_digests = BTreeMap::new();
+    if header.is_module {
+        for &m in &direct_import_names {
+            let dep_is_mod = dag
+                .nodes
+                .get(m)
+                .map(|n| n.is_module)
+                .unwrap_or_else(|| resolve_dep_module_visibility_spec(cfg, dag, node, m).0);
+            if dep_is_mod {
+                if let Some(td) = tier_digests.get(m) {
+                    import_export_digests.insert(m.clone(), td.dep_export.clone());
+                    import_meta_digests.insert(m.clone(), td.dep_meta.clone());
+                }
+            }
+        }
+    }
+    let preserve = crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root);
+    let (olean_export_digest, olean_meta_digest) = if header.is_module {
+        compute_module_artifact_tier_digests_with_policy(&node.olean_path, preserve)
+            .ok()
+            .filter(|td| td.full == olean_artifact_digest)
+            .map(|td| (td.dep_export, td.dep_meta))
+            .unwrap_or_default()
+    } else {
+        (String::new(), String::new())
     };
     // Fingerprint only a stable dependency-package artifact set that still digests to the recorded
     // value; root `.turbo_verified_sources.json` stays purely content-addressed across CAS restores.
@@ -16366,6 +17001,10 @@ pub(crate) fn record_verified_dep_source(
             lake_inputs_digest,
             kernel_audited,
             import_olean_digests,
+            import_export_digests,
+            import_meta_digests,
+            olean_export_digest,
+            olean_meta_digest,
             artifact_stat_fingerprint,
         },
     );
@@ -16398,6 +17037,7 @@ fn probe_warm_on_disk_module_candidate(
     node: &ModuleNode,
     preserve_lake: bool,
     olean_digests: &HashMap<String, String>,
+    tier_digests: &HashMap<String, ModuleArtifactTierDigests>,
     raw_imp_dynlibs: &[PathBuf],
 ) -> Option<String> {
     if cfg.lean_githash.is_empty()
@@ -16507,11 +17147,31 @@ fn probe_warm_on_disk_module_candidate(
             && entry.src_blake3 == node.src_blake3
             && entry.olean_artifact_digest == actual_olean_digest
         {
-            verified_entry_imports_current(entry, &header.imports, |imp, pin| {
+            verified_entry_imports_current_for_header(entry, &header, |imp, pin_spec| {
                 if let Some(expected_dig) = olean_digests.get(imp) {
-                    pin == Some(expected_dig.as_str())
+                    let Some(ps) = pin_spec else {
+                        return false;
+                    };
+                    if ps.full_pin == expected_dig {
+                        return true;
+                    }
+                    let dep_is_mod = dag.nodes.get(imp).map(|n| n.is_module).unwrap_or_else(|| {
+                        resolve_dep_module_visibility_spec(cfg, dag, node, imp).0
+                    });
+                    if !dep_is_mod {
+                        return false;
+                    }
+                    match (ps.tier_pin, tier_digests.get(imp)) {
+                        (Some((DepImportVisibility::PublicExport, exp)), Some(td)) => {
+                            !exp.is_empty() && exp == td.dep_export
+                        }
+                        (Some((DepImportVisibility::MetaExport, meta)), Some(td)) => {
+                            !meta.is_empty() && meta == td.dep_meta
+                        }
+                        _ => false,
+                    }
                 } else {
-                    pin.is_none()
+                    pin_spec.is_none()
                         && is_builtin_toolchain_module(
                             &cfg.toolchain_lib_lean,
                             Some(&cfg.lean_githash),
@@ -16974,33 +17634,228 @@ fn compute_dag_schedule_edges(
 
 type ModuleDepAndDynlibDigests = (Vec<(String, String)>, Vec<PathBuf>, Vec<(String, String)>);
 
-fn gather_module_dep_digests_and_dynlibs(
+fn resolve_dep_module_visibility_spec(
+    cfg: &ProjectConfig,
     dag: &ModuleDag,
     node: &ModuleNode,
-    olean_digests: &HashMap<String, String>,
+    mod_name: &str,
+) -> (bool, Option<Vec<ParsedImport>>) {
+    if let Some(dn) = dag.nodes.get(mod_name) {
+        return (dn.is_module, Some(dn.import_specs.clone()));
+    }
+    let src_opt = resolve_importable_module_in_package(&cfg.root_pkg, true, mod_name)
+        .or_else(|| {
+            cfg.dep_pkgs
+                .iter()
+                .find_map(|dp| resolve_importable_module_in_package(dp, false, mod_name))
+        })
+        .map(|sp| sp.src_path);
+    if let Some(sp) = src_opt.filter(|p| p.is_file()) {
+        if let Ok(raw) = fs::read_to_string(&sp) {
+            let hdr = parse_header_info(&raw);
+            return (hdr.is_module, Some(hdr.import_specs));
+        }
+    }
+    let olean_opt = node
+        .external_olean_deps
+        .iter()
+        .find(|(em, _)| em == mod_name)
+        .map(|(_, p)| p.clone())
+        .or_else(|| {
+            resolve_importable_module_in_package(&cfg.root_pkg, true, mod_name)
+                .or_else(|| {
+                    cfg.dep_pkgs
+                        .iter()
+                        .find_map(|dp| resolve_importable_module_in_package(dp, false, mod_name))
+                })
+                .map(|sp| {
+                    sp.build_lib_lean_dir
+                        .join(format!("{}.olean", module_name_to_rel_slash(mod_name)))
+                })
+        });
+    if let Some((specs, is_mod)) = olean_opt
+        .as_ref()
+        .and_then(|op| fs::read(op).ok())
+        .and_then(|bytes| parse_olean_binary_imports(&bytes))
+    {
+        return (is_mod, Some(specs));
+    }
+    if !cfg.toolchain_lib_lean.as_os_str().is_empty() {
+        let toolchain_olean = cfg
+            .toolchain_lib_lean
+            .join(format!("{}.olean", module_name_to_rel_slash(mod_name)));
+        if toolchain_olean.is_file() {
+            let tc_is_mod =
+                PathBuf::from(format!("{}.server", toolchain_olean.display())).is_file();
+            return (tc_is_mod, Some(Vec::new()));
+        }
+    }
+    let is_mod = olean_opt
+        .as_ref()
+        .is_some_and(|op| PathBuf::from(format!("{}.server", op.display())).is_file());
+    (is_mod, None)
+}
+
+pub(crate) fn compute_node_dep_visibility_map(
+    cfg: &ProjectConfig,
+    dag: &ModuleDag,
+    node: &ModuleNode,
+) -> (HashMap<String, DepImportVisibility>, HashMap<String, bool>) {
+    let mut vis_map: HashMap<String, DepImportVisibility> = HashMap::new();
+    let mut is_mod_map: HashMap<String, bool> = HashMap::new();
+    let mut specs_cache: HashMap<String, (bool, Option<Vec<ParsedImport>>)> = HashMap::new();
+    let mut get_info = |m: &str| -> (bool, Option<Vec<ParsedImport>>) {
+        if let Some(cached) = specs_cache.get(m) {
+            return cached.clone();
+        }
+        let info = resolve_dep_module_visibility_spec(cfg, dag, node, m);
+        specs_cache.insert(m.to_string(), info.clone());
+        info
+    };
+
+    if !node.is_module {
+        for dep in &node.expected_all_deps {
+            let (is_mod, _) = get_info(dep);
+            is_mod_map.insert(dep.clone(), is_mod);
+            vis_map.insert(dep.clone(), DepImportVisibility::All);
+        }
+        return (vis_map, is_mod_map);
+    }
+
+    let mut raise_vis = |m: &str, v: DepImportVisibility| -> bool {
+        let prev = vis_map.get(m).copied();
+        if prev.is_none_or(|p| v > p) {
+            vis_map.insert(m.to_string(), v);
+            true
+        } else {
+            false
+        }
+    };
+
+    // Walk stack carries `(module, import_all, needs_meta)`, matching `build_setup_json`.
+    let mut walk_stack: Vec<(String, bool, bool)> = Vec::new();
+    for imp in &node.import_specs {
+        if imp.module == node.module_name {
+            continue;
+        }
+        let (is_mod, _) = get_info(&imp.module);
+        is_mod_map.insert(imp.module.clone(), is_mod);
+        let direct_vis = if !is_mod || imp.import_all {
+            DepImportVisibility::All
+        } else if imp.is_meta {
+            DepImportVisibility::MetaExport
+        } else {
+            DepImportVisibility::PublicExport
+        };
+        raise_vis(&imp.module, direct_vis);
+    }
+    for imp in node.import_specs.iter().rev() {
+        if imp.module == node.module_name {
+            continue;
+        }
+        let (imp_is_mod, sub_specs_opt) = get_info(&imp.module);
+        let Some(sub_specs) = sub_specs_opt else {
+            // Fail closed: if transitive specs cannot be resolved, mark all remaining deps `All`.
+            for dep in &node.expected_all_deps {
+                let (dm, _) = get_info(dep);
+                is_mod_map.insert(dep.clone(), dm);
+                vis_map.insert(dep.clone(), DepImportVisibility::All);
+            }
+            return (vis_map, is_mod_map);
+        };
+        let imp_all = !imp_is_mod || imp.import_all;
+        for sub in sub_specs.iter().rev() {
+            if sub.module == imp.module {
+                continue;
+            }
+            let reachable = imp_all || sub.is_exported;
+            let c_all = imp_all && sub.import_all;
+            let c_meta = imp.is_meta || (reachable && sub.is_meta);
+            if reachable || c_meta {
+                walk_stack.push((sub.module.clone(), c_all, c_meta));
+            }
+        }
+    }
+
+    while let Some((cur, import_all, needs_meta)) = walk_stack.pop() {
+        let (is_mod, sub_specs_opt) = get_info(&cur);
+        is_mod_map.insert(cur.clone(), is_mod);
+        let eff_all = !is_mod || import_all;
+        let target_vis = if eff_all {
+            DepImportVisibility::All
+        } else if needs_meta {
+            DepImportVisibility::MetaExport
+        } else {
+            DepImportVisibility::PublicExport
+        };
+        if !raise_vis(&cur, target_vis) {
+            continue;
+        }
+        let Some(sub_specs) = sub_specs_opt else {
+            for dep in &node.expected_all_deps {
+                let (dm, _) = get_info(dep);
+                is_mod_map.insert(dep.clone(), dm);
+                vis_map.insert(dep.clone(), DepImportVisibility::All);
+            }
+            return (vis_map, is_mod_map);
+        };
+        for sub in sub_specs.iter().rev() {
+            if sub.module == cur {
+                continue;
+            }
+            let reachable = eff_all || sub.is_exported;
+            let child_import_all = eff_all && sub.import_all;
+            let child_needs_meta = needs_meta || (reachable && sub.is_meta);
+            if reachable || child_needs_meta {
+                walk_stack.push((sub.module.clone(), child_import_all, child_needs_meta));
+            }
+        }
+    }
+
+    for dep in &node.expected_all_deps {
+        let (is_mod, _) = get_info(dep);
+        is_mod_map.entry(dep.clone()).or_insert(is_mod);
+        vis_map
+            .entry(dep.clone())
+            .or_insert(DepImportVisibility::PublicExport);
+    }
+    (vis_map, is_mod_map)
+}
+
+fn gather_module_dep_digests_and_dynlibs(
+    cfg: &ProjectConfig,
+    dag: &ModuleDag,
+    node: &ModuleNode,
+    tier_digests: &HashMap<String, ModuleArtifactTierDigests>,
 ) -> Result<ModuleDepAndDynlibDigests> {
+    let (vis_map, is_mod_map) = compute_node_dep_visibility_map(cfg, dag, node);
+    let select_dig = |m: &str, tiers: &ModuleArtifactTierDigests| -> String {
+        let vis = vis_map.get(m).copied().unwrap_or(DepImportVisibility::All);
+        let dep_is_mod = is_mod_map.get(m).copied().unwrap_or(false);
+        tiers.for_visibility(vis, node.is_module && dep_is_mod)
+    };
     let mut dep_digests_map: BTreeMap<String, String> = BTreeMap::new();
     let mut dep_work: VecDeque<&str> = VecDeque::new();
     for d in &node.direct_dag_deps {
         dep_work.push_back(d);
     }
     for (ext_m, _) in &node.external_olean_deps {
-        if let Some(dig) = olean_digests.get(ext_m) {
-            dep_digests_map.insert(ext_m.clone(), dig.clone());
+        if let Some(tiers) = tier_digests.get(ext_m) {
+            dep_digests_map.insert(ext_m.clone(), select_dig(ext_m, tiers));
         }
     }
     while let Some(cur_dep) = dep_work.pop_front() {
         if dep_digests_map.contains_key(cur_dep) {
             continue;
         }
-        let dig = olean_digests.get(cur_dep).cloned().ok_or_else(|| {
+        let tiers = tier_digests.get(cur_dep).ok_or_else(|| {
             anyhow::anyhow!(
                 "Internal DAG error: dependency `{}` of `{}` missing olean digest",
                 cur_dep,
                 node.module_name
             )
         })?;
-        dep_digests_map.insert(cur_dep.to_string(), dig);
+        dep_digests_map.insert(cur_dep.to_string(), select_dig(cur_dep, tiers));
         if let Some(dep_node) = dag.nodes.get(cur_dep) {
             for sub_d in &dep_node.direct_dag_deps {
                 if !dep_digests_map.contains_key(sub_d) {
@@ -17008,10 +17863,10 @@ fn gather_module_dep_digests_and_dynlibs(
                 }
             }
             for (ext_m, _) in &dep_node.external_olean_deps {
-                if let Some(edig) = olean_digests.get(ext_m) {
+                if let Some(etiers) = tier_digests.get(ext_m) {
                     dep_digests_map
                         .entry(ext_m.clone())
-                        .or_insert_with(|| edig.clone());
+                        .or_insert_with(|| select_dig(ext_m, etiers));
                 }
             }
         }
@@ -17042,30 +17897,36 @@ fn try_compute_initial_module_action_keys(
     dag: &ModuleDag,
     node: &ModuleNode,
     preserve_project: bool,
-    ext_olean_digests: &HashMap<String, String>,
-    memo_on_disk_digests: &mut HashMap<String, Option<String>>,
+    ext_tier_digests: &HashMap<String, ModuleArtifactTierDigests>,
+    memo_on_disk_digests: &mut HashMap<String, Option<ModuleArtifactTierDigests>>,
 ) -> Option<(String, Option<String>)> {
+    let (vis_map, is_mod_map) = compute_node_dep_visibility_map(cfg, dag, node);
+    let select_dig = |m: &str, tiers: &ModuleArtifactTierDigests| -> String {
+        let vis = vis_map.get(m).copied().unwrap_or(DepImportVisibility::All);
+        let dep_is_mod = is_mod_map.get(m).copied().unwrap_or(false);
+        tiers.for_visibility(vis, node.is_module && dep_is_mod)
+    };
     let mut dep_digests_map: BTreeMap<String, String> = BTreeMap::new();
     let mut dep_work: VecDeque<&str> = VecDeque::new();
     for d in &node.direct_dag_deps {
         dep_work.push_back(d);
     }
     for (ext_m, _) in &node.external_olean_deps {
-        let dig = ext_olean_digests.get(ext_m)?;
-        dep_digests_map.insert(ext_m.clone(), dig.clone());
+        let tiers = ext_tier_digests.get(ext_m)?;
+        dep_digests_map.insert(ext_m.clone(), select_dig(ext_m, tiers));
     }
     while let Some(cur_dep) = dep_work.pop_front() {
         if dep_digests_map.contains_key(cur_dep) {
             continue;
         }
         let dep_node = dag.nodes.get(cur_dep)?;
-        let dig_opt = if let Some(cached) = memo_on_disk_digests.get(cur_dep) {
+        let tiers_opt = if let Some(cached) = memo_on_disk_digests.get(cur_dep) {
             cached.clone()
         } else {
             let preserve_dep = preserve_project
                 || crate::lake_build::worktree_auto_link_disabled(&dep_node.pkg_root);
             let computed = if validate_materialized_module_artifacts(dep_node, preserve_dep) {
-                compute_olean_artifact_set_digest_with_policy(
+                compute_module_artifact_tier_digests_with_policy(
                     &dep_node.olean_path,
                     preserve_project,
                 )
@@ -17076,18 +17937,18 @@ fn try_compute_initial_module_action_keys(
             memo_on_disk_digests.insert(cur_dep.to_string(), computed.clone());
             computed
         };
-        let dig = dig_opt?;
-        dep_digests_map.insert(cur_dep.to_string(), dig);
+        let tiers = tiers_opt?;
+        dep_digests_map.insert(cur_dep.to_string(), select_dig(cur_dep, &tiers));
         for sub_d in &dep_node.direct_dag_deps {
             if !dep_digests_map.contains_key(sub_d) {
                 dep_work.push_back(sub_d);
             }
         }
         for (ext_m, _) in &dep_node.external_olean_deps {
-            let edig = ext_olean_digests.get(ext_m)?;
+            let etiers = ext_tier_digests.get(ext_m)?;
             dep_digests_map
                 .entry(ext_m.clone())
-                .or_insert_with(|| edig.clone());
+                .or_insert_with(|| select_dig(ext_m, etiers));
         }
     }
     let dep_digests_vec: Vec<(String, String)> = dep_digests_map.into_iter().collect();
@@ -17125,9 +17986,10 @@ fn compute_module_b_levels(
     dependents: &BTreeMap<String, Vec<String>>,
     trust_domain: &str,
     preserve_project: bool,
-    ext_olean_digests: &HashMap<String, String>,
+    ext_tier_digests: &HashMap<String, ModuleArtifactTierDigests>,
 ) -> HashMap<String, u64> {
-    let mut memo_on_disk_digests: HashMap<String, Option<String>> = HashMap::new();
+    let mut memo_on_disk_digests: HashMap<String, Option<ModuleArtifactTierDigests>> =
+        HashMap::new();
     let mut weights: HashMap<String, u64> = HashMap::with_capacity(dag.nodes.len());
     for (mod_name, node) in &dag.nodes {
         let mut cached_dur: Option<u64> = None;
@@ -17136,7 +17998,7 @@ fn compute_module_b_levels(
             dag,
             node,
             preserve_project,
-            ext_olean_digests,
+            ext_tier_digests,
             &mut memo_on_disk_digests,
         ) {
             cached_dur = store.get_cached_action_duration_ms(&mod_key, trust_domain);
@@ -17794,6 +18656,7 @@ pub fn hydrate_project_traces(project_dir: &Path) -> Result<HydrateTracesReport>
             },
             import_olean_digests: import_pins,
             artifact_stat_fingerprint: stat_fp,
+            ..Default::default()
         };
         report.modules_verified += 1;
         updates_by_pkg
@@ -17939,8 +18802,10 @@ pub fn build_project_modules_native(
     } else {
         base_jobs
     };
-    // Map from module_name -> olean artifact set digest
+    // Map from module_name -> full olean artifact set digest (for freshness & post-audit checks)
     let mut olean_digests: HashMap<String, String> = HashMap::new();
+    // Map from module_name -> 3-tier artifact digests (for visibility-aware Module CAS keys)
+    let mut tier_digests: HashMap<String, ModuleArtifactTierDigests> = HashMap::new();
     // Pre-compute digests for external `.olean` dependencies (only populated when `!is_untrusted`)
     // and ensure every external `.olean` carries kernel-replay authority in `TurboStore` DB
     // (`.turbo_verified_sources.json` is freshness-only and never grants replay authority).
@@ -17952,8 +18817,10 @@ pub fn build_project_modules_native(
     for node in dag.nodes.values() {
         for (ext_mod, ext_path) in &node.external_olean_deps {
             if !olean_digests.contains_key(ext_mod) {
-                let d = compute_olean_artifact_set_digest_with_policy(ext_path, preserve_project)?;
-                olean_digests.insert(ext_mod.clone(), d);
+                let td =
+                    compute_module_artifact_tier_digests_with_policy(ext_path, preserve_project)?;
+                olean_digests.insert(ext_mod.clone(), td.full.clone());
+                tier_digests.insert(ext_mod.clone(), td);
             }
             if !is_olean_replayed_in_store(store, &cfg, &lean_path_env, ext_path) {
                 unverified_external_deps.insert(ext_mod.clone());
@@ -17985,7 +18852,7 @@ pub fn build_project_modules_native(
         &dependents,
         trust_domain,
         preserve_project,
-        &olean_digests,
+        &tier_digests,
     );
 
     enum PendingAuditOrigin {
@@ -18209,7 +19076,7 @@ pub fn build_project_modules_native(
                         let preserve_lake = preserve_project
                             || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
                         let (dep_digests_vec, raw_imp_dynlibs, dynlib_digests) =
-                            gather_module_dep_digests_and_dynlibs(&dag, node, &olean_digests)?;
+                            gather_module_dep_digests_and_dynlibs(&cfg, &dag, node, &tier_digests)?;
                         let mod_key = compute_module_cas_key_with_dynlibs(
                             &cfg,
                             node,
@@ -18367,6 +19234,7 @@ pub fn build_project_modules_native(
                                     node,
                                     preserve_lake,
                                     &olean_digests,
+                                    &tier_digests,
                                     &raw_imp_dynlibs,
                                 ) {
                                     pending_audit_meta.insert(
@@ -18611,10 +19479,12 @@ pub fn build_project_modules_native(
                                     if !is_untrusted {
                                         record_verified_dep_source(
                                             &cfg,
+                                            &dag,
                                             node,
                                             &dig,
                                             node.is_root_pkg,
                                             &olean_digests,
+                                            &tier_digests,
                                         );
                                     }
                                     write_file_atomic(
@@ -18677,10 +19547,12 @@ pub fn build_project_modules_native(
                                 )?;
                                 record_verified_dep_source(
                                     &cfg,
+                                    &dag,
                                     node,
                                     &dig,
                                     node.is_root_pkg,
                                     &olean_digests,
+                                    &tier_digests,
                                 );
                                 write_file_atomic(
                                     &module_setup_json_path(node),
@@ -18727,10 +19599,12 @@ pub fn build_project_modules_native(
                                 if !is_untrusted {
                                     record_verified_dep_source(
                                         &cfg,
+                                        &dag,
                                         node,
                                         &dig,
                                         node.is_root_pkg,
                                         &olean_digests,
+                                        &tier_digests,
                                     );
                                 }
                                 report.modules_compiled += 1;
@@ -18768,7 +19642,26 @@ pub fn build_project_modules_native(
                                         }
                                     }
                                 }
+                                let accepted_tiers =
+                                    match compute_module_artifact_tier_digests_with_policy(
+                                        &node.olean_path,
+                                        preserve_project,
+                                    ) {
+                                        Ok(td) if td.full == accepted_dig => td,
+                                        Ok(_) => {
+                                            fatal_err = Some(anyhow::anyhow!(
+                                            "Artifact tier digest mismatch after audit for `{}`",
+                                            mod_name
+                                        ));
+                                            break;
+                                        }
+                                        Err(e) => {
+                                            fatal_err = Some(e);
+                                            break;
+                                        }
+                                    };
                                 olean_digests.insert(mod_name.clone(), accepted_dig);
+                                tier_digests.insert(mod_name.clone(), accepted_tiers);
                                 completed_mods.insert(mod_name.clone());
                                 record_scheduler_test_event(
                                     "module_accepted",
@@ -18899,7 +19792,7 @@ pub fn build_project_modules_native(
 
 fn compute_cas_outputs_artifact_and_replay_digests(
     outputs: &[BlobEntry],
-) -> Option<(String, String)> {
+) -> Option<(ModuleArtifactTierDigests, String)> {
     let find_hash = |suffix: &str| -> Option<&str> {
         outputs
             .iter()
@@ -18917,27 +19810,51 @@ fn compute_cas_outputs_artifact_and_replay_digests(
     let ir_hex = find_hash(".ir");
     let ir_sig_hex = find_hash(".ir.sig");
 
-    let mut art_h = blake3::Hasher::new();
-    art_h.update(b"olean-art-v2\n");
-    for (tag, hex_opt) in [
-        ("olean", Some(olean_hex)),
-        ("srv", srv_hex),
-        ("priv", priv_hex),
-        ("ilean", ilean_hex),
-        ("ir", ir_hex),
-        ("ir_sig", ir_sig_hex),
-    ] {
-        let present = hex_opt.is_some();
-        if tag != "olean" {
-            art_h.update(&[u8::from(present)]);
+    let fold_tier = |domain: &[u8], items: &[(&str, Option<&str>)]| -> Option<String> {
+        let mut h = blake3::Hasher::new();
+        h.update(domain);
+        for &(tag, hex_opt) in items {
+            let present = hex_opt.is_some();
+            if tag != "olean" {
+                h.update(&[u8::from(present)]);
+            }
+            if let Some(hex_str) = hex_opt {
+                let raw_hash = crate::pack::decode_hex_fixed::<32>(hex_str).ok()?;
+                update_lp(&mut h, tag.as_bytes(), &raw_hash);
+            } else {
+                update_lp(&mut h, tag.as_bytes(), b"");
+            }
         }
-        if let Some(hex_str) = hex_opt {
-            let raw_hash = crate::pack::decode_hex_fixed::<32>(hex_str).ok()?;
-            update_lp(&mut art_h, tag.as_bytes(), &raw_hash);
-        } else {
-            update_lp(&mut art_h, tag.as_bytes(), b"");
-        }
-    }
+        Some(h.finalize().to_hex().to_string())
+    };
+
+    let full = fold_tier(
+        b"olean-art-v2\n",
+        &[
+            ("olean", Some(olean_hex)),
+            ("srv", srv_hex),
+            ("priv", priv_hex),
+            ("ilean", ilean_hex),
+            ("ir", ir_hex),
+            ("ir_sig", ir_sig_hex),
+        ],
+    )?;
+    let dep_export = fold_tier(
+        b"olean-export-v2\n",
+        &[
+            ("olean", Some(olean_hex)),
+            ("ir", ir_hex),
+            ("ir_sig", ir_sig_hex),
+        ],
+    )?;
+    let dep_meta = fold_tier(
+        b"olean-meta-v1\n",
+        &[
+            ("olean", Some(olean_hex)),
+            ("ir", ir_hex),
+            ("ir_sig", ir_sig_hex),
+        ],
+    )?;
 
     let mut rep_h = blake3::Hasher::new();
     rep_h.update(b"turbo-lean-replayed-olean-ilean-v1\n");
@@ -18958,7 +19875,11 @@ fn compute_cas_outputs_artifact_and_replay_digests(
     }
 
     Some((
-        art_h.finalize().to_hex().to_string(),
+        ModuleArtifactTierDigests {
+            full,
+            dep_export,
+            dep_meta,
+        },
         rep_h.finalize().to_hex().to_string(),
     ))
 }
@@ -18984,7 +19905,7 @@ pub fn build_cone_export_filter(
     let dag = build_module_dag_with_trust(&cfg, &[target.to_string()], true)?;
     let preserve_project = crate::lake_build::worktree_auto_link_disabled(&canon_dir);
 
-    let mut olean_digests: HashMap<String, String> = HashMap::new();
+    let mut tier_digests: HashMap<String, ModuleArtifactTierDigests> = HashMap::new();
     let mut allowed_actions: HashSet<String> = HashSet::new();
     let mut allowed_replay_modules: HashSet<String> = HashSet::new();
     let mut allowed_replay_artifact_digests: HashSet<String> = HashSet::new();
@@ -18993,11 +19914,11 @@ pub fn build_cone_export_filter(
         allowed_replay_modules.insert(node.module_name.clone());
         for (ext_mod, ext_path) in &node.external_olean_deps {
             allowed_replay_modules.insert(ext_mod.clone());
-            if !olean_digests.contains_key(ext_mod) {
-                if let Ok(d) =
-                    compute_olean_artifact_set_digest_with_policy(ext_path, preserve_project)
+            if !tier_digests.contains_key(ext_mod) {
+                if let Ok(td) =
+                    compute_module_artifact_tier_digests_with_policy(ext_path, preserve_project)
                 {
-                    olean_digests.insert(ext_mod.clone(), d);
+                    tier_digests.insert(ext_mod.clone(), td);
                 }
                 if let Ok(rd) = compute_replayed_olean_ilean_digest(ext_path) {
                     allowed_replay_artifact_digests.insert(rd);
@@ -19011,12 +19932,12 @@ pub fn build_cone_export_filter(
             continue;
         };
         let Ok((dep_digests_vec, _, dynlib_digests)) =
-            gather_module_dep_digests_and_dynlibs(&dag, node, &olean_digests)
+            gather_module_dep_digests_and_dynlibs(&cfg, &dag, node, &tier_digests)
         else {
-            if let Ok(disk_dig) =
-                compute_olean_artifact_set_digest_with_policy(&node.olean_path, preserve_project)
+            if let Ok(disk_td) =
+                compute_module_artifact_tier_digests_with_policy(&node.olean_path, preserve_project)
             {
-                olean_digests.insert(mod_name.clone(), disk_dig);
+                tier_digests.insert(mod_name.clone(), disk_td);
             }
             if let Ok(rd) = compute_replayed_olean_ilean_digest(&node.olean_path) {
                 allowed_replay_artifact_digests.insert(rd);
@@ -19037,33 +19958,33 @@ pub fn build_cone_export_filter(
             true,
             &dynlib_digests,
         )?;
-        let mut resolved_dig: Option<String> = None;
+        let mut resolved_tiers: Option<ModuleArtifactTierDigests> = None;
         for cand_key in [&key_no_c, &key_with_c] {
             if let Ok(Some(outputs)) = store.get_cached_action(cand_key, "trusted") {
                 allowed_actions.insert(cand_key.clone());
-                if let Some((art_dig, rep_dig)) =
+                if let Some((art_tiers, rep_dig)) =
                     compute_cas_outputs_artifact_and_replay_digests(&outputs)
                 {
                     let preferred_key = if node.needs_c { &key_with_c } else { &key_no_c };
-                    if resolved_dig.is_none() || cand_key == preferred_key {
-                        resolved_dig = Some(art_dig);
+                    if resolved_tiers.is_none() || cand_key == preferred_key {
+                        resolved_tiers = Some(art_tiers);
                     }
                     allowed_replay_artifact_digests.insert(rep_dig);
                 }
             }
         }
-        if resolved_dig.is_none() {
-            if let Ok(disk_dig) =
-                compute_olean_artifact_set_digest_with_policy(&node.olean_path, preserve_project)
+        if resolved_tiers.is_none() {
+            if let Ok(disk_td) =
+                compute_module_artifact_tier_digests_with_policy(&node.olean_path, preserve_project)
             {
-                resolved_dig = Some(disk_dig);
+                resolved_tiers = Some(disk_td);
             }
         }
         if let Ok(rd) = compute_replayed_olean_ilean_digest(&node.olean_path) {
             allowed_replay_artifact_digests.insert(rd);
         }
-        if let Some(dig) = resolved_dig {
-            olean_digests.insert(mod_name.clone(), dig);
+        if let Some(td) = resolved_tiers {
+            tier_digests.insert(mod_name.clone(), td);
         }
     }
 
@@ -23142,7 +24063,15 @@ lean_lib Smoke where
         .unwrap();
         let dep_b_pin = &dep_manifest.modules["DepPkg/B.lean"].olean_artifact_digest;
         assert!(
-            !import_pin_current(&cfg, &memo, "DepPkg.B", Some(dep_b_pin)),
+            !import_pin_current(
+                &cfg,
+                &memo,
+                "DepPkg.B",
+                Some(ImportPinSpec {
+                    full_pin: dep_b_pin,
+                    tier_pin: None,
+                }),
+            ),
             "`import_pin_current` accepted unaudited `App.R` via non-strict memo"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -30806,6 +31735,177 @@ globs = ["Down.+"]
             );
             let _ = bad_handle.join();
         }
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_speed4_module_public_export_digest_skips_downstream_on_private_edit() -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("speed4_mod_pub_export_cas");
+        let proj_dir = dir.join("proj");
+        fs::create_dir_all(proj_dir.join("App"))?;
+        fs::write(
+            proj_dir.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\nglobs = [\"App.+\"]\n",
+        )?;
+        fs::write(
+            proj_dir.join("App/A.lean"),
+            "module\nprivate def secretHelper : Nat := 1\nprivate theorem secretThm (x : Nat) : x + 0 = x := Nat.add_zero x\n@[noinline] public def pubFn (x : Nat) : Nat := secretHelper + x\npublic def polyFn (f : Nat → Nat) (x : Nat) : Nat := f x + 1\n@[inline] public def inlineFn (x : Nat) : Nat := x + 10\n",
+        )?;
+        fs::write(
+            proj_dir.join("App/B.lean"),
+            "module\npublic import App.A\npublic def useA : Nat := pubFn 5 + inlineFn 2 + polyFn (fun z => z + 3) 4\n",
+        )?;
+        fs::write(
+            proj_dir.join("App/AllConsumer.lean"),
+            "module\nimport all App.A\npublic def peekSecret : Nat := secretHelper\npublic theorem useSecretThm (x : Nat) : x + 0 = x := secretThm x\n",
+        )?;
+        fs::write(
+            proj_dir.join("App/MetaConsumer.lean"),
+            "module\nmeta import App.A\nmeta def metaVal : Nat := pubFn 3\n",
+        )?;
+
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        let rep1 = build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted",
+            0,
+            false,
+            true,
+            None,
+        )?;
+        assert_eq!(rep1.modules_compiled, 4);
+
+        let a_olean = proj_dir.join(".lake/build/lib/lean/App/A.olean");
+        let export1 = compute_dep_export_olean_digest(&a_olean)?;
+        let meta1 = compute_dep_meta_olean_digest(&a_olean)?;
+        let full1 = compute_olean_artifact_set_digest(&a_olean)?;
+
+        // 1. Edit private theorem/proof in App/A.lean:
+        //    A.olean + A.ir + A.ir.sig stay byte-identical -> App.B and App.MetaConsumer hit Module CAS!
+        //    Meanwhile A.olean.private & A.ilean mutate -> AllConsumer (`import all`) recompiles.
+        fs::write(
+            proj_dir.join("App/A.lean"),
+            "module\nprivate def secretHelper : Nat := 1\nprivate theorem secretThm (x : Nat) : x + 0 = x := by exact Nat.add_zero x\nprivate theorem extraSecretThm : True := trivial\n@[noinline] public def pubFn (x : Nat) : Nat := secretHelper + x\npublic def polyFn (f : Nat → Nat) (x : Nat) : Nat := f x + 1\n@[inline] public def inlineFn (x : Nat) : Nat := x + 10\n",
+        )?;
+        // Wipe B's and MetaConsumer's on-disk artifacts to prove they are satisfied purely from Module CAS.
+        for mod_rel in ["App/B", "App/MetaConsumer"] {
+            for ext in [
+                "olean",
+                "olean.server",
+                "olean.private",
+                "ilean",
+                "ir",
+                "ir.sig",
+                "trace",
+            ] {
+                let _ =
+                    fs::remove_file(proj_dir.join(format!(".lake/build/lib/lean/{mod_rel}.{ext}")));
+            }
+        }
+        let rep2 = build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted",
+            0,
+            false,
+            true,
+            None,
+        )?;
+        let export2 = compute_dep_export_olean_digest(&a_olean)?;
+        let meta2 = compute_dep_meta_olean_digest(&a_olean)?;
+        let full2 = compute_olean_artifact_set_digest(&a_olean)?;
+        assert_eq!(
+            export1, export2,
+            "private theorem edit in `module` must keep dep_export_olean_digest identical"
+        );
+        assert_eq!(
+            meta1, meta2,
+            "private theorem edit in `module` must keep dep_meta_olean_digest identical"
+        );
+        assert_ne!(
+            full1, full2,
+            "private theorem edit must change full 6-artifact digest"
+        );
+        assert!(
+            rep2.cached_modules.contains(&"App.B".to_string())
+                && !rep2.compiled_modules.contains(&"App.B".to_string())
+                && rep2.cached_modules.contains(&"App.MetaConsumer".to_string())
+                && !rep2.compiled_modules.contains(&"App.MetaConsumer".to_string()),
+            "App.B (`public import App.A`) and App.MetaConsumer (`meta import App.A`) must hit Module CAS after private theorem edit in App.A: {rep2:?}"
+        );
+        assert!(
+            rep2.compiled_modules.contains(&"App.A".to_string())
+                && rep2
+                    .compiled_modules
+                    .contains(&"App.AllConsumer".to_string()),
+            "App.A and App.AllConsumer (`import all`) must recompile: {rep2:?}"
+        );
+
+        // 2. Edit higher-order `public def polyFn` body in App/A.lean:
+        //    A.olean and A.ir.sig stay byte-identical, while A.ir mutates (specializable IR exported in `.ir`)
+        //    -> `dep_export_olean_digest` MUST change and App.B MUST miss CAS and recompile its C codegen!
+        fs::write(
+            proj_dir.join("App/A.lean"),
+            "module\nprivate def secretHelper : Nat := 1\nprivate theorem secretThm (x : Nat) : x + 0 = x := by exact Nat.add_zero x\nprivate theorem extraSecretThm : True := trivial\n@[noinline] public def pubFn (x : Nat) : Nat := secretHelper + x\npublic def polyFn (f : Nat → Nat) (x : Nat) : Nat := f x + 999\n@[inline] public def inlineFn (x : Nat) : Nat := x + 10\n",
+        )?;
+        let rep2_ir = build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted",
+            0,
+            false,
+            true,
+            None,
+        )?;
+        let export2_ir = compute_dep_export_olean_digest(&a_olean)?;
+        assert_ne!(
+            export2, export2_ir,
+            "higher-order `public def` body edit mutating `.ir` must change dep_export_olean_digest"
+        );
+        assert!(
+            rep2_ir.compiled_modules.contains(&"App.B".to_string())
+                && rep2_ir
+                    .compiled_modules
+                    .contains(&"App.MetaConsumer".to_string()),
+            "App.B and App.MetaConsumer must recompile when App.A `.ir` changes: {rep2_ir:?}"
+        );
+
+        // 3. Edit `@[inline] public def inlineFn` body in App/A.lean:
+        //    A.olean changes -> App.B MUST miss CAS and recompile!
+        fs::write(
+            proj_dir.join("App/A.lean"),
+            "module\nprivate def secretHelper : Nat := 1\nprivate theorem secretThm (x : Nat) : x + 0 = x := by exact Nat.add_zero x\nprivate theorem extraSecretThm : True := trivial\n@[noinline] public def pubFn (x : Nat) : Nat := secretHelper + x\npublic def polyFn (f : Nat → Nat) (x : Nat) : Nat := f x + 999\n@[inline] public def inlineFn (x : Nat) : Nat := x + 42\n",
+        )?;
+        let rep3 = build_project_modules_native(
+            &mut store,
+            &proj_dir,
+            &[],
+            "trusted",
+            0,
+            false,
+            true,
+            None,
+        )?;
+        let export3 = compute_dep_export_olean_digest(&a_olean)?;
+        assert_ne!(
+            export2_ir, export3,
+            "`@[inline] public def` body edit must change dep_export_olean_digest"
+        );
+        assert!(
+            rep3.compiled_modules.contains(&"App.B".to_string()),
+            "App.B must recompile when `@[inline] public def` body changes in App.A: {rep3:?}"
+        );
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())
