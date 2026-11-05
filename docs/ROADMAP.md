@@ -97,7 +97,7 @@ Building on the completed `C1`–`C8` `Lean 4 -> Target IR` foundation, Tracks `
 ### Wave 3 native parity measurements
 
 [`BENCH_RUST_PARITY.md`](BENCH_RUST_PARITY.md): eight actual canonical kernels,
-optimized LeanNative/Rust time geomean **0.872236×** on Boat Zen 5, with
+optimized LeanNative/Rust time geomean **0.875412×** on Boat Zen 5, with
 algorithm-sensitive EVM wins and array-kernel gaps. Includes D1/D2/D5 limited
 isolation and real D3/D4 receipts; missing requested kernels and measurement
 gaps are explicit. Reproduce: `python3 scripts/bench_rust_parity.py --trials 7 --json /tmp/bench_rust_parity.json`.
@@ -123,4 +123,5 @@ Once [#349](https://github.com/Th0rgal/turbo-lean/pull/349) merges, align `roadm
 | [#320](https://github.com/Th0rgal/turbo-lean/pull/320) | `3ff77b4` | fix(fastcheck): certify counterexamples only via statement re-evaluation |
 | [#343](https://github.com/Th0rgal/turbo-lean/pull/343) | `db3732f` | feat(pr-verify): fast proof-only overlay, prebuilt dep closure, and disposable snapshot seeding |
 | [#349](https://github.com/Th0rgal/turbo-lean/pull/349) | `32b9311` | docs(roadmap): add BendRT exploration proposal (B0-B6) *(docs-only; outside the `D`-track critical path)* |
-| [#353](https://github.com/Th0rgal/turbo-lean/pull/353) | `86e3ceb` | feat(speed4): public-signature early cutoff, impact, check --allow-sorry, and timeout hotspots |
+| [#353](https://github.com/Th0rgal/turbo-lean/pull/353) | `ea165f0` | feat(speed4): public-signature early cutoff, impact, check --allow-sorry, and timeout hotspots |
+| [#360](https://github.com/Th0rgal/turbo-lean/pull/360) | `cb726fe` | feat(bridge,driver): C8 ByteArray/FloatArray slice bridge lowering & standalone libleanrt.a build |

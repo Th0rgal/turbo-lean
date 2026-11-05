@@ -139,7 +139,7 @@ These controls suppress main-clone build/package copying and linking, build-outp
 
 **Wave 3 native parity:** [`Rust vs LeanNative report`](docs/BENCH_RUST_PARITY.md)
 measures the eight actual canonical LNIR kernels on Boat Zen 5: optimized
-LeanNative/Rust time geomean **0.872236×** (114.65% relative throughput), with
+LeanNative/Rust time geomean **0.875412×** (114.23% relative throughput), with
 algorithm-sensitive EVM wins and array-kernel gaps. This is native execution,
 separate from the proof-verification benchmarks below. Reproduce with
 `python3 scripts/bench_rust_parity.py --trials 7 --json /tmp/bench_rust_parity.json`.
