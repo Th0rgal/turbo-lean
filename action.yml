@@ -104,7 +104,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        SRC_HASH=$(sha256sum "$GITHUB_ACTION_PATH/Cargo.lock" "$GITHUB_ACTION_PATH/crates/turbo-lean/src/"*.rs 2>/dev/null | sha256sum | awk '{print $1}')
+        SRC_HASH=$(sha256sum "$GITHUB_ACTION_PATH/Cargo.lock" "$GITHUB_ACTION_PATH/crates/turbo-lean/build.rs" "$GITHUB_ACTION_PATH/crates/turbo-lean/src/"*.rs "$GITHUB_ACTION_PATH/crates/turbo-lean/src/"*.json "$GITHUB_ACTION_PATH/lean/lean-toolchain" "$GITHUB_ACTION_PATH/lean/TurboLean/"*.lean "$GITHUB_ACTION_PATH/lean/LeanNative/Proofs/"*.lean 2>/dev/null | sha256sum | awk '{print $1}')
         echo "src_hash=${SRC_HASH}" >> "$GITHUB_OUTPUT"
 
     - name: Cache turbo-lean CLI binary
@@ -123,7 +123,7 @@ runs:
         export PATH="$HOME/.cargo/bin:$PATH"
         BIN_DIR="$HOME/.cache/turbo-lean-action-bin/bin"
         mkdir -p "$BIN_DIR"
-        ACTION_SRC_HASH=$(sha256sum "$GITHUB_ACTION_PATH/crates/turbo-lean/src/"*.rs "$GITHUB_ACTION_PATH/Cargo.lock" 2>/dev/null | sha256sum | awk '{print $1}')
+        ACTION_SRC_HASH=$(sha256sum "$GITHUB_ACTION_PATH/Cargo.lock" "$GITHUB_ACTION_PATH/crates/turbo-lean/build.rs" "$GITHUB_ACTION_PATH/crates/turbo-lean/src/"*.rs "$GITHUB_ACTION_PATH/crates/turbo-lean/src/"*.json "$GITHUB_ACTION_PATH/lean/lean-toolchain" "$GITHUB_ACTION_PATH/lean/TurboLean/"*.lean "$GITHUB_ACTION_PATH/lean/LeanNative/Proofs/"*.lean 2>/dev/null | sha256sum | awk '{print $1}')
         if [ -x "$GITHUB_ACTION_PATH/target/release/turbo-lean" ]; then
           cp "$GITHUB_ACTION_PATH/target/release/turbo-lean" "$BIN_DIR/turbo-lean"
           echo "$ACTION_SRC_HASH" > "$BIN_DIR/.src_hash"

@@ -177,14 +177,93 @@ impl Drop for FlockGuard {
 
 /// Acquire an advisory `flock` (`exclusive` => `LOCK_EX`, else `LOCK_SH`; `nonblocking` => `| LOCK_NB`).
 /// Returns `Ok(None)` when `nonblocking` is true and another holder currently owns a conflicting lock.
+pub(crate) fn ensure_private_dir_all(dir: &Path) -> std::io::Result<()> {
+    ensure_dir_all_inner(dir, true)
+}
+
+fn ensure_nonsymlink_dir_all(dir: &Path) -> std::io::Result<()> {
+    ensure_dir_all_inner(dir, false)
+}
+
+fn ensure_dir_all_inner(dir: &Path, require_private_leaf: bool) -> std::io::Result<()> {
+    if dir.as_os_str().is_empty() || dir == Path::new(".") {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+        if fs::symlink_metadata(dir).is_err() {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            match builder.create(dir) {
+                Ok(()) => {
+                    let mut opts = fs::OpenOptions::new();
+                    opts.read(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+                    if let Ok(created_f) = opts.open(dir) {
+                        let _ = created_f.set_permissions(fs::Permissions::from_mode(0o700));
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
+            }
+        }
+        let sym = fs::symlink_metadata(dir)?;
+        if sym.file_type().is_symlink() || !sym.file_type().is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "staging directory is not a plain directory: {}",
+                    dir.display()
+                ),
+            ));
+        }
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+        let dir_f = opts.open(dir)?;
+        let meta = dir_f.metadata()?;
+        if !meta.file_type().is_dir() || !inode_matches_nofollow(&dir_f, dir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "staging directory failed nofollow verification: {}",
+                    dir.display()
+                ),
+            ));
+        }
+        if require_private_leaf {
+            let euid = unsafe { libc::geteuid() };
+            if meta.uid() != euid || (meta.mode() & 0o077) != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "staging directory is not privately owned (0700) by current uid: {}",
+                        dir.display()
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = require_private_leaf;
+        fs::create_dir_all(dir)
+    }
+}
+
 pub fn acquire_flock(
     lock_path: &Path,
     exclusive: bool,
     nonblocking: bool,
 ) -> std::io::Result<Option<FlockGuard>> {
     if let Some(parent) = lock_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
+        let base = staging_shm_dir();
+        if parent == base || parent.starts_with(&base) {
+            ensure_private_dir_all(parent)?;
+        } else {
+            ensure_nonsymlink_dir_all(parent)?;
         }
     }
     let mut opts = fs::OpenOptions::new();
@@ -540,8 +619,11 @@ fn stage_unique_tmp_path(target: &Path) -> std::io::Result<PathBuf> {
 
 fn stage_unique_tmp_path_ext(target: &Path, ext: &str) -> std::io::Result<PathBuf> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    if !parent.as_os_str().is_empty() && !parent.exists() {
-        fs::create_dir_all(parent)?;
+    let base = staging_shm_dir();
+    if parent == base || parent.starts_with(&base) {
+        ensure_private_dir_all(parent)?;
+    } else {
+        ensure_nonsymlink_dir_all(parent)?;
     }
     let file_name = target
         .file_name()
@@ -565,7 +647,7 @@ fn stage_unique_tmp_path_ext(target: &Path, ext: &str) -> std::io::Result<PathBu
 /// Atomically write `bytes` to `target` by staging into a process+sequence-unique temporary file
 /// in `target.parent()` and invoking `fs::rename` over `target`.
 pub fn atomic_write_shm(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let (mut tmp_f, tmp_path) = match open_unique_exclusive_tmp(target, 0o644) {
+    let (mut tmp_f, tmp_path) = match open_unique_exclusive_tmp(target, 0o600) {
         Ok(pair) => pair,
         Err(e) => {
             debug_log_cache_err("atomic_write_shm(open)", &e);
@@ -587,17 +669,218 @@ pub fn atomic_write_shm(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+fn is_safe_single_shm_segment(seg: &str) -> bool {
+    !seg.is_empty()
+        && seg != "."
+        && seg != ".."
+        && !seg.contains('/')
+        && !seg.contains('\\')
+        && !seg.contains('\0')
+}
+
+#[cfg(unix)]
+fn verify_or_create_private_dir_one(dir: &Path, create_if_missing: bool) -> Option<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    match fs::symlink_metadata(dir) {
+        Ok(sym_meta) => {
+            if sym_meta.file_type().is_symlink() || !sym_meta.file_type().is_dir() {
+                return None;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && create_if_missing => {
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(dir).ok()?;
+            let mut opts = fs::OpenOptions::new();
+            opts.read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+            let created_f = opts.open(dir).ok()?;
+            let _ = created_f.set_permissions(fs::Permissions::from_mode(0o700));
+        }
+        Err(_) => return None,
+    }
+
+    let sym_meta = fs::symlink_metadata(dir).ok()?;
+    if sym_meta.file_type().is_symlink() || !sym_meta.file_type().is_dir() {
+        return None;
+    }
+
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+    let dir_f = opts.open(dir).ok()?;
+    let meta = dir_f.metadata().ok()?;
+    let euid = unsafe { libc::geteuid() };
+    if !meta.file_type().is_dir() || meta.uid() != euid || (meta.mode() & 0o077) != 0 {
+        return None;
+    }
+    if !inode_matches_nofollow(&dir_f, dir) {
+        return None;
+    }
+    Some(())
+}
+
+/// Ensure `staging_shm_dir()` (and optional single-segment `subdir`) exists as a non-symlink
+/// directory owned by `geteuid()` with private `0o700` permissions (`(mode & 0o077) == 0`).
+pub fn ensure_verified_private_staging_dir(subdir: Option<&str>) -> Option<PathBuf> {
+    let base = staging_shm_dir();
+    #[cfg(unix)]
+    verify_or_create_private_dir_one(&base, true)?;
+    #[cfg(not(unix))]
+    fs::create_dir_all(&base).ok()?;
+
+    let Some(sub) = subdir else {
+        return Some(base);
+    };
+    if !is_safe_single_shm_segment(sub) {
+        return None;
+    }
+    let sub_path = base.join(sub);
+    #[cfg(unix)]
+    verify_or_create_private_dir_one(&sub_path, true)?;
+    #[cfg(not(unix))]
+    fs::create_dir_all(&sub_path).ok()?;
+    Some(sub_path)
+}
+
+/// Read `staging_shm_dir()/<subdir>/<file_name>` fail-closed WITHOUT mutating permissions:
+/// returns `None` if `base`, `subdir`, or `file_name` is a symlink, multiply linked (`nlink != 1`),
+/// not owned by `geteuid()`, or has any group/other permission bits (`(mode & 0o077) != 0`).
+pub fn read_verified_private_shm_file(subdir: &str, file_name: &str) -> Option<Vec<u8>> {
+    if !is_safe_single_shm_segment(subdir) || !is_safe_single_shm_segment(file_name) {
+        return None;
+    }
+    let base = staging_shm_dir();
+    let sub_path = base.join(subdir);
+    let file_path = sub_path.join(file_name);
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+        verify_or_create_private_dir_one(&base, false)?;
+        verify_or_create_private_dir_one(&sub_path, false)?;
+
+        let sym_meta = fs::symlink_metadata(&file_path).ok()?;
+        if sym_meta.file_type().is_symlink() || !sym_meta.file_type().is_file() {
+            return None;
+        }
+        let mut opts = fs::OpenOptions::new();
+        opts.read(true).custom_flags(libc::O_NOFOLLOW);
+        let mut f = opts.open(&file_path).ok()?;
+        let meta = f.metadata().ok()?;
+        let euid = unsafe { libc::geteuid() };
+        if !meta.file_type().is_file()
+            || meta.nlink() != 1
+            || meta.uid() != euid
+            || (meta.mode() & 0o077) != 0
+        {
+            return None;
+        }
+        if !inode_matches_nofollow(&f, &file_path) {
+            return None;
+        }
+        let mut buf = Vec::with_capacity(meta.len() as usize);
+        f.read_to_end(&mut buf).ok()?;
+        Some(buf)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::read(&file_path).ok()
+    }
+}
+
+/// Atomically write `bytes` to `staging_shm_dir()/<subdir>/<file_name>` with `0o600` permissions
+/// inside verified `0o700` `euid`-owned directories, refusing symlink targets.
+pub fn write_verified_private_shm_file(
+    subdir: &str,
+    file_name: &str,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    if !is_safe_single_shm_segment(subdir) || !is_safe_single_shm_segment(file_name) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid private shm cache segment",
+        ));
+    }
+    let sub_path = ensure_verified_private_staging_dir(Some(subdir)).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "untrusted or unowned staging_shm_dir",
+        )
+    })?;
+    let target = sub_path.join(file_name);
+    match fs::symlink_metadata(&target) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("refusing non-regular shm cache target {}", target.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let (mut tmp_f, tmp_path) = open_unique_exclusive_tmp(&target, 0o600)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = tmp_f.set_permissions(fs::Permissions::from_mode(0o600)) {
+            drop(tmp_f);
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+    }
+    if let Err(e) = tmp_f.write_all(bytes) {
+        drop(tmp_f);
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    drop(tmp_f);
+    match fs::symlink_metadata(&target) {
+        Ok(meta) if !meta.file_type().is_file() => {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("refusing non-regular shm cache target {}", target.display()),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+    }
+    if let Err(e) = fs::rename(&tmp_path, &target) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
+}
+
 pub(crate) struct StagingLeaseGuard {
     lock_path: PathBuf,
     _lease: Option<FlockGuard>,
 }
 
+fn ensure_lease_or_staging_parent_dir(parent: &Path) -> std::io::Result<()> {
+    if parent.as_os_str().is_empty() || parent == Path::new(".") {
+        return Ok(());
+    }
+    let base = staging_shm_dir();
+    if parent == base || parent.starts_with(&base) {
+        ensure_private_dir_all(parent)
+    } else {
+        ensure_nonsymlink_dir_all(parent)
+    }
+}
+
 impl StagingLeaseGuard {
     pub(crate) fn acquire_for_target(target: &Path) -> std::io::Result<Self> {
         if let Some(parent) = target.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+            ensure_lease_or_staging_parent_dir(parent)?;
         }
         #[cfg(unix)]
         let mut dir_lease = lock_staging_parent_dir(target, false, false)?;
@@ -659,9 +942,7 @@ impl StagedTempFile {
 
     fn stage_with_lease(path: PathBuf, bytes: &[u8]) -> std::io::Result<Self> {
         if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+            ensure_lease_or_staging_parent_dir(parent)?;
         }
         #[cfg(unix)]
         let mut dir_lease = lock_staging_parent_dir(&path, false, false)?;
@@ -859,9 +1140,7 @@ thread_local! {
 fn acquire_staging_lease(lock_path: &Path) -> std::io::Result<Option<FlockGuard>> {
     for attempt in 0..4096u32 {
         if let Some(parent) = lock_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+            ensure_lease_or_staging_parent_dir(parent)?;
         }
         let mut opts = fs::OpenOptions::new();
         opts.create(true).read(true).write(true).truncate(false);
@@ -1354,6 +1633,9 @@ pub fn read_shm_or_disk_spill(shm_path: &Path, disk_spill_dir: Option<&Path>) ->
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
     #[test]
     fn test_publication_snapshot_rejects_changed_and_new_artifacts() -> anyhow::Result<()> {
         let root = std::env::temp_dir().join(format!(
@@ -1583,6 +1865,12 @@ mod tests {
         let shm_dir = base_dir.join("shm");
         let spill_dir = base_dir.join("disk_spill");
         fs::create_dir_all(&shm_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&base_dir, fs::Permissions::from_mode(0o700))?;
+            fs::set_permissions(&shm_dir, fs::Permissions::from_mode(0o700))?;
+        }
 
         let f_old = shm_dir.join("entry_old.json");
         let f_mid = shm_dir.join("entry_mid.json");
@@ -1669,6 +1957,7 @@ mod tests {
         let det_target = staging.join("deterministic_race.lean");
         let det_lock = staging_lease_lock_path(&det_target);
         fs::create_dir_all(&staging)?;
+        fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
         let reaper_blocked_mid_open = std::rc::Rc::new(std::cell::Cell::new(false));
         let reaper_flag = reaper_blocked_mid_open.clone();
         let det_target_for_hook = det_target.clone();
@@ -1913,5 +2202,509 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_private_shm_trust_boundary_rejects_unverified_dirs_files_and_symlinks(
+    ) -> anyhow::Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "turbo_private_shm_boundary_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+
+        let prev_staging = std::env::var_os("TURBO_LEAN_STAGING_DIR");
+        let run_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            || -> anyhow::Result<()> {
+                let staging = root.join("staging");
+                std::env::set_var("TURBO_LEAN_STAGING_DIR", &staging);
+
+                // 1. Normal write & read roundtrip creates `0o700` dirs and `0o600` files.
+                write_verified_private_shm_file("test_sub", "ok.json", b"{\"ok\":true}")?;
+                assert_eq!(
+                    fs::symlink_metadata(&staging)?.mode() & 0o777,
+                    0o700,
+                    "staging root must be 0o700"
+                );
+                assert_eq!(
+                    fs::symlink_metadata(staging.join("test_sub"))?.mode() & 0o777,
+                    0o700,
+                    "staging subdir must be 0o700"
+                );
+                assert_eq!(
+                    fs::symlink_metadata(staging.join("test_sub/ok.json"))?.mode() & 0o777,
+                    0o600,
+                    "private shm file must be 0o600"
+                );
+                assert_eq!(
+                    read_verified_private_shm_file("test_sub", "ok.json").as_deref(),
+                    Some(&b"{\"ok\":true}"[..])
+                );
+
+                // Build minimal valid `.olean` bytes >64 KiB (`Init` import, `is_module = true`).
+                let make_valid_large_olean = || -> Vec<u8> {
+                    let mut b = vec![0u8; 70_000];
+                    b[0..5].copy_from_slice(b"olean");
+                    b[5] = 2;
+                    let base: u64 = 0x1000_0000;
+                    b[80..88].copy_from_slice(&base.to_le_bytes());
+                    let root_off = 96usize;
+                    let arr_off = 160usize;
+                    let imp_off = 200usize;
+                    let name_off = 232usize;
+                    let str_off = 264usize;
+                    b[88..96].copy_from_slice(&(base + root_off as u64).to_le_bytes());
+                    b[root_off + 6] = 5;
+                    b[root_off + 7] = 0;
+                    b[root_off + 8..root_off + 16]
+                        .copy_from_slice(&(base + arr_off as u64).to_le_bytes());
+                    b[root_off + 48] = 1; // is_module = true
+                    b[arr_off + 7] = 246;
+                    b[arr_off + 8..arr_off + 16].copy_from_slice(&1u64.to_le_bytes());
+                    b[arr_off + 24..arr_off + 32]
+                        .copy_from_slice(&(base + imp_off as u64).to_le_bytes());
+                    b[imp_off + 6] = 1;
+                    b[imp_off + 7] = 0;
+                    b[imp_off + 8..imp_off + 16]
+                        .copy_from_slice(&(base + name_off as u64).to_le_bytes());
+                    b[imp_off + 16] = 1;
+                    b[imp_off + 17] = 1;
+                    b[imp_off + 18] = 0;
+                    b[name_off + 7] = 1;
+                    b[name_off + 8..name_off + 16].copy_from_slice(&1u64.to_le_bytes());
+                    b[name_off + 16..name_off + 24]
+                        .copy_from_slice(&(base + str_off as u64).to_le_bytes());
+                    b[str_off + 7] = 249;
+                    b[str_off + 8..str_off + 16].copy_from_slice(&5u64.to_le_bytes());
+                    b[str_off + 32..str_off + 36].copy_from_slice(b"Init");
+                    b[str_off + 36] = 0;
+                    b
+                };
+
+                // Fixture files: source with forbidden `sorry` and real >64KiB `.olean`.
+                let lean_src = root.join("BadHygiene.lean");
+                fs::write(&lean_src, "theorem forged_bad : False := sorry\n")?;
+                let olean_path = root.join("RealMod.olean");
+                fs::write(&olean_path, make_valid_large_olean())?;
+                // Age past STAT_TRUST_WINDOW_NS (2s) so trusted SHM memoization persists entries.
+                std::thread::sleep(std::time::Duration::from_millis(2200));
+
+                // Populate legitimate `0o600` cache entries across all three subdirs first.
+                crate::module_builder::reset_lake_inputs_tag_memo();
+                crate::lake_build::clear_olean_interface_memo();
+                let real_hyg = crate::module_builder::load_source_hygiene_cached(&lean_src)?;
+                assert!(
+                    !real_hyg.is_clean_for_certification(),
+                    "real source has sorry and must not be clean"
+                );
+                let real_meta_dig =
+                    crate::module_builder::compute_replayed_olean_ilean_digest(&olean_path)?;
+                let (real_imps, real_is_mod) =
+                    crate::module_builder::read_olean_binary_imports_cached(&olean_path)?;
+                assert_eq!(real_imps.len(), 1);
+                assert_eq!(real_imps[0].module, "Init");
+                assert!(real_is_mod);
+                let comp_paths = crate::lake_build::single_olean_companion_paths(&olean_path);
+                let cur_stats =
+                    crate::lake_build::single_olean_stat_bundle(&olean_path, &comp_paths);
+                let (real_iface_dig, real_iface_deps, _) =
+                    crate::lake_build::compute_single_olean_digest_and_imports_with_stats(
+                        &olean_path,
+                        &comp_paths,
+                        cur_stats,
+                    )
+                    .expect("compute_single_olean_digest_and_imports_with_stats");
+                assert_eq!(real_iface_deps, vec!["Init".to_string()]);
+
+                let sh_key = &blake3::hash(lean_src.to_string_lossy().as_bytes())
+                    .to_hex()
+                    .to_string()[..28];
+                let sh_path = staging
+                    .join("src_hygiene_v2")
+                    .join(format!("sh_{sh_key}.json"));
+                let om_key = &blake3::hash(olean_path.to_string_lossy().as_bytes())
+                    .to_hex()
+                    .to_string()[..28];
+                let om_path = staging
+                    .join("olean_meta_v2")
+                    .join(format!("om_{om_key}.json"));
+                let oi_path = staging
+                    .join("olean_iface_v2")
+                    .join(format!("oi_{om_key}.json"));
+                assert_eq!(fs::symlink_metadata(&sh_path)?.mode() & 0o777, 0o600);
+                assert_eq!(fs::symlink_metadata(&om_path)?.mode() & 0o777, 0o600);
+                assert_eq!(fs::symlink_metadata(&oi_path)?.mode() & 0o777, 0o600);
+
+                // Craft forged JSON payloads preserving exact `stat`/`stats`/`sample_key` fields.
+                let mut forged_sh: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&sh_path)?)?;
+                forged_sh["hygiene"] = serde_json::to_value(crate::splitter::audit_hygiene(
+                    "theorem ok : True := trivial\n",
+                ))?;
+                let forged_sh_bytes = serde_json::to_vec(&forged_sh)?;
+
+                let mut forged_om: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&om_path)?)?;
+                forged_om["digest"] = serde_json::json!("forged_meta_digest_0000");
+                forged_om["imports"] = serde_json::json!([[], false]);
+                let forged_om_bytes = serde_json::to_vec(&forged_om)?;
+
+                let mut forged_oi: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&oi_path)?)?;
+                forged_oi["digest"] = serde_json::json!("forged_iface_digest_0000");
+                forged_oi["deps"] = serde_json::json!(["ForgedDep"]);
+                let forged_oi_bytes = serde_json::to_vec(&forged_oi)?;
+
+                let assert_all_caches_miss_and_recompute_truth = || -> anyhow::Result<()> {
+                    crate::module_builder::reset_lake_inputs_tag_memo();
+                    crate::lake_build::clear_olean_interface_memo();
+                    let h = crate::module_builder::load_source_hygiene_cached(&lean_src)?;
+                    anyhow::ensure!(
+                        !h.is_clean_for_certification(),
+                        "forged src_hygiene_v2 entry was trusted!"
+                    );
+                    let md =
+                        crate::module_builder::compute_replayed_olean_ilean_digest(&olean_path)?;
+                    anyhow::ensure!(
+                        md == real_meta_dig,
+                        "forged olean_meta_v2 digest was trusted: {md}"
+                    );
+                    crate::module_builder::reset_lake_inputs_tag_memo();
+                    let (imps, is_m) =
+                        crate::module_builder::read_olean_binary_imports_cached(&olean_path)?;
+                    anyhow::ensure!(
+                        imps.len() == 1 && imps[0].module == "Init" && is_m,
+                        "forged olean_meta_v2 binary imports were trusted: {imps:?}"
+                    );
+                    let (idig, ideps, _) =
+                        crate::lake_build::compute_single_olean_digest_and_imports_with_stats(
+                            &olean_path,
+                            &comp_paths,
+                            cur_stats,
+                        )
+                        .expect("recomputed iface digest");
+                    anyhow::ensure!(
+                        idig == real_iface_dig && ideps == real_iface_deps,
+                        "forged olean_iface_v2 entry was trusted: {idig} / {ideps:?}"
+                    );
+                    Ok(())
+                };
+
+                // 2. Group/world-readable cache files (`0o644`) inside `0o700` dirs must be ignored
+                //    WITHOUT mutating permissions when failing closed on read, then overwritten cleanly
+                //    by legitimate `0o600` atomic writes. Also verify `read_verified_private_shm_file`
+                //    directly refuses `0o644` without chmodding.
+                fs::write(&sh_path, &forged_sh_bytes)?;
+                fs::set_permissions(&sh_path, fs::Permissions::from_mode(0o644))?;
+                assert!(
+                    read_verified_private_shm_file(
+                        "src_hygiene_v2",
+                        sh_path.file_name().unwrap().to_str().unwrap()
+                    )
+                    .is_none(),
+                    "0o644 file must fail closed"
+                );
+                assert_eq!(
+                    fs::symlink_metadata(&sh_path)?.mode() & 0o777,
+                    0o644,
+                    "read_verified_private_shm_file must not mutate permissions of rejected files"
+                );
+                fs::write(&om_path, &forged_om_bytes)?;
+                fs::set_permissions(&om_path, fs::Permissions::from_mode(0o644))?;
+                fs::write(&oi_path, &forged_oi_bytes)?;
+                fs::set_permissions(&oi_path, fs::Permissions::from_mode(0o644))?;
+                assert_all_caches_miss_and_recompute_truth()?;
+
+                // 3. `0o755` subdirectory or `0o755` staging root must be rejected (without chmodding!).
+                fs::write(&sh_path, &forged_sh_bytes)?;
+                fs::set_permissions(&sh_path, fs::Permissions::from_mode(0o600))?;
+                fs::write(&om_path, &forged_om_bytes)?;
+                fs::set_permissions(&om_path, fs::Permissions::from_mode(0o600))?;
+                fs::write(&oi_path, &forged_oi_bytes)?;
+                fs::set_permissions(&oi_path, fs::Permissions::from_mode(0o600))?;
+                for sub in ["src_hygiene_v2", "olean_meta_v2", "olean_iface_v2"] {
+                    fs::set_permissions(staging.join(sub), fs::Permissions::from_mode(0o755))?;
+                }
+                assert!(ensure_verified_private_staging_dir(Some("src_hygiene_v2")).is_none());
+                assert_eq!(
+                    fs::symlink_metadata(staging.join("src_hygiene_v2"))?.mode() & 0o777,
+                    0o755,
+                    "verify must never chmod an untrusted 0o755 directory"
+                );
+                assert_all_caches_miss_and_recompute_truth()?;
+                for sub in ["src_hygiene_v2", "olean_meta_v2", "olean_iface_v2"] {
+                    fs::set_permissions(staging.join(sub), fs::Permissions::from_mode(0o700))?;
+                }
+
+                // Now `0o755` on staging root itself:
+                fs::write(&sh_path, &forged_sh_bytes)?;
+                fs::set_permissions(&sh_path, fs::Permissions::from_mode(0o600))?;
+                fs::write(&om_path, &forged_om_bytes)?;
+                fs::set_permissions(&om_path, fs::Permissions::from_mode(0o600))?;
+                fs::write(&oi_path, &forged_oi_bytes)?;
+                fs::set_permissions(&oi_path, fs::Permissions::from_mode(0o600))?;
+                fs::set_permissions(&staging, fs::Permissions::from_mode(0o755))?;
+                assert!(ensure_verified_private_staging_dir(None).is_none());
+                assert_all_caches_miss_and_recompute_truth()?;
+                fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
+
+                // 4. Symlinked cache files inside `0o700` subdirs must be ignored on read and
+                //    refused on write (`write_verified_private_shm_file` returns Err, target untouched).
+                let ext_target = root.join("ext_forged_payload.json");
+                fs::write(&ext_target, &forged_sh_bytes)?;
+                fs::set_permissions(&ext_target, fs::Permissions::from_mode(0o600))?;
+                for (p, payload) in [
+                    (&sh_path, &forged_sh_bytes),
+                    (&om_path, &forged_om_bytes),
+                    (&oi_path, &forged_oi_bytes),
+                ] {
+                    let ext =
+                        root.join(format!("ext_{}", p.file_name().unwrap().to_string_lossy()));
+                    fs::write(&ext, payload)?;
+                    fs::set_permissions(&ext, fs::Permissions::from_mode(0o600))?;
+                    let _ = fs::remove_file(p);
+                    std::os::unix::fs::symlink(&ext, p)?;
+                }
+                assert!(
+                    write_verified_private_shm_file(
+                        "src_hygiene_v2",
+                        sh_path.file_name().unwrap().to_str().unwrap(),
+                        b"{}"
+                    )
+                    .is_err(),
+                    "write_verified_private_shm_file must refuse symlink target"
+                );
+                assert_all_caches_miss_and_recompute_truth()?;
+
+                // 4b. Hardlinked cache files (`nlink > 1`) inside `0o700` subdirs must be rejected
+                //     on read (`read_verified_private_shm_file` returns `None`) and atomically
+                //     unlinked/replaced via rename on write without mutating the external hardlink.
+                for (p, payload) in [
+                    (&sh_path, &forged_sh_bytes),
+                    (&om_path, &forged_om_bytes),
+                    (&oi_path, &forged_oi_bytes),
+                ] {
+                    let ext_hl = root.join(format!(
+                        "ext_hl_{}",
+                        p.file_name().unwrap().to_string_lossy()
+                    ));
+                    fs::write(&ext_hl, payload)?;
+                    fs::set_permissions(&ext_hl, fs::Permissions::from_mode(0o600))?;
+                    let _ = fs::remove_file(p);
+                    fs::hard_link(&ext_hl, p)?;
+                }
+                assert!(
+                    read_verified_private_shm_file(
+                        "src_hygiene_v2",
+                        sh_path.file_name().unwrap().to_str().unwrap()
+                    )
+                    .is_none(),
+                    "read_verified_private_shm_file must reject hardlinked file (nlink > 1)"
+                );
+                assert_all_caches_miss_and_recompute_truth()?;
+                for (p, payload) in [
+                    (&sh_path, &forged_sh_bytes),
+                    (&om_path, &forged_om_bytes),
+                    (&oi_path, &forged_oi_bytes),
+                ] {
+                    let ext_hl = root.join(format!(
+                        "ext_hl_{}",
+                        p.file_name().unwrap().to_string_lossy()
+                    ));
+                    assert_eq!(
+                        fs::read(&ext_hl)?,
+                        *payload,
+                        "atomic rename must not mutate external hardlink target"
+                    );
+                }
+
+                // 5. Symlinked `TURBO_LEAN_STAGING_DIR` must be rejected by both private SHM
+                //    helpers AND `TurboStore::fast_staging_dir()` (which must fall back to
+                //    `<store_root>/staging` rather than returning the symlink).
+                let real_target_dir = root.join("real_target_700");
+                fs::create_dir_all(&real_target_dir)?;
+                fs::set_permissions(&real_target_dir, fs::Permissions::from_mode(0o700))?;
+                let symlink_staging = root.join("symlink_staging");
+                std::os::unix::fs::symlink(&real_target_dir, &symlink_staging)?;
+                std::env::set_var("TURBO_LEAN_STAGING_DIR", &symlink_staging);
+                assert!(ensure_verified_private_staging_dir(None).is_none());
+                assert!(
+                    write_verified_private_shm_file("src_hygiene_v2", "x.json", b"{}").is_err()
+                );
+                let store_root = root.join("store_fallback");
+                let store = crate::db::TurboStore::open(Some(&store_root))?;
+                let resolved_fast = store.fast_staging_dir();
+                assert_eq!(
+                    resolved_fast,
+                    store_root.join("staging"),
+                    "TurboStore::fast_staging_dir must fall back to store_root/staging when staging_shm_dir is a symlink"
+                );
+                assert_eq!(fs::symlink_metadata(&resolved_fast)?.mode() & 0o777, 0o700);
+
+                // Also verify `0o755` `TURBO_LEAN_STAGING_DIR` causes `fast_staging_dir()` fallback,
+                // and `ensure_private_dir_all` / staging `acquire_flock` / `atomic_write_shm` refuse
+                // pre-created `0o755` staging directories without chmodding them.
+                let perm755_staging = root.join("perm755_staging");
+                fs::create_dir_all(&perm755_staging)?;
+                fs::set_permissions(&perm755_staging, fs::Permissions::from_mode(0o755))?;
+                std::env::set_var("TURBO_LEAN_STAGING_DIR", &perm755_staging);
+                assert_eq!(store.fast_staging_dir(), store_root.join("staging"));
+                assert!(ensure_private_dir_all(&perm755_staging).is_err());
+                assert!(acquire_flock(&perm755_staging.join("x.lock"), true, false).is_err());
+                assert!(atomic_write_shm(&perm755_staging.join("x.json"), b"{}").is_err());
+                assert!(
+                    StagingLeaseGuard::acquire_for_target(&perm755_staging.join("x.lean")).is_err()
+                );
+                assert!(StagedTempFile::write(perm755_staging.join("x.lean"), b"x").is_err());
+                assert_eq!(
+                    fs::symlink_metadata(&perm755_staging)?.mode() & 0o777,
+                    0o755,
+                    "ensure_private_dir_all must not chmod an existing 0o755 directory"
+                );
+                // Meanwhile, `PrivateScratchDir` under `verified_private_temp_scratch_base()`
+                // and under a `0o755` non-staging temporary directory must succeed cleanly.
+                let priv_scratch_base = crate::check::verified_private_temp_scratch_base()?;
+                assert_eq!(
+                    fs::symlink_metadata(&priv_scratch_base)?.mode() & 0o777,
+                    0o700
+                );
+                let psd_tmp =
+                    crate::check::PrivateScratchDir::create(&priv_scratch_base, "turbo_tmp_test")?;
+                assert_eq!(fs::symlink_metadata(&psd_tmp.path)?.mode() & 0o777, 0o700);
+                drop(psd_tmp);
+                let non_staging_755 = root.join("non_staging_755");
+                fs::create_dir_all(&non_staging_755)?;
+                fs::set_permissions(&non_staging_755, fs::Permissions::from_mode(0o755))?;
+                let psd_755 =
+                    crate::check::PrivateScratchDir::create(&non_staging_755, "turbo_755_test")?;
+                assert_eq!(fs::symlink_metadata(&psd_755.path)?.mode() & 0o777, 0o700);
+                drop(psd_755);
+
+                // 6. Coarse-timestamp / trust-window regression across persistent SHM & in-memory
+                //    replay-authority, interface, and source-hygiene caches:
+                //    a same-length rewrite within a single 1s coarse timestamp tick must NEVER
+                //    return a stale replay digest, binary-import list, artifact-set digest,
+                //    single-olean interface digest, or source-hygiene / source-blake3 verdict.
+                let private_staging = root.join("coarse_staging");
+                std::env::set_var("TURBO_LEAN_STAGING_DIR", &private_staging);
+                crate::zygote::digest_test_hooks::set_forced_ts_granularity_ns(Some(1_000_000_000));
+                while crate::zygote::wall_clock_ns().rem_euclid(1_000_000_000) > 250_000_000 {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let coarse_olean = root.join("CoarseReplay.olean");
+                let mut olean_v1 = make_valid_large_olean();
+                let mut olean_v2 = olean_v1.clone();
+                // Same length (70_000 bytes), interior byte edit at offset 35_000 (outside 4 KiB head/tail sample!) AND different import (`Core` vs `Init`).
+                olean_v1[35_000] = 0x11;
+                olean_v2[35_000] = 0x22;
+                olean_v2[264 + 32..264 + 36].copy_from_slice(b"Core");
+                fs::write(&coarse_olean, &olean_v1)?;
+                let coarse_src = root.join("CoarseHygiene.lean");
+                // Same byte length (70_000 bytes, interior edit outside 4 KiB head/tail sample): clean vs sorry!
+                let pad_prefix = format!("-- {}\n", "a".repeat(34_900));
+                let pad_suffix = format!("-- {}\n", "b".repeat(35_050));
+                let src_v1 =
+                    format!("{pad_prefix}theorem coarse_t : True := trivial \n{pad_suffix}");
+                let src_v2 =
+                    format!("{pad_prefix}theorem coarse_t : True := by sorry\n{pad_suffix}");
+                assert_eq!(src_v1.len(), src_v2.len());
+                assert!(src_v1.len() > 65536);
+                fs::write(&coarse_src, &src_v1)?;
+
+                let d_v1 =
+                    crate::module_builder::compute_replayed_olean_ilean_digest(&coarse_olean)?;
+                let aset_v1 =
+                    crate::module_builder::compute_olean_artifact_set_digest(&coarse_olean)?;
+                let (imps_v1, _) =
+                    crate::module_builder::read_olean_binary_imports_cached(&coarse_olean)?;
+                let coarse_comp = crate::lake_build::single_olean_companion_paths(&coarse_olean);
+                let (iface_v1, _, _) =
+                    crate::lake_build::compute_single_olean_digest_and_imports_with_stats(
+                        &coarse_olean,
+                        &coarse_comp,
+                        crate::lake_build::single_olean_stat_bundle(&coarse_olean, &coarse_comp),
+                    )
+                    .expect("coarse iface v1");
+                let sb3_v1 = crate::lake_build::compute_cached_source_blake3(&coarse_src)
+                    .expect("coarse src blake3 v1");
+                let hyg_v1 = crate::module_builder::load_source_hygiene_cached(&coarse_src)?;
+                assert_eq!(imps_v1[0].module, "Init");
+                assert!(hyg_v1.is_clean_for_certification());
+
+                // Same-length rewrite inside the same 1s tick (and within STAT_TRUST_WINDOW_NS):
+                fs::write(&coarse_olean, &olean_v2)?;
+                fs::write(&coarse_src, &src_v2)?;
+                // Verify both in-memory (same memo window) AND across memo-window reset (SHM):
+                for reset in [false, true] {
+                    if reset {
+                        crate::module_builder::reset_lake_inputs_tag_memo();
+                    }
+                    let d_v2 =
+                        crate::module_builder::compute_replayed_olean_ilean_digest(&coarse_olean)?;
+                    let aset_v2 =
+                        crate::module_builder::compute_olean_artifact_set_digest(&coarse_olean)?;
+                    let (imps_v2, _) =
+                        crate::module_builder::read_olean_binary_imports_cached(&coarse_olean)?;
+                    let (iface_v2, _, _) =
+                        crate::lake_build::compute_single_olean_digest_and_imports_with_stats(
+                            &coarse_olean,
+                            &coarse_comp,
+                            crate::lake_build::single_olean_stat_bundle(
+                                &coarse_olean,
+                                &coarse_comp,
+                            ),
+                        )
+                        .expect("coarse iface v2");
+                    let sb3_v2 = crate::lake_build::compute_cached_source_blake3(&coarse_src)
+                        .expect("coarse src blake3 v2");
+                    let hyg_v2 = crate::module_builder::load_source_hygiene_cached(&coarse_src)?;
+                    assert_ne!(
+                        d_v1, d_v2,
+                        "same-length coarse-tick rewrite must rehash replay digest (reset={reset})"
+                    );
+                    assert_ne!(
+                        aset_v1, aset_v2,
+                        "same-length coarse-tick rewrite must rehash artifact-set digest (reset={reset})"
+                    );
+                    assert_ne!(
+                        iface_v1, iface_v2,
+                        "same-length coarse-tick interior rewrite must rehash single-olean interface digest (reset={reset})"
+                    );
+                    assert_ne!(
+                        sb3_v1, sb3_v2,
+                        "same-length coarse-tick interior rewrite must rehash cached source blake3 (reset={reset})"
+                    );
+                    assert_eq!(
+                        imps_v2[0].module, "Core",
+                        "same-length coarse-tick rewrite must re-parse binary imports (reset={reset})"
+                    );
+                    assert!(
+                        !hyg_v2.is_clean_for_certification(),
+                        "same-length coarse-tick rewrite must re-audit source hygiene (reset={reset})"
+                    );
+                }
+                crate::zygote::digest_test_hooks::clear();
+                Ok(())
+            },
+        ));
+        #[cfg(test)]
+        crate::zygote::digest_test_hooks::clear();
+        match prev_staging {
+            Some(v) => std::env::set_var("TURBO_LEAN_STAGING_DIR", v),
+            None => std::env::remove_var("TURBO_LEAN_STAGING_DIR"),
+        }
+        let _ = fs::remove_dir_all(&root);
+        match run_res {
+            Ok(r) => r,
+            Err(p) => std::panic::resume_unwind(p),
+        }
     }
 }

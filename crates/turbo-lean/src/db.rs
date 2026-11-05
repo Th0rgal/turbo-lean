@@ -399,6 +399,20 @@ const KERNEL_REPLAYED_OLEANS_AUTH_DDL: &str = "
     );
 ";
 
+const KERNEL_AUDITED_OLEANS_AUTH_DDL: &str = "
+    CREATE TABLE IF NOT EXISTS kernel_audited_oleans_auth (
+        artifact_digest TEXT NOT NULL,
+        environment_digest TEXT NOT NULL,
+        replay_version INTEGER NOT NULL,
+        toolchain_hash TEXT NOT NULL,
+        policy_digest TEXT NOT NULL,
+        module_name TEXT NOT NULL DEFAULT '',
+        audit_mac TEXT NOT NULL,
+        verified_at INTEGER NOT NULL,
+        PRIMARY KEY (artifact_digest, environment_digest, replay_version, toolchain_hash, policy_digest)
+    );
+";
+
 const VERIFIER_REPLAY_HMAC_KEY_FILENAME: &str = ".verifier_replay_hmac_key";
 
 fn canonical_or_lexical_path(p: &Path) -> PathBuf {
@@ -478,6 +492,33 @@ fn compute_kernel_replay_mac(
     msg.extend_from_slice(&replay_version.to_le_bytes());
     msg.extend_from_slice(&(toolchain_hash.len() as u64).to_le_bytes());
     msg.extend_from_slice(toolchain_hash.as_bytes());
+    blake3::keyed_hash(key, &msg).to_hex().to_string()
+}
+
+fn compute_kernel_audit_mac(
+    key: &[u8; 32],
+    artifact_digest: &str,
+    environment_digest: &str,
+    replay_version: u32,
+    toolchain_hash: &str,
+    policy_digest: &str,
+) -> String {
+    let mut msg = Vec::with_capacity(
+        80 + artifact_digest.len()
+            + environment_digest.len()
+            + toolchain_hash.len()
+            + policy_digest.len(),
+    );
+    msg.extend_from_slice(b"turbo-lean-verifier-audit-mac-v1\n");
+    msg.extend_from_slice(&(artifact_digest.len() as u64).to_le_bytes());
+    msg.extend_from_slice(artifact_digest.as_bytes());
+    msg.extend_from_slice(&(environment_digest.len() as u64).to_le_bytes());
+    msg.extend_from_slice(environment_digest.as_bytes());
+    msg.extend_from_slice(&replay_version.to_le_bytes());
+    msg.extend_from_slice(&(toolchain_hash.len() as u64).to_le_bytes());
+    msg.extend_from_slice(toolchain_hash.as_bytes());
+    msg.extend_from_slice(&(policy_digest.len() as u64).to_le_bytes());
+    msg.extend_from_slice(policy_digest.as_bytes());
     blake3::keyed_hash(key, &msg).to_hex().to_string()
 }
 
@@ -612,7 +653,7 @@ fn template_shm_path() -> (PathBuf, u32) {
     };
     let uid = unsafe { libc::geteuid() };
     (
-        shm_base.join(format!("turbo_lean_template_state_v6_{}.db", uid)),
+        shm_base.join(format!("turbo_lean_template_state_v7_{}.db", uid)),
         uid,
     )
 }
@@ -783,6 +824,12 @@ impl TurboStore {
                         KERNEL_REPLAYED_OLEANS_AUTH_DDL
                     ))?;
                 }
+                if uver < 5 {
+                    conn.execute_batch(&format!(
+                        "{}\nPRAGMA user_version = 5;",
+                        KERNEL_AUDITED_OLEANS_AUTH_DDL
+                    ))?;
+                }
             }
         } else {
             conn.execute_batch(&format!(
@@ -819,6 +866,7 @@ impl TurboStore {
                  {}
                  {}
                  {}
+                 {}
                  CREATE TABLE IF NOT EXISTS inflight_leases (
                      action_key TEXT PRIMARY KEY, fencing_token INTEGER NOT NULL, worker_pid INTEGER NOT NULL,
                      boot_id TEXT NOT NULL, started_at INTEGER NOT NULL, waiter_count INTEGER NOT NULL DEFAULT 1
@@ -836,12 +884,13 @@ impl TurboStore {
                      path_key TEXT PRIMARY KEY, mtime_sec INTEGER NOT NULL, mtime_nsec INTEGER NOT NULL,
                      size_bytes INTEGER NOT NULL, split_key TEXT NOT NULL, updated_at INTEGER NOT NULL
                  );
-                 PRAGMA user_version = 4;
+                 PRAGMA user_version = 5;
                  COMMIT;
                  PRAGMA wal_checkpoint(TRUNCATE);",
                 WORKTREE_LEASES_DDL,
                 KERNEL_REPLAYED_OLEANS_DDL,
-                KERNEL_REPLAYED_OLEANS_AUTH_DDL
+                KERNEL_REPLAYED_OLEANS_AUTH_DDL,
+                KERNEL_AUDITED_OLEANS_AUTH_DDL
             ))?;
             if !template_path.exists() {
                 if let Some(shm_base) = template_path.parent() {
@@ -868,10 +917,10 @@ impl TurboStore {
     }
 
     /// Compute the deterministic BLAKE3 cache key for `file_split_cache` from an existing
-    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v12:" + src_blake3_hex)`).
+    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v13:" + src_blake3_hex)`).
     pub fn compute_file_split_key_from_src_hash(src_blake3_hex: &str) -> String {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"file-split:v12:");
+        hasher.update(b"file-split:v13:");
         hasher.update(src_blake3_hex.as_bytes());
         hasher.finalize().to_hex().to_string()
     }
@@ -1285,17 +1334,29 @@ impl TurboStore {
     /// falling back to `self.root.join("staging")` so temporary `.lean` shard files never touch disk.
     pub fn fast_staging_dir(&self) -> PathBuf {
         if Path::new("/dev/shm").is_dir() || std::env::var("TURBO_LEAN_STAGING_DIR").is_ok() {
-            let dir = crate::shm_cache::staging_shm_dir();
-            if fs::create_dir_all(&dir).is_ok() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
-                }
+            if let Some(dir) = crate::shm_cache::ensure_verified_private_staging_dir(None) {
                 return dir;
             }
         }
-        self.root.join("staging")
+        let fallback = self.root.join("staging");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            if fs::symlink_metadata(&fallback).is_err() {
+                let mut builder = fs::DirBuilder::new();
+                builder.recursive(true).mode(0o700);
+                let _ = builder.create(&fallback);
+            }
+            if fs::symlink_metadata(&fallback)
+                .ok()
+                .is_some_and(|m| !m.file_type().is_symlink() && m.file_type().is_dir())
+            {
+                let _ = fs::set_permissions(&fallback, fs::Permissions::from_mode(0o700));
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = fs::create_dir_all(&fallback);
+        fallback
     }
 
     /// Batch-lookup multiple theorem shard keys in a single SQLite pass, verifying that the
@@ -2821,30 +2882,40 @@ impl TurboStore {
         Ok(())
     }
 
-    pub(crate) fn has_kernel_replayed_olean(
+    pub(crate) fn load_verified_replay_hmac_key(
         &self,
+        disallowed_roots: &[PathBuf],
+    ) -> Option<[u8; 32]> {
+        if !self.is_store_outside_disallowed_roots(disallowed_roots) {
+            return None;
+        }
+        let key_path = self.root.join(VERIFIER_REPLAY_HMAC_KEY_FILENAME);
+        read_verified_replay_hmac_key_file(&key_path, disallowed_roots)
+    }
+
+    pub(crate) fn has_kernel_replayed_olean_with_key(
+        &self,
+        key: &[u8; 32],
         artifact_digest: &str,
         environment_digest: &str,
         replay_version: u32,
         toolchain_hash: &str,
-        disallowed_roots: &[PathBuf],
     ) -> bool {
         if artifact_digest.is_empty()
             || environment_digest.is_empty()
             || replay_version == 0
             || toolchain_hash.is_empty()
-            || !self.is_store_outside_disallowed_roots(disallowed_roots)
         {
             return false;
         }
-        let key_path = self.root.join(VERIFIER_REPLAY_HMAC_KEY_FILENAME);
-        let Some(key) = read_verified_replay_hmac_key_file(&key_path, disallowed_roots) else {
-            return false;
-        };
-        let Ok(stored_mac) = self.conn.query_row(
+        let Ok(mut stmt) = self.conn.prepare_cached(
             "SELECT replay_mac FROM kernel_replayed_oleans_auth
              WHERE artifact_digest = ?1 AND environment_digest = ?2 AND replay_version = ?3 AND toolchain_hash = ?4
              LIMIT 1",
+        ) else {
+            return false;
+        };
+        let Ok(stored_mac) = stmt.query_row(
             params![
                 artifact_digest,
                 environment_digest,
@@ -2856,11 +2927,140 @@ impl TurboStore {
             return false;
         };
         let expected_mac = compute_kernel_replay_mac(
+            key,
+            artifact_digest,
+            environment_digest,
+            replay_version,
+            toolchain_hash,
+        );
+        stored_mac.len() == expected_mac.len()
+            && stored_mac
+                .as_bytes()
+                .iter()
+                .zip(expected_mac.as_bytes().iter())
+                .fold(0u8, |acc, (&a, &b)| acc | (a ^ b))
+                == 0
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_kernel_replayed_olean(
+        &self,
+        artifact_digest: &str,
+        environment_digest: &str,
+        replay_version: u32,
+        toolchain_hash: &str,
+        disallowed_roots: &[PathBuf],
+    ) -> bool {
+        let Some(key) = self.load_verified_replay_hmac_key(disallowed_roots) else {
+            return false;
+        };
+        self.has_kernel_replayed_olean_with_key(
             &key,
             artifact_digest,
             environment_digest,
             replay_version,
             toolchain_hash,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_kernel_audited_olean(
+        &self,
+        artifact_digest: &str,
+        environment_digest: &str,
+        replay_version: u32,
+        toolchain_hash: &str,
+        policy_digest: &str,
+        module_name: &str,
+        disallowed_roots: &[PathBuf],
+    ) -> Result<()> {
+        anyhow::ensure!(
+            !artifact_digest.is_empty()
+                && !environment_digest.is_empty()
+                && replay_version > 0
+                && !toolchain_hash.is_empty(),
+            "Refusing to record empty kernel-audit authority row (fail-closed)"
+        );
+        if !self.is_store_outside_disallowed_roots(disallowed_roots) {
+            return Ok(());
+        }
+        let Some(key) = get_or_create_verified_replay_hmac_key(&self.root, disallowed_roots) else {
+            return Ok(());
+        };
+        let audit_mac = compute_kernel_audit_mac(
+            &key,
+            artifact_digest,
+            environment_digest,
+            replay_version,
+            toolchain_hash,
+            policy_digest,
+        );
+        let now = now_unix();
+        self.conn.execute(
+            "INSERT INTO kernel_audited_oleans_auth (
+                artifact_digest, environment_digest, replay_version, toolchain_hash, policy_digest, module_name, audit_mac, verified_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(artifact_digest, environment_digest, replay_version, toolchain_hash, policy_digest) DO UPDATE SET
+                module_name = excluded.module_name,
+                audit_mac = excluded.audit_mac,
+                verified_at = excluded.verified_at",
+            params![
+                artifact_digest,
+                environment_digest,
+                i64::from(replay_version),
+                toolchain_hash,
+                policy_digest,
+                module_name,
+                audit_mac,
+                now
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn has_kernel_audited_olean_with_key(
+        &self,
+        key: &[u8; 32],
+        artifact_digest: &str,
+        environment_digest: &str,
+        replay_version: u32,
+        toolchain_hash: &str,
+        policy_digest: &str,
+    ) -> bool {
+        if artifact_digest.is_empty()
+            || environment_digest.is_empty()
+            || replay_version == 0
+            || toolchain_hash.is_empty()
+        {
+            return false;
+        }
+        let Ok(mut stmt) = self.conn.prepare_cached(
+            "SELECT audit_mac FROM kernel_audited_oleans_auth
+             WHERE artifact_digest = ?1 AND environment_digest = ?2 AND replay_version = ?3 AND toolchain_hash = ?4 AND policy_digest = ?5
+             LIMIT 1",
+        ) else {
+            return false;
+        };
+        let Ok(stored_mac) = stmt.query_row(
+            params![
+                artifact_digest,
+                environment_digest,
+                i64::from(replay_version),
+                toolchain_hash,
+                policy_digest
+            ],
+            |r| r.get::<_, String>(0),
+        ) else {
+            return false;
+        };
+        let expected_mac = compute_kernel_audit_mac(
+            key,
+            artifact_digest,
+            environment_digest,
+            replay_version,
+            toolchain_hash,
+            policy_digest,
         );
         stored_mac.len() == expected_mac.len()
             && stored_mac
@@ -3245,7 +3445,21 @@ impl TurboStore {
 
         let mut existing_map: std::collections::HashMap<String, String> =
             std::collections::HashMap::with_capacity(outputs.len());
-        {
+        if outputs.len() <= 128 {
+            let mut q_stmt = self.conn.prepare_cached(
+                "SELECT blob_hash FROM worktree_installations WHERE worktree_id = ?1 AND rel_path = ?2",
+            )?;
+            for out in outputs {
+                if out.rel_path.starts_with("thm:") {
+                    continue;
+                }
+                if let Ok(bh) =
+                    q_stmt.query_row(params![&wt_id, &out.rel_path], |r| r.get::<_, String>(0))
+                {
+                    existing_map.insert(out.rel_path.clone(), bh);
+                }
+            }
+        } else {
             let mut q_stmt = self.conn.prepare_cached(
                 "SELECT rel_path, blob_hash FROM worktree_installations WHERE worktree_id = ?1",
             )?;
@@ -3280,16 +3494,20 @@ impl TurboStore {
                 );
             }
             let dst = canon_root.join(&out.rel_path);
-            let dst_in_lake_build = is_non_package_lake_build_path(&dst);
+            let is_exe_bin = matches!(out.kind.as_str(), "exe" | "exe_bin" | "dynlib")
+                || is_lake_build_bin_executable_path(&dst);
+            let dst_in_lake_build = is_exe_bin || is_non_package_lake_build_path(&dst);
 
             let already_valid_in_place = if dst_in_lake_build {
                 match (fs::symlink_metadata(&src), fs::symlink_metadata(&dst)) {
                     (Ok(src_meta), Ok(dst_meta)) if src_meta.is_file() && dst_meta.is_file() => {
                         let same_ino =
                             src_meta.dev() == dst_meta.dev() && src_meta.ino() == dst_meta.ino();
+                        let exec_ok = !is_exe_bin || (dst_meta.permissions().mode() & 0o111) != 0;
                         !same_ino
                             && dst_meta.nlink() == 1
                             && (dst_meta.permissions().mode() & 0o200) != 0
+                            && exec_ok
                             && src_meta.len() == dst_meta.len()
                             && existing_map.get(&out.rel_path) == Some(&out.blob_hash)
                             && read_regular_nofollow(&dst).is_some_and(|(b, _)| {
@@ -3349,11 +3567,52 @@ impl TurboStore {
                 }
             }
 
-            let mode = install_verified_blob_to_path(&src, &dst, &out.blob_hash, out.size_bytes)?;
+            let mode = install_verified_blob_to_path_with_kind(
+                &src,
+                &dst,
+                &out.blob_hash,
+                out.size_bytes,
+                is_exe_bin,
+            )?;
             if existing_map.get(&out.rel_path) != Some(&out.blob_hash) {
                 db_updates.push((&out.rel_path, &out.blob_hash, mode));
             }
             linked += 1;
+        }
+
+        let output_rel_paths: std::collections::HashSet<&str> = outputs
+            .iter()
+            .filter(|o| !o.rel_path.starts_with("thm:"))
+            .map(|o| o.rel_path.as_str())
+            .collect();
+        for out in outputs {
+            if out.rel_path.starts_with("thm:") || !out.rel_path.ends_with(".trace") {
+                continue;
+            }
+            let Some((prefix, rel_no_ext)) = out.rel_path.rfind("/lib/lean/").and_then(|idx| {
+                let rest = out.rel_path[idx + "/lib/lean/".len()..].strip_suffix(".trace")?;
+                Some((&out.rel_path[..idx], rest))
+            }) else {
+                continue;
+            };
+            for suffix in ["ltar", "ltar.hash", "bc", "bc.hash"] {
+                let ir_rel = format!("{prefix}/ir/{rel_no_ext}.{suffix}");
+                if !output_rel_paths.contains(ir_rel.as_str()) {
+                    let _ = fs::remove_file(canon_root.join(&ir_rel));
+                }
+            }
+            let c_rel = format!("{prefix}/ir/{rel_no_ext}.c");
+            if !output_rel_paths.contains(c_rel.as_str()) {
+                let trace_dst = canon_root.join(&out.rel_path);
+                let trace_outputs_null = fs::read(&trace_dst)
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                    .is_some_and(|tv| tv.get("outputs") == Some(&serde_json::Value::Null));
+                if trace_outputs_null {
+                    let _ = fs::remove_file(canon_root.join(&c_rel));
+                    let _ = fs::remove_file(canon_root.join(format!("{c_rel}.hash")));
+                }
+            }
         }
 
         if db_updates.is_empty() && wt_last_seen.map(|ls| now - ls < 60).unwrap_or(false) {
@@ -6001,6 +6260,32 @@ pub(crate) fn is_non_package_lake_build_path(p: &Path) -> bool {
     false
 }
 
+pub(crate) fn is_lake_build_bin_executable_path(p: &Path) -> bool {
+    let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if fname.is_empty()
+        || fname.starts_with('.')
+        || fname.ends_with(".hash")
+        || fname.ends_with(".trace")
+        || fname.ends_with(".rsp")
+    {
+        return false;
+    }
+    let mut comps: Vec<&str> = Vec::new();
+    for c in p.components() {
+        if let std::path::Component::Normal(os) = c {
+            if let Some(s) = os.to_str() {
+                comps.push(s);
+            }
+        }
+    }
+    for i in 0..comps.len().saturating_sub(2) {
+        if comps[i] == ".lake" && comps[i + 1] == "build" && comps[i + 2] == "bin" {
+            return true;
+        }
+    }
+    false
+}
+
 /// Install a CAS blob `src` at `dst`, binding BLAKE3 digest (`expected_hash`) and byte length
 /// (`expected_len`) verification to the exact private staged inode/descriptor before atomic rename.
 pub(crate) fn install_verified_blob_to_path(
@@ -6009,7 +6294,23 @@ pub(crate) fn install_verified_blob_to_path(
     expected_hash: &str,
     expected_len: u64,
 ) -> Result<&'static str> {
-    install_blob_to_path_checked(src, dst, Some(expected_hash), Some(expected_len))
+    install_blob_to_path_checked(src, dst, Some(expected_hash), Some(expected_len), false)
+}
+
+pub(crate) fn install_verified_blob_to_path_with_kind(
+    src: &Path,
+    dst: &Path,
+    expected_hash: &str,
+    expected_len: u64,
+    force_executable: bool,
+) -> Result<&'static str> {
+    install_blob_to_path_checked(
+        src,
+        dst,
+        Some(expected_hash),
+        Some(expected_len),
+        force_executable,
+    )
 }
 
 #[cfg(test)]
@@ -6018,7 +6319,7 @@ pub(crate) fn try_reflink_or_hardlink(
     dst: &Path,
     expected_len: Option<u64>,
 ) -> Result<&'static str> {
-    install_blob_to_path_checked(src, dst, None, expected_len)
+    install_blob_to_path_checked(src, dst, None, expected_len, false)
 }
 
 fn install_blob_to_path_checked(
@@ -6026,6 +6327,7 @@ fn install_blob_to_path_checked(
     dst: &Path,
     expected_hash: Option<&str>,
     expected_len: Option<u64>,
+    force_executable: bool,
 ) -> Result<&'static str> {
     #[cfg(test)]
     if let Some(hook) = BEFORE_BLOB_INSTALL_HOOK.with(|h| h.borrow().clone()) {
@@ -6037,7 +6339,9 @@ fn install_blob_to_path_checked(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "artifact".to_string());
     let stem = format!(".{}.tl_tmp", fname);
-    let is_mutable_sidecar = fname == ".turbo_verified_sources.json"
+    let is_exe_bin = force_executable || is_lake_build_bin_executable_path(dst);
+    let is_mutable_sidecar = is_exe_bin
+        || fname == ".turbo_verified_sources.json"
         || fname.ends_with(".trace")
         || fname.ends_with(".hash")
         || fname.ends_with(".c")
@@ -6059,6 +6363,7 @@ fn install_blob_to_path_checked(
     };
 
     if is_mutable_sidecar {
+        let perm_mode = if is_exe_bin { 0o755 } else { 0o644 };
         let (src_bytes, src_file) = {
             let (mut f, meta) = open_regular_nofollow(src)
                 .with_context(|| format!("CAS source {} is not a regular file", src.display()))?;
@@ -6067,7 +6372,7 @@ fn install_blob_to_path_checked(
             verify_bytes(&b)?;
             (b, f)
         };
-        let (mut dst_file, tmp_dst) = open_unique_staging_file(parent, &stem, 0o644)?;
+        let (mut dst_file, tmp_dst) = open_unique_staging_file(parent, &stem, perm_mode)?;
         let install_res = (|| -> Result<&'static str> {
             #[cfg(target_os = "linux")]
             {
@@ -8827,7 +9132,7 @@ mod tests {
         let uv: i64 = store
             .conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
-        assert_eq!(uv, 4);
+        assert_eq!(uv, 5);
         assert!(!store.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
         assert!(store
             .record_kernel_replayed_olean("", "env1", 2, "tc1", "M", &[])
@@ -8887,6 +9192,25 @@ mod tests {
             fs::set_permissions(&key_path, fs::Permissions::from_mode(0o600))?;
             assert!(ro.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
         }
+
+        let key = store.load_verified_replay_hmac_key(&[]).expect("hmac key");
+        assert!(!store.has_kernel_audited_olean_with_key(&key, "dig1", "env1", 2, "tc1", "pol1"));
+        store.record_kernel_audited_olean("dig1", "env1", 2, "tc1", "pol1", "Root.Good", &[])?;
+        assert!(store.has_kernel_audited_olean_with_key(&key, "dig1", "env1", 2, "tc1", "pol1"));
+        assert!(!store.has_kernel_audited_olean_with_key(&key, "dig1", "env1", 2, "tc1", "pol2"));
+        store.conn.execute(
+            "INSERT INTO kernel_audited_oleans_auth (artifact_digest, environment_digest, replay_version, toolchain_hash, policy_digest, module_name, audit_mac, verified_at)
+             VALUES ('forged_aud', 'env1', 2, 'tc1', 'pol1', 'Forged', '0000000000000000000000000000000000000000000000000000000000000000', 1)",
+            [],
+        )?;
+        assert!(!store.has_kernel_audited_olean_with_key(
+            &key,
+            "forged_aud",
+            "env1",
+            2,
+            "tc1",
+            "pol1"
+        ));
 
         drop(ro);
         drop(store);

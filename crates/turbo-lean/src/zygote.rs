@@ -395,7 +395,7 @@ impl OneShotGuard {
             std::process::id(),
             next_tmp_id()
         ));
-        fs::create_dir_all(&dir)?;
+        crate::shm_cache::ensure_private_dir_all(&dir)?;
         std::env::set_var("TURBO_LEAN_STAGING_DIR", &dir);
         let _ = ONE_SHOT_DIR.set((dir, base));
         // `eval` also exits with explicit status codes, bypassing Rust Drop.
@@ -1147,20 +1147,35 @@ static ZYGOTE_POOL: std::sync::OnceLock<
 /// import pipeline, and a forced filesystem timestamp granularity. Thread-local, so parallel
 /// tests never observe each other's hooks; compiled out of non-test builds.
 #[cfg(test)]
-mod digest_test_hooks {
+pub(crate) mod digest_test_hooks {
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicI64, Ordering};
     type Hook = Box<dyn FnMut()>;
+    static FORCED_TS_GRANULARITY_SHARED_NS: AtomicI64 = AtomicI64::new(0);
     thread_local! {
         static HOOKS: RefCell<HashMap<&'static str, Hook>> = RefCell::new(HashMap::new());
-        pub(super) static FORCED_TS_GRANULARITY_NS: Cell<Option<i128>> = const { Cell::new(None) };
+        static FORCED_TS_GRANULARITY_TLS_NS: Cell<Option<i128>> = const { Cell::new(None) };
+    }
+    pub(crate) fn set_forced_ts_granularity_ns(val: Option<i128>) {
+        FORCED_TS_GRANULARITY_TLS_NS.with(|c| c.set(val));
+    }
+    pub(crate) fn set_forced_ts_granularity_shared_ns(val: Option<i64>) {
+        FORCED_TS_GRANULARITY_SHARED_NS.store(val.unwrap_or(0), Ordering::SeqCst);
+    }
+    pub(crate) fn forced_ts_granularity_ns() -> Option<i128> {
+        FORCED_TS_GRANULARITY_TLS_NS.with(|c| c.get()).or_else(|| {
+            let v = FORCED_TS_GRANULARITY_SHARED_NS.load(Ordering::SeqCst);
+            (v > 0).then_some(v as i128)
+        })
     }
     pub(super) fn set(name: &'static str, hook: impl FnMut() + 'static) {
         HOOKS.with(|h| h.borrow_mut().insert(name, Box::new(hook)));
     }
-    pub(super) fn clear() {
+    pub(crate) fn clear() {
         HOOKS.with(|h| h.borrow_mut().clear());
-        FORCED_TS_GRANULARITY_NS.with(|g| g.set(None));
+        set_forced_ts_granularity_ns(None);
+        set_forced_ts_granularity_shared_ns(None);
     }
     pub(super) fn run(name: &'static str) {
         let Some(mut hook) = HOOKS.with(|h| h.borrow_mut().remove(name)) else {
@@ -1180,19 +1195,19 @@ fn run_digest_test_hook(_name: &'static str) {
     digest_test_hooks::run(_name);
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct OleanFileStatSig {
-    dev: u64,
-    ino: u64,
-    mtime_sec: i64,
-    mtime_nsec: i64,
-    ctime_sec: i64,
-    ctime_nsec: i64,
-    size: u64,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(crate) struct OleanFileStatSig {
+    pub(crate) dev: u64,
+    pub(crate) ino: u64,
+    pub(crate) mtime_sec: i64,
+    pub(crate) mtime_nsec: i64,
+    pub(crate) ctime_sec: i64,
+    pub(crate) ctime_nsec: i64,
+    pub(crate) size: u64,
 }
 
 impl OleanFileStatSig {
-    fn from_meta(meta: &fs::Metadata) -> Self {
+    pub(crate) fn from_meta(meta: &fs::Metadata) -> Self {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -1208,7 +1223,7 @@ impl OleanFileStatSig {
             };
             // Emulate a filesystem that only stores timestamps at the forced granularity.
             #[cfg(test)]
-            if let Some(g) = digest_test_hooks::FORCED_TS_GRANULARITY_NS.with(|c| c.get()) {
+            if let Some(g) = digest_test_hooks::forced_ts_granularity_ns() {
                 let trunc = |sec: i64, nsec: i64| {
                     let ns = ((sec as i128) * 1_000_000_000 + nsec as i128).div_euclid(g) * g;
                     (
@@ -1236,7 +1251,7 @@ impl OleanFileStatSig {
         }
     }
 
-    fn ctime_ns(&self) -> i128 {
+    pub(crate) fn ctime_ns(&self) -> i128 {
         (self.ctime_sec as i128) * 1_000_000_000 + (self.ctime_nsec as i128)
     }
 }
@@ -1254,19 +1269,16 @@ impl OleanFileStatSig {
 ///
 /// Everything else re-hashes the bytes and memoizes nothing: coarse or unproven granularity
 /// (FAT, ext3, HFS+, some network/FUSE filesystems), recent `ctime`s, and non-Unix hosts.
-const STAT_TRUST_WINDOW_NS: i128 = 2_000_000_000;
+pub(crate) const STAT_TRUST_WINDOW_NS: i128 = 2_000_000_000;
 
 static TS_SUBSECOND_BY_DEV: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<u64, bool>>,
 > = std::sync::OnceLock::new();
 
 /// Whether `sig.dev` is proven to store sub-second timestamps (rule 1 above).
-fn dev_records_subsecond_timestamps(sig: &OleanFileStatSig) -> bool {
+pub(crate) fn dev_records_subsecond_timestamps(sig: &OleanFileStatSig) -> bool {
     #[cfg(test)]
-    if digest_test_hooks::FORCED_TS_GRANULARITY_NS
-        .with(|c| c.get())
-        .is_some_and(|g| g >= 1_000_000_000)
-    {
+    if digest_test_hooks::forced_ts_granularity_ns().is_some_and(|g| g >= 1_000_000_000) {
         return false;
     }
     if !cfg!(unix) {
@@ -1459,11 +1471,11 @@ fn olean_companion_paths(olean_path: &Path) -> [(&'static str, PathBuf); 5] {
 /// under, and its parsed direct imports (`None` when unreadable, unparseable or modified while
 /// read, so the closure cannot be proven complete).
 #[derive(PartialEq, Eq)]
-struct OleanEntryDigest {
+pub(crate) struct OleanEntryDigest {
     bytes: Vec<u8>,
     stats: [Option<OleanFileStatSig>; 6],
     /// Per file (`.olean`, then `olean_companion_paths` order), the BLAKE3 of its bytes.
-    hashes: [Option<String>; 6],
+    pub(crate) hashes: [Option<String>; 6],
     deps: Option<Vec<String>>,
 }
 
@@ -1622,50 +1634,49 @@ fn split_lean_path(lean_path: &str) -> Vec<&Path> {
 
 /// The imported `.olean` closure of `imports_csv`: its digest, and per module the resolved
 /// path with the entry bytes and stat tuples that produced it.
-struct ClosureSnapshot {
+pub(crate) struct ClosureSnapshot {
     lean_path: String,
     toolchain_lib: Option<PathBuf>,
     digest: String,
     /// Every module resolved, parsed, and read identically twice.
     complete: bool,
-    entries: std::collections::BTreeMap<String, Option<(PathBuf, OleanEntryDigest)>>,
+    pub(crate) entries: std::collections::BTreeMap<String, Option<(PathBuf, OleanEntryDigest)>>,
     /// Wall clock before the first read.
     taken_at_ns: i128,
     /// Per device, the `ctime` of a probe file created after the first read: any later write
     /// to a file on that device gets a `ctime` >= this fence.
     fences: std::collections::HashMap<u64, i128>,
     /// The private, content-addressed copy of the closure the worker imports, once verified.
-    materialized: Option<MaterializedClosure>,
+    pub(crate) materialized: Option<MaterializedClosure>,
     /// Materialization read other bytes than the scan hashed.
     materialize_changed: bool,
 }
 
 /// A verified, immutable copy of a closure's non-toolchain `.olean`s and companions.
-struct MaterializedClosure {
+pub(crate) struct MaterializedClosure {
     /// Digest of the snapshot's manifest: per module, every file's relative name and content
     /// hash (or absence). It labels every cache the worker's env feeds.
     label: String,
     /// The worker's only non-toolchain search root.
     #[cfg_attr(not(test), allow(dead_code))]
-    dir: PathBuf,
+    pub(crate) dir: PathBuf,
     /// Open `O_DIRECTORY | O_CLOEXEC` handle pinning `dir` by `(dev, ino)` so Linux workers
     /// import through `/proc/self/fd/<fd>` without re-traversing mutable ancestor pathnames.
     #[cfg(target_os = "linux")]
-    dir_fd: std::os::unix::io::OwnedFd,
+    pub(crate) dir_fd: std::os::unix::io::OwnedFd,
     #[cfg(target_os = "linux")]
     dir_dev_ino: (u64, u64),
     #[cfg(target_os = "linux")]
     toolchain_lib: Option<PathBuf>,
     /// The worker's canonical `LEAN_PATH`: `dir`, then the toolchain library.
     search_path: String,
-    /// Non-root ancestor directories above `dir` (`(path, dev, ino, ctime_ns, has_subsec)`),
+    /// Non-root ancestor directories above `dir` (`(path, dev, ino, ctime_ns, has_subsec, check_ctime)`),
     /// used to detect ancestor rename/symlink swaps across pathname resolution.
     #[cfg(unix)]
     ancestors: Vec<SnapshotAncestorSig>,
     #[cfg(not(unix))]
-    ancestors: Vec<(PathBuf, u64, u64, i128, bool)>,
-    /// Wall clock before ancestor verification (`STAT_TRUST_WINDOW_NS` fallback on non-Linux).
-    #[cfg_attr(target_os = "linux", allow(dead_code))]
+    ancestors: Vec<(PathBuf, u64, u64, i128, bool, bool)>,
+    /// Wall clock before ancestor verification (`STAT_TRUST_WINDOW_NS` fallback).
     taken_at_ns: i128,
     /// Every directory in the snapshot tree (`dir` and all subdirectories) and the `lstat`
     /// tuple it held after being sealed read-only (`0o500`). Any directory rename/swap or
@@ -1706,7 +1717,7 @@ fn fstatat_dir_sig(
         size: st.st_size as u64,
     };
     #[cfg(test)]
-    if let Some(g) = digest_test_hooks::FORCED_TS_GRANULARITY_NS.with(|c| c.get()) {
+    if let Some(g) = digest_test_hooks::forced_ts_granularity_ns() {
         let trunc = |sec: i64, nsec: i64| {
             let ns = ((sec as i128) * 1_000_000_000 + nsec as i128).div_euclid(g) * g;
             (
@@ -1728,7 +1739,7 @@ impl MaterializedClosure {
     fn binding(&self) -> ClosureBinding {
         let mut ordered = self.fence.is_some();
         #[cfg(unix)]
-        for (anc, dev, ino, ctime_ns, has_subsec) in &self.ancestors {
+        for (anc, dev, ino, ctime_ns, has_subsec, check_ctime) in &self.ancestors {
             use std::os::unix::fs::MetadataExt;
             let Ok(meta) = fs::symlink_metadata(anc) else {
                 return ClosureBinding::Changed;
@@ -1740,8 +1751,14 @@ impl MaterializedClosure {
             {
                 return ClosureBinding::Changed;
             }
-            #[cfg(not(target_os = "linux"))]
-            {
+            // `ancestors[0]` is `<closure_cache_base>/closure-snapshots` (whose `ctime` advances
+            // when sibling snapshots publish), and ancestors strictly above `closure_cache_base()`
+            // (such as `<cache_root>` / `TURBO_LEAN_HOME` or `/tmp`) legitimately record new store
+            // keys (`fastcheck_bins`, `.verifier_replay_hmac_key`) or sibling temp directories.
+            // Only `closure_cache_base()` itself (`check_ctime == true`), isolated in
+            // `<cache_root>/closure-realm` (`0o700`), enforces `ctime` invariance to catch ABA
+            // swaps of `closure-snapshots` within `closure_cache_base()`.
+            if *check_ctime {
                 let cur_ctime = OleanFileStatSig::from_meta(&meta).ctime_ns();
                 if cur_ctime != *ctime_ns {
                     return ClosureBinding::Changed;
@@ -1758,8 +1775,6 @@ impl MaterializedClosure {
                 };
                 ordered &= anc_ordered;
             }
-            #[cfg(target_os = "linux")]
-            let _ = (ctime_ns, has_subsec);
         }
         #[cfg(not(unix))]
         let _ = (&self.ancestors, self.taken_at_ns);
@@ -1843,7 +1858,7 @@ pub(crate) enum ClosureBinding {
     Unproven,
 }
 
-fn wall_clock_ns() -> i128 {
+pub(crate) fn wall_clock_ns() -> i128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i128)
@@ -1896,13 +1911,18 @@ impl ClosureSnapshot {
         }
         let mut fences = std::collections::HashMap::new();
         for (dev, newest_ctime) in newest {
-            for _ in 0..20 {
+            let mut prev: Option<i128> = None;
+            for _ in 0..80 {
                 match probe_ctime_fence(dev) {
                     Some(f) if f > newest_ctime => {
                         fences.insert(dev, f);
                         break;
                     }
-                    Some(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+                    Some(f) => {
+                        let wait_ms = if prev == Some(f) { 10 } else { 2 };
+                        prev = Some(f);
+                        std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                    }
                     None => break,
                 }
             }
@@ -2070,7 +2090,7 @@ fn closure_cache_base() -> PathBuf {
     if let Some(p) = TEST_CLOSURE_SNAPSHOT_CACHE_BASE.with(|c| c.borrow().clone()) {
         return p;
     }
-    crate::shm_cache::cache_root()
+    crate::shm_cache::cache_root().join("closure-realm")
 }
 
 fn closure_snapshot_root() -> PathBuf {
@@ -2142,15 +2162,22 @@ fn ensure_private_dir(dir: &Path) -> Result<PathBuf, SnapshotError> {
 }
 
 #[cfg(unix)]
-type SnapshotAncestorSig = (PathBuf, u64, u64, i128, bool);
+type SnapshotAncestorSig = (PathBuf, u64, u64, i128, bool, bool);
 
-/// Record every non-root ancestor directory above canonical `dir` (`(path, dev, ino, ctime_ns, has_subsec)`),
-/// rejecting symlinks or non-directory components.
+/// Record every non-root ancestor directory above canonical `dir`
+/// (`(path, dev, ino, ctime_ns, has_subsec, check_ctime)`), rejecting symlinks or non-directory
+/// components. `check_ctime` is enabled for private snapshot-realm ancestors at or below
+/// `canon_cache_base` above `closure-snapshots` (`depth > 0`), without pinning shared `<cache_root>`
+/// or `/tmp` directory `ctime`s.
 #[cfg(unix)]
-fn stat_snapshot_ancestors(dir: &Path) -> Result<Vec<SnapshotAncestorSig>, SnapshotError> {
+fn stat_snapshot_ancestors(
+    dir: &Path,
+    canon_cache_base: &Path,
+) -> Result<Vec<SnapshotAncestorSig>, SnapshotError> {
     use std::os::unix::fs::MetadataExt;
     let mut out = Vec::new();
     let mut cur = dir.parent();
+    let mut depth = 0usize;
     while let Some(p) = cur {
         if p == Path::new("/") || p.as_os_str().is_empty() {
             break;
@@ -2161,13 +2188,16 @@ fn stat_snapshot_ancestors(dir: &Path) -> Result<Vec<SnapshotAncestorSig>, Snaps
         }
         let sig = OleanFileStatSig::from_meta(&meta);
         let subsec = dev_records_subsecond_timestamps(&sig);
+        let check_ctime = depth > 0 && p.starts_with(canon_cache_base);
         out.push((
             p.to_path_buf(),
             meta.dev(),
             meta.ino(),
             sig.ctime_ns(),
             subsec,
+            check_ctime,
         ));
+        depth += 1;
         cur = p.parent();
     }
     Ok(out)
@@ -2176,8 +2206,9 @@ fn stat_snapshot_ancestors(dir: &Path) -> Result<Vec<SnapshotAncestorSig>, Snaps
 #[cfg(not(unix))]
 fn stat_snapshot_ancestors(
     dir: &Path,
-) -> Result<Vec<(PathBuf, u64, u64, i128, bool)>, SnapshotError> {
-    let _ = dir;
+    canon_cache_base: &Path,
+) -> Result<Vec<(PathBuf, u64, u64, i128, bool, bool)>, SnapshotError> {
+    let _ = (dir, canon_cache_base);
     Err(SnapshotError::Io)
 }
 
@@ -2362,35 +2393,35 @@ fn materialize_closure(
     let finish = |verified_dirs: Vec<(PathBuf, OleanFileStatSig)>,
                   verified_files: Vec<(PathBuf, OleanFileStatSig)>|
      -> Result<MaterializedClosure, SnapshotError> {
+        let _ = ensure_private_dir(&root.join(CLOSURE_BLOB_DIR))?;
+        let fence_probe_dir = ensure_private_dir(&root.join(CLOSURE_SNAPSHOT_USAGE_DIR))?;
+        let canon_cache_base = root.parent().unwrap_or(&root);
         let taken_at_ns = wall_clock_ns();
-        let ancestors = stat_snapshot_ancestors(&dir)?;
+        let ancestors = stat_snapshot_ancestors(&dir, canon_cache_base)?;
         #[cfg(target_os = "linux")]
         let (dir_fd, dir_dev_ino) = {
             let (_, root_sig) = verified_dirs.last().ok_or(SnapshotError::Changed)?;
             let (fd, dev_ino) = open_pinned_snapshot_dir(&dir, root_sig)?;
-            if stat_snapshot_ancestors(&dir)? != ancestors {
+            if stat_snapshot_ancestors(&dir, canon_cache_base)? != ancestors {
                 return Err(SnapshotError::Changed);
             }
             (fd, dev_ino)
         };
-        #[allow(unused_mut)]
         let mut newest = verified_dirs
             .iter()
             .chain(&verified_files)
             .map(|(_, s)| s.ctime_ns())
             .max()
             .unwrap_or(i128::MIN);
-        #[cfg(not(target_os = "linux"))]
-        {
-            let root_dev = verified_dirs.last().map_or(0, |(_, s)| s.dev);
-            for (_, adev, _, actime, _) in &ancestors {
-                if *adev == root_dev {
-                    newest = newest.max(*actime);
-                }
+        let root_dev = verified_dirs.last().map_or(0, |(_, s)| s.dev);
+        for (_, adev, _, actime, _, check_ctime) in &ancestors {
+            if *check_ctime && *adev == root_dev {
+                newest = newest.max(*actime);
             }
         }
+        let fence = fence_after_in(&fence_probe_dir, newest);
         Ok(MaterializedClosure {
-            fence: fence_after_in(&root, newest),
+            fence,
             label: label.clone(),
             dir: dir.clone(),
             #[cfg(target_os = "linux")]
@@ -2444,7 +2475,7 @@ fn materialize_closure(
                 #[cfg(not(unix))]
                 fs::create_dir_all(parent)?;
             }
-            fs::hard_link(ensure_closure_blob(&blobs, hash, src)?, &dst)?;
+            copy_verified_snapshot_file(&blobs, hash, src, &dst)?;
         }
         Ok(())
     })();
@@ -2476,6 +2507,22 @@ fn materialize_closure(
 
 const CLOSURE_BLOB_DIR: &str = "blobs";
 
+/// Populate `dst` as a snapshot-private read-only inode holding `hash` (reflink/copy from the
+/// verified blob cache, never a shared hardlink whose `ctime` would advance on sibling link/unlink).
+fn copy_verified_snapshot_file(
+    blobs: &Path,
+    hash: &str,
+    src: &Path,
+    dst: &Path,
+) -> Result<(), SnapshotError> {
+    let blob = ensure_closure_blob(blobs, hash, src)?;
+    copy_file_reflink(&blob, dst).map_err(|_| SnapshotError::Changed)?;
+    let mut perms = fs::metadata(dst)?.permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(dst, perms)?;
+    Ok(())
+}
+
 /// The verified blob holding `hash`, copied from `src` if not yet present.
 fn ensure_closure_blob(blobs: &Path, hash: &str, src: &Path) -> Result<PathBuf, SnapshotError> {
     let blob = blobs.join(hash);
@@ -2483,7 +2530,9 @@ fn ensure_closure_blob(blobs: &Path, hash: &str, src: &Path) -> Result<PathBuf, 
         Ok(Some(r)) if r.hash == hash && r.stable => return Ok(blob),
         Ok(None) => {}
         // Not what its name says: replace it.
-        _ => fs::remove_file(&blob)?,
+        _ => {
+            let _ = fs::remove_file(&blob);
+        }
     }
     let tmp = blobs.join(format!(".tmp-{}-{}", std::process::id(), next_tmp_id()));
     let res = (|| -> Result<(), SnapshotError> {
@@ -2496,6 +2545,26 @@ fn ensure_closure_blob(blobs: &Path, hash: &str, src: &Path) -> Result<PathBuf, 
         match read_file_digest(&tmp) {
             Ok(Some(r)) if r.hash == hash && r.stable => {}
             _ => return Err(SnapshotError::Changed),
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let c_tmp = std::ffi::CString::new(tmp.as_os_str().as_bytes())
+                .map_err(|_| SnapshotError::Io)?;
+            let c_blob = std::ffi::CString::new(blob.as_os_str().as_bytes())
+                .map_err(|_| SnapshotError::Io)?;
+            if unsafe { libc::link(c_tmp.as_ptr(), c_blob.as_ptr()) } == 0 {
+                let _ = fs::remove_file(&tmp);
+                return Ok(());
+            }
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::AlreadyExists {
+                if let Ok(Some(r)) = read_file_digest(&blob) {
+                    if r.hash == hash && r.stable {
+                        let _ = fs::remove_file(&tmp);
+                        return Ok(());
+                    }
+                }
+            }
         }
         fs::rename(&tmp, &blob)?;
         Ok(())
@@ -2528,10 +2597,15 @@ fn copy_file_reflink(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// A probe `ctime` in `dir` strictly newer than `newest` (re-probed briefly, as `ctime` comes
 /// from a coarse clock); see `ClosureSnapshot::take`.
 fn fence_after_in(dir: &Path, newest: i128) -> Option<i128> {
-    for _ in 0..20 {
+    let mut prev: Option<i128> = None;
+    for _ in 0..80 {
         match probe_ctime_in(dir) {
             Some(f) if f > newest => return Some(f),
-            Some(_) => std::thread::sleep(std::time::Duration::from_millis(2)),
+            Some(f) => {
+                let wait_ms = if prev == Some(f) { 10 } else { 2 };
+                prev = Some(f);
+                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+            }
             None => return None,
         }
     }
@@ -3163,6 +3237,14 @@ pub(crate) fn private_shared_zygote_dir() -> Option<PathBuf> {
 }
 
 fn private_shared_zygote_dir_in(base: &Path) -> Option<PathBuf> {
+    private_temp_subdir_in(base, "turbo_lean_shared_zygote_bins")
+}
+
+pub(crate) fn private_temp_subdir(prefix: &str) -> Option<PathBuf> {
+    private_temp_subdir_in(&std::env::temp_dir(), prefix)
+}
+
+fn private_temp_subdir_in(base: &Path, prefix: &str) -> Option<PathBuf> {
     #[cfg(unix)]
     let uid = unsafe { libc::geteuid() };
     #[cfg(not(unix))]
@@ -3181,7 +3263,7 @@ fn private_shared_zygote_dir_in(base: &Path) -> Option<PathBuf> {
                 return None;
             }
         }
-        let dir = base.join(format!("turbo_lean_shared_zygote_bins_{uid}"));
+        let dir = base.join(format!("{prefix}_{uid}"));
         match fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -3191,7 +3273,7 @@ fn private_shared_zygote_dir_in(base: &Path) -> Option<PathBuf> {
     };
     #[cfg(not(unix))]
     let dir = {
-        let dir = base.join(format!("turbo_lean_shared_zygote_bins_{uid}"));
+        let dir = base.join(format!("{prefix}_{uid}"));
         let _ = fs::create_dir_all(&dir);
         dir
     };
@@ -3220,7 +3302,7 @@ pub(crate) fn ensure_zygote_binary_at(
     let env_vars = &env_vars;
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"turbo-zygote:v4:absolute-tools:");
+    hasher.update(b"turbo-zygote:v5:hybrid-opt-tools:");
     hasher.update(std::env::consts::ARCH.as_bytes());
     hasher.update(lean_bin.to_string_lossy().as_bytes());
     if let Some(tc) = env_vars.get("ELAN_TOOLCHAIN") {
@@ -3232,8 +3314,19 @@ pub(crate) fn ensure_zygote_binary_at(
     let bin_name = format!("turbo_zygote_{}", &hasher.finalize().to_hex()[..16]);
     let bin_dir = store_root.join("fastcheck_bins");
     fs::create_dir_all(&bin_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if let Ok(m) = fs::symlink_metadata(&bin_dir) {
+            if m.is_dir() && m.uid() == unsafe { libc::geteuid() } && m.mode() & 0o077 != 0 {
+                let mut p = m.permissions();
+                p.set_mode(0o700);
+                let _ = fs::set_permissions(&bin_dir, p);
+            }
+        }
+    }
     let cached_bin = bin_dir.join(&bin_name);
-    if cached_bin.exists() {
+    if owned_private_file(&cached_bin) {
         return Ok(cached_bin);
     }
 
@@ -3248,14 +3341,17 @@ pub(crate) fn ensure_zygote_binary_at(
         })
         .flatten();
 
-    if cached_bin.exists() {
+    if owned_private_file(&cached_bin) {
         return Ok(cached_bin);
+    }
+    if cached_bin.symlink_metadata().is_ok() {
+        let _ = fs::remove_file(&cached_bin);
     }
     if let Some(shared_bin) = shared_bin.as_ref().filter(|b| owned_private_file(b)) {
         let tmp_copy = bin_dir.join(format!(".{}.{}.tmp", bin_name, next_tmp_id()));
         if fs::hard_link(shared_bin, &tmp_copy).is_ok() || fs::copy(shared_bin, &tmp_copy).is_ok() {
             let _ = fs::rename(&tmp_copy, &cached_bin);
-            if cached_bin.exists() {
+            if owned_private_file(&cached_bin) {
                 return Ok(cached_bin);
             }
         }
@@ -3298,11 +3394,11 @@ pub(crate) fn ensure_zygote_binary_at(
     };
     compile_env.insert("LEAN_PATH".to_string(), scratch_lp);
 
-    let mut c_files = Vec::with_capacity(3);
-    for (stem, src, emit_olean) in [
-        ("Blake3", BLAKE3_LEAN_SRC, true),
-        ("StatementHash", STATEMENT_HASH_LEAN_SRC, true),
-        ("ZygoteWorker", ZYGOTE_WORKER_LEAN_SRC, false),
+    let mut obj_files = Vec::with_capacity(3);
+    for (stem, src, emit_olean, c_opt) in [
+        ("Blake3", BLAKE3_LEAN_SRC, true, "-O3"),
+        ("StatementHash", STATEMENT_HASH_LEAN_SRC, true, "-O3"),
+        ("ZygoteWorker", ZYGOTE_WORKER_LEAN_SRC, false, "-O0"),
     ] {
         let lean_file = if emit_olean {
             scratch_pkg.join(format!("{stem}.lean"))
@@ -3310,6 +3406,7 @@ pub(crate) fn ensure_zygote_binary_at(
             scratch_dir.join(format!("ZygoteWorker_{tmp_id}.lean"))
         };
         let c_file = scratch_dir.join(format!("{stem}_{tmp_id}.c"));
+        let obj_file = scratch_dir.join(format!("{stem}_{tmp_id}.o"));
         fs::write(&lean_file, src)?;
         let mut cmd = Command::new(lean_bin);
         cmd.arg(format!("--root={}", scratch_dir.display()));
@@ -3325,18 +3422,32 @@ pub(crate) fn ensure_zygote_binary_at(
             .output()
             .with_context(|| format!("Failed to compile {stem}.lean to C"))?;
         if !out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            anyhow::bail!("`lean -c` failed on {stem}.lean:\n{stdout}{stderr}");
+        }
+        let c_out = Command::new(leanc_bin)
+            .arg(c_opt)
+            .arg("-c")
+            .arg(&c_file)
+            .arg("-o")
+            .arg(&obj_file)
+            .current_dir(&scratch_dir)
+            .envs(&compile_env)
+            .output()
+            .with_context(|| format!("Failed to compile {stem}.c via `leanc {c_opt} -c`"))?;
+        if !c_out.status.success() {
             anyhow::bail!(
-                "`lean -c` failed on {stem}.lean:\n{}",
-                String::from_utf8_lossy(&out.stderr)
+                "`leanc {c_opt} -c` failed on {stem}.c:\n{}",
+                String::from_utf8_lossy(&c_out.stderr)
             );
         }
-        c_files.push(c_file);
+        obj_files.push(obj_file);
     }
 
     let mut link_cmd = Command::new(leanc_bin);
-    link_cmd.arg("-O3");
-    for c_file in &c_files {
-        link_cmd.arg(c_file);
+    for obj_file in &obj_files {
+        link_cmd.arg(obj_file);
     }
     link_cmd
         .arg("-lleanshared")
@@ -3448,24 +3559,40 @@ pub(crate) struct PinnedFfiPackage {
     pub decls: &'static [(&'static str, &'static str)],
 }
 
-pub(crate) const PINNED_FFI_PACKAGES: &[PinnedFfiPackage] = &[PinnedFfiPackage {
-    name: "lean-sys",
-    url: "https://github.com/Th0rgal/lean-sys.git",
-    rev: "077775ba387f1eeb2976cb8763b4633b8d5ce313",
-    module: "LeanSys.Posix",
-    rel_src: "LeanSys/Posix.lean",
-    src_sha256: "35aacd3f54a985e2365de92eea17d167a2945538c0533cebf2a44338936ce2d8",
-    decls: &[
-        ("LeanSys.Posix.rawOpenFlock", "leansys_open_flock"),
-        ("LeanSys.Posix.rawFsCloneOrLink", "leansys_fs_clone_or_link"),
-        ("LeanSys.Posix.rawWriteAll", "leansys_write_all"),
-        ("LeanSys.Posix.rawPreadBa", "leansys_pread_ba"),
-        ("LeanSys.Posix.rawSpawnGroup", "leansys_spawn_group"),
-        ("LeanSys.Posix.rawKillWaitGroup", "leansys_kill_wait_group"),
-        ("LeanSys.Posix.rawNetListen", "leansys_net_listen"),
-        ("LeanSys.Posix.rawNetAcceptPoll", "leansys_net_accept_poll"),
-    ],
-}];
+pub(crate) const PINNED_FFI_PACKAGES: &[PinnedFfiPackage] = &[
+    PinnedFfiPackage {
+        name: "lean-sys",
+        url: "https://github.com/Th0rgal/lean-sys.git",
+        rev: "077775ba387f1eeb2976cb8763b4633b8d5ce313",
+        module: "LeanSys.Posix",
+        rel_src: "LeanSys/Posix.lean",
+        src_sha256: "35aacd3f54a985e2365de92eea17d167a2945538c0533cebf2a44338936ce2d8",
+        decls: &[
+            ("LeanSys.Posix.rawOpenFlock", "leansys_open_flock"),
+            ("LeanSys.Posix.rawFsCloneOrLink", "leansys_fs_clone_or_link"),
+            ("LeanSys.Posix.rawWriteAll", "leansys_write_all"),
+            ("LeanSys.Posix.rawPreadBa", "leansys_pread_ba"),
+            ("LeanSys.Posix.rawSpawnGroup", "leansys_spawn_group"),
+            ("LeanSys.Posix.rawKillWaitGroup", "leansys_kill_wait_group"),
+            ("LeanSys.Posix.rawNetListen", "leansys_net_listen"),
+            ("LeanSys.Posix.rawNetAcceptPoll", "leansys_net_accept_poll"),
+        ],
+    },
+    PinnedFfiPackage {
+        name: "evmyul",
+        url: "https://github.com/lfglabs-dev/EVMYulLean.git",
+        rev: "a132798069be50e8b03f88d6a96f2618c128ae7f",
+        module: "EvmYul.FFI.ffi",
+        rel_src: "EvmYul/FFI/ffi.lean",
+        src_sha256: "c0b6b455399a476fd3c5be3fd3e1df5788a112dd92b520397512d073b6317562",
+        decls: &[
+            ("ffi.sha256", "sha256"),
+            ("ffi.BLAKE2Compress", "blake2compressb64"),
+            ("ffi.ByteArray.zeroes", "memset_zero"),
+            ("ffi.keccak256", "keccak256"),
+        ],
+    },
+];
 
 pub(crate) fn pinned_ffi_allow_args(
     cfg: &crate::module_builder::ProjectConfig,
@@ -3532,6 +3659,268 @@ fn audit_batch_size() -> usize {
         .unwrap_or(8)
 }
 
+/// Materialize an immutable `ClosureSnapshot` over `mod_names` (and their full transitive
+/// non-toolchain `.olean` closure) so multi-phase kernel replay, `--skip-child-replay` policy
+/// audit, and `TurboStore` authority recording all read the exact same sealed snapshot bytes.
+pub(crate) fn materialize_bound_audit_closure(
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+) -> Result<ClosureSnapshot> {
+    let tc_opt = (!cfg.toolchain_lib_lean.as_os_str().is_empty())
+        .then_some(cfg.toolchain_lib_lean.as_path());
+    let csv = mod_names.join(",");
+    let mut snap = ClosureSnapshot::take(&csv, lean_path_env, tc_opt);
+    snap.materialize(tc_opt);
+    anyhow::ensure!(
+        snap.materialized.is_some() && snap.binding() == ClosureBinding::Bound,
+        "Failed to bind immutable `.olean` closure snapshot across kernel replay/audit phases (concurrent artifact mutation or incomplete closure): fail-closed"
+    );
+    Ok(snap)
+}
+
+pub(crate) fn ensure_bound_audit_closure(
+    snap: &ClosureSnapshot,
+    phase: &'static str,
+) -> Result<(String, PathBuf)> {
+    run_digest_test_hook(phase);
+    let Some(ref mat) = snap.materialized else {
+        anyhow::bail!(
+            "Immutable `.olean` closure snapshot missing materialized directory before `{}`: fail-closed",
+            phase
+        );
+    };
+    anyhow::ensure!(
+        snap.binding() == ClosureBinding::Bound,
+        "Immutable `.olean` closure snapshot lost binding before `{}`: fail-closed",
+        phase
+    );
+    Ok((mat.search_path.clone(), mat.dir.clone()))
+}
+
+pub(crate) fn snapshot_parent_search_path(snap: &ClosureSnapshot) -> Option<String> {
+    let mat = snap.materialized.as_ref()?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let fd_root = format!("/proc/self/fd/{}", mat.dir_fd.as_raw_fd());
+        Some(match &mat.toolchain_lib {
+            Some(t) => format!("{fd_root}:{}", t.display()),
+            None => fd_root,
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Some(mat.search_path.clone())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn snapshot_pinned_dir_raw_fd(
+    snap: &ClosureSnapshot,
+) -> Option<std::os::unix::io::RawFd> {
+    use std::os::unix::io::AsRawFd;
+    snap.materialized.as_ref().map(|m| m.dir_fd.as_raw_fd())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn snapshot_pinned_dir_raw_fd(_snap: &ClosureSnapshot) -> Option<i32> {
+    None
+}
+
+fn ensure_live_closure_matches_snapshot(snap: &ClosureSnapshot, phase: &'static str) -> Result<()> {
+    let _ = ensure_bound_audit_closure(snap, phase)?;
+    anyhow::ensure!(
+        snap.rebind() != ClosureBinding::Changed,
+        "Caller live `.olean` closure mutated or swapped during `{}` relative to verified closure snapshot: fail-closed",
+        phase
+    );
+    Ok(())
+}
+
+pub(crate) fn snapshot_module_artifact_set_digest(
+    snap: &ClosureSnapshot,
+    mod_name: &str,
+) -> Option<String> {
+    let (_, entry) = snap.entries.get(mod_name)?.as_ref()?;
+    let mut h = blake3::Hasher::new();
+    h.update(b"olean-art-v2\n");
+    let main_hex = entry.hashes[0].as_deref()?;
+    let mut main_bytes = [0u8; 32];
+    for (i, b) in main_bytes.iter_mut().enumerate() {
+        *b = u8::from_str_radix(main_hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    h.update(&(5u64).to_le_bytes());
+    h.update(b"olean");
+    h.update(&(32u64).to_le_bytes());
+    h.update(&main_bytes);
+    // `OleanEntryDigest::hashes` order: [0]=olean, [1]=srv, [2]=priv, [3]=ilean, [4]=ir_sig, [5]=ir.
+    // `olean_artifact_paths` order:     [0]=olean, [1]=srv, [2]=priv, [3]=ilean, [4]=ir,     [5]=ir_sig.
+    for (tag, hash_idx) in [
+        ("srv", 1usize),
+        ("priv", 2),
+        ("ilean", 3),
+        ("ir", 5),
+        ("ir_sig", 4),
+    ] {
+        match entry.hashes[hash_idx].as_deref() {
+            Some(hex) => {
+                let mut hb = [0u8; 32];
+                for (i, b) in hb.iter_mut().enumerate() {
+                    *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+                }
+                h.update(&[1u8]);
+                h.update(&(tag.len() as u64).to_le_bytes());
+                h.update(tag.as_bytes());
+                h.update(&(32u64).to_le_bytes());
+                h.update(&hb);
+            }
+            None => {
+                h.update(&[0u8]);
+                h.update(&(tag.len() as u64).to_le_bytes());
+                h.update(tag.as_bytes());
+                h.update(&(0u64).to_le_bytes());
+            }
+        }
+    }
+    Some(h.finalize().to_hex().to_string())
+}
+
+pub(crate) fn validate_untrusted_audit_caller_paths(
+    cfg: &crate::module_builder::ProjectConfig,
+    lean_path_env: &str,
+    extra_ro_binds: &[PathBuf],
+) -> Result<()> {
+    let tc_prefix = cfg
+        .toolchain_lib
+        .parent()
+        .filter(|p| p.is_dir() && p.is_absolute() && *p != Path::new("/"))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Invalid toolchain prefix `{}` for bubblewrap sandbox: fail-closed sandbox gate",
+                cfg.toolchain_lib.display()
+            )
+        })?;
+    let bootstrap_env = build_auditor_bootstrap_env(cfg);
+    let auditor_ld_library_path = bootstrap_env
+        .get("LD_LIBRARY_PATH")
+        .map(String::as_str)
+        .unwrap_or("");
+    if extra_ro_binds.is_empty() {
+        crate::module_builder::validate_untrusted_sandbox_search_paths(
+            cfg,
+            tc_prefix,
+            lean_path_env,
+            auditor_ld_library_path,
+        )?;
+    }
+    Ok(())
+}
+
+pub(crate) fn record_snapshot_modules_in_store(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    snap: &ClosureSnapshot,
+    replayed_mods: &[String],
+    audited_mods: &[String],
+    live_lean_path_env: &str,
+    extra_root_lib: Option<&Path>,
+) -> Result<()> {
+    let (snap_lp, _) = ensure_bound_audit_closure(snap, "audit_record_authority")?;
+    let parent_snap_lp = snapshot_parent_search_path(snap).unwrap_or(snap_lp);
+    let live_batch = crate::module_builder::ReplayLookupBatchCache::new_with_extra_root_lib(
+        store,
+        cfg,
+        live_lean_path_env,
+        extra_root_lib,
+    );
+    let mut snap_batch = crate::module_builder::ReplayLookupBatchCache::new_with_extra_root_lib(
+        store,
+        cfg,
+        &parent_snap_lp,
+        extra_root_lib,
+    );
+    fn resolve_binds_policy(
+        snap: &ClosureSnapshot,
+        snap_batch: &mut crate::module_builder::ReplayLookupBatchCache,
+        live_batch: &crate::module_builder::ReplayLookupBatchCache,
+        m: &str,
+    ) -> Result<(PathBuf, bool)> {
+        let Some(snap_olean) = snap_batch.resolve_module_olean(m) else {
+            anyhow::bail!(
+                "Verified module `{}` missing `.olean` in bound closure snapshot: fail-closed",
+                m
+            );
+        };
+        let Some((ref orig_olean, _)) = snap.entries.get(m).and_then(|e| e.as_ref()) else {
+            anyhow::bail!(
+                "Verified module `{}` missing origin entry in bound closure snapshot: fail-closed",
+                m
+            );
+        };
+        Ok((snap_olean, live_batch.is_root_module_olean(orig_olean)))
+    }
+    for m in replayed_mods {
+        let (snap_olean, binds_policy) =
+            resolve_binds_policy(snap, &mut snap_batch, &live_batch, m)?;
+        let dig = crate::module_builder::compute_replayed_olean_ilean_digest(&snap_olean)
+            .with_context(|| {
+                format!(
+                    "Failed to compute snapshot `.olean`+`.ilean` digest for `{}`",
+                    m
+                )
+            })?;
+        let env_dig = snap_batch
+            .compute_env_digest_with_binds_policy(cfg, &snap_olean, binds_policy)
+            .with_context(|| {
+                format!(
+                    "Failed to compute snapshot transitive import environment digest for `{}`",
+                    m
+                )
+            })?;
+        ensure_bound_audit_closure(snap, "audit_record_replayed_post")?;
+        store.record_kernel_replayed_olean(
+            &dig,
+            &env_dig,
+            ZYGOTE_REPLAY_VERSION,
+            &cfg.lean_githash,
+            m,
+            live_batch.disallowed_roots(),
+        )?;
+    }
+    for m in audited_mods {
+        let (snap_olean, binds_policy) =
+            resolve_binds_policy(snap, &mut snap_batch, &live_batch, m)?;
+        let dig = crate::module_builder::compute_replayed_olean_ilean_digest(&snap_olean)
+            .with_context(|| {
+                format!(
+                    "Failed to compute snapshot `.olean`+`.ilean` digest for `{}`",
+                    m
+                )
+            })?;
+        let env_dig = snap_batch
+            .compute_env_digest_with_binds_policy(cfg, &snap_olean, binds_policy)
+            .with_context(|| {
+                format!(
+                    "Failed to compute snapshot transitive import environment digest for `{}`",
+                    m
+                )
+            })?;
+        let policy_dig = compute_module_audit_policy_digest(cfg, m);
+        ensure_bound_audit_closure(snap, "audit_record_audited_post")?;
+        store.record_kernel_audited_olean(
+            &dig,
+            &env_dig,
+            ZYGOTE_REPLAY_VERSION,
+            &cfg.lean_githash,
+            &policy_dig,
+            m,
+            live_batch.disallowed_roots(),
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn audit_compiled_modules_with_zygote(
     store: &TurboStore,
     cfg: &crate::module_builder::ProjectConfig,
@@ -3566,100 +3955,723 @@ pub(crate) fn audit_compiled_modules_with_zygote_options(
     let mut sorted: Vec<String> = mod_names.to_vec();
     sorted.sort();
     sorted.dedup();
-    for chunk in sorted.chunks(audit_batch_size()) {
-        audit_compiled_module_batch(
-            store,
-            cfg,
-            chunk,
-            lean_path_env,
-            extra_ro_binds,
-            is_untrusted,
-            allow_sorry_axiom,
-        )?;
+    if is_untrusted {
+        // Validate the caller's live search paths against the untrusted sandbox gate first, then
+        // bind-mount only the immutable `ClosureSnapshot` directory inside `bwrap` so multi-module
+        // closure pre-replay and `--skip-child-replay` policy audit read identical sealed bytes.
+        validate_untrusted_audit_caller_paths(cfg, lean_path_env, extra_ro_binds)?;
     }
-    Ok(())
-}
-
-fn record_replayed_modules_in_store(
-    store: &TurboStore,
-    cfg: &crate::module_builder::ProjectConfig,
-    mod_names: &[String],
-    lean_path_env: &str,
-) -> Result<()> {
-    let disallowed_roots = crate::module_builder::project_disallowed_replay_store_roots(cfg);
-    let dirs: Vec<PathBuf> = std::env::split_paths(lean_path_env).collect();
-    for m in mod_names {
-        let rel_slash = crate::module_builder::module_name_to_rel_slash(m);
-        let rel_olean = format!("{}.olean", rel_slash);
-        let Some(olean_path) = dirs
-            .iter()
-            .map(|d| d.join(&rel_olean))
-            .find(|p| p.is_file())
-        else {
-            anyhow::bail!(
-                "Replayed module `{}` missing `.olean` along auditor LEAN_PATH: fail-closed",
-                m
-            );
+    let snap = materialize_bound_audit_closure(cfg, &sorted, lean_path_env)?;
+    let (snap_lp, snap_dir) = ensure_bound_audit_closure(&snap, "audit_before_replay")?;
+    let pinned_fd = snapshot_pinned_dir_raw_fd(&snap);
+    let parent_snap_lp = snapshot_parent_search_path(&snap).unwrap_or_else(|| snap_lp.clone());
+    let snap_binds: Vec<PathBuf> = if is_untrusted {
+        vec![snap_dir]
+    } else {
+        Vec::new()
+    };
+    // Pre-replay multi-module batches via topological `--kernel-replay-closure` slices against
+    // the sealed snapshot `LEAN_PATH` so `--audit-modules --skip-child-replay` and authority
+    // recording read the exact same immutable bytes.
+    let pre_replayed = if sorted.len() > 1 {
+        let replay_lp = if is_untrusted {
+            &snap_lp
+        } else {
+            &parent_snap_lp
         };
-        let dig = crate::module_builder::compute_replayed_olean_ilean_digest(&olean_path)
-            .with_context(|| {
-                format!(
-                    "Failed to compute post-replay `.olean`+`.ilean` digest for `{}`",
-                    m
-                )
-            })?;
-        let env_dig = crate::module_builder::compute_olean_transitive_env_digest(
+        kernel_replay_modules_exec_pinned(
+            &store.root,
             cfg,
-            lean_path_env,
-            &olean_path,
-        )
-        .with_context(|| {
-            format!(
-                "Failed to compute post-replay transitive import environment digest for `{}`",
-                m
-            )
-        })?;
-        store.record_kernel_replayed_olean(
-            &dig,
-            &env_dig,
-            ZYGOTE_REPLAY_VERSION,
-            &cfg.lean_githash,
-            m,
-            &disallowed_roots,
+            &sorted,
+            replay_lp,
+            &snap_binds,
+            is_untrusted,
+            pinned_fd,
         )?;
+        true
+    } else {
+        false
+    };
+    let _ = ensure_bound_audit_closure(&snap, "audit_after_replay")?;
+    let batch_sz = if pre_replayed && !is_untrusted {
+        audit_batch_size().max(32)
+    } else {
+        audit_batch_size()
+    };
+    let chunks: Vec<&[String]> = sorted.chunks(batch_sz).collect();
+    let should_record_chunk = |chunk: &[String]| -> bool {
+        !is_untrusted
+            && !allow_sorry_axiom
+            && extra_ro_binds.is_empty()
+            && !chunk.is_empty()
+            && chunk
+                .iter()
+                .all(|m| snap.entries.get(m).and_then(|e| e.as_ref()).is_some())
+    };
+    if is_untrusted || chunks.len() <= 1 {
+        for chunk in chunks {
+            let (chunk_lp, _) = ensure_bound_audit_closure(&snap, "audit_before_chunk")?;
+            audit_compiled_module_batch_exec_pinned(
+                &store.root,
+                cfg,
+                chunk,
+                &chunk_lp,
+                &snap_binds,
+                is_untrusted,
+                allow_sorry_axiom,
+                pre_replayed,
+                pinned_fd,
+            )?;
+            let _ = ensure_bound_audit_closure(&snap, "audit_after_chunk")?;
+            if should_record_chunk(chunk) {
+                record_snapshot_modules_in_store(
+                    store,
+                    cfg,
+                    &snap,
+                    chunk,
+                    chunk,
+                    lean_path_env,
+                    None,
+                )?;
+            }
+        }
+        return ensure_live_closure_matches_snapshot(&snap, "audit_complete");
     }
-    Ok(())
+    let parallelism = std::env::var("TURBO_LEAN_JOBS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            if pre_replayed {
+                cores
+            } else {
+                cores.div_ceil(4).max(1)
+            }
+        })
+        .min(chunks.len());
+    if parallelism <= 1 {
+        for chunk in chunks {
+            let (chunk_lp, _) = ensure_bound_audit_closure(&snap, "audit_before_chunk")?;
+            audit_compiled_module_batch_exec_pinned(
+                &store.root,
+                cfg,
+                chunk,
+                &chunk_lp,
+                &[],
+                false,
+                allow_sorry_axiom,
+                pre_replayed,
+                pinned_fd,
+            )?;
+            let _ = ensure_bound_audit_closure(&snap, "audit_after_chunk")?;
+            if should_record_chunk(chunk) {
+                record_snapshot_modules_in_store(
+                    store,
+                    cfg,
+                    &snap,
+                    chunk,
+                    chunk,
+                    lean_path_env,
+                    None,
+                )?;
+            }
+        }
+        return ensure_live_closure_matches_snapshot(&snap, "audit_complete");
+    }
+    let bootstrap_env = build_auditor_bootstrap_env(cfg);
+    let _ = ensure_zygote_binary_at(&store.root, &cfg.lean_bin, &bootstrap_env)?;
+    let store_root = store.root.clone();
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let first_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+    let record_lock: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    std::thread::scope(|s| {
+        for _ in 0..parallelism {
+            s.spawn(|| loop {
+                if first_err.lock().map(|g| g.is_some()).unwrap_or(true) {
+                    break;
+                }
+                let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if idx >= chunks.len() {
+                    break;
+                }
+                let chunk = chunks[idx];
+                let res = ensure_bound_audit_closure(&snap, "audit_before_chunk").and_then(
+                    |(chunk_lp, _)| {
+                        audit_compiled_module_batch_exec_pinned(
+                            &store_root,
+                            cfg,
+                            chunk,
+                            &chunk_lp,
+                            &[],
+                            false,
+                            allow_sorry_axiom,
+                            pre_replayed,
+                            pinned_fd,
+                        )?;
+                        let _ = ensure_bound_audit_closure(&snap, "audit_after_chunk")?;
+                        Ok(())
+                    },
+                );
+                let res = res.and_then(|()| {
+                    if should_record_chunk(chunk) {
+                        let _guard = record_lock
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("audit record mutex poisoned"))?;
+                        let worker_store = TurboStore::open(Some(&store_root))?;
+                        record_snapshot_modules_in_store(
+                            &worker_store,
+                            cfg,
+                            &snap,
+                            chunk,
+                            chunk,
+                            lean_path_env,
+                            None,
+                        )?;
+                    }
+                    Ok(())
+                });
+                if let Err(e) = res {
+                    if let Ok(mut g) = first_err.lock() {
+                        if g.is_none() {
+                            *g = Some(e);
+                        }
+                    }
+                    break;
+                }
+            });
+        }
+    });
+    if let Some(e) = first_err.into_inner().ok().flatten() {
+        return Err(e);
+    }
+    ensure_live_closure_matches_snapshot(&snap, "audit_complete")
 }
 
-/// Independent kernel replay (`--kernel-replay-module`, one child per module so import regions
-/// are reclaimed between modules) of trusted dependency artifacts that skip the full policy
-/// audit: their declarations are rechecked against their imports before anything imports them.
-pub(crate) fn kernel_replay_modules_with_zygote(
+/// Unified closure replay + soundness audit for `certify_head_statement_modules_and_replay` in
+/// trusted mode: replays `audit_mods ∪ replay_only_mods` together in a single topological closure
+/// batch pass so interleaved packages (e.g. `Verity.Core` -> `Compiler.*` -> `Verity.Macro`) do not
+/// taint/fragment each other's closure slices, then runs `--audit-modules --skip-child-replay` over
+/// `audit_mods` only and persists replay authority for both sets (including `extra_root_lib`
+/// overlay `.olean` roots).
+pub(crate) fn replay_and_audit_modules_with_zygote(
     store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    audit_mods: &[String],
+    replay_only_mods: &[String],
+    lean_path_env: &str,
+    extra_root_lib: Option<&Path>,
+) -> Result<()> {
+    let mut sorted_audit: Vec<String> = audit_mods.to_vec();
+    sorted_audit.sort();
+    sorted_audit.dedup();
+    let mut union_mods: Vec<String> =
+        Vec::with_capacity(sorted_audit.len() + replay_only_mods.len());
+    union_mods.extend(sorted_audit.iter().cloned());
+    union_mods.extend(replay_only_mods.iter().cloned());
+    union_mods.sort();
+    union_mods.dedup();
+    if union_mods.is_empty() {
+        return Ok(());
+    }
+    let snap = materialize_bound_audit_closure(cfg, &union_mods, lean_path_env)?;
+    let (snap_lp, _) = ensure_bound_audit_closure(&snap, "replay_and_audit_before_replay")?;
+    let pinned_fd = snapshot_pinned_dir_raw_fd(&snap);
+    let parent_snap_lp = snapshot_parent_search_path(&snap).unwrap_or_else(|| snap_lp.clone());
+    kernel_replay_modules_exec_pinned(
+        &store.root,
+        cfg,
+        &union_mods,
+        &parent_snap_lp,
+        &[],
+        false,
+        pinned_fd,
+    )?;
+    let _ = ensure_bound_audit_closure(&snap, "replay_and_audit_after_replay")?;
+    if !sorted_audit.is_empty() {
+        let batch_sz = audit_batch_size().max(32);
+        let chunks: Vec<&[String]> = sorted_audit.chunks(batch_sz).collect();
+        let parallelism = std::env::var("TURBO_LEAN_JOBS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            })
+            .min(chunks.len());
+        if parallelism <= 1 {
+            for chunk in chunks {
+                let (chunk_lp, _) =
+                    ensure_bound_audit_closure(&snap, "replay_and_audit_before_chunk")?;
+                audit_compiled_module_batch_exec_pinned(
+                    &store.root,
+                    cfg,
+                    chunk,
+                    &chunk_lp,
+                    &[],
+                    false,
+                    false,
+                    true,
+                    pinned_fd,
+                )?;
+                let _ = ensure_bound_audit_closure(&snap, "replay_and_audit_after_chunk")?;
+            }
+        } else {
+            let bootstrap_env = build_auditor_bootstrap_env(cfg);
+            let _ = ensure_zygote_binary_at(&store.root, &cfg.lean_bin, &bootstrap_env)?;
+            let store_root = store.root.clone();
+            let next_idx = std::sync::atomic::AtomicUsize::new(0);
+            let first_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+            std::thread::scope(|s| {
+                for _ in 0..parallelism {
+                    s.spawn(|| loop {
+                        if first_err.lock().map(|g| g.is_some()).unwrap_or(true) {
+                            break;
+                        }
+                        let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if idx >= chunks.len() {
+                            break;
+                        }
+                        if let Err(e) =
+                            ensure_bound_audit_closure(&snap, "replay_and_audit_before_chunk")
+                                .and_then(|(chunk_lp, _)| {
+                                    audit_compiled_module_batch_exec_pinned(
+                                        &store_root,
+                                        cfg,
+                                        chunks[idx],
+                                        &chunk_lp,
+                                        &[],
+                                        false,
+                                        false,
+                                        true,
+                                        pinned_fd,
+                                    )?;
+                                    let _ = ensure_bound_audit_closure(
+                                        &snap,
+                                        "replay_and_audit_after_chunk",
+                                    )?;
+                                    Ok(())
+                                })
+                        {
+                            if let Ok(mut g) = first_err.lock() {
+                                if g.is_none() {
+                                    *g = Some(e);
+                                }
+                            }
+                            break;
+                        }
+                    });
+                }
+            });
+            if let Some(e) = first_err.into_inner().ok().flatten() {
+                return Err(e);
+            }
+        }
+    }
+    record_snapshot_modules_in_store(
+        store,
+        cfg,
+        &snap,
+        &union_mods,
+        &sorted_audit,
+        lean_path_env,
+        extra_root_lib,
+    )?;
+    ensure_live_closure_matches_snapshot(&snap, "replay_and_audit_complete")
+}
+
+pub(crate) fn compute_module_audit_policy_digest(
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_name: &str,
+) -> String {
+    let base_policy = crate::splitter::current_kernel_policy_digest();
+    let ffi_args = pinned_ffi_allow_args(cfg, &[mod_name.to_string()]);
+    if base_policy.is_empty() && ffi_args.is_empty() {
+        return String::new();
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"turbo-lean-audit-policy-v1\n");
+    h.update(&(base_policy.len() as u64).to_le_bytes());
+    h.update(base_policy.as_bytes());
+    for a in &ffi_args {
+        h.update(&(a.len() as u64).to_le_bytes());
+        h.update(a.as_bytes());
+    }
+    h.finalize().to_hex().to_string()
+}
+
+fn replay_closure_batch_size() -> usize {
+    std::env::var("TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(32)
+}
+
+pub(crate) fn verify_proof_irrelevant_olean_update_exec(
+    store_root: &Path,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_name: &str,
+    old_olean_path: &Path,
+    new_olean_path: &Path,
+    lean_path_env: &str,
+    extra_ro_binds: &[PathBuf],
+) -> Result<bool> {
+    if mod_name.trim().is_empty() || !old_olean_path.is_file() || !new_olean_path.is_file() {
+        return Ok(false);
+    }
+    let (mut cmd, timeout) =
+        kernel_reader_command(store_root, cfg, lean_path_env, extra_ro_binds, false)?;
+    cmd.arg("--verify-proof-irrelevant-olean-update")
+        .arg(mod_name)
+        .arg(old_olean_path)
+        .arg(new_olean_path);
+    let out = crate::module_builder::run_command_with_timeout(&mut cmd, timeout, false)?;
+    Ok(out.status.success())
+}
+
+/// Compute a global topological ordering of all non-toolchain `.olean` modules transitively
+/// reachable from `mod_names`, then partition `mod_names` into topological closure slices of at
+/// most `batch_size` such that no module outside a slice transitively bridges two modules in that
+/// slice (so `importModulesCore` on the slice's frontier never imports any target in the slice).
+fn build_replay_closure_batches(
     cfg: &crate::module_builder::ProjectConfig,
     mod_names: &[String],
     lean_path_env: &str,
+    batch_size: usize,
+) -> Result<Vec<Vec<String>>> {
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(lean_path_env).collect();
+    if !cfg.toolchain_lib_lean.as_os_str().is_empty() && !dirs.contains(&cfg.toolchain_lib_lean) {
+        dirs.push(cfg.toolchain_lib_lean.clone());
+    }
+    let tc_gh = if cfg.lean_githash.is_empty() {
+        None
+    } else {
+        Some(cfg.lean_githash.as_str())
+    };
+    let target_set: std::collections::HashSet<String> = mod_names.iter().cloned().collect();
+    let mut path_memo: std::collections::HashMap<String, Option<PathBuf>> =
+        std::collections::HashMap::new();
+    let resolve_non_tc = |m: &str,
+                          memo: &mut std::collections::HashMap<String, Option<PathBuf>>|
+     -> Result<Option<PathBuf>> {
+        if let Some(cached) = memo.get(m) {
+            return Ok(cached.clone());
+        }
+        let rel = format!(
+            "{}.olean",
+            crate::module_builder::module_name_to_rel_slash(m)
+        );
+        let Some(p) = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
+            memo.insert(m.to_string(), None);
+            return Ok(None);
+        };
+        if !cfg.toolchain_lib_lean.as_os_str().is_empty()
+            && crate::module_builder::is_verified_toolchain_olean_file(
+                &cfg.toolchain_lib_lean,
+                tc_gh,
+                &p,
+            )
+        {
+            memo.insert(m.to_string(), None);
+            return Ok(None);
+        }
+        memo.insert(m.to_string(), Some(p.clone()));
+        Ok(Some(p))
+    };
+
+    // Iterative post-order DFS over all reachable non-toolchain `.olean`s for topological order.
+    enum Frame {
+        Enter(String),
+        Exit(String),
+    }
+    let mut state: std::collections::HashMap<String, u8> = std::collections::HashMap::new(); // 1=visiting, 2=done
+    let mut topo_all: Vec<String> = Vec::new();
+    let mut roots: Vec<String> = target_set.iter().cloned().collect();
+    roots.sort();
+    for root in roots {
+        if state.get(&root) == Some(&2) {
+            continue;
+        }
+        let mut stack = vec![Frame::Enter(root)];
+        while let Some(frame) = stack.pop() {
+            match frame {
+                Frame::Enter(m) => {
+                    match state.get(&m).copied() {
+                        Some(2) => continue,
+                        Some(1) => {
+                            // Import cycle: fall back to single-module batches so replayAuditedModule reports cleanly.
+                            return Ok(mod_names.iter().map(|s| vec![s.clone()]).collect());
+                        }
+                        _ => {}
+                    }
+                    let Some(path) = resolve_non_tc(&m, &mut path_memo)? else {
+                        state.insert(m, 2);
+                        continue;
+                    };
+                    let (imps, _) = crate::module_builder::read_olean_binary_imports_cached(&path)?;
+                    state.insert(m.clone(), 1);
+                    stack.push(Frame::Exit(m));
+                    for imp in imps.into_iter().rev() {
+                        if state.get(&imp.module) != Some(&2) {
+                            stack.push(Frame::Enter(imp.module));
+                        }
+                    }
+                }
+                Frame::Exit(m) => {
+                    state.insert(m.clone(), 2);
+                    topo_all.push(m);
+                }
+            }
+        }
+    }
+
+    // Scan `topo_all` in topological order while tracking `tainted` (non-batch modules that
+    // transitively import at least one module in `cur_batch`). Flushing whenever `m` imports a
+    // `tainted` module or `cur_batch.len() >= batch_size` guarantees no frontier import outside
+    // `cur_batch` can reach `cur_batch`.
+    let mut batches: Vec<Vec<String>> = Vec::new();
+    let mut cur_batch: Vec<String> = Vec::new();
+    let mut cur_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut tainted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_targets: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for m in topo_all {
+        let direct_imps: Vec<String> = if let Some(Some(p)) = path_memo.get(&m) {
+            crate::module_builder::read_olean_binary_imports_cached(p)?
+                .0
+                .into_iter()
+                .map(|i| i.module)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if target_set.contains(&m) {
+            seen_targets.insert(m.clone());
+            let touches_tainted = direct_imps.iter().any(|imp| tainted.contains(imp));
+            if !cur_batch.is_empty() && (cur_batch.len() >= batch_size || touches_tainted) {
+                batches.push(std::mem::take(&mut cur_batch));
+                cur_set.clear();
+                tainted.clear();
+            }
+            cur_set.insert(m.clone());
+            cur_batch.push(m);
+        } else if !cur_set.is_empty()
+            && direct_imps
+                .iter()
+                .any(|imp| cur_set.contains(imp) || tainted.contains(imp))
+        {
+            tainted.insert(m);
+        }
+    }
+    if !cur_batch.is_empty() {
+        batches.push(cur_batch);
+    }
+    // Any target module whose `.olean` was missing on disk (so `resolve_non_tc` returned `None`)
+    // MUST still be passed to `--kernel-replay-module` so it fails closed with the exact Lean error!
+    for m in mod_names {
+        if !seen_targets.contains(m) {
+            batches.push(vec![m.clone()]);
+        }
+    }
+    Ok(batches)
+}
+
+pub(crate) fn kernel_replay_modules_exec_pinned(
+    store_root: &Path,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+    extra_ro_binds: &[PathBuf],
+    is_untrusted: bool,
+    pinned_dir_raw_fd: Option<i32>,
 ) -> Result<()> {
     for m in mod_names {
         anyhow::ensure!(
             !m.trim().is_empty(),
             "Kernel replay received an empty module name: fail-closed"
         );
-        let (mut cmd, timeout) =
-            kernel_reader_command(&store.root, cfg, lean_path_env, &[], false)?;
-        cmd.args(["--kernel-replay-module", m]);
-        let out = crate::module_builder::run_command_with_timeout(&mut cmd, timeout, false)
+    }
+    if mod_names.is_empty() {
+        return Ok(());
+    }
+    let worker_budget = if is_untrusted {
+        1
+    } else {
+        std::env::var("TURBO_LEAN_JOBS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            })
+    };
+    let explicit_batch_cap = std::env::var("TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&v| v > 0);
+    let slice_cap = if is_untrusted {
+        replay_closure_batch_size().min(32)
+    } else if let Some(explicit) = explicit_batch_cap {
+        explicit
+    } else {
+        let base_cap = replay_closure_batch_size();
+        if worker_budget > 1 && mod_names.len() > worker_budget {
+            (mod_names.len() / (worker_budget * 2)).clamp(8, base_cap)
+        } else {
+            base_cap
+        }
+    };
+    let batches = build_replay_closure_batches(cfg, mod_names, lean_path_env, slice_cap)
+        .unwrap_or_else(|_| mod_names.iter().map(|s| vec![s.clone()]).collect());
+    let run_replay_slice = |slice: &[String]| -> Result<()> {
+        let (mut cmd, base_timeout) =
+            kernel_reader_command(store_root, cfg, lean_path_env, extra_ro_binds, is_untrusted)?;
+        let timeout = if slice.len() == 1 {
+            cmd.args(["--kernel-replay-module", &slice[0]]);
+            base_timeout
+        } else {
+            cmd.arg("--kernel-replay-closure");
+            cmd.args(slice.iter().map(|s| s.as_str()));
+            if is_untrusted {
+                base_timeout
+            } else {
+                base_timeout.max(std::time::Duration::from_secs(600))
+            }
+        };
+        let out = crate::module_builder::run_command_with_timeout_pinned_fd(
+            &mut cmd,
+            timeout,
+            is_untrusted,
+            pinned_dir_raw_fd,
+        )
+        .context("Failed to execute independent kernel replay")?;
+        if out.status.success() {
+            return Ok(());
+        }
+        if slice.len() == 1 {
+            anyhow::bail!(
+                "[TurboLean.KernelReplay] independent kernel re-check of `{}` failed (exit={}):\n{}",
+                slice[0],
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        for m in slice {
+            let (mut single_cmd, single_timeout) = kernel_reader_command(
+                store_root,
+                cfg,
+                lean_path_env,
+                extra_ro_binds,
+                is_untrusted,
+            )?;
+            single_cmd.args(["--kernel-replay-module", m]);
+            let single_out = crate::module_builder::run_command_with_timeout_pinned_fd(
+                &mut single_cmd,
+                single_timeout,
+                is_untrusted,
+                pinned_dir_raw_fd,
+            )
             .context("Failed to execute independent kernel replay (`--kernel-replay-module`)")?;
-        anyhow::ensure!(
-            out.status.success(),
-            "[TurboLean.KernelReplay] independent kernel re-check of dependency `{}` failed (exit={}):\n{}",
-            m,
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-        record_replayed_modules_in_store(store, cfg, std::slice::from_ref(m), lean_path_env)?;
+            anyhow::ensure!(
+                single_out.status.success(),
+                "[TurboLean.KernelReplay] independent kernel re-check of `{}` failed (exit={}):\n{}",
+                m,
+                single_out.status,
+                String::from_utf8_lossy(&single_out.stderr).trim()
+            );
+        }
+        Ok(())
+    };
+    let parallelism = if is_untrusted {
+        1
+    } else {
+        std::env::var("TURBO_LEAN_JOBS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            })
+            .min(batches.len())
+    };
+    if parallelism <= 1 {
+        for batch in &batches {
+            run_replay_slice(batch)?;
+        }
+        return Ok(());
+    }
+    let bootstrap_env = build_auditor_bootstrap_env(cfg);
+    let _ = ensure_zygote_binary_at(store_root, &cfg.lean_bin, &bootstrap_env)?;
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let first_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
+    std::thread::scope(|s| {
+        for _ in 0..parallelism {
+            s.spawn(|| loop {
+                if first_err.lock().map(|g| g.is_some()).unwrap_or(true) {
+                    break;
+                }
+                let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if idx >= batches.len() {
+                    break;
+                }
+                if let Err(e) = run_replay_slice(&batches[idx]) {
+                    if let Ok(mut g) = first_err.lock() {
+                        if g.is_none() {
+                            *g = Some(e);
+                        }
+                    }
+                    break;
+                }
+            });
+        }
+    });
+    if let Some(e) = first_err.into_inner().unwrap_or(None) {
+        return Err(e);
     }
     Ok(())
+}
+
+/// Independent kernel replay (`--kernel-replay-closure` / `--kernel-replay-module`, one OS child
+/// per bounded topological slice so import regions are reclaimed between batches) of trusted
+/// dependency artifacts that skip the full policy audit: their declarations are rechecked against
+/// their frontier imports before anything imports them.
+pub(crate) fn kernel_replay_modules_with_zygote(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+) -> Result<()> {
+    if mod_names.is_empty() {
+        return Ok(());
+    }
+    let mut sorted: Vec<String> = mod_names.to_vec();
+    sorted.sort();
+    sorted.dedup();
+    let snap = materialize_bound_audit_closure(cfg, &sorted, lean_path_env)?;
+    let (snap_lp, _) = ensure_bound_audit_closure(&snap, "kernel_replay_before_replay")?;
+    let pinned_fd = snapshot_pinned_dir_raw_fd(&snap);
+    let parent_snap_lp = snapshot_parent_search_path(&snap).unwrap_or(snap_lp);
+    kernel_replay_modules_exec_pinned(
+        &store.root,
+        cfg,
+        &sorted,
+        &parent_snap_lp,
+        &[],
+        false,
+        pinned_fd,
+    )?;
+    let _ = ensure_bound_audit_closure(&snap, "kernel_replay_after_replay")?;
+    record_snapshot_modules_in_store(store, cfg, &snap, &sorted, &[], lean_path_env, None)?;
+    ensure_live_closure_matches_snapshot(&snap, "kernel_replay_complete")
 }
 
 pub(crate) fn build_auditor_bootstrap_env(
@@ -3767,6 +4779,8 @@ pub(crate) fn kernel_reader_command(
         for key in [
             crate::splitter::ALLOWED_AXIOMS_ENV,
             "TURBO_LEAN_ALLOWED_CSIMP",
+            "TURBO_LEAN_ALLOWED_UNSAFE",
+            "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY",
         ] {
             if let Ok(allow) = std::env::var(key) {
                 if !allow.trim().is_empty() {
@@ -3817,25 +4831,22 @@ pub(crate) fn kernel_reader_command(
     Ok((cmd, std::time::Duration::from_millis(timeout_ms)))
 }
 
-fn audit_compiled_module_batch(
-    store: &TurboStore,
+fn audit_compiled_module_batch_exec_pinned(
+    store_root: &Path,
     cfg: &crate::module_builder::ProjectConfig,
     mod_names: &[String],
     lean_path_env: &str,
     extra_ro_binds: &[PathBuf],
     is_untrusted: bool,
     allow_sorry_axiom: bool,
+    skip_child_replay: bool,
+    pinned_dir_raw_fd: Option<i32>,
 ) -> Result<()> {
     if mod_names.is_empty() || mod_names.iter().any(|m| m.trim().is_empty()) {
         anyhow::bail!("In-kernel `.olean` audit received an empty module name: fail-closed");
     }
-    let (mut cmd, timeout) = kernel_reader_command(
-        &store.root,
-        cfg,
-        lean_path_env,
-        extra_ro_binds,
-        is_untrusted,
-    )?;
+    let (mut cmd, timeout) =
+        kernel_reader_command(store_root, cfg, lean_path_env, extra_ro_binds, is_untrusted)?;
     if allow_sorry_axiom && !is_untrusted {
         let mut allowed = crate::splitter::allowed_axioms();
         if !allowed.iter().any(|a| a == "sorryAx") {
@@ -3844,6 +4855,9 @@ fn audit_compiled_module_batch(
         cmd.env(crate::splitter::ALLOWED_AXIOMS_ENV, allowed.join(","));
     }
     cmd.arg("--audit-modules");
+    if skip_child_replay {
+        cmd.arg("--skip-child-replay");
+    }
     for a in pinned_ffi_allow_args(cfg, mod_names) {
         cmd.arg(a);
     }
@@ -3851,45 +4865,41 @@ fn audit_compiled_module_batch(
         cmd.arg(m);
     }
 
-    let out = crate::module_builder::run_command_with_timeout(&mut cmd, timeout, is_untrusted);
+    let out = crate::module_builder::run_command_with_timeout_pinned_fd(
+        &mut cmd,
+        timeout,
+        is_untrusted,
+        pinned_dir_raw_fd,
+    );
     match out.and_then(|o| parse_audit_modules_reply(&o, mod_names)) {
-        Ok(_) => {}
+        Ok(_) => Ok(()),
         Err(_) if mod_names.len() > 1 => {
             let mid = mod_names.len() / 2;
-            audit_compiled_module_batch(
-                store,
+            audit_compiled_module_batch_exec_pinned(
+                store_root,
                 cfg,
                 &mod_names[..mid],
                 lean_path_env,
                 extra_ro_binds,
                 is_untrusted,
                 allow_sorry_axiom,
+                skip_child_replay,
+                pinned_dir_raw_fd,
             )?;
-            audit_compiled_module_batch(
-                store,
+            audit_compiled_module_batch_exec_pinned(
+                store_root,
                 cfg,
                 &mod_names[mid..],
                 lean_path_env,
                 extra_ro_binds,
                 is_untrusted,
                 allow_sorry_axiom,
-            )?;
-            return Ok(());
+                skip_child_replay,
+                pinned_dir_raw_fd,
+            )
         }
-        Err(e) => return Err(e),
+        Err(e) => Err(e),
     }
-    if !is_untrusted && !allow_sorry_axiom && extra_ro_binds.is_empty() {
-        let dirs: Vec<PathBuf> = std::env::split_paths(lean_path_env).collect();
-        let all_on_lean_path = mod_names.iter().all(|m| {
-            let rel_slash = crate::module_builder::module_name_to_rel_slash(m);
-            let rel_olean = format!("{}.olean", rel_slash);
-            dirs.iter().map(|d| d.join(&rel_olean)).any(|p| p.is_file())
-        });
-        if all_on_lean_path {
-            record_replayed_modules_in_store(store, cfg, mod_names, lean_path_env)?;
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4441,6 +5451,17 @@ pub(crate) fn run_audited_lean_shard_at_with_full_report(
             crate::splitter::ALLOWED_AXIOMS_ENV,
             crate::splitter::extra_allowed_axiom_patterns().join(","),
         );
+    }
+    for key in [
+        "TURBO_LEAN_ALLOWED_CSIMP",
+        "TURBO_LEAN_ALLOWED_UNSAFE",
+        "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY",
+    ] {
+        if !env_vars.contains_key(key) {
+            if let Ok(val) = std::env::var(key) {
+                auditor.env(key, val);
+            }
+        }
     }
     let parsed_shards = crate::splitter::split_lean_source(source, &[]).shards;
     let fast_map = crate::splitter::FastVerifyMap::parse_and_validate(source, &parsed_shards)?;
@@ -9514,7 +10535,7 @@ mod tests {
         fs::create_dir_all(tmp_dir.join("Foo")).unwrap();
         let olean = tmp_dir.join("Foo/Bar.olean");
         let lp = tmp_dir.to_string_lossy().to_string();
-        digest_test_hooks::FORCED_TS_GRANULARITY_NS.with(|g| g.set(Some(1_000_000_000)));
+        digest_test_hooks::set_forced_ts_granularity_ns(Some(1_000_000_000));
         // Start early in a wall-clock second so that every write below shares one truncated
         // second: (dev, ino, mtime, ctime, size) are then identical across the rewrite.
         while wall_clock_ns().rem_euclid(1_000_000_000) > 300_000_000 {
@@ -13185,5 +14206,648 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
             "formatted hotspot diagnostics must include `[hotspot]`: {formatted}"
         );
         let _ = std::fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_zygote_binary_at_rejects_planted_symlink_or_group_writable_cached_bin() {
+        use std::os::unix::fs::PermissionsExt;
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_zygote_cached_bin_perm_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let store_1 = tmp_dir.join("store_1");
+        let store_2 = tmp_dir.join("store_2");
+        fs::create_dir_all(&store_1).unwrap();
+        fs::create_dir_all(&store_2).unwrap();
+
+        let proj = tmp_dir.join("proj");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"zp\"\n[[lean_lib]]\nname = \"Zp\"\n",
+        )
+        .unwrap();
+        let Ok(cfg) = crate::module_builder::resolve_project_config(&proj) else {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        };
+        let env_vars = build_auditor_bootstrap_env(&cfg);
+        let valid_bin = ensure_zygote_binary_at(&store_1, &cfg.lean_bin, &env_vars).unwrap();
+        let bin_name = valid_bin.file_name().unwrap().to_os_string();
+
+        let bin_dir_2 = store_2.join("fastcheck_bins");
+        fs::create_dir_all(&bin_dir_2).unwrap();
+        fs::set_permissions(&bin_dir_2, fs::Permissions::from_mode(0o777)).unwrap();
+
+        let decoy = tmp_dir.join("decoy_bin");
+        fs::write(&decoy, b"#!/bin/sh\nexit 99\n").unwrap();
+        fs::set_permissions(&decoy, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let planted = bin_dir_2.join(&bin_name);
+        std::os::unix::fs::symlink(&decoy, &planted).unwrap();
+        let repaired = ensure_zygote_binary_at(&store_2, &cfg.lean_bin, &env_vars).unwrap();
+        assert_eq!(repaired, planted);
+        assert!(
+            !fs::symlink_metadata(&repaired)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "planted symlink cached_bin must be replaced with an owned regular file"
+        );
+        assert_eq!(
+            fs::symlink_metadata(&bin_dir_2)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700,
+            "fastcheck_bins directory must be tightened to 0700"
+        );
+
+        fs::write(&planted, b"corrupted").unwrap();
+        fs::set_permissions(&planted, fs::Permissions::from_mode(0o775)).unwrap();
+        let repaired_2 = ensure_zygote_binary_at(&store_2, &cfg.lean_bin, &env_vars).unwrap();
+        assert!(owned_private_file(&repaired_2));
+        assert_ne!(fs::read(&repaired_2).unwrap(), b"corrupted");
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_compiled_modules_parallel_multichunk_persists_kernel_audited_authority() {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_audit_multichunk_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let proj = tmp_dir.join("proj");
+        fs::create_dir_all(proj.join("Mc")).unwrap();
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        let mut mod_names = Vec::new();
+        let mut roots_toml = Vec::new();
+        for idx in 0..34 {
+            let m = format!("Mc.M{idx:02}");
+            roots_toml.push(format!("\"{m}\""));
+            fs::write(
+                proj.join(format!("Mc/M{idx:02}.lean")),
+                format!("theorem t_{idx:02} : ({idx} : Nat) = {idx} := rfl\n"),
+            )
+            .unwrap();
+            mod_names.push(m);
+        }
+        fs::write(
+            proj.join("lakefile.toml"),
+            format!(
+                "name = \"mc_pkg\"\ndefaultTargets = [\"Mc\"]\n[[lean_lib]]\nname = \"Mc\"\nroots = [{}]\n",
+                roots_toml.join(", ")
+            ),
+        )
+        .unwrap();
+        let Ok(cfg) = crate::module_builder::resolve_project_config(&proj) else {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        };
+        let env = build_auditor_bootstrap_env(&cfg);
+        let ld = env.get("LD_LIBRARY_PATH").cloned().unwrap_or_default();
+        let olean_dir = proj.join(".lake/build/lib/lean/Mc");
+        fs::create_dir_all(&olean_dir).unwrap();
+        for idx in 0..34 {
+            let src = format!("Mc/M{idx:02}.lean");
+            let olean = format!("M{idx:02}.olean");
+            let out = Command::new(&cfg.lean_bin)
+                .current_dir(&proj)
+                .arg("-R")
+                .arg(&proj)
+                .arg("-o")
+                .arg(olean_dir.join(&olean))
+                .arg(proj.join(&src))
+                .env("LEAN_PATH", &cfg.toolchain_lib_lean)
+                .env("LD_LIBRARY_PATH", &ld)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "lean compile {src} failed: {:?}", out);
+        }
+        let store_dir = tmp_dir.join("external_store");
+        let store = TurboStore::open(Some(&store_dir)).unwrap();
+        let (lean_path_env, _) = crate::module_builder::build_lean_search_path(&cfg, true);
+
+        let prev_batch = std::env::var_os("TURBO_LEAN_AUDIT_BATCH_SIZE");
+        let prev_jobs = std::env::var_os("TURBO_LEAN_JOBS");
+        std::env::set_var("TURBO_LEAN_AUDIT_BATCH_SIZE", "1");
+        std::env::set_var("TURBO_LEAN_JOBS", "2");
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            audit_compiled_modules_with_zygote(
+                &store,
+                &cfg,
+                &mod_names,
+                &lean_path_env,
+                &[],
+                false,
+            )
+            .expect("parallel multi-chunk audit_compiled_modules_with_zygote must succeed");
+
+            let mut lookup =
+                crate::module_builder::ReplayLookupBatchCache::new(&store, &cfg, &lean_path_env);
+            for m in &mod_names {
+                let olean_path = lookup
+                    .resolve_module_olean(m)
+                    .unwrap_or_else(|| panic!("expected resolved .olean for {m}"));
+                assert!(
+                    lookup.is_audited_in_store(&store, &cfg, &lean_path_env, m, &olean_path),
+                    "parallel multi-chunk audit must persist kernel_audited_oleans_auth for {m}"
+                );
+            }
+        }));
+        match prev_batch {
+            Some(v) => std::env::set_var("TURBO_LEAN_AUDIT_BATCH_SIZE", v),
+            None => std::env::remove_var("TURBO_LEAN_AUDIT_BATCH_SIZE"),
+        }
+        match prev_jobs {
+            Some(v) => std::env::set_var("TURBO_LEAN_JOBS", v),
+            None => std::env::remove_var("TURBO_LEAN_JOBS"),
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+        if let Err(p) = res {
+            std::panic::resume_unwind(p);
+        }
+    }
+
+    #[test]
+    fn test_audit_and_replay_bind_immutable_closure_snapshot_against_live_olean_swap() {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_audit_closure_swap_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let proj = tmp_dir.join("proj");
+        fs::create_dir_all(proj.join("Sw")).unwrap();
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"sw_pkg\"\ndefaultTargets = [\"Sw\"]\n[[lean_lib]]\nname = \"Sw\"\nroots = [\"Sw.Base\", \"Sw.Leaf\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("Sw/Base.lean"),
+            "theorem t_base : True := trivial\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("Sw/Leaf.lean"),
+            "import Sw.Base\ntheorem t_leaf : True := t_base\n",
+        )
+        .unwrap();
+        let Ok(cfg) = crate::module_builder::resolve_project_config(&proj) else {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        };
+        let env = build_auditor_bootstrap_env(&cfg);
+        let ld = env.get("LD_LIBRARY_PATH").cloned().unwrap_or_default();
+        let olean_dir = proj.join(".lake/build/lib/lean/Sw");
+        fs::create_dir_all(&olean_dir).unwrap();
+        let compile_mod = |src: &str, out_path: &Path, lp: &str| {
+            let out = Command::new(&cfg.lean_bin)
+                .current_dir(&proj)
+                .arg("-R")
+                .arg(&proj)
+                .arg("-o")
+                .arg(out_path)
+                .arg(proj.join(src))
+                .env("LEAN_PATH", lp)
+                .env("LD_LIBRARY_PATH", &ld)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "lean compile {src} failed: {:?}", out);
+        };
+        let base_olean = olean_dir.join("Base.olean");
+        let leaf_olean = olean_dir.join("Leaf.olean");
+        compile_mod(
+            "Sw/Base.lean",
+            &base_olean,
+            &cfg.toolchain_lib_lean.to_string_lossy(),
+        );
+        let (lean_path_env, _) = crate::module_builder::build_lean_search_path(&cfg, true);
+        compile_mod("Sw/Leaf.lean", &leaf_olean, &lean_path_env);
+        let clean_leaf_bytes = fs::read(&leaf_olean).unwrap();
+
+        let bad_leaf_src = tmp_dir.join("BadLeaf.lean");
+        fs::write(
+            &proj.join("Sw/Leaf.lean"),
+            "import Sw.Base\ntheorem t_leaf : 1 = 2 := sorry\n",
+        )
+        .unwrap();
+        let sorry_leaf_olean = tmp_dir.join("SorryLeaf.olean");
+        compile_mod("Sw/Leaf.lean", &sorry_leaf_olean, &lean_path_env);
+        let sorry_leaf_bytes = fs::read(&sorry_leaf_olean).unwrap();
+        let _ = bad_leaf_src;
+        fs::write(
+            proj.join("Sw/Leaf.lean"),
+            "import Sw.Base\ntheorem t_leaf : True := t_base\n",
+        )
+        .unwrap();
+        fs::write(&leaf_olean, &clean_leaf_bytes).unwrap();
+
+        // 1) Trusted multi-module `audit_compiled_modules_with_zygote`: swap live `Leaf.olean` to
+        //    `sorryAx` right after pre-replay (`audit_after_replay`). Both `--skip-child-replay`
+        //    audit and authority recording stay pinned to the clean snapshot, AND the entrypoint
+        //    fails closed because live `Leaf.olean` diverged from the audited snapshot, while the
+        //    live `sorryAx` `.olean` on disk is NOT stamped as audited in `TurboStore`.
+        let store_dir = tmp_dir.join("store_audit");
+        let store = TurboStore::open(Some(&store_dir)).unwrap();
+        let swap_path = leaf_olean.clone();
+        let bad_bytes = sorry_leaf_bytes.clone();
+        digest_test_hooks::set("audit_after_replay", move || {
+            fs::write(&swap_path, &bad_bytes).unwrap();
+        });
+        let mods = vec!["Sw.Base".to_string(), "Sw.Leaf".to_string()];
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let err =
+                audit_compiled_modules_with_zygote(&store, &cfg, &mods, &lean_path_env, &[], false)
+                    .expect_err("live `.olean` swap during audit must fail closed for callers");
+            assert!(
+                err.to_string().contains("fail-closed"),
+                "expected fail-closed live-divergence error, got: {err:#}"
+            );
+            let mut lookup_bad =
+                crate::module_builder::ReplayLookupBatchCache::new(&store, &cfg, &lean_path_env);
+            assert!(
+                !lookup_bad.is_audited_in_store(&store, &cfg, &lean_path_env, "Sw.Leaf", &leaf_olean),
+                "post-replay swapped `sorryAx` Leaf.olean on disk must NOT inherit audited authority!"
+            );
+            fs::write(&leaf_olean, &clean_leaf_bytes).unwrap();
+            let mut lookup_clean =
+                crate::module_builder::ReplayLookupBatchCache::new(&store, &cfg, &lean_path_env);
+            assert!(
+                lookup_clean.is_audited_in_store(
+                    &store,
+                    &cfg,
+                    &lean_path_env,
+                    "Sw.Leaf",
+                    &leaf_olean
+                ),
+                "the exact clean snapshot Leaf.olean bytes MUST hold audited authority"
+            );
+        }));
+        digest_test_hooks::clear();
+        if let Err(p) = res {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            std::panic::resume_unwind(p);
+        }
+
+        // 2) `replay_and_audit_modules_with_zygote`: swap live `Leaf.olean` right after closure
+        //    replay (`replay_and_audit_after_replay`) and verify it fails closed and live `sorryAx`
+        //    gets zero authority.
+        fs::write(&leaf_olean, &clean_leaf_bytes).unwrap();
+        let store2 = TurboStore::open(Some(&tmp_dir.join("store_unified"))).unwrap();
+        let swap_path2 = leaf_olean.clone();
+        let bad_bytes2 = sorry_leaf_bytes.clone();
+        digest_test_hooks::set("replay_and_audit_after_replay", move || {
+            fs::write(&swap_path2, &bad_bytes2).unwrap();
+        });
+        let res2 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let err2 = replay_and_audit_modules_with_zygote(
+                &store2,
+                &cfg,
+                &["Sw.Leaf".to_string()],
+                &["Sw.Base".to_string()],
+                &lean_path_env,
+                None,
+            )
+            .expect_err("live `.olean` swap during unified replay_and_audit must fail closed");
+            assert!(
+                err2.to_string().contains("fail-closed"),
+                "expected fail-closed live-divergence error, got: {err2:#}"
+            );
+            let mut lookup_bad =
+                crate::module_builder::ReplayLookupBatchCache::new(&store2, &cfg, &lean_path_env);
+            assert!(
+                !lookup_bad.is_audited_in_store(
+                    &store2,
+                    &cfg,
+                    &lean_path_env,
+                    "Sw.Leaf",
+                    &leaf_olean
+                ),
+                "unified replay_and_audit must NOT record authority for post-replay swapped Leaf.olean"
+            );
+            assert!(
+                !lookup_bad.is_replayed_in_store(&store2, &cfg, &lean_path_env, &leaf_olean),
+                "unified replay_and_audit must NOT record replay authority for post-replay swapped Leaf.olean"
+            );
+        }));
+        digest_test_hooks::clear();
+        let _ = fs::remove_dir_all(&tmp_dir);
+        if let Err(p) = res2 {
+            std::panic::resume_unwind(p);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_audit_compiled_modules_ancestor_aba_swap_fails_closed_without_poisoning_store() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct ResetCacheBase;
+        impl Drop for ResetCacheBase {
+            fn drop(&mut self) {
+                TEST_CLOSURE_SNAPSHOT_CACHE_BASE.with(|c| *c.borrow_mut() = None);
+                digest_test_hooks::clear();
+            }
+        }
+        let _reset = ResetCacheBase;
+
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_audit_anc_aba_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let cache_base = tmp_dir.join("cache_base/turbo-lean-cache");
+        TEST_CLOSURE_SNAPSHOT_CACHE_BASE.with(|c| *c.borrow_mut() = Some(cache_base.clone()));
+        let snap_root = ensure_private_dir(&closure_snapshot_root()).unwrap();
+
+        let proj = tmp_dir.join("proj");
+        fs::create_dir_all(proj.join("Sw")).unwrap();
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"sw_anc\"\ndefaultTargets = [\"Sw\"]\n[[lean_lib]]\nname = \"Sw\"\nroots = [\"Sw.Base\", \"Sw.Leaf\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("Sw/Base.lean"),
+            "theorem t_base : True := trivial\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("Sw/Leaf.lean"),
+            "import Sw.Base\ntheorem t_leaf : True := t_base\n",
+        )
+        .unwrap();
+        let Ok(cfg) = crate::module_builder::resolve_project_config(&proj) else {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        };
+        let env = build_auditor_bootstrap_env(&cfg);
+        let ld = env.get("LD_LIBRARY_PATH").cloned().unwrap_or_default();
+        let olean_dir = proj.join(".lake/build/lib/lean/Sw");
+        fs::create_dir_all(&olean_dir).unwrap();
+        let compile_mod = |src: &str, out_path: &Path, lp: &str| {
+            let out = Command::new(&cfg.lean_bin)
+                .current_dir(&proj)
+                .arg("-R")
+                .arg(&proj)
+                .arg("-o")
+                .arg(out_path)
+                .arg(proj.join(src))
+                .env("LEAN_PATH", lp)
+                .env("LD_LIBRARY_PATH", &ld)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "lean compile {src} failed: {:?}", out);
+        };
+        let base_olean = olean_dir.join("Base.olean");
+        let leaf_olean = olean_dir.join("Leaf.olean");
+        compile_mod(
+            "Sw/Base.lean",
+            &base_olean,
+            &cfg.toolchain_lib_lean.to_string_lossy(),
+        );
+        let (lean_path_env, _) = crate::module_builder::build_lean_search_path(&cfg, true);
+        compile_mod("Sw/Leaf.lean", &leaf_olean, &lean_path_env);
+
+        fs::write(
+            proj.join("Sw/Leaf.lean"),
+            "import Sw.Base\ntheorem t_leaf : 1 = 2 := sorry\n",
+        )
+        .unwrap();
+        let sorry_leaf = tmp_dir.join("SorryLeaf.olean");
+        compile_mod("Sw/Leaf.lean", &sorry_leaf, &lean_path_env);
+        let sorry_bytes = fs::read(&sorry_leaf).unwrap();
+        fs::write(
+            proj.join("Sw/Leaf.lean"),
+            "import Sw.Base\ntheorem t_leaf : True := t_base\n",
+        )
+        .unwrap();
+
+        let mods = vec!["Sw.Base".to_string(), "Sw.Leaf".to_string()];
+        let pre_snap = materialize_bound_audit_closure(&cfg, &mods, &lean_path_env).unwrap();
+        let label = pre_snap.materialized.as_ref().unwrap().label.clone();
+        drop(pre_snap);
+
+        let saved_root = cache_base.join("closure-snapshots.saved");
+        let fake_root = cache_base.join("closure-snapshots.fake");
+        let fake_sw = fake_root.join(&label).join("Sw");
+        fs::create_dir_all(&fake_sw).unwrap();
+        fs::write(fake_sw.join("Base.olean"), fs::read(&base_olean).unwrap()).unwrap();
+        fs::write(fake_sw.join("Leaf.olean"), &sorry_bytes).unwrap();
+        for p in [fake_sw.join("Base.olean"), fake_sw.join("Leaf.olean")] {
+            let mut perms = fs::metadata(&p).unwrap().permissions();
+            perms.set_readonly(true);
+            fs::set_permissions(&p, perms).unwrap();
+        }
+        fs::set_permissions(&fake_sw, fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(fake_root.join(&label), fs::Permissions::from_mode(0o500)).unwrap();
+
+        let store = TurboStore::open(Some(&tmp_dir.join("store"))).unwrap();
+        let (sr1, sv1, fk1) = (snap_root.clone(), saved_root.clone(), fake_root.clone());
+        digest_test_hooks::set("audit_before_replay", move || {
+            if sr1.is_dir() && fk1.is_dir() {
+                fs::rename(&sr1, &sv1).unwrap();
+                fs::rename(&fk1, &sr1).unwrap();
+                fs::rename(&sr1, &fk1).unwrap();
+                fs::rename(&sv1, &sr1).unwrap();
+            }
+        });
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let err =
+                audit_compiled_modules_with_zygote(&store, &cfg, &mods, &lean_path_env, &[], false)
+                    .expect_err("ancestor directory ABA swap before audit replay must fail closed");
+            assert!(
+                err.to_string().contains("fail-closed"),
+                "expected fail-closed error on ancestor ABA swap, got: {err:#}"
+            );
+            fs::write(&leaf_olean, &sorry_bytes).unwrap();
+            let mut lookup_bad =
+                crate::module_builder::ReplayLookupBatchCache::new(&store, &cfg, &lean_path_env);
+            assert!(
+                !lookup_bad.is_audited_in_store(
+                    &store,
+                    &cfg,
+                    &lean_path_env,
+                    "Sw.Leaf",
+                    &leaf_olean
+                ),
+                "sorryAx Leaf.olean must never hold audited authority after ancestor ABA swap"
+            );
+        }));
+        digest_test_hooks::clear();
+        purge_snapshot_dir(&fake_root);
+        purge_snapshot_dir(&saved_root);
+        purge_snapshot_dir(&snap_root);
+        let _ = fs::remove_dir_all(&tmp_dir);
+        if let Err(p) = run {
+            std::panic::resume_unwind(p);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cold_turbo_lean_home_audit_does_not_self_invalidate_snapshot_binding() {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_cold_home_audit_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let cold_home = tmp_dir.join("cold_turbo_lean_home");
+        let prev_home = std::env::var_os("TURBO_LEAN_HOME");
+        std::env::set_var("TURBO_LEAN_HOME", &cold_home);
+        let restore_home = |prev: Option<std::ffi::OsString>| match prev {
+            Some(v) => std::env::set_var("TURBO_LEAN_HOME", v),
+            None => std::env::remove_var("TURBO_LEAN_HOME"),
+        };
+
+        let proj = tmp_dir.join("proj");
+        fs::create_dir_all(proj.join("Cold")).unwrap();
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"cold_pkg\"\ndefaultTargets = [\"Cold\"]\n[[lean_lib]]\nname = \"Cold\"\nroots = [\"Cold.A\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("Cold/A.lean"),
+            "theorem cold_ok : True := trivial\n",
+        )
+        .unwrap();
+        let Ok(cfg) = crate::module_builder::resolve_project_config(&proj) else {
+            restore_home(prev_home);
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        };
+        let env = build_auditor_bootstrap_env(&cfg);
+        let ld = env.get("LD_LIBRARY_PATH").cloned().unwrap_or_default();
+        let (lean_path_env, _) = crate::module_builder::build_lean_search_path(&cfg, false);
+        let out_dir = proj.join(".lake/build/lib/lean/Cold");
+        fs::create_dir_all(&out_dir).unwrap();
+        let a_olean = out_dir.join("A.olean");
+        let st = std::process::Command::new(&cfg.lean_bin)
+            .current_dir(&proj)
+            .env("LEAN_PATH", &lean_path_env)
+            .env("LD_LIBRARY_PATH", &ld)
+            .args(["-R", "."])
+            .arg(proj.join("Cold/A.lean"))
+            .arg("-o")
+            .arg(&a_olean)
+            .status()
+            .expect("invoke lean for Cold.A");
+        assert!(st.success(), "compiling Cold.A must succeed");
+
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let store = TurboStore::open(None).unwrap();
+            assert_eq!(store.root, cold_home);
+            assert!(!cold_home.join("fastcheck_bins").exists());
+            assert!(!cold_home.join(".verifier_replay_hmac_key").exists());
+            let mods = vec!["Cold.A".to_string()];
+            audit_compiled_modules_with_zygote(&store, &cfg, &mods, &lean_path_env, &[], false)
+                .expect("cold TURBO_LEAN_HOME audit must not self-invalidate snapshot binding");
+            assert!(cold_home.join("fastcheck_bins").is_dir());
+            assert!(cold_home.join(".verifier_replay_hmac_key").is_file());
+            assert!(cold_home.join("closure-realm/closure-snapshots").is_dir());
+            let mut lookup =
+                crate::module_builder::ReplayLookupBatchCache::new(&store, &cfg, &lean_path_env);
+            assert!(
+                lookup.is_audited_in_store(&store, &cfg, &lean_path_env, "Cold.A", &a_olean),
+                "Cold.A must hold audited authority in cold TURBO_LEAN_HOME store"
+            );
+        }));
+        restore_home(prev_home);
+        purge_snapshot_dir(&cold_home.join("closure-realm/closure-snapshots"));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        if let Err(p) = run {
+            std::panic::resume_unwind(p);
+        }
+    }
+
+    #[test]
+    fn test_overlapping_snapshots_sharing_dep_do_not_invalidate_binding() {
+        let Some((tmp_dir, _store, env_vars, lean_bin)) = open_test_zygote_env("overlap_snap")
+        else {
+            return;
+        };
+        let lib = tmp_dir.join("lib");
+        fs::create_dir_all(&lib).unwrap();
+        let dep = compile_test_olean(&lean_bin, &lib, "SharedDep", "def sharedVal : Nat := 7\n");
+        fs::write(lib.join("SharedDep.olean"), &dep).unwrap();
+        let a = compile_test_olean(
+            &lean_bin,
+            &lib,
+            "LeafA",
+            "import SharedDep\ndef valA : Nat := sharedVal + 1\n",
+        );
+        fs::write(lib.join("LeafA.olean"), &a).unwrap();
+        let b = compile_test_olean(
+            &lean_bin,
+            &lib,
+            "LeafB",
+            "import SharedDep\ndef valB : Nat := sharedVal + 2\n",
+        );
+        fs::write(lib.join("LeafB.olean"), &b).unwrap();
+        let lp = lib.to_string_lossy().into_owned();
+        let ctx_a = resolve_zygote_context(
+            "leanprover/lean4:v4.35.0",
+            &lp,
+            &env_vars,
+            &lean_bin,
+            "LeafA",
+        );
+        assert_eq!(ctx_a.closure.binding(), ClosureBinding::Bound);
+        // Wait so a shared-inode ctime bump would strictly differ from ctx_a's recorded FileSig.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let ctx_b = resolve_zygote_context(
+            "leanprover/lean4:v4.35.0",
+            &lp,
+            &env_vars,
+            &lean_bin,
+            "LeafB",
+        );
+        assert_eq!(ctx_b.closure.binding(), ClosureBinding::Bound);
+        assert_eq!(
+            ctx_a.closure.binding(),
+            ClosureBinding::Bound,
+            "materializing a sibling snapshot sharing SharedDep.olean must not invalidate ctx_a"
+        );
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

@@ -1904,12 +1904,24 @@ mod tests {
     fn test_verify_e2e_gain_u64_c_abi_gate() {
         for baseline in [0, 1, 99, 100, 101, 1000, u64::MAX - 99, u64::MAX] {
             let threshold = baseline - (baseline / 100 + u64::from(baseline % 100 != 0));
-            for candidate in [0, 1, threshold, threshold.saturating_add(1), baseline, u64::MAX] {
+            for candidate in [
+                0,
+                1,
+                threshold,
+                threshold.saturating_add(1),
+                baseline,
+                u64::MAX,
+            ] {
                 for hits in [0, 1, u64::MAX] {
-                    let expected = baseline > 0 && candidate > 0 && hits > 0
+                    let expected = baseline > 0
+                        && candidate > 0
+                        && hits > 0
                         && u128::from(candidate) * 100 <= u128::from(baseline) * 99;
-                    assert_eq!(verify_e2e_gain_u64(baseline, candidate, hits), expected,
-                        "baseline={baseline}, candidate={candidate}, hits={hits}");
+                    assert_eq!(
+                        verify_e2e_gain_u64(baseline, candidate, hits),
+                        expected,
+                        "baseline={baseline}, candidate={candidate}, hits={hits}"
+                    );
                 }
             }
         }

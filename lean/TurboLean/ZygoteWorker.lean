@@ -749,11 +749,70 @@ def collectNewDeclUsedConstants (beforeEnv afterEnv : Environment) : Array Strin
         out := out.push cs
   return out
 
+def eqConstantVal (a b : ConstantVal) : Bool :=
+  a.name == b.name && a.levelParams == b.levelParams && a.type == b.type
+
+def eqReducibilityHints : ReducibilityHints → ReducibilityHints → Bool
+  | .opaque, .opaque => true
+  | .abbrev, .abbrev => true
+  | .regular a, .regular b => a == b
+  | _, _ => false
+
+def eqDefinitionSafety (a b : DefinitionSafety) : Bool :=
+  a == b
+
+def eqQuotKind : QuotKind → QuotKind → Bool
+  | .type, .type => true
+  | .ctor, .ctor => true
+  | .lift, .lift => true
+  | .ind, .ind => true
+  | _, _ => false
+
+def eqRecursorRule (a b : RecursorRule) : Bool :=
+  a.ctor == b.ctor && a.nfields == b.nfields && a.rhs == b.rhs
+
+def eqRecursorRules : List RecursorRule → List RecursorRule → Bool
+  | [], [] => true
+  | a :: as_, b :: bs => eqRecursorRule a b && eqRecursorRules as_ bs
+  | _, _ => false
+
+def eqConstantInfo : ConstantInfo → ConstantInfo → Bool
+  | .axiomInfo a, .axiomInfo b =>
+    eqConstantVal a.toConstantVal b.toConstantVal && a.isUnsafe == b.isUnsafe
+  | .defnInfo a, .defnInfo b =>
+    eqConstantVal a.toConstantVal b.toConstantVal && a.value == b.value &&
+      eqReducibilityHints a.hints b.hints && eqDefinitionSafety a.safety b.safety && a.all == b.all
+  | .thmInfo a, .thmInfo b =>
+    eqConstantVal a.toConstantVal b.toConstantVal && a.value == b.value && a.all == b.all
+  | .opaqueInfo a, .opaqueInfo b =>
+    eqConstantVal a.toConstantVal b.toConstantVal && a.value == b.value &&
+      a.isUnsafe == b.isUnsafe && a.all == b.all
+  | .quotInfo a, .quotInfo b =>
+    eqConstantVal a.toConstantVal b.toConstantVal && eqQuotKind a.kind b.kind
+  | .inductInfo a, .inductInfo b =>
+    eqConstantVal a.toConstantVal b.toConstantVal && a.numParams == b.numParams &&
+      a.numIndices == b.numIndices && a.all == b.all && a.ctors == b.ctors &&
+      a.numNested == b.numNested && a.isRec == b.isRec && a.isUnsafe == b.isUnsafe &&
+      a.isReflexive == b.isReflexive
+  | .ctorInfo a, .ctorInfo b =>
+    eqConstantVal a.toConstantVal b.toConstantVal && a.induct == b.induct && a.cidx == b.cidx &&
+      a.numParams == b.numParams && a.numFields == b.numFields && a.isUnsafe == b.isUnsafe
+  | .recInfo a, .recInfo b =>
+    eqConstantVal a.toConstantVal b.toConstantVal && a.all == b.all &&
+      a.numParams == b.numParams && a.numIndices == b.numIndices &&
+      a.numMotives == b.numMotives && a.numMinors == b.numMinors &&
+      eqRecursorRules a.rules b.rules && a.k == b.k && a.isUnsafe == b.isUnsafe
+  | _, _ => false
+
+set_option linter.deprecated false in
+def replayEnvConstants (newConsts : Std.HashMap Name ConstantInfo) (env : Environment) : IO Environment :=
+  Lean.Environment.replay newConsts env
+
 /-- Independent kernel replay. `IO.processCommands` honors source-level options such as
     `set_option debug.skipKernelTC true` (or `set_option … in`), and these options persist in cached
     prefix `Command.State`s. So every declaration added since `beforeEnv` is sent to the kernel again,
     starting from `beforeEnv`'s kernel environment with checking forced on and ignoring all elaboration
-    options (`Kernel.Environment.replay` calls `addDeclCore` directly). Inductive types are re-added
+    options (`Lean.Environment.replay` replays against `toKernelEnv` via `addDeclCore` directly). Inductive types are re-added
     and their constructors and recursors must match the regenerated ones exactly. The replay skips
     non-safe declarations (`auditNewKernelDecls` rejects them) and `partial` ones (the kernel never
     lets a safe declaration refer to them). Changing a constant that existed before the request also
@@ -765,7 +824,7 @@ def kernelReplayNewDecls (beforeEnv afterEnv : Environment) : IO (List String) :
   for (name, oldInfo) in beforeMap.toList do
     match afterMap.find? name with
     | some newInfo =>
-      if !(newInfo == oldInfo) then
+      if !(eqConstantInfo newInfo oldInfo) then
         errs := errs ++ [s!"[TurboLean.KernelReplay] declaration `{name}` from the checked prefix was replaced"]
     | none =>
       errs := errs ++ [s!"[TurboLean.KernelReplay] declaration `{name}` from the checked prefix is missing"]
@@ -777,7 +836,7 @@ def kernelReplayNewDecls (beforeEnv afterEnv : Environment) : IO (List String) :
   if !errs.isEmpty || newConsts.isEmpty then
     return errs
   try
-    let _ ← beforeEnv.toKernelEnv.replay newConsts
+    let _ ← replayEnvConstants newConsts beforeEnv
     return []
   catch e =>
     return [s!"[TurboLean.KernelReplay] independent kernel re-check failed: {e}"]
@@ -1129,7 +1188,19 @@ def isCompilerPartialRecDefn (env : Environment) (modIdx : ModuleIdx) (cinfo : C
   let nameIsRecCombinator (n : Name) : Bool :=
     match n with
     | .str _ "brecOn" | .str _ "fix" | .str _ "fixF" => true
+    | .str _ s => s.startsWith "brecOn_"
     | _ => false
+  let bodyUsesRecCombinator (bVal : DefinitionVal) : Bool :=
+    let direct := bVal.value.getUsedConstants
+    direct.any nameIsRecCombinator ||
+    direct.any fun c =>
+      match c with
+      | .str _ "_mutual" | .str _ "_unary" =>
+        env.getModuleIdxFor? c == some modIdx &&
+        match env.find? c with
+        | some (.defnInfo mVal) => mVal.safety == .safe && mVal.value.getUsedConstants.any nameIsRecCombinator
+        | _ => false
+      | _ => false
   match cinfo with
   | .defnInfo dVal =>
     dVal.safety == .partial &&
@@ -1147,7 +1218,7 @@ def isCompilerPartialRecDefn (env : Environment) (modIdx : ModuleIdx) (cinfo : C
         bVal.safety == .safe &&
         bVal.levelParams == dVal.levelParams &&
         bVal.type == dVal.type &&
-        (env.contains (baseName.mkStr "_sunfold") || env.contains (baseName.mkStr "_unary") || bVal.value.getUsedConstants.any nameIsRecCombinator) &&
+        (env.contains (baseName.mkStr "_sunfold") || env.contains (baseName.mkStr "_unary") || bodyUsesRecCombinator bVal) &&
         dVal.value.getUsedConstants.any fun c =>
           match Lean.Compiler.isUnsafeRecName? c with
           | some peer => env.getModuleIdxFor? peer == some modIdx
@@ -1247,6 +1318,23 @@ def nestedInductiveAllowed (env : Environment) (iVal : InductiveVal) : Bool :=
         (env.find? ctor).any fun c => nestedOccurrencesAllowed iVal.all c.type
     | _ => false
 
+def isKernelConstantReachable (env : Environment) (src dst : Name) : Bool := Id.run do
+  let mut visited : Std.HashSet Name := {}
+  let mut work : Array Name := #[src]
+  while !work.isEmpty do
+    let curr := work.back!
+    work := work.pop
+    if curr == dst then
+      return true
+    if visited.contains curr then
+      continue
+    visited := visited.insert curr
+    if let some (.defnInfo dVal) := env.find? curr then
+      for c in dVal.value.getUsedConstants do
+        if !visited.contains c then
+          work := work.push c
+  return false
+
 def csimpReplacementPair? (env : Environment) (ty : Expr) : Option (Name × Name) :=
   match ty.eq? with
   | some (_, .const f us, .const g vs) =>
@@ -1289,10 +1377,53 @@ def collectCompiledCodeConsts (env : Environment) (declName : Name) : Std.HashSe
       out := collectIrFnBodyCalls body out
   return out
 
+def safeUnsafeCallWrapperParent? (env : Environment) (modIdx : ModuleIdx) (cinfo : ConstantInfo) : Option ConstantInfo :=
+  let suffixName (nm : Name) : Option (Name × String) :=
+    match nm with
+    | .str p s =>
+      if s.startsWith "unsafe_" && !(s.startsWith "unsafe_impl_") && (s.drop 7).toNat?.isSome then
+        some (p, s)
+      else
+        none
+    | _ => none
+  if !cinfo.isUnsafe ||
+     Lean.isExtern env cinfo.name ||
+     (Lean.Compiler.getImplementedBy? env cinfo.name).isSome ||
+     env.getModuleIdxFor? cinfo.name != some modIdx then
+    none
+  else
+    match suffixName (Lean.privateToUserName cinfo.name) with
+    | some (parentUser, _) =>
+      (env.header.moduleData[modIdx.toNat]?).bind fun mdata =>
+        mdata.constants.find? fun pc =>
+          pc.name != cinfo.name &&
+          !(Lean.isExtern env pc.name) &&
+          (Lean.Compiler.getImplementedBy? env pc.name).isNone &&
+          (pc.name == parentUser || Lean.privateToUserName pc.name == parentUser)
+    | none => none
+
+def safeUnsafeCallWrapperBridgeParent? (env : Environment) (modIdx : ModuleIdx) (declName : Name) : Option ConstantInfo :=
+  let isImplSuffix (nm : Name) : Bool :=
+    match nm with
+    | .str _ s => s.startsWith "unsafe_impl_" && (s.drop 12).toNat?.isSome
+    | _ => false
+  if Lean.isExtern env declName || !(isImplSuffix (Lean.privateToUserName declName)) then none
+  else match Lean.Compiler.getImplementedBy? env declName with
+    | some implName =>
+      match env.find? implName, env.find? declName with
+      | some implInfo, some declInfo =>
+        if !declInfo.isUnsafe && declInfo.type == implInfo.type then
+          safeUnsafeCallWrapperParent? env modIdx implInfo
+        else
+          none
+      | _, _ => none
+    | none => none
+
 def isPinnedFfiOpaque (env : Environment) (ffiAllow : Array (Name × Name × String)) (modIdx : ModuleIdx) (cinfo : ConstantInfo) : Bool :=
   match cinfo with
-  | .opaqueInfo _ =>
-    (Lean.Compiler.getImplementedBy? env cinfo.name).isNone &&
+  | .opaqueInfo _ | .defnInfo _ =>
+    !cinfo.isUnsafe &&
+      (Lean.Compiler.getImplementedBy? env cinfo.name).isNone &&
       env.getModuleIdxFor? cinfo.name == some modIdx &&
       (env.header.moduleNames[modIdx.toNat]?).any fun m =>
         (Lean.getExternNameFor env `c cinfo.name).any fun sym => ffiAllow.contains (m, cinfo.name, sym)
@@ -1313,8 +1444,7 @@ def collectStubDecls (consts : Array ConstantInfo) (stubOk : Array String) :
 /-- Recheck the complete (most private) module data against only its imports, as in
     LeanChecker.replayFromImports. Importing the target itself would trust its declarations
     without checking their types. Both module and shard audits call this same gate. -/
-def replayAuditedModule (moduleName : Name) : IO Unit := do
-  let file ← findOLean moduleName
+def readAuditedModulePartsAt (file : System.FilePath) (label : String) : IO (ModuleData × ModuleData) := do
   let mut files := #[file]
   let server := OLeanLevel.server.adjustFileName file
   if ← server.pathExists then
@@ -1324,45 +1454,151 @@ def replayAuditedModule (moduleName : Name) : IO Unit := do
       files := files.push privateFile
   let parts ← readModuleDataParts files
   if h : parts.size = 0 then
-    throw <| IO.userError s!"missing module data for `{moduleName}`"
+    throw <| IO.userError s!"missing module data for `{label}`"
   else
-  let mod := parts[0].1
+    return (parts[0].1, parts[parts.size - 1].1)
+
+def readAuditedModuleParts (moduleName : Name) : IO (ModuleData × ModuleData) := do
+  let file ← findOLean moduleName
+  readAuditedModulePartsAt file s!"{moduleName}"
+
+def dupTheoremMatch (ci existing : ConstantInfo) : Bool :=
+  match ci, existing with
+  | .thmInfo info, .thmInfo info' =>
+    info.name == info'.name &&
+    info.type == info'.type &&
+    info.levelParams == info'.levelParams &&
+    info.all == info'.all
+  | _, _ => false
+
+def verifyProofIrrelevantOleanUpdate (moduleName : Name) (oldPath newPath : System.FilePath) : IO Unit := do
+  if moduleName.isAnonymous then
+    throw <| IO.userError "invalid empty module name for proof-irrelevant `.olean` check"
+  let (oldMod, oldFull) ← readAuditedModulePartsAt oldPath s!"{moduleName}:old"
+  let (newMod, newFull) ← readAuditedModulePartsAt newPath s!"{moduleName}:new"
+  if oldMod.isModule != newMod.isModule || oldMod.imports != newMod.imports then
+    throw <| IO.userError s!"`{moduleName}` imports or module header changed"
+  let checkMap (label : String) (oldData newData : ModuleData) : IO Unit := do
+    if oldData.constNames.size != oldData.constants.size || newData.constNames.size != newData.constants.size then
+      throw <| IO.userError s!"`{moduleName}` ({label}) malformed constNames/constants size"
+    let mut newMap : Std.HashMap Name ConstantInfo := {}
+    for n in newData.constNames, ci in newData.constants do
+      newMap := newMap.insert n ci
+    for n in oldData.constNames, oldCi in oldData.constants do
+      let some newCi := newMap[n]?
+        | throw <| IO.userError s!"`{moduleName}` ({label}) dropped constant `{n}`"
+      if !(dupTheoremMatch newCi oldCi || eqConstantInfo newCi oldCi) then
+        throw <| IO.userError s!"`{moduleName}` ({label}) changed kernel signature/definition of `{n}`"
+    let mut oldSet : NameSet := {}
+    for n in oldData.constNames do
+      oldSet := oldSet.insert n
+    let expectedPrivPrefix := Name.mkNum (Lean.privateHeader ++ moduleName) 0
+    for n in newData.constNames, newCi in newData.constants do
+      if !oldSet.contains n then
+        if !(newCi matches .thmInfo _) then
+          throw <| IO.userError s!"`{moduleName}` ({label}) added non-theorem constant `{n}`"
+        let privOk := Lean.privatePrefix? n == some expectedPrivPrefix
+        if !privOk then
+          throw <| IO.userError s!"`{moduleName}` ({label}) added non-private constant `{n}`"
+  checkMap "exported" oldMod newMod
+  checkMap "private" oldFull newFull
+
+def replayAuditedModule (moduleName : Name) : IO Unit := do
+  let (mod, full) ← readAuditedModuleParts moduleName
   let (_, imports) ← importModulesCore mod.imports |>.run
   let base ← finalizeImport imports mod.imports {} 0 false false (isModule := true)
-  let mut constants := {}
-  let full := parts[parts.size - 1].1
+  if (base.getModuleIdx? moduleName).isSome then
+    throw <| IO.userError s!"`{moduleName}` appears in its own transitive import closure"
+  let mut constants : Std.HashMap Name ConstantInfo := {}
   for name in full.constNames, ci in full.constants do
-    if base.contains name then
-      throw <| IO.userError s!"`{moduleName}` redeclares imported constant `{name}`"
+    if let some existing := base.find? name then
+      if !dupTheoremMatch ci existing then
+        throw <| IO.userError s!"`{moduleName}` redeclares imported constant `{name}`"
     constants := constants.insert name ci
-  discard <| base.toKernelEnv.replay constants
+  discard <| replayEnvConstants constants base
+
+/-- Recheck a contiguous topological slice of modules against only their frontier imports outside
+    `moduleNames`, verifying fail-closed that none of `moduleNames` was imported into `base`
+    without kernel replay. -/
+def replayAuditedModuleClosure (moduleNames : Array Name) : IO Unit := do
+  if moduleNames.isEmpty then
+    return
+  if h : moduleNames.size = 1 then
+    replayAuditedModule moduleNames[0]
+    return
+  let mut targetSet : NameSet := {}
+  for m in moduleNames do
+    if m.isAnonymous then
+      throw <| IO.userError "invalid empty/anonymous module name in replay closure"
+    targetSet := targetSet.insert m
+  let mut frontierImports : Array Import := #[]
+  let mut seenFrontier : NameSet := {}
+  let mut fullModules : Array (Name × ModuleData) := #[]
+  for modName in moduleNames do
+    let (mod, full) ← readAuditedModuleParts modName
+    fullModules := fullModules.push (modName, full)
+    for imp in mod.imports do
+      if !targetSet.contains imp.module && !seenFrontier.contains imp.module then
+        seenFrontier := seenFrontier.insert imp.module
+        frontierImports := frontierImports.push imp
+  let (_, imports) ← importModulesCore frontierImports |>.run
+  let base ← finalizeImport imports frontierImports {} 0 false false (isModule := true)
+  for modName in moduleNames do
+    if (base.getModuleIdx? modName).isSome then
+      throw <| IO.userError s!"replay closure topological invariant violated: `{modName}` imported into base environment"
+  let mut constants : Std.HashMap Name ConstantInfo := {}
+  for (modName, full) in fullModules do
+    for name in full.constNames, ci in full.constants do
+      if let some existing := base.find? name then
+        if !dupTheoremMatch ci existing then
+          throw <| IO.userError s!"`{modName}` redeclares imported constant `{name}`"
+      else if let some prev := constants[name]? then
+        if !dupTheoremMatch ci prev then
+          throw <| IO.userError s!"`{modName}` redeclares closure constant `{name}`"
+        else
+          constants := constants.insert name ci
+      else
+        constants := constants.insert name ci
+  discard <| replayEnvConstants constants base
 
 def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Name))
     (ffiAllow : Array (Name × Name × String) := #[])
     (patterns : List String := []) (csimpPatterns : List String := [])
     (stubs : Std.HashSet Name := {})
+    (unsafePatterns : List String := []) (implByPatterns : List String := [])
+    (skipChildReplay : Bool := false)
     (allowSorry : Bool := false) : IO (List String × List String) := do
   let sorryAxName := Name.mkSimple ("sor" ++ "ryAx")
   let csimpAllowed := fun name : Name => csimpPatterns.any (globMatch ·.toList name.toString.toList)
+  let nameMatchesPolicy := fun (pats : List String) (name : Name) =>
+    let raw := name.toString.toList
+    let usr := (Lean.privateToUserName name).toString.toList
+    pats.any fun p =>
+      let pl := p.toList
+      globMatch pl raw || globMatch pl usr
+  let unsafeAllowed := fun name : Name =>
+    (Lean.Compiler.isUnsafeRecName? name).isNone && nameMatchesPolicy unsafePatterns name
+  let implByAllowed := fun name : Name =>
+    !(Lean.isExtern env name) && nameMatchesPolicy implByPatterns name
   let unsfTag := "un" ++ "safe"
   let mut violations : List String := []
   let mut sorryDecls : List String := []
   let mut seenSorry : Std.HashMap String Bool := {}
   let mut targetIdxs : Std.HashMap ModuleIdx String := {}
   let mut allRoots : Array Name := #[]
-  for (rawStr, nm) in targets do
-    try
-      -- Compacted import regions are not reclaimed automatically. Isolate each replay so
-      -- repeated dependency imports cannot exhaust the auditor's 8 GiB sandbox limit.
-      -- The child only reads module data and kernel-replays; it never runs initializers.
+  let app := (← IO.appPath).toString
+  -- Compacted import regions are not reclaimed automatically. Isolate replay in a child OS
+  -- process so repeated dependency imports cannot exhaust the auditor's 8 GiB sandbox limit.
+  if !skipChildReplay then
+    for (rawStr, nm) in targets do
+      let modStr := nm.toString
       let replay ← IO.Process.output {
-        cmd := (← IO.appPath).toString
-        args := #["--kernel-replay-module", nm.toString]
+        cmd := app
+        args := #["--kernel-replay-module", modStr]
       }
-      unless replay.exitCode == 0 do
-        throw <| IO.userError s!"kernel replay child exited {replay.exitCode}: {replay.stderr}"
-    catch e =>
-      violations := violations ++ [s!"[TurboLean.KernelReplay] independent kernel re-check of `{rawStr}` failed: {e}"]
+      if replay.exitCode != 0 then
+        violations := violations ++ [s!"[TurboLean.KernelReplay] independent kernel re-check of `{rawStr}` failed: kernel replay child exited {replay.exitCode}: {replay.stderr}"]
+  for (_, nm) in targets do
     if let some modIdx := env.getModuleIdx? nm then
       if h : modIdx.toNat < env.header.moduleData.size then
         for cinfo in env.header.moduleData[modIdx.toNat].constants do
@@ -1392,13 +1628,19 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
           if let some (lhs, rhs) := csimpReplacementPair? env cinfo.type then
             if !cinfo.isTheorem || !csimpAllowed declName then
               csimpCandidates := csimpCandidates.push (declName, lhs, rhs)
-          if cinfo.isUnsafe && !isWhitelistedInitExecUnsafe env modIdx cinfo then
+          if cinfo.isUnsafe &&
+             !isWhitelistedInitExecUnsafe env modIdx cinfo &&
+             !((safeUnsafeCallWrapperParent? env modIdx cinfo).any (fun pc => unsafeAllowed pc.name)) &&
+             !unsafeAllowed declName then
             violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} declaration `{declName}` in `{rawStr}` is forbidden"]
           if (cinfo.isPartial || (Lean.Compiler.isUnsafeRecName? declName).isSome) &&
              !isCompilerPartialRecDefn env modIdx cinfo then
             violations := violations ++ [s!"[TurboLean.KernelGate] forged or unpaired _unsafe_rec/partial declaration `{declName}` in `{rawStr}` is forbidden"]
           if (Lean.isExtern env declName || (Lean.Compiler.getImplementedBy? env declName).isSome) &&
-             !isWhitelistedInitExecBridge env modIdx declName && !isPinnedFfiOpaque env ffiAllow modIdx cinfo then
+             !isWhitelistedInitExecBridge env modIdx declName &&
+             !((safeUnsafeCallWrapperBridgeParent? env modIdx declName).any (fun pc => unsafeAllowed pc.name)) &&
+             !isPinnedFfiOpaque env ffiAllow modIdx cinfo &&
+             !implByAllowed declName then
             violations := violations ++ [s!"[TurboLean.KernelGate] extern/implemented_by bypass on `{declName}` in `{rawStr}` is forbidden"]
           for ax in axMap[declName]?.getD #[] do
             if allowSorry && ax == sorryAxName && !stubs.contains declName then
@@ -1413,6 +1655,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
               violations := violations ++ [s!"[TurboLean.KernelGate] declaration `{declName}` in `{rawStr}` transitively depends on disallowed axiom `{ax}`"]
         if !csimpCandidates.isEmpty then
           let mut targetCompiledCache : Std.HashMap Name (Std.HashSet Name) := {}
+          let mut reachCache : Std.HashMap (Name × Name) Bool := {}
           let getTargetCompiled (fnName : Name) : Std.HashSet Name := Id.run do
             if let some s := targetCompiledCache[fnName]? then
               return s
@@ -1421,6 +1664,11 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
             for fnName in [lhs, rhs] do
               if !targetCompiledCache.contains fnName then
                 targetCompiledCache := targetCompiledCache.insert fnName (collectCompiledCodeConsts env fnName)
+            for (u, v) in [(lhs, rhs), (rhs, lhs)] do
+              if !reachCache.contains (u, v) then
+                reachCache := reachCache.insert (u, v) (isKernelConstantReachable env u v)
+          let isReachableCached (u v : Name) : Bool :=
+            reachCache[(u, v)]?.getD false
           let mut callerNames : Array Name := #[]
           let mut seenCallers : Std.HashSet Name := {}
           for callerInfo in mdata.constants do
@@ -1459,29 +1707,44 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
               let kernelConsts := ownerInfo?.map ConstantInfo.getUsedConstantsAsSet |>.getD {}
               for (thmName, lhs, rhs) in csimpCandidates do
                 if ownerName != lhs && ownerName != rhs then
-                  let lhsCompiled := getTargetCompiled lhs
-                  let rhsCompiled := getTargetCompiled rhs
-                  let inlinedRhs := !rhsCompiled.isEmpty && !lhsCompiled.isEmpty &&
-                    rhsCompiled.all (fun c => compiledConsts.contains c) &&
-                    !lhsCompiled.all (fun c => compiledConsts.contains c)
-                  let inlinedLhs := !lhsCompiled.isEmpty && !rhsCompiled.isEmpty &&
-                    lhsCompiled.all (fun c => compiledConsts.contains c) &&
-                    !rhsCompiled.all (fun c => compiledConsts.contains c)
-                  let fwdHit := (kernelConsts.isEmpty || (kernelConsts.contains lhs && !kernelConsts.contains rhs)) &&
-                                (compiledConsts.contains rhs || compiledConsts.contains (Lean.Compiler.mkUnsafeRecName rhs) || inlinedRhs)
-                  let revHit := (!kernelConsts.isEmpty && kernelConsts.contains rhs && !kernelConsts.contains lhs) &&
-                                (compiledConsts.contains lhs || compiledConsts.contains (Lean.Compiler.mkUnsafeRecName lhs) || inlinedLhs)
-                  if fwdHit || revHit then
-                    violations := violations ++ [s!"[TurboLean.KernelGate] local csimp replacement `{thmName}` ({lhs} <-> {rhs}) rewrote compiled code of `{callerName}` in `{rawStr}`"]
+                  let lhsRhs := isReachableCached lhs rhs
+                  let rhsLhs := isReachableCached rhs lhs
+                  if !(lhsRhs && rhsLhs) then
+                    let lhsCompiled := getTargetCompiled lhs
+                    let rhsCompiled := getTargetCompiled rhs
+                    let inlinedRhs := !rhsCompiled.isEmpty && !lhsCompiled.isEmpty &&
+                      rhsCompiled.all (fun c => compiledConsts.contains c) &&
+                      !lhsCompiled.all (fun c => compiledConsts.contains c)
+                    let inlinedLhs := !lhsCompiled.isEmpty && !rhsCompiled.isEmpty &&
+                      lhsCompiled.all (fun c => compiledConsts.contains c) &&
+                      !rhsCompiled.all (fun c => compiledConsts.contains c)
+                    let fwdHit := !lhsRhs &&
+                                  (kernelConsts.isEmpty || (kernelConsts.contains lhs && !kernelConsts.contains rhs)) &&
+                                  (compiledConsts.contains rhs || compiledConsts.contains (Lean.Compiler.mkUnsafeRecName rhs) || inlinedRhs)
+                    let revHit := !rhsLhs &&
+                                  (!kernelConsts.isEmpty && kernelConsts.contains rhs && !kernelConsts.contains lhs) &&
+                                  (compiledConsts.contains lhs || compiledConsts.contains (Lean.Compiler.mkUnsafeRecName lhs) ||
+                                    (inlinedLhs && !lhsRhs))
+                    if fwdHit || revHit then
+                      violations := violations ++ [s!"[TurboLean.KernelGate] local csimp replacement `{thmName}` ({lhs} <-> {rhs}) rewrote compiled code of `{callerName}` in `{rawStr}`"]
         for extraName in mdata.extraConstNames do
           if (Lean.isExtern env extraName || (Lean.Compiler.getImplementedBy? env extraName).isSome) &&
              !isWhitelistedInitExecBridge env modIdx extraName &&
-             !((env.find? extraName).any (isPinnedFfiOpaque env ffiAllow modIdx)) then
+             !((safeUnsafeCallWrapperBridgeParent? env modIdx extraName).any (fun pc => unsafeAllowed pc.name)) &&
+             !((env.find? extraName).any (isPinnedFfiOpaque env ffiAllow modIdx)) &&
+             !implByAllowed extraName then
             violations := violations ++ [s!"[TurboLean.KernelGate] extern/implemented_by bypass on auxiliary `{extraName}` in `{rawStr}` is forbidden"]
       else
         violations := violations ++ [s!"[TurboLean.KernelGate] module `{rawStr}` index out of bounds"]
   let mut seenCSimp : Std.HashMap Name Bool := {}
+  let entryTouchesTarget (e : Lean.Compiler.CSimp.Entry) : Bool :=
+    [e.thmName, e.fromDeclName, e.toDeclName].any fun nm =>
+      match env.getModuleIdxFor? nm with
+      | some idx => targetIdxs.contains idx
+      | none => false
   let checkCSimpEntry (e : Lean.Compiler.CSimp.Entry) : List String := Id.run do
+    if !entryTouchesTarget e then
+      return []
     if (env.find? e.thmName).any (·.isTheorem) && csimpAllowed e.thmName then
       return []
     let mut out : List String := []
@@ -1501,13 +1764,13 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
         violations := violations ++ checkCSimpEntry entry
   let globalCSimp := Lean.Compiler.CSimp.ext.getState env
   for (_, entry) in globalCSimp.map do
-    if !(seenCSimp[entry.thmName]?.getD false) then
+    if !(seenCSimp[entry.thmName]?.getD false) && entryTouchesTarget entry then
       seenCSimp := seenCSimp.insert entry.thmName true
       violations := violations ++ checkCSimpEntry entry
   let scopedCSimp := (Lean.Compiler.CSimp.ext.ext.getState env).scopedEntries.map
   for (_, entries) in scopedCSimp do
     for entry in entries.toArray do
-      if !(seenCSimp[entry.thmName]?.getD false) then
+      if !(seenCSimp[entry.thmName]?.getD false) && entryTouchesTarget entry then
         seenCSimp := seenCSimp.insert entry.thmName true
         violations := violations ++ checkCSimpEntry entry
   return (violations, sorryDecls)
@@ -1525,6 +1788,12 @@ def auditShardModule (target : String × Name) (ffiAllow : Array (Name × Name �
     let t := p.trimAscii.toString
     if t.isEmpty then none else some t
   let csimpPatterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_CSIMP").getD "").splitOn ",").filterMap fun p =>
+    let t := p.trimAscii.toString
+    if t.isEmpty then none else some t
+  let unsafePatterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_UNSAFE").getD "").splitOn ",").filterMap fun p =>
+    let t := p.trimAscii.toString
+    if t.isEmpty then none else some t
+  let implByPatterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY").getD "").splitOn ",").filterMap fun p =>
     let t := p.trimAscii.toString
     if t.isEmpty then none else some t
   try
@@ -1558,18 +1827,25 @@ def auditShardModule (target : String × Name) (ffiAllow : Array (Name × Name �
         if rawNm != userNm && !(seen[rawNm]?.getD false) then
           seen := seen.insert rawNm true
           declTypes := declTypes ++ [(rawNm, h)]
-    let (impViolations, impSorryDecls) ← auditImportedModulesInEnv env #[target] ffiAllow patterns csimpPatterns stubs allowSorry
+    let (impViolations, impSorryDecls) ← auditImportedModulesInEnv env #[target] ffiAllow patterns csimpPatterns stubs unsafePatterns implByPatterns false allowSorry
     return (stubViolations ++ fastViolations ++ impViolations, decls, declTypes, impSorryDecls)
   catch e =>
     return ([s!"[TurboLean.KernelGate] failed to import `{target.1}` for audit: {e}"], #[], [], [])
 
-def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name × Name × String) := #[]) : IO (List String) := do
+def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name × Name × String) := #[])
+    (skipChildReplay : Bool := false) : IO (List String) := do
   if slice.isEmpty then
     return []
   let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
     let t := p.trimAscii.toString
     if t.isEmpty then none else some t
   let csimpPatterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_CSIMP").getD "").splitOn ",").filterMap fun p =>
+    let t := p.trimAscii.toString
+    if t.isEmpty then none else some t
+  let unsafePatterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_UNSAFE").getD "").splitOn ",").filterMap fun p =>
+    let t := p.trimAscii.toString
+    if t.isEmpty then none else some t
+  let implByPatterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY").getD "").splitOn ",").filterMap fun p =>
     let t := p.trimAscii.toString
     if t.isEmpty then none else some t
   let imports : Array Import := slice.map fun (_, nm) =>
@@ -1581,7 +1857,7 @@ def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name ×
     pure (Except.error (toString e))
   match batchRes with
   | .ok env =>
-    let (vs, _) ← auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns
+    let (vs, _) ← auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns {} unsafePatterns implByPatterns skipChildReplay false
     return vs
   | .error errMsg =>
     if slice.size == 1 then
@@ -1593,11 +1869,12 @@ def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name ×
     let app := (← IO.appPath).toString
     let ffiFlags : Array String := ffiAllow.map fun (m, d, sym) =>
       s!"--ffi-allow={m}={d}={sym}"
+    let replayFlags : Array String := if skipChildReplay then #["--skip-child-replay"] else #[]
     let runSubSlice (sub : Array (String × Name)) : IO (List String) := do
       let modFlags := sub.map (·.1)
       let child ← IO.Process.output {
         cmd := app
-        args := #["--audit-modules"] ++ ffiFlags ++ modFlags
+        args := #["--audit-modules"] ++ replayFlags ++ ffiFlags ++ modFlags
       }
       if child.exitCode == 0 then
         return []
@@ -1613,7 +1890,8 @@ def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name ×
     let v2 ← runSubSlice (slice.extract mid slice.size)
     return v1 ++ v2
 
-def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Name × String) := #[]) : IO (Bool × List String) := do
+def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Name × String) := #[])
+    (skipChildReplay : Bool := false) : IO (Bool × List String) := do
   let mut parsed : Array (String × Name) := #[]
   let mut initViolations : List String := []
   for raw in modNames do
@@ -1626,7 +1904,7 @@ def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Nam
         parsed := parsed.push (trimmed, nm)
   if parsed.isEmpty then
     return (initViolations.isEmpty, initViolations)
-  let sliceViolations ← auditModuleSlice parsed ffiAllow
+  let sliceViolations ← auditModuleSlice parsed ffiAllow skipChildReplay
   let allViolations := initViolations ++ sliceViolations
   return (allViolations.isEmpty, allViolations)
 
@@ -2438,12 +2716,25 @@ def main (args : List String) : IO Unit := do
   | ["--kernel-replay-module", moduleName] =>
     TurboLean.ZygoteWorker.replayAuditedModule (TurboLean.ZygoteWorker.parseModuleName moduleName)
     return
+  | ["--verify-proof-irrelevant-olean-update", moduleName, oldPath, newPath] =>
+    TurboLean.ZygoteWorker.verifyProofIrrelevantOleanUpdate
+      (TurboLean.ZygoteWorker.parseModuleName moduleName)
+      (System.FilePath.mk oldPath)
+      (System.FilePath.mk newPath)
+    return
+  | "--kernel-replay-closure" :: moduleNames =>
+    if moduleNames.isEmpty then
+      throw <| IO.userError "--kernel-replay-closure requires at least one module"
+    let parsed := moduleNames.toArray.map TurboLean.ZygoteWorker.parseModuleName
+    TurboLean.ZygoteWorker.replayAuditedModuleClosure parsed
+    return
   | "--audit-modules" :: modArgs =>
     let stdout ← IO.getStdout
     let (ffiArgs, rest) := modArgs.partition (·.startsWith "--ffi-allow=")
     let (stubArgs, rest) := rest.partition (·.startsWith "--stub-ok=")
     let (fastMapArgs, rest) := rest.partition (·.startsWith "--fast-map=")
     let (allowSorryFlags, rest) := rest.partition (· == "--allow-sorry")
+    let (skipReplayFlags, rest) := rest.partition (· == "--skip-child-replay")
     let (shardFlag, mods) := rest.partition (· == "--shard")
     let allowSorry := !allowSorryFlags.isEmpty
     let ffiAllow := ffiArgs.toArray.filterMap fun a =>
@@ -2467,16 +2758,19 @@ def main (args : List String) : IO Unit := do
     let (ok, violations, decls, declTypes, sorryDecls) ← match shardFlag.isEmpty, audited, fastMapOpt with
       | true, _, _ =>
         if stubArgs.isEmpty && fastMapArgs.isEmpty && !allowSorry then
-          let (ok, vs) ← TurboLean.ZygoteWorker.auditCompiledModules mods ffiAllow
+          let (ok, vs) ← TurboLean.ZygoteWorker.auditCompiledModules mods ffiAllow (!skipReplayFlags.isEmpty)
           pure (ok, vs, none, none, [])
         else pure (false, ["[TurboLean.KernelGate] --stub-ok / --fast-map / --allow-sorry requires --shard"], none, none, [])
       | false, _, none =>
         pure (false, ["[TurboLean.KernelGate] malformed --fast-map argument"], none, none, [])
       | false, [m], some fmap =>
-        let nm := TurboLean.ZygoteWorker.parseModuleName m.trimAscii.toString
-        let (vs, ds, dts, sds) ← TurboLean.ZygoteWorker.auditShardModule (m.trimAscii.toString, nm) ffiAllow
-          (stubArgs.toArray.map fun a => (a.drop 10).toString) fmap allowSorry
-        pure (vs.isEmpty && !nm.isAnonymous, vs, some ds, some dts, sds)
+        if !skipReplayFlags.isEmpty then
+          pure (false, ["[TurboLean.KernelGate] --skip-child-replay forbidden with --shard"], none, none, [])
+        else
+          let nm := TurboLean.ZygoteWorker.parseModuleName m.trimAscii.toString
+          let (vs, ds, dts, sds) ← TurboLean.ZygoteWorker.auditShardModule (m.trimAscii.toString, nm) ffiAllow
+            (stubArgs.toArray.map fun a => (a.drop 10).toString) fmap allowSorry
+          pure (vs.isEmpty && !nm.isAnonymous, vs, some ds, some dts, sds)
       | false, _, _ => pure (false, ["[TurboLean.KernelGate] --shard audits exactly one module"], none, none, [])
     let ok := ok && ffiAllow.size == ffiArgs.length
     let declsJson := match decls with

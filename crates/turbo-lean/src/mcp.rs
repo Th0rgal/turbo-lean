@@ -1449,9 +1449,28 @@ fn invoke_agent_step_json(
         if let Some(pd) = project_dir {
             cmd.arg("--project-dir").arg(pd);
         }
-        if std::env::var(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV).as_deref() == Ok("1") {
-            cmd.env_remove(crate::splitter::ALLOWED_AXIOMS_ENV);
-            cmd.env_remove(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV);
+        for (val_k, cfg_k) in [
+            (
+                crate::splitter::ALLOWED_AXIOMS_ENV,
+                crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV,
+            ),
+            (
+                "TURBO_LEAN_ALLOWED_CSIMP",
+                "TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG",
+            ),
+            (
+                "TURBO_LEAN_ALLOWED_UNSAFE",
+                "TURBO_LEAN_ALLOWED_UNSAFE_FROM_CONFIG",
+            ),
+            (
+                "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY",
+                "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY_FROM_CONFIG",
+            ),
+        ] {
+            if std::env::var(cfg_k).as_deref() == Ok("1") {
+                cmd.env_remove(val_k);
+                cmd.env_remove(cfg_k);
+            }
         }
         if let Ok(out) = cmd.output() {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1873,11 +1892,28 @@ pub fn handle_mcp_jsonrpc_request(
                         if mode == "untrusted" {
                             cmd.env("TURBO_LEAN_TRUST_PROJECT_TELEMETRY", "0");
                         }
-                        if std::env::var(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV).as_deref()
-                            == Ok("1")
-                        {
-                            cmd.env_remove(crate::splitter::ALLOWED_AXIOMS_ENV);
-                            cmd.env_remove(crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV);
+                        for (val_k, cfg_k) in [
+                            (
+                                crate::splitter::ALLOWED_AXIOMS_ENV,
+                                crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV,
+                            ),
+                            (
+                                "TURBO_LEAN_ALLOWED_CSIMP",
+                                "TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG",
+                            ),
+                            (
+                                "TURBO_LEAN_ALLOWED_UNSAFE",
+                                "TURBO_LEAN_ALLOWED_UNSAFE_FROM_CONFIG",
+                            ),
+                            (
+                                "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY",
+                                "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY_FROM_CONFIG",
+                            ),
+                        ] {
+                            if std::env::var(cfg_k).as_deref() == Ok("1") {
+                                cmd.env_remove(val_k);
+                                cmd.env_remove(cfg_k);
+                            }
                         }
                         if disallow_stmt {
                             cmd.arg("--disallow-statement-changes");
@@ -2057,6 +2093,13 @@ mod tests {
             let _ = fs::remove_dir_all(&root);
             fs::create_dir_all(root.join("staging")).unwrap();
             fs::create_dir_all(root.join("spool")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                for dir in [&root, &root.join("staging"), &root.join("spool")] {
+                    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+                }
+            }
             let keys = [
                 "TURBO_LEAN_STAGING_DIR",
                 "TURBO_LEAN_TELEMETRY_DIR",
