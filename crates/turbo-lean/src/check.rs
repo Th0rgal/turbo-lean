@@ -1013,6 +1013,7 @@ fn cache_shm_stat_split(
 fn emit_remote_decl_result(
     json_output: bool,
     emit_stdout: bool,
+    kernel_prov: &crate::kernel::KernelProvenance,
     resp_json: &serde_json::Value,
     remote_status: &str,
     target_decl: &str,
@@ -1032,7 +1033,7 @@ fn emit_remote_decl_result(
         .get("server_elapsed_ms")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let out_json = serde_json::json!({
+    let mut out_json = serde_json::json!({
         "status": remote_status,
         "decl": target_decl,
         "shard_key": shard_key,
@@ -1052,6 +1053,7 @@ fn emit_remote_decl_result(
         "estimated_tokens": 18,
         "elapsed_ms": dur_ms
     });
+    kernel_prov.insert_json_fields(&mut out_json);
     if emit_stdout {
         if json_output {
             println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -1302,6 +1304,13 @@ pub fn try_stateless_remote_check(
     jobs: Option<usize>,
     remote_url: &str,
 ) -> Result<bool> {
+    let canon_proj = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let kernel_prov = crate::kernel::resolve_kernel_engine(
+        crate::kernel::resolve_kernel_selection_from_env(None)?,
+        &detect_toolchain(&canon_proj),
+    )?;
     if let Some(target_decl) = decl {
         return try_stateless_remote_single_decl_check(
             cache_root,
@@ -1494,7 +1503,7 @@ pub fn try_stateless_remote_check(
     crate::lake_build::recheck_dependents_if_nonlocal(&store, &canon_dir, &canon_file)?;
     let misses = req_items.len();
     let effective_jobs = default_parallel_jobs(jobs).min(misses);
-    let out_json = serde_json::json!({
+    let mut out_json = serde_json::json!({
         "status": "file_verified",
         "mode": "remote_coalesced_shards",
         "remote_url": remote_url,
@@ -1509,6 +1518,7 @@ pub fn try_stateless_remote_check(
         "interface_hash": split.interface_hash,
         "elapsed_ms": dur_ms
     });
+    kernel_prov.insert_json_fields(&mut out_json);
     if json_output {
         println!("{}", serde_json::to_string_pretty(&out_json)?);
     } else {
@@ -1533,6 +1543,13 @@ pub fn try_stateless_remote_single_decl_check(
     remote_url: &str,
 ) -> Result<bool> {
     let t0 = Instant::now();
+    let canon_proj = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let kernel_prov = crate::kernel::resolve_kernel_engine(
+        crate::kernel::resolve_kernel_selection_from_env(None)?,
+        &detect_toolchain(&canon_proj),
+    )?;
     let Some((
         canon_dir,
         canon_file,
@@ -1738,6 +1755,7 @@ pub fn try_stateless_remote_single_decl_check(
     emit_remote_decl_result(
         json_output,
         true,
+        &kernel_prov,
         &resp_json,
         &remote_status,
         target_decl,
@@ -1868,6 +1886,10 @@ fn run_check_command_inner(
         .unwrap_or_else(|_| project_dir.clone());
     crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
     let toolchain = detect_toolchain(&canon_dir);
+    let kernel_prov = crate::kernel::resolve_kernel_engine(
+        crate::kernel::resolve_kernel_selection_from_env(None)?,
+        &toolchain,
+    )?;
     let resolved_file = if file == Path::new(".") {
         canon_dir.clone()
     } else if file.is_relative() && canon_dir.join(&file).exists() {
@@ -1889,6 +1911,7 @@ fn run_check_command_inner(
             store,
             json_output,
             emit_stdout,
+            &kernel_prov,
             &t0,
             &file,
             &resolved_file,
@@ -2115,6 +2138,7 @@ fn run_check_command_inner(
                 db_warm_on_open,
                 json_output,
                 emit_stdout,
+                &kernel_prov,
                 &t0,
                 &file,
                 &resolved_file,
@@ -2142,6 +2166,7 @@ fn run_check_command_inner(
                 db_warm_on_open,
                 json_output,
                 emit_stdout && !emit_olean,
+                &kernel_prov,
                 &t0,
                 &file,
                 &resolved_file,
@@ -2302,6 +2327,7 @@ fn check_directory(
     store: &mut TurboStore,
     json_output: bool,
     emit_stdout: bool,
+    kernel_prov: &crate::kernel::KernelProvenance,
     t0: &Instant,
     file: &Path,
     resolved_file: &Path,
@@ -2412,6 +2438,7 @@ fn check_directory(
             true,
             false,
             false,
+            kernel_prov,
             t0,
             sf,
             sf,
@@ -2520,6 +2547,7 @@ fn check_directory(
                 );
             }
         }
+        kernel_prov.insert_json_fields(&mut out_json);
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -3008,6 +3036,7 @@ fn check_directory(
             );
         }
     }
+    kernel_prov.insert_json_fields(&mut out_json);
     if emit_stdout {
         if json_output {
             println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -3226,6 +3255,7 @@ fn check_single_decl(
     db_warm_on_open: bool,
     json_output: bool,
     emit_stdout: bool,
+    kernel_prov: &crate::kernel::KernelProvenance,
     t0: &Instant,
     file: &Path,
     resolved_file: &Path,
@@ -3432,6 +3462,7 @@ fn check_single_decl(
                 obj.insert("sorry_decls".to_string(), serde_json::json!([]));
             }
         }
+        kernel_prov.insert_json_fields(&mut hit_json);
         hit_json
     };
 
@@ -3685,7 +3716,7 @@ fn check_single_decl(
                 }
             )
         };
-        let out_json = serde_json::json!({
+        let mut out_json = serde_json::json!({
             "status": status_str,
             "allow_sorry": true,
             "used_sorry": used_sorry,
@@ -3721,6 +3752,7 @@ fn check_single_decl(
             "estimated_tokens": 18,
             "elapsed_ms": dur_ms
         });
+        kernel_prov.insert_json_fields(&mut out_json);
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -4040,6 +4072,7 @@ fn check_single_decl(
         let (_, out_json) = emit_remote_decl_result(
             json_output,
             emit_stdout,
+            kernel_prov,
             &resp_json,
             &remote_status,
             target_decl,
@@ -5121,6 +5154,7 @@ fn check_single_decl(
                     obj.insert("sorry_decls".to_string(), serde_json::json!([]));
                 }
             }
+            kernel_prov.insert_json_fields(&mut out_json);
             if inflight_tx_open {
                 store.commit_inflight_publish_for_lease(&lease.action_key)?;
             } else {
@@ -5225,6 +5259,7 @@ fn check_single_file(
     db_warm_on_open: bool,
     json_output: bool,
     emit_stdout: bool,
+    kernel_prov: &crate::kernel::KernelProvenance,
     t0: &Instant,
     file: &Path,
     resolved_file: &Path,
@@ -5314,7 +5349,7 @@ fn check_single_file(
         }
         if misses == 0 && split.hygiene.is_clean_for_certification() && !split.shards.is_empty() {
             let elapsed_ms = t0.elapsed().as_millis() as i64;
-            let out_json = serde_json::json!({
+            let mut out_json = serde_json::json!({
                 "status": "all_shards_cached",
                 "allow_sorry": true,
                 "used_sorry": false,
@@ -5326,6 +5361,7 @@ fn check_single_file(
                 "interface_hash": split.interface_hash,
                 "elapsed_ms": elapsed_ms
             });
+            kernel_prov.insert_json_fields(&mut out_json);
             if emit_stdout {
                 if json_output {
                     println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -5584,7 +5620,7 @@ fn check_single_file(
             } else {
                 "file_verified"
             };
-            let out_json = serde_json::json!({
+            let mut out_json = serde_json::json!({
                 "status": status_str,
                 "allow_sorry": true,
                 "used_sorry": file_used_sorry,
@@ -5599,6 +5635,7 @@ fn check_single_file(
                 "interface_hash": split.interface_hash,
                 "elapsed_ms": dur_ms
             });
+            kernel_prov.insert_json_fields(&mut out_json);
             if emit_stdout {
                 if json_output {
                     println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -5738,7 +5775,7 @@ fn check_single_file(
         } else {
             "file_verified"
         };
-        let out_json = serde_json::json!({
+        let mut out_json = serde_json::json!({
             "status": status_str,
             "allow_sorry": true,
             "used_sorry": file_used_sorry,
@@ -5754,6 +5791,7 @@ fn check_single_file(
             "messages": eval_messages,
             "elapsed_ms": dur_ms
         });
+        kernel_prov.insert_json_fields(&mut out_json);
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -5834,6 +5872,7 @@ fn check_single_file(
                 obj.insert("sorry_decls".to_string(), serde_json::json!([]));
             }
         }
+        kernel_prov.insert_json_fields(&mut out_json);
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -5941,7 +5980,7 @@ fn check_single_file(
 
             let resp = remote_resp.unwrap();
             let dur_ms = t0.elapsed().as_millis() as i64;
-            let out_json = serde_json::json!({
+            let mut out_json = serde_json::json!({
                 "status": "file_verified",
                 "mode": "remote_coalesced_shards",
                 "remote_url": remote_url,
@@ -5956,6 +5995,7 @@ fn check_single_file(
                 "interface_hash": split.interface_hash,
                 "elapsed_ms": dur_ms
             });
+            kernel_prov.insert_json_fields(&mut out_json);
             if emit_stdout {
                 if json_output {
                     println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -6512,6 +6552,7 @@ fn check_single_file(
                 obj.insert("sorry_decls".to_string(), serde_json::json!([]));
             }
         }
+        kernel_prov.insert_json_fields(&mut out_json);
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -6880,6 +6921,7 @@ fn check_single_file(
                 obj.insert("sorry_decls".to_string(), serde_json::json!([]));
             }
         }
+        kernel_prov.insert_json_fields(&mut out_json);
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -7362,6 +7404,11 @@ but is expected to have type
             .canonicalize()
             .unwrap_or_else(|_| lean_file.clone());
 
+        let test_kp = crate::kernel::resolve_kernel_engine(
+            crate::kernel::KernelEngineSelection::Standard,
+            toolchain,
+        )
+        .unwrap();
         let run_decl = |st: &mut TurboStore, src: &str| {
             fs::write(&lean_file, src).unwrap();
             let mut split = split_lean_source(src, &[]);
@@ -7372,6 +7419,7 @@ but is expected to have type
                 true,
                 false,
                 false,
+                &test_kp,
                 &t0,
                 &lean_file,
                 &lean_file,
@@ -9095,6 +9143,11 @@ theorem after_macro : ext_magic = 7 := rfl
                 )
                 .unwrap();
         }
+        let test_kp = crate::kernel::resolve_kernel_engine(
+            crate::kernel::KernelEngineSelection::Standard,
+            toolchain,
+        )
+        .unwrap();
         let mut cb3 = None;
         let t0 = Instant::now();
         assert!(check_single_decl(
@@ -9102,6 +9155,7 @@ theorem after_macro : ext_magic = 7 := rfl
             true,
             false,
             false,
+            &test_kp,
             &t0,
             &lean_file,
             &lean_file,
@@ -9129,6 +9183,7 @@ theorem after_macro : ext_magic = 7 := rfl
             true,
             false,
             false,
+            &test_kp,
             &t0_ok,
             &lean_file,
             &lean_file,

@@ -26,6 +26,10 @@ use std::time::Instant;
 pub struct VerificationReceipt {
     pub schema_version: u32,
     pub mode: String,
+    pub kernel_engine: String,
+    pub lean_toolchain: String,
+    #[serde(default)]
+    pub con_leche_rev: Option<String>,
     pub interface_hash: String,
     pub action_key: String,
     pub files_audited: usize,
@@ -46,6 +50,9 @@ pub struct ReceiptVerificationReport {
     pub status: String,
     pub schema_version: u32,
     pub mode: String,
+    pub kernel_engine: String,
+    pub lean_toolchain: String,
+    pub con_leche_rev: Option<String>,
     pub interface_hash: String,
     pub action_key: String,
     pub receipt_blake3: String,
@@ -57,10 +64,49 @@ pub struct ReceiptVerificationReport {
     pub signature_verified: Option<bool>,
 }
 
+fn validate_receipt_kernel_provenance(
+    kernel_engine: &str,
+    lean_toolchain: &str,
+    con_leche_rev: Option<&str>,
+) -> Result<()> {
+    let resolved = crate::kernel::ResolvedKernelEngine::parse_resolved(kernel_engine)
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Receipt kernel provenance check FAILED: invalid `kernel_engine` `{}` (expected `standard`, `con-leche`, or `both`)",
+                kernel_engine
+            )
+        })?;
+    if lean_toolchain.trim().is_empty() {
+        anyhow::bail!("Receipt kernel provenance check FAILED: `lean_toolchain` must be non-empty");
+    }
+    match resolved {
+        crate::kernel::ResolvedKernelEngine::Standard => {
+            if let Some(rev) = con_leche_rev {
+                anyhow::bail!(
+                    "Receipt kernel provenance check FAILED: `kernel_engine` is `standard` but `con_leche_rev` is set (`{}`)",
+                    rev
+                );
+            }
+        }
+        crate::kernel::ResolvedKernelEngine::ConLeche
+        | crate::kernel::ResolvedKernelEngine::Both => match con_leche_rev {
+            Some(rev) if !rev.trim().is_empty() => {}
+            _ => anyhow::bail!(
+                "Receipt kernel provenance check FAILED: `kernel_engine` `{}` requires a non-empty `con_leche_rev`",
+                resolved.as_str()
+            ),
+        },
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn compute_receipt_blake3(
     schema_version: u32,
     mode: &str,
+    kernel_engine: &str,
+    lean_toolchain: &str,
+    con_leche_rev: Option<&str>,
     interface_hash: &str,
     action_key: &str,
     files_audited: usize,
@@ -70,18 +116,30 @@ pub fn compute_receipt_blake3(
 ) -> String {
     use std::fmt::Write;
     let mut hasher = blake3::Hasher::new();
-    let mut header = String::with_capacity(256);
+    let mut header = String::with_capacity(384);
     let _ = writeln!(
         header,
-        "turbo-lean-verification-receipt-v1\nschema_version:{}\nmode:{}\ninterface_hash:{}\naction_key:{}\nfiles_audited:{}\ntheorem_shards:{}\nforbidden_constructs_found:{}",
+        "turbo-lean-verification-receipt-v1\nschema_version:{}\nmode:{}\nkernel_engine:{}:{}\nlean_toolchain:{}:{}\ninterface_hash:{}\naction_key:{}\nfiles_audited:{}\ntheorem_shards:{}\nforbidden_constructs_found:{}",
         schema_version,
         mode,
+        kernel_engine.len(),
+        kernel_engine,
+        lean_toolchain.len(),
+        lean_toolchain,
         interface_hash,
         action_key,
         files_audited,
         theorem_shards,
         forbidden_constructs_found
     );
+    match con_leche_rev {
+        None => {
+            let _ = writeln!(header, "con_leche_rev:none");
+        }
+        Some(rev) => {
+            let _ = writeln!(header, "con_leche_rev:some:{}:{}", rev.len(), rev);
+        }
+    }
     hasher.update(header.as_bytes());
     for (rel_path, file_ih) in per_file_interfaces {
         hasher.update(b"file:");
@@ -181,8 +239,12 @@ pub fn attach_ed25519_signature(receipt: &mut VerificationReceipt, signing_key_s
     receipt.ed25519_signature = Some(sig_hex);
 }
 
-pub fn build_verification_receipt(
+#[allow(clippy::too_many_arguments)]
+pub fn build_verification_receipt_with_provenance(
     mode: &str,
+    kernel_engine: &str,
+    lean_toolchain: &str,
+    con_leche_rev: Option<&str>,
     interface_hash: &str,
     action_key: &str,
     files_audited: usize,
@@ -191,9 +253,13 @@ pub fn build_verification_receipt(
     per_file_interfaces: BTreeMap<String, String>,
 ) -> VerificationReceipt {
     let schema_version = 1u32;
+    let normalized_tc = crate::kernel::normalize_lean_toolchain(lean_toolchain);
     let receipt_blake3 = compute_receipt_blake3(
         schema_version,
         mode,
+        kernel_engine,
+        &normalized_tc,
+        con_leche_rev,
         interface_hash,
         action_key,
         files_audited,
@@ -204,6 +270,9 @@ pub fn build_verification_receipt(
     let mut rec = VerificationReceipt {
         schema_version,
         mode: mode.to_string(),
+        kernel_engine: kernel_engine.to_string(),
+        lean_toolchain: normalized_tc,
+        con_leche_rev: con_leche_rev.map(String::from),
         interface_hash: interface_hash.to_string(),
         action_key: action_key.to_string(),
         files_audited,
@@ -219,6 +288,29 @@ pub fn build_verification_receipt(
         attach_ed25519_signature(&mut rec, &sk);
     }
     rec
+}
+
+pub fn build_verification_receipt(
+    mode: &str,
+    interface_hash: &str,
+    action_key: &str,
+    files_audited: usize,
+    theorem_shards: usize,
+    forbidden_constructs_found: usize,
+    per_file_interfaces: BTreeMap<String, String>,
+) -> VerificationReceipt {
+    build_verification_receipt_with_provenance(
+        mode,
+        "standard",
+        "unknown",
+        None,
+        interface_hash,
+        action_key,
+        files_audited,
+        theorem_shards,
+        forbidden_constructs_found,
+        per_file_interfaces,
+    )
 }
 
 /// Write a [`VerificationReceipt`] to `receipt_path` if requested, optionally signing with `signing_key_hex`.
@@ -340,6 +432,9 @@ pub fn verify_receipt_data_with_policy(
     let expected_blake3 = compute_receipt_blake3(
         receipt.schema_version,
         &receipt.mode,
+        &receipt.kernel_engine,
+        &receipt.lean_toolchain,
+        receipt.con_leche_rev.as_deref(),
         &receipt.interface_hash,
         &receipt.action_key,
         receipt.files_audited,
@@ -354,6 +449,11 @@ pub fn verify_receipt_data_with_policy(
             receipt.receipt_blake3
         );
     }
+    validate_receipt_kernel_provenance(
+        &receipt.kernel_engine,
+        &receipt.lean_toolchain,
+        receipt.con_leche_rev.as_deref(),
+    )?;
     let sig_verified =
         verify_receipt_signature_policy(receipt, verify_pubkey_hex, require_signature)?;
     if receipt.forbidden_constructs_found != 0 {
@@ -376,6 +476,9 @@ pub fn verify_receipt_data_with_policy(
         let base_blake3 = compute_receipt_blake3(
             base.schema_version,
             &base.mode,
+            &base.kernel_engine,
+            &base.lean_toolchain,
+            base.con_leche_rev.as_deref(),
             &base.interface_hash,
             &base.action_key,
             base.files_audited,
@@ -390,6 +493,11 @@ pub fn verify_receipt_data_with_policy(
                 base.receipt_blake3
             );
         }
+        validate_receipt_kernel_provenance(
+            &base.kernel_engine,
+            &base.lean_toolchain,
+            base.con_leche_rev.as_deref(),
+        )?;
         let mut all_paths: BTreeSet<&String> = receipt.per_file_interfaces.keys().collect();
         all_paths.extend(base.per_file_interfaces.keys());
         for path in all_paths {
@@ -467,6 +575,9 @@ pub fn verify_receipt_file_with_policy(
         status: "receipt_verified".to_string(),
         schema_version: parsed.schema_version,
         mode: parsed.mode,
+        kernel_engine: parsed.kernel_engine,
+        lean_toolchain: parsed.lean_toolchain,
+        con_leche_rev: parsed.con_leche_rev,
         interface_hash: parsed.interface_hash,
         action_key: parsed.action_key,
         receipt_blake3: parsed.receipt_blake3,
@@ -508,6 +619,9 @@ pub fn run_verify_receipt_command(
                 "status": report.status,
                 "schema_version": report.schema_version,
                 "mode": report.mode,
+                "kernel_engine": report.kernel_engine,
+                "lean_toolchain": report.lean_toolchain,
+                "con_leche_rev": report.con_leche_rev,
                 "interface_hash": report.interface_hash,
                 "action_key": report.action_key,
                 "receipt_blake3": report.receipt_blake3,
@@ -521,7 +635,9 @@ pub fn run_verify_receipt_command(
         );
     } else {
         println!(
-            "[turbo-lean] RECEIPT VERIFIED (receipt_blake3={}.., interface_hash={}.., {} files, {:.3} ms)",
+            "[turbo-lean] RECEIPT VERIFIED (kernel={}, toolchain={}, receipt_blake3={}.., interface_hash={}.., {} files, {:.3} ms)",
+            report.kernel_engine,
+            report.lean_toolchain,
             &report.receipt_blake3[..12],
             &report.interface_hash[..12],
             report.files_audited,
@@ -639,5 +755,171 @@ mod tests {
         .is_err());
         assert!(verify_receipt_data_with_policy(&rec_v1, None, None, None, true).is_err());
         let _ = fs::remove_file(&tmp_rec_path);
+    }
+
+    #[test]
+    fn test_receipt_kernel_provenance_domain_separation_and_fail_closed_validation() {
+        let mut files = BTreeMap::new();
+        files.insert("A.lean".to_string(), "ih_a".to_string());
+
+        let h_none = compute_receipt_blake3(
+            1,
+            "trusted",
+            "standard",
+            "leanprover/lean4:v4.35.0",
+            None,
+            "ih",
+            "act",
+            1,
+            1,
+            0,
+            &files,
+        );
+        let h_some_none = compute_receipt_blake3(
+            1,
+            "trusted",
+            "standard",
+            "leanprover/lean4:v4.35.0",
+            Some("none"),
+            "ih",
+            "act",
+            1,
+            1,
+            0,
+            &files,
+        );
+        let h_some_empty = compute_receipt_blake3(
+            1,
+            "trusted",
+            "standard",
+            "leanprover/lean4:v4.35.0",
+            Some(""),
+            "ih",
+            "act",
+            1,
+            1,
+            0,
+            &files,
+        );
+        assert_ne!(h_none, h_some_none);
+        assert_ne!(h_none, h_some_empty);
+        assert_ne!(h_some_none, h_some_empty);
+
+        let rec = build_verification_receipt_with_provenance(
+            "trusted",
+            "standard",
+            "leanprover/lean4:v4.35.0",
+            None,
+            "ih",
+            "act",
+            1,
+            1,
+            0,
+            files.clone(),
+        );
+        assert!(verify_receipt_data(&rec, None, None).is_ok());
+
+        for mut tampered in [
+            {
+                let mut r = rec.clone();
+                r.kernel_engine = "con-leche".to_string();
+                r
+            },
+            {
+                let mut r = rec.clone();
+                r.lean_toolchain = "leanprover/lean4:v4.36.0".to_string();
+                r
+            },
+            {
+                let mut r = rec.clone();
+                r.con_leche_rev = Some("deadbeef".to_string());
+                r
+            },
+        ] {
+            let err = verify_receipt_data(&tampered, None, None).unwrap_err();
+            assert!(
+                err.to_string().contains("BLAKE3 integrity check FAILED"),
+                "tampered provenance must fail BLAKE3 check: {err}"
+            );
+            let sk = [0x55u8; 32];
+            attach_ed25519_signature(&mut tampered, &sk);
+            let err_sig = verify_receipt_data(&tampered, None, None).unwrap_err();
+            assert!(err_sig
+                .to_string()
+                .contains("BLAKE3 integrity check FAILED"));
+        }
+
+        let recompute = |mut r: VerificationReceipt| -> VerificationReceipt {
+            r.receipt_blake3 = compute_receipt_blake3(
+                r.schema_version,
+                &r.mode,
+                &r.kernel_engine,
+                &r.lean_toolchain,
+                r.con_leche_rev.as_deref(),
+                &r.interface_hash,
+                &r.action_key,
+                r.files_audited,
+                r.theorem_shards,
+                r.forbidden_constructs_found,
+                &r.per_file_interfaces,
+            );
+            r
+        };
+
+        let invalid_engine = recompute(VerificationReceipt {
+            kernel_engine: "auto".to_string(),
+            ..rec.clone()
+        });
+        assert!(verify_receipt_data(&invalid_engine, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("invalid `kernel_engine`"));
+
+        let empty_tc = recompute(VerificationReceipt {
+            lean_toolchain: "   ".to_string(),
+            ..rec.clone()
+        });
+        assert!(verify_receipt_data(&empty_tc, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("`lean_toolchain` must be non-empty"));
+
+        let std_with_rev = recompute(VerificationReceipt {
+            con_leche_rev: Some("rev123".to_string()),
+            ..rec.clone()
+        });
+        assert!(verify_receipt_data(&std_with_rev, None, None)
+            .unwrap_err()
+            .to_string()
+            .contains("`kernel_engine` is `standard` but `con_leche_rev` is set"));
+
+        for eng in ["con-leche", "both"] {
+            let missing_rev = recompute(VerificationReceipt {
+                kernel_engine: eng.to_string(),
+                con_leche_rev: None,
+                ..rec.clone()
+            });
+            assert!(verify_receipt_data(&missing_rev, None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("requires a non-empty `con_leche_rev`"));
+
+            let blank_rev = recompute(VerificationReceipt {
+                kernel_engine: eng.to_string(),
+                con_leche_rev: Some("   ".to_string()),
+                ..rec.clone()
+            });
+            assert!(verify_receipt_data(&blank_rev, None, None)
+                .unwrap_err()
+                .to_string()
+                .contains("requires a non-empty `con_leche_rev`"));
+
+            let valid_cl = recompute(VerificationReceipt {
+                kernel_engine: eng.to_string(),
+                con_leche_rev: Some("0123456789abcdef".to_string()),
+                ..rec.clone()
+            });
+            assert!(verify_receipt_data(&valid_cl, None, None).is_ok());
+        }
     }
 }
