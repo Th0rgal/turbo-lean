@@ -10083,6 +10083,184 @@ public def localNotVal : MYTYPE := true
             vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
         );
 
+        fs::write(
+            proj.join("Smoke/Provider1.lean"),
+            "module\npublic def p1 : Nat := 1\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/Provider2.lean"),
+            "module\npublic def p2 : Nat := 2\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\npublic import Smoke.Provider1\npublic import Smoke.Provider2\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/B.lean"),
+            "module\npublic import Smoke.A\npublic def useReexport : Nat := p1 + p2\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/C.lean"),
+            "module\nimport Smoke.B\npublic def useReexportC : Nat := useReexport\n",
+        )?;
+        run_git(&["add", "."])?;
+        run_git(&["commit", "-m", "public import order baseline"])?;
+
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\npublic import Smoke.Provider2\npublic import Smoke.Provider1\n",
+        )?;
+        let rep_pub_imp_swap = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_pub_imp_swap.edit_class, "public_signature_edit");
+        assert!(
+            rep_pub_imp_swap.public_signature_changed,
+            "swapping `public import` order must mark `public_signature_changed = true`"
+        );
+        assert!(rep_pub_imp_swap.meta_signature_changed);
+        assert_ne!(
+            Some(rep_pub_imp_swap.public_signature_digest.as_str()),
+            rep_pub_imp_swap.baseline_public_signature_digest.as_deref()
+        );
+        assert_eq!(
+            rep_pub_imp_swap.transitive_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+        assert!(
+            rep_pub_imp_swap.pruned_dependents.is_empty(),
+            "downstream importers must not be pruned when `public import` order changes"
+        );
+
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "-- header note\nmodule /- cmt -/\n\n  public   import   Smoke.Provider1 -- first\n  /- between -/\n  public   import   Smoke.Provider2\n",
+        )?;
+        let rep_pub_imp_ws_pure = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert!(!rep_pub_imp_ws_pure.public_signature_changed);
+        assert!(!rep_pub_imp_ws_pure.meta_signature_changed);
+        assert_eq!(
+            Some(rep_pub_imp_ws_pure.public_signature_digest.as_str()),
+            rep_pub_imp_ws_pure
+                .baseline_public_signature_digest
+                .as_deref()
+        );
+        assert!(rep_pub_imp_ws_pure.transitive_dependents.is_empty());
+        assert_eq!(
+            rep_pub_imp_ws_pure.pruned_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "-- header note\nmodule /- cmt -/\n\n  public   import   Smoke.Provider1 -- first\n  /- between -/\n  public   import   Smoke.Provider2\nprivate def trailingOnly : Nat := 9\n",
+        )?;
+        let rep_pub_imp_ws = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_pub_imp_ws.edit_class, "private_module_edit");
+        assert!(!rep_pub_imp_ws.public_signature_changed);
+        assert!(!rep_pub_imp_ws.meta_signature_changed);
+        assert_eq!(
+            Some(rep_pub_imp_ws.public_signature_digest.as_str()),
+            rep_pub_imp_ws.baseline_public_signature_digest.as_deref()
+        );
+        assert_eq!(
+            Some(rep_pub_imp_ws.meta_signature_digest.as_str()),
+            rep_pub_imp_ws.baseline_meta_signature_digest.as_deref()
+        );
+        assert!(rep_pub_imp_ws.transitive_dependents.is_empty());
+        assert_eq!(
+            rep_pub_imp_ws.pruned_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\npublic meta import Smoke.Provider1\npublic meta import Smoke.Provider2\npublic def pubConst : Nat := 1\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/B.lean"),
+            "module\npublic import Smoke.A\npublic def usePubConst : Nat := pubConst\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/C.lean"),
+            "module\nimport Smoke.B\npublic def usePubConstC : Nat := usePubConst\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/M.lean"),
+            "module\nmeta import Smoke.A\npublic meta def useMeta : Nat := p1 + p2\n",
+        )?;
+        run_git(&["add", "."])?;
+        run_git(&["commit", "-m", "public meta import order baseline"])?;
+
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\npublic meta import Smoke.Provider2\npublic meta import Smoke.Provider1\npublic def pubConst : Nat := 1\n",
+        )?;
+        let rep_meta_imp_swap = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_meta_imp_swap.edit_class, "meta_only_module_edit");
+        assert!(!rep_meta_imp_swap.public_signature_changed);
+        assert!(
+            rep_meta_imp_swap.meta_signature_changed,
+            "swapping `public meta import` order must mark `meta_signature_changed = true`"
+        );
+        assert_eq!(
+            Some(rep_meta_imp_swap.public_signature_digest.as_str()),
+            rep_meta_imp_swap
+                .baseline_public_signature_digest
+                .as_deref()
+        );
+        assert_ne!(
+            Some(rep_meta_imp_swap.meta_signature_digest.as_str()),
+            rep_meta_imp_swap.baseline_meta_signature_digest.as_deref()
+        );
+        assert_eq!(
+            rep_meta_imp_swap.transitive_dependents,
+            vec!["Smoke.M".to_string()]
+        );
+        assert_eq!(
+            rep_meta_imp_swap.pruned_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\n  /- meta cmt -/ public  meta  import  Smoke.Provider1 -- m1\n  public  meta  import  Smoke.Provider2\npublic def pubConst : Nat := 1\n",
+        )?;
+        let rep_meta_imp_ws = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert!(!rep_meta_imp_ws.public_signature_changed);
+        assert!(!rep_meta_imp_ws.meta_signature_changed);
+        assert_eq!(
+            Some(rep_meta_imp_ws.meta_signature_digest.as_str()),
+            rep_meta_imp_ws.baseline_meta_signature_digest.as_deref()
+        );
+        assert!(rep_meta_imp_ws.transitive_dependents.is_empty());
+        assert_eq!(
+            rep_meta_imp_ws.pruned_dependents,
+            vec![
+                "Smoke.B".to_string(),
+                "Smoke.C".to_string(),
+                "Smoke.M".to_string()
+            ]
+        );
+
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }

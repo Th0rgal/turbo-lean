@@ -6631,6 +6631,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
     let is_module = hdr.is_module && hdr.header_error.is_none();
     let mut exported_imports = Vec::new();
     let mut meta_exported_imports = Vec::new();
+    let mut combined_exported_imports = Vec::new();
     for spec in &hdr.import_specs {
         if spec.is_exported {
             let entry = if spec.import_all {
@@ -6639,16 +6640,17 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                 spec.module.clone()
             };
             if spec.is_meta {
+                combined_exported_imports.push(format!("meta:{entry}"));
                 meta_exported_imports.push(entry);
             } else {
+                combined_exported_imports.push(entry.clone());
                 exported_imports.push(entry);
             }
         }
     }
-    exported_imports.sort();
     exported_imports.dedup();
-    meta_exported_imports.sort();
     meta_exported_imports.dedup();
+    combined_exported_imports.dedup();
 
     if hdr.header_error.is_some() {
         let raw_hash = blake3::hash(src.as_bytes()).to_hex().to_string();
@@ -6686,8 +6688,16 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                 (true, true) => format!("meta import all {}", spec.module),
             };
             active_context_vars.push(cmd);
+        } else if !spec.is_meta {
+            let cmd = if spec.import_all {
+                format!("public import all {}", spec.module)
+            } else {
+                format!("public import {}", spec.module)
+            };
+            active_context_vars.push(cmd);
         }
     }
+    active_context_vars.dedup();
 
     let is_non_exported_import_cmd = |cmd_trimmed: &str| -> bool {
         cmd_trimmed.starts_with("import ") || cmd_trimmed.starts_with("meta import ")
@@ -7172,14 +7182,12 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
         &declarations,
         &public_directives_hash,
     );
-    let mut combined_imps = exported_imports.clone();
-    combined_imps.extend(meta_exported_imports.iter().cloned());
     let mut combined_decls = declarations.clone();
     combined_decls.extend(meta_declarations);
     let meta_signature_digest = hash_sig_list(
         b"turbo-lean-metasig:v2\n",
         is_module,
-        &combined_imps,
+        &combined_exported_imports,
         &combined_decls,
         &format!("{}:{}", public_directives_hash, meta_directives_hash),
     );
@@ -9278,6 +9286,113 @@ public theorem uses_ctx : True := trivial
         assert_eq!(
             tp1.public_signature_digest, tp2.public_signature_digest,
             "trailing private decls after last public decl must not change public_signature_digest"
+        );
+
+        let pub_order_ab = "module\npublic import Smoke.A\npublic import Smoke.B\n";
+        let pub_order_ba = "module\npublic import Smoke.B\npublic import Smoke.A\n";
+        let po_ab = extract_public_signature(pub_order_ab);
+        let po_ba = extract_public_signature(pub_order_ba);
+        assert_eq!(
+            po_ab.exported_imports,
+            vec![
+                "Init".to_string(),
+                "Smoke.A".to_string(),
+                "Smoke.B".to_string()
+            ]
+        );
+        assert_eq!(
+            po_ba.exported_imports,
+            vec![
+                "Init".to_string(),
+                "Smoke.B".to_string(),
+                "Smoke.A".to_string()
+            ]
+        );
+        assert_ne!(
+            po_ab.public_signature_digest, po_ba.public_signature_digest,
+            "swapping `public import` order must change public_signature_digest"
+        );
+        assert_ne!(
+            po_ab.meta_signature_digest, po_ba.meta_signature_digest,
+            "swapping `public import` order must change meta_signature_digest"
+        );
+
+        let pub_order_dup =
+            "module\npublic import Smoke.B\npublic import Smoke.B\npublic import Smoke.A\n";
+        let po_dup = extract_public_signature(pub_order_dup);
+        assert_eq!(po_dup.exported_imports, po_ba.exported_imports);
+        assert_eq!(
+            po_dup.public_signature_digest,
+            po_ba.public_signature_digest
+        );
+        assert_eq!(po_dup.meta_signature_digest, po_ba.meta_signature_digest);
+
+        let pub_order_ws_cmt = "-- leading comment\nmodule /- block comment -/\n\n  public   import   Smoke.A  -- line comment\n  /- comment between imports -/\n  public   import   «Smoke».«B»\n";
+        let po_ws = extract_public_signature(pub_order_ws_cmt);
+        assert_eq!(po_ws.exported_imports, po_ab.exported_imports);
+        assert_eq!(po_ws.public_signature_digest, po_ab.public_signature_digest);
+        assert_eq!(po_ws.meta_signature_digest, po_ab.meta_signature_digest);
+
+        let meta_order_ab =
+            "module\npublic meta import Smoke.A\npublic meta import Smoke.B\npublic def keep : Nat := 1\n";
+        let meta_order_ba =
+            "module\npublic meta import Smoke.B\npublic meta import Smoke.A\npublic def keep : Nat := 1\n";
+        let mo_ab = extract_public_signature(meta_order_ab);
+        let mo_ba = extract_public_signature(meta_order_ba);
+        assert_eq!(
+            mo_ab.meta_exported_imports,
+            vec![
+                "Init".to_string(),
+                "Smoke.A".to_string(),
+                "Smoke.B".to_string()
+            ]
+        );
+        assert_eq!(
+            mo_ba.meta_exported_imports,
+            vec![
+                "Init".to_string(),
+                "Smoke.B".to_string(),
+                "Smoke.A".to_string()
+            ]
+        );
+        assert_eq!(
+            mo_ab.public_signature_digest, mo_ba.public_signature_digest,
+            "swapping `public meta import` order without non-meta public import change keeps public_signature_digest equal"
+        );
+        assert_ne!(
+            mo_ab.meta_signature_digest, mo_ba.meta_signature_digest,
+            "swapping `public meta import` order must change meta_signature_digest"
+        );
+
+        let meta_order_dup = "module\npublic meta import Smoke.B\npublic meta import Smoke.B\npublic meta import Smoke.A\npublic def keep : Nat := 1\n";
+        let mo_dup = extract_public_signature(meta_order_dup);
+        assert_eq!(mo_dup.meta_exported_imports, mo_ba.meta_exported_imports);
+        assert_eq!(mo_dup.meta_signature_digest, mo_ba.meta_signature_digest);
+
+        let meta_order_ws_cmt = "module\n  /- c1 -/ public  meta  import  Smoke.A -- c2\n\n  public   meta   import   Smoke.B\npublic def keep : Nat := 1\n";
+        let mo_ws = extract_public_signature(meta_order_ws_cmt);
+        assert_eq!(mo_ws.meta_exported_imports, mo_ab.meta_exported_imports);
+        assert_eq!(mo_ws.public_signature_digest, mo_ab.public_signature_digest);
+        assert_eq!(mo_ws.meta_signature_digest, mo_ab.meta_signature_digest);
+
+        let mixed_order_v1 = "module\npublic import Smoke.A\npublic meta import Smoke.B\n";
+        let mixed_order_v2 = "module\npublic meta import Smoke.B\npublic import Smoke.A\n";
+        let mx1 = extract_public_signature(mixed_order_v1);
+        let mx2 = extract_public_signature(mixed_order_v2);
+        assert_eq!(mx1.public_signature_digest, mx2.public_signature_digest);
+        assert_ne!(
+            mx1.meta_signature_digest, mx2.meta_signature_digest,
+            "swapping `public import` and `public meta import` must change meta_signature_digest"
+        );
+
+        let mixed_priv_imp_v1 =
+            "module\npublic import Smoke.A\nimport Smoke.B\npublic def api := foo\n";
+        let mixed_priv_imp_v2 =
+            "module\nimport Smoke.B\npublic import Smoke.A\npublic def api := foo\n";
+        assert_ne!(
+            extract_public_signature(mixed_priv_imp_v1).public_signature_digest,
+            extract_public_signature(mixed_priv_imp_v2).public_signature_digest,
+            "swapping `public import` and non-exported `import` before an inferred-type public def must change public_signature_digest"
         );
     }
 }
