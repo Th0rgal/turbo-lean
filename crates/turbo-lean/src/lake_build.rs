@@ -11378,17 +11378,18 @@ macro \"SEC_VAL\" : term => `(macVal)
             assert!(rep_hole.pruned_dependents.is_empty());
         }
 
-        // Fully annotated `public def api.{u} (x_1 : _root_.Nat) : Nat` and `public theorem thm (x_1 : Nat) : x_1 = x_1`
-        // keep `private_module_edit` / `proof_body_only` cutoff intact.
+        // Fully annotated `public theorem thm (x_1 : Nat) : x_1 = x_1` BEFORE `public def api.{u} (x_1 : _root_.Nat) : Nat`
+        // keeps `proof_body_only` (theorem proof edit before public def) and `private_module_edit`
+        // (trailing unexposed public def body edit) cutoff intact.
         fs::write(
             proj.join("Smoke/A.lean"),
-            "module\npublic def api.{u} (x_1 : _root_.Nat) : Nat := x_1 + 1\npublic theorem thm (x_1 : Nat) : x_1 = x_1 := rfl\n",
+            "module\npublic theorem thm (x_1 : Nat) : x_1 = x_1 := rfl\npublic def api.{u} (x_1 : _root_.Nat) : Nat := x_1 + 1\n",
         )?;
         run_git(&["add", "-A"])?;
-        run_git(&["commit", "-m", "fully annotated def and thm baseline"])?;
+        run_git(&["commit", "-m", "fully annotated thm before def baseline"])?;
         fs::write(
             proj.join("Smoke/A.lean"),
-            "module\npublic def api.{u} (x_1 : _root_.Nat) : Nat := 1 + x_1\npublic theorem thm (x_1 : Nat) : x_1 = x_1 := rfl\n",
+            "module\npublic theorem thm (x_1 : Nat) : x_1 = x_1 := rfl\npublic def api.{u} (x_1 : _root_.Nat) : Nat := 1 + x_1\n",
         )?;
         let rep_annot_def = compute_impact_report(
             proj.join("Smoke/A.lean"),
@@ -11405,7 +11406,7 @@ macro \"SEC_VAL\" : term => `(macVal)
 
         fs::write(
             proj.join("Smoke/A.lean"),
-            "module\npublic def api.{u} (x_1 : _root_.Nat) : Nat := x_1 + 1\npublic theorem thm (x_1 : Nat) : x_1 = x_1 := Eq.refl x_1\n",
+            "module\npublic theorem thm (x_1 : Nat) : x_1 = x_1 := Eq.refl x_1\npublic def api.{u} (x_1 : _root_.Nat) : Nat := x_1 + 1\n",
         )?;
         let rep_annot_thm = compute_impact_report(
             proj.join("Smoke/A.lean"),
@@ -11417,6 +11418,180 @@ macro \"SEC_VAL\" : term => `(macVal)
         assert!(rep_annot_thm.transitive_dependents.is_empty());
         assert_eq!(
             rep_annot_thm.pruned_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+
+        // P2 4481733184 regression: within a `module`, an unexposed `public def flag : Bool := true`
+        // is reducible to subsequent declarations inside the same module! Flipping `flag` from `true`
+        // to `false` changes `api`'s elaborated type from `Nat` to `Bool`, so `compute_impact_report`
+        // MUST classify as `public_signature_edit` (`public_signature_changed == true`) and retain
+        // `Smoke.B` and `Smoke.C` (and Stage-2 native recheck must fail on broken `Smoke.B`).
+        let a_p2_intra_v1 = "\
+module
+public def flag : Bool := true
+public def api := by
+  first
+  | have h : flag = true := rfl
+    exact (0 : Nat)
+  | exact false
+";
+        let a_p2_intra_v2 = "\
+module
+public def flag : Bool := false
+public def api := by
+  first
+  | have h : flag = true := rfl
+    exact (0 : Nat)
+  | exact false
+";
+        fs::write(proj.join("Smoke/A.lean"), a_p2_intra_v1)?;
+        fs::write(
+            proj.join("Smoke/B.lean"),
+            "module\npublic import Smoke.A\npublic def useB : Nat := api + 1\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/C.lean"),
+            "module\npublic import Smoke.B\npublic def useC : Nat := useB\n",
+        )?;
+        run_git(&["add", "-A"])?;
+        run_git(&[
+            "commit",
+            "-m",
+            "intra-module public def reducibility baseline",
+        ])?;
+        crate::module_builder::build_project_modules_native(
+            &mut store,
+            &proj,
+            &["Smoke.C".to_string()],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+        fs::write(proj.join("Smoke/A.lean"), a_p2_intra_v2)?;
+        let rep_p2_intra = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_p2_intra.edit_class, "public_signature_edit");
+        assert!(
+            rep_p2_intra.public_signature_changed,
+            "preceding unexposed `public def flag : Bool` edit before `public def api := ...` must mark `public_signature_changed = true`"
+        );
+        assert!(rep_p2_intra.meta_signature_changed);
+        assert_eq!(
+            rep_p2_intra.transitive_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+        assert!(rep_p2_intra.pruned_dependents.is_empty());
+        let err_p2_intra_recheck = lake_recheck_dependents_with_store(
+            Some(&store),
+            &canon_proj,
+            &["Smoke/A.lean".to_string()],
+            Some("HEAD"),
+            false,
+        );
+        assert!(
+            err_p2_intra_recheck.is_err(),
+            "downstream consumer Smoke.B (`api + 1`) must be rechecked and fail when `flag` flips `api` from `Nat` to `Bool`"
+        );
+
+        for (commit_msg, base_a, edited_a) in [
+            (
+                "preceding public def type alias baseline",
+                "module\npublic def ty : Type := Nat\npublic def useTy (x : ty) : ty := x\n",
+                "module\npublic def ty : Type := Bool\npublic def useTy (x : ty) : ty := x\n",
+            ),
+            (
+                "preceding public section def baseline",
+                "module\npublic section\ndef flag : Bool := true\ndef api := flag\nend\n",
+                "module\npublic section\ndef flag : Bool := false\ndef api := flag\nend\n",
+            ),
+            (
+                "mutual public def sibling baseline",
+                "module\nmutual\n  public def a := b\n  public def b : Bool := true\nend\n",
+                "module\nmutual\n  public def a := b\n  public def b : Bool := false\nend\n",
+            ),
+            (
+                "preceding public def before exported notation baseline",
+                "module\npublic def flag : Bool := true\nnotation \"PUB_FLAG\" => flag\n",
+                "module\npublic def flag : Bool := false\nnotation \"PUB_FLAG\" => flag\n",
+            ),
+        ] {
+            fs::write(proj.join("Smoke/A.lean"), base_a)?;
+            fs::write(
+                proj.join("Smoke/B.lean"),
+                "module\npublic import Smoke.A\npublic def useB : Nat := 1\n",
+            )?;
+            fs::write(
+                proj.join("Smoke/C.lean"),
+                "module\npublic import Smoke.B\npublic def useC : Nat := useB\n",
+            )?;
+            run_git(&["add", "-A"])?;
+            run_git(&["commit", "-m", commit_msg])?;
+            fs::write(proj.join("Smoke/A.lean"), edited_a)?;
+            let rep_sub = compute_impact_report(
+                proj.join("Smoke/A.lean"),
+                Some(proj.clone()),
+                Some("HEAD".to_string()),
+            )?;
+            assert_eq!(
+                rep_sub.edit_class, "public_signature_edit",
+                "{commit_msg}: preceding public def body edit must be public_signature_edit"
+            );
+            assert!(rep_sub.public_signature_changed);
+            assert_eq!(
+                rep_sub.transitive_dependents,
+                vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+            );
+            assert!(rep_sub.pruned_dependents.is_empty());
+        }
+
+        // Preceding unexposed `public def` edit followed ONLY by `public meta def` classifies as
+        // `meta_only_module_edit`, retaining `Smoke.M` (`meta import Smoke.A`) while pruning
+        // ordinary importers `Smoke.B` and `Smoke.C`!
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\npublic def flag : Bool := true\npublic meta def metaApi : Bool := flag\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/B.lean"),
+            "module\npublic import Smoke.A\npublic def useB : Bool := flag\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/C.lean"),
+            "module\npublic import Smoke.B\npublic def useC : Bool := useB\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/M.lean"),
+            "module\nmeta import Smoke.A\nmeta def useMeta : Bool := metaApi\n",
+        )?;
+        run_git(&["add", "-A"])?;
+        run_git(&[
+            "commit",
+            "-m",
+            "preceding public def before public meta def baseline",
+        ])?;
+        fs::write(
+            proj.join("Smoke/A.lean"),
+            "module\npublic def flag : Bool := false\npublic meta def metaApi : Bool := flag\n",
+        )?;
+        let rep_pub_before_meta = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_pub_before_meta.edit_class, "meta_only_module_edit");
+        assert!(!rep_pub_before_meta.public_signature_changed);
+        assert!(rep_pub_before_meta.meta_signature_changed);
+        assert_eq!(
+            rep_pub_before_meta.transitive_dependents,
+            vec!["Smoke.M".to_string()]
+        );
+        assert_eq!(
+            rep_pub_before_meta.pruned_dependents,
             vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
         );
 

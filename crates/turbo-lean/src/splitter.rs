@@ -8880,10 +8880,10 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
         hash_exported_directive(directives_hasher);
     };
 
-    let non_public_decl_ctx_entry = |sub_clean: &str,
-                                     inherited_in_prefixes: &[String],
-                                     inherited_with_exporting: bool,
-                                     stack: &[PubScopeFrame]|
+    let elab_decl_ctx_entry = |sub_clean: &str,
+                               inherited_in_prefixes: &[String],
+                               inherited_with_exporting: bool,
+                               stack: &[PubScopeFrame]|
      -> Option<String> {
         let (trimmed, mut wrapper_in_prefixes, span_with_exporting, wrapper_empty_inner) =
             unwrap_pub_sig_cmd(sub_clean);
@@ -8907,8 +8907,9 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
         }
         let in_pub_sec = stack.iter().any(|f| f.is_public_section);
         let in_meta_sec = stack.iter().any(|f| f.is_meta_section);
+        let in_expose_sec = stack.iter().any(|f| f.section_has_expose);
         let in_noncomp_sec = stack.iter().any(|f| f.is_noncomputable_section);
-        let (mods, _) = parse_decl_modifiers_and_attrs(trimmed);
+        let (mods, attrs) = parse_decl_modifiers_and_attrs(trimmed);
         let is_priv_mod = mods.iter().any(|m| m == "private");
         let is_pub_mod = mods.iter().any(|m| m == "public");
         let is_meta_mod = mods.iter().any(|m| m == "meta") || in_meta_sec;
@@ -8919,10 +8920,9 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
         } else {
             true
         };
-        if is_public_visible && !(is_module && is_meta_mod) {
-            return None;
-        }
         let (kw, raw_name) = classify_decl_in_pub_sig(trimmed)?;
+        let mut decl_in_prefixes = collect_decl_in_prefixes(trimmed);
+        local_in_prefixes.append(&mut decl_in_prefixes);
         let const_name = if raw_name.is_empty() {
             format!(
                 "<anon:{}:{}>",
@@ -8932,11 +8932,6 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
         } else {
             pub_qualified_name(&raw_name, stack)
         };
-        let tag_kind = if is_public_visible {
-            "pub-meta-decl"
-        } else {
-            "priv-decl"
-        };
         let phase = if is_meta_mod { "meta" } else { "reg" };
         let nc_tag = if is_noncomp_mod { ":nc" } else { "" };
         let we_tag = if with_exporting { ":we" } else { "" };
@@ -8944,6 +8939,53 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             String::new()
         } else {
             format!(":in=[{}]", local_in_prefixes.join(";"))
+        };
+        if is_public_visible && !(is_module && is_meta_mod) {
+            let stripped_decl = strip_decl_and_in_prefixes(trimmed);
+            let sig_part = if matches!(kw, "structure" | "class" | "inductive" | "coinductive") {
+                stripped_decl
+            } else if let Some((sig, _)) = split_at_top_level_assign(stripped_decl) {
+                sig
+            } else if let Some((sig, _)) = split_at_top_level_where(stripped_decl) {
+                sig
+            } else {
+                stripped_decl
+            };
+            if matches!(kw, "theorem" | "lemma")
+                && decl_header_has_explicit_type_annotation(sig_part)
+            {
+                let mut norm_mods: Vec<String> = mods
+                    .iter()
+                    .filter(|m| m.as_str() != "public" && m.as_str() != "noncomputable")
+                    .cloned()
+                    .collect();
+                norm_mods.sort();
+                let mut norm_attrs: Vec<String> =
+                    attrs.iter().map(|a| normalize_whitespace(a)).collect();
+                if in_expose_sec
+                    && !norm_attrs
+                        .iter()
+                        .any(|a| a == "expose" || a.starts_with("expose "))
+                {
+                    norm_attrs.push("expose".to_string());
+                }
+                norm_attrs.sort();
+                return Some(format!(
+                    "pub-thm-hdr:{phase}{nc_tag}{we_tag}{in_tag}:mods=[{}]:attrs=[{}]:{const_name}:{}",
+                    norm_mods.join(","),
+                    norm_attrs.join(";"),
+                    normalize_whitespace(sig_part)
+                ));
+            }
+            return Some(format!(
+                "pub-decl:{phase}{nc_tag}{we_tag}{in_tag}:{const_name}:{}",
+                normalize_whitespace(trimmed)
+            ));
+        }
+        let tag_kind = if is_public_visible {
+            "pub-meta-decl"
+        } else {
+            "priv-decl"
         };
         Some(format!(
             "{tag_kind}:{phase}{nc_tag}{we_tag}{in_tag}:{const_name}:{}",
@@ -9127,7 +9169,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                         let eff_we =
                             combined_mutual_we || std::mem::replace(&mut sub_pending_we, false);
                         if let Some(entry) =
-                            non_public_decl_ctx_entry(sub.clean_text, &eff_in, eff_we, &stack)
+                            elab_decl_ctx_entry(sub.clean_text, &eff_in, eff_we, &stack)
                         {
                             active_context_vars.push(entry);
                         }
@@ -9184,8 +9226,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                         &mut meta_declarations,
                         &mut directives_hasher,
                     );
-                    if non_public_decl_ctx_entry(sub.clean_text, &eff_in, eff_we, &stack).is_none()
-                    {
+                    if elab_decl_ctx_entry(sub.clean_text, &eff_in, eff_we, &stack).is_none() {
                         if let Some(entry) =
                             post_cmd_elab_ctx_entry(sub.clean_text, &eff_in, eff_we, &stack)
                         {
@@ -9229,7 +9270,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             &mut meta_declarations,
             &mut directives_hasher,
         );
-        if let Some(entry) = non_public_decl_ctx_entry(
+        if let Some(entry) = elab_decl_ctx_entry(
             span.clean_text,
             &span_in_prefixes,
             span_with_exporting,
@@ -11015,18 +11056,18 @@ end MathlibEdgeCases
 module
 public import Init
 private def secretHelper (n : Nat) : Nat := n + 1
-public def pubFn (n : Nat) : Nat := secretHelper n
 public theorem pub_thm (n : Nat) : n + 0 = n := by
   exact Nat.add_zero n
+public def pubFn (n : Nat) : Nat := secretHelper n
 private def trailingHelper (n : Nat) : Nat := n + 2
 ";
         let mod_v2_priv_edit = "\
 module
 public import Init
 private def secretHelper (n : Nat) : Nat := n + 1
-public def pubFn (n : Nat) : Nat := secretHelper (n + 0)
 public theorem pub_thm (n : Nat) : n + 0 = n := by
   omega
+public def pubFn (n : Nat) : Nat := secretHelper (n + 0)
 private def trailingHelper (n : Nat) : Nat := (n + 2) + 0
 private theorem extra_priv_lemma : 1 + 1 = 2 := rfl
 ";
@@ -12227,9 +12268,9 @@ public theorem uses_ctx : True := trivial
         // Safe cutoff preserved inside sections and namespaces for unexposed bodies, theorem proofs, and trailing private sections!
         for (label, s1, s2) in [
             (
-                "unexposed public def body edit and theorem proof edit inside section with variable",
-                "module\nsection S\nvariable (x : Nat)\npublic def f : Nat := x + 1\npublic theorem thm : x + 0 = x := Nat.add_zero x\nend S\n",
-                "module\nsection S\nvariable (x : Nat)\npublic def f : Nat := 1 + x\npublic theorem thm : x + 0 = x := by omega\nend S\n",
+                "theorem proof edit before unexposed public def body edit inside section with variable",
+                "module\nsection S\nvariable (x : Nat)\npublic theorem thm : x + 0 = x := Nat.add_zero x\npublic def f : Nat := x + 1\nend S\n",
+                "module\nsection S\nvariable (x : Nat)\npublic theorem thm : x + 0 = x := by omega\npublic def f : Nat := 1 + x\nend S\n",
             ),
             (
                 "trailing private section after all public declarations",
@@ -12390,6 +12431,201 @@ public theorem uses_ctx : True := trivial
             assert_eq!(
                 sig_a.meta_signature_digest, sig_b.meta_signature_digest,
                 "{label}: fully annotated declaration must preserve meta_signature_digest"
+            );
+        }
+    }
+
+    #[test]
+    fn test_speed4_extract_public_signature_intra_module_public_decl_context_soundness() {
+        // P2 4481733184 exact reproducer: within a `module`, an unexposed `public def` is reducible
+        // to subsequent declarations inside the same module, so editing `flag`'s body MUST alter
+        // subsequent `api.sig_hash` and `public_signature_digest`.
+        let p2_v1 = "\
+module
+public def flag : Bool := true
+public def api := by
+  first
+  | have h : flag = true := rfl
+    exact (0 : Nat)
+  | exact false
+";
+        let p2_v2 = "\
+module
+public def flag : Bool := false
+public def api := by
+  first
+  | have h : flag = true := rfl
+    exact (0 : Nat)
+  | exact false
+";
+        let sig_p2_v1 = extract_public_signature(p2_v1);
+        let sig_p2_v2 = extract_public_signature(p2_v2);
+        assert_eq!(sig_p2_v1.declarations.len(), 2);
+        assert_eq!(sig_p2_v2.declarations.len(), 2);
+        assert_eq!(sig_p2_v1.declarations[0].const_name, "flag");
+        assert!(sig_p2_v1.declarations[0].exposed_body_hash.is_none());
+        assert_eq!(
+            sig_p2_v1.declarations[0].sig_hash,
+            sig_p2_v2.declarations[0].sig_hash
+        );
+        assert_eq!(sig_p2_v1.declarations[1].const_name, "api");
+        assert_ne!(
+            sig_p2_v1.declarations[1].sig_hash, sig_p2_v2.declarations[1].sig_hash,
+            "editing preceding unexposed `public def flag` body must alter subsequent `api.sig_hash`"
+        );
+        assert_ne!(
+            sig_p2_v1.public_signature_digest,
+            sig_p2_v2.public_signature_digest
+        );
+        assert_ne!(
+            sig_p2_v1.meta_signature_digest,
+            sig_p2_v2.meta_signature_digest
+        );
+
+        for (label, s1, s2) in [
+            (
+                "preceding public def type alias `ty : Type := Nat` -> `Bool` before `public def useTy (x : ty) : ty := x`",
+                "module\npublic def ty : Type := Nat\npublic def useTy (x : ty) : ty := x\n",
+                "module\npublic def ty : Type := Bool\npublic def useTy (x : ty) : ty := x\n",
+            ),
+            (
+                "preceding public def before public theorem referencing it",
+                "module\npublic def target : Nat := 1\npublic theorem thm : target = target := rfl\n",
+                "module\npublic def target : Nat := 2\npublic theorem thm : target = target := rfl\n",
+            ),
+            (
+                "preceding unannotated def inside `public section` before subsequent def",
+                "module\npublic section\ndef flag : Bool := true\ndef api := flag\nend\n",
+                "module\npublic section\ndef flag : Bool := false\ndef api := flag\nend\n",
+            ),
+            (
+                "mutual block with unexposed `public def` sibling body edit",
+                "module\nmutual\n  public def a := if b then (0 : Nat) else 1\n  public def b : Bool := true\nend\n",
+                "module\nmutual\n  public def a := if b then (0 : Nat) else 1\n  public def b : Bool := false\nend\n",
+            ),
+            (
+                "preceding unexposed `public def` before exported `notation` directive",
+                "module\npublic def flag : Bool := true\nnotation \"MY_CONST\" => flag\n",
+                "module\npublic def flag : Bool := false\nnotation \"MY_CONST\" => flag\n",
+            ),
+            (
+                "preceding unexposed `public def` before exported `macro` directive",
+                "module\npublic def flag : Bool := true\nmacro \"myMac\" : term => `(flag)\n",
+                "module\npublic def flag : Bool := false\nmacro \"myMac\" : term => `(flag)\n",
+            ),
+            (
+                "preceding unexposed `public def` before exported `attribute` directive",
+                "module\npublic class C (α : Type) where v : Nat\npublic def mkTag : C Nat := ⟨1⟩\nattribute [instance 100] mkTag\n",
+                "module\npublic class C (α : Type) where v : Nat\npublic def mkTag : C Nat := ⟨2⟩\nattribute [instance 100] mkTag\n",
+            ),
+            (
+                "preceding unannotated `public theorem` without `: Prop` before `public def`",
+                "module\npublic theorem inferredProp := True.intro\npublic def api : Nat := 1\n",
+                "module\npublic theorem inferredProp := (rfl : 0 = 0)\npublic def api : Nat := 1\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert_ne!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: public_signature_digest must change"
+            );
+            assert_ne!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: meta_signature_digest must change"
+            );
+        }
+
+        // Preceding unexposed `public def` edit before a `public meta def` (with no subsequent
+        // non-meta public decl or exported directive) keeps `public_signature_digest` identical
+        // while updating `meta_signature_digest`!
+        let before_meta_v1 =
+            "module\npublic def flag : Bool := true\npublic meta def metaApi : Bool := flag\n";
+        let before_meta_v2 =
+            "module\npublic def flag : Bool := false\npublic meta def metaApi : Bool := flag\n";
+        let bm1 = extract_public_signature(before_meta_v1);
+        let bm2 = extract_public_signature(before_meta_v2);
+        assert_eq!(
+            bm1.public_signature_digest, bm2.public_signature_digest,
+            "unexposed `public def` edit followed only by `public meta def` keeps non-meta public_signature_digest identical"
+        );
+        assert_ne!(
+            bm1.meta_signature_digest, bm2.meta_signature_digest,
+            "unexposed `public def` edit before `public meta def` must alter meta_signature_digest"
+        );
+
+        // Preceding explicitly-typed `public theorem` header change before `public meta def` also updates `meta_signature_digest`.
+        let thm_hdr_meta_v1 =
+            "module\npublic theorem lem : 1 + 1 = 2 := rfl\npublic meta def metaCheck : Nat := 1\n";
+        let thm_hdr_meta_v2 =
+            "module\npublic theorem lem : 2 + 2 = 4 := rfl\npublic meta def metaCheck : Nat := 1\n";
+        let thm_m1 = extract_public_signature(thm_hdr_meta_v1);
+        let thm_m2 = extract_public_signature(thm_hdr_meta_v2);
+        assert_ne!(
+            thm_m1.public_signature_digest,
+            thm_m2.public_signature_digest
+        );
+        assert_ne!(thm_m1.meta_signature_digest, thm_m2.meta_signature_digest);
+
+        // Positive cutoff preservation:
+        // 1. Unexposed `public def` body edit with NO subsequent public declarations (or followed only by `private` decls)
+        //    keeps `public_signature_digest` and `meta_signature_digest` identical.
+        // 2. Explicitly-typed `public theorem` / `public lemma` proof-body edit BEFORE a subsequent `public def`,
+        //    `public meta def`, exported directive, or inside a `mutual` block keeps `api.sig_hash`,
+        //    `public_signature_digest`, and `meta_signature_digest` 100% identical (proof irrelevance!).
+        for (label, s1, s2) in [
+            (
+                "unexposed public def body edit at end of module",
+                "module\npublic def api : Nat := 1\n",
+                "module\npublic def api : Nat := 2\n",
+            ),
+            (
+                "unexposed public def body edit followed only by private declarations",
+                "module\npublic def api : Nat := 1\nprivate def helper : Nat := api + 10\nprivate theorem helper_eq : helper = api + 10 := rfl\n",
+                "module\npublic def api : Nat := 2\nprivate def helper : Nat := api + 20\nprivate theorem helper_eq : helper = api + 20 := rfl\n",
+            ),
+            (
+                "explicitly-typed public theorem proof edit before subsequent public def and public meta def",
+                "module\npublic theorem lem : 1 + 1 = 2 := rfl\npublic def api : Nat := 1\npublic meta def metaApi : Nat := 1\n",
+                "module\npublic theorem lem : 1 + 1 = 2 := by decide\npublic def api : Nat := 1\npublic meta def metaApi : Nat := 1\n",
+            ),
+            (
+                "explicitly-typed public lemma proof edit with `where` clause before subsequent public def and exported notation",
+                "module\npublic lemma lem (n : Nat) : n + 0 = n := pf where\n  pf : n + 0 = n := Nat.add_zero n\npublic def api : Nat := 1\nnotation \"K_API\" => api\n",
+                "module\npublic lemma lem (n : Nat) : n + 0 = n := pf2 where\n  pf2 : n + 0 = n := by exact Nat.add_zero n\npublic def api : Nat := 1\nnotation \"K_API\" => api\n",
+            ),
+            (
+                "mutual block of explicitly-typed public theorems proof-only edit",
+                "module\nmutual\n  public theorem t1 : 1 + 1 = 2 := rfl\n  public theorem t2 : 2 + 2 = 4 := rfl\nend\npublic def api : Nat := 1\n",
+                "module\nmutual\n  public theorem t1 : 1 + 1 = 2 := by decide\n  public theorem t2 : 2 + 2 = 4 := by decide\nend\npublic def api : Nat := 1\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert_eq!(
+                sig_a.declarations.len(),
+                sig_b.declarations.len(),
+                "{label}: decl count"
+            );
+            for (da, db) in sig_a.declarations.iter().zip(sig_b.declarations.iter()) {
+                assert_eq!(da.sig_hash, db.sig_hash, "{label}: sig_hash for {}", da.const_name);
+                assert_eq!(
+                    da.exposed_body_hash, db.exposed_body_hash,
+                    "{label}: exposed_body_hash for {}",
+                    da.const_name
+                );
+            }
+            assert_eq!(
+                sig_a.public_directives_hash, sig_b.public_directives_hash,
+                "{label}: public_directives_hash must stay identical"
+            );
+            assert_eq!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: public_signature_digest must stay identical"
+            );
+            assert_eq!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: meta_signature_digest must stay identical"
             );
         }
     }
