@@ -197,6 +197,42 @@ fn check_kernel_precedence_fail_closed_and_json_provenance() {
     let v_cli: Value = serde_json::from_slice(&cli_over_env.stdout).unwrap();
     assert_eq!(v_cli["kernel_engine"], "standard");
     assert_eq!(v_cli["kernel_requested"], "standard");
+    fs::remove_file(proj.join("turbo-lean.toml")).unwrap();
+
+    // 4. Outer sentinel `lean-toolchain` in CWD (`f.root`) must NOT shadow `proj/lean-toolchain`
+    //    when invoking `check` without `--project-dir` on relative/absolute file, `--decl`, or dir.
+    fs::write(
+        f.root.join("lean-toolchain"),
+        "leanprover/lean4:v4.0.0-outer-sentinel\n",
+    )
+    .unwrap();
+    for (tag, args) in [
+        ("c4_rel", vec!["--json", "check", "proj/Sample.lean"]),
+        (
+            "c4_abs",
+            vec![
+                "--json",
+                "check",
+                proj.join("Sample.lean").to_str().unwrap(),
+            ],
+        ),
+        (
+            "c4_decl",
+            vec!["--json", "check", "proj/Sample.lean", "--decl", "t1"],
+        ),
+        ("c4_dir", vec!["--json", "check", "proj"]),
+    ] {
+        let nested_out = f.cli(tag).args(&args).output().unwrap();
+        assert_ok(&nested_out, tag);
+        let v_nested: Value = serde_json::from_slice(&nested_out.stdout).unwrap();
+        assert_eq!(v_nested["kernel_engine"], "standard");
+        assert_eq!(v_nested["lean_toolchain"], toolchain);
+        assert_ne!(
+            v_nested["lean_toolchain"],
+            "leanprover/lean4:v4.0.0-outer-sentinel"
+        );
+    }
+    assert!(!f.root.join(".lake").exists());
 }
 
 #[test]

@@ -1179,25 +1179,47 @@ type StatelessRemoteInit = (
     splitter::SplitResult,
 );
 
+fn resolve_check_project_and_target(file: &Path, project_dir: &Path) -> (PathBuf, PathBuf) {
+    let initial_dir = project_dir
+        .canonicalize()
+        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let resolved_file = if file == Path::new(".") {
+        initial_dir.clone()
+    } else if file.is_relative() && initial_dir.join(file).exists() {
+        initial_dir.join(file)
+    } else if file.exists() {
+        file.to_path_buf()
+    } else {
+        initial_dir.join(file)
+    };
+    let canon_dir = if project_dir == Path::new(".") {
+        let search_start = if file == Path::new(".") {
+            initial_dir.as_path()
+        } else if !resolved_file.exists() && resolved_file.extension().is_some_and(|e| e == "lean")
+        {
+            resolved_file
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."))
+        } else {
+            resolved_file.as_path()
+        };
+        let inferred = crate::lake_build::find_project_root(search_start);
+        inferred.canonicalize().unwrap_or(inferred)
+    } else {
+        initial_dir
+    };
+    (canon_dir, resolved_file)
+}
+
 fn prepare_stateless_remote_file(
     file: &Path,
     project_dir: &Path,
 ) -> Result<Option<StatelessRemoteInit>> {
     crate::module_builder::reset_lake_inputs_tag_memo();
-    let canon_dir = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let (canon_dir, resolved_file) = resolve_check_project_and_target(file, project_dir);
     crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
-    let resolved_file = if file == Path::new(".") {
-        return Ok(None);
-    } else if file.is_relative() && canon_dir.join(file).exists() {
-        canon_dir.join(file)
-    } else if file.exists() {
-        file.to_path_buf()
-    } else {
-        canon_dir.join(file)
-    };
-    if resolved_file.is_dir() || !resolved_file.exists() {
+    if file == Path::new(".") || resolved_file.is_dir() || !resolved_file.exists() {
         return Ok(None);
     }
     let Ok(active_src) = fs::read_to_string(&resolved_file) else {
@@ -1304,12 +1326,10 @@ pub fn try_stateless_remote_check(
     jobs: Option<usize>,
     remote_url: &str,
 ) -> Result<bool> {
-    let canon_proj = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let (inferred_canon_dir, _) = resolve_check_project_and_target(file, project_dir);
     let kernel_prov = crate::kernel::resolve_kernel_engine(
         crate::kernel::resolve_kernel_selection_from_env(None)?,
-        &detect_toolchain(&canon_proj),
+        &detect_toolchain(&inferred_canon_dir),
     )?;
     if let Some(target_decl) = decl {
         return try_stateless_remote_single_decl_check(
@@ -1543,12 +1563,10 @@ pub fn try_stateless_remote_single_decl_check(
     remote_url: &str,
 ) -> Result<bool> {
     let t0 = Instant::now();
-    let canon_proj = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.to_path_buf());
+    let (inferred_canon_dir, _) = resolve_check_project_and_target(file, project_dir);
     let kernel_prov = crate::kernel::resolve_kernel_engine(
         crate::kernel::resolve_kernel_selection_from_env(None)?,
-        &detect_toolchain(&canon_proj),
+        &detect_toolchain(&inferred_canon_dir),
     )?;
     let Some((
         canon_dir,
@@ -1881,24 +1899,13 @@ fn run_check_command_inner(
     }
     let _lifecycle = crate::zygote::lifecycle_lock(false)?;
     let t0 = Instant::now();
-    let canon_dir = project_dir
-        .canonicalize()
-        .unwrap_or_else(|_| project_dir.clone());
+    let (canon_dir, resolved_file) = resolve_check_project_and_target(&file, &project_dir);
     crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
     let toolchain = detect_toolchain(&canon_dir);
     let kernel_prov = crate::kernel::resolve_kernel_engine(
         crate::kernel::resolve_kernel_selection_from_env(None)?,
         &toolchain,
     )?;
-    let resolved_file = if file == Path::new(".") {
-        canon_dir.clone()
-    } else if file.is_relative() && canon_dir.join(&file).exists() {
-        canon_dir.join(&file)
-    } else if file.exists() {
-        file.clone()
-    } else {
-        canon_dir.join(&file)
-    };
 
     if resolved_file.is_dir() && decl.is_none() {
         if emit_olean {
@@ -9207,6 +9214,63 @@ theorem after_macro : ext_magic = 7 := rfl
                 compute_fission_store_key(toolchain, &shard.prefix_env_hash, &sub.sub_shard_key);
             assert!(store_has_provenanced_subshard(&store, &v3_key));
         }
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_resolve_check_project_and_target_infers_nested_project_root_when_default_cwd() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_resolve_check_proj_{}",
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let outer = tmp_dir.join("outer");
+        let nested_proj = outer.join("nested").join("proj");
+        let nested_sub = nested_proj.join("Sub");
+        fs::create_dir_all(&nested_sub).unwrap();
+        fs::write(
+            outer.join("lean-toolchain"),
+            "leanprover/lean4:v4.0.0-outer\n",
+        )
+        .unwrap();
+        fs::write(
+            nested_proj.join("lean-toolchain"),
+            "leanprover/lean4:v4.99.0-nested-test\n",
+        )
+        .unwrap();
+        let sample_file = nested_proj.join("Sample.lean");
+        fs::write(&sample_file, "theorem t : True := trivial\n").unwrap();
+
+        let canon_outer = outer.canonicalize().unwrap();
+        let canon_nested = nested_proj.canonicalize().unwrap();
+
+        let (dir_abs, resolved_abs) =
+            resolve_check_project_and_target(&sample_file, Path::new("."));
+        assert_eq!(dir_abs, canon_nested);
+        assert_eq!(resolved_abs, sample_file);
+        assert_eq!(
+            detect_toolchain(&dir_abs),
+            "leanprover/lean4:v4.99.0-nested-test"
+        );
+
+        let missing_lean = nested_sub.join("Missing.lean");
+        let (dir_missing, _) = resolve_check_project_and_target(&missing_lean, Path::new("."));
+        assert_eq!(dir_missing, canon_nested);
+        assert_eq!(
+            detect_toolchain(&dir_missing),
+            "leanprover/lean4:v4.99.0-nested-test"
+        );
+
+        let (dir_subdir, _) = resolve_check_project_and_target(&nested_sub, Path::new("."));
+        assert_eq!(dir_subdir, canon_nested);
+
+        let (dir_explicit, _) = resolve_check_project_and_target(&sample_file, &outer);
+        assert_eq!(dir_explicit, canon_outer);
+        assert_eq!(
+            detect_toolchain(&dir_explicit),
+            "leanprover/lean4:v4.0.0-outer"
+        );
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }
