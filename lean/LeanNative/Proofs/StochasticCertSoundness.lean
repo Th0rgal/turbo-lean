@@ -50,73 +50,25 @@ theorem foldCertifiedScalars_sound (profile : HardwareCostProfile) (certs : List
   | cons cert rest ih => exact (applyCertToScalar_sound profile e cert).trans (ih _)
 
 theorem scalarRefines_eval {a b : ScalarExpr} (h : ExprRefines (.scalar a) (.scalar b))
-    (env : VarEnv) (v : Val) (hv : evalScalarExpr env a = .ok v) : evalScalarExpr env b = .ok v := by
-  have hh := h env HeapState.empty v HeapState.empty (by simp [evalExpr, hv])
-  cases he : evalScalarExpr env b <;> simp_all [evalExpr]
+    (env : VarEnv) (v : Val) (hv : evalScalarExpr env a = .ok v) : evalScalarExpr env b = .ok v :=
+  ExprRefines.scalar_eval h env v hv
 
 theorem scalarRefines_of_eval {a b : ScalarExpr}
     (h : ∀ env v, evalScalarExpr env a = .ok v → evalScalarExpr env b = .ok v) :
-    ExprRefines (.scalar a) (.scalar b) := by
-  intro env st v st' hv
-  cases he : evalScalarExpr env a with
-  | error err => simp [evalExpr, he] at hv
-  | ok w => simpa [evalExpr, he, h env w he] using hv
+    ExprRefines (.scalar a) (.scalar b) := ExprRefines.scalar_of_eval h
 
 theorem applyCertsToScalar_sound (profile : HardwareCostProfile) (certs : List CertifiedRewriteCert)
     (e : ScalarExpr) : ExprRefines (.scalar e) (.scalar (applyCertsToScalar profile certs e)) := by
   induction e with
   | constU64 _ | constBool _ | var _ => exact foldCertifiedScalars_sound _ _ _
   | binOp op a b iha ihb =>
-    apply ExprRefines.trans (e2 := .scalar (.binOp op _ _)) ?_ (foldCertifiedScalars_sound _ _ _)
-    apply scalarRefines_of_eval
-    intro env v hv
-    cases ha : evalScalarExpr env a <;> cases hb : evalScalarExpr env b <;>
-      simp only [evalScalarExpr, ha, hb] at hv
-    all_goals try contradiction
-    simpa only [evalScalarExpr, scalarRefines_eval iha _ _ ha, scalarRefines_eval ihb _ _ hb] using hv
+    exact (ExprRefines.scalar_binOp_congr iha ihb).trans (foldCertifiedScalars_sound _ _ _)
   | unaryOp op a ih =>
-    apply ExprRefines.trans (e2 := .scalar (.unaryOp op _)) ?_ (foldCertifiedScalars_sound _ _ _)
-    apply scalarRefines_of_eval
-    intro env v hv
-    cases ha : evalScalarExpr env a with
-    | error err => simp [evalScalarExpr, ha] at hv
-    | ok w =>
-      simp only [evalScalarExpr, ha] at hv
-      simpa only [evalScalarExpr, scalarRefines_eval ih _ _ ha] using hv
+    exact (ExprRefines.scalar_unaryOp_congr ih).trans (foldCertifiedScalars_sound _ _ _)
   | select c t f ihc iht ihf =>
-    apply ExprRefines.trans (e2 := .scalar (.select _ _ _)) ?_ (foldCertifiedScalars_sound _ _ _)
-    apply scalarRefines_of_eval
-    intro env v hv
-    cases hc : evalScalarExpr env c with
-    | error err => simp [evalScalarExpr, hc] at hv
-    | ok w =>
-      simp only [evalScalarExpr, scalarRefines_eval ihc _ _ hc]
-      simp only [evalScalarExpr, hc] at hv
-      cases w with
-      | bool b =>
-        cases b
-        · exact scalarRefines_eval ihf _ _ hv
-        · exact scalarRefines_eval iht _ _ hv
-      | u64 n | u256 n =>
-        dsimp only at hv ⊢
-        split at hv <;> rename_i h
-        · simpa [h] using scalarRefines_eval iht _ _ hv
-        · simpa [h] using scalarRefines_eval ihf _ _ hv
-      | _ => contradiction
+    exact (ExprRefines.scalar_select_congr ihc iht ihf).trans (foldCertifiedScalars_sound _ _ _)
   | fma a b c iha ihb ihc =>
-    apply ExprRefines.trans (e2 := .scalar (.fma _ _ _)) ?_ (foldCertifiedScalars_sound _ _ _)
-    apply scalarRefines_of_eval
-    intro env v hv
-    cases ha : evalScalarExpr env a <;> cases hb : evalScalarExpr env b <;>
-      simp only [evalScalarExpr, ha, hb] at hv
-    all_goals try contradiction
-    simp only [evalScalarExpr, scalarRefines_eval iha _ _ ha, scalarRefines_eval ihb _ _ hb]
-    split at hv
-    · rename_i x y hx hy
-      rw [hx, scalarRefines_eval ihc _ _ hy]
-      exact hv
-    · contradiction
-    · contradiction
+    exact (ExprRefines.scalar_fma_congr iha ihb ihc).trans (foldCertifiedScalars_sound _ _ _)
 
 theorem applyCertifiedBundleCode_sound (bundle : CertifiedRuleBundle) (code : LNIRCode) :
     CodeRefines code (applyCertifiedBundleCode bundle code) := by

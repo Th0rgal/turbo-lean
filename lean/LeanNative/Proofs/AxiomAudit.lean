@@ -67,6 +67,11 @@ def auditedTheoremNames : List Name :=
   [ ``LeanNative.Semantics.ScalarExprEquiv.refl, ``LeanNative.Semantics.ScalarExprEquiv.symm
   , ``LeanNative.Semantics.ScalarExprEquiv.trans, ``LeanNative.Semantics.ExprRefines.refl
   , ``LeanNative.Semantics.ExprRefines.trans, ``LeanNative.Semantics.ExprRefines.of_scalar_equiv
+  , ``LeanNative.Semantics.ExprRefines.scalar_eval, ``LeanNative.Semantics.ExprRefines.scalar_of_eval
+  , ``LeanNative.Semantics.ExprRefines.scalar_unaryOp_congr
+  , ``LeanNative.Semantics.ExprRefines.scalar_binOp_congr
+  , ``LeanNative.Semantics.ExprRefines.scalar_select_congr
+  , ``LeanNative.Semantics.ExprRefines.scalar_fma_congr
   , ``LeanNative.Semantics.ExprEquiv.refl, ``LeanNative.Semantics.ExprEquiv.symm
   , ``LeanNative.Semantics.ExprEquiv.trans, ``LeanNative.Semantics.ExprEquiv.toRefines
   , ``LeanNative.Semantics.CodeRefines.refl, ``LeanNative.Semantics.CodeRefines.trans

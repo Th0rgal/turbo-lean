@@ -28,7 +28,15 @@ fn temp_test_dir(label: &str) -> PathBuf {
 }
 
 fn write_executable(path: &Path, content: &str) {
-    fs::write(path, content).unwrap();
+    fs::write(
+        path,
+        content.replacen(
+            "#!/bin/sh\n",
+            "#!/bin/sh\nif [ \"$2\" = \"--verify-bundle\" ]; then exit 0; fi\n",
+            1,
+        ),
+    )
+    .unwrap();
     let mut perms = fs::metadata(path).unwrap().permissions();
     perms.set_mode(0o755);
     fs::set_permissions(path, perms).unwrap();
@@ -202,6 +210,11 @@ fn pack_export_rejects_missing_bundle_and_report_schema() {
         serde_json::from_str(include_str!("fixtures/empty_stochastic_bundle.json")).unwrap();
     let mut malformed = good.clone();
     malformed["certificates"] = serde_json::json!([{}]);
+    let mut corrupt_wire = good.clone();
+    corrupt_wire["certificates"] = serde_json::json!([{
+        "theoremRef": "test", "costBefore": 2, "costAfter": 1,
+        "candidate": {"lhs": "LNIR_WIRE_V1|malformed", "rhs": "LNIR_WIRE_V1|garbage"}
+    }]);
     let mut non_improving = good;
     non_improving["certificates"] = serde_json::json!([{
         "theoremRef": "test", "costBefore": 1, "costAfter": 1,
@@ -213,6 +226,7 @@ fn pack_export_rejects_missing_bundle_and_report_schema() {
         Some(serde_json::json!({"schema":"lean-native.stochastic-cert.v1"})),
         Some(malformed),
         Some(non_improving),
+        Some(corrupt_wire),
     ] {
         if let Some(payload) = payload {
             fs::write(&bundle, serde_json::to_vec(&payload).unwrap()).unwrap();
@@ -337,6 +351,9 @@ fn real_bundle_json_raw_and_zstd_pack_consumption_and_rejection() {
     unsound["certificates"][0]["candidate"]["rhs"] =
         good["certificates"][0]["candidate"]["lhs"].clone();
     let mut add_one = good.clone();
+    let mut malformed_wire = good.clone();
+    malformed_wire["certificates"][0]["candidate"]["lhs"] =
+        serde_json::json!("LNIR_WIRE_V1|malformed");
     let scalar_wire = good["certificates"][0]["candidate"]["lhs"]
         .as_str()
         .unwrap();
@@ -363,12 +380,22 @@ fn real_bundle_json_raw_and_zstd_pack_consumption_and_rejection() {
         serde_json::to_vec(&bad_theorem).unwrap(),
         serde_json::to_vec(&unsound).unwrap(),
         serde_json::to_vec(&add_one).unwrap(),
+        serde_json::to_vec(&malformed_wire).unwrap(),
     ];
     let invalid = root.join("invalid");
     for data in std::iter::once(None).chain(cases.iter().map(Some)) {
         if let Some(data) = data {
             fs::write(&invalid, data).unwrap();
         }
+        let verified = Command::new(&core)
+            .args(["superopt-evolve", "--verify-bundle"])
+            .arg(&invalid)
+            .output()
+            .unwrap();
+        assert!(
+            !verified.status.success(),
+            "verifier accepted invalid bundle"
+        );
         for command in ["compile-llvm", "verify-certs"] {
             let out = Command::new(&core)
                 .args([command, "--canonical", "--stochastic-bundle"])
@@ -377,6 +404,31 @@ fn real_bundle_json_raw_and_zstd_pack_consumption_and_rejection() {
                 .unwrap();
             assert!(!out.status.success(), "accepted invalid bundle");
         }
+    }
+    // A producer may report success while leaving a forged bundle. Delegate
+    // verification to the real Lean core and ensure publication never occurs.
+    let producer = root.join("forged-producer");
+    fs::write(&producer, format!(
+        "#!/bin/sh\nif [ \"$2\" = \"--verify-bundle\" ]; then exec '{}' \"$@\"; fi\nprintf '{{}}'\n",
+        core.display()
+    )).unwrap();
+    fs::set_permissions(&producer, fs::Permissions::from_mode(0o755)).unwrap();
+    let rejected_pack = root.join("rejected.tlpack");
+    for payload in [&add_one, &malformed_wire] {
+        fs::write(&invalid, serde_json::to_vec(payload).unwrap()).unwrap();
+        let out = run_turbo(
+            &root.join("rejected-cache"),
+            &producer,
+            &[
+                "superopt-evolve",
+                "--bundle-out",
+                invalid.to_str().unwrap(),
+                "--pack-out",
+                rejected_pack.to_str().unwrap(),
+            ],
+        );
+        assert!(!out.status.success());
+        assert!(!rejected_pack.exists());
     }
     fs::remove_dir_all(root).unwrap();
 }

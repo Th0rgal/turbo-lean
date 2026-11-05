@@ -491,6 +491,9 @@ def SuperoptEvolveReceipt.formatSummary (r : SuperoptEvolveReceipt) (bundleOut? 
 
 def runSuperoptEvolve (elaborateHook? : Option (String → TargetArch → IO LNIRModule))
     (args : List String) : IO UInt32 := do
+  if let ["--verify-bundle", path] := args then
+    let _ ← loadStochasticBundleFromPath path
+    return 0
   let cfg ← match parseSuperoptEvolveArgs args with
     | .ok c => pure c
     | .error msg => throw <| IO.userError msg

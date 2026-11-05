@@ -180,6 +180,95 @@ pub fn resolve_lean_native_core_bin() -> Result<PathBuf> {
     )
 }
 
+// Check the scalar wrapper emitted by StochasticJson.scalarValue. Lean remains
+// authoritative for decoding the expression and checking its certificate.
+fn is_scalar_wire(wire: &str) -> bool {
+    let tokens: Vec<_> = wire.split('|').collect();
+    let mut expr = tokens.get(13..).unwrap_or_default().iter().copied();
+    let mut pending = 1usize;
+    while pending > 0 {
+        pending -= 1;
+        match expr.next() {
+            Some("S_u64" | "S_var") => {
+                if !expr
+                    .next()
+                    .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                {
+                    return false;
+                }
+            }
+            Some("S_bool") if matches!(expr.next(), Some("0" | "1")) => {}
+            Some("S_un") if matches!(expr.next(), Some("U_not" | "U_neg" | "U_clz256")) => {
+                pending += 1
+            }
+            Some("S_bin")
+                if matches!(
+                    expr.next(),
+                    Some(
+                        "B_add"
+                            | "B_sub"
+                            | "B_mul"
+                            | "B_div"
+                            | "B_mod"
+                            | "B_bitAnd"
+                            | "B_bitOr"
+                            | "B_bitXor"
+                            | "B_shl"
+                            | "B_shr"
+                            | "B_sar"
+                            | "B_eq"
+                            | "B_lt"
+                            | "B_le"
+                            | "B_addChecked256"
+                            | "B_subChecked256"
+                            | "B_mulChecked256"
+                            | "B_clmul64"
+                            | "B_clmul64Hi"
+                            | "B_gf2Affine"
+                            | "B_eor3"
+                    )
+                ) =>
+            {
+                pending += 2
+            }
+            Some("S_sel" | "S_fma") => pending += 3,
+            _ => return false,
+        }
+    }
+    let suffix: Vec<_> = expr.collect();
+    tokens.len() >= 17
+        && tokens[..5]
+            == [
+                "LNIR_WIRE_V1",
+                "7363616c6172",
+                "1",
+                "D_decl",
+                "7363616c6172",
+            ]
+        && matches!(
+            tokens[5],
+            "A_L0" | "A_L1" | "A_L2" | "A_L3" | "A_L4" | "A_TEST"
+        )
+        && tokens[6..13] == ["0", "0", "T_i64", "C_let", "0", "T_i64", "E_scalar"]
+        && (suffix == ["C_ret", "0"] || suffix == ["C_ret", "0", "F_facts", "0"])
+}
+
+fn verify_bundle_with_lean_core(lean_core_bin: &Path, bundle_path: &Path) -> Result<()> {
+    let output = Command::new(lean_core_bin)
+        .arg("superopt-evolve")
+        .arg("--verify-bundle")
+        .arg(bundle_path)
+        .env("LEAN_NATIVE_TELEMETRY", "off")
+        .output()
+        .context("Failed to execute Lean bundle verifier")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "Lean bundle verification failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(())
+}
+
 fn validate_stochastic_cert_bundle(value: &serde_json::Value) -> Result<()> {
     use serde_json::Value;
     let string = |v: &Value, key: &str| -> Result<()> {
@@ -231,10 +320,7 @@ fn validate_stochastic_cert_bundle(value: &serde_json::Value) -> Result<()> {
         for key in ["lhs", "rhs"] {
             string(&cert["candidate"], key)?;
             anyhow::ensure!(
-                cert["candidate"][key]
-                    .as_str()
-                    .unwrap()
-                    .starts_with("LNIR_WIRE_V1|"),
+                is_scalar_wire(cert["candidate"][key].as_str().unwrap()),
                 "Invalid candidate {key}"
             );
         }
@@ -272,6 +358,15 @@ pub fn export_bundle_to_pack(
         pack_out.display()
     );
     let target = normalize_superopt_target(&args.target)?;
+    // Verify the exact bytes that will be published, including callers that
+    // bypass collect_bundle_artifacts. Missing Lean verification fails closed.
+    let verifier = resolve_lean_native_core_bin()?;
+    let staging = TempBundleGuard::new(store)?;
+    for (_, bytes) in artifacts {
+        validate_stochastic_cert_bundle(&serde_json::from_slice(bytes)?)?;
+        fs::write(staging.bundle_path(), bytes)?;
+        verify_bundle_with_lean_core(&verifier, &staging.bundle_path())?;
+    }
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"turbo-lean:superopt-evolve:v1\0");
     hasher.update(target.as_bytes());
@@ -527,6 +622,10 @@ mod tests {
                 "theoremRef": "test", "costBefore": 1, "costAfter": 1,
                 "candidate": {"lhs": "LNIR_WIRE_V1|", "rhs": "LNIR_WIRE_V1|"}
             }),
+            serde_json::json!({
+                "theoremRef": "test", "costBefore": 2, "costAfter": 1,
+                "candidate": {"lhs": "LNIR_WIRE_V1|malformed", "rhs": "LNIR_WIRE_V1|garbage"}
+            }),
         ] {
             let mut bad = good.clone();
             bad["certificates"] = serde_json::json!([cert]);
@@ -553,7 +652,15 @@ mod tests {
     fn write_mock_helper(dir: &Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("mock-lean-native-core");
-        fs::write(&path, body).unwrap();
+        fs::write(
+            &path,
+            body.replacen(
+                "#!/bin/sh\n",
+                "#!/bin/sh\nif [ \"$2\" = \"--verify-bundle\" ]; then exit 0; fi\n",
+                1,
+            ),
+        )
+        .unwrap();
         let mut perms = fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&path, perms).unwrap();

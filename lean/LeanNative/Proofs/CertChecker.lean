@@ -119,6 +119,9 @@ def verifiedTheoremRegistry : List String :=
   let sem := [
     "ScalarExprEquiv.refl", "ScalarExprEquiv.symm", "ScalarExprEquiv.trans",
     "ExprRefines.refl", "ExprRefines.trans", "ExprRefines.of_scalar_equiv",
+    "ExprRefines.scalar_eval", "ExprRefines.scalar_of_eval",
+    "ExprRefines.scalar_unaryOp_congr", "ExprRefines.scalar_binOp_congr",
+    "ExprRefines.scalar_select_congr", "ExprRefines.scalar_fma_congr",
     "ExprEquiv.refl", "ExprEquiv.symm", "ExprEquiv.trans", "ExprEquiv.toRefines",
     "CodeRefines.refl", "CodeRefines.trans", "CodeRefines.letBind_congr",
     "CodeRefines.rawStore_congr", "CodeRefines.incRef_congr", "CodeRefines.decRef_congr",
