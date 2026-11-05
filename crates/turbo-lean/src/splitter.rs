@@ -1300,6 +1300,7 @@ fn is_top_level_command_start(trimmed: &str) -> bool {
         "example ",
         "alias ",
         "assert_not_exists ",
+        "assert_not_imported",
         "library_note ",
         "add_decl_doc ",
         "grind_pattern ",
@@ -1317,6 +1318,19 @@ fn is_top_level_command_start(trimmed: &str) -> bool {
         "#eval",
         "#print",
         "#guard_msgs",
+        "#guard_panic",
+        "#guard",
+        "#info_trees",
+        "#time",
+        "#with_exporting",
+        "#exit",
+        "#where",
+        "#version",
+        "#recall",
+        "#show_deprecated_modules",
+        "#import_path",
+        "#discr_tree_key",
+        "#discr_tree_simp_key",
         "#reduce",
         "#synth",
         "run_cmd",
@@ -1390,30 +1404,7 @@ fn strip_leading_attr_block(s: &str) -> Option<&str> {
 
 /// Strip a leading `set_option <opt> <val> in` prefix attached to a declaration.
 fn strip_leading_set_option_in(s: &str) -> Option<&str> {
-    let after_kw = s.strip_prefix("set_option")?;
-    if !after_kw.starts_with(char::is_whitespace) {
-        return None;
-    }
-    let first_line_end = s.find('\n').unwrap_or(s.len());
-    let first_line = &s[..first_line_end];
-    let trimmed_line = first_line.trim_end();
-    if let Some(before_in) = trimmed_line.strip_suffix(" in") {
-        if before_in.len() > "set_option".len() {
-            return Some(&s[trimmed_line.len()..]);
-        }
-        return None;
-    }
-    let mut rest = after_kw.trim_start();
-    let opt_end = rest.find(char::is_whitespace)?;
-    rest = rest[opt_end..].trim_start();
-    let val_end = rest.find(char::is_whitespace)?;
-    rest = rest[val_end..].trim_start();
-    let after_in = rest.strip_prefix("in")?;
-    if after_in.is_empty() || after_in.starts_with(char::is_whitespace) {
-        Some(after_in)
-    } else {
-        None
-    }
+    strip_leading_set_option_in_robust(s)
 }
 
 /// Strip leading attributes (`@[...]`), `set_option ... in`, and declaration modifiers (`private`,
@@ -1500,7 +1491,11 @@ fn is_incomplete_prefix_only_span(orig_chunk: &str, clean_chunk: &str) -> bool {
 }
 
 fn is_mutual_line_start(trimmed_clean: &str) -> bool {
-    let after = strip_decl_prefixes(trimmed_clean);
+    let base = match unwrap_command_bearing_diagnostic_wrappers(trimmed_clean) {
+        CommandBearingWrapperUnwrap::Inner { inner, .. } => inner,
+        _ => trimmed_clean,
+    };
+    let after = strip_decl_and_in_prefixes(base);
     after == "mutual"
         || after
             .strip_prefix("mutual")
@@ -1509,7 +1504,8 @@ fn is_mutual_line_start(trimmed_clean: &str) -> bool {
 }
 
 fn is_end_line_start(trimmed_clean: &str) -> bool {
-    trimmed_clean == "end" || trimmed_clean.starts_with("end ")
+    let base = unwrap_scope_line_wrappers(trimmed_clean);
+    base == "end" || base.starts_with("end ")
 }
 
 pub(crate) fn is_section_header_line(trimmed_clean: &str) -> bool {
@@ -6353,8 +6349,9 @@ fn parse_decl_modifiers_and_attrs(clean_cmd: &str) -> (Vec<String>, Vec<String>)
             rest = after_attr.trim_start();
             continue;
         }
-        if let Some(after_opt) = strip_leading_set_option_in(rest) {
-            rest = after_opt.trim_start();
+        let (after_in, in_list) = strip_leading_in_command_prefixes_with_list(rest);
+        if !in_list.is_empty() {
+            rest = after_in.trim_start();
             continue;
         }
         let mut stripped = false;
@@ -6428,11 +6425,50 @@ struct PubScopeFrame {
     section_has_expose: bool,
 }
 
+fn unwrap_scope_line_wrappers(s: &str) -> &str {
+    let trimmed = s.trim();
+    let mut cur = trimmed;
+    loop {
+        if let Some(after_time) = cur
+            .strip_prefix("#time")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
+            cur = after_time.trim_start();
+            continue;
+        }
+        if let Some(after_gm) = strip_leading_guard_msgs_in(cur).filter(|r| !r.trim().is_empty()) {
+            cur = after_gm.trim_start();
+            continue;
+        }
+        if let Some(after_gp) =
+            strip_leading_simple_in_wrapper(cur, "#guard_panic").filter(|r| !r.trim().is_empty())
+        {
+            cur = after_gp.trim_start();
+            continue;
+        }
+        if let Some(after_it) =
+            strip_leading_simple_in_wrapper(cur, "#info_trees").filter(|r| !r.trim().is_empty())
+        {
+            cur = after_it.trim_start();
+            continue;
+        }
+        if let Some(after_we) = cur
+            .strip_prefix("#with_exporting")
+            .filter(|r| r.starts_with(char::is_whitespace))
+        {
+            cur = after_we.trim_start();
+            continue;
+        }
+        break;
+    }
+    cur
+}
+
 fn update_pub_scope_stack(stack: &mut Vec<PubScopeFrame>, orig_chunk: &str) {
     let masked = mask_lean_lexemes(orig_chunk, true);
     for (line, orig_line) in masked.lines().zip(orig_chunk.lines()) {
-        let trimmed = line.trim();
-        let orig_trimmed = orig_line.trim();
+        let trimmed = unwrap_scope_line_wrappers(line.trim());
+        let orig_trimmed = unwrap_scope_line_wrappers(orig_line.trim());
         if let Some(rest) = trimmed.strip_prefix("namespace ") {
             let orig_rest = orig_trimmed.strip_prefix("namespace ").unwrap_or(rest);
             let name = take_leading_lean_ident(orig_rest.trim_start())
@@ -6554,7 +6590,7 @@ fn split_at_top_level_where(cmd: &str) -> Option<(&str, &str)> {
             b'}' => brace = (brace - 1).max(0),
             _ => {}
         }
-        i += 1;
+        i += cmd[i..].chars().next()?.len_utf8();
     }
     None
 }
@@ -6600,7 +6636,7 @@ fn decl_header_has_explicit_type_annotation(sig_part: &str) -> bool {
             }
             _ => {}
         }
-        i += 1;
+        i += sig_part[i..].chars().next().map_or(1, char::len_utf8);
     }
     false
 }
@@ -6623,19 +6659,321 @@ fn pub_qualified_name(name: &str, stack: &[PubScopeFrame]) -> String {
 }
 
 fn strip_leading_in_command_prefixes(s: &str) -> &str {
+    strip_leading_in_command_prefixes_with_list(s).0
+}
+
+fn strip_leading_in_command_prefixes_with_list(s: &str) -> (&str, Vec<String>) {
     let mut rest = s.trim_start();
+    let mut prefixes = Vec::new();
     loop {
-        if let Some(after_opt) = strip_leading_set_option_in(rest) {
+        if let Some(after_opt) = strip_leading_set_option_in_robust(rest) {
+            let consumed = rest.len() - after_opt.len();
+            prefixes.push(normalize_whitespace(&rest[..consumed]));
             rest = after_opt.trim_start();
             continue;
         }
         if let Some(after_open) = strip_leading_open_in(rest) {
+            let consumed = rest.len() - after_open.len();
+            prefixes.push(normalize_whitespace(&rest[..consumed]));
             rest = after_open.trim_start();
+            continue;
+        }
+        if let Some((after_gen_in, prefix_str)) = strip_leading_other_ctx_cmd_in(rest) {
+            prefixes.push(prefix_str);
+            rest = after_gen_in.trim_start();
             continue;
         }
         break;
     }
+    (rest, prefixes)
+}
+
+fn strip_leading_other_ctx_cmd_in(s: &str) -> Option<(&str, String)> {
+    const CTX_KWS: &[&str] = &[
+        "variable",
+        "variables",
+        "universe",
+        "universes",
+        "include",
+        "omit",
+    ];
+    let matched_kw = CTX_KWS.iter().find(|&&kw| {
+        s.strip_prefix(kw)
+            .is_some_and(|r| r.starts_with(char::is_whitespace))
+    })?;
+    let bytes = s.as_bytes();
+    let mut paren = 0i32;
+    let mut bracket = 0i32;
+    let mut brace = 0i32;
+    let mut strict_brace = 0i32;
+    let mut i = matched_kw.len();
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(s, i) {
+            i = span.end;
+            continue;
+        }
+        if bytes[i..].starts_with("⦃".as_bytes()) {
+            strict_brace += 1;
+            i += "⦃".len();
+            continue;
+        }
+        if bytes[i..].starts_with("⦄".as_bytes()) {
+            strict_brace = (strict_brace - 1).max(0);
+            i += "⦄".len();
+            continue;
+        }
+        if paren == 0
+            && bracket == 0
+            && brace == 0
+            && strict_brace == 0
+            && i + 2 <= bytes.len()
+            && &bytes[i..i + 2] == b"in"
+            && bytes[i - 1].is_ascii_whitespace()
+            && (i + 2 == bytes.len() || bytes[i + 2].is_ascii_whitespace())
+        {
+            let consumed = i + 2;
+            return Some((&s[consumed..], normalize_whitespace(&s[..consumed])));
+        }
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            _ => {}
+        }
+        i += s[i..].chars().next()?.len_utf8();
+    }
+    None
+}
+
+fn strip_leading_set_option_in_robust(s: &str) -> Option<&str> {
+    let after_kw = s.strip_prefix("set_option")?;
+    if !after_kw.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut i = "set_option".len();
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    // Option name (identifier / dotted identifier, possibly guillemet-escaped).
+    let name_start = i;
+    while i < bytes.len() {
+        if let Some(end) = scan_lean_guillemet_ident_end(s, i) {
+            i = end;
+            continue;
+        }
+        if bytes[i].is_ascii_whitespace() {
+            break;
+        }
+        i += s[i..].chars().next()?.len_utf8();
+    }
+    if i == name_start || i >= bytes.len() {
+        return None;
+    }
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    // Option value: string literal, raw string literal, or non-whitespace token (`true`/`false`/numeral).
+    if let Some(end) = scan_lean_norm_literal_end(s, i) {
+        i = end;
+    } else {
+        let val_start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += s[i..].chars().next()?.len_utf8();
+        }
+        if i == val_start {
+            return None;
+        }
+    }
+    let before_ws = i;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i == before_ws {
+        return None;
+    }
+    let after_in = s[i..].strip_prefix("in")?;
+    if after_in.is_empty() || after_in.starts_with(char::is_whitespace) {
+        Some(after_in)
+    } else {
+        None
+    }
+}
+
+fn strip_leading_guard_msgs_in(s: &str) -> Option<&str> {
+    let after_kw = s.strip_prefix("#guard_msgs")?;
+    if !after_kw.starts_with(char::is_whitespace) && !after_kw.starts_with('(') {
+        return None;
+    }
+    let mut rest = after_kw.trim_start();
+    if rest.starts_with('(') {
+        let bytes = rest.as_bytes();
+        let mut paren = 0i32;
+        let mut bracket = 0i32;
+        let mut brace = 0i32;
+        let mut i = 0usize;
+        let mut close_end = None;
+        while i < bytes.len() {
+            if let Some(span) = skip_lean_lexeme(rest, i) {
+                i = span.end;
+                continue;
+            }
+            match bytes[i] {
+                b'(' => paren += 1,
+                b')' => {
+                    paren -= 1;
+                    if paren == 0 && bracket == 0 && brace == 0 {
+                        close_end = Some(i + 1);
+                        break;
+                    }
+                }
+                b'[' => bracket += 1,
+                b']' => bracket = (bracket - 1).max(0),
+                b'{' => brace += 1,
+                b'}' => brace = (brace - 1).max(0),
+                _ => {}
+            }
+            i += rest[i..].chars().next()?.len_utf8();
+        }
+        rest = rest[close_end?..].trim_start();
+    }
+    let after_in = rest.strip_prefix("in")?;
+    if after_in.is_empty() || after_in.starts_with(char::is_whitespace) {
+        Some(after_in)
+    } else {
+        None
+    }
+}
+
+fn strip_leading_simple_in_wrapper<'a>(s: &'a str, kw: &str) -> Option<&'a str> {
+    let after_kw = s.strip_prefix(kw)?;
+    if !after_kw.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let rest = after_kw.trim_start();
+    let after_in = rest.strip_prefix("in")?;
+    if after_in.is_empty() || after_in.starts_with(char::is_whitespace) {
+        Some(after_in)
+    } else {
+        None
+    }
+}
+
+enum CommandBearingWrapperUnwrap<'a> {
+    NotWrapper,
+    EmptyInner {
+        in_prefixes: Vec<String>,
+        with_exporting: bool,
+    },
+    Inner {
+        inner: &'a str,
+        in_prefixes: Vec<String>,
+        with_exporting: bool,
+    },
+}
+
+fn unwrap_command_bearing_diagnostic_wrappers(s: &str) -> CommandBearingWrapperUnwrap<'_> {
+    let mut cur = s.trim_start();
+    let mut unwrapped_any = false;
+    let mut in_prefixes = Vec::new();
+    let mut with_exporting = false;
+    loop {
+        let cur_no_doc = strip_leading_doc_comments_only(cur);
+        let (after_in_prefixes, mut stripped_here) =
+            strip_leading_in_command_prefixes_with_list(cur_no_doc);
+        let after_in_no_doc = strip_leading_doc_comments_only(after_in_prefixes);
+        if let Some(after_time) = after_in_no_doc
+            .strip_prefix("#time")
+            .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+        {
+            unwrapped_any = true;
+            in_prefixes.append(&mut stripped_here);
+            cur = after_time.trim_start();
+            continue;
+        }
+        if let Some(after_gm) = strip_leading_guard_msgs_in(after_in_no_doc) {
+            unwrapped_any = true;
+            in_prefixes.append(&mut stripped_here);
+            cur = after_gm.trim_start();
+            continue;
+        }
+        if let Some(after_gp) = strip_leading_simple_in_wrapper(after_in_no_doc, "#guard_panic") {
+            unwrapped_any = true;
+            in_prefixes.append(&mut stripped_here);
+            cur = after_gp.trim_start();
+            continue;
+        }
+        if let Some(after_it) = strip_leading_simple_in_wrapper(after_in_no_doc, "#info_trees") {
+            unwrapped_any = true;
+            in_prefixes.append(&mut stripped_here);
+            cur = after_it.trim_start();
+            continue;
+        }
+        if let Some(after_we) = after_in_no_doc
+            .strip_prefix("#with_exporting")
+            .filter(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+        {
+            unwrapped_any = true;
+            with_exporting = true;
+            in_prefixes.append(&mut stripped_here);
+            cur = after_we.trim_start();
+            continue;
+        }
+        if !unwrapped_any {
+            return CommandBearingWrapperUnwrap::NotWrapper;
+        }
+        if after_in_no_doc.is_empty() {
+            in_prefixes.append(&mut stripped_here);
+            return CommandBearingWrapperUnwrap::EmptyInner {
+                in_prefixes,
+                with_exporting,
+            };
+        }
+        in_prefixes.append(&mut stripped_here);
+        return CommandBearingWrapperUnwrap::Inner {
+            inner: after_in_no_doc,
+            in_prefixes,
+            with_exporting,
+        };
+    }
+}
+
+fn strip_leading_doc_comments_only(s: &str) -> &str {
+    let mut rest = s.trim_start();
+    while let Some((end, is_doc)) = scan_lean_block_comment_end(rest, 0) {
+        if is_doc {
+            rest = rest[end..].trim_start();
+        } else {
+            break;
+        }
+    }
     rest
+}
+
+fn is_malformed_command_bearing_wrapper_start(s: &str) -> bool {
+    let core = strip_leading_in_command_prefixes(s);
+    ["#guard_msgs", "#guard_panic", "#info_trees"]
+        .iter()
+        .any(|kw| {
+            core.strip_prefix(kw).is_some_and(|r| {
+                r.is_empty() || r.starts_with(char::is_whitespace) || r.starts_with('(')
+            })
+        })
+}
+
+fn is_exit_cmd(after_prefixes: &str) -> bool {
+    let core = strip_leading_in_command_prefixes(after_prefixes);
+    core.strip_prefix("#exit")
+        .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace))
 }
 
 fn strip_leading_open_in(s: &str) -> Option<&str> {
@@ -6672,7 +7010,7 @@ fn strip_leading_open_in(s: &str) -> Option<&str> {
             b'}' => brace = (brace - 1).max(0),
             _ => {}
         }
-        i += 1;
+        i += s[i..].chars().next()?.len_utf8();
     }
     None
 }
@@ -6705,7 +7043,7 @@ fn extract_attribute_cmd_bracket_inner(after_prefixes: &str) -> Option<&str> {
             }
             _ => {}
         }
-        i += 1;
+        i += rest[i..].chars().next()?.len_utf8();
     }
     None
 }
@@ -6724,23 +7062,19 @@ fn is_pure_diagnostic_or_example_cmd(after_prefixes: &str) -> bool {
         "#check_assertions",
         "#check_simp",
         "#check_tactic",
-        "#eval",
+        "#check_tactic_failure",
         "#print",
         "#reduce",
         "#synth",
         "#guard",
-        "#guard_msgs",
-        "#guard_panic",
         "#guard_expr",
-        "#time",
         "#where",
         "#version",
-        "#exit",
         "#recall",
-        "#info_trees",
         "#show_deprecated_modules",
-        "assert_not_exists",
-        "assert_not_imported",
+        "#import_path",
+        "#discr_tree_key",
+        "#discr_tree_simp_key",
     ]
     .iter()
     .any(|kw| {
@@ -6748,6 +7082,150 @@ fn is_pure_diagnostic_or_example_cmd(after_prefixes: &str) -> bool {
             r.is_empty() || r.starts_with(char::is_whitespace) || r.starts_with('!')
         })
     })
+}
+
+fn collect_decl_in_prefixes(clean_cmd: &str) -> Vec<String> {
+    const MODS: &[&str] = &[
+        "private",
+        "protected",
+        "noncomputable",
+        "scoped",
+        "local",
+        "unsafe",
+        "partial",
+        "nonrec",
+        "public",
+        "meta",
+    ];
+    let mut out = Vec::new();
+    let mut rest = clean_cmd.trim_start();
+    loop {
+        if let Some((end, is_doc)) = scan_lean_block_comment_end(rest, 0) {
+            if is_doc {
+                rest = rest[end..].trim_start();
+                continue;
+            }
+        }
+        if let Some(after_attr) = strip_leading_attr_block(rest) {
+            rest = after_attr.trim_start();
+            continue;
+        }
+        let (after_in, mut in_list) = strip_leading_in_command_prefixes_with_list(rest);
+        if !in_list.is_empty() {
+            out.append(&mut in_list);
+            rest = after_in.trim_start();
+            continue;
+        }
+        let mut stripped = false;
+        for &m in MODS {
+            if let Some(after_m) = rest.strip_prefix(m) {
+                if after_m.is_empty() || after_m.starts_with(char::is_whitespace) {
+                    let trimmed_after = after_m.trim_start();
+                    if matches!(m, "noncomputable" | "public" | "meta")
+                        && (trimmed_after == "section"
+                            || trimmed_after.starts_with("section ")
+                            || trimmed_after.starts_with("import "))
+                    {
+                        break;
+                    }
+                    rest = trimmed_after;
+                    stripped = true;
+                    break;
+                }
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    out
+}
+
+fn strip_decl_and_in_prefixes(clean_cmd: &str) -> &str {
+    const MODS: &[&str] = &[
+        "private",
+        "protected",
+        "noncomputable",
+        "scoped",
+        "local",
+        "unsafe",
+        "partial",
+        "nonrec",
+        "public",
+        "meta",
+    ];
+    let mut rest = clean_cmd.trim_start();
+    loop {
+        if let Some((end, is_doc)) = scan_lean_block_comment_end(rest, 0) {
+            if is_doc {
+                rest = rest[end..].trim_start();
+                continue;
+            }
+        }
+        if let Some(after_attr) = strip_leading_attr_block(rest) {
+            rest = after_attr.trim_start();
+            continue;
+        }
+        let (after_in, in_list) = strip_leading_in_command_prefixes_with_list(rest);
+        if !in_list.is_empty() {
+            rest = after_in.trim_start();
+            continue;
+        }
+        let mut stripped = false;
+        for &m in MODS {
+            if let Some(after_m) = rest.strip_prefix(m) {
+                if after_m.is_empty() || after_m.starts_with(char::is_whitespace) {
+                    let trimmed_after = after_m.trim_start();
+                    if matches!(m, "noncomputable" | "public" | "meta")
+                        && (trimmed_after == "section"
+                            || trimmed_after.starts_with("section ")
+                            || trimmed_after.starts_with("import "))
+                    {
+                        break;
+                    }
+                    rest = trimmed_after;
+                    stripped = true;
+                    break;
+                }
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    rest
+}
+
+fn unwrap_span_for_mutual_subspans<'a>(span: &CmdSpan<'a>) -> Option<CmdSpan<'a>> {
+    let orig = span.orig_text;
+    let clean = span.clean_text;
+    if orig.len() != clean.len() {
+        return None;
+    }
+    let trimmed_clean = clean.trim_start();
+    if let CommandBearingWrapperUnwrap::Inner { inner, .. } =
+        unwrap_command_bearing_diagnostic_wrappers(trimmed_clean)
+    {
+        if is_mutual_line_start(inner) {
+            let inner_offset = inner.as_ptr() as usize - clean.as_ptr() as usize;
+            if inner_offset < orig.len() {
+                let line_delta = clean[..inner_offset]
+                    .bytes()
+                    .filter(|&b| b == b'\n')
+                    .count();
+                return Some(CmdSpan {
+                    start_line: span.start_line + line_delta,
+                    end_line: span.end_line,
+                    orig_text: &orig[inner_offset..],
+                    clean_text: &clean[inner_offset..],
+                });
+            }
+        }
+    }
+    if is_mutual_line_start(trimmed_clean) {
+        return Some(*span);
+    }
+    None
 }
 
 fn is_visibility_gated_module_cmd(after_prefixes: &str) -> bool {
@@ -6887,13 +7365,100 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             .unwrap_or(false)
     };
 
+    let classify_decl_in_pub_sig = |trimmed: &str| -> Option<(&'static str, String)> {
+        const KWS: &[&str] = &[
+            "theorem",
+            "lemma",
+            "def",
+            "abbrev",
+            "structure",
+            "class",
+            "inductive",
+            "coinductive",
+            "instance",
+            "axiom",
+            "opaque",
+            "constant",
+            "simproc_decl",
+            "dsimproc_decl",
+            "simproc",
+            "dsimproc",
+            "builtin_simproc",
+            "builtin_dsimproc",
+        ];
+        let rest = strip_decl_and_in_prefixes(trimmed);
+        for &kw in KWS {
+            if let Some(mut after) = rest.strip_prefix(kw) {
+                if after.is_empty()
+                    || after.starts_with(char::is_whitespace)
+                    || after.starts_with('[')
+                {
+                    after = after.trim_start();
+                    if after.starts_with('[') {
+                        if let Some(close_idx) = after.find(']') {
+                            after = after[close_idx + 1..].trim_start();
+                        }
+                    }
+                    let name = take_leading_lean_ident(after)
+                        .map(|(n, _)| n.to_string())
+                        .unwrap_or_default();
+                    return Some((kw, name));
+                }
+            }
+        }
+        None
+    };
+
+    fn unwrap_pub_sig_cmd(raw_clean: &str) -> (&str, Vec<String>, bool, bool) {
+        let raw_trimmed = raw_clean.trim();
+        match unwrap_command_bearing_diagnostic_wrappers(raw_trimmed) {
+            CommandBearingWrapperUnwrap::NotWrapper => (raw_trimmed, Vec::new(), false, false),
+            CommandBearingWrapperUnwrap::EmptyInner {
+                in_prefixes,
+                with_exporting,
+            } => (raw_trimmed, in_prefixes, with_exporting, true),
+            CommandBearingWrapperUnwrap::Inner {
+                inner,
+                in_prefixes,
+                with_exporting,
+            } => (inner.trim(), in_prefixes, with_exporting, false),
+        }
+    }
+
+    let is_scope_ctx_cmd = |after_p: &str| -> bool {
+        (after_p.starts_with("variable ") && strip_leading_other_ctx_cmd_in(after_p).is_none())
+            || (after_p.starts_with("variables ")
+                && strip_leading_other_ctx_cmd_in(after_p).is_none())
+            || (after_p.starts_with("universe ")
+                && strip_leading_other_ctx_cmd_in(after_p).is_none())
+            || (after_p.starts_with("universes ")
+                && strip_leading_other_ctx_cmd_in(after_p).is_none())
+            || (after_p.starts_with("open ") && strip_leading_open_in(after_p).is_none())
+            || (after_p.starts_with("set_option ")
+                && strip_leading_set_option_in_robust(after_p).is_none())
+            || (after_p.starts_with("include ")
+                && strip_leading_other_ctx_cmd_in(after_p).is_none())
+            || (after_p.starts_with("omit ") && strip_leading_other_ctx_cmd_in(after_p).is_none())
+            || after_p == "omit"
+    };
+
     let process_decl_cmd = |sub_clean: &str,
+                            inherited_in_prefixes: &[String],
+                            inherited_with_exporting: bool,
                             stack: &[PubScopeFrame],
                             active_vars: &[String],
                             declarations: &mut Vec<PublicDeclSig>,
                             meta_declarations: &mut Vec<PublicDeclSig>,
                             directives_hasher: &mut blake3::Hasher| {
-        let trimmed = sub_clean.trim();
+        let (trimmed, mut wrapper_in_prefixes, span_with_exporting, wrapper_empty_inner) =
+            unwrap_pub_sig_cmd(sub_clean);
+        if wrapper_empty_inner {
+            return;
+        }
+        let with_exporting = inherited_with_exporting || span_with_exporting;
+        let mut local_in_prefixes: Vec<String> = inherited_in_prefixes.to_vec();
+        local_in_prefixes.append(&mut wrapper_in_prefixes);
+
         if trimmed.is_empty()
             || trimmed == "module"
             || trimmed.starts_with("module ")
@@ -6921,10 +7486,13 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             true
         };
 
-        if let Some((kw, raw_name)) = classify_any_decl_header(trimmed) {
+        if let Some((kw, raw_name)) = classify_decl_in_pub_sig(trimmed) {
             if !is_public_visible {
                 return;
             }
+            let mut decl_in_prefixes = collect_decl_in_prefixes(trimmed);
+            local_in_prefixes.append(&mut decl_in_prefixes);
+
             let const_name = if raw_name.is_empty() {
                 format!(
                     "<anon:{}:{}>",
@@ -6979,7 +7547,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             inline_attrs.sort();
             other_exported_attrs.sort();
 
-            let stripped_decl = strip_decl_prefixes(trimmed);
+            let stripped_decl = strip_decl_and_in_prefixes(trimmed);
             let (sig_part, body_part_opt) =
                 if matches!(kw, "structure" | "class" | "inductive" | "coinductive") {
                     (stripped_decl, Some(stripped_decl))
@@ -6997,6 +7565,14 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                 sig_h.update(b"ctx:");
                 sig_h.update(v.as_bytes());
                 sig_h.update(b"\n");
+            }
+            for lp in &local_in_prefixes {
+                sig_h.update(b"ctx:");
+                sig_h.update(lp.as_bytes());
+                sig_h.update(b"\n");
+            }
+            if with_exporting {
+                sig_h.update(b"ctx:#with_exporting\n");
             }
             for m in &mods {
                 if m != "public" {
@@ -7024,7 +7600,8 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             } else if !has_explicit_type {
                 true
             } else if is_module {
-                is_meta_mod
+                with_exporting
+                    || is_meta_mod
                     || has_expose_attr
                     || reducibility == "reducible"
                     || inline_attrs.iter().any(|a| a != "noinline")
@@ -7054,7 +7631,17 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                 ))
             } else {
                 None
-            };
+            }
+            .map(|bh| {
+                if with_exporting {
+                    let mut h = blake3::Hasher::new();
+                    h.update(b"with_exporting:");
+                    h.update(bh.as_bytes());
+                    h.finalize().to_hex().to_string()
+                } else {
+                    bh
+                }
+            });
 
             let entry = PublicDeclSig {
                 const_name,
@@ -7074,30 +7661,29 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
         }
 
         // Scope/context or standalone commands (`variable`, `open`, `universe`, `attribute`, `notation`, `macro`, `elab`, `syntax`, `export`, etc.)
-        let after_prefixes = strip_decl_prefixes(trimmed);
-        if after_prefixes.starts_with("variable ")
-            || after_prefixes.starts_with("variables ")
-            || after_prefixes.starts_with("universe ")
-            || after_prefixes.starts_with("universes ")
-            || (after_prefixes.starts_with("open ")
-                && strip_leading_open_in(after_prefixes).is_none())
-            || (after_prefixes.starts_with("set_option ")
-                && strip_leading_set_option_in(after_prefixes).is_none())
-            || after_prefixes.starts_with("include ")
-            || after_prefixes.starts_with("omit ")
-            || after_prefixes == "omit"
-            || is_pure_diagnostic_or_example_cmd(after_prefixes)
+        let mut cmd_in_prefixes = collect_decl_in_prefixes(trimmed);
+        local_in_prefixes.append(&mut cmd_in_prefixes);
+        let after_prefixes = strip_decl_and_in_prefixes(trimmed);
+        if local_in_prefixes.is_empty() && !with_exporting && is_scope_ctx_cmd(after_prefixes) {
+            return;
+        }
+        if is_pure_diagnostic_or_example_cmd(after_prefixes) {
+            return;
+        }
+        if local_in_prefixes.is_empty()
+            && !with_exporting
+            && (trimmed.starts_with("namespace ")
+                || is_section_header_line(trimmed)
+                || trimmed == "end"
+                || trimmed.starts_with("end "))
         {
             return;
         }
-        if trimmed.starts_with("namespace ")
-            || is_section_header_line(trimmed)
-            || trimmed == "end"
-            || trimmed.starts_with("end ")
-        {
-            return;
-        }
-        if is_module
+        let is_exit = is_exit_cmd(after_prefixes);
+        let is_malformed_wrapper = is_malformed_command_bearing_wrapper_start(after_prefixes);
+        if !is_exit
+            && !is_malformed_wrapper
+            && is_module
             && (is_priv_mod
                 || is_local_mod
                 || is_all_local_attribute_cmd(after_prefixes)
@@ -7111,6 +7697,15 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             .map(|f| canonical_lean_name_component(f.name.as_str()))
             .collect::<Vec<_>>()
             .join(".");
+        let decl_pos_tag = if is_exit {
+            Some(format!(
+                "exit-pos:{}:{}",
+                declarations.len(),
+                meta_declarations.len()
+            ))
+        } else {
+            None
+        };
         let hash_exported_directive = |h: &mut blake3::Hasher| {
             h.update(b"dir:");
             h.update(ns_prefix.as_bytes());
@@ -7120,26 +7715,37 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
                 h.update(v.as_bytes());
                 h.update(b"|");
             }
+            for lp in &local_in_prefixes {
+                h.update(b"ctx:");
+                h.update(lp.as_bytes());
+                h.update(b"|");
+            }
+            if with_exporting {
+                h.update(b"ctx:#with_exporting|");
+            }
+            if let Some(ref pos_tag) = decl_pos_tag {
+                h.update(pos_tag.as_bytes());
+                h.update(b"|");
+            }
             hash_normalized_whitespace(h, trimmed, b"\n");
         };
         hash_exported_directive(directives_hasher);
     };
 
-    let is_scope_ctx_cmd = |after_p: &str| -> bool {
-        after_p.starts_with("variable ")
-            || after_p.starts_with("variables ")
-            || after_p.starts_with("universe ")
-            || after_p.starts_with("universes ")
-            || (after_p.starts_with("open ") && strip_leading_open_in(after_p).is_none())
-            || (after_p.starts_with("set_option ")
-                && strip_leading_set_option_in(after_p).is_none())
-            || after_p.starts_with("include ")
-            || after_p.starts_with("omit ")
-            || after_p == "omit"
-    };
+    let non_public_decl_ctx_entry = |sub_clean: &str,
+                                     inherited_in_prefixes: &[String],
+                                     inherited_with_exporting: bool,
+                                     stack: &[PubScopeFrame]|
+     -> Option<String> {
+        let (trimmed, mut wrapper_in_prefixes, span_with_exporting, wrapper_empty_inner) =
+            unwrap_pub_sig_cmd(sub_clean);
+        if wrapper_empty_inner {
+            return None;
+        }
+        let with_exporting = inherited_with_exporting || span_with_exporting;
+        let mut local_in_prefixes: Vec<String> = inherited_in_prefixes.to_vec();
+        local_in_prefixes.append(&mut wrapper_in_prefixes);
 
-    let non_public_decl_ctx_entry = |sub_clean: &str, stack: &[PubScopeFrame]| -> Option<String> {
-        let trimmed = sub_clean.trim();
         if trimmed.is_empty()
             || trimmed == "module"
             || trimmed.starts_with("module ")
@@ -7166,7 +7772,7 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
         if is_public_visible {
             return None;
         }
-        let (kw, raw_name) = classify_any_decl_header(trimmed)?;
+        let (kw, raw_name) = classify_decl_in_pub_sig(trimmed)?;
         let const_name = if raw_name.is_empty() {
             format!(
                 "<anon:{}:{}>",
@@ -7177,14 +7783,32 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             pub_qualified_name(&raw_name, stack)
         };
         let phase = if is_meta_mod { "meta" } else { "reg" };
+        let we_tag = if with_exporting { ":we" } else { "" };
+        let in_tag = if local_in_prefixes.is_empty() {
+            String::new()
+        } else {
+            format!(":in=[{}]", local_in_prefixes.join(";"))
+        };
         Some(format!(
-            "priv-decl:{phase}:{const_name}:{}",
+            "priv-decl:{phase}{we_tag}{in_tag}:{const_name}:{}",
             normalize_whitespace(trimmed)
         ))
     };
 
-    let post_cmd_elab_ctx_entry = |sub_clean: &str, stack: &[PubScopeFrame]| -> Option<String> {
-        let trimmed = sub_clean.trim();
+    let post_cmd_elab_ctx_entry = |sub_clean: &str,
+                                   inherited_in_prefixes: &[String],
+                                   inherited_with_exporting: bool,
+                                   stack: &[PubScopeFrame]|
+     -> Option<String> {
+        let (trimmed, mut wrapper_in_prefixes, span_with_exporting, wrapper_empty_inner) =
+            unwrap_pub_sig_cmd(sub_clean);
+        if wrapper_empty_inner {
+            return None;
+        }
+        let with_exporting = inherited_with_exporting || span_with_exporting;
+        let mut local_in_prefixes: Vec<String> = inherited_in_prefixes.to_vec();
+        local_in_prefixes.append(&mut wrapper_in_prefixes);
+
         if trimmed.is_empty()
             || trimmed == "module"
             || trimmed.starts_with("module ")
@@ -7194,19 +7818,36 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
         {
             return None;
         }
-        let after_p = strip_decl_prefixes(trimmed);
+        let mut cmd_in_prefixes = collect_decl_in_prefixes(trimmed);
+        local_in_prefixes.append(&mut cmd_in_prefixes);
+        let after_p = strip_decl_and_in_prefixes(trimmed);
         if is_non_exported_import_cmd(trimmed) || is_non_exported_import_cmd(after_p) {
             return Some(normalize_whitespace(trimmed));
         }
-        if is_scope_ctx_cmd(after_p)
-            || is_pure_diagnostic_or_example_cmd(after_p)
-            || trimmed.starts_with("namespace ")
-            || is_section_header_line(trimmed)
-            || trimmed == "end"
-            || trimmed.starts_with("end ")
+        if local_in_prefixes.is_empty()
+            && !with_exporting
+            && (is_scope_ctx_cmd(after_p)
+                || trimmed.starts_with("namespace ")
+                || is_section_header_line(trimmed)
+                || trimmed == "end"
+                || trimmed.starts_with("end "))
         {
             return None;
         }
+        if is_pure_diagnostic_or_example_cmd(after_p) {
+            return None;
+        }
+        let format_ctx = |norm: String| -> String {
+            let mut prefix_parts = local_in_prefixes.clone();
+            if with_exporting {
+                prefix_parts.push("#with_exporting".to_string());
+            }
+            if prefix_parts.is_empty() {
+                norm
+            } else {
+                format!("{} {}", prefix_parts.join(" "), norm)
+            }
+        };
         let in_pub_sec = stack.iter().any(|f| f.is_public_section);
         let (mods, attrs) = parse_decl_modifiers_and_attrs(trimmed);
         let is_priv_mod = mods.iter().any(|m| m == "private");
@@ -7215,9 +7856,9 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
         let has_local_attr = attrs
             .iter()
             .any(|a| a == "local" || a.starts_with("local "));
-        if classify_any_decl_header(trimmed).is_some() {
+        if classify_decl_in_pub_sig(trimmed).is_some() {
             if has_local_attr || is_local_mod {
-                return Some(normalize_whitespace(trimmed));
+                return Some(format_ctx(normalize_whitespace(trimmed)));
             }
             return None;
         }
@@ -7232,68 +7873,233 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
             || has_any_local_attribute_cmd(after_p)
             || !is_visibility_gated_module_cmd(after_p)
         {
-            return Some(normalize_whitespace(trimmed));
+            return Some(format_ctx(normalize_whitespace(trimmed)));
         }
         None
     };
 
+    let mut pending_in_prefixes: Vec<String> = Vec::new();
+    let mut pending_with_exporting = false;
+    let mut pending_wrapper = false;
+
     for span in &body_spans {
-        let trimmed = span.clean_text.trim();
-        let after_p = strip_decl_prefixes(trimmed);
-        if is_scope_ctx_cmd(after_p) {
-            active_context_vars.push(normalize_whitespace(trimmed));
+        let raw_trimmed = span.clean_text.trim();
+        if raw_trimmed.is_empty() {
+            continue;
         }
 
-        if let Some((_, inner_spans, _)) = split_mutual_block_subspans(span) {
-            stack.push(PubScopeFrame {
-                kind: ScopeKind::Mutual,
-                name: String::new(),
-                is_public_section: stack.iter().any(|f| f.is_public_section),
-                is_meta_section: stack.iter().any(|f| f.is_meta_section),
-                section_has_expose: stack.iter().any(|f| f.section_has_expose),
-            });
-            for sub in &inner_spans {
-                if let Some(entry) = non_public_decl_ctx_entry(sub.clean_text, &stack) {
-                    active_context_vars.push(entry);
+        // Check if this span is a standalone prefix line whose inner command was split into the next `CmdSpan`
+        // (e.g. `#time\npublic def api := 1`, `#guard_msgs in\npublic def api := 1`, or `open Foo in\npublic def api := 1`).
+        match unwrap_command_bearing_diagnostic_wrappers(raw_trimmed) {
+            CommandBearingWrapperUnwrap::EmptyInner {
+                mut in_prefixes,
+                with_exporting,
+            } => {
+                pending_in_prefixes.append(&mut in_prefixes);
+                pending_with_exporting |= with_exporting;
+                pending_wrapper = true;
+                continue;
+            }
+            CommandBearingWrapperUnwrap::NotWrapper => {
+                let no_doc = strip_leading_doc_comments_only(raw_trimmed);
+                let (after_in_only, mut in_only_list) =
+                    strip_leading_in_command_prefixes_with_list(no_doc);
+                if !in_only_list.is_empty()
+                    && strip_leading_doc_comments_only(after_in_only).is_empty()
+                {
+                    pending_in_prefixes.append(&mut in_only_list);
+                    continue;
                 }
             }
-            for sub in &inner_spans {
-                let sub_trimmed = sub.clean_text.trim();
-                let sub_after_p = strip_decl_prefixes(sub_trimmed);
-                if is_scope_ctx_cmd(sub_after_p) {
-                    active_context_vars.push(normalize_whitespace(sub_trimmed));
-                }
-                process_decl_cmd(
-                    sub.clean_text,
-                    &stack,
-                    &active_context_vars,
-                    &mut declarations,
-                    &mut meta_declarations,
-                    &mut directives_hasher,
-                );
-                if non_public_decl_ctx_entry(sub.clean_text, &stack).is_none() {
-                    if let Some(entry) = post_cmd_elab_ctx_entry(sub.clean_text, &stack) {
-                        active_context_vars.push(entry);
+            CommandBearingWrapperUnwrap::Inner { .. } => {}
+        }
+
+        let span_in_prefixes = std::mem::take(&mut pending_in_prefixes);
+        let span_with_exporting = std::mem::replace(&mut pending_with_exporting, false);
+        let _had_pending_wrapper = std::mem::replace(&mut pending_wrapper, false);
+
+        let (unwrapped_trimmed, span_wrap_in_prefixes, inner_we, _) =
+            unwrap_pub_sig_cmd(raw_trimmed);
+        let after_p = strip_decl_and_in_prefixes(unwrapped_trimmed);
+        if span_in_prefixes.is_empty()
+            && span_wrap_in_prefixes.is_empty()
+            && is_scope_ctx_cmd(after_p)
+        {
+            let norm_ctx = normalize_whitespace(unwrapped_trimmed);
+            if span_with_exporting || inner_we {
+                active_context_vars.push(format!("#with_exporting {norm_ctx}"));
+            } else {
+                active_context_vars.push(norm_ctx);
+            }
+        }
+
+        if let Some(mutual_span) = unwrap_span_for_mutual_subspans(span) {
+            if let Some((_, inner_spans, _)) = split_mutual_block_subspans(&mutual_span) {
+                let mut combined_mutual_in = span_in_prefixes.clone();
+                combined_mutual_in.extend(span_wrap_in_prefixes.clone());
+                let combined_mutual_we = span_with_exporting || inner_we;
+                stack.push(PubScopeFrame {
+                    kind: ScopeKind::Mutual,
+                    name: String::new(),
+                    is_public_section: stack.iter().any(|f| f.is_public_section),
+                    is_meta_section: stack.iter().any(|f| f.is_meta_section),
+                    section_has_expose: stack.iter().any(|f| f.section_has_expose),
+                });
+                {
+                    let mut sub_pending_in = Vec::new();
+                    let mut sub_pending_we = false;
+                    for sub in &inner_spans {
+                        let st = sub.clean_text.trim();
+                        if st.is_empty() {
+                            continue;
+                        }
+                        if let CommandBearingWrapperUnwrap::EmptyInner {
+                            mut in_prefixes,
+                            with_exporting,
+                        } = unwrap_command_bearing_diagnostic_wrappers(st)
+                        {
+                            sub_pending_in.append(&mut in_prefixes);
+                            sub_pending_we |= with_exporting;
+                            continue;
+                        }
+                        let no_doc = strip_leading_doc_comments_only(st);
+                        let (after_in_only, mut in_only_list) =
+                            strip_leading_in_command_prefixes_with_list(no_doc);
+                        if !in_only_list.is_empty()
+                            && strip_leading_doc_comments_only(after_in_only).is_empty()
+                        {
+                            sub_pending_in.append(&mut in_only_list);
+                            continue;
+                        }
+                        let mut eff_in = combined_mutual_in.clone();
+                        eff_in.append(&mut sub_pending_in);
+                        let eff_we =
+                            combined_mutual_we || std::mem::replace(&mut sub_pending_we, false);
+                        if let Some(entry) =
+                            non_public_decl_ctx_entry(sub.clean_text, &eff_in, eff_we, &stack)
+                        {
+                            active_context_vars.push(entry);
+                        }
                     }
                 }
+                let mut sub_pending_in = Vec::new();
+                let mut sub_pending_we = false;
+                for sub in &inner_spans {
+                    let sub_trimmed = sub.clean_text.trim();
+                    if sub_trimmed.is_empty() {
+                        continue;
+                    }
+                    if let CommandBearingWrapperUnwrap::EmptyInner {
+                        mut in_prefixes,
+                        with_exporting,
+                    } = unwrap_command_bearing_diagnostic_wrappers(sub_trimmed)
+                    {
+                        sub_pending_in.append(&mut in_prefixes);
+                        sub_pending_we |= with_exporting;
+                        continue;
+                    }
+                    let no_doc = strip_leading_doc_comments_only(sub_trimmed);
+                    let (after_in_only, mut in_only_list) =
+                        strip_leading_in_command_prefixes_with_list(no_doc);
+                    if !in_only_list.is_empty()
+                        && strip_leading_doc_comments_only(after_in_only).is_empty()
+                    {
+                        sub_pending_in.append(&mut in_only_list);
+                        continue;
+                    }
+                    let mut eff_in = combined_mutual_in.clone();
+                    eff_in.append(&mut sub_pending_in);
+                    let eff_we =
+                        combined_mutual_we || std::mem::replace(&mut sub_pending_we, false);
+                    let (sub_unwrapped, sub_wrap_in, sub_inner_we, _) =
+                        unwrap_pub_sig_cmd(sub_trimmed);
+                    let sub_after_p = strip_decl_and_in_prefixes(sub_unwrapped);
+                    if eff_in.is_empty() && sub_wrap_in.is_empty() && is_scope_ctx_cmd(sub_after_p)
+                    {
+                        let norm_ctx = normalize_whitespace(sub_unwrapped);
+                        if eff_we || sub_inner_we {
+                            active_context_vars.push(format!("#with_exporting {norm_ctx}"));
+                        } else {
+                            active_context_vars.push(norm_ctx);
+                        }
+                    }
+                    process_decl_cmd(
+                        sub.clean_text,
+                        &eff_in,
+                        eff_we,
+                        &stack,
+                        &active_context_vars,
+                        &mut declarations,
+                        &mut meta_declarations,
+                        &mut directives_hasher,
+                    );
+                    if non_public_decl_ctx_entry(sub.clean_text, &eff_in, eff_we, &stack).is_none()
+                    {
+                        if let Some(entry) =
+                            post_cmd_elab_ctx_entry(sub.clean_text, &eff_in, eff_we, &stack)
+                        {
+                            active_context_vars.push(entry);
+                        }
+                    }
+                }
+                if !sub_pending_in.is_empty() || sub_pending_we {
+                    directives_hasher.update(b"dangling-mutual-prefix:");
+                    for p in &sub_pending_in {
+                        directives_hasher.update(p.as_bytes());
+                        directives_hasher.update(b"|");
+                    }
+                    if sub_pending_we {
+                        directives_hasher.update(b"#with_exporting|");
+                    }
+                    directives_hasher.update(b"\n");
+                }
+                stack.pop();
+                continue;
             }
-            stack.pop();
-        } else {
-            process_decl_cmd(
-                span.clean_text,
-                &stack,
-                &active_context_vars,
-                &mut declarations,
-                &mut meta_declarations,
-                &mut directives_hasher,
-            );
-            if let Some(entry) = non_public_decl_ctx_entry(span.clean_text, &stack) {
-                active_context_vars.push(entry);
-            } else if let Some(entry) = post_cmd_elab_ctx_entry(span.clean_text, &stack) {
-                active_context_vars.push(entry);
-            }
+        }
+
+        process_decl_cmd(
+            span.clean_text,
+            &span_in_prefixes,
+            span_with_exporting,
+            &stack,
+            &active_context_vars,
+            &mut declarations,
+            &mut meta_declarations,
+            &mut directives_hasher,
+        );
+        if let Some(entry) = non_public_decl_ctx_entry(
+            span.clean_text,
+            &span_in_prefixes,
+            span_with_exporting,
+            &stack,
+        ) {
+            active_context_vars.push(entry);
+        } else if let Some(entry) = post_cmd_elab_ctx_entry(
+            span.clean_text,
+            &span_in_prefixes,
+            span_with_exporting,
+            &stack,
+        ) {
+            active_context_vars.push(entry);
+        }
+        if span_in_prefixes.is_empty() && span_wrap_in_prefixes.is_empty() {
             update_pub_scope_stack(&mut stack, span.orig_text);
         }
+    }
+    if pending_wrapper || !pending_in_prefixes.is_empty() || pending_with_exporting {
+        directives_hasher.update(b"dangling-eof-prefix:");
+        for p in &pending_in_prefixes {
+            directives_hasher.update(p.as_bytes());
+            directives_hasher.update(b"|");
+        }
+        if pending_with_exporting {
+            directives_hasher.update(b"#with_exporting|");
+        }
+        if pending_wrapper {
+            directives_hasher.update(b"wrapper|");
+        }
+        directives_hasher.update(b"\n");
     }
 
     let public_directives_hash = directives_hasher.finalize().to_hex().to_string();
@@ -9678,6 +10484,255 @@ public theorem uses_ctx : True := trivial
             assert_eq!(
                 sig_a.meta_signature_digest, sig_b.meta_signature_digest,
                 "{label}: non-exported trailing command must not alter meta_signature_digest"
+            );
+        }
+    }
+
+    #[test]
+    fn test_speed4_extract_public_signature_command_bearing_and_non_pure_diagnostics() {
+        // 1. Single-line and multiline (indented & unindented) command-bearing wrappers on public decls.
+        for (label, s1, s2) in [
+            (
+                "#time single-line public def type change",
+                "module\n#time public def api : Nat := 1\n",
+                "module\n#time public def api : Bool := true\n",
+            ),
+            (
+                "#time unindented multiline public def type change",
+                "module\n#time\npublic def api : Nat := 1\n",
+                "module\n#time\npublic def api : Bool := true\n",
+            ),
+            (
+                "#time indented multiline public def type change",
+                "module\n#time\n  public def api : Nat := 1\n",
+                "module\n#time\n  public def api : Bool := true\n",
+            ),
+            (
+                "#time @[expose] public def body change",
+                "module\n#time @[expose] public def api : Nat := 1\n",
+                "module\n#time @[expose] public def api : Nat := 2\n",
+            ),
+            (
+                "#guard_msgs in public def type change",
+                "module\n/-- warning: unused -/\n#guard_msgs in\npublic def api : Nat := 1\n",
+                "module\n/-- warning: unused -/\n#guard_msgs in\npublic def api : Bool := true\n",
+            ),
+            (
+                "#guard_msgs(warning) in (no space before paren) public def type change",
+                "module\n#guard_msgs(warning) in public def api : Nat := 1\n",
+                "module\n#guard_msgs(warning) in public def api : Bool := true\n",
+            ),
+            (
+                "#guard_msgs multiline spec in public def type change",
+                "module\n#guard_msgs (\n  drop info\n) in\npublic def api : Nat := 1\n",
+                "module\n#guard_msgs (\n  drop info\n) in\npublic def api : Bool := true\n",
+            ),
+            (
+                "#guard_panic in public def type change",
+                "module\n#guard_panic in public def api : Nat := 1\n",
+                "module\n#guard_panic in public def api : Bool := true\n",
+            ),
+            (
+                "#info_trees in public def type change",
+                "module\n/-- info -/\n#info_trees in\npublic def api : Nat := 1\n",
+                "module\n/-- info -/\n#info_trees in\npublic def api : Bool := true\n",
+            ),
+            (
+                "#with_exporting public def body change",
+                "module\n#with_exporting public def api : Nat := 1\n",
+                "module\n#with_exporting public def api : Nat := 2\n",
+            ),
+            (
+                "nested #time + #guard_msgs + #info_trees on public def",
+                "module\n#time #guard_msgs (drop info) in #info_trees in public def api : Nat := 1\n",
+                "module\n#time #guard_msgs (drop info) in #info_trees in public def api : Bool := true\n",
+            ),
+            (
+                "nested multiline #time + #guard_msgs on public def",
+                "module\n#time\n#guard_msgs (drop info) in\npublic def api : Nat := 1\n",
+                "module\n#time\n#guard_msgs (drop info) in\npublic def api : Bool := true\n",
+            ),
+            (
+                "#time inside public section without explicit public modifier",
+                "module\npublic section\n#time def api : Nat := 1\nend\n",
+                "module\npublic section\n#time def api : Bool := true\nend\n",
+            ),
+            (
+                "open ... in #time public def changes name resolution",
+                "module\nnamespace Foo\npublic def x : Nat := 1\nend Foo\nnamespace Bar\npublic def x : Bool := true\nend Bar\nopen Foo in #time public def api := x\n",
+                "module\nnamespace Foo\npublic def x : Nat := 1\nend Foo\nnamespace Bar\npublic def x : Bool := true\nend Bar\nopen Bar in #time public def api := x\n",
+            ),
+            (
+                "multiline open ... in before #time public def changes name resolution",
+                "module\nnamespace Foo\npublic def x : Nat := 1\nend Foo\nnamespace Bar\npublic def x : Bool := true\nend Bar\nopen Foo in\n#time\npublic def api := x\n",
+                "module\nnamespace Foo\npublic def x : Nat := 1\nend Foo\nnamespace Bar\npublic def x : Bool := true\nend Bar\nopen Bar in\n#time\npublic def api := x\n",
+            ),
+            (
+                "set_option autoImplicit in #time public def changes implicit binder elaboration",
+                "module\nset_option autoImplicit true in #time public def api (x : α) : α := x\n",
+                "module\nset_option autoImplicit false in #time public def api (x : α) : α := x\n",
+            ),
+            (
+                "set_option with quoted string value containing spaces in #time public def",
+                "module\nset_option linter.opt \"val one\" in #time public def api := 1\n",
+                "module\nset_option linter.opt \"val two\" in #time public def api := 1\n",
+            ),
+            (
+                "variable ... in #time public def changes implicit binder elaboration",
+                "module\nvariable (n : Nat) in #time public def api : Nat := n\n",
+                "module\nvariable (n : Bool) in #time public def api : Bool := n\n",
+            ),
+            (
+                "#time private helper before inferred-type public def",
+                "module\n#time private def helper := (0 : Nat)\npublic def api := helper\n",
+                "module\n#time private def helper := true\npublic def api := helper\n",
+            ),
+            (
+                "#guard_msgs in private helper before inferred-type public def",
+                "module\n#guard_msgs in\nprivate def helper := (0 : Nat)\npublic def api := helper\n",
+                "module\n#guard_msgs in\nprivate def helper := true\npublic def api := helper\n",
+            ),
+            (
+                "#time mutual ... end block with public def",
+                "module\n#time mutual\n  public def api : Nat := 1\nend\n",
+                "module\n#time mutual\n  public def api : Bool := true\nend\n",
+            ),
+            (
+                "#time scope commands (public section / namespace / end)",
+                "module\n#time namespace Foo\n#time public section\ndef api : Nat := 1\n#time end\n#time end Foo\n",
+                "module\n#time namespace Bar\n#time public section\ndef api : Nat := 1\n#time end\n#time end Bar\n",
+            ),
+            (
+                "#time wrapping exported attribute directive",
+                "module\npublic class C (α : Type) where v : Nat\n@[expose, instance_reducible] public def c1 : C Nat := ⟨1⟩\n#time attribute [instance 100] c1\n",
+                "module\npublic class C (α : Type) where v : Nat\n@[expose, instance_reducible] public def c1 : C Nat := ⟨1⟩\n#time attribute [instance 200] c1\n",
+            ),
+            (
+                "#guard_msgs in wrapping exported notation directive",
+                "module\npublic def api : Nat := 1\n#guard_msgs in notation \"MY_OP\" => 10\n",
+                "module\npublic def api : Nat := 1\n#guard_msgs in notation \"MY_OP\" => 20\n",
+            ),
+            (
+                "#eval command mutating environment via CommandElabM",
+                "module\npublic def api : Nat := 1\n#eval (pure 1 : IO Nat)\n",
+                "module\npublic def api : Nat := 1\n#eval (pure 2 : IO Nat)\n",
+            ),
+            (
+                "#eval! command mutating environment via CommandElabM",
+                "module\npublic def api : Nat := 1\n#eval! (pure 1 : IO Nat)\n",
+                "module\npublic def api : Nat := 1\n#eval! (pure 2 : IO Nat)\n",
+            ),
+            (
+                "assert_not_exists persists into assertExistsExt",
+                "module\npublic def api : Nat := 1\nassert_not_exists Foo.bar\n",
+                "module\npublic def api : Nat := 1\nassert_not_exists Foo.baz\n",
+            ),
+            (
+                "assert_not_imported persists into assertExistsExt",
+                "module\npublic def api : Nat := 1\nassert_not_imported Smoke.ForbiddenA\n",
+                "module\npublic def api : Nat := 1\nassert_not_imported Smoke.ForbiddenB\n",
+            ),
+            (
+                "adding or removing #exit truncates elaborated declarations",
+                "module\npublic def a : Nat := 1\npublic def b : Nat := 2\n",
+                "module\npublic def a : Nat := 1\n#exit\npublic def b : Nat := 2\n",
+            ),
+            (
+                "moving #exit across explicit-type public declarations changes exported prefix",
+                "module\npublic def a : Nat := 1\n#exit\npublic def b : Nat := 2\n",
+                "module\n#exit\npublic def a : Nat := 1\npublic def b : Nat := 2\n",
+            ),
+            (
+                "dangling #time at EOF fails closed",
+                "module\npublic def a : Nat := 1\n",
+                "module\npublic def a : Nat := 1\n#time\n",
+            ),
+            (
+                "#guard_msgs multiline spec mutual ... end block with public def",
+                "module\n#guard_msgs (\n  drop info\n) in mutual\n  public def api : Nat := 1\nend\n",
+                "module\n#guard_msgs (\n  drop info\n) in mutual\n  public def api : Bool := true\nend\n",
+            ),
+            (
+                "#with_exporting variable scope command recorded in active context",
+                "module\nvariable (x : Nat)\npublic def a := x\n",
+                "module\n#with_exporting variable (x : Nat)\npublic def a := x\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert_ne!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: public_signature_digest must change"
+            );
+            assert_ne!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: meta_signature_digest must change"
+            );
+        }
+
+        // 2. `public meta def` under `#time` / `#guard_msgs in` updates `meta_signature_digest` while keeping `public_signature_digest` stable.
+        for (label, s1, s2) in [
+            (
+                "#time public meta def change",
+                "module\npublic def keep : Nat := 1\n#time public meta def m : Nat := 1\n",
+                "module\npublic def keep : Nat := 1\n#time public meta def m : Nat := 2\n",
+            ),
+            (
+                "#guard_msgs in public meta def change",
+                "module\npublic def keep : Nat := 1\n#guard_msgs in\npublic meta def m : Nat := 1\n",
+                "module\npublic def keep : Nat := 1\n#guard_msgs in\npublic meta def m : Nat := 2\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert_eq!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: non-meta public_signature_digest stays unchanged"
+            );
+            assert_ne!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: meta_signature_digest must change"
+            );
+        }
+
+        // 3. Proof irrelevance and unexposed public def bodies still cut off under `#time` / `#guard_msgs`,
+        //    and wrappers around genuinely pure diagnostics (`#time #check`, `#guard_msgs in example`) still cut off!
+        for (label, s1, s2) in [
+            (
+                "#time public theorem proof-only edit",
+                "module\n#time public theorem t (n : Nat) : n + 0 = n := by exact Nat.add_zero n\n",
+                "module\n#time public theorem t (n : Nat) : n + 0 = n := Nat.add_zero n\n",
+            ),
+            (
+                "#time unexposed public def body-only edit",
+                "module\n#time public def f (n : Nat) : Nat := n + 1\n",
+                "module\n#time public def f (n : Nat) : Nat := 1 + n\n",
+            ),
+            (
+                "#time wrapping pure #check and example",
+                "module\npublic def api : Nat := 1\n#time #check Nat.add\n#guard_msgs in\nexample : 1 = 1 := rfl\n#info_trees in #reduce 1 + 1\n",
+                "module\npublic def api : Nat := 1\n#time #check Nat.mul\n#guard_msgs in\nexample : 2 = 2 := rfl\n#info_trees in #reduce 2 + 2\n",
+            ),
+            (
+                "open ... in after wrapper on pure #check",
+                "module\npublic def api : Nat := 1\n#time open Nat in #check succ\n",
+                "module\npublic def api : Nat := 1\n#time open Nat in #check pred\n",
+            ),
+            (
+                "trailing #time private def after all public decls",
+                "module\npublic def api : Nat := 1\n#time private def privHelper : Nat := 10\n",
+                "module\npublic def api : Nat := 1\n#time private def privHelper : Bool := true\n",
+            ),
+        ] {
+            let sig_a = extract_public_signature(s1);
+            let sig_b = extract_public_signature(s2);
+            assert_eq!(
+                sig_a.public_signature_digest, sig_b.public_signature_digest,
+                "{label}: pure diagnostic or private/body-only edit under wrapper must preserve public_signature_digest"
+            );
+            assert_eq!(
+                sig_a.meta_signature_digest, sig_b.meta_signature_digest,
+                "{label}: pure diagnostic or private/body-only edit under wrapper must preserve meta_signature_digest"
             );
         }
     }

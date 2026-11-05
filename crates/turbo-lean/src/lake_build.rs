@@ -10665,6 +10665,94 @@ end SmokeA
             vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
         );
 
+        // Command-bearing diagnostic wrappers (`#time`, `#guard_msgs`, `#info_trees`, `#with_exporting`,
+        // `open ... in #time`, `#eval`, `assert_not_exists`, `#exit`) must NEVER be discarded as pure
+        // diagnostics in `compute_impact_report`: exported signature/body/directive edits under them
+        // must mark `public_signature_changed = true` and retain downstream dependents (`Smoke.B`, `Smoke.C`).
+        let a_time_v1 = "module\n#time\n@[expose] public def timedApi : Nat := 1\n";
+        let a_time_v2 = "module\n#time\n@[expose] public def timedApi : Nat := 2\n";
+        fs::write(proj.join("Smoke/A.lean"), a_time_v1)?;
+        fs::write(
+            proj.join("Smoke/B.lean"),
+            "module\npublic import Smoke.A\npublic theorem useTimed : timedApi = 1 := rfl\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/C.lean"),
+            "module\npublic import Smoke.B\npublic theorem useTimedC : timedApi = 1 := useTimed\n",
+        )?;
+        run_git(&["add", "-A"])?;
+        run_git(&["commit", "-m", "time wrapper baseline"])?;
+        crate::module_builder::build_project_modules_native(
+            &mut store,
+            &proj,
+            &["Smoke.C".to_string()],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+
+        fs::write(proj.join("Smoke/A.lean"), a_time_v2)?;
+        let rep_time = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_time.edit_class, "public_signature_edit");
+        assert!(
+            rep_time.public_signature_changed,
+            "`#time` wrapping `@[expose] public def` edit must mark `public_signature_changed = true`"
+        );
+        assert!(rep_time.meta_signature_changed);
+        assert_eq!(
+            rep_time.transitive_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+        assert!(
+            rep_time.pruned_dependents.is_empty(),
+            "downstream consumers must NOT be pruned when `#time`-wrapped public declaration changes"
+        );
+        let err_time_recheck = lake_recheck_dependents_with_store(
+            Some(&store),
+            &canon_proj,
+            &["Smoke/A.lean".to_string()],
+            Some("HEAD"),
+            false,
+        );
+        assert!(
+            err_time_recheck.is_err(),
+            "downstream consumer Smoke.B (`timedApi = 1`) must be rechecked and fail when `timedApi` changes to `2` under `#time`"
+        );
+
+        let a_guard_msgs_v1 = "module\n#guard_msgs (drop info) in\npublic def gmApi : Nat := 1\n";
+        let a_guard_msgs_v2 =
+            "module\n#guard_msgs (drop info) in\npublic def gmApi : Bool := true\n";
+        fs::write(proj.join("Smoke/A.lean"), a_guard_msgs_v1)?;
+        fs::write(
+            proj.join("Smoke/B.lean"),
+            "module\npublic import Smoke.A\npublic def useGm : Nat := gmApi\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/C.lean"),
+            "module\npublic import Smoke.B\npublic def useGmC : Nat := useGm\n",
+        )?;
+        run_git(&["add", "-A"])?;
+        run_git(&["commit", "-m", "guard_msgs wrapper baseline"])?;
+        fs::write(proj.join("Smoke/A.lean"), a_guard_msgs_v2)?;
+        let rep_gm = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_gm.edit_class, "public_signature_edit");
+        assert!(rep_gm.public_signature_changed);
+        assert_eq!(
+            rep_gm.transitive_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+        assert!(rep_gm.pruned_dependents.is_empty());
+
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
