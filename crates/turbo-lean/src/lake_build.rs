@@ -11040,7 +11040,7 @@ mod tests {
             !root.join("ambient-lean-invoked").exists(),
             "ambient PATH `lean` shim was executed"
         );
-        let _ = fs::remove_dir_all(&root);
+        crate::zygote::purge_snapshot_dir(&root);
         Ok(())
     }
 

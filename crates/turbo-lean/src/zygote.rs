@@ -1169,7 +1169,7 @@ pub(crate) mod digest_test_hooks {
             (v > 0).then_some(v as i128)
         })
     }
-    pub(super) fn set(name: &'static str, hook: impl FnMut() + 'static) {
+    pub(crate) fn set(name: &'static str, hook: impl FnMut() + 'static) {
         HOOKS.with(|h| h.borrow_mut().insert(name, Box::new(hook)));
     }
     pub(crate) fn clear() {
@@ -2293,7 +2293,7 @@ fn seal_and_stat_snapshot_dirs(
 }
 
 /// Restore owner write permissions (`0o700`) on a sealed snapshot tree before removing it.
-fn purge_snapshot_dir(dir: &Path) {
+pub(crate) fn purge_snapshot_dir(dir: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -3728,7 +3728,10 @@ pub(crate) fn snapshot_pinned_dir_raw_fd(_snap: &ClosureSnapshot) -> Option<i32>
     None
 }
 
-fn ensure_live_closure_matches_snapshot(snap: &ClosureSnapshot, phase: &'static str) -> Result<()> {
+pub(crate) fn ensure_live_closure_matches_snapshot(
+    snap: &ClosureSnapshot,
+    phase: &'static str,
+) -> Result<()> {
     let _ = ensure_bound_audit_closure(snap, phase)?;
     anyhow::ensure!(
         snap.rebind() != ClosureBinding::Changed,
@@ -3949,8 +3952,29 @@ pub(crate) fn audit_compiled_modules_with_zygote_options(
     is_untrusted: bool,
     allow_sorry_axiom: bool,
 ) -> Result<()> {
+    let _ = audit_compiled_modules_with_zygote_snapshot(
+        store,
+        cfg,
+        mod_names,
+        lean_path_env,
+        extra_ro_binds,
+        is_untrusted,
+        allow_sorry_axiom,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+    extra_ro_binds: &[PathBuf],
+    is_untrusted: bool,
+    allow_sorry_axiom: bool,
+) -> Result<Option<ClosureSnapshot>> {
     if mod_names.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let mut sorted: Vec<String> = mod_names.to_vec();
     sorted.sort();
@@ -4035,7 +4059,8 @@ pub(crate) fn audit_compiled_modules_with_zygote_options(
                 )?;
             }
         }
-        return ensure_live_closure_matches_snapshot(&snap, "audit_complete");
+        ensure_live_closure_matches_snapshot(&snap, "audit_complete")?;
+        return Ok(Some(snap));
     }
     let parallelism = std::env::var("TURBO_LEAN_JOBS")
         .ok()
@@ -4079,7 +4104,8 @@ pub(crate) fn audit_compiled_modules_with_zygote_options(
                 )?;
             }
         }
-        return ensure_live_closure_matches_snapshot(&snap, "audit_complete");
+        ensure_live_closure_matches_snapshot(&snap, "audit_complete")?;
+        return Ok(Some(snap));
     }
     let bootstrap_env = build_auditor_bootstrap_env(cfg);
     let _ = ensure_zygote_binary_at(&store.root, &cfg.lean_bin, &bootstrap_env)?;
@@ -4147,7 +4173,8 @@ pub(crate) fn audit_compiled_modules_with_zygote_options(
     if let Some(e) = first_err.into_inner().ok().flatten() {
         return Err(e);
     }
-    ensure_live_closure_matches_snapshot(&snap, "audit_complete")
+    ensure_live_closure_matches_snapshot(&snap, "audit_complete")?;
+    Ok(Some(snap))
 }
 
 /// Unified closure replay + soundness audit for `certify_head_statement_modules_and_replay` in
@@ -4164,6 +4191,25 @@ pub(crate) fn replay_and_audit_modules_with_zygote(
     lean_path_env: &str,
     extra_root_lib: Option<&Path>,
 ) -> Result<()> {
+    let _ = replay_and_audit_modules_with_zygote_snapshot(
+        store,
+        cfg,
+        audit_mods,
+        replay_only_mods,
+        lean_path_env,
+        extra_root_lib,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn replay_and_audit_modules_with_zygote_snapshot(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    audit_mods: &[String],
+    replay_only_mods: &[String],
+    lean_path_env: &str,
+    extra_root_lib: Option<&Path>,
+) -> Result<Option<ClosureSnapshot>> {
     let mut sorted_audit: Vec<String> = audit_mods.to_vec();
     sorted_audit.sort();
     sorted_audit.dedup();
@@ -4174,7 +4220,7 @@ pub(crate) fn replay_and_audit_modules_with_zygote(
     union_mods.sort();
     union_mods.dedup();
     if union_mods.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let snap = materialize_bound_audit_closure(cfg, &union_mods, lean_path_env)?;
     let (snap_lp, _) = ensure_bound_audit_closure(&snap, "replay_and_audit_before_replay")?;
@@ -4281,7 +4327,8 @@ pub(crate) fn replay_and_audit_modules_with_zygote(
         lean_path_env,
         extra_root_lib,
     )?;
-    ensure_live_closure_matches_snapshot(&snap, "replay_and_audit_complete")
+    ensure_live_closure_matches_snapshot(&snap, "replay_and_audit_complete")?;
+    Ok(Some(snap))
 }
 
 pub(crate) fn compute_module_audit_policy_digest(
@@ -4831,6 +4878,7 @@ pub(crate) fn kernel_reader_command(
     Ok((cmd, std::time::Duration::from_millis(timeout_ms)))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn audit_compiled_module_batch_exec_pinned(
     store_root: &Path,
     cfg: &crate::module_builder::ProjectConfig,
@@ -14456,7 +14504,7 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
 
         let bad_leaf_src = tmp_dir.join("BadLeaf.lean");
         fs::write(
-            &proj.join("Sw/Leaf.lean"),
+            proj.join("Sw/Leaf.lean"),
             "import Sw.Base\ntheorem t_leaf : 1 = 2 := sorry\n",
         )
         .unwrap();

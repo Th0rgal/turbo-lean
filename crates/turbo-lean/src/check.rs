@@ -89,6 +89,7 @@ pub(crate) fn verified_private_temp_scratch_base() -> Result<PathBuf> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_and_read_probe_identities(
     probe: &str,
     project_dir: &Path,
@@ -2342,19 +2343,16 @@ fn check_directory(
     let mut sorry_files: Vec<PathBuf> = Vec::new();
 
     for (lf, src_blake3, src, split) in split_entries {
-        anyhow::ensure!(
-            split.hygiene.is_clean_or_deferred_to_kernel_gate(),
-            "Soundness hygiene violation in {}: {:?}",
-            lf.display(),
-            split.hygiene.disallowed_items()
-        );
         let rel = lf.strip_prefix(canon_dir).unwrap_or(&lf);
         dir_hasher.update(rel.to_string_lossy().as_bytes());
         dir_hasher.update(b":");
         dir_hasher.update(split.interface_hash.as_bytes());
         dir_hasher.update(b"\n");
 
-        if allow_sorry && split.hygiene.is_clean_modulo_sorry() {
+        if allow_sorry
+            && split.hygiene.is_clean_modulo_sorry()
+            && !split.hygiene.is_clean_for_certification()
+        {
             sorry_files.push(lf);
             continue;
         }
@@ -9480,6 +9478,127 @@ theorem after_macro : ext_magic = 7 := rfl
             None => std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV),
         }
         let _ = fs::remove_dir_all(&tmp_dir);
+        if let Err(p) = res {
+            std::panic::resume_unwind(p);
+        }
+    }
+
+    #[test]
+    fn test_check_directory_allow_sorry_routes_sorry_files_and_rejects_forbidden_hygiene() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_check_dir_allow_sorry_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let proj = tmp_dir.join("proj");
+        fs::create_dir_all(proj.join("Mod")).unwrap();
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"dir_sorry\"\ndefaultTargets = [\"Mod\"]\n[[lean_lib]]\nname = \"Mod\"\nglobs = [\"Mod.+\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("Mod/Clean.lean"),
+            "theorem clean_ok : 1 + 1 = 2 := rfl\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("Mod/Wip.lean"),
+            "theorem wip_thm : 1 + 1 = 2 := by sorry\n",
+        )
+        .unwrap();
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut store = TurboStore::open(Some(&tmp_dir.join("store"))).unwrap();
+            let strict_err = run_check_command_inner(
+                &mut store,
+                false,
+                true,
+                false,
+                false,
+                proj.join("Mod"),
+                None,
+                proj.clone(),
+                None,
+                false,
+                None,
+                false,
+            )
+            .expect_err("directory check without --allow-sorry must reject sorry");
+            assert!(
+                format!("{strict_err:#}").contains("sorry"),
+                "expected sorry rejection, got: {strict_err:#}"
+            );
+
+            let allow_res = run_check_command_inner(
+                &mut store,
+                false,
+                true,
+                false,
+                false,
+                proj.join("Mod"),
+                None,
+                proj.clone(),
+                None,
+                false,
+                None,
+                true,
+            )
+            .expect("directory check with --allow-sorry must accept sorry-bearing file");
+            assert_eq!(allow_res["status"], "file_verified_with_sorry");
+            assert_eq!(allow_res["used_sorry"], true);
+
+            let strict_after = run_check_command_inner(
+                &mut store,
+                false,
+                true,
+                false,
+                false,
+                proj.join("Mod"),
+                None,
+                proj.clone(),
+                None,
+                false,
+                None,
+                false,
+            )
+            .expect_err("directory check without --allow-sorry must not poison strict cache");
+            assert!(
+                format!("{strict_after:#}").contains("sorry"),
+                "expected sorry rejection after --allow-sorry run, got: {strict_after:#}"
+            );
+
+            fs::write(
+                proj.join("Mod/Wip.lean"),
+                "theorem bad_nd : 1 + 1 = 2 := by native_decide\n",
+            )
+            .unwrap();
+            let nd_err = run_check_command_inner(
+                &mut store,
+                false,
+                true,
+                false,
+                false,
+                proj.join("Mod"),
+                None,
+                proj.clone(),
+                None,
+                false,
+                None,
+                true,
+            )
+            .expect_err("directory check with --allow-sorry must still reject native_decide");
+            assert!(
+                format!("{nd_err:#}").contains("native_decide"),
+                "expected native_decide rejection, got: {nd_err:#}"
+            );
+        }));
+        crate::zygote::purge_snapshot_dir(&tmp_dir);
         if let Err(p) = res {
             std::panic::resume_unwind(p);
         }

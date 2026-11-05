@@ -15694,12 +15694,12 @@ impl ReplayLookupBatchCache {
         self.node_closures.clear();
     }
 
-    pub(crate) fn is_replayed_in_store(
+    pub(crate) fn is_replayed_in_store_with_binds_policy(
         &mut self,
         store: &TurboStore,
         cfg: &ProjectConfig,
-        lean_path_env: &str,
         olean_path: &Path,
+        binds_policy: bool,
     ) -> bool {
         if cfg.lean_githash.is_empty() || !self.store_outside_disallowed {
             return false;
@@ -15711,7 +15711,8 @@ impl ReplayLookupBatchCache {
         let Ok(dig) = compute_replayed_olean_ilean_digest(olean_path) else {
             return false;
         };
-        let Ok(env_dig) = self.compute_env_digest(cfg, lean_path_env, olean_path) else {
+        let Ok(env_dig) = self.compute_env_digest_with_binds_policy(cfg, olean_path, binds_policy)
+        else {
             return false;
         };
         store.has_kernel_replayed_olean_with_key(
@@ -15723,13 +15724,25 @@ impl ReplayLookupBatchCache {
         )
     }
 
-    pub(crate) fn is_audited_in_store(
+    pub(crate) fn is_replayed_in_store(
         &mut self,
         store: &TurboStore,
         cfg: &ProjectConfig,
         lean_path_env: &str,
+        olean_path: &Path,
+    ) -> bool {
+        let _ = lean_path_env;
+        let binds_policy = self.is_root_olean(olean_path);
+        self.is_replayed_in_store_with_binds_policy(store, cfg, olean_path, binds_policy)
+    }
+
+    pub(crate) fn is_audited_in_store_with_binds_policy(
+        &mut self,
+        store: &TurboStore,
+        cfg: &ProjectConfig,
         mod_name: &str,
         olean_path: &Path,
+        binds_policy: bool,
     ) -> bool {
         if cfg.lean_githash.is_empty() || !self.store_outside_disallowed {
             return false;
@@ -15741,7 +15754,8 @@ impl ReplayLookupBatchCache {
         let Ok(dig) = compute_replayed_olean_ilean_digest(olean_path) else {
             return false;
         };
-        let Ok(env_dig) = self.compute_env_digest(cfg, lean_path_env, olean_path) else {
+        let Ok(env_dig) = self.compute_env_digest_with_binds_policy(cfg, olean_path, binds_policy)
+        else {
             return false;
         };
         let policy_dig = crate::zygote::compute_module_audit_policy_digest(cfg, mod_name);
@@ -15753,6 +15767,19 @@ impl ReplayLookupBatchCache {
             &cfg.lean_githash,
             &policy_dig,
         )
+    }
+
+    pub(crate) fn is_audited_in_store(
+        &mut self,
+        store: &TurboStore,
+        cfg: &ProjectConfig,
+        lean_path_env: &str,
+        mod_name: &str,
+        olean_path: &Path,
+    ) -> bool {
+        let _ = lean_path_env;
+        let binds_policy = self.is_root_olean(olean_path);
+        self.is_audited_in_store_with_binds_policy(store, cfg, mod_name, olean_path, binds_policy)
     }
 
     pub(crate) fn disallowed_roots(&self) -> &[PathBuf] {
@@ -20301,6 +20328,7 @@ pub(crate) fn record_verified_dep_source(
     tier_digests: &HashMap<String, ModuleArtifactTierDigests>,
 ) {
     let mut one_shot_cache: HashMap<PathBuf, (VerifiedDepManifest, bool)> = HashMap::new();
+    let ws_inputs = workspace_lake_inputs_digest(cfg).ok();
     record_verified_dep_source_cached(
         cfg,
         dag,
@@ -20311,7 +20339,7 @@ pub(crate) fn record_verified_dep_source(
         tier_digests,
         &mut one_shot_cache,
         false,
-        None,
+        ws_inputs.as_deref(),
     );
 }
 
@@ -21676,6 +21704,7 @@ fn scheduler_audit_batch_size() -> usize {
         .unwrap_or(8)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_audit_chunk_subprocess(
     store_root: &Path,
     cfg: &ProjectConfig,
@@ -21740,7 +21769,11 @@ fn run_audit_chunk_subprocess(
 }
 
 type ModuleSnapshotAuthority = (std::sync::Arc<crate::zygote::ClosureSnapshot>, bool, bool);
-type PerModuleAuditOutcome = (Result<()>, Option<ModuleSnapshotAuthority>);
+enum ModuleAuditAuthority {
+    Snapshot(ModuleSnapshotAuthority),
+    FastStoreDigest(String),
+}
+type PerModuleAuditOutcome = (Result<()>, Option<ModuleAuditAuthority>);
 type AuditBatchWorkerOutcome = HashMap<String, PerModuleAuditOutcome>;
 
 fn run_audit_or_replay_batch_worker_bound(
@@ -21748,8 +21781,8 @@ fn run_audit_or_replay_batch_worker_bound(
     cfg: &ProjectConfig,
     dag: &ModuleDag,
     mod_names: &[String],
-    already_replayed: &HashSet<String>,
     snap: &std::sync::Arc<crate::zygote::ClosureSnapshot>,
+    live_lean_path_env: &str,
     is_untrusted: bool,
 ) -> Result<AuditBatchWorkerOutcome> {
     let (snap_lp, snap_dir) =
@@ -21774,15 +21807,39 @@ fn run_audit_or_replay_batch_worker_bound(
     replay_sorted.dedup();
 
     let mut per_mod: AuditBatchWorkerOutcome = HashMap::with_capacity(mod_names.len());
+    let mut snap_replayed: HashSet<String> = HashSet::new();
+    if !is_untrusted {
+        if let Ok(worker_store) = TurboStore::open(Some(store_root)) {
+            let live_batch = ReplayLookupBatchCache::new(&worker_store, cfg, live_lean_path_env);
+            let mut snap_batch = ReplayLookupBatchCache::new(&worker_store, cfg, &parent_snap_lp);
+            for m in audit.iter().chain(replay_sorted.iter()) {
+                let Some(snap_olean) = snap_batch.resolve_module_olean(m) else {
+                    continue;
+                };
+                let Some((ref orig_olean, _)) = snap.entries.get(m).and_then(|e| e.as_ref()) else {
+                    continue;
+                };
+                let binds_policy = live_batch.is_root_module_olean(orig_olean);
+                if snap_batch.is_replayed_in_store_with_binds_policy(
+                    &worker_store,
+                    cfg,
+                    &snap_olean,
+                    binds_policy,
+                ) {
+                    snap_replayed.insert(m.clone());
+                }
+            }
+        }
+    }
 
     let need_replay_audit: Vec<String> = audit
         .iter()
-        .filter(|m| is_untrusted || !already_replayed.contains(*m))
+        .filter(|m| is_untrusted || !snap_replayed.contains(*m))
         .cloned()
         .collect();
     let need_replay_dep: Vec<String> = replay_sorted
         .iter()
-        .filter(|m| !already_replayed.contains(*m))
+        .filter(|m| !snap_replayed.contains(*m))
         .cloned()
         .collect();
     let mut pre_replayed = need_replay_audit.is_empty() && !is_untrusted;
@@ -21818,12 +21875,16 @@ fn run_audit_or_replay_batch_worker_bound(
             let _ = crate::zygote::ensure_bound_audit_closure(snap, "sched_audit_after_replay")?;
             pre_replayed = true;
             for m in &replay_sorted {
-                let record_rep = !already_replayed.contains(m);
+                let record_rep = !snap_replayed.contains(m);
                 per_mod.insert(
                     m.clone(),
                     (
                         Ok(()),
-                        Some((std::sync::Arc::clone(snap), record_rep, false)),
+                        Some(ModuleAuditAuthority::Snapshot((
+                            std::sync::Arc::clone(snap),
+                            record_rep,
+                            false,
+                        ))),
                     ),
                 );
             }
@@ -21833,7 +21894,14 @@ fn run_audit_or_replay_batch_worker_bound(
         for m in &replay_sorted {
             per_mod.insert(
                 m.clone(),
-                (Ok(()), Some((std::sync::Arc::clone(snap), false, false))),
+                (
+                    Ok(()),
+                    Some(ModuleAuditAuthority::Snapshot((
+                        std::sync::Arc::clone(snap),
+                        false,
+                        false,
+                    ))),
+                ),
             );
         }
         replay_sorted.clear();
@@ -21852,8 +21920,7 @@ fn run_audit_or_replay_batch_worker_bound(
     for chunk in audit.chunks(audit_chunk_sz) {
         let _ = crate::zygote::ensure_bound_audit_closure(snap, "sched_audit_before_chunk")?;
         let chunk_skip_replay = (is_untrusted && pre_replayed)
-            || (!is_untrusted
-                && (pre_replayed || chunk.iter().all(|m| already_replayed.contains(m))));
+            || (!is_untrusted && (pre_replayed || chunk.iter().all(|m| snap_replayed.contains(m))));
         match run_audit_chunk_subprocess(
             store_root,
             cfg,
@@ -21867,13 +21934,17 @@ fn run_audit_or_replay_batch_worker_bound(
             Ok(()) => {
                 let _ = crate::zygote::ensure_bound_audit_closure(snap, "sched_audit_after_chunk")?;
                 for m in chunk {
-                    let record_rep = !is_untrusted && !already_replayed.contains(m);
+                    let record_rep = !is_untrusted && !snap_replayed.contains(m);
                     let record_aud = !is_untrusted;
                     per_mod.insert(
                         m.clone(),
                         (
                             Ok(()),
-                            Some((std::sync::Arc::clone(snap), record_rep, record_aud)),
+                            Some(ModuleAuditAuthority::Snapshot((
+                                std::sync::Arc::clone(snap),
+                                record_rep,
+                                record_aud,
+                            ))),
                         ),
                     );
                 }
@@ -21884,7 +21955,7 @@ fn run_audit_or_replay_batch_worker_bound(
                 } else {
                     for m in chunk {
                         let single_skip_replay = (is_untrusted && pre_replayed)
-                            || (!is_untrusted && (pre_replayed || already_replayed.contains(m)));
+                            || (!is_untrusted && (pre_replayed || snap_replayed.contains(m)));
                         let single_res = crate::zygote::ensure_bound_audit_closure(
                             snap,
                             "sched_audit_before_chunk",
@@ -21908,13 +21979,17 @@ fn run_audit_or_replay_batch_worker_bound(
                         });
                         match single_res {
                             Ok(()) => {
-                                let record_rep = !is_untrusted && !already_replayed.contains(m);
+                                let record_rep = !is_untrusted && !snap_replayed.contains(m);
                                 let record_aud = !is_untrusted;
                                 per_mod.insert(
                                     m.clone(),
                                     (
                                         Ok(()),
-                                        Some((std::sync::Arc::clone(snap), record_rep, record_aud)),
+                                        Some(ModuleAuditAuthority::Snapshot((
+                                            std::sync::Arc::clone(snap),
+                                            record_rep,
+                                            record_aud,
+                                        ))),
                                     ),
                                 );
                             }
@@ -21941,10 +22016,17 @@ fn run_audit_or_replay_batch_worker_bound(
             );
             continue;
         }
-        if !is_untrusted && already_replayed.contains(m) {
+        if !is_untrusted && snap_replayed.contains(m) {
             per_mod.insert(
                 m.clone(),
-                (Ok(()), Some((std::sync::Arc::clone(snap), false, false))),
+                (
+                    Ok(()),
+                    Some(ModuleAuditAuthority::Snapshot((
+                        std::sync::Arc::clone(snap),
+                        false,
+                        false,
+                    ))),
+                ),
             );
             continue;
         }
@@ -21973,7 +22055,14 @@ fn run_audit_or_replay_batch_worker_bound(
             Ok(()) => {
                 per_mod.insert(
                     m.clone(),
-                    (Ok(()), Some((std::sync::Arc::clone(snap), true, false))),
+                    (
+                        Ok(()),
+                        Some(ModuleAuditAuthority::Snapshot((
+                            std::sync::Arc::clone(snap),
+                            true,
+                            false,
+                        ))),
+                    ),
                 );
             }
             Err(e) => {
@@ -21990,7 +22079,6 @@ fn run_audit_or_replay_batch_worker(
     cfg: &ProjectConfig,
     dag: &ModuleDag,
     mod_names: &[String],
-    already_replayed: &HashSet<String>,
     lean_path_env: &str,
     is_untrusted: bool,
 ) -> Result<AuditBatchWorkerOutcome> {
@@ -22008,8 +22096,8 @@ fn run_audit_or_replay_batch_worker(
                 cfg,
                 dag,
                 mod_names,
-                already_replayed,
                 &snap,
+                lean_path_env,
                 is_untrusted,
             )
         }
@@ -22034,8 +22122,8 @@ fn run_audit_or_replay_batch_worker(
                             cfg,
                             dag,
                             single_slice,
-                            already_replayed,
                             &snap,
+                            lean_path_env,
                             is_untrusted,
                         ) {
                             Ok(mut sub) => {
@@ -22895,7 +22983,7 @@ pub(crate) fn build_project_modules_native_with_options(
     } else {
         max_jobs.min(4).min(dag.nodes.len()).max(1)
     };
-    let audit_work_queue: std::sync::Mutex<VecDeque<(Vec<String>, HashSet<String>)>> =
+    let audit_work_queue: std::sync::Mutex<VecDeque<Vec<String>>> =
         std::sync::Mutex::new(VecDeque::new());
     let audit_work_cv = std::sync::Condvar::new();
     let audit_shutdown = std::sync::atomic::AtomicBool::new(false);
@@ -22968,7 +23056,7 @@ pub(crate) fn build_project_modules_native_with_options(
                         guard.pop_front()
                     }
                 };
-                let Some((batch_mods, already_replayed)) = job_opt else {
+                let Some(batch_mods) = job_opt else {
                     break;
                 };
                 let res = run_audit_or_replay_batch_worker(
@@ -22976,7 +23064,6 @@ pub(crate) fn build_project_modules_native_with_options(
                     cfg_ref,
                     dag_ref,
                     &batch_mods,
-                    &already_replayed,
                     lp_ref,
                     is_untrusted,
                 );
@@ -23342,6 +23429,10 @@ pub(crate) fn build_project_modules_native_with_options(
                                             mod_key,
                                         },
                                     );
+                                    record_scheduler_test_event(
+                                        "warm_adopted",
+                                        std::slice::from_ref(&mod_name),
+                                    );
                                     pending_audit_queue.push_back(mod_name);
                                     return Ok(());
                                 }
@@ -23423,8 +23514,7 @@ pub(crate) fn build_project_modules_native_with_options(
                     None => scheduler_audit_batch_size(),
                 };
                 let mut batch_mods = Vec::with_capacity(pending_audit_queue.len().min(batch_limit));
-                let mut already_replayed = HashSet::new();
-                let mut fast_verified_mods = Vec::new();
+                let mut fast_verified_mods: Vec<(String, String)> = Vec::new();
                 let mut deferred_for_deps = Vec::new();
                 while batch_mods.len() < batch_limit {
                     let Some(m) = pending_audit_queue.pop_front() else {
@@ -23440,19 +23530,28 @@ pub(crate) fn build_project_modules_native_with_options(
                             continue;
                         }
                     }
-                    if !is_untrusted
-                        && matches!(
-                            pending_audit_meta.get(&m),
+                    if !is_untrusted && explicit_audit_batch_cfg.is_none() {
+                        let expected_origin_dig = match pending_audit_meta.get(&m) {
                             Some(
-                                PendingAuditOrigin::CasRestored { .. }
-                                    | PendingAuditOrigin::WarmAdopted { .. }
+                                PendingAuditOrigin::CasRestored { dig, .. }
+                                | PendingAuditOrigin::WarmAdopted { dig, .. },
+                            ) => Some(dig.clone()),
+                            _ => None,
+                        };
+                        if let (Some(expected_dig), Some(node)) =
+                            (expected_origin_dig, dag.nodes.get(&m))
+                        {
+                            let preserve_lake = preserve_project
+                                || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
+                            let pre_dig_ok = compute_olean_artifact_set_digest_with_policy(
+                                &node.olean_path,
+                                preserve_lake,
                             )
-                        )
-                    {
-                        if let Some(node) = dag.nodes.get(&m) {
-                            let is_root_audit = node.is_root_pkg;
-                            if explicit_audit_batch_cfg.is_none() {
-                                let store_verified = if is_root_audit {
+                            .ok()
+                            .as_deref()
+                                == Some(expected_dig.as_str());
+                            let store_verified = pre_dig_ok
+                                && if node.is_root_pkg {
                                     replay_batch.is_audited_in_store(
                                         store,
                                         &cfg,
@@ -23468,18 +23567,17 @@ pub(crate) fn build_project_modules_native_with_options(
                                         &node.olean_path,
                                     )
                                 };
-                                if store_verified {
-                                    fast_verified_mods.push(m);
-                                    continue;
-                                }
-                            }
-                            if replay_batch.is_replayed_in_store(
-                                store,
-                                &cfg,
-                                &lean_path_env,
-                                &node.olean_path,
-                            ) {
-                                already_replayed.insert(m.clone());
+                            let post_dig_ok = store_verified
+                                && compute_olean_artifact_set_digest_with_policy(
+                                    &node.olean_path,
+                                    preserve_lake,
+                                )
+                                .ok()
+                                .as_deref()
+                                    == Some(expected_dig.as_str());
+                            if post_dig_ok {
+                                fast_verified_mods.push((m, expected_dig));
+                                continue;
                             }
                         }
                     }
@@ -23499,27 +23597,34 @@ pub(crate) fn build_project_modules_native_with_options(
                     }
                     let mut fast_outcomes: AuditBatchWorkerOutcome =
                         HashMap::with_capacity(fast_verified_mods.len());
-                    for m in &fast_verified_mods {
-                        fast_outcomes.insert(m.clone(), (Ok(()), None));
+                    let mut fast_batch_names = Vec::with_capacity(fast_verified_mods.len());
+                    for (m, fast_dig) in fast_verified_mods {
+                        fast_outcomes.insert(
+                            m.clone(),
+                            (
+                                Ok(()),
+                                Some(ModuleAuditAuthority::FastStoreDigest(fast_dig)),
+                            ),
+                        );
+                        fast_batch_names.push(m);
                     }
                     in_flight_audits += 1;
                     let _ = result_tx.send(SchedulerEvent::AuditBatchFinished {
-                        batch_mods: fast_verified_mods,
+                        batch_mods: fast_batch_names,
                         res: Ok(fast_outcomes),
                     });
                 }
                 if !batch_mods.is_empty() {
                     if profile_phases {
                         eprintln!(
-                            "[turbo-lean][profile] audit_dispatch: n={} already_replayed={} (elapsed={}ms)",
+                            "[turbo-lean][profile] audit_dispatch: n={} (elapsed={}ms)",
                             batch_mods.len(),
-                            already_replayed.len(),
                             t_total.elapsed().as_millis()
                         );
                     }
                     {
                         let mut guard = audit_work_queue.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.push_back((batch_mods, already_replayed));
+                        guard.push_back(batch_mods);
                     }
                     audit_work_cv.notify_one();
                     in_flight_audits += 1;
@@ -23648,21 +23753,26 @@ pub(crate) fn build_project_modules_native_with_options(
                         let node = dag.nodes.get(&mod_name).expect("audited module in dag");
                         let preserve_lake = preserve_project
                             || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
-                        let snap_dig_opt = snap_auth_opt.as_ref().and_then(|(snap, _, _)| {
-                            crate::zygote::ensure_bound_audit_closure(snap, "sched_finalize_verify")
+                        let auth_dig_opt = match snap_auth_opt.as_ref() {
+                            Some(ModuleAuditAuthority::Snapshot((snap, _, _))) => {
+                                crate::zygote::ensure_bound_audit_closure(
+                                    snap,
+                                    "sched_finalize_verify",
+                                )
                                 .ok()
                                 .and_then(|_| {
                                     crate::zygote::snapshot_module_artifact_set_digest(
                                         snap, &mod_name,
                                     )
                                 })
-                        });
-                        let snap_matches_dig = |expected_dig: &str| -> bool {
-                            match (&snap_auth_opt, &snap_dig_opt) {
-                                (None, _) => true,
-                                (Some(_), Some(sd)) => sd == expected_dig,
-                                (Some(_), None) => false,
                             }
+                            Some(ModuleAuditAuthority::FastStoreDigest(fast_dig)) => {
+                                Some(fast_dig.clone())
+                            }
+                            None => None,
+                        };
+                        let snap_matches_dig = |expected_dig: &str| -> bool {
+                            auth_dig_opt.as_deref() == Some(expected_dig)
                         };
 
                         let step_res: Result<AcceptedAuditStep> = match origin {
@@ -23680,7 +23790,7 @@ pub(crate) fn build_project_modules_native_with_options(
                                 }
                                 let post_audit_dig = compute_olean_artifact_set_digest_with_policy(
                                     &node.olean_path,
-                                    preserve_project,
+                                    cas_preserve,
                                 )?;
                                 if post_audit_dig != dig || !snap_matches_dig(&dig) {
                                     wipe_node_locked(node, cas_preserve)?;
@@ -23736,7 +23846,7 @@ pub(crate) fn build_project_modules_native_with_options(
                                     if mod_audit_res.is_ok() && snap_matches_dig(&dig) {
                                         compute_olean_artifact_set_digest_with_policy(
                                             &node.olean_path,
-                                            preserve_project,
+                                            preserve_lake,
                                         )
                                         .ok()
                                     } else {
@@ -23891,7 +24001,7 @@ pub(crate) fn build_project_modules_native_with_options(
                                 }
                                 let post_audit_dig = compute_olean_artifact_set_digest_with_policy(
                                     &node.olean_path,
-                                    preserve_project,
+                                    preserve_lake,
                                 )?;
                                 if post_audit_dig != dig || !snap_matches_dig(&dig) {
                                     wipe_node_locked(node, preserve_lake)?;
@@ -23940,7 +24050,11 @@ pub(crate) fn build_project_modules_native_with_options(
                         match step_res {
                             Ok(Some((accepted_dig, cas_req_opt))) => {
                                 if !is_untrusted {
-                                    if let Some((ref snap, record_rep, record_aud)) = snap_auth_opt
+                                    if let Some(ModuleAuditAuthority::Snapshot((
+                                        ref snap,
+                                        record_rep,
+                                        record_aud,
+                                    ))) = snap_auth_opt
                                     {
                                         if record_rep || record_aud {
                                             let rep_slice = if record_rep {
@@ -37807,7 +37921,139 @@ globs = ["Down.+"]
             "swapped sorryAx Leaf.olean must never receive audited authority"
         );
 
+        crate::zygote::purge_snapshot_dir(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_record_verified_dep_source_preserves_manifest_when_workspace_lake_inputs_present(
+    ) -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_rec_ver_src_ws_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
         let _ = fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        fs::create_dir_all(proj.join("Pkg"))?;
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"recws\"\ndefaultTargets = [\"Pkg\"]\n[[lean_lib]]\nname = \"Pkg\"\nroots = [\"Pkg.Mod\"]\n",
+        )?;
+        fs::write(
+            proj.join("Pkg/Mod.lean"),
+            "def pkgVal : Nat := 42\ntheorem pkg_thm : pkgVal = 42 := rfl\n",
+        )?;
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        build_project_modules_native(&mut store, &proj, &[], "trusted", 1, false, true, None)?;
+        let manifest_path = proj.join(".lake/build/.turbo_verified_sources.json");
+        assert!(
+            manifest_path.is_file(),
+            "native build must write .turbo_verified_sources.json"
+        );
+        let cfg = resolve_project_config(&proj)?;
+        assert!(
+            workspace_lake_inputs_digest(&cfg).is_ok(),
+            "workspace_lake_inputs_digest must succeed for standard Lake project"
+        );
+        let dag = build_module_dag(&cfg, &[])?;
+        let node = dag.nodes.get("Pkg.Mod").expect("Pkg.Mod node");
+        let art_dig = compute_olean_artifact_set_digest(&node.olean_path)?;
+        let mut olean_digs = HashMap::new();
+        olean_digs.insert("Pkg.Mod".to_string(), art_dig.clone());
+        let mut tier_digs = HashMap::new();
+        tier_digs.insert(
+            "Pkg.Mod".to_string(),
+            compute_module_artifact_tier_digests(node)?,
+        );
+        record_verified_dep_source(&cfg, &dag, node, &art_dig, true, &olean_digs, &tier_digs);
+        assert!(
+            manifest_path.is_file(),
+            "record_verified_dep_source must preserve .turbo_verified_sources.json rather than deleting it"
+        );
+        let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+        assert!(
+            parsed["workspace_lake_inputs_digest"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "manifest must retain non-empty workspace_lake_inputs_digest: {parsed}"
+        );
+        crate::zygote::purge_snapshot_dir(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_scheduler_fast_store_hit_rejects_live_olean_swap_and_recompiles() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_sched_fast_store_swap_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        fs::create_dir_all(proj.join("Fs"))?;
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"fsstore\"\ndefaultTargets = [\"Fs\"]\n[[lean_lib]]\nname = \"Fs\"\nroots = [\"Fs.Mod\"]\n",
+        )?;
+        fs::write(
+            proj.join("Fs/Mod.lean"),
+            "theorem fs_ok : 1 = 2 := by sorry\n",
+        )?;
+        let bad_out = Command::new("lake")
+            .args(["build", "Fs.Mod"])
+            .env("LEAN_NUM_THREADS", "2")
+            .current_dir(&proj)
+            .output()?;
+        anyhow::ensure!(bad_out.status.success(), "lake build sorry Fs.Mod failed");
+        let sorry_bytes = fs::read(proj.join(".lake/build/lib/lean/Fs/Mod.olean"))?;
+
+        let _ = fs::remove_dir_all(proj.join(".lake/build"));
+        fs::write(proj.join("Fs/Mod.lean"), "theorem fs_ok : 1 = 1 := rfl\n")?;
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        let rep1 =
+            build_project_modules_native(&mut store, &proj, &[], "trusted", 1, false, true, None)?;
+        assert_eq!(rep1.compiled_modules, vec!["Fs.Mod".to_string()]);
+
+        // Remove `.turbo_verified_sources.json` while keeping the Lake `.trace` + `.olean` intact so
+        // the next build adopts `Fs.Mod` as `WarmAdopted`, then overwrite `Mod.olean` with `sorry_bytes`
+        // AFTER `WarmAdopted` records the clean digest (`warm_adopted` scheduler trace event) — before
+        // `audit_fast_store_hit` inspects `store`. The scheduler must reject the swapped `.olean`,
+        // fall back to clean compilation, and never grant authority to `sorry_bytes`!
+        let _ = fs::remove_file(proj.join(".lake/build/.turbo_verified_sources.json"));
+        let target_olean = proj.join(".lake/build/lib/lean/Fs/Mod.olean");
+        let bad_copy = sorry_bytes.clone();
+        let hook: std::sync::Arc<NativeSchedulerTestHook> =
+            std::sync::Arc::new(move |kind: &str, mods: &[String]| {
+                if kind == "warm_adopted" && mods.iter().any(|m| m == "Fs.Mod") {
+                    let _ = fs::write(&target_olean, &bad_copy);
+                }
+            });
+        let _trace = ScopedSchedulerTrace::start(Some(hook));
+        let rep2 =
+            build_project_modules_native(&mut store, &proj, &[], "trusted", 1, false, true, None)?;
+        assert_eq!(
+            rep2.compiled_modules,
+            vec!["Fs.Mod".to_string()],
+            "swapped warm .olean must fail audit/fast-store check and recompile cleanly"
+        );
+        let cfg = resolve_project_config(&proj)?;
+        let (lp, _) = build_lean_search_path(&cfg, true);
+        fs::write(proj.join(".lake/build/lib/lean/Fs/Mod.olean"), &sorry_bytes)?;
+        let mut lookup = ReplayLookupBatchCache::new(&store, &cfg, &lp);
+        assert!(
+            !lookup.is_audited_in_store(
+                &store,
+                &cfg,
+                &lp,
+                "Fs.Mod",
+                &proj.join(".lake/build/lib/lean/Fs/Mod.olean")
+            ),
+            "swapped sorry Fs/Mod.olean must never receive audited authority"
+        );
+        crate::zygote::purge_snapshot_dir(&dir);
         Ok(())
     }
 }

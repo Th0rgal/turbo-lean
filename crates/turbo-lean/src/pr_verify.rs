@@ -6116,19 +6116,44 @@ fn built_kernel_statement_report(
     store_root: Option<&Path>,
     overlay_lib_dir: Option<&Path>,
 ) -> Result<KernelStatementReport> {
+    built_kernel_statement_report_bound(
+        project,
+        scope,
+        is_untrusted,
+        store_root,
+        overlay_lib_dir,
+        None,
+    )
+}
+
+fn built_kernel_statement_report_bound(
+    project: &Path,
+    scope: Option<&Path>,
+    is_untrusted: bool,
+    store_root: Option<&Path>,
+    overlay_lib_dir: Option<&Path>,
+    bound_snap: Option<&crate::zygote::ClosureSnapshot>,
+) -> Result<KernelStatementReport> {
     let pkg = crate::module_builder::resolve_package_config(project, true)?;
     let lib_dir = project.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
     let mut modules = BTreeMap::new();
     for (module, (source, root)) in statement_source_modules(project, &pkg, scope)? {
-        let relative = source.strip_prefix(&root)?;
-        let has_olean = overlay_lib_dir
-            .is_some_and(|ov| ov.join(relative).with_extension("olean").is_file())
-            || lib_dir.join(relative).with_extension("olean").is_file();
-        anyhow::ensure!(
-            has_olean,
-            "No built .olean for {} after stock checking (statement pinning fails closed)",
-            source.display()
-        );
+        if let Some(snap) = bound_snap {
+            anyhow::ensure!(
+                snap.entries.get(&module).and_then(|e| e.as_ref()).is_some(),
+                "Statement module `{module}` missing from certified closure snapshot: fail-closed"
+            );
+        } else {
+            let relative = source.strip_prefix(&root)?;
+            let has_olean = overlay_lib_dir
+                .is_some_and(|ov| ov.join(relative).with_extension("olean").is_file())
+                || lib_dir.join(relative).with_extension("olean").is_file();
+            anyhow::ensure!(
+                has_olean,
+                "No built .olean for {} after stock checking (statement pinning fails closed)",
+                source.display()
+            );
+        }
         modules.insert(
             module,
             source.strip_prefix(project)?.to_string_lossy().to_string(),
@@ -6137,7 +6162,24 @@ fn built_kernel_statement_report(
     if modules.is_empty() {
         return Ok(KernelStatementReport::default());
     }
-    let zygote_cfg = if let Some(sr) = store_root {
+    let zygote_cfg = if let Some(snap) = bound_snap {
+        let sr = store_root
+            .context("Bound closure snapshot statement dump requires `store_root`: fail-closed")?;
+        let cfg = crate::module_builder::resolve_project_config_with_trust(project, is_untrusted)
+            .context("Failed to resolve project config for snapshot-bound statement dump")?;
+        let (snap_lp, snap_dir) =
+            crate::zygote::ensure_bound_audit_closure(snap, "stmt_report_before_dump")?;
+        let pinned_fd = crate::zygote::snapshot_pinned_dir_raw_fd(snap);
+        let parent_snap_lp =
+            crate::zygote::snapshot_parent_search_path(snap).unwrap_or_else(|| snap_lp.clone());
+        let (full_lp, extra_ro, cmd_pinned_fd) = if is_untrusted {
+            (snap_lp, vec![snap_dir], None)
+        } else {
+            (parent_snap_lp, Vec::new(), pinned_fd)
+        };
+        let _ = crate::zygote::kernel_reader_command(sr, &cfg, &full_lp, &extra_ro, is_untrusted)?;
+        Some((sr.to_path_buf(), cfg, full_lp, extra_ro, cmd_pinned_fd))
+    } else if let Some(sr) = store_root {
         crate::module_builder::resolve_project_config_with_trust(project, is_untrusted)
             .ok()
             .and_then(|cfg| {
@@ -6156,7 +6198,7 @@ fn built_kernel_statement_report(
                     overlay_lib_dir.iter().map(|p| (*p).to_path_buf()).collect();
                 crate::zygote::kernel_reader_command(sr, &cfg, &full_lp, &extra_ro, is_untrusted)
                     .ok()
-                    .map(|_| (sr.to_path_buf(), cfg, full_lp, extra_ro))
+                    .map(|_| (sr.to_path_buf(), cfg, full_lp, extra_ro, None))
             })
     } else {
         None
@@ -6199,36 +6241,46 @@ fn built_kernel_statement_report(
     let mut report = KernelStatementReport::default();
     let mut remaining = modules.clone();
     while let Some(mut batch) = batches.pop() {
-        let mut command = if let Some((ref sr, ref cfg, ref full_lp, ref extra_ro)) = zygote_cfg {
-            let (mut cmd, _) =
-                crate::zygote::kernel_reader_command(sr, cfg, full_lp, extra_ro, is_untrusted)?;
-            cmd.arg("--statement-dump").args(&batch);
-            cmd
-        } else {
-            let helper = helper_opt
-                .as_ref()
-                .context("Missing statement dump helper script")?;
-            let mut cmd = statement_lean_command(project, is_untrusted)?;
-            if let Some(ov) = overlay_lib_dir {
-                let (base_lp, _) =
-                    crate::module_builder::resolve_project_config_with_trust(project, is_untrusted)
-                        .map(|c| crate::module_builder::build_lean_search_path(&c, true))
-                        .unwrap_or_default();
-                let new_lp = if base_lp.is_empty() {
-                    ov.display().to_string()
-                } else {
-                    format!("{}:{base_lp}", ov.display())
-                };
-                cmd.env("LEAN_PATH", new_lp);
-            }
-            cmd.arg("--run").arg(helper).args(&batch);
-            cmd
-        };
-        let out = crate::module_builder::run_command_with_timeout(
+        if let Some(snap) = bound_snap {
+            let _ = crate::zygote::ensure_bound_audit_closure(snap, "stmt_report_before_batch")?;
+        }
+        let (mut command, batch_pinned_fd) =
+            if let Some((ref sr, ref cfg, ref full_lp, ref extra_ro, pinned_fd)) = zygote_cfg {
+                let (mut cmd, _) =
+                    crate::zygote::kernel_reader_command(sr, cfg, full_lp, extra_ro, is_untrusted)?;
+                cmd.arg("--statement-dump").args(&batch);
+                (cmd, pinned_fd)
+            } else {
+                let helper = helper_opt
+                    .as_ref()
+                    .context("Missing statement dump helper script")?;
+                let mut cmd = statement_lean_command(project, is_untrusted)?;
+                if let Some(ov) = overlay_lib_dir {
+                    let (base_lp, _) = crate::module_builder::resolve_project_config_with_trust(
+                        project,
+                        is_untrusted,
+                    )
+                    .map(|c| crate::module_builder::build_lean_search_path(&c, true))
+                    .unwrap_or_default();
+                    let new_lp = if base_lp.is_empty() {
+                        ov.display().to_string()
+                    } else {
+                        format!("{}:{base_lp}", ov.display())
+                    };
+                    cmd.env("LEAN_PATH", new_lp);
+                }
+                cmd.arg("--run").arg(helper).args(&batch);
+                (cmd, None)
+            };
+        let out = crate::module_builder::run_command_with_timeout_pinned_fd(
             &mut command,
             std::time::Duration::from_secs(600),
             is_untrusted,
+            batch_pinned_fd,
         )?;
+        if let Some(snap) = bound_snap {
+            let _ = crate::zygote::ensure_bound_audit_closure(snap, "stmt_report_after_batch")?;
+        }
         if !out.status.success() && batch.len() > 1 {
             let right = batch.split_off(batch.len() / 2);
             batches.push(right);
@@ -6281,6 +6333,9 @@ fn built_kernel_statement_report(
         );
     }
     anyhow::ensure!(remaining.is_empty(), "Incomplete kernel statement dump");
+    if let Some(snap) = bound_snap {
+        crate::zygote::ensure_live_closure_matches_snapshot(snap, "stmt_report_complete")?;
+    }
     Ok(report)
 }
 
@@ -6356,7 +6411,10 @@ fn certify_head_statement_modules_and_replay(
     is_untrusted: bool,
     overlay_lib_dir: Option<&Path>,
     pre_resolved_cfg: Option<&crate::module_builder::ProjectConfig>,
-) -> Result<Option<std::collections::HashSet<String>>> {
+) -> Result<(
+    Option<std::collections::HashSet<String>>,
+    Option<crate::zygote::ClosureSnapshot>,
+)> {
     let owned_cfg;
     let cfg = if let Some(c) = pre_resolved_cfg {
         c
@@ -6370,7 +6428,7 @@ fn certify_head_statement_modules_and_replay(
         .join(&cfg.root_pkg.lean_lib_dir);
     let statement_modules = statement_source_modules(head_project, &cfg.root_pkg, scope)?;
     if statement_modules.is_empty() {
-        return Ok(None);
+        return Ok((None, None));
     }
     let mut head_root_mods: Vec<(String, PathBuf)> = Vec::with_capacity(statement_modules.len());
     for (mod_name, (source, root)) in &statement_modules {
@@ -6498,25 +6556,28 @@ fn certify_head_statement_modules_and_replay(
 
     let _env_guard = StatementPolicyEnvGuard::enter(policy);
 
+    let mut all_mods: Vec<String> = dep_mods
+        .iter()
+        .chain(head_root_mods.iter())
+        .map(|(m, _)| m.clone())
+        .collect();
+    all_mods.sort();
+    all_mods.dedup();
+
     if is_untrusted {
-        let mut all_mods: Vec<String> = dep_mods
-            .into_iter()
-            .chain(head_root_mods)
-            .map(|(m, _)| m)
-            .collect();
-        all_mods.sort();
-        all_mods.dedup();
-        crate::zygote::audit_compiled_modules_with_zygote(
+        let snap = crate::zygote::audit_compiled_modules_with_zygote_snapshot(
             store,
             cfg,
             &all_mods,
             &replay_lp,
             &[],
             true,
+            false,
         )
         .context(
             "Head statement build `.olean` failed untrusted in-kernel soundness & replay audit",
         )?;
+        return Ok((None, snap));
     } else {
         let mut proof_irrelevant_overlay_ok = false;
         let mut rebuilt_overlay_mods: std::collections::HashSet<String> =
@@ -6569,6 +6630,113 @@ fn certify_head_statement_modules_and_replay(
                 }
             }
         }
+        let head_root_set: std::collections::HashSet<&str> =
+            head_root_mods.iter().map(|(m, _)| m.as_str()).collect();
+        let bind_and_certify_head_closure = |only_mods: Option<
+            &std::collections::HashSet<String>,
+        >,
+                                             err_ctx: &'static str|
+         -> Result<crate::zygote::ClosureSnapshot> {
+            let mut snap =
+                crate::zygote::materialize_bound_audit_closure(cfg, &all_mods, &replay_lp)?;
+            let mut check_pending =
+                |snap_ref: &crate::zygote::ClosureSnapshot| -> Result<(Vec<String>, Vec<String>)> {
+                    let (snap_lp, _) = crate::zygote::ensure_bound_audit_closure(
+                        snap_ref,
+                        "head_stmt_certify_lookup",
+                    )?;
+                    let parent_snap_lp =
+                        crate::zygote::snapshot_parent_search_path(snap_ref).unwrap_or(snap_lp);
+                    let live_batch =
+                        crate::module_builder::ReplayLookupBatchCache::new_with_extra_root_lib(
+                            store,
+                            cfg,
+                            &replay_lp,
+                            overlay_lib_dir,
+                        );
+                    let mut snap_batch =
+                        crate::module_builder::ReplayLookupBatchCache::new_with_extra_root_lib(
+                            store,
+                            cfg,
+                            &parent_snap_lp,
+                            overlay_lib_dir,
+                        );
+                    let mut pending_audit = Vec::new();
+                    let mut pending_replay = Vec::new();
+                    for (m, _) in dep_mods.iter().chain(head_root_mods.iter()) {
+                        if let Some(sub) = only_mods {
+                            if !sub.contains(m) {
+                                continue;
+                            }
+                        }
+                        let Some(snap_olean) = snap_batch.resolve_module_olean(m) else {
+                            anyhow::bail!(
+                                    "Head statement module `{m}` missing `.olean` in bound closure snapshot: fail-closed"
+                                );
+                        };
+                        let Some((ref orig_olean, _)) =
+                            snap_ref.entries.get(m).and_then(|e| e.as_ref())
+                        else {
+                            anyhow::bail!(
+                                    "Head statement module `{m}` missing origin entry in bound closure snapshot: fail-closed"
+                                );
+                        };
+                        let binds_policy = live_batch.is_root_module_olean(orig_olean);
+                        if head_root_set.contains(m.as_str()) || dep_audit_mods.contains(m) {
+                            if !snap_batch.is_audited_in_store_with_binds_policy(
+                                store,
+                                cfg,
+                                m,
+                                &snap_olean,
+                                binds_policy,
+                            ) {
+                                pending_audit.push(m.clone());
+                            }
+                        } else if !snap_batch.is_replayed_in_store_with_binds_policy(
+                            store,
+                            cfg,
+                            &snap_olean,
+                            binds_policy,
+                        ) {
+                            pending_replay.push(m.clone());
+                        }
+                    }
+                    Ok((pending_audit, pending_replay))
+                };
+            let (pending_audit, pending_replay) = check_pending(&snap)?;
+            if !pending_audit.is_empty() || !pending_replay.is_empty() {
+                let sub_snap = crate::zygote::replay_and_audit_modules_with_zygote_snapshot(
+                    store,
+                    cfg,
+                    &pending_audit,
+                    &pending_replay,
+                    &replay_lp,
+                    overlay_lib_dir,
+                )
+                .context(err_ctx)?;
+                if only_mods.is_none()
+                    && pending_audit.len() + pending_replay.len() == all_mods.len()
+                {
+                    if let Some(full_snap) = sub_snap {
+                        snap = full_snap;
+                    }
+                } else {
+                    snap =
+                        crate::zygote::materialize_bound_audit_closure(cfg, &all_mods, &replay_lp)?;
+                }
+                let (rem_audit, rem_replay) = check_pending(&snap)?;
+                anyhow::ensure!(
+                        rem_audit.is_empty() && rem_replay.is_empty(),
+                        "Head statement closure snapshot failed post-audit store authority re-verification (`audit={rem_audit:?}`, `replay={rem_replay:?}`): fail-closed"
+                    );
+            }
+            crate::zygote::ensure_live_closure_matches_snapshot(
+                &snap,
+                "head_stmt_certify_complete",
+            )?;
+            Ok(snap)
+        };
+
         if proof_irrelevant_overlay_ok {
             let to_base_path = |path: &Path| -> PathBuf {
                 if let Some(ov) = overlay_lib_dir {
@@ -6635,82 +6803,19 @@ fn certify_head_statement_modules_and_replay(
                     "Base statement build `.olean` failed in-kernel soundness & replay audit",
                 )?;
             }
-            let mut replay_batch =
-                crate::module_builder::ReplayLookupBatchCache::new_with_extra_root_lib(
-                    store,
-                    cfg,
-                    &replay_lp,
-                    overlay_lib_dir,
-                );
-            let mut ov_pending_audit = Vec::new();
-            let mut ov_pending_replay = Vec::new();
-            let head_root_set: std::collections::HashSet<&str> =
-                head_root_mods.iter().map(|(m, _)| m.as_str()).collect();
-            for (m, path) in dep_mods.iter().chain(head_root_mods.iter()) {
-                if !rebuilt_overlay_mods.contains(m) {
-                    continue;
-                }
-                if head_root_set.contains(m.as_str()) || dep_audit_mods.contains(m) {
-                    if !replay_batch.is_audited_in_store(store, cfg, &replay_lp, m, path) {
-                        ov_pending_audit.push(m.clone());
-                    }
-                } else if !replay_batch.is_replayed_in_store(store, cfg, &replay_lp, path) {
-                    ov_pending_replay.push(m.clone());
-                }
-            }
-            if !ov_pending_audit.is_empty() || !ov_pending_replay.is_empty() {
-                crate::zygote::replay_and_audit_modules_with_zygote(
-                    store,
-                    cfg,
-                    &ov_pending_audit,
-                    &ov_pending_replay,
-                    &replay_lp,
-                    overlay_lib_dir,
-                )
-                .context(
-                    "Head overlay statement build `.olean` failed in-kernel soundness & replay audit",
-                )?;
-            }
-            return Ok(Some(rebuilt_overlay_mods));
+            let head_snap = bind_and_certify_head_closure(
+                Some(&rebuilt_overlay_mods),
+                "Head overlay statement build `.olean` failed in-kernel soundness & replay audit",
+            )?;
+            return Ok((Some(rebuilt_overlay_mods), Some(head_snap)));
         }
 
-        let mut replay_batch =
-            crate::module_builder::ReplayLookupBatchCache::new_with_extra_root_lib(
-                store,
-                cfg,
-                &replay_lp,
-                overlay_lib_dir,
-            );
-        let mut pending_audit = Vec::new();
-        let mut pending_replay = Vec::new();
-        for (m, path) in &dep_mods {
-            if dep_audit_mods.contains(m) {
-                if !replay_batch.is_audited_in_store(store, cfg, &replay_lp, m, path) {
-                    pending_audit.push(m.clone());
-                }
-            } else if !replay_batch.is_replayed_in_store(store, cfg, &replay_lp, path) {
-                pending_replay.push(m.clone());
-            }
-        }
-        for (m, path) in &head_root_mods {
-            if !replay_batch.is_audited_in_store(store, cfg, &replay_lp, m, path) {
-                pending_audit.push(m.clone());
-            }
-        }
-        if !pending_audit.is_empty() || !pending_replay.is_empty() {
-            crate::zygote::replay_and_audit_modules_with_zygote(
-                store,
-                cfg,
-                &pending_audit,
-                &pending_replay,
-                &replay_lp,
-                overlay_lib_dir,
-            )
-            .context("Head statement build `.olean` failed in-kernel soundness & replay audit")?;
-        }
-        return Ok(None);
+        let head_snap = bind_and_certify_head_closure(
+            None,
+            "Head statement build `.olean` failed in-kernel soundness & replay audit",
+        )?;
+        return Ok((None, Some(head_snap)));
     }
-    Ok(None)
 }
 
 fn ensure_statement_lake_project(project: &Path) -> Result<()> {
@@ -6791,21 +6896,10 @@ fn head_statement_report_cache_action_key(
     head_project: &Path,
     scope: Option<&Path>,
     cfg: &crate::module_builder::ProjectConfig,
-    overlay_lib_dir: Option<&Path>,
+    snap: &crate::zygote::ClosureSnapshot,
 ) -> Option<String> {
-    let lib_dir = head_project
-        .join(&cfg.root_pkg.build_dir)
-        .join(&cfg.root_pkg.lean_lib_dir);
+    let _ = crate::zygote::ensure_bound_audit_closure(snap, "head_stmt_report_cache_key").ok()?;
     let mods = statement_source_modules(head_project, &cfg.root_pkg, scope).ok()?;
-    let (lean_path, _) = crate::module_builder::build_lean_search_path(cfg, true);
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Some(ov) = overlay_lib_dir {
-        dirs.push(ov.to_path_buf());
-    }
-    dirs.extend(std::env::split_paths(&lean_path));
-    if !cfg.toolchain_lib_lean.as_os_str().is_empty() && !dirs.contains(&cfg.toolchain_lib_lean) {
-        dirs.push(cfg.toolchain_lib_lean.clone());
-    }
     let mut h = blake3::Hasher::new();
     h.update(b"turbo-lean:head-stmt-report:v1\0");
     h.update(cfg.lean_githash.as_bytes());
@@ -6819,19 +6913,9 @@ fn head_statement_report_cache_action_key(
         h.update(sc.to_string_lossy().as_bytes());
     }
     h.update(b"\x01");
-    let mut worklist: Vec<String> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (module, (source, root)) in &mods {
-        let relative = source.strip_prefix(root).ok()?;
-        let olean_path = overlay_lib_dir
-            .map(|ov| ov.join(relative).with_extension("olean"))
-            .filter(|p| p.is_file())
-            .unwrap_or_else(|| lib_dir.join(relative).with_extension("olean"));
-        let (imps, _) =
-            crate::module_builder::read_olean_binary_imports_cached(&olean_path).ok()?;
-        let olean_dig =
-            crate::module_builder::compute_olean_artifact_set_digest_preserve_lake(&olean_path)
-                .ok()?;
+    for (module, (source, _)) in &mods {
+        let olean_dig = crate::zygote::snapshot_module_artifact_set_digest(snap, module)?;
         let rel_src = source.strip_prefix(head_project).ok()?.to_string_lossy();
         h.update(module.as_bytes());
         h.update(b"\0");
@@ -6840,34 +6924,23 @@ fn head_statement_report_cache_action_key(
         h.update(olean_dig.as_bytes());
         h.update(b"\n");
         seen.insert(module.clone());
-        worklist.extend(imps.into_iter().map(|i| i.module));
     }
     h.update(b"\x01");
     let mut dep_digests: BTreeMap<String, String> = BTreeMap::new();
-    while let Some(m) = worklist.pop() {
-        if !seen.insert(m.clone()) {
+    for (m, entry_opt) in &snap.entries {
+        if seen.contains(m) {
             continue;
         }
-        let rel_olean = format!(
-            "{}.olean",
-            crate::module_builder::module_name_to_rel_slash(&m)
-        );
-        let path = dirs
-            .iter()
-            .map(|d| d.join(&rel_olean))
-            .find(|p| p.is_file())?;
+        let (ref orig_path, _) = entry_opt.as_ref()?;
         if crate::module_builder::is_verified_toolchain_olean_file(
             &cfg.toolchain_lib_lean,
             Some(&cfg.lean_githash),
-            &path,
+            orig_path,
         ) {
             continue;
         }
-        let (imps, _) = crate::module_builder::read_olean_binary_imports_cached(&path).ok()?;
-        let dig =
-            crate::module_builder::compute_olean_artifact_set_digest_preserve_lake(&path).ok()?;
-        dep_digests.insert(m, dig);
-        worklist.extend(imps.into_iter().map(|i| i.module));
+        let dig = crate::zygote::snapshot_module_artifact_set_digest(snap, m)?;
+        dep_digests.insert(m.clone(), dig);
     }
     for (m, dig) in &dep_digests {
         h.update(m.as_bytes());
@@ -6875,6 +6948,8 @@ fn head_statement_report_cache_action_key(
         h.update(dig.as_bytes());
         h.update(b"\n");
     }
+    let _ =
+        crate::zygote::ensure_bound_audit_closure(snap, "head_stmt_report_cache_key_post").ok()?;
     Some(h.finalize().to_hex().to_string())
 }
 
@@ -7396,7 +7471,7 @@ fn kernel_statement_changes_with_trust(
                     }
                 }
             }
-            let _proof_irrelevant_mods = certify_head_statement_modules_and_replay(
+            let (_proof_irrelevant_mods, ov_cert_snap) = certify_head_statement_modules_and_replay(
                 store,
                 &head_project,
                 statement_scope,
@@ -7406,28 +7481,38 @@ fn kernel_statement_changes_with_trust(
                 Some(cfg),
             )
             .ok()?;
-            let head_key = head_statement_report_cache_action_key(
-                &head_project,
-                statement_scope,
-                cfg,
-                Some(&ov_lib),
-            );
+            let head_key = ov_cert_snap.as_ref().and_then(|snap| {
+                head_statement_report_cache_action_key(&head_project, statement_scope, cfg, snap)
+            });
             let rep = if let Some(cached) = head_key
                 .as_deref()
                 .and_then(|k| read_cached_json_blob::<KernelStatementReport>(store, k))
             {
+                if let Some(ref snap) = ov_cert_snap {
+                    crate::zygote::ensure_live_closure_matches_snapshot(
+                        snap,
+                        "ov_head_stmt_cache_hit",
+                    )
+                    .ok()?;
+                }
                 cached
             } else {
                 let head_t0 = std::time::Instant::now();
-                let computed = built_kernel_statement_report(
+                let computed = built_kernel_statement_report_bound(
                     &head_project,
                     statement_scope,
                     false,
                     Some(&store.root),
                     Some(&ov_lib),
+                    ov_cert_snap.as_ref(),
                 )
                 .ok()?;
-                if let Some(ref key) = head_key {
+                if let (Some(ref key), Some(ref snap)) = (&head_key, &ov_cert_snap) {
+                    crate::zygote::ensure_live_closure_matches_snapshot(
+                        snap,
+                        "ov_head_stmt_cache_write",
+                    )
+                    .ok()?;
                     write_cached_json_blob(
                         &store.root,
                         key,
@@ -7463,7 +7548,7 @@ fn kernel_statement_changes_with_trust(
         } else {
             trusted_cfg.as_ref()
         };
-        certify_head_statement_modules_and_replay(
+        let (_, head_cert_snap) = certify_head_statement_modules_and_replay(
             store,
             &head_project,
             statement_scope,
@@ -7478,24 +7563,42 @@ fn kernel_statement_changes_with_trust(
             None
         };
         let eff_cfg = snapshot_resolved_cfg.as_ref().or(snapshot_cfg);
-        let head_cache_key = eff_cfg.and_then(|cfg| {
-            head_statement_report_cache_action_key(&head_project, statement_scope, cfg, None)
-        });
+        let head_cache_key = if !is_untrusted {
+            eff_cfg
+                .zip(head_cert_snap.as_ref())
+                .and_then(|(cfg, snap)| {
+                    head_statement_report_cache_action_key(
+                        &head_project,
+                        statement_scope,
+                        cfg,
+                        snap,
+                    )
+                })
+        } else {
+            None
+        };
         if let Some(cached) = head_cache_key
             .as_deref()
             .and_then(|k| read_cached_json_blob::<KernelStatementReport>(store, k))
         {
+            if let Some(ref snap) = head_cert_snap {
+                crate::zygote::ensure_live_closure_matches_snapshot(snap, "head_stmt_cache_hit")?;
+            }
             cached
         } else {
             let head_t0 = std::time::Instant::now();
-            let computed = built_kernel_statement_report(
+            let computed = built_kernel_statement_report_bound(
                 &head_project,
                 statement_scope,
                 is_untrusted,
                 Some(&store.root),
                 None,
+                head_cert_snap.as_ref(),
             )?;
-            if let (Some(ref key), Some(cfg)) = (&head_cache_key, eff_cfg) {
+            if let (Some(ref key), Some(cfg), Some(ref snap)) =
+                (&head_cache_key, eff_cfg, &head_cert_snap)
+            {
+                crate::zygote::ensure_live_closure_matches_snapshot(snap, "head_stmt_cache_write")?;
                 write_cached_json_blob(
                     &store.root,
                     key,
@@ -10487,7 +10590,7 @@ end Fixture
             "unallowed custom axioms must fail"
         );
         println!("kernel policy fixtures: base-only csimp/native_decide allow and deny pass; sorryAx/trustCompiler/unallowed axioms rejected");
-        fs::remove_dir_all(dir)?;
+        crate::zygote::purge_snapshot_dir(&dir);
         Ok(())
     }
 
@@ -10643,7 +10746,7 @@ allow = [
                 String::from_utf8_lossy(&pr_ok.stderr)
             );
         }
-        fs::remove_dir_all(dir)?;
+        crate::zygote::purge_snapshot_dir(&dir);
         Ok(())
     }
 
@@ -15601,5 +15704,99 @@ end ParityNs
             Ok(r) => r,
             Err(p) => std::panic::resume_unwind(p),
         }
+    }
+
+    #[test]
+    fn test_head_statement_report_snapshot_bound_rejects_post_audit_live_olean_swap() -> Result<()>
+    {
+        use crate::worktree_test_support::LakeTree;
+        let tree = LakeTree::new(
+            "stmt_snap_swap",
+            &[("P/A.lean", "theorem a_thm : 1 + 1 = 2 := rfl\n")],
+        )?;
+        let git_ok = |args: &[&str]| -> Result<()> {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(&tree.project)
+                .output()?;
+            anyhow::ensure!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            Ok(())
+        };
+        git_ok(&["init", "-q"])?;
+        git_ok(&["config", "user.email", "test@example.com"])?;
+        git_ok(&["config", "user.name", "Test"])?;
+        git_ok(&["add", "."])?;
+        git_ok(&["commit", "-q", "-m", "base"])?;
+
+        let aux = LakeTree::new(
+            "stmt_snap_swap_aux",
+            &[("P/A.lean", "theorem a_thm : 1 + 1 = 3 := by sorry\n")],
+        )?;
+        let swapped_olean = fs::read(aux.project.join(".lake/build/lib/lean/P/A.olean"))?;
+        let live_olean = tree.project.join(".lake/build/lib/lean/P/A.olean");
+        let clean_olean = fs::read(&live_olean)?;
+
+        let store = TurboStore::open(Some(&tree.root.join("cache")))?;
+        let policy = StatementPolicy::default();
+        let (_, cert_snap_opt) = certify_head_statement_modules_and_replay(
+            &store,
+            &tree.project,
+            None,
+            &policy,
+            false,
+            None,
+            None,
+        )?;
+        let cert_snap = cert_snap_opt.expect("certified head closure snapshot");
+        let cfg = crate::module_builder::resolve_project_config_with_trust(&tree.project, false)?;
+        let key_before =
+            head_statement_report_cache_action_key(&tree.project, None, &cfg, &cert_snap)
+                .expect("snapshot-bound head statement cache key");
+
+        // Mutate live `.olean` after certification: cache key must stay bound to `cert_snap`,
+        // while `built_kernel_statement_report_bound` and `ensure_live_closure_matches_snapshot`
+        // must fail closed on the live mismatch!
+        fs::write(&live_olean, &swapped_olean)?;
+        let key_after =
+            head_statement_report_cache_action_key(&tree.project, None, &cfg, &cert_snap)
+                .expect("snapshot-bound head statement cache key after live swap");
+        assert_eq!(
+            key_before, key_after,
+            "head_statement_report_cache_action_key must read sealed snapshot digests, never live .olean"
+        );
+        let dump_err = built_kernel_statement_report_bound(
+            &tree.project,
+            None,
+            false,
+            Some(&store.root),
+            None,
+            Some(&cert_snap),
+        )
+        .expect_err("snapshot-bound statement report must reject post-audit live .olean swap");
+        assert!(
+            format!("{dump_err:#}").contains("closure"),
+            "expected closure mismatch error, got: {dump_err:#}"
+        );
+
+        // Restore clean live `.olean` and verify snapshot-bound dump succeeds cleanly.
+        fs::write(&live_olean, &clean_olean)?;
+        let rep = built_kernel_statement_report_bound(
+            &tree.project,
+            None,
+            false,
+            Some(&store.root),
+            None,
+            Some(&cert_snap),
+        )?;
+        assert!(
+            rep.statements.keys().any(|k| k.ends_with("::a_thm")),
+            "expected a_thm in snapshot-bound statement report: {:?}",
+            rep.statements
+        );
+        Ok(())
     }
 }
