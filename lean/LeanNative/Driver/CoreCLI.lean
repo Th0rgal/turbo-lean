@@ -28,6 +28,7 @@ import LeanNative.Backend.LLVMEmitVerify
 import LeanNative.Driver.Worker
 import LeanNative.Driver.CAbiEmit
 import LeanNative.Driver.EvalBatch
+import LeanNative.Driver.StochasticEvolve
 import LeanSys.Posix
 import LeanSys.Codec
 
@@ -934,6 +935,7 @@ def rcAdtSupportedCommands : List String := ["emit-lnir", "eval-lnir", "validate
 /-- Shared CLI dispatcher for both `lean-native-core` (`elaborateHook? = none`) and `lean-native` (`elaborateHook? = some ...`). -/
 def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule))
     (args : List String) : IO (Option UInt32) := do
+  if let "superopt-evolve" :: rest := args then return some (← runSuperoptEvolve elaborateHook? rest)
   validateValueTakingFlags args
   let isCabiFallback := !(args.headD "").startsWith "compile" && (hasFlag args "--c-abi" || hasFlag args "--emit-c-abi")
   if hasFlag args "--allow-rc-adt" && (!(rcAdtSupportedCommands.contains (args.headD "")) || isCabiFallback) then

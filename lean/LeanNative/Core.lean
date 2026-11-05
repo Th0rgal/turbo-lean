@@ -64,6 +64,8 @@ import LeanNative.Proofs.ProofRetentionProofs
 import LeanNative.Transform.LoopVectorizeOpt
 import LeanNative.Transform.KernelFusion
 import LeanNative.Transform.Superopt
+import LeanNative.Transform.StochasticCert
+import LeanNative.Proofs.StochasticCertSoundness
 import LeanNative.Transform.Plugins
 import LeanNative.Backend.LLVM
 import LeanNative.Backend.LLVMAst
@@ -82,6 +84,7 @@ import LeanNative.Backend.LLVMEmitVerify
 import LeanNative.Backend.Hybrid
 import LeanNative.Backend.FastCheck
 import LeanNative.Driver.EvalBatch
+import LeanNative.Driver.StochasticEvolve
 import LeanNative.Driver.CoreCLI
 import LeanNative.Proofs.AsyncStateMachineProofs
 

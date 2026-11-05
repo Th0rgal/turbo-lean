@@ -11,6 +11,8 @@ import LeanNative.Transform.HoistExclusivity
 import LeanNative.Transform.AsyncStateMachine
 import LeanNative.Frontend.ProofRetention
 import LeanNative.Proofs.ProofRetentionProofs
+import LeanNative.Transform.StochasticCert
+import LeanNative.Proofs.StochasticCertSoundness
 
 namespace LeanNative.Transform
 
@@ -288,7 +290,7 @@ def proofRetentionPass : TransformPass :=
   TransformPass.ofVerifiedContract proofRetentionContract
 
 def verifiedKernelPasses : List TransformPass :=
-  [eqSatPass, loopSchedulePass, ownershipRCPass, asyncStateMachinePass, proofRetentionPass]
+  [eqSatPass, loopSchedulePass, ownershipRCPass, asyncStateMachinePass, proofRetentionPass, stochasticCertPass]
 
 /-- Extended TV-validated pass pipeline (`UnboxTupleSROA`, `HoistExclusivity`, `LoopVectorizeOpt`,
     and extended `AlgebraicOpt` rules gated by `SymbolicTV.validateTranslationDecl`). -/

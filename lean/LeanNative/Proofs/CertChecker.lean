@@ -83,6 +83,9 @@ def verifiedTheoremRegistry : List String :=
     "superoptDeclCore_sound", "superoptDecl_sound", "superoptModuleCore_sound",
     "superoptModule_sound", "superoptModuleWithProfile_sound",
     "applyExprRules_sound", "applyRewriteTable_sound",
+    "certifyScalarPair_sound", "applyCertifiedScalarRewrite_sound", "stochasticProposerGate_sound",
+    "applyCertifiedBundleCode_sound", "stochasticCert_kills_unsound_mutant",
+    "stochasticCert_strict_cost_improvement", "stochasticCert_nonvacuous_pipeline",
     "scheduleStructuredLoop_sound", "applyLoopScheduleAux_refines",
     "elideAndMutateRC_sound", "rewriteCodeVerified_refines", "rewriteLNIRExprVerified_sound",
     "contractKernelScalar_sound", "specializeKernelCode_refines", "fuseMapScaleAddPair_algebra",
@@ -160,6 +163,7 @@ def verifiedTheoremRegistry : List String :=
   (proofs.map ("LeanNative.Proofs.SymbolicTVRefinesSoundness." ++ ·)) ++
   (proofs.map ("LeanNative.Proofs.SuperoptHelpersSoundness." ++ ·)) ++
   (proofs.map ("LeanNative.Proofs.SuperoptSoundness." ++ ·)) ++
+  (proofs.map ("LeanNative.Proofs.StochasticCertSoundness." ++ ·)) ++
   (xform.map ("LeanNative.Transform." ++ ·)) ++
   (sem.map ("LeanNative.Semantics." ++ ·)) ++
   (spec.map ("LeanNative.Spec." ++ ·)) ++
