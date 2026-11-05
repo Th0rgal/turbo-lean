@@ -129,33 +129,7 @@ theorem applyCertifiedBundleCode_sound (bundle : CertifiedRuleBundle) (code : LN
   | incRef v n k ih => exact CodeRefines.incRef_congr ih
   | decRef v n k ih => exact CodeRefines.decRef_congr ih
   | ite v t f iht ihf => exact CodeRefines.ite_congr iht ihf
-  | seqFor iv lv hv av ai aty step k ihs ihk =>
-    intro fuel env st v st' hsrc
-    simp only [applyCertifiedBundleCode, evalCode] at hsrc ⊢
-    cases hlo : env lv with
-    | none => simp [hlo] at hsrc
-    | some vlo =>
-      cases hhi : env hv with
-      | none => simp [hlo, hhi] at hsrc
-      | some vhi =>
-        cases hinit : env ai with
-        | none => simp [hlo, hhi, hinit] at hsrc
-        | some vinit =>
-          simp only [hlo, hhi, hinit] at hsrc ⊢
-          cases vlo <;> cases vhi <;> try simp at hsrc
-          rename_i lo hi
-          dsimp only [] at hsrc ⊢
-          cases hloop : evalSeqLoop (hi.toNat - lo.toNat) lo.toNat iv av vinit env st
-              (fun stepEnv stepSt => evalCode fuel stepEnv stepSt step) with
-          | error err => simp [hloop] at hsrc
-          | ok pair =>
-            rw [hloop] at hsrc
-            have hloop' := evalSeqLoop_refines (hi.toNat - lo.toNat) lo.toNat iv av vinit env st
-              (fun stepEnv stepSt => evalCode fuel stepEnv stepSt step)
-              (fun stepEnv stepSt => evalCode fuel stepEnv stepSt (applyCertifiedBundleCode bundle step))
-              pair (fun sEnv sSt sv sSt' hs => ihs fuel sEnv sSt sv sSt' hs) hloop
-            rw [hloop']
-            exact ihk fuel (env.bind av pair.1) pair.2 v st' hsrc
+  | seqFor _ _ _ _ _ _ _ _ ihs ihk => exact CodeRefines.seqFor_congr ihs ihk
   | parFor ov lv ins ty kern k ih =>
     cases kern with
     | customScalar iv vs body =>

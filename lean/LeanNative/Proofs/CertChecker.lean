@@ -86,7 +86,7 @@ def verifiedTheoremRegistry : List String :=
     "certifyScalarPair_sound", "applyCertifiedScalarRewrite_sound", "stochasticProposerGate_sound",
     "applyCertToScalar_sound", "foldCertifiedScalars_sound", "scalarRefines_eval",
     "scalarRefines_of_eval", "applyCertsToScalar_sound",
-    "applyCertifiedBundleCode_sound", "stochasticCert_kills_unsound_mutant",
+    "applyCertifiedBundleCode_sound", "CodeRefines.seqFor_congr", "stochasticCert_kills_unsound_mutant",
     "stochasticCert_strict_cost_improvement", "stochasticCert_nonvacuous_pipeline",
     "scheduleStructuredLoop_sound", "applyLoopScheduleAux_refines",
     "elideAndMutateRC_sound", "rewriteCodeVerified_refines", "rewriteLNIRExprVerified_sound",

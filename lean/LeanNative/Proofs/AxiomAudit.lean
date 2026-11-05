@@ -477,6 +477,7 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.applyCertifiedScalarRewrite_sound
   , ``LeanNative.Proofs.stochasticProposerGate_sound
   , ``LeanNative.Proofs.applyCertifiedBundleCode_sound
+  , ``LeanNative.Proofs.CodeRefines.seqFor_congr
   , ``LeanNative.Proofs.stochasticCert_kills_unsound_mutant
   , ``LeanNative.Proofs.stochasticCert_strict_cost_improvement
   , ``LeanNative.Proofs.stochasticCert_nonvacuous_pipeline

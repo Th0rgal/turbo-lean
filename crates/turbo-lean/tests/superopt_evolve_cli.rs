@@ -62,8 +62,8 @@ fn cli_superopt_evolve_forwards_flags_and_exports_importable_tlpack() {
     write_executable(
         &helper,
         &script.replace(
-            "lean-native.superopt-evolve.v1",
-            "lean-native.stochastic-cert.v1",
+            r#"{"schema":"lean-native.superopt-evolve.v1","target":"cuda_ptx","certificates":[{"rule":"shl_zero","sound":true}]}"#,
+            include_str!("fixtures/empty_stochastic_bundle.json").trim(),
         ),
     );
 
@@ -198,13 +198,24 @@ fn pack_export_rejects_missing_bundle_and_report_schema() {
     let bundle = root.join("bundle.json");
     let pack = root.join("bundle.tlpack");
     write_executable(&helper, "#!/bin/sh\nprintf '{\"status\":\"evolved\"}'\n");
-    for materialize_report in [false, true] {
-        if materialize_report {
-            fs::write(
-                &bundle,
-                r#"{"schema":"lean-native.superopt-evolve-receipt.v1"}"#,
-            )
-            .unwrap();
+    let good: Value =
+        serde_json::from_str(include_str!("fixtures/empty_stochastic_bundle.json")).unwrap();
+    let mut malformed = good.clone();
+    malformed["certificates"] = serde_json::json!([{}]);
+    let mut non_improving = good;
+    non_improving["certificates"] = serde_json::json!([{
+        "theoremRef": "test", "costBefore": 1, "costAfter": 1,
+        "candidate": {"lhs": "LNIR_WIRE_V1|", "rhs": "LNIR_WIRE_V1|"}
+    }]);
+    for payload in [
+        None,
+        Some(serde_json::json!({"schema":"lean-native.superopt-evolve-receipt.v1"})),
+        Some(serde_json::json!({"schema":"lean-native.stochastic-cert.v1"})),
+        Some(malformed),
+        Some(non_improving),
+    ] {
+        if let Some(payload) = payload {
+            fs::write(&bundle, serde_json::to_vec(&payload).unwrap()).unwrap();
         }
         let out = run_turbo(
             &root.join("cache"),
@@ -282,6 +293,41 @@ fn real_bundle_json_raw_and_zstd_pack_consumption_and_rejection() {
         }
     }
     let good: Value = serde_json::from_slice(&fs::read(&bundle).unwrap()).unwrap();
+    // Same-size valid JSON mutation: only the manifest digest changes.
+    let mut corrupted = fs::read(&pack).unwrap();
+    let header_len = u64::from_le_bytes(corrupted[8..16].try_into().unwrap()) as usize;
+    let mut manifest: Value = serde_json::from_slice(&corrupted[16..16 + header_len]).unwrap();
+    let hash = manifest["blobs"][0]["blob_hash"].as_str().unwrap();
+    manifest["blobs"][0]["blob_hash"] = serde_json::json!(format!(
+        "{}{}",
+        if hash.starts_with('0') { "1" } else { "0" },
+        &hash[1..]
+    ));
+    let header = serde_json::to_vec(&manifest).unwrap();
+    assert_eq!(header.len(), header_len);
+    corrupted[16..16 + header_len].copy_from_slice(&header);
+    let corrupt_pack = root.join("corrupt.tlpack");
+    let corrupt_zst = root.join("corrupt.tlpack.zst");
+    fs::write(&corrupt_pack, &corrupted).unwrap();
+    assert!(Command::new("zstd")
+        .args(["-q", "-o"])
+        .arg(&corrupt_zst)
+        .arg(&corrupt_pack)
+        .status()
+        .unwrap()
+        .success());
+    for path in [&corrupt_pack, &corrupt_zst] {
+        let out = Command::new(&core)
+            .args(["verify-certs", "--canonical", "--stochastic-bundle"])
+            .arg(path)
+            .output()
+            .unwrap();
+        assert!(
+            !out.status.success(),
+            "accepted tampered pack {}",
+            path.display()
+        );
+    }
     assert!(!good["certificates"].as_array().unwrap().is_empty());
     let mut bad_cost = good.clone();
     bad_cost["certificates"][0]["costAfter"] = serde_json::json!(999999);

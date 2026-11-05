@@ -534,6 +534,20 @@ theorem evalSeqLoop_refines (count curIdx : Nat) (idxVar accVar : VarId)
       rw [hs2]
       exact ih (curIdx + 1) nextAcc st1 hsrc
 
+/-- Simultaneous refinement of a sequential loop body and its continuation. -/
+theorem CodeRefines.seqFor_congr {iv lv hv av ai : VarId} {aty : LNIRType}
+    {step1 step2 k1 k2 : LNIRCode} (hstep : CodeRefines step1 step2) (hk : CodeRefines k1 k2) :
+    CodeRefines (.seqFor iv lv hv av ai aty step1 k1) (.seqFor iv lv hv av ai aty step2 k2) := by
+  intro fuel env st v st' hsrc
+  simp only [evalCode] at hsrc ⊢
+  split at hsrc <;> try contradiction
+  next lo hi initVal hlo hhi hinit =>
+    split at hsrc
+    next acc st1 hloop =>
+      rw [evalSeqLoop_refines _ _ _ _ _ _ _ _ _ _ (hstep fuel) hloop]
+      exact hk fuel _ _ _ _ hsrc
+    next => contradiction
+
 /-- Code-level superoptimizer preserves operational semantics (`CodeRefines`). -/
 theorem superoptCodeCore_sound (p : HardwareCostProfile) (targetLabel declName : String)
     (code : LNIRCode) :
@@ -559,36 +573,7 @@ theorem superoptCodeCore_sound (p : HardwareCostProfile) (targetLabel declName :
   | ite cv t e iht ihe =>
     simp only [superoptCodeCore]
     exact CodeRefines.ite_congr iht ihe
-  | seqFor iv lv hv av ai aty step k ihs ihk =>
-    intro fuel env st v st' hsrc
-    simp only [superoptCodeCore, evalCode] at hsrc ⊢
-    cases hlo : env lv with
-    | none => simp [hlo] at hsrc
-    | some vlo =>
-      cases hhi : env hv with
-      | none => simp [hlo, hhi] at hsrc
-      | some vhi =>
-        cases hinit : env ai with
-        | none => simp [hlo, hhi, hinit] at hsrc
-        | some vinit =>
-          simp only [hlo, hhi, hinit] at hsrc ⊢
-          cases vlo <;> cases vhi <;> try simp at hsrc
-          rename_i lo hi
-          dsimp only [] at hsrc ⊢
-          cases hloop :
-              evalSeqLoop (hi.toNat - lo.toNat) lo.toNat iv av vinit env st
-                (fun stepEnv stepSt => evalCode fuel stepEnv stepSt step) with
-          | error err => simp [hloop] at hsrc
-          | ok pair =>
-            rw [hloop] at hsrc
-            have hloop' :=
-              evalSeqLoop_refines (hi.toNat - lo.toNat) lo.toNat iv av vinit env st
-                (fun stepEnv stepSt => evalCode fuel stepEnv stepSt step)
-                (fun stepEnv stepSt =>
-                  evalCode fuel stepEnv stepSt (superoptCodeCore p targetLabel declName step).1)
-                pair (fun sEnv sSt sv sSt' hs => ihs fuel sEnv sSt sv sSt' hs) hloop
-            rw [hloop']
-            exact ihk fuel (env.bind av pair.1) pair.2 v st' hsrc
+  | seqFor _ _ _ _ _ _ _ _ ihs ihk => exact CodeRefines.seqFor_congr ihs ihk
   | parFor ov lv ins ety kern k ih =>
     cases kern with
     | customScalar idxVar inVars body =>

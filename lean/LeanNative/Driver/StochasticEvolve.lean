@@ -3,6 +3,7 @@ import LeanNative.Transform.StochasticCert
 import LeanNative.Transform.StochasticCertPass
 import LeanNative.Transform.LoopVectorizeOpt
 import LeanNative.Driver.CAbiEmit
+import TurboLean.Blake3
 
 set_option autoImplicit false
 
@@ -24,15 +25,19 @@ private def decodeStochasticPack? (bytes : ByteArray) : Option CertifiedRuleBund
       let header ← String.fromUTF8? (bytes.extract 16 start)
       let normalized ← normalizePackJson header
       let manifest ← StochasticJson.parse? normalized
+      guard ((← StochasticJson.nat? (← StochasticJson.field? manifest "format_version")) == 2)
+      let _ ← StochasticJson.array? (← StochasticJson.field? manifest "actions")
       let blobs ← StochasticJson.array? (← StochasticJson.field? manifest "blobs")
       let (endOffset, bundles) ← blobs.foldlM (fun (offset, found) blob => do
         let size ← StochasticJson.nat? (← StochasticJson.field? blob "size_bytes")
-        if offset + size > bytes.size then none else
-          let text ← String.fromUTF8? (bytes.extract offset (offset + size))
-          let found := match CertifiedRuleBundle.fromJson? text with
+        guard (offset + size ≤ bytes.size)
+        let hash ← StochasticJson.string? (← StochasticJson.field? blob "blob_hash")
+        let payload := bytes.extract offset (offset + size)
+        guard (hash == TurboLean.Blake3.blake3Bytes payload)
+        let found := match (String.fromUTF8? payload).bind CertifiedRuleBundle.fromJson? with
             | some b => b :: found
             | none => found
-          some (offset + size, found)) (start, [])
+        some (offset + size, found)) (start, [])
       if endOffset != bytes.size then none else match bundles with
       | [bundle] => some bundle
       | _ => none

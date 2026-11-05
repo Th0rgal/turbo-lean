@@ -175,4 +175,28 @@ def deepReceipt : SuperoptEvolveReceipt := executeSuperoptEvolve canonCfg (.modu
     (.select (.constBool true) stochasticCertWitnessLhs (.var 999)) ==
   .select (.constBool true) (.var 0) (.var 999)
 
+-- Exercise the public loader, including its compressed-pack path, with exact byte hashes.
+#eval show IO Unit from do
+  let payload := cachedStochasticBundle.toJson.toUTF8
+  let digest := TurboLean.Blake3.blake3Bytes payload
+  let path := "/tmp/stochastic-evolve-integrity.tlpack"
+  let compressed := path ++ ".zst"
+  for tamper in [false, true] do
+    let hash := if tamper then (if digest.startsWith "0" then "1" else "0") ++ digest.drop 1
+      else digest
+    let header := ("{\"format_version\":2,\"actions\":[],\"blobs\":[{\"size_bytes\":" ++
+      toString payload.size ++ ",\"blob_hash\":\"" ++ hash ++ "\"}]}").toUTF8
+    let length := ByteArray.mk ((List.range 8).map (fun i => (header.size / 256 ^ i).toUInt8)).toArray
+    IO.FS.writeBinFile path (ByteArray.mk #[84, 76, 80, 75, 0, 0, 0, 2] ++ length ++ header ++ payload)
+    let result ← IO.Process.output { cmd := "zstd", args := #["-q", "-f", "-o", compressed, path] }
+    unless result.exitCode == 0 do throw <| IO.userError "zstd failed"
+    for file in [path, compressed] do
+      let accepted ← try
+        let _ ← loadStochasticBundleFromPath file
+        pure true
+      catch _ => pure false
+      unless accepted != tamper do throw <| IO.userError "pack integrity regression"
+  IO.FS.removeFile path
+  IO.FS.removeFile compressed
+
 end LeanNative.Tests.StochasticEvolveTests

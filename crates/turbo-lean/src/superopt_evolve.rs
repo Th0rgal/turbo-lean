@@ -180,6 +180,68 @@ pub fn resolve_lean_native_core_bin() -> Result<PathBuf> {
     )
 }
 
+fn validate_stochastic_cert_bundle(value: &serde_json::Value) -> Result<()> {
+    use serde_json::Value;
+    let string = |v: &Value, key: &str| -> Result<()> {
+        anyhow::ensure!(
+            v.get(key).and_then(Value::as_str).is_some(),
+            "Missing string {key}"
+        );
+        Ok(())
+    };
+    anyhow::ensure!(
+        value["schema"] == "lean-native.stochastic-cert.v1",
+        "Invalid bundle schema"
+    );
+    for key in ["seed", "generations"] {
+        anyhow::ensure!(value[key].as_u64().is_some(), "Invalid bundle {key}");
+    }
+    // These are the wire names emitted by StochasticJson.profileValue.
+    let profile = &value["profile"];
+    for key in ["id", "target", "cpu", "sm"] {
+        string(profile, key)?;
+    }
+    anyhow::ensure!(
+        SUPPORTED_TARGETS.contains(&profile["target"].as_str().unwrap()),
+        "Invalid profile target"
+    );
+    let costs = profile["costs"]
+        .as_array()
+        .context("Missing profile costs")?;
+    anyhow::ensure!(
+        costs.len() == 14 && costs.iter().all(|c| c.as_u64().is_some_and(|n| n > 0)),
+        "Invalid profile costs"
+    );
+    let certificates = value["certificates"]
+        .as_array()
+        .context("Missing certificates")?;
+    for cert in certificates {
+        string(cert, "theoremRef")?;
+        anyhow::ensure!(
+            !cert["theoremRef"].as_str().unwrap().is_empty(),
+            "Empty theoremRef"
+        );
+        let before = cert["costBefore"].as_u64().context("Invalid costBefore")?;
+        let after = cert["costAfter"].as_u64().context("Invalid costAfter")?;
+        anyhow::ensure!(after < before, "Certificate must improve cost");
+        anyhow::ensure!(
+            cert.get("verified").is_none_or(|v| v == true),
+            "Invalid verified flag"
+        );
+        for key in ["lhs", "rhs"] {
+            string(&cert["candidate"], key)?;
+            anyhow::ensure!(
+                cert["candidate"][key]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("LNIR_WIRE_V1|"),
+                "Invalid candidate {key}"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn collect_bundle_artifacts(bundle_path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
     anyhow::ensure!(
         bundle_path.is_file(),
@@ -189,10 +251,7 @@ fn collect_bundle_artifacts(bundle_path: &Path) -> Result<Vec<(String, Vec<u8>)>
     let bytes = fs::read(bundle_path)
         .with_context(|| format!("Failed to read bundle {}", bundle_path.display()))?;
     let value: serde_json::Value = serde_json::from_slice(&bytes).context("Invalid bundle JSON")?;
-    anyhow::ensure!(
-        value.get("schema").and_then(|v| v.as_str()) == Some("lean-native.stochastic-cert.v1"),
-        "Expected lean-native.stochastic-cert.v1 bundle schema"
-    );
+    validate_stochastic_cert_bundle(&value)?;
     let name = bundle_path
         .file_name()
         .and_then(|s| s.to_str())
@@ -450,6 +509,35 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn test_superopt_evolve_bundle_validation() {
+        let good: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/empty_stochastic_bundle.json"
+        ))
+        .unwrap();
+        validate_stochastic_cert_bundle(&good).unwrap();
+        for key in ["profile", "seed", "generations", "certificates"] {
+            let mut bad = good.clone();
+            bad.as_object_mut().unwrap().remove(key);
+            assert!(validate_stochastic_cert_bundle(&bad).is_err(), "{key}");
+        }
+        for cert in [
+            serde_json::json!({}),
+            serde_json::json!({
+                "theoremRef": "test", "costBefore": 1, "costAfter": 1,
+                "candidate": {"lhs": "LNIR_WIRE_V1|", "rhs": "LNIR_WIRE_V1|"}
+            }),
+        ] {
+            let mut bad = good.clone();
+            bad["certificates"] = serde_json::json!([cert]);
+            assert!(validate_stochastic_cert_bundle(&bad).is_err());
+        }
+        assert!(validate_stochastic_cert_bundle(&serde_json::json!({
+            "schema": "lean-native.stochastic-cert.v1"
+        }))
+        .is_err());
+    }
+
     fn unique_test_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "turbo_superopt_evolve_{}_{}_{}",
@@ -541,8 +629,8 @@ mod tests {
         let mock_bin = write_mock_helper(
             &dir,
             &script.replace(
-                "lean-native.superopt-evolve.v1",
-                "lean-native.stochastic-cert.v1",
+                r#"{"schema":"lean-native.superopt-evolve.v1","rules":[{"name":"xor_self_zero","verified":true}]}"#,
+                include_str!("../tests/fixtures/empty_stochastic_bundle.json").trim(),
             ),
         );
         let prev_bin = std::env::var_os("LEAN_NATIVE_CORE_BIN");
@@ -625,8 +713,8 @@ mod tests {
         let mock_bin = write_mock_helper(
             &dir,
             &script.replace(
-                "lean-native.superopt-evolve.v1",
-                "lean-native.stochastic-cert.v1",
+                r#"{"schema":"lean-native.superopt-evolve.v1","certified":true}"#,
+                include_str!("../tests/fixtures/empty_stochastic_bundle.json").trim(),
             ),
         );
         let prev_bin = std::env::var_os("LEAN_NATIVE_CORE_BIN");
