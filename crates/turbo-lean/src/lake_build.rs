@@ -10561,6 +10561,110 @@ public def localNotVal : MYTYPE := true
             ]
         );
 
+        let a_trail_attr_v1 = "\
+module
+namespace SmokeA
+public class MyTag (α : Type) where
+  tag : Nat
+@[expose, instance_reducible] public def mkTag100 : MyTag Nat := { tag := 1 }
+@[expose, instance_reducible] public def mkTag150 : MyTag Nat := { tag := 2 }
+attribute [instance 150] mkTag150
+attribute [instance 100] mkTag100
+end SmokeA
+";
+        let a_trail_attr_v2 = "\
+module
+namespace SmokeA
+public class MyTag (α : Type) where
+  tag : Nat
+@[expose, instance_reducible] public def mkTag100 : MyTag Nat := { tag := 1 }
+@[expose, instance_reducible] public def mkTag150 : MyTag Nat := { tag := 2 }
+attribute [instance 150] mkTag150
+attribute [instance 200] mkTag100
+end SmokeA
+";
+        fs::write(proj.join("Smoke/A.lean"), a_trail_attr_v1)?;
+        fs::write(
+            proj.join("Smoke/B.lean"),
+            "module\npublic import Smoke.A\npublic theorem useTag : (inferInstance : SmokeA.MyTag Nat).tag = 2 := rfl\n",
+        )?;
+        fs::write(
+            proj.join("Smoke/C.lean"),
+            "module\npublic import Smoke.B\npublic theorem useTagC : (inferInstance : SmokeA.MyTag Nat).tag = 2 := useTag\n",
+        )?;
+        let _ = fs::remove_file(proj.join("Smoke/M.lean"));
+        run_git(&["add", "-A"])?;
+        run_git(&["commit", "-m", "trailing non-local attribute baseline"])?;
+        crate::module_builder::build_project_modules_native(
+            &mut store,
+            &proj,
+            &["Smoke.C".to_string()],
+            "trusted",
+            1,
+            false,
+            true,
+            None,
+        )?;
+
+        fs::write(proj.join("Smoke/A.lean"), a_trail_attr_v2)?;
+        let rep_trail_attr = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_trail_attr.edit_class, "public_signature_edit");
+        assert!(
+            rep_trail_attr.public_signature_changed,
+            "trailing `attribute [instance 100]` -> `200` outside `public section` must mark `public_signature_changed = true`"
+        );
+        assert!(rep_trail_attr.meta_signature_changed);
+        assert_eq!(
+            rep_trail_attr.transitive_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+        assert!(
+            rep_trail_attr.pruned_dependents.is_empty(),
+            "downstream consumers must not be pruned on trailing non-local attribute edit"
+        );
+        // Consumer `Smoke.B` actually fails to elaborate when `mkTag100` priority rises from 100 to 200 (`tag = 1` != `2`),
+        // proving `lake_recheck_dependents_with_store` does NOT cut off at `Smoke.A` and rechecks `Smoke.B`.
+        let err_recheck = lake_recheck_dependents_with_store(
+            Some(&store),
+            &canon_proj,
+            &["Smoke/A.lean".to_string()],
+            Some("HEAD"),
+            false,
+        );
+        assert!(
+            err_recheck.is_err(),
+            "downstream consumer Smoke.B must be rechecked (and fail typechecking) when trailing `attribute [instance 100]` changes to `200`"
+        );
+
+        let a_trail_local_attr_v1 =
+            format!("{a_trail_attr_v1}attribute [local instance 300] SmokeA.mkTag100\n");
+        let a_trail_local_attr_v2 =
+            format!("{a_trail_attr_v1}attribute [local instance 400] SmokeA.mkTag100\n");
+        fs::write(proj.join("Smoke/A.lean"), &a_trail_local_attr_v1)?;
+        run_git(&["add", "-A"])?;
+        run_git(&["commit", "-m", "trailing local attribute baseline"])?;
+        fs::write(proj.join("Smoke/A.lean"), &a_trail_local_attr_v2)?;
+        let rep_trail_local_attr = compute_impact_report(
+            proj.join("Smoke/A.lean"),
+            Some(proj.clone()),
+            Some("HEAD".to_string()),
+        )?;
+        assert_eq!(rep_trail_local_attr.edit_class, "private_module_edit");
+        assert!(
+            !rep_trail_local_attr.public_signature_changed,
+            "trailing `attribute [local ...]` edit after all public declarations must stay `private_module_edit`"
+        );
+        assert!(!rep_trail_local_attr.meta_signature_changed);
+        assert!(rep_trail_local_attr.transitive_dependents.is_empty());
+        assert_eq!(
+            rep_trail_local_attr.pruned_dependents,
+            vec!["Smoke.B".to_string(), "Smoke.C".to_string()]
+        );
+
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
