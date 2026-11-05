@@ -84,6 +84,8 @@ def verifiedTheoremRegistry : List String :=
     "superoptModule_sound", "superoptModuleWithProfile_sound",
     "applyExprRules_sound", "applyRewriteTable_sound",
     "certifyScalarPair_sound", "applyCertifiedScalarRewrite_sound", "stochasticProposerGate_sound",
+    "applyCertToScalar_sound", "foldCertifiedScalars_sound", "scalarRefines_eval",
+    "scalarRefines_of_eval", "applyCertsToScalar_sound",
     "applyCertifiedBundleCode_sound", "stochasticCert_kills_unsound_mutant",
     "stochasticCert_strict_cost_improvement", "stochasticCert_nonvacuous_pipeline",
     "scheduleStructuredLoop_sound", "applyLoopScheduleAux_refines",

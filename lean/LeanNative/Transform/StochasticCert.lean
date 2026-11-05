@@ -76,17 +76,49 @@ def candidateToVerifiedRule (profile : HardwareCostProfile) (candidate : Stochas
     | sarrayGet _ _ _ | sarraySet _ _ _ _ | rawLoad _ _ _ | boxScalar _ _ | unboxScalar _ _
     | call _ _ _ _ => exact ExprRefines.refl _
 
+def validateCertifiedRewriteCert (profile : HardwareCostProfile) (cert : CertifiedRewriteCert) : Bool :=
+    cert.costBefore == scalarExprCostWithProfile profile cert.candidate.lhs &&
+        cert.costAfter == scalarExprCostWithProfile profile cert.candidate.rhs &&
+        cert.theoremRef == "LeanNative.Proofs.certifyScalarPair_sound" &&
+        certifyScalarPair profile cert.candidate.lhs cert.candidate.rhs
+
 def certBundleToVerifiedRules (bundle : CertifiedRuleBundle) : List VerifiedExprRule :=
   bundle.certificates.filterMap fun cert =>
-    if cert.costBefore == scalarExprCostWithProfile bundle.profile cert.candidate.lhs &&
-        cert.costAfter == scalarExprCostWithProfile bundle.profile cert.candidate.rhs &&
-        cert.theoremRef == "LeanNative.Proofs.certifyScalarPair_sound" &&
-        certifyScalarPair bundle.profile cert.candidate.lhs cert.candidate.rhs then
+    if validateCertifiedRewriteCert bundle.profile cert then
       some (candidateToVerifiedRule bundle.profile cert.candidate)
     else none
 
-def applyCertifiedBundleCode (bundle : CertifiedRuleBundle) (code : LNIRCode) : LNIRCode :=
-  applyRewriteTable (certBundleToVerifiedRules bundle) code
+def applyCertToScalar (profile : HardwareCostProfile) (e : ScalarExpr)
+    (cert : CertifiedRewriteCert) : ScalarExpr :=
+  if e == cert.candidate.lhs && validateCertifiedRewriteCert profile cert then cert.candidate.rhs else e
+
+def applyCertsToScalar (profile : HardwareCostProfile) (certs : List CertifiedRewriteCert) :
+    ScalarExpr → ScalarExpr
+  | .binOp op l r => certs.foldl (applyCertToScalar profile)
+      (.binOp op (applyCertsToScalar profile certs l) (applyCertsToScalar profile certs r))
+  | .unaryOp op a => certs.foldl (applyCertToScalar profile) (.unaryOp op (applyCertsToScalar profile certs a))
+  | .select c t f => certs.foldl (applyCertToScalar profile)
+      (.select (applyCertsToScalar profile certs c) (applyCertsToScalar profile certs t) (applyCertsToScalar profile certs f))
+  | .fma a b c => certs.foldl (applyCertToScalar profile)
+      (.fma (applyCertsToScalar profile certs a) (applyCertsToScalar profile certs b) (applyCertsToScalar profile certs c))
+  | leaf => certs.foldl (applyCertToScalar profile) leaf
+
+def applyCertifiedBundleCode (bundle : CertifiedRuleBundle) : LNIRCode → LNIRCode
+  | .letBind dst ty (.scalar e) k =>
+    .letBind dst ty (.scalar (applyCertsToScalar bundle.profile bundle.certificates e)) (applyCertifiedBundleCode bundle k)
+  | .letBind dst ty e k => .letBind dst ty e (applyCertifiedBundleCode bundle k)
+  | .rawStore pv iv vv ty k => .rawStore pv iv vv ty (applyCertifiedBundleCode bundle k)
+  | .incRef v n k => .incRef v n (applyCertifiedBundleCode bundle k)
+  | .decRef v n k => .decRef v n (applyCertifiedBundleCode bundle k)
+  | .ite v t f => .ite v (applyCertifiedBundleCode bundle t) (applyCertifiedBundleCode bundle f)
+  | .seqFor iv lv hv av ai ty step k =>
+    .seqFor iv lv hv av ai ty (applyCertifiedBundleCode bundle step) (applyCertifiedBundleCode bundle k)
+  | .parFor ov lv ins ty (.customScalar iv vs body) k =>
+    .parFor ov lv ins ty (.customScalar iv vs (applyCertsToScalar bundle.profile bundle.certificates body))
+      (applyCertifiedBundleCode bundle k)
+  | .parFor ov lv ins ty kernel k => .parFor ov lv ins ty kernel (applyCertifiedBundleCode bundle k)
+  | .ret v => .ret v
+  | .unreachable => .unreachable
 
 def evalWithStochasticProposer (profile : HardwareCostProfile)
     (proposer : ScalarExpr → Option ScalarExpr) (lhs : ScalarExpr) : ScalarExpr :=
@@ -421,14 +453,5 @@ def cachedStochasticBundle : CertifiedRuleBundle :=
       costAfter := 0 }] }
 
 def cachedStochasticRules : List VerifiedExprRule := certBundleToVerifiedRules cachedStochasticBundle
-
-def verifiedStochasticCertContract : VerifiedCodePassContract where
-  name := "StochasticCert"
-  theoremRef := "LeanNative.Proofs.applyCertifiedBundleCode_sound"
-  notes := "Deterministic cached certified scalar rewrites; no search at pass runtime"
-  runCode := applyRewriteTable cachedStochasticRules
-  sound := applyRewriteTable_sound cachedStochasticRules
-
-def stochasticCertPass : TransformPass := TransformPass.ofVerifiedContract verifiedStochasticCertContract
 
 end LeanNative.Transform

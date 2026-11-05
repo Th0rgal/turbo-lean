@@ -156,4 +156,23 @@ def extReceipt : SuperoptEvolveReceipt :=
 #guard extReceipt.certCostAfter < extReceipt.certCostBefore
 #guard CertifiedRuleBundle.fromJson? extReceipt.bundle.toJson == some extReceipt.bundle
 
+def parallelDecl : LNIRDecl := {
+  name := "parallel_subexpr"
+  params := [{ id := 0, name := "n", ty := .i64 }]
+  retTy := .i64
+  body := .parFor 2 0 [] .i64
+    (.customScalar 1 [] (.binOp .add (.var 1) (.constU64 0))) (.ret 2)
+}
+
+def deepModule : LNIRModule := { moduleName := "deep", decls := [nestedLoopDecl, parallelDecl] }
+def deepReceipt : SuperoptEvolveReceipt := executeSuperoptEvolve canonCfg (.module deepModule)
+
+#guard deepReceipt.moduleCostAfter < deepReceipt.moduleCostBefore
+#guard deepReceipt.moduleCostAfter == deepModule.decls.foldl (fun n d =>
+  n + codeScalarCostWithProfile deepReceipt.bundle.profile (applyCertifiedBundleCode deepReceipt.bundle d.body)) 0
+#guard deepModule.decls.all (fun d => applyCertifiedBundleCode deepReceipt.bundle d.body != d.body)
+#guard applyCertsToScalar cachedStochasticBundle.profile cachedStochasticBundle.certificates
+    (.select (.constBool true) stochasticCertWitnessLhs (.var 999)) ==
+  .select (.constBool true) (.var 0) (.var 999)
+
 end LeanNative.Tests.StochasticEvolveTests

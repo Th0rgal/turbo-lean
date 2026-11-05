@@ -59,7 +59,13 @@ fn cli_superopt_evolve_forwards_flags_and_exports_importable_tlpack() {
         "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nbundle=\"\"\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"--bundle-out\" ]; then bundle=\"$a\"; fi\n  prev=\"$a\"\ndone\nif [ -n \"$bundle\" ]; then\n  printf '{{\"schema\":\"lean-native.superopt-evolve.v1\",\"target\":\"cuda_ptx\",\"certificates\":[{{\"rule\":\"shl_zero\",\"sound\":true}}]}}' > \"$bundle\"\nfi\nprintf '{{\"status\":\"evolved\",\"target\":\"cuda_ptx\",\"generations\":6,\"seed\":99,\"acceptedRules\":1}}\\n'\n",
         args_log.display()
     );
-    write_executable(&helper, &script);
+    write_executable(
+        &helper,
+        &script.replace(
+            "lean-native.superopt-evolve.v1",
+            "lean-native.stochastic-cert.v1",
+        ),
+    );
 
     let bundle_out = root.join("out").join("cert_bundle.json");
     let pack_out = root.join("out").join("cert_bundle.tlpack");
@@ -183,4 +189,148 @@ fn cli_superopt_evolve_rejects_invalid_target_and_propagates_helper_failure() {
     assert!(fail_stderr.contains("simulated evolution failure"));
 
     let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn pack_export_rejects_missing_bundle_and_report_schema() {
+    let root = temp_test_dir("missing_bundle");
+    let helper = root.join("helper");
+    let bundle = root.join("bundle.json");
+    let pack = root.join("bundle.tlpack");
+    write_executable(&helper, "#!/bin/sh\nprintf '{\"status\":\"evolved\"}'\n");
+    for materialize_report in [false, true] {
+        if materialize_report {
+            fs::write(
+                &bundle,
+                r#"{"schema":"lean-native.superopt-evolve-receipt.v1"}"#,
+            )
+            .unwrap();
+        }
+        let out = run_turbo(
+            &root.join("cache"),
+            &helper,
+            &[
+                "superopt-evolve",
+                "--bundle-out",
+                bundle.to_str().unwrap(),
+                "--pack-out",
+                pack.to_str().unwrap(),
+            ],
+        );
+        assert!(!out.status.success());
+        assert!(!pack.exists());
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn real_bundle_json_raw_and_zstd_pack_consumption_and_rejection() {
+    let root = temp_test_dir("real_bundle");
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let core = repo.join("lean/.lake/build/bin/lean-native-core");
+    assert!(
+        core.is_file(),
+        "Build lean-native-core before running integration tests"
+    );
+    let bundle = root.join("bundle.json");
+    let pack = root.join("bundle.tlpack");
+    let out = run_turbo(
+        &root.join("cache"),
+        &core,
+        &[
+            "--json",
+            "superopt-evolve",
+            "--bundle-out",
+            bundle.to_str().unwrap(),
+            "--pack-out",
+            pack.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let compressed = root.join("bundle.tlpack.zst");
+    assert!(Command::new("zstd")
+        .args(["-q", "-o"])
+        .arg(&compressed)
+        .arg(&pack)
+        .status()
+        .unwrap()
+        .success());
+    for path in [&bundle, &pack, &compressed] {
+        for command in ["compile-llvm", "verify-certs"] {
+            let mut cmd = Command::new(&core);
+            cmd.args([command, "--canonical", "--stochastic-bundle"])
+                .arg(path);
+            if command == "verify-certs" {
+                cmd.args(["--verified-kernel-only", "--json"]);
+            }
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}: {}",
+                path.display(),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if command == "verify-certs" {
+                let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+                assert_eq!(report["verified"], true);
+                assert_eq!(report["overallAssurance"], "VerifiedKernelProof");
+            }
+        }
+    }
+    let good: Value = serde_json::from_slice(&fs::read(&bundle).unwrap()).unwrap();
+    assert!(!good["certificates"].as_array().unwrap().is_empty());
+    let mut bad_cost = good.clone();
+    bad_cost["certificates"][0]["costAfter"] = serde_json::json!(999999);
+    let mut bad_theorem = good.clone();
+    bad_theorem["certificates"][0]["theoremRef"] = serde_json::json!("forged");
+    let mut unsound = good.clone();
+    unsound["certificates"][0]["candidate"]["rhs"] =
+        good["certificates"][0]["candidate"]["lhs"].clone();
+    let mut add_one = good.clone();
+    let scalar_wire = good["certificates"][0]["candidate"]["lhs"]
+        .as_str()
+        .unwrap();
+    let scalar_start = scalar_wire.find("S_").unwrap();
+    let scalar_end = scalar_wire.rfind("|C_ret").unwrap();
+    let wire = |expr: &str| {
+        format!(
+            "{}{}{}",
+            &scalar_wire[..scalar_start],
+            expr,
+            &scalar_wire[scalar_end..]
+        )
+    };
+    add_one["certificates"][0]["candidate"]["lhs"] =
+        serde_json::json!(wire("S_bin|B_add|S_var|0|S_u64|1"));
+    add_one["certificates"][0]["candidate"]["rhs"] = serde_json::json!(wire("S_var|0"));
+    add_one["certificates"][0]["costBefore"] = serde_json::json!(1);
+    add_one["certificates"][0]["costAfter"] = serde_json::json!(0);
+    let cases = [
+        b"not JSON".to_vec(),
+        b"TLPK\0\0\0\x02".to_vec(),
+        br#"{"schema":"lean-native.superopt-evolve-receipt.v1"}"#.to_vec(),
+        serde_json::to_vec(&bad_cost).unwrap(),
+        serde_json::to_vec(&bad_theorem).unwrap(),
+        serde_json::to_vec(&unsound).unwrap(),
+        serde_json::to_vec(&add_one).unwrap(),
+    ];
+    let invalid = root.join("invalid");
+    for data in std::iter::once(None).chain(cases.iter().map(Some)) {
+        if let Some(data) = data {
+            fs::write(&invalid, data).unwrap();
+        }
+        for command in ["compile-llvm", "verify-certs"] {
+            let out = Command::new(&core)
+                .args([command, "--canonical", "--stochastic-bundle"])
+                .arg(&invalid)
+                .output()
+                .unwrap();
+            assert!(!out.status.success(), "accepted invalid bundle");
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
 }

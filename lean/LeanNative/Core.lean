@@ -61,11 +61,12 @@ import LeanNative.Transform.HoistExclusivity
 import LeanNative.Transform.AsyncStateMachine
 import LeanNative.Frontend.ProofRetention
 import LeanNative.Proofs.ProofRetentionProofs
-import LeanNative.Transform.LoopVectorizeOpt
 import LeanNative.Transform.KernelFusion
 import LeanNative.Transform.Superopt
 import LeanNative.Transform.StochasticCert
 import LeanNative.Proofs.StochasticCertSoundness
+import LeanNative.Transform.StochasticCertPass
+import LeanNative.Transform.LoopVectorizeOpt
 import LeanNative.Transform.Plugins
 import LeanNative.Backend.LLVM
 import LeanNative.Backend.LLVMAst

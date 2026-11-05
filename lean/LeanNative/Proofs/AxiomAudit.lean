@@ -471,6 +471,9 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.metalBoundsFreeLoad_sound
   , ``LeanNative.Proofs.proofRetention_pipeline_nonvacuous
   , ``LeanNative.Proofs.certifyScalarPair_sound
+  , ``LeanNative.Proofs.applyCertToScalar_sound, ``LeanNative.Proofs.foldCertifiedScalars_sound
+  , ``LeanNative.Proofs.scalarRefines_eval, ``LeanNative.Proofs.scalarRefines_of_eval
+  , ``LeanNative.Proofs.applyCertsToScalar_sound
   , ``LeanNative.Proofs.applyCertifiedScalarRewrite_sound
   , ``LeanNative.Proofs.stochasticProposerGate_sound
   , ``LeanNative.Proofs.applyCertifiedBundleCode_sound

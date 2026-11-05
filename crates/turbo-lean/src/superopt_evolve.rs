@@ -7,7 +7,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
-use walkdir::WalkDir;
 
 const DEFAULT_TARGET: &str = "x86_64";
 const DEFAULT_INPUT: &str = "canonical";
@@ -181,61 +180,24 @@ pub fn resolve_lean_native_core_bin() -> Result<PathBuf> {
     )
 }
 
-fn collect_bundle_artifacts(
-    bundle_path: &Path,
-    fallback_stdout: &[u8],
-) -> Result<Vec<(String, Vec<u8>)>> {
-    if fs::symlink_metadata(bundle_path).is_ok() {
-        let resolved = fs::canonicalize(bundle_path).unwrap_or_else(|_| bundle_path.to_path_buf());
-        if resolved.is_file() {
-            let rel_name = bundle_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .filter(|s| !s.is_empty() && *s != "." && *s != "..")
-                .unwrap_or("superopt_bundle.json");
-            let bytes = fs::read(&resolved)
-                .with_context(|| format!("Failed to read bundle {}", resolved.display()))?;
-            return Ok(vec![(format!("superopt_evolve/{}", rel_name), bytes)]);
-        }
-        if resolved.is_dir() {
-            let mut entries = Vec::new();
-            for entry in WalkDir::new(&resolved).follow_links(false) {
-                let entry = entry?;
-                if entry.file_type().is_file() {
-                    let rel = entry
-                        .path()
-                        .strip_prefix(&resolved)
-                        .unwrap_or_else(|_| entry.path())
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    let clean_rel = rel.trim_start_matches('/');
-                    if clean_rel.is_empty() || clean_rel.starts_with('.') {
-                        continue;
-                    }
-                    let bytes = fs::read(entry.path())?;
-                    entries.push((format!("superopt_evolve/{}", clean_rel), bytes));
-                }
-            }
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            if !entries.is_empty() {
-                return Ok(entries);
-            }
-        }
-    }
-
-    if !fallback_stdout.is_empty()
-        && serde_json::from_slice::<serde_json::Value>(fallback_stdout).is_ok()
-    {
-        return Ok(vec![(
-            "superopt_evolve/report.json".to_string(),
-            fallback_stdout.to_vec(),
-        )]);
-    }
-
-    anyhow::bail!(
+fn collect_bundle_artifacts(bundle_path: &Path) -> Result<Vec<(String, Vec<u8>)>> {
+    anyhow::ensure!(
+        bundle_path.is_file(),
         "lean-native-core superopt-evolve did not materialize bundle output at {}",
         bundle_path.display()
-    )
+    );
+    let bytes = fs::read(bundle_path)
+        .with_context(|| format!("Failed to read bundle {}", bundle_path.display()))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).context("Invalid bundle JSON")?;
+    anyhow::ensure!(
+        value.get("schema").and_then(|v| v.as_str()) == Some("lean-native.stochastic-cert.v1"),
+        "Expected lean-native.stochastic-cert.v1 bundle schema"
+    );
+    let name = bundle_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("bundle.json");
+    Ok(vec![(format!("superopt_evolve/{name}"), bytes)])
 }
 
 pub fn export_bundle_to_pack(
@@ -411,7 +373,7 @@ pub fn run_superopt_evolve_command(
         let bundle_path = effective_bundle_path
             .as_deref()
             .context("Internal error: missing bundle path for --pack-out")?;
-        let artifacts = collect_bundle_artifacts(bundle_path, &output.stdout)?;
+        let artifacts = collect_bundle_artifacts(bundle_path)?;
         Some(export_bundle_to_pack(
             store,
             &args,
@@ -576,7 +538,13 @@ mod tests {
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nbundle=\"\"\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"--bundle-out\" ]; then bundle=\"$a\"; fi\n  prev=\"$a\"\ndone\nif [ -n \"$bundle\" ]; then\n  printf '{{\"schema\":\"lean-native.superopt-evolve.v1\",\"rules\":[{{\"name\":\"xor_self_zero\",\"verified\":true}}]}}' > \"$bundle\"\nfi\nprintf '{{\"status\":\"evolved\",\"acceptedRules\":1,\"rejectedCandidates\":3}}\\n'\n",
             args_log.display()
         );
-        let mock_bin = write_mock_helper(&dir, &script);
+        let mock_bin = write_mock_helper(
+            &dir,
+            &script.replace(
+                "lean-native.superopt-evolve.v1",
+                "lean-native.stochastic-cert.v1",
+            ),
+        );
         let prev_bin = std::env::var_os("LEAN_NATIVE_CORE_BIN");
         std::env::set_var("LEAN_NATIVE_CORE_BIN", &mock_bin);
 
@@ -654,7 +622,13 @@ mod tests {
             "#!/bin/sh\nbundle=\"\"\nprev=\"\"\nfor a in \"$@\"; do\n  if [ \"$prev\" = \"--bundle-out\" ]; then bundle=\"$a\"; fi\n  prev=\"$a\"\ndone\nprintf '%s' \"$bundle\" > \"{}\"\nprintf '{{\"schema\":\"lean-native.superopt-evolve.v1\",\"certified\":true}}' > \"$bundle\"\nprintf '{{\"status\":\"evolved\",\"acceptedRules\":2}}\\n'\n",
             bundle_seen.display()
         );
-        let mock_bin = write_mock_helper(&dir, &script);
+        let mock_bin = write_mock_helper(
+            &dir,
+            &script.replace(
+                "lean-native.superopt-evolve.v1",
+                "lean-native.stochastic-cert.v1",
+            ),
+        );
         let prev_bin = std::env::var_os("LEAN_NATIVE_CORE_BIN");
         std::env::set_var("LEAN_NATIVE_CORE_BIN", &mock_bin);
 

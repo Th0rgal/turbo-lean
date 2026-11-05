@@ -290,7 +290,7 @@ def proofRetentionPass : TransformPass :=
   TransformPass.ofVerifiedContract proofRetentionContract
 
 def verifiedKernelPasses : List TransformPass :=
-  [eqSatPass, loopSchedulePass, ownershipRCPass, asyncStateMachinePass, proofRetentionPass, stochasticCertPass]
+  [eqSatPass, loopSchedulePass, ownershipRCPass, asyncStateMachinePass, proofRetentionPass]
 
 /-- Extended TV-validated pass pipeline (`UnboxTupleSROA`, `HoistExclusivity`, `LoopVectorizeOpt`,
     and extended `AlgebraicOpt` rules gated by `SymbolicTV.validateTranslationDecl`). -/

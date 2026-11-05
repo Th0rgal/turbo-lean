@@ -1,5 +1,7 @@
 import LeanNative.IR.Codec
 import LeanNative.Transform.StochasticCert
+import LeanNative.Transform.StochasticCertPass
+import LeanNative.Transform.LoopVectorizeOpt
 import LeanNative.Driver.CAbiEmit
 
 set_option autoImplicit false
@@ -13,6 +15,80 @@ open LeanNative.Transform
 def defaultEvolveGenerations : Nat := 8
 def maxEvolveGenerations : Nat := 4096
 def defaultEvolveSeed : UInt64 := 42
+
+private def decodeStochasticPack? (bytes : ByteArray) : Option CertifiedRuleBundle := do
+  if bytes.size < 16 || bytes.extract 0 8 != ByteArray.mk #[84, 76, 80, 75, 0, 0, 0, 2] then none else
+    let headerLen := (List.range 8).foldl (fun n i => n + bytes[i + 8]!.toNat * 256 ^ i) 0
+    let start := 16 + headerLen
+    if start > bytes.size then none else
+      let header ← String.fromUTF8? (bytes.extract 16 start)
+      let normalized ← normalizePackJson header
+      let manifest ← StochasticJson.parse? normalized
+      let blobs ← StochasticJson.array? (← StochasticJson.field? manifest "blobs")
+      let (endOffset, bundles) ← blobs.foldlM (fun (offset, found) blob => do
+        let size ← StochasticJson.nat? (← StochasticJson.field? blob "size_bytes")
+        if offset + size > bytes.size then none else
+          let text ← String.fromUTF8? (bytes.extract offset (offset + size))
+          let found := match CertifiedRuleBundle.fromJson? text with
+            | some b => b :: found
+            | none => found
+          some (offset + size, found)) (start, [])
+      if endOffset != bytes.size then none else match bundles with
+      | [bundle] => some bundle
+      | _ => none
+where
+  normalizePackJson (s : String) : Option String :=
+    -- Manifest booleans/null are irrelevant to bundle offsets; preserve all quoted text.
+    go (s.length + 1) s.toList
+  go : Nat → List Char → Option String
+    | 0, _ => none
+    | _ + 1, [] => some ""
+    | n + 1, '"' :: rest => do
+      let (s, rem) ← StochasticJson.quoted rest
+      some (StochasticJson.render (.str s) ++ (← go n rem))
+    | n + 1, 't' :: 'r' :: 'u' :: 'e' :: rest
+    | n + 1, 'f' :: 'a' :: 'l' :: 's' :: 'e' :: rest
+    | n + 1, 'n' :: 'u' :: 'l' :: 'l' :: rest => do some ("0" ++ (← go n rest))
+    | n + 1, c :: rest => do some (String.singleton c ++ (← go n rest))
+
+def loadStochasticBundleFromPath (path : String) : IO CertifiedRuleBundle := do
+  let bytes ← IO.FS.readBinFile path
+  let bytes ← if bytes.extract 0 4 == ByteArray.mk #[0x28, 0xB5, 0x2F, 0xFD] then do
+      let child ← IO.Process.spawn { cmd := "zstd", args := #["-d", "-c", "--", path], stdout := .piped }
+      let mut output := ByteArray.empty
+      repeat
+        let chunk ← child.stdout.read 65536
+        if chunk.isEmpty then break
+        output := output ++ chunk
+      let exit ← child.wait
+      if exit != 0 then throw <| IO.userError "Invalid compressed stochastic bundle"
+      pure output
+    else pure bytes
+  let bundle? := if bytes.extract 0 4 == "TLPK".toUTF8 then decodeStochasticPack? bytes
+    else (String.fromUTF8? bytes).bind CertifiedRuleBundle.fromJson?
+  let some bundle := bundle? | throw <| IO.userError "Invalid stochastic certificate bundle schema or pack"
+  unless bundle.certificates.all (validateCertifiedRewriteCert bundle.profile) do
+    throw <| IO.userError "Invalid stochastic rewrite certificate"
+  return bundle
+
+def runOptPipelineWithArgs (args : List String) (useVerifiedOnly : Bool) (m : LNIRModule) :
+    IO (LNIRModule × List PassStepCert) := do
+  let rec bundlePath : List String → Except String (Option String)
+    | [] => .ok none
+    | "--stochastic-bundle" :: path :: rest => do
+      if path.isEmpty || path.startsWith "-" then .error "Missing stochastic bundle path" else
+        if (← bundlePath rest).isSome then .error "Duplicate --stochastic-bundle" else .ok (some path)
+    | ["--stochastic-bundle"] => .error "Missing stochastic bundle path"
+    | _ :: rest => bundlePath rest
+  let path ← match bundlePath args with
+    | .ok p => pure p
+    | .error e => throw <| IO.userError e
+  match path with
+  | none => return if useVerifiedOnly then runVerifiedKernelPipeline m else runDefaultPipeline m
+  | some path =>
+    let bundle ← loadStochasticBundleFromPath path
+    let pass := mkStochasticCertPass bundle
+    return runPassPipeline (if useVerifiedOnly then verifiedKernelPasses ++ [pass] else pass :: defaultPasses) m
 
 structure SuperoptEvolveConfig where
   target : SuperoptTarget := .x86_64
@@ -266,43 +342,6 @@ private def upsertBetterCert (certs : List CertifiedRewriteCert) (c : CertifiedR
 def mergeCertifiedRewrites (certs : List CertifiedRewriteCert) : List CertifiedRewriteCert :=
   certs.foldl upsertBetterCert []
 
-def applyCertsToScalar (profile : HardwareCostProfile) (certs : List CertifiedRewriteCert) :
-    ScalarExpr → ScalarExpr := fun e =>
-  let rec go (cur : ScalarExpr) : ScalarExpr :=
-    let stepped := match cur with
-      | .binOp op l r => .binOp op (go l) (go r)
-      | .unaryOp op a => .unaryOp op (go a)
-      | .select c t f => .select (go c) (go t) (go f)
-      | .fma a b c => .fma (go a) (go b) (go c)
-      | leaf => leaf
-    certs.foldl (fun acc cert =>
-      if acc == cert.candidate.lhs && certifyScalarPair profile cert.candidate.lhs cert.candidate.rhs then
-        cert.candidate.rhs
-      else acc) stepped
-  go e
-
-def applyBundleCodeDeep (bundle : CertifiedRuleBundle) : LNIRCode → LNIRCode
-  | .letBind dst ty (.scalar se) k =>
-    let se' := applyCertsToScalar bundle.profile bundle.certificates se
-    let e' := applyCertifiedBundleCode bundle (.letBind dst ty (.scalar se') (.ret dst))
-    match e' with
-    | .letBind _ _ val' _ => .letBind dst ty val' (applyBundleCodeDeep bundle k)
-    | _ => .letBind dst ty (.scalar se') (applyBundleCodeDeep bundle k)
-  | .letBind dst ty val k => .letBind dst ty val (applyBundleCodeDeep bundle k)
-  | .rawStore pv iv vv ety k => .rawStore pv iv vv ety (applyBundleCodeDeep bundle k)
-  | .incRef ov c k => .incRef ov c (applyBundleCodeDeep bundle k)
-  | .decRef ov c k => .decRef ov c (applyBundleCodeDeep bundle k)
-  | .ite cv t f => .ite cv (applyBundleCodeDeep bundle t) (applyBundleCodeDeep bundle f)
-  | .seqFor iv lv hv av ai aty step k =>
-    .seqFor iv lv hv av ai aty (applyBundleCodeDeep bundle step) (applyBundleCodeDeep bundle k)
-  | .parFor ov lv ins ety (.customScalar idxVar inVars body) k =>
-    let body' := applyCertsToScalar bundle.profile bundle.certificates body
-    .parFor ov lv ins ety (.customScalar idxVar inVars body') (applyBundleCodeDeep bundle k)
-  | .parFor ov lv ins ety kern k =>
-    .parFor ov lv ins ety kern (applyBundleCodeDeep bundle k)
-  | .ret v => .ret v
-  | .unreachable => .unreachable
-
 structure SuperoptEvolveReceipt where
   inputKind : String
   moduleName : String
@@ -336,7 +375,7 @@ def executeSuperoptEvolve (cfg : SuperoptEvolveConfig) (payload : EvolveInputPay
     }
     let rules := certBundleToVerifiedRules bundle
     let modCostBefore := mod.decls.foldl (fun acc d => acc + codeScalarCostWithProfile profile d.body) 0
-    let optDecls := mod.decls.map (fun d => { d with body := applyBundleCodeDeep bundle d.body })
+    let optDecls := mod.decls.map (fun d => { d with body := applyCertifiedBundleCode bundle d.body })
     let modCostAfter := optDecls.foldl (fun acc d => acc + codeScalarCostWithProfile profile d.body) 0
     let certBefore := certs.foldl (fun acc c => acc + c.costBefore) 0
     let certAfter := certs.foldl (fun acc c => acc + c.costAfter) 0

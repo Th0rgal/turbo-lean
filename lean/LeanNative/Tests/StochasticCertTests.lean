@@ -100,7 +100,13 @@ def sampleDecl : LNIRDecl := {
 #guard (stochasticCertPass.runDecl sampleDecl).2.changed == true
 #guard evalSameOk (evalCode 16 testEnv HeapState.empty (stochasticCertPass.runDecl sampleDecl).1.body)
   (evalCode 16 testEnv HeapState.empty sampleDecl.body)
-#guard verifiedKernelPasses.any (fun p => p.name == "StochasticCert")
+#guard !(verifiedKernelPasses ++ defaultPasses).any (fun p => p.name == "StochasticCert")
+#guard ((mkStochasticCertPass evolvedBundle).runDecl sampleDecl).2.changed
+def optInReport :=
+  let (_, certs) := runPassPipeline (verifiedKernelPasses ++ [mkStochasticCertPass evolvedBundle])
+    { moduleName := "m", decls := [sampleDecl] }
+  LeanNative.Proofs.verifyModuleCerts "m" (certs.map LeanNative.Driver.CoreCLI.toOptimizationCert)
+#guard optInReport.verified && optInReport.overallAssurance == .verifiedKernelProof
 
 def loopCode : LNIRCode :=
   .letBind 1 .i64 (.scalar (.constU64 0))
