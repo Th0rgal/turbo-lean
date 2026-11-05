@@ -1687,4 +1687,96 @@ theorem overlap_or_overflow_rejects_zero_copy_slice_io (c : ZeroCopySliceIoCheck
 #guard verifyZeroCopySliceIoC 4096 64 8192 32 64 0 == 0
 #guard verifyZeroCopySliceIoC 4096 64 8192 128 64 2 == 0
 
+structure CorpusTimingSample where
+  baselineNs : Nat
+  candidateNs : Nat
+  hits : Nat
+  declName : String := ""
+  deriving Repr, DecidableEq, Inhabited, BEq
+
+def meetsOnePercentE2EGain (b c : Nat) : Bool :=
+  b > 0 && c * 100 <= b * 99
+
+def corpusProdBaseline (corpus : List CorpusTimingSample) : Nat :=
+  corpus.foldl (fun acc s => acc * s.baselineNs) 1
+
+def corpusProdCandidate (corpus : List CorpusTimingSample) : Nat :=
+  corpus.foldl (fun acc s => acc * s.candidateNs) 1
+
+def meetsCorpusGeomeanOnePercentGain (corpus : List CorpusTimingSample) : Bool :=
+  !corpus.isEmpty &&
+    corpus.all (fun s => s.baselineNs > 0 && s.candidateNs > 0) &&
+    corpusProdCandidate corpus * (100 ^ corpus.length) <=
+      corpusProdBaseline corpus * (99 ^ corpus.length)
+
+/-- Leave-one-out evidence. Legacy field names are preserved for JSON compatibility:
+`baselineNs` is the total WITHOUT this site; `soloCandidateNs` is the retained-set total.
+Pairs are (without-site, with-site) in canonical workload order. Survivors share the final
+retained combination; rejected sites carry evidence from their elimination round. -/
+structure CandidateAblationSample where
+  siteIdx : Nat
+  declName : String := ""
+  baselineNs : Nat
+  soloCandidateNs : Nat
+  hits : Nat := 1
+  workloadPairs : List (Nat × Nat) := []
+  deriving Repr, DecidableEq, Inhabited, BEq
+
+def candidateAblationSurvives (s : CandidateAblationSample) : Bool :=
+  s.hits > 0 && s.baselineNs > 0 && s.soloCandidateNs > 0 &&
+    meetsCorpusGeomeanOnePercentGain (s.workloadPairs.map fun (b, c) =>
+      { baselineNs := b, candidateNs := c, hits := s.hits })
+
+def keepSiteByAblations (ablations : List CandidateAblationSample) (siteIdx : Nat)
+    (expectedPairs : Nat := 1) : Bool :=
+  let matching := ablations.filter (fun s => s.siteIdx == siteIdx)
+  !matching.isEmpty && matching.all (fun s =>
+    s.workloadPairs.length == expectedPairs && candidateAblationSurvives s)
+
+/-- Exact one-percent wall-clock gain without overflowing or allocating bignums. -/
+@[inline, export leannative_verify_e2e_gain_u64]
+def verifyE2EGainU64C (baselineNs candidateNs hits : UInt64) : UInt8 :=
+  let saving := baselineNs / 100 + (if baselineNs % 100 == 0 then 0 else 1)
+  if baselineNs > 0 && candidateNs > 0 && hits > 0 && candidateNs ≤ baselineNs &&
+      saving ≤ baselineNs - candidateNs then 1 else 0
+
+structure E2EGainCheck where
+  baselineNs : UInt64
+  candidateNs : UInt64
+  hits : UInt64
+
+def checkE2EGain (c : E2EGainCheck) : Bool :=
+  verifyE2EGainU64C c.baselineNs c.candidateNs c.hits == 1
+
+theorem e2e_gain_gate_sound (c : E2EGainCheck) :
+    checkE2EGain c = true ↔
+      0 < c.baselineNs.toNat ∧ 0 < c.candidateNs.toNat ∧ 0 < c.hits.toNat ∧
+      c.candidateNs.toNat * 100 ≤ c.baselineNs.toNat * 99 := by
+  rcases c with ⟨b, c, h⟩
+  have hb := b.toNat_lt
+  have hc := c.toNat_lt
+  have hr : (b % 100 == 0) = true ↔ b.toNat % 100 = 0 := by
+    simp [← UInt64.toNat_inj, UInt64.toNat_mod]
+  unfold checkE2EGain verifyE2EGainU64C
+  by_cases hle : c ≤ b
+  · rw [UInt64.le_iff_toNat_le] at hle
+    have hs : (b - c).toNat = b.toNat - c.toNat := UInt64.toNat_sub_of_le b c hle
+    simp only [UInt64.lt_iff_toNat_lt, UInt64.le_iff_toNat_le, UInt64.toNat_ofNat,
+      UInt64.toNat_add, UInt64.toNat_div, hs, Bool.and_eq_true, decide_eq_true_eq]
+    split <;> simp_all [UInt64.toNat_ofNat] <;> omega
+  · have hbad : ¬ c.toNat * 100 ≤ b.toNat * 99 := by
+      simp only [UInt64.le_iff_toNat_le] at hle
+      omega
+    simp [hle, hbad]
+
+def e2eGainMetaSpec : MetaGateSpec E2EGainCheck
+    (fun c => 0 < c.baselineNs.toNat ∧ 0 < c.candidateNs.toNat ∧ 0 < c.hits.toNat ∧
+      c.candidateNs.toNat * 100 ≤ c.baselineNs.toNat * 99) :=
+  ⟨checkE2EGain, fun c => (e2e_gain_gate_sound c).mp,
+    fun c => (e2e_gain_gate_sound c).mpr, ⟨1000, 990, 1⟩, ⟨1000, 991, 1⟩, rfl, rfl⟩
+
+theorem insufficient_gain_rejects_e2e (c : E2EGainCheck)
+    (h : c.baselineNs.toNat * 99 < c.candidateNs.toNat * 100) : checkE2EGain c = false :=
+  e2eGainMetaSpec.rejects_unsafe c (by omega)
+
 end LeanNative.Spec

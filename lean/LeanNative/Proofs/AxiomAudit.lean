@@ -46,6 +46,7 @@ import LeanNative.Backend.StableHLOAst
 import LeanNative.Transform.AsyncStateMachine
 import LeanNative.Proofs.AsyncStateMachineProofs
 import LeanNative.Proofs.ProofRetentionProofs
+import LeanNative.Proofs.CostAutotuneSoundness
 
 namespace LeanNative.Proofs
 
@@ -131,7 +132,7 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.evalScalarExpr_xor_mask_coalesce_u64, ``LeanNative.Proofs.evalScalarExpr_mul_add_distrib_const_u64
   , ``LeanNative.Spec.meta_verified_contract_compose_sound, ``LeanNative.Spec.meta_validator_rejects_semantic_mutants
   , ``LeanNative.Spec.meta_limb256_mul_lo_homomorphism, ``LeanNative.Spec.meta_unbox_tuple_full_elim_sound
-  , ``LeanNative.Spec.meta_double_shift_mask_and_fma_sound, ``LeanNative.Proofs.unboxTupleDeadElim_refines
+   , ``LeanNative.Spec.meta_double_shift_mask_and_fma_sound
   , ``LeanNative.Proofs.uint64_shr_shl_mask_collapse, ``LeanNative.Proofs.evalScalarExpr_shr_shl_mask_collapse_u64
   , ``LeanNative.Proofs.evalScalarExpr_fma_fusion_u64, ``LeanNative.Proofs.uint64_rotl_comm_or
   , ``LeanNative.Spec.small_trip_prefers_cpu_simd, ``LeanNative.Spec.matrix_contraction_prefers_tpu_mxu
@@ -184,6 +185,8 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Spec.low_twiddle_zmm_ntt_gate_sound, ``LeanNative.Spec.nonzero_tw_hi_rejects_low_twiddle_3clmul
   , ``LeanNative.Spec.trineon_fold_four_gate_sound, ``LeanNative.Spec.gpr_fmov_or_misaligned_rejects_trineon_fold_four
   , ``LeanNative.Spec.zero_copy_slice_io_gate_sound, ``LeanNative.Spec.overlap_or_overflow_rejects_zero_copy_slice_io
+  , ``LeanNative.Spec.e2e_gain_gate_sound, ``LeanNative.Spec.insufficient_gain_rejects_e2e
+  , ``LeanNative.Proofs.foldl_decls_mem_acc, ``LeanNative.Proofs.foldl_decls_refines
   , ``LeanNative.Proofs.evalParKernelLoop_append, ``LeanNative.Proofs.parFor_chunk_partition_sound
   , ``LeanNative.Semantics.HeapState.decRefBuf_one_frees_buffer
   , ``LeanNative.Semantics.HeapState.decRefBuf_none_error, ``LeanNative.Semantics.HeapState.incRefBuf_none_error
@@ -476,8 +479,10 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.metalBoundsFreeLoad_sound
   , ``LeanNative.Proofs.proofRetention_pipeline_nonvacuous
   , ``LeanNative.Proofs.certifyScalarPair_sound
-  , ``LeanNative.Proofs.applyCertToScalar_sound, ``LeanNative.Proofs.foldCertifiedScalars_sound
-  , ``LeanNative.Proofs.scalarRefines_eval, ``LeanNative.Proofs.scalarRefines_of_eval
+  , ``LeanNative.Proofs.applyCertToScalar_sound
+  , ``LeanNative.Proofs.foldCertifiedScalars_sound
+  , ``LeanNative.Proofs.scalarRefines_eval
+  , ``LeanNative.Proofs.scalarRefines_of_eval
   , ``LeanNative.Proofs.applyCertsToScalar_sound
   , ``LeanNative.Proofs.applyCertifiedScalarRewrite_sound
   , ``LeanNative.Proofs.stochasticProposerGate_sound
@@ -486,7 +491,25 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.stochasticCert_kills_unsound_mutant
   , ``LeanNative.Proofs.stochasticCert_strict_cost_improvement
   , ``LeanNative.Proofs.stochasticCert_nonvacuous_pipeline
+  , ``LeanNative.Proofs.calibrateHardwareProfile_preserves_target
+  , ``LeanNative.Proofs.meetsOnePercentE2EGain_iff
+  , ``LeanNative.Proofs.meetsOnePercentE2EGain_rejects_subthreshold
+  , ``LeanNative.Proofs.meetsCorpusGeomeanOnePercentGain_iff
+  , ``LeanNative.Proofs.meetsCorpusGeomeanOnePercentGain_rejects_summed_false_positive
+  , ``LeanNative.Proofs.superoptModuleWithCalibratedProfile_sound
+  , ``LeanNative.Proofs.superoptCodeSelective_sound
+  , ``LeanNative.Proofs.superoptDeclSelective_sound
+  , ``LeanNative.Proofs.superoptModuleSelective_sound
+  , ``LeanNative.Proofs.autotuneCodeWithAmdahl_sound
+  , ``LeanNative.Proofs.autotuneCodeWithAmdahl_uncalibrated_preserves
+  , ``LeanNative.Proofs.autotuneDeclWithAmdahl_sound
+  , ``LeanNative.Proofs.autotuneSuperoptModule_sound
+  , ``LeanNative.Proofs.costAutotune_amdahl_gate_nonvacuous
+  , ``LeanNative.Proofs.ablateSitesLeaveOneOut_sound
   ]
+
+#guard auditedTheoremNames.length == 552
+#guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/
 structure TheoremAxiomAudit where
@@ -548,7 +571,8 @@ elab "#verify_lean_native_axioms" : command => do
         next := next.push chunks[chunks.size - 1]!
       chunks := next
     let resultsExpr := chunks[0]?.getD (toExpr ([] : List TheoremAxiomAudit))
-    let reportExpr := mkApp4 (mkConst ``AxiomAuditReport.mk) (toExpr report.passed) (toExpr report.theoremsAudited) resultsExpr (toExpr report.forbiddenAxiomsFound)
+    let reportExpr := mkApp4 (mkConst ``AxiomAuditReport.mk) (toExpr report.passed)
+      (toExpr report.theoremsAudited) resultsExpr (toExpr report.forbiddenAxiomsFound)
     addAndCompile (Declaration.defnDecl {
       name := `LeanNative.Proofs.verifiedAxiomAuditReport
       levelParams := []

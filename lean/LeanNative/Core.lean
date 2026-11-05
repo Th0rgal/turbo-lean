@@ -88,6 +88,9 @@ import LeanNative.Driver.EvalBatch
 import LeanNative.Driver.StochasticEvolve
 import LeanNative.Driver.CoreCLI
 import LeanNative.Proofs.AsyncStateMachineProofs
+import LeanNative.Transform.CostAutotune
+import LeanNative.Proofs.CostAutotuneSoundness
+import LeanNative.Driver.CostAutotuneCLI
 
 namespace LeanNative.Core
 

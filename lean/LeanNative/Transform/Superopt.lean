@@ -1,4 +1,5 @@
 import LeanNative.IR.Types
+import Lean.Data.Json
 import LeanNative.IR.AST
 import LeanNative.Semantics.Value
 import LeanNative.Semantics.Eval
@@ -73,6 +74,7 @@ structure HardwareCostProfile where
   minGpuElements       : Nat := 65536
   gpuBlockThreads      : Nat := 256
   matmulTileDim        : Nat := 16
+  keptSites?           : Option (List (String × Nat)) := none
   deriving Repr, DecidableEq, Inhabited, BEq
 
 namespace HardwareCostProfile
@@ -107,6 +109,18 @@ private def extractJsonNatField (raw : String) (key : String) : Option Nat := do
 
 /-- Parse a `HardwareCostProfile` from a `profiles/*.json` file. -/
 def fromJson? (raw : String) : Option HardwareCostProfile := do
+  let top ← (Lean.Json.parse raw).toOption
+  let obj := (top.getObjVal? "profile").toOption.getD top
+  let keptSites? ← match obj.getObjVal? "kept_sites" with
+    | .error _ => some none
+    | .ok value => do
+      let rows ← value.getArr?.toOption
+      let sites ← rows.toList.mapM fun row => do
+        let decl ← (← row.getObjVal? "decl" |>.toOption).getStr?.toOption
+        let site ← (← row.getObjVal? "site" |>.toOption).getNat?.toOption
+        return (decl, site)
+      some (some sites)
+  let raw := obj.compress
   let tgtStr := (extractJsonStringField raw "target").getD "x86_64"
   let target : SuperoptTarget :=
     if tgtStr == "arm64" || tgtStr == "aarch64" then .arm64
@@ -119,6 +133,7 @@ def fromJson? (raw : String) : Option HardwareCostProfile := do
   let sm := (extractJsonStringField raw "sm_arch").getD base.smArch
   return {
     profileId            := pid
+    keptSites?           := keptSites?
     target               := target
     llvmTargetCpu        := llvmCpu
     smArch               := sm
@@ -829,41 +844,59 @@ def superoptScalarExprWithProfile (p : HardwareCostProfile) (declName : String) 
   superoptScalarExprCore p s!"{p.target.toString}:{p.profileId}" declName e
 
 /-- Superoptimize all scalar expressions in an `LNIRCode` block under `p`. -/
-def superoptCodeCore (p : HardwareCostProfile) (targetLabel : String) (declName : String) :
-    LNIRCode → LNIRCode × List SuperoptRewriteRecord
-  | .letBind dst ty (.scalar se) k =>
+def superoptCodeSelective (p : HardwareCostProfile) (targetLabel declName : String)
+    (keepIdx : Nat → Bool) : LNIRCode → Nat → LNIRCode × List SuperoptRewriteRecord × Nat
+  | .letBind dst ty (.scalar se) k, nextIdx =>
     let (se', recOpt) := superoptScalarExprCore p targetLabel declName se
-    let (k', kRecs) := superoptCodeCore p targetLabel declName k
-    (.letBind dst ty (.scalar se') k', match recOpt with | some r => r :: kRecs | none => kRecs)
-  | .letBind dst ty val k =>
-    let (k', kRecs) := superoptCodeCore p targetLabel declName k
-    (.letBind dst ty val k', kRecs)
-  | .rawStore pv iv vv ety k =>
-    let (k', kRecs) := superoptCodeCore p targetLabel declName k
-    (.rawStore pv iv vv ety k', kRecs)
-  | .incRef ov c k =>
-    let (k', kRecs) := superoptCodeCore p targetLabel declName k
-    (.incRef ov c k', kRecs)
-  | .decRef ov c k =>
-    let (k', kRecs) := superoptCodeCore p targetLabel declName k
-    (.decRef ov c k', kRecs)
-  | .ite cv t e =>
-    let (t', tRecs) := superoptCodeCore p targetLabel declName t
-    let (e', eRecs) := superoptCodeCore p targetLabel declName e
-    (.ite cv t' e', tRecs ++ eRecs)
-  | .seqFor iv lv hv av ai aty step k =>
-    let (step', sRecs) := superoptCodeCore p targetLabel declName step
-    let (k', kRecs) := superoptCodeCore p targetLabel declName k
-    (.seqFor iv lv hv av ai aty step' k', sRecs ++ kRecs)
-  | .parFor ov lv ins ety (.customScalar idxVar inVars body) k =>
+    match recOpt with
+    | some r =>
+      let keep := keepIdx nextIdx
+      let (k', recs, idx) := superoptCodeSelective p targetLabel declName keepIdx k (nextIdx + 1)
+      (.letBind dst ty (.scalar (if keep then se' else se)) k', if keep then r :: recs else recs, idx)
+    | none =>
+      let (k', recs, idx) := superoptCodeSelective p targetLabel declName keepIdx k nextIdx
+      (.letBind dst ty (.scalar se) k', recs, idx)
+  | .letBind dst ty val k, nextIdx =>
+    let (k', recs, idx) := superoptCodeSelective p targetLabel declName keepIdx k nextIdx
+    (.letBind dst ty val k', recs, idx)
+  | .rawStore pv iv vv ety k, nextIdx =>
+    let (k', recs, idx) := superoptCodeSelective p targetLabel declName keepIdx k nextIdx
+    (.rawStore pv iv vv ety k', recs, idx)
+  | .incRef ov c k, nextIdx =>
+    let (k', recs, idx) := superoptCodeSelective p targetLabel declName keepIdx k nextIdx
+    (.incRef ov c k', recs, idx)
+  | .decRef ov c k, nextIdx =>
+    let (k', recs, idx) := superoptCodeSelective p targetLabel declName keepIdx k nextIdx
+    (.decRef ov c k', recs, idx)
+  | .ite cv t e, nextIdx =>
+    let (t', tRecs, midIdx) := superoptCodeSelective p targetLabel declName keepIdx t nextIdx
+    let (e', eRecs, idx) := superoptCodeSelective p targetLabel declName keepIdx e midIdx
+    (.ite cv t' e', tRecs ++ eRecs, idx)
+  | .seqFor iv lv hv av ai aty step k, nextIdx =>
+    let (step', sRecs, midIdx) := superoptCodeSelective p targetLabel declName keepIdx step nextIdx
+    let (k', kRecs, idx) := superoptCodeSelective p targetLabel declName keepIdx k midIdx
+    (.seqFor iv lv hv av ai aty step' k', sRecs ++ kRecs, idx)
+  | .parFor ov lv ins ety (.customScalar idxVar inVars body) k, nextIdx =>
     let (body', recOpt) := superoptScalarExprCore p targetLabel declName body
-    let (k', kRecs) := superoptCodeCore p targetLabel declName k
-    (.parFor ov lv ins ety (.customScalar idxVar inVars body') k', match recOpt with | some r => r :: kRecs | none => kRecs)
-  | .parFor ov lv ins ety kern k =>
-    let (k', kRecs) := superoptCodeCore p targetLabel declName k
-    (.parFor ov lv ins ety kern k', kRecs)
-  | .ret v => (.ret v, [])
-  | .unreachable => (.unreachable, [])
+    match recOpt with
+    | some r =>
+      let keep := keepIdx nextIdx
+      let (k', recs, idx) := superoptCodeSelective p targetLabel declName keepIdx k (nextIdx + 1)
+      (.parFor ov lv ins ety (.customScalar idxVar inVars (if keep then body' else body)) k',
+        if keep then r :: recs else recs, idx)
+    | none =>
+      let (k', recs, idx) := superoptCodeSelective p targetLabel declName keepIdx k nextIdx
+      (.parFor ov lv ins ety (.customScalar idxVar inVars body) k', recs, idx)
+  | .parFor ov lv ins ety kern k, nextIdx =>
+    let (k', recs, idx) := superoptCodeSelective p targetLabel declName keepIdx k nextIdx
+    (.parFor ov lv ins ety kern k', recs, idx)
+  | .ret v, nextIdx => (.ret v, [], nextIdx)
+  | .unreachable, nextIdx => (.unreachable, [], nextIdx)
+
+def superoptCodeCore (p : HardwareCostProfile) (targetLabel declName : String) (code : LNIRCode) :
+    LNIRCode × List SuperoptRewriteRecord :=
+  let (code', recs, _) := superoptCodeSelective p targetLabel declName (fun _ => true) code 0
+  (code', recs)
 
 /-- Superoptimize all scalar expressions in an `LNIRCode` block. -/
 def superoptCode (target : SuperoptTarget) (declName : String) (code : LNIRCode) :
@@ -871,13 +904,19 @@ def superoptCode (target : SuperoptTarget) (declName : String) (code : LNIRCode)
   superoptCodeCore (HardwareCostProfile.forTarget target) target.toString declName code
 
 /-- Superoptimize an `LNIRDecl` under `p`. -/
-def superoptDeclCore (p : HardwareCostProfile) (targetLabel : String) (d : LNIRDecl) :
-    LNIRDecl × List SuperoptRewriteRecord :=
-  let (body', recs) := superoptCodeCore p targetLabel d.name d.body
+def superoptDeclSelective (p : HardwareCostProfile) (targetLabel : String)
+    (keepIdx : Nat → Bool) (d : LNIRDecl) (nextIdx : Nat) :
+    LNIRDecl × List SuperoptRewriteRecord × Nat :=
+  let (body', recs, count) := superoptCodeSelective p targetLabel d.name keepIdx d.body 0
   let assurance' :=
     if recs.isEmpty then d.assurance
     else AssuranceLevel.combine d.assurance .verifiedKernelProof
-  ({ d with body := body', assurance := assurance' }, recs)
+  ({ d with body := body', assurance := assurance' }, recs, nextIdx + count)
+
+def superoptDeclCore (p : HardwareCostProfile) (targetLabel : String) (d : LNIRDecl) :
+    LNIRDecl × List SuperoptRewriteRecord :=
+  let (d', recs, _) := superoptDeclSelective p targetLabel (fun _ => true) d 0
+  (d', recs)
 
 /-- Superoptimize an `LNIRDecl` for `target`. -/
 def superoptDecl (target : SuperoptTarget) (d : LNIRDecl) :
@@ -885,13 +924,14 @@ def superoptDecl (target : SuperoptTarget) (d : LNIRDecl) :
   superoptDeclCore (HardwareCostProfile.forTarget target) target.toString d
 
 /-- Superoptimize all declarations in an `LNIRModule` under `p` and return `SuperoptReport`. -/
-def superoptModuleCore (p : HardwareCostProfile) (targetLabel : String) (m : LNIRModule) :
-    LNIRModule × SuperoptReport :=
+def superoptModuleSelective (p : HardwareCostProfile) (keepIdx : String → Nat → Bool)
+    (m : LNIRModule) (targetLabel : String := s!"{p.target.toString}:{p.profileId}") :
+    LNIRModule × SuperoptReport × Nat :=
   let costBefore := m.decls.foldl (fun acc d => acc + codeScalarCostWithProfile p d.body) 0
-  let (decls', allRecs) := m.decls.foldl (fun (dAcc, rAcc) d =>
-    let (d', recs) := superoptDeclCore p targetLabel d
-    (dAcc ++ [d'], rAcc ++ recs)
-  ) ([], [])
+  let (decls', allRecs, totalSites) := m.decls.foldl (fun (dAcc, rAcc, idx) d =>
+    let (d', recs, idx') := superoptDeclSelective p targetLabel (keepIdx d.name) d idx
+    (dAcc ++ [d'], rAcc ++ recs, idx')
+  ) ([], [], 0)
   let m' : LNIRModule := { m with decls := decls' }
   let costAfter := m'.decls.foldl (fun acc d => acc + codeScalarCostWithProfile p d.body) 0
   (m', {
@@ -903,16 +943,17 @@ def superoptModuleCore (p : HardwareCostProfile) (targetLabel : String) (m : LNI
     totalCostBefore := costBefore
     totalCostAfter := costAfter
     records := allRecs
-  })
+  }, totalSites)
+
+def superoptModuleCore (p : HardwareCostProfile) (targetLabel : String) (m : LNIRModule) :
+    LNIRModule × SuperoptReport :=
+  let (m', report, _) := superoptModuleSelective p (fun _ _ => true) m targetLabel
+  (m', report)
 
 /-- Superoptimize all declarations in an `LNIRModule` for `target` and return the
     optimized module along with a structured `SuperoptReport`. -/
 def superoptModule (target : SuperoptTarget) (m : LNIRModule) : LNIRModule × SuperoptReport :=
   superoptModuleCore (HardwareCostProfile.forTarget target) target.toString m
-
-/-- Superoptimize all declarations in an `LNIRModule` using a `HardwareCostProfile` (`profiles/*.json`). -/
-def superoptModuleWithProfile (p : HardwareCostProfile) (m : LNIRModule) : LNIRModule × SuperoptReport :=
-  superoptModuleCore p s!"{p.target.toString}:{p.profileId}" m
 
 private abbrev escapeJsonSO := LeanNative.IR.jsonEscape
 

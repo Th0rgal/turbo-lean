@@ -29,6 +29,7 @@ import LeanNative.Driver.Worker
 import LeanNative.Driver.CAbiEmit
 import LeanNative.Driver.EvalBatch
 import LeanNative.Driver.StochasticEvolve
+import LeanNative.Driver.CostAutotuneCLI
 import LeanSys.Posix
 import LeanSys.Codec
 
@@ -39,16 +40,12 @@ open LeanNative.Backend.MLIRGPU LeanNative.Backend.Metal LeanSys.Posix LeanSys.C
 open LeanNative.Backend.Hybrid LeanNative.Backend.FastCheck
 
 def findFlagValue (args : List String) (flag : String) (defaultVal : String) : String :=
-  match args with
-  | [] => defaultVal
-  | f :: v :: rest => if f == flag then v else findFlagValue (v :: rest) flag defaultVal
-  | _ :: rest => findFlagValue rest flag defaultVal
+  ((args.zip (args.drop 1)).find? (fun (f, _) => f == flag)).map Prod.snd |>.getD defaultVal
 
 def hasFlag (args : List String) (flag : String) : Bool := args.contains flag
 
 def hasTelemetryOptIn (args : List String) : Bool :=
-  (args.contains "--telemetry" || args.contains "--telemetry=metrics" ||
-   args.contains "--telemetry=local" || args.contains "--telemetry=full") &&
+  ["--telemetry", "--telemetry=metrics", "--telemetry=local", "--telemetry=full"].any args.contains &&
   !(args.contains "--no-telemetry" || args.contains "--telemetry=off" || args.contains "--telemetry=0")
 
 def valueTakingFlags : List String :=
@@ -57,17 +54,11 @@ def valueTakingFlags : List String :=
    "--emit-fixtures", "--fixtures", "--emit-asm", "--asm", "--telemetry-spool",
    "--decl", "--args", "--cases-file", "--batch-file", "--fuel", "--clang-bin", "--ar-bin", "--emit-swift",
    "--swift", "--emit-modulemap", "--modulemap", "--emit-xcframework", "--xcframework",
-    "--emit-swift-package-skeleton", "--base", "--artifact-bundle", "--stochastic-bundle"]
+   "--emit-swift-package-skeleton", "--base", "--artifact-bundle", "--stochastic-bundle",
+   "--samples-json", "--corpus-json"]
 
-def validateValueTakingFlags : List String → IO Unit
-  | [] => return ()
-  | [f] => if valueTakingFlags.contains f then throw <| IO.userError s!"[lean-native] Flag '{f}' requires a value" else return ()
-  | f :: v :: rest =>
-    if valueTakingFlags.contains f then
-      if v.isEmpty || v.startsWith "-" then
-        throw <| IO.userError s!"[lean-native] Flag '{f}' requires a valid value, got '{v}'"
-      else validateValueTakingFlags rest
-    else validateValueTakingFlags (v :: rest)
+def validateValueTakingFlags : List String → IO Unit :=
+  LeanNative.Driver.CostAutotuneCLI.validateFlagValues valueTakingFlags
 
 /-- The single input selected by `--lnir`, `--input`, `--lean` or a positional path (`flag = ""`: none given). -/
 structure InputSel where
@@ -533,19 +524,28 @@ def runPRVerify (tag : String) (args : List String) : IO UInt32 := do
   let outPath := findFlagValue args "-o" ""
   let root := if ← System.FilePath.pathExists "lean/LeanNative/Spec.lean" then "" else "../"
   let specPath := root ++ "lean/LeanNative/Spec.lean"
-  let testPath := root ++ "scripts/ci_verify.sh"
+  let testRunnerPath := root ++ "scripts/ci_verify.sh"
+  let testPath := root ++ "lean/LeanNative/Tests"
   let specExists ← System.FilePath.pathExists specPath
-  let testExists ← System.FilePath.pathExists testPath
+  let testFiles ← if ← System.FilePath.pathExists testPath then
+    (·.toList.filter (fun e => e.path.extension == some "lean")) <$> System.FilePath.readDir testPath
+    else pure []
+  let runnerExists ← System.FilePath.pathExists testRunnerPath
+  let testExists := runnerExists && !testFiles.isEmpty
   let specHashHex := blake3Hex (← if specExists then IO.FS.readFile specPath else pure "")
-  let testHashHex := blake3Hex (← if testExists then IO.FS.readFile testPath else pure "")
+  let runnerText ← if runnerExists then IO.FS.readFile testRunnerPath else pure ""
+  let testHashHex := blake3Hex (runnerText ++ String.join
+    (← (testFiles.mergeSort (fun a b => a.fileName ≤ b.fileName)).mapM
+      (fun e => return e.fileName ++ "\n" ++ (← IO.FS.readFile e.path))))
   let disallowSpecChanges := hasFlag args "--disallow-spec-changes"
   let mut specUnchanged := specExists
   let mut testUnchanged := testExists
   if disallowSpecChanges then
     try
-      let changedFiles := (← IO.Process.output { cmd := "git", args := #["diff", "--name-only", baseRef, "--", specPath, testPath] }).stdout.trimAscii.toString
+      let changedFiles := (← IO.Process.output { cmd := "git", args := #["diff", "--name-only", baseRef, "--", specPath, testPath, testRunnerPath] }).stdout.trimAscii.toString
       if changedFiles.contains "LeanNative/Spec.lean" then specUnchanged := false
       if changedFiles.contains "scripts/ci_verify.sh" then testUnchanged := false
+      if changedFiles.contains "LeanNative/Tests/" then testUnchanged := false
     catch _ => pure ()
   let baseMod := mkCanonicalBenchmarkModule
   let (optMod, pluginReport) := runSegregatedPluginPipeline .x86_64 true baseMod
@@ -842,6 +842,7 @@ def printCoreUsage (tag : String) (hasFrontend : Bool) : IO Unit := do
     "  compile-fastcheck  Run Constraint-Propagating FastCheck or emit SIMD/PTX/Metal kernels (--samples N, --json, -o <path>)",
     "  compile-hybrid     Partition module into CPU/GPU and emit hybrid host dispatch glue (--input <file>, -o <path>)",
     "  superopt           Run cost-guided enumerative superoptimizer (--target x86_64|arm64|cuda_ptx|apple_metal, --json)",
+    "  calibrate-cost     Calibrate hardware cost profile (--target <preset>, --samples-json <path>, --json)",
     "  plugins            Run segregated optimization plugins under Law 1 TV/Cost Gate (--target <arch>, --test-adversarial, --json)",
     "  pr-verify          Run Law 5 PR & Spec-Pinning Gate (--base <ref>, --disallow-spec-changes, --json)",
     "  turbo-plugin       Run JSONL-stdio external accelerator plugin for turbo-lean",
@@ -958,6 +959,7 @@ def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → Ta
     throw <| IO.userError "[lean-native] Explicit input required (or --canonical-benchmark / --fastcheck-sample)"
   match args with
   | "audit-axioms" :: rest       => some <$> runAuditAxioms rest
+  | "calibrate-cost" :: rest     => some <$> LeanNative.Driver.CostAutotuneCLI.run rest
   | "bench-snark-kernels" :: rest => some <$> runBenchSnarkKernels rest
   | "eval-lnir" :: rest          => some <$> runEvalLNIR elaborateHook? rest
   | "compile-llvm" :: rest       => some <$> runCompileLLVM tag elaborateHook? rest
