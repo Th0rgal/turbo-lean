@@ -120,6 +120,22 @@ def verifyKernelEngineRoute
     (requestedEngine resolvedEngine : UInt8) (conLecheSupported : Bool) : Bool :=
   resolvedEngine != 0 && routeKernelEngine requestedEngine conLecheSupported == resolvedEngine
 
+/-- Receipt schema & kernel-provenance admission gate (`schemaVersion`: `1` or `2`;
+    `engineKind`: `0 = invalid`, `1 = standard`, `2 = con-leche`, `3 = both`;
+    `toolchainState` / `conLecheRevState`: `0 = none`, `1 = some_blank`, `2 = some_nonempty`). -/
+@[inline]
+def verifyReceiptProvenanceAdmission
+    (schemaVersion : UInt32) (hasKernelEngine : Bool)
+    (engineKind toolchainState conLecheRevState : UInt8) (blake3Matches : Bool) : Bool :=
+  blake3Matches &&
+    if schemaVersion == 1 then
+      !hasKernelEngine && toolchainState == 0 && conLecheRevState == 0
+    else if schemaVersion == 2 then
+      hasKernelEngine && toolchainState == 2 &&
+        ((engineKind == 1 && conLecheRevState == 0) ||
+          ((engineKind == 2 || engineKind == 3) && conLecheRevState == 2))
+    else false
+
 /-- Tier-aware Matryoshka cascade router (`0 = pass`, `1 = prune_stop`, `2 = abstain_escalate`). -/
 @[inline]
 def matryoshkaTierRouterSpec (survPermille pruneFloorPermille escalateBandPermille epsTierPermille : UInt64)
@@ -350,6 +366,13 @@ def verifyHygieneItemAdmittedC
 @[inline, export turbo_spec_route_kernel_engine]
 def routeKernelEngineC (requestedEngine : UInt8) (conLecheSupported : Bool) : UInt8 :=
   routeKernelEngine requestedEngine conLecheSupported
+
+@[inline, export turbo_spec_verify_receipt_provenance]
+def verifyReceiptProvenanceAdmissionC
+    (schemaVersion : UInt32) (hasKernelEngine : Bool)
+    (engineKind toolchainState conLecheRevState : UInt8) (blake3Matches : Bool) : Bool :=
+  verifyReceiptProvenanceAdmission
+    schemaVersion hasKernelEngine engineKind toolchainState conLecheRevState blake3Matches
 
 @[export turbo_spec_combined_step]
 def combinedStepC (i : UInt64) : UInt64 :=
