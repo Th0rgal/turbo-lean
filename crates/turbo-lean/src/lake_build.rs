@@ -1197,19 +1197,18 @@ pub(crate) struct ShmProjectStatSummary {
 }
 
 pub(crate) fn shm_file_splits_dir(store: &TurboStore) -> PathBuf {
-    let dir = store.fast_staging_dir().join("file_splits_v9");
+    let dir = store.fast_staging_dir().join("file_splits_v10");
     let _ = fs::create_dir_all(&dir);
     dir
 }
 
 pub(crate) fn compute_single_stat_hash(pk: &str, ms: i64, mn: i64, sz: i64) -> String {
     let mut h = blake3::Hasher::new();
-    // v4 rebuilds legacy shards without qualified declaration identities.
     // v9 invalidates declaration scopes computed before lossless dotted-component canonicalization.
     // v10 includes checking-weakening hygiene fields in cached file splits.
     // v11 invalidates splits computed before 3-byte `/--`/`/-!` docstring & raw/interp lexing fixes.
     // v12 invalidates splits computed before nested `/--` inside outer block comments/literals fix.
-    h.update(b"single-stat-split:v13\n");
+    h.update(b"single-stat-split:v14\n");
     h.update(pk.as_bytes());
     h.update(b":");
     h.update(&ms.to_le_bytes());
@@ -1235,7 +1234,7 @@ pub(crate) fn compact_split_for_shm_cache(split: &splitter::SplitResult) -> spli
 
 pub(crate) fn compute_stat_slice_hash(stats: &[(String, i64, i64, i64)]) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"project-stat-splits:v11\n");
+    h.update(b"project-stat-splits:v12\n");
     for (pk, ms, mn, sz) in stats {
         h.update(pk.as_bytes());
         h.update(b":");
@@ -1271,7 +1270,7 @@ pub(crate) fn load_project_stat_summary_cached(
 
     let summary_path = if paths.len() <= 128 && valid_stats.len() == paths.len() {
         let mut key_h = blake3::Hasher::new();
-        key_h.update(b"project-stat-summary-v4\n");
+        key_h.update(b"project-stat-summary-v5\n");
         key_h.update(compute_stat_slice_hash(&valid_stats).as_bytes());
         key_h.update(b"\n");
         if let Some(ref tag) = lake_inputs_tag {
@@ -1292,9 +1291,10 @@ pub(crate) fn load_project_stat_summary_cached(
             key_h.update(b"\n");
         }
         let stat_hash = key_h.finalize().to_hex().to_string();
-        let p = store
-            .fast_staging_dir()
-            .join(format!("project_stat_summary_v9_{}.json", &stat_hash[..24]));
+        let p = store.fast_staging_dir().join(format!(
+            "project_stat_summary_v10_{}.json",
+            &stat_hash[..24]
+        ));
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(summary) = serde_json::from_slice::<ShmProjectStatSummary>(&bytes) {
                 if summary.total_files == paths.len() {
@@ -1518,7 +1518,7 @@ pub(crate) fn load_and_split_files_with_hashes_cached(
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let p = store
             .fast_staging_dir()
-            .join(format!("project_stat_splits_v10_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_splits_v11_{}.json", &stat_hash[..24]));
         if let Ok(bytes) = fs::read(&p) {
             if let Ok(cached_entries) = serde_json::from_slice::<Vec<ShmCachedFileSplit>>(&bytes) {
                 if cached_entries.len() == paths.len()
@@ -1694,13 +1694,13 @@ pub(crate) fn split_and_audit_with_hashes_cached(
 
     let shm_proj_path = if files.len() <= 128 {
         let mut ch = blake3::Hasher::new();
-        ch.update(b"project-content-splits:v10\n");
+        ch.update(b"project-content-splits:v11\n");
         for (_, fk) in &file_keys {
             ch.update(fk.as_bytes());
             ch.update(b"\n");
         }
         let p = store.fast_staging_dir().join(format!(
-            "project_splits_v10_{}.json",
+            "project_splits_v11_{}.json",
             &ch.finalize().to_hex()[..24]
         ));
         if let Ok(bytes) = fs::read(&p) {
@@ -1827,7 +1827,7 @@ pub(crate) fn split_and_audit_with_hashes_cached(
         let stat_hash = compute_stat_slice_hash(&valid_stats);
         let stat_p = store
             .fast_staging_dir()
-            .join(format!("project_stat_splits_v10_{}.json", &stat_hash[..24]));
+            .join(format!("project_stat_splits_v11_{}.json", &stat_hash[..24]));
         if !stat_p.exists() || !new_splits.is_empty() {
             let compacts: Vec<ShmCachedFileSplit> = results
                 .iter()

@@ -1563,13 +1563,15 @@ pub(crate) fn is_section_header_line(trimmed_clean: &str) -> bool {
 
 fn scan_line_leading_code_offset(
     src: &str,
+    line_start: usize,
     line_end: usize,
     lexical_cursor: &mut usize,
     non_code_end: &mut usize,
     in_comment: &mut bool,
-) -> (Option<usize>, bool, bool) {
+) -> (Option<usize>, bool, bool, usize) {
     let mut first_doc_start = None;
     let mut after_prior_comment = false;
+    let mut line_indent = None;
     while *lexical_cursor < line_end {
         if *lexical_cursor < *non_code_end {
             if *in_comment && *non_code_end <= line_end {
@@ -1584,6 +1586,7 @@ fn scan_line_leading_code_offset(
             *lexical_cursor += 1;
             continue;
         }
+        let actual_indent = *line_indent.get_or_insert(*lexical_cursor - line_start);
         if matches!(
             scan_lean_block_comment_end(src, *lexical_cursor),
             Some((_, true))
@@ -1600,12 +1603,17 @@ fn scan_line_leading_code_offset(
             if span.is_literal {
                 *non_code_end = span.end;
                 *in_comment = false;
-                return (first_doc_start, false, after_prior_comment);
+                return (first_doc_start, false, after_prior_comment, actual_indent);
             }
         }
-        return (first_doc_start, true, after_prior_comment);
+        return (first_doc_start, true, after_prior_comment, actual_indent);
     }
-    (first_doc_start, false, after_prior_comment)
+    (
+        first_doc_start,
+        false,
+        after_prior_comment,
+        line_indent.unwrap_or(line_end - line_start),
+    )
 }
 
 fn has_unbalanced_delimiters(clean_chunk: &str) -> bool {
@@ -1809,13 +1817,15 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
             line_end
         };
 
-        let (first_doc_start, has_code_here, after_prior_comment) = scan_line_leading_code_offset(
-            src,
-            line_end_no_cr,
-            &mut lexical_cursor,
-            &mut non_code_end,
-            &mut in_comment,
-        );
+        let (first_doc_start, has_code_here, after_prior_comment, line_indent) =
+            scan_line_leading_code_offset(
+                src,
+                line_start,
+                line_end_no_cr,
+                &mut lexical_cursor,
+                &mut non_code_end,
+                &mut in_comment,
+            );
         let code_pos = lexical_cursor;
         while lexical_cursor < next_pos {
             if lexical_cursor < non_code_end {
@@ -1841,7 +1851,11 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
         }
 
         let effective_start = first_doc_start.unwrap_or(code_pos);
-        let indent = effective_start - line_start;
+        let indent = if after_prior_comment {
+            effective_start - line_start
+        } else {
+            line_indent
+        };
         let trimmed = if has_code_here {
             clean[code_pos..line_end_no_cr].trim_start()
         } else {
@@ -2241,12 +2255,17 @@ fn split_mutual_block_subspans<'a>(
 
     // Determine declaration indentation, not proof indentation: Lean also accepts
     // an unindented `:=` continuation inside a mutual block.
-    let min_indent = body_clean
+    let min_indent = body_orig
         .lines()
+        .zip(body_clean.lines())
         .enumerate()
-        .filter(|(_, l)| is_top_level_command_start(l.trim_start()))
-        .map(|(idx, l)| {
-            let lead = l.len() - l.trim_start().len();
+        .filter(|(_, (_, lc))| is_top_level_command_start(lc.trim_start()))
+        .map(|(idx, (lo, lc))| {
+            let lead = lo
+                .bytes()
+                .take_while(|&b| b == b' ' || b == b'\t')
+                .count()
+                .min(lc.len() - lc.trim_start().len());
             if idx == 0 && body_start > first_nl + 1 {
                 let col_off = body_start
                     - orig[..body_start]
@@ -2288,13 +2307,15 @@ fn split_mutual_block_subspans<'a>(
             line_end
         };
 
-        let (first_doc_start, has_code_here, after_prior_comment) = scan_line_leading_code_offset(
-            body_orig,
-            line_end_no_cr,
-            &mut lexical_cursor,
-            &mut non_code_end,
-            &mut in_comment,
-        );
+        let (first_doc_start, has_code_here, after_prior_comment, line_indent) =
+            scan_line_leading_code_offset(
+                body_orig,
+                line_start,
+                line_end_no_cr,
+                &mut lexical_cursor,
+                &mut non_code_end,
+                &mut in_comment,
+            );
         let code_pos = lexical_cursor;
         while lexical_cursor < next_pos {
             if lexical_cursor < non_code_end {
@@ -2324,7 +2345,11 @@ fn split_mutual_block_subspans<'a>(
         }
 
         let effective_start = first_doc_start.unwrap_or(code_pos);
-        let indent = effective_start - line_start;
+        let indent = if after_prior_comment {
+            effective_start - line_start
+        } else {
+            line_indent
+        };
         let trimmed = if has_code_here {
             body_clean[code_pos..line_end_no_cr].trim_start()
         } else {
@@ -8823,9 +8848,10 @@ fn has_unrecognized_command_indent_line<'a>(spans: &[CmdSpan<'a>]) -> bool {
                 line_end
             };
 
-            let (first_doc_start, has_code_here, after_prior_comment) =
+            let (first_doc_start, has_code_here, after_prior_comment, line_indent) =
                 scan_line_leading_code_offset(
                     span_src,
+                    line_start,
                     line_end_no_cr,
                     &mut lexical_cursor,
                     &mut non_code_end,
@@ -8858,15 +8884,18 @@ fn has_unrecognized_command_indent_line<'a>(spans: &[CmdSpan<'a>]) -> bool {
             }
 
             let effective_start = first_doc_start.unwrap_or(code_pos);
-            let indent = if after_prior_comment
-                && span_src[line_start..effective_start]
+            let indent = if after_prior_comment {
+                if span_src[line_start..effective_start]
                     .bytes()
                     .next()
                     .is_some_and(|b| b != b' ' && b != b'\t')
-            {
-                0
+                {
+                    0
+                } else {
+                    effective_start - line_start
+                }
             } else {
-                effective_start - line_start
+                line_indent
             };
             let trimmed_clean = if has_code_here {
                 span_clean[code_pos..line_end_no_cr].trim_start()
@@ -13441,6 +13470,98 @@ theorem kept : True := trivial
                 .map(|d| d.const_name.as_str())
                 .collect::<Vec<_>>(),
             vec!["S", "appTest", "parenTest", "kept"]
+        );
+
+        let same_line_src = "def x := 0\n/- c -/ theorem lost : True := trivial\n/- a -/ /- /- nested -/ b -/ theorem after_multi : True := trivial\ntheorem visible : True := trivial\n";
+        let same_line_split = split_lean_source(same_line_src, &[]);
+        assert_eq!(
+            same_line_split
+                .shards
+                .iter()
+                .map(|s| s.decl_name())
+                .collect::<Vec<_>>(),
+            vec!["lost", "after_multi", "visible"]
+        );
+        assert_eq!(
+            reconstruct_single_shard_source(same_line_src, "lost")
+                .unwrap()
+                .unwrap()
+                .trim_end(),
+            "def x := 0\n/- c -/ theorem lost : True := trivial"
+        );
+        assert_eq!(
+            extract_public_signature(same_line_src)
+                .declarations
+                .iter()
+                .map(|d| d.const_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["x", "lost", "after_multi", "visible"]
+        );
+
+        let tab_sec_src = "section TabSec\n\tdef x := 0\n\t/- c -/ theorem tab_lost : True := trivial\n\t/- d -/ /-- doc -/\n\ttheorem tab_doc : True := trivial\nend TabSec\n";
+        let tab_sec_split = split_lean_source(tab_sec_src, &[]);
+        assert_eq!(
+            tab_sec_split
+                .shards
+                .iter()
+                .map(|s| s.decl_name())
+                .collect::<Vec<_>>(),
+            vec!["tab_lost", "tab_doc"]
+        );
+        assert!(tab_sec_split.shards[1].shard_source.contains("/-- doc -/"));
+
+        let same_line_mut_src = "mutual\n  /- c1 -/ theorem m1 : True := trivial\n  /- c2 -/ /- /- n -/ c3 -/ theorem m2 : True := m1\n  /- c4 -/ end\n";
+        let same_line_mut_split = split_lean_source(same_line_mut_src, &[]);
+        assert_eq!(
+            same_line_mut_split
+                .shards
+                .iter()
+                .map(|s| s.decl_name())
+                .collect::<Vec<_>>(),
+            vec!["m1", "m2"]
+        );
+        assert_eq!(
+            extract_public_signature(same_line_mut_src)
+                .declarations
+                .iter()
+                .map(|d| d.const_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m1", "m2"]
+        );
+
+        let same_line_custom_a =
+            "module\npublic def base : Nat := 1\n/- c -/ my_custom_elab foo_v1\n";
+        let same_line_custom_b =
+            "module\npublic def base : Nat := 1\n/- c -/ my_custom_elab foo_v2\n";
+        assert_ne!(
+            extract_public_signature(same_line_custom_a).public_signature_digest,
+            extract_public_signature(same_line_custom_b).public_signature_digest
+        );
+
+        let same_line_cont = "module\npublic def cont : Nat :=\n  /- c -/ 42\n";
+        let same_line_cont_pub = extract_public_signature(same_line_cont);
+        assert!(!same_line_cont_pub
+            .public_signature_digest
+            .starts_with("pubsig-custom-cmd:"));
+        assert_eq!(
+            same_line_cont_pub
+                .declarations
+                .iter()
+                .map(|d| d.const_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cont"]
+        );
+
+        let same_line_indented_cont =
+            "def f (x : Nat) : Nat :=\n  /- c -/ @id Nat x\ntheorem after_f : True := trivial\n";
+        let same_line_indented_split = split_lean_source(same_line_indented_cont, &[]);
+        assert_eq!(
+            same_line_indented_split
+                .shards
+                .iter()
+                .map(|s| s.decl_name())
+                .collect::<Vec<_>>(),
+            vec!["after_f"]
         );
     }
 }

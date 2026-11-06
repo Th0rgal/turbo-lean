@@ -996,7 +996,7 @@ fn cache_shm_stat_split(
         let st_path = shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
         let src_b3 = blake3::hash(active_src.as_bytes()).to_hex().to_string();
         let entry = ShmCachedFileSplit {
-            split_key: format!("file-split:v14:{}", src_b3),
+            split_key: format!("file-split:v15:{}", src_b3),
             src_blake3: src_b3,
             split: compact_split_for_shm_cache(split),
             prefix_src: String::new(),
@@ -2040,7 +2040,7 @@ fn run_check_command_inner(
             let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
             if let Some((ref st_path, _)) = st_paths_opt {
                 let entry = ShmCachedFileSplit {
-                    split_key: format!("file-split:v14:{}", src_b3),
+                    split_key: format!("file-split:v15:{}", src_b3),
                     src_blake3: src_b3.clone(),
                     split: compact_split_for_shm_cache(&sp),
                     prefix_src: String::new(),
@@ -2080,7 +2080,7 @@ fn run_check_command_inner(
                     split_key: if src_b3.is_empty() {
                         String::new()
                     } else {
-                        format!("file-split:v14:{}", src_b3)
+                        format!("file-split:v15:{}", src_b3)
                     },
                     src_blake3: src_b3,
                     split: compact_split_for_shm_cache(&fast_res.0),
@@ -3326,7 +3326,7 @@ fn check_single_decl(
                         let st_path =
                             shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
                         let entry = ShmCachedFileSplit {
-                            split_key: format!("file-split:v14:{}", sub_b3),
+                            split_key: format!("file-split:v15:{}", sub_b3),
                             src_blake3: sub_b3.clone(),
                             split: compact_split_for_shm_cache(&sub_split),
                             prefix_src: if sub_src.len() <= 64 * 1024 {
@@ -9347,6 +9347,59 @@ theorem after_macro : ext_magic = 7 := rfl
                 .map(|c| c.decl_name.as_str())
                 .collect::<Vec<_>>(),
             vec!["lost", "visible"]
+        );
+
+        let same_line_file = proj_dir.join("PostSameLineComment.lean");
+        let same_line_src =
+            "def y := 0\n/- c -/ theorem same_lost : True := trivial\ntheorem visible : True := trivial\n";
+        fs::write(&same_line_file, same_line_src).unwrap();
+        let canon_same = same_line_file
+            .canonicalize()
+            .unwrap_or_else(|_| same_line_file.clone());
+        let mut same_split = split_lean_source(same_line_src, &[]);
+        let mut same_cb3 = None;
+        let same_ok = check_single_decl(
+            &mut store,
+            true,
+            false,
+            false,
+            &test_kp,
+            &t0,
+            &same_line_file,
+            &same_line_file,
+            &canon_same,
+            &canon_proj,
+            toolchain,
+            "same_lost",
+            same_line_src.to_string(),
+            &mut same_cb3,
+            &mut same_split,
+            false,
+            0,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(same_ok["status"], "theorem_verified");
+        assert_eq!(same_ok["decl"], "same_lost");
+
+        let same_refs: Vec<&splitter::TheoremShard> = same_split.shards.iter().collect();
+        let same_confirmed = confirm_file_decl_identities_with_extra_dirs(
+            same_line_src,
+            &same_refs,
+            &canon_proj,
+            &canon_same,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            same_confirmed
+                .iter()
+                .map(|c| c.decl_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["same_lost", "visible"]
         );
 
         let _ = fs::remove_dir_all(&tmp_dir);
