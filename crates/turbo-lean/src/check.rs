@@ -4588,7 +4588,6 @@ fn check_single_decl(
                         })
             };
             let mut try_zygote_src = |src_text: &str,
-                                      lp_override: Option<&str>,
                                       ev: &HashMap<String, String>,
                                       record_err: bool|
              -> Option<serde_json::Value> {
@@ -4601,7 +4600,7 @@ fn check_single_decl(
                     stmt_hash: shard.stmt_hash.clone(),
                     proof_hash: shard.proof_hash.clone(),
                     toolchain: toolchain.to_string(),
-                    lean_path: lp_override.unwrap_or(&local_lean_path).to_string(),
+                    lean_path: local_lean_path.clone(),
                     skip_cas_lock: true,
                     allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
                     lean_args: file_lean_args.clone(),
@@ -4796,7 +4795,7 @@ fn check_single_decl(
 
             if !verified_via_zygote {
                 if let Some(ref psrc) = pruned_src {
-                    if let Some(zjson) = try_zygote_src(psrc, None, &env_vars, false) {
+                    if let Some(zjson) = try_zygote_src(psrc, &env_vars, false) {
                         verified_via_fast_olean = true;
                         apply_zygote_json!(&zjson);
                     }
@@ -4805,7 +4804,7 @@ fn check_single_decl(
 
             if !verified_via_zygote {
                 if let Some(ref fsrc) = fast_olean_src {
-                    if let Some(zjson) = try_zygote_src(fsrc, None, &env_vars, false) {
+                    if let Some(zjson) = try_zygote_src(fsrc, &env_vars, false) {
                         verified_via_fast_olean = true;
                         apply_zygote_json!(&zjson);
                     }
@@ -4818,7 +4817,7 @@ fn check_single_decl(
                     split,
                     &rooted_target,
                 ) {
-                    if env_vars.is_empty() && fast_local_zygote_url.is_none() {
+                    if env_vars.len() <= 1 {
                         let (ev, ech) = resolve_lake_env(store, canon_dir)?;
                         lean_bin = resolve_lean_bin(canon_dir)?;
                         env_vars = ev;
@@ -4845,16 +4844,10 @@ fn check_single_decl(
                         let delta_src = outline_plan.render_delta_shard_source(&outline_mod);
                         let mut delta_ev = env_vars.clone();
                         delta_ev.insert("LEAN_PATH".to_string(), delta_lp.clone());
-                        if let Some(zjson) =
-                            try_zygote_src(&delta_src, Some(&delta_lp), &delta_ev, false)
-                        {
-                            verified_via_fast_olean = true;
-                            apply_zygote_json!(&zjson);
-                        } else {
-                            let mut stub_targets: Vec<String> =
-                                single_set.iter().cloned().collect();
-                            stub_targets.sort();
-                            if let Ok(reply) = crate::zygote::eval_with_zygote_pool_for_targets(
+                        let mut stub_targets: Vec<String> = single_set.iter().cloned().collect();
+                        stub_targets.sort();
+                        if let Ok(reply) =
+                            crate::zygote::eval_with_zygote_pool_for_targets_and_stubs(
                                 store,
                                 toolchain,
                                 &delta_lp,
@@ -4862,31 +4855,32 @@ fn check_single_decl(
                                 Path::new(&lean_bin),
                                 &delta_src,
                                 &stub_targets,
+                                &outline_plan.outline_stubs,
                                 Some(crate::zygote::remaining_timeout_ms(None, *t0)),
                                 &file_lean_args,
-                            ) {
-                                let c_abi_sound = unsafe {
-                                    crate::splitter::turbo_spec_is_sound_decl_summary(
-                                        0,
-                                        0,
-                                        0,
-                                        if reply.ok { 0 } else { 1 },
-                                    ) != 0
-                                };
-                                if reply.import_ok
-                                    && reply.ok
-                                    && !reply.crashed
-                                    && !reply.timed_out
-                                    && c_abi_sound
-                                    && crate::zygote::verify_attested_decl_types(
-                                        &reply.decl_types,
-                                        &expected_type_pair,
-                                    )
-                                    .is_ok()
-                                {
-                                    verified_via_fast_olean = true;
-                                    apply_zygote_reply!(reply);
-                                }
+                            )
+                        {
+                            let c_abi_sound = unsafe {
+                                crate::splitter::turbo_spec_is_sound_decl_summary(
+                                    0,
+                                    0,
+                                    0,
+                                    if reply.ok { 0 } else { 1 },
+                                ) != 0
+                            };
+                            if reply.import_ok
+                                && reply.ok
+                                && !reply.crashed
+                                && !reply.timed_out
+                                && c_abi_sound
+                                && crate::zygote::verify_attested_decl_types(
+                                    &reply.decl_types,
+                                    &expected_type_pair,
+                                )
+                                .is_ok()
+                            {
+                                verified_via_fast_olean = true;
+                                apply_zygote_reply!(reply);
                             }
                         }
                     }
@@ -4908,7 +4902,7 @@ fn check_single_decl(
                         .unwrap_or_default()
                 };
                 if !verified_via_zygote {
-                    if let Some(zjson) = try_zygote_src(&full_shard_src, None, &env_vars, true) {
+                    if let Some(zjson) = try_zygote_src(&full_shard_src, &env_vars, true) {
                         apply_zygote_json!(&zjson);
                     }
                 }

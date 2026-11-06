@@ -510,7 +510,7 @@ def collectDeclAxioms (beforeMap : Lean.PHashMap Name ConstantInfo) (afterEnv : 
       let isOutlineMod := match afterEnv.getModuleIdxFor? curr with
         | some mIdx => (afterEnv.header.moduleNames[mIdx.toNat]?).any (fun m => m.toString.startsWith "_TurboOutline_")
         | none => false
-      let isImportedOutlineStub := isOutlineMod && impCinfo?.any isExplicitSorryStub
+      let isImportedOutlineStub := opaqueStub curr && isOutlineMod && impCinfo?.any isExplicitSorryStub
       if isImportedOutlineStub then
         if let some (.thmInfo tv) := impCinfo? then
           for c in tv.type.getUsedConstants do
@@ -1197,18 +1197,30 @@ def resolveStubNames (consts : Array ConstantInfo) (stubs : List String) : Std.H
         [s!"[TurboLean.KernelGate] prefix stub `{repr}` is ambiguous: {hits.map (·.name)}"]
   return (out, violations)
 
-/-- Kernel names newly elaborated in `env` (`map₂`) exempt from the `sorryAx` gate: host stubs (`stubs`)
-    whose value is an explicit `sorry` (`isExplicitSorryStub`), never a host target. `violations` is
-    non-empty when any stub name is ambiguous (which exempts nothing at all). -/
+/-- Kernel names newly elaborated in `env` (`map₂`) or imported from `_TurboOutline_*` modules
+    exempt from the `sorryAx` gate: host stubs (`stubs`) whose value is an explicit `sorry`
+    (`isExplicitSorryStub`), never a host target. `violations` is non-empty when any stub name is
+    ambiguous (which exempts nothing at all). -/
 def stubExemptSet (env : Environment) (stubs targets : List String)
     (fastMap : List (String × String) := []) : Std.HashSet Name × List String :=
-  let consts := env.constants.map₂.foldl (fun acc _ c => acc.push c) #[]
-  let (named, violations) := resolveStubNames consts stubs
-  if !violations.isEmpty then ({}, violations)
+  if stubs.isEmpty then ({}, [])
   else
-    let exempt := named.fold (init := ({} : Std.HashSet Name)) fun acc n =>
-      if !ownedByTarget targets fastMap n && (env.find? n).any isExplicitSorryStub then acc.insert n else acc
-    (exempt, [])
+    let consts := Id.run do
+      let mut cs := env.constants.map₂.foldl (fun acc _ c => acc.push c) #[]
+      for modIdx in [0 : env.header.moduleNames.size] do
+        let modName := env.header.moduleNames[modIdx]!
+        if modName.toString.startsWith "_TurboOutline_" then
+          if let some mData := env.header.moduleData[modIdx]? then
+            for c in mData.constants do
+              if !env.constants.map₂.contains c.name then
+                cs := cs.push c
+      return cs
+    let (named, violations) := resolveStubNames consts stubs
+    if !violations.isEmpty then ({}, violations)
+    else
+      let exempt := named.fold (init := ({} : Std.HashSet Name)) fun acc n =>
+        if !ownedByTarget targets fastMap n && (env.find? n).any isExplicitSorryStub then acc.insert n else acc
+      (exempt, [])
 
 /-- Whether the stubbed prefix checkpoint `prefixEnv` holds any `sorryAx`-dependent declaration
     that this final run does not exempt (a checkpoint is shared by requests with other stubs and targets). -/
@@ -2650,13 +2662,6 @@ def auditShardModule (target : String × Name) (ffiAllow : Array (Name × Name �
       | some modIdx => (env.header.moduleData[modIdx.toNat]?).map (·.constants) |>.getD #[]
       | none => #[]
     let (stubs, stubViolations) := collectStubDecls consts stubOk
-    let mut allStubs := stubs
-    for h : mIdx in [0 : env.header.moduleData.size] do
-      let modName := env.header.moduleNames[mIdx]!
-      if modName.toString.startsWith "_TurboOutline_" then
-        for c in env.header.moduleData[mIdx].constants do
-          if isExplicitSorryStub c then
-            allStubs := allStubs.insert c.name
     let constNames := consts.map (·.name)
     let isImportedOrig := fun (origName : Name) =>
       match env.getModuleIdxFor? origName with
@@ -2681,7 +2686,7 @@ def auditShardModule (target : String × Name) (ffiAllow : Array (Name × Name �
         if rawNm != userNm && !(seen[rawNm]?.getD false) then
           seen := seen.insert rawNm true
           declTypes := declTypes ++ [(rawNm, h)]
-    let (impViolations, impSorryDecls) ← auditImportedModulesInEnv env #[target] ffiAllow patterns csimpPatterns allStubs unsafePatterns implByPatterns false allowSorry
+    let (impViolations, impSorryDecls) ← auditImportedModulesInEnv env #[target] ffiAllow patterns csimpPatterns stubs unsafePatterns implByPatterns false allowSorry
     return (stubViolations ++ fastViolations ++ impViolations, decls, declTypes, impSorryDecls)
   catch e =>
     return ([s!"[TurboLean.KernelGate] failed to import `{target.1}` for audit: {e}"], #[], [], [])
@@ -2711,18 +2716,7 @@ def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name ×
     pure (Except.error (toString e))
   match batchRes with
   | .ok env =>
-    let outlineSlice := slice.any fun (_, nm) => nm.toString.startsWith "_TurboOutline_"
-    let outlineStubs : Std.HashSet Name := if !outlineSlice then {} else Id.run do
-      let mut s : Std.HashSet Name := {}
-      for modIdx in [0 : env.header.moduleNames.size] do
-        let mName := env.header.moduleNames[modIdx]!
-        if mName.toString.startsWith "_TurboOutline_" then
-          if let some mData := env.header.moduleData[modIdx]? then
-            for c in mData.constants do
-              if isExplicitSorryStub c then
-                s := s.insert c.name
-      return s
-    let (vs, _) ← auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns outlineStubs unsafePatterns implByPatterns skipChildReplay allowSorry
+    let (vs, _) ← auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns {} unsafePatterns implByPatterns skipChildReplay allowSorry
     return vs
   | .error errMsg =>
     if slice.size == 1 then

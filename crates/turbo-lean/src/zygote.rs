@@ -5953,7 +5953,12 @@ fn encode_fast_map_lines(entries: &[crate::splitter::FastVerifyEntry]) -> String
 /// (the declarations under check) travel as `<allow_stub|strict>:<hex targets>:<hex stubs>[:<hex req>:<hex fast_map>]`,
 /// with the stubs the host wrote (`… := sorry` declarations that are not targets). The worker exempts only
 /// those, by kernel value and name, never a target; with no named targets it exempts nothing in the final run.
-fn stub_mode_flag(allow_stub: bool, stub_targets: &[String], shard_source: &str) -> Result<String> {
+fn stub_mode_flag(
+    allow_stub: bool,
+    stub_targets: &[String],
+    extra_stubs: &[String],
+    shard_source: &str,
+) -> Result<String> {
     let shards = crate::splitter::split_lean_source(shard_source, &[]).shards;
     let fast_map = crate::splitter::FastVerifyMap::parse_and_validate(shard_source, &shards)?;
     let prefix = if allow_stub { "allow_stub" } else { "strict" };
@@ -5961,7 +5966,13 @@ fn stub_mode_flag(allow_stub: bool, stub_targets: &[String], shard_source: &str)
         return Ok(prefix.to_string());
     }
     let targets: std::collections::HashSet<String> = stub_targets.iter().cloned().collect();
-    let stubs: Vec<String> = if allow_stub && !stub_targets.is_empty() {
+    let target_canons: std::collections::HashSet<String> = stub_targets
+        .iter()
+        .map(|t| {
+            crate::splitter::canonicalize_lean_name(t.strip_prefix("_root_.").unwrap_or(t.as_str()))
+        })
+        .collect();
+    let mut stubs: Vec<String> = if allow_stub && !stub_targets.is_empty() {
         shards
             .iter()
             .filter(|sh| {
@@ -5973,6 +5984,20 @@ fn stub_mode_flag(allow_stub: bool, stub_targets: &[String], shard_source: &str)
     } else {
         Vec::new()
     };
+    if allow_stub && !stub_targets.is_empty() {
+        for es in extra_stubs {
+            let trimmed = es.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let canon = crate::splitter::canonicalize_lean_name(
+                trimmed.strip_prefix("_root_.").unwrap_or(trimmed),
+            );
+            if !targets.contains(trimmed) && !target_canons.contains(&canon) {
+                stubs.push(trimmed.to_string());
+            }
+        }
+    }
     let targets_hex = hex_encode_bytes(stub_targets.join("\n").as_bytes());
     let stubs_hex = hex_encode_bytes(stubs.join("\n").as_bytes());
     if fast_map.is_empty() {
@@ -6075,6 +6100,42 @@ pub fn eval_with_zygote_pool_for_targets(
         lean_args,
         false,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn eval_with_zygote_pool_for_targets_and_stubs(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    shard_source: &str,
+    stub_targets: &[String],
+    extra_stubs: &[String],
+    timeout_ms: Option<u64>,
+    lean_args: &[String],
+) -> Result<ZygoteEvalReply> {
+    eval_with_zygote_pool_inner_with_context_ext(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        shard_source,
+        true,
+        false,
+        None,
+        timeout_ms,
+        None,
+        lean_args,
+        stub_targets,
+        extra_stubs,
+        false,
+        false,
+        false,
+        None,
+    )
+    .map(|(rep, _, _)| rep)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6497,6 +6558,7 @@ pub(crate) fn eval_with_resolved_context_opts_with_args(
         None,
         lean_args,
         &[],
+        &[],
         false,
         false,
         false,
@@ -6577,6 +6639,7 @@ fn eval_with_zygote_pool_inner_ext(
         batch_fission_override,
         lean_args,
         stub_targets,
+        &[],
         audit_all,
         allow_sorry,
         diagnose_hotspots,
@@ -6630,6 +6693,7 @@ fn eval_with_zygote_pool_inner_with_context_ext(
     batch_fission_override: Option<(String, String, String)>,
     lean_args: &[String],
     stub_targets: &[String],
+    extra_stubs: &[String],
     audit_all: bool,
     allow_sorry: bool,
     diagnose_hotspots: bool,
@@ -6654,7 +6718,7 @@ fn eval_with_zygote_pool_inner_with_context_ext(
         }
         encode_mode_with_file_and_cwd("strict_all", env_vars, file_name)
     } else {
-        stub_mode_flag(allow_stub, stub_targets, shard_source)?
+        stub_mode_flag(allow_stub, stub_targets, extra_stubs, shard_source)?
     };
     let stub_mode = if !eval_mode && !diagnose_hotspots && allow_sorry {
         if base_stub_mode == "strict_all" {
@@ -7244,12 +7308,18 @@ fn eval_with_zygote_pool_attempt(
                     if let Some(vec) = pool.get_mut(k) {
                         vec.retain(|w| {
                             #[cfg(target_os = "linux")]
-                            if w.pinned_snapshot_dir != expected_pinned_dir {
-                                return false;
-                            }
-                            if expected_pinned_dir.is_none()
-                                && w.spawn_lean_path != effective_lean_path
                             {
+                                if w.pinned_snapshot_dir != expected_pinned_dir {
+                                    return false;
+                                }
+                                if expected_pinned_dir.is_none()
+                                    && w.spawn_lean_path != effective_lean_path
+                                {
+                                    return false;
+                                }
+                            }
+                            #[cfg(not(target_os = "linux"))]
+                            if w.spawn_lean_path != effective_lean_path {
                                 return false;
                             }
                             (w.warm_imports.is_empty()
@@ -7591,10 +7661,17 @@ fn eval_with_zygote_pool_attempt(
             if let Some(vec) = pool.get_mut(k) {
                 vec.retain(|w| {
                     #[cfg(target_os = "linux")]
-                    if w.pinned_snapshot_dir != expected_pinned_dir {
-                        return false;
+                    {
+                        if w.pinned_snapshot_dir != expected_pinned_dir {
+                            return false;
+                        }
+                        if expected_pinned_dir.is_none() && w.spawn_lean_path != effective_lean_path
+                        {
+                            return false;
+                        }
                     }
-                    if expected_pinned_dir.is_none() && w.spawn_lean_path != effective_lean_path {
+                    #[cfg(not(target_os = "linux"))]
+                    if w.spawn_lean_path != effective_lean_path {
                         return false;
                     }
                     (w.warm_imports.is_empty()
@@ -15246,6 +15323,103 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
         assert!(
             r2.env_cache_hit,
             "second worktree with identical .olean closure must hit warm Zygote worker pool"
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_turbo_outline_prefix_module_never_exempts_unlisted_sorry() {
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_outline_evil_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        fs::write(tmp_dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            tmp_dir.join("lakefile.toml"),
+            "name = \"evil_pkg\"\ndefaultTargets = [\"_TurboOutline_evil\"]\n[[lean_lib]]\nname = \"_TurboOutline_evil\"\nroots = [\"_TurboOutline_evil\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp_dir.join("_TurboOutline_evil.lean"),
+            "theorem bad : False := sorry\n",
+        )
+        .unwrap();
+        let Ok(cfg) = crate::module_builder::resolve_project_config(&tmp_dir) else {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        };
+        let env = build_auditor_bootstrap_env(&cfg);
+        let ld = env.get("LD_LIBRARY_PATH").cloned().unwrap_or_default();
+        let olean_dir = tmp_dir.join(".lake/build/lib/lean");
+        fs::create_dir_all(&olean_dir).unwrap();
+        let out = Command::new(&cfg.lean_bin)
+            .current_dir(&tmp_dir)
+            .arg("-R")
+            .arg(&tmp_dir)
+            .arg("-o")
+            .arg(olean_dir.join("_TurboOutline_evil.olean"))
+            .arg(tmp_dir.join("_TurboOutline_evil.lean"))
+            .env("LEAN_PATH", &cfg.toolchain_lib_lean)
+            .env("LD_LIBRARY_PATH", &ld)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "compiling _TurboOutline_evil.lean failed: {:?}",
+            out
+        );
+
+        let store = TurboStore::open(Some(&tmp_dir.join("store"))).unwrap();
+        let (lean_path_env, _) = crate::module_builder::build_lean_search_path(&cfg, true);
+
+        let audit_res = audit_compiled_modules_with_zygote(
+            &store,
+            &cfg,
+            &["_TurboOutline_evil".to_string()],
+            &lean_path_env,
+            &[],
+            false,
+        );
+        assert!(
+            audit_res.is_err(),
+            "audit_compiled_modules_with_zygote must reject sorry in _TurboOutline_evil"
+        );
+        let audit_err = audit_res.unwrap_err().to_string();
+        assert!(
+            audit_err.contains("sorryAx"),
+            "expected sorryAx violation on _TurboOutline_evil, got: {audit_err}"
+        );
+
+        let mut eval_env = env.clone();
+        eval_env.insert("LEAN_PATH".to_string(), lean_path_env.clone());
+        let rep = eval_with_zygote_pool_for_targets(
+            &store,
+            &cfg.toolchain,
+            &lean_path_env,
+            &eval_env,
+            &cfg.lean_bin,
+            "import _TurboOutline_evil\ntheorem pwn : False := bad\n",
+            &["pwn".to_string()],
+            None,
+            &[],
+        )
+        .expect("eval_with_zygote_pool_for_targets IPC must return structured reply");
+        assert!(
+            !rep.ok,
+            "theorem importing _TurboOutline_evil without extra_stubs must fail closed: {:?}",
+            rep
+        );
+        assert!(
+            rep.errors.iter().any(|e| e.contains("sorryAx")),
+            "expected sorryAx error in errors, got: {:?}",
+            rep.errors
         );
 
         let _ = fs::remove_dir_all(&tmp_dir);

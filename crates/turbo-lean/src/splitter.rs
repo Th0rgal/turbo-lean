@@ -5086,6 +5086,7 @@ pub fn reconstruct_single_shard_source(
 #[derive(Debug, Clone)]
 pub struct PrefixOutlinePlan {
     pub outline_source: String,
+    pub outline_stubs: Vec<String>,
     delta_imports: Vec<String>,
     delta_body: String,
 }
@@ -5220,6 +5221,15 @@ pub fn build_prefix_outline_plan_with_split(
         outline_accum.push('\n');
         outline_accum.push_str(&ckpt_closing);
     }
+    let outline_stubs: Vec<String> = split_lean_source(&outline_accum, &[])
+        .shards
+        .into_iter()
+        .filter(|sh| {
+            strip_lean_comments(&sh.proof_text).trim() == "sorry"
+                && canonicalize_lean_name(&sh.qualified_name) != target_canon
+        })
+        .map(|sh| sh.rooted_name())
+        .collect();
 
     // 2. Build `delta_imports` and `delta_body` replaying active scopes up to `checkpoint_idx`,
     //    then stubbing `spans[checkpoint_idx..t_idx]`, then `spans[t_idx]` + closing scopes.
@@ -5302,6 +5312,7 @@ pub fn build_prefix_outline_plan_with_split(
 
     Some(PrefixOutlinePlan {
         outline_source: outline_accum,
+        outline_stubs,
         delta_imports,
         delta_body: delta_chunks.join("\n"),
     })
