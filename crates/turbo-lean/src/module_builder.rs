@@ -8594,7 +8594,7 @@ pub(crate) fn forget_refreshed_dep_module(cfg: &ProjectConfig, imp: &str) {
 pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
     cfg: &ProjectConfig,
     seeds: &[String],
-) -> bool {
+) -> Result<bool> {
     let mut visited = HashSet::new();
     let mut postorder: Vec<DiscoveredModuleSpec> = Vec::new();
     let mut stack: Vec<(DiscoveredModuleSpec, bool)> = seeds
@@ -8643,7 +8643,7 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
     for spec in postorder {
         let Ok(src_raw) = fs::read_to_string(&spec.src_path) else {
             tainted.insert((spec.pkg_root.clone(), spec.module_name.clone()));
-            crate::lake_build::remove_spec_build_artifacts(&spec);
+            crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
             purged_any = true;
             continue;
         };
@@ -8654,19 +8654,20 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
                     Some(rs) => ImportSite::Module(Box::new(rs)),
                     None => resolve_import_site(cfg, sub),
                 };
-                matches!(
-                    site,
-                    ImportSite::Module(sub_spec)
-                        if tainted.contains(&(sub_spec.pkg_root, sub_spec.module_name))
-                )
+                match site {
+                    ImportSite::Module(sub_spec) => {
+                        tainted.contains(&(sub_spec.pkg_root, sub_spec.module_name))
+                    }
+                    _ => false,
+                }
             });
         if imp_tainted || spec_source_has_disallowed_elab_host_effects(cfg, &spec, &src_raw) {
             tainted.insert((spec.pkg_root.clone(), spec.module_name.clone()));
-            crate::lake_build::remove_spec_build_artifacts(&spec);
+            crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
             purged_any = true;
         }
     }
-    purged_any
+    Ok(purged_any)
 }
 
 pub(crate) fn root_module_lake_sidecars_current(cfg: &ProjectConfig, imp: &str) -> bool {

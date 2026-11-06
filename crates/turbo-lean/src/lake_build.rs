@@ -3928,7 +3928,23 @@ fn purge_workspace_sorry_artifacts_and_manifest(
     sorry_mod_set
 }
 
-fn remove_build_artifacts_in_dirs(lib_lean_dir: &Path, ir_dir: &Path, rel_slash: &str) {
+fn remove_file_if_present_checked(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => anyhow::bail!(
+            "Failed to purge stale build artifact `{}` before Lake refresh: {}",
+            path.display(),
+            e
+        ),
+    }
+}
+
+fn remove_build_artifacts_in_dirs_checked(
+    lib_lean_dir: &Path,
+    ir_dir: &Path,
+    rel_slash: &str,
+) -> Result<()> {
     for suffix in [
         ".olean",
         ".olean.hash",
@@ -3945,7 +3961,7 @@ fn remove_build_artifacts_in_dirs(lib_lean_dir: &Path, ir_dir: &Path, rel_slash:
         ".trace",
     ] {
         let p = lib_lean_dir.join(format!("{}{}", rel_slash, suffix));
-        let _ = fs::remove_file(p);
+        remove_file_if_present_checked(&p)?;
     }
     for suffix in [
         ".c",
@@ -3960,19 +3976,26 @@ fn remove_build_artifacts_in_dirs(lib_lean_dir: &Path, ir_dir: &Path, rel_slash:
         ".trace",
     ] {
         let p = ir_dir.join(format!("{}{}", rel_slash, suffix));
-        let _ = fs::remove_file(p);
+        remove_file_if_present_checked(&p)?;
     }
+    Ok(())
 }
 
-pub(crate) fn remove_spec_build_artifacts(spec: &crate::module_builder::DiscoveredModuleSpec) {
+pub(crate) fn remove_spec_build_artifacts_checked(
+    spec: &crate::module_builder::DiscoveredModuleSpec,
+) -> Result<()> {
     let rel_slash = crate::module_builder::module_name_to_rel_slash(&spec.module_name);
-    remove_build_artifacts_in_dirs(&spec.build_lib_lean_dir, &spec.build_ir_dir, &rel_slash);
+    remove_build_artifacts_in_dirs_checked(&spec.build_lib_lean_dir, &spec.build_ir_dir, &rel_slash)
+}
+
+fn remove_module_build_artifacts_checked(canon_dir: &Path, rel_slash: &str) -> Result<()> {
+    let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
+    let ir_dir = canon_dir.join(".lake/build/ir");
+    remove_build_artifacts_in_dirs_checked(&lib_lean_dir, &ir_dir, rel_slash)
 }
 
 fn remove_module_build_artifacts(canon_dir: &Path, rel_slash: &str) {
-    let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
-    let ir_dir = canon_dir.join(".lake/build/ir");
-    remove_build_artifacts_in_dirs(&lib_lean_dir, &ir_dir, rel_slash);
+    let _ = remove_module_build_artifacts_checked(canon_dir, rel_slash);
 }
 
 /// Translate a list of stale modules into the targets to hand `lake build`, replacing any module
@@ -4609,7 +4632,7 @@ fn ensure_project_imports_fresh_inner(
                 crate::module_builder::purge_elab_host_effect_artifacts_in_closure(
                     cfg,
                     &lake_targets,
-                )
+                )?
             } else {
                 let mut purged = false;
                 for info in &ordered_imports {
@@ -4620,7 +4643,7 @@ fn ensure_project_imports_fresh_inner(
                             })
                             .unwrap_or(true)
                     {
-                        remove_module_build_artifacts(canon_dir, &info.imp_slash);
+                        remove_module_build_artifacts_checked(canon_dir, &info.imp_slash)?;
                         purged = true;
                     }
                 }
@@ -4635,7 +4658,7 @@ fn ensure_project_imports_fresh_inner(
         }
         for mod_name in &non_target_stale {
             let imp_slash = crate::module_builder::module_name_to_rel_slash(mod_name);
-            remove_module_build_artifacts(canon_dir, &imp_slash);
+            remove_module_build_artifacts_checked(canon_dir, &imp_slash)?;
         }
         if let Some(mut manifest) = manifest_opt {
             for info in &ordered_imports {

@@ -17845,6 +17845,29 @@ end ParityNs
                     Some(true),
                     "turbo-lean check must elaborate App.lean against refreshed alpha Dep.olean (Nat), got: {check_val}"
                 );
+                #[cfg(unix)]
+                if unsafe { libc::geteuid() } != 0 {
+                    use std::os::unix::fs::PermissionsExt;
+                    let dep_lib_dir = dep_in_pkgs.join(".lake/build/lib/lean");
+                    let orig_mode = fs::metadata(&dep_lib_dir)?.permissions().mode();
+                    fs::set_permissions(&dep_lib_dir, fs::Permissions::from_mode(0o555))?;
+                    let purge_err = crate::lake_build::ensure_project_imports_fresh_for_check(
+                        &canon_app,
+                        std::slice::from_ref(&canon_app_lean),
+                    );
+                    let _ =
+                        fs::set_permissions(&dep_lib_dir, fs::Permissions::from_mode(orig_mode));
+                    let err_msg = format!(
+                        "{:#}",
+                        purge_err.expect_err(
+                            "non-writable dep build dir must fail closed instead of silently skipping purge"
+                        )
+                    );
+                    assert!(
+                        err_msg.contains("Failed to purge stale build artifact"),
+                        "expected purge error message, got: {err_msg}"
+                    );
+                }
                 let _ = fs::remove_dir_all(&dep_case_root);
             }
 
