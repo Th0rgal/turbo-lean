@@ -1472,6 +1472,10 @@ fn invoke_agent_step_json(
                 cmd.env_remove(cfg_k);
             }
         }
+        if std::env::var(crate::kernel::KERNEL_ENGINE_FROM_CONFIG_ENV).as_deref() == Ok("1") {
+            cmd.env_remove(crate::kernel::KERNEL_ENGINE_ENV);
+            cmd.env_remove(crate::kernel::KERNEL_ENGINE_FROM_CONFIG_ENV);
+        }
         if let Ok(out) = cmd.output() {
             let stdout = String::from_utf8_lossy(&out.stdout);
             if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
@@ -1914,6 +1918,12 @@ pub fn handle_mcp_jsonrpc_request(
                                 cmd.env_remove(val_k);
                                 cmd.env_remove(cfg_k);
                             }
+                        }
+                        if std::env::var(crate::kernel::KERNEL_ENGINE_FROM_CONFIG_ENV).as_deref()
+                            == Ok("1")
+                        {
+                            cmd.env_remove(crate::kernel::KERNEL_ENGINE_ENV);
+                            cmd.env_remove(crate::kernel::KERNEL_ENGINE_FROM_CONFIG_ENV);
                         }
                         if disallow_stmt {
                             cmd.arg("--disallow-statement-changes");

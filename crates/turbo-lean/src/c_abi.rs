@@ -168,6 +168,15 @@ extern "C" {
         admits_native_decide: u8,
         admits_bv_decide: u8,
     ) -> u8;
+    pub fn turbo_spec_route_kernel_engine(requested_engine: u8, con_leche_supported: u8) -> u8;
+    pub fn turbo_spec_verify_receipt_provenance(
+        schema_version: u32,
+        has_kernel_engine: u8,
+        engine_kind: u8,
+        toolchain_state: u8,
+        con_leche_rev_state: u8,
+        blake3_matches: u8,
+    ) -> u8;
     pub fn leansys_verify_slice_bounds(off: u64, len: u64, cap: u64) -> u8;
     pub fn leansys_verify_wal_frame(
         magic: u32,
@@ -803,6 +812,32 @@ pub fn verify_pack_trust_admission(
             has_attestation_fields as u8,
             sig_valid as u8,
             allow_unattested_trusted as u8,
+        ) != 0
+    }
+}
+
+#[inline(always)]
+pub fn route_kernel_engine(requested_engine: u8, con_leche_supported: bool) -> u8 {
+    unsafe { turbo_spec_route_kernel_engine(requested_engine, con_leche_supported as u8) }
+}
+
+#[inline(always)]
+pub fn verify_receipt_provenance(
+    schema_version: u32,
+    has_kernel_engine: bool,
+    engine_kind: u8,
+    toolchain_state: u8,
+    con_leche_rev_state: u8,
+    blake3_matches: bool,
+) -> bool {
+    unsafe {
+        turbo_spec_verify_receipt_provenance(
+            schema_version,
+            has_kernel_engine as u8,
+            engine_kind,
+            toolchain_state,
+            con_leche_rev_state,
+            blake3_matches as u8,
         ) != 0
     }
 }
@@ -1983,5 +2018,72 @@ mod tests {
             unsafe { leannative_verify_zero_copy_slice_io(4096, 64, 8192, 128, 64, 2) },
             0
         );
+    }
+
+    #[test]
+    fn test_route_kernel_engine_c_abi_gate() {
+        for requested in 0u8..=u8::MAX {
+            for supported in [false, true] {
+                let expected = match (requested, supported) {
+                    (0, false) => 1,
+                    (0, true) => 2,
+                    (1, _) => 1,
+                    (2, true) => 2,
+                    (2, false) => 0,
+                    (3, true) => 3,
+                    (3, false) => 0,
+                    _ => 0,
+                };
+                assert_eq!(
+                    route_kernel_engine(requested, supported),
+                    expected,
+                    "requested={requested}, supported={supported}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_verify_receipt_provenance_c_abi_gate() {
+        for schema_version in [0u32, 1, 2, 3, u32::MAX] {
+            for has_kernel_engine in [false, true] {
+                for engine_kind in 0u8..=5 {
+                    for toolchain_state in 0u8..=3 {
+                        for con_leche_rev_state in 0u8..=3 {
+                            for blake3_matches in [false, true] {
+                                let expected = blake3_matches
+                                    && match schema_version {
+                                        1 => {
+                                            !has_kernel_engine
+                                                && toolchain_state == 0
+                                                && con_leche_rev_state == 0
+                                        }
+                                        2 => {
+                                            has_kernel_engine
+                                                && toolchain_state == 2
+                                                && ((engine_kind == 1 && con_leche_rev_state == 0)
+                                                    || ((engine_kind == 2 || engine_kind == 3)
+                                                        && con_leche_rev_state == 2))
+                                        }
+                                        _ => false,
+                                    };
+                                assert_eq!(
+                                    verify_receipt_provenance(
+                                        schema_version,
+                                        has_kernel_engine,
+                                        engine_kind,
+                                        toolchain_state,
+                                        con_leche_rev_state,
+                                        blake3_matches,
+                                    ),
+                                    expected,
+                                    "schema={schema_version}, has_ke={has_kernel_engine}, kind={engine_kind}, tc={toolchain_state}, rev={con_leche_rev_state}, blake3={blake3_matches}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

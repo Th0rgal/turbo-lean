@@ -20,6 +20,7 @@ mod check;
 pub mod cluster;
 mod db;
 mod gpu_fastcheck;
+pub mod kernel;
 mod lake_build;
 pub mod matryoshka;
 pub mod mcp;
@@ -139,9 +140,9 @@ enum Commands {
         /// Optional verification timeout in seconds (0 = unlimited)
         #[arg(long, default_value_t = 0)]
         timeout: u64,
-        /// Kernel verification engine (`standard`, `con-leche`, or `both`)
-        #[arg(long, default_value = "standard")]
-        kernel: String,
+        /// Kernel verification engine (`auto`, `standard`, `con-leche`, or `both`)
+        #[arg(long)]
+        kernel: Option<String>,
         /// Emit `.olean`, `.ilean`, `.hash`, and Lake `.trace` artifacts into `.lake/build` on 0-sorry module check
         #[arg(long, default_value_t = false)]
         emit_olean: bool,
@@ -311,6 +312,9 @@ enum Commands {
         /// Optional subdirectory or file scope to restrict verification to (e.g. ProximityPrize/SubmissionUpper)
         #[arg(long)]
         scope: Option<PathBuf>,
+        /// Kernel verification engine (`auto`, `standard`, `con-leche`, or `both`)
+        #[arg(long)]
+        kernel: Option<String>,
     },
     /// Seed TheoremProofCAS with theorem shards from verified/hygienic project modules in a single SQLite transaction
     SeedShards {
@@ -391,6 +395,9 @@ enum Commands {
         /// Absolute external kernel checker path outside the checkout for dual-auditor cross-checking
         #[arg(long)]
         nanoda_bin: Option<PathBuf>,
+        /// Kernel verification engine (`auto`, `standard`, `con-leche`, or `both`)
+        #[arg(long)]
+        kernel: Option<String>,
     },
     /// Unified sub-millisecond to few-millisecond agent verification funnel:
     /// Stage 0 (hygiene & cone cache) -> Stage 1 (spec vacuity & certified fast-check with hypothesis suggestion) -> Stage 2 (Zygote kernel verification)
@@ -714,23 +721,37 @@ fn run(cli: Cli) -> Result<()> {
         _ => None,
     };
     let (dir, rev) = match &cli.command {
+        Commands::Check {
+            file, project_dir, ..
+        } => {
+            let check_cfg_dir = if project_dir == std::path::Path::new(".") {
+                lake_build::find_project_root(file)
+            } else {
+                project_dir.clone()
+            };
+            (Some(check_cfg_dir), None)
+        }
         Commands::PrVerify {
             project_dir, base, ..
-        } => (Some(project_dir.as_path()), Some(base.as_str())),
+        } => (Some(project_dir.clone()), Some(base.as_str())),
         Commands::CiVerify {
             project_dir,
             base: Some(base),
             ..
-        } => (Some(project_dir.as_path()), Some(base.as_str())),
+        } => (Some(project_dir.clone()), Some(base.as_str())),
         Commands::CiVerify { base: None, .. } => (None, None),
-        Commands::Check { project_dir, .. }
-        | Commands::Build { project_dir, .. }
+        Commands::Build { project_dir, .. }
         | Commands::SeedShards { project_dir, .. }
-        | Commands::SeedOleans { project_dir, .. } => (Some(project_dir.as_path()), None),
-        Commands::AgentStep { .. } | Commands::Eval { .. } => (eval_project_root.as_deref(), None),
-        Commands::Mcp { project_dir } => (Some(project_dir.as_deref().unwrap_or(here)), None),
+        | Commands::SeedOleans { project_dir, .. } => (Some(project_dir.clone()), None),
+        Commands::AgentStep { .. } | Commands::Eval { .. } => (eval_project_root.clone(), None),
+        Commands::Mcp { project_dir } => (
+            Some(project_dir.clone().unwrap_or_else(|| here.to_path_buf())),
+            None,
+        ),
         _ => (None, None),
     };
+    let kernel_from_config =
+        std::env::var(kernel::KERNEL_ENGINE_FROM_CONFIG_ENV).as_deref() == Ok("1");
     if matches!(&cli.command, Commands::CiVerify { base: None, .. }) {
         // Neither checkout policy nor inherited allowlists can authorize CI
         // without a trusted revision, in either execution mode.
@@ -745,6 +766,10 @@ fn run(cli: Cli) -> Result<()> {
             "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY_FROM_CONFIG",
         ] {
             std::env::remove_var(key);
+        }
+        if kernel_from_config {
+            std::env::remove_var(kernel::KERNEL_ENGINE_ENV);
+            std::env::remove_var(kernel::KERNEL_ENGINE_FROM_CONFIG_ENV);
         }
         eprintln!("[turbo-lean] ci-verify without --base: using restrictive default policy (no project allowlists)");
     }
@@ -768,8 +793,28 @@ fn run(cli: Cli) -> Result<()> {
         std::env::remove_var("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY");
         std::env::remove_var("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY_FROM_CONFIG");
     }
-    if let Some(dir) = dir {
+    if kernel_from_config && dir.is_none() {
+        std::env::remove_var(kernel::KERNEL_ENGINE_ENV);
+        std::env::remove_var(kernel::KERNEL_ENGINE_FROM_CONFIG_ENV);
+    }
+    let cli_kernel_override = match &cli.command {
+        Commands::Check { kernel, .. }
+        | Commands::CiVerify { kernel, .. }
+        | Commands::PrVerify { kernel, .. } => kernel.as_deref(),
+        _ => None,
+    };
+    let caller_kernel_env = if kernel_from_config {
+        None
+    } else {
+        std::env::var(kernel::KERNEL_ENGINE_ENV)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    };
+    let mut config_kernel_setting: Option<String> = None;
+    if let Some(ref dir) = dir {
         let config = splitter::read_project_config(dir, rev)?.unwrap_or_default();
+        config_kernel_setting = accelerators::toml_value(&config, "kernel", "engine")
+            .map(|v| shm_cache::unquote_toml_scalar(&v));
         if rev.is_some()
             || std::env::var_os("TURBO_LEAN_ALLOWED_CSIMP").is_none()
             || csimp_from_config
@@ -840,6 +885,34 @@ fn run(cli: Cli) -> Result<()> {
                     std::env::set_var("TURBO_LEAN_MODULE_TIMEOUT_SECS", secs.to_string());
                 }
             }
+        }
+    }
+    if matches!(
+        &cli.command,
+        Commands::Check { .. } | Commands::CiVerify { .. } | Commands::PrVerify { .. }
+    ) {
+        let selected_kernel = kernel::resolve_kernel_selection(
+            cli_kernel_override,
+            caller_kernel_env.as_deref(),
+            config_kernel_setting.as_deref(),
+        )?;
+        std::env::set_var(kernel::KERNEL_ENGINE_ENV, selected_kernel.as_str());
+        if cli_kernel_override.is_none()
+            && caller_kernel_env.is_none()
+            && config_kernel_setting.is_some()
+        {
+            std::env::set_var(kernel::KERNEL_ENGINE_FROM_CONFIG_ENV, "1");
+        } else {
+            std::env::remove_var(kernel::KERNEL_ENGINE_FROM_CONFIG_ENV);
+        }
+    } else if cli_kernel_override.is_none() && caller_kernel_env.is_none() {
+        if let Some(ref cfg_kernel) = config_kernel_setting {
+            let selected_kernel = kernel::KernelEngineSelection::parse_selection(cfg_kernel)?;
+            std::env::set_var(kernel::KERNEL_ENGINE_ENV, selected_kernel.as_str());
+            std::env::set_var(kernel::KERNEL_ENGINE_FROM_CONFIG_ENV, "1");
+        } else if kernel_from_config {
+            std::env::remove_var(kernel::KERNEL_ENGINE_ENV);
+            std::env::remove_var(kernel::KERNEL_ENGINE_FROM_CONFIG_ENV);
         }
     }
 
@@ -1424,7 +1497,11 @@ fn run(cli: Cli) -> Result<()> {
                     "`turbo-lean check` is an interactive trusted command; for untrusted verification use `turbo-lean pr-verify --mode untrusted` or `turbo-lean ci-verify --mode untrusted`"
                 );
             }
-            std::env::set_var("TURBO_LEAN_KERNEL_ENGINE", &kernel);
+            if let Some(ref k) = kernel {
+                let sel = kernel::KernelEngineSelection::parse_selection(k)?;
+                std::env::set_var(kernel::KERNEL_ENGINE_ENV, sel.as_str());
+                std::env::remove_var(kernel::KERNEL_ENGINE_FROM_CONFIG_ENV);
+            }
             if timeout > 0 {
                 let file_disp = file.display().to_string();
                 let decl_disp = decl.clone();
@@ -1731,6 +1808,7 @@ fn run(cli: Cli) -> Result<()> {
             cone_stats,
             max_cone_jobs,
             nanoda_bin,
+            ..
         } => pr_verify::run_pr_verify_command(
             &mut store,
             cli.json,
