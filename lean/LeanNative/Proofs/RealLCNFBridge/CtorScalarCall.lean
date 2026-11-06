@@ -578,18 +578,29 @@ theorem lowerLetStep_sound (fuel : Nat) (ctx : RealBridgeCtx)
             intro u hex
             have hl0 := hl
             dsimp only [lowerImpureLetValuePure, Bind.bind, Except.bind] at hl0
-            cases ha : lowerRealArgList ctx st false args.toList
-            · rw [ha] at hl0; exact nomatch hl0
-            · rename_i pa; rw [ha] at hl0; dsimp only at hl0
-              cases hi : lowerCanonicalIntrinsicPure? fnName pa.1 (lowerGroundImpureTypeWith ctx declTy)
-                  (pa.1.map pa.2.getVarType) (ctx.findLocalCallee? fnName).isSome ctx.arch ctx.gfSimdIntrinsics
-              · rw [hi] at hl0; exact nomatch hl0
-              · rename_i e0; rw [hi] at hl0
-                injection hl0 with hp; rcases Prod.mk.inj hp with ⟨he0, _⟩
-                rcases lowerCanonicalIntrinsicPure_sound ctx st lenv venv hst pev.2.1 fnName args himp
-                    pa.1 pa.2 (lowerGroundImpureTypeWith ctx declTy) e0 pev.1 pev.2.2 hinv ha hi hev with
-                  ⟨_, _, _, _, se, hse, _⟩
-                rw [he0, hex] at hse; exact nomatch hse
+            cases hsl : lowerSliceCallPure? st fnName args.toList (lowerGroundImpureTypeWith ctx declTy)
+                (ctx.findLocalCallee? fnName).isSome ctx.arch
+            · rw [hsl] at hl0; dsimp only at hl0
+              cases ha : lowerRealArgList ctx st false args.toList
+              · rw [ha] at hl0; exact nomatch hl0
+              · rename_i pa; rw [ha] at hl0; dsimp only at hl0
+                cases hi : lowerCanonicalIntrinsicPure? fnName pa.1 (lowerGroundImpureTypeWith ctx declTy)
+                    (pa.1.map pa.2.getVarType) (ctx.findLocalCallee? fnName).isSome ctx.arch ctx.gfSimdIntrinsics
+                · rw [hi] at hl0; exact nomatch hl0
+                · rename_i e0; rw [hi] at hl0
+                  injection hl0 with hp; rcases Prod.mk.inj hp with ⟨he0, _⟩
+                  rcases lowerCanonicalIntrinsicPure_sound ctx st lenv venv hst pev.2.1 fnName args himp
+                      pa.1 pa.2 (lowerGroundImpureTypeWith ctx declTy) e0 pev.1 pev.2.2 hinv ha hi hev with
+                    ⟨_, _, _, _, se, hse, _⟩
+                  rw [he0, hex] at hse; exact nomatch hse
+            · rename_i eSlice; rw [hsl] at hl0
+              injection hl0 with hp; rcases Prod.mk.inj hp with ⟨heS, _⟩
+              rcases lowerSliceCallPure_sound ctx st lenv venv hst pev.2.1 fnName args himp
+                  (lowerGroundImpureTypeWith ctx declTy) eSlice pev.1 pev.2.2 hinv hsl hev with
+                ⟨_, _, _, hdisj⟩
+              rcases hdisj with ⟨_, hlen⟩ | ⟨_, _, _, hget⟩
+              · rw [heS, hex] at hlen; exact nomatch hlen
+              · rw [heS, hex] at hget; exact nomatch hget
           rcases pl with ⟨rhs, st1⟩; dsimp only at h_lower hnotEx ⊢
           cases hrhs : rhs
           all_goals (try exact False.elim (hnotEx _ hrhs))

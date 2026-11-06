@@ -475,7 +475,7 @@ theorem validateTranslationDeclSound_of_passed (src tgt : LNIRDecl) (numSamples 
   dsimp only [validateTranslationDecl] at h1
   simp only [Bool.and_eq_true] at h1
   rcases h1 with ⟨⟨⟨⟨⟨⟨hSymOk, hUbRef⟩, hDom⟩, hPoison⟩, _⟩, hConc⟩, _⟩
-  rcases hSymOk with ⟨⟨hExSrc, hExTgt⟩, hSupp⟩
+  rcases hSymOk with ⟨⟨⟨_, hExSrc⟩, hExTgt⟩, hSupp⟩
   rcases hUbRef with ⟨⟨_, hNoUb⟩, _⟩
   rcases hDom with ⟨hReach, _⟩
   have hExSrc' : (symExecDecl 4 src (some (Nat.max (declSynVarBase src) (declSynVarBase tgt)))).symExhausted = false := by

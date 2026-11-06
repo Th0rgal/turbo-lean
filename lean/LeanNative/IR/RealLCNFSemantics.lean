@@ -427,6 +427,46 @@ def LEnv.isHeapVar (env : LEnv) (x : Lean.FVarId) : Bool :=
   | none => true
   | some t => isHeapPtrType t
 
+def collectSliceEnvArgs (env : LEnv) :
+    List (Lean.Compiler.LCNF.Arg .impure) → Option (List Val × List LNIRType)
+  | [] => some ([], [])
+  | .erased :: rest | .type .. :: rest => collectSliceEnvArgs env rest
+  | .fvar x :: rest =>
+    match env.vals x, collectSliceEnvArgs env rest with
+    | some v, some (vs, ts) =>
+      let t := (env.tys x).getD .objPtr
+      some (if lnirTypeEq t .unit then (vs, ts) else (v :: vs, t :: ts))
+    | _, _ => none
+
+def evalSliceCall? (arch : TargetArch) (fn : Lean.Name) (env : LEnv) (st : HeapState)
+    (args : List (Lean.Compiler.LCNF.Arg .impure)) (ty : LNIRType) :
+    Option (Except UBError (Val × HeapState × Option Lean.Name)) :=
+  if arch.isWasm then none
+  else
+  let validLenRet := lnirTypeEq ty .i64 || (lnirTypeEq ty .usize && archSupportsUSize arch)
+  let validIdx (t : LNIRType) := lnirTypeEq t .i64 || (lnirTypeEq t .usize && archSupportsUSize arch)
+  match collectSliceEnvArgs env args with
+  | some ([vArr], [.sarray elemTy]) =>
+    if ((fn == ``ByteArray.usize && lnirTypeEq elemTy .i8) ||
+        (fn == ``FloatArray.usize && lnirTypeEq elemTy .f64)) && validLenRet then
+      some (match vArr with
+        | .sarrayId bufId =>
+          match st.findBuffer bufId with
+          | some buf => .ok (.u64 buf.data.size.toUInt64, st, none)
+          | none => .error (.typeError s!"unknown sarray buffer {bufId}")
+        | _ => .error (.typeError "sarrayLen expects sarrayId"))
+    else none
+  | some ([vArr, vIdx], [.sarray elemTy, idxTy]) =>
+    if validIdx idxTy &&
+       ((fn == ``ByteArray.uget && lnirTypeEq elemTy .i8 && lnirTypeEq ty .i8) ||
+        (fn == ``FloatArray.uget && lnirTypeEq elemTy .f64 && lnirTypeEq ty .f64)) then
+      some (match vArr, vIdx with
+        | .sarrayId bufId, .u64 idx =>
+          (st.readElem bufId idx.toNat).map (fun v => (.u64 (maskElemVal elemTy v), st, none))
+        | _, _ => .error (.typeError "sarrayGet expects sarrayId and u64 index"))
+    else none
+  | _ => none
+
 def evalLetValue (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
     (lv : Lean.Compiler.LCNF.LetValue .impure) (ty : LNIRType) :
     Except UBError (Val × HeapState × Option Lean.Name) :=
@@ -523,6 +563,9 @@ def evalLetValue (ctx : RealBridgeCtx) (env : LEnv) (st : HeapState)
     if (ctx.findLocalCallee? fn).isSome then
       .error (.unsupportedCall fn.toString)
     else
+    match evalSliceCall? ctx.arch fn env st args.toList ty with
+    | some res => res
+    | none =>
     match args.toList with
     | [a, b] =>
       match evalArg env.vals a, evalArg env.vals b with

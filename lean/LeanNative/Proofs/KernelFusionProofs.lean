@@ -317,9 +317,9 @@ theorem specializeKernel_loop_sound
 /-- `specializeKernel` preserves `evalParFor` identically (same `.sarrayId` and `HeapState`!). -/
 theorem specializeKernel_parFor_eq
     (fuel : Nat) (env : VarEnv) (st : HeapState) (lenVar : VarId) (inputs : List VarId)
-    (kernel : ParallelKernelKind) :
-    evalParFor fuel env st lenVar inputs kernel =
-    evalParFor fuel env st lenVar inputs (specializeKernel kernel) := by
+    (kernel : ParallelKernelKind) (elemTy : LNIRType := .i64) :
+    evalParFor fuel env st lenVar inputs kernel elemTy =
+    evalParFor fuel env st lenVar inputs (specializeKernel kernel) elemTy := by
   unfold evalParFor
   cases env lenVar with
   | none => rfl
@@ -332,8 +332,12 @@ theorem specializeKernel_parFor_eq
         cases evalVarList env inputs with
         | error _ => rfl
         | ok _ =>
-          rw [specializeKernel_loop_sound env st inputs n.toNat kernel (List.range n.toNat)]
-          cases evalParKernelLoop env st inputs n.toNat (specializeKernel kernel) (List.range n.toNat) with
+          dsimp only []
+          let stIn : HeapState :=
+            if maskElemVal elemTy 0xFFFFFFFFFFFFFFFF == 0xFFFFFFFFFFFFFFFF then st
+            else { st with buffers := st.buffers.map (fun b => { b with data := b.data.map (maskElemVal elemTy) }) }
+          rw [specializeKernel_loop_sound env stIn inputs n.toNat kernel (List.range n.toNat)]
+          cases evalParKernelLoop env stIn inputs n.toNat (specializeKernel kernel) (List.range n.toNat) with
           | error _ => rfl
           | ok elems =>
             cases kernel with
@@ -408,8 +412,8 @@ theorem specializeKernelCode_refines (code : LNIRCode) :
     intro fuel env st v st' hsrc
     simp only [specializeKernelCode]
     rw [evalCode] at hsrc ⊢
-    rw [← specializeKernel_parFor_eq]
-    cases hpar : evalParFor fuel env st len inputs kernel with
+    rw [← specializeKernel_parFor_eq fuel env st len inputs kernel ety]
+    cases hpar : evalParFor fuel env st len inputs kernel ety with
     | error _ => rw [hpar] at hsrc; cases hsrc
     | ok pair =>
       rw [hpar] at hsrc
@@ -547,9 +551,15 @@ theorem fuseMapScaleAdd_loop_sound
     simpa [List.getElem_range] using hraw
   exact fuseMapScaleAdd_elem_sound env st srcBuf tmpVar len s1 b1 s2 b2 elems1 i hlen hi h1i
 
+theorem maskElemVal_of_fullWidth (elemTy : LNIRType) (hfw : isFullWidthElemType elemTy = true) :
+    maskElemVal elemTy = id := by
+  funext v
+  cases elemTy <;> first | rfl | exact nomatch hfw
+
 /-- End-to-end `evalCode` buffer-content observational refinement theorem for `fuseParForCode`
     (`fuseParForKernels_sound`): whenever a two-stage `parFor` producer-consumer pipeline over
-    scalar element type `elemTy` (`sameElemType elemTy elemTy = true`) evaluates to
+    full-width scalar element type `elemTy` (`sameElemType elemTy elemTy = true`,
+    `isFullWidthElemType elemTy = true`) evaluates to
     `(.sarrayId idSrc, stSrc)`, the `fuseParForCode`-transformed single-pass `parFor` evaluates to
     `(.sarrayId idTgt, stTgt)` with identical `ArrayBuffer.data`, `exclusive = true`, and strictly
     one fewer intermediate `HeapState` buffer allocation (`stTgt.nextId + 1 = stSrc.nextId`). -/
@@ -558,6 +568,7 @@ theorem fuseParForKernels_sound
     (tmpVar outVar lenVar srcBuf : VarId) (elemTy : LNIRType)
     (s1 b1 s2 b2 : UInt64) (vSrc : Val) (stSrc : HeapState)
     (helem : sameElemType elemTy elemTy = true)
+    (hfw : isFullWidthElemType elemTy = true)
     (hlen_ne : tmpVar ≠ lenVar) (hout_ne : tmpVar ≠ outVar) (hsrc_ne : srcBuf ≠ tmpVar)
     (hsrc : evalCode fuel env st
       (.parFor tmpVar lenVar [srcBuf] elemTy (.mapScaleAdd s1 b1)
@@ -583,10 +594,11 @@ theorem fuseParForKernels_sound
     have hout_beq_symm : (outVar == tmpVar) = false := beq_false_of_ne (Ne.symm hout_ne)
     have htmp_src : tmpVar ≠ srcBuf := Ne.symm hsrc_ne
     simp [fuseParForCode, specializeKernel, stripDeadTmpDecRef, codeUsesVar,
-      fuseTwoParForStage, hout_bne, hout_beq_symm, htmp_src, helem]
+      fuseTwoParForStage, hout_bne, hout_beq_symm, htmp_src, helem, hfw]
   rw [hcode]
   simp only [evalCode] at hsrc ⊢
   unfold evalParFor at hsrc ⊢
+  simp only [maskElemVal_of_fullWidth elemTy hfw, id_eq, beq_self_eq_true, ite_true, List.map_id] at hsrc ⊢
   cases hlen : env lenVar with
   | none => rw [hlen] at hsrc; cases hsrc
   | some lv =>

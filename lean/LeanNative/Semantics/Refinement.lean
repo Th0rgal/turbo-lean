@@ -253,7 +253,7 @@ theorem parFor_congr {outVar lenVar : VarId} {inputs : List VarId} {elemTy : LNI
                 (.parFor outVar lenVar inputs elemTy kernel k2) := by
   intro fuel env st v st' hsrc
   rw [evalCode] at hsrc ⊢
-  cases hpar : evalParFor fuel env st lenVar inputs kernel with
+  cases hpar : evalParFor fuel env st lenVar inputs kernel elemTy with
   | error _ => rw [hpar] at hsrc; contradiction
   | ok pair => rw [hpar] at hsrc; exact hk fuel (env.bind outVar pair.1) pair.2 v st' hsrc
 

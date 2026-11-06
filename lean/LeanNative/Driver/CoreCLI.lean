@@ -257,7 +257,7 @@ def runCompileMode (tag : String) (elaborateHook? : Option (String → TargetArc
     let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
   let (optMod, _) ← if opts.isBaseline then pure (baseMod, []) else runOptPipelineWithArgs args false baseMod
   if !opts.emitCABI && !opts.emitPTX && !opts.emitMetal then
-    if let some (dName, callee) := findUnsupportedLLVMCall? optMod then
+    if let some (dName, callee) := findUnsupportedLLVMCall? optMod opts.arch then
       throw <| IO.userError s!"[{tag}] Unsupported external or non-scalar call '{callee}' in '{dName}'"
   if ["--emit-header", "--header", "--emit-rust", "--rust", "--emit-swift", "--swift",
       "--emit-modulemap", "--modulemap", "--emit-fixtures", "--fixtures"].any (fun f => !(findFlagValue args f "").isEmpty) then
@@ -282,7 +282,7 @@ def runCompileLLVM (tag : String) (elaborateHook? : Option (String → TargetArc
     let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
   let (modToEmit, _) ← if isBaseline then pure (baseMod, []) else runOptPipelineWithArgs args false baseMod
   -- `--slot-regression` is the fixed in-tree slot-typing fixture (its `ptr` slots are the point of the test)
-  if let some (dName, callee) := if hasFlag args "--slot-regression" then none else findUnsupportedLLVMCall? modToEmit then
+  if let some (dName, callee) := if hasFlag args "--slot-regression" then none else findUnsupportedLLVMCall? modToEmit arch then
     throw <| IO.userError s!"[{tag}] Unsupported external or non-scalar call '{callee}' in '{dName}'"
   let irText := if isBaseline then emitLLVMBaseline modToEmit arch none wasmSimd128 else emitLLVMOptimized modToEmit arch none wasmSimd128
   writeOrPrint outPath irText (some s!"[{tag}] Wrote LLVM 18 IR ({arch.triple}, baseline={isBaseline}, decls={modToEmit.decls.length}) to {outPath}")
@@ -312,7 +312,7 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → Targ
   rejectLeanSourceWithoutFrontend tag "compile-static-lib" elaborateHook? args
   let baseMod ← loadInputModule elaborateHook? args (sel? := some sel)
   let (optMod, _) ← runOptPipelineWithArgs args false baseMod
-  if let some (dName, callee) := findUnsupportedLLVMCall? optMod then
+  if let some (dName, callee) := findUnsupportedLLVMCall? optMod arch then
     throw <| IO.userError s!"[{tag}] Unsupported external or non-scalar call '{callee}' in '{dName}'"
   let (sigs, guards) ←
     if sel.isLeanSource then

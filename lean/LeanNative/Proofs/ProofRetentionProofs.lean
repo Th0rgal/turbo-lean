@@ -669,9 +669,9 @@ theorem dischargeRetainedExclusivity_sound
     cases hdec : st.evalDecRef env objVar cnt with
     | error _ => rw [hdec] at heval; exact heval
     | ok s1 => rw [hdec] at heval; exact ih fuel env s1 _ (holds_clear env st s1 facts hfacts) v st' heval
-  | parFor out _ _ _ _ _ ih =>
+  | parFor out lv ins ety kern _ ih =>
     simp only [dischargeRetainedExclusivity, evalCode] at heval ⊢
-    cases hpar : evalParFor fuel env st _ _ _ with
+    cases hpar : evalParFor fuel env st lv ins kern ety with
     | error _ => simp [hpar] at heval
     | ok pr =>
       simp only [hpar] at heval

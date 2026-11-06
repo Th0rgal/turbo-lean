@@ -14,7 +14,7 @@ theorem evalCode_fuel_mono_step (f : Nat) : ∀ (c : LNIRCode) (venv : VarEnv) (
     cases he : evalExpr venv hst val with
     | error _ => rw [he] at h; exact nomatch h
     | ok p => rw [he] at h; exact evalCode_fuel_mono_step f k (venv.bind dst p.1) p.2 v hst' h
-  | .rawStore pv iv vv _ k, venv, hst, v, hst', h => by
+  | .rawStore pv iv vv elemTy k, venv, hst, v, hst', h => by
     dsimp only [evalCode] at h ⊢
     cases hp : venv pv <;> cases hi : venv iv <;>
       cases hv : venv vv <;> simp only [hp, hi, hv] at h <;> try contradiction
@@ -23,7 +23,7 @@ theorem evalCode_fuel_mono_step (f : Nat) : ∀ (c : LNIRCode) (venv : VarEnv) (
       cases vv0 <;> simp only at h ⊢ <;> try contradiction
     all_goals (
       rename_i bufId idx val
-      cases hw : hst.writeElemExclusive bufId idx.toNat val <;> simp only [hw] at h ⊢
+      cases hw : hst.writeElemExclusive bufId idx.toNat (maskElemVal elemTy val) <;> simp only [hw] at h ⊢
       · contradiction
       · rename_i hst1; exact evalCode_fuel_mono_step f k venv hst1 v hst' h)
   | .incRef ov cnt k, venv, hst, v, hst', h => by
@@ -74,10 +74,10 @@ theorem evalCode_fuel_mono_step (f : Nat) : ∀ (c : LNIRCode) (venv : VarEnv) (
     | ok pr =>
       rw [hl] at h; rw [hloop _ _ _ _ _ pr hl]
       exact evalCode_fuel_mono_step f k (venv.bind accVar pr.1) pr.2 v hst' h
-  | .parFor outVar lenVar inputs _ kernel k, venv, hst, v, hst', h => by
+  | .parFor outVar lenVar inputs elemTy kernel k, venv, hst, v, hst', h => by
     dsimp only [evalCode] at h ⊢
-    have hpf : ∀ r, evalParFor f venv hst lenVar inputs kernel = .ok r →
-        evalParFor (f + 1) venv hst lenVar inputs kernel = .ok r := by
+    have hpf : ∀ r, evalParFor f venv hst lenVar inputs kernel elemTy = .ok r →
+        evalParFor (f + 1) venv hst lenVar inputs kernel elemTy = .ok r := by
       intro r hp; unfold evalParFor at hp ⊢
       cases hl : venv lenVar <;> rw [hl] at hp
       · exact nomatch hp
@@ -90,7 +90,7 @@ theorem evalCode_fuel_mono_step (f : Nat) : ∀ (c : LNIRCode) (venv : VarEnv) (
           · have hgt' : ¬(n.toNat > f + 1) := by omega
             simp only [hgt, hgt', ↓reduceIte] at hp ⊢; exact hp
         | _ => exact nomatch hp
-    cases hp : evalParFor f venv hst lenVar inputs kernel with
+    cases hp : evalParFor f venv hst lenVar inputs kernel elemTy with
     | error _ => rw [hp] at h; exact nomatch h
     | ok pr =>
       rw [hp] at h; rw [hpf pr hp]
@@ -223,14 +223,19 @@ theorem lowerImpureLetValuePure_st_eq (ctx : RealBridgeCtx) (st st1 : RealBridge
       · exact nomatch h
   | fap fn args _ =>
     unfold lowerImpureLetValuePure at h; dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure] at h
-    cases hl : lowerRealArgList ctx st false args.toList with
-    | error _ => rw [hl] at h; exact nomatch h
-    | ok p =>
-      rw [hl] at h; dsimp only at h
-      cases hi : lowerCanonicalIntrinsicPure? fn p.1 retTy (p.1.map p.2.getVarType)
-          (ctx.findLocalCallee? fn).isSome ctx.arch ctx.gfSimdIntrinsics <;> rw [hi] at h
-      · exact nomatch h
-      · injection h with hp; exact (Prod.mk.inj hp).2.symm.trans (lowerRealArgList_st_eq ctx false args.toList st p.2 p.1 hl)
+    cases hsl : lowerSliceCallPure? st fn args.toList retTy (ctx.findLocalCallee? fn).isSome ctx.arch with
+    | some sliceIntr =>
+      rw [hsl] at h; injection h with hp; exact (Prod.mk.inj hp).2.symm
+    | none =>
+      rw [hsl] at h; dsimp only at h
+      cases hl : lowerRealArgList ctx st false args.toList with
+      | error _ => rw [hl] at h; exact nomatch h
+      | ok p =>
+        rw [hl] at h; dsimp only at h
+        cases hi : lowerCanonicalIntrinsicPure? fn p.1 retTy (p.1.map p.2.getVarType)
+            (ctx.findLocalCallee? fn).isSome ctx.arch ctx.gfSimdIntrinsics <;> rw [hi] at h
+        · exact nomatch h
+        · injection h with hp; exact (Prod.mk.inj hp).2.symm.trans (lowerRealArgList_st_eq ctx false args.toList st p.2 p.1 hl)
   | pap _ _ _ => exact nomatch h
   | fvar x args =>
     unfold lowerImpureLetValuePure at h; dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure] at h

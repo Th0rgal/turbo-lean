@@ -101,7 +101,8 @@ private theorem extractDeclParFor_sound {code : LNIRCode}
     · cases kern with
       | dotProduct => exact False.elim (hNotDot rfl)
       | _ =>
-        simp only [evalCode, evalParFor, hlen, hnotFuel, ite_false, hvals, hloop]
+        simp only [evalCode, evalParFor, hlen, hnotFuel, ite_false, hvals,
+          maskElemVal_i64_fun, id_eq, beq_self_eq_true, ite_true, hloop, List.map_id]
         simp only [VarEnv.bind, beq_self_eq_true, ite_true]
     · simp [HeapState.findBuffer]
   | letBind lv ty valExpr body =>
@@ -138,7 +139,8 @@ private theorem extractDeclParFor_sound {code : LNIRCode}
         · cases kern with
           | dotProduct => exact False.elim (hNotDot rfl)
           | _ =>
-            simp only [evalCode, evalExpr, harr, hbuf, evalParFor, hlen, hnotFuel, ite_false, hvals, hloop]
+            simp only [evalCode, evalExpr, harr, hbuf, evalParFor, hlen, hnotFuel, ite_false, hvals,
+              maskElemVal_i64_fun, id_eq, beq_self_eq_true, ite_true, hloop, List.map_id]
             simp only [VarEnv.bind, beq_self_eq_true, ite_true]
         · simp [HeapState.findBuffer]
   | _ => simp [extractDeclParFor] at hex

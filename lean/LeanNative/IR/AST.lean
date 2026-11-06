@@ -314,4 +314,343 @@ def LNIRDecl.containsRcAdt (d : LNIRDecl) : Bool :=
 def LNIRModule.findRcAdtDecl? (m : LNIRModule) : Option String :=
   (m.decls.find? (·.containsRcAdt)).map (·.name)
 
+mutual
+  /-- Whether an `LNIRType` is or contains a scalar-array (`.sarray _`) or raw-pointer (`.rawPtr _`) view. -/
+  def LNIRType.containsSarray : LNIRType → Bool
+    | .sarray _ | .rawPtr _ => true
+    | .tuple fs => LNIRType.listContainsSarray fs
+    | _ => false
+
+  def LNIRType.listContainsSarray : List LNIRType → Bool
+    | [] => false
+    | t :: ts => t.containsSarray || LNIRType.listContainsSarray ts
+end
+
+private def exprContainsSarray : LNIRExpr → Bool
+  | .sarrayLen _ | .sarrayDataPtr _ _ | .sarrayEnsureExclusive _ _
+  | .sarrayGet _ _ _ | .sarraySet _ _ _ _ | .rawLoad _ _ _ => true
+  | .call fn _ _ _ => fn == "lean_native_ensure_exclusive" || fn == "lean_native_sarray_len"
+  | _ => false
+
+private def codeContainsSarray : LNIRCode → Bool
+  | .letBind _ ty rhs k => ty.containsSarray || exprContainsSarray rhs || codeContainsSarray k
+  | .rawStore _ _ _ _ _ | .parFor _ _ _ _ _ _ => true
+  | .incRef _ _ k | .decRef _ _ k => codeContainsSarray k
+  | .ite _ t e => codeContainsSarray t || codeContainsSarray e
+  | .seqFor _ _ _ _ _ aty step k => aty.containsSarray || codeContainsSarray step || codeContainsSarray k
+  | .ret _ | .unreachable => false
+
+/-- Whether `d` uses `.sarray`/`.rawPtr` parameters, returns, or operations (64-bit `lean_sarray_object` layout). -/
+def LNIRDecl.containsSarray (d : LNIRDecl) : Bool :=
+  d.params.any (fun p => p.ty.containsSarray) || d.retTy.containsSarray || codeContainsSarray d.body
+
+private def elemTypeOfBufTy? : LNIRType → Option LNIRType
+  | .sarray et | .rawPtr et => some et
+  | _ => none
+
+private def bindElemEnv? (env : List (VarId × LNIRType)) (v : VarId) (ty : LNIRType) : Option (List (VarId × LNIRType)) :=
+  match env.lookup v with
+  | some oldTy =>
+    if oldTy.containsSarray || ty.containsSarray then
+      if oldTy == ty then some ((v, ty) :: env.filter (·.1 != v)) else none
+    else
+      some ((v, ty) :: env.filter (·.1 != v))
+  | none => some ((v, ty) :: env)
+
+private def checkRetCompat (env : List (VarId × LNIRType)) (expectedTy : LNIRType) (v : VarId) : Option String :=
+  match env.lookup v with
+  | some actualTy =>
+    if expectedTy.containsSarray || actualTy.containsSarray then
+      if expectedTy == actualTy then none else some "inconsistent_elem_type"
+    else none
+  | none =>
+    if expectedTy.containsSarray then some "inconsistent_elem_type" else none
+
+private def scalarExprRefsBufVar (env : List (VarId × LNIRType)) : ScalarExpr → Bool
+  | .constU64 _ | .constBool _ => false
+  | .var id => match env.lookup id with | some t => t.containsSarray | none => false
+  | .binOp _ l r => scalarExprRefsBufVar env l || scalarExprRefsBufVar env r
+  | .unaryOp _ a => scalarExprRefsBufVar env a
+  | .select c t e | .fma c t e =>
+    scalarExprRefsBufVar env c || scalarExprRefsBufVar env t || scalarExprRefsBufVar env e
+
+private def envVarHasSarray (env : List (VarId × LNIRType)) (v : VarId) : Bool :=
+  match env.lookup v with
+  | some t => t.containsSarray
+  | none => false
+
+private def checkCallArgsCompat (env : List (VarId × LNIRType))
+    (localSigs : List (String × List LNIRType × LNIRType))
+    (callee : String) (args : List VarId) (dstTy : LNIRType) : Option String :=
+  let anyBufArg := args.any (envVarHasSarray env)
+  if dstTy.containsSarray then
+    some "inconsistent_elem_type"
+  else
+    match localSigs.find? (fun (nm, pTys, _) => nm == callee && pTys.length == args.length) with
+    | some (_, pTys, _) =>
+      let rec go : List VarId → List LNIRType → Option String
+        | [], [] => none
+        | av :: avs, pt :: pts =>
+          match checkRetCompat env pt av with
+          | some err => some err
+          | none => go avs pts
+        | _, _ => some "inconsistent_elem_type"
+      go args pTys
+    | none =>
+      if anyBufArg then some "inconsistent_elem_type" else none
+
+private def checkExprElemTypes (env : List (VarId × LNIRType))
+    (localSigs : List (String × List LNIRType × LNIRType))
+    (dstTy : LNIRType) : LNIRExpr → Option String
+  | .scalar (.var src) =>
+    checkRetCompat env dstTy src
+  | .scalar se =>
+    if dstTy.containsSarray || scalarExprRefsBufVar env se then some "inconsistent_elem_type"
+    else none
+  | .mkTuple fields =>
+    match dstTy with
+    | .tuple fieldTys =>
+      if fields.length != fieldTys.length then
+        if dstTy.containsSarray || fields.any (envVarHasSarray env) then
+          some "inconsistent_elem_type"
+        else none
+      else
+        let rec checkFields : List VarId → List LNIRType → Option String
+          | [], [] => none
+          | fv :: fvs, ft :: fts =>
+            if ft.containsSarray || envVarHasSarray env fv then
+              if env.lookup fv == some ft then checkFields fvs fts else some "inconsistent_elem_type"
+            else checkFields fvs fts
+          | _, _ => some "inconsistent_elem_type"
+        checkFields fields fieldTys
+    | _ =>
+      if dstTy.containsSarray || fields.any (envVarHasSarray env) then
+        some "inconsistent_elem_type"
+      else none
+  | .projTuple tupleVar idx =>
+    match env.lookup tupleVar with
+    | some (.tuple fieldTys) =>
+      match fieldTys[idx]? with
+      | some fTy =>
+        if dstTy.containsSarray || fTy.containsSarray then
+          if dstTy == fTy then none else some "inconsistent_elem_type"
+        else none
+      | none => if dstTy.containsSarray then some "inconsistent_elem_type" else none
+    | _ => if dstTy.containsSarray then some "inconsistent_elem_type" else none
+  | .sarrayDataPtr av et =>
+    if env.lookup av == some (.sarray et) && dstTy == .rawPtr et then none
+    else some "inconsistent_elem_type"
+  | .sarrayEnsureExclusive av et =>
+    if env.lookup av == some (.sarray et) && dstTy == .sarray et then none
+    else some "inconsistent_elem_type"
+  | .sarrayGet av _ et =>
+    if env.lookup av == some (.sarray et) && !dstTy.containsSarray then none
+    else some "inconsistent_elem_type"
+  | .sarraySet av _ vv et =>
+    if env.lookup av == some (.sarray et) && dstTy == .sarray et &&
+       !envVarHasSarray env vv then none
+    else some "inconsistent_elem_type"
+  | .rawLoad pv _ et =>
+    if env.lookup pv == some (.rawPtr et) && !dstTy.containsSarray then none
+    else some "inconsistent_elem_type"
+  | .sarrayLen av | .isExclusive av =>
+    if dstTy.containsSarray then some "inconsistent_elem_type"
+    else
+      match env.lookup av with
+      | some (.tuple _) =>
+        if envVarHasSarray env av then some "inconsistent_elem_type" else none
+      | _ => none
+  | .call fn args retTy isExt =>
+    if !isExt && fn == "lean_native_ensure_exclusive" then
+      match args with
+      | [av] =>
+        match dstTy, env.lookup av with
+        | .sarray et, some (.sarray et2) =>
+          if et == et2 && (retTy == dstTy || retTy == .objPtr) then none
+          else some "inconsistent_elem_type"
+        | .sarray _, _ => some "inconsistent_elem_type"
+        | _, some (.sarray _) => some "inconsistent_elem_type"
+        | _, _ =>
+          if dstTy.containsSarray || envVarHasSarray env av then some "inconsistent_elem_type"
+          else none
+      | _ =>
+        if dstTy.containsSarray || args.any (envVarHasSarray env) then some "inconsistent_elem_type"
+        else none
+    else if !isExt && fn == "lean_native_sarray_len" then
+      match args with
+      | [av] =>
+        if dstTy.containsSarray then some "inconsistent_elem_type"
+        else
+          match env.lookup av with
+          | some (.sarray _) => none
+          | _ => if envVarHasSarray env av then some "inconsistent_elem_type" else none
+      | _ =>
+        if dstTy.containsSarray || args.any (envVarHasSarray env) then some "inconsistent_elem_type"
+        else none
+    else if isExt then
+      if dstTy.containsSarray || args.any (envVarHasSarray env) then some "inconsistent_elem_type"
+      else none
+    else
+      checkCallArgsCompat env localSigs fn args dstTy
+  | .allocCtor _ ofs sfs =>
+    if dstTy.containsSarray || sfs.any (envVarHasSarray env) ||
+       ofs.any (fun fv => match env.lookup fv with | some (.tuple _) => envVarHasSarray env fv | some (.rawPtr _) => true | _ => false) then
+      some "inconsistent_elem_type"
+    else none
+  | .mulDivDown a b d | .mulDivUp a b d =>
+    if dstTy.containsSarray || envVarHasSarray env a || envVarHasSarray env b || envVarHasSarray env d then
+      some "inconsistent_elem_type"
+    else none
+  | .storageLoad m s =>
+    if dstTy.containsSarray || envVarHasSarray env m || envVarHasSarray env s then
+      some "inconsistent_elem_type"
+    else none
+  | .storageStore m s v =>
+    if dstTy.containsSarray || envVarHasSarray env m || envVarHasSarray env s || envVarHasSarray env v then
+      some "inconsistent_elem_type"
+    else none
+  | .ctorGetObj v _ | .ctorGetScalar v _ _ | .boxScalar v _ | .unboxScalar v _ =>
+    if dstTy.containsSarray || envVarHasSarray env v then some "inconsistent_elem_type"
+    else none
+  | .constU256 _ =>
+    if dstTy.containsSarray then some "inconsistent_elem_type" else none
+
+private partial def checkCodeElemTypes (env : List (VarId × LNIRType))
+    (localSigs : List (String × List LNIRType × LNIRType))
+    (expectedRetTy : LNIRType) :
+    LNIRCode → Option String
+  | .letBind dst ty rhs k =>
+    checkExprElemTypes env localSigs ty rhs <|>
+      match bindElemEnv? env dst ty with
+      | some env' => checkCodeElemTypes env' localSigs expectedRetTy k
+      | none => some "inconsistent_elem_type"
+  | .rawStore pv _ vv et k =>
+    if env.lookup pv == some (.rawPtr et) && !envVarHasSarray env vv then
+      checkCodeElemTypes env localSigs expectedRetTy k
+    else
+      some "inconsistent_elem_type"
+  | .incRef _ _ k | .decRef _ _ k => checkCodeElemTypes env localSigs expectedRetTy k
+  | .ite _ t e =>
+    checkCodeElemTypes env localSigs expectedRetTy t <|> checkCodeElemTypes env localSigs expectedRetTy e
+  | .seqFor idxVar _ _ accVar accInit accTy step k =>
+    match checkRetCompat env accTy accInit with
+    | some err => some err
+    | none =>
+      match bindElemEnv? env idxVar .i64 >>= fun e1 => bindElemEnv? e1 accVar accTy with
+      | some stepEnv =>
+        checkCodeElemTypes stepEnv localSigs accTy step <|>
+          match bindElemEnv? env accVar accTy with
+          | some contEnv => checkCodeElemTypes contEnv localSigs expectedRetTy k
+          | none => some "inconsistent_elem_type"
+      | none => some "inconsistent_elem_type"
+  | .parFor outVar _ inputs et _ k =>
+    if !(inputs.all fun iv => env.lookup iv == some (.sarray et)) then
+      some "inconsistent_elem_type"
+    else
+      match bindElemEnv? env outVar (.sarray et) with
+      | some env' => checkCodeElemTypes env' localSigs expectedRetTy k
+      | none => some "inconsistent_elem_type"
+  | .ret v => checkRetCompat env expectedRetTy v
+  | .unreachable => none
+
+/-- Check that all `.sarray`/`.rawPtr` bindings, loop-carried accumulators, calls, tuples, returns,
+    and element-typed operations in `d` agree on `elemTy` (optionally against `localSigs` of the enclosing module). -/
+def LNIRDecl.checkElemTypes (d : LNIRDecl)
+    (localSigs : List (String × List LNIRType × LNIRType) := []) : Option String :=
+  let initEnv? := d.params.foldlM (fun acc p => bindElemEnv? acc p.id p.ty) []
+  match initEnv? with
+  | none => some "inconsistent_elem_type"
+  | some env => checkCodeElemTypes env localSigs d.retTy d.body
+
+/-- Count AST nodes in `LNIRCode` (shared by `EqSat` and `SymbolicTV` budget guards). -/
+def LNIRCode.nodeSize : LNIRCode → Nat
+  | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k
+  | .decRef _ _ k | .parFor _ _ _ _ _ k =>
+    1 + k.nodeSize
+  | .ite _ t e | .seqFor _ _ _ _ _ _ t e =>
+    1 + t.nodeSize + e.nodeSize
+  | .ret _ | .unreachable => 1
+
+/-- Simultaneous variable renaming across a `ScalarExpr`. -/
+def ScalarExpr.rewriteSubst (subst : List (VarId × VarId)) : ScalarExpr → ScalarExpr
+  | .constU64 v => .constU64 v
+  | .constBool b => .constBool b
+  | .var id => .var ((subst.lookup id).getD id)
+  | .binOp op l r => .binOp op (l.rewriteSubst subst) (r.rewriteSubst subst)
+  | .unaryOp op a => .unaryOp op (a.rewriteSubst subst)
+  | .select c t e =>
+    .select (c.rewriteSubst subst) (t.rewriteSubst subst) (e.rewriteSubst subst)
+  | .fma a b c =>
+    .fma (a.rewriteSubst subst) (b.rewriteSubst subst) (c.rewriteSubst subst)
+
+/-- Simultaneous variable renaming across an `LNIRExpr`. -/
+def LNIRExpr.rewriteSubst (subst : List (VarId × VarId)) : LNIRExpr → LNIRExpr :=
+  let rw (v : VarId) : VarId := (subst.lookup v).getD v
+  fun
+  | .scalar se => .scalar (se.rewriteSubst subst)
+  | .constU256 w => .constU256 w
+  | .mulDivDown a b d => .mulDivDown (rw a) (rw b) (rw d)
+  | .mulDivUp a b d => .mulDivUp (rw a) (rw b) (rw d)
+  | .storageLoad m s => .storageLoad (rw m) (rw s)
+  | .storageStore m s v => .storageStore (rw m) (rw s) (rw v)
+  | .mkTuple fs => .mkTuple (fs.map rw)
+  | .projTuple tv idx => .projTuple (rw tv) idx
+  | .allocCtor tag ofs sfs => .allocCtor tag (ofs.map rw) (sfs.map rw)
+  | .ctorGetObj cv idx => .ctorGetObj (rw cv) idx
+  | .ctorGetScalar cv idx ty => .ctorGetScalar (rw cv) idx ty
+  | .isExclusive ov => .isExclusive (rw ov)
+  | .sarrayLen av => .sarrayLen (rw av)
+  | .sarrayDataPtr av et => .sarrayDataPtr (rw av) et
+  | .sarrayEnsureExclusive av et => .sarrayEnsureExclusive (rw av) et
+  | .sarrayGet av iv et => .sarrayGet (rw av) (rw iv) et
+  | .sarraySet av iv vv et => .sarraySet (rw av) (rw iv) (rw vv) et
+  | .rawLoad pv iv et => .rawLoad (rw pv) (rw iv) et
+  | .boxScalar vv ty => .boxScalar (rw vv) ty
+  | .unboxScalar bv ty => .unboxScalar (rw bv) ty
+  | .call fn args rty ext => .call fn (args.map rw) rty ext
+
+/-- Capture-avoiding binder freshening and substitution across `LNIRCode`
+    (shared by `EqSat` branch cloning and `SymbolicTV` local-call inlining). -/
+def LNIRCode.freshenBinders : LNIRCode → List (VarId × VarId) → StateM VarId LNIRCode
+  | .letBind dst ty val k, subst => do
+    let val' := val.rewriteSubst subst
+    let fDst ← get
+    set (fDst + 1)
+    return .letBind fDst ty val' (← k.freshenBinders ((dst, fDst) :: subst))
+  | .rawStore pv iv vv et k, subst => do
+    let rw (v : VarId) := (subst.lookup v).getD v
+    return .rawStore (rw pv) (rw iv) (rw vv) et (← k.freshenBinders subst)
+  | .incRef ov c k, subst => do
+    let rw (v : VarId) := (subst.lookup v).getD v
+    return .incRef (rw ov) c (← k.freshenBinders subst)
+  | .decRef ov c k, subst => do
+    let rw (v : VarId) := (subst.lookup v).getD v
+    return .decRef (rw ov) c (← k.freshenBinders subst)
+  | .ite cv t e, subst => do
+    let rw (v : VarId) := (subst.lookup v).getD v
+    return .ite (rw cv) (← t.freshenBinders subst) (← e.freshenBinders subst)
+  | .seqFor iv lv hv av ai aty step k, subst => do
+    let rw (v : VarId) := (subst.lookup v).getD v
+    let fIv ← get
+    let fAv := fIv + 1
+    set (fIv + 2)
+    let step' ← step.freshenBinders ((av, fAv) :: (iv, fIv) :: subst)
+    let k' ← k.freshenBinders ((av, fAv) :: subst)
+    return .seqFor fIv (rw lv) (rw hv) fAv (rw ai) aty step' k'
+  | .parFor ov lv ins et kern k, subst => do
+    let rw (v : VarId) := (subst.lookup v).getD v
+    let fOv ← get
+    set (fOv + 1)
+    let kern' ← match kern with
+      | .customScalar idxVar inVars body => do
+        let fIdx ← get
+        let fIns := (List.range inVars.length).map (fun i => fIdx + 1 + i)
+        set (fIdx + 1 + inVars.length)
+        let kSubst := (inVars.zip fIns) ++ ((idxVar, fIdx) :: subst)
+        pure (.customScalar fIdx fIns (body.rewriteSubst kSubst))
+      | other => pure other
+    return .parFor fOv (rw lv) (ins.map rw) et kern' (← k.freshenBinders ((ov, fOv) :: subst))
+  | .ret v, subst => return .ret ((subst.lookup v).getD v)
+  | .unreachable, _ => return .unreachable
+
 end LeanNative.IR
