@@ -142,10 +142,105 @@ theorem runCTA_deterministic (f1 f2 : Nat) (stmts : List PTXStmt) (cta : PTXCTAS
           exact ih f2' cta' h1 h2
       all_goals exact h1.symm.trans h2
 
-/-- 1:1 injectivity of `ppPTXType`: distinct PTX AST types pretty-print to distinct PTX type tokens. -/
+/-- Prefix consumption preserves the arbitrary suffix. -/
+theorem stripPrefixChars_append (pre rest : List Char) :
+    stripPrefixChars pre (pre ++ rest) = some rest := by
+  induction pre <;> simp_all [stripPrefixChars]
+
+theorem scanPTXName_append (name rest : List Char) (fuel : Nat)
+    (hn : ∀ c ∈ name, ptxNameChar c = true)
+    (hr : rest = [] ∨ ∃ c cs, rest = c :: cs ∧ ptxNameChar c = false)
+    (hf : name.length < fuel) : scanPTXName fuel (name ++ rest) = some (name, rest) := by
+  induction name generalizing fuel with
+  | nil =>
+    cases fuel with
+    | zero => simp at hf
+    | succ f =>
+      rcases hr with rfl | ⟨c, cs, rfl, hc⟩ <;> simp_all [scanPTXName]
+  | cons c cs ih =>
+    cases fuel with
+    | zero => simp at hf
+    | succ f =>
+      simp only [List.cons_append, scanPTXName, hn c (by simp), ↓reduceIte]
+      rw [ih f (by intro x hx; exact hn x (by simp [hx])) (by simpa using hf)]
+      rfl
+
+theorem parsePTXPredGuard_roundtrip (g : PTXPredGuard) (rest : List Char)
+    (h : CanonicalPTXPredGuard g) (fuel : Nat) (hf : g.predReg.toList.length < fuel) :
+    parsePTXPredGuard (fuel + 1) ((ppPredGuard g).toList ++ rest) = some (g, rest) := by
+  rcases g with ⟨name, negated⟩
+  rcases h with ⟨⟨cs, hn, _⟩, hc⟩
+  have hs := scanPTXName_append name.toList (' ' :: rest) fuel hc
+    (Or.inr ⟨' ', rest, rfl, by decide⟩) hf
+  have hn' : String.ofList ('%' :: cs) = name := by rw [← hn]; simp
+  cases negated <;> simp [ppPredGuard, parsePTXPredGuard, stripPrefixChars,
+    toString, String.toList_append, List.append_assoc, hn] at hs ⊢ <;>
+    simp_all [stripPrefixChars]
+
+theorem parsePTXType_roundtrip (ty : PTXType) (fuel : Nat) (rest : List Char) :
+    parsePTXType (fuel + 1) ((ppPTXType ty).toList ++ rest) = some (ty, rest) := by
+  cases ty <;> rfl
+
+theorem ppPredGuard_injective (a b : PTXPredGuard)
+    (ha : CanonicalPTXPredGuard a) (hb : CanonicalPTXPredGuard b)
+    (h : ppPredGuard a = ppPredGuard b) : a = b := by
+  let fuel := a.predReg.toList.length + b.predReg.toList.length + 1
+  have hp := congrArg (fun s : String => parsePTXPredGuard (fuel + 1) (s.toList ++ [])) h
+  rw [parsePTXPredGuard_roundtrip a [] ha fuel (by omega),
+      parsePTXPredGuard_roundtrip b [] hb fuel (by omega)] at hp
+  exact (Option.some.inj hp |> Prod.mk.inj).1
+
+theorem parsePTXNamedOperand_specialReg (sr : SpecialReg) :
+    parsePTXNamedOperand (ppSpecialReg sr) = .sreg sr := by
+  cases sr <;> decide
+
+theorem parsePTXNamedOperand_reg (name : String)
+    (h : CanonicalPTXOperand (.reg name)) : parsePTXNamedOperand name = .reg name := by
+  have hf : ptxSpecialRegs.find? (fun sr => ppSpecialReg sr == name) = none := by
+    apply List.find?_eq_none.mpr
+    intro sr hs
+    simpa using h.2.2 sr hs
+  simp [parsePTXNamedOperand, hf, h.2.1]
+
+theorem parsePTXOperand_specialReg_roundtrip (sr : SpecialReg) (rest : List Char) :
+    parsePTXOperand 16 ((ppPTXOperand (.sreg sr)).toList ++ ',' :: rest) =
+      some (.sreg sr, ',' :: rest) := by
+  cases sr <;> simp [parsePTXOperand, ppPTXOperand, ppSpecialReg, scanPTXName,
+    ptxNameChar, parsePTXNamedOperand, ptxSpecialRegs, List.find?]
+
+theorem parsePTXOperand_reg_roundtrip (name : String) (cs rest : List Char)
+    (hn : name.toList = '%' :: cs) (h : CanonicalPTXOperand (.reg name))
+    (fuel : Nat) (hf : name.toList.length < fuel) :
+    parsePTXOperand fuel ((ppPTXOperand (.reg name)).toList ++ ',' :: rest) =
+      some (.reg name, ',' :: rest) := by
+  have hs := scanPTXName_append name.toList (',' :: rest) fuel h.1.2
+    (Or.inr ⟨',', rest, rfl, by decide⟩) hf
+  have hp := parsePTXNamedOperand_reg name h
+  have hc : String.ofList ('%' :: cs) = name := by rw [← hn]; simp
+  simp only [ppPTXOperand, hn, List.cons_append] at hs ⊢
+  simp [parsePTXOperand, hs, hc, hp]
+
+theorem ppPTXOperand_reg_injective (a b : String)
+    (h : ppPTXOperand (.reg a) = ppPTXOperand (.reg b)) : a = b := h
+
+theorem parsePTXInstr_ret_roundtrip (rest : List Char) :
+    parsePTXInstr 8 ((ppPTXInstr .ret).toList ++ rest) = some (.ret, rest) := by
+  simp [parsePTXInstr, ppPTXInstr, parsePTXName, scanPTXName, ptxNameChar, stripPrefixChars]
+
+theorem parsePTXStmt_ret_roundtrip (rest : List Char) :
+    parsePTXStmt 8 ((ppPTXStmt (.instr none .ret)).toList ++ rest) =
+      some (.instr none .ret, rest) := by
+  simp [parsePTXStmt, ppPTXStmt, parsePTXInstr, ppPTXInstr,
+    parsePTXName, scanPTXName, ptxNameChar, stripPrefixChars, toString]
+
+theorem ppPTXType_injective_via_parser : Function.Injective ppPTXType := by
+  intro a b h
+  have hp := congrArg (fun s : String => parsePTXType 1 (s.toList ++ [])) h
+  simpa only [parsePTXType_roundtrip, Option.some.injEq, Prod.mk.injEq, and_true] using hp
+
 theorem ppPTXType_injective (t1 t2 : PTXType) (h : ppPTXType t1 = ppPTXType t2) :
-    t1 = t2 := by
-  cases t1 <;> cases t2 <;> first | rfl | exact absurd h (by decide)
+     t1 = t2 := by
+  exact ppPTXType_injective_via_parser h
 
 /-- 1:1 injectivity of `ppStateSpace`: distinct PTX state spaces pretty-print to distinct tokens. -/
 theorem ppStateSpace_injective (s1 s2 : StateSpace) (h : ppStateSpace s1 = ppStateSpace s2) :

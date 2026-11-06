@@ -21,6 +21,457 @@ Kernel-checked theorems over `LeanNative.Backend.MetalAst`:
 
 namespace LeanNative.Backend.MetalAst
 
+theorem parseMSLScalarType_roundtrip (ty : MSLType) (h : CanonicalMSLValueType ty) :
+    parseMSLScalarType (ppMSLType ty) = some ty := by
+  cases ty <;> simp_all [CanonicalMSLValueType, ppMSLType, parseMSLScalarType]
+
+set_option maxHeartbeats 1600000 in
+theorem parseMSLParamType_roundtrip (ty : MSLType) (h : CanonicalMSLType ty) :
+    parseMSLParamType (ppMSLType ty) = some ty := by
+  cases ty with
+  | pointer sp c el =>
+    cases el <;> simp only [CanonicalMSLType, CanonicalMSLValueType, false_and] at h
+    all_goals try contradiction
+    all_goals cases sp <;> cases c <;> first | exact False.elim (Bool.noConfusion (h.2 rfl)) | decide
+  | ref sp el =>
+    cases el <;> simp only [CanonicalMSLType, CanonicalMSLValueType] at h
+    all_goals try contradiction
+    all_goals cases sp <;> decide
+  | _ => first | contradiction | decide
+
+theorem ppMSLType_injective_on_canonical (a b : MSLType)
+    (ha : CanonicalMSLType a) (hb : CanonicalMSLType b)
+    (h : ppMSLType a = ppMSLType b) : a = b := by
+  have hp := congrArg parseMSLParamType h
+  simpa only [parseMSLParamType_roundtrip a ha, parseMSLParamType_roundtrip b hb,
+    Option.some.injEq] using hp
+
+theorem scanMSLToken_append (delimiter : Char) (token rest : List Char)
+    (h : delimiter ∉ token) :
+    scanMSLToken delimiter (token ++ delimiter :: rest) = (token, delimiter :: rest) := by
+  induction token with
+  | nil => simp [scanMSLToken]
+  | cons c cs ih =>
+    have hc : c ≠ delimiter := fun he => h (by simp [he])
+    have hs : delimiter ∉ cs := fun hm => h (by simp [hm])
+    simp [scanMSLToken, hc, ih hs]
+
+theorem canonicalMSLType_no_closeParen (ty : MSLType) (h : CanonicalMSLType ty) :
+    ')' ∉ (ppMSLType ty).toList := by
+  cases ty with
+  | pointer sp c el =>
+    cases el <;> simp only [CanonicalMSLType, CanonicalMSLValueType, false_and] at h
+    all_goals try contradiction
+    all_goals cases sp <;> cases c
+    all_goals first | exact False.elim (Bool.noConfusion (h.2 rfl)) | decide
+  | ref sp el =>
+    cases el <;> simp only [CanonicalMSLType, CanonicalMSLValueType] at h
+    all_goals try contradiction
+    all_goals cases sp <;> decide
+  | _ => first | contradiction | decide
+
+theorem parseMSLType_roundtrip (ty : MSLType) (h : CanonicalMSLType ty)
+    (rest : List Char) :
+    parseMSLType ((ppMSLType ty).toList ++ ')' :: rest) = some (ty, ')' :: rest) := by
+  simp [parseMSLType, scanMSLToken_append ')' _ rest (canonicalMSLType_no_closeParen ty h),
+    parseMSLParamType_roundtrip ty h]
+
+theorem stripPrefixChars_append (pre rest : List Char) :
+    stripPrefixChars pre (pre ++ rest) = some rest := by
+  induction pre <;> simp_all [stripPrefixChars]
+
+theorem scanMSLName_append (name rest : List Char) (fuel : Nat)
+    (hn : ∀ c ∈ name, mslNameChar c = true)
+    (hr : rest = [] ∨ ∃ c cs, rest = c :: cs ∧ mslNameChar c = false)
+    (hf : name.length < fuel) : scanMSLName fuel (name ++ rest) = some (name, rest) := by
+  induction name generalizing fuel with
+  | nil =>
+    cases fuel with
+    | zero => simp at hf
+    | succ f =>
+      rcases hr with rfl | ⟨c, cs, rfl, hc⟩ <;> simp_all [scanMSLName]
+  | cons c cs ih =>
+    cases fuel with
+    | zero => simp at hf
+    | succ f =>
+      simp only [List.cons_append, scanMSLName, hn c (by simp), ↓reduceIte]
+      rw [ih f (by intro x hx; exact hn x (by simp [hx])) (by simpa using hf)]
+      rfl
+
+theorem parseMSLExpr_bool_roundtrip (b : Bool) (rest : List Char) :
+    parseMSLExpr 8 ((ppMSLExpr (.immBool b)).toList ++ ')' :: rest) =
+      some (.immBool b, ')' :: rest) := by
+  cases b <;> simp [parseMSLExpr, ppMSLExpr, scanMSLName, mslNameChar]
+
+theorem validMSLExprSuffix_nameBoundary (rest : List Char) (h : ValidMSLExprSuffix rest) :
+    rest = [] ∨ ∃ c cs, rest = c :: cs ∧ mslNameChar c = false := by
+  cases rest with
+  | nil => exact Or.inl rfl
+  | cons c cs =>
+    right
+    refine ⟨c, cs, rfl, ?_⟩
+    rcases h with rfl | rfl | rfl | rfl | rfl <;> decide
+
+theorem stripPrefixChars_eq_some_iff (pre input rest : List Char) :
+    stripPrefixChars pre input = some rest ↔ input = pre ++ rest := by
+  induction pre generalizing input with
+  | nil => simp [stripPrefixChars]
+  | cons p ps ih =>
+    cases input with
+    | nil => simp [stripPrefixChars]
+    | cons c cs =>
+      by_cases h : p = c
+      · simp_all [stripPrefixChars]
+      · simp_all [stripPrefixChars, Ne.symm h]
+
+theorem parseMSLExpr_var_roundtrip (name : String) (h : CanonicalMSLName name)
+    (rest : List Char) (hr : ValidMSLExprSuffix rest) (fuel : Nat)
+    (hf : name.toList.length < fuel) :
+    parseMSLExpr (fuel + 1) (name.toList ++ rest) = some (.var name, rest) := by
+  have hs := scanMSLName_append name.toList rest fuel h.2.1
+    (validMSLExprSuffix_nameBoundary rest hr) hf
+  rcases h with ⟨⟨c, cs, hn, hc⟩, hall, ht, hfalse, hul, hclz⟩
+  have hc' : c ≠ '(' := by intro he; subst c; contradiction
+  have hne : name.toList.isEmpty = false := by simp [hn]
+  have hname : String.singleton c ++ String.ofList cs = name := by
+    simpa using congrArg String.ofList hn.symm
+  rw [hn] at hs
+  simp only [List.cons_append] at hs
+  have hul' : ¬ ['L', 'U'] <+: cs.reverse ++ [c] := by
+    have hh := hul
+    rw [hn] at hh
+    intro hp
+    have hp' := List.isPrefixOf_iff_prefix.mpr hp
+    simp only [List.reverse_cons] at hh
+    rw [hh] at hp'
+    contradiction
+  simp only [hn, List.cons_append]
+  cases rest with
+  | nil =>
+    simp only [List.append_nil] at hs ⊢
+    simp [parseMSLExpr, hc', hs, hname, ht, hfalse, hul']
+  | cons d ds =>
+    rcases hr with rfl | rfl | rfl | rfl | rfl <;>
+      simp [parseMSLExpr, hc', hs, hname, ht, hfalse, hul']
+
+
+theorem parseMSLStmt_return_roundtrip (indent : String) (rest : List Char) :
+    parseMSLStmt 2 indent ((ppMSLStmt indent .returnStmt).toList ++ rest) =
+      some (.returnStmt, rest) := by
+  simp only [ppMSLStmt, String.toList_append, List.append_assoc]
+  simp [parseMSLStmt, stripPrefixChars_append, parseMSLSimpleStmt,
+    stripPrefixChars, String.reduceToList]
+
+theorem parseMSLExpr_bool_suffix_roundtrip (b : Bool) (rest : List Char)
+    (hr : ValidMSLExprSuffix rest) (fuel : Nat) (hf : 6 < fuel) :
+    parseMSLExpr fuel ((ppMSLExpr (.immBool b)).toList ++ rest) =
+      some (.immBool b, rest) := by
+  cases fuel with
+  | zero => omega
+  | succ f =>
+    have hs (chars : List Char) (hc : ∀ c ∈ chars, mslNameChar c = true)
+        (hlen : chars.length < f) :=
+      scanMSLName_append chars rest f hc (validMSLExprSuffix_nameBoundary rest hr) hlen
+    cases b <;>
+      simp only [ppMSLExpr, Bool.false_eq_true, ↓reduceIte, String.reduceToList]
+    · have hscan := hs ['f', 'a', 'l', 's', 'e'] (by decide) (by simp; omega)
+      simp only [parseMSLExpr, hscan]
+      rfl
+
+    · have hscan := hs ['t', 'r', 'u', 'e'] (by decide) (by simp; omega)
+      simp only [parseMSLExpr, hscan]
+      rfl
+
+theorem mslNameChar_of_isDigit (c : Char) (h : c.isDigit = true) : mslNameChar c = true := by
+  simp [mslNameChar, Char.isAlphanum, h]
+
+theorem natRepr_mslNameChars (n : Nat) :
+    ∀ c ∈ n.repr.toList, mslNameChar c = true := by
+  intro c hc
+  apply mslNameChar_of_isDigit
+  rw [Nat.toList_repr] at hc
+  exact Nat.isDigit_of_mem_toDigits (by omega) (by omega) hc
+
+set_option maxHeartbeats 800000 in
+theorem parseMSLExpr_u64_roundtrip (v : BitVec 64) (rest : List Char)
+    (hr : ValidMSLExprSuffix rest) (fuel : Nat)
+    (hf : v.toNat.repr.toList.length + 2 < fuel) :
+    parseMSLExpr (fuel + 1) ((ppMSLExpr (.immU64 v)).toList ++ rest) =
+      some (.immU64 v, rest) := by
+  generalize hdigits : v.toNat.repr.toList = digits at hf
+  have hd : ∀ c ∈ digits, c.isDigit = true := by
+    intro c hc
+    exact Nat.isDigit_of_mem_toDigits (b := 10) (n := v.toNat) (by omega) (by omega)
+      (by simpa only [← hdigits, Nat.toList_repr] using hc)
+  have hn : digits ≠ [] := by rw [← hdigits]; simp
+  have hs := scanMSLName_append (digits ++ ['U', 'L']) rest fuel
+    (by
+      intro c hc
+      rcases List.mem_append.mp hc with hc | hc
+      · exact mslNameChar_of_isDigit c (hd c hc)
+      · simp only [List.mem_cons, List.not_mem_nil, or_false] at hc
+        rcases hc with rfl | rfl <;> decide)
+    (validMSLExprSuffix_nameBoundary rest hr) (by simpa using hf)
+  have ht : String.ofList (digits ++ ['U', 'L']) ≠ "true" := by
+    intro he
+    have hh := congrArg String.toList he
+    cases heq : digits with
+    | nil => exact hn heq
+    | cons c cs =>
+      have hc := hd c (by simp [heq])
+      simp only [String.toList_ofList, heq, List.cons_append, String.reduceToList,
+        List.cons.injEq] at hh
+      rcases hh with ⟨rfl, _⟩
+      contradiction
+  have hfalse : String.ofList (digits ++ ['U', 'L']) ≠ "false" := by
+    intro he
+    have hh := congrArg String.toList he
+    cases heq : digits with
+    | nil => exact hn heq
+    | cons c cs =>
+      have hc := hd c (by simp [heq])
+      simp only [String.toList_ofList, heq, List.cons_append, String.reduceToList,
+        List.cons.injEq] at hh
+      rcases hh with ⟨rfl, _⟩
+      contradiction
+  have hnum : (String.ofList digits).toNat? = some v.toNat := by
+    simpa only [← hdigits, String.ofList_toList] using Nat.toNat?_repr v.toNat
+  have hv : v.toNat < 2^64 := v.isLt
+  simp only [ppMSLExpr, String.toList_append, Nat.toString_eq_repr]
+  rw [hdigits]
+  change parseMSLExpr (fuel + 1) ((digits ++ ['U', 'L']) ++ rest) = _
+  cases he : digits with
+  | nil => exact False.elim (hn he)
+  | cons c cs =>
+    have hc := hd c (by simp [he])
+    have hc' : c ≠ '(' := by intro hh; subst c; contradiction
+    have hs' := hs
+    simp only [he, List.cons_append] at hs'
+    simp only [List.cons_append]
+    simp only [parseMSLExpr]
+    split
+    all_goals try contradiction
+    all_goals try { rename_i hh; simp [hc'] at hh }
+    simp only [hs']
+    have he' : c :: (cs ++ ['U', 'L']) = digits ++ ['U', 'L'] := by rw [he]; rfl
+    rw [he']
+    simp only [String.ofList_append] at ht hfalse
+    simp [ht, hfalse, List.reverse_append, hnum, hv]
+
+theorem parseMSLExpr_bitNot_step (a : MSLExpr) (rest : List Char) (fuel : Nat)
+    (h : parseMSLExpr fuel ((ppMSLExpr a).toList ++ ')' :: rest) = some (a, ')' :: rest)) :
+    parseMSLExpr (fuel + 1) ((ppMSLExpr (.bitNot a)).toList ++ rest) =
+      some (.bitNot a, rest) := by
+  simp only [ppMSLExpr, toString, String.toList_append, String.reduceToList,
+    List.append_assoc, List.cons_append, List.nil_append]
+  simp [parseMSLExpr, h, stripPrefixChars]
+
+theorem parseMSLExpr_logNot_step (a : MSLExpr) (rest : List Char) (fuel : Nat)
+    (h : parseMSLExpr fuel ((ppMSLExpr a).toList ++ ')' :: rest) = some (a, ')' :: rest)) :
+    parseMSLExpr (fuel + 1) ((ppMSLExpr (.logNot a)).toList ++ rest) =
+      some (.logNot a, rest) := by
+  simp only [ppMSLExpr, toString, String.toList_append, String.reduceToList, List.append_assoc,
+    List.cons_append, List.nil_append]
+  simp [parseMSLExpr, h, stripPrefixChars]
+
+theorem parseMSLExpr_neg_step (a : MSLExpr) (rest : List Char) (fuel : Nat)
+    (h : parseMSLExpr fuel ((ppMSLExpr a).toList ++ ')' :: rest) = some (a, ')' :: rest)) :
+    parseMSLExpr (fuel + 1) ((ppMSLExpr (.neg a)).toList ++ rest) =
+      some (.neg a, rest) := by
+  simp only [ppMSLExpr, toString, String.toList_append, String.reduceToList, List.append_assoc,
+    List.cons_append, List.nil_append]
+  simp [parseMSLExpr, h, stripPrefixChars]
+
+theorem parseMSLExpr_cast_step (ty : MSLType) (a : MSLExpr) (rest : List Char) (fuel : Nat)
+    (ht : ty = .ulong ∨ ty = .long ∨ ty = .uint)
+    (h : parseMSLExpr fuel ((ppMSLExpr a).toList ++ ')' :: rest) = some (a, ')' :: rest)) :
+    parseMSLExpr (fuel + 1) ((ppMSLExpr (.cast ty a)).toList ++ rest) =
+      some (.cast ty a, rest) := by
+  rcases ht with rfl | rfl | rfl <;>
+    simp [ppMSLExpr, ppMSLType, toString, String.toList_append, List.append_assoc,
+      parseMSLExpr, mslNameChar, parseMSLScalarType, stripPrefixChars, h]
+
+theorem ppMSLExpr_canonical_head (e : MSLExpr) (h : CanonicalMSLExpr e) :
+    ∃ c cs, (ppMSLExpr e).toList = c :: cs ∧ c ≠ ')' := by
+  cases e <;> simp_all [CanonicalMSLExpr, ppMSLExpr, toString, String.toList_append]
+  case var name =>
+    rcases h.1 with ⟨c, cs, he, hc⟩
+    exact ⟨c, ⟨cs, he⟩, by intro hh; subst c; contradiction⟩
+  case immU64 v =>
+    have hn := Nat.toDigits_ne_nil (n := v.toNat) (b := 10)
+    cases he : Nat.toDigits 10 v.toNat with
+    | nil => contradiction
+    | cons c cs =>
+      refine ⟨c, ⟨cs ++ ['U', 'L'], rfl⟩, ?_⟩
+      have hc := Nat.isDigit_of_mem_toDigits (b := 10) (n := v.toNat) (by omega) (by omega)
+        (show c ∈ Nat.toDigits 10 v.toNat by simp [he])
+      intro hh; subst c; contradiction
+  case immBool b => cases b <;> simp
+  case index name idx =>
+    rcases h.1.1 with ⟨c, cs, he, hc⟩
+    refine ⟨c, ⟨cs ++ '[' :: ((ppMSLExpr idx).toList ++ [']']), ?_⟩, ?_⟩
+    · rw [he]; rfl
+    · intro hh; subst c; contradiction
+
+theorem parseMSLExpr_clz_step (a : MSLExpr) (ha : CanonicalMSLExpr a)
+    (rest : List Char) (fuel : Nat) (hf : 4 < fuel)
+    (h : parseMSLExpr fuel ((ppMSLExpr a).toList ++ ')' :: rest) = some (a, ')' :: rest)) :
+    parseMSLExpr (fuel + 2) ((ppMSLExpr (.clz a)).toList ++ rest) =
+      some (.clz a, rest) := by
+  have hs := scanMSLName_append "clz".toList ('(' :: ((ppMSLExpr a).toList ++ ')' :: rest))
+    (fuel + 1) (by decide) (by exact Or.inr ⟨'(', _, rfl, rfl⟩) (by simp; omega)
+  rcases ppMSLExpr_canonical_head a ha with ⟨c, cs, he, hc⟩
+  simp only [ppMSLExpr, toString, String.toList_append, String.reduceToList,
+    List.append_assoc, List.cons_append, List.nil_append]
+  have hs' := hs
+  simp only [String.reduceToList, List.cons_append, List.nil_append] at hs'
+  rw [parseMSLExpr] <;> try { intros; contradiction }
+  rw [hs']
+  have hp : parseMSLExprArgs (fuel + 1) ((ppMSLExpr a).toList ++ ')' :: rest) =
+      some (.cons a .nil, rest) := by
+    rw [he] at h ⊢
+    simp only [List.cons_append] at h ⊢
+    simp [parseMSLExprArgs, hc, h]
+  simp [hp]
+  all_goals simp
+
+theorem parseMSLExpr_index_step (name : String) (hn : CanonicalMSLName name)
+    (idx : MSLExpr) (rest : List Char) (fuel : Nat) (hf : name.toList.length < fuel)
+    (h : parseMSLExpr fuel ((ppMSLExpr idx).toList ++ ']' :: rest) = some (idx, ']' :: rest)) :
+    parseMSLExpr (fuel + 1) ((ppMSLExpr (.index name idx)).toList ++ rest) =
+      some (.index name idx, rest) := by
+  have hs := scanMSLName_append name.toList ('[' :: ((ppMSLExpr idx).toList ++ ']' :: rest))
+    fuel hn.2.1 (Or.inr ⟨'[', _, rfl, rfl⟩) hf
+  rcases hn with ⟨⟨c, cs, he, hc⟩, _, ht, hfalse, hul, _⟩
+  have hc' : c ≠ '(' := by intro hh; subst c; contradiction
+  have hname : String.ofList (c :: cs) = name := by rw [← he]; simp
+  have hul' : ¬ ['L', 'U'] <+: cs.reverse ++ [c] := by
+    intro hp
+    have hh := List.isPrefixOf_iff_prefix.mpr hp
+    rw [he] at hul
+    simp only [List.reverse_cons] at hul
+    rw [hul] at hh
+    contradiction
+  simp only [String.ofList_cons] at hname
+  simp only [ppMSLExpr, toString, String.toList_append, String.reduceToList,
+    List.append_assoc, List.cons_append, List.nil_append]
+  rw [he] at hs ⊢
+  simp only [List.cons_append] at hs ⊢
+  rw [parseMSLExpr]
+  · rw [hs]
+    simp [hname, ht, hfalse, hul', h, stripPrefixChars]
+  all_goals simp [hc']
+
+theorem parseMSLExprTail_select_step (a b c : MSLExpr) (rest : List Char) (fuel : Nat)
+    (hb : parseMSLExpr fuel ((ppMSLExpr b).toList ++ ' ' :: ':' :: ' ' ::
+      ((ppMSLExpr c).toList ++ ')' :: rest)) =
+      some (b, ' ' :: ':' :: ' ' :: ((ppMSLExpr c).toList ++ ')' :: rest)))
+    (hc : parseMSLExpr fuel ((ppMSLExpr c).toList ++ ')' :: rest) = some (c, ')' :: rest)) :
+    parseMSLExprTail (fuel + 1) a (' ' :: '?' :: ' ' ::
+      ((ppMSLExpr b).toList ++ ' ' :: ':' :: ' ' :: ((ppMSLExpr c).toList ++ ')' :: rest))) =
+      some (.select a b c, rest) := by
+  simp [parseMSLExprTail, stripPrefixChars, hb, hc]
+
+theorem parseMSLExprTail_binary_step (opcode : String) (ctor : MSLExpr → MSLExpr → MSLExpr)
+    (hop : mslBinary opcode = some ctor) (hspace : ∀ c ∈ opcode.toList, c ≠ ' ')
+    (hquestion : ∀ cs, opcode.toList ≠ '?' :: cs)
+    (a b : MSLExpr) (rest : List Char) (fuel : Nat)
+    (hb : parseMSLExpr fuel ((ppMSLExpr b).toList ++ ')' :: rest) = some (b, ')' :: rest)) :
+    parseMSLExprTail (fuel + 1) a
+      (' ' :: (opcode.toList ++ ' ' :: ((ppMSLExpr b).toList ++ ')' :: rest))) =
+      some (ctor a b, rest) := by
+  have ht : (opcode.toList ++ ' ' :: ((ppMSLExpr b).toList ++ ')' :: rest)).takeWhile (· != ' ') =
+      opcode.toList := by
+    rw [List.takeWhile_append_of_pos (by intro c hc; simpa using hspace c hc)]
+    simp
+  have hq : stripPrefixChars [' ', '?', ' ']
+      (' ' :: (opcode.toList ++ ' ' :: ((ppMSLExpr b).toList ++ ')' :: rest))) = none := by
+    cases he : opcode.toList with
+    | nil => rfl
+    | cons c cs =>
+      by_cases hc : c = '?'
+      · subst c
+        exact False.elim (hquestion cs he)
+      · simp [stripPrefixChars, Ne.symm hc]
+  simp only [parseMSLExprTail, hq]
+  have hp := stripPrefixChars_append (opcode.toList ++ [' ']) ((ppMSLExpr b).toList ++ ')' :: rest)
+  simp only [List.append_assoc, List.cons_append, List.nil_append] at hp
+  simp [stripPrefixChars, ht, hp, hop, hb]
+
+theorem parseMSLExprArgs_singleton_step (a : MSLExpr) (ha : CanonicalMSLExpr a)
+    (rest : List Char) (fuel : Nat)
+    (h : parseMSLExpr fuel ((ppMSLExpr a).toList ++ ')' :: rest) = some (a, ')' :: rest)) :
+    parseMSLExprArgs (fuel + 1) ((ppMSLExpr a).toList ++ ')' :: rest) =
+      some (.cons a .nil, rest) := by
+  obtain ⟨c, cs, he, hc⟩ := ppMSLExpr_canonical_head a ha
+  rw [he] at h ⊢
+  simp only [List.cons_append] at h
+  simp [parseMSLExprArgs, hc, h]
+
+theorem parseMSLExprArgs_cons_step (a : MSLExpr) (ha : CanonicalMSLExpr a)
+    (args : MSLExprList) (input rest : List Char) (fuel : Nat)
+    (h : parseMSLExpr fuel ((ppMSLExpr a).toList ++ ',' :: ' ' :: input) =
+      some (a, ',' :: ' ' :: input))
+    (hs : parseMSLExprArgs fuel input = some (args, rest)) :
+    parseMSLExprArgs (fuel + 1) ((ppMSLExpr a).toList ++ ',' :: ' ' :: input) =
+      some (.cons a args, rest) := by
+  obtain ⟨c, cs, he, hc⟩ := ppMSLExpr_canonical_head a ha
+  rw [he] at h ⊢
+  simp only [List.cons_append] at h
+  simp [parseMSLExprArgs, hc, h, hs, stripPrefixChars]
+
+theorem parseMSLExpr_builtin_step (name : String)
+    (hn : name = "select" ∨ name = "fma")
+    (a b c : MSLExpr) (input rest : List Char) (fuel : Nat)
+    (hf : 6 < fuel)
+    (h : parseMSLExprArgs fuel input = some (.cons a (.cons b (.cons c .nil)), rest)) :
+    parseMSLExpr (fuel + 1) (name.toList ++ '(' :: input) =
+      some (if name = "select" then .builtinSelect a b c else .fma a b c, rest) := by
+  have hchars : ∀ c ∈ name.toList, mslNameChar c = true := by
+    rcases hn with rfl | rfl <;> simp [mslNameChar] <;> decide
+  have hlen : name.toList.length < fuel := by
+    rcases hn with rfl | rfl <;> simp only [String.reduceToList, List.length_cons, List.length_nil] <;> omega
+  have hs := scanMSLName_append name.toList ('(' :: input) fuel hchars
+    (Or.inr ⟨'(', input, rfl, rfl⟩) hlen
+  rcases hn with rfl | rfl
+  all_goals
+    simp only [String.reduceToList, List.cons_append, List.nil_append] at hs ⊢
+    rw [parseMSLExpr]
+    · rw [hs]
+      simp [h]
+    all_goals simp
+
+theorem parseMSLExprArgs_three_step (a b c : MSLExpr)
+    (ha : CanonicalMSLExpr a) (hb : CanonicalMSLExpr b) (hc : CanonicalMSLExpr c)
+    (rest : List Char) (fuel : Nat)
+    (pa : parseMSLExpr (fuel + 2) ((ppMSLExpr a).toList ++ ',' :: ' ' ::
+      ((ppMSLExpr b).toList ++ ',' :: ' ' :: ((ppMSLExpr c).toList ++ ')' :: rest))) =
+      some (a, ',' :: ' ' :: ((ppMSLExpr b).toList ++ ',' :: ' ' ::
+        ((ppMSLExpr c).toList ++ ')' :: rest))))
+    (pb : parseMSLExpr (fuel + 1) ((ppMSLExpr b).toList ++ ',' :: ' ' ::
+      ((ppMSLExpr c).toList ++ ')' :: rest)) =
+      some (b, ',' :: ' ' :: ((ppMSLExpr c).toList ++ ')' :: rest)))
+    (pc : parseMSLExpr fuel ((ppMSLExpr c).toList ++ ')' :: rest) = some (c, ')' :: rest)) :
+    parseMSLExprArgs (fuel + 3) ((ppMSLExpr a).toList ++ ',' :: ' ' ::
+      ((ppMSLExpr b).toList ++ ',' :: ' ' :: ((ppMSLExpr c).toList ++ ')' :: rest))) =
+      some (.cons a (.cons b (.cons c .nil)), rest) :=
+  parseMSLExprArgs_cons_step a ha _ _ rest (fuel + 2) pa
+    (parseMSLExprArgs_cons_step b hb _ _ rest (fuel + 1) pb
+      (parseMSLExprArgs_singleton_step c hc rest fuel pc))
+
+theorem parseMSLAttr_roundtrip (attr : MSLAttr) (fuel : Nat) :
+    parseMSLAttr (fuel + 1) (ppMSLAttr attr).toList = some attr := by
+  cases attr with
+  | buffer n =>
+    simpa [ppMSLAttr, parseMSLAttr, String.toList_append, List.reverse_append,
+      toString, Nat.repr] using Nat.toNat?_repr n
+  | _ => rfl
+
+theorem ppMSLAttr_injective_via_parser : Function.Injective ppMSLAttr := by
+  intro a b h
+  have hp := congrArg (fun s : String => parseMSLAttr 1 s.toList) h
+  simpa only [parseMSLAttr_roundtrip, Option.some.injEq] using hp
+
 /-- `writeDeviceBuffer` never alters `constantBuffers` or `threadgroupArrays`. -/
 theorem writeDeviceBuffer_preserves_const_and_tg (g g' : MSLGroupState)
     (bufIdx : Nat) (elemTy : MSLType) (elemIdx : Nat) (val : BitVec 64)

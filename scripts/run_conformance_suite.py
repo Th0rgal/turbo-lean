@@ -130,7 +130,7 @@ def run_c1_corpus(asan: bool, ubsan: bool) -> dict[str, Any]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--fuzz-seeds", type=int, default=50)
+    parser.add_argument("--fuzz-seeds", "--seeds", dest="fuzz_seeds", type=int, default=50)
     parser.add_argument(
         "--tier",
         "--tiers",

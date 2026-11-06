@@ -1,4 +1,5 @@
 import LeanNative.Backend.MetalAst.Syntax
+import Std.Data.String.ToNat
 
 namespace LeanNative.Backend.MetalAst
 
@@ -2171,6 +2172,23 @@ def hexDigitMSL (n : Nat) : Char :=
   | 8 => '8' | 9 => '9' | 10 => 'A' | 11 => 'B'
   | 12 => 'C' | 13 => 'D' | 14 => 'E' | _ => 'F'
 
+/-- Parse a complete attribute token. No trailing characters are accepted. -/
+def parseMSLAttr : Nat → List Char → Option MSLAttr
+  | 0, _ => none
+  | _ + 1, 'b' :: 'u' :: 'f' :: 'f' :: 'e' :: 'r' :: '(' :: cs =>
+    match cs.reverse with
+    | ')' :: digits => (String.ofList digits.reverse).toNat?.map MSLAttr.buffer
+    | _ => none
+  | _ + 1, cs =>
+    let s := String.ofList cs
+    if s == "thread_position_in_grid" then some .threadPositionInGrid
+    else if s == "thread_position_in_threadgroup" then some .threadPositionInThreadgroup
+    else if s == "threadgroup_position_in_grid" then some .threadgroupPositionInGrid
+    else if s == "threads_per_threadgroup" then some .threadsPerThreadgroup
+    else if s == "thread_index_in_simdgroup" then some .threadIndexInSimdgroup
+    else if s == "simdgroup_index_in_threadgroup" then some .simdgroupIndexInThreadgroup
+    else none
+
 def hexNibblesMSL (v : Nat) : Nat → List Char
   | 0 => []
   | k + 1 => hexDigitMSL (v >>> (k * 4)) :: hexNibblesMSL v k
@@ -2368,5 +2386,310 @@ def ppMSLModule (m : MSLModule) : String :=
   match blocks with
   | [] => ppMSLModuleHeader ++ "\n"
   | bs => ppMSLModuleHeader ++ "\n\n" ++ String.intercalate "\n\n" bs ++ "\n"
+
+/-- Exact character-prefix consumption for the MSL grammar. -/
+def stripPrefixChars : List Char → List Char → Option (List Char)
+  | [], input => some input
+  | _ :: _, [] => none
+  | p :: ps, c :: cs => if p == c then stripPrefixChars ps cs else none
+
+def mslNameChar (c : Char) : Bool := c.isAlphanum || c == '_'
+
+/-- Identifier spellings disjoint from literals and the scalar parser's reserved forms. -/
+def CanonicalMSLName (name : String) : Prop :=
+  (∃ c cs, name.toList = c :: cs ∧ (c.isAlpha || c == '_') = true) ∧
+  (∀ c ∈ name.toList, mslNameChar c = true) ∧
+  name ≠ "true" ∧ name ≠ "false" ∧ (['L', 'U'].isPrefixOf name.toList.reverse) = false ∧
+  ¬ "clz(".toList.isPrefixOf name.toList
+
+def scanMSLName : Nat → List Char → Option (List Char × List Char)
+  | 0, _ => none
+  | _ + 1, [] => some ([], [])
+  | fuel + 1, c :: cs =>
+    if mslNameChar c then do
+      let (name, rest) ← scanMSLName fuel cs
+      return (c :: name, rest)
+    else some ([], c :: cs)
+
+/-- Expression boundaries cannot continue an identifier or start a postfix operation. -/
+def ValidMSLExprSuffix : List Char → Prop
+  | [] => True
+  | c :: _ => c = ')' ∨ c = ',' ∨ c = ';' ∨ c = ']' ∨ c = ' '
+
+def mslBinary : String → Option (MSLExpr → MSLExpr → MSLExpr)
+  | "+" => some .add | "-" => some .sub | "*" => some .mul | "/" => some .div
+  | "%" => some .rem | "&" => some .bitAnd | "|" => some .bitOr | "^" => some .bitXor
+  | "<<" => some .shl | ">>" => some .shr | "&&" => some .logAnd | "||" => some .logOr
+  | "==" => some .eq | "!=" => some .ne | "<" => some .lt | "<=" => some .le
+  | ">" => some .gt | ">=" => some .ge | _ => none
+
+def parseMSLScalarType : String → Option MSLType
+  | "void" => some .void | "bool" => some .bool | "uchar" => some .uchar
+  | "ushort" => some .ushort | "uint" => some .uint | "int" => some .int
+  | "ulong" => some .ulong | "long" => some .long | "half" => some .half
+  | "float" => some .float | "double" => some .double
+  | "uint2" => some .uint2 | "uint3" => some .uint3 | "uint4" => some .uint4
+  | "ulong2" => some .ulong2 | "atomic_uint" => some .atomicUint | "ln_u256" => some .u256
+  | _ => none
+
+/-- Collision-free scalar fragment: identifiers cannot be literal spellings, casts
+use builtin scalar types, and the ambiguous general call/struct constructors are excluded. -/
+def CanonicalMSLExpr : MSLExpr → Prop
+  | .var name => CanonicalMSLName name
+  | .immU64 _ | .immBool _ => True
+  | .bitNot a | .logNot a | .neg a | .clz a => CanonicalMSLExpr a
+  | .cast ty a => (ty = .ulong ∨ ty = .long ∨ ty = .uint) ∧ CanonicalMSLExpr a
+  | .add a b | .sub a b | .mul a b | .div a b | .rem a b
+  | .bitAnd a b | .bitOr a b | .bitXor a b | .shl a b | .shr a b
+  | .logAnd a b | .logOr a b | .eq a b | .ne a b | .lt a b | .le a b
+  | .gt a b | .ge a b => CanonicalMSLExpr a ∧ CanonicalMSLExpr b
+  | .select a b c | .builtinSelect a b c | .fma a b c =>
+    CanonicalMSLExpr a ∧ CanonicalMSLExpr b ∧ CanonicalMSLExpr c
+  | .index name idx => CanonicalMSLName name ∧ CanonicalMSLExpr idx
+  | _ => False
+
+mutual
+/-- Parse the fully parenthesized scalar MSL grammar. Every recursive descent consumes fuel. -/
+def parseMSLExpr : Nat → List Char → Option (MSLExpr × List Char)
+  | 0, _ => none
+  | fuel + 1, input => do
+    match input with
+    | '(' :: '(' :: input =>
+      let typeChars := input.takeWhile mslNameChar
+      let afterType := input.drop typeChars.length
+      if let (some ty, some rest) :=
+          (parseMSLScalarType (String.ofList typeChars), stripPrefixChars [')'] afterType) then
+        let (arg, rest) ← parseMSLExpr fuel rest
+        return (.cast ty arg, ← stripPrefixChars [')'] rest)
+      else do
+        let (a, rest) ← parseMSLExpr fuel ('(' :: input)
+        parseMSLExprTail fuel a rest
+    | '(' :: '~' :: rest =>
+      let (a, rest) ← parseMSLExpr fuel rest
+      return (.bitNot a, ← stripPrefixChars [')'] rest)
+    | '(' :: '!' :: rest =>
+      let (a, rest) ← parseMSLExpr fuel rest
+      return (.logNot a, ← stripPrefixChars [')'] rest)
+    | '(' :: '-' :: rest =>
+      let (a, rest) ← parseMSLExpr fuel rest
+      return (.neg a, ← stripPrefixChars [')'] rest)
+    | '(' :: rest =>
+      let (a, rest) ← parseMSLExpr fuel rest
+      parseMSLExprTail fuel a rest
+    | _ =>
+      let (chars, rest) ← scanMSLName fuel input
+      if chars.isEmpty then none else do
+        let name := String.ofList chars
+        if name == "true" then return (.immBool true, rest)
+        if name == "false" then return (.immBool false, rest)
+        if ['L', 'U'].isPrefixOf name.toList.reverse then
+          let n ← (String.ofList (chars.take (chars.length - 2))).toNat?
+          if n < 2^64 then return (.immU64 (BitVec.ofNat 64 n), rest) else none
+        else if let '[' :: input := rest then
+          let (idx, rest) ← parseMSLExpr fuel input
+          return (.index name idx, ← stripPrefixChars [']'] rest)
+        else if let '(' :: input := rest then
+          let (args, rest) ← parseMSLExprArgs fuel input
+          match name, args with
+          | "clz", .cons a .nil => return (.clz a, rest)
+          | "select", .cons a (.cons b (.cons c .nil)) => return (.builtinSelect a b c, rest)
+          | "fma", .cons a (.cons b (.cons c .nil)) => return (.fma a b c, rest)
+          | _, _ => return (.call name args, rest)
+        else return (.var name, rest)
+
+def parseMSLExprTail : Nat → MSLExpr → List Char → Option (MSLExpr × List Char)
+  | 0, _, _ => none
+  | fuel + 1, a, rest => do
+    if let some rest := stripPrefixChars [' ', '?', ' '] rest then
+      let (b, rest) ← parseMSLExpr fuel rest
+      let rest ← stripPrefixChars [' ', ':', ' '] rest
+      let (c, rest) ← parseMSLExpr fuel rest
+      return (.select a b c, ← stripPrefixChars [')'] rest)
+    let rest ← stripPrefixChars [' '] rest
+    let op := rest.takeWhile (· != ' ')
+    let rest ← stripPrefixChars (op ++ [' ']) rest
+    let ctor ← mslBinary (String.ofList op)
+    let (b, rest) ← parseMSLExpr fuel rest
+    return (ctor a b, ← stripPrefixChars [')'] rest)
+
+def parseMSLExprArgs : Nat → List Char → Option (MSLExprList × List Char)
+  | 0, _ => none
+  | fuel + 1, input => do
+    if let ')' :: rest := input then return (.nil, rest)
+    let (arg, rest) ← parseMSLExpr fuel input
+    if let ')' :: rest := rest then return (.cons arg .nil, rest)
+    let rest ← stripPrefixChars [',', ' '] rest
+    let (args, rest) ← parseMSLExprArgs fuel rest
+    return (.cons arg args, rest)
+end
+
+/-- Parse simple statement syntax; structured control flow is handled by `parseMSLStmt`. -/
+def parseMSLSimpleStmt (fuel : Nat) (input : List Char) : Option (MSLStmt × List Char) := do
+  if let some rest := stripPrefixChars "return;".toList input then return (.returnStmt, rest)
+  if let some rest := stripPrefixChars "return ".toList input then
+    let (e, rest) ← parseMSLExpr fuel rest
+    return (.returnVal e, ← stripPrefixChars [';'] rest)
+  if let some rest := stripPrefixChars "threadgroup_barrier(mem_flags::mem_threadgroup);".toList input then
+    return (.threadgroupBarrier, rest)
+  let (chars, rest) ← scanMSLName fuel input
+  if chars.isEmpty then none else do
+    let name := String.ofList chars
+    if let some ty := parseMSLScalarType name then
+      let rest ← stripPrefixChars [' '] rest
+      let (dst, rest) ← scanMSLName fuel rest
+      if dst.isEmpty then none else do
+        let rest ← stripPrefixChars " = ".toList rest
+        let (rhs, rest) ← parseMSLExpr fuel rest
+        return (.varDecl ty (String.ofList dst) rhs, ← stripPrefixChars [';'] rest)
+    else if let '[' :: rest := rest then
+      let (idx, rest) ← parseMSLExpr fuel rest
+      let rest ← stripPrefixChars "] = ".toList rest
+      let (rhs, rest) ← parseMSLExpr fuel rest
+      return (.indexAssign name idx rhs, ← stripPrefixChars [';'] rest)
+    else if let some rest := stripPrefixChars " = ".toList rest then
+      let (rhs, rest) ← parseMSLExpr fuel rest
+      return (.assign name rhs, ← stripPrefixChars [';'] rest)
+    else
+      let (e, rest) ← parseMSLExpr fuel input
+      return (.exprStmt e, ← stripPrefixChars [';'] rest)
+
+mutual
+/-- Parse the exact indentation and brace layout emitted for scalar blocks. -/
+def parseMSLStmt : Nat → String → List Char → Option (MSLStmt × List Char)
+  | 0, _, _ => none
+  | fuel + 1, indent, input => do
+    let input ← stripPrefixChars indent.toList input
+    if let some rest := stripPrefixChars "if (".toList input then
+      let (cond, rest) ← parseMSLExpr fuel rest
+      let rest ← stripPrefixChars ") {\n".toList rest
+      let (yes, rest) ← parseMSLBlock fuel (indent ++ "    ") rest
+      let rest ← stripPrefixChars ("\n" ++ indent ++ "}").toList rest
+      if let some rest := stripPrefixChars " else {\n".toList rest then
+        let (no, rest) ← parseMSLBlock fuel (indent ++ "    ") rest
+        return (.ifElse cond yes no, ← stripPrefixChars ("\n" ++ indent ++ "}").toList rest)
+      else return (.ifElse cond yes .nil, rest)
+    else parseMSLSimpleStmt fuel input
+
+def parseMSLBlock : Nat → String → List Char → Option (MSLBlock × List Char)
+  | 0, _, _ => none
+  | fuel + 1, indent, input => do
+    if !(stripPrefixChars indent.toList input).isSome then return (.nil, input)
+    let (stmt, rest) ← parseMSLStmt fuel indent input
+    if let '\n' :: next := rest then
+      if (stripPrefixChars indent.toList next).isSome then
+        let (body, rest) ← parseMSLBlock fuel indent next
+        return (.cons stmt body, rest)
+      else return (.cons stmt .nil, rest)
+    else return (.cons stmt .nil, rest)
+end
+
+#guard parseMSLStmt 128 "    " "    if ((v0 < v1)) {\n        return v0;\n    } else {\n        return v1;\n    }".toList =
+  some (.ifElse (.lt (.var "v0") (.var "v1"))
+    (.cons (.returnVal (.var "v0")) .nil) (.cons (.returnVal (.var "v1")) .nil), [])
+
+#guard parseMSLExpr 64 "((v1 == 0UL) ? 0UL : (v0 / v1))".toList =
+  some (.select (.eq (.var "v1") (.immU64 0)) (.immU64 0) (.div (.var "v0") (.var "v1")), [])
+#guard parseMSLExpr 64 "(v0 << (v1 & 63UL))".toList =
+  some (.shl (.var "v0") (.bitAnd (.var "v1") (.immU64 63)), [])
+
+/-- Types used by the scalar kernel ABI, including canonical constant pointers. -/
+def parseMSLParamType (text : String) : Option MSLType := do
+  if let some ty := parseMSLScalarType text then return ty
+  let (space, chars) ← match text.toList with
+    | 'd' :: 'e' :: 'v' :: 'i' :: 'c' :: 'e' :: ' ' :: rest => some (MSLAddressSpace.device, rest)
+    | 'c' :: 'o' :: 'n' :: 's' :: 't' :: 'a' :: 'n' :: 't' :: ' ' :: rest => some (.constant, rest)
+    | 't' :: 'h' :: 'r' :: 'e' :: 'a' :: 'd' :: ' ' :: rest => some (.thread, rest)
+    | 't' :: 'h' :: 'r' :: 'e' :: 'a' :: 'd' :: 'g' :: 'r' :: 'o' :: 'u' :: 'p' :: ' ' :: rest => some (.threadgroup, rest)
+    | _ => none
+  let (isConst, chars) := match chars with
+    | 'c' :: 'o' :: 'n' :: 's' :: 't' :: ' ' :: rest => (true, rest)
+    | _ => (false, chars)
+  let suffix :: rev := chars.reverse | none
+  let ty ← parseMSLScalarType (String.ofList rev.reverse)
+  if suffix == '*' then return .pointer space isConst ty
+  else if suffix == '&' && !isConst then return .ref space ty else none
+
+/-- Builtin value types have distinct keywords; user-defined structure names are
+excluded because they can collide with these keywords. -/
+def CanonicalMSLValueType : MSLType → Prop
+  | .pointer .. | .ref .. | .threadArr .. | .structTy .. => False
+  | _ => True
+
+/-- The scalar kernel ABI uses builtin values and one-level pointers/references.
+The constant-space pointer's erased const bit has the unique representative `false`. -/
+def CanonicalMSLType : MSLType → Prop
+  | .pointer sp isConst elem =>
+    CanonicalMSLValueType elem ∧ (sp = .constant → isConst = false)
+  | .ref _ elem => CanonicalMSLValueType elem
+  | ty => CanonicalMSLValueType ty
+
+/-- Assignment targets must not be mistaken for declaration or statement keywords. -/
+def CanonicalMSLBindingName (name : String) : Prop :=
+  CanonicalMSLName name ∧ parseMSLScalarType name = none ∧
+    name ≠ "return" ∧ name ≠ "threadgroup_barrier"
+
+mutual
+/-- Statement grammar emitted by the scalar parallel-kernel lowerer. -/
+def CanonicalMSLStmt : MSLStmt → Prop
+  | .varDecl ty name rhs =>
+    CanonicalMSLValueType ty ∧ CanonicalMSLName name ∧ CanonicalMSLExpr rhs
+  | .assign name rhs => CanonicalMSLBindingName name ∧ CanonicalMSLExpr rhs
+  | .indexAssign name idx rhs =>
+    CanonicalMSLBindingName name ∧ CanonicalMSLExpr idx ∧ CanonicalMSLExpr rhs
+  | .ifElse cond yes no =>
+    CanonicalMSLExpr cond ∧ CanonicalMSLBlock yes ∧ CanonicalMSLBlock no
+  | .returnVal e => CanonicalMSLExpr e
+  | .returnStmt | .threadgroupBarrier => True
+  | _ => False
+
+def CanonicalMSLBlock : MSLBlock → Prop
+  | .nil => True
+  | .cons stmt rest => CanonicalMSLStmt stmt ∧ CanonicalMSLBlock rest
+end
+
+def CanonicalMSLKernel (kernel : MSLKernelDecl) : Prop :=
+  CanonicalMSLName kernel.name ∧
+  (∀ param ∈ kernel.params, CanonicalMSLType param.ty ∧ CanonicalMSLName param.name) ∧
+  kernel.sharedDecls = [] ∧ ∀ stmt ∈ kernel.body, CanonicalMSLStmt stmt
+
+/-- Split a delimiter-terminated token without consuming the delimiter. -/
+def scanMSLToken (delimiter : Char) : List Char → List Char × List Char
+  | [] => ([], [])
+  | c :: cs => if c == delimiter then ([], c :: cs) else
+    let (token, rest) := scanMSLToken delimiter cs
+    (c :: token, rest)
+
+/-- Parse an ABI type in a cast, leaving its closing parenthesis unconsumed. -/
+def parseMSLType (input : List Char) : Option (MSLType × List Char) := do
+  let (token, rest) := scanMSLToken ')' input
+  return (← parseMSLParamType (String.ofList token), rest)
+
+def parseMSLParam (fuel : Nat) (text : String) : Option MSLParamDecl := do
+  let (decl, attr) ← match text.splitOn " [[" with
+    | [decl] => some (decl, none)
+    | [decl, attr] => do
+      let ']' :: ']' :: rev := attr.toList.reverse | none
+      pure (decl, some (← parseMSLAttr fuel rev.reverse))
+    | _ => none
+  let words := decl.trimAscii.toString.splitOn " "
+  let name ← words.getLast?
+  if name.isEmpty || !(name.toList.all mslNameChar) then none else do
+    let ty ← parseMSLParamType (String.intercalate " " words.dropLast)
+    return { name, ty, attr }
+
+/-- Scalar kernel parser. Shared arrays and unsupported statement constructors fail closed. -/
+def parseMSLKernel (fuel : Nat) (text : String) : Option MSLKernelDecl := do
+  let header :: lines := text.splitOn "\n" | none
+  let chars ← stripPrefixChars "kernel void ".toList header.toList
+  let (name, rest) ← scanMSLName fuel chars
+  if rest != ['('] || name.isEmpty then none else do
+    let paramLines := lines.takeWhile (· != ") {")
+    let ") {" :: lines := lines.drop paramLines.length | none
+    let params ← (if paramLines == [""] then some [] else paramLines.mapM fun line => do
+      let chars := if line.endsWith "," then line.toList.take (line.length - 1) else line.toList
+      parseMSLParam fuel (String.ofList chars))
+    let (body, rest) ← parseMSLBlock fuel "    " (String.intercalate "\n" lines).toList
+    if rest != "\n}".toList then none
+    else return { name := String.ofList name, params, body := body.toList }
 
 end LeanNative.Backend.MetalAst

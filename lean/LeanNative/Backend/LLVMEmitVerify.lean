@@ -21,6 +21,16 @@ open LeanNative.Backend.TargetIR
 open LeanNative.Backend.LLVM
 open LeanNative.Backend.LLVMAst
 
+theorem emitDeclLLVMViaAST_matches_lowering (d : LNIRDecl) :
+    emitDeclLLVMViaAST d = LLVMLower.ppLoweredDeclWithFacts d := by
+  unfold emitDeclLLVMViaAST LLVMLower.ppLoweredDeclWithFacts
+  cases LLVMLower.lowerModuleWithFacts d <;> rfl
+
+theorem emitDeclLLVMViaAST_of_lowered (d : LNIRDecl) (m : LLVMModule)
+    (h : LLVMLower.lowerModuleWithFacts d = some m) :
+    emitDeclLLVMViaAST d = some (PP.ppModule m) := by
+  simp [emitDeclLLVMViaAST, h]
+
 def dropStr (s : String) (n : Nat) : String :=
   (s.drop n).toString
 

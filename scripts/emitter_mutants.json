@@ -120,8 +120,8 @@
       "id": "M1",
       "backend": "llvm",
       "file": "lean/LeanNative/Backend/LLVM.lean",
-      "search": "| .sub    => emitLine s!\"  {res} = sub {tyStr} {lVal}, {rVal}\"; return res",
-      "replace": "| .sub    => emitLine s!\"  {res} = sub {tyStr} {rVal}, {lVal}\"; return res",
+      "search": "emitLine s!\"  {res} = sub{fl} {tyStr} {lVal}, {rVal}\"; return res",
+      "replace": "emitLine s!\"  {res} = sub{fl} {tyStr} {rVal}, {lVal}\"; return res",
       "expected_match_count": 1
     },
     {
@@ -167,33 +167,33 @@
     {
       "id": "M7",
       "backend": "ptx",
-      "file": "lean/LeanNative/Backend/MLIRGPU.lean",
-      "search": "| .sub | .subChecked256 => ([s!\"    sub.u64      {dst}, {lReg}, {rReg};\"], r2 + 1, p2)",
-      "replace": "| .sub | .subChecked256 => ([s!\"    sub.u64      {dst}, {rReg}, {lReg};\"], r2 + 1, p2)",
+      "file": "lean/LeanNative/Backend/PTXLower.lean",
+      "search": "| .sub | .subChecked256 => arith (.sub .u64 d.name lo ro)",
+      "replace": "| .sub | .subChecked256 => arith (.sub .u64 d.name ro lo)",
       "expected_match_count": 1
     },
     {
       "id": "M8",
       "backend": "ptx",
-      "file": "lean/LeanNative/Backend/MLIRGPU.lean",
-      "search": "| .lt => ([s!\"    setp.lt.u64  %p{p2}, {lReg}, {rReg};\\n    selp.u64     {dst}, 1, 0, %p{p2};\"], r2 + 1, p2 + 1)",
-      "replace": "| .lt => ([s!\"    setp.le.u64  %p{p2}, {lReg}, {rReg};\\n    selp.u64     {dst}, 1, 0, %p{p2};\"], r2 + 1, p2 + 1)",
+      "file": "lean/LeanNative/Backend/PTXLower.lean",
+      "search": "let cmp := match op with | .lt => PTXCmpOp.lt | .le => .le | _ => .eq",
+      "replace": "let cmp := match op with | .lt => PTXCmpOp.le | .le => .le | _ => .eq",
       "expected_match_count": 1
     },
     {
       "id": "M9",
       "backend": "metal",
-      "file": "lean/LeanNative/Backend/Metal.lean",
-      "search": "| .div => s!\"(({rs} == 0UL) ? 0UL : ({ls} / {rs}))\"",
-      "replace": "| .div => s!\"({ls} / {rs})\"",
+      "file": "lean/LeanNative/Backend/MetalLower.lean",
+      "search": "| .div => .select (.eq rs (u 0)) (u 0) (.div ls rs)",
+      "replace": "| .div => .div ls rs",
       "expected_match_count": 1
     },
     {
       "id": "M10",
       "backend": "metal",
-      "file": "lean/LeanNative/Backend/Metal.lean",
-      "search": "| .shl => s!\"({ls} << ({rs} & 63UL))\"",
-      "replace": "| .shl => s!\"({ls} << ({rs} & 31UL))\"",
+      "file": "lean/LeanNative/Backend/MetalLower.lean",
+      "search": "def m63 (e : MSLExpr) : MSLExpr := .bitAnd e (u 63)",
+      "replace": "def m63 (e : MSLExpr) : MSLExpr := .bitAnd e (u 31)",
       "expected_match_count": 1
     },
     {

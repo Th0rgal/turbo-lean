@@ -35,7 +35,25 @@ open LeanNative.Backend.GPUEmitVerify
 set_option maxRecDepth 262144
 set_option maxHeartbeats 1600000
 
+theorem production_customScalar_emitter_wired (name : String) (iv : VarId)
+    (inputs : List VarId) (body : ScalarExpr)
+    (hneDot : (name == "lean_native_decl_dot_product_u64") = false)
+    (hneMat : (name == "lean_native_decl_matmul_tiled_u64") = false) :
+    emitPTXDeclKernel name (.customScalar iv inputs body) =
+      ppPTXKernel (LeanNative.Backend.PTXLower.lowerKind name (.customScalar iv inputs body)) := by
+  simp [emitPTXDeclKernel, hneDot, hneMat]
+
 #guard verifyGPUEmitters = true
+
+/- Exercise the shared target-AST parser on the live lowerer's complete scalar kernel. -/
+#guard (let k := LeanNative.Backend.MetalLower.lowerKind "copy" .zipAdd
+  LeanNative.Backend.MetalAst.parseMSLKernel 512 (ppMSLKernel k) = some k)
+#guard (let k := LeanNative.Backend.PTXLower.lowerKind "copy" .zipAdd
+  LeanNative.Backend.PTXAst.parsePTXKernel 512 (ppPTXKernel k) = some k)
+#guard (let k := LeanNative.Backend.MetalLower.lowerKind "division" (.customScalar 9 [0, 1] (.binOp .div (.var 0) (.var 1)))
+  LeanNative.Backend.MetalAst.parseMSLKernel 512 (ppMSLKernel k) = some k)
+#guard (let k := LeanNative.Backend.MetalLower.lowerKind "shift" (.customScalar 9 [0, 1] (.binOp .shl (.var 0) (.var 1)))
+  LeanNative.Backend.MetalAst.parseMSLKernel 512 (ppMSLKernel k) = some k)
 
 #guard (let mod : LNIRModule :=
           { moduleName := "M6", decls := [ptxProbeDecl "emit_shl" (.binOp .shl (.var 0) (.var 1))] }
@@ -48,8 +66,8 @@ set_option maxHeartbeats 1600000
 #guard (let mod : LNIRModule :=
           { moduleName := "M7", decls := [ptxProbeDecl "emit_sub" (.binOp .sub (.var 0) (.var 1))] }
         let ptx := emitPTXModule mod
-        let ptxMut := ptx.replace "    sub.u64      %rd10, %rd8, %rd9;"
-          "    sub.u64      %rd10, %rd9, %rd8;"
+        let ptxMut := ptx.replace "    sub.u64 %rd9, %rd7, %rd8;"
+          "    sub.u64 %rd9, %rd8, %rd7;"
         let exp : List UInt64 := [3, (1 : UInt64) - 4]
         ptxMut != ptx && probePTX ptx "emit_sub" 2 2 200 [[5, 1], [2, 4]] exp &&
         !(probePTX ptxMut "emit_sub" 2 2 200 [[5, 1], [2, 4]] exp)) = true
@@ -77,7 +95,7 @@ set_option maxHeartbeats 1600000
 
 #guard ((emitPTXDeclKernel "lean_native_decl_emit_sub"
           (.customScalar 9 [0, 1] (.binOp .sub (.var 0) (.var 1)))).replace
-          "    sub.u64      %rd10, %rd8, %rd9;" "    sub.u64      %rd10, %rd9, %rd8;" !=
+          "    sub.u64 %rd9, %rd7, %rd8;" "    sub.u64 %rd9, %rd8, %rd7;" !=
         emitPTXDeclKernel "lean_native_decl_emit_sub"
           (.customScalar 9 [0, 1] (.binOp .sub (.var 0) (.var 1)))) = true
 

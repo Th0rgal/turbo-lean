@@ -5,6 +5,31 @@ namespace LeanNative.Backend.StableHLOAst
 
 open LeanNative.IR
 
+/-- Successful body parsing respects the printer's environment update at every step. -/
+theorem parseBody_cons (tenv : TypeEnv) (line : String) (lines : List String)
+    (op : StableHLOOp) (ops : List StableHLOOp)
+    (hop : parseStableHLOOp tenv line = some op)
+    (hrest : parseBody (bindResult tenv op) lines = some ops) :
+    parseBody tenv (("    " ++ line) :: lines) = some (op :: ops) := by
+  simp [parseBody, String.toList_append, hop, hrest]
+
+/-- An identifier token recovers exactly its nonempty alphanumeric/underscore payload. -/
+theorem parseSSAName_roundtrip (name : String) (hne : name.toList.isEmpty = false)
+    (hchars : name.toList.all (fun c => c.isAlphanum || c == '_') = true) :
+    parseSSAName ("%" ++ name) = some name := by
+  simp [parseSSAName, String.toList_append, hne, hchars]
+
+/-- A closing tensor delimiter disambiguates `i1` from `i16`. -/
+theorem parseElemType_roundtrip (ty : ElemType) (fuel : Nat) (rest : List Char) :
+    parseElemType (fuel + 1) ((ppElemType ty).toList ++ '>' :: rest) =
+      some (ty, '>' :: rest) := by
+  cases ty <;> rfl
+
+theorem ppElemType_injective_via_parser : Function.Injective ppElemType := by
+  intro a b h
+  have hp := congrArg (fun s : String => parseElemType 1 (s.toList ++ ['>'])) h
+  simpa only [parseElemType_roundtrip, Option.some.injEq, Prod.mk.injEq, and_true] using hp
+
 theorem numElements_scalar (e : ElemType) :
     ({ shape := [], elem := e : TensorType }).numElements = 1 := rfl
 

@@ -731,6 +731,28 @@ def run_unit_tests() -> bool:
                 self.root, os.environ.copy(), self.root / "command.log", self.spec["infra_signatures"],
             )
 
+        def test_active_mutants_apply_to_current_sources(self):
+            active = [m for m in self.spec["mutations"] if not m.get("not_applicable")]
+            self.assertEqual({m["id"] for m in active}, {f"M{i}" for i in range(1, 11)})
+            for mutation in active:
+                with self.subTest(mutant=mutation["id"]):
+                    self.assertEqual(mutation["expected_match_count"], 1)
+                    source = ROOT / mutation["file"]
+                    target = self.root / mutation["file"]
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, target)
+                    before = target.read_text(encoding="utf-8")
+                    self.assertEqual(before.count(mutation["search"]), 1)
+                    # Isolate application from the checkout and only mock the
+                    # reporting diff; exercise the runner's real patch function.
+                    with patch(__name__ + ".git", return_value=subprocess.CompletedProcess([], 0, "fixture diff", "")):
+                        count, diff = apply_patch(self.root, mutation)
+                    self.assertEqual(count, 1)
+                    self.assertTrue(diff)
+                    self.assertEqual(target.read_text(encoding="utf-8"),
+                        before.replace(mutation["search"], mutation["replace"], 1))
+                    self.assertNotEqual(target.read_text(encoding="utf-8"), before)
+
         def rows(self) -> list[dict]:
             return [{"id": mid, "backend": "llvm", "outcome": "SURVIVED"} for mid in COMPARISON_UNIVERSE]
 

@@ -9,6 +9,23 @@ def ppElemType : ElemType → String
   | .ui8 => "ui8" | .ui16 => "ui16" | .ui32 => "ui32" | .ui64 => "ui64"
   | .f32 => "f32" | .f64 => "f64" | .bf16 => "bf16"
 
+/-- Parse an element-type token, longest tokens first. -/
+def parseElemType : Nat → List Char → Option (ElemType × List Char)
+  | 0, _ => none
+  | _ + 1, 'i' :: '1' :: '6' :: cs => some (.i16, cs)
+  | _ + 1, 'i' :: '1' :: cs => some (.i1, cs)
+  | _ + 1, 'i' :: '8' :: cs => some (.i8, cs)
+  | _ + 1, 'i' :: '3' :: '2' :: cs => some (.i32, cs)
+  | _ + 1, 'i' :: '6' :: '4' :: cs => some (.i64, cs)
+  | _ + 1, 'u' :: 'i' :: '8' :: cs => some (.ui8, cs)
+  | _ + 1, 'u' :: 'i' :: '1' :: '6' :: cs => some (.ui16, cs)
+  | _ + 1, 'u' :: 'i' :: '3' :: '2' :: cs => some (.ui32, cs)
+  | _ + 1, 'u' :: 'i' :: '6' :: '4' :: cs => some (.ui64, cs)
+  | _ + 1, 'f' :: '3' :: '2' :: cs => some (.f32, cs)
+  | _ + 1, 'f' :: '6' :: '4' :: cs => some (.f64, cs)
+  | _ + 1, 'b' :: 'f' :: '1' :: '6' :: cs => some (.bf16, cs)
+  | _, _ => none
+
 def ppShape (shape : List Nat) : String :=
   String.intercalate "x" (shape.map toString)
 
@@ -1022,5 +1039,128 @@ def evalModuleOp (m : ModuleOp) (func : String) (args : List TensorVal) :
   match m.funcs.find? fun f => f.name == func with
   | none => .error (.unbound func)
   | some f => evalFuncOp f args
+
+/-- Parse a statically shaped tensor type and require complete token consumption. -/
+def parseTensorType (text : String) : Option TensorType := do
+  let 't' :: 'e' :: 'n' :: 's' :: 'o' :: 'r' :: '<' :: chars := text.toList | none
+  let '>' :: rev := chars.reverse | none
+  let parts := (String.ofList rev.reverse).splitOn "x"
+  let elemText ← parts.getLast?
+  let (elem, []) ← parseElemType 1 elemText.toList | none
+  let shape ← parts.dropLast.mapM String.toNat?
+  return { shape, elem }
+
+def parseSSAName (text : String) : Option String := do
+  let '%' :: chars := text.toList | none
+  if chars.isEmpty || !(chars.all fun c => c.isAlphanum || c == '_') then none
+  else some (String.ofList chars)
+
+def parseNatList (text : String) : Option (List Nat) := do
+  let '[' :: chars := text.toList | none
+  let ']' :: rev := chars.reverse | none
+  if rev.isEmpty then some []
+  else (String.ofList rev.reverse).splitOn ", " |>.mapM String.toNat?
+
+/-- Parse binary operation syntax independently of its type annotation. -/
+def parseBinaryOp (opcode dst a b : String) : Option StableHLOOp :=
+  match opcode with
+  | "stablehlo.add" => some (.add dst a b)
+  | "stablehlo.subtract" => some (.subtract dst a b)
+  | "stablehlo.multiply" => some (.multiply dst a b)
+  | "stablehlo.divide" => some (.divide dst a b)
+  | "stablehlo.remainder" => some (.remainder dst a b)
+  | "stablehlo.maximum" => some (.maximum dst a b)
+  | "stablehlo.minimum" => some (.minimum dst a b)
+  | "stablehlo.and" => some (.and dst a b)
+  | "stablehlo.or" => some (.or dst a b)
+  | "stablehlo.xor" => some (.xor dst a b)
+  | "stablehlo.shift_left" => some (.shiftLeft dst a b)
+  | "stablehlo.shift_right_arithmetic" => some (.shiftRightArithmetic dst a b)
+  | "stablehlo.shift_right_logical" => some (.shiftRightLogical dst a b)
+  | _ => none
+
+/-- Constant/binary/unbatched-dot/return fragment parser. Type annotations agree with the supplied SSA
+environment; unknown or ill-typed operands are rejected rather than using printer defaults. -/
+def parseStableHLOOp (tenv : TypeEnv) (text : String) : Option StableHLOOp := do
+  let [operation, annotation] := text.splitOn " : " | none
+  if let [dst, payload] := operation.splitOn " = stablehlo.dot_general " then
+    let dst ← parseSSAName dst
+    let [args, contraction] := payload.splitOn ", contracting_dims = " | none
+    let [a, b] := args.splitOn ", " | none
+    let a ← parseSSAName a
+    let b ← parseSSAName b
+    let [lc, rc] := contraction.splitOn " x " | none
+    let lc ← parseNatList lc
+    let rc ← parseNatList rc
+    let [_, outType] := annotation.splitOn " -> " | none
+    let ty ← parseTensorType outType
+    let op := StableHLOOp.dotGeneral dst a b [] [] lc rc ty.shape
+    let ta ← tenv a
+    let tb ← tenv b
+    let inferred ← resultTypeOf tenv op
+    if inferred == ty && annotation == s!"({ppTensorType ta}, {ppTensorType tb}) -> {ppTensorType ty}"
+      then return op else none
+  if let [dst, payload] := operation.splitOn " = stablehlo.constant dense<" then
+    let dst ← parseSSAName dst
+    let ty ← parseTensorType annotation
+    let '>' :: rev := payload.toList.reverse | none
+    if ty.elem != .ui64 then none else do
+      let body := String.ofList rev.reverse
+      let values ← (if let '[' :: chars := body.toList then do
+        let ']' :: rev := chars.reverse | none
+        (String.ofList rev.reverse).splitOn ", " |>.mapM String.toNat?
+        else do
+          let n ← body.toNat?
+          pure (List.replicate ty.numElements n) : Option (List Nat))
+      if values.length != ty.numElements || !(values.all (· < 2^64)) then none
+      else return .constant dst { ty, data := (values.map (BitVec.ofNat 64)).toArray }
+  match operation.splitOn " " with
+  | ["return", arg] =>
+    let name ← parseSSAName arg
+    let ty ← tenv name
+    if annotation == ppTensorType ty then some (.returnOp name) else none
+  | [dst, "=", opcode, argA, argB] =>
+    let dst ← parseSSAName dst
+    let aChars := argA.toList
+    if aChars.getLast? != some ',' then none else do
+      let a ← parseSSAName (String.ofList (aChars.take (aChars.length - 1)))
+      let b ← parseSSAName argB
+      let op ← parseBinaryOp opcode dst a b
+      let ty ← resultTypeOf tenv op
+      if annotation == ppTensorType ty then some op else none
+  | _ => none
+
+/-- Parse body lines while threading exactly the printer's SSA type environment. -/
+def parseBody (tenv : TypeEnv) : List String → Option (List StableHLOOp)
+  | [] => some []
+  | line :: rest => do
+    let ' ' :: ' ' :: ' ' :: ' ' :: chars := line.toList | none
+    let op ← parseStableHLOOp tenv (String.ofList chars)
+    return op :: (← parseBody (bindResult tenv op) rest)
+
+/-- Parse the single-line function signature and newline-separated covered operations. -/
+def parseFuncOp (text : String) : Option FuncOp := do
+  let header :: lines := text.splitOn "\n" | none
+  let ["  func.func", signature] := header.splitOn " @" | none
+  let [name, signature] := signature.splitOn "(" | none
+  let _ ← parseSSAName ("%" ++ name)
+  let [params, signature] := signature.splitOn ") -> " | none
+  let [result, ""] := signature.splitOn " {" | none
+  let result ← parseTensorType result
+  let params ← (if params.isEmpty then some [] else
+    (params.splitOn ", ").mapM fun param => do
+      let [name, ty] := param.splitOn ": " | none
+      return (← parseSSAName name, ← parseTensorType ty))
+  let "  }" :: reversed := lines.reverse | none
+  let tenv := params.foldl (fun env (name, ty) => env.bind name ty) TypeEnv.empty
+  let body ← parseBody tenv reversed.reverse
+  return { name, params, result, body }
+
+#guard parseBody (TypeEnv.empty.bind "a" ⟨[4], .ui64⟩ |>.bind "b" ⟨[4], .ui64⟩)
+  ["    %sum = stablehlo.add %a, %b : tensor<4xui64>",
+   "    return %sum : tensor<4xui64>"] = some [.add "sum" "a" "b", .returnOp "sum"]
+#guard parseStableHLOOp TypeEnv.empty "return %missing : tensor<i64>" = none
+#guard (let f : FuncOp := { name := "add", params := [("a", ⟨[4], .ui64⟩), ("b", ⟨[4], .ui64⟩)], result := ⟨[4], .ui64⟩, body := [.add "sum" "a" "b", .returnOp "sum"] }
+  parseFuncOp (ppFuncOp f) = some f)
 
 end LeanNative.Backend.StableHLOAst

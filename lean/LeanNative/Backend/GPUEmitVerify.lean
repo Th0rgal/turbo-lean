@@ -235,10 +235,10 @@ def parsePTXKernel (text : String) : Option PTXKernel :=
           else if l.startsWith ".reg .pred" then
             let (b, p, r, rd) := takeBody ls
             (b, Nat.max p (parseRegCount l), r, rd)
-          else if l.startsWith ".reg .b32" then
+          else if l.startsWith ".reg .b32" || l.startsWith ".reg .u32" then
             let (b, p, r, rd) := takeBody ls
             (b, p, Nat.max r (parseRegCount l), rd)
-          else if l.startsWith ".reg .b64" then
+          else if l.startsWith ".reg .b64" || l.startsWith ".reg .u64" then
             let (b, p, r, rd) := takeBody ls
             (b, p, r, Nat.max rd (parseRegCount l))
           else
@@ -391,7 +391,10 @@ def parseMSLExpr (s0 : String) : Option MSLExpr :=
               | _ => none
             else if !t.isEmpty && t.all (fun c => c.isAlphanum || c == '_') then some (.var t)
             else none
-  go 48 s0
+  let chars := s0.trimAscii.toString.toList
+  match MetalAst.parseMSLExpr (chars.length * 2 + 1) chars with
+  | some (expr, []) => some expr
+  | _ => go 48 s0
 
 def parseMSLSimpleLine (line : String) : Option MSLStmt :=
   let l := stripSemi line.trimAscii.toString

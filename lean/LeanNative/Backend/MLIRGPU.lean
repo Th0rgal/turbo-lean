@@ -3,6 +3,7 @@ import LeanNative.IR.AST
 import LeanNative.Backend.GPUIR
 import LeanNative.Backend.PTXAst
 import LeanNative.Backend.PTXLower
+import LeanNative.Backend.StableHLOAst
 
 namespace LeanNative.Backend.MLIRGPU
 
@@ -491,39 +492,7 @@ def emitPTXDeclKernel (fnSymbol : String) (kernel : ParallelKernelKind) : String
     ppPTXKernel (lowerKind fnSymbol kernel)
   | .dotProduct =>
     emitPTXDotReduceKernel fnSymbol
-  | .customScalar iv inVars body =>
-    let rec buildInDecls (k : Nat) : List VarId → List String × List String × List (VarId × String)
-      | [] => ([], [], [])
-      | vId :: rest =>
-        let (pDecls, lLines, vMap) := buildInDecls (k + 1) rest
-        let pName := s!"param_in{k}"
-        let rName := s!"%rd{8 + k}"
-        let loadSeq := [
-          s!"    ld.param.u64 %rd7, [{pName}];",
-          "    cvta.to.global.u64 %rd7, %rd7;",
-          "    add.u64      %rd7, %rd7, %rd6;",
-          s!"    ld.global.u64 {rName}, [%rd7];"
-        ]
-        (s!"    .param .u64 {pName}," :: pDecls, loadSeq ++ lLines, (vId, rName) :: vMap)
-    let (inParamDecls, inLoadLines, inVarMap) := buildInDecls 0 inVars
-    let fullVarMap := (iv, "%rd5") :: inVarMap
-    let (exprLines, resReg, maxRd, maxPred) := emitPTXScalarExpr body fullVarMap (8 + inVars.length) 2
-    let paramHeader := String.intercalate "\n" (
-      ["    .param .u64 param_out,"] ++ inParamDecls ++ ["    .param .u64 param_n"]
-    )
-    let guardLines := [s!"    setp.ge.u64  %p1, %rd5, %rd2;\n    @%p1 bra     $L_done_{fnSymbol};"]
-    String.intercalate "\n" ([
-      s!".visible .entry {fnSymbol}(\n{paramHeader}\n)\n\{",
-      s!"    .reg .pred %p<{maxPred}>;\n    .reg .b32  %r<5>;\n    .reg .b64  %rd<{maxRd}>;",
-      "    ld.param.u64 %rd1, [param_out];\n    ld.param.u64 %rd2, [param_n];",
-      "    mov.u32      %r1, %ctaid.x;\n    mov.u32      %r2, %ntid.x;\n    mov.u32      %r3, %tid.x;",
-      "    mul.wide.u32 %rd3, %r1, %r2;\n    cvt.u64.u32  %rd4, %r3;\n    add.u64      %rd5, %rd3, %rd4;"
-    ] ++ guardLines ++ [
-      "    cvta.to.global.u64 %rd1, %rd1;\n    shl.b64      %rd6, %rd5, 3;"
-    ] ++ inLoadLines ++ exprLines ++ [
-      s!"    add.u64      %rd7, %rd1, %rd6;\n    st.global.u64 [%rd7], {resReg};",
-      s!"$L_done_{fnSymbol}:\n    ret;\n}"
-    ])
+  | .customScalar _ _ _ => ppPTXKernel (lowerKind fnSymbol kernel)
 
 /-- Lower GPU-compatible kernels in `m` directly to valid NVIDIA PTX 8.0 assembly
     (`.version 8.0`, `.target sm_90`, `.address_size 64`). -/
@@ -661,14 +630,40 @@ def emitPTXModule (m : LNIRModule) (smArch : String := "sm_90") : String :=
 
 /-- Emit a StableHLO function (`func.func @...`) targeting Google Cloud TPU v5e
     (`128x128` MXU systolic array and `128x8` VPU vector lanes) for a `ParallelKernelKind`. -/
-def emitStableHLODeclFunc (fnName : String) (elemTy : LNIRType) (kernel : ParallelKernelKind) : String :=
+def lowerStableHLODeclFunc (fnName : String) (kernel : ParallelKernelKind) : Option StableHLOAst.FuncOp := do
+  let ty : StableHLOAst.TensorType := { shape := [262144], elem := .ui64 }
+  let constant (name : String) (n : UInt64) : StableHLOAst.StableHLOOp :=
+    .constant name { ty, data := Array.replicate ty.numElements n.toBitVec }
+  let (names, result, body) ← match kernel with
+    | .mapScaleAdd scale bias => some (["in0"], ty,
+      [constant "c_scale" scale, constant "c_bias" bias,
+       .multiply "scaled" "in0" "c_scale", .add "res" "scaled" "c_bias", .returnOp "res"])
+    | .zipAdd => some (["in0", "in1"], ty, [.add "res" "in0" "in1", .returnOp "res"])
+    | .zipMul => some (["in0", "in1"], ty, [.multiply "res" "in0" "in1", .returnOp "res"])
+    | .saxpy alpha => some (["x", "y"], ty,
+      [constant "c_alpha" alpha, .multiply "ax" "c_alpha" "x", .add "res" "ax" "y", .returnOp "res"])
+    | .dotProduct => some (["lhs", "rhs"], { shape := [], elem := .ui64 },
+      [.dotGeneral "dot" "lhs" "rhs" [] [] [0] [0] [], .returnOp "dot"])
+    | _ => none
+  return { name := fnName, params := names.map (·, ty), result, body }
+
+def emitStableHLODeclFunc (fnName : String) (elemTy : LNIRType) (kernel : ParallelKernelKind) : String := Id.run do
+  if elemTy == .i64 then
+    if let some f := lowerStableHLODeclFunc fnName kernel then
+      let params := String.intercalate ", " (f.params.map fun (n, ty) => s!"%{n}: {StableHLOAst.ppTensorType ty}")
+      let tenv := f.params.foldl (fun e (n, ty) => StableHLOAst.TypeEnv.bind e n ty) StableHLOAst.TypeEnv.empty
+      let attrs := match kernel with
+        | .dotProduct => "tpu.unit = \"mxu_256x256\""
+        | _ => "tpu.unit = \"vpu_trillium\", tpu.vmem_block = 2048 : i64"
+      return String.intercalate "\n" ([s!"  func.func @{fnName}({params}) -> {StableHLOAst.ppTensorType f.result} attributes \{{attrs}} \{"] ++
+        StableHLOAst.ppBody tenv f.body ++ ["  }"])
   let shloElem := match elemTy with | .f32 => "f32" | .f64 => "f64" | .i32 => "ui32" | _ => "ui64"
   let tensorTy := s!"tensor<262144x{shloElem}>"
   let mkVpu (params : String) (retVar : String) (body : List String) : String :=
     String.intercalate "\n" ([
       s!"  func.func @{fnName}({params}) -> {tensorTy} attributes \{tpu.unit = \"vpu_trillium\", tpu.vmem_block = 2048 : i64} \{"
     ] ++ body ++ [s!"    return {retVar} : {tensorTy}\n  }"])
-  match kernel with
+  return match kernel with
   | .mapScaleAdd scale bias =>
     mkVpu s!"%in0: {tensorTy}" "%res" [
       s!"    %c_scale = stablehlo.constant dense<{scale}> : {tensorTy}\n    %c_bias = stablehlo.constant dense<{bias}> : {tensorTy}",

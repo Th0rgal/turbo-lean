@@ -1,4 +1,5 @@
 import Lean
+import LeanNative.Backend.LLVMEmitVerify
 import LeanNative.IR.Types
 import LeanNative.IR.AST
 import LeanNative.Spec
@@ -331,6 +332,65 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.HeapObjAbi.cowWriteField_result_exclusive
   , ``LeanNative.Proofs.HeapObjAbi.cowWriteField_preserves_live_alias
   , ``LeanNative.Backend.LLVMAst.ppType_injective
+  , ``LeanNative.Backend.PTXAst.parsePTXType_roundtrip
+  , ``LeanNative.Backend.PTXAst.stripPrefixChars_append
+  , ``LeanNative.Backend.PTXAst.scanPTXName_append
+  , ``LeanNative.Backend.PTXAst.parsePTXPredGuard_roundtrip
+  , ``LeanNative.Backend.PTXAst.ppPredGuard_injective
+  , ``LeanNative.Backend.PTXAst.parsePTXNamedOperand_specialReg
+  , ``LeanNative.Backend.PTXAst.parsePTXNamedOperand_reg
+  , ``LeanNative.Backend.PTXAst.parsePTXOperand_reg_roundtrip
+  , ``LeanNative.Backend.PTXAst.ppPTXOperand_reg_injective
+  , ``LeanNative.Backend.PTXAst.parsePTXInstr_ret_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXStmt_ret_roundtrip
+  , ``LeanNative.Backend.MetalAst.stripPrefixChars_append
+  , ``LeanNative.Backend.MetalAst.scanMSLName_append
+  , ``LeanNative.Backend.MetalAst.parseMSLExpr_bool_roundtrip
+  , ``LeanNative.Backend.MetalAst.parseMSLStmt_return_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.parseBody_cons
+  , ``LeanNative.Backend.StableHLOAst.parseSSAName_roundtrip
+  , ``LeanNative.Proofs.MetalLowerProofs.lowerScalar_canonical
+  , ``LeanNative.Backend.MetalAst.parseMSLScalarType_roundtrip
+  , ``LeanNative.Backend.MetalAst.parseMSLParamType_roundtrip
+  , ``LeanNative.Backend.MetalAst.ppMSLType_injective_on_canonical
+  , ``LeanNative.Backend.MetalAst.scanMSLToken_append
+  , ``LeanNative.Backend.MetalAst.canonicalMSLType_no_closeParen
+  , ``LeanNative.Backend.MetalAst.parseMSLType_roundtrip
+  , ``LeanNative.Backend.MetalAst.validMSLExprSuffix_nameBoundary
+  , ``LeanNative.Backend.MetalAst.stripPrefixChars_eq_some_iff
+  , ``LeanNative.Backend.MetalAst.parseMSLExpr_var_roundtrip
+  , ``LeanNative.Backend.MetalAst.parseMSLExpr_bool_suffix_roundtrip
+  , ``LeanNative.Backend.MetalAst.mslNameChar_of_isDigit
+  , ``LeanNative.Backend.MetalAst.natRepr_mslNameChars
+  , ``LeanNative.Backend.MetalAst.parseMSLExpr_u64_roundtrip
+  , ``LeanNative.Backend.MetalAst.parseMSLExpr_bitNot_step
+  , ``LeanNative.Backend.MetalAst.parseMSLExpr_logNot_step
+  , ``LeanNative.Backend.MetalAst.parseMSLExpr_neg_step
+  , ``LeanNative.Backend.MetalAst.parseMSLExpr_cast_step
+  , ``LeanNative.Backend.MetalAst.ppMSLExpr_canonical_head
+  , ``LeanNative.Backend.MetalAst.parseMSLExpr_clz_step
+  , ``LeanNative.Backend.MetalAst.parseMSLExpr_index_step
+  , ``LeanNative.Backend.MetalAst.parseMSLExprTail_select_step
+  , ``LeanNative.Backend.MetalAst.parseMSLExprTail_binary_step
+  , ``LeanNative.Backend.MetalAst.parseMSLExprArgs_singleton_step
+  , ``LeanNative.Backend.MetalAst.parseMSLExprArgs_cons_step
+  , ``LeanNative.Backend.MetalAst.parseMSLExprArgs_three_step
+  , ``LeanNative.Backend.MetalAst.parseMSLExpr_builtin_step
+  , ``LeanNative.Proofs.MetalLowerProofs.canonicalBlock_ofList
+  , ``LeanNative.Proofs.MetalLowerProofs.bufParam_type_canonical
+  , ``LeanNative.Proofs.MetalLowerProofs.guarded_canonical
+  , ``LeanNative.Proofs.MetalLowerProofs.storeOut_canonical
+  , ``LeanNative.Proofs.MetalLowerProofs.kernelOf_canonical
+  , ``LeanNative.Proofs.MetalLowerProofs.lowerKind_canonical
+  , ``LeanNative.Backend.PTXAst.parsePTXOperand_specialReg_roundtrip
+  , ``LeanNative.Backend.PTXAst.ppPTXType_injective_via_parser
+  , ``LeanNative.Backend.StableHLOAst.parseElemType_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.ppElemType_injective_via_parser
+  , ``LeanNative.Backend.MetalAst.parseMSLAttr_roundtrip
+  , ``LeanNative.Backend.MetalAst.ppMSLAttr_injective_via_parser
+  , ``LeanNative.Proofs.GPUEmitterMutantProofs.production_customScalar_emitter_wired
+  , ``LeanNative.Backend.LLVMEmitVerify.emitDeclLLVMViaAST_matches_lowering
+  , ``LeanNative.Backend.LLVMEmitVerify.emitDeclLLVMViaAST_of_lowered
   , ``LeanNative.Backend.LLVMAst.ppInstr_nonempty
   , ``LeanNative.Backend.LLVMAst.add_nsw_overflow_poison
   , ``LeanNative.Backend.LLVMAst.shl_overshift_poison
@@ -531,7 +591,7 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.ablateSitesLeaveOneOut_sound
   ]
 
-#guard auditedTheoremNames.length == 574
+#guard auditedTheoremNames.length == 633
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/
