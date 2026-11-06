@@ -276,6 +276,7 @@ pub struct ProjectConfig {
     pub manifest_packages: Vec<ManifestPackageEntry>,
     pub dep_pkgs: Vec<PackageConfig>,
     pub canonical_config_digest: String,
+    pub is_untrusted: bool,
 }
 /// A single parsed import directive with Lake v4.35 module-system visibility flags.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2019,8 +2020,13 @@ pub(crate) fn verifier_path(lean: &Path) -> String {
 pub(crate) fn trusted_lake_build_path(lean: &Path, canon_dir: &Path) -> String {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let lake_sub = canon_dir.join(".lake");
+    let has_lake_component = |p: &Path| p.components().any(|c| c.as_os_str() == ".lake");
     let mut push_dir = |p: PathBuf| {
-        if p.is_absolute() && !p.starts_with(&lake_sub) && !dirs.contains(&p) {
+        if p.is_absolute()
+            && !p.starts_with(&lake_sub)
+            && !has_lake_component(&p)
+            && !dirs.contains(&p)
+        {
             dirs.push(p);
         }
     };
@@ -2029,10 +2035,10 @@ pub(crate) fn trusted_lake_build_path(lean: &Path, canon_dir: &Path) -> String {
     }
     if let Some(raw) = std::env::var_os("PATH") {
         for entry in std::env::split_paths(&raw) {
-            if entry.is_absolute() && entry.is_dir() {
+            if entry.is_absolute() && entry.is_dir() && !has_lake_component(&entry) {
                 let canon_ok = entry
                     .canonicalize()
-                    .map(|c| !c.starts_with(&lake_sub))
+                    .map(|c| !c.starts_with(&lake_sub) && !has_lake_component(&c))
                     .unwrap_or(false);
                 if canon_ok {
                     push_dir(entry);
@@ -7169,8 +7175,16 @@ pub fn resolve_project_config_with_trust(
     }
     if is_untrusted {
         for pkg in std::iter::once(&root_pkg).chain(dep_pkgs.iter()) {
+            let pkg_has_precompile = pkg.precompile_modules
+                || pkg.libs.iter().any(|l| l.precompile_modules == Some(true));
+            let has_unbuilt_recipe = (!pkg.custom_targets.is_empty()
+                && (pkg.pkg_root == root_pkg.pkg_root || pkg_has_precompile))
+                || pkg
+                    .extern_libs
+                    .iter()
+                    .any(|e| e.static_artifact_blake3.is_none());
             anyhow::ensure!(
-                pkg.custom_targets.is_empty() && pkg.extern_libs.is_empty(),
+                !has_unbuilt_recipe,
                 "Untrusted verification rejects dynamic Lake recipes in package `{}`",
                 pkg.name
             );
@@ -7241,6 +7255,7 @@ pub fn resolve_project_config_with_trust(
         manifest_packages,
         dep_pkgs,
         canonical_config_digest,
+        is_untrusted,
     };
     materialize_lake_recipes(&cfg, is_untrusted)
 }
@@ -12112,10 +12127,79 @@ fn collect_prebuilt_dep_pkg_closure_for_statement(
     res
 }
 
+type LakeRecipeMemoKey = (PathBuf, String, PathBuf, String, Vec<String>, String);
+type LakeRecipeMemoVal = Vec<(String, PathBuf, String)>;
+static LAKE_RECIPE_MEMO: OnceLock<Mutex<HashMap<LakeRecipeMemoKey, LakeRecipeMemoVal>>> =
+    OnceLock::new();
+
+fn pkg_non_lake_tree_digest(pkg: &PackageConfig) -> Option<String> {
+    let root = pkg.pkg_root.canonicalize().ok()?;
+    let build_abs = if pkg.build_dir.is_absolute() {
+        pkg.build_dir.clone()
+    } else {
+        root.join(&pkg.build_dir)
+    };
+    let mut entries: Vec<(Vec<u8>, [u8; 32])> = Vec::new();
+    let iter = walkdir::WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            if e.depth() == 0 {
+                return true;
+            }
+            let name = e.file_name();
+            if name == ".lake" || name == ".git" {
+                return false;
+            }
+            e.path() != build_abs
+        });
+    for entry in iter {
+        let entry = entry.ok()?;
+        if entry.path_is_symlink() {
+            return None;
+        }
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        if !entry.file_type().is_file() || entries.len() >= 4096 {
+            return None;
+        }
+        let rel = entry.path().strip_prefix(&root).ok()?;
+        let bytes = fs::read(entry.path()).ok()?;
+        entries.push((
+            rel.as_os_str().as_encoded_bytes().to_vec(),
+            *blake3::hash(&bytes).as_bytes(),
+        ));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut h = blake3::Hasher::new();
+    h.update(b"turbo-lean-pkg-recipe-tree-v1\n");
+    for (rel, digest) in &entries {
+        update_hasher_lp(&mut h, rel);
+        h.update(digest);
+    }
+    Some(h.finalize().to_hex().to_string())
+}
+
 fn materialize_lake_recipes(cfg: &ProjectConfig, is_untrusted: bool) -> Result<ProjectConfig> {
+    let recipe_names = |pkg: &PackageConfig| -> Vec<String> {
+        if is_untrusted {
+            return Vec::new();
+        }
+        pkg.custom_targets
+            .iter()
+            .cloned()
+            .chain(
+                pkg.extern_libs
+                    .iter()
+                    .filter(|e| e.is_dynamic_recipe)
+                    .map(|e| e.name.clone()),
+            )
+            .collect()
+    };
     if std::iter::once(&cfg.root_pkg)
         .chain(&cfg.dep_pkgs)
-        .all(|p| p.custom_targets.is_empty() && p.extern_libs.is_empty())
+        .all(|p| recipe_names(p).is_empty())
     {
         return Ok(cfg.clone());
     }
@@ -12123,72 +12207,122 @@ fn materialize_lake_recipes(cfg: &ProjectConfig, is_untrusted: bool) -> Result<P
     let mut workspace = blake3::Hasher::new();
     workspace.update(b"turbo-lean-lake-recipes-v1\n");
     for pkg in std::iter::once(&mut resolved.root_pkg).chain(&mut resolved.dep_pkgs) {
-        if pkg.custom_targets.is_empty() && pkg.extern_libs.is_empty() {
+        let names = recipe_names(pkg);
+        if names.is_empty() {
             continue;
         }
         anyhow::ensure!(
             !is_untrusted,
-            "Untrusted verification rejects dynamic Lake recipes"
+            "Untrusted verification rejects dynamic Lake recipes in package `{}`",
+            pkg.name
         );
         anyhow::ensure!(
             !crate::lake_build::worktree_auto_link_disabled(&pkg.pkg_root),
             "Lake materialization requires a writable package `{}`",
             pkg.name
         );
-        let tools = ToolchainExecutables::from_lean(&cfg.lean_bin)?;
-        let mut digest = blake3::Hasher::new();
-        update_hasher_lp(&mut digest, pkg.config_digest.as_bytes());
-        let names: Vec<String> = pkg
-            .custom_targets
-            .iter()
-            .cloned()
-            .chain(pkg.extern_libs.iter().map(|e| e.name.clone()))
-            .collect();
         for name in &names {
             anyhow::ensure!(
                 !pkg.inputs.iter().any(|i| &i.name == name),
                 "Duplicate Lake materialization target `{name}`"
             );
+        }
+        let root = pkg.pkg_root.canonicalize()?;
+        let tree_digest = pkg_non_lake_tree_digest(pkg);
+        let memo_key = tree_digest.as_ref().map(|td| {
+            (
+                cfg.lean_bin.clone(),
+                cfg.lean_githash.clone(),
+                root.clone(),
+                pkg.config_digest.clone(),
+                names.clone(),
+                td.clone(),
+            )
+        });
+        let cached_artifacts: Option<Vec<(String, PathBuf, String)>> =
+            memo_key.as_ref().and_then(|key| {
+                let memo = LAKE_RECIPE_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+                let items = memo.lock().ok()?.get(key)?.clone();
+                for (_, path, expected_hash) in &items {
+                    let canon = path.canonicalize().ok()?;
+                    if !canon.starts_with(&root) || !canon.is_file() {
+                        return None;
+                    }
+                    let actual = blake3::hash(&fs::read(&canon).ok()?).to_hex().to_string();
+                    if &actual != expected_hash {
+                        return None;
+                    }
+                }
+                Some(items)
+            });
+        let artifacts = if let Some(items) = cached_artifacts {
+            items
+        } else {
+            let tools = ToolchainExecutables::from_lean(&cfg.lean_bin)?;
+            let mut queried = Vec::with_capacity(names.len());
+            for name in &names {
+                let target = format!("@{}/{}", pkg.base_name, name);
+                let mut query_cmd = Command::new(&tools.lake);
+                scrub_untrusted_env(&mut query_cmd);
+                let output = query_cmd
+                    .current_dir(&cfg.root_pkg.pkg_root)
+                    .env("PATH", tools.lake_build_path(&cfg.root_pkg.pkg_root))
+                    .env("LEAN", &tools.lean)
+                    .env("LAKE", &tools.lake)
+                    .env("LEANC", &tools.leanc)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_ATTR_NOSYSTEM", "1")
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .env("GIT_NO_LAZY_FETCH", "1")
+                    .env("GIT_ALLOW_PROTOCOL", "")
+                    .env(
+                        "GIT_CONFIG_PARAMETERS",
+                        "'core.fsmonitor=' 'core.hooksPath=/dev/null' 'core.sshCommand=false' 'core.askPass=' 'credential.helper=' 'protocol.allow=never' 'diff.external=' 'core.attributesFile=/dev/null' 'submodule.recurse=false'",
+                    )
+                    .args(["query", "--json", &target])
+                    .output()
+                    .context("Failed to execute Lake materialization")?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "Lake materialization of `{target}` failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let path: String = serde_json::from_slice(&output.stdout).with_context(|| {
+                    format!("Lake target `{target}` must return a single FilePath")
+                })?;
+                let path = PathBuf::from(path);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    cfg.root_pkg.pkg_root.join(path)
+                };
+                let canonical = path
+                    .canonicalize()
+                    .with_context(|| format!("Missing Lake artifact for `{target}`"))?;
+                anyhow::ensure!(
+                    canonical.starts_with(&root) && canonical.is_file(),
+                    "Lake target `{target}` must return a regular artifact inside its package"
+                );
+                let bytes = fs::read(&canonical)?;
+                let hash = blake3::hash(&bytes).to_hex().to_string();
+                queried.push((name.clone(), canonical, hash));
+            }
+            if let Some(key) = memo_key {
+                let memo = LAKE_RECIPE_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+                if let Ok(mut g) = memo.lock() {
+                    if g.len() >= 256 {
+                        g.clear();
+                    }
+                    g.insert(key, queried.clone());
+                }
+            }
+            queried
+        };
+        let mut digest = blake3::Hasher::new();
+        update_hasher_lp(&mut digest, pkg.config_digest.as_bytes());
+        for (name, canonical, hash) in artifacts {
             let target = format!("@{}/{}", pkg.base_name, name);
-            let output = Command::new(&tools.lake)
-                .current_dir(&cfg.root_pkg.pkg_root)
-                .env(
-                    "PATH",
-                    format!(
-                        "{}:{}",
-                        tools.path(),
-                        std::env::var("PATH").unwrap_or_default()
-                    ),
-                )
-                .env("LEAN", &tools.lean)
-                .env("LAKE", &tools.lake)
-                .env("LEANC", &tools.leanc)
-                .args(["query", "--json", &target])
-                .output()
-                .context("Failed to execute Lake materialization")?;
-            anyhow::ensure!(
-                output.status.success(),
-                "Lake materialization of `{target}` failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let path: String = serde_json::from_slice(&output.stdout)
-                .with_context(|| format!("Lake target `{target}` must return a single FilePath"))?;
-            let path = PathBuf::from(path);
-            let path = if path.is_absolute() {
-                path
-            } else {
-                cfg.root_pkg.pkg_root.join(path)
-            };
-            let canonical = path
-                .canonicalize()
-                .with_context(|| format!("Missing Lake artifact for `{target}`"))?;
-            let root = pkg.pkg_root.canonicalize()?;
-            anyhow::ensure!(
-                canonical.starts_with(&root) && canonical.is_file(),
-                "Lake target `{target}` must return a regular artifact inside its package"
-            );
-            let bytes = fs::read(&canonical)?;
-            let hash = blake3::hash(&bytes).to_hex().to_string();
             let mut input = InputTargetConfig {
                 name: name.clone(),
                 path: canonical.strip_prefix(&root)?.to_path_buf(),
@@ -12211,7 +12345,7 @@ fn materialize_lake_recipes(cfg: &ProjectConfig, is_untrusted: bool) -> Result<P
                     .as_encoded_bytes(),
             );
             update_hasher_lp(&mut digest, hash.as_bytes());
-            if let Some(ext) = pkg.extern_libs.iter_mut().find(|e| &e.name == name) {
+            if let Some(ext) = pkg.extern_libs.iter_mut().find(|e| e.name == name) {
                 anyhow::ensure!(
                     canonical
                         .extension()
@@ -12265,7 +12399,15 @@ fn build_module_dag_inner(
         anyhow::ensure!(
             std::iter::once(&cfg.root_pkg)
                 .chain(&cfg.dep_pkgs)
-                .all(|p| p.custom_targets.is_empty() && p.extern_libs.is_empty()),
+                .all(|p| {
+                    let pkg_has_precompile = p.precompile_modules
+                        || p.libs.iter().any(|l| l.precompile_modules == Some(true));
+                    (p.custom_targets.is_empty()
+                        || (p.pkg_root != cfg.root_pkg.pkg_root && !pkg_has_precompile))
+                        && p.extern_libs
+                            .iter()
+                            .all(|e| e.static_artifact_blake3.is_some())
+                }),
             "Untrusted verification rejects dynamic Lake recipes"
         );
     }
@@ -14591,15 +14733,31 @@ pub(crate) fn workspace_lake_inputs_digest(cfg: &ProjectConfig) -> Result<String
 
 fn validate_materialized_artifacts(cfg: &ProjectConfig) -> Result<()> {
     for pkg in std::iter::once(&cfg.root_pkg).chain(&cfg.dep_pkgs) {
-        for name in pkg
-            .custom_targets
-            .iter()
-            .chain(pkg.extern_libs.iter().map(|e| &e.name))
-        {
+        if !cfg.is_untrusted {
+            for name in pkg.custom_targets.iter().chain(
+                pkg.extern_libs
+                    .iter()
+                    .filter(|e| e.is_dynamic_recipe)
+                    .map(|e| &e.name),
+            ) {
+                anyhow::ensure!(
+                    pkg.inputs.iter().any(|i| &i.name == name),
+                    "Lake recipe `{}/{name}` has not been materialized",
+                    pkg.name
+                );
+            }
+        }
+        for ext in &pkg.extern_libs {
+            let path = ext
+                .static_artifact_path
+                .as_ref()
+                .with_context(|| format!("Missing native archive `{}/{}`", pkg.name, ext.name))?;
+            let digest = blake3::hash(&fs::read(path)?).to_hex().to_string();
             anyhow::ensure!(
-                pkg.inputs.iter().any(|i| &i.name == name),
-                "Lake recipe `{}/{name}` has not been materialized",
-                pkg.name
+                ext.static_artifact_blake3.as_ref() == Some(&digest),
+                "Materialized Lake artifact `{}/{}` changed during build",
+                pkg.name,
+                ext.name
             );
         }
         for input in &pkg.inputs {
@@ -16642,6 +16800,7 @@ pub(crate) fn scrub_untrusted_env(cmd: &mut Command) {
             || ku.starts_with("AWS_")
             || ku.starts_with("GH_")
             || ku.starts_with("GITHUB_")
+            || ku.starts_with("GIT_")
             || ku.starts_with("OPENAI_")
             || ku.starts_with("ANTHROPIC_")
             || ku == "LEAN_SRC_PATH"
@@ -28501,6 +28660,25 @@ lean_lib Smoke where
         assert!(!dir.join(".lake/build/bin/lean-sys-core").exists());
         fs::remove_dir_all(dir)?;
         Ok(())
+    }
+
+    #[test]
+    fn test_lean_project_untrusted_accepts_prebuilt_extern_lib() {
+        let lean_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
+        let archive = lean_dir.join(".lake/packages/lean-sys/.lake/build/lib/liblean_sys_shim.a");
+        if archive.is_file() {
+            let cfg = resolve_project_config_with_trust(&lean_dir, true).unwrap();
+            let dag = build_module_dag_with_trust(&cfg, &[], true).unwrap();
+            assert!(!workspace_lake_inputs_digest(&cfg).unwrap().is_empty());
+            let leaf = dag
+                .nodes
+                .values()
+                .find(|n| n.direct_dag_deps.is_empty() && n.external_olean_deps.is_empty())
+                .unwrap();
+            assert!(!compute_module_cas_key(&cfg, leaf, &[], false)
+                .unwrap()
+                .is_empty());
+        }
     }
 
     #[test]
