@@ -43,10 +43,10 @@ In Lean 4 builds, **85–95% of wall-clock time** is spent in `Lean.Elab` (`Meta
 
 ## Goal G3: End-to-End Semantic Sovereignty (Closing the Frontend & Backend Trust Sandwich)
 
-### Problem Statement
-Today, `LeanNative` has real operational semantics (`evalCode` in `LeanNative/Semantics/Eval.lean`) and machine-checked proofs for scalar peepholes, 1D loops, and `SymbolicTV`. However, it is sandwiched between two unverified layers:
-1. **Frontend (`LeanNative/IR/Bridge.lean`)**: Lowers `Lean.Compiler.LCNF.Code` to `LNIRCode` using fragile string-suffix matching (`callee.endsWith "add"`, `callee.endsWith "get"`) while mixing 1,500+ lines of "Wave 15–32" whole-function rewrites directly into the lowering pass.
-2. **Backend (`LeanNative/Backend/LLVM.lean`, `GPUIR.lean`, `Metal.lean`, `Driver/CoreCLI.lean`)**: Emits LLVM IR, CUDA PTX, Apple Metal 3.0, and C-ABI AVX-512/NEON kernels via raw string interpolation without a mechanized target ISA semantics.
+### Historical Baseline & Remaining Trust Gaps
+`LeanNative` pairs operational semantics (`evalCode` in `LeanNative/Semantics/Eval.lean`) and machine-checked proofs for middle-end passes, `SymbolicTV`, `RealLCNFBridge`, and typed Target-IR AST subsets (`LLVMAst`, `PTXAst`, `MetalAst`, `StableHLOAst`) with two remaining end-to-end gaps (having historically started from):
+1. **Frontend (`LeanNative/IR/Bridge.lean` & `RealLCNFBridge.lean`)**: Historically lowered `Lean.Compiler.LCNF.Code` using string-suffix matching and inline rewrites (since extracted to modular passes with `Bridge.lean` compressed to `< 350` LOC and `RealLCNFBridge` verified on scalars/tuples/Stage-1D ADTs against in-repo `RealLCNFSemantics`), while upstream `lean4lean` `LCNF` semantics and higher-order/recursive `LCNF` coverage remain open.
+2. **Backend (`LeanNative/Backend/LLVM.lean`, `MLIRGPU.lean`, `Metal.lean`, `Driver/CoreCLI.lean`)**: Production text emitters still serialize parts of LLVM IR, CUDA PTX, Apple Metal 3.0, and C-ABI SIMD kernels via direct string formatting outside the proved Target-IR AST pretty-printers, and the Target-IR semantics are not yet bridged to upstream `lean-mlir`, `LNSym`, or `sail-riscv-lean`.
 
 ### Target Architecture
 
@@ -98,11 +98,11 @@ Typed Target IRs Grounded in Official External Semantics (G3.3):
 
 ## Goal G4: Radical Simplicity & Internal Abstractions (The LOC Compression Ratchet)
 
-### Problem Statement
-Rapid feature waves have accumulated substantial structural duplication across the repository:
-- `lean/LeanNative/Driver/CoreCLI.lean` has grown to **~7,500 LOC**, largely embedding raw C/SIMD/Metal source strings.
-- `lean/LeanNative/IR/Bridge.lean` has grown to **~2,000 LOC** of ad-hoc Wave 15–32 AST matchers.
-- `lean/LeanNative/Spec.lean` (~1,415 LOC) and `lean/TurboLean/Spec.lean` (~800 LOC) contain dozens of repetitive 4-field boolean `MetaGateSpec` boilerplate blocks.
+### Historical Motivation & Ratchet Baseline
+Early feature waves accumulated substantial structural duplication across the repository (subsequently ratcheted down by CI gates `Bridge.lean <= 350 LOC` and `CoreCLI.lean <= 1000 LOC`, with backend string-emitter unification continuing below):
+- `lean/LeanNative/Driver/CoreCLI.lean` had grown to **~7,500 LOC** of embedded C/SIMD/Metal source strings (now gated at `<= 1,000 LOC`).
+- `lean/LeanNative/IR/Bridge.lean` had grown to **~2,000 LOC** of ad-hoc Wave 15–32 AST matchers (now gated at `<= 350 LOC`).
+- `lean/LeanNative/Spec.lean` and `lean/TurboLean/Spec.lean` accumulated repetitive 4-field boolean `MetaGateSpec` blocks suitable for higher-order combinator factoring.
 
 ### Target Architecture (Compress Maintained LOC by $\ge 50\%$ While Increasing Coverage)
 1. **Replace 32 Ad-Hoc Optimization Waves with 3 Compositional Verified Engines**:
@@ -135,6 +135,6 @@ Even with machine-checked proofs, specification blind spots (e.g., mismatched FF
 
 - **`G1` (`con-leche` Zero-Copy Kernel)**: Vendor official `leanprover/con-leche` (+ `lean4lean` corner cases), replace the self-contained `"OLEN"` model with a direct Lean 4 `.olean` / `ConstantInfo` mmap reader for compatible `lean-toolchain`s, and register the compiled `con-leche` backend behind the landed `--kernel <auto|standard|con-leche|both>` selector and `schema_version = 2` provenance receipts.
 - **`G2` (`HeaderPin` & CAS Proof Distillation)**: Connect `HeaderPin` to real parsed Lean surface signatures vs. elaborated `Lean.ConstantInfo.type`, and emit/replay kernel `Expr` witnesses in `TurboStore` during `build`/`ci-verify`.
-- **`G3.1` & `G3.2` (Broader `LCNF` Coverage)**: Expand `Lean.Compiler.LCNF -> LNIR` coverage beyond the current scalar, flat-tuple, slice, non-escaping async, and Stage-1D subset to general recursion, closures/higher-order `.fvar` calls, `letrec`, signed `Int*`, and full LLVM heap-op codegen.
+- **`G3.1` & `G3.2` (Broader `LCNF` Coverage)**: Expand `Lean.Compiler.LCNF -> LNIR` frontend coverage beyond the current scalar, flat-tuple, and bounded Stage-1D constructor/ADT subset (with slice and non-escaping async passes in middle-end `LNIR`) to upstream `lean4lean` `LCNF` semantics, general recursion, closures/higher-order `.fvar` calls, `letrec`, signed `Int*`, and full LLVM heap-op codegen.
 - **`G3.3` & `G4` (Upstream Semantics & Unified AST-to-Text Emission)**: Link upstream `opencompl/lean-mlir`, `leanprover/LNSym`, and `opencompl/sail-riscv-lean`, and route production `LLVM`/`PTX`/`Metal`/`StableHLO` text emission directly through the proved Target-IR AST pretty-printers instead of standalone string emitters.
 - **`G5` (Ecosystem Differential Fuzzing)**: Expand 3-way differential conformance (`--tier C2,C3`) across 250+ upstream `lean4/tests/lean/run` files, real Lake packages (`Batteries`, `LeanSys`, `SciLean`), and 10,000-seed nightly `LCNF` fuzzing.
