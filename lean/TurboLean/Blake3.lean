@@ -41,7 +41,7 @@ def blockBytesToWords (bytes : ByteArray) (offset : Nat) (len : Nat) : Array UIn
 def wordToHexLE (w : UInt32) : String :=
   let hexChars := "0123456789abcdef".toList
   let byteHex (b : UInt32) : List Char := [hexChars[((b >>> 4) &&& 0xf).toNat]?.getD '0', hexChars[(b &&& 0xf).toNat]?.getD '0']
-  String.ofList (byteHex (w &&& 0xff) ++ byteHex ((w >>> 8) &&& 0xff) ++ byteHex ((w >>> 16) &&& 0xff) ++ byteHex ((w >>> 24) &&& 0xff))
+  String.mk (byteHex (w &&& 0xff) ++ byteHex ((w >>> 8) &&& 0xff) ++ byteHex ((w >>> 16) &&& 0xff) ++ byteHex ((w >>> 24) &&& 0xff))
 
 def cvToHex (cv : Array UInt32) : String := String.join ((List.range 8).map (fun i => wordToHexLE cv[i]!))
 

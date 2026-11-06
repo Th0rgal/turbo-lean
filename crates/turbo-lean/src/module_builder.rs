@@ -118,6 +118,9 @@ pub struct LeanLibConfig {
     /// `needs := #[...]`: names of the package's `input_file` / `input_dir` targets.
     #[serde(default)]
     pub needs: Vec<String>,
+    /// Names of package `target ...` custom targets declared in `needs := #[...]` (dependency packages).
+    #[serde(default)]
+    pub custom_target_needs: Vec<String>,
     /// Why turbo-lean cannot build this dependency target like Lake (see `PackageConfig`).
     #[serde(default)]
     pub unsupported: Option<String>,
@@ -188,6 +191,8 @@ pub struct LeanExeConfig {
     /// Names of package `input_file` / `input_dir` targets declared in `needs := #[...]`.
     #[serde(default)]
     pub needs: Vec<String>,
+    #[serde(default)]
+    pub custom_target_needs: Vec<String>,
     #[serde(default)]
     pub unsupported: Option<String>,
     #[serde(default)]
@@ -3597,6 +3602,7 @@ fn parse_lakefile_toml_inner(
                             default_facets: Vec::new(),
                             is_default_target: false,
                             needs: Vec::new(),
+                            custom_target_needs: Vec::new(),
                             unsupported: None,
                             native_unsupported: None,
                             link_unsupported: None,
@@ -3617,6 +3623,7 @@ fn parse_lakefile_toml_inner(
                             platform_independent: None,
                             is_default_target: false,
                             needs: Vec::new(),
+                            custom_target_needs: Vec::new(),
                             unsupported: None,
                             native_unsupported: None,
                             link_unsupported: None,
@@ -5903,10 +5910,12 @@ fn parse_lakefile_lean_inner(
                             "needs" => {
                                 let needs = parse_lean_bare_name_array_expr(&val_accum, key)?;
                                 let mut input_needs = Vec::with_capacity(needs.len());
+                                let mut custom_needs = Vec::new();
                                 for n in needs {
                                     if pkg.inputs.iter().any(|i| i.name == n) {
                                         input_needs.push(n);
                                     } else if !is_root_pkg && pkg.custom_targets.contains(&n) {
+                                        custom_needs.push(n.clone());
                                         unsupported_lake_field(
                                             &mut lib.unsupported,
                                             is_root_pkg,
@@ -5934,6 +5943,7 @@ fn parse_lakefile_lean_inner(
                                     }
                                 }
                                 lib.needs = input_needs;
+                                lib.custom_target_needs = custom_needs;
                             }
                             "defaultFacets" => {
                                 let facets = parse_lean_bare_name_array_expr(&val_accum, key)?;
@@ -6027,10 +6037,12 @@ fn parse_lakefile_lean_inner(
                             "needs" => {
                                 let needs = parse_lean_bare_name_array_expr(&val_accum, key)?;
                                 let mut input_needs = Vec::with_capacity(needs.len());
+                                let mut custom_needs = Vec::new();
                                 for n in needs {
                                     if pkg.inputs.iter().any(|i| i.name == n) {
                                         input_needs.push(n);
                                     } else if !is_root_pkg && pkg.custom_targets.contains(&n) {
+                                        custom_needs.push(n.clone());
                                         unsupported_lake_field(
                                             &mut exe.unsupported,
                                             is_root_pkg,
@@ -6058,6 +6070,7 @@ fn parse_lakefile_lean_inner(
                                     }
                                 }
                                 exe.needs = input_needs;
+                                exe.custom_target_needs = custom_needs;
                             }
                             other => {
                                 let (c_why, l_why) = classify_native_unsupported_field(
@@ -6098,8 +6111,9 @@ fn parse_lakefile_lean_inner(
                             .flatten();
                         match key {
                             "path" => {
-                                let bindings_opt = (!is_root_pkg && lakefile_is_plain(&clean))
-                                    .then_some((&lean_option_bindings, line_no));
+                                let bindings_opt =
+                                    (!is_root_pkg && lakefile_is_plain_with_policy(&clean, is_root_pkg))
+                                        .then_some((&lean_option_bindings, line_no));
                                 input.path =
                                     checked_input_path(&parse_lean_path_literal_with_bindings(
                                         key,
@@ -6263,6 +6277,7 @@ where
             default_facets: Vec::new(),
             is_default_target: is_def,
             needs: Vec::new(),
+            custom_target_needs: Vec::new(),
             unsupported: None,
             native_unsupported: None,
             link_unsupported: None,
@@ -6286,6 +6301,7 @@ where
             platform_independent: None,
             is_default_target: is_def,
             needs: Vec::new(),
+            custom_target_needs: Vec::new(),
             unsupported: None,
             native_unsupported: None,
             link_unsupported: None,
@@ -7298,6 +7314,7 @@ pub(crate) struct DiscoveredModuleSpec {
     strong_args: Vec<String>,
     weak_args: Vec<String>,
     extern_lib_digests: Vec<String>,
+    pub(crate) custom_target_needs: Vec<String>,
     pub(crate) pkg_config_digest: String,
     /// Set when turbo-lean cannot build the module like Lake (`PackageConfig::unsupported`).
     unsupported: Option<String>,
@@ -7594,6 +7611,7 @@ fn resolve_module_in_package_mode(
                         strong_args,
                         weak_args,
                         extern_lib_digests: extern_digests,
+                        custom_target_needs: exe.custom_target_needs.clone(),
                         pkg_config_digest: pkg.config_digest.clone(),
                         unsupported: pkg.unsupported.clone().or_else(|| exe.unsupported.clone()),
                         native_unsupported: pkg
@@ -7658,6 +7676,7 @@ fn resolve_module_in_package_mode(
                     strong_args,
                     weak_args,
                     extern_lib_digests: extern_digests,
+                    custom_target_needs: lib.custom_target_needs.clone(),
                     pkg_config_digest: pkg.config_digest.clone(),
                     unsupported: pkg.unsupported.clone().or_else(|| lib.unsupported.clone()),
                     native_unsupported: pkg
@@ -7697,6 +7716,7 @@ fn resolve_module_in_package_mode(
             strong_args,
             weak_args,
             extern_lib_digests: extern_digests,
+            custom_target_needs: Vec::new(),
             pkg_config_digest: pkg.config_digest.clone(),
             unsupported: pkg.unsupported.clone(),
             native_unsupported: pkg.native_unsupported.clone(),
@@ -8040,6 +8060,7 @@ pub(crate) struct LakeClosureCache {
     pb_exp_memo: HashMap<(PathBuf, bool), Option<LakeModuleExportInfo>>,
     pinned_memo: HashSet<(PathBuf, String, String, bool)>,
     cutoff_pins: HashMap<(PathBuf, String), CutoffPinBaseline>,
+    clean_git_pin_memo: HashMap<PathBuf, Option<HashSet<PathBuf>>>,
     pub(crate) post_lake_refresh: bool,
     pub(crate) ignore_mtime_skew: bool,
 }
@@ -8774,6 +8795,7 @@ pub(crate) fn dep_pkg_module_stale(
     }
     if !olean_present {
         return !cache.post_lake_refresh
+            && !is_git_pinned_manifest_package(cfg, &spec)
             && package_by_root(cfg, &spec.pkg_root).is_some_and(|p| !p.inputs.is_empty());
     }
     if cfg.lean_bin.as_os_str().is_empty() {
@@ -8954,6 +8976,346 @@ fn verify_lake_trace_options_and_args(
         && args_pair[1].as_str() == Some(expected_args_h.as_str())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_expected_lake_module_inputs_value(
+    cfg: &ProjectConfig,
+    pkg_root: &Path,
+    pkg_name: &str,
+    pkg_base_name: &str,
+    target_name: &str,
+    is_exe_target: bool,
+    module_name: &str,
+    is_module: bool,
+    platform_independent: Option<bool>,
+    lean_options: &LeanOptionsMap,
+    strong_args: &[String],
+    src_path: &Path,
+    src_h: u64,
+    import_entries: Vec<serde_json::Value>,
+    raw_imp_dynlibs: &[PathBuf],
+) -> Option<serde_json::Value> {
+    if cfg.lean_githash.is_empty() || cfg.lean_githash == "lean-not-installed" {
+        return None;
+    }
+    let options_val = if lean_options.is_empty() {
+        serde_json::json!("00000000000006bb")
+    } else {
+        let mut opt_entries = Vec::with_capacity(lean_options.len());
+        for (k, v) in lean_options {
+            let flag = format!("-D{}={}", k.to_lean_string(), v.as_cli_flag_value());
+            opt_entries.push(serde_json::json!([
+                flag,
+                format!("{:016x}", lake_hash_text(&flag))
+            ]));
+        }
+        serde_json::Value::Array(opt_entries)
+    };
+    let lean_args_h = strong_args.iter().fold(LAKE_NIL_HASH, |acc, a| {
+        lake_mix_hash(acc, lake_hash_bytes(a.as_bytes()))
+    });
+    let base_pkg_name = if pkg_base_name.is_empty() {
+        pkg_name
+    } else {
+        pkg_base_name
+    };
+    let pkg_base_ident = if base_pkg_name.contains('-') {
+        format!("«{}»", base_pkg_name)
+    } else {
+        base_pkg_name.to_string()
+    };
+    let pkg_id_ident = if pkg_name.contains('-') {
+        format!("«{}»", pkg_name)
+    } else {
+        pkg_name.to_string()
+    };
+    let ver_short = cfg
+        .toolchain
+        .rsplit(':')
+        .next()
+        .unwrap_or(&cfg.toolchain)
+        .trim_start_matches('v');
+    let lean_cap = format!("Lean {}, commit {}", ver_short, cfg.lean_githash.trim());
+    let lean_gh_h = lake_hash_bytes(cfg.lean_githash.trim().as_bytes());
+    let is_mod_h = lake_mix_hash(LAKE_NIL_HASH, if is_module { 11 } else { 13 });
+    let lean_args_cap = if strong_args.is_empty() {
+        "Module.leanArgs: #[]".to_string()
+    } else {
+        format!("Module.leanArgs: #[{}]", strong_args.join(", "))
+    };
+    let libs_trace_entry = if platform_independent == Some(true) {
+        serde_json::json!([
+            "libs",
+            [
+                ["import dynlibs", "00000000000006bb"],
+                ["package external libraries", "00000000000006bb"],
+                ["module dynlibs", "00000000000006bb"],
+                ["module plugins", "00000000000006bb"]
+            ]
+        ])
+    } else {
+        let mut import_dynlib_entries = Vec::with_capacity(raw_imp_dynlibs.len());
+        for p in raw_imp_dynlibs {
+            let h = verify_and_hash_artifact_bytes(p, false, false).ok()?;
+            import_dynlib_entries.push(serde_json::json!([
+                p.to_string_lossy(),
+                format!("{:016x}", h)
+            ]));
+        }
+        let import_dynlibs_json = if import_dynlib_entries.is_empty() {
+            serde_json::Value::String("00000000000006bb".to_string())
+        } else {
+            serde_json::Value::Array(import_dynlib_entries)
+        };
+        serde_json::json!([
+            "libs",
+            [
+                ["import dynlibs", import_dynlibs_json],
+                ["package external libraries", "00000000000006bb"],
+                ["module dynlibs", "00000000000006bb"],
+                ["module plugins", "00000000000006bb"]
+            ]
+        ])
+    };
+    let inputs_val = if import_entries.is_empty() {
+        serde_json::json!("00000000000006bb")
+    } else {
+        serde_json::Value::Array(import_entries)
+    };
+    let mut extra_dep_entries = vec![serde_json::json!([
+        format!("@{}:extraDep", pkg_base_ident),
+        format!("{LAKE_NIL_HASH:016x}")
+    ])];
+    if let Some(pkg) = package_by_root(cfg, pkg_root) {
+        let needs: &[String] = if is_exe_target {
+            pkg.exes
+                .iter()
+                .find(|e| e.name == target_name && e.root == module_name)
+                .map_or(&[], |e| e.needs.as_slice())
+        } else {
+            pkg.libs
+                .iter()
+                .find(|l| l.name == target_name && lib_can_build_module(l, module_name))
+                .map_or(&[], |l| l.needs.as_slice())
+        };
+        extra_dep_entries.extend(
+            needs
+                .iter()
+                .filter_map(|n| pkg.inputs.iter().find(|i| &i.name == n))
+                .map(|i| {
+                    serde_json::json!([
+                        pkg.pkg_root.join(&i.path).to_string_lossy(),
+                        i.lake_hash
+                    ])
+                }),
+        );
+    }
+    let deps_entry = serde_json::json!([
+        "deps",
+        [
+            [
+                format!("{}/{}:extraDep", pkg_base_ident, target_name),
+                extra_dep_entries
+            ],
+            ["imports", inputs_val]
+        ]
+    ]);
+    let nested = lake_trace_uses_nested_mod_deps(&cfg.toolchain);
+    let mut input_vec = if nested {
+        let mut nested_entries = vec![deps_entry];
+        if platform_independent != Some(true) {
+            nested_entries.push(libs_trace_entry);
+        }
+        if platform_independent == Some(false) {
+            let tc_spec = query_toolchain_native_spec(&cfg.lean_bin).ok()?;
+            if tc_spec.target.is_empty() {
+                return None;
+            }
+            let plat_h = lake_hash_bytes(tc_spec.target.as_bytes());
+            nested_entries.push(serde_json::json!([
+                tc_spec.target,
+                format!("{:016x}", plat_h)
+            ]));
+        }
+        vec![serde_json::json!([
+            format!("{}:deps", module_name),
+            nested_entries
+        ])]
+    } else {
+        let mut top_entries = vec![deps_entry, libs_trace_entry];
+        if platform_independent == Some(false) {
+            let tc_spec = query_toolchain_native_spec(&cfg.lean_bin).ok()?;
+            if tc_spec.target.is_empty() {
+                return None;
+            }
+            let plat_h = lake_hash_bytes(tc_spec.target.as_bytes());
+            top_entries.push(serde_json::json!([
+                tc_spec.target,
+                format!("{:016x}", plat_h)
+            ]));
+        }
+        top_entries
+    };
+    input_vec.extend([
+        serde_json::json!([lean_cap, format!("{:016x}", lean_gh_h)]),
+        serde_json::json!([src_path.to_string_lossy(), format!("{:016x}", src_h)]),
+        serde_json::json!(["options", options_val]),
+        serde_json::json!([
+            format!("isModule: {}", is_module),
+            format!("{:016x}", is_mod_h)
+        ]),
+        serde_json::json!([
+            format!("Module.name: {}", module_name),
+            format!("{:016x}", lake_hash_name(module_name))
+        ]),
+        serde_json::json!([
+            format!("Package.id?: (some {})", pkg_id_ident),
+            format!("{:016x}", lake_hash_pkg_id(pkg_name))
+        ]),
+        serde_json::json!([lean_args_cap, format!("{:016x}", lean_args_h)]),
+    ]);
+    Some(serde_json::Value::Array(input_vec))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compute_expected_lake_module_dep_hash(
+    cfg: &ProjectConfig,
+    pkg_root: &Path,
+    pkg_name: &str,
+    pkg_base_name: &str,
+    target_name: &str,
+    is_exe_target: bool,
+    module_name: &str,
+    is_module: bool,
+    platform_independent: Option<bool>,
+    lean_options: &LeanOptionsMap,
+    strong_args: &[String],
+    src_path: &Path,
+    src_h: u64,
+    import_entries: Vec<serde_json::Value>,
+    raw_imp_dynlibs: &[PathBuf],
+) -> Option<u64> {
+    let inputs = build_expected_lake_module_inputs_value(
+        cfg,
+        pkg_root,
+        pkg_name,
+        pkg_base_name,
+        target_name,
+        is_exe_target,
+        module_name,
+        is_module,
+        platform_independent,
+        lean_options,
+        strong_args,
+        src_path,
+        src_h,
+        import_entries,
+        raw_imp_dynlibs,
+    )?;
+    lake_input_hash(&inputs).ok()
+}
+
+fn spec_in_clean_git_pinned_manifest_package(
+    cfg: &ProjectConfig,
+    spec: &DiscoveredModuleSpec,
+    cache: &mut LakeClosureCache,
+) -> bool {
+    if spec.is_root_pkg {
+        return false;
+    }
+    let spec_canon = spec
+        .pkg_root
+        .canonicalize()
+        .unwrap_or_else(|_| spec.pkg_root.clone());
+    let Some(expected_rev) = cfg
+        .manifest_packages
+        .iter()
+        .find(|mp| {
+            mp.pkg_type == "git"
+                && mp.rev.as_deref().is_some_and(|r| !r.is_empty())
+                && (mp.name == spec.pkg_name
+                    || (!spec.pkg_base_name.is_empty() && mp.name == spec.pkg_base_name)
+                    || mp.dir == spec.pkg_root
+                    || mp
+                        .dir
+                        .canonicalize()
+                        .ok()
+                        .is_some_and(|a| a == spec_canon))
+        })
+        .and_then(|mp| mp.rev.as_deref())
+    else {
+        return false;
+    };
+    let dirty_opt = cache
+        .clean_git_pin_memo
+        .entry(spec_canon.clone())
+        .or_insert_with(|| {
+            let mut rev_cmd = crate::trusted_tools::git(&spec_canon).ok()?;
+            let rev_out = rev_cmd
+                .args([
+                    "--no-optional-locks",
+                    "-C",
+                    &spec_canon.to_string_lossy(),
+                    "rev-parse",
+                    "HEAD",
+                ])
+                .output()
+                .ok()?;
+            if !rev_out.status.success() {
+                return None;
+            }
+            let head_rev = String::from_utf8_lossy(&rev_out.stdout);
+            if !head_rev.trim().eq_ignore_ascii_case(expected_rev.trim()) {
+                return None;
+            }
+            let mut st_cmd = crate::trusted_tools::git(&spec_canon).ok()?;
+            let st_out = st_cmd
+                .args([
+                    "--no-optional-locks",
+                    "-C",
+                    &spec_canon.to_string_lossy(),
+                    "status",
+                    "--porcelain",
+                    "-z",
+                    "-uall",
+                    crate::trusted_tools::NO_SUBMODULES,
+                ])
+                .output()
+                .ok()?;
+            if !st_out.status.success() {
+                return None;
+            }
+            let mut dirty = HashSet::new();
+            let mut entries = st_out
+                .stdout
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty());
+            while let Some(rec) = entries.next() {
+                if rec.len() < 4 {
+                    continue;
+                }
+                let xy = &rec[..2];
+                let path_bytes = &rec[3..];
+                let rel = PathBuf::from(String::from_utf8_lossy(path_bytes).into_owned());
+                dirty.insert(spec_canon.join(&rel));
+                if xy.contains(&b'R') || xy.contains(&b'C') {
+                    if let Some(orig) = entries.next() {
+                        let orig_rel = PathBuf::from(String::from_utf8_lossy(orig).into_owned());
+                        dirty.insert(spec_canon.join(orig_rel));
+                    }
+                }
+            }
+            Some(dirty)
+        });
+    let Some(dirty_set) = dirty_opt.as_ref() else {
+        return false;
+    };
+    let src_canon = spec
+        .src_path
+        .canonicalize()
+        .unwrap_or_else(|_| spec.src_path.clone());
+    !dirty_set.contains(&src_canon)
+}
+
 fn prebuilt_artifact_traces(
     olean_path: &Path,
 ) -> Option<(LakeModuleExportInfo, bool, serde_json::Value)> {
@@ -9055,13 +9417,30 @@ fn prebuilt_closure_export_info(
     let mut local_pairs: Vec<(String, PathBuf)> = Vec::new();
     let collect_pairs = pb_closure_opt.is_some();
     let res = (|| -> Option<LakeModuleExportInfo> {
-        if let Some(mapped_spec) = resolve_source_spec_for_prebuilt_olean(cfg, olean_path) {
+        let mapped_spec_opt = resolve_source_spec_for_prebuilt_olean(cfg, olean_path);
+        if let Some(ref mapped_spec) = mapped_spec_opt {
             let mapped_src = fs::read_to_string(&mapped_spec.src_path).ok()?;
-            if spec_source_has_disallowed_elab_host_effects(cfg, &mapped_spec, &mapped_src) {
+            if spec_source_has_disallowed_elab_host_effects(cfg, mapped_spec, &mapped_src) {
                 return None;
             }
         }
         let (mut info, is_mod, tv) = prebuilt_artifact_traces(olean_path)?;
+        if tv.get("inputs").is_none() {
+            let mapped_spec = mapped_spec_opt?;
+            return lake_closure_export_info_inner(
+                cfg,
+                &mapped_spec,
+                strict_policy,
+                cache,
+                mod_visiting,
+                pb_visiting,
+                if collect_pairs {
+                    Some(&mut local_pairs)
+                } else {
+                    None
+                },
+            );
+        }
         let actual_imports_h = recorded_trace_imports_hash(&tv)?;
         if !cfg.lean_githash.is_empty() && cfg.lean_githash != "lean-not-installed" {
             let expected_bgh = cfg.lean_githash.trim();
@@ -9312,7 +9691,8 @@ fn lake_closure_export_info_inner(
             && !cache.post_lake_refresh
             && !expected_lake_inputs.is_empty()
             && ((spec.is_root_pkg && cached_manifest.raw.is_some())
-                || package_by_root(cfg, &spec.pkg_root).is_some_and(|p| !p.inputs.is_empty()))
+                || (!is_git_pinned_manifest_package(cfg, spec)
+                    && package_by_root(cfg, &spec.pkg_root).is_some_and(|p| !p.inputs.is_empty())))
         {
             return None;
         }
@@ -9516,160 +9896,194 @@ fn lake_closure_export_info_inner(
             let tv: serde_json::Value =
                 serde_json::from_slice(&fs::read(olean_path.with_extension("trace")).ok()?).ok()?;
             let src_h = lake_hash_text(&src_raw);
-            let expected_gh = format!("{:016x}", lake_hash_bytes(cfg.lean_githash.as_bytes()));
-            let expected_src = format!("{:016x}", src_h);
-            let expected_is_mod =
-                format!("{:016x}", lake_mix_hash(1723, if is_mod { 11 } else { 13 }));
-            let expected_mod_name = format!("{:016x}", lake_hash_name(&spec.module_name));
-            let expected_pkg_id = format!("{:016x}", lake_hash_pkg_id(&spec.pkg_name));
-            let expected_imports_h = if import_entries.is_empty() {
-                1723u64
-            } else {
-                lake_input_hash(&serde_json::Value::Array(import_entries)).ok()?
-            };
-            let nested = lake_trace_uses_nested_mod_deps(&cfg.toolchain);
-            let expected_first_tag = format!("{}:deps", spec.module_name);
-            if tv.pointer("/inputs/0/0").and_then(|v| v.as_str())
-                != Some(if nested {
-                    expected_first_tag.as_str()
+            if tv.get("inputs").is_none() {
+                let actual_dep_h = tv
+                    .get("depHash")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| is_valid_16hex_hash(s))
+                    .and_then(|s| u64::from_str_radix(s, 16).ok())?;
+                if !spec.custom_target_needs.is_empty() {
+                    if !spec_in_clean_git_pinned_manifest_package(cfg, spec, cache) {
+                        return None;
+                    }
                 } else {
-                    "deps"
-                })
-            {
-                return None;
-            }
-            let actual_imports_h = recorded_trace_imports_hash(&tv)?;
-            let actual_extra_dep_h = tv
-                .pointer(if nested {
-                    "/inputs/0/1/0/1/0/1"
-                } else {
-                    "/inputs/0/1/0/1"
-                })
-                .and_then(|v| lake_input_hash(v).ok())?;
-            let empty_libs = (0..4).fold(1723u64, |acc, _| lake_mix_hash(acc, 1723));
-            let has_plat_entry = spec.platform_independent == Some(false);
-            let actual_libs_h = if nested && spec.platform_independent == Some(true) {
-                empty_libs
-            } else {
-                let libs_pair = tv.pointer(if nested { "/inputs/0/1/1" } else { "/inputs/1" })?;
-                if libs_pair.get(0).and_then(|v| v.as_str()) != Some("libs") {
-                    return None;
+                    let expected_dep_h = compute_expected_lake_module_dep_hash(
+                        cfg,
+                        &spec.pkg_root,
+                        &spec.pkg_name,
+                        &spec.pkg_base_name,
+                        &spec.target_name,
+                        spec.is_exe_target,
+                        &spec.module_name,
+                        is_mod,
+                        spec.platform_independent,
+                        &spec.lean_options,
+                        &spec.strong_args,
+                        &spec.src_path,
+                        src_h,
+                        import_entries,
+                        &[],
+                    )?;
+                    if actual_dep_h != expected_dep_h {
+                        return None;
+                    }
                 }
-                lake_input_hash(libs_pair.get(1)?).ok()?
-            };
-            let base_pkg_name = if spec.pkg_base_name.is_empty() {
-                &spec.pkg_name
             } else {
-                &spec.pkg_base_name
-            };
-            let pkg_base_ident = if base_pkg_name.contains('-') {
-                format!("«{}»", base_pkg_name)
-            } else {
-                base_pkg_name.clone()
-            };
-            let mut extra_dep_entries = vec![serde_json::json!([
-                format!("@{}:extraDep", pkg_base_ident),
-                format!("{LAKE_NIL_HASH:016x}")
-            ])];
-            if let Some(pkg) = package_by_root(cfg, &spec.pkg_root) {
-                let needs: &[String] = if spec.is_exe_target {
-                    pkg.exes
-                        .iter()
-                        .find(|e| e.name == spec.target_name && e.root == spec.module_name)
-                        .map_or(&[], |e| e.needs.as_slice())
+                let expected_gh = format!("{:016x}", lake_hash_bytes(cfg.lean_githash.as_bytes()));
+                let expected_src = format!("{:016x}", src_h);
+                let expected_is_mod =
+                    format!("{:016x}", lake_mix_hash(1723, if is_mod { 11 } else { 13 }));
+                let expected_mod_name = format!("{:016x}", lake_hash_name(&spec.module_name));
+                let expected_pkg_id = format!("{:016x}", lake_hash_pkg_id(&spec.pkg_name));
+                let expected_imports_h = if import_entries.is_empty() {
+                    1723u64
                 } else {
-                    pkg.libs
-                        .iter()
-                        .find(|l| {
-                            l.name == spec.target_name && lib_can_build_module(l, &spec.module_name)
-                        })
-                        .map_or(&[], |l| l.needs.as_slice())
+                    lake_input_hash(&serde_json::Value::Array(import_entries)).ok()?
                 };
-                extra_dep_entries.extend(
-                    needs
-                        .iter()
-                        .filter_map(|n| pkg.inputs.iter().find(|i| &i.name == n))
-                        .map(|i| {
-                            serde_json::json!([
-                                pkg.pkg_root.join(&i.path).to_string_lossy(),
-                                i.lake_hash
-                            ])
-                        }),
-                );
-            }
-            let expected_extra_dep_h =
-                lake_input_hash(&serde_json::Value::Array(extra_dep_entries)).ok()?;
-            let base_idx = if nested {
-                1usize
-            } else if has_plat_entry {
-                3usize
-            } else {
-                2usize
-            };
-            if nested {
-                let expected_nested_len = match spec.platform_independent {
-                    Some(true) => 1usize,
-                    Some(false) => 3usize,
-                    None => 2usize,
-                };
-                if tv
-                    .pointer("/inputs/0/1")
-                    .and_then(|v| v.as_array())
-                    .is_none_or(|a| a.len() != expected_nested_len)
+                let nested = lake_trace_uses_nested_mod_deps(&cfg.toolchain);
+                let expected_first_tag = format!("{}:deps", spec.module_name);
+                if tv.pointer("/inputs/0/0").and_then(|v| v.as_str())
+                    != Some(if nested {
+                        expected_first_tag.as_str()
+                    } else {
+                        "deps"
+                    })
                 {
                     return None;
                 }
-            }
-            if has_plat_entry {
-                let tc_spec = query_toolchain_native_spec(&cfg.lean_bin).ok()?;
-                if tc_spec.target.is_empty() {
-                    return None;
+                let actual_imports_h = recorded_trace_imports_hash(&tv)?;
+                let actual_extra_dep_h = tv
+                    .pointer(if nested {
+                        "/inputs/0/1/0/1/0/1"
+                    } else {
+                        "/inputs/0/1/0/1"
+                    })
+                    .and_then(|v| lake_input_hash(v).ok())?;
+                let empty_libs = (0..4).fold(1723u64, |acc, _| lake_mix_hash(acc, 1723));
+                let has_plat_entry = spec.platform_independent == Some(false);
+                let actual_libs_h = if nested && spec.platform_independent == Some(true) {
+                    empty_libs
+                } else {
+                    let libs_pair = tv.pointer(if nested { "/inputs/0/1/1" } else { "/inputs/1" })?;
+                    if libs_pair.get(0).and_then(|v| v.as_str()) != Some("libs") {
+                        return None;
+                    }
+                    lake_input_hash(libs_pair.get(1)?).ok()?
+                };
+                let base_pkg_name = if spec.pkg_base_name.is_empty() {
+                    &spec.pkg_name
+                } else {
+                    &spec.pkg_base_name
+                };
+                let pkg_base_ident = if base_pkg_name.contains('-') {
+                    format!("«{}»", base_pkg_name)
+                } else {
+                    base_pkg_name.clone()
+                };
+                let mut extra_dep_entries = vec![serde_json::json!([
+                    format!("@{}:extraDep", pkg_base_ident),
+                    format!("{LAKE_NIL_HASH:016x}")
+                ])];
+                if let Some(pkg) = package_by_root(cfg, &spec.pkg_root) {
+                    let needs: &[String] = if spec.is_exe_target {
+                        pkg.exes
+                            .iter()
+                            .find(|e| e.name == spec.target_name && e.root == spec.module_name)
+                            .map_or(&[], |e| e.needs.as_slice())
+                    } else {
+                        pkg.libs
+                            .iter()
+                            .find(|l| {
+                                l.name == spec.target_name && lib_can_build_module(l, &spec.module_name)
+                            })
+                            .map_or(&[], |l| l.needs.as_slice())
+                    };
+                    extra_dep_entries.extend(
+                        needs
+                            .iter()
+                            .filter_map(|n| pkg.inputs.iter().find(|i| &i.name == n))
+                            .map(|i| {
+                                serde_json::json!([
+                                    pkg.pkg_root.join(&i.path).to_string_lossy(),
+                                    i.lake_hash
+                                ])
+                            }),
+                    );
                 }
-                let expected_plat_h =
-                    format!("{:016x}", lake_hash_bytes(tc_spec.target.as_bytes()));
-                let plat_pair = tv.pointer(if nested { "/inputs/0/1/2" } else { "/inputs/2" })?;
-                if plat_pair.get(0).and_then(|v| v.as_str()) != Some(tc_spec.target.as_str())
-                    || plat_pair.get(1).and_then(|v| v.as_str()) != Some(expected_plat_h.as_str())
+                let expected_extra_dep_h =
+                    lake_input_hash(&serde_json::Value::Array(extra_dep_entries)).ok()?;
+                let base_idx = if nested {
+                    1usize
+                } else if has_plat_entry {
+                    3usize
+                } else {
+                    2usize
+                };
+                if nested {
+                    let expected_nested_len = match spec.platform_independent {
+                        Some(true) => 1usize,
+                        Some(false) => 3usize,
+                        None => 2usize,
+                    };
+                    if tv
+                        .pointer("/inputs/0/1")
+                        .and_then(|v| v.as_array())
+                        .is_none_or(|a| a.len() != expected_nested_len)
+                    {
+                        return None;
+                    }
+                }
+                if has_plat_entry {
+                    let tc_spec = query_toolchain_native_spec(&cfg.lean_bin).ok()?;
+                    if tc_spec.target.is_empty() {
+                        return None;
+                    }
+                    let expected_plat_h =
+                        format!("{:016x}", lake_hash_bytes(tc_spec.target.as_bytes()));
+                    let plat_pair = tv.pointer(if nested { "/inputs/0/1/2" } else { "/inputs/2" })?;
+                    if plat_pair.get(0).and_then(|v| v.as_str()) != Some(tc_spec.target.as_str())
+                        || plat_pair.get(1).and_then(|v| v.as_str()) != Some(expected_plat_h.as_str())
+                    {
+                        return None;
+                    }
+                }
+                let expected_len = base_idx + 7;
+                let inputs_arr = tv.get("inputs").and_then(|v| v.as_array())?;
+                let expected_opts_and_args_ok =
+                    verify_lake_trace_options_and_args(spec, &tv, base_idx + 2);
+                if actual_imports_h != expected_imports_h
+                    || actual_extra_dep_h != expected_extra_dep_h
+                    || actual_libs_h != empty_libs
+                    || inputs_arr
+                        .get(base_idx)
+                        .and_then(|v| v.get(1))
+                        .and_then(|v| v.as_str())
+                        != Some(expected_gh.as_str())
+                    || inputs_arr
+                        .get(base_idx + 1)
+                        .and_then(|v| v.get(1))
+                        .and_then(|v| v.as_str())
+                        != Some(expected_src.as_str())
+                    || !expected_opts_and_args_ok
+                    || inputs_arr
+                        .get(base_idx + 3)
+                        .and_then(|v| v.get(1))
+                        .and_then(|v| v.as_str())
+                        != Some(expected_is_mod.as_str())
+                    || inputs_arr
+                        .get(base_idx + 4)
+                        .and_then(|v| v.get(1))
+                        .and_then(|v| v.as_str())
+                        != Some(expected_mod_name.as_str())
+                    || inputs_arr
+                        .get(base_idx + 5)
+                        .and_then(|v| v.get(1))
+                        .and_then(|v| v.as_str())
+                        != Some(expected_pkg_id.as_str())
+                    || inputs_arr.len() != expected_len
                 {
                     return None;
                 }
-            }
-            let expected_len = base_idx + 7;
-            let inputs_arr = tv.get("inputs").and_then(|v| v.as_array())?;
-            let expected_opts_and_args_ok =
-                verify_lake_trace_options_and_args(spec, &tv, base_idx + 2);
-            if actual_imports_h != expected_imports_h
-                || actual_extra_dep_h != expected_extra_dep_h
-                || actual_libs_h != empty_libs
-                || inputs_arr
-                    .get(base_idx)
-                    .and_then(|v| v.get(1))
-                    .and_then(|v| v.as_str())
-                    != Some(expected_gh.as_str())
-                || inputs_arr
-                    .get(base_idx + 1)
-                    .and_then(|v| v.get(1))
-                    .and_then(|v| v.as_str())
-                    != Some(expected_src.as_str())
-                || !expected_opts_and_args_ok
-                || inputs_arr
-                    .get(base_idx + 3)
-                    .and_then(|v| v.get(1))
-                    .and_then(|v| v.as_str())
-                    != Some(expected_is_mod.as_str())
-                || inputs_arr
-                    .get(base_idx + 4)
-                    .and_then(|v| v.get(1))
-                    .and_then(|v| v.as_str())
-                    != Some(expected_mod_name.as_str())
-                || inputs_arr
-                    .get(base_idx + 5)
-                    .and_then(|v| v.get(1))
-                    .and_then(|v| v.as_str())
-                    != Some(expected_pkg_id.as_str())
-                || inputs_arr.len() != expected_len
-            {
-                return None;
             }
         }
         Some(LakeModuleExportInfo {
@@ -9785,8 +10199,9 @@ pub(crate) fn dep_pkg_import_pins_consistent(
                 || (!cache.post_lake_refresh
                     && !expected_lake_inputs.is_empty()
                     && ((cur.is_root_pkg && cached_manifest.raw.is_some())
-                        || package_by_root(cfg, &cur.pkg_root)
-                            .is_some_and(|p| !p.inputs.is_empty())))
+                        || (!is_git_pinned_manifest_package(cfg, &cur)
+                            && package_by_root(cfg, &cur.pkg_root)
+                                .is_some_and(|p| !p.inputs.is_empty()))))
                 || !pin_matches_lake
             {
                 return false;
@@ -10446,7 +10861,7 @@ pub(crate) fn find_dirty_modules_in_otherwise_fresh_dag(
                 &src_raw,
                 node.is_module,
                 node.needs_c,
-                true,
+                false,
                 false,
                 !node.needs_c,
             );
@@ -10477,99 +10892,6 @@ pub(crate) fn find_dirty_modules_in_otherwise_fresh_dag(
                 mark_dirty(&mut dirty_mods, &mut cascading_dirty_mods, true)?;
                 continue;
             };
-            let expected_src_h = format!("{:016x}", lake_hash_text(&src_raw));
-            let recorded_src_h = trace_recorded_src_hash(&tv);
-            let mut src_is_proof_only_dirty = false;
-            if recorded_src_h != Some(expected_src_h.as_str()) {
-                let matches_proof_only_base = recorded_src_h.is_some_and(|rec| {
-                    proof_only_base_trace_src_hashes.contains(&(mod_name.clone(), rec.to_string()))
-                });
-                if !matches_proof_only_base {
-                    mark_dirty(&mut dirty_mods, &mut cascading_dirty_mods, true)?;
-                    continue;
-                }
-                src_is_proof_only_dirty = true;
-            }
-            let base_idx = if nested {
-                1usize
-            } else if node.platform_independent == Some(false) {
-                3usize
-            } else {
-                2usize
-            };
-            if tv
-                .pointer(&format!("/inputs/{}/1", base_idx))
-                .and_then(|v| v.as_str())
-                != Some(expected_lean_gh_h.as_str())
-            {
-                return None;
-            }
-            let mut opt_entries = Vec::new();
-            let mut lean_args = Vec::new();
-            for a in &node.strong_args {
-                if a.starts_with("-D") {
-                    opt_entries.push(serde_json::json!([
-                        a,
-                        format!("{:016x}", lake_hash_text(a))
-                    ]));
-                } else {
-                    lean_args.push(a.as_str());
-                }
-            }
-            let expected_opts_h = lake_input_hash(&serde_json::Value::Array(opt_entries)).ok();
-            let actual_opts_h = tv
-                .pointer(&format!("/inputs/{}/1", base_idx + 2))
-                .and_then(|v| lake_input_hash(v).ok());
-            if expected_opts_h.is_none() || expected_opts_h != actual_opts_h {
-                return None;
-            }
-            let expected_is_mod_h = format!(
-                "{:016x}",
-                lake_mix_hash(LAKE_NIL_HASH, if node.is_module { 11 } else { 13 })
-            );
-            if tv
-                .pointer(&format!("/inputs/{}/1", base_idx + 3))
-                .and_then(|v| v.as_str())
-                != Some(expected_is_mod_h.as_str())
-            {
-                return None;
-            }
-            let expected_lean_args_h = format!(
-                "{:016x}",
-                lean_args.iter().fold(LAKE_NIL_HASH, |acc, a| {
-                    lake_mix_hash(acc, lake_hash_bytes(a.as_bytes()))
-                })
-            );
-            if tv
-                .pointer(&format!("/inputs/{}/1", base_idx + 6))
-                .and_then(|v| v.as_str())
-                != Some(expected_lean_args_h.as_str())
-            {
-                return None;
-            }
-            let pkg_ident = if node.pkg_name.contains('-') {
-                format!("«{}»", node.pkg_name)
-            } else {
-                node.pkg_name.clone()
-            };
-            let mut extra_dep_entries = vec![serde_json::json!([
-                format!("@{}:extraDep", pkg_ident),
-                nil_hex
-            ])];
-            extra_dep_entries.extend(lake_needs_trace_entries(cfg, node));
-            let expected_extra_h =
-                lake_input_hash(&serde_json::Value::Array(extra_dep_entries)).ok();
-            let actual_extra_ptr = if nested {
-                "/inputs/0/1/0/1/0/1"
-            } else {
-                "/inputs/0/1/0/1"
-            };
-            let actual_extra_h = tv
-                .pointer(actual_extra_ptr)
-                .and_then(|v| lake_input_hash(v).ok());
-            if expected_extra_h.is_none() || expected_extra_h != actual_extra_h {
-                return None;
-            }
             let mut import_entries = Vec::new();
             let mut visiting = HashSet::new();
             let mut imp_dirty = false;
@@ -10611,52 +10933,148 @@ pub(crate) fn find_dirty_modules_in_otherwise_fresh_dag(
                     imp_dirty = true;
                     break;
                 };
-                if !node.is_module {
-                    import_entries.push(serde_json::json!([
-                        format!("{} transitive imports (legacy)", imp.module),
-                        format!("{:016x}", exp_info.legacy_trans_trace)
-                    ]));
-                    import_entries.push(serde_json::json!([
-                        format!("{}:importAllArts", imp.module),
-                        format!("{:016x}", exp_info.all_arts_trace)
-                    ]));
-                } else if imp.import_all {
-                    import_entries.push(serde_json::json!([
-                        format!("{} transitive imports (all)", imp.module),
-                        format!("{:016x}", exp_info.all_trans_trace)
-                    ]));
-                    import_entries.push(serde_json::json!([
-                        format!("{}:importAllArts", imp.module),
-                        format!("{:016x}", exp_info.all_arts_trace)
-                    ]));
-                } else if imp.is_meta {
-                    import_entries.push(serde_json::json!([
-                        format!("{} transitive imports (meta)", imp.module),
-                        format!("{:016x}", exp_info.meta_trans_trace)
-                    ]));
-                    import_entries.push(serde_json::json!([
-                        format!("{}:importArts (meta)", imp.module),
-                        format!("{:016x}", exp_info.meta_arts_trace)
-                    ]));
-                } else {
-                    import_entries.push(serde_json::json!([
-                        format!("{} transitive imports (public)", imp.module),
-                        format!("{:016x}", exp_info.trans_trace)
-                    ]));
-                    import_entries.push(serde_json::json!([
-                        format!("{}:importArts", imp.module),
-                        format!("{:016x}", exp_info.arts_trace)
-                    ]));
-                }
+                import_entries.extend(lake_import_trace_entries(node.is_module, imp, &exp_info));
             }
             if imp_dirty {
                 mark_dirty(&mut dirty_mods, &mut cascading_dirty_mods, true)?;
                 continue;
             }
-            let expected_imps_val = serde_json::Value::Array(import_entries);
+            let src_h = lake_hash_text(&src_raw);
+            if tv.get("inputs").is_none() {
+                let raw_imp_dynlibs = compute_module_raw_import_dynlibs(dag, node);
+                let actual_dep_h = tv
+                    .get("depHash")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| is_valid_16hex_hash(s))
+                    .and_then(|s| u64::from_str_radix(s, 16).ok());
+                let expected_dep_h = compute_expected_lake_module_dep_hash(
+                    cfg,
+                    &node.pkg_root,
+                    &node.pkg_name,
+                    &node.pkg_base_name,
+                    &node.target_name,
+                    node.is_exe_target,
+                    &node.module_name,
+                    node.is_module,
+                    node.platform_independent,
+                    &node.lean_options,
+                    &node.strong_args,
+                    &node.src_path,
+                    src_h,
+                    import_entries,
+                    &raw_imp_dynlibs,
+                );
+                if actual_dep_h.is_none() || actual_dep_h != expected_dep_h {
+                    mark_dirty(&mut dirty_mods, &mut cascading_dirty_mods, true)?;
+                }
+                continue;
+            }
+            let expected_src_h = format!("{:016x}", src_h);
+            let recorded_src_h = trace_recorded_src_hash(&tv);
+            let mut src_is_proof_only_dirty = false;
+            if recorded_src_h != Some(expected_src_h.as_str()) {
+                let matches_proof_only_base = recorded_src_h.is_some_and(|rec| {
+                    proof_only_base_trace_src_hashes.contains(&(mod_name.clone(), rec.to_string()))
+                });
+                if !matches_proof_only_base {
+                    mark_dirty(&mut dirty_mods, &mut cascading_dirty_mods, true)?;
+                    continue;
+                }
+                src_is_proof_only_dirty = true;
+            }
+            let base_idx = if nested {
+                1usize
+            } else if node.platform_independent == Some(false) {
+                3usize
+            } else {
+                2usize
+            };
+            if tv
+                .pointer(&format!("/inputs/{}/1", base_idx))
+                .and_then(|v| v.as_str())
+                != Some(expected_lean_gh_h.as_str())
+            {
+                return None;
+            }
+            let expected_opts_val = if node.lean_options.is_empty() {
+                serde_json::json!("00000000000006bb")
+            } else {
+                let mut opt_entries = Vec::with_capacity(node.lean_options.len());
+                for (k, v) in &node.lean_options {
+                    let flag = format!("-D{}={}", k.to_lean_string(), v.as_cli_flag_value());
+                    opt_entries.push(serde_json::json!([
+                        flag,
+                        format!("{:016x}", lake_hash_text(&flag))
+                    ]));
+                }
+                serde_json::Value::Array(opt_entries)
+            };
+            let expected_opts_h = lake_input_hash(&expected_opts_val).ok();
+            let actual_opts_h = tv
+                .pointer(&format!("/inputs/{}/1", base_idx + 2))
+                .and_then(|v| lake_input_hash(v).ok());
+            if expected_opts_h.is_none() || expected_opts_h != actual_opts_h {
+                return None;
+            }
+            let expected_is_mod_h = format!(
+                "{:016x}",
+                lake_mix_hash(LAKE_NIL_HASH, if node.is_module { 11 } else { 13 })
+            );
+            if tv
+                .pointer(&format!("/inputs/{}/1", base_idx + 3))
+                .and_then(|v| v.as_str())
+                != Some(expected_is_mod_h.as_str())
+            {
+                return None;
+            }
+            let expected_lean_args_h = format!(
+                "{:016x}",
+                node.strong_args.iter().fold(LAKE_NIL_HASH, |acc, a| {
+                    lake_mix_hash(acc, lake_hash_bytes(a.as_bytes()))
+                })
+            );
+            if tv
+                .pointer(&format!("/inputs/{}/1", base_idx + 6))
+                .and_then(|v| v.as_str())
+                != Some(expected_lean_args_h.as_str())
+            {
+                return None;
+            }
+            let base_pkg_name = if node.pkg_base_name.is_empty() {
+                &node.pkg_name
+            } else {
+                &node.pkg_base_name
+            };
+            let pkg_base_ident = if base_pkg_name.contains('-') {
+                format!("«{}»", base_pkg_name)
+            } else {
+                base_pkg_name.clone()
+            };
+            let mut extra_dep_entries = vec![serde_json::json!([
+                format!("@{}:extraDep", pkg_base_ident),
+                nil_hex
+            ])];
+            extra_dep_entries.extend(lake_needs_trace_entries(cfg, node));
+            let expected_extra_h =
+                lake_input_hash(&serde_json::Value::Array(extra_dep_entries)).ok();
+            let actual_extra_ptr = if nested {
+                "/inputs/0/1/0/1/0/1"
+            } else {
+                "/inputs/0/1/0/1"
+            };
+            let actual_extra_h = tv
+                .pointer(actual_extra_ptr)
+                .and_then(|v| lake_input_hash(v).ok());
+            if expected_extra_h.is_none() || expected_extra_h != actual_extra_h {
+                return None;
+            }
+            let expected_imps_val = if import_entries.is_empty() {
+                serde_json::json!("00000000000006bb")
+            } else {
+                serde_json::Value::Array(import_entries)
+            };
             let expected_imps_h = lake_input_hash(&expected_imps_val).ok();
-            let actual_imps_h =
-                trace_recorded_imports_array(&tv).and_then(|v| lake_input_hash(v).ok());
+            let actual_imps_h = recorded_trace_imports_hash(&tv);
             if expected_imps_h.is_none() || expected_imps_h != actual_imps_h {
                 mark_dirty(&mut dirty_mods, &mut cascading_dirty_mods, true)?;
                 continue;
@@ -10752,7 +11170,7 @@ pub(crate) fn seed_verified_fresh_modules_into_disposable_snapshot(
                 &dst_src_raw,
                 node.is_module,
                 node.needs_c,
-                true,
+                false,
                 true,
                 !node.needs_c,
             );
@@ -10768,92 +11186,6 @@ pub(crate) fn seed_verified_fresh_modules_into_disposable_snapshot(
                 dirty_mods.insert(mod_name.clone());
                 continue;
             };
-            let nested = lake_trace_uses_nested_mod_deps(&dst_cfg.toolchain);
-            let base_idx = if nested {
-                1usize
-            } else if node.platform_independent == Some(false) {
-                3usize
-            } else {
-                2usize
-            };
-            if tv
-                .pointer(&format!("/inputs/{}/1", base_idx))
-                .and_then(|v| v.as_str())
-                != Some(expected_lean_gh_h.as_str())
-            {
-                dirty_mods.insert(mod_name.clone());
-                continue;
-            }
-            let mut opt_entries = Vec::new();
-            let mut lean_args = Vec::new();
-            for a in &node.strong_args {
-                if a.starts_with("-D") {
-                    opt_entries.push(serde_json::json!([
-                        a,
-                        format!("{:016x}", lake_hash_text(a))
-                    ]));
-                } else {
-                    lean_args.push(a.as_str());
-                }
-            }
-            let expected_opts_h = lake_input_hash(&serde_json::Value::Array(opt_entries)).ok();
-            let actual_opts_h = tv
-                .pointer(&format!("/inputs/{}/1", base_idx + 2))
-                .and_then(|v| lake_input_hash(v).ok());
-            if expected_opts_h.is_none() || expected_opts_h != actual_opts_h {
-                dirty_mods.insert(mod_name.clone());
-                continue;
-            }
-            let expected_is_mod_h = format!(
-                "{:016x}",
-                lake_mix_hash(LAKE_NIL_HASH, if node.is_module { 11 } else { 13 })
-            );
-            if tv
-                .pointer(&format!("/inputs/{}/1", base_idx + 3))
-                .and_then(|v| v.as_str())
-                != Some(expected_is_mod_h.as_str())
-            {
-                dirty_mods.insert(mod_name.clone());
-                continue;
-            }
-            let expected_lean_args_h = format!(
-                "{:016x}",
-                lean_args.iter().fold(LAKE_NIL_HASH, |acc, a| {
-                    lake_mix_hash(acc, lake_hash_bytes(a.as_bytes()))
-                })
-            );
-            if tv
-                .pointer(&format!("/inputs/{}/1", base_idx + 6))
-                .and_then(|v| v.as_str())
-                != Some(expected_lean_args_h.as_str())
-            {
-                dirty_mods.insert(mod_name.clone());
-                continue;
-            }
-            let pkg_ident = if node.pkg_name.contains('-') {
-                format!("«{}»", node.pkg_name)
-            } else {
-                node.pkg_name.clone()
-            };
-            let mut extra_dep_entries = vec![serde_json::json!([
-                format!("@{}:extraDep", pkg_ident),
-                nil_hex
-            ])];
-            extra_dep_entries.extend(lake_needs_trace_entries(&dst_cfg, node));
-            let expected_extra_h =
-                lake_input_hash(&serde_json::Value::Array(extra_dep_entries)).ok();
-            let actual_extra_ptr = if nested {
-                "/inputs/0/1/0/1/0/1"
-            } else {
-                "/inputs/0/1/0/1"
-            };
-            let actual_extra_h = tv
-                .pointer(actual_extra_ptr)
-                .and_then(|v| lake_input_hash(v).ok());
-            if expected_extra_h.is_none() || expected_extra_h != actual_extra_h {
-                dirty_mods.insert(mod_name.clone());
-                continue;
-            }
             let mut import_entries = Vec::new();
             let mut visiting = HashSet::new();
             let mut imp_dirty = false;
@@ -10895,55 +11227,148 @@ pub(crate) fn seed_verified_fresh_modules_into_disposable_snapshot(
                     imp_dirty = true;
                     break;
                 };
-                if !node.is_module {
-                    import_entries.push(serde_json::json!([
-                        format!("{} transitive imports (legacy)", imp.module),
-                        format!("{:016x}", exp_info.legacy_trans_trace)
-                    ]));
-                    import_entries.push(serde_json::json!([
-                        format!("{}:importAllArts", imp.module),
-                        format!("{:016x}", exp_info.all_arts_trace)
-                    ]));
-                } else if imp.import_all {
-                    import_entries.push(serde_json::json!([
-                        format!("{} transitive imports (all)", imp.module),
-                        format!("{:016x}", exp_info.all_trans_trace)
-                    ]));
-                    import_entries.push(serde_json::json!([
-                        format!("{}:importAllArts", imp.module),
-                        format!("{:016x}", exp_info.all_arts_trace)
-                    ]));
-                } else if imp.is_meta {
-                    import_entries.push(serde_json::json!([
-                        format!("{} transitive imports (meta)", imp.module),
-                        format!("{:016x}", exp_info.meta_trans_trace)
-                    ]));
-                    import_entries.push(serde_json::json!([
-                        format!("{}:importArts (meta)", imp.module),
-                        format!("{:016x}", exp_info.meta_arts_trace)
-                    ]));
-                } else {
-                    import_entries.push(serde_json::json!([
-                        format!("{} transitive imports (public)", imp.module),
-                        format!("{:016x}", exp_info.trans_trace)
-                    ]));
-                    import_entries.push(serde_json::json!([
-                        format!("{}:importArts", imp.module),
-                        format!("{:016x}", exp_info.arts_trace)
-                    ]));
-                }
+                import_entries.extend(lake_import_trace_entries(node.is_module, imp, &exp_info));
             }
             if imp_dirty {
                 dirty_mods.insert(mod_name.clone());
                 continue;
             }
-            let expected_imps_val = serde_json::Value::Array(import_entries);
-            let expected_imps_h = lake_input_hash(&expected_imps_val).ok();
-            let actual_imps_h =
-                trace_recorded_imports_array(&tv).and_then(|v| lake_input_hash(v).ok());
-            if expected_imps_h.is_none() || expected_imps_h != actual_imps_h {
-                dirty_mods.insert(mod_name.clone());
-                continue;
+            if tv.get("inputs").is_none() {
+                let raw_imp_dynlibs = compute_module_raw_import_dynlibs(&dst_dag, node);
+                let actual_dep_h = tv
+                    .get("depHash")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| is_valid_16hex_hash(s))
+                    .and_then(|s| u64::from_str_radix(s, 16).ok());
+                let expected_dep_h = compute_expected_lake_module_dep_hash(
+                    &dst_cfg,
+                    &node.pkg_root,
+                    &node.pkg_name,
+                    &node.pkg_base_name,
+                    &node.target_name,
+                    node.is_exe_target,
+                    &node.module_name,
+                    node.is_module,
+                    node.platform_independent,
+                    &node.lean_options,
+                    &node.strong_args,
+                    &src_cfg.root_pkg.pkg_root.join(
+                        node.src_path
+                            .strip_prefix(&dst_cfg.root_pkg.pkg_root)
+                            .unwrap_or(&node.src_path),
+                    ),
+                    lake_hash_text(&dst_src_raw),
+                    import_entries,
+                    &raw_imp_dynlibs,
+                );
+                if actual_dep_h.is_none() || actual_dep_h != expected_dep_h {
+                    dirty_mods.insert(mod_name.clone());
+                    continue;
+                }
+            } else {
+                let nested = lake_trace_uses_nested_mod_deps(&dst_cfg.toolchain);
+                let base_idx = if nested {
+                    1usize
+                } else if node.platform_independent == Some(false) {
+                    3usize
+                } else {
+                    2usize
+                };
+                if tv
+                    .pointer(&format!("/inputs/{}/1", base_idx))
+                    .and_then(|v| v.as_str())
+                    != Some(expected_lean_gh_h.as_str())
+                {
+                    dirty_mods.insert(mod_name.clone());
+                    continue;
+                }
+                let expected_opts_val = if node.lean_options.is_empty() {
+                    serde_json::json!("00000000000006bb")
+                } else {
+                    let mut opt_entries = Vec::with_capacity(node.lean_options.len());
+                    for (k, v) in &node.lean_options {
+                        let flag = format!("-D{}={}", k.to_lean_string(), v.as_cli_flag_value());
+                        opt_entries.push(serde_json::json!([
+                            flag,
+                            format!("{:016x}", lake_hash_text(&flag))
+                        ]));
+                    }
+                    serde_json::Value::Array(opt_entries)
+                };
+                let expected_opts_h = lake_input_hash(&expected_opts_val).ok();
+                let actual_opts_h = tv
+                    .pointer(&format!("/inputs/{}/1", base_idx + 2))
+                    .and_then(|v| lake_input_hash(v).ok());
+                if expected_opts_h.is_none() || expected_opts_h != actual_opts_h {
+                    dirty_mods.insert(mod_name.clone());
+                    continue;
+                }
+                let expected_is_mod_h = format!(
+                    "{:016x}",
+                    lake_mix_hash(LAKE_NIL_HASH, if node.is_module { 11 } else { 13 })
+                );
+                if tv
+                    .pointer(&format!("/inputs/{}/1", base_idx + 3))
+                    .and_then(|v| v.as_str())
+                    != Some(expected_is_mod_h.as_str())
+                {
+                    dirty_mods.insert(mod_name.clone());
+                    continue;
+                }
+                let expected_lean_args_h = format!(
+                    "{:016x}",
+                    node.strong_args.iter().fold(LAKE_NIL_HASH, |acc, a| {
+                        lake_mix_hash(acc, lake_hash_bytes(a.as_bytes()))
+                    })
+                );
+                if tv
+                    .pointer(&format!("/inputs/{}/1", base_idx + 6))
+                    .and_then(|v| v.as_str())
+                    != Some(expected_lean_args_h.as_str())
+                {
+                    dirty_mods.insert(mod_name.clone());
+                    continue;
+                }
+                let base_pkg_name = if node.pkg_base_name.is_empty() {
+                    &node.pkg_name
+                } else {
+                    &node.pkg_base_name
+                };
+                let pkg_base_ident = if base_pkg_name.contains('-') {
+                    format!("«{}»", base_pkg_name)
+                } else {
+                    base_pkg_name.clone()
+                };
+                let mut extra_dep_entries = vec![serde_json::json!([
+                    format!("@{}:extraDep", pkg_base_ident),
+                    nil_hex
+                ])];
+                extra_dep_entries.extend(lake_needs_trace_entries(&dst_cfg, node));
+                let expected_extra_h =
+                    lake_input_hash(&serde_json::Value::Array(extra_dep_entries)).ok();
+                let actual_extra_ptr = if nested {
+                    "/inputs/0/1/0/1/0/1"
+                } else {
+                    "/inputs/0/1/0/1"
+                };
+                let actual_extra_h = tv
+                    .pointer(actual_extra_ptr)
+                    .and_then(|v| lake_input_hash(v).ok());
+                if expected_extra_h.is_none() || expected_extra_h != actual_extra_h {
+                    dirty_mods.insert(mod_name.clone());
+                    continue;
+                }
+                let expected_imps_val = if import_entries.is_empty() {
+                    serde_json::json!("00000000000006bb")
+                } else {
+                    serde_json::Value::Array(import_entries)
+                };
+                let expected_imps_h = lake_input_hash(&expected_imps_val).ok();
+                let actual_imps_h = recorded_trace_imports_hash(&tv);
+                if expected_imps_h.is_none() || expected_imps_h != actual_imps_h {
+                    dirty_mods.insert(mod_name.clone());
+                    continue;
+                }
             }
             for suffix in [
                 ".olean",
@@ -11117,6 +11542,7 @@ fn is_git_pinned_manifest_package(cfg: &ProjectConfig, spec: &DiscoveredModuleSp
         mp.pkg_type == "git"
             && mp.rev.as_deref().is_some_and(|r| !r.is_empty())
             && (mp.name == spec.pkg_name
+                || (!spec.pkg_base_name.is_empty() && mp.name == spec.pkg_base_name)
                 || mp.dir == spec.pkg_root
                 || mp
                     .dir
@@ -12272,6 +12698,7 @@ fn build_module_dag_inner(
                     strong_args: strong_args.clone(),
                     weak_args: weak_args.clone(),
                     extern_lib_digests: extern_digests.clone(),
+                    custom_target_needs: lib.custom_target_needs.clone(),
                     pkg_config_digest: target_pkg.config_digest.clone(),
                     unsupported: target_pkg
                         .unsupported
@@ -12713,6 +13140,7 @@ fn build_module_dag_inner(
                             strong_args: strong_args.clone(),
                             weak_args: weak_args.clone(),
                             extern_lib_digests: Vec::new(),
+                            custom_target_needs: Vec::new(),
                             pkg_config_digest: root_pkg.config_digest.clone(),
                             unsupported: root_pkg.unsupported.clone(),
                             native_unsupported: root_pkg.native_unsupported.clone(),
@@ -17346,19 +17774,7 @@ fn write_lake_module_hashes_and_trace_with_memo(
     let axiom_ok = !hygiene.has_axiom
         || !node.is_root_pkg
         || splitter::HygieneReport::has_custom_axiom_policy();
-    let checking_weakening_ok = if !node.is_root_pkg
-        && cfg.manifest_packages.iter().any(|mp| {
-            mp.pkg_type == "git"
-                && mp.rev.as_deref().is_some_and(|r| !r.is_empty())
-                && (mp.name == node.pkg_name
-                    || mp.dir == node.pkg_root
-                    || mp
-                        .dir
-                        .canonicalize()
-                        .ok()
-                        .zip(node.pkg_root.canonicalize().ok())
-                        .is_some_and(|(a, b)| a == b))
-        }) {
+    let checking_weakening_ok = if node_is_git_pinned_manifest_package(cfg, node) {
         !hygiene.has_checking_weakening_option
     } else {
         !hygiene.has_checking_weakening
@@ -17458,174 +17874,32 @@ fn write_lake_module_hashes_and_trace_with_memo(
         }
     }
     let src_h = lake_hash_text(&src_raw);
-    let options_val = if node.lean_options.is_empty() {
-        serde_json::json!("00000000000006bb")
+    let raw_imp_dynlibs = if node.platform_independent == Some(true) {
+        Vec::new()
     } else {
-        let mut opt_entries = Vec::with_capacity(node.lean_options.len());
-        for (k, v) in &node.lean_options {
-            let flag = format!("-D{}={}", k.to_lean_string(), v.as_cli_flag_value());
-            opt_entries.push(serde_json::json!([
-                flag,
-                format!("{:016x}", lake_hash_text(&flag))
-            ]));
-        }
-        serde_json::Value::Array(opt_entries)
+        compute_module_raw_import_dynlibs(dag, node)
     };
-    let lean_args_h = node.strong_args.iter().fold(LAKE_NIL_HASH, |acc, a| {
-        lake_mix_hash(acc, lake_hash_bytes(a.as_bytes()))
-    });
-    let base_pkg_name = if node.pkg_base_name.is_empty() {
-        &node.pkg_name
-    } else {
-        &node.pkg_base_name
-    };
-    let pkg_base_ident = if base_pkg_name.contains('-') {
-        format!("«{}»", base_pkg_name)
-    } else {
-        base_pkg_name.clone()
-    };
-    let pkg_id_ident = if node.pkg_name.contains('-') {
-        format!("«{}»", node.pkg_name)
-    } else {
-        node.pkg_name.clone()
-    };
-    let ver_short = cfg
-        .toolchain
-        .rsplit(':')
-        .next()
-        .unwrap_or(&cfg.toolchain)
-        .trim_start_matches('v');
-    let lean_cap = format!("Lean {}, commit {}", ver_short, cfg.lean_githash);
-    let lean_gh_h = lake_hash_bytes(cfg.lean_githash.as_bytes());
-    let is_mod_h = lake_mix_hash(LAKE_NIL_HASH, if node.is_module { 11 } else { 13 });
-    let lean_args_cap = if node.strong_args.is_empty() {
-        "Module.leanArgs: #[]".to_string()
-    } else {
-        format!("Module.leanArgs: #[{}]", node.strong_args.join(", "))
-    };
-    let libs_trace_entry = if node.platform_independent == Some(true) {
-        serde_json::json!([
-            "libs",
-            [
-                ["import dynlibs", "00000000000006bb"],
-                ["package external libraries", "00000000000006bb"],
-                ["module dynlibs", "00000000000006bb"],
-                ["module plugins", "00000000000006bb"]
-            ]
-        ])
-    } else {
-        let import_dynlib_paths = compute_module_raw_import_dynlibs(dag, node);
-        let mut import_dynlib_entries = Vec::with_capacity(import_dynlib_paths.len());
-        for p in &import_dynlib_paths {
-            match verify_and_hash_artifact_bytes(p, false, false) {
-                Ok(h) => {
-                    import_dynlib_entries.push(serde_json::json!([
-                        p.to_string_lossy(),
-                        format!("{:016x}", h)
-                    ]));
-                }
-                Err(_) => {
-                    dep_trace_fresh = false;
-                    break;
-                }
-            }
-        }
-        let import_dynlibs_json = if import_dynlib_entries.is_empty() {
-            serde_json::Value::String("00000000000006bb".to_string())
-        } else {
-            serde_json::Value::Array(import_dynlib_entries)
-        };
-        serde_json::json!([
-            "libs",
-            [
-                ["import dynlibs", import_dynlibs_json],
-                ["package external libraries", "00000000000006bb"],
-                ["module dynlibs", "00000000000006bb"],
-                ["module plugins", "00000000000006bb"]
-            ]
-        ])
-    };
-    let inputs_val = if import_entries.is_empty() {
-        serde_json::json!("00000000000006bb")
-    } else {
-        serde_json::Value::Array(import_entries)
-    };
-    let mut extra_dep_entries = vec![serde_json::json!([
-        format!("@{}:extraDep", pkg_base_ident),
-        format!("{LAKE_NIL_HASH:016x}")
-    ])];
-    extra_dep_entries.extend(lake_needs_trace_entries(cfg, node));
-    let deps_entry = serde_json::json!([
-        "deps",
-        [
-            [
-                format!("{}/{}:extraDep", pkg_base_ident, node.target_name),
-                extra_dep_entries
-            ],
-            ["imports", inputs_val]
-        ]
-    ]);
-    let nested = lake_trace_uses_nested_mod_deps(&cfg.toolchain);
-    let mut input_vec = if nested {
-        let mut nested_entries = vec![deps_entry];
-        if node.platform_independent != Some(true) {
-            nested_entries.push(libs_trace_entry);
-        }
-        if node.platform_independent == Some(false) {
-            match query_toolchain_native_spec(&cfg.lean_bin) {
-                Ok(tc_spec) if !tc_spec.target.is_empty() => {
-                    let plat_h = lake_hash_bytes(tc_spec.target.as_bytes());
-                    nested_entries.push(serde_json::json!([
-                        tc_spec.target,
-                        format!("{:016x}", plat_h)
-                    ]));
-                }
-                _ => {
-                    dep_trace_fresh = false;
-                }
-            }
-        }
-        vec![serde_json::json!([
-            format!("{}:deps", node.module_name),
-            nested_entries
-        ])]
-    } else {
-        let mut top_entries = vec![deps_entry, libs_trace_entry];
-        if node.platform_independent == Some(false) {
-            match query_toolchain_native_spec(&cfg.lean_bin) {
-                Ok(tc_spec) if !tc_spec.target.is_empty() => {
-                    let plat_h = lake_hash_bytes(tc_spec.target.as_bytes());
-                    top_entries.push(serde_json::json!([
-                        tc_spec.target,
-                        format!("{:016x}", plat_h)
-                    ]));
-                }
-                _ => {
-                    dep_trace_fresh = false;
-                }
-            }
-        }
-        top_entries
-    };
-    input_vec.extend([
-        serde_json::json!([lean_cap, format!("{:016x}", lean_gh_h)]),
-        serde_json::json!([node.src_path.to_string_lossy(), format!("{:016x}", src_h)]),
-        serde_json::json!(["options", options_val]),
-        serde_json::json!([
-            format!("isModule: {}", node.is_module),
-            format!("{:016x}", is_mod_h)
-        ]),
-        serde_json::json!([
-            format!("Module.name: {}", node.module_name),
-            format!("{:016x}", lake_hash_name(&node.module_name))
-        ]),
-        serde_json::json!([
-            format!("Package.id?: (some {})", pkg_id_ident),
-            format!("{:016x}", lake_hash_pkg_id(&node.pkg_name))
-        ]),
-        serde_json::json!([lean_args_cap, format!("{:016x}", lean_args_h)]),
-    ]);
-    let inputs = serde_json::Value::Array(input_vec);
+    let inputs_opt = build_expected_lake_module_inputs_value(
+        cfg,
+        &node.pkg_root,
+        &node.pkg_name,
+        &node.pkg_base_name,
+        &node.target_name,
+        node.is_exe_target,
+        &node.module_name,
+        node.is_module,
+        node.platform_independent,
+        &node.lean_options,
+        &node.strong_args,
+        &node.src_path,
+        src_h,
+        import_entries,
+        &raw_imp_dynlibs,
+    );
+    if inputs_opt.is_none() {
+        dep_trace_fresh = false;
+    }
+    let inputs = inputs_opt.unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
     let dep_hash_opt = lake_input_hash(&inputs).ok();
     let stubbed_placeholder_count = if is_stubbed_skeleton { 1u64 } else { 0u64 };
     let total_shard_count = 1u64;
@@ -20753,6 +21027,7 @@ fn node_is_git_pinned_manifest_package(cfg: &ProjectConfig, node: &ModuleNode) -
             mp.pkg_type == "git"
                 && mp.rev.as_deref().is_some_and(|r| !r.is_empty())
                 && (mp.name == node.pkg_name
+                    || (!node.pkg_base_name.is_empty() && mp.name == node.pkg_base_name)
                     || mp.dir == node.pkg_root
                     || mp
                         .dir
@@ -21121,19 +21396,7 @@ fn probe_warm_on_disk_module_candidate(
     let axiom_ok = !hygiene.has_axiom
         || !node.is_root_pkg
         || splitter::HygieneReport::has_custom_axiom_policy();
-    let checking_weakening_ok = if !node.is_root_pkg
-        && cfg.manifest_packages.iter().any(|mp| {
-            mp.pkg_type == "git"
-                && mp.rev.as_deref().is_some_and(|r| !r.is_empty())
-                && (mp.name == node.pkg_name
-                    || mp.dir == node.pkg_root
-                    || mp
-                        .dir
-                        .canonicalize()
-                        .ok()
-                        .zip(node.pkg_root.canonicalize().ok())
-                        .is_some_and(|(a, b)| a == b))
-        }) {
+    let checking_weakening_ok = if node_is_git_pinned_manifest_package(cfg, node) {
         !hygiene.has_checking_weakening_option
     } else {
         !hygiene.has_checking_weakening
@@ -21357,7 +21620,7 @@ fn probe_warm_on_disk_module_candidate(
         &src_raw,
         node.is_module,
         node.needs_c,
-        true,
+        false,
         true,
         !node.needs_c,
     )
@@ -21396,6 +21659,38 @@ fn probe_warm_on_disk_module_candidate(
         let exp_info =
             compute_lake_export_info(cfg, dag, node, &imp.module, exp_memo, &mut visiting).ok()?;
         import_entries.extend(lake_import_trace_entries(node.is_module, imp, &exp_info));
+    }
+
+    if tv.get("inputs").is_none() {
+        let actual_dep_h = tv
+            .get("depHash")
+            .and_then(|v| v.as_str())
+            .filter(|s| is_valid_16hex_hash(s))
+            .and_then(|s| u64::from_str_radix(s, 16).ok())?;
+        let expected_dep_h = compute_expected_lake_module_dep_hash(
+            cfg,
+            &node.pkg_root,
+            &node.pkg_name,
+            &node.pkg_base_name,
+            &node.target_name,
+            node.is_exe_target,
+            &node.module_name,
+            node.is_module,
+            node.platform_independent,
+            &node.lean_options,
+            &node.strong_args,
+            &node.src_path,
+            lake_hash_text(&src_raw),
+            import_entries,
+            raw_imp_dynlibs,
+        )?;
+        if actual_dep_h != expected_dep_h {
+            return None;
+        }
+        if !clean_stale_ltar_bc() {
+            return None;
+        }
+        return Some(actual_olean_digest);
     }
 
     let expected_imports_h = if import_entries.is_empty() {
@@ -39111,6 +39406,209 @@ globs = ["Down.+"]
         );
 
         crate::zygote::purge_snapshot_dir(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_proofwidgets_style_dep_lakefile_and_inputless_leantar_trace_verified() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let root = tmp.path();
+        fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.31.0\n")?;
+        fs::write(
+            root.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage app where\n@[default_target]\nlean_lib App where\n",
+        )?;
+        fs::write(root.join("App.lean"), "import PwDep\ndef x : Nat := pwVal\n")?;
+
+        let pw_dir = root.join(".lake/packages/proofwidgets");
+        fs::create_dir_all(pw_dir.join("widget/js"))?;
+        fs::write(pw_dir.join("widget/js/hello.tsx"), "export default {}\n")?;
+        fs::write(
+            pw_dir.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL System\npackage ProofWidgets where\n  preferReleaseBuild := true\ndef widgetDir : FilePath := \"widget\"\ninput_dir widgetJsAllTs where\n  path := widgetDir / \"js\"\n  filter := .extension <| .mem #[\"ts\", \"tsx\"]\ntarget widgetJsAll pkg : Unit := do\n  return .nil\n@[default_target]\nlean_lib ProofWidgets where\n  needs := #[widgetJsAll]\n",
+        )?;
+        fs::write(pw_dir.join("ProofWidgets.lean"), "def pwHelper : Nat := 1\n")?;
+
+        let dep_dir = root.join(".lake/packages/pwdep");
+        fs::create_dir_all(&dep_dir)?;
+        fs::write(
+            dep_dir.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage PwDep where\n@[default_target]\nlean_lib PwDep where\n",
+        )?;
+        let dep_src = "def pwVal : Nat := 42\n";
+        fs::write(dep_dir.join("PwDep.lean"), dep_src)?;
+
+        let mut git_init = crate::trusted_tools::git(root)?;
+        assert!(git_init.args(["init", "-q"]).arg(&pw_dir).status()?.success());
+        let mut git_add = crate::trusted_tools::git(&pw_dir)?;
+        assert!(git_add.args(["-C"]).arg(&pw_dir).args(["add", "."]).status()?.success());
+        let mut git_commit = crate::trusted_tools::git(&pw_dir)?;
+        assert!(git_commit
+            .args([
+                "-C",
+                &pw_dir.to_string_lossy(),
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@e",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "init",
+            ])
+            .status()?
+            .success());
+        let mut git_rev = crate::trusted_tools::git(&pw_dir)?;
+        let pw_rev = String::from_utf8(
+            git_rev
+                .args(["-C"])
+                .arg(&pw_dir)
+                .args(["rev-parse", "HEAD"])
+                .output()?
+                .stdout,
+        )?
+        .trim()
+        .to_string();
+
+        fs::write(
+            root.join("lake-manifest.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [
+                    {
+                        "type": "git",
+                        "name": "proofwidgets",
+                        "rev": pw_rev,
+                        "url": "https://example.invalid/ProofWidgets4",
+                        "inherited": false,
+                        "configFile": "lakefile.lean"
+                    },
+                    {
+                        "type": "git",
+                        "name": "pwdep",
+                        "rev": "0123456789abcdef0123456789abcdef01234567",
+                        "url": "https://example.invalid/pwdep",
+                        "inherited": false,
+                        "configFile": "lakefile.lean"
+                    }
+                ]
+            }))?,
+        )?;
+
+        let mut cfg = resolve_project_config_with_trust(root, false)?;
+        let fake_githash = "0123456789abcdef0123456789abcdef01234567";
+        cfg.lean_githash = fake_githash.to_string();
+        cfg.lean_bin = PathBuf::from("/bin/true");
+
+        let pw_pkg = cfg
+            .dep_pkgs
+            .iter()
+            .find(|p| p.name == "ProofWidgets")
+            .expect("ProofWidgets parsed");
+        assert_eq!(pw_pkg.base_name, "proofwidgets");
+        assert_eq!(pw_pkg.inputs.len(), 1);
+        assert_eq!(pw_pkg.libs[0].custom_target_needs, vec!["widgetJsAll".to_string()]);
+
+        let write_fake_leantar_artifacts =
+            |olean_path: &Path, dep_h: u64| -> Result<()> {
+                fs::create_dir_all(olean_path.parent().unwrap())?;
+                let mut olean_bytes = vec![0u8; 88];
+                olean_bytes[0..5].copy_from_slice(b"olean");
+                olean_bytes[5] = 2;
+                olean_bytes[6..46].copy_from_slice(fake_githash.as_bytes());
+                fs::write(olean_path, &olean_bytes)?;
+                let ilean_path = olean_path.with_extension("ilean");
+                fs::write(&ilean_path, b"{}")?;
+                let o_h = lake_hash_bytes(&olean_bytes);
+                let i_h = lake_hash_bytes(b"{}");
+                fs::write(
+                    PathBuf::from(format!("{}.hash", olean_path.display())),
+                    format!("{o_h:016x}"),
+                )?;
+                fs::write(
+                    PathBuf::from(format!("{}.hash", ilean_path.display())),
+                    format!("{i_h:016x}"),
+                )?;
+                let trace_json = serde_json::json!({
+                    "schemaVersion": "2025-09-10",
+                    "depHash": format!("{dep_h:016x}"),
+                    "outputs": {
+                        "o": [format!("{o_h:016x}.olean")],
+                        "i": format!("{i_h:016x}.ilean")
+                    }
+                });
+                fs::write(
+                    olean_path.with_extension("trace"),
+                    serde_json::to_vec(&trace_json)?,
+                )?;
+                Ok(())
+            };
+
+        let dep_spec = resolve_module_in_package(
+            cfg.dep_pkgs.iter().find(|p| p.name == "PwDep").unwrap(),
+            false,
+            "PwDep",
+        )
+        .expect("PwDep spec");
+        let expected_dep_h = compute_expected_lake_module_dep_hash(
+            &cfg,
+            &dep_spec.pkg_root,
+            &dep_spec.pkg_name,
+            &dep_spec.pkg_base_name,
+            &dep_spec.target_name,
+            dep_spec.is_exe_target,
+            &dep_spec.module_name,
+            false,
+            dep_spec.platform_independent,
+            &dep_spec.lean_options,
+            &dep_spec.strong_args,
+            &dep_spec.src_path,
+            lake_hash_text(dep_src),
+            Vec::new(),
+            &[],
+        )
+        .expect("expected depHash");
+        write_fake_leantar_artifacts(&spec_olean_path(&dep_spec), expected_dep_h)?;
+
+        let mut cache = LakeClosureCache::default();
+        cache.ignore_mtime_skew = true;
+        let mut visiting = HashSet::new();
+        assert!(
+            lake_closure_export_info(&cfg, &dep_spec, true, &mut cache, &mut visiting).is_some(),
+            "inputless leantar .trace with exact depHash must verify"
+        );
+
+        // Tampering with source invalidates inputless depHash verification.
+        fs::write(dep_dir.join("PwDep.lean"), "def pwVal : Nat := 99\n")?;
+        let mut cache2 = LakeClosureCache::default();
+        cache2.ignore_mtime_skew = true;
+        let mut visiting2 = HashSet::new();
+        assert!(
+            lake_closure_export_info(&cfg, &dep_spec, true, &mut cache2, &mut visiting2).is_none(),
+            "tampered source must fail inputless leantar depHash check"
+        );
+
+        // ProofWidgets custom target `needs := #[widgetJsAll]` verifies at clean git rev and rejects dirty checkout.
+        let pw_spec = resolve_module_in_package(pw_pkg, false, "ProofWidgets").expect("PW spec");
+        write_fake_leantar_artifacts(&spec_olean_path(&pw_spec), 0x123456789abcdef0)?;
+        let mut cache3 = LakeClosureCache::default();
+        cache3.ignore_mtime_skew = true;
+        let mut visiting3 = HashSet::new();
+        assert!(
+            lake_closure_export_info(&cfg, &pw_spec, true, &mut cache3, &mut visiting3).is_some(),
+            "clean git-pinned custom-target-needs package must verify"
+        );
+        fs::write(pw_dir.join("ProofWidgets.lean"), "def pwHelper : Nat := 2\n")?;
+        let mut cache4 = LakeClosureCache::default();
+        cache4.ignore_mtime_skew = true;
+        let mut visiting4 = HashSet::new();
+        assert!(
+            lake_closure_export_info(&cfg, &pw_spec, true, &mut cache4, &mut visiting4).is_none(),
+            "dirty source in git-pinned custom-target-needs package must fail closed"
+        );
+
         Ok(())
     }
 }

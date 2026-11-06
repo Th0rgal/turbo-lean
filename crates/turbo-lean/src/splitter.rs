@@ -1581,12 +1581,153 @@ pub(crate) fn source_may_execute_elab_host_effects(src: &str, reject_pure_macros
     false
 }
 
-/// Returns true if `src` may execute elaboration-time host effects inside a git-pinned dependency
-/// package (delegating directly to `source_may_execute_elab_host_effects(src, false)` so any
-/// custom `elab`, `run_tac`, `initialize`, `@[extern]`, `IO.FS.lines`, `Std.Internal.UV`, etc.
-/// fails closed while pure `def`/`theorem`/`macro_rules` modules remain eligible).
+/// Returns true if `src` may read external host state (filesystem, environment variables,
+/// subprocesses, sockets, monotonic/wall clocks, randomness, or out-of-package `include_str`)
+/// during elaboration inside a git-pinned dependency package. Pure `MetaM`/`TacticM`/`CommandElabM`
+/// metaprograms (`elab`, `macro_rules`, `simproc`, `initialize`, `@[tactic]`, `MonadEnv.getEnv`,
+/// `Lean.Server.RequestM`, `IO.Ref`, etc.) remain allowed so git-pinned dependencies such as
+/// `Mathlib`, `Batteries`, `Aesop`, `Qq`, and `ProofWidgets` can reuse verified `.olean` caches.
 pub(crate) fn source_may_read_host_state(src: &str) -> bool {
-    source_may_execute_elab_host_effects(src, false)
+    let comment_free = strip_lean_comments(src);
+    let clean = strip_string_literals_inner(&comment_free, true);
+    let unquoted = clean.replace(['«', '»'], "");
+    if ["#eval", "#eval!"]
+        .iter()
+        .any(|w| contains_lean_word(&unquoted, w))
+    {
+        return true;
+    }
+    const QUALIFIED_HOST_READS: &[&str] = &[
+        "IO.FS",
+        "IO.Process",
+        "System.Process",
+        "IO.getEnv",
+        "System.getEnv",
+        "IO.currentDir",
+        "IO.appPath",
+        "IO.appDir",
+        "IO.realPath",
+        "IO.monoMsNow",
+        "IO.monoNanosNow",
+        "IO.getRandomBytes",
+        "IO.rand",
+        "ByteArray.random",
+        "Std.Internal.UV",
+    ];
+    if QUALIFIED_HOST_READS
+        .iter()
+        .any(|q| contains_lean_word(&unquoted, q) || unquoted.contains(&format!("{q}.")))
+    {
+        return true;
+    }
+    const HOST_READ_SEGMENTS: &[&str] = &[
+        "FS",
+        "UV",
+        "TcpSocket",
+        "UdpSocket",
+        "currentDir",
+        "appPath",
+        "appDir",
+        "realPath",
+        "pathExists",
+        "fileExists",
+        "readFile",
+        "readBinFile",
+        "readDir",
+        "symlinkMetadata",
+        "withFile",
+        "monoMsNow",
+        "monoNanosNow",
+        "getRandomBytes",
+    ];
+    if HOST_READ_SEGMENTS
+        .iter()
+        .any(|seg| contains_lean_ident_segment(&unquoted, seg))
+    {
+        return true;
+    }
+    let has_open_io_or_sys = unquoted.lines().any(|line| {
+        let t = line.trim_start();
+        (t.starts_with("open ") || t.contains(" open "))
+            && (contains_lean_ident_segment(t, "IO") || contains_lean_ident_segment(t, "System"))
+    });
+    if has_open_io_or_sys
+        && ["getEnv", "Process", "rand"]
+            .iter()
+            .any(|seg| contains_lean_ident_segment(&unquoted, seg))
+    {
+        return true;
+    }
+    if contains_lean_ident_segment(&unquoted, "getEnv") {
+        for (idx, _) in comment_free.match_indices("getEnv") {
+            let prev_ok = idx == 0
+                || !comment_free[..idx]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| is_lean_id_rest(c) || c == '»');
+            let after = comment_free[idx + "getEnv".len()..].trim_start();
+            if prev_ok && after.starts_with('"') {
+                return true;
+            }
+        }
+    }
+    if contains_lean_word(&unquoted, "include_str") {
+        let mut search_from = 0usize;
+        while let Some(rel_idx) = comment_free[search_from..].find("include_str") {
+            let idx = search_from + rel_idx;
+            search_from = idx + "include_str".len();
+            let prev_ok = idx == 0
+                || !comment_free[..idx]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| is_lean_id_rest(c) || c == '.');
+            if !prev_ok {
+                continue;
+            }
+            let tail = &comment_free[search_from..];
+            let expr_end = tail.find('\n').unwrap_or(tail.len());
+            let line = &tail[..expr_end];
+            let mut in_str = false;
+            let mut cur_lit = String::new();
+            let mut lits = Vec::new();
+            let mut chars = line.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if in_str {
+                    if ch == '\\' {
+                        if let Some(esc) = chars.next() {
+                            cur_lit.push(esc);
+                        }
+                    } else if ch == '"' {
+                        in_str = false;
+                        lits.push(std::mem::take(&mut cur_lit));
+                    } else {
+                        cur_lit.push(ch);
+                    }
+                } else if ch == '"' {
+                    in_str = true;
+                }
+            }
+            if lits.is_empty() {
+                return true;
+            }
+            let mut up_count = 0usize;
+            for (k, lit) in lits.iter().enumerate() {
+                if (k == 0 && (lit.starts_with('/') || lit.starts_with('\\') || lit.contains(':')))
+                    || lit.split(['/', '\\']).any(|seg| seg == "..")
+                {
+                    if lit == ".." {
+                        up_count += 1;
+                    } else {
+                        return true;
+                    }
+                }
+            }
+            if up_count > 4 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn contains_word(haystack: &str, word: &str) -> bool {
@@ -13542,8 +13683,17 @@ public def api := by
         assert!(source_may_read_host_state(
             "open Lean Elab Term in\nelab \"line_count\" : term => do\n  let rows ← IO.FS.lines \"/tmp/flag\"\n  return mkNatLit rows.size\n"
         ));
+        assert!(source_may_read_host_state(
+            "open IO in\npublic meta section\nopen Lean Elab Term in\npublic elab \"env_nat\" : term => do\n  let _ ← getEnv \"X\"\n  return mkNatLit 0\n"
+        ));
+        assert!(source_may_read_host_state(
+            "def badInclude : String := include_str \"/etc/hostname\"\n"
+        ));
         assert!(!source_may_read_host_state(
             "def pureHelper (n : Nat) : Array Nat := Array.init n id\n"
+        ));
+        assert!(!source_may_read_host_state(
+            "open Lean Elab Tactic Server in\nelab \"pure_meta\" : tactic => do\n  let _ ← MonadEnv.getEnv\n  return ()\ndef widgetJs : String := include_str \"..\" / \"build\" / \"js\" / \"w.js\"\n"
         ));
         assert!(source_may_execute_elab_host_effects(
             "def f : String := s!\"{unsafeCast 0}\"\n",
