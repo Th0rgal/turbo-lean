@@ -8569,10 +8569,7 @@ pub(crate) fn forget_refreshed_dep_module(cfg: &ProjectConfig, imp: &str) {
         let rel = spec_rel_src(&spec);
         let is_root_imp = spec.pkg_root == root_key.0 && spec.module_name == root_key.1;
         let should_drop = manifest.modules.get(&rel).is_some_and(|entry| {
-            let mut cache = LakeClosureCache {
-                post_lake_refresh: true,
-                ..Default::default()
-            };
+            let mut cache = LakeClosureCache::default();
             is_root_imp
                 || !dep_pkg_import_pins_consistent(
                     cfg,
@@ -8981,7 +8978,9 @@ fn prebuilt_closure_export_info(
     let res = (|| -> Option<LakeModuleExportInfo> {
         if let Some(mapped_spec) = resolve_source_spec_for_prebuilt_olean(cfg, olean_path) {
             let mapped_src = fs::read_to_string(&mapped_spec.src_path).ok()?;
-            if spec_source_has_disallowed_elab_host_effects(cfg, &mapped_spec, &mapped_src) {
+            if !cache.post_lake_refresh
+                && spec_source_has_disallowed_elab_host_effects(cfg, &mapped_spec, &mapped_src)
+            {
                 return None;
             }
         }
@@ -9190,7 +9189,9 @@ fn lake_closure_export_info_inner(
             return None;
         }
         let src_raw = fs::read_to_string(&spec.src_path).ok()?;
-        if spec_source_has_disallowed_elab_host_effects(cfg, spec, &src_raw) {
+        if !cache.post_lake_refresh
+            && spec_source_has_disallowed_elab_host_effects(cfg, spec, &src_raw)
+        {
             return None;
         }
         let hdr = parse_header_info(&src_raw);
@@ -9728,7 +9729,8 @@ pub(crate) fn dep_pkg_import_pins_consistent(
         let Ok(src) = fs::read_to_string(&cur.src_path) else {
             return false;
         };
-        if spec_source_has_disallowed_elab_host_effects(cfg, &cur, &src) {
+        if !cache.post_lake_refresh && spec_source_has_disallowed_elab_host_effects(cfg, &cur, &src)
+        {
             return false;
         }
         let hdr = parse_header_info(&src);

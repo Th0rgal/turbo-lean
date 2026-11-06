@@ -17577,6 +17577,16 @@ end ParityNs
                 rep_alpha.modules_up_to_date_reused, 0,
                 "neither P.EnvDep nor transitive P.Consumer may warm-adopt across env rotation"
             );
+            let canon_tree2 = tree2.project.canonicalize()?;
+            let canon_consumer = tree2.project.join("P/Consumer.lean").canonicalize()?;
+            let refreshed_root = crate::lake_build::ensure_project_imports_fresh_for_check(
+                &canon_tree2,
+                std::slice::from_ref(&canon_consumer),
+            )?;
+            assert!(
+                refreshed_root >= 1,
+                "ensure_project_imports_fresh_for_check must refresh root host-effect import P.EnvDep via Lake and verify post-refresh"
+            );
 
             // Fifth case (`astra` Finding 2 + `sol` Finding 2): path dependency AND git-pinned dependency
             // defining an elaborator (`getEnv` for path dep, `IO.FS.lines` for git-pinned dep) imported by
@@ -17772,6 +17782,16 @@ end ParityNs
                 assert_eq!(
                     dep_beta_rep.modules_up_to_date_reused, 0,
                     "dep & App (git={use_git_pin}) must recompile rather than warm-adopting stale alpha .olean"
+                );
+                let canon_app = app_proj.canonicalize()?;
+                let canon_app_lean = app_proj.join("App.lean").canonicalize()?;
+                let refreshed = crate::lake_build::ensure_project_imports_fresh_for_check(
+                    &canon_app,
+                    std::slice::from_ref(&canon_app_lean),
+                )?;
+                assert!(
+                    refreshed >= 1,
+                    "ensure_project_imports_fresh_for_check must refresh host-effect dep via Lake and verify post-refresh (git={use_git_pin})"
                 );
                 let _ = fs::remove_dir_all(&dep_case_root);
             }
