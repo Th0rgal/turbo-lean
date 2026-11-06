@@ -5892,6 +5892,66 @@ fn stock_statement_build_with_trust(
     compile_standalone_statement_modules(project, &pkg, &lib_dir, standalone, is_untrusted, None)
 }
 
+fn standalone_source_has_host_effects(src_text: &str) -> bool {
+    let split = splitter::split_lean_source(src_text, &[]);
+    split.hygiene.has_impure_metaprograms
+        || src_text.contains("IO.FS.")
+        || src_text.contains("IO.Process.")
+        || src_text.contains("IO.getEnv")
+        || src_text.contains("System.FilePath")
+        || src_text.contains("include_str")
+}
+
+fn imported_module_source_for_standalone(
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_name: &str,
+) -> Option<PathBuf> {
+    let mut specs = Vec::new();
+    if let Some(root_spec) =
+        crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, mod_name)
+    {
+        specs.push(root_spec.src_path);
+    }
+    for dp in &cfg.dep_pkgs {
+        if let Some(dep_spec) =
+            crate::module_builder::resolve_module_in_package(dp, false, mod_name)
+        {
+            specs.push(dep_spec.src_path);
+        }
+    }
+    if specs.len() == 1 {
+        return specs.into_iter().next();
+    }
+    if specs.len() > 1 {
+        return None;
+    }
+    let rel_slash = crate::module_builder::module_name_to_rel_slash(mod_name);
+    let base = cfg.root_pkg.pkg_root.join(&cfg.root_pkg.src_dir);
+    let mut roots = vec![base.clone()];
+    roots.extend(
+        cfg.root_pkg
+            .libs
+            .iter()
+            .filter_map(|l| l.src_dir.as_ref())
+            .map(|d| base.join(d)),
+    );
+    roots.extend(
+        cfg.root_pkg
+            .exes
+            .iter()
+            .filter_map(|e| e.src_dir.as_ref())
+            .map(|d| base.join(d)),
+    );
+    roots.sort();
+    roots.dedup();
+    let mut cands: Vec<PathBuf> = roots
+        .into_iter()
+        .map(|r| r.join(format!("{rel_slash}.lean")))
+        .filter(|p| p.is_file())
+        .collect();
+    (cands.len() == 1).then(|| cands.pop()).flatten()
+}
+
 fn standalone_statement_olean_action_key(
     cfg: &crate::module_builder::ProjectConfig,
     pkg: &crate::module_builder::PackageConfig,
@@ -5901,15 +5961,10 @@ fn standalone_statement_olean_action_key(
     imports: &[String],
     overlay_lib_dir: Option<&Path>,
 ) -> Option<String> {
-    let split = splitter::split_lean_source(src_text, &[]);
-    if split.hygiene.has_impure_metaprograms
-        || src_text.contains("IO.FS.")
-        || src_text.contains("IO.Process.")
-        || src_text.contains("IO.getEnv")
-        || src_text.contains("include_str")
-    {
+    if standalone_source_has_host_effects(src_text) {
         return None;
     }
+    let ws_inputs_digest = crate::module_builder::workspace_lake_inputs_digest(cfg).ok()?;
     let (lean_path, _) = crate::module_builder::build_lean_search_path(cfg, true);
     let mut dirs: Vec<PathBuf> = overlay_lib_dir.iter().map(|p| (*p).to_path_buf()).collect();
     dirs.extend(std::env::split_paths(&lean_path));
@@ -5931,6 +5986,11 @@ fn standalone_statement_olean_action_key(
         ) {
             continue;
         }
+        let dep_src_path = imported_module_source_for_standalone(cfg, &m)?;
+        let dep_src = fs::read_to_string(&dep_src_path).ok()?;
+        if standalone_source_has_host_effects(&dep_src) {
+            return None;
+        }
         let (imps, _) = crate::module_builder::read_olean_binary_imports_cached(&path).ok()?;
         let art_dig =
             crate::module_builder::compute_olean_artifact_set_digest_preserve_lake(&path).ok()?;
@@ -5938,10 +5998,12 @@ fn standalone_statement_olean_action_key(
         worklist.extend(imps.into_iter().map(|i| i.module));
     }
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean:standalone-stmt-olean:v2\0");
+    h.update(b"turbo-lean:standalone-stmt-olean:v3\0");
     h.update(cfg.lean_githash.as_bytes());
     h.update(b"\0");
     h.update(pkg.config_digest.as_bytes());
+    h.update(b"\0");
+    h.update(ws_inputs_digest.as_bytes());
     h.update(b"\0");
     for arg in &pkg.more_lean_args {
         h.update(arg.as_bytes());
@@ -6008,7 +6070,6 @@ fn validate_standalone_artifact_outputs(
     let mut has_olean = false;
     let mut has_srv = false;
     let mut has_priv = false;
-    let mut has_ir = false;
     for entry in outputs {
         if entry.size_bytes == 0 {
             return None;
@@ -6021,14 +6082,13 @@ fn validate_standalone_artifact_outputs(
             "olean" => has_olean = true,
             "srv" => has_srv = true,
             "priv" => has_priv = true,
-            "ir" => has_ir = true,
             _ => {}
         }
         if mapped.insert(entry.rel_path.clone(), abs.clone()).is_some() {
             return None;
         }
     }
-    if !has_olean || (is_module && (!has_srv || !has_priv || !has_ir)) {
+    if !has_olean || (is_module && (!has_srv || !has_priv)) {
         return None;
     }
     Some(mapped)
@@ -6041,10 +6101,8 @@ fn standalone_artifacts_present_on_disk(olean_path: &Path, is_module: bool) -> b
     if is_module {
         let srv = PathBuf::from(format!("{}.server", olean_path.display()));
         let prv = PathBuf::from(format!("{}.private", olean_path.display()));
-        let ir = olean_path.with_extension("ir");
         if !is_regular_nonempty_standalone_artifact(&srv)
             || !is_regular_nonempty_standalone_artifact(&prv)
-            || !is_regular_nonempty_standalone_artifact(&ir)
         {
             return false;
         }
@@ -16771,13 +16829,21 @@ end ParityNs
         let tree = LakeTree::new(
             "standalone_module_private_cache",
             &[
-                ("P/A.lean", "theorem dag_thm : 1 + 1 = 2 := by\n  omega\n"),
+                (
+                    "P/A.lean",
+                    "module\npublic theorem dag_thm : 1 + 1 = 2 := by\n  omega\n",
+                ),
                 (
                     "Extra/StandMod.lean",
                     "module\npublic import P.A\npublic theorem pub_thm : True := trivial\nprivate theorem priv_thm : 1 + 1 = 2 := rfl\n",
                 ),
             ],
         )?;
+        fs::write(
+            tree.project.join("lakefile.toml"),
+            "name = \"fixture\"\ndefaultTargets = [\"P\"]\n[[input_file]]\nname = \"SpecCfg\"\npath = \"spec.txt\"\ntext = true\n[[lean_lib]]\nname = \"P\"\nglobs = [\"P.+\"]\n",
+        )?;
+        fs::write(tree.project.join("spec.txt"), "v1\n")?;
         git_init_and_commit(&tree.project, "base_standalone_module")?;
         let pkg = crate::module_builder::resolve_package_config(&tree.project, true)?;
         let lib_dir = tree.project.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
@@ -16801,11 +16867,43 @@ end ParityNs
         let olean_p = lib_dir.join("Extra/StandMod.olean");
         let srv_p = PathBuf::from(format!("{}.server", olean_p.display()));
         let priv_p = PathBuf::from(format!("{}.private", olean_p.display()));
-        let ir_p = olean_p.with_extension("ir");
         assert!(
-            olean_p.is_file() && srv_p.is_file() && priv_p.is_file() && ir_p.is_file(),
-            "cold standalone `module` build must emit .olean, .olean.server, .olean.private, and .ir"
+            olean_p.is_file() && srv_p.is_file() && priv_p.is_file(),
+            "cold standalone `module` build must emit .olean, .olean.server, and .olean.private"
         );
+        let cfg1 = crate::module_builder::resolve_project_config(&tree.project)?;
+        let stand_src1 = fs::read_to_string(tree.project.join("Extra/StandMod.lean"))?;
+        let stand_hdr1 = crate::module_builder::parse_header_info(&stand_src1);
+        let stand_key1 = standalone_statement_olean_action_key(
+            &cfg1,
+            &pkg,
+            "Extra.StandMod",
+            Path::new("Extra/StandMod.lean"),
+            &stand_src1,
+            &stand_hdr1.imports,
+            None,
+        )
+        .expect("standalone action key v1");
+        fs::write(tree.project.join("spec.txt"), "v2\n")?;
+        crate::module_builder::reset_lake_inputs_tag_memo();
+        let cfg2 = crate::module_builder::resolve_project_config(&tree.project)?;
+        let stand_key2 = standalone_statement_olean_action_key(
+            &cfg2,
+            &pkg,
+            "Extra.StandMod",
+            Path::new("Extra/StandMod.lean"),
+            &stand_src1,
+            &stand_hdr1.imports,
+            None,
+        )
+        .expect("standalone action key v2");
+        assert_ne!(
+            stand_key2, stand_key1,
+            "workspace Lake input_file content change must rotate standalone_statement_olean_action_key"
+        );
+        fs::write(tree.project.join("spec.txt"), "v1\n")?;
+        crate::module_builder::reset_lake_inputs_tag_memo();
+
         let cold_rep = built_kernel_statement_report(&tree.project, None, false, None, None)?;
         assert!(
             cold_rep.statements.keys().any(|k| k.ends_with("pub_thm")),
@@ -16828,8 +16926,8 @@ end ParityNs
             Some(&mut warm_store),
         )?;
         assert!(
-            olean_p.is_file() && srv_p.is_file() && priv_p.is_file() && ir_p.is_file(),
-            "warm standalone `module` cache hit must restore .olean, .olean.server, .olean.private, and .ir"
+            olean_p.is_file() && srv_p.is_file() && priv_p.is_file(),
+            "warm standalone `module` cache hit must restore .olean, .olean.server, and .olean.private"
         );
         let warm_rep = built_kernel_statement_report(&tree.project, None, false, None, None)?;
         assert_eq!(
@@ -16887,7 +16985,7 @@ end ParityNs
         )?;
         fs::write(
             tree.project.join("P/A.lean"),
-            "theorem dag_thm : 1 + 1 = 2 := by\n  exact rfl\n",
+            "module\npublic theorem dag_thm : 1 + 1 = 2 := by\n  exact rfl\n",
         )?;
         fs::write(
             tree.project.join("Extra/StandMod.lean"),
@@ -16933,6 +17031,34 @@ end ParityNs
         assert!(
             warm_err.to_string().contains("priv_thm") && cold_err.to_string().contains("priv_thm"),
             "both warm ({warm_err:#}) and cold ({cold_err:#}) must detect private statement change"
+        );
+
+        // Imported elaborator reading an untracked file via `IO.FS.readFile` must bypass standalone
+        // caching (`None`) so `pr-verify` never reuses a stale standalone `.olean`.
+        fs::write(
+            tree.project.join("P/A.lean"),
+            "module\npublic meta import Lean\nopen Lean Elab Term in\npublic elab \"ext_val\" : term => do\n  let s ← IO.FS.readFile \"spec.txt\"\n  return mkNatLit s.trimAscii.toString.length\npublic theorem dag_thm : 1 + 1 = 2 := by\n  omega\n",
+        )?;
+        fs::write(
+            tree.project.join("Extra/StandMod.lean"),
+            "module\npublic import P.A\npublic theorem pub_thm : ext_val = ext_val := rfl\n",
+        )?;
+        tree.lake(&["build", "P"])?;
+        let cfg_eff = crate::module_builder::resolve_project_config(&tree.project)?;
+        let stand_eff_src = fs::read_to_string(tree.project.join("Extra/StandMod.lean"))?;
+        let stand_eff_hdr = crate::module_builder::parse_header_info(&stand_eff_src);
+        assert!(
+            standalone_statement_olean_action_key(
+                &cfg_eff,
+                &pkg,
+                "Extra.StandMod",
+                Path::new("Extra/StandMod.lean"),
+                &stand_eff_src,
+                &stand_eff_hdr.imports,
+                None,
+            )
+            .is_none(),
+            "imported module with host IO.FS effects must disable standalone statement caching"
         );
 
         let _ = fs::remove_dir_all(&tree.root);

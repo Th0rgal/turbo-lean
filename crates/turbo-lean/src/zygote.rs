@@ -4901,6 +4901,9 @@ fn audit_compiled_module_batch_exec_pinned(
         cmd.env(crate::splitter::ALLOWED_AXIOMS_ENV, allowed.join(","));
     }
     cmd.arg("--audit-modules");
+    if allow_sorry_axiom && !is_untrusted {
+        cmd.arg("--allow-sorry");
+    }
     if skip_child_replay {
         cmd.arg("--skip-child-replay");
     }

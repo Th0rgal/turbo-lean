@@ -1833,7 +1833,7 @@ def auditShardModule (target : String × Name) (ffiAllow : Array (Name × Name �
     return ([s!"[TurboLean.KernelGate] failed to import `{target.1}` for audit: {e}"], #[], [], [])
 
 def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name × Name × String) := #[])
-    (skipChildReplay : Bool := false) : IO (List String) := do
+    (skipChildReplay : Bool := false) (allowSorry : Bool := false) : IO (List String) := do
   if slice.isEmpty then
     return []
   let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
@@ -1857,7 +1857,7 @@ def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name ×
     pure (Except.error (toString e))
   match batchRes with
   | .ok env =>
-    let (vs, _) ← auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns {} unsafePatterns implByPatterns skipChildReplay false
+    let (vs, _) ← auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns {} unsafePatterns implByPatterns skipChildReplay allowSorry
     return vs
   | .error errMsg =>
     if slice.size == 1 then
@@ -1870,11 +1870,12 @@ def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name ×
     let ffiFlags : Array String := ffiAllow.map fun (m, d, sym) =>
       s!"--ffi-allow={m}={d}={sym}"
     let replayFlags : Array String := if skipChildReplay then #["--skip-child-replay"] else #[]
+    let sorryFlags : Array String := if allowSorry then #["--allow-sorry"] else #[]
     let runSubSlice (sub : Array (String × Name)) : IO (List String) := do
       let modFlags := sub.map (·.1)
       let child ← IO.Process.output {
         cmd := app
-        args := #["--audit-modules"] ++ replayFlags ++ ffiFlags ++ modFlags
+        args := #["--audit-modules"] ++ replayFlags ++ sorryFlags ++ ffiFlags ++ modFlags
       }
       if child.exitCode == 0 then
         return []
@@ -1891,7 +1892,7 @@ def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name ×
     return v1 ++ v2
 
 def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Name × String) := #[])
-    (skipChildReplay : Bool := false) : IO (Bool × List String) := do
+    (skipChildReplay : Bool := false) (allowSorry : Bool := false) : IO (Bool × List String) := do
   let mut parsed : Array (String × Name) := #[]
   let mut initViolations : List String := []
   for raw in modNames do
@@ -1904,7 +1905,7 @@ def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Nam
         parsed := parsed.push (trimmed, nm)
   if parsed.isEmpty then
     return (initViolations.isEmpty, initViolations)
-  let sliceViolations ← auditModuleSlice parsed ffiAllow skipChildReplay
+  let sliceViolations ← auditModuleSlice parsed ffiAllow skipChildReplay allowSorry
   let allViolations := initViolations ++ sliceViolations
   return (allViolations.isEmpty, allViolations)
 
@@ -2757,10 +2758,10 @@ def main (args : List String) : IO Unit := do
     -- stubs and reporting its theorems; stubs are never exempt in whole-module audits.
     let (ok, violations, decls, declTypes, sorryDecls) ← match shardFlag.isEmpty, audited, fastMapOpt with
       | true, _, _ =>
-        if stubArgs.isEmpty && fastMapArgs.isEmpty && !allowSorry then
-          let (ok, vs) ← TurboLean.ZygoteWorker.auditCompiledModules mods ffiAllow (!skipReplayFlags.isEmpty)
+        if stubArgs.isEmpty && fastMapArgs.isEmpty then
+          let (ok, vs) ← TurboLean.ZygoteWorker.auditCompiledModules mods ffiAllow (!skipReplayFlags.isEmpty) allowSorry
           pure (ok, vs, none, none, [])
-        else pure (false, ["[TurboLean.KernelGate] --stub-ok / --fast-map / --allow-sorry requires --shard"], none, none, [])
+        else pure (false, ["[TurboLean.KernelGate] --stub-ok / --fast-map requires --shard"], none, none, [])
       | false, _, none =>
         pure (false, ["[TurboLean.KernelGate] malformed --fast-map argument"], none, none, [])
       | false, [m], some fmap =>
