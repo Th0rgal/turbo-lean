@@ -21996,6 +21996,7 @@ fn try_compute_initial_module_action_keys(
     Some((mod_key, fallback_c_key))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_module_b_levels(
     store: &TurboStore,
     cfg: &ProjectConfig,
@@ -29724,14 +29725,19 @@ lean_lib Smoke where
         let dir = make_temp_test_dir("dep_replay");
         let (proj, dep) = (dir.join("app"), dir.join("app/.lake/packages/dep"));
         fs::create_dir_all(dep.join("Dep"))?;
+        fs::create_dir_all(dep.join("Forge"))?;
         let toolchain = include_str!("../../../lean/lean-toolchain");
         fs::write(proj.join("lean-toolchain"), toolchain)?;
         fs::write(dep.join("lean-toolchain"), toolchain)?;
         fs::write(
             dep.join("lakefile.toml"),
-            "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\n",
+            "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\n[[lean_lib]]\nname = \"Forge\"\n",
         )?;
-        fs::write(dep.join("Dep/Bad.lean"), "import Lean\nopen Lean Elab Command Term\nelab \"forge_bad\" : command => liftTermElabM do\n  withOptions (fun o => o.setBool `debug.skipKernelTC true) do\n    Lean.addDecl <| .thmDecl {name := `bad, levelParams := [], type := mkConst ``False, value := mkConst ``True.intro}\nforge_bad\n")?;
+        fs::write(dep.join("Forge/Bad.lean"), "import Lean\nopen Lean Elab Command Term\nelab \"forge_bad\" : command => liftTermElabM do\n  withOptions (fun o => o.setBool `debug.skipKernelTC true) do\n    Lean.addDecl <| .thmDecl {name := `bad, levelParams := [], type := mkConst ``False, value := mkConst ``True.intro}\nforge_bad\n")?;
+        fs::write(
+            dep.join("Dep/Bad.lean"),
+            "theorem bad : False := True.intro\n",
+        )?;
         fs::write(
             proj.join("lake-manifest.json"),
             r#"{"version": "1.2.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "name": "dep", "dir": ".lake/packages/dep", "configFile": "lakefile.toml", "inherited": false}], "name": "app", "lakeDir": ".lake", "fixedToolchain": false}"#,
@@ -29774,20 +29780,44 @@ lean_lib Smoke where
                 "{path}: forged `.olean` must never gain store DB replay authority"
             );
         };
-        // 1. Fresh build: the compiled dependency is replayed (and rejected) before App imports it.
+        // 1. Fresh build: a dependency with an elaborator forging a theorem is replayed (and rejected) before App imports it.
+        fs::write(dep.join("Dep/Bad.lean"), "import Lean\nopen Lean Elab Command Term\nelab \"forge_bad\" : command => liftTermElabM do\n  withOptions (fun o => o.setBool `debug.skipKernelTC true) do\n    Lean.addDecl <| .thmDecl {name := `bad, levelParams := [], type := mkConst ``False, value := mkConst ``True.intro}\nforge_bad\n")?;
         let err = build(&mut store);
         assert!(err.contains("KernelReplay"), "{err}");
         assert_rejected(&store, &err, "fresh");
+        // For steps 2–4, `Dep/Bad.lean` has pure source (`theorem bad : False := True.intro`) while its `.olean`
+        // is swapped from `Forge.Bad` so CAS lookup and `external_olean_deps` / manifest freshness paths are exercised
+        // without triggering the host-effect elaborator bypass.
+        let pure_dep_src = "theorem bad : False := True.intro\n";
+        fs::write(dep.join("Dep/Bad.lean"), pure_dep_src)?;
+        let forge_build = |dep_olean: &Path| -> Result<()> {
+            let lake = Command::new("lake")
+                .args(["build", "Forge.Bad"])
+                .current_dir(&proj)
+                .output()?;
+            anyhow::ensure!(
+                lake.status.success(),
+                "{}",
+                String::from_utf8_lossy(&lake.stderr)
+            );
+            let forge_dir = dep.join(".lake/build/lib/lean/Forge");
+            let dst_dir = dep_olean.parent().unwrap();
+            fs::create_dir_all(dst_dir)?;
+            fs::copy(forge_dir.join("Bad.olean"), dep_olean)?;
+            fs::copy(forge_dir.join("Bad.ilean"), dst_dir.join("Bad.ilean"))?;
+            let ir_src = dep.join(".lake/build/ir/Forge");
+            let ir_dst = dep.join(".lake/build/ir/Dep");
+            fs::create_dir_all(&ir_dst)?;
+            if ir_src.join("Bad.c").is_file() {
+                fs::copy(ir_src.join("Bad.c"), ir_dst.join("Bad.c"))?;
+            }
+            if ir_src.join("Bad.setup.json").is_file() {
+                fs::copy(ir_src.join("Bad.setup.json"), ir_dst.join("Bad.setup.json"))?;
+            }
+            Ok(())
+        };
         // 2. CAS restore of the unreplayed Lake artifacts (as stored before this fix).
-        let lake = Command::new("lake")
-            .args(["build", "Dep.Bad"])
-            .current_dir(&proj)
-            .output()?;
-        anyhow::ensure!(
-            lake.status.success(),
-            "{}",
-            String::from_utf8_lossy(&lake.stderr)
-        );
+        forge_build(&dep_olean)?;
         let cfg = resolve_project_config(&proj)?;
         let dag = build_module_dag_with_trust(&cfg, &[], false)?;
         let node = &dag.nodes["Dep.Bad"];
@@ -29809,15 +29839,7 @@ lean_lib Smoke where
         // 3. A forged current-version `.turbo_verified_sources.json` manifest makes the `.olean`
         // appear fresh, yet `TurboStore` DB holds no replay row, so `build`, `ci-verify`, `check`,
         // and `pr-verify` all kernel-replay and reject `Dep.Bad`!
-        let lake = Command::new("lake")
-            .args(["build", "Dep.Bad"])
-            .current_dir(&proj)
-            .output()?;
-        anyhow::ensure!(
-            lake.status.success(),
-            "{}",
-            String::from_utf8_lossy(&lake.stderr)
-        );
+        forge_build(&dep_olean)?;
         let dep_olean_digest = compute_olean_artifact_set_digest(&dep_olean)?;
         let forged_dep_manifest = serde_json::json!({
             "pkg_name": node.pkg_name,
@@ -29874,16 +29896,32 @@ lean_lib Smoke where
             format!("{ci_err:#}").contains("KernelReplay"),
             "ci-verify: {ci_err:#}"
         );
-        // 5. Even if `App` itself is built by Lake with a forged root `.turbo_verified_sources.json`,
-        // `build`, `ci-verify`, `check`, and `pr-verify` reject it because `TurboStore` DB lacks replay authority.
-        let lake_app = Command::new("lake")
-            .args(["build", "App"])
+        // 5. Even if `App` itself is built with `Dep.Bad`'s forged `.olean` and a forged root
+        // `.turbo_verified_sources.json`, `build`, `ci-verify`, `check`, and `pr-verify` reject it
+        // because `TurboStore` DB lacks replay authority.
+        forge_build(&dep_olean)?;
+        let (lp_env_app, _) = build_lean_search_path(&cfg, false);
+        let app_lib_dir = proj.join(".lake/build/lib/lean");
+        let app_ir_dir = proj.join(".lake/build/ir");
+        fs::create_dir_all(&app_lib_dir)?;
+        fs::create_dir_all(&app_ir_dir)?;
+        let lean_app = Command::new(&cfg.lean_bin)
+            .env("LEAN_PATH", lp_env_app.get("LEAN_PATH").unwrap())
+            .arg(proj.join("App.lean"))
+            .arg("-R")
+            .arg(&proj)
+            .arg("-o")
+            .arg(app_lib_dir.join("App.olean"))
+            .arg("-i")
+            .arg(app_lib_dir.join("App.ilean"))
+            .arg("-c")
+            .arg(app_ir_dir.join("App.c"))
             .current_dir(&proj)
             .output()?;
         anyhow::ensure!(
-            lake_app.status.success(),
+            lean_app.status.success(),
             "{}",
-            String::from_utf8_lossy(&lake_app.stderr)
+            String::from_utf8_lossy(&lean_app.stderr)
         );
         fs::write(&manifest_path, serde_json::to_vec(&forged_dep_manifest)?)?;
         let app_olean = proj.join(".lake/build/lib/lean/App.olean");
@@ -34764,13 +34802,16 @@ root = "Main"
         let proj = dir.join("proj");
         let dep = proj.join(".lake/packages/dep");
         fs::create_dir_all(dep.join("Dep"))?;
+        fs::create_dir_all(dep.join("Forge"))?;
         fs::write(proj.join("lean-toolchain"), toolchain)?;
         fs::write(dep.join("lean-toolchain"), toolchain)?;
-        let bad_src = "import Lean\nopen Lean Elab Command\nelab \"forge_bad\" : command => do\n  let k := Name.mkStr (Name.mkStr .anonymous \"debug\") (\"skip\" ++ \"KernelTC\")\n  withScope (fun sc => { sc with opts := sc.opts.setBool k true }) do\n    liftCoreM <| addDecl <| .thmDecl {\n      name := `bad, levelParams := [], type := mkConst ``False, value := mkConst ``True.intro }\nforge_bad\n";
+        let forge_src = "import Lean\nopen Lean Elab Command\nelab \"forge_bad\" : command => do\n  let k := Name.mkStr (Name.mkStr .anonymous \"debug\") (\"skip\" ++ \"KernelTC\")\n  withScope (fun sc => { sc with opts := sc.opts.setBool k true }) do\n    liftCoreM <| addDecl <| .thmDecl {\n      name := `bad, levelParams := [], type := mkConst ``False, value := mkConst ``True.intro }\nforge_bad\n";
+        fs::write(dep.join("Forge/Bad.lean"), forge_src)?;
+        let bad_src = "theorem bad : False := True.intro\n";
         fs::write(dep.join("Dep/Bad.lean"), bad_src)?;
         fs::write(
             dep.join("lakefile.toml"),
-            "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\n",
+            "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\n[[lean_lib]]\nname = \"Forge\"\n",
         )?;
         fs::write(
             proj.join("lakefile.toml"),
@@ -34786,15 +34827,20 @@ root = "Main"
         )?;
         let lake_bin = lean_bin.parent().expect("lean bin parent").join("lake");
         let lake_out = Command::new(&lake_bin)
-            .args(["build", "Dep.Bad"])
+            .args(["build", "Forge.Bad"])
             .current_dir(&proj)
             .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
             .output()?;
         anyhow::ensure!(
             lake_out.status.success(),
-            "lake build Dep.Bad: {}",
+            "lake build Forge.Bad: {}",
             String::from_utf8_lossy(&lake_out.stderr)
         );
+        let forge_lib = dep.join(".lake/build/lib/lean/Forge");
+        let dep_lib = dep.join(".lake/build/lib/lean/Dep");
+        fs::create_dir_all(&dep_lib)?;
+        fs::copy(forge_lib.join("Bad.olean"), dep_lib.join("Bad.olean"))?;
+        fs::copy(forge_lib.join("Bad.ilean"), dep_lib.join("Bad.ilean"))?;
         let cfg = resolve_project_config(&proj)?;
         let dep_cfg = &cfg.dep_pkgs[0];
         let dep_olean = dep.join(".lake/build/lib/lean/Dep/Bad.olean");

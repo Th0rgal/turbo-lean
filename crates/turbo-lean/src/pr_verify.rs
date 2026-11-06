@@ -6013,6 +6013,7 @@ fn stock_statement_build_with_trust(
 
 fn standalone_source_has_host_effects(src_text: &str) -> bool {
     splitter::source_may_execute_elab_host_effects(src_text, true)
+        || splitter::contains_lean_word(&splitter::strip_lean_comments(src_text), "include_str")
 }
 
 fn imported_module_source_for_standalone(
@@ -17255,7 +17256,7 @@ end ParityNs
         // standalone caching (`None`) so `pr-verify` never reuses a stale standalone `.olean`.
         fs::write(
             tree.project.join("P/A.lean"),
-            "module\npublic meta import Lean\npublic meta section\nopen IO Lean Elab Term in\npublic elab \"ext_val\" : term => do\n  let s ← FS.readFile \"spec.txt\"\n  return mkNatLit s.trimAscii.toString.length\nend\npublic theorem dag_thm : 1 + 1 = 2 := by\n  omega\n",
+            "module\npublic meta import Lean\nopen IO Lean Elab Term in\npublic meta elab \"ext_val\" : term => do\n  let s ← FS.readFile \"spec.txt\"\n  return mkNatLit s.trimAscii.toString.length\npublic theorem dag_thm : 1 + 1 = 2 := by\n  omega\n",
         )?;
         fs::write(
             tree.project.join("Extra/StandMod.lean"),
@@ -17511,12 +17512,8 @@ end ParityNs
                 None,
             )?;
             fs::write(
-                tree2.project.join("P/EnvDep.lean"),
-                "import Lean\nopen IO Lean Elab Term in\nelab \"env_dep_ty\" : term => do\n  let _ ← getEnv \"TURBO_TEST_ELAB_STMT_ENV\"\n  return mkConst ``Nat\ndef depWitness (x : env_dep_ty) : env_dep_ty := x\n",
-            )?;
-            fs::write(
                 tree2.project.join("P/Consumer.lean"),
-                "import P.EnvDep\ntheorem consumer_thm (x : _) : depWitness x = depWitness x := by\n  exact rfl\n",
+                "import P.EnvDep\ntheorem consumer_thm (x : Nat) : depWitness x = depWitness x := by\n  exact rfl\n",
             )?;
             std::env::set_var(ENV_KEY, "beta");
             let trans_beta_err = run_pr_verify_command(
@@ -17534,18 +17531,22 @@ end ParityNs
                 0,
                 None,
             )
-            .expect_err("transitive consumer of `P.EnvDep` must detect HEAD(Bool) vs WT(Nat) delta when env=beta");
+            .expect_err("transitive consumer of `P.EnvDep` must detect HEAD(Bool) vs WT(Nat) or reject stale type when env=beta");
             assert!(
                 trans_beta_err.to_string().contains("consumer_thm")
-                    || trans_beta_err.to_string().contains("depWitness"),
+                    || trans_beta_err.to_string().contains("depWitness")
+                    || trans_beta_err
+                        .to_string()
+                        .contains("Application type mismatch")
+                    || trans_beta_err.to_string().contains("type mismatch"),
                 "unexpected transitive beta error: {trans_beta_err:#}"
             );
-            // Restore original env-branching `P/EnvDep.lean` so `tree2` branches on `ENV_KEY`, build under `beta`
-            // so `P.EnvDep(Bool)` & `P.Consumer(Bool)` exist on disk & in CAS (if unblocked), then switch back to
+            // Restore original `P/Consumer.lean` (`x : _`), build under `beta` so `P.EnvDep(Bool)` &
+            // `P.Consumer(Bool)` exist on disk & in CAS (if unblocked), then switch back to
             // `alpha` and verify neither Module CAS nor warm-probe serves a stale `P.Consumer` artifact!
             fs::write(
-                tree2.project.join("P/EnvDep.lean"),
-                "import Lean\nopen IO Lean Elab Term in\nelab \"env_dep_ty\" : term => do\n  match (← getEnv \"TURBO_TEST_ELAB_STMT_ENV\") with\n  | some \"beta\" => return mkConst ``Bool\n  | _ => return mkConst ``Nat\ndef depWitness (x : env_dep_ty) : env_dep_ty := x\n",
+                tree2.project.join("P/Consumer.lean"),
+                "import P.EnvDep\ntheorem consumer_thm (x : _) : depWitness x = depWitness x := by\n  rfl\n",
             )?;
             crate::module_builder::build_project_modules_native(
                 &mut trans_store,

@@ -1089,10 +1089,19 @@ pub fn strip_lean_comments(src: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
-fn strip_string_literals(src: &str) -> std::borrow::Cow<'_, str> {
+fn strip_string_literals_inner(
+    src: &str,
+    comments_already_stripped: bool,
+) -> std::borrow::Cow<'_, str> {
     if !src.contains('"') && !src.contains('\'') && !src.contains('«') {
         return std::borrow::Cow::Borrowed(src);
     }
+    let clean_cow = if comments_already_stripped {
+        std::borrow::Cow::Borrowed(src)
+    } else {
+        std::borrow::Cow::Owned(strip_lean_comments(src))
+    };
+    let src = clean_cow.as_ref();
     let bytes = src.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -1110,7 +1119,7 @@ fn strip_string_literals(src: &str) -> std::borrow::Cow<'_, str> {
                 while j < end {
                     if interp_depth > 0 {
                         if let Some(sub_end) = scan_lean_norm_literal_end(src, j) {
-                            let stripped = strip_string_literals(&src[j..sub_end]);
+                            let stripped = strip_string_literals_inner(&src[j..sub_end], true);
                             out.extend_from_slice(stripped.as_bytes());
                             j = sub_end;
                             continue;
@@ -1169,6 +1178,10 @@ fn strip_string_literals(src: &str) -> std::borrow::Cow<'_, str> {
         String::from_utf8(out)
             .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()),
     )
+}
+
+fn strip_string_literals(src: &str) -> std::borrow::Cow<'_, str> {
+    strip_string_literals_inner(src, false)
 }
 
 pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
@@ -1446,7 +1459,7 @@ fn contains_lean_attribute_word(unquoted: &str, attrs: &[&str]) -> bool {
 /// `macro_rules`, `@[macro]`) is also rejected.
 pub(crate) fn source_may_execute_elab_host_effects(src: &str, reject_pure_macros: bool) -> bool {
     let comment_free = strip_lean_comments(src);
-    let clean = strip_string_literals(&comment_free);
+    let clean = strip_string_literals_inner(&comment_free, true);
     let unquoted = clean.replace(['«', '»'], "");
     const ELAB_IO_WORDS: &[&str] = &[
         "elab",
@@ -1461,8 +1474,6 @@ pub(crate) fn source_may_execute_elab_host_effects(src: &str, reject_pure_macros
         "#guard_msgs",
         "initialize",
         "builtin_initialize",
-        "include_str",
-        "unsafe",
         "simproc",
         "dsimproc",
         "simproc_decl",
@@ -1479,6 +1490,12 @@ pub(crate) fn source_may_execute_elab_host_effects(src: &str, reject_pure_macros
         "evalConst",
         "evalConstCheck",
         "evalTerm",
+        "unsafeCast",
+        "unsafeIO",
+        "unsafeBaseIO",
+        "unsafePerformIO",
+        "ptrAddrUnsafe",
+        "lcProof",
         "registerBuiltinAttribute",
         "registerTagAttribute",
         "registerParametricAttribute",

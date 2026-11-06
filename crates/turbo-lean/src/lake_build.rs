@@ -4316,7 +4316,8 @@ fn ensure_project_imports_fresh_inner(
             .to_string_lossy()
             .replace('\\', "/");
         let cur_hash = compute_cached_source_blake3(&info.dep_src);
-        let src_elab_host_effects_stale = olean_meta.is_some()
+        let src_elab_host_effects_stale = !verify_only
+            && olean_meta.is_some()
             && fs::read_to_string(&info.dep_src)
                 .map(|s| crate::splitter::source_may_execute_elab_host_effects(&s, false))
                 .unwrap_or(true);
