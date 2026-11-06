@@ -173,10 +173,12 @@ const BV_DECIDE_PROBE_AXIOMS: [&str; 1] = ["Pkg.thm._native.bv_decide.ax_1_1"];
 
 /// Route hygiene item admission through the shared Lean C-ABI gate (`turbo_spec_verify_hygiene_item_admitted`)
 /// using the exact same `glob_match` axiom policy as the kernel gate (`ZygoteWorker.isAllowedAxiom`).
-fn item_allowed(item: &str, allowed: &[String]) -> bool {
+fn item_allowed(item: &str, allowed: &[String], allow_interactive_sorry: bool) -> bool {
     let kind_code: u8 = match item_kind(item) {
         "native_decide/ofReduceBool" => 1,
         "bv_decide" => 2,
+        "trustCompiler" => 3,
+        "sorry/admit token" => 4,
         _ => 0,
     };
     let admits_nd = NATIVE_DECIDE_PROBE_AXIOMS
@@ -190,33 +192,38 @@ fn item_allowed(item: &str, allowed: &[String]) -> bool {
             kind_code,
             u8::from(admits_nd),
             u8::from(admits_bv),
+            u8::from(allow_interactive_sorry),
         ) != 0
     }
 }
 
 pub fn native_decide_allowed() -> bool {
-    item_allowed("native_decide/ofReduceBool", &allowed_axioms())
+    item_allowed("native_decide/ofReduceBool", &allowed_axioms(), false)
 }
 
 /// Hygiene items that block certification under the `allowed` axioms (impure commands such as
 /// `#eval` are reported but do not block).
-fn blocking_items_under(items: &[String], allowed: &[String]) -> Vec<String> {
-    let blocks = |i: &&String| !item_allowed(i, allowed) && !item_kind(i).starts_with("impure/");
+fn blocking_items_under(
+    items: &[String],
+    allowed: &[String],
+    allow_interactive_sorry: bool,
+) -> Vec<String> {
+    let blocks = |i: &&String| {
+        !item_allowed(i, allowed, allow_interactive_sorry) && !item_kind(i).starts_with("impure/")
+    };
     items.iter().filter(blocks).cloned().collect()
 }
 
 pub fn blocking_items(items: &[String]) -> Vec<String> {
-    blocking_items_under(items, &allowed_axioms())
+    blocking_items_under(items, &allowed_axioms(), false)
 }
 
 /// Hygiene items that block under `--allow-sorry` (trusted interactive proof sketching only):
-/// admits `sorry/admit token` items while still rejecting axioms, `native_decide`/`bv_decide`
-/// violations, `trustCompiler`, `unsafe`, `extern`/`implemented_by`/`csimp`, and checking-weakening.
+/// admits `sorry/admit token` items via the `turbo_spec_verify_hygiene_item_admitted` C-ABI gate
+/// while still rejecting axioms, `native_decide`/`bv_decide` violations, `trustCompiler`,
+/// `unsafe`, `extern`/`implemented_by`/`csimp`, and checking-weakening.
 pub fn blocking_items_modulo_sorry(items: &[String]) -> Vec<String> {
-    blocking_items(items)
-        .into_iter()
-        .filter(|i| item_kind(i) != "sorry/admit token")
-        .collect()
+    blocking_items_under(items, &allowed_axioms(), true)
 }
 
 impl HygieneReport {
@@ -242,7 +249,7 @@ impl HygieneReport {
         self.has_native_decide
             && self.flagged_items.iter().any(|i| {
                 matches!(item_kind(i), "native_decide/ofReduceBool" | "bv_decide")
-                    && !item_allowed(i, allowed)
+                    && !item_allowed(i, allowed, false)
             })
     }
 
@@ -253,7 +260,7 @@ impl HygieneReport {
 
     /// Flagged items that block certification under an explicit `allowed` policy.
     pub fn disallowed_items_under(&self, allowed: &[String]) -> Vec<String> {
-        blocking_items_under(&self.flagged_items, allowed)
+        blocking_items_under(&self.flagged_items, allowed, false)
     }
 
     /// Return only hygiene items that are newly introduced relative to `base`
@@ -278,7 +285,9 @@ impl HygieneReport {
             out.push(item.clone());
         }
         let allowed = allowed_axioms();
-        let (admitted, blocking) = out.into_iter().partition(|i| item_allowed(i, &allowed));
+        let (admitted, blocking) = out
+            .into_iter()
+            .partition(|i| item_allowed(i, &allowed, false));
         let clean = self.is_clean_for_certification();
         (if clean { Vec::new() } else { blocking }, admitted)
     }
@@ -1574,7 +1583,7 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
     let mut mutual_depth = 0usize;
     let mut scope_depth = 0usize;
     let mut lexical_cursor = 0usize;
-    let mut literal_end = 0usize;
+    let mut non_code_end = 0usize;
 
     while pos < total_len {
         let line_start = pos;
@@ -1596,33 +1605,47 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
         let line_orig = &src[line_start..line_end_no_cr];
         let line_clean = &clean[line_start..line_end_no_cr];
         let trimmed = line_clean.trim_start();
+        let trimmed_orig_line = line_orig.trim_start();
+        let indent = line_orig.len() - trimmed_orig_line.len();
+        let orig_token_start = line_start + indent;
         let token_start = line_start + line_clean.len() - trimmed.len();
-        // Keep the whole source's lexical context: a command-looking line inside a
-        // literal must not become a declaration or change the namespace stack.
-        while lexical_cursor < token_start {
+        // Keep the whole source's lexical context: advance to `orig_token_start` first so an
+        // outer `/- ... -/` or string literal opened on an earlier line sets `non_code_end`
+        // without swallowing a new `/--` docstring starting right at `orig_token_start`.
+        while lexical_cursor < orig_token_start {
             if let Some(span) = skip_lean_lexeme(src, lexical_cursor) {
-                if span.is_literal {
-                    literal_end = span.end;
+                if span.is_literal || span.is_comment {
+                    non_code_end = span.end;
                 }
                 lexical_cursor = span.end;
             } else {
                 lexical_cursor += src[lexical_cursor..].chars().next().unwrap().len_utf8();
             }
         }
-        if token_start < literal_end {
+        let orig_in_prior_non_code = orig_token_start < non_code_end;
+        let at_command_indent = cur_cmd_indent.is_none_or(|base| indent <= base);
+        let starts_doc_comment = !orig_in_prior_non_code
+            && matches!(
+                scan_lean_block_comment_end(trimmed_orig_line, 0),
+                Some((_, true))
+            )
+            && (indent == 0 || (scope_depth > 0 && at_command_indent));
+        while lexical_cursor < token_start {
+            if let Some(span) = skip_lean_lexeme(src, lexical_cursor) {
+                if span.is_literal || span.is_comment {
+                    non_code_end = span.end;
+                }
+                lexical_cursor = span.end;
+            } else {
+                lexical_cursor += src[lexical_cursor..].chars().next().unwrap().len_utf8();
+            }
+        }
+        if orig_in_prior_non_code || (!starts_doc_comment && token_start < non_code_end) {
             cur_byte_end = line_end_no_cr;
             pos = next_pos;
             line_num += 1;
             continue;
         }
-
-        let indent = line_orig.len() - line_orig.trim_start().len();
-        let at_command_indent = cur_cmd_indent.is_none_or(|base| indent <= base);
-        let trimmed_orig_line = line_orig.trim_start();
-        let starts_doc_comment = matches!(
-            scan_lean_block_comment_end(trimmed_orig_line, 0),
-            Some((_, true))
-        ) && (indent == 0 || (scope_depth > 0 && at_command_indent));
 
         if mutual_depth > 0 {
             if at_command_indent {
@@ -1959,6 +1982,8 @@ fn split_mutual_block_subspans<'a>(
     let mut cur_byte_end = 0usize;
     let mut line_num = span.start_line + 1;
     let mut pos = 0usize;
+    let mut lexical_cursor = 0usize;
+    let mut non_code_end = 0usize;
 
     while pos < total_len {
         let line_start = pos;
@@ -1980,14 +2005,52 @@ fn split_mutual_block_subspans<'a>(
         let line_orig = &body_orig[line_start..line_end_no_cr];
         let line_clean = &body_clean[line_start..line_end_no_cr];
         let trimmed = line_clean.trim_start();
-        let indent = line_orig.len() - line_orig.trim_start().len();
-        let is_top_inner = indent <= min_indent;
         let orig_trimmed = line_orig.trim_start();
-        let starts_doc = is_top_inner
+        let indent = line_orig.len() - orig_trimmed.len();
+        let orig_token_start = line_start + indent;
+        let token_start = line_start + line_clean.len() - trimmed.len();
+        while lexical_cursor < orig_token_start {
+            if let Some(lex_span) = skip_lean_lexeme(body_orig, lexical_cursor) {
+                if lex_span.is_literal || lex_span.is_comment {
+                    non_code_end = lex_span.end;
+                }
+                lexical_cursor = lex_span.end;
+            } else {
+                lexical_cursor += body_orig[lexical_cursor..]
+                    .chars()
+                    .next()
+                    .unwrap()
+                    .len_utf8();
+            }
+        }
+        let orig_in_prior_non_code = orig_token_start < non_code_end;
+        let is_top_inner = indent <= min_indent;
+        let starts_doc = !orig_in_prior_non_code
+            && is_top_inner
             && matches!(
                 scan_lean_block_comment_end(orig_trimmed, 0),
                 Some((_, true))
             );
+        while lexical_cursor < token_start {
+            if let Some(lex_span) = skip_lean_lexeme(body_orig, lexical_cursor) {
+                if lex_span.is_literal || lex_span.is_comment {
+                    non_code_end = lex_span.end;
+                }
+                lexical_cursor = lex_span.end;
+            } else {
+                lexical_cursor += body_orig[lexical_cursor..]
+                    .chars()
+                    .next()
+                    .unwrap()
+                    .len_utf8();
+            }
+        }
+        if orig_in_prior_non_code || (!starts_doc && token_start < non_code_end) {
+            cur_byte_end = line_end_no_cr;
+            pos = next_pos;
+            line_num += 1;
+            continue;
+        }
 
         if line_num > span.start_line + 1
             && is_top_inner
@@ -4272,6 +4335,43 @@ fn sanitize_ident_for_fast_check_underscore(name: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Build `(stubbed_prefix_before_target, closing_scopes, qualified_refute_name)` for `target_decl`.
+pub fn reconstruct_prefix_and_closers_for_decl(
+    src: &str,
+    target_decl: &str,
+    short_refute_name: &str,
+) -> anyhow::Result<Option<(String, String, String)>> {
+    let clean = strip_lean_comments(src);
+    let spans = parse_command_spans(src, &clean);
+    let closed_sections = compute_closed_section_ranges(&spans);
+    let declarations = qualified_span_declarations(&spans);
+    let Some(decl_idx) = resolve_decl_index(
+        declarations.iter().map(|(_, name)| name.as_str()),
+        target_decl,
+    )?
+    else {
+        return Ok(None);
+    };
+    let t_idx = declarations[decl_idx].0;
+    let omit_mask = compute_omitted_closed_section_spans(&spans, &closed_sections, t_idx);
+    let mut prefix_skeleton_accum = String::with_capacity(src.len());
+    let mut scope_stack: Vec<ScopeFrame> = Vec::new();
+    for (idx, span) in spans[..t_idx].iter().enumerate() {
+        update_scope_stack_with_idx(&mut scope_stack, span.orig_text, idx);
+        if omit_mask[idx] {
+            for _ in 0..=span.orig_text.matches('\n').count() {
+                prefix_skeleton_accum.push('\n');
+            }
+            continue;
+        }
+        prefix_skeleton_accum.push_str(&stub_identity_probe_src(span.orig_text));
+        prefix_skeleton_accum.push('\n');
+    }
+    let closing_scopes = format_closing_scopes(&scope_stack);
+    let qual_refute = qualified_decl_name(short_refute_name, &scope_stack);
+    Ok(Some((prefix_skeleton_accum, closing_scopes, qual_refute)))
 }
 
 /// Reconstruct the self-contained prefix-only `shard_source` (`prefix_skeleton_accum + span.orig_text + closing_scopes`)
@@ -8266,7 +8366,7 @@ fn has_unrecognized_command_indent_line<'a>(spans: &[CmdSpan<'a>]) -> bool {
     let check_span = |span: &CmdSpan<'a>| -> bool {
         let span_src = span.orig_text;
         let mut lexical_cursor = 0usize;
-        let mut literal_end = 0usize;
+        let mut non_code_end = 0usize;
         let mut first_non_empty_idx: Option<usize> = None;
         let mut base_indent = 0usize;
         let mut line_byte_start = 0usize;
@@ -8275,11 +8375,31 @@ fn has_unrecognized_command_indent_line<'a>(spans: &[CmdSpan<'a>]) -> bool {
         {
             let trimmed_clean = clean_line.trim_start();
             let trimmed_orig = orig_line.trim_start();
+            let orig_token_start = line_byte_start + orig_line.len() - trimmed_orig.len();
             let token_start = line_byte_start + clean_line.len() - trimmed_clean.len();
+            while lexical_cursor < orig_token_start {
+                if let Some(lex_span) = skip_lean_lexeme(span_src, lexical_cursor) {
+                    if lex_span.is_literal || lex_span.is_comment {
+                        non_code_end = lex_span.end;
+                    }
+                    lexical_cursor = lex_span.end;
+                } else {
+                    lexical_cursor += span_src[lexical_cursor..]
+                        .chars()
+                        .next()
+                        .map_or(1, char::len_utf8);
+                }
+            }
+            let orig_in_prior_non_code = orig_token_start < non_code_end;
+            let starts_doc_here = !orig_in_prior_non_code
+                && matches!(
+                    scan_lean_block_comment_end(trimmed_orig, 0),
+                    Some((_, true))
+                );
             while lexical_cursor < token_start {
                 if let Some(lex_span) = skip_lean_lexeme(span_src, lexical_cursor) {
-                    if lex_span.is_literal {
-                        literal_end = lex_span.end;
+                    if lex_span.is_literal || lex_span.is_comment {
+                        non_code_end = lex_span.end;
                     }
                     lexical_cursor = lex_span.end;
                 } else {
@@ -8290,7 +8410,7 @@ fn has_unrecognized_command_indent_line<'a>(spans: &[CmdSpan<'a>]) -> bool {
                 }
             }
             line_byte_start += orig_line.len() + 1;
-            if token_start < literal_end {
+            if orig_in_prior_non_code || (!starts_doc_here && token_start < non_code_end) {
                 continue;
             }
             if trimmed_clean.is_empty() && trimmed_orig.is_empty() {
@@ -9503,17 +9623,28 @@ mod tests {
         let only_bv = [std3.clone(), vec!["*._native.bv_decide.ax_*".to_string()]].concat();
         let wildcard = [std3.clone(), vec!["*".to_string()]].concat();
         let native_glob = [std3.clone(), vec!["*._native.*.ax_*".to_string()]].concat();
-        assert_eq!(blocking_items_under(&rep.flagged_items, &std3).len(), 2);
         assert_eq!(
-            blocking_items_under(&rep.flagged_items, &only_bv),
+            blocking_items_under(&rep.flagged_items, &std3, false).len(),
+            2
+        );
+        assert_eq!(
+            blocking_items_under(&rep.flagged_items, &only_bv, false),
             ["L1: native_decide/ofReduceBool"]
         );
-        assert!(blocking_items_under(&rep.flagged_items, &wildcard).is_empty());
-        assert!(blocking_items_under(&rep.flagged_items, &native_glob).is_empty());
+        assert!(blocking_items_under(&rep.flagged_items, &wildcard, false).is_empty());
+        assert!(blocking_items_under(&rep.flagged_items, &native_glob, false).is_empty());
         let sorry_rep = audit_hygiene("theorem bad : False := sorry\n");
         assert_eq!(
-            blocking_items_under(&sorry_rep.flagged_items, &wildcard).len(),
+            blocking_items_under(&sorry_rep.flagged_items, &wildcard, false).len(),
             1
+        );
+        assert!(blocking_items_under(&sorry_rep.flagged_items, &std3, true).is_empty());
+        let mixed_rep = audit_hygiene(
+            "theorem s : False := sorry\nunsafe def u : Nat := 1\ntheorem nd : True := by native_decide\n",
+        );
+        assert_eq!(
+            blocking_items_under(&mixed_rep.flagged_items, &std3, true),
+            ["L2: unsafe declaration", "L3: native_decide/ofReduceBool"]
         );
 
         // The policy comes from the nearest `turbo-lean.toml`, at the given revision if any.
@@ -12628,6 +12759,55 @@ public def api := by
                 "{label}: meta_signature_digest must stay identical"
             );
         }
+    }
+
+    #[test]
+    fn test_nested_doc_comment_marker_inside_block_comment_and_literals_does_not_split() {
+        let cases = [
+            (
+                "outer block comment",
+                "/-\n/-- fake doc inside block comment -/\ntheorem fake : False := sorry\n-/\ntheorem real_thm : 1 = 1 := rfl\n",
+            ),
+            (
+                "multiline string literal",
+                "def s : String := \"\n/-- fake doc inside string -/\ntheorem fake : False := sorry\"\ntheorem real_thm : 1 = 1 := rfl\n",
+            ),
+            (
+                "raw string literal",
+                "def s : String := r#\"\n/-- fake doc inside raw string -/\ntheorem fake : False := sorry\"#\ntheorem real_thm : 1 = 1 := rfl\n",
+            ),
+            (
+                "interpolated string literal",
+                "def s : String := s!\"\n/-- fake doc inside interpolated string -/\ntheorem fake : False := sorry\"\ntheorem real_thm : 1 = 1 := rfl\n",
+            ),
+        ];
+        for (label, src) in cases {
+            let split = split_lean_source(src, &[]);
+            assert_eq!(
+                split.shards.len(),
+                1,
+                "{label}: fake `/--` inside non-code span must not split into an extra theorem shard: {:?}",
+                split.shards.iter().map(|s| s.decl_name()).collect::<Vec<_>>()
+            );
+            assert_eq!(split.shards[0].decl_name(), "real_thm", "{label}");
+            assert!(
+                !split.hygiene.has_sorry,
+                "{label}: fake sorry must stay in non-code"
+            );
+        }
+
+        let top_doc_src = "/-- first doc -/\ntheorem t1 : 1 = 1 := rfl\n/-- second doc -/\ntheorem t2 : 2 = 2 := rfl\n";
+        let top_doc_split = split_lean_source(top_doc_src, &[]);
+        assert_eq!(top_doc_split.shards.len(), 2);
+        assert!(top_doc_split.shards[0]
+            .shard_source
+            .contains("/-- first doc -/"));
+        assert!(!top_doc_split.shards[0]
+            .shard_source
+            .contains("/-- second doc -/"));
+        assert!(top_doc_split.shards[1]
+            .shard_source
+            .contains("/-- second doc -/"));
     }
 }
 
