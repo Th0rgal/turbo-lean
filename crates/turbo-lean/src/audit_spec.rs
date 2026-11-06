@@ -442,7 +442,34 @@ pub(super) fn split_at_first_top_level_assign(s: &str) -> Option<(&str, &str)> {
 /// so `audit-spec` can delta-unfold predicate wrappers (e.g., `def Impossible (x : Nat) : Prop := x < 0`),
 /// multi-line lowering definitions (`def evalLCNF ... :=\n  evalCode ...`), and tautological conclusion wrappers.
 // Name, application parameters, body, and binder-type dependencies.
-// Dependencies in types are real uses even when absent from an erased body.
+pub(super) fn extract_opened_namespaces(clean_src: &str) -> Vec<String> {
+    let mut opened = Vec::new();
+    for raw_line in clean_src.lines() {
+        let mut line = raw_line.trim();
+        if let Some(rest) = line.strip_prefix("scoped ") {
+            line = rest.trim();
+        }
+        let Some(mut rest) = line.strip_prefix("open ") else {
+            continue;
+        };
+        if let Some((before_in, _)) = rest.split_once(" in ") {
+            rest = before_in;
+        }
+        for tok in rest.split_whitespace() {
+            if matches!(tok, "scoped" | "hiding" | "renaming" | "in") || tok.starts_with('(') {
+                break;
+            }
+            let ns = tok.trim_end_matches([',', ';']);
+            if !ns.is_empty()
+                && ns.chars().all(|c| c == '.' || is_ident_continue(c))
+                && !opened.iter().any(|existing| existing == ns)
+            {
+                opened.push(ns.to_string());
+            }
+        }
+    }
+    opened
+}
 pub(super) type LocalDefUnfolding = (String, Vec<String>, String, String);
 
 pub(super) fn extract_local_def_unfoldings(clean_src: &str) -> Vec<LocalDefUnfolding> {
@@ -1976,6 +2003,7 @@ pub(super) fn audit_referenced_local_defs_for_stubs(
     hyp_strings: &[String],
     unfolded_conclusion: &str,
     local_defs: &[LocalDefUnfolding],
+    open_namespaces: &[String],
     policy: &AuditSpecPolicyConfig,
 ) -> Vec<String> {
     if !policy.reject_identity_stubs
@@ -2002,12 +2030,17 @@ pub(super) fn audit_referenced_local_defs_for_stubs(
 
     // Collect transitively referenced local defs (up to 4 hops).
     // Match full qualified `def_name` everywhere, and only match unqualified `short` when
-    // either `short == def_name` (top-level / same scope) or the referencing declaration/helper's
-    // namespace shares a non-empty namespace prefix with `def_name` (preventing a 1-letter helper
-    // `Foo.Bar.v` in an unrelated sibling directory from colliding with every binder `v` in
-    // `Root.Spec`, while still resolving unqualified calls within a cross-namespace helper's own
-    // defining namespace on subsequent hops).
+    // `short == def_name` (top-level), `def_ns` is brought into scope via `open`, or the
+    // referencing declaration/helper's namespace shares a non-empty namespace prefix with
+    // `def_name` (preventing a 1-letter helper `Foo.Bar.v` in an unrelated unopened sibling
+    // directory from colliding with every binder `v` in `Root.Spec`, while resolving both
+    // `open`-imported helpers and cross-namespace helper-internal calls).
     let decl_ns = decl.name.rsplit_once('.').map(|(ns, _)| ns).unwrap_or("");
+    let ns_shares_prefix = |lhs: &str, rhs: &str| {
+        lhs == rhs
+            || lhs.starts_with(&format!("{rhs}."))
+            || (!lhs.is_empty() && rhs.starts_with(&format!("{lhs}.")))
+    };
     let mut visited = std::collections::HashSet::new();
     let mut frontier: Vec<(String, String)> = vec![(decl_ns.to_string(), full_stmt)];
     let mut referenced = Vec::new();
@@ -2018,11 +2051,12 @@ pub(super) fn audit_referenced_local_defs_for_stubs(
                 continue;
             }
             let (def_ns, short) = def_name.rsplit_once('.').unwrap_or(("", def_name.as_str()));
+            let opened_match = open_namespaces
+                .iter()
+                .any(|open_ns| ns_shares_prefix(open_ns, def_ns));
             let is_ref = frontier.iter().any(|(caller_ns, txt)| {
-                let allow_short_match = def_ns.is_empty()
-                    || caller_ns == def_ns
-                    || caller_ns.starts_with(&format!("{def_ns}."))
-                    || (!caller_ns.is_empty() && def_ns.starts_with(&format!("{caller_ns}.")));
+                let allow_short_match =
+                    def_ns.is_empty() || opened_match || ns_shares_prefix(caller_ns, def_ns);
                 replace_ident_boundary(txt, def_name, "__REF__") != *txt
                     || (allow_short_match && replace_ident_boundary(txt, short, "__REF__") != *txt)
             });
@@ -2585,6 +2619,22 @@ pub(super) fn audit_single_decl_spec_full_with_policy(
     Vec<String>,
     Vec<String>,
 ) {
+    audit_single_decl_spec_full_with_policy_and_opens(decl, local_defs, &[], policy)
+}
+
+#[allow(clippy::type_complexity)]
+pub(super) fn audit_single_decl_spec_full_with_policy_and_opens(
+    decl: &ExtractedDecl,
+    local_defs: &[LocalDefUnfolding],
+    open_namespaces: &[String],
+    policy: &AuditSpecPolicyConfig,
+) -> (
+    (bool, bool, String),
+    String,
+    String,
+    Vec<String>,
+    Vec<String>,
+) {
     let mut hyp_strings = Vec::new();
     for (_, ty) in &decl.binders {
         if !is_known_binder_value_type(ty) {
@@ -2755,6 +2805,7 @@ pub(super) fn audit_single_decl_spec_full_with_policy(
         &hyp_strings,
         &conclusion_str,
         local_defs,
+        open_namespaces,
         policy,
     );
     let is_trivial_conclusion =
@@ -2815,7 +2866,7 @@ pub(super) fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<Ex
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 17;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 18;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -3032,6 +3083,11 @@ pub fn audit_spec_file_or_source(
     inline_src: Option<&str>,
     decl_filter: Option<&str>,
 ) -> serde_json::Value {
+    if inline_src.is_none()
+        && (file.is_dir() || (file.is_file() && file.with_extension("").is_dir()))
+    {
+        return audit_spec_files(&[file.to_path_buf()], decl_filter);
+    }
     match AuditSpecPolicyConfig::try_load_for_target(file, None, None, &[], &[]) {
         Ok(policy) => audit_spec_file_or_source_with_policy(file, inline_src, decl_filter, &policy),
         Err(err) => build_audit_spec_error_report(file, decl_filter, format!("{:#}", err)),
@@ -3059,19 +3115,25 @@ fn audit_spec_file_or_source_with_policy_inner(
         policy.effective_forbidden_for_path(file);
     let mut cache_target_path: Option<PathBuf> = None;
     let mut preloaded_file_src: Option<String> = None;
-    let mut preloaded_external_local_defs: Option<Vec<LocalDefUnfolding>> = None;
+    let mut preloaded_external_local_defs: Option<(Vec<LocalDefUnfolding>, Vec<String>)> = None;
     if inline_src.is_none()
         && file.is_file()
         && (!expand_umbrella_subdir || !file.with_extension("").is_dir())
     {
         if let Ok(file_bytes) = fs::read(file) {
             if let Ok(file_src) = String::from_utf8(file_bytes.clone()) {
-                let mut local_defs = extract_local_def_unfoldings(&strip_audit_comments(&file_src));
+                let clean_file_src = strip_audit_comments(&file_src);
+                let mut local_defs = extract_local_def_unfoldings(&clean_file_src);
+                let mut open_ns = extract_opened_namespaces(&clean_file_src);
                 for p in collect_external_local_def_lean_paths(file) {
                     if let Ok(sib_src) = fs::read_to_string(&p) {
-                        local_defs.extend(extract_local_def_unfoldings(&strip_audit_comments(
-                            &sib_src,
-                        )));
+                        let clean_sib = strip_audit_comments(&sib_src);
+                        local_defs.extend(extract_local_def_unfoldings(&clean_sib));
+                        for ons in extract_opened_namespaces(&clean_sib) {
+                            if !open_ns.contains(&ons) {
+                                open_ns.push(ons);
+                            }
+                        }
                     }
                 }
                 if let Some(cache_dir) = resolve_audit_spec_cache_dir() {
@@ -3088,6 +3150,11 @@ fn audit_spec_file_or_source_with_policy_inner(
                         ld_hasher.update(body.as_bytes());
                         ld_hasher.update(&(type_deps.len() as u64).to_le_bytes());
                         ld_hasher.update(type_deps.as_bytes());
+                    }
+                    ld_hasher.update(&(open_ns.len() as u64).to_le_bytes());
+                    for ons in &open_ns {
+                        ld_hasher.update(&(ons.len() as u64).to_le_bytes());
+                        ld_hasher.update(ons.as_bytes());
                     }
                     let ld_digest = *ld_hasher.finalize().as_bytes();
                     let hex_hash = compute_audit_spec_cache_key_with_policy(
@@ -3121,7 +3188,7 @@ fn audit_spec_file_or_source_with_policy_inner(
                     cache_target_path = Some(cache_path);
                 }
                 preloaded_file_src = Some(file_src);
-                preloaded_external_local_defs = Some(local_defs);
+                preloaded_external_local_defs = Some((local_defs, open_ns));
             }
         }
     }
@@ -3224,26 +3291,37 @@ fn audit_spec_file_or_source_with_policy_inner(
                 forbidden_scope_decls.push(v);
             }
         }
-        let local_defs = if let Some(preloaded) = preloaded_external_local_defs.take() {
-            preloaded
-        } else {
-            let mut defs = extract_local_def_unfoldings(&clean_src);
-            if inline_src.is_none() && src_path.is_file() {
-                for p in collect_external_local_def_lean_paths(src_path) {
-                    if let Ok(sib_src) = fs::read_to_string(&p) {
-                        defs.extend(extract_local_def_unfoldings(&strip_audit_comments(
-                            &sib_src,
-                        )));
+        let (local_defs, open_namespaces) =
+            if let Some(preloaded) = preloaded_external_local_defs.take() {
+                preloaded
+            } else {
+                let mut defs = extract_local_def_unfoldings(&clean_src);
+                let mut opens = extract_opened_namespaces(&clean_src);
+                if inline_src.is_none() && src_path.is_file() {
+                    for p in collect_external_local_def_lean_paths(src_path) {
+                        if let Ok(sib_src) = fs::read_to_string(&p) {
+                            let clean_sib = strip_audit_comments(&sib_src);
+                            defs.extend(extract_local_def_unfoldings(&clean_sib));
+                            for ons in extract_opened_namespaces(&clean_sib) {
+                                if !opens.contains(&ons) {
+                                    opens.push(ons);
+                                }
+                            }
+                        }
                     }
                 }
-            }
-            defs
-        };
+                (defs, opens)
+            };
 
         for d in extract_decls_fast(src, decl_filter) {
             total_specs_audited += 1;
             let ((is_vacuous, is_tight, reason), pos_witness, neg_witness, drop_hyps, decl_stubs) =
-                audit_single_decl_spec_full_with_policy(&d, &local_defs, policy);
+                audit_single_decl_spec_full_with_policy_and_opens(
+                    &d,
+                    &local_defs,
+                    &open_namespaces,
+                    policy,
+                );
             droppable_hypotheses.extend(drop_hyps.iter().cloned());
             for st in &decl_stubs {
                 if !stub_defs.contains(st) {
@@ -3565,8 +3643,8 @@ fn run_audit_spec_batch_with<F>(
 where
     F: Fn(&Path, bool) -> serde_json::Value + Sync,
 {
-    if files.len() == 1 && !files[0].is_dir() {
-        return audit_one(&files[0], true);
+    if files.len() == 1 && !files[0].is_dir() && !files[0].with_extension("").is_dir() {
+        return audit_one(&files[0], false);
     }
     let t0 = Instant::now();
     let targets = expand_audit_spec_targets(files);

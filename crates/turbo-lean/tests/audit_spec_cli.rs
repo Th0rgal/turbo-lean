@@ -797,10 +797,62 @@ end Uses
         "expected Helpers.unusedStub in {stubs:?}"
     );
 
+    // 1b. Negative (`open`): unqualified reference to an `open`-imported stub (`open OpenedLib`)
+    //     must be caught, whereas an unopened 1-letter sibling stub (`UnopenedSib.v`) must NOT
+    //     collide with an ordinary binder `(v : Nat)` in `Uses`!
+    let open_neg = fx.write(
+        "OpenStubNeg.lean",
+        r#"
+namespace OpenedLib
+def openIdentityStub (n : Nat) : Nat := n
+end OpenedLib
+
+open OpenedLib
+
+namespace Uses
+theorem test_open_stub (n : Nat) : openIdentityStub n + 1 > 0 := by omega
+end Uses
+"#,
+    );
+    let open_neg_out = fx
+        .cli("open-ns-neg")
+        .args(["--json", "audit-spec"])
+        .arg(&open_neg)
+        .output()
+        .unwrap();
+    let open_neg_json = assert_cli_fail_json(&open_neg_out, "open-imported identity stub");
+    assert!(open_neg_json["stub_defs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s
+            .as_str()
+            .unwrap_or("")
+            .contains("OpenedLib.openIdentityStub")));
+
+    fx.write(
+        "sib_no_collide/OtherSib.lean",
+        "namespace UnopenedSib\ndef v (x : Nat) : Nat := x\nend UnopenedSib\n",
+    );
+    let unopened_pos = fx.write(
+        "sib_no_collide/UnopenedNoCollide.lean",
+        "namespace Uses\ntheorem clean_binder_v (v : Nat) (h : v > 0) : v >= 1 := by omega\nend Uses\n",
+    );
+    let unopened_pos_out = fx
+        .cli("unopened-pos")
+        .args(["--json", "audit-spec"])
+        .arg(&unopened_pos)
+        .output()
+        .unwrap();
+    assert_cli_ok(
+        &unopened_pos_out,
+        "unopened 1-letter sibling def must not collide with binder v",
+    );
+
     // 2. Directory containing an umbrella module `Pkg.lean` + `Pkg/A.lean` must audit `Pkg/A.lean`
     //    exactly once (total_specs_audited == 2, never double-counted as 3).
     let dir_root = fx.root.join("umbrella_tree");
-    fx.write(
+    let pkg_umbrella = fx.write(
         "umbrella_tree/Pkg.lean",
         "theorem pkg_root_thm (n : Nat) (h : n > 0) : n >= 1 := by omega\n",
     );
@@ -818,4 +870,56 @@ end Uses
     assert_eq!(dir_json["total_specs_audited"].as_u64(), Some(2));
     assert_eq!(dir_json["tight_specs"].as_u64(), Some(2));
     assert_eq!(dir_json["file_reports"].as_array().map(Vec::len), Some(2));
+
+    // 3. Single-umbrella target (`audit-spec Pkg.lean`) MUST resolve descendant policies per file:
+    //    a strict `Pkg/audit-spec.toml` forbidding `structure` (or malformed TOML) in `Pkg/` must
+    //    fail closed when auditing `Pkg.lean`, while passing when `Pkg/A.lean` obeys its policy.
+    let single_umb_ok = fx
+        .cli("umbrella-single-ok")
+        .args(["--json", "audit-spec"])
+        .arg(&pkg_umbrella)
+        .output()
+        .unwrap();
+    let single_umb_ok_json = assert_cli_ok(&single_umb_ok, "single umbrella positive");
+    assert_eq!(single_umb_ok_json["total_specs_audited"].as_u64(), Some(2));
+
+    fx.write(
+        "umbrella_tree/Pkg/audit-spec.toml",
+        "policy = \"strict-proofs\"\nforbid_decl_kinds = [\"structure\"]\n",
+    );
+    fx.write(
+        "umbrella_tree/Pkg/A.lean",
+        "structure ForbiddenInSubdir where\n  x : Nat\ntheorem pkg_sub_thm (n : Nat) (h : n > 1) : n >= 2 := by omega\n",
+    );
+    let single_umb_bad = fx
+        .cli("umbrella-single-bad")
+        .args(["--json", "audit-spec"])
+        .arg(&pkg_umbrella)
+        .output()
+        .unwrap();
+    let single_umb_bad_json = assert_cli_fail_json(
+        &single_umb_bad,
+        "single umbrella must enforce descendant Pkg/audit-spec.toml",
+    );
+    assert!(single_umb_bad_json["forbidden_scope_decls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str().unwrap_or("").contains("ForbiddenInSubdir")));
+
+    fx.write(
+        "umbrella_tree/Pkg/audit-spec.toml",
+        "policy = \"strict-proofs\"\nunknown_descendant_key = true\n",
+    );
+    let single_umb_malformed = fx
+        .cli("umbrella-single-malformed")
+        .args(["--json", "audit-spec"])
+        .arg(&pkg_umbrella)
+        .output()
+        .unwrap();
+    let single_umb_mal_json = assert_cli_fail_json(
+        &single_umb_malformed,
+        "single umbrella must fail closed on malformed descendant config",
+    );
+    assert_eq!(single_umb_mal_json["verdict"].as_str(), Some("error"));
 }
