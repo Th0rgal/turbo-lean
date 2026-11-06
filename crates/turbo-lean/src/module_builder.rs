@@ -36246,11 +36246,11 @@ root = "Main"
             &store,
             &cfg,
             &dag,
+            &HashSet::new(),
             &dependents,
             "trusted",
             false,
             &HashMap::new(),
-            &HashSet::new(),
         );
         assert!(
             b_levels["App.ZRoot"] >= 1_500_000 && b_levels["App.ALeaf"] >= 500_000,
