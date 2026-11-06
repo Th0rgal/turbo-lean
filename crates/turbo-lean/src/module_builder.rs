@@ -8915,6 +8915,47 @@ fn prebuilt_import_specs(olean_path: &Path) -> Option<Vec<ParsedImport>> {
     Some(specs)
 }
 
+fn resolve_source_spec_for_prebuilt_olean(
+    cfg: &ProjectConfig,
+    olean_path: &Path,
+) -> Option<DiscoveredModuleSpec> {
+    let canon = fs::canonicalize(olean_path).unwrap_or_else(|_| olean_path.to_path_buf());
+    for (pkg, is_root) in
+        std::iter::once((&cfg.root_pkg, true)).chain(cfg.dep_pkgs.iter().map(|dp| (dp, false)))
+    {
+        let lib_dir = pkg.pkg_root.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
+        let lib_canon = fs::canonicalize(&lib_dir).unwrap_or(lib_dir);
+        if let Ok(rel) = canon.strip_prefix(&lib_canon) {
+            if rel.extension().and_then(|e| e.to_str()) == Some("olean") {
+                let stem = rel.with_extension("");
+                let mod_name = stem
+                    .to_string_lossy()
+                    .replace('\\', "/")
+                    .trim_matches('/')
+                    .replace('/', ".");
+                if !mod_name.is_empty() {
+                    if let Some(spec) = resolve_module_in_package(pkg, is_root, &mod_name) {
+                        return Some(spec);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn spec_source_has_disallowed_elab_host_effects(
+    cfg: &ProjectConfig,
+    spec: &DiscoveredModuleSpec,
+    src_raw: &str,
+) -> bool {
+    if !spec.is_root_pkg && is_git_pinned_manifest_package(cfg, spec) {
+        crate::splitter::source_may_read_host_state(src_raw)
+    } else {
+        crate::splitter::source_may_execute_elab_host_effects(src_raw, false)
+    }
+}
+
 fn prebuilt_closure_export_info(
     cfg: &ProjectConfig,
     strict_policy: bool,
@@ -8938,6 +8979,12 @@ fn prebuilt_closure_export_info(
     let mut local_pairs: Vec<(String, PathBuf)> = Vec::new();
     let collect_pairs = pb_closure_opt.is_some();
     let res = (|| -> Option<LakeModuleExportInfo> {
+        if let Some(mapped_spec) = resolve_source_spec_for_prebuilt_olean(cfg, olean_path) {
+            let mapped_src = fs::read_to_string(&mapped_spec.src_path).ok()?;
+            if spec_source_has_disallowed_elab_host_effects(cfg, &mapped_spec, &mapped_src) {
+                return None;
+            }
+        }
         let (mut info, is_mod, tv) = prebuilt_artifact_traces(olean_path)?;
         let actual_imports_h = recorded_trace_imports_hash(&tv)?;
         if !cfg.lean_githash.is_empty() && cfg.lean_githash != "lean-not-installed" {
@@ -9143,6 +9190,9 @@ fn lake_closure_export_info_inner(
             return None;
         }
         let src_raw = fs::read_to_string(&spec.src_path).ok()?;
+        if spec_source_has_disallowed_elab_host_effects(cfg, spec, &src_raw) {
+            return None;
+        }
         let hdr = parse_header_info(&src_raw);
         if hdr.header_error.is_some() {
             return None;
@@ -9678,6 +9728,9 @@ pub(crate) fn dep_pkg_import_pins_consistent(
         let Ok(src) = fs::read_to_string(&cur.src_path) else {
             return false;
         };
+        if spec_source_has_disallowed_elab_host_effects(cfg, &cur, &src) {
+            return Ok(None);
+        }
         let hdr = parse_header_info(&src);
         if hdr.header_error.is_some()
             || !entry_matches_import_pin_spec(&olean_path, &entry, hdr.is_module, &req.as_spec())
@@ -11276,6 +11329,9 @@ fn collect_fresh_dep_pkg_closure(
                     format!("Module {} ({})", cur.module_name, cur.src_path.display())
                 })?;
             }
+            if spec_source_has_disallowed_elab_host_effects(cfg, &cur, &src) {
+                return Ok(None);
+            }
             let hdr = parse_header_info(&src);
             if hdr.header_error.is_some() {
                 return Ok(None);
@@ -11887,6 +11943,9 @@ fn collect_prebuilt_dep_pkg_closure_for_statement(
                                 format!("Module {} ({})", cur.module_name, cur.src_path.display())
                             })
                             .map_err(|e| format!("{e:#}"))?;
+                    }
+                    if spec_source_has_disallowed_elab_host_effects(cfg, &cur, &src) {
+                        return Ok(None);
                     }
                     let hdr = parse_header_info(&src);
                     if hdr.header_error.is_some() {
@@ -16246,7 +16305,7 @@ pub fn compute_module_cas_key_with_dynlibs(
         );
     }
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean-module-cas-v6\n");
+    h.update(b"turbo-lean-module-cas-v7\n");
     update_lp(&mut h, b"toolchain", cfg.toolchain.as_bytes());
     update_lp(&mut h, b"githash", cfg.lean_githash.as_bytes());
     update_lp(
@@ -20573,6 +20632,66 @@ pub(crate) fn ensure_imported_oleans_replayed_with_roots_and_axioms(
     Ok(pending_audit.len() + pending_replay.len())
 }
 
+fn node_is_git_pinned_manifest_package(cfg: &ProjectConfig, node: &ModuleNode) -> bool {
+    !node.is_root_pkg
+        && cfg.manifest_packages.iter().any(|mp| {
+            mp.pkg_type == "git"
+                && mp.rev.as_deref().is_some_and(|r| !r.is_empty())
+                && (mp.name == node.pkg_name
+                    || mp.dir == node.pkg_root
+                    || mp
+                        .dir
+                        .canonicalize()
+                        .ok()
+                        .zip(node.pkg_root.canonicalize().ok())
+                        .is_some_and(|(a, b)| a == b))
+        })
+}
+
+fn node_source_has_disallowed_elab_host_effects(
+    cfg: &ProjectConfig,
+    node: &ModuleNode,
+    src_raw: &str,
+) -> bool {
+    if node_is_git_pinned_manifest_package(cfg, node) {
+        crate::splitter::source_may_read_host_state(src_raw)
+    } else {
+        crate::splitter::source_may_execute_elab_host_effects(src_raw, false)
+    }
+}
+
+fn compute_tainted_elab_host_effect_modules(
+    cfg: &ProjectConfig,
+    dag: &ModuleDag,
+) -> HashSet<String> {
+    let mut ext_tainted_memo: HashMap<PathBuf, bool> = HashMap::new();
+    let mut tainted: HashSet<String> = HashSet::new();
+    for mod_name in &dag.topological_order {
+        let Some(node) = dag.nodes.get(mod_name) else {
+            continue;
+        };
+        let self_tainted = fs::read_to_string(&node.src_path)
+            .map(|s| node_source_has_disallowed_elab_host_effects(cfg, node, &s))
+            .unwrap_or(true);
+        let dag_dep_tainted = node.direct_dag_deps.iter().any(|d| tainted.contains(d));
+        let ext_dep_tainted = node.external_olean_deps.iter().any(|(_, olean_path)| {
+            *ext_tainted_memo
+                .entry(olean_path.clone())
+                .or_insert_with(|| {
+                    resolve_source_spec_for_prebuilt_olean(cfg, olean_path).is_some_and(|spec| {
+                        fs::read_to_string(&spec.src_path)
+                            .map(|s| spec_source_has_disallowed_elab_host_effects(cfg, &spec, &s))
+                            .unwrap_or(true)
+                    })
+                })
+        });
+        if self_tainted || dag_dep_tainted || ext_dep_tainted {
+            tainted.insert(mod_name.clone());
+        }
+    }
+    tainted
+}
+
 pub(crate) fn record_verified_dep_source(
     cfg: &ProjectConfig,
     dag: &ModuleDag,
@@ -20582,12 +20701,14 @@ pub(crate) fn record_verified_dep_source(
     olean_digests: &HashMap<String, String>,
     tier_digests: &HashMap<String, ModuleArtifactTierDigests>,
 ) {
+    let tainted = compute_tainted_elab_host_effect_modules(cfg, dag);
     let mut one_shot_cache: HashMap<PathBuf, (VerifiedDepManifest, bool)> = HashMap::new();
     let ws_inputs = workspace_lake_inputs_digest(cfg).ok();
     record_verified_dep_source_cached(
         cfg,
         dag,
         node,
+        tainted.contains(&node.module_name),
         olean_artifact_digest,
         kernel_audited,
         olean_digests,
@@ -20603,6 +20724,7 @@ fn record_verified_dep_source_cached(
     cfg: &ProjectConfig,
     dag: &ModuleDag,
     node: &ModuleNode,
+    closure_has_elab_host_effects: bool,
     olean_artifact_digest: &str,
     kernel_audited: bool,
     olean_digests: &HashMap<String, String>,
@@ -20611,11 +20733,41 @@ fn record_verified_dep_source_cached(
     defer_disk_flush: bool,
     precomputed_ws_inputs: Option<&str>,
 ) {
+    if closure_has_elab_host_effects {
+        let pkg_root = &node.pkg_root;
+        let rel_src = node
+            .src_path
+            .strip_prefix(pkg_root)
+            .unwrap_or(&node.src_path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if let Some((manifest, dirty)) = manifest_cache.get_mut(pkg_root) {
+            if manifest.modules.remove(&rel_src).is_some() {
+                *dirty = true;
+                if !defer_disk_flush && flush_verified_dep_manifest_atomic(pkg_root, manifest) {
+                    *dirty = false;
+                }
+            }
+        } else {
+            let manifest_path = pkg_root.join(".lake/build/.turbo_verified_sources.json");
+            if let Ok(bytes) = fs::read(&manifest_path) {
+                if let Ok(mut m) = serde_json::from_slice::<VerifiedDepManifest>(&bytes) {
+                    if m.modules.remove(&rel_src).is_some() {
+                        let _ = flush_verified_dep_manifest_atomic(pkg_root, &m);
+                    }
+                }
+            }
+        }
+        return;
+    }
     // Pin the direct imports the `.olean` was elaborated against; skip recording if the
     // source moved on mid-build or a dependency digest is unknown.
     let Some(header) = fs::read_to_string(&node.src_path)
         .ok()
-        .filter(|src| blake3::hash(src.as_bytes()).to_hex().as_str() == node.src_blake3)
+        .filter(|src| {
+            blake3::hash(src.as_bytes()).to_hex().as_str() == node.src_blake3
+                && !node_source_has_disallowed_elab_host_effects(cfg, node, src)
+        })
         .map(|src| parse_header_info(&src))
     else {
         return;
@@ -21848,6 +22000,7 @@ fn compute_module_b_levels(
     store: &TurboStore,
     cfg: &ProjectConfig,
     dag: &ModuleDag,
+    tainted_elab_host_effect_mods: &HashSet<String>,
     dependents: &BTreeMap<String, Vec<String>>,
     trust_domain: &str,
     preserve_project: bool,
@@ -21858,18 +22011,20 @@ fn compute_module_b_levels(
     let mut weights: HashMap<String, u64> = HashMap::with_capacity(dag.nodes.len());
     for (mod_name, node) in &dag.nodes {
         let mut cached_dur: Option<u64> = None;
-        if let Some((mod_key, fallback_c_key)) = try_compute_initial_module_action_keys(
-            cfg,
-            dag,
-            node,
-            preserve_project,
-            ext_tier_digests,
-            &mut memo_on_disk_digests,
-        ) {
-            cached_dur = store.get_cached_action_duration_ms(&mod_key, trust_domain);
-            if cached_dur.is_none() {
-                if let Some(ref c_key) = fallback_c_key {
-                    cached_dur = store.get_cached_action_duration_ms(c_key, trust_domain);
+        if !tainted_elab_host_effect_mods.contains(mod_name) {
+            if let Some((mod_key, fallback_c_key)) = try_compute_initial_module_action_keys(
+                cfg,
+                dag,
+                node,
+                preserve_project,
+                ext_tier_digests,
+                &mut memo_on_disk_digests,
+            ) {
+                cached_dur = store.get_cached_action_duration_ms(&mod_key, trust_domain);
+                if cached_dur.is_none() {
+                    if let Some(ref c_key) = fallback_c_key {
+                        cached_dur = store.get_cached_action_duration_ms(c_key, trust_domain);
+                    }
                 }
             }
         }
@@ -23093,10 +23248,12 @@ pub(crate) fn build_project_modules_native_with_options(
             shared_lib_local_mods.insert(lm.clone());
         }
     }
+    let tainted_elab_host_effect_mods = compute_tainted_elab_host_effect_modules(&cfg, &dag);
     let b_levels = compute_module_b_levels(
         store,
         &cfg,
         &dag,
+        &tainted_elab_host_effect_mods,
         &dependents,
         trust_domain,
         preserve_project,
@@ -23399,11 +23556,13 @@ pub(crate) fn build_project_modules_native_with_options(
                         } else {
                             None
                         };
-                        let node_has_elab_host_effects = fs::read_to_string(&node.src_path)
-                            .map(|s| {
-                                crate::splitter::source_may_execute_elab_host_effects(&s, false)
-                            })
-                            .unwrap_or(true);
+                        let node_has_elab_host_effects = tainted_elab_host_effect_mods
+                            .contains(&mod_name)
+                            || fs::read_to_string(&node.src_path)
+                                .map(|s| {
+                                    node_source_has_disallowed_elab_host_effects(&cfg, node, &s)
+                                })
+                                .unwrap_or(true);
                         let mut cas_hit_outputs: Option<Vec<BlobEntry>> = None;
                         if !node_has_elab_host_effects {
                             if let Some(outputs) =
@@ -23623,7 +23782,7 @@ pub(crate) fn build_project_modules_native_with_options(
                                 "Worktree opt-out prevents rebuilding invalid CAS outputs for `{mod_name}`; build with Lake first"
                             );
                         } else {
-                            if !is_untrusted {
+                            if !is_untrusted && !node_has_elab_host_effects {
                                 let warm_opt = {
                                     let (active_digests, active_tiers) = if verified_ready {
                                         (&olean_digests, &tier_digests)
@@ -24099,6 +24258,7 @@ pub(crate) fn build_project_modules_native_with_options(
                                             &cfg,
                                             &dag,
                                             node,
+                                            tainted_elab_host_effect_mods.contains(&mod_name),
                                             &dig,
                                             node.is_root_pkg,
                                             &olean_digests,
@@ -24248,6 +24408,7 @@ pub(crate) fn build_project_modules_native_with_options(
                                         &cfg,
                                         &dag,
                                         node,
+                                        tainted_elab_host_effect_mods.contains(&mod_name),
                                         &dig,
                                         node.is_root_pkg,
                                         &olean_digests,
@@ -24264,7 +24425,20 @@ pub(crate) fn build_project_modules_native_with_options(
                                     )?;
                                 }
                                 report.modules_up_to_date_reused += 1;
-                                Ok(Some((dig, Some((mod_key, 0, existing_log)))))
+                                let warm_cas_store_opt = (!tainted_elab_host_effect_mods
+                                    .contains(&mod_name))
+                                .then(|| {
+                                    fs::read_to_string(&node.src_path)
+                                        .ok()
+                                        .filter(|s| {
+                                            !node_source_has_disallowed_elab_host_effects(
+                                                &cfg, node, s,
+                                            )
+                                        })
+                                        .map(|_| (mod_key, 0, existing_log))
+                                })
+                                .flatten();
+                                Ok(Some((dig, warm_cas_store_opt)))
                             })(
                             ),
                             PendingAuditOrigin::Compiled {
@@ -24309,6 +24483,7 @@ pub(crate) fn build_project_modules_native_with_options(
                                             &cfg,
                                             &dag,
                                             node,
+                                            tainted_elab_host_effect_mods.contains(&mod_name),
                                             &dig,
                                             node.is_root_pkg,
                                             &olean_digests,
@@ -24321,14 +24496,19 @@ pub(crate) fn build_project_modules_native_with_options(
                                 }
                                 report.modules_compiled += 1;
                                 report.compiled_modules.push(mod_name.clone());
-                                let cas_store_opt = fs::read_to_string(&node.src_path)
-                                    .ok()
-                                    .filter(|s| {
-                                        !crate::splitter::source_may_execute_elab_host_effects(
-                                            s, false,
-                                        )
-                                    })
-                                    .map(|_| (mod_key, dur_ms, trace_log));
+                                let cas_store_opt = (!tainted_elab_host_effect_mods
+                                    .contains(&mod_name))
+                                .then(|| {
+                                    fs::read_to_string(&node.src_path)
+                                        .ok()
+                                        .filter(|s| {
+                                            !node_source_has_disallowed_elab_host_effects(
+                                                &cfg, node, s,
+                                            )
+                                        })
+                                        .map(|_| (mod_key, dur_ms, trace_log))
+                                })
+                                .flatten();
                                 Ok(Some((dig, cas_store_opt)))
                             })(),
                         };
@@ -24817,6 +24997,7 @@ pub fn build_cone_export_filter(
         }
     }
 
+    let tainted_elab_host_effect_mods = compute_tainted_elab_host_effect_modules(&cfg, &dag);
     for mod_name in &dag.topological_order {
         let Some(node) = dag.nodes.get(mod_name) else {
             continue;
@@ -24849,17 +25030,19 @@ pub fn build_cone_export_filter(
             &dynlib_digests,
         )?;
         let mut resolved_tiers: Option<ModuleArtifactTierDigests> = None;
-        for cand_key in [&key_no_c, &key_with_c] {
-            if let Ok(Some(outputs)) = store.get_cached_action(cand_key, "trusted") {
-                allowed_actions.insert(cand_key.clone());
-                if let Some((art_tiers, rep_dig)) =
-                    compute_cas_outputs_artifact_and_replay_digests(&outputs)
-                {
-                    let preferred_key = if node.needs_c { &key_with_c } else { &key_no_c };
-                    if resolved_tiers.is_none() || cand_key == preferred_key {
-                        resolved_tiers = Some(art_tiers);
+        if !tainted_elab_host_effect_mods.contains(mod_name) {
+            for cand_key in [&key_no_c, &key_with_c] {
+                if let Ok(Some(outputs)) = store.get_cached_action(cand_key, "trusted") {
+                    allowed_actions.insert(cand_key.clone());
+                    if let Some((art_tiers, rep_dig)) =
+                        compute_cas_outputs_artifact_and_replay_digests(&outputs)
+                    {
+                        let preferred_key = if node.needs_c { &key_with_c } else { &key_no_c };
+                        if resolved_tiers.is_none() || cand_key == preferred_key {
+                            resolved_tiers = Some(art_tiers);
+                        }
+                        allowed_replay_artifact_digests.insert(rep_dig);
                     }
-                    allowed_replay_artifact_digests.insert(rep_dig);
                 }
             }
         }

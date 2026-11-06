@@ -1364,10 +1364,86 @@ pub(crate) fn contains_lean_word(haystack: &str, word: &str) -> bool {
     false
 }
 
+/// Match an identifier component even when qualified by a namespace prefix/suffix (e.g. `IO.getEnv`
+/// or `System.FilePath` as well as bare `getEnv` under `open IO`).
+pub(crate) fn contains_lean_ident_segment(haystack: &str, seg: &str) -> bool {
+    for (idx, _) in haystack.match_indices(seg) {
+        let prev_ok = idx == 0
+            || !haystack[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| is_lean_id_rest(c) || c == '»');
+        let end = idx + seg.len();
+        let next_ok = end >= haystack.len()
+            || !haystack[end..]
+                .chars()
+                .next()
+                .is_some_and(|c| is_lean_id_rest(c) || c == '«');
+        if prev_ok && next_ok {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_lean_attribute_word(unquoted: &str, attrs: &[&str]) -> bool {
+    let mut rest = unquoted;
+    while !rest.is_empty() {
+        let at_pos = rest.find("@[");
+        let kw_pos = rest.find("attribute").and_then(|p| {
+            let prev_ok = p == 0
+                || !rest[..p]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| is_lean_id_rest(c) || c == '.');
+            let after = &rest[p + "attribute".len()..];
+            let trimmed = after.trim_start();
+            if prev_ok
+                && (after.len() != trimmed.len() || after.starts_with('['))
+                && trimmed.starts_with('[')
+            {
+                Some((p, rest.len() - trimmed.len() + 1))
+            } else {
+                None
+            }
+        });
+        let (advance_from, open_inner) = match (at_pos, kw_pos) {
+            (Some(a), Some((k, inner))) if a <= k => (a + 2, a + 2),
+            (None, Some((_, inner))) => (inner, inner),
+            (_, Some((_, inner))) => (inner, inner),
+            (Some(a), None) => (a + 2, a + 2),
+            (None, None) => break,
+        };
+        let tail = &rest[open_inner..];
+        let mut depth = 1usize;
+        let mut close_idx = tail.len();
+        for (i, ch) in tail.char_indices() {
+            match ch {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_idx = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let inner = &tail[..close_idx];
+        if attrs.iter().any(|w| contains_lean_ident_segment(inner, w)) {
+            return true;
+        }
+        rest = &rest[advance_from.min(rest.len())..];
+    }
+    false
+}
+
 /// Returns true if `src` may execute arbitrary `IO` / `CoreM` / `CommandElabM` / `TermElabM` /
-/// `TacticM` / FFI host effects during elaboration (including under `open IO`, aliases, or
-/// wrapper helpers). When `reject_pure_macros` is true, pure `MacroM` (`macro`, `macro_rules`,
-/// `@[macro]`) is also rejected.
+/// `TacticM` / `evalConst` / FFI host effects during elaboration (including under `open IO`,
+/// `run_tac`, attributes like `@[env_linter]`/`@[package_check]`/`@[cpass]`, or `macro`s building
+/// raw `Syntax.node*` ASTs). When `reject_pure_macros` is true, pure `MacroM` (`macro`,
+/// `macro_rules`, `@[macro]`) is also rejected.
 pub(crate) fn source_may_execute_elab_host_effects(src: &str, reject_pure_macros: bool) -> bool {
     let comment_free = strip_lean_comments(src);
     let clean = strip_string_literals(&comment_free);
@@ -1379,6 +1455,7 @@ pub(crate) fn source_may_execute_elab_host_effects(src: &str, reject_pure_macros
         "run_elab",
         "run_cmd",
         "run_meta",
+        "run_tac",
         "#eval",
         "#eval!",
         "#guard_msgs",
@@ -1386,21 +1463,10 @@ pub(crate) fn source_may_execute_elab_host_effects(src: &str, reject_pure_macros
         "builtin_initialize",
         "include_str",
         "unsafe",
-        "command_elab",
-        "term_elab",
-        "app_elab",
-        "tactic",
         "simproc",
         "dsimproc",
         "simproc_decl",
         "dsimproc_decl",
-        "init",
-        "builtin_init",
-        "extern",
-        "implemented_by",
-        "csimp",
-        "env_extension",
-        "builtin_env_extension",
     ];
     if ELAB_IO_WORDS
         .iter()
@@ -1408,10 +1474,135 @@ pub(crate) fn source_may_execute_elab_host_effects(src: &str, reject_pure_macros
     {
         return true;
     }
-    reject_pure_macros
-        && ["macro", "macro_rules"]
+    const ELAB_IDENT_SEGMENTS: &[&str] = &[
+        "runTac",
+        "evalConst",
+        "evalConstCheck",
+        "evalTerm",
+        "registerBuiltinAttribute",
+        "registerTagAttribute",
+        "registerParametricAttribute",
+        "registerEnvExtension",
+        "mkEnvExtension",
+        "registerSimplePersistentEnvExtension",
+        "registerPersistentEnvExtension",
+    ];
+    if ELAB_IDENT_SEGMENTS
+        .iter()
+        .any(|w| contains_lean_ident_segment(&unquoted, w))
+    {
+        return true;
+    }
+    const ELAB_ATTRS: &[&str] = &[
+        "command_elab",
+        "term_elab",
+        "app_elab",
+        "tactic",
+        "init",
+        "builtin_init",
+        "extern",
+        "implemented_by",
+        "csimp",
+        "env_linter",
+        "package_check",
+        "cpass",
+        "user_attr",
+        "env_extension",
+        "builtin_env_extension",
+    ];
+    if contains_lean_attribute_word(&unquoted, ELAB_ATTRS) {
+        return true;
+    }
+    let has_macro_decl = ["macro", "macro_rules"]
+        .iter()
+        .any(|w| contains_lean_word(&unquoted, w))
+        || contains_lean_attribute_word(&unquoted, &["macro", "macro_rules"]);
+    if has_macro_decl {
+        if reject_pure_macros {
+            return true;
+        }
+        const RAW_SYNTAX_SEGMENTS: &[&str] = &[
+            "node",
+            "node1",
+            "node2",
+            "node3",
+            "node4",
+            "node5",
+            "node6",
+            "node7",
+            "node8",
+            "mkNode",
+            "mkApp",
+            "mkCApp",
+            "mkStr1",
+            "mkStr2",
+            "mkStr3",
+            "mkStr4",
+            "mkStr5",
+            "mkStr6",
+            "mkStr7",
+            "mkStr8",
+            "mkSimple",
+            "SourceInfo",
+        ];
+        if RAW_SYNTAX_SEGMENTS
             .iter()
-            .any(|w| contains_lean_word(&unquoted, w))
+            .any(|w| contains_lean_ident_segment(&unquoted, w))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true if `src` references host-environment, filesystem, process, clock, RNG, or FFI
+/// primitives (qualified or unqualified under `open IO` / `open System`) that could observe
+/// unpinned host state during elaboration inside a git-pinned dependency package.
+pub(crate) fn source_may_read_host_state(src: &str) -> bool {
+    let comment_free = strip_lean_comments(src);
+    let clean = strip_string_literals(&comment_free);
+    let unquoted = clean.replace(['«', '»'], "");
+    if contains_lean_word(&unquoted, "include_str") {
+        return true;
+    }
+    const HOST_READ_SEGMENTS: &[&str] = &[
+        "getEnv",
+        "readFile",
+        "readBinFile",
+        "readDir",
+        "readLines",
+        "pathExists",
+        "isDir",
+        "metadata",
+        "realPath",
+        "currentDir",
+        "appPath",
+        "Process",
+        "Handle",
+        "getRandomBytes",
+        "monoMsNow",
+        "monoNanosNow",
+        "dlopen",
+    ];
+    if HOST_READ_SEGMENTS
+        .iter()
+        .any(|w| contains_lean_ident_segment(&unquoted, w))
+    {
+        return true;
+    }
+    contains_lean_attribute_word(
+        &unquoted,
+        &[
+            "extern",
+            "implemented_by",
+            "csimp",
+            "init",
+            "builtin_init",
+            "env_linter",
+            "package_check",
+            "cpass",
+        ],
+    )
 }
 
 fn contains_word(haystack: &str, word: &str) -> bool {
@@ -12955,22 +13146,39 @@ public def api := by
             true
         ));
         assert!(!source_may_execute_elab_host_effects(
-            "def elaboratedValue : Nat := 1\ndef Unsafe.foo : Nat := 2\n",
+            "def elaboratedValue : Nat := 1\ndef Unsafe.foo : Nat := 2\ndef xs := Array.init 4 id\ndef tacticHelper : Nat := 3\n",
             true
         ));
         assert!(source_may_execute_elab_host_effects(
             "open IO in\npublic meta section\nopen Lean Elab Term in\npublic elab \"env_nat\" : term => do\n  let _ ← getEnv \"X\"\n  return mkNatLit 0\n",
             false
         ));
-        assert!(
-            source_may_execute_elab_host_effects(
-                "def f : String := s!\"{by run_tac trivial}\"\n",
-                false
-            ) || source_may_execute_elab_host_effects(
-                "def f : String := s!\"{unsafeCast 0}\"\n",
-                false
-            )
-        );
+        assert!(source_may_execute_elab_host_effects(
+            "theorem env_sig (x : show Type from by run_tac exact ()) : x = x := rfl\n",
+            false
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "macro \"raw_rt\" : tactic => return Lean.Syntax.node2 .none (Lean.Name.mkStr4 \"Lean\" \"Parser\" \"Tactic\" \"runTac\") (mkAtom \"x\") (mkAtom \"y\")\n",
+            false
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "@[env_linter] def myLinter : Nat := 0\n",
+            false
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "attribute [package_check] myCheck\n",
+            false
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "def f : String := s!\"{by run_tac trivial}\"\n",
+            false
+        ));
+        assert!(source_may_read_host_state(
+            "open IO in\ndef readFlag : IO (Option String) := getEnv \"FLAG\"\n"
+        ));
+        assert!(!source_may_read_host_state(
+            "def pureHelper (n : Nat) : Array Nat := Array.init n id\n"
+        ));
         assert!(source_may_execute_elab_host_effects(
             "def f : String := s!\"{unsafeCast 0}\"\n",
             false

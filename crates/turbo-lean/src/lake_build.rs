@@ -2888,6 +2888,9 @@ fn verify_project_module_entry_and_sidecars(
     if actual_src_b3 != expected_src_blake3 {
         return false;
     }
+    if crate::splitter::source_may_execute_elab_host_effects(&src_raw, false) {
+        return false;
+    }
     let hdr = crate::module_builder::parse_header_info(&src_raw);
     if hdr.header_error.is_some() {
         return false;
@@ -4313,6 +4316,10 @@ fn ensure_project_imports_fresh_inner(
             .to_string_lossy()
             .replace('\\', "/");
         let cur_hash = compute_cached_source_blake3(&info.dep_src);
+        let src_elab_host_effects_stale = olean_meta.is_some()
+            && fs::read_to_string(&info.dep_src)
+                .map(|s| crate::splitter::source_may_execute_elab_host_effects(&s, false))
+                .unwrap_or(true);
 
         let pkg_inputs_stale = !verify_only
             && root_lake_inputs_stale
@@ -4385,6 +4392,7 @@ fn ensure_project_imports_fresh_inner(
         let opt_out = worktree_auto_link_disabled(canon_dir);
         let cryptographically_verified = !opt_out
             && olean_meta.is_some()
+            && !src_elab_host_effects_stale
             && !pkg_inputs_stale
             && !manifest_stale
             && !lake_root_stale
@@ -4430,7 +4438,8 @@ fn ensure_project_imports_fresh_inner(
                 }
                 _ => false,
             };
-        if pkg_inputs_stale
+        if src_elab_host_effects_stale
+            || pkg_inputs_stale
             || manifest_stale
             || lake_root_stale
             || olean_githash_stale

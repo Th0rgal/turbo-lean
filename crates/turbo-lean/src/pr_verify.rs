@@ -5708,6 +5708,72 @@ fn package_has_lean_elab_host_effects(pkg: &crate::module_builder::PackageConfig
     false
 }
 
+fn package_may_read_host_state(pkg: &PackageConfig) -> bool {
+    let Ok(dep_root) = pkg.pkg_root.canonicalize() else {
+        return true;
+    };
+    let build_abs = dep_root.join(&pkg.build_dir);
+    let pkgs_abs = dep_root.join(&pkg.packages_dir);
+    let lake_abs = dep_root.join(".lake");
+    let mut stack = vec![dep_root];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else {
+            return true;
+        };
+        for ent in rd {
+            let Ok(ent) = ent else {
+                return true;
+            };
+            let p = ent.path();
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if name == ".git" || p == build_abs || p == pkgs_abs || p == lake_abs {
+                continue;
+            }
+            let Ok(st) = fs::symlink_metadata(&p) else {
+                return true;
+            };
+            if st.file_type().is_symlink() {
+                continue;
+            }
+            if st.is_dir() {
+                stack.push(p);
+            } else if st.is_file() && name.ends_with(".lean") {
+                let Ok(src) = fs::read_to_string(&p) else {
+                    return true;
+                };
+                if splitter::source_may_read_host_state(&src) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn is_pinned_git_manifest_dep(cfg: &ProjectConfig, dep: &PackageConfig) -> bool {
+    let dep_canon = dep.pkg_root.canonicalize().ok();
+    cfg.manifest_packages.iter().any(|mp| {
+        mp.pkg_type == "git"
+            && mp.rev.as_deref().is_some_and(|r| !r.is_empty())
+            && (mp.name == dep.name
+                || mp.dir == dep.pkg_root
+                || mp
+                    .dir
+                    .canonicalize()
+                    .ok()
+                    .zip(dep_canon.as_ref())
+                    .is_some_and(|(a, b)| a == *b))
+    })
+}
+
+fn dep_package_has_disallowed_elab_host_effects(cfg: &ProjectConfig, dep: &PackageConfig) -> bool {
+    if is_pinned_git_manifest_dep(cfg, dep) {
+        package_may_read_host_state(dep)
+    } else {
+        package_has_lean_elab_host_effects(dep)
+    }
+}
+
 fn copy_dep_sources_without_build_products(
     src_root: &Path,
     dst_root: &Path,
@@ -5764,14 +5830,7 @@ fn seed_trusted_statement_dependencies(
         }
         let source = dep.pkg_root.canonicalize()?;
         if source.is_absolute() && source.is_dir() {
-            let is_pinned_git_dep = cfg.manifest_packages.iter().any(|mp| {
-                mp.pkg_type == "git"
-                    && mp.rev.as_deref().is_some_and(|r| !r.is_empty())
-                    && (mp.name == dep.name
-                        || mp.dir == dep.pkg_root
-                        || mp.dir.canonicalize().ok().as_deref() == Some(source.as_path()))
-            });
-            if !is_pinned_git_dep && package_has_lean_elab_host_effects(dep) {
+            if dep_package_has_disallowed_elab_host_effects(cfg, dep) {
                 let build_abs = source.join(&dep.build_dir);
                 copy_dep_sources_without_build_products(&source, &target, &build_abs)?;
             } else {
@@ -6084,7 +6143,7 @@ fn standalone_statement_olean_action_key(
         worklist.extend(imps.into_iter().map(|i| i.module));
     }
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean:standalone-stmt-olean:v4\0");
+    h.update(b"turbo-lean:standalone-stmt-olean:v5\0");
     h.update(cfg.lean_githash.as_bytes());
     h.update(b"\0");
     h.update(pkg.config_digest.as_bytes());
@@ -7463,7 +7522,7 @@ fn base_statement_cache_action_key(
     }
     git_tree_has_no_elab_host_effects(repo, &tree_oid)?;
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean:base-stmt-map:v4\0");
+    h.update(b"turbo-lean:base-stmt-map:v5\0");
     update_lp_bytes(&mut h, b"githash", cfg.lean_githash.as_bytes());
     update_lp_bytes(
         &mut h,
@@ -7522,6 +7581,10 @@ fn base_statement_cache_action_key(
         {
             return None;
         }
+        if dep_package_has_disallowed_elab_host_effects(cfg, dp) {
+            return None;
+        }
+        let reject_dep_elab_effects = !is_pinned_git_manifest_dep(cfg, dp);
         let dep_root = dp.pkg_root.canonicalize().ok()?;
         update_lp_bytes(&mut h, b"dep_name", dp.name.as_bytes());
         update_lp_bytes(&mut h, b"dep_base_name", dp.base_name.as_bytes());
@@ -7565,7 +7628,7 @@ fn base_statement_cache_action_key(
                 sr,
                 std::slice::from_ref(&pkgs_abs),
                 Some(&[".lean"]),
-                true,
+                reject_dep_elab_effects,
             )?;
         }
         hash_deterministic_file_tree(
@@ -7573,7 +7636,7 @@ fn base_statement_cache_action_key(
             &dep_root,
             &[build_abs.clone(), pkgs_abs, lake_abs],
             Some(&[".lean"]),
-            true,
+            reject_dep_elab_effects,
         )?;
         hash_deterministic_file_tree(
             &mut h,
@@ -8018,21 +8081,11 @@ fn kernel_statement_changes_with_trust(
                 return None;
             }
             let cfg = trusted_cfg.as_ref()?;
-            if cfg.dep_pkgs.iter().any(|dp| {
-                let is_pinned_git_dep = cfg.manifest_packages.iter().any(|mp| {
-                    mp.pkg_type == "git"
-                        && mp.rev.as_deref().is_some_and(|r| !r.is_empty())
-                        && (mp.name == dp.name
-                            || mp.dir == dp.pkg_root
-                            || mp
-                                .dir
-                                .canonicalize()
-                                .ok()
-                                .zip(dp.pkg_root.canonicalize().ok())
-                                .is_some_and(|(a, b)| a == b))
-                });
-                !is_pinned_git_dep && package_has_lean_elab_host_effects(dp)
-            }) {
+            if cfg
+                .dep_pkgs
+                .iter()
+                .any(|dp| dep_package_has_disallowed_elab_host_effects(cfg, dp))
+            {
                 return None;
             }
             let pkg = crate::module_builder::resolve_package_config(&head_project, true).ok()?;
@@ -17383,19 +17436,11 @@ end ParityNs
             )?;
             git_init_and_commit(&tree2.project, "base_dag_alpha")?;
             let cfg2 = crate::module_builder::resolve_project_config(&tree2.project)?;
-            let mods2 = BTreeMap::from([
-                (
-                    "P.EnvDep".to_string(),
-                    (tree2.project.join("P/EnvDep.lean"), tree2.project.clone()),
-                ),
-                (
-                    "P.Consumer".to_string(),
-                    (tree2.project.join("P/Consumer.lean"), tree2.project.clone()),
-                ),
-            ]);
-            let dag2 = crate::module_builder::build_dag_from_modules(mods2, None)?;
+            let targets2 = vec!["P.EnvDep".to_string(), "P.Consumer".to_string()];
+            let dag2 =
+                crate::module_builder::build_module_dag_for_trusted_statement(&cfg2, &targets2)?;
             assert!(
-                !crate::module_builder::are_dag_modules_fresh_by_lake_trace(&cfg2, &dag2, 4),
+                !crate::module_builder::are_dag_modules_fresh_by_lake_trace(&cfg2, &dag2),
                 "DAG containing an elaborator module (`P.EnvDep`) must never report fresh-by-Lake-trace alone"
             );
             let dirty2 = crate::module_builder::find_dirty_modules_in_otherwise_fresh_dag(
@@ -17406,10 +17451,296 @@ end ParityNs
             )
             .expect("dirty module scan on otherwise-fresh DAG");
             assert!(
-                dirty2.contains("P.EnvDep") && dirty2.contains("P.Consumer"),
+                dirty2.iter().any(|m| m == "P.EnvDep") && dirty2.iter().any(|m| m == "P.Consumer"),
                 "elaboration host-effect module `P.EnvDep` must cascade dirtiness to downstream `P.Consumer`, got: {dirty2:?}"
             );
 
+            // Third case (`sol` Finding 1): `by run_tac` in a theorem type without `elab`/`macro`
+            // must also bypass caches and fail warm/cold parity when `TURBO_TEST_ELAB_STMT_ENV` rotates.
+            std::env::set_var(ENV_KEY, "alpha");
+            let rt_src_v1 = "import Lean\nopen IO Lean Elab Tactic in\ntheorem rt_thm (x : show Type from by\n  run_tac do\n    match (← getEnv \"TURBO_TEST_ELAB_STMT_ENV\") with\n    | some \"beta\" => evalTactic (← `(tactic| exact Bool))\n    | _ => evalTactic (← `(tactic| exact Nat))) : x = x := by\n  rfl\n";
+            let tree_rt =
+                LakeTree::new("run_tac_getenv_stmt_parity", &[("P/RtMod.lean", rt_src_v1)])?;
+            git_init_and_commit(&tree_rt.project, "base_rt_alpha")?;
+            let mut rt_warm_store = TurboStore::open(Some(&tree_rt.root.join("warm_store")))?;
+            run_pr_verify_command(
+                &mut rt_warm_store,
+                true,
+                tree_rt.project.clone(),
+                "HEAD".into(),
+                "trusted".into(),
+                true,
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+                None,
+            )?;
+            let rt_src_v2 = "import Lean\nopen IO Lean Elab Tactic in\ntheorem rt_thm (x : show Type from by\n  run_tac do\n    let _ ← getEnv \"TURBO_TEST_ELAB_STMT_ENV\"\n    evalTactic (← `(tactic| exact Nat))) : x = x := by\n  exact rfl\n";
+            fs::write(tree_rt.project.join("P/RtMod.lean"), rt_src_v2)?;
+            std::env::set_var(ENV_KEY, "beta");
+            let mut rt_cold_store = TurboStore::open(Some(&tree_rt.root.join("cold_store")))?;
+            let rt_warm_err = run_pr_verify_command(
+                &mut rt_warm_store,
+                true,
+                tree_rt.project.clone(),
+                "HEAD".into(),
+                "trusted".into(),
+                true,
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+                None,
+            )
+            .expect_err(
+                "warm pr-verify must not reuse stale alpha baseline for `by run_tac` when env=beta",
+            );
+            let rt_cold_err = run_pr_verify_command(
+                &mut rt_cold_store,
+                true,
+                tree_rt.project.clone(),
+                "HEAD".into(),
+                "trusted".into(),
+                true,
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+                None,
+            )
+            .expect_err("cold pr-verify must detect `by run_tac` statement delta between HEAD(Bool) and WT(Nat)");
+            assert!(
+                rt_warm_err.to_string().contains("rt_thm")
+                    && rt_cold_err.to_string().contains("rt_thm"),
+                "warm ({rt_warm_err:#}) and cold ({rt_cold_err:#}) must both pinpoint `rt_thm`"
+            );
+
+            // Fourth case (`astra` Finding 1 + `argon` Finding 2): transitive import `P.EnvDep -> P.Consumer`
+            // where `P.Consumer` has NO `elab`/`macro` tokens (`x : _` inferred from `depWitness`) must NOT
+            // be served from Module CAS or warm-probe when `TURBO_TEST_ELAB_STMT_ENV` rotates (`alpha` -> `beta` -> `alpha`).
+            std::env::set_var(ENV_KEY, "alpha");
+            let mut trans_store = TurboStore::open(Some(&tree2.root.join("trans_store")))?;
+            run_pr_verify_command(
+                &mut trans_store,
+                true,
+                tree2.project.clone(),
+                "HEAD".into(),
+                "trusted".into(),
+                true,
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+                None,
+            )?;
+            fs::write(
+                tree2.project.join("P/EnvDep.lean"),
+                "import Lean\nopen IO Lean Elab Term in\nelab \"env_dep_ty\" : term => do\n  let _ ← getEnv \"TURBO_TEST_ELAB_STMT_ENV\"\n  return mkConst ``Nat\ndef depWitness (x : env_dep_ty) : env_dep_ty := x\n",
+            )?;
+            fs::write(
+                tree2.project.join("P/Consumer.lean"),
+                "import P.EnvDep\ntheorem consumer_thm (x : _) : depWitness x = depWitness x := by\n  exact rfl\n",
+            )?;
+            std::env::set_var(ENV_KEY, "beta");
+            let trans_beta_err = run_pr_verify_command(
+                &mut trans_store,
+                true,
+                tree2.project.clone(),
+                "HEAD".into(),
+                "trusted".into(),
+                true,
+                None,
+                None,
+                None,
+                None,
+                false,
+                0,
+                None,
+            )
+            .expect_err("transitive consumer of `P.EnvDep` must detect HEAD(Bool) vs WT(Nat) delta when env=beta");
+            assert!(
+                trans_beta_err.to_string().contains("consumer_thm")
+                    || trans_beta_err.to_string().contains("depWitness"),
+                "unexpected transitive beta error: {trans_beta_err:#}"
+            );
+            // Restore original env-branching `P/EnvDep.lean` so `tree2` branches on `ENV_KEY`, build under `beta`
+            // so `P.EnvDep(Bool)` & `P.Consumer(Bool)` exist on disk & in CAS (if unblocked), then switch back to
+            // `alpha` and verify neither Module CAS nor warm-probe serves a stale `P.Consumer` artifact!
+            fs::write(
+                tree2.project.join("P/EnvDep.lean"),
+                "import Lean\nopen IO Lean Elab Term in\nelab \"env_dep_ty\" : term => do\n  match (← getEnv \"TURBO_TEST_ELAB_STMT_ENV\") with\n  | some \"beta\" => return mkConst ``Bool\n  | _ => return mkConst ``Nat\ndef depWitness (x : env_dep_ty) : env_dep_ty := x\n",
+            )?;
+            crate::module_builder::build_project_modules_native(
+                &mut trans_store,
+                &tree2.project,
+                &[],
+                "trusted",
+                1,
+                false,
+                true,
+                None,
+            )?;
+            std::env::set_var(ENV_KEY, "alpha");
+            let rep_alpha = crate::module_builder::build_project_modules_native(
+                &mut trans_store,
+                &tree2.project,
+                &[],
+                "trusted",
+                1,
+                false,
+                true,
+                None,
+            )?;
+            assert_eq!(
+                rep_alpha.modules_cached, 0,
+                "neither P.EnvDep nor transitive P.Consumer may hit Module CAS"
+            );
+            assert_eq!(
+                rep_alpha.modules_up_to_date_reused, 0,
+                "neither P.EnvDep nor transitive P.Consumer may warm-adopt across env rotation"
+            );
+
+            // Fifth case (`astra` Finding 2 + `sol` Finding 2): path dependency AND git-pinned dependency
+            // defining an env-reading elaborator (`elab "dep_env_ty"`) imported by a pure root `App.lean`
+            // must NOT reuse stale `.lake/packages/dep/.lake/build` `.olean`s when `ENV_KEY` rotates!
+            for use_git_pin in [false, true] {
+                std::env::set_var(ENV_KEY, "alpha");
+                let dep_case_root = tree.root.join(if use_git_pin {
+                    "git_dep_case"
+                } else {
+                    "path_dep_case"
+                });
+                let dep_pkg_src = dep_case_root.join("dep_origin");
+                let app_proj = dep_case_root.join("app");
+                let dep_in_pkgs = app_proj.join(".lake/packages/dep");
+                fs::create_dir_all(&dep_pkg_src)?;
+                fs::create_dir_all(&app_proj)?;
+                let tc = include_str!("../../../lean/lean-toolchain");
+                fs::write(dep_pkg_src.join("lean-toolchain"), tc)?;
+                fs::write(
+                    dep_pkg_src.join("lakefile.toml"),
+                    "name = \"dep\"\ndefaultTargets = [\"Dep\"]\n[[lean_lib]]\nname = \"Dep\"\nroots = [\"Dep\"]\n",
+                )?;
+                fs::write(
+                    dep_pkg_src.join("Dep.lean"),
+                    "import Lean\nopen IO Lean Elab Term in\nelab \"dep_env_ty\" : term => do\n  match (← getEnv \"TURBO_TEST_ELAB_STMT_ENV\") with\n  | some \"beta\" => return mkConst ``Bool\n  | _ => return mkConst ``Nat\ndef depWitness (x : dep_env_ty) : dep_env_ty := x\n",
+                )?;
+                git_init_and_commit(&dep_pkg_src, "dep_init")?;
+                let dep_rev_out = Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(&dep_pkg_src)
+                    .output()?;
+                let dep_rev = String::from_utf8(dep_rev_out.stdout)?.trim().to_string();
+                fs::create_dir_all(dep_in_pkgs.parent().unwrap())?;
+                let clone_st = Command::new("git")
+                    .args(["clone", "--quiet"])
+                    .arg(&dep_pkg_src)
+                    .arg(&dep_in_pkgs)
+                    .status()?;
+                anyhow::ensure!(clone_st.success(), "git clone dep_pkg_src failed");
+
+                fs::write(app_proj.join("lean-toolchain"), tc)?;
+                fs::write(
+                    app_proj.join("lakefile.toml"),
+                    "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep\"\npath = \".lake/packages/dep\"\n[[lean_lib]]\nname = \"App\"\nroots = [\"App\"]\n",
+                )?;
+                let manifest_json = if use_git_pin {
+                    serde_json::json!({
+                        "version": "1.1.0",
+                        "packagesDir": ".lake/packages",
+                        "lakeDir": ".lake",
+                        "packages": [{
+                            "type": "git",
+                            "scope": "",
+                            "name": "dep",
+                            "manifestFile": "lake-manifest.json",
+                            "inherited": false,
+                            "url": dep_pkg_src.to_string_lossy(),
+                            "rev": dep_rev,
+                            "inputRev": null,
+                            "subDir": null,
+                            "configFile": "lakefile.toml"
+                        }]
+                    })
+                    .to_string()
+                } else {
+                    r#"{"version": "1.1.0", "packagesDir": ".lake/packages", "lakeDir": ".lake", "packages": [{"type": "path", "scope": "", "name": "dep", "manifestFile": "lake-manifest.json", "inherited": false, "dir": ".lake/packages/dep", "configFile": "lakefile.toml"}]}"#.to_string()
+                };
+                fs::write(app_proj.join("lake-manifest.json"), manifest_json)?;
+                fs::write(
+                    app_proj.join("App.lean"),
+                    "import Dep\ntheorem app_env_thm (x : _) : depWitness x = depWitness x := by\n  rfl\n",
+                )?;
+                fs::write(app_proj.join(".gitignore"), ".lake/\n")?;
+                git_init_and_commit(&app_proj, "app_base")?;
+                let lb = Command::new("lake")
+                    .args(["build", "App"])
+                    .current_dir(&app_proj)
+                    .output()?;
+                anyhow::ensure!(
+                    lb.status.success(),
+                    "lake build App failed (git={use_git_pin}): {}",
+                    String::from_utf8_lossy(&lb.stderr)
+                );
+                let mut dep_store = TurboStore::open(Some(&dep_case_root.join("store")))?;
+                run_pr_verify_command(
+                    &mut dep_store,
+                    true,
+                    app_proj.clone(),
+                    "HEAD".into(),
+                    "trusted".into(),
+                    true,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    0,
+                    None,
+                )?;
+                let app_cfg = crate::module_builder::resolve_project_config(&app_proj)?;
+                assert!(
+                    base_statement_cache_action_key(&app_proj, "HEAD", Path::new(""), None, &app_cfg)
+                        .is_none(),
+                    "dep with host-state-reading elaborator (git={use_git_pin}) must disable base_statement_cache_action_key"
+                );
+                let app_dag = crate::module_builder::build_module_dag(&app_cfg, &[])?;
+                assert!(
+                    app_dag.nodes.contains_key("Dep"),
+                    "dep with host-state-reading elaborator (git={use_git_pin}) must NOT be externalized into external_olean_deps"
+                );
+                std::env::set_var(ENV_KEY, "beta");
+                let dep_beta_rep = crate::module_builder::build_project_modules_native(
+                    &mut dep_store,
+                    &app_proj,
+                    &[],
+                    "trusted",
+                    1,
+                    false,
+                    true,
+                    None,
+                )?;
+                assert_eq!(
+                    dep_beta_rep.modules_cached, 0,
+                    "dep & App (git={use_git_pin}) must not hit Module CAS across env rotation"
+                );
+                assert_eq!(
+                    dep_beta_rep.modules_up_to_date_reused, 0,
+                    "dep & App (git={use_git_pin}) must recompile rather than warm-adopting stale alpha .olean"
+                );
+                let _ = fs::remove_dir_all(&dep_case_root);
+            }
+
+            let _ = fs::remove_dir_all(&tree_rt.root);
             let _ = fs::remove_dir_all(&tree.root);
             let _ = fs::remove_dir_all(&tree2.root);
             Ok(())
