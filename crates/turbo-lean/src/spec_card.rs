@@ -7,14 +7,15 @@ use std::time::Instant;
 
 use super::audit_spec::{
     audit_spec_file_or_source_with_policy, extract_all_lean_theorems, extract_local_def_unfoldings,
-    AuditSpecPolicyConfig,
+    inline_stmt_let_bindings, AuditSpecPolicyConfig,
 };
 use super::{
-    is_known_binder_value_type, split_top_level_implications, strip_lean_comments, ExtractedDecl,
+    is_known_binder_value_type, split_top_level_colon, split_top_level_implications,
+    strip_lean_comments, ExtractedDecl,
 };
 use crate::splitter::{
-    audit_hygiene, canonicalize_lean_name, extract_public_signature, qualified_decl_name,
-    skip_lean_lexeme, ScopeFrame, ScopeKind,
+    audit_hygiene, canonicalize_lean_name, decl_name_matches_target, extract_public_signature,
+    qualified_decl_name, skip_lean_lexeme, ScopeFrame, ScopeKind,
 };
 
 const UNCHECKED: &[&str] = &[
@@ -25,21 +26,21 @@ const UNCHECKED: &[&str] = &[
     "instance binders and section variable/include context are syntactic only; nonstandard ones are not evaluated",
 ];
 
-const STANDARD_INSTANCE_HEADS: &[&str] = &[
+const TOTAL_INSTANCE_HEADS: &[&str] = &[
     "BEq",
     "DecidableEq",
     "DecidablePred",
     "DecidableRel",
-    "EquivBEq",
     "Hashable",
-    "Inhabited",
     "LE",
     "LT",
-    "LawfulBEq",
-    "LawfulHashable",
     "Ord",
     "Repr",
     "ToString",
+];
+
+const PRIMITIVE_LAWFUL_TYPES: &[&str] = &[
+    "Bool", "Char", "Int", "Nat", "String", "UInt8", "UInt16", "UInt32", "UInt64", "USize",
 ];
 
 pub fn run_spec_card_command(
@@ -58,6 +59,24 @@ pub fn run_spec_card_command(
             file.display()
         );
     }
+    if let Some(policy) = policy_override {
+        anyhow::ensure!(
+            matches!(
+                policy.trim().to_ascii_lowercase().as_str(),
+                "default" | "permissive" | "strict-proofs" | "strict_proofs" | "strict"
+            ),
+            "Unknown audit-spec policy: {policy}"
+        );
+    }
+    if let Some(path) = config_override {
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read audit-spec config {}", path.display()))?;
+        anyhow::ensure!(
+            AuditSpecPolicyConfig::parse_config_str(&text).is_some(),
+            "Invalid audit-spec config {}",
+            path.display()
+        );
+    }
     let started = Instant::now();
     let mut sources = Vec::new();
     for file in files {
@@ -72,8 +91,8 @@ pub fn run_spec_card_command(
     let mut extraction_incomplete = false;
     let mut all_audits_ok = true;
     let mut any_audit_error = false;
-    let mut policy_name = policy_override.unwrap_or("default").to_string();
-    for (idx, (path, src)) in sources.iter().enumerate() {
+    let mut resolved_policies = Vec::with_capacity(sources.len());
+    for (path, src) in &sources {
         let policy = AuditSpecPolicyConfig::load_for_target(
             path,
             policy_override,
@@ -81,9 +100,7 @@ pub fn run_spec_card_command(
             &[],
             &[],
         );
-        if idx == 0 {
-            policy_name = policy.policy.clone();
-        }
+        resolved_policies.push(policy.policy.clone());
         let audit = audit_spec_file_or_source_with_policy(path, None, decl_filter, &policy);
         if audit.get("status").and_then(Value::as_str) == Some("error") {
             any_audit_error = true;
@@ -115,50 +132,66 @@ pub fn run_spec_card_command(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let extras = scan_decl_extras(src);
-        let mut extra_used = vec![false; extras.len()];
-        let mut detail_used = vec![false; details.len()];
-        for decl in extract_all_lean_theorems(src, decl_filter) {
-            matched += 1;
-            let extra_idx = extras.iter().enumerate().position(|(idx, row)| {
-                !extra_used[idx]
-                    && canonicalize_lean_name(&row.name) == canonicalize_lean_name(&decl.name)
-            });
-            if let Some(idx) = extra_idx {
-                extra_used[idx] = true;
+        let all_decls = extract_all_lean_theorems(src, None);
+        let (extras, file_has_malformed_scope) = scan_decl_extras(src);
+        if file_has_malformed_scope {
+            extraction_incomplete = true;
+        }
+        let aligned_extras = all_decls.len() == extras.len();
+        let mut filtered_idx = 0usize;
+        for (decl_idx, decl) in all_decls.into_iter().enumerate() {
+            let matches_filter = match decl_filter {
+                Some(target) if !target.is_empty() && target != "auto" => {
+                    decl_name_matches_target(&decl.name, target)
+                }
+                _ => true,
+            };
+            if !matches_filter {
+                continue;
             }
-            let extra = extra_idx.map(|idx| &extras[idx]);
+            matched += 1;
+            let detail = details.get(filtered_idx);
+            filtered_idx += 1;
+            let extra = aligned_extras.then(|| &extras[decl_idx]);
+            let effective_name = extra.map_or(decl.name.as_str(), |row| row.name.as_str());
             let visibility = visibility_of(
-                &decl.name,
+                effective_name,
                 &public_names,
                 visibility_known,
                 public_sig.is_module,
                 extra,
             );
             if public_only && visibility != "public" {
-                if visibility == "unresolved" {
+                if visibility == "unresolved"
+                    || extra.is_none()
+                    || extra.is_some_and(|row| row.saw_unparsed_binder)
+                {
                     extraction_incomplete = true;
                 }
                 hidden_private += 1;
                 continue;
             }
-            let detail_idx = details.iter().enumerate().position(|(idx, row)| {
-                !detail_used[idx]
-                    && row.get("decl").and_then(Value::as_str) == Some(decl.name.as_str())
-            });
-            if let Some(idx) = detail_idx {
-                detail_used[idx] = true;
-            }
-            let detail = detail_idx.map(|idx| &details[idx]);
             let ctx = FileCardCtx {
                 path,
                 local_defs: &local_defs,
                 hygiene: &hygiene,
                 audit: &audit,
             };
-            cards.push(card_for(&ctx, &decl, visibility, extra, detail));
+            cards.push(card_for(
+                &ctx,
+                &decl,
+                effective_name,
+                visibility,
+                extra,
+                detail,
+            ));
         }
     }
+    let policy_name = match resolved_policies.first() {
+        Some(first) if resolved_policies.iter().all(|item| item == first) => first.clone(),
+        Some(_) => "mixed".to_string(),
+        None => policy_override.unwrap_or("default").to_string(),
+    };
     let elapsed_ms = (started.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     let filter_miss = decl_filter.is_some() && matched == 0;
     let public_miss = public_only && matched > 0 && cards.is_empty();
@@ -168,8 +201,12 @@ pub fn run_spec_card_command(
                 .and_then(Value::as_bool)
                 == Some(false)
         });
+    let all_cards_tight = cards
+        .iter()
+        .all(|card| card.get("verdict").and_then(Value::as_str) == Some("TIGHT"));
     let ok = !any_audit_error
         && all_audits_ok
+        && all_cards_tight
         && !hygiene_dirty
         && !filter_miss
         && !public_miss
@@ -212,14 +249,17 @@ pub fn run_spec_card_command(
 
 fn load_sources(file: &Path) -> Result<Vec<(PathBuf, String)>> {
     if file.is_dir() {
-        let mut sources: Vec<(PathBuf, String)> = crate::lake_build::collect_lean_files(file)
-            .into_iter()
-            .filter_map(|path| fs::read_to_string(&path).ok().map(|src| (path, src)))
-            .collect();
-        sources.sort_by(|left, right| left.0.cmp(&right.0));
-        if sources.is_empty() {
+        let paths = crate::lake_build::collect_lean_files(file);
+        if paths.is_empty() {
             bail!("No readable Lean files found in {}", file.display());
         }
+        let mut sources = Vec::with_capacity(paths.len());
+        for path in paths {
+            let src = fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            sources.push((path, src));
+        }
+        sources.sort_by(|left, right| left.0.cmp(&right.0));
         return Ok(sources);
     }
     let src =
@@ -227,11 +267,11 @@ fn load_sources(file: &Path) -> Result<Vec<(PathBuf, String)>> {
     let mut sources = vec![(file.to_path_buf(), src)];
     let sub_dir = file.with_extension("");
     if sub_dir.is_dir() {
-        sources.extend(
-            crate::lake_build::collect_lean_files(&sub_dir)
-                .into_iter()
-                .filter_map(|path| fs::read_to_string(&path).ok().map(|src| (path, src))),
-        );
+        for path in crate::lake_build::collect_lean_files(&sub_dir) {
+            let sub_src = fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            sources.push((path, sub_src));
+        }
         sources.sort_by(|left, right| left.0.cmp(&right.0));
     }
     Ok(sources)
@@ -240,39 +280,46 @@ fn load_sources(file: &Path) -> Result<Vec<(PathBuf, String)>> {
 struct DeclExtra {
     name: String,
     is_private: bool,
+    explicit_public: bool,
     instance_binders: Vec<String>,
     context_assumptions: Vec<String>,
     saw_unparsed_binder: bool,
 }
 
-struct ContextFrame {
-    assumptions: Vec<String>,
-    span: usize,
-}
-
-fn scan_decl_extras(src: &str) -> Vec<DeclExtra> {
+fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
     let masked = mask_comments(src);
     let chars: Vec<char> = masked.chars().collect();
     let byte_offsets: Vec<usize> = masked.char_indices().map(|(offset, _)| offset).collect();
     let n = chars.len();
     let mut i = 0usize;
     let mut scope: Vec<ScopeFrame> = Vec::new();
-    let mut context = vec![ContextFrame {
-        assumptions: Vec::new(),
-        span: 0,
-    }];
-    let mut next_span = 1usize;
+    let mut context: Vec<Vec<String>> = vec![Vec::new()];
     let mut at_cmd_head = true;
     let mut pending_private = false;
+    let mut pending_public = false;
     let mut pending_assumptions: Vec<String> = Vec::new();
+    let mut has_malformed_scope = false;
     let mut out = Vec::new();
     while i < n {
         if let Some(end) = skip_any(&masked, &byte_offsets, i) {
             i = end;
             continue;
         }
-        if chars[i] == '\n' || chars[i] == ';' {
+        if chars[i] == '\n' {
+            if !at_cmd_head {
+                pending_private = false;
+                pending_public = false;
+                pending_assumptions.clear();
+            }
             at_cmd_head = true;
+            i += 1;
+            continue;
+        }
+        if chars[i] == ';' {
+            at_cmd_head = true;
+            pending_private = false;
+            pending_public = false;
+            pending_assumptions.clear();
             i += 1;
             continue;
         }
@@ -301,6 +348,7 @@ fn scan_decl_extras(src: &str) -> Vec<DeclExtra> {
             if let Some(end) = skip_any_lexeme(&masked, &byte_offsets, i) {
                 at_cmd_head = false;
                 pending_private = false;
+                pending_public = false;
                 pending_assumptions.clear();
                 i = end;
                 continue;
@@ -309,14 +357,9 @@ fn scan_decl_extras(src: &str) -> Vec<DeclExtra> {
         if !is_ident_start(chars[i]) {
             at_cmd_head = false;
             pending_private = false;
+            pending_public = false;
             pending_assumptions.clear();
             i += 1;
-            continue;
-        }
-        if !at_cmd_head {
-            while i < n && is_ident_continue(chars[i]) {
-                i += 1;
-            }
             continue;
         }
         let start = i;
@@ -324,25 +367,42 @@ fn scan_decl_extras(src: &str) -> Vec<DeclExtra> {
             i += 1;
         }
         let word: String = chars[start..i].iter().collect();
-        if matches!(
-            word.as_str(),
-            "public"
-                | "private"
-                | "protected"
-                | "noncomputable"
-                | "scoped"
-                | "local"
-                | "unsafe"
-                | "partial"
-                | "nonrec"
-                | "meta"
-        ) {
+        if !at_cmd_head && !matches!(word.as_str(), "theorem" | "lemma") {
+            continue;
+        }
+        if at_cmd_head
+            && matches!(
+                word.as_str(),
+                "public"
+                    | "private"
+                    | "protected"
+                    | "noncomputable"
+                    | "scoped"
+                    | "local"
+                    | "unsafe"
+                    | "partial"
+                    | "nonrec"
+                    | "meta"
+            )
+        {
             if word == "private" || word == "local" {
                 pending_private = true;
+                pending_public = false;
+            }
+            if word == "public" {
+                pending_public = true;
+                pending_private = false;
+            }
+            if word == "scoped" && i < n && chars[i] == '[' {
+                if let Some(end) = matching_close(&masked, &byte_offsets, &chars, i, '[', ']') {
+                    i = end;
+                }
             }
             continue;
         }
+        let was_at_cmd_head = at_cmd_head;
         let decl_private = std::mem::replace(&mut pending_private, false);
+        let decl_public = std::mem::replace(&mut pending_public, false);
         let decl_inline_assumptions = if matches!(word.as_str(), "theorem" | "lemma") {
             std::mem::take(&mut pending_assumptions)
         } else {
@@ -357,32 +417,39 @@ fn scan_decl_extras(src: &str) -> Vec<DeclExtra> {
         at_cmd_head = false;
         match word.as_str() {
             "namespace" if i < n && chars[i].is_whitespace() => {
+                if decl_public || decl_private {
+                    has_malformed_scope = true;
+                }
                 let (name, next) = dotted_name(&masked, &byte_offsets, &chars, i, n);
                 i = next;
-                let span = next_span;
-                next_span += 1;
-                for seg in crate::splitter::split_lean_name_components(&name) {
+                let segs: Vec<&str> = crate::splitter::split_lean_name_components(&name);
+                let inline = std::mem::take(&mut pending_assumptions);
+                let last_idx = segs.len().saturating_sub(1);
+                for (seg_idx, seg) in segs.into_iter().enumerate() {
                     scope.push(ScopeFrame {
                         kind: ScopeKind::Namespace,
                         name: seg.to_string(),
-                        open_span_idx: span,
+                        open_span_idx: 0,
+                    });
+                    context.push(if seg_idx == last_idx {
+                        inline.clone()
+                    } else {
+                        Vec::new()
                     });
                 }
-                context.push(ContextFrame {
-                    assumptions: std::mem::take(&mut pending_assumptions),
-                    span,
-                });
+                at_cmd_head = true;
             }
             "section" => {
-                let (name, next) = if i < n && chars[i].is_whitespace() {
+                if decl_private {
+                    has_malformed_scope = true;
+                }
+                let (name, next) = if i < n && chars[i].is_whitespace() && chars[i] != '\n' {
                     dotted_name(&masked, &byte_offsets, &chars, i, n)
                 } else {
                     (String::new(), i)
                 };
                 i = next;
-                let span = next_span;
-                next_span += 1;
-                let segs = if name.is_empty() {
+                let segs: Vec<String> = if name.is_empty() {
                     vec![String::new()]
                 } else {
                     crate::splitter::split_lean_name_components(&name)
@@ -390,52 +457,65 @@ fn scan_decl_extras(src: &str) -> Vec<DeclExtra> {
                         .map(str::to_string)
                         .collect()
                 };
-                for seg in segs {
+                let inline = std::mem::take(&mut pending_assumptions);
+                let last_idx = segs.len().saturating_sub(1);
+                for (seg_idx, seg) in segs.into_iter().enumerate() {
                     scope.push(ScopeFrame {
                         kind: ScopeKind::Section,
                         name: seg,
-                        open_span_idx: span,
+                        open_span_idx: 0,
+                    });
+                    context.push(if seg_idx == last_idx {
+                        inline.clone()
+                    } else {
+                        Vec::new()
                     });
                 }
-                context.push(ContextFrame {
-                    assumptions: std::mem::take(&mut pending_assumptions),
-                    span,
-                });
+                at_cmd_head = true;
             }
             "mutual" if i >= n || chars[i].is_whitespace() => {
-                let span = next_span;
-                next_span += 1;
+                if decl_public || decl_private {
+                    has_malformed_scope = true;
+                }
                 scope.push(ScopeFrame {
                     kind: ScopeKind::Mutual,
                     name: String::new(),
-                    open_span_idx: span,
+                    open_span_idx: 0,
                 });
-                context.push(ContextFrame {
-                    assumptions: std::mem::take(&mut pending_assumptions),
-                    span,
-                });
+                context.push(std::mem::take(&mut pending_assumptions));
+                at_cmd_head = true;
             }
             "end" if i >= n || chars[i].is_whitespace() => {
+                if decl_public || decl_private {
+                    has_malformed_scope = true;
+                }
                 let (name, next) = if i < n && chars[i].is_whitespace() && chars[i] != '\n' {
                     dotted_name(&masked, &byte_offsets, &chars, i, n)
                 } else {
                     (String::new(), i)
                 };
                 i = next;
-                pop_scope(&mut scope, &mut context, &name);
+                if pop_scope(&mut scope, &mut context, &name) {
+                    has_malformed_scope = true;
+                }
+                at_cmd_head = true;
             }
             "variable" | "variables" | "include" | "omit" => {
                 let body_start = i;
-                while i < n && chars[i] != '\n' {
+                while i < n && chars[i] != '\n' && chars[i] != ';' {
+                    if let Some(end) = skip_any(&masked, &byte_offsets, i) {
+                        i = end;
+                        continue;
+                    }
                     i += 1;
                 }
                 let body: String = chars[body_start..i].iter().collect();
                 let clean_body = normalize_ws(&body);
                 if let Some(frame) = context.last_mut() {
                     if clean_body.is_empty() {
-                        frame.assumptions.push(word);
+                        frame.push(word);
                     } else {
-                        frame.assumptions.push(format!("{word} {clean_body}"));
+                        frame.push(format!("{word} {clean_body}"));
                     }
                 }
             }
@@ -449,7 +529,8 @@ fn scan_decl_extras(src: &str) -> Vec<DeclExtra> {
                 }
                 i = next;
                 let mut binders = Vec::new();
-                let mut saw_unparsed_binder = false;
+                let mut saw_unparsed_binder = !was_at_cmd_head;
+                let mut found_colon = false;
                 while i < n {
                     while i < n && chars[i].is_whitespace() {
                         i += 1;
@@ -457,11 +538,13 @@ fn scan_decl_extras(src: &str) -> Vec<DeclExtra> {
                     if i >= n {
                         break;
                     }
-                    if let Some(end) = skip_any(&masked, &byte_offsets, i) {
+                    if let Some(end) = skip_any_lexeme(&masked, &byte_offsets, i) {
                         i = end;
                         continue;
                     }
                     if chars[i] == ':' && (i + 1 >= n || chars[i + 1] != '=') {
+                        i += 1;
+                        found_colon = true;
                         break;
                     }
                     if chars[i] == ':' && i + 1 < n && chars[i + 1] == '=' {
@@ -479,12 +562,8 @@ fn scan_decl_extras(src: &str) -> Vec<DeclExtra> {
                             saw_unparsed_binder = true;
                             break;
                         }
-                    } else if chars[i] == '(' || chars[i] == '{' || chars[i] == '⦃' {
-                        let close = match chars[i] {
-                            '(' => ')',
-                            '{' => '}',
-                            _ => '⦄',
-                        };
+                    } else if chars[i] == '(' || chars[i] == '{' {
+                        let close = if chars[i] == '(' { ')' } else { '}' };
                         if let Some(end) =
                             matching_close(&masked, &byte_offsets, &chars, i, chars[i], close)
                         {
@@ -493,18 +572,90 @@ fn scan_decl_extras(src: &str) -> Vec<DeclExtra> {
                             saw_unparsed_binder = true;
                             break;
                         }
+                    } else if chars[i] == '⦃' {
+                        saw_unparsed_binder = true;
+                        if let Some(end) =
+                            matching_close(&masked, &byte_offsets, &chars, i, '⦃', '⦄')
+                        {
+                            i = end;
+                        } else {
+                            break;
+                        }
                     } else {
                         i += 1;
                     }
                 }
+                if !found_colon {
+                    continue;
+                }
+                let stmt_start = i;
+                let mut paren_depth = 0usize;
+                let mut angle_depth = 0usize;
+                let mut pending_let_assign = false;
+                let mut stmt_end = n;
+                while i < n {
+                    if let Some(end) = skip_any_lexeme(&masked, &byte_offsets, i) {
+                        i = end;
+                        continue;
+                    }
+                    let ch = chars[i];
+                    if ch == '(' || ch == '{' || ch == '[' {
+                        paren_depth += 1;
+                    } else if ch == ')' || ch == '}' || ch == ']' {
+                        paren_depth = paren_depth.saturating_sub(1);
+                    } else if ch == '⟨' {
+                        angle_depth += 1;
+                    } else if ch == '⟩' {
+                        angle_depth = angle_depth.saturating_sub(1);
+                    } else if paren_depth == 0
+                        && angle_depth == 0
+                        && ch == 'l'
+                        && i + 3 < n
+                        && chars[i + 1] == 'e'
+                        && chars[i + 2] == 't'
+                        && chars[i + 3].is_whitespace()
+                        && (i == stmt_start || !is_ident_continue(chars[i - 1]))
+                    {
+                        pending_let_assign = true;
+                        i += 3;
+                        continue;
+                    } else if paren_depth == 0
+                        && angle_depth == 0
+                        && ch == ':'
+                        && i + 1 < n
+                        && chars[i + 1] == '='
+                    {
+                        if pending_let_assign {
+                            pending_let_assign = false;
+                            i += 2;
+                            continue;
+                        }
+                        stmt_end = i;
+                        break;
+                    } else if paren_depth == 0
+                        && angle_depth == 0
+                        && ch == '|'
+                        && i > stmt_start
+                        && chars[stmt_start..i].contains(&'\n')
+                    {
+                        stmt_end = i;
+                        break;
+                    }
+                    i += 1;
+                }
+                let prop_str: String = chars[stmt_start..stmt_end].iter().collect();
+                if inline_stmt_let_bindings(prop_str.trim()).is_empty() {
+                    continue;
+                }
                 let mut assumptions: Vec<String> = context
                     .iter()
-                    .flat_map(|frame| frame.assumptions.iter().cloned())
+                    .flat_map(|frame| frame.iter().cloned())
                     .collect();
                 assumptions.extend(decl_inline_assumptions);
                 out.push(DeclExtra {
                     name: qualified_decl_name(&raw_name, &scope),
                     is_private: decl_private,
+                    explicit_public: decl_public,
                     instance_binders: binders,
                     context_assumptions: assumptions,
                     saw_unparsed_binder,
@@ -513,41 +664,42 @@ fn scan_decl_extras(src: &str) -> Vec<DeclExtra> {
             _ => {}
         }
     }
-    out
+    (out, has_malformed_scope)
 }
 
-fn pop_scope(scope: &mut Vec<ScopeFrame>, context: &mut Vec<ContextFrame>, name: &str) {
+fn pop_scope(scope: &mut Vec<ScopeFrame>, context: &mut Vec<Vec<String>>, name: &str) -> bool {
     if name.is_empty() {
-        scope.pop();
+        let Some(top) = scope.pop() else {
+            return true;
+        };
         if context.len() > 1 {
             context.pop();
         }
-        return;
+        return !top.name.is_empty();
     }
+    let mut malformed = false;
     for seg in crate::splitter::split_lean_name_components(name)
         .into_iter()
         .rev()
     {
         let canon = crate::splitter::canonical_lean_name_component(seg);
-        let Some(pos) = scope.iter().rposition(|frame| {
-            crate::splitter::canonical_lean_name_component(&frame.name) == canon
-        }) else {
-            scope.pop();
-            if context.len() > 1 {
+        if let Some(pos) = scope
+            .iter()
+            .rposition(|frame| crate::splitter::canonical_lean_name_component(&frame.name) == canon)
+        {
+            if pos + 1 != scope.len() {
+                malformed = true;
+            }
+            scope.truncate(pos);
+            context.truncate(pos + 1);
+        } else {
+            malformed = true;
+            if scope.pop().is_some() && context.len() > 1 {
                 context.pop();
             }
-            continue;
-        };
-        let span = scope[pos].open_span_idx;
-        scope.truncate(pos);
-        context.retain(|frame| frame.span < span || frame.span == 0);
-        if context.is_empty() {
-            context.push(ContextFrame {
-                assumptions: Vec::new(),
-                span: 0,
-            });
         }
     }
+    malformed
 }
 
 fn mask_comments(src: &str) -> String {
@@ -600,6 +752,9 @@ fn consume_in_command_prefix(
         "variables",
         "include",
         "omit",
+        "attribute",
+        "export",
+        "deriving",
         "#guard_msgs",
         "#guard_panic",
         "#info_trees",
@@ -722,15 +877,63 @@ fn normalize_ws(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn standard_instance(text: &str) -> bool {
-    let head = text
+fn instance_class_expr(text: &str) -> &str {
+    split_top_level_colon(text).map_or_else(|| text.trim(), |(_, ty)| ty.trim())
+}
+
+fn instance_head_and_arg(text: &str) -> Option<(&str, &str)> {
+    let class_expr = instance_class_expr(text);
+    let mut parts = class_expr.split_whitespace();
+    let head_raw = parts.next()?;
+    let arg = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let head = head_raw.rsplit('.').next()?;
+    let valid_arg =
+        arg.chars().next().is_some_and(is_ident_start) && arg.chars().all(is_ident_continue);
+    valid_arg.then_some((head, arg))
+}
+
+fn has_matching_instance(all_binders: &[String], want_head: &str, want_arg: &str) -> bool {
+    all_binders.iter().any(|other| {
+        instance_head_and_arg(other).is_some_and(|(head, arg)| head == want_head && arg == want_arg)
+    })
+}
+
+fn standard_instance(text: &str, all_binders: &[String], type_params: &BTreeSet<String>) -> bool {
+    let class_expr = instance_class_expr(text);
+    let head = class_expr
         .split_whitespace()
         .next()
         .unwrap_or("")
         .rsplit('.')
         .next()
         .unwrap_or("");
-    STANDARD_INSTANCE_HEADS.contains(&head)
+    if matches!(head, "DecidablePred" | "DecidableRel") {
+        return class_expr.split_whitespace().nth(1).is_some();
+    }
+    let Some((head, arg)) = instance_head_and_arg(text) else {
+        return false;
+    };
+    if TOTAL_INSTANCE_HEADS.contains(&head) {
+        return true;
+    }
+    let allowed_lawful_target = PRIMITIVE_LAWFUL_TYPES.contains(&arg) || type_params.contains(arg);
+    if !allowed_lawful_target {
+        return false;
+    }
+    match head {
+        "LawfulBEq" | "EquivBEq" => {
+            PRIMITIVE_LAWFUL_TYPES.contains(&arg) || has_matching_instance(all_binders, "BEq", arg)
+        }
+        "LawfulHashable" => {
+            PRIMITIVE_LAWFUL_TYPES.contains(&arg)
+                || (has_matching_instance(all_binders, "BEq", arg)
+                    && has_matching_instance(all_binders, "Hashable", arg))
+        }
+        _ => false,
+    }
 }
 
 fn visibility_of(
@@ -747,6 +950,9 @@ fn visibility_of(
         return "private";
     }
     if !is_module {
+        return "public";
+    }
+    if extra.is_some_and(|row| row.explicit_public) {
         return "public";
     }
     if public_names.contains(&canonicalize_lean_name(name)) {
@@ -766,13 +972,24 @@ struct FileCardCtx<'a> {
 fn card_for(
     ctx: &FileCardCtx<'_>,
     decl: &ExtractedDecl,
+    effective_name: &str,
     visibility: &str,
     extra: Option<&DeclExtra>,
     detail: Option<&Value>,
 ) -> Value {
     let mut param_binders = Vec::new();
     let mut hypothesis_text = Vec::new();
+    let mut type_params = BTreeSet::new();
     for (vars, ty) in &decl.binders {
+        let ty_trimmed = ty.trim();
+        if ty_trimmed == "Type"
+            || ty_trimmed.starts_with("Type ")
+            || ty_trimmed.starts_with("Sort ")
+        {
+            for var in vars {
+                type_params.insert(var.clone());
+            }
+        }
         if is_known_binder_value_type(ty) {
             param_binders.push(json!({"vars": vars, "type": ty}));
         } else {
@@ -796,7 +1013,7 @@ fn card_for(
     let mut extraction_warnings = Vec::new();
     let nonstandard: Vec<&str> = instance_binders
         .iter()
-        .filter(|binder| !standard_instance(binder))
+        .filter(|binder| !standard_instance(binder, &instance_binders, &type_params))
         .map(String::as_str)
         .collect();
     if !nonstandard.is_empty() {
@@ -852,7 +1069,7 @@ fn card_for(
     };
     json!({
         "file": ctx.path.display().to_string(),
-        "decl": decl.name,
+        "decl": effective_name,
         "visibility": visibility,
         "contract": {
             "binders": param_binders,
@@ -876,7 +1093,11 @@ fn card_for(
             "flagged_lines": ctx.hygiene.flagged_items.clone(),
             "shadowed_constants": ctx.audit.get("shadowed_constants").cloned().unwrap_or(json!([])),
             "forbidden_scope": ctx.audit.get("forbidden_scope_decls").cloned().unwrap_or(json!([])),
-            "stub_defs": ctx.audit.get("stub_defs").cloned().unwrap_or(json!([])),
+            "stub_defs": detail
+                .and_then(|row| row.get("stub_defs"))
+                .cloned()
+                .or_else(|| ctx.audit.get("stub_defs").cloned())
+                .unwrap_or(json!([])),
         },
         "verdict": verdict,
         "pos_witness": detail.and_then(|row| row.get("pos_witness")).cloned().unwrap_or(Value::Null),

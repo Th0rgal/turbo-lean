@@ -398,12 +398,113 @@ fn spec_card_does_not_treat_nonempty_false_as_standard() {
     let path = write_spec(
         &dir,
         "Nonempty.lean",
-        "theorem vacuous [Nonempty False] (n : Nat) (h : n < 2) : n = 0 ∨ n = 1 := by\n  omega\n",
+        r#"
+inductive Bad where | mk
+
+theorem vacuous [Nonempty False] (n : Nat) (h : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+
+theorem inhabited_false [Inhabited False] (n : Nat) (h : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+
+theorem named_inst [BEq : Fact False] (n : Nat) (h : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+
+theorem concrete_lawful [LawfulBEq Bad] (n : Nat) (h : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+
+theorem strict_implicit ⦃h : False⦄ (n : Nat) (hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+"#,
     );
     let out = run(&["--json", "spec-card", path.to_str().unwrap()]);
     let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
     assert!(!out.status.success(), "{report}");
-    assert_eq!(report["cards"][0]["verdict"], "UNCHECKED_ASSUMPTIONS");
+    let cards = report["cards"].as_array().unwrap();
+    assert_eq!(cards.len(), 5, "{report}");
+    assert!(
+        cards
+            .iter()
+            .all(|card| card["contract"]["extraction_complete"] == false
+                && card["verdict"] != "TIGHT"),
+        "{report}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn spec_card_rejects_public_namespace_bypass_and_invalid_policy() {
+    let dir = fixture("pubns");
+    let path = write_spec(
+        &dir,
+        "PubNs.lean",
+        r#"
+module
+
+public theorem clean (n : Nat) (h : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+
+public namespace Outer
+public theorem backdoor [Fact False] (n : Nat) (h : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+end Outer
+"#,
+    );
+    let out = run(&[
+        "--json",
+        "spec-card",
+        path.to_str().unwrap(),
+        "--public-only",
+    ]);
+    let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(!out.status.success(), "{report}");
+    let cards = report["cards"].as_array().unwrap();
+    assert!(
+        cards
+            .iter()
+            .any(|card| card["decl"] == "Outer.backdoor"
+                && card["verdict"] == "UNCHECKED_ASSUMPTIONS"),
+        "{report}"
+    );
+    assert_eq!(report["summary"]["extraction_complete"], false, "{report}");
+
+    let bad_policy = run(&[
+        "--json",
+        "spec-card",
+        path.to_str().unwrap(),
+        "--policy",
+        "typo-policy",
+    ]);
+    assert!(!bad_policy.status.success());
+
+    let scopes = write_spec(
+        &dir,
+        "BareEnds.lean",
+        r#"
+section Outer
+variable (h : False)
+namespace A.B
+end
+end
+theorem still_outer (n : Nat) (hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+end Outer
+"#,
+    );
+    let scopes_out = run(&["--json", "spec-card", scopes.to_str().unwrap()]);
+    let scopes_report: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&scopes_out.stdout)).unwrap();
+    assert!(!scopes_out.status.success(), "{scopes_report}");
+    assert_eq!(
+        scopes_report["cards"][0]["verdict"],
+        "UNCHECKED_ASSUMPTIONS"
+    );
+
+    let bad_dir = dir.join("BrokenDir");
+    fs::create_dir_all(&bad_dir).unwrap();
+    fs::write(bad_dir.join("NotUtf8.lean"), [0xff, 0xfe, 0xfd]).unwrap();
+    let unreadable = run(&["--json", "spec-card", bad_dir.to_str().unwrap()]);
+    assert!(!unreadable.status.success());
     let _ = fs::remove_dir_all(&dir);
 }
 
