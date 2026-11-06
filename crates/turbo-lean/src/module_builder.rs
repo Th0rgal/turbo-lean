@@ -276,6 +276,7 @@ pub struct ProjectConfig {
     pub manifest_packages: Vec<ManifestPackageEntry>,
     pub dep_pkgs: Vec<PackageConfig>,
     pub canonical_config_digest: String,
+    pub is_untrusted: bool,
 }
 /// A single parsed import directive with Lake v4.35 module-system visibility flags.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2019,8 +2020,13 @@ pub(crate) fn verifier_path(lean: &Path) -> String {
 pub(crate) fn trusted_lake_build_path(lean: &Path, canon_dir: &Path) -> String {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let lake_sub = canon_dir.join(".lake");
+    let has_lake_component = |p: &Path| p.components().any(|c| c.as_os_str() == ".lake");
     let mut push_dir = |p: PathBuf| {
-        if p.is_absolute() && !p.starts_with(&lake_sub) && !dirs.contains(&p) {
+        if p.is_absolute()
+            && !p.starts_with(&lake_sub)
+            && !has_lake_component(&p)
+            && !dirs.contains(&p)
+        {
             dirs.push(p);
         }
     };
@@ -2029,10 +2035,10 @@ pub(crate) fn trusted_lake_build_path(lean: &Path, canon_dir: &Path) -> String {
     }
     if let Some(raw) = std::env::var_os("PATH") {
         for entry in std::env::split_paths(&raw) {
-            if entry.is_absolute() && entry.is_dir() {
+            if entry.is_absolute() && entry.is_dir() && !has_lake_component(&entry) {
                 let canon_ok = entry
                     .canonicalize()
-                    .map(|c| !c.starts_with(&lake_sub))
+                    .map(|c| !c.starts_with(&lake_sub) && !has_lake_component(&c))
                     .unwrap_or(false);
                 if canon_ok {
                     push_dir(entry);
@@ -5348,9 +5354,6 @@ fn parse_lean_path_literal(field: &str, expr: &str) -> Result<PathBuf> {
     parse_lean_path_literal_with_bindings(field, expr, None)
 }
 /// Parse a static declarative `lakefile.lean` into `PackageConfig`.
-/// Fails closed if dynamic constructs (`meta if`, `run_cmd`, `#eval`, `script`, custom
-/// `target ... := do`, unbuilt `extern_lib`, or `needs` / `input_*` beyond declarative file
-/// inputs) are encountered.
 pub fn parse_lakefile_lean(
     pkg_root: &Path,
     lean_path: &Path,
@@ -7019,41 +7022,6 @@ fn finalize_package_config(
         check_allowed_args(weak, &format!("{scope}.weakLeanArgs"))?;
         check_allowed_opts(opts, &format!("{scope}.leanOptions"))?;
     }
-    // Fail-closed check for unbuilt dynamic extern_lib or custom targets in root package
-    let any_precompile = pkg.precompile_modules
-        || pkg
-            .libs
-            .iter()
-            .any(|l| l.precompile_modules.unwrap_or(false));
-    let has_unbuilt_extern = pkg
-        .extern_libs
-        .iter()
-        .any(|e| e.is_dynamic_recipe && e.static_artifact_path.is_none())
-        && (is_root_pkg || any_precompile);
-    let has_root_custom_target = is_root_pkg && !pkg.custom_targets.is_empty();
-    if !c_abi::verify_static_lake_config(true, has_root_custom_target, has_unbuilt_extern, false) {
-        if has_unbuilt_extern {
-            let missing: Vec<&str> = pkg
-                .extern_libs
-                .iter()
-                .filter(|e| e.is_dynamic_recipe && e.static_artifact_path.is_none())
-                .map(|e| e.name.as_str())
-                .collect();
-            anyhow::bail!(
-                "Package `{}` ({}) declares dynamic `extern_lib` {:?} without prebuilt static artifact in `{}/lib`: fail-closed static Lake config gate",
-                pkg.name,
-                config_path.display(),
-                missing,
-                pkg.build_dir.display()
-            );
-        }
-        anyhow::bail!(
-            "Package `{}` ({}) declares custom dynamic targets {:?}: fail-closed static Lake config gate",
-            pkg.name,
-            config_path.display(),
-            pkg.custom_targets
-        );
-    }
     pkg.config_digest = compute_package_config_digest(pkg, raw_hash);
     Ok(())
 }
@@ -7209,6 +7177,19 @@ pub fn resolve_project_config_with_trust(
         for pkg in std::iter::once(&root_pkg).chain(dep_pkgs.iter()) {
             let pkg_has_precompile = pkg.precompile_modules
                 || pkg.libs.iter().any(|l| l.precompile_modules == Some(true));
+            let has_unbuilt_recipe = (!pkg.custom_targets.is_empty()
+                && (pkg.pkg_root == root_pkg.pkg_root || pkg_has_precompile))
+                || pkg
+                    .extern_libs
+                    .iter()
+                    .any(|e| e.static_artifact_blake3.is_none());
+            anyhow::ensure!(
+                !has_unbuilt_recipe,
+                "Untrusted verification rejects dynamic Lake recipes in package `{}`",
+                pkg.name
+            );
+            let pkg_has_precompile = pkg.precompile_modules
+                || pkg.libs.iter().any(|l| l.precompile_modules == Some(true));
             if !c_abi::verify_static_lake_config(true, pkg_has_precompile, false, false) {
                 anyhow::bail!(
                     "Untrusted verification rejects `precompileModules = true` in package `{}`: native code execution and dlopen plugins are forbidden in untrusted mode: fail-closed static Lake config gate",
@@ -7264,7 +7245,7 @@ pub fn resolve_project_config_with_trust(
         update_hasher_lp(&mut ch, dp.config_digest.as_bytes());
     }
     let canonical_config_digest = ch.finalize().to_hex().to_string();
-    Ok(ProjectConfig {
+    let cfg = ProjectConfig {
         toolchain,
         lean_bin,
         lean_githash,
@@ -7274,7 +7255,9 @@ pub fn resolve_project_config_with_trust(
         manifest_packages,
         dep_pkgs,
         canonical_config_digest,
-    })
+        is_untrusted,
+    };
+    materialize_lake_recipes(&cfg, is_untrusted)
 }
 #[derive(Clone)]
 pub(crate) struct DiscoveredModuleSpec {
@@ -12144,6 +12127,253 @@ fn collect_prebuilt_dep_pkg_closure_for_statement(
     res
 }
 
+type LakeRecipeMemoKey = (PathBuf, String, PathBuf, String, Vec<String>, String);
+type LakeRecipeMemoVal = Vec<(String, PathBuf, String)>;
+static LAKE_RECIPE_MEMO: OnceLock<Mutex<HashMap<LakeRecipeMemoKey, LakeRecipeMemoVal>>> =
+    OnceLock::new();
+
+fn pkg_non_lake_tree_digest(pkg: &PackageConfig) -> Option<String> {
+    let root = pkg.pkg_root.canonicalize().ok()?;
+    let build_abs = if pkg.build_dir.is_absolute() {
+        pkg.build_dir.clone()
+    } else {
+        root.join(&pkg.build_dir)
+    };
+    let mut entries: Vec<(Vec<u8>, [u8; 32])> = Vec::new();
+    let iter = walkdir::WalkDir::new(&root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| {
+            if e.depth() == 0 {
+                return true;
+            }
+            let name = e.file_name();
+            if name == ".lake" || name == ".git" {
+                return false;
+            }
+            e.path() != build_abs
+        });
+    for entry in iter {
+        let entry = entry.ok()?;
+        if entry.path_is_symlink() {
+            return None;
+        }
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        if !entry.file_type().is_file() || entries.len() >= 4096 {
+            return None;
+        }
+        let rel = entry.path().strip_prefix(&root).ok()?;
+        let bytes = fs::read(entry.path()).ok()?;
+        entries.push((
+            rel.as_os_str().as_encoded_bytes().to_vec(),
+            *blake3::hash(&bytes).as_bytes(),
+        ));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut h = blake3::Hasher::new();
+    h.update(b"turbo-lean-pkg-recipe-tree-v1\n");
+    for (rel, digest) in &entries {
+        update_hasher_lp(&mut h, rel);
+        h.update(digest);
+    }
+    Some(h.finalize().to_hex().to_string())
+}
+
+fn materialize_lake_recipes(cfg: &ProjectConfig, is_untrusted: bool) -> Result<ProjectConfig> {
+    let recipe_names = |pkg: &PackageConfig| -> Vec<String> {
+        if is_untrusted {
+            return Vec::new();
+        }
+        pkg.custom_targets
+            .iter()
+            .cloned()
+            .chain(
+                pkg.extern_libs
+                    .iter()
+                    .filter(|e| e.is_dynamic_recipe)
+                    .map(|e| e.name.clone()),
+            )
+            .collect()
+    };
+    if std::iter::once(&cfg.root_pkg)
+        .chain(&cfg.dep_pkgs)
+        .all(|p| recipe_names(p).is_empty())
+    {
+        return Ok(cfg.clone());
+    }
+    let mut resolved = cfg.clone();
+    let mut workspace = blake3::Hasher::new();
+    workspace.update(b"turbo-lean-lake-recipes-v1\n");
+    for pkg in std::iter::once(&mut resolved.root_pkg).chain(&mut resolved.dep_pkgs) {
+        let names = recipe_names(pkg);
+        if names.is_empty() {
+            continue;
+        }
+        anyhow::ensure!(
+            !is_untrusted,
+            "Untrusted verification rejects dynamic Lake recipes in package `{}`",
+            pkg.name
+        );
+        anyhow::ensure!(
+            !crate::lake_build::worktree_auto_link_disabled(&pkg.pkg_root),
+            "Lake materialization requires a writable package `{}`",
+            pkg.name
+        );
+        for name in &names {
+            anyhow::ensure!(
+                !pkg.inputs.iter().any(|i| &i.name == name),
+                "Duplicate Lake materialization target `{name}`"
+            );
+        }
+        let root = pkg.pkg_root.canonicalize()?;
+        let tree_digest = pkg_non_lake_tree_digest(pkg);
+        let memo_key = tree_digest.as_ref().map(|td| {
+            (
+                cfg.lean_bin.clone(),
+                cfg.lean_githash.clone(),
+                root.clone(),
+                pkg.config_digest.clone(),
+                names.clone(),
+                td.clone(),
+            )
+        });
+        let cached_artifacts: Option<Vec<(String, PathBuf, String)>> =
+            memo_key.as_ref().and_then(|key| {
+                let memo = LAKE_RECIPE_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+                let items = memo.lock().ok()?.get(key)?.clone();
+                for (_, path, expected_hash) in &items {
+                    let canon = path.canonicalize().ok()?;
+                    if !canon.starts_with(&root) || !canon.is_file() {
+                        return None;
+                    }
+                    let actual = blake3::hash(&fs::read(&canon).ok()?).to_hex().to_string();
+                    if &actual != expected_hash {
+                        return None;
+                    }
+                }
+                Some(items)
+            });
+        let artifacts = if let Some(items) = cached_artifacts {
+            items
+        } else {
+            let tools = ToolchainExecutables::from_lean(&cfg.lean_bin)?;
+            let mut queried = Vec::with_capacity(names.len());
+            for name in &names {
+                let target = format!("@{}/{}", pkg.base_name, name);
+                let mut query_cmd = Command::new(&tools.lake);
+                scrub_untrusted_env(&mut query_cmd);
+                let output = query_cmd
+                    .current_dir(&cfg.root_pkg.pkg_root)
+                    .env("PATH", tools.lake_build_path(&cfg.root_pkg.pkg_root))
+                    .env("LEAN", &tools.lean)
+                    .env("LAKE", &tools.lake)
+                    .env("LEANC", &tools.leanc)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_ATTR_NOSYSTEM", "1")
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .env("GIT_NO_LAZY_FETCH", "1")
+                    .env("GIT_ALLOW_PROTOCOL", "")
+                    .env(
+                        "GIT_CONFIG_PARAMETERS",
+                        "'core.fsmonitor=' 'core.hooksPath=/dev/null' 'core.sshCommand=false' 'core.askPass=' 'credential.helper=' 'protocol.allow=never' 'diff.external=' 'core.attributesFile=/dev/null' 'submodule.recurse=false'",
+                    )
+                    .args(["query", "--json", &target])
+                    .output()
+                    .context("Failed to execute Lake materialization")?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "Lake materialization of `{target}` failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let path: String = serde_json::from_slice(&output.stdout).with_context(|| {
+                    format!("Lake target `{target}` must return a single FilePath")
+                })?;
+                let path = PathBuf::from(path);
+                let path = if path.is_absolute() {
+                    path
+                } else {
+                    cfg.root_pkg.pkg_root.join(path)
+                };
+                let canonical = path
+                    .canonicalize()
+                    .with_context(|| format!("Missing Lake artifact for `{target}`"))?;
+                anyhow::ensure!(
+                    canonical.starts_with(&root) && canonical.is_file(),
+                    "Lake target `{target}` must return a regular artifact inside its package"
+                );
+                let bytes = fs::read(&canonical)?;
+                let hash = blake3::hash(&bytes).to_hex().to_string();
+                queried.push((name.clone(), canonical, hash));
+            }
+            if let Some(key) = memo_key {
+                let memo = LAKE_RECIPE_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+                if let Ok(mut g) = memo.lock() {
+                    if g.len() >= 256 {
+                        g.clear();
+                    }
+                    g.insert(key, queried.clone());
+                }
+            }
+            queried
+        };
+        let mut digest = blake3::Hasher::new();
+        update_hasher_lp(&mut digest, pkg.config_digest.as_bytes());
+        for (name, canonical, hash) in artifacts {
+            let target = format!("@{}/{}", pkg.base_name, name);
+            let mut input = InputTargetConfig {
+                name: name.clone(),
+                path: canonical.strip_prefix(&root)?.to_path_buf(),
+                is_dir: false,
+                extension: None,
+                extensions: None,
+                text: false,
+                blake3: String::new(),
+                lake_hash: String::new(),
+                unsupported: None,
+            };
+            (input.blake3, input.lake_hash) = hash_input_target(&pkg.pkg_root, &input)?;
+            pkg.inputs.push(input);
+            update_hasher_lp(&mut digest, name.as_bytes());
+            update_hasher_lp(
+                &mut digest,
+                canonical
+                    .strip_prefix(&root)?
+                    .as_os_str()
+                    .as_encoded_bytes(),
+            );
+            update_hasher_lp(&mut digest, hash.as_bytes());
+            if let Some(ext) = pkg.extern_libs.iter_mut().find(|e| e.name == name) {
+                anyhow::ensure!(
+                    canonical
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|s| matches!(s, "a" | "lib")),
+                    "Extern library `{target}` did not return a static archive"
+                );
+                ext.static_artifact_path = Some(canonical);
+                ext.static_artifact_blake3 = Some(hash);
+            }
+        }
+        pkg.config_digest = digest.finalize().to_hex().to_string();
+        update_hasher_lp(&mut workspace, pkg.config_digest.as_bytes());
+    }
+    let native_digest = workspace.finalize();
+    let mut canonical = blake3::Hasher::new();
+    update_hasher_lp(&mut canonical, cfg.canonical_config_digest.as_bytes());
+    update_hasher_lp(&mut canonical, native_digest.as_bytes());
+    resolved.canonical_config_digest = canonical.finalize().to_hex().to_string();
+    for pkg in std::iter::once(&mut resolved.root_pkg).chain(&mut resolved.dep_pkgs) {
+        let mut digest = blake3::Hasher::new();
+        update_hasher_lp(&mut digest, pkg.config_digest.as_bytes());
+        update_hasher_lp(&mut digest, native_digest.as_bytes());
+        pkg.config_digest = digest.finalize().to_hex().to_string();
+    }
+    Ok(resolved)
+}
+
 pub fn build_module_dag_with_trust(
     cfg: &ProjectConfig,
     targets: &[String],
@@ -12165,6 +12395,23 @@ fn build_module_dag_inner(
     is_untrusted: bool,
     allow_prebuilt_dep_pkgs: bool,
 ) -> Result<ModuleDag> {
+    if is_untrusted {
+        anyhow::ensure!(
+            std::iter::once(&cfg.root_pkg)
+                .chain(&cfg.dep_pkgs)
+                .all(|p| {
+                    let pkg_has_precompile = p.precompile_modules
+                        || p.libs.iter().any(|l| l.precompile_modules == Some(true));
+                    (p.custom_targets.is_empty()
+                        || (p.pkg_root != cfg.root_pkg.pkg_root && !pkg_has_precompile))
+                        && p.extern_libs
+                            .iter()
+                            .all(|e| e.static_artifact_blake3.is_some())
+                }),
+            "Untrusted verification rejects dynamic Lake recipes"
+        );
+    }
+    validate_materialized_artifacts(cfg)?;
     let root_pkg = &cfg.root_pkg;
     let mut initial_specs: Vec<(DiscoveredModuleSpec, bool)> = Vec::new();
     // Shared-library identity is `(pkg_root, lib_name)`, never `origName`, so two dependencies
@@ -12472,18 +12719,13 @@ fn build_module_dag_inner(
         if !package_defaults
             && !explicit_module
             && (target_pkg.custom_targets.iter().any(|ct| ct == &item_name)
-                || target_pkg.extern_libs.iter().any(|el| {
-                    el.name == item_name
-                        && el.is_dynamic_recipe
-                        && el.static_artifact_path.is_none()
-                }))
+                || target_pkg.extern_libs.iter().any(|el| el.name == item_name))
         {
-            let _ = c_abi::verify_static_lake_config(true, true, false, false);
-            anyhow::bail!(
-                "Target `{}` requires executing a dynamic Lake recipe in `{}`: fail-closed static Lake config gate",
-                raw_target,
-                target_pkg.name
+            anyhow::ensure!(
+                facet_opt.is_none(),
+                "Unsupported facet on materialized Lake target `{raw_target}`"
             );
+            continue;
         }
         let mut matched = false;
         let mut default_entries: Vec<String> = Vec::new();
@@ -12494,18 +12736,12 @@ fn build_module_dag_inner(
         for entry in &default_entries {
             let entry_name = clean_lake_ident(entry);
             if target_pkg.custom_targets.iter().any(|ct| ct == &entry_name)
-                || target_pkg.extern_libs.iter().any(|el| {
-                    el.name == entry_name
-                        && el.is_dynamic_recipe
-                        && el.static_artifact_path.is_none()
-                })
+                || target_pkg
+                    .extern_libs
+                    .iter()
+                    .any(|el| el.name == entry_name)
             {
-                let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                anyhow::bail!(
-                    "Target `{}` requires executing a dynamic Lake recipe in `{}`: fail-closed static Lake config gate",
-                    entry,
-                    target_pkg.name
-                );
+                continue;
             }
             if let Some(lib) = target_pkg.libs.iter().find(|l| l.name == entry_name) {
                 push_lib_specs(
@@ -12538,12 +12774,6 @@ fn build_module_dag_inner(
                         target_pkg.name
                     );
                 }
-            } else if target_pkg
-                .extern_libs
-                .iter()
-                .any(|el| el.name == entry_name)
-            {
-                // Static prebuilt extern_lib in defaultTargets: no Lean module specs to enqueue.
             } else if let Some(spec) =
                 resolve_module_in_package(target_pkg, target_is_root, &entry_name)
             {
@@ -12683,6 +12913,15 @@ fn build_module_dag_inner(
         let build_base = root_pkg.pkg_root.join(&root_pkg.build_dir);
         let (lean_options, strong_args, weak_args) =
             compose_effective_args(root_pkg, &LeanOptionsMap::new(), &[], &[]);
+        let extern_lib_digests: Vec<String> = root_pkg
+            .extern_libs
+            .iter()
+            .filter_map(|e| {
+                e.static_artifact_blake3
+                    .as_ref()
+                    .map(|h| format!("{}:{}", e.name, h))
+            })
+            .collect();
         for f in files {
             if let Ok(rel) = f.strip_prefix(&src_root) {
                 let mod_name = rel
@@ -12712,7 +12951,7 @@ fn build_module_dag_inner(
                             lean_options: lean_options.clone(),
                             strong_args: strong_args.clone(),
                             weak_args: weak_args.clone(),
-                            extern_lib_digests: Vec::new(),
+                            extern_lib_digests: extern_lib_digests.clone(),
                             pkg_config_digest: root_pkg.config_digest.clone(),
                             unsupported: root_pkg.unsupported.clone(),
                             native_unsupported: root_pkg.native_unsupported.clone(),
@@ -13897,15 +14136,6 @@ fn build_module_dag_inner(
                         why
                     );
                 }
-                if !pkg.extern_libs.is_empty() {
-                    let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                    anyhow::bail!(
-                        "Cannot build shared library `{}` of package `{}` like Lake (package declares `extern_lib` {:?}): fail-closed static Lake config gate",
-                        lib_name,
-                        pkg.name,
-                        pkg.extern_libs.iter().map(|e| &e.name).collect::<Vec<_>>()
-                    );
-                }
             }
         }
         for m in &topological_order {
@@ -13930,20 +14160,6 @@ fn build_module_dag_inner(
                             node.pkg_name,
                             why
                         );
-                    }
-                    if let Some(pkg) = std::iter::once(&cfg.root_pkg)
-                        .chain(&cfg.dep_pkgs)
-                        .find(|p| p.pkg_root == node.pkg_root)
-                    {
-                        if !pkg.extern_libs.is_empty() {
-                            let _ = c_abi::verify_static_lake_config(true, true, false, false);
-                            anyhow::bail!(
-                                "Cannot build module `{}` of package `{}` like Lake (package declares `extern_lib` {:?}): fail-closed static Lake config gate",
-                                node.module_name,
-                                node.pkg_name,
-                                pkg.extern_libs.iter().map(|e| &e.name).collect::<Vec<_>>()
-                            );
-                        }
                     }
                 }
             }
@@ -14488,7 +14704,14 @@ pub(crate) fn module_lake_input_digest(cfg: &ProjectConfig, node: &ModuleNode) -
 /// placeholder string: any deterministic string would compare equal across two runs with different
 /// underlying input bytes, turning cache consumers and manifest guards into false-green hits.
 pub(crate) fn workspace_lake_inputs_digest(cfg: &ProjectConfig) -> Result<String> {
+    validate_materialized_artifacts(cfg)?;
     let mut out = String::new();
+    if std::iter::once(&cfg.root_pkg)
+        .chain(&cfg.dep_pkgs)
+        .any(|p| !p.custom_targets.is_empty() || !p.extern_libs.is_empty())
+    {
+        out.push_str(&format!("native:{}\n", cfg.canonical_config_digest));
+    }
     for p in std::iter::once(&cfg.root_pkg)
         .chain(cfg.dep_pkgs.iter())
         .filter(|p| !p.inputs.is_empty())
@@ -14506,6 +14729,52 @@ pub(crate) fn workspace_lake_inputs_digest(cfg: &ProjectConfig) -> Result<String
         }
     }
     Ok(out)
+}
+
+fn validate_materialized_artifacts(cfg: &ProjectConfig) -> Result<()> {
+    for pkg in std::iter::once(&cfg.root_pkg).chain(&cfg.dep_pkgs) {
+        if !cfg.is_untrusted {
+            for name in pkg.custom_targets.iter().chain(
+                pkg.extern_libs
+                    .iter()
+                    .filter(|e| e.is_dynamic_recipe)
+                    .map(|e| &e.name),
+            ) {
+                anyhow::ensure!(
+                    pkg.inputs.iter().any(|i| &i.name == name),
+                    "Lake recipe `{}/{name}` has not been materialized",
+                    pkg.name
+                );
+            }
+        }
+        for ext in &pkg.extern_libs {
+            let path = ext
+                .static_artifact_path
+                .as_ref()
+                .with_context(|| format!("Missing native archive `{}/{}`", pkg.name, ext.name))?;
+            let digest = blake3::hash(&fs::read(path)?).to_hex().to_string();
+            anyhow::ensure!(
+                ext.static_artifact_blake3.as_ref() == Some(&digest),
+                "Materialized Lake artifact `{}/{}` changed during build",
+                pkg.name,
+                ext.name
+            );
+        }
+        for input in &pkg.inputs {
+            if pkg.custom_targets.contains(&input.name)
+                || pkg.extern_libs.iter().any(|e| e.name == input.name)
+            {
+                let (digest, _) = hash_input_target(&pkg.pkg_root, input)?;
+                anyhow::ensure!(
+                    digest == input.blake3,
+                    "Materialized Lake artifact `{}/{}` changed during build",
+                    pkg.name,
+                    input.name
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Every Lake config file a workspace resolve would read: the root package's, plus one per
@@ -14584,7 +14853,11 @@ pub(crate) fn workspace_lake_config_candidates(project_dir: &Path) -> Result<Vec
 pub(crate) fn workspace_may_declare_lake_inputs(project_dir: &Path) -> bool {
     match workspace_lake_config_candidates(project_dir) {
         Ok(candidates) => candidates.iter().any(|p| {
-            fs::read_to_string(p).is_ok_and(|s| s.contains("input_file") || s.contains("input_dir"))
+            fs::read_to_string(p).is_ok_and(|s| {
+                ["input_file", "input_dir", "extern_lib", "target "]
+                    .iter()
+                    .any(|needle| s.contains(needle))
+            })
         }),
         Err(_) => true,
     }
@@ -16398,14 +16671,15 @@ pub fn compute_module_cas_key_with_dynlibs(
             cfg_valid
         );
     }
+    validate_materialized_artifacts(cfg)?;
     let mut h = blake3::Hasher::new();
     h.update(b"turbo-lean-module-cas-v7\n");
     update_lp(&mut h, b"toolchain", cfg.toolchain.as_bytes());
     update_lp(&mut h, b"githash", cfg.lean_githash.as_bytes());
     update_lp(
         &mut h,
-        b"lean_bin",
-        cfg.lean_bin.to_string_lossy().as_bytes(),
+        b"lean_bin_digest",
+        blake3::hash(&fs::read(&cfg.lean_bin).context("Cannot hash Lean compiler")?).as_bytes(),
     );
     update_lp(&mut h, b"os", std::env::consts::OS.as_bytes());
     update_lp(&mut h, b"arch", std::env::consts::ARCH.as_bytes());
@@ -16526,6 +16800,7 @@ pub(crate) fn scrub_untrusted_env(cmd: &mut Command) {
             || ku.starts_with("AWS_")
             || ku.starts_with("GH_")
             || ku.starts_with("GITHUB_")
+            || ku.starts_with("GIT_")
             || ku.starts_with("OPENAI_")
             || ku.starts_with("ANTHROPIC_")
             || ku == "LEAN_SRC_PATH"
@@ -18875,6 +19150,44 @@ fn build_module_co_export(cfg: &ProjectConfig, node: &ModuleNode) -> Result<Path
     Ok(co_path)
 }
 
+fn native_link_package_roots(dag: &ModuleDag, so_path: &Path) -> Result<BTreeSet<PathBuf>> {
+    let mut roots = BTreeSet::new();
+    let mut pending = Vec::new();
+    if let Some(sl) = dag.shared_libs.iter().find(|s| s.path == so_path) {
+        roots.insert(sl.pkg_root.clone());
+        pending.extend(sl.local_modules.iter().cloned());
+    } else if let Some(node) = dag
+        .nodes
+        .values()
+        .find(|n| module_dynlib_so_path(n).as_deref() == Some(so_path))
+    {
+        pending.push(node.module_name.clone());
+    } else {
+        anyhow::bail!(
+            "No owning package for shared object `{}`",
+            so_path.display()
+        );
+    }
+    let mut visited = HashSet::new();
+    while let Some(name) = pending.pop() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        let node = dag
+            .nodes
+            .get(&name)
+            .with_context(|| format!("Missing native dependency `{name}`"))?;
+        roots.insert(node.pkg_root.clone());
+        for (_, path) in &node.external_olean_deps {
+            if let Some(root) = infer_pkg_root_from_artifact_path(path) {
+                roots.insert(root);
+            }
+        }
+        pending.extend(node.direct_dag_deps.iter().cloned());
+    }
+    Ok(roots)
+}
+
 fn build_shared_object(
     cfg: &ProjectConfig,
     dag: &ModuleDag,
@@ -18891,6 +19204,25 @@ fn build_shared_object(
         .iter()
         .map(|p| p.to_string_lossy().to_string())
         .collect();
+    let native_roots = native_link_package_roots(dag, so_path)?;
+    for pkg in std::iter::once(&cfg.root_pkg)
+        .chain(&cfg.dep_pkgs)
+        .filter(|p| native_roots.contains(&p.pkg_root))
+    {
+        for ext in &pkg.extern_libs {
+            let path = ext
+                .static_artifact_path
+                .as_ref()
+                .context("Missing materialized native archive")?;
+            let digest = blake3::hash(&fs::read(path)?).to_hex().to_string();
+            anyhow::ensure!(
+                ext.static_artifact_blake3.as_ref() == Some(&digest),
+                "Native archive changed after materialization: {}",
+                path.display()
+            );
+            rsp_args.push(path.to_string_lossy().into_owned());
+        }
+    }
     if toolchain_native.is_windows {
         let mut by_path: HashMap<PathBuf, &SharedLibSpec> = HashMap::new();
         for sl in &dag.shared_libs {
@@ -24276,6 +24608,10 @@ pub(crate) fn build_project_modules_native_with_options(
                             continue;
                         }
                     };
+                    if let Err(e) = validate_materialized_artifacts(&cfg) {
+                        fatal_err = Some(e);
+                        continue;
+                    }
                     let mut finalize_queue: VecDeque<(String, PerModuleAuditOutcome)> =
                         VecDeque::with_capacity(batch_mods.len());
                     for mod_name in batch_mods {
@@ -24956,6 +25292,7 @@ pub(crate) fn build_project_modules_native_with_options(
     report
         .cached_modules
         .sort_by_key(|m| topo_rank.get(m.as_str()).copied().unwrap_or(usize::MAX));
+    validate_materialized_artifacts(&cfg)?;
     if profile_phases {
         eprintln!(
             "[turbo-lean][profile] module_builder: cfg={}ms dag={}ms ext_digests={}ms ext_replay={}ms(n={}) scheduler={}ms staged_paths={}ms total={}ms (dag_nodes={} unique_ext={} compiled={} cached={})",
@@ -28037,6 +28374,314 @@ lean_lib Smoke where
     }
 
     #[test]
+    fn test_portable_compiler_and_hybrid_lake_keys() -> Result<()> {
+        let _guard = native_build_env_guard();
+        let dir = make_temp_test_dir("hybrid_lake");
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(dir.join("A.lean"), "def answer : Nat := 42\n")?;
+        fs::write(dir.join("payload"), "first")?;
+        fs::write(dir.join("native.a"), "!<arch>\n")?;
+        fs::write(dir.join("lakefile.lean"), "import Lake\nopen Lake DSL\nopen System (FilePath)\npackage hybrid\ntarget generated pkg : FilePath := do\n  inputTextFile (pkg.dir / \"payload\")\nextern_lib libnative pkg := do\n  inputTextFile (pkg.dir / \"native.a\")\n@[default_target]\nlean_lib A\n")?;
+        let cfg = resolve_project_config(&dir)?;
+        assert!(cfg.root_pkg.extern_libs[0].static_artifact_blake3.is_some());
+        let dag = build_module_dag(&cfg, &[])?;
+        let node = &dag.nodes["A"];
+        let key = compute_module_cas_key(&cfg, node, &[], false)?;
+        let mut relocated = cfg.clone();
+        relocated.lean_bin = dir.join("relocated-lean");
+        fs::copy(&cfg.lean_bin, &relocated.lean_bin)?;
+        assert_eq!(key, compute_module_cas_key(&relocated, node, &[], false)?);
+        fs::write(&relocated.lean_bin, b"different compiler")?;
+        assert_ne!(key, compute_module_cas_key(&relocated, node, &[], false)?);
+        fs::write(dir.join("payload"), "second")?;
+        let changed = resolve_project_config(&dir)?;
+        let changed_dag = build_module_dag(&changed, &[])?;
+        assert_ne!(
+            key,
+            compute_module_cas_key(&changed, &changed_dag.nodes["A"], &[], false)?
+        );
+        assert!(workspace_lake_inputs_digest(&cfg).is_err());
+        assert!(compute_module_cas_key(&cfg, node, &[], false).is_err());
+        assert!(!workspace_lake_inputs_digest(&changed)?.is_empty());
+        assert!(resolve_project_config_with_trust(&dir, true).is_err());
+        let changed_key = compute_module_cas_key(&changed, &changed_dag.nodes["A"], &[], false)?;
+        fs::write(dir.join("native.a"), "!<arch>\nchanged")?;
+        let native_changed = resolve_project_config(&dir)?;
+        let native_dag = build_module_dag(&native_changed, &[])?;
+        assert_ne!(
+            changed_key,
+            compute_module_cas_key(&native_changed, &native_dag.nodes["A"], &[], false)?
+        );
+        fs::write(dir.join("lakefile.lean"), "import Lake\nopen Lake DSL\npackage hybrid\nextern_lib libnative pkg := do\n  inputTextFile (pkg.dir / \"native.a\")\n")?;
+        let bare_cfg = resolve_project_config(&dir)?;
+        let bare_dag = build_module_dag(&bare_cfg, &[])?;
+        assert_eq!(bare_dag.nodes["A"].extern_lib_digests.len(), 1);
+        fs::write(dir.join("lakefile.lean"), "import Lake\nopen Lake DSL\nopen System (FilePath)\npackage hybrid\ntarget generated pkg : FilePath := do\n  pure (Job.pure (pkg.dir / \"missing\"))\nlean_lib A\n")?;
+        assert!(resolve_project_config(&dir).is_err());
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_native_archive_linkage_dependency_closure() -> Result<()> {
+        let _guard = native_build_env_guard();
+        let dir = make_temp_test_dir("native_archive_closure");
+        for (name, source) in [
+            ("app", "import Dep\ndef app := dep\n"),
+            ("dep", "import Leaf\ndef dep := leaf\n"),
+            ("leaf", "def leaf := 1\n"),
+            ("unrelated", "def unrelated := 2\n"),
+        ] {
+            let root = dir.join(name);
+            fs::create_dir_all(&root)?;
+            fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+            let module = match name {
+                "app" => "App",
+                "dep" => "Dep",
+                "leaf" => "Leaf",
+                _ => "Unrelated",
+            };
+            fs::write(root.join(format!("{module}.lean")), source)?;
+            fs::write(root.join("native.a"), b"!<arch>\n")?;
+            let requires = if name == "app" {
+                "require dep from \"../dep\"\nrequire leaf from \"../leaf\"\nrequire unrelated from \"../unrelated\"\n"
+            } else if name == "dep" {
+                "require leaf from \"../leaf\"\n"
+            } else {
+                ""
+            };
+            fs::write(root.join("lakefile.lean"), format!("import Lake\nopen Lake DSL\npackage {name}\n{requires}extern_lib native_ext pkg := do\n  inputTextFile (pkg.dir / \"native.a\")\nlean_lib {module}\n"))?;
+        }
+        resolve_project_config(&dir.join("app"))?;
+        let cfg = resolve_project_config(&dir.join("app"))?;
+        let dag = build_module_dag(
+            &cfg,
+            &["+App:dynlib".into(), "@unrelated/+Unrelated:dynlib".into()],
+        )?;
+        let expected = BTreeSet::from([
+            dir.join("app").canonicalize()?,
+            dir.join("dep").canonicalize()?,
+            dir.join("leaf").canonicalize()?,
+        ]);
+        assert_eq!(
+            native_link_package_roots(&dag, &module_dynlib_so_path(&dag.nodes["App"]).unwrap())?,
+            expected
+        );
+        let shared = build_module_dag(
+            &cfg,
+            &["App:shared".into(), "@unrelated/Unrelated:shared".into()],
+        )?;
+        let sl = shared
+            .shared_libs
+            .iter()
+            .find(|s| s.pkg_root == cfg.root_pkg.pkg_root)
+            .unwrap();
+        assert_eq!(native_link_package_roots(&shared, &sl.path)?, expected);
+        assert!(build_module_dag(&cfg, &["native_ext".into()])?
+            .nodes
+            .is_empty());
+        assert!(build_module_dag(&cfg, &["native_ext:bogus".into()]).is_err());
+        fs::write(dir.join("unrelated/native.a"), b"invalid unrelated archive")?;
+        let mut link_cfg = cfg.clone();
+        let unrelated = link_cfg
+            .dep_pkgs
+            .iter_mut()
+            .find(|p| p.base_name == "unrelated")
+            .unwrap();
+        unrelated.extern_libs[0].static_artifact_blake3 = Some(
+            blake3::hash(b"invalid unrelated archive")
+                .to_hex()
+                .to_string(),
+        );
+        fs::write(
+            dir.join("entry.c"),
+            "int native_link_entry(void) { return 42; }\n",
+        )?;
+        let object = dir.join("entry.o");
+        let (cc, _cflags, _link_flags, _toolchain_native, _custom_cc) = lake_cc_and_flags(&cfg)?;
+        let status = Command::new(&cc)
+            .args(["-fPIC", "-c"])
+            .arg(dir.join("entry.c"))
+            .arg("-o")
+            .arg(&object)
+            .status()?;
+        anyhow::ensure!(
+            status.success(),
+            "Failed to compile linkage regression object"
+        );
+        fs::write(
+            dir.join("entry.o.hash"),
+            format!("{:016x}", lake_hash_bytes(&fs::read(&object)?)),
+        )?;
+        build_shared_object(
+            &link_cfg,
+            &shared,
+            &sl.path,
+            std::slice::from_ref(&object),
+            &[],
+        )?;
+        build_shared_object(
+            &link_cfg,
+            &dag,
+            &module_dynlib_so_path(&dag.nodes["App"]).unwrap(),
+            std::slice::from_ref(&object),
+            &[],
+        )?;
+        fs::write(dir.join("leaf/native.a"), b"invalid required archive")?;
+        let leaf = link_cfg
+            .dep_pkgs
+            .iter_mut()
+            .find(|p| p.base_name == "leaf")
+            .unwrap();
+        leaf.extern_libs[0].static_artifact_blake3 = Some(
+            blake3::hash(b"invalid required archive")
+                .to_hex()
+                .to_string(),
+        );
+        assert!(build_shared_object(&link_cfg, &shared, &sl.path, &[object], &[]).is_err());
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_lean_sys_native_recipe_materialization() -> Result<()> {
+        let _guard = native_build_env_guard();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../lean-sys");
+        let dir = make_temp_test_dir("lean_sys_native_recipe");
+        fs::create_dir_all(dir.join("c"))?;
+        if fixture.join("lakefile.lean").is_file() {
+            fs::copy(fixture.join("lakefile.lean"), dir.join("lakefile.lean"))?;
+            fs::copy(fixture.join("lean-toolchain"), dir.join("lean-toolchain"))?;
+            fs::copy(
+                fixture.join("c/lean_sys_shim.c"),
+                dir.join("c/lean_sys_shim.c"),
+            )?;
+            for entry in walkdir::WalkDir::new(fixture.join("LeanSys")) {
+                let entry = entry?;
+                let dest = dir.join(entry.path().strip_prefix(&fixture)?);
+                if entry.file_type().is_dir() {
+                    fs::create_dir_all(dest)?;
+                } else if entry.path().extension().is_some_and(|e| e == "lean") {
+                    fs::copy(entry.path(), dest)?;
+                }
+            }
+            fs::copy(fixture.join("LeanSys.lean"), dir.join("LeanSys.lean"))?;
+        } else {
+            let repo_tc = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean/lean-toolchain");
+            fs::copy(repo_tc, dir.join("lean-toolchain"))?;
+            fs::write(
+                dir.join("lakefile.lean"),
+                "import Lake\nopen Lake DSL\nopen System (FilePath)\n\npackage «lean-sys» where\n  version := v!\"0.1.0\"\n\ntarget lean_sys_shim_o pkg : FilePath := do\n  let oFile := pkg.buildDir / \"c\" / \"lean_sys_shim.o\"\n  let srcJob ← inputTextFile <| pkg.dir / \"c\" / \"lean_sys_shim.c\"\n  let leanIncludeDir ← getLeanIncludeDir\n  buildO oFile srcJob #[\"-I\", leanIncludeDir.toString] #[\"-O3\", \"-fPIC\"] \"cc\"\n\nextern_lib liblean_sys_shim pkg := do\n  let shimO ← lean_sys_shim_o.fetch\n  let name := nameToStaticLib \"lean_sys_shim\"\n  buildStaticLib (pkg.staticLibDir / name) #[shimO]\n\n@[default_target]\nlean_lib «LeanSys» where\n  roots := #[`LeanSys]\n  precompileModules := false\n\n@[default_target]\nlean_exe «lean-sys-core» where\n  root := `LeanSys.Core\n  supportInterpreter := false\n",
+            )?;
+            fs::write(
+                dir.join("c/lean_sys_shim.c"),
+                "#include <lean/lean.h>\nlean_obj_res leansys_ping(lean_obj_arg w) { return lean_io_result_mk_ok(lean_box(0)); }\n",
+            )?;
+            fs::create_dir_all(dir.join("LeanSys/Contracts"))?;
+            fs::write(
+                dir.join("LeanSys/Contracts/MetaGate.lean"),
+                "namespace LeanSys.Contracts\ndef metaGateOk : Bool := true\nend LeanSys.Contracts\n",
+            )?;
+            fs::write(
+                dir.join("LeanSys/Posix.lean"),
+                "namespace LeanSys.Posix\n@[extern \"leansys_ping\"] opaque rawPing : IO Unit\nend LeanSys.Posix\n",
+            )?;
+            fs::write(
+                dir.join("LeanSys/Core.lean"),
+                "import LeanSys.Posix\ndef main : IO Unit := LeanSys.Posix.rawPing\n",
+            )?;
+            fs::write(
+                dir.join("LeanSys.lean"),
+                "import LeanSys.Contracts.MetaGate\nimport LeanSys.Posix\n",
+            )?;
+        }
+        let cfg = resolve_project_config(&dir)?;
+        let ext = &cfg.root_pkg.extern_libs[0];
+        assert!(ext.static_artifact_path.as_ref().unwrap().is_file());
+        assert!(ext.static_artifact_blake3.is_some());
+        assert!(cfg
+            .root_pkg
+            .inputs
+            .iter()
+            .any(|i| i.name == "lean_sys_shim_o"));
+        validate_materialized_artifacts(&cfg)?;
+        let mut store = TurboStore::open(Some(&dir.join("store")))?;
+        let report = build_project_modules_native(
+            &mut store,
+            &dir,
+            &["+LeanSys.Contracts.MetaGate".into()],
+            "trusted",
+            0,
+            false,
+            false,
+            None,
+        )?;
+        assert!(report.modules_compiled > 0);
+        assert!(dir
+            .join(".lake/build/lib/lean/LeanSys/Contracts/MetaGate.olean")
+            .is_file());
+        let error = build_project_modules_native(
+            &mut store,
+            &dir,
+            &["LeanSys".into()],
+            "trusted",
+            0,
+            false,
+            false,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("LeanSys.Posix") && error.contains("forbidden"),
+            "{error}"
+        );
+        assert!(
+            !resolve_requested_exe_link_targets(&cfg, &["lean-sys-core".into()])
+                .0
+                .is_empty()
+        );
+        let exe_error = build_project_modules_native(
+            &mut store,
+            &dir,
+            &["lean-sys-core".into()],
+            "trusted",
+            0,
+            false,
+            false,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            exe_error.contains("LeanSys.Posix") && exe_error.contains("forbidden"),
+            "{exe_error}"
+        );
+        assert!(!dir.join(".lake/build/bin/lean-sys-core").exists());
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_lean_project_untrusted_accepts_prebuilt_extern_lib() {
+        let lean_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
+        let archive = lean_dir.join(".lake/packages/lean-sys/.lake/build/lib/liblean_sys_shim.a");
+        if archive.is_file() {
+            let cfg = resolve_project_config_with_trust(&lean_dir, true).unwrap();
+            let dag = build_module_dag_with_trust(&cfg, &[], true).unwrap();
+            assert!(!workspace_lake_inputs_digest(&cfg).unwrap().is_empty());
+            let leaf = dag
+                .nodes
+                .values()
+                .find(|n| n.direct_dag_deps.is_empty() && n.external_olean_deps.is_empty())
+                .unwrap();
+            assert!(!compute_module_cas_key(&cfg, leaf, &[], false)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[test]
     fn test_dynamic_lakefile_fails_closed_with_precise_diagnostics() {
         let dir = make_temp_test_dir("fail_closed");
         // 1. Dynamic `meta if` in lakefile.lean
@@ -28057,17 +28702,17 @@ lean_lib Smoke where
         // 3. Unbuilt dynamic `extern_lib` in root lakefile.lean
         let dyn_ext = "import Lake\nopen Lake DSL\npackage p\nextern_lib libfoo pkg := do\n  pure ()\nlean_lib A\n";
         fs::write(&lf, dyn_ext).unwrap();
-        let err3 = parse_lakefile_lean(&dir, &lf, true)
-            .unwrap_err()
-            .to_string();
-        assert!(err3.contains("extern_lib") && err3.contains("libfoo"));
+        assert_eq!(
+            parse_lakefile_lean(&dir, &lf, true).unwrap().extern_libs[0].name,
+            "libfoo"
+        );
         // 4. Custom `target ... := do` in root lakefile.lean
         let dyn_tgt = "import Lake\nopen Lake DSL\npackage p\ntarget custom_c pkg : FilePath := do\n  pure ()\nlean_lib A\n";
         fs::write(&lf, dyn_tgt).unwrap();
-        let err4 = parse_lakefile_lean(&dir, &lf, true)
-            .unwrap_err()
-            .to_string();
-        assert!(err4.contains("custom_c") && err4.contains("fail-closed"));
+        assert_eq!(
+            parse_lakefile_lean(&dir, &lf, true).unwrap().custom_targets,
+            ["custom_c"]
+        );
         // 5. Unsafe `--load-dynlib` in `moreLeanArgs` in lakefile.toml
         let dyn_toml = "name = \"p\"\nmoreLeanArgs = [\"--load-dynlib=evil.so\"]\n[[lean_lib]]\nname = \"A\"\n";
         let tf = dir.join("lakefile.toml");
@@ -31909,7 +32554,7 @@ globs = ["Demo.+"]
     }
 
     #[test]
-    fn test_adversarial_compiler_arg_allowlist_and_custom_target_fail_closed() {
+    fn test_adversarial_compiler_arg_allowlist_and_custom_target_parsing() {
         // 1. Strict allowlist accepts safe Lean compiler flags
         for ok_arg in [
             "-DautoImplicit=false",
@@ -31955,7 +32600,6 @@ globs = ["Demo.+"]
             );
         }
 
-        // 3. Root `custom_target` MUST fail closed even when a prebuilt `extern_lib` static artifact exists
         let dir = make_temp_test_dir("adv_custom_target_with_ext");
         fs::create_dir_all(dir.join(".lake/build/lib")).unwrap();
         fs::write(dir.join(".lake/build/lib/libfoo.a"), b"!<arch>\n").unwrap();
@@ -31965,14 +32609,9 @@ globs = ["Demo.+"]
             "import Lake\nopen Lake DSL\npackage p\nextern_lib libfoo pkg := do\n  pure ()\ntarget custom_gen pkg : FilePath := do\n  pure ()\nlean_lib A\n",
         )
         .unwrap();
-        let err = parse_lakefile_lean(&dir, &lf, true)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("custom_gen") && err.contains("fail-closed"),
-            "expected custom_target with extern_lib to fail closed, got: {}",
-            err
-        );
+        let pkg = parse_lakefile_lean(&dir, &lf, true).unwrap();
+        assert_eq!(pkg.custom_targets, ["custom_gen"]);
+        assert_eq!(pkg.extern_libs[0].name, "libfoo");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -34064,10 +34703,6 @@ root = "Main"
             "worklist re-hit promoting `needs_co_export` must enforce `native_unsupported` gate"
         );
 
-        // Duplicate `origName` (`p.name == "cas_proj"`) across packages must resolve `extern_lib`
-        // per `pkg_root`: `shadow_dep` declaring `extern_lib` must reject `@shadow_dep/+DepMod:dynlib`
-        // even when root `cas_proj` has no `extern_lib`, and must NOT reject `+RootMod:dynlib` when
-        // reversed.
         fs::write(
             cas_proj.join("lakefile.toml"),
             "name = \"cas_proj\"\n[[require]]\nname = \"shadow_dep\"\npath = \"deps/shadow_dep\"\n[[lean_lib]]\nname = \"SharedTarget\"\nroots = [\"RootMod\"]\n",
@@ -34075,9 +34710,10 @@ root = "Main"
         .unwrap();
         fs::write(
             shadow_dep.join("lakefile.lean"),
-            "import Lake\nopen Lake DSL\npackage cas_proj\nextern_lib native_ext pkg := do\n  return .nil\nlean_lib SharedTarget where\n  roots := #[`DepMod]\n",
+            "import Lake\nopen Lake DSL\npackage cas_proj\nextern_lib native_ext pkg := do\n  inputTextFile (pkg.dir / \"native.a\")\nlean_lib SharedTarget where\n  roots := #[`DepMod]\n",
         )
         .unwrap();
+        fs::write(shadow_dep.join("native.a"), b"!<arch>\n").unwrap();
         let _ = fs::remove_file(shadow_dep.join("lakefile.toml"));
         fs::write(
             cas_proj.join("lake-manifest.json"),
@@ -34092,13 +34728,26 @@ root = "Main"
         )
         .unwrap();
         let dup_ext_cfg = resolve_project_config(&cas_proj).unwrap();
-        assert!(
-            build_module_dag(&dup_ext_cfg, &["+DepMod:dynlib".into()]).is_err(),
-            "dep sharing `origName` with root must still fail closed on its own `extern_lib` when building `:dynlib`"
+        let dep_dag =
+            build_module_dag(&dup_ext_cfg, &["@shadow_dep/+DepMod:dynlib".into()]).unwrap();
+        let dep_node = &dep_dag.nodes["DepMod"];
+        assert_eq!(dep_node.pkg_root, shadow_dep.canonicalize().unwrap());
+        assert_eq!(
+            native_link_package_roots(&dep_dag, &module_dynlib_so_path(dep_node).unwrap()).unwrap(),
+            BTreeSet::from([dep_node.pkg_root.clone()])
+        );
+        let root_dag = build_module_dag(&dup_ext_cfg, &["+RootMod:dynlib".into()]).unwrap();
+        let root_node = &root_dag.nodes["RootMod"];
+        assert_eq!(
+            native_link_package_roots(&root_dag, &module_dynlib_so_path(root_node).unwrap())
+                .unwrap(),
+            BTreeSet::from([root_node.pkg_root.clone()])
         );
         assert!(
-            build_module_dag(&dup_ext_cfg, &["+RootMod:dynlib".into()]).is_ok(),
-            "root sharing `origName` with `extern_lib` dep must not be spuriously rejected when root has no `extern_lib`"
+            build_module_dag(&dup_ext_cfg, &["@shadow_dep/native_ext".into()])
+                .unwrap()
+                .nodes
+                .is_empty()
         );
 
         let samelib_base = dir.join("samelib_proj");
