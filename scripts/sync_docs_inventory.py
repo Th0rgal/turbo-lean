@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Synchronize or verify `<!-- inventory:KEY -->...<!-- /inventory:KEY -->` markers
-in `README.md` and `AGENTS.md` against the live `TurboLean/Spec.lean` and
+in `AGENTS.md` against the live `TurboLean/Spec.lean`, `LeanNative/Spec.lean`, and
 C-ABI export inventory in `crates/turbo-lean/build.rs`.
 """
 import argparse
@@ -84,11 +84,11 @@ def apply_markers(text: str, inv: dict[str, str]) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true", help="Verify markers match without writing")
-    ap.add_argument("--write", action="store_true", help="Update markers in README.md and AGENTS.md")
+    ap.add_argument("--write", action="store_true", help="Update markers in AGENTS.md")
     args = ap.parse_args()
 
     inv = compute_inventory()
-    targets = [ROOT / "README.md", ROOT / "AGENTS.md"]
+    targets = [ROOT / "AGENTS.md"]
     drifted = []
     for p in targets:
         orig = p.read_text(encoding="utf-8")
