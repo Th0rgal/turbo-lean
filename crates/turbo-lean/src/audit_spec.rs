@@ -3,6 +3,48 @@
 use super::*;
 use crate::splitter::skip_lean_lexeme;
 
+fn scan_let_colon_eq(src: &str) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    let mut p_depth = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(src, i) {
+            i = span.end;
+            continue;
+        }
+        let ch = src[i..].chars().next()?;
+        match ch {
+            '(' | '{' | '[' | '⟨' => p_depth += 1,
+            ')' | '}' | ']' | '⟩' => p_depth = p_depth.saturating_sub(1),
+            ':' if p_depth == 0 && bytes.get(i + 1) == Some(&b'=') => return Some(i),
+            ';' | '\n' if p_depth == 0 => return None,
+            _ => {}
+        }
+        i += ch.len_utf8();
+    }
+    None
+}
+
+fn scan_let_rhs_terminator(src: &str) -> Option<usize> {
+    let mut i = 0usize;
+    let mut p_depth = 0usize;
+    while i < src.len() {
+        if let Some(span) = skip_lean_lexeme(src, i) {
+            i = span.end;
+            continue;
+        }
+        let ch = src[i..].chars().next()?;
+        match ch {
+            '(' | '{' | '[' | '⟨' => p_depth += 1,
+            ')' | '}' | ']' | '⟩' => p_depth = p_depth.saturating_sub(1),
+            ';' | '\n' if p_depth == 0 => return Some(i),
+            _ => {}
+        }
+        i += ch.len_utf8();
+    }
+    None
+}
+
 pub(super) fn inline_stmt_let_bindings(stmt: &str) -> String {
     let mut cur = stmt.trim().to_string();
     for _ in 0..16 {
@@ -22,30 +64,15 @@ pub(super) fn inline_stmt_let_bindings(stmt: &str) -> String {
         }
         let var_name = &rest[..name_end];
         let after_name = &rest[name_end..];
-        let Some(eq_idx) = after_name.find(":=") else {
+        let Some(eq_idx) = scan_let_colon_eq(after_name) else {
             break;
         };
         let after_eq = after_name[eq_idx + 2..].trim_start();
-        // Find top-level `;` or `\n` terminating the `let` RHS
-        let chars: Vec<char> = after_eq.chars().collect();
-        let mut p_depth = 0usize;
-        let mut split_char_idx = None;
-        for (idx, &ch) in chars.iter().enumerate() {
-            match ch {
-                '(' | '{' | '[' | '⟨' => p_depth += 1,
-                ')' | '}' | ']' | '⟩' => p_depth = p_depth.saturating_sub(1),
-                ';' | '\n' if p_depth == 0 => {
-                    split_char_idx = Some(idx);
-                    break;
-                }
-                _ => {}
-            }
-        }
-        let Some(sc_idx) = split_char_idx else {
+        let Some(sc_idx) = scan_let_rhs_terminator(after_eq) else {
             break;
         };
-        let rhs: String = chars[..sc_idx].iter().collect();
-        let body: String = chars[sc_idx + 1..].iter().collect();
+        let rhs = &after_eq[..sc_idx];
+        let body = &after_eq[sc_idx + 1..];
         let rhs_wrapped = format!("({})", rhs.trim());
         cur = replace_ident_boundary(body.trim(), var_name, &rhs_wrapped);
     }
@@ -618,27 +645,163 @@ pub(super) fn extract_local_def_unfoldings(clean_src: &str) -> Vec<LocalDefUnfol
     defs
 }
 
+fn replace_ident_in_interpolated_string(lit: &str, ident: &str, replacement: &str) -> String {
+    let bytes = lit.as_bytes();
+    if bytes.first() != Some(&b'"') || !lit.contains('{') {
+        return lit.to_string();
+    }
+    let mut out = String::with_capacity(lit.len());
+    out.push('"');
+    let mut i = 1usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                let end = (i + 2).min(bytes.len());
+                out.push_str(&lit[i..end]);
+                i = end;
+            }
+            b'"' => {
+                out.push('"');
+                i += 1;
+                break;
+            }
+            b'{' => {
+                out.push('{');
+                i += 1;
+                let expr_start = i;
+                let mut depth = 1usize;
+                while i < bytes.len() && depth > 0 {
+                    if let Some(span) = skip_lean_lexeme(lit, i) {
+                        i = span.end;
+                        continue;
+                    }
+                    match bytes[i] {
+                        b'{' => {
+                            depth += 1;
+                            i += 1;
+                        }
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                            i += 1;
+                        }
+                        _ => {
+                            i += lit[i..].chars().next().unwrap().len_utf8();
+                        }
+                    }
+                }
+                let expr_slice = &lit[expr_start..i];
+                out.push_str(&replace_ident_boundary(expr_slice, ident, replacement));
+                if i < bytes.len() && bytes[i] == b'}' {
+                    out.push('}');
+                    i += 1;
+                }
+            }
+            _ => {
+                let ch = lit[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+    }
+    if i < bytes.len() {
+        out.push_str(&lit[i..]);
+    }
+    out
+}
+
 pub(super) fn replace_ident_boundary(haystack: &str, ident: &str, replacement: &str) -> String {
-    if ident.is_empty() || ident == "_" {
+    if ident.is_empty() || ident == "_" || !haystack.contains(ident) {
         return haystack.to_string();
     }
-    let chars: Vec<char> = haystack.chars().collect();
-    let id_chars: Vec<char> = ident.chars().collect();
+    let id_bytes = ident.as_bytes();
+    let id_first = id_bytes[0];
+    let id_is_ascii = ident.is_ascii();
+    let hs_bytes = haystack.as_bytes();
     let mut out = String::with_capacity(haystack.len());
-    let mut i = 0;
-    while i < chars.len() {
-        if i + id_chars.len() <= chars.len() && chars[i..i + id_chars.len()] == id_chars[..] {
-            let prev_ok = i == 0 || (!is_ident_continue(chars[i - 1]) && chars[i - 1] != '.');
-            let next_ok =
-                i + id_chars.len() == chars.len() || !is_ident_continue(chars[i + id_chars.len()]);
+    let mut i = 0usize;
+    while i < haystack.len() {
+        let b = hs_bytes[i];
+        if matches!(b, b'-' | b'/' | b'\'' | b'"' | b'r' | 0xC2) {
+            if let Some(span) = skip_lean_lexeme(haystack, i) {
+                if span.is_comment {
+                    out.push_str(&haystack[i..span.end]);
+                    i = span.end;
+                    continue;
+                }
+                if span.is_literal {
+                    let is_interp = b == b'"'
+                        && i >= 2
+                        && hs_bytes[i - 1] == b'!'
+                        && haystack[..i - 1]
+                            .chars()
+                            .next_back()
+                            .is_some_and(is_ident_continue);
+                    if is_interp {
+                        out.push_str(&replace_ident_in_interpolated_string(
+                            &haystack[i..span.end],
+                            ident,
+                            replacement,
+                        ));
+                    } else {
+                        out.push_str(&haystack[i..span.end]);
+                    }
+                    i = span.end;
+                    continue;
+                }
+            }
+        }
+        if b == id_first
+            && i + id_bytes.len() <= hs_bytes.len()
+            && &hs_bytes[i..i + id_bytes.len()] == id_bytes
+        {
+            let prev_ok = if i == 0 {
+                true
+            } else if hs_bytes[i - 1].is_ascii() {
+                let pc = hs_bytes[i - 1] as char;
+                !is_ident_continue(pc) && pc != '.'
+            } else {
+                haystack[..i]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !is_ident_continue(c) && c != '.')
+            };
+            let after = i + id_bytes.len();
+            let next_ok = if after == hs_bytes.len() {
+                true
+            } else if hs_bytes[after].is_ascii() {
+                !is_ident_continue(hs_bytes[after] as char)
+            } else {
+                haystack[after..]
+                    .chars()
+                    .next()
+                    .is_none_or(|c| !is_ident_continue(c))
+            };
             if prev_ok && next_ok {
                 out.push_str(replacement);
-                i += id_chars.len();
+                i = after;
                 continue;
             }
         }
-        out.push(chars[i]);
-        i += 1;
+        if b.is_ascii() {
+            out.push(b as char);
+            i += 1;
+            if id_is_ascii && is_ident_continue(b as char) {
+                while i < hs_bytes.len()
+                    && hs_bytes[i].is_ascii()
+                    && is_ident_continue(hs_bytes[i] as char)
+                {
+                    out.push(hs_bytes[i] as char);
+                    i += 1;
+                }
+            }
+        } else {
+            let ch = haystack[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
     }
     out
 }
@@ -865,19 +1028,26 @@ pub(super) fn unfold_expr_single_step(expr: &str, local_defs: &[LocalDefUnfoldin
         }
     }
     for (def_name, params, body, _) in local_defs {
-        let short = def_name.rsplit('.').next().unwrap_or(def_name.as_str());
-        if body.len() > 240
-            || replace_ident_boundary(body, short, "__SELF__") != *body
-            || replace_ident_boundary(body, def_name, "__SELF__") != *body
-        {
+        if body.len() > 240 {
             continue;
         }
+        let short = def_name.rsplit('.').next().unwrap_or(def_name.as_str());
         for cand in [def_name.as_str(), short] {
             if params.is_empty() && trimmed == cand {
+                if replace_ident_boundary(body, short, "__SELF__") != *body
+                    || replace_ident_boundary(body, def_name, "__SELF__") != *body
+                {
+                    break;
+                }
                 return body.clone();
             }
             if let Some(rest) = trimmed.strip_prefix(cand) {
                 if rest.starts_with(char::is_whitespace) || rest.starts_with('(') {
+                    if replace_ident_boundary(body, short, "__SELF__") != *body
+                        || replace_ident_boundary(body, def_name, "__SELF__") != *body
+                    {
+                        break;
+                    }
                     let args = split_lean_app_args(rest);
                     if args.len() == params.len() && !params.is_empty() {
                         let mut unfolded = body.clone();
@@ -1054,6 +1224,7 @@ pub(super) fn is_syntactically_contradictory_hyp(hyp: &str) -> bool {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AuditSpecPathRule {
     pub glob_pattern: String,
     #[serde(default)]
@@ -1064,7 +1235,121 @@ pub struct AuditSpecPathRule {
     pub forbid_namespaces: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAuditSpecPathRuleBody {
+    #[serde(default)]
+    forbid_decl_kinds: Vec<String>,
+    #[serde(default)]
+    allow_decl_names: Vec<String>,
+    #[serde(default)]
+    forbid_namespaces: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAuditSpecPathRuleItem {
+    #[serde(alias = "glob", alias = "pattern")]
+    glob_pattern: String,
+    #[serde(default)]
+    forbid_decl_kinds: Vec<String>,
+    #[serde(default)]
+    allow_decl_names: Vec<String>,
+    #[serde(default)]
+    forbid_namespaces: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum RawAuditSpecPathRules {
+    Map(std::collections::BTreeMap<String, RawAuditSpecPathRuleBody>),
+    List(Vec<RawAuditSpecPathRuleItem>),
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAuditSpecSection {
+    policy: Option<String>,
+    reject_conjunct_tautologies: Option<bool>,
+    reject_definitional_lowering_tautology: Option<bool>,
+    reject_identity_stubs: Option<bool>,
+    reject_unused_param_defs: Option<bool>,
+    reject_size_only_parsers: Option<bool>,
+    #[serde(default)]
+    forbid_decl_kinds: Vec<String>,
+    #[serde(default)]
+    forbid_namespaces: Vec<String>,
+    #[serde(alias = "path_overrides")]
+    path_rules: Option<RawAuditSpecPathRules>,
+}
+
+impl RawAuditSpecSection {
+    fn into_policy_config(self) -> Result<AuditSpecPolicyConfig> {
+        let mut cfg = match self.policy.as_deref() {
+            Some(p) => AuditSpecPolicyConfig::try_from_preset(p)?,
+            None => AuditSpecPolicyConfig::default(),
+        };
+        if let Some(v) = self.reject_conjunct_tautologies {
+            cfg.reject_conjunct_tautologies = v;
+        }
+        if let Some(v) = self.reject_definitional_lowering_tautology {
+            cfg.reject_definitional_lowering_tautology = v;
+        }
+        if let Some(v) = self.reject_identity_stubs {
+            cfg.reject_identity_stubs = v;
+        }
+        if let Some(v) = self.reject_unused_param_defs {
+            cfg.reject_unused_param_defs = v;
+        }
+        if let Some(v) = self.reject_size_only_parsers {
+            cfg.reject_size_only_parsers = v;
+        }
+        for item in self.forbid_decl_kinds {
+            let trimmed = item.trim();
+            if !trimmed.is_empty() && !cfg.forbid_decl_kinds.iter().any(|x| x == trimmed) {
+                cfg.forbid_decl_kinds.push(trimmed.to_string());
+            }
+        }
+        for item in self.forbid_namespaces {
+            let trimmed = item.trim();
+            if !trimmed.is_empty() && !cfg.forbid_namespaces.iter().any(|x| x == trimmed) {
+                cfg.forbid_namespaces.push(trimmed.to_string());
+            }
+        }
+        let parsed_rules: Vec<AuditSpecPathRule> = match self.path_rules {
+            None => Vec::new(),
+            Some(RawAuditSpecPathRules::Map(map)) => map
+                .into_iter()
+                .map(|(glob_pattern, body)| AuditSpecPathRule {
+                    glob_pattern,
+                    forbid_decl_kinds: body.forbid_decl_kinds,
+                    allow_decl_names: body.allow_decl_names,
+                    forbid_namespaces: body.forbid_namespaces,
+                })
+                .collect(),
+            Some(RawAuditSpecPathRules::List(list)) => list
+                .into_iter()
+                .map(|item| AuditSpecPathRule {
+                    glob_pattern: item.glob_pattern,
+                    forbid_decl_kinds: item.forbid_decl_kinds,
+                    allow_decl_names: item.allow_decl_names,
+                    forbid_namespaces: item.forbid_namespaces,
+                })
+                .collect(),
+        };
+        for pr in parsed_rules {
+            anyhow::ensure!(
+                !pr.glob_pattern.trim().is_empty(),
+                "audit_spec.path_rules entry must have a non-empty glob_pattern"
+            );
+            cfg.merge_path_rule(pr);
+        }
+        Ok(cfg)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AuditSpecPolicyConfig {
     pub policy: String,
     pub reject_conjunct_tautologies: bool,
@@ -1087,9 +1372,20 @@ impl Default for AuditSpecPolicyConfig {
 }
 
 impl AuditSpecPolicyConfig {
-    pub fn from_preset(preset: &str) -> Self {
+    pub fn try_from_preset(preset: &str) -> Result<Self> {
         match preset.trim().to_ascii_lowercase().as_str() {
-            "permissive" => Self {
+            "default" => Ok(Self {
+                policy: "default".to_string(),
+                reject_conjunct_tautologies: true,
+                reject_definitional_lowering_tautology: true,
+                reject_identity_stubs: true,
+                reject_unused_param_defs: true,
+                reject_size_only_parsers: true,
+                forbid_decl_kinds: Vec::new(),
+                forbid_namespaces: Vec::new(),
+                path_rules: Vec::new(),
+            }),
+            "permissive" => Ok(Self {
                 policy: "permissive".to_string(),
                 reject_conjunct_tautologies: false,
                 reject_definitional_lowering_tautology: false,
@@ -1099,8 +1395,8 @@ impl AuditSpecPolicyConfig {
                 forbid_decl_kinds: Vec::new(),
                 forbid_namespaces: Vec::new(),
                 path_rules: Vec::new(),
-            },
-            "strict-proofs" | "strict_proofs" | "strict" => Self {
+            }),
+            "strict-proofs" | "strict_proofs" | "strict" => Ok(Self {
                 policy: "strict-proofs".to_string(),
                 reject_conjunct_tautologies: true,
                 reject_definitional_lowering_tautology: true,
@@ -1122,39 +1418,149 @@ impl AuditSpecPolicyConfig {
                         "LNSym".to_string(),
                     ],
                 }],
-            },
-            _ => Self {
-                policy: "default".to_string(),
-                reject_conjunct_tautologies: true,
-                reject_definitional_lowering_tautology: true,
-                reject_identity_stubs: true,
-                reject_unused_param_defs: true,
-                reject_size_only_parsers: true,
-                forbid_decl_kinds: Vec::new(),
-                forbid_namespaces: Vec::new(),
-                path_rules: Vec::new(),
-            },
+            }),
+            other => anyhow::bail!(
+                "Unknown audit-spec policy preset `{}` (expected `default`, `permissive`, or `strict-proofs`)",
+                other
+            ),
         }
     }
 
-    pub fn load_for_target(
+    pub fn from_preset(preset: &str) -> Self {
+        Self::try_from_preset(preset).unwrap_or_else(|_| {
+            Self::try_from_preset("default").expect("`default` preset is valid")
+        })
+    }
+
+    fn merge_path_rule(&mut self, pr: AuditSpecPathRule) {
+        if let Some(existing) = self
+            .path_rules
+            .iter_mut()
+            .find(|r| r.glob_pattern == pr.glob_pattern)
+        {
+            for (dst, src) in [
+                (&mut existing.forbid_decl_kinds, pr.forbid_decl_kinds),
+                (&mut existing.allow_decl_names, pr.allow_decl_names),
+                (&mut existing.forbid_namespaces, pr.forbid_namespaces),
+            ] {
+                for item in src {
+                    if !dst.contains(&item) {
+                        dst.push(item);
+                    }
+                }
+            }
+        } else {
+            self.path_rules.push(pr);
+        }
+    }
+
+    pub fn try_load_for_target(
         file: &Path,
         policy_override: Option<&str>,
         config_path_override: Option<&Path>,
         extra_forbid_namespaces: &[String],
         extra_forbid_decl_kinds: &[String],
-    ) -> Self {
-        let mut cfg = crate::shm_cache::load_project_or_env_config(
-            config_path_override,
-            "TURBO_LEAN_AUDIT_SPEC_CONFIG",
-            Some(file),
-            &[],
-            true,
-            Self::parse_config_str,
-        )
-        .unwrap_or_default();
+    ) -> Result<Self> {
+        let mut loaded: Option<Self> = None;
+        if let Some(p) = config_path_override {
+            let txt = fs::read_to_string(p).with_context(|| {
+                format!("Failed to read audit-spec config file {}", p.display())
+            })?;
+            let is_dedicated = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_none_or(|n| n != "turbo-lean.toml" && n != ".turbo-lean.toml");
+            let cfg = Self::try_parse_config_str_mode(&txt, is_dedicated)
+                .with_context(|| format!("Invalid audit-spec config in {}", p.display()))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Config file {} contains no `[audit_spec]`/`[audit-spec]` table or JSON policy object",
+                        p.display()
+                    )
+                })?;
+            loaded = Some(cfg);
+        } else if let Ok(ev) = std::env::var("TURBO_LEAN_AUDIT_SPEC_CONFIG") {
+            let trimmed = ev.trim();
+            if !trimmed.is_empty() {
+                if trimmed.starts_with('{') || trimmed.contains('\n') || trimmed.contains('=') {
+                    let cfg = Self::try_parse_config_str_mode(trimmed, true)
+                        .context("Invalid inline TURBO_LEAN_AUDIT_SPEC_CONFIG")?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Inline TURBO_LEAN_AUDIT_SPEC_CONFIG contains no `[audit_spec]`/`[audit-spec]` configuration"
+                            )
+                        })?;
+                    loaded = Some(cfg);
+                } else {
+                    let env_path = Path::new(trimmed);
+                    let txt = fs::read_to_string(env_path).with_context(|| {
+                        format!(
+                            "Failed to read TURBO_LEAN_AUDIT_SPEC_CONFIG path {}",
+                            env_path.display()
+                        )
+                    })?;
+                    let is_dedicated = env_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_none_or(|n| n != "turbo-lean.toml" && n != ".turbo-lean.toml");
+                    let cfg = Self::try_parse_config_str_mode(&txt, is_dedicated)
+                        .with_context(|| {
+                            format!(
+                                "Invalid audit-spec config in TURBO_LEAN_AUDIT_SPEC_CONFIG ({})",
+                                env_path.display()
+                            )
+                        })?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Config file {} from TURBO_LEAN_AUDIT_SPEC_CONFIG contains no `[audit_spec]`/`[audit-spec]` configuration",
+                                env_path.display()
+                            )
+                        })?;
+                    loaded = Some(cfg);
+                }
+            }
+        }
+        if loaded.is_none() && !file.as_os_str().is_empty() {
+            let start_dir: Option<PathBuf> = if file.is_dir() {
+                Some(file.to_path_buf())
+            } else if let Some(parent) = file.parent().filter(|p| !p.as_os_str().is_empty()) {
+                parent.exists().then(|| parent.to_path_buf())
+            } else if file.exists() {
+                std::env::current_dir().ok()
+            } else {
+                None
+            };
+            if let Some(dir) = start_dir {
+                let canon = dir.canonicalize().unwrap_or(dir);
+                'ancestors: for anc in canon.ancestors() {
+                    for (rel, allow_top_level) in [
+                        ("audit-spec.toml", true),
+                        (".audit-spec.toml", true),
+                        ("turbo-lean.toml", false),
+                        (".turbo-lean.toml", false),
+                    ] {
+                        let cand = anc.join(rel);
+                        if cand.is_file() {
+                            let txt = fs::read_to_string(&cand).with_context(|| {
+                                format!("Failed to read project config {}", cand.display())
+                            })?;
+                            if let Some(cfg) =
+                                Self::try_parse_config_str_mode(&txt, allow_top_level)
+                                    .with_context(|| {
+                                        format!("Invalid config in {}", cand.display())
+                                    })?
+                            {
+                                loaded = Some(cfg);
+                                break 'ancestors;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut cfg = loaded.unwrap_or_default();
         if let Some(pol) = policy_override.filter(|s| !s.trim().is_empty()) {
-            let preset = Self::from_preset(pol);
+            let preset = Self::try_from_preset(pol)?;
             cfg.policy = preset.policy;
             cfg.reject_conjunct_tautologies = preset.reject_conjunct_tautologies;
             cfg.reject_definitional_lowering_tautology =
@@ -1163,25 +1569,7 @@ impl AuditSpecPolicyConfig {
             cfg.reject_unused_param_defs = preset.reject_unused_param_defs;
             cfg.reject_size_only_parsers = preset.reject_size_only_parsers;
             for pr in preset.path_rules {
-                if let Some(existing) = cfg
-                    .path_rules
-                    .iter_mut()
-                    .find(|r| r.glob_pattern == pr.glob_pattern)
-                {
-                    for (dst, src) in [
-                        (&mut existing.forbid_decl_kinds, pr.forbid_decl_kinds),
-                        (&mut existing.allow_decl_names, pr.allow_decl_names),
-                        (&mut existing.forbid_namespaces, pr.forbid_namespaces),
-                    ] {
-                        for item in src {
-                            if !dst.contains(&item) {
-                                dst.push(item);
-                            }
-                        }
-                    }
-                } else {
-                    cfg.path_rules.push(pr);
-                }
+                cfg.merge_path_rule(pr);
             }
         }
         for (dst, extras) in [
@@ -1194,114 +1582,85 @@ impl AuditSpecPolicyConfig {
                 }
             }
         }
-        cfg
+        Ok(cfg)
+    }
+
+    pub fn load_for_target(
+        file: &Path,
+        policy_override: Option<&str>,
+        config_path_override: Option<&Path>,
+        extra_forbid_namespaces: &[String],
+        extra_forbid_decl_kinds: &[String],
+    ) -> Self {
+        Self::try_load_for_target(
+            file,
+            policy_override,
+            config_path_override,
+            extra_forbid_namespaces,
+            extra_forbid_decl_kinds,
+        )
+        .unwrap_or_default()
+    }
+
+    pub fn try_parse_config_str(text: &str) -> Result<Option<Self>> {
+        Self::try_parse_config_str_mode(text, false)
+    }
+
+    pub fn try_parse_config_str_mode(
+        text: &str,
+        allow_top_level_toml: bool,
+    ) -> Result<Option<Self>> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        if trimmed.starts_with('{') {
+            let val: serde_json::Value =
+                serde_json::from_str(trimmed).context("Malformed JSON audit-spec config")?;
+            let obj = val
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("Audit-spec JSON config must be a JSON object"))?;
+            let has_underscore = obj.contains_key("audit_spec");
+            let has_hyphen = obj.contains_key("audit-spec");
+            anyhow::ensure!(
+                !(has_underscore && has_hyphen),
+                "Config cannot specify both `audit_spec` and `audit-spec`"
+            );
+            let target_val = if has_underscore {
+                obj["audit_spec"].clone()
+            } else if has_hyphen {
+                obj["audit-spec"].clone()
+            } else {
+                val
+            };
+            let raw: RawAuditSpecSection = serde_json::from_value(target_val)
+                .context("Invalid schema in JSON audit-spec config")?;
+            return raw.into_policy_config().map(Some);
+        }
+        let doc: toml::Table =
+            toml::from_str(trimmed).context("Malformed TOML in project/audit-spec config")?;
+        let has_underscore = doc.contains_key("audit_spec");
+        let has_hyphen = doc.contains_key("audit-spec");
+        anyhow::ensure!(
+            !(has_underscore && has_hyphen),
+            "TOML config cannot specify both `[audit_spec]` and `[audit-spec]`"
+        );
+        let Some(sec_val) = doc
+            .get("audit_spec")
+            .or_else(|| doc.get("audit-spec"))
+            .cloned()
+            .or_else(|| allow_top_level_toml.then_some(toml::Value::Table(doc)))
+        else {
+            return Ok(None);
+        };
+        let raw: RawAuditSpecSection = sec_val
+            .try_into()
+            .context("Invalid schema in `[audit_spec]` TOML section")?;
+        raw.into_policy_config().map(Some)
     }
 
     pub fn parse_config_str(text: &str) -> Option<Self> {
-        use crate::shm_cache::{
-            for_each_toml_entry, parse_relaxed_bool, parse_relaxed_toml_string_array,
-            unquote_toml_scalar,
-        };
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        if trimmed.starts_with('{') {
-            return serde_json::from_str::<Self>(trimmed).ok();
-        }
-        let (mut cfg, mut in_audit_spec, mut current_rule, mut parsed_any) =
-            (Self::default(), false, None::<AuditSpecPathRule>, false);
-        for_each_toml_entry(trimmed, |section, key, val| {
-            if key.is_empty() {
-                if let Some(r) = current_rule.take().filter(|r| !r.glob_pattern.is_empty()) {
-                    cfg.path_rules.push(r);
-                }
-                let sec = section[1..section.len() - 1].trim();
-                in_audit_spec = sec == "audit_spec" || sec == "audit-spec";
-                if in_audit_spec {
-                    parsed_any = true;
-                } else if let Some(rest) = sec
-                    .strip_prefix("audit_spec.path_rules.")
-                    .or_else(|| sec.strip_prefix("audit-spec.path_rules."))
-                {
-                    parsed_any = true;
-                    current_rule = Some(AuditSpecPathRule {
-                        glob_pattern: unquote_toml_scalar(rest),
-                        forbid_decl_kinds: Vec::new(),
-                        allow_decl_names: Vec::new(),
-                        forbid_namespaces: Vec::new(),
-                    });
-                }
-                return;
-            }
-            if let Some(ref mut rule) = current_rule {
-                match key {
-                    "forbid_decl_kinds" => {
-                        rule.forbid_decl_kinds = parse_relaxed_toml_string_array(val)
-                    }
-                    "allow_decl_names" => {
-                        rule.allow_decl_names = parse_relaxed_toml_string_array(val)
-                    }
-                    "forbid_namespaces" => {
-                        rule.forbid_namespaces = parse_relaxed_toml_string_array(val)
-                    }
-                    _ => {}
-                }
-            } else if in_audit_spec {
-                match key {
-                    "policy" => {
-                        let preset = Self::from_preset(&unquote_toml_scalar(val));
-                        cfg.policy = preset.policy;
-                        cfg.reject_conjunct_tautologies = preset.reject_conjunct_tautologies;
-                        cfg.reject_definitional_lowering_tautology =
-                            preset.reject_definitional_lowering_tautology;
-                        cfg.reject_identity_stubs = preset.reject_identity_stubs;
-                        cfg.reject_unused_param_defs = preset.reject_unused_param_defs;
-                        cfg.reject_size_only_parsers = preset.reject_size_only_parsers;
-                        for pr in preset.path_rules {
-                            if !cfg
-                                .path_rules
-                                .iter()
-                                .any(|r| r.glob_pattern == pr.glob_pattern)
-                            {
-                                cfg.path_rules.push(pr);
-                            }
-                        }
-                    }
-                    "reject_conjunct_tautologies" => {
-                        cfg.reject_conjunct_tautologies =
-                            parse_relaxed_bool(val).unwrap_or(cfg.reject_conjunct_tautologies);
-                    }
-                    "reject_definitional_lowering_tautology" => {
-                        cfg.reject_definitional_lowering_tautology = parse_relaxed_bool(val)
-                            .unwrap_or(cfg.reject_definitional_lowering_tautology);
-                    }
-                    "reject_identity_stubs" => {
-                        cfg.reject_identity_stubs =
-                            parse_relaxed_bool(val).unwrap_or(cfg.reject_identity_stubs);
-                    }
-                    "reject_unused_param_defs" => {
-                        cfg.reject_unused_param_defs =
-                            parse_relaxed_bool(val).unwrap_or(cfg.reject_unused_param_defs);
-                    }
-                    "reject_size_only_parsers" => {
-                        cfg.reject_size_only_parsers =
-                            parse_relaxed_bool(val).unwrap_or(cfg.reject_size_only_parsers);
-                    }
-                    "forbid_decl_kinds" => {
-                        cfg.forbid_decl_kinds = parse_relaxed_toml_string_array(val)
-                    }
-                    "forbid_namespaces" => {
-                        cfg.forbid_namespaces = parse_relaxed_toml_string_array(val)
-                    }
-                    _ => {}
-                }
-            }
-        });
-        if let Some(r) = current_rule.take().filter(|r| !r.glob_pattern.is_empty()) {
-            cfg.path_rules.push(r);
-        }
-        parsed_any.then_some(cfg)
+        Self::try_parse_config_str(text).ok().flatten()
     }
 
     pub fn effective_forbidden_for_path(
@@ -1335,28 +1694,76 @@ impl AuditSpecPolicyConfig {
     }
 }
 
+fn segment_glob_match(pat: &str, seg: &str) -> bool {
+    match pat.split_once('*') {
+        None => pat == seg,
+        Some((head, rest)) => {
+            seg.starts_with(head)
+                && (0..=seg.len() - head.len())
+                    .filter(|i| seg.is_char_boundary(head.len() + i))
+                    .any(|i| segment_glob_match(rest, &seg[head.len() + i..]))
+        }
+    }
+}
+
+fn match_audit_glob_segments(pat_segs: &[&str], path_segs: &[&str]) -> bool {
+    if pat_segs.is_empty() {
+        return path_segs.is_empty();
+    }
+    if pat_segs[0] == "**" {
+        return match_audit_glob_segments(&pat_segs[1..], path_segs)
+            || (!path_segs.is_empty() && match_audit_glob_segments(pat_segs, &path_segs[1..]));
+    }
+    if let Some(core) = pat_segs[0]
+        .strip_prefix("**")
+        .and_then(|s| s.strip_suffix("**"))
+        .filter(|s| !s.is_empty())
+    {
+        return path_segs.iter().enumerate().any(|(idx, seg)| {
+            *seg == core
+                && (pat_segs.len() == 1
+                    || match_audit_glob_segments(&pat_segs[1..], &path_segs[idx + 1..]))
+        });
+    }
+    if path_segs.is_empty() {
+        return false;
+    }
+    segment_glob_match(pat_segs[0], path_segs[0])
+        && match_audit_glob_segments(&pat_segs[1..], &path_segs[1..])
+}
+
 pub(super) fn path_matches_audit_glob(path_str: &str, glob_pat: &str) -> bool {
-    let pat = glob_pat.trim().replace('\\', "/");
-    if pat.is_empty() || pat == "**" || pat == "*" {
+    let pat_raw = glob_pat.trim().replace('\\', "/");
+    let pat = pat_raw.trim_start_matches("./");
+    if pat.is_empty() || pat == "**" {
         return true;
     }
-    // Common proof-directory glob fast-paths (e.g. `lean/**/Proofs/**`)
-    let anchor_parts: Vec<&str> = pat
-        .split("**")
-        .map(|s| s.trim_matches('/'))
-        .filter(|s| !s.is_empty() && *s != "*")
-        .collect();
-    if anchor_parts.is_empty() {
+    let path_norm = path_str.replace('\\', "/");
+    let path_trimmed = path_norm.trim_start_matches("./");
+    let path_segs: Vec<&str> = path_trimmed.split('/').filter(|s| !s.is_empty()).collect();
+    if pat == "*" {
+        return path_segs.len() <= 1;
+    }
+    let pat_segs: Vec<&str> = pat.split('/').filter(|s| !s.is_empty()).collect();
+    if pat_segs.is_empty() {
         return true;
     }
-    let mut search_from = 0usize;
-    for part in anchor_parts {
-        let Some(pos) = path_str[search_from..].find(part) else {
-            return false;
-        };
-        search_from += pos + part.len();
+    if pat.starts_with('/') {
+        return match_audit_glob_segments(&pat_segs, &path_segs);
     }
-    true
+    // Relative globs match at the relative path root or anchored at a suffix boundary when `path_str`
+    // is an absolute filesystem path (e.g. `/abs/repo/lean/Pkg/Proofs/Foo.lean` vs `lean/**/Proofs/**`).
+    if match_audit_glob_segments(&pat_segs, &path_segs) {
+        return true;
+    }
+    if path_trimmed.starts_with('/') {
+        for start in 1..path_segs.len() {
+            if match_audit_glob_segments(&pat_segs, &path_segs[start..]) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub(super) fn is_single_conjunct_trivial(c: &str) -> bool {
@@ -1660,6 +2067,31 @@ pub(super) fn audit_referenced_local_defs_for_stubs(
     stub_findings
 }
 
+fn skip_balanced_attr_brackets(src: &str, start: usize, line_no: &mut usize) -> usize {
+    let bytes = src.as_bytes();
+    if bytes.get(start..start + 2) != Some(b"@[") {
+        return start;
+    }
+    let mut i = start + 2;
+    let mut depth = 1usize;
+    while i < src.len() && depth > 0 {
+        if let Some(span) = skip_lean_lexeme(src, i) {
+            *line_no += src[i..span.end].bytes().filter(|&b| b == b'\n').count();
+            i = span.end;
+            continue;
+        }
+        let ch = src[i..].chars().next().unwrap();
+        match ch {
+            '[' => depth += 1,
+            ']' => depth -= 1,
+            '\n' => *line_no += 1,
+            _ => {}
+        }
+        i += ch.len_utf8();
+    }
+    i
+}
+
 pub(super) fn audit_forbidden_scope_declarations(
     clean_src: &str,
     forbid_kinds: &[String],
@@ -1669,89 +2101,395 @@ pub(super) fn audit_forbidden_scope_declarations(
     if forbid_kinds.is_empty() && forbid_namespaces.is_empty() {
         return Vec::new();
     }
+    let src = strip_audit_comments(clean_src);
+    let bytes = src.as_bytes();
     let mut violations = Vec::new();
     let mut current_ns = String::new();
-    for (idx, raw_line) in clean_src.lines().enumerate() {
-        let ln = idx + 1;
-        let mut line = raw_line.trim();
-        if line.is_empty() {
-            continue;
+    let mut line_start = 0usize;
+    let mut line_no = 1usize;
+    let skip_ws_inline = |mut pos: usize| -> usize {
+        while pos < bytes.len() && matches!(bytes[pos], b' ' | b'\t' | b'\r') {
+            pos += 1;
         }
-        if let Some(ns_rest) = line.strip_prefix("namespace ") {
-            let ns = ns_rest.split_whitespace().next().unwrap_or("").trim();
-            if !ns.is_empty() {
-                current_ns = if current_ns.is_empty() {
-                    ns.to_string()
-                } else {
-                    format!("{}.{}", current_ns, ns)
-                };
-                for fns in forbid_namespaces {
-                    if current_ns == *fns
-                        || ns == fns.as_str()
-                        || current_ns.starts_with(&format!("{}.", fns))
-                    {
-                        violations.push(format!(
-                            "L{}: forbidden namespace `{}` opened in restricted scope",
-                            ln, current_ns
-                        ));
-                        break;
-                    }
-                }
+        pos
+    };
+    let skip_ws_multiline = |mut pos: usize, ln: &mut usize| -> usize {
+        while pos < bytes.len() && bytes[pos].is_ascii_whitespace() {
+            if bytes[pos] == b'\n' {
+                *ln += 1;
             }
-            continue;
+            pos += 1;
         }
-        if line == "end" || line.starts_with("end ") {
-            let end_ns = line.strip_prefix("end").unwrap_or("").trim();
-            if end_ns.is_empty() || current_ns == end_ns {
-                current_ns.clear();
-            } else if let Some(prefix) = current_ns.strip_suffix(&format!(".{}", end_ns)) {
-                current_ns = prefix.to_string();
-            }
-            continue;
+        pos
+    };
+    let read_word_or_guillemet = |pos: usize| -> Option<(String, usize)> {
+        if pos >= src.len() {
+            return None;
         }
-        loop {
-            let mut stripped = false;
-            for pfx in [
-                "private ",
-                "protected ",
-                "@[inline] ",
-                "@[reducible] ",
-                "@[simp] ",
-                "noncomputable ",
-                "scoped ",
-                "local ",
-            ] {
-                if let Some(rest) = line.strip_prefix(pfx) {
-                    line = rest.trim();
-                    stripped = true;
-                }
+        if src[pos..].starts_with('«') {
+            if let Some(span) = skip_lean_lexeme(&src, pos) {
+                return Some((src[pos..span.end].to_string(), span.end));
             }
-            if !stripped {
+        }
+        let first = src[pos..].chars().next()?;
+        if !is_ident_start(first) {
+            return None;
+        }
+        let mut end = pos + first.len_utf8();
+        while end < src.len() {
+            let c = src[end..].chars().next().unwrap();
+            if is_ident_continue(c) {
+                end += c.len_utf8();
+            } else {
                 break;
             }
         }
-        for fk in forbid_kinds {
-            let kw_space = format!("{} ", fk.trim());
-            if line.starts_with(&kw_space) {
-                let decl_name = line[kw_space.len()..]
-                    .split(|c: char| c.is_whitespace() || c == '(' || c == '{' || c == ':')
-                    .next()
-                    .unwrap_or("<anon>");
-                if allow_decl_names.iter().any(|a| a == decl_name) {
+        Some((src[pos..end].to_string(), end))
+    };
+    let advance_to_next_line = |mut pos: usize, ln: &mut usize| -> usize {
+        while pos < src.len() {
+            if let Some(span) = skip_lean_lexeme(&src, pos) {
+                if span.is_comment || span.is_literal {
+                    *ln += src[pos..span.end].bytes().filter(|&b| b == b'\n').count();
+                    pos = span.end;
                     continue;
                 }
-                violations.push(format!(
-                    "L{}: forbidden `{}` declaration `{}` in restricted scope",
-                    ln,
-                    fk.trim(),
-                    decl_name
-                ));
+            }
+            if bytes[pos] == b'\n' {
+                *ln += 1;
+                return pos + 1;
+            }
+            pos += src[pos..].chars().next().unwrap().len_utf8();
+        }
+        src.len()
+    };
+
+    while line_start < src.len() {
+        let mut pos = skip_ws_inline(line_start);
+        if pos >= src.len() {
+            break;
+        }
+        if bytes[pos] == b'\n' {
+            line_no += 1;
+            line_start = pos + 1;
+            continue;
+        }
+        if let Some(span) = skip_lean_lexeme(&src, pos) {
+            if span.is_comment || span.is_literal {
+                line_start = advance_to_next_line(pos, &mut line_no);
+                continue;
             }
         }
+
+        // Consume any chain of `@[...]` attributes and declaration modifiers (`private`, `protected`,
+        // `noncomputable`, `partial`, `unsafe`, `scoped`, `local`), including across newlines.
+        let mut cur_ln = line_no;
+        loop {
+            pos = skip_ws_inline(pos);
+            if pos + 1 < bytes.len() && &bytes[pos..pos + 2] == b"@[" {
+                pos = skip_balanced_attr_brackets(&src, pos, &mut cur_ln);
+                pos = skip_ws_multiline(pos, &mut cur_ln);
+                continue;
+            }
+            if let Some((kw, next_pos)) = read_word_or_guillemet(pos) {
+                if matches!(
+                    kw.as_str(),
+                    "private"
+                        | "protected"
+                        | "noncomputable"
+                        | "partial"
+                        | "unsafe"
+                        | "scoped"
+                        | "local"
+                ) && (next_pos >= bytes.len()
+                    || bytes[next_pos].is_ascii_whitespace()
+                    || bytes.get(next_pos..next_pos + 2) == Some(b"@["))
+                {
+                    pos = skip_ws_multiline(next_pos, &mut cur_ln);
+                    continue;
+                }
+            }
+            break;
+        }
+
+        let decl_ln = cur_ln;
+        if let Some((kw, after_kw)) = read_word_or_guillemet(pos) {
+            let boundary_ok = after_kw >= src.len()
+                || src[after_kw..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_whitespace());
+            if kw == "namespace" && boundary_ok {
+                let ns_pos = skip_ws_inline(after_kw);
+                let line_end = src[ns_pos..]
+                    .find('\n')
+                    .map(|off| ns_pos + off)
+                    .unwrap_or(src.len());
+                let ns = src[ns_pos..line_end]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if !ns.is_empty() {
+                    current_ns = if current_ns.is_empty() {
+                        ns.to_string()
+                    } else {
+                        format!("{}.{}", current_ns, ns)
+                    };
+                    for fns in forbid_namespaces {
+                        if current_ns == *fns
+                            || ns == fns.as_str()
+                            || current_ns.starts_with(&format!("{}.", fns))
+                        {
+                            violations.push(format!(
+                                "L{}: forbidden namespace `{}` opened in restricted scope",
+                                decl_ln, current_ns
+                            ));
+                            break;
+                        }
+                    }
+                }
+                line_no = cur_ln;
+                line_start = advance_to_next_line(after_kw, &mut line_no);
+                continue;
+            }
+            if kw == "end" && (after_kw >= src.len() || bytes[after_kw] == b'\n' || boundary_ok) {
+                let end_pos = skip_ws_inline(after_kw);
+                let line_end = src[end_pos..]
+                    .find('\n')
+                    .map(|off| end_pos + off)
+                    .unwrap_or(src.len());
+                let end_ns = src[end_pos..line_end]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                if end_ns.is_empty() || current_ns == end_ns {
+                    current_ns.clear();
+                } else if let Some(prefix) = current_ns.strip_suffix(&format!(".{}", end_ns)) {
+                    current_ns = prefix.to_string();
+                }
+                line_no = cur_ln;
+                line_start = advance_to_next_line(after_kw, &mut line_no);
+                continue;
+            }
+            if boundary_ok {
+                for fk in forbid_kinds {
+                    let fk_trim = fk.trim();
+                    if !fk_trim.is_empty() && kw == fk_trim {
+                        let name_pos = skip_ws_multiline(after_kw, &mut cur_ln);
+                        let line_end = src[name_pos..]
+                            .find('\n')
+                            .map(|off| name_pos + off)
+                            .unwrap_or(src.len());
+                        let decl_name =
+                            if let Some((dn, mut dend)) = read_word_or_guillemet(name_pos) {
+                                let mut full = dn;
+                                while dend < line_end && bytes[dend] == b'.' {
+                                    if let Some((seg, next_d)) = read_word_or_guillemet(dend + 1) {
+                                        full.push('.');
+                                        full.push_str(&seg);
+                                        dend = next_d;
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                full
+                            } else {
+                                src[name_pos..line_end]
+                                    .split(|c: char| {
+                                        c.is_whitespace() || matches!(c, '(' | '{' | '[' | ':')
+                                    })
+                                    .next()
+                                    .filter(|s| !s.is_empty())
+                                    .unwrap_or("<anon>")
+                                    .to_string()
+                            };
+                        let canon_decl = crate::splitter::canonical_lean_name_component(&decl_name);
+                        let allowed = allow_decl_names.iter().any(|a| {
+                            a == &decl_name
+                                || crate::splitter::canonical_lean_name_component(a) == canon_decl
+                        });
+                        if !allowed {
+                            violations.push(format!(
+                                "L{}: forbidden `{}` declaration `{}` in restricted scope",
+                                decl_ln, fk_trim, decl_name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        line_no = cur_ln;
+        line_start = advance_to_next_line(pos, &mut line_no);
     }
     violations
 }
 
+/// Build specialized copies of `decl` that alias compatible value binders (`y := x`) or pin scalar
+/// binders to concrete boundary constants (`0`, `1`), allowing `eval_extracted_decl_in_memory` to
+/// find concrete satisfying assignments on measure-zero diagonal/relational preconditions (such as
+/// injectivity `f x = f y → x = y`) without falsely flagging them as `vacuous_precondition`.
+fn probe_diagonal_and_boundary_precondition_satisfiability(
+    decl: &ExtractedDecl,
+) -> Option<(u64, u64, String)> {
+    let mut typed_params: Vec<(String, String)> = Vec::new();
+    for (names, ty) in &decl.binders {
+        if is_known_binder_value_type(ty) {
+            let norm_ty = ty.trim().to_string();
+            for n in names {
+                typed_params.push((n.clone(), norm_ty.clone()));
+            }
+        }
+    }
+    if typed_params.is_empty() {
+        return None;
+    }
+
+    let make_substituted_decl = |substs: &[(&str, &str)]| -> ExtractedDecl {
+        let drop_names: std::collections::HashSet<&str> =
+            substs.iter().map(|(from, _)| *from).collect();
+        let apply_all = |s: &str| -> String {
+            let mut cur = s.to_string();
+            for (from, to) in substs {
+                cur = replace_ident_boundary(&cur, from, to);
+            }
+            cur
+        };
+        let mut new_binders = Vec::new();
+        for (names, ty) in &decl.binders {
+            if is_known_binder_value_type(ty) {
+                let kept: Vec<String> = names
+                    .iter()
+                    .filter(|n| !drop_names.contains(n.as_str()))
+                    .cloned()
+                    .collect();
+                if !kept.is_empty() {
+                    new_binders.push((kept, ty.clone()));
+                }
+            } else {
+                new_binders.push((names.clone(), apply_all(ty)));
+            }
+        }
+        ExtractedDecl {
+            name: decl.name.clone(),
+            binders: new_binders,
+            prop_str: apply_all(&decl.prop_str),
+        }
+    };
+
+    // 1. Pairwise equal-type diagonal specializations (`y := x`).
+    if typed_params.len() >= 2 && typed_params.len() <= 12 {
+        for i in 0..typed_params.len() {
+            for j in (i + 1)..typed_params.len() {
+                if typed_params[i].1 == typed_params[j].1 {
+                    let lhs_var = typed_params[i].0.as_str();
+                    let rhs_var = typed_params[j].0.as_str();
+                    let specialized = make_substituted_decl(&[(rhs_var, lhs_var)]);
+                    if let Some((d_rep, _, _)) = eval_extracted_decl_in_memory(&specialized, 256) {
+                        if d_rep.satisfied_preconditions > 0 {
+                            return Some((
+                                d_rep.satisfied_preconditions,
+                                d_rep.n_states,
+                                format!("{}={}", rhs_var, lhs_var),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        // Full same-type collapse (`v_k := v_0` for all binders sharing a type).
+        let mut collapse_substs: Vec<(&str, &str)> = Vec::new();
+        for idx in 1..typed_params.len() {
+            if let Some((canon, _)) = typed_params[..idx]
+                .iter()
+                .find(|(_, t)| *t == typed_params[idx].1)
+            {
+                collapse_substs.push((typed_params[idx].0.as_str(), canon.as_str()));
+            }
+        }
+        if collapse_substs.len() >= 2 {
+            let specialized = make_substituted_decl(&collapse_substs);
+            if let Some((d_rep, _, _)) = eval_extracted_decl_in_memory(&specialized, 256) {
+                if d_rep.satisfied_preconditions > 0 {
+                    let label = collapse_substs
+                        .iter()
+                        .map(|(a, b)| format!("{}={}", a, b))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    return Some((d_rep.satisfied_preconditions, d_rep.n_states, label));
+                }
+            }
+        }
+    }
+
+    // 2. Single-parameter boundary specializations (`x := 0`, `x := 1`, `x := true`, `x := false`).
+    for (p_name, p_ty) in &typed_params[..typed_params.len().min(6)] {
+        let candidates: &[&str] = if p_ty == "Bool" {
+            &["false", "true"]
+        } else if p_ty.contains("256") {
+            &["Word256.zero", "Word256.one"]
+        } else {
+            &["0", "1"]
+        };
+        for &lit in candidates {
+            let specialized = make_substituted_decl(&[(p_name.as_str(), lit)]);
+            if let Some((b_rep, _, _)) = eval_extracted_decl_in_memory(&specialized, 64) {
+                if b_rep.satisfied_preconditions > 0 {
+                    return Some((
+                        b_rep.satisfied_preconditions,
+                        b_rep.n_states,
+                        format!("{}={}", p_name, lit),
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Probe whether the postcondition alone (with hypotheses dropped) is falsified by at least one
+/// evaluated state in `eval_extracted_decl_in_memory`, returning a concrete refuting witness string
+/// when found (`eval_refuted_postcondition(...)`).
+fn probe_concrete_postcondition_refutation(
+    decl: &ExtractedDecl,
+    conclusion_str: &str,
+) -> Option<String> {
+    let value_binders: Vec<(Vec<String>, String)> = decl
+        .binders
+        .iter()
+        .filter(|(_, ty)| is_known_binder_value_type(ty))
+        .cloned()
+        .collect();
+    if value_binders.is_empty() {
+        return None;
+    }
+    let post_only_decl = ExtractedDecl {
+        name: decl.name.clone(),
+        binders: value_binders,
+        prop_str: conclusion_str.to_string(),
+    };
+    let (rep, _, _) = eval_extracted_decl_in_memory(&post_only_decl, 256)?;
+    if rep.violations > 0 {
+        if let Some(ce) = rep.counterexample {
+            let assign = ce
+                .bindings
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Some(format!(
+                "eval_refuted_postcondition(violations={}/{}; {})",
+                rep.violations, rep.n_states, assign
+            ));
+        }
+        return Some(format!(
+            "eval_refuted_postcondition(violations={}/{})",
+            rep.violations, rep.n_states
+        ));
+    }
+    None
+}
 /// Audit a single extracted theorem declaration for vacuous preconditions and postcondition tightness.
 pub(super) fn audit_single_decl_spec(decl: &ExtractedDecl) -> (bool, bool, String) {
     audit_single_decl_spec_with_defs(decl, &[]).0
@@ -1858,17 +2596,35 @@ pub(super) fn audit_single_decl_spec_full_with_policy(
             .join(" → ");
     }
 
-    let mut pos_witness = "precondition_satisfiable(unconstrained_or_symbolic)".to_string();
+    let mut pos_witness = if hyp_strings.is_empty() {
+        "unconstrained_domain(no_preconditions)".to_string()
+    } else {
+        "heuristic_unverified_precondition(non_executable_domain)".to_string()
+    };
     let mut droppable_hyps = Vec::new();
     if !is_vacuous && !hyp_strings.is_empty() {
         if let Some((rep, _, _)) = eval_extracted_decl_in_memory(&unfolded_decl, 256) {
+            let mut effective_satisfied = rep.satisfied_preconditions;
             if rep.vacuous_precondition_warning || rep.satisfied_preconditions == 0 {
-                is_vacuous = true;
+                if let Some((diag_sat, diag_total, diag_label)) =
+                    probe_diagonal_and_boundary_precondition_satisfiability(&unfolded_decl)
+                {
+                    effective_satisfied = diag_sat;
+                    pos_witness = format!(
+                        "satisfied_states={}/{} (diagonal_or_boundary: {})",
+                        diag_sat, diag_total, diag_label
+                    );
+                } else {
+                    is_vacuous = true;
+                    pos_witness = format!("none(0/{}_sampled_states_satisfied)", rep.n_states);
+                }
             } else {
                 pos_witness = format!(
                     "satisfied_states={}/{}",
                     rep.satisfied_preconditions, rep.n_states
                 );
+            }
+            if !is_vacuous && effective_satisfied > 0 {
                 // Hypothesis-drop mutation probe: drop each non-value binder hypothesis one by one
                 // and check whether the postcondition still holds across all 256 states and has no
                 // variable overlap with the conclusion (indicating a redundant hypothesis).
@@ -1900,7 +2656,9 @@ pub(super) fn audit_single_decl_spec_full_with_policy(
                                 let disjoint =
                                     !hyp_vars.is_empty() && hyp_vars.is_disjoint(&concl_vars);
                                 if disjoint
-                                    || m_rep.satisfied_preconditions > rep.satisfied_preconditions
+                                    || (rep.satisfied_preconditions > 0
+                                        && m_rep.satisfied_preconditions
+                                            > rep.satisfied_preconditions)
                                 {
                                     droppable_hyps.push(format!("{}: {}", decl.name, ty.trim()));
                                 }
@@ -1910,6 +2668,8 @@ pub(super) fn audit_single_decl_spec_full_with_policy(
                 }
             }
         }
+    } else if is_vacuous {
+        pos_witness = "none(syntactically_contradictory_precondition)".to_string();
     }
 
     let concl_imp_segments = split_top_level_implications(&conclusion_str);
@@ -1950,7 +2710,16 @@ pub(super) fn audit_single_decl_spec_full_with_policy(
     let has_pos_witness = !is_vacuous;
     let has_neg_witness = !is_trivial_conclusion;
     let neg_witness = if has_neg_witness {
-        format!("postcondition_discriminates({})", conclusion_str)
+        if let Some(concrete_refutation) =
+            probe_concrete_postcondition_refutation(&unfolded_decl, &conclusion_str)
+        {
+            concrete_refutation
+        } else {
+            format!(
+                "heuristic_unverified_postcondition_non_trivial({})",
+                conclusion_str
+            )
+        }
     } else if is_whole_trivial {
         "none(tautological_postcondition)".to_string()
     } else if !stub_findings.is_empty() {
@@ -1993,10 +2762,55 @@ pub(super) fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<Ex
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 14;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 15;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
+
+fn cli_global_cache_dir_override() -> Option<PathBuf> {
+    let mut args = std::env::args_os().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            break;
+        }
+        if arg == "--cache-dir" {
+            if let Some(val) = args.next().filter(|v| !v.is_empty()) {
+                return Some(PathBuf::from(val));
+            }
+        } else if let Some(s) = arg.to_str() {
+            if let Some(rest) = s
+                .strip_prefix("--cache-dir=")
+                .filter(|v| !v.trim().is_empty())
+            {
+                return Some(PathBuf::from(rest.trim()));
+            }
+        }
+    }
+    None
+}
+
+fn ensure_private_cache_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(dir)?;
+        let meta = fs::symlink_metadata(dir)?;
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "audit-spec cache directory must not be a symlink",
+            ));
+        }
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(dir)
+    }
+}
 
 pub(super) fn resolve_audit_spec_cache_dir() -> Option<PathBuf> {
     if std::env::var("TURBO_LEAN_NO_AUDIT_CACHE")
@@ -2005,12 +2819,27 @@ pub(super) fn resolve_audit_spec_cache_dir() -> Option<PathBuf> {
     {
         return None;
     }
-    let dir = std::env::var("TURBO_LEAN_AUDIT_CACHE_DIR")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/turbo-lean-audit-spec-cache-v1"));
+    let non_empty_env = |key: &str| -> Option<PathBuf> {
+        std::env::var(key)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+    };
+    let dir = if let Some(explicit) = non_empty_env("TURBO_LEAN_AUDIT_CACHE_DIR") {
+        explicit
+    } else if let Some(cli_cache) = cli_global_cache_dir_override() {
+        cli_cache.join("audit-spec-cache-v1")
+    } else if let Some(cache_base) = non_empty_env("TURBO_LEAN_CACHE_DIR") {
+        cache_base.join("audit-spec-cache-v1")
+    } else if let Some(home_base) = non_empty_env("TURBO_LEAN_HOME") {
+        home_base.join("audit-spec-cache-v1")
+    } else {
+        let staging = crate::shm_cache::staging_shm_dir();
+        let _ = ensure_private_cache_dir(&staging);
+        staging.join("audit-spec-cache-v1")
+    };
+    ensure_private_cache_dir(&dir).ok()?;
     Some(dir)
 }
 
@@ -2076,7 +2905,7 @@ pub(super) fn write_audit_spec_cache_atomic(target: &Path, report: &serde_json::
     let Some(parent) = target.parent() else {
         return;
     };
-    if fs::create_dir_all(parent).is_err() {
+    if ensure_private_cache_dir(parent).is_err() {
         return;
     }
     let Ok(bytes) = serde_json::to_vec(report) else {
@@ -2107,6 +2936,41 @@ pub(super) fn write_audit_spec_cache_atomic(target: &Path, report: &serde_json::
     }
 }
 
+fn build_audit_spec_error_report(
+    file: &Path,
+    decl_filter: Option<&str>,
+    err_msg: impl Into<String>,
+) -> serde_json::Value {
+    let msg = err_msg.into();
+    serde_json::json!({
+        "status": "error",
+        "ok": false,
+        "verdict": "error",
+        "error": msg,
+        "policy": "error",
+        "file": file.display().to_string(),
+        "decl": decl_filter.unwrap_or("file"),
+        "total_specs_audited": 0,
+        "vacuous_specs": 0,
+        "trivial_specs": 0,
+        "tight_specs": 0,
+        "vacuous": false,
+        "vacuous_spec_names": [],
+        "trivial_spec_names": [],
+        "shadowed_constants": [],
+        "forbidden_scope_decls": [],
+        "stub_defs": [],
+        "unused_private_decls": [],
+        "horizontal_packing_warnings": [],
+        "droppable_hypotheses": [],
+        "warnings": [],
+        "specs": [],
+        "cache_hit": false,
+        "elapsed_ms": 0.0,
+        "ms": 0.0,
+    })
+}
+
 /// Unified specification & hygiene audit across `file` (or `inline_src`):
 /// - **Tier 1 (Blocking, `"ok": false` if any > 0)**: `vacuous_specs`, `trivial_specs`, `shadowed_constants`, `forbidden_scope_decls`, `stub_defs`.
 /// - **Tier 2 (Advisory, `"warnings"` only, non-blocking)**: `unused_private_decls`, `horizontal_packing_warnings`.
@@ -2115,8 +2979,10 @@ pub fn audit_spec_file_or_source(
     inline_src: Option<&str>,
     decl_filter: Option<&str>,
 ) -> serde_json::Value {
-    let policy = AuditSpecPolicyConfig::load_for_target(file, None, None, &[], &[]);
-    audit_spec_file_or_source_with_policy(file, inline_src, decl_filter, &policy)
+    match AuditSpecPolicyConfig::try_load_for_target(file, None, None, &[], &[]) {
+        Ok(policy) => audit_spec_file_or_source_with_policy(file, inline_src, decl_filter, &policy),
+        Err(err) => build_audit_spec_error_report(file, decl_filter, format!("{:#}", err)),
+    }
 }
 
 pub fn audit_spec_file_or_source_with_policy(
@@ -2354,18 +3220,31 @@ pub fn audit_spec_file_or_source_with_policy(
             .iter()
             .map(|dh| format!("droppable_hypothesis: {}", dh)),
     );
+    let decl_missing =
+        decl_filter.is_some_and(|df| !df.trim().is_empty()) && total_specs_audited == 0;
     if total_specs_audited == 0 {
-        warnings.push(format!(
-            "no_specs_found: 0 theorem/lemma specifications recognized in {}",
-            file.display()
-        ));
+        if let Some(df) = decl_filter.filter(|df| !df.trim().is_empty()) {
+            warnings.push(format!(
+                "decl_not_found: declaration `{}` was not found in {}",
+                df,
+                file.display()
+            ));
+        } else {
+            warnings.push(format!(
+                "no_specs_found: 0 theorem/lemma specifications recognized in {}",
+                file.display()
+            ));
+        }
     }
-    let tier1_clean = vacuous_specs == 0
+    let tier1_clean = !decl_missing
+        && vacuous_specs == 0
         && trivial_specs == 0
         && shadowed_constants.is_empty()
         && forbidden_scope_decls.is_empty()
         && stub_defs.is_empty();
-    let verdict = if total_specs_audited == 0 {
+    let verdict = if decl_missing {
+        "decl_not_found"
+    } else if total_specs_audited == 0 {
         "no_specs_found"
     } else {
         "specs_audited"
@@ -2403,62 +3282,12 @@ pub fn audit_spec_file_or_source_with_policy(
     report
 }
 
-/// Audit theorem specifications across multiple `files` concurrently and merge into a unified report.
-pub fn audit_spec_files(files: &[PathBuf], decl_filter: Option<&str>) -> serde_json::Value {
-    let policy = files
-        .first()
-        .map(|f| AuditSpecPolicyConfig::load_for_target(f, None, None, &[], &[]))
-        .unwrap_or_default();
-    audit_spec_files_with_policy(files, decl_filter, &policy)
-}
-
-pub fn audit_spec_files_with_policy(
-    files: &[PathBuf],
+fn aggregate_audit_spec_reports(
+    per_file_reports: Vec<serde_json::Value>,
     decl_filter: Option<&str>,
-    policy: &AuditSpecPolicyConfig,
+    fallback_policy_label: Option<&str>,
+    t0: Instant,
 ) -> serde_json::Value {
-    if files.len() == 1 {
-        return audit_spec_file_or_source_with_policy(&files[0], None, decl_filter, policy);
-    }
-    let t0 = Instant::now();
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(files.len().max(1));
-    let next_idx = std::sync::atomic::AtomicUsize::new(0);
-    let per_file_reports: Vec<serde_json::Value> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                let next_ref = &next_idx;
-                s.spawn(move || {
-                    let mut local = Vec::new();
-                    loop {
-                        let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= files.len() {
-                            break;
-                        }
-                        local.push((
-                            i,
-                            audit_spec_file_or_source_with_policy(
-                                &files[i],
-                                None,
-                                decl_filter,
-                                policy,
-                            ),
-                        ));
-                    }
-                    local
-                })
-            })
-            .collect();
-        let mut indexed: Vec<(usize, serde_json::Value)> = handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
-            .collect();
-        indexed.sort_by_key(|(i, _)| *i);
-        indexed.into_iter().map(|(_, r)| r).collect()
-    });
-
     let mut total_specs_audited = 0usize;
     let mut vacuous_specs = 0usize;
     let mut trivial_specs = 0usize;
@@ -2474,13 +3303,16 @@ pub fn audit_spec_files_with_policy(
     let mut warnings = Vec::new();
     let mut spec_details = Vec::new();
     let mut file_labels = Vec::new();
+    let mut policy_labels: Vec<String> = Vec::new();
     let mut cache_hits = 0usize;
 
+    let has_decl_filter = decl_filter.is_some_and(|df| !df.trim().is_empty());
     let mut any_report_error = false;
     let mut error_messages = Vec::new();
+    let mut decl_not_found_warnings = Vec::new();
     for rep in &per_file_reports {
         if rep["status"].as_str() == Some("error")
-            || rep["ok"].as_bool() == Some(false) && rep["verdict"].as_str() == Some("error")
+            || (rep["ok"].as_bool() == Some(false) && rep["verdict"].as_str() == Some("error"))
         {
             any_report_error = true;
             if let Some(em) = rep["error"].as_str() {
@@ -2489,6 +3321,11 @@ pub fn audit_spec_files_with_policy(
         }
         if let Some(f) = rep["file"].as_str() {
             file_labels.push(f.to_string());
+        }
+        if let Some(p) = rep["policy"].as_str() {
+            if !policy_labels.iter().any(|x| x == p) {
+                policy_labels.push(p.to_string());
+            }
         }
         if rep["cache_hit"].as_bool() == Some(true) {
             cache_hits += 1;
@@ -2522,14 +3359,26 @@ pub fn audit_spec_files_with_policy(
             droppable_hypotheses.extend(arr.iter().cloned());
         }
         if let Some(arr) = rep["warnings"].as_array() {
-            warnings.extend(arr.iter().cloned());
+            for w in arr {
+                if has_decl_filter && w.as_str().is_some_and(|s| s.starts_with("decl_not_found:")) {
+                    decl_not_found_warnings.push(w.clone());
+                } else {
+                    warnings.push(w.clone());
+                }
+            }
         }
         if let Some(arr) = rep["specs"].as_array() {
             spec_details.extend(arr.iter().cloned());
         }
     }
 
+    let batch_decl_missing = has_decl_filter && total_specs_audited == 0;
+    if batch_decl_missing {
+        warnings.extend(decl_not_found_warnings);
+    }
+
     let tier1_clean = !any_report_error
+        && !batch_decl_missing
         && vacuous_specs == 0
         && trivial_specs == 0
         && shadowed_constants.is_empty()
@@ -2538,23 +3387,40 @@ pub fn audit_spec_files_with_policy(
     let all_cache_hit = !per_file_reports.is_empty() && cache_hits == per_file_reports.len();
     let batch_verdict = if any_report_error {
         "error"
+    } else if batch_decl_missing {
+        "decl_not_found"
     } else if total_specs_audited == 0 {
         "no_specs_found"
     } else {
         "specs_audited"
     };
     if !any_report_error && total_specs_audited == 0 && warnings.is_empty() {
-        warnings.push(serde_json::json!(format!(
-            "no_specs_found: 0 theorem/lemma specifications recognized in {}",
-            file_labels.join(", ")
-        )));
+        if let Some(df) = decl_filter.filter(|df| !df.trim().is_empty()) {
+            warnings.push(serde_json::json!(format!(
+                "decl_not_found: declaration `{}` was not found in {}",
+                df,
+                file_labels.join(", ")
+            )));
+        } else {
+            warnings.push(serde_json::json!(format!(
+                "no_specs_found: 0 theorem/lemma specifications recognized in {}",
+                file_labels.join(", ")
+            )));
+        }
     }
+    let summary_policy = if policy_labels.len() == 1 {
+        policy_labels.remove(0)
+    } else if policy_labels.len() > 1 {
+        "mixed".to_string()
+    } else {
+        fallback_policy_label.unwrap_or("default").to_string()
+    };
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     let mut out = serde_json::json!({
         "status": if any_report_error { "error" } else { "ok" },
         "ok": tier1_clean,
         "verdict": batch_verdict,
-        "policy": policy.policy,
+        "policy": summary_policy,
         "file": file_labels.join(", "),
         "files": file_labels,
         "file_reports": per_file_reports,
@@ -2583,6 +3449,175 @@ pub fn audit_spec_files_with_policy(
         out["error"] = serde_json::json!(error_messages.join("; "));
     }
     out
+}
+
+fn expand_audit_spec_targets(files: &[PathBuf]) -> Vec<(PathBuf, Option<String>)> {
+    let mut expanded = Vec::with_capacity(files.len());
+    for f in files {
+        if f.is_dir() {
+            let sub = crate::lake_build::collect_lean_files(f);
+            if sub.is_empty() {
+                expanded.push((
+                    f.clone(),
+                    Some(format!("No readable Lean files found in {}", f.display())),
+                ));
+            } else {
+                for p in sub {
+                    expanded.push((p, None));
+                }
+            }
+        } else {
+            expanded.push((f.clone(), None));
+        }
+    }
+    expanded
+}
+
+fn audit_spec_files_resolving_per_target(
+    files: &[PathBuf],
+    decl_filter: Option<&str>,
+    policy_override: Option<&str>,
+    config_override: Option<&Path>,
+    forbid_namespaces: &[String],
+    forbid_decl_kinds: &[String],
+) -> serde_json::Value {
+    if files.len() == 1 && !files[0].is_dir() {
+        let f = &files[0];
+        return match AuditSpecPolicyConfig::try_load_for_target(
+            f,
+            policy_override,
+            config_override,
+            forbid_namespaces,
+            forbid_decl_kinds,
+        ) {
+            Ok(pol) => audit_spec_file_or_source_with_policy(f, None, decl_filter, &pol),
+            Err(err) => build_audit_spec_error_report(f, decl_filter, format!("{:#}", err)),
+        };
+    }
+    let t0 = Instant::now();
+    let targets = expand_audit_spec_targets(files);
+    if targets.len() == 1 {
+        let (f, maybe_err) = &targets[0];
+        if let Some(err_msg) = maybe_err {
+            return build_audit_spec_error_report(f, decl_filter, err_msg.clone());
+        }
+    }
+    let targets_slice = targets.as_slice();
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(targets_slice.len().max(1));
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let per_file_reports: Vec<serde_json::Value> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let next_ref = &next_idx;
+                s.spawn(move || {
+                    let mut local = Vec::new();
+                    loop {
+                        let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= targets_slice.len() {
+                            break;
+                        }
+                        let (f, maybe_err) = &targets_slice[i];
+                        let rep = if let Some(err_msg) = maybe_err {
+                            build_audit_spec_error_report(f, decl_filter, err_msg.clone())
+                        } else {
+                            match AuditSpecPolicyConfig::try_load_for_target(
+                                f,
+                                policy_override,
+                                config_override,
+                                forbid_namespaces,
+                                forbid_decl_kinds,
+                            ) {
+                                Ok(pol) => audit_spec_file_or_source_with_policy(
+                                    f,
+                                    None,
+                                    decl_filter,
+                                    &pol,
+                                ),
+                                Err(err) => build_audit_spec_error_report(
+                                    f,
+                                    decl_filter,
+                                    format!("{:#}", err),
+                                ),
+                            }
+                        };
+                        local.push((i, rep));
+                    }
+                    local
+                })
+            })
+            .collect();
+        let mut indexed: Vec<(usize, serde_json::Value)> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect();
+        indexed.sort_by_key(|(i, _)| *i);
+        indexed.into_iter().map(|(_, r)| r).collect()
+    });
+    aggregate_audit_spec_reports(per_file_reports, decl_filter, policy_override, t0)
+}
+
+/// Audit theorem specifications across multiple `files` concurrently, resolving project/policy
+/// configuration independently for each target file so multi-file batches are permutation-invariant.
+pub fn audit_spec_files(files: &[PathBuf], decl_filter: Option<&str>) -> serde_json::Value {
+    audit_spec_files_resolving_per_target(files, decl_filter, None, None, &[], &[])
+}
+
+pub fn audit_spec_files_with_policy(
+    files: &[PathBuf],
+    decl_filter: Option<&str>,
+    policy: &AuditSpecPolicyConfig,
+) -> serde_json::Value {
+    if files.len() == 1 && !files[0].is_dir() {
+        return audit_spec_file_or_source_with_policy(&files[0], None, decl_filter, policy);
+    }
+    let t0 = Instant::now();
+    let targets = expand_audit_spec_targets(files);
+    if targets.len() == 1 {
+        let (f, maybe_err) = &targets[0];
+        if let Some(err_msg) = maybe_err {
+            return build_audit_spec_error_report(f, decl_filter, err_msg.clone());
+        }
+    }
+    let targets_slice = targets.as_slice();
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(targets_slice.len().max(1));
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let per_file_reports: Vec<serde_json::Value> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                let next_ref = &next_idx;
+                s.spawn(move || {
+                    let mut local = Vec::new();
+                    loop {
+                        let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= targets_slice.len() {
+                            break;
+                        }
+                        let (f, maybe_err) = &targets_slice[i];
+                        let rep = if let Some(err_msg) = maybe_err {
+                            build_audit_spec_error_report(f, decl_filter, err_msg.clone())
+                        } else {
+                            audit_spec_file_or_source_with_policy(f, None, decl_filter, policy)
+                        };
+                        local.push((i, rep));
+                    }
+                    local
+                })
+            })
+            .collect();
+        let mut indexed: Vec<(usize, serde_json::Value)> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect();
+        indexed.sort_by_key(|(i, _)| *i);
+        indexed.into_iter().map(|(_, r)| r).collect()
+    });
+    aggregate_audit_spec_reports(per_file_reports, decl_filter, Some(&policy.policy), t0)
 }
 
 /// Audit theorem specifications in `files` for vacuous preconditions and postcondition tightness.
@@ -2624,7 +3659,12 @@ pub fn apply_require_nonempty_to_audit_report(
     if zero_total || any_sub_failed {
         if let Some(obj) = report.as_object_mut() {
             obj.insert("ok".to_string(), serde_json::json!(false));
-            if zero_total && obj.get("verdict").and_then(|v| v.as_str()) != Some("error") {
+            if zero_total
+                && !matches!(
+                    obj.get("verdict").and_then(|v| v.as_str()),
+                    Some("error" | "decl_not_found")
+                )
+            {
                 obj.insert("verdict".to_string(), serde_json::json!("no_specs_found"));
             }
         }
@@ -2642,27 +3682,38 @@ pub fn run_audit_spec_command_with_options(
     forbid_decl_kinds: &[String],
     require_nonempty: bool,
 ) -> Result<()> {
-    anyhow::ensure!(!files.is_empty(), "No files provided to audit-spec");
+    if files.is_empty() {
+        let msg = "No files provided to audit-spec";
+        if json_mode {
+            let err_rep = build_audit_spec_error_report(Path::new(""), decl_filter, msg);
+            println!("{}", serde_json::to_string_pretty(&err_rep)?);
+            std::process::exit(1);
+        }
+        anyhow::bail!("{msg}");
+    }
     for f in files {
-        anyhow::ensure!(
-            f.exists(),
-            "Failed to read {}: path does not exist",
-            f.display()
-        );
+        if !f.exists() {
+            let msg = format!("Failed to read {}: path does not exist", f.display());
+            if json_mode {
+                let err_rep = build_audit_spec_error_report(f, decl_filter, &msg);
+                println!("{}", serde_json::to_string_pretty(&err_rep)?);
+                std::process::exit(1);
+            }
+            anyhow::bail!("{msg}");
+        }
     }
     let first_file = &files[0];
-    let policy = AuditSpecPolicyConfig::load_for_target(
-        first_file,
+    let mut report = audit_spec_files_resolving_per_target(
+        files,
+        decl_filter,
         policy_override,
         config_override,
         forbid_namespaces,
         forbid_decl_kinds,
     );
-    let mut report = audit_spec_files_with_policy(files, decl_filter, &policy);
     apply_require_nonempty_to_audit_report(&mut report, require_nonempty);
-    let nonempty_failed = require_nonempty && report["ok"].as_bool() == Some(false);
+    let ok_flag = report["ok"].as_bool() == Some(true);
     if crate::mcp::should_emit_cli_telemetry() {
-        let ok_flag = report["ok"].as_bool().unwrap_or(false);
         let decl_label = decl_filter.map(String::from).unwrap_or_else(|| {
             if files.len() == 1 {
                 first_file
@@ -2704,10 +3755,13 @@ pub fn run_audit_spec_command_with_options(
     }
     if json_mode {
         println!("{}", serde_json::to_string_pretty(&report)?);
-        if nonempty_failed {
+        if !ok_flag {
             std::process::exit(1);
         }
     } else {
+        if let Some(err_str) = report["error"].as_str() {
+            anyhow::bail!("Specification audit error: {}", err_str);
+        }
         println!(
             "[turbo-lean] AUDIT-SPEC ({}) on {}: ok={} verdict={} audited={} tight={} vacuous={} trivial={} shadowed={} forbidden_scope={} stubs={} warnings={} ({:.3} ms)",
             report["policy"].as_str().unwrap_or("default"),
@@ -2725,7 +3779,7 @@ pub fn run_audit_spec_command_with_options(
             report["elapsed_ms"].as_f64().unwrap_or(0.0),
         );
         anyhow::ensure!(
-            report["ok"].as_bool() == Some(true),
+            ok_flag,
             "Specification audit failed on {} (verdict={}, audited={}, vacuous={}, trivial={}, shadowed={}, forbidden_scope={}, stubs={})",
             report["file"].as_str().unwrap_or_default(),
             report["verdict"].as_str().unwrap_or("specs_audited"),
