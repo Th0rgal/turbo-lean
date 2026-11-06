@@ -29790,6 +29790,42 @@ lean_lib Smoke where
         // without triggering the host-effect elaborator bypass.
         let pure_dep_src = "theorem bad : False := True.intro\n";
         fs::write(dep.join("Dep/Bad.lean"), pure_dep_src)?;
+        let forge_sidecars = |olean_p: &Path, c_opt: Option<&Path>, src_text: &str| -> Result<()> {
+            let ob = fs::read(olean_p)?;
+            let ib = fs::read(olean_p.with_extension("ilean"))?;
+            let (oh, ih) = (lake_hash_bytes(&ob), lake_hash_bytes(&ib));
+            fs::write(format!("{}.hash", olean_p.display()), format!("{oh:016x}"))?;
+            fs::write(
+                format!("{}.hash", olean_p.with_extension("ilean").display()),
+                format!("{ih:016x}"),
+            )?;
+            let outputs = if let Some(cp) = c_opt.filter(|p| p.is_file()) {
+                let ch = lake_hash_bytes(&fs::read(cp)?);
+                fs::write(format!("{}.hash", cp.display()), format!("{ch:016x}"))?;
+                serde_json::json!({
+                    "o": [format!("{oh:016x}.olean")],
+                    "m": false,
+                    "i": format!("{ih:016x}.ilean"),
+                    "c": format!("{ch:016x}.c"),
+                })
+            } else {
+                serde_json::Value::Null
+            };
+            let sh = lake_hash_text(src_text);
+            let z = 0u64;
+            let dh = lake_mix_hash(
+                lake_mix_hash(lake_mix_hash(lake_mix_hash(LAKE_NIL_HASH, z), z), z),
+                sh,
+            );
+            let tj = serde_json::json!({
+                "schemaVersion": "2025-09-10",
+                "depHash": format!("{dh:016x}"),
+                "inputs": [["a", format!("{z:016x}")], ["b", format!("{z:016x}")], ["c", format!("{z:016x}")], ["src", format!("{sh:016x}")]],
+                "outputs": outputs,
+            });
+            fs::write(olean_p.with_extension("trace"), serde_json::to_vec(&tj)?)?;
+            Ok(())
+        };
         let forge_build = |dep_olean: &Path| -> Result<()> {
             let lake = Command::new("lake")
                 .args(["build", "Forge.Bad"])
@@ -29808,13 +29844,14 @@ lean_lib Smoke where
             let ir_src = dep.join(".lake/build/ir/Forge");
             let ir_dst = dep.join(".lake/build/ir/Dep");
             fs::create_dir_all(&ir_dst)?;
+            let dep_c = ir_dst.join("Bad.c");
             if ir_src.join("Bad.c").is_file() {
-                fs::copy(ir_src.join("Bad.c"), ir_dst.join("Bad.c"))?;
+                fs::copy(ir_src.join("Bad.c"), &dep_c)?;
             }
             if ir_src.join("Bad.setup.json").is_file() {
                 fs::copy(ir_src.join("Bad.setup.json"), ir_dst.join("Bad.setup.json"))?;
             }
-            Ok(())
+            forge_sidecars(dep_olean, Some(&dep_c), pure_dep_src)
         };
         // 2. CAS restore of the unreplayed Lake artifacts (as stored before this fix).
         forge_build(&dep_olean)?;
@@ -29841,17 +29878,22 @@ lean_lib Smoke where
         // and `pr-verify` all kernel-replay and reject `Dep.Bad`!
         forge_build(&dep_olean)?;
         let dep_olean_digest = compute_olean_artifact_set_digest(&dep_olean)?;
+        let ws_inputs = workspace_lake_inputs_digest(&cfg)?;
+        let policy_dig = crate::splitter::current_kernel_policy_digest();
         let forged_dep_manifest = serde_json::json!({
             "pkg_name": node.pkg_name,
             "toolchain": cfg.toolchain,
             "lean_githash": cfg.lean_githash,
             "pkg_config_digest": node.pkg_config_digest,
+            "lake_inputs_digest": &ws_inputs,
             "workspace_config_digest": cfg.canonical_config_digest,
             "allowed_axioms": crate::splitter::allowed_axioms(),
+            "kernel_policy_digest": &policy_dig,
             "modules": {
                 "Dep/Bad.lean": {
                     "src_blake3": node.src_blake3,
                     "olean_artifact_digest": &dep_olean_digest,
+                    "lake_inputs_digest": &ws_inputs,
                     "kernel_audited": true,
                     "import_olean_digests": {},
                     "replay_version": crate::zygote::ZYGOTE_REPLAY_VERSION,
@@ -29926,17 +29968,21 @@ lean_lib Smoke where
         fs::write(&manifest_path, serde_json::to_vec(&forged_dep_manifest)?)?;
         let app_olean = proj.join(".lake/build/lib/lean/App.olean");
         let app_src_raw = fs::read_to_string(proj.join("App.lean"))?;
+        forge_sidecars(&app_olean, Some(&app_ir_dir.join("App.c")), &app_src_raw)?;
         let forged_root_manifest = serde_json::json!({
             "pkg_name": cfg.root_pkg.name,
             "toolchain": cfg.toolchain,
             "lean_githash": cfg.lean_githash,
             "pkg_config_digest": cfg.root_pkg.config_digest,
+            "lake_inputs_digest": &ws_inputs,
             "workspace_config_digest": cfg.canonical_config_digest,
             "allowed_axioms": crate::splitter::allowed_axioms(),
+            "kernel_policy_digest": &policy_dig,
             "modules": {
                 "App.lean": {
                     "src_blake3": blake3::hash(app_src_raw.as_bytes()).to_hex().to_string(),
                     "olean_artifact_digest": compute_olean_artifact_set_digest(&app_olean)?,
+                    "lake_inputs_digest": &ws_inputs,
                     "kernel_audited": true,
                     "import_olean_digests": { "Dep.Bad": &dep_olean_digest },
                     "replay_version": crate::zygote::ZYGOTE_REPLAY_VERSION,
@@ -30016,27 +30062,62 @@ lean_lib Smoke where
         }
         let edited_app = "import Dep.Bad\ntheorem uses_bad : False := by exact bad\n";
         fs::write(proj.join("App.lean"), edited_app)?;
-        let lake_app2 = Command::new("lake")
-            .args(["build", "App"])
+        forge_build(&dep_olean)?;
+        let lean_app2 = Command::new(&cfg.lean_bin)
+            .env("LEAN_PATH", &lp_env_app)
+            .arg(proj.join("App.lean"))
+            .arg("-R")
+            .arg(&proj)
+            .arg("-o")
+            .arg(app_lib_dir.join("App.olean"))
+            .arg("-i")
+            .arg(app_lib_dir.join("App.ilean"))
+            .arg("-c")
+            .arg(app_ir_dir.join("App.c"))
             .current_dir(&proj)
             .output()?;
         anyhow::ensure!(
-            lake_app2.status.success(),
+            lean_app2.status.success(),
             "{}",
-            String::from_utf8_lossy(&lake_app2.stderr)
+            String::from_utf8_lossy(&lean_app2.stderr)
         );
-        fs::write(&manifest_path, serde_json::to_vec(&forged_dep_manifest)?)?;
+        forge_sidecars(&app_olean, Some(&app_ir_dir.join("App.c")), edited_app)?;
+        let ws_inputs2 = workspace_lake_inputs_digest(&resolve_project_config(&proj)?)?;
+        let forged_dep_manifest2 = serde_json::json!({
+            "pkg_name": node.pkg_name,
+            "toolchain": cfg.toolchain,
+            "lean_githash": cfg.lean_githash,
+            "pkg_config_digest": node.pkg_config_digest,
+            "lake_inputs_digest": &ws_inputs2,
+            "workspace_config_digest": cfg.canonical_config_digest,
+            "allowed_axioms": crate::splitter::allowed_axioms(),
+            "kernel_policy_digest": &policy_dig,
+            "modules": {
+                "Dep/Bad.lean": {
+                    "src_blake3": node.src_blake3,
+                    "olean_artifact_digest": &dep_olean_digest,
+                    "lake_inputs_digest": &ws_inputs2,
+                    "kernel_audited": true,
+                    "import_olean_digests": {},
+                    "replay_version": crate::zygote::ZYGOTE_REPLAY_VERSION,
+                }
+            }
+        });
+        fs::write(&manifest_path, serde_json::to_vec(&forged_dep_manifest2)?)?;
         let forged_root_manifest2 = serde_json::json!({
             "pkg_name": cfg.root_pkg.name,
             "toolchain": cfg.toolchain,
             "lean_githash": cfg.lean_githash,
             "pkg_config_digest": cfg.root_pkg.config_digest,
+            "lake_inputs_digest": &ws_inputs2,
             "workspace_config_digest": cfg.canonical_config_digest,
             "allowed_axioms": crate::splitter::allowed_axioms(),
+            "kernel_policy_digest": &policy_dig,
             "modules": {
                 "App.lean": {
                     "src_blake3": blake3::hash(edited_app.as_bytes()).to_hex().to_string(),
                     "olean_artifact_digest": compute_olean_artifact_set_digest(&app_olean)?,
+                    "lake_inputs_digest": &ws_inputs2,
                     "kernel_audited": true,
                     "import_olean_digests": { "Dep.Bad": &dep_olean_digest },
                     "replay_version": crate::zygote::ZYGOTE_REPLAY_VERSION,
@@ -34844,17 +34925,48 @@ root = "Main"
         let cfg = resolve_project_config(&proj)?;
         let dep_cfg = &cfg.dep_pkgs[0];
         let dep_olean = dep.join(".lake/build/lib/lean/Dep/Bad.olean");
+        let ob = fs::read(&dep_olean)?;
+        let ib = fs::read(dep_olean.with_extension("ilean"))?;
+        let (oh, ih, sh) = (
+            lake_hash_bytes(&ob),
+            lake_hash_bytes(&ib),
+            lake_hash_text(bad_src),
+        );
+        fs::write(
+            format!("{}.hash", dep_olean.display()),
+            format!("{oh:016x}"),
+        )?;
+        fs::write(
+            format!("{}.hash", dep_olean.with_extension("ilean").display()),
+            format!("{ih:016x}"),
+        )?;
+        let z = 0u64;
+        let dh = lake_mix_hash(
+            lake_mix_hash(lake_mix_hash(lake_mix_hash(LAKE_NIL_HASH, z), z), z),
+            sh,
+        );
+        let tj = serde_json::json!({
+            "schemaVersion": "2025-09-10",
+            "depHash": format!("{dh:016x}"),
+            "inputs": [["a", format!("{z:016x}")], ["b", format!("{z:016x}")], ["c", format!("{z:016x}")], ["src", format!("{sh:016x}")]],
+            "outputs": serde_json::Value::Null,
+        });
+        fs::write(dep_olean.with_extension("trace"), serde_json::to_vec(&tj)?)?;
+        let ws_inputs = workspace_lake_inputs_digest(&cfg)?;
         let forged_manifest = serde_json::json!({
             "pkg_name": dep_cfg.name,
             "toolchain": cfg.toolchain,
             "lean_githash": cfg.lean_githash,
             "pkg_config_digest": dep_cfg.config_digest,
+            "lake_inputs_digest": &ws_inputs,
             "workspace_config_digest": cfg.canonical_config_digest,
             "allowed_axioms": crate::splitter::allowed_axioms(),
+            "kernel_policy_digest": crate::splitter::current_kernel_policy_digest(),
             "modules": {
                 "Dep/Bad.lean": {
                     "src_blake3": blake3::hash(bad_src.as_bytes()).to_hex().to_string(),
                     "olean_artifact_digest": compute_olean_artifact_set_digest(&dep_olean)?,
+                    "lake_inputs_digest": &ws_inputs,
                     "kernel_audited": true,
                     "import_olean_digests": {},
                 }

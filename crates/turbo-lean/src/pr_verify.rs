@@ -17256,7 +17256,7 @@ end ParityNs
         // standalone caching (`None`) so `pr-verify` never reuses a stale standalone `.olean`.
         fs::write(
             tree.project.join("P/A.lean"),
-            "module\npublic meta import Lean\nopen IO Lean Elab Term in\npublic meta elab \"ext_val\" : term => do\n  let s ← FS.readFile \"spec.txt\"\n  return mkNatLit s.trimAscii.toString.length\npublic theorem dag_thm : 1 + 1 = 2 := by\n  omega\n",
+            "module\npublic meta import Lean\npublic meta section\nopen IO Lean Elab Term\nelab \"ext_val\" : term => do\n  let s ← FS.readFile \"spec.txt\"\n  return mkNatLit s.trimAscii.toString.length\nend\npublic theorem dag_thm : 1 + 1 = 2 := by\n  omega\n",
         )?;
         fs::write(
             tree.project.join("Extra/StandMod.lean"),
