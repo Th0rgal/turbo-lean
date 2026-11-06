@@ -17841,8 +17841,8 @@ end ParityNs
                     None,
                 )?;
                 assert_eq!(
-                    check_val.get("ok").and_then(|v| v.as_bool()),
-                    Some(true),
+                    check_val.get("status").and_then(|v| v.as_str()),
+                    Some("file_verified"),
                     "turbo-lean check must elaborate App.lean against refreshed alpha Dep.olean (Nat), got: {check_val}"
                 );
                 #[cfg(unix)]
