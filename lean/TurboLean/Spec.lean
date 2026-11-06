@@ -1299,29 +1299,43 @@ theorem pack_trust_admission_configured_pubkey_blocks_unattested_override
     rcases h_unattested with h | h <;> simp [h_pk, h])
 
 structure HygieneItemAdmissionState where
-  itemKind           : UInt8
-  admitsNativeDecide : Bool
-  admitsBvDecide     : Bool
+  itemKind              : UInt8
+  admitsNativeDecide    : Bool
+  admitsBvDecide        : Bool
+  allowInteractiveSorry : Bool
   deriving Repr, DecidableEq, BEq
 
 def hygieneItemAdmissionMetaSpec : MetaGateSpec HygieneItemAdmissionState
     (fun s => (s.itemKind = 1 ∧ s.admitsNativeDecide = true) ∨
-      (s.itemKind = 2 ∧ s.admitsBvDecide = true)) where
-  gate := fun s => verifyHygieneItemAdmitted s.itemKind s.admitsNativeDecide s.admitsBvDecide
+      (s.itemKind = 2 ∧ s.admitsBvDecide = true) ∨
+      (s.itemKind = 4 ∧ s.allowInteractiveSorry = true)) where
+  gate := fun s => verifyHygieneItemAdmitted
+    s.itemKind s.admitsNativeDecide s.admitsBvDecide s.allowInteractiveSorry
   sound := fun s h => by
-    simpa [verifyHygieneItemAdmitted, Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq] using h
+    simpa [verifyHygieneItemAdmitted, Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq, or_assoc]
+      using h
   complete := fun s h => by
-    simpa [verifyHygieneItemAdmitted, Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq] using h
-  posWitness := ⟨2, false, true⟩
-  negWitness := ⟨3, true, true⟩
+    simpa [verifyHygieneItemAdmitted, Bool.or_eq_true, Bool.and_eq_true, beq_iff_eq, or_assoc]
+      using h
+  posWitness := ⟨4, false, false, true⟩
+  negWitness := ⟨4, true, true, false⟩
   nonVacuous := rfl
   tight := rfl
 
+theorem hygiene_item_admission_rejects_sorry_when_disabled
+    (s : HygieneItemAdmissionState)
+    (h_sorry : s.itemKind = 4) (h_dis : s.allowInteractiveSorry = false) :
+    verifyHygieneItemAdmitted
+      s.itemKind s.admitsNativeDecide s.admitsBvDecide s.allowInteractiveSorry = false :=
+  hygieneItemAdmissionMetaSpec.rejects_unsafe s (by simp [h_sorry, h_dis])
+
 theorem hygiene_item_admission_rejects_sorry_and_trust_compiler
     (s : HygieneItemAdmissionState)
-    (h_non_native : s.itemKind ≠ 1 ∧ s.itemKind ≠ 2) :
-    verifyHygieneItemAdmitted s.itemKind s.admitsNativeDecide s.admitsBvDecide = false :=
-  hygieneItemAdmissionMetaSpec.rejects_unsafe s (by simp [h_non_native.1, h_non_native.2])
+    (h_non_admitted : s.itemKind ≠ 1 ∧ s.itemKind ≠ 2 ∧ s.itemKind ≠ 4) :
+    verifyHygieneItemAdmitted
+      s.itemKind s.admitsNativeDecide s.admitsBvDecide s.allowInteractiveSorry = false :=
+  hygieneItemAdmissionMetaSpec.rejects_unsafe s
+    (by simp [h_non_admitted.1, h_non_admitted.2.1, h_non_admitted.2.2])
 
 structure KernelEngineRouteState where
   requestedEngine   : UInt8
