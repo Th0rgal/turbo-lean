@@ -291,10 +291,16 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
           | _ => if callSlotKind ty == some false then st.clearAlias dst else st
         let st1 := symEvalExpr st0 dst ty val
         symExecCode fuel' unrollBound st1 k expandRetHeap
-    | .rawStore ptrVar idxVar valVar _elemTy k =>
+    | .rawStore ptrVar idxVar valVar elemTy k =>
       let idxSv := st.lookupVar idxVar
       let valSv := st.lookupVar valVar
-      let st1 := st.writeBufSym .sarray ptrVar idxSv.expr valSv.expr true
+      let maskedVal : SymExpr :=
+        match elemTy with
+        | .i1 | .i8 => normSymBinOpStep .bitAnd valSv.expr (.constU64 0xff)
+        | .i16 => normSymBinOpStep .bitAnd valSv.expr (.constU64 0xffff)
+        | .i32 | .f32 => normSymBinOpStep .bitAnd valSv.expr (.constU64 0xffffffff)
+        | _ => valSv.expr
+      let st1 := st.writeBufSym .sarray ptrVar idxSv.expr maskedVal true
       let st2 := { st1 with
         ubCond := if idxSv.noUB && valSv.noUB then st1.ubCond else .constBool false
         noUB := st1.noUB && idxSv.noUB && valSv.noUB
@@ -482,7 +488,9 @@ def symExecDecl (loopUnrollBound : Nat := 4) (d : LNIRDecl) (synBaseOverride? : 
     | _ =>
       (acc.bindVar p.id { expr := .symVar p.id, nonPoison := true, noUB := true }, curSubId)
   ) ({ synVarBase := synBase + 4096 }, initTupleBase)
-  let initState := { paramState with synVarBase := Nat.max (synBase + 4096) tupleEnd }
+  let initState :=
+    let base := { paramState with synVarBase := Nat.max (synBase + 4096) tupleEnd }
+    if d.checkElemTypes.isSome then base.markUnsupported else base
   let (finalSt, retExpr) := symExecCode 256 loopUnrollBound initState d.body true
   let rawWrites :=
     (finalSt.memWrites.filter fun (_, r, _, _) => !(finalSt.allocRoots.contains r)).mergeSort

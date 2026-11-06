@@ -115,11 +115,11 @@ theorem symbolicKernelRefines_not_dotProduct_iff {ctx : SymRefinesCtx}
 
 theorem symbolicKernelRefines_parFor_sound {ctx : SymRefinesCtx} {env : VarEnv}
     (hctx : CtxHolds ctx env) (fuel : Nat) (st : HeapState)
-    (lenVar : VarId) (inputs : List VarId) (kSrc kTgt : ParallelKernelKind)
+    (lenVar : VarId) (inputs : List VarId) (kSrc kTgt : ParallelKernelKind) (elemTy : LNIRType)
     (pair : Val × HeapState)
     (href : symbolicKernelRefines ((ctx.addU64 lenVar).addBoundVars inputs) kSrc kTgt = true)
-    (hsrc : evalParFor fuel env st lenVar inputs kSrc = .ok pair) :
-    evalParFor fuel env st lenVar inputs kTgt = .ok pair ∧
+    (hsrc : evalParFor fuel env st lenVar inputs kSrc elemTy = .ok pair) :
+    evalParFor fuel env st lenVar inputs kTgt elemTy = .ok pair ∧
     CtxHolds ((ctx.addU64 lenVar).addBoundVars inputs) env := by
   unfold evalParFor at hsrc ⊢
   cases hlen : env lenVar with
@@ -138,11 +138,14 @@ theorem symbolicKernelRefines_parFor_sound {ctx : SymRefinesCtx} {env : VarEnv}
           rw [hvars] at hsrc
           have hctxLen : CtxHolds ((ctx.addU64 lenVar).addBoundVars inputs) env :=
             (hctx.addU64_of_u64 lenVar n hlen).addBoundVars_of_evalVarList inputs vs hvars
-          cases hloop : evalParKernelLoop env st inputs n.toNat kSrc (List.range n.toNat) with
+          let stIn : HeapState :=
+            if maskElemVal elemTy 0xFFFFFFFFFFFFFFFF == 0xFFFFFFFFFFFFFFFF then st
+            else { st with buffers := st.buffers.map (fun b => { b with data := b.data.map (maskElemVal elemTy) }) }
+          cases hloop : evalParKernelLoop env stIn inputs n.toNat kSrc (List.range n.toNat) with
           | error _ => rw [hloop] at hsrc; contradiction
           | ok elems =>
             rw [hloop] at hsrc
-            rw [symbolicKernelRefines_loop_sound hctxLen st inputs n.toNat kSrc kTgt
+            rw [symbolicKernelRefines_loop_sound hctxLen stIn inputs n.toNat kSrc kTgt
                   (List.range n.toNat) elems href hloop]
             have hdot := symbolicKernelRefines_not_dotProduct_iff kSrc kTgt href
             refine ⟨?_, hctxLen⟩
@@ -283,7 +286,8 @@ theorem symbolicCodeRefinesAux_sound (ctx : SymRefinesCtx) (src tgt : LNIRCode)
     cases tgt with
     | rawStore p2 i2 v2 ty2 k2 =>
       simp only [symbolicCodeRefinesAux, Bool.and_eq_true, beq_iff_eq] at href
-      rcases href with ⟨⟨⟨rfl, rfl⟩, rfl⟩, hk⟩
+      rcases href with ⟨⟨⟨⟨rfl, rfl⟩, rfl⟩, hmask⟩, hk⟩
+      have hm : ∀ w, maskElemVal ty1 w = maskElemVal ty2 w := maskElemVal_eq_of_allOnes_eq ty1 ty2 hmask
       simp only [evalCode] at hsrc ⊢
       cases hp : env p1 with
       | none => rw [hp] at hsrc; contradiction
@@ -303,7 +307,8 @@ theorem symbolicCodeRefinesAux_sound (ctx : SymRefinesCtx) (src tgt : LNIRCode)
             all_goals
               rename_i bid idx nval
               dsimp only at hsrc ⊢
-              cases hw : st.writeElemExclusive bid idx.toNat nval with
+              rw [← hm nval]
+              cases hw : st.writeElemExclusive bid idx.toNat (maskElemVal ty1 nval) with
               | error _ => rw [hw] at hsrc; contradiction
               | ok st1 =>
                 rw [hw] at hsrc
@@ -478,14 +483,17 @@ theorem symbolicCodeRefinesAux_sound (ctx : SymRefinesCtx) (src tgt : LNIRCode)
     cases tgt with
     | parFor out2 len2 ins2 ety2 kern2 k2 =>
       simp only [symbolicCodeRefinesAux, Bool.and_eq_true, beq_iff_eq] at href
-      rcases href with ⟨⟨⟨rfl, rfl⟩, hins⟩, hkern, hk⟩
+      rcases href with ⟨⟨⟨⟨rfl, rfl⟩, hins⟩, hmask⟩, hkern, hk⟩
       rw [← varIdListEq_sound ins1 ins2 hins]
-      simp only [evalCode] at hsrc ⊢
-      cases hp1 : evalParFor fuel env st len1 ins1 kern1 with
+      have hm : maskElemVal ety1 = maskElemVal ety2 := funext (maskElemVal_eq_of_allOnes_eq ety1 ety2 hmask)
+      have hparEq : evalParFor fuel env st len1 ins1 kern2 ety2 = evalParFor fuel env st len1 ins1 kern2 ety1 := by
+        unfold evalParFor; rw [hm]
+      simp only [evalCode, hparEq] at hsrc ⊢
+      cases hp1 : evalParFor fuel env st len1 ins1 kern1 ety1 with
       | error _ => rw [hp1] at hsrc; contradiction
       | ok pair =>
         rw [hp1] at hsrc
-        obtain ⟨hp2, hctxLen⟩ := symbolicKernelRefines_parFor_sound hctx fuel st len1 ins1 kern1 kern2 pair hkern hp1
+        obtain ⟨hp2, hctxLen⟩ := symbolicKernelRefines_parFor_sound hctx fuel st len1 ins1 kern1 kern2 ety1 pair hkern hp1
         rw [hp2]
         rcases pair with ⟨outVal, stPar⟩
         have hContCtx := (hctxLen.killVar_bind out1 outVal).addBound_of_some out1 outVal
@@ -510,11 +518,13 @@ theorem symbolicValidatedDeclOpt_sound (propose : LNIRDecl → LNIRDecl) (d d' :
     (h : runSymbolicValidatedDecl propose d = some d') :
     CodeRefines d.body d'.body := by
   unfold runSymbolicValidatedDecl at h
-  cases href : symbolicCodeRefines d.body (propose d).body
-  · rw [href] at h; cases h
-  · rw [href] at h
+  dsimp only at h
+  cases hgate : (d.checkElemTypes.isNone && (propose d).checkElemTypes.isNone && symbolicCodeRefines d.body (propose d).body)
+  · rw [hgate] at h; cases h
+  · rw [hgate] at h
     simp only [↓reduceIte, Option.some.injEq] at h
     subst h
-    exact symbolicCodeRefines_sound d.body (propose d).body href
+    simp only [Bool.and_eq_true] at hgate
+    exact symbolicCodeRefines_sound d.body (propose d).body hgate.2
 
 end LeanNative.Proofs

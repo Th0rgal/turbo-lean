@@ -34,7 +34,7 @@ private theorem evalSarrayGet_ok (env : VarEnv) (st : HeapState) (arrVar idxVar 
     (ty : LNIRType) (bufId : Nat) (idx elem : UInt64)
     (harr : env arrVar = some (.sarrayId bufId)) (hidx : env idxVar = some (.u64 idx))
     (hread : st.readElem bufId idx.toNat = .ok elem) :
-    evalExpr env st (.sarrayGet arrVar idxVar ty) = .ok (.u64 elem, st) := by
+    evalExpr env st (.sarrayGet arrVar idxVar ty) = .ok (.u64 (maskElemVal ty elem), st) := by
   dsimp only [evalExpr]
   rw [harr, hidx]
   dsimp only
@@ -44,7 +44,7 @@ private theorem evalRawLoad_ok (env : VarEnv) (st : HeapState) (ptrVar idxVar : 
     (ty : LNIRType) (bufId : Nat) (idx elem : UInt64)
     (hptr : env ptrVar = some (.rawPtrId bufId)) (hidx : env idxVar = some (.u64 idx))
     (hread : st.readElem bufId idx.toNat = .ok elem) :
-    evalExpr env st (.rawLoad ptrVar idxVar ty) = .ok (.u64 elem, st) := by
+    evalExpr env st (.rawLoad ptrVar idxVar ty) = .ok (.u64 (maskElemVal ty elem), st) := by
   dsimp only [evalExpr]
   rw [hptr, hidx]
   dsimp only
@@ -94,7 +94,7 @@ theorem subSliceBounds_no_oob (s sub : TypedSliceView) (subOff subLen idx : Nat)
   simp only [HeapState.readElem, hfind, hlt, ↓reduceDIte]
   rfl
 
-/-- Zero-copy indexed read: `lowerSliceGet` loads the exact element at `offset + idx`. -/
+/-- Zero-copy indexed read: `lowerSliceGet` loads the masked element at `offset + idx`. -/
 theorem lowerSliceGet_sound (fuel : Nat) (env : VarEnv) (st : HeapState)
     (dst posTmp idxVar : VarId) (s : TypedSliceView) (idx bufId : Nat) (buf : ArrayBuffer)
     (harr : env s.arrVar = some (.sarrayId bufId)) (hidx : env idxVar = some (.u64 idx.toUInt64))
@@ -102,7 +102,7 @@ theorem lowerSliceGet_sound (fuel : Nat) (env : VarEnv) (st : HeapState)
     (hfind : st.findBuffer bufId = some buf) (hsize : s.view.backingLen ≤ buf.data.size)
     (hu64 : buf.data.size < UInt64.size) :
     evalCode fuel env st (lowerSliceGet dst posTmp s idxVar (.ret dst)) =
-      .ok (.u64 (buf.data[s.view.offset + idx]?.getD 0), st) := by
+      .ok (.u64 (maskElemVal s.kind.lnirType (buf.data[s.view.offset + idx]?.getD 0)), st) := by
   have hwin : s.view.offset + s.view.len ≤ s.view.backingLen := by
     simpa [checkSliceViewValid, LeanNative.Spec.isValidByteSlice] using of_decide_eq_true hvalid
   have hpos : s.view.offset + idx < buf.data.size := by omega
@@ -126,7 +126,7 @@ theorem lowerSliceGet_sound (fuel : Nat) (env : VarEnv) (st : HeapState)
   rw [evalCode]
   simp [hpos]
 
-/-- Zero-copy raw-pointer load: `lowerSliceRawLoad` loads the exact element at `offset + idx`. -/
+/-- Zero-copy raw-pointer load: `lowerSliceRawLoad` loads the masked element at `offset + idx`. -/
 theorem lowerSliceRawLoad_sound (fuel : Nat) (env : VarEnv) (st : HeapState)
     (dst posTmp idxVar : VarId) (s : TypedSliceView) (idx bufId : Nat) (buf : ArrayBuffer)
     (harr : env s.arrVar = some (.rawPtrId bufId)) (hidx : env idxVar = some (.u64 idx.toUInt64))
@@ -134,7 +134,7 @@ theorem lowerSliceRawLoad_sound (fuel : Nat) (env : VarEnv) (st : HeapState)
     (hfind : st.findBuffer bufId = some buf) (hsize : s.view.backingLen ≤ buf.data.size)
     (hu64 : buf.data.size < UInt64.size) :
     evalCode fuel env st (lowerSliceRawLoad dst posTmp s idxVar (.ret dst)) =
-      .ok (.u64 (buf.data[s.view.offset + idx]?.getD 0), st) := by
+      .ok (.u64 (maskElemVal s.kind.lnirType (buf.data[s.view.offset + idx]?.getD 0)), st) := by
   have hwin : s.view.offset + s.view.len ≤ s.view.backingLen := by
     simpa [checkSliceViewValid, LeanNative.Spec.isValidByteSlice] using of_decide_eq_true hvalid
   have hpos : s.view.offset + idx < buf.data.size := by omega
@@ -158,7 +158,7 @@ theorem lowerSliceRawLoad_sound (fuel : Nat) (env : VarEnv) (st : HeapState)
   rw [evalCode]
   simp [hpos]
 
-/-- One step of a zero-copy slice fold: accumulator `acc` grows by `buf.data[offset + curIdx]`. -/
+/-- One step of a zero-copy slice fold: accumulator `acc` grows by masked `buf.data[offset + curIdx]`. -/
 theorem sliceFoldStep_sound (fuel : Nat) (env : VarEnv) (st : HeapState)
     (s : TypedSliceView) (idxVar accVar posTmp elemTmp nextAcc : VarId)
     (curIdx : Nat) (acc : UInt64) (bufId : Nat) (buf : ArrayBuffer)
@@ -170,7 +170,7 @@ theorem sliceFoldStep_sound (fuel : Nat) (env : VarEnv) (st : HeapState)
     (hfind : st.findBuffer bufId = some buf) (hsize : s.view.backingLen ≤ buf.data.size)
     (hu64 : buf.data.size < UInt64.size) :
     evalCode fuel env st (sliceFoldStep s idxVar accVar posTmp elemTmp nextAcc) =
-      .ok (.u64 (acc + (buf.data[s.view.offset + curIdx]?.getD 0)), st) := by
+      .ok (.u64 (acc + maskElemVal s.kind.lnirType (buf.data[s.view.offset + curIdx]?.getD 0)), st) := by
   have hwin : s.view.offset + s.view.len ≤ s.view.backingLen := by
     simpa [checkSliceViewValid, LeanNative.Spec.isValidByteSlice] using of_decide_eq_true hvalid
   have hpos : s.view.offset + curIdx < buf.data.size := by omega
@@ -191,7 +191,7 @@ theorem sliceFoldStep_sound (fuel : Nat) (env : VarEnv) (st : HeapState)
   rw [evalCode, evalSarrayGet_ok env1 st s.arrVar posTmp s.kind.lnirType bufId _ _
     harr1 (VarEnv.bind_self _ _ _) hread]
   dsimp only
-  let env2 := env1.bind elemTmp (.u64 buf.data[s.view.offset + curIdx])
+  let env2 := env1.bind elemTmp (.u64 (maskElemVal s.kind.lnirType buf.data[s.view.offset + curIdx]))
   have hacc2 : env2 accVar = some (.u64 acc) := by
     simp [env2, env1, beq_false_of_ne hne5, beq_false_of_ne hne6, hacc]
   rw [evalCode, evalAddVars_u64 env2 st accVar elemTmp acc _ hacc2 (VarEnv.bind_self _ _ _)]
@@ -214,7 +214,7 @@ theorem sliceFoldLoop_sound (fuel : Nat) (env : VarEnv) (st : HeapState)
       evalSeqLoop count curIdx idxVar accVar (.u64 acc) env st
         (fun stepEnv stepSt => evalCode fuel stepEnv stepSt
           (sliceFoldStep s idxVar accVar posTmp elemTmp nextAcc)) =
-      .ok (.u64 (sumSliceFrom buf.data (s.view.offset + curIdx) acc count), st) := by
+      .ok (.u64 (sumSliceFrom s.kind.lnirType buf.data (s.view.offset + curIdx) acc count), st) := by
   intro count
   induction count with
   | zero =>
@@ -239,7 +239,7 @@ theorem sliceFoldLoop_sound (fuel : Nat) (env : VarEnv) (st : HeapState)
       simp [hpos]
     rw [hget]
     dsimp only
-    rw [ih (curIdx + 1) (acc + buf.data[s.view.offset + curIdx]) (by omega)]
+    rw [ih (curIdx + 1) (acc + maskElemVal s.kind.lnirType buf.data[s.view.offset + curIdx]) (by omega)]
     have hshift : s.view.offset + (curIdx + 1) = s.view.offset + curIdx + 1 := by omega
     simp [sumSliceFrom, hpos, hshift]
 
@@ -258,7 +258,7 @@ theorem lowerSliceFold_sound (fuel : Nat) (env : VarEnv) (st : HeapState)
     (hne4 : s.arrVar ≠ idxVar) (hne5 : accVar ≠ elemTmp) (hne6 : accVar ≠ posTmp) :
     evalCode fuel env st (lowerSliceFold s initVal loVar hiVar initVar idxVar accVar posTmp elemTmp
         nextAcc (.ret accVar)) =
-      .ok (.u64 (sumSliceFrom buf.data s.view.offset initVal s.view.len), st) := by
+      .ok (.u64 (sumSliceFrom s.kind.lnirType buf.data s.view.offset initVal s.view.len), st) := by
   have hwin : s.view.offset + s.view.len ≤ s.view.backingLen := by
     simpa [checkSliceViewValid, LeanNative.Spec.isValidByteSlice] using of_decide_eq_true hvalid
   have hlen : s.view.len.toUInt64.toNat = s.view.len := by
@@ -275,7 +275,7 @@ theorem lowerSliceFold_sound (fuel : Nat) (env : VarEnv) (st : HeapState)
   change evalCode fuel env3 st
       (.seqFor idxVar loVar hiVar accVar initVar .i64
         (sliceFoldStep s idxVar accVar posTmp elemTmp nextAcc) (.ret accVar)) =
-    .ok (.u64 (sumSliceFrom buf.data s.view.offset initVal s.view.len), st)
+    .ok (.u64 (sumSliceFrom s.kind.lnirType buf.data s.view.offset initVal s.view.len), st)
   have hlo : env3 loVar = some (.u64 0) := by
     simp [env3, beq_false_of_ne hneD, beq_false_of_ne hneE]
   have hhi : env3 hiVar = some (.u64 s.view.len.toUInt64) := by

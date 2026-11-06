@@ -305,6 +305,12 @@ def coerceProducerScalarToU64? (allowedU64Vars : List VarId) (e : ScalarExpr) : 
   | some false => some (.select e (.constU64 1) (.constU64 0))
   | none => none
 
+/-- True when `elemTy` stores full 64-bit words without sub-word truncation (`maskElemVal elemTy v = v`),
+    which is required for eliding an intermediate `parFor` buffer without masking intermediate arithmetic. -/
+def isFullWidthElemType : LNIRType → Bool
+  | .i1 | .i8 | .i16 | .i32 | .f32 => false
+  | _ => true
+
 /-- Strict verified two-stage `.mapScaleAdd` producer-consumer fusion across an `LNIRCode` block,
     restricted exclusively to the pattern proven by `LeanNative.Proofs.fuseParForKernels_sound`. -/
 def fuseVerifiedMapScaleAddCode : LNIRCode → LNIRCode
@@ -319,7 +325,7 @@ def fuseVerifiedMapScaleAddCode : LNIRCode → LNIRCode
     match k1, in1, k with
     | .mapScaleAdd s1 b1, [srcBuf], .parFor out2 len2 [cBuf] ety2 (.mapScaleAdd s2 b2) (.ret retV) =>
       if out1 != out2 && out1 != len1 && srcBuf != out1 && cBuf == out1 &&
-         len1 == len2 && sameElemType ety1 ety2 && retV == out2 then
+         len1 == len2 && sameElemType ety1 ety2 && isFullWidthElemType ety1 && retV == out2 then
         .parFor out2 len2 [srcBuf] ety2 (fuseMapScaleAddPair s1 b1 s2 b2) (.ret retV)
       else
         .parFor out1 len1 in1 ety1 k1 (fuseVerifiedMapScaleAddCode k)
@@ -400,7 +406,8 @@ def fuseParForCode : LNIRCode → LNIRCode
     match k' with
     | .parFor out2 len2 in2 ety2 k2 rest =>
       let restCleaned := stripDeadTmpDecRef out1 rest
-      if out1 != out2 && len1 == len2 && sameElemType ety1 ety2 && !codeUsesVar out1 restCleaned then
+      if out1 != out2 && len1 == len2 && sameElemType ety1 ety2 && isFullWidthElemType ety1 &&
+         !codeUsesVar out1 restCleaned then
         match fuseTwoParForStage out1 in1 k1' in2 k2 with
         | some (fusedIns, fusedKern) =>
           .parFor out2 len2 fusedIns ety2 fusedKern restCleaned

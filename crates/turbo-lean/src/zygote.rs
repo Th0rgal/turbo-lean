@@ -128,7 +128,13 @@ pub fn query_lean_native_core_worker(
         .filter(|s| !s.trim().is_empty())
         .is_some_and(|s| !Path::new(s.trim()).is_file());
     let cabi_certified = !custom_nonexistent
-        && crate::c_abi::leannative_certify_cex_witnesses_safe(1_000_000, 0, u64::MAX);
+        && crate::c_abi::leannative_certify_cex_witnesses_safe(1_000_000, 0, u64::MAX)
+        && match method {
+            "eval-cex" | "compile-fastcheck" => {
+                crate::gpu_fastcheck::canonical_cex_kernel_certified()
+            }
+            _ => true,
+        };
     let result = match method {
         "ping" => serde_json::json!({
             "status": "pong",
@@ -9478,7 +9484,10 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             if let Some(process) = LifecycleProcess::open(child.id(), staging, None) {
-                return process;
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                if process.valid_identity() {
+                    return process;
+                }
             }
             assert!(
                 child.try_wait().unwrap().is_none(),
@@ -9502,10 +9511,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("turbo-pidfd-{}", next_tmp_id()));
         fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("turbo_zygote_pidfd_test");
-        fs::copy("/bin/sleep", &exe).unwrap();
+        fs::copy("/bin/bash", &exe).unwrap();
         let mut child = std::process::Command::new(&exe)
-            .arg("30")
+            .args(["-c", "read -t 30"])
             .env("TURBO_LEAN_STAGING_DIR", &dir)
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .unwrap();
         let mut process = open_test_lifecycle_process(&mut child, Some(&dir));
@@ -9547,10 +9557,11 @@ mod tests {
             let dir = std::env::temp_dir().join(format!("turbo-stop-namespace-{}", next_tmp_id()));
             fs::create_dir_all(&dir).unwrap();
             let exe = dir.join("turbo_zygote_stop_test");
-            fs::copy("/bin/sleep", &exe).unwrap();
+            fs::copy("/bin/bash", &exe).unwrap();
             let mut child = Command::new(exe)
-                .arg("30")
+                .args(["-c", "read -t 30"])
                 .env("TURBO_LEAN_STAGING_DIR", &dir)
+                .stdin(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
             // Same user-wide (staging=None) identity path, with an explicit candidate set
@@ -10093,6 +10104,7 @@ mod tests {
             (Some(true), Some("pong"))
         );
         let _ = query_lean_native_core_worker("validate-tv", None);
+        let _ = query_lean_native_core_worker("eval-cex", None);
 
         let methods = ["ping", "validate-tv", "verify-certs", "eval-cex"];
         let t0 = std::time::Instant::now();

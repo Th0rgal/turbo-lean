@@ -48,11 +48,14 @@ def lnirExprEvalEq : LNIRExpr → LNIRExpr → Bool
   | .ctorGetScalar o1 i1 _, .ctorGetScalar o2 i2 _ => o1 == o2 && i1 == i2
   | .isExclusive o1, .isExclusive o2 => o1 == o2
   | .sarrayLen a1, .sarrayLen a2 => a1 == a2
-  | .sarrayDataPtr a1 _, .sarrayDataPtr a2 _ => a1 == a2
-  | .sarrayEnsureExclusive a1 _, .sarrayEnsureExclusive a2 _ => a1 == a2
-  | .sarrayGet a1 i1 _, .sarrayGet a2 i2 _ => a1 == a2 && i1 == i2
-  | .sarraySet a1 i1 v1 _, .sarraySet a2 i2 v2 _ => a1 == a2 && i1 == i2 && v1 == v2
-  | .rawLoad p1 i1 _, .rawLoad p2 i2 _ => p1 == p2 && i1 == i2
+  | .sarrayDataPtr a1 ty1, .sarrayDataPtr a2 ty2 => a1 == a2 && ty1 == ty2
+  | .sarrayEnsureExclusive a1 ty1, .sarrayEnsureExclusive a2 ty2 => a1 == a2 && ty1 == ty2
+  | .sarrayGet a1 i1 ty1, .sarrayGet a2 i2 ty2 =>
+    a1 == a2 && i1 == i2 && maskElemVal ty1 0xffffffffffffffff == maskElemVal ty2 0xffffffffffffffff
+  | .sarraySet a1 i1 v1 ty1, .sarraySet a2 i2 v2 ty2 =>
+    a1 == a2 && i1 == i2 && v1 == v2 && maskElemVal ty1 0xffffffffffffffff == maskElemVal ty2 0xffffffffffffffff
+  | .rawLoad p1 i1 ty1, .rawLoad p2 i2 ty2 =>
+    p1 == p2 && i1 == i2 && maskElemVal ty1 0xffffffffffffffff == maskElemVal ty2 0xffffffffffffffff
   | .boxScalar v1 _, .boxScalar v2 _ => v1 == v2
   | .unboxScalar o1 _, .unboxScalar o2 _ => o1 == o2
   | .call f1 as1 _ ext1, .call f2 as2 _ ext2 =>
@@ -296,10 +299,11 @@ def symbolicCodeRefinesAux (ctx : SymRefinesCtx) (src tgt : LNIRCode) : Bool :=
         lnirExprEvalEq val1 val2 &&
         symbolicCodeRefinesAux ((ctx.killVar dst1).addBound dst1) k1 k2
       | _ => false
-  | .rawStore p1 i1 v1 _ k1 =>
+  | .rawStore p1 i1 v1 ty1 k1 =>
     match tgt with
-    | .rawStore p2 i2 v2 _ k2 =>
+    | .rawStore p2 i2 v2 ty2 k2 =>
       p1 == p2 && i1 == i2 && v1 == v2 &&
+      maskElemVal ty1 0xffffffffffffffff == maskElemVal ty2 0xffffffffffffffff &&
       symbolicCodeRefinesAux (((ctx.addBound p1).addU64 i1).addU64 v1) k1 k2
     | _ => false
   | .incRef o1 c1 k1 =>
@@ -341,10 +345,11 @@ def symbolicCodeRefinesAux (ctx : SymRefinesCtx) (src tgt : LNIRCode) : Bool :=
        symbolicCodeRefinesAux stepCtx step1 step2 &&
        symbolicCodeRefinesAux contCtx k1 k2)
     | _ => false
-  | .parFor out1 len1 ins1 _ kern1 k1 =>
+  | .parFor out1 len1 ins1 ty1 kern1 k1 =>
     match tgt with
-    | .parFor out2 len2 ins2 _ kern2 k2 =>
+    | .parFor out2 len2 ins2 ty2 kern2 k2 =>
       out1 == out2 && len1 == len2 && varIdListEq ins1 ins2 &&
+      maskElemVal ty1 0xffffffffffffffff == maskElemVal ty2 0xffffffffffffffff &&
       (let ctxLen := (ctx.addU64 len1).addBoundVars ins1
        symbolicKernelRefines ctxLen kern1 kern2 &&
        symbolicCodeRefinesAux ((ctxLen.killVar out1).addBound out1) k1 k2)
@@ -355,8 +360,13 @@ def symbolicCodeRefines (src tgt : LNIRCode) : Bool :=
   symbolicCodeRefinesAux {} src tgt
 
 /-- Total declaration-level translation-validated optimizer wrapper (`Contract V2` `VerifiedTVPassContract`):
-    returns `some tgt` iff `symbolicCodeRefines src.body tgt.body = true`. -/
+    returns `some tgt` iff element types are consistent in both `d` and `propose d` and
+    `symbolicCodeRefines src.body tgt.body = true`. -/
 def runSymbolicValidatedDecl (propose : LNIRDecl → LNIRDecl) (d : LNIRDecl) : Option LNIRDecl :=
-  if symbolicCodeRefines d.body (propose d).body then some (propose d) else none
+  let tgt := propose d
+  if d.checkElemTypes.isNone && tgt.checkElemTypes.isNone && symbolicCodeRefines d.body tgt.body then
+    some tgt
+  else
+    none
 
 end LeanNative.Proofs

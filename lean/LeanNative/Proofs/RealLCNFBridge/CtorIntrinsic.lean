@@ -255,6 +255,270 @@ theorem lowerRealCtor_sound (ctx : RealBridgeCtx) (st : RealBridgeState) (lenv :
                 simp only [evalExpr, hvarList, evalVarList, hvsNe, Bool.false_and, hwf, Bool.false_eq_true, ↓reduceIte]
               · simp [hwf] at h_eval'
 
+theorem collectSliceCallArgs_sound (st : RealBridgeState) (lenv : LEnv) (venv : VarEnv)
+    (hinv : BridgeStateInv st lenv venv) :
+    ∀ (args : List (Lean.Compiler.LCNF.Arg .impure)) (argVars : List VarId) (argTys : List LNIRType),
+      collectSliceCallArgsPure st args = some (argVars, argTys) →
+      ∃ vs, collectSliceEnvArgs lenv args = some (vs, argTys) ∧
+        evalVarList venv argVars = .ok vs ∧
+        stripErasedSliceArgs? argVars argTys = some (argVars, argTys)
+  | [], _, _, h => by
+    dsimp only [collectSliceCallArgsPure] at h
+    injection h with hp; rcases Prod.mk.inj hp with ⟨rfl, rfl⟩
+    exact ⟨[], rfl, rfl, rfl⟩
+  | .erased :: rest, argVars, argTys, h =>
+    collectSliceCallArgs_sound st lenv venv hinv rest argVars argTys h
+  | .type _ _ :: rest, argVars, argTys, h =>
+    collectSliceCallArgs_sound st lenv venv hinv rest argVars argTys h
+  | .fvar x :: rest, argVars, argTys, h => by
+    dsimp only [collectSliceCallArgsPure] at h
+    cases hlu : st.lookupFVar? x with
+    | none => simp [hlu] at h
+    | some vid =>
+      rw [hlu] at h
+      cases hrest : collectSliceCallArgsPure st rest with
+      | none => simp [hrest] at h
+      | some p =>
+        rcases p with ⟨vsVars, ts⟩
+        rw [hrest] at h; dsimp only at h
+        rcases collectSliceCallArgs_sound st lenv venv hinv rest vsVars ts hrest with
+          ⟨vs, hce, hvl, hstrip⟩
+        rcases hinv.fvar_val x vid hlu with ⟨hveq, his⟩
+        have hty := hinv.fvar_ty x vid hlu
+        cases hvv : venv vid with
+        | none => rw [hvv] at his; cases his
+        | some vx =>
+          have hvalL : lenv.vals x = some vx := hveq.trans hvv
+          have htyD : (lenv.tys x).getD .objPtr = st.getVarType vid := by simp [hty]
+          dsimp only [collectSliceEnvArgs]
+          rw [hvalL, hce]; dsimp only
+          rw [htyD]
+          cases hu : lnirTypeEq (st.getVarType vid) .unit
+          · simp only [hu, Bool.false_eq_true, ↓reduceIte] at h ⊢
+            injection h with hp; rcases Prod.mk.inj hp with ⟨rfl, rfl⟩
+            exact ⟨vx :: vs, rfl, by simp [evalVarList, hvv, hvl],
+              by simp [stripErasedSliceArgs?, hstrip, hu]⟩
+          · simp only [hu, ↓reduceIte] at h ⊢
+            injection h with hp; rcases Prod.mk.inj hp with ⟨rfl, rfl⟩
+            exact ⟨vs, rfl, hvl, hstrip⟩
+
+theorem evalSliceCall_none_of_lowerRealArgList (ctx : RealBridgeCtx) (st : RealBridgeState)
+    (lenv : LEnv) (venv : VarEnv) (hst : HeapState) (fn : Lean.Name)
+    (args : List (Lean.Compiler.LCNF.Arg .impure)) (argVars : List VarId) (st1 : RealBridgeState)
+    (retTy : LNIRType)
+    (hinv : BridgeStateInv st lenv venv)
+    (hargL : lowerRealArgList ctx st false args = .ok (argVars, st1)) :
+    evalSliceCall? ctx.arch fn lenv hst args retTy = none := by
+  have hallScalar : ∀ (as_ : List (Lean.Compiler.LCNF.Arg .impure)) (vs_ : List VarId) (s_ : RealBridgeState),
+      lowerRealArgList ctx st false as_ = .ok (vs_, s_) →
+      match collectSliceEnvArgs lenv as_ with
+      | none => True
+      | some (_, ts) => ∀ t ∈ ts, isSupportedStage1BScalarOrTuple t ctx.arch = true := by
+    intro as_
+    induction as_ with
+    | nil =>
+      intro _ _ _
+      dsimp only [collectSliceEnvArgs]
+      intro t ht
+      cases ht
+    | cons a rest ih =>
+      intro vs_ s_ hl
+      unfold lowerRealArgList at hl; dsimp only [Bind.bind, Except.bind, Pure.pure, Except.pure] at hl
+      cases ha : lowerRealArg ctx st a false with
+      | error _ => rw [ha] at hl; exact nomatch hl
+      | ok p1 =>
+        rcases p1 with ⟨vid, stA⟩; rw [ha] at hl; dsimp only at hl
+        rcases lowerRealArg_sound ctx st lenv venv a false vid stA hinv ha with
+          ⟨x, vx, rfl, hlu, hev, _, htyA, hstA⟩
+        subst stA
+        have hsc : isSupportedStage1BScalarOrTuple (st.getVarType vid) ctx.arch = true := by
+          unfold lowerRealArg at ha
+          simp only [hlu, Bool.false_and, Bool.or_false] at ha
+          split at ha
+          · assumption
+          · exact nomatch ha
+        cases hr : lowerRealArgList ctx st false rest with
+        | error _ => rw [hr] at hl; exact nomatch hl
+        | ok p2 =>
+          have ihr := ih p2.1 p2.2 hr
+          dsimp only [collectSliceEnvArgs]
+          have hvalL : lenv.vals x = some vx := by
+            dsimp only [evalArg] at hev
+            cases hlx : lenv.vals x with
+            | none =>
+              rw [hlx] at hev
+              exact nomatch hev
+            | some vx' =>
+              rw [hlx] at hev
+              injection hev with h'
+              subst h'
+              rfl
+          rw [hvalL, htyA]
+          cases hce : collectSliceEnvArgs lenv rest with
+          | none => trivial
+          | some pr =>
+            rw [hce] at ihr; dsimp only
+            cases hu : lnirTypeEq (st.getVarType vid) .unit <;> simp only [Bool.false_eq_true, ↓reduceIte]
+            · intro t ht; rcases List.mem_cons.mp ht with rfl | hmem
+              · exact hsc
+              · exact ihr t hmem
+            · exact ihr
+  have hs := hallScalar args argVars st1 hargL
+  unfold evalSliceCall?
+  cases hwasm : ctx.arch.isWasm
+  · rw [ite_eq_right (by simp)]
+    cases hce : collectSliceEnvArgs lenv args with
+    | none => rfl
+    | some p =>
+      rw [hce] at hs; rcases p with ⟨vs, ts⟩
+      split
+      · next vArr elemTy hEq =>
+        injection hEq with hp; rcases Prod.mk.inj hp with ⟨_, hts⟩
+        rw [hts] at hs
+        have hbad := hs (.sarray elemTy) (List.Mem.head _)
+        cases hbad
+      · next vArr vIdx elemTy idxTy hEq =>
+        injection hEq with hp; rcases Prod.mk.inj hp with ⟨_, hts⟩
+        rw [hts] at hs
+        have hbad := hs (.sarray elemTy) (List.Mem.head _)
+        cases hbad
+      · rfl
+  · rfl
+
+theorem evalVarList_singleton_inv (venv : VarEnv) (v0 : VarId) (vs : List Val)
+    (h : evalVarList venv [v0] = .ok vs) :
+    ∃ x0, venv v0 = some x0 ∧ vs = [x0] := by
+  dsimp only [evalVarList] at h
+  cases hx0 : venv v0 with
+  | none => rw [hx0] at h; exact nomatch h
+  | some x0 =>
+    rw [hx0] at h; dsimp only [evalVarList] at h
+    injection h with hvs
+    exact ⟨x0, rfl, hvs.symm⟩
+
+theorem evalVarList_pair_inv (venv : VarEnv) (v0 v1 : VarId) (vs : List Val)
+    (h : evalVarList venv [v0, v1] = .ok vs) :
+    ∃ x0 x1, venv v0 = some x0 ∧ venv v1 = some x1 ∧ vs = [x0, x1] := by
+  dsimp only [evalVarList] at h
+  cases hx0 : venv v0 with
+  | none => rw [hx0] at h; exact nomatch h
+  | some x0 =>
+    rw [hx0] at h
+    cases hx1 : venv v1 with
+    | none => simp [hx1] at h
+    | some x1 =>
+      simp only [hx1] at h
+      injection h with hvs
+      exact ⟨x0, x1, rfl, rfl, hvs.symm⟩
+
+theorem sarrayLen_fap_refines (venv : VarEnv) (hst hst' : HeapState) (arrVar : VarId)
+    (vArr v : Val) (ctor? : Option Lean.Name)
+    (ho : ((match vArr with
+      | .sarrayId bufId =>
+        match hst.findBuffer bufId with
+        | some buf => .ok (.u64 buf.data.size.toUInt64, hst, none)
+        | none => .error (.typeError s!"unknown sarray buffer {bufId}")
+      | _ => .error (.typeError "sarrayLen expects sarrayId")) :
+        Except UBError (Val × HeapState × Option Lean.Name)) = .ok (v, hst', ctor?))
+    (harrV : venv arrVar = some vArr) :
+    evalExpr venv hst (.sarrayLen arrVar) = .ok (v, hst') ∧ hst' = hst ∧ ctor? = none := by
+  cases vArr with
+  | sarrayId bufId =>
+    dsimp only at ho
+    cases hfb : hst.findBuffer bufId with
+    | none => rw [hfb] at ho; exact nomatch ho
+    | some buf =>
+      rw [hfb] at ho; injection ho with hp
+      rcases Prod.mk.inj hp with ⟨rfl, hp2⟩
+      rcases Prod.mk.inj hp2 with ⟨rfl, rfl⟩
+      exact ⟨by simp [evalExpr, harrV, hfb], rfl, rfl⟩
+  | _ => exact nomatch ho
+
+theorem sarrayGet_fap_refines (venv : VarEnv) (hst hst' : HeapState) (arrVar idxVar : VarId)
+    (elemTy : LNIRType) (vArr vIdx v : Val) (ctor? : Option Lean.Name)
+    (ho : ((match vArr, vIdx with
+      | .sarrayId bufId, .u64 idx =>
+        (hst.readElem bufId idx.toNat).map (fun x => (Val.u64 (maskElemVal elemTy x), hst, none))
+      | _, _ => .error (.typeError "sarrayGet expects sarrayId and u64 index")) :
+        Except UBError (Val × HeapState × Option Lean.Name)) = .ok (v, hst', ctor?))
+    (harrV : venv arrVar = some vArr) (hidxV : venv idxVar = some vIdx) :
+    evalExpr venv hst (.sarrayGet arrVar idxVar elemTy) = .ok (v, hst') ∧ hst' = hst ∧ ctor? = none := by
+  cases vArr with
+  | sarrayId bufId =>
+    cases vIdx with
+    | u64 idx =>
+      dsimp only [Functor.map, Except.map] at ho
+      cases hr : hst.readElem bufId idx.toNat with
+      | error _ => rw [hr] at ho; exact nomatch ho
+      | ok elem =>
+        rw [hr] at ho; injection ho with hp
+        rcases Prod.mk.inj hp with ⟨rfl, hp2⟩
+        rcases Prod.mk.inj hp2 with ⟨rfl, rfl⟩
+        exact ⟨by simp [evalExpr, harrV, hidxV, hr], rfl, rfl⟩
+    | _ => exact nomatch ho
+  | _ => exact nomatch ho
+
+/-- Layer I soundness combinator: `lowerSliceCallPure?` agrees with `.fap` `evalLetValue` (`evalSliceCall?`)
+    across all zero-copy `ByteArray`/`FloatArray` `usize` and `uget` intrinsics without mutating `HeapState`. -/
+theorem lowerSliceCallPure_sound (ctx : RealBridgeCtx) (st : RealBridgeState) (lenv : LEnv)
+    (venv : VarEnv) (hst hst' : HeapState) (fn : Lean.Name)
+    (args : Array (Lean.Compiler.LCNF.Arg .impure)) (himp : Lean.Compiler.LCNF.Purity.impure = .impure)
+    (retTy : LNIRType) (expr : LNIRExpr) (v : Val) (ctor? : Option Lean.Name)
+    (hinv : BridgeStateInv st lenv venv)
+    (hs : lowerSliceCallPure? st fn args.toList retTy (ctx.findLocalCallee? fn).isSome ctx.arch = some expr)
+    (ho : evalLetValue ctx lenv hst (.fap fn args himp) retTy = .ok (v, hst', ctor?)) :
+    evalExpr venv hst expr = .ok (v, hst') ∧ hst' = hst ∧ ctor? = none ∧
+      ((∃ arrVar, expr = .sarrayLen arrVar) ∨
+       (∃ arrVar idxVar elemTy, expr = .sarrayGet arrVar idxVar elemTy)) := by
+  unfold lowerSliceCallPure? at hs
+  dsimp only [evalLetValue] at ho
+  cases hloc : (ctx.findLocalCallee? fn).isSome
+  · rw [hloc] at hs ho; simp only [Bool.false_eq_true, ↓reduceIte] at hs ho
+    cases hcol : collectSliceCallArgsPure st args.toList with
+    | none => simp [hcol] at hs
+    | some pair =>
+      rcases pair with ⟨argVars, argTys⟩
+      rw [hcol] at hs; dsimp only at hs
+      rcases collectSliceCallArgs_sound st lenv venv hinv args.toList argVars argTys hcol with
+        ⟨vs, hce, hvl, hstrip⟩
+      unfold lowerSliceIntrinsicPure? at hs
+      unfold evalSliceCall? at ho
+      cases hwasm : ctx.arch.isWasm
+      · rw [hwasm] at hs ho
+        simp only [Bool.or_false, Bool.false_eq_true, ↓reduceIte, hstrip] at hs ho
+        rw [hce] at ho
+        split at hs
+        · next arrVar elemTy hEq =>
+          injection hEq with hp
+          rcases Prod.mk.inj hp with ⟨rfl, rfl⟩
+          rcases evalVarList_singleton_inv venv arrVar vs hvl with ⟨vArr, harrV, rfl⟩
+          cases hc : (((fn == ``ByteArray.usize && lnirTypeEq elemTy .i8) ||
+              (fn == ``FloatArray.usize && lnirTypeEq elemTy .f64)) &&
+              (lnirTypeEq retTy .i64 || (lnirTypeEq retTy .usize && archSupportsUSize ctx.arch)))
+          · simp [hc] at hs
+          · simp only [hc, ↓reduceIte] at hs ho
+            injection hs with he; subst he
+            rcases sarrayLen_fap_refines venv hst hst' arrVar vArr v ctor? ho harrV with ⟨he, hh, hc0⟩
+            exact ⟨he, hh, hc0, Or.inl ⟨arrVar, rfl⟩⟩
+        · next arrVar idxVar elemTy idxTy hEq =>
+          injection hEq with hp
+          rcases Prod.mk.inj hp with ⟨rfl, rfl⟩
+          rcases evalVarList_pair_inv venv arrVar idxVar vs hvl with ⟨vArr, vIdx, harrV, hidxV, rfl⟩
+          cases hvIdx : (lnirTypeEq idxTy .i64 || (lnirTypeEq idxTy .usize && archSupportsUSize ctx.arch))
+          · simp [hvIdx] at hs
+          · simp only [hvIdx, Bool.not_true, Bool.false_eq_true, Bool.true_and, ↓reduceIte] at hs ho
+            cases hg : ((fn == ``ByteArray.uget && lnirTypeEq elemTy .i8 && lnirTypeEq retTy .i8) ||
+                (fn == ``FloatArray.uget && lnirTypeEq elemTy .f64 && lnirTypeEq retTy .f64))
+            · simp [hg] at hs
+            · simp only [hg, ↓reduceIte] at hs ho
+              injection hs with he; subst he
+              rcases sarrayGet_fap_refines venv hst hst' arrVar idxVar elemTy vArr vIdx v ctor? ho harrV hidxV with
+                ⟨he, hh, hc0⟩
+              exact ⟨he, hh, hc0, Or.inr ⟨arrVar, idxVar, elemTy, rfl⟩⟩
+        · exact nomatch hs
+      · rw [hwasm] at hs; simp at hs
+  · rw [hloc] at hs; cases hcol : collectSliceCallArgsPure st args.toList <;> simp [hcol, lowerSliceIntrinsicPure?] at hs
+
 /-- `lowerCanonicalIntrinsicPure?` agrees with `.fap` evaluation on all binary, GF/SIMD, boolean, unary, and cast intrinsics. -/
 theorem lowerCanonicalIntrinsicPure_sound (ctx : RealBridgeCtx) (st : RealBridgeState) (lenv : LEnv)
     (venv : VarEnv) (hst hst' : HeapState) (fn : Lean.Name)
@@ -274,6 +538,7 @@ theorem lowerCanonicalIntrinsicPure_sound (ctx : RealBridgeCtx) (st : RealBridge
   dsimp only [evalLetValue] at ho
   cases hloc : (ctx.findLocalCallee? fn).isSome
   · rw [hloc] at hs ho; simp only [Bool.false_eq_true, ↓reduceIte] at hs ho
+    rw [evalSliceCall_none_of_lowerRealArgList ctx st1 lenv venv hst fn args.toList argVars st1 retTy hinv hargL] at ho; dsimp only at ho
     cases hlist : args.toList with
     | nil => rw [hlist] at hlen; cases argVars <;> simp at hlen hs
     | cons a rest1 =>

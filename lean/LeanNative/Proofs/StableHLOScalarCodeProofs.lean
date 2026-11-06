@@ -414,9 +414,10 @@ theorem evalParFor_mapScaleAdd_inv (fuel : Nat) (env : VarEnv) (st st' : HeapSta
   dsimp only at hEval
   by_cases hgt : uLen.toNat > fuel
   · simp [hgt] at hEval
-  · simp only [hgt, ↓reduceIte, evalVarList, hX] at hEval
+  · simp only [hgt, ↓reduceIte, evalVarList, hX, maskElemVal_i64_fun, id_eq, beq_self_eq_true] at hEval
     rw [evalParKernelLoop_eq_map env st [x] uLen.toNat (.mapScaleAdd scale bias) f
       (List.range uLen.toNat) (fun i hi => hElem i (List.mem_range.mp hi))] at hEval
+    simp only [List.map_id] at hEval
     injection hEval with hp
     injection hp with hv hst
     exact ⟨hv.symm, hst.symm⟩
@@ -443,11 +444,11 @@ theorem evalParFor_inv_2 (fuel : Nat) (env : VarEnv) (st st' : HeapState)
   dsimp only at hEval
   by_cases hgt : uLen.toNat > fuel
   · simp [hgt] at hEval
-  · simp only [hgt, ↓reduceIte, evalVarList, hX, hY] at hEval
+  · simp only [hgt, ↓reduceIte, evalVarList, hX, hY, maskElemVal_i64_fun, id_eq, beq_self_eq_true] at hEval
     rw [evalParKernelLoop_eq_map env st [x, y] uLen.toNat kernel f (List.range uLen.toNat)
       (fun i hi => hElem i (List.mem_range.mp hi))] at hEval
     cases kernel <;>
-    · dsimp only [parKernelOutData]
+    · simp only [parKernelOutData, List.map_id] at hEval ⊢
       injection hEval with hp
       injection hp with hv hst
       exact ⟨hv.symm, hst.symm⟩

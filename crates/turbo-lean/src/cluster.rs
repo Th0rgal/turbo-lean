@@ -851,12 +851,16 @@ pub fn auto_fastcheck_batch(
             || combined_lower.contains("inite.source")
             || combined_lower.contains("keccak");
 
-        // Step 1: Local C-ABI / SIMD fast-reject + witness re-certification (`0` false positives)
+        // Step 1: Local C-ABI / SIMD fast-reject + Lean kernel witness re-certification (`0` false positives)
         let cex_opt = if eff_pref == "tpu" || route.selected_node.target.is_tpu() {
-            crate::gpu_fastcheck::try_tpu_xla_fast_reject(decl_name, &formatted_src)
-                .or_else(|| crate::gpu_fastcheck::try_lnir_fast_reject(decl_name, &formatted_src))
+            crate::gpu_fastcheck::try_tpu_xla_fast_reject(decl_name, &formatted_src).or_else(|| {
+                crate::gpu_fastcheck::try_lnir_fast_reject_kernel_certified(
+                    decl_name,
+                    &formatted_src,
+                )
+            })
         } else {
-            crate::gpu_fastcheck::try_lnir_fast_reject(decl_name, &formatted_src)
+            crate::gpu_fastcheck::try_lnir_fast_reject_kernel_certified(decl_name, &formatted_src)
         };
 
         if let Some((witness, suggested_hyp)) = cex_opt {
@@ -906,7 +910,7 @@ pub fn auto_fastcheck_batch(
                 "router_action": matryoshka_router_code_to_action(r_code),
                 "cbv_offload_recommended": cbv_offload_recommended,
                 "winning_tactic_hint": winning_tactic_hint,
-                "locally_recertified": true,
+                "locally_recertified": false,
                 "false_positives": 0,
             }));
         }
@@ -956,7 +960,7 @@ pub fn auto_fastcheck_batch(
         "witness_summary": first_witness,
         "suggested_hypothesis": first_hypothesis,
         "counterexample_triage": top_triage,
-        "lean_native_certified": true,
+        "lean_native_certified": !verified && total_violations > 0,
         "false_positives": 0,
         "speculate_forest_endpoint": "/v1/speculate-forest",
         "tpu_speculate_forest_endpoint": "/v1/tpu-speculate-forest",

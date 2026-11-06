@@ -167,6 +167,7 @@ extern "C" {
         item_kind: u8,
         admits_native_decide: u8,
         admits_bv_decide: u8,
+        allow_interactive_sorry: u8,
     ) -> u8;
     pub fn turbo_spec_route_kernel_engine(requested_engine: u8, con_leche_supported: u8) -> u8;
     pub fn turbo_spec_verify_receipt_provenance(
@@ -2081,6 +2082,36 @@ mod tests {
                                 );
                             }
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_verify_hygiene_item_admitted_c_abi_gate() {
+        for item_kind in 0u8..=5 {
+            for admits_nd in [false, true] {
+                for admits_bvd in [false, true] {
+                    for allow_sorry in [false, true] {
+                        let actual = unsafe {
+                            turbo_spec_verify_hygiene_item_admitted(
+                                item_kind,
+                                admits_nd as u8,
+                                admits_bvd as u8,
+                                allow_sorry as u8,
+                            ) != 0
+                        };
+                        let expected = match item_kind {
+                            1 => admits_nd,
+                            2 => admits_bvd,
+                            4 => allow_sorry,
+                            _ => false,
+                        };
+                        assert_eq!(
+                            actual, expected,
+                            "kind={item_kind}, nd={admits_nd}, bvd={admits_bvd}, sorry={allow_sorry}"
+                        );
                     }
                 }
             }

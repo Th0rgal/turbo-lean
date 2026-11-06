@@ -89,7 +89,11 @@ def isSupportedStage1BScalarType (ty : LNIRType) (arch : TargetArch) : Bool :=
   | _ => false
 
 def isFlatUnboxedScalar : LNIRType → Bool
-  | .i1 | .i8 | .i16 | .i32 | .i64 | .usize | .u256 | .i256 => true
+  | .i1 | .i8 | .i16 | .i32 | .i64 | .usize | .u256 | .i256 | .f64 => true
+  | _ => false
+
+def isSupportedSliceType : LNIRType → Bool
+  | .sarray .i8 | .sarray .f64 => true
   | _ => false
 
 def isUnboxedScalarOrTuple : LNIRType → Bool
@@ -288,6 +292,49 @@ def lowerUnaryScalarIntrinsic? (fnName : Lean.Name) (arg : VarId) (argTys : List
           let raw := if isNeg then ScalarExpr.binOp .sub (.constU64 0) (.var arg) else ScalarExpr.unaryOp .not (.var arg)
           some (.scalar (if mask == 0xFFFFFFFFFFFFFFFF then raw else .binOp .bitAnd raw (.constU64 mask)))
   | _ => none
+
+/-- Strip erased `.unit` proof arguments (such as `h : i.toNat < a.size` on `ByteArray.uget` / `FloatArray.uget`)
+    while failing closed on mismatched `(argVars, argTys)` list lengths. -/
+def stripErasedSliceArgs? : List VarId → List LNIRType → Option (List VarId × List LNIRType)
+  | [], [] => some ([], [])
+  | v :: vs, t :: ts =>
+    match stripErasedSliceArgs? vs ts with
+    | some (vs', ts') =>
+      some (if lnirTypeEq t .unit then (vs', ts') else (v :: vs', t :: ts'))
+    | none => none
+  | _, _ => none
+
+/-- Pure canonical zero-copy `ByteArray` / `FloatArray` length & proof-indexed element intrinsic lowering:
+    - `ByteArray.usize` (`[.sarray .i8] -> .usize/.i64`) → `.sarrayLen arr`
+    - `FloatArray.usize` (`[.sarray .f64] -> .usize/.i64`) → `.sarrayLen arr`
+    - `ByteArray.uget` (`[.sarray .i8, idxScalar, (.unit)*] -> .i8`) → `.sarrayGet arr idx .i8`
+    - `FloatArray.uget` (`[.sarray .f64, idxScalar, (.unit)*] -> .f64`) → `.sarrayGet arr idx .f64`
+    Strictly requires non-local canonical declarations and typed `.sarray` arguments (`fail closed` on heap `.objPtr`,
+    `Nat`-returning `size`, or panicking `get!`). -/
+def lowerSliceIntrinsicPure? (fnName : Lean.Name) (argVars : List VarId)
+    (retTy : LNIRType) (argTys : List LNIRType := []) (isLocal : Bool := false)
+    (arch : TargetArch := .x86_64) : Option LNIRExpr :=
+  if isLocal || arch.isWasm then none
+  else
+    let validLenRet : Bool :=
+      lnirTypeEq retTy .i64 || (lnirTypeEq retTy .usize && archSupportsUSize arch)
+    let validIdxArg (t : LNIRType) : Bool :=
+      lnirTypeEq t .i64 || (lnirTypeEq t .usize && archSupportsUSize arch)
+    match stripErasedSliceArgs? argVars argTys with
+    | some ([arrVar], [.sarray elemTy]) =>
+      if ((fnName == ``ByteArray.usize && lnirTypeEq elemTy .i8) ||
+          (fnName == ``FloatArray.usize && lnirTypeEq elemTy .f64)) && validLenRet then
+        some (.sarrayLen arrVar)
+      else
+        none
+    | some ([arrVar, idxVar], [.sarray elemTy, idxTy]) =>
+      if !validIdxArg idxTy then none
+      else if (fnName == ``ByteArray.uget && lnirTypeEq elemTy .i8 && lnirTypeEq retTy .i8) ||
+              (fnName == ``FloatArray.uget && lnirTypeEq elemTy .f64 && lnirTypeEq retTy .f64) then
+        some (.sarrayGet arrVar idxVar elemTy)
+      else
+        none
+    | _ => none
 
 /-- Pure canonical intrinsic lowering (shared verbatim by `Bridge.tryLowerIntrinsicCall`). -/
 def lowerCanonicalIntrinsicPure? (fnName : Lean.Name) (argVars : List VarId)
@@ -543,11 +590,34 @@ def lowerRealArg (ctx : RealBridgeCtx) (st : RealBridgeState) (arg : Lean.Compil
     | none => .error s!"[lean-native] unbound LCNF free variable `{fvarId.name}`"
     | some vid =>
       let vTy := st.getVarType vid
-      if isSupportedStage1BScalarOrTuple vTy ctx.arch || (allowInternalObj && isHeapPtrType vTy) then
+      if isSupportedStage1BScalarOrTuple vTy ctx.arch ||
+          (allowInternalObj && (isHeapPtrType vTy || isSupportedSliceType vTy || lnirTypeEq vTy .f64)) then
         .ok (vid, st)
       else
         .error s!"[lean-native] Unsupported non-scalar argument of type `{reprStr vTy}`"
   | .erased | .type .. => .error "[lean-native] unsupported erased runtime argument in pure core"
+
+/-- Collect runtime `FVarId` arguments for canonical slice intrinsics (`ByteArray.usize`/`uget`, `FloatArray.usize`/`uget`),
+    dropping erased proof/type arguments without mutating `RealBridgeState`. -/
+def collectSliceCallArgsPure (st : RealBridgeState) :
+    List (Lean.Compiler.LCNF.Arg .impure) → Option (List VarId × List LNIRType)
+  | [] => some ([], [])
+  | .erased :: rest | .type .. :: rest => collectSliceCallArgsPure st rest
+  | .fvar x :: rest =>
+    match st.lookupFVar? x, collectSliceCallArgsPure st rest with
+    | some vid, some (vs, ts) =>
+      let t := st.getVarType vid
+      some (if lnirTypeEq t .unit then (vs, ts) else (vid :: vs, t :: ts))
+    | _, _ => none
+
+/-- Lower a real `.fap` call to a zero-copy `ByteArray`/`FloatArray` slice intrinsic when eligible. -/
+def lowerSliceCallPure? (st : RealBridgeState) (fnName : Lean.Name)
+    (args : List (Lean.Compiler.LCNF.Arg .impure)) (retTy : LNIRType)
+    (isLocal : Bool) (arch : TargetArch) : Option LNIRExpr :=
+  match collectSliceCallArgsPure st args with
+  | some (argVars, argTys) =>
+    lowerSliceIntrinsicPure? fnName argVars retTy argTys isLocal arch
+  | none => none
 
 /-- Lower a list of `Lean.Compiler.LCNF.Arg .impure` left-to-right. -/
 def lowerRealArgList (ctx : RealBridgeCtx) (st : RealBridgeState) (allowInternalObj : Bool) :
@@ -665,11 +735,14 @@ def lowerImpureLetValuePure (ctx : RealBridgeCtx) (st : RealBridgeState)
       return (.ctorGetScalar v slot ty, st)
   | .fap fnName args _ =>
     let isLocal := (ctx.findLocalCallee? fnName).isSome
-    let (argVars, st1) ← lowerRealArgList ctx st false args.toList
-    let argTys := argVars.map st1.getVarType
-    match lowerCanonicalIntrinsicPure? fnName argVars retTy argTys isLocal ctx.arch ctx.gfSimdIntrinsics with
-    | some intr => return (intr, st1)
-    | none => throw s!"[lean-native] Unsupported external or non-scalar call `{fnName}` in Stage 1B"
+    match lowerSliceCallPure? st fnName args.toList retTy isLocal ctx.arch with
+    | some sliceIntr => return (sliceIntr, st)
+    | none =>
+      let (argVars, st1) ← lowerRealArgList ctx st false args.toList
+      let argTys := argVars.map st1.getVarType
+      match lowerCanonicalIntrinsicPure? fnName argVars retTy argTys isLocal ctx.arch ctx.gfSimdIntrinsics with
+      | some intr => return (intr, st1)
+      | none => throw s!"[lean-native] Unsupported external or non-scalar call `{fnName}` in Stage 1B"
   | .pap fnName _ _ =>
     throw s!"[lean-native] Unsupported partial application (`pap {fnName}`) in Stage 1B"
   | .box _ fvarId _ | .unbox fvarId _ =>
@@ -705,7 +778,7 @@ def inferImpureRhsTypePure (st : RealBridgeState) (rhs : LNIRExpr) (declTy : LNI
       let sty := st.getVarType sv
       if isUnboxedScalarOrTuple declTy then declTy
       else if isUnboxedScalarOrTuple sty then sty else declTy
-    | .scalar _ => if isUnboxedScalarOrTuple declTy then declTy else .i64
+    | .scalar _ | .sarrayLen _ | .sarrayGet _ _ _ => if isUnboxedScalarOrTuple declTy then declTy else .i64
     | .mkTuple argVars => .tuple (argVars.map st.getVarType)
     | .projTuple tv idx =>
       match st.getVarType tv with

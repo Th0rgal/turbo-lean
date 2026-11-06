@@ -653,7 +653,7 @@ fn template_shm_path() -> (PathBuf, u32) {
     };
     let uid = unsafe { libc::geteuid() };
     (
-        shm_base.join(format!("turbo_lean_template_state_v7_{}.db", uid)),
+        shm_base.join(format!("turbo_lean_template_state_v9_{}.db", uid)),
         uid,
     )
 }
@@ -824,9 +824,11 @@ impl TurboStore {
                         KERNEL_REPLAYED_OLEANS_AUTH_DDL
                     ))?;
                 }
-                if uver < 5 {
+                if uver < 7 {
+                    let _ = conn.execute("DELETE FROM file_stat_cache", []);
+                    let _ = conn.execute("DELETE FROM file_split_cache", []);
                     conn.execute_batch(&format!(
-                        "{}\nPRAGMA user_version = 5;",
+                        "{}\nPRAGMA user_version = 7;",
                         KERNEL_AUDITED_OLEANS_AUTH_DDL
                     ))?;
                 }
@@ -884,7 +886,7 @@ impl TurboStore {
                      path_key TEXT PRIMARY KEY, mtime_sec INTEGER NOT NULL, mtime_nsec INTEGER NOT NULL,
                      size_bytes INTEGER NOT NULL, split_key TEXT NOT NULL, updated_at INTEGER NOT NULL
                  );
-                 PRAGMA user_version = 5;
+                 PRAGMA user_version = 7;
                  COMMIT;
                  PRAGMA wal_checkpoint(TRUNCATE);",
                 WORKTREE_LEASES_DDL,
@@ -917,10 +919,10 @@ impl TurboStore {
     }
 
     /// Compute the deterministic BLAKE3 cache key for `file_split_cache` from an existing
-    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v13:" + src_blake3_hex)`).
+    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v16:" + src_blake3_hex)`).
     pub fn compute_file_split_key_from_src_hash(src_blake3_hex: &str) -> String {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"file-split:v13:");
+        hasher.update(b"file-split:v16:");
         hasher.update(src_blake3_hex.as_bytes());
         hasher.finalize().to_hex().to_string()
     }
@@ -9132,7 +9134,7 @@ mod tests {
         let uv: i64 = store
             .conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
-        assert_eq!(uv, 5);
+        assert_eq!(uv, 7);
         assert!(!store.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
         assert!(store
             .record_kernel_replayed_olean("", "env1", 2, "tc1", "M", &[])
