@@ -500,4 +500,59 @@ fn cli_transpiled_fastcheck_falls_back_to_kernel_when_shadowed_witness_rejected(
         assert!(!out.status.success(), "{args:?}: {text}");
         assert!(!text.contains("counterexample_found"), "{args:?}: {text}");
     }
+
+    let post_comment_nat_src = concat!(
+        "def x := 0\n",
+        "/- comment\n",
+        "-/ theorem lost (b : BitVec 8) : Nat.add (0 - b).toNat x = (0 - b).toNat := by sorry\n",
+    );
+    fs::write(tmp.0.join("Identity.lean"), post_comment_nat_src).unwrap();
+    for (args, expect_ok) in [
+        (
+            vec!["fast-check", "Identity.lean", "--transpile-lean", "lost"],
+            false,
+        ),
+        (
+            vec!["fast-check", "Identity.lean", "--tpu", "--decl", "lost"],
+            false,
+        ),
+    ] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_turbo-lean"));
+        cmd.current_dir(&tmp.0)
+            .env("TURBO_LEAN_NO_DAEMON", "1")
+            .args(["--json", "--cache-dir"])
+            .arg(tmp.0.join("cache"))
+            .args(&args);
+        let out = corpus::run(&mut cmd);
+        let text = corpus::diagnostic(&out);
+        assert_eq!(out.status.success(), expect_ok, "{args:?}: {text}");
+        assert!(
+            !text.contains("declaration identity unconfirmed"),
+            "post-comment identity must be confirmed for {args:?}: {text}"
+        );
+    }
+    let pure_bv_nat_src = concat!(
+        "def x := 0\n",
+        "/- comment\n",
+        "-/ theorem bv_tonat_ok (b : BitVec 8) : Nat.add (0 - b).toNat 0 = (0 - b).toNat := by sorry\n",
+        "theorem nat_hyp_ok (n : Nat) : n + 1 = 0 -> n = 1 := by sorry\n",
+    );
+    fs::write(tmp.0.join("Identity.lean"), pure_bv_nat_src).unwrap();
+    for decl in ["bv_tonat_ok", "nat_hyp_ok"] {
+        for args in [
+            vec!["fast-check", "Identity.lean", "--transpile-lean", decl],
+            vec!["fast-check", "Identity.lean", "--tpu", "--decl", decl],
+        ] {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_turbo-lean"));
+            cmd.current_dir(&tmp.0)
+                .env("TURBO_LEAN_NO_DAEMON", "1")
+                .args(["--json", "--cache-dir"])
+                .arg(tmp.0.join("cache"))
+                .args(&args);
+            let out = corpus::run(&mut cmd);
+            let text = corpus::diagnostic(&out);
+            assert!(out.status.success(), "{args:?}: {text}");
+            assert!(!text.contains("counterexample_found"), "{args:?}: {text}");
+        }
+    }
 }

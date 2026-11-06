@@ -4495,66 +4495,79 @@ fn format_stubbed_decl_span(orig_text: &str, sig_clean: &str, proof_clean: &str)
 fn stub_identity_probe_src(src: &str) -> String {
     let clean = strip_lean_comments(src);
     let spans = parse_command_spans(src, &clean);
-    let texts: Vec<String> = spans
-        .iter()
-        .map(|span| {
-            if let Some((header, inner, footer)) = split_mutual_block_subspans(span) {
-                let inner_texts: Vec<String> = inner
-                    .iter()
-                    .map(|s| stub_identity_probe_src(s.orig_text))
-                    .collect();
-                return join_mutual_parts(
-                    span.start_line,
-                    header,
-                    &inner,
-                    &inner_texts,
-                    footer,
-                    span.end_line,
-                );
-            }
-            if classify_decl_header(span.clean_text).is_some() {
-                if let Some((sig, proof)) = split_at_top_level_assign(span.clean_text) {
-                    return format_stubbed_decl_span(span.orig_text, sig, proof);
-                }
-            }
-            sanitize_stubbed_prefix_options(span.orig_text)
-        })
-        .collect();
+    let texts: Vec<String> = spans.iter().map(stub_identity_span).collect();
     join_span_texts(&spans, &texts)
 }
 
-pub(crate) fn declaration_identity_prefix(src: &str, start_line: usize) -> String {
+fn stub_identity_span(span: &CmdSpan<'_>) -> String {
+    if let Some((header, inner, footer)) = split_mutual_block_subspans(span) {
+        let inner_texts: Vec<String> = inner.iter().map(stub_identity_span).collect();
+        return join_mutual_parts(
+            span.start_line,
+            header,
+            &inner,
+            &inner_texts,
+            footer,
+            span.end_line,
+        );
+    }
+    if classify_decl_header(span.clean_text).is_some() {
+        if let Some((sig, proof)) = split_at_top_level_assign(span.clean_text) {
+            return format_stubbed_decl_span(span.orig_text, sig, proof);
+        }
+    }
+    sanitize_stubbed_prefix_options(span.orig_text)
+}
+
+pub(crate) fn declaration_identity_prefix(src: &str, shard: &TheoremShard) -> String {
     let clean = strip_lean_comments(src);
     let spans = parse_command_spans(src, &clean);
+    let mut scope_stack = Vec::new();
+    let matches_target = |s: &CmdSpan<'_>, stack: &[ScopeFrame]| {
+        s.start_line == shard.start_line
+            && s.end_line == shard.end_line
+            && classify_decl_header(s.clean_text).is_some_and(|(_, name)| {
+                qualified_decl_name(&name, stack) == shard.qualified_name || name == shard.name
+            })
+    };
     let mut prefix = String::new();
     let mut prev_end_line = None;
-    for span in &spans {
-        if span.start_line >= start_line {
+    let push_span = |prefix: &mut String, prev_end_line: &mut Option<usize>, s: &CmdSpan<'_>| {
+        push_joined_span(prefix, *prev_end_line, s, &stub_identity_span(s));
+        *prev_end_line = Some(s.end_line);
+    };
+    for (s_idx, span) in spans.iter().enumerate() {
+        if let Some((_, inner, _)) = split_mutual_block_subspans(span) {
+            if let Some(t_idx) = inner
+                .iter()
+                .position(|sub| matches_target(sub, &scope_stack))
+            {
+                for sub in &inner[..t_idx] {
+                    push_span(&mut prefix, &mut prev_end_line, sub);
+                }
+                return prefix;
+            }
+        } else if matches_target(span, &scope_stack) {
+            return prefix;
+        }
+        if span.start_line > shard.start_line {
             break;
         }
-        if span.end_line >= start_line {
-            // `mutual` changes recursion, not the declaration namespace. Flatten
-            // only this unfinished group so the independent probe is a command.
+        if span.end_line > shard.start_line {
             if let Some((_, inner, _)) = split_mutual_block_subspans(span) {
-                for sub in inner.iter().take_while(|s| s.start_line < start_line) {
-                    push_joined_span(
-                        &mut prefix,
-                        prev_end_line,
-                        sub,
-                        &stub_identity_probe_src(sub.orig_text),
-                    );
-                    prev_end_line = Some(sub.end_line);
+                for sub in inner.iter().take_while(|s| {
+                    s.start_line < shard.start_line || s.end_line < shard.start_line
+                }) {
+                    push_span(&mut prefix, &mut prev_end_line, sub);
                 }
             }
             break;
         }
-        push_joined_span(
-            &mut prefix,
-            prev_end_line,
-            span,
-            &stub_identity_probe_src(span.orig_text),
-        );
-        prev_end_line = Some(span.end_line);
+        if span.start_line == shard.start_line {
+            break;
+        }
+        push_span(&mut prefix, &mut prev_end_line, span);
+        update_scope_stack_with_idx(&mut scope_stack, span.orig_text, s_idx);
     }
     prefix
 }
@@ -13070,7 +13083,7 @@ public def api := by
                 .collect::<Vec<_>>()
         };
 
-        let src = "def x := 0\n/- comment\n-/ theorem lost : True := trivial\ntheorem visible : True := trivial\n";
+        let src = "def x := 0\n/- comment\n-/ theorem lost : x = 0 := rfl\ntheorem visible : x = 0 := lost\n";
         let split = split_lean_source(src, &[]);
         assert_eq!(shard_names(&split), vec!["lost", "visible"]);
         assert_eq!(
@@ -13083,15 +13096,23 @@ public def api := by
         );
         assert!(!split.shards[0].signature_text.contains("-/"));
         assert_eq!(
+            declaration_identity_prefix(src, &split.shards[0]),
+            "def x := 0\n/- comment\n-/ "
+        );
+        assert_eq!(
+            declaration_identity_prefix(src, &split.shards[1]),
+            "def x := 0\n/- comment\n-/  theorem lost : x = 0  := sorry"
+        );
+        assert_eq!(
             reconstruct_single_shard_source(src, "lost")
                 .unwrap()
                 .unwrap()
                 .trim_end(),
-            "def x := 0\n/- comment\n-/  theorem lost : True := trivial"
+            "def x := 0\n/- comment\n-/  theorem lost : x = 0 := rfl"
         );
         assert_eq!(
             extract_shard_orig_decl(src, &split.shards[0]),
-            "theorem lost : True := trivial"
+            "theorem lost : x = 0 := rfl"
         );
         assert_eq!(pub_names(src), vec!["x", "lost", "visible"]);
         let (probe, offset) = build_file_identity_probe(src);
@@ -13128,7 +13149,13 @@ public def api := by
             "mutual\n  theorem m1 : True := trivial\n  /- inner comment\n  -/ theorem m2 : True := m1\n  /- before end\n  -/ end\n",
             "mutual\n  /- c1 -/ theorem m1 : True := trivial\n  /- c2 -/ /- /- n -/ c3 -/ theorem m2 : True := m1\n  /- c4 -/ end\n",
         ] {
-            assert_eq!(shard_names(&split_lean_source(m_src, &[])), vec!["m1", "m2"]);
+            let m_split = split_lean_source(m_src, &[]);
+            assert_eq!(shard_names(&m_split), vec!["m1", "m2"]);
+            let prefix_m2 = declaration_identity_prefix(m_src, &m_split.shards[1]);
+            assert!(
+                prefix_m2.contains("theorem m1 : True") && prefix_m2.contains(":= sorry"),
+                "mutual identity prefix must retain preceding m1 span sharing m2 start_line: {prefix_m2:?}"
+            );
             assert_eq!(pub_names(m_src), vec!["m1", "m2"]);
         }
 

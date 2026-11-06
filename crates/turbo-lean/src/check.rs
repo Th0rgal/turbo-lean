@@ -268,7 +268,7 @@ pub(crate) fn confirm_decl_identity_with_extra_dirs(
 ) -> Result<ConfirmedDeclIdentity> {
     let probe_started = request_started.unwrap_or_else(Instant::now);
     let expected = shard.decl_name();
-    let prefix = splitter::declaration_identity_prefix(src, shard.start_line);
+    let prefix = splitter::declaration_identity_prefix(src, shard);
     let header_info = crate::module_builder::parse_header_info(&prefix);
     let (header, prefix) = prefix.split_at(header_info.body_byte_offset);
     let (signature, _) = splitter::extract_shard_stmt_and_proof(src, shard);
@@ -302,15 +302,7 @@ pub(crate) fn confirm_decl_identity_with_extra_dirs(
             // Proof-driven type inference (`theorem t : _ := ...` or equation-compiler arms)
             // cannot elaborate against `:= by sorry`; retry once in a fresh isolated scratch
             // probe with the declaration's original text.
-            let decl_lines = if shard.start_line >= 1 && shard.end_line >= shard.start_line {
-                src.lines()
-                    .skip(shard.start_line - 1)
-                    .take(shard.end_line - shard.start_line + 1)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else {
-                String::new()
-            };
+            let decl_lines = splitter::extract_shard_orig_decl(src, shard);
             if decl_lines.trim().is_empty() {
                 Err(stub_err)
             } else {
@@ -9295,13 +9287,26 @@ theorem after_macro : ext_magic = 7 := rfl
         .unwrap();
         let lean_file = proj_dir.join("PostCommentClose.lean");
         let src =
-            "def x := 0\n/- comment\n-/ theorem lost : True := trivial\ntheorem visible : True := trivial\n";
+            "def x := 0\n/- comment\n-/ theorem lost : x = 0 := rfl\n/- infer\n-/ theorem infer_lost : x = 0\n  | => rfl\ntheorem visible : x = 0 := lost\n";
         fs::write(&lean_file, src).unwrap();
         let canon_proj = proj_dir.canonicalize().unwrap_or_else(|_| proj_dir.clone());
         let canon_file = lean_file
             .canonicalize()
             .unwrap_or_else(|_| lean_file.clone());
         let mut split = split_lean_source(src, &[]);
+        for sh in &split.shards {
+            let att = confirm_decl_identity_with_extra_dirs(
+                src,
+                sh,
+                &canon_proj,
+                &canon_file,
+                false,
+                &[],
+                None,
+            )
+            .unwrap();
+            assert_eq!(att.decl_name, sh.decl_name());
+        }
         let mut cb3 = None;
         let t0 = Instant::now();
         let ok_json = check_single_decl(
@@ -9329,7 +9334,7 @@ theorem after_macro : ext_magic = 7 := rfl
         assert_eq!(ok_json["status"], "theorem_verified");
         assert_eq!(ok_json["decl"], "lost");
 
-        // Also confirm full-file batched identity probe confirms both `lost` and `visible`.
+        // Also confirm full-file batched identity probe confirms all three declarations.
         let shard_refs: Vec<&splitter::TheoremShard> = split.shards.iter().collect();
         let confirmed = confirm_file_decl_identities_with_extra_dirs(
             src,
@@ -9346,8 +9351,30 @@ theorem after_macro : ext_magic = 7 := rfl
                 .iter()
                 .map(|c| c.decl_name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["lost", "visible"]
+            vec!["lost", "infer_lost", "visible"]
         );
+
+        let mutual_file = proj_dir.join("PostCommentMutual.lean");
+        let mutual_src =
+            "def x := 0\nmutual\n  theorem m1 : x = 0 := rfl\n  /- inner\n  -/ theorem m2 : x = 0 := m1\nend\n";
+        fs::write(&mutual_file, mutual_src).unwrap();
+        let canon_mut = mutual_file
+            .canonicalize()
+            .unwrap_or_else(|_| mutual_file.clone());
+        let mut_split = split_lean_source(mutual_src, &[]);
+        for sh in &mut_split.shards {
+            let att = confirm_decl_identity_with_extra_dirs(
+                mutual_src,
+                sh,
+                &canon_proj,
+                &canon_mut,
+                false,
+                &[],
+                None,
+            )
+            .unwrap();
+            assert_eq!(att.decl_name, sh.decl_name());
+        }
 
         let same_line_file = proj_dir.join("PostSameLineComment.lean");
         let same_line_src =

@@ -887,8 +887,40 @@ fn classify_word256_or_unqualified_call(
     }
 }
 
-fn emit_cuda_expr(expr: &LeanExpr) -> Result<String> {
-    emit_cuda_expr_with_mode(expr, false)
+fn is_nat_valued_expr(expr: &LeanExpr) -> bool {
+    match expr {
+        LeanExpr::Member(_, field) => matches!(field.as_str(), "val" | "toNat"),
+        LeanExpr::IfThenElse(_, t, e) => is_nat_valued_expr(t) || is_nat_valued_expr(e),
+        LeanExpr::Unary(_, inner) => is_nat_valued_expr(inner),
+        LeanExpr::Binary(op, l, r) => {
+            !matches!(
+                ScalarBinOp::from_infix(op),
+                Some(
+                    ScalarBinOp::Eq
+                        | ScalarBinOp::Ne
+                        | ScalarBinOp::Lt
+                        | ScalarBinOp::Le
+                        | ScalarBinOp::Gt
+                        | ScalarBinOp::Ge
+                        | ScalarBinOp::BoolAnd
+                        | ScalarBinOp::BoolOr
+                )
+            ) && (is_nat_valued_expr(l) || is_nat_valued_expr(r))
+        }
+        LeanExpr::App(head, args) => flatten_qualified_name(head).is_some_and(|fname| {
+            fname.rsplit_once('.').is_some_and(|(prefix, short)| {
+                prefix == "Nat"
+                    && !matches!(
+                        classify_nat_call(short, args.len()),
+                        Some(ResolvedCallOp::Binary {
+                            op: ScalarBinOp::Eq | ScalarBinOp::Lt | ScalarBinOp::Le,
+                            ..
+                        }) | None
+                    )
+            })
+        }),
+        _ => false,
+    }
 }
 
 fn emit_cuda_expr_with_mode(expr: &LeanExpr, is_nat_ctx: bool) -> Result<String> {
@@ -964,29 +996,36 @@ fn emit_cuda_expr_with_mode(expr: &LeanExpr, is_nat_ctx: bool) -> Result<String>
         }
         LeanExpr::IfThenElse(c, t, e) => Ok(format!(
             "(({}) ? ({}) : ({}))",
-            emit_cuda_expr_with_mode(c, is_nat_ctx)?,
+            emit_cuda_expr_with_mode(c, false)?,
             emit_cuda_expr_with_mode(t, is_nat_ctx)?,
             emit_cuda_expr_with_mode(e, is_nat_ctx)?
         )),
         LeanExpr::Unary(op, inner) => {
-            let ic = emit_cuda_expr_with_mode(inner, is_nat_ctx)?;
-            match classify_unary_op(op) {
-                Some(ScalarUnaryOp::BitNot) => Ok(format!("lean_bitnot({})", ic)),
-                Some(ScalarUnaryOp::BoolNot) => Ok(format!("(!({}))", ic)),
-                Some(ScalarUnaryOp::Neg) => Ok(if is_nat_ctx {
+            let un_op = classify_unary_op(op)
+                .ok_or_else(|| anyhow::anyhow!("Unsupported unary operator `{}`", op))?;
+            let sub_nat = !matches!(un_op, ScalarUnaryOp::BoolNot)
+                && (is_nat_ctx || is_nat_valued_expr(inner));
+            let ic = emit_cuda_expr_with_mode(inner, sub_nat)?;
+            match un_op {
+                ScalarUnaryOp::BitNot => Ok(format!("lean_bitnot({})", ic)),
+                ScalarUnaryOp::BoolNot => Ok(format!("(!({}))", ic)),
+                ScalarUnaryOp::Neg => Ok(if sub_nat {
                     "0ULL".to_string()
                 } else {
                     format!("lean_neg({})", ic)
                 }),
-                None => bail!("Unsupported unary operator `{}`", op),
             }
         }
         LeanExpr::Binary(op, lhs, rhs) => {
             let bin_op = ScalarBinOp::from_infix(op)
                 .ok_or_else(|| anyhow::anyhow!("Unsupported binary operator `{}`", op))?;
-            let l = emit_cuda_expr_with_mode(lhs, is_nat_ctx)?;
-            let r = emit_cuda_expr_with_mode(rhs, is_nat_ctx)?;
-            Ok(bin_op.emit_cuda_call(&l, &r, is_nat_ctx))
+            let sub_nat = (!matches!(bin_op, ScalarBinOp::BoolAnd | ScalarBinOp::BoolOr)
+                && is_nat_ctx)
+                || is_nat_valued_expr(lhs)
+                || is_nat_valued_expr(rhs);
+            let l = emit_cuda_expr_with_mode(lhs, sub_nat)?;
+            let r = emit_cuda_expr_with_mode(rhs, sub_nat)?;
+            Ok(bin_op.emit_cuda_call(&l, &r, sub_nat))
         }
         LeanExpr::App(head, args) => {
             let fname = flatten_qualified_name(head).ok_or_else(|| {
@@ -1230,8 +1269,8 @@ fn split_equality_ast(expr: &LeanExpr) -> Option<(&LeanExpr, &LeanExpr)> {
     }
 }
 
-fn emit_cuda_rhs_for_param(expr: &LeanExpr, cuda_type: &str) -> Result<String> {
-    let raw = emit_cuda_expr(expr)?;
+fn emit_cuda_rhs_for_param(expr: &LeanExpr, cuda_type: &str, is_nat: bool) -> Result<String> {
+    let raw = emit_cuda_expr_with_mode(expr, is_nat)?;
     if cuda_type == "u256" && matches!(expr, LeanExpr::Number(_)) {
         Ok(format!("u256_from_u64({})", raw))
     } else {
@@ -1249,6 +1288,7 @@ pub fn transpile_lean_theorem_to_cuda(
 
     let mut params = Vec::new();
     let mut raw_hyp_exprs = Vec::new();
+    let mut binder_hyps = Vec::new();
 
     for (names, ty) in &extracted.binders {
         if let Some(cuda_ty) = classify_binder_cuda_type(ty) {
@@ -1260,9 +1300,7 @@ pub fn transpile_lean_theorem_to_cuda(
                 });
             }
         } else if let Ok(cond_expr) = parse_lean_expr_str(ty) {
-            if emit_cuda_expr(&cond_expr).is_ok() {
-                flatten_conjunctions(cond_expr, &mut raw_hyp_exprs);
-            }
+            binder_hyps.push(cond_expr);
         }
     }
 
@@ -1281,6 +1319,12 @@ pub fn transpile_lean_theorem_to_cuda(
             } else {
                 scalar_dom = Some(d);
             }
+        }
+    }
+    let root_is_nat = scalar_dom.is_some_and(|d| d.is_nat);
+    for cond_expr in binder_hyps {
+        if emit_cuda_expr_with_mode(&cond_expr, root_is_nat).is_ok() {
+            flatten_conjunctions(cond_expr, &mut raw_hyp_exprs);
         }
     }
 
@@ -1306,7 +1350,7 @@ pub fn transpile_lean_theorem_to_cuda(
         std::collections::HashMap::new();
 
     for hyp_expr in &raw_hyp_exprs {
-        let cond_cuda = emit_cuda_expr(hyp_expr)?;
+        let cond_cuda = emit_cuda_expr_with_mode(hyp_expr, root_is_nat)?;
         preconditions_cuda.push(cond_cuda.clone());
 
         let mut substituted = false;
@@ -1321,9 +1365,11 @@ pub fn transpile_lean_theorem_to_cuda(
                                 && !rhs_vars.contains(target_name)
                                 && !depends_transitively_on(&rhs_vars, target_name, &subst_deps)
                             {
-                                if let Ok(rhs_cuda) =
-                                    emit_cuda_rhs_for_param(val_e, &p_info.cuda_type)
-                                {
+                                if let Ok(rhs_cuda) = emit_cuda_rhs_for_param(
+                                    val_e,
+                                    &p_info.cuda_type,
+                                    p_info.lean_type.trim() == "Nat",
+                                ) {
                                     subst_deps.insert(target_name.clone(), rhs_vars);
                                     subst_exprs.push((target_name.clone(), rhs_cuda));
                                     substituted = true;
@@ -1380,11 +1426,14 @@ pub fn transpile_lean_theorem_to_cuda(
 
     let lhs_ast = parse_lean_expr_str(&lhs_lean)?;
     let rhs_ast = parse_lean_expr_str(&rhs_lean)?;
-    let lhs_cuda_expr = emit_cuda_expr(&lhs_ast)?;
+    let eq_is_nat = scalar_dom.is_some_and(|d| d.is_nat)
+        || is_nat_valued_expr(&lhs_ast)
+        || is_nat_valued_expr(&rhs_ast);
+    let lhs_cuda_expr = emit_cuda_expr_with_mode(&lhs_ast, eq_is_nat)?;
     let rhs_cuda_expr = if is_ne {
         bail!("Top-level inequality conclusion not yet supported as equality target")
     } else {
-        emit_cuda_expr(&rhs_ast)?
+        emit_cuda_expr_with_mode(&rhs_ast, eq_is_nat)?
     };
 
     let cuda_source = generate_cuda_fastcheck_source(
@@ -1526,6 +1575,15 @@ pub fn generate_cuda_fastcheck_source(
     } else {
         "0"
     };
+    let neq_cuda = if lhs_cuda.contains("nat_")
+        || rhs_cuda.contains("nat_")
+        || lhs_cuda.contains("lean_to_nat(")
+        || rhs_cuda.contains("lean_to_nat(")
+    {
+        "!nat_eq(lhs_val, rhs_val)"
+    } else {
+        "!lean_eq(lhs_val, rhs_val)"
+    };
 
     format!(
         r#"// Auto-transpiled by turbo-lean from Lean 4 theorem `{decl_name}`
@@ -1583,7 +1641,7 @@ HD u256 u256_max()  {{ return make_u256(~0ULL, ~0ULL, ~0ULL, ~0ULL); }}
 HD u256 u256_from_u64(uint64_t x) {{ return make_u256(x, 0ULL, 0ULL, 0ULL); }}
 
 HD bool lean_eq(const u256& a, const u256& b) {{ return ((a.w0 ^ b.w0) | (a.w1 ^ b.w1) | (a.w2 ^ b.w2) | (a.w3 ^ b.w3)) == 0ULL; }}
-HD bool lean_eq(uint64_t a, uint64_t b) {{ return (a & SCALAR_MASK) == (b & SCALAR_MASK); }}
+HD bool lean_eq(uint64_t a, uint64_t b) {{ return IS_NAT ? (a == b) : ((a & SCALAR_MASK) == (b & SCALAR_MASK)); }}
 HD bool lean_eq(bool a, bool b) {{ return a == b; }}
 HD bool lean_eq(const u256_bool_pair& a, const u256_bool_pair& b) {{ return lean_eq(a.fst, b.fst) && (a.snd == b.snd); }}
 HD bool lean_eq(const u256& a, uint64_t b) {{ return lean_eq(a, u256_from_u64(b)); }}
@@ -1595,9 +1653,9 @@ HD bool lean_lt(const u256& a, const u256& b) {{
     if (a.w1 != b.w1) return a.w1 < b.w1;
     return a.w0 < b.w0;
 }}
-HD bool lean_lt(uint64_t a, uint64_t b) {{ return (a & SCALAR_MASK) < (b & SCALAR_MASK); }}
+HD bool lean_lt(uint64_t a, uint64_t b) {{ return IS_NAT ? (a < b) : ((a & SCALAR_MASK) < (b & SCALAR_MASK)); }}
 HD bool lean_le(const u256& a, const u256& b) {{ return !lean_lt(b, a); }}
-HD bool lean_le(uint64_t a, uint64_t b) {{ return (a & SCALAR_MASK) <= (b & SCALAR_MASK); }}
+HD bool lean_le(uint64_t a, uint64_t b) {{ return IS_NAT ? (a <= b) : ((a & SCALAR_MASK) <= (b & SCALAR_MASK)); }}
 
 HD u256 lean_bitand(const u256& a, const u256& b) {{ return make_u256(a.w0 & b.w0, a.w1 & b.w1, a.w2 & b.w2, a.w3 & b.w3); }}
 HD uint64_t lean_bitand(uint64_t a, uint64_t b) {{ return (a & b) & SCALAR_MASK; }}
@@ -1848,7 +1906,7 @@ __global__ void check_transpiled_theorem_kernel(
             cuda_opaque_barrier(lhs_val);
             if (!has_nat_overflow()) {{
                 satisfied = true;
-                if (!lean_eq(lhs_val, rhs_val)) {{
+                if ({neq_cuda}) {{
                     viol = true;
                 }}
             }}
@@ -1961,7 +2019,7 @@ int main(int argc, char** argv) {{
             auto rhs_val = {rhs_cuda};
             if (!has_nat_overflow()) {{
                 h_satisfied_count++;
-                if (!lean_eq(lhs_val, rhs_val)) {{
+                if ({neq_cuda}) {{
                     h_violations++;
                     if (idx < h_first_ce) h_first_ce = idx;
                 }}
@@ -4998,20 +5056,39 @@ fn eval_lean_expr_fast_with_domain(
             ))
         }
         LeanExpr::IfThenElse(c, t, e) => {
-            if eval_lean_expr_fast_with_domain(c, env, dom, root_dom)?.as_bool()? {
+            if eval_lean_expr_fast_with_domain(c, env, root_dom, root_dom)?.as_bool()? {
                 eval_lean_expr_fast_with_domain(t, env, dom, root_dom)
             } else {
                 eval_lean_expr_fast_with_domain(e, env, dom, root_dom)
             }
         }
         LeanExpr::Unary(op, inner) => {
-            let v = eval_lean_expr_fast_with_domain(inner, env, dom, root_dom)?;
-            eval_scalar_unary_op(classify_unary_op(op)?, v, dom)
+            let un_op = classify_unary_op(op)?;
+            let sub_dom = if matches!(un_op, ScalarUnaryOp::BoolNot) {
+                root_dom
+            } else if dom.is_nat || is_nat_valued_expr(inner) {
+                ScalarEvalDomain::NAT
+            } else {
+                dom
+            };
+            let v = eval_lean_expr_fast_with_domain(inner, env, sub_dom, root_dom)?;
+            eval_scalar_unary_op(un_op, v, sub_dom)
         }
         LeanExpr::Binary(op, lhs, rhs) => {
-            let l = eval_lean_expr_fast_with_domain(lhs, env, dom, root_dom)?;
-            let r = eval_lean_expr_fast_with_domain(rhs, env, dom, root_dom)?;
-            eval_scalar_bin_op(ScalarBinOp::from_infix(op)?, l, r, dom)
+            let bin_op = ScalarBinOp::from_infix(op)?;
+            let sub_dom = if is_nat_valued_expr(lhs)
+                || is_nat_valued_expr(rhs)
+                || (!matches!(bin_op, ScalarBinOp::BoolAnd | ScalarBinOp::BoolOr) && dom.is_nat)
+            {
+                ScalarEvalDomain::NAT
+            } else if matches!(bin_op, ScalarBinOp::BoolAnd | ScalarBinOp::BoolOr) {
+                root_dom
+            } else {
+                dom
+            };
+            let l = eval_lean_expr_fast_with_domain(lhs, env, sub_dom, root_dom)?;
+            let r = eval_lean_expr_fast_with_domain(rhs, env, sub_dom, root_dom)?;
+            eval_scalar_bin_op(bin_op, l, r, sub_dom)
         }
         LeanExpr::App(head, args) => {
             let fname = flatten_qualified_name(head)?;
@@ -7197,6 +7274,9 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
             ("bv8_shr_trunc", "theorem bv8_shr_trunc (x : BitVec 8) : x >>> 8 = 0 := by sorry"),
             ("bv64_shl_trunc", "theorem bv64_shl_trunc (x : BitVec 64) : x <<< 64 = 0 := by sorry"),
             ("bv8_sub_tonat_in_nat_add", "theorem bv8_sub_tonat_in_nat_add (x : BitVec 8) : Nat.add (0 - x).toNat 0 = (0 - x).toNat := by sorry"),
+            ("bv8_sub_tonat_infix", "theorem bv8_sub_tonat_infix (x : BitVec 8) : (0 - x).toNat - 256 = 0 := by sorry"),
+            ("bv8_tonat_overflow_wrap", "theorem bv8_tonat_overflow_wrap (x : BitVec 8) : x.toNat + 256 = Nat.add x.toNat 256 := by sorry"),
+            ("bv8_ite_subword_cond", "theorem bv8_ite_subword_cond (x : BitVec 8) : (if 0 - x == 255 then x.toNat else x.toNat) = x.toNat := by sorry"),
             ("nat_lt_succ", "theorem nat_lt_succ (n : Nat) : (n < n + 1) = true := by sorry"),
             ("nat_sub_le", "theorem nat_sub_le (a b : Nat) : (a - b <= a) = true := by sorry"),
         ];
@@ -7206,12 +7286,25 @@ theorem swar_scale_let_conclusion (a b : UInt64) (h : a < 100) :
             let (rep, _, _) = eval_extracted_decl_in_memory(&decl, 256).unwrap();
             assert!(rep.verified && rep.violations == 0, "{name}");
             let kernel = transpile_lean_theorem_to_cuda(stmt, Some(name)).unwrap();
+            let raw_rep = execute_transpiled_cuda_kernel_raw(&kernel, 256, false).unwrap();
+            assert!(
+                raw_rep.verified && raw_rep.violations == 0,
+                "{name} raw: {raw_rep:?}"
+            );
             let exec_rep = execute_transpiled_cuda_kernel(&kernel, 256, false).unwrap();
             assert!(
                 exec_rep.verified && exec_rep.violations == 0,
                 "{name}: {exec_rep:?}"
             );
         }
+        let buggy_bv8_tonat =
+            "theorem buggy_bv8_tonat (x : BitVec 8) : x.toNat + 256 = x.toNat := by sorry";
+        assert!(try_lnir_fast_reject("buggy_bv8_tonat", buggy_bv8_tonat).is_some());
+        let buggy_bv8_kernel =
+            transpile_lean_theorem_to_cuda(buggy_bv8_tonat, Some("buggy_bv8_tonat")).unwrap();
+        let buggy_bv8_raw =
+            execute_transpiled_cuda_kernel_raw(&buggy_bv8_kernel, 256, false).unwrap();
+        assert!(!buggy_bv8_raw.verified && buggy_bv8_raw.violations > 0);
         let mixed_stmt =
             "theorem mixed_u8_u32 (x : UInt8) (y : UInt32) : y >>> 8 = y / 256 := by sorry";
         assert_eq!(try_lnir_fast_reject("mixed_u8_u32", mixed_stmt), None);
