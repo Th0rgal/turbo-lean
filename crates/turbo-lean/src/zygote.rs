@@ -4183,6 +4183,7 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
 /// taint/fragment each other's closure slices, then runs `--audit-modules --skip-child-replay` over
 /// `audit_mods` only and persists replay authority for both sets (including `extra_root_lib`
 /// overlay `.olean` roots).
+#[cfg(test)]
 pub(crate) fn replay_and_audit_modules_with_zygote(
     store: &TurboStore,
     cfg: &crate::module_builder::ProjectConfig,

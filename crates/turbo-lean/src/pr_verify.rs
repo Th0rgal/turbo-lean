@@ -15802,9 +15802,20 @@ end ParityNs
             head_statement_report_cache_action_key(&tree.project, None, &cfg, &cert_snap)
                 .expect("snapshot-bound head statement cache key");
 
-        // Mutate live `.olean` after certification: cache key must stay bound to `cert_snap`,
-        // while `built_kernel_statement_report_bound` and `ensure_live_closure_matches_snapshot`
-        // must fail closed on the live mismatch!
+        let rep = built_kernel_statement_report_bound(
+            &tree.project,
+            None,
+            false,
+            Some(&store.root),
+            None,
+            Some(&cert_snap),
+        )?;
+        assert!(
+            rep.statements.keys().any(|k| k.ends_with("::a_thm")),
+            "expected a_thm in snapshot-bound statement report: {:?}",
+            rep.statements
+        );
+
         fs::write(&live_olean, &swapped_olean)?;
         let key_after =
             head_statement_report_cache_action_key(&tree.project, None, &cfg, &cert_snap)
@@ -15826,22 +15837,7 @@ end ParityNs
             format!("{dump_err:#}").contains("closure"),
             "expected closure mismatch error, got: {dump_err:#}"
         );
-
-        // Restore clean live `.olean` and verify snapshot-bound dump succeeds cleanly.
         fs::write(&live_olean, &clean_olean)?;
-        let rep = built_kernel_statement_report_bound(
-            &tree.project,
-            None,
-            false,
-            Some(&store.root),
-            None,
-            Some(&cert_snap),
-        )?;
-        assert!(
-            rep.statements.keys().any(|k| k.ends_with("::a_thm")),
-            "expected a_thm in snapshot-bound statement report: {:?}",
-            rep.statements
-        );
 
         // Also verify proof-irrelevant overlay certification binds unchanged base modules
         // and modified overlay modules across sealed `base_snap` and `head_snap` snapshots.
