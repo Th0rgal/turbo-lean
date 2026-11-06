@@ -29,8 +29,6 @@ const UNCHECKED: &[&str] = &[
 const TOTAL_INSTANCE_HEADS: &[&str] = &[
     "BEq",
     "DecidableEq",
-    "DecidablePred",
-    "DecidableRel",
     "Hashable",
     "LE",
     "LT",
@@ -41,6 +39,59 @@ const TOTAL_INSTANCE_HEADS: &[&str] = &[
 
 const PRIMITIVE_LAWFUL_TYPES: &[&str] = &[
     "Bool", "Char", "Int", "Nat", "String", "UInt8", "UInt16", "UInt32", "UInt64", "USize",
+];
+
+const RESERVED_INSTANCE_AND_TYPE_NAMES: &[&str] = &[
+    "BEq",
+    "DecidableEq",
+    "DecidablePred",
+    "DecidableRel",
+    "Hashable",
+    "LE",
+    "LT",
+    "Ord",
+    "Repr",
+    "ToString",
+    "LawfulBEq",
+    "EquivBEq",
+    "LawfulHashable",
+    "Bool",
+    "Char",
+    "Int",
+    "Nat",
+    "String",
+    "UInt8",
+    "UInt16",
+    "UInt32",
+    "UInt64",
+    "USize",
+    "Unit",
+    "PUnit",
+    "True",
+    "False",
+    "Empty",
+    "PEmpty",
+    "Fin",
+    "BitVec",
+    "Word256",
+    "UInt256",
+    "Uint256",
+    "Int256",
+    "List",
+    "Array",
+    "Option",
+    "Prod",
+    "PProd",
+    "Sigma",
+    "PSigma",
+    "Exists",
+    "Subtype",
+    "ULift",
+    "PLift",
+    "Thunk",
+    "Fact",
+    "Nonempty",
+    "Inhabited",
 ];
 
 pub fn run_spec_card_command(
@@ -54,28 +105,16 @@ pub fn run_spec_card_command(
     anyhow::ensure!(!files.is_empty(), "No files provided to spec-card");
     for file in files {
         anyhow::ensure!(
-            file.exists(),
+            fs::symlink_metadata(file).is_ok(),
             "Failed to read {}: path does not exist",
             file.display()
         );
     }
     if let Some(policy) = policy_override {
-        anyhow::ensure!(
-            matches!(
-                policy.trim().to_ascii_lowercase().as_str(),
-                "default" | "permissive" | "strict-proofs" | "strict_proofs" | "strict"
-            ),
-            "Unknown audit-spec policy: {policy}"
-        );
+        AuditSpecPolicyConfig::try_from_preset(policy)?;
     }
     if let Some(path) = config_override {
-        let text = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read audit-spec config {}", path.display()))?;
-        anyhow::ensure!(
-            AuditSpecPolicyConfig::parse_config_str(&text).is_some(),
-            "Invalid audit-spec config {}",
-            path.display()
-        );
+        AuditSpecPolicyConfig::try_load_for_target(Path::new(""), None, Some(path), &[], &[])?;
     }
     let started = Instant::now();
     let mut sources = Vec::new();
@@ -93,15 +132,15 @@ pub fn run_spec_card_command(
     let mut any_audit_error = false;
     let mut resolved_policies = Vec::with_capacity(sources.len());
     for (path, src) in &sources {
-        let policy = AuditSpecPolicyConfig::load_for_target(
+        let policy = AuditSpecPolicyConfig::try_load_for_target(
             path,
             policy_override,
             config_override,
             &[],
             &[],
-        );
+        )?;
         resolved_policies.push(policy.policy.clone());
-        let audit = audit_spec_file_or_source_with_policy(path, None, decl_filter, &policy);
+        let audit = audit_spec_file_or_source_with_policy(path, Some(src), decl_filter, &policy);
         if audit.get("status").and_then(Value::as_str) == Some("error") {
             any_audit_error = true;
         }
@@ -126,6 +165,9 @@ pub fn run_spec_card_command(
             && !public_sig
                 .public_signature_digest
                 .starts_with("pubsig-invalid:");
+        if public_only && !visibility_known {
+            extraction_incomplete = true;
+        }
         let local_defs = extract_local_def_unfoldings(&clean);
         let details = audit
             .get("specs")
@@ -133,11 +175,14 @@ pub fn run_spec_card_command(
             .cloned()
             .unwrap_or_default();
         let all_decls = extract_all_lean_theorems(src, None);
-        let (extras, file_has_malformed_scope) = scan_decl_extras(src);
-        if file_has_malformed_scope {
+        let scan = scan_decl_extras(src);
+        if scan.has_malformed_scope || scan.has_unmodeled_syntax_env {
             extraction_incomplete = true;
         }
-        let aligned_extras = all_decls.len() == extras.len();
+        let aligned_extras = all_decls.len() == scan.extras.len();
+        if !aligned_extras {
+            extraction_incomplete = true;
+        }
         let mut filtered_idx = 0usize;
         for (decl_idx, decl) in all_decls.into_iter().enumerate() {
             let matches_filter = match decl_filter {
@@ -152,7 +197,7 @@ pub fn run_spec_card_command(
             matched += 1;
             let detail = details.get(filtered_idx);
             filtered_idx += 1;
-            let extra = aligned_extras.then(|| &extras[decl_idx]);
+            let extra = aligned_extras.then(|| &scan.extras[decl_idx]);
             let effective_name = extra.map_or(decl.name.as_str(), |row| row.name.as_str());
             let visibility = visibility_of(
                 effective_name,
@@ -160,11 +205,12 @@ pub fn run_spec_card_command(
                 visibility_known,
                 public_sig.is_module,
                 extra,
+                scan.has_malformed_scope,
             );
             if public_only && visibility != "public" {
                 if visibility == "unresolved"
                     || extra.is_none()
-                    || extra.is_some_and(|row| row.saw_unparsed_binder)
+                    || extra.is_some_and(|row| row.saw_malformed_prefix)
                 {
                     extraction_incomplete = true;
                 }
@@ -176,6 +222,8 @@ pub fn run_spec_card_command(
                 local_defs: &local_defs,
                 hygiene: &hygiene,
                 audit: &audit,
+                has_unmodeled_instance_env: scan.has_unmodeled_instance_env,
+                has_unmodeled_syntax_env: scan.has_unmodeled_syntax_env,
             };
             cards.push(card_for(
                 &ctx,
@@ -187,8 +235,12 @@ pub fn run_spec_card_command(
             ));
         }
     }
+    let policy_mixed = resolved_policies
+        .as_slice()
+        .windows(2)
+        .any(|pair| pair[0] != pair[1]);
     let policy_name = match resolved_policies.first() {
-        Some(first) if resolved_policies.iter().all(|item| item == first) => first.clone(),
+        Some(first) if !policy_mixed => first.clone(),
         Some(_) => "mixed".to_string(),
         None => policy_override.unwrap_or("default").to_string(),
     };
@@ -210,7 +262,8 @@ pub fn run_spec_card_command(
         && !hygiene_dirty
         && !filter_miss
         && !public_miss
-        && !incomplete;
+        && !incomplete
+        && !policy_mixed;
     let status = if any_audit_error {
         "error"
     } else if ok {
@@ -248,8 +301,15 @@ pub fn run_spec_card_command(
 }
 
 fn load_sources(file: &Path) -> Result<Vec<(PathBuf, String)>> {
+    let meta =
+        fs::symlink_metadata(file).with_context(|| format!("Failed to read {}", file.display()))?;
+    anyhow::ensure!(
+        !meta.file_type().is_symlink(),
+        "Refusing to follow symlink {}",
+        file.display()
+    );
     if file.is_dir() {
-        let paths = crate::lake_build::collect_lean_files(file);
+        let paths = collect_source_paths(file)?;
         if paths.is_empty() {
             bail!("No readable Lean files found in {}", file.display());
         }
@@ -266,15 +326,75 @@ fn load_sources(file: &Path) -> Result<Vec<(PathBuf, String)>> {
         fs::read_to_string(file).with_context(|| format!("Failed to read {}", file.display()))?;
     let mut sources = vec![(file.to_path_buf(), src)];
     let sub_dir = file.with_extension("");
-    if sub_dir.is_dir() {
-        for path in crate::lake_build::collect_lean_files(&sub_dir) {
-            let sub_src = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read {}", path.display()))?;
-            sources.push((path, sub_src));
+    if let Ok(sub_meta) = fs::symlink_metadata(&sub_dir) {
+        anyhow::ensure!(
+            !sub_meta.file_type().is_symlink(),
+            "Refusing to follow symlink {}",
+            sub_dir.display()
+        );
+        if sub_meta.is_dir() {
+            for path in collect_source_paths(&sub_dir)? {
+                let sub_src = fs::read_to_string(&path)
+                    .with_context(|| format!("Failed to read {}", path.display()))?;
+                sources.push((path, sub_src));
+            }
+            sources.sort_by(|left, right| left.0.cmp(&right.0));
         }
-        sources.sort_by(|left, right| left.0.cmp(&right.0));
     }
     Ok(sources)
+}
+
+fn collect_source_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    let root_meta =
+        fs::symlink_metadata(root).with_context(|| format!("Failed to read {}", root.display()))?;
+    anyhow::ensure!(
+        !root_meta.file_type().is_symlink(),
+        "Refusing to follow symlink {}",
+        root.display()
+    );
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        let entries =
+            fs::read_dir(&dir).with_context(|| format!("Failed to read {}", dir.display()))?;
+        for entry in entries {
+            let entry = entry.with_context(|| format!("Failed to read {}", dir.display()))?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            let meta = fs::symlink_metadata(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
+            anyhow::ensure!(
+                !meta.file_type().is_symlink(),
+                "Refusing to follow symlink {}",
+                path.display()
+            );
+            if meta.is_dir() {
+                if (depth > 0 && name_str.starts_with('.'))
+                    || matches!(
+                        name_str.as_ref(),
+                        ".git"
+                            | ".lake"
+                            | ".elan"
+                            | ".cargo"
+                            | ".benchmark-tools"
+                            | "target"
+                            | "node_modules"
+                    )
+                {
+                    continue;
+                }
+                stack.push((path, depth + 1));
+            } else if meta.is_file()
+                && path.extension().and_then(|ext| ext.to_str()) == Some("lean")
+                && name_str != "lakefile.lean"
+            {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
 }
 
 struct DeclExtra {
@@ -282,23 +402,52 @@ struct DeclExtra {
     is_private: bool,
     explicit_public: bool,
     instance_binders: Vec<String>,
+    ordered_type_params: Vec<BTreeSet<String>>,
     context_assumptions: Vec<String>,
+    saw_malformed_prefix: bool,
     saw_unparsed_binder: bool,
+    saw_unparsed_telescope: bool,
 }
 
-fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
+struct DeclScan {
+    extras: Vec<DeclExtra>,
+    has_malformed_scope: bool,
+    has_unmodeled_instance_env: bool,
+    has_unmodeled_syntax_env: bool,
+}
+
+enum PrefixAction {
+    Assumption(String),
+    UnmodeledEnv,
+    SyntaxEnv,
+    Malformed,
+    Ignore,
+}
+
+fn scan_decl_extras(src: &str) -> DeclScan {
     let masked = mask_comments(src);
     let chars: Vec<char> = masked.chars().collect();
     let byte_offsets: Vec<usize> = masked.char_indices().map(|(offset, _)| offset).collect();
     let n = chars.len();
     let mut i = 0usize;
     let mut scope: Vec<ScopeFrame> = Vec::new();
+    let public_section_stack_init: Vec<bool> = Vec::new();
+    let mut public_section_stack = public_section_stack_init;
+    let mut meta_section_stack: Vec<bool> = Vec::new();
     let mut context: Vec<Vec<String>> = vec![Vec::new()];
     let mut at_cmd_head = true;
     let mut pending_private = false;
     let mut pending_public = false;
+    let mut pending_meta = false;
+    let mut pending_noncomputable = false;
+    let mut pending_other_mod = false;
+    let mut pending_attr_has_instance = false;
     let mut pending_assumptions: Vec<String> = Vec::new();
+    let mut pending_saw_attr = false;
+    let mut pending_malformed_prefix = false;
     let mut has_malformed_scope = false;
+    let mut has_unmodeled_instance_env = false;
+    let mut has_unmodeled_syntax_env = false;
     let mut out = Vec::new();
     while i < n {
         if let Some(end) = skip_any(&masked, &byte_offsets, i) {
@@ -309,7 +458,13 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
             if !at_cmd_head {
                 pending_private = false;
                 pending_public = false;
+                pending_meta = false;
+                pending_noncomputable = false;
+                pending_other_mod = false;
+                pending_attr_has_instance = false;
                 pending_assumptions.clear();
+                pending_saw_attr = false;
+                pending_malformed_prefix = false;
             }
             at_cmd_head = true;
             i += 1;
@@ -319,7 +474,13 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
             at_cmd_head = true;
             pending_private = false;
             pending_public = false;
+            pending_meta = false;
+            pending_noncomputable = false;
+            pending_other_mod = false;
+            pending_attr_has_instance = false;
             pending_assumptions.clear();
+            pending_saw_attr = false;
+            pending_malformed_prefix = false;
             i += 1;
             continue;
         }
@@ -328,19 +489,90 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
             continue;
         }
         if at_cmd_head && chars[i] == '@' && i + 1 < n && chars[i + 1] == '[' {
+            if pending_private
+                || pending_public
+                || pending_meta
+                || pending_noncomputable
+                || pending_other_mod
+            {
+                pending_malformed_prefix = true;
+                has_malformed_scope = true;
+            }
             if let Some(end) = matching_close(&masked, &byte_offsets, &chars, i + 1, '[', ']') {
+                let inner: String = chars[i + 2..end - 1].iter().collect();
+                if attr_mentions_instance_or_class(&inner) {
+                    pending_attr_has_instance = true;
+                }
+                pending_saw_attr = true;
                 i = end;
                 continue;
             }
         }
         if at_cmd_head {
-            if let Some((after_in, inline_assumption)) =
-                consume_in_command_prefix(&masked, &byte_offsets, &chars, i)
-            {
-                if let Some(assumption) = inline_assumption {
-                    pending_assumptions.push(assumption);
+            let mut chained = false;
+            let mut base_cmd_col: Option<usize> = None;
+            while let Some((after_in, kw, action)) = consume_in_command_prefix(
+                &masked,
+                &byte_offsets,
+                &chars,
+                i,
+                base_cmd_col.unwrap_or_else(|| line_col(&chars, i)),
+            ) {
+                chained = true;
+                base_cmd_col.get_or_insert_with(|| line_col(&chars, i));
+                let prefix_allows_decl_mods = matches!(
+                    kw,
+                    "instance"
+                        | "def"
+                        | "abbrev"
+                        | "class"
+                        | "structure"
+                        | "inductive"
+                        | "coinductive"
+                        | "axiom"
+                        | "opaque"
+                        | "constant"
+                        | "example"
+                        | "theorem"
+                        | "lemma"
+                ) || syntax_env_keyword(kw);
+                if !prefix_allows_decl_mods
+                    && (pending_private
+                        || pending_public
+                        || pending_meta
+                        || pending_noncomputable
+                        || pending_other_mod
+                        || pending_saw_attr)
+                {
+                    has_malformed_scope = true;
+                    pending_malformed_prefix = true;
+                }
+                if pending_attr_has_instance {
+                    has_unmodeled_instance_env = true;
+                }
+                pending_private = false;
+                pending_public = false;
+                pending_meta = false;
+                pending_noncomputable = false;
+                pending_other_mod = false;
+                pending_attr_has_instance = false;
+                pending_saw_attr = false;
+                match action {
+                    PrefixAction::Assumption(assumption) => pending_assumptions.push(assumption),
+                    PrefixAction::UnmodeledEnv => has_unmodeled_instance_env = true,
+                    PrefixAction::SyntaxEnv => {
+                        has_unmodeled_syntax_env = true;
+                        has_unmodeled_instance_env = true;
+                    }
+                    PrefixAction::Malformed => has_malformed_scope = true,
+                    PrefixAction::Ignore => {}
                 }
                 i = after_in;
+                while i < n && chars[i].is_whitespace() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            if chained {
                 continue;
             }
         }
@@ -349,7 +581,13 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
                 at_cmd_head = false;
                 pending_private = false;
                 pending_public = false;
+                pending_meta = false;
+                pending_noncomputable = false;
+                pending_other_mod = false;
+                pending_attr_has_instance = false;
                 pending_assumptions.clear();
+                pending_saw_attr = false;
+                pending_malformed_prefix = false;
                 i = end;
                 continue;
             }
@@ -358,7 +596,13 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
             at_cmd_head = false;
             pending_private = false;
             pending_public = false;
+            pending_meta = false;
+            pending_noncomputable = false;
+            pending_other_mod = false;
+            pending_attr_has_instance = false;
             pending_assumptions.clear();
+            pending_saw_attr = false;
+            pending_malformed_prefix = false;
             i += 1;
             continue;
         }
@@ -388,10 +632,18 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
             if word == "private" || word == "local" {
                 pending_private = true;
                 pending_public = false;
-            }
-            if word == "public" {
+            } else if word == "public" {
+                if pending_meta || pending_noncomputable || pending_other_mod {
+                    pending_malformed_prefix = true;
+                }
                 pending_public = true;
                 pending_private = false;
+            } else if word == "meta" {
+                pending_meta = true;
+            } else if word == "noncomputable" {
+                pending_noncomputable = true;
+            } else {
+                pending_other_mod = true;
             }
             if word == "scoped" && i < n && chars[i] == '[' {
                 if let Some(end) = matching_close(&masked, &byte_offsets, &chars, i, '[', ']') {
@@ -403,6 +655,15 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
         let was_at_cmd_head = at_cmd_head;
         let decl_private = std::mem::replace(&mut pending_private, false);
         let decl_public = std::mem::replace(&mut pending_public, false);
+        let decl_meta = std::mem::replace(&mut pending_meta, false);
+        let decl_noncomputable = std::mem::replace(&mut pending_noncomputable, false);
+        let decl_other_mod = std::mem::replace(&mut pending_other_mod, false);
+        let decl_attr_has_instance = std::mem::replace(&mut pending_attr_has_instance, false);
+        let decl_saw_attr = std::mem::replace(&mut pending_saw_attr, false);
+        let decl_malformed_prefix = std::mem::replace(&mut pending_malformed_prefix, false);
+        if decl_attr_has_instance {
+            has_unmodeled_instance_env = true;
+        }
         let decl_inline_assumptions = if matches!(word.as_str(), "theorem" | "lemma") {
             std::mem::take(&mut pending_assumptions)
         } else {
@@ -411,16 +672,34 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
         if !matches!(
             word.as_str(),
             "namespace" | "section" | "mutual" | "theorem" | "lemma"
-        ) {
+        ) && word != "end"
+        {
             pending_assumptions.clear();
         }
         at_cmd_head = false;
         match word.as_str() {
             "namespace" if i < n && chars[i].is_whitespace() => {
-                if decl_public || decl_private {
+                if decl_public
+                    || decl_private
+                    || decl_saw_attr
+                    || decl_other_mod
+                    || decl_meta
+                    || decl_noncomputable
+                    || decl_malformed_prefix
+                {
                     has_malformed_scope = true;
                 }
-                let (name, next) = dotted_name(&masked, &byte_offsets, &chars, i, n);
+                let (name, next, _crossed) = dotted_name_multiline(
+                    &masked,
+                    &byte_offsets,
+                    &chars,
+                    i,
+                    n,
+                    line_col(&chars, start),
+                );
+                if name.is_empty() {
+                    has_malformed_scope = true;
+                }
                 i = next;
                 let segs: Vec<&str> = crate::splitter::split_lean_name_components(&name);
                 let inline = std::mem::take(&mut pending_assumptions);
@@ -431,6 +710,8 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
                         name: seg.to_string(),
                         open_span_idx: 0,
                     });
+                    public_section_stack.push(false);
+                    meta_section_stack.push(false);
                     context.push(if seg_idx == last_idx {
                         inline.clone()
                     } else {
@@ -440,14 +721,32 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
                 at_cmd_head = true;
             }
             "section" => {
-                if decl_private {
+                if decl_private
+                    || decl_other_mod
+                    || decl_malformed_prefix
+                    || (decl_saw_attr && !decl_public)
+                    || (decl_meta && decl_saw_attr)
+                    || (decl_meta && decl_noncomputable)
+                {
                     has_malformed_scope = true;
                 }
-                let (name, next) = if i < n && chars[i].is_whitespace() && chars[i] != '\n' {
-                    dotted_name(&masked, &byte_offsets, &chars, i, n)
+                let (name, next, _crossed) = if i < n && chars[i].is_whitespace() {
+                    dotted_name_multiline(
+                        &masked,
+                        &byte_offsets,
+                        &chars,
+                        i,
+                        n,
+                        line_col(&chars, start),
+                    )
                 } else {
-                    (String::new(), i)
+                    (String::new(), i, false)
                 };
+                if (decl_public || decl_meta || decl_noncomputable || decl_saw_attr)
+                    && !name.is_empty()
+                {
+                    has_malformed_scope = true;
+                }
                 i = next;
                 let segs: Vec<String> = if name.is_empty() {
                     vec![String::new()]
@@ -465,6 +764,8 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
                         name: seg,
                         open_span_idx: 0,
                     });
+                    public_section_stack.push(decl_public);
+                    meta_section_stack.push(decl_meta);
                     context.push(if seg_idx == last_idx {
                         inline.clone()
                     } else {
@@ -474,7 +775,14 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
                 at_cmd_head = true;
             }
             "mutual" if i >= n || chars[i].is_whitespace() => {
-                if decl_public || decl_private {
+                if decl_public
+                    || decl_private
+                    || decl_saw_attr
+                    || decl_meta
+                    || decl_noncomputable
+                    || decl_other_mod
+                    || decl_malformed_prefix
+                {
                     has_malformed_scope = true;
                 }
                 scope.push(ScopeFrame {
@@ -482,33 +790,59 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
                     name: String::new(),
                     open_span_idx: 0,
                 });
+                public_section_stack.push(false);
+                meta_section_stack.push(false);
                 context.push(std::mem::take(&mut pending_assumptions));
                 at_cmd_head = true;
             }
             "end" if i >= n || chars[i].is_whitespace() => {
-                if decl_public || decl_private {
+                if decl_public
+                    || decl_private
+                    || decl_saw_attr
+                    || decl_meta
+                    || decl_noncomputable
+                    || decl_other_mod
+                    || decl_malformed_prefix
+                    || !pending_assumptions.is_empty()
+                {
                     has_malformed_scope = true;
+                    pending_assumptions.clear();
                 }
-                let (name, next) = if i < n && chars[i].is_whitespace() && chars[i] != '\n' {
-                    dotted_name(&masked, &byte_offsets, &chars, i, n)
+                let (name, next, _crossed) = if i < n && chars[i].is_whitespace() {
+                    dotted_name_multiline(
+                        &masked,
+                        &byte_offsets,
+                        &chars,
+                        i,
+                        n,
+                        line_col(&chars, start),
+                    )
                 } else {
-                    (String::new(), i)
+                    (String::new(), i, false)
                 };
                 i = next;
-                if pop_scope(&mut scope, &mut context, &name) {
+                if pop_scope(
+                    &mut scope,
+                    &mut public_section_stack,
+                    &mut meta_section_stack,
+                    &mut context,
+                    &name,
+                ) {
                     has_malformed_scope = true;
                 }
                 at_cmd_head = true;
             }
             "variable" | "variables" | "include" | "omit" => {
                 let body_start = i;
-                while i < n && chars[i] != '\n' && chars[i] != ';' {
-                    if let Some(end) = skip_any(&masked, &byte_offsets, i) {
-                        i = end;
-                        continue;
-                    }
-                    i += 1;
-                }
+                i = scan_command_body(
+                    &masked,
+                    &byte_offsets,
+                    &chars,
+                    &word,
+                    i,
+                    n,
+                    line_col(&chars, start),
+                );
                 let body: String = chars[body_start..i].iter().collect();
                 let clean_body = normalize_ws(&body);
                 if let Some(frame) = context.last_mut() {
@@ -517,6 +851,112 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
                     } else {
                         frame.push(format!("{word} {clean_body}"));
                     }
+                }
+            }
+            "instance"
+            | "deriving"
+            | "notation"
+            | "infix"
+            | "infixl"
+            | "infixr"
+            | "prefix"
+            | "postfix"
+            | "macro"
+            | "macro_rules"
+            | "elab"
+            | "elab_rules"
+            | "syntax"
+            | "run_cmd"
+            | "run_elab"
+            | "drun_elab"
+            | "run_meta"
+            | "unif_hint"
+            | "binder_predicate"
+            | "simproc"
+            | "dsimproc"
+            | "builtin_simproc"
+            | "builtin_dsimproc"
+            | "cbv_simproc"
+            | "builtin_cbv_simproc"
+            | "grind_pattern" => {
+                if syntax_env_keyword(&word) {
+                    has_unmodeled_syntax_env = true;
+                }
+                has_unmodeled_instance_env = true;
+                i = scan_command_body(
+                    &masked,
+                    &byte_offsets,
+                    &chars,
+                    &word,
+                    i,
+                    n,
+                    line_col(&chars, start),
+                );
+                if consume_trailing_in(&masked, &byte_offsets, &chars, &mut i) {
+                    at_cmd_head = true;
+                }
+            }
+            "attribute" => {
+                let body_start = i;
+                i = scan_command_body(
+                    &masked,
+                    &byte_offsets,
+                    &chars,
+                    &word,
+                    i,
+                    n,
+                    line_col(&chars, start),
+                );
+                let body: String = chars[body_start..i].iter().collect();
+                if attr_mentions_instance_or_class(&body) {
+                    has_unmodeled_instance_env = true;
+                }
+                if consume_trailing_in(&masked, &byte_offsets, &chars, &mut i) {
+                    at_cmd_head = true;
+                }
+            }
+            "open" | "export" => {
+                let body_start = i;
+                i = scan_command_body(
+                    &masked,
+                    &byte_offsets,
+                    &chars,
+                    &word,
+                    i,
+                    n,
+                    line_col(&chars, start),
+                );
+                let body: String = chars[body_start..i].iter().collect();
+                if RESERVED_INSTANCE_AND_TYPE_NAMES
+                    .iter()
+                    .any(|reserved| ident_mentioned(&body, reserved))
+                {
+                    has_unmodeled_instance_env = true;
+                }
+                if consume_trailing_in(&masked, &byte_offsets, &chars, &mut i) {
+                    at_cmd_head = true;
+                }
+            }
+            "class" | "structure" | "inductive" | "coinductive" | "def" | "abbrev" | "opaque"
+            | "constant" | "example" | "axiom" => {
+                let (decl_name, next) = dotted_name(&masked, &byte_offsets, &chars, i, n);
+                i = next;
+                let short = decl_name.rsplit('.').next().unwrap_or(decl_name.as_str());
+                let short_canon = crate::splitter::canonical_lean_name_component(short);
+                if RESERVED_INSTANCE_AND_TYPE_NAMES.contains(&short_canon.as_str()) {
+                    has_unmodeled_instance_env = true;
+                }
+                i = scan_command_body(
+                    &masked,
+                    &byte_offsets,
+                    &chars,
+                    &word,
+                    i,
+                    n,
+                    line_col(&chars, start),
+                );
+                if consume_trailing_in(&masked, &byte_offsets, &chars, &mut i) {
+                    at_cmd_head = true;
                 }
             }
             "theorem" | "lemma" => {
@@ -529,7 +969,9 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
                 }
                 i = next;
                 let mut binders = Vec::new();
-                let mut saw_unparsed_binder = !was_at_cmd_head;
+                let mut ordered_type_params: Vec<BTreeSet<String>> = Vec::new();
+                let mut cur_type_params: BTreeSet<String> = BTreeSet::new();
+                let mut saw_unparsed_binder = !was_at_cmd_head || decl_malformed_prefix;
                 let mut found_colon = false;
                 while i < n {
                     while i < n && chars[i].is_whitespace() {
@@ -557,6 +999,7 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
                         {
                             let inner: String = chars[open_at + 1..end - 1].iter().collect();
                             binders.push(normalize_ws(&inner));
+                            ordered_type_params.push(cur_type_params.clone());
                             i = end;
                         } else {
                             saw_unparsed_binder = true;
@@ -564,9 +1007,28 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
                         }
                     } else if chars[i] == '(' || chars[i] == '{' {
                         let close = if chars[i] == '(' { ')' } else { '}' };
+                        let open_at = i;
                         if let Some(end) =
                             matching_close(&masked, &byte_offsets, &chars, i, chars[i], close)
                         {
+                            let inner: String = chars[open_at + 1..end - 1].iter().collect();
+                            if explicit_binder_is_unparsed(&inner) {
+                                saw_unparsed_binder = true;
+                            } else if let Some((vars_part, ty_part)) =
+                                split_top_level_colon(inner.trim())
+                            {
+                                let ty_trimmed = ty_part.trim();
+                                if ty_trimmed == "Type"
+                                    || ty_trimmed.starts_with("Type ")
+                                    || ty_trimmed.starts_with("Sort ")
+                                {
+                                    for var in vars_part.split_whitespace() {
+                                        if !var.is_empty() {
+                                            cur_type_params.insert(var.to_string());
+                                        }
+                                    }
+                                }
+                            }
                             i = end;
                         } else {
                             saw_unparsed_binder = true;
@@ -593,15 +1055,16 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
                 let mut angle_depth = 0usize;
                 let mut pending_let_assign = false;
                 let mut stmt_end = n;
+                let mut saw_unparsed_telescope = false;
                 while i < n {
                     if let Some(end) = skip_any_lexeme(&masked, &byte_offsets, i) {
                         i = end;
                         continue;
                     }
                     let ch = chars[i];
-                    if ch == '(' || ch == '{' || ch == '[' {
+                    if ch == '(' || ch == '{' || ch == '[' || ch == '⦃' {
                         paren_depth += 1;
-                    } else if ch == ')' || ch == '}' || ch == ']' {
+                    } else if ch == ')' || ch == '}' || ch == ']' || ch == '⦄' {
                         paren_depth = paren_depth.saturating_sub(1);
                     } else if ch == '⟨' {
                         angle_depth += 1;
@@ -644,8 +1107,18 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
                     i += 1;
                 }
                 let prop_str: String = chars[stmt_start..stmt_end].iter().collect();
-                if inline_stmt_let_bindings(prop_str.trim()).is_empty() {
+                if stmt_end == n || prop_escaped_decl_boundary(&prop_str) {
+                    has_malformed_scope = true;
+                    saw_unparsed_telescope = true;
+                }
+                let trimmed_prop = inline_stmt_let_bindings(prop_str.trim());
+                if trimmed_prop.is_empty() {
                     continue;
+                }
+                if stmt_has_unparsed_telescope(&trimmed_prop)
+                    || statement_let_is_unsafe(&prop_str, &trimmed_prop)
+                {
+                    saw_unparsed_telescope = true;
                 }
                 let mut assumptions: Vec<String> = context
                     .iter()
@@ -655,23 +1128,45 @@ fn scan_decl_extras(src: &str) -> (Vec<DeclExtra>, bool) {
                 out.push(DeclExtra {
                     name: qualified_decl_name(&raw_name, &scope),
                     is_private: decl_private,
-                    explicit_public: decl_public,
+                    explicit_public: decl_public
+                        || (public_section_stack.iter().any(|&flag| flag) && !decl_private),
                     instance_binders: binders,
+                    ordered_type_params,
                     context_assumptions: assumptions,
+                    saw_malformed_prefix: decl_malformed_prefix,
                     saw_unparsed_binder,
+                    saw_unparsed_telescope,
                 });
+                let proof_cmd_col = line_col(&chars, start);
+                i = scan_command_body(&masked, &byte_offsets, &chars, &word, i, n, proof_cmd_col);
+                if consume_trailing_in(&masked, &byte_offsets, &chars, &mut i) {
+                    at_cmd_head = true;
+                }
             }
             _ => {}
         }
     }
-    (out, has_malformed_scope)
+    DeclScan {
+        extras: out,
+        has_malformed_scope,
+        has_unmodeled_instance_env,
+        has_unmodeled_syntax_env,
+    }
 }
 
-fn pop_scope(scope: &mut Vec<ScopeFrame>, context: &mut Vec<Vec<String>>, name: &str) -> bool {
+fn pop_scope(
+    scope: &mut Vec<ScopeFrame>,
+    public_section_stack: &mut Vec<bool>,
+    meta_section_stack: &mut Vec<bool>,
+    context: &mut Vec<Vec<String>>,
+    name: &str,
+) -> bool {
     if name.is_empty() {
         let Some(top) = scope.pop() else {
             return true;
         };
+        public_section_stack.pop();
+        meta_section_stack.pop();
         if context.len() > 1 {
             context.pop();
         }
@@ -685,21 +1180,982 @@ fn pop_scope(scope: &mut Vec<ScopeFrame>, context: &mut Vec<Vec<String>>, name: 
         let canon = crate::splitter::canonical_lean_name_component(seg);
         if let Some(pos) = scope
             .iter()
-            .rposition(|frame| crate::splitter::canonical_lean_name_component(&frame.name) == canon)
+            .rposition(|frame| frame_name_matches(&frame.name, &canon))
         {
             if pos + 1 != scope.len() {
                 malformed = true;
             }
             scope.truncate(pos);
+            public_section_stack.truncate(pos);
+            meta_section_stack.truncate(pos);
             context.truncate(pos + 1);
         } else {
             malformed = true;
-            if scope.pop().is_some() && context.len() > 1 {
-                context.pop();
+            if scope.pop().is_some() {
+                public_section_stack.pop();
+                meta_section_stack.pop();
+                if context.len() > 1 {
+                    context.pop();
+                }
             }
         }
     }
     malformed
+}
+
+fn frame_name_matches(frame_name: &str, canon: &str) -> bool {
+    crate::splitter::canonical_lean_name_component(frame_name) == canon
+}
+
+fn attr_mentions_instance_or_class(text: &str) -> bool {
+    ident_mentioned(text, "instance")
+        || ident_mentioned(text, "default_instance")
+        || ident_mentioned(text, "class")
+}
+
+fn explicit_binder_is_unparsed(inner: &str) -> bool {
+    let sanitized = mask_literals(inner);
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let Some((_, ty)) = split_top_level_colon(trimmed) else {
+        return true;
+    };
+    let ty = ty.trim();
+    ty.is_empty()
+        || ty.contains(":=")
+        || ident_mentioned(ty, "autoParam")
+        || ident_mentioned(ty, "optParam")
+        || ident_mentioned(ty, "outParam")
+        || ident_mentioned(ty, "semiOutParam")
+}
+
+fn statement_let_is_unsafe(prop: &str, inlined: &str) -> bool {
+    let clean_prop = mask_literals(prop);
+    let clean_inlined = mask_literals(inlined);
+    if ident_mentioned(&clean_prop, "have") || ident_mentioned(&clean_inlined, "let") {
+        return true;
+    }
+    let mut cur = prop.trim();
+    while let Some(after_let) = cur
+        .strip_prefix("let")
+        .filter(|rest| rest.starts_with(char::is_whitespace))
+    {
+        let rest = after_let.trim_start();
+        let name_end = rest
+            .find(|c: char| !is_ident_continue(c))
+            .unwrap_or(rest.len());
+        if name_end == 0 {
+            return true;
+        }
+        let var_name = &rest[..name_end];
+        let after_name = &rest[name_end..];
+        let Some(eq_idx) = scan_top_level_colon_eq(after_name) else {
+            return true;
+        };
+        let type_part = after_name[..eq_idx].trim();
+        if !type_part.is_empty() {
+            let Some(ty) = type_part.strip_prefix(':').map(str::trim) else {
+                return true;
+            };
+            if ty.is_empty() || !is_safe_inlined_let_type(ty) {
+                return true;
+            }
+        }
+        let after_eq = after_name[eq_idx + 2..].trim_start();
+        let Some((_rhs_end, body_start)) = scan_let_body_start(after_eq) else {
+            return true;
+        };
+        let body = after_eq[body_start..].trim_start();
+        if !ident_mentioned(body, var_name) {
+            return true;
+        }
+        cur = body;
+    }
+    false
+}
+
+fn scan_top_level_colon_eq(src: &str) -> Option<usize> {
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    while i < bytes.len() {
+        if let Some(span) = skip_lean_lexeme(src, i) {
+            i = span.end;
+            continue;
+        }
+        let ch = src[i..].chars().next()?;
+        match ch {
+            '(' | '{' | '[' | '⦃' | '⟨' => depth += 1,
+            ')' | '}' | ']' | '⦄' | '⟩' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 && bytes.get(i + 1) == Some(&b'=') => return Some(i),
+            ';' if depth == 0 => return None,
+            _ => {}
+        }
+        i += ch.len_utf8();
+    }
+    None
+}
+
+fn scan_let_body_start(src: &str) -> Option<(usize, usize)> {
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    while i < src.len() {
+        if let Some(span) = skip_lean_lexeme(src, i) {
+            i = span.end;
+            continue;
+        }
+        let ch = src[i..].chars().next()?;
+        match ch {
+            '(' | '{' | '[' | '⦃' | '⟨' => depth += 1,
+            ')' | '}' | ']' | '⦄' | '⟩' => depth = depth.saturating_sub(1),
+            ';' | '\n' if depth == 0 => return Some((i, i + 1)),
+            _ if depth == 0
+                && i > 0
+                && src.as_bytes()[i - 1].is_ascii_whitespace()
+                && src[i..].starts_with("in")
+                && src[i + 2..].chars().next().is_some_and(char::is_whitespace) =>
+            {
+                return Some((i, i + 2));
+            }
+            _ => {}
+        }
+        i += ch.len_utf8();
+    }
+    None
+}
+
+fn is_safe_inlined_let_type(ty: &str) -> bool {
+    matches!(
+        ty.trim(),
+        "Nat"
+            | "Int"
+            | "Bool"
+            | "String"
+            | "Char"
+            | "UInt8"
+            | "UInt16"
+            | "UInt32"
+            | "UInt64"
+            | "USize"
+            | "Unit"
+            | "PUnit"
+    )
+}
+
+fn line_col(chars: &[char], idx: usize) -> usize {
+    let mut col = 0usize;
+    let mut i = idx;
+    while i > 0 && chars[i - 1] != '\n' {
+        i -= 1;
+        col += 1;
+    }
+    col
+}
+
+fn next_significant(src: &str, byte_offsets: &[usize], chars: &[char], mut k: usize) -> usize {
+    while k < chars.len() && chars[k].is_whitespace() && chars[k] != ';' {
+        if let Some(end) = skip_any(src, byte_offsets, k) {
+            k = end;
+            continue;
+        }
+        k += 1;
+    }
+    k
+}
+
+fn token_is_keyword(chars: &[char], k: usize, kw: &str) -> bool {
+    let needle: Vec<char> = kw.chars().collect();
+    k + needle.len() <= chars.len()
+        && chars[k..k + needle.len()] == needle[..]
+        && (k + needle.len() >= chars.len() || !is_ident_continue(chars[k + needle.len()]))
+}
+
+fn is_top_level_command_token(chars: &[char], k: usize) -> bool {
+    const COMMANDS: &[&str] = &[
+        "theorem",
+        "lemma",
+        "def",
+        "abbrev",
+        "instance",
+        "class",
+        "structure",
+        "inductive",
+        "coinductive",
+        "axiom",
+        "opaque",
+        "constant",
+        "example",
+        "variable",
+        "variables",
+        "universe",
+        "universes",
+        "set_option",
+        "namespace",
+        "section",
+        "end",
+        "open",
+        "attribute",
+        "export",
+        "include",
+        "omit",
+        "notation",
+        "infix",
+        "infixl",
+        "infixr",
+        "prefix",
+        "postfix",
+        "macro",
+        "macro_rules",
+        "elab",
+        "elab_rules",
+        "syntax",
+        "mutual",
+        "deriving",
+        "run_cmd",
+        "run_elab",
+        "drun_elab",
+        "run_meta",
+        "unif_hint",
+        "binder_predicate",
+        "simproc",
+        "dsimproc",
+        "builtin_simproc",
+        "builtin_dsimproc",
+        "cbv_simproc",
+        "builtin_cbv_simproc",
+        "grind_pattern",
+        "public",
+        "private",
+        "protected",
+        "meta",
+        "noncomputable",
+        "local",
+        "scoped",
+        "unsafe",
+        "partial",
+        "nonrec",
+    ];
+    COMMANDS.iter().any(|kw| token_is_keyword(chars, k, kw))
+        || matches!(chars.get(k), Some('@' | '#'))
+}
+
+fn consume_trailing_in(src: &str, byte_offsets: &[usize], chars: &[char], idx: &mut usize) -> bool {
+    let k = next_significant(src, byte_offsets, chars, *idx);
+    if token_is_keyword(chars, k, "in") {
+        *idx = k + 2;
+        while *idx < chars.len() && chars[*idx].is_whitespace() && chars[*idx] != '\n' {
+            *idx += 1;
+        }
+        return true;
+    }
+    false
+}
+
+fn command_line_continues(
+    src: &str,
+    byte_offsets: &[usize],
+    chars: &[char],
+    kw: &str,
+    body_is_ws: bool,
+    cmd_col: usize,
+    newline_at: usize,
+) -> bool {
+    let k = next_significant(src, byte_offsets, chars, newline_at + 1);
+    if k >= chars.len() || chars[k] == ';' {
+        return false;
+    }
+    if token_is_keyword(chars, k, "in") {
+        return true;
+    }
+    if kw == "attribute" && body_is_ws && chars[k] == '[' {
+        return true;
+    }
+    if kw == "open"
+        && body_is_ws
+        && (token_is_keyword(chars, k, "scoped")
+            || token_is_keyword(chars, k, "hiding")
+            || token_is_keyword(chars, k, "renaming"))
+    {
+        return true;
+    }
+    if kw == "open" && body_is_ws && chars[k] == '(' {
+        return false;
+    }
+    line_col(chars, k) > cmd_col && !is_top_level_command_token(chars, k)
+}
+
+fn scan_command_body(
+    src: &str,
+    byte_offsets: &[usize],
+    chars: &[char],
+    kw: &str,
+    start: usize,
+    n: usize,
+    cmd_col: usize,
+) -> usize {
+    let mut i = start;
+    let mut depth = 0usize;
+    let mut body_is_ws = true;
+    let mut pending_let_in = false;
+    while i < n {
+        if let Some(end) = skip_any(src, byte_offsets, i) {
+            i = end;
+            continue;
+        }
+        match chars[i] {
+            '(' | '[' | '{' | '⦃' | '⟨' => {
+                depth += 1;
+                body_is_ws = false;
+            }
+            ')' | ']' | '}' | '⦄' | '⟩' => {
+                depth = depth.saturating_sub(1);
+                body_is_ws = false;
+            }
+            'l' if depth == 0
+                && token_is_keyword(chars, i, "let")
+                && (i == 0 || !is_ident_continue(chars[i - 1])) =>
+            {
+                pending_let_in = true;
+                body_is_ws = false;
+            }
+            'i' if depth == 0
+                && token_is_keyword(chars, i, "in")
+                && i > 0
+                && chars[i - 1].is_whitespace() =>
+            {
+                if pending_let_in {
+                    pending_let_in = false;
+                    body_is_ws = false;
+                } else {
+                    break;
+                }
+            }
+            '\n' if depth == 0 => {
+                pending_let_in = false;
+                if command_line_continues(src, byte_offsets, chars, kw, body_is_ws, cmd_col, i) {
+                    body_is_ws = false;
+                } else {
+                    break;
+                }
+            }
+            ';' if depth == 0 => {
+                if pending_let_in {
+                    pending_let_in = false;
+                    body_is_ws = false;
+                } else {
+                    break;
+                }
+            }
+            ch if !ch.is_whitespace() => body_is_ws = false,
+            _ => {}
+        }
+        i += 1;
+    }
+    i
+}
+
+fn syntax_env_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "notation"
+            | "infix"
+            | "infixl"
+            | "infixr"
+            | "prefix"
+            | "postfix"
+            | "macro"
+            | "macro_rules"
+            | "elab"
+            | "elab_rules"
+            | "syntax"
+            | "run_cmd"
+            | "run_elab"
+            | "drun_elab"
+            | "run_meta"
+            | "unif_hint"
+            | "binder_predicate"
+            | "simproc"
+            | "dsimproc"
+            | "builtin_simproc"
+            | "builtin_dsimproc"
+            | "cbv_simproc"
+            | "builtin_cbv_simproc"
+            | "grind_pattern"
+    )
+}
+
+fn stmt_has_unparsed_telescope(prop: &str) -> bool {
+    let clean = mask_literals(prop);
+    let peeled = peel_implication_telescope(&clean);
+    clean.contains('[')
+        || clean.contains('{')
+        || clean.contains('⦃')
+        || clean.contains('∀')
+        || ident_mentioned(&clean, "forall")
+        || prop_escaped_decl_boundary(prop)
+        || peeled
+            .iter()
+            .take(peeled.len().saturating_sub(1))
+            .any(|part| has_top_level_colon_in_binders(part) || parenthesized_implication(part))
+        || peeled
+            .last()
+            .is_some_and(|concl| has_top_level_colon_in_binders(concl))
+}
+
+fn prop_escaped_decl_boundary(prop: &str) -> bool {
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    while i < prop.len() {
+        if let Some(span) = skip_lean_lexeme(prop, i) {
+            i = span.end;
+            continue;
+        }
+        let Some(ch) = prop[i..].chars().next() else {
+            break;
+        };
+        match ch {
+            '(' | '{' | '[' | '⦃' | '⟨' => depth += 1,
+            ')' | '}' | ']' | '⦄' | '⟩' => depth = depth.saturating_sub(1),
+            _ if depth == 0 && is_ident_start(ch) => {
+                let start = i;
+                i += ch.len_utf8();
+                while let Some(c) = prop[i..].chars().next() {
+                    if is_ident_continue(c) {
+                        i += c.len_utf8();
+                    } else {
+                        break;
+                    }
+                }
+                if matches!(
+                    &prop[start..i],
+                    "where" | "theorem" | "lemma" | "def" | "abbrev" | "instance" | "axiom"
+                ) {
+                    return true;
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += ch.len_utf8();
+    }
+    false
+}
+
+fn peel_implication_telescope(prop: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = prop.trim().to_string();
+    for _ in 0..64 {
+        let split = split_top_level_implications(&current);
+        if split.len() > 1 {
+            parts.extend_from_slice(&split[..split.len() - 1]);
+            current = split.last().cloned().unwrap_or_default();
+            continue;
+        }
+        if let Some(inner) = strip_wrapping_parens(&current) {
+            if split_arrow(inner).is_some() {
+                current = inner.to_string();
+                continue;
+            }
+        }
+        break;
+    }
+    parts.push(current);
+    parts
+}
+
+fn strip_wrapping_parens(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    let chars: Vec<(usize, char)> = trimmed.char_indices().collect();
+    if chars.first().map(|(_, ch)| *ch) != Some('(') || chars.last().map(|(_, ch)| *ch) != Some(')')
+    {
+        return None;
+    }
+    let mut depth = 0usize;
+    for (idx, (_, ch)) in chars.iter().enumerate() {
+        match ch {
+            '(' | '{' | '[' | '⦃' | '⟨' => depth += 1,
+            ')' | '}' | ']' | '⦄' | '⟩' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && idx + 1 < chars.len() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return None;
+    }
+    let last_byte = chars.last()?.0;
+    Some(trimmed[1..last_byte].trim())
+}
+
+fn parenthesized_implication(part: &str) -> bool {
+    let mut cur = part.trim();
+    let mut stripped_any = false;
+    while let Some(inner) = strip_wrapping_parens(cur) {
+        stripped_any = true;
+        cur = inner;
+    }
+    stripped_any && split_arrow(cur).is_some()
+}
+
+fn hypothesis_is_vacuous(text: &str) -> bool {
+    let mut current = text.trim();
+    while let Some(inner) = strip_wrapping_parens(current) {
+        current = inner;
+    }
+    let ty = split_top_level_colon(current).map_or(current, |(_, rhs)| rhs.trim());
+    type_is_vacuous(ty)
+}
+
+fn type_is_vacuous(ty: &str) -> bool {
+    let mut cur = ty.trim();
+    while let Some(inner) = strip_wrapping_parens(cur) {
+        cur = inner;
+    }
+    let cur = cur.strip_prefix("_root_.").map_or(cur, str::trim);
+    if matches!(
+        cur,
+        "Empty"
+            | "PEmpty"
+            | "False"
+            | "false"
+            | "Not True"
+            | "¬ True"
+            | "¬True"
+            | "True = False"
+            | "False = True"
+            | "true = false"
+            | "false = true"
+    ) {
+        return true;
+    }
+    if let Some(neg_inner) = cur
+        .strip_prefix('¬')
+        .or_else(|| cur.strip_prefix("Not ").map(str::trim))
+    {
+        if type_is_trivially_true(neg_inner) {
+            return true;
+        }
+    }
+    let conjuncts = split_top_level_and(cur);
+    if conjuncts.len() > 1 && conjuncts.iter().any(|part| type_is_vacuous(part)) {
+        return true;
+    }
+    if let Some((lhs, rhs, is_ne)) = split_top_level_eq_or_ne(cur) {
+        if is_ne && lhs == rhs {
+            return true;
+        }
+        if !is_ne {
+            if let (Ok(lv), Ok(rv)) = (lhs.parse::<u128>(), rhs.parse::<u128>()) {
+                if lv != rv {
+                    return true;
+                }
+            }
+        }
+    }
+    if let Some(body) = cur
+        .strip_prefix('∃')
+        .and_then(|rest| split_top_level_comma(rest))
+    {
+        if type_is_vacuous(body.1) {
+            return true;
+        }
+    }
+    if let Some((lhs, rhs)) = split_arrow(cur) {
+        return type_is_inhabited_source(&lhs) && type_is_vacuous(&rhs);
+    }
+    if let Some((left, right)) = split_top_level_product_op(cur) {
+        return type_is_vacuous(&left) || type_is_vacuous(&right);
+    }
+    if let Some(pred) = subtype_predicate(cur) {
+        return type_is_vacuous(&pred);
+    }
+    let Some((head_raw, args)) = split_type_application(cur) else {
+        return false;
+    };
+    let head = head_raw.rsplit('.').next().unwrap_or(head_raw);
+    match (head, args.as_slice()) {
+        ("Fin", [bound]) => !bound_is_positive_fin(bound),
+        ("Nonempty" | "Inhabited" | "Fact" | "ULift" | "PLift" | "Thunk" | "id", [inner]) => {
+            type_is_vacuous(inner)
+        }
+        ("Exists", [pred]) => lambda_body_is_vacuous(pred),
+        ("Prod" | "PProd", [left, right]) => type_is_vacuous(left) || type_is_vacuous(right),
+        ("Sigma" | "PSigma" | "Subtype", [left, right]) => {
+            type_is_vacuous(left) || lambda_body_is_vacuous(right)
+        }
+        ("Sigma" | "PSigma", [pred]) => lambda_body_is_vacuous(pred),
+        _ => false,
+    }
+}
+
+fn type_is_trivially_true(ty: &str) -> bool {
+    let inner = strip_wrapping_parens(ty).unwrap_or(ty).trim();
+    if matches!(inner, "True" | "true") {
+        return true;
+    }
+    if let Some((lhs, rhs, false)) = split_top_level_eq_or_ne(inner) {
+        return lhs == rhs;
+    }
+    false
+}
+
+fn lambda_body_is_vacuous(expr: &str) -> bool {
+    let mut cur = expr.trim();
+    while let Some(inner) = strip_wrapping_parens(cur) {
+        cur = inner;
+    }
+    if let Some(rest) = cur
+        .strip_prefix("fun")
+        .filter(|r| r.starts_with(char::is_whitespace) || r.starts_with('('))
+        .or_else(|| cur.strip_prefix('λ'))
+    {
+        if let Some(arrow_pos) = find_top_level_fat_arrow(rest) {
+            return type_is_vacuous(rest[arrow_pos + 2..].trim());
+        }
+    }
+    type_is_vacuous(cur)
+}
+
+fn find_top_level_fat_arrow(src: &str) -> Option<usize> {
+    let chars: Vec<(usize, char)> = src.char_indices().collect();
+    let mut depth = 0usize;
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        match chars[idx].1 {
+            '(' | '{' | '[' | '⦃' | '⟨' => depth += 1,
+            ')' | '}' | ']' | '⦄' | '⟩' => depth = depth.saturating_sub(1),
+            '=' if depth == 0 && chars.get(idx + 1).map(|(_, c)| *c) == Some('>') => {
+                return Some(chars[idx].0);
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn split_top_level_comma(src: &str) -> Option<(&str, &str)> {
+    let chars: Vec<(usize, char)> = src.char_indices().collect();
+    let mut depth = 0usize;
+    for (byte, ch) in chars {
+        match ch {
+            '(' | '{' | '[' | '⦃' | '⟨' => depth += 1,
+            ')' | '}' | ']' | '⦄' | '⟩' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => return Some((src[..byte].trim(), src[byte + 1..].trim())),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_top_level_and(src: &str) -> Vec<String> {
+    let chars: Vec<(usize, char)> = src.char_indices().collect();
+    let mut depth = 0usize;
+    let mut parts = Vec::new();
+    let mut last_byte = 0usize;
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        let (byte, ch) = chars[idx];
+        match ch {
+            '(' | '{' | '[' | '⦃' | '⟨' => depth += 1,
+            ')' | '}' | ']' | '⦄' | '⟩' => depth = depth.saturating_sub(1),
+            '∧' if depth == 0 => {
+                parts.push(src[last_byte..byte].trim().to_string());
+                last_byte = byte + ch.len_utf8();
+            }
+            '/' if depth == 0 && chars.get(idx + 1).map(|(_, c)| *c) == Some('\\') => {
+                parts.push(src[last_byte..byte].trim().to_string());
+                last_byte = byte + 2;
+                idx += 1;
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    parts.push(src[last_byte..].trim().to_string());
+    parts
+}
+
+fn split_top_level_eq_or_ne(src: &str) -> Option<(&str, &str, bool)> {
+    let chars: Vec<(usize, char)> = src.char_indices().collect();
+    let mut depth = 0usize;
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        let (byte, ch) = chars[idx];
+        match ch {
+            '(' | '{' | '[' | '⦃' | '⟨' => depth += 1,
+            ')' | '}' | ']' | '⦄' | '⟩' => depth = depth.saturating_sub(1),
+            '≠' if depth == 0 => {
+                return Some((src[..byte].trim(), src[byte + ch.len_utf8()..].trim(), true));
+            }
+            '!' if depth == 0 && chars.get(idx + 1).map(|(_, c)| *c) == Some('=') => {
+                return Some((src[..byte].trim(), src[byte + 2..].trim(), true));
+            }
+            '=' if depth == 0 => {
+                let prev = idx
+                    .checked_sub(1)
+                    .and_then(|p| chars.get(p))
+                    .map(|(_, c)| *c);
+                let next = chars.get(idx + 1).map(|(_, c)| *c);
+                if !matches!(prev, Some(':' | '<' | '>' | '!' | '='))
+                    && !matches!(next, Some('=' | '>'))
+                {
+                    return Some((src[..byte].trim(), src[byte + 1..].trim(), false));
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn type_is_inhabited_source(ty: &str) -> bool {
+    matches!(
+        ty.trim().trim_start_matches("_root_.").trim(),
+        "Nat" | "Int" | "Bool" | "String" | "Char" | "Unit" | "True" | "PUnit"
+    )
+}
+
+fn split_arrow(ty: &str) -> Option<(String, String)> {
+    let chars: Vec<char> = ty.chars().collect();
+    let mut depth = 0usize;
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        match chars[idx] {
+            '(' | '{' | '[' | '⦃' | '⟨' => depth += 1,
+            ')' | '}' | ']' | '⦄' | '⟩' => depth = depth.saturating_sub(1),
+            '→' if depth == 0 => {
+                return Some((
+                    chars[..idx].iter().collect::<String>().trim().to_string(),
+                    chars[idx + 1..]
+                        .iter()
+                        .collect::<String>()
+                        .trim()
+                        .to_string(),
+                ));
+            }
+            '-' if depth == 0 && idx + 1 < chars.len() && chars[idx + 1] == '>' => {
+                return Some((
+                    chars[..idx].iter().collect::<String>().trim().to_string(),
+                    chars[idx + 2..]
+                        .iter()
+                        .collect::<String>()
+                        .trim()
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn safe_inhabited_value_binder_type(ty: &str, has_unmodeled_env: bool) -> bool {
+    if has_unmodeled_env || type_is_vacuous(ty) {
+        return false;
+    }
+    let mut cur = ty.trim();
+    while let Some(inner) = strip_wrapping_parens(cur) {
+        cur = inner;
+    }
+    let cur = cur.strip_prefix("_root_.").map_or(cur, str::trim);
+    if matches!(
+        cur,
+        "Nat"
+            | "Int"
+            | "Bool"
+            | "String"
+            | "Char"
+            | "UInt8"
+            | "UInt16"
+            | "UInt32"
+            | "UInt64"
+            | "USize"
+            | "Word256"
+            | "TurboLean.FastCheck.Word256"
+            | "UInt256"
+            | "Uint256"
+            | "Int256"
+            | "ByteArray"
+            | "Unit"
+            | "PUnit"
+            | "StorageKey"
+            | "TurboLean.Reflection.StorageKey"
+            | "ContractState"
+            | "TurboLean.Reflection.ContractState"
+            | "Type"
+    ) || cur.starts_with("Type ")
+        || cur.starts_with("Sort ")
+    {
+        return true;
+    }
+    if let Some((lhs, rhs)) = split_top_level_product_op(cur) {
+        return safe_inhabited_value_binder_type(&lhs, false)
+            && safe_inhabited_value_binder_type(&rhs, false);
+    }
+    let Some((head_raw, args)) = split_type_application(cur) else {
+        return false;
+    };
+    let head = head_raw.strip_prefix("_root_.").unwrap_or(head_raw);
+    if head.contains('.') {
+        return false;
+    }
+    match (head, args.as_slice()) {
+        ("BitVec", [width]) => width_is_nonempty_bitvec(width),
+        ("Fin", [bound]) => bound_is_positive_fin(bound),
+        ("List" | "Array" | "Option", [_]) => true,
+        ("Prod" | "PProd", [left, right]) => {
+            safe_inhabited_value_binder_type(left, false)
+                && safe_inhabited_value_binder_type(right, false)
+        }
+        _ => false,
+    }
+}
+
+fn width_is_nonempty_bitvec(width: &str) -> bool {
+    let w = strip_wrapping_parens(width).unwrap_or(width).trim();
+    w.parse::<u64>().is_ok()
+        || w.chars().next().is_some_and(is_ident_start) && w.chars().all(is_ident_continue)
+}
+
+fn bound_is_positive_fin(bound: &str) -> bool {
+    let b = strip_wrapping_parens(bound).unwrap_or(bound).trim();
+    if let Ok(val) = b.parse::<u64>() {
+        return val > 0;
+    }
+    if let Some((lhs, rhs)) = b.rsplit_once('+') {
+        if rhs.trim().parse::<u64>().is_ok_and(|inc| inc > 0) {
+            let base = lhs.trim();
+            return base.parse::<u64>().is_ok()
+                || (base.chars().next().is_some_and(is_ident_start)
+                    && base.chars().all(is_ident_continue));
+        }
+    }
+    false
+}
+
+fn split_top_level_product_op(ty: &str) -> Option<(String, String)> {
+    let chars: Vec<char> = ty.chars().collect();
+    let mut depth = 0usize;
+    for (idx, ch) in chars.iter().enumerate() {
+        match ch {
+            '(' | '{' | '[' | '⦃' | '⟨' => depth += 1,
+            ')' | '}' | ']' | '⦄' | '⟩' => depth = depth.saturating_sub(1),
+            '×' if depth == 0 => {
+                return Some((
+                    chars[..idx].iter().collect::<String>().trim().to_string(),
+                    chars[idx + 1..]
+                        .iter()
+                        .collect::<String>()
+                        .trim()
+                        .to_string(),
+                ));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn split_type_application(ty: &str) -> Option<(&str, Vec<String>)> {
+    let trimmed = ty.trim();
+    if trimmed.contains('→') || trimmed.contains("->") {
+        return None;
+    }
+    let mut tokens = Vec::new();
+    let chars: Vec<(usize, char)> = trimmed.char_indices().collect();
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        while idx < chars.len() && chars[idx].1.is_whitespace() {
+            idx += 1;
+        }
+        if idx >= chars.len() {
+            break;
+        }
+        let start_byte = chars[idx].0;
+        let mut depth = 0usize;
+        while idx < chars.len() {
+            match chars[idx].1 {
+                '(' | '{' | '[' | '⦃' | '⟨' => depth += 1,
+                ')' | '}' | ']' | '⦄' | '⟩' => depth = depth.saturating_sub(1),
+                ch if depth == 0 && ch.is_whitespace() => break,
+                _ => {}
+            }
+            idx += 1;
+        }
+        let end_byte = chars.get(idx).map_or(trimmed.len(), |(byte, _)| *byte);
+        tokens.push(trimmed[start_byte..end_byte].to_string());
+    }
+    let head_len = tokens.first()?.len();
+    let head = &trimmed[..head_len];
+    Some((head, tokens.into_iter().skip(1).collect()))
+}
+
+fn subtype_predicate(ty: &str) -> Option<String> {
+    let chars: Vec<char> = ty.trim().chars().collect();
+    if chars.first() != Some(&'{') || chars.last() != Some(&'}') {
+        return None;
+    }
+    let inner: String = chars[1..chars.len() - 1].iter().collect();
+    let marker = inner.find("//")?;
+    Some(inner[marker + 2..].trim().to_string())
+}
+
+fn has_top_level_colon_in_binders(part: &str) -> bool {
+    let trimmed = part.trim();
+    if split_top_level_colon(trimmed).is_some() {
+        return true;
+    }
+    let chars: Vec<char> = trimmed.chars().collect();
+    if chars.first() == Some(&'(') && chars.last() == Some(&')') {
+        let mut depth = 0usize;
+        let mut wraps_all = true;
+        for (idx, ch) in chars.iter().enumerate() {
+            match ch {
+                '(' | '{' | '[' | '⦃' => depth += 1,
+                ')' | '}' | ']' | '⦄' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 && idx + 1 < chars.len() {
+                        wraps_all = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if wraps_all {
+            let inner: String = chars[1..chars.len() - 1].iter().collect();
+            return has_top_level_colon_in_binders(&inner);
+        }
+    }
+    false
+}
+
+fn mask_literals(src: &str) -> String {
+    let mut out = src.as_bytes().to_vec();
+    let mut i = 0usize;
+    while i < src.len() {
+        if let Some(span) = skip_lean_lexeme(src, i) {
+            if span.is_literal && span.end > i + 1 {
+                for byte in &mut out[i + 1..span.end - 1] {
+                    if *byte != b'\n' {
+                        *byte = b' ';
+                    }
+                }
+            }
+            i = span.end;
+        } else {
+            i += src[i..].chars().next().map_or(1, char::len_utf8);
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| src.to_string())
 }
 
 fn mask_comments(src: &str) -> String {
@@ -742,7 +2198,8 @@ fn consume_in_command_prefix(
     byte_offsets: &[usize],
     chars: &[char],
     start: usize,
-) -> Option<(usize, Option<String>)> {
+    cmd_col: usize,
+) -> Option<(usize, &'static str, PrefixAction)> {
     const PREFIXES: &[&str] = &[
         "set_option",
         "open",
@@ -755,21 +2212,66 @@ fn consume_in_command_prefix(
         "attribute",
         "export",
         "deriving",
+        "instance",
+        "notation",
+        "infix",
+        "infixl",
+        "infixr",
+        "prefix",
+        "postfix",
+        "macro",
+        "macro_rules",
+        "elab",
+        "elab_rules",
+        "syntax",
+        "run_cmd",
+        "run_elab",
+        "drun_elab",
+        "run_meta",
+        "unif_hint",
+        "binder_predicate",
+        "simproc",
+        "dsimproc",
+        "builtin_simproc",
+        "builtin_dsimproc",
+        "cbv_simproc",
+        "builtin_cbv_simproc",
+        "grind_pattern",
+        "def",
+        "abbrev",
+        "class",
+        "structure",
+        "inductive",
+        "coinductive",
+        "axiom",
+        "opaque",
+        "constant",
+        "example",
+        "theorem",
+        "lemma",
         "#guard_msgs",
         "#guard_panic",
         "#info_trees",
     ];
     let byte_start = *byte_offsets.get(start)?;
     let tail = &src[byte_start..];
-    if let Some(rest) = tail
-        .strip_prefix("#time")
-        .or_else(|| tail.strip_prefix("#with_exporting"))
-    {
+    if let Some(rest) = tail.strip_prefix("#time") {
         if rest.starts_with(char::is_whitespace) {
             let consumed = tail.len() - rest.len();
             return Some((
                 byte_offsets.partition_point(|offset| *offset < byte_start + consumed),
-                None,
+                "#time",
+                PrefixAction::Ignore,
+            ));
+        }
+    }
+    if let Some(rest) = tail.strip_prefix("#with_exporting") {
+        if rest.starts_with(char::is_whitespace) {
+            let consumed = tail.len() - rest.len();
+            return Some((
+                byte_offsets.partition_point(|offset| *offset < byte_start + consumed),
+                "#with_exporting",
+                PrefixAction::Malformed,
             ));
         }
     }
@@ -779,35 +2281,125 @@ fn consume_in_command_prefix(
     })?;
     let mut i = start + kw.chars().count();
     let mut depth = 0usize;
+    let mut body_is_ws = true;
+    let mut pending_let_in = false;
     while i < chars.len() {
         if let Some(end) = skip_any(src, byte_offsets, i) {
             i = end;
             continue;
         }
         match chars[i] {
-            '(' | '[' | '{' | '⦃' => depth += 1,
-            ')' | ']' | '}' | '⦄' => depth = depth.saturating_sub(1),
-            '\n' | ';' if depth == 0 => return None,
-            'i' if depth == 0
-                && i + 1 < chars.len()
-                && chars[i + 1] == 'n'
-                && i > 0
-                && chars[i - 1].is_whitespace()
-                && (i + 2 >= chars.len() || chars[i + 2].is_whitespace()) =>
-            {
-                let after = i + 2;
-                let assumption =
-                    matches!(kw, "variable" | "variables" | "include" | "omit").then(|| {
-                        let raw: String = chars[start..after].iter().collect();
-                        normalize_ws(&raw)
-                    });
-                return Some((after, assumption));
+            '(' | '[' | '{' | '⦃' | '⟨' => {
+                depth += 1;
+                body_is_ws = false;
             }
+            ')' | ']' | '}' | '⦄' | '⟩' => {
+                depth = depth.saturating_sub(1);
+                body_is_ws = false;
+            }
+            'l' if depth == 0 && token_is_keyword(chars, i, "let") => {
+                pending_let_in = true;
+                body_is_ws = false;
+            }
+            ';' if depth == 0 => {
+                if pending_let_in {
+                    pending_let_in = false;
+                    body_is_ws = false;
+                } else {
+                    return None;
+                }
+            }
+            '\n' if depth == 0 => {
+                pending_let_in = false;
+                if command_line_continues(src, byte_offsets, chars, kw, body_is_ws, cmd_col, i) {
+                    body_is_ws = false;
+                } else {
+                    return None;
+                }
+            }
+            'i' if depth == 0
+                && token_is_keyword(chars, i, "in")
+                && i > 0
+                && chars[i - 1].is_whitespace() =>
+            {
+                if pending_let_in {
+                    pending_let_in = false;
+                    body_is_ws = false;
+                } else {
+                    let after = i + 2;
+                    let raw: String = chars[start..after].iter().collect();
+                    return Some((after, kw, classify_in_prefix(kw, &raw)));
+                }
+            }
+            ch if !ch.is_whitespace() => body_is_ws = false,
             _ => {}
         }
         i += 1;
     }
     None
+}
+
+fn classify_in_prefix(kw: &str, raw: &str) -> PrefixAction {
+    if matches!(kw, "variable" | "variables" | "include" | "omit") {
+        return PrefixAction::Assumption(normalize_ws(raw));
+    }
+    if matches!(kw, "deriving" | "instance") {
+        return PrefixAction::UnmodeledEnv;
+    }
+    if syntax_env_keyword(kw) {
+        return PrefixAction::SyntaxEnv;
+    }
+    if kw == "attribute" && attr_mentions_instance_or_class(raw) {
+        return PrefixAction::UnmodeledEnv;
+    }
+    if matches!(kw, "open" | "export")
+        && RESERVED_INSTANCE_AND_TYPE_NAMES
+            .iter()
+            .any(|reserved| ident_mentioned(raw, reserved))
+    {
+        return PrefixAction::UnmodeledEnv;
+    }
+    if matches!(
+        kw,
+        "def"
+            | "abbrev"
+            | "class"
+            | "structure"
+            | "inductive"
+            | "coinductive"
+            | "axiom"
+            | "opaque"
+            | "constant"
+            | "example"
+            | "theorem"
+            | "lemma"
+    ) {
+        return PrefixAction::UnmodeledEnv;
+    }
+    PrefixAction::Ignore
+}
+
+fn dotted_name_multiline(
+    src: &str,
+    byte_offsets: &[usize],
+    chars: &[char],
+    mut pos: usize,
+    n: usize,
+    cmd_col: usize,
+) -> (String, usize, bool) {
+    let mut crossed = false;
+    while pos < n && chars[pos].is_whitespace() && chars[pos] != '\n' {
+        pos += 1;
+    }
+    if pos < n && chars[pos] == '\n' {
+        let next = next_significant(src, byte_offsets, chars, pos + 1);
+        if next < n && line_col(chars, next) > cmd_col && !is_top_level_command_token(chars, next) {
+            pos = next;
+            crossed = true;
+        }
+    }
+    let (name, end) = dotted_name(src, byte_offsets, chars, pos, n);
+    (name, end, crossed)
 }
 
 fn dotted_name(
@@ -903,15 +2495,21 @@ fn has_matching_instance(all_binders: &[String], want_head: &str, want_arg: &str
 
 fn standard_instance(text: &str, all_binders: &[String], type_params: &BTreeSet<String>) -> bool {
     let class_expr = instance_class_expr(text);
-    let head = class_expr
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .rsplit('.')
-        .next()
-        .unwrap_or("");
+    if class_expr.contains("→")
+        || class_expr.contains("->")
+        || class_expr.contains('∀')
+        || class_expr.contains("forall")
+    {
+        return false;
+    }
+    let mut parts = class_expr.split_whitespace();
+    let head_raw = parts.next().unwrap_or("");
+    if head_raw.contains('.') && head_raw != "_root_" {
+        return false;
+    }
+    let head = head_raw.rsplit('.').next().unwrap_or("");
     if matches!(head, "DecidablePred" | "DecidableRel") {
-        return class_expr.split_whitespace().nth(1).is_some();
+        return false;
     }
     let Some((head, arg)) = instance_head_and_arg(text) else {
         return false;
@@ -942,6 +2540,7 @@ fn visibility_of(
     known: bool,
     is_module: bool,
     extra: Option<&DeclExtra>,
+    malformed_scope: bool,
 ) -> &'static str {
     if !known {
         return "unresolved";
@@ -955,6 +2554,9 @@ fn visibility_of(
     if extra.is_some_and(|row| row.explicit_public) {
         return "public";
     }
+    if malformed_scope {
+        return "unresolved";
+    }
     if public_names.contains(&canonicalize_lean_name(name)) {
         "public"
     } else {
@@ -967,6 +2569,8 @@ struct FileCardCtx<'a> {
     local_defs: &'a [(String, Vec<String>, String, String)],
     hygiene: &'a crate::splitter::HygieneReport,
     audit: &'a Value,
+    has_unmodeled_instance_env: bool,
+    has_unmodeled_syntax_env: bool,
 }
 
 fn card_for(
@@ -979,31 +2583,26 @@ fn card_for(
 ) -> Value {
     let mut param_binders = Vec::new();
     let mut hypothesis_text = Vec::new();
-    let mut type_params = BTreeSet::new();
     for (vars, ty) in &decl.binders {
-        let ty_trimmed = ty.trim();
-        if ty_trimmed == "Type"
-            || ty_trimmed.starts_with("Type ")
-            || ty_trimmed.starts_with("Sort ")
+        if is_known_binder_value_type(ty)
+            && safe_inhabited_value_binder_type(ty, ctx.has_unmodeled_instance_env)
         {
-            for var in vars {
-                type_params.insert(var.clone());
-            }
-        }
-        if is_known_binder_value_type(ty) {
             param_binders.push(json!({"vars": vars, "type": ty}));
         } else {
             let names = vars.join(" ");
             hypothesis_text.push(format!("({names} : {ty})"));
         }
     }
-    let parts = split_top_level_implications(&decl.prop_str);
+    let parts = peel_implication_telescope(&decl.prop_str);
     let conclusion = if parts.len() <= 1 {
         parts.first().cloned().unwrap_or_default()
     } else {
         hypothesis_text.extend_from_slice(&parts[..parts.len() - 1]);
         parts.last().cloned().unwrap_or_default()
     };
+    let vacuous_hypothesis = hypothesis_text
+        .iter()
+        .any(|text| hypothesis_is_vacuous(text));
     let instance_binders = extra
         .map(|row| row.instance_binders.clone())
         .unwrap_or_default();
@@ -1013,8 +2612,17 @@ fn card_for(
     let mut extraction_warnings = Vec::new();
     let nonstandard: Vec<&str> = instance_binders
         .iter()
-        .filter(|binder| !standard_instance(binder, &instance_binders, &type_params))
-        .map(String::as_str)
+        .enumerate()
+        .filter(|(idx, binder)| {
+            let prior = extra.map_or(BTreeSet::new(), |row| {
+                row.ordered_type_params
+                    .get(*idx)
+                    .cloned()
+                    .unwrap_or_default()
+            });
+            !standard_instance(binder, &instance_binders, &prior)
+        })
+        .map(|(_, binder)| binder.as_str())
         .collect();
     if !nonstandard.is_empty() {
         extraction_warnings.push(format!(
@@ -1028,10 +2636,23 @@ fn card_for(
                 .to_string(),
         );
     }
-    if extra.is_none() || extra.is_some_and(|row| row.saw_unparsed_binder) {
+    if extra.is_none()
+        || extra.is_some_and(|row| row.saw_unparsed_binder || row.saw_unparsed_telescope)
+        || vacuous_hypothesis
+    {
         extraction_warnings.push(
             "declaration modifiers, attributes, or binders were not fully parsed".to_string(),
         );
+    }
+    if ctx.has_unmodeled_instance_env && !instance_binders.is_empty() {
+        extraction_warnings.push(
+            "file-local instances, notation, or shadowed standard names leave instance binders unverified"
+                .to_string(),
+        );
+    }
+    if ctx.has_unmodeled_syntax_env {
+        extraction_warnings
+            .push("file-level syntax, macros, or elaborators can rewrite statements".to_string());
     }
     let extraction_complete = extraction_warnings.is_empty();
     let hypothesis_count = hypothesis_text.len();

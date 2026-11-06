@@ -567,3 +567,399 @@ fn spec_card_public_only_hides_non_module_private_and_includes_companion_dir() {
         .any(|card| card["decl"] == "bad" && card["verdict"] == "VACUOUS"));
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn spec_card_multiline_prefixes_and_inline_env_fail_closed() {
+    let dir = fixture("multiline_in");
+    let chained = write_spec(
+        &dir,
+        "Chained.lean",
+        r#"
+open Nat
+  in variable [Nonempty False] in
+theorem sound_looking (n : Nat) (_hn : n < 2) : n = 0 ∨ n = 1 := by
+  exact False.elim (Classical.choice inferInstance)
+
+section S
+variable
+  [Nonempty False]
+
+theorem multiline_var (n : Nat) (_hn : n < 2) : n = 0 ∨ n = 1 := by
+  exact False.elim (Classical.choice inferInstance)
+end S
+
+def ok_prefix :=
+  let x := 1;
+  x in
+theorem clean_after_def_in (n : Nat) (_hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+"#,
+    );
+    let out = run(&["--json", "spec-card", chained.to_str().unwrap()]);
+    let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(!out.status.success(), "{report}");
+    let cards = report["cards"].as_array().unwrap();
+    for bad in ["sound_looking", "S.multiline_var"] {
+        let short = bad.rsplit('.').next().unwrap();
+        let card = cards
+            .iter()
+            .find(|c| c["decl"] == bad || c["decl"] == short)
+            .unwrap();
+        assert_eq!(card["verdict"], "UNCHECKED_ASSUMPTIONS", "{card}");
+        assert_eq!(card["contract"]["extraction_complete"], false);
+    }
+    let clean = cards
+        .iter()
+        .find(|c| c["decl"] == "clean_after_def_in")
+        .unwrap();
+    assert_eq!(clean["verdict"], "TIGHT", "{clean}");
+
+    let attr_inst = write_spec(
+        &dir,
+        "AttrInst.lean",
+        r#"
+@[implicit_reducible]
+def sneakyInst : BEq Nat := ⟨fun _ _ => false⟩
+
+attribute
+  [instance 10000] sneakyInst
+
+theorem exploit [LawfulBEq Nat] (n : Nat) (_h : n < 2) : n = 999 := by
+  have h1 : (0 == 0) = true := beq_self_eq_true 0
+  exact False.elim (Bool.noConfusion h1)
+"#,
+    );
+    let attr_out = run(&["--json", "spec-card", attr_inst.to_str().unwrap()]);
+    let attr_report: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&attr_out.stdout)).unwrap();
+    assert!(!attr_out.status.success(), "{attr_report}");
+    assert_eq!(attr_report["cards"][0]["verdict"], "UNCHECKED_ASSUMPTIONS");
+
+    let open_shadow = write_spec(
+        &dir,
+        "OpenShadow.lean",
+        r#"
+namespace Shadow
+class BEq (α : Type) where
+  falsehood : False
+end Shadow
+
+open
+  Shadow
+
+theorem exploit {α : Type} [BEq α] (n : Nat) (_h : n < 2) : n = 999 := by
+  exact False.elim BEq.falsehood
+"#,
+    );
+    let open_out = run(&["--json", "spec-card", open_shadow.to_str().unwrap()]);
+    let open_report: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&open_out.stdout)).unwrap();
+    assert!(!open_out.status.success(), "{open_report}");
+    assert_eq!(open_report["cards"][0]["verdict"], "UNCHECKED_ASSUMPTIONS");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn spec_card_telescopes_binders_and_vacuous_types_fail_closed() {
+    let dir = fixture("telescopes");
+    let path = write_spec(
+        &dir,
+        "Telescopes.lean",
+        r#"
+theorem m1 (n : Nat) (_hn : n < 2) : [Nonempty False] → n = 0 ∨ n = 1 := by
+  intro _; exact False.elim (Classical.choice inferInstance)
+
+theorem m2 : ∀ [Nonempty False] (n : Nat), n < 2 → n = 0 ∨ n = 1 := by
+  intro _ _ _; exact False.elim (Classical.choice inferInstance)
+
+theorem m3 (n : Nat) (_hn : n < 2) : ⦃_h : False⦄ → n = 0 ∨ n = 1 := by
+  intro h; exact False.elim h
+
+theorem m4 (n : Nat) (_hn : n < 2) : {_h : False} → n = 0 ∨ n = 1 := by
+  intro h; exact False.elim h
+
+theorem outer_paren (n : Nat) : (False → n = 999) := by
+  intro h; exact False.elim h
+
+theorem nested_paren (n : Nat) : (n < 2 → (False → n = 999)) := by
+  intro _ h; exact False.elim h
+
+theorem paren_impl ((n : Nat)) : ((False → n = 0)) → (n < 2 → n = 0 ∨ n = 1) := by
+  intro _ hn; omega
+
+theorem fin_zero (h : Fin 0) (n : Nat) : n = 999 := by
+  exact h.elim0
+
+theorem prod_empty (h : Prod Nat Empty) (n : Nat) : n = 999 := by
+  exact Empty.elim h.2
+
+theorem prod_op (h : Nat × Empty) (n : Nat) : n = 999 := by
+  exact Empty.elim h.2
+
+theorem root_empty (h : _root_.Empty) (n : Nat) : n = 999 := by
+  exact Empty.elim h
+
+theorem arrow_false (h : Nat → False) (n : Nat) : n = 999 := by
+  exact False.elim (h n)
+
+theorem id_false (h : id False) (n : Nat) : n = 999 := by
+  exact False.elim h
+
+theorem subtype_false (h : { _x : Nat // False }) (n : Nat) : n = 999 := by
+  exact False.elim h.2
+
+theorem sigma_empty (h : Sigma (fun _ : Nat => PEmpty)) (n : Nat) : n = 999 := by
+  cases h.2
+
+theorem exists_false (h : ∃ _ : Nat, False) (n : Nat) : n = 999 := by
+  obtain ⟨_, hf⟩ := h; exact False.elim hf
+
+theorem untyped_binder (x) (n : Nat) (_hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+
+theorem out_param_binder (h : outParam False) (n : Nat) : n = 999 := by
+  exact False.elim h
+
+theorem have_stmt (n : Nat) (_hn : n < 2) : have _x : Nat := 0; n = 0 ∨ n = 1 := by
+  omega
+
+theorem let_unused_false (h : Empty) (n : Nat) : let x : False := Empty.elim h; n = 999 := by
+  exact Empty.elim h
+
+theorem let_safe (n : Nat) (_hn : n < 2) : let x : Nat := 1; n < x + 1 → n = 0 ∨ n = 1 := by
+  intro _; omega
+
+theorem iff_conj (a b : Nat) : (a = b → b = a) ∧ (b = a → a = b) := by
+  constructor <;> intro h <;> omega
+"#,
+    );
+    let out = run(&["--json", "spec-card", path.to_str().unwrap()]);
+    let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(!out.status.success(), "{report}");
+    let cards = report["cards"].as_array().unwrap();
+    for card in cards {
+        let decl = card["decl"].as_str().unwrap();
+        if matches!(decl, "let_safe" | "iff_conj") {
+            assert_eq!(card["verdict"], "TIGHT", "{decl}: {card}");
+            assert_eq!(
+                card["contract"]["extraction_complete"], true,
+                "{decl}: {card}"
+            );
+        } else {
+            assert_ne!(card["verdict"], "TIGHT", "{decl}: {card}");
+            assert_eq!(
+                card["contract"]["extraction_complete"], false,
+                "{decl}: {card}"
+            );
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn spec_card_instances_macros_and_module_sections_fail_closed() {
+    let dir = fixture("inst_macro_mod");
+    let evil_beq = write_spec(
+        &dir,
+        "EvilBeq.lean",
+        r#"
+namespace Evil
+class BEq (p : Prop) : Prop where out : p
+end Evil
+theorem vacuous_via_evil_beq [Evil.BEq False] (n : Nat) (_hn : n < 2) : n = 0 ∨ n = 1 := by
+  exact False.elim Evil.BEq.out
+"#,
+    );
+    let out1 = run(&["--json", "spec-card", evil_beq.to_str().unwrap()]);
+    let rep1: Value = serde_json::from_str(&String::from_utf8_lossy(&out1.stdout)).unwrap();
+    assert!(!out1.status.success(), "{rep1}");
+    assert_eq!(rep1["cards"][0]["verdict"], "UNCHECKED_ASSUMPTIONS");
+
+    let inst_checks = write_spec(
+        &dir,
+        "InstChecks.lean",
+        r#"
+theorem bad_order [LawfulBEq α] {α : Type} [BEq α] (x : α) (n : Nat) (_hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+
+theorem dec_pred [DecidablePred (fun _ : Nat => False)] (n : Nat) (_hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+
+theorem dec_arrow [DecidablePred (fun _ : Nat => True) → Nonempty False] (n : Nat) (_hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+
+theorem good_lawful {α : Type} [BEq α] [LawfulBEq α] (x : α) (n : Nat) (_hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+
+theorem good_nat_lawful [LawfulBEq Nat] (n : Nat) (_hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+"#,
+    );
+    let out2 = run(&["--json", "spec-card", inst_checks.to_str().unwrap()]);
+    let rep2: Value = serde_json::from_str(&String::from_utf8_lossy(&out2.stdout)).unwrap();
+    assert!(!out2.status.success(), "{rep2}");
+    for card in rep2["cards"].as_array().unwrap() {
+        let decl = card["decl"].as_str().unwrap();
+        if decl.starts_with("good_") {
+            assert_eq!(card["verdict"], "TIGHT", "{card}");
+        } else {
+            assert_eq!(card["verdict"], "UNCHECKED_ASSUMPTIONS", "{card}");
+        }
+    }
+
+    let macro_taint = write_spec(
+        &dir,
+        "MacroTaint.lean",
+        r#"
+section S
+local macro_rules | `($a < $b) => `(False)
+end S
+theorem after_macro (n : Nat) (h : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+"#,
+    );
+    let out3 = run(&["--json", "spec-card", macro_taint.to_str().unwrap()]);
+    let rep3: Value = serde_json::from_str(&String::from_utf8_lossy(&out3.stdout)).unwrap();
+    assert!(!out3.status.success(), "{rep3}");
+    assert_eq!(rep3["summary"]["extraction_complete"], false);
+    assert_eq!(rep3["cards"][0]["verdict"], "UNCHECKED_ASSUMPTIONS");
+
+    let zero_thm_elab = write_spec(
+        &dir,
+        "ZeroThmElab.lean",
+        "elab \"declare_hidden\" : command => pure ()\n",
+    );
+    let out4 = run(&["--json", "spec-card", zero_thm_elab.to_str().unwrap()]);
+    let rep4: Value = serde_json::from_str(&String::from_utf8_lossy(&out4.stdout)).unwrap();
+    assert!(!out4.status.success(), "{rep4}");
+    assert_eq!(rep4["summary"]["extraction_complete"], false);
+
+    let zero_cards = write_spec(
+        &dir,
+        "OnlyDef.lean",
+        "def helper (n : Nat) : Nat := n + 1\n",
+    );
+    let out5 = run(&["--json", "spec-card", zero_cards.to_str().unwrap()]);
+    let rep5: Value = serde_json::from_str(&String::from_utf8_lossy(&out5.stdout)).unwrap();
+    assert!(out5.status.success(), "{rep5}");
+    assert_eq!(rep5["ok"], true);
+    assert_eq!(rep5["summary"]["cards"], 0);
+
+    let pub_meta = write_spec(
+        &dir,
+        "PubMeta.lean",
+        r#"
+module
+public theorem clean (n : Nat) (_hn : n < 2) : n = 0 ∨ n = 1 := by omega
+@[expose] public section
+end
+public meta section
+theorem sneaky_meta [Nonempty False] (n : Nat) (_hn : n < 2) : n = 0 ∨ n = 1 := by
+  exact False.elim (Classical.choice inferInstance)
+end
+meta section
+theorem hidden_meta (n : Nat) (_hn : n < 2) : n = 0 ∨ n = 1 := by omega
+end
+"#,
+    );
+    let out6 = run(&[
+        "--json",
+        "spec-card",
+        "--public-only",
+        pub_meta.to_str().unwrap(),
+    ]);
+    let rep6: Value = serde_json::from_str(&String::from_utf8_lossy(&out6.stdout)).unwrap();
+    assert!(!out6.status.success(), "{rep6}");
+    let cards6 = rep6["cards"].as_array().unwrap();
+    assert!(cards6
+        .iter()
+        .any(|c| c["decl"] == "sneaky_meta" && c["verdict"] == "UNCHECKED_ASSUMPTIONS"));
+    assert!(!cards6.iter().any(|c| c["decl"] == "hidden_meta"));
+
+    let where_escape = write_spec(
+        &dir,
+        "WhereEscape.lean",
+        r#"
+module
+structure P : Prop where
+  mk ::
+private theorem t1 : P where
+public theorem t2 [Nonempty False] (n : Nat) (_h : n < 2) : n = 0 ∨ n = 1 := by
+  exact False.elim (Classical.choice inferInstance)
+public theorem clean (n : Nat) (_h : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+"#,
+    );
+    let out7 = run(&[
+        "--json",
+        "spec-card",
+        "--public-only",
+        where_escape.to_str().unwrap(),
+    ]);
+    let rep7: Value = serde_json::from_str(&String::from_utf8_lossy(&out7.stdout)).unwrap();
+    assert!(!out7.status.success(), "{rep7}");
+    assert_eq!(rep7["summary"]["extraction_complete"], false);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn spec_card_rejects_symlinks_unreadable_dirs_and_mixed_policies() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let dir = fixture("fs_safety");
+    let tree = dir.join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    let good = write_spec(&tree, "Good.lean", TIGHT);
+    let outside = write_spec(&dir, "Outside.lean", TIGHT);
+    symlink(&outside, tree.join("Linked.lean")).unwrap();
+    let sym_out = run(&["--json", "spec-card", tree.to_str().unwrap()]);
+    assert!(!sym_out.status.success());
+    fs::remove_file(tree.join("Linked.lean")).unwrap();
+
+    symlink(dir.join("Missing.lean"), tree.join("Broken.lean")).unwrap();
+    let broken_out = run(&["--json", "spec-card", tree.to_str().unwrap()]);
+    assert!(!broken_out.status.success());
+    fs::remove_file(tree.join("Broken.lean")).unwrap();
+
+    let locked = tree.join("locked");
+    fs::create_dir_all(&locked).unwrap();
+    write_spec(
+        &locked,
+        "Secret.lean",
+        "theorem bad (h : False) : True := by cases h\n",
+    );
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let can_block_read = fs::read_dir(&locked).is_err();
+    let locked_out = run(&["--json", "spec-card", tree.to_str().unwrap()]);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+    if can_block_read {
+        assert!(!locked_out.status.success());
+    }
+
+    let proj_a = dir.join("proj_a");
+    let proj_b = dir.join("proj_b");
+    fs::create_dir_all(&proj_a).unwrap();
+    fs::create_dir_all(&proj_b).unwrap();
+    fs::write(proj_a.join("audit-spec.toml"), "policy = \"default\"\n").unwrap();
+    fs::write(
+        proj_b.join("audit-spec.toml"),
+        "policy = \"strict-proofs\"\n",
+    )
+    .unwrap();
+    let file_a = write_spec(&proj_a, "A.lean", TIGHT);
+    let file_b = write_spec(&proj_b, "B.lean", TIGHT);
+    let _ = good;
+    let mixed_out = run(&[
+        "--json",
+        "spec-card",
+        file_a.to_str().unwrap(),
+        file_b.to_str().unwrap(),
+    ]);
+    let mixed_rep: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&mixed_out.stdout)).unwrap();
+    assert!(!mixed_out.status.success(), "{mixed_rep}");
+    assert_eq!(mixed_rep["summary"]["policy"], "mixed");
+    assert_eq!(mixed_rep["ok"], false);
+    let _ = fs::remove_dir_all(&dir);
+}
