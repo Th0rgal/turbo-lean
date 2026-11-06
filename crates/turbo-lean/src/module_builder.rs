@@ -11071,7 +11071,10 @@ impl DepClosureMemo {
         Self {
             expected_lake_inputs: workspace_lake_inputs_digest(cfg).ok(),
             manifests: HashMap::new(),
-            lake_closure_cache: LakeClosureCache::default(),
+            lake_closure_cache: LakeClosureCache {
+                ignore_mtime_skew: true,
+                ..Default::default()
+            },
             search_dirs: std::env::split_paths(&eff_lp).collect(),
             fresh_closure: HashMap::new(),
             prebuilt_closure: HashMap::new(),
@@ -11980,6 +11983,18 @@ fn collect_prebuilt_dep_pkg_closure_for_statement(
                         if !src_matched {
                             return Ok(None);
                         }
+                    }
+                    let mut lc_visiting = HashSet::new();
+                    if lake_closure_export_info(
+                        cfg,
+                        &cur,
+                        false,
+                        &mut memo.lake_closure_cache,
+                        &mut lc_visiting,
+                    )
+                    .is_none()
+                    {
+                        return Ok(None);
                     }
                     Ok(Some((olean_path, hdr.imports)))
                 })(
@@ -16961,6 +16976,7 @@ fn compute_lake_export_info_opts(
     let mut all_trans_trace = LAKE_NIL_HASH;
     let mut legacy_trans_trace = LAKE_NIL_HASH;
     if let Some((_, _, ref dh)) = dep_src_info {
+        let mut import_entries = Vec::new();
         for sub_imp in &dh.import_specs {
             let is_ws_or_pkg = dag.nodes.contains_key(&sub_imp.module)
                 || requester
@@ -16999,6 +17015,9 @@ fn compute_lake_export_info_opts(
                 visiting,
                 allow_stale_src_in_dag,
             )?;
+            if !is_in_dag {
+                import_entries.extend(lake_import_trace_entries(is_mod, sub_imp, &sub_exp));
+            }
             fold_lake_export_traces(
                 &mut trans_trace,
                 &mut meta_trans_trace,
@@ -17007,6 +17026,23 @@ fn compute_lake_export_info_opts(
                 sub_imp,
                 &sub_exp,
             );
+        }
+        if !is_in_dag && tv.get("inputs").is_some() {
+            if let Some(actual_imports_h) = recorded_trace_imports_hash(&tv) {
+                let expected_imports_h = if import_entries.is_empty() {
+                    LAKE_NIL_HASH
+                } else {
+                    lake_input_hash(&serde_json::Value::Array(import_entries))?
+                };
+                if actual_imports_h != expected_imports_h {
+                    visiting.remove(mod_name);
+                    anyhow::bail!(
+                        "Dependency trace `{}` recorded import hash does not match current imports of `{}`",
+                        olean_path.with_extension("trace").display(),
+                        mod_name
+                    );
+                }
+            }
         }
     } else {
         let mut pb_cache = LakeClosureCache::default();
@@ -36257,6 +36293,109 @@ root = "Main"
         assert!(dst_proj
             .join(".lake/build/lib/lean/Root/Top.olean")
             .is_file());
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_prebuilt_dep_pkg_closure_rejects_stale_transitive_macro_import() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_prebuilt_dep_stale_trans_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let dep_dir = dir.join("dep_pkg");
+        let root_dir = dir.join("root_pkg");
+        fs::create_dir_all(dep_dir.join("Dep"))?;
+        fs::create_dir_all(root_dir.join("Root"))?;
+
+        let tc_str = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(|p| p.parent())
+                .unwrap_or_else(|| Path::new("."))
+                .join("lean/lean-toolchain"),
+        )
+        .unwrap_or_else(|_| "leanprover/lean4:v4.24.0\n".to_string());
+
+        fs::write(dep_dir.join("lean-toolchain"), &tc_str)?;
+        fs::write(
+            dep_dir.join("lakefile.toml"),
+            "name = \"dep_pkg\"\ndefaultTargets = [\"Dep\"]\n[[lean_lib]]\nname = \"Dep\"\nglobs = [\"Dep.+\"]\n",
+        )?;
+        fs::write(
+            dep_dir.join("Dep/A.lean"),
+            "macro \"depMacroTy\" : term => `(Nat)\n",
+        )?;
+        fs::write(
+            dep_dir.join("Dep/B.lean"),
+            "import Dep.A\ntheorem dep_witness : Nonempty depMacroTy := ⟨default⟩\n",
+        )?;
+
+        let dep_status = std::process::Command::new("lake")
+            .arg("build")
+            .current_dir(&dep_dir)
+            .status()?;
+        assert!(dep_status.success(), "initial lake build of dep_pkg failed");
+        let _ = fs::remove_file(dep_dir.join(".lake/build/.turbo_verified_sources.json"));
+
+        fs::write(root_dir.join("lean-toolchain"), &tc_str)?;
+        fs::write(
+            root_dir.join("lakefile.toml"),
+            "name = \"root_pkg\"\ndefaultTargets = [\"Root\"]\n[[require]]\nname = \"dep_pkg\"\npath = \"../dep_pkg\"\n[[lean_lib]]\nname = \"Root\"\nglobs = [\"Root.+\"]\n",
+        )?;
+        fs::create_dir_all(root_dir.join(".lake"))?;
+        fs::write(
+            root_dir.join("lake-manifest.json"),
+            serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake",
+                "packages": [{
+                    "type": "path",
+                    "scope": "",
+                    "name": "dep_pkg",
+                    "manifestFile": "lake-manifest.json",
+                    "inherited": false,
+                    "dir": "../dep_pkg",
+                    "configFile": "lakefile.toml"
+                }]
+            })
+            .to_string(),
+        )?;
+        fs::write(
+            root_dir.join("Root/Main.lean"),
+            "import Dep.B\ntheorem root_ok : Nonempty Nat := dep_witness\n",
+        )?;
+
+        let targets = vec!["Root".to_string()];
+        let fresh_cfg = resolve_project_config_with_trust(&root_dir, false)?;
+        let fresh_dag = build_module_dag_for_trusted_statement(&fresh_cfg, &targets)?;
+        assert!(
+            !fresh_dag.nodes.contains_key("Dep.B") && !fresh_dag.nodes.contains_key("Dep.A"),
+            "fresh unmanifested dep_pkg closure should stay in external_olean_deps"
+        );
+
+        fs::write(
+            dep_dir.join("Dep/A.lean"),
+            "macro \"depMacroTy\" : term => `(Bool)\n",
+        )?;
+        let dep_a_status = std::process::Command::new("lake")
+            .args(["build", "Dep.A"])
+            .current_dir(&dep_dir)
+            .status()?;
+        assert!(dep_a_status.success(), "selective lake build Dep.A failed");
+        let _ = fs::remove_file(dep_dir.join(".lake/build/.turbo_verified_sources.json"));
+
+        let stale_cfg = resolve_project_config_with_trust(&root_dir, false)?;
+        let stale_dag = build_module_dag_for_trusted_statement(&stale_cfg, &targets)?;
+        assert!(
+            stale_dag.nodes.contains_key("Dep.B"),
+            "stale Dep.B whose recorded import hash no longer matches rebuilt Dep.A must not be accepted as prebuilt external_olean_deps"
+        );
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())
