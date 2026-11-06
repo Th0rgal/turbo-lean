@@ -835,7 +835,7 @@ pub(crate) fn skip_lean_lexeme(src: &str, start: usize) -> Option<LeanLexicalSpa
 }
 
 /// Preserve byte offsets and newlines while hiding lexical contents from scope scans.
-fn mask_lean_lexemes(src: &str, literals: bool) -> String {
+pub(crate) fn mask_lean_lexemes(src: &str, literals: bool) -> String {
     if !literals {
         return strip_lean_comments(src);
     }
@@ -1342,6 +1342,76 @@ pub(crate) fn reject_git_pinned_dep_checking_weakening(source: &str) -> anyhow::
         report.disallowed_items().join(", ")
     );
     Ok(())
+}
+
+pub(crate) fn contains_lean_word(haystack: &str, word: &str) -> bool {
+    for (idx, _) in haystack.match_indices(word) {
+        let prev_ok = idx == 0
+            || !haystack[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| is_lean_id_rest(c) || c == '»' || c == '.');
+        let end = idx + word.len();
+        let next_ok = end >= haystack.len()
+            || !haystack[end..]
+                .chars()
+                .next()
+                .is_some_and(|c| is_lean_id_rest(c) || c == '«' || c == '.');
+        if prev_ok && next_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true if `src` may execute arbitrary `IO` / `CoreM` / `CommandElabM` / `TermElabM` /
+/// `TacticM` / FFI host effects during elaboration (including under `open IO`, aliases, or
+/// wrapper helpers). When `reject_pure_macros` is true, pure `MacroM` (`macro`, `macro_rules`,
+/// `@[macro]`) is also rejected.
+pub(crate) fn source_may_execute_elab_host_effects(src: &str, reject_pure_macros: bool) -> bool {
+    let comment_free = strip_lean_comments(src);
+    let clean = strip_string_literals(&comment_free);
+    let unquoted = clean.replace(['«', '»'], "");
+    const ELAB_IO_WORDS: &[&str] = &[
+        "elab",
+        "elab_rules",
+        "drun_elab",
+        "run_elab",
+        "run_cmd",
+        "run_meta",
+        "#eval",
+        "#eval!",
+        "#guard_msgs",
+        "initialize",
+        "builtin_initialize",
+        "include_str",
+        "unsafe",
+        "command_elab",
+        "term_elab",
+        "app_elab",
+        "tactic",
+        "simproc",
+        "dsimproc",
+        "simproc_decl",
+        "dsimproc_decl",
+        "init",
+        "builtin_init",
+        "extern",
+        "implemented_by",
+        "csimp",
+        "env_extension",
+        "builtin_env_extension",
+    ];
+    if ELAB_IO_WORDS
+        .iter()
+        .any(|w| contains_lean_word(&unquoted, w))
+    {
+        return true;
+    }
+    reject_pure_macros
+        && ["macro", "macro_rules"]
+            .iter()
+            .any(|w| contains_lean_word(&unquoted, w))
 }
 
 fn contains_word(haystack: &str, word: &str) -> bool {
@@ -12875,6 +12945,60 @@ public def api := by
             )
             .is_none(),
             "build_fast_olean_shard_source_with_split must return None for retroactive `attribute [simp] foo`"
+        );
+    }
+
+    #[test]
+    fn test_source_may_execute_elab_host_effects_covers_open_io_interpolations_and_macros() {
+        assert!(!source_may_execute_elab_host_effects(
+            "-- elab initialize #eval @[term_elab]\n/- run_cmd unsafe -/\ndef msg : String := \"elab initialize #eval run_cmd\"\ntheorem ok : 1 + 1 = 2 := rfl\n",
+            true
+        ));
+        assert!(!source_may_execute_elab_host_effects(
+            "def elaboratedValue : Nat := 1\ndef Unsafe.foo : Nat := 2\n",
+            true
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "open IO in\npublic meta section\nopen Lean Elab Term in\npublic elab \"env_nat\" : term => do\n  let _ ← getEnv \"X\"\n  return mkNatLit 0\n",
+            false
+        ));
+        assert!(
+            source_may_execute_elab_host_effects(
+                "def f : String := s!\"{by run_tac trivial}\"\n",
+                false
+            ) || source_may_execute_elab_host_effects(
+                "def f : String := s!\"{unsafeCast 0}\"\n",
+                false
+            )
+        );
+        assert!(source_may_execute_elab_host_effects(
+            "def f : String := s!\"{unsafeCast 0}\"\n",
+            false
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "«elab» \"q\" : term => `(Nat)\n",
+            false
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "@[term_elab mySyntax] def elabMySyntax : Nat := 0\n",
+            false
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "@[extern \"c_fn\"] opaque cFn : IO Nat\n",
+            false
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "initialize myRef : IO.Ref Nat ← IO.mkRef 0\n",
+            false
+        ));
+        let pure_macro = "macro \"dep_ty\" : term => `(Nat)\nmacro_rules | `(t) => `(Nat)\n";
+        assert!(
+            !source_may_execute_elab_host_effects(pure_macro, false),
+            "pure MacroM must remain allowed for base/DAG caching when reject_pure_macros == false"
+        );
+        assert!(
+            source_may_execute_elab_host_effects(pure_macro, true),
+            "standalone .olean statement cache must reject MacroM when reject_pure_macros == true"
         );
     }
 }

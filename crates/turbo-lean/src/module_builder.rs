@@ -10296,6 +10296,8 @@ pub(crate) fn find_dirty_modules_in_otherwise_fresh_dag(
             if blake3::hash(src_raw.as_bytes()).to_hex().as_str() != node.src_blake3 {
                 return None;
             }
+            let src_has_elab_host_effects =
+                crate::splitter::source_may_execute_elab_host_effects(&src_raw, false);
             let header = parse_header_info(&src_raw);
             if header.header_error.is_some() || header.is_module != node.is_module {
                 return None;
@@ -10331,7 +10333,7 @@ pub(crate) fn find_dirty_modules_in_otherwise_fresh_dag(
                 }
                 Some(())
             };
-            if sidecars_ok.is_err() {
+            if src_has_elab_host_effects || sidecars_ok.is_err() {
                 mark_dirty(&mut dirty_mods, &mut cascading_dirty_mods, true)?;
                 continue;
             }
@@ -10600,6 +10602,10 @@ pub(crate) fn seed_verified_fresh_modules_into_disposable_snapshot(
                 dirty_mods.insert(mod_name.clone());
                 continue;
             };
+            if crate::splitter::source_may_execute_elab_host_effects(&dst_src_raw, false) {
+                dirty_mods.insert(mod_name.clone());
+                continue;
+            }
             let header = parse_header_info(&dst_src_raw);
             if header.header_error.is_some() {
                 dirty_mods.insert(mod_name.clone());
@@ -20837,6 +20843,9 @@ fn probe_warm_on_disk_module_candidate(
     if blake3::hash(src_raw.as_bytes()).to_hex().as_str() != node.src_blake3 {
         return None;
     }
+    if crate::splitter::source_may_execute_elab_host_effects(&src_raw, false) {
+        return None;
+    }
     let header = parse_header_info(&src_raw);
     if header.header_error.is_some() || header.is_module != node.is_module {
         return None;
@@ -23390,15 +23399,26 @@ pub(crate) fn build_project_modules_native_with_options(
                         } else {
                             None
                         };
+                        let node_has_elab_host_effects = fs::read_to_string(&node.src_path)
+                            .map(|s| {
+                                crate::splitter::source_may_execute_elab_host_effects(&s, false)
+                            })
+                            .unwrap_or(true);
                         let mut cas_hit_outputs: Option<Vec<BlobEntry>> = None;
-                        if let Some(outputs) = store.get_cached_action(&mod_key, trust_domain)? {
-                            cas_hit_outputs = Some(outputs);
-                        } else if let Some(ref c_key) = fallback_c_key_opt {
-                            if let Some(outputs) = store.get_cached_action(c_key, trust_domain)? {
+                        if !node_has_elab_host_effects {
+                            if let Some(outputs) =
+                                store.get_cached_action(&mod_key, trust_domain)?
+                            {
                                 cas_hit_outputs = Some(outputs);
+                            } else if let Some(ref c_key) = fallback_c_key_opt {
+                                if let Some(outputs) =
+                                    store.get_cached_action(c_key, trust_domain)?
+                                {
+                                    cas_hit_outputs = Some(outputs);
+                                }
                             }
                         }
-                        if cas_hit_outputs.is_none() {
+                        if !node_has_elab_host_effects && cas_hit_outputs.is_none() {
                             if let Some(ref rem_url) = remote_cache_url {
                                 let mut wanted = vec![mod_key.clone()];
                                 if let Some(ref c_key) = fallback_c_key_opt {
@@ -24301,7 +24321,15 @@ pub(crate) fn build_project_modules_native_with_options(
                                 }
                                 report.modules_compiled += 1;
                                 report.compiled_modules.push(mod_name.clone());
-                                Ok(Some((dig, Some((mod_key, dur_ms, trace_log)))))
+                                let cas_store_opt = fs::read_to_string(&node.src_path)
+                                    .ok()
+                                    .filter(|s| {
+                                        !crate::splitter::source_may_execute_elab_host_effects(
+                                            s, false,
+                                        )
+                                    })
+                                    .map(|_| (mod_key, dur_ms, trace_log));
+                                Ok(Some((dig, cas_store_opt)))
                             })(),
                         };
 
