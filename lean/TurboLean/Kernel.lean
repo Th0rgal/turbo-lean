@@ -25,6 +25,9 @@ export TurboLean.PolicyGates (
   verifyAuditMaterializeGate
   verifyPackTrustAdmission
   verifyHygieneItemAdmitted
+  routeKernelEngine
+  verifyKernelEngineRoute
+  verifyReceiptProvenanceAdmission
   matryoshkaTierRouterSpec
   isClosedSectionNeededC
   cAbiIsClosedSectionNeeded
@@ -69,6 +72,8 @@ export TurboLean.PolicyGates (
   verifyAuditMaterializeGateC
   verifyPackTrustAdmissionC
   verifyHygieneItemAdmittedC
+  routeKernelEngineC
+  verifyReceiptProvenanceAdmissionC
   combinedStepC
 )
 

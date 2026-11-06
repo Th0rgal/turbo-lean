@@ -3622,6 +3622,11 @@ pub fn run_ci_verify_command(
     } else {
         "trusted".to_string()
     };
+    let toolchain = detect_toolchain(&canon_dir);
+    let kernel_prov = crate::kernel::resolve_kernel_engine(
+        crate::kernel::resolve_kernel_selection_from_env(None)?,
+        &toolchain,
+    )?;
 
     if is_untrusted && crate::module_builder::probe_bwrap_sandbox(&canon_dir).is_none() {
         anyhow::bail!(
@@ -3646,18 +3651,19 @@ pub fn run_ci_verify_command(
     let mut per_file_interfaces = BTreeMap::new();
     let lean_paths =
         crate::lake_build::collect_project_lean_files(&canon_dir, true, scope.as_deref());
-    let toolchain = detect_toolchain(&canon_dir);
     let ci_axioms = splitter::allowed_axioms();
     let mut hasher = blake3::Hasher::new();
     // v5: bind global C-emission flags, custom CC env, and full native/package `.lake/build` outputs.
     hasher.update(
         format!(
-            "turbo-lean-ci-build-v5\n{}\n{}\n{}\n{}:{}\n",
+            "turbo-lean-ci-build-v5\n{}\n{}\n{}\n{}:{}\n:kernel:{}:{}\n",
             toolchain,
             trust_domain,
             cfg.canonical_config_digest,
             crate::zygote::ZYGOTE_SCANNER_VERSION,
-            crate::zygote::ZYGOTE_REPLAY_VERSION
+            crate::zygote::ZYGOTE_REPLAY_VERSION,
+            kernel_prov.kernel_engine.as_str(),
+            kernel_prov.con_leche_rev.as_deref().unwrap_or("none"),
         )
         .as_bytes(),
     );
@@ -3969,8 +3975,11 @@ pub fn run_ci_verify_command(
         0
     };
 
-    let mut ver_receipt = build_verification_receipt(
+    let mut ver_receipt = build_verification_receipt_with_provenance(
         &mode,
+        kernel_prov.kernel_engine.as_str(),
+        &kernel_prov.lean_toolchain,
+        kernel_prov.con_leche_rev.as_deref(),
         &interface_hash,
         &action_key,
         total_files,
@@ -3985,14 +3994,40 @@ pub fn run_ci_verify_command(
     )?;
 
     let elapsed_ms = t0.elapsed().as_millis();
+    let mut telemetry_json = serde_json::json!({
+        "schema": "turbo-lean.telemetry.v1",
+        "tool_name": "ci_verify",
+        "command": "ci-verify",
+        "decl_name": project_name,
+        "status": "ci_verified",
+        "mode": mode,
+        "trust_domain": trust_domain,
+        "env_scrubbed": is_untrusted,
+        "bwrap_net_isolated": bwrap_used,
+        "bwrap_sandbox_used": bwrap_used,
+        "build_status": build_status,
+        "cache_hit": build_status.starts_with("cache_hit"),
+        "accepted": true,
+        "action_key": action_key,
+        "interface_hash": interface_hash,
+        "receipt_blake3": ver_receipt.receipt_blake3,
+        "files_audited": total_files,
+        "files_checked": total_files,
+        "theorem_shards": total_shards,
+        "shards_seeded": seeded_shards,
+        "zero_sorry": true,
+        "zero_native_decide": !splitter::native_decide_allowed(),
+        "elapsed_ms": elapsed_ms,
+    });
+    kernel_prov.insert_json_fields(&mut telemetry_json);
     crate::mcp::emit_cli_telemetry_event(
         Some(&canon_dir),
         !is_untrusted,
-        serde_json::json!({
-            "schema": "turbo-lean.telemetry.v1",
-            "tool_name": "ci_verify",
-            "command": "ci-verify",
-            "decl_name": project_name,
+        telemetry_json,
+        "turbo_lean_events.jsonl",
+    );
+    if json {
+        let mut out_json = serde_json::json!({
             "status": "ci_verified",
             "mode": mode,
             "trust_domain": trust_domain,
@@ -4000,50 +4035,25 @@ pub fn run_ci_verify_command(
             "bwrap_net_isolated": bwrap_used,
             "bwrap_sandbox_used": bwrap_used,
             "build_status": build_status,
-            "cache_hit": build_status.starts_with("cache_hit"),
-            "accepted": true,
             "action_key": action_key,
             "interface_hash": interface_hash,
             "receipt_blake3": ver_receipt.receipt_blake3,
+            "receipt_path": receipt.as_ref().map(|p| p.display().to_string()),
             "files_audited": total_files,
             "files_checked": total_files,
             "theorem_shards": total_shards,
             "shards_seeded": seeded_shards,
             "zero_sorry": true,
             "zero_native_decide": !splitter::native_decide_allowed(),
-            "elapsed_ms": elapsed_ms,
-        }),
-        "turbo_lean_events.jsonl",
-    );
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "status": "ci_verified",
-                "mode": mode,
-                "trust_domain": trust_domain,
-                "env_scrubbed": is_untrusted,
-                "bwrap_net_isolated": bwrap_used,
-                "bwrap_sandbox_used": bwrap_used,
-                "build_status": build_status,
-                "action_key": action_key,
-                "interface_hash": interface_hash,
-                "receipt_blake3": ver_receipt.receipt_blake3,
-                "receipt_path": receipt.as_ref().map(|p| p.display().to_string()),
-                "files_audited": total_files,
-                "files_checked": total_files,
-                "theorem_shards": total_shards,
-                "shards_seeded": seeded_shards,
-                "zero_sorry": true,
-                "zero_native_decide": !splitter::native_decide_allowed(),
-                "allowed_axioms": splitter::allowed_axioms(),
-                "elapsed_ms": elapsed_ms
-            }))?
-        );
+            "allowed_axioms": splitter::allowed_axioms(),
+            "elapsed_ms": elapsed_ms
+        });
+        kernel_prov.insert_json_fields(&mut out_json);
+        println!("{}", serde_json::to_string_pretty(&out_json)?);
     } else {
         println!(
-            "[turbo-lean] CI-VERIFY PASSED (mode={}, env_scrubbed={}, status={}, {} files, {} theorems, receipt_blake3={}.., {} ms)",
-            mode, is_untrusted, build_status, total_files, total_shards, &ver_receipt.receipt_blake3[..12], elapsed_ms
+            "[turbo-lean] CI-VERIFY PASSED (mode={}, kernel={}, env_scrubbed={}, status={}, {} files, {} theorems, receipt_blake3={}.., {} ms)",
+            mode, kernel_prov.kernel_engine, is_untrusted, build_status, total_files, total_shards, &ver_receipt.receipt_blake3[..12], elapsed_ms
         );
     }
     if !is_untrusted && !crate::zygote::daemon_disabled() {
@@ -4058,6 +4068,7 @@ pub fn run_ci_verify_command(
 
 fn build_pr_verification_receipt(
     mode: &str,
+    kernel_prov: &crate::kernel::KernelProvenance,
     base: &str,
     classification: &PrClassification,
 ) -> VerificationReceipt {
@@ -4065,13 +4076,17 @@ fn build_pr_verification_receipt(
         + classification.proof_edited_theorems.len()
         + classification.statement_edited_theorems.len();
     let action_key = format!(
-        "pr-verify:{}:{}",
+        "pr-verify:{}:{}:{}",
         base,
+        kernel_prov.kernel_engine.as_str(),
         &classification.current_interface_hash
             [..16.min(classification.current_interface_hash.len())]
     );
-    build_verification_receipt(
+    build_verification_receipt_with_provenance(
         mode,
+        kernel_prov.kernel_engine.as_str(),
+        &kernel_prov.lean_toolchain,
+        kernel_prov.con_leche_rev.as_deref(),
         &classification.current_interface_hash,
         &action_key,
         classification.total_files,
@@ -5850,6 +5865,11 @@ pub fn run_pr_verify_command(
     let canon_dir = project_dir
         .canonicalize()
         .unwrap_or_else(|_| project_dir.clone());
+    let toolchain = detect_toolchain(&canon_dir);
+    let kernel_prov = crate::kernel::resolve_kernel_engine(
+        crate::kernel::resolve_kernel_selection_from_env(None)?,
+        &toolchain,
+    )?;
     let is_untrusted = mode == "untrusted";
     if !is_untrusted
         && (canon_dir.join("lakefile.lean").is_file() || canon_dir.join("lakefile.toml").is_file())
@@ -5862,7 +5882,6 @@ pub fn run_pr_verify_command(
     } else {
         "trusted".to_string()
     };
-    let toolchain = detect_toolchain(&canon_dir);
 
     let untrusted_pr_cfg = if is_untrusted {
         if crate::module_builder::probe_bwrap_sandbox(&canon_dir).is_none() {
@@ -7100,7 +7119,8 @@ pub fn run_pr_verify_command(
         nanoda_verified = true;
     }
 
-    let mut ver_receipt = build_pr_verification_receipt(&mode, &base, &classification);
+    let mut ver_receipt =
+        build_pr_verification_receipt(&mode, &kernel_prov, &base, &classification);
     emit_verification_receipt_with_signing_key(
         receipt.as_deref(),
         &mut ver_receipt,
@@ -7123,37 +7143,39 @@ pub fn run_pr_verify_command(
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "pr-project".to_string());
+    let mut pr_telemetry_json = serde_json::json!({
+        "schema": "turbo-lean.telemetry.v1",
+        "tool_name": "pr_verify",
+        "command": "pr-verify",
+        "decl_name": project_name,
+        "status": "pr_verified",
+        "base": base,
+        "mode": mode,
+        "trust_domain": trust_domain,
+        "interface_drift": classification.interface_drift,
+        "interface_hash": classification.current_interface_hash,
+        "receipt_blake3": ver_receipt.receipt_blake3,
+        "total_files": classification.total_files,
+        "modified_files_count": classification.modified_files.len(),
+        "unchanged_theorems_count": classification.unchanged_theorems.len(),
+        "proof_edited_theorems_count": classification.proof_edited_theorems.len(),
+        "statement_edited_theorems_count": classification.statement_edited_theorems.len(),
+        "shard_cache_hits": shard_cache_hits,
+        "shards_verified": shards_verified,
+        "cache_hit": shards_verified == 0,
+        "accepted": true,
+        "nanoda_verified": nanoda_verified,
+        "fast_olean_used": fast_olean_used,
+        "cross_file_coalesced": cross_file_coalesced,
+        "zero_sorry": true,
+        "zero_native_decide": !splitter::native_decide_allowed(),
+        "elapsed_ms": elapsed_ms,
+    });
+    kernel_prov.insert_json_fields(&mut pr_telemetry_json);
     crate::mcp::emit_cli_telemetry_event(
         Some(&canon_dir),
         !is_untrusted,
-        serde_json::json!({
-            "schema": "turbo-lean.telemetry.v1",
-            "tool_name": "pr_verify",
-            "command": "pr-verify",
-            "decl_name": project_name,
-            "status": "pr_verified",
-            "base": base,
-            "mode": mode,
-            "trust_domain": trust_domain,
-            "interface_drift": classification.interface_drift,
-            "interface_hash": classification.current_interface_hash,
-            "receipt_blake3": ver_receipt.receipt_blake3,
-            "total_files": classification.total_files,
-            "modified_files_count": classification.modified_files.len(),
-            "unchanged_theorems_count": classification.unchanged_theorems.len(),
-            "proof_edited_theorems_count": classification.proof_edited_theorems.len(),
-            "statement_edited_theorems_count": classification.statement_edited_theorems.len(),
-            "shard_cache_hits": shard_cache_hits,
-            "shards_verified": shards_verified,
-            "cache_hit": shards_verified == 0,
-            "accepted": true,
-            "nanoda_verified": nanoda_verified,
-            "fast_olean_used": fast_olean_used,
-            "cross_file_coalesced": cross_file_coalesced,
-            "zero_sorry": true,
-            "zero_native_decide": !splitter::native_decide_allowed(),
-            "elapsed_ms": elapsed_ms,
-        }),
+        pr_telemetry_json,
         "turbo_lean_events.jsonl",
     );
     if json {
@@ -7193,6 +7215,7 @@ pub fn run_pr_verify_command(
             "axiom_flags": classification.axiom_flags,
             "elapsed_ms": elapsed_ms
         });
+        kernel_prov.insert_json_fields(&mut out_json);
         if cone_stats {
             out_json["cone_stats"] = serde_json::json!({
                 "total_project_theorems": total_project_theorems,
@@ -7206,8 +7229,9 @@ pub fn run_pr_verify_command(
         println!("{}", serde_json::to_string_pretty(&out_json)?);
     } else {
         println!(
-            "[turbo-lean] PR-VERIFY PASSED vs {} ({} unchanged, {} proof-edited, {} stmt-edited, interface_drift={}, fast_olean={}, cross_file={}, {:.2} ms)",
+            "[turbo-lean] PR-VERIFY PASSED vs {} (kernel={}, {} unchanged, {} proof-edited, {} stmt-edited, interface_drift={}, fast_olean={}, cross_file={}, {:.2} ms)",
             base,
+            kernel_prov.kernel_engine,
             classification.unchanged_theorems.len(),
             classification.proof_edited_theorems.len(),
             classification.statement_edited_theorems.len(),
@@ -7523,7 +7547,7 @@ mod pr_verify_tests {
         let cfg = crate::module_builder::resolve_project_config(&tree.project)?;
         hasher.update(
             format!(
-                "turbo-lean-ci-build-v5\n{toolchain}\nuntrusted:ci\n{}\n{}:{}\n",
+                "turbo-lean-ci-build-v5\n{toolchain}\nuntrusted:ci\n{}\n{}:{}\n:kernel:standard:none\n",
                 cfg.canonical_config_digest,
                 crate::zygote::ZYGOTE_SCANNER_VERSION,
                 crate::zygote::ZYGOTE_REPLAY_VERSION

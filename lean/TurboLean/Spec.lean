@@ -74,6 +74,9 @@ export TurboLean.PolicyGates (
   verifyAuditMaterializeGate
   verifyPackTrustAdmission
   verifyHygieneItemAdmitted
+  routeKernelEngine
+  verifyKernelEngineRoute
+  verifyReceiptProvenanceAdmission
   matryoshkaTierRouterSpec
   isClosedSectionNeededC
   cAbiIsClosedSectionNeeded
@@ -118,6 +121,8 @@ export TurboLean.PolicyGates (
   verifyAuditMaterializeGateC
   verifyPackTrustAdmissionC
   verifyHygieneItemAdmittedC
+  routeKernelEngineC
+  verifyReceiptProvenanceAdmissionC
   combinedStepC
 )
 
@@ -1317,5 +1322,92 @@ theorem hygiene_item_admission_rejects_sorry_and_trust_compiler
     (h_non_native : s.itemKind ≠ 1 ∧ s.itemKind ≠ 2) :
     verifyHygieneItemAdmitted s.itemKind s.admitsNativeDecide s.admitsBvDecide = false :=
   hygieneItemAdmissionMetaSpec.rejects_unsafe s (by simp [h_non_native.1, h_non_native.2])
+
+structure KernelEngineRouteState where
+  requestedEngine   : UInt8
+  resolvedEngine    : UInt8
+  conLecheSupported : Bool
+  deriving Repr, DecidableEq, BEq
+
+def kernelEngineRouteMetaSpec : MetaGateSpec KernelEngineRouteState
+    (fun s => s.resolvedEngine ≠ 0 ∧
+      routeKernelEngine s.requestedEngine s.conLecheSupported = s.resolvedEngine) where
+  gate := fun s =>
+    verifyKernelEngineRoute s.requestedEngine s.resolvedEngine s.conLecheSupported
+  sound := fun s h => by
+    simpa [verifyKernelEngineRoute, Bool.and_eq_true, bne_iff_ne, beq_iff_eq] using h
+  complete := fun s h => by
+    simpa [verifyKernelEngineRoute, Bool.and_eq_true, bne_iff_ne, beq_iff_eq] using h
+  posWitness := ⟨0, 1, false⟩
+  negWitness := ⟨2, 1, false⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem kernel_engine_route_fails_closed_without_con_leche
+    (s : KernelEngineRouteState)
+    (h_req : s.requestedEngine = 2 ∨ s.requestedEngine = 3)
+    (h_unsupported : s.conLecheSupported = false) :
+    verifyKernelEngineRoute s.requestedEngine s.resolvedEngine s.conLecheSupported = false :=
+  kernelEngineRouteMetaSpec.rejects_unsafe s fun ⟨h_ne, h_eq⟩ => by
+    rcases h_req with h | h <;> simp [routeKernelEngine, h, h_unsupported] at h_eq
+    all_goals exact h_ne h_eq.symm
+
+structure ReceiptProvenanceAdmissionState where
+  schemaVersion    : UInt32
+  hasKernelEngine  : Bool
+  engineKind       : UInt8
+  toolchainState   : UInt8
+  conLecheRevState : UInt8
+  blake3Matches    : Bool
+  deriving Repr, DecidableEq, BEq
+
+def receiptProvenanceAdmissionMetaSpec : MetaGateSpec ReceiptProvenanceAdmissionState
+    (fun s => s.blake3Matches = true ∧
+      ((s.schemaVersion = 1 ∧ s.hasKernelEngine = false ∧
+          s.toolchainState = 0 ∧ s.conLecheRevState = 0) ∨
+       (s.schemaVersion = 2 ∧ s.hasKernelEngine = true ∧ s.toolchainState = 2 ∧
+          ((s.engineKind = 1 ∧ s.conLecheRevState = 0) ∨
+            ((s.engineKind = 2 ∨ s.engineKind = 3) ∧ s.conLecheRevState = 2))))) where
+  gate := fun s =>
+    verifyReceiptProvenanceAdmission
+      s.schemaVersion s.hasKernelEngine s.engineKind
+      s.toolchainState s.conLecheRevState s.blake3Matches
+  sound := fun s h => by
+    by_cases hv1 : s.schemaVersion = 1 <;> by_cases hv2 : s.schemaVersion = 2 <;>
+      simp [verifyReceiptProvenanceAdmission, hv1, hv2,
+        Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq, and_assoc] at h ⊢ <;>
+      exact h
+  complete := fun s h => by
+    rcases h with ⟨hb, ⟨hv, hk, ht, hc⟩ | ⟨hv, hk, ht, hrev⟩⟩
+    · simp [verifyReceiptProvenanceAdmission, hv, hb, hk, ht, hc]
+    · simpa [verifyReceiptProvenanceAdmission, hv, hb, hk, ht,
+        Bool.and_eq_true, Bool.or_eq_true, beq_iff_eq] using hrev
+  posWitness := ⟨2, true, 2, 2, 2, true⟩
+  negWitness := ⟨2, true, 2, 2, 0, true⟩
+  nonVacuous := rfl
+  tight := rfl
+
+theorem receipt_provenance_admission_rejects_unauthenticated_v1
+    (s : ReceiptProvenanceAdmissionState)
+    (h_v1 : s.schemaVersion = 1)
+    (h_prov : s.hasKernelEngine = true ∨ s.toolchainState ≠ 0 ∨ s.conLecheRevState ≠ 0) :
+    verifyReceiptProvenanceAdmission
+      s.schemaVersion s.hasKernelEngine s.engineKind
+      s.toolchainState s.conLecheRevState s.blake3Matches = false :=
+  receiptProvenanceAdmissionMetaSpec.rejects_unsafe s (by
+    rcases h_prov with h | h | h <;> simp [h_v1, h])
+
+theorem receipt_provenance_admission_v2_enforces_engine_revision_consistency
+    (s : ReceiptProvenanceAdmissionState)
+    (h_v2 : s.schemaVersion = 2)
+    (h_bad : s.engineKind = 0 ∨ s.engineKind > 3 ∨
+      (s.engineKind = 1 ∧ s.conLecheRevState ≠ 0) ∨
+      ((s.engineKind = 2 ∨ s.engineKind = 3) ∧ s.conLecheRevState ≠ 2)) :
+    verifyReceiptProvenanceAdmission
+      s.schemaVersion s.hasKernelEngine s.engineKind
+      s.toolchainState s.conLecheRevState s.blake3Matches = false :=
+  receiptProvenanceAdmissionMetaSpec.rejects_unsafe s fun ⟨_, h⟩ => by
+    rcases h with ⟨hv, _⟩ | ⟨_, _, _, ⟨_, _⟩ | ⟨_ | _, _⟩⟩ <;>
+      rcases h_bad with hb | hb | ⟨_, _⟩ | ⟨_ | _, _⟩ <;> simp_all <;> omega
 
 end TurboLean.Spec
