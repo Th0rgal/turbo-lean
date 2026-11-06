@@ -92,6 +92,33 @@ theorem parseSSAName_roundtrip (name : String) (hne : name.toList.isEmpty = fals
     parseSSAName ("%" ++ name) = some name := by
   simp [parseSSAName, String.toList_append, hne, hchars]
 
+theorem CanonicalSSAName.parse_roundtrip (name : String) (h : CanonicalSSAName name) :
+    parseSSAName ("%" ++ name) = some name :=
+  parseSSAName_roundtrip name h.1 h.2
+
+/-- Generated decimal suffixes preserve the SSA identifier alphabet. -/
+theorem CanonicalSSAName.append_nat (pre : String) (h : CanonicalSSAName pre) (n : Nat) :
+    CanonicalSSAName (pre ++ n.repr) := by
+  have hd : n.repr.toList.all (fun c => c.isAlphanum || c == '_') = true := by
+    apply List.all_eq_true.mpr
+    intro c hc
+    have hc := Nat.isDigit_of_mem_toDigits (b := 10) (n := n) (by omega) (by omega)
+      (by simpa only [Nat.toList_repr] using hc)
+    simp [Char.isAlphanum, hc]
+  constructor
+  · cases he : pre.toList with
+    | nil => have := h.1; simp [he] at this
+    | cons c cs => simp [String.toList_append, he]
+  · rw [String.toList_append, List.all_append, h.2, hd]; rfl
+
+/-- Canonicality is compositional with exactly the printer's SSA environment threading. -/
+theorem CanonicalBody.append (tenv : TypeEnv) (xs ys : List StableHLOOp) :
+    CanonicalBody tenv (xs ++ ys) ↔
+      CanonicalBody tenv xs ∧ CanonicalBody (xs.foldl bindResult tenv) ys := by
+  induction xs generalizing tenv with
+  | nil => simp [CanonicalBody]
+  | cons op ops ih => simp [CanonicalBody, ih, and_assoc]
+
 /-- A closing tensor delimiter disambiguates `i1` from `i16`. -/
 theorem parseElemType_roundtrip (ty : ElemType) (fuel : Nat) (rest : List Char) :
     parseElemType (fuel + 1) ((ppElemType ty).toList ++ '>' :: rest) =

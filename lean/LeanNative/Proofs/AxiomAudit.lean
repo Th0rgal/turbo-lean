@@ -431,6 +431,60 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.MetalLowerProofs.lowerKind_canonical
   , ``LeanNative.Proofs.MetalLowerProofs.lowerKind_roundtrip
   , ``LeanNative.Backend.PTXAst.parsePTXOperand_specialReg_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXOperand_reg_suffix_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXOperand_specialReg_suffix_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXOperand_sym_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXName_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXName_nat_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXOperand_u64_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXOperand_s64_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXOperand_f32_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXOperand_f64_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXOperand_roundtrip
+  , ``LeanNative.Backend.PTXAst.ppPTXOperand_injective_on_canonical
+  , ``LeanNative.Backend.PTXAst.parsePTXAddr_reg_zero_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXInstr_bra_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXTypedName_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXInstr_mov_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXInstr_ldParam_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXAddr_param_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXParamDecl_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXAddr_offset_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXAddr_roundtrip
+  , ``LeanNative.Backend.PTXAst.ppPTXAddr_injective_on_canonical
+  , ``LeanNative.Backend.PTXAst.parsePTXInstr_load_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXInstr_store_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXInstr_cvtaToGlobal_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXInstr_ret_suffix_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXInstr_barSync_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXInstr_unary_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXInstr_binary_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXInstr_modified_binary_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXInstr_selp_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXInstr_ternary_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXInstr_cvt_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXInstr_roundtrip
+  , ``LeanNative.Backend.PTXAst.ppPTXInstr_injective_on_canonical
+  , ``LeanNative.Backend.PTXAst.parsePTXRegDecl_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXSharedDecl_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXStmt_label_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXStmt_roundtrip
+  , ``LeanNative.Backend.PTXAst.ppPTXStmt_injective_on_canonical
+  , ``LeanNative.Backend.PTXAst.scanPTXLines_prefix
+  , ``LeanNative.Backend.PTXAst.parsePTXDeclsAndBody_regs_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXDeclsAndBody_shared_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXDeclsAndBody_local_roundtrip
+  , ``LeanNative.Backend.PTXAst.ppPTXStmt_not_decl
+  , ``LeanNative.Backend.PTXAst.parsePTXDeclsAndBody_body_roundtrip
+  , ``LeanNative.Proofs.PTXLowerProofs.lowerScalar_canonical
+  , ``LeanNative.Proofs.PTXLowerProofs.lowerScalar_stmt_roundtrip
+  , ``LeanNative.Proofs.PTXLowerProofs.lowerKind_canonical
+  , ``LeanNative.Backend.StableHLOAst.parseTensorType_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.ppTensorType_injective
+  , ``LeanNative.Backend.StableHLOAst.CanonicalSSAName.parse_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.CanonicalSSAName.append_nat
+  , ``LeanNative.Backend.StableHLOAst.CanonicalBody.append
+  , ``LeanNative.Backend.MLIRGPU.lowerStableHLODeclFunc_canonical
   , ``LeanNative.Backend.PTXAst.ppPTXType_injective_via_parser
   , ``LeanNative.Backend.StableHLOAst.parseElemType_roundtrip
   , ``LeanNative.Backend.StableHLOAst.ppElemType_injective_via_parser
@@ -639,7 +693,7 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.ablateSitesLeaveOneOut_sound
   ]
 
-#guard auditedTheoremNames.length == 681
+#guard auditedTheoremNames.length == 735
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/

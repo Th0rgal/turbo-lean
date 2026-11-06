@@ -1,4 +1,5 @@
 import LeanNative.Proofs.StableHLOCodeProofs
+import LeanNative.Backend.MLIRGPU
 
 /-!
 # Top-Level `LNIR → StableHLOAst` Soundness & Mutant Kills (`LeanNative.Proofs.StableHLOLowerProofs`)
@@ -14,6 +15,28 @@ Proves:
    mechanized emitter mutant-kill proofs against `hloMutantSubSwap`, `hloMutantUnmaskedShl`,
    and `hloMutantUnguardedDiv`.
 -/
+
+namespace LeanNative.Backend.MLIRGPU
+
+open LeanNative.IR StableHLOAst
+
+/-- The declaration emitter constructs lexically valid, well-typed covered operations. -/
+theorem lowerStableHLODeclFunc_canonical (name : String) (kernel : ParallelKernelKind)
+    (f : FuncOp) (hn : CanonicalSSAName name)
+    (hf : lowerStableHLODeclFunc name kernel = some f) : CanonicalFuncOp f := by
+  cases kernel <;> simp only [lowerStableHLODeclFunc, bind, Option.bind, pure] at hf
+  all_goals try contradiction
+  all_goals cases hf
+  all_goals simp only [CanonicalFuncOp, hn, true_and]
+  all_goals
+    simp [CanonicalBody, CanonicalStableHLOOp,
+      CanonicalSSAName, bindResult, resultTypeOf, TypeEnv.bind, TypeEnv.empty,
+      TensorType.numElements, dotOperandOk, dimsStrict, complement,
+      show (ElemType.ui64 == ElemType.ui64) = true from rfl,
+      show (({ shape := [262144], elem := .ui64 } : TensorType) ==
+        { shape := [262144], elem := .ui64 }) = true from rfl]
+
+end LeanNative.Backend.MLIRGPU
 
 namespace LeanNative.Proofs
 

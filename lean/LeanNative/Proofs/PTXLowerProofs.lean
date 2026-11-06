@@ -91,6 +91,60 @@ theorem lowerScalar_stmt_roundtrip (varOf : Nat → Option PReg) (e : PEnv) (exp
   exact parsePTXStmt_roundtrip s (lowerScalar_canonical varOf e expr hr hp s hs)
     rest ((ppPTXStmt s).toList.length + 1) (by omega)
 
+set_option maxHeartbeats 4000000 in
+/-- Kernel lowering preserves the scalar grammar under lexical naming premises. -/
+theorem lowerKind_canonical (name : String) (kind : ParallelKernelKind)
+    (hn : CanonicalPTXSymbol name)
+    (hr : ∀ p : PReg, CanonicalPTXName p.name ∧ CanonicalPTXOperand (iOp p))
+    (hp : ∀ n : Nat, CanonicalPTXName s!"%p{n}")
+    (hi : ∀ n : Nat, CanonicalPTXSymbol s!"param_in{n}")
+    (hd : CanonicalPTXName s!"$L_done_{name}")
+    (hb : CanonicalPTXName s!"$L_boundary_{name}") :
+    CanonicalPTXKernel (lowerKind name kind) := by
+  simp only [toString] at hn hr hp hi hd hb ⊢
+  have hloads (n : Nat) :
+      ∀ s ∈ (List.range n).foldl (fun acc k => acc ++ loadIn k s!"%rd{7 + k}") [],
+        CanonicalPTXStmt s := by
+    apply canonical_fold_append
+    · simp
+    · intro k _
+      have hreg := hr (.rd (7 + k))
+      simp only [PReg.name, iOp, CanonicalPTXOperand] at hreg
+      simp only [toString] at hreg
+      simp only [loadIn, ins, toString, List.forall_mem_cons, List.forall_mem_nil,
+        CanonicalPTXStmt, Option.mem_def, reduceCtorEq, false_implies, forall_const,
+        true_and, CanonicalPTXInstr, CanonicalPTXAddr, CanonicalPTXOperand]
+      simp only [hreg.1, hreg.2.1, hreg.2.2.1, hreg.2.2.2, hi, true_and, and_true]
+      simp only [List.not_mem_nil, false_implies, implies_true, and_true]
+      exact ⟨hreg.2.2.2, hreg.2.2.2, (hr (.rd 5)).2⟩
+  have hscalar := fun v e x => lowerScalar_canonical v e x hr hp
+  have hro := fun p => (hr p).2
+  have hl (n : Nat) : (∀ s ∈ (List.range n).foldl
+      (fun acc k => acc ++ loadIn k s!"%rd{7 + k}") [], CanonicalPTXStmt s) = True :=
+    propext ⟨fun _ => trivial, fun _ => hloads n⟩
+  have hs (v : Nat → Option PReg) (e : PEnv) (x : ScalarExpr) :
+      (∀ s ∈ (lowerScalar v e x).1, CanonicalPTXStmt s) = True :=
+    propext ⟨fun _ => trivial, fun _ => hscalar v e x⟩
+  cases kind <;>
+    simp only [lowerKind, kernelOf, CanonicalPTXKernel, List.forall_mem_append,
+      List.forall_mem_cons, List.forall_mem_nil, List.forall_mem_map]
+  all_goals
+    try simp only [hl, hs, true_and, and_true]
+  all_goals
+    simp only [toString, CanonicalPTXParamDecl, CanonicalPTXRegDecl, gidSetup, loadIn, ins, i64,
+      List.forall_mem_append, List.forall_mem_cons, List.forall_mem_nil,
+      List.forall_mem_map, hn, hd, hb, hi, hloads,
+      hscalar, hro]
+  all_goals
+    simp [toString,
+      CanonicalPTXStmt, CanonicalPTXInstr, CanonicalPTXAddr, CanonicalPTXPredGuard,
+      hd, hb, hi, hro]
+  all_goals
+    repeat' apply And.intro
+    all_goals first | assumption | exact hi _ |
+      (simp [CanonicalPTXName, CanonicalPTXSymbol, CanonicalPTXOperand,
+        ptxNameChar, ptxSpecialRegs, ppSpecialReg])
+
 private theorem packInputWordLists_props (env : VarEnv) (st : HeapState) (len : Nat) :
     ∀ (inputs : List VarId) (ws : List (List (BitVec 64))),
       packInputWordLists env st len inputs = some ws →

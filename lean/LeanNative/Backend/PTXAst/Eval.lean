@@ -2402,6 +2402,15 @@ def CanonicalPTXKernel (k : PTXKernel) : Prop :=
   (∀ s ∈ k.sharedDecls, CanonicalPTXSharedDecl s) ∧
   (∀ s ∈ k.body, CanonicalPTXStmt s)
 
+/-- A structural upper bound for every identifier, decimal field, and body statement. -/
+def ptxKernelFuel (k : PTXKernel) : Nat :=
+  2 + k.name.toList.length + k.localBytes.repr.toList.length +
+    (k.params.map (fun p => p.name.toList.length)).sum +
+    (k.regDecls.map (fun r => r.prefixName.toList.length + r.count.repr.toList.length)).sum +
+    (k.sharedDecls.map (fun s => s.name.toList.length + s.align.repr.toList.length +
+      s.count.repr.toList.length)).sum +
+    (k.body.map (fun s => (ppPTXStmt s).toList.length)).sum
+
 /-- Disambiguate register names from the twelve architectural special registers. -/
 def parsePTXNamedOperand (name : String) : PTXOperand :=
   match ptxSpecialRegs.find? (fun sr => ppSpecialReg sr == name) with
@@ -2644,6 +2653,26 @@ def parsePTXSharedDecl (fuel : Nat) (input : List Char) :
   let rest ← stripPrefixChars [']', ';'] input
   return ({ name, elemTy, align := ← align.toNat?, count := ← count.toNat? }, rest)
 
+/-- Consume declaration/body lines structurally, preserving the parser's section state.
+Declarations may be interleaved before the first statement, but never follow it. -/
+def parsePTXDeclsAndBody (fuel : Nat) : List String → PTXKernel → Bool → Option PTXKernel
+  | [], kernel, _ => some kernel
+  | line :: lines, kernel, inBody => do
+    if let some (reg, []) := parsePTXRegDecl fuel line.toList then
+      if inBody then none else
+        parsePTXDeclsAndBody fuel lines { kernel with regDecls := kernel.regDecls ++ [reg] } false
+    else if let some (shared, []) := parsePTXSharedDecl fuel line.toList then
+      if inBody then none else
+        parsePTXDeclsAndBody fuel lines { kernel with sharedDecls := kernel.sharedDecls ++ [shared] } false
+    else if let some chars := stripPrefixChars "    .local .align 8 .b8 __local_mem[".toList line.toList then
+      if inBody || kernel.localBytes != 0 then none else do
+        let (count, chars) ← parsePTXName fuel chars
+        let [] ← stripPrefixChars [']', ';'] chars | none
+        parsePTXDeclsAndBody fuel lines { kernel with localBytes := ← count.toNat? } false
+    else
+      let (stmt, []) ← parsePTXStmt fuel line.toList | none
+      parsePTXDeclsAndBody fuel lines { kernel with body := kernel.body ++ [stmt] } true
+
 /-- Parse a complete kernel, retaining declaration order and rejecting unknown lines. -/
 def parsePTXKernel (fuel : Nat) (text : String) : Option PTXKernel := do
   let header :: lines := (← scanPTXLines (text.toList.length + 1) text.toList).map String.ofList | none
@@ -2659,25 +2688,8 @@ def parsePTXKernel (fuel : Nat) (text : String) : Option PTXKernel := do
       pure (params, lines)
   let "{" :: lines := lines | none
   let "}" :: reversed := lines.reverse | none
-  let mut kernel : PTXKernel := { name, params, regDecls := [], sharedDecls := [], body := [] }
-  let mut inBody := false
-  for line in reversed.reverse do
-    if let some (reg, []) := parsePTXRegDecl fuel line.toList then
-      if inBody then none else do
-        kernel := { kernel with regDecls := kernel.regDecls ++ [reg] }
-    else if let some (shared, []) := parsePTXSharedDecl fuel line.toList then
-      if inBody then none else do
-        kernel := { kernel with sharedDecls := kernel.sharedDecls ++ [shared] }
-    else if let some chars := stripPrefixChars "    .local .align 8 .b8 __local_mem[".toList line.toList then
-      if inBody || kernel.localBytes != 0 then none else do
-        let (count, chars) ← parsePTXName fuel chars
-        let [] ← stripPrefixChars [']', ';'] chars | none
-        kernel := { kernel with localBytes := ← count.toNat? }
-    else
-      let (stmt, []) ← parsePTXStmt fuel line.toList | none
-      inBody := true
-      kernel := { kernel with body := kernel.body ++ [stmt] }
-  return kernel
+  parsePTXDeclsAndBody fuel reversed.reverse
+    { name, params, regDecls := [], sharedDecls := [], body := [] } false
 
 #guard parsePTXOperand 32 "%tid.x,".toList = some (.sreg .tidX, [','])
 #guard parsePTXOperand 32 "18446744073709551615;".toList = some (.immU64 18446744073709551615, [';'])

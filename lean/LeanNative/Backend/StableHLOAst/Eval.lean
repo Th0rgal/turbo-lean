@@ -1071,6 +1071,42 @@ def parseTensorType (text : String) : Option TensorType := do
   let shape ← parts.dropLast.mapM String.toNat?
   return { shape, elem }
 
+/-- Lexical SSA/function identifiers, independent of parser success. -/
+def CanonicalSSAName (name : String) : Prop :=
+  name.toList.isEmpty = false ∧ name.toList.all (fun c => c.isAlphanum || c == '_') = true
+
+/-- The covered syntax has lossless constants and well-typed SSA operands. -/
+def CanonicalStableHLOOp (tenv : TypeEnv) (op : StableHLOOp) : Prop :=
+  match op with
+  | .constant d v => CanonicalSSAName d ∧ v.ty.elem = .ui64 ∧
+      (v.ty.shape = [] ∨ ∃ n, v.ty.shape = [n]) ∧ v.data.size = v.ty.numElements
+  | .add d a b | .subtract d a b | .multiply d a b | .divide d a b
+  | .remainder d a b | .maximum d a b | .minimum d a b
+  | .and d a b | .or d a b | .xor d a b
+  | .shiftLeft d a b | .shiftRightArithmetic d a b | .shiftRightLogical d a b
+  | .compare d a b _ =>
+      CanonicalSSAName d ∧ CanonicalSSAName a ∧ CanonicalSSAName b ∧
+        (resultTypeOf tenv op).isSome = true
+  | .select d p t e =>
+      CanonicalSSAName d ∧ CanonicalSSAName p ∧ CanonicalSSAName t ∧ CanonicalSSAName e ∧
+        (resultTypeOf tenv op).isSome = true
+  | .broadcastInDim d s _ _ | .reshape d s _ | .slice d s _ _ _ | .convert d s _ =>
+      CanonicalSSAName d ∧ CanonicalSSAName s ∧ (resultTypeOf tenv op).isSome = true
+  | .dotGeneral d a b lb rb _ _ _ =>
+      CanonicalSSAName d ∧ CanonicalSSAName a ∧ CanonicalSSAName b ∧
+        lb = [] ∧ rb = [] ∧ (resultTypeOf tenv op).isSome = true
+  | .returnOp s => CanonicalSSAName s ∧ (tenv s).isSome = true
+  | .dynamicSlice .. | .reduce .. => False
+
+/-- Each operation is checked in the environment established by its predecessors. -/
+def CanonicalBody (tenv : TypeEnv) : List StableHLOOp → Prop
+  | [] => True
+  | op :: ops => CanonicalStableHLOOp tenv op ∧ CanonicalBody (bindResult tenv op) ops
+
+def CanonicalFuncOp (f : FuncOp) : Prop :=
+  CanonicalSSAName f.name ∧ (∀ p ∈ f.params, CanonicalSSAName p.1) ∧
+    CanonicalBody (f.params.foldl (fun e (n, ty) => e.bind n ty) TypeEnv.empty) f.body
+
 def parseSSAName (text : String) : Option String := do
   let '%' :: chars := text.toList | none
   if chars.isEmpty || !(chars.all fun c => c.isAlphanum || c == '_') then none
@@ -1244,13 +1280,15 @@ def parseFuncOp (text : String) : Option FuncOp := do
       return (← parseSSAName name, ← parseTensorType ty))
   let "  }" :: reversed := lines.reverse | none
   let tenv := params.foldl (fun env (name, ty) => env.bind name ty) TypeEnv.empty
-  let body ← parseBody tenv reversed.reverse
+  let body ← if reversed == [""] then some [] else parseBody tenv reversed.reverse
   return { name, params, result, body }
 
 #guard parseBody (TypeEnv.empty.bind "a" ⟨[4], .ui64⟩ |>.bind "b" ⟨[4], .ui64⟩)
   ["    %sum = stablehlo.add %a, %b : tensor<4xui64>",
    "    return %sum : tensor<4xui64>"] = some [.add "sum" "a" "b", .returnOp "sum"]
 #guard parseStableHLOOp TypeEnv.empty "return %missing : tensor<i64>" = none
+#guard (let f : FuncOp := { name := "empty", params := [], result := ⟨[], .ui64⟩, body := [] }
+  parseFuncOp (ppFuncOp f) = some f)
 #guard (let op := StableHLOOp.constant "empty" { ty := ⟨[0], .ui64⟩, data := #[] }
   parseStableHLOOp TypeEnv.empty (ppStableHLOOp TypeEnv.empty op) = some op)
 -- Exercise every new branch against its real printer, including multi-field ranges.

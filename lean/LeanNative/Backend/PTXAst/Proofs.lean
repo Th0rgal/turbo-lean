@@ -1004,7 +1004,7 @@ theorem parsePTXInstr_cvtaToGlobal_roundtrip (ty : PTXType) (dst : String) (src 
       ["cvta", "to", "global", String.ofList ((ppPTXType ty).toList.drop 1)] := by
     rw [String.toList_append, ptxOpcodeFields_typed, List.map_append]
     rfl
-  simp only [String.toList_append, String.reduceToList, List.append_assoc,
+  simp only [String.toList_append, String.reduceToList,
     List.cons_append, List.nil_append] at ht
   simp only [ppPTXInstr, toString, String.toList_append, String.reduceToList,
     List.append_assoc, List.cons_append, List.nil_append]
@@ -1218,7 +1218,7 @@ theorem parsePTXInstr_selp_roundtrip (ty : PTXType) (dst pred : String) (a b : P
   have hfields : (ptxOpcodeFields ("selp" ++ ppPTXType ty).toList).map String.ofList =
       ["selp", String.ofList ((ppPTXType ty).toList.drop 1)] := by
     rw [String.toList_append, ptxOpcodeFields_typed, List.map_append]; rfl
-  simp only [String.toList_append, String.reduceToList, List.append_assoc,
+  simp only [String.toList_append, String.reduceToList,
     List.cons_append, List.nil_append] at ht
   simp only [ppPTXInstr, toString, String.toList_append, String.reduceToList,
     List.append_assoc, List.cons_append, List.nil_append]
@@ -1569,6 +1569,193 @@ theorem ppPTXStmt_injective_on_canonical (a b : PTXStmt)
   rw [parsePTXStmt_roundtrip a ha [] fuel (by omega),
     parsePTXStmt_roundtrip b hb [] fuel (by omega)] at hp
   exact (Option.some.inj hp |> Prod.mk.inj).1
+
+/-- Register sections preserve source order in the structural kernel parser. -/
+theorem parsePTXDeclsAndBody_regs_roundtrip (rs : List PTXRegDecl)
+    (hr : ∀ r ∈ rs, CanonicalPTXRegDecl r) (fuel : Nat)
+    (hf : ∀ r ∈ rs, r.prefixName.toList.length < fuel + 1 ∧
+      r.count.repr.toList.length < fuel + 1)
+    (rest : List String) (k : PTXKernel) :
+    parsePTXDeclsAndBody (fuel + 1)
+      (rs.map (fun r => s!"    .reg {ppPTXType r.ty} {r.prefixName}<{r.count}>;") ++ rest) k false =
+    parsePTXDeclsAndBody (fuel + 1) rest { k with regDecls := k.regDecls ++ rs } false := by
+  induction rs generalizing k with
+  | nil => simp
+  | cons r rs ih =>
+    have hp := parsePTXRegDecl_roundtrip r (hr r (by simp)).1 [] fuel
+      (hf r (by simp)).1 (hf r (by simp)).2
+    simp only [List.append_nil] at hp
+    simp only [List.map_cons, List.cons_append, parsePTXDeclsAndBody, hp]
+    simp only [Bool.false_eq_true, ↓reduceIte]
+    rw [ih (by intro r h; exact hr r (by simp [h]))
+      (by intro r h; exact hf r (by simp [h]))]
+    simp [List.append_assoc]
+
+/-- Shared declarations preserve source order and cannot be mistaken for registers. -/
+theorem parsePTXDeclsAndBody_shared_roundtrip (ss : List PTXSharedDecl)
+    (hs : ∀ s ∈ ss, CanonicalPTXSharedDecl s) (fuel : Nat)
+    (hf : ∀ s ∈ ss, s.name.toList.length < fuel + 1 ∧
+      s.align.repr.toList.length < fuel + 1 ∧ s.count.repr.toList.length < fuel + 1)
+    (rest : List String) (k : PTXKernel) :
+    parsePTXDeclsAndBody (fuel + 1)
+      (ss.map (fun s => s!"    .shared .align {s.align} {ppPTXType s.elemTy} {s.name}[{s.count}];") ++ rest) k false =
+    parsePTXDeclsAndBody (fuel + 1) rest { k with sharedDecls := k.sharedDecls ++ ss } false := by
+  induction ss generalizing k with
+  | nil => simp
+  | cons s ss ih =>
+    have hp := parsePTXSharedDecl_roundtrip s (hs s (by simp)).1 [] fuel
+      (hf s (by simp)).1 (hf s (by simp)).2.1 (hf s (by simp)).2.2
+    simp only [List.append_nil] at hp
+    have hn : parsePTXRegDecl (fuel + 1)
+        (s!"    .shared .align {s.align} {ppPTXType s.elemTy} {s.name}[{s.count}];").toList = none := by
+      simp [parsePTXRegDecl, stripPrefixChars, toString, String.toList_append]
+    simp only [List.map_cons, List.cons_append, parsePTXDeclsAndBody, hn, hp]
+    simp only [Bool.false_eq_true, ↓reduceIte]
+    rw [ih (by intro s h; exact hs s (by simp [h]))
+      (by intro s h; exact hf s (by simp [h]))]
+    simp [List.append_assoc]
+
+theorem parsePTXDeclsAndBody_local_roundtrip (n : Nat)
+    (fuel : Nat) (hf : n.repr.toList.length < fuel + 1)
+    (rest : List String) (k : PTXKernel) (hk : k.localBytes = 0) :
+    parsePTXDeclsAndBody (fuel + 1)
+      (s!"    .local .align 8 .b8 __local_mem[{n}];" :: rest) k false =
+    parsePTXDeclsAndBody (fuel + 1) rest { k with localBytes := n } false := by
+  have hp := parsePTXName_nat_roundtrip n [']', ';']
+    (Or.inr ⟨']', [';'], rfl, rfl⟩) (fuel + 1) hf
+  simp only [Nat.toList_repr] at hp
+  simp [parsePTXDeclsAndBody, parsePTXRegDecl, parsePTXSharedDecl, stripPrefixChars,
+    toString, String.toList_append, hk, hp]
+
+theorem ppPTXStmt_not_decl (s : PTXStmt) (hs : CanonicalPTXStmt s) (fuel : Nat) :
+    parsePTXRegDecl fuel (ppPTXStmt s).toList = none ∧
+    parsePTXSharedDecl fuel (ppPTXStmt s).toList = none ∧
+    stripPrefixChars "    .local .align 8 .b8 __local_mem[".toList (ppPTXStmt s).toList = none := by
+  cases s with
+  | label name =>
+    cases he : name.toList with
+    | nil => exact False.elim (hs.1 he)
+    | cons c cs =>
+      have hc := hs.2 c (by simp [he])
+      have hn : c ≠ ' ' := by intro h; subst c; contradiction
+      simp [ppPTXStmt, toString, String.toList_append, he, parsePTXRegDecl,
+        parsePTXSharedDecl, stripPrefixChars, Ne.symm hn]
+  | instr guard ins =>
+    cases guard with
+    | some g =>
+      cases g with
+      | mk name neg =>
+        cases neg <;> simp [ppPTXStmt, ppPredGuard, toString, String.toList_append,
+          parsePTXRegDecl, parsePTXSharedDecl, stripPrefixChars]
+    | none =>
+      cases ins <;> simp [ppPTXStmt, ppPTXInstr, toString, String.toList_append,
+        parsePTXRegDecl, parsePTXSharedDecl, stripPrefixChars]
+
+theorem parsePTXDeclsAndBody_body_roundtrip (ss : List PTXStmt)
+    (hs : ∀ s ∈ ss, CanonicalPTXStmt s) (fuel : Nat)
+    (hf : ∀ s ∈ ss, (ppPTXStmt s).toList.length < fuel)
+    (k : PTXKernel) (inBody : Bool) :
+    parsePTXDeclsAndBody (fuel + 1) (ss.map ppPTXStmt) k inBody =
+      some { k with body := k.body ++ ss } := by
+  induction ss generalizing k inBody with
+  | nil => simp [parsePTXDeclsAndBody]
+  | cons s ss ih =>
+    have hp := parsePTXStmt_roundtrip s (hs s (by simp)) [] fuel (hf s (by simp))
+    simp only [List.append_nil] at hp
+    have hn := ppPTXStmt_not_decl s (hs s (by simp)) (fuel + 1)
+    simp only [List.map_cons, parsePTXDeclsAndBody, hn.1, hn.2.1, hn.2.2, hp,
+      bind, Option.bind]
+    rw [ih (by intro s h; exact hs s (by simp [h]))
+      (by intro s h; exact hf s (by simp [h]))]
+    simp [List.append_assoc]
+
+/-- The structural budget bounds every separately parsed kernel field. -/
+theorem ptxKernelFuel_bounds (k : PTXKernel) (fuel : Nat)
+    (hf : ptxKernelFuel k ≤ fuel + 1) :
+    k.name.toList.length < fuel + 1 ∧
+    (∀ p ∈ k.params, p.name.toList.length < fuel + 1) ∧
+    (∀ r ∈ k.regDecls, r.prefixName.toList.length < fuel + 1 ∧
+      r.count.repr.toList.length < fuel + 1) ∧
+    (∀ s ∈ k.sharedDecls, s.name.toList.length < fuel + 1 ∧
+      s.align.repr.toList.length < fuel + 1 ∧ s.count.repr.toList.length < fuel + 1) ∧
+    k.localBytes.repr.toList.length < fuel + 1 ∧
+    (∀ s ∈ k.body, (ppPTXStmt s).toList.length < fuel) := by
+  have bound {α : Type} (xs : List α) (f : α → Nat) (x : α) (hx : x ∈ xs) :
+      f x ≤ (xs.map f).sum := by
+    induction xs with
+    | nil => simp at hx
+    | cons a xs ih =>
+      simp only [List.mem_cons] at hx
+      simp only [List.map_cons, List.sum_cons]
+      rcases hx with rfl | hx
+      · omega
+      · have := ih hx; omega
+  unfold ptxKernelFuel at hf
+  refine ⟨by omega, ?_, ?_, ?_, by omega, ?_⟩
+  · intro p hp
+    have := bound k.params (fun p => p.name.toList.length) p hp
+    omega
+  · intro r hr
+    have := bound k.regDecls
+      (fun r => r.prefixName.toList.length + r.count.repr.toList.length) r hr
+    constructor <;> omega
+  · intro s hs
+    have := bound k.sharedDecls (fun s => s.name.toList.length +
+      s.align.repr.toList.length + s.count.repr.toList.length) s hs
+    exact ⟨by omega, by omega, by omega⟩
+  · intro s hs
+    have := bound k.body (fun s => (ppPTXStmt s).toList.length) s hs
+    omega
+
+/-- Compose the declaration sections and body, retaining every kernel field. -/
+theorem parsePTXDeclsAndBody_kernel_roundtrip (k : PTXKernel)
+    (hk : CanonicalPTXKernel k) (fuel : Nat)
+    (hr : ∀ r ∈ k.regDecls, r.prefixName.toList.length < fuel + 1 ∧
+      r.count.repr.toList.length < fuel + 1)
+    (hs : ∀ s ∈ k.sharedDecls, s.name.toList.length < fuel + 1 ∧
+      s.align.repr.toList.length < fuel + 1 ∧ s.count.repr.toList.length < fuel + 1)
+    (hl : k.localBytes.repr.toList.length < fuel + 1)
+    (hb : ∀ s ∈ k.body, (ppPTXStmt s).toList.length < fuel) :
+    parsePTXDeclsAndBody (fuel + 1)
+      (k.sharedDecls.map (fun s =>
+        s!"    .shared .align {s.align} {ppPTXType s.elemTy} {s.name}[{s.count}];") ++
+       (if k.localBytes == 0 then [] else
+         [s!"    .local .align 8 .b8 __local_mem[{k.localBytes}];"]) ++
+       k.regDecls.map (fun r => s!"    .reg {ppPTXType r.ty} {r.prefixName}<{r.count}>;") ++
+       k.body.map ppPTXStmt)
+      { name := k.name, params := k.params, regDecls := [], sharedDecls := [], body := [] }
+      false = some k := by
+  simp only [List.append_assoc]
+  rw [parsePTXDeclsAndBody_shared_roundtrip _ hk.2.2.2.1 _ hs]
+  split
+  next hz =>
+    have hz' : k.localBytes = 0 := by simpa using hz
+    simp only [List.nil_append]
+    rw [parsePTXDeclsAndBody_regs_roundtrip _ hk.2.2.1 _ hr,
+      parsePTXDeclsAndBody_body_roundtrip _ hk.2.2.2.2 _ hb]
+    cases k <;> simp_all
+  next hz =>
+    simp only [List.singleton_append]
+    rw [parsePTXDeclsAndBody_local_roundtrip _ _ hl _ _ rfl,
+      parsePTXDeclsAndBody_regs_roundtrip _ hk.2.2.1 _ hr,
+      parsePTXDeclsAndBody_body_roundtrip _ hk.2.2.2.2 _ hb]
+    cases k <;> simp
+
+/-- One structural budget suffices for all declaration and statement sections. -/
+theorem parsePTXDeclsAndBody_kernel_fuel_roundtrip (k : PTXKernel)
+    (hk : CanonicalPTXKernel k) (fuel : Nat) (hf : ptxKernelFuel k ≤ fuel + 1) :
+    parsePTXDeclsAndBody (fuel + 1)
+      (k.sharedDecls.map (fun s =>
+        s!"    .shared .align {s.align} {ppPTXType s.elemTy} {s.name}[{s.count}];") ++
+       (if k.localBytes == 0 then [] else
+         [s!"    .local .align 8 .b8 __local_mem[{k.localBytes}];"]) ++
+       k.regDecls.map (fun r => s!"    .reg {ppPTXType r.ty} {r.prefixName}<{r.count}>;") ++
+       k.body.map ppPTXStmt)
+      { name := k.name, params := k.params, regDecls := [], sharedDecls := [], body := [] }
+      false = some k := by
+  have h := ptxKernelFuel_bounds k fuel hf
+  exact parsePTXDeclsAndBody_kernel_roundtrip k hk fuel h.2.2.1 h.2.2.2.1
+    h.2.2.2.2.1 h.2.2.2.2.2
 
 theorem ppPTXType_injective_via_parser : Function.Injective ppPTXType := by
   intro a b h
