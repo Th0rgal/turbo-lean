@@ -2365,6 +2365,31 @@ def CanonicalPTXAddr : PTXAddr → Prop
   | .regOffset name _ => CanonicalPTXName name ∧ name.startsWith "%" = true
   | .symOffset name offset => CanonicalPTXSymbol name ∧ offset ≠ 0
 
+/-- Scalar instruction grammar, with lexical premises independent of parser success. -/
+def CanonicalPTXInstr : PTXInstr → Prop
+  | .mov _ d a | .cvtaToGlobal _ d a | .cvt _ _ _ d a
+  | .bitNot _ d a | .neg _ d a | .clz _ d a =>
+    CanonicalPTXName d ∧ CanonicalPTXOperand a
+  | .ldParam _ d p => CanonicalPTXName d ∧ CanonicalPTXSymbol p
+  | .ldGlobal _ d a | .ldShared _ d a | .ldConst _ d a | .ldLocal _ d a =>
+    CanonicalPTXName d ∧ CanonicalPTXAddr a
+  | .stGlobal _ a s | .stShared _ a s | .stConst _ a s | .stLocal _ a s =>
+    CanonicalPTXAddr a ∧ CanonicalPTXOperand s
+  | .add _ _ d a b | .sub _ d a b | .mul _ _ d a b | .div _ d a b | .rem _ d a b
+  | .bitAnd _ d a b | .bitOr _ d a b | .bitXor _ d a b | .shl _ d a b | .shr _ d a b
+  | .setp _ _ d a b => CanonicalPTXName d ∧ CanonicalPTXOperand a ∧ CanonicalPTXOperand b
+  | .mad _ _ d a b c | .fma _ _ d a b c =>
+    CanonicalPTXName d ∧ CanonicalPTXOperand a ∧ CanonicalPTXOperand b ∧ CanonicalPTXOperand c
+  | .selp _ d a b p =>
+    CanonicalPTXName d ∧ CanonicalPTXOperand a ∧ CanonicalPTXOperand b ∧ CanonicalPTXName p
+  | .bra label => CanonicalPTXName label
+  | .barSync _ | .ret => True
+  | _ => False
+
+def CanonicalPTXStmt : PTXStmt → Prop
+  | .label name => CanonicalPTXName name
+  | .instr guard instr => (∀ g ∈ guard, CanonicalPTXPredGuard g) ∧ CanonicalPTXInstr instr
+
 /-- Disambiguate register names from the twelve architectural special registers. -/
 def parsePTXNamedOperand (name : String) : PTXOperand :=
   match ptxSpecialRegs.find? (fun sr => ppSpecialReg sr == name) with
@@ -2425,6 +2450,14 @@ def parsePTXName (fuel : Nat) (input : List Char) : Option (String × List Char)
   let (chars, rest) ← scanPTXName fuel input
   if chars.isEmpty then none else return (String.ofList chars, rest)
 
+/-- Structural dot-separated opcode fields; unlike operand names, dots delimit modifiers. -/
+def ptxOpcodeFields : List Char → List (List Char)
+  | [] => [[]]
+  | '.' :: cs => [] :: ptxOpcodeFields cs
+  | c :: cs => match ptxOpcodeFields cs with
+    | [] => [[c]]
+    | field :: fields => (c :: field) :: fields
+
 /-- Total instruction parser for scalar arithmetic and ordinary memory operations.
 Packed moves, shuffle and atomics are outside this fragment. -/
 def parsePTXInstr (fuel : Nat) (input : List Char) : Option (PTXInstr × List Char) := do
@@ -2437,7 +2470,7 @@ def parsePTXInstr (fuel : Nat) (input : List Char) : Option (PTXInstr × List Ch
   if token == "bar.sync" then
     let (n, rest) ← parsePTXName fuel rest
     return (.barSync (← n.toNat?), ← stripPrefixChars [';'] rest)
-  let parts := token.splitOn "."
+  let parts := (ptxOpcodeFields token.toList).map String.ofList
   let opcode ← parts.head?
   let suffix := "." ++ (← parts.getLast?)
   let (ty, []) ← parsePTXType fuel suffix.toList | none
@@ -2502,7 +2535,9 @@ def parsePTXInstr (fuel : Nat) (input : List Char) : Option (PTXInstr × List Ch
     let cmp ← match mods with
       | ["eq"] => some PTXCmpOp.eq | ["ne"] => some .ne
       | ["lt"] => some .lt | ["le"] => some .le
-      | ["gt"] => some .gt | ["ge"] => some .ge | _ => none
+      | ["gt"] => some .gt | ["ge"] => some .ge
+      | ["lo"] => some .lo | ["ls"] => some .ls
+      | ["hi"] => some .hi | ["hs"] => some .hs | _ => none
     return (.setp cmp ty dst a b, ← stripPrefixChars [';'] rest)
   if opcode == "mul" || opcode == "mad" then
     let mode ← match mods with
