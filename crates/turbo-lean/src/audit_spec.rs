@@ -1312,8 +1312,15 @@ impl AuditSpecPolicyConfig {
         let mut allow_names = Vec::new();
         let mut namespaces = self.forbid_namespaces.clone();
         let path_norm = file.to_string_lossy().replace('\\', "/");
+        let canon_norm = fs::canonicalize(file)
+            .ok()
+            .map(|p| p.to_string_lossy().replace('\\', "/"));
         for rule in &self.path_rules {
-            if path_matches_audit_glob(&path_norm, &rule.glob_pattern) {
+            if path_matches_audit_glob(&path_norm, &rule.glob_pattern)
+                || canon_norm
+                    .as_deref()
+                    .is_some_and(|c| path_matches_audit_glob(c, &rule.glob_pattern))
+            {
                 for k in &rule.forbid_decl_kinds {
                     if !kinds.iter().any(|x| x == k) {
                         kinds.push(k.clone());
@@ -1340,23 +1347,88 @@ pub(super) fn path_matches_audit_glob(path_str: &str, glob_pat: &str) -> bool {
     if pat.is_empty() || pat == "**" || pat == "*" {
         return true;
     }
-    // Common proof-directory glob fast-paths (e.g. `lean/**/Proofs/**`)
-    let anchor_parts: Vec<&str> = pat
-        .split("**")
-        .map(|s| s.trim_matches('/'))
-        .filter(|s| !s.is_empty() && *s != "*")
+    let path_norm = path_str.replace('\\', "/");
+    if pat.starts_with("**") && pat.ends_with("**") && !pat.contains('/') {
+        let mid = pat.trim_matches('*');
+        return mid.is_empty() || path_norm.contains(mid);
+    }
+    let pat_segs: Vec<&str> = pat
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
         .collect();
-    if anchor_parts.is_empty() {
+    if pat_segs.is_empty() || pat_segs.iter().all(|s| *s == "**") {
         return true;
     }
-    let mut search_from = 0usize;
-    for part in anchor_parts {
-        let Some(pos) = path_str[search_from..].find(part) else {
-            return false;
-        };
-        search_from += pos + part.len();
+    let path_segs: Vec<&str> = path_norm
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    let anchored_start = pat.starts_with('/') || pat.starts_with("./");
+    let starts = if anchored_start {
+        0..=0
+    } else {
+        0..=path_segs.len()
+    };
+    for start in starts {
+        if audit_glob_segments_match(&path_segs[start..], &pat_segs) {
+            return true;
+        }
     }
-    true
+    false
+}
+
+fn audit_glob_segments_match(path_segs: &[&str], pat_segs: &[&str]) -> bool {
+    let Some((first, rest_pat)) = pat_segs.split_first() else {
+        return path_segs.is_empty();
+    };
+    if *first == "**" {
+        let mut rest = rest_pat;
+        while rest.first() == Some(&"**") {
+            rest = &rest[1..];
+        }
+        if rest.is_empty() {
+            return true;
+        }
+        for skip in 0..=path_segs.len() {
+            if audit_glob_segments_match(&path_segs[skip..], rest) {
+                return true;
+            }
+        }
+        return false;
+    }
+    let Some((seg, rest_path)) = path_segs.split_first() else {
+        return false;
+    };
+    audit_glob_segment_matches(seg, first) && audit_glob_segments_match(rest_path, rest_pat)
+}
+
+fn audit_glob_segment_matches(seg: &str, pat: &str) -> bool {
+    let s: Vec<char> = seg.chars().collect();
+    let p: Vec<char> = pat.chars().collect();
+    let (mut si, mut pi) = (0usize, 0usize);
+    let (mut star_pi, mut star_si) = (None::<usize>, 0usize);
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == s[si]) {
+            si += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            pi += 1;
+            star_si = si;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_si += 1;
+            si = star_si;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 pub(super) fn is_single_conjunct_trivial(c: &str) -> bool {
@@ -2010,8 +2082,77 @@ pub(super) fn resolve_audit_spec_cache_dir() -> Option<PathBuf> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/tmp/turbo-lean-audit-spec-cache-v1"));
-    Some(dir)
+        .unwrap_or_else(|| {
+            #[cfg(unix)]
+            let uid = unsafe { libc::geteuid() };
+            #[cfg(not(unix))]
+            let uid = 0u32;
+            std::env::temp_dir().join(format!("turbo-lean-audit-spec-cache-v1-{uid}"))
+        });
+    private_audit_spec_cache_dir(&dir)
+}
+
+fn private_audit_spec_cache_dir(dir: &Path) -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        let uid = unsafe { libc::geteuid() };
+        let absolute = std::path::absolute(dir).ok()?;
+        let parent = absolute.parent()?;
+        if !parent.exists() {
+            private_audit_spec_cache_dir(parent)?;
+        }
+        let parent = fs::canonicalize(parent).ok()?;
+        for ancestor in parent.ancestors() {
+            let meta = fs::symlink_metadata(ancestor).ok()?;
+            if !meta.is_dir()
+                || (meta.uid() != 0 && meta.uid() != uid)
+                || (meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0)
+            {
+                return None;
+            }
+        }
+        let path = parent.join(absolute.file_name()?);
+        match fs::DirBuilder::new().mode(0o700).create(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(_) => return None,
+        }
+        let meta = fs::symlink_metadata(&path).ok()?;
+        (meta.is_dir() && meta.uid() == uid && meta.mode() & 0o077 == 0).then_some(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+fn read_audit_spec_cache(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    private_audit_spec_cache_dir(path.parent()?)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options.open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o022 != 0 {
+            return None;
+        }
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
 }
 
 pub(super) fn collect_external_local_def_lean_paths(src_path: &Path) -> Vec<PathBuf> {
@@ -2073,37 +2214,54 @@ pub(super) fn compute_audit_spec_cache_key_with_policy(
 }
 
 pub(super) fn write_audit_spec_cache_atomic(target: &Path, report: &serde_json::Value) {
-    let Some(parent) = target.parent() else {
+    use std::io::Write;
+    let Some(parent) = target.parent().and_then(private_audit_spec_cache_dir) else {
         return;
     };
-    if fs::create_dir_all(parent).is_err() {
+    let Some(file_name) = target.file_name() else {
         return;
-    }
+    };
+    let target = parent.join(file_name);
     let Ok(bytes) = serde_json::to_vec(report) else {
         return;
     };
-    let file_name = target
-        .file_name()
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_else(|| std::borrow::Cow::Borrowed("audit_spec_entry"));
+    let file_name_str = file_name.to_string_lossy();
     let tid_str: String = format!("{:?}", std::thread::current().id())
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect();
-    let seq = AUDIT_SPEC_CACHE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp_path = parent.join(format!(
-        ".{}.pid{}.{}.{}.tmp",
-        file_name,
-        std::process::id(),
-        tid_str,
-        seq
-    ));
-    if fs::write(&tmp_path, &bytes).is_ok() {
-        if fs::rename(&tmp_path, target).is_err() {
-            let _ = fs::remove_file(&tmp_path);
+    for _ in 0..16 {
+        let seq = AUDIT_SPEC_CACHE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_path = parent.join(format!(
+            ".{}.pid{}.{}.{}.tmp",
+            file_name_str,
+            std::process::id(),
+            tid_str,
+            seq
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
-    } else {
-        let _ = fs::remove_file(&tmp_path);
+        match options.open(&tmp_path) {
+            Ok(mut tmp_file) => {
+                if tmp_file.write_all(&bytes).is_ok() {
+                    drop(tmp_file);
+                    if fs::rename(&tmp_path, &target).is_err() {
+                        let _ = fs::remove_file(&tmp_path);
+                    }
+                } else {
+                    drop(tmp_file);
+                    let _ = fs::remove_file(&tmp_path);
+                }
+                return;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return,
+        }
     }
 }
 
@@ -2168,7 +2326,7 @@ pub fn audit_spec_file_or_source_with_policy(
                         &ld_digest,
                     );
                     let cache_path = cache_dir.join(format!("{}.json", hex_hash));
-                    if let Ok(cached_bytes) = fs::read(&cache_path) {
+                    if let Some(cached_bytes) = read_audit_spec_cache(&cache_path) {
                         if let Ok(mut cached_val) =
                             serde_json::from_slice::<serde_json::Value>(&cached_bytes)
                         {
@@ -2405,11 +2563,9 @@ pub fn audit_spec_file_or_source_with_policy(
 
 /// Audit theorem specifications across multiple `files` concurrently and merge into a unified report.
 pub fn audit_spec_files(files: &[PathBuf], decl_filter: Option<&str>) -> serde_json::Value {
-    let policy = files
-        .first()
-        .map(|f| AuditSpecPolicyConfig::load_for_target(f, None, None, &[], &[]))
-        .unwrap_or_default();
-    audit_spec_files_with_policy(files, decl_filter, &policy)
+    audit_spec_files_resolving_policy(files, decl_filter, |file| {
+        AuditSpecPolicyConfig::load_for_target(file, None, None, &[], &[])
+    })
 }
 
 pub fn audit_spec_files_with_policy(
@@ -2417,8 +2573,21 @@ pub fn audit_spec_files_with_policy(
     decl_filter: Option<&str>,
     policy: &AuditSpecPolicyConfig,
 ) -> serde_json::Value {
+    audit_spec_files_resolving_policy(files, decl_filter, |_| policy.clone())
+}
+
+fn audit_spec_files_resolving_policy(
+    files: &[PathBuf],
+    decl_filter: Option<&str>,
+    resolve_policy: impl Fn(&Path) -> AuditSpecPolicyConfig + Sync,
+) -> serde_json::Value {
     if files.len() == 1 {
-        return audit_spec_file_or_source_with_policy(&files[0], None, decl_filter, policy);
+        return audit_spec_file_or_source_with_policy(
+            &files[0],
+            None,
+            decl_filter,
+            &resolve_policy(&files[0]),
+        );
     }
     let t0 = Instant::now();
     let workers = std::thread::available_parallelism()
@@ -2430,6 +2599,7 @@ pub fn audit_spec_files_with_policy(
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 let next_ref = &next_idx;
+                let resolve_policy = &resolve_policy;
                 s.spawn(move || {
                     let mut local = Vec::new();
                     loop {
@@ -2443,7 +2613,7 @@ pub fn audit_spec_files_with_policy(
                                 &files[i],
                                 None,
                                 decl_filter,
-                                policy,
+                                &resolve_policy(&files[i]),
                             ),
                         ));
                     }
@@ -2550,11 +2720,23 @@ pub fn audit_spec_files_with_policy(
         )));
     }
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
+    let policy = per_file_reports
+        .first()
+        .and_then(|r| r["policy"].as_str())
+        .unwrap_or("default");
+    let policy = if per_file_reports
+        .iter()
+        .all(|r| r["policy"].as_str() == Some(policy))
+    {
+        policy
+    } else {
+        "mixed"
+    };
     let mut out = serde_json::json!({
         "status": if any_report_error { "error" } else { "ok" },
         "ok": tier1_clean,
         "verdict": batch_verdict,
-        "policy": policy.policy,
+        "policy": policy,
         "file": file_labels.join(", "),
         "files": file_labels,
         "file_reports": per_file_reports,
@@ -2650,15 +2832,34 @@ pub fn run_audit_spec_command_with_options(
             f.display()
         );
     }
+    if let Some(policy) = policy_override {
+        anyhow::ensure!(
+            matches!(
+                policy.trim().to_ascii_lowercase().as_str(),
+                "default" | "permissive" | "strict-proofs" | "strict_proofs" | "strict"
+            ),
+            "Unknown audit-spec policy: {policy}"
+        );
+    }
+    if let Some(path) = config_override {
+        let text = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read audit-spec config {}", path.display()))?;
+        anyhow::ensure!(
+            AuditSpecPolicyConfig::parse_config_str(&text).is_some(),
+            "Invalid audit-spec config {}",
+            path.display()
+        );
+    }
     let first_file = &files[0];
-    let policy = AuditSpecPolicyConfig::load_for_target(
-        first_file,
-        policy_override,
-        config_override,
-        forbid_namespaces,
-        forbid_decl_kinds,
-    );
-    let mut report = audit_spec_files_with_policy(files, decl_filter, &policy);
+    let mut report = audit_spec_files_resolving_policy(files, decl_filter, |file| {
+        AuditSpecPolicyConfig::load_for_target(
+            file,
+            policy_override,
+            config_override,
+            forbid_namespaces,
+            forbid_decl_kinds,
+        )
+    });
     apply_require_nonempty_to_audit_report(&mut report, require_nonempty);
     let nonempty_failed = require_nonempty && report["ok"].as_bool() == Some(false);
     if crate::mcp::should_emit_cli_telemetry() {
