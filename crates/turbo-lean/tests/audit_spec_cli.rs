@@ -923,3 +923,509 @@ end Uses
     );
     assert_eq!(single_umb_mal_json["verdict"].as_str(), Some("error"));
 }
+
+#[test]
+fn subdirectory_cwd_and_dotdot_relative_paths_enforce_project_path_rules_and_reject_outside_spoofs()
+{
+    let fx = AuditSpecFixture::new("subdir_path_rules");
+    fx.write(
+        "repo/turbo-lean.toml",
+        r#"
+[audit_spec]
+policy = "strict-proofs"
+
+[audit_spec.path_rules."lean/**/Proofs/**"]
+forbid_decl_kinds = ["inductive"]
+allow_decl_names = ["SymExpr"]
+forbid_namespaces = ["ConLeche"]
+"#,
+    );
+    fs::create_dir_all(fx.root.join("repo/sub")).unwrap();
+    fx.write(
+        "repo/lean/Pkg/Proofs/Bad.lean",
+        "inductive ForbiddenAst where\n  | mk (n : Nat)\ntheorem p_ok (n : Nat) (h : n > 0) : n >= 1 := by omega\n",
+    );
+    fx.write(
+        "repo/lean/Pkg/Proofs/Good.lean",
+        "inductive SymExpr where\n  | lit (n : Nat)\ntheorem good_ok (n : Nat) (h : n > 0) : n >= 1 := by omega\n",
+    );
+    // Outside `lean/**/Proofs/**`: `inductive` is permitted
+    fx.write(
+        "repo/lean/Pkg/Defs.lean",
+        "inductive AllowedOutsideProofs where\n  | mk (n : Nat)\ntheorem defs_ok (n : Nat) (h : n > 0) : n >= 1 := by omega\n",
+    );
+
+    // Negative 1: invoked from `<repo>/lean/Pkg/Proofs` on bare `Bad.lean` and `.`
+    for (tag, target) in [("sub-proofs-file", "Bad.lean"), ("sub-proofs-dot", ".")] {
+        let out = fx
+            .cli(tag)
+            .current_dir(fx.root.join("repo/lean/Pkg/Proofs"))
+            .args(["--json", "audit-spec", target])
+            .output()
+            .unwrap();
+        let json = assert_cli_fail_json(&out, tag);
+        assert!(json["forbidden_scope_decls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str().unwrap_or("").contains("ForbiddenAst")));
+    }
+
+    // Negative 2: invoked from `<repo>/lean` on `Pkg/Proofs/Bad.lean`
+    let out_lean = fx
+        .cli("sub-lean")
+        .current_dir(fx.root.join("repo/lean"))
+        .args(["--json", "audit-spec", "Pkg/Proofs/Bad.lean"])
+        .output()
+        .unwrap();
+    let json_lean = assert_cli_fail_json(&out_lean, "cwd=<repo>/lean Pkg/Proofs/Bad.lean");
+    assert!(json_lean["forbidden_scope_decls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str().unwrap_or("").contains("ForbiddenAst")));
+
+    // Negative 3: invoked from `<repo>/sub` via `../lean/Pkg/Proofs/Bad.lean`
+    let out_dotdot = fx
+        .cli("sub-dotdot")
+        .current_dir(fx.root.join("repo/sub"))
+        .args(["--json", "audit-spec", "../lean/Pkg/Proofs/Bad.lean"])
+        .output()
+        .unwrap();
+    let json_dotdot = assert_cli_fail_json(&out_dotdot, "../lean/Pkg/Proofs/Bad.lean");
+    assert!(json_dotdot["forbidden_scope_decls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str().unwrap_or("").contains("ForbiddenAst")));
+
+    // Negative 4: invoked from `<repo>` via `sub/../lean/Pkg/Proofs/Bad.lean`
+    let out_mid_dotdot = fx
+        .cli("root-mid-dotdot")
+        .current_dir(fx.root.join("repo"))
+        .args(["--json", "audit-spec", "sub/../lean/Pkg/Proofs/Bad.lean"])
+        .output()
+        .unwrap();
+    let json_mid = assert_cli_fail_json(&out_mid_dotdot, "sub/../lean/Pkg/Proofs/Bad.lean");
+    assert!(json_mid["forbidden_scope_decls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str().unwrap_or("").contains("ForbiddenAst")));
+
+    // Positive 1: allowed `SymExpr` inside `Proofs` from subdirectory `cwd`, and `Defs.lean` outside `Proofs`
+    let ok_good = fx
+        .cli("sub-good")
+        .current_dir(fx.root.join("repo/lean/Pkg/Proofs"))
+        .args(["--json", "audit-spec", "Good.lean"])
+        .output()
+        .unwrap();
+    assert_cli_ok(&ok_good, "allowed SymExpr from Proofs cwd");
+
+    let ok_defs = fx
+        .cli("sub-defs")
+        .current_dir(fx.root.join("repo/sub"))
+        .args(["--json", "audit-spec", "../lean/Pkg/Defs.lean"])
+        .output()
+        .unwrap();
+    assert_cli_ok(&ok_defs, "Defs.lean outside Proofs via ..");
+
+    // Positive 2: ancestor directory names ABOVE `turbo-lean.toml` (`lean/outer/Proofs/repo/Other.lean`)
+    // must NOT falsely trigger repo-relative `lean/**/Proofs/**` rules!
+    fx.write(
+        "lean/outer/Proofs/nested_repo/turbo-lean.toml",
+        r#"
+[audit_spec]
+policy = "strict-proofs"
+"#,
+    );
+    let nested_other = fx.write(
+        "lean/outer/Proofs/nested_repo/src/Other.lean",
+        "inductive AllowedBecauseAboveRepoRoot where\n  | mk (n : Nat)\ntheorem nested_ok (n : Nat) (h : n > 0) : n >= 1 := by omega\n",
+    );
+    let ok_nested = fx
+        .cli("nested-above-root")
+        .args(["--json", "audit-spec"])
+        .arg(&nested_other)
+        .output()
+        .unwrap();
+    assert_cli_ok(
+        &ok_nested,
+        "ancestor segments above turbo-lean.toml must not falsely match relative path_rules",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_rejects_symlink_poisoning_symlinked_parents_and_enforces_0600_entries() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let fx = AuditSpecFixture::new("cache_hardening");
+    let bad_spec = fx.write(
+        "PoisonTarget.lean",
+        "theorem vacuous_bad (n : Nat) (h : n < 0) : n = 99 := by omega\n",
+    );
+    let cache_dir = fx.root.join("audit-cache-sec");
+
+    // 1. First run on vacuous file fails and writes a `0600` cache entry inside a `0700` dir
+    let out1 = fx
+        .cli("sec-1")
+        .env("TURBO_LEAN_AUDIT_CACHE_DIR", &cache_dir)
+        .args(["--json", "audit-spec"])
+        .arg(&bad_spec)
+        .output()
+        .unwrap();
+    assert_cli_fail_json(&out1, "initial vacuous audit");
+
+    let dir_mode = fs::symlink_metadata(&cache_dir)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        dir_mode, 0o700,
+        "expected 0700 cache dir, got {:o}",
+        dir_mode
+    );
+
+    let entries: Vec<PathBuf> = fs::read_dir(&cache_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "expected 1 cached json file, got {entries:?}"
+    );
+    let cache_entry = &entries[0];
+    let file_mode = fs::symlink_metadata(cache_entry)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        file_mode, 0o600,
+        "expected 0600 cache entry (not world-readable 0644), got {:o}",
+        file_mode
+    );
+
+    // 2. Replace `<hash>.json` with a symlink pointing to a forged `"ok": true` JSON payload ->
+    //    reader MUST reject via O_NOFOLLOW, recompute fail-closed (`ok: false`, `cache_hit: false`),
+    //    and atomically replace the symlink without writing through to `forged_ok.json`!
+    let forged_target = fx.write(
+        "forged_ok.json",
+        r#"{"status":"ok","ok":true,"verdict":"specs_audited","policy":"default","total_specs_audited":1,"vacuous_specs":0,"trivial_specs":0,"tight_specs":1,"vacuous":false,"shadowed_constants":[],"forbidden_scope_decls":[],"stub_defs":[],"warnings":[],"specs":[]}"#,
+    );
+    fs::remove_file(cache_entry).unwrap();
+    symlink(&forged_target, cache_entry).unwrap();
+
+    let out_sym = fx
+        .cli("sec-sym")
+        .env("TURBO_LEAN_AUDIT_CACHE_DIR", &cache_dir)
+        .args(["--json", "audit-spec"])
+        .arg(&bad_spec)
+        .output()
+        .unwrap();
+    let sym_json = assert_cli_fail_json(&out_sym, "symlinked cache entry must not poison audit");
+    assert_eq!(sym_json["cache_hit"].as_bool(), Some(false));
+    let forged_after = fs::read_to_string(&forged_target).unwrap();
+    assert!(
+        forged_after.contains("\"ok\":true"),
+        "atomic cache write must never overwrite symlink target"
+    );
+    assert!(
+        !fs::symlink_metadata(cache_entry)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "atomic rename should replace symlink with regular 0600 file"
+    );
+
+    // 3. Making `<hash>.json` group/world-readable (`0644`) must also be rejected as untrusted
+    fs::set_permissions(cache_entry, fs::Permissions::from_mode(0o644)).unwrap();
+    let out_perm = fx
+        .cli("sec-perm")
+        .env("TURBO_LEAN_AUDIT_CACHE_DIR", &cache_dir)
+        .args(["--json", "audit-spec"])
+        .arg(&bad_spec)
+        .output()
+        .unwrap();
+    let perm_json = assert_cli_fail_json(&out_perm, "0644 cache entry must miss cache");
+    assert_eq!(perm_json["cache_hit"].as_bool(), Some(false));
+
+    // 4. Symlinked parent component in `TURBO_LEAN_AUDIT_CACHE_DIR=<root>/sym_parent/subcache`
+    //    must NEVER be traversed or populated!
+    let victim_dir = fx.root.join("victim_real_dir");
+    fs::create_dir_all(&victim_dir).unwrap();
+    let sym_parent = fx.root.join("sym_parent");
+    symlink(&victim_dir, &sym_parent).unwrap();
+    let escaped_cache = sym_parent.join("subcache");
+
+    let good_spec = fx.write(
+        "CleanSpec.lean",
+        "theorem clean_spec (n : Nat) (h : n > 0) : n >= 1 := by omega\n",
+    );
+    let out_parent_sym = fx
+        .cli("sec-parent-sym")
+        .env("TURBO_LEAN_AUDIT_CACHE_DIR", &escaped_cache)
+        .args(["--json", "audit-spec"])
+        .arg(&good_spec)
+        .output()
+        .unwrap();
+    let parent_sym_json = assert_cli_ok(
+        &out_parent_sym,
+        "audit still runs without poisoned cache dir",
+    );
+    assert_eq!(parent_sym_json["cache_hit"].as_bool(), Some(false));
+    assert!(
+        !victim_dir.join("subcache").exists(),
+        "must NEVER create subdirectories through symlinked cache parent!"
+    );
+}
+
+#[test]
+fn combined_custom_multiline_attributes_and_modifiers_on_local_defs_are_audited_for_stubs() {
+    let fx = AuditSpecFixture::new("attr_mod_stubs");
+
+    // Negative: `@[simp, inline]`, `@[csimp]`, multiline `@[simp]\ndef`, `partial def`, `unsafe def`,
+    // and `scoped @[reducible] def` hiding identity stubs, unused-param stubs, or tautological wrappers
+    let bad = fx.write(
+        "AttrStubsBad.lean",
+        r#"
+@[simp, inline] def comboStub (x : Nat) : Nat := x
+
+@[always_inline]
+def multilineUnusedStub (x y : Nat) : Nat := x + 1
+
+partial def partialIdentityStub (x : Nat) : Nat := x
+
+unsafe def unsafeIdentityStub (x : Nat) : Nat := x
+
+scoped @[reducible] def tautPred (x : Nat) : Prop := x = x
+
+theorem bad_combo (x : Nat) : comboStub x = x := rfl
+theorem bad_multiline_unused (x y : Nat) : multilineUnusedStub x y > 0 := by omega
+theorem bad_partial (x : Nat) : partialIdentityStub x + 1 > 0 := by omega
+theorem bad_unsafe (x : Nat) : unsafeIdentityStub x + 1 > 0 := by omega
+theorem bad_taut_pred (x : Nat) (h : x > 0) : tautPred x := rfl
+"#,
+    );
+    let bad_out = fx
+        .cli("attr-stubs-bad")
+        .args(["--json", "audit-spec", "--policy", "strict-proofs"])
+        .arg(&bad)
+        .output()
+        .unwrap();
+    let bad_json = assert_cli_fail_json(&bad_out, "attributed/modified stubs must fail");
+    let stubs = bad_json["stub_defs"].as_array().unwrap();
+    for expected in [
+        "comboStub",
+        "multilineUnusedStub",
+        "partialIdentityStub",
+        "unsafeIdentityStub",
+    ] {
+        assert!(
+            stubs
+                .iter()
+                .any(|s| s.as_str().unwrap_or("").contains(expected)),
+            "expected {expected} in stub_defs, got {stubs:?}"
+        );
+    }
+    assert!(
+        bad_json["trivial_spec_names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s.as_str() == Some("bad_taut_pred")),
+        "expected bad_taut_pred unfolded via scoped @[reducible] def in {bad_json}"
+    );
+
+    // Positive: non-stub attributed/modified helper definitions pass cleanly
+    let good = fx.write(
+        "AttrStubsGood.lean",
+        r#"
+@[simp, inline] def addTwo (x : Nat) : Nat := x + 2
+
+@[always_inline]
+partial def stepCount (x y : Nat) : Nat := x + y + 1
+
+theorem good_attributed (x y : Nat) (h : x > 0) : addTwo x + stepCount x y >= 4 := by omega
+"#,
+    );
+    let good_out = fx
+        .cli("attr-stubs-good")
+        .args(["--json", "audit-spec", "--policy", "strict-proofs"])
+        .arg(&good)
+        .output()
+        .unwrap();
+    let good_json = assert_cli_ok(&good_out, "non-stub attributed defs");
+    assert_eq!(good_json["tight_specs"].as_u64(), Some(1));
+}
+
+#[test]
+fn section_and_anonymous_end_preserve_enclosing_namespace_stack() {
+    let fx = AuditSpecFixture::new("section_ns_stack");
+
+    // Negative 1: `section S ... end` inside `namespace TurboLean.Kernel` followed by
+    // `namespace ConLeche` MUST resolve to `TurboLean.Kernel.ConLeche` and fail `--forbid-namespace`!
+    let bad_ns = fx.write(
+        "SectionClobberBad.lean",
+        r#"
+namespace TurboLean.Kernel
+section S
+def benignHelper (x : Nat) : Nat := x + 1
+end
+namespace ConLeche
+theorem smuggled_thm (x : Nat) (h : x > 0) : benignHelper x >= 2 := by omega
+end ConLeche
+end TurboLean.Kernel
+"#,
+    );
+    let bad_out = fx
+        .cli("sec-ns-bad")
+        .args([
+            "--json",
+            "audit-spec",
+            "--forbid-namespace",
+            "TurboLean.Kernel.ConLeche",
+        ])
+        .arg(&bad_ns)
+        .output()
+        .unwrap();
+    let bad_json = assert_cli_fail_json(
+        &bad_out,
+        "section ... end inside namespace must not clobber TurboLean.Kernel prefix",
+    );
+    assert!(bad_json["forbidden_scope_decls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v
+            .as_str()
+            .unwrap_or("")
+            .contains("TurboLean.Kernel.ConLeche")));
+
+    // Negative 2: anonymous `end` after nested `namespace A` -> `namespace B` only pops `B`
+    // (leaving `A` active so `namespace ForbiddenSub` is `A.ForbiddenSub`, and local def qualification
+    // inside `A` after `section ... end` still resolves `A.localStub`).
+    let anon_end_bad = fx.write(
+        "AnonEndStackBad.lean",
+        r#"
+namespace Outer
+namespace Inner
+def innerVal : Nat := 1
+end
+section LocalSec
+end
+def localStub (x : Nat) : Nat := x
+namespace ForbiddenChild
+theorem child_thm (x : Nat) : Outer.localStub x = x := rfl
+end ForbiddenChild
+end Outer
+"#,
+    );
+    let anon_out = fx
+        .cli("anon-end-bad")
+        .args([
+            "--json",
+            "audit-spec",
+            "--forbid-namespace",
+            "Outer.ForbiddenChild",
+        ])
+        .arg(&anon_end_bad)
+        .output()
+        .unwrap();
+    let anon_json = assert_cli_fail_json(&anon_out, "anonymous end pops only innermost scope");
+    assert!(anon_json["forbidden_scope_decls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str().unwrap_or("").contains("Outer.ForbiddenChild")));
+    assert!(anon_json["stub_defs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v.as_str().unwrap_or("").contains("Outer.localStub")));
+
+    // Positive: properly closed `end TurboLean.Kernel` before top-level `namespace AllowedOther`
+    // does NOT falsely trigger `--forbid-namespace TurboLean.Kernel.AllowedOther`
+    let good_ns = fx.write(
+        "SectionStackGood.lean",
+        r#"
+namespace TurboLean.Kernel
+section S
+def okHelper (x : Nat) : Nat := x + 1
+end S
+end TurboLean.Kernel
+
+namespace AllowedOther
+theorem ok_thm (x : Nat) (h : x > 0) : x >= 1 := by omega
+end AllowedOther
+"#,
+    );
+    let good_out = fx
+        .cli("sec-ns-good")
+        .args([
+            "--json",
+            "audit-spec",
+            "--forbid-namespace",
+            "TurboLean.Kernel.AllowedOther",
+        ])
+        .arg(&good_ns)
+        .output()
+        .unwrap();
+    assert_cli_ok(
+        &good_out,
+        "closed outer namespace must not bleed into AllowedOther",
+    );
+}
+
+#[test]
+fn empty_or_whitespace_policy_flag_fails_closed() {
+    let fx = AuditSpecFixture::new("empty_policy");
+    // Even if a valid project config exists, explicit `--policy ""` or `--policy "   "` MUST fail closed!
+    fx.write(
+        "turbo-lean.toml",
+        "[audit_spec]\npolicy = \"strict-proofs\"\n",
+    );
+    let spec = fx.write(
+        "Spec.lean",
+        "theorem ok_thm (n : Nat) (h : n > 0) : n >= 1 := by omega\n",
+    );
+
+    for (tag, bad_pol) in [("empty-pol", ""), ("space-pol", "   ")] {
+        let json_out = fx
+            .cli(tag)
+            .args(["--json", "audit-spec", "--policy", bad_pol])
+            .arg(&spec)
+            .output()
+            .unwrap();
+        let err_json = assert_cli_fail_json(&json_out, tag);
+        assert_eq!(err_json["verdict"].as_str(), Some("error"));
+        assert!(err_json["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Unknown audit-spec policy preset"));
+
+        let text_out = fx
+            .cli(&format!("{tag}-txt"))
+            .args(["audit-spec", "--policy", bad_pol])
+            .arg(&spec)
+            .output()
+            .unwrap();
+        assert!(
+            !text_out.status.success(),
+            "text mode --policy {bad_pol:?} must exit non-zero"
+        );
+    }
+
+    // Positive: valid `--policy strict-proofs` succeeds
+    let ok_out = fx
+        .cli("valid-pol")
+        .args(["--json", "audit-spec", "--policy", "strict-proofs"])
+        .arg(&spec)
+        .output()
+        .unwrap();
+    assert_cli_ok(&ok_out, "valid --policy strict-proofs");
+}
