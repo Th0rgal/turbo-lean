@@ -29906,7 +29906,7 @@ lean_lib Smoke where
         fs::create_dir_all(&app_lib_dir)?;
         fs::create_dir_all(&app_ir_dir)?;
         let lean_app = Command::new(&cfg.lean_bin)
-            .env("LEAN_PATH", lp_env_app.get("LEAN_PATH").unwrap())
+            .env("LEAN_PATH", &lp_env_app)
             .arg(proj.join("App.lean"))
             .arg("-R")
             .arg(&proj)
