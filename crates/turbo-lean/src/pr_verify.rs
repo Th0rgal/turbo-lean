@@ -5708,49 +5708,14 @@ fn package_has_lean_elab_host_effects(pkg: &crate::module_builder::PackageConfig
     false
 }
 
-fn package_may_read_host_state(pkg: &PackageConfig) -> bool {
-    let Ok(dep_root) = pkg.pkg_root.canonicalize() else {
-        return true;
-    };
-    let build_abs = dep_root.join(&pkg.build_dir);
-    let pkgs_abs = dep_root.join(&pkg.packages_dir);
-    let lake_abs = dep_root.join(".lake");
-    let mut stack = vec![dep_root];
-    while let Some(dir) = stack.pop() {
-        let Ok(rd) = fs::read_dir(&dir) else {
-            return true;
-        };
-        for ent in rd {
-            let Ok(ent) = ent else {
-                return true;
-            };
-            let p = ent.path();
-            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if name == ".git" || p == build_abs || p == pkgs_abs || p == lake_abs {
-                continue;
-            }
-            let Ok(st) = fs::symlink_metadata(&p) else {
-                return true;
-            };
-            if st.file_type().is_symlink() {
-                continue;
-            }
-            if st.is_dir() {
-                stack.push(p);
-            } else if st.is_file() && name.ends_with(".lean") {
-                let Ok(src) = fs::read_to_string(&p) else {
-                    return true;
-                };
-                if splitter::source_may_read_host_state(&src) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+fn package_may_read_host_state(pkg: &crate::module_builder::PackageConfig) -> bool {
+    package_has_lean_elab_host_effects(pkg)
 }
 
-fn is_pinned_git_manifest_dep(cfg: &ProjectConfig, dep: &PackageConfig) -> bool {
+fn is_pinned_git_manifest_dep(
+    cfg: &crate::module_builder::ProjectConfig,
+    dep: &crate::module_builder::PackageConfig,
+) -> bool {
     let dep_canon = dep.pkg_root.canonicalize().ok();
     cfg.manifest_packages.iter().any(|mp| {
         mp.pkg_type == "git"
@@ -5766,7 +5731,10 @@ fn is_pinned_git_manifest_dep(cfg: &ProjectConfig, dep: &PackageConfig) -> bool 
     })
 }
 
-fn dep_package_has_disallowed_elab_host_effects(cfg: &ProjectConfig, dep: &PackageConfig) -> bool {
+fn dep_package_has_disallowed_elab_host_effects(
+    cfg: &crate::module_builder::ProjectConfig,
+    dep: &crate::module_builder::PackageConfig,
+) -> bool {
     if is_pinned_git_manifest_dep(cfg, dep) {
         package_may_read_host_state(dep)
     } else {
@@ -17610,8 +17578,9 @@ end ParityNs
             );
 
             // Fifth case (`astra` Finding 2 + `sol` Finding 2): path dependency AND git-pinned dependency
-            // defining an env-reading elaborator (`elab "dep_env_ty"`) imported by a pure root `App.lean`
-            // must NOT reuse stale `.lake/packages/dep/.lake/build` `.olean`s when `ENV_KEY` rotates!
+            // defining an elaborator (`getEnv` for path dep, `IO.FS.lines` for git-pinned dep) imported by
+            // a pure root `App.lean` must NOT reuse stale `.lake/packages/dep/.lake/build` `.olean`s,
+            // base/overlay caches, or Module CAS across untracked env/file rotation!
             for use_git_pin in [false, true] {
                 std::env::set_var(ENV_KEY, "alpha");
                 let dep_case_root = tree.root.join(if use_git_pin {
@@ -17622,18 +17591,25 @@ end ParityNs
                 let dep_pkg_src = dep_case_root.join("dep_origin");
                 let app_proj = dep_case_root.join("app");
                 let dep_in_pkgs = app_proj.join(".lake/packages/dep");
+                let flag_file = dep_case_root.join("host_lines_flag.txt");
                 fs::create_dir_all(&dep_pkg_src)?;
                 fs::create_dir_all(&app_proj)?;
+                fs::write(&flag_file, "alpha\n")?;
                 let tc = include_str!("../../../lean/lean-toolchain");
                 fs::write(dep_pkg_src.join("lean-toolchain"), tc)?;
                 fs::write(
                     dep_pkg_src.join("lakefile.toml"),
                     "name = \"dep\"\ndefaultTargets = [\"Dep\"]\n[[lean_lib]]\nname = \"Dep\"\nroots = [\"Dep\"]\n",
                 )?;
-                fs::write(
-                    dep_pkg_src.join("Dep.lean"),
-                    "import Lean\nopen IO Lean Elab Term in\nelab \"dep_env_ty\" : term => do\n  match (← getEnv \"TURBO_TEST_ELAB_STMT_ENV\") with\n  | some \"beta\" => return mkConst ``Bool\n  | _ => return mkConst ``Nat\ndef depWitness (x : dep_env_ty) : dep_env_ty := x\n",
-                )?;
+                let dep_lean_src = if use_git_pin {
+                    let escaped_flag = flag_file.to_string_lossy().replace('\\', "\\\\");
+                    format!(
+                        "import Lean\nopen Lean Elab Term in\nelab \"dep_env_ty\" : term => do\n  let rows ← IO.FS.lines \"{escaped_flag}\"\n  if rows.size >= 2 then\n    return mkConst ``Bool\n  else\n    return mkConst ``Nat\ndef depWitness (x : dep_env_ty) : dep_env_ty := x\n"
+                    )
+                } else {
+                    "import Lean\nopen IO Lean Elab Term in\nelab \"dep_env_ty\" : term => do\n  match (← getEnv \"TURBO_TEST_ELAB_STMT_ENV\") with\n  | some \"beta\" => return mkConst ``Bool\n  | _ => return mkConst ``Nat\ndef depWitness (x : dep_env_ty) : dep_env_ty := x\n".to_string()
+                };
+                fs::write(dep_pkg_src.join("Dep.lean"), dep_lean_src)?;
                 git_init_and_commit(&dep_pkg_src, "dep_init")?;
                 let dep_rev_out = Command::new("git")
                     .args(["rev-parse", "HEAD"])
@@ -17678,7 +17654,7 @@ end ParityNs
                 fs::write(app_proj.join("lake-manifest.json"), manifest_json)?;
                 fs::write(
                     app_proj.join("App.lean"),
-                    "import Dep\ntheorem app_env_thm (x : _) : depWitness x = depWitness x := by\n  rfl\n",
+                    "import Dep\ntheorem app_env_thm (x : dep_env_ty) : x = x := by\n  rfl\n",
                 )?;
                 fs::write(app_proj.join(".gitignore"), ".lake/\n")?;
                 git_init_and_commit(&app_proj, "app_base")?;
@@ -17719,6 +17695,65 @@ end ParityNs
                     "dep with host-state-reading elaborator (git={use_git_pin}) must NOT be externalized into external_olean_deps"
                 );
                 std::env::set_var(ENV_KEY, "beta");
+                fs::write(&flag_file, "alpha\nbeta\n")?;
+                let base_oid_out = Command::new("git")
+                    .args(["rev-parse", "HEAD"])
+                    .current_dir(&app_proj)
+                    .output()?;
+                let app_base_oid = String::from_utf8(base_oid_out.stdout)?.trim().to_string();
+                // Smuggle `(x : Nat) : x = x` on `App.lean` after rotating `flag_file` / `ENV_KEY`
+                // to `beta` (`base` now elaborates `dep_env_ty` as `Bool`, whereas stale `alpha`
+                // `.olean`s and stale `base_stmt_map` had `(x : Nat) : x = x`). Both warm (`dep_store`)
+                // and cold (`cold_dep_store`) `pr-verify` must reject the smuggled statement change!
+                fs::write(
+                    app_proj.join("App.lean"),
+                    "import Dep\ntheorem app_env_thm (x : Nat) : x = x := by\n  exact rfl\n",
+                )?;
+                let err_warm_dep = run_pr_verify_command(
+                    &mut dep_store,
+                    true,
+                    app_proj.clone(),
+                    app_base_oid.clone(),
+                    "trusted".into(),
+                    true,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    0,
+                    None,
+                )
+                .expect_err(
+                    "warm pr-verify must detect smuggled Nat statement delta when dep IO.FS.lines/getEnv rotated base to Bool",
+                );
+                assert!(
+                    format!("{err_warm_dep:#}").contains("app_env_thm"),
+                    "expected statement delta on app_env_thm (warm, git={use_git_pin}), got: {err_warm_dep:#}"
+                );
+                let mut cold_dep_store = TurboStore::open(Some(&dep_case_root.join("cold_store")))?;
+                let err_cold_dep = run_pr_verify_command(
+                    &mut cold_dep_store,
+                    true,
+                    app_proj.clone(),
+                    app_base_oid,
+                    "trusted".into(),
+                    true,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    0,
+                    None,
+                )
+                .expect_err(
+                    "cold pr-verify must not seed stale alpha dep .olean and must detect smuggled Nat statement delta under beta",
+                );
+                assert!(
+                    format!("{err_cold_dep:#}").contains("app_env_thm"),
+                    "expected statement delta on app_env_thm (cold, git={use_git_pin}), got: {err_cold_dep:#}"
+                );
                 let dep_beta_rep = crate::module_builder::build_project_modules_native(
                     &mut dep_store,
                     &app_proj,
@@ -17731,7 +17766,7 @@ end ParityNs
                 )?;
                 assert_eq!(
                     dep_beta_rep.modules_cached, 0,
-                    "dep & App (git={use_git_pin}) must not hit Module CAS across env rotation"
+                    "dep & App (git={use_git_pin}) must not hit Module CAS across env/file rotation"
                 );
                 assert_eq!(
                     dep_beta_rep.modules_up_to_date_reused, 0,

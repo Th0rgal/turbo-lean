@@ -1408,7 +1408,7 @@ fn contains_lean_attribute_word(unquoted: &str, attrs: &[&str]) -> bool {
             }
         });
         let (advance_from, open_inner) = match (at_pos, kw_pos) {
-            (Some(a), Some((k, inner))) if a <= k => (a + 2, a + 2),
+            (Some(a), Some((k, _inner))) if a <= k => (a + 2, a + 2),
             (None, Some((_, inner))) => (inner, inner),
             (_, Some((_, inner))) => (inner, inner),
             (Some(a), None) => (a + 2, a + 2),
@@ -1555,54 +1555,12 @@ pub(crate) fn source_may_execute_elab_host_effects(src: &str, reject_pure_macros
     false
 }
 
-/// Returns true if `src` references host-environment, filesystem, process, clock, RNG, or FFI
-/// primitives (qualified or unqualified under `open IO` / `open System`) that could observe
-/// unpinned host state during elaboration inside a git-pinned dependency package.
+/// Returns true if `src` may execute elaboration-time host effects inside a git-pinned dependency
+/// package (delegating directly to `source_may_execute_elab_host_effects(src, false)` so any
+/// custom `elab`, `run_tac`, `initialize`, `@[extern]`, `IO.FS.lines`, `Std.Internal.UV`, etc.
+/// fails closed while pure `def`/`theorem`/`macro_rules` modules remain eligible).
 pub(crate) fn source_may_read_host_state(src: &str) -> bool {
-    let comment_free = strip_lean_comments(src);
-    let clean = strip_string_literals(&comment_free);
-    let unquoted = clean.replace(['«', '»'], "");
-    if contains_lean_word(&unquoted, "include_str") {
-        return true;
-    }
-    const HOST_READ_SEGMENTS: &[&str] = &[
-        "getEnv",
-        "readFile",
-        "readBinFile",
-        "readDir",
-        "readLines",
-        "pathExists",
-        "isDir",
-        "metadata",
-        "realPath",
-        "currentDir",
-        "appPath",
-        "Process",
-        "Handle",
-        "getRandomBytes",
-        "monoMsNow",
-        "monoNanosNow",
-        "dlopen",
-    ];
-    if HOST_READ_SEGMENTS
-        .iter()
-        .any(|w| contains_lean_ident_segment(&unquoted, w))
-    {
-        return true;
-    }
-    contains_lean_attribute_word(
-        &unquoted,
-        &[
-            "extern",
-            "implemented_by",
-            "csimp",
-            "init",
-            "builtin_init",
-            "env_linter",
-            "package_check",
-            "cpass",
-        ],
-    )
+    source_may_execute_elab_host_effects(src, false)
 }
 
 fn contains_word(haystack: &str, word: &str) -> bool {
@@ -13174,7 +13132,7 @@ public def api := by
             false
         ));
         assert!(source_may_read_host_state(
-            "open IO in\ndef readFlag : IO (Option String) := getEnv \"FLAG\"\n"
+            "open Lean Elab Term in\nelab \"line_count\" : term => do\n  let rows ← IO.FS.lines \"/tmp/flag\"\n  return mkNatLit rows.size\n"
         ));
         assert!(!source_may_read_host_state(
             "def pureHelper (n : Nat) : Array Nat := Array.init n id\n"

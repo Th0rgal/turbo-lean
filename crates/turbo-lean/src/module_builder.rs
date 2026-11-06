@@ -9729,7 +9729,7 @@ pub(crate) fn dep_pkg_import_pins_consistent(
             return false;
         };
         if spec_source_has_disallowed_elab_host_effects(cfg, &cur, &src) {
-            return Ok(None);
+            return false;
         }
         let hdr = parse_header_info(&src);
         if hdr.header_error.is_some()
@@ -36250,6 +36250,7 @@ root = "Main"
             "trusted",
             false,
             &HashMap::new(),
+            &HashSet::new(),
         );
         assert!(
             b_levels["App.ZRoot"] >= 1_500_000 && b_levels["App.ALeaf"] >= 500_000,
