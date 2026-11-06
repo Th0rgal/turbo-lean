@@ -1610,6 +1610,7 @@ pub(crate) fn resolve_closure_module(
     mod_name: &str,
     toolchain_lib: Option<&Path>,
 ) -> Option<PathBuf> {
+    let resolved = crate::module_builder::resolve_olean_along_search_dirs(search_dirs, mod_name);
     let rel = crate::module_builder::module_name_to_rel_slash(mod_name);
     let pkg = rel.split('/').next().unwrap_or_default();
     let root = search_dirs
@@ -1620,7 +1621,7 @@ pub(crate) fn resolve_closure_module(
     {
         return None;
     }
-    Some(root?.join(format!("{rel}.olean"))).filter(|p| p.is_file())
+    resolved
 }
 
 fn split_lean_path(lean_path: &str) -> Vec<&Path> {

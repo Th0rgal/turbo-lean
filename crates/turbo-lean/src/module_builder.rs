@@ -845,6 +845,26 @@ pub fn module_name_to_rel_slash(mod_name: &str) -> String {
     segs.join("/")
 }
 
+/// Resolve `mod_name` along `search_dirs` matching Lean's `findOLean` (`findWithExt`):
+/// the first directory containing the module's root package (`<pkg>/` or `<pkg>.olean`) wins,
+/// and `<rel>.olean` is looked up only inside that winning directory.
+pub(crate) fn resolve_olean_along_search_dirs<P: AsRef<Path>>(
+    search_dirs: &[P],
+    mod_name: &str,
+) -> Option<PathBuf> {
+    let rel = module_name_to_rel_slash(mod_name);
+    let pkg = rel.split('/').next().unwrap_or_default();
+    if pkg.is_empty() {
+        return None;
+    }
+    let pkg_olean = format!("{pkg}.olean");
+    let root = search_dirs
+        .iter()
+        .map(AsRef::as_ref)
+        .find(|d| d.join(pkg).is_dir() || d.join(&pkg_olean).exists())?;
+    Some(root.join(format!("{rel}.olean"))).filter(|p| p.is_file())
+}
+
 /// Format raw filesystem path components into a round-trippable `Lean.Name.toString` module name.
 pub fn format_lean_module_name_from_parts<'a, I: IntoIterator<Item = &'a str>>(parts: I) -> String {
     parts
@@ -15284,18 +15304,15 @@ fn resolve_olean_import_closure_cached_with_stat_memo(
                     let path = if let Some(cached_p) = path_memo.get(&m) {
                         cached_p.clone()
                     } else {
-                        let rel = format!("{}.olean", module_name_to_rel_slash(&m));
-                        let resolved = dirs
-                            .iter()
-                            .map(|d| d.join(&rel))
-                            .find(|p| p.is_file())
-                            .ok_or_else(|| {
+                        let resolved = resolve_olean_along_search_dirs(&dirs, &m).ok_or_else(
+                            || {
                                 anyhow::anyhow!(
                                     "Unresolvable binary import `{}` required by `{}` along LEAN_PATH: fail-closed",
                                     m,
                                     cur_path.display()
                                 )
-                            })?;
+                            },
+                        )?;
                         path_memo.insert(m.clone(), resolved.clone());
                         resolved
                     };
@@ -15516,8 +15533,7 @@ impl ReplayLookupBatchCache {
     }
 
     fn resolve_module_along_dirs(&self, m: &str) -> Option<PathBuf> {
-        let rel = format!("{}.olean", module_name_to_rel_slash(m));
-        self.dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file())
+        resolve_olean_along_search_dirs(&self.dirs, m)
     }
 
     fn intern_node(&mut self, path: &Path) -> usize {
@@ -20443,8 +20459,7 @@ pub(crate) fn ensure_imported_oleans_replayed_with_roots_and_axioms(
         if !seen.insert(m.clone()) {
             continue;
         }
-        let rel = format!("{}.olean", module_name_to_rel_slash(&m));
-        let Some(path) = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
+        let Some(path) = resolve_olean_along_search_dirs(&dirs, &m) else {
             continue;
         };
         if let Some(ref t) = tc_lib {
@@ -38421,6 +38436,38 @@ globs = ["Down.+"]
         assert!(
             !lookup.verify_fast_store_authority(&fast_auth_v1),
             "shadowing transitive dependency along LEAN_PATH must invalidate FastStore authority"
+        );
+
+        // Remove `extra/Leaf.olean`, re-populate memo & authority for `Rb.Top` (which imports `Rb.Mid`),
+        // then create an empty higher-precedence package directory `extra/Rb/` (without `Mid.olean`).
+        // Lean's `findOLean` selects `extra` as the package root for `Rb.*` and fails to resolve `Rb.Mid`,
+        // so both `resolve_module_olean("Rb.Mid")`, `is_audited_in_store`, and `verify_fast_store_authority`
+        // MUST reject the cached authority!
+        fs::remove_file(extra.join("Leaf.olean"))?;
+        assert!(lookup.is_audited_in_store(&store, &cfg, &lp, "Rb.Top", &top_olean));
+        let fast_auth_pkg = lookup
+            .verify_audited_in_store_authority(
+                &store,
+                &cfg,
+                "Rb.Top",
+                &top_olean,
+                true,
+                "dig-v1".to_string(),
+            )
+            .expect("fast-store authority before package-directory shadowing");
+        fs::create_dir_all(extra.join("Rb"))?;
+        assert_eq!(
+            lookup.resolve_module_olean("Rb.Mid"),
+            None,
+            "empty higher-precedence package directory `extra/Rb/` must shadow `Rb.Mid` per Lean findOLean"
+        );
+        assert!(
+            !lookup.is_audited_in_store(&store, &cfg, &lp, "Rb.Top", &top_olean),
+            "package-directory shadowing of `Rb/` without `Mid.olean` must invalidate memoized audit lookup"
+        );
+        assert!(
+            !lookup.verify_fast_store_authority(&fast_auth_pkg),
+            "package-directory shadowing of `Rb/` without `Mid.olean` must invalidate FastStore authority"
         );
 
         crate::zygote::purge_snapshot_dir(&dir);
