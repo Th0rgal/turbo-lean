@@ -384,3 +384,120 @@ fn untargeted_and_auto_fastcheck_agent_step_and_mcp_confirm_elaborated_identity(
         "{mcp_unconfirmed_body}"
     );
 }
+
+#[test]
+fn cli_transpiled_fastcheck_falls_back_to_kernel_when_shadowed_witness_rejected() {
+    let shadowed_src = concat!(
+        "namespace CustomWord\n",
+        "structure Word256 where\n  w0 : UInt64\n  w1 : UInt64\n  w2 : UInt64\n  w3 : UInt64\n  deriving DecidableEq, Repr\n",
+        "def Word256.zero : Word256 := ⟨0, 0, 0, 0⟩\n",
+        "def Word256.one : Word256 := ⟨1, 0, 0, 0⟩\n",
+        "def Word256.bitAnd (a _b : Word256) : Word256 := a\n",
+        "theorem valid_shadowed (a : Word256) : Word256.bitAnd a Word256.zero = a := rfl\n",
+        "theorem invalid_shadowed (a : Word256) : Word256.bitAnd a Word256.zero = Word256.one := by sorry\n",
+        "end CustomWord\n",
+    );
+    let tmp = identity_project("cli-transpile-fallback", shadowed_src);
+    fs::write(
+        tmp.0.join("lakefile.toml"),
+        "name = \"identity\"\nversion = \"0.1.0\"\n\n[[lean_lib]]\nname = \"Identity\"\n",
+    )
+    .unwrap();
+    for (args, expect_ok, expect_cex) in [
+        (
+            vec![
+                "fast-check",
+                "Identity.lean",
+                "--transpile-lean",
+                "CustomWord.valid_shadowed",
+            ],
+            true,
+            false,
+        ),
+        (
+            vec![
+                "fast-check",
+                "Identity.lean",
+                "--tpu",
+                "--decl",
+                "CustomWord.valid_shadowed",
+            ],
+            true,
+            false,
+        ),
+        (
+            vec![
+                "fast-check",
+                "Identity.lean",
+                "--transpile-lean",
+                "CustomWord.invalid_shadowed",
+            ],
+            false,
+            true,
+        ),
+        (
+            vec![
+                "fast-check",
+                "Identity.lean",
+                "--tpu",
+                "--decl",
+                "CustomWord.invalid_shadowed",
+            ],
+            false,
+            true,
+        ),
+    ] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_turbo-lean"));
+        cmd.current_dir(&tmp.0)
+            .env("TURBO_LEAN_NO_DAEMON", "1")
+            .args(["--json", "--cache-dir"])
+            .arg(tmp.0.join("cache"))
+            .args(&args);
+        let out = corpus::run(&mut cmd);
+        let text = corpus::diagnostic(&out);
+        assert_eq!(out.status.success(), expect_ok, "{args:?}: {text}");
+        if !expect_cex {
+            assert!(
+                !text.contains("counterexample_found"),
+                "must never report bogus transpiled counterexample for {args:?}: {text}"
+            );
+        } else {
+            assert!(
+                text.contains("\"lean_native_certified\": true")
+                    || text.contains("\"status\": \"counterexample_found\""),
+                "kernel-certified counterexample must be reported for {args:?}: {text}"
+            );
+        }
+    }
+    let broken_shadowed = shadowed_src.replace(
+        "theorem valid_shadowed (a : Word256) : Word256.bitAnd a Word256.zero = a := rfl\n",
+        "theorem valid_shadowed (a : Word256) : Word256.bitAnd a Word256.zero = a := by sorry\n",
+    );
+    fs::write(tmp.0.join("Identity.lean"), &broken_shadowed).unwrap();
+    for args in [
+        vec![
+            "fast-check",
+            "Identity.lean",
+            "--transpile-lean",
+            "CustomWord.valid_shadowed",
+        ],
+        vec![
+            "fast-check",
+            "Identity.lean",
+            "--tpu",
+            "--decl",
+            "CustomWord.valid_shadowed",
+        ],
+    ] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_turbo-lean"));
+        cmd.current_dir(&tmp.0)
+            .env("TURBO_LEAN_NO_DAEMON", "1")
+            .args(["--json", "--cache-dir"])
+            .arg(tmp.0.join("cache"))
+            .args(&args);
+        let out = corpus::run(&mut cmd);
+        let text = corpus::diagnostic(&out);
+        assert!(!out.status.success(), "{args:?}: {text}");
+        assert!(!text.contains("counterexample_found"), "{args:?}: {text}");
+    }
+}
