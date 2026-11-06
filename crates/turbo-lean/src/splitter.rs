@@ -1283,7 +1283,7 @@ fn is_top_level_command_start(trimmed: &str) -> bool {
         "export ",
         "include ",
         "omit ",
-        "@",
+        "@[",
         "private ",
         "protected ",
         "noncomputable ",
@@ -1561,6 +1561,212 @@ pub(crate) fn is_section_header_line(trimmed_clean: &str) -> bool {
             .is_some_and(|r| r.starts_with(char::is_whitespace))
 }
 
+fn scan_line_leading_code_offset(
+    src: &str,
+    line_end: usize,
+    lexical_cursor: &mut usize,
+    non_code_end: &mut usize,
+    in_comment: &mut bool,
+) -> (Option<usize>, bool, bool) {
+    let mut first_doc_start = None;
+    let mut after_prior_comment = false;
+    while *lexical_cursor < line_end {
+        if *lexical_cursor < *non_code_end {
+            if *in_comment && *non_code_end <= line_end {
+                after_prior_comment = true;
+            }
+            *lexical_cursor = (*non_code_end).min(line_end);
+            continue;
+        }
+        *in_comment = false;
+        let b = src.as_bytes()[*lexical_cursor];
+        if b == b' ' || b == b'\t' {
+            *lexical_cursor += 1;
+            continue;
+        }
+        if matches!(
+            scan_lean_block_comment_end(src, *lexical_cursor),
+            Some((_, true))
+        ) {
+            first_doc_start.get_or_insert(*lexical_cursor);
+        }
+        if let Some(span) = skip_lean_lexeme(src, *lexical_cursor) {
+            if span.is_comment {
+                *non_code_end = span.end;
+                *in_comment = true;
+                *lexical_cursor = span.end.min(line_end);
+                continue;
+            }
+            if span.is_literal {
+                *non_code_end = span.end;
+                *in_comment = false;
+                return (first_doc_start, false, after_prior_comment);
+            }
+        }
+        return (first_doc_start, true, after_prior_comment);
+    }
+    (first_doc_start, false, after_prior_comment)
+}
+
+fn has_unbalanced_delimiters(clean_chunk: &str) -> bool {
+    let bytes = clean_chunk.as_bytes();
+    let (mut paren, mut bracket, mut brace, mut strict_brace) = (0i32, 0i32, 0i32, 0i32);
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(end) = scan_lean_norm_literal_end(clean_chunk, i) {
+            i = end;
+            continue;
+        }
+        if bytes[i..].starts_with("⦃".as_bytes()) {
+            strict_brace += 1;
+            i += "⦃".len();
+            continue;
+        }
+        if bytes[i..].starts_with("⦄".as_bytes()) {
+            strict_brace = (strict_brace - 1).max(0);
+            i += "⦄".len();
+            continue;
+        }
+        match bytes[i] {
+            b'(' => paren += 1,
+            b')' => paren = (paren - 1).max(0),
+            b'[' => bracket += 1,
+            b']' => bracket = (bracket - 1).max(0),
+            b'{' => brace += 1,
+            b'}' => brace = (brace - 1).max(0),
+            _ => {}
+        }
+        i += 1;
+    }
+    paren > 0 || bracket > 0 || brace > 0 || strict_brace > 0
+}
+
+fn ends_with_unfinished_continuation(clean_chunk: &str) -> bool {
+    let t = clean_chunk.trim_end();
+    if t.is_empty() {
+        return false;
+    }
+    for sym in [":=", "=>", "->", "←", "→", ",", "|"] {
+        if t.ends_with(sym) {
+            return true;
+        }
+    }
+    for kw in [
+        "by", "do", "where", "in", "let", "have", "fun", "match", "with",
+    ] {
+        if let Some(before) = t.strip_suffix(kw) {
+            if before.is_empty()
+                || before
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| !is_lean_id_rest(c) && c != '»' && c != '.')
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_unambiguous_post_comment_command(
+    orig_from_split: &str,
+    clean_from_split: &str,
+    prev_clean: &str,
+) -> bool {
+    if prev_clean.trim().is_empty()
+        || has_unbalanced_delimiters(prev_clean)
+        || ends_with_unfinished_continuation(prev_clean)
+    {
+        return false;
+    }
+    let after = strip_decl_and_in_prefixes(orig_from_split);
+    if after.is_empty() {
+        return is_top_level_command_start(clean_from_split.trim_start())
+            || matches!(
+                scan_lean_block_comment_end(orig_from_split.trim_start(), 0),
+                Some((_, true))
+            );
+    }
+    if let Some(rest) = after.strip_prefix("deriving ") {
+        return rest.trim_start().starts_with("instance ");
+    }
+    is_top_level_command_start(after)
+}
+
+fn push_joined_span(
+    acc: &mut String,
+    prev_end_line: Option<usize>,
+    span: &CmdSpan<'_>,
+    text: &str,
+) {
+    if let Some(pe) = prev_end_line {
+        acc.push(if pe == span.start_line { ' ' } else { '\n' });
+    }
+    acc.push_str(text);
+}
+
+fn push_omitted_span_newlines(
+    acc: &mut String,
+    prev_end_line: Option<usize>,
+    span: &CmdSpan<'_>,
+    next_start_line: Option<usize>,
+) {
+    if let Some(pe) = prev_end_line {
+        if pe < span.start_line {
+            acc.push('\n');
+        }
+    }
+    for _ in 0..span.orig_text.matches('\n').count() {
+        acc.push('\n');
+    }
+    if next_start_line.is_none() {
+        acc.push('\n');
+    }
+}
+
+fn join_span_texts(spans: &[CmdSpan<'_>], texts: &[String]) -> String {
+    let total: usize = texts.iter().map(|s| s.len() + 1).sum();
+    let mut out = String::with_capacity(total);
+    for (i, (span, text)) in spans.iter().zip(texts.iter()).enumerate() {
+        let prev_end = i.checked_sub(1).map(|p| spans[p].end_line);
+        push_joined_span(&mut out, prev_end, span, text);
+    }
+    out
+}
+
+fn join_mutual_parts(
+    span_start_line: usize,
+    header: &str,
+    inner_spans: &[CmdSpan<'_>],
+    inner_texts: &[String],
+    footer: &str,
+    span_end_line: usize,
+) -> String {
+    let header_end_line = span_start_line + header.matches('\n').count();
+    let footer_start_line = span_end_line.saturating_sub(footer.matches('\n').count());
+    let mut out = String::with_capacity(
+        header.len() + footer.len() + inner_texts.iter().map(|s| s.len() + 1).sum::<usize>() + 2,
+    );
+    out.push_str(header);
+    let mut prev_end_line = header_end_line;
+    for (sub, text) in inner_spans.iter().zip(inner_texts.iter()) {
+        out.push(if prev_end_line == sub.start_line {
+            ' '
+        } else {
+            '\n'
+        });
+        out.push_str(text);
+        prev_end_line = sub.end_line;
+    }
+    out.push(if prev_end_line == footer_start_line {
+        ' '
+    } else {
+        '\n'
+    });
+    out.push_str(footer);
+    out
+}
+
 /// Zero-copy segmentation of `(src, clean)` into top-level `CmdSpan`s.
 /// Handles `/-- ... -/` doc comments, multi-line `@[...]` attribute / modifier prefixes,
 /// commands indented inside `section ... end` blocks, and `mutual ... end` blocks without
@@ -1584,6 +1790,7 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
     let mut scope_depth = 0usize;
     let mut lexical_cursor = 0usize;
     let mut non_code_end = 0usize;
+    let mut in_comment = false;
 
     while pos < total_len {
         let line_start = pos;
@@ -1602,53 +1809,57 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
             line_end
         };
 
-        let line_orig = &src[line_start..line_end_no_cr];
-        let line_clean = &clean[line_start..line_end_no_cr];
-        let trimmed = line_clean.trim_start();
-        let trimmed_orig_line = line_orig.trim_start();
-        let indent = line_orig.len() - trimmed_orig_line.len();
-        let orig_token_start = line_start + indent;
-        let token_start = line_start + line_clean.len() - trimmed.len();
-        // Keep the whole source's lexical context: advance to `orig_token_start` first so an
-        // outer `/- ... -/` or string literal opened on an earlier line sets `non_code_end`
-        // without swallowing a new `/--` docstring starting right at `orig_token_start`.
-        while lexical_cursor < orig_token_start {
+        let (first_doc_start, has_code_here, after_prior_comment) = scan_line_leading_code_offset(
+            src,
+            line_end_no_cr,
+            &mut lexical_cursor,
+            &mut non_code_end,
+            &mut in_comment,
+        );
+        let code_pos = lexical_cursor;
+        while lexical_cursor < next_pos {
+            if lexical_cursor < non_code_end {
+                lexical_cursor = non_code_end.min(next_pos);
+                continue;
+            }
+            in_comment = false;
             if let Some(span) = skip_lean_lexeme(src, lexical_cursor) {
                 if span.is_literal || span.is_comment {
                     non_code_end = span.end;
+                    in_comment = span.is_comment;
                 }
-                lexical_cursor = span.end;
+                lexical_cursor = span.end.min(next_pos);
             } else {
                 lexical_cursor += src[lexical_cursor..].chars().next().unwrap().len_utf8();
             }
         }
-        let orig_in_prior_non_code = orig_token_start < non_code_end;
-        let at_command_indent = cur_cmd_indent.is_none_or(|base| indent <= base);
-        let starts_doc_comment = !orig_in_prior_non_code
-            && matches!(
-                scan_lean_block_comment_end(trimmed_orig_line, 0),
-                Some((_, true))
-            )
-            && (indent == 0 || (scope_depth > 0 && at_command_indent));
-        while lexical_cursor < token_start {
-            if let Some(span) = skip_lean_lexeme(src, lexical_cursor) {
-                if span.is_literal || span.is_comment {
-                    non_code_end = span.end;
-                }
-                lexical_cursor = span.end;
-            } else {
-                lexical_cursor += src[lexical_cursor..].chars().next().unwrap().len_utf8();
-            }
-        }
-        if orig_in_prior_non_code || (!starts_doc_comment && token_start < non_code_end) {
+        if first_doc_start.is_none() && !has_code_here {
             cur_byte_end = line_end_no_cr;
             pos = next_pos;
             line_num += 1;
             continue;
         }
 
+        let effective_start = first_doc_start.unwrap_or(code_pos);
+        let indent = effective_start - line_start;
+        let trimmed = if has_code_here {
+            clean[code_pos..line_end_no_cr].trim_start()
+        } else {
+            ""
+        };
+        let at_command_indent = cur_cmd_indent.is_none_or(|base| indent <= base);
+        let post_comment_split = after_prior_comment
+            && !at_command_indent
+            && is_unambiguous_post_comment_command(
+                &src[effective_start..],
+                &clean[effective_start..],
+                &clean[cur_byte_start..effective_start],
+            );
+        let starts_doc_comment = first_doc_start.is_some()
+            && (indent == 0 || (scope_depth > 0 && at_command_indent) || after_prior_comment);
+
         if mutual_depth > 0 {
-            if at_command_indent {
+            if at_command_indent || after_prior_comment {
                 if is_mutual_line_start(trimmed) {
                     mutual_depth += 1;
                 } else if is_end_line_start(trimmed) {
@@ -1661,8 +1872,23 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
             continue;
         }
 
-        let prev_orig = &src[cur_byte_start..cur_byte_end];
-        let prev_clean = &clean[cur_byte_start..cur_byte_end];
+        let split_byte_start = if after_prior_comment {
+            effective_start
+        } else {
+            line_start
+        };
+        let prev_end = if after_prior_comment {
+            effective_start
+        } else {
+            cur_byte_end
+        };
+        let prev_end_line = if after_prior_comment {
+            line_num
+        } else {
+            line_num - 1
+        };
+        let prev_orig = &src[cur_byte_start..prev_end];
+        let prev_clean = &clean[cur_byte_start..prev_end];
         let prev_trimmed = prev_clean.trim();
         let prev_unwrapped = unwrap_scope_line_wrappers(prev_trimmed);
         let prev_is_section_or_ns_header = is_section_header_line(prev_unwrapped)
@@ -1679,6 +1905,7 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
             && take_leading_lean_ident(trimmed).is_some();
 
         let can_start_at_indent = (at_command_indent
+            || post_comment_split
             || (scope_depth > 0 && prev_is_section_or_ns_header))
             && !prev_incomplete_ns
             && !prev_incomplete_section_name;
@@ -1690,17 +1917,21 @@ fn parse_command_spans<'a>(src: &'a str, clean: &'a str) -> Vec<CmdSpan<'a>> {
         {
             spans.push(CmdSpan {
                 start_line: cur_start_line,
-                end_line: line_num - 1,
+                end_line: prev_end_line,
                 orig_text: prev_orig,
                 clean_text: prev_clean,
             });
             cur_start_line = line_num;
-            cur_byte_start = line_start;
+            cur_byte_start = split_byte_start;
             cur_cmd_indent = None;
         }
 
         if !trimmed.is_empty() && cur_cmd_indent.is_none() {
-            cur_cmd_indent = Some(indent);
+            cur_cmd_indent = Some(if after_prior_comment && scope_depth == 0 {
+                0
+            } else {
+                indent
+            });
         }
 
         let cur_span_clean = &clean[cur_byte_start..line_end_no_cr];
@@ -1957,12 +2188,54 @@ fn split_mutual_block_subspans<'a>(
         return None;
     }
 
-    let header_orig = &orig[..first_nl];
-    let footer_orig = &orig[last_nl + 1..];
-    let body_orig = &orig[first_nl + 1..last_nl];
-    let body_clean = &clean[first_nl + 1..last_nl];
+    let mut header_end = first_nl;
+    let mut body_start = first_nl + 1;
+    let mut body_line_start = span.start_line + 1;
+    if clean[..first_nl]
+        .trim_end()
+        .strip_suffix("mutual")
+        .is_none()
+    {
+        // A multiline block comment may open on the `mutual` header line (`mutual /- c\n  -/ def a`).
+        // Advance across leading comments after `mutual` so `header_orig` closes the comment cleanly.
+        if let Some(mut_pos) = clean[..first_nl].find("mutual") {
+            let after_mut = mut_pos + "mutual".len();
+            let ws_end = orig.len() - orig[after_mut..].trim_start().len();
+            if let Some((c_end, false)) = scan_lean_block_comment_end(orig, ws_end) {
+                if c_end > first_nl && c_end <= last_nl {
+                    header_end = c_end;
+                    body_start = if orig.as_bytes().get(c_end) == Some(&b'\n') {
+                        c_end + 1
+                    } else {
+                        c_end
+                    };
+                    body_line_start = span.start_line
+                        + orig[..body_start].bytes().filter(|&b| b == b'\n').count();
+                }
+            }
+        }
+    }
 
-    if body_orig.trim().is_empty() {
+    // If a multiline block comment opened inside `body` closes on the `end` line (`/- c\n  -/ end`),
+    // keep the comment inside `body_orig` by splitting `footer_orig` at the `end` token offset.
+    let end_token_rel = clean[last_nl + 1..trimmed_end_len].len()
+        - clean[last_nl + 1..trimmed_end_len].trim_start().len();
+    let end_token_abs = last_nl + 1 + end_token_rel;
+    let (body_end, footer_start) = if orig[last_nl + 1..end_token_abs].trim().is_empty() {
+        (last_nl, last_nl + 1)
+    } else {
+        (end_token_abs, end_token_abs)
+    };
+    if body_end <= body_start {
+        return None;
+    }
+
+    let header_orig = &orig[..header_end];
+    let footer_orig = &orig[footer_start..];
+    let body_orig = &orig[body_start..body_end];
+    let body_clean = &clean[body_start..body_end];
+
+    if body_clean.trim().is_empty() {
         return None;
     }
 
@@ -1970,20 +2243,33 @@ fn split_mutual_block_subspans<'a>(
     // an unindented `:=` continuation inside a mutual block.
     let min_indent = body_clean
         .lines()
-        .filter(|l| is_top_level_command_start(l.trim_start()))
-        .map(|l| l.len() - l.trim_start().len())
+        .enumerate()
+        .filter(|(_, l)| is_top_level_command_start(l.trim_start()))
+        .map(|(idx, l)| {
+            let lead = l.len() - l.trim_start().len();
+            if idx == 0 && body_start > first_nl + 1 {
+                let col_off = body_start
+                    - orig[..body_start]
+                        .rfind('\n')
+                        .map_or(0, |nl_idx| nl_idx + 1);
+                col_off + lead
+            } else {
+                lead
+            }
+        })
         .min()?;
 
     let bytes = body_orig.as_bytes();
     let total_len = bytes.len();
     let mut inner_spans = Vec::new();
-    let mut cur_start_line = span.start_line + 1;
+    let mut cur_start_line = body_line_start;
     let mut cur_byte_start = 0usize;
     let mut cur_byte_end = 0usize;
-    let mut line_num = span.start_line + 1;
+    let mut line_num = body_line_start;
     let mut pos = 0usize;
     let mut lexical_cursor = 0usize;
     let mut non_code_end = 0usize;
+    let mut in_comment = false;
 
     while pos < total_len {
         let line_start = pos;
@@ -2002,19 +2288,26 @@ fn split_mutual_block_subspans<'a>(
             line_end
         };
 
-        let line_orig = &body_orig[line_start..line_end_no_cr];
-        let line_clean = &body_clean[line_start..line_end_no_cr];
-        let trimmed = line_clean.trim_start();
-        let orig_trimmed = line_orig.trim_start();
-        let indent = line_orig.len() - orig_trimmed.len();
-        let orig_token_start = line_start + indent;
-        let token_start = line_start + line_clean.len() - trimmed.len();
-        while lexical_cursor < orig_token_start {
+        let (first_doc_start, has_code_here, after_prior_comment) = scan_line_leading_code_offset(
+            body_orig,
+            line_end_no_cr,
+            &mut lexical_cursor,
+            &mut non_code_end,
+            &mut in_comment,
+        );
+        let code_pos = lexical_cursor;
+        while lexical_cursor < next_pos {
+            if lexical_cursor < non_code_end {
+                lexical_cursor = non_code_end.min(next_pos);
+                continue;
+            }
+            in_comment = false;
             if let Some(lex_span) = skip_lean_lexeme(body_orig, lexical_cursor) {
                 if lex_span.is_literal || lex_span.is_comment {
                     non_code_end = lex_span.end;
+                    in_comment = lex_span.is_comment;
                 }
-                lexical_cursor = lex_span.end;
+                lexical_cursor = lex_span.end.min(next_pos);
             } else {
                 lexical_cursor += body_orig[lexical_cursor..]
                     .chars()
@@ -2023,50 +2316,58 @@ fn split_mutual_block_subspans<'a>(
                     .len_utf8();
             }
         }
-        let orig_in_prior_non_code = orig_token_start < non_code_end;
-        let is_top_inner = indent <= min_indent;
-        let starts_doc = !orig_in_prior_non_code
-            && is_top_inner
-            && matches!(
-                scan_lean_block_comment_end(orig_trimmed, 0),
-                Some((_, true))
-            );
-        while lexical_cursor < token_start {
-            if let Some(lex_span) = skip_lean_lexeme(body_orig, lexical_cursor) {
-                if lex_span.is_literal || lex_span.is_comment {
-                    non_code_end = lex_span.end;
-                }
-                lexical_cursor = lex_span.end;
-            } else {
-                lexical_cursor += body_orig[lexical_cursor..]
-                    .chars()
-                    .next()
-                    .unwrap()
-                    .len_utf8();
-            }
-        }
-        if orig_in_prior_non_code || (!starts_doc && token_start < non_code_end) {
+        if first_doc_start.is_none() && !has_code_here {
             cur_byte_end = line_end_no_cr;
             pos = next_pos;
             line_num += 1;
             continue;
         }
 
-        if line_num > span.start_line + 1
-            && is_top_inner
+        let effective_start = first_doc_start.unwrap_or(code_pos);
+        let indent = effective_start - line_start;
+        let trimmed = if has_code_here {
+            body_clean[code_pos..line_end_no_cr].trim_start()
+        } else {
+            ""
+        };
+        let is_top_inner = indent <= min_indent;
+        let post_comment_split = after_prior_comment
+            && !is_top_inner
+            && is_unambiguous_post_comment_command(
+                &body_orig[effective_start..],
+                &body_clean[effective_start..],
+                &body_clean[cur_byte_start..effective_start],
+            );
+        let starts_doc = first_doc_start.is_some() && (is_top_inner || after_prior_comment);
+
+        if line_num > body_line_start
+            && (is_top_inner || post_comment_split)
             && (starts_doc || (!trimmed.is_empty() && is_top_level_command_start(trimmed)))
         {
-            let prev_orig = &body_orig[cur_byte_start..cur_byte_end];
-            let prev_clean = &body_clean[cur_byte_start..cur_byte_end];
+            let prev_end = if after_prior_comment {
+                effective_start
+            } else {
+                cur_byte_end
+            };
+            let prev_orig = &body_orig[cur_byte_start..prev_end];
+            let prev_clean = &body_clean[cur_byte_start..prev_end];
             if !is_incomplete_prefix_only_span(prev_orig, prev_clean) {
                 inner_spans.push(CmdSpan {
                     start_line: cur_start_line,
-                    end_line: line_num - 1,
+                    end_line: if after_prior_comment {
+                        line_num
+                    } else {
+                        line_num - 1
+                    },
                     orig_text: prev_orig,
                     clean_text: prev_clean,
                 });
                 cur_start_line = line_num;
-                cur_byte_start = line_start;
+                cur_byte_start = if after_prior_comment {
+                    effective_start
+                } else {
+                    line_start
+                };
             }
         }
 
@@ -2157,11 +2458,35 @@ fn is_pattern_match_arm_at(cmd: &str, pipe_idx: usize) -> bool {
     false
 }
 
-pub(crate) fn extract_shard_stmt_and_proof(src: &str, shard: &TheoremShard) -> (String, String) {
-    if !shard.signature_text.is_empty() && !shard.proof_text.is_empty() {
-        return (shard.signature_text.clone(), shard.proof_text.clone());
+pub(crate) fn extract_shard_orig_decl(src: &str, shard: &TheoremShard) -> String {
+    let clean = strip_lean_comments(src);
+    let spans = parse_command_spans(src, &clean);
+    let mut scope_stack: Vec<ScopeFrame> = Vec::new();
+    for (s_idx, span) in spans.iter().enumerate() {
+        if let Some((_, inner_spans, _)) = split_mutual_block_subspans(span) {
+            for sub in &inner_spans {
+                if sub.start_line == shard.start_line && sub.end_line == shard.end_line {
+                    if let Some((_, name)) = classify_decl_header(sub.clean_text) {
+                        if qualified_decl_name(&name, &scope_stack) == shard.qualified_name
+                            || name == shard.name
+                        {
+                            return sub.orig_text.to_string();
+                        }
+                    }
+                }
+            }
+        } else if span.start_line == shard.start_line && span.end_line == shard.end_line {
+            if let Some((_, name)) = classify_decl_header(span.clean_text) {
+                if qualified_decl_name(&name, &scope_stack) == shard.qualified_name
+                    || name == shard.name
+                {
+                    return span.orig_text.to_string();
+                }
+            }
+        }
+        update_scope_stack_with_idx(&mut scope_stack, span.orig_text, s_idx);
     }
-    let decl_lines = if shard.start_line >= 1 && shard.end_line >= shard.start_line {
+    if shard.start_line >= 1 && shard.end_line >= shard.start_line {
         src.lines()
             .skip(shard.start_line - 1)
             .take(shard.end_line - shard.start_line + 1)
@@ -2169,7 +2494,14 @@ pub(crate) fn extract_shard_stmt_and_proof(src: &str, shard: &TheoremShard) -> (
             .join("\n")
     } else {
         String::new()
-    };
+    }
+}
+
+pub(crate) fn extract_shard_stmt_and_proof(src: &str, shard: &TheoremShard) -> (String, String) {
+    if !shard.signature_text.is_empty() && !shard.proof_text.is_empty() {
+        return (shard.signature_text.clone(), shard.proof_text.clone());
+    }
+    let decl_lines = extract_shard_orig_decl(src, shard);
     if let Some((sig, prf)) =
         split_at_top_level_assign(&decl_lines).or_else(|| decl_lines.split_once(":="))
     {
@@ -2696,8 +3028,12 @@ pub(crate) fn update_scope_stack_with_idx(
 ) {
     let masked = mask_lean_lexemes(orig_chunk, true);
     for (line, orig_line) in masked.lines().zip(orig_chunk.lines()) {
-        let trimmed = line.trim();
-        let orig_trimmed = orig_line.trim();
+        let lead_ws = line.len() - line.trim_start().len();
+        let trimmed = line[lead_ws..].trim_end();
+        let orig_trimmed = orig_line
+            .get(lead_ws..)
+            .unwrap_or_else(|| orig_line.trim_start())
+            .trim_end();
         if let Some(rest) = trimmed.strip_prefix("namespace ") {
             let orig_rest = orig_trimmed.strip_prefix("namespace ").unwrap_or(rest);
             let name = take_leading_lean_ident(orig_rest.trim_start())
@@ -2822,8 +3158,12 @@ fn compute_closed_section_ranges(spans: &[CmdSpan<'_>]) -> Vec<(usize, usize)> {
     for (idx, span) in spans.iter().enumerate() {
         let masked = mask_lean_lexemes(span.orig_text, true);
         for (line, orig_line) in masked.lines().zip(span.orig_text.lines()) {
-            let trimmed = line.trim();
-            let orig_trimmed = orig_line.trim();
+            let lead_ws = line.len() - line.trim_start().len();
+            let trimmed = line[lead_ws..].trim_end();
+            let orig_trimmed = orig_line
+                .get(lead_ws..)
+                .unwrap_or_else(|| orig_line.trim_start())
+                .trim_end();
             if let Some(rest) = trimmed.strip_prefix("namespace ") {
                 let orig_rest = orig_trimmed.strip_prefix("namespace ").unwrap_or(rest);
                 let name = take_leading_lean_ident(orig_rest.trim_start())
@@ -3544,8 +3884,7 @@ fn split_lean_source_inner(
                         Vec::new()
                     };
                     if !omit_shard_source {
-                        let mut inner_skel_parts = Vec::with_capacity(inner_spans.len() + 2);
-                        inner_skel_parts.push(header_orig.to_string());
+                        let mut inner_skel_parts = Vec::with_capacity(inner_spans.len());
                         for sub in &inner_spans {
                             if classify_decl_header(sub.clean_text).is_some() {
                                 if let Some((sig_clean, proof_clean)) =
@@ -3575,8 +3914,14 @@ fn split_lean_source_inner(
                                 )));
                             }
                         }
-                        inner_skel_parts.push(footer_orig.to_string());
-                        span_skel_orig.push(inner_skel_parts.join("\n"));
+                        span_skel_orig.push(join_mutual_parts(
+                            span.start_line,
+                            header_orig,
+                            &inner_spans,
+                            &inner_skel_parts,
+                            footer_orig,
+                            span.end_line,
+                        ));
                     } else if has_closed_sections {
                         for sub in &inner_spans {
                             if classify_decl_header(sub.clean_text).is_some() {
@@ -3685,12 +4030,19 @@ fn split_lean_source_inner(
             };
             let Some(omit_mask) = omit_mask_opt else {
                 let mut prefix_accum = String::new();
-                if !omit_shard_source {
+                if !omit_shard_source && target_idx > 0 {
                     prefix_accum.reserve(src.len());
-                    for skel in span_skel_orig.iter().take(target_idx) {
-                        prefix_accum.push_str(skel);
-                        prefix_accum.push('\n');
+                    for (i, skel) in span_skel_orig.iter().take(target_idx).enumerate() {
+                        let prev_end = i.checked_sub(1).map(|p| spans[p].end_line);
+                        push_joined_span(&mut prefix_accum, prev_end, &spans[i], skel);
                     }
+                    prefix_accum.push(
+                        if spans[target_idx - 1].end_line == spans[target_idx].start_line {
+                            ' '
+                        } else {
+                            '\n'
+                        },
+                    );
                 }
                 let h = inc_hasher.clone();
                 return (h.finalize().to_hex().to_string(), prefix_accum, None);
@@ -3708,9 +4060,14 @@ fn split_lean_source_inner(
             for i in 0..target_idx {
                 if omit_mask[i] {
                     if !omit_shard_source {
-                        for _ in 0..=spans[i].orig_text.matches('\n').count() {
-                            prefix_accum.push('\n');
-                        }
+                        let prev_end = i.checked_sub(1).map(|p| spans[p].end_line);
+                        let next_start = spans.get(i + 1).map(|n| n.start_line);
+                        push_omitted_span_newlines(
+                            &mut prefix_accum,
+                            prev_end,
+                            &spans[i],
+                            next_start,
+                        );
                     }
                     continue;
                 }
@@ -3719,7 +4076,16 @@ fn split_lean_source_inner(
                     hasher.update(norm_line.as_bytes());
                 }
                 if !omit_shard_source {
-                    prefix_accum.push_str(&span_skel_orig[i]);
+                    let prev_end = i.checked_sub(1).map(|p| spans[p].end_line);
+                    push_joined_span(&mut prefix_accum, prev_end, &spans[i], &span_skel_orig[i]);
+                }
+            }
+            if !omit_shard_source && target_idx > 0 {
+                if !omit_mask[target_idx - 1]
+                    && spans[target_idx - 1].end_line == spans[target_idx].start_line
+                {
+                    prefix_accum.push(' ');
+                } else {
                     prefix_accum.push('\n');
                 }
             }
@@ -4244,17 +4610,22 @@ fn format_stubbed_decl_span(orig_text: &str, sig_clean: &str, proof_clean: &str)
 /// making earlier theorem proofs irrelevant, as in normal isolated shard checks.
 fn stub_identity_probe_src(src: &str) -> String {
     let clean = strip_lean_comments(src);
-    parse_command_spans(src, &clean)
+    let spans = parse_command_spans(src, &clean);
+    let texts: Vec<String> = spans
         .iter()
         .map(|span| {
             if let Some((header, inner, footer)) = split_mutual_block_subspans(span) {
-                return format!(
-                    "{header}\n{}\n{footer}",
-                    inner
-                        .iter()
-                        .map(|s| stub_identity_probe_src(s.orig_text))
-                        .collect::<Vec<_>>()
-                        .join("\n")
+                let inner_texts: Vec<String> = inner
+                    .iter()
+                    .map(|s| stub_identity_probe_src(s.orig_text))
+                    .collect();
+                return join_mutual_parts(
+                    span.start_line,
+                    header,
+                    &inner,
+                    &inner_texts,
+                    footer,
+                    span.end_line,
                 );
             }
             if classify_decl_header(span.clean_text).is_some() {
@@ -4264,14 +4635,15 @@ fn stub_identity_probe_src(src: &str) -> String {
             }
             sanitize_stubbed_prefix_options(span.orig_text)
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect();
+    join_span_texts(&spans, &texts)
 }
 
 pub(crate) fn declaration_identity_prefix(src: &str, start_line: usize) -> String {
     let clean = strip_lean_comments(src);
     let spans = parse_command_spans(src, &clean);
-    let mut prefix = Vec::new();
+    let mut prefix = String::new();
+    let mut prev_end_line = None;
     for span in &spans {
         if span.start_line >= start_line {
             break;
@@ -4281,14 +4653,26 @@ pub(crate) fn declaration_identity_prefix(src: &str, start_line: usize) -> Strin
             // only this unfinished group so the independent probe is a command.
             if let Some((_, inner, _)) = split_mutual_block_subspans(span) {
                 for sub in inner.iter().take_while(|s| s.start_line < start_line) {
-                    prefix.push(stub_identity_probe_src(sub.orig_text));
+                    push_joined_span(
+                        &mut prefix,
+                        prev_end_line,
+                        sub,
+                        &stub_identity_probe_src(sub.orig_text),
+                    );
+                    prev_end_line = Some(sub.end_line);
                 }
             }
             break;
         }
-        prefix.push(stub_identity_probe_src(span.orig_text));
+        push_joined_span(
+            &mut prefix,
+            prev_end_line,
+            span,
+            &stub_identity_probe_src(span.orig_text),
+        );
+        prev_end_line = Some(span.end_line);
     }
-    prefix.join("\n")
+    prefix
 }
 
 /// Build one full-file stubbed identity probe source (`:= sorry` with exact newline preservation)
@@ -4360,14 +4744,25 @@ pub fn reconstruct_prefix_and_closers_for_decl(
     let mut scope_stack: Vec<ScopeFrame> = Vec::new();
     for (idx, span) in spans[..t_idx].iter().enumerate() {
         update_scope_stack_with_idx(&mut scope_stack, span.orig_text, idx);
+        let prev_end = idx.checked_sub(1).map(|p| spans[p].end_line);
         if omit_mask[idx] {
-            for _ in 0..=span.orig_text.matches('\n').count() {
-                prefix_skeleton_accum.push('\n');
-            }
+            let next_start = spans.get(idx + 1).map(|n| n.start_line);
+            push_omitted_span_newlines(&mut prefix_skeleton_accum, prev_end, span, next_start);
             continue;
         }
-        prefix_skeleton_accum.push_str(&stub_identity_probe_src(span.orig_text));
-        prefix_skeleton_accum.push('\n');
+        push_joined_span(
+            &mut prefix_skeleton_accum,
+            prev_end,
+            span,
+            &stub_identity_probe_src(span.orig_text),
+        );
+    }
+    if t_idx > 0 {
+        if !omit_mask[t_idx - 1] && spans[t_idx - 1].end_line == spans[t_idx].start_line {
+            prefix_skeleton_accum.push(' ');
+        } else {
+            prefix_skeleton_accum.push('\n');
+        }
     }
     let closing_scopes = format_closing_scopes(&scope_stack);
     let qual_refute = qualified_decl_name(short_refute_name, &scope_stack);
@@ -4401,10 +4796,10 @@ pub fn reconstruct_single_shard_source(
 
     for (idx, span) in spans[..t_idx].iter().enumerate() {
         update_scope_stack_with_idx(&mut scope_stack, span.orig_text, idx);
+        let prev_end = idx.checked_sub(1).map(|p| spans[p].end_line);
         if omit_mask[idx] {
-            for _ in 0..=span.orig_text.matches('\n').count() {
-                prefix_skeleton_accum.push('\n');
-            }
+            let next_start = spans.get(idx + 1).map(|n| n.start_line);
+            push_omitted_span_newlines(&mut prefix_skeleton_accum, prev_end, span, next_start);
             continue;
         }
         if let Some((header_orig, inner_spans, footer_orig)) = split_mutual_block_subspans(span) {
@@ -4413,43 +4808,54 @@ pub fn reconstruct_single_shard_source(
                     && split_at_top_level_assign(sub.clean_text).is_some()
             });
             if has_inner_thm {
-                prefix_skeleton_accum.push_str(header_orig);
-                prefix_skeleton_accum.push('\n');
+                let mut inner_texts = Vec::with_capacity(inner_spans.len());
                 for sub in &inner_spans {
                     if classify_decl_header(sub.clean_text).is_some() {
                         if let Some((sig_clean, proof_clean)) =
                             split_at_top_level_assign(sub.clean_text)
                         {
-                            prefix_skeleton_accum.push_str(&format_stubbed_decl_span(
+                            inner_texts.push(format_stubbed_decl_span(
                                 sub.orig_text,
                                 sig_clean,
                                 proof_clean,
                             ));
-                            prefix_skeleton_accum.push('\n');
                             continue;
                         }
                     }
-                    prefix_skeleton_accum.push_str(sub.orig_text);
-                    prefix_skeleton_accum.push('\n');
+                    inner_texts.push(sub.orig_text.to_string());
                 }
-                prefix_skeleton_accum.push_str(footer_orig);
-                prefix_skeleton_accum.push('\n');
+                let joined_mut = join_mutual_parts(
+                    span.start_line,
+                    header_orig,
+                    &inner_spans,
+                    &inner_texts,
+                    footer_orig,
+                    span.end_line,
+                );
+                push_joined_span(&mut prefix_skeleton_accum, prev_end, span, &joined_mut);
                 continue;
             }
         }
         if classify_decl_header(span.clean_text).is_some() {
             if let Some((sig_clean, proof_clean)) = split_at_top_level_assign(span.clean_text) {
-                prefix_skeleton_accum.push_str(&format_stubbed_decl_span(
-                    span.orig_text,
-                    sig_clean,
-                    proof_clean,
-                ));
-                prefix_skeleton_accum.push('\n');
+                let stub = format_stubbed_decl_span(span.orig_text, sig_clean, proof_clean);
+                push_joined_span(&mut prefix_skeleton_accum, prev_end, span, &stub);
                 continue;
             }
         }
-        prefix_skeleton_accum.push_str(&sanitize_stubbed_prefix_options(span.orig_text));
-        prefix_skeleton_accum.push('\n');
+        push_joined_span(
+            &mut prefix_skeleton_accum,
+            prev_end,
+            span,
+            &sanitize_stubbed_prefix_options(span.orig_text),
+        );
+    }
+    if t_idx > 0 {
+        if !omit_mask[t_idx - 1] && spans[t_idx - 1].end_line == spans[t_idx].start_line {
+            prefix_skeleton_accum.push(' ');
+        } else {
+            prefix_skeleton_accum.push('\n');
+        }
     }
 
     let closing_scopes = format_closing_scopes(&scope_stack);
@@ -4814,7 +5220,8 @@ pub fn build_coalesced_shard_source(
             .is_some_and(|orig| matches_uncached_name(orig, uncached_names))
     };
 
-    let mut chunks = Vec::with_capacity(spans.len());
+    let mut out = String::with_capacity(src.len());
+    let mut prev_end_line = None;
     let mut scope_stack: Vec<ScopeFrame> = Vec::new();
     for (s_idx, span) in spans.iter().enumerate() {
         if let Some((header_orig, inner_spans, footer_orig)) = split_mutual_block_subspans(span) {
@@ -4823,8 +5230,7 @@ pub fn build_coalesced_shard_source(
                     && split_at_top_level_assign(sub.clean_text).is_some()
             });
             if has_inner_thm {
-                let mut inner_chunks = Vec::with_capacity(inner_spans.len() + 2);
-                inner_chunks.push(header_orig.to_string());
+                let mut inner_chunks = Vec::with_capacity(inner_spans.len());
                 for sub in &inner_spans {
                     if let Some((_kind, name)) = classify_decl_header(sub.clean_text) {
                         let qname = qualified_decl_name(&name, &scope_stack);
@@ -4843,8 +5249,16 @@ pub fn build_coalesced_shard_source(
                     }
                     inner_chunks.push(sub.orig_text.to_string());
                 }
-                inner_chunks.push(footer_orig.to_string());
-                chunks.push(inner_chunks.join("\n"));
+                let joined_mut = join_mutual_parts(
+                    span.start_line,
+                    header_orig,
+                    &inner_spans,
+                    &inner_chunks,
+                    footer_orig,
+                    span.end_line,
+                );
+                push_joined_span(&mut out, prev_end_line, span, &joined_mut);
+                prev_end_line = Some(span.end_line);
                 update_scope_stack_with_idx(&mut scope_stack, span.orig_text, s_idx);
                 continue;
             }
@@ -4858,21 +5272,25 @@ pub fn build_coalesced_shard_source(
                     continue;
                 }
                 if let Some((sig_clean, proof_clean)) = split_at_top_level_assign(span.clean_text) {
-                    chunks.push(format_stubbed_decl_span(
-                        span.orig_text,
-                        sig_clean,
-                        proof_clean,
-                    ));
+                    let stub = format_stubbed_decl_span(span.orig_text, sig_clean, proof_clean);
+                    push_joined_span(&mut out, prev_end_line, span, &stub);
+                    prev_end_line = Some(span.end_line);
                     update_scope_stack_with_idx(&mut scope_stack, span.orig_text, s_idx);
                     continue;
                 }
             }
         }
-        chunks.push(sanitize_stubbed_prefix_options(span.orig_text));
+        push_joined_span(
+            &mut out,
+            prev_end_line,
+            span,
+            &sanitize_stubbed_prefix_options(span.orig_text),
+        );
+        prev_end_line = Some(span.end_line);
         update_scope_stack_with_idx(&mut scope_stack, span.orig_text, s_idx);
     }
 
-    chunks.join("\n")
+    out
 }
 
 fn contains_local_decl_ref(haystack: &str, short: &str, full_name: &str) -> bool {
@@ -5431,8 +5849,7 @@ pub fn build_fast_olean_shard_source_with_split(
                         .unwrap_or(false)
                 });
                 if any_uncached {
-                    let mut inner_chunks = Vec::with_capacity(inner_spans.len() + 2);
-                    inner_chunks.push(header_orig.to_string());
+                    let mut inner_chunks = Vec::with_capacity(inner_spans.len());
                     for sub in &inner_spans {
                         if let Some((_kind, name)) = classify_decl_header(sub.clean_text) {
                             if split_at_top_level_assign(sub.clean_text).is_some() {
@@ -5454,8 +5871,14 @@ pub fn build_fast_olean_shard_source_with_split(
                         }
                         inner_chunks.push(sub.orig_text.to_string());
                     }
-                    inner_chunks.push(footer_orig.to_string());
-                    chunks.push(inner_chunks.join("\n"));
+                    chunks.push(join_mutual_parts(
+                        span.start_line,
+                        header_orig,
+                        &inner_spans,
+                        &inner_chunks,
+                        footer_orig,
+                        span.end_line,
+                    ));
                 } else {
                     for sub in &inner_spans {
                         if classify_decl_header(sub.clean_text).is_some()
@@ -5583,13 +6006,18 @@ pub fn build_pruned_imports_shard_source(
         find_last_matching_span_idx(&spans, |n| matches_uncached_name(n, uncached_names))?;
     let omit_mask = compute_omitted_closed_section_spans(&spans, &closed_sections, last_span_idx);
 
-    let mut out_chunks = Vec::with_capacity(last_span_idx + 2);
+    let mut out = String::with_capacity(src.len());
     let mut scope_stack: Vec<ScopeFrame> = Vec::new();
     let mut pruned_imports = 0usize;
 
     for (s_idx, span) in spans[..=last_span_idx].iter().enumerate() {
+        let prev_end = s_idx.checked_sub(1).map(|p| spans[p].end_line);
         if omit_mask[s_idx] {
-            out_chunks.push("\n".repeat(span.orig_text.matches('\n').count()));
+            let next_start = spans
+                .get(s_idx + 1)
+                .filter(|_| s_idx < last_span_idx)
+                .map(|n| n.start_line);
+            push_omitted_span_newlines(&mut out, prev_end, span, next_start);
             continue;
         }
         let trimmed_clean = span.clean_text.trim();
@@ -5604,7 +6032,7 @@ pub fn build_pruned_imports_shard_source(
                     kept_lines.push(line);
                 }
             }
-            out_chunks.push(kept_lines.join("\n"));
+            push_joined_span(&mut out, prev_end, span, &kept_lines.join("\n"));
             continue;
         }
 
@@ -5625,16 +6053,13 @@ pub fn build_pruned_imports_shard_source(
                     } else {
                         span.orig_text.to_string()
                     };
-                    out_chunks.push(adapted_decl);
+                    push_joined_span(&mut out, prev_end, span, &adapted_decl);
                 } else {
                     if contains_mathlib_tactic_or_namespace(sig_clean) {
                         return None;
                     }
-                    out_chunks.push(format_stubbed_decl_span(
-                        span.orig_text,
-                        sig_clean,
-                        proof_clean,
-                    ));
+                    let stub = format_stubbed_decl_span(span.orig_text, sig_clean, proof_clean);
+                    push_joined_span(&mut out, prev_end, span, &stub);
                 }
                 update_scope_stack_with_idx(&mut scope_stack, span.orig_text, s_idx);
                 continue;
@@ -5644,7 +6069,7 @@ pub fn build_pruned_imports_shard_source(
         if contains_mathlib_tactic_or_namespace(span.clean_text) {
             return None;
         }
-        out_chunks.push(span.orig_text.to_string());
+        push_joined_span(&mut out, prev_end, span, span.orig_text);
         update_scope_stack_with_idx(&mut scope_stack, span.orig_text, s_idx);
     }
 
@@ -5654,10 +6079,13 @@ pub fn build_pruned_imports_shard_source(
 
     let closing = format_closing_scopes(&scope_stack);
     if !closing.is_empty() {
-        out_chunks.push(closing);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&closing);
     }
 
-    Some(out_chunks.join("\n"))
+    Some(out)
 }
 
 /// Check whether `src` and `uncached_names` are eligible for fast `.olean` import
@@ -8365,43 +8793,57 @@ fn unwrap_span_for_mutual_subspans<'a>(span: &CmdSpan<'a>) -> Option<CmdSpan<'a>
 fn has_unrecognized_command_indent_line<'a>(spans: &[CmdSpan<'a>]) -> bool {
     let check_span = |span: &CmdSpan<'a>| -> bool {
         let span_src = span.orig_text;
+        let span_clean = span.clean_text;
+        if span_src.len() != span_clean.len() {
+            return true;
+        }
+        let bytes = span_src.as_bytes();
+        let total_len = bytes.len();
         let mut lexical_cursor = 0usize;
         let mut non_code_end = 0usize;
+        let mut in_comment = false;
         let mut first_non_empty_idx: Option<usize> = None;
         let mut base_indent = 0usize;
-        let mut line_byte_start = 0usize;
-        for (idx, (orig_line, clean_line)) in
-            span_src.lines().zip(span.clean_text.lines()).enumerate()
-        {
-            let trimmed_clean = clean_line.trim_start();
-            let trimmed_orig = orig_line.trim_start();
-            let orig_token_start = line_byte_start + orig_line.len() - trimmed_orig.len();
-            let token_start = line_byte_start + clean_line.len() - trimmed_clean.len();
-            while lexical_cursor < orig_token_start {
-                if let Some(lex_span) = skip_lean_lexeme(span_src, lexical_cursor) {
-                    if lex_span.is_literal || lex_span.is_comment {
-                        non_code_end = lex_span.end;
-                    }
-                    lexical_cursor = lex_span.end;
-                } else {
-                    lexical_cursor += span_src[lexical_cursor..]
-                        .chars()
-                        .next()
-                        .map_or(1, char::len_utf8);
-                }
+        let mut pos = 0usize;
+        let mut idx = 0usize;
+        while pos < total_len {
+            let line_start = pos;
+            let mut line_end = pos;
+            while line_end < total_len && bytes[line_end] != b'\n' {
+                line_end += 1;
             }
-            let orig_in_prior_non_code = orig_token_start < non_code_end;
-            let starts_doc_here = !orig_in_prior_non_code
-                && matches!(
-                    scan_lean_block_comment_end(trimmed_orig, 0),
-                    Some((_, true))
+            let next_pos = if line_end < total_len {
+                line_end + 1
+            } else {
+                total_len
+            };
+            let line_end_no_cr = if line_end > line_start && bytes[line_end - 1] == b'\r' {
+                line_end - 1
+            } else {
+                line_end
+            };
+
+            let (first_doc_start, has_code_here, after_prior_comment) =
+                scan_line_leading_code_offset(
+                    span_src,
+                    line_end_no_cr,
+                    &mut lexical_cursor,
+                    &mut non_code_end,
+                    &mut in_comment,
                 );
-            while lexical_cursor < token_start {
+            let code_pos = lexical_cursor;
+            while lexical_cursor < next_pos {
+                if lexical_cursor < non_code_end {
+                    lexical_cursor = non_code_end.min(next_pos);
+                    continue;
+                }
+                in_comment = false;
                 if let Some(lex_span) = skip_lean_lexeme(span_src, lexical_cursor) {
                     if lex_span.is_literal || lex_span.is_comment {
                         non_code_end = lex_span.end;
+                        in_comment = lex_span.is_comment;
                     }
-                    lexical_cursor = lex_span.end;
+                    lexical_cursor = lex_span.end.min(next_pos);
                 } else {
                     lexical_cursor += span_src[lexical_cursor..]
                         .chars()
@@ -8409,43 +8851,56 @@ fn has_unrecognized_command_indent_line<'a>(spans: &[CmdSpan<'a>]) -> bool {
                         .map_or(1, char::len_utf8);
                 }
             }
-            line_byte_start += orig_line.len() + 1;
-            if orig_in_prior_non_code || (!starts_doc_here && token_start < non_code_end) {
+            if first_doc_start.is_none() && !has_code_here {
+                pos = next_pos;
+                idx += 1;
                 continue;
             }
-            if trimmed_clean.is_empty() && trimmed_orig.is_empty() {
-                continue;
-            }
+
+            let effective_start = first_doc_start.unwrap_or(code_pos);
+            let indent = if after_prior_comment
+                && span_src[line_start..effective_start]
+                    .bytes()
+                    .next()
+                    .is_some_and(|b| b != b' ' && b != b'\t')
+            {
+                0
+            } else {
+                effective_start - line_start
+            };
+            let trimmed_clean = if has_code_here {
+                span_clean[code_pos..line_end_no_cr].trim_start()
+            } else {
+                ""
+            };
             if first_non_empty_idx.is_none() {
                 first_non_empty_idx = Some(idx);
-                base_indent = orig_line.len() - trimmed_orig.len();
-                if !trimmed_clean.is_empty() && !is_top_level_command_start(trimmed_clean) {
-                    let starts_doc = matches!(
-                        scan_lean_block_comment_end(trimmed_orig, 0),
-                        Some((_, true))
-                    );
-                    if !starts_doc {
-                        return true;
-                    }
+                base_indent = indent;
+                if first_doc_start.is_none()
+                    && !trimmed_clean.is_empty()
+                    && !is_top_level_command_start(trimmed_clean)
+                {
+                    return true;
                 }
+                pos = next_pos;
+                idx += 1;
                 continue;
             }
-            if trimmed_clean.is_empty() {
+            if trimmed_clean.is_empty() && first_doc_start.is_none() {
+                pos = next_pos;
+                idx += 1;
                 continue;
             }
-            let indent = orig_line.len() - trimmed_orig.len();
             if indent <= base_indent {
-                let prev_clean = span
-                    .clean_text
-                    .lines()
-                    .take(idx)
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let prev_orig = span_src.lines().take(idx).collect::<Vec<_>>().join("\n");
-                if is_incomplete_prefix_only_span(&prev_orig, &prev_clean) {
-                    if !is_top_level_command_start(trimmed_clean) {
+                let prev_end = line_start.saturating_sub(usize::from(line_start > 0));
+                let prev_clean = &span_clean[..prev_end];
+                let prev_orig = &span_src[..prev_end];
+                if is_incomplete_prefix_only_span(prev_orig, prev_clean) {
+                    if first_doc_start.is_none() && !is_top_level_command_start(trimmed_clean) {
                         return true;
                     }
+                    pos = next_pos;
+                    idx += 1;
                     continue;
                 }
                 let prev_unwrapped = unwrap_scope_line_wrappers(prev_clean.trim());
@@ -8455,6 +8910,8 @@ fn has_unrecognized_command_indent_line<'a>(spans: &[CmdSpan<'a>]) -> bool {
                     || unwrap_end_line_wrappers(prev_clean.trim()) == "end")
                     && take_leading_lean_ident(trimmed_clean).is_some();
                 if is_split_scope_ident {
+                    pos = next_pos;
+                    idx += 1;
                     continue;
                 }
                 if trimmed_clean.starts_with("| ")
@@ -8471,10 +8928,14 @@ fn has_unrecognized_command_indent_line<'a>(spans: &[CmdSpan<'a>]) -> bool {
                     || trimmed_clean == "}"
                     || trimmed_clean.starts_with("} ")
                 {
+                    pos = next_pos;
+                    idx += 1;
                     continue;
                 }
                 return true;
             }
+            pos = next_pos;
+            idx += 1;
         }
         false
     };
@@ -12808,6 +13269,179 @@ public def api := by
         assert!(top_doc_split.shards[1]
             .shard_source
             .contains("/-- second doc -/"));
+    }
+
+    #[test]
+    fn test_command_after_multiline_comment_close_not_merged_or_lost() {
+        let src = "def x := 0\n/- comment\n-/ theorem lost : True := trivial\ntheorem visible : True := trivial\n";
+        let split = split_lean_source(src, &[]);
+        assert_eq!(
+            split
+                .shards
+                .iter()
+                .map(|s| s.decl_name())
+                .collect::<Vec<_>>(),
+            vec!["lost", "visible"]
+        );
+        assert_eq!(
+            (split.shards[0].start_line, split.shards[0].end_line),
+            (3, 3)
+        );
+        assert_eq!(
+            (split.shards[1].start_line, split.shards[1].end_line),
+            (4, 4)
+        );
+        assert!(!split.shards[0].signature_text.contains("-/"));
+        assert_eq!(
+            reconstruct_single_shard_source(src, "lost")
+                .unwrap()
+                .unwrap()
+                .trim_end(),
+            "def x := 0\n/- comment\n-/  theorem lost : True := trivial"
+        );
+        assert_eq!(
+            extract_shard_orig_decl(src, &split.shards[0]),
+            "theorem lost : True := trivial"
+        );
+
+        let pubsig = extract_public_signature(src);
+        let pub_names: Vec<&str> = pubsig
+            .declarations
+            .iter()
+            .map(|d| d.const_name.as_str())
+            .collect();
+        assert_eq!(pub_names, vec!["x", "lost", "visible"]);
+
+        let (probe, offset) = build_file_identity_probe(src);
+        let probe_lines: Vec<&str> = probe.lines().collect();
+        assert!(
+            probe_lines[3 - 1 + offset].contains("theorem lost")
+                && probe_lines[4 - 1 + offset].contains("theorem visible"),
+            "probe must preserve exact line numbers: {probe:?}"
+        );
+
+        // Indented `-/` and docstrings/attributes following `-/` on the same line
+        let indented_src = "namespace PostComment\ndef x := 0\n  /- block\n  -/ /-- doc on lost -/\ntheorem lost : True := trivial\n  /- block2\n  -/ @[simp] theorem simp_after : True := trivial\n/- close ns\n-/ end PostComment\n";
+        let ind_split = split_lean_source(indented_src, &[]);
+        assert_eq!(
+            ind_split
+                .shards
+                .iter()
+                .map(|s| s.decl_name())
+                .collect::<Vec<_>>(),
+            vec!["PostComment.lost", "PostComment.simp_after"]
+        );
+        assert!(ind_split.shards[0]
+            .shard_source
+            .contains("/-- doc on lost -/"));
+        assert!(ind_split.shards[0]
+            .shard_source
+            .trim_end()
+            .ends_with("end PostComment"));
+        let ind_pub = extract_public_signature(indented_src);
+        assert_eq!(
+            ind_pub
+                .declarations
+                .iter()
+                .map(|d| d.const_name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "PostComment.x",
+                "PostComment.lost",
+                "PostComment.simp_after"
+            ]
+        );
+
+        // `mutual` block inner declarations & closing `end` after `-/`
+        let mutual_src = "mutual\n  theorem m1 : True := trivial\n  /- inner comment\n  -/ theorem m2 : True := m1\n  /- before end\n  -/ end\n";
+        let mut_split = split_lean_source(mutual_src, &[]);
+        assert_eq!(
+            mut_split
+                .shards
+                .iter()
+                .map(|s| s.decl_name())
+                .collect::<Vec<_>>(),
+            vec!["m1", "m2"]
+        );
+        assert_eq!(
+            extract_public_signature(mutual_src)
+                .declarations
+                .iter()
+                .map(|d| d.const_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["m1", "m2"]
+        );
+
+        // `has_unrecognized_command_indent_line`: unrecognized command after `-/` at column 0
+        // inside a `module` file must trigger conservative fallback instead of being ignored.
+        let custom_cmd_mod_a =
+            "module\npublic def base : Nat := 1\n/- c\n-/ my_custom_elab foo_v1\n";
+        let custom_cmd_mod_b =
+            "module\npublic def base : Nat := 1\n/- c\n-/ my_custom_elab foo_v2\n";
+        assert_ne!(
+            extract_public_signature(custom_cmd_mod_a).public_signature_digest,
+            extract_public_signature(custom_cmd_mod_b).public_signature_digest,
+            "unrecognized top-level command after `-/` must invalidate public_signature_digest"
+        );
+
+        // Continuation expression after indented `-/` (`def cont : Nat :=\n  /- c\n  -/ 42`)
+        // must NOT trigger `has_unrecognized_command_indent_line` fallback.
+        let cont_src = "module\npublic def cont : Nat :=\n  /- comment\n  -/ 42\n";
+        let cont_pub = extract_public_signature(cont_src);
+        assert!(
+            !cont_pub
+                .public_signature_digest
+                .starts_with("pubsig-custom-cmd:"),
+            "indented continuation after `-/` must not trigger custom-cmd fallback: {}",
+            cont_pub.public_signature_digest
+        );
+        assert_eq!(
+            cont_pub
+                .declarations
+                .iter()
+                .map(|d| d.const_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cont"]
+        );
+
+        // False-positive guards: structure fields, `deriving` clauses, unclosed delimiters,
+        // unfinished `:=`/`by`, and explicit `@id` applications after `-/` must NOT split.
+        let guard_src = "\
+structure S where
+  x : Nat
+  /- field comment
+  -/ private y : Nat
+  /- deriving comment
+  -/ deriving Repr
+def appTest (x : Nat) : Nat :=
+  /- explicit app comment
+  -/ @id Nat x
+def parenTest (x : Nat) : Nat := (
+  x +
+  /- inside parens
+  -/ private_helper
+) where
+  private_helper := 1
+theorem kept : True := trivial
+";
+        let guard_split = split_lean_source(guard_src, &[]);
+        assert_eq!(
+            guard_split
+                .shards
+                .iter()
+                .map(|s| s.decl_name())
+                .collect::<Vec<_>>(),
+            vec!["kept"]
+        );
+        let guard_pub = extract_public_signature(guard_src);
+        assert_eq!(
+            guard_pub
+                .declarations
+                .iter()
+                .map(|d| d.const_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["S", "appTest", "parenTest", "kept"]
+        );
     }
 }
 

@@ -9030,6 +9030,7 @@ mod tests {
             (Some(true), Some("pong"))
         );
         let _ = query_lean_native_core_worker("validate-tv", None);
+        let _ = query_lean_native_core_worker("eval-cex", None);
 
         let methods = ["ping", "validate-tv", "verify-certs", "eval-cex"];
         let t0 = std::time::Instant::now();
