@@ -2126,15 +2126,30 @@ impl AuditSpecPolicyConfig {
 }
 
 fn segment_glob_match(pat: &str, seg: &str) -> bool {
-    match pat.split_once('*') {
-        None => pat == seg,
-        Some((head, rest)) => {
-            seg.starts_with(head)
-                && (0..=seg.len() - head.len())
-                    .filter(|i| seg.is_char_boundary(head.len() + i))
-                    .any(|i| segment_glob_match(rest, &seg[head.len() + i..]))
+    let s: Vec<char> = seg.chars().collect();
+    let p: Vec<char> = pat.chars().collect();
+    let (mut si, mut pi) = (0usize, 0usize);
+    let (mut star_pi, mut star_si) = (None::<usize>, 0usize);
+    while si < s.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == s[si]) {
+            si += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = Some(pi);
+            pi += 1;
+            star_si = si;
+        } else if let Some(sp) = star_pi {
+            pi = sp + 1;
+            star_si += 1;
+            si = star_si;
+        } else {
+            return false;
         }
     }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 fn match_audit_glob_segments(pat_segs: &[&str], path_segs: &[&str]) -> bool {
@@ -2171,12 +2186,18 @@ pub(super) fn path_matches_audit_glob(path_str: &str, glob_pat: &str) -> bool {
     }
     let path_norm = path_str.replace('\\', "/");
     let path_trimmed = path_norm.trim_start_matches("./");
-    let path_segs: Vec<&str> = path_trimmed.split('/').filter(|s| !s.is_empty()).collect();
+    let path_segs: Vec<&str> = path_trimmed
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
     if pat == "*" {
         return path_segs.len() <= 1;
     }
-    let pat_segs: Vec<&str> = pat.split('/').filter(|s| !s.is_empty()).collect();
-    if pat_segs.is_empty() {
+    let pat_segs: Vec<&str> = pat
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
+    if pat_segs.is_empty() || pat_segs.iter().all(|s| *s == "**") {
         return true;
     }
     if pat.starts_with('/') {
@@ -3225,7 +3246,7 @@ pub(super) fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<Ex
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 19;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 20;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -3278,6 +3299,16 @@ fn ensure_private_cache_dir(dir: &Path) -> std::io::Result<PathBuf> {
             }
         }
         let euid = unsafe { libc::geteuid() };
+        let root_meta = fs::symlink_metadata("/")?;
+        if !root_meta.is_dir()
+            || (root_meta.uid() != 0 && root_meta.uid() != euid)
+            || (root_meta.mode() & 0o022 != 0 && root_meta.mode() & 0o1000 == 0)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "root directory failed ownership/mode check",
+            ));
+        }
         let mut cur = PathBuf::from("/");
         let mut created_any = false;
         let components: Vec<_> = norm
@@ -3287,6 +3318,12 @@ fn ensure_private_cache_dir(dir: &Path) -> std::io::Result<PathBuf> {
                 _ => None,
             })
             .collect();
+        if components.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "audit-spec cache directory cannot be `/`",
+            ));
+        }
         for (idx, seg) in components.iter().enumerate() {
             cur.push(seg);
             let is_leaf = idx + 1 == components.len();
@@ -3296,47 +3333,72 @@ fn ensure_private_cache_dir(dir: &Path) -> std::io::Result<PathBuf> {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             format!(
-                                "audit-spec cache ancestor `{}` must be a real directory (not a symlink)",
+                                "audit-spec cache path `{}` must be a real directory (not a symlink)",
                                 cur.display()
                             ),
                         ));
                     }
-                    if (created_any || is_leaf) && meta.uid() != euid {
+                    if created_any || is_leaf {
+                        if meta.uid() != euid || (meta.mode() & 0o077) != 0 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::PermissionDenied,
+                                format!(
+                                    "audit-spec cache directory `{}` must be owned by uid {} with 0700 permissions",
+                                    cur.display(),
+                                    euid
+                                ),
+                            ));
+                        }
+                    } else if (meta.uid() != 0 && meta.uid() != euid)
+                        || (meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0)
+                    {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::PermissionDenied,
                             format!(
-                                "audit-spec cache directory `{}` uid {} does not match euid {}",
-                                cur.display(),
-                                meta.uid(),
-                                euid
+                                "audit-spec cache ancestor `{}` has unsafe ownership or writable permissions",
+                                cur.display()
                             ),
                         ));
-                    }
-                    if (created_any || is_leaf) && (meta.mode() & 0o077) != 0 {
-                        fs::set_permissions(&cur, fs::Permissions::from_mode(0o700))?;
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     created_any = true;
                     let mut builder = fs::DirBuilder::new();
                     builder.mode(0o700);
-                    if let Err(ce) = builder.create(&cur) {
-                        if ce.kind() != std::io::ErrorKind::AlreadyExists {
-                            return Err(ce);
+                    match builder.create(&cur) {
+                        Ok(()) => {
+                            let meta = fs::symlink_metadata(&cur)?;
+                            if meta.file_type().is_symlink() || !meta.is_dir() || meta.uid() != euid
+                            {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    format!(
+                                        "audit-spec cache directory `{}` failed post-create ownership/symlink validation",
+                                        cur.display()
+                                    ),
+                                ));
+                            }
+                            if (meta.mode() & 0o077) != 0 {
+                                fs::set_permissions(&cur, fs::Permissions::from_mode(0o700))?;
+                            }
                         }
-                    }
-                    let meta = fs::symlink_metadata(&cur)?;
-                    if meta.file_type().is_symlink() || !meta.is_dir() || meta.uid() != euid {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            format!(
-                                "audit-spec cache directory `{}` failed post-create ownership/symlink validation",
-                                cur.display()
-                            ),
-                        ));
-                    }
-                    if (meta.mode() & 0o077) != 0 {
-                        fs::set_permissions(&cur, fs::Permissions::from_mode(0o700))?;
+                        Err(ce) if ce.kind() == std::io::ErrorKind::AlreadyExists => {
+                            let meta = fs::symlink_metadata(&cur)?;
+                            if meta.file_type().is_symlink()
+                                || !meta.is_dir()
+                                || meta.uid() != euid
+                                || (meta.mode() & 0o077) != 0
+                            {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::PermissionDenied,
+                                    format!(
+                                        "audit-spec cache directory `{}` failed raced-create validation",
+                                        cur.display()
+                                    ),
+                                ));
+                            }
+                        }
+                        Err(ce) => return Err(ce),
                     }
                 }
                 Err(e) => return Err(e),
@@ -3357,8 +3419,11 @@ fn ensure_private_cache_dir(dir: &Path) -> std::io::Result<PathBuf> {
     }
     #[cfg(not(unix))]
     {
-        fs::create_dir_all(dir)?;
-        Ok(dir.to_path_buf())
+        let _ = dir;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "private audit-spec cache requires unix permissions",
+        ))
     }
 }
 
@@ -3373,7 +3438,7 @@ fn read_verified_audit_spec_cache_entry(cache_path: &Path) -> std::io::Result<Ve
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let mut f = opts.open(cache_path)?;
     let meta = f.metadata()?;
@@ -3402,7 +3467,7 @@ fn read_verified_audit_spec_cache_entry(cache_path: &Path) -> std::io::Result<Ve
 pub(super) fn resolve_audit_spec_cache_dir() -> Option<PathBuf> {
     if std::env::var("TURBO_LEAN_NO_AUDIT_CACHE")
         .ok()
-        .is_some_and(|v| matches!(v.trim(), "1" | "true" | "yes"))
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
     {
         return None;
     }
@@ -3413,20 +3478,33 @@ pub(super) fn resolve_audit_spec_cache_dir() -> Option<PathBuf> {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
     };
-    let dir = if let Some(explicit) = non_empty_env("TURBO_LEAN_AUDIT_CACHE_DIR") {
-        explicit
-    } else if let Some(cli_cache) = cli_global_cache_dir_override() {
-        cli_cache.join("audit-spec-cache-v1")
-    } else if let Some(cache_base) = non_empty_env("TURBO_LEAN_CACHE_DIR") {
-        cache_base.join("audit-spec-cache-v1")
-    } else if let Some(home_base) = non_empty_env("TURBO_LEAN_HOME") {
-        home_base.join("audit-spec-cache-v1")
-    } else {
-        let staging = crate::shm_cache::staging_shm_dir();
-        let staging_norm = ensure_private_cache_dir(&staging).ok()?;
-        staging_norm.join("audit-spec-cache-v1")
-    };
-    ensure_private_cache_dir(&dir).ok()
+    if let Some(explicit) = non_empty_env("TURBO_LEAN_AUDIT_CACHE_DIR") {
+        return ensure_private_cache_dir(&explicit).ok();
+    }
+    if let Some(cli_cache) = cli_global_cache_dir_override() {
+        return ensure_private_cache_dir(&cli_cache.join("audit-spec-cache-v1")).ok();
+    }
+    if let Some(cache_base) = non_empty_env("TURBO_LEAN_CACHE_DIR") {
+        return ensure_private_cache_dir(&cache_base.join("audit-spec-cache-v1")).ok();
+    }
+    if let Some(home_base) = non_empty_env("TURBO_LEAN_HOME") {
+        return ensure_private_cache_dir(&home_base.join("audit-spec-cache-v1")).ok();
+    }
+    if let Some(staging_override) = non_empty_env("TURBO_LEAN_STAGING_DIR") {
+        return ensure_private_cache_dir(&staging_override.join("audit-spec-cache-v1")).ok();
+    }
+    let staging = crate::shm_cache::staging_shm_dir().join("audit-spec-cache-v1");
+    if let Ok(valid) = ensure_private_cache_dir(&staging) {
+        return Some(valid);
+    }
+    #[cfg(unix)]
+    let uid = unsafe { libc::geteuid() };
+    #[cfg(not(unix))]
+    let uid = 0u32;
+    ensure_private_cache_dir(
+        &std::env::temp_dir().join(format!("turbo-lean-audit-spec-cache-v1-{uid}")),
+    )
+    .ok()
 }
 
 pub(super) fn collect_external_local_def_lean_paths(src_path: &Path) -> Vec<PathBuf> {
@@ -3507,7 +3585,7 @@ pub(super) fn write_audit_spec_cache_atomic(target: &Path, report: &serde_json::
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect();
-    for _ in 0..8 {
+    for _ in 0..16 {
         let seq = AUDIT_SPEC_CACHE_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp_path = parent_norm.join(format!(
             ".{}.pid{}.{}.{}.tmp",
