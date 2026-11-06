@@ -963,3 +963,260 @@ fn spec_card_rejects_symlinks_unreadable_dirs_and_mixed_policies() {
     assert_eq!(mixed_rep["ok"], false);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn spec_card_carbon_repros_fail_closed() {
+    let dir = fixture("carbon");
+    let cases: [(&str, &str, &[&str]); 11] = [
+        (
+            "AtIn.lean",
+            r#"
+def harmless : Type :=
+  @Unit in variable [Nonempty False] in
+theorem exploit_at_in (n : Nat) (_hn : n < 2) : n = 999 := by
+  exact False.elim (Classical.choice inferInstance)
+"#,
+            &["exploit_at_in"],
+        ),
+        (
+            "DoubleParen.lean",
+            r#"
+theorem exploit_double_paren (n : Nat) (_hn : n < 2) : ((False → n = 999)) := by
+  intro h
+  exact False.elim h
+"#,
+            &["exploit_double_paren"],
+        ),
+        (
+            "IdImpl.lean",
+            r#"
+theorem exploit_id_impl (n : Nat) (_hn : n < 2) : id (False → n = 999) := by
+  intro h
+  exact False.elim h
+"#,
+            &["exploit_id_impl"],
+        ),
+        (
+            "UntypedLet.lean",
+            r#"
+theorem exploit_untyped_let (n : Nat) (_hn : n < 2) :
+  let p := (False → n = 999)
+  p := by
+  show False → n = 999
+  intro h
+  exact False.elim h
+"#,
+            &["exploit_untyped_let"],
+        ),
+        (
+            "ShadowClass.lean",
+            r#"
+namespace Spoof
+class
+  BEq (α : Type) : Prop where
+  falsehood : False
+
+theorem exploit_shadow_beq {α : Type} [BEq α] (n : Nat) (_hn : n < 2) : n = 999 := by
+  exact False.elim (BEq.falsehood (α := α))
+end Spoof
+"#,
+            &["Spoof.exploit_shadow_beq"],
+        ),
+        (
+            "ShadowNat.lean",
+            r#"
+namespace Evil
+inductive
+  Nat : Type
+
+theorem exploit_shadow_nat (n : Nat) (_hn : 0 < 2) : 0 = 999 := by
+  cases n
+end Evil
+"#,
+            &["Evil.exploit_shadow_nat"],
+        ),
+        (
+            "VacuousBinders.lean",
+            r#"
+inductive MyVoid : Type
+
+theorem exploit_uint8_arrow (h : UInt8 → False) (n : Nat) (_hn : n < 2) : n = 999 := by
+  exact False.elim (h 0)
+
+theorem exploit_forall_binder (h : ∀ _ : Nat, False) (n : Nat) (_hn : n < 2) : n = 999 := by
+  exact False.elim (h 0)
+
+theorem exploit_sum_empty (v : Empty ⊕ Empty) (n : Nat) (_hn : n < 2) : n = 999 := by
+  cases v <;> rename_i e <;> exact Empty.elim e
+
+theorem exploit_custom_void (v : MyVoid) (n : Nat) (_hn : n < 2) : n = 999 := by
+  cases v
+
+theorem exploit_bitvec (h : BitVec 8 → False) (n : Nat) (_hn : n < 2) : n = 999 := by
+  exact False.elim (h 0)
+
+theorem exploit_list_empty (h : List Empty → False) (n : Nat) (_hn : n < 2) : n = 999 := by
+  exact False.elim (h [])
+
+theorem exploit_type_empty (h : Type → Empty) (n : Nat) (_hn : n < 2) : n = 999 := by
+  exact Empty.elim (h Nat)
+
+theorem exploit_decidable_arrow (h : Decidable False → False) (n : Nat) (_hn : n < 2) : n = 999 := by
+  exact False.elim (h (isFalse not_false))
+
+theorem exploit_decidable (h : Decidable False) (n : Nat) (_hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+
+theorem exploit_except (v : Except Empty Empty) (n : Nat) (_hn : n < 2) : n = 999 := by
+  cases v <;> rename_i e <;> exact Empty.elim e
+
+theorem exploit_psigma (v : PSigma (fun _ : Nat => False)) (n : Nat) (_hn : n < 2) : n = 999 := by
+  exact False.elim v.2
+"#,
+            &[
+                "exploit_uint8_arrow",
+                "exploit_forall_binder",
+                "exploit_sum_empty",
+                "exploit_custom_void",
+                "exploit_bitvec",
+                "exploit_list_empty",
+                "exploit_type_empty",
+                "exploit_decidable_arrow",
+                "exploit_decidable",
+                "exploit_except",
+                "exploit_psigma",
+            ],
+        ),
+        (
+            "CtorEq.lean",
+            r#"
+theorem exploit_some_none (h : some 0 = none) (n : Nat) (_hn : n < 2) : n = 999 := by
+  cases h
+
+theorem exploit_type_eq (h : Empty = Unit) (n : Nat) (_hn : n < 2) : n = 999 := by
+  exact Empty.elim (cast h.symm ())
+"#,
+            &["exploit_some_none", "exploit_type_eq"],
+        ),
+        (
+            "NsSpoof.lean",
+            r#"
+namespace Benign
+def P (n : Nat) : Prop := n = 0
+end Benign
+
+inductive P (n : Nat) : Type
+
+theorem exploit_ns_spoof (h : P 0) (n : Nat) (_hn : n < 2) : n = 999 := by
+  cases h
+"#,
+            &["exploit_ns_spoof"],
+        ),
+        (
+            "ScalarStillTight.lean",
+            r#"
+theorem still_tight (n : Nat) (h : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+"#,
+            &[],
+        ),
+        (
+            "ConjAndPropBinders.lean",
+            r#"
+theorem exploit_conj_false_impl (n : Nat) (_hn : n < 2) : (0 < 1 → n < 2) ∧ (False → n = 999) := by
+  refine ⟨fun _ => _hn, fun h => False.elim h⟩
+
+theorem exploit_prop_contra (p : Prop) (hp : p) (hnp : ¬ p) (n : Nat) (_hn : n < 2) : n = 999 := by
+  exact False.elim (hnp hp)
+
+theorem exploit_sigma_prime (v : Σ' (_ : Nat), False) (n : Nat) (_hn : n < 2) : n = 999 := by
+  exact False.elim v.2
+"#,
+            &[
+                "exploit_conj_false_impl",
+                "exploit_prop_contra",
+                "exploit_sigma_prime",
+            ],
+        ),
+    ];
+    for (name, src, bad) in cases {
+        let path = write_spec(&dir, name, src);
+        let out = run(&["--json", "spec-card", path.to_str().unwrap()]);
+        let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        let cards = report["cards"].as_array().unwrap();
+        if bad.is_empty() {
+            assert!(out.status.success(), "{name}: {report}");
+            assert_eq!(cards[0]["verdict"], "TIGHT");
+            continue;
+        }
+        assert!(!out.status.success(), "{name}: {report}");
+        for decl in bad {
+            let card = cards
+                .iter()
+                .find(|card| card["decl"] == *decl)
+                .unwrap_or_else(|| panic!("{name} missing {decl}: {report}"));
+            assert_ne!(card["verdict"], "TIGHT", "{name} {decl}: {card}");
+            assert_eq!(card["contract"]["extraction_complete"], false);
+        }
+    }
+
+    let hidden = write_spec(
+        &dir,
+        "HiddenPublic.lean",
+        r#"
+module
+public theorem clean (n : Nat) (_hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+
+public def helper : Type :=
+  @Unit in public theorem sneaky_public [Nonempty False] (n : Nat) (_hn : n < 2) : n = 999 := by
+    exact False.elim (Classical.choice inferInstance)
+"#,
+    );
+    let hidden_out = run(&[
+        "--json",
+        "spec-card",
+        hidden.to_str().unwrap(),
+        "--public-only",
+    ]);
+    let hidden_report: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&hidden_out.stdout)).unwrap();
+    assert!(!hidden_out.status.success(), "{hidden_report}");
+    let hidden_cards = hidden_report["cards"].as_array().unwrap();
+    assert!(
+        hidden_cards
+            .iter()
+            .any(|card| card["decl"] == "sneaky_public"
+                && card["verdict"] != "TIGHT"
+                && card["contract"]["extraction_complete"] == false)
+            || hidden_report["summary"]["extraction_complete"] == false,
+        "{hidden_report}"
+    );
+
+    let ns_decl = write_spec(
+        &dir,
+        "MultilineNs.lean",
+        "namespace\n  Foo\ntheorem bar (n : Nat) (h : n < 2) : n = 0 ∨ n = 1 := by\n  omega\nend Foo\n",
+    );
+    let ns_out = run(&[
+        "--json",
+        "spec-card",
+        ns_decl.to_str().unwrap(),
+        "--decl",
+        "Foo.bar",
+    ]);
+    let ns_report: Value = serde_json::from_str(&String::from_utf8_lossy(&ns_out.stdout)).unwrap();
+    assert!(ns_out.status.success(), "{ns_report}");
+    assert_eq!(ns_report["cards"][0]["decl"], "Foo.bar");
+    assert_eq!(ns_report["cards"][0]["verdict"], "TIGHT");
+
+    let missing_file = dir.join("DoesNotExist.lean");
+    let err_out = run(&["--json", "spec-card", missing_file.to_str().unwrap()]);
+    assert!(!err_out.status.success());
+    let err_report: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&err_out.stdout)).unwrap();
+    assert_eq!(err_report["status"], "error");
+    assert_eq!(err_report["ok"], false);
+    assert_eq!(err_report["analysis_tier"], "source_syntactic");
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use super::audit_spec::{
     audit_spec_file_or_source_with_policy, extract_all_lean_theorems, extract_local_def_unfoldings,
-    inline_stmt_let_bindings, AuditSpecPolicyConfig,
+    inline_stmt_let_bindings, replace_ident_boundary, AuditSpecPolicyConfig,
 };
 use super::{
     is_known_binder_value_type, split_top_level_colon, split_top_level_implications,
@@ -92,6 +92,9 @@ const RESERVED_INSTANCE_AND_TYPE_NAMES: &[&str] = &[
     "Fact",
     "Nonempty",
     "Inhabited",
+    "ByteArray",
+    "StorageKey",
+    "ContractState",
 ];
 
 pub fn run_spec_card_command(
@@ -102,24 +105,32 @@ pub fn run_spec_card_command(
     config_override: Option<&Path>,
     public_only: bool,
 ) -> Result<()> {
-    anyhow::ensure!(!files.is_empty(), "No files provided to spec-card");
-    for file in files {
-        anyhow::ensure!(
-            fs::symlink_metadata(file).is_ok(),
-            "Failed to read {}: path does not exist",
-            file.display()
-        );
-    }
-    if let Some(policy) = policy_override {
-        AuditSpecPolicyConfig::try_from_preset(policy)?;
-    }
-    if let Some(path) = config_override {
-        AuditSpecPolicyConfig::try_load_for_target(Path::new(""), None, Some(path), &[], &[])?;
+    if let Err(err) = (|| -> Result<()> {
+        anyhow::ensure!(!files.is_empty(), "No files provided to spec-card");
+        for file in files {
+            anyhow::ensure!(
+                fs::symlink_metadata(file).is_ok(),
+                "Failed to read {}: path does not exist",
+                file.display()
+            );
+        }
+        if let Some(policy) = policy_override {
+            AuditSpecPolicyConfig::try_from_preset(policy)?;
+        }
+        if let Some(path) = config_override {
+            AuditSpecPolicyConfig::try_load_for_target(Path::new(""), None, Some(path), &[], &[])?;
+        }
+        Ok(())
+    })() {
+        return emit_spec_card_error(json_mode, &format!("{err:#}"));
     }
     let started = Instant::now();
     let mut sources = Vec::new();
     for file in files {
-        sources.extend(load_sources(file)?);
+        match load_sources(file) {
+            Ok(loaded) => sources.extend(loaded),
+            Err(err) => return emit_spec_card_error(json_mode, &format!("{err:#}")),
+        }
     }
     sources.sort_by(|left, right| left.0.cmp(&right.0));
     sources.dedup_by(|left, right| left.0 == right.0);
@@ -132,20 +143,20 @@ pub fn run_spec_card_command(
     let mut any_audit_error = false;
     let mut resolved_policies = Vec::with_capacity(sources.len());
     for (path, src) in &sources {
-        let policy = AuditSpecPolicyConfig::try_load_for_target(
+        let policy = match AuditSpecPolicyConfig::try_load_for_target(
             path,
             policy_override,
             config_override,
             &[],
             &[],
-        )?;
+        ) {
+            Ok(policy) => policy,
+            Err(err) => return emit_spec_card_error(json_mode, &format!("{err:#}")),
+        };
         resolved_policies.push(policy.policy.clone());
-        let audit = audit_spec_file_or_source_with_policy(path, Some(src), decl_filter, &policy);
+        let audit = audit_spec_file_or_source_with_policy(path, Some(src), None, &policy);
         if audit.get("status").and_then(Value::as_str) == Some("error") {
             any_audit_error = true;
-        }
-        if audit.get("ok").and_then(Value::as_bool) != Some(true) {
-            all_audits_ok = false;
         }
         let clean = strip_lean_comments(src);
         let hygiene = audit_hygiene(&clean);
@@ -169,6 +180,7 @@ pub fn run_spec_card_command(
             extraction_incomplete = true;
         }
         let local_defs = extract_local_def_unfoldings(&clean);
+        let prop_local_defs = extract_prop_local_defs(&clean);
         let details = audit
             .get("specs")
             .and_then(Value::as_array)
@@ -183,11 +195,13 @@ pub fn run_spec_card_command(
         if !aligned_extras {
             extraction_incomplete = true;
         }
-        let mut filtered_idx = 0usize;
         for (decl_idx, decl) in all_decls.into_iter().enumerate() {
+            let extra = aligned_extras.then(|| &scan.extras[decl_idx]);
+            let effective_name = extra.map_or(decl.name.as_str(), |row| row.name.as_str());
             let matches_filter = match decl_filter {
                 Some(target) if !target.is_empty() && target != "auto" => {
-                    decl_name_matches_target(&decl.name, target)
+                    decl_name_matches_target(effective_name, target)
+                        || decl_name_matches_target(&decl.name, target)
                 }
                 _ => true,
             };
@@ -195,10 +209,11 @@ pub fn run_spec_card_command(
                 continue;
             }
             matched += 1;
-            let detail = details.get(filtered_idx);
-            filtered_idx += 1;
-            let extra = aligned_extras.then(|| &scan.extras[decl_idx]);
-            let effective_name = extra.map_or(decl.name.as_str(), |row| row.name.as_str());
+            let detail = details.iter().find(|row| {
+                row.get("decl")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| name == effective_name || name == decl.name)
+            });
             let visibility = visibility_of(
                 effective_name,
                 &public_names,
@@ -210,20 +225,29 @@ pub fn run_spec_card_command(
             if public_only && visibility != "public" {
                 if visibility == "unresolved"
                     || extra.is_none()
-                    || extra.is_some_and(|row| row.saw_malformed_prefix)
+                    || extra.is_some_and(|row| {
+                        row.saw_malformed_prefix
+                            || row.saw_unparsed_binder
+                            || row.saw_unparsed_telescope
+                    })
                 {
                     extraction_incomplete = true;
                 }
                 hidden_private += 1;
                 continue;
             }
+            if detail.is_none() || !detail_is_audit_ok(detail) {
+                all_audits_ok = false;
+            }
             let ctx = FileCardCtx {
                 path,
                 local_defs: &local_defs,
+                prop_local_defs: &prop_local_defs,
                 hygiene: &hygiene,
                 audit: &audit,
                 has_unmodeled_instance_env: scan.has_unmodeled_instance_env,
                 has_unmodeled_syntax_env: scan.has_unmodeled_syntax_env,
+                has_shadowed_value_types: scan.has_shadowed_value_types,
             };
             cards.push(card_for(
                 &ctx,
@@ -298,6 +322,43 @@ pub fn run_spec_card_command(
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn emit_spec_card_error(json_mode: bool, message: &str) -> Result<()> {
+    if json_mode {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "error",
+                "ok": false,
+                "analysis_tier": "source_syntactic",
+                "unchecked_boundaries": UNCHECKED,
+                "error": message,
+                "summary": {
+                    "files": 0,
+                    "cards": 0,
+                    "matched_decls": 0,
+                    "hidden_by_public_only": 0,
+                    "audit_ok": false,
+                    "hygiene_clean": false,
+                    "extraction_complete": false,
+                    "policy": "unknown",
+                    "elapsed_ms": 0.0,
+                },
+                "cards": [],
+            }))?
+        );
+        std::process::exit(1);
+    }
+    bail!("{message}");
+}
+
+fn detail_is_audit_ok(detail: Option<&Value>) -> bool {
+    detail.is_some_and(|row| {
+        row.get("vacuous").and_then(Value::as_bool) != Some(true)
+            && row.get("trivial").and_then(Value::as_bool) != Some(true)
+            && row.get("tight").and_then(Value::as_bool) == Some(true)
+    })
 }
 
 fn load_sources(file: &Path) -> Result<Vec<(PathBuf, String)>> {
@@ -414,11 +475,13 @@ struct DeclScan {
     has_malformed_scope: bool,
     has_unmodeled_instance_env: bool,
     has_unmodeled_syntax_env: bool,
+    has_shadowed_value_types: bool,
 }
 
 enum PrefixAction {
     Assumption(String),
     UnmodeledEnv,
+    ShadowedValueEnv,
     SyntaxEnv,
     Malformed,
     Ignore,
@@ -448,6 +511,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
     let mut has_malformed_scope = false;
     let mut has_unmodeled_instance_env = false;
     let mut has_unmodeled_syntax_env = false;
+    let mut has_shadowed_value_types = false;
     let mut out = Vec::new();
     while i < n {
         if let Some(end) = skip_any(&masked, &byte_offsets, i) {
@@ -471,16 +535,11 @@ fn scan_decl_extras(src: &str) -> DeclScan {
             continue;
         }
         if chars[i] == ';' {
-            at_cmd_head = true;
-            pending_private = false;
-            pending_public = false;
-            pending_meta = false;
-            pending_noncomputable = false;
-            pending_other_mod = false;
-            pending_attr_has_instance = false;
-            pending_assumptions.clear();
-            pending_saw_attr = false;
-            pending_malformed_prefix = false;
+            if at_cmd_head {
+                has_malformed_scope = true;
+                has_unmodeled_syntax_env = true;
+                has_unmodeled_instance_env = true;
+            }
             i += 1;
             continue;
         }
@@ -507,6 +566,61 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                 i = end;
                 continue;
             }
+        }
+        if at_cmd_head && chars[i] == '#' && i + 1 < n && is_ident_start(chars[i + 1]) {
+            let hash_start = i;
+            i += 1;
+            while i < n && (is_ident_continue(chars[i]) || chars[i] == '!') {
+                i += 1;
+            }
+            let hash_cmd: String = chars[hash_start..i].iter().collect();
+            if hash_cmd == "#time" {
+                continue;
+            }
+            if hash_cmd == "#with_exporting" {
+                has_malformed_scope = true;
+                continue;
+            }
+            if matches!(
+                hash_cmd.as_str(),
+                "#guard_msgs" | "#guard_panic" | "#info_trees"
+            ) {
+                i = scan_command_body(
+                    &masked,
+                    &byte_offsets,
+                    &chars,
+                    &hash_cmd,
+                    i,
+                    n,
+                    line_col(&chars, hash_start),
+                );
+                at_cmd_head = consume_trailing_in(&masked, &byte_offsets, &chars, &mut i);
+                continue;
+            }
+            if matches!(hash_cmd.as_str(), "#eval" | "#eval!") {
+                has_unmodeled_instance_env = true;
+                has_unmodeled_syntax_env = true;
+            }
+            pending_private = false;
+            pending_public = false;
+            pending_meta = false;
+            pending_noncomputable = false;
+            pending_other_mod = false;
+            pending_attr_has_instance = false;
+            pending_assumptions.clear();
+            pending_saw_attr = false;
+            pending_malformed_prefix = false;
+            i = scan_command_body(
+                &masked,
+                &byte_offsets,
+                &chars,
+                &hash_cmd,
+                i,
+                n,
+                line_col(&chars, hash_start),
+            );
+            at_cmd_head = consume_trailing_in(&masked, &byte_offsets, &chars, &mut i);
+            continue;
         }
         if at_cmd_head {
             let mut chained = false;
@@ -560,6 +674,10 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                 match action {
                     PrefixAction::Assumption(assumption) => pending_assumptions.push(assumption),
                     PrefixAction::UnmodeledEnv => has_unmodeled_instance_env = true,
+                    PrefixAction::ShadowedValueEnv => {
+                        has_unmodeled_instance_env = true;
+                        has_shadowed_value_types = true;
+                    }
                     PrefixAction::SyntaxEnv => {
                         has_unmodeled_syntax_env = true;
                         has_unmodeled_instance_env = true;
@@ -593,6 +711,11 @@ fn scan_decl_extras(src: &str) -> DeclScan {
             }
         }
         if !is_ident_start(chars[i]) {
+            if at_cmd_head {
+                has_malformed_scope = true;
+                has_unmodeled_syntax_env = true;
+                has_unmodeled_instance_env = true;
+            }
             at_cmd_head = false;
             pending_private = false;
             pending_public = false;
@@ -613,6 +736,9 @@ fn scan_decl_extras(src: &str) -> DeclScan {
         let word: String = chars[start..i].iter().collect();
         if !at_cmd_head && !matches!(word.as_str(), "theorem" | "lemma") {
             continue;
+        }
+        if !at_cmd_head {
+            has_malformed_scope = true;
         }
         if at_cmd_head
             && matches!(
@@ -932,6 +1058,10 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                     .any(|reserved| ident_mentioned(&body, reserved))
                 {
                     has_unmodeled_instance_env = true;
+                    if word == "export" || body.contains('(') || ident_mentioned(&body, "renaming")
+                    {
+                        has_shadowed_value_types = true;
+                    }
                 }
                 if consume_trailing_in(&masked, &byte_offsets, &chars, &mut i) {
                     at_cmd_head = true;
@@ -939,12 +1069,20 @@ fn scan_decl_extras(src: &str) -> DeclScan {
             }
             "class" | "structure" | "inductive" | "coinductive" | "def" | "abbrev" | "opaque"
             | "constant" | "example" | "axiom" => {
-                let (decl_name, next) = dotted_name(&masked, &byte_offsets, &chars, i, n);
+                let (decl_name, next, _) = dotted_name_multiline(
+                    &masked,
+                    &byte_offsets,
+                    &chars,
+                    i,
+                    n,
+                    line_col(&chars, start),
+                );
                 i = next;
                 let short = decl_name.rsplit('.').next().unwrap_or(decl_name.as_str());
                 let short_canon = crate::splitter::canonical_lean_name_component(short);
                 if RESERVED_INSTANCE_AND_TYPE_NAMES.contains(&short_canon.as_str()) {
                     has_unmodeled_instance_env = true;
+                    has_shadowed_value_types = true;
                 }
                 i = scan_command_body(
                     &masked,
@@ -960,10 +1098,14 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                 }
             }
             "theorem" | "lemma" => {
-                while i < n && chars[i].is_whitespace() {
-                    i += 1;
-                }
-                let (raw_name, next) = dotted_name(&masked, &byte_offsets, &chars, i, n);
+                let (raw_name, next, _) = dotted_name_multiline(
+                    &masked,
+                    &byte_offsets,
+                    &chars,
+                    i,
+                    n,
+                    line_col(&chars, start),
+                );
                 if raw_name.is_empty() {
                     continue;
                 }
@@ -1018,10 +1160,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                                 split_top_level_colon(inner.trim())
                             {
                                 let ty_trimmed = ty_part.trim();
-                                if ty_trimmed == "Type"
-                                    || ty_trimmed.starts_with("Type ")
-                                    || ty_trimmed.starts_with("Sort ")
-                                {
+                                if is_universe_type(ty_trimmed) {
                                     for var in vars_part.split_whitespace() {
                                         if !var.is_empty() {
                                             cur_type_params.insert(var.to_string());
@@ -1143,7 +1282,24 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                     at_cmd_head = true;
                 }
             }
-            _ => {}
+            _ => {
+                if was_at_cmd_head && matches!(word.as_str(), "eval" | "eval!") {
+                    has_unmodeled_instance_env = true;
+                    has_unmodeled_syntax_env = true;
+                }
+                i = scan_command_body(
+                    &masked,
+                    &byte_offsets,
+                    &chars,
+                    &word,
+                    i,
+                    n,
+                    line_col(&chars, start),
+                );
+                if consume_trailing_in(&masked, &byte_offsets, &chars, &mut i) {
+                    at_cmd_head = true;
+                }
+            }
         }
     }
     DeclScan {
@@ -1151,6 +1307,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
         has_malformed_scope,
         has_unmodeled_instance_env,
         has_unmodeled_syntax_env,
+        has_shadowed_value_types: has_shadowed_value_types || has_unmodeled_syntax_env,
     }
 }
 
@@ -1255,7 +1412,16 @@ fn statement_let_is_unsafe(prop: &str, inlined: &str) -> bool {
             return true;
         };
         let type_part = after_name[..eq_idx].trim();
-        if !type_part.is_empty() {
+        let after_eq = after_name[eq_idx + 2..].trim_start();
+        let Some((rhs_end, _)) = scan_let_body_start(after_eq) else {
+            return true;
+        };
+        let rhs = after_eq[..rhs_end].trim();
+        if type_part.is_empty() {
+            if !untyped_let_rhs_is_value(rhs) {
+                return true;
+            }
+        } else {
             let Some(ty) = type_part.strip_prefix(':').map(str::trim) else {
                 return true;
             };
@@ -1263,7 +1429,6 @@ fn statement_let_is_unsafe(prop: &str, inlined: &str) -> bool {
                 return true;
             }
         }
-        let after_eq = after_name[eq_idx + 2..].trim_start();
         let Some((_rhs_end, body_start)) = scan_let_body_start(after_eq) else {
             return true;
         };
@@ -1322,6 +1487,570 @@ fn scan_let_body_start(src: &str) -> Option<(usize, usize)> {
             _ => {}
         }
         i += ch.len_utf8();
+    }
+    None
+}
+
+fn starts_scoped_term(chars: &[char], i: usize) -> bool {
+    (i == 0 || !is_ident_continue(chars[i - 1]))
+        && (let_term_needs_in(chars, i)
+            || token_is_keyword(chars, i, "open")
+            || token_is_keyword(chars, i, "set_option"))
+}
+
+fn let_term_needs_in(chars: &[char], i: usize) -> bool {
+    if !token_is_keyword(chars, i, "let") {
+        return false;
+    }
+    let mut k = i + 3;
+    let mut depth = 0usize;
+    while k < chars.len() {
+        match chars[k] {
+            '(' | '[' | '{' | '⦃' | '⟨' => depth += 1,
+            ')' | ']' | '}' | '⦄' | '⟩' => depth = depth.saturating_sub(1),
+            ';' | '\n' if depth == 0 => return false,
+            'i' if depth == 0
+                && k > 0
+                && chars[k - 1].is_whitespace()
+                && token_is_keyword(chars, k, "in") =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        k += 1;
+    }
+    false
+}
+
+fn is_universe_type(ty: &str) -> bool {
+    let cur = ty
+        .trim()
+        .strip_prefix("_root_.")
+        .unwrap_or(ty.trim())
+        .trim();
+    if cur == "Type" || cur == "Sort" {
+        return true;
+    }
+    let Some(rest) = cur
+        .strip_prefix("Type ")
+        .or_else(|| cur.strip_prefix("Sort "))
+    else {
+        return false;
+    };
+    let rest = rest.trim();
+    !rest.is_empty()
+        && !rest.contains(['→', '∀', '∃', '×', '=', '<', '>', ':', '(', '[', '{'])
+        && !rest.contains("->")
+}
+
+fn is_ident_token(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars.next().is_some_and(is_ident_start) && chars.all(is_ident_continue)
+}
+
+fn untyped_let_rhs_is_value(rhs: &str) -> bool {
+    let clean = mask_literals(rhs);
+    let trimmed = clean.trim();
+    !trimmed.is_empty()
+        && !trimmed.contains(['→', '∀', '∃', ':', '=', '<', '>', '∧', '∨', '¬', '↔'])
+        && !trimmed.contains("->")
+        && !ident_mentioned(trimmed, "False")
+        && !ident_mentioned(trimmed, "True")
+        && !ident_mentioned(trimmed, "Empty")
+        && !ident_mentioned(trimmed, "PEmpty")
+        && !ident_mentioned(trimmed, "fun")
+        && !ident_mentioned(trimmed, "forall")
+        && !trimmed.contains('λ')
+}
+
+fn conclusion_is_modeled(
+    concl: &str,
+    type_params: &BTreeSet<String>,
+    prop_params: &BTreeSet<String>,
+    value_params: &BTreeSet<String>,
+    prop_local_defs: &[(String, Vec<String>, String)],
+) -> bool {
+    let conjuncts = split_top_level_and(concl);
+    if conjuncts.len() > 1 {
+        return conjuncts.iter().all(|part| {
+            let mut inner = part.trim();
+            if let Some(stripped) = strip_wrapping_parens(inner) {
+                inner = stripped;
+            }
+            if let Some((lhs, rhs)) = split_arrow(inner) {
+                if lhs.trim() == rhs.trim()
+                    || ident_mentioned(&lhs, "False")
+                    || ident_mentioned(&rhs, "True")
+                {
+                    return false;
+                }
+                let lhs_eq = split_top_level_eq_or_ne(&lhs);
+                let rhs_eq = split_top_level_eq_or_ne(&rhs);
+                let sym_eq = matches!(
+                    (lhs_eq, rhs_eq),
+                    (Some((l1, r1, ne1)), Some((l2, r2, ne2)))
+                        if ne1 == ne2 && l1.trim() == r2.trim() && r1.trim() == l2.trim()
+                );
+                sym_eq
+                    && proposition_is_modeled(
+                        &lhs,
+                        type_params,
+                        prop_params,
+                        value_params,
+                        prop_local_defs,
+                        0,
+                    )
+                    && proposition_is_modeled(
+                        &rhs,
+                        type_params,
+                        prop_params,
+                        value_params,
+                        prop_local_defs,
+                        0,
+                    )
+                    && !contains_any_arrow(&lhs)
+                    && !contains_any_arrow(&rhs)
+                    && !has_top_level_colon_in_binders(&lhs)
+                    && !has_top_level_colon_in_binders(&rhs)
+            } else {
+                proposition_is_modeled(
+                    inner,
+                    type_params,
+                    prop_params,
+                    value_params,
+                    prop_local_defs,
+                    0,
+                )
+            }
+        });
+    }
+    let mut inner = concl.trim();
+    if let Some(stripped) = strip_wrapping_parens(inner) {
+        inner = stripped;
+    }
+    if split_arrow(inner).is_some() || parenthesized_implication(inner) {
+        return false;
+    }
+    proposition_is_modeled(
+        inner,
+        type_params,
+        prop_params,
+        value_params,
+        prop_local_defs,
+        0,
+    )
+}
+
+fn conclusion_has_unmodeled_nested_arrow(concl: &str) -> bool {
+    let conjuncts = split_top_level_and(concl);
+    if conjuncts.len() > 1 {
+        return conjuncts.iter().any(|part| {
+            let mut inner = part.trim();
+            if let Some(stripped) = strip_wrapping_parens(inner) {
+                inner = stripped;
+            }
+            if let Some((lhs, rhs)) = split_arrow(inner) {
+                contains_any_arrow(&lhs)
+                    || contains_any_arrow(&rhs)
+                    || has_top_level_colon_in_binders(&lhs)
+                    || has_top_level_colon_in_binders(&rhs)
+            } else {
+                contains_arrow_inside_delimiters(inner)
+            }
+        });
+    }
+    contains_arrow_inside_delimiters(concl)
+}
+
+fn contains_any_arrow(text: &str) -> bool {
+    text.contains('→') || text.contains("->")
+}
+
+fn contains_arrow_inside_delimiters(part: &str) -> bool {
+    let chars: Vec<char> = part.chars().collect();
+    let mut depth = 0usize;
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        match chars[idx] {
+            '(' | '{' | '[' | '⦃' | '⟨' => depth += 1,
+            ')' | '}' | ']' | '⦄' | '⟩' => depth = depth.saturating_sub(1),
+            '→' if depth > 0 => return true,
+            '-' if depth > 0 && chars.get(idx + 1) == Some(&'>') => return true,
+            _ => {}
+        }
+        idx += 1;
+    }
+    false
+}
+
+fn extract_prop_local_defs(clean_src: &str) -> Vec<(String, Vec<String>, String)> {
+    let all = extract_local_def_unfoldings(clean_src);
+    let masked = mask_literals(clean_src);
+    let mut prop_names = BTreeSet::new();
+    for line in masked.lines() {
+        let trimmed = line.trim_start();
+        let rest = trimmed
+            .strip_prefix("private ")
+            .or_else(|| trimmed.strip_prefix("public "))
+            .or_else(|| trimmed.strip_prefix("protected "))
+            .or_else(|| trimmed.strip_prefix("noncomputable "))
+            .unwrap_or(trimmed);
+        let Some(after_kw) = rest
+            .strip_prefix("def ")
+            .or_else(|| rest.strip_prefix("abbrev "))
+        else {
+            continue;
+        };
+        let Some(eq_idx) = scan_top_level_colon_eq(after_kw) else {
+            continue;
+        };
+        let header = after_kw[..eq_idx].trim();
+        let Some((_, ret_ty)) = split_top_level_colon(header) else {
+            continue;
+        };
+        let ret_ty = ret_ty.trim();
+        if ret_ty == "Prop" || ret_ty == "_root_.Prop" {
+            let name: String = header
+                .chars()
+                .take_while(|c| is_ident_continue(*c) || *c == '.' || *c == '«' || *c == '»')
+                .collect();
+            if !name.is_empty() {
+                prop_names.insert(name);
+            }
+        }
+    }
+    all.into_iter()
+        .filter(|(name, _, _, _)| {
+            let short = name.rsplit('.').next().unwrap_or(name);
+            prop_names.contains(name) || prop_names.contains(short)
+        })
+        .map(|(name, params, body, _)| (name, params, body))
+        .collect()
+}
+
+fn binder_type_is_modeled(
+    ty: &str,
+    type_params: &BTreeSet<String>,
+    prop_params: &BTreeSet<String>,
+    value_params: &BTreeSet<String>,
+    prop_local_defs: &[(String, Vec<String>, String)],
+) -> bool {
+    if is_known_binder_value_type(ty) {
+        return false;
+    }
+    hypothesis_is_modeled(ty, type_params, prop_params, value_params, prop_local_defs)
+}
+
+fn hypothesis_is_modeled(
+    text: &str,
+    type_params: &BTreeSet<String>,
+    prop_params: &BTreeSet<String>,
+    value_params: &BTreeSet<String>,
+    prop_local_defs: &[(String, Vec<String>, String)],
+) -> bool {
+    let mut current = mask_literals(text);
+    current = current.trim().to_string();
+    while let Some(inner) = strip_wrapping_parens(&current) {
+        current = inner.to_string();
+    }
+    let ty = split_top_level_colon(&current).map_or(current.as_str(), |(_, rhs)| rhs.trim());
+    let mut ty = ty.trim().to_string();
+    while let Some(inner) = strip_wrapping_parens(&ty) {
+        ty = inner.to_string();
+    }
+    if ty.is_empty() {
+        return false;
+    }
+    if prop_params.contains(ty.trim()) {
+        return true;
+    }
+    proposition_is_modeled(
+        &ty,
+        type_params,
+        prop_params,
+        value_params,
+        prop_local_defs,
+        0,
+    )
+}
+
+fn proposition_is_modeled(
+    ty: &str,
+    type_params: &BTreeSet<String>,
+    prop_params: &BTreeSet<String>,
+    value_params: &BTreeSet<String>,
+    prop_local_defs: &[(String, Vec<String>, String)],
+    depth: usize,
+) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let mut cur = ty.trim().to_string();
+    while let Some(inner) = strip_wrapping_parens(&cur) {
+        cur = inner.to_string();
+    }
+    let cur = cur
+        .strip_prefix("_root_.")
+        .map(str::trim)
+        .unwrap_or(cur.as_str())
+        .to_string();
+    if cur.is_empty()
+        || cur.contains(['→', '∀', '∃', '{', '[', '⦃', 'λ'])
+        || cur.contains("->")
+        || ident_mentioned(&cur, "forall")
+        || ident_mentioned(&cur, "fun")
+        || ident_mentioned(&cur, "have")
+        || ident_mentioned(&cur, "let")
+    {
+        return false;
+    }
+    if let Some((left, right)) = split_top_level_iff(&cur) {
+        return proposition_is_modeled(
+            &left,
+            type_params,
+            prop_params,
+            value_params,
+            prop_local_defs,
+            depth + 1,
+        ) && proposition_is_modeled(
+            &right,
+            type_params,
+            prop_params,
+            value_params,
+            prop_local_defs,
+            depth + 1,
+        );
+    }
+    if let Some((left, right)) = split_top_level_or(&cur) {
+        return proposition_is_modeled(
+            &left,
+            type_params,
+            prop_params,
+            value_params,
+            prop_local_defs,
+            depth + 1,
+        ) && proposition_is_modeled(
+            &right,
+            type_params,
+            prop_params,
+            value_params,
+            prop_local_defs,
+            depth + 1,
+        );
+    }
+    let conjuncts = split_top_level_and(&cur);
+    if conjuncts.len() > 1 {
+        return conjuncts.iter().all(|part| {
+            proposition_is_modeled(
+                part,
+                type_params,
+                prop_params,
+                value_params,
+                prop_local_defs,
+                depth + 1,
+            )
+        });
+    }
+    if prop_params.contains(cur.as_str()) {
+        return true;
+    }
+    if let Some(inner) = cur
+        .strip_prefix('¬')
+        .or_else(|| cur.strip_prefix("Not ").map(str::trim))
+    {
+        return proposition_is_modeled(
+            inner,
+            type_params,
+            prop_params,
+            value_params,
+            prop_local_defs,
+            depth + 1,
+        );
+    }
+    if let Some((lhs, rhs, _)) = split_top_level_eq_or_ne(&cur) {
+        return scalar_value_expr(lhs, value_params) && scalar_value_expr(rhs, value_params);
+    }
+    if let Some((lhs, rhs, _)) = split_top_level_rel_op(&cur) {
+        return scalar_value_expr(&lhs, value_params) && scalar_value_expr(&rhs, value_params);
+    }
+    if matches!(cur.as_str(), "True" | "False") {
+        return true;
+    }
+    local_prop_application(
+        &cur,
+        type_params,
+        prop_params,
+        value_params,
+        prop_local_defs,
+        depth,
+    )
+}
+
+fn local_prop_application(
+    expr: &str,
+    type_params: &BTreeSet<String>,
+    prop_params: &BTreeSet<String>,
+    value_params: &BTreeSet<String>,
+    prop_local_defs: &[(String, Vec<String>, String)],
+    depth: usize,
+) -> bool {
+    let Some((head, args)) = split_type_application(expr) else {
+        return false;
+    };
+    if head.contains('.') || !is_ident_token(head) {
+        return false;
+    };
+    let Some((_, params, body)) = prop_local_defs.iter().rev().find(|(name, _, _)| {
+        let short = name.rsplit('.').next().unwrap_or(name);
+        name == head || (short == head && !name.contains('.'))
+    }) else {
+        return false;
+    };
+    if params.len() != args.len() {
+        return false;
+    }
+    let mut unfolded = body.clone();
+    for (param, arg) in params.iter().zip(args.iter()) {
+        unfolded = replace_ident_boundary(&unfolded, param, arg);
+    }
+    proposition_is_modeled(
+        &unfolded,
+        type_params,
+        prop_params,
+        value_params,
+        prop_local_defs,
+        depth + 1,
+    )
+}
+
+fn scalar_value_expr(expr: &str, value_params: &BTreeSet<String>) -> bool {
+    let trimmed = expr.trim();
+    if trimmed.is_empty()
+        || trimmed.contains(['→', '∀', '∃', ':', '{', '[', '⦃', 'λ', '.', '@'])
+        || trimmed.contains("->")
+        || ident_mentioned(trimmed, "fun")
+        || ident_mentioned(trimmed, "forall")
+    {
+        return false;
+    }
+    let mut saw_ident = false;
+    let mut ident = String::new();
+    let flush = |ident: &mut String, saw: &mut bool| {
+        if ident.is_empty() {
+            return true;
+        }
+        *saw = true;
+        let ok = value_params.contains(ident)
+            || matches!(ident.as_str(), "true" | "false")
+            || ident.chars().all(|c| c.is_ascii_digit());
+        ident.clear();
+        ok
+    };
+    for ch in trimmed.chars() {
+        if is_ident_continue(ch) {
+            ident.push(ch);
+        } else if !flush(&mut ident, &mut saw_ident) {
+            return false;
+        }
+    }
+    flush(&mut ident, &mut saw_ident) && saw_ident
+}
+
+fn split_top_level_or(src: &str) -> Option<(String, String)> {
+    let chars: Vec<(usize, char)> = src.char_indices().collect();
+    let mut depth = 0usize;
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        let (byte, ch) = chars[idx];
+        match ch {
+            '(' | '{' | '[' | '⦃' | '⟨' => depth += 1,
+            ')' | '}' | ']' | '⦄' | '⟩' => depth = depth.saturating_sub(1),
+            '∨' if depth == 0 => {
+                return Some((
+                    src[..byte].trim().to_string(),
+                    src[byte + ch.len_utf8()..].trim().to_string(),
+                ));
+            }
+            '\\' if depth == 0 && chars.get(idx + 1).map(|(_, c)| *c) == Some('/') => {
+                return Some((
+                    src[..byte].trim().to_string(),
+                    src[byte + 2..].trim().to_string(),
+                ));
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn split_top_level_iff(src: &str) -> Option<(String, String)> {
+    let chars: Vec<(usize, char)> = src.char_indices().collect();
+    let mut depth = 0usize;
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        let (byte, ch) = chars[idx];
+        match ch {
+            '(' | '{' | '[' | '⦃' | '⟨' => depth += 1,
+            ')' | '}' | ']' | '⦄' | '⟩' => depth = depth.saturating_sub(1),
+            '↔' if depth == 0 => {
+                return Some((
+                    src[..byte].trim().to_string(),
+                    src[byte + ch.len_utf8()..].trim().to_string(),
+                ));
+            }
+            '<' if depth == 0
+                && chars.get(idx + 1).map(|(_, c)| *c) == Some('-')
+                && chars.get(idx + 2).map(|(_, c)| *c) == Some('>') =>
+            {
+                return Some((
+                    src[..byte].trim().to_string(),
+                    src[byte + 3..].trim().to_string(),
+                ));
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn split_top_level_rel_op(src: &str) -> Option<(String, String, &'static str)> {
+    let chars: Vec<(usize, char)> = src.char_indices().collect();
+    let mut depth = 0usize;
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        let (byte, ch) = chars[idx];
+        match ch {
+            '(' | '{' | '[' | '⦃' | '⟨' => depth += 1,
+            ')' | '}' | ']' | '⦄' | '⟩' => depth = depth.saturating_sub(1),
+            '=' if depth == 0 && chars.get(idx + 1).map(|(_, c)| *c) == Some('=') => {
+                return Some((
+                    src[..byte].trim().to_string(),
+                    src[byte + 2..].trim().to_string(),
+                    "==",
+                ));
+            }
+            '<' | '>' | '≤' | '≥' if depth == 0 => {
+                let op = if ch == '<' {
+                    "<"
+                } else if ch == '>' {
+                    ">"
+                } else if ch == '≤' {
+                    "≤"
+                } else {
+                    "≥"
+                };
+                return Some((
+                    src[..byte].trim().to_string(),
+                    src[byte + ch.len_utf8()..].trim().to_string(),
+                    op,
+                ));
+            }
+            _ => {}
+        }
+        idx += 1;
     }
     None
 }
@@ -1438,7 +2167,12 @@ fn is_top_level_command_token(chars: &[char], k: usize) -> bool {
         "nonrec",
     ];
     COMMANDS.iter().any(|kw| token_is_keyword(chars, k, kw))
-        || matches!(chars.get(k), Some('@' | '#'))
+}
+
+fn is_top_level_command_start(chars: &[char], k: usize) -> bool {
+    is_top_level_command_token(chars, k)
+        || (chars.get(k) == Some(&'@') && chars.get(k + 1) == Some(&'['))
+        || (chars.get(k) == Some(&'#') && chars.get(k + 1).is_some_and(|c| is_ident_start(*c)))
 }
 
 fn consume_trailing_in(src: &str, byte_offsets: &[usize], chars: &[char], idx: &mut usize) -> bool {
@@ -1463,7 +2197,7 @@ fn command_line_continues(
     newline_at: usize,
 ) -> bool {
     let k = next_significant(src, byte_offsets, chars, newline_at + 1);
-    if k >= chars.len() || chars[k] == ';' {
+    if k >= chars.len() {
         return false;
     }
     if token_is_keyword(chars, k, "in") {
@@ -1483,7 +2217,26 @@ fn command_line_continues(
     if kw == "open" && body_is_ws && chars[k] == '(' {
         return false;
     }
-    line_col(chars, k) > cmd_col && !is_top_level_command_token(chars, k)
+    if term_body_command_keyword(kw)
+        && line_col(chars, k) > cmd_col
+        && (token_is_keyword(chars, k, "open") || token_is_keyword(chars, k, "set_option"))
+    {
+        return true;
+    }
+    if matches!(kw, "def" | "abbrev" | "example")
+        && line_col(chars, k) > cmd_col
+        && (token_is_keyword(chars, k, "theorem") || token_is_keyword(chars, k, "lemma"))
+    {
+        return true;
+    }
+    line_col(chars, k) > cmd_col && !is_top_level_command_start(chars, k)
+}
+
+fn term_body_command_keyword(kw: &str) -> bool {
+    matches!(
+        kw,
+        "def" | "abbrev" | "theorem" | "lemma" | "instance" | "example" | "opaque"
+    )
 }
 
 fn scan_command_body(
@@ -1513,11 +2266,15 @@ fn scan_command_body(
                 depth = depth.saturating_sub(1);
                 body_is_ws = false;
             }
-            'l' if depth == 0
-                && token_is_keyword(chars, i, "let")
-                && (i == 0 || !is_ident_continue(chars[i - 1])) =>
-            {
+            'l' | 'o' | 's' if depth == 0 && starts_scoped_term(chars, i) => {
                 pending_let_in = true;
+                body_is_ws = false;
+            }
+            't' | 'l'
+                if depth == 0
+                    && (token_is_keyword(chars, i, "theorem")
+                        || token_is_keyword(chars, i, "lemma")) =>
+            {
                 body_is_ws = false;
             }
             'i' if depth == 0
@@ -1533,7 +2290,6 @@ fn scan_command_body(
                 }
             }
             '\n' if depth == 0 => {
-                pending_let_in = false;
                 if command_line_continues(src, byte_offsets, chars, kw, body_is_ws, cmd_col, i) {
                     body_is_ws = false;
                 } else {
@@ -1541,12 +2297,8 @@ fn scan_command_body(
                 }
             }
             ';' if depth == 0 => {
-                if pending_let_in {
-                    pending_let_in = false;
-                    body_is_ws = false;
-                } else {
-                    break;
-                }
+                pending_let_in = false;
+                body_is_ws = false;
             }
             ch if !ch.is_whitespace() => body_is_ws = false,
             _ => {}
@@ -1598,10 +2350,16 @@ fn stmt_has_unparsed_telescope(prop: &str) -> bool {
         || peeled
             .iter()
             .take(peeled.len().saturating_sub(1))
-            .any(|part| has_top_level_colon_in_binders(part) || parenthesized_implication(part))
-        || peeled
-            .last()
-            .is_some_and(|concl| has_top_level_colon_in_binders(concl))
+            .any(|part| {
+                has_top_level_colon_in_binders(part)
+                    || parenthesized_implication(part)
+                    || contains_arrow_inside_delimiters(part)
+            })
+        || peeled.last().is_some_and(|concl| {
+            has_top_level_colon_in_binders(concl)
+                || parenthesized_implication(concl)
+                || conclusion_has_unmodeled_nested_arrow(concl)
+        })
 }
 
 fn prop_escaped_decl_boundary(prop: &str) -> bool {
@@ -1653,11 +2411,13 @@ fn peel_implication_telescope(prop: &str) -> Vec<String> {
             current = split.last().cloned().unwrap_or_default();
             continue;
         }
-        if let Some(inner) = strip_wrapping_parens(&current) {
-            if split_arrow(inner).is_some() {
-                current = inner.to_string();
-                continue;
-            }
+        let mut unwrapped = current.as_str();
+        while let Some(inner) = strip_wrapping_parens(unwrapped) {
+            unwrapped = inner;
+        }
+        if unwrapped.len() != current.trim().len() && split_arrow(unwrapped).is_some() {
+            current = unwrapped.to_string();
+            continue;
         }
         break;
     }
@@ -1957,8 +2717,8 @@ fn split_arrow(ty: &str) -> Option<(String, String)> {
     None
 }
 
-fn safe_inhabited_value_binder_type(ty: &str, has_unmodeled_env: bool) -> bool {
-    if has_unmodeled_env || type_is_vacuous(ty) {
+fn safe_inhabited_value_binder_type(ty: &str, has_shadowed_value_types: bool) -> bool {
+    if has_shadowed_value_types || type_is_vacuous(ty) {
         return false;
     }
     let mut cur = ty.trim();
@@ -1991,8 +2751,7 @@ fn safe_inhabited_value_binder_type(ty: &str, has_unmodeled_env: bool) -> bool {
             | "ContractState"
             | "TurboLean.Reflection.ContractState"
             | "Type"
-    ) || cur.starts_with("Type ")
-        || cur.starts_with("Sort ")
+    ) || is_universe_type(cur)
     {
         return true;
     }
@@ -2297,20 +3056,22 @@ fn consume_in_command_prefix(
                 depth = depth.saturating_sub(1);
                 body_is_ws = false;
             }
-            'l' if depth == 0 && token_is_keyword(chars, i, "let") => {
+            'l' | 'o' | 's' if depth == 0 && starts_scoped_term(chars, i) => {
                 pending_let_in = true;
                 body_is_ws = false;
             }
+            't' | 'l'
+                if depth == 0
+                    && (token_is_keyword(chars, i, "theorem")
+                        || token_is_keyword(chars, i, "lemma")) =>
+            {
+                body_is_ws = false;
+            }
             ';' if depth == 0 => {
-                if pending_let_in {
-                    pending_let_in = false;
-                    body_is_ws = false;
-                } else {
-                    return None;
-                }
+                pending_let_in = false;
+                body_is_ws = false;
             }
             '\n' if depth == 0 => {
-                pending_let_in = false;
                 if command_line_continues(src, byte_offsets, chars, kw, body_is_ws, cmd_col, i) {
                     body_is_ws = false;
                 } else {
@@ -2357,24 +3118,37 @@ fn classify_in_prefix(kw: &str, raw: &str) -> PrefixAction {
             .iter()
             .any(|reserved| ident_mentioned(raw, reserved))
     {
+        if kw == "export" || raw.contains('(') || ident_mentioned(raw, "renaming") {
+            return PrefixAction::ShadowedValueEnv;
+        }
         return PrefixAction::UnmodeledEnv;
     }
     if matches!(
         kw,
-        "def"
-            | "abbrev"
-            | "class"
-            | "structure"
-            | "inductive"
-            | "coinductive"
-            | "axiom"
-            | "opaque"
-            | "constant"
-            | "example"
-            | "theorem"
-            | "lemma"
+        "class" | "structure" | "inductive" | "coinductive" | "axiom" | "opaque"
     ) {
-        return PrefixAction::UnmodeledEnv;
+        return PrefixAction::ShadowedValueEnv;
+    }
+    if matches!(
+        kw,
+        "def" | "abbrev" | "constant" | "example" | "theorem" | "lemma"
+    ) {
+        if matches!(kw, "theorem" | "lemma") {
+            return PrefixAction::ShadowedValueEnv;
+        }
+        let after_kw = raw.trim_start().trim_start_matches(kw).trim_start();
+        let short: String = after_kw
+            .chars()
+            .take_while(|c| is_ident_continue(*c) || *c == '.' || *c == '«' || *c == '»')
+            .collect();
+        let short = short.rsplit('.').next().unwrap_or(short.as_str());
+        let short_canon = crate::splitter::canonical_lean_name_component(short);
+        if RESERVED_INSTANCE_AND_TYPE_NAMES.contains(&short_canon.as_str())
+            || ident_mentioned(after_kw, "theorem")
+            || ident_mentioned(after_kw, "lemma")
+        {
+            return PrefixAction::ShadowedValueEnv;
+        }
     }
     PrefixAction::Ignore
 }
@@ -2393,7 +3167,7 @@ fn dotted_name_multiline(
     }
     if pos < n && chars[pos] == '\n' {
         let next = next_significant(src, byte_offsets, chars, pos + 1);
-        if next < n && line_col(chars, next) > cmd_col && !is_top_level_command_token(chars, next) {
+        if next < n && line_col(chars, next) > cmd_col && !is_top_level_command_start(chars, next) {
             pos = next;
             crossed = true;
         }
@@ -2567,10 +3341,12 @@ fn visibility_of(
 struct FileCardCtx<'a> {
     path: &'a Path,
     local_defs: &'a [(String, Vec<String>, String, String)],
+    prop_local_defs: &'a [(String, Vec<String>, String)],
     hygiene: &'a crate::splitter::HygieneReport,
     audit: &'a Value,
     has_unmodeled_instance_env: bool,
     has_unmodeled_syntax_env: bool,
+    has_shadowed_value_types: bool,
 }
 
 fn card_for(
@@ -2583,12 +3359,51 @@ fn card_for(
 ) -> Value {
     let mut param_binders = Vec::new();
     let mut hypothesis_text = Vec::new();
+    let mut seen_type_params: BTreeSet<String> = BTreeSet::new();
+    let mut seen_prop_params: BTreeSet<String> = BTreeSet::new();
+    let mut seen_value_params: BTreeSet<String> = BTreeSet::new();
+    let mut unmodeled_binder = false;
     for (vars, ty) in &decl.binders {
-        if is_known_binder_value_type(ty)
-            && safe_inhabited_value_binder_type(ty, ctx.has_unmodeled_instance_env)
+        if !binder_type_is_modeled(
+            ty,
+            &seen_type_params,
+            &seen_prop_params,
+            &seen_value_params,
+            ctx.prop_local_defs,
+        ) && !(is_known_binder_value_type(ty)
+            && safe_inhabited_value_binder_type(ty, ctx.has_shadowed_value_types))
+            && !is_universe_type(ty)
+            && ty.trim() != "Prop"
+            && ty.trim() != "_root_.Prop"
+            && !seen_type_params.contains(ty.trim())
         {
+            unmodeled_binder = true;
+        }
+        if is_universe_type(ty) && vars.iter().all(|var| is_ident_token(var)) {
+            seen_type_params.extend(vars.iter().cloned());
             param_binders.push(json!({"vars": vars, "type": ty}));
+        } else if (ty.trim() == "Prop" || ty.trim() == "_root_.Prop")
+            && vars.iter().all(|var| is_ident_token(var))
+        {
+            seen_prop_params.extend(vars.iter().cloned());
+            param_binders.push(json!({"vars": vars, "type": ty}));
+        } else if seen_type_params.contains(ty.trim())
+            || (is_known_binder_value_type(ty)
+                && safe_inhabited_value_binder_type(ty, ctx.has_shadowed_value_types))
+        {
+            seen_value_params.extend(vars.iter().cloned());
+            param_binders.push(json!({"vars": vars, "type": ty}));
+        } else if binder_type_is_modeled(
+            ty,
+            &seen_type_params,
+            &seen_prop_params,
+            &seen_value_params,
+            ctx.prop_local_defs,
+        ) {
+            let names = vars.join(" ");
+            hypothesis_text.push(format!("({names} : {ty})"));
         } else {
+            unmodeled_binder = true;
             let names = vars.join(" ");
             hypothesis_text.push(format!("({names} : {ty})"));
         }
@@ -2603,6 +3418,23 @@ fn card_for(
     let vacuous_hypothesis = hypothesis_text
         .iter()
         .any(|text| hypothesis_is_vacuous(text));
+    let unmodeled_hypothesis = !seen_prop_params.is_empty()
+        || hypothesis_text.iter().any(|text| {
+            !hypothesis_is_modeled(
+                text,
+                &seen_type_params,
+                &seen_prop_params,
+                &seen_value_params,
+                ctx.prop_local_defs,
+            )
+        })
+        || !conclusion_is_modeled(
+            &conclusion,
+            &seen_type_params,
+            &seen_prop_params,
+            &seen_value_params,
+            ctx.prop_local_defs,
+        );
     let instance_binders = extra
         .map(|row| row.instance_binders.clone())
         .unwrap_or_default();
@@ -2639,6 +3471,8 @@ fn card_for(
     if extra.is_none()
         || extra.is_some_and(|row| row.saw_unparsed_binder || row.saw_unparsed_telescope)
         || vacuous_hypothesis
+        || unmodeled_binder
+        || unmodeled_hypothesis
     {
         extraction_warnings.push(
             "declaration modifiers, attributes, or binders were not fully parsed".to_string(),
