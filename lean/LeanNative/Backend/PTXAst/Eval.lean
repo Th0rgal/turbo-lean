@@ -2170,15 +2170,15 @@ def ppCmpOp : PTXCmpOp → String
   | .hi => ".hi"
   | .hs => ".hs"
 
-private def hexDigitChar (n : Nat) : Char :=
+def hexDigitChar (n : Nat) : Char :=
   let d := n % 16
   if d < 10 then Char.ofNat ('0'.toNat + d) else Char.ofNat ('a'.toNat + (d - 10))
 
-private def toHexFixedGo (v : Nat) (acc : List Char) : Nat → List Char
+def toHexFixedGo (v : Nat) (acc : List Char) : Nat → List Char
   | 0 => acc
   | k + 1 => toHexFixedGo (v / 16) (hexDigitChar v :: acc) k
 
-private def toHexFixed (val : Nat) (nibbles : Nat) : String :=
+def toHexFixed (val : Nat) (nibbles : Nat) : String :=
   String.ofList (toHexFixedGo val [] nibbles)
 
 /-- Render a `PTXOperand`. -/
@@ -2194,12 +2194,10 @@ def ppPTXOperand : PTXOperand → String
 /-- Render a `PTXAddr` bracketed memory operand. -/
 def ppPTXAddr : PTXAddr → String
   | .paramSym name => s!"[{name}]"
-  | .regOffset r 0 => s!"[{r}]"
   | .regOffset r off =>
-    if off > 0 then s!"[{r}+{off}]" else s!"[{r}{off}]"
-  | .symOffset s 0 => s!"[{s}]"
+    if off = 0 then s!"[{r}]" else if off > 0 then s!"[{r}+{off}]" else s!"[{r}{off}]"
   | .symOffset s off =>
-    if off > 0 then s!"[{s}+{off}]" else s!"[{s}{off}]"
+    if off = 0 then s!"[{s}]" else if off > 0 then s!"[{s}+{off}]" else s!"[{s}{off}]"
 
 /-- Render a `PTXPredGuard` (`@%p1 ` or `@!%p1 `). -/
 def ppPredGuard (g : PTXPredGuard) : String :=
@@ -2389,6 +2387,20 @@ def CanonicalPTXInstr : PTXInstr → Prop
 def CanonicalPTXStmt : PTXStmt → Prop
   | .label name => CanonicalPTXName name
   | .instr guard instr => (∀ g ∈ guard, CanonicalPTXPredGuard g) ∧ CanonicalPTXInstr instr
+
+def CanonicalPTXParamDecl (p : PTXParamDecl) : Prop := CanonicalPTXSymbol p.name
+
+def CanonicalPTXRegDecl (r : PTXRegDecl) : Prop :=
+  CanonicalPTXName r.prefixName ∧ r.prefixName.startsWith "%" = true
+
+def CanonicalPTXSharedDecl (s : PTXSharedDecl) : Prop := CanonicalPTXSymbol s.name
+
+def CanonicalPTXKernel (k : PTXKernel) : Prop :=
+  CanonicalPTXSymbol k.name ∧
+  (∀ p ∈ k.params, CanonicalPTXParamDecl p) ∧
+  (∀ r ∈ k.regDecls, CanonicalPTXRegDecl r) ∧
+  (∀ s ∈ k.sharedDecls, CanonicalPTXSharedDecl s) ∧
+  (∀ s ∈ k.body, CanonicalPTXStmt s)
 
 /-- Disambiguate register names from the twelve architectural special registers. -/
 def parsePTXNamedOperand (name : String) : PTXOperand :=
@@ -2591,9 +2603,50 @@ def parsePTXStmt (fuel : Nat) (input : List Char) : Option (PTXStmt × List Char
     let (name, rest) ← parsePTXName fuel input
     return (.label name, ← stripPrefixChars [':'] rest)
 
+/-- Scan newline-delimited text with a character budget. -/
+def scanPTXLines : Nat → List Char → Option (List (List Char))
+  | 0, _ => none
+  | _ + 1, [] => some [[]]
+  | fuel + 1, c :: cs => do
+    let line :: lines ← scanPTXLines fuel cs | none
+    if c == '\n' then return [] :: line :: lines
+    else return (c :: line) :: lines
+
+def parsePTXParamDecl (fuel : Nat) (input : List Char) :
+    Option (PTXParamDecl × List Char) := do
+  let input ← stripPrefixChars "    .param ".toList input
+  let (ty, input) ← parsePTXType fuel input
+  let input ← stripPrefixChars [' '] input
+  let (name, rest) ← parsePTXName fuel input
+  return ({ name, ty }, rest)
+
+def parsePTXRegDecl (fuel : Nat) (input : List Char) :
+    Option (PTXRegDecl × List Char) := do
+  let input ← stripPrefixChars "    .reg ".toList input
+  let (ty, input) ← parsePTXType fuel input
+  let input ← stripPrefixChars [' '] input
+  let (prefixName, input) ← parsePTXName fuel input
+  let input ← stripPrefixChars ['<'] input
+  let (count, input) ← parsePTXName fuel input
+  let rest ← stripPrefixChars ['>', ';'] input
+  return ({ ty, prefixName, count := ← count.toNat? }, rest)
+
+def parsePTXSharedDecl (fuel : Nat) (input : List Char) :
+    Option (PTXSharedDecl × List Char) := do
+  let input ← stripPrefixChars "    .shared .align ".toList input
+  let (align, input) ← parsePTXName fuel input
+  let input ← stripPrefixChars [' '] input
+  let (elemTy, input) ← parsePTXType fuel input
+  let input ← stripPrefixChars [' '] input
+  let (name, input) ← parsePTXName fuel input
+  let input ← stripPrefixChars ['['] input
+  let (count, input) ← parsePTXName fuel input
+  let rest ← stripPrefixChars [']', ';'] input
+  return ({ name, elemTy, align := ← align.toNat?, count := ← count.toNat? }, rest)
+
 /-- Parse a complete kernel, retaining declaration order and rejecting unknown lines. -/
 def parsePTXKernel (fuel : Nat) (text : String) : Option PTXKernel := do
-  let header :: lines := text.splitOn "\n" | none
+  let header :: lines := (← scanPTXLines (text.toList.length + 1) text.toList).map String.ofList | none
   let header ← stripPrefixChars ".visible .entry ".toList header.toList
   let (name, rest) ← parsePTXName fuel header
   let (params, lines) ← if rest == "()".toList then pure ([], lines) else do
@@ -2601,38 +2654,20 @@ def parsePTXKernel (fuel : Nat) (text : String) : Option PTXKernel := do
       let paramLines := lines.takeWhile (· != ")")
       let ")" :: lines := lines.drop paramLines.length | none
       let params ← paramLines.mapM fun line => do
-        let chars ← stripPrefixChars "    .param ".toList line.toList
-        let (ty, chars) ← parsePTXType fuel chars
-        let chars ← stripPrefixChars [' '] chars
-        let (name, rest) ← parsePTXName fuel chars
-        if rest == [] || rest == [','] then pure ({ name, ty } : PTXParamDecl) else none
+        let (param, rest) ← parsePTXParamDecl fuel line.toList
+        if rest == [] || rest == [','] then pure param else none
       pure (params, lines)
   let "{" :: lines := lines | none
   let "}" :: reversed := lines.reverse | none
   let mut kernel : PTXKernel := { name, params, regDecls := [], sharedDecls := [], body := [] }
   let mut inBody := false
   for line in reversed.reverse do
-    if let some chars := stripPrefixChars "    .reg ".toList line.toList then
+    if let some (reg, []) := parsePTXRegDecl fuel line.toList then
       if inBody then none else do
-        let (ty, chars) ← parsePTXType fuel chars
-        let chars ← stripPrefixChars [' '] chars
-        let (prefixName, chars) ← parsePTXName fuel chars
-        let chars ← stripPrefixChars ['<'] chars
-        let (count, chars) ← parsePTXName fuel chars
-        let [] ← stripPrefixChars ['>', ';'] chars | none
-        kernel := { kernel with regDecls := kernel.regDecls ++ [{ ty, prefixName, count := ← count.toNat? }] }
-    else if let some chars := stripPrefixChars "    .shared .align ".toList line.toList then
+        kernel := { kernel with regDecls := kernel.regDecls ++ [reg] }
+    else if let some (shared, []) := parsePTXSharedDecl fuel line.toList then
       if inBody then none else do
-        let (align, chars) ← parsePTXName fuel chars
-        let chars ← stripPrefixChars [' '] chars
-        let (elemTy, chars) ← parsePTXType fuel chars
-        let chars ← stripPrefixChars [' '] chars
-        let (name, chars) ← parsePTXName fuel chars
-        let chars ← stripPrefixChars ['['] chars
-        let (count, chars) ← parsePTXName fuel chars
-        let [] ← stripPrefixChars [']', ';'] chars | none
-        kernel := { kernel with sharedDecls := kernel.sharedDecls ++
-          [{ name, elemTy, align := ← align.toNat?, count := ← count.toNat? }] }
+        kernel := { kernel with sharedDecls := kernel.sharedDecls ++ [shared] }
     else if let some chars := stripPrefixChars "    .local .align 8 .b8 __local_mem[".toList line.toList then
       if inBody || kernel.localBytes != 0 then none else do
         let (count, chars) ← parsePTXName fuel chars

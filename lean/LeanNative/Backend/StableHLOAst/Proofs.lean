@@ -1,9 +1,82 @@
 import LeanNative.Backend.StableHLOAst.Syntax
 import LeanNative.Backend.StableHLOAst.Eval
+import Std.Data.String.ToNat
 
 namespace LeanNative.Backend.StableHLOAst
 
 open LeanNative.IR
+
+theorem stripPrefixChars_append (pre rest : List Char) :
+    stripPrefixChars pre (pre ++ rest) = some rest := by
+  induction pre <;> simp_all [stripPrefixChars]
+
+theorem scanHLOFields_singleton_append (sep : Char) (field rest : List Char)
+    (hn : sep ∉ field) (fuel : Nat) (hf : field.length < fuel) :
+    scanHLOFields [sep] fuel (field ++ sep :: rest) =
+      (scanHLOFields [sep] (fuel - field.length - 1) rest).map (fun fields => field :: fields) := by
+  induction field generalizing fuel with
+  | nil =>
+    cases fuel with
+    | zero => simp at hf
+    | succ f =>
+      simp only [scanHLOFields, stripPrefixChars, List.nil_append, List.isEmpty_cons,
+        Bool.false_eq_true, ↓reduceIte, beq_self_eq_true, List.length_nil, Nat.sub_zero,
+        Nat.add_sub_cancel]
+      cases scanHLOFields [sep] f rest <;> rfl
+  | cons c cs ih =>
+    cases fuel with
+    | zero => simp at hf
+    | succ f =>
+      have hc : sep ≠ c := by simp_all
+      have ht : sep ∉ cs := by simp_all
+      simp only [List.cons_append, scanHLOFields, List.isEmpty_cons, Bool.false_eq_true,
+        ↓reduceIte, stripPrefixChars, beq_iff_eq, hc]
+      rw [ih ht f (by simpa using hf)]
+      cases h : scanHLOFields [sep] (f - cs.length - 1) rest <;>
+        simp [List.length_cons, Nat.succ_sub_succ_eq_sub, h]
+
+theorem scanHLOFields_singleton_last (sep : Char) (field : List Char)
+    (hn : sep ∉ field) (fuel : Nat) (hf : field.length < fuel) :
+    scanHLOFields [sep] fuel field = some [field] := by
+  induction field generalizing fuel with
+  | nil => cases fuel <;> simp_all [scanHLOFields]
+  | cons c cs ih =>
+    cases fuel with
+    | zero => simp at hf
+    | succ f =>
+      have hc : sep ≠ c := by simp_all
+      have ht : sep ∉ cs := by simp_all
+      simp [scanHLOFields, stripPrefixChars, hc, ih ht f (by simpa using hf)]
+
+theorem scanHLOFields_intercalate (sep : Char) (fields : List (List Char))
+    (hne : fields ≠ []) (hn : ∀ field ∈ fields, sep ∉ field)
+    (fuel : Nat) (hf : (List.intercalate [sep] fields).length < fuel) :
+    scanHLOFields [sep] fuel (List.intercalate [sep] fields) = some fields := by
+  induction fields generalizing fuel with
+  | nil => contradiction
+  | cons field fields ih =>
+    cases fields with
+    | nil => simpa using scanHLOFields_singleton_last sep field (hn _ (by simp)) fuel (by simpa using hf)
+    | cons next fields =>
+      have he : List.intercalate [sep] (field :: next :: fields) =
+          field ++ sep :: List.intercalate [sep] (next :: fields) := by
+        simp [List.intercalate, List.intersperse]
+      rw [he] at hf ⊢
+      rw [scanHLOFields_singleton_append sep field _ (hn _ (by simp)) fuel (by simp at hf; omega)]
+      rw [ih (by simp) (by intro x hx; exact hn x (by simp [hx])) _
+        (by simp only [List.length_append, List.length_cons] at hf; omega)]
+      rfl
+
+theorem parseHLOFields_intercalate (sep : Char) (fields : List String)
+    (hne : fields ≠ []) (hn : ∀ field ∈ fields, sep ∉ field.toList) :
+    parseHLOFields (String.singleton sep) (String.intercalate (String.singleton sep) fields) =
+      some fields := by
+  unfold parseHLOFields
+  have hs := scanHLOFields_intercalate sep (fields.map String.toList)
+    (by simpa using hne) (by simpa using hn)
+    ((List.intercalate [sep] (fields.map String.toList)).length + 1) (by omega)
+  simpa [String.toList_intercalate, List.map_map] using congrArg
+    (Option.map (List.map String.ofList)) hs
 
 /-- Successful body parsing respects the printer's environment update at every step. -/
 theorem parseBody_cons (tenv : TypeEnv) (line : String) (lines : List String)
@@ -29,6 +102,54 @@ theorem ppElemType_injective_via_parser : Function.Injective ppElemType := by
   intro a b h
   have hp := congrArg (fun s : String => parseElemType 1 (s.toList ++ ['>'])) h
   simpa only [parseElemType_roundtrip, Option.some.injEq, Prod.mk.injEq, and_true] using hp
+
+theorem parseElemType_complete (ty : ElemType) :
+    parseElemType 1 (ppElemType ty).toList = some (ty, []) := by
+  cases ty <;> rfl
+
+theorem ppTensorType_fields (ty : TensorType) :
+    ppTensorType ty = "tensor<" ++
+      String.intercalate "x" (ty.shape.map Nat.repr ++ [ppElemType ty.elem]) ++ ">" := by
+  cases ty with
+  | mk shape elem =>
+    cases shape with
+    | nil => simp [ppTensorType, toString]
+    | cons n ns =>
+      rw [String.intercalate_append_of_ne_nil (by simp : (n :: ns).map Nat.repr ≠ [])
+          (by simp : [ppElemType elem] ≠ [])]
+      simp [ppTensorType, ppShape, toString, String.append_assoc]
+
+theorem parseTensorType_roundtrip (ty : TensorType) :
+    parseTensorType (ppTensorType ty) = some ty := by
+  have hn (n : Nat) : 'x' ∉ n.repr.toList := by
+    intro h
+    have hd := Nat.isDigit_of_mem_toDigits (b := 10) (n := n) (by omega) (by omega)
+      (by simpa only [Nat.toList_repr] using h)
+    contradiction
+  have he : 'x' ∉ (ppElemType ty.elem).toList := by cases ty.elem <;> decide
+  have hs := parseHLOFields_intercalate 'x' (ty.shape.map Nat.repr ++ [ppElemType ty.elem])
+    (by simp) (by
+      intro field h
+      rcases List.mem_append.mp h with h | h
+      · obtain ⟨n, _, rfl⟩ := List.mem_map.mp h; exact hn n
+      · obtain rfl := List.mem_singleton.mp h; exact he)
+  have hx : String.singleton 'x' = "x" := by decide
+  rw [hx] at hs
+  rw [ppTensorType_fields]
+  simp only [parseTensorType, String.toList_append, String.reduceToList,
+    List.cons_append, List.nil_append, List.reverse_append, List.reverse_cons,
+    List.reverse_nil, List.nil_append, List.reverse_reverse]
+  simp only [String.ofList_toList]
+  rw [hs]
+  have hmap : ∀ xs : List Nat, xs.mapM (String.toNat? ∘ Nat.repr) = some xs := by
+    intro xs
+    induction xs <;> simp_all [List.mapM_cons, Function.comp_def]
+  simp [parseElemType_complete, hmap]
+
+theorem ppTensorType_injective : Function.Injective ppTensorType := by
+  intro a b h
+  have hp := congrArg parseTensorType h
+  simpa only [parseTensorType_roundtrip, Option.some.injEq] using hp
 
 theorem numElements_scalar (e : ElemType) :
     ({ shape := [], elem := e : TensorType }).numElements = 1 := rfl

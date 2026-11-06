@@ -1040,11 +1040,32 @@ def evalModuleOp (m : ModuleOp) (func : String) (args : List TensorVal) :
   | none => .error (.unbound func)
   | some f => evalFuncOp f args
 
+/-- Exact prefix consumption for structural StableHLO text parsers. -/
+def stripPrefixChars : List Char → List Char → Option (List Char)
+  | [], input => some input
+  | _ :: _, [] => none
+  | p :: ps, c :: cs => if p == c then stripPrefixChars ps cs else none
+
+/-- Delimiter scanner with an explicit input-character budget. -/
+def scanHLOFields (sep : List Char) : Nat → List Char → Option (List (List Char))
+  | 0, _ => none
+  | _ + 1, [] => some [[]]
+  | fuel + 1, c :: cs =>
+    if sep.isEmpty then none else
+    match stripPrefixChars sep (c :: cs) with
+    | some rest => do return [] :: (← scanHLOFields sep fuel rest)
+    | none => do
+      let field :: fields ← scanHLOFields sep fuel cs | none
+      return (c :: field) :: fields
+
+def parseHLOFields (sep : String) (text : String) : Option (List String) :=
+  (scanHLOFields sep.toList (text.toList.length + 1) text.toList).map (List.map String.ofList)
+
 /-- Parse a statically shaped tensor type and require complete token consumption. -/
 def parseTensorType (text : String) : Option TensorType := do
   let 't' :: 'e' :: 'n' :: 's' :: 'o' :: 'r' :: '<' :: chars := text.toList | none
   let '>' :: rev := chars.reverse | none
-  let parts := (String.ofList rev.reverse).splitOn "x"
+  let parts ← parseHLOFields "x" (String.ofList rev.reverse)
   let elemText ← parts.getLast?
   let (elem, []) ← parseElemType 1 elemText.toList | none
   let shape ← parts.dropLast.mapM String.toNat?
@@ -1059,7 +1080,7 @@ def parseNatList (text : String) : Option (List Nat) := do
   let '[' :: chars := text.toList | none
   let ']' :: rev := chars.reverse | none
   if rev.isEmpty then some []
-  else (String.ofList rev.reverse).splitOn ", " |>.mapM String.toNat?
+  else (← parseHLOFields ", " (String.ofList rev.reverse)).mapM String.toNat?
 
 /-- Parse binary operation syntax independently of its type annotation. -/
 def parseBinaryOp (opcode dst a b : String) : Option StableHLOOp :=
@@ -1082,17 +1103,17 @@ def parseBinaryOp (opcode dst a b : String) : Option StableHLOOp :=
 /-- Constant/binary/unbatched-dot/return fragment parser. Type annotations agree with the supplied SSA
 environment; unknown or ill-typed operands are rejected rather than using printer defaults. -/
 def parseStableHLOOp (tenv : TypeEnv) (text : String) : Option StableHLOOp := do
-  let [operation, annotation] := text.splitOn " : " | none
-  if let [dst, payload] := operation.splitOn " = stablehlo.dot_general " then
+  let [operation, annotation] ← parseHLOFields " : " text | none
+  if let some [dst, payload] := parseHLOFields " = stablehlo.dot_general " operation then
     let dst ← parseSSAName dst
-    let [args, contraction] := payload.splitOn ", contracting_dims = " | none
-    let [a, b] := args.splitOn ", " | none
+    let [args, contraction] ← parseHLOFields ", contracting_dims = " payload | none
+    let [a, b] ← parseHLOFields ", " args | none
     let a ← parseSSAName a
     let b ← parseSSAName b
-    let [lc, rc] := contraction.splitOn " x " | none
+    let [lc, rc] ← parseHLOFields " x " contraction | none
     let lc ← parseNatList lc
     let rc ← parseNatList rc
-    let [_, outType] := annotation.splitOn " -> " | none
+    let [_, outType] ← parseHLOFields " -> " annotation | none
     let ty ← parseTensorType outType
     let op := StableHLOOp.dotGeneral dst a b [] [] lc rc ty.shape
     let ta ← tenv a
@@ -1100,7 +1121,7 @@ def parseStableHLOOp (tenv : TypeEnv) (text : String) : Option StableHLOOp := do
     let inferred ← resultTypeOf tenv op
     if inferred == ty && annotation == s!"({ppTensorType ta}, {ppTensorType tb}) -> {ppTensorType ty}"
       then return op else none
-  if let [dst, payload] := operation.splitOn " = stablehlo.constant dense<" then
+  if let some [dst, payload] := parseHLOFields " = stablehlo.constant dense<" operation then
     let dst ← parseSSAName dst
     let ty ← parseTensorType annotation
     let '>' :: rev := payload.toList.reverse | none
@@ -1108,13 +1129,13 @@ def parseStableHLOOp (tenv : TypeEnv) (text : String) : Option StableHLOOp := do
       let body := String.ofList rev.reverse
       let values ← (if let '[' :: chars := body.toList then do
         let ']' :: rev := chars.reverse | none
-        (String.ofList rev.reverse).splitOn ", " |>.mapM String.toNat?
+        (← parseHLOFields ", " (String.ofList rev.reverse)).mapM String.toNat?
         else do
           let n ← body.toNat?
           pure (List.replicate ty.numElements n) : Option (List Nat))
       if values.length != ty.numElements || !(values.all (· < 2^64)) then none
       else return .constant dst { ty, data := (values.map (BitVec.ofNat 64)).toArray }
-  match operation.splitOn " " with
+  match ← parseHLOFields " " operation with
   | ["return", arg] =>
     let name ← parseSSAName arg
     let ty ← tenv name
@@ -1140,16 +1161,16 @@ def parseBody (tenv : TypeEnv) : List String → Option (List StableHLOOp)
 
 /-- Parse the single-line function signature and newline-separated covered operations. -/
 def parseFuncOp (text : String) : Option FuncOp := do
-  let header :: lines := text.splitOn "\n" | none
-  let ["  func.func", signature] := header.splitOn " @" | none
-  let [name, signature] := signature.splitOn "(" | none
+  let header :: lines ← parseHLOFields "\n" text | none
+  let ["  func.func", signature] ← parseHLOFields " @" header | none
+  let [name, signature] ← parseHLOFields "(" signature | none
   let _ ← parseSSAName ("%" ++ name)
-  let [params, signature] := signature.splitOn ") -> " | none
-  let [result, ""] := signature.splitOn " {" | none
+  let [params, signature] ← parseHLOFields ") -> " signature | none
+  let [result, ""] ← parseHLOFields " {" signature | none
   let result ← parseTensorType result
-  let params ← (if params.isEmpty then some [] else
-    (params.splitOn ", ").mapM fun param => do
-      let [name, ty] := param.splitOn ": " | none
+  let params ← (if params.isEmpty then some [] else do
+    (← parseHLOFields ", " params).mapM fun param => do
+      let [name, ty] ← parseHLOFields ": " param | none
       return (← parseSSAName name, ← parseTensorType ty))
   let "  }" :: reversed := lines.reverse | none
   let tenv := params.foldl (fun env (name, ty) => env.bind name ty) TypeEnv.empty
