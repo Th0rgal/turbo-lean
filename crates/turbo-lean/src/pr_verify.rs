@@ -6906,11 +6906,7 @@ fn hash_deterministic_file_tree(
         children.sort();
         for p in children {
             let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if matches!(
-                name,
-                ".git" | ".elan" | ".cargo" | ".benchmark-tools" | "target" | "node_modules"
-            ) || name.starts_with(".turbo_")
-            {
+            if name == ".git" {
                 continue;
             }
             if skip_dirs.contains(&p) {
@@ -9930,6 +9926,12 @@ globs = ["Corpus.+"]
     fn untrusted_kernel_statements_materialize_removed_base_manifest_git_dependencies() -> Result<()>
     {
         use std::os::unix::fs::symlink;
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if crate::module_builder::probe_bwrap_sandbox(Path::new(".")).is_none() {
             println!("untrusted removed base dependency fixture skipped: no working bubblewrap");
             return Ok(());
@@ -10095,6 +10097,12 @@ lean_lib Demo where
 
     #[test]
     fn non_lean_gitlink_allowed_and_lean_overlapping_gitlink_rejected() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "turbo-gitlink-filter-{}-{}",
             std::process::id(),
@@ -10233,6 +10241,12 @@ globs = ["Demo.+"]
 
     #[test]
     fn kernel_statement_fixtures() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "turbo-kernel-statements-{}-{}",
             std::process::id(),
@@ -10538,6 +10552,9 @@ root = "Spoof"
 
     #[test]
     fn kernel_policy_is_resolved_at_base_and_never_admits_forbidden_axioms() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -10798,6 +10815,9 @@ end Fixture
 
     #[test]
     fn unsafe_and_implemented_by_policy_and_replay_isolation() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -12364,6 +12384,9 @@ allow = [
 
     #[test]
     fn test_untrusted_ci_and_pr_verify_fail_closed_and_kernel_audit() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -12605,6 +12628,9 @@ allow = [
 
     #[test]
     fn test_untrusted_pr_verify_multi_theorem_file_checks_full_source() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -12667,6 +12693,9 @@ allow = [
 
     #[test]
     fn test_pr_verify_rejects_native_decide_proof_edit_in_both_modes() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -12739,6 +12768,12 @@ allow = [
 
     #[test]
     fn test_trusted_pr_verify_rejects_metaprogram_sorry_proof_edits() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Proof-only edits that close the goal with `sorryAx` without any `sorry`/`admit` token, in
         // a file that spoofs `#print axioms`, are rejected end to end in trusted mode (by the
         // statement-policy audit, a final zygote rejection, or the audited fallback).
@@ -12798,6 +12833,9 @@ allow = [
 
     #[test]
     fn test_pr_verify_rechecks_dependents_of_nonlocal_edits_with_lake() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -12956,6 +12994,9 @@ allow = [
 
     #[test]
     fn test_pr_verify_cone_budget_overflow_fails_closed_without_emitting_receipt() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -14948,6 +14989,12 @@ end ParityNs
 
     #[test]
     fn test_pr_verify_and_check_reject_kernel_type_mismatch_fail_closed() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "turbo_kth_mismatch_{}_{}",
             std::process::id(),
@@ -15912,6 +15959,12 @@ end ParityNs
     fn test_head_statement_report_snapshot_bound_rejects_post_audit_live_olean_swap() -> Result<()>
     {
         use crate::worktree_test_support::LakeTree;
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let tree = LakeTree::new(
             "stmt_snap_swap",
             &[("P/A.lean", "theorem a_thm : 1 + 1 = 2 := rfl\n")],
@@ -16042,6 +16095,9 @@ end ParityNs
         let _guard = crate::pack::tests::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = std::env::temp_dir().join(format!(
             "turbo_base_stmt_dep_bind_{}_{}",
             std::process::id(),
@@ -16050,19 +16106,19 @@ end ParityNs
         let _ = fs::remove_dir_all(&root);
         let dep_dir = root.join("dep");
         let proj = root.join("proj");
-        fs::create_dir_all(dep_dir.join("Dep"))?;
+        fs::create_dir_all(dep_dir.join("target/Dep"))?;
         fs::create_dir_all(proj.join("App"))?;
         let tc = include_str!("../../../lean/lean-toolchain");
         fs::write(dep_dir.join("lean-toolchain"), tc)?;
         fs::write(
             dep_dir.join("lakefile.toml"),
-            "name = \"dep\"\ndefaultTargets = [\"Dep\"]\n[[lean_lib]]\nname = \"Dep\"\nroots = [\"Dep\"]\n",
+            "name = \"dep\"\nsrcDir = \"target\"\ndefaultTargets = [\"Dep\"]\n[[lean_lib]]\nname = \"Dep\"\nroots = [\"Dep\"]\n",
         )?;
-        fs::write(dep_dir.join("Dep.lean"), "def depConst : Nat := 1\n")?;
+        fs::write(dep_dir.join("target/Dep.lean"), "def depConst : Nat := 1\n")?;
         fs::write(proj.join("lean-toolchain"), tc)?;
         fs::write(
             proj.join("lakefile.toml"),
-            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[input_file]]\nname = \"SpecCfg\"\npath = \"spec.txt\"\ntext = true\n[[lean_lib]]\nname = \"App\"\nneeds = [\"SpecCfg\"]\nroots = [\"App\"]\n",
+            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep\"\npath = \"../dep\"\n[[input_file]]\nname = \"SpecCfg\"\npath = \"spec.txt\"\ntext = true\n[[lean_lib]]\nname = \"App\"\nneeds = [\"SpecCfg\"]\nroots = [\"App\"]\n",
         )?;
         fs::write(proj.join("spec.txt"), "v1\n")?;
         fs::write(
@@ -16104,10 +16160,10 @@ end ParityNs
             "Lake input_file content change must rotate base_statement_cache_action_key"
         );
 
-        // Mutate path dependency `Dep.lean` macro (`macro "dep_ty" : term => ...`) without touching
-        // `proj`'s `HEAD` commit or `lakefile.toml`, and verify warm-vs-cold agreement:
+        // Mutate path dependency `target/Dep.lean` macro (`macro "dep_ty" : term => ...`) without touching
+        // `proj`'s `HEAD` commit or `lakefile.toml`, and verify warm-vs-cold agreement (including `srcDir = "target"`):
         fs::write(
-            dep_dir.join("Dep.lean"),
+            dep_dir.join("target/Dep.lean"),
             "macro \"dep_ty\" : term => `(Nat)\n",
         )?;
         fs::write(
@@ -16127,13 +16183,19 @@ end ParityNs
         let key_v2 = base_statement_cache_action_key(&proj, "HEAD", Path::new(""), None, &cfg_v2)
             .expect("base statement cache key v2");
 
-        // Now change `dep/Dep.lean` macro to expand `dep_ty` to `Bool` while modifying `App.lean`
-        // working tree to `theorem app_thm : Bool := false`. Under the old cache key, `warm_store`
-        // reused the stale cached `Nat` baseline while a cold store computed the new `Bool` baseline!
+        // First verify source-only edit under `dep/target/Dep.lean` BEFORE rebuilding artifacts rotates the key!
         fs::write(
-            dep_dir.join("Dep.lean"),
+            dep_dir.join("target/Dep.lean"),
             "macro \"dep_ty\" : term => `(Bool)\n",
         )?;
+        let cfg_dep_src_only = crate::module_builder::resolve_project_config(&proj)?;
+        let key_dep_src_only =
+            base_statement_cache_action_key(&proj, "HEAD", Path::new(""), None, &cfg_dep_src_only)
+                .expect("base statement cache key after dep/target/Dep.lean source-only change");
+        assert_ne!(
+            key_dep_src_only, key_v2,
+            "dependency source edit under `srcDir = \"target\"` must rotate base_statement_cache_action_key even before artifact rebuild"
+        );
         fs::write(
             proj.join("App.lean"),
             "import Dep\ntheorem app_thm : Bool := false\n",

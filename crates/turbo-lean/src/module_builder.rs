@@ -38278,6 +38278,10 @@ globs = ["Down.+"]
         {
             return Ok(());
         }
+        let _env_guard = native_build_env_guard();
+        let _bwrap_guard = BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "turbo_replay_batch_dep_reval_{}_{}",
             std::process::id(),
@@ -38287,16 +38291,16 @@ globs = ["Down.+"]
         let proj = dir.join("proj");
         let extra = dir.join("extra_lib");
         fs::create_dir_all(proj.join("Rb"))?;
-        fs::create_dir_all(extra.join("Rb"))?;
+        fs::create_dir_all(&extra)?;
         fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
         fs::write(
             proj.join("lakefile.toml"),
-            "name = \"rbbatch\"\ndefaultTargets = [\"Rb\"]\n[[lean_lib]]\nname = \"Rb\"\nroots = [\"Rb.Leaf\", \"Rb.Mid\", \"Rb.Top\", \"Rb.Parent\"]\n",
+            "name = \"rbbatch\"\ndefaultTargets = [\"Rb\"]\n[[lean_lib]]\nname = \"Rb\"\nroots = [\"Leaf\", \"Rb.Mid\", \"Rb.Top\", \"Rb.Parent\"]\n",
         )?;
-        fs::write(proj.join("Rb/Leaf.lean"), "def leafVal : Nat := 1\n")?;
+        fs::write(proj.join("Leaf.lean"), "def leafVal : Nat := 1\n")?;
         fs::write(
             proj.join("Rb/Mid.lean"),
-            "import Rb.Leaf\ndef midVal : Nat := leafVal\n",
+            "import Leaf\ndef midVal : Nat := leafVal\n",
         )?;
         fs::write(
             proj.join("Rb/Top.lean"),
@@ -38321,7 +38325,7 @@ globs = ["Down.+"]
             &store,
             &cfg,
             &[
-                "Rb.Leaf".to_string(),
+                "Leaf".to_string(),
                 "Rb.Mid".to_string(),
                 "Rb.Top".to_string(),
                 "Rb.Parent".to_string(),
@@ -38330,7 +38334,7 @@ globs = ["Down.+"]
             &[],
             false,
         )?;
-        let leaf_olean = proj.join(".lake/build/lib/lean/Rb/Leaf.olean");
+        let leaf_olean = proj.join(".lake/build/lib/lean/Leaf.olean");
         let mid_olean = proj.join(".lake/build/lib/lean/Rb/Mid.olean");
         let top_olean = proj.join(".lake/build/lib/lean/Rb/Top.olean");
         let parent_olean = proj.join(".lake/build/lib/lean/Rb/Parent.olean");
@@ -38356,15 +38360,15 @@ globs = ["Down.+"]
             .expect("fast-store authority snapshot");
         assert!(lookup.verify_fast_store_authority(&fast_auth));
 
-        // Rebuild `Rb.Leaf` with a changed definition while restoring `Mid`, `Top`, and `Parent`
+        // Rebuild `Leaf` with a changed definition while restoring `Mid`, `Top`, and `Parent`
         // `.olean` bytes untouched on disk.
-        fs::write(proj.join("Rb/Leaf.lean"), "def leafVal : Nat := 2\n")?;
+        fs::write(proj.join("Leaf.lean"), "def leafVal : Nat := 2\n")?;
         let out2 = Command::new("lake")
-            .args(["build", "Rb.Leaf"])
+            .args(["build", "Leaf"])
             .env("LEAN_NUM_THREADS", "2")
             .current_dir(&proj)
             .output()?;
-        anyhow::ensure!(out2.status.success(), "lake build Rb.Leaf v2 failed");
+        anyhow::ensure!(out2.status.success(), "lake build Leaf v2 failed");
         let leaf_v2 = fs::read(&leaf_olean)?;
         fs::write(&mid_olean, &mid_v1)?;
         fs::write(&top_olean, &top_v1)?;
@@ -38383,15 +38387,15 @@ globs = ["Down.+"]
         );
         assert!(
             !lookup.is_audited_in_store(&store, &cfg, &lp, "Rb.Top", &top_olean),
-            "mutated transitive dependency Rb.Leaf must invalidate memoized Rb.Top audit lookup"
+            "mutated transitive dependency Leaf must invalidate memoized Rb.Top audit lookup"
         );
         assert!(
             !lookup.verify_fast_store_authority(&fast_auth),
-            "mutated transitive dependency Rb.Leaf must invalidate FastStore authority"
+            "mutated transitive dependency Leaf must invalidate FastStore authority"
         );
 
         // Restore v1 `Leaf.olean`, re-populate memo, then place v2 `Leaf.olean` in higher-precedence
-        // search-path directory `extra` without touching `proj/.lake/build/lib/lean/Rb/Leaf.olean`.
+        // search-path directory `extra` without touching `proj/.lake/build/lib/lean/Leaf.olean`.
         fs::write(&leaf_olean, &leaf_v1)?;
         assert!(lookup.is_audited_in_store(&store, &cfg, &lp, "Rb.Top", &top_olean));
         let fast_auth_v1 = lookup
@@ -38404,10 +38408,10 @@ globs = ["Down.+"]
                 "dig-v1".to_string(),
             )
             .expect("fast-store authority v1");
-        fs::write(extra.join("Rb/Leaf.olean"), &leaf_v2)?;
+        fs::write(extra.join("Leaf.olean"), &leaf_v2)?;
         assert_eq!(
-            lookup.resolve_module_olean("Rb.Leaf"),
-            Some(extra.join("Rb/Leaf.olean")),
+            lookup.resolve_module_olean("Leaf"),
+            Some(extra.join("Leaf.olean")),
             "resolve_module_olean must observe newly created shadowing file along LEAN_PATH"
         );
         assert!(
