@@ -15409,12 +15409,29 @@ fn resolve_olean_import_closure_cached_with_stat_memo(
 }
 
 #[allow(clippy::type_complexity)]
+#[derive(Clone)]
+struct ReplayClosureMemoEntry {
+    reach: Vec<usize>,
+    resolved_mods: Vec<(String, PathBuf)>,
+    tc_mods: Vec<String>,
+    non_tc_mods: Vec<(String, PathBuf, String)>,
+}
+
+#[derive(Clone)]
+pub(crate) struct VerifiedFastStoreAuthority {
+    pub(crate) artifact_digest: String,
+    resolved_mods: Vec<(String, PathBuf)>,
+    non_tc_mods: Vec<(PathBuf, String)>,
+}
+
+#[allow(clippy::type_complexity)]
 pub(crate) struct ReplayLookupBatchCache {
     path_memo: HashMap<String, PathBuf>,
     env_memo: HashMap<(bool, PathBuf), String>,
     node_pool: Vec<PathBuf>,
     node_ids: HashMap<PathBuf, usize>,
-    node_closures: Vec<Option<(Vec<usize>, Vec<String>, Vec<(String, String)>)>>,
+    node_closures: Vec<Option<ReplayClosureMemoEntry>>,
+    node_header_sigs: Vec<Option<crate::zygote::OleanFileStatSig>>,
     dirs: Vec<PathBuf>,
     disallowed_roots: Vec<PathBuf>,
     store_outside_disallowed: bool,
@@ -15481,6 +15498,7 @@ impl ReplayLookupBatchCache {
             node_pool: Vec::new(),
             node_ids: HashMap::new(),
             node_closures: Vec::new(),
+            node_header_sigs: Vec::new(),
             dirs,
             disallowed_roots,
             store_outside_disallowed,
@@ -15493,6 +15511,11 @@ impl ReplayLookupBatchCache {
         }
     }
 
+    fn resolve_module_along_dirs(&self, m: &str) -> Option<PathBuf> {
+        let rel = format!("{}.olean", module_name_to_rel_slash(m));
+        self.dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file())
+    }
+
     fn intern_node(&mut self, path: &Path) -> usize {
         if let Some(&id) = self.node_ids.get(path) {
             return id;
@@ -15502,26 +15525,73 @@ impl ReplayLookupBatchCache {
         self.node_pool.push(owned.clone());
         self.node_ids.insert(owned, id);
         self.node_closures.push(None);
+        self.node_header_sigs.push(None);
         id
     }
 
-    fn ensure_node_closure(&mut self, cfg: &ProjectConfig, root_id: usize) -> Result<()> {
-        if self.node_closures[root_id].is_some() {
-            return Ok(());
+    fn closure_memo_is_fresh(&self, entry: &ReplayClosureMemoEntry) -> bool {
+        for &nid in &entry.reach {
+            let Some(expected_sig) = self.node_header_sigs[nid] else {
+                return false;
+            };
+            if !crate::zygote::dev_records_subsecond_timestamps(&expected_sig)
+                || path_olean_stat_sig(&self.node_pool[nid]) != Some(expected_sig)
+            {
+                return false;
+            }
+        }
+        for (m, cached_p) in &entry.resolved_mods {
+            if self.resolve_module_along_dirs(m).as_ref() != Some(cached_p) {
+                return false;
+            }
+        }
+        for (_, dep_p, expected_dig) in &entry.non_tc_mods {
+            let Ok(cur_dig) = compute_replayed_olean_ilean_digest(dep_p) else {
+                return false;
+            };
+            if &cur_dig != expected_dig {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn ensure_node_closure(&mut self, cfg: &ProjectConfig, olean_path: &Path) -> Result<usize> {
+        let mut root_id = self.intern_node(olean_path);
+        if let Some(ref entry) = self.node_closures[root_id] {
+            if self.closure_memo_is_fresh(entry) {
+                return Ok(root_id);
+            }
+            self.invalidate_memo();
+            root_id = self.intern_node(olean_path);
         }
         enum Frame {
             Enter(usize),
-            Exit(usize, Vec<usize>, Vec<String>, Vec<(String, String)>),
+            Exit(
+                usize,
+                Vec<usize>,
+                Vec<(String, PathBuf)>,
+                Vec<String>,
+                Vec<(String, PathBuf, String)>,
+            ),
         }
         let mut stack = vec![Frame::Enter(root_id)];
         let mut visiting: HashSet<usize> = HashSet::new();
         while let Some(frame) = stack.pop() {
             match frame {
                 Frame::Enter(uid) => {
-                    if self.node_closures[uid].is_some() || !visiting.insert(uid) {
+                    if let Some(ref existing) = self.node_closures[uid] {
+                        if self.closure_memo_is_fresh(existing) {
+                            continue;
+                        }
+                        self.node_closures[uid] = None;
+                        self.node_header_sigs[uid] = None;
+                    }
+                    if !visiting.insert(uid) {
                         continue;
                     }
                     let cur_path = self.node_pool[uid].clone();
+                    let pre_sig = path_olean_stat_sig(&cur_path);
                     let (imps, _) =
                         read_olean_binary_imports_cached(&cur_path).with_context(|| {
                             format!(
@@ -15529,30 +15599,27 @@ impl ReplayLookupBatchCache {
                                 cur_path.display()
                             )
                         })?;
+                    let post_sig = path_olean_stat_sig(&cur_path);
+                    self.node_header_sigs[uid] = if pre_sig.is_some() && pre_sig == post_sig {
+                        post_sig
+                    } else {
+                        None
+                    };
+                    let mut direct_resolved = Vec::with_capacity(imps.len());
                     let mut direct_tc = Vec::new();
                     let mut direct_non_tc = Vec::new();
                     let mut child_ids = Vec::new();
                     for imp in imps {
                         let m = imp.module;
-                        let path = if let Some(cached_p) = self.path_memo.get(&m) {
-                            cached_p.clone()
-                        } else {
-                            let rel = format!("{}.olean", module_name_to_rel_slash(&m));
-                            let resolved = self
-                                .dirs
-                                .iter()
-                                .map(|d| d.join(&rel))
-                                .find(|p| p.is_file())
-                                .ok_or_else(|| {
-                                    anyhow::anyhow!(
-                                        "Unresolvable binary import `{}` required by `{}` along LEAN_PATH: fail-closed",
-                                        m,
-                                        cur_path.display()
-                                    )
-                                })?;
-                            self.path_memo.insert(m.clone(), resolved.clone());
-                            resolved
-                        };
+                        let path = self.resolve_module_along_dirs(&m).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Unresolvable binary import `{}` required by `{}` along LEAN_PATH: fail-closed",
+                                m,
+                                cur_path.display()
+                            )
+                        })?;
+                        self.path_memo.insert(m.clone(), path.clone());
+                        direct_resolved.push((m.clone(), path.clone()));
                         if is_verified_toolchain_olean_file(
                             &cfg.toolchain_lib_lean,
                             Some(&cfg.lean_githash),
@@ -15564,40 +15631,58 @@ impl ReplayLookupBatchCache {
                         let dep_dig = compute_replayed_olean_ilean_digest(&path)?;
                         let cid = self.intern_node(&path);
                         child_ids.push(cid);
-                        direct_non_tc.push((m, dep_dig));
+                        direct_non_tc.push((m, path, dep_dig));
                     }
                     let to_visit: Vec<usize> = child_ids
                         .iter()
                         .copied()
-                        .filter(|&cid| self.node_closures[cid].is_none())
+                        .filter(|&cid| {
+                            self.node_closures[cid]
+                                .as_ref()
+                                .is_none_or(|e| !self.closure_memo_is_fresh(e))
+                        })
                         .collect();
-                    stack.push(Frame::Exit(uid, child_ids, direct_tc, direct_non_tc));
+                    stack.push(Frame::Exit(
+                        uid,
+                        child_ids,
+                        direct_resolved,
+                        direct_tc,
+                        direct_non_tc,
+                    ));
                     for cid in to_visit.into_iter().rev() {
                         stack.push(Frame::Enter(cid));
                     }
                 }
-                Frame::Exit(uid, child_ids, mut tc_vec, mut non_tc_vec) => {
+                Frame::Exit(uid, child_ids, mut resolved_vec, mut tc_vec, mut non_tc_vec) => {
                     visiting.remove(&uid);
                     let mut reach: Vec<usize> = Vec::with_capacity(1 + child_ids.len() * 8);
                     reach.push(uid);
                     for cid in child_ids {
-                        if let Some((ch_reach, ch_tc, ch_non_tc)) = &self.node_closures[cid] {
-                            reach.extend_from_slice(ch_reach);
-                            tc_vec.extend(ch_tc.iter().cloned());
-                            non_tc_vec.extend(ch_non_tc.iter().cloned());
+                        if let Some(ch_entry) = &self.node_closures[cid] {
+                            reach.extend_from_slice(&ch_entry.reach);
+                            resolved_vec.extend(ch_entry.resolved_mods.iter().cloned());
+                            tc_vec.extend(ch_entry.tc_mods.iter().cloned());
+                            non_tc_vec.extend(ch_entry.non_tc_mods.iter().cloned());
                         }
                     }
                     reach.sort_unstable();
                     reach.dedup();
+                    resolved_vec.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    resolved_vec.dedup_by(|a, b| a.0 == b.0);
                     tc_vec.sort_unstable();
                     tc_vec.dedup();
                     non_tc_vec.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                     non_tc_vec.dedup_by(|a, b| a.0 == b.0);
-                    self.node_closures[uid] = Some((reach, tc_vec, non_tc_vec));
+                    self.node_closures[uid] = Some(ReplayClosureMemoEntry {
+                        reach,
+                        resolved_mods: resolved_vec,
+                        tc_mods: tc_vec,
+                        non_tc_mods: non_tc_vec,
+                    });
                 }
             }
         }
-        Ok(())
+        Ok(root_id)
     }
 
     fn is_root_olean(&self, olean_path: &Path) -> bool {
@@ -15630,17 +15715,16 @@ impl ReplayLookupBatchCache {
         olean_path: &Path,
         binds_policy: bool,
     ) -> Result<String> {
+        let root_id = self.ensure_node_closure(cfg, olean_path)?;
         if let Some(hit) = self.env_memo.get(&(binds_policy, olean_path.to_path_buf())) {
             return Ok(hit.clone());
         }
-        let root_id = self.intern_node(olean_path);
-        self.ensure_node_closure(cfg, root_id)?;
         let policy_dig_ref = if binds_policy {
             self.policy_dig.as_str()
         } else {
             ""
         };
-        let Some((_, resolved_tc, resolved_non_tc)) = &self.node_closures[root_id] else {
+        let Some(entry) = &self.node_closures[root_id] else {
             anyhow::bail!(
                 "Failed to memoize binary import closure for `{}`: fail-closed",
                 olean_path.display()
@@ -15652,12 +15736,12 @@ impl ReplayLookupBatchCache {
         if binds_policy && !policy_dig_ref.is_empty() {
             update_lp(&mut h, b"kernel_policy", policy_dig_ref.as_bytes());
         }
-        h.update(&(resolved_tc.len() as u64).to_le_bytes());
-        for tc_m in resolved_tc.iter() {
+        h.update(&(entry.tc_mods.len() as u64).to_le_bytes());
+        for tc_m in entry.tc_mods.iter() {
             update_lp(&mut h, b"tc", tc_m.as_bytes());
         }
-        h.update(&(resolved_non_tc.len() as u64).to_le_bytes());
-        for (dep_m, dep_dig) in resolved_non_tc.iter() {
+        h.update(&(entry.non_tc_mods.len() as u64).to_le_bytes());
+        for (dep_m, _, dep_dig) in entry.non_tc_mods.iter() {
             update_lp(&mut h, b"dep_mod", dep_m.as_bytes());
             update_lp(&mut h, b"dep_dig", dep_dig.as_bytes());
         }
@@ -15665,6 +15749,42 @@ impl ReplayLookupBatchCache {
         self.env_memo
             .insert((binds_policy, olean_path.to_path_buf()), res.clone());
         Ok(res)
+    }
+
+    pub(crate) fn snapshot_fast_store_authority(
+        &mut self,
+        cfg: &ProjectConfig,
+        olean_path: &Path,
+        artifact_digest: String,
+    ) -> Option<VerifiedFastStoreAuthority> {
+        let root_id = self.ensure_node_closure(cfg, olean_path).ok()?;
+        let entry = self.node_closures.get(root_id)?.as_ref()?;
+        Some(VerifiedFastStoreAuthority {
+            artifact_digest,
+            resolved_mods: entry.resolved_mods.clone(),
+            non_tc_mods: entry
+                .non_tc_mods
+                .iter()
+                .map(|(_, p, d)| (p.clone(), d.clone()))
+                .collect(),
+        })
+    }
+
+    pub(crate) fn verify_fast_store_authority(&self, auth: &VerifiedFastStoreAuthority) -> bool {
+        for (m, expected_p) in &auth.resolved_mods {
+            if self.resolve_module_along_dirs(m).as_ref() != Some(expected_p) {
+                return false;
+            }
+        }
+        for (dep_p, expected_dig) in &auth.non_tc_mods {
+            let Ok(cur_dig) = compute_replayed_olean_ilean_digest(dep_p) else {
+                return false;
+            };
+            if &cur_dig != expected_dig {
+                return false;
+            }
+        }
+        true
     }
 
     pub(crate) fn is_root_module_olean(&self, olean_path: &Path) -> bool {
@@ -15678,10 +15798,12 @@ impl ReplayLookupBatchCache {
     }
 
     pub(crate) fn invalidate_memo(&mut self) {
+        self.path_memo.clear();
         self.env_memo.clear();
         self.node_pool.clear();
         self.node_ids.clear();
         self.node_closures.clear();
+        self.node_header_sigs.clear();
     }
 
     pub(crate) fn is_replayed_in_store_with_binds_policy(
@@ -15777,15 +15899,7 @@ impl ReplayLookupBatchCache {
     }
 
     pub(crate) fn resolve_module_olean(&mut self, m: &str) -> Option<PathBuf> {
-        if let Some(p) = self.path_memo.get(m) {
-            return Some(p.clone());
-        }
-        let rel = format!("{}.olean", module_name_to_rel_slash(m));
-        let found = self
-            .dirs
-            .iter()
-            .map(|d| d.join(&rel))
-            .find(|p| p.is_file())?;
+        let found = self.resolve_module_along_dirs(m)?;
         self.path_memo.insert(m.to_string(), found.clone());
         Some(found)
     }
@@ -21761,7 +21875,7 @@ fn run_audit_chunk_subprocess(
 type ModuleSnapshotAuthority = (std::sync::Arc<crate::zygote::ClosureSnapshot>, bool, bool);
 enum ModuleAuditAuthority {
     Snapshot(ModuleSnapshotAuthority),
-    FastStoreDigest(String),
+    FastStore(VerifiedFastStoreAuthority),
 }
 type PerModuleAuditOutcome = (Result<()>, Option<ModuleAuditAuthority>);
 type AuditBatchWorkerOutcome = HashMap<String, PerModuleAuditOutcome>;
@@ -23287,10 +23401,12 @@ pub(crate) fn build_project_modules_native_with_options(
                                 };
                                 if restored.is_none() && !preserve_lake {
                                     wipe_existing_module_artifacts(node);
+                                    replay_batch.invalidate_memo();
                                 }
                                 restored
                             };
                             if let Some((cas_tiers, trace_log)) = cas_restored_dig_opt {
+                                replay_batch.invalidate_memo();
                                 let dig = cas_tiers.full.clone();
                                 if !is_untrusted && !shared_lib_local_mods.contains(&mod_name) {
                                     probe_olean_digests.insert(mod_name.clone(), dig.clone());
@@ -23504,7 +23620,7 @@ pub(crate) fn build_project_modules_native_with_options(
                     None => scheduler_audit_batch_size(),
                 };
                 let mut batch_mods = Vec::with_capacity(pending_audit_queue.len().min(batch_limit));
-                let mut fast_verified_mods: Vec<(String, String)> = Vec::new();
+                let mut fast_verified_mods: Vec<(String, VerifiedFastStoreAuthority)> = Vec::new();
                 let mut deferred_for_deps = Vec::new();
                 while batch_mods.len() < batch_limit {
                     let Some(m) = pending_audit_queue.pop_front() else {
@@ -23566,8 +23682,14 @@ pub(crate) fn build_project_modules_native_with_options(
                                 .as_deref()
                                     == Some(expected_dig.as_str());
                             if post_dig_ok {
-                                fast_verified_mods.push((m, expected_dig));
-                                continue;
+                                if let Some(fast_auth) = replay_batch.snapshot_fast_store_authority(
+                                    &cfg,
+                                    &node.olean_path,
+                                    expected_dig,
+                                ) {
+                                    fast_verified_mods.push((m, fast_auth));
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -23588,13 +23710,10 @@ pub(crate) fn build_project_modules_native_with_options(
                     let mut fast_outcomes: AuditBatchWorkerOutcome =
                         HashMap::with_capacity(fast_verified_mods.len());
                     let mut fast_batch_names = Vec::with_capacity(fast_verified_mods.len());
-                    for (m, fast_dig) in fast_verified_mods {
+                    for (m, fast_auth) in fast_verified_mods {
                         fast_outcomes.insert(
                             m.clone(),
-                            (
-                                Ok(()),
-                                Some(ModuleAuditAuthority::FastStoreDigest(fast_dig)),
-                            ),
+                            (Ok(()), Some(ModuleAuditAuthority::FastStore(fast_auth))),
                         );
                         fast_batch_names.push(m);
                     }
@@ -23680,6 +23799,7 @@ pub(crate) fn build_project_modules_native_with_options(
                             let node = dag.nodes.get(&mod_name).expect("compiled module in dag");
                             match publish_staged_module_compile_output(node, staged) {
                                 Ok((dur_ms, stdout_str, dig)) => {
+                                    replay_batch.invalidate_memo();
                                     pending_audit_meta.insert(
                                         mod_name.clone(),
                                         PendingAuditOrigin::Compiled {
@@ -23756,9 +23876,9 @@ pub(crate) fn build_project_modules_native_with_options(
                                     )
                                 })
                             }
-                            Some(ModuleAuditAuthority::FastStoreDigest(fast_dig)) => {
-                                Some(fast_dig.clone())
-                            }
+                            Some(ModuleAuditAuthority::FastStore(fast_auth)) => replay_batch
+                                .verify_fast_store_authority(fast_auth)
+                                .then(|| fast_auth.artifact_digest.clone()),
                             None => None,
                         };
                         let snap_matches_dig = |expected_dig: &str| -> bool {
@@ -38065,6 +38185,125 @@ globs = ["Down.+"]
             ),
             "swapped sorry Fs/Mod.olean must never receive audited authority"
         );
+        crate::zygote::purge_snapshot_dir(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn replay_lookup_batch_cache_revalidates_mutated_transitive_dependency_and_shadowing(
+    ) -> Result<()> {
+        if !crate::zygote::lean_cmd_available()
+            || Command::new("lake").arg("--version").output().is_err()
+        {
+            return Ok(());
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_replay_batch_dep_reval_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        let extra = dir.join("extra_lib");
+        fs::create_dir_all(proj.join("Rb"))?;
+        fs::create_dir_all(extra.join("Rb"))?;
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"rbbatch\"\ndefaultTargets = [\"Rb\"]\n[[lean_lib]]\nname = \"Rb\"\nroots = [\"Rb.Leaf\", \"Rb.Mid\", \"Rb.Top\"]\n",
+        )?;
+        fs::write(proj.join("Rb/Leaf.lean"), "def leafVal : Nat := 1\n")?;
+        fs::write(
+            proj.join("Rb/Mid.lean"),
+            "import Rb.Leaf\ndef midVal : Nat := leafVal\n",
+        )?;
+        fs::write(
+            proj.join("Rb/Top.lean"),
+            "import Rb.Mid\ntheorem top_ok : midVal = 1 := rfl\n",
+        )?;
+        let out1 = Command::new("lake")
+            .args(["build", "Rb"])
+            .env("LEAN_NUM_THREADS", "2")
+            .current_dir(&proj)
+            .output()?;
+        anyhow::ensure!(out1.status.success(), "lake build Rb v1 failed");
+
+        let store = TurboStore::open(Some(&dir.join("store")))?;
+        let cfg = resolve_project_config(&proj)?;
+        let (base_lp, _) = build_lean_search_path(&cfg, true);
+        let lp = format!("{}:{base_lp}", extra.display());
+        crate::zygote::audit_compiled_modules_with_zygote(
+            &store,
+            &cfg,
+            &[
+                "Rb.Leaf".to_string(),
+                "Rb.Mid".to_string(),
+                "Rb.Top".to_string(),
+            ],
+            &lp,
+            &[],
+            false,
+        )?;
+        let leaf_olean = proj.join(".lake/build/lib/lean/Rb/Leaf.olean");
+        let mid_olean = proj.join(".lake/build/lib/lean/Rb/Mid.olean");
+        let top_olean = proj.join(".lake/build/lib/lean/Rb/Top.olean");
+        let leaf_v1 = fs::read(&leaf_olean)?;
+        let top_v1 = fs::read(&top_olean)?;
+        let mid_v1 = fs::read(&mid_olean)?;
+
+        let mut lookup = ReplayLookupBatchCache::new(&store, &cfg, &lp);
+        assert!(lookup.is_audited_in_store(&store, &cfg, &lp, "Rb.Mid", &mid_olean));
+        assert!(lookup.is_audited_in_store(&store, &cfg, &lp, "Rb.Top", &top_olean));
+        let fast_auth = lookup
+            .snapshot_fast_store_authority(&cfg, &top_olean, "dig-v1".to_string())
+            .expect("fast-store authority snapshot");
+        assert!(lookup.verify_fast_store_authority(&fast_auth));
+
+        // Rebuild `Rb.Leaf` with a changed definition while restoring `Mid.olean` and `Top.olean`
+        // bytes untouched on disk. `lookup` has already memoized `Leaf`, `Mid`, and `Top` without
+        // an explicit `invalidate_memo()` call; it MUST detect the transitive `Leaf.olean` change!
+        fs::write(proj.join("Rb/Leaf.lean"), "def leafVal : Nat := 2\n")?;
+        let out2 = Command::new("lake")
+            .args(["build", "Rb.Leaf"])
+            .env("LEAN_NUM_THREADS", "2")
+            .current_dir(&proj)
+            .output()?;
+        anyhow::ensure!(out2.status.success(), "lake build Rb.Leaf v2 failed");
+        let leaf_v2 = fs::read(&leaf_olean)?;
+        fs::write(&mid_olean, &mid_v1)?;
+        fs::write(&top_olean, &top_v1)?;
+
+        assert!(
+            !lookup.is_audited_in_store(&store, &cfg, &lp, "Rb.Top", &top_olean),
+            "mutated transitive dependency Rb.Leaf must invalidate memoized Rb.Top audit lookup"
+        );
+        assert!(
+            !lookup.verify_fast_store_authority(&fast_auth),
+            "mutated transitive dependency Rb.Leaf must invalidate FastStore authority"
+        );
+
+        // Restore v1 `Leaf.olean`, re-populate memo, then place v2 `Leaf.olean` in higher-precedence
+        // search-path directory `extra` without touching `proj/.lake/build/lib/lean/Rb/Leaf.olean`.
+        fs::write(&leaf_olean, &leaf_v1)?;
+        assert!(lookup.is_audited_in_store(&store, &cfg, &lp, "Rb.Top", &top_olean));
+        let fast_auth_v1 = lookup
+            .snapshot_fast_store_authority(&cfg, &top_olean, "dig-v1".to_string())
+            .expect("fast-store authority v1");
+        fs::write(extra.join("Rb/Leaf.olean"), &leaf_v2)?;
+        assert_eq!(
+            lookup.resolve_module_olean("Rb.Leaf"),
+            Some(extra.join("Rb/Leaf.olean")),
+            "resolve_module_olean must observe newly created shadowing file along LEAN_PATH"
+        );
+        assert!(
+            !lookup.is_audited_in_store(&store, &cfg, &lp, "Rb.Top", &top_olean),
+            "shadowing transitive dependency along LEAN_PATH must invalidate memoized audit lookup"
+        );
+        assert!(
+            !lookup.verify_fast_store_authority(&fast_auth_v1),
+            "shadowing transitive dependency along LEAN_PATH must invalidate FastStore authority"
+        );
+
         crate::zygote::purge_snapshot_dir(&dir);
         Ok(())
     }
