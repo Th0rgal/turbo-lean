@@ -15,6 +15,7 @@ Confirm the installed binary with `turbo-lean --version` and `turbo-lean --help`
 | Question | Command |
 | --- | --- |
 | Does this declaration kernel-check? | `turbo-lean check <file.lean> --decl <Full.Name> --max-memory-mb 6144 --no-auto-worktree-link` |
+| Do deep `--decl` prefix outlines & CoW-forked Zygote pools hold `0 sorryAx`? | `TURBO_LEAN_ZYGOTE_FORK_SHARDS=1 turbo-lean --json check <file.lean> --decl <Full.Name> --max-memory-mb 6144 --no-auto-worktree-link` |
 | Is the spec non-vacuous and tight? | `turbo-lean --json audit-spec [--policy strict-proofs] [--require-nonempty] <Spec.lean>` |
 | Does the diff verify against the base? | `turbo-lean pr-verify --base <ref>` |
 | Does the tree meet the repo gate? | `turbo-lean ci-verify --project-dir <dir>` |

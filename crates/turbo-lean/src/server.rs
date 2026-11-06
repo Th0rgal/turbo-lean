@@ -1489,10 +1489,18 @@ impl HttpShardReceiptContext {
             .collect();
         canon_axioms.sort();
         canon_axioms.dedup();
-        let import_context = format!(
-            "{}|{}|{}",
-            zctx.lean_path, zctx.imports_csv, zctx.olean_digest
-        );
+        let import_context = if !zctx.host_closure_digest.is_empty() && !zctx.imports_csv.is_empty()
+        {
+            format!(
+                "closure:{}|{}|{}",
+                zctx.host_closure_digest, zctx.imports_csv, zctx.closure_pool_digest
+            )
+        } else {
+            format!(
+                "{}|{}|{}",
+                zctx.lean_path, zctx.imports_csv, zctx.olean_digest
+            )
+        };
         Ok((
             Self {
                 lean_args_digest: lean_args_digest.unwrap_or("").to_string(),

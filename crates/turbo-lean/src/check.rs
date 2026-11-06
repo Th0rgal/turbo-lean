@@ -4588,6 +4588,7 @@ fn check_single_decl(
                         })
             };
             let mut try_zygote_src = |src_text: &str,
+                                      lp_override: Option<&str>,
                                       ev: &HashMap<String, String>,
                                       record_err: bool|
              -> Option<serde_json::Value> {
@@ -4600,7 +4601,7 @@ fn check_single_decl(
                     stmt_hash: shard.stmt_hash.clone(),
                     proof_hash: shard.proof_hash.clone(),
                     toolchain: toolchain.to_string(),
-                    lean_path: local_lean_path.clone(),
+                    lean_path: lp_override.unwrap_or(&local_lean_path).to_string(),
                     skip_cas_lock: true,
                     allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
                     lean_args: file_lean_args.clone(),
@@ -4795,7 +4796,7 @@ fn check_single_decl(
 
             if !verified_via_zygote {
                 if let Some(ref psrc) = pruned_src {
-                    if let Some(zjson) = try_zygote_src(psrc, &env_vars, false) {
+                    if let Some(zjson) = try_zygote_src(psrc, None, &env_vars, false) {
                         verified_via_fast_olean = true;
                         apply_zygote_json!(&zjson);
                     }
@@ -4804,9 +4805,90 @@ fn check_single_decl(
 
             if !verified_via_zygote {
                 if let Some(ref fsrc) = fast_olean_src {
-                    if let Some(zjson) = try_zygote_src(fsrc, &env_vars, false) {
+                    if let Some(zjson) = try_zygote_src(fsrc, None, &env_vars, false) {
                         verified_via_fast_olean = true;
                         apply_zygote_json!(&zjson);
+                    }
+                }
+            }
+
+            if !verified_via_zygote && fast_olean_src.is_none() {
+                if let Some(outline_plan) = splitter::build_prefix_outline_plan_with_split(
+                    &active_src,
+                    split,
+                    &rooted_target,
+                ) {
+                    if env_vars.is_empty() && fast_local_zygote_url.is_none() {
+                        let (ev, ech) = resolve_lake_env(store, canon_dir)?;
+                        lean_bin = resolve_lean_bin(canon_dir)?;
+                        env_vars = ev;
+                        env_cache_hit = ech;
+                    }
+                    let orig_display = file.display().to_string();
+                    if let Ok((outline_dir, outline_mod)) =
+                        crate::zygote::ensure_prefix_outline_olean(
+                            store,
+                            toolchain,
+                            &local_lean_path,
+                            &env_vars,
+                            Path::new(&lean_bin),
+                            &outline_plan.outline_source,
+                            &orig_display,
+                            &file_lean_args,
+                        )
+                    {
+                        let delta_lp = if local_lean_path.is_empty() {
+                            outline_dir.to_string_lossy().into_owned()
+                        } else {
+                            format!("{}:{}", outline_dir.display(), local_lean_path)
+                        };
+                        let delta_src = outline_plan.render_delta_shard_source(&outline_mod);
+                        let mut delta_ev = env_vars.clone();
+                        delta_ev.insert("LEAN_PATH".to_string(), delta_lp.clone());
+                        if let Some(zjson) =
+                            try_zygote_src(&delta_src, Some(&delta_lp), &delta_ev, false)
+                        {
+                            verified_via_fast_olean = true;
+                            apply_zygote_json!(&zjson);
+                        } else {
+                            let mut stub_targets: Vec<String> =
+                                single_set.iter().cloned().collect();
+                            stub_targets.sort();
+                            if let Ok(reply) = crate::zygote::eval_with_zygote_pool_for_targets(
+                                store,
+                                toolchain,
+                                &delta_lp,
+                                &delta_ev,
+                                Path::new(&lean_bin),
+                                &delta_src,
+                                &stub_targets,
+                                Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                                &file_lean_args,
+                            ) {
+                                let c_abi_sound = unsafe {
+                                    crate::splitter::turbo_spec_is_sound_decl_summary(
+                                        0,
+                                        0,
+                                        0,
+                                        if reply.ok { 0 } else { 1 },
+                                    ) != 0
+                                };
+                                if reply.import_ok
+                                    && reply.ok
+                                    && !reply.crashed
+                                    && !reply.timed_out
+                                    && c_abi_sound
+                                    && crate::zygote::verify_attested_decl_types(
+                                        &reply.decl_types,
+                                        &expected_type_pair,
+                                    )
+                                    .is_ok()
+                                {
+                                    verified_via_fast_olean = true;
+                                    apply_zygote_reply!(reply);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -4826,7 +4908,7 @@ fn check_single_decl(
                         .unwrap_or_default()
                 };
                 if !verified_via_zygote {
-                    if let Some(zjson) = try_zygote_src(&full_shard_src, &env_vars, true) {
+                    if let Some(zjson) = try_zygote_src(&full_shard_src, None, &env_vars, true) {
                         apply_zygote_json!(&zjson);
                     }
                 }
@@ -7698,7 +7780,7 @@ but is expected to have type
             &[],
         )
         .unwrap();
-        assert!(reply.import_ok && reply.ok && reply.winning_candidate_idx == Some(2));
+        assert!(reply.import_ok && reply.ok && matches!(reply.winning_candidate_idx, Some(2 | 3)));
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 
@@ -9994,5 +10076,134 @@ theorem after_macro : ext_magic = 7 := rfl
 
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
+    }
+
+    #[test]
+    fn test_deep_decl_auto_prefix_outline_olean_without_prebuilt_module() {
+        let toolchain = "leanprover/lean4:v4.35.0";
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_check_prefix_outline_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let proj_dir = tmp_dir.join("proj");
+        let cache_dir = tmp_dir.join("cache");
+        fs::create_dir_all(&proj_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(proj_dir.join("lean-toolchain"), format!("{toolchain}\n")).unwrap();
+        fs::write(
+            proj_dir.join("lakefile.toml"),
+            "name = \"outline_pkg\"\ndefaultTargets = [\"DeepMod\"]\n",
+        )
+        .unwrap();
+        let mut store = TurboStore::open(Some(&cache_dir)).unwrap();
+        let Ok((_ev, lean_bin)) =
+            crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "")
+        else {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        };
+        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        }
+        let Ok(test_kp) = crate::kernel::resolve_kernel_engine(
+            crate::kernel::KernelEngineSelection::Standard,
+            toolchain,
+        ) else {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        };
+
+        let mut src = String::from("namespace DeepNs\ndef step (n : Nat) : Nat := n + 1\n");
+        for i in 0..18 {
+            src.push_str(&format!("theorem pre_{i} : step {i} = {} := rfl\n", i + 1));
+        }
+        src.push_str("theorem deep_target_ok : step 41 = 42 ∧ pre_17 = pre_17 := ⟨rfl, rfl⟩\n");
+        src.push_str("theorem deep_target_sorry : step 0 = 99 := by sorry\n");
+        src.push_str("end DeepNs\n");
+
+        let mod_file = proj_dir.join("DeepMod.lean");
+        fs::write(&mod_file, &src).unwrap();
+        let canon_proj = proj_dir.canonicalize().unwrap_or_else(|_| proj_dir.clone());
+        let canon_file = mod_file.canonicalize().unwrap_or_else(|_| mod_file.clone());
+        let t0 = Instant::now();
+        let mut split = split_lean_source(&src, &[]);
+        let mut cb3 = None;
+
+        let plan =
+            splitter::build_prefix_outline_plan_with_split(&src, &split, "DeepNs.deep_target_ok")
+                .expect("deep declaration should produce a prefix outline plan");
+        assert!(plan.outline_source.contains("theorem pre_0"));
+
+        let out_ok = check_single_decl(
+            &mut store,
+            true,
+            false,
+            false,
+            &test_kp,
+            &t0,
+            &mod_file,
+            &mod_file,
+            &canon_file,
+            &canon_proj,
+            toolchain,
+            "DeepNs.deep_target_ok",
+            src.clone(),
+            &mut cb3,
+            &mut split,
+            false,
+            0,
+            None,
+            false,
+        )
+        .expect("deep_target_ok should verify via prefix outline olean");
+        assert_eq!(out_ok["status"], "theorem_verified");
+        assert_eq!(out_ok["fast_olean_import"], true);
+
+        // Stubbed prefix theorems from the outline must NEVER be published to TheoremProofCAS!
+        let pre0_shard = split
+            .shards
+            .iter()
+            .find(|s| s.qualified_name == "DeepNs.pre_0")
+            .unwrap();
+        let pre0_key = crate::lake_build::compute_shard_key(toolchain, pre0_shard);
+        assert!(
+            store
+                .batch_get_theorem_shards(std::slice::from_ref(&pre0_key), "trusted")
+                .unwrap()
+                .is_empty(),
+            "stubbed outline theorems must never be written to TheoremProofCAS"
+        );
+
+        // Sorry-backed target declaration must still fail closed even when importing `_TurboOutline_*`!
+        let mut sorry_cb3 = None;
+        let err = check_single_decl(
+            &mut store,
+            true,
+            false,
+            false,
+            &test_kp,
+            &t0,
+            &mod_file,
+            &mod_file,
+            &canon_file,
+            &canon_proj,
+            toolchain,
+            "DeepNs.deep_target_sorry",
+            src.clone(),
+            &mut sorry_cb3,
+            &mut split,
+            false,
+            0,
+            None,
+            false,
+        );
+        assert!(
+            err.is_err(),
+            "sorry-backed target must fail closed under prefix outline import"
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
     }
 }

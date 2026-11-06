@@ -10,6 +10,7 @@ use std::process::Command;
 
 const BLAKE3_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/Blake3.lean");
 const STATEMENT_HASH_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/StatementHash.lean");
+const ZYGOTE_FORK_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/ZygoteFork.lean");
 const ZYGOTE_WORKER_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/ZygoteWorker.lean");
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1126,6 +1127,7 @@ pub struct ZygoteWorkerProcess {
     stderr_scan: std::sync::Arc<StderrScan>,
     #[cfg(target_os = "linux")]
     pinned_snapshot_dir: Option<(u64, u64)>,
+    spawn_lean_path: String,
     warm_prefixes: std::collections::HashSet<String>,
     warm_prefix_tree: Vec<(String, String)>,
     warm_imports: std::collections::HashMap<String, String>,
@@ -3320,7 +3322,7 @@ pub(crate) fn ensure_zygote_binary_at(
     let env_vars = &env_vars;
 
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"turbo-zygote:v5:hybrid-opt-tools:");
+    hasher.update(b"turbo-zygote:v6:cow-fork-pool:");
     hasher.update(std::env::consts::ARCH.as_bytes());
     hasher.update(lean_bin.to_string_lossy().as_bytes());
     if let Some(tc) = env_vars.get("ELAN_TOOLCHAIN") {
@@ -3328,6 +3330,7 @@ pub(crate) fn ensure_zygote_binary_at(
     }
     hasher.update(BLAKE3_LEAN_SRC.as_bytes());
     hasher.update(STATEMENT_HASH_LEAN_SRC.as_bytes());
+    hasher.update(ZYGOTE_FORK_LEAN_SRC.as_bytes());
     hasher.update(ZYGOTE_WORKER_LEAN_SRC.as_bytes());
     let bin_name = format!("turbo_zygote_{}", &hasher.finalize().to_hex()[..16]);
     let bin_dir = store_root.join("fastcheck_bins");
@@ -3412,10 +3415,11 @@ pub(crate) fn ensure_zygote_binary_at(
     };
     compile_env.insert("LEAN_PATH".to_string(), scratch_lp);
 
-    let mut obj_files = Vec::with_capacity(3);
+    let mut obj_files = Vec::with_capacity(4);
     for (stem, src, emit_olean, c_opt) in [
         ("Blake3", BLAKE3_LEAN_SRC, true, "-O3"),
         ("StatementHash", STATEMENT_HASH_LEAN_SRC, true, "-O3"),
+        ("ZygoteFork", ZYGOTE_FORK_LEAN_SRC, true, "-O3"),
         ("ZygoteWorker", ZYGOTE_WORKER_LEAN_SRC, false, "-O0"),
     ] {
         let lean_file = if emit_olean {
@@ -5913,11 +5917,13 @@ pub fn eval_with_zygote_pool_opts_with_args(
 pub(crate) struct ResolvedZygoteContext {
     pub(crate) lean_path: String,
     /// What the worker searches: the closure snapshot and the toolchain, when materialized.
-    worker_lean_path: String,
+    pub(crate) worker_lean_path: String,
     pub(crate) imports_csv: String,
     pub(crate) olean_digest: String,
-    search_path_digest: String,
-    host_closure_digest: String,
+    /// Worktree-path-independent closure digest (`snap:<manifest>[#inputs:<lake_inputs>]` when
+    /// materialized, otherwise `olean_digest`), keying `ZygotePool` and verified-shard dedup across worktrees.
+    pub(crate) closure_pool_digest: String,
+    pub(crate) host_closure_digest: String,
     pub(crate) toolchain_policy: String,
     pub(crate) lake_inputs_uncacheable: bool,
     pub(crate) identity: String,
@@ -6390,11 +6396,6 @@ pub(crate) fn resolve_zygote_context(
     // (which keys the verified-shard memo and the `warm_imports` / `warm_prefixes` match).
     let (lake_inputs_digest, lake_inputs_uncacheable) =
         compute_lean_path_lake_inputs_digest(&effective_lean_path, env_vars);
-    let pool_digest_tag = if lake_inputs_digest.is_empty() {
-        search_path_digest.clone()
-    } else {
-        format!("{}#inputs:{}", search_path_digest, lake_inputs_digest)
-    };
     // Workers enforce the axiom policy they were spawned with: key them (and their replies) by it.
     let extra_axioms: Vec<String> = env_vars
         .get(crate::splitter::ALLOWED_AXIOMS_ENV)
@@ -6418,6 +6419,15 @@ pub(crate) fn resolve_zygote_context(
             "{}:{}#inputs:{}",
             search_path_digest, imported_digest, lake_inputs_digest
         )
+    };
+    let closure_pool_digest = if closure.label().is_some() {
+        if lake_inputs_digest.is_empty() {
+            imported_digest.clone()
+        } else {
+            format!("{}#inputs:{}", imported_digest, lake_inputs_digest)
+        }
+    } else {
+        olean_digest.clone()
     };
     let compiler_path = fs::canonicalize(lean_bin).unwrap_or_else(|_| lean_bin.to_path_buf());
     let compiler_digest = fs::read(&compiler_path)
@@ -6446,7 +6456,7 @@ pub(crate) fn resolve_zygote_context(
         lean_path: effective_lean_path,
         imports_csv,
         olean_digest,
-        search_path_digest: pool_digest_tag,
+        closure_pool_digest,
         host_closure_digest: host_closure_digest.to_string(),
         toolchain_policy,
         lake_inputs_uncacheable,
@@ -6776,16 +6786,20 @@ fn eval_with_zygote_pool_attempt(
     let closure = &context.closure;
     let effective_lean_path = context.worker_lean_path.clone();
     let imports_csv = context.imports_csv.clone();
-    let pool_digest_tag = context.search_path_digest.clone();
+    let closure_pool_digest = context.closure_pool_digest.clone();
     let toolchain_policy = context.toolchain_policy.clone();
-    let olean_digest = context.olean_digest.clone();
     let lake_inputs_uncacheable = context.lake_inputs_uncacheable;
     let host_closure_digest = context.host_closure_digest.as_str();
     let executed_identity = context.identity.clone();
+    let worker_scope_key = if closure.label().is_some() {
+        format!("closure:{}", host_closure_digest)
+    } else {
+        effective_lean_path.clone()
+    };
     let pool_key = (
         toolchain_policy.clone(),
-        effective_lean_path.clone(),
-        format!("{}#{}", pool_digest_tag, imports_csv),
+        worker_scope_key,
+        format!("{}#{}", closure_pool_digest, imports_csv),
     );
     let verified_cache_policy = match &args_digest_opt {
         Some(ad) => format!("{}#opts:{}", toolchain_policy, ad),
@@ -6814,7 +6828,7 @@ fn eval_with_zygote_pool_attempt(
     {
         Some((
             verified_cache_policy,
-            olean_digest.clone(),
+            closure_pool_digest.clone(),
             stub_mode.to_string(),
             shard_source.to_string(),
         ))
@@ -6983,6 +6997,7 @@ fn eval_with_zygote_pool_attempt(
             stderr_scan,
             #[cfg(target_os = "linux")]
             pinned_snapshot_dir: expected_pinned_dir,
+            spawn_lean_path: effective_lean_path.clone(),
             warm_prefixes: std::collections::HashSet::new(),
             warm_prefix_tree: Vec::new(),
             warm_imports: std::collections::HashMap::new(),
@@ -7232,12 +7247,17 @@ fn eval_with_zygote_pool_attempt(
                             if w.pinned_snapshot_dir != expected_pinned_dir {
                                 return false;
                             }
+                            if expected_pinned_dir.is_none()
+                                && w.spawn_lean_path != effective_lean_path
+                            {
+                                return false;
+                            }
                             (w.warm_imports.is_empty()
                                 || (w.warm_imports.len() == 1
                                     && w.warm_imports.contains_key(&imports_csv)))
                                 && w.warm_imports
                                     .get(&imports_csv)
-                                    .map(|d| d == &olean_digest)
+                                    .map(|d| d == &closure_pool_digest)
                                     .unwrap_or(true)
                         });
                     }
@@ -7326,7 +7346,7 @@ fn eval_with_zygote_pool_attempt(
                             && !r.errors.iter().any(|e| e == RUNTIME_PANIC_ERR)
                         {
                             w.warm_imports
-                                .insert(imports_csv.clone(), olean_digest.clone());
+                                .insert(imports_csv.clone(), closure_pool_digest.clone());
                             return_worker_to_pool(pool_mutex, pool_key.clone(), w);
                         }
                         replies.push(r);
@@ -7574,11 +7594,14 @@ fn eval_with_zygote_pool_attempt(
                     if w.pinned_snapshot_dir != expected_pinned_dir {
                         return false;
                     }
+                    if expected_pinned_dir.is_none() && w.spawn_lean_path != effective_lean_path {
+                        return false;
+                    }
                     (w.warm_imports.is_empty()
                         || (w.warm_imports.len() == 1 && w.warm_imports.contains_key(&imports_csv)))
                         && w.warm_imports
                             .get(&imports_csv)
-                            .map(|d| d == &olean_digest)
+                            .map(|d| d == &closure_pool_digest)
                             .unwrap_or(true)
                 });
             }
@@ -7728,7 +7751,7 @@ fn eval_with_zygote_pool_attempt(
                 && !lake_inputs_uncacheable
             {
                 w.warm_imports
-                    .insert(imports_csv.clone(), olean_digest.clone());
+                    .insert(imports_csv.clone(), closure_pool_digest.clone());
                 if let Some(pk) = active_prefix_key {
                     w.warm_prefixes.insert(pk);
                 }
@@ -8103,6 +8126,142 @@ pub fn eval_candidates_race_via_zygote(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn ensure_prefix_outline_olean(
+    store: &TurboStore,
+    toolchain: &str,
+    req_lean_path: &str,
+    env_vars: &std::collections::HashMap<String, String>,
+    lean_bin: &Path,
+    outline_source: &str,
+    file_name: &str,
+    lean_args: &[String],
+) -> Result<(PathBuf, String)> {
+    crate::splitter::reject_checking_weakening(outline_source)?;
+    crate::module_builder::validate_lean_args(lean_args)?;
+    let (raw_imports_csv, body_code) = split_shard_for_zygote(outline_source);
+    if raw_imports_csv == "__HEADER_ERR__" {
+        anyhow::bail!("Unsupported header in prefix outline source");
+    }
+    let context = resolve_zygote_context(
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        &raw_imports_csv,
+    );
+    let args_digest = crate::module_builder::compute_lean_args_digest(lean_args)?;
+    let mut key_hasher = blake3::Hasher::new();
+    key_hasher.update(b"turbo-prefix-outline:v1\0");
+    key_hasher.update(context.toolchain_policy.as_bytes());
+    key_hasher.update(b"\0");
+    key_hasher.update(context.closure_pool_digest.as_bytes());
+    key_hasher.update(b"\0");
+    key_hasher.update(context.imports_csv.as_bytes());
+    key_hasher.update(b"\0");
+    if let Some(ref ad) = args_digest {
+        key_hasher.update(ad.as_bytes());
+    }
+    key_hasher.update(b"\0");
+    key_hasher.update(outline_source.as_bytes());
+    let key_hex = key_hasher.finalize().to_hex().to_string();
+    let outline_mod = format!("_TurboOutline_{}", &key_hex[..24]);
+
+    let outline_dir = store.fast_staging_dir().join("prefix_outlines");
+    fs::create_dir_all(&outline_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if let Ok(m) = fs::symlink_metadata(&outline_dir) {
+            if m.is_dir() && m.uid() == unsafe { libc::geteuid() } && m.mode() & 0o077 != 0 {
+                let mut p = m.permissions();
+                p.set_mode(0o700);
+                let _ = fs::set_permissions(&outline_dir, p);
+            }
+        }
+    }
+    let final_olean = outline_dir.join(format!("{}.olean", outline_mod));
+    if final_olean.is_file() && final_olean.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        return Ok((outline_dir, outline_mod));
+    }
+
+    let lock_path = outline_dir.join(format!("{}.lock", outline_mod));
+    let _flock = crate::shm_cache::acquire_flock(&lock_path, true, false).ok();
+    if final_olean.is_file() && final_olean.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        return Ok((outline_dir, outline_mod));
+    }
+
+    let tmp_olean = outline_dir.join(format!(
+        ".{}.tmp.{}.{}.olean",
+        outline_mod,
+        std::process::id(),
+        next_tmp_id()
+    ));
+    let outline_shards = crate::splitter::split_lean_source(outline_source, &[]).shards;
+    let stubs: Vec<String> = outline_shards
+        .into_iter()
+        .filter(|sh| crate::splitter::strip_lean_comments(&sh.proof_text).trim() == "sorry")
+        .map(|sh| sh.rooted_name())
+        .collect();
+    let mode = format!(
+        "emit_outline_olean:{}:{}:{}:{}",
+        hex_encode_bytes(outline_mod.as_bytes()),
+        hex_encode_bytes(tmp_olean.to_string_lossy().as_bytes()),
+        hex_encode_bytes(file_name.as_bytes()),
+        hex_encode_bytes(stubs.join("\n").as_bytes()),
+    );
+    let hex_body = hex_encode_bytes(body_code.as_bytes());
+    let hex_opts = encode_lean_args_hex(lean_args);
+    let req_line = if hex_opts.is_empty() {
+        format!("{}\t{}\t{}\n", context.imports_csv, hex_body, mode)
+    } else {
+        format!(
+            "{}\t{}\t{}\t\t\t{}\n",
+            context.imports_csv, hex_body, mode, hex_opts
+        )
+    };
+    let res = eval_with_zygote_pool_inner(
+        store,
+        toolchain,
+        req_lean_path,
+        env_vars,
+        lean_bin,
+        "",
+        false,
+        false,
+        Some(file_name),
+        None,
+        Some((context.imports_csv.clone(), String::new(), req_line)),
+        lean_args,
+        &[],
+        false,
+    );
+    match res {
+        Ok(rep)
+            if rep.import_ok
+                && rep.ok
+                && !rep.timed_out
+                && !rep.crashed
+                && tmp_olean.metadata().map(|m| m.len() > 0).unwrap_or(false) =>
+        {
+            fs::rename(&tmp_olean, &final_olean)?;
+            Ok((outline_dir, outline_mod))
+        }
+        Ok(rep) => {
+            let _ = fs::remove_file(&tmp_olean);
+            anyhow::bail!(
+                "Prefix outline `.olean` emission failed for `{}`: {}",
+                outline_mod,
+                rep.errors.join("\n")
+            );
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&tmp_olean);
+            Err(e)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct LocalZygoteDaemonInfo {
     pub(crate) addr: String,
@@ -8363,9 +8522,16 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
         let mut cmd = Command::new(&current_exe);
         cmd.arg("--cache-dir")
             .arg(&daemon_cache_dir)
-            .args(["serve", "--listen", &addr])
-            .envs(env_vars)
-            .env("TURBO_LEAN_DAEMON", "1")
+            .args(["serve", "--listen", &addr]);
+        for (k, v) in env_vars {
+            if !matches!(
+                k.as_str(),
+                "LEAN_PATH" | "TURBO_LEAN_PROJECT_DIR" | "TURBO_LEAN_CALLER_CWD"
+            ) {
+                cmd.env(k, v);
+            }
+        }
+        cmd.env("TURBO_LEAN_DAEMON", "1")
             .env("TURBO_LEAN_DAEMON_TOKEN", &auth_token)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -12495,6 +12661,7 @@ mod tests {
                 stderr_scan: Default::default(),
                 #[cfg(target_os = "linux")]
                 pinned_snapshot_dir: None,
+                spawn_lean_path: String::new(),
                 warm_prefixes: std::collections::HashSet::new(),
                 warm_prefix_tree: Vec::new(),
                 warm_imports: std::collections::HashMap::new(),
@@ -14939,6 +15106,148 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
             ClosureBinding::Bound,
             "materializing a sibling snapshot sharing SharedDep.olean must not invalidate ctx_a"
         );
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_zygote_cow_fork_race_candidates_and_sorry_rejection() {
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("cow_fork_race")
+        else {
+            return;
+        };
+        let prefix = "import Init\ndef baseVal : Nat := 21\n";
+        let cands_ok = vec![
+            "theorem race_t : baseVal + baseVal = 42 := by exact False.elim sorry".to_string(),
+            "theorem race_t : baseVal + baseVal = 999 := by rfl".to_string(),
+            "theorem race_t : baseVal + baseVal = 42 := by rfl".to_string(),
+        ];
+        let rep = eval_candidates_race_via_zygote(
+            &store,
+            "leanprover/lean4:v4.35.0",
+            "",
+            &env_vars,
+            &lean_bin,
+            prefix,
+            &cands_ok,
+            &[],
+        )
+        .expect("race_candidates IPC must succeed");
+        assert!(
+            rep.ok && rep.import_ok && rep.kernel_gate_active,
+            "expected valid candidate to win race: {:?}",
+            rep.errors
+        );
+        assert_eq!(rep.winning_candidate_idx, Some(2));
+        assert!(!rep.used_sorry && rep.sorry_decls.is_empty());
+
+        let cands_sorry_only = vec!["theorem race_bad : baseVal = 999 := by sorry".to_string()];
+        let rep_bad = eval_candidates_race_via_zygote(
+            &store,
+            "leanprover/lean4:v4.35.0",
+            "",
+            &env_vars,
+            &lean_bin,
+            prefix,
+            &cands_sorry_only,
+            &[],
+        )
+        .expect("race_candidates sorry-only IPC must return structured reply");
+        assert!(
+            !rep_bad.ok,
+            "sorry-backed candidate must be rejected fail-closed by kernel gate"
+        );
+
+        let mut fork_env = env_vars.clone();
+        fork_env.insert("TURBO_LEAN_ZYGOTE_FORK_SHARDS".to_string(), "1".to_string());
+        let fork_rep = eval_with_zygote_pool_for_targets(
+            &store,
+            "leanprover/lean4:v4.35.0",
+            "",
+            &fork_env,
+            &lean_bin,
+            "import Init\ntheorem forked_ok : 2 + 2 = 4 := rfl\n",
+            &["forked_ok".to_string()],
+            None,
+            &[],
+        )
+        .expect("forked shard check must succeed");
+        assert!(fork_rep.ok && fork_rep.import_ok && !fork_rep.used_sorry);
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_cross_worktree_closure_pool_dedup() {
+        let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("xwt_dedup") else {
+            return;
+        };
+        let wt1 = tmp_dir.join("worktree_alpha/.lake/packages/dep/build/lib/lean");
+        let wt2 = tmp_dir.join("worktree_beta/.lake/packages/dep/build/lib/lean");
+        fs::create_dir_all(&wt1).unwrap();
+        fs::create_dir_all(&wt2).unwrap();
+        let dep_bytes =
+            compile_test_olean(&lean_bin, &wt1, "XwtShared", "def xwtConst : Nat := 108\n");
+        fs::write(wt1.join("XwtShared.olean"), &dep_bytes).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        fs::write(wt2.join("XwtShared.olean"), &dep_bytes).unwrap();
+
+        let lp1 = wt1.to_string_lossy().into_owned();
+        let lp2 = wt2.to_string_lossy().into_owned();
+        let mut ev1 = env_vars.clone();
+        ev1.insert("LEAN_PATH".to_string(), lp1.clone());
+        let mut ev2 = env_vars.clone();
+        ev2.insert("LEAN_PATH".to_string(), lp2.clone());
+
+        let ctx1 = resolve_zygote_context(
+            "leanprover/lean4:v4.35.0",
+            &lp1,
+            &ev1,
+            &lean_bin,
+            "XwtShared",
+        );
+        let ctx2 = resolve_zygote_context(
+            "leanprover/lean4:v4.35.0",
+            &lp2,
+            &ev2,
+            &lean_bin,
+            "XwtShared",
+        );
+        assert_ne!(ctx1.lean_path, ctx2.lean_path);
+        assert_eq!(ctx1.host_closure_digest, ctx2.host_closure_digest);
+        assert_eq!(ctx1.closure_pool_digest, ctx2.closure_pool_digest);
+
+        let r1 = eval_with_zygote_pool_for_targets(
+            &store,
+            "leanprover/lean4:v4.35.0",
+            &lp1,
+            &ev1,
+            &lean_bin,
+            "import XwtShared\ntheorem t_wt1 : xwtConst = 108 := rfl\n",
+            &["t_wt1".to_string()],
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(r1.ok && r1.import_ok);
+
+        let r2 = eval_with_zygote_pool_for_targets(
+            &store,
+            "leanprover/lean4:v4.35.0",
+            &lp2,
+            &ev2,
+            &lean_bin,
+            "import XwtShared\ntheorem t_wt2 : xwtConst + 1 = 109 := rfl\n",
+            &["t_wt2".to_string()],
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(r2.ok && r2.import_ok);
+        assert!(
+            r2.env_cache_hit,
+            "second worktree with identical .olean closure must hit warm Zygote worker pool"
+        );
+
         let _ = fs::remove_dir_all(&tmp_dir);
     }
 }
