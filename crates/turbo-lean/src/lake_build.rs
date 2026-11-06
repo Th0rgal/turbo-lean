@@ -3704,11 +3704,22 @@ pub(crate) fn purge_sorry_artifacts_after_allow_sorry_failure(
 /// Purge modulo-`sorry` build artifacts and `.turbo_verified_sources.json` entries across the
 /// full workspace DAG + standalone graph (covering non-root `srcDir`, multi-hop transitive
 /// dependents `A -> B -> C`, and pre-existing sorry-bearing imports).
-fn purge_workspace_sorry_artifacts_and_manifest(
+pub(crate) fn workspace_tainted_sorry_paths(
+    canon_dir: &Path,
+    extra_seed_files: &[PathBuf],
+) -> HashSet<PathBuf> {
+    collect_workspace_sorry_taint(canon_dir, extra_seed_files, &[]).1
+}
+
+fn collect_workspace_sorry_taint(
     canon_dir: &Path,
     extra_seed_files: &[PathBuf],
     extra_seed_mods: &[String],
-) -> HashSet<String> {
+) -> (
+    HashSet<String>,
+    HashSet<PathBuf>,
+    Option<ProjectDependentClosure>,
+) {
     let file_has_sorry = |p: &Path| -> bool {
         fs::read_to_string(p)
             .map(|s| splitter::audit_hygiene(&splitter::strip_lean_comments(&s)).has_sorry)
@@ -3776,7 +3787,7 @@ fn purge_workspace_sorry_artifacts_and_manifest(
     }
 
     if sorry_mod_set.is_empty() && sorry_canon_paths.is_empty() {
-        return sorry_mod_set;
+        return (sorry_mod_set, sorry_canon_paths, closure_opt);
     }
 
     // Fixed-point transitive dependent closure across DAG nodes, standalone modules, and rechecked files.
@@ -3832,6 +3843,21 @@ fn purge_workspace_sorry_artifacts_and_manifest(
                 recheck_changed = true;
             }
         }
+    }
+
+    (sorry_mod_set, sorry_canon_paths, closure_opt)
+}
+
+fn purge_workspace_sorry_artifacts_and_manifest(
+    canon_dir: &Path,
+    extra_seed_files: &[PathBuf],
+    extra_seed_mods: &[String],
+) -> HashSet<String> {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let (sorry_mod_set, sorry_canon_paths, closure_opt) =
+        collect_workspace_sorry_taint(canon_dir, extra_seed_files, extra_seed_mods);
+    if sorry_mod_set.is_empty() && sorry_canon_paths.is_empty() {
+        return sorry_mod_set;
     }
 
     // Purge all build artifacts for tainted modules.

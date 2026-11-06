@@ -5938,7 +5938,7 @@ fn standalone_statement_olean_action_key(
         worklist.extend(imps.into_iter().map(|i| i.module));
     }
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean:standalone-stmt-olean:v1\0");
+    h.update(b"turbo-lean:standalone-stmt-olean:v2\0");
     h.update(cfg.lean_githash.as_bytes());
     h.update(b"\0");
     h.update(pkg.config_digest.as_bytes());
@@ -5975,6 +5975,83 @@ fn standalone_statement_olean_action_key(
         h.update(b"\n");
     }
     Some(h.finalize().to_hex().to_string())
+}
+
+fn is_regular_nonempty_standalone_artifact(p: &Path) -> bool {
+    fs::symlink_metadata(p)
+        .is_ok_and(|m| !m.file_type().is_symlink() && m.file_type().is_file() && m.len() > 0)
+}
+
+fn validate_standalone_artifact_outputs(
+    outputs: &[crate::db::BlobEntry],
+    lib_dir: &Path,
+    rel_source: &Path,
+    is_module: bool,
+) -> Option<std::collections::BTreeMap<String, PathBuf>> {
+    let output = lib_dir.join(rel_source).with_extension("olean");
+    let expected: std::collections::BTreeMap<String, (&'static str, PathBuf)> =
+        crate::module_builder::olean_artifact_paths(&output)
+            .into_iter()
+            .filter_map(|(kind, abs)| {
+                let rel = abs
+                    .strip_prefix(lib_dir)
+                    .ok()?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                Some((rel, (kind, abs)))
+            })
+            .collect();
+    if outputs.is_empty() {
+        return None;
+    }
+    let mut mapped = std::collections::BTreeMap::new();
+    let mut has_olean = false;
+    let mut has_srv = false;
+    let mut has_priv = false;
+    let mut has_ir = false;
+    for entry in outputs {
+        if entry.size_bytes == 0 {
+            return None;
+        }
+        let &(exp_kind, ref abs) = expected.get(&entry.rel_path)?;
+        if entry.kind != exp_kind {
+            return None;
+        }
+        match exp_kind {
+            "olean" => has_olean = true,
+            "srv" => has_srv = true,
+            "priv" => has_priv = true,
+            "ir" => has_ir = true,
+            _ => {}
+        }
+        if mapped.insert(entry.rel_path.clone(), abs.clone()).is_some() {
+            return None;
+        }
+    }
+    if !has_olean || (is_module && (!has_srv || !has_priv || !has_ir)) {
+        return None;
+    }
+    Some(mapped)
+}
+
+fn standalone_artifacts_present_on_disk(olean_path: &Path, is_module: bool) -> bool {
+    if !is_regular_nonempty_standalone_artifact(olean_path) {
+        return false;
+    }
+    if is_module {
+        let srv = PathBuf::from(format!("{}.server", olean_path.display()));
+        let prv = PathBuf::from(format!("{}.private", olean_path.display()));
+        let ir = olean_path.with_extension("ir");
+        if !is_regular_nonempty_standalone_artifact(&srv)
+            || !is_regular_nonempty_standalone_artifact(&prv)
+            || !is_regular_nonempty_standalone_artifact(&ir)
+        {
+            return false;
+        }
+    }
+    crate::module_builder::olean_artifact_paths(olean_path)
+        .into_iter()
+        .all(|(_, p)| fs::symlink_metadata(&p).map_or(true, |m| !m.file_type().is_symlink()))
 }
 
 fn compile_standalone_statement_modules(
@@ -6044,13 +6121,38 @@ fn compile_standalone_statement_modules(
                 {
                     match outcome {
                         crate::db::SingleflightOutcome::CacheHit { outputs, .. } => {
-                            if let Some(entry) = outputs.first() {
-                                let _ = fs::remove_file(output.with_extension("olean.server"));
-                                let _ = fs::remove_file(output.with_extension("olean.private"));
-                                if st.restore_blob_to_path(&entry.blob_hash, &output).is_ok()
-                                    && output.is_file()
+                            if let Some(mapped) = validate_standalone_artifact_outputs(
+                                &outputs,
+                                lib_dir,
+                                rel_source,
+                                header.is_module,
+                            ) {
+                                for (_, cand) in
+                                    crate::module_builder::olean_artifact_paths(&output)
                                 {
+                                    if !mapped.values().any(|p| p == &cand)
+                                        && fs::symlink_metadata(&cand).is_ok()
+                                    {
+                                        let _ = fs::remove_file(&cand);
+                                    }
+                                }
+                                let restored_all = outputs.iter().all(|entry| {
+                                    mapped.get(&entry.rel_path).is_some_and(|dest| {
+                                        st.restore_blob_to_path(&entry.blob_hash, dest).is_ok()
+                                    })
+                                }) && standalone_artifacts_present_on_disk(
+                                    &output,
+                                    header.is_module,
+                                );
+                                if restored_all {
                                     continue;
+                                }
+                                for (_, cand) in
+                                    crate::module_builder::olean_artifact_paths(&output)
+                                {
+                                    if fs::symlink_metadata(&cand).is_ok() {
+                                        let _ = fs::remove_file(&cand);
+                                    }
                                 }
                             }
                         }
@@ -6058,6 +6160,11 @@ fn compile_standalone_statement_modules(
                             pending_lease = Some(lease);
                         }
                     }
+                }
+            }
+            for (_, cand) in crate::module_builder::olean_artifact_paths(&output) {
+                if fs::symlink_metadata(&cand).is_ok() {
+                    let _ = fs::remove_file(&cand);
                 }
             }
             let t0 = std::time::Instant::now();
@@ -6081,7 +6188,9 @@ fn compile_standalone_statement_modules(
                 std::time::Duration::from_secs(1800),
                 is_untrusted,
             )?;
-            if !out.status.success() {
+            let artifacts_valid = out.status.success()
+                && standalone_artifacts_present_on_disk(&output, header.is_module);
+            if !artifacts_valid {
                 if let (Some(lease), Some(st)) = (pending_lease.take(), store.as_deref_mut()) {
                     st.remove_singleflight_done(&lease.action_key);
                     drop(lease);
@@ -6093,19 +6202,44 @@ fn compile_standalone_statement_modules(
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
+            anyhow::ensure!(
+                artifacts_valid,
+                "Stock Lean statement module {name} produced incomplete artifact set (is_module={})",
+                header.is_module
+            );
             if let (Some(lease), Some(st)) = (pending_lease.take(), store.as_deref_mut()) {
                 let dur_ms = t0.elapsed().as_millis() as i64;
-                if let Ok(bytes) = fs::read(&output) {
-                    let rel_out = rel_source
-                        .with_extension("olean")
-                        .to_string_lossy()
-                        .to_string();
-                    if st
-                        .publish_action_with_blob(
-                            &lease, &bytes, "olean", &rel_out, dur_ms, "trusted",
-                        )
-                        .is_err()
-                    {
+                let mut blob_items = Vec::new();
+                let mut read_ok = true;
+                for (kind, abs_path) in crate::module_builder::olean_artifact_paths(&output) {
+                    if is_regular_nonempty_standalone_artifact(&abs_path) {
+                        match (fs::read(&abs_path), abs_path.strip_prefix(lib_dir)) {
+                            (Ok(bytes), Ok(rel_p)) => {
+                                let sz = bytes.len() as u64;
+                                let rel_str = rel_p.to_string_lossy().replace('\\', "/");
+                                blob_items.push((
+                                    String::new(),
+                                    bytes,
+                                    kind.to_string(),
+                                    rel_str,
+                                    sz,
+                                ));
+                            }
+                            _ => {
+                                read_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if read_ok && !blob_items.is_empty() {
+                    let pub_res: Result<()> = (|| {
+                        let _pub_guard = crate::db::acquire_cas_publication_guard(&st.root)?;
+                        let entries = st.batch_store_immutable_blobs(&blob_items, "trusted", 0)?;
+                        st.publish_action(&lease, &entries, dur_ms, 0, 0, "trusted")?;
+                        Ok(())
+                    })();
+                    if pub_res.is_err() {
                         st.remove_singleflight_done(&lease.action_key);
                     }
                 } else {
@@ -7540,9 +7674,17 @@ fn kernel_statement_changes_with_trust(
             && statement_source_modules(proj, &pkg, statement_scope)?
                 .values()
                 .all(|(source, root)| {
+                    let is_mod = fs::read_to_string(source)
+                        .map(|s| crate::module_builder::parse_header_info(&s).is_module)
+                        .unwrap_or(false);
                     source
                         .strip_prefix(root)
-                        .map(|rel| lib_dir.join(rel).with_extension("olean").is_file())
+                        .map(|rel| {
+                            standalone_artifacts_present_on_disk(
+                                &lib_dir.join(rel).with_extension("olean"),
+                                is_mod,
+                            )
+                        })
                         .unwrap_or(false)
                 });
         if !all_built {
@@ -7768,17 +7910,20 @@ fn kernel_statement_changes_with_trust(
                 let base_lib_dir = head_project.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
                 let (base_lp, _) = crate::module_builder::build_lean_search_path(cfg, true);
                 let ov_lp = format!("{}:{base_lp}", ov_lib.display());
-                let mut pending: BTreeMap<String, (PathBuf, PathBuf, String, Vec<String>)> =
+                let mut pending: BTreeMap<String, (PathBuf, PathBuf, String, Vec<String>, bool)> =
                     BTreeMap::new();
                 for (name, (source, root)) in standalone {
                     let src_str = fs::read_to_string(&source).ok()?;
-                    let imps = crate::module_builder::parse_header_info(&src_str).imports;
-                    pending.insert(name, (source, root, src_str, imps));
+                    let header = crate::module_builder::parse_header_info(&src_str);
+                    pending.insert(
+                        name,
+                        (source, root, src_str, header.imports, header.is_module),
+                    );
                 }
                 while !pending.is_empty() {
                     let ready: Vec<String> = pending
                         .iter()
-                        .filter(|(_, (_, _, _, imps))| {
+                        .filter(|(_, (_, _, _, imps, _))| {
                             imps.iter().all(|m| !pending.contains_key(m))
                         })
                         .map(|(name, _)| name.clone())
@@ -7787,13 +7932,13 @@ fn kernel_statement_changes_with_trust(
                         return None;
                     }
                     for name in ready {
-                        let (source, root, src_str, imps) = pending.remove(&name)?;
+                        let (source, root, src_str, imps, is_mod) = pending.remove(&name)?;
                         let rel = source.strip_prefix(&root).ok()?;
                         let existing_olean = base_lib_dir.join(rel).with_extension("olean");
                         let touches_rebuilt =
                             imps.iter().any(|m| rebuilt_hint.contains(m.as_str()));
                         let fresh_unchanged = !touches_rebuilt
-                            && existing_olean.is_file()
+                            && standalone_artifacts_present_on_disk(&existing_olean, is_mod)
                             && standalone_statement_olean_action_key(
                                 cfg,
                                 &pkg,
@@ -7804,11 +7949,30 @@ fn kernel_statement_changes_with_trust(
                                 Some(&ov_lib),
                             )
                             .and_then(|key| store.get_cached_action(&key, "trusted").ok().flatten())
-                            .and_then(|outs| outs.first().map(|e| e.blob_hash.clone()))
-                            .is_some_and(|expected_hash| {
-                                fs::read(&existing_olean)
-                                    .map(|b| blake3::hash(&b).to_hex().as_str() == expected_hash)
-                                    .unwrap_or(false)
+                            .is_some_and(|outs| {
+                                let Some(mapped) = validate_standalone_artifact_outputs(
+                                    &outs,
+                                    &base_lib_dir,
+                                    rel,
+                                    is_mod,
+                                ) else {
+                                    return false;
+                                };
+                                crate::module_builder::olean_artifact_paths(&existing_olean)
+                                    .into_iter()
+                                    .all(|(_, cand)| {
+                                        mapped.values().any(|p| p == &cand)
+                                            || fs::symlink_metadata(&cand).is_err()
+                                    })
+                                    && outs.iter().all(|entry| {
+                                        mapped
+                                            .get(&entry.rel_path)
+                                            .and_then(|p| fs::read(p).ok())
+                                            .is_some_and(|b| {
+                                                blake3::hash(&b).to_hex().as_str()
+                                                    == entry.blob_hash
+                                            })
+                                    })
                             });
                         if fresh_unchanged {
                             let dst_olean = ov_lib.join(rel).with_extension("olean");
@@ -7838,7 +8002,7 @@ fn kernel_statement_changes_with_trust(
                             }
                             let mut cmd = statement_lean_command(&head_project, false).ok()?;
                             cmd.env("LEAN_PATH", &ov_lp);
-                            cmd.args(&pkg.more_lean_args).args(&pkg.weak_lean_args);
+                            cmd.args(&pkg.weak_lean_args).args(&pkg.more_lean_args);
                             for (k, v) in &pkg.lean_options {
                                 cmd.arg(format!("-D{}={}", k.to_lean_string(), v.raw_cli_value()));
                             }
@@ -7849,7 +8013,9 @@ fn kernel_statement_changes_with_trust(
                                 false,
                             )
                             .ok()?;
-                            if !out.status.success() {
+                            if !out.status.success()
+                                || !standalone_artifacts_present_on_disk(&output, is_mod)
+                            {
                                 return None;
                             }
                         }
@@ -16584,6 +16750,192 @@ end ParityNs
         );
 
         let _ = fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[test]
+    fn test_standalone_module_format_cache_preserves_private_sidecars_and_cold_warm_parity(
+    ) -> Result<()> {
+        if Command::new("lean").arg("--version").output().is_err()
+            || Command::new("lake").arg("--version").output().is_err()
+        {
+            return Ok(());
+        }
+        use crate::worktree_test_support::LakeTree;
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = LakeTree::new(
+            "standalone_module_private_cache",
+            &[
+                ("P/A.lean", "theorem dag_thm : 1 + 1 = 2 := by\n  omega\n"),
+                (
+                    "Extra/StandMod.lean",
+                    "module\npublic import P.A\npublic theorem pub_thm : True := trivial\nprivate theorem priv_thm : 1 + 1 = 2 := rfl\n",
+                ),
+            ],
+        )?;
+        git_init_and_commit(&tree.project, "base_standalone_module")?;
+        let pkg = crate::module_builder::resolve_package_config(&tree.project, true)?;
+        let lib_dir = tree.project.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
+        let standalone = BTreeMap::from([(
+            "Extra.StandMod".to_string(),
+            (
+                tree.project.join("Extra/StandMod.lean"),
+                tree.project.clone(),
+            ),
+        )]);
+
+        let mut warm_store = TurboStore::open(Some(&tree.root.join("warm_store")))?;
+        compile_standalone_statement_modules(
+            &tree.project,
+            &pkg,
+            &lib_dir,
+            standalone.clone(),
+            false,
+            Some(&mut warm_store),
+        )?;
+        let olean_p = lib_dir.join("Extra/StandMod.olean");
+        let srv_p = PathBuf::from(format!("{}.server", olean_p.display()));
+        let priv_p = PathBuf::from(format!("{}.private", olean_p.display()));
+        let ir_p = olean_p.with_extension("ir");
+        assert!(
+            olean_p.is_file() && srv_p.is_file() && priv_p.is_file() && ir_p.is_file(),
+            "cold standalone `module` build must emit .olean, .olean.server, .olean.private, and .ir"
+        );
+        let cold_rep = built_kernel_statement_report(&tree.project, None, false, None, None)?;
+        assert!(
+            cold_rep.statements.keys().any(|k| k.ends_with("pub_thm")),
+            "cold report must contain public theorem"
+        );
+        assert!(
+            cold_rep.statements.keys().any(|k| k.contains("priv_thm")),
+            "cold report must contain private theorem from .olean.private, got keys: {:?}",
+            cold_rep.statements.keys().collect::<Vec<_>>()
+        );
+
+        // Wipe `Extra/` build outputs and restore via warm `compile_standalone_statement_modules` hit.
+        fs::remove_dir_all(lib_dir.join("Extra"))?;
+        compile_standalone_statement_modules(
+            &tree.project,
+            &pkg,
+            &lib_dir,
+            standalone.clone(),
+            false,
+            Some(&mut warm_store),
+        )?;
+        assert!(
+            olean_p.is_file() && srv_p.is_file() && priv_p.is_file() && ir_p.is_file(),
+            "warm standalone `module` cache hit must restore .olean, .olean.server, .olean.private, and .ir"
+        );
+        let warm_rep = built_kernel_statement_report(&tree.project, None, false, None, None)?;
+        assert_eq!(
+            warm_rep.statements, cold_rep.statements,
+            "warm standalone `module` cache hit must preserve exact kernel statement parity with cold build"
+        );
+
+        // Corrupt the cached action outputs in SQLite to drop `.olean.private`: warm hit must reject
+        // the incomplete entry and fall back to recompiling the full artifact set.
+        warm_store.conn.execute(
+            "DELETE FROM action_outputs WHERE rel_path LIKE '%.private'",
+            [],
+        )?;
+        for f in warm_store
+            .root
+            .join("locks")
+            .read_dir()
+            .into_iter()
+            .flatten()
+            .flatten()
+        {
+            if f.path().extension().and_then(|e| e.to_str()) == Some("done") {
+                let _ = fs::remove_file(f.path());
+            }
+        }
+        fs::remove_dir_all(lib_dir.join("Extra"))?;
+        compile_standalone_statement_modules(
+            &tree.project,
+            &pkg,
+            &lib_dir,
+            standalone,
+            false,
+            Some(&mut warm_store),
+        )?;
+        assert!(
+            priv_p.is_file(),
+            "incomplete cached standalone `module` entry missing .olean.private must be rejected and recompiled"
+        );
+
+        // End-to-end warm vs cold `pr-verify` parity when a private theorem statement changes in `Extra/StandMod.lean`.
+        run_pr_verify_command(
+            &mut warm_store,
+            true,
+            tree.project.clone(),
+            "HEAD".into(),
+            "trusted".into(),
+            true,
+            None,
+            None,
+            None,
+            None,
+            false,
+            0,
+            None,
+        )?;
+        fs::write(
+            tree.project.join("P/A.lean"),
+            "theorem dag_thm : 1 + 1 = 2 := by\n  exact rfl\n",
+        )?;
+        fs::write(
+            tree.project.join("Extra/StandMod.lean"),
+            "module\npublic import P.A\npublic theorem pub_thm : True := trivial\nprivate theorem priv_thm : 2 + 2 = 4 := rfl\n",
+        )?;
+        let mut cold_store = TurboStore::open(Some(&tree.root.join("cold_store")))?;
+        let warm_err = run_pr_verify_command(
+            &mut warm_store,
+            true,
+            tree.project.clone(),
+            "HEAD".into(),
+            "trusted".into(),
+            true,
+            None,
+            None,
+            None,
+            None,
+            false,
+            0,
+            None,
+        )
+        .expect_err(
+            "warm pr-verify must reject private theorem statement edit in standalone module",
+        );
+        let cold_err = run_pr_verify_command(
+            &mut cold_store,
+            true,
+            tree.project.clone(),
+            "HEAD".into(),
+            "trusted".into(),
+            true,
+            None,
+            None,
+            None,
+            None,
+            false,
+            0,
+            None,
+        )
+        .expect_err(
+            "cold pr-verify must reject private theorem statement edit in standalone module",
+        );
+        assert!(
+            warm_err.to_string().contains("priv_thm") && cold_err.to_string().contains("priv_thm"),
+            "both warm ({warm_err:#}) and cold ({cold_err:#}) must detect private statement change"
+        );
+
+        let _ = fs::remove_dir_all(&tree.root);
         Ok(())
     }
 }

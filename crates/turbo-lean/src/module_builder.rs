@@ -20437,7 +20437,26 @@ pub(crate) fn ensure_imported_oleans_replayed(
     canon_dir: &Path,
     target_files: &[PathBuf],
 ) -> Result<usize> {
-    ensure_imported_oleans_replayed_with_roots(store, canon_dir, target_files, &[])
+    ensure_imported_oleans_replayed_with_options(store, canon_dir, target_files, false)
+}
+
+pub(crate) fn ensure_imported_oleans_replayed_with_options(
+    store: &TurboStore,
+    canon_dir: &Path,
+    target_files: &[PathBuf],
+    allow_sorry: bool,
+) -> Result<usize> {
+    let mut allowed = splitter::allowed_axioms();
+    if allow_sorry && !allowed.iter().any(|a| a == "sorryAx") {
+        allowed.push("sorryAx".to_string());
+    }
+    ensure_imported_oleans_replayed_with_roots_and_axioms(
+        store,
+        canon_dir,
+        target_files,
+        &[],
+        &allowed,
+    )
 }
 
 pub(crate) fn ensure_imported_oleans_replayed_with_roots(
@@ -20529,13 +20548,15 @@ pub(crate) fn ensure_imported_oleans_replayed_with_roots_and_axioms(
         }
     }
     if !pending_audit.is_empty() {
-        crate::zygote::audit_compiled_modules_with_zygote(
+        let allow_sorry_axiom = allowed_axioms.iter().any(|a| a == "sorryAx");
+        crate::zygote::audit_compiled_modules_with_zygote_options(
             store,
             &cfg,
             &pending_audit,
             &replay_lp,
             &[],
             false,
+            allow_sorry_axiom,
         )
         .context("Imported `.olean` failed in-kernel soundness & replay audit")?;
     }

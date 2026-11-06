@@ -1919,20 +1919,29 @@ fn run_check_command_inner(
                 resolved_file.display()
             );
         }
-        return check_directory(
-            store,
-            json_output,
-            emit_stdout,
-            &kernel_prov,
-            &t0,
-            &file,
-            &resolved_file,
-            &canon_dir,
-            &toolchain,
-            jobs,
-            remote_http.as_deref(),
-            allow_sorry,
-        );
+        return {
+            let dir_res = check_directory(
+                store,
+                json_output,
+                emit_stdout,
+                &kernel_prov,
+                &t0,
+                &file,
+                &resolved_file,
+                &canon_dir,
+                &toolchain,
+                jobs,
+                remote_http.as_deref(),
+                allow_sorry,
+            );
+            if dir_res.is_err() && allow_sorry {
+                let dir_files = collect_lean_files(&resolved_file);
+                crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(
+                    &canon_dir, &dir_files,
+                );
+            }
+            dir_res
+        };
     }
 
     let canon_resolved_initial = resolved_file
@@ -1951,10 +1960,11 @@ fn run_check_command_inner(
             );
         }
         fresh_res?;
-        let import_res = crate::module_builder::ensure_imported_oleans_replayed(
+        let import_res = crate::module_builder::ensure_imported_oleans_replayed_with_options(
             store,
             &canon_dir,
             std::slice::from_ref(&canon_resolved_initial),
+            allow_sorry,
         );
         if import_res.is_err() && allow_sorry {
             crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(
@@ -2324,12 +2334,19 @@ fn run_check_command_inner(
     }
     let res = res_or_err?;
     if !emit_olean {
-        crate::lake_build::recheck_dependents_if_nonlocal_with_options(
+        let recheck_res = crate::lake_build::recheck_dependents_if_nonlocal_with_options(
             store,
             &canon_dir,
             &resolved_file,
             allow_sorry,
-        )?;
+        );
+        if recheck_res.is_err() && allow_sorry {
+            crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(
+                &canon_dir,
+                std::slice::from_ref(&canon_resolved_initial),
+            );
+        }
+        recheck_res?;
     }
     Ok(res)
 }
@@ -2359,8 +2376,12 @@ fn check_directory(
         crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(canon_dir, &dir_files);
     }
     fresh_res?;
-    let import_res =
-        crate::module_builder::ensure_imported_oleans_replayed(store, canon_dir, &dir_files);
+    let import_res = crate::module_builder::ensure_imported_oleans_replayed_with_options(
+        store,
+        canon_dir,
+        &dir_files,
+        allow_sorry,
+    );
     if import_res.is_err() && allow_sorry {
         crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(canon_dir, &dir_files);
     }
@@ -2374,6 +2395,11 @@ fn check_directory(
     let mut parsed_files = Vec::with_capacity(split_entries.len());
     let mut all_shard_keys = Vec::new();
     let mut sorry_files: Vec<PathBuf> = Vec::new();
+    let tainted_sorry_paths = if allow_sorry {
+        crate::lake_build::workspace_tainted_sorry_paths(canon_dir, &dir_files)
+    } else {
+        HashSet::new()
+    };
 
     for (lf, src_blake3, src, split) in split_entries {
         let rel = lf.strip_prefix(canon_dir).unwrap_or(&lf);
@@ -2382,9 +2408,11 @@ fn check_directory(
         dir_hasher.update(split.interface_hash.as_bytes());
         dir_hasher.update(b"\n");
 
+        let lf_canon = lf.canonicalize().unwrap_or_else(|_| lf.clone());
         if allow_sorry
             && split.hygiene.is_clean_modulo_sorry()
-            && !split.hygiene.is_clean_for_certification()
+            && (!split.hygiene.is_clean_for_certification()
+                || tainted_sorry_paths.contains(&lf_canon))
         {
             sorry_files.push(lf);
             continue;
