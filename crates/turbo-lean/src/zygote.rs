@@ -4411,11 +4411,7 @@ fn build_replay_closure_batches(
         if let Some(cached) = memo.get(m) {
             return Ok(cached.clone());
         }
-        let rel = format!(
-            "{}.olean",
-            crate::module_builder::module_name_to_rel_slash(m)
-        );
-        let Some(p) = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
+        let Some(p) = crate::module_builder::resolve_olean_along_search_dirs(&dirs, m) else {
             memo.insert(m.to_string(), None);
             return Ok(None);
         };
@@ -8703,7 +8699,7 @@ fn write_eval_shm_cache(path: &Path, closure: &ClosureSnapshot, bytes: &[u8]) {
 }
 
 fn read_cached_eval_shm_reply(path: &Path) -> Option<ZygoteEvalReply> {
-    let bytes = fs::read(path).ok()?;
+    let bytes = crate::shm_cache::read_verified_private_file_at(path)?;
     let mut cached_rep: ZygoteEvalReply = serde_json::from_slice(&bytes).ok()?;
     // Fail closed on entries without current provenance (older hosts, foreign writers).
     if !eval_reply_cacheable(&cached_rep) {
@@ -8781,7 +8777,8 @@ pub fn try_stateless_eval_shm_cache(
     .ok()?;
     let base_staging =
         if Path::new("/dev/shm").is_dir() || std::env::var("TURBO_LEAN_STAGING_DIR").is_ok() {
-            crate::shm_cache::staging_shm_dir()
+            crate::shm_cache::ensure_verified_private_staging_dir(None)
+                .unwrap_or_else(|| cache_root.join("staging"))
         } else {
             cache_root.join("staging")
         };
@@ -8903,12 +8900,15 @@ pub fn try_local_zygote_eval_with_args(
             &filtered_args,
         )?;
         let dir = store.fast_staging_dir().join("eval_shm_cache");
-        let _ = crate::shm_cache::ensure_private_dir_all(&dir);
-        let path = dir.join(filename);
-        if let Some(cached_rep) = read_cached_eval_shm_reply(&path) {
-            return Ok(Some(cached_rep));
+        if crate::shm_cache::ensure_private_dir_all(&dir).is_ok() {
+            let path = dir.join(filename);
+            if let Some(cached_rep) = read_cached_eval_shm_reply(&path) {
+                return Ok(Some(cached_rep));
+            }
+            Some(path)
+        } else {
+            None
         }
-        Some(path)
     } else {
         None
     };
@@ -9824,7 +9824,7 @@ mod tests {
             ..Default::default()
         };
         let bytes = serde_json::to_vec(&reply)?;
-        fs::write(&path, &bytes)?;
+        crate::shm_cache::atomic_write_shm(&path, &bytes)?;
         let eval = |args: &[String]| {
             try_local_zygote_eval_with_args(
                 &store,
@@ -12004,12 +12004,12 @@ mod tests {
         // and, as a foreign/unversioned writer would, at the new key.
         let stale = br#"{"ok":true,"kernel_gate_active":false,"import_ok":true,"env_cache_hit":false,"prefix_cache_hit":false,"import_us":1,"prefix_us":0,"elab_us":1,"heartbeats":0,"proof_term_nodes":0,"rss_delta_mb":0,"peak_rss_mb":0,"subshards_verified":1,"stdout":"","messages":[],"errors":[],"used_constants":[],"timed_out":false,"crashed":false}"#;
         for name in [&v3_name, &v4_name, &new_name] {
-            fs::write(dir.join(name), stale).unwrap();
+            crate::shm_cache::atomic_write_shm(&dir.join(name), stale).unwrap();
         }
         assert!(read_cached_eval_shm_reply(&dir.join(&v3_name)).is_none());
         assert!(read_cached_eval_shm_reply(&dir.join(&v4_name)).is_none());
-        fs::write(dir.join(&v4_name), stale).unwrap();
-        fs::write(dir.join(&new_name), stale).unwrap();
+        crate::shm_cache::atomic_write_shm(&dir.join(&v4_name), stale).unwrap();
+        crate::shm_cache::atomic_write_shm(&dir.join(&new_name), stale).unwrap();
 
         let rep = try_local_zygote_eval_with_args(
             &store,
@@ -12113,12 +12113,12 @@ mod tests {
         // What a #306 host cached: scanner-vetted, ok, but never kernel-replayed.
         let stale = br#"{"ok":true,"kernel_gate_active":true,"import_ok":true,"env_cache_hit":false,"prefix_cache_hit":false,"import_us":1,"prefix_us":0,"elab_us":1,"heartbeats":0,"proof_term_nodes":0,"rss_delta_mb":0,"peak_rss_mb":0,"subshards_verified":2,"stdout":"","messages":[],"errors":[],"used_constants":["bad"],"timed_out":false,"crashed":false,"scanner_version":1}"#;
         for name in [&v4_name, &v5_name, &new_name] {
-            fs::write(dir.join(name), stale).unwrap();
+            crate::shm_cache::atomic_write_shm(&dir.join(name), stale).unwrap();
             assert!(
                 read_cached_eval_shm_reply(&dir.join(name)).is_none(),
                 "pre-replay entry {name} was accepted"
             );
-            fs::write(dir.join(name), stale).unwrap();
+            crate::shm_cache::atomic_write_shm(&dir.join(name), stale).unwrap();
         }
         let rep = try_local_zygote_eval_with_args(
             &store,

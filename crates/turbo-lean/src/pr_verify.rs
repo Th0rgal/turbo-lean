@@ -5899,6 +5899,7 @@ fn standalone_statement_olean_action_key(
     rel_source: &Path,
     src_text: &str,
     imports: &[String],
+    overlay_lib_dir: Option<&Path>,
 ) -> Option<String> {
     let split = splitter::split_lean_source(src_text, &[]);
     if split.hygiene.has_impure_metaprograms
@@ -5910,7 +5911,8 @@ fn standalone_statement_olean_action_key(
         return None;
     }
     let (lean_path, _) = crate::module_builder::build_lean_search_path(cfg, true);
-    let mut dirs: Vec<PathBuf> = std::env::split_paths(&lean_path).collect();
+    let mut dirs: Vec<PathBuf> = overlay_lib_dir.iter().map(|p| (*p).to_path_buf()).collect();
+    dirs.extend(std::env::split_paths(&lean_path));
     if !cfg.toolchain_lib_lean.as_os_str().is_empty() && !dirs.contains(&cfg.toolchain_lib_lean) {
         dirs.push(cfg.toolchain_lib_lean.clone());
     }
@@ -5921,14 +5923,7 @@ fn standalone_statement_olean_action_key(
         if !seen.insert(m.clone()) {
             continue;
         }
-        let rel_olean = format!(
-            "{}.olean",
-            crate::module_builder::module_name_to_rel_slash(&m)
-        );
-        let path = dirs
-            .iter()
-            .map(|d| d.join(&rel_olean))
-            .find(|p| p.is_file())?;
+        let path = crate::module_builder::resolve_olean_along_search_dirs(&dirs, &m)?;
         if crate::module_builder::is_verified_toolchain_olean_file(
             &cfg.toolchain_lib_lean,
             Some(&cfg.lean_githash),
@@ -6037,6 +6032,7 @@ fn compile_standalone_statement_modules(
                     rel_source,
                     &src_text,
                     &header.imports,
+                    None,
                 )
             });
             let mut pending_lease = None;
@@ -6439,6 +6435,7 @@ impl Drop for StatementPolicyEnvGuard {
 #[cfg(test)]
 static HEAD_OVERLAY_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+#[allow(clippy::too_many_arguments)]
 fn certify_head_statement_modules_and_replay(
     store: &TurboStore,
     head_project: &Path,
@@ -7768,70 +7765,73 @@ fn kernel_statement_changes_with_trust(
             let mut rebuilt_hint: std::collections::HashSet<String> =
                 dirty_mods.iter().cloned().collect();
             if !standalone.is_empty() {
-                let dirty_set: std::collections::HashSet<&str> =
-                    dirty_mods.iter().map(String::as_str).collect();
                 let base_lib_dir = head_project.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
-                let mut standalone_to_build = BTreeMap::new();
+                let (base_lp, _) = crate::module_builder::build_lean_search_path(cfg, true);
+                let ov_lp = format!("{}:{base_lp}", ov_lib.display());
+                let mut pending: BTreeMap<String, (PathBuf, PathBuf, String, Vec<String>)> =
+                    BTreeMap::new();
                 for (name, (source, root)) in standalone {
-                    let rel = source.strip_prefix(&root).ok()?;
-                    let existing_olean = base_lib_dir.join(rel).with_extension("olean");
                     let src_str = fs::read_to_string(&source).ok()?;
                     let imps = crate::module_builder::parse_header_info(&src_str).imports;
-                    let touches_dirty = imps.iter().any(|m| dirty_set.contains(m.as_str()));
-                    let fresh_unchanged = !touches_dirty
-                        && existing_olean.is_file()
-                        && standalone_statement_olean_action_key(
-                            cfg, &pkg, &name, rel, &src_str, &imps,
-                        )
-                        .and_then(|key| store.get_cached_action(&key, "trusted").ok().flatten())
-                        .and_then(|outs| outs.first().map(|e| e.blob_hash.clone()))
-                        .is_some_and(|expected_hash| {
-                            fs::read(&existing_olean)
-                                .map(|b| blake3::hash(&b).to_hex().as_str() == expected_hash)
-                                .unwrap_or(false)
-                        });
-                    if !fresh_unchanged {
-                        rebuilt_hint.insert(name.clone());
-                        standalone_to_build.insert(name, (source, root));
-                    } else {
-                        let dst_olean = ov_lib.join(rel).with_extension("olean");
-                        for (_, src_art) in
-                            crate::module_builder::olean_artifact_paths(&existing_olean)
-                        {
-                            if src_art.is_file() {
-                                let file_name = src_art.file_name()?;
-                                let dst_art = dst_olean
-                                    .parent()
-                                    .map(|p| p.join(file_name))
-                                    .unwrap_or_else(|| ov_lib.join(file_name));
-                                if let Some(parent) = dst_art.parent() {
-                                    fs::create_dir_all(parent).ok()?;
-                                }
-                                if !dst_art.exists() {
-                                    crate::zygote::copy_file_reflink(&src_art, &dst_art).ok()?;
-                                }
-                            }
-                        }
-                    }
+                    pending.insert(name, (source, root, src_str, imps));
                 }
-                if !standalone_to_build.is_empty() {
-                    let (base_lp, _) = crate::module_builder::build_lean_search_path(cfg, true);
-                    let ov_lp = format!("{}:{base_lp}", ov_lib.display());
-                    while !standalone_to_build.is_empty() {
-                        let mut ready = Vec::new();
-                        for (name, (source, _)) in &standalone_to_build {
-                            let src_str = fs::read_to_string(source).ok()?;
-                            let imps = crate::module_builder::parse_header_info(&src_str).imports;
-                            if imps.iter().all(|m| !standalone_to_build.contains_key(m)) {
-                                ready.push(name.clone());
+                while !pending.is_empty() {
+                    let ready: Vec<String> = pending
+                        .iter()
+                        .filter(|(_, (_, _, _, imps))| {
+                            imps.iter().all(|m| !pending.contains_key(m))
+                        })
+                        .map(|(name, _)| name.clone())
+                        .collect();
+                    if ready.is_empty() {
+                        return None;
+                    }
+                    for name in ready {
+                        let (source, root, src_str, imps) = pending.remove(&name)?;
+                        let rel = source.strip_prefix(&root).ok()?;
+                        let existing_olean = base_lib_dir.join(rel).with_extension("olean");
+                        let touches_rebuilt =
+                            imps.iter().any(|m| rebuilt_hint.contains(m.as_str()));
+                        let fresh_unchanged = !touches_rebuilt
+                            && existing_olean.is_file()
+                            && standalone_statement_olean_action_key(
+                                cfg,
+                                &pkg,
+                                &name,
+                                rel,
+                                &src_str,
+                                &imps,
+                                Some(&ov_lib),
+                            )
+                            .and_then(|key| store.get_cached_action(&key, "trusted").ok().flatten())
+                            .and_then(|outs| outs.first().map(|e| e.blob_hash.clone()))
+                            .is_some_and(|expected_hash| {
+                                fs::read(&existing_olean)
+                                    .map(|b| blake3::hash(&b).to_hex().as_str() == expected_hash)
+                                    .unwrap_or(false)
+                            });
+                        if fresh_unchanged {
+                            let dst_olean = ov_lib.join(rel).with_extension("olean");
+                            for (_, src_art) in
+                                crate::module_builder::olean_artifact_paths(&existing_olean)
+                            {
+                                if src_art.is_file() {
+                                    let file_name = src_art.file_name()?;
+                                    let dst_art = dst_olean
+                                        .parent()
+                                        .map(|p| p.join(file_name))
+                                        .unwrap_or_else(|| ov_lib.join(file_name));
+                                    if let Some(parent) = dst_art.parent() {
+                                        fs::create_dir_all(parent).ok()?;
+                                    }
+                                    if !dst_art.exists() {
+                                        crate::zygote::copy_file_reflink(&src_art, &dst_art)
+                                            .ok()?;
+                                    }
+                                }
                             }
-                        }
-                        if ready.is_empty() {
-                            return None;
-                        }
-                        for name in ready {
-                            let (source, root) = standalone_to_build.remove(&name)?;
-                            let rel = source.strip_prefix(&root).ok()?;
+                        } else {
+                            rebuilt_hint.insert(name);
                             let output = ov_lib.join(rel).with_extension("olean");
                             if let Some(parent) = output.parent() {
                                 fs::create_dir_all(parent).ok()?;
@@ -15905,6 +15905,79 @@ end ParityNs
             before_lake,
             "try_head_overlay must verify sorry-removal proof edit without mutating on-disk .lake/build or retaining stale base sorryAx audit"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_pr_verify_overlay_propagates_transitive_standalone_invalidation() -> Result<()> {
+        use crate::worktree_test_support::{snapshot, LakeTree};
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = LakeTree::new(
+            "pr_verify_transitive_standalone",
+            &[
+                ("P.lean", "import P.A\n"),
+                ("P/A.lean", "theorem dag_thm : 1 + 1 = 2 := by\n  omega\n"),
+                (
+                    "P/StandMid.lean",
+                    "import P.A\nmacro \"stand_ty\" : term => `(Nat)\n",
+                ),
+                (
+                    "P/StandLeaf.lean",
+                    "import P.StandMid\ntheorem leaf_thm (x : stand_ty) : x = x := rfl\n",
+                ),
+            ],
+        )?;
+        let _ = fs::remove_dir_all(tree.project.join(".lake/build"));
+        git_init_and_commit(&tree.project, "base_standalone_chain")?;
+        tree.lake(&["build", "P"])?;
+        let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+        run_pr_verify_command(
+            &mut store,
+            true,
+            tree.project.clone(),
+            "HEAD".into(),
+            "trusted".into(),
+            true,
+            None,
+            None,
+            None,
+            None,
+            false,
+            0,
+            None,
+        )?;
+        fs::write(
+            tree.project.join("P/A.lean"),
+            "theorem dag_thm : 1 + 1 = 2 := by\n  exact rfl\n",
+        )?;
+        fs::write(
+            tree.project.join("P/StandMid.lean"),
+            "import P.A\nmacro \"stand_ty\" : term => `(Bool)\n",
+        )?;
+        let before_lake = snapshot(&tree.project)?;
+        let err = run_pr_verify_command(
+            &mut store,
+            true,
+            tree.project.clone(),
+            "HEAD".into(),
+            "trusted".into(),
+            true,
+            None,
+            None,
+            None,
+            None,
+            false,
+            0,
+            None,
+        )
+        .expect_err("transitive standalone macro change altering StandLeaf statement must fail strict statement pinning");
+        assert!(
+            err.to_string().contains("leaf_thm") || err.to_string().contains("statement"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(snapshot(&tree.project)?, before_lake);
         Ok(())
     }
 

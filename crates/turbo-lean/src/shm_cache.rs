@@ -620,7 +620,14 @@ fn stage_unique_tmp_path(target: &Path) -> std::io::Result<PathBuf> {
 fn stage_unique_tmp_path_ext(target: &Path, ext: &str) -> std::io::Result<PathBuf> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     let base = staging_shm_dir();
-    if parent == base || parent.starts_with(&base) {
+    let in_private_staging = parent == base
+        || parent.starts_with(&base)
+        || parent
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            == Some("staging");
+    if in_private_staging {
         ensure_private_dir_all(parent)?;
     } else {
         ensure_nonsymlink_dir_all(parent)?;
@@ -744,31 +751,37 @@ pub fn ensure_verified_private_staging_dir(subdir: Option<&str>) -> Option<PathB
     Some(sub_path)
 }
 
-/// Read `staging_shm_dir()/<subdir>/<file_name>` fail-closed WITHOUT mutating permissions:
-/// returns `None` if `base`, `subdir`, or `file_name` is a symlink, multiply linked (`nlink != 1`),
-/// not owned by `geteuid()`, or has any group/other permission bits (`(mode & 0o077) != 0`).
-pub fn read_verified_private_shm_file(subdir: &str, file_name: &str) -> Option<Vec<u8>> {
-    if !is_safe_single_shm_segment(subdir) || !is_safe_single_shm_segment(file_name) {
+/// Read a private cache file at `file_path` fail-closed WITHOUT mutating permissions:
+/// verifies `file_path.parent()` (and its parent when under `staging_shm_dir()` or `<root>/staging`)
+/// is a non-symlink directory owned by `geteuid()` with `0o700` permissions, and opens `file_path`
+/// with `O_NOFOLLOW` verifying regular file, `nlink == 1`, `uid == geteuid()`, and `(mode & 0o077) == 0`.
+pub(crate) fn read_verified_private_file_at(file_path: &Path) -> Option<Vec<u8>> {
+    let sub_path = file_path.parent()?;
+    if sub_path.as_os_str().is_empty() {
         return None;
     }
-    let base = staging_shm_dir();
-    let sub_path = base.join(subdir);
-    let file_path = sub_path.join(file_name);
     #[cfg(unix)]
     {
         use std::io::Read;
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
-        verify_or_create_private_dir_one(&base, false)?;
-        verify_or_create_private_dir_one(&sub_path, false)?;
+        let base_shm = staging_shm_dir();
+        if sub_path == base_shm || sub_path.starts_with(&base_shm) {
+            verify_or_create_private_dir_one(&base_shm, false)?;
+        } else if let Some(parent_base) = sub_path.parent() {
+            if parent_base.file_name().and_then(|s| s.to_str()) == Some("staging") {
+                verify_or_create_private_dir_one(parent_base, false)?;
+            }
+        }
+        verify_or_create_private_dir_one(sub_path, false)?;
 
-        let sym_meta = fs::symlink_metadata(&file_path).ok()?;
+        let sym_meta = fs::symlink_metadata(file_path).ok()?;
         if sym_meta.file_type().is_symlink() || !sym_meta.file_type().is_file() {
             return None;
         }
         let mut opts = fs::OpenOptions::new();
         opts.read(true).custom_flags(libc::O_NOFOLLOW);
-        let mut f = opts.open(&file_path).ok()?;
+        let mut f = opts.open(file_path).ok()?;
         let meta = f.metadata().ok()?;
         let euid = unsafe { libc::geteuid() };
         if !meta.file_type().is_file()
@@ -778,7 +791,7 @@ pub fn read_verified_private_shm_file(subdir: &str, file_name: &str) -> Option<V
         {
             return None;
         }
-        if !inode_matches_nofollow(&f, &file_path) {
+        if !inode_matches_nofollow(&f, file_path) {
             return None;
         }
         let mut buf = Vec::with_capacity(meta.len() as usize);
@@ -787,8 +800,18 @@ pub fn read_verified_private_shm_file(subdir: &str, file_name: &str) -> Option<V
     }
     #[cfg(not(unix))]
     {
-        fs::read(&file_path).ok()
+        fs::read(file_path).ok()
     }
+}
+
+/// Read `staging_shm_dir()/<subdir>/<file_name>` fail-closed WITHOUT mutating permissions:
+/// returns `None` if `base`, `subdir`, or `file_name` is a symlink, multiply linked (`nlink != 1`),
+/// not owned by `geteuid()`, or has any group/other permission bits (`(mode & 0o077) != 0`).
+pub fn read_verified_private_shm_file(subdir: &str, file_name: &str) -> Option<Vec<u8>> {
+    if !is_safe_single_shm_segment(subdir) || !is_safe_single_shm_segment(file_name) {
+        return None;
+    }
+    read_verified_private_file_at(&staging_shm_dir().join(subdir).join(file_name))
 }
 
 /// Atomically write `bytes` to `staging_shm_dir()/<subdir>/<file_name>` with `0o600` permissions
@@ -1042,7 +1065,18 @@ fn open_unique_exclusive_tmp_ext(
             opts.mode(mode).custom_flags(libc::O_NOFOLLOW);
         }
         match opts.open(&tmp_path) {
-            Ok(f) => return Ok((f, tmp_path)),
+            Ok(f) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(e) = f.set_permissions(fs::Permissions::from_mode(mode)) {
+                        drop(f);
+                        let _ = fs::remove_file(&tmp_path);
+                        return Err(e);
+                    }
+                }
+                return Ok((f, tmp_path));
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
         }
@@ -2560,6 +2594,16 @@ mod tests {
                 assert!(ensure_private_dir_all(&perm755_staging).is_err());
                 assert!(acquire_flock(&perm755_staging.join("x.lock"), true, false).is_err());
                 assert!(atomic_write_shm(&perm755_staging.join("x.json"), b"{}").is_err());
+                let perm755_eval_sub = perm755_staging.join("eval_shm_cache");
+                fs::create_dir_all(&perm755_eval_sub)?;
+                fs::set_permissions(&perm755_eval_sub, fs::Permissions::from_mode(0o755))?;
+                let planted_eval = perm755_eval_sub.join("planted.json");
+                fs::write(&planted_eval, b"{}")?;
+                fs::set_permissions(&planted_eval, fs::Permissions::from_mode(0o600))?;
+                assert!(
+                    read_verified_private_file_at(&planted_eval).is_none(),
+                    "read_verified_private_file_at must reject 0755 staging/subdir"
+                );
                 assert!(
                     StagingLeaseGuard::acquire_for_target(&perm755_staging.join("x.lean")).is_err()
                 );

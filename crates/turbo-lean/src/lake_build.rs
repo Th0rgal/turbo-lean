@@ -3173,11 +3173,7 @@ fn ensure_olean_roots_and_imports_replayed_in_store(
         if !seen.insert(m.clone()) {
             continue;
         }
-        let rel = format!(
-            "{}.olean",
-            crate::module_builder::module_name_to_rel_slash(&m)
-        );
-        let Some(path) = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
+        let Some(path) = crate::module_builder::resolve_olean_along_search_dirs(&dirs, &m) else {
             continue;
         };
         if crate::module_builder::is_verified_toolchain_olean_file(

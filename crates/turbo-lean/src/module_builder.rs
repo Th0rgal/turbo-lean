@@ -7933,13 +7933,12 @@ pub(crate) fn is_unshadowed_toolchain_olean_import(
     {
         return false;
     }
-    let rel = format!("{}.olean", module_name_to_rel_slash(mod_name));
     let mut all_dirs: Vec<PathBuf> = search_dirs.to_vec();
     if !cfg.toolchain_lib_lean.as_os_str().is_empty() && !all_dirs.contains(&cfg.toolchain_lib_lean)
     {
         all_dirs.push(cfg.toolchain_lib_lean.clone());
     }
-    let Some(first_hit) = all_dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
+    let Some(first_hit) = resolve_olean_along_search_dirs(&all_dirs, mod_name) else {
         return !is_untrusted
             && cfg.toolchain_lib_lean.as_os_str().is_empty()
             && is_builtin_toolchain_module(
