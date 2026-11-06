@@ -257,3 +257,212 @@ theorem lawful {α : Type} [BEq α] [LawfulBEq α] (x : α) (h : x == x) : x == 
     assert_eq!(lawful["contract"]["instance_binders"][1], "LawfulBEq α");
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn spec_card_prefixed_decls_and_sections_fail_closed() {
+    let dir = fixture("prefixed");
+    let path = write_spec(
+        &dir,
+        "Prefixed.lean",
+        r#"
+section Outer
+variable (h : False)
+
+public section
+theorem nested (n : Nat) (hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+end
+
+@[simp] public theorem tagged [Fact False] (n : Nat) (hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+
+end Outer
+
+variable (bad : False) in
+theorem scoped_in (n : Nat) (hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+
+variable (gone : False) in
+section Scoped
+theorem inside (n : Nat) (hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+end
+
+theorem clean_after_in (n : Nat) (hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+"#,
+    );
+    let out = run(&["--json", "spec-card", path.to_str().unwrap()]);
+    let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(!out.status.success(), "{report}");
+    for name in ["nested", "tagged", "scoped_in", "inside"] {
+        let card = report["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|card| card["decl"] == name)
+            .unwrap();
+        assert_eq!(card["verdict"], "UNCHECKED_ASSUMPTIONS", "{name}: {card}");
+        assert_eq!(card["contract"]["extraction_complete"], false);
+    }
+    let clean = report["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|card| card["decl"] == "clean_after_in")
+        .unwrap();
+    assert_eq!(clean["verdict"], "TIGHT", "{clean}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn spec_card_keeps_assumptions_across_nested_scopes_and_duplicate_names() {
+    let dir = fixture("scopes");
+    let path = write_spec(
+        &dir,
+        "Scopes.lean",
+        r#"
+section Outer
+variable (h : False)
+
+namespace A.B
+end A.B
+
+theorem after_ns (n : Nat) (hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+
+section Inner
+variable (q : Prop)
+end Outer
+
+theorem after_outer (n : Nat) (hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+
+section First
+variable (p : Prop)
+theorem same_name (n : Nat) (hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+end First
+
+section Second
+theorem same_name (n : Nat) (hn : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+end Second
+"#,
+    );
+    let out = run(&["--json", "spec-card", path.to_str().unwrap()]);
+    let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let cards = report["cards"].as_array().unwrap();
+    let after_ns = cards
+        .iter()
+        .find(|card| card["decl"] == "after_ns")
+        .unwrap();
+    assert_eq!(after_ns["verdict"], "UNCHECKED_ASSUMPTIONS");
+    let after_outer = cards
+        .iter()
+        .find(|card| card["decl"] == "after_outer")
+        .unwrap();
+    assert_eq!(after_outer["contract"]["extraction_complete"], true);
+    let duplicates = cards
+        .iter()
+        .filter(|card| card["decl"] == "same_name")
+        .collect::<Vec<_>>();
+    assert_eq!(duplicates.len(), 2);
+    assert_eq!(duplicates[0]["contract"]["extraction_complete"], false);
+    assert_eq!(duplicates[1]["contract"]["extraction_complete"], true);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn spec_card_reads_guillemet_names_and_literals_inside_binders() {
+    let dir = fixture("lexemes");
+    let path = write_spec(
+        &dir,
+        "Lexemes.lean",
+        "theorem «bad» [Fact False] (n : Nat) (h : n < 2) : n = 0 ∨ n = 1 := by\n  omega\n\ntheorem quoted (s : String := \")\") [Fact False] (n : Nat) (h : n < 2) : n = 0 ∨ n = 1 := by\n  omega\n",
+    );
+    let out = run(&["--json", "spec-card", path.to_str().unwrap()]);
+    let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(!out.status.success(), "{report}");
+    let cards = report["cards"].as_array().unwrap();
+    assert!(cards
+        .iter()
+        .all(|card| card["verdict"] == "UNCHECKED_ASSUMPTIONS"
+            && card["contract"]["instance_binders"][0] == "Fact False"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn spec_card_does_not_treat_nonempty_false_as_standard() {
+    let dir = fixture("nonempty");
+    let path = write_spec(
+        &dir,
+        "Nonempty.lean",
+        "theorem vacuous [Nonempty False] (n : Nat) (h : n < 2) : n = 0 ∨ n = 1 := by\n  omega\n",
+    );
+    let out = run(&["--json", "spec-card", path.to_str().unwrap()]);
+    let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(!out.status.success(), "{report}");
+    assert_eq!(report["cards"][0]["verdict"], "UNCHECKED_ASSUMPTIONS");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn spec_card_public_only_unresolved_does_not_hide_a_mixed_run() {
+    let dir = fixture("unresolved");
+    let broken = write_spec(
+        &dir,
+        "Broken.lean",
+        "my_custom_cmd\ntheorem hidden (n : Nat) : n = n := rfl\n",
+    );
+    let shown = write_spec(&dir, "Shown.lean", TIGHT);
+    let out = run(&[
+        "--json",
+        "spec-card",
+        broken.to_str().unwrap(),
+        shown.to_str().unwrap(),
+        "--public-only",
+    ]);
+    let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(!out.status.success(), "{report}");
+    assert_eq!(report["summary"]["extraction_complete"], false);
+    assert!(report["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|card| card["decl"] == "bounded_succ"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn spec_card_public_only_hides_non_module_private_and_includes_companion_dir() {
+    let dir = fixture("companion");
+    let root = write_spec(
+        &dir,
+        "Root.lean",
+        "private theorem secret (n : Nat) : n = n := rfl\ntheorem visible (n : Nat) (h : n < 2) : n = 0 ∨ n = 1 := by\n  omega\n",
+    );
+    let companion = dir.join("Root");
+    fs::create_dir_all(&companion).unwrap();
+    write_spec(
+        &companion,
+        "Sub.lean",
+        "theorem bad (h : False) : True := by\n  cases h\n",
+    );
+    let out = run(&[
+        "--json",
+        "spec-card",
+        root.to_str().unwrap(),
+        "--public-only",
+    ]);
+    let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(!out.status.success(), "{report}");
+    assert_eq!(report["summary"]["hidden_by_public_only"], 1);
+    let cards = report["cards"].as_array().unwrap();
+    assert!(!cards.iter().any(|card| card["decl"] == "secret"));
+    assert!(cards.iter().any(|card| card["decl"] == "visible"));
+    assert!(cards
+        .iter()
+        .any(|card| card["decl"] == "bad" && card["verdict"] == "VACUOUS"));
+    let _ = fs::remove_dir_all(&dir);
+}

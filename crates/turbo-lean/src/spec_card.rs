@@ -27,7 +27,6 @@ const UNCHECKED: &[&str] = &[
 
 const STANDARD_INSTANCE_HEADS: &[&str] = &[
     "BEq",
-    "Decidable",
     "DecidableEq",
     "DecidablePred",
     "DecidableRel",
@@ -38,7 +37,6 @@ const STANDARD_INSTANCE_HEADS: &[&str] = &[
     "LT",
     "LawfulBEq",
     "LawfulHashable",
-    "Nonempty",
     "Ord",
     "Repr",
     "ToString",
@@ -71,6 +69,7 @@ pub fn run_spec_card_command(
     let mut matched = 0usize;
     let mut hidden_private = 0usize;
     let mut hygiene_dirty = false;
+    let mut extraction_incomplete = false;
     let mut all_audits_ok = true;
     let mut any_audit_error = false;
     let mut policy_name = policy_override.unwrap_or("default").to_string();
@@ -117,19 +116,40 @@ pub fn run_spec_card_command(
             .cloned()
             .unwrap_or_default();
         let extras = scan_decl_extras(src);
+        let mut extra_used = vec![false; extras.len()];
+        let mut detail_used = vec![false; details.len()];
         for decl in extract_all_lean_theorems(src, decl_filter) {
             matched += 1;
-            let visibility = visibility_of(&decl.name, &public_names, visibility_known);
+            let extra_idx = extras.iter().enumerate().position(|(idx, row)| {
+                !extra_used[idx]
+                    && canonicalize_lean_name(&row.name) == canonicalize_lean_name(&decl.name)
+            });
+            if let Some(idx) = extra_idx {
+                extra_used[idx] = true;
+            }
+            let extra = extra_idx.map(|idx| &extras[idx]);
+            let visibility = visibility_of(
+                &decl.name,
+                &public_names,
+                visibility_known,
+                public_sig.is_module,
+                extra,
+            );
             if public_only && visibility != "public" {
+                if visibility == "unresolved" {
+                    extraction_incomplete = true;
+                }
                 hidden_private += 1;
                 continue;
             }
-            let detail = details
-                .iter()
-                .find(|row| row.get("decl").and_then(Value::as_str) == Some(decl.name.as_str()));
-            let extra = extras.iter().find(|row| {
-                canonicalize_lean_name(&row.name) == canonicalize_lean_name(&decl.name)
+            let detail_idx = details.iter().enumerate().position(|(idx, row)| {
+                !detail_used[idx]
+                    && row.get("decl").and_then(Value::as_str) == Some(decl.name.as_str())
             });
+            if let Some(idx) = detail_idx {
+                detail_used[idx] = true;
+            }
+            let detail = detail_idx.map(|idx| &details[idx]);
             let ctx = FileCardCtx {
                 path,
                 local_defs: &local_defs,
@@ -142,11 +162,12 @@ pub fn run_spec_card_command(
     let elapsed_ms = (started.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     let filter_miss = decl_filter.is_some() && matched == 0;
     let public_miss = public_only && matched > 0 && cards.is_empty();
-    let incomplete = cards.iter().any(|card| {
-        card.pointer("/contract/extraction_complete")
-            .and_then(Value::as_bool)
-            == Some(false)
-    });
+    let incomplete = extraction_incomplete
+        || cards.iter().any(|card| {
+            card.pointer("/contract/extraction_complete")
+                .and_then(Value::as_bool)
+                == Some(false)
+        });
     let ok = !any_audit_error
         && all_audits_ok
         && !hygiene_dirty
@@ -203,30 +224,99 @@ fn load_sources(file: &Path) -> Result<Vec<(PathBuf, String)>> {
     }
     let src =
         fs::read_to_string(file).with_context(|| format!("Failed to read {}", file.display()))?;
-    Ok(vec![(file.to_path_buf(), src)])
+    let mut sources = vec![(file.to_path_buf(), src)];
+    let sub_dir = file.with_extension("");
+    if sub_dir.is_dir() {
+        sources.extend(
+            crate::lake_build::collect_lean_files(&sub_dir)
+                .into_iter()
+                .filter_map(|path| fs::read_to_string(&path).ok().map(|src| (path, src))),
+        );
+        sources.sort_by(|left, right| left.0.cmp(&right.0));
+    }
+    Ok(sources)
 }
 
 struct DeclExtra {
     name: String,
+    is_private: bool,
     instance_binders: Vec<String>,
     context_assumptions: Vec<String>,
+    saw_unparsed_binder: bool,
+}
+
+struct ContextFrame {
+    assumptions: Vec<String>,
+    span: usize,
 }
 
 fn scan_decl_extras(src: &str) -> Vec<DeclExtra> {
     let masked = mask_comments(src);
     let chars: Vec<char> = masked.chars().collect();
+    let byte_offsets: Vec<usize> = masked.char_indices().map(|(offset, _)| offset).collect();
     let n = chars.len();
     let mut i = 0usize;
     let mut scope: Vec<ScopeFrame> = Vec::new();
-    let mut context: Vec<Vec<String>> = vec![Vec::new()];
+    let mut context = vec![ContextFrame {
+        assumptions: Vec::new(),
+        span: 0,
+    }];
+    let mut next_span = 1usize;
+    let mut at_cmd_head = true;
+    let mut pending_private = false;
+    let mut pending_assumptions: Vec<String> = Vec::new();
     let mut out = Vec::new();
     while i < n {
-        if let Some(end) = skip_any(&masked, i) {
+        if let Some(end) = skip_any(&masked, &byte_offsets, i) {
             i = end;
             continue;
         }
-        if !is_ident_start(chars[i]) || !line_command_start(&chars, i) {
+        if chars[i] == '\n' || chars[i] == ';' {
+            at_cmd_head = true;
             i += 1;
+            continue;
+        }
+        if chars[i].is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if at_cmd_head && chars[i] == '@' && i + 1 < n && chars[i + 1] == '[' {
+            if let Some(end) = matching_close(&masked, &byte_offsets, &chars, i + 1, '[', ']') {
+                i = end;
+                continue;
+            }
+        }
+        if at_cmd_head {
+            if let Some((after_in, inline_assumption)) =
+                consume_in_command_prefix(&masked, &byte_offsets, &chars, i)
+            {
+                if let Some(assumption) = inline_assumption {
+                    pending_assumptions.push(assumption);
+                }
+                i = after_in;
+                continue;
+            }
+        }
+        if chars[i] == '«' {
+            if let Some(end) = skip_any_lexeme(&masked, &byte_offsets, i) {
+                at_cmd_head = false;
+                pending_private = false;
+                pending_assumptions.clear();
+                i = end;
+                continue;
+            }
+        }
+        if !is_ident_start(chars[i]) {
+            at_cmd_head = false;
+            pending_private = false;
+            pending_assumptions.clear();
+            i += 1;
+            continue;
+        }
+        if !at_cmd_head {
+            while i < n && is_ident_continue(chars[i]) {
+                i += 1;
+            }
             continue;
         }
         let start = i;
@@ -234,26 +324,64 @@ fn scan_decl_extras(src: &str) -> Vec<DeclExtra> {
             i += 1;
         }
         let word: String = chars[start..i].iter().collect();
+        if matches!(
+            word.as_str(),
+            "public"
+                | "private"
+                | "protected"
+                | "noncomputable"
+                | "scoped"
+                | "local"
+                | "unsafe"
+                | "partial"
+                | "nonrec"
+                | "meta"
+        ) {
+            if word == "private" || word == "local" {
+                pending_private = true;
+            }
+            continue;
+        }
+        let decl_private = std::mem::replace(&mut pending_private, false);
+        let decl_inline_assumptions = if matches!(word.as_str(), "theorem" | "lemma") {
+            std::mem::take(&mut pending_assumptions)
+        } else {
+            Vec::new()
+        };
+        if !matches!(
+            word.as_str(),
+            "namespace" | "section" | "mutual" | "theorem" | "lemma"
+        ) {
+            pending_assumptions.clear();
+        }
+        at_cmd_head = false;
         match word.as_str() {
             "namespace" if i < n && chars[i].is_whitespace() => {
-                let (name, next) = dotted_name(&chars, i, n);
+                let (name, next) = dotted_name(&masked, &byte_offsets, &chars, i, n);
                 i = next;
+                let span = next_span;
+                next_span += 1;
                 for seg in crate::splitter::split_lean_name_components(&name) {
                     scope.push(ScopeFrame {
                         kind: ScopeKind::Namespace,
                         name: seg.to_string(),
-                        open_span_idx: 0,
+                        open_span_idx: span,
                     });
                 }
-                context.push(Vec::new());
+                context.push(ContextFrame {
+                    assumptions: std::mem::take(&mut pending_assumptions),
+                    span,
+                });
             }
             "section" => {
                 let (name, next) = if i < n && chars[i].is_whitespace() {
-                    dotted_name(&chars, i, n)
+                    dotted_name(&masked, &byte_offsets, &chars, i, n)
                 } else {
                     (String::new(), i)
                 };
                 i = next;
+                let span = next_span;
+                next_span += 1;
                 let segs = if name.is_empty() {
                     vec![String::new()]
                 } else {
@@ -266,29 +394,35 @@ fn scan_decl_extras(src: &str) -> Vec<DeclExtra> {
                     scope.push(ScopeFrame {
                         kind: ScopeKind::Section,
                         name: seg,
-                        open_span_idx: 0,
+                        open_span_idx: span,
                     });
-                    context.push(Vec::new());
                 }
+                context.push(ContextFrame {
+                    assumptions: std::mem::take(&mut pending_assumptions),
+                    span,
+                });
             }
-            "end" => {
-                let (name, next) = if i < n && chars[i].is_whitespace() {
-                    dotted_name(&chars, i, n)
+            "mutual" if i >= n || chars[i].is_whitespace() => {
+                let span = next_span;
+                next_span += 1;
+                scope.push(ScopeFrame {
+                    kind: ScopeKind::Mutual,
+                    name: String::new(),
+                    open_span_idx: span,
+                });
+                context.push(ContextFrame {
+                    assumptions: std::mem::take(&mut pending_assumptions),
+                    span,
+                });
+            }
+            "end" if i >= n || chars[i].is_whitespace() => {
+                let (name, next) = if i < n && chars[i].is_whitespace() && chars[i] != '\n' {
+                    dotted_name(&masked, &byte_offsets, &chars, i, n)
                 } else {
                     (String::new(), i)
                 };
                 i = next;
-                let pops = if name.is_empty() {
-                    1
-                } else {
-                    crate::splitter::split_lean_name_components(&name).len()
-                };
-                for _ in 0..pops {
-                    scope.pop();
-                    if context.len() > 1 {
-                        context.pop();
-                    }
-                }
+                pop_scope(&mut scope, &mut context, &name);
             }
             "variable" | "variables" | "include" | "omit" => {
                 let body_start = i;
@@ -299,9 +433,9 @@ fn scan_decl_extras(src: &str) -> Vec<DeclExtra> {
                 let clean_body = normalize_ws(&body);
                 if let Some(frame) = context.last_mut() {
                     if clean_body.is_empty() {
-                        frame.push(word);
+                        frame.assumptions.push(word);
                     } else {
-                        frame.push(format!("{word} {clean_body}"));
+                        frame.assumptions.push(format!("{word} {clean_body}"));
                     }
                 }
             }
@@ -309,12 +443,13 @@ fn scan_decl_extras(src: &str) -> Vec<DeclExtra> {
                 while i < n && chars[i].is_whitespace() {
                     i += 1;
                 }
-                let (raw_name, next) = dotted_name(&chars, i, n);
+                let (raw_name, next) = dotted_name(&masked, &byte_offsets, &chars, i, n);
                 if raw_name.is_empty() {
                     continue;
                 }
                 i = next;
                 let mut binders = Vec::new();
+                let mut saw_unparsed_binder = false;
                 while i < n {
                     while i < n && chars[i].is_whitespace() {
                         i += 1;
@@ -322,7 +457,7 @@ fn scan_decl_extras(src: &str) -> Vec<DeclExtra> {
                     if i >= n {
                         break;
                     }
-                    if let Some(end) = skip_any(&masked, i) {
+                    if let Some(end) = skip_any(&masked, &byte_offsets, i) {
                         i = end;
                         continue;
                     }
@@ -334,39 +469,85 @@ fn scan_decl_extras(src: &str) -> Vec<DeclExtra> {
                     }
                     if chars[i] == '[' {
                         let open_at = i;
-                        if let Some(end) = matching_close(&chars, i, '[', ']') {
+                        if let Some(end) =
+                            matching_close(&masked, &byte_offsets, &chars, i, '[', ']')
+                        {
                             let inner: String = chars[open_at + 1..end - 1].iter().collect();
                             binders.push(normalize_ws(&inner));
                             i = end;
                         } else {
+                            saw_unparsed_binder = true;
                             break;
                         }
-                    } else if chars[i] == '(' || chars[i] == '{' {
-                        let (open, close) = if chars[i] == '(' {
-                            ('(', ')')
-                        } else {
-                            ('{', '}')
+                    } else if chars[i] == '(' || chars[i] == '{' || chars[i] == '⦃' {
+                        let close = match chars[i] {
+                            '(' => ')',
+                            '{' => '}',
+                            _ => '⦄',
                         };
-                        if let Some(end) = matching_close(&chars, i, open, close) {
+                        if let Some(end) =
+                            matching_close(&masked, &byte_offsets, &chars, i, chars[i], close)
+                        {
                             i = end;
                         } else {
+                            saw_unparsed_binder = true;
                             break;
                         }
                     } else {
                         i += 1;
                     }
                 }
-                let assumptions = context.iter().flatten().cloned().collect();
+                let mut assumptions: Vec<String> = context
+                    .iter()
+                    .flat_map(|frame| frame.assumptions.iter().cloned())
+                    .collect();
+                assumptions.extend(decl_inline_assumptions);
                 out.push(DeclExtra {
                     name: qualified_decl_name(&raw_name, &scope),
+                    is_private: decl_private,
                     instance_binders: binders,
                     context_assumptions: assumptions,
+                    saw_unparsed_binder,
                 });
             }
             _ => {}
         }
     }
     out
+}
+
+fn pop_scope(scope: &mut Vec<ScopeFrame>, context: &mut Vec<ContextFrame>, name: &str) {
+    if name.is_empty() {
+        scope.pop();
+        if context.len() > 1 {
+            context.pop();
+        }
+        return;
+    }
+    for seg in crate::splitter::split_lean_name_components(name)
+        .into_iter()
+        .rev()
+    {
+        let canon = crate::splitter::canonical_lean_name_component(seg);
+        let Some(pos) = scope.iter().rposition(|frame| {
+            crate::splitter::canonical_lean_name_component(&frame.name) == canon
+        }) else {
+            scope.pop();
+            if context.len() > 1 {
+                context.pop();
+            }
+            continue;
+        };
+        let span = scope[pos].open_span_idx;
+        scope.truncate(pos);
+        context.retain(|frame| frame.span < span || frame.span == 0);
+        if context.is_empty() {
+            context.push(ContextFrame {
+                assumptions: Vec::new(),
+                span: 0,
+            });
+        }
+    }
 }
 
 fn mask_comments(src: &str) -> String {
@@ -389,38 +570,115 @@ fn mask_comments(src: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| src.to_string())
 }
 
-fn skip_any(src: &str, idx: usize) -> Option<usize> {
-    let byte = byte_to_char_inverse(src, idx);
+fn skip_any(src: &str, byte_offsets: &[usize], idx: usize) -> Option<usize> {
+    let byte = *byte_offsets.get(idx)?;
     let span = skip_lean_lexeme(src, byte)?;
     if !(span.is_comment || span.is_literal) {
         return None;
     }
-    Some(byte_to_char(src, span.end))
+    Some(byte_offsets.partition_point(|offset| *offset < span.end))
 }
 
-fn byte_to_char_inverse(src: &str, char_idx: usize) -> usize {
-    src.chars().take(char_idx).map(char::len_utf8).sum()
+fn skip_any_lexeme(src: &str, byte_offsets: &[usize], idx: usize) -> Option<usize> {
+    let byte = *byte_offsets.get(idx)?;
+    let span = skip_lean_lexeme(src, byte)?;
+    Some(byte_offsets.partition_point(|offset| *offset < span.end))
 }
 
-fn byte_to_char(src: &str, byte: usize) -> usize {
-    src[..byte.min(src.len())].chars().count()
-}
-
-fn line_command_start(chars: &[char], word_idx: usize) -> bool {
-    let mut pos = word_idx;
-    while pos > 0 && (chars[pos - 1] == ' ' || chars[pos - 1] == '\t') {
-        pos -= 1;
+fn consume_in_command_prefix(
+    src: &str,
+    byte_offsets: &[usize],
+    chars: &[char],
+    start: usize,
+) -> Option<(usize, Option<String>)> {
+    const PREFIXES: &[&str] = &[
+        "set_option",
+        "open",
+        "universe",
+        "universes",
+        "variable",
+        "variables",
+        "include",
+        "omit",
+        "#guard_msgs",
+        "#guard_panic",
+        "#info_trees",
+    ];
+    let byte_start = *byte_offsets.get(start)?;
+    let tail = &src[byte_start..];
+    if let Some(rest) = tail
+        .strip_prefix("#time")
+        .or_else(|| tail.strip_prefix("#with_exporting"))
+    {
+        if rest.starts_with(char::is_whitespace) {
+            let consumed = tail.len() - rest.len();
+            return Some((
+                byte_offsets.partition_point(|offset| *offset < byte_start + consumed),
+                None,
+            ));
+        }
     }
-    pos == 0 || chars[pos - 1] == '\n' || chars[pos - 1] == ';'
+    let kw = *PREFIXES.iter().find(|&&kw| {
+        tail.strip_prefix(kw)
+            .is_some_and(|rest| rest.starts_with(char::is_whitespace) || rest.starts_with('('))
+    })?;
+    let mut i = start + kw.chars().count();
+    let mut depth = 0usize;
+    while i < chars.len() {
+        if let Some(end) = skip_any(src, byte_offsets, i) {
+            i = end;
+            continue;
+        }
+        match chars[i] {
+            '(' | '[' | '{' | '⦃' => depth += 1,
+            ')' | ']' | '}' | '⦄' => depth = depth.saturating_sub(1),
+            '\n' | ';' if depth == 0 => return None,
+            'i' if depth == 0
+                && i + 1 < chars.len()
+                && chars[i + 1] == 'n'
+                && i > 0
+                && chars[i - 1].is_whitespace()
+                && (i + 2 >= chars.len() || chars[i + 2].is_whitespace()) =>
+            {
+                let after = i + 2;
+                let assumption =
+                    matches!(kw, "variable" | "variables" | "include" | "omit").then(|| {
+                        let raw: String = chars[start..after].iter().collect();
+                        normalize_ws(&raw)
+                    });
+                return Some((after, assumption));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
-fn dotted_name(chars: &[char], mut pos: usize, n: usize) -> (String, usize) {
+fn dotted_name(
+    src: &str,
+    byte_offsets: &[usize],
+    chars: &[char],
+    mut pos: usize,
+    n: usize,
+) -> (String, usize) {
     while pos < n && chars[pos].is_whitespace() && chars[pos] != '\n' {
         pos += 1;
     }
     let start = pos;
-    while pos < n && (is_ident_continue(chars[pos]) || chars[pos] == '.') {
-        pos += 1;
+    while pos < n {
+        if chars[pos] == '«' {
+            if let Some(end) = skip_any_lexeme(src, byte_offsets, pos) {
+                pos = end;
+                continue;
+            }
+            break;
+        }
+        if is_ident_continue(chars[pos]) || chars[pos] == '.' {
+            pos += 1;
+        } else {
+            break;
+        }
     }
     (
         chars[start..pos]
@@ -432,10 +690,21 @@ fn dotted_name(chars: &[char], mut pos: usize, n: usize) -> (String, usize) {
     )
 }
 
-fn matching_close(chars: &[char], open_at: usize, open: char, close: char) -> Option<usize> {
+fn matching_close(
+    src: &str,
+    byte_offsets: &[usize],
+    chars: &[char],
+    open_at: usize,
+    open: char,
+    close: char,
+) -> Option<usize> {
     let mut depth = 0usize;
     let mut i = open_at;
     while i < chars.len() {
+        if let Some(end) = skip_any(src, byte_offsets, i) {
+            i = end;
+            continue;
+        }
         if chars[i] == open {
             depth += 1;
         } else if chars[i] == close {
@@ -464,9 +733,21 @@ fn standard_instance(text: &str) -> bool {
     STANDARD_INSTANCE_HEADS.contains(&head)
 }
 
-fn visibility_of(name: &str, public_names: &BTreeSet<String>, known: bool) -> &'static str {
+fn visibility_of(
+    name: &str,
+    public_names: &BTreeSet<String>,
+    known: bool,
+    is_module: bool,
+    extra: Option<&DeclExtra>,
+) -> &'static str {
     if !known {
         return "unresolved";
+    }
+    if extra.is_some_and(|row| row.is_private) {
+        return "private";
+    }
+    if !is_module {
+        return "public";
     }
     if public_names.contains(&canonicalize_lean_name(name)) {
         "public"
@@ -528,6 +809,11 @@ fn card_for(
         extraction_warnings.push(
             "section variable/include/omit assumptions are not bound by the syntactic audit"
                 .to_string(),
+        );
+    }
+    if extra.is_none() || extra.is_some_and(|row| row.saw_unparsed_binder) {
+        extraction_warnings.push(
+            "declaration modifiers, attributes, or binders were not fully parsed".to_string(),
         );
     }
     let extraction_complete = extraction_warnings.is_empty();
@@ -673,12 +959,35 @@ fn ident_mentioned(text: &str, ident: &str) -> bool {
     false
 }
 
+fn is_lean_letter_like(c: char) -> bool {
+    let v = c as u32;
+    ((0x3b1..=0x3c9).contains(&v) && v != 0x3bb)
+        || ((0x391..=0x3a9).contains(&v) && v != 0x3a0 && v != 0x3a3)
+        || (0x3ca..=0x3fb).contains(&v)
+        || (0x1f00..=0x1ffe).contains(&v)
+        || (0x2100..=0x214f).contains(&v)
+        || (0x1d49c..=0x1d59f).contains(&v)
+        || ((0x00c0..=0x00ff).contains(&v) && v != 0x00d7 && v != 0x00f7)
+        || (0x0100..=0x017f).contains(&v)
+}
+
+fn is_lean_subscript_alnum(c: char) -> bool {
+    let v = c as u32;
+    (0x2080..=0x2089).contains(&v)
+        || (0x2090..=0x209c).contains(&v)
+        || (0x1d62..=0x1d6a).contains(&v)
+        || v == 0x2c7c
+}
+
 fn is_ident_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_'
+    c.is_ascii_alphabetic() || c == '_' || is_lean_letter_like(c)
 }
 
 fn is_ident_continue(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_' || c == '\''
+    c.is_ascii_alphanumeric()
+        || matches!(c, '_' | '\'' | '!' | '?')
+        || is_lean_letter_like(c)
+        || is_lean_subscript_alnum(c)
 }
 
 fn one_line(body: &str, max_chars: usize) -> String {
