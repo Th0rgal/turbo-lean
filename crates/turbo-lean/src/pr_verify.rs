@@ -6913,7 +6913,7 @@ fn hash_deterministic_file_tree(
             {
                 continue;
             }
-            if skip_dirs.iter().any(|sd| p == *sd) {
+            if skip_dirs.contains(&p) {
                 continue;
             }
             let st = fs::symlink_metadata(&p).ok()?;
@@ -6995,9 +6995,7 @@ fn base_statement_cache_action_key(
         for entry in entries {
             let entry = entry.ok()?;
             let name_os = entry.file_name();
-            let Some(s) = name_os.to_str() else {
-                return None;
-            };
+            let s = name_os.to_str()?;
             if matches!(s, "build" | "packages" | "config") || s.starts_with('.') {
                 continue;
             }
@@ -16036,7 +16034,7 @@ end ParityNs
 
     #[test]
     fn base_statement_cache_key_binds_local_dep_sources_artifacts_and_lake_inputs() -> Result<()> {
-        if !crate::zygote::lean_cmd_available()
+        if Command::new("lean").arg("--version").output().is_err()
             || Command::new("lake").arg("--version").output().is_err()
         {
             return Ok(());

@@ -15411,6 +15411,7 @@ fn resolve_olean_import_closure_cached_with_stat_memo(
 #[allow(clippy::type_complexity)]
 #[derive(Clone)]
 struct ReplayClosureMemoEntry {
+    generation: u64,
     reach: Vec<usize>,
     resolved_mods: Vec<(String, PathBuf)>,
     tc_mods: Vec<String>,
@@ -15420,6 +15421,7 @@ struct ReplayClosureMemoEntry {
 #[derive(Clone)]
 pub(crate) struct VerifiedFastStoreAuthority {
     pub(crate) artifact_digest: String,
+    reach_sigs: Vec<(PathBuf, crate::zygote::OleanFileStatSig)>,
     resolved_mods: Vec<(String, PathBuf)>,
     non_tc_mods: Vec<(PathBuf, String)>,
 }
@@ -15427,7 +15429,8 @@ pub(crate) struct VerifiedFastStoreAuthority {
 #[allow(clippy::type_complexity)]
 pub(crate) struct ReplayLookupBatchCache {
     path_memo: HashMap<String, PathBuf>,
-    env_memo: HashMap<(bool, PathBuf), String>,
+    env_memo: HashMap<(bool, PathBuf), (u64, String)>,
+    next_closure_gen: u64,
     node_pool: Vec<PathBuf>,
     node_ids: HashMap<PathBuf, usize>,
     node_closures: Vec<Option<ReplayClosureMemoEntry>>,
@@ -15495,6 +15498,7 @@ impl ReplayLookupBatchCache {
         Self {
             path_memo: HashMap::new(),
             env_memo: HashMap::new(),
+            next_closure_gen: 1,
             node_pool: Vec::new(),
             node_ids: HashMap::new(),
             node_closures: Vec::new(),
@@ -15673,7 +15677,10 @@ impl ReplayLookupBatchCache {
                     tc_vec.dedup();
                     non_tc_vec.sort_unstable_by(|a, b| a.0.cmp(&b.0));
                     non_tc_vec.dedup_by(|a, b| a.0 == b.0);
+                    let generation = self.next_closure_gen;
+                    self.next_closure_gen += 1;
                     self.node_closures[uid] = Some(ReplayClosureMemoEntry {
+                        generation,
                         reach,
                         resolved_mods: resolved_vec,
                         tc_mods: tc_vec,
@@ -15715,20 +15722,33 @@ impl ReplayLookupBatchCache {
         olean_path: &Path,
         binds_policy: bool,
     ) -> Result<String> {
+        let (_, res) = self.compute_env_digest_and_root(cfg, olean_path, binds_policy)?;
+        Ok(res)
+    }
+
+    fn compute_env_digest_and_root(
+        &mut self,
+        cfg: &ProjectConfig,
+        olean_path: &Path,
+        binds_policy: bool,
+    ) -> Result<(usize, String)> {
         let root_id = self.ensure_node_closure(cfg, olean_path)?;
-        if let Some(hit) = self.env_memo.get(&(binds_policy, olean_path.to_path_buf())) {
-            return Ok(hit.clone());
-        }
-        let policy_dig_ref = if binds_policy {
-            self.policy_dig.as_str()
-        } else {
-            ""
-        };
         let Some(entry) = &self.node_closures[root_id] else {
             anyhow::bail!(
                 "Failed to memoize binary import closure for `{}`: fail-closed",
                 olean_path.display()
             );
+        };
+        let cur_gen = entry.generation;
+        if let Some((hit_gen, hit)) = self.env_memo.get(&(binds_policy, olean_path.to_path_buf())) {
+            if *hit_gen == cur_gen {
+                return Ok((root_id, hit.clone()));
+            }
+        }
+        let policy_dig_ref = if binds_policy {
+            self.policy_dig.as_str()
+        } else {
+            ""
         };
         let mut h = blake3::Hasher::new();
         h.update(b"turbo-lean-olean-transitive-env-v1\n");
@@ -15746,21 +15766,30 @@ impl ReplayLookupBatchCache {
             update_lp(&mut h, b"dep_dig", dep_dig.as_bytes());
         }
         let res = h.finalize().to_hex().to_string();
-        self.env_memo
-            .insert((binds_policy, olean_path.to_path_buf()), res.clone());
-        Ok(res)
+        self.env_memo.insert(
+            (binds_policy, olean_path.to_path_buf()),
+            (cur_gen, res.clone()),
+        );
+        Ok((root_id, res))
     }
 
-    pub(crate) fn snapshot_fast_store_authority(
-        &mut self,
-        cfg: &ProjectConfig,
-        olean_path: &Path,
+    fn capture_verified_closure_authority(
+        &self,
+        root_id: usize,
         artifact_digest: String,
     ) -> Option<VerifiedFastStoreAuthority> {
-        let root_id = self.ensure_node_closure(cfg, olean_path).ok()?;
         let entry = self.node_closures.get(root_id)?.as_ref()?;
+        if !self.closure_memo_is_fresh(entry) {
+            return None;
+        }
+        let mut reach_sigs = Vec::with_capacity(entry.reach.len());
+        for &nid in &entry.reach {
+            let sig = self.node_header_sigs.get(nid).copied().flatten()?;
+            reach_sigs.push((self.node_pool.get(nid)?.clone(), sig));
+        }
         Some(VerifiedFastStoreAuthority {
             artifact_digest,
+            reach_sigs,
             resolved_mods: entry.resolved_mods.clone(),
             non_tc_mods: entry
                 .non_tc_mods
@@ -15771,6 +15800,13 @@ impl ReplayLookupBatchCache {
     }
 
     pub(crate) fn verify_fast_store_authority(&self, auth: &VerifiedFastStoreAuthority) -> bool {
+        for (p, expected_sig) in &auth.reach_sigs {
+            if !crate::zygote::dev_records_subsecond_timestamps(expected_sig)
+                || path_olean_stat_sig(p).as_ref() != Some(expected_sig)
+            {
+                return false;
+            }
+        }
         for (m, expected_p) in &auth.resolved_mods {
             if self.resolve_module_along_dirs(m).as_ref() != Some(expected_p) {
                 return false;
@@ -15813,27 +15849,44 @@ impl ReplayLookupBatchCache {
         olean_path: &Path,
         binds_policy: bool,
     ) -> bool {
+        self.verify_replayed_in_store_authority(store, cfg, olean_path, binds_policy, String::new())
+            .is_some()
+    }
+
+    pub(crate) fn verify_replayed_in_store_authority(
+        &mut self,
+        store: &TurboStore,
+        cfg: &ProjectConfig,
+        olean_path: &Path,
+        binds_policy: bool,
+        artifact_digest: String,
+    ) -> Option<VerifiedFastStoreAuthority> {
         if cfg.lean_githash.is_empty() || !self.store_outside_disallowed {
-            return false;
+            return None;
         }
         self.refresh_replay_hmac_key(store);
-        let Some(key) = self.replay_hmac_key else {
-            return false;
-        };
-        let Ok(dig) = compute_replayed_olean_ilean_digest(olean_path) else {
-            return false;
-        };
-        let Ok(env_dig) = self.compute_env_digest_with_binds_policy(cfg, olean_path, binds_policy)
-        else {
-            return false;
-        };
-        store.has_kernel_replayed_olean_with_key(
+        let key = self.replay_hmac_key?;
+        let dig = compute_replayed_olean_ilean_digest(olean_path).ok()?;
+        let (root_id, env_dig) = self
+            .compute_env_digest_and_root(cfg, olean_path, binds_policy)
+            .ok()?;
+        if !store.has_kernel_replayed_olean_with_key(
             &key,
             &dig,
             &env_dig,
             crate::zygote::ZYGOTE_REPLAY_VERSION,
             &cfg.lean_githash,
-        )
+        ) {
+            return None;
+        }
+        if compute_replayed_olean_ilean_digest(olean_path)
+            .ok()
+            .as_deref()
+            != Some(dig.as_str())
+        {
+            return None;
+        }
+        self.capture_verified_closure_authority(root_id, artifact_digest)
     }
 
     pub(crate) fn is_replayed_in_store(
@@ -15856,29 +15909,54 @@ impl ReplayLookupBatchCache {
         olean_path: &Path,
         binds_policy: bool,
     ) -> bool {
+        self.verify_audited_in_store_authority(
+            store,
+            cfg,
+            mod_name,
+            olean_path,
+            binds_policy,
+            String::new(),
+        )
+        .is_some()
+    }
+
+    pub(crate) fn verify_audited_in_store_authority(
+        &mut self,
+        store: &TurboStore,
+        cfg: &ProjectConfig,
+        mod_name: &str,
+        olean_path: &Path,
+        binds_policy: bool,
+        artifact_digest: String,
+    ) -> Option<VerifiedFastStoreAuthority> {
         if cfg.lean_githash.is_empty() || !self.store_outside_disallowed {
-            return false;
+            return None;
         }
         self.refresh_replay_hmac_key(store);
-        let Some(key) = self.replay_hmac_key else {
-            return false;
-        };
-        let Ok(dig) = compute_replayed_olean_ilean_digest(olean_path) else {
-            return false;
-        };
-        let Ok(env_dig) = self.compute_env_digest_with_binds_policy(cfg, olean_path, binds_policy)
-        else {
-            return false;
-        };
+        let key = self.replay_hmac_key?;
+        let dig = compute_replayed_olean_ilean_digest(olean_path).ok()?;
+        let (root_id, env_dig) = self
+            .compute_env_digest_and_root(cfg, olean_path, binds_policy)
+            .ok()?;
         let policy_dig = crate::zygote::compute_module_audit_policy_digest(cfg, mod_name);
-        store.has_kernel_audited_olean_with_key(
+        if !store.has_kernel_audited_olean_with_key(
             &key,
             &dig,
             &env_dig,
             crate::zygote::ZYGOTE_REPLAY_VERSION,
             &cfg.lean_githash,
             &policy_dig,
-        )
+        ) {
+            return None;
+        }
+        if compute_replayed_olean_ilean_digest(olean_path)
+            .ok()
+            .as_deref()
+            != Some(dig.as_str())
+        {
+            return None;
+        }
+        self.capture_verified_closure_authority(root_id, artifact_digest)
     }
 
     pub(crate) fn is_audited_in_store(
@@ -23656,37 +23734,40 @@ pub(crate) fn build_project_modules_native_with_options(
                             .ok()
                             .as_deref()
                                 == Some(expected_dig.as_str());
-                            let store_verified = pre_dig_ok
-                                && if node.is_root_pkg {
-                                    replay_batch.is_audited_in_store(
+                            let fast_auth_opt = if pre_dig_ok {
+                                let binds_policy =
+                                    replay_batch.is_root_module_olean(&node.olean_path);
+                                if node.is_root_pkg {
+                                    replay_batch.verify_audited_in_store_authority(
                                         store,
                                         &cfg,
-                                        &lean_path_env,
                                         &m,
                                         &node.olean_path,
+                                        binds_policy,
+                                        expected_dig.clone(),
                                     )
                                 } else {
-                                    replay_batch.is_replayed_in_store(
+                                    replay_batch.verify_replayed_in_store_authority(
                                         store,
                                         &cfg,
-                                        &lean_path_env,
                                         &node.olean_path,
+                                        binds_policy,
+                                        expected_dig.clone(),
                                     )
-                                };
-                            let post_dig_ok = store_verified
-                                && compute_olean_artifact_set_digest_with_policy(
+                                }
+                            } else {
+                                None
+                            };
+                            if let Some(fast_auth) = fast_auth_opt {
+                                let post_dig_ok = compute_olean_artifact_set_digest_with_policy(
                                     &node.olean_path,
                                     preserve_lake,
                                 )
                                 .ok()
                                 .as_deref()
-                                    == Some(expected_dig.as_str());
-                            if post_dig_ok {
-                                if let Some(fast_auth) = replay_batch.snapshot_fast_store_authority(
-                                    &cfg,
-                                    &node.olean_path,
-                                    expected_dig,
-                                ) {
+                                    == Some(expected_dig.as_str())
+                                    && replay_batch.verify_fast_store_authority(&fast_auth);
+                                if post_dig_ok {
                                     fast_verified_mods.push((m, fast_auth));
                                     continue;
                                 }
@@ -38192,7 +38273,7 @@ globs = ["Down.+"]
     #[test]
     fn replay_lookup_batch_cache_revalidates_mutated_transitive_dependency_and_shadowing(
     ) -> Result<()> {
-        if !crate::zygote::lean_cmd_available()
+        if Command::new("lean").arg("--version").output().is_err()
             || Command::new("lake").arg("--version").output().is_err()
         {
             return Ok(());
@@ -38210,7 +38291,7 @@ globs = ["Down.+"]
         fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
         fs::write(
             proj.join("lakefile.toml"),
-            "name = \"rbbatch\"\ndefaultTargets = [\"Rb\"]\n[[lean_lib]]\nname = \"Rb\"\nroots = [\"Rb.Leaf\", \"Rb.Mid\", \"Rb.Top\"]\n",
+            "name = \"rbbatch\"\ndefaultTargets = [\"Rb\"]\n[[lean_lib]]\nname = \"Rb\"\nroots = [\"Rb.Leaf\", \"Rb.Mid\", \"Rb.Top\", \"Rb.Parent\"]\n",
         )?;
         fs::write(proj.join("Rb/Leaf.lean"), "def leafVal : Nat := 1\n")?;
         fs::write(
@@ -38220,6 +38301,10 @@ globs = ["Down.+"]
         fs::write(
             proj.join("Rb/Top.lean"),
             "import Rb.Mid\ntheorem top_ok : midVal = 1 := rfl\n",
+        )?;
+        fs::write(
+            proj.join("Rb/Parent.lean"),
+            "import Rb.Mid\ntheorem parent_ok : midVal = 1 := rfl\n",
         )?;
         let out1 = Command::new("lake")
             .args(["build", "Rb"])
@@ -38239,6 +38324,7 @@ globs = ["Down.+"]
                 "Rb.Leaf".to_string(),
                 "Rb.Mid".to_string(),
                 "Rb.Top".to_string(),
+                "Rb.Parent".to_string(),
             ],
             &lp,
             &[],
@@ -38247,21 +38333,31 @@ globs = ["Down.+"]
         let leaf_olean = proj.join(".lake/build/lib/lean/Rb/Leaf.olean");
         let mid_olean = proj.join(".lake/build/lib/lean/Rb/Mid.olean");
         let top_olean = proj.join(".lake/build/lib/lean/Rb/Top.olean");
+        let parent_olean = proj.join(".lake/build/lib/lean/Rb/Parent.olean");
         let leaf_v1 = fs::read(&leaf_olean)?;
         let top_v1 = fs::read(&top_olean)?;
         let mid_v1 = fs::read(&mid_olean)?;
+        let parent_v1 = fs::read(&parent_olean)?;
 
+        // Seed `lookup` with `Mid` and `Top` (leaving `Parent` unseen so traversing `Parent`
+        // enters DFS without top-level `invalidate_memo()`!).
         let mut lookup = ReplayLookupBatchCache::new(&store, &cfg, &lp);
         assert!(lookup.is_audited_in_store(&store, &cfg, &lp, "Rb.Mid", &mid_olean));
         assert!(lookup.is_audited_in_store(&store, &cfg, &lp, "Rb.Top", &top_olean));
         let fast_auth = lookup
-            .snapshot_fast_store_authority(&cfg, &top_olean, "dig-v1".to_string())
+            .verify_audited_in_store_authority(
+                &store,
+                &cfg,
+                "Rb.Top",
+                &top_olean,
+                true,
+                "dig-v1".to_string(),
+            )
             .expect("fast-store authority snapshot");
         assert!(lookup.verify_fast_store_authority(&fast_auth));
 
-        // Rebuild `Rb.Leaf` with a changed definition while restoring `Mid.olean` and `Top.olean`
-        // bytes untouched on disk. `lookup` has already memoized `Leaf`, `Mid`, and `Top` without
-        // an explicit `invalidate_memo()` call; it MUST detect the transitive `Leaf.olean` change!
+        // Rebuild `Rb.Leaf` with a changed definition while restoring `Mid`, `Top`, and `Parent`
+        // `.olean` bytes untouched on disk.
         fs::write(proj.join("Rb/Leaf.lean"), "def leafVal : Nat := 2\n")?;
         let out2 = Command::new("lake")
             .args(["build", "Rb.Leaf"])
@@ -38272,7 +38368,19 @@ globs = ["Down.+"]
         let leaf_v2 = fs::read(&leaf_olean)?;
         fs::write(&mid_olean, &mid_v1)?;
         fs::write(&top_olean, &top_v1)?;
+        fs::write(&parent_olean, &parent_v1)?;
 
+        // First query previously-unseen `Rb.Parent`: DFS refreshes `Rb.Mid`'s closure internally
+        // without calling `invalidate_memo()`. A subsequent query on `Rb.Mid` MUST NOT reuse
+        // `Rb.Mid`'s stale pre-refresh `env_memo` generation!
+        assert!(
+            !lookup.is_audited_in_store(&store, &cfg, &lp, "Rb.Parent", &parent_olean),
+            "unseen parent Rb.Parent must reject stale transitive Leaf"
+        );
+        assert!(
+            !lookup.is_audited_in_store(&store, &cfg, &lp, "Rb.Mid", &mid_olean),
+            "child Rb.Mid refreshed during unseen parent DFS must not reuse stale env_memo"
+        );
         assert!(
             !lookup.is_audited_in_store(&store, &cfg, &lp, "Rb.Top", &top_olean),
             "mutated transitive dependency Rb.Leaf must invalidate memoized Rb.Top audit lookup"
@@ -38287,7 +38395,14 @@ globs = ["Down.+"]
         fs::write(&leaf_olean, &leaf_v1)?;
         assert!(lookup.is_audited_in_store(&store, &cfg, &lp, "Rb.Top", &top_olean));
         let fast_auth_v1 = lookup
-            .snapshot_fast_store_authority(&cfg, &top_olean, "dig-v1".to_string())
+            .verify_audited_in_store_authority(
+                &store,
+                &cfg,
+                "Rb.Top",
+                &top_olean,
+                true,
+                "dig-v1".to_string(),
+            )
             .expect("fast-store authority v1");
         fs::write(extra.join("Rb/Leaf.olean"), &leaf_v2)?;
         assert_eq!(
