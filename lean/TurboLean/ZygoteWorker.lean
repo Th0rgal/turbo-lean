@@ -7,7 +7,11 @@
   reload or process startup overhead, leaving `baseEnv` completely unmutated.
 -/
 import Lean.Elab.Frontend
+import Lean.Elab.Command
 import Lean.Elab.App
+import Lean.Elab.PreDefinition.Structural.Main
+import Lean.Elab.PreDefinition.WF.Main
+import Lean.Elab.PreDefinition.PartialFixpoint.Main
 import Lean.Data.Json
 import Lean.Util.CollectAxioms
 import Lean.Replay
@@ -46,6 +50,65 @@ namespace TurboLean.ZygoteWorker
 instance : MonadEnv (ReaderT Environment Id) where
   getEnv := read
   modifyEnv _ := pure ()
+
+set_option hygiene false in
+local elab "#emit_zygote_toolchain_shims" : command => do
+  let env ← getEnv
+  Command.elabCommand (← if env.contains `Lean.Kernel.Environment.replay then
+    `(command| def replayKernelConstants (constants : Std.HashMap Name ConstantInfo)
+        (env : Environment) : IO Kernel.Environment :=
+      Kernel.Environment.replay constants env.toKernelEnv)
+    else
+    `(command| def replayKernelConstants (constants : Std.HashMap Name ConstantInfo)
+        (env : Environment) : IO Kernel.Environment := do
+      return (← Environment.replay constants env).toKernelEnv))
+  let rec arity : Expr → Nat
+    | .forallE _ _ b _ => arity b + 1
+    | _ => 0
+  let some addDecl := env.find? `Lean.Kernel.Environment.addDeclCore
+    | throwError "missing kernel declaration checker"
+  Command.elabCommand (← if arity addDecl.type == 5 then
+    `(command| def checkKernelDecl (env : Kernel.Environment) (decl : Declaration) :=
+      env.addDeclCore 0 0 decl (cancelTk? := none))
+    else
+    `(command| def checkKernelDecl (env : Kernel.Environment) (decl : Declaration) :=
+      env.addDeclCore 0 decl (cancelTk? := none)))
+  Command.elabCommand (← if env.contains `Lean.ImportArtifacts.ofArrays then
+    `(command| def publicImportArtifacts (oleanParts irParts : Array System.FilePath) : ImportArtifacts :=
+      ImportArtifacts.ofArrays #[oleanParts, irParts])
+    else
+    `(command| def publicImportArtifacts (oleanParts _irParts : Array System.FilePath) : ImportArtifacts :=
+      ImportArtifacts.ofArray oleanParts))
+  Command.elabCommand (← if env.contains `Lean.ReducibilityStatus.instanceReducible then
+    `(command| private def formatReducibilityStatus : ReducibilityStatus → String
+      | .reducible => "reducible"
+      | .semireducible => "semireducible"
+      | .irreducible => "irreducible"
+      | .implicitReducible => "implicit_reducible"
+      | .instanceReducible => "instance_reducible")
+    else
+    `(command| private def formatReducibilityStatus : ReducibilityStatus → String
+      | .reducible => "reducible"
+      | .semireducible => "semireducible"
+      | .irreducible => "irreducible"
+      | .implicitReducible => "implicit_reducible"))
+  let some monoType := env.find? `Lean.Compiler.LCNF.monoTypeExt
+    | throwError "missing monomorphic type extension"
+  let hasMonoEntries := monoType.type.getAppFn.isConstOf `Lean.MapDeclarationExtension
+  Command.elabCommand (← if hasMonoEntries then
+    `(command| def monoTypeModuleEntries (env : Environment) (idx : ModuleIdx) : Array (Name × Expr) :=
+      Compiler.LCNF.monoTypeExt.getModuleEntries env idx)
+    else
+    `(command| def monoTypeModuleEntries (_ : Environment) (_ : ModuleIdx) : Array (Name × Expr) := #[]))
+  Command.elabCommand (← `(command| def hasMonoTypeModuleEntries : Bool := $(quote hasMonoEntries)))
+  Command.elabCommand (← if env.contains `Lean.MessageData.ofOriginatingSyntax then
+    `(command| def originatingMessage? : MessageData → Option MessageData
+      | .ofOriginatingSyntax _ inner => some inner
+      | _ => none)
+    else
+    `(command| def originatingMessage? (_ : MessageData) : Option MessageData := none))
+
+#emit_zygote_toolchain_shims
 
 /-- Convert an ASCII hex character byte to its 4-bit numerical value. -/
 def hexDigitVal (c : UInt8) : UInt8 :=
@@ -417,6 +480,536 @@ def collectDeclAxioms (beforeMap : Lean.PHashMap Name ConstantInfo) (afterEnv : 
           axioms := axioms.push ax
   return axioms
 
+section RecAudit
+open Meta
+
+def hydrateRecAuditEnv (env0 : Environment) : Environment := Id.run do
+  let mut e := env0
+  for i in [:e.header.moduleData.size] do
+    for entry in Meta.Match.Extension.extension.getModuleEntries e i .private do
+      e := Meta.Match.Extension.addMatcherInfo e entry.name entry.info
+    for scEntry in Elab.WF.wfPreprocessSimpExtension.ext.getModuleEntries e i .private do
+      match scEntry with
+      | .global entry => e := Elab.WF.wfPreprocessSimpExtension.addEntry e entry
+      | .scoped ns entry => e := Elab.WF.wfPreprocessSimpExtension.addScopedEntry e ns entry
+  return e.setMainModule e.mainModule
+
+def isCoreRecCombinator (env : Environment) (c : Name) : Bool :=
+  (env.getModuleIdxFor? c).any fun idx =>
+    (env.header.moduleNames[idx.toNat]?).any fun m => m.getRoot == `Init || m.getRoot == `Lean
+
+def checkRecAuditThmDecl (patterns : List String) (levelParams : List Name) (type value : Expr)
+    (localAxioms : Array Name := #[]) : MetaM Unit := do
+  let name ← mkFreshUserName `_recAuditThm
+  addDecl (.thmDecl { name, levelParams, type, value })
+  let env ← getEnv
+  let axs := collectDeclAxioms {} env name
+  unless axs.all (fun ax => localAxioms.contains ax || isAllowedAxiom patterns ax) do
+    throwError "disallowed axiom in recursion proof"
+
+def checkRecAuditDefEqKernel (patterns : List String) (levelParams : List Name) (lhs rhs : Expr) : MetaM Unit := do
+  let goal ← Meta.mkEq lhs rhs
+  let proof ← Meta.mkFreshExprSyntheticOpaqueMVar goal
+  Meta.withTransparency .all <| withOptions (Meta.smartUnfolding.set · false) proof.mvarId!.refl
+  let proof ← instantiateMVars proof
+  checkRecAuditThmDecl patterns levelParams goal proof
+
+def unfoldCliqueAuxThms (fresh : Array Name) (e : Expr) : CoreM Expr := withoutExporting do
+  let env ← getEnv
+  Core.transform e
+    (pre := fun sub => sub.withAppRev fun f revArgs => do
+      if f.isConst && revArgs.any (fun a => (a.find? fun x => x.isConst && fresh.contains x.constName!).isSome) then
+        if let some info@(.thmInfo _) := env.find? f.constName! then
+          return .visit <| (← instantiateValueLevelParams info f.constLevels! (allowOpaque := true)).betaRev revArgs
+      return .continue)
+
+def reconstructStructuralClique (preDefs : Array PreDefinition) (perms : FixedParamPerms)
+    (xs : Array Expr) (infos : Array Structural.RecArgInfo) : MetaM (Array Expr) := do
+  let values ← preDefs.mapIdxM (perms.perms[·]!.instantiateLambda ·.value xs)
+  let types ← preDefs.mapIdxM (perms.perms[·]!.instantiateForall ·.type xs)
+  let ind ← getConstInfoInduct infos[0]!.indGroupInst.all[0]!
+  let positions : Structural.Positions := .groupAndSort (·.indIdx) infos (Array.range ind.numTypeFormers)
+  let isPred ← Meta.forallTelescopeReducing ind.type fun _ r => pure r.isProp
+  let withMotives (k : Array Expr → Array Expr → MetaM (Array Expr)) : MetaM (Array Expr) := do
+    if isPred then
+      Structural.withFunTypes values fun funTypes => do
+        let motives ← infos.mapIdxM fun i r => Structural.mkIndPredBRecOnMotive r values[i]! funTypes[i]!
+        k funTypes motives
+    else
+      let motives ← infos.mapIdxM fun i r => Structural.mkBRecOnMotive r values[i]! types[i]!
+      k #[] motives
+  withMotives fun funTypes motives => do
+    let brec ← Structural.mkBRecOnConst infos positions motives isPred
+    let fTypes ← Structural.inferBRecOnFTypes infos positions brec
+    let fs ← infos.mapIdxM fun i r => do
+      if isPred then
+        let (f, matchers) ← withoutModifyingEnv do
+          preDefs.forM addAsAxiom
+          Structural.mkIndPredBRecOnF infos positions r values[i]! fTypes[i]! (brec 0).getAppArgs
+        matchers.forM (·)
+        return f
+      else
+        withoutModifyingEnv do
+          preDefs.forM addAsAxiom
+          Structural.mkBRecOnF infos positions r values[i]! fTypes[i]!
+    let fs ← fs.mapM fun f => eraseRecAppSyntaxExpr f
+    let dummy := mkAppN (brec 0) (.replicate (ind.numIndices + 1) default)
+    let packedTypes ← Meta.inferArgumentTypesN positions.size dummy
+    let packed ← positions.mapMwith (PProdN.mkLambdas · ·) packedTypes fs
+    let result ← infos.mapIdxM fun i r => Structural.mkBRecOnApp positions i brec packed funTypes r values[i]!
+    values.mapIdxM fun i v => Meta.lambdaTelescope v fun ys _ =>
+      Meta.mkLambdaFVars (perms.perms[i]!.buildArgs xs ys) (result[i]!.beta ys)
+
+def checkStructuralClique (patterns : List String) (peers : Array Name) (fresh : Array Name) (defs : Array PreDefinition) : MetaM Bool := do
+  try
+    withoutModifyingEnv do
+      let defs ← withoutModifyingEnv do
+        defs.forM addAsAxiom
+        defs.mapM fun d => do
+          let v ← unfoldCliqueAuxThms fresh d.value
+          return { d with value := (← Structural.preprocess v fresh 0) }
+      let perms ← withoutModifyingEnv do
+        defs.forM addAsAxiom
+        let info ← getFixedParamsInfo defs
+        for params in info.graph do
+          for param in params do
+            if let some mapping := param then
+              unless mapping[0]?.join.isSome do throwError "disconnected clique"
+        getFixedParamPerms defs
+      perms.perms[0]!.forallTelescope defs[0]!.type fun xs => do
+        let values ← defs.mapIdxM (perms.perms[·]!.instantiateLambda ·.value xs)
+        let candidates ← withoutModifyingEnv do
+          defs.forM addAsAxiom
+          Structural.findRecArgCandidates fresh perms xs values (defs.map fun _ => none)
+        for candidate in candidates.candidates do
+          try
+            let ok ← withoutModifyingEnv do
+              let (perms', xs', erased) := perms.erase xs (candidate.comb.map (·.indicesAndRecArgPos))
+              let infos := candidate.comb.mapIdx fun i r => { r with fixedParamPerm := perms'.perms[i]! }
+              for r in infos do
+                for indParam in r.indGroupInst.params do
+                  for y in erased do
+                    if (← dependsOn indParam y) then throwError "index in fixed param"
+              withErasedFVars erased do
+                let result ← reconstructStructuralClique defs perms' xs' infos
+                return (some result)
+            if let some result := ok then
+              withoutModifyingEnv do
+                for i in [:peers.size] do
+                  let ci ← getConstInfoDefn peers[i]!
+                  checkRecAuditDefEqKernel patterns ci.levelParams ci.value result[i]!
+              return true
+          catch _ => pure ()
+        return false
+  catch _ =>
+    return false
+
+def auditIsForallMotive (matcherApp : Meta.MatcherApp) : MetaM (Option Expr) :=
+  Meta.lambdaBoundedTelescope matcherApp.motive matcherApp.discrs.size fun xs t =>
+    if xs.size == matcherApp.discrs.size && t.isForall && !t.bindingBody!.hasLooseBVar 0 then
+      return some (← Meta.mkLambdaFVars xs t.bindingBody!)
+    else
+      return none
+
+def auditSplitMatchOrCasesOn (mvarId : MVarId) (e : Expr) (matcherInfo : Meta.MatcherInfo) : MetaM (List MVarId) := do
+  if (← Meta.isMatcherApp e) then
+    Meta.Split.splitMatch mvarId e
+  else
+    let discr := e.getAppArgs[matcherInfo.numParams + matcherInfo.numDiscrs]!
+    unless discr.isFVar do throwError "expected fvar discr"
+    let subgoals ← mvarId.cases discr.fvarId!
+    return subgoals.map (·.mvarId) |>.toList
+
+def mkAuditMatchArgPusher (matcherName : Name) (matcherInfo : Meta.MatcherInfo) : MetaM Name := do
+  let name ← mkFreshUserName `_recAuditArgPusher
+  let matcherVal ← getConstVal matcherName
+  Meta.forallBoundedTelescope matcherVal.type (some (matcherInfo.numParams + 1)) fun xs _ => do
+    let params := xs[*...matcherInfo.numParams]
+    let motive' := xs[matcherInfo.numParams]!
+    let u ← mkFreshUserName `u
+    let v ← mkFreshUserName `v
+    withLocalDeclD `α (.sort (.param u)) fun alpha => do
+    withLocalDeclD `β (← mkArrow alpha (.sort (.param v))) fun beta => do
+    withLocalDeclD `f (.forallE `x alpha (mkApp beta (.bvar 0)) .default) fun f => do
+    let relType ← forallTelescope (← inferType motive') fun xs _ =>
+      mkForallFVars xs (.forallE `x alpha (.sort 0) .default)
+    withLocalDeclD `rel relType fun rel => do
+    let motive ← forallTelescope (← inferType motive') fun xs _ => do
+      let motiveBody := mkAppN motive' xs
+      let extraArgType := .forallE `y alpha (.forallE `h (mkAppN rel (xs.push (.bvar 0))) (mkApp beta (.bvar 1)) .default) .default
+      let motiveBody ← mkArrow extraArgType motiveBody
+      mkLambdaFVars xs motiveBody
+    let uElim ← Meta.lambdaBoundedTelescope motive matcherInfo.numDiscrs fun _ motiveBody => Meta.getLevel motiveBody
+    let us := matcherVal.levelParams ++ [u, v]
+    let matcherLevels' := matcherVal.levelParams.map mkLevelParam
+    let matcherLevels ← match matcherInfo.uElimPos? with
+      | none =>
+        unless uElim.isZero do throwError "unexpected non-zero motive"
+        pure matcherLevels'
+      | some pos => pure <| (matcherLevels'.toArray.set! pos uElim).toList
+    let lhs := mkApp (mkAppN (.const matcherName matcherLevels) params) motive
+    let rhs := mkApp (mkAppN (.const matcherName matcherLevels') params) motive'
+    Meta.forallBoundedTelescope (← Meta.inferType lhs) matcherInfo.numDiscrs fun discrs _ => do
+    let lhs := mkAppN lhs discrs
+    let rhs := mkAppN rhs discrs
+    Meta.forallBoundedTelescope (← Meta.inferType lhs) matcherInfo.numAlts fun alts _ => do
+    let lhs := mkAppN lhs alts
+    let mut rhs := rhs
+    for alt in alts, altNumParams in matcherInfo.altNumParams do
+      let alt' ← Meta.forallBoundedTelescope (← Meta.inferType alt) altNumParams fun ys altBodyType => do
+        unless altBodyType.isForall do throwError "expected forall in alt"
+        let altArg ← Meta.forallBoundedTelescope altBodyType.bindingDomain! (some 2) fun ys _ =>
+          Meta.mkLambdaFVars ys (.app f ys[0]!)
+        Meta.mkLambdaFVars ys (mkAppN alt (ys.push altArg))
+      rhs := mkApp rhs alt'
+    let extraArg := .lam `y alpha (.lam `h (mkAppN rel (discrs.push (.bvar 0))) (mkApp f (.bvar 1)) .default) .default
+    let lhs := mkApp lhs extraArg
+    let goal ← Meta.mkEq lhs rhs
+    let value ← Meta.mkFreshExprSyntheticOpaqueMVar goal
+    let mvarIds ← auditSplitMatchOrCasesOn value.mvarId! rhs matcherInfo
+    for mvarId in mvarIds do
+      mvarId.refl
+    let value ← instantiateMVars value
+    let allVars := params ++ #[motive', alpha, beta, f, rel] ++ discrs ++ alts
+    let type ← Meta.mkForallFVars allVars goal
+    let value ← Meta.mkLambdaFVars allVars value
+    addDecl <| Declaration.thmDecl { name, levelParams := us, type, value }
+    return name
+
+def auditPushMatcherArgProc : Meta.Simp.Simproc := fun e => do
+  let e := e.headBeta
+  let some matcherApp ← Meta.matchMatcherApp? e (alsoCasesOn := true) | return .continue
+  let some fArg := matcherApp.remaining[0]? | return .continue
+  unless fArg.isLambda && fArg.bindingBody!.isLambda && fArg.bindingBody!.bindingBody!.isApp do return .continue
+  if fArg.bindingBody!.bindingBody!.hasLooseBVar 0 then return .continue
+  unless fArg.bindingBody!.bindingBody!.appArg! == .bvar 1 do return .continue
+  if fArg.bindingBody!.bindingBody!.appFn!.hasLooseBVar 1 then return .continue
+  let fExpr := fArg.bindingBody!.bindingBody!.appFn!
+  let fExprType ← Meta.withTransparency .all (Meta.whnfForall (← Meta.inferType fExpr))
+  unless fExprType.isForall do return .continue
+  let alpha := fExprType.bindingDomain!
+  let beta := .lam fExprType.bindingName! fExprType.bindingDomain! fExprType.bindingBody! .default
+  let some motive' ← auditIsForallMotive matcherApp | return .continue
+  let rel ← Meta.lambdaTelescope matcherApp.motive fun xs motiveBody =>
+    let motiveBodyArg := motiveBody.bindingDomain!
+    Meta.mkLambdaFVars xs (.lam motiveBodyArg.bindingName! motiveBodyArg.bindingDomain! motiveBodyArg.bindingBody!.bindingDomain! .default)
+  let argPusher ← mkAuditMatchArgPusher matcherApp.matcherName matcherApp.toMatcherInfo
+  let proof ← Meta.withTransparency .all <| Meta.mkAppOptM
+    argPusher ((matcherApp.params ++ #[motive', alpha, beta, fExpr, rel] ++ matcherApp.discrs ++ matcherApp.alts).map some)
+  let some (_, _, rhs) := (← Meta.inferType proof).eq? | throwError "expected equality"
+  let step : Meta.Simp.Result := { expr := rhs, proof? := some proof }
+  let step ← step.addExtraArgs matcherApp.remaining[1...*]
+  return .continue (some step)
+
+def declMatchesAuditScope (env : Environment) (beforeMap : Lean.PHashMap Name ConstantInfo)
+    (modIdx? : Option ModuleIdx) (name : Name) : Bool :=
+  match modIdx? with
+  | some modIdx => env.getModuleIdxFor? name == some modIdx
+  | none => env.constants.map₂.contains name && !beforeMap.contains name
+
+def checkWFClique (patterns : List String) (beforeMap : Lean.PHashMap Name ConstantInfo) (modIdx? : Option ModuleIdx)
+    (peers : Array Name) (fresh : Array Name) (defs : Array PreDefinition) : MetaM Bool := do
+  try
+    withoutModifyingEnv do
+      let defs ← defs.mapM fun d => return { d with value := (← WF.floatRecApp d.value) }
+      let (perms, argsPacker, unaryPreDef) ← withoutModifyingEnv do
+        defs.forM addAsAxiom
+        let info ← getFixedParamsInfo defs
+        for params in info.graph do
+          for param in params do
+            if let some mapping := param then
+              unless mapping[0]?.join.isSome do throwError "disconnected clique"
+        let perms ← getFixedParamPerms defs
+        let varNamess ← defs.mapIdxM fun i d => WF.varyingVarNames perms i d
+        for vns in varNamess do
+          if vns.isEmpty then throwError "no varying args"
+        let argsPacker : ArgsPacker := { varNamess }
+        let defs' ← defs.mapM fun d => return { d with value := (← unfoldCliqueAuxThms fresh d.value) }
+        let unaryPreDef ← WF.packMutual perms argsPacker defs'
+        return (perms, argsPacker, unaryPreDef)
+      let nonRecName : Name :=
+        if perms.fixedArePrefix && argsPacker.onlyOneUnary then
+          peers[0]!
+        else if argsPacker.numFuncs > 1 then
+          peers[0]! ++ `_mutual
+        else
+          peers[0]! ++ `_unary
+      let env ← getEnv
+      unless declMatchesAuditScope env beforeMap modIdx? nonRecName &&
+             !(Lean.isExtern env nonRecName) &&
+             (Lean.Compiler.getImplementedBy? env nonRecName).isNone do
+        return false
+      let nonRecCi ← getConstInfoDefn nonRecName
+      unless nonRecCi.safety == .safe && nonRecCi.levelParams == defs[0]!.levelParams do
+        return false
+      checkRecAuditDefEqKernel patterns nonRecCi.levelParams nonRecCi.type unaryPreDef.type
+      if nonRecName != peers[0]! then
+        let freshUnary ← mkFreshUserName `_recAuditUnary
+        let expectedDefs ← WF.preDefsFromUnaryNonRec perms argsPacker
+          (defs.mapIdx fun i d => { d with declName := peers[i]! })
+          { unaryPreDef with declName := freshUnary }
+        for i in [:peers.size] do
+          let ci ← getConstInfoDefn peers[i]!
+          let expectedVal := expectedDefs[i]!.value.replace fun sub =>
+            if sub.isConstOf freshUnary then some (.const nonRecName sub.constLevels!) else none
+          checkRecAuditDefEqKernel patterns ci.levelParams ci.value expectedVal
+      let (_, wfPreprocessProof) ← withoutModifyingEnv do
+        addAsAxiom unaryPreDef
+        let r ← WF.preprocess unaryPreDef.value
+        return (r.expr, r)
+      Meta.lambdaTelescope nonRecCi.value fun fixedArgs fixBody => do
+        unless fixedArgs.size == perms.numFixed do return false
+        let fn := fixBody.getAppFn
+        let args := fixBody.getAppArgs
+        let F ←
+          if fn.isConstOf ``WellFounded.fix && args.size == 5 && isCoreRecCombinator env ``WellFounded.fix then
+            pure args[4]!
+          else if fn.isConstOf ``WellFounded.Nat.fix && args.size == 4 && isCoreRecCombinator env ``WellFounded.Nat.fix then
+            pure args[3]!
+          else
+            throwError "not a WF fix body"
+        Meta.withLocalDeclD (← mkFreshUserName `_wfRecFn) unaryPreDef.type fun g => do
+          let preprocessed ← instantiateLambda wfPreprocessProof.expr fixedArgs
+          Meta.lambdaBoundedTelescope preprocessed 1 fun xs rhsOpen => do
+            unless xs.size == 1 do throwError "expected packed arg"
+            let x := xs[0]!
+            let rhsOpen := rhsOpen.replace fun sub =>
+              if sub.isConstOf unaryPreDef.declName then some g else none
+            let gFixed := mkAppN g fixedArgs
+            let ftype := (← Meta.inferType (mkApp F x)).bindingDomain!
+            let f' ← Meta.forallBoundedTelescope ftype (some 2) fun ys _ =>
+              Meta.mkLambdaFVars ys (.app gFixed ys[0]!)
+            let lhsOpen := mkApp2 F x f'
+            let eqOpen ← Meta.mkEq lhsOpen rhsOpen
+            let main ← Meta.mkFreshExprSyntheticOpaqueMVar eqOpen
+            let ctx ← Meta.Simp.mkContext (config := { dsimp := false, etaStruct := .none, letToHave := false, singlePass := true })
+            let methods : Meta.Simp.Methods := { pre := auditPushMatcherArgProc }
+            let mvarId? : Option MVarId ← main.mvarId!.withContext do
+              let target ← instantiateMVars (← main.mvarId!.getType)
+              let (r, _) ← Meta.Simp.main target ctx (methods := methods)
+              if r.expr.isTrue then
+                match r.proof? with
+                | some proof => main.mvarId!.assign (← Meta.mkOfEqTrue proof)
+                | none => main.mvarId!.assign (mkConst ``True.intro)
+                pure none
+              else
+                pure (some (← Meta.applySimpResultToTarget main.mvarId! target r))
+            if let some mvarId' := mvarId? then
+              Meta.withTransparency .all <| withOptions (Meta.smartUnfolding.set · false) mvarId'.refl
+            let openProof ← instantiateMVars main
+            let allVars := #[g] ++ fixedArgs ++ #[x]
+            let thmType ← Meta.mkForallFVars allVars eqOpen
+            let thmVal ← Meta.mkLambdaFVars allVars openProof
+            checkRecAuditThmDecl patterns nonRecCi.levelParams thmType thmVal
+            Meta.lambdaTelescope unaryPreDef.value fun uxs ubody => do
+              addAsAxiom unaryPreDef
+              let pStep ← wfPreprocessProof.addExtraArgs uxs
+              let rawEq ← Meta.mkEq ubody pStep.expr
+              let rawProof ← match pStep.proof? with
+                | some pr => pure pr
+                | none =>
+                  let m ← Meta.mkFreshExprSyntheticOpaqueMVar rawEq
+                  Meta.withTransparency .all <| withOptions (Meta.smartUnfolding.set · false) m.mvarId!.refl
+                  instantiateMVars m
+              let rawThmType ← Meta.mkForallFVars uxs rawEq
+              let rawThmVal ← Meta.mkLambdaFVars uxs rawProof
+              checkRecAuditThmDecl patterns nonRecCi.levelParams rawThmType rawThmVal #[unaryPreDef.declName]
+            return true
+  catch _ =>
+    return false
+
+def checkPFClique (patterns : List String) (beforeMap : Lean.PHashMap Name ConstantInfo) (modIdx? : Option ModuleIdx)
+    (peers : Array Name) (fresh : Array Name) (defs : Array PreDefinition) : MetaM Bool := do
+  try
+    withoutModifyingEnv do
+      let defs ← withoutModifyingEnv do
+        defs.forM addAsAxiom
+        defs.mapM fun d => return { d with value := (← unfoldCliqueAuxThms fresh d.value) }
+      let perms ← withoutModifyingEnv do
+        defs.forM addAsAxiom
+        let info ← getFixedParamsInfo defs
+        for params in info.graph do
+          for param in params do
+            if let some mapping := param then
+              unless mapping[0]?.join.isSome do throwError "disconnected clique"
+        getFixedParamPerms defs
+      let nonRecName : Name :=
+        if defs.size == 1 && perms.fixedArePrefix then
+          peers[0]!
+        else
+          peers[0]! ++ `mutual
+      let env ← getEnv
+      unless declMatchesAuditScope env beforeMap modIdx? nonRecName &&
+             !(Lean.isExtern env nonRecName) &&
+             (Lean.Compiler.getImplementedBy? env nonRecName).isNone do
+        return false
+      let nonRecCi ← getConstInfoDefn nonRecName
+      unless nonRecCi.safety == .safe && nonRecCi.levelParams == defs[0]!.levelParams do
+        return false
+      perms.perms[0]!.forallTelescope defs[0]!.type fun fixedArgs => do
+        let types ← defs.mapIdxM (perms.perms[·]!.instantiateForall ·.type fixedArgs)
+        let packedType ← PProdN.pack 0 types
+        let expectedNonRecType ← Meta.mkForallFVars fixedArgs packedType
+        checkRecAuditDefEqKernel patterns nonRecCi.levelParams nonRecCi.type expectedNonRecType
+        if nonRecName != peers[0]! then
+          for fidx in [:peers.size] do
+            let ci ← getConstInfoDefn peers[fidx]!
+            let expectedWrapper ← Meta.forallBoundedTelescope ci.type perms.perms[fidx]!.size fun params _ => do
+              let fixed := perms.perms[fidx]!.pickFixed params
+              let varying := perms.perms[fidx]!.pickVarying params
+              let us := nonRecCi.levelParams.map mkLevelParam
+              let val := mkAppN (mkConst nonRecName us) fixed
+              let val := PProdN.proj peers.size fidx packedType val
+              let val := mkAppN val varying
+              Meta.mkLambdaFVars (etaReduce := true) params val
+            checkRecAuditDefEqKernel patterns ci.levelParams ci.value expectedWrapper
+        let expectedFs ← withoutExporting do defs.mapIdxM fun funIdx preDef => do
+          let body ← perms.perms[funIdx]!.instantiateLambda preDef.value fixedArgs
+          Meta.withLocalDeclD (← mkFreshUserName `f) packedType fun f => do
+            let body' ← withoutModifyingEnv do
+              defs.forM addAsAxiom
+              let t ← Meta.inferType f
+              Meta.transform body fun sub => sub.withApp fun fn args => do
+                let some idx := fn.constName?.bind (fresh.idxOf? ·) | return .continue
+                let varying := perms.perms[idx]!.pickVarying args
+                return .continue (mkAppN (PProdN.proj fresh.size idx t f) varying)
+            Meta.mkLambdaFVars #[f] body'.headBeta
+        let expectedPackedF ← Meta.withLocalDeclD (← mkFreshUserName `f) packedType fun f => do
+          let packed ← PProdN.mk 0 (expectedFs.map (·.beta #[f]))
+          Meta.mkLambdaFVars #[f] packed
+        let nonRecBody ← instantiateLambda nonRecCi.value fixedArgs
+        let fn := nonRecBody.getAppFn
+        let args := nonRecBody.getAppArgs
+        unless (fn.isConstOf ``Lean.Order.fix || fn.isConstOf ``Lean.Order.lfp_monotone) &&
+               args.size == 4 && isCoreRecCombinator env fn.constName! do
+          return false
+        let actualF := args[2]!
+        let eqF ← Meta.mkEq actualF expectedPackedF
+        let proof ← Meta.mkFreshExprSyntheticOpaqueMVar eqF
+        Meta.withTransparency .all <| withOptions (Meta.smartUnfolding.set · false) proof.mvarId!.refl
+        let proof ← instantiateMVars proof
+        let thmType ← Meta.mkForallFVars fixedArgs eqF
+        let thmVal ← Meta.mkLambdaFVars fixedArgs proof
+        checkRecAuditThmDecl patterns nonRecCi.levelParams thmType thmVal
+        return true
+  catch _ =>
+    return false
+
+def checkRecursionCliqueMeta (patterns : List String) (beforeMap : Lean.PHashMap Name ConstantInfo)
+    (modIdx? : Option ModuleIdx) (peers : Array Name) : MetaM Bool := withoutExporting do
+  let fresh ← peers.mapM fun _ => mkFreshUserName `_recAuditPeer
+  let rename (e : Expr) : Expr := e.replace fun sub => do
+    let .const n us := sub | none
+    let base := (Compiler.isUnsafeRecName? n).getD n
+    let i ← peers.idxOf? base
+    return .const fresh[i]! us
+  let mut defs : Array PreDefinition := #[]
+  for i in [:peers.size] do
+    let ci ← getConstInfoDefn peers[i]!
+    let u ← getConstInfoDefn (Compiler.mkUnsafeRecName peers[i]!)
+    let rawVal := rename u.value
+    let val ← Core.transform rawVal fun sub => do
+      if sub.isApp && sub.getAppFn.isLambda && sub.getAppArgs.all fun arg => arg.getAppFn.isConst && fresh.contains arg.getAppFn.constName! then
+        return .visit sub.headBeta
+      else
+        return .continue
+    defs := defs.push { (default : PreDefinition) with
+      declName := fresh[i]!, type := ci.type, value := val, levelParams := ci.levelParams }
+  if (← checkStructuralClique patterns peers fresh defs) then return true
+  if (← checkWFClique patterns beforeMap modIdx? peers fresh defs) then return true
+  if (← checkPFClique patterns beforeMap modIdx? peers fresh defs) then return true
+  return false
+
+partial def isCompilerPartialRecDefn (env : Environment) (hydratedEnvRef : IO.Ref (Option Environment))
+    (cliqueCacheRef : IO.Ref (Std.HashMap (Option ModuleIdx × Name) Bool))
+    (patterns : List String) (beforeMap : Lean.PHashMap Name ConstantInfo)
+    (modIdx? : Option ModuleIdx) (cinfo : ConstantInfo)
+    (visiting : Array (Option ModuleIdx × Name) := #[]) : IO Bool := do
+  let .defnInfo dVal := cinfo | return false
+  if dVal.safety != .partial ||
+     dVal.all.isEmpty ||
+     Lean.isExtern env dVal.name ||
+     (Lean.Compiler.getImplementedBy? env dVal.name).isSome then
+    return false
+  let some baseName := Lean.Compiler.isUnsafeRecName? dVal.name | return false
+  if !dVal.all.contains dVal.name || !declMatchesAuditScope env beforeMap modIdx? baseName then
+    return false
+  let mut peers : Array Name := #[]
+  for twin in dVal.all do
+    let some peer := Lean.Compiler.isUnsafeRecName? twin | return false
+    if peers.contains peer then
+      return false
+    if !declMatchesAuditScope env beforeMap modIdx? twin ||
+       !declMatchesAuditScope env beforeMap modIdx? peer ||
+       Lean.isExtern env twin ||
+       (Lean.Compiler.getImplementedBy? env twin).isSome ||
+       Lean.isExtern env peer ||
+       (Lean.Compiler.getImplementedBy? env peer).isSome then
+      return false
+    match env.find? twin with
+    | some (.defnInfo uVal) =>
+      if uVal.safety != .partial || uVal.all != dVal.all || uVal.levelParams != dVal.levelParams then
+        return false
+    | _ => return false
+    peers := peers.push peer
+  let cacheKey := (modIdx?, peers[0]!)
+  if let some cached := (← cliqueCacheRef.get)[cacheKey]? then
+    return cached
+  if visiting.contains cacheKey then
+    return false
+  let recordResult (ok : Bool) : IO Bool := do
+    cliqueCacheRef.modify (·.insert cacheKey ok)
+    return ok
+  let mut allOpaque := true
+  let mut allSafeDefn := true
+  for peer in peers do
+    let twin := Lean.Compiler.mkUnsafeRecName peer
+    let some (.defnInfo uVal) := env.find? twin | return (← recordResult false)
+    match env.find? peer with
+    | some (.opaqueInfo oVal) =>
+      allSafeDefn := false
+      if oVal.isUnsafe || oVal.levelParams != uVal.levelParams || oVal.type != uVal.type then
+        return (← recordResult false)
+    | some (.defnInfo bVal) =>
+      allOpaque := false
+      if bVal.safety != .safe || bVal.levelParams != uVal.levelParams || bVal.type != uVal.type then
+        return (← recordResult false)
+    | _ => return (← recordResult false)
+  if allOpaque then
+    return (← recordResult true)
+  if !allSafeDefn then
+    return (← recordResult false)
+  let nextVisiting := visiting.push cacheKey
+  for peer in peers do
+    let twin := Lean.Compiler.mkUnsafeRecName peer
+    let some (.defnInfo uVal) := env.find? twin | return (← recordResult false)
+    for c in uVal.value.getUsedConstants do
+      if let some refPeer := Lean.Compiler.isUnsafeRecName? c then
+        if !peers.contains refPeer then
+          let some refCi := env.find? c | return (← recordResult false)
+          let refScope? := env.getModuleIdxFor? c
+          let refBeforeMap := if refScope?.isSome then ({} : Lean.PHashMap Name ConstantInfo) else beforeMap
+          unless (← isCompilerPartialRecDefn env hydratedEnvRef cliqueCacheRef patterns refBeforeMap refScope? refCi nextVisiting) do
+            return (← recordResult false)
+  let hydratedEnv ← match ← hydratedEnvRef.get with
+    | some hEnv => pure hEnv
+    | none =>
+      let hEnv := hydrateRecAuditEnv env
+      hydratedEnvRef.set (some hEnv)
+      pure hEnv
+  let opts := maxHeartbeats.set {} 2000000
+  let ok ← try
+    let (res, _) ← (Meta.MetaM.run' (withCurrHeartbeats <| checkRecursionCliqueMeta patterns beforeMap modIdx? peers)).toIO
+      { fileName := "<recursion-audit>", fileMap := default, options := opts,
+        maxRecDepth := 100000, maxHeartbeats := Core.getMaxHeartbeats opts }
+      { env := hydratedEnv }
+    pure res
+  catch _ =>
+    pure false
+  recordResult ok
+
+end RecAudit
+
 /-- Unescaped components of a host declaration name (`.`-separated, `«…»` quoting). -/
 def hostNameComponents (s : String) : List String := Id.run do
   let mut comps : Array String := #[]
@@ -621,9 +1214,14 @@ def auditNewKernelDecls
   let newDecls := afterMap.foldl (fun acc name cinfo =>
     if !beforeMap.contains name then (name, cinfo) :: acc else acc) []
   let orderedNewDecls := newDecls.reverse
+  let hydratedEnvRef ← IO.mkRef (none : Option Environment)
+  let cliqueCacheRef ← IO.mkRef ({} : Std.HashMap (Option ModuleIdx × Name) Bool)
   for (name, cinfo) in orderedNewDecls do
     if cinfo.isUnsafe then
       violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} declaration `{name}` is forbidden"]
+    if (cinfo.isPartial || (Lean.Compiler.isUnsafeRecName? name).isSome) &&
+       !(← isCompilerPartialRecDefn afterEnv hydratedEnvRef cliqueCacheRef patterns beforeMap none cinfo) then
+      violations := violations ++ [s!"[TurboLean.KernelGate] forged or unpaired _unsafe_rec/partial declaration `{name}` is forbidden"]
     let isNestedInd := match cinfo with
       | .inductInfo iVal => iVal.isNested
       | _ => false
@@ -749,65 +1347,36 @@ def collectNewDeclUsedConstants (beforeEnv afterEnv : Environment) : Array Strin
         out := out.push cs
   return out
 
-def eqConstantVal (a b : ConstantVal) : Bool :=
-  a.name == b.name && a.levelParams == b.levelParams && a.type == b.type
-
-def eqReducibilityHints : ReducibilityHints → ReducibilityHints → Bool
-  | .opaque, .opaque => true
-  | .abbrev, .abbrev => true
-  | .regular a, .regular b => a == b
-  | _, _ => false
-
-def eqDefinitionSafety (a b : DefinitionSafety) : Bool :=
-  a == b
-
-def eqQuotKind : QuotKind → QuotKind → Bool
-  | .type, .type => true
-  | .ctor, .ctor => true
-  | .lift, .lift => true
-  | .ind, .ind => true
-  | _, _ => false
-
-def eqRecursorRule (a b : RecursorRule) : Bool :=
-  a.ctor == b.ctor && a.nfields == b.nfields && a.rhs == b.rhs
-
-def eqRecursorRules : List RecursorRule → List RecursorRule → Bool
-  | [], [] => true
-  | a :: as_, b :: bs => eqRecursorRule a b && eqRecursorRules as_ bs
-  | _, _ => false
-
-def eqConstantInfo : ConstantInfo → ConstantInfo → Bool
-  | .axiomInfo a, .axiomInfo b =>
-    eqConstantVal a.toConstantVal b.toConstantVal && a.isUnsafe == b.isUnsafe
+def eqConstantInfo (a b : ConstantInfo) : Bool :=
+  a.name == b.name && a.levelParams == b.levelParams && a.type == b.type &&
+  match a, b with
+  | .axiomInfo a, .axiomInfo b => a.isUnsafe == b.isUnsafe
   | .defnInfo a, .defnInfo b =>
-    eqConstantVal a.toConstantVal b.toConstantVal && a.value == b.value &&
-      eqReducibilityHints a.hints b.hints && eqDefinitionSafety a.safety b.safety && a.all == b.all
-  | .thmInfo a, .thmInfo b =>
-    eqConstantVal a.toConstantVal b.toConstantVal && a.value == b.value && a.all == b.all
+    a.value == b.value && a.safety == b.safety && a.all == b.all &&
+      (match a.hints, b.hints with
+       | .opaque, .opaque | .abbrev, .abbrev => true
+       | .regular a, .regular b => a == b
+       | _, _ => false)
+  | .thmInfo a, .thmInfo b => a.value == b.value && a.all == b.all
   | .opaqueInfo a, .opaqueInfo b =>
-    eqConstantVal a.toConstantVal b.toConstantVal && a.value == b.value &&
-      a.isUnsafe == b.isUnsafe && a.all == b.all
+    a.value == b.value && a.isUnsafe == b.isUnsafe && a.all == b.all
   | .quotInfo a, .quotInfo b =>
-    eqConstantVal a.toConstantVal b.toConstantVal && eqQuotKind a.kind b.kind
+    match a.kind, b.kind with
+    | .type, .type | .ctor, .ctor | .lift, .lift | .ind, .ind => true
+    | _, _ => false
   | .inductInfo a, .inductInfo b =>
-    eqConstantVal a.toConstantVal b.toConstantVal && a.numParams == b.numParams &&
-      a.numIndices == b.numIndices && a.all == b.all && a.ctors == b.ctors &&
-      a.numNested == b.numNested && a.isRec == b.isRec && a.isUnsafe == b.isUnsafe &&
-      a.isReflexive == b.isReflexive
+    a.numParams == b.numParams && a.numIndices == b.numIndices && a.all == b.all &&
+    a.ctors == b.ctors && a.numNested == b.numNested && a.isRec == b.isRec &&
+    a.isUnsafe == b.isUnsafe && a.isReflexive == b.isReflexive
   | .ctorInfo a, .ctorInfo b =>
-    eqConstantVal a.toConstantVal b.toConstantVal && a.induct == b.induct && a.cidx == b.cidx &&
-      a.numParams == b.numParams && a.numFields == b.numFields && a.isUnsafe == b.isUnsafe
+    a.induct == b.induct && a.cidx == b.cidx && a.numParams == b.numParams &&
+    a.numFields == b.numFields && a.isUnsafe == b.isUnsafe
   | .recInfo a, .recInfo b =>
-    eqConstantVal a.toConstantVal b.toConstantVal && a.all == b.all &&
-      a.numParams == b.numParams && a.numIndices == b.numIndices &&
-      a.numMotives == b.numMotives && a.numMinors == b.numMinors &&
-      eqRecursorRules a.rules b.rules && a.k == b.k && a.isUnsafe == b.isUnsafe
+    a.all == b.all && a.numParams == b.numParams && a.numIndices == b.numIndices &&
+    a.numMotives == b.numMotives && a.numMinors == b.numMinors && a.k == b.k &&
+    a.isUnsafe == b.isUnsafe && a.rules.length == b.rules.length &&
+    (a.rules.zip b.rules).all fun (a, b) => a.ctor == b.ctor && a.nfields == b.nfields && a.rhs == b.rhs
   | _, _ => false
-
-set_option linter.deprecated false in
-def replayEnvConstants (newConsts : Std.HashMap Name ConstantInfo) (env : Environment) : IO Environment :=
-  Lean.Environment.replay newConsts env
-
 /-- Independent kernel replay. `IO.processCommands` honors source-level options such as
     `set_option debug.skipKernelTC true` (or `set_option … in`), and these options persist in cached
     prefix `Command.State`s. So every declaration added since `beforeEnv` is sent to the kernel again,
@@ -824,7 +1393,7 @@ def kernelReplayNewDecls (beforeEnv afterEnv : Environment) : IO (List String) :
   for (name, oldInfo) in beforeMap.toList do
     match afterMap.find? name with
     | some newInfo =>
-      if !(eqConstantInfo newInfo oldInfo) then
+      if !eqConstantInfo newInfo oldInfo then
         errs := errs ++ [s!"[TurboLean.KernelReplay] declaration `{name}` from the checked prefix was replaced"]
     | none =>
       errs := errs ++ [s!"[TurboLean.KernelReplay] declaration `{name}` from the checked prefix is missing"]
@@ -836,7 +1405,7 @@ def kernelReplayNewDecls (beforeEnv afterEnv : Environment) : IO (List String) :
   if !errs.isEmpty || newConsts.isEmpty then
     return errs
   try
-    let _ ← replayEnvConstants newConsts beforeEnv
+    let _ ← replayKernelConstants newConsts beforeEnv
     return []
   catch e =>
     return [s!"[TurboLean.KernelReplay] independent kernel re-check failed: {e}"]
@@ -1175,58 +1744,6 @@ def isWhitelistedInitExecUnsafe (env : Environment) (modIdx : ModuleIdx) (cinfo 
       env.getModuleIdxFor? cinfo.name == some modIdx
     | _ => false
 
-/-- Recognizes Lean 4's compiler-generated `_unsafe_rec` lowering (`foo._unsafe_rec`
-    with `DefinitionSafety.partial` paired in the same module with `foo` of the
-    identical level parameters and type):
-    - `partial def foo`: `foo` is `.opaqueInfo` (`!oVal.isUnsafe`), OR
-    - structurally / well-founded recursive `def foo`: `foo` is `.defnInfo` (`bVal.safety == .safe`)
-      whose kernel body uses `brecOn` / `WellFounded.fix` / `WellFounded.Nat.fix` (or `foo._sunfold`)
-      and `foo._unsafe_rec` actually calls an `._unsafe_rec` peer in the same module.
-    Forged `safeTarget._unsafe_rec` hijack attempts on non-recursive `def safeTarget`
-    fail closed because neither `safeTarget` is recursive nor does a constant body invoke `_unsafe_rec`. -/
-def isCompilerPartialRecDefn (env : Environment) (modIdx : ModuleIdx) (cinfo : ConstantInfo) : Bool :=
-  let nameIsRecCombinator (n : Name) : Bool :=
-    match n with
-    | .str _ "brecOn" | .str _ "fix" | .str _ "fixF" => true
-    | .str _ s => s.startsWith "brecOn_"
-    | _ => false
-  let bodyUsesRecCombinator (bVal : DefinitionVal) : Bool :=
-    let direct := bVal.value.getUsedConstants
-    direct.any nameIsRecCombinator ||
-    direct.any fun c =>
-      match c with
-      | .str _ "_mutual" | .str _ "_unary" =>
-        env.getModuleIdxFor? c == some modIdx &&
-        match env.find? c with
-        | some (.defnInfo mVal) => mVal.safety == .safe && mVal.value.getUsedConstants.any nameIsRecCombinator
-        | _ => false
-      | _ => false
-  match cinfo with
-  | .defnInfo dVal =>
-    dVal.safety == .partial &&
-    !(Lean.isExtern env dVal.name) &&
-    (Lean.Compiler.getImplementedBy? env dVal.name).isNone &&
-    match Lean.Compiler.isUnsafeRecName? dVal.name with
-    | some baseName =>
-      env.getModuleIdxFor? baseName == some modIdx &&
-      !(Lean.isExtern env baseName) &&
-      (Lean.Compiler.getImplementedBy? env baseName).isNone &&
-      match env.find? baseName with
-      | some (.opaqueInfo oVal) =>
-        !oVal.isUnsafe && oVal.levelParams == dVal.levelParams && oVal.type == dVal.type
-      | some (.defnInfo bVal) =>
-        bVal.safety == .safe &&
-        bVal.levelParams == dVal.levelParams &&
-        bVal.type == dVal.type &&
-        (env.contains (baseName.mkStr "_sunfold") || env.contains (baseName.mkStr "_unary") || bodyUsesRecCombinator bVal) &&
-        dVal.value.getUsedConstants.any fun c =>
-          match Lean.Compiler.isUnsafeRecName? c with
-          | some peer => env.getModuleIdxFor? peer == some modIdx
-          | none => false
-      | _ => false
-    | none => false
-  | _ => false
-
 def isWhitelistedInitExecBridge (env : Environment) (modIdx : ModuleIdx) (declName : Name) : Bool :=
   if Lean.isExtern env declName then false
   else match Lean.Compiler.getImplementedBy? env declName with
@@ -1510,12 +2027,27 @@ def replayAuditedModule (moduleName : Name) : IO Unit := do
   if (base.getModuleIdx? moduleName).isSome then
     throw <| IO.userError s!"`{moduleName}` appears in its own transitive import closure"
   let mut constants : Std.HashMap Name ConstantInfo := {}
+  let mut dupProofChecks : Array TheoremVal := #[]
   for name in full.constNames, ci in full.constants do
     if let some existing := base.find? name then
-      if !dupTheoremMatch ci existing then
+      if eqConstantInfo ci existing then
+        pure ()
+      else if dupTheoremMatch ci existing then
+        if let .thmInfo info := ci then
+          dupProofChecks := dupProofChecks.push info
+      else
         throw <| IO.userError s!"`{moduleName}` redeclares imported constant `{name}`"
     constants := constants.insert name ci
-  discard <| replayEnvConstants constants base
+  let kenv ← replayKernelConstants constants base
+  for i in [:dupProofChecks.size] do
+    let tv := dupProofChecks[i]!
+    let freshName := Name.mkNum (Name.mkStr `_turbo_dup_check (toString moduleName)) i
+    let decl := Declaration.thmDecl { tv with name := freshName, all := [freshName] }
+    match checkKernelDecl kenv decl with
+    | .ok _ => pure ()
+    | .error ex =>
+      let msg ← ex.toMessageData {} |>.toString
+      throw <| IO.userError s!"duplicate realized theorem `{tv.name}` in `{moduleName}` failed kernel check: {msg}"
 
 /-- Recheck a contiguous topological slice of modules against only their frontier imports outside
     `moduleNames`, verifying fail-closed that none of `moduleNames` was imported into `base`
@@ -1547,19 +2079,40 @@ def replayAuditedModuleClosure (moduleNames : Array Name) : IO Unit := do
     if (base.getModuleIdx? modName).isSome then
       throw <| IO.userError s!"replay closure topological invariant violated: `{modName}` imported into base environment"
   let mut constants : Std.HashMap Name ConstantInfo := {}
+  let mut dupProofChecks : Array (Name × TheoremVal) := #[]
   for (modName, full) in fullModules do
     for name in full.constNames, ci in full.constants do
       if let some existing := base.find? name then
-        if !dupTheoremMatch ci existing then
+        if eqConstantInfo ci existing then
+          pure ()
+        else if dupTheoremMatch ci existing then
+          if let .thmInfo info := ci then
+            dupProofChecks := dupProofChecks.push (modName, info)
+        else
           throw <| IO.userError s!"`{modName}` redeclares imported constant `{name}`"
       else if let some prev := constants[name]? then
-        if !dupTheoremMatch ci prev then
-          throw <| IO.userError s!"`{modName}` redeclares closure constant `{name}`"
-        else
+        if eqConstantInfo ci prev then
+          pure ()
+        else if dupTheoremMatch ci prev then
+          if let .thmInfo info := ci then
+            if let .thmInfo prevInfo := prev then
+              dupProofChecks := dupProofChecks.push (modName, prevInfo)
+            dupProofChecks := dupProofChecks.push (modName, info)
           constants := constants.insert name ci
+        else
+          throw <| IO.userError s!"`{modName}` redeclares closure constant `{name}`"
       else
         constants := constants.insert name ci
-  discard <| replayEnvConstants constants base
+  let kenv ← replayKernelConstants constants base
+  for i in [:dupProofChecks.size] do
+    let (modName, tv) := dupProofChecks[i]!
+    let freshName := Name.mkNum (Name.mkStr `_turbo_dup_check (toString modName)) i
+    let decl := Declaration.thmDecl { tv with name := freshName, all := [freshName] }
+    match checkKernelDecl kenv decl with
+    | .ok _ => pure ()
+    | .error ex =>
+      let msg ← ex.toMessageData {} |>.toString
+      throw <| IO.userError s!"duplicate realized theorem `{tv.name}` in `{modName}` failed kernel check: {msg}"
 
 def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Name))
     (ffiAllow : Array (Name × Name × String) := #[])
@@ -1603,7 +2156,13 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
       if h : modIdx.toNat < env.header.moduleData.size then
         for cinfo in env.header.moduleData[modIdx.toNat].constants do
           allRoots := allRoots.push cinfo.name
+          if let .thmInfo tv := cinfo then
+            if !stubs.contains cinfo.name && env.getModuleIdxFor? cinfo.name != some modIdx then
+              for u in tv.type.getUsedConstants ++ tv.value.getUsedConstants do
+                allRoots := allRoots.push u
   let axMap := collectForbiddenAxiomsByDecl env allRoots patterns stubs
+  let hydratedEnvRef ← IO.mkRef (none : Option Environment)
+  let cliqueCacheRef ← IO.mkRef ({} : Std.HashMap (Option ModuleIdx × Name) Bool)
   for (rawStr, nm) in targets do
     match env.getModuleIdx? nm with
     | none =>
@@ -1634,7 +2193,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
              !unsafeAllowed declName then
             violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} declaration `{declName}` in `{rawStr}` is forbidden"]
           if (cinfo.isPartial || (Lean.Compiler.isUnsafeRecName? declName).isSome) &&
-             !isCompilerPartialRecDefn env modIdx cinfo then
+             !(← isCompilerPartialRecDefn env hydratedEnvRef cliqueCacheRef patterns {} (some modIdx) cinfo) then
             violations := violations ++ [s!"[TurboLean.KernelGate] forged or unpaired _unsafe_rec/partial declaration `{declName}` in `{rawStr}` is forbidden"]
           if (Lean.isExtern env declName || (Lean.Compiler.getImplementedBy? env declName).isSome) &&
              !isWhitelistedInitExecBridge env modIdx declName &&
@@ -1642,7 +2201,21 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
              !isPinnedFfiOpaque env ffiAllow modIdx cinfo &&
              !implByAllowed declName then
             violations := violations ++ [s!"[TurboLean.KernelGate] extern/implemented_by bypass on `{declName}` in `{rawStr}` is forbidden"]
-          for ax in axMap[declName]?.getD #[] do
+          let cinfoAxs : Array Name := Id.run do
+            let mut acc := axMap[declName]?.getD #[]
+            match cinfo with
+            | .thmInfo tv =>
+              if !stubs.contains declName then
+                for u in tv.type.getUsedConstants ++ tv.value.getUsedConstants do
+                  if let some ciU := env.find? u then
+                    if ciU matches .axiomInfo _ && !isAllowedAxiom patterns u && !acc.contains u then
+                      acc := acc.push u
+                  for ax in axMap[u]?.getD #[] do
+                    if !acc.contains ax then
+                      acc := acc.push ax
+            | _ => pure ()
+            return acc
+          for ax in cinfoAxs do
             if allowSorry && ax == sorryAxName && !stubs.contains declName then
               let userNm := canonicalName (Lean.privateToUserName declName)
               if !userNm.isEmpty && !((userNm.splitOn "._").length > 1) && !((userNm.splitOn "_proof_").length > 1) && !(seenSorry[userNm]?.getD false) then
@@ -1909,14 +2482,6 @@ def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Nam
   let allViolations := initViolations ++ sliceViolations
   return (allViolations.isEmpty, allViolations)
 
-private def formatReducibilityStatus (r : ReducibilityStatus) : String :=
-  match r with
-  | .reducible => "reducible"
-  | .semireducible => "semireducible"
-  | .irreducible => "irreducible"
-  | .implicitReducible => "implicit_reducible"
-  | .instanceReducible => "instance_reducible"
-
 private def formatInlineAttr (i : Option Compiler.InlineAttributeKind) : String :=
   match i with
   | none => "none"
@@ -2175,7 +2740,7 @@ private def isWhitelistedPublicSigExtName (extStr : String) : Bool :=
   || extStr == "Lean.Compiler.LCNF.baseExt"
   || extStr == "Lean.Compiler.LCNF.monoExt"
   || extStr == "Lean.Compiler.LCNF.impureSigExt"
-  || extStr == "Lean.Compiler.LCNF.monoTypeExt"
+  || (hasMonoTypeModuleEntries && extStr == "Lean.Compiler.LCNF.monoTypeExt")
   || extStr == "_private.Lean.Compiler.LCNF.MonoTypes.0.Lean.Compiler.LCNF.trivialStructureInfoExt"
   || extStr == "_private.Lean.Compiler.LCNF.ToImpureType.0.Lean.Compiler.LCNF.impureTypeExt"
   || extStr == "_private.Lean.Compiler.LCNF.ToImpureType.0.Lean.Compiler.LCNF.impureTrivialStructureInfoExt"
@@ -2196,7 +2761,7 @@ def dumpPublicSignatureJson (modStr : String) : IO String := do
   let oleanParts := if hasSrv then #[oleanPath, srvPath] else #[oleanPath]
   let irParts := if hasIrSig then (if hasIr then #[irSigPath, irPath] else #[irSigPath]) else #[]
   let arts : NameMap ImportArtifacts :=
-    (∅ : NameMap ImportArtifacts).insert nm (ImportArtifacts.ofArrays #[oleanParts, irParts])
+    (∅ : NameMap ImportArtifacts).insert nm (publicImportArtifacts oleanParts irParts)
   let env ← Lean.importModules #[{ module := nm, isExported := true, importAll := false }] {} 0 #[] true false .exported arts
   let some idx := env.getModuleIdx? nm | throw (IO.userError s!"module `{modStr}` not imported")
   let md := env.header.moduleData[idx.toNat]!
@@ -2326,7 +2891,7 @@ def dumpPublicSignatureJson (modStr : String) : IO String := do
   for mdDecl in Compiler.LCNF.monoExt.getModuleEntries env idx do
     lcnfMonoEntries := lcnfMonoEntries.push (← formatLcnfDeclIO env norm .mono mdDecl)
   let lcnfImpureSigEntries := ((Compiler.LCNF.impureSigExt.getModuleEntries env idx).map (formatLcnfSignature norm)).qsort (· < ·)
-  let lcnfMonoTypeEntries := ((Compiler.LCNF.monoTypeExt.getModuleEntries env idx).map fun (dName, mTy) =>
+  let lcnfMonoTypeEntries := ((monoTypeModuleEntries env idx).map fun (dName, mTy) =>
     let mTyHash := TurboLean.Blake3.blake3Bytes (TurboLean.StatementHash.exprJson norm mTy).compress.toUTF8
     s!"{canonicalName (norm dName)}:{mTyHash}").qsort (· < ·)
   let matchPatEntries := ((Lean.matchPatternAttr.ext.getModuleEntries env idx).map (fun dName => canonicalName (norm dName))).qsort (· < ·)
@@ -2577,12 +3142,13 @@ private partial def walkHotspotMessageData
     walkHotspotMessageData b cmdLine traceOut simpOut visitedNodes
   | .tagged _ inner => walkHotspotMessageData inner cmdLine traceOut simpOut visitedNodes
   | .ofWidget _ inner => walkHotspotMessageData inner cmdLine traceOut simpOut visitedNodes
-  | .ofOriginatingSyntax _ inner => walkHotspotMessageData inner cmdLine traceOut simpOut visitedNodes
   | .ofLazy fn _ =>
     let dyn ← (fn none : BaseIO Dynamic)
     if let some inner := dyn.get? MessageData then
       walkHotspotMessageData inner cmdLine traceOut simpOut visitedNodes
-  | _ => pure ()
+  | other =>
+    if let some inner := originatingMessage? other then
+      walkHotspotMessageData inner cmdLine traceOut simpOut visitedNodes
 
 /-- Bounded command-by-command diagnostic pass executed ONLY after a timeout or heartbeat/recursion
     exhaustion failure. Enables `profiler` + `trace.Meta.Tactic.simp.*` on an isolated state, records
