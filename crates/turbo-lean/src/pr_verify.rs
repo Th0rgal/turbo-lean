@@ -5613,12 +5613,26 @@ fn seed_base_statement_dependencies(
     Ok(())
 }
 
+fn normal_rel_path(rel: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for c in rel.components() {
+        match c {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(p) if !p.eq_ignore_ascii_case(".git") => out.push(p),
+            _ => return None,
+        }
+    }
+    (!out.as_os_str().is_empty()).then_some(out)
+}
+
 fn trusted_dep_snapshot_rel_path(
     cfg: &crate::module_builder::ProjectConfig,
     dep: &crate::module_builder::PackageConfig,
 ) -> Option<PathBuf> {
     if let Ok(rel) = dep.pkg_root.strip_prefix(&cfg.root_pkg.pkg_root) {
-        return Some(rel.to_path_buf());
+        if let Some(clean) = normal_rel_path(rel) {
+            return Some(clean);
+        }
     }
     for mp in &cfg.manifest_packages {
         let same_target = mp.dir == dep.pkg_root
@@ -5630,7 +5644,9 @@ fn trusted_dep_snapshot_rel_path(
                 .is_some_and(|(a, b)| a == b);
         if same_target {
             if let Ok(rel) = mp.dir.strip_prefix(&cfg.root_pkg.pkg_root) {
-                return Some(rel.to_path_buf());
+                if let Some(clean) = normal_rel_path(rel) {
+                    return Some(clean);
+                }
             }
         }
     }
@@ -5642,7 +5658,9 @@ fn trusted_dep_snapshot_rel_path(
                 .packages_dir
                 .strip_prefix(&cfg.root_pkg.pkg_root)
                 .unwrap_or(&cfg.root_pkg.packages_dir);
-            return Some(pkgs_rel.join(sub));
+            if let Some(clean) = normal_rel_path(&pkgs_rel.join(sub)) {
+                return Some(clean);
+            }
         }
     }
     None
@@ -6946,6 +6964,112 @@ fn hash_deterministic_file_tree(
     Some(())
 }
 
+fn base_statement_config_files_match_live(
+    repo: &Path,
+    base: &str,
+    proj_rel_in_repo: &Path,
+    live_proj: &Path,
+) -> Option<()> {
+    if base.starts_with('-') {
+        return None;
+    }
+    let prefix = proj_rel_in_repo.to_string_lossy().replace('\\', "/");
+    let names = [
+        "lean-toolchain",
+        "lakefile.lean",
+        "lakefile.toml",
+        "lake-manifest.json",
+    ];
+    let repo_rels: Vec<String> = names.iter().map(|n| join_proj_prefix(&prefix, n)).collect();
+    let ls_out = crate::trusted_tools::git(repo)
+        .ok()?
+        .arg("-C")
+        .arg(repo)
+        .args(["ls-tree", "-z", "--full-tree", base, "--"])
+        .args(&repo_rels)
+        .output()
+        .ok()?;
+    if !ls_out.status.success() {
+        return None;
+    }
+    let mut base_oids: std::collections::HashMap<String, String> =
+        std::collections::HashMap::with_capacity(names.len());
+    for entry in ls_out.stdout.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+        let tab = entry.iter().position(|&b| b == b'\t')?;
+        let header = std::str::from_utf8(&entry[..tab]).ok()?;
+        let path_str = std::str::from_utf8(&entry[tab + 1..]).ok()?;
+        let mut fields = header.split(' ');
+        let (mode, obj_type, oid) = (fields.next()?, fields.next()?, fields.next()?);
+        if fields.next().is_some() || !matches!(mode, "100644" | "100755") || obj_type != "blob" {
+            return None;
+        }
+        base_oids.insert(path_str.to_string(), oid.to_string());
+    }
+    for (name, repo_rel) in names.iter().zip(repo_rels.iter()) {
+        let live_path = live_proj.join(name);
+        match (base_oids.get(repo_rel), fs::symlink_metadata(&live_path)) {
+            (None, Err(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            (Some(oid), Ok(meta)) if meta.is_file() && !meta.file_type().is_symlink() => {
+                let live_bytes = fs::read(&live_path).ok()?;
+                let cat_out = crate::trusted_tools::git(repo)
+                    .ok()?
+                    .arg("-C")
+                    .arg(repo)
+                    .args(["cat-file", "blob", oid])
+                    .output()
+                    .ok()?;
+                if !cat_out.status.success() || cat_out.stdout != live_bytes {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    if base_oids.get(&repo_rels[0]).is_none() && repo != live_proj {
+        let root_tc = repo.join("lean-toolchain");
+        let ls_root = crate::trusted_tools::git(repo)
+            .ok()?
+            .arg("-C")
+            .arg(repo)
+            .args(["ls-tree", "-z", "--full-tree", base, "--", "lean-toolchain"])
+            .output()
+            .ok()?;
+        if !ls_root.status.success() {
+            return None;
+        }
+        let mut root_oid = None;
+        for entry in ls_root.stdout.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+            let tab = entry.iter().position(|&b| b == b'\t')?;
+            let header = std::str::from_utf8(&entry[..tab]).ok()?;
+            let mut fields = header.split(' ');
+            let (mode, obj_type, oid) = (fields.next()?, fields.next()?, fields.next()?);
+            if fields.next().is_some() || !matches!(mode, "100644" | "100755") || obj_type != "blob"
+            {
+                return None;
+            }
+            root_oid = Some(oid.to_string());
+        }
+        match (root_oid, fs::symlink_metadata(&root_tc)) {
+            (None, Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
+            (Some(oid), Ok(meta)) if meta.is_file() && !meta.file_type().is_symlink() => {
+                let live_bytes = fs::read(&root_tc).ok()?;
+                let cat_out = crate::trusted_tools::git(repo)
+                    .ok()?
+                    .arg("-C")
+                    .arg(repo)
+                    .args(["cat-file", "blob", &oid])
+                    .output()
+                    .ok()?;
+                if !cat_out.status.success() || cat_out.stdout != live_bytes {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(())
+}
+
 fn base_statement_cache_action_key(
     repo: &Path,
     base: &str,
@@ -6953,6 +7077,7 @@ fn base_statement_cache_action_key(
     relative_scope: Option<&Path>,
     cfg: &crate::module_builder::ProjectConfig,
 ) -> Option<String> {
+    base_statement_config_files_match_live(repo, base, proj_rel_in_repo, &cfg.root_pkg.pkg_root)?;
     let ws_inputs_digest = crate::module_builder::workspace_lake_inputs_digest(cfg).ok()?;
     let spec = if proj_rel_in_repo.as_os_str().is_empty() {
         format!("{base}^{{tree}}")
@@ -6974,7 +7099,7 @@ fn base_statement_cache_action_key(
         return None;
     }
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean:base-stmt-map:v2\0");
+    h.update(b"turbo-lean:base-stmt-map:v3\0");
     update_lp_bytes(&mut h, b"githash", cfg.lean_githash.as_bytes());
     update_lp_bytes(
         &mut h,
@@ -7019,6 +7144,17 @@ fn base_statement_cache_action_key(
             || dp.native_unsupported.is_some()
             || dp.link_unsupported.is_some()
             || !dp.custom_targets.is_empty()
+            || dp.libs.iter().any(|l| {
+                l.unsupported.is_some()
+                    || l.native_unsupported.is_some()
+                    || l.link_unsupported.is_some()
+            })
+            || dp.exes.iter().any(|e| {
+                e.unsupported.is_some()
+                    || e.native_unsupported.is_some()
+                    || e.link_unsupported.is_some()
+            })
+            || trusted_dep_snapshot_rel_path(cfg, dp).is_none()
         {
             return None;
         }
@@ -7029,6 +7165,39 @@ fn base_statement_cache_action_key(
         let build_abs = dep_root.join(&dp.build_dir);
         let pkgs_abs = dep_root.join(&dp.packages_dir);
         let lake_abs = dep_root.join(".lake");
+        let norm_dep_sub = |p: &Path| -> PathBuf {
+            let mut out = PathBuf::new();
+            for c in p.components() {
+                match c {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        out.pop();
+                    }
+                    other => out.push(other),
+                }
+            }
+            out
+        };
+        let pkg_src_abs = norm_dep_sub(&dep_root.join(&dp.src_dir));
+        let mut src_roots: Vec<PathBuf> = vec![pkg_src_abs.clone()];
+        for lib in &dp.libs {
+            if let Some(ref s) = lib.src_dir {
+                src_roots.push(norm_dep_sub(&pkg_src_abs.join(s)));
+            }
+        }
+        for exe in &dp.exes {
+            if let Some(ref s) = exe.src_dir {
+                src_roots.push(norm_dep_sub(&pkg_src_abs.join(s)));
+            }
+        }
+        src_roots.sort();
+        src_roots.dedup();
+        h.update(&(src_roots.len() as u64).to_le_bytes());
+        for sr in &src_roots {
+            let sr_rel = sr.strip_prefix(&dep_root).ok()?;
+            update_lp_bytes(&mut h, b"dep_src_root", sr_rel.to_string_lossy().as_bytes());
+            hash_deterministic_file_tree(&mut h, sr, &[pkgs_abs.clone()], Some(&[".lean"]))?;
+        }
         hash_deterministic_file_tree(
             &mut h,
             &dep_root,
@@ -16104,30 +16273,41 @@ end ParityNs
             crate::pack::next_tmp_id()
         ));
         let _ = fs::remove_dir_all(&root);
-        let dep_dir = root.join("dep");
         let proj = root.join("proj");
-        fs::create_dir_all(dep_dir.join("target/Dep"))?;
-        fs::create_dir_all(proj.join("App"))?;
+        let dep_dir = proj.join(".lake/packages/dep");
+        let ext_dep = root.join("ext_dep");
+        fs::create_dir_all(dep_dir.join("target"))?;
+        fs::create_dir_all(dep_dir.join(".lake/gen"))?;
+        fs::create_dir_all(&ext_dep)?;
+        fs::create_dir_all(&proj)?;
         let tc = include_str!("../../../lean/lean-toolchain");
         fs::write(dep_dir.join("lean-toolchain"), tc)?;
         fs::write(
             dep_dir.join("lakefile.toml"),
-            "name = \"dep\"\nsrcDir = \"target\"\ndefaultTargets = [\"Dep\"]\n[[lean_lib]]\nname = \"Dep\"\nroots = [\"Dep\"]\n",
+            "name = \"dep\"\ndefaultTargets = [\"Dep\", \"Gen\"]\n[[lean_lib]]\nname = \"Dep\"\nsrcDir = \"target\"\nroots = [\"Dep\"]\n[[lean_lib]]\nname = \"Gen\"\nsrcDir = \".lake/gen\"\nroots = [\"Gen\"]\n",
         )?;
         fs::write(dep_dir.join("target/Dep.lean"), "def depConst : Nat := 1\n")?;
-        fs::write(proj.join("lean-toolchain"), tc)?;
         fs::write(
-            proj.join("lakefile.toml"),
-            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep\"\npath = \"../dep\"\n[[input_file]]\nname = \"SpecCfg\"\npath = \"spec.txt\"\ntext = true\n[[lean_lib]]\nname = \"App\"\nneeds = [\"SpecCfg\"]\nroots = [\"App\"]\n",
+            dep_dir.join(".lake/gen/Gen.lean"),
+            "def genConst : Nat := 1\n",
         )?;
+        fs::write(ext_dep.join("lean-toolchain"), tc)?;
+        fs::write(
+            ext_dep.join("lakefile.toml"),
+            "name = \"ext_dep\"\ndefaultTargets = [\"Ext\"]\n[[lean_lib]]\nname = \"Ext\"\nroots = [\"Ext\"]\n",
+        )?;
+        fs::write(ext_dep.join("Ext.lean"), "def extConst : Nat := 1\n")?;
+        fs::write(proj.join("lean-toolchain"), tc)?;
+        let root_lakefile = "import Lake\nopen Lake DSL\npackage app\nrequire dep from \".lake/packages/dep\"\ninput_file SpecCfg where\n  path := \"spec.txt\"\n  text := true\n@[default_target]\nlean_lib App where\n  roots := #[`App]\n  needs := #[SpecCfg]\n";
+        fs::write(proj.join("lakefile.lean"), root_lakefile)?;
         fs::write(proj.join("spec.txt"), "v1\n")?;
         fs::write(
             proj.join("lake-manifest.json"),
-            r#"{"version": "1.1.0", "packagesDir": ".lake/packages", "lakeDir": ".lake", "packages": [{"type": "path", "scope": "", "name": "dep", "manifestFile": "lake-manifest.json", "inherited": false, "dir": "../dep", "configFile": "lakefile.toml"}]}"#,
+            r#"{"version": "1.1.0", "packagesDir": ".lake/packages", "lakeDir": ".lake", "packages": [{"type": "path", "scope": "", "name": "dep", "manifestFile": "lake-manifest.json", "inherited": false, "dir": ".lake/packages/dep", "configFile": "lakefile.toml"}]}"#,
         )?;
         fs::write(
             proj.join("App.lean"),
-            "import Dep\ntheorem app_thm : depConst = depConst := rfl\n",
+            "import Dep\nimport Gen\ntheorem app_thm : depConst + genConst = depConst + genConst := rfl\n",
         )?;
         fs::write(proj.join(".gitignore"), ".lake/\nspec.txt\n")?;
         git_init_and_commit(&proj, "base")?;
@@ -16136,7 +16316,11 @@ end ParityNs
             .args(["build", "App"])
             .current_dir(&proj)
             .output()?;
-        anyhow::ensure!(b1.status.success(), "lake build App v1 failed");
+        anyhow::ensure!(
+            b1.status.success(),
+            "lake build App v1 failed: {}",
+            String::from_utf8_lossy(&b1.stderr)
+        );
 
         let warm_store = TurboStore::open(Some(&root.join("warm_store")))?;
         let changes1 =
@@ -16149,8 +16333,8 @@ end ParityNs
         let key1 = base_statement_cache_action_key(&proj, "HEAD", Path::new(""), None, &cfg1)
             .expect("base statement cache key v1");
 
-        // Mutate `spec.txt` (gitignored Lake `input_file` outside `HEAD^{tree}`) without touching
-        // `lakefile.toml`: `base_statement_cache_action_key` MUST rotate via `workspace_lake_inputs_digest`.
+        // 1. Mutate `spec.txt` (gitignored Lake `input_file` outside `HEAD^{tree}`) without touching
+        // `lakefile.lean`: `base_statement_cache_action_key` MUST rotate via `workspace_lake_inputs_digest`.
         fs::write(proj.join("spec.txt"), "v2\n")?;
         let cfg_inp = crate::module_builder::resolve_project_config(&proj)?;
         let key_inp = base_statement_cache_action_key(&proj, "HEAD", Path::new(""), None, &cfg_inp)
@@ -16160,15 +16344,41 @@ end ParityNs
             "Lake input_file content change must rotate base_statement_cache_action_key"
         );
 
-        // Mutate path dependency `target/Dep.lean` macro (`macro "dep_ty" : term => ...`) without touching
-        // `proj`'s `HEAD` commit or `lakefile.toml`, and verify warm-vs-cold agreement (including `srcDir = "target"`):
+        // 2. Uncommitted `lakefile.lean` drift from `base` must return `None` (fail-closed miss).
+        fs::write(
+            proj.join("lakefile.lean"),
+            format!("{root_lakefile}\n-- drift\n"),
+        )?;
+        let cfg_drift = crate::module_builder::resolve_project_config(&proj)?;
+        assert!(
+            base_statement_cache_action_key(&proj, "HEAD", Path::new(""), None, &cfg_drift)
+                .is_none(),
+            "live lakefile.lean drift relative to base commit must disable baseline statement cache"
+        );
+        fs::write(proj.join("lakefile.lean"), root_lakefile)?;
+
+        // 3. Sibling external path dependency (`../ext_dep`) must not panic/bail on `..` in
+        // `trusted_dep_snapshot_rel_path` and must return `None` from `base_statement_cache_action_key`.
+        let orig_manifest = fs::read_to_string(proj.join("lake-manifest.json"))?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{"version": "1.1.0", "packagesDir": ".lake/packages", "lakeDir": ".lake", "packages": [{"type": "path", "scope": "", "name": "ext_dep", "manifestFile": "lake-manifest.json", "inherited": false, "dir": "../ext_dep", "configFile": "lakefile.toml"}]}"#,
+        )?;
+        let cfg_ext = crate::module_builder::resolve_project_config(&proj)?;
+        assert!(
+            trusted_dep_snapshot_rel_path(&cfg_ext, &cfg_ext.dep_pkgs[0]).is_none(),
+            "external `../ext_dep` path dependency must never yield a `..` snapshot path"
+        );
+        fs::write(proj.join("lake-manifest.json"), &orig_manifest)?;
+
+        // 4. Mutate path dependency `target/Dep.lean` macro and overlapping `.lake/gen/Gen.lean`:
         fs::write(
             dep_dir.join("target/Dep.lean"),
             "macro \"dep_ty\" : term => `(Nat)\n",
         )?;
         fs::write(
             proj.join("App.lean"),
-            "import Dep\ntheorem app_thm : dep_ty := 0\n",
+            "import Dep\nimport Gen\ntheorem app_thm : dep_ty := genConst\n",
         )?;
         git_commit_all(&proj, "base_dep_macro")?;
         let b2 = Command::new("lake")
@@ -16183,7 +16393,25 @@ end ParityNs
         let key_v2 = base_statement_cache_action_key(&proj, "HEAD", Path::new(""), None, &cfg_v2)
             .expect("base statement cache key v2");
 
-        // First verify source-only edit under `dep/target/Dep.lean` BEFORE rebuilding artifacts rotates the key!
+        // Source-only edit inside overlapping `.lake/gen/Gen.lean` BEFORE artifact rebuild must rotate key!
+        fs::write(
+            dep_dir.join(".lake/gen/Gen.lean"),
+            "def genConst : Nat := 2\n",
+        )?;
+        let cfg_gen_src_only = crate::module_builder::resolve_project_config(&proj)?;
+        let key_gen_src_only =
+            base_statement_cache_action_key(&proj, "HEAD", Path::new(""), None, &cfg_gen_src_only)
+                .expect("base statement cache key after .lake/gen/Gen.lean source-only change");
+        assert_ne!(
+            key_gen_src_only, key_v2,
+            "dependency source edit inside `.lake/gen` must rotate base_statement_cache_action_key"
+        );
+        fs::write(
+            dep_dir.join(".lake/gen/Gen.lean"),
+            "def genConst : Nat := 1\n",
+        )?;
+
+        // Source-only edit under `dep/target/Dep.lean` BEFORE rebuilding artifacts must rotate key!
         fs::write(
             dep_dir.join("target/Dep.lean"),
             "macro \"dep_ty\" : term => `(Bool)\n",
@@ -16198,7 +16426,7 @@ end ParityNs
         );
         fs::write(
             proj.join("App.lean"),
-            "import Dep\ntheorem app_thm : Bool := false\n",
+            "import Dep\nimport Gen\ntheorem app_thm : Bool := false\n",
         )?;
         let b3 = Command::new("lake")
             .args(["build", "App"])
@@ -16215,20 +16443,17 @@ end ParityNs
 
         let cold_store = TurboStore::open(Some(&root.join("cold_store")))?;
         let warm_res =
-            kernel_statement_changes_with_trust(&warm_store, &proj, "HEAD", None, None, &[]);
+            kernel_statement_changes_with_trust(&warm_store, &proj, "HEAD", None, None, &[])?;
         let cold_res =
-            kernel_statement_changes_with_trust(&cold_store, &proj, "HEAD", None, None, &[]);
-        assert_eq!(
-            warm_res.is_ok(),
-            cold_res.is_ok(),
-            "warm and cold statement checks must agree on outcome after dependency-only mutation"
+            kernel_statement_changes_with_trust(&cold_store, &proj, "HEAD", None, None, &[])?;
+        assert!(
+            warm_res.is_empty(),
+            "stale Nat baseline cache entry must not be reused after dependency macro changed to Bool"
         );
-        if let (Ok(w), Ok(c)) = (warm_res, cold_res) {
-            assert_eq!(
-                w, c,
-                "warm and cold statement deltas must agree after dependency-only mutation"
-            );
-        }
+        assert_eq!(
+            warm_res, cold_res,
+            "warm and cold statement deltas must agree after dependency-only mutation"
+        );
 
         let _ = fs::remove_dir_all(&root);
         Ok(())
