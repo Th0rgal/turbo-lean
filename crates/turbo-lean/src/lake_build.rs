@@ -1958,7 +1958,7 @@ pub(crate) struct ShmProjectStatSummary {
 
 pub(crate) fn shm_file_splits_dir(store: &TurboStore) -> PathBuf {
     let dir = store.fast_staging_dir().join("file_splits_v8");
-    let _ = fs::create_dir_all(&dir);
+    let _ = crate::shm_cache::ensure_private_dir_all(&dir);
     dir
 }
 

@@ -2578,7 +2578,7 @@ fn ensure_closure_blob(blobs: &Path, hash: &str, src: &Path) -> Result<PathBuf, 
 
 /// Copy `src` to a new file `dst`: a reflink (`FICLONE`) when the filesystem supports it,
 /// otherwise a byte copy. Either way `dst` is an independent inode.
-fn copy_file_reflink(src: &Path, dst: &Path) -> std::io::Result<()> {
+pub(crate) fn copy_file_reflink(src: &Path, dst: &Path) -> std::io::Result<()> {
     let from = fs::File::open(src)?;
     let mut to = fs::OpenOptions::new()
         .write(true)
@@ -8903,7 +8903,7 @@ pub fn try_local_zygote_eval_with_args(
             &filtered_args,
         )?;
         let dir = store.fast_staging_dir().join("eval_shm_cache");
-        let _ = fs::create_dir_all(&dir);
+        let _ = crate::shm_cache::ensure_private_dir_all(&dir);
         let path = dir.join(filename);
         if let Some(cached_rep) = read_cached_eval_shm_reply(&path) {
             return Ok(Some(cached_rep));
@@ -9813,7 +9813,7 @@ mod tests {
         let filename =
             compute_eval_shm_cache_filename(&context, &file_name, Some(&cwd), source, &[])?;
         let cache_dir = store.fast_staging_dir().join("eval_shm_cache");
-        fs::create_dir_all(&cache_dir)?;
+        crate::shm_cache::ensure_private_dir_all(&cache_dir)?;
         let path = cache_dir.join(filename);
         let reply = ZygoteEvalReply {
             ok: true,
@@ -11999,7 +11999,7 @@ mod tests {
             "scanner namespace must change the #305 key"
         );
         let dir = store.fast_staging_dir().join("eval_shm_cache");
-        fs::create_dir_all(&dir).unwrap();
+        crate::shm_cache::ensure_private_dir_all(&dir).unwrap();
         // A pre-scanner (no `scanner_version`) false success, planted at the v3 and v4 keys
         // and, as a foreign/unversioned writer would, at the new key.
         let stale = br#"{"ok":true,"kernel_gate_active":false,"import_ok":true,"env_cache_hit":false,"prefix_cache_hit":false,"import_us":1,"prefix_us":0,"elab_us":1,"heartbeats":0,"proof_term_nodes":0,"rss_delta_mb":0,"peak_rss_mb":0,"subshards_verified":1,"stdout":"","messages":[],"errors":[],"used_constants":[],"timed_out":false,"crashed":false}"#;
@@ -12109,7 +12109,7 @@ mod tests {
         );
         assert_ne!(v4_name, new_name);
         let dir = store.fast_staging_dir().join("eval_shm_cache");
-        fs::create_dir_all(&dir).unwrap();
+        crate::shm_cache::ensure_private_dir_all(&dir).unwrap();
         // What a #306 host cached: scanner-vetted, ok, but never kernel-replayed.
         let stale = br#"{"ok":true,"kernel_gate_active":true,"import_ok":true,"env_cache_hit":false,"prefix_cache_hit":false,"import_us":1,"prefix_us":0,"elab_us":1,"heartbeats":0,"proof_term_nodes":0,"rss_delta_mb":0,"peak_rss_mb":0,"subshards_verified":2,"stdout":"","messages":[],"errors":[],"used_constants":["bad"],"timed_out":false,"crashed":false,"scanner_version":1}"#;
         for name in [&v4_name, &v5_name, &new_name] {

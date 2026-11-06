@@ -10844,7 +10844,9 @@ pub(crate) fn seed_verified_fresh_modules_into_disposable_snapshot(
 }
 
 /// Compile `dirty_mods` (already in topological wave order) into `overlay_root/{lib/lean,ir}`
-/// without mutating `.lake/build`, returning `overlay_lib_dir`.
+/// after seeding fresh non-dirty root-package artifacts so `overlay_lib_dir/<pkg>/` never shadows
+/// sibling `.lake/build` modules under Lean's package-root `findOLean` rule, without mutating
+/// `.lake/build`, returning `overlay_lib_dir`.
 pub(crate) fn compile_overlay_modules_direct(
     cfg: &ProjectConfig,
     dag: &ModuleDag,
@@ -10855,9 +10857,39 @@ pub(crate) fn compile_overlay_modules_direct(
     let overlay_ir_dir = overlay_root.join("ir");
     fs::create_dir_all(&overlay_lib_dir)?;
     fs::create_dir_all(&overlay_ir_dir)?;
+    let dirty_set: HashSet<&str> = dirty_mods.iter().map(String::as_str).collect();
+    let mut overlay_dag = dag.clone();
+    for (mod_name, orig_node) in &dag.nodes {
+        if dirty_set.contains(mod_name.as_str()) {
+            continue;
+        }
+        let rel_slash = module_name_to_rel_slash(mod_name);
+        let dst_olean = overlay_lib_dir.join(format!("{rel_slash}.olean"));
+        for (_, src_art) in olean_artifact_paths(&orig_node.olean_path) {
+            if src_art.is_file() {
+                let Some(file_name) = src_art.file_name() else {
+                    continue;
+                };
+                let dst_art = dst_olean
+                    .parent()
+                    .map(|p| p.join(file_name))
+                    .unwrap_or_else(|| overlay_lib_dir.join(file_name));
+                if let Some(parent) = dst_art.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if !dst_art.exists() {
+                    crate::zygote::copy_file_reflink(&src_art, &dst_art)?;
+                }
+            }
+        }
+        let mut seeded_node = orig_node.clone();
+        seeded_node.pkg_root = overlay_root.to_path_buf();
+        seeded_node.olean_path = dst_olean;
+        seeded_node.ilean_path = overlay_lib_dir.join(format!("{rel_slash}.ilean"));
+        overlay_dag.nodes.insert(mod_name.clone(), seeded_node);
+    }
     let (base_lp, ld_lp) = build_lean_search_path(cfg, true);
     let overlay_lp = format!("{}:{}", overlay_lib_dir.display(), base_lp);
-    let mut overlay_dag = dag.clone();
     for mod_name in dirty_mods {
         let orig_node = overlay_dag
             .nodes
@@ -13887,7 +13919,7 @@ pub(crate) fn compute_olean_artifact_set_digest_with_policy(
     Ok(res)
 }
 
-fn olean_artifact_paths(olean_path: &Path) -> [(&'static str, PathBuf); 6] {
+pub(crate) fn olean_artifact_paths(olean_path: &Path) -> [(&'static str, PathBuf); 6] {
     let suffixed = |p: &Path, sfx: &str| PathBuf::from(format!("{}{}", p.display(), sfx));
     let ir = olean_path.with_extension("ir");
     [
@@ -15304,7 +15336,7 @@ fn resolve_olean_import_closure_cached_with_stat_memo(
                     let path = if let Some(cached_p) = path_memo.get(&m) {
                         cached_p.clone()
                     } else {
-                        let resolved = resolve_olean_along_search_dirs(&dirs, &m).ok_or_else(
+                        let resolved = resolve_olean_along_search_dirs(dirs, &m).ok_or_else(
                             || {
                                 anyhow::anyhow!(
                                     "Unresolvable binary import `{}` required by `{}` along LEAN_PATH: fail-closed",

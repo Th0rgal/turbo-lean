@@ -6436,6 +6436,9 @@ impl Drop for StatementPolicyEnvGuard {
     }
 }
 
+#[cfg(test)]
+static HEAD_OVERLAY_HITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn certify_head_statement_modules_and_replay(
     store: &TurboStore,
     head_project: &Path,
@@ -6443,6 +6446,7 @@ fn certify_head_statement_modules_and_replay(
     policy: &StatementPolicy,
     is_untrusted: bool,
     overlay_lib_dir: Option<&Path>,
+    overlay_rebuilt_hint: Option<&std::collections::HashSet<String>>,
     pre_resolved_cfg: Option<&crate::module_builder::ProjectConfig>,
 ) -> Result<(
     Option<std::collections::HashSet<String>>,
@@ -6544,14 +6548,7 @@ fn certify_head_statement_modules_and_replay(
         if !seen.insert(m.clone()) {
             continue;
         }
-        let rel_olean = format!(
-            "{}.olean",
-            crate::module_builder::module_name_to_rel_slash(&m)
-        );
-        let path = dirs
-            .iter()
-            .map(|d| d.join(&rel_olean))
-            .find(|p| p.is_file())
+        let path = crate::module_builder::resolve_olean_along_search_dirs(&dirs, &m)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "Unresolvable binary import `{m}` required by head statement build along LEAN_PATH: fail-closed"
@@ -6729,7 +6726,10 @@ fn certify_head_statement_modules_and_replay(
                     .symlink_metadata()
                     .map(|md| md.file_type().is_symlink())
                     .unwrap_or(false);
-                if path.starts_with(ov) && !is_symlink {
+                let is_rebuilt = path.starts_with(ov)
+                    && !is_symlink
+                    && overlay_rebuilt_hint.is_none_or(|h| h.contains(m));
+                if is_rebuilt {
                     let Ok(rel) = path.strip_prefix(ov) else {
                         all_have_base = false;
                         break;
@@ -7765,6 +7765,8 @@ fn kernel_statement_changes_with_trust(
                 &ov_guard.path,
             )
             .ok()?;
+            let mut rebuilt_hint: std::collections::HashSet<String> =
+                dirty_mods.iter().cloned().collect();
             if !standalone.is_empty() {
                 let dirty_set: std::collections::HashSet<&str> =
                     dirty_mods.iter().map(String::as_str).collect();
@@ -7789,7 +7791,27 @@ fn kernel_statement_changes_with_trust(
                                 .unwrap_or(false)
                         });
                     if !fresh_unchanged {
+                        rebuilt_hint.insert(name.clone());
                         standalone_to_build.insert(name, (source, root));
+                    } else {
+                        let dst_olean = ov_lib.join(rel).with_extension("olean");
+                        for (_, src_art) in
+                            crate::module_builder::olean_artifact_paths(&existing_olean)
+                        {
+                            if src_art.is_file() {
+                                let file_name = src_art.file_name()?;
+                                let dst_art = dst_olean
+                                    .parent()
+                                    .map(|p| p.join(file_name))
+                                    .unwrap_or_else(|| ov_lib.join(file_name));
+                                if let Some(parent) = dst_art.parent() {
+                                    fs::create_dir_all(parent).ok()?;
+                                }
+                                if !dst_art.exists() {
+                                    crate::zygote::copy_file_reflink(&src_art, &dst_art).ok()?;
+                                }
+                            }
+                        }
                     }
                 }
                 if !standalone_to_build.is_empty() {
@@ -7841,6 +7863,7 @@ fn kernel_statement_changes_with_trust(
                 &policy,
                 false,
                 Some(&ov_lib),
+                Some(&rebuilt_hint),
                 Some(cfg),
             )
             .ok()?;
@@ -7891,6 +7914,8 @@ fn kernel_statement_changes_with_trust(
             Some((ov_guard, rep))
         };
     let after: KernelStatementReport = if let Some((_ov_guard, rep)) = try_head_overlay() {
+        #[cfg(test)]
+        HEAD_OVERLAY_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         rep
     } else {
         let head_project = if head_snapshot.is_none() {
@@ -7917,6 +7942,7 @@ fn kernel_statement_changes_with_trust(
             statement_scope,
             &policy,
             is_untrusted,
+            None,
             None,
             snapshot_cfg,
         )?;
@@ -15750,6 +15776,7 @@ end ParityNs
         )?;
         let before_lake = snapshot(&tree.project)?;
         let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+        let hits0 = HEAD_OVERLAY_HITS.load(std::sync::atomic::Ordering::SeqCst);
         run_pr_verify_command(
             &mut store,
             true,
@@ -15765,6 +15792,11 @@ end ParityNs
             0,
             None,
         )?;
+        assert_eq!(
+            HEAD_OVERLAY_HITS.load(std::sync::atomic::Ordering::SeqCst),
+            hits0 + 1,
+            "first proof-only edit on multi-module package must succeed via try_head_overlay without falling back to make_head_snapshot"
+        );
         // `.lake` must remain completely untouched (including zero `.turbo_publish.lock` creation).
         assert_eq!(snapshot(&tree.project)?, before_lake);
         // Base replay authority must now be persisted so `resolve_replayed_proof_only_module_import` resolves `P.Target` ONLY for the base source (not mismatched source).
@@ -15810,6 +15842,11 @@ end ParityNs
             0,
             None,
         )?;
+        assert_eq!(
+            HEAD_OVERLAY_HITS.load(std::sync::atomic::Ordering::SeqCst),
+            hits0 + 2,
+            "second warm proof-only edit must also succeed via try_head_overlay"
+        );
         assert_eq!(snapshot(&tree.project)?, before_lake);
         Ok(())
     }
@@ -15842,6 +15879,7 @@ end ParityNs
         )?;
         let before_lake = snapshot(&tree.project)?;
         let mut store = TurboStore::open(Some(&tree.root.join("cache")))?;
+        let hits0 = HEAD_OVERLAY_HITS.load(std::sync::atomic::Ordering::SeqCst);
         run_pr_verify_command(
             &mut store,
             true,
@@ -15857,6 +15895,11 @@ end ParityNs
             0,
             None,
         )?;
+        assert_eq!(
+            HEAD_OVERLAY_HITS.load(std::sync::atomic::Ordering::SeqCst),
+            hits0 + 1,
+            "sorry-removal proof edit must succeed via try_head_overlay without falling back to make_head_snapshot"
+        );
         assert_eq!(
             snapshot(&tree.project)?,
             before_lake,
@@ -16179,6 +16222,7 @@ end ParityNs
             false,
             None,
             None,
+            None,
         )?;
         let cert_snap = cert_snap_opt.expect("certified head closure snapshot");
         let cfg = crate::module_builder::resolve_project_config_with_trust(&tree.project, false)?;
@@ -16242,6 +16286,7 @@ end ParityNs
             &policy,
             false,
             Some(&ov_dir),
+            None,
             Some(&cfg),
         )?;
         assert_eq!(
@@ -16338,8 +16383,8 @@ end ParityNs
         let key1 = base_statement_cache_action_key(&proj, "HEAD", Path::new(""), None, &cfg1)
             .expect("base statement cache key v1");
 
-        // 1. Mutate `spec.txt` (gitignored Lake `input_file` outside `HEAD^{tree}`) without touching
-        // `lakefile.lean`: `base_statement_cache_action_key` MUST rotate via `workspace_lake_inputs_digest`.
+        // 1. Mutate `spec.txt` (Lake `input_file` tracked at `v1` in `HEAD`, modified in working tree)
+        // without touching `lakefile.lean`: `base_statement_cache_action_key` MUST rotate via `workspace_lake_inputs_digest`.
         fs::write(proj.join("spec.txt"), "v2\n")?;
         let cfg_inp = crate::module_builder::resolve_project_config(&proj)?;
         let key_inp = base_statement_cache_action_key(&proj, "HEAD", Path::new(""), None, &cfg_inp)

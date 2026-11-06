@@ -591,9 +591,6 @@ pub fn discover_cluster_nodes(force_refresh: bool) -> Vec<ComputeNode> {
         env_fingerprint: env_fp,
         nodes: nodes.clone(),
     };
-    if let Some(parent) = cache_path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
     if let Ok(bytes) = serde_json::to_vec(&snapshot) {
         let _ = crate::shm_cache::atomic_write_shm(&cache_path, &bytes);
     }
