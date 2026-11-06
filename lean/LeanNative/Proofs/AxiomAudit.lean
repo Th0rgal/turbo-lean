@@ -376,12 +376,60 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Backend.MetalAst.parseMSLExprArgs_cons_step
   , ``LeanNative.Backend.MetalAst.parseMSLExprArgs_three_step
   , ``LeanNative.Backend.MetalAst.parseMSLExpr_builtin_step
+  , ``LeanNative.Backend.MetalAst.takeWhile_mslName_append
+  , ``LeanNative.Backend.MetalAst.ppMSLExpr_not_cast_type
+  , ``LeanNative.Backend.MetalAst.parseMSLExpr_paren_step
+  , ``LeanNative.Backend.MetalAst.parseMSLExpr_roundtrip
+  , ``LeanNative.Backend.MetalAst.ppMSLExpr_injective_on_canonical
+  , ``LeanNative.Backend.MetalAst.scanMSLToken_of_not_mem
+  , ``LeanNative.Backend.MetalAst.canonicalMSLName_no_space
+  , ``LeanNative.Backend.MetalAst.parseMSLParamDeclChars_roundtrip
+  , ``LeanNative.Backend.MetalAst.canonicalMSLType_no_openBracket
+  , ``LeanNative.Backend.MetalAst.parseMSLParam_roundtrip
+  , ``LeanNative.Backend.MetalAst.ppMSLParam_injective_on_canonical
+  , ``LeanNative.Backend.MetalAst.parseMSLStmt_returnVal_step
+  , ``LeanNative.Backend.MetalAst.parseMSLStmt_barrier_step
+  , ``LeanNative.Backend.MetalAst.parseMSLStmt_return_step
+  , ``LeanNative.Backend.MetalAst.parseMSLStmt_ifElse_step
+  , ``LeanNative.Backend.MetalAst.parseMSLStmt_ifThen_step
+  , ``LeanNative.Backend.MetalAst.parseMSLSimpleStmt_assign_step
+  , ``LeanNative.Backend.MetalAst.parseMSLStmt_assign_step
+  , ``LeanNative.Backend.MetalAst.parseMSLSimpleStmt_indexAssign_step
+  , ``LeanNative.Backend.MetalAst.parseMSLStmt_indexAssign_step
+  , ``LeanNative.Backend.MetalAst.parseMSLStmt_varDecl_step
+  , ``LeanNative.Backend.MetalAst.parseMSLBlock_nil_step
+  , ``LeanNative.Backend.MetalAst.parseMSLBlock_singleton_step
+  , ``LeanNative.Backend.MetalAst.parseMSLBlock_cons_step
+  , ``LeanNative.Backend.MetalAst.stripPrefixChars_keyword_none
+  , ``LeanNative.Backend.MetalAst.ppMSLStmt_indent_prefix
+  , ``LeanNative.Backend.MetalAst.ppMSLStmt_strip_indent
+  , ``LeanNative.Backend.MetalAst.ppMSLBlock_nil
+  , ``LeanNative.Backend.MetalAst.ppMSLBlock_singleton
+  , ``LeanNative.Backend.MetalAst.ppMSLBlock_cons
+  , ``LeanNative.Backend.MetalAst.stripPrefixChars_append_cancel
+  , ``LeanNative.Backend.MetalAst.stripPrefixChars_indent_close
+  , ``LeanNative.Backend.MetalAst.stripPrefixChars_indent_newline
+  , ``LeanNative.Backend.MetalAst.indent_append_nonempty
+  , ``LeanNative.Backend.MetalAst.ppMSLBlock_strip_indent
+  , ``LeanNative.Backend.MetalAst.parseMSLStmt_roundtrip
+  , ``LeanNative.Backend.MetalAst.parseMSLBlock_roundtrip
+  , ``LeanNative.Backend.MetalAst.ppMSLStmt_injective_on_canonical
+  , ``LeanNative.Backend.MetalAst.ppMSLBlock_injective_on_canonical
+  , ``LeanNative.Backend.MetalAst.canonicalMSLParam_no_newline_comma
+  , ``LeanNative.Backend.MetalAst.ppMSLParam_nonempty
+  , ``LeanNative.Backend.MetalAst.parseMSLParams_roundtrip
+  , ``LeanNative.Backend.MetalAst.canonicalMSLBlock_ofList
+  , ``LeanNative.Backend.MetalAst.ppMSLBlockLines_ofList
+  , ``LeanNative.Backend.MetalAst.mslBlock_toList_ofList
+  , ``LeanNative.Backend.MetalAst.parseMSLKernel_roundtrip
+  , ``LeanNative.Backend.MetalAst.ppMSLKernel_injective_on_canonical
   , ``LeanNative.Proofs.MetalLowerProofs.canonicalBlock_ofList
   , ``LeanNative.Proofs.MetalLowerProofs.bufParam_type_canonical
   , ``LeanNative.Proofs.MetalLowerProofs.guarded_canonical
   , ``LeanNative.Proofs.MetalLowerProofs.storeOut_canonical
   , ``LeanNative.Proofs.MetalLowerProofs.kernelOf_canonical
   , ``LeanNative.Proofs.MetalLowerProofs.lowerKind_canonical
+  , ``LeanNative.Proofs.MetalLowerProofs.lowerKind_roundtrip
   , ``LeanNative.Backend.PTXAst.parsePTXOperand_specialReg_roundtrip
   , ``LeanNative.Backend.PTXAst.ppPTXType_injective_via_parser
   , ``LeanNative.Backend.StableHLOAst.parseElemType_roundtrip
@@ -591,7 +639,7 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.ablateSitesLeaveOneOut_sound
   ]
 
-#guard auditedTheoremNames.length == 633
+#guard auditedTheoremNames.length == 681
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/

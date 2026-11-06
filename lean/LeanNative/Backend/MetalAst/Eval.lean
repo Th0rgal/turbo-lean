@@ -2448,6 +2448,22 @@ def CanonicalMSLExpr : MSLExpr → Prop
   | .index name idx => CanonicalMSLName name ∧ CanonicalMSLExpr idx
   | _ => False
 
+/-- Conservative parser budget, including token scanning and builtin argument descent. -/
+def mslExprFuel : MSLExpr → Nat
+  | .var name => name.toList.length + 4
+  | .immU64 n => n.toNat.repr.toList.length + 4
+  | .immBool _ => 8
+  | .bitNot a | .logNot a | .neg a | .cast _ a => mslExprFuel a + 4
+  | .clz a => mslExprFuel a + 11
+  | .index name a => name.toList.length + mslExprFuel a + 4
+  | .add a b | .sub a b | .mul a b | .div a b | .rem a b
+  | .bitAnd a b | .bitOr a b | .bitXor a b | .shl a b | .shr a b
+  | .logAnd a b | .logOr a b | .eq a b | .ne a b | .lt a b | .le a b
+  | .gt a b | .ge a b => mslExprFuel a + mslExprFuel b + 4
+  | .select a b c | .builtinSelect a b c | .fma a b c =>
+    mslExprFuel a + mslExprFuel b + mslExprFuel c + 11
+  | _ => 4
+
 mutual
 /-- Parse the fully parenthesized scalar MSL grammar. Every recursive descent consumes fuel. -/
 def parseMSLExpr : Nat → List Char → Option (MSLExpr × List Char)
@@ -2652,6 +2668,26 @@ def CanonicalMSLKernel (kernel : MSLKernelDecl) : Prop :=
   (∀ param ∈ kernel.params, CanonicalMSLType param.ty ∧ CanonicalMSLName param.name) ∧
   kernel.sharedDecls = [] ∧ ∀ stmt ∈ kernel.body, CanonicalMSLStmt stmt
 
+/-- Exact block text shared by statement and kernel roundtrip specifications. -/
+def ppMSLBlock (indent : String) (body : MSLBlock) : String :=
+  String.intercalate "\n" (ppMSLBlockLines indent body)
+
+mutual
+def mslStmtFuel : MSLStmt → Nat
+  | .varDecl ty name rhs => (ppMSLType ty).toList.length + name.toList.length + mslExprFuel rhs + 4
+  | .assign name rhs => name.toList.length + mslExprFuel rhs + 4
+  | .indexAssign name idx rhs => name.toList.length + mslExprFuel idx + mslExprFuel rhs + 4
+  | .returnVal e => mslExprFuel e + 4
+  | .ifElse cond yes no => mslExprFuel cond + mslBlockFuel yes + mslBlockFuel no + 4
+  | _ => 4
+def mslBlockFuel : MSLBlock → Nat
+  | .nil => 1
+  | .cons stmt rest => mslStmtFuel stmt + mslBlockFuel rest + 2
+end
+
+def mslKernelFuel (k : MSLKernelDecl) : Nat :=
+  k.name.toList.length + k.params.length + mslBlockFuel (MSLBlock.ofList k.body) + 4
+
 /-- Split a delimiter-terminated token without consuming the delimiter. -/
 def scanMSLToken (delimiter : Char) : List Char → List Char × List Char
   | [] => ([], [])
@@ -2664,31 +2700,51 @@ def parseMSLType (input : List Char) : Option (MSLType × List Char) := do
   let (token, rest) := scanMSLToken ')' input
   return (← parseMSLParamType (String.ofList token), rest)
 
+/-- Read a parameter declaration from its rightmost space, preserving spaces in ABI types. -/
+def parseMSLParamDeclChars (input : List Char) (attr : Option MSLAttr) : Option MSLParamDecl := do
+  let (revName, rest) := scanMSLToken ' ' input.reverse
+  let ' ' :: revType := rest | none
+  if revName.isEmpty || !(revName.all mslNameChar) then none else do
+    let ty ← parseMSLParamType (String.ofList revType.reverse)
+    return { name := String.ofList revName.reverse, ty, attr }
+
+/-- Exact printer grammar, with optional attribute indentation and no whitespace normalization. -/
 def parseMSLParam (fuel : Nat) (text : String) : Option MSLParamDecl := do
-  let (decl, attr) ← match text.splitOn " [[" with
-    | [decl] => some (decl, none)
-    | [decl, attr] => do
-      let ']' :: ']' :: rev := attr.toList.reverse | none
-      pure (decl, some (← parseMSLAttr fuel rev.reverse))
-    | _ => none
-  let words := decl.trimAscii.toString.splitOn " "
-  let name ← words.getLast?
-  if name.isEmpty || !(name.toList.all mslNameChar) then none else do
-    let ty ← parseMSLParamType (String.intercalate " " words.dropLast)
-    return { name, ty, attr }
+  let (decl, rest) := scanMSLToken '[' text.toList
+  match rest with
+  | [] => parseMSLParamDeclChars decl none
+  | '[' :: '[' :: attr =>
+    let ']' :: ']' :: revAttr := attr.reverse | none
+    let decl ← stripPrefixChars "    ".toList decl
+    let ' ' :: revDecl := decl.reverse | none
+    parseMSLParamDeclChars revDecl.reverse (some (← parseMSLAttr fuel revAttr.reverse))
+  | _ => none
+
+/-- Parameter lines terminate at the exact kernel-header delimiter. -/
+def parseMSLParams : Nat → List Char → Option (List MSLParamDecl × List Char)
+  | 0, _ => none
+  | fuel + 1, input => do
+    let (line, rest) := scanMSLToken '\n' input
+    if line.isEmpty then return ([], ← stripPrefixChars "\n) {\n".toList rest)
+    match line.reverse with
+    | ',' :: rev =>
+      let p ← parseMSLParam (fuel + 1) (String.ofList rev.reverse)
+      let '\n' :: rest := rest | none
+      let (ps, rest) ← parseMSLParams fuel rest
+      return (p :: ps, rest)
+    | _ =>
+      let p ← parseMSLParam (fuel + 1) (String.ofList line)
+      let rest ← stripPrefixChars "\n) {\n".toList rest
+      return ([p], rest)
 
 /-- Scalar kernel parser. Shared arrays and unsupported statement constructors fail closed. -/
 def parseMSLKernel (fuel : Nat) (text : String) : Option MSLKernelDecl := do
-  let header :: lines := text.splitOn "\n" | none
-  let chars ← stripPrefixChars "kernel void ".toList header.toList
+  let chars ← stripPrefixChars "kernel void ".toList text.toList
   let (name, rest) ← scanMSLName fuel chars
-  if rest != ['('] || name.isEmpty then none else do
-    let paramLines := lines.takeWhile (· != ") {")
-    let ") {" :: lines := lines.drop paramLines.length | none
-    let params ← (if paramLines == [""] then some [] else paramLines.mapM fun line => do
-      let chars := if line.endsWith "," then line.toList.take (line.length - 1) else line.toList
-      parseMSLParam fuel (String.ofList chars))
-    let (body, rest) ← parseMSLBlock fuel "    " (String.intercalate "\n" lines).toList
+  if name.isEmpty then none else do
+    let rest ← stripPrefixChars "(\n".toList rest
+    let (params, rest) ← parseMSLParams fuel rest
+    let (body, rest) ← parseMSLBlock fuel "    " rest
     if rest != "\n}".toList then none
     else return { name := String.ofList name, params, body := body.toList }
 

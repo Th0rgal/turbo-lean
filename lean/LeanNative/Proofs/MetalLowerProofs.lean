@@ -110,6 +110,15 @@ theorem lowerKind_canonical (name : String) (kind : ParallelKernelKind)
     · exact ⟨trivial, hv _, he i⟩
     · exact storeOut_canonical _ (lowerScalar_canonical _ _ _ hg64 hv)
 
+theorem lowerKind_roundtrip (name : String) (kind : ParallelKernelKind)
+    (hn : MetalAst.CanonicalMSLName name)
+    (hi : ∀ i : Nat, MetalAst.CanonicalMSLName s!"in{i}")
+    (hv : ∀ i : Nat, MetalAst.CanonicalMSLName s!"v{i}")
+    (fuel : Nat) (hf : MetalAst.mslKernelFuel (lowerKind name kind) ≤ fuel) :
+    MetalAst.parseMSLKernel fuel (MetalAst.ppMSLKernel (lowerKind name kind)) =
+      some (lowerKind name kind) :=
+  MetalAst.parseMSLKernel_roundtrip _ (lowerKind_canonical name kind hn hi hv) fuel hf
+
 theorem lowerScalar_inferExprType (g : MetalAst.MSLGroupState) (ls : MetalAst.MSLLocals)
     (idxName : String) (idxVar : Nat) (boundVars : List Nat) (e : ScalarExpr) (s : Bool)
     (hsort : inferScalarSort boundVars e = some s)
