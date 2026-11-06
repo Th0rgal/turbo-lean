@@ -80,6 +80,13 @@ fn checked(command: &mut Command) -> Output {
     out
 }
 
+fn host_git_bin() -> PathBuf {
+    std::env::var_os("TURBO_LEAN_GIT")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute() && p.is_file())
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/git"))
+}
+
 fn sandbox_available() -> bool {
     Command::new("/usr/bin/bwrap")
         .args([
@@ -178,6 +185,7 @@ fn project_toolchain_names_cannot_substitute_verifiers_or_prewarm_helpers() {
         fs::remove_file(f.0.join("shim-invoked")).unwrap();
     }
     let repo_exec = f.0.join(".lake/build/bin/repo-exec");
+    let host_git = host_git_bin();
     for key in [
         "core.fsmonitor",
         "core.hooksPath",
@@ -186,14 +194,14 @@ fn project_toolchain_names_cannot_substitute_verifiers_or_prewarm_helpers() {
         "filter.attack.process",
     ] {
         checked(
-            Command::new("/usr/bin/git")
+            Command::new(&host_git)
                 .current_dir(&f.0)
                 .args(["config", key])
                 .arg(&repo_exec),
         );
     }
     checked(
-        Command::new("/usr/bin/git")
+        Command::new(&host_git)
             .current_dir(&f.0)
             .args(["status", "--porcelain"]),
     );
@@ -381,17 +389,14 @@ fn conditional_worktree_filters_cannot_run_during_pr_verification() {
     fs::write(f.0.join(".gitignore"), ".lake/\ncache/\ncache-staging/\n").unwrap();
     fs::write(f.0.join(".gitattributes"), "*.lean filter=attack\n").unwrap();
     fs::write(f.0.join("Demo.lean"), "theorem pinned : 1 + 1 = 2 := rfl\n").unwrap();
+    let host_git = host_git_bin();
     checked(
-        Command::new("/usr/bin/git")
+        Command::new(&host_git)
             .current_dir(&f.0)
             .args(["init", "-q"]),
     );
-    checked(
-        Command::new("/usr/bin/git")
-            .current_dir(&f.0)
-            .args(["add", "."]),
-    );
-    checked(Command::new("/usr/bin/git").current_dir(&f.0).args([
+    checked(Command::new(&host_git).current_dir(&f.0).args(["add", "."]));
+    checked(Command::new(&host_git).current_dir(&f.0).args([
         "-c",
         "user.name=Test",
         "-c",
@@ -413,7 +418,7 @@ fn conditional_worktree_filters_cannot_run_during_pr_verification() {
         ),
     ] {
         checked(
-            Command::new("/usr/bin/git")
+            Command::new(&host_git)
                 .args(["config", "--file"])
                 .arg(&config)
                 .arg(format!("filter.attack.{key}"))
@@ -421,12 +426,12 @@ fn conditional_worktree_filters_cannot_run_during_pr_verification() {
         );
     }
     checked(
-        Command::new("/usr/bin/git")
+        Command::new(&host_git)
             .current_dir(&f.0)
             .args(["config", "includeIf.gitdir:**/worktrees/**.path"])
             .arg(&config),
     );
-    let invisible = Command::new("/usr/bin/git")
+    let invisible = Command::new(&host_git)
         .current_dir(&f.0)
         .args(["config", "--get", "filter.attack.process"])
         .output()
@@ -438,7 +443,7 @@ fn conditional_worktree_filters_cannot_run_during_pr_verification() {
     );
     // Positive control: ordinary checkout executes the conditional filter.
     let control = f.0.join("control");
-    let checkout = Command::new("/usr/bin/git")
+    let checkout = Command::new(&host_git)
         .current_dir(&f.0)
         .args(["worktree", "add", "--detach"])
         .arg(&control)
@@ -451,7 +456,7 @@ fn conditional_worktree_filters_cannot_run_during_pr_verification() {
     );
     if checkout.status.success() {
         checked(
-            Command::new("/usr/bin/git")
+            Command::new(&host_git)
                 .current_dir(&f.0)
                 .args(["worktree", "remove", "--force"])
                 .arg(&control),
@@ -460,7 +465,7 @@ fn conditional_worktree_filters_cannot_run_during_pr_verification() {
         // A process filter that exits during the handshake can abort checkout;
         // Git removes the failed worktree registration itself.
         checked(
-            Command::new("/usr/bin/git")
+            Command::new(&host_git)
                 .current_dir(&f.0)
                 .args(["worktree", "prune"]),
         );
@@ -535,8 +540,9 @@ fn missing_promised_base_blob_fails_closed_without_running_repository_helpers() 
     )));
     fs::create_dir_all(&f.0).unwrap();
     let marker = f.0.join("shim-invoked");
+    let host_git = host_git_bin();
     let plain = |args: &[&str]| {
-        Command::new("/usr/bin/git")
+        Command::new(&host_git)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", &f.0)
@@ -636,8 +642,9 @@ fn submodule_only_filters_never_run_during_pr_verification() {
         let marker = f.0.join("shim-invoked");
         fs::create_dir_all(&sub).unwrap();
         fs::create_dir_all(&proj).unwrap();
+        let host_git = host_git_bin();
         let plain = |dir: &Path, args: &[&str]| {
-            Command::new("/usr/bin/git")
+            Command::new(&host_git)
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin")
                 .env("HOME", &f.0)

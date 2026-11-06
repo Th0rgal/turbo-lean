@@ -778,6 +778,10 @@ fn run(cli: Cli) -> Result<()> {
             splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV,
             "TURBO_LEAN_ALLOWED_CSIMP",
             "TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG",
+            "TURBO_LEAN_ALLOWED_UNSAFE",
+            "TURBO_LEAN_ALLOWED_UNSAFE_FROM_CONFIG",
+            "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY",
+            "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY_FROM_CONFIG",
         ] {
             std::env::remove_var(key);
         }
@@ -791,9 +795,21 @@ fn run(cli: Cli) -> Result<()> {
         std::env::var(splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV).as_deref() == Ok("1");
     let csimp_from_config =
         std::env::var("TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG").as_deref() == Ok("1");
+    let unsafe_from_config =
+        std::env::var("TURBO_LEAN_ALLOWED_UNSAFE_FROM_CONFIG").as_deref() == Ok("1");
+    let impl_by_from_config =
+        std::env::var("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY_FROM_CONFIG").as_deref() == Ok("1");
     if csimp_from_config && dir.is_none() {
         std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP");
         std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG");
+    }
+    if unsafe_from_config && dir.is_none() {
+        std::env::remove_var("TURBO_LEAN_ALLOWED_UNSAFE");
+        std::env::remove_var("TURBO_LEAN_ALLOWED_UNSAFE_FROM_CONFIG");
+    }
+    if impl_by_from_config && dir.is_none() {
+        std::env::remove_var("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY");
+        std::env::remove_var("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY_FROM_CONFIG");
     }
     if kernel_from_config && dir.is_none() {
         std::env::remove_var(kernel::KERNEL_ENGINE_ENV);
@@ -828,6 +844,28 @@ fn run(cli: Cli) -> Result<()> {
             );
             std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG", "1");
         }
+        if rev.is_some()
+            || std::env::var_os("TURBO_LEAN_ALLOWED_UNSAFE").is_none()
+            || unsafe_from_config
+        {
+            let allow = accelerators::toml_string_array(&config, "unsafe", "allow");
+            std::env::set_var(
+                "TURBO_LEAN_ALLOWED_UNSAFE",
+                allow.unwrap_or_default().join(","),
+            );
+            std::env::set_var("TURBO_LEAN_ALLOWED_UNSAFE_FROM_CONFIG", "1");
+        }
+        if rev.is_some()
+            || std::env::var_os("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY").is_none()
+            || impl_by_from_config
+        {
+            let allow = accelerators::toml_string_array(&config, "implemented_by", "allow");
+            std::env::set_var(
+                "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY",
+                allow.unwrap_or_default().join(","),
+            );
+            std::env::set_var("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY_FROM_CONFIG", "1");
+        }
         if rev.is_some() || std::env::var_os(splitter::ALLOWED_AXIOMS_ENV).is_none() || from_cfg_env
         {
             let allow = accelerators::toml_string_array(&config, "axioms", "allow");
@@ -856,6 +894,14 @@ fn run(cli: Cli) -> Result<()> {
             if let Some(secs) = accelerators::toml_value(&config, "zygote", "idle_ttl_secs") {
                 let secs: u64 = secs.parse()?;
                 std::env::set_var("TURBO_LEAN_DAEMON_IDLE_SECS", secs.to_string());
+            }
+        }
+        if std::env::var_os("TURBO_LEAN_MODULE_TIMEOUT_SECS").is_none() {
+            if let Some(secs) = accelerators::toml_value(&config, "build", "module_timeout_secs") {
+                let secs: u64 = secs.parse()?;
+                if secs > 0 {
+                    std::env::set_var("TURBO_LEAN_MODULE_TIMEOUT_SECS", secs.to_string());
+                }
             }
         }
     }

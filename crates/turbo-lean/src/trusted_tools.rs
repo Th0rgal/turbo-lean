@@ -269,6 +269,21 @@ fn sq_quote(s: &str) -> String {
 /// contents are never inspected, so a dirty-state or source answer would be incomplete.
 /// Neither `ls-files -s` nor `ls-tree` enters a submodule.
 pub(crate) fn reject_gitlinks(repo: &Path, revs: &[&str], pathspec: &Path) -> Result<()> {
+    reject_gitlinks_filtered(repo, revs, pathspec, |_| true)
+}
+
+/// Like `reject_gitlinks`, but invokes `touches_lean` with the repository-relative path of each
+/// `160000` gitlink entry and only rejects gitlinks for which `touches_lean` returns `true`.
+pub(crate) fn reject_gitlinks_filtered<F>(
+    repo: &Path,
+    revs: &[&str],
+    pathspec: &Path,
+    mut touches_lean: F,
+) -> Result<()>
+where
+    F: FnMut(&Path) -> bool,
+{
+    use std::os::unix::ffi::OsStrExt;
     let mut lists = vec![git(repo)?
         .arg("-C")
         .arg(repo)
@@ -292,17 +307,20 @@ pub(crate) fn reject_gitlinks(repo: &Path, revs: &[&str], pathspec: &Path) -> Re
             "Cannot list Git entries: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         );
-        if let Some(link) = out
+        for link in out
             .stdout
             .split(|b| *b == 0)
-            .find(|e| e.starts_with(b"160000 "))
+            .filter(|e| e.starts_with(b"160000 "))
         {
             let path = link.splitn(2, |b| *b == b'\t').nth(1).unwrap_or_default();
-            anyhow::bail!(
-                "Submodule gitlinks are not supported on verification paths (their contents \
-                 and config are never inspected): {}",
-                String::from_utf8_lossy(path)
-            );
+            let rel = Path::new(std::ffi::OsStr::from_bytes(path));
+            if touches_lean(rel) {
+                anyhow::bail!(
+                    "Submodule gitlinks are not supported on verification paths (their contents \
+                     and config are never inspected): {}",
+                    String::from_utf8_lossy(path)
+                );
+            }
         }
     }
     Ok(())

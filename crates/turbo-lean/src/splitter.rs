@@ -55,6 +55,8 @@ pub struct HygieneReport {
     pub has_impure_metaprograms: bool,
     #[serde(default)]
     pub has_checking_weakening: bool,
+    #[serde(default)]
+    pub has_checking_weakening_option: bool,
     pub flagged_items: Vec<String>,
 }
 
@@ -99,7 +101,7 @@ pub fn allowed_axioms() -> Vec<String> {
 }
 
 /// `*`-glob match (`*` matches any, possibly empty, run of characters); same as the zygote's `globMatch`.
-fn glob_match(pat: &str, s: &str) -> bool {
+pub(crate) fn glob_match(pat: &str, s: &str) -> bool {
     match pat.split_once('*') {
         None => pat == s,
         Some((head, rest)) => {
@@ -199,6 +201,94 @@ fn item_allowed(item: &str, allowed: &[String], allow_interactive_sorry: bool) -
 
 pub fn native_decide_allowed() -> bool {
     item_allowed("native_decide/ofReduceBool", &allowed_axioms(), false)
+}
+
+pub(crate) fn has_nonempty_policy_env(key: &str) -> bool {
+    std::env::var(key).is_ok_and(|v| v.split(',').any(|p| !p.trim().is_empty()))
+}
+
+pub(crate) fn normalized_policy_env_vec(key: &str) -> Vec<String> {
+    let mut out: Vec<String> = std::env::var(key)
+        .ok()
+        .into_iter()
+        .flat_map(|v| {
+            v.split(',')
+                .map(|p| p.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+pub(crate) fn current_kernel_policy_digest() -> String {
+    let mut axioms = extra_allowed_axiom_patterns();
+    axioms.retain(|a| !STANDARD_AXIOMS.contains(&a.as_str()));
+    axioms.sort();
+    axioms.dedup();
+    let csimp = normalized_policy_env_vec("TURBO_LEAN_ALLOWED_CSIMP");
+    let unsafe_decls = normalized_policy_env_vec("TURBO_LEAN_ALLOWED_UNSAFE");
+    let impl_by = normalized_policy_env_vec("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY");
+    if axioms.is_empty() && csimp.is_empty() && unsafe_decls.is_empty() && impl_by.is_empty() {
+        return String::new();
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"turbo-lean-kernel-policy-v1\n");
+    for (tag, list) in [
+        ("axioms", &axioms),
+        ("csimp", &csimp),
+        ("unsafe", &unsafe_decls),
+        ("implemented_by", &impl_by),
+    ] {
+        h.update(tag.as_bytes());
+        h.update(b":");
+        for item in list {
+            h.update(&(item.len() as u64).to_le_bytes());
+            h.update(item.as_bytes());
+        }
+        h.update(b"\n");
+    }
+    h.finalize().to_hex().to_string()
+}
+
+impl HygieneReport {
+    /// Whether `allowed` contains any custom axiom patterns beyond the standard three
+    /// (`propext`, `Quot.sound`, `Classical.choice`) and `native_decide`/`bv_decide` probes.
+    pub(crate) fn has_custom_axiom_policy_under(allowed: &[String]) -> bool {
+        allowed.iter().any(|pat| {
+            let p = pat.trim();
+            !p.is_empty()
+                && !STANDARD_AXIOMS.contains(&p)
+                && p != "Lean.ofReduceBool"
+                && !p.ends_with("._native.native_decide.ax_*")
+                && !p.ends_with("._native.bv_decide.ax_*")
+        })
+    }
+
+    pub(crate) fn has_custom_axiom_policy() -> bool {
+        Self::has_custom_axiom_policy_under(&allowed_axioms())
+    }
+
+    /// Whether every hygiene item that blocks certification can be decided by the compiled `.olean`
+    /// kernel gate (`ZygoteWorker` `--audit-modules`) under active `[axioms]`, `[csimp]`, `[unsafe]`,
+    /// and `[implemented_by]` policies rather than requiring immediate source-level rejection.
+    pub(crate) fn is_clean_or_deferred_to_kernel_gate(&self) -> bool {
+        let allow_axioms = Self::has_custom_axiom_policy();
+        let allow_csimp = has_nonempty_policy_env("TURBO_LEAN_ALLOWED_CSIMP");
+        let allow_unsafe = has_nonempty_policy_env("TURBO_LEAN_ALLOWED_UNSAFE");
+        let allow_impl_by = has_nonempty_policy_env("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY");
+        self.disallowed_items()
+            .into_iter()
+            .all(|item| match item_kind(&item) {
+                "axiom" => allow_axioms,
+                "csimp" => allow_csimp,
+                "unsafe declaration" => allow_unsafe,
+                "implemented_by" => allow_impl_by,
+                _ => false,
+            })
+    }
 }
 
 /// Hygiene items that block certification under the `allowed` axioms (impure commands such as
@@ -302,6 +392,8 @@ pub struct SplitResult {
     pub interface_hash: String,
     pub shards: Vec<TheoremShard>,
     pub hygiene: HygieneReport,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attribute_targets: Vec<String>,
 }
 
 #[allow(dead_code)]
@@ -752,7 +844,7 @@ pub(crate) fn skip_lean_lexeme(src: &str, start: usize) -> Option<LeanLexicalSpa
 }
 
 /// Preserve byte offsets and newlines while hiding lexical contents from scope scans.
-fn mask_lean_lexemes(src: &str, literals: bool) -> String {
+pub(crate) fn mask_lean_lexemes(src: &str, literals: bool) -> String {
     if !literals {
         return strip_lean_comments(src);
     }
@@ -1006,10 +1098,19 @@ pub fn strip_lean_comments(src: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
-fn strip_string_literals(src: &str) -> std::borrow::Cow<'_, str> {
+fn strip_string_literals_inner(
+    src: &str,
+    comments_already_stripped: bool,
+) -> std::borrow::Cow<'_, str> {
     if !src.contains('"') && !src.contains('\'') && !src.contains('«') {
         return std::borrow::Cow::Borrowed(src);
     }
+    let clean_cow = if comments_already_stripped {
+        std::borrow::Cow::Borrowed(src)
+    } else {
+        std::borrow::Cow::Owned(strip_lean_comments(src))
+    };
+    let src = clean_cow.as_ref();
     let bytes = src.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -1027,7 +1128,7 @@ fn strip_string_literals(src: &str) -> std::borrow::Cow<'_, str> {
                 while j < end {
                     if interp_depth > 0 {
                         if let Some(sub_end) = scan_lean_norm_literal_end(src, j) {
-                            let stripped = strip_string_literals(&src[j..sub_end]);
+                            let stripped = strip_string_literals_inner(&src[j..sub_end], true);
                             out.extend_from_slice(stripped.as_bytes());
                             j = sub_end;
                             continue;
@@ -1088,6 +1189,10 @@ fn strip_string_literals(src: &str) -> std::borrow::Cow<'_, str> {
     )
 }
 
+fn strip_string_literals(src: &str) -> std::borrow::Cow<'_, str> {
+    strip_string_literals_inner(src, false)
+}
+
 pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
     let mut report = HygieneReport::default();
     let clean_no_strings = strip_string_literals(clean_src);
@@ -1137,6 +1242,7 @@ pub fn audit_hygiene(clean_src: &str) -> HygieneReport {
             || (key == "warn.sorry" && words.next() != Some("true"))
         {
             report.has_checking_weakening = true;
+            report.has_checking_weakening_option = true;
             let line = clean_src[..pos].bytes().filter(|b| *b == b'\n').count() + 1;
             report
                 .flagged_items
@@ -1244,6 +1350,243 @@ pub(crate) fn reject_checking_weakening(source: &str) -> anyhow::Result<()> {
         report.disallowed_items().join(", ")
     );
     Ok(())
+}
+
+/// For git-pinned manifest dependency packages (e.g. `mathlib`, `batteries`, `Qq`), `run_cmd` /
+/// `run_elab` / `run_meta` register coercions and linters; their compiled `.olean` declarations are
+/// still independently kernel-replayed via `Kernel.Environment.replay`. Explicit checking-weakening
+/// `set_option` directives (`debug.*`, `weak.*`, `warn.sorry false`) remain unconditionally rejected.
+pub(crate) fn reject_git_pinned_dep_checking_weakening(source: &str) -> anyhow::Result<()> {
+    let report = audit_hygiene(&strip_lean_comments(source));
+    anyhow::ensure!(
+        !report.has_checking_weakening_option,
+        "Soundness hygiene violation: {}",
+        report.disallowed_items().join(", ")
+    );
+    Ok(())
+}
+
+pub(crate) fn contains_lean_word(haystack: &str, word: &str) -> bool {
+    for (idx, _) in haystack.match_indices(word) {
+        let prev_ok = idx == 0
+            || !haystack[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| is_lean_id_rest(c) || c == '»' || c == '.');
+        let end = idx + word.len();
+        let next_ok = end >= haystack.len()
+            || !haystack[end..]
+                .chars()
+                .next()
+                .is_some_and(|c| is_lean_id_rest(c) || c == '«' || c == '.');
+        if prev_ok && next_ok {
+            return true;
+        }
+    }
+    false
+}
+
+/// Match an identifier component even when qualified by a namespace prefix/suffix (e.g. `IO.getEnv`
+/// or `System.FilePath` as well as bare `getEnv` under `open IO`).
+pub(crate) fn contains_lean_ident_segment(haystack: &str, seg: &str) -> bool {
+    for (idx, _) in haystack.match_indices(seg) {
+        let prev_ok = idx == 0
+            || !haystack[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| is_lean_id_rest(c) || c == '»');
+        let end = idx + seg.len();
+        let next_ok = end >= haystack.len()
+            || !haystack[end..]
+                .chars()
+                .next()
+                .is_some_and(|c| is_lean_id_rest(c) || c == '«');
+        if prev_ok && next_ok {
+            return true;
+        }
+    }
+    false
+}
+
+fn contains_lean_attribute_word(unquoted: &str, attrs: &[&str]) -> bool {
+    let mut rest = unquoted;
+    while !rest.is_empty() {
+        let at_pos = rest.find("@[");
+        let kw_pos = rest.find("attribute").and_then(|p| {
+            let prev_ok = p == 0
+                || !rest[..p]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| is_lean_id_rest(c) || c == '.');
+            let after = &rest[p + "attribute".len()..];
+            let trimmed = after.trim_start();
+            if prev_ok
+                && (after.len() != trimmed.len() || after.starts_with('['))
+                && trimmed.starts_with('[')
+            {
+                Some((p, rest.len() - trimmed.len() + 1))
+            } else {
+                None
+            }
+        });
+        let (advance_from, open_inner) = match (at_pos, kw_pos) {
+            (Some(a), Some((k, _inner))) if a <= k => (a + 2, a + 2),
+            (None, Some((_, inner))) => (inner, inner),
+            (_, Some((_, inner))) => (inner, inner),
+            (Some(a), None) => (a + 2, a + 2),
+            (None, None) => break,
+        };
+        let tail = &rest[open_inner..];
+        let mut depth = 1usize;
+        let mut close_idx = tail.len();
+        for (i, ch) in tail.char_indices() {
+            match ch {
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_idx = i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let inner = &tail[..close_idx];
+        if attrs.iter().any(|w| contains_lean_ident_segment(inner, w)) {
+            return true;
+        }
+        rest = &rest[advance_from.min(rest.len())..];
+    }
+    false
+}
+
+/// Returns true if `src` may execute arbitrary `IO` / `CoreM` / `CommandElabM` / `TermElabM` /
+/// `TacticM` / `evalConst` / FFI host effects during elaboration (including under `open IO`,
+/// `run_tac`, attributes like `@[env_linter]`/`@[package_check]`/`@[cpass]`, or `macro`s building
+/// raw `Syntax.node*` ASTs). When `reject_pure_macros` is true, pure `MacroM` (`macro`,
+/// `macro_rules`, `@[macro]`) is also rejected.
+pub(crate) fn source_may_execute_elab_host_effects(src: &str, reject_pure_macros: bool) -> bool {
+    let comment_free = strip_lean_comments(src);
+    let clean = strip_string_literals_inner(&comment_free, true);
+    let unquoted = clean.replace(['«', '»'], "");
+    const ELAB_IO_WORDS: &[&str] = &[
+        "elab",
+        "elab_rules",
+        "drun_elab",
+        "run_elab",
+        "run_cmd",
+        "run_meta",
+        "run_tac",
+        "#eval",
+        "#eval!",
+        "#guard_msgs",
+        "initialize",
+        "builtin_initialize",
+        "simproc",
+        "dsimproc",
+        "simproc_decl",
+        "dsimproc_decl",
+    ];
+    if ELAB_IO_WORDS
+        .iter()
+        .any(|w| contains_lean_word(&unquoted, w))
+    {
+        return true;
+    }
+    const ELAB_IDENT_SEGMENTS: &[&str] = &[
+        "runTac",
+        "evalConst",
+        "evalConstCheck",
+        "evalTerm",
+        "unsafeCast",
+        "unsafeIO",
+        "unsafeBaseIO",
+        "unsafePerformIO",
+        "ptrAddrUnsafe",
+        "lcProof",
+        "registerBuiltinAttribute",
+        "registerTagAttribute",
+        "registerParametricAttribute",
+        "registerEnvExtension",
+        "mkEnvExtension",
+        "registerSimplePersistentEnvExtension",
+        "registerPersistentEnvExtension",
+    ];
+    if ELAB_IDENT_SEGMENTS
+        .iter()
+        .any(|w| contains_lean_ident_segment(&unquoted, w))
+    {
+        return true;
+    }
+    const ELAB_ATTRS: &[&str] = &[
+        "command_elab",
+        "term_elab",
+        "app_elab",
+        "tactic",
+        "init",
+        "builtin_init",
+        "extern",
+        "implemented_by",
+        "csimp",
+        "env_linter",
+        "package_check",
+        "cpass",
+        "user_attr",
+        "env_extension",
+        "builtin_env_extension",
+    ];
+    if contains_lean_attribute_word(&unquoted, ELAB_ATTRS) {
+        return true;
+    }
+    let has_macro_decl = ["macro", "macro_rules"]
+        .iter()
+        .any(|w| contains_lean_word(&unquoted, w))
+        || contains_lean_attribute_word(&unquoted, &["macro", "macro_rules"]);
+    if has_macro_decl {
+        if reject_pure_macros {
+            return true;
+        }
+        const RAW_SYNTAX_SEGMENTS: &[&str] = &[
+            "node",
+            "node1",
+            "node2",
+            "node3",
+            "node4",
+            "node5",
+            "node6",
+            "node7",
+            "node8",
+            "mkNode",
+            "mkApp",
+            "mkCApp",
+            "mkStr1",
+            "mkStr2",
+            "mkStr3",
+            "mkStr4",
+            "mkStr5",
+            "mkStr6",
+            "mkStr7",
+            "mkStr8",
+            "mkSimple",
+            "SourceInfo",
+        ];
+        if RAW_SYNTAX_SEGMENTS
+            .iter()
+            .any(|w| contains_lean_ident_segment(&unquoted, w))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true if `src` may execute elaboration-time host effects inside a git-pinned dependency
+/// package (delegating directly to `source_may_execute_elab_host_effects(src, false)` so any
+/// custom `elab`, `run_tac`, `initialize`, `@[extern]`, `IO.FS.lines`, `Std.Internal.UV`, etc.
+/// fails closed while pure `def`/`theorem`/`macro_rules` modules remain eligible).
+pub(crate) fn source_may_read_host_state(src: &str) -> bool {
+    source_may_execute_elab_host_effects(src, false)
 }
 
 fn contains_word(haystack: &str, word: &str) -> bool {
@@ -4294,6 +4637,7 @@ fn split_lean_source_inner(
         update_scope_stack_with_idx(&mut scope_stack, span.orig_text, span_idx);
     }
 
+    let attribute_targets = extract_attribute_command_targets(&spans);
     let skeleton_source = if omit_shard_source {
         String::new()
     } else {
@@ -4315,6 +4659,7 @@ fn split_lean_source_inner(
         interface_hash,
         shards,
         hygiene,
+        attribute_targets,
     }
 }
 
@@ -5184,11 +5529,99 @@ fn contains_local_decl_ref(haystack: &str, short: &str, full_name: &str) -> bool
     false
 }
 
+fn extract_attribute_command_targets(spans: &[CmdSpan<'_>]) -> Vec<String> {
+    let mut targets = Vec::new();
+    let mut scope_stack: Vec<ScopeFrame> = Vec::new();
+    for (s_idx, span) in spans.iter().enumerate() {
+        let mut tc = span.clean_text.trim_start();
+        while let Some(after_opt) = strip_leading_set_option_in(tc) {
+            tc = after_opt.trim_start();
+        }
+        for m in ["local", "scoped"] {
+            if let Some(after_m) = tc.strip_prefix(m) {
+                if after_m.starts_with(char::is_whitespace) {
+                    tc = after_m.trim_start();
+                }
+            }
+        }
+        if let Some(after_attr) = tc.strip_prefix("attribute") {
+            if after_attr.starts_with(char::is_whitespace) || after_attr.starts_with('[') {
+                let mut rest = after_attr.trim_start();
+                if rest.starts_with('[') {
+                    let mut depth = 0usize;
+                    let mut close_idx = None;
+                    for (i, ch) in rest.char_indices() {
+                        match ch {
+                            '[' => depth += 1,
+                            ']' => {
+                                depth = depth.saturating_sub(1);
+                                if depth == 0 {
+                                    close_idx = Some(i + 1);
+                                    break;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(ci) = close_idx {
+                        rest = &rest[ci..];
+                    } else {
+                        targets.push("*".to_string());
+                        update_scope_stack_with_idx(&mut scope_stack, span.orig_text, s_idx);
+                        continue;
+                    }
+                }
+                for tok in extract_ident_tokens(rest) {
+                    let qual = qualified_decl_name(&tok, &scope_stack);
+                    if !targets.contains(&tok) {
+                        targets.push(tok);
+                    }
+                    if !targets.contains(&qual) {
+                        targets.push(qual);
+                    }
+                }
+            }
+        }
+        update_scope_stack_with_idx(&mut scope_stack, span.orig_text, s_idx);
+    }
+    targets
+}
+
+fn attribute_targets_match_uncached(
+    targets: &[String],
+    uncached_names: &std::collections::HashSet<String>,
+) -> bool {
+    targets.iter().any(|tok| {
+        tok == "*"
+            || matches_uncached_name(tok, uncached_names)
+            || uncached_names
+                .iter()
+                .any(|u| last_host_name_component(u) == last_host_name_component(tok))
+    })
+}
+
+/// Returns true if `clean_src` contains a retroactive `attribute [...] ...` command targeting any
+/// declaration in `uncached_names` (e.g. `attribute [simp] foo`, which remains active in an
+/// imported `<Module>.olean` even after `foo` is renamed to `_turbo_verify_0_foo`).
+pub(crate) fn source_has_attribute_command_for_uncached(
+    src: &str,
+    uncached_names: &std::collections::HashSet<String>,
+) -> bool {
+    let clean = strip_lean_comments(src);
+    let spans = parse_command_spans(src, &clean);
+    attribute_targets_match_uncached(&extract_attribute_command_targets(&spans), uncached_names)
+}
+
 /// Verify that the proof body of shard `idx` does not reference its own theorem name
-/// or any subsequent theorem `j >= idx` in the same file, guaranteeing acyclic soundness
-/// when importing the pre-compiled `.olean` environment.
+/// or any subsequent theorem `j >= idx` in the same file, and that shard `idx` does not carry
+/// global solver/elaborator attributes (`@[simp]`, `@[aesop]`, `@[ext]`, etc.) that would remain
+/// active on the original constant in an imported `<Module>.olean` environment.
 pub fn shard_is_acyclic_for_fast_import(shards: &[TheoremShard], idx: usize) -> bool {
     if idx >= shards.len() {
+        return false;
+    }
+    let sig_clean = strip_lean_comments(&shards[idx].signature_text);
+    if has_non_local_attribute(&sig_clean) {
         return false;
     }
     let proof_clean = strip_lean_comments(&shards[idx].proof_text);
@@ -5620,6 +6053,10 @@ pub fn build_fast_olean_shard_source_with_split(
         }
     }
 
+    if source_has_attribute_command_for_uncached(src, uncached_names) {
+        return None;
+    }
+
     let src_prefix = slice_up_to_line(src, max_end_line);
     let clean = strip_lean_comments(src_prefix);
     let spans = parse_command_spans(src_prefix, &clean);
@@ -5967,7 +6404,7 @@ pub fn can_use_fast_olean_import(
     src: &str,
     uncached_names: &std::collections::HashSet<String>,
 ) -> bool {
-    if uncached_names.is_empty() {
+    if uncached_names.is_empty() || source_has_attribute_command_for_uncached(src, uncached_names) {
         return false;
     }
     let split = split_lean_source_fast_no_cone(src, &[]);
@@ -5979,6 +6416,12 @@ pub fn can_use_fast_olean_import_with_split(
     uncached_names: &std::collections::HashSet<String>,
 ) -> bool {
     if uncached_names.is_empty() || !split.eligible_for_sharding || split.shards.is_empty() {
+        return false;
+    }
+    if attribute_targets_match_uncached(&split.attribute_targets, uncached_names)
+        || (!split.skeleton_source.is_empty()
+            && source_has_attribute_command_for_uncached(&split.skeleton_source, uncached_names))
+    {
         return false;
     }
     for (idx, shard) in split.shards.iter().enumerate() {
@@ -6020,6 +6463,9 @@ pub fn build_cross_file_coalesced_shard(
             .map(|s| s.end_line)
             .max()
             .unwrap_or(0);
+        if source_has_attribute_command_for_uncached(src, &uncached_names) {
+            return "#eval (panic! \"turbo-lean: unsafe attribute command in fast-olean coalesced shard\" : IO Unit)\n".to_string();
+        }
         let src_prefix = slice_up_to_line(src, max_end_line);
 
         let clean = strip_lean_comments(src_prefix);
@@ -13019,6 +13465,115 @@ public def api := by
                 "{label}: meta_signature_digest must stay identical"
             );
         }
+    }
+
+    #[test]
+    fn test_fast_olean_import_rejects_simp_attribute_or_retroactive_attribute_command() {
+        let src_inline_simp =
+            "@[simp]\ntheorem foo (n : Nat) : n + 0 = n := by\n  exact Nat.add_zero n\n";
+        let mut uncached = std::collections::HashSet::new();
+        uncached.insert("_root_.foo".to_string());
+        assert!(
+            !can_use_fast_olean_import(src_inline_simp, &uncached),
+            "fast_olean must reject @[simp] theorem to prevent circular self-application from imported .olean"
+        );
+        assert!(
+            build_fast_olean_shard_source(src_inline_simp, "P.Target", &uncached).is_none(),
+            "build_fast_olean_shard_source must return None for @[simp] uncached theorem"
+        );
+
+        let src_retro_attr =
+            "theorem foo (n : Nat) : n + 0 = n := by\n  exact Nat.add_zero n\nattribute [simp] foo\n";
+        assert!(
+            !can_use_fast_olean_import(src_retro_attr, &uncached),
+            "fast_olean must reject retroactive `attribute [simp] foo` command"
+        );
+        let split_retro = split_lean_source_fast_no_cone(src_retro_attr, &[]);
+        assert!(
+            !can_use_fast_olean_import_with_split(&split_retro, &uncached),
+            "can_use_fast_olean_import_with_split must also reject retroactive `attribute [simp] foo`"
+        );
+        assert!(
+            build_fast_olean_shard_source_with_split(
+                src_retro_attr,
+                &split_retro,
+                "P.Target",
+                &uncached
+            )
+            .is_none(),
+            "build_fast_olean_shard_source_with_split must return None for retroactive `attribute [simp] foo`"
+        );
+    }
+
+    #[test]
+    fn test_source_may_execute_elab_host_effects_covers_open_io_interpolations_and_macros() {
+        assert!(!source_may_execute_elab_host_effects(
+            "-- elab initialize #eval @[term_elab]\n/- run_cmd unsafe -/\ndef msg : String := \"elab initialize #eval run_cmd\"\ntheorem ok : 1 + 1 = 2 := rfl\n",
+            true
+        ));
+        assert!(!source_may_execute_elab_host_effects(
+            "def elaboratedValue : Nat := 1\ndef Unsafe.foo : Nat := 2\ndef xs := Array.init 4 id\ndef tacticHelper : Nat := 3\n",
+            true
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "open IO in\npublic meta section\nopen Lean Elab Term in\npublic elab \"env_nat\" : term => do\n  let _ ← getEnv \"X\"\n  return mkNatLit 0\n",
+            false
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "theorem env_sig (x : show Type from by run_tac exact ()) : x = x := rfl\n",
+            false
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "macro \"raw_rt\" : tactic => return Lean.Syntax.node2 .none (Lean.Name.mkStr4 \"Lean\" \"Parser\" \"Tactic\" \"runTac\") (mkAtom \"x\") (mkAtom \"y\")\n",
+            false
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "@[env_linter] def myLinter : Nat := 0\n",
+            false
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "attribute [package_check] myCheck\n",
+            false
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "def f : String := s!\"{by run_tac trivial}\"\n",
+            false
+        ));
+        assert!(source_may_read_host_state(
+            "open Lean Elab Term in\nelab \"line_count\" : term => do\n  let rows ← IO.FS.lines \"/tmp/flag\"\n  return mkNatLit rows.size\n"
+        ));
+        assert!(!source_may_read_host_state(
+            "def pureHelper (n : Nat) : Array Nat := Array.init n id\n"
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "def f : String := s!\"{unsafeCast 0}\"\n",
+            false
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "«elab» \"q\" : term => `(Nat)\n",
+            false
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "@[term_elab mySyntax] def elabMySyntax : Nat := 0\n",
+            false
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "@[extern \"c_fn\"] opaque cFn : IO Nat\n",
+            false
+        ));
+        assert!(source_may_execute_elab_host_effects(
+            "initialize myRef : IO.Ref Nat ← IO.mkRef 0\n",
+            false
+        ));
+        let pure_macro = "macro \"dep_ty\" : term => `(Nat)\nmacro_rules | `(t) => `(Nat)\n";
+        assert!(
+            !source_may_execute_elab_host_effects(pure_macro, false),
+            "pure MacroM must remain allowed for base/DAG caching when reject_pure_macros == false"
+        );
+        assert!(
+            source_may_execute_elab_host_effects(pure_macro, true),
+            "standalone .olean statement cache must reject MacroM when reject_pure_macros == true"
+        );
     }
 
     #[test]

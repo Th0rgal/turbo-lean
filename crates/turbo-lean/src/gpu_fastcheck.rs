@@ -6248,7 +6248,9 @@ pub fn evaluate_agent_step_value(
                 let sp = crate::splitter::split_lean_source(&src_text, &dep_hashes);
                 if let Some(ref st_path) = st_path_opt {
                     let entry = crate::lake_build::ShmCachedFileSplit {
-                        split_key: format!("file-split:v15:{}", src_b3),
+                        split_key: crate::db::TurboStore::compute_file_split_key_from_src_hash(
+                            &src_b3,
+                        ),
                         src_blake3: src_b3,
                         split: crate::lake_build::compact_split_for_shm_cache(&sp),
                         prefix_src: if src_text.len() <= 64 * 1024 {
