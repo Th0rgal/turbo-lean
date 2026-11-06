@@ -9245,10 +9245,19 @@ fn spec_in_clean_git_pinned_manifest_package(
     else {
         return false;
     };
-    let dirty_opt = cache
+    let clean_opt = cache
         .clean_git_pin_memo
         .entry(spec_canon.clone())
         .or_insert_with(|| {
+            if crate::trusted_tools::reject_gitlinks(
+                &spec_canon,
+                &[expected_rev.trim()],
+                Path::new("."),
+            )
+            .is_err()
+            {
+                return None;
+            }
             let mut rev_cmd = crate::trusted_tools::git(&spec_canon).ok()?;
             let rev_out = rev_cmd
                 .args([
@@ -9291,6 +9300,7 @@ fn spec_in_clean_git_pinned_manifest_package(
                 .filter(|s| !s.is_empty());
             while let Some(rec) = entries.next() {
                 if rec.len() < 4 {
+                    dirty.insert(spec_canon.clone());
                     continue;
                 }
                 let xy = &rec[..2];
@@ -9306,14 +9316,10 @@ fn spec_in_clean_git_pinned_manifest_package(
             }
             Some(dirty)
         });
-    let Some(dirty_set) = dirty_opt.as_ref() else {
+    let Some(dirty_set) = clean_opt.as_ref() else {
         return false;
     };
-    let src_canon = spec
-        .src_path
-        .canonicalize()
-        .unwrap_or_else(|_| spec.src_path.clone());
-    !dirty_set.contains(&src_canon)
+    dirty_set.is_empty()
 }
 
 fn prebuilt_artifact_traces(
@@ -9929,7 +9935,7 @@ fn lake_closure_export_info_inner(
                     }
                 }
             } else {
-                let expected_gh = format!("{:016x}", lake_hash_bytes(cfg.lean_githash.as_bytes()));
+                let expected_gh = format!("{:016x}", lake_hash_bytes(cfg.lean_githash.trim().as_bytes()));
                 let expected_src = format!("{:016x}", src_h);
                 let expected_is_mod =
                     format!("{:016x}", lake_mix_hash(1723, if is_mod { 11 } else { 13 }));
@@ -21870,7 +21876,7 @@ fn probe_warm_on_disk_module_candidate(
         return None;
     }
 
-    let expected_gh = format!("{:016x}", lake_hash_bytes(cfg.lean_githash.as_bytes()));
+    let expected_gh = format!("{:016x}", lake_hash_bytes(cfg.lean_githash.trim().as_bytes()));
     let expected_src = format!("{:016x}", lake_hash_text(&src_raw));
     let expected_is_mod = format!(
         "{:016x}",
@@ -39552,24 +39558,58 @@ globs = ["Down.+"]
             "PwDep",
         )
         .expect("PwDep spec");
-        let expected_dep_h = compute_expected_lake_module_dep_hash(
-            &cfg,
-            &dep_spec.pkg_root,
-            &dep_spec.pkg_name,
-            &dep_spec.pkg_base_name,
-            &dep_spec.target_name,
-            dep_spec.is_exe_target,
-            &dep_spec.module_name,
-            false,
-            dep_spec.platform_independent,
-            &dep_spec.lean_options,
-            &dep_spec.strong_args,
-            &dep_spec.src_path,
-            lake_hash_text(dep_src),
-            Vec::new(),
-            &[],
-        )
-        .expect("expected depHash");
+        // Construct expected Lake trace inputs independently from Lake's documented schema
+        // (`PwDep:deps` nested entry on v4.31.0, toolchain cap, source path hash, options, isModule, Module.name, Package.id?, Module.leanArgs)
+        // rather than calling `compute_expected_lake_module_dep_hash` so parity is non-circular.
+        let indep_inputs = serde_json::json!([
+            [
+                "PwDep:deps",
+                [
+                    [
+                        "deps",
+                        [
+                            [
+                                "pwdep/PwDep:extraDep",
+                                [["@pwdep:extraDep", "00000000000006bb"]]
+                            ],
+                            ["imports", "00000000000006bb"]
+                        ]
+                    ],
+                    [
+                        "libs",
+                        [
+                            ["import dynlibs", "00000000000006bb"],
+                            ["package external libraries", "00000000000006bb"],
+                            ["module dynlibs", "00000000000006bb"],
+                            ["module plugins", "00000000000006bb"]
+                        ]
+                    ]
+                ]
+            ],
+            [
+                format!("Lean 4.31.0, commit {fake_githash}"),
+                format!("{:016x}", lake_hash_bytes(fake_githash.as_bytes()))
+            ],
+            [
+                dep_spec.src_path.to_string_lossy(),
+                format!("{:016x}", lake_hash_text(dep_src))
+            ],
+            ["options", "00000000000006bb"],
+            [
+                "isModule: false",
+                format!("{:016x}", lake_mix_hash(LAKE_NIL_HASH, 13))
+            ],
+            [
+                "Module.name: PwDep",
+                format!("{:016x}", lake_hash_name("PwDep"))
+            ],
+            [
+                "Package.id?: (some PwDep)",
+                format!("{:016x}", lake_hash_pkg_id("PwDep"))
+            ],
+            ["Module.leanArgs: #[]", "00000000000006bb"]
+        ]);
+        let expected_dep_h = lake_input_hash(&indep_inputs)?;
         write_fake_leantar_artifacts(&spec_olean_path(&dep_spec), expected_dep_h)?;
 
         let mut cache = LakeClosureCache::default();
@@ -39590,7 +39630,44 @@ globs = ["Down.+"]
             "tampered source must fail inputless leantar depHash check"
         );
 
-        // ProofWidgets custom target `needs := #[widgetJsAll]` verifies at clean git rev and rejects dirty checkout.
+        // ProofWidgets custom target `needs := #[widgetJsAll]` verifies at clean git rev and rejects both dirty non-.lean inputs and dirty .lean files.
+        // Write artifacts into `.lake/build/` BEFORE committing would be wrong, so ensure `.lake/` is gitignored as in real ProofWidgets4.
+        fs::write(pw_dir.join(".gitignore"), "/.lake/\n")?;
+        let mut git_add_ig = crate::trusted_tools::git(&pw_dir)?;
+        assert!(git_add_ig.args(["-C"]).arg(&pw_dir).args(["add", ".gitignore"]).status()?.success());
+        let mut git_commit_ig = crate::trusted_tools::git(&pw_dir)?;
+        assert!(git_commit_ig
+            .args([
+                "-C",
+                &pw_dir.to_string_lossy(),
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@e",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "ignore .lake",
+            ])
+            .status()?
+            .success());
+        let mut git_rev2 = crate::trusted_tools::git(&pw_dir)?;
+        let pw_rev2 = String::from_utf8(
+            git_rev2
+                .args(["-C"])
+                .arg(&pw_dir)
+                .args(["rev-parse", "HEAD"])
+                .output()?
+                .stdout,
+        )?
+        .trim()
+        .to_string();
+        cfg.manifest_packages
+            .iter_mut()
+            .find(|mp| mp.name == "proofwidgets")
+            .unwrap()
+            .rev = Some(pw_rev2);
         let pw_spec = resolve_module_in_package(pw_pkg, false, "ProofWidgets").expect("PW spec");
         write_fake_leantar_artifacts(&spec_olean_path(&pw_spec), 0x123456789abcdef0)?;
         let mut cache3 = LakeClosureCache::default();
@@ -39600,6 +39677,17 @@ globs = ["Down.+"]
             lake_closure_export_info(&cfg, &pw_spec, true, &mut cache3, &mut visiting3).is_some(),
             "clean git-pinned custom-target-needs package must verify"
         );
+        // Dirty tracked custom-target input (`widget/js/hello.tsx`) must fail closed even when `.lean` is untouched.
+        fs::write(pw_dir.join("widget/js/hello.tsx"), "export default { pwned: true }\n")?;
+        let mut cache_tsx = LakeClosureCache::default();
+        cache_tsx.ignore_mtime_skew = true;
+        let mut visiting_tsx = HashSet::new();
+        assert!(
+            lake_closure_export_info(&cfg, &pw_spec, true, &mut cache_tsx, &mut visiting_tsx)
+                .is_none(),
+            "dirty non-.lean tracked input in git-pinned custom-target-needs package must fail closed"
+        );
+        fs::write(pw_dir.join("widget/js/hello.tsx"), "export default {}\n")?;
         fs::write(pw_dir.join("ProofWidgets.lean"), "def pwHelper : Nat := 2\n")?;
         let mut cache4 = LakeClosureCache::default();
         cache4.ignore_mtime_skew = true;

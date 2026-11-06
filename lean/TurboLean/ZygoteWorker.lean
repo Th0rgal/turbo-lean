@@ -1911,9 +1911,10 @@ def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Nam
 
 #eval show Command.CommandElabM Unit from do
   let env ← getEnv
+  let fnId := mkIdent `formatReducibilityStatus
   if env.contains `Lean.ReducibilityStatus.instanceReducible then
     Command.elabCommand (← `(
-      private def formatReducibilityStatus (r : ReducibilityStatus) : String :=
+      private def $fnId:ident (r : ReducibilityStatus) : String :=
         match r with
         | .reducible => "reducible"
         | .semireducible => "semireducible"
@@ -1923,7 +1924,7 @@ def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Nam
     ))
   else if env.contains `Lean.ReducibilityStatus.implicitReducible then
     Command.elabCommand (← `(
-      private def formatReducibilityStatus (r : ReducibilityStatus) : String :=
+      private def $fnId:ident (r : ReducibilityStatus) : String :=
         match r with
         | .reducible => "reducible"
         | .semireducible => "semireducible"
@@ -1932,7 +1933,7 @@ def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Nam
     ))
   else
     Command.elabCommand (← `(
-      private def formatReducibilityStatus (r : ReducibilityStatus) : String :=
+      private def $fnId:ident (r : ReducibilityStatus) : String :=
         match r with
         | .reducible => "reducible"
         | .semireducible => "semireducible"
@@ -2206,9 +2207,10 @@ private def isWhitelistedPublicSigExtName (extStr : String) : Bool :=
 
 #eval show Command.CommandElabM Unit from do
   let env ← getEnv
+  let fnId := mkIdent `buildDumpImportArtifacts
   if env.contains `Lean.ImportArtifacts.ofArrays then
     Command.elabCommand (← `(
-      private def buildDumpImportArtifacts (oleanPath srvPath irPath irSigPath : System.FilePath)
+      private def $fnId:ident (oleanPath srvPath irPath irSigPath : System.FilePath)
           (hasSrv hasIrSig hasIr : Bool) : ImportArtifacts :=
         let oleanParts := if hasSrv then #[oleanPath, srvPath] else #[oleanPath]
         let irParts := if hasIrSig then (if hasIr then #[irSigPath, irPath] else #[irSigPath]) else #[]
@@ -2216,30 +2218,33 @@ private def isWhitelistedPublicSigExtName (extStr : String) : Bool :=
     ))
   else
     Command.elabCommand (← `(
-      private def buildDumpImportArtifacts (oleanPath _srvPath irPath _irSigPath : System.FilePath)
+      private def $fnId:ident (oleanPath _srvPath irPath _irSigPath : System.FilePath)
           (_hasSrv _hasIrSig hasIr : Bool) : ImportArtifacts :=
         ImportArtifacts.ofArray (if hasIr then #[oleanPath, irPath] else #[oleanPath])
     ))
 
 #eval show Command.CommandElabM Unit from do
   let env ← getEnv
-  let hasMonoExt := match env.find? `Lean.Compiler.LCNF.monoTypeExt with
-    | some ci =>
-      ci.type.isAppOf `Lean.MapDeclarationExtension || ci.type.isAppOf `Lean.PersistentEnvExtension
-    | none => false
-  if hasMonoExt then
-    Command.elabCommand (← `(
-      private def collectLcnfMonoTypeEntries (env : Environment) (idx : ModuleIdx)
-          (norm : Name → Name) : Array String :=
-        ((Compiler.LCNF.monoTypeExt.getModuleEntries env idx).map fun (dName, mTy) =>
-          let mTyHash := TurboLean.Blake3.blake3Bytes (TurboLean.StatementHash.exprJson norm mTy).compress.toUTF8
-          s!"{canonicalName (norm dName)}:{mTyHash}").qsort (· < ·)
-    ))
-  else
-    Command.elabCommand (← `(
-      private def collectLcnfMonoTypeEntries (_env : Environment) (_idx : ModuleIdx)
-          (_norm : Name → Name) : Array String := #[]
-    ))
+  let fnId := mkIdent `collectLcnfMonoTypeEntries
+  match env.find? `Lean.Compiler.LCNF.monoTypeExt with
+  | some ci =>
+    if ci.type.isAppOf `Lean.MapDeclarationExtension || ci.type.isAppOf `Lean.PersistentEnvExtension then
+      Command.elabCommand (← `(
+        private def $fnId:ident (env : Environment) (idx : ModuleIdx)
+            (norm : Name → Name) : Array String :=
+          ((Compiler.LCNF.monoTypeExt.getModuleEntries env idx).map fun (dName, mTy) =>
+            let mTyHash := TurboLean.Blake3.blake3Bytes (TurboLean.StatementHash.exprJson norm mTy).compress.toUTF8
+            s!"{canonicalName (norm dName)}:{mTyHash}").qsort (· < ·)
+      ))
+    else if ci.type.isAppOf `Lean.EnvExtension then
+      Command.elabCommand (← `(
+        private def $fnId:ident (_env : Environment) (_idx : ModuleIdx)
+            (_norm : Name → Name) : Array String := #[]
+      ))
+    else
+      throwError m!"Unexpected Lean.Compiler.LCNF.monoTypeExt type: {ci.type}"
+  | none =>
+    throwError "Lean.Compiler.LCNF.monoTypeExt missing from imported environment"
 
 def dumpPublicSignatureJson (modStr : String) : IO String := do
   let nm := parseModuleName modStr
@@ -2584,15 +2589,16 @@ structure SimpHotspotEntry where
 
 #eval show Command.CommandElabM Unit from do
   let env ← getEnv
+  let fnId := mkIdent `unwrapOriginatingSyntax?
   if env.contains `Lean.MessageData.ofOriginatingSyntax then
     Command.elabCommand (← `(
-      private def unwrapOriginatingSyntax? : MessageData → Option MessageData
+      private def $fnId:ident : MessageData → Option MessageData
         | .ofOriginatingSyntax _ inner => some inner
         | _ => none
     ))
   else
     Command.elabCommand (← `(
-      private def unwrapOriginatingSyntax? : MessageData → Option MessageData := fun _ => none
+      private def $fnId:ident : MessageData → Option MessageData := fun _ => none
     ))
 
 private partial def walkHotspotMessageData

@@ -1603,6 +1603,8 @@ pub(crate) fn source_may_read_host_state(src: &str) -> bool {
         "System.Process",
         "IO.getEnv",
         "System.getEnv",
+        "IO.getStdin",
+        "IO.stdin",
         "IO.currentDir",
         "IO.appPath",
         "IO.appDir",
@@ -1613,6 +1615,8 @@ pub(crate) fn source_may_read_host_state(src: &str) -> bool {
         "IO.rand",
         "ByteArray.random",
         "Std.Internal.UV",
+        "Std.Time.DateTime.now",
+        "DateTime.now",
     ];
     if QUALIFIED_HOST_READS
         .iter()
@@ -1625,6 +1629,8 @@ pub(crate) fn source_may_read_host_state(src: &str) -> bool {
         "UV",
         "TcpSocket",
         "UdpSocket",
+        "getStdin",
+        "stdin",
         "currentDir",
         "appPath",
         "appDir",
@@ -1649,10 +1655,12 @@ pub(crate) fn source_may_read_host_state(src: &str) -> bool {
     let has_open_io_or_sys = unquoted.lines().any(|line| {
         let t = line.trim_start();
         (t.starts_with("open ") || t.contains(" open "))
-            && (contains_lean_ident_segment(t, "IO") || contains_lean_ident_segment(t, "System"))
+            && (contains_lean_ident_segment(t, "IO")
+                || contains_lean_ident_segment(t, "System")
+                || contains_lean_ident_segment(t, "DateTime"))
     });
     if has_open_io_or_sys
-        && ["getEnv", "Process", "rand"]
+        && ["getEnv", "Process", "rand", "getStdin", "stdin", "now"]
             .iter()
             .any(|seg| contains_lean_ident_segment(&unquoted, seg))
     {
@@ -1722,7 +1730,7 @@ pub(crate) fn source_may_read_host_state(src: &str) -> bool {
                     }
                 }
             }
-            if up_count > 4 {
+            if up_count > 2 {
                 return true;
             }
         }
@@ -13694,6 +13702,15 @@ public def api := by
         ));
         assert!(!source_may_read_host_state(
             "open Lean Elab Tactic Server in\nelab \"pure_meta\" : tactic => do\n  let _ ← MonadEnv.getEnv\n  return ()\ndef widgetJs : String := include_str \"..\" / \"build\" / \"js\" / \"w.js\"\n"
+        ));
+        assert!(source_may_read_host_state(
+            "def escapeInclude : String := include_str \"..\" / \"..\" / \"..\" / \"secret.txt\"\n"
+        ));
+        assert!(source_may_read_host_state(
+            "def stdinRead : IO String := do let s ← IO.getStdin; s.getLine\n"
+        ));
+        assert!(source_may_read_host_state(
+            "def nowRead : IO Unit := do let _ ← Std.Time.DateTime.now; pure ()\n"
         ));
         assert!(source_may_execute_elab_host_effects(
             "def f : String := s!\"{unsafeCast 0}\"\n",
