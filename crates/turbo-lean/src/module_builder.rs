@@ -4988,6 +4988,7 @@ fn lakefile_is_plain_with_policy(clean: &str, is_root_pkg: bool) -> bool {
     })
 }
 
+#[cfg(test)]
 fn lakefile_is_plain(clean: &str) -> bool {
     lakefile_is_plain_with_policy(clean, true)
 }
@@ -39417,8 +39418,14 @@ globs = ["Down.+"]
 
     #[test]
     fn test_proofwidgets_style_dep_lakefile_and_inputless_leantar_trace_verified() -> Result<()> {
-        let tmp = tempfile::tempdir()?;
-        let root = tmp.path();
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_pw_leantar_trace_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        let root = dir.as_path();
         fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.31.0\n")?;
         fs::write(
             root.join("lakefile.lean"),
@@ -39697,6 +39704,7 @@ globs = ["Down.+"]
             "dirty source in git-pinned custom-target-needs package must fail closed"
         );
 
+        crate::zygote::purge_snapshot_dir(&dir);
         Ok(())
     }
 }
