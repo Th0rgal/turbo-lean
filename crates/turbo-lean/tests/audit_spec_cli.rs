@@ -116,7 +116,7 @@ theorem let_with_semi_and_eq_in_string (n : Nat) (h : n > 1) :
     assert_eq!(json["tight_specs"].as_u64(), Some(1));
     assert_eq!(json["stub_defs"].as_array().unwrap().len(), 0);
 
-    // Negative control: unused param `id` referenced ONLY inside a plain string literal
+    // Negative control 1: unused param `id` referenced ONLY inside a plain string literal
     // (not an `s!"...{id}..."` splice) must still be caught as a stub!
     let bad = fx.write(
         "PlainStringStub.lean",
@@ -140,6 +140,43 @@ theorem uses_fake_fmt (id : Nat) : fakeFmt id = "tag={id}" := by rfl
             .any(|s| s.as_str().unwrap_or("").contains("fakeFmt")),
         "expected fakeFmt stub finding, got: {bad_json}"
     );
+
+    // Negative control 2: `let tag := "a := b; c"; let y := x; y = y` must NOT get confused by
+    // `:=` or `;` inside the string literal and MUST reject `y = y` as a tautology (`trivial_specs == 1`).
+    let taut_let = fx.write(
+        "TautLetWithString.lean",
+        "theorem let_string_taut (x : Nat) : let tag := \"a := b; c\"; let y := x; y = y := by rfl\n",
+    );
+    let taut_out = fx
+        .cli("let-taut-str")
+        .args(["--json", "audit-spec"])
+        .arg(&taut_let)
+        .output()
+        .unwrap();
+    let taut_json = assert_cli_fail_json(&taut_out, "let tag := \"a := b; c\"; let y := x; y = y");
+    assert_eq!(taut_json["trivial_specs"].as_u64(), Some(1));
+
+    // Negative control 3: multiline `let` declaration placing `:=` on a continuation line (`let x : Nat\n := n; x = x`)
+    // and `in`-delimited `let y := x in y = y` must also inline and be rejected as tautologies!
+    let multiline_let = fx.write(
+        "MultilineLetTaut.lean",
+        r#"
+theorem multiline_let_taut (n : Nat) :
+    let x : Nat
+      := n; x = x := by
+  rfl
+
+theorem let_in_taut (n : Nat) : let y := n in y = y := by rfl
+"#,
+    );
+    let ml_out = fx
+        .cli("let-multiline")
+        .args(["--json", "audit-spec"])
+        .arg(&multiline_let)
+        .output()
+        .unwrap();
+    let ml_json = assert_cli_fail_json(&ml_out, "multiline let := and let ... in tautologies");
+    assert_eq!(ml_json["trivial_specs"].as_u64(), Some(2));
 }
 
 #[test]
@@ -217,6 +254,41 @@ fn config_loader_fails_closed_on_unknown_preset_malformed_toml_and_unknown_keys(
         .unwrap();
     let bad_type_json = assert_cli_fail_json(&bad_type, "wrong type in audit-spec.toml");
     assert_eq!(bad_type_json["verdict"].as_str(), Some("error"));
+
+    // 6. Positive: `turbo-lean.toml` with unrelated top-level tables (`[kernel]`, `[build]`, `[axioms]`)
+    // plus standard `[[audit_spec.path_rules]]` array-of-tables must load cleanly!
+    let _ = fs::remove_file(fx.root.join("proj/audit-spec.toml"));
+    fx.write(
+        "proj/turbo-lean.toml",
+        r#"
+[kernel]
+engine = "standard"
+
+[build]
+jobs = 4
+
+[axioms]
+allow = ["Custom.axiom"]
+
+[audit_spec]
+policy = "strict-proofs"
+
+[[audit_spec.path_rules]]
+glob = "proj/*.lean"
+forbid_decl_kinds = ["opaque"]
+"#,
+    );
+    let multi_table_ok = fx
+        .cli("cfg-multi-table")
+        .args(["--json", "audit-spec"])
+        .arg(&spec)
+        .output()
+        .unwrap();
+    let multi_json = assert_cli_ok(
+        &multi_table_ok,
+        "turbo-lean.toml with unrelated tables + path_rules",
+    );
+    assert_eq!(multi_json["policy"].as_str(), Some("strict-proofs"));
 }
 
 #[test]
@@ -301,6 +373,29 @@ allow_decl_names = ["AllowedBox", "SneakyBox"]
         .as_array()
         .unwrap()
         .is_empty());
+
+    // Substring lookalikes (`other/not_Proofs_note.lean`, `my_lean_archive/not_Proofs_notes.lean`)
+    // MUST NOT falsely match `lean/Proofs/*.lean` or `lean/**/Proofs/*.lean`!
+    for (idx, rel) in [
+        "other/not_Proofs_note.lean",
+        "my_lean_archive/not_Proofs_notes.lean",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let lookalike = fx.write(
+            rel,
+            "structure AllowedOutsideProofs where\n  x : Nat\ntheorem lk_ok (n : Nat) (h : n > 0) : n >= 1 := by omega\n",
+        );
+        let lk_out = fx
+            .cli(&format!("glob-lookalike-{idx}"))
+            .args(["--json", "audit-spec", "--config"])
+            .arg(&cfg)
+            .arg(&lookalike)
+            .output()
+            .unwrap();
+        assert_cli_ok(&lk_out, rel);
+    }
 }
 
 #[test]
@@ -313,10 +408,17 @@ fn forbidden_scope_scanner_catches_multiline_and_bracketed_attributes() {
 private unsafe inductive HiddenInductive where
   | mk (x : Nat)
 
-@[inline]
+@[always_inline]
 noncomputable opaque hiddenOpaque : Nat := 0
 
-theorem dummy_spec (n : Nat) (h : n > 0) : n >= 1 := by omega
+@[csimp]
+def hiddenCsimpDef : Nat := 1
+
+@[simp]
+def multilineSimpDef (n : Nat) : Nat := n + 1
+
+@[simp]
+theorem allowed_simp_thm (n : Nat) (h : n > 0) : n >= 1 := by omega
 "#,
     );
     let out = fx
@@ -330,21 +432,31 @@ theorem dummy_spec (n : Nat) (h : n > 0) : n >= 1 := by omega
             "inductive",
             "--forbid-decl-kinds",
             "opaque",
+            "--forbid-decl-kinds",
+            "def",
         ])
         .arg(&bypass)
         .output()
         .unwrap();
     let json = assert_cli_fail_json(&out, "multiline attribute forbidden decls");
     let forb = json["forbidden_scope_decls"].as_array().unwrap();
+    for expected in [
+        "HiddenInductive",
+        "hiddenOpaque",
+        "hiddenCsimpDef",
+        "multilineSimpDef",
+    ] {
+        assert!(
+            forb.iter()
+                .any(|v| v.as_str().unwrap_or("").contains(expected)),
+            "missing {expected} in {forb:?}"
+        );
+    }
     assert!(
-        forb.iter()
-            .any(|v| v.as_str().unwrap_or("").contains("HiddenInductive")),
-        "missing HiddenInductive in {forb:?}"
-    );
-    assert!(
-        forb.iter()
-            .any(|v| v.as_str().unwrap_or("").contains("hiddenOpaque")),
-        "missing hiddenOpaque in {forb:?}"
+        !forb
+            .iter()
+            .any(|v| v.as_str().unwrap_or("").contains("allowed_simp_thm")),
+        "allowed theorem should not be flagged in {forb:?}"
     );
 }
 
@@ -352,10 +464,16 @@ theorem dummy_spec (n : Nat) (h : n > 0) : n >= 1 := by omega
 fn diagonal_vacuity_and_honest_witness_labels_are_enforced() {
     let fx = AuditSpecFixture::new("diag_vacuity");
 
-    // 1. Positive: equality/aliasing precondition `a = b ∧ a > 0` MUST NOT be falsely marked vacuous
+    // 1. Positive: equality/aliasing & injectivity preconditions (`f x = f y → x = y`) MUST NOT be falsely marked vacuous
     let diag_ok = fx.write(
         "DiagOk.lean",
-        "theorem eq_alias_nonvacuous (a b : Nat) (h1 : a = b) (h2 : a > 0) : b >= 1 := by omega\n",
+        r#"
+def dbl (x : Nat) : Nat := x + x
+
+theorem eq_alias_nonvacuous (a b : Nat) (h1 : a = b) (h2 : a > 0) : b >= 1 := by omega
+
+theorem dbl_injective (x y : Nat) : dbl x = dbl y → x = y := by omega
+"#,
     );
     let ok_out = fx
         .cli("diag-ok")
@@ -363,9 +481,9 @@ fn diagonal_vacuity_and_honest_witness_labels_are_enforced() {
         .arg(&diag_ok)
         .output()
         .unwrap();
-    let ok_json = assert_cli_ok(&ok_out, "diagonal equality precondition");
+    let ok_json = assert_cli_ok(&ok_out, "diagonal equality & injectivity preconditions");
     assert_eq!(ok_json["vacuous_specs"].as_u64(), Some(0));
-    assert_eq!(ok_json["tight_specs"].as_u64(), Some(1));
+    assert_eq!(ok_json["tight_specs"].as_u64(), Some(2));
 
     // 2. Negative: contradictory precondition `a < b ∧ b < a` MUST still be caught as vacuous
     let vac = fx.write(
@@ -502,6 +620,32 @@ fn multi_file_batch_resolves_per_target_policy_permutation_invariantly() {
     assert_eq!(json_ab["policy"].as_str(), Some("mixed"));
     assert_eq!(json_ba["policy"].as_str(), Some("mixed"));
 
+    // Single-file reference runs must match the corresponding entries in `file_reports` regardless of batch order
+    let single_lenient = parse_json_stdout(
+        &fx.cli("single-lenient")
+            .args(["--json", "audit-spec"])
+            .arg(&lenient_file)
+            .output()
+            .unwrap(),
+        "single lenient_file",
+    );
+    let single_strict_bad = parse_json_stdout(
+        &fx.cli("single-strict-bad")
+            .args(["--json", "audit-spec"])
+            .arg(&strict_bad_file)
+            .output()
+            .unwrap(),
+        "single strict_bad_file",
+    );
+    assert_eq!(json_ab["file_reports"][0]["ok"], single_lenient["ok"]);
+    assert_eq!(json_ab["file_reports"][1]["ok"], single_strict_bad["ok"]);
+    assert_eq!(json_ba["file_reports"][0]["ok"], single_strict_bad["ok"]);
+    assert_eq!(json_ba["file_reports"][1]["ok"], single_lenient["ok"]);
+    assert_eq!(
+        json_ba["file_reports"][0]["forbidden_scope_decls"],
+        single_strict_bad["forbidden_scope_decls"]
+    );
+
     // Positive mixed batch: lenient (with structure) + strict (theorem only) -> passes in both orders!
     for (tag, pair) in [
         ("ok-ac", [&lenient_file, &strict_good_file]),
@@ -560,7 +704,17 @@ fn decl_filter_miss_missing_file_and_require_nonempty_fail_closed_with_json_and_
     let batch_hit_json = assert_cli_ok(&batch_decl_hit, "batch --decl found in second file");
     assert_eq!(batch_hit_json["total_specs_audited"].as_u64(), Some(1));
 
-    // 4. Negative `--require-nonempty` on theorem-less file -> ok: false, exit != 0
+    // 4a. Default whole-file audit on theorem-less file WITHOUT `--require-nonempty` remains optional (`ok: true`, exit 0)
+    let opt_empty = fx
+        .cli("opt-empty")
+        .args(["--json", "audit-spec"])
+        .arg(&empty_lean)
+        .output()
+        .unwrap();
+    let opt_json = assert_cli_ok(&opt_empty, "0-theorem file without --require-nonempty");
+    assert_eq!(opt_json["verdict"].as_str(), Some("no_specs_found"));
+
+    // 4b. Negative `--require-nonempty` on theorem-less file -> ok: false, exit != 0
     let req_nonempty = fx
         .cli("req-nonempty")
         .args(["--json", "audit-spec", "--require-nonempty"])

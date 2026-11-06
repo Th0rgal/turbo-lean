@@ -17,7 +17,7 @@ fn scan_let_colon_eq(src: &str) -> Option<usize> {
             '(' | '{' | '[' | '⟨' => p_depth += 1,
             ')' | '}' | ']' | '⟩' => p_depth = p_depth.saturating_sub(1),
             ':' if p_depth == 0 && bytes.get(i + 1) == Some(&b'=') => return Some(i),
-            ';' | '\n' if p_depth == 0 => return None,
+            ';' if p_depth == 0 => return None,
             _ => {}
         }
         i += ch.len_utf8();
@@ -25,7 +25,7 @@ fn scan_let_colon_eq(src: &str) -> Option<usize> {
     None
 }
 
-fn scan_let_rhs_terminator(src: &str) -> Option<usize> {
+fn scan_let_rhs_terminator(src: &str) -> Option<(usize, usize)> {
     let mut i = 0usize;
     let mut p_depth = 0usize;
     while i < src.len() {
@@ -37,7 +37,18 @@ fn scan_let_rhs_terminator(src: &str) -> Option<usize> {
         match ch {
             '(' | '{' | '[' | '⟨' => p_depth += 1,
             ')' | '}' | ']' | '⟩' => p_depth = p_depth.saturating_sub(1),
-            ';' | '\n' if p_depth == 0 => return Some(i),
+            ';' | '\n' if p_depth == 0 => return Some((i, i + 1)),
+            _ if p_depth == 0
+                && i > 0
+                && src.as_bytes()[i - 1].is_ascii_whitespace()
+                && src[i..].starts_with("in")
+                && src[i + 2..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_whitespace()) =>
+            {
+                return Some((i, i + 2));
+            }
             _ => {}
         }
         i += ch.len_utf8();
@@ -68,11 +79,11 @@ pub(super) fn inline_stmt_let_bindings(stmt: &str) -> String {
             break;
         };
         let after_eq = after_name[eq_idx + 2..].trim_start();
-        let Some(sc_idx) = scan_let_rhs_terminator(after_eq) else {
+        let Some((rhs_end, body_start)) = scan_let_rhs_terminator(after_eq) else {
             break;
         };
-        let rhs = &after_eq[..sc_idx];
-        let body = &after_eq[sc_idx + 1..];
+        let rhs = &after_eq[..rhs_end];
+        let body = &after_eq[body_start..];
         let rhs_wrapped = format!("({})", rhs.trim());
         cur = replace_ident_boundary(body.trim(), var_name, &rhs_wrapped);
     }
@@ -725,29 +736,58 @@ pub(super) fn replace_ident_boundary(haystack: &str, ident: &str, replacement: &
     while i < haystack.len() {
         let b = hs_bytes[i];
         if matches!(b, b'-' | b'/' | b'\'' | b'"' | b'r' | 0xC2) {
-            if let Some(span) = skip_lean_lexeme(haystack, i) {
-                if span.is_comment {
-                    out.push_str(&haystack[i..span.end]);
-                    i = span.end;
+            if matches!(b, b'"' | b'\'') && i >= 2 && hs_bytes[i - 1] == b'!' {
+                let interp_tag_ok = haystack[..i - 1]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_ident_continue);
+                if b == b'"' && interp_tag_ok {
+                    let mut j = i + 1;
+                    while j < hs_bytes.len() {
+                        match hs_bytes[j] {
+                            b'\\' => j = (j + 2).min(hs_bytes.len()),
+                            b'"' => {
+                                j += 1;
+                                break;
+                            }
+                            b'{' => {
+                                j += 1;
+                                let mut depth = 1usize;
+                                while j < hs_bytes.len() && depth > 0 {
+                                    if let Some(sp) = skip_lean_lexeme(haystack, j) {
+                                        j = sp.end;
+                                        continue;
+                                    }
+                                    match hs_bytes[j] {
+                                        b'{' => {
+                                            depth += 1;
+                                            j += 1;
+                                        }
+                                        b'}' => {
+                                            depth -= 1;
+                                            j += 1;
+                                        }
+                                        _ => {
+                                            j += haystack[j..].chars().next().unwrap().len_utf8();
+                                        }
+                                    }
+                                }
+                            }
+                            _ => j += haystack[j..].chars().next().unwrap().len_utf8(),
+                        }
+                    }
+                    out.push_str(&replace_ident_in_interpolated_string(
+                        &haystack[i..j],
+                        ident,
+                        replacement,
+                    ));
+                    i = j;
                     continue;
                 }
-                if span.is_literal {
-                    let is_interp = b == b'"'
-                        && i >= 2
-                        && hs_bytes[i - 1] == b'!'
-                        && haystack[..i - 1]
-                            .chars()
-                            .next_back()
-                            .is_some_and(is_ident_continue);
-                    if is_interp {
-                        out.push_str(&replace_ident_in_interpolated_string(
-                            &haystack[i..span.end],
-                            ident,
-                            replacement,
-                        ));
-                    } else {
-                        out.push_str(&haystack[i..span.end]);
-                    }
+            }
+            if let Some(span) = skip_lean_lexeme(haystack, i) {
+                if span.is_comment || span.is_literal {
+                    out.push_str(&haystack[i..span.end]);
                     i = span.end;
                     continue;
                 }
@@ -1960,7 +2000,12 @@ pub(super) fn audit_referenced_local_defs_for_stubs(
     full_stmt.push(' ');
     full_stmt.push_str(unfolded_conclusion);
 
-    // Collect transitively referenced local defs (up to 4 hops)
+    // Collect transitively referenced local defs (up to 4 hops).
+    // Match full qualified `def_name` everywhere, and only match unqualified `short` when
+    // either `short == def_name` (top-level / same scope) or `decl.name` shares a non-empty
+    // namespace prefix with `def_name` (preventing a 1-letter helper `Foo.Bar.v` in an
+    // unrelated sibling directory from colliding with every binder `v` in `Root.Spec`).
+    let decl_ns = decl.name.rsplit_once('.').map(|(ns, _)| ns).unwrap_or("");
     let mut visited = std::collections::HashSet::new();
     let mut frontier = vec![full_stmt];
     let mut referenced = Vec::new();
@@ -1970,10 +2015,14 @@ pub(super) fn audit_referenced_local_defs_for_stubs(
             if visited.contains(def_name.as_str()) {
                 continue;
             }
-            let short = def_name.rsplit('.').next().unwrap_or(def_name.as_str());
+            let (def_ns, short) = def_name.rsplit_once('.').unwrap_or(("", def_name.as_str()));
+            let allow_short_match = def_ns.is_empty()
+                || decl_ns == def_ns
+                || decl_ns.starts_with(&format!("{def_ns}."))
+                || def_ns.starts_with(&format!("{decl_ns}."));
             let is_ref = frontier.iter().any(|txt| {
                 replace_ident_boundary(txt, def_name, "__REF__") != *txt
-                    || replace_ident_boundary(txt, short, "__REF__") != *txt
+                    || (allow_short_match && replace_ident_boundary(txt, short, "__REF__") != *txt)
             });
             if is_ref {
                 visited.insert(def_name.clone());
@@ -2762,7 +2811,7 @@ pub(super) fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<Ex
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 15;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 16;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -3473,26 +3522,17 @@ fn expand_audit_spec_targets(files: &[PathBuf]) -> Vec<(PathBuf, Option<String>)
     expanded
 }
 
-fn audit_spec_files_resolving_per_target(
+fn run_audit_spec_batch_with<F>(
     files: &[PathBuf],
     decl_filter: Option<&str>,
-    policy_override: Option<&str>,
-    config_override: Option<&Path>,
-    forbid_namespaces: &[String],
-    forbid_decl_kinds: &[String],
-) -> serde_json::Value {
+    fallback_policy_label: Option<&str>,
+    audit_one: F,
+) -> serde_json::Value
+where
+    F: Fn(&Path) -> serde_json::Value + Sync,
+{
     if files.len() == 1 && !files[0].is_dir() {
-        let f = &files[0];
-        return match AuditSpecPolicyConfig::try_load_for_target(
-            f,
-            policy_override,
-            config_override,
-            forbid_namespaces,
-            forbid_decl_kinds,
-        ) {
-            Ok(pol) => audit_spec_file_or_source_with_policy(f, None, decl_filter, &pol),
-            Err(err) => build_audit_spec_error_report(f, decl_filter, format!("{:#}", err)),
-        };
+        return audit_one(&files[0]);
     }
     let t0 = Instant::now();
     let targets = expand_audit_spec_targets(files);
@@ -3512,6 +3552,7 @@ fn audit_spec_files_resolving_per_target(
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 let next_ref = &next_idx;
+                let audit_ref = &audit_one;
                 s.spawn(move || {
                     let mut local = Vec::new();
                     loop {
@@ -3523,25 +3564,7 @@ fn audit_spec_files_resolving_per_target(
                         let rep = if let Some(err_msg) = maybe_err {
                             build_audit_spec_error_report(f, decl_filter, err_msg.clone())
                         } else {
-                            match AuditSpecPolicyConfig::try_load_for_target(
-                                f,
-                                policy_override,
-                                config_override,
-                                forbid_namespaces,
-                                forbid_decl_kinds,
-                            ) {
-                                Ok(pol) => audit_spec_file_or_source_with_policy(
-                                    f,
-                                    None,
-                                    decl_filter,
-                                    &pol,
-                                ),
-                                Err(err) => build_audit_spec_error_report(
-                                    f,
-                                    decl_filter,
-                                    format!("{:#}", err),
-                                ),
-                            }
+                            audit_ref(f)
                         };
                         local.push((i, rep));
                     }
@@ -3556,7 +3579,29 @@ fn audit_spec_files_resolving_per_target(
         indexed.sort_by_key(|(i, _)| *i);
         indexed.into_iter().map(|(_, r)| r).collect()
     });
-    aggregate_audit_spec_reports(per_file_reports, decl_filter, policy_override, t0)
+    aggregate_audit_spec_reports(per_file_reports, decl_filter, fallback_policy_label, t0)
+}
+
+fn audit_spec_files_resolving_per_target(
+    files: &[PathBuf],
+    decl_filter: Option<&str>,
+    policy_override: Option<&str>,
+    config_override: Option<&Path>,
+    forbid_namespaces: &[String],
+    forbid_decl_kinds: &[String],
+) -> serde_json::Value {
+    run_audit_spec_batch_with(files, decl_filter, policy_override, |f| {
+        match AuditSpecPolicyConfig::try_load_for_target(
+            f,
+            policy_override,
+            config_override,
+            forbid_namespaces,
+            forbid_decl_kinds,
+        ) {
+            Ok(pol) => audit_spec_file_or_source_with_policy(f, None, decl_filter, &pol),
+            Err(err) => build_audit_spec_error_report(f, decl_filter, format!("{:#}", err)),
+        }
+    })
 }
 
 /// Audit theorem specifications across multiple `files` concurrently, resolving project/policy
@@ -3570,54 +3615,9 @@ pub fn audit_spec_files_with_policy(
     decl_filter: Option<&str>,
     policy: &AuditSpecPolicyConfig,
 ) -> serde_json::Value {
-    if files.len() == 1 && !files[0].is_dir() {
-        return audit_spec_file_or_source_with_policy(&files[0], None, decl_filter, policy);
-    }
-    let t0 = Instant::now();
-    let targets = expand_audit_spec_targets(files);
-    if targets.len() == 1 {
-        let (f, maybe_err) = &targets[0];
-        if let Some(err_msg) = maybe_err {
-            return build_audit_spec_error_report(f, decl_filter, err_msg.clone());
-        }
-    }
-    let targets_slice = targets.as_slice();
-    let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(targets_slice.len().max(1));
-    let next_idx = std::sync::atomic::AtomicUsize::new(0);
-    let per_file_reports: Vec<serde_json::Value> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..workers)
-            .map(|_| {
-                let next_ref = &next_idx;
-                s.spawn(move || {
-                    let mut local = Vec::new();
-                    loop {
-                        let i = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if i >= targets_slice.len() {
-                            break;
-                        }
-                        let (f, maybe_err) = &targets_slice[i];
-                        let rep = if let Some(err_msg) = maybe_err {
-                            build_audit_spec_error_report(f, decl_filter, err_msg.clone())
-                        } else {
-                            audit_spec_file_or_source_with_policy(f, None, decl_filter, policy)
-                        };
-                        local.push((i, rep));
-                    }
-                    local
-                })
-            })
-            .collect();
-        let mut indexed: Vec<(usize, serde_json::Value)> = handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
-            .collect();
-        indexed.sort_by_key(|(i, _)| *i);
-        indexed.into_iter().map(|(_, r)| r).collect()
-    });
-    aggregate_audit_spec_reports(per_file_reports, decl_filter, Some(&policy.policy), t0)
+    run_audit_spec_batch_with(files, decl_filter, Some(&policy.policy), |f| {
+        audit_spec_file_or_source_with_policy(f, None, decl_filter, policy)
+    })
 }
 
 /// Audit theorem specifications in `files` for vacuous preconditions and postcondition tightness.
