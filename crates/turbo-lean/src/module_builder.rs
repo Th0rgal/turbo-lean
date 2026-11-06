@@ -39548,6 +39548,7 @@ globs = ["Down.+"]
                     "schemaVersion": "2025-09-10",
                     "depHash": format!("{dep_h:016x}"),
                     "outputs": {
+                        "m": false,
                         "o": [format!("{o_h:016x}.olean")],
                         "i": format!("{i_h:016x}.ilean")
                     }

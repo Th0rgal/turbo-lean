@@ -2236,7 +2236,7 @@ private def isWhitelistedPublicSigExtName (extStr : String) : Bool :=
             let mTyHash := TurboLean.Blake3.blake3Bytes (TurboLean.StatementHash.exprJson norm mTy).compress.toUTF8
             s!"{canonicalName (norm dName)}:{mTyHash}").qsort (· < ·)
       ))
-    else if ci.type.isAppOf `Lean.EnvExtension then
+    else if ci.type.isAppOf `Lean.EnvExtension || ci.type.isAppOf `Lean.Compiler.LCNF.CacheExtension then
       Command.elabCommand (← `(
         private def $fnId:ident (_env : Environment) (_idx : ModuleIdx)
             (_norm : Name → Name) : Array String := #[]
