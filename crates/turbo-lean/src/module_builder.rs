@@ -28339,7 +28339,8 @@ lean_lib Smoke where
             "int native_link_entry(void) { return 42; }\n",
         )?;
         let object = dir.join("entry.o");
-        let status = Command::new("/usr/bin/clang-18")
+        let (cc, _cflags, _link_flags, _toolchain_native, _custom_cc) = lake_cc_and_flags(&cfg)?;
+        let status = Command::new(&cc)
             .args(["-fPIC", "-c"])
             .arg(dir.join("entry.c"))
             .arg("-o")
