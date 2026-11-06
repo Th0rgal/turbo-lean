@@ -77,6 +77,19 @@ fn match_expected_decl_identity(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Return a per-UID `0700` scratch base inside `std::env::temp_dir()` when every ancestor is
+/// owned by `root` or `geteuid()` and only sticky when writable by others (falling back to
+/// `ensure_verified_private_staging_dir(Some("scratch"))`).
+pub(crate) fn verified_private_temp_scratch_base() -> Result<PathBuf> {
+    if let Some(dir) = crate::zygote::private_temp_subdir("turbo_lean_scratch") {
+        return Ok(dir);
+    }
+    crate::shm_cache::ensure_verified_private_staging_dir(Some("scratch")).ok_or_else(|| {
+        anyhow::anyhow!("Failed to establish a verified private (0700) temporary scratch root")
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compile_and_read_probe_identities(
     probe: &str,
     project_dir: &Path,
@@ -91,12 +104,13 @@ fn compile_and_read_probe_identities(
     // Three disjoint private (0700, exclusively created) scratch directories separate
     // read-only probe input (`src_scratch`), compiler output (`out_scratch`), and the
     // trusted reader's frozen `.olean` copy (`reader_scratch`).
-    let src_scratch = PrivateScratchDir::create(&std::env::temp_dir(), "turbo_id_src")?;
+    let scratch_base = verified_private_temp_scratch_base()?;
+    let src_scratch = PrivateScratchDir::create(&scratch_base, "turbo_id_src")?;
     let nonce = src_scratch.nonce.clone();
     let out_scratch =
-        PrivateScratchDir::create_with_nonce(&std::env::temp_dir(), "turbo_id_out", nonce.clone())?;
+        PrivateScratchDir::create_with_nonce(&scratch_base, "turbo_id_out", nonce.clone())?;
     let reader_scratch =
-        PrivateScratchDir::create_with_nonce(&std::env::temp_dir(), "turbo_id_rdr", nonce.clone())?;
+        PrivateScratchDir::create_with_nonce(&scratch_base, "turbo_id_rdr", nonce.clone())?;
     let probe_nonce = format!("id_{nonce}");
     let result = (|| -> Result<Vec<OleanDeclEntry>> {
         let module = format!("TurboIdentityProbe_{nonce}");
@@ -988,7 +1002,7 @@ fn cache_shm_stat_split(
         let st_path = shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
         let src_b3 = blake3::hash(active_src.as_bytes()).to_hex().to_string();
         let entry = ShmCachedFileSplit {
-            split_key: format!("file-split:v15:{}", src_b3),
+            split_key: TurboStore::compute_file_split_key_from_src_hash(&src_b3),
             src_blake3: src_b3,
             split: compact_split_for_shm_cache(split),
             prefix_src: String::new(),
@@ -1271,17 +1285,15 @@ fn stateless_imports_replayed_in_store(
     if !cfg.toolchain_lib_lean.as_os_str().is_empty() && !dirs.contains(&cfg.toolchain_lib_lean) {
         dirs.push(cfg.toolchain_lib_lean.clone());
     }
+    let mut replay_batch =
+        crate::module_builder::ReplayLookupBatchCache::new(ro_store, &cfg, local_lean_path);
     let mut worklist = crate::module_builder::parse_header_info(active_src).imports;
     let mut seen = HashSet::new();
     while let Some(m) = worklist.pop() {
         if !seen.insert(m.clone()) {
             continue;
         }
-        let rel = format!(
-            "{}.olean",
-            crate::module_builder::module_name_to_rel_slash(&m)
-        );
-        let Some(path) = dirs.iter().map(|d| d.join(&rel)).find(|p| p.is_file()) else {
+        let Some(path) = replay_batch.resolve_module_olean(&m) else {
             return false;
         };
         if crate::module_builder::is_verified_toolchain_olean_file(
@@ -1291,20 +1303,13 @@ fn stateless_imports_replayed_in_store(
         ) {
             continue;
         }
-        if !crate::module_builder::is_olean_replayed_in_store(
-            ro_store,
-            &cfg,
-            local_lean_path,
-            &path,
-        ) {
+        if !replay_batch.is_replayed_in_store(ro_store, &cfg, local_lean_path, &path) {
             return false;
         }
-        let Ok(bytes) = fs::read(&path) else {
+        let Ok((imps, _)) = crate::module_builder::read_olean_binary_imports_cached(&path) else {
             return false;
         };
-        if let Some((imps, _)) = crate::module_builder::parse_olean_binary_imports(&bytes) {
-            worklist.extend(imps.into_iter().map(|i| i.module));
-        }
+        worklist.extend(imps.into_iter().map(|i| i.module));
     }
     true
 }
@@ -1906,20 +1911,29 @@ fn run_check_command_inner(
                 resolved_file.display()
             );
         }
-        return check_directory(
-            store,
-            json_output,
-            emit_stdout,
-            &kernel_prov,
-            &t0,
-            &file,
-            &resolved_file,
-            &canon_dir,
-            &toolchain,
-            jobs,
-            remote_http.as_deref(),
-            allow_sorry,
-        );
+        return {
+            let dir_res = check_directory(
+                store,
+                json_output,
+                emit_stdout,
+                &kernel_prov,
+                &t0,
+                &file,
+                &resolved_file,
+                &canon_dir,
+                &toolchain,
+                jobs,
+                remote_http.as_deref(),
+                allow_sorry,
+            );
+            if dir_res.is_err() && allow_sorry {
+                let dir_files = collect_lean_files(&resolved_file);
+                crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(
+                    &canon_dir, &dir_files,
+                );
+            }
+            dir_res
+        };
     }
 
     let canon_resolved_initial = resolved_file
@@ -1938,10 +1952,11 @@ fn run_check_command_inner(
             );
         }
         fresh_res?;
-        let import_res = crate::module_builder::ensure_imported_oleans_replayed(
+        let import_res = crate::module_builder::ensure_imported_oleans_replayed_with_options(
             store,
             &canon_dir,
             std::slice::from_ref(&canon_resolved_initial),
+            allow_sorry,
         );
         if import_res.is_err() && allow_sorry {
             crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(
@@ -2032,7 +2047,7 @@ fn run_check_command_inner(
             let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
             if let Some((ref st_path, _)) = st_paths_opt {
                 let entry = ShmCachedFileSplit {
-                    split_key: format!("file-split:v15:{}", src_b3),
+                    split_key: TurboStore::compute_file_split_key_from_src_hash(&src_b3),
                     src_blake3: src_b3.clone(),
                     split: compact_split_for_shm_cache(&sp),
                     prefix_src: String::new(),
@@ -2072,7 +2087,7 @@ fn run_check_command_inner(
                     split_key: if src_b3.is_empty() {
                         String::new()
                     } else {
-                        format!("file-split:v15:{}", src_b3)
+                        TurboStore::compute_file_split_key_from_src_hash(&src_b3)
                     },
                     src_blake3: src_b3,
                     split: compact_split_for_shm_cache(&fast_res.0),
@@ -2311,12 +2326,19 @@ fn run_check_command_inner(
     }
     let res = res_or_err?;
     if !emit_olean {
-        crate::lake_build::recheck_dependents_if_nonlocal_with_options(
+        let recheck_res = crate::lake_build::recheck_dependents_if_nonlocal_with_options(
             store,
             &canon_dir,
             &resolved_file,
             allow_sorry,
-        )?;
+        );
+        if recheck_res.is_err() && allow_sorry {
+            crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(
+                &canon_dir,
+                std::slice::from_ref(&canon_resolved_initial),
+            );
+        }
+        recheck_res?;
     }
     Ok(res)
 }
@@ -2346,8 +2368,12 @@ fn check_directory(
         crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(canon_dir, &dir_files);
     }
     fresh_res?;
-    let import_res =
-        crate::module_builder::ensure_imported_oleans_replayed(store, canon_dir, &dir_files);
+    let import_res = crate::module_builder::ensure_imported_oleans_replayed_with_options(
+        store,
+        canon_dir,
+        &dir_files,
+        allow_sorry,
+    );
     if import_res.is_err() && allow_sorry {
         crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(canon_dir, &dir_files);
     }
@@ -2361,21 +2387,25 @@ fn check_directory(
     let mut parsed_files = Vec::with_capacity(split_entries.len());
     let mut all_shard_keys = Vec::new();
     let mut sorry_files: Vec<PathBuf> = Vec::new();
+    let tainted_sorry_paths = if allow_sorry {
+        crate::lake_build::workspace_tainted_sorry_paths(canon_dir, &dir_files)
+    } else {
+        HashSet::new()
+    };
 
     for (lf, src_blake3, src, split) in split_entries {
-        anyhow::ensure!(
-            !split.hygiene.has_checking_weakening,
-            "Soundness hygiene violation in {}: {:?}",
-            lf.display(),
-            split.hygiene.disallowed_items()
-        );
         let rel = lf.strip_prefix(canon_dir).unwrap_or(&lf);
         dir_hasher.update(rel.to_string_lossy().as_bytes());
         dir_hasher.update(b":");
         dir_hasher.update(split.interface_hash.as_bytes());
         dir_hasher.update(b"\n");
 
-        if allow_sorry && split.hygiene.is_clean_modulo_sorry() {
+        let lf_canon = lf.canonicalize().unwrap_or_else(|_| lf.clone());
+        if allow_sorry
+            && split.hygiene.is_clean_modulo_sorry()
+            && (!split.hygiene.is_clean_for_certification()
+                || tainted_sorry_paths.contains(&lf_canon))
+        {
             sorry_files.push(lf);
             continue;
         }
@@ -2399,8 +2429,9 @@ fn check_directory(
         .filter(|(_, _, _, split, _, _)| {
             if allow_sorry {
                 !split.hygiene.is_clean_modulo_sorry()
+                    && !split.hygiene.is_clean_or_deferred_to_kernel_gate()
             } else {
-                !split.hygiene.is_clean_for_certification()
+                !split.hygiene.is_clean_or_deferred_to_kernel_gate()
             }
         })
         .map(|(lf, _, _, split, _, _)| {
@@ -2488,9 +2519,14 @@ fn check_directory(
 
     let mut total_hits = 0usize;
     let mut uncached_files = Vec::new();
-    let mut all_uncached_hygiene_clean = true;
+    let mut deferred_kernel_gate_files = Vec::new();
     for (lf, src_blake3, src, split, file_keys, file_lean_args) in parsed_files {
         let file_hygiene_clean = split.hygiene.is_clean_for_certification();
+        if !file_hygiene_clean {
+            let names: HashSet<String> = split.shards.iter().map(|s| s.rooted_name()).collect();
+            deferred_kernel_gate_files.push((lf, src, names, file_lean_args));
+            continue;
+        }
         let mut file_uncached = Vec::new();
         for (idx, shard) in split.shards.into_iter().enumerate() {
             let k = file_keys[idx].clone();
@@ -2501,10 +2537,47 @@ fn check_directory(
             }
         }
         if !file_uncached.is_empty() {
-            if !file_hygiene_clean {
-                all_uncached_hygiene_clean = false;
-            }
             uncached_files.push((lf, src_blake3, src, file_uncached, file_lean_args));
+        }
+    }
+
+    let deferred_verified_files = deferred_kernel_gate_files.len();
+    if !deferred_kernel_gate_files.is_empty() {
+        let (def_env_vars, _) = resolve_lake_env(store, canon_dir)?;
+        let def_lean_bin = resolve_lean_bin(canon_dir)?;
+        for (lf, mut src, names, file_lean_args) in deferred_kernel_gate_files {
+            if src.is_empty() {
+                src = fs::read_to_string(&lf).with_context(|| {
+                    format!(
+                        "Failed to read deferred policy-gated file `{}`",
+                        lf.display()
+                    )
+                })?;
+            }
+            let (out, _) = crate::zygote::run_audited_lean_shard_at_with_types_report(
+                &store.root,
+                &store.fast_staging_dir(),
+                Path::new(&def_lean_bin),
+                &def_env_vars,
+                Some(canon_dir),
+                Some(&lf),
+                &src,
+                &names,
+                false,
+                &[],
+                &file_lean_args,
+                Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+            )?;
+            if !out.status.success() {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                anyhow::bail!(
+                    "Directory check failed in {}:\n{}\n{}",
+                    lf.display(),
+                    stdout,
+                    stderr
+                );
+            }
         }
     }
 
@@ -2516,7 +2589,7 @@ fn check_directory(
         let mut out_json = serde_json::json!({
             "status": if dir_used_sorry {
                 "verified_modulo_sorry"
-            } else if dir_sorry_misses > 0 {
+            } else if dir_sorry_misses > 0 || deferred_verified_files > 0 {
                 "file_verified"
             } else {
                 "all_shards_cached"
@@ -2560,12 +2633,21 @@ fn check_directory(
                     combined_hits,
                     elapsed_ms
                 );
-            } else {
+            } else if deferred_verified_files == 0 {
                 println!(
                     "[turbo-lean] ALL {} THEOREM SHARDS CACHED across {} files in {} ({} ms)",
                     combined_hits,
                     dir_files.len(),
                     file.display(),
+                    elapsed_ms
+                );
+            } else {
+                println!(
+                    "[turbo-lean] DIRECTORY VERIFIED across {} files in {} ({} shard hits, {} policy-gated files, {} ms)",
+                    dir_files.len(),
+                    file.display(),
+                    combined_hits,
+                    deferred_verified_files,
                     elapsed_ms
                 );
             }
@@ -2592,7 +2674,6 @@ fn check_directory(
     let pid = std::process::id();
 
     let proj_build_verified = remote_http.is_none()
-        && all_uncached_hygiene_clean
         && load_verified_project_manifest(canon_dir).is_some_and(|manifest| {
             uncached_files.iter().all(|(lf, sb, _, _, _)| {
                 !sb.is_empty()
@@ -2632,16 +2713,12 @@ fn check_directory(
         let canon_lf = lf.canonicalize().unwrap_or_else(|_| lf.clone());
         if let Some(mod_imp) = resolve_replayed_prebuilt_module_import(store, canon_dir, &canon_lf)
         {
-            if proj_build_verified {
+            let uncached_names: HashSet<String> = file_uncached
+                .iter()
+                .map(|(_, sh)| sh.rooted_name())
+                .collect();
+            if splitter::can_use_fast_olean_import(src, &uncached_names) {
                 cross_eligible.push((mod_imp, src.as_str(), file_uncached));
-            } else {
-                let uncached_names: HashSet<String> = file_uncached
-                    .iter()
-                    .map(|(_, sh)| sh.rooted_name())
-                    .collect();
-                if splitter::can_use_fast_olean_import(src, &uncached_names) {
-                    cross_eligible.push((mod_imp, src.as_str(), file_uncached));
-                }
             }
         }
     }
@@ -3318,7 +3395,7 @@ fn check_single_decl(
                         let st_path =
                             shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
                         let entry = ShmCachedFileSplit {
-                            split_key: format!("file-split:v15:{}", sub_b3),
+                            split_key: TurboStore::compute_file_split_key_from_src_hash(&sub_b3),
                             src_blake3: sub_b3.clone(),
                             split: compact_split_for_shm_cache(&sub_split),
                             prefix_src: if sub_src.len() <= 64 * 1024 {
@@ -3773,311 +3850,318 @@ fn check_single_decl(
         return Ok(out_json);
     }
 
-    if let Some(remote_url) = remote_http {
-        if db_warm_on_open
-            && store.has_attested_decl_receipt(
-                &shard_key,
-                "trusted",
-                target_decl,
-                &attested.kernel_type_hash,
-            )
-        {
-            let elapsed_ms = t0.elapsed().as_millis();
-            let out_json = make_cache_hit_json(false, elapsed_ms);
-            if emit_stdout {
-                if json_output {
-                    println!("{}", serde_json::to_string_pretty(&out_json)?);
-                } else {
-                    println!(
-                        "[turbo-lean] SHARD CACHE HIT `{}` (coalesced=false, {} ms)",
-                        target_decl, elapsed_ms
-                    );
+    if split.hygiene.is_clean_for_certification() {
+        if let Some(remote_url) = remote_http {
+            if db_warm_on_open
+                && store.has_attested_decl_receipt(
+                    &shard_key,
+                    "trusted",
+                    target_decl,
+                    &attested.kernel_type_hash,
+                )
+            {
+                let elapsed_ms = t0.elapsed().as_millis();
+                let out_json = make_cache_hit_json(false, elapsed_ms);
+                if emit_stdout {
+                    if json_output {
+                        println!("{}", serde_json::to_string_pretty(&out_json)?);
+                    } else {
+                        println!(
+                            "[turbo-lean] SHARD CACHE HIT `{}` (coalesced=false, {} ms)",
+                            target_decl, elapsed_ms
+                        );
+                    }
                 }
+                return Ok(out_json);
             }
-            return Ok(out_json);
-        }
-        if active_src.is_empty() {
-            active_src = fs::read_to_string(&active_file)
-                .with_context(|| format!("Failed to read {}", active_file.display()))?;
-        }
-        let canon_file = if active_file == resolved_file {
-            canon_resolved_initial.to_path_buf()
-        } else {
-            active_file
-                .canonicalize()
-                .unwrap_or_else(|_| active_file.clone())
-        };
-        let rooted_target = shard.rooted_name();
-        let single_set = HashSet::from([rooted_target.clone()]);
-        let pruned_src = splitter::build_pruned_imports_shard_source(&active_src, &single_set);
-        let fast_olean_src = if split.shards.len() <= 1 {
-            None
-        } else {
-            resolve_replayed_prebuilt_module_import(store, canon_dir, &canon_file).and_then(
-                |mod_imp| {
-                    splitter::build_fast_olean_shard_source_with_split(
-                        &active_src,
-                        split,
-                        &mod_imp,
-                        &single_set,
-                    )
-                },
-            )
-        };
-        let endpoint = format!("{}/check-shard", remote_url.trim_end_matches('/'));
-        let cached_env = if db_warm_on_open {
-            let env_key = TurboStore::compute_lake_env_key(canon_dir);
-            store.get_lake_env(&env_key).ok().flatten()
-        } else {
-            None
-        };
-        let local_lean_path = resolve_remote_lean_path(canon_dir, cached_env.as_ref());
-
-        let fast_candidates: Vec<(&str, bool)> = if let Some(ref psrc) = pruned_src {
-            if let Some(ref fsrc) = fast_olean_src {
-                vec![(psrc.as_str(), true), (fsrc.as_str(), true)]
-            } else {
-                vec![(psrc.as_str(), true)]
+            if active_src.is_empty() {
+                active_src = fs::read_to_string(&active_file)
+                    .with_context(|| format!("Failed to read {}", active_file.display()))?;
             }
-        } else if let Some(ref fsrc) = fast_olean_src {
-            vec![(fsrc.as_str(), true)]
-        } else {
-            vec![]
-        };
-
-        let mut resp_json = serde_json::Value::Null;
-        let mut remote_status = String::from("unknown");
-        let mut fast_olean_used = false;
-        let mut last_err: Option<anyhow::Error> = None;
-        let mut prestaged_receipt: Option<Vec<u8>> = None;
-        let mut inflight_tx_open = false;
-
-        let full_shard_src: String;
-        let mut candidates = fast_candidates;
-        if candidates.is_empty() {
-            full_shard_src = if !shard.shard_source.is_empty() {
-                shard.shard_source.clone()
+            let canon_file = if active_file == resolved_file {
+                canon_resolved_initial.to_path_buf()
             } else {
-                splitter::reconstruct_single_shard_source(&active_src, &rooted_target)?
-                    .unwrap_or_default()
+                active_file
+                    .canonicalize()
+                    .unwrap_or_else(|_| active_file.clone())
             };
-            candidates.push((full_shard_src.as_str(), false));
-        }
+            let rooted_target = shard.rooted_name();
+            let single_set = HashSet::from([rooted_target.clone()]);
+            let pruned_src = splitter::build_pruned_imports_shard_source(&active_src, &single_set);
+            let fast_olean_src = if split.shards.len() <= 1 {
+                None
+            } else {
+                resolve_replayed_prebuilt_module_import(store, canon_dir, &canon_file).and_then(
+                    |mod_imp| {
+                        splitter::build_fast_olean_shard_source_with_split(
+                            &active_src,
+                            split,
+                            &mod_imp,
+                            &single_set,
+                        )
+                    },
+                )
+            };
+            let endpoint = format!("{}/check-shard", remote_url.trim_end_matches('/'));
+            let cached_env = if db_warm_on_open {
+                let env_key = TurboStore::compute_lake_env_key(canon_dir);
+                store.get_lake_env(&env_key).ok().flatten()
+            } else {
+                None
+            };
+            let local_lean_path = resolve_remote_lean_path(canon_dir, cached_env.as_ref());
 
-        for (cand_src, is_fast) in &candidates {
-            let is_fast = *is_fast;
-            let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
-                decl: target_decl.to_string(),
-                shard_key: shard_key.clone(),
-                shard_source: (*cand_src).to_string(),
-                interface_hash: split.interface_hash.clone(),
-                prefix_env_hash: shard.prefix_env_hash.clone(),
-                stmt_hash: shard.stmt_hash.clone(),
-                proof_hash: shard.proof_hash.clone(),
-                toolchain: toolchain.to_string(),
-                lean_path: local_lean_path.clone(),
-                skip_cas_lock: false,
-                allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
-                lean_args: file_lean_args.clone(),
-                targets: vec![rooted_target.clone()],
-                expected_kernel_type_hash: Some(attested.kernel_type_hash.clone()),
-            })?;
-            match pack::http_request_with_inflight(
-                "POST",
-                &endpoint,
-                "application/json",
-                &req_body,
-                || {
-                    if db_warm_on_open && !inflight_tx_open {
-                        if let Ok(r_bytes) = make_attested_shard_receipt_bytes(
-                            target_decl,
-                            &shard.prefix_env_hash,
-                            &shard.stmt_hash,
-                            &shard.proof_hash,
-                            db::now_unix(),
-                            Some(&attested.kernel_type_hash),
-                        ) {
-                            let items = [(
-                                shard_key.clone(),
-                                target_decl.to_string(),
-                                r_bytes.clone(),
-                                1,
-                            )];
-                            if store
-                                .begin_inflight_publish_theorem_shards(toolchain, "trusted", &items)
-                                .is_ok()
-                            {
-                                inflight_tx_open = true;
+            let fast_candidates: Vec<(&str, bool)> = if let Some(ref psrc) = pruned_src {
+                if let Some(ref fsrc) = fast_olean_src {
+                    vec![(psrc.as_str(), true), (fsrc.as_str(), true)]
+                } else {
+                    vec![(psrc.as_str(), true)]
+                }
+            } else if let Some(ref fsrc) = fast_olean_src {
+                vec![(fsrc.as_str(), true)]
+            } else {
+                vec![]
+            };
+
+            let mut resp_json = serde_json::Value::Null;
+            let mut remote_status = String::from("unknown");
+            let mut fast_olean_used = false;
+            let mut last_err: Option<anyhow::Error> = None;
+            let mut prestaged_receipt: Option<Vec<u8>> = None;
+            let mut inflight_tx_open = false;
+
+            let full_shard_src: String;
+            let mut candidates = fast_candidates;
+            if candidates.is_empty() {
+                full_shard_src = if !shard.shard_source.is_empty() {
+                    shard.shard_source.clone()
+                } else {
+                    splitter::reconstruct_single_shard_source(&active_src, &rooted_target)?
+                        .unwrap_or_default()
+                };
+                candidates.push((full_shard_src.as_str(), false));
+            }
+
+            for (cand_src, is_fast) in &candidates {
+                let is_fast = *is_fast;
+                let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
+                    decl: target_decl.to_string(),
+                    shard_key: shard_key.clone(),
+                    shard_source: (*cand_src).to_string(),
+                    interface_hash: split.interface_hash.clone(),
+                    prefix_env_hash: shard.prefix_env_hash.clone(),
+                    stmt_hash: shard.stmt_hash.clone(),
+                    proof_hash: shard.proof_hash.clone(),
+                    toolchain: toolchain.to_string(),
+                    lean_path: local_lean_path.clone(),
+                    skip_cas_lock: false,
+                    allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
+                    lean_args: file_lean_args.clone(),
+                    targets: vec![rooted_target.clone()],
+                    expected_kernel_type_hash: Some(attested.kernel_type_hash.clone()),
+                })?;
+                match pack::http_request_with_inflight(
+                    "POST",
+                    &endpoint,
+                    "application/json",
+                    &req_body,
+                    || {
+                        if db_warm_on_open && !inflight_tx_open {
+                            if let Ok(r_bytes) = make_attested_shard_receipt_bytes(
+                                target_decl,
+                                &shard.prefix_env_hash,
+                                &shard.stmt_hash,
+                                &shard.proof_hash,
+                                db::now_unix(),
+                                Some(&attested.kernel_type_hash),
+                            ) {
+                                let items = [(
+                                    shard_key.clone(),
+                                    target_decl.to_string(),
+                                    r_bytes.clone(),
+                                    1,
+                                )];
+                                if store
+                                    .begin_inflight_publish_theorem_shards(
+                                        toolchain, "trusted", &items,
+                                    )
+                                    .is_ok()
+                                {
+                                    inflight_tx_open = true;
+                                }
+                                prestaged_receipt = Some(r_bytes);
                             }
-                            prestaged_receipt = Some(r_bytes);
+                        }
+                    },
+                ) {
+                    Ok(resp_bytes) => {
+                        if let Ok(rj) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
+                            let st = rj
+                                .get("status")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            if st == "remote_theorem_verified" || st == "remote_theorem_cache_hit" {
+                                let remote_type_ok = rj
+                                    .get("kernel_type_hash")
+                                    .and_then(|v| v.as_str())
+                                    .is_some_and(|h| h == attested.kernel_type_hash)
+                                    || rj
+                                        .get("decl_types")
+                                        .and_then(|v| {
+                                            serde_json::from_value::<
+                                                std::collections::BTreeMap<String, String>,
+                                            >(v.clone())
+                                            .ok()
+                                        })
+                                        .is_some_and(|m| {
+                                            crate::zygote::verify_attested_decl_types(
+                                                &m,
+                                                &expected_type_pair,
+                                            )
+                                            .is_ok()
+                                        });
+                                if remote_type_ok {
+                                    resp_json = rj;
+                                    remote_status = st;
+                                    fast_olean_used = is_fast;
+                                    last_err = None;
+                                    break;
+                                }
+                                last_err = Some(anyhow::anyhow!(
+                                "Remote shard check for `{target_decl}` on {endpoint} missed or mismatched `kernel_type_hash`"
+                            ));
+                            } else {
+                                last_err = Some(anyhow::anyhow!(
+                                    "Remote shard check failed on {}: {}",
+                                    endpoint,
+                                    rj
+                                ));
+                            }
                         }
                     }
-                },
-            ) {
-                Ok(resp_bytes) => {
+                    Err(e) => {
+                        last_err = Some(e);
+                    }
+                }
+            }
+            if last_err.is_some() && !candidates.iter().any(|(_, is_fast)| !*is_fast) {
+                let fallback_src = if !shard.shard_source.is_empty() {
+                    shard.shard_source.clone()
+                } else {
+                    splitter::reconstruct_single_shard_source(&active_src, &rooted_target)?
+                        .unwrap_or_default()
+                };
+                let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
+                    decl: target_decl.to_string(),
+                    shard_key: shard_key.clone(),
+                    shard_source: fallback_src,
+                    interface_hash: split.interface_hash.clone(),
+                    prefix_env_hash: shard.prefix_env_hash.clone(),
+                    stmt_hash: shard.stmt_hash.clone(),
+                    proof_hash: shard.proof_hash.clone(),
+                    toolchain: toolchain.to_string(),
+                    lean_path: local_lean_path.clone(),
+                    skip_cas_lock: false,
+                    allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
+                    lean_args: file_lean_args.clone(),
+                    targets: vec![rooted_target],
+                    expected_kernel_type_hash: Some(attested.kernel_type_hash.clone()),
+                })?;
+                if let Ok(resp_bytes) =
+                    pack::http_request("POST", &endpoint, "application/json", &req_body)
+                {
                     if let Ok(rj) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
                         let st = rj
                             .get("status")
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown")
                             .to_string();
-                        if st == "remote_theorem_verified" || st == "remote_theorem_cache_hit" {
-                            let remote_type_ok = rj
-                                .get("kernel_type_hash")
-                                .and_then(|v| v.as_str())
-                                .is_some_and(|h| h == attested.kernel_type_hash)
-                                || rj
-                                    .get("decl_types")
-                                    .and_then(|v| {
-                                        serde_json::from_value::<
-                                            std::collections::BTreeMap<String, String>,
-                                        >(v.clone())
-                                        .ok()
-                                    })
-                                    .is_some_and(|m| {
-                                        crate::zygote::verify_attested_decl_types(
-                                            &m,
-                                            &expected_type_pair,
-                                        )
-                                        .is_ok()
-                                    });
-                            if remote_type_ok {
-                                resp_json = rj;
-                                remote_status = st;
-                                fast_olean_used = is_fast;
-                                last_err = None;
-                                break;
-                            }
-                            last_err = Some(anyhow::anyhow!(
-                                "Remote shard check for `{target_decl}` on {endpoint} missed or mismatched `kernel_type_hash`"
-                            ));
-                        } else {
-                            last_err = Some(anyhow::anyhow!(
-                                "Remote shard check failed on {}: {}",
-                                endpoint,
-                                rj
-                            ));
+                        let remote_type_ok = rj
+                            .get("kernel_type_hash")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|h| h == attested.kernel_type_hash)
+                            || rj
+                                .get("decl_types")
+                                .and_then(|v| {
+                                    serde_json::from_value::<
+                                        std::collections::BTreeMap<String, String>,
+                                    >(v.clone())
+                                    .ok()
+                                })
+                                .is_some_and(|m| {
+                                    crate::zygote::verify_attested_decl_types(
+                                        &m,
+                                        &expected_type_pair,
+                                    )
+                                    .is_ok()
+                                });
+                        if (st == "remote_theorem_verified" || st == "remote_theorem_cache_hit")
+                            && remote_type_ok
+                        {
+                            resp_json = rj;
+                            remote_status = st;
+                            fast_olean_used = false;
+                            last_err = None;
                         }
                     }
                 }
-                Err(e) => {
-                    last_err = Some(e);
-                }
             }
-        }
-        if last_err.is_some() && !candidates.iter().any(|(_, is_fast)| !*is_fast) {
-            let fallback_src = if !shard.shard_source.is_empty() {
-                shard.shard_source.clone()
-            } else {
-                splitter::reconstruct_single_shard_source(&active_src, &rooted_target)?
-                    .unwrap_or_default()
-            };
-            let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
-                decl: target_decl.to_string(),
-                shard_key: shard_key.clone(),
-                shard_source: fallback_src,
-                interface_hash: split.interface_hash.clone(),
-                prefix_env_hash: shard.prefix_env_hash.clone(),
-                stmt_hash: shard.stmt_hash.clone(),
-                proof_hash: shard.proof_hash.clone(),
-                toolchain: toolchain.to_string(),
-                lean_path: local_lean_path.clone(),
-                skip_cas_lock: false,
-                allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
-                lean_args: file_lean_args.clone(),
-                targets: vec![rooted_target],
-                expected_kernel_type_hash: Some(attested.kernel_type_hash.clone()),
-            })?;
-            if let Ok(resp_bytes) =
-                pack::http_request("POST", &endpoint, "application/json", &req_body)
-            {
-                if let Ok(rj) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
-                    let st = rj
-                        .get("status")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let remote_type_ok = rj
-                        .get("kernel_type_hash")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|h| h == attested.kernel_type_hash)
-                        || rj
-                            .get("decl_types")
-                            .and_then(|v| {
-                                serde_json::from_value::<
-                                    std::collections::BTreeMap<String, String>,
-                                >(v.clone())
-                                .ok()
-                            })
-                            .is_some_and(|m| {
-                                crate::zygote::verify_attested_decl_types(&m, &expected_type_pair)
-                                    .is_ok()
-                            });
-                    if (st == "remote_theorem_verified" || st == "remote_theorem_cache_hit")
-                        && remote_type_ok
-                    {
-                        resp_json = rj;
-                        remote_status = st;
-                        fast_olean_used = false;
-                        last_err = None;
-                    }
+            if let Some(err) = last_err {
+                if inflight_tx_open {
+                    store.rollback_inflight_publish();
                 }
+                return Err(err);
             }
-        }
-        if let Some(err) = last_err {
+
+            let dur_ms = t0.elapsed().as_millis() as i64;
+            let server_elapsed_ms = resp_json
+                .get("server_elapsed_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             if inflight_tx_open {
-                store.rollback_inflight_publish();
+                store.commit_inflight_publish()?;
+            } else {
+                let receipt = match prestaged_receipt {
+                    Some(r) => r,
+                    None => make_attested_shard_receipt_bytes(
+                        target_decl,
+                        &shard.prefix_env_hash,
+                        &shard.stmt_hash,
+                        &shard.proof_hash,
+                        db::now_unix(),
+                        Some(&attested.kernel_type_hash),
+                    )?,
+                };
+                store.batch_publish_theorem_shards(
+                    toolchain,
+                    "trusted",
+                    &[(
+                        shard_key.clone(),
+                        target_decl.to_string(),
+                        receipt,
+                        (server_elapsed_ms as i64).max(dur_ms),
+                    )],
+                )?;
             }
-            return Err(err);
-        }
 
-        let dur_ms = t0.elapsed().as_millis() as i64;
-        let server_elapsed_ms = resp_json
-            .get("server_elapsed_ms")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        if inflight_tx_open {
-            store.commit_inflight_publish()?;
-        } else {
-            let receipt = match prestaged_receipt {
-                Some(r) => r,
-                None => make_attested_shard_receipt_bytes(
-                    target_decl,
-                    &shard.prefix_env_hash,
-                    &shard.stmt_hash,
-                    &shard.proof_hash,
-                    db::now_unix(),
-                    Some(&attested.kernel_type_hash),
-                )?,
-            };
-            store.batch_publish_theorem_shards(
-                toolchain,
-                "trusted",
-                &[(
-                    shard_key.clone(),
-                    target_decl.to_string(),
-                    receipt,
-                    (server_elapsed_ms as i64).max(dur_ms),
-                )],
+            let (_, out_json) = emit_remote_decl_result(
+                json_output,
+                emit_stdout,
+                kernel_prov,
+                &resp_json,
+                &remote_status,
+                target_decl,
+                &shard_key,
+                remote_url,
+                fast_olean_used,
+                &split.interface_hash,
+                &shard.prefix_env_hash,
+                split.shards.len(),
+                dur_ms,
             )?;
+            return Ok(out_json);
         }
-
-        let (_, out_json) = emit_remote_decl_result(
-            json_output,
-            emit_stdout,
-            kernel_prov,
-            &resp_json,
-            &remote_status,
-            target_decl,
-            &shard_key,
-            remote_url,
-            fast_olean_used,
-            &split.interface_hash,
-            &shard.prefix_env_hash,
-            split.shards.len(),
-            dur_ms,
-        )?;
-        return Ok(out_json);
     }
 
     let singleflight_outcome =
@@ -5286,10 +5370,11 @@ fn check_single_file(
     let mut hits = 0usize;
     let mut uncached_shards = Vec::new();
     let mut attested_kths: HashMap<String, String> = HashMap::new();
+    let hygiene_deferrable = split.hygiene.is_clean_or_deferred_to_kernel_gate();
     let hygiene_ok_for_split = if allow_sorry {
-        split.hygiene.is_clean_modulo_sorry()
+        split.hygiene.is_clean_modulo_sorry() || hygiene_deferrable
     } else {
-        split.hygiene.is_clean_for_certification()
+        hygiene_deferrable
     };
     if split.eligible_for_sharding && hygiene_ok_for_split && !split.shards.is_empty() {
         if src.is_empty() {
@@ -5309,10 +5394,16 @@ fn check_single_file(
             attested_kths.insert(file_shard_keys[idx].clone(), att.kernel_type_hash);
         }
     }
+    let hygiene_strictly_clean = split.hygiene.is_clean_for_certification();
     for (idx, shard) in split.shards.iter().enumerate() {
         let shard_key = file_shard_keys[idx].clone();
-        let is_attested_hit = (!allow_sorry || !shard_text_contains_sorry_or_admit(shard))
-            && cached_map.contains_key(&shard_key)
+        let is_attested_hit = if allow_sorry {
+            hygiene_strictly_clean
+                || (split.hygiene.is_clean_modulo_sorry()
+                    && !shard_text_contains_sorry_or_admit(shard))
+        } else {
+            hygiene_strictly_clean
+        } && cached_map.contains_key(&shard_key)
             && attested_kths.get(&shard_key).is_some_and(|kth| {
                 store.has_attested_decl_receipt(&shard_key, "trusted", shard.decl_name(), kth)
             });
@@ -5327,7 +5418,7 @@ fn check_single_file(
     }
     let misses = uncached_shards.len();
 
-    if allow_sorry {
+    if allow_sorry && (split.hygiene.is_clean_modulo_sorry() || !hygiene_deferrable) {
         if !split.hygiene.is_clean_modulo_sorry() {
             let items = split.hygiene.disallowed_items_modulo_sorry();
             anyhow::bail!(
@@ -5809,7 +5900,7 @@ fn check_single_file(
         return Ok(out_json);
     }
 
-    if !split.hygiene.is_clean_for_certification() {
+    if !hygiene_deferrable {
         if !crate::zygote::daemon_disabled() {
             if src.is_empty() {
                 *src = fs::read_to_string(resolved_file).unwrap_or_default();
@@ -5847,7 +5938,11 @@ fn check_single_file(
         );
     }
 
-    if misses == 0 && !split.shards.is_empty() && split.eligible_for_sharding {
+    if hygiene_strictly_clean
+        && misses == 0
+        && !split.shards.is_empty()
+        && split.eligible_for_sharding
+    {
         let elapsed_ms = t0.elapsed().as_millis();
         let mut out_json = serde_json::json!({
             "status": "all_shards_cached",
@@ -5883,7 +5978,7 @@ fn check_single_file(
 
     let requested_jobs = default_parallel_jobs(jobs);
 
-    if split.eligible_for_sharding && !uncached_shards.is_empty() {
+    if hygiene_strictly_clean && split.eligible_for_sharding && !uncached_shards.is_empty() {
         if let Some(remote_url) = remote_http {
             if src.is_empty() {
                 *src = fs::read_to_string(resolved_file)
@@ -6008,7 +6103,8 @@ fn check_single_file(
         }
     }
 
-    let use_parallel_shards = split.eligible_for_sharding && !uncached_shards.is_empty();
+    let use_parallel_shards =
+        hygiene_strictly_clean && split.eligible_for_sharding && !uncached_shards.is_empty();
 
     let proj_build_verified = split.hygiene.is_clean_for_certification()
         && cached_file_blake3
@@ -6579,12 +6675,13 @@ fn check_single_file(
                 src.is_empty() || blake3::hash(src.as_bytes()).to_hex().as_str() != expected_hex
             }
         };
+        let mut actual_hygiene_strictly_clean = hygiene_strictly_clean;
         if needs_fresh_read {
             *src = fs::read_to_string(resolved_file)
                 .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
             let actual_deps = compute_imported_olean_interface_hashes(src, canon_dir, None);
             let actual_split = split_lean_source(src, &actual_deps);
-            if !actual_split.hygiene.is_clean_for_certification() {
+            if !actual_split.hygiene.is_clean_or_deferred_to_kernel_gate() {
                 anyhow::bail!(
                     "Soundness hygiene violation in {}: {}",
                     file.display(),
@@ -6595,6 +6692,7 @@ fn check_single_file(
                     }
                 );
             }
+            actual_hygiene_strictly_clean &= actual_split.hygiene.is_clean_for_certification();
             if actual_split.interface_hash != split.interface_hash
                 || actual_split.shards.len() != split.shards.len()
                 || actual_split
@@ -6618,7 +6716,8 @@ fn check_single_file(
         let mut verified_via_zygote_eval = false;
         let mut eval_stdout_text = String::new();
         let mut eval_messages: Vec<String> = Vec::new();
-        let can_use_zygote_eval = !crate::zygote::daemon_disabled()
+        let can_use_zygote_eval = actual_hygiene_strictly_clean
+            && !crate::zygote::daemon_disabled()
             && !src.contains("IO.Process.exit")
             && !src.lines().take(20).any(|l| {
                 let t = l.split("--").next().unwrap_or(l).trim();
@@ -6864,7 +6963,7 @@ fn check_single_file(
             }
         }
         let dur_ms = t0.elapsed().as_millis() as i64;
-        if !uncached_shards.is_empty() {
+        if actual_hygiene_strictly_clean && !uncached_shards.is_empty() {
             let now = db::now_unix();
             for (shard_key, shard) in uncached_shards {
                 if let SingleflightOutcome::Leader(lease) =
@@ -8579,7 +8678,10 @@ but is expected to have type
 
     #[test]
     fn test_read_single_isolated_olean_rejects_extra_files_symlinks_and_hardlinks() -> Result<()> {
-        let scratch = PrivateScratchDir::create(&std::env::temp_dir(), "turbo_iso_olean_test")?;
+        let scratch = PrivateScratchDir::create(
+            &verified_private_temp_scratch_base()?,
+            "turbo_iso_olean_test",
+        )?;
         let out_dir = scratch.path.join("out");
         fs::create_dir_all(&out_dir)?;
 
@@ -8630,7 +8732,10 @@ but is expected to have type
     #[cfg(unix)]
     fn test_post_exit_background_child_reaped_and_frozen_dir_blocks_overwrite() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
-        let scratch = PrivateScratchDir::create(&std::env::temp_dir(), "turbo_bg_reap_test")?;
+        let scratch = PrivateScratchDir::create(
+            &verified_private_temp_scratch_base()?,
+            "turbo_bg_reap_test",
+        )?;
         let out_dir = scratch.path.join("out");
         fs::create_dir_all(&out_dir)?;
         let expected = out_dir.join("Mod.olean");
@@ -8931,7 +9036,10 @@ theorem after_macro : ext_magic = 7 := rfl
         assert_eq!(mod_atts[1].decl_name, "priv_mod_thm");
 
         // Stage isolated module artifacts rejects unexpected files while accepting `.olean.{server,private}` and `.ir{,.sig}`.
-        let iso = PrivateScratchDir::create(&std::env::temp_dir(), "turbo_iso_mod_test")?;
+        let iso = PrivateScratchDir::create(
+            &verified_private_temp_scratch_base()?,
+            "turbo_iso_mod_test",
+        )?;
         let out_m = iso.path.join("out");
         let rdr_m = iso.path.join("rdr");
         fs::create_dir_all(&out_m)?;
@@ -9202,6 +9310,374 @@ theorem after_macro : ext_magic = 7 := rfl
         }
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_check_deferred_axiom_policy_single_file_cold_and_directory() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_check_deferred_policy_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let proj = tmp_dir.join("proj");
+        fs::create_dir_all(proj.join("Mod")).unwrap();
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"def_pol\"\ndefaultTargets = [\"Mod\"]\n[[lean_lib]]\nname = \"Mod\"\nglobs = [\"Mod.+\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("Mod/Ax.lean"),
+            "axiom allowedDirAx : True\ntheorem ax_ok : True := allowedDirAx\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("Mod/Clean.lean"),
+            "theorem clean_ok : 1 + 1 = 2 := rfl\n",
+        )
+        .unwrap();
+
+        let prev_ax = std::env::var_os(crate::splitter::ALLOWED_AXIOMS_ENV);
+        std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, "allowedDirAx");
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // 1. Cold single-file check on fresh `TurboStore` must defer to kernel gate and pass.
+            let mut cold_store = TurboStore::open(Some(&tmp_dir.join("store_cold"))).unwrap();
+            let file_res = evaluate_check_command_value(
+                &mut cold_store,
+                proj.join("Mod/Ax.lean"),
+                None,
+                proj.clone(),
+            )
+            .expect("cold single-file check should allow custom allowedDirAx");
+            assert_eq!(file_res["status"], "file_verified");
+
+            // 2. Directory check must defer `Mod/Ax.lean` to kernel gate and pass (both cold and warm).
+            let mut dir_store = TurboStore::open(Some(&tmp_dir.join("store_dir"))).unwrap();
+            let dir_res =
+                evaluate_check_command_value(&mut dir_store, proj.join("Mod"), None, proj.clone())
+                    .expect("directory check should allow custom allowedDirAx");
+            assert_eq!(dir_res["status"], "file_verified");
+            let dir_warm =
+                evaluate_check_command_value(&mut dir_store, proj.join("Mod"), None, proj.clone())
+                    .expect("warm directory check should re-audit deferred file and pass");
+            assert_eq!(dir_warm["status"], "file_verified");
+
+            // 3. Disallowed axiom in directory must still be rejected by the kernel gate.
+            fs::write(
+                proj.join("Mod/Ax.lean"),
+                "axiom forbiddenDirAx : False\ntheorem ax_bad : False := forbiddenDirAx\n",
+            )
+            .unwrap();
+            let bad_err =
+                evaluate_check_command_value(&mut dir_store, proj.join("Mod"), None, proj.clone())
+                    .expect_err("directory check must reject unallowed axiom");
+            assert!(
+                format!("{bad_err:#}").contains("forbiddenDirAx"),
+                "unexpected error: {bad_err:#}"
+            );
+        }));
+        match prev_ax {
+            Some(v) => std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, v),
+            None => std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV),
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+        if let Err(p) = res {
+            std::panic::resume_unwind(p);
+        }
+    }
+
+    #[test]
+    fn test_check_single_file_remote_http_never_offloads_deferred_hygiene() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_check_remote_deferred_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let proj = tmp_dir.join("proj");
+        fs::create_dir_all(proj.join("Mod")).unwrap();
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"rem_def_pol\"\ndefaultTargets = [\"Mod\"]\n[[lean_lib]]\nname = \"Mod\"\nglobs = [\"Mod.+\"]\n",
+        )
+        .unwrap();
+
+        // Bind a mock HTTP server that unconditionally returns `{"ok": true}` and counts hits.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let remote_url = format!("http://{addr}");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let hits_bg = Arc::clone(&hits);
+        let stop_bg = Arc::clone(&stop);
+        let server_handle = std::thread::spawn(move || {
+            while !stop_bg.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ =
+                            stream.set_read_timeout(Some(std::time::Duration::from_millis(200)));
+                        let mut buf = [0u8; 8192];
+                        let _ = stream.read(&mut buf);
+                        hits_bg.fetch_add(1, Ordering::SeqCst);
+                        let body = r#"{"ok":true,"status":"shard_verified","cache_hit":false,"cache_hits":0,"verified_count":1,"stdout":"","stderr":"","verified_decl_types":{}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let prev_ax = std::env::var_os(crate::splitter::ALLOWED_AXIOMS_ENV);
+        std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, "allowedRemoteAx");
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // 1. File with theorem + disallowed trailing axiom when custom policy is set:
+            //    must NEVER hit `remote_http`, and must fail closed under local kernel gate!
+            let bad_file = proj.join("Mod/BadTrailingAx.lean");
+            fs::write(
+                &bad_file,
+                "theorem ok_thm : 1 + 1 = 2 := rfl\naxiom forbiddenRemoteAx : False\n",
+            )
+            .unwrap();
+            let mut store = TurboStore::open(Some(&tmp_dir.join("store"))).unwrap();
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            let bad_err = run_check_command_inner(
+                &mut store,
+                false,
+                true,
+                false,
+                false,
+                bad_file.clone(),
+                None,
+                proj.clone(),
+                None,
+                false,
+                Some(remote_url.clone()),
+                false,
+            )
+            .expect_err(
+                "check_single_file --remote-http must reject disallowed trailing axiom locally",
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "remote HTTP server must receive 0 requests on deferred-hygiene file"
+            );
+            assert!(
+                format!("{bad_err:#}").contains("forbiddenRemoteAx"),
+                "unexpected error: {bad_err:#}"
+            );
+
+            // Also verify `check_single_decl` (`--decl ok_thm --remote-http`) refuses to offload
+            // when the surrounding file has deferred hygiene!
+            let decl_err = run_check_command_inner(
+                &mut store,
+                false,
+                true,
+                false,
+                false,
+                bad_file,
+                Some("ok_thm".to_string()),
+                proj.clone(),
+                None,
+                false,
+                Some(remote_url.clone()),
+                false,
+            );
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "check_single_decl --remote-http must also receive 0 remote HTTP requests on deferred-hygiene file"
+            );
+            let _ = decl_err;
+
+            // 2. File with custom-allowed axiom must also receive 0 remote HTTP requests and
+            //    succeed locally through the whole-file kernel gate.
+            let ok_file = proj.join("Mod/AllowedAx.lean");
+            fs::write(
+                &ok_file,
+                "axiom allowedRemoteAx : True\ntheorem ok_allowed : True := allowedRemoteAx\n",
+            )
+            .unwrap();
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            let ok_val = run_check_command_inner(
+                &mut store,
+                false,
+                true,
+                false,
+                false,
+                ok_file,
+                None,
+                proj.clone(),
+                None,
+                false,
+                Some(remote_url.clone()),
+                false,
+            )
+            .expect("check_single_file --remote-http should pass locally for allowedRemoteAx");
+            assert_eq!(ok_val["status"], "file_verified");
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                0,
+                "remote HTTP server must receive 0 requests even when custom axiom is allowed"
+            );
+        }));
+
+        stop.store(true, Ordering::Release);
+        let _ = server_handle.join();
+        match prev_ax {
+            Some(v) => std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, v),
+            None => std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV),
+        }
+        let _ = fs::remove_dir_all(&tmp_dir);
+        if let Err(p) = res {
+            std::panic::resume_unwind(p);
+        }
+    }
+
+    #[test]
+    fn test_check_directory_allow_sorry_routes_sorry_files_and_rejects_forbidden_hygiene() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_check_dir_allow_sorry_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let proj = tmp_dir.join("proj");
+        fs::create_dir_all(proj.join("Mod")).unwrap();
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"dir_sorry\"\ndefaultTargets = [\"Mod\"]\n[[lean_lib]]\nname = \"Mod\"\nglobs = [\"Mod.+\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("Mod/Clean.lean"),
+            "theorem clean_ok : 1 + 1 = 2 := rfl\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("Mod/Wip.lean"),
+            "theorem wip_thm : 1 + 1 = 2 := by sorry\n",
+        )
+        .unwrap();
+
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut store = TurboStore::open(Some(&tmp_dir.join("store"))).unwrap();
+            let strict_err = run_check_command_inner(
+                &mut store,
+                false,
+                true,
+                false,
+                false,
+                proj.join("Mod"),
+                None,
+                proj.clone(),
+                None,
+                false,
+                None,
+                false,
+            )
+            .expect_err("directory check without --allow-sorry must reject sorry");
+            assert!(
+                format!("{strict_err:#}").contains("sorry"),
+                "expected sorry rejection, got: {strict_err:#}"
+            );
+
+            let allow_res = run_check_command_inner(
+                &mut store,
+                false,
+                true,
+                false,
+                false,
+                proj.join("Mod"),
+                None,
+                proj.clone(),
+                None,
+                false,
+                None,
+                true,
+            )
+            .expect("directory check with --allow-sorry must accept sorry-bearing file");
+            assert_eq!(allow_res["status"], "verified_modulo_sorry");
+            assert_eq!(allow_res["used_sorry"], true);
+
+            let strict_after = run_check_command_inner(
+                &mut store,
+                false,
+                true,
+                false,
+                false,
+                proj.join("Mod"),
+                None,
+                proj.clone(),
+                None,
+                false,
+                None,
+                false,
+            )
+            .expect_err("directory check without --allow-sorry must not poison strict cache");
+            assert!(
+                format!("{strict_after:#}").contains("sorry"),
+                "expected sorry rejection after --allow-sorry run, got: {strict_after:#}"
+            );
+
+            fs::write(
+                proj.join("Mod/Wip.lean"),
+                "theorem bad_nd : 1 + 1 = 2 := by native_decide\n",
+            )
+            .unwrap();
+            let nd_err = run_check_command_inner(
+                &mut store,
+                false,
+                true,
+                false,
+                false,
+                proj.join("Mod"),
+                None,
+                proj.clone(),
+                None,
+                false,
+                None,
+                true,
+            )
+            .expect_err("directory check with --allow-sorry must still reject native_decide");
+            assert!(
+                format!("{nd_err:#}").contains("native_decide"),
+                "expected native_decide rejection, got: {nd_err:#}"
+            );
+        }));
+        crate::zygote::purge_snapshot_dir(&tmp_dir);
+        if let Err(p) = res {
+            std::panic::resume_unwind(p);
+        }
     }
 
     #[test]

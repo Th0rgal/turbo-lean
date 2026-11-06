@@ -1119,11 +1119,29 @@ theorem c_thm : baseVal = 7 := b_thm
     assert!(!lib_dir.join("B.olean").exists());
     assert!(!lib_dir.join("C.olean").exists());
 
-    // 3. Subsequent strict `check` on `A.lean`, `B.lean`, `C.lean`, and `--decl c_thm` MUST ALL fail closed!
+    // 2b. Directory `check src/Chain --allow-sorry` must also route downstream clean-text
+    //     `B.lean` and `C.lean` through modulo-sorry verification, report `verified_modulo_sorry`,
+    //     and purge all sorry-tainted `.olean`s afterward!
+    let chk_dir_mod = run_cli(&["check", "src/Chain", "--allow-sorry"]);
+    assert!(
+        chk_dir_mod.status.success(),
+        "check src/Chain --allow-sorry failed:\n{}{}",
+        String::from_utf8_lossy(&chk_dir_mod.stdout),
+        String::from_utf8_lossy(&chk_dir_mod.stderr)
+    );
+    let chk_dir_json: Value = serde_json::from_slice(&chk_dir_mod.stdout).unwrap();
+    assert_eq!(chk_dir_json["status"], "verified_modulo_sorry");
+    assert_eq!(chk_dir_json["used_sorry"], true);
+    assert!(!lib_dir.join("A.olean").exists());
+    assert!(!lib_dir.join("B.olean").exists());
+    assert!(!lib_dir.join("C.olean").exists());
+
+    // 3. Subsequent strict `check` on `A.lean`, `B.lean`, `C.lean`, `src/Chain`, and `--decl c_thm` MUST ALL fail closed!
     for strict_args in [
         &["check", "src/Chain/A.lean"][..],
         &["check", "src/Chain/B.lean"][..],
         &["check", "src/Chain/C.lean"][..],
+        &["check", "src/Chain"][..],
         &["check", "src/Chain/C.lean", "--decl", "c_thm"][..],
     ] {
         let out = run_cli(strict_args);

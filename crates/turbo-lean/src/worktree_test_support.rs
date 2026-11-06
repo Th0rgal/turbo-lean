@@ -105,7 +105,7 @@ impl LakeTree {
 
 impl Drop for LakeTree {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.root);
+        crate::zygote::purge_snapshot_dir(&self.root);
     }
 }
 
