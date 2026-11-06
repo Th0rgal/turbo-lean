@@ -71,9 +71,8 @@ Typed Target IRs Grounded in Official External Semantics (G3.3):
 ```
 
 #### G3.1 — Pure, Verified `LCNF → LNIR` Frontend (`Bridge.lean`)
-- **Delete String-Suffix Dispatch**: Replace `callee.endsWith ...` in `classifyPrimitive` with exact pattern matching on fully-qualified `Lean.Name` constants (````UInt64.add`, ````Array.uget`, ````ByteArray.uset`, etc.) and `LCNF` type signatures.
-- **Zero Optimizations in `Bridge.lean`**: Strip all Wave 15–32 pattern-matching rewrites out of `Bridge.lean` and move them into modular `LNIR → LNIR` passes under `LeanNative/Transform/`.
-- **Frontend Refinement Proof**: Formalize the small-step/fuel evaluator for `LCNF.Code` (building on `digama0/lean4lean`) and prove that `lowerDecl : LCNF.Decl → LNIRDecl` preserves evaluation semantics (`LCNFRefinesLNIR`).
+- **Completed Baseline**: Canonical `Lean.Name` primitive lookup (`Bridge.lean` with `0` `callee.endsWith` occurrences), pass extraction out of `Bridge.lean` (`<= 350 LOC` CI gate), and `RealLCNFBridge` refinement proofs against in-repo `RealLCNFSemantics` for the scalar/tuple/Stage-1D ADT subset.
+- **Remaining Upstream Frontend Refinement**: Ground `LCNF.Code` evaluation in upstream `digama0/lean4lean` operational semantics and extend verified lowering to higher-order closures, general recursive `LCNF` declarations, and remaining primitive operations.
 
 #### G3.2 — Full-Bitwidth `LNIR` Semantics & Proof-Carrying Middle-End (`Transform/`)
 - **Upgrade `Value` & `HeapState` (`Eval.lean`)**:
@@ -112,8 +111,8 @@ Early feature waves accumulated substantial structural duplication across the re
      One parameterized affine loop transformer handling loop fusion, strip-mining/tiling, 2-layer Radix-4 NTT butterfly fusion, 2D stencil Halo tiling, and ping-pong buffer rotation under a single induction principle.
    - **Engine 3 — Linear RC Ownership & Alias Abstract Interpreter (`Transform/OwnershipRC.lean`)**:
      One forward/backward abstract interpretation lattice over `LNIRCode` proving borrow inference, `incRef`/`decRef` cancellation, tuple unboxing (`UnboxTupleSROA`), and `isExclusive` in-place array updates (`HoistExclusivity`).
-2. **Generate C-ABI / SIMD / Metal Kernels from `LNIR` Instead of Hardcoded Strings in `CoreCLI.lean`**:
-   - Extract the hardcoded C99/AVX-512/NEON/Metal templates out of `Driver/CoreCLI.lean` and generate them directly from verified `LNIR` kernel definitions via the typed backend pipeline, shrinking `CoreCLI.lean` from ~7,500 LOC to **$< 1,000\text{ LOC}$**.
+2. **Unify Remaining Direct String Emitters onto Proved Target-IR AST Pretty-Printers**:
+   - With `Driver/CoreCLI.lean` already compressed under its `<= 1,000 LOC` CI ratchet (`990 LOC`), route remaining direct string codegen paths in `Backend/LLVM.lean`, `Backend/MLIRGPU.lean`, `Backend/Metal.lean`, `Backend/Hybrid.lean`, and `Driver/CoreCLI.lean` through verified `LNIR → TargetAst → TargetAst.pp` pipelines.
 3. **Parameterized Spec Combinators**:
    - Replace repetitive `MetaGateSpec` boilerplate with higher-order dependent combinators (`Spec.andGate`, `Spec.boundedWindowGate`, `Spec.refinementGate`) that automatically synthesize `sound`, `complete`, `posWitness`, and `negWitness` proofs from declarative domain constraints.
 
