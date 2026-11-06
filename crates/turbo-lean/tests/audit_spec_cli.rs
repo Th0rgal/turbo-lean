@@ -499,6 +499,21 @@ theorem dbl_injective (x y : Nat) : dbl x = dbl y → x = y := by omega
     let vac_json = assert_cli_fail_json(&vac_out, "contradictory precondition");
     assert_eq!(vac_json["vacuous_specs"].as_u64(), Some(1));
 
+    // 2b. Negative: narrow-width `UInt8` wrapping overflow (`x + 255 > 255`) MUST preserve `UInt8`
+    //     scalar domain during boundary specialization and remain rejected as vacuous!
+    let u8_vac = fx.write(
+        "UInt8Vacuous.lean",
+        "theorem u8_impossible (x : UInt8) (h : x + 255 > 255) : x = 0 := by omega\n",
+    );
+    let u8_out = fx
+        .cli("diag-u8-vac")
+        .args(["--json", "audit-spec"])
+        .arg(&u8_vac)
+        .output()
+        .unwrap();
+    let u8_json = assert_cli_fail_json(&u8_out, "UInt8 wrapping impossible precondition");
+    assert_eq!(u8_json["vacuous_specs"].as_u64(), Some(1));
+
     // 3. Honest witness label: symbolic abstract theorem without concrete arithmetic assignment
     //    must emit `heuristic_unverified_*` rather than claiming `concrete_refutation_found`.
     let abstract_spec = fx.write(
@@ -734,4 +749,73 @@ fn decl_filter_miss_missing_file_and_require_nonempty_fail_closed_with_json_and_
         .unwrap();
     let miss_file_json = assert_cli_fail_json(&miss_file, "missing file path");
     assert_eq!(miss_file_json["verdict"].as_str(), Some("error"));
+}
+
+#[test]
+fn cross_namespace_transitive_stubs_and_umbrella_directory_dedup_are_enforced() {
+    let fx = AuditSpecFixture::new("ns_and_umbrella");
+
+    // 1. Cross-namespace wrapper calling an unqualified identity stub or unused-param stub in its
+    //    own namespace must be caught on hop >= 2 without colliding with unrelated namespaces.
+    let cross_ns = fx.write(
+        "CrossNsStubs.lean",
+        r#"
+namespace Lib
+def identityStub (n : Nat) : Nat := n
+def wrapId (n : Nat) : Nat := identityStub n + 1
+end Lib
+
+namespace Helpers
+def unusedStub (n : Nat) : Nat := 0
+def wrapper (n : Nat) : Nat := unusedStub n + 1
+end Helpers
+
+namespace Uses
+theorem test_wrap_id (n : Nat) : Lib.wrapId n = n + 1 := rfl
+theorem test_wrap_unused (n : Nat) : Helpers.wrapper n > 0 := by omega
+end Uses
+"#,
+    );
+    let ns_out = fx
+        .cli("cross-ns")
+        .args(["--json", "audit-spec"])
+        .arg(&cross_ns)
+        .output()
+        .unwrap();
+    let ns_json = assert_cli_fail_json(&ns_out, "cross-namespace transitive stub detection");
+    let stubs = ns_json["stub_defs"].as_array().unwrap();
+    assert!(
+        stubs
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("Lib.identityStub")),
+        "expected Lib.identityStub in {stubs:?}"
+    );
+    assert!(
+        stubs
+            .iter()
+            .any(|s| s.as_str().unwrap_or("").contains("Helpers.unusedStub")),
+        "expected Helpers.unusedStub in {stubs:?}"
+    );
+
+    // 2. Directory containing an umbrella module `Pkg.lean` + `Pkg/A.lean` must audit `Pkg/A.lean`
+    //    exactly once (total_specs_audited == 2, never double-counted as 3).
+    let dir_root = fx.root.join("umbrella_tree");
+    fx.write(
+        "umbrella_tree/Pkg.lean",
+        "theorem pkg_root_thm (n : Nat) (h : n > 0) : n >= 1 := by omega\n",
+    );
+    fx.write(
+        "umbrella_tree/Pkg/A.lean",
+        "theorem pkg_sub_thm (n : Nat) (h : n > 1) : n >= 2 := by omega\n",
+    );
+    let dir_out = fx
+        .cli("umbrella-dir")
+        .args(["--json", "audit-spec"])
+        .arg(&dir_root)
+        .output()
+        .unwrap();
+    let dir_json = assert_cli_ok(&dir_out, "umbrella directory deduplication");
+    assert_eq!(dir_json["total_specs_audited"].as_u64(), Some(2));
+    assert_eq!(dir_json["tight_specs"].as_u64(), Some(2));
+    assert_eq!(dir_json["file_reports"].as_array().map(Vec::len), Some(2));
 }

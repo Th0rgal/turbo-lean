@@ -2002,12 +2002,14 @@ pub(super) fn audit_referenced_local_defs_for_stubs(
 
     // Collect transitively referenced local defs (up to 4 hops).
     // Match full qualified `def_name` everywhere, and only match unqualified `short` when
-    // either `short == def_name` (top-level / same scope) or `decl.name` shares a non-empty
-    // namespace prefix with `def_name` (preventing a 1-letter helper `Foo.Bar.v` in an
-    // unrelated sibling directory from colliding with every binder `v` in `Root.Spec`).
+    // either `short == def_name` (top-level / same scope) or the referencing declaration/helper's
+    // namespace shares a non-empty namespace prefix with `def_name` (preventing a 1-letter helper
+    // `Foo.Bar.v` in an unrelated sibling directory from colliding with every binder `v` in
+    // `Root.Spec`, while still resolving unqualified calls within a cross-namespace helper's own
+    // defining namespace on subsequent hops).
     let decl_ns = decl.name.rsplit_once('.').map(|(ns, _)| ns).unwrap_or("");
     let mut visited = std::collections::HashSet::new();
-    let mut frontier = vec![full_stmt];
+    let mut frontier: Vec<(String, String)> = vec![(decl_ns.to_string(), full_stmt)];
     let mut referenced = Vec::new();
     for _hop in 0..4 {
         let mut next_frontier = Vec::new();
@@ -2016,11 +2018,11 @@ pub(super) fn audit_referenced_local_defs_for_stubs(
                 continue;
             }
             let (def_ns, short) = def_name.rsplit_once('.').unwrap_or(("", def_name.as_str()));
-            let allow_short_match = def_ns.is_empty()
-                || decl_ns == def_ns
-                || decl_ns.starts_with(&format!("{def_ns}."))
-                || def_ns.starts_with(&format!("{decl_ns}."));
-            let is_ref = frontier.iter().any(|txt| {
+            let is_ref = frontier.iter().any(|(caller_ns, txt)| {
+                let allow_short_match = def_ns.is_empty()
+                    || caller_ns == def_ns
+                    || caller_ns.starts_with(&format!("{def_ns}."))
+                    || (!caller_ns.is_empty() && def_ns.starts_with(&format!("{caller_ns}.")));
                 replace_ident_boundary(txt, def_name, "__REF__") != *txt
                     || (allow_short_match && replace_ident_boundary(txt, short, "__REF__") != *txt)
             });
@@ -2032,7 +2034,12 @@ pub(super) fn audit_referenced_local_defs_for_stubs(
                     body.as_str(),
                     dependencies.as_str(),
                 ));
-                next_frontier.push(body.clone());
+                let mut combined_body = body.clone();
+                if !dependencies.is_empty() {
+                    combined_body.push(' ');
+                    combined_body.push_str(dependencies);
+                }
+                next_frontier.push((def_ns.to_string(), combined_body));
             }
         }
         if next_frontier.is_empty() {
@@ -2396,8 +2403,6 @@ fn probe_diagonal_and_boundary_precondition_satisfiability(
     }
 
     let make_substituted_decl = |substs: &[(&str, &str)]| -> ExtractedDecl {
-        let drop_names: std::collections::HashSet<&str> =
-            substs.iter().map(|(from, _)| *from).collect();
         let apply_all = |s: &str| -> String {
             let mut cur = s.to_string();
             for (from, to) in substs {
@@ -2405,20 +2410,19 @@ fn probe_diagonal_and_boundary_precondition_satisfiability(
             }
             cur
         };
-        let mut new_binders = Vec::new();
-        for (names, ty) in &decl.binders {
-            if is_known_binder_value_type(ty) {
-                let kept: Vec<String> = names
-                    .iter()
-                    .filter(|n| !drop_names.contains(n.as_str()))
-                    .cloned()
-                    .collect();
-                if !kept.is_empty() {
-                    new_binders.push((kept, ty.clone()));
+        let mut new_binders: Vec<(Vec<String>, String)> = decl
+            .binders
+            .iter()
+            .map(|(names, ty)| {
+                if is_known_binder_value_type(ty) {
+                    (names.clone(), ty.clone())
+                } else {
+                    (names.clone(), apply_all(ty))
                 }
-            } else {
-                new_binders.push((names.clone(), apply_all(ty)));
-            }
+            })
+            .collect();
+        for (idx, (from, to)) in substs.iter().enumerate() {
+            new_binders.push((vec![format!("__diag_eq_{idx}")], format!("{from} = {to}")));
         }
         ExtractedDecl {
             name: decl.name.clone(),
@@ -2811,7 +2815,7 @@ pub(super) fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<Ex
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 16;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 17;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -3040,13 +3044,26 @@ pub fn audit_spec_file_or_source_with_policy(
     decl_filter: Option<&str>,
     policy: &AuditSpecPolicyConfig,
 ) -> serde_json::Value {
+    audit_spec_file_or_source_with_policy_inner(file, inline_src, decl_filter, policy, true)
+}
+
+fn audit_spec_file_or_source_with_policy_inner(
+    file: &Path,
+    inline_src: Option<&str>,
+    decl_filter: Option<&str>,
+    policy: &AuditSpecPolicyConfig,
+    expand_umbrella_subdir: bool,
+) -> serde_json::Value {
     let t0 = Instant::now();
     let (eff_forbid_kinds, eff_allow_names, eff_forbid_namespaces) =
         policy.effective_forbidden_for_path(file);
     let mut cache_target_path: Option<PathBuf> = None;
     let mut preloaded_file_src: Option<String> = None;
     let mut preloaded_external_local_defs: Option<Vec<LocalDefUnfolding>> = None;
-    if inline_src.is_none() && file.is_file() && !file.with_extension("").is_dir() {
+    if inline_src.is_none()
+        && file.is_file()
+        && (!expand_umbrella_subdir || !file.with_extension("").is_dir())
+    {
         if let Ok(file_bytes) = fs::read(file) {
             if let Ok(file_src) = String::from_utf8(file_bytes.clone()) {
                 let mut local_defs = extract_local_def_unfoldings(&strip_audit_comments(&file_src));
@@ -3162,13 +3179,15 @@ pub fn audit_spec_file_or_source_with_policy(
                 });
             }
         };
-        let sub_dir = file.with_extension("");
-        if sub_dir.is_dir() {
-            v.extend(
-                crate::lake_build::collect_lean_files(&sub_dir)
-                    .into_iter()
-                    .filter_map(|p| fs::read_to_string(&p).ok().map(|s| (p, s))),
-            );
+        if expand_umbrella_subdir {
+            let sub_dir = file.with_extension("");
+            if sub_dir.is_dir() {
+                v.extend(
+                    crate::lake_build::collect_lean_files(&sub_dir)
+                        .into_iter()
+                        .filter_map(|p| fs::read_to_string(&p).ok().map(|s| (p, s))),
+                );
+            }
         }
         v
     };
@@ -3502,6 +3521,13 @@ fn aggregate_audit_spec_reports(
 
 fn expand_audit_spec_targets(files: &[PathBuf]) -> Vec<(PathBuf, Option<String>)> {
     let mut expanded = Vec::with_capacity(files.len());
+    let mut seen_paths = std::collections::HashSet::new();
+    let mut push_unique_file = |p: PathBuf, out: &mut Vec<(PathBuf, Option<String>)>| {
+        let key = fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+        if seen_paths.insert(key) {
+            out.push((p, None));
+        }
+    };
     for f in files {
         if f.is_dir() {
             let sub = crate::lake_build::collect_lean_files(f);
@@ -3512,11 +3538,19 @@ fn expand_audit_spec_targets(files: &[PathBuf]) -> Vec<(PathBuf, Option<String>)
                 ));
             } else {
                 for p in sub {
-                    expanded.push((p, None));
+                    push_unique_file(p, &mut expanded);
                 }
             }
         } else {
-            expanded.push((f.clone(), None));
+            push_unique_file(f.clone(), &mut expanded);
+            if f.is_file() {
+                let sub_dir = f.with_extension("");
+                if sub_dir.is_dir() {
+                    for p in crate::lake_build::collect_lean_files(&sub_dir) {
+                        push_unique_file(p, &mut expanded);
+                    }
+                }
+            }
         }
     }
     expanded
@@ -3529,10 +3563,10 @@ fn run_audit_spec_batch_with<F>(
     audit_one: F,
 ) -> serde_json::Value
 where
-    F: Fn(&Path) -> serde_json::Value + Sync,
+    F: Fn(&Path, bool) -> serde_json::Value + Sync,
 {
     if files.len() == 1 && !files[0].is_dir() {
-        return audit_one(&files[0]);
+        return audit_one(&files[0], true);
     }
     let t0 = Instant::now();
     let targets = expand_audit_spec_targets(files);
@@ -3564,7 +3598,7 @@ where
                         let rep = if let Some(err_msg) = maybe_err {
                             build_audit_spec_error_report(f, decl_filter, err_msg.clone())
                         } else {
-                            audit_ref(f)
+                            audit_ref(f, false)
                         };
                         local.push((i, rep));
                     }
@@ -3590,7 +3624,7 @@ fn audit_spec_files_resolving_per_target(
     forbid_namespaces: &[String],
     forbid_decl_kinds: &[String],
 ) -> serde_json::Value {
-    run_audit_spec_batch_with(files, decl_filter, policy_override, |f| {
+    run_audit_spec_batch_with(files, decl_filter, policy_override, |f, expand_umbrella| {
         match AuditSpecPolicyConfig::try_load_for_target(
             f,
             policy_override,
@@ -3598,7 +3632,13 @@ fn audit_spec_files_resolving_per_target(
             forbid_namespaces,
             forbid_decl_kinds,
         ) {
-            Ok(pol) => audit_spec_file_or_source_with_policy(f, None, decl_filter, &pol),
+            Ok(pol) => audit_spec_file_or_source_with_policy_inner(
+                f,
+                None,
+                decl_filter,
+                &pol,
+                expand_umbrella,
+            ),
             Err(err) => build_audit_spec_error_report(f, decl_filter, format!("{:#}", err)),
         }
     })
@@ -3615,9 +3655,20 @@ pub fn audit_spec_files_with_policy(
     decl_filter: Option<&str>,
     policy: &AuditSpecPolicyConfig,
 ) -> serde_json::Value {
-    run_audit_spec_batch_with(files, decl_filter, Some(&policy.policy), |f| {
-        audit_spec_file_or_source_with_policy(f, None, decl_filter, policy)
-    })
+    run_audit_spec_batch_with(
+        files,
+        decl_filter,
+        Some(&policy.policy),
+        |f, expand_umbrella| {
+            audit_spec_file_or_source_with_policy_inner(
+                f,
+                None,
+                decl_filter,
+                policy,
+                expand_umbrella,
+            )
+        },
+    )
 }
 
 /// Audit theorem specifications in `files` for vacuous preconditions and postcondition tightness.
