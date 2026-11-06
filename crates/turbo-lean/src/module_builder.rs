@@ -37927,9 +37927,10 @@ globs = ["Down.+"]
         let proj = dir.join("proj");
         fs::create_dir_all(proj.join("Pkg"))?;
         fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(proj.join("spec.json"), "{\"v\":1}\n")?;
         fs::write(
-            proj.join("lakefile.toml"),
-            "name = \"recws\"\ndefaultTargets = [\"Pkg\"]\n[[lean_lib]]\nname = \"Pkg\"\nroots = [\"Pkg.Mod\"]\n",
+            proj.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage recws\ninput_file specFile where\n  path := \"spec.json\"\n@[default_target]\nlean_lib Pkg where\n  roots := #[`Pkg.Mod]\n  needs := #[specFile]\n",
         )?;
         fs::write(
             proj.join("Pkg/Mod.lean"),
@@ -37943,9 +37944,10 @@ globs = ["Down.+"]
             "native build must write .turbo_verified_sources.json"
         );
         let cfg = resolve_project_config(&proj)?;
+        let expected_ws_inputs = workspace_lake_inputs_digest(&cfg)?;
         assert!(
-            workspace_lake_inputs_digest(&cfg).is_ok(),
-            "workspace_lake_inputs_digest must succeed for standard Lake project"
+            !expected_ws_inputs.is_empty(),
+            "workspace_lake_inputs_digest must be non-empty when input_file is declared"
         );
         let dag = build_module_dag(&cfg, &[])?;
         let node = dag.nodes.get("Pkg.Mod").expect("Pkg.Mod node");
@@ -37963,11 +37965,15 @@ globs = ["Down.+"]
             "record_verified_dep_source must preserve .turbo_verified_sources.json rather than deleting it"
         );
         let parsed: serde_json::Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
-        assert!(
-            parsed["workspace_lake_inputs_digest"]
-                .as_str()
-                .is_some_and(|s| !s.is_empty()),
-            "manifest must retain non-empty workspace_lake_inputs_digest: {parsed}"
+        assert_eq!(
+            parsed["lake_inputs_digest"].as_str(),
+            Some(expected_ws_inputs.as_str()),
+            "manifest must retain non-empty lake_inputs_digest: {parsed}"
+        );
+        assert_eq!(
+            parsed["modules"]["Pkg/Mod.lean"]["lake_inputs_digest"].as_str(),
+            Some(expected_ws_inputs.as_str()),
+            "module entry must retain non-empty lake_inputs_digest: {parsed}"
         );
         crate::zygote::purge_snapshot_dir(&dir);
         Ok(())
@@ -38002,17 +38008,33 @@ globs = ["Down.+"]
 
         let _ = fs::remove_dir_all(proj.join(".lake/build"));
         fs::write(proj.join("Fs/Mod.lean"), "theorem fs_ok : 1 = 1 := rfl\n")?;
+        let clean_out = Command::new("lake")
+            .args(["build", "Fs.Mod"])
+            .env("LEAN_NUM_THREADS", "2")
+            .current_dir(&proj)
+            .output()?;
+        anyhow::ensure!(clean_out.status.success(), "lake build clean Fs.Mod failed");
         let mut store = TurboStore::open(Some(&dir.join("store")))?;
-        let rep1 =
-            build_project_modules_native(&mut store, &proj, &[], "trusted", 1, false, true, None)?;
-        assert_eq!(rep1.compiled_modules, vec!["Fs.Mod".to_string()]);
+        {
+            // Seed audited authority for the clean Lake-built `.olean` in `store` WITHOUT
+            // writing a `build_module` CAS action entry, so `build_project_modules_native` takes
+            // the `WarmAdopted` + `audit_fast_store_hit` path!
+            let cfg0 = resolve_project_config(&proj)?;
+            let (lp0, _) = build_lean_search_path(&cfg0, true);
+            crate::zygote::audit_compiled_modules_with_zygote(
+                &store,
+                &cfg0,
+                &["Fs.Mod".to_string()],
+                &lp0,
+                &[],
+                false,
+            )?;
+        }
 
-        // Remove `.turbo_verified_sources.json` while keeping the Lake `.trace` + `.olean` intact so
-        // the next build adopts `Fs.Mod` as `WarmAdopted`, then overwrite `Mod.olean` with `sorry_bytes`
-        // AFTER `WarmAdopted` records the clean digest (`warm_adopted` scheduler trace event) — before
-        // `audit_fast_store_hit` inspects `store`. The scheduler must reject the swapped `.olean`,
-        // fall back to clean compilation, and never grant authority to `sorry_bytes`!
-        let _ = fs::remove_file(proj.join(".lake/build/.turbo_verified_sources.json"));
+        // Overwrite `Mod.olean` with `sorry_bytes` AFTER `WarmAdopted` records the clean digest
+        // (`warm_adopted` scheduler trace event) — before `audit_fast_store_hit` inspects `store`.
+        // The scheduler must reject the swapped `.olean`, fall back to clean compilation, and
+        // never grant authority to `sorry_bytes`!
         let target_olean = proj.join(".lake/build/lib/lean/Fs/Mod.olean");
         let bad_copy = sorry_bytes.clone();
         let hook: std::sync::Arc<NativeSchedulerTestHook> =

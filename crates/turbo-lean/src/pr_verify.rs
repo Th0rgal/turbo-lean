@@ -6579,66 +6579,15 @@ fn certify_head_statement_modules_and_replay(
         )?;
         Ok((None, snap))
     } else {
-        let mut proof_irrelevant_overlay_ok = false;
-        let mut rebuilt_overlay_mods: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
-        if let Some(ov) = overlay_lib_dir {
-            let mut candidates: Vec<(String, PathBuf, PathBuf)> = Vec::new();
-            let mut all_have_base = true;
-            for (m, path) in dep_mods.iter().chain(head_root_mods.iter()) {
-                let is_symlink = path
-                    .symlink_metadata()
-                    .map(|md| md.file_type().is_symlink())
-                    .unwrap_or(false);
-                if path.starts_with(ov) && !is_symlink {
-                    let Ok(rel) = path.strip_prefix(ov) else {
-                        all_have_base = false;
-                        break;
-                    };
-                    let base_path = lib_dir.join(rel);
-                    if !base_path.is_file() {
-                        all_have_base = false;
-                        break;
-                    }
-                    candidates.push((m.clone(), base_path, path.clone()));
-                }
-            }
-            if all_have_base && !candidates.is_empty() {
-                let extra_ro = [ov.to_path_buf()];
-                let mut all_equiv = true;
-                for (m, old_p, new_p) in &candidates {
-                    if !crate::zygote::verify_proof_irrelevant_olean_update_exec(
-                        &store.root,
-                        cfg,
-                        m,
-                        old_p,
-                        new_p,
-                        &replay_lp,
-                        &extra_ro,
-                    )
-                    .unwrap_or(false)
-                    {
-                        all_equiv = false;
-                        break;
-                    }
-                }
-                if all_equiv {
-                    proof_irrelevant_overlay_ok = true;
-                    for (m, _, _) in candidates {
-                        rebuilt_overlay_mods.insert(m);
-                    }
-                }
-            }
-        }
         let head_root_set: std::collections::HashSet<&str> =
             head_root_mods.iter().map(|(m, _)| m.as_str()).collect();
-        let bind_and_certify_head_closure = |only_mods: Option<
-            &std::collections::HashSet<String>,
-        >,
-                                             err_ctx: &'static str|
+        let bind_and_certify_closure = |closure_lp: &str,
+                                        extra_lib: Option<&Path>,
+                                        required_mods: &[(&String, bool)],
+                                        err_ctx: &'static str|
          -> Result<crate::zygote::ClosureSnapshot> {
             let mut snap =
-                crate::zygote::materialize_bound_audit_closure(cfg, &all_mods, &replay_lp)?;
+                crate::zygote::materialize_bound_audit_closure(cfg, &all_mods, closure_lp)?;
             let check_pending =
                 |snap_ref: &crate::zygote::ClosureSnapshot| -> Result<(Vec<String>, Vec<String>)> {
                     let (snap_lp, _) = crate::zygote::ensure_bound_audit_closure(
@@ -6649,26 +6598,18 @@ fn certify_head_statement_modules_and_replay(
                         crate::zygote::snapshot_parent_search_path(snap_ref).unwrap_or(snap_lp);
                     let live_batch =
                         crate::module_builder::ReplayLookupBatchCache::new_with_extra_root_lib(
-                            store,
-                            cfg,
-                            &replay_lp,
-                            overlay_lib_dir,
+                            store, cfg, closure_lp, extra_lib,
                         );
                     let mut snap_batch =
                         crate::module_builder::ReplayLookupBatchCache::new_with_extra_root_lib(
                             store,
                             cfg,
                             &parent_snap_lp,
-                            overlay_lib_dir,
+                            extra_lib,
                         );
                     let mut pending_audit = Vec::new();
                     let mut pending_replay = Vec::new();
-                    for (m, _) in dep_mods.iter().chain(head_root_mods.iter()) {
-                        if let Some(sub) = only_mods {
-                            if !sub.contains(m) {
-                                continue;
-                            }
-                        }
+                    for &(m, needs_audit) in required_mods {
                         let Some(snap_olean) = snap_batch.resolve_module_olean(m) else {
                             anyhow::bail!(
                                     "Head statement module `{m}` missing `.olean` in bound closure snapshot: fail-closed"
@@ -6682,7 +6623,7 @@ fn certify_head_statement_modules_and_replay(
                                 );
                         };
                         let binds_policy = live_batch.is_root_module_olean(orig_olean);
-                        if head_root_set.contains(m.as_str()) || dep_audit_mods.contains(m) {
+                        if needs_audit {
                             if !snap_batch.is_audited_in_store_with_binds_policy(
                                 store,
                                 cfg,
@@ -6710,19 +6651,17 @@ fn certify_head_statement_modules_and_replay(
                     cfg,
                     &pending_audit,
                     &pending_replay,
-                    &replay_lp,
-                    overlay_lib_dir,
+                    closure_lp,
+                    extra_lib,
                 )
                 .context(err_ctx)?;
-                if only_mods.is_none()
-                    && pending_audit.len() + pending_replay.len() == all_mods.len()
-                {
+                if pending_audit.len() + pending_replay.len() == all_mods.len() {
                     if let Some(full_snap) = sub_snap {
                         snap = full_snap;
                     }
                 } else {
                     snap =
-                        crate::zygote::materialize_bound_audit_closure(cfg, &all_mods, &replay_lp)?;
+                        crate::zygote::materialize_bound_audit_closure(cfg, &all_mods, closure_lp)?;
                 }
                 let (rem_audit, rem_replay) = check_pending(&snap)?;
                 anyhow::ensure!(
@@ -6737,81 +6676,159 @@ fn certify_head_statement_modules_and_replay(
             Ok(snap)
         };
 
-        if proof_irrelevant_overlay_ok {
-            let to_base_path = |path: &Path| -> PathBuf {
-                if let Some(ov) = overlay_lib_dir {
-                    if let Ok(rel) = path.strip_prefix(ov) {
-                        return lib_dir.join(rel);
+        let full_reqs: Vec<(&String, bool)> = dep_mods
+            .iter()
+            .chain(head_root_mods.iter())
+            .map(|(m, _)| {
+                (
+                    m,
+                    head_root_set.contains(m.as_str()) || dep_audit_mods.contains(m),
+                )
+            })
+            .collect();
+
+        if let Some(ov) = overlay_lib_dir {
+            let mut rebuilt_overlay_mods: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut all_have_base = true;
+            for (m, path) in dep_mods.iter().chain(head_root_mods.iter()) {
+                let is_symlink = path
+                    .symlink_metadata()
+                    .map(|md| md.file_type().is_symlink())
+                    .unwrap_or(false);
+                if path.starts_with(ov) && !is_symlink {
+                    let Ok(rel) = path.strip_prefix(ov) else {
+                        all_have_base = false;
+                        break;
+                    };
+                    if !lib_dir.join(rel).is_file() {
+                        all_have_base = false;
+                        break;
                     }
-                }
-                path.to_path_buf()
-            };
-            let mut base_replay_batch =
-                crate::module_builder::ReplayLookupBatchCache::new(store, cfg, &base_replay_lp);
-            let mut base_pending_audit = Vec::new();
-            let mut base_pending_replay = Vec::new();
-            for (m, path) in &dep_mods {
-                let bp = to_base_path(path);
-                if rebuilt_overlay_mods.contains(m) {
-                    if !bp.is_file()
-                        || !base_replay_batch.is_replayed_in_store(store, cfg, &base_replay_lp, &bp)
-                    {
-                        base_pending_replay.push(m.clone());
-                    }
-                } else if dep_audit_mods.contains(m) {
-                    if !bp.is_file()
-                        || !base_replay_batch.is_audited_in_store(
-                            store,
-                            cfg,
-                            &base_replay_lp,
-                            m,
-                            &bp,
-                        )
-                    {
-                        base_pending_audit.push(m.clone());
-                    }
-                } else if !bp.is_file()
-                    || !base_replay_batch.is_replayed_in_store(store, cfg, &base_replay_lp, &bp)
-                {
-                    base_pending_replay.push(m.clone());
+                    rebuilt_overlay_mods.insert(m.clone());
                 }
             }
-            for (m, path) in &head_root_mods {
-                let bp = to_base_path(path);
-                if rebuilt_overlay_mods.contains(m) {
-                    if !bp.is_file()
-                        || !base_replay_batch.is_replayed_in_store(store, cfg, &base_replay_lp, &bp)
-                    {
-                        base_pending_replay.push(m.clone());
-                    }
-                } else if !bp.is_file()
-                    || !base_replay_batch.is_audited_in_store(store, cfg, &base_replay_lp, m, &bp)
-                {
-                    base_pending_audit.push(m.clone());
-                }
-            }
-            if !base_pending_audit.is_empty() || !base_pending_replay.is_empty() {
-                crate::zygote::replay_and_audit_modules_with_zygote(
-                    store,
-                    cfg,
-                    &base_pending_audit,
-                    &base_pending_replay,
+            if all_have_base && !rebuilt_overlay_mods.is_empty() {
+                let base_reqs: Vec<(&String, bool)> = dep_mods
+                    .iter()
+                    .chain(head_root_mods.iter())
+                    .map(|(m, _)| {
+                        let needs_audit = !rebuilt_overlay_mods.contains(m)
+                            && (head_root_set.contains(m.as_str()) || dep_audit_mods.contains(m));
+                        (m, needs_audit)
+                    })
+                    .collect();
+                if let Ok(base_snap) = bind_and_certify_closure(
                     &base_replay_lp,
                     None,
-                )
-                .context(
+                    &base_reqs,
                     "Base statement build `.olean` failed in-kernel soundness & replay audit",
-                )?;
+                ) {
+                    let ov_reqs: Vec<(&String, bool)> = dep_mods
+                        .iter()
+                        .chain(head_root_mods.iter())
+                        .filter(|(m, _)| rebuilt_overlay_mods.contains(m))
+                        .map(|(m, _)| {
+                            (
+                                m,
+                                head_root_set.contains(m.as_str()) || dep_audit_mods.contains(m),
+                            )
+                        })
+                        .collect();
+                    if let Ok(head_snap) = bind_and_certify_closure(
+                        &replay_lp,
+                        overlay_lib_dir,
+                        &ov_reqs,
+                        "Head overlay statement build `.olean` failed in-kernel soundness & replay audit",
+                    ) {
+                        let mut sealed_ok = crate::zygote::ensure_bound_audit_closure(
+                            &base_snap,
+                            "ov_equiv_base_pre",
+                        )
+                        .ok()
+                        .zip(
+                            crate::zygote::ensure_bound_audit_closure(
+                                &head_snap,
+                                "ov_equiv_head_pre",
+                            )
+                            .ok(),
+                        )
+                        .is_some();
+                        if sealed_ok {
+                            for m in &all_mods {
+                                if !rebuilt_overlay_mods.contains(m)
+                                    && crate::zygote::snapshot_module_artifact_set_digest(
+                                        &base_snap, m,
+                                    ) != crate::zygote::snapshot_module_artifact_set_digest(
+                                        &head_snap, m,
+                                    )
+                                {
+                                    sealed_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if sealed_ok {
+                            if let (Ok((base_snap_lp, base_dir)), Ok((_, head_dir))) = (
+                                crate::zygote::ensure_bound_audit_closure(
+                                    &base_snap,
+                                    "ov_equiv_paths",
+                                ),
+                                crate::zygote::ensure_bound_audit_closure(
+                                    &head_snap,
+                                    "ov_equiv_paths_head",
+                                ),
+                            ) {
+                                let extra_ro = [base_dir.clone(), head_dir.clone()];
+                                for m in &rebuilt_overlay_mods {
+                                    let rel_olean = format!(
+                                        "{}.olean",
+                                        crate::module_builder::module_name_to_rel_slash(m)
+                                    );
+                                    let old_p = base_dir.join(&rel_olean);
+                                    let new_p = head_dir.join(&rel_olean);
+                                    if !crate::zygote::verify_proof_irrelevant_olean_update_exec(
+                                        &store.root,
+                                        cfg,
+                                        m,
+                                        &old_p,
+                                        &new_p,
+                                        &base_snap_lp,
+                                        &extra_ro,
+                                    )
+                                    .unwrap_or(false)
+                                    {
+                                        sealed_ok = false;
+                                        break;
+                                    }
+                                }
+                            } else {
+                                sealed_ok = false;
+                            }
+                        }
+                        if sealed_ok
+                            && crate::zygote::ensure_bound_audit_closure(
+                                &base_snap,
+                                "ov_equiv_base_post",
+                            )
+                            .is_ok()
+                            && crate::zygote::ensure_live_closure_matches_snapshot(
+                                &head_snap,
+                                "ov_equiv_head_post",
+                            )
+                            .is_ok()
+                        {
+                            return Ok((Some(rebuilt_overlay_mods), Some(head_snap)));
+                        }
+                    }
+                }
             }
-            let head_snap = bind_and_certify_head_closure(
-                Some(&rebuilt_overlay_mods),
-                "Head overlay statement build `.olean` failed in-kernel soundness & replay audit",
-            )?;
-            return Ok((Some(rebuilt_overlay_mods), Some(head_snap)));
         }
 
-        let head_snap = bind_and_certify_head_closure(
-            None,
+        let head_snap = bind_and_certify_closure(
+            &replay_lp,
+            overlay_lib_dir,
+            &full_reqs,
             "Head statement build `.olean` failed in-kernel soundness & replay audit",
         )?;
         Ok((None, Some(head_snap)))
@@ -6931,7 +6948,11 @@ fn head_statement_report_cache_action_key(
         if seen.contains(m) {
             continue;
         }
-        let (ref orig_path, _) = entry_opt.as_ref()?;
+        let Some((ref orig_path, _)) = entry_opt.as_ref() else {
+            // `snap.complete` is already enforced by `ensure_bound_audit_closure`, which permits
+            // `None` entries exclusively for verified toolchain builtins (e.g., `Init`).
+            continue;
+        };
         if crate::module_builder::is_verified_toolchain_olean_file(
             &cfg.toolchain_lib_lean,
             Some(&cfg.lean_githash),
@@ -15796,6 +15817,40 @@ end ParityNs
             rep.statements.keys().any(|k| k.ends_with("::a_thm")),
             "expected a_thm in snapshot-bound statement report: {:?}",
             rep.statements
+        );
+
+        // Also verify proof-irrelevant overlay certification binds unchanged base modules
+        // and modified overlay modules across sealed `base_snap` and `head_snap` snapshots.
+        let aux_proof = LakeTree::new(
+            "stmt_snap_ov_proof",
+            &[("P/A.lean", "theorem a_thm : 1 + 1 = 2 := by decide\n")],
+        )?;
+        let ov_dir = tree.root.join("ov_lib");
+        fs::create_dir_all(ov_dir.join("P"))?;
+        fs::copy(
+            aux_proof.project.join(".lake/build/lib/lean/P/A.olean"),
+            ov_dir.join("P/A.olean"),
+        )?;
+        let (rebuilt_opt, ov_snap_opt) = certify_head_statement_modules_and_replay(
+            &store,
+            &tree.project,
+            None,
+            &policy,
+            false,
+            Some(&ov_dir),
+            Some(&cfg),
+        )?;
+        assert_eq!(
+            rebuilt_opt,
+            Some(std::collections::HashSet::from(["P.A".to_string()])),
+            "proof-irrelevant overlay update must take sealed overlay fast path"
+        );
+        let ov_snap = ov_snap_opt.expect("certified overlay closure snapshot");
+        let ov_key = head_statement_report_cache_action_key(&tree.project, None, &cfg, &ov_snap)
+            .expect("snapshot-bound overlay head statement cache key");
+        assert_ne!(
+            ov_key, key_before,
+            "overlay .olean digest change must rotate head statement report cache key"
         );
         Ok(())
     }

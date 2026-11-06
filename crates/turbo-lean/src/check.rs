@@ -9550,7 +9550,7 @@ theorem after_macro : ext_magic = 7 := rfl
                 true,
             )
             .expect("directory check with --allow-sorry must accept sorry-bearing file");
-            assert_eq!(allow_res["status"], "file_verified_with_sorry");
+            assert_eq!(allow_res["status"], "verified_modulo_sorry");
             assert_eq!(allow_res["used_sorry"], true);
 
             let strict_after = run_check_command_inner(
