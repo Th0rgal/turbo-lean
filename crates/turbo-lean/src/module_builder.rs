@@ -17778,6 +17778,7 @@ fn write_lake_module_hashes_and_trace_with_memo(
     let src_blake3_matches =
         src_read_ok && blake3::hash(src_raw.as_bytes()).to_hex().as_str() == node.src_blake3;
     let hygiene = splitter::audit_hygiene(&splitter::strip_lean_comments(&src_raw));
+    let sorry_ok = !node.is_root_pkg || !hygiene.has_sorry;
     let axiom_ok = !hygiene.has_axiom
         || !node.is_root_pkg
         || splitter::HygieneReport::has_custom_axiom_policy();
@@ -17786,14 +17787,14 @@ fn write_lake_module_hashes_and_trace_with_memo(
     } else {
         !hygiene.has_checking_weakening
     };
-    let no_forbidden_proof_tokens = !hygiene.has_sorry
+    let no_forbidden_proof_tokens = sorry_ok
         && axiom_ok
         && (!node.is_root_pkg || !hygiene.native_violation())
         && (!node.is_root_pkg || !hygiene.has_trust_compiler)
         && checking_weakening_ok;
     let skeleton_clean = src_blake3_matches && no_forbidden_proof_tokens;
     let is_stubbed_skeleton =
-        hygiene.has_sorry || !no_forbidden_proof_tokens || !src_blake3_matches;
+        !sorry_ok || !no_forbidden_proof_tokens || !src_blake3_matches;
     let olean_h_res = verify_and_hash_artifact_bytes(&node.olean_path, false, false);
     let ilean_h_res = verify_and_hash_artifact_bytes(&node.ilean_path, false, false);
     let c_h_res = if is_regular_nonempty_file(&node.c_path) {
@@ -17823,7 +17824,7 @@ fn write_lake_module_hashes_and_trace_with_memo(
     let digest_matches = !expected_artifact_digest.is_empty()
         && actual_art_digest_opt.as_deref() == Some(expected_artifact_digest);
     let all_shards_certified =
-        validate_materialized_module_artifacts(node, false) && !hygiene.has_sorry && digest_matches;
+        validate_materialized_module_artifacts(node, false) && sorry_ok && digest_matches;
     let artifact_hashes_match = digest_matches
         && olean_h_res.is_ok()
         && ilean_h_res.is_ok()
@@ -21028,7 +21029,7 @@ pub(crate) fn ensure_imported_oleans_replayed_with_roots_and_axioms(
     Ok(pending_audit.len() + pending_replay.len())
 }
 
-fn node_is_git_pinned_manifest_package(cfg: &ProjectConfig, node: &ModuleNode) -> bool {
+pub(crate) fn node_is_git_pinned_manifest_package(cfg: &ProjectConfig, node: &ModuleNode) -> bool {
     !node.is_root_pkg
         && cfg.manifest_packages.iter().any(|mp| {
             mp.pkg_type == "git"
@@ -21392,7 +21393,7 @@ fn probe_warm_on_disk_module_candidate(
     if blake3::hash(src_raw.as_bytes()).to_hex().as_str() != node.src_blake3 {
         return None;
     }
-    if crate::splitter::source_may_execute_elab_host_effects(&src_raw, false) {
+    if node_source_has_disallowed_elab_host_effects(cfg, node, &src_raw) {
         return None;
     }
     let header = parse_header_info(&src_raw);
@@ -21400,6 +21401,7 @@ fn probe_warm_on_disk_module_candidate(
         return None;
     }
     let hygiene = splitter::audit_hygiene(&splitter::strip_lean_comments(&src_raw));
+    let sorry_ok = !node.is_root_pkg || !hygiene.has_sorry;
     let axiom_ok = !hygiene.has_axiom
         || !node.is_root_pkg
         || splitter::HygieneReport::has_custom_axiom_policy();
@@ -21408,7 +21410,7 @@ fn probe_warm_on_disk_module_candidate(
     } else {
         !hygiene.has_checking_weakening
     };
-    if hygiene.has_sorry
+    if !sorry_ok
         || !axiom_ok
         || (node.is_root_pkg && hygiene.native_violation())
         || (node.is_root_pkg && hygiene.has_trust_compiler)
@@ -39530,7 +39532,9 @@ globs = ["Down.+"]
                 let mut olean_bytes = vec![0u8; 88];
                 olean_bytes[0..5].copy_from_slice(b"olean");
                 olean_bytes[5] = 2;
-                olean_bytes[6..46].copy_from_slice(fake_githash.as_bytes());
+                olean_bytes[6] = 1;
+                olean_bytes[7..13].copy_from_slice(b"4.31.0");
+                olean_bytes[40..80].copy_from_slice(fake_githash.as_bytes());
                 fs::write(olean_path, &olean_bytes)?;
                 let ilean_path = olean_path.with_extension("ilean");
                 fs::write(&ilean_path, b"{}")?;
@@ -39704,6 +39708,110 @@ globs = ["Down.+"]
             lake_closure_export_info(&cfg, &pw_spec, true, &mut cache4, &mut visiting4).is_none(),
             "dirty source in git-pinned custom-target-needs package must fail closed"
         );
+
+        crate::zygote::purge_snapshot_dir(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_non_root_dep_pkg_sorry_reference_emits_sidecars_while_root_pkg_rejects() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_dep_sorry_sidecars_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        let root = dir.as_path();
+        fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.31.0\n")?;
+        fs::write(
+            root.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage app where\n@[default_target]\nlean_lib App where\n",
+        )?;
+        let root_sorry_src = "import SearchDep.Syntax\ntheorem badRoot : False := sorry\n";
+        fs::write(root.join("App.lean"), root_sorry_src)?;
+
+        let dep_dir = root.join(".lake/packages/searchdep");
+        fs::create_dir_all(dep_dir.join("SearchDep"))?;
+        fs::write(
+            dep_dir.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage SearchDep where\n@[default_target]\nlean_lib SearchDep where\n  globs := #[.submodules `SearchDep]\n",
+        )?;
+        // Mimics `LeanSearchClient.Syntax`: non-root git-pinned dependency mentioning `IO.getEnv`
+        // (forcing native DAG compilation) and referencing `sorryAx` in helper/meta code.
+        let dep_src = "def queryUrl : IO (Option String) := IO.getEnv \"LEANSEARCHCLIENT_URL\"\ndef mkFallbackRef : String := s!\"{``sorryAx}\"\n";
+        fs::write(dep_dir.join("SearchDep/Syntax.lean"), dep_src)?;
+
+        fs::write(
+            root.join("lake-manifest.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [{
+                    "type": "git",
+                    "name": "searchdep",
+                    "rev": "0123456789abcdef0123456789abcdef01234567",
+                    "url": "https://example.invalid/searchdep",
+                    "inherited": false,
+                    "configFile": "lakefile.lean"
+                }]
+            }))?,
+        )?;
+
+        let mut cfg = resolve_project_config_with_trust(root, false)?;
+        let fake_githash = "0123456789abcdef0123456789abcdef01234567";
+        cfg.lean_githash = fake_githash.to_string();
+        cfg.lean_bin = PathBuf::from("/bin/true");
+
+        let dag = build_module_dag_with_trust(&cfg, &[], false)?;
+        let dep_node = dag
+            .nodes
+            .get("SearchDep.Syntax")
+            .expect("SearchDep.Syntax must enter DAG when IO.getEnv is referenced");
+        assert!(!dep_node.is_root_pkg);
+        let root_node = dag.nodes.get("App").expect("App in DAG");
+        assert!(root_node.is_root_pkg);
+
+        for node in [dep_node, root_node] {
+            fs::create_dir_all(node.olean_path.parent().unwrap())?;
+            let mut olean_bytes = vec![0u8; 88];
+            olean_bytes[0..5].copy_from_slice(b"olean");
+            olean_bytes[5] = 2;
+            olean_bytes[6] = 1;
+            olean_bytes[7..13].copy_from_slice(b"4.31.0");
+            olean_bytes[40..80].copy_from_slice(fake_githash.as_bytes());
+            fs::write(&node.olean_path, &olean_bytes)?;
+            fs::write(&node.ilean_path, b"{}")?;
+        }
+
+        let dep_dig = compute_olean_artifact_set_digest(&dep_node.olean_path)?;
+        write_lake_module_hashes_and_trace(
+            &cfg,
+            &dag,
+            dep_node,
+            &dep_dig,
+            Some(&dep_dig),
+            true,
+        )?;
+        assert!(
+            dep_node.olean_path.with_extension("trace").is_file(),
+            "non-root dependency mentioning sorryAx in meta helper must emit Lake .trace sidecar"
+        );
+
+        let root_dig = compute_olean_artifact_set_digest(&root_node.olean_path)?;
+        let root_err = write_lake_module_hashes_and_trace(
+            &cfg,
+            &dag,
+            root_node,
+            &root_dig,
+            Some(&root_dig),
+            true,
+        )
+        .expect_err("root-package module containing sorry must fail sidecar materialization gate");
+        assert!(root_err
+            .to_string()
+            .contains("turbo_spec_verify_audit_materialize_gate"));
+        assert!(!root_node.olean_path.with_extension("trace").exists());
 
         crate::zygote::purge_snapshot_dir(&dir);
         Ok(())
