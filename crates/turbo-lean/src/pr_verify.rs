@@ -4389,7 +4389,7 @@ struct KernelAudit {
     axioms: Vec<String>,
 }
 
-#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
 struct KernelStatementReport {
     statements: BTreeMap<String, String>,
     audits: Vec<KernelAudit>,
@@ -6577,7 +6577,7 @@ fn certify_head_statement_modules_and_replay(
         .context(
             "Head statement build `.olean` failed untrusted in-kernel soundness & replay audit",
         )?;
-        return Ok((None, snap));
+        Ok((None, snap))
     } else {
         let mut proof_irrelevant_overlay_ok = false;
         let mut rebuilt_overlay_mods: std::collections::HashSet<String> =
@@ -6639,7 +6639,7 @@ fn certify_head_statement_modules_and_replay(
          -> Result<crate::zygote::ClosureSnapshot> {
             let mut snap =
                 crate::zygote::materialize_bound_audit_closure(cfg, &all_mods, &replay_lp)?;
-            let mut check_pending =
+            let check_pending =
                 |snap_ref: &crate::zygote::ClosureSnapshot| -> Result<(Vec<String>, Vec<String>)> {
                     let (snap_lp, _) = crate::zygote::ensure_bound_audit_closure(
                         snap_ref,
@@ -6814,7 +6814,7 @@ fn certify_head_statement_modules_and_replay(
             None,
             "Head statement build `.olean` failed in-kernel soundness & replay audit",
         )?;
-        return Ok((None, Some(head_snap)));
+        Ok((None, Some(head_snap)))
     }
 }
 
@@ -15741,7 +15741,7 @@ end ParityNs
         let clean_olean = fs::read(&live_olean)?;
 
         let store = TurboStore::open(Some(&tree.root.join("cache")))?;
-        let policy = StatementPolicy::default();
+        let policy = StatementPolicy::at(&tree.project, "HEAD");
         let (_, cert_snap_opt) = certify_head_statement_modules_and_replay(
             &store,
             &tree.project,

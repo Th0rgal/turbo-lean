@@ -15667,16 +15667,6 @@ impl ReplayLookupBatchCache {
         Ok(res)
     }
 
-    pub(crate) fn compute_env_digest(
-        &mut self,
-        cfg: &ProjectConfig,
-        _lean_path_env: &str,
-        olean_path: &Path,
-    ) -> Result<String> {
-        let binds_policy = self.is_root_olean(olean_path);
-        self.compute_env_digest_with_binds_policy(cfg, olean_path, binds_policy)
-    }
-
     pub(crate) fn is_root_module_olean(&self, olean_path: &Path) -> bool {
         self.is_root_olean(olean_path)
     }
@@ -37965,7 +37955,7 @@ globs = ["Down.+"]
         let mut tier_digs = HashMap::new();
         tier_digs.insert(
             "Pkg.Mod".to_string(),
-            compute_module_artifact_tier_digests(node)?,
+            compute_module_artifact_tier_digests_with_policy(&node.olean_path, false)?,
         );
         record_verified_dep_source(&cfg, &dag, node, &art_dig, true, &olean_digs, &tier_digs);
         assert!(
