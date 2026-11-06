@@ -17301,6 +17301,8 @@ end ParityNs
             .unwrap_or_else(|e| e.into_inner());
         const ENV_KEY: &str = "TURBO_TEST_ELAB_STMT_ENV";
         let prev_env = std::env::var_os(ENV_KEY);
+        let prev_lake_cache_dir = std::env::var_os("LAKE_CACHE_DIR");
+        let prev_lake_art_cache = std::env::var_os("LAKE_ARTIFACT_CACHE");
         std::env::set_var(ENV_KEY, "alpha");
 
         let run = || -> Result<()> {
@@ -17579,13 +17581,35 @@ end ParityNs
             );
             let canon_tree2 = tree2.project.canonicalize()?;
             let canon_consumer = tree2.project.join("P/Consumer.lean").canonicalize()?;
-            let refreshed_root = crate::lake_build::ensure_project_imports_fresh_for_check(
+            let root_env_olean = tree2.project.join(".lake/build/lib/lean/P/EnvDep.olean");
+            let root_alpha_bytes = fs::read(&root_env_olean)?;
+            let root_fake_cache = tree2.root.join("populated_lake_cache");
+            fs::create_dir_all(&root_fake_cache)?;
+            let seed_cache_st = Command::new("lake")
+                .arg("build")
+                .env("LAKE_CACHE_DIR", &root_fake_cache)
+                .env("LAKE_ARTIFACT_CACHE", "true")
+                .current_dir(&canon_tree2)
+                .status()?;
+            anyhow::ensure!(seed_cache_st.success(), "seed lake artifact cache failed");
+            std::env::set_var("LAKE_CACHE_DIR", &root_fake_cache);
+            std::env::set_var("LAKE_ARTIFACT_CACHE", "true");
+            std::env::set_var(ENV_KEY, "beta");
+            let refreshed_root_res = crate::lake_build::ensure_project_imports_fresh_for_check(
                 &canon_tree2,
                 std::slice::from_ref(&canon_consumer),
-            )?;
+            );
+            std::env::remove_var("LAKE_CACHE_DIR");
+            std::env::remove_var("LAKE_ARTIFACT_CACHE");
+            let refreshed_root = refreshed_root_res?;
             assert!(
                 refreshed_root >= 1,
                 "ensure_project_imports_fresh_for_check must refresh root host-effect import P.EnvDep via Lake and verify post-refresh"
+            );
+            assert_ne!(
+                fs::read(&root_env_olean)?,
+                root_alpha_bytes,
+                "ensure_project_imports_fresh_for_check must bypass LAKE_ARTIFACT_CACHE and force Lake to re-elaborate P.EnvDep across untracked env rotation"
             );
 
             // Fifth case (`astra` Finding 2 + `sol` Finding 2): path dependency AND git-pinned dependency
@@ -17785,6 +17809,10 @@ end ParityNs
                 );
                 let canon_app = app_proj.canonicalize()?;
                 let canon_app_lean = app_proj.join("App.lean").canonicalize()?;
+                let dep_olean = dep_in_pkgs.join(".lake/build/lib/lean/Dep.olean");
+                let dep_beta_bytes = fs::read(&dep_olean)?;
+                std::env::set_var(ENV_KEY, "alpha");
+                fs::write(&flag_file, "alpha\n")?;
                 let refreshed = crate::lake_build::ensure_project_imports_fresh_for_check(
                     &canon_app,
                     std::slice::from_ref(&canon_app_lean),
@@ -17792,6 +17820,30 @@ end ParityNs
                 assert!(
                     refreshed >= 1,
                     "ensure_project_imports_fresh_for_check must refresh host-effect dep via Lake and verify post-refresh (git={use_git_pin})"
+                );
+                assert_ne!(
+                    fs::read(&dep_olean)?,
+                    dep_beta_bytes,
+                    "ensure_project_imports_fresh_for_check must purge and force Lake to re-elaborate Dep.olean across untracked env/file rotation (git={use_git_pin})"
+                );
+                fs::write(
+                    &canon_app_lean,
+                    "import Dep\ntheorem app_check_thm : depWitness 0 = 0 := rfl\n",
+                )?;
+                let check_val = crate::check::run_check_command_value(
+                    &mut dep_store,
+                    true,
+                    canon_app_lean.clone(),
+                    None,
+                    canon_app.clone(),
+                    Some(1),
+                    false,
+                    None,
+                )?;
+                assert_eq!(
+                    check_val.get("ok").and_then(|v| v.as_bool()),
+                    Some(true),
+                    "turbo-lean check must elaborate App.lean against refreshed alpha Dep.olean (Nat), got: {check_val}"
                 );
                 let _ = fs::remove_dir_all(&dep_case_root);
             }
@@ -17806,6 +17858,14 @@ end ParityNs
         match prev_env {
             Some(v) => std::env::set_var(ENV_KEY, v),
             None => std::env::remove_var(ENV_KEY),
+        }
+        match prev_lake_cache_dir {
+            Some(v) => std::env::set_var("LAKE_CACHE_DIR", v),
+            None => std::env::remove_var("LAKE_CACHE_DIR"),
+        }
+        match prev_lake_art_cache {
+            Some(v) => std::env::set_var("LAKE_ARTIFACT_CACHE", v),
+            None => std::env::remove_var("LAKE_ARTIFACT_CACHE"),
         }
         res
     }

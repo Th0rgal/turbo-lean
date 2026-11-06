@@ -3928,9 +3928,7 @@ fn purge_workspace_sorry_artifacts_and_manifest(
     sorry_mod_set
 }
 
-fn remove_module_build_artifacts(canon_dir: &Path, rel_slash: &str) {
-    let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
-    let ir_dir = canon_dir.join(".lake/build/ir");
+fn remove_build_artifacts_in_dirs(lib_lean_dir: &Path, ir_dir: &Path, rel_slash: &str) {
     for suffix in [
         ".olean",
         ".olean.hash",
@@ -3964,6 +3962,17 @@ fn remove_module_build_artifacts(canon_dir: &Path, rel_slash: &str) {
         let p = ir_dir.join(format!("{}{}", rel_slash, suffix));
         let _ = fs::remove_file(p);
     }
+}
+
+pub(crate) fn remove_spec_build_artifacts(spec: &crate::module_builder::DiscoveredModuleSpec) {
+    let rel_slash = crate::module_builder::module_name_to_rel_slash(&spec.module_name);
+    remove_build_artifacts_in_dirs(&spec.build_lib_lean_dir, &spec.build_ir_dir, &rel_slash);
+}
+
+fn remove_module_build_artifacts(canon_dir: &Path, rel_slash: &str) {
+    let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
+    let ir_dir = canon_dir.join(".lake/build/ir");
+    remove_build_artifacts_in_dirs(&lib_lean_dir, &ir_dir, rel_slash);
 }
 
 /// Translate a list of stale modules into the targets to hand `lake build`, replacing any module
@@ -4596,10 +4605,32 @@ fn ensure_project_imports_fresh_inner(
         // artifact cache): let Lake bring stale target imports up to date, and purge any stale
         // standalone non-target `.olean`s left in `.lake/build/lib/lean`.
         if !lake_targets.is_empty() {
-            lake_build_modules(
+            let bypass_lake_cache = if let Some(ref cfg) = root_cfg {
+                crate::module_builder::purge_elab_host_effect_artifacts_in_closure(
+                    cfg,
+                    &lake_targets,
+                )
+            } else {
+                let mut purged = false;
+                for info in &ordered_imports {
+                    if stale_mods.contains(&info.mod_name)
+                        && fs::read_to_string(&info.dep_src)
+                            .map(|s| {
+                                crate::splitter::source_may_execute_elab_host_effects(&s, false)
+                            })
+                            .unwrap_or(true)
+                    {
+                        remove_module_build_artifacts(canon_dir, &info.imp_slash);
+                        purged = true;
+                    }
+                }
+                purged
+            };
+            lake_build_modules_opts(
                 canon_dir,
                 &lake_refresh_targets(canon_dir, &lake_targets),
                 rev,
+                bypass_lake_cache,
             )?;
         }
         for mod_name in &non_target_stale {
@@ -4695,7 +4726,16 @@ pub(crate) fn ensure_project_imports_fresh_for_check(
 pub(crate) fn lake_build_modules(
     canon_dir: &Path,
     modules: &[String],
+    rev: Option<&str>,
+) -> Result<()> {
+    lake_build_modules_opts(canon_dir, modules, rev, false)
+}
+
+fn lake_build_modules_opts(
+    canon_dir: &Path,
+    modules: &[String],
     _rev: Option<&str>,
+    bypass_artifact_cache: bool,
 ) -> Result<()> {
     if worktree_auto_link_disabled(canon_dir) {
         anyhow::bail!(
@@ -4708,11 +4748,25 @@ pub(crate) fn lake_build_modules(
         canon_dir,
         &detect_toolchain(canon_dir),
     )?;
-    let out = Command::new(&tools.lake)
-        .env("PATH", tools.lake_build_path(canon_dir))
+    let _isolated_cache = if bypass_artifact_cache {
+        Some(crate::check::PrivateScratchDir::create(
+            &crate::check::verified_private_temp_scratch_base()?,
+            "turbo_lake_nocache",
+        )?)
+    } else {
+        None
+    };
+    let mut cmd = Command::new(&tools.lake);
+    cmd.env("PATH", tools.lake_build_path(canon_dir))
         .env("LEAN", &tools.lean)
         .env("LAKE", &tools.lake)
-        .env("LEANC", &tools.leanc)
+        .env("LEANC", &tools.leanc);
+    if let Some(ref scratch) = _isolated_cache {
+        cmd.arg("--no-cache")
+            .env("LAKE_ARTIFACT_CACHE", "false")
+            .env("LAKE_CACHE_DIR", &scratch.path);
+    }
+    let out = cmd
         .arg("build")
         .args(modules)
         .current_dir(canon_dir)

@@ -8591,6 +8591,84 @@ pub(crate) fn forget_refreshed_dep_module(cfg: &ProjectConfig, imp: &str) {
     }
 }
 
+pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
+    cfg: &ProjectConfig,
+    seeds: &[String],
+) -> bool {
+    let mut visited = HashSet::new();
+    let mut postorder: Vec<DiscoveredModuleSpec> = Vec::new();
+    let mut stack: Vec<(DiscoveredModuleSpec, bool)> = seeds
+        .iter()
+        .filter_map(|imp| {
+            let site = match resolve_module_in_package(&cfg.root_pkg, true, imp) {
+                Some(rs) => ImportSite::Module(Box::new(rs)),
+                None => resolve_import_site(cfg, imp),
+            };
+            match site {
+                ImportSite::Module(spec) => Some((*spec, false)),
+                _ => None,
+            }
+        })
+        .collect();
+    while let Some((spec, expanded)) = stack.pop() {
+        let key = (spec.pkg_root.clone(), spec.module_name.clone());
+        if expanded {
+            postorder.push(spec);
+            continue;
+        }
+        if !visited.insert(key) {
+            continue;
+        }
+        let sub_imps = fs::read_to_string(&spec.src_path)
+            .ok()
+            .map(|s| parse_header_info(&s))
+            .filter(|h| h.header_error.is_none())
+            .map(|h| h.imports)
+            .unwrap_or_default();
+        stack.push((spec, true));
+        for sub in sub_imps {
+            let site = match resolve_module_in_package(&cfg.root_pkg, true, &sub) {
+                Some(rs) => ImportSite::Module(Box::new(rs)),
+                None => resolve_import_site(cfg, &sub),
+            };
+            if let ImportSite::Module(sub_spec) = site {
+                if !visited.contains(&(sub_spec.pkg_root.clone(), sub_spec.module_name.clone())) {
+                    stack.push((*sub_spec, false));
+                }
+            }
+        }
+    }
+    let mut tainted: HashSet<(PathBuf, String)> = HashSet::new();
+    let mut purged_any = false;
+    for spec in postorder {
+        let Ok(src_raw) = fs::read_to_string(&spec.src_path) else {
+            tainted.insert((spec.pkg_root.clone(), spec.module_name.clone()));
+            crate::lake_build::remove_spec_build_artifacts(&spec);
+            purged_any = true;
+            continue;
+        };
+        let hdr = parse_header_info(&src_raw);
+        let imp_tainted = hdr.header_error.is_some()
+            || hdr.imports.iter().any(|sub| {
+                let site = match resolve_module_in_package(&cfg.root_pkg, true, sub) {
+                    Some(rs) => ImportSite::Module(Box::new(rs)),
+                    None => resolve_import_site(cfg, sub),
+                };
+                matches!(
+                    site,
+                    ImportSite::Module(sub_spec)
+                        if tainted.contains(&(sub_spec.pkg_root, sub_spec.module_name))
+                )
+            });
+        if imp_tainted || spec_source_has_disallowed_elab_host_effects(cfg, &spec, &src_raw) {
+            tainted.insert((spec.pkg_root.clone(), spec.module_name.clone()));
+            crate::lake_build::remove_spec_build_artifacts(&spec);
+            purged_any = true;
+        }
+    }
+    purged_any
+}
+
 pub(crate) fn root_module_lake_sidecars_current(cfg: &ProjectConfig, imp: &str) -> bool {
     let Some(spec) = resolve_module_in_package(&cfg.root_pkg, true, imp) else {
         return false;
@@ -8941,7 +9019,7 @@ fn resolve_source_spec_for_prebuilt_olean(
     None
 }
 
-fn spec_source_has_disallowed_elab_host_effects(
+pub(crate) fn spec_source_has_disallowed_elab_host_effects(
     cfg: &ProjectConfig,
     spec: &DiscoveredModuleSpec,
     src_raw: &str,
@@ -8978,9 +9056,7 @@ fn prebuilt_closure_export_info(
     let res = (|| -> Option<LakeModuleExportInfo> {
         if let Some(mapped_spec) = resolve_source_spec_for_prebuilt_olean(cfg, olean_path) {
             let mapped_src = fs::read_to_string(&mapped_spec.src_path).ok()?;
-            if !cache.post_lake_refresh
-                && spec_source_has_disallowed_elab_host_effects(cfg, &mapped_spec, &mapped_src)
-            {
+            if spec_source_has_disallowed_elab_host_effects(cfg, &mapped_spec, &mapped_src) {
                 return None;
             }
         }
@@ -9658,7 +9734,7 @@ pub(crate) fn dep_pkg_import_pins_consistent(
     };
     let mut seen: HashMap<(PathBuf, String), String> = HashMap::new();
     let mut stack = vec![(spec, OwnedImportPinSpec::from_spec(pin_spec))];
-    let use_global_memo = cache.cutoff_pins.is_empty();
+    let use_global_memo = cache.cutoff_pins.is_empty() && !cache.post_lake_refresh;
     while let Some((cur, req)) = stack.pop() {
         let key = (cur.pkg_root.clone(), cur.module_name.clone());
         let req_spec = req.as_spec();
