@@ -17,6 +17,20 @@ namespace LeanNative.IR
 open Lean
 open Lean.Compiler.LCNF
 
+/-- Decide whether native executable linking uses standalone static `libleanrt.a` + `libInit.a` (`true`)
+    or shared `libleanshared` (`false`), failing closed when `--standalone` is explicitly requested
+    alongside `--dynamic-runtime`, on Darwin, or when static runtime archives are missing. -/
+def resolveStandaloneLinkMode (isDarwin forceStandalone forceDynamic hasStaticLeanRt hasStaticInit : Bool) :
+    Except String Bool :=
+  if forceStandalone && forceDynamic then
+    .error "[lean-native] conflicting flags: `--standalone` and `--dynamic-runtime` cannot be combined"
+  else if forceStandalone && isDarwin then
+    .error "[lean-native] `--standalone` static runtime linking is not supported on Darwin targets"
+  else if forceStandalone && (!hasStaticLeanRt || !hasStaticInit) then
+    .error "[lean-native] `--standalone` requested, but static Lean runtime archives (`libleanrt.a`, `libInit.a`) are missing"
+  else
+    .ok (!isDarwin && !forceDynamic && hasStaticLeanRt && hasStaticInit)
+
 /-- Resolve the Lean 4.35 sysroot path reliably even when `lean` is not on `PATH`. -/
 def resolveLeanSysroot : IO System.FilePath := do
   if let some envRoot ← IO.getEnv "LEAN_SYSROOT" then
@@ -103,9 +117,9 @@ def emitLeanCFromSourceFile (filePath : String) (modName : Lean.Name := `Main)
 /-- P-cert C4/C5 `build-exe` gate (fail closed, checked before any file is written): the Bridge already refuses
     RC-ADT decls without `allowRcAdt`, but the LLVM backend accepts no heap code, so `build-exe` re-checks
     `findRcAdtDecl?` on the lowered module and `findUnsupportedLLVMCall?` on the optimized one explicitly. -/
-def buildExeLLVMGate? (rawMod optMod : LNIRModule) : Option String :=
+def buildExeLLVMGate? (rawMod optMod : LNIRModule) (arch : TargetArch := .x86_64) : Option String :=
   (rawMod.findRcAdtDecl?.map fun d => s!"[lean-native] build-exe: RC-ADT declaration '{d}' is unsupported by the LLVM backend") <|>
-  ((LeanNative.Backend.LLVM.findUnsupportedLLVMCall? optMod).map fun (d, c) =>
+  ((LeanNative.Backend.LLVM.findUnsupportedLLVMCall? optMod arch).map fun (d, c) =>
     s!"[lean-native] build-exe: unsupported external or non-scalar call '{c}' in '{d}'")
 
 /-- Full LCNF-to-Executable builder (`buildNativeExecutable` / `buildExecutableFromLeanFile`). -/
@@ -116,7 +130,7 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
     if System.Platform.target.startsWith "aarch64" || System.Platform.target.startsWith "arm64" then .arm64 else .x86_64
   let (cCode, rawMod) ← emitLeanCFromSourceFile filePath `Main hostArch
   let (optMod, _) := LeanNative.Transform.runDefaultPipeline rawMod
-  if let some err := buildExeLLVMGate? rawMod optMod then throw <| IO.userError err
+  if let some err := buildExeLLVMGate? rawMod optMod hostArch then throw <| IO.userError err
   let superoptTgt : LeanNative.Transform.SuperoptTarget :=
     match hostArch with
     | .arm64 => .arm64
@@ -199,11 +213,42 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
 
   let isDarwin := (System.Platform.target.splitOn "darwin").length > 1 || (System.Platform.target.splitOn "apple").length > 1
   let linkInputs := if isDarwin then #[optLlPath, runtimePath] else #[optLlPath, lnirOptLlPath, runtimePath, "-Wl,--allow-multiple-definition"]
-  let linkOut ← IO.Process.output {
+  let sysLibDir := (sysroot / "lib").toString
+  let hasStaticLeanRt ← ((sysroot / "lib" / "lean" / "libleanrt.a").pathExists)
+  let hasStaticInit ← ((sysroot / "lib" / "lean" / "libInit.a").pathExists)
+  let hasStaticStd ← ((sysroot / "lib" / "lean" / "libStd.a").pathExists)
+  let forceDynamic := cliArgs.contains "--dynamic-runtime"
+  let forceStandalone := cliArgs.contains "--standalone"
+  let useStandaloneStatic ← match resolveStandaloneLinkMode isDarwin forceStandalone forceDynamic hasStaticLeanRt hasStaticInit with
+    | .ok mode => pure mode
+    | .error msg => throw <| IO.userError msg
+  let runtimeLinkFlags : Array String ← do
+    if useStandaloneStatic then
+      let leanLibDir := sysroot / "lib" / "lean"
+      let mut leanArchives := #[(leanLibDir / "libInit.a").toString]
+      if hasStaticStd then leanArchives := leanArchives.push (leanLibDir / "libStd.a").toString
+      leanArchives := leanArchives.push (leanLibDir / "libleanrt.a").toString
+      if (← (leanLibDir / "libleancpp.a").pathExists) then
+        leanArchives := leanArchives.push (leanLibDir / "libleancpp.a").toString
+      let mut extStatic := #[]
+      for cand in #["libgmp.a", "libunwind.a", "libuv.a", "libc++.a", "libc++abi.a"] do
+        if (← (sysroot / "lib" / cand).pathExists) then
+          extStatic := extStatic.push (sysroot / "lib" / cand).toString
+      pure (#[s!"-L{libDir}", s!"-L{sysLibDir}", "-Wl,--gc-sections", "-Wl,--start-group"] ++
+        leanArchives ++ extStatic ++ #["-Wl,--end-group", "-lm", "-lpthread", "-ldl", "-lrt"])
+    else
+      pure #[s!"-L{libDir}", "-lleanshared", s!"-Wl,-rpath,{libDir}", "-lm", "-lpthread", "-ldl"]
+  let mut linkOut ← IO.Process.output {
     cmd  := clangCmd
     args := #[optLevel, "-DNDEBUG", "-march=native", "-Wno-override-module", s!"-I{incDir}", s!"-I{runtimeDir}"] ++
-      extraIncArgs ++ linkInputs ++ #[s!"-L{libDir}", "-lleanshared", s!"-Wl,-rpath,{libDir}", "-lm", "-lpthread", "-ldl", "-o", outBin]
+      extraIncArgs ++ linkInputs ++ runtimeLinkFlags ++ #["-o", outBin]
   }
+  if linkOut.exitCode != 0 && useStandaloneStatic && !cliArgs.contains "--standalone" then
+    linkOut ← IO.Process.output {
+      cmd  := clangCmd
+      args := #[optLevel, "-DNDEBUG", "-march=native", "-Wno-override-module", s!"-I{incDir}", s!"-I{runtimeDir}"] ++
+        extraIncArgs ++ linkInputs ++ #[s!"-L{libDir}", "-lleanshared", s!"-Wl,-rpath,{libDir}", "-lm", "-lpthread", "-ldl", "-o", outBin]
+    }
   if linkOut.exitCode != 0 then
     throw <| IO.userError s!"clang native link failed:\n{linkOut.stderr}"
 

@@ -234,8 +234,10 @@ def validateTranslationDecl (src tgt : LNIRDecl) (numSamples : Nat := 64) : TVDe
   let symUbImplies : Bool :=
     tcUb == .constBool true || scUb == .constBool false || scUb == tcUb ||
       normSymExpr (SymExecState.hoistIteTupleFuel 16 (normSymIteStep scUb tcUb (.constBool true))) == .constBool true
-  -- C6.1/C6.2: exhaustion is an incomplete analysis on either side, never excused by syntactic identity
-  let symSupportedOk := !sSrc.symExhausted && !sTgt.symExhausted &&
+  -- C6.1/C6.2: exhaustion is an incomplete analysis on either side, never excused by syntactic identity;
+  -- element-type inconsistency (`checkElemTypes`) also fails closed even when `src == tgt`.
+  let elemTypesOk := src.checkElemTypes.isNone && tgt.checkElemTypes.isNone
+  let symSupportedOk := elemTypesOk && !sSrc.symExhausted && !sTgt.symExhausted &&
     (isIdenticalDecl || (!sSrc.symUnsupported && !sTgt.symUnsupported))
   let ubRefines := symSupportedOk && (!sSrc.noUB || sTgt.noUB) && symUbImplies
   -- 2. Return domain / reachability equivalence on defined source paths (`scUb → (sSrc.reachCond == sTgt.reachCond)`)
@@ -316,11 +318,515 @@ def validateTranslationDecl (src tgt : LNIRDecl) (numSamples : Nat := 64) : TVDe
     srcRetSummary := reprStr sSrc.retVal
     tgtRetSummary := reprStr sTgt.retVal }
 
+private def isLocalCallableScalarInt : LNIRType → Bool
+  | .i64 | .usize | .i32 | .i16 | .i8 | .i1 | .unit => true
+  | _ => false
+
+private def isLocalCallableParamTy : LNIRType → Bool
+  | .sarray _ | .f64 => true
+  | ty => isLocalCallableScalarInt ty
+
+private def isLocalCallDstScalarSlot : LNIRType → Bool
+  | .objPtr | .taggedPtr | .sarray _ | .rawPtr _ | .storageMap | .u256 | .i256 | .tuple _ => false
+  | _ => true
+
+private def isExternWrapperDecl (d : LNIRDecl) : Bool :=
+  match d.body with
+  | .letBind dst _ (.call fn _ _ true) (.ret retVar) => dst == retVar && fn == d.name
+  | _ => false
+
+private def localCallableSigs (m : LNIRModule) : List (String × List LNIRType × LNIRType) :=
+  m.decls.filterMap fun d =>
+    if !isExternWrapperDecl d && (isLocalCallableScalarInt d.retTy || d.retTy == .f64) &&
+       d.params.all (fun p => isLocalCallableParamTy p.ty) then
+      some (d.name, d.params.map (·.ty), d.retTy)
+    else none
+
+private def isBuiltinRuntimeCall (fnName : String) : Bool :=
+  fnName == "lean_native_box_u64" || fnName == "lean_native_unbox_u64" ||
+  fnName == "lean_native_ensure_exclusive" || fnName == "lean_native_sarray_len" ||
+  fnName == "lean_mark_mt" || fnName == "lean_native_ctor_set" ||
+  fnName == "lean_native_ctor_set_scalar" || fnName == "lean_native_ctor_set_tag" ||
+  fnName == "lean_native_del_obj" || fnName == "lean_native_ctor_tag"
+
+private def codeHasUserLocalCall : LNIRCode → Bool
+  | .letBind _ _ (.call fn _ _ false) k => (!isBuiltinRuntimeCall fn) || codeHasUserLocalCall k
+  | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k | .parFor _ _ _ _ _ k =>
+    codeHasUserLocalCall k
+  | .ite _ t e | .seqFor _ _ _ _ _ _ t e => codeHasUserLocalCall t || codeHasUserLocalCall e
+  | .ret _ | .unreachable => false
+
+private abbrev SpecValSort := UInt8
+private def specSortBool : UInt8 := 0
+private def specSortU64 : UInt8 := 1
+private def specSortUnit : UInt8 := 2
+private def specSortSarray : UInt8 := 3
+private def specSortOther : UInt8 := 4
+
+private def paramSpecSort : LNIRType → SpecValSort
+  | .i1 => specSortBool
+  | .unit => specSortUnit
+  | .sarray _ => specSortSarray
+  | .i8 | .i16 | .i32 | .i64 | .usize | .f32 | .f64 => specSortU64
+  | _ => specSortOther
+
+private def elemStorageWidth? : LNIRType → Option LNIRType
+  | .i1 | .i8 => some .i8
+  | .i16 => some .i16
+  | .i32 | .f32 => some .i32
+  | _ => none
+
+private def widthFitsIn (knownTy targetTy : LNIRType) : Bool :=
+  match knownTy, targetTy with
+  | .i1, .i1 | .i1, .i8 | .i1, .i16 | .i1, .i32 => true
+  | .i8, .i8 | .i8, .i16 | .i8, .i32 => true
+  | .i16, .i16 | .i16, .i32 => true
+  | .i32, .i32 => true
+  | _, _ => false
+
+private def exprGuaranteedWidth? (exactEnv : List (VarId × LNIRType)) : LNIRExpr → Option LNIRType
+  | .sarrayGet _ _ et | .rawLoad _ _ et => elemStorageWidth? et
+  | .scalar (.var v) => exactEnv.lookup v
+  | .scalar (.constBool _) | .isExclusive _ => some .i1
+  | .scalar (.constU64 c) =>
+    if c ≤ 1 then some .i1
+    else if c ≤ 0xFF then some .i8
+    else if c ≤ 0xFFFF then some .i16
+    else if c ≤ 0xFFFFFFFF then some .i32
+    else none
+  | _ => none
+
+private def scalarExprSpecSort (sortEnv : List (VarId × SpecValSort)) : ScalarExpr → SpecValSort
+  | .constBool _ => specSortBool
+  | .constU64 _ => specSortU64
+  | .var id => (sortEnv.lookup id).getD specSortOther
+  | .binOp .eq l r =>
+    let sl := scalarExprSpecSort sortEnv l
+    let sr := scalarExprSpecSort sortEnv r
+    if (sl == specSortBool && sr == specSortBool) || (sl == specSortU64 && sr == specSortU64) then
+      specSortBool
+    else
+      specSortOther
+  | .binOp .lt l r | .binOp .le l r =>
+    if scalarExprSpecSort sortEnv l == specSortU64 && scalarExprSpecSort sortEnv r == specSortU64 then
+      specSortBool
+    else
+      specSortOther
+  | .binOp .addChecked256 _ _ | .binOp .subChecked256 _ _ | .binOp .mulChecked256 _ _ => specSortOther
+  | .binOp _ l r =>
+    if scalarExprSpecSort sortEnv l == specSortU64 && scalarExprSpecSort sortEnv r == specSortU64 then
+      specSortU64
+    else
+      specSortOther
+  | .unaryOp .not a =>
+    let sa := scalarExprSpecSort sortEnv a
+    if sa == specSortBool || sa == specSortU64 then sa else specSortOther
+  | .unaryOp .neg a =>
+    if scalarExprSpecSort sortEnv a == specSortU64 then specSortU64 else specSortOther
+  | .unaryOp .clz256 _ => specSortOther
+  | .select c t e =>
+    let sc := scalarExprSpecSort sortEnv c
+    let st := scalarExprSpecSort sortEnv t
+    let se := scalarExprSpecSort sortEnv e
+    if (sc == specSortBool || sc == specSortU64) && st == se then st else specSortOther
+  | .fma a b c =>
+    if scalarExprSpecSort sortEnv a == specSortU64 &&
+       scalarExprSpecSort sortEnv b == specSortU64 &&
+       scalarExprSpecSort sortEnv c == specSortU64 then specSortU64 else specSortOther
+
+private def exprSpecSort (sortEnv : List (VarId × SpecValSort)) : LNIRExpr → SpecValSort
+  | .scalar se => scalarExprSpecSort sortEnv se
+  | .sarrayGet .. | .rawLoad .. | .sarrayLen _ | .unboxScalar .. => specSortU64
+  | .sarrayEnsureExclusive .. | .sarraySet .. => specSortSarray
+  | .isExclusive _ => specSortBool
+  | .call fn _ _ false =>
+    if fn == "lean_native_ensure_exclusive" then specSortSarray
+    else if fn == "lean_native_sarray_len" || fn == "lean_mark_mt" || fn == "lean_native_ctor_tag" then
+      specSortU64
+    else if fn == "lean_native_ctor_set" || fn == "lean_native_ctor_set_scalar" ||
+            fn == "lean_native_ctor_set_tag" || fn == "lean_native_del_obj" then specSortUnit
+    else specSortOther
+  | _ => specSortOther
+
+private def scalarExprHasBoolSortConflict (varEnv : List (VarId × LNIRType))
+    (sortEnv : List (VarId × SpecValSort)) : ScalarExpr → Bool
+  | .constBool _ | .constU64 _ | .var _ => false
+  | .unaryOp .not (.var id) =>
+    let isI1Slot := varEnv.lookup id == some .i1
+    let s := (sortEnv.lookup id).getD specSortOther
+    (isI1Slot && s != specSortBool) || (!isI1Slot && s == specSortBool)
+  | .unaryOp .not a => scalarExprHasBoolSortConflict varEnv sortEnv a
+  | .unaryOp .neg a =>
+    scalarExprSpecSort sortEnv a == specSortBool || scalarExprHasBoolSortConflict varEnv sortEnv a
+  | .unaryOp .clz256 a =>
+    scalarExprSpecSort sortEnv a == specSortBool || scalarExprHasBoolSortConflict varEnv sortEnv a
+  | .binOp .eq l r =>
+    let sl := scalarExprSpecSort sortEnv l
+    let sr := scalarExprSpecSort sortEnv r
+    ((sl == specSortBool) != (sr == specSortBool)) ||
+    scalarExprHasBoolSortConflict varEnv sortEnv l || scalarExprHasBoolSortConflict varEnv sortEnv r
+  | .binOp _ l r =>
+    scalarExprSpecSort sortEnv l == specSortBool || scalarExprSpecSort sortEnv r == specSortBool ||
+    scalarExprHasBoolSortConflict varEnv sortEnv l || scalarExprHasBoolSortConflict varEnv sortEnv r
+  | .select c t e =>
+    scalarExprHasBoolSortConflict varEnv sortEnv c ||
+    scalarExprHasBoolSortConflict varEnv sortEnv t ||
+    scalarExprHasBoolSortConflict varEnv sortEnv e
+  | .fma a b c =>
+    scalarExprSpecSort sortEnv a == specSortBool ||
+    scalarExprSpecSort sortEnv b == specSortBool ||
+    scalarExprSpecSort sortEnv c == specSortBool ||
+    scalarExprHasBoolSortConflict varEnv sortEnv a ||
+    scalarExprHasBoolSortConflict varEnv sortEnv b ||
+    scalarExprHasBoolSortConflict varEnv sortEnv c
+
+private def exprHasBoolSortConflict (varEnv : List (VarId × LNIRType))
+    (sortEnv : List (VarId × SpecValSort)) : LNIRExpr → Bool
+  | .scalar se => scalarExprHasBoolSortConflict varEnv sortEnv se
+  | .sarrayGet _ iv _ | .rawLoad _ iv _ => sortEnv.lookup iv == some specSortBool
+  | .sarraySet _ iv vv _ =>
+    sortEnv.lookup iv == some specSortBool || sortEnv.lookup vv == some specSortBool
+  | _ => false
+
+private def coerceCallArgExpr? (srcSort : SpecValSort) (paramTy : LNIRType) (alreadyNarrow : Bool)
+    (argVar : VarId) : Option LNIRExpr :=
+  match paramTy with
+  | .sarray _ =>
+    if srcSort == specSortSarray then some (.scalar (.var argVar)) else none
+  | .unit =>
+    if srcSort == specSortUnit then some (.scalar (.var argVar)) else some (.scalar (.constU64 0))
+  | .i1 =>
+    if srcSort == specSortBool then some (.scalar (.var argVar))
+    else if srcSort == specSortU64 then
+      some (.scalar (.binOp .eq (.binOp .bitAnd (.var argVar) (.constU64 1)) (.constU64 1)))
+    else none
+  | .i8 =>
+    if srcSort == specSortBool then some (.scalar (.select (.var argVar) (.constU64 1) (.constU64 0)))
+    else if srcSort == specSortU64 then
+      some (if alreadyNarrow then .scalar (.var argVar)
+            else .scalar (.binOp .bitAnd (.var argVar) (.constU64 0xFF)))
+    else none
+  | .i16 =>
+    if srcSort == specSortBool then some (.scalar (.select (.var argVar) (.constU64 1) (.constU64 0)))
+    else if srcSort == specSortU64 then
+      some (if alreadyNarrow then .scalar (.var argVar)
+            else .scalar (.binOp .bitAnd (.var argVar) (.constU64 0xFFFF)))
+    else none
+  | .i32 =>
+    if srcSort == specSortBool then some (.scalar (.select (.var argVar) (.constU64 1) (.constU64 0)))
+    else if srcSort == specSortU64 then
+      some (if alreadyNarrow then .scalar (.var argVar)
+            else .scalar (.binOp .bitAnd (.var argVar) (.constU64 0xFFFFFFFF)))
+    else none
+  | _ =>
+    if srcSort == specSortBool then some (.scalar (.select (.var argVar) (.constU64 1) (.constU64 0)))
+    else if srcSort == specSortU64 then some (.scalar (.var argVar))
+    else none
+
+private def coerceCallRetExpr? (rvSort : SpecValSort) (calleeRetTy dstTy : LNIRType)
+    (alreadyNarrow : Bool) (rv : VarId) : Option LNIRExpr :=
+  if calleeRetTy == .unit then
+    if dstTy == .i1 then none
+    else if dstTy == .unit && rvSort == specSortUnit then some (.scalar (.var rv))
+    else if dstTy != .unit then some (.scalar (.constU64 0))
+    else none
+  else if dstTy == .unit then
+    none
+  else if dstTy == .i1 then
+    if calleeRetTy != .i1 then none
+    else if rvSort == specSortBool then some (.scalar (.var rv))
+    else if rvSort == specSortU64 then
+      let m : ScalarExpr := if alreadyNarrow then .var rv else .binOp .bitAnd (.var rv) (.constU64 1)
+      some (.scalar (.binOp .eq m (.constU64 1)))
+    else none
+  else if rvSort != specSortBool && rvSort != specSortU64 then
+    none
+  else
+    let asU64 : ScalarExpr :=
+      if rvSort == specSortBool then .select (.var rv) (.constU64 1) (.constU64 0) else .var rv
+    let maskedU64 : ScalarExpr :=
+      if alreadyNarrow || rvSort == specSortBool then asU64
+      else
+        match calleeRetTy with
+        | .i1 => .binOp .bitAnd asU64 (.constU64 1)
+        | .i8 => .binOp .bitAnd asU64 (.constU64 0xFF)
+        | .i16 => .binOp .bitAnd asU64 (.constU64 0xFFFF)
+        | .i32 => .binOp .bitAnd asU64 (.constU64 0xFFFFFFFF)
+        | _ => asU64
+    some (.scalar maskedU64)
+
+private def spliceCalleeBody (inLoopStep : Bool) (calleeEnv exactEnv : List (VarId × LNIRType))
+    (sortEnv : List (VarId × SpecValSort)) (calleeRetTy callDstTy : LNIRType) (callDst : VarId)
+    (callerCont : LNIRCode) : LNIRCode → List (VarId × VarId) → StateM VarId (Option LNIRCode)
+  | .letBind dst ty val k, subst => do
+    if exprHasBoolSortConflict calleeEnv sortEnv val then return none
+    let val' := val.rewriteSubst subst
+    let fDst ← get
+    set (fDst + 1)
+    let exactEnv' := match exprGuaranteedWidth? exactEnv val with
+      | some wTy => (dst, wTy) :: exactEnv.filter (·.1 != dst)
+      | none => exactEnv.filter (·.1 != dst)
+    let sortEnv' := (dst, exprSpecSort sortEnv val) :: sortEnv.filter (·.1 != dst)
+    match ← spliceCalleeBody inLoopStep ((dst, ty) :: calleeEnv.filter (·.1 != dst)) exactEnv' sortEnv'
+        calleeRetTy callDstTy callDst callerCont k ((dst, fDst) :: subst) with
+    | some k' => return some (.letBind fDst ty val' k')
+    | none => return none
+  | .rawStore pv iv vv et k, subst => do
+    if sortEnv.lookup iv == some specSortBool || sortEnv.lookup vv == some specSortBool then
+      return none
+    let rw (v : VarId) := (subst.lookup v).getD v
+    match ← spliceCalleeBody inLoopStep calleeEnv exactEnv sortEnv calleeRetTy callDstTy callDst
+        callerCont k subst with
+    | some k' => return some (.rawStore (rw pv) (rw iv) (rw vv) et k')
+    | none => return none
+  | .incRef ov c k, subst => do
+    let rw (v : VarId) := (subst.lookup v).getD v
+    match ← spliceCalleeBody inLoopStep calleeEnv exactEnv sortEnv calleeRetTy callDstTy callDst
+        callerCont k subst with
+    | some k' => return some (.incRef (rw ov) c k')
+    | none => return none
+  | .decRef ov c k, subst => do
+    let rw (v : VarId) := (subst.lookup v).getD v
+    match ← spliceCalleeBody inLoopStep calleeEnv exactEnv sortEnv calleeRetTy callDstTy callDst
+        callerCont k subst with
+    | some k' => return some (.decRef (rw ov) c k')
+    | none => return none
+  | .ite cv t e, subst => do
+    let rw (v : VarId) := (subst.lookup v).getD v
+    match ← spliceCalleeBody inLoopStep calleeEnv exactEnv sortEnv calleeRetTy callDstTy callDst
+              callerCont t subst,
+          ← spliceCalleeBody inLoopStep calleeEnv exactEnv sortEnv calleeRetTy callDstTy callDst
+              callerCont e subst with
+    | some t', some e' => return some (.ite (rw cv) t' e')
+    | _, _ => return none
+  | .seqFor iv lv hv av ai aty step k, subst => do
+    if sortEnv.lookup lv == some specSortBool || sortEnv.lookup hv == some specSortBool then
+      return none
+    let rw (v : VarId) := (subst.lookup v).getD v
+    let fIv ← get
+    let fAv := fIv + 1
+    set (fIv + 2)
+    let accSort := (sortEnv.lookup ai).getD (paramSpecSort aty)
+    let stepEnv := (av, aty) :: (iv, .i64) :: calleeEnv.filter (fun (id, _) => id != av && id != iv)
+    let exactStep := exactEnv.filter (fun (id, _) => id != av && id != iv)
+    let sortStep :=
+      (av, accSort) :: (iv, specSortU64) :: sortEnv.filter (fun (id, _) => id != av && id != iv)
+    let contEnv := (av, aty) :: calleeEnv.filter (·.1 != av)
+    let sortCont := (av, accSort) :: sortEnv.filter (·.1 != av)
+    match ← spliceCalleeBody true stepEnv exactStep sortStep calleeRetTy callDstTy callDst callerCont
+              step ((av, fAv) :: (iv, fIv) :: subst),
+          ← spliceCalleeBody inLoopStep contEnv (exactEnv.filter (·.1 != av)) sortCont
+              calleeRetTy callDstTy callDst callerCont k ((av, fAv) :: subst) with
+    | some step', some k' => return some (.seqFor fIv (rw lv) (rw hv) fAv (rw ai) aty step' k')
+    | _, _ => return none
+  | .parFor ov lv ins et kern k, subst => do
+    if sortEnv.lookup lv == some specSortBool then return none
+    let rw (v : VarId) := (subst.lookup v).getD v
+    let fOv ← get
+    set (fOv + 1)
+    let kern' ← match kern with
+      | .customScalar idxVar inVars body => do
+        let fIdx ← get
+        let fIns := (List.range inVars.length).map (fun i => fIdx + 1 + i)
+        set (fIdx + 1 + inVars.length)
+        let kSubst := (inVars.zip fIns) ++ ((idxVar, fIdx) :: subst)
+        pure (.customScalar fIdx fIns (body.rewriteSubst kSubst))
+      | other => pure other
+    let contEnv := (ov, .sarray et) :: calleeEnv.filter (·.1 != ov)
+    let sortCont := (ov, specSortSarray) :: sortEnv.filter (·.1 != ov)
+    match ← spliceCalleeBody inLoopStep contEnv (exactEnv.filter (·.1 != ov)) sortCont
+        calleeRetTy callDstTy callDst callerCont k ((ov, fOv) :: subst) with
+    | some k' => return some (.parFor fOv (rw lv) (ins.map rw) et kern' k')
+    | none => return none
+  | .ret rv, subst => do
+    let rv' := (subst.lookup rv).getD rv
+    if inLoopStep then
+      return some (.ret rv')
+    else
+      let rvSort := (sortEnv.lookup rv).getD specSortOther
+      let alreadyNarrow := match exactEnv.lookup rv with
+        | some wTy => widthFitsIn wTy calleeRetTy
+        | none => false
+      match coerceCallRetExpr? rvSort calleeRetTy callDstTy alreadyNarrow rv' with
+      | none => return none
+      | some retExpr =>
+        let fCallDst ← get
+        set (fCallDst + 1)
+        let contFresh ← callerCont.freshenBinders [(callDst, fCallDst)]
+        return some (.letBind fCallDst callDstTy retExpr contFresh)
+  | .unreachable, _ => return some .unreachable
+
+private def foldCallArgBinds? : List ((LNIRParam × VarId) × VarId) →
+    List (VarId × LNIRType) → List (VarId × SpecValSort) → LNIRCode → Option LNIRCode
+  | [], _, _, acc => some acc
+  | ((p, av), fp) :: rest, exactEnv, sortEnv, acc => do
+    let restCode ← foldCallArgBinds? rest exactEnv sortEnv acc
+    let srcSort := (sortEnv.lookup av).getD specSortOther
+    let argNarrow := match exactEnv.lookup av with
+      | some wTy => widthFitsIn wTy p.ty
+      | none => false
+    let argExpr ← coerceCallArgExpr? srcSort p.ty argNarrow av
+    some (.letBind fp p.ty argExpr restCode)
+
+private def inlineModuleCallsCode : Nat → List String → LNIRModule →
+    List (String × List LNIRType × LNIRType) → List (VarId × LNIRType) → List (VarId × LNIRType) →
+    List (VarId × SpecValSort) → LNIRCode → StateM VarId (Option LNIRCode)
+  | 0, _, _, _, _, _, _, _ => return none
+  | fuel + 1, visited, m, localSigs, varEnv, exactEnv, sortEnv, code => do
+    match code with
+    | .letBind dst ty (.call callee args retTy isExt) k =>
+      if isExt || isBuiltinRuntimeCall callee then
+        let callSort := exprSpecSort sortEnv (.call callee args retTy isExt)
+        let sortEnv' := (dst, callSort) :: sortEnv.filter (·.1 != dst)
+        match ← inlineModuleCallsCode (fuel + 1) visited m localSigs
+            ((dst, ty) :: varEnv.filter (·.1 != dst))
+            (exactEnv.filter (·.1 != dst)) sortEnv' k with
+        | some k' => return some (.letBind dst ty (.call callee args retTy isExt) k')
+        | none => return none
+      else if visited.contains callee || !isLocalCallDstScalarSlot ty ||
+              !localSigs.any (fun (nm, pTys, _) => nm == callee && pTys.length == args.length) then
+        return none
+      else
+        match m.decls.find? (fun d => d.name == callee && d.params.length == args.length) with
+        | none => return none
+        | some calleeDecl =>
+          if (ty == .i1 && calleeDecl.retTy != .i1) || (ty == .unit && calleeDecl.retTy != .unit) ||
+             (calleeDecl.retTy != .unit && ty == .unit) then
+            return none
+          let calleeInitEnv := calleeDecl.params.map fun p => (p.id, p.ty)
+          let calleeInitExact := calleeDecl.params.filterMap fun p =>
+            match p.ty with
+            | .i1 | .i8 | .i16 | .i32 => some (p.id, p.ty)
+            | _ => none
+          let calleeInitSort := calleeDecl.params.map fun p => (p.id, paramSpecSort p.ty)
+          let curMax ← get
+          set (Nat.max curMax (declSynVarBase calleeDecl + 16))
+          match ← inlineModuleCallsCode fuel (callee :: visited) m localSigs calleeInitEnv
+              calleeInitExact calleeInitSort calleeDecl.body with
+          | none => return none
+          | some calleeBodyInlined =>
+            let dstExact := match calleeDecl.retTy with
+              | .i1 | .i8 | .i16 | .i32 => (dst, calleeDecl.retTy) :: exactEnv.filter (·.1 != dst)
+              | _ => exactEnv.filter (·.1 != dst)
+            let dstSort : SpecValSort :=
+              if ty == .i1 then specSortBool
+              else if ty == .unit then specSortUnit
+              else specSortU64
+            let dstSortEnv := (dst, dstSort) :: sortEnv.filter (·.1 != dst)
+            match ← inlineModuleCallsCode (fuel + 1) visited m localSigs
+                ((dst, ty) :: varEnv.filter (·.1 != dst))
+                dstExact dstSortEnv k with
+            | none => return none
+            | some kInlined =>
+              let paramBase ← get
+              set (paramBase + calleeDecl.params.length + 4)
+              let freshParamIds := (List.range calleeDecl.params.length).map (fun i => paramBase + i)
+              let paramSubst := (calleeDecl.params.map (·.id)).zip freshParamIds
+              match ← spliceCalleeBody false calleeInitEnv calleeInitExact calleeInitSort
+                  calleeDecl.retTy ty dst kInlined calleeBodyInlined paramSubst with
+              | none => return none
+              | some splicedBody =>
+                let argTriples := (calleeDecl.params.zip args).zip freshParamIds
+                match foldCallArgBinds? argTriples exactEnv sortEnv splicedBody with
+                | none => return none
+                | some fullCode =>
+                  if fullCode.nodeSize > 16384 then return none
+                  else return some fullCode
+    | .letBind dst ty val k =>
+      if exprHasBoolSortConflict varEnv sortEnv val then return none
+      let exactEnv' := match exprGuaranteedWidth? exactEnv val with
+        | some wTy => (dst, wTy) :: exactEnv.filter (·.1 != dst)
+        | none => exactEnv.filter (·.1 != dst)
+      let sortEnv' := (dst, exprSpecSort sortEnv val) :: sortEnv.filter (·.1 != dst)
+      match ← inlineModuleCallsCode (fuel + 1) visited m localSigs
+          ((dst, ty) :: varEnv.filter (·.1 != dst))
+          exactEnv' sortEnv' k with
+      | some k' => return some (.letBind dst ty val k')
+      | none => return none
+    | .rawStore pv iv vv et k =>
+      if sortEnv.lookup iv == some specSortBool || sortEnv.lookup vv == some specSortBool then
+        return none
+      match ← inlineModuleCallsCode (fuel + 1) visited m localSigs varEnv exactEnv sortEnv k with
+      | some k' => return some (.rawStore pv iv vv et k')
+      | none => return none
+    | .incRef ov c k =>
+      match ← inlineModuleCallsCode (fuel + 1) visited m localSigs varEnv exactEnv sortEnv k with
+      | some k' => return some (.incRef ov c k')
+      | none => return none
+    | .decRef ov c k =>
+      match ← inlineModuleCallsCode (fuel + 1) visited m localSigs varEnv exactEnv sortEnv k with
+      | some k' => return some (.decRef ov c k')
+      | none => return none
+    | .ite cv t e =>
+      match ← inlineModuleCallsCode (fuel + 1) visited m localSigs varEnv exactEnv sortEnv t,
+            ← inlineModuleCallsCode (fuel + 1) visited m localSigs varEnv exactEnv sortEnv e with
+      | some t', some e' => return some (.ite cv t' e')
+      | _, _ => return none
+    | .seqFor iv lv hv av ai aty step k =>
+      if sortEnv.lookup lv == some specSortBool || sortEnv.lookup hv == some specSortBool then
+        return none
+      let accSort := (sortEnv.lookup ai).getD (paramSpecSort aty)
+      let stepEnv := (av, aty) :: (iv, .i64) :: varEnv.filter (fun (id, _) => id != av && id != iv)
+      let exactStep := exactEnv.filter (fun (id, _) => id != av && id != iv)
+      let sortStep :=
+        (av, accSort) :: (iv, specSortU64) :: sortEnv.filter (fun (id, _) => id != av && id != iv)
+      let contEnv := (av, aty) :: varEnv.filter (·.1 != av)
+      let sortCont := (av, accSort) :: sortEnv.filter (·.1 != av)
+      match ← inlineModuleCallsCode (fuel + 1) visited m localSigs stepEnv exactStep sortStep step,
+            ← inlineModuleCallsCode (fuel + 1) visited m localSigs contEnv
+                (exactEnv.filter (·.1 != av)) sortCont k with
+      | some step', some k' => return some (.seqFor iv lv hv av ai aty step' k')
+      | _, _ => return none
+    | .parFor ov lv ins et kern k =>
+      if sortEnv.lookup lv == some specSortBool then return none
+      let contEnv := (ov, .sarray et) :: varEnv.filter (·.1 != ov)
+      let sortCont := (ov, specSortSarray) :: sortEnv.filter (·.1 != ov)
+      match ← inlineModuleCallsCode (fuel + 1) visited m localSigs contEnv
+          (exactEnv.filter (·.1 != ov)) sortCont k with
+      | some k' => return some (.parFor ov lv ins et kern k')
+      | none => return none
+    | .ret v => return some (.ret v)
+    | .unreachable => return some .unreachable
+termination_by fuel _ _ _ _ _ _ code => (fuel, sizeOf code)
+
+private def specializeModuleLocalCallsDecl (m : LNIRModule)
+    (localSigs : List (String × List LNIRType × LNIRType)) (d : LNIRDecl) : Option LNIRDecl :=
+  let initMax := m.decls.foldl (fun acc md => Nat.max acc (declSynVarBase md)) (declSynVarBase d) + 32
+  let initEnv := d.params.map fun p => (p.id, p.ty)
+  let initExact := d.params.filterMap fun p =>
+    match p.ty with
+    | .i1 | .i8 | .i16 | .i32 => some (p.id, p.ty)
+    | _ => none
+  let initSort := d.params.map fun p => (p.id, paramSpecSort p.ty)
+  let (body?, _) := (inlineModuleCallsCode 8 [d.name] m localSigs initEnv initExact initSort d.body).run initMax
+  body?.map fun b => { d with body := b }
+
 /-- Validate an entire optimized `LNIRModule` against its unoptimized source `LNIRModule`. -/
 def validateTranslationModule (srcMod tgtMod : LNIRModule) (numSamples : Nat := 64) : TVModuleReport :=
+  let srcSigs := localCallableSigs srcMod
+  let tgtSigs := localCallableSigs tgtMod
   let results := srcMod.decls.filterMap (fun srcDecl =>
     match tgtMod.decls.find? (fun d => d.name == srcDecl.name) with
-    | some tgtDecl => some (validateTranslationDecl srcDecl tgtDecl numSamples)
+    | some tgtDecl =>
+      let sigEq := srcDecl.params.map (·.ty) == tgtDecl.params.map (·.ty) && srcDecl.retTy == tgtDecl.retTy
+      let modElemOk := sigEq && (srcDecl.checkElemTypes srcSigs).isNone && (tgtDecl.checkElemTypes tgtSigs).isNone
+      if !modElemOk then
+        let baseRes := validateTranslationDecl srcDecl tgtDecl numSamples
+        some { baseRes with ubRefines := false, passed := false }
+      else if codeHasUserLocalCall srcDecl.body || codeHasUserLocalCall tgtDecl.body then
+        match specializeModuleLocalCallsDecl srcMod srcSigs srcDecl,
+              specializeModuleLocalCallsDecl tgtMod tgtSigs tgtDecl with
+        | some srcSpec, some tgtSpec =>
+          let specRes := validateTranslationDecl srcSpec tgtSpec numSamples
+          some { specRes with
+            declName := srcDecl.name
+            srcHash := srcDecl.structuralHash
+            tgtHash := tgtDecl.structuralHash }
+        | _, _ =>
+          let baseRes := validateTranslationDecl srcDecl tgtDecl numSamples
+          some { baseRes with ubRefines := false, passed := false }
+      else
+        some (validateTranslationDecl srcDecl tgtDecl numSamples)
     | none => none)
   let passedCount := (results.filter (·.passed)).length
   { moduleName := srcMod.moduleName

@@ -903,12 +903,12 @@ private theorem stepLetScalar (fuel : Nat) (env : VarEnv) (st : HeapState)
   rw [h]
 
 private theorem stepLetRawLoad (fuel : Nat) (env : VarEnv) (st : HeapState)
-    (dst p i : VarId) (ty rty : LNIRType) (bufId : Nat) (idx w : UInt64) (k : LNIRCode)
+    (dst p i : VarId) (ty : LNIRType) (bufId : Nat) (idx w : UInt64) (k : LNIRCode)
     (hp : env p = some (.rawPtrId bufId)) (hi : env i = some (.u64 idx))
     (hrd : st.readElem bufId idx.toNat = .ok w) :
-    evalCode fuel env st (.letBind dst ty (.rawLoad p i rty) k) =
+    evalCode fuel env st (.letBind dst ty (.rawLoad p i .i64) k) =
       evalCode fuel (env.bind dst (.u64 w)) st k := by
-  dsimp only [evalCode, evalExpr]
+  dsimp only [evalCode, evalExpr, maskElemVal]
   rw [hp, hi]
   dsimp only
   rw [hrd]
@@ -932,12 +932,12 @@ private theorem stepIteFalse (fuel : Nat) (env : VarEnv) (st : HeapState)
   rw [ite_eq_right hn]
 
 private theorem stepRawStore (fuel : Nat) (env : VarEnv) (st st' : HeapState)
-    (p i v : VarId) (ty : LNIRType) (bufId : Nat) (idx val : UInt64) (k : LNIRCode)
+    (p i v : VarId) (bufId : Nat) (idx val : UInt64) (k : LNIRCode)
     (hp : env p = some (.rawPtrId bufId)) (hi : env i = some (.u64 idx))
     (hv : env v = some (.u64 val))
     (hwr : st.writeElemExclusive bufId idx.toNat val = .ok st') :
-    evalCode fuel env st (.rawStore p i v ty k) = evalCode fuel env st' k := by
-  dsimp only [evalCode]
+    evalCode fuel env st (.rawStore p i v .i64 k) = evalCode fuel env st' k := by
+  dsimp only [evalCode, maskElemVal]
   rw [hp, hi, hv]
   dsimp only
   rw [hwr]
@@ -1244,7 +1244,7 @@ theorem lowerUnboxedFieldStore_eval_subword (baseVar idxVar posVar valVar : VarI
                     (evalScalar_constU64 _ _), evalBinOp_shr_u64])
               (evalScalar_constU64 _ _), evalBinOp_add_u64])]
       rw [ite_eq_right hnsub]
-      rw [stepLetRawLoad fuel env2 st (aTmp + 1) baseVar posVar .i64 .i64
+      rw [stepLetRawLoad fuel env2 st (aTmp + 1) baseVar posVar .i64
         bufId wordIdx oldWord _ hbase2 (bind_eq_lookup _ _ _) hread]
       rw [stepLetScalar fuel env3 st (aTmp + 2) .i64 _ (.u64 masked) _
         (by rw [evalScalar_binOp_ok _ _ _ _ _ _ (evalScalar_var_some _ _ _ hval3)
@@ -1264,7 +1264,7 @@ theorem lowerUnboxedFieldStore_eval_subword (baseVar idxVar posVar valVar : VarI
         (by rw [evalScalar_binOp_ok _ _ _ _ _ _
               (evalScalar_var_some _ _ _ (bind_eq_lookup _ _ _))
               (evalScalar_var_some _ _ _ hsh6), evalBinOp_bitOr_u64])]
-      exact stepRawStore fuel env7 st st1 baseVar posVar (aTmp + 5) .i64
+      exact stepRawStore fuel env7 st st1 baseVar posVar (aTmp + 5)
         bufId wordIdx newWord k hbase7 hpos7 (bind_eq_lookup _ _ _) hwrite
     · intro q hq hqp
       dsimp only [env7, env6, env5, env4, env3, env2, env1]
@@ -1327,7 +1327,7 @@ theorem lowerUnboxedFieldLoad_eval_subword (dst baseVar idxVar posVar : VarId)
                     (evalScalar_constU64 _ _), evalBinOp_shr_u64])
               (evalScalar_constU64 _ _), evalBinOp_add_u64])]
       rw [ite_eq_right hnsub]
-      rw [stepLetRawLoad fuel env2 st (aTmp + 1) baseVar posVar .i64 .i64
+      rw [stepLetRawLoad fuel env2 st (aTmp + 1) baseVar posVar .i64
         bufId wordIdx wordVal _ hbase2 (bind_eq_lookup _ _ _) hread]
       exact stepLetScalar fuel env3 st dst field.field.kind.lnirType _ (.u64 extracted) k
         (by rw [evalScalar_binOp_ok _ _ _ _ (.u64 (wordVal >>> fieldBitOff field)) _

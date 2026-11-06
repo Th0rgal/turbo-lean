@@ -273,10 +273,10 @@ theorem evalParKernelLoop_customScalar_refines (env : VarEnv) (st : HeapState)
 /-- Custom scalar `parFor` forward refinement. -/
 theorem evalParFor_customScalar_refines (fuel : Nat) (env : VarEnv) (st : HeapState)
     (lenVar : VarId) (inputs : List VarId) (idxVar : VarId) (inVars : List VarId)
-    (body body' : ScalarExpr) (pair : Val × HeapState)
+    (body body' : ScalarExpr) (pair : Val × HeapState) (elemTy : LNIRType := .i64)
     (href : ExprRefines (.scalar body) (.scalar body'))
-    (hsrc : evalParFor fuel env st lenVar inputs (.customScalar idxVar inVars body) = .ok pair) :
-    evalParFor fuel env st lenVar inputs (.customScalar idxVar inVars body') = .ok pair := by
+    (hsrc : evalParFor fuel env st lenVar inputs (.customScalar idxVar inVars body) elemTy = .ok pair) :
+    evalParFor fuel env st lenVar inputs (.customScalar idxVar inVars body') elemTy = .ok pair := by
   unfold evalParFor at hsrc ⊢
   cases hlen : env lenVar with
   | none => simp [hlen] at hsrc
@@ -292,15 +292,36 @@ theorem evalParFor_customScalar_refines (fuel : Nat) (env : VarEnv) (st : HeapSt
         | error err => simp [hvars] at hsrc
         | ok vs =>
           rw [hvars] at hsrc
+          dsimp only [] at hsrc ⊢
+          let stIn : HeapState :=
+            if maskElemVal elemTy 0xFFFFFFFFFFFFFFFF == 0xFFFFFFFFFFFFFFFF then st
+            else { st with buffers := st.buffers.map (fun b => { b with data := b.data.map (maskElemVal elemTy) }) }
+          have hloopEq :
+              evalParKernelLoop env stIn inputs n.toNat (.customScalar idxVar inVars body) (List.range n.toNat) =
+              evalParKernelLoop env
+                (if maskElemVal elemTy 0xFFFFFFFFFFFFFFFF == 0xFFFFFFFFFFFFFFFF then st
+                 else { st with buffers := st.buffers.map (fun b => { b with data := b.data.map (maskElemVal elemTy) }) })
+                inputs n.toNat (.customScalar idxVar inVars body) (List.range n.toNat) := rfl
           cases hloop :
-              evalParKernelLoop env st inputs n.toNat (.customScalar idxVar inVars body)
+              evalParKernelLoop env stIn inputs n.toNat (.customScalar idxVar inVars body)
                 (List.range n.toNat) with
-          | error err => simp [hloop] at hsrc
-          | ok elems =>
+          | error err =>
+            rw [hloopEq] at hloop
             rw [hloop] at hsrc
+            cases hsrc
+          | ok elems =>
             have hloop' :=
-              evalParKernelLoop_customScalar_refines env st inputs n.toNat idxVar inVars
+              evalParKernelLoop_customScalar_refines env stIn inputs n.toNat idxVar inVars
                 body body' (List.range n.toNat) elems href hloop
+            rw [hloopEq] at hloop
+            rw [hloop] at hsrc
+            change (match evalParKernelLoop env stIn inputs n.toNat (.customScalar idxVar inVars body') (List.range n.toNat) with
+              | Except.error err => Except.error err
+              | Except.ok elems => Except.ok (.sarrayId (st.nextId + 1),
+                  { st with
+                    buffers := { id := st.nextId + 1, exclusive := true,
+                                 data := (elems.map (maskElemVal elemTy)).toArray } :: st.buffers,
+                    nextId := st.nextId + 1 })) = Except.ok pair
             rw [hloop']
             exact hsrc
     | _ => simp at hsrc
@@ -390,7 +411,7 @@ theorem superoptCodeSelective_sound (p : HardwareCostProfile) (targetLabel declN
         simp only [evalCode] at hsrc ⊢
         split at hsrc <;> try contradiction
         next out heap hpar =>
-          rw [evalParFor_customScalar_refines _ _ _ _ _ _ _ _ _ (out, heap) hb hpar]
+          rw [evalParFor_customScalar_refines _ _ _ _ _ _ _ _ _ (out, heap) ety hb hpar]
           exact hk fuel _ _ v st' hsrc
       simp only [superoptCodeSelective]
       have hs := superoptScalarExprCore_sound p targetLabel declName body

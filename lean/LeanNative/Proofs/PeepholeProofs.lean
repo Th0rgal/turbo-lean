@@ -368,7 +368,7 @@ theorem evalCode_rewriteCodePeephole_eq (c : LNIRCode) :
           | error _ => rfl | ok pair => exact ihk fuel (env.bind accVar pair.1) pair.2
   | parFor outVar lenVar inputs elemTy kernel k ih =>
     intro fuel env st; rw [rewriteCodePeephole, evalCode, evalCode]
-    cases evalParFor fuel env st lenVar inputs kernel with
+    cases evalParFor fuel env st lenVar inputs kernel elemTy with
     | error _ => rfl
     | ok pair => exact ih fuel (env.bind outVar pair.1) pair.2
   | ret _ => intro _ _ _; rfl
@@ -568,7 +568,7 @@ theorem evalCode_rewriteCodeVerified_eq (c : LNIRCode) :
           | error _ => rfl | ok pair => exact ihk fuel (env.bind accVar pair.1) pair.2
   | parFor outVar lenVar inputs elemTy kernel k ih =>
     intro fuel env st; rw [rewriteCodeVerified, evalCode, evalCode]
-    cases evalParFor fuel env st lenVar inputs kernel with
+    cases evalParFor fuel env st lenVar inputs kernel elemTy with
     | error _ => rfl
     | ok pair => exact ih fuel (env.bind outVar pair.1) pair.2
   | ret _ => intro _ _ _; rfl

@@ -26,17 +26,34 @@ def canonicalUIntCastMask? (fnName : Lean.Name) (argTys : List LNIRType) (retTy 
 def tryLowerIntrinsicCall (env : Lean.Environment) (fnName : Lean.Name) (argVars : List VarId)
     (retTy : LNIRType) (argTys : List LNIRType := []) (isLocal : Bool := false)
     (arch : TargetArch := .x86_64) : Option LNIRExpr :=
-  match argVars with
-  | [_, _] =>
-    (tryLowerGfSimdIntrinsic env fnName argVars retTy argTys).orElse fun _ =>
-      RealLCNFBridge.lowerCanonicalIntrinsicPure? fnName argVars retTy argTys isLocal arch
-  | _ => RealLCNFBridge.lowerCanonicalIntrinsicPure? fnName argVars retTy argTys isLocal arch
+  (RealLCNFBridge.lowerSliceIntrinsicPure? fnName argVars retTy argTys isLocal arch).orElse fun _ =>
+    match argVars with
+    | [_, _] =>
+      (tryLowerGfSimdIntrinsic env fnName argVars retTy argTys).orElse fun _ =>
+        RealLCNFBridge.lowerCanonicalIntrinsicPure? fnName argVars retTy argTys isLocal arch
+    | _ => RealLCNFBridge.lowerCanonicalIntrinsicPure? fnName argVars retTy argTys isLocal arch
 
 def lowerNamedCall (fnName : Lean.Name) (args : Array (Lean.Compiler.LCNF.Arg pu)) (retTy : LNIRType) : BridgeM LNIRExpr := do
   let env ← getEnv
   let st ← get
   let isLocal := st.localDeclNames.contains fnName || fnName == st.selfDeclName
-  let argVars ← args.toList.mapM (lowerArg · isLocal)
+  let isCanonicalSliceCall :=
+    !isLocal &&
+    (fnName == ``ByteArray.usize || fnName == ``FloatArray.usize ||
+     fnName == ``ByteArray.uget || fnName == ``FloatArray.uget)
+  let argVars ← args.toList.mapM (fun a => do
+    match a with
+    | .fvar fvarId =>
+      if ((← get).localFunMap.contains fvarId) then
+        Lean.throwError "[lean-native] Unsupported higher-order / escaping local function value"
+      let vid ← internFVar fvarId
+      let vTy ← getVarType vid
+      if !(isSupportedParamOrRetType vTy (← get).arch (isLocal || isCanonicalSliceCall) ||
+           (isLocal && (vTy == .objPtr || vTy == .taggedPtr))) then
+        Lean.throwError s!"[lean-native] Unsupported non-scalar argument of type `{reprStr vTy}`"
+      return vid
+    | .erased => freshBridgeVar .unit
+    | .type .. => freshBridgeVar .unit)
   let argTys ← argVars.mapM getVarType
   match tryLowerIntrinsicCall env fnName argVars retTy argTys isLocal st.arch with
   | some intrinsicExpr => return intrinsicExpr
@@ -149,7 +166,7 @@ def ingestLCNFDeclGenericWithState {pu} (decl : Lean.Compiler.LCNF.Decl pu)
     selfDeclName := decl.name, localDeclNames := localDeclNames, arch := arch,
     allowStage1DHeap := isStage1DHeap }
   let action : BridgeM LNIRDecl := do
-    let envParamTys := collectEnvExplicitParamTypes env decl.name
+    let envParamTys ← collectDeclExplicitParamTypesM env decl.name
     let mut lnirParams : List LNIRParam := []
     let mut pIdx : Nat := 0
     for p in decl.params do
@@ -158,11 +175,13 @@ def ingestLCNFDeclGenericWithState {pu} (decl : Lean.Compiler.LCNF.Decl pu)
         if !isStage1DHeap && (rawPTy == .objPtr || rawPTy == .taggedPtr) then
           match envParamTys[pIdx]? with
           | some (.tuple fs) => .tuple fs
+          | some (.sarray .i8) => .sarray .i8
+          | some (.sarray .f64) => .sarray .f64
           | _ => rawPTy
         else rawPTy
-      checkBridgeType s!"parameter `{p.binderName}` of `{decl.name}`" p.type pTy allowInternalObj
+      checkBridgeType s!"parameter `{p.binderName}` of `{decl.name}`" p.type pTy allowInternalObj (!isExported)
       let vid ← internFVar p.fvarId pTy true
-      lnirParams := lnirParams ++ [{ id := vid, name := p.binderName.toString, ty := pTy, borrow := p.borrow }]
+      lnirParams := lnirParams ++ [{ id := vid, name := p.binderName.toString, ty := pTy, borrow := p.borrow || isSupportedSliceType pTy }]
       pIdx := pIdx + 1
     let retTy ← lowerBridgeType decl.type
     checkBridgeType s!"return type of `{decl.name}`" decl.type retTy allowInternalObj

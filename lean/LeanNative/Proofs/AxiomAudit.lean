@@ -47,6 +47,7 @@ import LeanNative.Transform.AsyncStateMachine
 import LeanNative.Proofs.AsyncStateMachineProofs
 import LeanNative.Proofs.ProofRetentionProofs
 import LeanNative.Proofs.CostAutotuneSoundness
+import LeanNative.Proofs.SliceBridgeStandaloneProofs
 
 namespace LeanNative.Proofs
 
@@ -297,6 +298,28 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.sliceFoldStep_sound
   , ``LeanNative.Proofs.sliceFoldLoop_sound
   , ``LeanNative.Proofs.lowerSliceFold_sound
+  , ``LeanNative.Proofs.collectSliceCallArgs_sound
+  , ``LeanNative.Proofs.evalSliceCall_none_of_lowerRealArgList
+  , ``LeanNative.Proofs.evalVarList_singleton_inv
+  , ``LeanNative.Proofs.evalVarList_pair_inv
+  , ``LeanNative.Proofs.sarrayLen_fap_refines
+  , ``LeanNative.Proofs.sarrayGet_fap_refines
+  , ``LeanNative.Proofs.lowerSliceCallPure_sound
+  , ``LeanNative.Proofs.evalSliceLen_of_lower
+  , ``LeanNative.Proofs.evalSliceUget_of_lower
+  , ``LeanNative.Proofs.lowerSliceCall_refines_of_name
+  , ``LeanNative.Proofs.lowerSliceIntrinsic_byteArrayUsize_sound
+  , ``LeanNative.Proofs.lowerSliceIntrinsic_floatArrayUsize_sound
+  , ``LeanNative.Proofs.lowerSliceIntrinsic_byteArrayUget_sound
+  , ``LeanNative.Proofs.lowerSliceIntrinsic_floatArrayUget_sound
+  , ``LeanNative.Proofs.lowerSliceCall_byteArrayUsize_refines
+  , ``LeanNative.Proofs.lowerSliceCall_floatArrayUsize_refines
+  , ``LeanNative.Proofs.lowerSliceCall_byteArrayUget_refines
+  , ``LeanNative.Proofs.lowerSliceCall_floatArrayUget_refines
+  , ``LeanNative.Proofs.lowerSliceIntrinsic_rejects_local_shadow
+  , ``LeanNative.Proofs.lowerSliceIntrinsic_rejects_heap_objPtr
+  , ``LeanNative.Proofs.lowerSliceIntrinsic_rejects_element_mismatch
+  , ``LeanNative.Proofs.lowerSliceIntrinsic_rejects_panicking_getBang
   , ``LeanNative.Proofs.HeapObjAbi.unbox_box_id
   , ``LeanNative.Proofs.HeapObjAbi.unbox_box_eq_iff
   , ``LeanNative.Proofs.HeapObjAbi.box_ne_aligned_ptr
@@ -508,7 +531,7 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.ablateSitesLeaveOneOut_sound
   ]
 
-#guard auditedTheoremNames.length == 552
+#guard auditedTheoremNames.length == 574
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/

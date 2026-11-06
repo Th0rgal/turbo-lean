@@ -54,12 +54,12 @@ def checkedSubSlice (s : TypedSliceView) (subOff subLen : Nat) : Option TypedSli
   else
     none
 
-/-- Pure model of summing `len` elements starting at `offset` in `data` (left-to-right). -/
-def sumSliceFrom (data : Array UInt64) (curIdx : Nat) (acc : UInt64) : Nat → UInt64
+/-- Pure model of summing `len` width-masked elements starting at `offset` in `data` (left-to-right). -/
+def sumSliceFrom (elemTy : LNIRType) (data : Array UInt64) (curIdx : Nat) (acc : UInt64) : Nat → UInt64
   | 0 => acc
   | n + 1 =>
-    let cur := if h : curIdx < data.size then data[curIdx] else 0
-    sumSliceFrom data (curIdx + 1) (acc + cur) n
+    let cur := if h : curIdx < data.size then maskElemVal elemTy data[curIdx] else 0
+    sumSliceFrom elemTy data (curIdx + 1) (acc + cur) n
 
 /-- Lower a zero-copy indexed read `s[idxVar]` to `posTmp := offset + idxVar; dst := sarrayGet arr posTmp`. -/
 def lowerSliceGet (dst posTmp : VarId) (s : TypedSliceView) (idxVar : VarId) (k : LNIRCode) : LNIRCode :=

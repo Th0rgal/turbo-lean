@@ -40,7 +40,7 @@ Agent / CLI / MCP ──► Stage 0: Cone & CAS Filter (`TurboLean/Spec.lean` + 
    Every refactoring, bug fix, or feature addition must actively compress or factor existing code and specifications. New capabilities are integrated by generalizing Layer I combinators or unified runtime traits rather than accreting ad-hoc modules or duplicating logic across repositories.
 
 6. **Doc & Context Ratchet (`scripts/sync_docs_inventory.py`)**:
-   Any commit that changes `TurboLean/Spec.lean` tight-spec counts (`<!-- inventory:turbo_tight_specs -->98/98<!-- /inventory:turbo_tight_specs -->`), `LeanNative/Spec.lean` tight-spec counts (`<!-- inventory:leannative_tight_specs -->124/124<!-- /inventory:leannative_tight_specs -->`), or C-ABI exports (`<!-- inventory:turbo_cabi_exports -->80<!-- /inventory:turbo_cabi_exports -->`) must update `README.md` and `AGENTS.md` in the same change. `./scripts/ci_verify.sh` checks those counters.
+   Any commit that changes `TurboLean/Spec.lean` tight-spec counts (`<!-- inventory:turbo_tight_specs -->98/98<!-- /inventory:turbo_tight_specs -->`), `LeanNative/Spec.lean` tight-spec counts (`<!-- inventory:leannative_tight_specs -->124/124<!-- /inventory:leannative_tight_specs -->`), or C-ABI exports (`<!-- inventory:turbo_cabi_exports -->80<!-- /inventory:turbo_cabi_exports -->`) must update `AGENTS.md` in the same change. `./scripts/ci_verify.sh` checks those counters.
 
 7. **End-to-End Amdahl & Ablation Ratchet (`ΔE2E >= 1%` or Delete)**:
    - **No Micro-Benchmark-Only Optimizations**: No hardware backend, cascade tier, heuristic pass, or rewrite rule lands without a measured wall-clock speedup on the end-to-end pipeline.

@@ -104,7 +104,8 @@ private theorem extractDeclParFor_sound {code : LNIRCode}
         buffers := { id := st.nextId + 1, exclusive := true, data := elems.toArray } :: st.buffers
         nextId := st.nextId + 1 },
       { id := st.nextId + 1, exclusive := true, data := elems.toArray }, ?_, ?_, rfl⟩
-    · simp only [evalCode, evalParFor, hlen, hnotFuel, ite_false, hvals, hloop]
+    · simp only [evalCode, evalParFor, hlen, hnotFuel, ite_false, hvals,
+        maskElemVal_i64_fun, id_eq, beq_self_eq_true, ite_true, hloop, List.map_id]
       simp only [VarEnv.bind, beq_self_eq_true, ite_true]
       change Except.ok (Val.sarrayId (st.nextId + 1),
         { st with
@@ -143,7 +144,8 @@ private theorem extractDeclParFor_sound {code : LNIRCode}
             buffers := { id := st.nextId + 1, exclusive := true, data := elems.toArray } :: st.buffers
             nextId := st.nextId + 1 },
           { id := st.nextId + 1, exclusive := true, data := elems.toArray }, ?_, ?_, rfl⟩
-        · simp only [evalCode, evalExpr, harr, hbuf, evalParFor, hlen, hnotFuel, ite_false, hvals, hloop]
+        · simp only [evalCode, evalExpr, harr, hbuf, evalParFor, hlen, hnotFuel, ite_false, hvals,
+            maskElemVal_i64_fun, id_eq, beq_self_eq_true, ite_true, hloop, List.map_id]
           simp only [VarEnv.bind, beq_self_eq_true, ite_true]
           change Except.ok (Val.sarrayId (st.nextId + 1),
             { st with

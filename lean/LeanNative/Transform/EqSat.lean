@@ -168,67 +168,11 @@ partial def spliceInlinedBodyM (paramMap : List (VarId × VarId)) (unboxedLocal 
   | .ret rv => retCont (renameVarId paramMap offset rv)
   | _ => return .unreachable
 
-partial def freshenClonedCont (code : LNIRCode) (subst : List (VarId × VarId) := []) : StateM VarId LNIRCode := do
-  let rwVar (v : VarId) : VarId := (subst.lookup v).getD v
-  let rec rwScalar : ScalarExpr → ScalarExpr
-    | .constU64 v => .constU64 v | .constBool b => .constBool b | .var id => .var (rwVar id)
-    | .binOp op l r => .binOp op (rwScalar l) (rwScalar r) | .unaryOp op a => .unaryOp op (rwScalar a)
-    | .select c t e => .select (rwScalar c) (rwScalar t) (rwScalar e)
-    | .fma a b c => .fma (rwScalar a) (rwScalar b) (rwScalar c)
-  let rwExpr : LNIRExpr → LNIRExpr
-    | .scalar se => .scalar (rwScalar se) | .constU256 w => .constU256 w
-    | .mulDivDown a b d => .mulDivDown (rwVar a) (rwVar b) (rwVar d)
-    | .mulDivUp a b d => .mulDivUp (rwVar a) (rwVar b) (rwVar d)
-    | .storageLoad m s => .storageLoad (rwVar m) (rwVar s)
-    | .storageStore m s v => .storageStore (rwVar m) (rwVar s) (rwVar v)
-    | .mkTuple fs => .mkTuple (fs.map rwVar) | .projTuple tv idx => .projTuple (rwVar tv) idx
-    | .allocCtor tag ofs sfs => .allocCtor tag (ofs.map rwVar) (sfs.map rwVar)
-    | .ctorGetObj cv idx => .ctorGetObj (rwVar cv) idx | .ctorGetScalar cv idx ty => .ctorGetScalar (rwVar cv) idx ty
-    | .isExclusive ov => .isExclusive (rwVar ov) | .sarrayLen av => .sarrayLen (rwVar av)
-    | .sarrayDataPtr av et => .sarrayDataPtr (rwVar av) et | .sarrayEnsureExclusive av et => .sarrayEnsureExclusive (rwVar av) et
-    | .sarrayGet av iv et => .sarrayGet (rwVar av) (rwVar iv) et
-    | .sarraySet av iv vv et => .sarraySet (rwVar av) (rwVar iv) (rwVar vv) et
-    | .rawLoad pv iv et => .rawLoad (rwVar pv) (rwVar iv) et
-    | .boxScalar vv ty => .boxScalar (rwVar vv) ty | .unboxScalar bv ty => .unboxScalar (rwVar bv) ty
-    | .call fn args rty ext => .call fn (args.map rwVar) rty ext
-  match code with
-  | .letBind dst ty val k =>
-    let val' := rwExpr val
-    let freshDst ← get; set (freshDst + 1)
-    return .letBind freshDst ty val' (← freshenClonedCont k ((dst, freshDst) :: subst))
-  | .rawStore pv iv vv et k =>
-    return .rawStore (rwVar pv) (rwVar iv) (rwVar vv) et (← freshenClonedCont k subst)
-  | .incRef ov c k => return .incRef (rwVar ov) c (← freshenClonedCont k subst)
-  | .decRef ov c k => return .decRef (rwVar ov) c (← freshenClonedCont k subst)
-  | .ite cv t e =>
-    return .ite (rwVar cv) (← freshenClonedCont t subst) (← freshenClonedCont e subst)
-  | .seqFor iv lv hv av ai aty step k =>
-    let fIv ← get; let fAv := fIv + 1; set (fIv + 2)
-    return .seqFor fIv (rwVar lv) (rwVar hv) fAv (rwVar ai) aty
-      (← freshenClonedCont step ((av, fAv) :: (iv, fIv) :: subst))
-      (← freshenClonedCont k ((av, fAv) :: subst))
-  | .parFor ov lv ins et kern k =>
-    let fOv ← get; set (fOv + 1)
-    let kern' ← match kern with
-      | .customScalar idxVar inVars body => do
-        let fIdx ← get
-        let fIns := (List.range inVars.length).map (fun i => fIdx + 1 + i)
-        set (fIdx + 1 + inVars.length)
-        let kSubst := (inVars.zip fIns) ++ ((idxVar, fIdx) :: subst)
-        let rec rwK : ScalarExpr → ScalarExpr
-          | .constU64 v => .constU64 v | .constBool b => .constBool b | .var id => .var ((kSubst.lookup id).getD id)
-          | .binOp op l r => .binOp op (rwK l) (rwK r) | .unaryOp op a => .unaryOp op (rwK a)
-          | .select c t e => .select (rwK c) (rwK t) (rwK e) | .fma a b c => .fma (rwK a) (rwK b) (rwK c)
-        pure (.customScalar fIdx fIns (rwK body))
-      | other => pure other
-    return .parFor fOv (rwVar lv) (ins.map rwVar) et kern' (← freshenClonedCont k ((ov, fOv) :: subst))
-  | .ret v => return .ret (rwVar v)
-  | .unreachable => return .unreachable
+def freshenClonedCont (code : LNIRCode) (subst : List (VarId × VarId) := []) :
+    StateM VarId LNIRCode :=
+  code.freshenBinders subst
 
-partial def codeNodeSize : LNIRCode → Nat
-  | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k | .parFor _ _ _ _ _ k => 1 + codeNodeSize k
-  | .ite _ t e | .seqFor _ _ _ _ _ _ t e => 1 + codeNodeSize t + codeNodeSize e
-  | .ret _ | .unreachable => 1
+abbrev codeNodeSize : LNIRCode → Nat := LNIRCode.nodeSize
 
 partial def codeHasIte : LNIRCode → Bool
   | .ite _ _ _ => true

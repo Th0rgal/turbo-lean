@@ -87,11 +87,11 @@ theorem applyCertifiedBundleCode_sound (bundle : CertifiedRuleBundle) (code : LN
     | customScalar iv vs body =>
       intro fuel env st v st' hsrc
       simp only [applyCertifiedBundleCode, evalCode] at hsrc ⊢
-      cases hp : evalParFor fuel env st lv ins (.customScalar iv vs body) with
+      cases hp : evalParFor fuel env st lv ins (.customScalar iv vs body) ty with
       | error err => simp [hp] at hsrc
       | ok pair =>
         rw [hp] at hsrc
-        rw [evalParFor_customScalar_refines fuel env st lv ins iv vs body _ pair
+        rw [evalParFor_customScalar_refines fuel env st lv ins iv vs body _ pair ty
           (applyCertsToScalar_sound _ _ _) hp]
         exact ih fuel (env.bind ov pair.1) pair.2 v st' hsrc
     | _ => exact CodeRefines.parFor_congr ih

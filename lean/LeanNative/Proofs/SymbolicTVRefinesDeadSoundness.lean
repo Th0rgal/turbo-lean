@@ -308,10 +308,11 @@ theorem evalParKernelLoop_bind_not_uses (env : VarEnv) (st : HeapState) (dst : V
 
 theorem evalParFor_bind_not_uses (fuel : Nat) (env : VarEnv) (st : HeapState)
     (dst : VarId) (val : Val) (lenVar : VarId) (inputs : List VarId) (kern : ParallelKernelKind)
+    (elemTy : LNIRType := .i64)
     (hlen : (lenVar == dst) = false)
     (hnc : inputs.contains dst = false) (hku : kernelUsesVar dst kern = false) :
-    evalParFor fuel (env.bind dst val) st lenVar inputs kern =
-    evalParFor fuel env st lenVar inputs kern := by
+    evalParFor fuel (env.bind dst val) st lenVar inputs kern elemTy =
+    evalParFor fuel env st lenVar inputs kern elemTy := by
   unfold evalParFor
   rw [VarEnv.bind_ne env dst lenVar val hlen]
   cases env lenVar with
@@ -323,7 +324,10 @@ theorem evalParFor_bind_not_uses (fuel : Nat) (env : VarEnv) (st : HeapState)
       split
       · rfl
       · rw [evalVarList_bind_not_contains env dst val inputs hnc,
-            evalParKernelLoop_bind_not_uses env st dst val inputs n.toNat kern (List.range n.toNat) hnc hku]
+            evalParKernelLoop_bind_not_uses env
+              (if maskElemVal elemTy 0xFFFFFFFFFFFFFFFF == 0xFFFFFFFFFFFFFFFF then st
+               else { st with buffers := st.buffers.map (fun b => { b with data := b.data.map (maskElemVal elemTy) }) })
+              dst val inputs n.toNat kern (List.range n.toNat) hnc hku]
     | _ => rfl
 
 theorem evalSeqLoop_congr_step (count curIdx : Nat) (idxVar accVar : VarId)
@@ -487,8 +491,8 @@ theorem evalCode_bind_not_uses (fuel : Nat) (code : LNIRCode) (env : VarEnv) (st
   | parFor ov lv ins ety kern k ihk =>
     simp only [codeUsesVar, Bool.or_eq_false_iff] at hnu
     rcases hnu with ⟨⟨⟨hlv, hins⟩, hkern⟩, hkUse⟩
-    simp only [evalCode, evalParFor_bind_not_uses fuel env st dst val lv ins kern hlv hins hkern]
-    cases evalParFor fuel env st lv ins kern with
+    simp only [evalCode, evalParFor_bind_not_uses fuel env st dst val lv ins kern ety hlv hins hkern]
+    cases evalParFor fuel env st lv ins kern ety with
     | error _ => rfl
     | ok pair =>
       rcases pair with ⟨outVal, st'⟩
