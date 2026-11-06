@@ -101,8 +101,10 @@ def verifyPackTrustAdmission
 
 @[inline]
 def verifyHygieneItemAdmitted
-    (itemKind : UInt8) (admitsNativeDecide admitsBvDecide : Bool) : Bool :=
-  (itemKind == 1 && admitsNativeDecide) || (itemKind == 2 && admitsBvDecide)
+    (itemKind : UInt8) (admitsNativeDecide admitsBvDecide allowInteractiveSorry : Bool) : Bool :=
+  (itemKind == 1 && admitsNativeDecide) ||
+    (itemKind == 2 && admitsBvDecide) ||
+    (itemKind == 4 && allowInteractiveSorry)
 
 /-- Pluggable kernel engine router (`requestedEngine`: `0 = auto`, `1 = standard`,
     `2 = con-leche`, `3 = both`; returns `0 = rejected_fail_closed`, `1 = standard`,
@@ -360,8 +362,8 @@ def verifyPackTrustAdmissionC
 
 @[inline, export turbo_spec_verify_hygiene_item_admitted]
 def verifyHygieneItemAdmittedC
-    (itemKind : UInt8) (admitsNativeDecide admitsBvDecide : Bool) : Bool :=
-  verifyHygieneItemAdmitted itemKind admitsNativeDecide admitsBvDecide
+    (itemKind : UInt8) (admitsNativeDecide admitsBvDecide allowInteractiveSorry : Bool) : Bool :=
+  verifyHygieneItemAdmitted itemKind admitsNativeDecide admitsBvDecide allowInteractiveSorry
 
 @[inline, export turbo_spec_route_kernel_engine]
 def routeKernelEngineC (requestedEngine : UInt8) (conLecheSupported : Bool) : UInt8 :=

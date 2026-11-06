@@ -9,6 +9,13 @@ namespace TurboLean.FastCheck
 open LeanNative.Backend.FastCheck
 abbrev Word256 := LeanNative.Backend.FastCheck.Word256
 
+@[inline] def _root_.LeanNative.Backend.FastCheck.Word256.add (a b : Word256) : Word256 :=
+  (Word256.addWithCarry a b).1
+@[inline] def _root_.LeanNative.Backend.FastCheck.Word256.sub (a b : Word256) : Word256 :=
+  (Word256.subWithBorrow a b).1
+@[inline] def Word256.add (a b : Word256) : Word256 := (Word256.addWithCarry a b).1
+@[inline] def Word256.sub (a b : Word256) : Word256 := (Word256.subWithBorrow a b).1
+
 theorem addWithCarry_zero_right (a : Word256) :
     (Word256.addWithCarry a Word256.zero).2 = false := by
   simp [Word256.addWithCarry, Word256.zero]

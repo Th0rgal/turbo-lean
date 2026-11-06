@@ -268,7 +268,7 @@ pub(crate) fn confirm_decl_identity_with_extra_dirs(
 ) -> Result<ConfirmedDeclIdentity> {
     let probe_started = request_started.unwrap_or_else(Instant::now);
     let expected = shard.decl_name();
-    let prefix = splitter::declaration_identity_prefix(src, shard.start_line);
+    let prefix = splitter::declaration_identity_prefix(src, shard);
     let header_info = crate::module_builder::parse_header_info(&prefix);
     let (header, prefix) = prefix.split_at(header_info.body_byte_offset);
     let (signature, _) = splitter::extract_shard_stmt_and_proof(src, shard);
@@ -302,15 +302,7 @@ pub(crate) fn confirm_decl_identity_with_extra_dirs(
             // Proof-driven type inference (`theorem t : _ := ...` or equation-compiler arms)
             // cannot elaborate against `:= by sorry`; retry once in a fresh isolated scratch
             // probe with the declaration's original text.
-            let decl_lines = if shard.start_line >= 1 && shard.end_line >= shard.start_line {
-                src.lines()
-                    .skip(shard.start_line - 1)
-                    .take(shard.end_line - shard.start_line + 1)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else {
-                String::new()
-            };
+            let decl_lines = splitter::extract_shard_orig_decl(src, shard);
             if decl_lines.trim().is_empty() {
                 Err(stub_err)
             } else {
@@ -996,7 +988,7 @@ fn cache_shm_stat_split(
         let st_path = shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
         let src_b3 = blake3::hash(active_src.as_bytes()).to_hex().to_string();
         let entry = ShmCachedFileSplit {
-            split_key: format!("file-split:v12:{}", src_b3),
+            split_key: format!("file-split:v15:{}", src_b3),
             src_blake3: src_b3,
             split: compact_split_for_shm_cache(split),
             prefix_src: String::new(),
@@ -2040,7 +2032,7 @@ fn run_check_command_inner(
             let src_b3 = blake3::hash(loaded_src.as_bytes()).to_hex().to_string();
             if let Some((ref st_path, _)) = st_paths_opt {
                 let entry = ShmCachedFileSplit {
-                    split_key: format!("file-split:v12:{}", src_b3),
+                    split_key: format!("file-split:v15:{}", src_b3),
                     src_blake3: src_b3.clone(),
                     split: compact_split_for_shm_cache(&sp),
                     prefix_src: String::new(),
@@ -2080,7 +2072,7 @@ fn run_check_command_inner(
                     split_key: if src_b3.is_empty() {
                         String::new()
                     } else {
-                        format!("file-split:v12:{}", src_b3)
+                        format!("file-split:v15:{}", src_b3)
                     },
                     src_blake3: src_b3,
                     split: compact_split_for_shm_cache(&fast_res.0),
@@ -3164,15 +3156,9 @@ fn store_has_provenanced_subshard(store: &TurboStore, key: &str) -> bool {
 }
 
 fn extract_decl_source_from_file(active_src: &str, shard: &splitter::TheoremShard) -> String {
-    if shard.start_line >= 1 && shard.end_line >= shard.start_line {
-        let lines: Vec<&str> = active_src
-            .lines()
-            .skip(shard.start_line - 1)
-            .take(shard.end_line - shard.start_line + 1)
-            .collect();
-        if !lines.is_empty() {
-            return lines.join("\n");
-        }
+    let extracted = splitter::extract_shard_orig_decl(active_src, shard);
+    if !extracted.is_empty() {
+        return extracted;
     }
     if !shard.signature_text.is_empty() && !shard.proof_text.is_empty() {
         return format!("{} := {}", shard.signature_text, shard.proof_text);
@@ -3332,7 +3318,7 @@ fn check_single_decl(
                         let st_path =
                             shm_file_splits_dir(store).join(format!("st_{}.json", &st_hash[..24]));
                         let entry = ShmCachedFileSplit {
-                            split_key: format!("file-split:v12:{}", sub_b3),
+                            split_key: format!("file-split:v15:{}", sub_b3),
                             src_blake3: sub_b3.clone(),
                             split: compact_split_for_shm_cache(&sub_split),
                             prefix_src: if sub_src.len() <= 64 * 1024 {
@@ -9270,6 +9256,177 @@ theorem after_macro : ext_magic = 7 := rfl
         assert_eq!(
             detect_toolchain(&dir_explicit),
             "leanprover/lean4:v4.0.0-outer"
+        );
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_check_single_decl_after_multiline_comment_close_on_same_line() {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_post_comment_decl_check_{}",
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let (store_dir, proj_dir) = (tmp_dir.join("store"), tmp_dir.join("proj"));
+        fs::create_dir_all(&store_dir).unwrap();
+        fs::create_dir_all(&proj_dir).unwrap();
+        let toolchain = "leanprover/lean4:v4.35.0";
+        fs::write(proj_dir.join("lean-toolchain"), format!("{toolchain}\n")).unwrap();
+        let mut store = TurboStore::open(Some(&store_dir)).unwrap();
+        let (_env_vars, lean_bin) =
+            crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "").unwrap();
+        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return;
+        }
+        let test_kp = crate::kernel::resolve_kernel_engine(
+            crate::kernel::KernelEngineSelection::Standard,
+            toolchain,
+        )
+        .unwrap();
+        let lean_file = proj_dir.join("PostCommentClose.lean");
+        let src =
+            "def x := 0\n/- comment\n-/ theorem lost : x = 0 := rfl\n/- infer\n-/ theorem infer_lost : x = 0\n  | => rfl\ntheorem visible : x = 0 := lost\n";
+        fs::write(&lean_file, src).unwrap();
+        let canon_proj = proj_dir.canonicalize().unwrap_or_else(|_| proj_dir.clone());
+        let canon_file = lean_file
+            .canonicalize()
+            .unwrap_or_else(|_| lean_file.clone());
+        let mut split = split_lean_source(src, &[]);
+        for sh in &split.shards {
+            let att = confirm_decl_identity_with_extra_dirs(
+                src,
+                sh,
+                &canon_proj,
+                &canon_file,
+                false,
+                &[],
+                None,
+            )
+            .unwrap();
+            assert_eq!(att.decl_name, sh.decl_name());
+        }
+        let mut cb3 = None;
+        let t0 = Instant::now();
+        let ok_json = check_single_decl(
+            &mut store,
+            true,
+            false,
+            false,
+            &test_kp,
+            &t0,
+            &lean_file,
+            &lean_file,
+            &canon_file,
+            &canon_proj,
+            toolchain,
+            "lost",
+            src.to_string(),
+            &mut cb3,
+            &mut split,
+            false,
+            0,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(ok_json["status"], "theorem_verified");
+        assert_eq!(ok_json["decl"], "lost");
+
+        // Also confirm full-file batched identity probe confirms all three declarations.
+        let shard_refs: Vec<&splitter::TheoremShard> = split.shards.iter().collect();
+        let confirmed = confirm_file_decl_identities_with_extra_dirs(
+            src,
+            &shard_refs,
+            &canon_proj,
+            &canon_file,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            confirmed
+                .iter()
+                .map(|c| c.decl_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["lost", "infer_lost", "visible"]
+        );
+
+        let mutual_file = proj_dir.join("PostCommentMutual.lean");
+        let mutual_src =
+            "def x := 0\nmutual\n  theorem m1 : x = 0 := rfl\n  /- inner\n  -/ theorem m2 : x = 0 := m1\nend\n";
+        fs::write(&mutual_file, mutual_src).unwrap();
+        let canon_mut = mutual_file
+            .canonicalize()
+            .unwrap_or_else(|_| mutual_file.clone());
+        let mut_split = split_lean_source(mutual_src, &[]);
+        for sh in &mut_split.shards {
+            let att = confirm_decl_identity_with_extra_dirs(
+                mutual_src,
+                sh,
+                &canon_proj,
+                &canon_mut,
+                false,
+                &[],
+                None,
+            )
+            .unwrap();
+            assert_eq!(att.decl_name, sh.decl_name());
+        }
+
+        let same_line_file = proj_dir.join("PostSameLineComment.lean");
+        let same_line_src =
+            "def y := 0\n/- c -/ theorem same_lost : True := trivial\ntheorem visible : True := trivial\n";
+        fs::write(&same_line_file, same_line_src).unwrap();
+        let canon_same = same_line_file
+            .canonicalize()
+            .unwrap_or_else(|_| same_line_file.clone());
+        let mut same_split = split_lean_source(same_line_src, &[]);
+        let mut same_cb3 = None;
+        let same_ok = check_single_decl(
+            &mut store,
+            true,
+            false,
+            false,
+            &test_kp,
+            &t0,
+            &same_line_file,
+            &same_line_file,
+            &canon_same,
+            &canon_proj,
+            toolchain,
+            "same_lost",
+            same_line_src.to_string(),
+            &mut same_cb3,
+            &mut same_split,
+            false,
+            0,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(same_ok["status"], "theorem_verified");
+        assert_eq!(same_ok["decl"], "same_lost");
+
+        let same_refs: Vec<&splitter::TheoremShard> = same_split.shards.iter().collect();
+        let same_confirmed = confirm_file_decl_identities_with_extra_dirs(
+            same_line_src,
+            &same_refs,
+            &canon_proj,
+            &canon_same,
+            false,
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            same_confirmed
+                .iter()
+                .map(|c| c.decl_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["same_lost", "visible"]
         );
 
         let _ = fs::remove_dir_all(&tmp_dir);

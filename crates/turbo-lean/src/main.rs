@@ -1571,10 +1571,15 @@ fn run(cli: Cli) -> Result<()> {
             let effective_gpu = gpu || backend.eq_ignore_ascii_case("gpu");
             std::env::set_var("TURBO_LEAN_FASTCHECK_BACKEND", &backend);
             if effective_tpu {
-                gpu_fastcheck::run_tpu_fast_check(cli.json, &file, transpile_lean.as_deref())
+                gpu_fastcheck::run_tpu_fast_check(
+                    &mut store,
+                    cli.json,
+                    &file,
+                    transpile_lean.as_deref(),
+                )
             } else {
                 gpu_fastcheck::run_fast_check_command(
-                    &store,
+                    &mut store,
                     cli.json,
                     file,
                     effective_gpu,
