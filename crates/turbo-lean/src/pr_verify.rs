@@ -7025,7 +7025,7 @@ fn base_statement_config_files_match_live(
             _ => return None,
         }
     }
-    if base_oids.get(&repo_rels[0]).is_none() && repo != live_proj {
+    if !base_oids.contains_key(&repo_rels[0]) && repo != live_proj {
         let root_tc = repo.join("lean-toolchain");
         let ls_root = crate::trusted_tools::git(repo)
             .ok()?
@@ -7196,7 +7196,12 @@ fn base_statement_cache_action_key(
         for sr in &src_roots {
             let sr_rel = sr.strip_prefix(&dep_root).ok()?;
             update_lp_bytes(&mut h, b"dep_src_root", sr_rel.to_string_lossy().as_bytes());
-            hash_deterministic_file_tree(&mut h, sr, &[pkgs_abs.clone()], Some(&[".lean"]))?;
+            hash_deterministic_file_tree(
+                &mut h,
+                sr,
+                std::slice::from_ref(&pkgs_abs),
+                Some(&[".lean"]),
+            )?;
         }
         hash_deterministic_file_tree(
             &mut h,
@@ -16309,7 +16314,7 @@ end ParityNs
             proj.join("App.lean"),
             "import Dep\nimport Gen\ntheorem app_thm : depConst + genConst = depConst + genConst := rfl\n",
         )?;
-        fs::write(proj.join(".gitignore"), ".lake/\nspec.txt\n")?;
+        fs::write(proj.join(".gitignore"), ".lake/\n")?;
         git_init_and_commit(&proj, "base")?;
 
         let b1 = Command::new("lake")
@@ -16369,6 +16374,11 @@ end ParityNs
             trusted_dep_snapshot_rel_path(&cfg_ext, &cfg_ext.dep_pkgs[0]).is_none(),
             "external `../ext_dep` path dependency must never yield a `..` snapshot path"
         );
+        git_commit_all(&proj, "ext_dep_manifest")?;
+        assert!(
+            base_statement_cache_action_key(&proj, "HEAD", Path::new(""), None, &cfg_ext).is_none(),
+            "external `../ext_dep` path dependency must disable base_statement_cache_action_key even when lake-manifest.json matches HEAD"
+        );
         fs::write(proj.join("lake-manifest.json"), &orig_manifest)?;
 
         // 4. Mutate path dependency `target/Dep.lean` macro and overlapping `.lake/gen/Gen.lean`:
@@ -16378,7 +16388,7 @@ end ParityNs
         )?;
         fs::write(
             proj.join("App.lean"),
-            "import Dep\nimport Gen\ntheorem app_thm : dep_ty := genConst\n",
+            "import Dep\nimport Gen\ntheorem app_thm : dep_ty = dep_ty ∧ genConst = genConst := ⟨rfl, rfl⟩\n",
         )?;
         git_commit_all(&proj, "base_dep_macro")?;
         let b2 = Command::new("lake")
@@ -16426,7 +16436,7 @@ end ParityNs
         );
         fs::write(
             proj.join("App.lean"),
-            "import Dep\nimport Gen\ntheorem app_thm : Bool := false\n",
+            "import Dep\nimport Gen\ntheorem app_thm : Bool = Bool ∧ genConst = genConst := ⟨rfl, rfl⟩\n",
         )?;
         let b3 = Command::new("lake")
             .args(["build", "App"])
