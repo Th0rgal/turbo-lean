@@ -20,6 +20,77 @@ open LeanNative.Proofs.PTXSIMT
 open LeanNative.Backend.PTXLower
 open LeanNative.Proofs.PTXScalarProofs
 
+/-- Appending only canonical statements preserves canonicality of a generated loop. -/
+theorem canonical_fold_append {α : Type} (xs : List α) (init : List PTXStmt)
+    (step : α → List PTXStmt) (hi : ∀ s ∈ init, CanonicalPTXStmt s)
+    (hs : ∀ x ∈ xs, ∀ s ∈ step x, CanonicalPTXStmt s) :
+    ∀ s ∈ xs.foldl (fun acc x => acc ++ step x) init, CanonicalPTXStmt s := by
+  induction xs generalizing init with
+  | nil => exact hi
+  | cons x xs ih =>
+    apply ih
+    · intro s h
+      rcases List.mem_append.mp h with h | h
+      · exact hi s h
+      · exact hs x (by simp) s h
+    · intro y hy; exact hs y (by simp [hy])
+
+set_option maxHeartbeats 4000000 in
+/-- Scalar lowering uses only the canonical scalar instruction grammar.
+The premises concern the lexical register naming scheme, independently of parsing. -/
+theorem lowerScalar_canonical (varOf : Nat → Option PReg) (e : PEnv) (expr : ScalarExpr)
+    (hr : ∀ p : PReg, CanonicalPTXName p.name ∧ CanonicalPTXOperand (iOp p))
+    (hp : ∀ n : Nat, CanonicalPTXName s!"%p{n}") :
+    ∀ s ∈ (lowerScalar varOf e expr).1, CanonicalPTXStmt s := by
+  have hrn := fun p => (hr p).1
+  have hro := fun p => (hr p).2
+  have himm : ∀ v, CanonicalPTXOperand (.immU64 v) := fun _ => trivial
+  induction expr generalizing e with
+  | constU64 v => simp [lowerScalar, freshRd, ins, CanonicalPTXStmt, CanonicalPTXInstr, hr, CanonicalPTXOperand]
+  | constBool b => simp [lowerScalar, freshRd, ins, i64, CanonicalPTXStmt, CanonicalPTXInstr, hr, CanonicalPTXOperand]
+  | var id =>
+    simp only [lowerScalar]
+    split
+    · simp
+    · simp [freshRd, ins, i64, CanonicalPTXStmt, CanonicalPTXInstr, hr, CanonicalPTXOperand]
+  | unaryOp op arg ih =>
+    cases op <;> simp only [lowerScalar, freshRd, freshR, Prod.fst, Prod.snd, List.forall_mem_append, List.forall_mem_cons, List.forall_mem_nil, ih, true_and, and_true] <;>
+      simp [ins, i64, CanonicalPTXStmt, CanonicalPTXInstr, hrn, hro, himm] <;> exact ih _
+  | select c t f ihc iht ihf =>
+    simp only [lowerScalar, freshRd, freshP, Prod.fst, Prod.snd, List.forall_mem_append, List.forall_mem_cons, List.forall_mem_nil, ihc, iht, ihf, true_and, and_true]
+    simp [ins, i64, CanonicalPTXStmt, CanonicalPTXInstr, hrn, hro, hp, himm]
+    exact ⟨⟨⟨ihc _, iht _⟩, ihf _⟩, hp _⟩
+  | fma a b c iha ihb ihc =>
+    simp only [lowerScalar, freshRd, Prod.fst, Prod.snd, List.forall_mem_append, List.forall_mem_cons, List.forall_mem_nil, iha, ihb, ihc, true_and, and_true]
+    simp [ins, CanonicalPTXStmt, CanonicalPTXInstr, hrn, hro]
+    exact ⟨⟨iha _, ihb _⟩, ihc _⟩
+  | binOp op lhs rhs ihl ihr =>
+    cases op <;> simp only [lowerScalar, freshRd, freshR, freshP, Prod.fst, Prod.snd, List.forall_mem_append, List.forall_mem_cons, List.forall_mem_nil, ihl, ihr, true_and, and_true] <;>
+      simp [ins, i64, CanonicalPTXStmt, CanonicalPTXInstr, hrn, hro, hp, himm]
+    all_goals try exact ⟨ihl _, ihr _⟩
+    all_goals try exact ⟨⟨ihl _, ihr _⟩, hp _⟩
+    all_goals
+      refine ⟨⟨ihl _, ihr _⟩, ?_⟩
+      intro s k hk hs
+      repeat' split at hs
+      all_goals simp_all only [Bool.true_eq_false, Bool.false_eq_true, and_false, false_and,
+        ite_true, ite_false, false_or, or_false]
+      all_goals
+        rcases hs with hs | hs | hs | hs | hs | hs | hs | hs | hs | hs | hs | hs
+        all_goals try (rcases hs with ⟨_, hs⟩)
+        all_goals subst_vars
+        all_goals simp [CanonicalPTXStmt, CanonicalPTXInstr, hrn, hro, himm]
+
+/-- Each emitted scalar statement roundtrips with a structural character budget. -/
+theorem lowerScalar_stmt_roundtrip (varOf : Nat → Option PReg) (e : PEnv) (expr : ScalarExpr)
+    (hr : ∀ p : PReg, CanonicalPTXName p.name ∧ CanonicalPTXOperand (iOp p))
+    (hp : ∀ n : Nat, CanonicalPTXName s!"%p{n}")
+    (s : PTXStmt) (hs : s ∈ (lowerScalar varOf e expr).1) (rest : List Char) :
+    parsePTXStmt ((ppPTXStmt s).toList.length + 2) ((ppPTXStmt s).toList ++ rest) =
+      some (s, rest) := by
+  exact parsePTXStmt_roundtrip s (lowerScalar_canonical varOf e expr hr hp s hs)
+    rest ((ppPTXStmt s).toList.length + 1) (by omega)
+
 private theorem packInputWordLists_props (env : VarEnv) (st : HeapState) (len : Nat) :
     ∀ (inputs : List VarId) (ws : List (List (BitVec 64))),
       packInputWordLists env st len inputs = some ws →

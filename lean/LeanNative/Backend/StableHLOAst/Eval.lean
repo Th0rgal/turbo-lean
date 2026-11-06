@@ -1100,10 +1100,80 @@ def parseBinaryOp (opcode dst a b : String) : Option StableHLOOp :=
   | "stablehlo.shift_right_logical" => some (.shiftRightLogical dst a b)
   | _ => none
 
-/-- Constant/binary/unbatched-dot/return fragment parser. Type annotations agree with the supplied SSA
+/-- Parse the explicit comparison direction token. -/
+def parseCompareDir : String → Option CompareDir
+  | "EQ" => some .eq | "NE" => some .ne | "LT" => some .lt
+  | "LE" => some .le | "GT" => some .gt | "GE" => some .ge
+  | _ => none
+
+/-- Parse each slice dimension without silently truncating mismatched index lists. -/
+def parseSliceRanges (text : String) : Option (List Nat × List Nat × List Nat) := do
+  let '[' :: chars := text.toList | none
+  let ']' :: rev := chars.reverse | none
+  let fields ← if rev.isEmpty then some []
+    else parseHLOFields ", " (String.ofList rev.reverse)
+  let triples ← fields.mapM fun field => do
+    let [start, limit, stride] ← parseHLOFields ":" field | none
+    return (← start.toNat?, ← limit.toNat?, ← stride.toNat?)
+  return (triples.map (·.1), triples.map (·.2.1), triples.map (·.2.2))
+
+/-- Constant/scalar/shape/unbatched-dot/return fragment parser. Type annotations agree with the supplied SSA
 environment; unknown or ill-typed operands are rejected rather than using printer defaults. -/
 def parseStableHLOOp (tenv : TypeEnv) (text : String) : Option StableHLOOp := do
   let [operation, annotation] ← parseHLOFields " : " text | none
+  if let some [dst, payload] := parseHLOFields " = stablehlo.compare " operation then
+    let dst ← parseSSAName dst
+    let [dir, a, b, kind] ← parseHLOFields ", " payload | none
+    let dir ← parseCompareDir dir
+    let a ← parseSSAName a
+    let b ← parseSSAName b
+    let op := StableHLOOp.compare dst a b dir
+    let inn ← tenv a
+    let out ← resultTypeOf tenv op
+    if kind == ppCompareType inn.elem &&
+        annotation == s!"({ppTensorType inn}, {ppTensorType inn}) -> {ppTensorType out}"
+      then return op else none
+  if let some [dst, payload] := parseHLOFields " = stablehlo.select " operation then
+    let dst ← parseSSAName dst
+    let [p, t, e] ← parseHLOFields ", " payload | none
+    let p ← parseSSAName p
+    let t ← parseSSAName t
+    let e ← parseSSAName e
+    let op := StableHLOOp.select dst p t e
+    let _ ← resultTypeOf tenv op
+    let pt ← tenv p
+    let tt ← tenv t
+    if annotation == s!"{ppTensorType pt}, {ppTensorType tt}" then return op else none
+  if let some [dst, suffix] := parseHLOFields " = stablehlo." operation then
+    let dst ← parseSSAName dst
+    let payload := "stablehlo." ++ suffix
+    let unary : Option (String × (TensorType → StableHLOOp)) := do
+      if let some [arg, dims] := parseHLOFields ", dims = " payload then
+        let ["stablehlo.broadcast_in_dim", src] ← parseHLOFields " " arg | none
+        let src ← parseSSAName src
+        let dims ← parseNatList dims
+        return (src, fun out => .broadcastInDim dst src out.shape dims)
+      match ← parseHLOFields " " payload with
+      | ["stablehlo.reshape", src] =>
+        let src ← parseSSAName src
+        return (src, fun out => .reshape dst src out.shape)
+      | ["stablehlo.convert", src] =>
+        let src ← parseSSAName src
+        return (src, fun out => .convert dst src out.elem)
+      | _ =>
+        let ["stablehlo.slice", srcAndRanges] ← parseHLOFields " %" payload | none
+        let [src, ranges] ← parseHLOFields " [" srcAndRanges | none
+        let src ← parseSSAName ("%" ++ src)
+        let (starts, limits, strides) ← parseSliceRanges ("[" ++ ranges)
+        return (src, fun _ => .slice dst src starts limits strides)
+    if let some (src, makeOp) := unary then
+      let [_, outText] ← parseHLOFields " -> " annotation | none
+      let out ← parseTensorType outText
+      let inn ← tenv src
+      let op := makeOp out
+      let inferred ← resultTypeOf tenv op
+      if inferred == out && annotation == s!"({ppTensorType inn}) -> {ppTensorType out}"
+        then return op else none
   if let some [dst, payload] := parseHLOFields " = stablehlo.dot_general " operation then
     let dst ← parseSSAName dst
     let [args, contraction] ← parseHLOFields ", contracting_dims = " payload | none
@@ -1127,7 +1197,7 @@ def parseStableHLOOp (tenv : TypeEnv) (text : String) : Option StableHLOOp := do
     let '>' :: rev := payload.toList.reverse | none
     if ty.elem != .ui64 then none else do
       let body := String.ofList rev.reverse
-      let values ← (if let '[' :: chars := body.toList then do
+      let values ← (if body.isEmpty then pure [] else if let '[' :: chars := body.toList then do
         let ']' :: rev := chars.reverse | none
         (← parseHLOFields ", " (String.ofList rev.reverse)).mapM String.toNat?
         else do
@@ -1181,6 +1251,27 @@ def parseFuncOp (text : String) : Option FuncOp := do
   ["    %sum = stablehlo.add %a, %b : tensor<4xui64>",
    "    return %sum : tensor<4xui64>"] = some [.add "sum" "a" "b", .returnOp "sum"]
 #guard parseStableHLOOp TypeEnv.empty "return %missing : tensor<i64>" = none
+#guard (let op := StableHLOOp.constant "empty" { ty := ⟨[0], .ui64⟩, data := #[] }
+  parseStableHLOOp TypeEnv.empty (ppStableHLOOp TypeEnv.empty op) = some op)
+-- Exercise every new branch against its real printer, including multi-field ranges.
+#guard (let env := TypeEnv.empty.bind "a" ⟨[4], .ui64⟩ |>.bind "b" ⟨[4], .ui64⟩
+    |>.bind "p" ⟨[4], .i1⟩ |>.bind "s" ⟨[], .ui64⟩ |>.bind "m" ⟨[2, 3], .ui64⟩
+  ([.compare "d" "a" "b" .lt, .select "d" "p" "a" "b",
+    .broadcastInDim "d" "s" [4] [], .broadcastInDim "d" "m" [2, 3] [0, 1],
+    .reshape "d" "a" [2, 2], .slice "d" "a" [1] [4] [2],
+    .slice "d" "m" [0, 1] [2, 3] [1, 1], .convert "d" "a" .i64] : List StableHLOOp).all
+      fun op => parseStableHLOOp env (ppStableHLOOp env op) == some op)
+#guard (let env := TypeEnv.empty.bind "a" ⟨[4], .ui64⟩ |>.bind "b" ⟨[3], .ui64⟩
+    |>.bind "p" ⟨[4], .ui64⟩
+  ["%d = stablehlo.compare EQ, %a, %b, UNSIGNED : (tensor<4xui64>, tensor<4xui64>) -> tensor<4xi1>",
+   "%d = stablehlo.compare EQ, %a, %a, SIGNED : (tensor<4xui64>, tensor<4xui64>) -> tensor<4xi1>",
+   "%d = stablehlo.select %p, %a, %a : tensor<4xui64>, tensor<4xui64>",
+   "%d = stablehlo.broadcast_in_dim %a, dims = [0] : (tensor<4xui64>) -> tensor<3xui64>",
+   "%d = stablehlo.reshape %a : (tensor<4xui64>) -> tensor<3xui64>",
+   "%d = stablehlo.slice %a [0:4:0] : (tensor<4xui64>) -> tensor<4xui64>",
+   "%d = stablehlo.convert %a : (tensor<4xi64>) -> tensor<4xi64>",
+   "%d = stablehlo.convert %missing : (tensor<4xui64>) -> tensor<4xi64>"].all
+      fun text => (parseStableHLOOp env text).isNone)
 #guard (let f : FuncOp := { name := "add", params := [("a", ⟨[4], .ui64⟩), ("b", ⟨[4], .ui64⟩)], result := ⟨[4], .ui64⟩, body := [.add "sum" "a" "b", .returnOp "sum"] }
   parseFuncOp (ppFuncOp f) = some f)
 
