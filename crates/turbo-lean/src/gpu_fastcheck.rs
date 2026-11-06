@@ -1986,16 +1986,21 @@ theorem _turbo_canonical_cex_refute :
 ";
 
 pub(crate) fn canonical_cex_kernel_certified() -> bool {
-    static CERTIFIED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CERTIFIED.get_or_init(|| {
-        eval_refutation_snippet_via_lean_kernel(
-            None,
-            None,
-            None,
-            CANONICAL_CEX_REFUTATION_SRC,
-            "_turbo_canonical_cex_refute",
-        )
-    })
+    static CERTIFIED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if CERTIFIED.get().is_some() {
+        return true;
+    }
+    let ok = eval_refutation_snippet_via_lean_kernel(
+        None,
+        None,
+        None,
+        CANONICAL_CEX_REFUTATION_SRC,
+        "_turbo_canonical_cex_refute",
+    );
+    if ok {
+        let _ = CERTIFIED.set(());
+    }
+    ok
 }
 
 fn parse_u64_witness_str(raw: &str) -> Option<u64> {
@@ -2204,7 +2209,7 @@ fn eval_refutation_snippet_via_lean_kernel(
     refutation_src: &str,
     qual_refute_name: &str,
 ) -> bool {
-    static MEMO: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<[u8; 32], bool>>> =
+    static MEMO: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<[u8; 32]>>> =
         std::sync::OnceLock::new();
     let repo_lean_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -2230,15 +2235,13 @@ fn eval_refutation_snippet_via_lean_kernel(
         h.update(refutation_src.as_bytes());
         *h.finalize().as_bytes()
     };
-    if is_standalone {
-        if let Ok(guard) = MEMO
-            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    if is_standalone
+        && MEMO
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
             .lock()
-        {
-            if let Some(&cached) = guard.get(&cache_key) {
-                return cached;
-            }
-        }
+            .is_ok_and(|guard| guard.contains(&cache_key))
+    {
+        return true;
     }
     let owned_store;
     let store = match store_opt {
@@ -2257,6 +2260,7 @@ fn eval_refutation_snippet_via_lean_kernel(
     let mut env_vars = crate::lake_build::resolve_lake_env(store, &eff_proj)
         .map(|(m, _)| m)
         .unwrap_or_default();
+    let _ = crate::zygote::ensure_zygote_binary(store, Path::new(&lean_bin), &env_vars);
     let mut req_lean_path = if has_lake {
         crate::lake_build::resolve_remote_lean_path(&eff_proj, Some(&env_vars))
     } else {
@@ -2290,7 +2294,7 @@ fn eval_refutation_snippet_via_lean_kernel(
         Path::new(&lean_bin),
         refutation_src,
         &targets,
-        Some(15_000),
+        Some(30_000),
         &lean_args,
     )
     .map(|r| {
@@ -2302,15 +2306,15 @@ fn eval_refutation_snippet_via_lean_kernel(
             && crate::zygote::verifier_provenance_ok(r.scanner_version, r.replay_version)
     })
     .unwrap_or(false);
-    if is_standalone {
+    if is_standalone && ok {
         if let Ok(mut guard) = MEMO
-            .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+            .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
             .lock()
         {
             if guard.len() >= 1024 {
                 guard.clear();
             }
-            guard.insert(cache_key, ok);
+            guard.insert(cache_key);
         }
     }
     ok
@@ -7541,5 +7545,60 @@ allow_decl_names = [\"ShadowAst\"]
         assert_eq!(step["stage"], "stage2_kernel_verified");
         assert_eq!(step["stage1_fastcheck_certified"], false);
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_standalone_cex_memo_never_caches_transient_failure() {
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let snippet = "\
+import LeanNative.Backend.FastCheck
+open LeanNative.Backend.FastCheck
+theorem _turbo_memo_retry_probe :
+    let a : Word256 := Word256.zero
+    let b : Word256 := Word256.max
+    ¬ (Word256.bitNot (Word256.bitAnd a b) = Word256.bitAnd (Word256.bitNot a) (Word256.bitNot b)) := by
+  decide
+";
+        let failed = eval_refutation_snippet_via_lean_kernel(
+            None,
+            None,
+            None,
+            snippet,
+            "_turbo_nonexistent_target",
+        );
+        assert!(!failed);
+        let bad_file = std::env::temp_dir().join(format!(
+            "tl_memo_bad_store_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::write(&bad_file, "not-a-directory").unwrap();
+        let prev_home = std::env::var_os("TURBO_LEAN_HOME");
+        std::env::set_var("TURBO_LEAN_HOME", &bad_file);
+        let store_failed = eval_refutation_snippet_via_lean_kernel(
+            None,
+            None,
+            None,
+            snippet,
+            "_turbo_memo_retry_probe",
+        );
+        match prev_home {
+            Some(v) => std::env::set_var("TURBO_LEAN_HOME", v),
+            None => std::env::remove_var("TURBO_LEAN_HOME"),
+        }
+        let _ = fs::remove_file(&bad_file);
+        assert!(!store_failed);
+        assert!(
+            eval_refutation_snippet_via_lean_kernel(
+                None,
+                None,
+                None,
+                snippet,
+                "_turbo_memo_retry_probe",
+            ),
+            "Transient standalone kernel-refutation failure must not poison MEMO"
+        );
     }
 }
