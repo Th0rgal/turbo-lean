@@ -54,32 +54,32 @@ theorem lowerScalar_canonical (varOf : Nat → Option PReg) (e : PEnv) (expr : S
     · simp
     · simp [freshRd, ins, i64, CanonicalPTXStmt, CanonicalPTXInstr, hr, CanonicalPTXOperand]
   | unaryOp op arg ih =>
-    cases op <;> simp only [lowerScalar, freshRd, freshR, Prod.fst, Prod.snd, List.forall_mem_append, List.forall_mem_cons, List.forall_mem_nil, ih, true_and, and_true] <;>
+    cases op <;> simp only [lowerScalar, freshRd, freshR, List.forall_mem_append, List.forall_mem_cons] <;>
       simp [ins, i64, CanonicalPTXStmt, CanonicalPTXInstr, hrn, hro, himm] <;> exact ih _
   | select c t f ihc iht ihf =>
-    simp only [lowerScalar, freshRd, freshP, Prod.fst, Prod.snd, List.forall_mem_append, List.forall_mem_cons, List.forall_mem_nil, ihc, iht, ihf, true_and, and_true]
-    simp [ins, i64, CanonicalPTXStmt, CanonicalPTXInstr, hrn, hro, hp, himm]
+    simp only [lowerScalar, freshRd, freshP, List.forall_mem_append, List.forall_mem_cons]
+    simp [ins, i64, CanonicalPTXStmt, CanonicalPTXInstr, hrn, hro, himm]
     exact ⟨⟨⟨ihc _, iht _⟩, ihf _⟩, hp _⟩
   | fma a b c iha ihb ihc =>
-    simp only [lowerScalar, freshRd, Prod.fst, Prod.snd, List.forall_mem_append, List.forall_mem_cons, List.forall_mem_nil, iha, ihb, ihc, true_and, and_true]
+    simp only [lowerScalar, freshRd, List.forall_mem_append, List.forall_mem_cons]
     simp [ins, CanonicalPTXStmt, CanonicalPTXInstr, hrn, hro]
     exact ⟨⟨iha _, ihb _⟩, ihc _⟩
   | binOp op lhs rhs ihl ihr =>
-    cases op <;> simp only [lowerScalar, freshRd, freshR, freshP, Prod.fst, Prod.snd, List.forall_mem_append, List.forall_mem_cons, List.forall_mem_nil, ihl, ihr, true_and, and_true] <;>
-      simp [ins, i64, CanonicalPTXStmt, CanonicalPTXInstr, hrn, hro, hp, himm]
+    cases op <;> simp only [lowerScalar, freshRd, freshR, freshP, List.forall_mem_append, List.forall_mem_cons] <;>
+      simp [ins, i64, CanonicalPTXStmt, CanonicalPTXInstr, hrn, hro, himm]
     all_goals try exact ⟨ihl _, ihr _⟩
     all_goals try exact ⟨⟨ihl _, ihr _⟩, hp _⟩
     all_goals
       refine ⟨⟨ihl _, ihr _⟩, ?_⟩
       intro s k hk hs
       repeat' split at hs
-      all_goals simp_all only [Bool.true_eq_false, Bool.false_eq_true, and_false, false_and,
-        ite_true, ite_false, false_or, or_false]
+      all_goals simp_all only [Bool.true_eq_false, Bool.false_eq_true, false_and,
+        ite_true, ite_false]
       all_goals
         rcases hs with hs | hs | hs | hs | hs | hs | hs | hs | hs | hs | hs | hs
         all_goals try (rcases hs with ⟨_, hs⟩)
         all_goals subst_vars
-        all_goals simp [CanonicalPTXStmt, CanonicalPTXInstr, hrn, hro, himm]
+        all_goals simp [hrn, hro, himm]
 
 /-- Each emitted scalar statement roundtrips with a structural character budget. -/
 theorem lowerScalar_stmt_roundtrip (varOf : Nat → Option PReg) (e : PEnv) (expr : ScalarExpr)
@@ -111,10 +111,10 @@ theorem lowerKind_canonical (name : String) (kind : ParallelKernelKind)
       have hreg := hr (.rd (7 + k))
       simp only [PReg.name, iOp, CanonicalPTXOperand] at hreg
       simp only [toString] at hreg
-      simp only [loadIn, ins, toString, List.forall_mem_cons, List.forall_mem_nil,
+      simp only [loadIn, ins, toString, List.forall_mem_cons,
         CanonicalPTXStmt, Option.mem_def, reduceCtorEq, false_implies, forall_const,
         true_and, CanonicalPTXInstr, CanonicalPTXAddr, CanonicalPTXOperand]
-      simp only [hreg.1, hreg.2.1, hreg.2.2.1, hreg.2.2.2, hi, true_and, and_true]
+      simp only [hreg.1, hreg.2.2.1, hi, true_and, and_true]
       simp only [List.not_mem_nil, false_implies, implies_true, and_true]
       exact ⟨hreg.2.2.2, hreg.2.2.2, (hr (.rd 5)).2⟩
   have hscalar := fun v e x => lowerScalar_canonical v e x hr hp
@@ -127,23 +127,32 @@ theorem lowerKind_canonical (name : String) (kind : ParallelKernelKind)
     propext ⟨fun _ => trivial, fun _ => hscalar v e x⟩
   cases kind <;>
     simp only [lowerKind, kernelOf, CanonicalPTXKernel, List.forall_mem_append,
-      List.forall_mem_cons, List.forall_mem_nil, List.forall_mem_map]
+      List.forall_mem_cons, List.forall_mem_map]
   all_goals
-    try simp only [hl, hs, true_and, and_true]
+    try simp only [hl, hs, and_true]
   all_goals
     simp only [toString, CanonicalPTXParamDecl, CanonicalPTXRegDecl, gidSetup, loadIn, ins, i64,
-      List.forall_mem_append, List.forall_mem_cons, List.forall_mem_nil,
-      List.forall_mem_map, hn, hd, hb, hi, hloads,
-      hscalar, hro]
+      List.forall_mem_cons, hn, hi]
   all_goals
-    simp [toString,
-      CanonicalPTXStmt, CanonicalPTXInstr, CanonicalPTXAddr, CanonicalPTXPredGuard,
+    simp [CanonicalPTXStmt, CanonicalPTXInstr, CanonicalPTXAddr, CanonicalPTXPredGuard,
       hd, hb, hi, hro]
   all_goals
     repeat' apply And.intro
     all_goals first | assumption | exact hi _ |
-      (simp [CanonicalPTXName, CanonicalPTXSymbol, CanonicalPTXOperand,
-        ptxNameChar, ptxSpecialRegs, ppSpecialReg])
+      (simp [CanonicalPTXOperand, ptxNameChar, ptxSpecialRegs, ppSpecialReg])
+
+/-- Canonical lowered kernels are recovered by the structural text parser. -/
+theorem lowerKind_roundtrip (name : String) (kind : ParallelKernelKind)
+    (hn : CanonicalPTXSymbol name)
+    (hr : ∀ p : PReg, CanonicalPTXName p.name ∧ CanonicalPTXOperand (iOp p))
+    (hp : ∀ n : Nat, CanonicalPTXName s!"%p{n}")
+    (hi : ∀ n : Nat, CanonicalPTXSymbol s!"param_in{n}")
+    (hd : CanonicalPTXName s!"$L_done_{name}")
+    (hb : CanonicalPTXName s!"$L_boundary_{name}") :
+    parsePTXKernel (ptxKernelFuel (lowerKind name kind) + 1)
+      (ppPTXKernel (lowerKind name kind)) = some (lowerKind name kind) := by
+  exact parsePTXKernel_roundtrip _ (lowerKind_canonical name kind hn hr hp hi hd hb)
+    _ (by omega)
 
 private theorem packInputWordLists_props (env : VarEnv) (st : HeapState) (len : Nat) :
     ∀ (inputs : List VarId) (ws : List (List (BitVec 64))),

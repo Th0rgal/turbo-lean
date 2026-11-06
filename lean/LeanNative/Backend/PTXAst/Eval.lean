@@ -2286,10 +2286,14 @@ def ppPTXStmt : PTXStmt → String
   | .instr none ins => s!"    {ppPTXInstr ins}"
   | .instr (some g) ins => s!"    {ppPredGuard g}{ppPTXInstr ins}"
 
-/-- Render a `.visible .entry` `PTXKernel`. -/
-def ppPTXKernel (k : PTXKernel) : String :=
-  let paramLines := String.intercalate ",\n"
-    (k.params.map fun p => s!"    .param {ppPTXType p.ty} {p.name}")
+/-- Parameter lines retain the comma on every non-final parameter. -/
+def ppPTXParamLines : List PTXParamDecl → List String
+  | [] => []
+  | p :: ps => (s!"    .param {ppPTXType p.ty} {p.name}" ++
+      if ps.isEmpty then "" else ",") :: ppPTXParamLines ps
+
+/-- Declaration and statement lines in their canonical section order. -/
+def ppPTXKernelBodyLines (k : PTXKernel) : List String :=
   let sharedLines := k.sharedDecls.map fun s =>
     s!"    .shared .align {s.align} {ppPTXType s.elemTy} {s.name}[{s.count}];"
   let localLines :=
@@ -2298,10 +2302,13 @@ def ppPTXKernel (k : PTXKernel) : String :=
   let regLines := k.regDecls.map fun r =>
     s!"    .reg {ppPTXType r.ty} {r.prefixName}<{r.count}>;"
   let bodyLines := k.body.map ppPTXStmt
-  let header :=
-    if k.params.isEmpty then s!".visible .entry {k.name}()\n\{"
-    else s!".visible .entry {k.name}(\n{paramLines}\n)\n\{"
-  String.intercalate "\n" ([header] ++ sharedLines ++ localLines ++ regLines ++ bodyLines ++ ["}"])
+  sharedLines ++ localLines ++ regLines ++ bodyLines
+
+/-- Render a `.visible .entry` `PTXKernel` from newline-free structural lines. -/
+def ppPTXKernel (k : PTXKernel) : String :=
+  let header := if k.params.isEmpty then [s!".visible .entry {k.name}()", "{"]
+    else [s!".visible .entry {k.name}("] ++ ppPTXParamLines k.params ++ [")", "{"]
+  String.intercalate "\n" (header ++ ppPTXKernelBodyLines k ++ ["}"])
 
 /-- Render the canonical `.version` / `.target` / `.address_size` header of a `PTXModule`. -/
 def ppPTXModuleHeader (m : PTXModule) : String :=
