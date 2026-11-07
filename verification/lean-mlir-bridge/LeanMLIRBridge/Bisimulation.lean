@@ -44,7 +44,7 @@ def ofLLVMVal? (w : IntWidth) : LLVMVal → Option (LLVM.IntW w.bits)
 @[simp]
 theorem ofLLVMVal?_toLLVMVal (w : IntWidth) (x : LLVM.IntW w.bits) :
     ofLLVMVal? w (toLLVMVal w x) = some x := by
-  cases x <;> simp [toLLVMVal, ofLLVMVal?]
+  cases x using PoisonOr.casesOn' <;> simp [toLLVMVal, ofLLVMVal?]
 
 /-- Translate `LLVMAst.OverflowFlags` to `opencompl/lean-mlir`'s `LLVM.NoWrapFlags`. -/
 def toNoWrapFlags : OverflowFlags → LLVM.NoWrapFlags
@@ -68,44 +68,60 @@ def toIntPred : ICmpPred → LLVM.IntPred
 
 /-! ## Two's-Complement Bridge Lemmas (`bvSigned` / Overflow / `icmp` / Shifts / Division) -/
 
+private theorem two_pow_eq_two_mul_pred (n : Nat) (hpos : 0 < n) :
+    2 ^ n = 2 * 2 ^ (n - 1) := by
+  cases n with
+  | zero => omega
+  | succ k => simp [Nat.pow_succ, Nat.mul_comm]
+
+private theorem int_two_pow_eq_natCast (n : Nat) :
+    ((2 : Int) ^ n) = ((2 ^ n : Nat) : Int) := by
+  rw [Int.natCast_pow]
+  rfl
+
 theorem bvSigned_eq_toInt (w : IntWidth) (v : BitVec w.bits) :
     bvSigned w v = v.toInt := by
   have hpos : 0 < w.bits := w.bits_pos
+  have h2w : 2 ^ w.bits = 2 * 2 ^ (w.bits - 1) := two_pow_eq_two_mul_pred w.bits hpos
   unfold bvSigned BitVec.toInt
-  have hpow : (2 : Int) ^ w.bits = (2 : Int) * (2 : Int) ^ (w.bits - 1) := by
-    conv_lhs => rw [show w.bits = (w.bits - 1) + 1 by omega]
-    rw [Int.pow_succ]
-    omega
-  simp only [Nat.cast_pow, Nat.cast_ofNat]
-  split_ifs with h1 h2
-  · rfl
-  · exfalso; omega
-  · exfalso; omega
-  · rfl
+  simp only [Int.ofNat_eq_natCast, int_two_pow_eq_natCast]
+  split <;> split <;> omega
 
 theorem addOverflowNSW_eq_saddOverflow (w : IntWidth) (a b : BitVec w.bits) :
     addOverflowNSW w a b = BitVec.saddOverflow a b := by
   have hpos : 0 < w.bits := w.bits_pos
   unfold addOverflowNSW BitVec.saddOverflow
   rw [bvSigned_eq_toInt, bvSigned_eq_toInt]
-  simp only [Nat.cast_pow, Nat.cast_ofNat, decide_eq_decide]
-  omega
+  cases hc : w.bits == 0
+  · simp only [int_two_pow_eq_natCast]
+    apply Bool.eq_iff_iff.mpr
+    simp only [decide_eq_true_eq, Bool.or_eq_true]
+    omega
+  · simp at hc; omega
 
 theorem subOverflowNSW_eq_ssubOverflow (w : IntWidth) (a b : BitVec w.bits) :
     subOverflowNSW w a b = BitVec.ssubOverflow a b := by
   have hpos : 0 < w.bits := w.bits_pos
   unfold subOverflowNSW BitVec.ssubOverflow
   rw [bvSigned_eq_toInt, bvSigned_eq_toInt]
-  simp only [Nat.cast_pow, Nat.cast_ofNat, decide_eq_decide]
-  omega
+  cases hc : w.bits == 0
+  · simp only [int_two_pow_eq_natCast]
+    apply Bool.eq_iff_iff.mpr
+    simp only [decide_eq_true_eq, Bool.or_eq_true]
+    omega
+  · simp at hc; omega
 
 theorem mulOverflowNSW_eq_smulOverflow (w : IntWidth) (a b : BitVec w.bits) :
     mulOverflowNSW w a b = BitVec.smulOverflow a b := by
   have hpos : 0 < w.bits := w.bits_pos
   unfold mulOverflowNSW BitVec.smulOverflow
   rw [bvSigned_eq_toInt, bvSigned_eq_toInt]
-  simp only [Nat.cast_pow, Nat.cast_ofNat, decide_eq_decide]
-  omega
+  cases hc : w.bits == 0
+  · simp only [int_two_pow_eq_natCast]
+    apply Bool.eq_iff_iff.mpr
+    simp only [decide_eq_true_eq, Bool.or_eq_true]
+    omega
+  · simp at hc; omega
 
 theorem addOverflowNUW_eq_uaddOverflow (w : IntWidth) (a b : BitVec w.bits) :
     addOverflowNUW w a b = BitVec.uaddOverflow a b := by
@@ -127,406 +143,204 @@ theorem icmpEval_eq_mlir (p : ICmpPred) (w : IntWidth) (a b : BitVec w.bits) :
   cases p <;> simp [icmpEval, toIntPred, LLVM.icmp', BitVec.ult, BitVec.ule,
     BitVec.slt, BitVec.sle, bvSigned_eq_toInt]
 
+private theorem two_pow_pos_nat (k : Nat) : 0 < 2 ^ k := by
+  induction k with
+  | zero => decide
+  | succ k ih => simp [Nat.pow_succ]; omega
+
 theorem shlOverflowNSW_eq_mlir (w : IntWidth) (a amt : BitVec w.bits)
     (h_lt : amt.toNat < w.bits) :
     shlOverflowNSW w a amt = decide (((a <<< amt).sshiftRight' amt) ≠ a) := by
   unfold shlOverflowNSW
   rw [bvSigned_eq_toInt]
   have hpos : 0 < w.bits := w.bits_pos
-  -- Using `BitVec.toInt_sshiftRight` & `BitVec.toInt_shiftLeft`: shifting left by `k < w.bits`
-  -- then arithmetic-shifting right by `k` recovers `a` iff `a.toInt * 2^k` fits in signed `w.bits`.
   have h_round : ((a <<< amt).sshiftRight' amt = a) ↔
       (-((2 : Int) ^ (w.bits - 1)) ≤ a.toInt * (2 : Int) ^ amt.toNat ∧
        a.toInt * (2 : Int) ^ amt.toNat ≤ (2 : Int) ^ (w.bits - 1) - 1) := by
-    have hk : amt.toNat ≤ w.bits := Nat.le_of_lt h_lt
     have h_sh_def : (a <<< amt).sshiftRight' amt = (a <<< amt.toNat).sshiftRight amt.toNat := rfl
-    rw [h_sh_def, ← BitVec.toInt_inj]
-    have h_sdiv : ((a <<< amt.toNat).sshiftRight amt.toNat).toInt =
-        (a <<< amt.toNat).toInt / (2 : Int) ^ amt.toNat := by
-      rw [BitVec.toInt_sshiftRight_of_lt _ h_lt]
-    rw [h_sdiv]
-    have h2pos : (0 : Int) < (2 : Int) ^ amt.toNat := by positivity
-    have h2w : (2 : Int) ^ w.bits = (2 : Int) ^ (w.bits - 1 + 1) := by
-      congr 1; omega
-    have h_rem : (2 : Int) ^ w.bits = ((2 : Int) ^ (w.bits - amt.toNat)) * ((2 : Int) ^ amt.toNat) := by
-      rw [← Int.pow_add]
+    rw [h_sh_def, ← BitVec.toInt_inj, BitVec.toInt_sshiftRight, Int.shiftRight_eq_div_pow]
+    have h2pos_nat : 0 < 2 ^ amt.toNat := two_pow_pos_nat amt.toNat
+    have h2pos : (0 : Int) < ((2 ^ amt.toNat : Nat) : Int) := Int.natCast_pos.mpr h2pos_nat
+    have h_cast_amt : ((2 : Int) ^ amt.toNat) = ((2 ^ amt.toNat : Nat) : Int) :=
+      int_two_pow_eq_natCast amt.toNat
+    have h_half_nat : 2 ^ (w.bits - 1) = 2 ^ (w.bits - 1 - amt.toNat) * 2 ^ amt.toNat := by
+      rw [← Nat.pow_add]
       congr 1
       omega
-    have h_half : (2 : Int) ^ (w.bits - 1) =
-        ((2 : Int) ^ (w.bits - 1 - amt.toNat)) * ((2 : Int) ^ amt.toNat) := by
-      rw [← Int.pow_add]
-      congr 1
-      omega
+    have h_half : ((2 : Int) ^ (w.bits - 1)) =
+        ((2 ^ (w.bits - 1 - amt.toNat) : Nat) : Int) * ((2 ^ amt.toNat : Nat) : Int) := by
+      rw [int_two_pow_eq_natCast, h_half_nat, Int.natCast_mul]
+    have h_full_nat : 2 ^ w.bits = 2 * 2 ^ (w.bits - 1) := two_pow_eq_two_mul_pred w.bits hpos
     have h_toInt_shl : (a <<< amt.toNat).toInt =
-        Int.bmod (a.toInt * (2 : Int) ^ amt.toNat) (2 ^ w.bits) := by
-      rw [BitVec.toInt_shiftLeft]
-      simp [Int.shiftLeft_eq, BitVec.toInt_bmod_cancel]
+        Int.bmod (a.toInt * ((2 ^ amt.toNat : Nat) : Int)) (2 ^ w.bits) := by
+      rw [BitVec.toInt_shiftLeft, Nat.shiftLeft_eq, Int.natCast_mul,
+        Int.mul_bmod, ← BitVec.toInt_eq_toNat_bmod,
+        ← BitVec.toInt_bmod_cancel a, ← Int.mul_bmod, BitVec.toInt_bmod_cancel]
     constructor
     · intro heq
-      have h_bds := BitVec.toInt_lt (a <<< amt.toNat)
-      have h_lo := BitVec.le_toInt (a <<< amt.toNat)
-      simp only [Nat.cast_pow, Nat.cast_ofNat] at h_bds h_lo
-      have h_prod_lo : -((2 : Int) ^ (w.bits - 1)) ≤ a.toInt * (2 : Int) ^ amt.toNat := by
-        -- Since `(x / 2^k) = a.toInt` and `x >= -2^(w-1)` with `2^k | 2^(w-1)`
-        have h1 : -((2 : Int) ^ (w.bits - 1 - amt.toNat)) ≤ (a <<< amt.toNat).toInt / (2 : Int) ^ amt.toNat := by
-          rw [h_half] at h_lo
-          exact Int.le_ediv_of_mul_le h2pos h_lo
-        rw [heq] at h1
-        have := Int.mul_le_mul_of_nonneg_right h1 (le_of_lt h2pos)
-        simpa [← h_half] using this
-      have h_prod_hi : a.toInt * (2 : Int) ^ amt.toNat ≤ (2 : Int) ^ (w.bits - 1) - 1 := by
-        have h1 : (a <<< amt.toNat).toInt / (2 : Int) ^ amt.toNat < (2 : Int) ^ (w.bits - 1 - amt.toNat) := by
-          rw [h_half] at h_bds
-          exact Int.ediv_lt_of_lt_mul h2pos h_bds
-        rw [heq] at h1
-        have h1' : a.toInt ≤ (2 : Int) ^ (w.bits - 1 - amt.toNat) - 1 := by omega
-        have := Int.mul_le_mul_of_nonneg_right h1' (le_of_lt h2pos)
-        rw [Int.sub_mul, one_mul, ← h_half] at this
-        omega
-      exact ⟨h_prod_lo, h_prod_hi⟩
+      have h_bds : (a <<< amt.toNat).toInt < ((2 ^ (w.bits - 1) : Nat) : Int) := by
+        have hb0 : (a <<< amt.toNat).toInt < (2 : Int) ^ (w.bits - 1) := BitVec.toInt_lt
+        rwa [int_two_pow_eq_natCast] at hb0
+      have h_lo : -((2 ^ (w.bits - 1) : Nat) : Int) ≤ (a <<< amt.toNat).toInt := by
+        have hl0 : -((2 : Int) ^ (w.bits - 1)) ≤ (a <<< amt.toNat).toInt := BitVec.le_toInt (a <<< amt.toNat)
+        rwa [int_two_pow_eq_natCast] at hl0
+      rw [h_half_nat, Int.natCast_mul] at h_bds h_lo
+      have h_neg_mul : -(((2 ^ (w.bits - 1 - amt.toNat) : Nat) : Int) * ((2 ^ amt.toNat : Nat) : Int)) =
+          (-((2 ^ (w.bits - 1 - amt.toNat) : Nat) : Int)) * ((2 ^ amt.toNat : Nat) : Int) := by
+        rw [Int.neg_mul_eq_neg_mul]
+      rw [h_neg_mul] at h_lo
+      have h1 : -((2 ^ (w.bits - 1 - amt.toNat) : Nat) : Int) ≤
+          (a <<< amt.toNat).toInt / ((2 ^ amt.toNat : Nat) : Int) :=
+        Int.le_ediv_of_mul_le h2pos h_lo
+      have h2 : (a <<< amt.toNat).toInt / ((2 ^ amt.toNat : Nat) : Int) <
+          ((2 ^ (w.bits - 1 - amt.toNat) : Nat) : Int) :=
+        Int.ediv_lt_of_lt_mul h2pos h_bds
+      rw [heq] at h1 h2
+      have h2' : a.toInt ≤ ((2 ^ (w.bits - 1 - amt.toNat) : Nat) : Int) - 1 := by omega
+      have hlo_prod := Int.mul_le_mul_of_nonneg_right h1 (Int.le_of_lt h2pos)
+      have hhi_prod := Int.mul_le_mul_of_nonneg_right h2' (Int.le_of_lt h2pos)
+      rw [Int.sub_mul, Int.one_mul] at hhi_prod
+      rw [h_cast_amt, h_half]
+      omega
     · rintro ⟨hlo, hhi⟩
-      have h_bmod_id : Int.bmod (a.toInt * (2 : Int) ^ amt.toNat) (2 ^ w.bits) =
-          a.toInt * (2 : Int) ^ amt.toNat := by
+      rw [h_cast_amt, int_two_pow_eq_natCast] at hlo hhi
+      have h_bmod_id : Int.bmod (a.toInt * ((2 ^ amt.toNat : Nat) : Int)) (2 ^ w.bits) =
+          a.toInt * ((2 ^ amt.toNat : Nat) : Int) := by
         apply Int.bmod_eq_of_le
-        · simp only [Nat.cast_pow, Nat.cast_ofNat]; omega
-        · simp only [Nat.cast_pow, Nat.cast_ofNat]; omega
-      rw [h_toInt_shl, h_bmod_id, Int.mul_ediv_cancel _ (ne_of_gt h2pos)]
-  simp only [decide_eq_decide]
+        · omega
+        · omega
+      rw [h_toInt_shl, h_bmod_id, Int.mul_ediv_cancel _ (Int.ne_of_gt h2pos)]
+  apply Bool.eq_iff_iff.mpr
+  simp only [decide_eq_true_eq, ne_eq, h_round]
   omega
 
 theorem shiftedOut_iff_ushift_roundtrip (w : IntWidth) (a amt : BitVec w.bits)
     (h_lt : amt.toNat < w.bits) :
     ((a <<< (w.bits - amt.toNat)) != 0#w.bits) = decide ((a >>> amt) <<< amt ≠ a) := by
+  have h_sh_eq : ((a >>> amt) <<< amt) = ((a >>> amt.toNat) <<< amt.toNat) := rfl
+  rw [h_sh_eq]
   apply Bool.eq_iff_iff.mpr
   simp only [bne_iff_ne, ne_eq, decide_eq_true_eq]
-  apply not_iff_not.mpr
+  apply Decidable.not_iff_not.mpr
   constructor
   · intro h_zero
     ext i hi
-    simp only [BitVec.getElem_shiftLeft, BitVec.getElem_ushiftRight]
+    rw [BitVec.getElem_shiftLeft hi]
     by_cases h_ge : i < amt.toNat
-    · simp [h_ge]
+    · simp only [h_ge, decide_true, Bool.not_true, Bool.false_and]
       have h_idx : i + (w.bits - amt.toNat) < w.bits := by omega
-      have hbit := congrArg (fun bv => bv[i + (w.bits - amt.toNat)]'h_idx) h_zero
-      simp only [BitVec.getElem_shiftLeft, BitVec.getElem_zero] at hbit
+      have hbit : (a <<< (w.bits - amt.toNat))[i + (w.bits - amt.toNat)] = (0#w.bits)[i + (w.bits - amt.toNat)] :=
+        congrArg (fun bv => bv[i + (w.bits - amt.toNat)]'h_idx) h_zero
+      rw [BitVec.getElem_shiftLeft h_idx, BitVec.getElem_zero] at hbit
       have h_not : ¬(i + (w.bits - amt.toNat) < w.bits - amt.toNat) := by omega
-      simp [h_not, show i + (w.bits - amt.toNat) - (w.bits - amt.toNat) = i by omega] at hbit
+      have h_sub : i + (w.bits - amt.toNat) - (w.bits - amt.toNat) = i := by omega
+      simp only [h_not, decide_false, Bool.not_false, Bool.true_and, h_sub] at hbit
       exact hbit.symm
-    · have h_le : amt.toNat ≤ i := by omega
-      have h_sub : i - amt.toNat + amt.toNat = i := by omega
-      simp [h_ge, h_sub]
+    · have h_sub_lt : i - amt.toNat < w.bits := by omega
+      have h_add : amt.toNat + (i - amt.toNat) = i := by omega
+      simp only [h_ge, decide_false, Bool.not_false, Bool.true_and]
+      rw [BitVec.getElem_ushiftRight a (i - amt.toNat) amt.toNat h_sub_lt]
+      simp [BitVec.getLsbD_eq_getElem hi, h_add]
   · intro h_rt
     ext i hi
-    simp only [BitVec.getElem_shiftLeft, BitVec.getElem_zero]
+    rw [BitVec.getElem_shiftLeft hi, BitVec.getElem_zero]
     by_cases h_low : i < w.bits - amt.toNat
     · simp [h_low]
-    · simp only [h_low, ↓reduceIte, Bool.not_false, Bool.true_and]
+    · simp only [h_low, decide_false, Bool.not_false, Bool.true_and]
       have h_idx : i - (w.bits - amt.toNat) < w.bits := by omega
-      have hbit := congrArg (fun bv => bv[i - (w.bits - amt.toNat)]'h_idx) h_rt
-      simp only [BitVec.getElem_shiftLeft] at hbit
+      have hbit : ((a >>> amt.toNat) <<< amt.toNat)[i - (w.bits - amt.toNat)] = a[i - (w.bits - amt.toNat)] :=
+        congrArg (fun bv => bv[i - (w.bits - amt.toNat)]'h_idx) h_rt
+      rw [BitVec.getElem_shiftLeft h_idx] at hbit
       have h_lt_amt : i - (w.bits - amt.toNat) < amt.toNat := by omega
-      simp [h_lt_amt] at hbit
+      simp only [h_lt_amt, decide_true, Bool.not_true, Bool.false_and] at hbit
       exact hbit.symm
+
+private theorem ofNat_cond_eq_ofInt (n : Nat) (z : Int) :
+    (if 0 ≤ z then BitVec.ofNat n z.toNat
+     else BitVec.ofNat n (2 ^ n - (-z).toNat % 2 ^ n)) = BitVec.ofInt n z := by
+  by_cases hz : 0 ≤ z
+  · simp only [hz, ↓reduceIte]
+    have hz_eq : ((z.toNat : Nat) : Int) = z := Int.toNat_of_nonneg hz
+    rw [← BitVec.ofInt_natCast, hz_eq]
+  · simp only [hz, ↓reduceIte]
+    apply BitVec.eq_of_toNat_eq
+    simp only [BitVec.toNat_ofNat, BitVec.toNat_ofInt]
+    let m := (-z).toNat
+    have hm : z = -(m : Int) := by omega
+    have hm_toNat : (-z).toNat = m := rfl
+    rw [hm_toNat, hm]
+    have hpos : 0 < 2 ^ n := two_pow_pos_nat n
+    by_cases hrem : m % 2 ^ n = 0
+    · simp only [hrem, Nat.sub_zero, Nat.mod_self]
+      have hdvd : (2 ^ n) ∣ m := Nat.dvd_of_mod_eq_zero hrem
+      rcases hdvd with ⟨k, hk⟩
+      rw [hk]
+      have hmul : -(((2 ^ n * k : Nat) : Int)) = ((2 ^ n : Nat) : Int) * (-(k : Int)) := by
+        rw [Int.natCast_mul, Int.mul_neg]
+      rw [hmul, Int.mul_emod_right]
+      rfl
+    · have hlt : m % 2 ^ n < 2 ^ n := Nat.mod_lt _ hpos
+      have hle : m % 2 ^ n ≤ 2 ^ n := Nat.le_of_lt hlt
+      have hsub_lt : 2 ^ n - m % 2 ^ n < 2 ^ n := by omega
+      rw [Nat.mod_eq_of_lt hsub_lt]
+      have hdiv : (m : Int) = ((2 ^ n : Nat) : Int) * ((m / 2 ^ n : Nat) : Int) + ((m % 2 ^ n : Nat) : Int) := by
+        have hd := congrArg (Nat.cast (R := Int)) (Nat.div_add_mod m (2 ^ n)).symm
+        simpa [Int.natCast_add, Int.natCast_mul] using hd
+      have hsub_cast : (((2 ^ n - m % 2 ^ n : Nat) : Int)) =
+          ((2 ^ n : Nat) : Int) - ((m % 2 ^ n : Nat) : Int) := Int.ofNat_sub hle
+      have h_decomp : -(m : Int) =
+          (((2 ^ n - m % 2 ^ n : Nat) : Int)) +
+          ((2 ^ n : Nat) : Int) * (-((m / 2 ^ n : Nat) : Int) - 1) := by
+        have hmul_exp :
+            ((2 ^ n : Nat) : Int) * (-((m / 2 ^ n : Nat) : Int) - 1) =
+              -(((2 ^ n : Nat) : Int) * ((m / 2 ^ n : Nat) : Int)) - ((2 ^ n : Nat) : Int) := by
+          rw [Int.sub_eq_add_neg, Int.mul_add, Int.mul_neg, Int.mul_neg, Int.mul_one, ← Int.sub_eq_add_neg]
+        omega
+      have hlo : (0 : Int) ≤ ((2 ^ n - m % 2 ^ n : Nat) : Int) := Int.natCast_nonneg _
+      have hhi : ((2 ^ n - m % 2 ^ n : Nat) : Int) < ((2 ^ n : Nat) : Int) :=
+        Int.ofNat_lt.mpr hsub_lt
+      rw [h_decomp, Int.add_mul_emod_self_left, Int.emod_eq_of_lt hlo hhi, Int.toNat_natCast]
 
 theorem bvSDiv_eq_sdiv (w : IntWidth) (a b : BitVec w.bits) :
     bvSDiv w a b = BitVec.sdiv a b := by
   unfold bvSDiv
-  rw [bvSigned_eq_toInt, bvSigned_eq_toInt]
-  -- Both `bvSDiv` and `BitVec.sdiv` compute two's-complement truncated signed division `Int.tdiv a.toInt b.toInt` modulo `2^w.bits`.
-  have h_mod : (if 0 ≤ Int.tdiv a.toInt b.toInt then
-      BitVec.ofNat w.bits (Int.tdiv a.toInt b.toInt).toNat
-    else
-      BitVec.ofNat w.bits (2 ^ w.bits - (-Int.tdiv a.toInt b.toInt).toNat % 2 ^ w.bits)) =
-      BitVec.ofInt w.bits (Int.tdiv a.toInt b.toInt) := by
-    set q := Int.tdiv a.toInt b.toInt
-    by_cases hq : 0 ≤ q
-    · simp only [hq, ↓reduceIte]
-      have hq_eq : q = Int.ofNat q.toNat := (Int.toNat_of_nonneg hq).symm
-      rw [hq_eq, BitVec.ofInt_ofNat]
-    · simp only [hq, ↓reduceIte]
-      apply BitVec.eq_of_toNat_eq
-      simp only [BitVec.toNat_ofNat, BitVec.toNat_ofInt]
-      have hq_neg : q < 0 := by omega
-      set n := (-q).toNat
-      have hn : q = -(n : Int) := by omega
-      rw [hn]
-      have hpos : (0 : Nat) < 2 ^ w.bits := Nat.pos_of_ne_zero (by positivity)
-      have hposZ : (0 : Int) < (2 ^ w.bits : Nat) := by exact_mod_cast hpos
-      by_cases hrem : n % 2 ^ w.bits = 0
-      · simp [hrem]
-        have hdvd : ((2 ^ w.bits : Nat) : Int) ∣ (n : Int) := by
-          exact_mod_cast Nat.dvd_of_mod_eq_zero hrem
-        rcases hdvd with ⟨k, hk⟩
-        rw [hk]
-        simp [Int.neg_mul_eq_neg_mul]
-      · have hlt : n % 2 ^ w.bits < 2 ^ w.bits := Nat.mod_lt _ hpos
-        have hsub_lt : 2 ^ w.bits - n % 2 ^ w.bits < 2 ^ w.bits := by omega
-        rw [Nat.mod_eq_of_lt hsub_lt]
-        have h_emod : (-(n : Int)) % ((2 ^ w.bits : Nat) : Int) =
-            ((2 ^ w.bits : Nat) : Int) - ((n % 2 ^ w.bits : Nat) : Int) := by
-          have h1 : (n : Int) = ((2 ^ w.bits : Nat) : Int) * (n / 2 ^ w.bits : Nat) + (n % 2 ^ w.bits : Nat) := by
-            exact_mod_cast (Nat.div_add_mod n (2 ^ w.bits)).symm
-          have hrem_pos : (0 : Int) < (n % 2 ^ w.bits : Nat) := by
-            exact_mod_cast Nat.pos_of_ne_zero hrem
-          have hrem_lt : ((n % 2 ^ w.bits : Nat) : Int) < (2 ^ w.bits : Nat) := by
-            exact_mod_cast hlt
-          have h_decomp : -(n : Int) =
-              (((2 ^ w.bits : Nat) : Int) - (n % 2 ^ w.bits : Nat)) +
-              ((2 ^ w.bits : Nat) : Int) * (-((n / 2 ^ w.bits : Nat) : Int) - 1) := by
-            linarith
-          rw [h_decomp, Int.add_mul_emod_self_left, Int.emod_eq_of_lt (by omega) (by omega)]
-        rw [h_emod]
-        omega
-  rw [h_mod]
-  -- Now relate `BitVec.ofInt w.bits (Int.tdiv a.toInt b.toInt)` to `BitVec.sdiv a b`
-  unfold BitVec.sdiv BitVec.udiv
-  by_cases ha : 0 ≤ a.toInt <;> by_cases hb : 0 ≤ b.toInt
-  · have h_msb_a : a.msb = false := BitVec.msb_eq_false_iff_two_mul_lt.mpr (by
-      have := BitVec.toInt_eq_toNat_cond a; split_ifs at this <;> omega)
-    have h_msb_b : b.msb = false := BitVec.msb_eq_false_iff_two_mul_lt.mpr (by
-      have := BitVec.toInt_eq_toNat_cond b; split_ifs at this <;> omega)
-    simp only [h_msb_a, h_msb_b]
-    have ha_eq : a.toInt = a.toNat := by
-      have := BitVec.toInt_eq_toNat_cond a; split_ifs at this <;> omega
-    have hb_eq : b.toInt = b.toNat := by
-      have := BitVec.toInt_eq_toNat_cond b; split_ifs at this <;> omega
-    rw [ha_eq, hb_eq, Int.tdiv_ofNat, BitVec.ofInt_ofNat]
-    rfl
-  · have h_msb_a : a.msb = false := BitVec.msb_eq_false_iff_two_mul_lt.mpr (by
-      have := BitVec.toInt_eq_toNat_cond a; split_ifs at this <;> omega)
-    have h_msb_b : b.msb = true := by
-      cases hm : b.msb
-      · exfalso
-        have := BitVec.msb_eq_false_iff_two_mul_lt.mp hm
-        have hti := BitVec.toInt_eq_toNat_cond b; split_ifs at hti <;> omega
-      · rfl
-    simp only [h_msb_a, h_msb_b]
-    have ha_eq : a.toInt = (a.toNat : Int) := by
-      have := BitVec.toInt_eq_toNat_cond a; split_ifs at this <;> omega
-    have hb_neg : b.toInt = -(((-b).toNat : Nat) : Int) := by
-      have hti := BitVec.toInt_eq_toNat_cond b
-      have hneg : (-b).toNat = 2 ^ w.bits - b.toNat := by
-        have hb_nz : b.toNat ≠ 0 := by omega
-        simp [BitVec.toNat_neg, Nat.mod_eq_of_lt (show 2 ^ w.bits - b.toNat < 2 ^ w.bits by omega)]
-      split_ifs at hti <;> omega
-    rw [ha_eq, hb_neg]
-    cases hn : (-b).toNat with
-    | zero => simp [Int.tdiv]
-    | succ k =>
-      have : -(((k + 1 : Nat) : Int)) = Int.negSucc k := rfl
-      rw [this, Int.tdiv]
-      simp only [BitVec.ofInt_neg, BitVec.ofInt_ofNat]
-      rfl
-  · have h_msb_a : a.msb = true := by
-      cases hm : a.msb
-      · exfalso
-        have := BitVec.msb_eq_false_iff_two_mul_lt.mp hm
-        have hti := BitVec.toInt_eq_toNat_cond a; split_ifs at hti <;> omega
-      · rfl
-    have h_msb_b : b.msb = false := BitVec.msb_eq_false_iff_two_mul_lt.mpr (by
-      have := BitVec.toInt_eq_toNat_cond b; split_ifs at this <;> omega)
-    simp only [h_msb_a, h_msb_b]
-    have hb_eq : b.toInt = (b.toNat : Int) := by
-      have := BitVec.toInt_eq_toNat_cond b; split_ifs at this <;> omega
-    have ha_neg : a.toInt = -(((-a).toNat : Nat) : Int) := by
-      have hti := BitVec.toInt_eq_toNat_cond a
-      have hneg : (-a).toNat = 2 ^ w.bits - a.toNat := by
-        have ha_nz : a.toNat ≠ 0 := by omega
-        simp [BitVec.toNat_neg, Nat.mod_eq_of_lt (show 2 ^ w.bits - a.toNat < 2 ^ w.bits by omega)]
-      split_ifs at hti <;> omega
-    rw [ha_neg, hb_eq]
-    cases hm : (-a).toNat with
-    | zero => simp [Int.tdiv]
-    | succ k =>
-      have : -(((k + 1 : Nat) : Int)) = Int.negSucc k := rfl
-      rw [this, Int.tdiv]
-      simp only [BitVec.ofInt_neg, BitVec.ofInt_ofNat]
-      rfl
-  · have h_msb_a : a.msb = true := by
-      cases hm : a.msb
-      · exfalso
-        have := BitVec.msb_eq_false_iff_two_mul_lt.mp hm
-        have hti := BitVec.toInt_eq_toNat_cond a; split_ifs at hti <;> omega
-      · rfl
-    have h_msb_b : b.msb = true := by
-      cases hm : b.msb
-      · exfalso
-        have := BitVec.msb_eq_false_iff_two_mul_lt.mp hm
-        have hti := BitVec.toInt_eq_toNat_cond b; split_ifs at hti <;> omega
-      · rfl
-    simp only [h_msb_a, h_msb_b]
-    have ha_neg : a.toInt = -(((-a).toNat : Nat) : Int) := by
-      have hti := BitVec.toInt_eq_toNat_cond a
-      have hneg : (-a).toNat = 2 ^ w.bits - a.toNat := by
-        have ha_nz : a.toNat ≠ 0 := by omega
-        simp [BitVec.toNat_neg, Nat.mod_eq_of_lt (show 2 ^ w.bits - a.toNat < 2 ^ w.bits by omega)]
-      split_ifs at hti <;> omega
-    have hb_neg : b.toInt = -(((-b).toNat : Nat) : Int) := by
-      have hti := BitVec.toInt_eq_toNat_cond b
-      have hneg : (-b).toNat = 2 ^ w.bits - b.toNat := by
-        have hb_nz : b.toNat ≠ 0 := by omega
-        simp [BitVec.toNat_neg, Nat.mod_eq_of_lt (show 2 ^ w.bits - b.toNat < 2 ^ w.bits by omega)]
-      split_ifs at hti <;> omega
-    rw [ha_neg, hb_neg]
-    cases hm : (-a).toNat with
-    | zero => simp [Int.tdiv]
-    | succ ka =>
-      cases hn : (-b).toNat with
-      | zero => simp [Int.tdiv]
-      | succ kb =>
-        have ha' : -(((ka + 1 : Nat) : Int)) = Int.negSucc ka := rfl
-        have hb' : -(((kb + 1 : Nat) : Int)) = Int.negSucc kb := rfl
-        rw [ha', hb', Int.tdiv, BitVec.ofInt_ofNat]
-        rfl
+  dsimp only []
+  rw [bvSigned_eq_toInt, bvSigned_eq_toInt, ofNat_cond_eq_ofInt]
+  apply BitVec.eq_of_toInt_eq
+  rw [BitVec.toInt_ofInt, BitVec.toInt_sdiv]
 
 theorem bvSRem_eq_srem (w : IntWidth) (a b : BitVec w.bits) :
     bvSRem w a b = BitVec.srem a b := by
+  have hpos : 0 < w.bits := w.bits_pos
+  have h2w : 2 ^ w.bits = 2 * 2 ^ (w.bits - 1) := two_pow_eq_two_mul_pred w.bits hpos
   unfold bvSRem
-  rw [bvSigned_eq_toInt, bvSigned_eq_toInt]
-  have h_mod : (if 0 ≤ Int.tmod a.toInt b.toInt then
-      BitVec.ofNat w.bits (Int.tmod a.toInt b.toInt).toNat
-    else
-      BitVec.ofNat w.bits (2 ^ w.bits - (-Int.tmod a.toInt b.toInt).toNat % 2 ^ w.bits)) =
-      BitVec.ofInt w.bits (Int.tmod a.toInt b.toInt) := by
-    set r := Int.tmod a.toInt b.toInt
-    by_cases hr : 0 ≤ r
-    · simp only [hr, ↓reduceIte]
-      have hr_eq : r = Int.ofNat r.toNat := (Int.toNat_of_nonneg hr).symm
-      rw [hr_eq, BitVec.ofInt_ofNat]
-    · simp only [hr, ↓reduceIte]
-      apply BitVec.eq_of_toNat_eq
-      simp only [BitVec.toNat_ofNat, BitVec.toNat_ofInt]
-      set n := (-r).toNat
-      have hn : r = -(n : Int) := by omega
-      rw [hn]
-      have hpos : (0 : Nat) < 2 ^ w.bits := Nat.pos_of_ne_zero (by positivity)
-      by_cases hrem : n % 2 ^ w.bits = 0
-      · simp [hrem]
-        have hdvd : ((2 ^ w.bits : Nat) : Int) ∣ (n : Int) := by
-          exact_mod_cast Nat.dvd_of_mod_eq_zero hrem
-        rcases hdvd with ⟨k, hk⟩
-        rw [hk]
-        simp [Int.neg_mul_eq_neg_mul]
-      · have hlt : n % 2 ^ w.bits < 2 ^ w.bits := Nat.mod_lt _ hpos
-        have hsub_lt : 2 ^ w.bits - n % 2 ^ w.bits < 2 ^ w.bits := by omega
-        rw [Nat.mod_eq_of_lt hsub_lt]
-        have h_emod : (-(n : Int)) % ((2 ^ w.bits : Nat) : Int) =
-            ((2 ^ w.bits : Nat) : Int) - ((n % 2 ^ w.bits : Nat) : Int) := by
-          have h1 : (n : Int) = ((2 ^ w.bits : Nat) : Int) * (n / 2 ^ w.bits : Nat) + (n % 2 ^ w.bits : Nat) := by
-            exact_mod_cast (Nat.div_add_mod n (2 ^ w.bits)).symm
-          have hrem_pos : (0 : Int) < (n % 2 ^ w.bits : Nat) := by
-            exact_mod_cast Nat.pos_of_ne_zero hrem
-          have hrem_lt : ((n % 2 ^ w.bits : Nat) : Int) < (2 ^ w.bits : Nat) := by
-            exact_mod_cast hlt
-          have h_decomp : -(n : Int) =
-              (((2 ^ w.bits : Nat) : Int) - (n % 2 ^ w.bits : Nat)) +
-              ((2 ^ w.bits : Nat) : Int) * (-((n / 2 ^ w.bits : Nat) : Int) - 1) := by
-            linarith
-          rw [h_decomp, Int.add_mul_emod_self_left, Int.emod_eq_of_lt (by omega) (by omega)]
-        rw [h_emod]
-        omega
-  rw [h_mod]
-  unfold BitVec.srem BitVec.urem
-  by_cases ha : 0 ≤ a.toInt <;> by_cases hb : 0 ≤ b.toInt
-  · have h_msb_a : a.msb = false := BitVec.msb_eq_false_iff_two_mul_lt.mpr (by
-      have := BitVec.toInt_eq_toNat_cond a; split_ifs at this <;> omega)
-    have h_msb_b : b.msb = false := BitVec.msb_eq_false_iff_two_mul_lt.mpr (by
-      have := BitVec.toInt_eq_toNat_cond b; split_ifs at this <;> omega)
-    simp only [h_msb_a, h_msb_b]
-    have ha_eq : a.toInt = a.toNat := by
-      have := BitVec.toInt_eq_toNat_cond a; split_ifs at this <;> omega
-    have hb_eq : b.toInt = b.toNat := by
-      have := BitVec.toInt_eq_toNat_cond b; split_ifs at this <;> omega
-    rw [ha_eq, hb_eq, Int.tmod_ofNat, BitVec.ofInt_ofNat]
-    rfl
-  · have h_msb_a : a.msb = false := BitVec.msb_eq_false_iff_two_mul_lt.mpr (by
-      have := BitVec.toInt_eq_toNat_cond a; split_ifs at this <;> omega)
-    have h_msb_b : b.msb = true := by
-      cases hm : b.msb
-      · exfalso
-        have := BitVec.msb_eq_false_iff_two_mul_lt.mp hm
-        have hti := BitVec.toInt_eq_toNat_cond b; split_ifs at hti <;> omega
-      · rfl
-    simp only [h_msb_a, h_msb_b]
-    have ha_eq : a.toInt = (a.toNat : Int) := by
-      have := BitVec.toInt_eq_toNat_cond a; split_ifs at this <;> omega
-    have hb_neg : b.toInt = -(((-b).toNat : Nat) : Int) := by
-      have hti := BitVec.toInt_eq_toNat_cond b
-      have hneg : (-b).toNat = 2 ^ w.bits - b.toNat := by
-        have hb_nz : b.toNat ≠ 0 := by omega
-        simp [BitVec.toNat_neg, Nat.mod_eq_of_lt (show 2 ^ w.bits - b.toNat < 2 ^ w.bits by omega)]
-      split_ifs at hti <;> omega
-    rw [ha_eq, hb_neg]
-    cases hn : (-b).toNat with
-    | zero => simp [Int.tmod]
-    | succ k =>
-      have : -(((k + 1 : Nat) : Int)) = Int.negSucc k := rfl
-      rw [this, Int.tmod, BitVec.ofInt_ofNat]
-      rfl
-  · have h_msb_a : a.msb = true := by
-      cases hm : a.msb
-      · exfalso
-        have := BitVec.msb_eq_false_iff_two_mul_lt.mp hm
-        have hti := BitVec.toInt_eq_toNat_cond a; split_ifs at hti <;> omega
-      · rfl
-    have h_msb_b : b.msb = false := BitVec.msb_eq_false_iff_two_mul_lt.mpr (by
-      have := BitVec.toInt_eq_toNat_cond b; split_ifs at this <;> omega)
-    simp only [h_msb_a, h_msb_b]
-    have hb_eq : b.toInt = (b.toNat : Int) := by
-      have := BitVec.toInt_eq_toNat_cond b; split_ifs at this <;> omega
-    have ha_neg : a.toInt = -(((-a).toNat : Nat) : Int) := by
-      have hti := BitVec.toInt_eq_toNat_cond a
-      have hneg : (-a).toNat = 2 ^ w.bits - a.toNat := by
-        have ha_nz : a.toNat ≠ 0 := by omega
-        simp [BitVec.toNat_neg, Nat.mod_eq_of_lt (show 2 ^ w.bits - a.toNat < 2 ^ w.bits by omega)]
-      split_ifs at hti <;> omega
-    rw [ha_neg, hb_eq]
-    cases hm : (-a).toNat with
-    | zero => simp [Int.tmod]
-    | succ k =>
-      have : -(((k + 1 : Nat) : Int)) = Int.negSucc k := rfl
-      rw [this, Int.tmod]
-      simp only [BitVec.ofInt_neg, BitVec.ofInt_ofNat]
-      rfl
-  · have h_msb_a : a.msb = true := by
-      cases hm : a.msb
-      · exfalso
-        have := BitVec.msb_eq_false_iff_two_mul_lt.mp hm
-        have hti := BitVec.toInt_eq_toNat_cond a; split_ifs at hti <;> omega
-      · rfl
-    have h_msb_b : b.msb = true := by
-      cases hm : b.msb
-      · exfalso
-        have := BitVec.msb_eq_false_iff_two_mul_lt.mp hm
-        have hti := BitVec.toInt_eq_toNat_cond b; split_ifs at hti <;> omega
-      · rfl
-    simp only [h_msb_a, h_msb_b]
-    have ha_neg : a.toInt = -(((-a).toNat : Nat) : Int) := by
-      have hti := BitVec.toInt_eq_toNat_cond a
-      have hneg : (-a).toNat = 2 ^ w.bits - a.toNat := by
-        have ha_nz : a.toNat ≠ 0 := by omega
-        simp [BitVec.toNat_neg, Nat.mod_eq_of_lt (show 2 ^ w.bits - a.toNat < 2 ^ w.bits by omega)]
-      split_ifs at hti <;> omega
-    have hb_neg : b.toInt = -(((-b).toNat : Nat) : Int) := by
-      have hti := BitVec.toInt_eq_toNat_cond b
-      have hneg : (-b).toNat = 2 ^ w.bits - b.toNat := by
-        have hb_nz : b.toNat ≠ 0 := by omega
-        simp [BitVec.toNat_neg, Nat.mod_eq_of_lt (show 2 ^ w.bits - b.toNat < 2 ^ w.bits by omega)]
-      split_ifs at hti <;> omega
-    rw [ha_neg, hb_neg]
-    cases hm : (-a).toNat with
-    | zero => simp [Int.tmod]
-    | succ ka =>
-      cases hn : (-b).toNat with
-      | zero => simp [Int.tmod]
-      | succ kb =>
-        have ha' : -(((ka + 1 : Nat) : Int)) = Int.negSucc ka := rfl
-        have hb' : -(((kb + 1 : Nat) : Int)) = Int.negSucc kb := rfl
-        rw [ha', hb', Int.tmod]
-        simp only [BitVec.ofInt_neg, BitVec.ofInt_ofNat]
-        rfl
+  dsimp only []
+  rw [bvSigned_eq_toInt, bvSigned_eq_toInt, ofNat_cond_eq_ofInt]
+  apply BitVec.eq_of_toInt_eq
+  rw [BitVec.toInt_ofInt, BitVec.toInt_srem]
+  have h := BitVec.toInt_srem a b
+  have hlo : -((2 : Int) ^ (w.bits - 1)) ≤ (a.srem b).toInt := BitVec.le_toInt (a.srem b)
+  have hhi : (a.srem b).toInt < (2 : Int) ^ (w.bits - 1) := BitVec.toInt_lt
+  rw [h, int_two_pow_eq_natCast] at hlo hhi
+  apply Int.bmod_eq_of_le <;> omega
 
 /-! ## Instruction-Level Bisimulation (`stepInstr` ↔ `LLVM.*` & `InstCombine.Op.denote`) -/
+
+@[simp]
+private theorem intW_bind_poison {w₁ w₂ : Nat} (f : BitVec w₁ → LLVM.IntW w₂) :
+    (PoisonOr.poison : LLVM.IntW w₁) >>= f = PoisonOr.poison := rfl
+
+@[simp]
+private theorem intW_bind_value {w₁ w₂ : Nat} (v : BitVec w₁) (f : BitVec w₁ → LLVM.IntW w₂) :
+    (PoisonOr.value v : LLVM.IntW w₁) >>= f = f v := rfl
+
+@[simp]
+private theorem intW_mk_none {w : Nat} :
+    ({ toOption := none } : LLVM.IntW w) = PoisonOr.poison := rfl
+
+@[simp]
+private theorem intW_mk_some {w : Nat} (v : BitVec w) :
+    ({ toOption := some v } : LLVM.IntW w) = PoisonOr.value v := rfl
 
 theorem stepInstr_add_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (dst : RegName) (flags : OverflowFlags) (w : IntWidth) (aOp bOp : Operand)
@@ -535,12 +349,15 @@ theorem stepInstr_add_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (hb : evalOperand st bOp = toLLVMVal w xb) :
     stepInstr mod_ fuel st (.add dst flags w aOp bOp) =
       .inr (bindReg st dst (toLLVMVal w (LLVM.add xa xb (toNoWrapFlags flags)))) := by
-  cases xa <;> cases xb <;> cases flags
+  rcases xa with ⟨none | va⟩ <;> rcases xb with ⟨none | vb⟩ <;> cases flags
   all_goals
-    simp [stepInstr, stepInstrWith, binResult, ha, hb, toLLVMVal, toNoWrapFlags,
-      LLVM.add, LLVM.add?, PoisonOr.bind, Bind.bind, Pure.pure, flagsOverflow,
-      addOverflowNSW_eq_saddOverflow, addOverflowNUW_eq_uaddOverflow]
-    try split_ifs <;> simp_all [toLLVMVal]
+    simp only [intW_mk_none, intW_mk_some] at ha hb ⊢
+    simp only [stepInstr, stepInstrWith, binResult, ha, hb, toLLVMVal, toNoWrapFlags,
+      LLVM.add, LLVM.add?, intW_bind_poison, intW_bind_value, flagsOverflow,
+      addOverflowNSW_eq_saddOverflow, addOverflowNUW_eq_uaddOverflow, ↓reduceDIte]
+    try (by_cases hs : BitVec.saddOverflow va vb = true <;>
+         by_cases hu : BitVec.uaddOverflow va vb = true <;>
+         simp [hs, hu])
 
 theorem stepInstr_sub_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (dst : RegName) (flags : OverflowFlags) (w : IntWidth) (aOp bOp : Operand)
@@ -549,12 +366,15 @@ theorem stepInstr_sub_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (hb : evalOperand st bOp = toLLVMVal w xb) :
     stepInstr mod_ fuel st (.sub dst flags w aOp bOp) =
       .inr (bindReg st dst (toLLVMVal w (LLVM.sub xa xb (toNoWrapFlags flags)))) := by
-  cases xa <;> cases xb <;> cases flags
+  rcases xa with ⟨none | va⟩ <;> rcases xb with ⟨none | vb⟩ <;> cases flags
   all_goals
-    simp [stepInstr, stepInstrWith, binResult, ha, hb, toLLVMVal, toNoWrapFlags,
-      LLVM.sub, LLVM.sub?, PoisonOr.bind, Bind.bind, Pure.pure, flagsOverflow,
-      subOverflowNSW_eq_ssubOverflow, subOverflowNUW_eq_usubOverflow]
-    try split_ifs <;> simp_all [toLLVMVal]
+    simp only [intW_mk_none, intW_mk_some] at ha hb ⊢
+    simp only [stepInstr, stepInstrWith, binResult, ha, hb, toLLVMVal, toNoWrapFlags,
+      LLVM.sub, LLVM.sub?, intW_bind_poison, intW_bind_value, flagsOverflow,
+      subOverflowNSW_eq_ssubOverflow, subOverflowNUW_eq_usubOverflow, ↓reduceDIte]
+    try (by_cases hs : BitVec.ssubOverflow va vb = true <;>
+         by_cases hu : BitVec.usubOverflow va vb = true <;>
+         simp [hs, hu])
 
 theorem stepInstr_mul_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (dst : RegName) (flags : OverflowFlags) (w : IntWidth) (aOp bOp : Operand)
@@ -563,12 +383,15 @@ theorem stepInstr_mul_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (hb : evalOperand st bOp = toLLVMVal w xb) :
     stepInstr mod_ fuel st (.mul dst flags w aOp bOp) =
       .inr (bindReg st dst (toLLVMVal w (LLVM.mul xa xb (toNoWrapFlags flags)))) := by
-  cases xa <;> cases xb <;> cases flags
+  rcases xa with ⟨none | va⟩ <;> rcases xb with ⟨none | vb⟩ <;> cases flags
   all_goals
-    simp [stepInstr, stepInstrWith, binResult, ha, hb, toLLVMVal, toNoWrapFlags,
-      LLVM.mul, LLVM.mul?, PoisonOr.bind, Bind.bind, Pure.pure, flagsOverflow,
-      mulOverflowNSW_eq_smulOverflow, mulOverflowNUW_eq_umulOverflow]
-    try split_ifs <;> simp_all [toLLVMVal]
+    simp only [intW_mk_none, intW_mk_some] at ha hb ⊢
+    simp only [stepInstr, stepInstrWith, binResult, ha, hb, toLLVMVal, toNoWrapFlags,
+      LLVM.mul, LLVM.mul?, intW_bind_poison, intW_bind_value, flagsOverflow,
+      mulOverflowNSW_eq_smulOverflow, mulOverflowNUW_eq_umulOverflow, ↓reduceDIte]
+    try (by_cases hs : BitVec.smulOverflow va vb = true <;>
+         by_cases hu : BitVec.umulOverflow va vb = true <;>
+         simp [hs, hu])
 
 theorem stepInstr_and_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (dst : RegName) (w : IntWidth) (aOp bOp : Operand)
@@ -577,9 +400,9 @@ theorem stepInstr_and_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (hb : evalOperand st bOp = toLLVMVal w xb) :
     stepInstr mod_ fuel st (.and_ dst w aOp bOp) =
       .inr (bindReg st dst (toLLVMVal w (LLVM.and xa xb))) := by
-  cases xa <;> cases xb <;>
+  rcases xa with ⟨none | va⟩ <;> rcases xb with ⟨none | vb⟩ <;>
     simp [stepInstr, stepInstrWith, binResult, ha, hb, toLLVMVal, LLVM.and, LLVM.and?,
-      PoisonOr.bind, Bind.bind, flagsOverflow]
+      flagsOverflow]
 
 theorem stepInstr_or_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (dst : RegName) (w : IntWidth) (aOp bOp : Operand)
@@ -588,9 +411,9 @@ theorem stepInstr_or_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (hb : evalOperand st bOp = toLLVMVal w xb) :
     stepInstr mod_ fuel st (.or_ dst w aOp bOp) =
       .inr (bindReg st dst (toLLVMVal w (LLVM.or xa xb { disjoint := false }))) := by
-  cases xa <;> cases xb <;>
+  rcases xa with ⟨none | va⟩ <;> rcases xb with ⟨none | vb⟩ <;>
     simp [stepInstr, stepInstrWith, binResult, ha, hb, toLLVMVal, LLVM.or, LLVM.or?,
-      PoisonOr.bind, Bind.bind, flagsOverflow]
+      flagsOverflow]
 
 theorem stepInstr_xor_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (dst : RegName) (w : IntWidth) (aOp bOp : Operand)
@@ -599,9 +422,9 @@ theorem stepInstr_xor_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (hb : evalOperand st bOp = toLLVMVal w xb) :
     stepInstr mod_ fuel st (.xor dst w aOp bOp) =
       .inr (bindReg st dst (toLLVMVal w (LLVM.xor xa xb))) := by
-  cases xa <;> cases xb <;>
+  rcases xa with ⟨none | va⟩ <;> rcases xb with ⟨none | vb⟩ <;>
     simp [stepInstr, stepInstrWith, binResult, ha, hb, toLLVMVal, LLVM.xor, LLVM.xor?,
-      PoisonOr.bind, Bind.bind, flagsOverflow]
+      flagsOverflow]
 
 theorem stepInstr_shl_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (dst : RegName) (flags : OverflowFlags) (w : IntWidth) (aOp bOp : Operand)
@@ -610,34 +433,42 @@ theorem stepInstr_shl_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (hb : evalOperand st bOp = toLLVMVal w xb) :
     stepInstr mod_ fuel st (.shl dst flags w aOp bOp) =
       .inr (bindReg st dst (toLLVMVal w (LLVM.shl xa xb (toNoWrapFlags flags)))) := by
-  cases xa with
-  | poison =>
-    cases xb <;>
-      simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal, LLVM.shl,
-        PoisonOr.bind, Bind.bind]
-  | value va =>
-    cases xb with
-    | poison =>
-      simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal, LLVM.shl,
-        PoisonOr.bind, Bind.bind]
-    | value vb =>
-      have h_ge_iff : (vb ≥ (w.bits : BitVec w.bits)) ↔ w.bits ≤ vb.toNat := by
-        simp [BitVec.le_def, BitVec.toNat_ofNat]
+  rcases xa with ⟨none | va⟩
+  · rcases xb with ⟨none | vb⟩ <;>
+      simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal, LLVM.shl]
+  · rcases xb with ⟨none | vb⟩
+    · simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal, LLVM.shl]
+    · simp only [intW_mk_some] at ha hb ⊢
+      have h_ge_iff : BitVec.ofNat w.bits w.bits ≤ vb ↔ w.bits ≤ vb.toNat := by
+        have hw_lt : w.bits < 2 ^ w.bits := by
+          have : ∀ k : Nat, k < 2 ^ k := fun k => by
+            induction k with
+            | zero => decide
+            | succ m ihm => simp [Nat.pow_succ]; omega
+          exact this w.bits
+        simp [BitVec.le_def, BitVec.toNat_ofNat, Nat.mod_eq_of_lt hw_lt]
       by_cases h_over : w.bits ≤ vb.toNat
-      · have h_bv_ge : vb ≥ (w.bits : BitVec w.bits) := h_ge_iff.mpr h_over
+      · have h_bv_ge : BitVec.ofNat w.bits w.bits ≤ vb := h_ge_iff.mpr h_over
+        have h_shl? : LLVM.shl? va vb = .poison := by
+          unfold LLVM.shl?
+          change (if BitVec.ofNat w.bits w.bits ≤ vb then PoisonOr.poison else PoisonOr.value (va <<< vb)) = PoisonOr.poison
+          simp [h_bv_ge]
+        have h_mlir : LLVM.shl (.value va) (.value vb) (toNoWrapFlags flags) = .poison := by
+          simp only [LLVM.shl, intW_bind_value, h_shl?, ite_self]
         cases flags <;>
-          simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal, toNoWrapFlags,
-            LLVM.shl, LLVM.shl?, PoisonOr.bind, Bind.bind, h_over, h_bv_ge] <;>
-          split_ifs <;> rfl
+          simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal, h_mlir, h_over]
       · have h_lt : vb.toNat < w.bits := Nat.lt_of_not_ge h_over
-        have h_not_ge : ¬(vb ≥ (w.bits : BitVec w.bits)) := fun hg => h_over (h_ge_iff.mp hg)
+        have h_not_ge : ¬(BitVec.ofNat w.bits w.bits ≤ vb) := fun hg => h_over (h_ge_iff.mp hg)
+        have h_shl? : LLVM.shl? va vb = .value (va <<< vb) := by
+          unfold LLVM.shl?
+          change (if BitVec.ofNat w.bits w.bits ≤ vb then PoisonOr.poison else PoisonOr.value (va <<< vb)) = PoisonOr.value (va <<< vb)
+          simp [h_not_ge]
         have h_nsw := shlOverflowNSW_eq_mlir w va vb h_lt
-        have h_sh_eq : (va <<< vb : BitVec w.bits) = va <<< vb.toNat := rfl
         cases flags <;>
+          by_cases h1 : (va <<< vb.toNat).sshiftRight vb.toNat = va <;>
+          by_cases h2 : (va <<< vb.toNat) >>> vb.toNat = va <;>
           simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal, toNoWrapFlags,
-            LLVM.shl, LLVM.shl?, PoisonOr.bind, Bind.bind, h_over, h_not_ge,
-            flagsOverflow, h_nsw, shlOverflowNUW] <;>
-          split_ifs <;> simp_all [toLLVMVal]
+            LLVM.shl, h_shl?, h_over, flagsOverflow, h_nsw, shlOverflowNUW, h1, h2]
 
 theorem stepInstr_lshr_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (dst : RegName) (exact : Bool) (w : IntWidth) (aOp bOp : Operand)
@@ -646,33 +477,41 @@ theorem stepInstr_lshr_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (hb : evalOperand st bOp = toLLVMVal w xb) :
     stepInstr mod_ fuel st (.lshr dst exact w aOp bOp) =
       .inr (bindReg st dst (toLLVMVal w (LLVM.lshr xa xb { exact := exact }))) := by
-  cases xa with
-  | poison =>
-    cases xb <;>
-      simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal, LLVM.lshr,
-        PoisonOr.bind, Bind.bind]
-  | value va =>
-    cases xb with
-    | poison =>
-      simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal, LLVM.lshr,
-        PoisonOr.bind, Bind.bind]
-    | value vb =>
-      have h_ge_iff : (vb ≥ (w.bits : BitVec w.bits)) ↔ w.bits ≤ vb.toNat := by
-        simp [BitVec.le_def, BitVec.toNat_ofNat]
+  rcases xa with ⟨none | va⟩
+  · rcases xb with ⟨none | vb⟩ <;>
+      simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal, LLVM.lshr]
+  · rcases xb with ⟨none | vb⟩
+    · simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal, LLVM.lshr]
+    · simp only [intW_mk_some] at ha hb ⊢
+      have h_ge_iff : BitVec.ofNat w.bits w.bits ≤ vb ↔ w.bits ≤ vb.toNat := by
+        have hw_lt : w.bits < 2 ^ w.bits := by
+          have : ∀ k : Nat, k < 2 ^ k := fun k => by
+            induction k with
+            | zero => decide
+            | succ m ihm => simp [Nat.pow_succ]; omega
+          exact this w.bits
+        simp [BitVec.le_def, BitVec.toNat_ofNat, Nat.mod_eq_of_lt hw_lt]
       by_cases h_over : w.bits ≤ vb.toNat
-      · have h_bv_ge : vb ≥ (w.bits : BitVec w.bits) := h_ge_iff.mpr h_over
+      · have h_bv_ge : BitVec.ofNat w.bits w.bits ≤ vb := h_ge_iff.mpr h_over
+        have h_lshr? : LLVM.lshr? va vb = .poison := by
+          unfold LLVM.lshr?
+          change (if BitVec.ofNat w.bits w.bits ≤ vb then PoisonOr.poison else PoisonOr.value (va >>> vb)) = PoisonOr.poison
+          simp [h_bv_ge]
+        have h_mlir : LLVM.lshr (.value va) (.value vb) { exact := exact } = .poison := by
+          simp only [LLVM.lshr, intW_bind_value, h_lshr?, ite_self]
         cases exact <;>
-          simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal,
-            LLVM.lshr, LLVM.lshr?, PoisonOr.bind, Bind.bind, h_over, h_bv_ge] <;>
-          split_ifs <;> rfl
+          simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal, h_mlir, h_over]
       · have h_lt : vb.toNat < w.bits := Nat.lt_of_not_ge h_over
-        have h_not_ge : ¬(vb ≥ (w.bits : BitVec w.bits)) := fun hg => h_over (h_ge_iff.mp hg)
+        have h_not_ge : ¬(BitVec.ofNat w.bits w.bits ≤ vb) := fun hg => h_over (h_ge_iff.mp hg)
+        have h_lshr? : LLVM.lshr? va vb = .value (va >>> vb) := by
+          unfold LLVM.lshr?
+          change (if BitVec.ofNat w.bits w.bits ≤ vb then PoisonOr.poison else PoisonOr.value (va >>> vb)) = PoisonOr.value (va >>> vb)
+          simp [h_not_ge]
         have h_ex := shiftedOut_iff_ushift_roundtrip w va vb h_lt
         cases exact <;>
+          by_cases hrt : (va >>> vb.toNat) <<< vb.toNat = va <;>
           simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal,
-            LLVM.lshr, LLVM.lshr?, PoisonOr.bind, Bind.bind, h_over, h_not_ge,
-            flagsOverflow, h_ex] <;>
-          split_ifs <;> simp_all [toLLVMVal]
+            LLVM.lshr, h_lshr?, h_over, flagsOverflow, h_ex, hrt]
 
 theorem stepInstr_ashr_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (dst : RegName) (exact : Bool) (w : IntWidth) (aOp bOp : Operand)
@@ -681,34 +520,41 @@ theorem stepInstr_ashr_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (hb : evalOperand st bOp = toLLVMVal w xb) :
     stepInstr mod_ fuel st (.ashr dst exact w aOp bOp) =
       .inr (bindReg st dst (toLLVMVal w (LLVM.ashr xa xb { exact := exact }))) := by
-  cases xa with
-  | poison =>
-    cases xb <;>
-      simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal, LLVM.ashr,
-        PoisonOr.bind, Bind.bind]
-  | value va =>
-    cases xb with
-    | poison =>
-      simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal, LLVM.ashr,
-        PoisonOr.bind, Bind.bind]
-    | value vb =>
-      have h_ge_iff : (vb ≥ (w.bits : BitVec w.bits)) ↔ w.bits ≤ vb.toNat := by
-        simp [BitVec.le_def, BitVec.toNat_ofNat]
+  rcases xa with ⟨none | va⟩
+  · rcases xb with ⟨none | vb⟩ <;>
+      simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal, LLVM.ashr]
+  · rcases xb with ⟨none | vb⟩
+    · simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal, LLVM.ashr]
+    · simp only [intW_mk_some] at ha hb ⊢
+      have h_ge_iff : BitVec.ofNat w.bits w.bits ≤ vb ↔ w.bits ≤ vb.toNat := by
+        have hw_lt : w.bits < 2 ^ w.bits := by
+          have : ∀ k : Nat, k < 2 ^ k := fun k => by
+            induction k with
+            | zero => decide
+            | succ m ihm => simp [Nat.pow_succ]; omega
+          exact this w.bits
+        simp [BitVec.le_def, BitVec.toNat_ofNat, Nat.mod_eq_of_lt hw_lt]
       by_cases h_over : w.bits ≤ vb.toNat
-      · have h_bv_ge : vb ≥ (w.bits : BitVec w.bits) := h_ge_iff.mpr h_over
+      · have h_bv_ge : BitVec.ofNat w.bits w.bits ≤ vb := h_ge_iff.mpr h_over
+        have h_ashr? : LLVM.ashr? va vb = .poison := by
+          unfold LLVM.ashr?
+          change (if BitVec.ofNat w.bits w.bits ≤ vb then PoisonOr.poison else PoisonOr.value (va.sshiftRight' vb)) = PoisonOr.poison
+          simp [h_bv_ge]
+        have h_mlir : LLVM.ashr (.value va) (.value vb) { exact := exact } = .poison := by
+          simp only [LLVM.ashr, intW_bind_value, h_ashr?, ite_self]
         cases exact <;>
-          simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal,
-            LLVM.ashr, LLVM.ashr?, PoisonOr.bind, Bind.bind, h_over, h_bv_ge] <;>
-          split_ifs <;> rfl
+          simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal, h_mlir, h_over]
       · have h_lt : vb.toNat < w.bits := Nat.lt_of_not_ge h_over
-        have h_not_ge : ¬(vb ≥ (w.bits : BitVec w.bits)) := fun hg => h_over (h_ge_iff.mp hg)
+        have h_not_ge : ¬(BitVec.ofNat w.bits w.bits ≤ vb) := fun hg => h_over (h_ge_iff.mp hg)
+        have h_ashr? : LLVM.ashr? va vb = .value (va.sshiftRight vb.toNat) := by
+          unfold LLVM.ashr?
+          change (if BitVec.ofNat w.bits w.bits ≤ vb then PoisonOr.poison else PoisonOr.value (va.sshiftRight' vb)) = PoisonOr.value (va.sshiftRight vb.toNat)
+          simp [h_not_ge, BitVec.sshiftRight_eq']
         have h_ex := shiftedOut_iff_ushift_roundtrip w va vb h_lt
-        have h_ashr_eq : va.sshiftRight vb.toNat = va.sshiftRight' vb := rfl
         cases exact <;>
+          by_cases hrt : (va >>> vb.toNat) <<< vb.toNat = va <;>
           simp [stepInstr, stepInstrWith, shiftResult, ha, hb, toLLVMVal,
-            LLVM.ashr, LLVM.ashr?, PoisonOr.bind, Bind.bind, h_over, h_not_ge,
-            flagsOverflow, h_ex, h_ashr_eq] <;>
-          split_ifs <;> simp_all [toLLVMVal]
+            LLVM.ashr, h_ashr?, h_over, flagsOverflow, h_ex, hrt]
 
 theorem stepInstr_icmp_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (dst : RegName) (pred : ICmpPred) (w : IntWidth) (aOp bOp : Operand)
@@ -717,17 +563,14 @@ theorem stepInstr_icmp_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (hb : evalOperand st bOp = toLLVMVal w xb) :
     stepInstr mod_ fuel st (.icmp dst pred (.int w) aOp bOp) =
       .inr (bindReg st dst (toLLVMVal .i1 (LLVM.icmp (toIntPred pred) xa xb))) := by
-  cases xa with
-  | poison =>
-    cases xb <;>
-      simp [stepInstr, stepInstrWith, ha, hb, toLLVMVal, LLVM.icmp, PoisonOr.bind, Bind.bind]
-  | value va =>
-    cases xb with
-    | poison =>
-      simp [stepInstr, stepInstrWith, ha, hb, toLLVMVal, LLVM.icmp, PoisonOr.bind, Bind.bind]
-    | value vb =>
-      simp [stepInstr, stepInstrWith, ha, hb, toLLVMVal, LLVM.icmp, LLVM.icmp?,
-        PoisonOr.bind, Bind.bind, icmpEval_eq_mlir, IntWidth.bits]
+  rcases xa with ⟨none | va⟩
+  · rcases xb with ⟨none | vb⟩ <;>
+      simp [stepInstr, stepInstrWith, ha, hb, toLLVMVal, LLVM.icmp]
+  · rcases xb with ⟨none | vb⟩
+    · simp [stepInstr, stepInstrWith, ha, hb, toLLVMVal, LLVM.icmp]
+    · simp only [intW_mk_some] at ha hb ⊢
+      simp only [stepInstr, stepInstrWith, ha, hb, toLLVMVal, LLVM.icmp, LLVM.icmp?,
+        intW_bind_value, icmpEval_eq_mlir, ↓reduceDIte]
       cases LLVM.icmp' (toIntPred pred) va vb <;> rfl
 
 theorem stepInstr_select_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
@@ -738,14 +581,13 @@ theorem stepInstr_select_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (he : evalTypedOperand st (.int w) eOp = toLLVMVal w xe) :
     stepInstr mod_ fuel st (.select dst condOp (.int w) tOp eOp) =
       .inr (bindReg st dst (toLLVMVal w (LLVM.select xc xt xe))) := by
-  cases xc with
-  | poison =>
-    simp [stepInstr, stepInstrWith, hc, toLLVMVal, LLVM.select, PoisonOr.bind, Bind.bind]
-  | value c =>
+  rcases xc with ⟨none | c⟩
+  · simp [stepInstr, stepInstrWith, hc, toLLVMVal, LLVM.select]
+  · simp only [intW_mk_some] at hc ⊢
     by_cases hc1 : c = 1#1
     · subst hc1
-      simp [stepInstr, stepInstrWith, hc, ht, toLLVMVal, LLVM.select, PoisonOr.bind, Bind.bind]
-    · simp [stepInstr, stepInstrWith, hc, he, hc1, toLLVMVal, LLVM.select, PoisonOr.bind, Bind.bind]
+      simp [stepInstr, stepInstrWith, hc, ht, toLLVMVal, LLVM.select]
+    · simp [stepInstr, stepInstrWith, hc, he, hc1, toLLVMVal, LLVM.select]
 
 theorem stepInstr_zext_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (dst : RegName) (srcW dstW : IntWidth) (op : Operand)
@@ -754,9 +596,8 @@ theorem stepInstr_zext_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (hx : evalOperand st op = toLLVMVal srcW x) :
     stepInstr mod_ fuel st (.zext dst srcW op dstW) =
       .inr (bindReg st dst (toLLVMVal dstW (LLVM.zext dstW.bits x { nneg := false }))) := by
-  cases x <;>
-    simp [stepInstr, stepInstrWith, hx, h_le, toLLVMVal, LLVM.zext, LLVM.zext?,
-      PoisonOr.bind, Bind.bind]
+  rcases x with ⟨none | v⟩ <;>
+    simp [stepInstr, stepInstrWith, hx, h_le, toLLVMVal, LLVM.zext, LLVM.zext?]
 
 theorem stepInstr_sext_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (dst : RegName) (srcW dstW : IntWidth) (op : Operand)
@@ -765,9 +606,8 @@ theorem stepInstr_sext_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (hx : evalOperand st op = toLLVMVal srcW x) :
     stepInstr mod_ fuel st (.sext dst srcW op dstW) =
       .inr (bindReg st dst (toLLVMVal dstW (LLVM.sext dstW.bits x))) := by
-  cases x <;>
-    simp [stepInstr, stepInstrWith, hx, h_le, toLLVMVal, LLVM.sext, LLVM.sext?,
-      PoisonOr.bind, Bind.bind]
+  rcases x with ⟨none | v⟩ <;>
+    simp [stepInstr, stepInstrWith, hx, h_le, toLLVMVal, LLVM.sext, LLVM.sext?]
 
 theorem stepInstr_trunc_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (dst : RegName) (srcW dstW : IntWidth) (op : Operand)
@@ -776,9 +616,8 @@ theorem stepInstr_trunc_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (hx : evalOperand st op = toLLVMVal srcW x) :
     stepInstr mod_ fuel st (.trunc dst srcW op dstW) =
       .inr (bindReg st dst (toLLVMVal dstW (LLVM.trunc dstW.bits x { nsw := false, nuw := false }))) := by
-  cases x <;>
-    simp [stepInstr, stepInstrWith, hx, h_le, toLLVMVal, LLVM.trunc, LLVM.trunc?,
-      PoisonOr.bind, Bind.bind]
+  rcases x with ⟨none | v⟩ <;>
+    simp [stepInstr, stepInstrWith, hx, h_le, toLLVMVal, LLVM.trunc, LLVM.trunc?]
 
 /-! ## Exact UB-vs-Poison Boundary for Division and Remainder -/
 
@@ -798,24 +637,24 @@ theorem stepInstr_udiv_ub_or_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecSt
       else
         stepInstr mod_ fuel st (.udiv dst exact w aOp bOp) =
           .inr (bindReg st dst (toLLVMVal w (LLVM.udiv xa (.value vb) { exact := exact }))) := by
-  cases xb with
-  | poison =>
-    simp [stepInstr, stepInstrWith, divOrRem, hb, toLLVMVal]
-  | value vb =>
+  rcases xb with ⟨none | vb⟩
+  · simp [stepInstr, stepInstrWith, divOrRem, hb, toLLVMVal]
+  · simp only [intW_mk_some] at hb ⊢
     by_cases h0 : vb = 0#w.bits
     · subst h0
       simp [stepInstr, stepInstrWith, divOrRem, hb, toLLVMVal]
     · simp only [h0, ↓reduceIte]
-      cases xa with
-      | poison =>
-        simp [stepInstr, stepInstrWith, divOrRem, ha, hb, h0, toLLVMVal,
-          LLVM.udiv, PoisonOr.bind, Bind.bind]
-      | value va =>
-        have h_umod : va.umod vb = va % vb := rfl
+      rcases xa with ⟨none | va⟩
+      · simp [stepInstr, stepInstrWith, divOrRem, ha, hb, h0, toLLVMVal, LLVM.udiv]
+      · simp only [intW_mk_some] at ha ⊢
+        have h_udiv? : LLVM.udiv? va vb = .value (va / vb) := by
+          unfold LLVM.udiv?
+          change (if vb = 0#w.bits then PoisonOr.poison else PoisonOr.value (va / vb)) = PoisonOr.value (va / vb)
+          simp [h0]
         cases exact <;>
+          by_cases hm : va % vb = 0#w.bits <;>
           simp [stepInstr, stepInstrWith, divOrRem, ha, hb, h0, toLLVMVal,
-            LLVM.udiv, LLVM.udiv?, PoisonOr.bind, Bind.bind, h_umod] <;>
-          split_ifs <;> simp_all [toLLVMVal]
+            LLVM.udiv, h_udiv?, BitVec.umod_eq, hm]
 
 /-- `urem`: `LLVMAst.stepInstr` raises `.ub` iff divisor is poison or `0`, and otherwise coincides
 bit-for-bit with `opencompl/lean-mlir`'s `LLVM.urem`. -/
@@ -833,17 +672,20 @@ theorem stepInstr_urem_ub_or_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecSt
       else
         stepInstr mod_ fuel st (.urem dst w aOp bOp) =
           .inr (bindReg st dst (toLLVMVal w (LLVM.urem xa (.value vb)))) := by
-  cases xb with
-  | poison =>
-    simp [stepInstr, stepInstrWith, divOrRem, hb, toLLVMVal]
-  | value vb =>
+  rcases xb with ⟨none | vb⟩
+  · simp [stepInstr, stepInstrWith, divOrRem, hb, toLLVMVal]
+  · simp only [intW_mk_some] at hb ⊢
     by_cases h0 : vb = 0#w.bits
     · subst h0
       simp [stepInstr, stepInstrWith, divOrRem, hb, toLLVMVal]
     · simp only [h0, ↓reduceIte]
-      cases xa <;>
-        simp [stepInstr, stepInstrWith, divOrRem, ha, hb, h0, toLLVMVal,
-          LLVM.urem, LLVM.urem?, PoisonOr.bind, Bind.bind]
+      rcases xa with ⟨none | va⟩ <;>
+        simp [stepInstr, stepInstrWith, divOrRem, ha, hb, h0, toLLVMVal, LLVM.urem, LLVM.urem?]
+
+private theorem smod_eq_zero_iff_srem_eq_zero {n : Nat} (a b : BitVec n) :
+    (a.smod b = 0#n) ↔ (a.srem b = 0#n) := by
+  rw [← BitVec.toInt_inj, ← BitVec.toInt_inj, BitVec.toInt_smod, BitVec.toInt_srem,
+    BitVec.toInt_zero, ← Int.dvd_iff_fmod_eq_zero, ← Int.dvd_iff_tmod_eq_zero]
 
 /-- `sdiv` on concrete widths `w ≠ .i1` without UB (`vb ≠ 0` and not `INT_MIN / -1`) coincides
 bit-for-bit with `opencompl/lean-mlir`'s `LLVM.sdiv`. -/
@@ -857,31 +699,48 @@ theorem stepInstr_sdiv_bisim_of_non_ub (mod_ : LLVMModule) (fuel : Nat) (st : Ex
     (hb : evalOperand st bOp = .bits w vb) :
     stepInstr mod_ fuel st (.sdiv dst exact w aOp bOp) =
       .inr (bindReg st dst (toLLVMVal w (LLVM.sdiv (.value va) (.value vb) { exact := exact }))) := by
+  have hpos : 0 < w.bits := w.bits_pos
+  have hw2 : 1 < w.bits := by omega
   have h_intMin : ¬(va = BitVec.intMin w.bits ∧ vb = -1) := by
     rintro ⟨hmin, hm1⟩
     unfold sdivOverflow at hno_ov
     rw [bvSigned_eq_toInt, bvSigned_eq_toInt] at hno_ov
-    have hpos : 1 < w.bits := by have := w.bits_pos; omega
     have hva_int : va.toInt = -((2 : Int) ^ (w.bits - 1)) := by
       subst hmin
-      simpa using BitVec.toInt_intMin (w := w.bits)
+      have h2w : 2 ^ w.bits = 2 * 2 ^ (w.bits - 1) := two_pow_eq_two_mul_pred w.bits hpos
+      have hp : 0 < 2 ^ (w.bits - 1) := two_pow_pos_nat (w.bits - 1)
+      have hlt : 2 ^ (w.bits - 1) < 2 ^ w.bits := by omega
+      rw [BitVec.toInt_intMin, Nat.mod_eq_of_lt hlt, int_two_pow_eq_natCast]
     have hvb_int : vb.toInt = -1 := by
       subst hm1
-      exact BitVec.toInt_neg_one (by omega)
+      have h2w : 2 ^ w.bits = 2 * 2 ^ (w.bits - 1) := two_pow_eq_two_mul_pred w.bits hpos
+      have hp1 : 1 < 2 ^ (w.bits - 1) := by
+        cases hwb : w.bits - 1 with
+        | zero => omega
+        | succ k =>
+          have := two_pow_pos_nat k
+          simp [Nat.pow_succ]; omega
+      have hone : (1 : BitVec w.bits).toInt = 1 := BitVec.toInt_one hw2
+      rw [BitVec.toInt_neg, hone]
+      apply Int.bmod_eq_of_le <;> omega
     simp [hva_int, hvb_int] at hno_ov
-  have h_smod : va.smod vb = BitVec.srem va vb := rfl
-  have h_not_mlir_ov : (vb == 0 || (decide (w.bits ≠ 1) && va == BitVec.intMin w.bits && vb == -1)) = false := by
-    simp only [Bool.or_eq_false_iff, beq_eq_false_iff_ne, ne_eq, Bool.and_eq_false_iff,
-      decide_eq_true_eq]
-    refine ⟨hb0, ?_⟩
-    by_cases h1 : va = BitVec.intMin w.bits
-    · right; intro h2; exact h_intMin ⟨h1, h2⟩
-    · left; right; exact h1
+  have h_sdiv? : LLVM.sdiv? va vb = .value (va.sdiv vb) := by
+    unfold LLVM.sdiv?
+    have hcond : (vb == 0 || (w.bits != 1 && va == BitVec.intMin w.bits && vb == -1)) = false := by
+      simp only [Bool.or_eq_false_iff, beq_eq_false_iff_ne, ne_eq, Bool.and_eq_false_iff,
+        bne_eq_false_iff_eq]
+      refine ⟨hb0, ?_⟩
+      by_cases h1 : va = BitVec.intMin w.bits
+      · right; intro h2; exact h_intMin ⟨h1, h2⟩
+      · left; right; exact h1
+    rw [hcond]
+    rfl
+  have h_smod_iff : (va.smod vb = 0#w.bits) ↔ (va.srem vb = 0#w.bits) :=
+    smod_eq_zero_iff_srem_eq_zero va vb
   cases exact <;>
+    by_cases hsr : va.srem vb = 0#w.bits <;>
     simp [stepInstr, stepInstrWith, divOrRem, ha, hb, hb0, hno_ov, toLLVMVal,
-      LLVM.sdiv, LLVM.sdiv?, PoisonOr.bind, Bind.bind, bvSDiv_eq_sdiv, bvSRem_eq_srem,
-      h_smod, h_not_mlir_ov] <;>
-    split_ifs <;> simp_all [toLLVMVal]
+      LLVM.sdiv, h_sdiv?, bvSDiv_eq_sdiv, bvSRem_eq_srem, h_smod_iff, hsr]
 
 /-! ## Dialect-Level Bridge (`InstCombine.Op.denote` over `LLVM.Op` / `MOp 0`) -/
 
@@ -945,7 +804,8 @@ theorem execInstrs_of_straightLineBisim {mod_ : LLVMModule} {fuel : Nat}
   induction h with
   | nil st => rfl
   | cons h_step _ ih =>
-    unfold execInstrs execInstrsWith at *
+    unfold execInstrs at *
+    simp only [execInstrsWith]
     unfold stepInstr at h_step
     rw [h_step]
     exact ih

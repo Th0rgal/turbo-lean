@@ -35,6 +35,16 @@ SUMMARY_CORRECT_RE = re.compile(r"^\s*(\d+)\s+correct transformations?\b", re.M)
 SUMMARY_INCORRECT_RE = re.compile(r"^\s*(\d+)\s+incorrect transformations?\b", re.M)
 SUMMARY_FAILED_RE = re.compile(r"^\s*(\d+)\s+failed-to-prove transformations?\b", re.M)
 SUMMARY_ALIVE_ERR_RE = re.compile(r"^\s*(\d+)\s+Alive2 errors?\b", re.M)
+USER_FN_DEF_RE = re.compile(r"^define\s+dso_local\b[^\n]*?@([A-Za-z0-9_.$]+)\s*\(", re.M)
+
+
+def extract_user_functions(ir_text: str) -> list[str]:
+    """Extract compiled LNIR user/ABI function names (`define dso_local ... @fn(`),
+    skipping `define weak_odr dso_local` runtime/atomic/intrinsics helpers."""
+    seen: dict[str, None] = {}
+    for m in USER_FN_DEF_RE.finditer(ir_text):
+        seen.setdefault(m.group(1), None)
+    return list(seen.keys())
 
 
 def find_tool(names: list[str]) -> str | None:
@@ -73,8 +83,10 @@ def parse_alive_tv_output(stdout: str, stderr: str, returncode: int) -> dict[str
     )
     rejected = (
         errors == 0
-        and returncode != 0
-        and (incorrect >= 1 or "Transformation doesn't verify!" in combined)
+        and failed == 0
+        and m_inc is not None
+        and incorrect >= 1
+        and "Transformation doesn't verify!" in combined
     )
     return {
         "returncode": returncode,
@@ -249,11 +261,28 @@ def run_suite(core_bin: Path, alive_tv: str, opt_bin: str) -> dict[str, Any]:
             )
             # Pipeline -O0 vs -O3 lowers pure LNIR functions whose ABI entry points receive
             # well-defined scalar/pointer arguments from the Lean runtime/C-ABI boundary.
-            res = run_alive_pair(alive_tv, src_ll, tgt_ll, disable_undef_input=True)
+            # Scope `--func` to compiled user/ABI functions (`define dso_local ...`) so
+            # `weak_odr` runtime helpers (`atomicrmw`, `@llvm.trap`, `@llvm.vscale`) are not parsed.
+            src_fns = extract_user_functions(src_ll.read_text(encoding="utf-8"))
+            tgt_fns = set(extract_user_functions(tgt_ll.read_text(encoding="utf-8")))
+            shared_fns = [fn for fn in src_fns if fn in tgt_fns]
+            if not shared_fns:
+                raise RuntimeError(f"No user functions found in {label}")
+            fn_flags = [f"--func={fn}" for fn in shared_fns]
+            res = run_alive_pair(
+                alive_tv,
+                src_ll,
+                tgt_ll,
+                extra_flags=fn_flags,
+                disable_undef_input=True,
+            )
             res["id"] = label
+            res["checked_functions"] = shared_fns
             positive_results.append(res)
 
         # 2. Lowered LNIR -> LLVMAst modules vs LLVM `opt -passes='default<O2>'`
+        # `LLVMAst.Eval` models `PoisonOr Val` (determined bitvectors + poison, without `undef`),
+        # matching `compile-llvm`'s `noundef` ABI boundary via `--disable-undef-input`.
         for item in fixtures["loweredPositives"]:
             pid = f"opt_O2_{item['id']}"
             src_ll = tmp / f"{pid}_src.ll"
@@ -265,7 +294,7 @@ def run_suite(core_bin: Path, alive_tv: str, opt_bin: str) -> dict[str, Any]:
                 capture_output=True,
                 text=True,
             )
-            res = run_alive_pair(alive_tv, src_ll, tgt_ll)
+            res = run_alive_pair(alive_tv, src_ll, tgt_ll, disable_undef_input=True)
             res["id"] = pid
             positive_results.append(res)
 
@@ -276,7 +305,7 @@ def run_suite(core_bin: Path, alive_tv: str, opt_bin: str) -> dict[str, Any]:
             tgt_ll = tmp / f"{mid}_tgt.ll"
             src_ll.write_text(mut["srcIr"], encoding="utf-8")
             tgt_ll.write_text(mut["tgtIr"], encoding="utf-8")
-            res = run_alive_pair(alive_tv, src_ll, tgt_ll)
+            res = run_alive_pair(alive_tv, src_ll, tgt_ll, disable_undef_input=True)
             res["id"] = mid
             res["description"] = mut["description"]
             negative_results.append(res)
@@ -338,10 +367,22 @@ Summary:
   0 failed-to-prove transformations
   0 Alive2 errors
 """
-        d = parse_alive_tv_output(sample_bad, "", 1)
-        self.assertFalse(d["verified"])
-        self.assertTrue(d["rejected"])
-        self.assertEqual(d["incorrect"], 1)
+        for rc in (0, 1):
+            d = parse_alive_tv_output(sample_bad, "", rc)
+            self.assertFalse(d["verified"])
+            self.assertTrue(d["rejected"])
+            self.assertEqual(d["incorrect"], 1)
+
+    def test_extract_user_functions_skips_weak_odr_helpers(self) -> None:
+        sample_ir = (
+            "define weak_odr dso_local void @lean_inc_ref_n(ptr %obj, i64 %n) #0 {\n"
+            "define dso_local i64 @collatz_steps(i64 noundef %v0, i64 noundef %v1) #0 {\n"
+            "define dso_local ptr @lean_native_abi_collatz_steps(ptr %a, ptr %b) #0 {\n"
+        )
+        self.assertEqual(
+            extract_user_functions(sample_ir),
+            ["collatz_steps", "lean_native_abi_collatz_steps"],
+        )
 
     def test_parse_error_is_not_clean_rejection(self) -> None:
         sample_err = """

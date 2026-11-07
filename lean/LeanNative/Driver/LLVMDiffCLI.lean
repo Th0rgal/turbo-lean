@@ -387,7 +387,8 @@ def buildAlive2MutantFixturesJson : Json :=
     [ ("M1_sub_swap", "swapped sub operands", f1, mutantM1)
     , ("M2_shl_as_lshr", "shl lowered as lshr", f2, mutantM2)
     , ("M3_ult64_as_ule64", "ult i64 relaxed to ule i64", f3, mutantM3)
-    , ("M4_ult256_as_ule256", "ult i256 relaxed to ule i256", specUlt256Fn, mutantM4)
+    , ("M4_ult256_as_ule256", "ult i256 relaxed to ule i256",
+        { specUlt256Fn with name := "mutant_m4_ult256_as_ule256" }, mutantM4)
     , ("M5_udiv_unguarded", "unguarded udiv UB on zero divisor",
         { specUdivGuardFn with name := "mutant_m5_udiv_unguarded" }, mutantM5) ]
   let loweredPositives : List Json :=
