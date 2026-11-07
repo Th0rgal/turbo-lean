@@ -1189,6 +1189,7 @@ theorem parsePTXInstr_modified_binary_roundtrip (opcode modifier : String) (ty :
     rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
   have hop_not_selp : (opcode == "selp") = false := by
     rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hhead : parts.head? = some opcode := rfl
   simp only [String.toList_append, List.append_assoc] at ht
   conv =>
     lhs
@@ -1198,8 +1199,7 @@ theorem parsePTXInstr_modified_binary_roundtrip (opcode modifier : String) (ty :
   simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
     Bool.false_eq_true, ↓reduceIte, stripPrefixChars, beq_self_eq_true]
   rw [hparts]
-  dsimp only [parts, List.head?_cons]
-  simp only [hlast, parsePTXType_suffix, hmods,
+  simp only [hhead, hlast, parsePTXType_suffix, hmods,
     hop_not_st, hop_not_ld, hop_not_cvta, hop_not_cvt, hop_allow, Bool.not_true, Bool.false_and,
     hd, ha, hb, hop_not_selp, stripPrefixChars, beq_self_eq_true, bind, Option.bind, pure, ↓reduceIte, Bool.false_eq_true]
   rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩ | ⟨cmp, rfl, rfl, rfl⟩
@@ -1322,6 +1322,7 @@ theorem parsePTXInstr_ternary_roundtrip (opcode modifier : String) (ty : PTXType
     rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
   have hop_not_setp : (opcode == "setp") = false := by
     rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hhead : parts.head? = some opcode := rfl
   simp only [String.toList_append, List.append_assoc] at ht
   conv =>
     lhs
@@ -1331,8 +1332,7 @@ theorem parsePTXInstr_ternary_roundtrip (opcode modifier : String) (ty : PTXType
   simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
     Bool.false_eq_true, ↓reduceIte, stripPrefixChars, beq_self_eq_true]
   rw [hparts]
-  dsimp only [parts, List.head?_cons]
-  simp only [hlast, parsePTXType_suffix, hmods,
+  simp only [hhead, hlast, parsePTXType_suffix, hmods,
     hop_not_st, hop_not_ld, hop_not_cvta, hop_not_cvt, hop_allow, Bool.not_true, Bool.false_and,
     hd, ha, hb, hc, hop_not_selp, hop_not_setp, stripPrefixChars, beq_self_eq_true, bind, Option.bind, pure, ↓reduceIte, Bool.false_eq_true]
   rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩
@@ -1380,6 +1380,7 @@ theorem parsePTXInstr_cvt_roundtrip (rm : PTXRoundMode) (dt st : PTXType)
     cases rm <;> rfl
   have hdt : parsePTXType (fuel + 1) ('.' :: (ppPTXType dt).toList.drop 1) = some (dt, []) := by
     cases dt <;> rfl
+  have hhead : parts.head? = some "cvt" := rfl
   simp only [String.toList_append, String.reduceToList, List.append_assoc,
     List.cons_append, List.nil_append] at ht
   conv =>
@@ -1390,8 +1391,7 @@ theorem parsePTXInstr_cvt_roundtrip (rm : PTXRoundMode) (dt st : PTXType)
   simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
     Bool.false_eq_true, ↓reduceIte, stripPrefixChars, beq_self_eq_true]
   rw [hfields]
-  dsimp only [parts, List.head?_cons]
-  simp only [hlast, stTok, parsePTXType_suffix, hmods,
+  simp only [hhead, hlast, stTok, parsePTXType_suffix, hmods,
     show ("cvt" == "st") = false from rfl, show ("cvt" == "ld") = false from rfl,
     show ("cvt" == "cvta") = false from rfl, show ("cvt" == "cvt") = true from rfl,
     hd, hs, stripPrefixChars, beq_self_eq_true, bind, Option.bind, pure, ↓reduceIte, Bool.false_eq_true]
