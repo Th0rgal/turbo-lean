@@ -2236,7 +2236,8 @@ fn update_hasher_lean_options(h: &mut blake3::Hasher, opts: &LeanOptionsMap) {
 
 fn compute_package_config_digest(pkg: &PackageConfig, raw_config_hash: &str) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean-pkg-config-v4\n");
+    h.update(b"turbo-lean-pkg-config-v5\n");
+    update_hasher_lp(&mut h, crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
     update_hasher_lp(&mut h, pkg.name.as_bytes());
     update_hasher_lp(&mut h, pkg.base_name.as_bytes());
     update_hasher_lp(&mut h, pkg.config_file_kind.as_bytes());
@@ -7256,7 +7257,8 @@ pub fn resolve_project_config_with_trust(
         }
     }
     let mut ch = blake3::Hasher::new();
-    ch.update(b"turbo-lean-project-config-v2\n");
+    ch.update(b"turbo-lean-project-config-v3\n");
+    update_hasher_lp(&mut ch, crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
     update_hasher_lp(&mut ch, toolchain.as_bytes());
     update_hasher_lp(&mut ch, lean_githash.as_bytes());
     update_hasher_lp(&mut ch, root_pkg.config_digest.as_bytes());
@@ -9113,10 +9115,7 @@ fn build_expected_lake_module_inputs_value(
                 .iter()
                 .filter_map(|n| pkg.inputs.iter().find(|i| &i.name == n))
                 .map(|i| {
-                    serde_json::json!([
-                        pkg.pkg_root.join(&i.path).to_string_lossy(),
-                        i.lake_hash
-                    ])
+                    serde_json::json!([pkg.pkg_root.join(&i.path).to_string_lossy(), i.lake_hash])
                 }),
         );
     }
@@ -9404,10 +9403,7 @@ fn spec_in_clean_git_pinned_manifest_package(
                 return None;
             }
             let mut dirty = HashSet::new();
-            let mut entries = st_out
-                .stdout
-                .split(|&b| b == 0)
-                .filter(|s| !s.is_empty());
+            let mut entries = st_out.stdout.split(|&b| b == 0).filter(|s| !s.is_empty());
             while let Some(rec) = entries.next() {
                 if rec.len() < 4 {
                     dirty.insert(spec_canon.clone());
@@ -10045,7 +10041,10 @@ fn lake_closure_export_info_inner(
                     }
                 }
             } else {
-                let expected_gh = format!("{:016x}", lake_hash_bytes(cfg.lean_githash.trim().as_bytes()));
+                let expected_gh = format!(
+                    "{:016x}",
+                    lake_hash_bytes(cfg.lean_githash.trim().as_bytes())
+                );
                 let expected_src = format!("{:016x}", src_h);
                 let expected_is_mod =
                     format!("{:016x}", lake_mix_hash(1723, if is_mod { 11 } else { 13 }));
@@ -10080,7 +10079,8 @@ fn lake_closure_export_info_inner(
                 let actual_libs_h = if nested && spec.platform_independent == Some(true) {
                     empty_libs
                 } else {
-                    let libs_pair = tv.pointer(if nested { "/inputs/0/1/1" } else { "/inputs/1" })?;
+                    let libs_pair =
+                        tv.pointer(if nested { "/inputs/0/1/1" } else { "/inputs/1" })?;
                     if libs_pair.get(0).and_then(|v| v.as_str()) != Some("libs") {
                         return None;
                     }
@@ -10110,7 +10110,8 @@ fn lake_closure_export_info_inner(
                         pkg.libs
                             .iter()
                             .find(|l| {
-                                l.name == spec.target_name && lib_can_build_module(l, &spec.module_name)
+                                l.name == spec.target_name
+                                    && lib_can_build_module(l, &spec.module_name)
                             })
                             .map_or(&[], |l| l.needs.as_slice())
                     };
@@ -10156,9 +10157,11 @@ fn lake_closure_export_info_inner(
                     }
                     let expected_plat_h =
                         format!("{:016x}", lake_hash_bytes(tc_spec.target.as_bytes()));
-                    let plat_pair = tv.pointer(if nested { "/inputs/0/1/2" } else { "/inputs/2" })?;
+                    let plat_pair =
+                        tv.pointer(if nested { "/inputs/0/1/2" } else { "/inputs/2" })?;
                     if plat_pair.get(0).and_then(|v| v.as_str()) != Some(tc_spec.target.as_str())
-                        || plat_pair.get(1).and_then(|v| v.as_str()) != Some(expected_plat_h.as_str())
+                        || plat_pair.get(1).and_then(|v| v.as_str())
+                            != Some(expected_plat_h.as_str())
                     {
                         return None;
                     }
@@ -15478,7 +15481,7 @@ pub(crate) fn lake_inputs_tag_from_digest(digest: &str) -> Option<String> {
 /// file. That is the over-invalidating side of the trade the project-wide rule asks for, and it is
 /// bounded to the overlap between two concurrent requests on the same project; the one-shot CLI
 /// path, where the figures above were measured, has a single window and is unaffected.
-type LakeInputsTagMemoEntry = (u64, Result<Option<String>, String>);
+type LakeInputsTagMemoEntry = (u64, Option<String>);
 
 static LAKE_INPUTS_TAG_MEMO: OnceLock<Mutex<HashMap<PathBuf, LakeInputsTagMemoEntry>>> =
     OnceLock::new();
@@ -15752,14 +15755,10 @@ pub fn reset_lake_inputs_tag_memo() {
     crate::lake_build::clear_olean_interface_memo();
 }
 
-/// Store `res` for `project_dir` as a caller that entered in `window` computed it. `false` when the
-/// window has been superseded, i.e. another command or request reset the memo while this caller was
-/// reading input bytes -- those bytes answer for a window nobody is in any more.
-fn publish_lake_inputs_tag_result(
-    project_dir: &Path,
-    window: u64,
-    res: &Result<Option<String>, String>,
-) -> bool {
+/// Store positive `tag` for `project_dir` as a caller that entered in `window` computed it.
+/// Errors are never memoized (positive-only memoization). Returns `false` when the window has been
+/// superseded, i.e. another command or request reset the memo while this caller was reading input bytes.
+fn publish_lake_inputs_tag(project_dir: &Path, window: u64, tag: &Option<String>) -> bool {
     let memo = LAKE_INPUTS_TAG_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
     let Ok(mut g) = memo.lock() else {
         return false;
@@ -15771,13 +15770,8 @@ fn publish_lake_inputs_tag_result(
     if g.len() >= 256 {
         g.clear();
     }
-    g.insert(project_dir.to_path_buf(), (window, res.clone()));
+    g.insert(project_dir.to_path_buf(), (window, tag.clone()));
     true
-}
-
-#[cfg(test)]
-fn publish_lake_inputs_tag(project_dir: &Path, window: u64, tag: &Option<String>) -> bool {
-    publish_lake_inputs_tag_result(project_dir, window, &Ok(tag.clone()))
 }
 
 /// Fallible version of [`project_lake_inputs_tag`]: returns `Err` when the workspace may declare
@@ -15791,25 +15785,24 @@ pub(crate) fn try_project_lake_inputs_tag(project_dir: &Path) -> Result<Option<S
         return Ok(None);
     }
     let memo = LAKE_INPUTS_TAG_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
-    // Read *before* any input byte is, and re-checked by `publish_lake_inputs_tag_result` afterwards.
+    // Read *before* any input byte is, and re-checked by `publish_lake_inputs_tag` afterwards.
     let window = LAKE_INPUTS_TAG_MEMO_WINDOW.load(Ordering::SeqCst);
     if let Ok(g) = memo.lock() {
         if let Some((w, hit)) = g.get(project_dir) {
             if *w == window {
-                return hit.clone().map_err(|e| anyhow::anyhow!("{e}"));
+                return Ok(hit.clone());
             }
         }
     }
-    let res: Result<Option<String>, String> = if workspace_may_declare_lake_inputs(project_dir) {
-        resolve_project_config(project_dir)
-            .and_then(|cfg| workspace_lake_inputs_digest(&cfg))
-            .map(|digest| lake_inputs_tag_from_digest(&digest))
-            .map_err(|e| format!("{e:#}"))
+    let tag = if workspace_may_declare_lake_inputs(project_dir) {
+        let cfg = resolve_project_config(project_dir)?;
+        let digest = workspace_lake_inputs_digest(&cfg)?;
+        lake_inputs_tag_from_digest(&digest)
     } else {
-        Ok(None)
+        None
     };
-    let _ = publish_lake_inputs_tag_result(project_dir, window, &res);
-    res.map_err(|e| anyhow::anyhow!("{e}"))
+    let _ = publish_lake_inputs_tag(project_dir, window, &tag);
+    Ok(tag)
 }
 
 pub(crate) fn project_lake_inputs_tag(project_dir: &Path) -> Option<String> {
@@ -15883,6 +15876,8 @@ struct ShmReplayedOleanDigestEntry {
     digest: String,
     #[serde(default)]
     imports: Option<(Vec<ParsedImport>, bool)>,
+    #[serde(default)]
+    epoch: String,
 }
 
 fn shm_replayed_olean_cache_file_name(olean_path: &Path) -> String {
@@ -15896,6 +15891,8 @@ fn shm_replayed_olean_cache_file_name(olean_path: &Path) -> String {
 struct ShmSourceHygieneEntry {
     stat: crate::zygote::OleanFileStatSig,
     hygiene: splitter::HygieneReport,
+    #[serde(default)]
+    epoch: String,
 }
 
 pub(crate) fn load_source_hygiene_cached(src_path: &Path) -> Result<splitter::HygieneReport> {
@@ -15910,7 +15907,7 @@ pub(crate) fn load_source_hygiene_cached(src_path: &Path) -> Result<splitter::Hy
                 crate::shm_cache::read_verified_private_shm_file("src_hygiene_v2", &file_name)
             {
                 if let Ok(entry) = serde_json::from_slice::<ShmSourceHygieneEntry>(&bytes) {
-                    if entry.stat == st {
+                    if entry.epoch == crate::TURBO_LEAN_BUILD_EPOCH && entry.stat == st {
                         return Ok(entry.hygiene);
                     }
                 }
@@ -15934,6 +15931,7 @@ pub(crate) fn load_source_hygiene_cached(src_path: &Path) -> Result<splitter::Hy
             let entry = ShmSourceHygieneEntry {
                 stat: post_st,
                 hygiene: hygiene.clone(),
+                epoch: crate::TURBO_LEAN_BUILD_EPOCH.to_string(),
             };
             if let Ok(bytes) = serde_json::to_vec(&entry) {
                 let _ = crate::shm_cache::write_verified_private_shm_file(
@@ -15978,7 +15976,10 @@ pub(crate) fn compute_replayed_olean_ilean_digest(olean_path: &Path) -> Result<S
             crate::shm_cache::read_verified_private_shm_file("olean_meta_v2", &shm_file_name)
         {
             if let Ok(entry) = serde_json::from_slice::<ShmReplayedOleanDigestEntry>(&bytes) {
-                if entry.stats == cur_stats && !entry.digest.is_empty() {
+                if entry.epoch == crate::TURBO_LEAN_BUILD_EPOCH
+                    && entry.stats == cur_stats
+                    && !entry.digest.is_empty()
+                {
                     if let Ok(mut g) = memo.lock() {
                         if current_memo_window() == window {
                             if g.len() >= 65536 {
@@ -16121,6 +16122,7 @@ pub(crate) fn compute_replayed_olean_ilean_digest(olean_path: &Path) -> Result<S
             stats: post_stats,
             digest: res.clone(),
             imports: parsed_imps,
+            epoch: crate::TURBO_LEAN_BUILD_EPOCH.to_string(),
         };
         if let Ok(bytes) = serde_json::to_vec(&shm_entry) {
             let _ = crate::shm_cache::write_verified_private_shm_file(
@@ -16153,7 +16155,7 @@ pub(crate) fn read_olean_binary_imports_cached(
                 crate::shm_cache::read_verified_private_shm_file("olean_meta_v2", &shm_file_name)
             {
                 if let Ok(entry) = serde_json::from_slice::<ShmReplayedOleanDigestEntry>(&bytes) {
-                    if entry.stats[0] == Some(st) {
+                    if entry.epoch == crate::TURBO_LEAN_BUILD_EPOCH && entry.stats[0] == Some(st) {
                         if let Some((imps, is_mod)) = entry.imports {
                             if let Ok(mut g) = memo.lock() {
                                 if current_memo_window() == window {
@@ -17244,7 +17246,12 @@ pub fn compute_module_cas_key_with_dynlibs(
     }
     validate_materialized_artifacts(cfg)?;
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean-module-cas-v7\n");
+    h.update(b"turbo-lean-module-cas-v8\n");
+    update_lp(
+        &mut h,
+        b"build_epoch",
+        crate::TURBO_LEAN_BUILD_EPOCH.as_bytes(),
+    );
     update_lp(&mut h, b"toolchain", cfg.toolchain.as_bytes());
     update_lp(&mut h, b"githash", cfg.lean_githash.as_bytes());
     update_lp(
@@ -18204,8 +18211,7 @@ fn write_lake_module_hashes_and_trace_with_memo(
         && (!node.is_root_pkg || !hygiene.has_trust_compiler)
         && checking_weakening_ok;
     let skeleton_clean = src_blake3_matches && no_forbidden_proof_tokens;
-    let is_stubbed_skeleton =
-        !sorry_ok || !no_forbidden_proof_tokens || !src_blake3_matches;
+    let is_stubbed_skeleton = !sorry_ok || !no_forbidden_proof_tokens || !src_blake3_matches;
     let olean_h_res = verify_and_hash_artifact_bytes(&node.olean_path, false, false);
     let ilean_h_res = verify_and_hash_artifact_bytes(&node.ilean_path, false, false);
     let c_h_res = if is_regular_nonempty_file(&node.c_path) {
@@ -22359,7 +22365,10 @@ fn probe_warm_on_disk_module_candidate(
         return None;
     }
 
-    let expected_gh = format!("{:016x}", lake_hash_bytes(cfg.lean_githash.trim().as_bytes()));
+    let expected_gh = format!(
+        "{:016x}",
+        lake_hash_bytes(cfg.lean_githash.trim().as_bytes())
+    );
     let expected_src = format!("{:016x}", lake_hash_text(&src_raw));
     let expected_is_mod = format!(
         "{:016x}",
@@ -40499,9 +40508,18 @@ globs = ["Down.+"]
         .to_string();
 
         let mut git_init = crate::trusted_tools::git(root)?;
-        assert!(git_init.args(["init", "-q"]).arg(&pw_dir).status()?.success());
+        assert!(git_init
+            .args(["init", "-q"])
+            .arg(&pw_dir)
+            .status()?
+            .success());
         let mut git_add = crate::trusted_tools::git(&pw_dir)?;
-        assert!(git_add.args(["-C"]).arg(&pw_dir).args(["add", "."]).status()?.success());
+        assert!(git_add
+            .args(["-C"])
+            .arg(&pw_dir)
+            .args(["add", "."])
+            .status()?
+            .success());
         let mut git_commit = crate::trusted_tools::git(&pw_dir)?;
         assert!(git_commit
             .args([
@@ -40575,46 +40593,48 @@ globs = ["Down.+"]
             pw_pkg.custom_targets,
             vec!["widgetJsAll".to_string(), "widgetJsAllDev".to_string()]
         );
-        assert_eq!(pw_pkg.libs[0].custom_target_needs, vec!["widgetJsAll".to_string()]);
+        assert_eq!(
+            pw_pkg.libs[0].custom_target_needs,
+            vec!["widgetJsAll".to_string()]
+        );
         assert!(!workspace_lake_inputs_digest(&cfg)?.is_empty());
 
-        let write_fake_leantar_artifacts =
-            |olean_path: &Path, dep_h: u64| -> Result<()> {
-                fs::create_dir_all(olean_path.parent().unwrap())?;
-                let mut olean_bytes = vec![0u8; 88];
-                olean_bytes[0..5].copy_from_slice(b"olean");
-                olean_bytes[5] = 2;
-                olean_bytes[6] = 1;
-                olean_bytes[7..13].copy_from_slice(b"4.31.0");
-                olean_bytes[40..80].copy_from_slice(fake_githash.as_bytes());
-                fs::write(olean_path, &olean_bytes)?;
-                let ilean_path = olean_path.with_extension("ilean");
-                fs::write(&ilean_path, b"{}")?;
-                let o_h = lake_hash_bytes(&olean_bytes);
-                let i_h = lake_hash_bytes(b"{}");
-                fs::write(
-                    PathBuf::from(format!("{}.hash", olean_path.display())),
-                    format!("{o_h:016x}"),
-                )?;
-                fs::write(
-                    PathBuf::from(format!("{}.hash", ilean_path.display())),
-                    format!("{i_h:016x}"),
-                )?;
-                let trace_json = serde_json::json!({
-                    "schemaVersion": "2025-09-10",
-                    "depHash": format!("{dep_h:016x}"),
-                    "outputs": {
-                        "m": false,
-                        "o": [format!("{o_h:016x}.olean")],
-                        "i": format!("{i_h:016x}.ilean")
-                    }
-                });
-                fs::write(
-                    olean_path.with_extension("trace"),
-                    serde_json::to_vec(&trace_json)?,
-                )?;
-                Ok(())
-            };
+        let write_fake_leantar_artifacts = |olean_path: &Path, dep_h: u64| -> Result<()> {
+            fs::create_dir_all(olean_path.parent().unwrap())?;
+            let mut olean_bytes = vec![0u8; 88];
+            olean_bytes[0..5].copy_from_slice(b"olean");
+            olean_bytes[5] = 2;
+            olean_bytes[6] = 1;
+            olean_bytes[7..13].copy_from_slice(b"4.31.0");
+            olean_bytes[40..80].copy_from_slice(fake_githash.as_bytes());
+            fs::write(olean_path, &olean_bytes)?;
+            let ilean_path = olean_path.with_extension("ilean");
+            fs::write(&ilean_path, b"{}")?;
+            let o_h = lake_hash_bytes(&olean_bytes);
+            let i_h = lake_hash_bytes(b"{}");
+            fs::write(
+                PathBuf::from(format!("{}.hash", olean_path.display())),
+                format!("{o_h:016x}"),
+            )?;
+            fs::write(
+                PathBuf::from(format!("{}.hash", ilean_path.display())),
+                format!("{i_h:016x}"),
+            )?;
+            let trace_json = serde_json::json!({
+                "schemaVersion": "2025-09-10",
+                "depHash": format!("{dep_h:016x}"),
+                "outputs": {
+                    "m": false,
+                    "o": [format!("{o_h:016x}.olean")],
+                    "i": format!("{i_h:016x}.ilean")
+                }
+            });
+            fs::write(
+                olean_path.with_extension("trace"),
+                serde_json::to_vec(&trace_json)?,
+            )?;
+            Ok(())
+        };
 
         let dep_spec = resolve_module_in_package(
             cfg.dep_pkgs.iter().find(|p| p.name == "PwDep").unwrap(),
@@ -40676,8 +40696,10 @@ globs = ["Down.+"]
         let expected_dep_h = lake_input_hash(&indep_inputs)?;
         write_fake_leantar_artifacts(&spec_olean_path(&dep_spec), expected_dep_h)?;
 
-        let mut cache = LakeClosureCache::default();
-        cache.ignore_mtime_skew = true;
+        let mut cache = LakeClosureCache {
+            ignore_mtime_skew: true,
+            ..Default::default()
+        };
         let mut visiting = HashSet::new();
         assert!(
             lake_closure_export_info(&cfg, &dep_spec, true, &mut cache, &mut visiting).is_some(),
@@ -40685,10 +40707,15 @@ globs = ["Down.+"]
         );
 
         // Tampering with source invalidates inputless depHash verification.
-        fs::write(dep_dir.join("PwDep.lean"), "prelude\ndef pwVal : Nat := 99\n")?;
+        fs::write(
+            dep_dir.join("PwDep.lean"),
+            "prelude\ndef pwVal : Nat := 99\n",
+        )?;
         reset_lake_inputs_tag_memo();
-        let mut cache2 = LakeClosureCache::default();
-        cache2.ignore_mtime_skew = true;
+        let mut cache2 = LakeClosureCache {
+            ignore_mtime_skew: true,
+            ..Default::default()
+        };
         let mut visiting2 = HashSet::new();
         assert!(
             lake_closure_export_info(&cfg, &dep_spec, true, &mut cache2, &mut visiting2).is_none(),
@@ -40699,7 +40726,12 @@ globs = ["Down.+"]
         // Write artifacts into `.lake/build/` BEFORE committing would be wrong, so ensure `.lake/` is gitignored as in real ProofWidgets4.
         fs::write(pw_dir.join(".gitignore"), "/.lake/\n")?;
         let mut git_add_ig = crate::trusted_tools::git(&pw_dir)?;
-        assert!(git_add_ig.args(["-C"]).arg(&pw_dir).args(["add", ".gitignore"]).status()?.success());
+        assert!(git_add_ig
+            .args(["-C"])
+            .arg(&pw_dir)
+            .args(["add", ".gitignore"])
+            .status()?
+            .success());
         let mut git_commit_ig = crate::trusted_tools::git(&pw_dir)?;
         assert!(git_commit_ig
             .args([
@@ -40761,8 +40793,10 @@ globs = ["Down.+"]
         reset_lake_inputs_tag_memo();
         let pw_spec = resolve_module_in_package(&pw_pkg, false, "ProofWidgets").expect("PW spec");
         write_fake_leantar_artifacts(&spec_olean_path(&pw_spec), 0x123456789abcdef0)?;
-        let mut cache3 = LakeClosureCache::default();
-        cache3.ignore_mtime_skew = true;
+        let mut cache3 = LakeClosureCache {
+            ignore_mtime_skew: true,
+            ..Default::default()
+        };
         let mut visiting3 = HashSet::new();
         assert!(
             lake_closure_export_info(&cfg, &pw_spec, true, &mut cache3, &mut visiting3).is_some(),
@@ -40783,10 +40817,15 @@ globs = ["Down.+"]
         assert_eq!(app_deps.len(), 2);
         assert!(!compute_module_cas_key(&cfg, app_node, &app_deps, false)?.is_empty());
         // Dirty tracked custom-target input (`widget/js/hello.tsx`) must fail closed even when `.lean` is untouched.
-        fs::write(pw_dir.join("widget/js/hello.tsx"), "export default { pwned: true }\n")?;
+        fs::write(
+            pw_dir.join("widget/js/hello.tsx"),
+            "export default { pwned: true }\n",
+        )?;
         reset_lake_inputs_tag_memo();
-        let mut cache_tsx = LakeClosureCache::default();
-        cache_tsx.ignore_mtime_skew = true;
+        let mut cache_tsx = LakeClosureCache {
+            ignore_mtime_skew: true,
+            ..Default::default()
+        };
         let mut visiting_tsx = HashSet::new();
         assert!(
             lake_closure_export_info(&cfg, &pw_spec, true, &mut cache_tsx, &mut visiting_tsx)
@@ -40799,8 +40838,10 @@ globs = ["Down.+"]
             "prelude\ndef pwHelper : Nat := 2\n",
         )?;
         reset_lake_inputs_tag_memo();
-        let mut cache4 = LakeClosureCache::default();
-        cache4.ignore_mtime_skew = true;
+        let mut cache4 = LakeClosureCache {
+            ignore_mtime_skew: true,
+            ..Default::default()
+        };
         let mut visiting4 = HashSet::new();
         assert!(
             lake_closure_export_info(&cfg, &pw_spec, true, &mut cache4, &mut visiting4).is_none(),
@@ -40918,14 +40959,7 @@ globs = ["Down.+"]
         }
 
         let dep_dig = compute_olean_artifact_set_digest(&dep_node.olean_path)?;
-        write_lake_module_hashes_and_trace(
-            &cfg,
-            &dag,
-            dep_node,
-            &dep_dig,
-            Some(&dep_dig),
-            true,
-        )?;
+        write_lake_module_hashes_and_trace(&cfg, &dag, dep_node, &dep_dig, Some(&dep_dig), true)?;
         assert!(
             dep_node.olean_path.with_extension("trace").is_file(),
             "non-root dependency mentioning sorryAx in meta helper must emit Lake .trace sidecar"
@@ -40947,6 +40981,111 @@ globs = ["Down.+"]
         assert!(!root_node.olean_path.with_extension("trace").exists());
 
         crate::zygote::purge_snapshot_dir(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_lake_inputs_tag_memo_never_poisons_transient_failure() -> Result<()> {
+        reset_lake_inputs_tag_memo();
+        let dir = make_temp_test_dir("lake_inputs_positive_only_memo");
+        let proj = dir.join("proj");
+        fs::create_dir_all(&proj)?;
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            proj.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage «p»\ninput_file specTxt where\n  path := \"spec.txt\"\n  text := true\n",
+        )?;
+        // Missing `spec.txt` causes `try_project_lake_inputs_tag` to error without poisoning `LAKE_INPUTS_TAG_MEMO`.
+        assert!(try_project_lake_inputs_tag(&proj).is_err());
+
+        fs::write(proj.join("spec.txt"), "hello\n")?;
+        let populated = try_project_lake_inputs_tag(&proj)?;
+        assert!(
+            populated.is_some(),
+            "try_project_lake_inputs_tag must recompute once transient missing input is restored"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_are_all_project_oleans_replayed_requires_policy_bound_audit() -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("olean_up_to_date_csimp_policy");
+        let proj = dir.join("proj");
+        let store_dir = dir.join("store");
+        fs::create_dir_all(&proj)?;
+        fs::write(proj.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"csimp-up-to-date\"\ndefaultTargets = [\"Fixture\"]\n[[lean_lib]]\nname = \"Fixture\"\n",
+        )?;
+        let src = "\
+namespace Fixture
+def slow (n : Nat) : Nat := n + 1
+def fast (n : Nat) : Nat := n.succ
+@[csimp] theorem fast_eq : @slow = @fast := by
+  funext n
+  rfl
+end Fixture
+";
+        fs::write(proj.join("Fixture.lean"), src)?;
+        let mut store = TurboStore::open(Some(&store_dir))?;
+        let canon = fs::canonicalize(&proj)?;
+        let mut file_hashes = std::collections::BTreeMap::new();
+        file_hashes.insert(
+            "Fixture.lean".to_string(),
+            blake3::hash(src.as_bytes()).to_hex().to_string(),
+        );
+
+        // Build and audit under explicit csimp permission `Fixture.fast_eq`.
+        {
+            let _csimp = ScopedEnvVar::set("TURBO_LEAN_ALLOWED_CSIMP", "Fixture.fast_eq");
+            build_project_modules_native(
+                &mut store,
+                &canon,
+                &[],
+                "trusted",
+                1,
+                false,
+                true,
+                Some(&file_hashes),
+            )?;
+            assert!(
+                crate::lake_build::are_all_project_oleans_replayed_in_store(
+                    &store,
+                    &canon,
+                    &file_hashes,
+                ),
+                "audited root `.olean` must satisfy `are_all_project_oleans_replayed_in_store` under matching csimp policy"
+            );
+        }
+
+        // Without csimp permission, `are_all_project_oleans_replayed_in_store` must return false
+        // and `ensure_project_and_imported_oleans_replayed_in_store` must reject the `.olean` via
+        // the compiled kernel auditor.
+        assert!(
+            !crate::lake_build::are_all_project_oleans_replayed_in_store(
+                &store,
+                &canon,
+                &file_hashes,
+            ),
+            "replay-only or different-policy `.olean` must not satisfy `are_all_project_oleans_replayed_in_store`"
+        );
+        let audit_err = crate::lake_build::ensure_project_and_imported_oleans_replayed_in_store(
+            &store,
+            &canon,
+            &file_hashes,
+        )
+        .expect_err("unpermitted csimp `.olean` must fail compiled kernel audit");
+        assert!(
+            format!("{audit_err:#}").contains("audit")
+                || format!("{audit_err:#}").contains("csimp"),
+            "unexpected error: {audit_err:#}"
+        );
+
+        crate::zygote::purge_snapshot_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
 }

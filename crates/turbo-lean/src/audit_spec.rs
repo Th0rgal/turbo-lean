@@ -1800,6 +1800,24 @@ impl AuditSpecPolicyConfig {
         extra_forbid_namespaces: &[String],
         extra_forbid_decl_kinds: &[String],
     ) -> Result<Self> {
+        Self::try_load_for_target_with_project_dir(
+            file,
+            None,
+            policy_override,
+            config_path_override,
+            extra_forbid_namespaces,
+            extra_forbid_decl_kinds,
+        )
+    }
+
+    pub fn try_load_for_target_with_project_dir(
+        file: &Path,
+        project_dir_fallback: Option<&Path>,
+        policy_override: Option<&str>,
+        config_path_override: Option<&Path>,
+        extra_forbid_namespaces: &[String],
+        extra_forbid_decl_kinds: &[String],
+    ) -> Result<Self> {
         let discover_project_root = |target: &Path| -> Option<PathBuf> {
             if target.as_os_str().is_empty() {
                 return None;
@@ -1907,6 +1925,31 @@ impl AuditSpecPolicyConfig {
                 }
             }
         }
+        let search_ancestors_for_config = |canon: &Path| -> Result<Option<Self>> {
+            for anc in canon.ancestors() {
+                for (rel, allow_top_level) in [
+                    ("audit-spec.toml", true),
+                    (".audit-spec.toml", true),
+                    ("turbo-lean.toml", false),
+                    (".turbo-lean.toml", false),
+                ] {
+                    let cand = anc.join(rel);
+                    if cand.is_file() {
+                        let txt = fs::read_to_string(&cand).with_context(|| {
+                            format!("Failed to read project config {}", cand.display())
+                        })?;
+                        if let Some(mut cfg) =
+                            Self::try_parse_config_str_mode(&txt, allow_top_level)
+                                .with_context(|| format!("Invalid config in {}", cand.display()))?
+                        {
+                            cfg.config_root = Some(anc.to_path_buf());
+                            return Ok(Some(cfg));
+                        }
+                    }
+                }
+            }
+            Ok(None)
+        };
         if loaded.is_none() && !file.as_os_str().is_empty() {
             let start_dir: Option<PathBuf> = if file.is_dir() {
                 Some(resolve_canonical_or_lexical_path(file))
@@ -1922,36 +1965,31 @@ impl AuditSpecPolicyConfig {
                     })
             };
             if let Some(canon) = start_dir {
-                'ancestors: for anc in canon.ancestors() {
-                    for (rel, allow_top_level) in [
-                        ("audit-spec.toml", true),
-                        (".audit-spec.toml", true),
-                        ("turbo-lean.toml", false),
-                        (".turbo-lean.toml", false),
-                    ] {
-                        let cand = anc.join(rel);
-                        if cand.is_file() {
-                            let txt = fs::read_to_string(&cand).with_context(|| {
-                                format!("Failed to read project config {}", cand.display())
-                            })?;
-                            if let Some(mut cfg) =
-                                Self::try_parse_config_str_mode(&txt, allow_top_level)
-                                    .with_context(|| {
-                                        format!("Invalid config in {}", cand.display())
-                                    })?
-                            {
-                                cfg.config_root = Some(anc.to_path_buf());
-                                loaded = Some(cfg);
-                                break 'ancestors;
-                            }
-                        }
-                    }
+                loaded = search_ancestors_for_config(&canon)?;
+            }
+        }
+        if loaded.is_none() {
+            if let Some(pd) = project_dir_fallback.filter(|p| !p.as_os_str().is_empty()) {
+                let canon_pd = if pd.is_dir() {
+                    resolve_canonical_or_lexical_path(pd)
+                } else {
+                    resolve_canonical_or_lexical_path(pd)
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_else(|| resolve_canonical_or_lexical_path(pd))
+                };
+                if canon_pd.exists() {
+                    loaded = search_ancestors_for_config(&canon_pd)?;
                 }
             }
         }
         let mut cfg = loaded.unwrap_or_default();
         if cfg.config_root.is_none() {
-            cfg.config_root = discover_project_root(file);
+            cfg.config_root = discover_project_root(file).or_else(|| {
+                project_dir_fallback
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .and_then(discover_project_root)
+            });
         }
         if let Some(pol) = policy_override {
             let preset = Self::try_from_preset(pol)?;
@@ -2891,15 +2929,17 @@ fn probe_diagonal_and_boundary_precondition_satisfiability(
     }
 
     // 2. Single-parameter boundary specializations (`x := 0`, `x := 1`, `x := true`, `x := false`).
-    for (p_name, p_ty) in &typed_params[..typed_params.len().min(6)] {
-        let candidates: &[&str] = if p_ty == "Bool" {
+    let boundary_candidates_for_ty = |p_ty: &str| -> &'static [&'static str] {
+        if p_ty == "Bool" {
             &["false", "true"]
         } else if p_ty.contains("256") {
             &["Word256.zero", "Word256.one"]
         } else {
-            &["0", "1"]
-        };
-        for &lit in candidates {
+            &["0", "1", "2"]
+        }
+    };
+    for (p_name, p_ty) in &typed_params[..typed_params.len().min(6)] {
+        for &lit in boundary_candidates_for_ty(p_ty) {
             let specialized = make_substituted_decl(&[(p_name.as_str(), lit)]);
             if let Some((b_rep, _, _)) = eval_extracted_decl_in_memory(&specialized, 64) {
                 if b_rep.satisfied_preconditions > 0 {
@@ -2912,7 +2952,86 @@ fn probe_diagonal_and_boundary_precondition_satisfiability(
             }
         }
     }
+
+    // 3. Pairwise boundary grid (`(x, y) in {0, 1, 2}^2`) for coupled relational preconditions
+    // such as `x = 0 ∧ y = 1` or `x + 1 = y`.
+    if typed_params.len() >= 2 {
+        let cap = typed_params.len().min(5);
+        for i in 0..cap {
+            for j in (i + 1)..cap {
+                let (lhs_name, lhs_ty) = (&typed_params[i].0, &typed_params[i].1);
+                let (rhs_name, rhs_ty) = (&typed_params[j].0, &typed_params[j].1);
+                for &l_lit in boundary_candidates_for_ty(lhs_ty) {
+                    for &r_lit in boundary_candidates_for_ty(rhs_ty) {
+                        let specialized = make_substituted_decl(&[
+                            (lhs_name.as_str(), l_lit),
+                            (rhs_name.as_str(), r_lit),
+                        ]);
+                        if let Some((b_rep, _, _)) = eval_extracted_decl_in_memory(&specialized, 32)
+                        {
+                            if b_rep.satisfied_preconditions > 0 {
+                                return Some((
+                                    b_rep.satisfied_preconditions,
+                                    b_rep.n_states,
+                                    format!("{}={},{}={}", lhs_name, l_lit, rhs_name, r_lit),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     None
+}
+
+/// Check whether every equational hypothesis in `hyp_strings` shares at least oneuniversally
+/// bound value parameter with `raw_conclusion_str` (indicating an injectivity or algebraic
+/// cancellation theorem such as `f x = f y → x = y` rather than a definitional-lowering wrapper
+/// `lower c = .ok tgt → evalSrc c = evalTgt tgt` where `tgt` is introduced solely to alias `lower c`).
+fn is_coupled_injectivity_style_equality(
+    decl: &ExtractedDecl,
+    hyp_strings: &[String],
+    raw_conclusion_str: &str,
+) -> bool {
+    let value_params: std::collections::HashSet<&str> = decl
+        .binders
+        .iter()
+        .filter(|(_, ty)| is_known_binder_value_type(ty))
+        .flat_map(|(names, _)| names.iter().map(|s| s.as_str()))
+        .collect();
+    if value_params.len() < 2 {
+        return false;
+    }
+    let Some((c_lhs, c_rhs, false)) =
+        split_top_level_eq(strip_balanced_outer_parens(raw_conclusion_str))
+    else {
+        return false;
+    };
+    let c_l = strip_balanced_outer_parens(&c_lhs);
+    let c_r = strip_balanced_outer_parens(&c_rhs);
+    // Conclusion is a direct equality between distinct value parameters (`x = y`) or tuple/field projections thereof.
+    if c_l == c_r || !value_params.contains(c_l) || !value_params.contains(c_r) {
+        return false;
+    }
+    // At least one hypothesis must equate composite applications (`f ...` = `f ...`), not a bare `x = y` tautology!
+    hyp_strings.iter().any(|h| {
+        split_top_level_conjuncts(h).into_iter().any(|conj| {
+            let Some((hl, hr, false)) = split_top_level_eq(&conj) else {
+                return false;
+            };
+            let hlt = strip_balanced_outer_parens(&hl);
+            let hrt = strip_balanced_outer_parens(&hr);
+            if (hlt == c_l && hrt == c_r) || (hlt == c_r && hrt == c_l) {
+                return false;
+            }
+            let mentions_l = replace_ident_boundary(hlt, c_l, "__V__") != hlt
+                || replace_ident_boundary(hrt, c_l, "__V__") != hrt;
+            let mentions_r = replace_ident_boundary(hlt, c_r, "__V__") != hlt
+                || replace_ident_boundary(hrt, c_r, "__V__") != hrt;
+            mentions_l && mentions_r && (hlt.contains(' ') || hrt.contains(' '))
+        })
+    })
 }
 
 /// Probe whether the postcondition alone (with hypotheses dropped) is falsified by at least one
@@ -3032,7 +3151,10 @@ pub(super) fn audit_single_decl_spec_full_with_policy_and_opens(
         hyp_strings.push(unfold_expr_one_level(stripped, local_defs));
     }
 
-    if policy.reject_definitional_lowering_tautology && !hyp_strings.is_empty() {
+    if policy.reject_definitional_lowering_tautology
+        && !hyp_strings.is_empty()
+        && !is_coupled_injectivity_style_equality(decl, &hyp_strings, &raw_conclusion_str)
+    {
         conclusion_str =
             substitute_equational_hypotheses(&conclusion_str, &hyp_strings, local_defs);
     }
@@ -3246,7 +3368,7 @@ pub(super) fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<Ex
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 20;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 21;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -3501,9 +3623,11 @@ pub(super) fn resolve_audit_spec_cache_dir() -> Option<PathBuf> {
     let uid = unsafe { libc::geteuid() };
     #[cfg(not(unix))]
     let uid = 0u32;
-    ensure_private_cache_dir(
-        &std::env::temp_dir().join(format!("turbo-lean-audit-spec-cache-v1-{uid}")),
-    )
+    let tmp_root = fs::canonicalize(std::env::temp_dir()).unwrap_or_else(|_| std::env::temp_dir());
+    ensure_private_cache_dir(&tmp_root.join(format!(
+        "turbo-lean-audit-spec-cache-v2-{uid}-{}",
+        crate::build_epoch_short()
+    )))
     .ok()
 }
 
@@ -3546,6 +3670,8 @@ pub(super) fn compute_audit_spec_cache_key_with_policy(
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"turbo-lean-audit-spec-cache:");
     hasher.update(&AUDIT_SPEC_CACHE_SCHEMA_VERSION.to_le_bytes());
+    hasher.update(b":");
+    hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
     hasher.update(b":");
     let df = decl_filter.unwrap_or("");
     hasher.update(&(df.len() as u64).to_le_bytes());
@@ -3668,12 +3794,36 @@ pub fn audit_spec_file_or_source(
     inline_src: Option<&str>,
     decl_filter: Option<&str>,
 ) -> serde_json::Value {
+    audit_spec_file_or_source_in_project(file, inline_src, decl_filter, None)
+}
+
+pub fn audit_spec_file_or_source_in_project(
+    file: &Path,
+    inline_src: Option<&str>,
+    decl_filter: Option<&str>,
+    project_dir: Option<&Path>,
+) -> serde_json::Value {
     if inline_src.is_none()
         && (file.is_dir() || (file.is_file() && file.with_extension("").is_dir()))
     {
-        return audit_spec_files(&[file.to_path_buf()], decl_filter);
+        return audit_spec_files_resolving_per_target_in_project(
+            &[file.to_path_buf()],
+            decl_filter,
+            project_dir,
+            None,
+            None,
+            &[],
+            &[],
+        );
     }
-    match AuditSpecPolicyConfig::try_load_for_target(file, None, None, &[], &[]) {
+    match AuditSpecPolicyConfig::try_load_for_target_with_project_dir(
+        file,
+        project_dir,
+        None,
+        None,
+        &[],
+        &[],
+    ) {
         Ok(policy) => audit_spec_file_or_source_with_policy(file, inline_src, decl_filter, &policy),
         Err(err) => build_audit_spec_error_report(file, decl_filter, format!("{:#}", err)),
     }
@@ -4287,9 +4437,30 @@ fn audit_spec_files_resolving_per_target(
     forbid_namespaces: &[String],
     forbid_decl_kinds: &[String],
 ) -> serde_json::Value {
+    audit_spec_files_resolving_per_target_in_project(
+        files,
+        decl_filter,
+        None,
+        policy_override,
+        config_override,
+        forbid_namespaces,
+        forbid_decl_kinds,
+    )
+}
+
+fn audit_spec_files_resolving_per_target_in_project(
+    files: &[PathBuf],
+    decl_filter: Option<&str>,
+    project_dir: Option<&Path>,
+    policy_override: Option<&str>,
+    config_override: Option<&Path>,
+    forbid_namespaces: &[String],
+    forbid_decl_kinds: &[String],
+) -> serde_json::Value {
     run_audit_spec_batch_with(files, decl_filter, policy_override, |f, expand_umbrella| {
-        match AuditSpecPolicyConfig::try_load_for_target(
+        match AuditSpecPolicyConfig::try_load_for_target_with_project_dir(
             f,
+            project_dir,
             policy_override,
             config_override,
             forbid_namespaces,
@@ -4718,5 +4889,85 @@ theorem bad (n : Nat) : n = n := by rfl
             audit_spec_file_or_source(Path::new("NsAudit.lean"), Some(src), Some("A.«good.one»"));
         assert_eq!(good["ok"].as_bool(), Some(true));
         assert_eq!(good["total_specs_audited"].as_u64(), Some(1));
+    }
+
+    #[test]
+    fn audit_spec_canonical_temp_cache_coupled_injectivity_and_pairwise_boundary_probe() {
+        #[cfg(unix)]
+        {
+            let root = std::env::temp_dir().join(format!(
+                "turbo_audit_symlink_tmp_{}_{}",
+                std::process::id(),
+                crate::pack::next_tmp_id()
+            ));
+            let real_tmp = root.join("real_tmp");
+            let sym_tmp = root.join("sym_tmp");
+            fs::create_dir_all(&real_tmp).unwrap();
+            std::os::unix::fs::symlink(&real_tmp, &sym_tmp).unwrap();
+            let _env_guard = crate::pack::tests::env_test_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev_home = std::env::var_os("TURBO_LEAN_HOME");
+            let prev_xdg = std::env::var_os("XDG_CACHE_HOME");
+            let prev_user_home = std::env::var_os("HOME");
+            let prev_tmp = std::env::var_os("TMPDIR");
+            std::env::remove_var("TURBO_LEAN_HOME");
+            std::env::remove_var("XDG_CACHE_HOME");
+            std::env::remove_var("HOME");
+            std::env::set_var("TMPDIR", &sym_tmp);
+            let cache_dir = resolve_audit_spec_cache_dir();
+            match prev_home {
+                Some(v) => std::env::set_var("TURBO_LEAN_HOME", v),
+                None => std::env::remove_var("TURBO_LEAN_HOME"),
+            }
+            match prev_xdg {
+                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+                None => std::env::remove_var("XDG_CACHE_HOME"),
+            }
+            match prev_user_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_tmp {
+                Some(v) => std::env::set_var("TMPDIR", v),
+                None => std::env::remove_var("TMPDIR"),
+            }
+            assert!(
+                cache_dir.is_some(),
+                "resolve_audit_spec_cache_dir must canonicalize symlinked TMPDIR before private-dir check"
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
+
+        // Coupled injectivity equality (`encode x = encode y -> x = y`) is non-vacuous & tight,
+        // not falsely rejected as a definitional lowering tautology.
+        let inj_src = "\
+def encode (n : Nat) : Nat := n + 1
+theorem encode_injective (x y : Nat) (h : encode x = encode y) : x = y := by
+  unfold encode at h
+  omega
+";
+        let inj_rep = audit_spec_file_or_source(
+            Path::new("InjectivityProbe.lean"),
+            Some(inj_src),
+            Some("encode_injective"),
+        );
+        assert_eq!(inj_rep["ok"].as_bool(), Some(true), "{inj_rep}");
+        assert_eq!(inj_rep["tight_specs"].as_u64(), Some(1), "{inj_rep}");
+        assert_eq!(inj_rep["trivial_specs"].as_u64(), Some(0), "{inj_rep}");
+
+        // Pairwise distinct boundary probing (`(1, 2)`) certifies preconditions like `0 < x ∧ x < y`.
+        let pair_src = "\
+theorem strict_chain_step (x y : Nat) (hx : 0 < x) (hxy : x < y) : 2 ≤ y := by
+  omega
+";
+        let pair_rep = audit_spec_file_or_source(
+            Path::new("PairwiseBoundaryProbe.lean"),
+            Some(pair_src),
+            Some("strict_chain_step"),
+        );
+        assert_eq!(pair_rep["ok"].as_bool(), Some(true), "{pair_rep}");
+        assert_eq!(pair_rep["vacuous_specs"].as_u64(), Some(0), "{pair_rep}");
+        assert_eq!(pair_rep["tight_specs"].as_u64(), Some(1), "{pair_rep}");
     }
 }

@@ -331,7 +331,9 @@ fn git_head_tree_cache_paths(
     // v16: folds verifier provenance versions (`ZYGOTE_SCANNER_VERSION`, `ZYGOTE_REPLAY_VERSION`),
     // `theorem-shard-v8` keys, 3-byte docstring/module-doc split hashes, workspace config digest,
     // and Lake declarative input tag unconditionally.
-    h.update(b"git-head-tree:v16:");
+    h.update(b"git-head-tree:v17:");
+    h.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+    h.update(b":");
     h.update(&crate::zygote::ZYGOTE_SCANNER_VERSION.to_le_bytes());
     h.update(&crate::zygote::ZYGOTE_REPLAY_VERSION.to_le_bytes());
     h.update(repo_root.to_string_lossy().as_bytes());
@@ -3881,7 +3883,8 @@ pub fn run_ci_verify_command(
     // v5: bind global C-emission flags, custom CC env, and full native/package `.lake/build` outputs.
     hasher.update(
         format!(
-            "turbo-lean-ci-build-v5\n{}\n{}\n{}\n{}:{}\n:kernel:{}:{}\n",
+            "turbo-lean-ci-build-v6\n{}\n{}\n{}\n{}\n{}:{}\n:kernel:{}:{}\n",
+            crate::TURBO_LEAN_BUILD_EPOCH,
             toolchain,
             trust_domain,
             cfg.canonical_config_digest,
@@ -4017,7 +4020,7 @@ pub fn run_ci_verify_command(
     let impl_by_policy_nonempty =
         std::env::var("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY").is_ok_and(|s| !s.trim().is_empty());
     if custom_axiom_policy
-        || (is_untrusted && csimp_policy_nonempty)
+        || csimp_policy_nonempty
         || unsafe_policy_nonempty
         || impl_by_policy_nonempty
     {
@@ -4027,7 +4030,7 @@ pub fn run_ci_verify_command(
             }
             items.retain(|item| match item.rsplit(": ").next() {
                 Some("axiom") if custom_axiom_policy => false,
-                Some("csimp") if is_untrusted && csimp_policy_nonempty => false,
+                Some("csimp") if csimp_policy_nonempty => false,
                 Some("unsafe declaration") if unsafe_policy_nonempty => false,
                 Some("implemented_by") if impl_by_policy_nonempty => false,
                 _ => true,
@@ -4158,6 +4161,13 @@ pub fn run_ci_verify_command(
                 )
                 .context("CI native module build failed")?;
                 bwrap_used = Some(build_rep.bwrap_used);
+            }
+            if !is_untrusted {
+                ensure_project_and_imported_oleans_replayed_in_store(
+                    store,
+                    &canon_dir,
+                    &file_hashes,
+                )?;
             }
 
             let env_key = TurboStore::compute_lake_env_key(&canon_dir);
@@ -6299,7 +6309,9 @@ fn standalone_statement_olean_action_key(
         worklist.extend(imps.into_iter().map(|i| i.module));
     }
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean:standalone-stmt-olean:v5\0");
+    h.update(b"turbo-lean:standalone-stmt-olean:v6\0");
+    h.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+    h.update(b"\0");
     h.update(cfg.lean_githash.as_bytes());
     h.update(b"\0");
     h.update(pkg.config_digest.as_bytes());
@@ -7678,7 +7690,12 @@ fn base_statement_cache_action_key(
     }
     git_tree_has_no_elab_host_effects(repo, &tree_oid)?;
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean:base-stmt-map:v5\0");
+    h.update(b"turbo-lean:base-stmt-map:v6\0");
+    update_lp_bytes(
+        &mut h,
+        b"build_epoch",
+        crate::TURBO_LEAN_BUILD_EPOCH.as_bytes(),
+    );
     update_lp_bytes(&mut h, b"githash", cfg.lean_githash.as_bytes());
     update_lp_bytes(
         &mut h,
@@ -7833,7 +7850,9 @@ fn head_statement_report_cache_action_key(
     let _ = crate::zygote::ensure_bound_audit_closure(snap, "head_stmt_report_cache_key").ok()?;
     let mods = statement_source_modules(head_project, &cfg.root_pkg, scope).ok()?;
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean:head-stmt-report:v1\0");
+    h.update(b"turbo-lean:head-stmt-report:v2\0");
+    h.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+    h.update(b"\0");
     h.update(cfg.lean_githash.as_bytes());
     h.update(b"\0");
     h.update(
@@ -10498,7 +10517,8 @@ mod pr_verify_tests {
         let cfg = crate::module_builder::resolve_project_config(&tree.project)?;
         hasher.update(
             format!(
-                "turbo-lean-ci-build-v5\n{toolchain}\nuntrusted:ci\n{}\n{}:{}\n:kernel:standard:none\n",
+                "turbo-lean-ci-build-v6\n{}\n{toolchain}\nuntrusted:ci\n{}\n{}:{}\n:kernel:standard:none\n",
+                crate::TURBO_LEAN_BUILD_EPOCH,
                 cfg.canonical_config_digest,
                 crate::zygote::ZYGOTE_SCANNER_VERSION,
                 crate::zygote::ZYGOTE_REPLAY_VERSION
@@ -11402,6 +11422,14 @@ root = "Spoof"
             pack::next_tmp_id()
         ));
         fs::create_dir_all(&dir)?;
+        let Some(git_bin) = crate::trusted_tools::discover_or_skip_trusted_git_for_test(&dir)?
+        else {
+            let _ = fs::remove_dir_all(&dir);
+            return Ok(());
+        };
+        if std::env::var_os("TURBO_LEAN_GIT").is_none() {
+            std::env::set_var("TURBO_LEAN_GIT", &git_bin);
+        }
         let config = "[axioms]\nallow = [\"*._native.native_decide.ax_*\"]\n[csimp]\nallow = [\"Fixture.fast_eq\"]\n";
         fs::write(
             dir.join("turbo-lean.toml"),
@@ -11555,6 +11583,7 @@ end Fixture
             for (command, mode) in [
                 ("pr-verify", "trusted"),
                 ("pr-verify", "untrusted"),
+                ("ci-verify", "trusted"),
                 ("ci-verify", "untrusted"),
             ] {
                 if mode == "untrusted" && !sandbox {

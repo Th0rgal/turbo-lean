@@ -115,8 +115,17 @@ impl DerefMut for GitCommand {
 const MIN_GIT: (u32, u32) = (2, 46);
 
 fn parse_git_version(out: &str) -> Option<(u32, u32)> {
-    let mut parts = out.trim().strip_prefix("git version ")?.split('.');
-    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+    let rest = out
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("git version "))?;
+    let mut parts = rest.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor_digits: String = parts
+        .next()?
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    Some((major, minor_digits.parse().ok()?))
 }
 
 fn checked_git(path: PathBuf) -> Result<PathBuf> {
@@ -129,19 +138,52 @@ fn checked_git(path: PathBuf) -> Result<PathBuf> {
         .current_dir("/")
         .output()
         .with_context(|| format!("Cannot run {}", path.display()))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "`{} version` exited with {}: {}",
+        path.display(),
+        out.status,
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
     let text = String::from_utf8_lossy(&out.stdout);
-    let version = parse_git_version(&text)
-        .with_context(|| format!("Unrecognized Git version from {}", path.display()))?;
+    let version = parse_git_version(&text).with_context(|| {
+        format!(
+            "Unrecognized Git version output {:?} from {}",
+            text.trim(),
+            path.display()
+        )
+    })?;
     anyhow::ensure!(
         version >= MIN_GIT,
-        "{} is {}; verification requires Git >= {}.{} (GIT_NO_LAZY_FETCH): fail-closed. \
-         Install a newer Git or set TURBO_LEAN_GIT to one",
+        "{} reports `{}` (parsed {}.{}); verification requires Git >= {}.{} (GIT_NO_LAZY_FETCH): fail-closed. \
+         Install Git >= {}.{} or set TURBO_LEAN_GIT=/abs/path/to/git",
         path.display(),
         text.trim(),
+        version.0,
+        version.1,
+        MIN_GIT.0,
+        MIN_GIT.1,
         MIN_GIT.0,
         MIN_GIT.1
     );
     Ok(path)
+}
+
+fn resolve_trusted_git_uncached(project: &Path) -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("TURBO_LEAN_GIT") {
+        let raw = Path::new(&path);
+        let vetted = outside_checkout(raw, project)
+            .with_context(|| format!("Invalid TURBO_LEAN_GIT={}", raw.display()))?;
+        return checked_git(vetted);
+    }
+    let candidate = SYSTEM_BINS
+        .iter()
+        .find_map(|dir| system_executable(&Path::new(dir).join("git"), project).ok())
+        .context(
+            "No trusted system Git in /usr/bin, /bin, /usr/local/bin, /usr/sbin, or /sbin; \
+             set TURBO_LEAN_GIT=/abs/path/to/git outside all checkouts",
+        )?;
+    checked_git(candidate)
 }
 
 /// Resolve once per process, then validate against every project (including
@@ -151,15 +193,10 @@ fn checked_git(path: PathBuf) -> Result<PathBuf> {
 /// of missing partial-clone objects is disabled: a missing object is an error.
 pub(crate) fn git(project: &Path) -> Result<GitCommand> {
     static GIT: OnceLock<std::result::Result<PathBuf, String>> = OnceLock::new();
-    let program = GIT.get_or_init(|| {
-        (|| -> Result<PathBuf> {
-            if let Some(path) = std::env::var_os("TURBO_LEAN_GIT") {
-                return checked_git(outside_checkout(Path::new(&path), project)?);
-            }
-            checked_git(SYSTEM_BINS.iter().find_map(|dir| system_executable(&Path::new(dir).join("git"), project).ok())
-                .context("No trusted system Git; set TURBO_LEAN_GIT to an absolute executable outside all checkouts")?)
-        })().map_err(|e| format!("{e:#}"))
-    }).as_ref().map_err(|e| anyhow::anyhow!("Trusted Git unavailable: {e}"))?;
+    let program = GIT
+        .get_or_init(|| resolve_trusted_git_uncached(project).map_err(|e| format!("{e:#}")))
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("Trusted Git unavailable: {e}"))?;
     let program = outside_checkout(program, project)?;
     let home = PrivateHome::new()?;
     let prepare = |extra: &[String]| {
@@ -350,10 +387,59 @@ fn trusted_executables_reject_relative_and_checkout_symlink_targets() -> Result<
 }
 
 #[cfg(test)]
+pub(crate) fn discover_or_skip_trusted_git_for_test(project: &Path) -> Result<Option<PathBuf>> {
+    if let Some(raw) = std::env::var_os("TURBO_LEAN_GIT") {
+        let vetted = outside_checkout(Path::new(&raw), project)
+            .with_context(|| format!("Invalid TURBO_LEAN_GIT={}", Path::new(&raw).display()))?;
+        return checked_git(vetted).map(Some);
+    }
+    let mut candidates: Vec<PathBuf> = SYSTEM_BINS
+        .iter()
+        .map(|d| Path::new(d).join("git"))
+        .collect();
+    for extra in [
+        "/opt/homebrew/bin/git",
+        "/usr/local/git/bin/git",
+        "/nix/var/nix/profiles/default/bin/git",
+    ] {
+        candidates.push(PathBuf::from(extra));
+    }
+    if let Some(path_env) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_env) {
+            candidates.push(dir.join("git"));
+        }
+    }
+    for cand in candidates {
+        if let Ok(vetted) = outside_checkout(&cand, project) {
+            if let Ok(ok_git) = checked_git(vetted) {
+                return Ok(Some(ok_git));
+            }
+        }
+    }
+    if std::env::var_os("CI").is_some() {
+        anyhow::bail!(
+            "CI requires Git >= {}.{} for trusted_tools tests (or explicit TURBO_LEAN_GIT)",
+            MIN_GIT.0,
+            MIN_GIT.1
+        );
+    }
+    eprintln!(
+        "skipping trusted_tools Git >= {}.{} runtime test in local non-CI environment (host Git < {}.{})",
+        MIN_GIT.0, MIN_GIT.1, MIN_GIT.0, MIN_GIT.1
+    );
+    Ok(None)
+}
+
+#[cfg(test)]
 #[test]
 fn trusted_git_rejects_old_versions() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     assert_eq!(parse_git_version("git version 2.46.0\n"), Some((2, 46)));
+    assert_eq!(
+        parse_git_version("git version 2.46.1 (Apple Git-155)\n"),
+        Some((2, 46))
+    );
+    assert_eq!(parse_git_version("git version 2.47.rc1\n"), Some((2, 47)));
     assert_eq!(
         parse_git_version("git version 2.43.0.windows.1"),
         Some((2, 43))
@@ -365,16 +451,30 @@ fn trusted_git_rejects_old_versions() -> Result<()> {
         crate::pack::next_tmp_id()
     ));
     fs::create_dir_all(&root)?;
-    for (version, ok) in [("2.43.0", false), ("2.46.0", true), ("3.0.0", true)] {
+    for (version, ok) in [
+        ("2.43.0", false),
+        ("2.45.9", false),
+        ("2.46.0", true),
+        ("3.0.0", true),
+    ] {
         let fake = root.join(format!("git-{version}"));
         fs::write(&fake, format!("#!/bin/sh\necho 'git version {version}'\n"))?;
         fs::set_permissions(&fake, fs::Permissions::from_mode(0o755))?;
         let checked = checked_git(fake);
         assert_eq!(checked.is_ok(), ok, "{version}: {checked:?}");
         if !ok {
-            assert!(format!("{:#}", checked.unwrap_err()).contains("Git >= 2.46"));
+            let msg = format!("{:#}", checked.unwrap_err());
+            assert!(
+                msg.contains("Git >= 2.46") && msg.contains("TURBO_LEAN_GIT"),
+                "{msg}"
+            );
         }
     }
+    let bad_exit = root.join("git-exit-1");
+    fs::write(&bad_exit, "#!/bin/sh\necho 'fatal: broken' >&2\nexit 1\n")?;
+    fs::set_permissions(&bad_exit, fs::Permissions::from_mode(0o755))?;
+    let err = checked_git(bad_exit).expect_err("non-zero git version must fail closed");
+    assert!(format!("{err:#}").contains("exited with"), "{err:#}");
     fs::remove_dir_all(root)?;
     Ok(())
 }
@@ -391,10 +491,17 @@ fn trusted_git_never_lazily_fetches_or_runs_repository_helpers() -> Result<()> {
     ));
     let repo = root.join("repo");
     fs::create_dir_all(&repo)?;
+    let Some(git_bin) = discover_or_skip_trusted_git_for_test(&repo)? else {
+        let _ = fs::remove_dir_all(&root);
+        return Ok(());
+    };
+    if std::env::var_os("TURBO_LEAN_GIT").is_none() {
+        std::env::set_var("TURBO_LEAN_GIT", &git_bin);
+    }
     let marker = root.join("marker");
     // Plain Git with no inherited environment, like a host user or CI shell.
     let plain = |args: &[&str]| {
-        Command::new("git")
+        Command::new(&git_bin)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", &root)
@@ -442,7 +549,7 @@ fn trusted_git_never_lazily_fetches_or_runs_repository_helpers() -> Result<()> {
     assert!(!plain(&["cat-file", "-p", "HEAD:A.lean"])?.status.success());
     assert!(marker.exists(), "lazy fetch control did not run sshCommand");
     fs::remove_file(&marker)?;
-    let mut fill = Command::new("git");
+    let mut fill = Command::new(&git_bin);
     fill.env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", &root)
@@ -505,8 +612,11 @@ fn trusted_git_never_lazily_fetches_or_runs_repository_helpers() -> Result<()> {
 /// any `git status`/`diff` that enters the submodule runs the filter.
 #[cfg(test)]
 pub(crate) fn submodule_filter_fixture(root: &Path, via_include: bool) -> Result<PathBuf> {
+    let git_bin = std::env::var_os("TURBO_LEAN_GIT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/usr/bin/git"));
     let plain = |dir: &Path, args: &[&str]| -> Result<()> {
-        let out = Command::new("/usr/bin/git")
+        let out = Command::new(&git_bin)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", root)
@@ -586,6 +696,13 @@ pub(crate) fn restat_submodule_file(repo: &Path) -> Result<()> {
 #[cfg(test)]
 #[test]
 fn trusted_git_never_runs_submodule_only_filters() -> Result<()> {
+    let probe_dir = std::env::temp_dir();
+    let Some(git_bin) = discover_or_skip_trusted_git_for_test(&probe_dir)? else {
+        return Ok(());
+    };
+    if std::env::var_os("TURBO_LEAN_GIT").is_none() {
+        std::env::set_var("TURBO_LEAN_GIT", &git_bin);
+    }
     for via_include in [false, true] {
         let root = std::env::temp_dir().join(format!(
             "turbo-sub-filter-{}-{}",
@@ -596,7 +713,7 @@ fn trusted_git_never_runs_submodule_only_filters() -> Result<()> {
         let marker = root.join("marker");
         let plain = |args: &[&str]| -> Result<std::process::Output> {
             restat_submodule_file(&repo)?;
-            Ok(Command::new("/usr/bin/git")
+            Ok(Command::new(&git_bin)
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin")
                 .env("HOME", &root)
@@ -700,5 +817,69 @@ fn trusted_git_never_runs_submodule_only_filters() -> Result<()> {
         assert!(!marker.exists());
         fs::remove_dir_all(root)?;
     }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn trusted_git_uncached_resolution_validates_override_and_ci_fail_closed() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let _env_guard = crate::pack::tests::env_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let prev_git = std::env::var_os("TURBO_LEAN_GIT");
+    let prev_ci = std::env::var_os("CI");
+    let root = Path::new("/tmp").join(format!(
+        "turbo-trusted-git-res-{}-{}",
+        std::process::id(),
+        crate::pack::next_tmp_id()
+    ));
+    let proj = root.join("proj");
+    let bins = root.join("bins");
+    fs::create_dir_all(proj.join(".git"))?;
+    fs::create_dir_all(&bins)?;
+
+    let in_repo = proj.join("git-fake");
+    fs::write(&in_repo, "#!/bin/sh\necho 'git version 2.46.0'\n")?;
+    fs::set_permissions(&in_repo, fs::Permissions::from_mode(0o755))?;
+    std::env::set_var("TURBO_LEAN_GIT", &in_repo);
+    let err_inside = resolve_trusted_git_uncached(&proj)
+        .expect_err("TURBO_LEAN_GIT inside checkout must fail closed");
+    assert!(
+        format!("{err_inside:#}").contains("inside a project/checkout"),
+        "{err_inside:#}"
+    );
+
+    let old_bin = bins.join("git-2.43");
+    fs::write(&old_bin, "#!/bin/sh\necho 'git version 2.43.0'\n")?;
+    fs::set_permissions(&old_bin, fs::Permissions::from_mode(0o755))?;
+    std::env::set_var("TURBO_LEAN_GIT", &old_bin);
+    let err_old =
+        resolve_trusted_git_uncached(&proj).expect_err("TURBO_LEAN_GIT < 2.46 must fail closed");
+    assert!(
+        format!("{err_old:#}").contains("Git >= 2.46"),
+        "{err_old:#}"
+    );
+
+    let new_bin = bins.join("git-2.46");
+    fs::write(&new_bin, "#!/bin/sh\necho 'git version 2.46.2'\n")?;
+    fs::set_permissions(&new_bin, fs::Permissions::from_mode(0o755))?;
+    std::env::set_var("TURBO_LEAN_GIT", &new_bin);
+    let resolved = resolve_trusted_git_uncached(&proj)?;
+    assert_eq!(resolved, new_bin.canonicalize()?);
+
+    std::env::set_var("CI", "1");
+    std::env::set_var("TURBO_LEAN_GIT", &old_bin);
+    assert!(discover_or_skip_trusted_git_for_test(&proj).is_err());
+
+    match prev_git {
+        Some(v) => std::env::set_var("TURBO_LEAN_GIT", v),
+        None => std::env::remove_var("TURBO_LEAN_GIT"),
+    }
+    match prev_ci {
+        Some(v) => std::env::set_var("CI", v),
+        None => std::env::remove_var("CI"),
+    }
+    let _ = fs::remove_dir_all(&root);
     Ok(())
 }

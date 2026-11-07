@@ -2232,12 +2232,14 @@ fn execute_transpiled_cuda_kernel_raw(
     Ok(report)
 }
 
-fn suppress_uncertified_transpiled_cex(report: &mut TranspiledFastCheckReport) {
+fn ensure_transpiled_cex_certified(report: &TranspiledFastCheckReport) -> Result<()> {
     if !report.verified && !report.lean_native_certified {
-        report.verified = true;
-        report.violations = 0;
-        report.counterexample = None;
+        anyhow::bail!(
+            "Uncertified transpiled counterexample for `{}` rejected fail-closed (Lean kernel refutation did not certify witness)",
+            report.decl_name
+        );
     }
+    Ok(())
 }
 
 fn certify_transpiled_report_in_file(
@@ -2279,8 +2281,8 @@ pub fn execute_transpiled_cuda_kernel(
     n_states: u64,
     prefer_nvcc: bool,
 ) -> Result<TranspiledFastCheckReport> {
-    let mut report = execute_transpiled_cuda_kernel_raw(kernel, n_states, prefer_nvcc)?;
-    suppress_uncertified_transpiled_cex(&mut report);
+    let report = execute_transpiled_cuda_kernel_raw(kernel, n_states, prefer_nvcc)?;
+    ensure_transpiled_cex_certified(&report)?;
     Ok(report)
 }
 
@@ -2536,7 +2538,9 @@ fn eval_refutation_snippet_via_lean_kernel(
     let is_standalone = project_dir.is_none();
     let cache_key = {
         let mut h = blake3::Hasher::new();
-        h.update(b"cex-kernel-refute-v1\0");
+        h.update(b"cex-kernel-refute-v2\0");
+        h.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+        h.update(b"\0");
         h.update(toolchain.as_bytes());
         h.update(b"\0");
         h.update(qual_refute_name.as_bytes());
@@ -3594,6 +3598,29 @@ end TurboLean.FastCheck
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+fn shell_single_quote(s: &str) -> Result<String> {
+    anyhow::ensure!(
+        !s.contains('\0') && !s.contains('\n') && !s.contains('\r'),
+        "Refusing control/NUL byte in SSH argument"
+    );
+    Ok(format!("'{}'", s.replace('\'', "'\\''")))
+}
+
+fn validate_ssh_host_spec(label: &str, spec: &str) -> Result<()> {
+    let trimmed = spec.trim();
+    anyhow::ensure!(
+        !trimmed.is_empty() && !trimmed.starts_with('-'),
+        "Invalid {label} `{spec}`: must be non-empty and not start with `-`"
+    );
+    anyhow::ensure!(
+        trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'@' | b':')),
+        "Invalid {label} `{spec}`: contains disallowed shell/SSH metacharacters"
+    );
+    Ok(())
+}
+
 /// Zero-SQLite HTTP remote fast-check path (`turbo-lean fast-check --remote-http <URL>`).
 pub fn run_fast_check_remote_http_stateless(
     json: bool,
@@ -3637,6 +3664,12 @@ pub fn run_fast_check_remote_http_stateless(
     )?;
     let mut resp_json: serde_json::Value = serde_json::from_slice(&resp_bytes)
         .context("Failed to parse JSON response from remote HTTP `/fast-check`")?;
+    if resp_json["status"].as_str() == Some("error") || resp_json["ok"].as_bool() == Some(false) {
+        anyhow::bail!(
+            "Remote HTTP `/fast-check` returned error: {}",
+            resp_json["error"].as_str().unwrap_or("unknown error")
+        );
+    }
     resp_json["client_roundtrip_ms"] = serde_json::json!(t0.elapsed().as_millis());
     resp_json["remote_http"] = serde_json::json!(http_url);
     if json {
@@ -4150,7 +4183,10 @@ pub fn run_fast_check_command(
     let is_cu = gpu || file.extension().and_then(|s| s.to_str()) == Some("cu");
 
     if let Some(ssh_host) = remote_ssh {
-        let remote_tmp = format!("/tmp/turbo_fastcheck_{}.cu", std::process::id());
+        validate_ssh_host_spec("SSH host", &ssh_host)?;
+        if let Some(ref jump) = via_jump {
+            validate_ssh_host_spec("SSH jump host", jump)?;
+        }
         let src = fs::read(&file)?;
         let ssh_cfg_owned = std::env::var("SANDBOXED_DEVELOPMENT_IDENTITY")
             .ok()
@@ -4172,36 +4208,37 @@ pub fn run_fast_check_command(
             .as_ref()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_default();
-        let make_ssh_cmd = |remote_sh: &str| -> Command {
+        let make_ssh_cmd = |remote_sh: &str| -> Result<Command> {
             let mut cmd = Command::new("ssh");
+            cmd.arg("-o").arg("BatchMode=yes");
             if !ssh_cfg.is_empty() {
                 cmd.args(["-F", &ssh_cfg]);
             }
             if let Some(ref jump) = via_jump {
-                cmd.args([jump, &format!("ssh {} '{}'", ssh_host, remote_sh)]);
+                let q_host = shell_single_quote(&ssh_host)?;
+                let q_sh = shell_single_quote(remote_sh)?;
+                cmd.arg("--")
+                    .arg(jump)
+                    .arg(format!("ssh -o BatchMode=yes -- {q_host} {q_sh}"));
             } else {
-                cmd.args([&ssh_host, remote_sh]);
+                cmd.arg("--").arg(&ssh_host).arg(remote_sh);
             }
-            cmd
+            Ok(cmd)
         };
 
-        let mut child = make_ssh_cmd(&format!("cat > {}", remote_tmp))
+        let remote_script = "set -eu; d=$(mktemp -d \"${TMPDIR:-/tmp}/turbo_fastcheck.XXXXXXXXXX\"); trap 'rm -rf \"$d\"' EXIT INT TERM; cat > \"$d/kernel.cu\"; (/usr/local/cuda/bin/nvcc -O3 -arch=native \"$d/kernel.cu\" -lcuda -o \"$d/kernel.bin\" || nvcc -O3 -arch=native \"$d/kernel.cu\" -lcuda -o \"$d/kernel.bin\") && CUDA_MODULE_LOADING=LAZY \"$d/kernel.bin\"";
+        let run_t0 = Instant::now();
+        let mut child = make_ssh_cmd(remote_script)?
             .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .spawn()?;
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
             stdin.write_all(&src)?;
         }
-        child.wait()?;
-
-        let remote_cmd = format!(
-            "(/usr/local/cuda/bin/nvcc -O3 -arch=native {0} -lcuda -o {0}.bin || nvcc -O3 -arch=native {0} -lcuda -o {0}.bin) && CUDA_MODULE_LOADING=LAZY {0}.bin",
-            remote_tmp
-        );
-        let run_t0 = Instant::now();
-        let out = make_ssh_cmd(&remote_cmd).output()?;
+        let out = child.wait_with_output()?;
         let exec_ms = run_t0.elapsed().as_millis();
-        let _ = make_ssh_cmd(&format!("rm -f {0} {0}.bin", remote_tmp)).output();
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         if !out.status.success() {
@@ -7774,10 +7811,12 @@ allow_decl_names = [\"ShadowAst\"]
             transpile_lean_theorem_to_cuda(&src_text, Some("CustomWord.custom_and_left")).unwrap();
         let raw_rep = execute_transpiled_cuda_kernel_raw(&shadowed_kernel, 256, false).unwrap();
         assert!(!raw_rep.verified && !raw_rep.lean_native_certified);
-        let pub_rep = execute_transpiled_cuda_kernel(&shadowed_kernel, 256, false).unwrap();
+        let pub_err = execute_transpiled_cuda_kernel(&shadowed_kernel, 256, false).unwrap_err();
         assert!(
-            pub_rep.verified && pub_rep.violations == 0 && pub_rep.counterexample.is_none(),
-            "Uncertified transpiled witness must be suppressed by execute_transpiled_cuda_kernel"
+            pub_err
+                .to_string()
+                .contains("Uncertified transpiled counterexample"),
+            "Uncertified transpiled witness must fail closed in execute_transpiled_cuda_kernel, got: {pub_err}"
         );
         let store_dir = tmp_dir.join(".tl_store");
         let mut store = crate::db::TurboStore::open(Some(&store_dir)).unwrap();
@@ -7869,5 +7908,39 @@ theorem _turbo_memo_retry_probe :
             ),
             "Transient standalone kernel-refutation failure must not poison MEMO"
         );
+    }
+
+    #[test]
+    fn test_build_epoch_and_ssh_host_spec_and_uncertified_cex_fail_closed() {
+        assert_eq!(crate::TURBO_LEAN_BUILD_EPOCH.len(), 64);
+        assert!(crate::TURBO_LEAN_BUILD_EPOCH
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(crate::build_epoch_short().len(), 16);
+
+        assert!(validate_ssh_host_spec("ssh_host", "worker@10.0.0.5").is_ok());
+        assert!(validate_ssh_host_spec("ssh_host", "-oProxyCommand=evil").is_err());
+        assert!(validate_ssh_host_spec("ssh_host", "host with space").is_err());
+        assert!(validate_ssh_host_spec("ssh_host", "").is_err());
+        assert_eq!(shell_single_quote("a'b").unwrap(), "'a'\\''b'");
+
+        let uncert = TranspiledFastCheckReport {
+            decl_name: "Foo.bar".to_string(),
+            backend: "cpu".to_string(),
+            gpu_device: "none".to_string(),
+            n_states: 16,
+            violations: 1,
+            satisfied_preconditions: 16,
+            vacuous_precondition_warning: false,
+            verified: false,
+            kernel_ms: 0.1,
+            throughput_mstates_s: 1.0,
+            counterexample: None,
+            lean_native_certified: false,
+            lean_native_engine_version: String::new(),
+        };
+        let err =
+            ensure_transpiled_cex_certified(&uncert).expect_err("uncertified CEX must fail closed");
+        assert!(format!("{err:#}").contains("Uncertified transpiled counterexample"));
     }
 }

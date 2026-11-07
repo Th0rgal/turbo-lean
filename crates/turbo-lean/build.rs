@@ -142,6 +142,45 @@ fn find_elan_tool(tool_name: &str) -> Option<PathBuf> {
     None
 }
 
+fn collect_deterministic_files(root: &std::path::Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for p in paths {
+        let Ok(meta) = fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if meta.file_type().is_dir() {
+            collect_deterministic_files(&p, out);
+        } else if meta.file_type().is_file() {
+            out.push(p);
+        }
+    }
+}
+
+fn hash_epoch_file(
+    hasher: &mut blake3::Hasher,
+    tag: &str,
+    path: &std::path::Path,
+    emit_rerun: bool,
+) {
+    if emit_rerun {
+        println!("cargo:rerun-if-changed={}", path.display());
+    }
+    let bytes = fs::read(path).unwrap_or_else(|e| {
+        panic!(
+            "failed to read `{}` for TURBO_LEAN_BUILD_EPOCH: {e}",
+            path.display()
+        )
+    });
+    hasher.update(&(tag.len() as u64).to_le_bytes());
+    hasher.update(tag.as_bytes());
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(&bytes);
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=../../lean/TurboLean/PolicyGates.lean");
     println!("cargo:rerun-if-changed=../../lean/TurboLean/Kernel.lean");
@@ -149,8 +188,12 @@ fn main() {
     println!("cargo:rerun-if-changed=../../lean/LeanNative/Spec.lean");
     println!("cargo:rerun-if-changed=../../lean/lean-toolchain");
     println!("cargo:rerun-if-changed=../../lean/lakefile.lean");
+    println!("cargo:rerun-if-changed=../../lean/lake-manifest.json");
+    println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=src/zygote_fork_posix.lean");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=../../lean/TurboLean");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -511,6 +554,97 @@ fn main() {
         ar_status.success() && lib_path.is_file(),
         "failed to create static library libturbo_spec_cabi.a"
     );
+
+    let mut epoch_hasher = blake3::Hasher::new();
+    epoch_hasher.update(b"turbo-lean-build-epoch:v1\0");
+    hash_epoch_file(
+        &mut epoch_hasher,
+        "Cargo.toml",
+        &manifest_dir.join("Cargo.toml"),
+        true,
+    );
+    hash_epoch_file(
+        &mut epoch_hasher,
+        "build.rs",
+        &manifest_dir.join("build.rs"),
+        true,
+    );
+    let mut src_files = Vec::new();
+    collect_deterministic_files(&manifest_dir.join("src"), &mut src_files);
+    for p in &src_files {
+        let rel = p
+            .strip_prefix(&manifest_dir)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/");
+        hash_epoch_file(&mut epoch_hasher, &rel, p, true);
+    }
+    let mut turbo_lean_files = Vec::new();
+    collect_deterministic_files(&lean_dir.join("TurboLean"), &mut turbo_lean_files);
+    for p in &turbo_lean_files {
+        let rel = p
+            .strip_prefix(repo_root)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/");
+        hash_epoch_file(&mut epoch_hasher, &rel, p, true);
+    }
+    for (tag, opt_path, rerun) in [
+        (
+            "lean/LeanNative/Spec.lean",
+            Some(leannative_spec_lean.as_path()),
+            true,
+        ),
+        (
+            "lean/lean-toolchain",
+            Some(lean_dir.join("lean-toolchain").as_path()),
+            true,
+        ),
+        (
+            "lean/lakefile.lean",
+            Some(lean_dir.join("lakefile.lean").as_path()),
+            true,
+        ),
+        (
+            "lean/lake-manifest.json",
+            Some(lake_manifest_path.as_path()),
+            true,
+        ),
+        (
+            "out/PolicyGates.olean",
+            Some(policy_gates_olean.as_path()),
+            false,
+        ),
+        ("out/Kernel.olean", Some(kernel_olean.as_path()), false),
+        ("out/Spec.olean", Some(spec_olean.as_path()), false),
+        (
+            "out/TurboLean_Kernel_generated.c",
+            Some(kernel_c_path.as_path()),
+            false,
+        ),
+        ("lean/LeanSys/Spec.c", Some(lean_sys_spec_c.as_path()), true),
+        (
+            "lean/LeanNative/Spec.c",
+            Some(leannative_spec_c.as_path()),
+            true,
+        ),
+        ("lean/LeanSys.olean", Some(lean_sys_olean.as_path()), true),
+        (
+            "lean/LeanSys/Gate.olean",
+            Some(lean_sys_gate_olean.as_path()),
+            true,
+        ),
+        ("out/libturbo_spec_cabi.a", Some(lib_path.as_path()), false),
+    ] {
+        if let Some(p) = opt_path {
+            if p.is_file() {
+                hash_epoch_file(&mut epoch_hasher, tag, p, rerun);
+            }
+        }
+    }
+    let build_epoch = epoch_hasher.finalize().to_hex();
+    assert_eq!(build_epoch.len(), 64);
+    println!("cargo:rustc-env=TURBO_LEAN_BUILD_EPOCH={build_epoch}");
 
     println!("cargo:rustc-link-search=native={}", out_dir.display());
     println!("cargo:rustc-link-lib=static=turbo_spec_cabi");

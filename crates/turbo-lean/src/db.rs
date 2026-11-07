@@ -481,10 +481,13 @@ fn compute_kernel_replay_mac(
     replay_version: u32,
     toolchain_hash: &str,
 ) -> String {
+    let epoch = crate::TURBO_LEAN_BUILD_EPOCH;
     let mut msg = Vec::with_capacity(
-        64 + artifact_digest.len() + environment_digest.len() + toolchain_hash.len(),
+        80 + epoch.len() + artifact_digest.len() + environment_digest.len() + toolchain_hash.len(),
     );
-    msg.extend_from_slice(b"turbo-lean-verifier-replay-mac-v1\n");
+    msg.extend_from_slice(b"turbo-lean-verifier-replay-mac-v2\n");
+    msg.extend_from_slice(&(epoch.len() as u64).to_le_bytes());
+    msg.extend_from_slice(epoch.as_bytes());
     msg.extend_from_slice(&(artifact_digest.len() as u64).to_le_bytes());
     msg.extend_from_slice(artifact_digest.as_bytes());
     msg.extend_from_slice(&(environment_digest.len() as u64).to_le_bytes());
@@ -503,13 +506,17 @@ fn compute_kernel_audit_mac(
     toolchain_hash: &str,
     policy_digest: &str,
 ) -> String {
+    let epoch = crate::TURBO_LEAN_BUILD_EPOCH;
     let mut msg = Vec::with_capacity(
-        80 + artifact_digest.len()
+        96 + epoch.len()
+            + artifact_digest.len()
             + environment_digest.len()
             + toolchain_hash.len()
             + policy_digest.len(),
     );
-    msg.extend_from_slice(b"turbo-lean-verifier-audit-mac-v1\n");
+    msg.extend_from_slice(b"turbo-lean-verifier-audit-mac-v2\n");
+    msg.extend_from_slice(&(epoch.len() as u64).to_le_bytes());
+    msg.extend_from_slice(epoch.as_bytes());
     msg.extend_from_slice(&(artifact_digest.len() as u64).to_le_bytes());
     msg.extend_from_slice(artifact_digest.as_bytes());
     msg.extend_from_slice(&(environment_digest.len() as u64).to_le_bytes());
@@ -653,7 +660,11 @@ fn template_shm_path() -> (PathBuf, u32) {
     };
     let uid = unsafe { libc::geteuid() };
     (
-        shm_base.join(format!("turbo_lean_template_state_v9_{}.db", uid)),
+        shm_base.join(format!(
+            "turbo_lean_template_state_v10_{}_{}.db",
+            crate::build_epoch_short(),
+            uid
+        )),
         uid,
     )
 }
@@ -737,6 +748,7 @@ impl TurboStore {
         let mut from_template = false;
         let (template_path, uid) = template_shm_path();
         if !db_warm {
+            crate::pack::purge_orphan_locks_sidecars_on_cold_db_durable(&root)?;
             ensure_store_locks_dir_durable(&root)?;
             for sub in ["blobs", "staging"] {
                 match fs::create_dir(root.join(sub)) {
@@ -832,6 +844,21 @@ impl TurboStore {
                         KERNEL_AUDITED_OLEANS_AUTH_DDL
                     ))?;
                 }
+                if uver < 8 {
+                    let _ = conn.execute("DELETE FROM file_stat_cache", []);
+                    let _ = conn.execute("DELETE FROM file_split_cache", []);
+                    let _ = conn.execute("DELETE FROM lake_env_cache", []);
+                    let _ = conn.execute("DELETE FROM inflight_leases", []);
+                    let _ = conn.execute("DELETE FROM attestations", []);
+                    let _ = conn.execute("DELETE FROM action_outputs", []);
+                    let _ = conn.execute("DELETE FROM actions", []);
+                    let _ = conn.execute("DELETE FROM kernel_replayed_oleans", []);
+                    let _ = conn.execute("DELETE FROM kernel_replayed_oleans_auth", []);
+                    let _ = conn.execute("DELETE FROM kernel_audited_oleans_auth", []);
+                    let _ = fs::remove_file(root.join("file_splits.sst"));
+                    crate::pack::purge_pre_epoch_locks_sidecars_durable(&root)?;
+                    conn.execute_batch("PRAGMA user_version = 8;")?;
+                }
             }
         } else {
             conn.execute_batch(&format!(
@@ -886,7 +913,7 @@ impl TurboStore {
                      path_key TEXT PRIMARY KEY, mtime_sec INTEGER NOT NULL, mtime_nsec INTEGER NOT NULL,
                      size_bytes INTEGER NOT NULL, split_key TEXT NOT NULL, updated_at INTEGER NOT NULL
                  );
-                 PRAGMA user_version = 7;
+                 PRAGMA user_version = 8;
                  COMMIT;
                  PRAGMA wal_checkpoint(TRUNCATE);",
                 WORKTREE_LEASES_DDL,
@@ -919,10 +946,12 @@ impl TurboStore {
     }
 
     /// Compute the deterministic BLAKE3 cache key for `file_split_cache` from an existing
-    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v16:" + src_blake3_hex)`).
+    /// hex-encoded BLAKE3 digest of the raw file bytes (`BLAKE3("file-split:v17:" + epoch + ":" + src_blake3_hex)`).
     pub fn compute_file_split_key_from_src_hash(src_blake3_hex: &str) -> String {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"file-split:v16:");
+        hasher.update(b"file-split:v17:");
+        hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+        hasher.update(b":");
         hasher.update(src_blake3_hex.as_bytes());
         hasher.finalize().to_hex().to_string()
     }
@@ -1264,7 +1293,9 @@ impl TurboStore {
     /// `BLAKE3(canon_project_dir + lean-toolchain + lakefile.lean + lake-manifest.json)`
     pub fn compute_lake_env_key(canon_project_dir: &Path) -> String {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"lake-env-cache-v1\n");
+        hasher.update(b"lake-env-cache-v2\n");
+        hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+        hasher.update(b"\n");
         hasher.update(canon_project_dir.to_string_lossy().as_bytes());
         hasher.update(b"\n");
         for fname in [
@@ -9134,7 +9165,7 @@ mod tests {
         let uv: i64 = store
             .conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
-        assert_eq!(uv, 7);
+        assert_eq!(uv, 8);
         assert!(!store.has_kernel_replayed_olean("dig1", "env1", 2, "tc1", &[]));
         assert!(store
             .record_kernel_replayed_olean("", "env1", 2, "tc1", "M", &[])
@@ -9216,6 +9247,64 @@ mod tests {
 
         drop(ro);
         drop(store);
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_sqlite_v7_to_v8_migration_clears_stale_epoch_state_and_binds_keys() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_lean_db_v8_epoch_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let cache_dir = tmp_dir.join("cache");
+        fs::create_dir_all(&cache_dir)?;
+
+        let store = TurboStore::open(Some(&cache_dir))?;
+        store.put_lake_env(
+            "proj_v7",
+            &HashMap::from([("LEAN_PATH".to_string(), "stale".to_string())]),
+        )?;
+        let sp = crate::splitter::split_lean_source("theorem t : 1 = 1 := rfl\n", &[]);
+        store.batch_put_file_splits(&[("split_v7".to_string(), &sp)])?;
+        store.record_kernel_replayed_olean("dig_v7", "env_v7", 2, "tc_v7", "Stale.Mod", &[])?;
+        store.record_kernel_audited_olean(
+            "dig_v7",
+            "env_v7",
+            2,
+            "tc_v7",
+            "pol_v7",
+            "Stale.Mod",
+            &[],
+        )?;
+        fs::write(cache_dir.join("file_splits.sst"), b"stale-sst")?;
+        store.conn.execute_batch("PRAGMA user_version = 7;")?;
+        drop(store);
+
+        let migrated = TurboStore::open(Some(&cache_dir))?;
+        let uv: i64 = migrated
+            .conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
+        assert_eq!(uv, 8);
+        assert!(migrated.get_lake_env("proj_v7")?.is_none());
+        assert!(migrated
+            .batch_get_file_splits(&["split_v7".to_string()])?
+            .is_empty());
+        assert!(!migrated.has_kernel_replayed_olean("dig_v7", "env_v7", 2, "tc_v7", &[]));
+        let key = migrated
+            .load_verified_replay_hmac_key(&[])
+            .expect("hmac key");
+        assert!(!migrated
+            .has_kernel_audited_olean_with_key(&key, "dig_v7", "env_v7", 2, "tc_v7", "pol_v7"));
+        assert!(!cache_dir.join("file_splits.sst").exists());
+        assert!(cache_dir.join("staging").is_dir());
+        assert!(template_shm_path()
+            .0
+            .to_string_lossy()
+            .contains(crate::build_epoch_short()));
+        drop(migrated);
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
