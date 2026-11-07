@@ -8359,6 +8359,9 @@ pub(crate) struct LocalZygoteDaemonInfo {
     /// reused only under the same `daemon_policy()`.
     #[serde(default)]
     pub(crate) policy: Vec<String>,
+    /// Build epoch of the daemon binary; reused only when equal to `TURBO_LEAN_BUILD_EPOCH`.
+    #[serde(default)]
+    pub(crate) build_epoch: String,
 }
 
 /// Timeouts belong to requests; only axiom policy determines daemon identity.
@@ -8490,6 +8493,9 @@ fn current_exe_daemon_paths(store: &TurboStore) -> Option<(PathBuf, i64, i64, Pa
         .unwrap_or((0, 0, 0));
     let mut exe_hasher = blake3::Hasher::new();
     exe_hasher.update(current_exe.to_string_lossy().as_bytes());
+    exe_hasher.update(b":");
+    exe_hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+    exe_hasher.update(b":");
     // One daemon (and theorem CAS) per axiom policy: a pass under one policy is no cache hit
     // under a stricter one.
     exe_hasher.update(daemon_policy().join(",").as_bytes());
@@ -8518,7 +8524,10 @@ fn check_existing_daemon_state(
     if info.policy != daemon_policy() {
         return None;
     }
-    if info.exe_mtime_sec != exe_mtime_sec || info.exe_mtime_nsec != exe_mtime_nsec {
+    if info.build_epoch != crate::TURBO_LEAN_BUILD_EPOCH
+        || info.exe_mtime_sec != exe_mtime_sec
+        || info.exe_mtime_nsec != exe_mtime_nsec
+    {
         if kill_stale {
             terminate_and_remove_daemon_state_file(path);
         }
@@ -8656,6 +8665,7 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
             exe_mtime_nsec,
             auth_token: auth_token.clone(),
             policy: daemon_policy(),
+            build_epoch: crate::TURBO_LEAN_BUILD_EPOCH.to_string(),
         };
         if let Ok(json_bytes) = serde_json::to_vec(&info) {
             write_daemon_state_file_private(&state_file, &json_bytes);
@@ -9869,6 +9879,7 @@ mod tests {
             exe_mtime_nsec: 0,
             auth_token: String::new(),
             policy: vec![],
+            build_epoch: crate::TURBO_LEAN_BUILD_EPOCH.to_string(),
         };
         fs::write(&state, serde_json::to_vec(&info).unwrap()).unwrap();
         let mut identity = portable_process_identity(child.id())
@@ -13412,6 +13423,7 @@ mod tests {
             exe_mtime_nsec,
             auth_token: tok.to_string(),
             policy: daemon_policy(),
+            build_epoch: crate::TURBO_LEAN_BUILD_EPOCH.to_string(),
         };
         fs::write(
             store.root.join("zygote_daemon.json"),
@@ -14154,6 +14166,7 @@ mod tests {
             exe_mtime_nsec,
             auth_token: tok.to_string(),
             policy: daemon_policy(),
+            build_epoch: crate::TURBO_LEAN_BUILD_EPOCH.to_string(),
         };
         let daemon_json = serde_json::to_vec(&daemon_info).unwrap();
         fs::write(&state_file, &daemon_json).unwrap();

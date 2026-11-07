@@ -748,6 +748,7 @@ impl TurboStore {
         let mut from_template = false;
         let (template_path, uid) = template_shm_path();
         if !db_warm {
+            crate::pack::purge_orphan_locks_sidecars_on_cold_db_durable(&root)?;
             ensure_store_locks_dir_durable(&root)?;
             for sub in ["blobs", "staging"] {
                 match fs::create_dir(root.join(sub)) {
@@ -855,6 +856,7 @@ impl TurboStore {
                     let _ = conn.execute("DELETE FROM kernel_replayed_oleans_auth", []);
                     let _ = conn.execute("DELETE FROM kernel_audited_oleans_auth", []);
                     let _ = fs::remove_file(root.join("file_splits.sst"));
+                    crate::pack::purge_pre_epoch_locks_sidecars_durable(&root)?;
                     conn.execute_batch("PRAGMA user_version = 8;")?;
                 }
             }

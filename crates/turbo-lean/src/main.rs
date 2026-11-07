@@ -1240,12 +1240,7 @@ fn run(cli: Cli) -> Result<()> {
                 .filter(|s| !s.trim().is_empty())
                 .is_some();
         if !has_expected_sha {
-            if db_warm_on_open
-                || resolved_cache_root
-                    .join("locks")
-                    .join("last_import_stamp")
-                    .exists()
-            {
+            if db_warm_on_open {
                 if let Some(counts) = pack::try_stateless_warm_import_with_domain(
                     &resolved_cache_root,
                     input,
@@ -1330,11 +1325,7 @@ fn run(cli: Cli) -> Result<()> {
             let base = remote.trim_end_matches('/').to_string();
             if !push
                 && !has_strict_pull_policy
-                && (db_warm_on_open
-                    || resolved_cache_root
-                        .join("locks")
-                        .join("cached_portable_manifest.json")
-                        .exists())
+                && db_warm_on_open
                 && pack::try_stateless_noop_pull_sync(&resolved_cache_root, &base)
             {
                 if cli.json {

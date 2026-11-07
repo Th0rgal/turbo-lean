@@ -1683,6 +1683,13 @@ mod tests {
             0,
             u64::MAX
         ));
+        assert!(!leannative_certify_cex_witnesses_safe(
+            1_000_000,
+            u64::MAX,
+            u64::MAX
+        ));
+        assert!(!leannative_certify_cex_witnesses_safe(0, 0, u64::MAX));
+        assert!(!leannative_certify_cex_witnesses_safe(1_000_000, 0, 0));
         assert!(verify_dag_wave_step(0, 4, 8, 16, 4, 4));
         assert!(!verify_dag_wave_step(1, 4, 8, 16, 4, 4));
         assert!(!verify_dag_wave_step(0, 0, 8, 16, 4, 4));

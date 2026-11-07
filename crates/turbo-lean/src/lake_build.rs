@@ -398,12 +398,18 @@ pub(crate) fn worktree_auto_link_disabled(project_dir: &Path) -> bool {
             }
         }
     }
-    let res = toml_path
-        .as_deref()
-        .and_then(|p| fs::read_to_string(p).ok())
-        .and_then(|t| crate::accelerators::toml_value(&t, "worktree", "auto_link"))
-        .and_then(|v| crate::shm_cache::parse_relaxed_bool(&v))
-        == Some(false);
+    let computed: Option<bool> = match toml_path.as_deref() {
+        None => Some(false),
+        Some(p) => fs::read_to_string(p).ok().map(|t| {
+            crate::accelerators::toml_value(&t, "worktree", "auto_link")
+                .and_then(|v| crate::shm_cache::parse_relaxed_bool(&v))
+                == Some(false)
+        }),
+    };
+    let res = match computed {
+        Some(v) => v,
+        None => return true,
+    };
     if let Ok(mut g) = memo.lock() {
         if crate::module_builder::current_memo_window() == window {
             if g.len() >= 1024 {

@@ -236,6 +236,7 @@ pub fn serve_cas_http_with_auth(
                 exe_mtime_nsec,
                 auth_token: std::env::var("TURBO_LEAN_DAEMON_TOKEN").unwrap_or_default(),
                 policy: crate::zygote::daemon_policy(),
+                build_epoch: crate::TURBO_LEAN_BUILD_EPOCH.to_string(),
             };
             if let Ok(json_bytes) = serde_json::to_vec(&info) {
                 let _ = fs::write(&state_path, &json_bytes);
