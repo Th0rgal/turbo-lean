@@ -40600,7 +40600,15 @@ globs = ["Down.+"]
         let dag = build_module_dag(&cfg, &[])?;
         assert!(dag.nodes.contains_key("App"));
         assert!(!dag.nodes.contains_key("ProofWidgets"));
-        assert!(!compute_module_cas_key(&cfg, &dag.nodes["App"], &[], false)?.is_empty());
+        let app_node = &dag.nodes["App"];
+        let mut app_deps: Vec<(String, String)> = app_node
+            .external_olean_deps
+            .iter()
+            .map(|(m, p)| Ok((m.clone(), compute_olean_artifact_set_digest(p)?)))
+            .collect::<Result<Vec<_>>>()?;
+        app_deps.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(app_deps.len(), 2);
+        assert!(!compute_module_cas_key(&cfg, app_node, &app_deps, false)?.is_empty());
         // Dirty tracked custom-target input (`widget/js/hello.tsx`) must fail closed even when `.lean` is untouched.
         fs::write(pw_dir.join("widget/js/hello.tsx"), "export default { pwned: true }\n")?;
         let mut cache_tsx = LakeClosureCache::default();
