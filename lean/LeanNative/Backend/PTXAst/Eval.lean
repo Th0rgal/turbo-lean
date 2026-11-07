@@ -581,6 +581,23 @@ def ppPTXType : PTXType → String
   | .f32  => ".f32"
   | .f64  => ".f64"
 
+/-- Fuel-bounded token parser; the unconsumed suffix is returned verbatim. -/
+def parsePTXType : Nat → List Char → Option (PTXType × List Char)
+  | 0, _ => none
+  | _ + 1, '.' :: 'p' :: 'r' :: 'e' :: 'd' :: cs => some (.pred, cs)
+  | _ + 1, '.' :: 'b' :: '8' :: cs => some (.b8, cs)
+  | _ + 1, '.' :: 'b' :: '1' :: '6' :: cs => some (.b16, cs)
+  | _ + 1, '.' :: 'b' :: '3' :: '2' :: cs => some (.b32, cs)
+  | _ + 1, '.' :: 'b' :: '6' :: '4' :: cs => some (.b64, cs)
+  | _ + 1, '.' :: 'u' :: '1' :: '6' :: cs => some (.u16, cs)
+  | _ + 1, '.' :: 'u' :: '3' :: '2' :: cs => some (.u32, cs)
+  | _ + 1, '.' :: 'u' :: '6' :: '4' :: cs => some (.u64, cs)
+  | _ + 1, '.' :: 's' :: '3' :: '2' :: cs => some (.s32, cs)
+  | _ + 1, '.' :: 's' :: '6' :: '4' :: cs => some (.s64, cs)
+  | _ + 1, '.' :: 'f' :: '3' :: '2' :: cs => some (.f32, cs)
+  | _ + 1, '.' :: 'f' :: '6' :: '4' :: cs => some (.f64, cs)
+  | _, _ => none
+
 /-- Evaluate a `PTXOperand` to a `BitVec 64` in the context of a thread and CTA. -/
 def evalOperand (cta : PTXCTAState) (th : PTXThreadState) (op : PTXOperand)
     (expectedWidth? : Option Nat := none) : PTXOutcome (BitVec 64) :=
@@ -2153,15 +2170,15 @@ def ppCmpOp : PTXCmpOp → String
   | .hi => ".hi"
   | .hs => ".hs"
 
-private def hexDigitChar (n : Nat) : Char :=
+def hexDigitChar (n : Nat) : Char :=
   let d := n % 16
   if d < 10 then Char.ofNat ('0'.toNat + d) else Char.ofNat ('a'.toNat + (d - 10))
 
-private def toHexFixedGo (v : Nat) (acc : List Char) : Nat → List Char
+def toHexFixedGo (v : Nat) (acc : List Char) : Nat → List Char
   | 0 => acc
   | k + 1 => toHexFixedGo (v / 16) (hexDigitChar v :: acc) k
 
-private def toHexFixed (val : Nat) (nibbles : Nat) : String :=
+def toHexFixed (val : Nat) (nibbles : Nat) : String :=
   String.ofList (toHexFixedGo val [] nibbles)
 
 /-- Render a `PTXOperand`. -/
@@ -2177,12 +2194,10 @@ def ppPTXOperand : PTXOperand → String
 /-- Render a `PTXAddr` bracketed memory operand. -/
 def ppPTXAddr : PTXAddr → String
   | .paramSym name => s!"[{name}]"
-  | .regOffset r 0 => s!"[{r}]"
   | .regOffset r off =>
-    if off > 0 then s!"[{r}+{off}]" else s!"[{r}{off}]"
-  | .symOffset s 0 => s!"[{s}]"
+    if off = 0 then s!"[{r}]" else if off > 0 then s!"[{r}+{off}]" else s!"[{r}{off}]"
   | .symOffset s off =>
-    if off > 0 then s!"[{s}+{off}]" else s!"[{s}{off}]"
+    if off = 0 then s!"[{s}]" else if off > 0 then s!"[{s}+{off}]" else s!"[{s}{off}]"
 
 /-- Render a `PTXPredGuard` (`@%p1 ` or `@!%p1 `). -/
 def ppPredGuard (g : PTXPredGuard) : String :=
@@ -2271,10 +2286,14 @@ def ppPTXStmt : PTXStmt → String
   | .instr none ins => s!"    {ppPTXInstr ins}"
   | .instr (some g) ins => s!"    {ppPredGuard g}{ppPTXInstr ins}"
 
-/-- Render a `.visible .entry` `PTXKernel`. -/
-def ppPTXKernel (k : PTXKernel) : String :=
-  let paramLines := String.intercalate ",\n"
-    (k.params.map fun p => s!"    .param {ppPTXType p.ty} {p.name}")
+/-- Parameter lines retain the comma on every non-final parameter. -/
+def ppPTXParamLines : List PTXParamDecl → List String
+  | [] => []
+  | p :: ps => (s!"    .param {ppPTXType p.ty} {p.name}" ++
+      if ps.isEmpty then "" else ",") :: ppPTXParamLines ps
+
+/-- Declaration and statement lines in their canonical section order. -/
+def ppPTXKernelBodyLines (k : PTXKernel) : List String :=
   let sharedLines := k.sharedDecls.map fun s =>
     s!"    .shared .align {s.align} {ppPTXType s.elemTy} {s.name}[{s.count}];"
   let localLines :=
@@ -2283,10 +2302,13 @@ def ppPTXKernel (k : PTXKernel) : String :=
   let regLines := k.regDecls.map fun r =>
     s!"    .reg {ppPTXType r.ty} {r.prefixName}<{r.count}>;"
   let bodyLines := k.body.map ppPTXStmt
-  let header :=
-    if k.params.isEmpty then s!".visible .entry {k.name}()\n\{"
-    else s!".visible .entry {k.name}(\n{paramLines}\n)\n\{"
-  String.intercalate "\n" ([header] ++ sharedLines ++ localLines ++ regLines ++ bodyLines ++ ["}"])
+  sharedLines ++ localLines ++ regLines ++ bodyLines
+
+/-- Render a `.visible .entry` `PTXKernel` from newline-free structural lines. -/
+def ppPTXKernel (k : PTXKernel) : String :=
+  let header := if k.params.isEmpty then [s!".visible .entry {k.name}()", "{"]
+    else [s!".visible .entry {k.name}("] ++ ppPTXParamLines k.params ++ [")", "{"]
+  String.intercalate "\n" (header ++ ppPTXKernelBodyLines k ++ ["}"])
 
 /-- Render the canonical `.version` / `.target` / `.address_size` header of a `PTXModule`. -/
 def ppPTXModuleHeader (m : PTXModule) : String :=
@@ -2298,5 +2320,394 @@ def ppPTXModule (m : PTXModule) : String :=
   match m.kernels with
   | [] => header ++ "\n"
   | ks => header ++ "\n\n" ++ String.intercalate "\n\n" (ks.map ppPTXKernel) ++ "\n"
+
+/-- Exact prefix consumption shared by the textual PTX parsers. -/
+def stripPrefixChars : List Char → List Char → Option (List Char)
+  | [], input => some input
+  | _ :: _, [] => none
+  | p :: ps, c :: cs => if p == c then stripPrefixChars ps cs else none
+
+/-- Register/identifier characters, excluding every PTX operand delimiter. -/
+def ptxNameChar (c : Char) : Bool := c.isAlphanum || c == '_' || c == '$' || c == '.' || c == '%'
+
+/-- Scan a lexeme with a strict character budget, retaining its delimiter. -/
+def scanPTXName : Nat → List Char → Option (List Char × List Char)
+  | 0, _ => none
+  | _ + 1, [] => some ([], [])
+  | fuel + 1, c :: cs =>
+    if ptxNameChar c then do
+      let (name, rest) ← scanPTXName fuel cs
+      return (c :: name, rest)
+    else some ([], c :: cs)
+
+/-- Predicate names must be nonempty `%` registers with no delimiters. -/
+def CanonicalPTXPredGuard (g : PTXPredGuard) : Prop :=
+  (∃ cs, g.predReg.toList = '%' :: cs ∧ cs ≠ []) ∧
+    ∀ c ∈ g.predReg.toList, ptxNameChar c = true
+
+def ptxSpecialRegs : List SpecialReg :=
+  [.tidX, .tidY, .tidZ, .ntidX, .ntidY, .ntidZ,
+   .ctaidX, .ctaidY, .ctaidZ, .nctaidX, .nctaidY, .nctaidZ]
+
+def CanonicalPTXName (name : String) : Prop :=
+  name.toList ≠ [] ∧ ∀ c ∈ name.toList, ptxNameChar c = true
+
+/-- Printed names must be lexically distinguishable from numbers and registers. -/
+def CanonicalPTXSymbol (name : String) : Prop :=
+  CanonicalPTXName name ∧ ∃ c cs, name.toList = c :: cs ∧
+    (c.isAlpha = true ∨ c = '_' ∨ c = '$')
+
+def CanonicalPTXOperand : PTXOperand → Prop
+  | .reg name => CanonicalPTXName name ∧ name.startsWith "%" = true ∧
+      ∀ sr ∈ ptxSpecialRegs, ppSpecialReg sr ≠ name
+  | .sym name => CanonicalPTXSymbol name
+  | .immS64 n => n < 0
+  | .sreg _ | .immU64 _ | .immF32 _ | .immF64 _ => True
+
+/-- The printer conflates `paramSym s` and `symOffset s 0`; only the former is canonical. -/
+def CanonicalPTXAddr : PTXAddr → Prop
+  | .paramSym name => CanonicalPTXSymbol name
+  | .regOffset name _ => CanonicalPTXName name ∧ name.startsWith "%" = true
+  | .symOffset name offset => CanonicalPTXSymbol name ∧ offset ≠ 0
+
+/-- Scalar instruction grammar, with lexical premises independent of parser success. -/
+def CanonicalPTXInstr : PTXInstr → Prop
+  | .mov _ d a | .cvtaToGlobal _ d a | .cvt _ _ _ d a
+  | .bitNot _ d a | .neg _ d a | .clz _ d a =>
+    CanonicalPTXName d ∧ CanonicalPTXOperand a
+  | .ldParam _ d p => CanonicalPTXName d ∧ CanonicalPTXSymbol p
+  | .ldGlobal _ d a | .ldShared _ d a | .ldConst _ d a | .ldLocal _ d a =>
+    CanonicalPTXName d ∧ CanonicalPTXAddr a
+  | .stGlobal _ a s | .stShared _ a s | .stConst _ a s | .stLocal _ a s =>
+    CanonicalPTXAddr a ∧ CanonicalPTXOperand s
+  | .add _ _ d a b | .sub _ d a b | .mul _ _ d a b | .div _ d a b | .rem _ d a b
+  | .bitAnd _ d a b | .bitOr _ d a b | .bitXor _ d a b | .shl _ d a b | .shr _ d a b
+  | .setp _ _ d a b => CanonicalPTXName d ∧ CanonicalPTXOperand a ∧ CanonicalPTXOperand b
+  | .mad _ _ d a b c | .fma _ _ d a b c =>
+    CanonicalPTXName d ∧ CanonicalPTXOperand a ∧ CanonicalPTXOperand b ∧ CanonicalPTXOperand c
+  | .selp _ d a b p =>
+    CanonicalPTXName d ∧ CanonicalPTXOperand a ∧ CanonicalPTXOperand b ∧ CanonicalPTXName p
+  | .bra label => CanonicalPTXName label
+  | .barSync _ | .ret => True
+  | _ => False
+
+def CanonicalPTXStmt : PTXStmt → Prop
+  | .label name => CanonicalPTXName name
+  | .instr guard instr => (∀ g ∈ guard, CanonicalPTXPredGuard g) ∧ CanonicalPTXInstr instr
+
+def CanonicalPTXParamDecl (p : PTXParamDecl) : Prop := CanonicalPTXSymbol p.name
+
+def CanonicalPTXRegDecl (r : PTXRegDecl) : Prop :=
+  CanonicalPTXName r.prefixName ∧ r.prefixName.startsWith "%" = true
+
+def CanonicalPTXSharedDecl (s : PTXSharedDecl) : Prop := CanonicalPTXSymbol s.name
+
+def CanonicalPTXKernel (k : PTXKernel) : Prop :=
+  CanonicalPTXSymbol k.name ∧
+  (∀ p ∈ k.params, CanonicalPTXParamDecl p) ∧
+  (∀ r ∈ k.regDecls, CanonicalPTXRegDecl r) ∧
+  (∀ s ∈ k.sharedDecls, CanonicalPTXSharedDecl s) ∧
+  (∀ s ∈ k.body, CanonicalPTXStmt s)
+
+/-- A structural upper bound for every identifier, decimal field, and body statement. -/
+def ptxKernelFuel (k : PTXKernel) : Nat :=
+  2 + k.name.toList.length + k.localBytes.repr.toList.length +
+    (k.params.map (fun p => p.name.toList.length)).sum +
+    (k.regDecls.map (fun r => r.prefixName.toList.length + r.count.repr.toList.length)).sum +
+    (k.sharedDecls.map (fun s => s.name.toList.length + s.align.repr.toList.length +
+      s.count.repr.toList.length)).sum +
+    (k.body.map (fun s => (ppPTXStmt s).toList.length)).sum
+
+/-- Disambiguate register names from the twelve architectural special registers. -/
+def parsePTXNamedOperand (name : String) : PTXOperand :=
+  match ptxSpecialRegs.find? (fun sr => ppSpecialReg sr == name) with
+  | some sr => .sreg sr
+  | none => if name.startsWith "%" then .reg name else .sym name
+
+/-- Hexadecimal floating immediates encode bits, not a decimal floating value. -/
+def parsePTXHex : Nat → List Char → Option Nat
+  | 0, [] => some 0
+  | n + 1, c :: cs => do
+    let digit ← if c ≥ '0' && c ≤ '9' then some (c.toNat - '0'.toNat)
+      else if c ≥ 'a' && c ≤ 'f' then some (c.toNat - 'a'.toNat + 10) else none
+    let tail ← parsePTXHex n cs
+    return digit * 16^n + tail
+  | _, _ => none
+
+/-- Parse a PTX operand without consuming its delimiter; decimal words are width checked. -/
+def parsePTXOperand (fuel : Nat) (input : List Char) : Option (PTXOperand × List Char) := do
+  let (negative, input) := match input with
+    | '-' :: rest => (true, rest)
+    | _ => (false, input)
+  let (chars, rest) ← scanPTXName fuel input
+  if chars.isEmpty then none else do
+    let name := String.ofList chars
+    if negative then
+      let n ← name.toNat?
+      if n == 0 then none else return (.immS64 (-(Int.ofNat n)), rest)
+    else if name.startsWith "%" then return (parsePTXNamedOperand name, rest)
+    else if let '0' :: 'f' :: hex := chars then
+      return (.immF32 (UInt32.ofNat (← parsePTXHex 8 hex)), rest)
+    else if let '0' :: 'd' :: hex := chars then
+      return (.immF64 (UInt64.ofNat (← parsePTXHex 16 hex)), rest)
+    else if let some n := name.toNat? then
+      if n < 2^64 then return (.immU64 (BitVec.ofNat 64 n), rest) else none
+    else return (parsePTXNamedOperand name, rest)
+
+/-- Address names use the same lexer; offsets are signed decimal byte offsets.
+Zero-offset symbols have the unique `paramSym` representation. -/
+def parsePTXAddr (fuel : Nat) (input : List Char) : Option (PTXAddr × List Char) := do
+  let input ← stripPrefixChars ['['] input
+  let (chars, rest) ← scanPTXName fuel input
+  if chars.isEmpty then none else do
+    let name := String.ofList chars
+    let (offset, rest) ← (show Option (Int × List Char) from match rest with
+      | '+' :: cs => do
+        let (ds, rest) ← scanPTXName fuel cs
+        return (Int.ofNat (← (String.ofList ds).toNat?), rest)
+      | '-' :: cs => do
+        let (ds, rest) ← scanPTXName fuel cs
+        return (-(Int.ofNat (← (String.ofList ds).toNat?)), rest)
+      | _ => some (0, rest))
+    let rest ← stripPrefixChars [']'] rest
+    return ((if name.startsWith "%" then .regOffset name offset
+      else if offset == 0 then .paramSym name else .symOffset name offset), rest)
+
+/-- Read a delimiter-terminated identifier, retaining no delimiter in the AST. -/
+def parsePTXName (fuel : Nat) (input : List Char) : Option (String × List Char) := do
+  let (chars, rest) ← scanPTXName fuel input
+  if chars.isEmpty then none else return (String.ofList chars, rest)
+
+/-- Structural dot-separated opcode fields; unlike operand names, dots delimit modifiers. -/
+def ptxOpcodeFields : List Char → List (List Char)
+  | [] => [[]]
+  | '.' :: cs => [] :: ptxOpcodeFields cs
+  | c :: cs => match ptxOpcodeFields cs with
+    | [] => [[c]]
+    | field :: fields => (c :: field) :: fields
+
+/-- Total instruction parser for scalar arithmetic and ordinary memory operations.
+Packed moves, shuffle and atomics are outside this fragment. -/
+def parsePTXInstr (fuel : Nat) (input : List Char) : Option (PTXInstr × List Char) := do
+  let (token, rest) ← parsePTXName fuel input
+  if token == "ret" then return (.ret, ← stripPrefixChars [';'] rest)
+  let rest ← stripPrefixChars [' '] rest
+  if token == "bra" then
+    let (label, rest) ← parsePTXName fuel rest
+    return (.bra label, ← stripPrefixChars [';'] rest)
+  if token == "bar.sync" then
+    let (n, rest) ← parsePTXName fuel rest
+    return (.barSync (← n.toNat?), ← stripPrefixChars [';'] rest)
+  let parts := (ptxOpcodeFields token.toList).map String.ofList
+  let opcode ← parts.head?
+  let suffix := "." ++ (← parts.getLast?)
+  let (ty, []) ← parsePTXType fuel suffix.toList | none
+  let mods := parts.drop 1 |>.dropLast
+  if opcode == "st" then
+    let (addr, rest) ← parsePTXAddr fuel rest
+    let rest ← stripPrefixChars [',', ' '] rest
+    let (src, rest) ← parsePTXOperand fuel rest
+    let ins ← match mods with
+      | ["global"] => some (PTXInstr.stGlobal ty addr src)
+      | ["shared"] => some (.stShared ty addr src)
+      | ["local"] => some (.stLocal ty addr src)
+      | ["const"] => some (.stConst ty addr src)
+      | _ => none
+    return (ins, ← stripPrefixChars [';'] rest)
+  let (dst, rest) ← parsePTXName fuel rest
+  let rest ← stripPrefixChars [',', ' '] rest
+  if opcode == "ld" then
+    let (addr, rest) ← parsePTXAddr fuel rest
+    let ins ← match mods, addr with
+      | ["param"], .paramSym name => some (PTXInstr.ldParam ty dst name)
+      | ["global"], _ => some (.ldGlobal ty dst addr)
+      | ["shared"], _ => some (.ldShared ty dst addr)
+      | ["local"], _ => some (.ldLocal ty dst addr)
+      | ["const"], _ => some (.ldConst ty dst addr)
+      | _, _ => none
+    return (ins, ← stripPrefixChars [';'] rest)
+  let (a, rest) ← parsePTXOperand fuel rest
+  if opcode == "cvta" then
+    if mods == ["to", "global"] then
+      return (.cvtaToGlobal ty dst a, ← stripPrefixChars [';'] rest)
+    else none
+  if opcode == "cvt" then
+    let (rounding, dstToken) ← match mods with
+      | [dstToken] => some (PTXRoundMode.none, dstToken)
+      | ["rn", dstToken] => some (.rn, dstToken)
+      | ["rz", dstToken] => some (.rz, dstToken)
+      | _ => none
+    let (dstTy, []) ← parsePTXType fuel ("." ++ dstToken).toList | none
+    return (.cvt rounding dstTy ty dst a, ← stripPrefixChars [';'] rest)
+  if !(opcode == "add" || opcode == "mul" || opcode == "mad" || opcode == "fma" ||
+      opcode == "setp") && !mods.isEmpty then none else do
+  let rm ← match mods with
+    | [] => some PTXRoundMode.none | ["rn"] => some .rn | ["rz"] => some .rz
+    | _ => if opcode == "mul" || opcode == "mad" || opcode == "setp" then some .none else none
+  let unary ← match opcode with
+    | "mov" => some (some (PTXInstr.mov ty dst a))
+    | "not" => some (some (.bitNot ty dst a))
+    | "neg" => some (some (.neg ty dst a))
+    | "clz" => some (some (.clz ty dst a))
+    | "add" | "sub" | "div" | "rem" | "and" | "or" | "xor" | "shl" | "shr"
+    | "mul" | "mad" | "fma" | "setp" | "selp" => some none
+    | _ => none
+  if let some instr := unary then return (instr, ← stripPrefixChars [';'] rest)
+  let rest ← stripPrefixChars [',', ' '] rest
+  let (b, rest) ← parsePTXOperand fuel rest
+  if opcode == "selp" then
+    let rest ← stripPrefixChars [',', ' '] rest
+    let (p, rest) ← parsePTXName fuel rest
+    return (.selp ty dst a b p, ← stripPrefixChars [';'] rest)
+  if opcode == "setp" then
+    let cmp ← match mods with
+      | ["eq"] => some PTXCmpOp.eq | ["ne"] => some .ne
+      | ["lt"] => some .lt | ["le"] => some .le
+      | ["gt"] => some .gt | ["ge"] => some .ge
+      | ["lo"] => some .lo | ["ls"] => some .ls
+      | ["hi"] => some .hi | ["hs"] => some .hs | _ => none
+    return (.setp cmp ty dst a b, ← stripPrefixChars [';'] rest)
+  if opcode == "mul" || opcode == "mad" then
+    let mode ← match mods with
+      | ["lo"] => some PTXMulMode.lo | ["hi"] => some .hi
+      | ["wide"] => some .wide | ["rn"] => some .rn | _ => none
+    if opcode == "mul" then return (.mul mode ty dst a b, ← stripPrefixChars [';'] rest)
+    let rest ← stripPrefixChars [',', ' '] rest
+    let (c, rest) ← parsePTXOperand fuel rest
+    return (.mad mode ty dst a b c, ← stripPrefixChars [';'] rest)
+  if opcode == "fma" then
+    let rest ← stripPrefixChars [',', ' '] rest
+    let (c, rest) ← parsePTXOperand fuel rest
+    return (.fma rm ty dst a b c, ← stripPrefixChars [';'] rest)
+  let instr ← match opcode with
+    | "add" => some (PTXInstr.add rm ty dst a b)
+    | "sub" => some (.sub ty dst a b)
+    | "div" => some (.div ty dst a b)
+    | "rem" => some (.rem ty dst a b)
+    | "and" => some (.bitAnd ty dst a b)
+    | "or" => some (.bitOr ty dst a b)
+    | "xor" => some (.bitXor ty dst a b)
+    | "shl" => some (.shl ty dst a b)
+    | "shr" => some (.shr ty dst a b)
+    | _ => none
+  return (instr, ← stripPrefixChars [';'] rest)
+
+/-- Parse the exact `@%p ` / `@!%p ` prefix emitted by `ppPredGuard`. -/
+def parsePTXPredGuard : Nat → List Char → Option (PTXPredGuard × List Char)
+  | 0, _ => none
+  | fuel + 1, input => do
+    let input ← stripPrefixChars ['@'] input
+    let (negated, input) := match input with
+      | '!' :: rest => (true, rest)
+      | _ => (false, input)
+    let (name, rest) ← scanPTXName fuel input
+    let rest ← stripPrefixChars [' '] rest
+    return ({ predReg := String.ofList name, negated }, rest)
+
+/-- Parse labels or indented, optionally predicated instructions. -/
+def parsePTXStmt (fuel : Nat) (input : List Char) : Option (PTXStmt × List Char) := do
+  if let some input := stripPrefixChars [' ', ' ', ' ', ' '] input then
+    let (guard, input) ← (show Option (Option PTXPredGuard × List Char) from
+      match input with
+      | '@' :: _ => do
+        let (g, rest) ← parsePTXPredGuard fuel input
+        return (some g, rest)
+      | _ => some (none, input))
+    let (instr, rest) ← parsePTXInstr fuel input
+    return (.instr guard instr, rest)
+  else
+    let (name, rest) ← parsePTXName fuel input
+    return (.label name, ← stripPrefixChars [':'] rest)
+
+/-- Scan newline-delimited text with a character budget. -/
+def scanPTXLines : Nat → List Char → Option (List (List Char))
+  | 0, _ => none
+  | _ + 1, [] => some [[]]
+  | fuel + 1, c :: cs => do
+    let line :: lines ← scanPTXLines fuel cs | none
+    if c == '\n' then return [] :: line :: lines
+    else return (c :: line) :: lines
+
+def parsePTXParamDecl (fuel : Nat) (input : List Char) :
+    Option (PTXParamDecl × List Char) := do
+  let input ← stripPrefixChars "    .param ".toList input
+  let (ty, input) ← parsePTXType fuel input
+  let input ← stripPrefixChars [' '] input
+  let (name, rest) ← parsePTXName fuel input
+  return ({ name, ty }, rest)
+
+def parsePTXRegDecl (fuel : Nat) (input : List Char) :
+    Option (PTXRegDecl × List Char) := do
+  let input ← stripPrefixChars "    .reg ".toList input
+  let (ty, input) ← parsePTXType fuel input
+  let input ← stripPrefixChars [' '] input
+  let (prefixName, input) ← parsePTXName fuel input
+  let input ← stripPrefixChars ['<'] input
+  let (count, input) ← parsePTXName fuel input
+  let rest ← stripPrefixChars ['>', ';'] input
+  return ({ ty, prefixName, count := ← count.toNat? }, rest)
+
+def parsePTXSharedDecl (fuel : Nat) (input : List Char) :
+    Option (PTXSharedDecl × List Char) := do
+  let input ← stripPrefixChars "    .shared .align ".toList input
+  let (align, input) ← parsePTXName fuel input
+  let input ← stripPrefixChars [' '] input
+  let (elemTy, input) ← parsePTXType fuel input
+  let input ← stripPrefixChars [' '] input
+  let (name, input) ← parsePTXName fuel input
+  let input ← stripPrefixChars ['['] input
+  let (count, input) ← parsePTXName fuel input
+  let rest ← stripPrefixChars [']', ';'] input
+  return ({ name, elemTy, align := ← align.toNat?, count := ← count.toNat? }, rest)
+
+/-- Consume declaration/body lines structurally, preserving the parser's section state.
+Declarations may be interleaved before the first statement, but never follow it. -/
+def parsePTXDeclsAndBody (fuel : Nat) : List String → PTXKernel → Bool → Option PTXKernel
+  | [], kernel, _ => some kernel
+  | line :: lines, kernel, inBody => do
+    if let some (reg, []) := parsePTXRegDecl fuel line.toList then
+      if inBody then none else
+        parsePTXDeclsAndBody fuel lines { kernel with regDecls := kernel.regDecls ++ [reg] } false
+    else if let some (shared, []) := parsePTXSharedDecl fuel line.toList then
+      if inBody then none else
+        parsePTXDeclsAndBody fuel lines { kernel with sharedDecls := kernel.sharedDecls ++ [shared] } false
+    else if let some chars := stripPrefixChars "    .local .align 8 .b8 __local_mem[".toList line.toList then
+      if inBody || kernel.localBytes != 0 then none else do
+        let (count, chars) ← parsePTXName fuel chars
+        let [] ← stripPrefixChars [']', ';'] chars | none
+        parsePTXDeclsAndBody fuel lines { kernel with localBytes := ← count.toNat? } false
+    else
+      let (stmt, []) ← parsePTXStmt fuel line.toList | none
+      parsePTXDeclsAndBody fuel lines { kernel with body := kernel.body ++ [stmt] } true
+
+/-- Parse a complete kernel, retaining declaration order and rejecting unknown lines. -/
+def parsePTXKernel (fuel : Nat) (text : String) : Option PTXKernel := do
+  let header :: lines := (← scanPTXLines (text.toList.length + 1) text.toList).map String.ofList | none
+  let header ← stripPrefixChars ".visible .entry ".toList header.toList
+  let (name, rest) ← parsePTXName fuel header
+  let (params, lines) ← if rest == "()".toList then pure ([], lines) else do
+    if rest != ['('] then none else do
+      let paramLines := lines.takeWhile (· != ")")
+      let ")" :: lines := lines.drop paramLines.length | none
+      let params ← paramLines.mapM fun line => do
+        let (param, rest) ← parsePTXParamDecl fuel line.toList
+        if rest == [] || rest == [','] then pure param else none
+      pure (params, lines)
+  let "{" :: lines := lines | none
+  let "}" :: reversed := lines.reverse | none
+  parsePTXDeclsAndBody fuel reversed.reverse
+    { name, params, regDecls := [], sharedDecls := [], body := [] } false
+
+#guard parsePTXOperand 32 "%tid.x,".toList = some (.sreg .tidX, [','])
+#guard parsePTXOperand 32 "18446744073709551615;".toList = some (.immU64 18446744073709551615, [';'])
+#guard parsePTXOperand 32 "18446744073709551616;".toList = none
+#guard parsePTXOperand 32 "-12]".toList = some (.immS64 (-12), [']'])
+#guard parsePTXOperand 32 "0f80000000;".toList = some (.immF32 2147483648, [';'])
+#guard parsePTXAddr 32 "[%rd1-8],".toList = some (.regOffset "%rd1" (-8), [','])
+#guard parsePTXStmt 32 "    @!%p1 sub.u64 %rd2, %rd1, 1;".toList =
+  some (.instr (some { predReg := "%p1", negated := true })
+    (.sub .u64 "%rd2" (.reg "%rd1") (.immU64 1)), [])
+#guard (let k : PTXKernel := { name := "copy", params := [{ name := "input", ty := .u64 }], regDecls := [{ prefixName := "%rd", ty := .u64, count := 2 }], sharedDecls := [], body := [.instr none (.ldParam .u64 "%rd1" "input"), .instr none .ret] }
+  parsePTXKernel 64 (ppPTXKernel k) = some k)
 
 end LeanNative.Backend.PTXAst

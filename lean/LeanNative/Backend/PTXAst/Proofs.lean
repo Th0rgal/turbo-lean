@@ -1,4 +1,5 @@
 import LeanNative.Backend.PTXAst.Eval
+import Std.Data.String.ToNat
 
 /-!
 # Genuine NVIDIA CUDA PTX 8.0 AST (`C2b`) — kernel-checked SIMT theorems.
@@ -142,10 +143,1990 @@ theorem runCTA_deterministic (f1 f2 : Nat) (stmts : List PTXStmt) (cta : PTXCTAS
           exact ih f2' cta' h1 h2
       all_goals exact h1.symm.trans h2
 
-/-- 1:1 injectivity of `ppPTXType`: distinct PTX AST types pretty-print to distinct PTX type tokens. -/
+/-- Prefix consumption preserves the arbitrary suffix. -/
+theorem stripPrefixChars_append (pre rest : List Char) :
+    stripPrefixChars pre (pre ++ rest) = some rest := by
+  induction pre <;> simp_all [stripPrefixChars]
+
+theorem scanPTXName_append (name rest : List Char) (fuel : Nat)
+    (hn : ∀ c ∈ name, ptxNameChar c = true)
+    (hr : rest = [] ∨ ∃ c cs, rest = c :: cs ∧ ptxNameChar c = false)
+    (hf : name.length < fuel) : scanPTXName fuel (name ++ rest) = some (name, rest) := by
+  induction name generalizing fuel with
+  | nil =>
+    cases fuel with
+    | zero => simp at hf
+    | succ f =>
+      rcases hr with rfl | ⟨c, cs, rfl, hc⟩ <;> simp_all [scanPTXName]
+  | cons c cs ih =>
+    cases fuel with
+    | zero => simp at hf
+    | succ f =>
+      simp only [List.cons_append, scanPTXName, hn c (by simp), ↓reduceIte]
+      rw [ih f (by intro x hx; exact hn x (by simp [hx])) (by simpa using hf)]
+      rfl
+
+theorem parsePTXPredGuard_roundtrip (g : PTXPredGuard) (rest : List Char)
+    (h : CanonicalPTXPredGuard g) (fuel : Nat) (hf : g.predReg.toList.length < fuel) :
+    parsePTXPredGuard (fuel + 1) ((ppPredGuard g).toList ++ rest) = some (g, rest) := by
+  rcases g with ⟨name, negated⟩
+  rcases h with ⟨⟨cs, hn, _⟩, hc⟩
+  have hs := scanPTXName_append name.toList (' ' :: rest) fuel hc
+    (Or.inr ⟨' ', rest, rfl, by decide⟩) hf
+  have hn' : String.ofList ('%' :: cs) = name := by rw [← hn]; simp
+  cases negated <;> simp [ppPredGuard, parsePTXPredGuard, stripPrefixChars,
+    toString, String.toList_append, List.append_assoc, hn] at hs ⊢ <;>
+    simp_all [stripPrefixChars]
+
+/-- A canonical identifier consumes exactly its spelling and leaves the delimiter intact. -/
+theorem parsePTXName_roundtrip (name : String) (hn : CanonicalPTXName name)
+    (rest : List Char)
+    (hr : rest = [] ∨ ∃ c cs, rest = c :: cs ∧ ptxNameChar c = false)
+    (fuel : Nat) (hf : name.toList.length < fuel) :
+    parsePTXName fuel (name.toList ++ rest) = some (name, rest) := by
+  have hs := scanPTXName_append name.toList rest fuel hn.2 hr hf
+  have hne : name ≠ "" := by intro he; exact hn.1 (by simp [he])
+  simp [parsePTXName, hs, hne]
+
+theorem parsePTXType_roundtrip (ty : PTXType) (fuel : Nat) (rest : List Char) :
+    parsePTXType (fuel + 1) ((ppPTXType ty).toList ++ rest) = some (ty, rest) := by
+  cases ty <;> rfl
+
+theorem ppPredGuard_injective (a b : PTXPredGuard)
+    (ha : CanonicalPTXPredGuard a) (hb : CanonicalPTXPredGuard b)
+    (h : ppPredGuard a = ppPredGuard b) : a = b := by
+  let fuel := a.predReg.toList.length + b.predReg.toList.length + 1
+  have hp := congrArg (fun s : String => parsePTXPredGuard (fuel + 1) (s.toList ++ [])) h
+  rw [parsePTXPredGuard_roundtrip a [] ha fuel (by omega),
+      parsePTXPredGuard_roundtrip b [] hb fuel (by omega)] at hp
+  exact (Option.some.inj hp |> Prod.mk.inj).1
+
+theorem parsePTXNamedOperand_specialReg (sr : SpecialReg) :
+    parsePTXNamedOperand (ppSpecialReg sr) = .sreg sr := by
+  cases sr <;> decide
+
+theorem parsePTXNamedOperand_reg (name : String)
+    (h : CanonicalPTXOperand (.reg name)) : parsePTXNamedOperand name = .reg name := by
+  have hf : ptxSpecialRegs.find? (fun sr => ppSpecialReg sr == name) = none := by
+    apply List.find?_eq_none.mpr
+    intro sr hs
+    simpa using h.2.2 sr hs
+  simp [parsePTXNamedOperand, hf, h.2.1]
+
+theorem parsePTXOperand_specialReg_roundtrip (sr : SpecialReg) (rest : List Char) :
+    parsePTXOperand 16 ((ppPTXOperand (.sreg sr)).toList ++ ',' :: rest) =
+      some (.sreg sr, ',' :: rest) := by
+  cases sr <;> simp [parsePTXOperand, ppPTXOperand, ppSpecialReg, scanPTXName,
+    ptxNameChar, parsePTXNamedOperand, ptxSpecialRegs, List.find?]
+
+theorem parsePTXOperand_reg_roundtrip (name : String) (cs rest : List Char)
+    (hn : name.toList = '%' :: cs) (h : CanonicalPTXOperand (.reg name))
+    (fuel : Nat) (hf : name.toList.length < fuel) :
+    parsePTXOperand fuel ((ppPTXOperand (.reg name)).toList ++ ',' :: rest) =
+      some (.reg name, ',' :: rest) := by
+  have hs := scanPTXName_append name.toList (',' :: rest) fuel h.1.2
+    (Or.inr ⟨',', rest, rfl, by decide⟩) hf
+  have hp := parsePTXNamedOperand_reg name h
+  have hc : String.ofList ('%' :: cs) = name := by rw [← hn]; simp
+  simp only [ppPTXOperand, hn, List.cons_append] at hs ⊢
+  simp [parsePTXOperand, hs, hc, hp]
+
+theorem ppPTXOperand_reg_injective (a b : String)
+    (h : ppPTXOperand (.reg a) = ppPTXOperand (.reg b)) : a = b := h
+
+theorem parsePTXOperand_reg_suffix_roundtrip (name : String)
+    (h : CanonicalPTXOperand (.reg name)) (rest : List Char)
+    (hr : rest = [] ∨ ∃ c cs, rest = c :: cs ∧ ptxNameChar c = false)
+    (fuel : Nat) (hf : name.toList.length < fuel) :
+    parsePTXOperand fuel ((ppPTXOperand (.reg name)).toList ++ rest) =
+      some (.reg name, rest) := by
+  have hn : ∃ cs, name.toList = '%' :: cs := by
+    have hp := String.startsWith_string_iff.mp h.2.1
+    obtain ⟨cs, he⟩ := hp
+    exact ⟨cs, he.symm⟩
+  obtain ⟨cs, hn⟩ := hn
+  have hs := scanPTXName_append name.toList rest fuel h.1.2 hr hf
+  have hp := parsePTXNamedOperand_reg name h
+  have hc : String.ofList ('%' :: cs) = name := by rw [← hn]; simp
+  simp only [ppPTXOperand, hn, List.cons_append] at hs ⊢
+  simp [parsePTXOperand, hs, hc, hp]
+
+theorem parsePTXOperand_specialReg_suffix_roundtrip (sr : SpecialReg) (rest : List Char)
+    (hr : rest = [] ∨ ∃ c cs, rest = c :: cs ∧ ptxNameChar c = false)
+    (fuel : Nat) (hf : (ppSpecialReg sr).toList.length < fuel) :
+    parsePTXOperand fuel ((ppPTXOperand (.sreg sr)).toList ++ rest) = some (.sreg sr, rest) := by
+  have hc : ∀ c ∈ (ppSpecialReg sr).toList, ptxNameChar c = true := by cases sr <;> decide
+  have hs := scanPTXName_append (ppSpecialReg sr).toList rest fuel hc hr hf
+  cases sr <;> simp only [ppSpecialReg, String.reduceToList, List.cons_append, List.nil_append] at hs
+  all_goals simp [parsePTXOperand, ppPTXOperand, ppSpecialReg, hs,
+    parsePTXNamedOperand, ptxSpecialRegs, List.find?]
+
+theorem natRepr_ptxNameChars (n : Nat) :
+    ∀ c ∈ n.repr.toList, ptxNameChar c = true := by
+  intro c hc
+  have hd := Nat.isDigit_of_mem_toDigits (b := 10) (n := n) (by omega) (by omega)
+    (by simpa only [Nat.toList_repr] using hc)
+  simp [ptxNameChar, Char.isAlphanum, hd]
+
+theorem parsePTXOperand_sym_roundtrip (name : String) (hn : CanonicalPTXSymbol name)
+    (rest : List Char)
+    (hr : rest = [] ∨ ∃ c cs, rest = c :: cs ∧ ptxNameChar c = false)
+    (fuel : Nat) (hf : name.toList.length < fuel) :
+    parsePTXOperand fuel ((ppPTXOperand (.sym name)).toList ++ rest) = some (.sym name, rest) := by
+  obtain ⟨c, cs, he, hc⟩ := hn.2
+  have hm : c ≠ '-' := by
+    rcases hc with hc | rfl | rfl
+    · intro h; subst c; contradiction
+    all_goals decide
+  have hp : c ≠ '%' := by
+    rcases hc with hc | rfl | rfl
+    · intro h; subst c; contradiction
+    all_goals decide
+  have hz : c ≠ '0' := by
+    rcases hc with hc | rfl | rfl
+    · intro h; subst c; contradiction
+    all_goals decide
+  have hd : c.isDigit = false := by
+    rcases hc with hc | rfl | rfl
+    · simp only [Char.isAlpha, Char.isLower, Char.isUpper, Bool.or_eq_true,
+        Bool.and_eq_true, decide_eq_true_eq] at hc
+      simp only [Char.isDigit, Bool.and_eq_false_iff, decide_eq_false_iff_not]
+      rcases hc with ⟨h, _⟩ | ⟨h, _⟩ <;> right <;> intro h'
+      all_goals
+        have h := UInt32.le_iff_toNat_le.mp h
+        have h' := UInt32.le_iff_toNat_le.mp h'
+        simp at h h'
+        omega
+    all_goals rfl
+  have hstr : String.ofList (c :: cs) = name := by rw [← he]; simp
+  have hpercent : name.startsWith "%" = false := by
+    simp [String.startsWith_string_eq_false_iff, he, Ne.symm hp]
+  have hs := scanPTXName_append name.toList rest fuel hn.1.2 hr hf
+  have hnat : name.toNat? = none := by
+    apply String.toNat?_eq_none
+    apply Bool.eq_false_iff.mpr
+    intro h
+    have h := String.isNat_iff.mp h
+    have hc' := h.2.1 c (by simp [he])
+    rcases hc' with hc' | rfl
+    · simp [hd] at hc'
+    · exact h.2.2.2.1 (by simp [he])
+  have hspecial : ptxSpecialRegs.find? (fun sr => ppSpecialReg sr == name) = none := by
+    apply List.find?_eq_none.mpr
+    intro sr _
+    have hne : ppSpecialReg sr ≠ name := by
+      intro h
+      have hh := congrArg (fun s : String => s.startsWith "%") h
+      cases sr <;> simp [ppSpecialReg, hpercent] at hh
+    simpa using hne
+  simp only [he] at hs
+  simp only [ppPTXOperand, he, List.cons_append, parsePTXOperand]
+  split
+  · simp_all
+  · simp only [← List.cons_append, hs, bind, Option.bind]
+    simp [hstr, hpercent, hnat, hz, parsePTXNamedOperand, hspecial]
+
+theorem parsePTXName_nat_roundtrip (n : Nat) (rest : List Char)
+    (hr : rest = [] ∨ ∃ c cs, rest = c :: cs ∧ ptxNameChar c = false)
+    (fuel : Nat) (hf : n.repr.toList.length < fuel) :
+    parsePTXName fuel (n.repr.toList ++ rest) = some (n.repr, rest) := by
+  exact parsePTXName_roundtrip _ ⟨by simpa only [Nat.toList_repr] using Nat.toDigits_ne_nil,
+    natRepr_ptxNameChars n⟩ rest hr fuel hf
+
+theorem parsePTXOperand_u64_roundtrip (v : BitVec 64) (rest : List Char)
+    (hr : rest = [] ∨ ∃ c cs, rest = c :: cs ∧ ptxNameChar c = false)
+    (fuel : Nat) (hf : v.toNat.repr.toList.length < fuel) :
+    parsePTXOperand fuel ((ppPTXOperand (.immU64 v)).toList ++ rest) =
+      some (.immU64 v, rest) := by
+  have hs := scanPTXName_append v.toNat.repr.toList rest fuel (natRepr_ptxNameChars _) hr hf
+  have hd (c : Char) (hc : c ∈ v.toNat.repr.toList) : c.isDigit = true :=
+    Nat.isDigit_of_mem_toDigits (b := 10) (n := v.toNat) (by omega) (by omega)
+      (by simpa only [Nat.toList_repr] using hc)
+  cases he : v.toNat.repr.toList with
+  | nil => exact False.elim (Nat.toDigits_ne_nil (by simpa only [Nat.toList_repr] using he))
+  | cons c cs =>
+    have hc := hd c (by simp [he])
+    have hminus : c ≠ '-' := by intro h; subst c; contradiction
+    have hpercent : c ≠ '%' := by intro h; subst c; contradiction
+    have hstr : String.ofList (c :: cs) = v.toNat.repr := by rw [← he]; exact String.ofList_toList
+    have hhexF : ∀ xs, c :: cs ≠ '0' :: 'f' :: xs := by
+      intro xs h
+      have hh := hd 'f' (by simp [he, h])
+      contradiction
+    have hhexD : ∀ xs, c :: cs ≠ '0' :: 'd' :: xs := by
+      intro xs h
+      have hh := hd 'd' (by simp [he, h])
+      contradiction
+    simp only [ppPTXOperand, toString, he, List.cons_append] at hs ⊢
+    have hm : (match c :: (cs ++ rest) with
+        | '-' :: xs => (true, xs)
+        | _ => (false, c :: (cs ++ rest)) : Bool × List Char) = (false, c :: (cs ++ rest)) := by
+      split <;> simp_all
+    simp only [parsePTXOperand]
+    split
+    · simp_all
+    · rw [hs]
+      simp only [List.isEmpty_cons, Bool.false_eq_true, ↓reduceIte,
+        bind, Option.bind]
+      have hp : (String.ofList (c :: cs)).startsWith "%" = false := by
+        simp [String.startsWith_string_eq_false_iff, Ne.symm hpercent]
+      rw [hp]
+      simp only [Bool.false_eq_true, ↓reduceIte]
+      simp [hstr, Nat.toNat?_repr, v.isLt]
+
+theorem parsePTXInstr_ret_roundtrip (rest : List Char) :
+    parsePTXInstr 8 ((ppPTXInstr .ret).toList ++ rest) = some (.ret, rest) := by
+  simp [parsePTXInstr, ppPTXInstr, parsePTXName, scanPTXName, ptxNameChar, stripPrefixChars]
+
+theorem parsePTXOperand_s64_roundtrip (n : Int) (hn : n < 0) (rest : List Char)
+    (hr : rest = [] ∨ ∃ c cs, rest = c :: cs ∧ ptxNameChar c = false)
+    (fuel : Nat) (hf : n.natAbs.repr.toList.length < fuel) :
+    parsePTXOperand fuel ((ppPTXOperand (.immS64 n)).toList ++ rest) =
+      some (.immS64 n, rest) := by
+  cases n with
+  | ofNat n => exact False.elim (Int.not_lt.mpr (Int.natCast_nonneg n) hn)
+  | negSucc n =>
+    have hs := scanPTXName_append (n + 1).repr.toList rest fuel
+      (natRepr_ptxNameChars _) hr hf
+    have hne : (n + 1).repr.toList ≠ [] := by
+      simpa only [Nat.toList_repr] using Nat.toDigits_ne_nil (b := 10) (n := n + 1)
+    have hp : (ppPTXOperand (.immS64 (Int.negSucc n))).toList =
+        '-' :: (n + 1).repr.toList := by
+      simp [ppPTXOperand, toString, Int.repr, Nat.toList_repr]
+    rw [hp]
+    simp only [List.cons_append, parsePTXOperand, hs, bind, Option.bind]
+    simp only [List.isEmpty_iff, hne, ↓reduceIte, String.ofList_toList,
+      Nat.toNat?_repr]
+    simp
+    rfl
+
+theorem toHexFixedGo_append (v : Nat) (acc : List Char) (n : Nat) :
+    toHexFixedGo v acc n = toHexFixedGo v [] n ++ acc := by
+  induction n generalizing v acc with
+  | zero => rfl
+  | succ n ih =>
+    simp only [toHexFixedGo]
+    rw [ih, ih (v / 16) [hexDigitChar v]]
+    simp
+
+theorem hexDigitChar_valid (v : Nat) :
+    ptxNameChar (hexDigitChar v) = true ∧
+    (if hexDigitChar v ≥ '0' && hexDigitChar v ≤ '9' then some ((hexDigitChar v).toNat - '0'.toNat)
+      else if hexDigitChar v ≥ 'a' && hexDigitChar v ≤ 'f' then
+        some ((hexDigitChar v).toNat - 'a'.toNat + 10) else none) = some (v % 16) := by
+  have h : v % 16 < 16 := Nat.mod_lt _ (by decide)
+  unfold hexDigitChar
+  generalize v % 16 = d at h ⊢
+  have hd : d = 0 ∨ d = 1 ∨ d = 2 ∨ d = 3 ∨ d = 4 ∨ d = 5 ∨ d = 6 ∨ d = 7 ∨
+      d = 8 ∨ d = 9 ∨ d = 10 ∨ d = 11 ∨ d = 12 ∨ d = 13 ∨ d = 14 ∨ d = 15 := by omega
+  rcases hd with h | h | h | h | h | h | h | h | h | h | h | h | h | h | h | h <;>
+    subst d <;> decide
+
+theorem parsePTXHex_append_digit (n : Nat) (cs : List Char) (v value : Nat)
+    (h : parsePTXHex n cs = some value) :
+    parsePTXHex (n + 1) (cs ++ [hexDigitChar v]) = some (value * 16 + v % 16) := by
+  induction n generalizing cs value with
+  | zero =>
+    cases cs <;> simp [parsePTXHex] at h
+    subst value
+    simpa [parsePTXHex] using (hexDigitChar_valid v).2
+  | succ n ih =>
+    cases cs with
+    | nil => simp [parsePTXHex] at h
+    | cons c cs =>
+      simp only [List.cons_append, parsePTXHex] at h ⊢
+      split at h <;> (try split at h)
+      all_goals simp_all only [↓reduceIte, bind, Option.bind]
+      all_goals
+        cases ht : parsePTXHex n cs <;> simp [ht] at h
+        all_goals subst value
+        all_goals simp [ih _ _ ht, Nat.pow_succ, Nat.add_mul,
+          Nat.mul_assoc, Nat.add_assoc]
+
+theorem parsePTXHex_toHexFixedGo (v n : Nat) (hv : v < 16^n) :
+    parsePTXHex n (toHexFixedGo v [] n) = some v := by
+  induction n generalizing v with
+  | zero =>
+    have : v = 0 := by simpa using hv
+    subst v
+    rfl
+  | succ n ih =>
+    have hdiv : v / 16 < 16^n := by
+      apply Nat.div_lt_of_lt_mul
+      simpa [Nat.pow_succ, Nat.mul_comm] using hv
+    rw [toHexFixedGo, toHexFixedGo_append]
+    rw [parsePTXHex_append_digit n _ v _ (ih _ hdiv)]
+    congr 1
+    omega
+
+theorem toHexFixedGo_chars (v n : Nat) :
+    (toHexFixedGo v [] n).length = n ∧
+    ∀ c ∈ toHexFixedGo v [] n, ptxNameChar c = true := by
+  induction n generalizing v with
+  | zero => simp [toHexFixedGo]
+  | succ n ih =>
+    rw [toHexFixedGo, toHexFixedGo_append]
+    constructor
+    · simp [ih]
+    · intro c hc
+      rcases List.mem_append.mp hc with hc | hc
+      · exact (ih _).2 c hc
+      · simpa using List.mem_singleton.mp hc ▸ (hexDigitChar_valid v).1
+
+theorem parsePTXOperand_f32_roundtrip (v : UInt32) (rest : List Char)
+    (hr : rest = [] ∨ ∃ c cs, rest = c :: cs ∧ ptxNameChar c = false)
+    (fuel : Nat) (hf : 10 < fuel) :
+    parsePTXOperand fuel ((ppPTXOperand (.immF32 v)).toList ++ rest) = some (.immF32 v, rest) := by
+  have hs := scanPTXName_append ('0' :: 'f' :: toHexFixedGo v.toNat [] 8) rest fuel
+    (by simpa [ptxNameChar] using (toHexFixedGo_chars v.toNat 8).2) hr
+    (by simpa [(toHexFixedGo_chars v.toNat 8).1] using hf)
+  have hh := parsePTXHex_toHexFixedGo v.toNat 8 (by exact v.toFin.isLt)
+  simp only [List.cons_append] at hs
+  simp only [ppPTXOperand, toString, toHexFixed, String.toList_append,
+    String.reduceToList, String.toList_ofList, List.cons_append, List.nil_append]
+  simp only [parsePTXOperand, bind, Option.bind]
+  simp [hs, hh]
+
+theorem parsePTXOperand_f64_roundtrip (v : UInt64) (rest : List Char)
+    (hr : rest = [] ∨ ∃ c cs, rest = c :: cs ∧ ptxNameChar c = false)
+    (fuel : Nat) (hf : 18 < fuel) :
+    parsePTXOperand fuel ((ppPTXOperand (.immF64 v)).toList ++ rest) = some (.immF64 v, rest) := by
+  have hs := scanPTXName_append ('0' :: 'd' :: toHexFixedGo v.toNat [] 16) rest fuel
+    (by simpa [ptxNameChar] using (toHexFixedGo_chars v.toNat 16).2) hr
+    (by simpa [(toHexFixedGo_chars v.toNat 16).1] using hf)
+  have hh := parsePTXHex_toHexFixedGo v.toNat 16 (by exact v.toFin.isLt)
+  simp only [List.cons_append] at hs
+  simp only [ppPTXOperand, toString, toHexFixed, String.toList_append,
+    String.reduceToList, String.toList_ofList, List.cons_append, List.nil_append]
+  simp only [parsePTXOperand, bind, Option.bind]
+  simp [hs, hh]
+
+theorem parsePTXOperand_roundtrip (op : PTXOperand) (h : CanonicalPTXOperand op)
+    (rest : List Char)
+    (hr : rest = [] ∨ ∃ c cs, rest = c :: cs ∧ ptxNameChar c = false)
+    (fuel : Nat) (hf : (ppPTXOperand op).toList.length < fuel) :
+    parsePTXOperand fuel ((ppPTXOperand op).toList ++ rest) = some (op, rest) := by
+  cases op with
+  | reg name => exact parsePTXOperand_reg_suffix_roundtrip name h rest hr fuel hf
+  | sreg sr => exact parsePTXOperand_specialReg_suffix_roundtrip sr rest hr fuel hf
+  | sym name => exact parsePTXOperand_sym_roundtrip name h rest hr fuel hf
+  | immU64 v => exact parsePTXOperand_u64_roundtrip v rest hr fuel hf
+  | immS64 n =>
+    apply parsePTXOperand_s64_roundtrip n h rest hr fuel
+    cases n with
+    | ofNat n => exact False.elim (Int.not_lt.mpr (Int.natCast_nonneg n) h)
+    | negSucc n =>
+      simp [ppPTXOperand, toString, Int.repr, String.toList_append] at hf ⊢
+      omega
+  | immF32 v =>
+    apply parsePTXOperand_f32_roundtrip v rest hr fuel
+    simpa [ppPTXOperand, toString, toHexFixed, String.toList_append,
+      (toHexFixedGo_chars v.toNat 8).1] using hf
+  | immF64 v =>
+    apply parsePTXOperand_f64_roundtrip v rest hr fuel
+    simpa [ppPTXOperand, toString, toHexFixed, String.toList_append,
+      (toHexFixedGo_chars v.toNat 16).1] using hf
+
+theorem ppPTXOperand_injective_on_canonical (a b : PTXOperand)
+    (ha : CanonicalPTXOperand a) (hb : CanonicalPTXOperand b)
+    (h : ppPTXOperand a = ppPTXOperand b) : a = b := by
+  let fuel := (ppPTXOperand a).toList.length + (ppPTXOperand b).toList.length + 1
+  have hp := congrArg (fun s : String => parsePTXOperand fuel (s.toList ++ [])) h
+  rw [parsePTXOperand_roundtrip a ha [] (Or.inl rfl) fuel (by omega),
+      parsePTXOperand_roundtrip b hb [] (Or.inl rfl) fuel (by omega)] at hp
+  exact (Option.some.inj hp |> Prod.mk.inj).1
+
+theorem parsePTXAddr_reg_zero_roundtrip (name : String)
+    (hn : CanonicalPTXName name) (hp : name.startsWith "%" = true)
+    (rest : List Char) (fuel : Nat) (hf : name.toList.length < fuel) :
+    parsePTXAddr fuel ((ppPTXAddr (.regOffset name 0)).toList ++ rest) =
+      some (.regOffset name 0, rest) := by
+  have hs := scanPTXName_append name.toList (']' :: rest) fuel hn.2
+    (Or.inr ⟨']', rest, rfl, rfl⟩) hf
+  have hne : name ≠ "" := by intro h; exact hn.1 (by simp [h])
+  simp [parsePTXAddr, ppPTXAddr, toString, String.toList_append, List.append_assoc,
+    stripPrefixChars, hs, hne]
+  simpa using hp
+
+theorem parsePTXInstr_bra_roundtrip (name : String) (hn : CanonicalPTXName name)
+    (rest : List Char) (fuel : Nat) (hf : name.toList.length < fuel) (hmin : 4 ≤ fuel) :
+    parsePTXInstr fuel ((ppPTXInstr (.bra name)).toList ++ rest) = some (.bra name, rest) := by
+  have htok := parsePTXName_roundtrip "bra" (by unfold CanonicalPTXName; decide)
+    (' ' :: (name.toList ++ ';' :: rest)) (Or.inr ⟨' ', _, rfl, rfl⟩) fuel (by simp; omega)
+  have hname := parsePTXName_roundtrip name hn (';' :: rest)
+    (Or.inr ⟨';', rest, rfl, rfl⟩) fuel hf
+  simp only [ppPTXInstr, toString, String.toList_append, String.reduceToList,
+    List.append_assoc, List.cons_append, List.nil_append] at htok ⊢
+  simp [parsePTXInstr, htok, hname, stripPrefixChars]
+
+theorem ptxOpcodeFields_append_dot (a b : List Char) (ha : '.' ∉ a) :
+    ptxOpcodeFields (a ++ '.' :: b) = a :: ptxOpcodeFields b := by
+  induction a with
+  | nil => rfl
+  | cons c cs ih =>
+    have hc : c ≠ '.' := by intro h; subst c; simp at ha
+    have ht : '.' ∉ cs := by simp_all
+    simp [List.cons_append, ptxOpcodeFields, ih ht]
+
+theorem ptxOpcodeFields_mov (ty : PTXType) :
+    (ptxOpcodeFields ("mov" ++ ppPTXType ty).toList).map String.ofList =
+      ["mov", String.ofList ((ppPTXType ty).toList.drop 1)] := by
+  cases ty <;> rfl
+
+theorem ptxOpcodeFields_typed (pre : List Char) (ty : PTXType) :
+    ptxOpcodeFields (pre ++ (ppPTXType ty).toList) =
+      ptxOpcodeFields pre ++ [(ppPTXType ty).toList.drop 1] := by
+  induction pre with
+  | nil => cases ty <;> rfl
+  | cons c cs ih =>
+    by_cases hc : c = '.'
+    · subst c; simp [ptxOpcodeFields, ih]
+    · simp only [List.cons_append]
+      simp only [ptxOpcodeFields, ih]
+      cases h : ptxOpcodeFields cs with
+      | nil =>
+        have hn : ∀ xs, ptxOpcodeFields xs ≠ [] := by
+          intro xs
+          induction xs with
+          | nil => simp [ptxOpcodeFields]
+          | cons c cs ih =>
+            by_cases hc : c = '.'
+            · subst c; simp [ptxOpcodeFields]
+            · simp [ptxOpcodeFields]; split <;> simp
+        exact False.elim (hn cs h)
+      | cons field fields => rfl
+
+theorem parsePTXType_suffix (ty : PTXType) (fuel : Nat) :
+    parsePTXType (fuel + 1)
+      ("." ++ String.ofList ((ppPTXType ty).toList.drop 1)).toList = some (ty, []) := by
+  cases ty <;> rfl
+
+theorem ptxTypedName (pre : String) (hp : CanonicalPTXName pre) (ty : PTXType) :
+    CanonicalPTXName (pre ++ ppPTXType ty) := by
+  constructor
+  · intro h
+    rw [String.toList_append] at h
+    exact hp.1 (List.append_eq_nil_iff.mp h).1
+  · intro c hc
+    rcases List.mem_append.mp (by simpa using hc) with hc | hc
+    · exact hp.2 c hc
+    · have ht : ∀ c ∈ (ppPTXType ty).toList, ptxNameChar c = true := by
+        cases ty <;> decide
+      exact ht c hc
+
+theorem parsePTXTypedName_roundtrip (pre : String) (hp : CanonicalPTXName pre)
+    (ty : PTXType) (rest : List Char) (fuel : Nat)
+    (hf : (pre ++ ppPTXType ty).toList.length < fuel) :
+    parsePTXName fuel ((pre ++ ppPTXType ty).toList ++ ' ' :: rest) =
+      some (pre ++ ppPTXType ty, ' ' :: rest) :=
+  parsePTXName_roundtrip _ (ptxTypedName pre hp ty) _ (Or.inr ⟨' ', _, rfl, rfl⟩) fuel hf
+
+theorem ptxMovToken_ne (ty : PTXType) :
+    ("mov" ++ ppPTXType ty == "ret") = false ∧
+    ("mov" ++ ppPTXType ty == "bra") = false ∧
+    ("mov" ++ ppPTXType ty == "bar.sync") = false := by
+  cases ty <;> decide
+
+theorem parsePTXInstr_mov_step (ty : PTXType) (dst : String) (src : PTXOperand)
+    (hd : CanonicalPTXName dst) (rest : List Char) (fuel : Nat)
+    (hf : dst.toList.length < fuel) (hmin : 16 ≤ fuel)
+    (hs : parsePTXOperand fuel ((ppPTXOperand src).toList ++ ';' :: rest) = some (src, ';' :: rest)) :
+    parsePTXInstr fuel ((ppPTXInstr (.mov ty dst src)).toList ++ rest) = some (.mov ty dst src, rest) := by
+  have ht : CanonicalPTXName ("mov" ++ ppPTXType ty) := by
+    cases ty <;> unfold CanonicalPTXName <;> decide
+  have hlen : ("mov" ++ ppPTXType ty).toList.length < fuel := by
+    cases ty <;> simp [ppPTXType] <;> omega
+  have htok := parsePTXName_roundtrip _ ht
+    (' ' :: (dst.toList ++ ", ".toList ++ (ppPTXOperand src).toList ++ ';' :: rest))
+    (Or.inr ⟨' ', _, rfl, rfl⟩) fuel hlen
+  have hdst := parsePTXName_roundtrip dst hd
+    (", ".toList ++ (ppPTXOperand src).toList ++ ';' :: rest)
+    (Or.inr ⟨',', _, rfl, rfl⟩) fuel hf
+  obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 1 := ⟨fuel - 1, by omega⟩
+  simp only [String.toList_append, String.reduceToList, List.append_assoc,
+    List.cons_append, List.nil_append] at htok hdst
+  simp only [ppPTXInstr, toString, String.toList_append, String.reduceToList,
+    List.append_assoc, List.cons_append, List.nil_append]
+  simp only [parsePTXInstr, htok]
+  simp only [bind, Option.bind, ptxMovToken_ne ty |>.1,
+    ptxMovToken_ne ty |>.2.1, ptxMovToken_ne ty |>.2.2, Bool.false_eq_true,
+    ↓reduceIte, stripPrefixChars]
+  rw [ptxOpcodeFields_mov]
+  simp only [List.head?_cons, List.getLast?_cons_cons, List.getLast?_singleton,
+    parsePTXType_suffix]
+  simp [stripPrefixChars, hdst, hs]
+
+theorem parsePTXInstr_mov_roundtrip (ty : PTXType) (dst : String) (src : PTXOperand)
+    (hd : CanonicalPTXName dst) (hs : CanonicalPTXOperand src)
+    (rest : List Char) (fuel : Nat)
+    (hf : (ppPTXInstr (.mov ty dst src)).toList.length < fuel) (hmin : 16 ≤ fuel) :
+    parsePTXInstr fuel ((ppPTXInstr (.mov ty dst src)).toList ++ rest) =
+      some (.mov ty dst src, rest) := by
+  have hlen : dst.toList.length < fuel ∧ (ppPTXOperand src).toList.length < fuel := by
+    simp [ppPTXInstr, toString, String.toList_append] at hf
+    omega
+  exact parsePTXInstr_mov_step ty dst src hd rest fuel hlen.1 hmin
+    (parsePTXOperand_roundtrip src hs (';' :: rest) (Or.inr ⟨';', _, rfl, rfl⟩) fuel hlen.2)
+
+theorem ptxTypedToken_ne (pre : String) (ty : PTXType)
+    (hpre : 2 ≤ pre.toList.length) :
+    (pre ++ ppPTXType ty == "ret") = false ∧
+    (pre ++ ppPTXType ty == "bra") = false ∧
+    (pre ++ ppPTXType ty == "bar.sync") = false := by
+  have hlen : 3 ≤ (ppPTXType ty).toList.length := by cases ty <;> decide
+  have hret : pre ++ ppPTXType ty ≠ "ret" := by
+    intro h
+    have := congrArg (fun s : String => s.toList.length) h
+    simp only [String.toList_append, List.length_append, String.reduceToList, List.length_cons, List.length_nil] at this
+    omega
+  have hbra : pre ++ ppPTXType ty ≠ "bra" := by
+    intro h
+    have := congrArg (fun s : String => s.toList.length) h
+    simp only [String.toList_append, List.length_append, String.reduceToList, List.length_cons, List.length_nil] at this
+    omega
+  have hbar : pre ++ ppPTXType ty ≠ "bar.sync" := by
+    intro h
+    have hs := congrArg (fun s : String => s.toList.getLast?) h
+    cases ty <;> simp [ppPTXType, String.toList_append] at hs
+  simpa using ⟨hret, hbra, hbar⟩
+
+theorem parsePTXInstr_ldParam_roundtrip (ty : PTXType) (dst name : String)
+    (hd : CanonicalPTXName dst) (hn : CanonicalPTXSymbol name)
+    (rest : List Char) (fuel : Nat)
+    (hf : (ppPTXInstr (.ldParam ty dst name)).toList.length < fuel + 1) :
+    parsePTXInstr (fuel + 1) ((ppPTXInstr (.ldParam ty dst name)).toList ++ rest) =
+      some (.ldParam ty dst name, rest) := by
+  have ht := parsePTXTypedName_roundtrip "ld.param" (by unfold CanonicalPTXName; decide)
+    ty (dst.toList ++ ", [".toList ++ name.toList ++ ']' :: ';' :: rest) (fuel + 1)
+    (by simp [ppPTXInstr, toString, String.toList_append] at hf ⊢; omega)
+  have hd := parsePTXName_roundtrip dst hd
+    (", [".toList ++ name.toList ++ ']' :: ';' :: rest)
+    (Or.inr ⟨',', _, rfl, rfl⟩) (fuel + 1)
+    (by simp [ppPTXInstr, toString, String.toList_append] at hf; omega)
+  have hs := scanPTXName_append name.toList (']' :: ';' :: rest) (fuel + 1) hn.1.2
+    (Or.inr ⟨']', _, rfl, rfl⟩)
+    (by simp [ppPTXInstr, toString, String.toList_append] at hf; omega)
+  have hp : name.startsWith "%" = false := by
+    obtain ⟨c, cs, he, hc⟩ := hn.2
+    have h : c ≠ '%' := by
+      rcases hc with hc | rfl | rfl
+      · intro h; subst c; contradiction
+      all_goals decide
+    simp [String.startsWith_string_eq_false_iff, he, Ne.symm h]
+  have hnonempty : name ≠ "" := by intro h; exact hn.1.1 (by simp [h])
+  have ha : parsePTXAddr (fuel + 1) ('[' :: (name.toList ++ ']' :: ';' :: rest)) =
+      some (.paramSym name, ';' :: rest) := by
+    simp [parsePTXAddr, stripPrefixChars, hs, hnonempty]
+    simpa using hp
+  have hne := ptxTypedToken_ne "ld.param" ty (by decide)
+  have hfields := congrArg (List.map String.ofList) (ptxOpcodeFields_typed "ld.param".toList ty)
+  simp only [String.toList_append, String.reduceToList,
+    List.append_assoc, List.cons_append, List.nil_append] at ht hd ha
+  simp only [ppPTXInstr, toString, String.toList_append, String.reduceToList,
+    List.append_assoc, List.cons_append, List.nil_append]
+  simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
+    Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
+  rw [show (ptxOpcodeFields ("ld.param" ++ ppPTXType ty).toList).map String.ofList =
+      ["ld", "param", String.ofList ((ppPTXType ty).toList.drop 1)] by
+    simpa [String.toList_append, List.map_append, ptxOpcodeFields] using hfields]
+  simp only [List.head?_cons, List.getLast?_cons_cons, List.getLast?_singleton,
+    parsePTXType_suffix]
+  simp [stripPrefixChars, hd, ha]
+
+theorem parsePTXStmt_instr_step (guard : Option PTXPredGuard) (ins : PTXInstr)
+    (hg : ∀ g ∈ guard, CanonicalPTXPredGuard g) (rest : List Char)
+    (fuel : Nat) (hf : ∀ g ∈ guard, g.predReg.toList.length < fuel)
+    (hi : parsePTXInstr (fuel + 1) ((ppPTXInstr ins).toList ++ rest) = some (ins, rest)) :
+    parsePTXStmt (fuel + 1) ((ppPTXStmt (.instr guard ins)).toList ++ rest) =
+      some (.instr guard ins, rest) := by
+  cases guard with
+  | none =>
+    have hn' : ∀ cs, (ppPTXInstr ins).toList ++ rest ≠ '@' :: cs := by
+      intro cs
+      cases ins <;> simp [ppPTXInstr, toString, String.toList_append]
+    have hguard : (match (ppPTXInstr ins).toList ++ rest with
+        | '@' :: _ => do
+          let (g, rest) ← parsePTXPredGuard (fuel + 1) ((ppPTXInstr ins).toList ++ rest)
+          pure (some g, rest)
+        | _ => some (none, (ppPTXInstr ins).toList ++ rest) :
+        Option (Option PTXPredGuard × List Char)) = some (none, (ppPTXInstr ins).toList ++ rest) := by
+      split
+      · rename_i cs he; exact False.elim (hn' cs he)
+      · rfl
+    simp [ppPTXStmt, toString, String.toList_append, parsePTXStmt,
+      stripPrefixChars, hi]
+  | some g =>
+    have hp := parsePTXPredGuard_roundtrip g ((ppPTXInstr ins).toList ++ rest)
+      (hg g (by simp)) fuel (hf g (by simp))
+    have hat : ∃ cs, (ppPredGuard g).toList = '@' :: cs := by
+      unfold ppPredGuard
+      split <;> simp [toString, String.toList_append]
+    obtain ⟨cs, he⟩ := hat
+    simp only [ppPTXStmt, toString, String.toList_append, String.reduceToList,
+      List.append_assoc, List.cons_append, List.nil_append, parsePTXStmt, stripPrefixChars]
+    simp only [he, List.cons_append] at hp ⊢
+    simp [hp, hi]
+
+theorem parsePTXAddr_param_roundtrip (name : String)
+    (hn : CanonicalPTXName name) (hp : name.startsWith "%" = false)
+    (rest : List Char) (fuel : Nat) (hf : name.toList.length < fuel) :
+    parsePTXAddr fuel ((ppPTXAddr (.paramSym name)).toList ++ rest) =
+      some (.paramSym name, rest) := by
+  have hs := scanPTXName_append name.toList (']' :: rest) fuel hn.2
+    (Or.inr ⟨']', rest, rfl, rfl⟩) hf
+  have hne : name ≠ "" := by intro h; exact hn.1 (by simp [h])
+  simp [parsePTXAddr, ppPTXAddr, toString, String.toList_append, List.append_assoc,
+    stripPrefixChars, hs, hne]
+  simpa using hp
+
+theorem parsePTXParamDecl_roundtrip (p : PTXParamDecl)
+    (hn : CanonicalPTXName p.name) (rest : List Char)
+    (hr : rest = [] ∨ ∃ c cs, rest = c :: cs ∧ ptxNameChar c = false)
+    (fuel : Nat) (hf : p.name.toList.length < fuel + 1) :
+    parsePTXParamDecl (fuel + 1)
+      ((s!"    .param {ppPTXType p.ty} {p.name}").toList ++ rest) = some (p, rest) := by
+  have ht := parsePTXType_roundtrip p.ty fuel (' ' :: (p.name.toList ++ rest))
+  have hp := parsePTXName_roundtrip p.name hn rest hr (fuel + 1) hf
+  rcases p with ⟨ty, name⟩
+  simp [parsePTXParamDecl, toString, String.toList_append, List.append_assoc,
+    stripPrefixChars, ht, hp]
+
+theorem parsePTXAddr_offset_roundtrip (name : String) (offset : Int)
+    (hn : CanonicalPTXName name) (rest : List Char)
+    (fuel : Nat) (hf : name.toList.length < fuel)
+    (ho : offset.natAbs.repr.toList.length < fuel) :
+    parsePTXAddr fuel
+      ((if offset = 0 then s!"[{name}]"
+        else if offset > 0 then s!"[{name}+{offset}]" else s!"[{name}{offset}]").toList ++ rest) =
+      some ((if name.startsWith "%" then .regOffset name offset
+        else if offset = 0 then .paramSym name else .symOffset name offset), rest) := by
+  have hne : name ≠ "" := by intro h; exact hn.1 (by simp [h])
+  cases offset with
+  | ofNat n =>
+    cases n with
+    | zero =>
+      have hs := scanPTXName_append name.toList (']' :: rest) fuel hn.2
+        (Or.inr ⟨']', _, rfl, rfl⟩) hf
+      simp [parsePTXAddr, toString, String.toList_append, List.append_assoc,
+        stripPrefixChars, hs, hne]
+    | succ n =>
+      have hz : (n : Int) + 1 ≠ 0 := by omega
+      have hdigit : (String.ofList (Nat.toDigits 10 (n + 1))).toNat? = some (n + 1) :=
+        Nat.toNat?_repr (n + 1)
+      have hs := scanPTXName_append name.toList
+        ('+' :: ((n + 1).repr.toList ++ ']' :: rest)) fuel hn.2
+        (Or.inr ⟨'+', _, rfl, rfl⟩) hf
+      have hd := scanPTXName_append (n + 1).repr.toList (']' :: rest) fuel
+        (natRepr_ptxNameChars _) (Or.inr ⟨']', _, rfl, rfl⟩) ho
+      simp only [Nat.toList_repr] at hs hd
+      simp [parsePTXAddr, toString, Int.repr, String.toList_append, List.append_assoc,
+        stripPrefixChars, hs, hd, hne, hz, hdigit]
+  | negSucc n =>
+    have hdigit : (String.ofList (Nat.toDigits 10 (n + 1))).toNat? = some (n + 1) :=
+      Nat.toNat?_repr (n + 1)
+    have hneg : -((n : Int) + 1) = Int.negSucc n := rfl
+    have hs := scanPTXName_append name.toList
+      ('-' :: ((n + 1).repr.toList ++ ']' :: rest)) fuel hn.2
+      (Or.inr ⟨'-', _, rfl, rfl⟩) hf
+    have hd := scanPTXName_append (n + 1).repr.toList (']' :: rest) fuel
+      (natRepr_ptxNameChars _) (Or.inr ⟨']', _, rfl, rfl⟩) ho
+    simp only [Nat.toList_repr] at hs hd
+    simp [parsePTXAddr, toString, Int.repr, String.toList_append, List.append_assoc,
+      stripPrefixChars, hs, hd, hne, hdigit, hneg]
+
+theorem parsePTXAddr_roundtrip (a : PTXAddr) (ha : CanonicalPTXAddr a)
+    (rest : List Char) (fuel : Nat) (hf : (ppPTXAddr a).toList.length < fuel) :
+    parsePTXAddr fuel ((ppPTXAddr a).toList ++ rest) = some (a, rest) := by
+  cases a with
+  | paramSym name =>
+    have hp : name.startsWith "%" = false := by
+      obtain ⟨c, cs, he, hc⟩ := ha.2
+      have hn : c ≠ '%' := by
+        rcases hc with hc | rfl | rfl
+        · intro h; subst c; contradiction
+        all_goals decide
+      simp [String.startsWith_string_eq_false_iff, he, Ne.symm hn]
+    apply parsePTXAddr_param_roundtrip name ha.1 hp rest fuel
+    simp [ppPTXAddr, toString, String.toList_append] at hf
+    omega
+  | regOffset name offset =>
+    have hlen : name.toList.length < fuel ∧ offset.natAbs.repr.toList.length < fuel := by
+      cases offset with
+      | ofNat n =>
+        have hz (m : Nat) : (m : Int) + 1 ≠ 0 := by omega
+        have habs (m : Nat) : ((m : Int) + 1).natAbs = m + 1 := rfl
+        cases n <;> simp [ppPTXAddr, toString, Int.repr, String.toList_append, hz, habs] at hf ⊢ <;> omega
+      | negSucc n =>
+        simp [ppPTXAddr, toString, Int.repr, String.toList_append] at hf ⊢
+        omega
+    have h := parsePTXAddr_offset_roundtrip name offset ha.1 rest fuel hlen.1 hlen.2
+    simpa [ppPTXAddr, ha.2] using h
+  | symOffset name offset =>
+    have hp : name.startsWith "%" = false := by
+      obtain ⟨c, cs, he, hc⟩ := ha.1.2
+      have hn : c ≠ '%' := by
+        rcases hc with hc | rfl | rfl
+        · intro h; subst c; contradiction
+        all_goals decide
+      simp [String.startsWith_string_eq_false_iff, he, Ne.symm hn]
+    have hlen : name.toList.length < fuel ∧ offset.natAbs.repr.toList.length < fuel := by
+      cases offset with
+      | ofNat n =>
+        have hz (m : Nat) : (m : Int) + 1 ≠ 0 := by omega
+        have habs (m : Nat) : ((m : Int) + 1).natAbs = m + 1 := rfl
+        cases n <;> simp [ppPTXAddr, toString, Int.repr, String.toList_append, hz, habs] at hf ⊢ <;> omega
+      | negSucc n =>
+        simp [ppPTXAddr, toString, Int.repr, String.toList_append] at hf ⊢
+        omega
+    have h := parsePTXAddr_offset_roundtrip name offset ha.1.1 rest fuel hlen.1 hlen.2
+    simpa [ppPTXAddr, hp, ha.2] using h
+
+theorem ppPTXAddr_injective_on_canonical (a b : PTXAddr)
+    (ha : CanonicalPTXAddr a) (hb : CanonicalPTXAddr b)
+    (h : ppPTXAddr a = ppPTXAddr b) : a = b := by
+  let fuel := (ppPTXAddr a).toList.length + (ppPTXAddr b).toList.length + 1
+  have hp := congrArg (fun s : String => parsePTXAddr fuel (s.toList ++ [])) h
+  rw [parsePTXAddr_roundtrip a ha [] fuel (by omega),
+      parsePTXAddr_roundtrip b hb [] fuel (by omega)] at hp
+  exact (Option.some.inj hp |> Prod.mk.inj).1
+
+set_option maxHeartbeats 1000000 in
+/-- All ordinary load address spaces share the same operand grammar. -/
+theorem parsePTXInstr_load_roundtrip (space : String) (ty : PTXType)
+    (dst : String) (addr : PTXAddr)
+    (hspace : space ∈ ["global", "shared", "local", "const"])
+    (hd : CanonicalPTXName dst) (ha : CanonicalPTXAddr addr)
+    (rest : List Char) (fuel : Nat)
+    (hf : ("ld." ++ space ++ ppPTXType ty ++ " " ++ dst ++ ", " ++
+      ppPTXAddr addr ++ ";").toList.length < fuel + 1) :
+    parsePTXInstr (fuel + 1)
+      (("ld." ++ space ++ ppPTXType ty ++ " " ++ dst ++ ", " ++
+        ppPTXAddr addr ++ ";").toList ++ rest) =
+      some ((match (generalizing := false) space with
+        | "global" => .ldGlobal ty dst addr | "shared" => .ldShared ty dst addr
+        | "local" => .ldLocal ty dst addr | _ => .ldConst ty dst addr), rest) := by
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at hspace
+  have hn : CanonicalPTXName ("ld." ++ space) := by
+    rcases hspace with rfl | rfl | rfl | rfl <;> unfold CanonicalPTXName <;> decide
+  have ht := parsePTXTypedName_roundtrip ("ld." ++ space) hn ty
+    (dst.toList ++ ',' :: ' ' :: ((ppPTXAddr addr).toList ++ ';' :: rest)) (fuel + 1)
+    (by simp [String.toList_append] at hf ⊢; omega)
+  have hd := parsePTXName_roundtrip dst hd
+    (',' :: ' ' :: ((ppPTXAddr addr).toList ++ ';' :: rest))
+    (Or.inr ⟨',', _, rfl, rfl⟩) (fuel + 1)
+    (by simp [String.toList_append] at hf; omega)
+  have ha := parsePTXAddr_roundtrip addr ha (';' :: rest) (fuel + 1)
+    (by simp [String.toList_append] at hf; omega)
+  have hne := ptxTypedToken_ne ("ld." ++ space) ty
+    (by simp [String.toList_append])
+  have hfields : (ptxOpcodeFields ("ld." ++ space ++ ppPTXType ty).toList).map String.ofList =
+      ["ld", space, String.ofList ((ppPTXType ty).toList.drop 1)] := by
+    rw [String.toList_append, ptxOpcodeFields_typed, List.map_append]
+    rcases hspace with rfl | rfl | rfl | rfl <;> rfl
+  simp only [String.toList_append, String.reduceToList, List.append_assoc,
+    List.cons_append, List.nil_append] at ht
+  conv =>
+    lhs
+    arg 2
+    simp only [String.toList_append, String.reduceToList, List.append_assoc,
+      List.cons_append, List.nil_append]
+  simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
+    Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
+  rw [hfields]
+  simp only [List.head?_cons, List.getLast?_cons_cons, List.getLast?_singleton,
+    parsePTXType_suffix]
+  rcases hspace with rfl | rfl | rfl | rfl <;> simp [stripPrefixChars, hd, ha]
+
+/-- All ordinary store address spaces share the same address/source grammar. -/
+theorem parsePTXInstr_store_roundtrip (space : String) (ty : PTXType)
+    (addr : PTXAddr) (src : PTXOperand)
+    (hspace : space ∈ ["global", "shared", "local", "const"])
+    (ha : CanonicalPTXAddr addr) (hs : CanonicalPTXOperand src)
+    (rest : List Char) (fuel : Nat)
+    (hf : ("st." ++ space ++ ppPTXType ty ++ " " ++ ppPTXAddr addr ++ ", " ++
+      ppPTXOperand src ++ ";").toList.length < fuel + 1) :
+    parsePTXInstr (fuel + 1)
+      (("st." ++ space ++ ppPTXType ty ++ " " ++ ppPTXAddr addr ++ ", " ++
+        ppPTXOperand src ++ ";").toList ++ rest) =
+      some ((match (generalizing := false) space with
+        | "global" => .stGlobal ty addr src | "shared" => .stShared ty addr src
+        | "local" => .stLocal ty addr src | _ => .stConst ty addr src), rest) := by
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at hspace
+  have hn : CanonicalPTXName ("st." ++ space) := by
+    rcases hspace with rfl | rfl | rfl | rfl <;> unfold CanonicalPTXName <;> decide
+  have ht := parsePTXTypedName_roundtrip ("st." ++ space) hn ty
+    ((ppPTXAddr addr).toList ++ ',' :: ' ' :: ((ppPTXOperand src).toList ++ ';' :: rest)) (fuel + 1)
+    (by simp [String.toList_append] at hf ⊢; omega)
+  have ha := parsePTXAddr_roundtrip addr ha
+    (',' :: ' ' :: ((ppPTXOperand src).toList ++ ';' :: rest)) (fuel + 1)
+    (by simp [String.toList_append] at hf; omega)
+  have hs := parsePTXOperand_roundtrip src hs (';' :: rest)
+    (Or.inr ⟨';', _, rfl, rfl⟩) (fuel + 1)
+    (by simp [String.toList_append] at hf; omega)
+  have hne := ptxTypedToken_ne ("st." ++ space) ty
+    (by simp [String.toList_append])
+  have hfields : (ptxOpcodeFields ("st." ++ space ++ ppPTXType ty).toList).map String.ofList =
+      ["st", space, String.ofList ((ppPTXType ty).toList.drop 1)] := by
+    rw [String.toList_append, ptxOpcodeFields_typed, List.map_append]
+    rcases hspace with rfl | rfl | rfl | rfl <;> rfl
+  simp only [String.toList_append, String.reduceToList, List.append_assoc,
+    List.cons_append, List.nil_append] at ht
+  conv =>
+    lhs
+    arg 2
+    simp only [String.toList_append, String.reduceToList, List.append_assoc,
+      List.cons_append, List.nil_append]
+  simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
+    Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
+  rw [hfields]
+  simp only [List.head?_cons, List.getLast?_cons_cons, List.getLast?_singleton,
+    parsePTXType_suffix]
+  rcases hspace with rfl | rfl | rfl | rfl <;> simp [stripPrefixChars, ha, hs]
+
+theorem parsePTXInstr_cvtaToGlobal_roundtrip (ty : PTXType) (dst : String) (src : PTXOperand)
+    (hd : CanonicalPTXName dst) (hs : CanonicalPTXOperand src)
+    (rest : List Char) (fuel : Nat)
+    (hf : (ppPTXInstr (.cvtaToGlobal ty dst src)).toList.length < fuel + 1) :
+    parsePTXInstr (fuel + 1) ((ppPTXInstr (.cvtaToGlobal ty dst src)).toList ++ rest) =
+      some (.cvtaToGlobal ty dst src, rest) := by
+  have ht := parsePTXTypedName_roundtrip "cvta.to.global" (by unfold CanonicalPTXName; decide) ty
+    (dst.toList ++ ',' :: ' ' :: ((ppPTXOperand src).toList ++ ';' :: rest)) (fuel + 1)
+    (by simp [ppPTXInstr, toString, String.toList_append] at hf ⊢; omega)
+  have hd := parsePTXName_roundtrip dst hd
+    (',' :: ' ' :: ((ppPTXOperand src).toList ++ ';' :: rest))
+    (Or.inr ⟨',', _, rfl, rfl⟩) (fuel + 1)
+    (by simp [ppPTXInstr, toString, String.toList_append] at hf; omega)
+  have hs := parsePTXOperand_roundtrip src hs (';' :: rest)
+    (Or.inr ⟨';', _, rfl, rfl⟩) (fuel + 1)
+    (by simp [ppPTXInstr, toString, String.toList_append] at hf; omega)
+  have hne := ptxTypedToken_ne "cvta.to.global" ty (by decide)
+  have hfields : (ptxOpcodeFields ("cvta.to.global" ++ ppPTXType ty).toList).map String.ofList =
+      ["cvta", "to", "global", String.ofList ((ppPTXType ty).toList.drop 1)] := by
+    rw [String.toList_append, ptxOpcodeFields_typed, List.map_append]
+    rfl
+  simp only [String.toList_append, String.reduceToList,
+    List.cons_append, List.nil_append] at ht
+  simp only [ppPTXInstr, toString, String.toList_append, String.reduceToList,
+    List.append_assoc, List.cons_append, List.nil_append]
+  simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
+    Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
+  rw [hfields]
+  simp only [List.head?_cons, List.getLast?_cons_cons, List.getLast?_singleton,
+    parsePTXType_suffix]
+  simp [stripPrefixChars, hd, hs]
+
+theorem parsePTXInstr_ret_suffix_roundtrip (rest : List Char) (fuel : Nat) (hf : 3 < fuel) :
+    parsePTXInstr fuel ((ppPTXInstr .ret).toList ++ rest) = some (.ret, rest) := by
+  have ht := parsePTXName_roundtrip "ret" (by unfold CanonicalPTXName; decide)
+    (';' :: rest) (Or.inr ⟨';', _, rfl, rfl⟩) fuel hf
+  simp only [String.reduceToList, List.cons_append, List.nil_append] at ht
+  simp [parsePTXInstr, ppPTXInstr, ht, stripPrefixChars]
+
+theorem parsePTXInstr_barSync_roundtrip (bid : Nat) (rest : List Char) (fuel : Nat)
+    (hf : bid.repr.toList.length < fuel) (hmin : 8 < fuel) :
+    parsePTXInstr fuel ((ppPTXInstr (.barSync bid)).toList ++ rest) = some (.barSync bid, rest) := by
+  have ht := parsePTXName_roundtrip "bar.sync" (by unfold CanonicalPTXName; decide)
+    (' ' :: (bid.repr.toList ++ ';' :: rest)) (Or.inr ⟨' ', _, rfl, rfl⟩) fuel hmin
+  have hn := parsePTXName_nat_roundtrip bid (';' :: rest)
+    (Or.inr ⟨';', _, rfl, rfl⟩) fuel hf
+  simp only [String.reduceToList, List.cons_append, List.nil_append, Nat.toList_repr] at ht hn
+  simp [parsePTXInstr, ppPTXInstr, toString, String.toList_append, List.append_assoc,
+    ht, hn, stripPrefixChars, Nat.toNat?_repr]
+
+theorem parsePTXInstr_unary_roundtrip (opcode : String) (ty : PTXType)
+    (dst : String) (src : PTXOperand)
+    (hop : opcode = "mov" ∨ opcode = "not" ∨ opcode = "neg" ∨ opcode = "clz")
+    (hd : CanonicalPTXName dst) (hs : CanonicalPTXOperand src)
+    (rest : List Char) (fuel : Nat)
+    (hf : (opcode ++ ppPTXType ty ++ " " ++ dst ++ ", " ++ ppPTXOperand src ++ ";").toList.length < fuel + 1) :
+    parsePTXInstr (fuel + 1)
+      ((opcode ++ ppPTXType ty ++ " " ++ dst ++ ", " ++ ppPTXOperand src ++ ";").toList ++ rest) =
+      some ((if opcode = "mov" then .mov ty dst src else if opcode = "not" then .bitNot ty dst src
+        else if opcode = "neg" then .neg ty dst src else .clz ty dst src), rest) := by
+  have hopName : CanonicalPTXName opcode := by
+    rcases hop with rfl | rfl | rfl | rfl <;> unfold CanonicalPTXName <;> decide
+  have ht := parsePTXTypedName_roundtrip opcode hopName ty
+    (dst.toList ++ ',' :: ' ' :: ((ppPTXOperand src).toList ++ ';' :: rest)) (fuel + 1)
+    (by simp [String.toList_append] at hf ⊢; omega)
+  have hd := parsePTXName_roundtrip dst hd
+    (',' :: ' ' :: ((ppPTXOperand src).toList ++ ';' :: rest))
+    (Or.inr ⟨',', _, rfl, rfl⟩) (fuel + 1) (by simp [String.toList_append] at hf; omega)
+  have hs := parsePTXOperand_roundtrip src hs (';' :: rest)
+    (Or.inr ⟨';', _, rfl, rfl⟩) (fuel + 1) (by simp [String.toList_append] at hf; omega)
+  have hne := ptxTypedToken_ne opcode ty (by rcases hop with rfl | rfl | rfl | rfl <;> decide)
+  have hfields : (ptxOpcodeFields (opcode ++ ppPTXType ty).toList).map String.ofList =
+      [opcode, String.ofList ((ppPTXType ty).toList.drop 1)] := by
+    rw [String.toList_append, ptxOpcodeFields_typed, List.map_append]
+    rcases hop with rfl | rfl | rfl | rfl <;> rfl
+  simp only [String.toList_append, String.reduceToList, List.append_assoc,
+    List.cons_append, List.nil_append] at ht ⊢
+  simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
+    Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
+  rw [hfields]
+  simp only [List.head?_cons, List.getLast?_cons_cons, List.getLast?_singleton, parsePTXType_suffix]
+  rcases hop with rfl | rfl | rfl | rfl <;> simp [stripPrefixChars, hd, hs]
+
+theorem parsePTXInstr_binary_roundtrip (opcode : String) (ty : PTXType)
+    (dst : String) (a b : PTXOperand)
+    (hop : opcode ∈ ["sub", "div", "rem", "and", "or", "xor", "shl", "shr"])
+    (hd : CanonicalPTXName dst) (ha : CanonicalPTXOperand a) (hb : CanonicalPTXOperand b)
+    (rest : List Char) (fuel : Nat)
+    (hf : (opcode ++ ppPTXType ty ++ " " ++ dst ++ ", " ++ ppPTXOperand a ++
+      ", " ++ ppPTXOperand b ++ ";").toList.length < fuel + 1) :
+    parsePTXInstr (fuel + 1)
+      ((opcode ++ ppPTXType ty ++ " " ++ dst ++ ", " ++ ppPTXOperand a ++
+        ", " ++ ppPTXOperand b ++ ";").toList ++ rest) =
+      some ((match (generalizing := false) opcode with
+        | "sub" => .sub ty dst a b | "div" => .div ty dst a b
+        | "rem" => .rem ty dst a b | "and" => .bitAnd ty dst a b
+        | "or" => .bitOr ty dst a b | "xor" => .bitXor ty dst a b
+        | "shl" => .shl ty dst a b | _ => .shr ty dst a b), rest) := by
+  simp only [List.mem_cons, List.not_mem_nil, or_false] at hop
+  have hopName : CanonicalPTXName opcode := by
+    rcases hop with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
+      unfold CanonicalPTXName <;> decide
+  have ht := parsePTXTypedName_roundtrip opcode hopName ty
+    (dst.toList ++ ',' :: ' ' :: ((ppPTXOperand a).toList ++ ',' :: ' ' ::
+      ((ppPTXOperand b).toList ++ ';' :: rest))) (fuel + 1)
+    (by simp [String.toList_append] at hf ⊢; omega)
+  have hd := parsePTXName_roundtrip dst hd
+    (',' :: ' ' :: ((ppPTXOperand a).toList ++ ',' :: ' ' :: ((ppPTXOperand b).toList ++ ';' :: rest)))
+    (Or.inr ⟨',', _, rfl, rfl⟩) (fuel + 1) (by simp [String.toList_append] at hf; omega)
+  have ha := parsePTXOperand_roundtrip a ha
+    (',' :: ' ' :: ((ppPTXOperand b).toList ++ ';' :: rest))
+    (Or.inr ⟨',', _, rfl, rfl⟩) (fuel + 1) (by simp [String.toList_append] at hf; omega)
+  have hb := parsePTXOperand_roundtrip b hb (';' :: rest)
+    (Or.inr ⟨';', _, rfl, rfl⟩) (fuel + 1) (by simp [String.toList_append] at hf; omega)
+  have hne := ptxTypedToken_ne opcode ty
+    (by rcases hop with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> decide)
+  have hfields : (ptxOpcodeFields (opcode ++ ppPTXType ty).toList).map String.ofList =
+      [opcode, String.ofList ((ppPTXType ty).toList.drop 1)] := by
+    rw [String.toList_append, ptxOpcodeFields_typed, List.map_append]
+    rcases hop with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;> rfl
+  simp only [String.toList_append, List.append_assoc] at ht
+  conv =>
+    lhs
+    arg 2
+    simp only [String.toList_append, String.reduceToList, List.append_assoc,
+      List.cons_append, List.nil_append]
+  simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
+    Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
+  rw [hfields]
+  simp only [List.head?_cons, List.getLast?_cons_cons, List.getLast?_singleton, parsePTXType_suffix]
+  rcases hop with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
+    simp [stripPrefixChars, hd, ha, hb]
+
+/-- Binary instructions whose opcode includes one scalar modifier. -/
+theorem parsePTXInstr_modified_binary_roundtrip (opcode modifier : String) (ty : PTXType)
+    (dst : String) (a b : PTXOperand) (ins : PTXInstr)
+    (hop : (∃ rm, opcode = "add" ∧ modifier = ppRoundMode rm ∧ ins = .add rm ty dst a b) ∨
+      (∃ mode, opcode = "mul" ∧ modifier = ppMulMode mode ∧ ins = .mul mode ty dst a b) ∨
+      (∃ cmp, opcode = "setp" ∧ modifier = ppCmpOp cmp ∧ ins = .setp cmp ty dst a b))
+    (hd : CanonicalPTXName dst) (ha : CanonicalPTXOperand a) (hb : CanonicalPTXOperand b)
+    (rest : List Char) (fuel : Nat)
+    (hf : (opcode ++ modifier ++ ppPTXType ty ++ " " ++ dst ++ ", " ++ ppPTXOperand a ++
+      ", " ++ ppPTXOperand b ++ ";").toList.length < fuel + 1) :
+    parsePTXInstr (fuel + 1)
+      ((opcode ++ modifier ++ ppPTXType ty ++ " " ++ dst ++ ", " ++ ppPTXOperand a ++
+        ", " ++ ppPTXOperand b ++ ";").toList ++ rest) = some (ins, rest) := by
+  have hn : CanonicalPTXName (opcode ++ modifier) := by
+    rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩ | ⟨cmp, rfl, rfl, rfl⟩
+    · cases rm <;> unfold CanonicalPTXName <;> decide
+    · cases mode <;> unfold CanonicalPTXName <;> decide
+    · cases cmp <;> unfold CanonicalPTXName <;> decide
+  have ht := parsePTXTypedName_roundtrip (opcode ++ modifier) hn ty
+    (dst.toList ++ ',' :: ' ' :: ((ppPTXOperand a).toList ++ ',' :: ' ' ::
+      ((ppPTXOperand b).toList ++ ';' :: rest))) (fuel + 1)
+    (by simp [String.toList_append] at hf ⊢; omega)
+  have hd := parsePTXName_roundtrip dst hd
+    (',' :: ' ' :: ((ppPTXOperand a).toList ++ ',' :: ' ' :: ((ppPTXOperand b).toList ++ ';' :: rest)))
+    (Or.inr ⟨',', _, rfl, rfl⟩) (fuel + 1) (by simp [String.toList_append] at hf; omega)
+  have ha := parsePTXOperand_roundtrip a ha
+    (',' :: ' ' :: ((ppPTXOperand b).toList ++ ';' :: rest))
+    (Or.inr ⟨',', _, rfl, rfl⟩) (fuel + 1) (by simp [String.toList_append] at hf; omega)
+  have hb := parsePTXOperand_roundtrip b hb (';' :: rest)
+    (Or.inr ⟨';', _, rfl, rfl⟩) (fuel + 1) (by simp [String.toList_append] at hf; omega)
+  have hne := ptxTypedToken_ne (opcode ++ modifier) ty (by
+    rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩ | ⟨cmp, rfl, rfl, rfl⟩ <;>
+      simp [String.toList_append])
+  have hfields := congrArg (List.map String.ofList) (ptxOpcodeFields_typed (opcode ++ modifier).toList ty)
+  let mods : List String := match modifier.toList with
+    | '.' :: cs => [String.ofList cs]
+    | _ => []
+  have htok_parts : (ptxOpcodeFields (opcode ++ modifier).toList).map String.ofList = opcode :: mods := by
+    rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩ | ⟨cmp, rfl, rfl, rfl⟩
+    · cases rm <;> rfl
+    · cases mode <;> rfl
+    · cases cmp <;> rfl
+  let parts := opcode :: (mods ++ [String.ofList ((ppPTXType ty).toList.drop 1)])
+  have hparts : (ptxOpcodeFields (opcode ++ modifier ++ ppPTXType ty).toList).map String.ofList = parts := by
+    rw [show (ptxOpcodeFields (opcode ++ modifier ++ ppPTXType ty).toList).map String.ofList =
+      (ptxOpcodeFields (opcode ++ modifier).toList).map String.ofList ++
+        [String.ofList ((ppPTXType ty).toList.drop 1)] by
+      simpa [String.toList_append, List.map_append] using hfields, htok_parts, List.cons_append]
+  have hlast : parts.getLast? = some (String.ofList ((ppPTXType ty).toList.drop 1)) := by
+    dsimp only [parts]
+    rcases hop with ⟨rm, _, rfl, _⟩ | ⟨mode, _, rfl, _⟩ | ⟨cmp, _, rfl, _⟩
+    · cases rm <;> rfl
+    · cases mode <;> rfl
+    · cases cmp <;> rfl
+  have hmods : (parts.drop 1).dropLast = mods := by
+    dsimp only [parts]
+    rcases hop with ⟨rm, _, rfl, _⟩ | ⟨mode, _, rfl, _⟩ | ⟨cmp, _, rfl, _⟩
+    · cases rm <;> rfl
+    · cases mode <;> rfl
+    · cases cmp <;> rfl
+  have hop_not_st : (opcode == "st") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_not_ld : (opcode == "ld") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_not_cvta : (opcode == "cvta") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_not_cvt : (opcode == "cvt") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_allow : (opcode == "add" || opcode == "mul" || opcode == "mad" || opcode == "fma" ||
+      opcode == "setp") = true := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_not_selp : (opcode == "selp") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hhead : parts.head? = some opcode := rfl
+  simp only [String.toList_append, List.append_assoc] at ht
+  conv =>
+    lhs
+    arg 2
+    simp only [String.toList_append, String.reduceToList, List.append_assoc,
+      List.cons_append, List.nil_append]
+  simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
+    Bool.false_eq_true, ↓reduceIte, stripPrefixChars, beq_self_eq_true]
+  rw [hparts]
+  simp only [hhead, hlast, parsePTXType_suffix, hmods,
+    hop_not_st, hop_not_ld, hop_not_cvta, hop_not_cvt, hop_allow, Bool.not_true, Bool.false_and,
+    hd, ha, hb, hop_not_selp, stripPrefixChars, beq_self_eq_true, pure, ↓reduceIte, Bool.false_eq_true]
+  rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩ | ⟨cmp, rfl, rfl, rfl⟩
+  · cases rm <;> rfl
+  · cases mode <;> rfl
+  · cases cmp <;> rfl
+
+theorem parsePTXInstr_selp_roundtrip (ty : PTXType) (dst pred : String) (a b : PTXOperand)
+    (hd : CanonicalPTXName dst) (hp : CanonicalPTXName pred)
+    (ha : CanonicalPTXOperand a) (hb : CanonicalPTXOperand b)
+    (rest : List Char) (fuel : Nat)
+    (hf : (ppPTXInstr (.selp ty dst a b pred)).toList.length < fuel + 1) :
+    parsePTXInstr (fuel + 1) ((ppPTXInstr (.selp ty dst a b pred)).toList ++ rest) =
+      some (.selp ty dst a b pred, rest) := by
+  have ht := parsePTXTypedName_roundtrip "selp" (by unfold CanonicalPTXName; decide) ty
+    (dst.toList ++ ',' :: ' ' :: ((ppPTXOperand a).toList ++ ',' :: ' ' ::
+      ((ppPTXOperand b).toList ++ ',' :: ' ' :: (pred.toList ++ ';' :: rest)))) (fuel + 1)
+    (by simp [ppPTXInstr, toString, String.toList_append] at hf ⊢; omega)
+  have hd := parsePTXName_roundtrip dst hd
+    (',' :: ' ' :: ((ppPTXOperand a).toList ++ ',' :: ' ' ::
+      ((ppPTXOperand b).toList ++ ',' :: ' ' :: (pred.toList ++ ';' :: rest))))
+    (Or.inr ⟨',', _, rfl, rfl⟩) (fuel + 1)
+    (by simp [ppPTXInstr, toString, String.toList_append] at hf; omega)
+  have ha := parsePTXOperand_roundtrip a ha
+    (',' :: ' ' :: ((ppPTXOperand b).toList ++ ',' :: ' ' :: (pred.toList ++ ';' :: rest)))
+    (Or.inr ⟨',', _, rfl, rfl⟩) (fuel + 1)
+    (by simp [ppPTXInstr, toString, String.toList_append] at hf; omega)
+  have hb := parsePTXOperand_roundtrip b hb (',' :: ' ' :: (pred.toList ++ ';' :: rest))
+    (Or.inr ⟨',', _, rfl, rfl⟩) (fuel + 1)
+    (by simp [ppPTXInstr, toString, String.toList_append] at hf; omega)
+  have hp := parsePTXName_roundtrip pred hp (';' :: rest)
+    (Or.inr ⟨';', _, rfl, rfl⟩) (fuel + 1)
+    (by simp [ppPTXInstr, toString, String.toList_append] at hf; omega)
+  have hne := ptxTypedToken_ne "selp" ty (by decide)
+  have hfields : (ptxOpcodeFields ("selp" ++ ppPTXType ty).toList).map String.ofList =
+      ["selp", String.ofList ((ppPTXType ty).toList.drop 1)] := by
+    rw [String.toList_append, ptxOpcodeFields_typed, List.map_append]; rfl
+  simp only [String.toList_append, String.reduceToList,
+    List.cons_append, List.nil_append] at ht
+  simp only [ppPTXInstr, toString, String.toList_append, String.reduceToList,
+    List.append_assoc, List.cons_append, List.nil_append]
+  simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
+    Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
+  rw [hfields]
+  simp only [List.head?_cons, List.getLast?_cons_cons, List.getLast?_singleton,
+    parsePTXType_suffix]
+  simp [stripPrefixChars, hd, ha, hb, hp]
+
+/-- Three-operand scalar instructions, including every printed arithmetic modifier. -/
+theorem parsePTXInstr_ternary_roundtrip (opcode modifier : String) (ty : PTXType)
+    (dst : String) (a b c : PTXOperand) (ins : PTXInstr)
+    (hop : (∃ rm, opcode = "fma" ∧ modifier = ppRoundMode rm ∧ ins = .fma rm ty dst a b c) ∨
+      (∃ mode, opcode = "mad" ∧ modifier = ppMulMode mode ∧ ins = .mad mode ty dst a b c))
+    (hd : CanonicalPTXName dst) (ha : CanonicalPTXOperand a)
+    (hb : CanonicalPTXOperand b) (hc : CanonicalPTXOperand c)
+    (rest : List Char) (fuel : Nat)
+    (hf : (opcode ++ modifier ++ ppPTXType ty ++ " " ++ dst ++ ", " ++ ppPTXOperand a ++
+      ", " ++ ppPTXOperand b ++ ", " ++ ppPTXOperand c ++ ";").toList.length < fuel + 1) :
+    parsePTXInstr (fuel + 1)
+      ((opcode ++ modifier ++ ppPTXType ty ++ " " ++ dst ++ ", " ++ ppPTXOperand a ++
+        ", " ++ ppPTXOperand b ++ ", " ++ ppPTXOperand c ++ ";").toList ++ rest) = some (ins, rest) := by
+  have hn : CanonicalPTXName (opcode ++ modifier) := by
+    rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩
+    · cases rm <;> unfold CanonicalPTXName <;> decide
+    · cases mode <;> unfold CanonicalPTXName <;> decide
+  have ht := parsePTXTypedName_roundtrip (opcode ++ modifier) hn ty
+    (dst.toList ++ ',' :: ' ' :: ((ppPTXOperand a).toList ++ ',' :: ' ' ::
+      ((ppPTXOperand b).toList ++ ',' :: ' ' :: ((ppPTXOperand c).toList ++ ';' :: rest)))) (fuel + 1)
+    (by simp [String.toList_append] at hf ⊢; omega)
+  have hd := parsePTXName_roundtrip dst hd
+    (',' :: ' ' :: ((ppPTXOperand a).toList ++ ',' :: ' ' ::
+      ((ppPTXOperand b).toList ++ ',' :: ' ' :: ((ppPTXOperand c).toList ++ ';' :: rest))))
+    (Or.inr ⟨',', _, rfl, rfl⟩) (fuel + 1) (by simp [String.toList_append] at hf; omega)
+  have ha := parsePTXOperand_roundtrip a ha
+    (',' :: ' ' :: ((ppPTXOperand b).toList ++ ',' :: ' ' :: ((ppPTXOperand c).toList ++ ';' :: rest)))
+    (Or.inr ⟨',', _, rfl, rfl⟩) (fuel + 1) (by simp [String.toList_append] at hf; omega)
+  have hb := parsePTXOperand_roundtrip b hb
+    (',' :: ' ' :: ((ppPTXOperand c).toList ++ ';' :: rest))
+    (Or.inr ⟨',', _, rfl, rfl⟩) (fuel + 1) (by simp [String.toList_append] at hf; omega)
+  have hc := parsePTXOperand_roundtrip c hc (';' :: rest)
+    (Or.inr ⟨';', _, rfl, rfl⟩) (fuel + 1) (by simp [String.toList_append] at hf; omega)
+  have hne := ptxTypedToken_ne (opcode ++ modifier) ty (by
+    rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩ <;> simp [String.toList_append])
+  have hfields := congrArg (List.map String.ofList) (ptxOpcodeFields_typed (opcode ++ modifier).toList ty)
+  let mods : List String := match modifier.toList with
+    | '.' :: cs => [String.ofList cs]
+    | _ => []
+  have htok_parts : (ptxOpcodeFields (opcode ++ modifier).toList).map String.ofList = opcode :: mods := by
+    rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩
+    · cases rm <;> rfl
+    · cases mode <;> rfl
+  let parts := opcode :: (mods ++ [String.ofList ((ppPTXType ty).toList.drop 1)])
+  have hparts : (ptxOpcodeFields (opcode ++ modifier ++ ppPTXType ty).toList).map String.ofList = parts := by
+    rw [show (ptxOpcodeFields (opcode ++ modifier ++ ppPTXType ty).toList).map String.ofList =
+      (ptxOpcodeFields (opcode ++ modifier).toList).map String.ofList ++
+        [String.ofList ((ppPTXType ty).toList.drop 1)] by
+      simpa [String.toList_append, List.map_append] using hfields, htok_parts, List.cons_append]
+  have hlast : parts.getLast? = some (String.ofList ((ppPTXType ty).toList.drop 1)) := by
+    dsimp only [parts]
+    rcases hop with ⟨rm, _, rfl, _⟩ | ⟨mode, _, rfl, _⟩
+    · cases rm <;> rfl
+    · cases mode <;> rfl
+  have hmods : (parts.drop 1).dropLast = mods := by
+    dsimp only [parts]
+    rcases hop with ⟨rm, _, rfl, _⟩ | ⟨mode, _, rfl, _⟩
+    · cases rm <;> rfl
+    · cases mode <;> rfl
+  have hop_not_st : (opcode == "st") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_not_ld : (opcode == "ld") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_not_cvta : (opcode == "cvta") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_not_cvt : (opcode == "cvt") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_not_selp : (opcode == "selp") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_not_setp : (opcode == "setp") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hhead : parts.head? = some opcode := rfl
+  simp only [String.toList_append, List.append_assoc] at ht
+  conv =>
+    lhs
+    arg 2
+    simp only [String.toList_append, String.reduceToList, List.append_assoc,
+      List.cons_append, List.nil_append]
+  simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
+    Bool.false_eq_true, ↓reduceIte, stripPrefixChars, beq_self_eq_true]
+  rw [hparts]
+  simp only [hhead, hlast, parsePTXType_suffix, hmods,
+    hop_not_st, hop_not_ld, hop_not_cvta, hop_not_cvt,
+    hd, ha, hb, hc, hop_not_selp, hop_not_setp, stripPrefixChars, beq_self_eq_true, pure, ↓reduceIte, Bool.false_eq_true]
+  rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩
+  · cases rm <;> rfl
+  · cases mode <;> rfl
+
+theorem parsePTXInstr_cvt_roundtrip (rm : PTXRoundMode) (dt st : PTXType)
+    (dst : String) (src : PTXOperand)
+    (hd : CanonicalPTXName dst) (hs : CanonicalPTXOperand src)
+    (rest : List Char) (fuel : Nat)
+    (hf : (ppPTXInstr (.cvt rm dt st dst src)).toList.length < fuel + 1) :
+    parsePTXInstr (fuel + 1) ((ppPTXInstr (.cvt rm dt st dst src)).toList ++ rest) =
+      some (.cvt rm dt st dst src, rest) := by
+  have hn : CanonicalPTXName ("cvt" ++ ppRoundMode rm) := by
+    cases rm <;> unfold CanonicalPTXName <;> decide
+  have ht := parsePTXTypedName_roundtrip ("cvt" ++ ppRoundMode rm ++ ppPTXType dt)
+    (ptxTypedName _ hn dt) st
+    (dst.toList ++ ',' :: ' ' :: ((ppPTXOperand src).toList ++ ';' :: rest)) (fuel + 1)
+    (by simp [ppPTXInstr, toString, String.toList_append] at hf ⊢; omega)
+  have hd := parsePTXName_roundtrip dst hd
+    (',' :: ' ' :: ((ppPTXOperand src).toList ++ ';' :: rest))
+    (Or.inr ⟨',', _, rfl, rfl⟩) (fuel + 1)
+    (by simp [ppPTXInstr, toString, String.toList_append] at hf; omega)
+  have hs := parsePTXOperand_roundtrip src hs (';' :: rest)
+    (Or.inr ⟨';', _, rfl, rfl⟩) (fuel + 1)
+    (by simp [ppPTXInstr, toString, String.toList_append] at hf; omega)
+  have hne := ptxTypedToken_ne ("cvt" ++ ppRoundMode rm ++ ppPTXType dt) st
+    (by simp [String.toList_append])
+  let dtTok := String.ofList ((ppPTXType dt).toList.drop 1)
+  let stTok := String.ofList ((ppPTXType st).toList.drop 1)
+  let rmMods : List String := match rm with
+    | .none => []
+    | .rn => ["rn"]
+    | .rz => ["rz"]
+  have hrm_parts : (ptxOpcodeFields ("cvt" ++ ppRoundMode rm).toList).map String.ofList = "cvt" :: rmMods := by
+    cases rm <;> rfl
+  let parts := "cvt" :: (rmMods ++ [dtTok] ++ [stTok])
+  have hfields : (ptxOpcodeFields ("cvt" ++ ppRoundMode rm ++ ppPTXType dt ++ ppPTXType st).toList).map String.ofList = parts := by
+    rw [String.toList_append, ptxOpcodeFields_typed, List.map_append,
+      String.toList_append, ptxOpcodeFields_typed, List.map_append, hrm_parts]
+    simp only [parts, dtTok, stTok, List.map_cons, List.map_nil, List.append_assoc, List.cons_append, List.nil_append]
+  have hlast : parts.getLast? = some stTok := by
+    cases rm <;> rfl
+  have hmods : (parts.drop 1).dropLast = rmMods ++ [dtTok] := by
+    cases rm <;> rfl
+  have hhead : parts.head? = some "cvt" := rfl
+  simp only [String.toList_append, String.reduceToList, List.append_assoc,
+    List.cons_append, List.nil_append] at ht
+  conv =>
+    lhs
+    arg 2
+    simp only [ppPTXInstr, toString, String.toList_append, String.reduceToList,
+      List.append_assoc, List.cons_append, List.nil_append]
+  simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
+    Bool.false_eq_true, ↓reduceIte, stripPrefixChars, beq_self_eq_true]
+  rw [hfields]
+  simp only [hhead, hlast, stTok, parsePTXType_suffix, hmods,
+    show ("cvt" == "st") = false from rfl, show ("cvt" == "ld") = false from rfl,
+    show ("cvt" == "cvta") = false from rfl, show ("cvt" == "cvt") = true from rfl,
+    hd, hs, stripPrefixChars, beq_self_eq_true, pure, ↓reduceIte, Bool.false_eq_true]
+  dsimp only [rmMods, dtTok]
+  cases rm <;> cases dt <;> rfl
+
+set_option maxHeartbeats 1000000 in
+/-- Every instruction in the syntactically canonical scalar fragment roundtrips. -/
+theorem parsePTXInstr_roundtrip (ins : PTXInstr) (h : CanonicalPTXInstr ins)
+    (rest : List Char) (fuel : Nat)
+    (hf : (ppPTXInstr ins).toList.length < fuel + 1) :
+    parsePTXInstr (fuel + 1) ((ppPTXInstr ins).toList ++ rest) = some (ins, rest) := by
+  cases ins
+  case ldParam ty dst name =>
+    exact parsePTXInstr_ldParam_roundtrip ty dst name h.1 h.2 rest fuel hf
+  case cvtaToGlobal ty dst src =>
+    exact parsePTXInstr_cvtaToGlobal_roundtrip ty dst src h.1 h.2 rest fuel hf
+  case cvt rm dt st dst src =>
+    exact parsePTXInstr_cvt_roundtrip rm dt st dst src h.1 h.2 rest fuel hf
+  case selp ty dst a b pred =>
+    exact parsePTXInstr_selp_roundtrip ty dst pred a b h.1 h.2.2.2 h.2.1 h.2.2.1 rest fuel hf
+  case bra label =>
+    exact parsePTXInstr_bra_roundtrip label h rest (fuel + 1)
+      (by simp [ppPTXInstr, toString, String.toList_append] at hf; omega)
+      (by simp [ppPTXInstr, toString, String.toList_append] at hf; omega)
+  case ret =>
+    exact parsePTXInstr_ret_suffix_roundtrip rest (fuel + 1) (by simp [ppPTXInstr] at hf; omega)
+  case barSync bid =>
+    exact parsePTXInstr_barSync_roundtrip bid rest (fuel + 1)
+      (by simp [ppPTXInstr, toString, String.toList_append, Nat.toList_repr] at hf ⊢; omega)
+      (by simp [ppPTXInstr, toString, String.toList_append] at hf; omega)
+  case ldGlobal ty dst addr =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_load_roundtrip "global" ty dst addr (by simp) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case ldShared ty dst addr =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_load_roundtrip "shared" ty dst addr (by simp) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case ldLocal ty dst addr =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_load_roundtrip "local" ty dst addr (by simp) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case ldConst ty dst addr =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_load_roundtrip "const" ty dst addr (by simp) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case stGlobal ty addr src =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_store_roundtrip "global" ty addr src (by simp) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case stShared ty addr src =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_store_roundtrip "shared" ty addr src (by simp) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case stLocal ty addr src =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_store_roundtrip "local" ty addr src (by simp) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case stConst ty addr src =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_store_roundtrip "const" ty addr src (by simp) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case mov ty dst src =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_unary_roundtrip "mov" ty dst src (Or.inl rfl) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case bitNot ty dst src =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_unary_roundtrip "not" ty dst src (Or.inr (Or.inl rfl)) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case neg ty dst src =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_unary_roundtrip "neg" ty dst src (Or.inr (Or.inr (Or.inl rfl))) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case clz ty dst src =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_unary_roundtrip "clz" ty dst src (Or.inr (Or.inr (Or.inr rfl))) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case sub ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_binary_roundtrip "sub" ty dst a b (by simp) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case div ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_binary_roundtrip "div" ty dst a b (by simp) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case rem ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_binary_roundtrip "rem" ty dst a b (by simp) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case bitAnd ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_binary_roundtrip "and" ty dst a b (by simp) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case bitOr ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_binary_roundtrip "or" ty dst a b (by simp) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case bitXor ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_binary_roundtrip "xor" ty dst a b (by simp) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case shl ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_binary_roundtrip "shl" ty dst a b (by simp) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case shr ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_binary_roundtrip "shr" ty dst a b (by simp) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case add rm ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_modified_binary_roundtrip "add" (ppRoundMode rm) ty dst a b _
+        (Or.inl ⟨rm, rfl, rfl, rfl⟩) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case mul mode ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_modified_binary_roundtrip "mul" (ppMulMode mode) ty dst a b _
+        (Or.inr (Or.inl ⟨mode, rfl, rfl, rfl⟩)) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case setp cmp ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_modified_binary_roundtrip "setp" (ppCmpOp cmp) ty dst a b _
+        (Or.inr (Or.inr ⟨cmp, rfl, rfl, rfl⟩)) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case mad mode ty dst a b c =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_ternary_roundtrip "mad" (ppMulMode mode) ty dst a b c _
+        (Or.inr ⟨mode, rfl, rfl, rfl⟩) h.1 h.2.1 h.2.2.1 h.2.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case fma rm ty dst a b c =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_ternary_roundtrip "fma" (ppRoundMode rm) ty dst a b c _
+        (Or.inl ⟨rm, rfl, rfl, rfl⟩) h.1 h.2.1 h.2.2.1 h.2.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  all_goals exact False.elim h
+
+theorem ppPTXInstr_injective_on_canonical (a b : PTXInstr)
+    (ha : CanonicalPTXInstr a) (hb : CanonicalPTXInstr b)
+    (h : ppPTXInstr a = ppPTXInstr b) : a = b := by
+  let fuel := (ppPTXInstr a).toList.length + (ppPTXInstr b).toList.length
+  have hp := congrArg (fun s : String => parsePTXInstr (fuel + 1) (s.toList ++ [])) h
+  rw [parsePTXInstr_roundtrip a ha [] fuel (by omega),
+    parsePTXInstr_roundtrip b hb [] fuel (by omega)] at hp
+  exact (Option.some.inj hp |> Prod.mk.inj).1
+
+theorem scanPTXLines_singleton (chars : List Char)
+    (hn : '\n' ∉ chars) (fuel : Nat) (hf : chars.length < fuel) :
+    scanPTXLines fuel chars = some [chars] := by
+  induction chars generalizing fuel with
+  | nil => cases fuel <;> simp_all [scanPTXLines]
+  | cons c cs ih =>
+    cases fuel with
+    | zero => simp at hf
+    | succ fuel =>
+      have hc : c ≠ '\n' := by intro he; subst c; simp at hn
+      have hs : '\n' ∉ cs := by intro he; exact hn (List.mem_cons_of_mem c he)
+      simp [scanPTXLines, ih hs fuel (by simpa using hf), hc]
+
+theorem scanPTXLines_prepend (chars rest : List Char) (lines : List (List Char))
+    (hn : '\n' ∉ chars) (fuel : Nat)
+    (hp : scanPTXLines fuel rest = some lines) (hne : lines ≠ []) :
+    scanPTXLines (fuel + chars.length + 1) (chars ++ '\n' :: rest) =
+      some (chars :: lines) := by
+  induction chars with
+  | nil => cases lines <;> simp_all [scanPTXLines]
+  | cons c cs ih =>
+    have hc : c ≠ '\n' := by intro he; subst c; simp at hn
+    have hs : '\n' ∉ cs := by intro he; exact hn (List.mem_cons_of_mem c he)
+    have hi := ih hs
+    simp only [Nat.add_assoc] at hi
+    simp [List.length_cons, Nat.add_assoc, scanPTXLines, hc, hi]
+
+theorem scanPTXLines_intercalate (lines : List (List Char))
+    (hne : lines ≠ []) (hn : ∀ line ∈ lines, '\n' ∉ line) (fuel : Nat)
+    (hf : (List.intercalate ['\n'] lines).length < fuel) :
+    scanPTXLines fuel (List.intercalate ['\n'] lines) = some lines := by
+  induction lines generalizing fuel with
+  | nil => contradiction
+  | cons line lines ih =>
+    cases lines with
+    | nil => simpa using scanPTXLines_singleton line (hn line (by simp)) fuel (by simpa using hf)
+    | cons next lines =>
+      have hp := ih (by simp) (by intro l hl; exact hn l (by simp [hl]))
+        (fuel - line.length - 1) (by
+          simp [List.intercalate_cons_cons, List.length_append] at hf ⊢
+          omega)
+      have hr := scanPTXLines_prepend line
+        (List.intercalate ['\n'] (next :: lines)) (next :: lines)
+        (hn line (by simp)) (fuel - line.length - 1) hp (by simp)
+      have he : fuel - line.length - 1 + line.length + 1 = fuel := by
+        simp [List.intercalate_cons_cons, List.length_append] at hf
+        omega
+      simpa [he, List.intercalate_cons_cons] using hr
+
+theorem parsePTXRegDecl_roundtrip (r : PTXRegDecl)
+    (hn : CanonicalPTXName r.prefixName) (rest : List Char)
+    (fuel : Nat) (hf : r.prefixName.toList.length < fuel + 1)
+    (hc : r.count.repr.toList.length < fuel + 1) :
+    parsePTXRegDecl (fuel + 1)
+      ((s!"    .reg {ppPTXType r.ty} {r.prefixName}<{r.count}>;").toList ++ rest) =
+      some (r, rest) := by
+  have ht := parsePTXType_roundtrip r.ty fuel
+    (' ' :: (r.prefixName.toList ++ '<' :: (r.count.repr.toList ++ '>' :: ';' :: rest)))
+  have hp := parsePTXName_roundtrip r.prefixName hn
+    ('<' :: (r.count.repr.toList ++ '>' :: ';' :: rest))
+    (Or.inr ⟨'<', _, rfl, rfl⟩) (fuel + 1) hf
+  have hc := parsePTXName_nat_roundtrip r.count ('>' :: ';' :: rest)
+    (Or.inr ⟨'>', _, rfl, rfl⟩) (fuel + 1) hc
+  rcases r with ⟨ty, name, count⟩
+  simp only [Nat.toList_repr] at ht hp hc
+  simp [parsePTXRegDecl, toString, String.toList_append, List.append_assoc,
+    stripPrefixChars, ht, hp, hc, Nat.toNat?_repr]
+
+theorem parsePTXSharedDecl_roundtrip (s : PTXSharedDecl)
+    (hn : CanonicalPTXName s.name) (rest : List Char)
+    (fuel : Nat) (hf : s.name.toList.length < fuel + 1)
+    (ha : s.align.repr.toList.length < fuel + 1)
+    (hc : s.count.repr.toList.length < fuel + 1) :
+    parsePTXSharedDecl (fuel + 1)
+      ((s!"    .shared .align {s.align} {ppPTXType s.elemTy} {s.name}[{s.count}];").toList ++ rest) =
+      some (s, rest) := by
+  have ha := parsePTXName_nat_roundtrip s.align
+    (' ' :: ((ppPTXType s.elemTy).toList ++ ' ' :: (s.name.toList ++ '[' ::
+      (s.count.repr.toList ++ ']' :: ';' :: rest))))
+    (Or.inr ⟨' ', _, rfl, rfl⟩) (fuel + 1) ha
+  have ht := parsePTXType_roundtrip s.elemTy fuel
+    (' ' :: (s.name.toList ++ '[' :: (s.count.repr.toList ++ ']' :: ';' :: rest)))
+  have hp := parsePTXName_roundtrip s.name hn
+    ('[' :: (s.count.repr.toList ++ ']' :: ';' :: rest))
+    (Or.inr ⟨'[', _, rfl, rfl⟩) (fuel + 1) hf
+  have hc := parsePTXName_nat_roundtrip s.count (']' :: ';' :: rest)
+    (Or.inr ⟨']', _, rfl, rfl⟩) (fuel + 1) hc
+  rcases s with ⟨align, ty, name, count⟩
+  simp only [Nat.toList_repr] at ha ht hp hc
+  simp [parsePTXSharedDecl, toString, String.toList_append, List.append_assoc,
+    stripPrefixChars, ha, ht, hp, hc, Nat.toNat?_repr]
+
+theorem parsePTXStmt_ret_roundtrip (rest : List Char) :
+    parsePTXStmt 8 ((ppPTXStmt (.instr none .ret)).toList ++ rest) =
+      some (.instr none .ret, rest) := by
+  simp [parsePTXStmt, ppPTXStmt, parsePTXInstr, ppPTXInstr,
+    parsePTXName, scanPTXName, ptxNameChar, stripPrefixChars, toString]
+
+theorem parsePTXStmt_label_roundtrip (name : String) (hn : CanonicalPTXName name)
+    (rest : List Char) (fuel : Nat) (hf : name.toList.length < fuel) :
+    parsePTXStmt fuel ((ppPTXStmt (.label name)).toList ++ rest) =
+      some (.label name, rest) := by
+  have hp := parsePTXName_roundtrip name hn (':' :: rest)
+    (Or.inr ⟨':', rest, rfl, rfl⟩) fuel hf
+  cases he : name.toList with
+  | nil => exact False.elim (hn.1 he)
+  | cons c cs =>
+    have hc := hn.2 c (by simp [he])
+    have hspace : c ≠ ' ' := by intro h; subst c; contradiction
+    simp only [ppPTXStmt, toString, String.toList_append, String.reduceToList,
+      List.append_assoc, List.cons_append, List.nil_append]
+    have hi : stripPrefixChars [' ', ' ', ' ', ' '] (name.toList ++ ':' :: rest) = none := by
+      simp [he, stripPrefixChars, Ne.symm hspace]
+    simp [parsePTXStmt, hi, hp, stripPrefixChars]
+
+theorem parsePTXStmt_roundtrip (stmt : PTXStmt) (h : CanonicalPTXStmt stmt)
+    (rest : List Char) (fuel : Nat)
+    (hf : (ppPTXStmt stmt).toList.length < fuel) :
+    parsePTXStmt (fuel + 1) ((ppPTXStmt stmt).toList ++ rest) = some (stmt, rest) := by
+  cases stmt with
+  | label name =>
+    apply parsePTXStmt_label_roundtrip name h rest (fuel + 1)
+    simp [ppPTXStmt, toString, String.toList_append] at hf
+    omega
+  | instr guard ins =>
+    apply parsePTXStmt_instr_step guard ins h.1 rest fuel
+    · intro g hg
+      cases guard with
+      | none => simp at hg
+      | some g' =>
+        have he : g' = g := by simpa using hg
+        subst g'
+        cases g with
+        | mk pred negated =>
+          cases negated <;> simp [ppPTXStmt, ppPredGuard, toString, String.toList_append] at hf ⊢ <;> omega
+    · apply parsePTXInstr_roundtrip ins h.2 rest fuel
+      cases guard <;> simp [ppPTXStmt, toString, String.toList_append] at hf <;> omega
+
+/-- A newline-free prefix is preserved by the structural line scanner. -/
+theorem scanPTXLines_prefix (pre rest : List Char)
+    (hn : ∀ c ∈ pre, c ≠ '\n') (fuel : Nat)
+    (line : List Char) (lines : List (List Char))
+    (hr : scanPTXLines fuel rest = some (line :: lines)) :
+    scanPTXLines (pre.length + fuel) (pre ++ rest) =
+      some ((pre ++ line) :: lines) := by
+  induction pre with
+  | nil => simpa using hr
+  | cons c cs ih =>
+    have hc := hn c (by simp)
+    have ht : ∀ x ∈ cs, x ≠ '\n' := fun x hx => hn x (by simp [hx])
+    rw [List.length_cons, Nat.succ_add, List.cons_append, scanPTXLines, ih ht]
+    simp [hc]
+
+theorem ppPTXStmt_injective_on_canonical (a b : PTXStmt)
+    (ha : CanonicalPTXStmt a) (hb : CanonicalPTXStmt b)
+    (h : ppPTXStmt a = ppPTXStmt b) : a = b := by
+  let fuel := (ppPTXStmt a).toList.length + (ppPTXStmt b).toList.length + 1
+  have hp := congrArg (fun s : String => parsePTXStmt (fuel + 1) (s.toList ++ [])) h
+  rw [parsePTXStmt_roundtrip a ha [] fuel (by omega),
+    parsePTXStmt_roundtrip b hb [] fuel (by omega)] at hp
+  exact (Option.some.inj hp |> Prod.mk.inj).1
+
+/-- Register sections preserve source order in the structural kernel parser. -/
+theorem parsePTXDeclsAndBody_regs_roundtrip (rs : List PTXRegDecl)
+    (hr : ∀ r ∈ rs, CanonicalPTXRegDecl r) (fuel : Nat)
+    (hf : ∀ r ∈ rs, r.prefixName.toList.length < fuel + 1 ∧
+      r.count.repr.toList.length < fuel + 1)
+    (rest : List String) (k : PTXKernel) :
+    parsePTXDeclsAndBody (fuel + 1)
+      (rs.map (fun r => s!"    .reg {ppPTXType r.ty} {r.prefixName}<{r.count}>;") ++ rest) k false =
+    parsePTXDeclsAndBody (fuel + 1) rest { k with regDecls := k.regDecls ++ rs } false := by
+  induction rs generalizing k with
+  | nil => simp
+  | cons r rs ih =>
+    have hp := parsePTXRegDecl_roundtrip r (hr r (by simp)).1 [] fuel
+      (hf r (by simp)).1 (hf r (by simp)).2
+    simp only [List.append_nil] at hp
+    simp only [List.map_cons, List.cons_append, parsePTXDeclsAndBody, hp]
+    simp only [Bool.false_eq_true, ↓reduceIte]
+    rw [ih (by intro r h; exact hr r (by simp [h]))
+      (by intro r h; exact hf r (by simp [h]))]
+    simp [List.append_assoc]
+
+/-- Shared declarations preserve source order and cannot be mistaken for registers. -/
+theorem parsePTXDeclsAndBody_shared_roundtrip (ss : List PTXSharedDecl)
+    (hs : ∀ s ∈ ss, CanonicalPTXSharedDecl s) (fuel : Nat)
+    (hf : ∀ s ∈ ss, s.name.toList.length < fuel + 1 ∧
+      s.align.repr.toList.length < fuel + 1 ∧ s.count.repr.toList.length < fuel + 1)
+    (rest : List String) (k : PTXKernel) :
+    parsePTXDeclsAndBody (fuel + 1)
+      (ss.map (fun s => s!"    .shared .align {s.align} {ppPTXType s.elemTy} {s.name}[{s.count}];") ++ rest) k false =
+    parsePTXDeclsAndBody (fuel + 1) rest { k with sharedDecls := k.sharedDecls ++ ss } false := by
+  induction ss generalizing k with
+  | nil => simp
+  | cons s ss ih =>
+    have hp := parsePTXSharedDecl_roundtrip s (hs s (by simp)).1 [] fuel
+      (hf s (by simp)).1 (hf s (by simp)).2.1 (hf s (by simp)).2.2
+    simp only [List.append_nil] at hp
+    have hn : parsePTXRegDecl (fuel + 1)
+        (s!"    .shared .align {s.align} {ppPTXType s.elemTy} {s.name}[{s.count}];").toList = none := by
+      simp [parsePTXRegDecl, stripPrefixChars, toString, String.toList_append]
+    simp only [List.map_cons, List.cons_append, parsePTXDeclsAndBody, hn, hp]
+    simp only [Bool.false_eq_true, ↓reduceIte]
+    rw [ih (by intro s h; exact hs s (by simp [h]))
+      (by intro s h; exact hf s (by simp [h]))]
+    simp [List.append_assoc]
+
+theorem parsePTXDeclsAndBody_local_roundtrip (n : Nat)
+    (fuel : Nat) (hf : n.repr.toList.length < fuel + 1)
+    (rest : List String) (k : PTXKernel) (hk : k.localBytes = 0) :
+    parsePTXDeclsAndBody (fuel + 1)
+      (s!"    .local .align 8 .b8 __local_mem[{n}];" :: rest) k false =
+    parsePTXDeclsAndBody (fuel + 1) rest { k with localBytes := n } false := by
+  have hp := parsePTXName_nat_roundtrip n [']', ';']
+    (Or.inr ⟨']', [';'], rfl, rfl⟩) (fuel + 1) hf
+  simp only [Nat.toList_repr] at hp
+  simp [parsePTXDeclsAndBody, parsePTXRegDecl, parsePTXSharedDecl, stripPrefixChars,
+    toString, String.toList_append, hk, hp]
+
+theorem ppPTXStmt_not_decl (s : PTXStmt) (hs : CanonicalPTXStmt s) (fuel : Nat) :
+    parsePTXRegDecl fuel (ppPTXStmt s).toList = none ∧
+    parsePTXSharedDecl fuel (ppPTXStmt s).toList = none ∧
+    stripPrefixChars "    .local .align 8 .b8 __local_mem[".toList (ppPTXStmt s).toList = none := by
+  cases s with
+  | label name =>
+    cases he : name.toList with
+    | nil => exact False.elim (hs.1 he)
+    | cons c cs =>
+      have hc := hs.2 c (by simp [he])
+      have hn : c ≠ ' ' := by intro h; subst c; contradiction
+      simp [ppPTXStmt, toString, String.toList_append, he, parsePTXRegDecl,
+        parsePTXSharedDecl, stripPrefixChars, Ne.symm hn]
+  | instr guard ins =>
+    cases guard with
+    | some g =>
+      cases g with
+      | mk name neg =>
+        cases neg <;> simp [ppPTXStmt, ppPredGuard, toString, String.toList_append,
+          parsePTXRegDecl, parsePTXSharedDecl, stripPrefixChars]
+    | none =>
+      cases ins <;> simp [ppPTXStmt, ppPTXInstr, toString, String.toList_append,
+        parsePTXRegDecl, parsePTXSharedDecl, stripPrefixChars]
+
+theorem parsePTXDeclsAndBody_body_roundtrip (ss : List PTXStmt)
+    (hs : ∀ s ∈ ss, CanonicalPTXStmt s) (fuel : Nat)
+    (hf : ∀ s ∈ ss, (ppPTXStmt s).toList.length < fuel)
+    (k : PTXKernel) (inBody : Bool) :
+    parsePTXDeclsAndBody (fuel + 1) (ss.map ppPTXStmt) k inBody =
+      some { k with body := k.body ++ ss } := by
+  induction ss generalizing k inBody with
+  | nil => simp [parsePTXDeclsAndBody]
+  | cons s ss ih =>
+    have hp := parsePTXStmt_roundtrip s (hs s (by simp)) [] fuel (hf s (by simp))
+    simp only [List.append_nil] at hp
+    have hn := ppPTXStmt_not_decl s (hs s (by simp)) (fuel + 1)
+    simp only [List.map_cons, parsePTXDeclsAndBody, hn.1, hn.2.1, hn.2.2, hp,
+      bind, Option.bind]
+    rw [ih (by intro s h; exact hs s (by simp [h]))
+      (by intro s h; exact hf s (by simp [h]))]
+    simp [List.append_assoc]
+
+/-- The structural budget bounds every separately parsed kernel field. -/
+theorem ptxKernelFuel_bounds (k : PTXKernel) (fuel : Nat)
+    (hf : ptxKernelFuel k ≤ fuel + 1) :
+    k.name.toList.length < fuel + 1 ∧
+    (∀ p ∈ k.params, p.name.toList.length < fuel + 1) ∧
+    (∀ r ∈ k.regDecls, r.prefixName.toList.length < fuel + 1 ∧
+      r.count.repr.toList.length < fuel + 1) ∧
+    (∀ s ∈ k.sharedDecls, s.name.toList.length < fuel + 1 ∧
+      s.align.repr.toList.length < fuel + 1 ∧ s.count.repr.toList.length < fuel + 1) ∧
+    k.localBytes.repr.toList.length < fuel + 1 ∧
+    (∀ s ∈ k.body, (ppPTXStmt s).toList.length < fuel) := by
+  have bound {α : Type} (xs : List α) (f : α → Nat) (x : α) (hx : x ∈ xs) :
+      f x ≤ (xs.map f).sum := by
+    induction xs with
+    | nil => simp at hx
+    | cons a xs ih =>
+      simp only [List.mem_cons] at hx
+      simp only [List.map_cons, List.sum_cons]
+      rcases hx with rfl | hx
+      · omega
+      · have := ih hx; omega
+  unfold ptxKernelFuel at hf
+  refine ⟨by omega, ?_, ?_, ?_, by omega, ?_⟩
+  · intro p hp
+    have := bound k.params (fun p => p.name.toList.length) p hp
+    omega
+  · intro r hr
+    have := bound k.regDecls
+      (fun r => r.prefixName.toList.length + r.count.repr.toList.length) r hr
+    constructor <;> omega
+  · intro s hs
+    have := bound k.sharedDecls (fun s => s.name.toList.length +
+      s.align.repr.toList.length + s.count.repr.toList.length) s hs
+    exact ⟨by omega, by omega, by omega⟩
+  · intro s hs
+    have := bound k.body (fun s => (ppPTXStmt s).toList.length) s hs
+    omega
+
+/-- Compose the declaration sections and body, retaining every kernel field. -/
+theorem parsePTXDeclsAndBody_kernel_roundtrip (k : PTXKernel)
+    (hk : CanonicalPTXKernel k) (fuel : Nat)
+    (hr : ∀ r ∈ k.regDecls, r.prefixName.toList.length < fuel + 1 ∧
+      r.count.repr.toList.length < fuel + 1)
+    (hs : ∀ s ∈ k.sharedDecls, s.name.toList.length < fuel + 1 ∧
+      s.align.repr.toList.length < fuel + 1 ∧ s.count.repr.toList.length < fuel + 1)
+    (hl : k.localBytes.repr.toList.length < fuel + 1)
+    (hb : ∀ s ∈ k.body, (ppPTXStmt s).toList.length < fuel) :
+    parsePTXDeclsAndBody (fuel + 1)
+      (k.sharedDecls.map (fun s =>
+        s!"    .shared .align {s.align} {ppPTXType s.elemTy} {s.name}[{s.count}];") ++
+       (if k.localBytes == 0 then [] else
+         [s!"    .local .align 8 .b8 __local_mem[{k.localBytes}];"]) ++
+       k.regDecls.map (fun r => s!"    .reg {ppPTXType r.ty} {r.prefixName}<{r.count}>;") ++
+       k.body.map ppPTXStmt)
+      { name := k.name, params := k.params, regDecls := [], sharedDecls := [], body := [] }
+      false = some k := by
+  simp only [List.append_assoc]
+  rw [parsePTXDeclsAndBody_shared_roundtrip _ hk.2.2.2.1 _ hs]
+  split
+  next hz =>
+    have hz' : k.localBytes = 0 := by simpa using hz
+    simp only [List.nil_append]
+    rw [parsePTXDeclsAndBody_regs_roundtrip _ hk.2.2.1 _ hr,
+      parsePTXDeclsAndBody_body_roundtrip _ hk.2.2.2.2 _ hb]
+    cases k <;> simp_all
+  next hz =>
+    simp only [List.singleton_append]
+    rw [parsePTXDeclsAndBody_local_roundtrip _ _ hl _ _ rfl,
+      parsePTXDeclsAndBody_regs_roundtrip _ hk.2.2.1 _ hr,
+      parsePTXDeclsAndBody_body_roundtrip _ hk.2.2.2.2 _ hb]
+    cases k <;> simp
+
+/-- One structural budget suffices for all declaration and statement sections. -/
+theorem parsePTXDeclsAndBody_kernel_fuel_roundtrip (k : PTXKernel)
+    (hk : CanonicalPTXKernel k) (fuel : Nat) (hf : ptxKernelFuel k ≤ fuel + 1) :
+    parsePTXDeclsAndBody (fuel + 1)
+      (k.sharedDecls.map (fun s =>
+        s!"    .shared .align {s.align} {ppPTXType s.elemTy} {s.name}[{s.count}];") ++
+       (if k.localBytes == 0 then [] else
+         [s!"    .local .align 8 .b8 __local_mem[{k.localBytes}];"]) ++
+       k.regDecls.map (fun r => s!"    .reg {ppPTXType r.ty} {r.prefixName}<{r.count}>;") ++
+       k.body.map ppPTXStmt)
+      { name := k.name, params := k.params, regDecls := [], sharedDecls := [], body := [] }
+      false = some k := by
+  have h := ptxKernelFuel_bounds k fuel hf
+  exact parsePTXDeclsAndBody_kernel_roundtrip k hk fuel h.2.2.1 h.2.2.2.1
+    h.2.2.2.2.1 h.2.2.2.2.2
+
+/-- Newline-separated nonempty lists of newline-free strings split losslessly. -/
+theorem scanPTXLines_string_intercalate (lines : List String) (hne : lines ≠ [])
+    (hn : ∀ line ∈ lines, '\n' ∉ line.toList) :
+    scanPTXLines ((String.intercalate "\n" lines).toList.length + 1)
+      (String.intercalate "\n" lines).toList = some (lines.map String.toList) := by
+  simpa only [String.toList_intercalate, String.reduceToList] using
+    scanPTXLines_intercalate (lines.map String.toList) (by simpa using hne)
+      (by simpa using hn) _ (Nat.lt_succ_self _)
+
+private theorem canonical_name_no_newline (s : String) (h : CanonicalPTXName s) :
+    '\n' ∉ s.toList := by
+  intro hn
+  have := h.2 '\n' hn
+  contradiction
+
+private theorem nat_no_newline (n : Nat) : '\n' ∉ n.repr.toList := by
+  intro h
+  have := Nat.isDigit_of_mem_toDigits (b := 10) (n := n) (by omega) (by omega)
+    (by simpa only [Nat.toList_repr] using h)
+  contradiction
+
+private theorem digits_no_newline (n : Nat) : '\n' ∉ Nat.toDigits 10 n := by
+  simpa only [Nat.toList_repr] using nat_no_newline n
+
+private theorem int_no_newline (n : Int) : '\n' ∉ n.repr.toList := by
+  cases n <;> simp [Int.repr, String.toList_append, digits_no_newline]
+
+private theorem operand_no_newline (a : PTXOperand) (h : CanonicalPTXOperand a) :
+    '\n' ∉ (ppPTXOperand a).toList := by
+  cases a with
+  | reg r => exact canonical_name_no_newline r h.1
+  | sym s => exact canonical_name_no_newline s h.1
+  | sreg s => cases s <;> decide
+  | immU64 n => exact nat_no_newline n.toNat
+  | immS64 n => exact int_no_newline n
+  | immF32 n =>
+    have hn : '\n' ∉ toHexFixedGo n.toNat [] 8 := by
+      intro hn
+      have := (toHexFixedGo_chars n.toNat 8).2 '\n' hn
+      contradiction
+    simpa [ppPTXOperand, toHexFixed, toString, String.toList_append] using hn
+  | immF64 n =>
+    have hn : '\n' ∉ toHexFixedGo n.toNat [] 16 := by
+      intro hn
+      have := (toHexFixedGo_chars n.toNat 16).2 '\n' hn
+      contradiction
+    simpa [ppPTXOperand, toHexFixed, toString, String.toList_append] using hn
+
+private theorem addr_no_newline (a : PTXAddr) (h : CanonicalPTXAddr a) :
+    '\n' ∉ (ppPTXAddr a).toList := by
+  cases a with
+  | paramSym s => simp [ppPTXAddr, toString, String.toList_append, canonical_name_no_newline s h.1]
+  | regOffset s n =>
+    simp only [ppPTXAddr]
+    (split <;> try split) <;>
+      simp [toString, String.toList_append, canonical_name_no_newline s h.1, int_no_newline]
+  | symOffset s n =>
+    simp only [ppPTXAddr]
+    (split <;> try split) <;>
+      simp [toString, String.toList_append, canonical_name_no_newline s h.1.1, int_no_newline]
+
+private theorem type_no_newline (t : PTXType) : '\n' ∉ (ppPTXType t).toList := by
+  cases t <;> decide
+
+private theorem instr_no_newline (i : PTXInstr) (h : CanonicalPTXInstr i) :
+    '\n' ∉ (ppPTXInstr i).toList := by
+  have rm (r : PTXRoundMode) : '\n' ∉ (ppRoundMode r).toList := by cases r <;> decide
+  have mm (m : PTXMulMode) : '\n' ∉ (ppMulMode m).toList := by cases m <;> decide
+  have cm (c : PTXCmpOp) : '\n' ∉ (ppCmpOp c).toList := by cases c <;> decide
+  cases i <;> simp only [CanonicalPTXInstr] at h <;>
+    simp_all [ppPTXInstr, toString, String.toList_append, type_no_newline,
+      canonical_name_no_newline, operand_no_newline, addr_no_newline, digits_no_newline]
+  exact canonical_name_no_newline _ h.2.1
+
+private theorem stmt_no_newline (s : PTXStmt) (h : CanonicalPTXStmt s) :
+    '\n' ∉ (ppPTXStmt s).toList := by
+  cases s with
+  | label n => simp [ppPTXStmt, toString, String.toList_append, canonical_name_no_newline n h]
+  | instr g i =>
+    have hi := instr_no_newline i h.2
+    cases g with
+    | none => simpa [ppPTXStmt, toString, String.toList_append] using hi
+    | some g =>
+      have hg := h.1 g (by simp)
+      have hn : '\n' ∉ g.predReg.toList := by
+        intro hn
+        have := hg.2 '\n' hn
+        contradiction
+      cases he : g.negated <;> simp [ppPTXStmt, ppPredGuard, he, toString,
+        String.toList_append, hn, hi]
+
+private theorem body_lines_no_newline (k : PTXKernel) (h : CanonicalPTXKernel k) :
+    ∀ line ∈ ppPTXKernelBodyLines k, '\n' ∉ line.toList := by
+  intro line hl
+  simp only [ppPTXKernelBodyLines, List.mem_append, List.mem_map] at hl
+  rcases hl with ((⟨s, hs, rfl⟩ | hl) | ⟨r, hr, rfl⟩) | ⟨s, hs, rfl⟩
+  · simp [toString, String.toList_append, digits_no_newline, type_no_newline,
+      canonical_name_no_newline s.name (h.2.2.2.1 s hs).1]
+  · split at hl
+    · simp at hl
+    · have he : line = s!"    .local .align 8 .b8 __local_mem[{k.localBytes}];" := by simpa using hl
+      subst line
+      simp [toString, String.toList_append, digits_no_newline]
+  · simp [toString, String.toList_append, digits_no_newline, type_no_newline,
+      canonical_name_no_newline r.prefixName (h.2.2.1 r hr).1]
+  · exact stmt_no_newline s (h.2.2.2.2 s hs)
+
+private theorem param_lines_no_newline (ps : List PTXParamDecl)
+    (h : ∀ p ∈ ps, CanonicalPTXParamDecl p) :
+    ∀ line ∈ ppPTXParamLines ps, '\n' ∉ line.toList := by
+  induction ps with
+  | nil => simp [ppPTXParamLines]
+  | cons p ps ih =>
+    intro line hl
+    simp only [ppPTXParamLines, List.mem_cons] at hl
+    rcases hl with rfl | hl
+    · have hn := canonical_name_no_newline p.name (h p (by simp)).1
+      split <;> simp [toString, String.toList_append, type_no_newline, hn]
+    · exact ih (by intro p hp; exact h p (by simp [hp])) line hl
+
+private theorem param_lines_parse (ps : List PTXParamDecl)
+    (h : ∀ p ∈ ps, CanonicalPTXParamDecl p) (fuel : Nat)
+    (hf : ∀ p ∈ ps, p.name.toList.length < fuel + 1) :
+    (ppPTXParamLines ps).mapM (fun line => do
+      let (param, rest) ← parsePTXParamDecl (fuel + 1) line.toList
+      if rest == [] || rest == [','] then pure param else none) = some ps := by
+  induction ps with
+  | nil => rfl
+  | cons p ps ih =>
+    have ht := ih (by intro p hp; exact h p (by simp [hp]))
+      (by intro p hp; exact hf p (by simp [hp]))
+    simp only [bind, Option.bind, pure] at ht
+    have hp := parsePTXParamDecl_roundtrip p (h p (by simp)).1
+    have hp0 := hp [] (Or.inl rfl) fuel (hf p (by simp))
+    have hp1 := hp [','] (Or.inr ⟨',', [], rfl, rfl⟩) fuel (hf p (by simp))
+    simp only [List.append_nil] at hp0
+    simp only [ppPTXParamLines, List.mapM_cons]
+    split
+    · simp only [String.append_empty, hp0, bind, Option.bind, beq_self_eq_true,
+        Bool.true_or, ↓reduceIte, pure, ht]
+    · rw [String.toList_append]
+      simp only [String.reduceToList, hp1, bind, Option.bind, beq_self_eq_true,
+        Bool.or_true, ↓reduceIte, pure, ht]
+
+private theorem param_lines_not_close (ps : List PTXParamDecl) :
+    ∀ line ∈ ppPTXParamLines ps, line ≠ ")" := by
+  induction ps with
+  | nil => simp [ppPTXParamLines]
+  | cons p ps ih =>
+    intro line hl
+    simp only [ppPTXParamLines, List.mem_cons] at hl
+    rcases hl with rfl | hl
+    · intro he
+      have := congrArg String.toList he
+      simp [toString, String.toList_append] at this
+    · exact ih line hl
+
+private theorem takeWhile_params (ps : List PTXParamDecl) (rest : List String) :
+    (ppPTXParamLines ps ++ ")" :: "{" :: rest).takeWhile (· != ")") =
+      ppPTXParamLines ps := by
+  have aux (ls : List String) (hn : ∀ l ∈ ls, l ≠ ")") :
+      (ls ++ ")" :: "{" :: rest).takeWhile (· != ")") = ls := by
+    induction ls with
+    | nil => rfl
+    | cons l ls ih =>
+      simp [hn l (by simp), ih (by intro l hl; exact hn l (by simp [hl]))]
+  simpa [List.append_assoc] using aux _ (param_lines_not_close ps)
+
+theorem parsePTXKernel_roundtrip (k : PTXKernel) (hk : CanonicalPTXKernel k)
+    (fuel : Nat) (hf : ptxKernelFuel k ≤ fuel + 1) :
+    parsePTXKernel (fuel + 1) (ppPTXKernel k) = some k := by
+  have hb := parsePTXDeclsAndBody_kernel_fuel_roundtrip k hk fuel hf
+  change parsePTXDeclsAndBody (fuel + 1) (ppPTXKernelBodyLines k) _ false = some k at hb
+  have bounds := ptxKernelFuel_bounds k fuel hf
+  have hn := canonical_name_no_newline k.name hk.1.1
+  have hbody := body_lines_no_newline k hk
+  have hparams := param_lines_no_newline k.params hk.2.1
+  unfold ppPTXKernel
+  split
+  next he =>
+    have hz : k.params = [] := by simpa using he
+    have hs := scanPTXLines_string_intercalate
+      ([s!".visible .entry {k.name}()", "{"] ++ ppPTXKernelBodyLines k ++ ["}"])
+      (by simp) (by
+        intro l hl
+        simp only [List.mem_append, List.mem_cons, List.not_mem_nil,
+          or_false] at hl
+        rcases hl with ((rfl | rfl) | hl) | rfl
+        · simp [toString, String.toList_append, hn]
+        · decide
+        · exact hbody l hl
+        · decide)
+    have hp := parsePTXName_roundtrip k.name hk.1.1 ['(', ')']
+      (Or.inr ⟨'(', [')'], rfl, rfl⟩) (fuel + 1) bounds.1
+    unfold parsePTXKernel
+    rw [hs]
+    simp only [List.map_append, List.map_cons, List.map_nil,
+      List.cons_append, List.nil_append]
+    simpa [toString, String.toList_append, stripPrefixChars, hp, hz,
+      List.reverse_append, hb] using hb
+  next he =>
+    have hs := scanPTXLines_string_intercalate
+      (([s!".visible .entry {k.name}("] ++ ppPTXParamLines k.params ++ [")", "{"]) ++
+        ppPTXKernelBodyLines k ++ ["}"])
+      (by simp) (by
+        intro l hl
+        simp only [List.mem_append, List.mem_cons, List.not_mem_nil,
+          or_false] at hl
+        rcases hl with (((rfl | hl) | (rfl | rfl)) | hl) | rfl
+        · simp [toString, String.toList_append, hn]
+        · exact hparams l hl
+        · decide
+        · decide
+        · exact hbody l hl
+        · decide)
+    have hp := parsePTXName_roundtrip k.name hk.1.1 ['(']
+      (Or.inr ⟨'(', [], rfl, rfl⟩) (fuel + 1) bounds.1
+    have hparse := param_lines_parse k.params hk.2.1 fuel bounds.2.1
+    simp only [bind, pure, Bool.or_eq_true, beq_iff_eq] at hparse
+    unfold parsePTXKernel
+    rw [hs]
+    simp only [List.map_append, List.map_cons, List.map_nil,
+      List.cons_append, List.nil_append]
+    simp [toString, String.toList_append, stripPrefixChars, hp, List.append_assoc,
+      takeWhile_params, List.reverse_append]
+    rw [hparse]
+    exact hb
+
+theorem ppPTXKernel_injective_on_canonical (a b : PTXKernel)
+    (ha : CanonicalPTXKernel a) (hb : CanonicalPTXKernel b)
+    (h : ppPTXKernel a = ppPTXKernel b) : a = b := by
+  have hp := congrArg (parsePTXKernel (max (ptxKernelFuel a) (ptxKernelFuel b) + 1)) h
+  rw [parsePTXKernel_roundtrip a ha _ (by omega),
+    parsePTXKernel_roundtrip b hb _ (by omega)] at hp
+  exact Option.some.inj hp
+
+theorem ppPTXType_injective_via_parser : Function.Injective ppPTXType := by
+  intro a b h
+  have hp := congrArg (fun s : String => parsePTXType 1 (s.toList ++ [])) h
+  simpa only [parsePTXType_roundtrip, Option.some.injEq, Prod.mk.injEq, and_true] using hp
+
 theorem ppPTXType_injective (t1 t2 : PTXType) (h : ppPTXType t1 = ppPTXType t2) :
-    t1 = t2 := by
-  cases t1 <;> cases t2 <;> first | rfl | exact absurd h (by decide)
+     t1 = t2 := by
+  exact ppPTXType_injective_via_parser h
 
 /-- 1:1 injectivity of `ppStateSpace`: distinct PTX state spaces pretty-print to distinct tokens. -/
 theorem ppStateSpace_injective (s1 s2 : StateSpace) (h : ppStateSpace s1 = ppStateSpace s2) :

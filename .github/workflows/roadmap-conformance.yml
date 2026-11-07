@@ -17,7 +17,34 @@ env:
   TURBO_LEAN_HOME: ${{ github.workspace }}/.turbo-cache
 
 jobs:
+  impact:
+    name: Fast inventory and impact gates
+    runs-on: ubuntu-latest
+    outputs:
+      run_lean_build: ${{ steps.plan.outputs.run_lean_build }}
+      conformance_seeds: ${{ steps.plan.outputs.conformance_seeds }}
+      run_conformance_full: ${{ steps.plan.outputs.run_conformance_full }}
+      impact_digest: ${{ steps.plan.outputs.impact_digest }}
+      inputs_unchanged: ${{ steps.plan.outputs.inputs_unchanged }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: |
+          python3 scripts/ci_impact_plan.py --self-test
+          python3 scripts/sync_docs_inventory.py --check
+          python3 scripts/emitter_mutants.py --unit-tests
+      - id: plan
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
+        run: |
+          if [ "$BASE" = "0000000000000000000000000000000000000000" ]; then BASE=HEAD; fi
+          python3 scripts/ci_impact_plan.py --base "$BASE"
+
   roadmap-conformance:
+    needs: impact
+    if: needs.impact.outputs.run_lean_build == 'true'
     name: Verify Roadmap Contract & 3-Way Differential Conformance (ASan/UBSan)
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -45,10 +72,9 @@ jobs:
             ~/.cargo/git
             target
             lean/.lake/build
-          key: ${{ runner.os }}-cargo-lean-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'lean/lean-toolchain', 'lean/**/*.lean') }}
+          key: ${{ runner.os }}-roadmap-cargo-lean-${{ needs.impact.outputs.impact_digest }}
           restore-keys: |
-            ${{ runner.os }}-cargo-lean-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'lean/lean-toolchain') }}-
-            ${{ runner.os }}-cargo-lean-
+            ${{ runner.os }}-roadmap-cargo-lean-
 
       - name: Setup Lean 4 toolchain
         run: |
@@ -68,6 +94,8 @@ jobs:
           cargo build --release -p turbo-lean
 
       - name: Run Contract V5 checklist & 3-way ASan/UBSan conformance gate
+        env:
+          CONFORMANCE_SEEDS: ${{ needs.impact.outputs.conformance_seeds }}
         run: ./scripts/verify_roadmap_contract.sh
 
       - name: Run full scalar/tuple/Stage-1D frontend & SymbolicTV conformance suite

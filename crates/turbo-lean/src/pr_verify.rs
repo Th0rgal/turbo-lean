@@ -5879,8 +5879,37 @@ fn seed_trusted_statement_dependencies(
         let source = dep.pkg_root.canonicalize()?;
         if source.is_absolute() && source.is_dir() {
             if dep_package_has_disallowed_elab_host_effects(cfg, dep) {
-                let build_abs = source.join(&dep.build_dir);
-                copy_dep_sources_without_build_products(&source, &target, &build_abs)?;
+                if is_pinned_git_manifest_dep(cfg, dep) && source.join(".git").exists() {
+                    let out = crate::trusted_tools::git(project)?
+                        .env("GIT_ALLOW_PROTOCOL", "file")
+                        .args(["clone", "--local"])
+                        .args(["--quiet", "--no-hardlinks", "--no-checkout", "--template="])
+                        .arg("--")
+                        .arg(&source)
+                        .arg(&target)
+                        .current_dir("/")
+                        .output()?;
+                    anyhow::ensure!(
+                        out.status.success(),
+                        "Cannot seed offline trusted statement dependency {}: {}",
+                        dep.name,
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    materialize_statement_tree(
+                        &target,
+                        "HEAD",
+                        &target,
+                        Some(StatementDependencySpec {
+                            dep: Some(dep),
+                            config_file: None,
+                        }),
+                        Path::new(""),
+                        None,
+                    )?;
+                } else {
+                    let build_abs = source.join(&dep.build_dir);
+                    copy_dep_sources_without_build_products(&source, &target, &build_abs)?;
+                }
             } else {
                 #[cfg(unix)]
                 {
@@ -17740,10 +17769,15 @@ end ParityNs
                 anyhow::ensure!(clone_st.success(), "git clone dep_pkg_src failed");
 
                 fs::write(app_proj.join("lean-toolchain"), tc)?;
-                fs::write(
-                    app_proj.join("lakefile.toml"),
-                    "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep\"\npath = \".lake/packages/dep\"\n[[lean_lib]]\nname = \"App\"\nroots = [\"App\"]\n",
-                )?;
+                let app_lakefile = if use_git_pin {
+                    let escaped_dep_url = dep_pkg_src.to_string_lossy().replace('\\', "\\\\");
+                    format!(
+                        "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep\"\ngit = \"{escaped_dep_url}\"\nrev = \"{dep_rev}\"\n[[lean_lib]]\nname = \"App\"\nroots = [\"App\"]\n"
+                    )
+                } else {
+                    "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep\"\npath = \".lake/packages/dep\"\n[[lean_lib]]\nname = \"App\"\nroots = [\"App\"]\n".to_string()
+                };
+                fs::write(app_proj.join("lakefile.toml"), app_lakefile)?;
                 let manifest_json = if use_git_pin {
                     serde_json::json!({
                         "version": "1.1.0",
