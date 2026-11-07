@@ -5083,6 +5083,241 @@ pub fn reconstruct_single_shard_source(
     )))
 }
 
+#[derive(Debug, Clone)]
+pub struct PrefixOutlinePlan {
+    pub outline_source: String,
+    pub outline_stubs: Vec<String>,
+    delta_imports: Vec<String>,
+    delta_body: String,
+}
+
+impl PrefixOutlinePlan {
+    pub fn render_delta_shard_source(&self, outline_module: &str) -> String {
+        let mut lines = Vec::with_capacity(self.delta_imports.len() + 2);
+        lines.extend(self.delta_imports.iter().cloned());
+        lines.push(format!("import {}", outline_module.trim()));
+        lines.push(self.delta_body.clone());
+        lines.join("\n")
+    }
+}
+
+pub const PREFIX_OUTLINE_MIN_PRIOR_SHARDS: usize = 8;
+const PREFIX_OUTLINE_BUCKET_SPANS: usize = 16;
+
+/// Construct a two-stage `(outline_source, delta_shard)` split for deep `--decl` verification when no
+/// pre-built `<Module>.olean` exists yet:
+/// 1. `outline_source` contains the stubbed prefix up to a quantized checkpoint before `target_decl`
+///    (closed cleanly with matching `end` commands), ready for `ZygoteWorker` `emit_outline_olean:`.
+/// 2. `render_delta_shard_source("_TurboOutline_<hash>")` imports the cached outline `.olean`, replays
+///    active scope/context directives (`namespace`, `section`, `open`, `variable`, `universe`, `set_option`,
+///    `local ...`, `scoped ...`), stubs the `< 16` trailing commands between the checkpoint and `target_decl`,
+///    and checks `target_decl` with its original name and statement (`0` renaming needed).
+pub fn build_prefix_outline_plan_with_split(
+    src: &str,
+    split: &SplitResult,
+    target_decl: &str,
+) -> Option<PrefixOutlinePlan> {
+    let min_prior = std::env::var("TURBO_LEAN_PREFIX_OUTLINE_MIN_SHARDS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(PREFIX_OUTLINE_MIN_PRIOR_SHARDS);
+    if min_prior == usize::MAX || split.shards.len() <= min_prior {
+        return None;
+    }
+    let target_canon = canonicalize_lean_name(target_decl);
+    let target_shard_pos = split.shards.iter().position(|sh| {
+        canonicalize_lean_name(&sh.qualified_name) == target_canon
+            || canonicalize_lean_name(&sh.name) == target_canon
+    })?;
+    if target_shard_pos < min_prior {
+        return None;
+    }
+    let hdr_info = crate::module_builder::parse_header_info(&split.imports_header);
+    if hdr_info.header_error.is_some() || hdr_info.is_module || hdr_info.has_prelude {
+        return None;
+    }
+
+    let max_end_line = split.shards[target_shard_pos].end_line;
+    let src_prefix = slice_up_to_line(src, max_end_line);
+    let clean = strip_lean_comments(src_prefix);
+    let spans = parse_command_spans(src_prefix, &clean);
+    let declarations = qualified_span_declarations(&spans);
+    let decl_idx = resolve_decl_index(
+        declarations.iter().map(|(_, name)| name.as_str()),
+        target_decl,
+    )
+    .ok()??;
+    let t_idx = declarations[decl_idx].0;
+    if split_mutual_block_subspans(&spans[t_idx]).is_some() {
+        return None;
+    }
+
+    let first_body_idx = spans
+        .iter()
+        .position(|sp| {
+            let t = sp.clean_text.trim();
+            !(t == "module"
+                || t.starts_with("module ")
+                || t == "prelude"
+                || t.starts_with("prelude ")
+                || t.starts_with("import ")
+                || t.starts_with("public import ")
+                || t.starts_with("meta import ")
+                || t.starts_with("public meta import "))
+        })
+        .unwrap_or(0);
+    if t_idx <= first_body_idx + 2 {
+        return None;
+    }
+    let body_prefix_spans = t_idx - first_body_idx;
+    let checkpoint_idx = if body_prefix_spans >= PREFIX_OUTLINE_BUCKET_SPANS {
+        first_body_idx
+            + (body_prefix_spans / PREFIX_OUTLINE_BUCKET_SPANS) * PREFIX_OUTLINE_BUCKET_SPANS
+    } else {
+        t_idx
+    };
+    if checkpoint_idx <= first_body_idx {
+        return None;
+    }
+
+    let closed_sections = compute_closed_section_ranges(&spans);
+    let omit_at_target = compute_omitted_closed_section_spans(&spans, &closed_sections, t_idx);
+    let omit_at_ckpt =
+        compute_omitted_closed_section_spans(&spans, &closed_sections, checkpoint_idx);
+
+    let mut has_unextractable_scope_leak = false;
+    for (s_idx, span) in spans[..checkpoint_idx].iter().enumerate() {
+        if omit_at_target[s_idx] {
+            continue;
+        }
+        let tc = span.clean_text.trim();
+        if tc.starts_with("include ") || tc.starts_with("omit ") {
+            has_unextractable_scope_leak = true;
+            break;
+        }
+    }
+    let scope_isolated = unsafe {
+        turbo_spec_is_scope_isolated_for_fast_olean(u8::from(has_unextractable_scope_leak), 0) != 0
+    };
+    if !scope_isolated {
+        return None;
+    }
+
+    // 1. Build `outline_source` for `spans[..checkpoint_idx]` + closing scopes at `checkpoint_idx`.
+    let mut outline_accum = String::with_capacity(src_prefix.len());
+    let mut ckpt_scope_stack: Vec<ScopeFrame> = Vec::new();
+    for (idx, span) in spans[..checkpoint_idx].iter().enumerate() {
+        update_scope_stack_with_idx(&mut ckpt_scope_stack, span.orig_text, idx);
+        let prev_end = idx.checked_sub(1).map(|p| spans[p].end_line);
+        if omit_at_ckpt[idx] {
+            let next_start = spans.get(idx + 1).map(|n| n.start_line);
+            push_omitted_span_newlines(&mut outline_accum, prev_end, span, next_start);
+        } else {
+            push_joined_span(&mut outline_accum, prev_end, span, &stub_command_span(span));
+        }
+    }
+    let ckpt_closing = format_closing_scopes(&ckpt_scope_stack);
+    if !ckpt_closing.is_empty() {
+        outline_accum.push('\n');
+        outline_accum.push_str(&ckpt_closing);
+    }
+    let outline_stubs: Vec<String> = split_lean_source(&outline_accum, &[])
+        .shards
+        .into_iter()
+        .filter(|sh| {
+            strip_lean_comments(&sh.proof_text).trim() == "sorry"
+                && canonicalize_lean_name(&sh.qualified_name) != target_canon
+        })
+        .map(|sh| sh.rooted_name())
+        .collect();
+
+    // 2. Build `delta_imports` and `delta_body` replaying active scopes up to `checkpoint_idx`,
+    //    then stubbing `spans[checkpoint_idx..t_idx]`, then `spans[t_idx]` + closing scopes.
+    let mut delta_imports = Vec::new();
+    let mut seen_imports = std::collections::HashSet::new();
+    let has_explicit_init = split.imports_header.lines().any(|l| {
+        let t = l
+            .trim()
+            .strip_prefix("public ")
+            .map(str::trim_start)
+            .unwrap_or(l.trim())
+            .strip_prefix("meta ")
+            .map(str::trim_start)
+            .unwrap_or(l.trim());
+        t == "import Init" || t == "import all Init"
+    });
+    for imp_mod in &hdr_info.imports {
+        if imp_mod != "Init" || has_explicit_init {
+            let stmt = format!("import {}", imp_mod);
+            if seen_imports.insert(stmt.clone()) {
+                delta_imports.push(stmt);
+            }
+        }
+    }
+
+    let mut delta_chunks = Vec::new();
+    let mut delta_scope_stack: Vec<ScopeFrame> = Vec::new();
+    for (s_idx, span) in spans[first_body_idx..checkpoint_idx].iter().enumerate() {
+        let abs_idx = first_body_idx + s_idx;
+        if omit_at_target[abs_idx] {
+            continue;
+        }
+        if let Some((_, name)) = classify_decl_header(span.clean_text) {
+            if split_at_top_level_assign(span.clean_text).is_some() {
+                for local_attr in extract_local_attributes(span.clean_text) {
+                    delta_chunks.push(format!("attribute [{}] {}", local_attr, name));
+                }
+                update_scope_stack_with_idx(&mut delta_scope_stack, span.orig_text, abs_idx);
+                continue;
+            }
+        }
+        if is_scope_or_context_command(span.clean_text) {
+            let trimmed_clean = span.clean_text.trim();
+            if trimmed_clean.starts_with("attribute ") && trimmed_clean.contains("to_additive") {
+                update_scope_stack_with_idx(&mut delta_scope_stack, span.orig_text, abs_idx);
+                continue;
+            }
+            if is_section_header_line(trimmed_clean) {
+                let mut after = span.clean_text.trim();
+                while let Some(next) = strip_leading_attr_block(after) {
+                    after = next.trim_start();
+                }
+                if let Some(after_pub) = after.strip_prefix("public ") {
+                    delta_chunks.push(after_pub.trim_start().to_string());
+                    update_scope_stack_with_idx(&mut delta_scope_stack, span.orig_text, abs_idx);
+                    continue;
+                }
+            }
+            delta_chunks.push(format_scoped_instance_for_fast_check(
+                span.orig_text,
+                span.clean_text,
+                abs_idx,
+            ));
+        }
+        update_scope_stack_with_idx(&mut delta_scope_stack, span.orig_text, abs_idx);
+    }
+
+    for (rel_idx, span) in spans[checkpoint_idx..t_idx].iter().enumerate() {
+        let abs_idx = checkpoint_idx + rel_idx;
+        update_scope_stack_with_idx(&mut delta_scope_stack, span.orig_text, abs_idx);
+        if !omit_at_target[abs_idx] {
+            delta_chunks.push(stub_command_span(span));
+        }
+    }
+    delta_chunks.push(spans[t_idx].orig_text.to_string());
+    let delta_closing = format_closing_scopes(&delta_scope_stack);
+    if !delta_closing.is_empty() {
+        delta_chunks.push(delta_closing);
+    }
+
+    Some(PrefixOutlinePlan {
+        outline_source: outline_accum,
+        outline_stubs,
+        delta_imports,
+        delta_body: delta_chunks.join("\n"),
+    })
+}
+
 fn normalize_whitespace(s: &str) -> String {
     let mut out = Vec::with_capacity(s.len());
     emit_normalized_lean(s, &mut |chunk| out.extend_from_slice(chunk));
