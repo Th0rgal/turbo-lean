@@ -91,8 +91,12 @@ private theorem canonicalMSLType_no_special_char (ty : MSLType) (h : CanonicalMS
   cases ty with
   | pointer sp isConst el =>
     have hel := canonicalMSLValueType_no_special_char el h.1 c hc
-    cases isConst <;>
-      simp [ppMSLType, String.toList_append, hsp sp, hel, hconst_str, hspace, hstar]
+    cases isConst
+    · simp [ppMSLType, String.toList_append, hsp sp, hel, hspace, hstar]
+    · by_cases hsp_eq : (sp != .constant) = true
+      · simp [ppMSLType, hsp_eq, String.toList_append, hsp sp, hel, hconst_str, hspace, hstar]
+      · simp only [Bool.not_eq_true] at hsp_eq
+        simp [ppMSLType, hsp_eq, String.toList_append, hsp sp, hel, hspace, hstar]
   | ref sp el =>
     have hel := canonicalMSLValueType_no_special_char el h c hc
     simp [ppMSLType, String.toList_append, hsp sp, hel, hspace, hamp]
