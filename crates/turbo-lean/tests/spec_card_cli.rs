@@ -1368,3 +1368,476 @@ theorem exploit_seq_subst_poly {α : Type} [BEq α] [LawfulBEq α] (_y : α) (b 
 
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn spec_card_let_capture_and_shadow_chains_fail_closed_while_clean_lets_stay_tight() {
+    let dir = fixture("let_capture");
+    for (name, src) in [
+        (
+            "LetCaptureVacuous.lean",
+            r#"theorem let_capture_vacuous (a b : Nat) (ha : a = 0) :
+    let x : Nat := a; let a : Nat := 1; x = a → b = 999 := by
+  intro h
+  omega
+"#,
+        ),
+        (
+            "LetCaptureTaut.lean",
+            r#"theorem let_capture_taut (a : Nat) (_ha : a < 2) :
+    let x : Nat := a; let a : Nat := a + 1; x + 1 = a := by
+  omega
+"#,
+        ),
+        (
+            "LetSelfRef.lean",
+            r#"theorem let_self_ref (a : Nat) (_ha : a < 2) :
+    let a : Nat := a + 1; a > 0 := by
+  omega
+"#,
+        ),
+    ] {
+        let path = write_spec(&dir, name, src);
+        let out = run(&["--json", "spec-card", path.to_str().unwrap()]);
+        let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        assert!(!out.status.success(), "{name}: {report}");
+        assert_eq!(report["ok"], false, "{name}: {report}");
+        let card = &report["cards"][0];
+        assert_eq!(card["verdict"], "UNCHECKED_ASSUMPTIONS", "{name}: {card}");
+        assert_eq!(
+            card["contract"]["extraction_complete"], false,
+            "{name}: {card}"
+        );
+    }
+
+    let single_vac = write_spec(
+        &dir,
+        "SingleLetVac.lean",
+        "theorem single_vac (b : Nat) : let a : Nat := 0; a = 5 → b = 999 := by\n  intro h\n  omega\n",
+    );
+    let vac_report: Value = serde_json::from_str(&String::from_utf8_lossy(
+        &run(&["--json", "spec-card", single_vac.to_str().unwrap()]).stdout,
+    ))
+    .unwrap();
+    assert_eq!(vac_report["ok"], false);
+    assert_eq!(vac_report["cards"][0]["verdict"], "VACUOUS");
+
+    let single_triv = write_spec(
+        &dir,
+        "SingleLetTriv.lean",
+        "theorem single_triv (b : Nat) : let a : Nat := b; a = b := rfl\n",
+    );
+    let triv_report: Value = serde_json::from_str(&String::from_utf8_lossy(
+        &run(&["--json", "spec-card", single_triv.to_str().unwrap()]).stdout,
+    ))
+    .unwrap();
+    assert_eq!(triv_report["ok"], false);
+    assert_eq!(triv_report["cards"][0]["verdict"], "TRIVIAL");
+
+    let clean_lets = write_spec(
+        &dir,
+        "CleanLets.lean",
+        r#"def P (x : Nat) : Prop := x < 2
+
+theorem let_param_clean (n : Nat) (hn : n < 2) : let y : Nat := n + 1; y = 1 ∨ y = 2 := by
+  omega
+
+theorem let_shadows_prop_name_with_nat (n : Nat) (_hn : P n) :
+    let P : Nat := 999; P = 999 → n = 0 ∨ n = 1 := by
+  intro _
+  unfold _root_.P at _hn
+  omega
+"#,
+    );
+    let clean_out = run(&["--json", "spec-card", clean_lets.to_str().unwrap()]);
+    let clean_report: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&clean_out.stdout)).unwrap();
+    assert!(clean_out.status.success(), "{clean_report}");
+    assert_eq!(clean_report["ok"], true, "{clean_report}");
+    for card in clean_report["cards"].as_array().unwrap() {
+        assert_eq!(card["verdict"], "TIGHT", "{card}");
+        assert_eq!(card["contract"]["extraction_complete"], true, "{card}");
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn spec_card_scoped_in_and_prelude_namespace_prop_shadows_fail_closed() {
+    let dir = fixture("scoped_prelude_shadows");
+    for (name, src) in [
+        (
+            "NsDefIn.lean",
+            r#"def P (x : Nat) : Prop := x < 2
+namespace N
+def P (x : Nat) : Prop := x = 1 ∧ x = 2 in
+theorem bad_def (n : Nat) (_hn : n < 2) (h : P n) : n = 999 := by
+  unfold P at h
+  omega
+end N
+"#,
+        ),
+        (
+            "NsPrivAbbrevModIn.lean",
+            r#"def P (x : Nat) : Prop := x < 2
+namespace N1
+private def P (x : Nat) : Prop := x = 1 ∧ x = 2 in
+theorem bad_priv (n : Nat) (_hn : n < 2) (h : P n) : n = 999 := by
+  unfold P at h
+  omega
+end N1
+namespace N2
+abbrev P (x : Nat) : Prop := x = 1 ∧ x = 2 in
+theorem bad_abbrev (n : Nat) (_hn : n < 2) (h : P n) : n = 999 := by
+  unfold P at h
+  omega
+end N2
+namespace N3
+noncomputable def P (x : Nat) : Prop := x = 1 ∧ x = 2 in
+theorem bad_noncomp (n : Nat) (_hn : n < 2) (h : P n) : n = 999 := by
+  unfold P at h
+  omega
+end N3
+namespace N4
+def
+  P (x : Nat) : Prop := x = 1 ∧ x = 2 in
+theorem bad_multiline (n : Nat) (_hn : n < 2) (h : P n) : n = 999 := by
+  unfold P at h
+  omega
+end N4
+"#,
+        ),
+        (
+            "NsAttrAndSetOptIn.lean",
+            r#"def P (x : Nat) : Prop := x < 2
+namespace M1
+@[simp] def P (x : Nat) : Prop := x = 1 ∧ x = 2 in
+theorem bad_simp (n : Nat) (_hn : n < 2) (h : P n) : n = 999 := by
+  simp at h
+  omega
+end M1
+namespace M2
+set_option linter.unusedVariables false in private def P (x : Nat) : Prop := x = 1 ∧ x = 2 in
+theorem bad_setopt_priv (n : Nat) (_hn : n < 2) (h : P n) : n = 999 := by
+  unfold P at h
+  omega
+end M2
+namespace M3
+set_option linter.unusedVariables false in @[simp] def P (x : Nat) : Prop := x = 1 ∧ x = 2 in
+theorem bad_setopt_simp (n : Nat) (_hn : n < 2) (h : P n) : n = 999 := by
+  simp at h
+  omega
+end M3
+"#,
+        ),
+        (
+            "PreludeNatVacuity.lean",
+            r#"def Coprime (a b : Nat) : Prop := a < 4 ∧ b < 4
+def isPowerOfTwo (a : Nat) : Prop := a < 4
+namespace Nat
+theorem bad_coprime (n : Nat) (_hn : n < 2) (h : Coprime 2 2) : n = 999 := by
+  exact False.elim ((by decide : ¬ Nat.Coprime 2 2) h)
+theorem bad_pow2 (n : Nat) (_hn : n < 2) (h : isPowerOfTwo 3) : n = 999 := by
+  exact False.elim ((by decide : ¬ Nat.isPowerOfTwo 3) h)
+end Nat
+"#,
+        ),
+        (
+            "PreludeNatDvdCharTaut.lean",
+            r#"def Coprime (a b : Nat) : Prop := a = 999 ∧ b = 999
+def isPowerOfTwo (a : Nat) : Prop := a = 999
+def dvd (a b : Nat) : Prop := a = 999 ∧ b = 999
+def isValidCharNat (a : Nat) : Prop := a = 999
+namespace Nat
+theorem bad_coprime_taut (n : Nat) (_hn : n < 2) : Coprime 2 3 := by
+  decide
+theorem bad_pow2_taut (n : Nat) (_hn : n < 2) : isPowerOfTwo 2 := by
+  decide
+end Nat
+namespace Dvd
+theorem bad_dvd_taut (n : Nat) (_hn : n < 2) : dvd 1 2 := by
+  decide
+end Dvd
+namespace Char
+theorem bad_char_taut (n : Nat) (_hn : n < 2) : isValidCharNat 65 := by
+  decide
+end Char
+"#,
+        ),
+        (
+            "PreludeDvdVacAndLeanGrind.lean",
+            r#"import Lean
+def dvd (a b : Nat) : Prop := a < 4 ∧ b < 4
+def eqBwdPattern (a b : Nat) : Prop := a = 999 ∧ b = 999
+namespace Dvd
+theorem bad_dvd_vac (n : Nat) (_hn : n < 2) (h : dvd 2 3) : n = 999 := by
+  exact False.elim ((by decide : ¬ (2 ∣ 3)) h)
+end Dvd
+namespace Lean.Grind
+theorem bad_grind (n : Nat) (_hn : n < 2) : eqBwdPattern 1 1 := by
+  exact rfl
+end Lean.Grind
+"#,
+        ),
+    ] {
+        let path = write_spec(&dir, name, src);
+        let out = run(&["--json", "spec-card", path.to_str().unwrap()]);
+        let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        assert!(!out.status.success(), "{name}: {report}");
+        assert_eq!(report["ok"], false, "{name}: {report}");
+        let cards = report["cards"].as_array().unwrap();
+        assert!(!cards.is_empty(), "{name}: {report}");
+        for card in cards {
+            assert_eq!(card["verdict"], "UNCHECKED_ASSUMPTIONS", "{name}: {card}");
+            assert_eq!(
+                card["contract"]["extraction_complete"], false,
+                "{name}: {card}"
+            );
+        }
+    }
+
+    let clean_ns = write_spec(
+        &dir,
+        "CleanPreludeAndUserNs.lean",
+        r#"import Std
+def bounded (n : Nat) : Prop := n < 2
+def eqBwdPattern (a b : Nat) : Prop := a < 2 ∧ b < 2
+
+namespace Std
+theorem good_std_omega (n : Nat) (h : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+end Std
+
+namespace Foo
+theorem bar (n : Nat) (h : bounded n) : n = 0 ∨ n = 1 := by
+  unfold bounded at h
+  omega
+end Foo
+
+open Nat
+theorem good_open_nat (n : Nat) (h : bounded n) : n = 0 ∨ n = 1 := by
+  unfold bounded at h
+  omega
+
+open Nat in
+theorem good_open_nat_in (n : Nat) (h : bounded n) : n = 0 ∨ n = 1 := by
+  unfold bounded at h
+  omega
+"#,
+    );
+    let clean_out = run(&["--json", "spec-card", clean_ns.to_str().unwrap()]);
+    let clean_report: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&clean_out.stdout)).unwrap();
+    assert!(clean_out.status.success(), "{clean_report}");
+    assert_eq!(clean_report["ok"], true, "{clean_report}");
+    assert_eq!(clean_report["cards"].as_array().unwrap().len(), 4);
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn spec_card_where_and_let_rec_aux_prop_shadows_fail_closed() {
+    let dir = fixture("where_let_rec_shadows");
+    for (name, src) in [
+        (
+            "WhereMultiAndEqn.lean",
+            r#"def P (x : Nat) : Prop := x < 2
+
+def helper1 : Nat := 0 where
+  A : Nat := 0
+  P (x : Nat) : Prop := x = 1 ∧ x = 2
+
+theorem helper1.bad (n : Nat) (_hn : n < 2) (h : P n) : n = 999 := by
+  unfold helper1.P at h
+  omega
+
+def helper2 : Nat → Nat
+  | 0 => 0
+  | n + 1 => helper2 n
+where
+  P (x : Nat) : Prop := x = 1 ∧ x = 2
+
+theorem helper2.bad (n : Nat) (_hn : n < 2) (h : P n) : n = 999 := by
+  unfold helper2.P at h
+  omega
+
+def helper3 (k : Nat) : Nat :=
+  match k with
+  | 0 => 0
+  | _ => 1
+where
+  «P» (x : Nat) : Prop := x = 1 ∧ x = 2
+
+theorem helper3.bad (n : Nat) (_hn : n < 2) (h : P n) : n = 999 := by
+  unfold helper3.P at h
+  omega
+"#,
+        ),
+        (
+            "LetRecCommaMutualNested.lean",
+            r#"def P (x : Nat) : Prop := x < 2
+
+def h1 : Nat :=
+  let rec
+    «P» (x : Nat) : Prop := x = 1 ∧ x = 2
+  0
+
+theorem h1.bad (n : Nat) (_hn : n < 2) (h : P n) : n = 999 := by
+  unfold h1.P at h
+  omega
+
+def h2 : Nat :=
+  let rec A : Nat := 0, P (x : Nat) : Prop := x = 1 ∧ x = 2
+  A
+
+theorem h2.bad (n : Nat) (_hn : n < 2) (h : P n) : n = 999 := by
+  unfold h2.P at h
+  omega
+
+mutual
+def h3 : Nat := 0 where
+  P (x : Nat) : Prop := x = 1 ∧ x = 2
+end
+
+theorem h3.bad (n : Nat) (_hn : n < 2) (h : P n) : n = 999 := by
+  unfold h3.P at h
+  omega
+
+def h4 : Nat := 0 where
+  sub : Nat :=
+    let rec P (x : Nat) : Prop := x = 1 ∧ x = 2
+    0
+
+theorem h4.sub.bad (n : Nat) (_hn : n < 2) (h : P n) : n = 999 := by
+  unfold h4.sub.P at h
+  omega
+"#,
+        ),
+    ] {
+        let path = write_spec(&dir, name, src);
+        let out = run(&["--json", "spec-card", path.to_str().unwrap()]);
+        let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        assert!(!out.status.success(), "{name}: {report}");
+        assert_eq!(report["ok"], false, "{name}: {report}");
+        for card in report["cards"].as_array().unwrap() {
+            assert_eq!(card["verdict"], "UNCHECKED_ASSUMPTIONS", "{name}: {card}");
+            assert_eq!(
+                card["contract"]["extraction_complete"], false,
+                "{name}: {card}"
+            );
+        }
+    }
+
+    let mixed = write_spec(
+        &dir,
+        "MixedWhereAndIn.lean",
+        r#"def P (x : Nat) : Prop := x < 2
+
+def helper_in : Nat :=
+  let rec P (x : Nat) : Prop := x = 1 ∧ x = 2; 0 in
+theorem dummy (n : Nat) (h : P n) : n = 0 ∨ n = 1 := by
+  unfold P at h
+  omega
+
+theorem helper_in.bad (n : Nat) (_hn : n < 2) (h : P n) : n = 999 := by
+  unfold helper_in.P at h
+  omega
+
+theorem helper_thm (n : Nat) (h : P n) : n = 0 ∨ n = 1 := by
+  unfold _root_.P at h
+  omega
+where
+  P (x : Nat) : Prop := x = 1 ∧ x = 2
+
+theorem helper_thm.bad (n : Nat) (_hn : n < 2) (h : P n) : n = 999 := by
+  unfold helper_thm.P at h
+  omega
+"#,
+    );
+    let mixed_out = run(&["--json", "spec-card", mixed.to_str().unwrap()]);
+    let mixed_report: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&mixed_out.stdout)).unwrap();
+    assert!(!mixed_out.status.success(), "{mixed_report}");
+    assert_eq!(mixed_report["ok"], false, "{mixed_report}");
+    let by_decl = mixed_report["cards"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["decl"].as_str().unwrap(), c["verdict"].as_str().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        by_decl,
+        vec![
+            ("dummy", "TIGHT"),
+            ("helper_in.bad", "UNCHECKED_ASSUMPTIONS"),
+            ("helper_thm", "TIGHT"),
+            ("helper_thm.bad", "UNCHECKED_ASSUMPTIONS"),
+        ]
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn spec_card_positional_audit_join_prevents_multiline_namespace_duplicate_steal() {
+    let dir = fixture("positional_join");
+    let dup = write_spec(
+        &dir,
+        "DupMultilineNs.lean",
+        r#"theorem foo (n : Nat) (h : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+
+namespace
+  A
+theorem foo (n : Nat) (_h : n < 2) : n = n := rfl
+end A
+"#,
+    );
+    let out = run(&["--json", "spec-card", dup.to_str().unwrap()]);
+    let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(!out.status.success(), "{report}");
+    assert_eq!(report["ok"], false, "{report}");
+    let cards = report["cards"].as_array().unwrap();
+    assert_eq!(cards[0]["decl"], "foo");
+    assert_eq!(cards[0]["verdict"], "TIGHT");
+    assert_eq!(cards[1]["decl"], "A.foo");
+    assert_eq!(cards[1]["verdict"], "TRIVIAL");
+
+    let filtered_out = run(&[
+        "--json",
+        "spec-card",
+        "--decl",
+        "A.foo",
+        dup.to_str().unwrap(),
+    ]);
+    let filtered_report: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&filtered_out.stdout)).unwrap();
+    assert!(!filtered_out.status.success(), "{filtered_report}");
+    assert_eq!(filtered_report["ok"], false, "{filtered_report}");
+    assert_eq!(filtered_report["cards"][0]["decl"], "A.foo");
+    assert_eq!(filtered_report["cards"][0]["verdict"], "TRIVIAL");
+
+    let clean_multiline = write_spec(
+        &dir,
+        "CleanMultilineNs.lean",
+        r#"namespace
+  Foo
+theorem bar (n : Nat) (h : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+end Foo
+
+theorem after_foo (n : Nat) (h : n < 2) : n = 0 ∨ n = 1 := by
+  omega
+"#,
+    );
+    let clean_out = run(&["--json", "spec-card", clean_multiline.to_str().unwrap()]);
+    let clean_report: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&clean_out.stdout)).unwrap();
+    assert!(clean_out.status.success(), "{clean_report}");
+    assert_eq!(clean_report["ok"], true, "{clean_report}");
+    assert_eq!(clean_report["cards"][0]["decl"], "Foo.bar");
+    assert_eq!(clean_report["cards"][0]["verdict"], "TIGHT");
+    assert_eq!(clean_report["cards"][1]["decl"], "after_foo");
+    assert_eq!(clean_report["cards"][1]["verdict"], "TIGHT");
+
+    let _ = fs::remove_dir_all(&dir);
+}

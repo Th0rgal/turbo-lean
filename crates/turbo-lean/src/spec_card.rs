@@ -97,6 +97,51 @@ const RESERVED_INSTANCE_AND_TYPE_NAMES: &[&str] = &[
     "ContractState",
 ];
 
+const PRELUDE_PROP_NAMESPACE_ROOTS: &[&str] = &[
+    "Array",
+    "BitVec",
+    "ByteArray",
+    "Char",
+    "Dvd",
+    "Float",
+    "Float32",
+    "FloatSpec",
+    "Function",
+    "GE",
+    "GT",
+    "HasSSubset",
+    "HasSubset",
+    "ISize",
+    "Int",
+    "Int16",
+    "Int32",
+    "Int64",
+    "Int8",
+    "LE",
+    "LT",
+    "Lean",
+    "List",
+    "Membership",
+    "MonadAttach",
+    "Nat",
+    "Option",
+    "PSigma",
+    "Prod",
+    "Relation",
+    "Setoid",
+    "Std",
+    "String",
+    "Sum",
+    "UInt16",
+    "UInt32",
+    "UInt64",
+    "UInt8",
+    "USize",
+    "Vector",
+    "WellFoundedRelation",
+    "hint",
+];
+
 pub fn run_spec_card_command(
     files: &[PathBuf],
     decl_filter: Option<&str>,
@@ -195,6 +240,25 @@ pub fn run_spec_card_command(
         if !aligned_extras {
             extraction_incomplete = true;
         }
+        let aligned_details = details.len() == all_decls.len();
+        if !aligned_details {
+            extraction_incomplete = true;
+        }
+        let mut effective_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for (decl_idx, decl) in all_decls.iter().enumerate() {
+            let eff = if aligned_extras {
+                scan.extras[decl_idx].name.as_str()
+            } else {
+                decl.name.as_str()
+            };
+            *effective_counts.entry(eff.to_string()).or_insert(0) += 1;
+        }
+        let mut audit_name_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for row in &details {
+            if let Some(name) = row.get("decl").and_then(Value::as_str) {
+                *audit_name_counts.entry(name.to_string()).or_insert(0) += 1;
+            }
+        }
         for (decl_idx, decl) in all_decls.into_iter().enumerate() {
             let extra = aligned_extras.then(|| &scan.extras[decl_idx]);
             let effective_name = extra.map_or(decl.name.as_str(), |row| row.name.as_str());
@@ -209,11 +273,30 @@ pub fn run_spec_card_command(
                 continue;
             }
             matched += 1;
-            let detail = details.iter().find(|row| {
+            let indexed_detail = aligned_details.then(|| &details[decl_idx]).filter(|row| {
                 row.get("decl")
                     .and_then(Value::as_str)
                     .is_some_and(|name| name == effective_name || name == decl.name)
             });
+            let detail = indexed_detail.or_else(|| {
+                details.iter().find(|row| {
+                    row.get("decl")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| name == effective_name || name == decl.name)
+                })
+            });
+            let ambiguous_audit_join = detail.is_none()
+                || (indexed_detail.is_none()
+                    && (effective_counts.get(effective_name).copied().unwrap_or(0) > 1
+                        || detail
+                            .and_then(|row| row.get("decl"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|audit_decl| {
+                                audit_name_counts.get(audit_decl).copied().unwrap_or(0) > 1
+                                    || (audit_decl != effective_name
+                                        && effective_counts.get(audit_decl).copied().unwrap_or(0)
+                                            > 0)
+                            })));
             let visibility = visibility_of(
                 effective_name,
                 &public_names,
@@ -236,7 +319,7 @@ pub fn run_spec_card_command(
                 hidden_private += 1;
                 continue;
             }
-            if detail.is_none() || !detail_is_audit_ok(detail) {
+            if detail.is_none() || ambiguous_audit_join || !detail_is_audit_ok(detail) {
                 all_audits_ok = false;
             }
             let ctx = FileCardCtx {
@@ -244,6 +327,7 @@ pub fn run_spec_card_command(
                 local_defs: &local_defs,
                 prop_local_defs: &prop_local_defs,
                 defined_short_names: &scan.defined_short_names,
+                decl_namespace_roots: &scan.decl_namespace_roots,
                 hygiene: &hygiene,
                 audit: &audit,
                 has_unmodeled_instance_env: scan.has_unmodeled_instance_env,
@@ -257,6 +341,7 @@ pub fn run_spec_card_command(
                 visibility,
                 extra,
                 detail,
+                ambiguous_audit_join,
             ));
         }
     }
@@ -474,6 +559,7 @@ struct DeclExtra {
 struct DeclScan {
     extras: Vec<DeclExtra>,
     defined_short_names: BTreeSet<String>,
+    decl_namespace_roots: BTreeSet<String>,
     has_malformed_scope: bool,
     has_unmodeled_instance_env: bool,
     has_unmodeled_syntax_env: bool,
@@ -487,6 +573,14 @@ enum PrefixAction {
     SyntaxEnv,
     Malformed,
     Ignore,
+}
+
+struct InPrefixMatch {
+    after_in: usize,
+    kw: &'static str,
+    action: PrefixAction,
+    short: Option<String>,
+    decl: Option<String>,
 }
 
 fn scan_decl_extras(src: &str) -> DeclScan {
@@ -511,11 +605,13 @@ fn scan_decl_extras(src: &str) -> DeclScan {
     let mut pending_assumptions: Vec<String> = Vec::new();
     let mut pending_saw_attr = false;
     let mut pending_malformed_prefix = false;
+    let mut pending_cmd_col: Option<usize> = None;
     let mut has_malformed_scope = false;
     let mut has_unmodeled_instance_env = false;
     let mut has_unmodeled_syntax_env = false;
     let mut has_shadowed_value_types = false;
     let mut defined_short_names: BTreeSet<String> = BTreeSet::new();
+    let mut decl_namespace_roots: BTreeSet<String> = BTreeSet::new();
     let mut out = Vec::new();
     while i < n {
         if let Some(end) = skip_any(&masked, &byte_offsets, i) {
@@ -534,6 +630,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                 pending_assumptions.clear();
                 pending_saw_attr = false;
                 pending_malformed_prefix = false;
+                pending_cmd_col = None;
             }
             at_cmd_head = true;
             i += 1;
@@ -553,6 +650,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
             continue;
         }
         if at_cmd_head && chars[i] == '@' && i + 1 < n && chars[i + 1] == '[' {
+            pending_cmd_col.get_or_insert_with(|| line_col(&chars, i));
             if pending_private
                 || pending_local
                 || pending_public
@@ -617,6 +715,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
             pending_assumptions.clear();
             pending_saw_attr = false;
             pending_malformed_prefix = false;
+            pending_cmd_col = None;
             i = scan_command_body(
                 &masked,
                 &byte_offsets,
@@ -631,8 +730,14 @@ fn scan_decl_extras(src: &str) -> DeclScan {
         }
         if at_cmd_head {
             let mut chained = false;
-            let mut base_cmd_col: Option<usize> = None;
-            while let Some((after_in, kw, action, prefix_short)) = consume_in_command_prefix(
+            let mut base_cmd_col: Option<usize> = pending_cmd_col;
+            while let Some(InPrefixMatch {
+                after_in,
+                kw,
+                action,
+                short: prefix_short,
+                decl: prefix_decl,
+            }) = consume_in_command_prefix(
                 &masked,
                 &byte_offsets,
                 &chars,
@@ -642,6 +747,12 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                 chained = true;
                 if let Some(short) = prefix_short {
                     defined_short_names.insert(short);
+                }
+                if let Some(raw_decl) = prefix_decl {
+                    let qual = qualified_decl_name(&raw_decl, &scope);
+                    if !qual.is_empty() {
+                        decl_namespace_roots.insert(qual);
+                    }
                 }
                 base_cmd_col.get_or_insert_with(|| line_col(&chars, i));
                 let prefix_allows_decl_mods = matches!(
@@ -683,6 +794,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                 pending_other_mod = false;
                 pending_attr_has_instance = false;
                 pending_saw_attr = false;
+                pending_cmd_col = base_cmd_col;
                 match action {
                     PrefixAction::Assumption(assumption) => pending_assumptions.push(assumption),
                     PrefixAction::UnmodeledEnv => has_unmodeled_instance_env = true,
@@ -719,6 +831,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                 pending_assumptions.clear();
                 pending_saw_attr = false;
                 pending_malformed_prefix = false;
+                pending_cmd_col = None;
                 i = end;
                 continue;
             }
@@ -740,6 +853,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
             pending_assumptions.clear();
             pending_saw_attr = false;
             pending_malformed_prefix = false;
+            pending_cmd_col = None;
             i += 1;
             continue;
         }
@@ -769,6 +883,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                     | "meta"
             )
         {
+            pending_cmd_col.get_or_insert_with(|| line_col(&chars, start));
             if word == "private" {
                 pending_private = true;
                 pending_public = false;
@@ -794,6 +909,9 @@ fn scan_decl_extras(src: &str) -> DeclScan {
             }
             continue;
         }
+        let cmd_col = pending_cmd_col
+            .take()
+            .unwrap_or_else(|| line_col(&chars, start));
         let was_at_cmd_head = at_cmd_head;
         let decl_private = std::mem::replace(&mut pending_private, false);
         let _decl_local = std::mem::replace(&mut pending_local, false);
@@ -832,14 +950,8 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                 {
                     has_malformed_scope = true;
                 }
-                let (name, next, _crossed) = dotted_name_multiline(
-                    &masked,
-                    &byte_offsets,
-                    &chars,
-                    i,
-                    n,
-                    line_col(&chars, start),
-                );
+                let (name, next, _crossed) =
+                    dotted_name_multiline(&masked, &byte_offsets, &chars, i, n, cmd_col);
                 if name.is_empty() {
                     has_malformed_scope = true;
                 }
@@ -874,14 +986,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                     has_malformed_scope = true;
                 }
                 let (name, next, _crossed) = if i < n && chars[i].is_whitespace() {
-                    dotted_name_multiline(
-                        &masked,
-                        &byte_offsets,
-                        &chars,
-                        i,
-                        n,
-                        line_col(&chars, start),
-                    )
+                    dotted_name_multiline(&masked, &byte_offsets, &chars, i, n, cmd_col)
                 } else {
                     (String::new(), i, false)
                 };
@@ -952,14 +1057,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                     pending_assumptions.clear();
                 }
                 let (name, next, _crossed) = if i < n && chars[i].is_whitespace() {
-                    dotted_name_multiline(
-                        &masked,
-                        &byte_offsets,
-                        &chars,
-                        i,
-                        n,
-                        line_col(&chars, start),
-                    )
+                    dotted_name_multiline(&masked, &byte_offsets, &chars, i, n, cmd_col)
                 } else {
                     (String::new(), i, false)
                 };
@@ -977,15 +1075,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
             }
             "variable" | "variables" | "include" | "omit" => {
                 let body_start = i;
-                i = scan_command_body(
-                    &masked,
-                    &byte_offsets,
-                    &chars,
-                    &word,
-                    i,
-                    n,
-                    line_col(&chars, start),
-                );
+                i = scan_command_body(&masked, &byte_offsets, &chars, &word, i, n, cmd_col);
                 let body: String = chars[body_start..i].iter().collect();
                 let clean_body = normalize_ws(&body);
                 if let Some(frame) = context.last_mut() {
@@ -1032,30 +1122,14 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                 {
                     has_unmodeled_instance_env = true;
                 }
-                i = scan_command_body(
-                    &masked,
-                    &byte_offsets,
-                    &chars,
-                    &word,
-                    i,
-                    n,
-                    line_col(&chars, start),
-                );
+                i = scan_command_body(&masked, &byte_offsets, &chars, &word, i, n, cmd_col);
                 if consume_trailing_in(&masked, &byte_offsets, &chars, &mut i) {
                     at_cmd_head = true;
                 }
             }
             "attribute" => {
                 let body_start = i;
-                i = scan_command_body(
-                    &masked,
-                    &byte_offsets,
-                    &chars,
-                    &word,
-                    i,
-                    n,
-                    line_col(&chars, start),
-                );
+                i = scan_command_body(&masked, &byte_offsets, &chars, &word, i, n, cmd_col);
                 let body: String = chars[body_start..i].iter().collect();
                 if attr_mentions_instance_or_class(&body) {
                     has_unmodeled_instance_env = true;
@@ -1066,15 +1140,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
             }
             "open" | "export" => {
                 let body_start = i;
-                i = scan_command_body(
-                    &masked,
-                    &byte_offsets,
-                    &chars,
-                    &word,
-                    i,
-                    n,
-                    line_col(&chars, start),
-                );
+                i = scan_command_body(&masked, &byte_offsets, &chars, &word, i, n, cmd_col);
                 let body: String = chars[body_start..i].iter().collect();
                 let mentions_defined = defined_short_names
                     .iter()
@@ -1104,15 +1170,13 @@ fn scan_decl_extras(src: &str) -> DeclScan {
             }
             "class" | "structure" | "inductive" | "coinductive" | "def" | "abbrev" | "opaque"
             | "constant" | "example" | "axiom" => {
-                let (decl_name, next, _) = dotted_name_multiline(
-                    &masked,
-                    &byte_offsets,
-                    &chars,
-                    i,
-                    n,
-                    line_col(&chars, start),
-                );
+                let (decl_name, next, _) =
+                    dotted_name_multiline(&masked, &byte_offsets, &chars, i, n, cmd_col);
                 i = next;
+                let qual_decl = qualified_decl_name(&decl_name, &scope);
+                if !qual_decl.is_empty() {
+                    decl_namespace_roots.insert(qual_decl);
+                }
                 let short = decl_name.rsplit('.').next().unwrap_or(decl_name.as_str());
                 let short_canon = crate::splitter::canonical_lean_name_component(short);
                 if !short_canon.is_empty()
@@ -1126,28 +1190,14 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                     has_unmodeled_instance_env = true;
                     has_shadowed_value_types = true;
                 }
-                i = scan_command_body(
-                    &masked,
-                    &byte_offsets,
-                    &chars,
-                    &word,
-                    i,
-                    n,
-                    line_col(&chars, start),
-                );
+                i = scan_command_body(&masked, &byte_offsets, &chars, &word, i, n, cmd_col);
                 if consume_trailing_in(&masked, &byte_offsets, &chars, &mut i) {
                     at_cmd_head = true;
                 }
             }
             "theorem" | "lemma" => {
-                let (raw_name, next, _) = dotted_name_multiline(
-                    &masked,
-                    &byte_offsets,
-                    &chars,
-                    i,
-                    n,
-                    line_col(&chars, start),
-                );
+                let (raw_name, next, _) =
+                    dotted_name_multiline(&masked, &byte_offsets, &chars, i, n, cmd_col);
                 if raw_name.is_empty() {
                     continue;
                 }
@@ -1307,6 +1357,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                 }
                 if stmt_has_unparsed_telescope(&trimmed_prop)
                     || statement_let_is_unsafe(&prop_str, &trimmed_prop)
+                    || nested_prop_shadow(&prop_str)
                 {
                     saw_unparsed_telescope = true;
                 }
@@ -1315,8 +1366,12 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                     .flat_map(|frame| frame.iter().cloned())
                     .collect();
                 assumptions.extend(decl_inline_assumptions);
+                let qual_name = qualified_decl_name(&raw_name, &scope);
+                if !qual_name.is_empty() {
+                    decl_namespace_roots.insert(qual_name.clone());
+                }
                 out.push(DeclExtra {
-                    name: qualified_decl_name(&raw_name, &scope),
+                    name: qual_name,
                     is_private: decl_private,
                     explicit_public: decl_public
                         || (public_section_stack.iter().any(|&flag| flag) && !decl_private),
@@ -1327,8 +1382,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                     saw_unparsed_binder,
                     saw_unparsed_telescope,
                 });
-                let proof_cmd_col = line_col(&chars, start);
-                i = scan_command_body(&masked, &byte_offsets, &chars, &word, i, n, proof_cmd_col);
+                i = scan_command_body(&masked, &byte_offsets, &chars, &word, i, n, cmd_col);
                 if consume_trailing_in(&masked, &byte_offsets, &chars, &mut i) {
                     at_cmd_head = true;
                 }
@@ -1338,15 +1392,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                     has_unmodeled_instance_env = true;
                     has_unmodeled_syntax_env = true;
                 }
-                i = scan_command_body(
-                    &masked,
-                    &byte_offsets,
-                    &chars,
-                    &word,
-                    i,
-                    n,
-                    line_col(&chars, start),
-                );
+                i = scan_command_body(&masked, &byte_offsets, &chars, &word, i, n, cmd_col);
                 if consume_trailing_in(&masked, &byte_offsets, &chars, &mut i) {
                     at_cmd_head = true;
                 }
@@ -1356,6 +1402,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
     DeclScan {
         extras: out,
         defined_short_names,
+        decl_namespace_roots,
         has_malformed_scope,
         has_unmodeled_instance_env,
         has_unmodeled_syntax_env,
@@ -1446,6 +1493,7 @@ fn statement_let_is_unsafe(prop: &str, inlined: &str) -> bool {
     if ident_mentioned(&clean_prop, "have") || ident_mentioned(&clean_inlined, "let") {
         return true;
     }
+    let mut lets = Vec::new();
     let mut cur = prop.trim();
     while let Some(after_let) = cur
         .strip_prefix("let")
@@ -1468,7 +1516,7 @@ fn statement_let_is_unsafe(prop: &str, inlined: &str) -> bool {
         };
         let type_part = after_name[..eq_idx].trim();
         let after_eq = after_name[eq_idx + 2..].trim_start();
-        let Some((rhs_end, _)) = scan_let_body_start(after_eq) else {
+        let Some((rhs_end, body_start)) = scan_let_body_start(after_eq) else {
             return true;
         };
         let rhs = after_eq[..rhs_end].trim();
@@ -1484,16 +1532,28 @@ fn statement_let_is_unsafe(prop: &str, inlined: &str) -> bool {
                 return true;
             }
         }
-        let Some((_rhs_end, body_start)) = scan_let_body_start(after_eq) else {
-            return true;
-        };
         let body = after_eq[body_start..].trim_start();
         if !ident_mentioned(body, var_name) {
             return true;
         }
+        lets.push((var_name.to_string(), rhs.to_string()));
         cur = body;
     }
-    false
+    for (idx, (name, _)) in lets.iter().enumerate() {
+        if lets[..idx].iter().any(|(earlier, _)| earlier == name) {
+            return true;
+        }
+    }
+    lets.iter().enumerate().any(|(idx, (_, rhs))| {
+        lets[idx..]
+            .iter()
+            .any(|(later, _)| ident_mentioned(rhs, later))
+    })
+}
+
+fn nested_prop_shadow(prop: &str) -> bool {
+    let clean = mask_literals(prop);
+    ident_mentioned(&clean, "where") || clean.contains("let rec")
 }
 
 fn scan_top_level_colon_eq(src: &str) -> Option<usize> {
@@ -3368,7 +3428,7 @@ fn consume_in_command_prefix(
     chars: &[char],
     start: usize,
     cmd_col: usize,
-) -> Option<(usize, &'static str, PrefixAction, Option<String>)> {
+) -> Option<InPrefixMatch> {
     const PREFIXES: &[&str] = &[
         "set_option",
         "open",
@@ -3427,23 +3487,25 @@ fn consume_in_command_prefix(
     if let Some(rest) = tail.strip_prefix("#time") {
         if rest.starts_with(char::is_whitespace) {
             let consumed = tail.len() - rest.len();
-            return Some((
-                byte_offsets.partition_point(|offset| *offset < byte_start + consumed),
-                "#time",
-                PrefixAction::Ignore,
-                None,
-            ));
+            return Some(InPrefixMatch {
+                after_in: byte_offsets.partition_point(|offset| *offset < byte_start + consumed),
+                kw: "#time",
+                action: PrefixAction::Ignore,
+                short: None,
+                decl: None,
+            });
         }
     }
     if let Some(rest) = tail.strip_prefix("#with_exporting") {
         if rest.starts_with(char::is_whitespace) {
             let consumed = tail.len() - rest.len();
-            return Some((
-                byte_offsets.partition_point(|offset| *offset < byte_start + consumed),
-                "#with_exporting",
-                PrefixAction::Malformed,
-                None,
-            ));
+            return Some(InPrefixMatch {
+                after_in: byte_offsets.partition_point(|offset| *offset < byte_start + consumed),
+                kw: "#with_exporting",
+                action: PrefixAction::Malformed,
+                short: None,
+                decl: None,
+            });
         }
     }
     let kw = *PREFIXES.iter().find(|&&kw| {
@@ -3501,8 +3563,14 @@ fn consume_in_command_prefix(
                 } else {
                     let after = i + 2;
                     let raw: String = chars[start..after].iter().collect();
-                    let (action, prefix_short) = classify_in_prefix(kw, &raw);
-                    return Some((after, kw, action, prefix_short));
+                    let (action, short, decl) = classify_in_prefix(kw, &raw);
+                    return Some(InPrefixMatch {
+                        after_in: after,
+                        kw,
+                        action,
+                        short,
+                        decl,
+                    });
                 }
             }
             ch if !ch.is_whitespace() => body_is_ws = false,
@@ -3513,18 +3581,18 @@ fn consume_in_command_prefix(
     None
 }
 
-fn classify_in_prefix(kw: &str, raw: &str) -> (PrefixAction, Option<String>) {
+fn classify_in_prefix(kw: &str, raw: &str) -> (PrefixAction, Option<String>, Option<String>) {
     if matches!(kw, "variable" | "variables" | "include" | "omit") {
-        return (PrefixAction::Assumption(normalize_ws(raw)), None);
+        return (PrefixAction::Assumption(normalize_ws(raw)), None, None);
     }
     if matches!(kw, "deriving" | "instance") {
-        return (PrefixAction::UnmodeledEnv, None);
+        return (PrefixAction::UnmodeledEnv, None, None);
     }
     if syntax_env_keyword(kw) {
-        return (PrefixAction::SyntaxEnv, None);
+        return (PrefixAction::SyntaxEnv, None, None);
     }
     if kw == "attribute" && attr_mentions_instance_or_class(raw) {
-        return (PrefixAction::UnmodeledEnv, None);
+        return (PrefixAction::UnmodeledEnv, None, None);
     }
     if matches!(kw, "open" | "export") {
         if kw == "export"
@@ -3532,29 +3600,31 @@ fn classify_in_prefix(kw: &str, raw: &str) -> (PrefixAction, Option<String>) {
             || ident_mentioned(raw, "renaming")
             || ident_mentioned(raw, "scoped")
         {
-            return (PrefixAction::ShadowedValueEnv, None);
+            return (PrefixAction::ShadowedValueEnv, None, None);
         }
         if RESERVED_INSTANCE_AND_TYPE_NAMES
             .iter()
             .any(|reserved| ident_mentioned(raw, reserved) && *reserved != "Nat")
         {
-            return (PrefixAction::UnmodeledEnv, None);
+            return (PrefixAction::UnmodeledEnv, None, None);
         }
-        return (PrefixAction::Ignore, None);
+        return (PrefixAction::Ignore, None, None);
     }
     if matches!(
         kw,
         "class" | "structure" | "inductive" | "coinductive" | "axiom" | "opaque"
     ) {
         let after_kw = raw.trim_start().trim_start_matches(kw).trim_start();
-        let short: String = after_kw
+        let raw_decl: String = after_kw
             .chars()
             .take_while(|c| is_ident_continue(*c) || *c == '.' || *c == '«' || *c == '»')
             .collect();
-        let short = short.rsplit('.').next().unwrap_or(short.as_str());
+        let raw_decl = raw_decl.trim_end_matches('.');
+        let short = raw_decl.rsplit('.').next().unwrap_or(raw_decl);
         let short_canon = crate::splitter::canonical_lean_name_component(short);
         let recorded = (!short_canon.is_empty()).then_some(short_canon);
-        return (PrefixAction::ShadowedValueEnv, recorded);
+        let decl = (!raw_decl.is_empty()).then(|| raw_decl.to_string());
+        return (PrefixAction::ShadowedValueEnv, recorded, decl);
     }
     if matches!(
         kw,
@@ -3565,22 +3635,23 @@ fn classify_in_prefix(kw: &str, raw: &str) -> (PrefixAction, Option<String>) {
             .chars()
             .take_while(|c| is_ident_continue(*c) || *c == '.' || *c == '«' || *c == '»')
             .collect();
-        let short = raw_decl.rsplit('.').next().unwrap_or(raw_decl.as_str());
+        let raw_decl = raw_decl.trim_end_matches('.');
+        let short = raw_decl.rsplit('.').next().unwrap_or(raw_decl);
         let short_canon = crate::splitter::canonical_lean_name_component(short);
-        let recorded = (!short_canon.is_empty() && (kw == "constant" || raw_decl.contains('.')))
-            .then(|| short_canon.clone());
+        let recorded = (!short_canon.is_empty()).then(|| short_canon.clone());
+        let decl = (!raw_decl.is_empty()).then(|| raw_decl.to_string());
         if matches!(kw, "theorem" | "lemma") {
-            return (PrefixAction::ShadowedValueEnv, recorded);
+            return (PrefixAction::ShadowedValueEnv, recorded, decl);
         }
         if RESERVED_INSTANCE_AND_TYPE_NAMES.contains(&short_canon.as_str())
             || ident_mentioned(after_kw, "theorem")
             || ident_mentioned(after_kw, "lemma")
         {
-            return (PrefixAction::ShadowedValueEnv, recorded);
+            return (PrefixAction::ShadowedValueEnv, recorded, decl);
         }
-        return (PrefixAction::Ignore, recorded);
+        return (PrefixAction::Ignore, recorded, decl);
     }
-    (PrefixAction::Ignore, None)
+    (PrefixAction::Ignore, None, None)
 }
 
 fn dotted_name_multiline(
@@ -3773,6 +3844,7 @@ struct FileCardCtx<'a> {
     local_defs: &'a [(String, Vec<String>, String, String)],
     prop_local_defs: &'a [(String, Vec<String>, String)],
     defined_short_names: &'a BTreeSet<String>,
+    decl_namespace_roots: &'a BTreeSet<String>,
     hygiene: &'a crate::splitter::HygieneReport,
     audit: &'a Value,
     has_unmodeled_instance_env: bool,
@@ -4347,6 +4419,21 @@ fn scalar_domain_key(ty: &str) -> Option<&'static str> {
     }
 }
 
+fn decl_has_shadow_namespace_ancestor(
+    effective_name: &str,
+    decl_namespace_roots: &BTreeSet<String>,
+) -> bool {
+    let Some((root, _)) = effective_name.split_once('.') else {
+        return false;
+    };
+    if PRELUDE_PROP_NAMESPACE_ROOTS.contains(&root) {
+        return true;
+    }
+    effective_name
+        .match_indices('.')
+        .any(|(idx, _)| decl_namespace_roots.contains(&effective_name[..idx]))
+}
+
 fn card_for(
     ctx: &FileCardCtx<'_>,
     decl: &ExtractedDecl,
@@ -4354,7 +4441,14 @@ fn card_for(
     visibility: &str,
     extra: Option<&DeclExtra>,
     detail: Option<&Value>,
+    ambiguous_audit_join: bool,
 ) -> Value {
+    let active_prop_local_defs: &[(String, Vec<String>, String)] =
+        if decl_has_shadow_namespace_ancestor(effective_name, ctx.decl_namespace_roots) {
+            &[]
+        } else {
+            ctx.prop_local_defs
+        };
     let instance_binders = extra
         .map(|row| row.instance_binders.clone())
         .unwrap_or_default();
@@ -4403,7 +4497,7 @@ fn card_for(
             &seen_lawful_beq_vars,
             &seen_prop_params,
             &seen_value_params,
-            ctx.prop_local_defs,
+            active_prop_local_defs,
             ctx.defined_short_names,
         ) && !(is_known_binder_value_type(ty)
             && safe_inhabited_value_binder_type(
@@ -4457,7 +4551,7 @@ fn card_for(
             &seen_lawful_beq_vars,
             &seen_prop_params,
             &seen_value_params,
-            ctx.prop_local_defs,
+            active_prop_local_defs,
             ctx.defined_short_names,
         ) {
             let names = vars.join(" ");
@@ -4498,14 +4592,14 @@ fn card_for(
                 &hypothesis_text,
                 &nat_sorts,
                 &seen_lawful_beq_vars,
-                ctx.prop_local_defs,
+                active_prop_local_defs,
                 ctx.defined_short_names,
             ))
             || !scalar_conclusion_refuted(
                 &conclusion,
                 &nat_sorts,
                 &seen_lawful_beq_vars,
-                ctx.prop_local_defs,
+                active_prop_local_defs,
                 ctx.defined_short_names,
             ));
     let unmodeled_hypothesis = !seen_prop_params.is_empty()
@@ -4517,7 +4611,7 @@ fn card_for(
                 &seen_lawful_beq_vars,
                 &seen_prop_params,
                 &seen_value_params,
-                ctx.prop_local_defs,
+                active_prop_local_defs,
                 ctx.defined_short_names,
             )
         })
@@ -4526,7 +4620,7 @@ fn card_for(
             &seen_lawful_beq_vars,
             &seen_prop_params,
             &seen_value_params,
-            ctx.prop_local_defs,
+            active_prop_local_defs,
             ctx.defined_short_names,
         );
     let context_assumptions = extra
@@ -4561,6 +4655,7 @@ fn card_for(
     }
     if extra.is_none()
         || extra.is_some_and(|row| row.saw_unparsed_binder || row.saw_unparsed_telescope)
+        || ambiguous_audit_join
         || vacuous_hypothesis
         || unmodeled_binder
         || unmodeled_hypothesis
