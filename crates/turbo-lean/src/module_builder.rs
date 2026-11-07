@@ -9358,12 +9358,8 @@ fn spec_in_clean_git_pinned_manifest_package(
             {
                 return None;
             }
-            if crate::trusted_tools::reject_gitlinks(
-                &spec_canon,
-                &[expected_rev],
-                Path::new("."),
-            )
-            .is_err()
+            if crate::trusted_tools::reject_gitlinks(&spec_canon, &[expected_rev], Path::new("."))
+                .is_err()
             {
                 return None;
             }
@@ -12171,7 +12167,7 @@ pub fn lean_mk_module_initialization_stem(mod_or_lib_name: &str, pkg_name: Optio
     lean_name_mangle(&parsed, &pre)
 }
 
-fn expand_lib_configured_modules(
+pub(crate) fn expand_lib_configured_modules(
     pkg: &PackageConfig,
     lib: &LeanLibConfig,
 ) -> Result<Vec<(String, PathBuf)>> {
@@ -12195,6 +12191,190 @@ fn expand_lib_configured_modules(
         }
     }
     Ok(out)
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TrustedAssuranceSurface {
+    pub mod_names: HashSet<String>,
+    pub canon_paths: HashSet<PathBuf>,
+    pub lib_names: HashSet<String>,
+    pub exe_names: HashSet<String>,
+}
+
+pub(crate) fn discover_trusted_assurance_surface(
+    project: &Path,
+    pkg: &PackageConfig,
+    allowed_axioms: &[String],
+) -> TrustedAssuranceSurface {
+    let canon = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let canon_proj = canon(project);
+    let mut dep_roots: Vec<PathBuf> = parse_lake_manifest(project, false)
+        .map(|(_, pkgs, _)| {
+            pkgs.into_iter()
+                .filter_map(|mp| {
+                    let c = canon(&mp.dir);
+                    (c != canon_proj && mp.dir != project).then_some(c)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    dep_roots.sort();
+    dep_roots.dedup();
+    let pkg_base = project.join(&pkg.src_dir);
+    let mut roots = vec![canon(&pkg_base)];
+    for dir in pkg
+        .libs
+        .iter()
+        .filter_map(|l| l.src_dir.as_ref())
+        .chain(pkg.exes.iter().filter_map(|e| e.src_dir.as_ref()))
+    {
+        roots.push(canon(&pkg_base.join(dir)));
+    }
+    if !roots.contains(&canon_proj) {
+        roots.push(canon_proj.clone());
+    }
+    roots.sort_by_key(|r| std::cmp::Reverse(r.components().count()));
+    roots.dedup();
+
+    struct ModInfo {
+        canon_path: PathBuf,
+        imports: Vec<String>,
+        is_dot_fixture: bool,
+        is_zero_shard_meta_audit: bool,
+    }
+    let mut all_mods: HashMap<String, ModInfo> = HashMap::new();
+    let mut lib_mods: Vec<(String, Vec<String>)> = Vec::new();
+    let mut exe_mods: Vec<(String, String)> = Vec::new();
+
+    let mut register_mod = |m_name: String, src: PathBuf| {
+        if m_name.is_empty() || all_mods.contains_key(&m_name) {
+            return;
+        }
+        let canon_src = canon(&src);
+        if dep_roots.iter().any(|dr| canon_src.starts_with(dr)) {
+            return;
+        }
+        let is_dot_fixture = canon_src.strip_prefix(&canon_proj).ok().is_some_and(|rel| {
+            rel.components().any(|c| {
+                c.as_os_str()
+                    .to_str()
+                    .is_some_and(|s| s.starts_with('.') && s != "." && s != "..")
+            })
+        });
+        let Ok(raw) = fs::read_to_string(&src) else {
+            return;
+        };
+        let hdr = parse_header_info(&raw);
+        if hdr.header_error.is_some() {
+            return;
+        }
+        let split = splitter::split_lean_source(&raw, &[]);
+        let is_zero_shard_meta_audit = split.shards.is_empty()
+            && split.hygiene.has_checking_weakening
+            && !split.hygiene.has_checking_weakening_option
+            && !split.hygiene.has_sorry
+            && !split.hygiene.has_axiom
+            && !split.hygiene.has_trust_compiler
+            && !split.hygiene.native_violation_under(allowed_axioms);
+        all_mods.insert(
+            m_name,
+            ModInfo {
+                canon_path: canon_src,
+                imports: hdr.imports,
+                is_dot_fixture,
+                is_zero_shard_meta_audit,
+            },
+        );
+    };
+
+    for lib in &pkg.libs {
+        if let Ok(pairs) = expand_lib_configured_modules(pkg, lib) {
+            let mut names = Vec::with_capacity(pairs.len());
+            for (m_name, m_path) in pairs {
+                names.push(m_name.clone());
+                register_mod(m_name, m_path);
+            }
+            lib_mods.push((lib.name.clone(), names));
+        }
+    }
+    for exe in &pkg.exes {
+        if !exe.root.is_empty() {
+            if let Some(spec) = resolve_module_in_package(pkg, true, &exe.root) {
+                exe_mods.push((exe.name.clone(), exe.root.clone()));
+                register_mod(exe.root.clone(), spec.src_path);
+            }
+        }
+    }
+    for source in crate::lake_build::collect_project_lean_files(project, false, None) {
+        let canon_src = canon(&source);
+        if dep_roots.iter().any(|dr| canon_src.starts_with(dr)) {
+            continue;
+        }
+        let Some(root) = roots.iter().find(|r| canon_src.starts_with(r)) else {
+            continue;
+        };
+        let Ok(rel) = canon_src.strip_prefix(root) else {
+            continue;
+        };
+        let m_name = format_lean_module_name_from_parts(
+            rel.with_extension("")
+                .components()
+                .filter_map(|c| c.as_os_str().to_str()),
+        );
+        register_mod(m_name, source);
+    }
+
+    let mut cand: HashSet<String> = all_mods
+        .iter()
+        .filter(|(_, info)| info.is_dot_fixture || info.is_zero_shard_meta_audit)
+        .map(|(m, _)| m.clone())
+        .collect();
+
+    // Closed sink-cone pruning: remove any candidate imported by a module outside `cand`.
+    let mut changed = !cand.is_empty();
+    while changed {
+        changed = false;
+        let mut to_remove = Vec::new();
+        for (importer, info) in &all_mods {
+            if cand.contains(importer) {
+                continue;
+            }
+            for imp in &info.imports {
+                if cand.contains(imp) {
+                    to_remove.push(imp.clone());
+                }
+            }
+        }
+        for bad in to_remove {
+            if cand.remove(&bad) {
+                changed = true;
+            }
+        }
+    }
+    if cand.is_empty() {
+        return TrustedAssuranceSurface::default();
+    }
+
+    let canon_paths: HashSet<PathBuf> = cand
+        .iter()
+        .filter_map(|m| all_mods.get(m).map(|i| i.canon_path.clone()))
+        .collect();
+    let lib_names: HashSet<String> = lib_mods
+        .into_iter()
+        .filter(|(_, names)| !names.is_empty() && names.iter().any(|m| cand.contains(m)))
+        .map(|(l, _)| l)
+        .collect();
+    let exe_names: HashSet<String> = exe_mods
+        .into_iter()
+        .filter(|(_, root)| cand.contains(root))
+        .map(|(e, _)| e)
+        .collect();
+    TrustedAssuranceSurface {
+        mod_names: cand,
+        canon_paths,
+        lib_names,
+        exe_names,
+    }
 }
 
 /// Build the deterministic module dependency DAG for `cfg` and requested `targets` (trusted mode).
@@ -23618,10 +23798,17 @@ pub fn hydrate_project_traces(project_dir: &Path) -> Result<HydrateTracesReport>
             continue;
         }
         report.packages_scanned += 1;
+        let assurance = if is_root {
+            discover_trusted_assurance_surface(&pkg.pkg_root, pkg, &allowed_axioms)
+        } else {
+            TrustedAssuranceSurface::default()
+        };
         let specs = discover_all_package_module_specs(pkg, is_root);
         let built_specs: Vec<DiscoveredModuleSpec> = specs
             .into_iter()
-            .filter(|s| spec_olean_path(s).is_file())
+            .filter(|s| {
+                !assurance.mod_names.contains(&s.module_name) && spec_olean_path(s).is_file()
+            })
             .collect();
         report.modules_scanned += built_specs.len();
         if !built_specs.is_empty() {
@@ -40475,9 +40662,18 @@ globs = ["Down.+"]
         fs::write(dep_dir.join("PwDep.lean"), dep_src)?;
 
         let mut git_init_dep = crate::trusted_tools::git(root)?;
-        assert!(git_init_dep.args(["init", "-q"]).arg(&dep_dir).status()?.success());
+        assert!(git_init_dep
+            .args(["init", "-q"])
+            .arg(&dep_dir)
+            .status()?
+            .success());
         let mut git_add_dep = crate::trusted_tools::git(&dep_dir)?;
-        assert!(git_add_dep.args(["-C"]).arg(&dep_dir).args(["add", "."]).status()?.success());
+        assert!(git_add_dep
+            .args(["-C"])
+            .arg(&dep_dir)
+            .args(["add", "."])
+            .status()?
+            .success());
         let mut git_commit_dep = crate::trusted_tools::git(&dep_dir)?;
         assert!(git_commit_dep
             .args([
@@ -40883,9 +41079,18 @@ globs = ["Down.+"]
         fs::write(dep_dir.join("SearchDep/Syntax.lean"), dep_src)?;
 
         let mut git_init = crate::trusted_tools::git(root)?;
-        assert!(git_init.args(["init", "-q"]).arg(&dep_dir).status()?.success());
+        assert!(git_init
+            .args(["init", "-q"])
+            .arg(&dep_dir)
+            .status()?
+            .success());
         let mut git_add = crate::trusted_tools::git(&dep_dir)?;
-        assert!(git_add.args(["-C"]).arg(&dep_dir).args(["add", "."]).status()?.success());
+        assert!(git_add
+            .args(["-C"])
+            .arg(&dep_dir)
+            .args(["add", "."])
+            .status()?
+            .success());
         let mut git_commit = crate::trusted_tools::git(&dep_dir)?;
         assert!(git_commit
             .args([

@@ -534,15 +534,22 @@ def collectDeclAxioms (beforeMap : Lean.PHashMap Name ConstantInfo) (afterEnv : 
 section RecAudit
 open Meta
 
-def hydrateRecAuditEnv (env0 : Environment) : Environment := Id.run do
+def hydrateOnePersistentExt {α β σ : Type} [Inhabited σ]
+    (ext : PersistentEnvExtension α β σ) (env : Environment) : IO Environment := do
+  let s := ext.toEnvExtension.getState env (asyncMode := .sync)
+  let newState ← ext.addImportedFn s.importedEntries { env, opts := {} }
+  return ext.toEnvExtension.setState env { s with state := newState } (asyncMode := .sync)
+
+def hydrateRecAuditEnv (env0 : Environment) : IO Environment := do
+  if Lean.classExtension.getState env0 |>.outParamMap.contains ``Monad then
+    return env0
   let mut e := env0
-  for i in [:e.header.moduleData.size] do
-    for entry in Meta.Match.Extension.extension.getModuleEntries e i .private do
-      e := Meta.Match.Extension.addMatcherInfo e entry.name entry.info
-    for scEntry in Elab.WF.wfPreprocessSimpExtension.ext.getModuleEntries e i .private do
-      match scEntry with
-      | .global entry => e := Elab.WF.wfPreprocessSimpExtension.addEntry e entry
-      | .scoped ns entry => e := Elab.WF.wfPreprocessSimpExtension.addScopedEntry e ns entry
+  e ← hydrateOnePersistentExt Lean.classExtension e
+  e ← hydrateOnePersistentExt Lean.Meta.instanceExtension.ext e
+  e ← hydrateOnePersistentExt Lean.Meta.defaultInstanceExtension e
+  e ← hydrateOnePersistentExt Lean.reducibilityExtraExt.ext e
+  e ← hydrateOnePersistentExt Lean.Meta.Match.Extension.extension e
+  e ← hydrateOnePersistentExt Lean.Elab.WF.wfPreprocessSimpExtension.ext e
   return e.setMainModule e.mainModule
 
 def isCoreRecCombinator (env : Environment) (c : Name) : Bool :=
@@ -1083,7 +1090,7 @@ partial def isCompilerPartialRecDefn (env : Environment) (hydratedEnvRef : IO.Re
   let hydratedEnv ← match ← hydratedEnvRef.get with
     | some hEnv => pure hEnv
     | none =>
-      let hEnv := hydrateRecAuditEnv env
+      let hEnv ← hydrateRecAuditEnv env
       hydratedEnvRef.set (some hEnv)
       pure hEnv
   let opts := maxHeartbeats.set {} 8000000
