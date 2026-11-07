@@ -175,17 +175,36 @@ impl Drop for FlockGuard {
     }
 }
 
-/// Acquire an advisory `flock` (`exclusive` => `LOCK_EX`, else `LOCK_SH`; `nonblocking` => `| LOCK_NB`).
-/// Returns `Ok(None)` when `nonblocking` is true and another holder currently owns a conflicting lock.
+fn is_private_staging_parent(parent: &Path) -> bool {
+    let base = staging_shm_dir();
+    parent == base
+        || parent.starts_with(&base)
+        || parent.file_name().and_then(|s| s.to_str()) == Some("staging")
+        || parent
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            == Some("staging")
+}
+
+fn ensure_parent_dir_for_leaf_write(parent: &Path) -> std::io::Result<()> {
+    if parent.as_os_str().is_empty() || parent == Path::new(".") {
+        return Ok(());
+    }
+    if is_private_staging_parent(parent) {
+        return ensure_private_dir_all(parent);
+    }
+    fs::create_dir_all(parent)?;
+    if !fs::metadata(parent)?.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("parent directory is not a directory: {}", parent.display()),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn ensure_private_dir_all(dir: &Path) -> std::io::Result<()> {
-    ensure_dir_all_inner(dir, true)
-}
-
-fn ensure_nonsymlink_dir_all(dir: &Path) -> std::io::Result<()> {
-    ensure_dir_all_inner(dir, false)
-}
-
-fn ensure_dir_all_inner(dir: &Path, require_private_leaf: bool) -> std::io::Result<()> {
     if dir.as_os_str().is_empty() || dir == Path::new(".") {
         return Ok(());
     }
@@ -232,39 +251,33 @@ fn ensure_dir_all_inner(dir: &Path, require_private_leaf: bool) -> std::io::Resu
                 ),
             ));
         }
-        if require_private_leaf {
-            let euid = unsafe { libc::geteuid() };
-            if meta.uid() != euid || (meta.mode() & 0o077) != 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "staging directory is not privately owned (0700) by current uid: {}",
-                        dir.display()
-                    ),
-                ));
-            }
+        let euid = unsafe { libc::geteuid() };
+        if meta.uid() != euid || (meta.mode() & 0o077) != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!(
+                    "staging directory is not privately owned (0700) by current uid: {}",
+                    dir.display()
+                ),
+            ));
         }
         Ok(())
     }
     #[cfg(not(unix))]
     {
-        let _ = require_private_leaf;
         fs::create_dir_all(dir)
     }
 }
 
+/// Acquire an advisory `flock` (`exclusive` => `LOCK_EX`, else `LOCK_SH`; `nonblocking` => `| LOCK_NB`).
+/// Returns `Ok(None)` when `nonblocking` is true and another holder currently owns a conflicting lock.
 pub fn acquire_flock(
     lock_path: &Path,
     exclusive: bool,
     nonblocking: bool,
 ) -> std::io::Result<Option<FlockGuard>> {
     if let Some(parent) = lock_path.parent() {
-        let base = staging_shm_dir();
-        if parent == base || parent.starts_with(&base) {
-            ensure_private_dir_all(parent)?;
-        } else {
-            ensure_nonsymlink_dir_all(parent)?;
-        }
+        ensure_parent_dir_for_leaf_write(parent)?;
     }
     let mut opts = fs::OpenOptions::new();
     opts.create(true).read(true).write(true).truncate(false);
@@ -619,19 +632,7 @@ fn stage_unique_tmp_path(target: &Path) -> std::io::Result<PathBuf> {
 
 fn stage_unique_tmp_path_ext(target: &Path, ext: &str) -> std::io::Result<PathBuf> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    let base = staging_shm_dir();
-    let in_private_staging = parent == base
-        || parent.starts_with(&base)
-        || parent
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|s| s.to_str())
-            == Some("staging");
-    if in_private_staging {
-        ensure_private_dir_all(parent)?;
-    } else {
-        ensure_nonsymlink_dir_all(parent)?;
-    }
+    ensure_parent_dir_for_leaf_write(parent)?;
     let file_name = target
         .file_name()
         .map(|n| n.to_string_lossy())
@@ -889,15 +890,7 @@ pub(crate) struct StagingLeaseGuard {
 }
 
 fn ensure_lease_or_staging_parent_dir(parent: &Path) -> std::io::Result<()> {
-    if parent.as_os_str().is_empty() || parent == Path::new(".") {
-        return Ok(());
-    }
-    let base = staging_shm_dir();
-    if parent == base || parent.starts_with(&base) {
-        ensure_private_dir_all(parent)
-    } else {
-        ensure_nonsymlink_dir_all(parent)
-    }
+    ensure_parent_dir_for_leaf_write(parent)
 }
 
 impl StagingLeaseGuard {
@@ -1775,6 +1768,52 @@ mod tests {
             }
         }
         std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_publish_flock_and_atomic_write_support_symlinked_lake_build_dir() -> anyhow::Result<()>
+    {
+        let root = std::env::temp_dir().join(format!(
+            "turbo_pub_symlink_build_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let project = root.join("project");
+        let sticky_build = root.join("sticky_build");
+        let outside = root.join("outside");
+        fs::create_dir_all(project.join(".lake"))?;
+        fs::create_dir_all(&sticky_build)?;
+        fs::create_dir_all(&outside)?;
+        std::os::unix::fs::symlink(&sticky_build, project.join(".lake/build"))?;
+
+        let pub_guard = super::acquire_publish_flock(&project, true, false)?;
+        assert!(sticky_build.join(".turbo_publish.lock").is_file());
+        drop(pub_guard);
+
+        let manifest_path = project.join(".lake/build/.turbo_verified_manifest.json");
+        super::atomic_write_shm(&manifest_path, b"{\"ok\":true}")?;
+        assert_eq!(fs::read(sticky_build.join(".turbo_verified_manifest.json"))?, b"{\"ok\":true}");
+
+        // Leaf lockfile symlinks inside symlinked `.lake/build` still fail closed via O_NOFOLLOW.
+        let planted_lock = project.join(".lake/build/.turbo_publish.lock");
+        fs::remove_file(&planted_lock)?;
+        std::os::unix::fs::symlink(outside.join("escaped_lock"), &planted_lock)?;
+        assert!(super::acquire_publish_flock(&project, true, false).is_err());
+        assert!(!outside.join("escaped_lock").exists());
+
+        // Meanwhile, symlinked private `staging` directories still fail closed.
+        let real_staging = root.join("real_staging");
+        fs::create_dir_all(&real_staging)?;
+        let symlink_staging = root.join("store").join("staging");
+        fs::create_dir_all(symlink_staging.parent().unwrap())?;
+        std::os::unix::fs::symlink(&real_staging, &symlink_staging)?;
+        assert!(super::acquire_flock(&symlink_staging.join("x.lock"), true, false).is_err());
+        assert!(super::atomic_write_shm(&symlink_staging.join("x.json"), b"{}").is_err());
+
+        fs::remove_dir_all(&root)?;
         Ok(())
     }
 
