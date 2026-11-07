@@ -4143,9 +4143,14 @@ pub fn sync_push_http_with_manifest(
     ))
 }
 
+/// Local attestation-cache key prefix for `offload_check_shards_batch_http` (attestation cache only, not a `srv-v9:` HTTP context receipt).
+pub(crate) fn client_attested_receipt_key(shard_key: &str) -> String {
+    format!("client-attested-v1:{shard_key}")
+}
+
 /// Offload a coalesced batch of uncached theorem shards to a remote `turbo-lean serve` coordinator
-/// via `POST /check-shards-batch`. On `ok == true`, atomically publishes all verified shard receipts
-/// into the local `store` `TheoremProofCAS` via `batch_publish_theorem_shards`.
+/// via `POST /check-shards-batch`. On `ok == true`, publishes local attestation-cache receipts
+/// strictly for items verified against `resp.verified_decl_types` (never caller hashes).
 #[allow(clippy::too_many_arguments)]
 pub fn offload_check_shards_batch_http(
     store: &mut TurboStore,
@@ -4173,7 +4178,6 @@ pub fn offload_check_shards_batch_http(
         allowed_axioms: Some(crate::splitter::extra_allowed_axiom_patterns()),
         lean_args: filtered_args,
     };
-    let body = serde_json::to_vec(&req)?;
     let tc = if toolchain.is_empty() {
         "leanprover/lean4:v4.35.0"
     } else {
@@ -4184,117 +4188,85 @@ pub fn offload_check_shards_batch_http(
     } else {
         trust_domain
     };
-    let build_publish_items = |dur_ms: i64| -> Vec<(String, String, Vec<u8>, i64)> {
-        let now = now_unix();
-        items
-            .iter()
-            .filter_map(|item| {
-                let clean_decl = item
-                    .decl_name
-                    .strip_prefix("_root_.")
-                    .unwrap_or(&item.decl_name);
-                let mut receipt_obj = serde_json::json!({
-                    "decl": clean_decl,
-                    "prefix_env_hash": item.prefix_env_hash,
-                    "stmt_hash": item.stmt_hash,
-                    "proof_hash": item.proof_hash,
-                    "verified_at": now,
-                    "scanner_version": crate::zygote::ZYGOTE_SCANNER_VERSION,
-                    "replay_version": crate::zygote::ZYGOTE_REPLAY_VERSION
-                });
-                if let Some(ref ad) = args_digest_opt {
-                    if let Some(map) = receipt_obj.as_object_mut() {
-                        map.insert(
-                            "lean_args_digest".to_string(),
-                            serde_json::Value::String(ad.clone()),
-                        );
-                    }
-                }
-                if let Some(ref kth) = item.expected_kernel_type_hash {
-                    if let Some(map) = receipt_obj.as_object_mut() {
-                        map.insert(
-                            "kernel_type_hash".to_string(),
-                            serde_json::Value::String(kth.clone()),
-                        );
-                    }
-                }
-                let receipt = serde_json::to_vec(&receipt_obj).ok()?;
-                Some((
-                    item.shard_key.clone(),
-                    clean_decl.to_string(),
-                    receipt,
-                    dur_ms,
-                ))
-            })
-            .collect()
-    };
-    let mut publish_items = Vec::new();
-    let mut inflight_tx_begun = false;
-    let resp_res = http_request_with_inflight("POST", &url, "application/json", &body, || {
-        if !items.is_empty() {
-            publish_items = build_publish_items(1);
-            if publish_items.len() == items.len()
-                && store
-                    .begin_inflight_publish_theorem_shards(tc, td, &publish_items)
-                    .is_ok()
-            {
-                inflight_tx_begun = true;
-            }
-        }
-    });
-    let resp_bytes = match resp_res {
-        Ok(b) => b,
-        Err(e) => {
-            if inflight_tx_begun {
-                store.rollback_inflight_publish();
-            }
-            return Err(e);
-        }
-    };
-    let resp: CheckShardsBatchResponse = match serde_json::from_slice(&resp_bytes) {
-        Ok(r) => r,
-        Err(e) => {
-            if inflight_tx_begun {
-                store.rollback_inflight_publish();
-            }
-            return Err(e.into());
-        }
-    };
+    let resp_bytes = http_request("POST", &url, "application/json", &serde_json::to_vec(&req)?)?;
+    let resp: CheckShardsBatchResponse = serde_json::from_slice(&resp_bytes)?;
 
     if resp.ok {
         let expected_types: Vec<(String, String)> = items
             .iter()
-            .filter_map(|item| {
-                item.expected_kernel_type_hash
+            .filter_map(|i| {
+                i.expected_kernel_type_hash
                     .as_ref()
-                    .map(|kth| (item.decl_name.clone(), kth.clone()))
+                    .map(|k| (i.decl_name.clone(), k.clone()))
             })
             .collect();
         if !expected_types.is_empty() {
-            if let Err(e) = crate::zygote::verify_attested_decl_types(
-                &resp.verified_decl_types,
-                &expected_types,
-            ) {
-                if inflight_tx_begun {
-                    store.rollback_inflight_publish();
-                }
-                return Err(e.context(format!(
+            crate::zygote::verify_attested_decl_types(&resp.verified_decl_types, &expected_types)
+                .with_context(|| {
+                format!(
                     "Remote batch coordinator `{url}` did not attest expected kernel statement types"
-                )));
+                )
+            })?;
+        }
+        if !items.is_empty() && !resp.verified_decl_types.is_empty() {
+            let now = now_unix();
+            let per_shard_ms = ((resp.elapsed_ms as i64) / (items.len() as i64).max(1)).max(1);
+            let publish_items: Vec<_> = items
+                .iter()
+                .filter_map(|item| {
+                    let clean_decl = crate::splitter::canonicalize_lean_name(&item.decl_name);
+                    if clean_decl.is_empty() {
+                        return None;
+                    }
+                    let kth = match item.expected_kernel_type_hash.as_ref() {
+                        Some(exp) => exp.clone(),
+                        None => {
+                            let mut m = resp
+                                .verified_decl_types
+                                .iter()
+                                .filter(|(got, _)| {
+                                    crate::splitter::matches_attested_decl_or_fast_verify(
+                                        got,
+                                        &item.decl_name,
+                                    )
+                                })
+                                .map(|(_, h)| h);
+                            let first = m.next()?;
+                            if first.is_empty() || !m.all(|h| h == first) {
+                                return None;
+                            }
+                            first.clone()
+                        }
+                    };
+                    crate::zygote::verify_attested_decl_types(
+                        &resp.verified_decl_types,
+                        &[(item.decl_name.clone(), kth.clone())],
+                    )
+                    .ok()?;
+                    let mut receipt_obj = serde_json::json!({
+                        "decl": clean_decl,
+                        "kernel_type_hash": kth,
+                        "verified_at": now,
+                        "scanner_version": crate::zygote::ZYGOTE_SCANNER_VERSION,
+                        "replay_version": crate::zygote::ZYGOTE_REPLAY_VERSION
+                    });
+                    if let Some((ad, map)) =
+                        args_digest_opt.as_ref().zip(receipt_obj.as_object_mut())
+                    {
+                        map.insert("lean_args_digest".into(), ad.clone().into());
+                    }
+                    Some((
+                        client_attested_receipt_key(&item.shard_key),
+                        clean_decl,
+                        serde_json::to_vec(&receipt_obj).ok()?,
+                        per_shard_ms,
+                    ))
+                })
+                .collect();
+            if !publish_items.is_empty() {
+                store.batch_publish_theorem_shards(tc, td, &publish_items)?;
             }
         }
-    }
-
-    if resp.ok && !items.is_empty() {
-        if inflight_tx_begun {
-            store.commit_inflight_publish()?;
-        } else {
-            let per_shard_ms = ((resp.elapsed_ms as i64) / (items.len() as i64).max(1)).max(1);
-            publish_items = build_publish_items(per_shard_ms);
-            store.batch_publish_theorem_shards(tc, td, &publish_items)?;
-        }
-    } else if inflight_tx_begun {
-        store.rollback_inflight_publish();
     }
 
     Ok(resp)
@@ -5522,12 +5494,31 @@ pub(crate) mod tests {
             "batch_shard_key_1".to_string(),
             "batch_shard_key_2".to_string(),
         ];
-        assert_eq!(
+        assert!(
             store_client
                 .batch_get_theorem_shards(&both_keys, "trusted")?
-                .len(),
-            2
+                .is_empty(),
+            "raw unattested caller shard keys must never be published locally"
         );
+        let attested_keys: Vec<String> = both_keys
+            .iter()
+            .map(|k| client_attested_receipt_key(k))
+            .collect();
+        let client1_hits = store_client.batch_get_theorem_shards(&attested_keys, "trusted")?;
+        assert_eq!(client1_hits.len(), 2);
+        for k in &attested_keys {
+            let entries = store_client
+                .get_cached_action_no_hit_bump(k, "trusted")?
+                .expect("attested receipt entry");
+            let raw = store_client
+                .read_verified_blob(&entries[0].blob_hash)
+                .expect("verified receipt blob");
+            let val: serde_json::Value = serde_json::from_slice(&raw)?;
+            assert!(val.get("prefix_env_hash").is_none());
+            assert!(val.get("stmt_hash").is_none());
+            assert!(val.get("proof_hash").is_none());
+            assert!(val["kernel_type_hash"].as_str().is_some());
+        }
 
         let dir_client2 =
             std::env::temp_dir().join(format!("turbo_lean_batch_shard_cli2_{}", next_tmp_id()));
@@ -5546,9 +5537,12 @@ pub(crate) mod tests {
         assert!(
             resp2.ok && resp2.verified_count == 0 && resp2.cache_hits == 2 && resp2.exit_code == 0
         );
+        assert!(store_client2
+            .batch_get_theorem_shards(&both_keys, "trusted")?
+            .is_empty());
         assert_eq!(
             store_client2
-                .batch_get_theorem_shards(&both_keys, "trusted")?
+                .batch_get_theorem_shards(&attested_keys, "trusted")?
                 .len(),
             2
         );
@@ -5603,16 +5597,18 @@ pub(crate) mod tests {
         let fake_addr = fake_listener.local_addr()?;
         let fake_handle = std::thread::spawn(move || {
             use std::io::{Read, Write};
-            if let Ok((mut sock, _)) = fake_listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = sock.read(&mut buf);
-                let body = r#"{"ok":true,"verified_count":1,"cache_hits":0,"elapsed_ms":1.0,"exit_code":0,"stdout":"","stderr":"","error":null}"#;
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = sock.write_all(resp.as_bytes());
+            for _ in 0..2 {
+                if let Ok((mut sock, _)) = fake_listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf);
+                    let body = r#"{"ok":true,"verified_count":1,"cache_hits":0,"elapsed_ms":1.0,"exit_code":0,"stdout":"","stderr":"","error":null}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes());
+                }
             }
         });
         let unattested_items = vec![CheckShardBatchItem {
@@ -5634,16 +5630,54 @@ pub(crate) mod tests {
             &[],
         )
         .unwrap_err();
-        let _ = fake_handle.join();
         assert!(
             format!("{err:#}").contains("did not attest expected kernel statement types"),
             "unexpected error: {err:#}"
         );
         assert!(
             store_client
-                .batch_get_theorem_shards(&["unattested_remote_key".to_string()], "trusted")?
+                .batch_get_theorem_shards(
+                    &[
+                        "unattested_remote_key".to_string(),
+                        client_attested_receipt_key("unattested_remote_key"),
+                    ],
+                    "trusted"
+                )?
                 .is_empty(),
-            "local CAS must roll back inflight publish when remote coordinator omits verified_decl_types"
+            "local CAS must not publish when remote coordinator omits verified_decl_types"
+        );
+
+        let unpinned_unattested_items = vec![CheckShardBatchItem {
+            shard_key: "unattested_unpinned_key".into(),
+            decl_name: "Ns.thm".into(),
+            prefix_env_hash: "forged_prefix".into(),
+            stmt_hash: "forged_stmt".into(),
+            proof_hash: "forged_proof".into(),
+            expected_kernel_type_hash: None,
+        }];
+        let unpinned_resp = offload_check_shards_batch_http(
+            &mut store_client,
+            &format!("http://{fake_addr}"),
+            &unpinned_unattested_items,
+            "namespace Ns\ntheorem thm : 2 + 2 = 4 := rfl\nend Ns\n",
+            "trusted",
+            include_str!("../../../lean/lean-toolchain").trim(),
+            "",
+            &[],
+        )?;
+        let _ = fake_handle.join();
+        assert!(unpinned_resp.ok);
+        assert!(
+            store_client
+                .batch_get_theorem_shards(
+                    &[
+                        "unattested_unpinned_key".to_string(),
+                        client_attested_receipt_key("unattested_unpinned_key"),
+                    ],
+                    "trusted"
+                )?
+                .is_empty(),
+            "unattested ok response without verified_decl_types must never cache caller hashes"
         );
 
         // 2) Real coordinator returns `verified_decl_types` for namespaced declarations on both cold verify and warm cache hit.
@@ -5691,8 +5725,11 @@ pub(crate) mod tests {
             &[],
         )?;
         assert!(cold_att.ok && cold_att.verified_count == 1);
+        assert!(store_client
+            .batch_get_theorem_shards(&["real_ns_attested".to_string()], "trusted")?
+            .is_empty());
         assert!(store_client.has_attested_decl_receipt(
-            "real_ns_attested",
+            &client_attested_receipt_key("real_ns_attested"),
             "trusted",
             "Ns.thm",
             &real_kth
@@ -5713,6 +5750,41 @@ pub(crate) mod tests {
         )?;
         assert!(warm_att.ok && warm_att.cache_hits == 1);
         assert_eq!(warm_att.verified_decl_types.get("Ns.thm"), Some(&real_kth));
+        assert!(store_client2.has_attested_decl_receipt(
+            &client_attested_receipt_key("real_ns_attested"),
+            "trusted",
+            "Ns.thm",
+            &real_kth
+        ));
+
+        let mismatched_items = vec![CheckShardBatchItem {
+            shard_key: "real_ns_mismatched".into(),
+            decl_name: "Ns.thm".into(),
+            prefix_env_hash: "p".into(),
+            stmt_hash: "s".into(),
+            proof_hash: "pr".into(),
+            expected_kernel_type_hash: Some("0".repeat(64)),
+        }];
+        let mismatched_resp = offload_check_shards_batch_http(
+            &mut store_client2,
+            &endpoint,
+            &mismatched_items,
+            ns_src,
+            "trusted",
+            include_str!("../../../lean/lean-toolchain").trim(),
+            "",
+            &[],
+        )?;
+        assert!(!mismatched_resp.ok);
+        assert!(store_client2
+            .batch_get_theorem_shards(
+                &[
+                    "real_ns_mismatched".to_string(),
+                    client_attested_receipt_key("real_ns_mismatched"),
+                ],
+                "trusted"
+            )?
+            .is_empty());
 
         std::env::remove_var("TURBO_LEAN_API_TOKEN");
         for d in [&dir_server, &dir_client, &dir_client2] {
