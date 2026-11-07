@@ -21252,7 +21252,7 @@ pub(crate) fn verify_imported_package_module_source_hygiene(
         hygiene.disallowed_items_under(allowed_axioms)
     );
     anyhow::ensure!(
-        !hygiene.native_violation_under(allowed_axioms),
+        is_git_pinned_dep || !hygiene.native_violation_under(allowed_axioms),
         "[TurboLean.KernelGate] native_decide/bv_decide in imported module `{mod_name}` ({}) is not admitted by the project's axiom allowlist",
         spec.src_path.display()
     );
@@ -40869,6 +40869,171 @@ end Fixture
             format!("{audit_err:#}").contains("audit")
                 || format!("{audit_err:#}").contains("csimp"),
             "unexpected error: {audit_err:#}"
+        );
+
+        crate::zygote::purge_snapshot_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_git_pinned_dep_unused_native_decide_allowed_but_used_rejected() -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("git_pinned_dep_native_decide_hygiene");
+        let dep_origin = dir.join("dep_origin");
+        let proj = dir.join("proj");
+        let dep = proj.join(".lake/packages/dep_bv");
+        let store_dir = dir.join("store");
+        fs::create_dir_all(dep_origin.join("DepBv"))?;
+        fs::create_dir_all(proj.join("App"))?;
+        let tc = "leanprover/lean4:v4.35.0\n";
+        fs::write(dep_origin.join("lean-toolchain"), tc)?;
+        fs::write(proj.join("lean-toolchain"), tc)?;
+        fs::write(
+            dep_origin.join("lakefile.toml"),
+            "name = \"dep_bv\"\ndefaultTargets = [\"DepBv\"]\n[[lean_lib]]\nname = \"DepBv\"\n",
+        )?;
+        fs::write(
+            dep_origin.join("DepBv/Bridge.lean"),
+            "def safeVal : Nat := 7\ntheorem unused_native : 1 + 1 = 2 := by native_decide\n",
+        )?;
+        fs::write(dep_origin.join("DepBv.lean"), "import DepBv.Bridge\n")?;
+        let git_bin = std::env::var_os("TURBO_LEAN_GIT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("git"));
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@e.com"],
+            vec!["config", "user.name", "T"],
+            vec!["add", "."],
+            vec!["commit", "-m", "init"],
+        ] {
+            let st = Command::new(&git_bin)
+                .args(&args)
+                .current_dir(&dep_origin)
+                .status()?;
+            anyhow::ensure!(st.success(), "git init dep_origin failed on {args:?}");
+        }
+        let rev_out = Command::new(&git_bin)
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&dep_origin)
+            .output()?;
+        anyhow::ensure!(rev_out.status.success());
+        let rev = String::from_utf8(rev_out.stdout)?.trim().to_string();
+        fs::create_dir_all(dep.parent().unwrap())?;
+        let clone_st = Command::new(&git_bin)
+            .args(["clone", "--quiet"])
+            .arg(&dep_origin)
+            .arg(&dep)
+            .status()?;
+        anyhow::ensure!(clone_st.success(), "git clone dep_origin failed");
+        fs::write(
+            proj.join("lakefile.toml"),
+            format!(
+                "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep_bv\"\ngit = {:?}\nrev = {:?}\n[[lean_lib]]\nname = \"App\"\n",
+                dep_origin.to_string_lossy(),
+                rev
+            ),
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [{
+                    "type": "git",
+                    "scope": "",
+                    "name": "dep_bv",
+                    "manifestFile": "lake-manifest.json",
+                    "rev": rev,
+                    "inherited": false,
+                    "configFile": "lakefile.toml",
+                    "inputRev": rev,
+                    "url": dep_origin.to_string_lossy()
+                }]
+            })
+            .to_string(),
+        )?;
+        let mut ctor_lines =
+            String::from("inductive BigExpr where\n  | leaf (n : Nat)\n  | rec1 (a b : BigExpr)\n");
+        for idx in 0..72 {
+            ctor_lines.push_str(&format!("  | op{idx} (a b : BigExpr)\n"));
+        }
+        let mut match_lines = String::from(
+            "private def walkBig (e : BigExpr) : List Nat :=\n  match e with\n  | .leaf n => [n]\n  | .rec1 a b => walkBig a ++ walkBig b\n",
+        );
+        for idx in 0..72 {
+            match_lines.push_str(&format!(
+                "  | .op{idx} a b => {idx} :: (walkBig a ++ walkBig b)\n"
+            ));
+        }
+        match_lines.push_str("termination_by sizeOf e\n");
+        let safe_src = format!(
+            "import DepBv.Bridge\n{ctor_lines}{match_lines}theorem root_safe : safeVal = 7 ∧ walkBig (.leaf 3) = walkBig (.leaf 3) := ⟨rfl, rfl⟩\n"
+        );
+        fs::write(proj.join("App/Safe.lean"), &safe_src)?;
+        fs::write(proj.join("App.lean"), "import App.Safe\n")?;
+
+        let mut store = TurboStore::open(Some(&store_dir))?;
+        let canon = fs::canonicalize(&proj)?;
+        let mut file_hashes = std::collections::BTreeMap::new();
+        for (rel, body) in [
+            ("App/Safe.lean", safe_src.as_str()),
+            ("App.lean", "import App.Safe\n"),
+        ] {
+            file_hashes.insert(
+                rel.to_string(),
+                blake3::hash(body.as_bytes()).to_hex().to_string(),
+            );
+        }
+        build_project_modules_native(
+            &mut store,
+            &canon,
+            &[],
+            "trusted",
+            1,
+            false,
+            true,
+            Some(&file_hashes),
+        )?;
+        crate::lake_build::ensure_project_and_imported_oleans_replayed_in_store(
+            &store,
+            &canon,
+            &file_hashes,
+        )?;
+        ensure_imported_oleans_replayed_with_roots(
+            &store,
+            &canon,
+            &[canon.join("App/Safe.lean")],
+            &[String::from("App.Safe")],
+        )?;
+
+        let bad_src =
+            "import DepBv.Bridge\ntheorem root_uses_native : 1 + 1 = 2 := unused_native\n";
+        fs::write(proj.join("App/Safe.lean"), bad_src)?;
+        file_hashes.insert(
+            "App/Safe.lean".to_string(),
+            blake3::hash(bad_src.as_bytes()).to_hex().to_string(),
+        );
+        let bad_err = build_project_modules_native(
+            &mut store,
+            &canon,
+            &[],
+            "trusted",
+            1,
+            false,
+            true,
+            Some(&file_hashes),
+        )
+        .expect_err(
+            "root theorem referencing native_decide theorem in git-pinned dep must fail KernelGate",
+        );
+        assert!(
+            format!("{bad_err:#}").contains("Lean.ofReduceBool")
+                || format!("{bad_err:#}").contains("Lean.trustCompiler")
+                || format!("{bad_err:#}").contains("KernelGate")
+                || format!("{bad_err:#}").contains("disallowed axiom"),
+            "unexpected error when referencing git-pinned native_decide theorem: {bad_err:#}"
         );
 
         crate::zygote::purge_snapshot_dir(&dir);

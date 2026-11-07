@@ -682,7 +682,24 @@ def auditSplitMatchOrCasesOn (mvarId : MVarId) (e : Expr) (matcherInfo : Meta.Ma
     let subgoals ← mvarId.cases discr.fvarId!
     return subgoals.map (·.mvarId) |>.toList
 
+def existingAuditMatchArgPusher? (matcherName : Name) : MetaM (Option Name) := do
+  let env ← getEnv
+  let userMatcher := privateToUserName matcherName
+  let candidates : Array Name :=
+    match env.getModuleIdxFor? matcherName with
+    | some idx =>
+      match env.header.moduleNames[idx.toNat]? with
+      | some modName => #[mkPrivateNameCore modName userMatcher ++ `_arg_pusher, mkPrivateName env matcherName ++ `_arg_pusher]
+      | none => #[mkPrivateName env matcherName ++ `_arg_pusher]
+    | none => #[mkPrivateName env matcherName ++ `_arg_pusher]
+  for cand in candidates do
+    if let some (.thmInfo _) := env.find? cand then
+      return some cand
+  return none
+
 def mkAuditMatchArgPusher (matcherName : Name) (matcherInfo : Meta.MatcherInfo) : MetaM Name := do
+  if let some existing ← existingAuditMatchArgPusher? matcherName then
+    return existing
   let name ← mkFreshUserName `_recAuditArgPusher
   let matcherVal ← getConstVal matcherName
   Meta.forallBoundedTelescope matcherVal.type (some (matcherInfo.numParams + 1)) fun xs _ => do
@@ -1069,7 +1086,7 @@ partial def isCompilerPartialRecDefn (env : Environment) (hydratedEnvRef : IO.Re
       let hEnv := hydrateRecAuditEnv env
       hydratedEnvRef.set (some hEnv)
       pure hEnv
-  let opts := maxHeartbeats.set {} 2000000
+  let opts := maxHeartbeats.set {} 8000000
   let ok ← try
     let (res, _) ← (Meta.MetaM.run' (withCurrHeartbeats <| checkRecursionCliqueMeta patterns beforeMap modIdx? peers opaqueStub allowSorry)).toIO
       { fileName := "<recursion-audit>", fileMap := default, options := opts,
