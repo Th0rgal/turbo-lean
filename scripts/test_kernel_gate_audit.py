@@ -432,9 +432,9 @@ class KernelGateAudit(unittest.TestCase):
             "theorem modulus_pos : 0 < 256 := sorry\n"
             "def modWrap (n : Nat) : Fin 256 := ⟨n % 256, Nat.mod_lt n modulus_pos⟩\n"
             "def powBySquaring (b e : Fin 256) : Fin 256 :=\n"
-            "  if h : e.val == 0 then modWrap 1\n"
-            "  else have : e.val / 2 < e.val := Nat.div_lt_self (by omega) (by decide)\n"
-            "       powBySquaring (modWrap (b.val * b.val)) ⟨e.val / 2, by omega⟩\n"
+            "  if h : e.val = 0 then modWrap 1\n"
+            "  else have : e.val / 2 < e.val := Nat.div_lt_self (Nat.pos_of_ne_zero h) (by decide)\n"
+            "       powBySquaring (modWrap (b.val * b.val)) ⟨e.val / 2, Nat.lt_trans this e.isLt⟩\n"
             "termination_by e.val\n"
             "theorem target_thm : (modWrap 1).val = 1 := rfl\n"
         )

@@ -3910,10 +3910,10 @@ def main (args : List String) : IO Unit := do
         if isBatchFission then
           let (bOk, bElabUs, bHbs, bNodes, bVer, bOut, bMsgs, bErrs, bUsed, bDeclTypes) ←
             TurboLean.ZygoteWorker.runBatchFissionSubs hexSubs (fun sc => do
-              let (ok, us, hbs, nodes, errs, msgs, outS, used, dts, _) ←
-                TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (combineWithPref sc) allowStub false fn none encodedLeanArgs stubTargets stubs
-                  (requiredTargets := some []) (fastMap := fastMap)
-              pure (ok, us, hbs, nodes, errs, msgs, outS, used, dts))
+                let (ok, us, hbs, nodes, errs, msgs, outS, used, dts, _) ←
+                  TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (combineWithPref sc) allowStub false fn none encodedLeanArgs stubTargets stubs
+                    (requiredTargets := some []) (fastMap := fastMap) (allowSorry := allowSorry)
+                pure (ok, us, hbs, nodes, errs, msgs, outS, used, dts))
           if !bOk && bErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
           TurboLean.ZygoteWorker.emitZygoteReply stdout bOk none kgActive true envCacheHit false importUs 0 bElabUs bHbs bNodes bVer bOut bMsgs bErrs bUsed bDeclTypes
         else if isRaceCandidates then
@@ -3925,7 +3925,7 @@ def main (args : List String) : IO Unit := do
             else
               let (ok, us, hbs, nodes, errs, msgs, outS, used, dts, _) ←
                 TurboLean.ZygoteWorker.checkShardWithEnv baseEnv (combineWithPref cc) allowStub false fn none encodedLeanArgs stubTargets stubs
-                  (requiredTargets := some []) (fastMap := fastMap)
+                  (requiredTargets := some []) (fastMap := fastMap) (allowSorry := allowSorry)
               pure (ok, us, hbs, nodes, errs, msgs, outS, used, dts)
           let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed, rDeclTypes) ←
             TurboLean.ZygoteWorker.runRaceCandidatesSubs hexSubs evalRaceOnBase false (some evalRaceOnBase)
@@ -4064,7 +4064,7 @@ def main (args : List String) : IO Unit := do
           let evalFromCkpt := fun (sc : String) => do
             let (ok, us, hbs, nodes, errs, msgs, outS, used, dts, _, _) ←
               TurboLean.ZygoteWorker.runCommandsFromState ckptState sc fn allowStub false stubTargets stubs
-                (strictPrefix := !allowStub) (requiredTargets := some []) (fastMap := fastMap)
+                (strictPrefix := !allowStub) (requiredTargets := some []) (fastMap := fastMap) (allowSorry := allowSorry)
             pure (ok, us, hbs, nodes, errs, msgs, outS, used, dts)
           if isBatchFission then
             if hexSubs.isEmpty then
@@ -4089,7 +4089,7 @@ def main (args : List String) : IO Unit := do
                   let combined := if prefixCode.endsWith "\n" then prefixCode ++ sc else prefixCode ++ "\n" ++ sc
                   let (ok, us, hbs, nodes, errs, msgs, outS, used, dts, _) ←
                     TurboLean.ZygoteWorker.checkShardWithEnv baseEnv combined allowStub false fn none encodedLeanArgs stubTargets stubs
-                      (requiredTargets := some []) (fastMap := fastMap)
+                      (requiredTargets := some []) (fastMap := fastMap) (allowSorry := allowSorry)
                   pure (ok, us, hbs, nodes, errs, msgs, outS, used, dts)
               let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed, rDeclTypes) ←
                 TurboLean.ZygoteWorker.runRaceCandidatesSubs hexSubs evalFromCkpt false (some evalCandForkFromBase)
