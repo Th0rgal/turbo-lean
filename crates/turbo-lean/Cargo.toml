@@ -23,3 +23,7 @@ sha2 = "0.10"
 toml = "0.8"
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 walkdir = "2.5"
+
+[build-dependencies]
+blake3 = "1.5"
+

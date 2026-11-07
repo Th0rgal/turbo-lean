@@ -43,6 +43,15 @@ pub use gpu_fastcheck::*;
 pub use lake_build::*;
 pub use pr_verify::*;
 
+/// Deterministic BLAKE3 digest of all Rust sources, Lean specs/workers, and compiled C-ABI inputs
+/// baked at build time by `crates/turbo-lean/build.rs`.
+pub const TURBO_LEAN_BUILD_EPOCH: &str = env!("TURBO_LEAN_BUILD_EPOCH");
+
+/// Fixed-width 16-hex prefix of [`TURBO_LEAN_BUILD_EPOCH`] for compact `/dev/shm` and filename tags.
+pub fn build_epoch_short() -> &'static str {
+    &TURBO_LEAN_BUILD_EPOCH[..16]
+}
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use db::TurboStore;
@@ -1231,12 +1240,7 @@ fn run(cli: Cli) -> Result<()> {
                 .filter(|s| !s.trim().is_empty())
                 .is_some();
         if !has_expected_sha {
-            if db_warm_on_open
-                || resolved_cache_root
-                    .join("locks")
-                    .join("last_import_stamp")
-                    .exists()
-            {
+            if db_warm_on_open {
                 if let Some(counts) = pack::try_stateless_warm_import_with_domain(
                     &resolved_cache_root,
                     input,
@@ -1321,11 +1325,7 @@ fn run(cli: Cli) -> Result<()> {
             let base = remote.trim_end_matches('/').to_string();
             if !push
                 && !has_strict_pull_policy
-                && (db_warm_on_open
-                    || resolved_cache_root
-                        .join("locks")
-                        .join("cached_portable_manifest.json")
-                        .exists())
+                && db_warm_on_open
                 && pack::try_stateless_noop_pull_sync(&resolved_cache_root, &base)
             {
                 if cli.json {

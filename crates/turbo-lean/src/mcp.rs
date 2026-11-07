@@ -1655,7 +1655,16 @@ pub fn execute_mcp_audit_spec(
     project_dir: Option<&Path>,
 ) -> serde_json::Value {
     let t0 = Instant::now();
-    if file.as_os_str().is_empty() || !file.exists() {
+    let resolved_file = if !file.as_os_str().is_empty() && file.is_relative() && !file.exists() {
+        project_dir
+            .filter(|pd| !pd.as_os_str().is_empty())
+            .map(|pd| pd.join(file))
+            .filter(|cand| cand.exists())
+            .unwrap_or_else(|| file.to_path_buf())
+    } else {
+        file.to_path_buf()
+    };
+    if resolved_file.as_os_str().is_empty() || !resolved_file.exists() {
         let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
         return serde_json::json!({
             "status": "error",
@@ -1668,13 +1677,18 @@ pub fn execute_mcp_audit_spec(
             "ms": elapsed_ms,
         });
     }
-    let val = crate::gpu_fastcheck::audit_spec_file_or_source(file, None, decl);
+    let val = crate::gpu_fastcheck::audit_spec_file_or_source_in_project(
+        &resolved_file,
+        None,
+        decl,
+        project_dir,
+    );
     let elapsed_ms = (t0.elapsed().as_secs_f64() * 1000.0 * 1000.0).round() / 1000.0;
     record_agent_call_telemetry(AgentCallTelemetry {
         tool_name: "turbo_audit_spec".to_string(),
         project_dir: Some(
             project_dir
-                .or_else(|| file.parent().filter(|p| !p.as_os_str().is_empty()))
+                .or_else(|| resolved_file.parent().filter(|p| !p.as_os_str().is_empty()))
                 .unwrap_or_else(|| Path::new("."))
                 .to_path_buf(),
         ),
@@ -2665,5 +2679,109 @@ mod tests {
         let compact = verdict.to_compact_json();
         assert_eq!(compact["ok"], true);
         assert_eq!(compact["fast_tactic"], "by simp only [eligible, Eligible]");
+    }
+
+    #[test]
+    fn test_mcp_audit_spec_resolves_project_dir_policy_fail_closed() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "turbo_mcp_audit_spec_proj_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let proj = root.join("proj");
+        let ext = root.join("external_specs");
+        fs::create_dir_all(proj.join("Specs")).unwrap();
+        fs::create_dir_all(&ext).unwrap();
+
+        let spec_src = "namespace ForbiddenNs\ntheorem ok_spec (n : Nat) (h : n > 0) : n >= 1 := by omega\nend ForbiddenNs\n";
+        fs::write(proj.join("Specs/Probe.lean"), spec_src).unwrap();
+        let ext_file = ext.join("ExternalProbe.lean");
+        fs::write(&ext_file, spec_src).unwrap();
+
+        // 1. Relative file path resolves against `project_dir` and honours `[audit_spec]` config.
+        fs::write(
+            proj.join("turbo-lean.toml"),
+            "[audit_spec]\nforbid_namespaces = [\"ForbiddenNs\"]\n",
+        )
+        .unwrap();
+        let ok_rel = handle_mcp_jsonrpc_request(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 91,
+                "method": "tools/call",
+                "params": {
+                    "name": "turbo_audit_spec",
+                    "arguments": {
+                        "file": "Specs/Probe.lean"
+                    }
+                }
+            }),
+            Some(&proj),
+            Some(&root.join(".cache")),
+        )
+        .unwrap();
+        let parsed_rel: serde_json::Value =
+            serde_json::from_str(ok_rel["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed_rel["ok"], false, "{parsed_rel}");
+        assert!(
+            parsed_rel["forbidden_scope_decls"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty()),
+            "relative file must pick up forbid_namespaces from project_dir: {parsed_rel}"
+        );
+
+        // 2. External file outside `project_dir` falls back to `project_dir/turbo-lean.toml` policy.
+        let ok_ext = handle_mcp_jsonrpc_request(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 92,
+                "method": "tools/call",
+                "params": {
+                    "name": "turbo_audit_spec",
+                    "arguments": {
+                        "file": ext_file.to_string_lossy()
+                    }
+                }
+            }),
+            Some(&proj),
+            Some(&root.join(".cache")),
+        )
+        .unwrap();
+        let parsed_ext: serde_json::Value =
+            serde_json::from_str(ok_ext["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed_ext["ok"], false, "{parsed_ext}");
+        assert!(
+            parsed_ext["forbidden_scope_decls"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty()),
+            "external file must inherit project_dir/turbo-lean.toml policy: {parsed_ext}"
+        );
+
+        // 3. Malformed `project_dir/turbo-lean.toml` fails closed even for external `file`.
+        fs::write(proj.join("turbo-lean.toml"), "[audit_spec\nbroken =").unwrap();
+        let bad_cfg = handle_mcp_jsonrpc_request(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 93,
+                "method": "tools/call",
+                "params": {
+                    "name": "turbo_audit_spec",
+                    "arguments": {
+                        "file": ext_file.to_string_lossy()
+                    }
+                }
+            }),
+            Some(&proj),
+            Some(&root.join(".cache")),
+        )
+        .unwrap();
+        assert_eq!(
+            bad_cfg["result"]["isError"], true,
+            "malformed project_dir/turbo-lean.toml must fail closed: {bad_cfg}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }
