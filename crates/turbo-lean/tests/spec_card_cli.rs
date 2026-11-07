@@ -1220,3 +1220,151 @@ public def helper : Type :=
     assert_eq!(err_report["analysis_tier"], "source_syntactic");
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn spec_card_scalar_and_env_bypasses_fail_closed() {
+    let dir = fixture("scalar_env_bypasses");
+
+    let multiline_prop = write_spec(
+        &dir,
+        "MultilinePropDef.lean",
+        r#"def bounded
+    (n : Nat) : Prop :=
+  n < 2
+
+theorem still_tight (n : Nat) (h : bounded n) : n = 0 ∨ n = 1 := by
+  unfold bounded at h
+  omega
+"#,
+    );
+    let mp_out = run(&["--json", "spec-card", multiline_prop.to_str().unwrap()]);
+    let mp_report: Value = serde_json::from_str(&String::from_utf8_lossy(&mp_out.stdout)).unwrap();
+    assert!(mp_out.status.success(), "{mp_report}");
+    assert_eq!(mp_report["ok"], true, "{mp_report}");
+    assert_eq!(mp_report["cards"][0]["verdict"], "TIGHT", "{mp_report}");
+    assert_eq!(
+        mp_report["cards"][0]["contract"]["extraction_complete"], true,
+        "{mp_report}"
+    );
+
+    for (name, src) in [
+        (
+            "LocalLtInstance.lean",
+            r#"local instance : LT Nat where
+  lt _ _ := False
+
+theorem exploit_local_lt_instance (n : Nat) (h : n < 2) : False := h
+"#,
+        ),
+        (
+            "AttrInstance.lean",
+            r#"@[instance] def badLt : LT Nat where
+  lt _ _ := False
+
+theorem exploit_attr_instance (n : Nat) (h : n < 2) : False := h
+"#,
+        ),
+        (
+            "NonExecDomains.lean",
+            r#"local instance : OfNat (Fin 1) 1 where
+  ofNat := ⟨0, by decide⟩
+
+theorem exploit_fin_ofnat : (0 : Fin 1) = 1 := rfl
+
+theorem exploit_tuple_eq (h : (0, 1) = (0, 2)) : False := by
+  cases h
+
+theorem exploit_nat_pow (h : 0 ^ 0 = 0) : False := by
+  cases h
+
+theorem exploit_generic_beq {α : Type} [BEq α] (x : α) (h1 : (x == x) = true) (h2 : (x == x) = false) : False := by
+  rw [h1] at h2
+  cases h2
+"#,
+        ),
+        (
+            "NsPropShadow.lean",
+            r#"def P (n : Nat) : Prop := n < 2
+
+namespace Evil
+
+inductive P (n : Nat) : Prop where
+
+theorem exploit_ns_prop_shadow (n : Nat) (h : P n) : False := by
+  cases h
+
+end Evil
+"#,
+        ),
+        (
+            "ScalarWitnessGaps.lean",
+            r#"def Pu8 (x : UInt8) : Prop := x < 256
+
+def m : UInt8 := 0
+def Pcap (n : Nat) : Prop := n < 2 ∧ m < 256
+
+def Pseq (a b : Nat) : Prop := a + b = 10
+
+theorem exploit_poly_vac {α : Type} [BEq α] [LawfulBEq α] (_x : α) (n : Nat) (h1 : n < 2) (h2 : n > 5) : n = 999 := by
+  omega
+
+theorem exploit_taut_disj (n : Nat) (_h : n < 2) : n = 0 ∨ n ≥ 1 := by
+  omega
+
+theorem exploit_bool_taut_disj (b : Bool) (n : Nat) (_h : n < 2) : b = true ∨ b = false := by
+  cases b <;> simp
+
+theorem exploit_u8_poly_wrap {α : Type} [BEq α] [LawfulBEq α] (_y : α) (x : UInt8) (h : x < 256) : x = 99 ∨ x = 98 := by
+  have h0 : (256 : UInt8) = 0 := rfl
+  rw [h0] at h
+  exact False.elim (Nat.not_lt_zero x.toNat h)
+
+theorem exploit_u8_sub_vac {α : Type} [BEq α] [LawfulBEq α] (_y : α) (x : UInt8) (h1 : 0 - 1 = x) (h2 : x = 0) : x = 99 ∨ x = 98 := by
+  have h255 : (255 : UInt8) = x := h1
+  rw [h2] at h255
+  cases h255
+
+theorem exploit_let_int_neg (n : Nat) (_hn : n < 2) : let x : Int := 0 - 1; x = 0 → n = 999 :=
+  fun h => nomatch h
+
+theorem exploit_let_u8_wrap (n : Nat) (_hn : n < 2) : let x : UInt8 := 255; x + 1 > 0 → n = 999 :=
+  fun h => False.elim (by revert h; decide)
+
+theorem exploit_not_ge (n : Nat) (h : ¬ n ≥ 0) : n = 999 := by
+  omega
+
+theorem exploit_or_hyp (n : Nat) (h : n < 0 ∨ n > n) : n = 999 := by
+  omega
+
+theorem exploit_prop_def_u8 (n : Nat) (_hn : n < 2) (h : Pu8 0) : n = 999 := by
+  unfold Pu8 at h
+  exact False.elim (by revert h; decide)
+
+theorem exploit_capture (m : Nat) (_hm : m = 0) (n : Nat) (h : Pcap n) : n = 999 := by
+  unfold Pcap at h
+  exact False.elim (by have h2 := h.2; revert h2; decide)
+
+theorem exploit_seq_subst_poly {α : Type} [BEq α] [LawfulBEq α] (_y : α) (b : Nat) (h : Pseq b (b + 1)) : b = 999 := by
+  unfold Pseq at h
+  omega
+"#,
+        ),
+    ] {
+        let path = write_spec(&dir, name, src);
+        let out = run(&["--json", "spec-card", path.to_str().unwrap()]);
+        let report: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        assert!(!out.status.success(), "{name}: {report}");
+        assert_eq!(report["ok"], false, "{name}: {report}");
+        let cards = report["cards"].as_array().unwrap();
+        assert!(!cards.is_empty(), "{name}: {report}");
+        for card in cards {
+            assert_ne!(card["verdict"], "TIGHT", "{name}: {card}");
+            assert_eq!(
+                card["contract"]["extraction_complete"], false,
+                "{name}: {card}"
+            );
+        }
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}

@@ -1,13 +1,13 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use super::audit_spec::{
     audit_spec_file_or_source_with_policy, extract_all_lean_theorems, extract_local_def_unfoldings,
-    inline_stmt_let_bindings, replace_ident_boundary, AuditSpecPolicyConfig,
+    inline_stmt_let_bindings, AuditSpecPolicyConfig,
 };
 use super::{
     is_known_binder_value_type, split_top_level_colon, split_top_level_implications,
@@ -243,6 +243,7 @@ pub fn run_spec_card_command(
                 path,
                 local_defs: &local_defs,
                 prop_local_defs: &prop_local_defs,
+                defined_short_names: &scan.defined_short_names,
                 hygiene: &hygiene,
                 audit: &audit,
                 has_unmodeled_instance_env: scan.has_unmodeled_instance_env,
@@ -472,6 +473,7 @@ struct DeclExtra {
 
 struct DeclScan {
     extras: Vec<DeclExtra>,
+    defined_short_names: BTreeSet<String>,
     has_malformed_scope: bool,
     has_unmodeled_instance_env: bool,
     has_unmodeled_syntax_env: bool,
@@ -500,6 +502,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
     let mut context: Vec<Vec<String>> = vec![Vec::new()];
     let mut at_cmd_head = true;
     let mut pending_private = false;
+    let mut pending_local = false;
     let mut pending_public = false;
     let mut pending_meta = false;
     let mut pending_noncomputable = false;
@@ -512,6 +515,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
     let mut has_unmodeled_instance_env = false;
     let mut has_unmodeled_syntax_env = false;
     let mut has_shadowed_value_types = false;
+    let mut defined_short_names: BTreeSet<String> = BTreeSet::new();
     let mut out = Vec::new();
     while i < n {
         if let Some(end) = skip_any(&masked, &byte_offsets, i) {
@@ -521,6 +525,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
         if chars[i] == '\n' {
             if !at_cmd_head {
                 pending_private = false;
+                pending_local = false;
                 pending_public = false;
                 pending_meta = false;
                 pending_noncomputable = false;
@@ -549,6 +554,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
         }
         if at_cmd_head && chars[i] == '@' && i + 1 < n && chars[i + 1] == '[' {
             if pending_private
+                || pending_local
                 || pending_public
                 || pending_meta
                 || pending_noncomputable
@@ -602,6 +608,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                 has_unmodeled_syntax_env = true;
             }
             pending_private = false;
+            pending_local = false;
             pending_public = false;
             pending_meta = false;
             pending_noncomputable = false;
@@ -625,7 +632,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
         if at_cmd_head {
             let mut chained = false;
             let mut base_cmd_col: Option<usize> = None;
-            while let Some((after_in, kw, action)) = consume_in_command_prefix(
+            while let Some((after_in, kw, action, prefix_short)) = consume_in_command_prefix(
                 &masked,
                 &byte_offsets,
                 &chars,
@@ -633,6 +640,9 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                 base_cmd_col.unwrap_or_else(|| line_col(&chars, i)),
             ) {
                 chained = true;
+                if let Some(short) = prefix_short {
+                    defined_short_names.insert(short);
+                }
                 base_cmd_col.get_or_insert_with(|| line_col(&chars, i));
                 let prefix_allows_decl_mods = matches!(
                     kw,
@@ -652,6 +662,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                 ) || syntax_env_keyword(kw);
                 if !prefix_allows_decl_mods
                     && (pending_private
+                        || pending_local
                         || pending_public
                         || pending_meta
                         || pending_noncomputable
@@ -665,6 +676,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                     has_unmodeled_instance_env = true;
                 }
                 pending_private = false;
+                pending_local = false;
                 pending_public = false;
                 pending_meta = false;
                 pending_noncomputable = false;
@@ -698,6 +710,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
             if let Some(end) = skip_any_lexeme(&masked, &byte_offsets, i) {
                 at_cmd_head = false;
                 pending_private = false;
+                pending_local = false;
                 pending_public = false;
                 pending_meta = false;
                 pending_noncomputable = false;
@@ -718,6 +731,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
             }
             at_cmd_head = false;
             pending_private = false;
+            pending_local = false;
             pending_public = false;
             pending_meta = false;
             pending_noncomputable = false;
@@ -755,9 +769,11 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                     | "meta"
             )
         {
-            if word == "private" || word == "local" {
+            if word == "private" {
                 pending_private = true;
                 pending_public = false;
+            } else if word == "local" {
+                pending_local = true;
             } else if word == "public" {
                 if pending_meta || pending_noncomputable || pending_other_mod {
                     pending_malformed_prefix = true;
@@ -780,6 +796,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
         }
         let was_at_cmd_head = at_cmd_head;
         let decl_private = std::mem::replace(&mut pending_private, false);
+        let _decl_local = std::mem::replace(&mut pending_local, false);
         let decl_public = std::mem::replace(&mut pending_public, false);
         let decl_meta = std::mem::replace(&mut pending_meta, false);
         let decl_noncomputable = std::mem::replace(&mut pending_noncomputable, false);
@@ -1008,7 +1025,13 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                 if syntax_env_keyword(&word) {
                     has_unmodeled_syntax_env = true;
                 }
-                has_unmodeled_instance_env = true;
+                if word == "instance"
+                    || word == "deriving"
+                    || word == "notation"
+                    || syntax_env_keyword(&word)
+                {
+                    has_unmodeled_instance_env = true;
+                }
                 i = scan_command_body(
                     &masked,
                     &byte_offsets,
@@ -1053,15 +1076,27 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                     line_col(&chars, start),
                 );
                 let body: String = chars[body_start..i].iter().collect();
-                if RESERVED_INSTANCE_AND_TYPE_NAMES
+                let mentions_defined = defined_short_names
                     .iter()
-                    .any(|reserved| ident_mentioned(&body, reserved))
+                    .any(|defined| ident_mentioned(&body, defined) && defined != "Nat");
+                for tok in ident_tokens_in(&body) {
+                    if tok != "renaming" && tok != "hiding" && tok != "scoped" {
+                        defined_short_names.insert(tok);
+                    }
+                }
+                if word == "export"
+                    || body.contains('(')
+                    || ident_mentioned(&body, "renaming")
+                    || ident_mentioned(&body, "scoped")
                 {
                     has_unmodeled_instance_env = true;
-                    if word == "export" || body.contains('(') || ident_mentioned(&body, "renaming")
-                    {
-                        has_shadowed_value_types = true;
-                    }
+                    has_shadowed_value_types = true;
+                } else if RESERVED_INSTANCE_AND_TYPE_NAMES
+                    .iter()
+                    .any(|reserved| ident_mentioned(&body, reserved) && *reserved != "Nat")
+                    || mentions_defined
+                {
+                    has_unmodeled_instance_env = true;
                 }
                 if consume_trailing_in(&masked, &byte_offsets, &chars, &mut i) {
                     at_cmd_head = true;
@@ -1080,6 +1115,13 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                 i = next;
                 let short = decl_name.rsplit('.').next().unwrap_or(decl_name.as_str());
                 let short_canon = crate::splitter::canonical_lean_name_component(short);
+                if !short_canon.is_empty()
+                    && (!matches!(word.as_str(), "def" | "abbrev" | "example")
+                        || !scope.is_empty()
+                        || decl_name.contains('.'))
+                {
+                    defined_short_names.insert(short_canon.clone());
+                }
                 if RESERVED_INSTANCE_AND_TYPE_NAMES.contains(&short_canon.as_str()) {
                     has_unmodeled_instance_env = true;
                     has_shadowed_value_types = true;
@@ -1108,6 +1150,15 @@ fn scan_decl_extras(src: &str) -> DeclScan {
                 );
                 if raw_name.is_empty() {
                     continue;
+                }
+                let raw_short = raw_name.rsplit('.').next().unwrap_or(raw_name.as_str());
+                let raw_short_canon = crate::splitter::canonical_lean_name_component(raw_short);
+                if !raw_short_canon.is_empty() && (!scope.is_empty() || raw_name.contains('.')) {
+                    defined_short_names.insert(raw_short_canon.clone());
+                }
+                if RESERVED_INSTANCE_AND_TYPE_NAMES.contains(&raw_short_canon.as_str()) {
+                    has_unmodeled_instance_env = true;
+                    has_shadowed_value_types = true;
                 }
                 i = next;
                 let mut binders = Vec::new();
@@ -1304,6 +1355,7 @@ fn scan_decl_extras(src: &str) -> DeclScan {
     }
     DeclScan {
         extras: out,
+        defined_short_names,
         has_malformed_scope,
         has_unmodeled_instance_env,
         has_unmodeled_syntax_env,
@@ -1407,6 +1459,9 @@ fn statement_let_is_unsafe(prop: &str, inlined: &str) -> bool {
             return true;
         }
         let var_name = &rest[..name_end];
+        if is_reserved_binder_ident(var_name) {
+            return true;
+        }
         let after_name = &rest[name_end..];
         let Some(eq_idx) = scan_top_level_colon_eq(after_name) else {
             return true;
@@ -1550,26 +1605,19 @@ fn is_ident_token(text: &str) -> bool {
 }
 
 fn untyped_let_rhs_is_value(rhs: &str) -> bool {
-    let clean = mask_literals(rhs);
-    let trimmed = clean.trim();
-    !trimmed.is_empty()
-        && !trimmed.contains(['→', '∀', '∃', ':', '=', '<', '>', '∧', '∨', '¬', '↔'])
-        && !trimmed.contains("->")
-        && !ident_mentioned(trimmed, "False")
-        && !ident_mentioned(trimmed, "True")
-        && !ident_mentioned(trimmed, "Empty")
-        && !ident_mentioned(trimmed, "PEmpty")
-        && !ident_mentioned(trimmed, "fun")
-        && !ident_mentioned(trimmed, "forall")
-        && !trimmed.contains('λ')
+    let empty = BTreeSet::new();
+    scalar_value_expr(rhs, &empty)
+        && !ident_mentioned(rhs, "true")
+        && !ident_mentioned(rhs, "false")
 }
 
 fn conclusion_is_modeled(
     concl: &str,
-    type_params: &BTreeSet<String>,
+    lawful_beq_type_vars: &BTreeSet<String>,
     prop_params: &BTreeSet<String>,
     value_params: &BTreeSet<String>,
     prop_local_defs: &[(String, Vec<String>, String)],
+    defined_short_names: &BTreeSet<String>,
 ) -> bool {
     let conjuncts = split_top_level_and(concl);
     if conjuncts.len() > 1 {
@@ -1595,18 +1643,20 @@ fn conclusion_is_modeled(
                 sym_eq
                     && proposition_is_modeled(
                         &lhs,
-                        type_params,
+                        lawful_beq_type_vars,
                         prop_params,
                         value_params,
                         prop_local_defs,
+                        defined_short_names,
                         0,
                     )
                     && proposition_is_modeled(
                         &rhs,
-                        type_params,
+                        lawful_beq_type_vars,
                         prop_params,
                         value_params,
                         prop_local_defs,
+                        defined_short_names,
                         0,
                     )
                     && !contains_any_arrow(&lhs)
@@ -1616,10 +1666,11 @@ fn conclusion_is_modeled(
             } else {
                 proposition_is_modeled(
                     inner,
-                    type_params,
+                    lawful_beq_type_vars,
                     prop_params,
                     value_params,
                     prop_local_defs,
+                    defined_short_names,
                     0,
                 )
             }
@@ -1634,10 +1685,11 @@ fn conclusion_is_modeled(
     }
     proposition_is_modeled(
         inner,
-        type_params,
+        lawful_beq_type_vars,
         prop_params,
         value_params,
         prop_local_defs,
+        defined_short_names,
         0,
     )
 }
@@ -1688,66 +1740,245 @@ fn extract_prop_local_defs(clean_src: &str) -> Vec<(String, Vec<String>, String)
     let all = extract_local_def_unfoldings(clean_src);
     let masked = mask_literals(clean_src);
     let mut prop_names = BTreeSet::new();
-    for line in masked.lines() {
-        let trimmed = line.trim_start();
-        let rest = trimmed
-            .strip_prefix("private ")
-            .or_else(|| trimmed.strip_prefix("public "))
-            .or_else(|| trimmed.strip_prefix("protected "))
-            .or_else(|| trimmed.strip_prefix("noncomputable "))
-            .unwrap_or(trimmed);
-        let Some(after_kw) = rest
-            .strip_prefix("def ")
-            .or_else(|| rest.strip_prefix("abbrev "))
-        else {
+    let mut i = 0usize;
+    let chars: Vec<char> = masked.chars().collect();
+    let n = chars.len();
+    while i < n {
+        while i < n && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= n {
+            break;
+        }
+        let start = i;
+        while i < n && is_ident_continue(chars[i]) {
+            i += 1;
+        }
+        let word: String = chars[start..i].iter().collect();
+        while i < n && chars[i].is_whitespace() && chars[i] != '\n' {
+            i += 1;
+        }
+        if !matches!(
+            word.as_str(),
+            "def"
+                | "abbrev"
+                | "private"
+                | "public"
+                | "protected"
+                | "noncomputable"
+                | "local"
+                | "scoped"
+                | "unsafe"
+                | "partial"
+                | "nonrec"
+        ) {
+            while i < n && chars[i] != '\n' {
+                i += 1;
+            }
             continue;
-        };
-        let Some(eq_idx) = scan_top_level_colon_eq(after_kw) else {
+        }
+        if matches!(
+            word.as_str(),
+            "private"
+                | "public"
+                | "protected"
+                | "noncomputable"
+                | "local"
+                | "scoped"
+                | "unsafe"
+                | "partial"
+                | "nonrec"
+        ) {
             continue;
-        };
-        let header = after_kw[..eq_idx].trim();
-        let Some((_, ret_ty)) = split_top_level_colon(header) else {
-            continue;
-        };
-        let ret_ty = ret_ty.trim();
-        if ret_ty == "Prop" || ret_ty == "_root_.Prop" {
-            let name: String = header
-                .chars()
-                .take_while(|c| is_ident_continue(*c) || *c == '.' || *c == '«' || *c == '»')
-                .collect();
-            if !name.is_empty() {
-                prop_names.insert(name);
+        }
+        let header_start = i;
+        let mut depth = 0usize;
+        while i < n {
+            match chars[i] {
+                '(' | '{' | '[' | '⦃' | '⟨' => depth += 1,
+                ')' | '}' | ']' | '⦄' | '⟩' => depth = depth.saturating_sub(1),
+                ':' if depth == 0 && chars.get(i + 1) == Some(&'=') => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        let header: String = chars[header_start..i].iter().collect();
+        let flat_header = normalize_ws(&header);
+        if let Some((lhs_header, ret_ty)) = split_top_level_colon(flat_header.trim()) {
+            let ret_ty = ret_ty.trim();
+            if ret_ty == "Prop" || ret_ty == "_root_.Prop" {
+                let trimmed_lhs = lhs_header.trim();
+                let name: String = trimmed_lhs
+                    .chars()
+                    .take_while(|c| is_ident_continue(*c) || *c == '.' || *c == '«' || *c == '»')
+                    .collect();
+                let binder_part = trimmed_lhs[name.len()..].trim();
+                if !name.is_empty() && !name.contains('.') && prop_def_binders_are_nat(binder_part)
+                {
+                    prop_names.insert(name);
+                }
             }
         }
+        while i < n && chars[i] != '\n' {
+            i += 1;
+        }
     }
-    all.into_iter()
-        .filter(|(name, _, _, _)| {
-            let short = name.rsplit('.').next().unwrap_or(name);
-            prop_names.contains(name) || prop_names.contains(short)
-        })
-        .map(|(name, params, body, _)| (name, params, body))
-        .collect()
+    let mut admitted_names = BTreeSet::new();
+    let mut out = Vec::new();
+    for (name, params, body, _) in all {
+        if !name.contains('.')
+            && prop_names.contains(&name)
+            && prop_body_is_closed(&body, &params, &admitted_names)
+        {
+            admitted_names.insert(name.clone());
+            out.push((name, params, body));
+        }
+    }
+    out
+}
+
+fn prop_def_binders_are_nat(binder_part: &str) -> bool {
+    let mut cur = binder_part.trim();
+    let mut seen = BTreeSet::new();
+    while !cur.is_empty() {
+        if !cur.starts_with('(') {
+            return false;
+        }
+        let mut depth = 0usize;
+        let mut close_byte = None;
+        for (idx, ch) in cur.char_indices() {
+            match ch {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        close_byte = Some(idx);
+                        break;
+                    }
+                }
+                '{' | '}' | '[' | ']' | '⦃' | '⦄' => return false,
+                _ => {}
+            }
+        }
+        let Some(end) = close_byte else {
+            return false;
+        };
+        let inside = &cur[1..end];
+        let Some((vars_part, ty_part)) = split_top_level_colon(inside) else {
+            return false;
+        };
+        let mut ty = ty_part.trim();
+        while let Some(inner) = strip_wrapping_parens(ty) {
+            ty = inner;
+        }
+        if !matches!(ty, "Nat" | "_root_.Nat") {
+            return false;
+        }
+        let vars: Vec<&str> = vars_part.split_whitespace().collect();
+        if vars.is_empty() {
+            return false;
+        }
+        for var in vars {
+            if !is_ident_token(var)
+                || is_reserved_binder_ident(var)
+                || (var != "_" && !seen.insert(var.to_string()))
+            {
+                return false;
+            }
+        }
+        cur = cur[end + 1..].trim_start();
+    }
+    true
+}
+
+fn prop_body_is_closed(body: &str, params: &[String], admitted_props: &BTreeSet<String>) -> bool {
+    let chars: Vec<char> = body.chars().collect();
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        if chars[idx] == ':' {
+            return false;
+        }
+        if is_ident_continue(chars[idx]) {
+            let start = idx;
+            while idx < chars.len() && is_ident_continue(chars[idx]) {
+                idx += 1;
+            }
+            let tok: String = chars[start..idx].iter().collect();
+            if !tok.chars().all(|ch| ch.is_ascii_digit())
+                && !matches!(tok.as_str(), "True" | "False" | "Not")
+                && !params.iter().any(|param| param == &tok)
+                && !admitted_props.contains(&tok)
+            {
+                return false;
+            }
+        } else {
+            idx += 1;
+        }
+    }
+    true
+}
+
+fn simultaneous_subst_params(body: &str, params: &[String], args: &[String]) -> String {
+    let mut map: BTreeMap<&str, String> = BTreeMap::new();
+    for (param, arg) in params.iter().zip(args.iter()) {
+        let rep = if arg.contains(char::is_whitespace) {
+            format!("({arg})")
+        } else {
+            arg.clone()
+        };
+        map.insert(param.as_str(), rep);
+    }
+    let chars: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(body.len());
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        if is_ident_continue(chars[idx]) {
+            let start = idx;
+            while idx < chars.len() && is_ident_continue(chars[idx]) {
+                idx += 1;
+            }
+            let tok: String = chars[start..idx].iter().collect();
+            if let Some(rep) = map.get(tok.as_str()) {
+                out.push_str(rep);
+            } else {
+                out.push_str(&tok);
+            }
+        } else {
+            out.push(chars[idx]);
+            idx += 1;
+        }
+    }
+    out
 }
 
 fn binder_type_is_modeled(
     ty: &str,
-    type_params: &BTreeSet<String>,
+    lawful_beq_type_vars: &BTreeSet<String>,
     prop_params: &BTreeSet<String>,
     value_params: &BTreeSet<String>,
     prop_local_defs: &[(String, Vec<String>, String)],
+    defined_short_names: &BTreeSet<String>,
 ) -> bool {
     if is_known_binder_value_type(ty) {
         return false;
     }
-    hypothesis_is_modeled(ty, type_params, prop_params, value_params, prop_local_defs)
+    hypothesis_is_modeled(
+        ty,
+        lawful_beq_type_vars,
+        prop_params,
+        value_params,
+        prop_local_defs,
+        defined_short_names,
+    )
 }
 
 fn hypothesis_is_modeled(
     text: &str,
-    type_params: &BTreeSet<String>,
+    lawful_beq_type_vars: &BTreeSet<String>,
     prop_params: &BTreeSet<String>,
     value_params: &BTreeSet<String>,
     prop_local_defs: &[(String, Vec<String>, String)],
+    defined_short_names: &BTreeSet<String>,
 ) -> bool {
     let mut current = mask_literals(text);
     current = current.trim().to_string();
@@ -1765,22 +1996,83 @@ fn hypothesis_is_modeled(
     if prop_params.contains(ty.trim()) {
         return true;
     }
+    if !hypothesis_connectives_are_audited(&ty) {
+        return false;
+    }
     proposition_is_modeled(
         &ty,
-        type_params,
+        lawful_beq_type_vars,
         prop_params,
         value_params,
         prop_local_defs,
+        defined_short_names,
         0,
     )
 }
 
+fn hypothesis_connectives_are_audited(ty: &str) -> bool {
+    let mut cur = ty.trim().to_string();
+    while let Some(inner) = strip_wrapping_parens(&cur) {
+        cur = inner.to_string();
+    }
+    if split_top_level_or(&cur).is_some() || split_top_level_iff(&cur).is_some() {
+        return false;
+    }
+    let conjuncts = split_top_level_and(&cur);
+    if conjuncts.len() > 1 {
+        return conjuncts
+            .iter()
+            .all(|part| hypothesis_connectives_are_audited(part));
+    }
+    if let Some(inner) = cur
+        .strip_prefix('¬')
+        .or_else(|| cur.strip_prefix("Not ").map(str::trim))
+    {
+        return hypothesis_connectives_are_audited(inner);
+    }
+    true
+}
+
+fn lawful_beq_reflexive_prop(expr: &str, lawful_beq_type_vars: &BTreeSet<String>) -> bool {
+    let mut cur = expr.trim();
+    while let Some(inner) = strip_wrapping_parens(cur) {
+        cur = inner;
+    }
+    if let Some((lhs, rhs, is_ne)) = split_top_level_eq_or_ne(cur) {
+        let mut lhs = lhs.trim();
+        let mut rhs = rhs.trim();
+        while let Some(inner) = strip_wrapping_parens(lhs) {
+            lhs = inner;
+        }
+        while let Some(inner) = strip_wrapping_parens(rhs) {
+            rhs = inner;
+        }
+        if is_ne {
+            return false;
+        }
+        if rhs == "true" {
+            return lawful_beq_reflexive_prop(lhs, lawful_beq_type_vars);
+        }
+        if lhs == "true" {
+            return lawful_beq_reflexive_prop(rhs, lawful_beq_type_vars);
+        }
+        return lhs == rhs && lawful_beq_type_vars.contains(lhs);
+    }
+    if let Some((lhs, rhs, "==")) = split_top_level_rel_op(cur) {
+        let lhs = lhs.trim();
+        let rhs = rhs.trim();
+        return lhs == rhs && lawful_beq_type_vars.contains(lhs);
+    }
+    false
+}
+
 fn proposition_is_modeled(
     ty: &str,
-    type_params: &BTreeSet<String>,
+    lawful_beq_type_vars: &BTreeSet<String>,
     prop_params: &BTreeSet<String>,
     value_params: &BTreeSet<String>,
     prop_local_defs: &[(String, Vec<String>, String)],
+    defined_short_names: &BTreeSet<String>,
     depth: usize,
 ) -> bool {
     if depth > 8 {
@@ -1808,34 +2100,38 @@ fn proposition_is_modeled(
     if let Some((left, right)) = split_top_level_iff(&cur) {
         return proposition_is_modeled(
             &left,
-            type_params,
+            lawful_beq_type_vars,
             prop_params,
             value_params,
             prop_local_defs,
+            defined_short_names,
             depth + 1,
         ) && proposition_is_modeled(
             &right,
-            type_params,
+            lawful_beq_type_vars,
             prop_params,
             value_params,
             prop_local_defs,
+            defined_short_names,
             depth + 1,
         );
     }
     if let Some((left, right)) = split_top_level_or(&cur) {
         return proposition_is_modeled(
             &left,
-            type_params,
+            lawful_beq_type_vars,
             prop_params,
             value_params,
             prop_local_defs,
+            defined_short_names,
             depth + 1,
         ) && proposition_is_modeled(
             &right,
-            type_params,
+            lawful_beq_type_vars,
             prop_params,
             value_params,
             prop_local_defs,
+            defined_short_names,
             depth + 1,
         );
     }
@@ -1844,10 +2140,11 @@ fn proposition_is_modeled(
         return conjuncts.iter().all(|part| {
             proposition_is_modeled(
                 part,
-                type_params,
+                lawful_beq_type_vars,
                 prop_params,
                 value_params,
                 prop_local_defs,
+                defined_short_names,
                 depth + 1,
             )
         });
@@ -1859,14 +2156,25 @@ fn proposition_is_modeled(
         .strip_prefix('¬')
         .or_else(|| cur.strip_prefix("Not ").map(str::trim))
     {
+        let mut atom = inner.trim();
+        while let Some(peeled) = strip_wrapping_parens(atom) {
+            atom = peeled;
+        }
+        if split_top_level_rel_op(atom).is_some() || split_top_level_eq_or_ne(atom).is_some() {
+            return false;
+        }
         return proposition_is_modeled(
             inner,
-            type_params,
+            lawful_beq_type_vars,
             prop_params,
             value_params,
             prop_local_defs,
+            defined_short_names,
             depth + 1,
         );
+    }
+    if lawful_beq_reflexive_prop(&cur, lawful_beq_type_vars) {
+        return true;
     }
     if let Some((lhs, rhs, _)) = split_top_level_eq_or_ne(&cur) {
         return scalar_value_expr(lhs, value_params) && scalar_value_expr(rhs, value_params);
@@ -1879,47 +2187,58 @@ fn proposition_is_modeled(
     }
     local_prop_application(
         &cur,
-        type_params,
+        lawful_beq_type_vars,
         prop_params,
         value_params,
         prop_local_defs,
+        defined_short_names,
         depth,
     )
 }
 
 fn local_prop_application(
     expr: &str,
-    type_params: &BTreeSet<String>,
+    lawful_beq_type_vars: &BTreeSet<String>,
     prop_params: &BTreeSet<String>,
     value_params: &BTreeSet<String>,
     prop_local_defs: &[(String, Vec<String>, String)],
+    defined_short_names: &BTreeSet<String>,
     depth: usize,
 ) -> bool {
-    let Some((head, args)) = split_type_application(expr) else {
+    let args_or_zero: Option<(&str, Vec<String>)> = if is_ident_token(expr) {
+        Some((expr, Vec::new()))
+    } else {
+        split_type_application(expr)
+    };
+    let Some((head, args)) = args_or_zero else {
         return false;
     };
-    if head.contains('.') || !is_ident_token(head) {
-        return false;
-    };
-    let Some((_, params, body)) = prop_local_defs.iter().rev().find(|(name, _, _)| {
-        let short = name.rsplit('.').next().unwrap_or(name);
-        name == head || (short == head && !name.contains('.'))
-    }) else {
-        return false;
-    };
-    if params.len() != args.len() {
+    if head.contains('.') || !is_ident_token(head) || defined_short_names.contains(head) {
         return false;
     }
-    let mut unfolded = body.clone();
-    for (param, arg) in params.iter().zip(args.iter()) {
-        unfolded = replace_ident_boundary(&unfolded, param, arg);
+    let matches: Vec<_> = prop_local_defs
+        .iter()
+        .rev()
+        .filter(|(name, _, _)| name == head || name.rsplit('.').next() == Some(head))
+        .collect();
+    if matches.len() != 1 {
+        return false;
     }
+    let (name, params, body) = matches[0];
+    if name.contains('.') && name != head {
+        return false;
+    }
+    if params.len() != args.len() || !args.iter().all(|arg| scalar_value_expr(arg, value_params)) {
+        return false;
+    }
+    let unfolded = simultaneous_subst_params(body, params, &args);
     proposition_is_modeled(
         &unfolded,
-        type_params,
+        lawful_beq_type_vars,
         prop_params,
         value_params,
         prop_local_defs,
+        defined_short_names,
         depth + 1,
     )
 }
@@ -1927,34 +2246,81 @@ fn local_prop_application(
 fn scalar_value_expr(expr: &str, value_params: &BTreeSet<String>) -> bool {
     let trimmed = expr.trim();
     if trimmed.is_empty()
-        || trimmed.contains(['→', '∀', '∃', ':', '{', '[', '⦃', 'λ', '.', '@'])
+        || trimmed.contains([
+            '→', '∀', '∃', ':', '{', '[', '⦃', 'λ', '.', '@', ',', '⟨', '⟩', '^',
+        ])
         || trimmed.contains("->")
         || ident_mentioned(trimmed, "fun")
         || ident_mentioned(trimmed, "forall")
     {
         return false;
     }
-    let mut saw_ident = false;
+    let mut depth = 0i32;
     let mut ident = String::new();
-    let flush = |ident: &mut String, saw: &mut bool| {
-        if ident.is_empty() {
-            return true;
+    let mut saw_ident = false;
+    let mut last_was_value = false;
+    let flush_ident =
+        |ident: &mut String, saw_ident: &mut bool, last_was_value: &mut bool| -> bool {
+            if ident.is_empty() {
+                return true;
+            }
+            *saw_ident = true;
+            if *last_was_value {
+                return false;
+            }
+            let ok = value_params.contains(ident)
+                || matches!(ident.as_str(), "true" | "false")
+                || ident.chars().all(|c| c.is_ascii_digit());
+            ident.clear();
+            *last_was_value = ok;
+            ok
+        };
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        let ch = chars[idx];
+        if ch.is_whitespace() {
+            if !flush_ident(&mut ident, &mut saw_ident, &mut last_was_value) {
+                return false;
+            }
+            idx += 1;
+            continue;
         }
-        *saw = true;
-        let ok = value_params.contains(ident)
-            || matches!(ident.as_str(), "true" | "false")
-            || ident.chars().all(|c| c.is_ascii_digit());
-        ident.clear();
-        ok
-    };
-    for ch in trimmed.chars() {
         if is_ident_continue(ch) {
             ident.push(ch);
-        } else if !flush(&mut ident, &mut saw_ident) {
+            idx += 1;
+            continue;
+        }
+        if !flush_ident(&mut ident, &mut saw_ident, &mut last_was_value) {
             return false;
         }
+        if ch == '(' {
+            if last_was_value {
+                return false;
+            }
+            depth += 1;
+            idx += 1;
+            continue;
+        }
+        if ch == ')' {
+            if depth == 0 {
+                return false;
+            }
+            depth -= 1;
+            last_was_value = true;
+            idx += 1;
+            continue;
+        }
+        if !matches!(ch, '+' | '-' | '*' | '/' | '%') || !last_was_value {
+            return false;
+        }
+        last_was_value = false;
+        idx += 1;
     }
-    flush(&mut ident, &mut saw_ident) && saw_ident
+    flush_ident(&mut ident, &mut saw_ident, &mut last_was_value)
+        && saw_ident
+        && last_was_value
+        && depth == 0
 }
 
 fn split_top_level_or(src: &str) -> Option<(String, String)> {
@@ -2056,20 +2422,66 @@ fn split_top_level_rel_op(src: &str) -> Option<(String, String, &'static str)> {
 }
 
 fn is_safe_inlined_let_type(ty: &str) -> bool {
+    matches!(ty.trim(), "Nat" | "_root_.Nat")
+}
+
+fn is_reserved_binder_ident(name: &str) -> bool {
     matches!(
-        ty.trim(),
+        name,
         "Nat"
-            | "Int"
             | "Bool"
+            | "Int"
             | "String"
+            | "Unit"
+            | "PUnit"
             | "Char"
+            | "Float"
             | "UInt8"
             | "UInt16"
             | "UInt32"
             | "UInt64"
             | "USize"
-            | "Unit"
-            | "PUnit"
+            | "ISize"
+            | "BitVec"
+            | "Fin"
+            | "List"
+            | "Array"
+            | "Option"
+            | "Prod"
+            | "Sum"
+            | "Sigma"
+            | "PSigma"
+            | "Subtype"
+            | "Empty"
+            | "PEmpty"
+            | "True"
+            | "False"
+            | "Not"
+            | "And"
+            | "Or"
+            | "Iff"
+            | "Eq"
+            | "Ne"
+            | "LT"
+            | "LE"
+            | "GT"
+            | "GE"
+            | "BEq"
+            | "LawfulBEq"
+            | "EquivBEq"
+            | "Hashable"
+            | "LawfulHashable"
+            | "Decidable"
+            | "DecidableEq"
+            | "Inhabited"
+            | "Nonempty"
+            | "Subsingleton"
+            | "OfNat"
+            | "true"
+            | "false"
+            | "Prop"
+            | "Type"
+            | "Sort"
     )
 }
 
@@ -2792,9 +3204,7 @@ fn bound_is_positive_fin(bound: &str) -> bool {
     if let Some((lhs, rhs)) = b.rsplit_once('+') {
         if rhs.trim().parse::<u64>().is_ok_and(|inc| inc > 0) {
             let base = lhs.trim();
-            return base.parse::<u64>().is_ok()
-                || (base.chars().next().is_some_and(is_ident_start)
-                    && base.chars().all(is_ident_continue));
+            return base.parse::<u64>().is_ok();
         }
     }
     false
@@ -2958,7 +3368,7 @@ fn consume_in_command_prefix(
     chars: &[char],
     start: usize,
     cmd_col: usize,
-) -> Option<(usize, &'static str, PrefixAction)> {
+) -> Option<(usize, &'static str, PrefixAction, Option<String>)> {
     const PREFIXES: &[&str] = &[
         "set_option",
         "open",
@@ -3021,6 +3431,7 @@ fn consume_in_command_prefix(
                 byte_offsets.partition_point(|offset| *offset < byte_start + consumed),
                 "#time",
                 PrefixAction::Ignore,
+                None,
             ));
         }
     }
@@ -3031,6 +3442,7 @@ fn consume_in_command_prefix(
                 byte_offsets.partition_point(|offset| *offset < byte_start + consumed),
                 "#with_exporting",
                 PrefixAction::Malformed,
+                None,
             ));
         }
     }
@@ -3089,7 +3501,8 @@ fn consume_in_command_prefix(
                 } else {
                     let after = i + 2;
                     let raw: String = chars[start..after].iter().collect();
-                    return Some((after, kw, classify_in_prefix(kw, &raw)));
+                    let (action, prefix_short) = classify_in_prefix(kw, &raw);
+                    return Some((after, kw, action, prefix_short));
                 }
             }
             ch if !ch.is_whitespace() => body_is_ws = false,
@@ -3100,42 +3513,39 @@ fn consume_in_command_prefix(
     None
 }
 
-fn classify_in_prefix(kw: &str, raw: &str) -> PrefixAction {
+fn classify_in_prefix(kw: &str, raw: &str) -> (PrefixAction, Option<String>) {
     if matches!(kw, "variable" | "variables" | "include" | "omit") {
-        return PrefixAction::Assumption(normalize_ws(raw));
+        return (PrefixAction::Assumption(normalize_ws(raw)), None);
     }
     if matches!(kw, "deriving" | "instance") {
-        return PrefixAction::UnmodeledEnv;
+        return (PrefixAction::UnmodeledEnv, None);
     }
     if syntax_env_keyword(kw) {
-        return PrefixAction::SyntaxEnv;
+        return (PrefixAction::SyntaxEnv, None);
     }
     if kw == "attribute" && attr_mentions_instance_or_class(raw) {
-        return PrefixAction::UnmodeledEnv;
+        return (PrefixAction::UnmodeledEnv, None);
     }
-    if matches!(kw, "open" | "export")
-        && RESERVED_INSTANCE_AND_TYPE_NAMES
-            .iter()
-            .any(|reserved| ident_mentioned(raw, reserved))
-    {
-        if kw == "export" || raw.contains('(') || ident_mentioned(raw, "renaming") {
-            return PrefixAction::ShadowedValueEnv;
+    if matches!(kw, "open" | "export") {
+        if kw == "export"
+            || raw.contains('(')
+            || ident_mentioned(raw, "renaming")
+            || ident_mentioned(raw, "scoped")
+        {
+            return (PrefixAction::ShadowedValueEnv, None);
         }
-        return PrefixAction::UnmodeledEnv;
+        if RESERVED_INSTANCE_AND_TYPE_NAMES
+            .iter()
+            .any(|reserved| ident_mentioned(raw, reserved) && *reserved != "Nat")
+        {
+            return (PrefixAction::UnmodeledEnv, None);
+        }
+        return (PrefixAction::Ignore, None);
     }
     if matches!(
         kw,
         "class" | "structure" | "inductive" | "coinductive" | "axiom" | "opaque"
     ) {
-        return PrefixAction::ShadowedValueEnv;
-    }
-    if matches!(
-        kw,
-        "def" | "abbrev" | "constant" | "example" | "theorem" | "lemma"
-    ) {
-        if matches!(kw, "theorem" | "lemma") {
-            return PrefixAction::ShadowedValueEnv;
-        }
         let after_kw = raw.trim_start().trim_start_matches(kw).trim_start();
         let short: String = after_kw
             .chars()
@@ -3143,14 +3553,34 @@ fn classify_in_prefix(kw: &str, raw: &str) -> PrefixAction {
             .collect();
         let short = short.rsplit('.').next().unwrap_or(short.as_str());
         let short_canon = crate::splitter::canonical_lean_name_component(short);
+        let recorded = (!short_canon.is_empty()).then_some(short_canon);
+        return (PrefixAction::ShadowedValueEnv, recorded);
+    }
+    if matches!(
+        kw,
+        "def" | "abbrev" | "constant" | "example" | "theorem" | "lemma"
+    ) {
+        let after_kw = raw.trim_start().trim_start_matches(kw).trim_start();
+        let raw_decl: String = after_kw
+            .chars()
+            .take_while(|c| is_ident_continue(*c) || *c == '.' || *c == '«' || *c == '»')
+            .collect();
+        let short = raw_decl.rsplit('.').next().unwrap_or(raw_decl.as_str());
+        let short_canon = crate::splitter::canonical_lean_name_component(short);
+        let recorded = (!short_canon.is_empty() && (kw == "constant" || raw_decl.contains('.')))
+            .then(|| short_canon.clone());
+        if matches!(kw, "theorem" | "lemma") {
+            return (PrefixAction::ShadowedValueEnv, recorded);
+        }
         if RESERVED_INSTANCE_AND_TYPE_NAMES.contains(&short_canon.as_str())
             || ident_mentioned(after_kw, "theorem")
             || ident_mentioned(after_kw, "lemma")
         {
-            return PrefixAction::ShadowedValueEnv;
+            return (PrefixAction::ShadowedValueEnv, recorded);
         }
+        return (PrefixAction::Ignore, recorded);
     }
-    PrefixAction::Ignore
+    (PrefixAction::Ignore, None)
 }
 
 fn dotted_name_multiline(
@@ -3342,11 +3772,579 @@ struct FileCardCtx<'a> {
     path: &'a Path,
     local_defs: &'a [(String, Vec<String>, String, String)],
     prop_local_defs: &'a [(String, Vec<String>, String)],
+    defined_short_names: &'a BTreeSet<String>,
     hygiene: &'a crate::splitter::HygieneReport,
     audit: &'a Value,
     has_unmodeled_instance_env: bool,
     has_unmodeled_syntax_env: bool,
     has_shadowed_value_types: bool,
+}
+
+fn is_executable_stage1_binder_type(ty: &str) -> bool {
+    scalar_domain_key(ty).is_some()
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NatSort {
+    Nat,
+    Mod(u128),
+    Bool,
+}
+
+type DomainSort = (&'static str, NatSort);
+
+fn nat_sort_of(ty: &str) -> Option<DomainSort> {
+    let key = scalar_domain_key(ty)?;
+    let sort = match key {
+        "nat" => NatSort::Nat,
+        "u64" | "bv64" => NatSort::Mod(1u128 << 64),
+        "u32" | "bv32" => NatSort::Mod(1u128 << 32),
+        "u16" | "bv16" => NatSort::Mod(1u128 << 16),
+        "u8" | "bv8" => NatSort::Mod(1u128 << 8),
+        "bool" => NatSort::Bool,
+        _ => return None,
+    };
+    Some((key, sort))
+}
+
+fn nat_sort_max(sort: NatSort) -> u128 {
+    match sort {
+        NatSort::Nat => u128::MAX,
+        NatSort::Mod(bound) => bound - 1,
+        NatSort::Bool => 1,
+    }
+}
+
+fn eval_nat_binop(sort: NatSort, op: char, left: u128, right: u128) -> Option<u128> {
+    if sort == NatSort::Bool {
+        return None;
+    }
+    let wrapped = |value: u128| match sort {
+        NatSort::Nat => Some(value),
+        NatSort::Mod(bound) => Some(value % bound),
+        NatSort::Bool => None,
+    };
+    match op {
+        '+' => left.checked_add(right).and_then(wrapped),
+        '-' => match sort {
+            NatSort::Nat => Some(left.saturating_sub(right)),
+            NatSort::Mod(bound) => Some((left + bound - right) % bound),
+            NatSort::Bool => None,
+        },
+        '*' => left.checked_mul(right).and_then(wrapped),
+        '/' => left.checked_div(right).map_or(Some(0), wrapped),
+        '%' => left.checked_rem(right).map_or(Some(left), wrapped),
+        _ => None,
+    }
+}
+
+fn infer_atom_sort(
+    lhs: &str,
+    rhs: &str,
+    sorts: &BTreeMap<String, DomainSort>,
+) -> Option<DomainSort> {
+    let mut chosen: Option<DomainSort> = None;
+    for side in [lhs, rhs] {
+        let chars: Vec<char> = side.chars().collect();
+        let mut idx = 0usize;
+        while idx < chars.len() {
+            if chars[idx].is_ascii_digit() || is_ident_continue(chars[idx]) {
+                let start = idx;
+                while idx < chars.len()
+                    && (chars[idx].is_ascii_digit() || is_ident_continue(chars[idx]))
+                {
+                    idx += 1;
+                }
+                let token: String = chars[start..idx].iter().collect();
+                let found = if let Some(entry) = sorts.get(&token).copied() {
+                    Some(entry)
+                } else if matches!(token.as_str(), "true" | "false") {
+                    Some(("bool", NatSort::Bool))
+                } else if token.chars().all(|ch| ch.is_ascii_digit()) {
+                    None
+                } else {
+                    return None;
+                };
+                if let Some((key, sort)) = found {
+                    if let Some((prev_key, _)) = chosen {
+                        if prev_key != key {
+                            return None;
+                        }
+                    } else {
+                        chosen = Some((key, sort));
+                    }
+                }
+            } else {
+                idx += 1;
+            }
+        }
+    }
+    Some(chosen.unwrap_or(("nat", NatSort::Nat)))
+}
+
+fn eval_nat_expr(
+    expr: &str,
+    expected: DomainSort,
+    sorts: &BTreeMap<String, DomainSort>,
+    env: &BTreeMap<String, u128>,
+) -> Option<u128> {
+    fn rec(
+        chars: &[char],
+        idx: &mut usize,
+        min_prec: u8,
+        expected: DomainSort,
+        sorts: &BTreeMap<String, DomainSort>,
+        env: &BTreeMap<String, u128>,
+    ) -> Option<u128> {
+        while chars.get(*idx).is_some_and(|ch| ch.is_whitespace()) {
+            *idx += 1;
+        }
+        let (expected_key, sort) = expected;
+        let mut value = if chars.get(*idx) == Some(&'(') {
+            *idx += 1;
+            let inner = rec(chars, idx, 0, expected, sorts, env)?;
+            while chars.get(*idx).is_some_and(|ch| ch.is_whitespace()) {
+                *idx += 1;
+            }
+            if chars.get(*idx) != Some(&')') {
+                return None;
+            }
+            *idx += 1;
+            inner
+        } else {
+            let start = *idx;
+            while chars
+                .get(*idx)
+                .is_some_and(|ch| ch.is_ascii_digit() || is_ident_continue(*ch))
+            {
+                *idx += 1;
+            }
+            if start == *idx {
+                return None;
+            }
+            let token: String = chars[start..*idx].iter().collect();
+            if let Some((key, _)) = sorts.get(&token).copied() {
+                if key != expected_key {
+                    return None;
+                }
+                env.get(&token).copied()?
+            } else if sort == NatSort::Bool {
+                match token.as_str() {
+                    "false" => 0,
+                    "true" => 1,
+                    _ => return None,
+                }
+            } else if token.chars().all(|ch| ch.is_ascii_digit()) {
+                let raw = token.parse::<u128>().ok()?;
+                match sort {
+                    NatSort::Nat => raw,
+                    NatSort::Mod(bound) => raw % bound,
+                    NatSort::Bool => return None,
+                }
+            } else {
+                return None;
+            }
+        };
+        loop {
+            while chars.get(*idx).is_some_and(|ch| ch.is_whitespace()) {
+                *idx += 1;
+            }
+            let Some(op) = chars.get(*idx).copied() else {
+                break;
+            };
+            let prec = match op {
+                '+' | '-' => 1u8,
+                '*' | '/' | '%' => 2,
+                _ => break,
+            };
+            if prec < min_prec {
+                break;
+            }
+            *idx += 1;
+            let rhs = rec(chars, idx, prec + 1, expected, sorts, env)?;
+            value = eval_nat_binop(sort, op, value, rhs)?;
+        }
+        Some(value)
+    }
+    let chars: Vec<char> = expr.trim().chars().collect();
+    let mut idx = 0usize;
+    let value = rec(&chars, &mut idx, 0, expected, sorts, env)?;
+    while chars.get(idx).is_some_and(|ch| ch.is_whitespace()) {
+        idx += 1;
+    }
+    (idx == chars.len()).then_some(value)
+}
+
+fn unfold_local_prop_once(
+    expr: &str,
+    prop_local_defs: &[(String, Vec<String>, String)],
+    defined_short_names: &BTreeSet<String>,
+    sorts: &BTreeMap<String, DomainSort>,
+) -> Option<String> {
+    let args_or_zero: Option<(&str, Vec<String>)> = if is_ident_token(expr) {
+        Some((expr, Vec::new()))
+    } else {
+        split_type_application(expr)
+    };
+    let (head, args) = args_or_zero?;
+    if head.contains('.') || !is_ident_token(head) || defined_short_names.contains(head) {
+        return None;
+    }
+    let matches: Vec<_> = prop_local_defs
+        .iter()
+        .rev()
+        .filter(|(name, _, _)| name == head || name.rsplit('.').next() == Some(head))
+        .collect();
+    if matches.len() != 1 {
+        return None;
+    }
+    let (name, params, body) = matches[0];
+    if (name.contains('.') && name != head) || params.len() != args.len() {
+        return None;
+    }
+    for arg in &args {
+        if infer_atom_sort(arg, "0", sorts) != Some(("nat", NatSort::Nat)) {
+            return None;
+        }
+    }
+    Some(simultaneous_subst_params(body, params, &args))
+}
+
+fn eval_nat_prop(
+    prop: &str,
+    sorts: &BTreeMap<String, DomainSort>,
+    lawful_beq_type_vars: &BTreeSet<String>,
+    prop_local_defs: &[(String, Vec<String>, String)],
+    defined_short_names: &BTreeSet<String>,
+    env: &BTreeMap<String, u128>,
+    depth: usize,
+) -> Option<bool> {
+    if depth > 16 {
+        return None;
+    }
+    let mut cur = prop.trim().to_string();
+    while let Some(inner) = strip_wrapping_parens(&cur) {
+        cur = inner.to_string();
+    }
+    let cur = cur
+        .strip_prefix("_root_.")
+        .map(str::trim)
+        .unwrap_or(cur.as_str())
+        .to_string();
+    if cur.is_empty() {
+        return None;
+    }
+    if let Some((left, right)) = split_top_level_iff(&cur) {
+        return Some(
+            eval_nat_prop(
+                &left,
+                sorts,
+                lawful_beq_type_vars,
+                prop_local_defs,
+                defined_short_names,
+                env,
+                depth + 1,
+            )? == eval_nat_prop(
+                &right,
+                sorts,
+                lawful_beq_type_vars,
+                prop_local_defs,
+                defined_short_names,
+                env,
+                depth + 1,
+            )?,
+        );
+    }
+    if let Some((left, right)) = split_top_level_or(&cur) {
+        return Some(
+            eval_nat_prop(
+                &left,
+                sorts,
+                lawful_beq_type_vars,
+                prop_local_defs,
+                defined_short_names,
+                env,
+                depth + 1,
+            )? || eval_nat_prop(
+                &right,
+                sorts,
+                lawful_beq_type_vars,
+                prop_local_defs,
+                defined_short_names,
+                env,
+                depth + 1,
+            )?,
+        );
+    }
+    let conjuncts = split_top_level_and(&cur);
+    if conjuncts.len() > 1 {
+        return conjuncts.iter().try_fold(true, |acc, part| {
+            Some(
+                acc && eval_nat_prop(
+                    part,
+                    sorts,
+                    lawful_beq_type_vars,
+                    prop_local_defs,
+                    defined_short_names,
+                    env,
+                    depth + 1,
+                )?,
+            )
+        });
+    }
+    if lawful_beq_reflexive_prop(&cur, lawful_beq_type_vars) {
+        return Some(true);
+    }
+    if cur.as_str() == "True" {
+        return Some(true);
+    }
+    if cur.as_str() == "False" {
+        return Some(false);
+    }
+    if let Some(inner) = cur
+        .strip_prefix('¬')
+        .or_else(|| cur.strip_prefix("Not ").map(str::trim))
+    {
+        return Some(!eval_nat_prop(
+            inner,
+            sorts,
+            lawful_beq_type_vars,
+            prop_local_defs,
+            defined_short_names,
+            env,
+            depth + 1,
+        )?);
+    }
+    if let Some(unfolded) =
+        unfold_local_prop_once(&cur, prop_local_defs, defined_short_names, sorts)
+    {
+        return eval_nat_prop(
+            &unfolded,
+            sorts,
+            lawful_beq_type_vars,
+            prop_local_defs,
+            defined_short_names,
+            env,
+            depth + 1,
+        );
+    }
+    let (lhs, rhs, rel) = if let Some((lhs, rhs, ne)) = split_top_level_eq_or_ne(&cur) {
+        (
+            lhs.to_string(),
+            rhs.to_string(),
+            if ne { "!=" } else { "=" },
+        )
+    } else if let Some((lhs, rhs, op)) = split_top_level_rel_op(&cur) {
+        (lhs, rhs, op)
+    } else {
+        return None;
+    };
+    let expected = infer_atom_sort(&lhs, &rhs, sorts)?;
+    let left = eval_nat_expr(&lhs, expected, sorts, env)?;
+    let right = eval_nat_expr(&rhs, expected, sorts, env)?;
+    Some(match rel {
+        "=" | "==" => left == right,
+        "!=" => left != right,
+        "<" => left < right,
+        "<=" | "≤" => left <= right,
+        ">" => left > right,
+        ">=" | "≥" => left >= right,
+        _ => return None,
+    })
+}
+
+fn nat_candidates(sort: NatSort, literals: &[u128]) -> Vec<u128> {
+    let max = nat_sort_max(sort);
+    let mut values = BTreeSet::new();
+    for seed in [
+        0u128, 1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 63, 64, 127, 128, 255, 256,
+    ] {
+        if seed <= max {
+            values.insert(seed);
+        }
+    }
+    values.insert(max);
+    for lit in literals {
+        let lit = match sort {
+            NatSort::Nat => *lit,
+            NatSort::Mod(bound) => lit % bound,
+            NatSort::Bool => continue,
+        };
+        if lit <= max {
+            values.insert(lit);
+            if lit > 0 {
+                values.insert(lit - 1);
+            }
+            if lit < max {
+                values.insert(lit + 1);
+            }
+        }
+    }
+    values.into_iter().collect()
+}
+
+fn numeric_literals_in(text: &str) -> Vec<u128> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        if chars[idx].is_ascii_digit() && (idx == 0 || !is_ident_continue(chars[idx - 1])) {
+            let start = idx;
+            while idx < chars.len() && chars[idx].is_ascii_digit() {
+                idx += 1;
+            }
+            if idx >= chars.len() || !is_ident_continue(chars[idx]) {
+                if let Ok(value) = chars[start..idx].iter().collect::<String>().parse::<u128>() {
+                    out.push(value);
+                }
+            }
+        } else {
+            idx += 1;
+        }
+    }
+    out
+}
+
+fn for_each_nat_env(
+    sorts: &BTreeMap<String, DomainSort>,
+    literals: &[u128],
+    mut visit: impl FnMut(&BTreeMap<String, u128>) -> bool,
+) -> bool {
+    let vars: Vec<(String, NatSort)> = sorts
+        .iter()
+        .map(|(name, (_, sort))| (name.clone(), *sort))
+        .collect();
+    if vars.len() > 4 {
+        return false;
+    }
+    let domains: Vec<Vec<u128>> = vars
+        .iter()
+        .map(|(_, sort)| nat_candidates(*sort, literals))
+        .collect();
+    if domains.iter().any(Vec::is_empty) || domains.iter().any(|dom| dom.len() > 64) {
+        return false;
+    }
+    if vars.is_empty() {
+        return visit(&BTreeMap::new());
+    }
+    let mut picks = vec![0usize; vars.len()];
+    loop {
+        let mut env = BTreeMap::new();
+        for (idx, (name, _)) in vars.iter().enumerate() {
+            env.insert(name.clone(), domains[idx][picks[idx]]);
+        }
+        if visit(&env) {
+            return true;
+        }
+        let mut cursor = vars.len();
+        while cursor > 0 {
+            cursor -= 1;
+            picks[cursor] += 1;
+            if picks[cursor] < domains[cursor].len() {
+                break;
+            }
+            picks[cursor] = 0;
+        }
+        if cursor == 0 && picks.iter().all(|pick| *pick == 0) {
+            return false;
+        }
+    }
+}
+
+fn scalar_hypotheses_have_witness(
+    hypotheses: &[String],
+    sorts: &BTreeMap<String, DomainSort>,
+    lawful: &BTreeSet<String>,
+    prop_local_defs: &[(String, Vec<String>, String)],
+    defined_short_names: &BTreeSet<String>,
+) -> bool {
+    if hypotheses.is_empty() {
+        return true;
+    }
+    let literals = numeric_literals_in(&hypotheses.join(" "));
+    for_each_nat_env(sorts, &literals, |env| {
+        hypotheses.iter().all(|text| {
+            let mut trimmed = text.trim();
+            while let Some(inner) = strip_wrapping_parens(trimmed) {
+                trimmed = inner;
+            }
+            let rhs = split_top_level_colon(trimmed).map_or(trimmed, |(_, rhs)| rhs.trim());
+            eval_nat_prop(
+                rhs,
+                sorts,
+                lawful,
+                prop_local_defs,
+                defined_short_names,
+                env,
+                0,
+            ) == Some(true)
+        })
+    })
+}
+
+fn symmetric_equality_conclusion(conclusion: &str) -> bool {
+    let conjuncts = split_top_level_and(conclusion);
+    conjuncts.len() > 1
+        && conjuncts.iter().all(|part| {
+            let mut inner = part.trim();
+            while let Some(stripped) = strip_wrapping_parens(inner) {
+                inner = stripped;
+            }
+            let Some((lhs, rhs)) = split_arrow(inner) else {
+                return false;
+            };
+            let Some((l1, r1, false)) = split_top_level_eq_or_ne(lhs.trim()) else {
+                return false;
+            };
+            let Some((l2, r2, false)) = split_top_level_eq_or_ne(rhs.trim()) else {
+                return false;
+            };
+            l1.trim() != r1.trim() && l1.trim() == r2.trim() && r1.trim() == l2.trim()
+        })
+}
+
+fn scalar_conclusion_refuted(
+    conclusion: &str,
+    sorts: &BTreeMap<String, DomainSort>,
+    lawful: &BTreeSet<String>,
+    prop_local_defs: &[(String, Vec<String>, String)],
+    defined_short_names: &BTreeSet<String>,
+) -> bool {
+    if symmetric_equality_conclusion(conclusion) || lawful_beq_reflexive_prop(conclusion, lawful) {
+        return true;
+    }
+    let literals = numeric_literals_in(conclusion);
+    for_each_nat_env(sorts, &literals, |env| {
+        eval_nat_prop(
+            conclusion,
+            sorts,
+            lawful,
+            prop_local_defs,
+            defined_short_names,
+            env,
+            0,
+        ) == Some(false)
+    })
+}
+
+fn scalar_domain_key(ty: &str) -> Option<&'static str> {
+    let mut cur = ty.trim();
+    while let Some(inner) = strip_wrapping_parens(cur) {
+        cur = inner;
+    }
+    match cur.strip_prefix("_root_.").map_or(cur, str::trim) {
+        "Nat" => Some("nat"),
+        "UInt64" => Some("u64"),
+        "BitVec 64" => Some("bv64"),
+        "UInt32" => Some("u32"),
+        "BitVec 32" => Some("bv32"),
+        "UInt16" => Some("u16"),
+        "BitVec 16" => Some("bv16"),
+        "UInt8" => Some("u8"),
+        "BitVec 8" => Some("bv8"),
+        "Bool" => Some("bool"),
+        _ => None,
+    }
 }
 
 fn card_for(
@@ -3357,21 +4355,61 @@ fn card_for(
     extra: Option<&DeclExtra>,
     detail: Option<&Value>,
 ) -> Value {
+    let instance_binders = extra
+        .map(|row| row.instance_binders.clone())
+        .unwrap_or_default();
     let mut param_binders = Vec::new();
     let mut hypothesis_text = Vec::new();
     let mut seen_type_params: BTreeSet<String> = BTreeSet::new();
     let mut seen_prop_params: BTreeSet<String> = BTreeSet::new();
     let mut seen_value_params: BTreeSet<String> = BTreeSet::new();
+    let mut seen_lawful_beq_vars: BTreeSet<String> = BTreeSet::new();
+    let mut seen_scalar_domain: Option<&'static str> = None;
+    let mut mixed_scalar_domains = false;
     let mut unmodeled_binder = false;
+    let mut seen_binder_names: BTreeSet<String> = BTreeSet::new();
+    for inst in &instance_binders {
+        if let Some((lhs, _)) = split_top_level_colon(inst) {
+            let inst_name = lhs.trim();
+            if !inst_name.is_empty()
+                && inst_name != "_"
+                && (!is_ident_token(inst_name)
+                    || is_reserved_binder_ident(inst_name)
+                    || ctx.defined_short_names.contains(inst_name)
+                    || ctx.prop_local_defs.iter().any(|(name, _, _)| {
+                        name == inst_name || name.rsplit('.').next() == Some(inst_name)
+                    })
+                    || !seen_binder_names.insert(inst_name.to_string()))
+            {
+                unmodeled_binder = true;
+            }
+        }
+    }
     for (vars, ty) in &decl.binders {
+        for var in vars {
+            if var != "_"
+                && (is_reserved_binder_ident(var)
+                    || ctx.defined_short_names.contains(var)
+                    || ctx.prop_local_defs.iter().any(|(name, _, _)| {
+                        name == var || name.rsplit('.').next() == Some(var.as_str())
+                    })
+                    || !seen_binder_names.insert(var.clone()))
+            {
+                unmodeled_binder = true;
+            }
+        }
         if !binder_type_is_modeled(
             ty,
-            &seen_type_params,
+            &seen_lawful_beq_vars,
             &seen_prop_params,
             &seen_value_params,
             ctx.prop_local_defs,
+            ctx.defined_short_names,
         ) && !(is_known_binder_value_type(ty)
-            && safe_inhabited_value_binder_type(ty, ctx.has_shadowed_value_types))
+            && safe_inhabited_value_binder_type(
+                ty,
+                ctx.has_shadowed_value_types || ctx.has_unmodeled_instance_env,
+            ))
             && !is_universe_type(ty)
             && ty.trim() != "Prop"
             && ty.trim() != "_root_.Prop"
@@ -3389,16 +4427,38 @@ fn card_for(
             param_binders.push(json!({"vars": vars, "type": ty}));
         } else if seen_type_params.contains(ty.trim())
             || (is_known_binder_value_type(ty)
-                && safe_inhabited_value_binder_type(ty, ctx.has_shadowed_value_types))
+                && safe_inhabited_value_binder_type(
+                    ty,
+                    ctx.has_shadowed_value_types || ctx.has_unmodeled_instance_env,
+                ))
         {
-            seen_value_params.extend(vars.iter().cloned());
+            let ty_trim = ty.trim();
+            if seen_type_params.contains(ty_trim)
+                && has_matching_instance(&instance_binders, "BEq", ty_trim)
+                && has_matching_instance(&instance_binders, "LawfulBEq", ty_trim)
+            {
+                seen_lawful_beq_vars.extend(vars.iter().cloned());
+            }
+            if is_executable_stage1_binder_type(ty) {
+                if let Some(dom_key) = scalar_domain_key(ty) {
+                    if let Some(prev) = seen_scalar_domain {
+                        if prev != dom_key {
+                            mixed_scalar_domains = true;
+                        }
+                    } else {
+                        seen_scalar_domain = Some(dom_key);
+                    }
+                }
+                seen_value_params.extend(vars.iter().cloned());
+            }
             param_binders.push(json!({"vars": vars, "type": ty}));
         } else if binder_type_is_modeled(
             ty,
-            &seen_type_params,
+            &seen_lawful_beq_vars,
             &seen_prop_params,
             &seen_value_params,
             ctx.prop_local_defs,
+            ctx.defined_short_names,
         ) {
             let names = vars.join(" ");
             hypothesis_text.push(format!("({names} : {ty})"));
@@ -3418,26 +4478,57 @@ fn card_for(
     let vacuous_hypothesis = hypothesis_text
         .iter()
         .any(|text| hypothesis_is_vacuous(text));
+    let mut nat_sorts: BTreeMap<String, DomainSort> = BTreeMap::new();
+    for (vars, ty) in &decl.binders {
+        if let Some(sort) = nat_sort_of(ty) {
+            for var in vars {
+                if seen_value_params.contains(var) {
+                    nat_sorts.insert(var.clone(), sort);
+                }
+            }
+        }
+    }
+    let raw_tight = detail
+        .and_then(|row| row.get("tight"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let scalar_audit_gap = raw_tight
+        && ((!hypothesis_text.is_empty()
+            && !scalar_hypotheses_have_witness(
+                &hypothesis_text,
+                &nat_sorts,
+                &seen_lawful_beq_vars,
+                ctx.prop_local_defs,
+                ctx.defined_short_names,
+            ))
+            || !scalar_conclusion_refuted(
+                &conclusion,
+                &nat_sorts,
+                &seen_lawful_beq_vars,
+                ctx.prop_local_defs,
+                ctx.defined_short_names,
+            ));
     let unmodeled_hypothesis = !seen_prop_params.is_empty()
+        || scalar_audit_gap
+        || (mixed_scalar_domains && !hypothesis_text.is_empty())
         || hypothesis_text.iter().any(|text| {
             !hypothesis_is_modeled(
                 text,
-                &seen_type_params,
+                &seen_lawful_beq_vars,
                 &seen_prop_params,
                 &seen_value_params,
                 ctx.prop_local_defs,
+                ctx.defined_short_names,
             )
         })
         || !conclusion_is_modeled(
             &conclusion,
-            &seen_type_params,
+            &seen_lawful_beq_vars,
             &seen_prop_params,
             &seen_value_params,
             ctx.prop_local_defs,
+            ctx.defined_short_names,
         );
-    let instance_binders = extra
-        .map(|row| row.instance_binders.clone())
-        .unwrap_or_default();
     let context_assumptions = extra
         .map(|row| row.context_assumptions.clone())
         .unwrap_or_default();
@@ -3478,7 +4569,10 @@ fn card_for(
             "declaration modifiers, attributes, or binders were not fully parsed".to_string(),
         );
     }
-    if ctx.has_unmodeled_instance_env && !instance_binders.is_empty() {
+    if ctx.has_unmodeled_instance_env
+        || ctx.has_shadowed_value_types
+        || ctx.has_unmodeled_syntax_env
+    {
         extraction_warnings.push(
             "file-local instances, notation, or shadowed standard names leave instance binders unverified"
                 .to_string(),
@@ -3633,6 +4727,47 @@ fn ident_mentioned(text: &str, ident: &str) -> bool {
         idx += 1;
     }
     false
+}
+
+fn ident_tokens_in(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut idx = 0usize;
+    let mut out = Vec::new();
+    while idx < chars.len() {
+        if chars[idx] == '«' {
+            let start = idx;
+            idx += 1;
+            while idx < chars.len() && chars[idx] != '»' {
+                idx += 1;
+            }
+            if idx < chars.len() {
+                idx += 1;
+            }
+            let raw: String = chars[start..idx].iter().collect();
+            let canon = crate::splitter::canonical_lean_name_component(&raw);
+            if !canon.is_empty() {
+                out.push(canon);
+            }
+            continue;
+        }
+        if is_ident_start(chars[idx]) {
+            let start = idx;
+            idx += 1;
+            while idx < chars.len() && (is_ident_continue(chars[idx]) || chars[idx] == '.') {
+                idx += 1;
+            }
+            let raw: String = chars[start..idx].iter().collect();
+            for part in raw.trim_end_matches('.').split('.') {
+                let canon = crate::splitter::canonical_lean_name_component(part);
+                if !canon.is_empty() {
+                    out.push(canon);
+                }
+            }
+        } else {
+            idx += 1;
+        }
+    }
+    out
 }
 
 fn is_lean_letter_like(c: char) -> bool {
