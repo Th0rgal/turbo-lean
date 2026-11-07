@@ -955,6 +955,28 @@ def run_unit_tests() -> bool:
                     self.assertEqual(record["outcome"], expected)
                     self.assertEqual(record["not_applicable"]["removed_in_verified"], expected == "NOT_APPLICABLE")
 
+        def test_verify_kills_uses_full_check_order(self):
+            import io
+            from contextlib import redirect_stdout
+            captured = {}
+
+            def fake_run_suite(out_path, logs_path, only_ids=None, check_subset=CHECK_ORDER):
+                captured["check_subset"] = tuple(check_subset)
+                active_expected = sum(1 for m in self.spec["mutations"] if not m.get("not_applicable"))
+                return {
+                    "run_outcome": "CONCLUSIVE",
+                    "summary": {"counts": {"KILLED": active_expected, "SURVIVED": 0}},
+                }
+
+            buf = io.StringIO()
+            with patch(__name__ + ".run_unit_tests", return_value=True), patch(
+                __name__ + ".run_suite", side_effect=fake_run_suite
+            ), patch.object(sys, "argv", ["emitter_mutants.py", "--verify-kills"]), redirect_stdout(buf):
+                rc = main()
+            self.assertEqual(rc, 0)
+            self.assertEqual(captured["check_subset"], CHECK_ORDER)
+            self.assertEqual(json.loads(buf.getvalue())["check_subset"], list(CHECK_ORDER))
+
     return unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(RunnerTests)).wasSuccessful()
 
 
@@ -993,7 +1015,7 @@ def main() -> int:
         if not run_unit_tests():
             return 1
         active_expected = sum(1 for m in load_spec()["mutations"] if not m.get("not_applicable"))
-        verify_subset = ("C1", "C2", "C5", "C6", "C7")
+        verify_subset = CHECK_ORDER
         tmp_ctx = tempfile.TemporaryDirectory(prefix="emitter-verify-kills-") if (args.output is None and args.logs is None) else None
         try:
             base_dir = Path(tmp_ctx.name) if tmp_ctx is not None else ROOT

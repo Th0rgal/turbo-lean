@@ -9225,6 +9225,114 @@ fn compute_expected_lake_module_dep_hash(
     lake_input_hash(&inputs).ok()
 }
 
+#[allow(clippy::type_complexity)]
+static CLEAN_GIT_PIN_MEMO: OnceLock<Mutex<HashMap<(PathBuf, String), (u64, bool)>>> =
+    OnceLock::new();
+
+pub(crate) fn manifest_pinned_git_rev_for_pkg<'a>(
+    cfg: &'a ProjectConfig,
+    pkg_name: &str,
+    pkg_base_name: &str,
+    pkg_root: &Path,
+) -> Option<&'a str> {
+    let pkg_canon = pkg_root.canonicalize().ok();
+    cfg.manifest_packages
+        .iter()
+        .find(|mp| {
+            mp.pkg_type == "git"
+                && mp
+                    .rev
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|r| !r.is_empty() && !r.starts_with('-'))
+                && (mp.name == pkg_name
+                    || (!pkg_base_name.is_empty() && mp.name == pkg_base_name)
+                    || mp.dir == pkg_root
+                    || mp
+                        .dir
+                        .canonicalize()
+                        .ok()
+                        .zip(pkg_canon.as_ref())
+                        .is_some_and(|(a, b)| a == *b))
+        })
+        .and_then(|mp| mp.rev.as_deref().map(str::trim))
+}
+
+pub(crate) fn is_clean_pinned_git_checkout(pkg_root: &Path, expected_rev: &str) -> bool {
+    let expected = expected_rev.trim();
+    if expected.is_empty()
+        || expected.starts_with('-')
+        || !matches!(expected.len(), 40 | 64)
+        || !expected.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return false;
+    }
+    let Ok(canon) = pkg_root.canonicalize() else {
+        return false;
+    };
+    if !canon.join(".git").exists() {
+        return false;
+    }
+    let window = current_memo_window();
+    let key = (canon.clone(), expected.to_ascii_lowercase());
+    let memo = CLEAN_GIT_PIN_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Ok(guard) = memo.lock() {
+        if let Some(&(cached_win, ok)) = guard.get(&key) {
+            if cached_win == window {
+                return ok;
+            }
+        }
+    }
+    let computed = (|| -> Option<bool> {
+        if crate::trusted_tools::reject_gitlinks(&canon, &[expected], Path::new(".")).is_err() {
+            return Some(false);
+        }
+        let mut rev_cmd = crate::trusted_tools::git(&canon).ok()?;
+        let rev_out = rev_cmd
+            .args([
+                "--no-optional-locks",
+                "-C",
+                &canon.to_string_lossy(),
+                "rev-parse",
+                "HEAD",
+            ])
+            .output()
+            .ok()?;
+        if !rev_out.status.success() {
+            return Some(false);
+        }
+        let head_rev = String::from_utf8_lossy(&rev_out.stdout);
+        if !head_rev.trim().eq_ignore_ascii_case(expected) {
+            return Some(false);
+        }
+        let mut st_cmd = crate::trusted_tools::git(&canon).ok()?;
+        let st_out = st_cmd
+            .args([
+                "--no-optional-locks",
+                "-C",
+                &canon.to_string_lossy(),
+                "status",
+                "--porcelain",
+                "-z",
+                "-uall",
+                crate::trusted_tools::NO_SUBMODULES,
+            ])
+            .output()
+            .ok()?;
+        if !st_out.status.success() {
+            return Some(false);
+        }
+        Some(st_out.stdout.iter().all(|&b| b == 0))
+    })()
+    .unwrap_or(false);
+    if let Ok(mut guard) = memo.lock() {
+        if current_memo_window() == window {
+            guard.insert(key, (window, computed));
+        }
+    }
+    computed
+}
+
 fn spec_in_clean_git_pinned_manifest_package(
     cfg: &ProjectConfig,
     spec: &DiscoveredModuleSpec,
@@ -9237,22 +9345,8 @@ fn spec_in_clean_git_pinned_manifest_package(
         .pkg_root
         .canonicalize()
         .unwrap_or_else(|_| spec.pkg_root.clone());
-    let Some(expected_rev) = cfg
-        .manifest_packages
-        .iter()
-        .find(|mp| {
-            mp.pkg_type == "git"
-                && mp.rev.as_deref().is_some_and(|r| !r.is_empty())
-                && (mp.name == spec.pkg_name
-                    || (!spec.pkg_base_name.is_empty() && mp.name == spec.pkg_base_name)
-                    || mp.dir == spec.pkg_root
-                    || mp
-                        .dir
-                        .canonicalize()
-                        .ok()
-                        .is_some_and(|a| a == spec_canon))
-        })
-        .and_then(|mp| mp.rev.as_deref())
+    let Some(expected_rev) =
+        manifest_pinned_git_rev_for_pkg(cfg, &spec.pkg_name, &spec.pkg_base_name, &spec.pkg_root)
     else {
         return false;
     };
@@ -9260,9 +9354,14 @@ fn spec_in_clean_git_pinned_manifest_package(
         .clean_git_pin_memo
         .entry(spec_canon.clone())
         .or_insert_with(|| {
+            if !expected_rev.bytes().all(|b| b.is_ascii_hexdigit())
+                || !matches!(expected_rev.len(), 40 | 64)
+            {
+                return None;
+            }
             if crate::trusted_tools::reject_gitlinks(
                 &spec_canon,
-                &[expected_rev.trim()],
+                &[expected_rev],
                 Path::new("."),
             )
             .is_err()
@@ -9284,7 +9383,7 @@ fn spec_in_clean_git_pinned_manifest_package(
                 return None;
             }
             let head_rev = String::from_utf8_lossy(&rev_out.stdout);
-            if !head_rev.trim().eq_ignore_ascii_case(expected_rev.trim()) {
+            if !head_rev.trim().eq_ignore_ascii_case(expected_rev) {
                 return None;
             }
             let mut st_cmd = crate::trusted_tools::git(&spec_canon).ok()?;
@@ -11567,19 +11666,9 @@ pub(crate) fn compile_disposable_snapshot_dirty_modules_direct(
 }
 
 fn is_git_pinned_manifest_package(cfg: &ProjectConfig, spec: &DiscoveredModuleSpec) -> bool {
-    cfg.manifest_packages.iter().any(|mp| {
-        mp.pkg_type == "git"
-            && mp.rev.as_deref().is_some_and(|r| !r.is_empty())
-            && (mp.name == spec.pkg_name
-                || (!spec.pkg_base_name.is_empty() && mp.name == spec.pkg_base_name)
-                || mp.dir == spec.pkg_root
-                || mp
-                    .dir
-                    .canonicalize()
-                    .ok()
-                    .zip(spec.pkg_root.canonicalize().ok())
-                    .is_some_and(|(a, b)| a == b))
-    })
+    !spec.is_root_pkg
+        && manifest_pinned_git_rev_for_pkg(cfg, &spec.pkg_name, &spec.pkg_base_name, &spec.pkg_root)
+            .is_some_and(|rev| is_clean_pinned_git_checkout(&spec.pkg_root, rev))
 }
 
 #[allow(clippy::type_complexity)]
@@ -15644,6 +15733,11 @@ pub fn reset_lake_inputs_tag_memo() {
         }
     }
     if let Some(m) = ARTIFACT_LAKE_HASH_MEMO.get() {
+        if let Ok(mut g) = m.lock() {
+            g.clear();
+        }
+    }
+    if let Some(m) = CLEAN_GIT_PIN_MEMO.get() {
         if let Ok(mut g) = m.lock() {
             g.clear();
         }
@@ -20293,11 +20387,22 @@ pub(crate) fn run_command_with_timeout_pinned_fd(
                             (libc::RLIMIT_DATA, 12 * 1024 * 1024 * 1024),
                             (libc::RLIMIT_FSIZE, 512 * 1024 * 1024),
                         ] {
-                            let r = libc::rlimit {
-                                rlim_cur: lim,
-                                rlim_max: lim,
+                            let mut cur = std::mem::zeroed::<libc::rlimit>();
+                            let capped = if libc::getrlimit(res, &mut cur) == 0
+                                && cur.rlim_max != libc::RLIM_INFINITY
+                                && cur.rlim_max < lim
+                            {
+                                cur.rlim_max
+                            } else {
+                                lim
                             };
-                            let _ = libc::setrlimit(res, &r);
+                            let r = libc::rlimit {
+                                rlim_cur: capped,
+                                rlim_max: capped,
+                            };
+                            if libc::setrlimit(res, &r) != 0 {
+                                return Err(std::io::Error::last_os_error());
+                            }
                         }
                     }
                     Ok(())
@@ -20818,6 +20923,30 @@ fn build_module_compile_command(
 type ModuleCompileOutput = (i64, String, String);
 type StagedModuleCompileOutput = (i64, String, TempDirGuard);
 
+/// Per-module / per-shard compile timeout in seconds (`TURBO_LEAN_MODULE_TIMEOUT_SECS`,
+/// defaulting to 300 s and clamped in untrusted mode to `[15, 600]` so heavy proof modules
+/// do not spuriously fail on shared 4-vCPU CI runners while untrusted builds remain bounded).
+pub(crate) fn module_compile_timeout_secs_from(raw_env: Option<&str>, is_untrusted: bool) -> u64 {
+    let configured = raw_env
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(300);
+    if is_untrusted {
+        configured.clamp(15, 600)
+    } else {
+        configured
+    }
+}
+
+pub(crate) fn module_compile_timeout_secs(is_untrusted: bool) -> u64 {
+    module_compile_timeout_secs_from(
+        std::env::var("TURBO_LEAN_MODULE_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+        is_untrusted,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_single_module_staged(
     cfg: &ProjectConfig,
@@ -20874,15 +21003,7 @@ fn compile_single_module_staged(
         is_untrusted,
         bwrap_bin,
     )?;
-    let timeout_secs = if is_untrusted {
-        120u64
-    } else {
-        std::env::var("TURBO_LEAN_MODULE_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(300)
-    };
+    let timeout_secs = module_compile_timeout_secs(is_untrusted);
     let output = run_command_with_timeout(
         &mut cmd,
         std::time::Duration::from_secs(timeout_secs),
@@ -21400,19 +21521,8 @@ pub(crate) fn ensure_imported_oleans_replayed_with_roots_and_axioms(
 
 pub(crate) fn node_is_git_pinned_manifest_package(cfg: &ProjectConfig, node: &ModuleNode) -> bool {
     !node.is_root_pkg
-        && cfg.manifest_packages.iter().any(|mp| {
-            mp.pkg_type == "git"
-                && mp.rev.as_deref().is_some_and(|r| !r.is_empty())
-                && (mp.name == node.pkg_name
-                    || (!node.pkg_base_name.is_empty() && mp.name == node.pkg_base_name)
-                    || mp.dir == node.pkg_root
-                    || mp
-                        .dir
-                        .canonicalize()
-                        .ok()
-                        .zip(node.pkg_root.canonicalize().ok())
-                        .is_some_and(|(a, b)| a == b))
-        })
+        && manifest_pinned_git_rev_for_pkg(cfg, &node.pkg_name, &node.pkg_base_name, &node.pkg_root)
+            .is_some_and(|rev| is_clean_pinned_git_checkout(&node.pkg_root, rev))
 }
 
 fn node_source_has_disallowed_elab_host_effects(
@@ -40347,12 +40457,46 @@ globs = ["Down.+"]
 
         let dep_dir = root.join(".lake/packages/pwdep");
         fs::create_dir_all(&dep_dir)?;
+        fs::write(dep_dir.join(".gitignore"), "/.lake/\n")?;
         fs::write(
             dep_dir.join("lakefile.lean"),
             "import Lake\nopen Lake DSL\npackage PwDep where\n@[default_target]\nlean_lib PwDep where\n",
         )?;
         let dep_src = "prelude\ndef pwVal : Nat := 42\n";
         fs::write(dep_dir.join("PwDep.lean"), dep_src)?;
+
+        let mut git_init_dep = crate::trusted_tools::git(root)?;
+        assert!(git_init_dep.args(["init", "-q"]).arg(&dep_dir).status()?.success());
+        let mut git_add_dep = crate::trusted_tools::git(&dep_dir)?;
+        assert!(git_add_dep.args(["-C"]).arg(&dep_dir).args(["add", "."]).status()?.success());
+        let mut git_commit_dep = crate::trusted_tools::git(&dep_dir)?;
+        assert!(git_commit_dep
+            .args([
+                "-C",
+                &dep_dir.to_string_lossy(),
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@e",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "init",
+            ])
+            .status()?
+            .success());
+        let mut git_rev_dep = crate::trusted_tools::git(&dep_dir)?;
+        let pwdep_rev = String::from_utf8(
+            git_rev_dep
+                .args(["-C"])
+                .arg(&dep_dir)
+                .args(["rev-parse", "HEAD"])
+                .output()?
+                .stdout,
+        )?
+        .trim()
+        .to_string();
 
         let mut git_init = crate::trusted_tools::git(root)?;
         assert!(git_init.args(["init", "-q"]).arg(&pw_dir).status()?.success());
@@ -40404,7 +40548,7 @@ globs = ["Down.+"]
                     {
                         "type": "git",
                         "name": "pwdep",
-                        "rev": "0123456789abcdef0123456789abcdef01234567",
+                        "rev": pwdep_rev,
                         "url": "https://example.invalid/pwdep",
                         "inherited": false,
                         "configFile": "lakefile.lean"
@@ -40542,6 +40686,7 @@ globs = ["Down.+"]
 
         // Tampering with source invalidates inputless depHash verification.
         fs::write(dep_dir.join("PwDep.lean"), "prelude\ndef pwVal : Nat := 99\n")?;
+        reset_lake_inputs_tag_memo();
         let mut cache2 = LakeClosureCache::default();
         cache2.ignore_mtime_skew = true;
         let mut visiting2 = HashSet::new();
@@ -40587,7 +40732,33 @@ globs = ["Down.+"]
             .iter_mut()
             .find(|mp| mp.name == "proofwidgets")
             .unwrap()
-            .rev = Some(pw_rev2);
+            .rev = Some(pw_rev2.clone());
+        fs::write(
+            root.join("lake-manifest.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [
+                    {
+                        "type": "git",
+                        "name": "proofwidgets",
+                        "rev": pw_rev2,
+                        "url": "https://example.invalid/ProofWidgets4",
+                        "inherited": false,
+                        "configFile": "lakefile.lean"
+                    },
+                    {
+                        "type": "git",
+                        "name": "pwdep",
+                        "rev": pwdep_rev,
+                        "url": "https://example.invalid/pwdep",
+                        "inherited": false,
+                        "configFile": "lakefile.lean"
+                    }
+                ]
+            }))?,
+        )?;
+        reset_lake_inputs_tag_memo();
         let pw_spec = resolve_module_in_package(&pw_pkg, false, "ProofWidgets").expect("PW spec");
         write_fake_leantar_artifacts(&spec_olean_path(&pw_spec), 0x123456789abcdef0)?;
         let mut cache3 = LakeClosureCache::default();
@@ -40598,6 +40769,7 @@ globs = ["Down.+"]
             "clean git-pinned custom-target-needs package must verify"
         );
         fs::write(dep_dir.join("PwDep.lean"), dep_src)?;
+        reset_lake_inputs_tag_memo();
         let dag = build_module_dag(&cfg, &[])?;
         assert!(dag.nodes.contains_key("App"));
         assert!(!dag.nodes.contains_key("ProofWidgets"));
@@ -40612,6 +40784,7 @@ globs = ["Down.+"]
         assert!(!compute_module_cas_key(&cfg, app_node, &app_deps, false)?.is_empty());
         // Dirty tracked custom-target input (`widget/js/hello.tsx`) must fail closed even when `.lean` is untouched.
         fs::write(pw_dir.join("widget/js/hello.tsx"), "export default { pwned: true }\n")?;
+        reset_lake_inputs_tag_memo();
         let mut cache_tsx = LakeClosureCache::default();
         cache_tsx.ignore_mtime_skew = true;
         let mut visiting_tsx = HashSet::new();
@@ -40625,6 +40798,7 @@ globs = ["Down.+"]
             pw_dir.join("ProofWidgets.lean"),
             "prelude\ndef pwHelper : Nat := 2\n",
         )?;
+        reset_lake_inputs_tag_memo();
         let mut cache4 = LakeClosureCache::default();
         cache4.ignore_mtime_skew = true;
         let mut visiting4 = HashSet::new();
@@ -40657,6 +40831,7 @@ globs = ["Down.+"]
 
         let dep_dir = root.join(".lake/packages/searchdep");
         fs::create_dir_all(dep_dir.join("SearchDep"))?;
+        fs::write(dep_dir.join(".gitignore"), "/.lake/\n")?;
         fs::write(
             dep_dir.join("lakefile.lean"),
             "import Lake\nopen Lake DSL\npackage SearchDep where\n@[default_target]\nlean_lib SearchDep where\n  globs := #[.submodules `SearchDep]\n",
@@ -40666,6 +40841,39 @@ globs = ["Down.+"]
         let dep_src = "prelude\ndef queryUrl : IO (Option String) := IO.getEnv \"LEANSEARCHCLIENT_URL\"\ndef mkFallbackRef : String := s!\"{``sorryAx}\"\n";
         fs::write(dep_dir.join("SearchDep/Syntax.lean"), dep_src)?;
 
+        let mut git_init = crate::trusted_tools::git(root)?;
+        assert!(git_init.args(["init", "-q"]).arg(&dep_dir).status()?.success());
+        let mut git_add = crate::trusted_tools::git(&dep_dir)?;
+        assert!(git_add.args(["-C"]).arg(&dep_dir).args(["add", "."]).status()?.success());
+        let mut git_commit = crate::trusted_tools::git(&dep_dir)?;
+        assert!(git_commit
+            .args([
+                "-C",
+                &dep_dir.to_string_lossy(),
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@e",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "init",
+            ])
+            .status()?
+            .success());
+        let mut git_rev = crate::trusted_tools::git(&dep_dir)?;
+        let searchdep_rev = String::from_utf8(
+            git_rev
+                .args(["-C"])
+                .arg(&dep_dir)
+                .args(["rev-parse", "HEAD"])
+                .output()?
+                .stdout,
+        )?
+        .trim()
+        .to_string();
+
         fs::write(
             root.join("lake-manifest.json"),
             serde_json::to_string_pretty(&serde_json::json!({
@@ -40674,7 +40882,7 @@ globs = ["Down.+"]
                 "packages": [{
                     "type": "git",
                     "name": "searchdep",
-                    "rev": "0123456789abcdef0123456789abcdef01234567",
+                    "rev": searchdep_rev,
                     "url": "https://example.invalid/searchdep",
                     "inherited": false,
                     "configFile": "lakefile.lean"

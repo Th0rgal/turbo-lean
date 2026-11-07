@@ -3713,7 +3713,9 @@ fn run_lean_temp_file(
 
         let out_res = crate::module_builder::run_command_with_timeout(
             &mut cmd,
-            std::time::Duration::from_secs(120),
+            std::time::Duration::from_secs(crate::module_builder::module_compile_timeout_secs(
+                true,
+            )),
             true,
         );
         crate::zygote::reap_processes_with_nonce(&nonce);
@@ -5791,24 +5793,24 @@ fn package_may_read_host_state(pkg: &crate::module_builder::PackageConfig) -> bo
     false
 }
 
+fn pinned_git_manifest_dep_rev<'a>(
+    cfg: &'a crate::module_builder::ProjectConfig,
+    dep: &crate::module_builder::PackageConfig,
+) -> Option<&'a str> {
+    crate::module_builder::manifest_pinned_git_rev_for_pkg(
+        cfg,
+        &dep.name,
+        &dep.base_name,
+        &dep.pkg_root,
+    )
+    .filter(|rev| crate::module_builder::is_clean_pinned_git_checkout(&dep.pkg_root, rev))
+}
+
 fn is_pinned_git_manifest_dep(
     cfg: &crate::module_builder::ProjectConfig,
     dep: &crate::module_builder::PackageConfig,
 ) -> bool {
-    let dep_canon = dep.pkg_root.canonicalize().ok();
-    cfg.manifest_packages.iter().any(|mp| {
-        mp.pkg_type == "git"
-            && mp.rev.as_deref().is_some_and(|r| !r.is_empty())
-            && (mp.name == dep.name
-                || (!dep.base_name.is_empty() && mp.name == dep.base_name)
-                || mp.dir == dep.pkg_root
-                || mp
-                    .dir
-                    .canonicalize()
-                    .ok()
-                    .zip(dep_canon.as_ref())
-                    .is_some_and(|(a, b)| a == *b))
-    })
+    pinned_git_manifest_dep_rev(cfg, dep).is_some()
 }
 
 fn dep_package_has_disallowed_elab_host_effects(
@@ -5820,6 +5822,42 @@ fn dep_package_has_disallowed_elab_host_effects(
     } else {
         package_has_lean_elab_host_effects(dep)
     }
+}
+
+fn strip_snapshot_build_products_and_oleans(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for ent in fs::read_dir(dir)? {
+        let ent = ent?;
+        let p = ent.path();
+        let st = fs::symlink_metadata(&p)?;
+        if st.file_type().is_symlink() {
+            continue;
+        }
+        let name = ent.file_name();
+        if name.to_str() == Some(".git") || name.to_str() == Some(".lake") {
+            if st.is_dir() {
+                fs::remove_dir_all(&p)?;
+            } else {
+                fs::remove_file(&p)?;
+            }
+            continue;
+        }
+        if st.is_dir() {
+            strip_snapshot_build_products_and_oleans(&p)?;
+        } else if st.is_file() {
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let fname = name.to_str().unwrap_or("");
+            if matches!(ext, "olean" | "ilean" | "trace")
+                || fname.contains(".olean.")
+                || fname == ".turbo_verified_sources.json"
+            {
+                fs::remove_file(&p)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn copy_dep_sources_without_build_products(
@@ -5835,7 +5873,7 @@ fn copy_dep_sources_without_build_products(
             continue;
         }
         let name = ent.file_name();
-        if name.to_str() == Some(".git") {
+        if matches!(name.to_str(), Some(".git" | ".lake")) {
             continue;
         }
         let dst = dst_root.join(&name);
@@ -5854,6 +5892,14 @@ fn copy_dep_sources_without_build_products(
         } else if st.is_dir() {
             copy_dep_sources_without_build_products(&p, &dst, build_abs)?;
         } else if st.is_file() {
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let fname = name.to_str().unwrap_or("");
+            if matches!(ext, "olean" | "ilean" | "trace")
+                || fname.contains(".olean.")
+                || fname == ".turbo_verified_sources.json"
+            {
+                continue;
+            }
             fs::copy(&p, &dst)?;
         }
     }
@@ -5864,6 +5910,8 @@ fn seed_trusted_statement_dependencies(
     project: &Path,
     cfg: &crate::module_builder::ProjectConfig,
 ) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+
     for dep in &cfg.dep_pkgs {
         let Some(rel) = trusted_dep_snapshot_rel_path(cfg, dep) else {
             continue;
@@ -5879,14 +5927,34 @@ fn seed_trusted_statement_dependencies(
         let source = dep.pkg_root.canonicalize()?;
         if source.is_absolute() && source.is_dir() {
             if dep_package_has_disallowed_elab_host_effects(cfg, dep) {
-                if is_pinned_git_manifest_dep(cfg, dep) && source.join(".git").exists() {
+                if let Some(pinned_rev) =
+                    pinned_git_manifest_dep_rev(cfg, dep).filter(|_| source.join(".git").exists())
+                {
+                    struct ScratchCloneGuard(PathBuf);
+                    impl Drop for ScratchCloneGuard {
+                        fn drop(&mut self) {
+                            let _ = fs::remove_dir_all(&self.0);
+                        }
+                    }
+                    let scratch = loop {
+                        let path = Path::new("/tmp").join(format!(
+                            "turbo-trusted-dep-{}-{}",
+                            std::process::id(),
+                            pack::next_tmp_id()
+                        ));
+                        match fs::DirBuilder::new().mode(0o700).create(&path) {
+                            Ok(()) => break ScratchCloneGuard(path),
+                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                            Err(e) => return Err(e.into()),
+                        }
+                    };
+                    let clone_repo = scratch.0.join("repo.git");
                     let out = crate::trusted_tools::git(project)?
                         .env("GIT_ALLOW_PROTOCOL", "file")
-                        .args(["clone", "--local"])
-                        .args(["--quiet", "--no-hardlinks", "--no-checkout", "--template="])
+                        .args(["clone", "--local", "--bare", "--quiet", "--no-hardlinks", "--template="])
                         .arg("--")
                         .arg(&source)
-                        .arg(&target)
+                        .arg(&clone_repo)
                         .current_dir("/")
                         .output()?;
                     anyhow::ensure!(
@@ -5895,9 +5963,10 @@ fn seed_trusted_statement_dependencies(
                         dep.name,
                         String::from_utf8_lossy(&out.stderr)
                     );
+                    fs::create_dir_all(&target)?;
                     materialize_statement_tree(
-                        &target,
-                        "HEAD",
+                        &clone_repo,
+                        pinned_rev,
                         &target,
                         Some(StatementDependencySpec {
                             dep: Some(dep),
@@ -5906,6 +5975,15 @@ fn seed_trusted_statement_dependencies(
                         Path::new(""),
                         None,
                     )?;
+                    let build_in_target = target.join(&dep.build_dir);
+                    if build_in_target.starts_with(&target) && build_in_target != target && build_in_target.exists() {
+                        if build_in_target.is_dir() {
+                            fs::remove_dir_all(&build_in_target)?;
+                        } else {
+                            fs::remove_file(&build_in_target)?;
+                        }
+                    }
+                    strip_snapshot_build_products_and_oleans(&target)?;
                 } else {
                     let build_abs = source.join(&dep.build_dir);
                     copy_dep_sources_without_build_products(&source, &target, &build_abs)?;
@@ -8569,6 +8647,12 @@ fn compare_kernel_statements(
         .collect()
 }
 
+fn pr_verify_file_worker_jobs(is_untrusted: bool, available_cpus: usize, files_len: usize) -> usize {
+    let base = available_cpus.max(1);
+    let capped = if is_untrusted { base.min(2) } else { base };
+    capped.min(files_len.max(1))
+}
+
 /// Execute `turbo-lean pr-verify`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_pr_verify_command(
@@ -9877,7 +9961,11 @@ pub fn run_pr_verify_command(
                     let default_jobs = std::thread::available_parallelism()
                         .map(|n| n.get())
                         .unwrap_or(4);
-                    let jobs = default_jobs.max(1).min(uncached_by_file.len());
+                    let jobs = pr_verify_file_worker_jobs(
+                        is_untrusted,
+                        default_jobs,
+                        uncached_by_file.len(),
+                    );
                     let next_f = std::sync::atomic::AtomicUsize::new(0);
                     let total_f = uncached_by_file.len();
                     let verify_ref = &verify_one_file;
@@ -18005,5 +18093,204 @@ end ParityNs
             None => std::env::remove_var("LAKE_ARTIFACT_CACHE"),
         }
         res
+    }
+
+    #[test]
+    fn test_pinned_git_dep_cleanliness_and_snapshot_olean_stripping() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_pinned_git_clean_and_strip_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&dir)?;
+        let run = || -> Result<()> {
+            let dep_origin = dir.join("dep_origin");
+            let app_proj = dir.join("app");
+            let dep_in_pkgs = app_proj.join(".lake/packages/dep");
+            fs::create_dir_all(&dep_origin)?;
+            fs::create_dir_all(&app_proj)?;
+            fs::write(dep_origin.join("lean-toolchain"), "leanprover/lean4:v4.31.0\n")?;
+            fs::write(
+                dep_origin.join("lakefile.toml"),
+                "name = \"dep\"\ndefaultTargets = [\"Dep\"]\n[[lean_lib]]\nname = \"Dep\"\nroots = [\"Dep\"]\n",
+            )?;
+            fs::write(
+                dep_origin.join("Dep.lean"),
+                "prelude\ndef depVal : IO (Option String) := IO.getEnv \"TURBO_DUMMY_PIN_ENV\"\n",
+            )?;
+            // Commit a fake prebuilt `.olean` inside `.lake/build/lib/lean/` at rev1 to verify
+            // `seed_trusted_statement_dependencies` strips `.git`, `.lake`, and `.olean` products.
+            fs::create_dir_all(dep_origin.join(".lake/build/lib/lean"))?;
+            fs::write(
+                dep_origin.join(".lake/build/lib/lean/Dep.olean"),
+                b"smuggled-committed-olean",
+            )?;
+            fs::write(
+                dep_origin.join(".lake/build/.turbo_verified_sources.json"),
+                b"{}",
+            )?;
+            git_init_and_commit(&dep_origin, "rev1_with_committed_olean")?;
+            let rev1 = String::from_utf8(
+                crate::trusted_tools::git(&dep_origin)?
+                    .arg("-C")
+                    .arg(&dep_origin)
+                    .args(["rev-parse", "HEAD"])
+                    .output()?
+                    .stdout,
+            )?
+            .trim()
+            .to_string();
+
+            fs::create_dir_all(dep_in_pkgs.parent().unwrap())?;
+            let clone_st = crate::trusted_tools::git(&app_proj)?
+                .env("GIT_ALLOW_PROTOCOL", "file")
+                .args(["clone", "--quiet", "--"])
+                .arg(&dep_origin)
+                .arg(&dep_in_pkgs)
+                .status()?;
+            anyhow::ensure!(clone_st.success(), "clone dep_origin failed");
+
+            fs::write(app_proj.join("lean-toolchain"), "leanprover/lean4:v4.31.0\n")?;
+            fs::write(
+                app_proj.join("lakefile.toml"),
+                format!(
+                    "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep\"\ngit = \"{}\"\nrev = \"{rev1}\"\n[[lean_lib]]\nname = \"App\"\nroots = [\"App\"]\n",
+                    dep_origin.to_string_lossy().replace('\\', "\\\\")
+                ),
+            )?;
+            fs::write(
+                app_proj.join("lake-manifest.json"),
+                serde_json::json!({
+                    "version": "1.1.0",
+                    "packagesDir": ".lake/packages",
+                    "lakeDir": ".lake",
+                    "packages": [{
+                        "type": "git",
+                        "scope": "",
+                        "name": "dep",
+                        "manifestFile": "lake-manifest.json",
+                        "inherited": false,
+                        "url": dep_origin.to_string_lossy(),
+                        "rev": rev1,
+                        "inputRev": rev1,
+                        "subDir": null,
+                        "configFile": "lakefile.toml"
+                    }]
+                })
+                .to_string(),
+            )?;
+            fs::write(app_proj.join("App.lean"), "prelude\nimport Dep\n")?;
+
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            let cfg_clean = crate::module_builder::resolve_project_config_with_trust(&app_proj, false)?;
+            let dep_cfg = cfg_clean
+                .dep_pkgs
+                .iter()
+                .find(|d| d.name == "dep")
+                .expect("dep package resolved");
+            assert!(
+                is_pinned_git_manifest_dep(&cfg_clean, dep_cfg),
+                "clean git checkout at exact manifest rev must be recognized as pinned git dep"
+            );
+
+            let snap_clean = dir.join("snap_clean");
+            fs::create_dir_all(&snap_clean)?;
+            seed_trusted_statement_dependencies(&snap_clean, &cfg_clean)?;
+            let seeded_dep = snap_clean.join(".lake/packages/dep");
+            assert!(seeded_dep.join("Dep.lean").is_file());
+            assert!(
+                !seeded_dep.join(".git").exists(),
+                "trusted statement snapshot must not retain .git directory"
+            );
+            assert!(
+                !seeded_dep.join(".lake").exists(),
+                "trusted statement snapshot must strip committed .lake build products"
+            );
+
+            // Advance local checkout HEAD to an unpinned commit `rev2` without updating `lake-manifest.json`:
+            // `is_pinned_git_manifest_dep` MUST fail closed (`false`).
+            fs::write(
+                dep_in_pkgs.join("Dep.lean"),
+                "prelude\ndef depVal : IO (Option String) := pure (some \"tampered\")\n",
+            )?;
+            let add_st = crate::trusted_tools::git(&dep_in_pkgs)?
+                .arg("-C")
+                .arg(&dep_in_pkgs)
+                .args(["add", "Dep.lean"])
+                .status()?;
+            assert!(add_st.success());
+            let commit_st = crate::trusted_tools::git(&dep_in_pkgs)?
+                .arg("-C")
+                .arg(&dep_in_pkgs)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@e",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "drifted_head",
+                ])
+                .status()?;
+            assert!(commit_st.success());
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            assert!(
+                !is_pinned_git_manifest_dep(&cfg_clean, dep_cfg),
+                "HEAD-drifted git checkout must NOT be treated as clean manifest-pinned git dep"
+            );
+
+            // Reset back to `rev1`, then dirty the worktree with an untracked file: must also fail closed (`false`).
+            let reset_st = crate::trusted_tools::git(&dep_in_pkgs)?
+                .arg("-C")
+                .arg(&dep_in_pkgs)
+                .args(["reset", "--hard", "-q", &rev1])
+                .status()?;
+            assert!(reset_st.success());
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            assert!(is_pinned_git_manifest_dep(&cfg_clean, dep_cfg));
+
+            fs::write(dep_in_pkgs.join("UntrackedEvil.lean"), "prelude\n")?;
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            assert!(
+                !is_pinned_git_manifest_dep(&cfg_clean, dep_cfg),
+                "dirty/untracked git checkout must NOT be treated as clean manifest-pinned git dep"
+            );
+            Ok(())
+        };
+        let res = run();
+        let _ = fs::remove_dir_all(&dir);
+        res
+    }
+
+    #[test]
+    fn test_untrusted_pr_worker_cap_and_timeout_bounds() {
+        assert_eq!(pr_verify_file_worker_jobs(true, 4, 10), 2);
+        assert_eq!(pr_verify_file_worker_jobs(true, 16, 10), 2);
+        assert_eq!(pr_verify_file_worker_jobs(true, 4, 1), 1);
+        assert_eq!(pr_verify_file_worker_jobs(false, 4, 10), 4);
+        assert_eq!(pr_verify_file_worker_jobs(false, 8, 3), 3);
+
+        assert_eq!(
+            crate::module_builder::module_compile_timeout_secs_from(None, true),
+            300
+        );
+        assert_eq!(
+            crate::module_builder::module_compile_timeout_secs_from(Some("0"), true),
+            300
+        );
+        assert_eq!(
+            crate::module_builder::module_compile_timeout_secs_from(Some("5"), true),
+            15
+        );
+        assert_eq!(
+            crate::module_builder::module_compile_timeout_secs_from(Some("1200"), true),
+            600
+        );
+        assert_eq!(
+            crate::module_builder::module_compile_timeout_secs_from(Some("1200"), false),
+            1200
+        );
     }
 }
