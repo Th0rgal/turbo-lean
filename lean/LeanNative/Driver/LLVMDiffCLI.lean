@@ -304,7 +304,8 @@ private def loweredLnirDecls : List (String × LNIRDecl × Option (LLVMFn × Str
   let dUlt := mkBinScalarDecl "lnir_ult64" .i1 (.binOp .lt (.var 0) (.var 1))
   let dDiv := mkBinScalarDecl "lnir_udiv64" .i64 (.binOp .div (.var 0) (.var 1))
   let dDivPow2 := mkBinScalarDecl "lnir_udiv_pow2" .i64
-    (.binOp .div (.var 0) (.binOp .shl (.constU64 1) (.var 1)))
+    (.binOp .div (.binOp .bitAnd (.var 0) (.constU64 255))
+      (.binOp .shl (.constU64 1) (.binOp .bitAnd (.var 1) (.constU64 7))))
   let dDivU8 := mkBinScalarDecl "lnir_udiv_u8" .i64
     (.binOp .div (.binOp .bitAnd (.var 0) (.constU64 255)) (.binOp .bitAnd (.var 1) (.constU64 255)))
   let dIte : LNIRDecl :=

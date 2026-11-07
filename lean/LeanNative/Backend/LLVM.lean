@@ -1635,8 +1635,9 @@ def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_
     let pTy := if rawPTy == "void" then "ptr" else rawPTy
     let zAttr := sigLLVMAttr target p.ty
     let attrs :=
-      if optimized && pTy == "ptr" then " noalias noundef"
-      else if optimized && (pTy == "i8" || pTy == "i16" || pTy == "i32" || pTy == "i64" || pTy == "i256" || pTy == "double") then
+      if pTy == "ptr" then
+        if optimized then " noalias noundef" else " noundef"
+      else if pTy == "i8" || pTy == "i16" || pTy == "i32" || pTy == "i64" || pTy == "i256" || pTy == "double" then
         " " ++ zAttr ++ "noundef"
       else if zAttr != "" then " zeroext"
       else ""
