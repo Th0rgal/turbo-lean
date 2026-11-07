@@ -23,21 +23,65 @@ namespace LeanNative.Backend.MLIRGPU
 
 open LeanNative.IR StableHLOAst
 
+private theorem ssaName_lit (s : String)
+    (h1 : s.toList.isEmpty = false := by decide)
+    (h2 : s.toList.all (fun c => c.isAlphanum || c == '_') = true := by decide) :
+    CanonicalSSAName s := ⟨h1, h2⟩
+
+private theorem const1D_canonical (tenv : TypeEnv) (d : String) (n : Nat) (w : UInt64)
+    (hd : CanonicalSSAName d) :
+    let ty : TensorType := { shape := [n], elem := .ui64 }
+    let v : TensorVal := { ty := ty, data := Array.replicate ty.numElements w.toBitVec }
+    CanonicalStableHLOOp tenv (.constant d v) ∧
+    bindResult tenv (.constant d v) = tenv.bind d ty := by
+  refine ⟨⟨hd, rfl, Or.inr ⟨n, rfl⟩, Array.size_replicate ..⟩, ?_⟩
+  simp only [bindResult, resultTypeOf, Array.size_replicate, beq_self_eq_true, ↓reduceIte]
+
 /-- The declaration emitter constructs lexically valid, well-typed covered operations. -/
 theorem lowerStableHLODeclFunc_canonical (name : String) (kernel : ParallelKernelKind)
     (f : FuncOp) (hn : CanonicalSSAName name)
     (hf : lowerStableHLODeclFunc name kernel = some f) : CanonicalFuncOp f := by
-  cases kernel <;> simp only [lowerStableHLODeclFunc, bind, Option.bind, pure] at hf
-  all_goals try contradiction
-  all_goals cases hf
-  all_goals simp only [CanonicalFuncOp, hn, true_and]
-  all_goals
-    simp [CanonicalBody, CanonicalStableHLOOp,
-      CanonicalSSAName, bindResult, resultTypeOf, TypeEnv.bind,
-      TensorType.numElements, dotOperandOk, dimsStrict, complement,
-      show (ElemType.ui64 == ElemType.ui64) = true from rfl,
-      show (({ shape := [262144], elem := .ui64 } : TensorType) ==
-        { shape := [262144], elem := .ui64 }) = true from rfl]
+  let ty : TensorType := { shape := [262144], elem := .ui64 }
+  cases kernel with
+  | mapScaleAdd scale bias =>
+    simp only [lowerStableHLODeclFunc, bind, Option.bind, pure, Option.some.injEq] at hf
+    subst hf; refine ⟨hn, ?_, ?_⟩
+    · intro p hp; simp only [List.map, List.mem_singleton] at hp; subst hp; exact ssaName_lit _
+    · dsimp only [List.map, List.foldl, CanonicalBody]
+      have h0 := const1D_canonical (TypeEnv.empty.bind "in0" ty) "c_scale" 262144 scale (ssaName_lit _)
+      refine ⟨h0.1, ?_⟩; rw [h0.2]
+      have h1 := const1D_canonical ((TypeEnv.empty.bind "in0" ty).bind "c_scale" ty) "c_bias" 262144 bias (ssaName_lit _)
+      refine ⟨h1.1, ?_⟩; rw [h1.2]
+      dsimp only [CanonicalStableHLOOp, resultTypeOf, bindResult, TypeEnv.bind]
+      exact ⟨⟨ssaName_lit _, ssaName_lit _, ssaName_lit _, by decide⟩,
+        ⟨ssaName_lit _, ssaName_lit _, ssaName_lit _, by decide⟩, ⟨ssaName_lit _, by decide⟩, trivial⟩
+  | zipAdd | zipMul =>
+    simp only [lowerStableHLODeclFunc, bind, Option.bind, pure, Option.some.injEq] at hf
+    subst hf; refine ⟨hn, ?_, ?_⟩
+    · intro p hp; simp only [List.map, List.mem_cons, List.not_mem_nil, or_false] at hp
+      rcases hp with rfl | rfl <;> exact ssaName_lit _
+    · dsimp only [List.map, List.foldl, CanonicalBody, CanonicalStableHLOOp, resultTypeOf, bindResult, TypeEnv.bind]
+      exact ⟨⟨ssaName_lit _, ssaName_lit _, ssaName_lit _, by decide⟩, ⟨ssaName_lit _, by decide⟩, trivial⟩
+  | saxpy alpha =>
+    simp only [lowerStableHLODeclFunc, bind, Option.bind, pure, Option.some.injEq] at hf
+    subst hf; refine ⟨hn, ?_, ?_⟩
+    · intro p hp; simp only [List.map, List.mem_cons, List.not_mem_nil, or_false] at hp
+      rcases hp with rfl | rfl <;> exact ssaName_lit _
+    · dsimp only [List.map, List.foldl, CanonicalBody]
+      have h0 := const1D_canonical ((TypeEnv.empty.bind "x" ty).bind "y" ty) "c_alpha" 262144 alpha (ssaName_lit _)
+      refine ⟨h0.1, ?_⟩; rw [h0.2]
+      dsimp only [CanonicalStableHLOOp, resultTypeOf, bindResult, TypeEnv.bind]
+      exact ⟨⟨ssaName_lit _, ssaName_lit _, ssaName_lit _, by decide⟩,
+        ⟨ssaName_lit _, ssaName_lit _, ssaName_lit _, by decide⟩, ⟨ssaName_lit _, by decide⟩, trivial⟩
+  | dotProduct =>
+    simp only [lowerStableHLODeclFunc, bind, Option.bind, pure, Option.some.injEq] at hf
+    subst hf; refine ⟨hn, ?_, ?_⟩
+    · intro p hp; simp only [List.map, List.mem_cons, List.not_mem_nil, or_false] at hp
+      rcases hp with rfl | rfl <;> exact ssaName_lit _
+    · dsimp only [List.map, List.foldl, CanonicalBody, CanonicalStableHLOOp, resultTypeOf, bindResult, TypeEnv.bind]
+      exact ⟨⟨ssaName_lit _, ssaName_lit _, ssaName_lit _, rfl, rfl, by decide⟩, ⟨ssaName_lit _, by decide⟩, trivial⟩
+  | stencil1D3Pt _ _ _ | customScalar _ _ _ =>
+    simp [lowerStableHLODeclFunc] at hf
 
 /-- Every canonical lowered declaration function roundtrips through `parseFuncOp ∘ ppFuncOp`. -/
 theorem lowerStableHLODeclFunc_roundtrip (name : String) (kernel : ParallelKernelKind)

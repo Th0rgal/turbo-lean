@@ -20290,7 +20290,7 @@ pub(crate) fn run_command_with_timeout_pinned_fd(
                     if is_untrusted {
                         for (res, lim) in [
                             (libc::RLIMIT_CORE, 0),
-                            (libc::RLIMIT_DATA, 8 * 1024 * 1024 * 1024),
+                            (libc::RLIMIT_DATA, 12 * 1024 * 1024 * 1024),
                             (libc::RLIMIT_FSIZE, 512 * 1024 * 1024),
                         ] {
                             let r = libc::rlimit {
@@ -20785,7 +20785,8 @@ fn build_module_compile_command(
         c
     };
     // When `is_untrusted`, pass Lean's `-M 4096 -j 4` (4096 MB internal allocator limit and 4
-    // task threads so 256 MB per-thread stacks fit inside the 8 GiB `RLIMIT_DATA` cap on ≥8-core hosts)
+    // task threads so 256 MB per-thread stacks + imported `.olean` mappings fit inside the 12 GiB
+    // `RLIMIT_DATA` cap on ≥8-core hosts)
     // after `cfg.lean_bin` in addition to the OS-level `RLIMIT_DATA` enforced in `run_command_with_timeout`.
     if is_untrusted {
         cmd.args(["-M", "4096", "-j", "4"]);
