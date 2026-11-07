@@ -28,107 +28,19 @@ theorem parseMSLScalarType_roundtrip (ty : MSLType) (h : CanonicalMSLValueType t
 private theorem parseMSLParamType_pointer_roundtrip (sp : MSLAddressSpace) (isConst : Bool)
     (el : MSLType) (hel : CanonicalMSLValueType el) (hconst : sp = .constant → isConst = false) :
     parseMSLParamType (ppMSLType (.pointer sp isConst el)) = some (.pointer sp isConst el) := by
-  have hpel : parseMSLScalarType (ppMSLType el) = some el := parseMSLScalarType_roundtrip el hel
-  have hscalar : parseMSLScalarType (ppMSLType (.pointer sp isConst el)) = none := by
-    cases sp <;> cases isConst <;> cases el <;> first | exact False.elim hel | rfl
-  have hnotconst : ∀ rest, (ppMSLType el).toList ++ ['*'] ≠ 'c' :: 'o' :: 'n' :: 's' :: 't' :: ' ' :: rest := by
-    intro rest heq
-    cases el <;> first | exact False.elim hel | simp [ppMSLType] at heq
-  have hrev (l : List Char) : (l ++ ['*']).reverse = '*' :: l.reverse := by simp
-  unfold parseMSLParamType
-  rw [hscalar]
-  dsimp only [bind, Option.bind, pure]
-  cases isConst with
-  | false =>
-    cases sp <;> {
-      simp only [ppMSLType, ppMSLAddressSpace, Bool.false_and, Bool.false_eq_true, ↓reduceIte,
-        String.toList_append, String.reduceToList, List.cons_append, List.nil_append]
-      change (let p := match (ppMSLType el).toList ++ ['*'] with
-        | 'c' :: 'o' :: 'n' :: 's' :: 't' :: ' ' :: rest => (true, rest)
-        | _ => (false, (ppMSLType el).toList ++ ['*'])
-        match p.2.reverse with
-        | suffix :: rev =>
-          match parseMSLScalarType (String.ofList rev.reverse) with
-          | some ty =>
-            if suffix == '*' then some (.pointer _ p.1 ty)
-            else if suffix == '&' && !p.1 then some (.ref _ ty) else none
-          | none => none
-        | [] => none) = _
-      split
-      · rename_i rest heq; exact False.elim (hnotconst rest heq)
-      · dsimp only; rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
-    }
-  | true =>
-    cases sp
-    case constant => exact False.elim (Bool.noConfusion (hconst rfl))
-    case device =>
-      simp only [ppMSLType, ppMSLAddressSpace, show (MSLAddressSpace.device != .constant) = true from rfl,
-        Bool.true_and, ↓reduceIte, String.toList_append, String.reduceToList, List.cons_append, List.nil_append]
-      change (match ((ppMSLType el).toList ++ ['*']).reverse with
-        | suffix :: rev =>
-          match parseMSLScalarType (String.ofList rev.reverse) with
-          | some ty =>
-            if suffix == '*' then some (.pointer .device true ty)
-            else if suffix == '&' && !true then some (.ref .device ty) else none
-          | none => none
-        | [] => none) = _
-      rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
-    case thread =>
-      simp only [ppMSLType, ppMSLAddressSpace, show (MSLAddressSpace.thread != .constant) = true from rfl,
-        Bool.true_and, ↓reduceIte, String.toList_append, String.reduceToList, List.cons_append, List.nil_append]
-      change (match ((ppMSLType el).toList ++ ['*']).reverse with
-        | suffix :: rev =>
-          match parseMSLScalarType (String.ofList rev.reverse) with
-          | some ty =>
-            if suffix == '*' then some (.pointer .thread true ty)
-            else if suffix == '&' && !true then some (.ref .thread ty) else none
-          | none => none
-        | [] => none) = _
-      rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
-    case threadgroup =>
-      simp only [ppMSLType, ppMSLAddressSpace, show (MSLAddressSpace.threadgroup != .constant) = true from rfl,
-        Bool.true_and, ↓reduceIte, String.toList_append, String.reduceToList, List.cons_append, List.nil_append]
-      change (match ((ppMSLType el).toList ++ ['*']).reverse with
-        | suffix :: rev =>
-          match parseMSLScalarType (String.ofList rev.reverse) with
-          | some ty =>
-            if suffix == '*' then some (.pointer .threadgroup true ty)
-            else if suffix == '&' && !true then some (.ref .threadgroup ty) else none
-          | none => none
-        | [] => none) = _
-      rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
+  cases isConst <;> cases sp <;> cases el <;>
+    first
+    | exact False.elim hel
+    | exact False.elim (Bool.noConfusion (hconst rfl))
+    | rfl
 
 private theorem parseMSLParamType_ref_roundtrip (sp : MSLAddressSpace)
     (el : MSLType) (hel : CanonicalMSLValueType el) :
     parseMSLParamType (ppMSLType (.ref sp el)) = some (.ref sp el) := by
-  have hpel : parseMSLScalarType (ppMSLType el) = some el := parseMSLScalarType_roundtrip el hel
-  have hscalar : parseMSLScalarType (ppMSLType (.ref sp el)) = none := by
-    cases sp <;> cases el <;> first | exact False.elim hel | rfl
-  have hnotconst : ∀ rest, (ppMSLType el).toList ++ ['&'] ≠ 'c' :: 'o' :: 'n' :: 's' :: 't' :: ' ' :: rest := by
-    intro rest heq
-    cases el <;> first | exact False.elim hel | simp [ppMSLType] at heq
-  have hrev (l : List Char) : (l ++ ['&']).reverse = '&' :: l.reverse := by simp
-  unfold parseMSLParamType
-  rw [hscalar]
-  dsimp only [bind, Option.bind, pure]
-  cases sp <;> {
-    simp only [ppMSLType, ppMSLAddressSpace, String.toList_append, String.reduceToList,
-      List.cons_append, List.nil_append]
-    change (let p := match (ppMSLType el).toList ++ ['&'] with
-      | 'c' :: 'o' :: 'n' :: 's' :: 't' :: ' ' :: rest => (true, rest)
-      | _ => (false, (ppMSLType el).toList ++ ['&'])
-      match p.2.reverse with
-      | suffix :: rev =>
-        match parseMSLScalarType (String.ofList rev.reverse) with
-        | some ty =>
-          if suffix == '*' then some (.pointer _ p.1 ty)
-          else if suffix == '&' && !p.1 then some (.ref _ ty) else none
-        | none => none
-      | [] => none) = _
-    split
-    · rename_i rest heq; exact False.elim (hnotconst rest heq)
-    · dsimp only; rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
-  }
+  cases sp <;> cases el <;>
+    first
+    | exact False.elim hel
+    | rfl
 
 theorem parseMSLParamType_roundtrip (ty : MSLType) (h : CanonicalMSLType ty) :
     parseMSLParamType (ppMSLType ty) = some ty := by
