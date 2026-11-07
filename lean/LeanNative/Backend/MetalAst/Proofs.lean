@@ -43,10 +43,20 @@ private theorem parseMSLParamType_pointer_roundtrip (sp : MSLAddressSpace) (isCo
     cases sp <;> {
       simp only [ppMSLType, ppMSLAddressSpace, Bool.false_and, Bool.false_eq_true, ↓reduceIte,
         String.toList_append, String.reduceToList, List.cons_append, List.nil_append]
-      dsimp only [Option.bind]
+      change (let p := match (ppMSLType el).toList ++ ['*'] with
+        | 'c' :: 'o' :: 'n' :: 's' :: 't' :: ' ' :: rest => (true, rest)
+        | _ => (false, (ppMSLType el).toList ++ ['*'])
+        match p.2.reverse with
+        | suffix :: rev =>
+          match parseMSLScalarType (String.ofList rev.reverse) with
+          | some ty =>
+            if suffix == '*' then some (.pointer _ p.1 ty)
+            else if suffix == '&' && !p.1 then some (.ref _ ty) else none
+          | none => none
+        | [] => none) = _
       split
       · rename_i rest heq; exact False.elim (hnotconst rest heq)
-      · rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
+      · dsimp only; rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
     }
   | true =>
     cases sp
@@ -54,15 +64,39 @@ private theorem parseMSLParamType_pointer_roundtrip (sp : MSLAddressSpace) (isCo
     case device =>
       simp only [ppMSLType, ppMSLAddressSpace, show (MSLAddressSpace.device != .constant) = true from rfl,
         Bool.true_and, ↓reduceIte, String.toList_append, String.reduceToList, List.cons_append, List.nil_append]
-      dsimp only [Option.bind]; rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
+      change (match ((ppMSLType el).toList ++ ['*']).reverse with
+        | suffix :: rev =>
+          match parseMSLScalarType (String.ofList rev.reverse) with
+          | some ty =>
+            if suffix == '*' then some (.pointer .device true ty)
+            else if suffix == '&' && !true then some (.ref .device ty) else none
+          | none => none
+        | [] => none) = _
+      rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
     case thread =>
       simp only [ppMSLType, ppMSLAddressSpace, show (MSLAddressSpace.thread != .constant) = true from rfl,
         Bool.true_and, ↓reduceIte, String.toList_append, String.reduceToList, List.cons_append, List.nil_append]
-      dsimp only [Option.bind]; rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
+      change (match ((ppMSLType el).toList ++ ['*']).reverse with
+        | suffix :: rev =>
+          match parseMSLScalarType (String.ofList rev.reverse) with
+          | some ty =>
+            if suffix == '*' then some (.pointer .thread true ty)
+            else if suffix == '&' && !true then some (.ref .thread ty) else none
+          | none => none
+        | [] => none) = _
+      rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
     case threadgroup =>
       simp only [ppMSLType, ppMSLAddressSpace, show (MSLAddressSpace.threadgroup != .constant) = true from rfl,
         Bool.true_and, ↓reduceIte, String.toList_append, String.reduceToList, List.cons_append, List.nil_append]
-      dsimp only [Option.bind]; rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
+      change (match ((ppMSLType el).toList ++ ['*']).reverse with
+        | suffix :: rev =>
+          match parseMSLScalarType (String.ofList rev.reverse) with
+          | some ty =>
+            if suffix == '*' then some (.pointer .threadgroup true ty)
+            else if suffix == '&' && !true then some (.ref .threadgroup ty) else none
+          | none => none
+        | [] => none) = _
+      rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
 
 private theorem parseMSLParamType_ref_roundtrip (sp : MSLAddressSpace)
     (el : MSLType) (hel : CanonicalMSLValueType el) :
@@ -80,10 +114,20 @@ private theorem parseMSLParamType_ref_roundtrip (sp : MSLAddressSpace)
   cases sp <;> {
     simp only [ppMSLType, ppMSLAddressSpace, String.toList_append, String.reduceToList,
       List.cons_append, List.nil_append]
-    dsimp only [Option.bind]
+    change (let p := match (ppMSLType el).toList ++ ['&'] with
+      | 'c' :: 'o' :: 'n' :: 's' :: 't' :: ' ' :: rest => (true, rest)
+      | _ => (false, (ppMSLType el).toList ++ ['&'])
+      match p.2.reverse with
+      | suffix :: rev =>
+        match parseMSLScalarType (String.ofList rev.reverse) with
+        | some ty =>
+          if suffix == '*' then some (.pointer _ p.1 ty)
+          else if suffix == '&' && !p.1 then some (.ref _ ty) else none
+        | none => none
+      | [] => none) = _
     split
     · rename_i rest heq; exact False.elim (hnotconst rest heq)
-    · rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
+    · dsimp only; rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
   }
 
 theorem parseMSLParamType_roundtrip (ty : MSLType) (h : CanonicalMSLType ty) :
