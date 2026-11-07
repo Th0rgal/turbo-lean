@@ -493,6 +493,79 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.GPUEmitterMutantProofs.production_customScalar_emitter_wired
   , ``LeanNative.Backend.LLVMEmitVerify.emitDeclLLVMViaAST_matches_lowering
   , ``LeanNative.Backend.LLVMEmitVerify.emitDeclLLVMViaAST_of_lowered
+  , ``LeanNative.Backend.PTXAst.natRepr_ptxNameChars
+  , ``LeanNative.Backend.PTXAst.toHexFixedGo_append
+  , ``LeanNative.Backend.PTXAst.hexDigitChar_valid
+  , ``LeanNative.Backend.PTXAst.parsePTXHex_append_digit
+  , ``LeanNative.Backend.PTXAst.parsePTXHex_toHexFixedGo
+  , ``LeanNative.Backend.PTXAst.toHexFixedGo_chars
+  , ``LeanNative.Backend.PTXAst.ptxOpcodeFields_append_dot
+  , ``LeanNative.Backend.PTXAst.ptxOpcodeFields_mov
+  , ``LeanNative.Backend.PTXAst.ptxOpcodeFields_typed
+  , ``LeanNative.Backend.PTXAst.parsePTXType_suffix
+  , ``LeanNative.Backend.PTXAst.ptxTypedName
+  , ``LeanNative.Backend.PTXAst.ptxMovToken_ne
+  , ``LeanNative.Backend.PTXAst.parsePTXInstr_mov_step
+  , ``LeanNative.Backend.PTXAst.ptxTypedToken_ne
+  , ``LeanNative.Backend.PTXAst.parsePTXStmt_instr_step
+  , ``LeanNative.Backend.PTXAst.scanPTXLines_singleton
+  , ``LeanNative.Backend.PTXAst.scanPTXLines_prepend
+  , ``LeanNative.Backend.PTXAst.scanPTXLines_intercalate
+  , ``LeanNative.Backend.PTXAst.ptxKernelFuel_bounds
+  , ``LeanNative.Backend.PTXAst.parsePTXDeclsAndBody_kernel_roundtrip
+  , ``LeanNative.Backend.PTXAst.parsePTXDeclsAndBody_kernel_fuel_roundtrip
+  , ``LeanNative.Backend.PTXAst.scanPTXLines_string_intercalate
+  , ``LeanNative.Backend.PTXAst.parsePTXKernel_roundtrip
+  , ``LeanNative.Backend.PTXAst.ppPTXKernel_injective_on_canonical
+  , ``LeanNative.Proofs.PTXLowerProofs.canonical_fold_append
+  , ``LeanNative.Proofs.PTXLowerProofs.lowerKind_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.stripPrefixChars_append
+  , ``LeanNative.Backend.StableHLOAst.scanHLOFields_singleton_append
+  , ``LeanNative.Backend.StableHLOAst.scanHLOFields_singleton_last
+  , ``LeanNative.Backend.StableHLOAst.scanHLOFields_intercalate
+  , ``LeanNative.Backend.StableHLOAst.parseHLOFields_intercalate
+  , ``LeanNative.Backend.StableHLOAst.scanHLOFields_prefix
+  , ``LeanNative.Backend.StableHLOAst.scanHLOFields_delimiter
+  , ``LeanNative.Backend.StableHLOAst.scanHLOFields_intercalate_head
+  , ``LeanNative.Backend.StableHLOAst.parseHLOFields_intercalate_head
+  , ``LeanNative.Backend.StableHLOAst.scanHLOFields_chunk
+  , ``LeanNative.Backend.StableHLOAst.parseStableHLOOp_return_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.parseNatList_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.parseStableHLOOp_binary_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.parseStableHLOOp_add_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.parseElemType_complete
+  , ``LeanNative.Backend.StableHLOAst.ppTensorType_fields
+  , ``LeanNative.Backend.StableHLOAst.parseStableHLOOp_convert_reshape_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.parseStableHLOOp_convert_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.parseStableHLOOp_reshape_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.parseStableHLOOp_select_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.parseStableHLOOp_compare_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.intercalate_all
+  , ``LeanNative.Backend.StableHLOAst.ppNatList_chars
+  , ``LeanNative.Backend.StableHLOAst.ppNatList_excludes
+  , ``LeanNative.Backend.StableHLOAst.stripPrefixChars_none_of_absent
+  , ``LeanNative.Backend.StableHLOAst.scanHLOFields_single_of_absent
+  , ``LeanNative.Backend.StableHLOAst.parseHLOFields_single_of_absent
+  , ``LeanNative.Backend.StableHLOAst.parseHLOFields_pair_of_no_prefix
+  , ``LeanNative.Backend.StableHLOAst.parseHLOFields_pair_head
+  , ``LeanNative.Backend.StableHLOAst.parseHLOFields_pair_second
+  , ``LeanNative.Backend.StableHLOAst.parseHLOFields_stablehlo_nonmatch
+  , ``LeanNative.Backend.StableHLOAst.parseStableHLOOp_broadcastInDim_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.parseStableHLOOp_dotGeneral_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.parseSliceRanges_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.parseStableHLOOp_slice_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.parseStableHLOOp_constant_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.parseStableHLOOp_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.ppStableHLOOp_injective_on_canonical
+  , ``LeanNative.Backend.StableHLOAst.parseBody_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.ppBody_injective_on_canonical
+  , ``LeanNative.Backend.StableHLOAst.parseFuncOp_roundtrip
+  , ``LeanNative.Backend.StableHLOAst.ppFuncOp_injective_on_canonical
+  , ``LeanNative.Backend.MLIRGPU.lowerStableHLODeclFunc_roundtrip
+  , ``LeanNative.Proofs.canonicalSSAName_hloVarReg
+  , ``LeanNative.Proofs.canonicalSSAName_hloTmpReg
+  , ``LeanNative.Proofs.lowerToStableHLO_canonical
+  , ``LeanNative.Proofs.lowerToStableHLO_roundtrip
   , ``LeanNative.Backend.LLVMAst.ppInstr_nonempty
   , ``LeanNative.Backend.LLVMAst.add_nsw_overflow_poison
   , ``LeanNative.Backend.LLVMAst.shl_overshift_poison
@@ -693,7 +766,7 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.ablateSitesLeaveOneOut_sound
   ]
 
-#guard auditedTheoremNames.length == 735
+#guard auditedTheoremNames.length == 808
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/

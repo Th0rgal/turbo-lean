@@ -195,6 +195,38 @@ class Tests(unittest.TestCase):
                 forced = plan(base, docs, "--event", event)
                 self.assertTrue(forced["force_full"])
                 self.assertTrue(forced["run_lean_build"])
+            checked = json.loads(command("python3", script, "--check", "--base", base))
+            self.assertEqual(checked["base"], base)
+            checked_default = json.loads(command("python3", script, "--check"))
+            self.assertEqual(checked_default["head"], command("git", "rev-parse", "HEAD"))
+
+
+def verify_plan_invariants(plan):
+    for key in ("impact_digest", "base_impact_digest"):
+        digest = plan.get(key, "")
+        if not (isinstance(digest, str) and len(digest) == 64):
+            raise AssertionError(f"invalid {key}: {digest!r}")
+    expected_build = (plan["force_full"] or not plan["docs_only"]
+                      or not plan["inputs_unchanged"])
+    if plan["run_lean_build"] != expected_build:
+        raise AssertionError(f"run_lean_build mismatch: {plan}")
+    if plan["force_full"] and not (
+        plan["run_lean_build"] and plan["run_conformance_full"]
+        and plan["conformance_seeds"] == 64
+    ):
+        raise AssertionError(f"force_full invariant failed: {plan}")
+
+
+def resolve_default_base():
+    for candidate in ("origin/main", "main", "HEAD"):
+        try:
+            return subprocess.check_output(
+                ["git", "rev-parse", "--verify", "-q", candidate + "^{commit}"],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+        except subprocess.CalledProcessError:
+            continue
+    raise SystemExit("unable to resolve default base commit for --check")
 
 
 def main():
@@ -205,15 +237,19 @@ def main():
     ap.add_argument("--ref", default=os.getenv("GITHUB_REF", ""))
     ap.add_argument("--github-output", default=os.getenv("GITHUB_OUTPUT"))
     ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--check", action="store_true")
     args = ap.parse_args()
     if args.self_test:
         result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(Tests))
         return 0 if result.wasSuccessful() else 1
-    if not args.base:
-        ap.error("--base is required unless --self-test is used")
-    base = git("rev-parse", "--verify", args.base + "^{commit}").decode().strip()
+    if not args.base and not args.check:
+        ap.error("--base is required unless --self-test or --check is used")
+    base = (git("rev-parse", "--verify", args.base + "^{commit}").decode().strip()
+            if args.base else resolve_default_base())
     head = git("rev-parse", "--verify", args.head + "^{commit}").decode().strip()
     plan, paths = plan_trees(base, head, args.event, args.ref)
+    if args.check:
+        verify_plan_invariants(plan)
     print(json.dumps(dict(plan, base=base, head=head, changed_files=paths), sort_keys=True))
     if args.github_output:
         with open(args.github_output, "a", encoding="utf-8") as out:
