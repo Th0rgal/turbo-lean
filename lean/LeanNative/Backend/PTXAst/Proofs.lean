@@ -1116,7 +1116,6 @@ theorem parsePTXInstr_binary_roundtrip (opcode : String) (ty : PTXType)
   rcases hop with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl <;>
     simp [stripPrefixChars, hd, ha, hb]
 
-set_option maxHeartbeats 2000000 in
 /-- Binary instructions whose opcode includes one scalar modifier. -/
 theorem parsePTXInstr_modified_binary_roundtrip (opcode modifier : String) (ty : PTXType)
     (dst : String) (a b : PTXOperand) (ins : PTXInstr)
@@ -1151,42 +1150,53 @@ theorem parsePTXInstr_modified_binary_roundtrip (opcode modifier : String) (ty :
     rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩ | ⟨cmp, rfl, rfl, rfl⟩ <;>
       simp [String.toList_append])
   have hfields := congrArg (List.map String.ofList) (ptxOpcodeFields_typed (opcode ++ modifier).toList ty)
+  let mods : List String := match modifier.toList with
+    | '.' :: cs => [String.ofList cs]
+    | _ => []
+  have htok_parts : (ptxOpcodeFields (opcode ++ modifier).toList).map String.ofList = opcode :: mods := by
+    rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩ | ⟨cmp, rfl, rfl, rfl⟩
+    · cases rm <;> rfl
+    · cases mode <;> rfl
+    · cases cmp <;> rfl
+  let parts := opcode :: (mods ++ [String.ofList ((ppPTXType ty).toList.drop 1)])
+  have hparts : (ptxOpcodeFields (opcode ++ modifier ++ ppPTXType ty).toList).map String.ofList = parts := by
+    rw [show (ptxOpcodeFields (opcode ++ modifier ++ ppPTXType ty).toList).map String.ofList =
+      (ptxOpcodeFields (opcode ++ modifier).toList).map String.ofList ++
+        [String.ofList ((ppPTXType ty).toList.drop 1)] by
+      simpa [String.toList_append, List.map_append] using hfields, htok_parts, List.cons_append]
+  have hlast : parts.getLast? = some (String.ofList ((ppPTXType ty).toList.drop 1)) := by
+    simp [parts, List.getLast?_append_of_ne_nil]
+  have hmods : (parts.drop 1).dropLast = mods := by
+    simp [parts, List.dropLast_concat]
+  have hop_not_st : (opcode == "st") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_not_ld : (opcode == "ld") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_not_cvta : (opcode == "cvta") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_not_cvt : (opcode == "cvt") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_allow : (opcode == "add" || opcode == "mul" || opcode == "mad" || opcode == "fma" ||
+      opcode == "setp") = true := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_not_selp : (opcode == "selp") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
   simp only [String.toList_append, List.append_assoc] at ht
   conv =>
     lhs
     arg 2
     simp only [String.toList_append, String.reduceToList, List.append_assoc,
       List.cons_append, List.nil_append]
-  simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
-    Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
-  rw [show (ptxOpcodeFields (opcode ++ modifier ++ ppPTXType ty).toList).map String.ofList =
-    (ptxOpcodeFields (opcode ++ modifier).toList).map String.ofList ++
-      [String.ofList ((ppPTXType ty).toList.drop 1)] by
-    simpa [String.toList_append, List.map_append] using hfields]
+  unfold parsePTXInstr
+  simp only [ht, bind, Option.bind, pure, hne.1, hne.2.1, hne.2.2,
+    Bool.false_eq_true, ↓reduceIte, stripPrefixChars, hparts]
+  simp only [parts, List.head?_cons, hlast, parsePTXType_suffix, hmods,
+    hop_not_st, hop_not_ld, hop_not_cvta, hop_not_cvt, hop_allow, Bool.not_true, Bool.false_and,
+    hd, ha, hb, hop_not_selp, stripPrefixChars]
   rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩ | ⟨cmp, rfl, rfl, rfl⟩
-  all_goals first | cases rm | cases mode | cases cmp
-  all_goals
-    simp only [ppRoundMode, ppMulMode, ppCmpOp, String.reduceAppend]
-    simp only [show (ptxOpcodeFields "add".toList).map String.ofList = ["add"] from rfl,
-      show (ptxOpcodeFields "add.rn".toList).map String.ofList = ["add", "rn"] from rfl,
-      show (ptxOpcodeFields "add.rz".toList).map String.ofList = ["add", "rz"] from rfl,
-      show (ptxOpcodeFields "mul.lo".toList).map String.ofList = ["mul", "lo"] from rfl,
-      show (ptxOpcodeFields "mul.hi".toList).map String.ofList = ["mul", "hi"] from rfl,
-      show (ptxOpcodeFields "mul.wide".toList).map String.ofList = ["mul", "wide"] from rfl,
-      show (ptxOpcodeFields "mul.rn".toList).map String.ofList = ["mul", "rn"] from rfl,
-      show (ptxOpcodeFields "setp.eq".toList).map String.ofList = ["setp", "eq"] from rfl,
-      show (ptxOpcodeFields "setp.ne".toList).map String.ofList = ["setp", "ne"] from rfl,
-      show (ptxOpcodeFields "setp.lt".toList).map String.ofList = ["setp", "lt"] from rfl,
-      show (ptxOpcodeFields "setp.le".toList).map String.ofList = ["setp", "le"] from rfl,
-      show (ptxOpcodeFields "setp.gt".toList).map String.ofList = ["setp", "gt"] from rfl,
-      show (ptxOpcodeFields "setp.ge".toList).map String.ofList = ["setp", "ge"] from rfl,
-      show (ptxOpcodeFields "setp.lo".toList).map String.ofList = ["setp", "lo"] from rfl,
-      show (ptxOpcodeFields "setp.ls".toList).map String.ofList = ["setp", "ls"] from rfl,
-      show (ptxOpcodeFields "setp.hi".toList).map String.ofList = ["setp", "hi"] from rfl,
-      show (ptxOpcodeFields "setp.hs".toList).map String.ofList = ["setp", "hs"] from rfl,
-      List.cons_append, List.nil_append, List.head?_cons,
-      List.getLast?_cons_cons, List.getLast?_singleton, parsePTXType_suffix]
-    simp [stripPrefixChars, hd, ha, hb]
+  · cases rm <;> rfl
+  · cases mode <;> rfl
+  · cases cmp <;> rfl
 
 theorem parsePTXInstr_selp_roundtrip (ty : PTXType) (dst pred : String) (a b : PTXOperand)
     (hd : CanonicalPTXName dst) (hp : CanonicalPTXName pred)
@@ -1229,7 +1239,6 @@ theorem parsePTXInstr_selp_roundtrip (ty : PTXType) (dst pred : String) (a b : P
     parsePTXType_suffix]
   simp [stripPrefixChars, hd, ha, hb, hp]
 
-set_option maxHeartbeats 2000000 in
 /-- Three-operand scalar instructions, including every printed arithmetic modifier. -/
 theorem parsePTXInstr_ternary_roundtrip (opcode modifier : String) (ty : PTXType)
     (dst : String) (a b c : PTXOperand) (ins : PTXInstr)
@@ -1266,34 +1275,54 @@ theorem parsePTXInstr_ternary_roundtrip (opcode modifier : String) (ty : PTXType
   have hne := ptxTypedToken_ne (opcode ++ modifier) ty (by
     rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩ <;> simp [String.toList_append])
   have hfields := congrArg (List.map String.ofList) (ptxOpcodeFields_typed (opcode ++ modifier).toList ty)
+  let mods : List String := match modifier.toList with
+    | '.' :: cs => [String.ofList cs]
+    | _ => []
+  have htok_parts : (ptxOpcodeFields (opcode ++ modifier).toList).map String.ofList = opcode :: mods := by
+    rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩
+    · cases rm <;> rfl
+    · cases mode <;> rfl
+  let parts := opcode :: (mods ++ [String.ofList ((ppPTXType ty).toList.drop 1)])
+  have hparts : (ptxOpcodeFields (opcode ++ modifier ++ ppPTXType ty).toList).map String.ofList = parts := by
+    rw [show (ptxOpcodeFields (opcode ++ modifier ++ ppPTXType ty).toList).map String.ofList =
+      (ptxOpcodeFields (opcode ++ modifier).toList).map String.ofList ++
+        [String.ofList ((ppPTXType ty).toList.drop 1)] by
+      simpa [String.toList_append, List.map_append] using hfields, htok_parts, List.cons_append]
+  have hlast : parts.getLast? = some (String.ofList ((ppPTXType ty).toList.drop 1)) := by
+    simp [parts, List.getLast?_append_of_ne_nil]
+  have hmods : (parts.drop 1).dropLast = mods := by
+    simp [parts, List.dropLast_concat]
+  have hop_not_st : (opcode == "st") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_not_ld : (opcode == "ld") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_not_cvta : (opcode == "cvta") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_not_cvt : (opcode == "cvt") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_allow : (opcode == "add" || opcode == "mul" || opcode == "mad" || opcode == "fma" ||
+      opcode == "setp") = true := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_not_selp : (opcode == "selp") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
+  have hop_not_setp : (opcode == "setp") = false := by
+    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
   simp only [String.toList_append, List.append_assoc] at ht
   conv =>
     lhs
     arg 2
     simp only [String.toList_append, String.reduceToList, List.append_assoc,
       List.cons_append, List.nil_append]
-  simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
-    Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
-  rw [show (ptxOpcodeFields (opcode ++ modifier ++ ppPTXType ty).toList).map String.ofList =
-    (ptxOpcodeFields (opcode ++ modifier).toList).map String.ofList ++
-      [String.ofList ((ppPTXType ty).toList.drop 1)] by
-    simpa [String.toList_append, List.map_append] using hfields]
+  unfold parsePTXInstr
+  simp only [ht, bind, Option.bind, pure, hne.1, hne.2.1, hne.2.2,
+    Bool.false_eq_true, ↓reduceIte, stripPrefixChars, hparts]
+  simp only [parts, List.head?_cons, hlast, parsePTXType_suffix, hmods,
+    hop_not_st, hop_not_ld, hop_not_cvta, hop_not_cvt, hop_allow, Bool.not_true, Bool.false_and,
+    hd, ha, hb, hc, hop_not_selp, hop_not_setp, stripPrefixChars]
   rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩
-  all_goals first | cases rm | cases mode
-  all_goals
-    simp only [ppRoundMode, ppMulMode, String.reduceAppend]
-    simp only [show (ptxOpcodeFields "fma".toList).map String.ofList = ["fma"] from rfl,
-      show (ptxOpcodeFields "fma.rn".toList).map String.ofList = ["fma", "rn"] from rfl,
-      show (ptxOpcodeFields "fma.rz".toList).map String.ofList = ["fma", "rz"] from rfl,
-      show (ptxOpcodeFields "mad.lo".toList).map String.ofList = ["mad", "lo"] from rfl,
-      show (ptxOpcodeFields "mad.hi".toList).map String.ofList = ["mad", "hi"] from rfl,
-      show (ptxOpcodeFields "mad.wide".toList).map String.ofList = ["mad", "wide"] from rfl,
-      show (ptxOpcodeFields "mad.rn".toList).map String.ofList = ["mad", "rn"] from rfl,
-      List.cons_append, List.nil_append, List.head?_cons,
-      List.getLast?_cons_cons, List.getLast?_singleton, parsePTXType_suffix]
-    simp [stripPrefixChars, hd, ha, hb, hc]
+  · cases rm <;> rfl
+  · cases mode <;> rfl
 
-set_option maxHeartbeats 2000000 in
 theorem parsePTXInstr_cvt_roundtrip (rm : PTXRoundMode) (dt st : PTXType)
     (dst : String) (src : PTXOperand)
     (hd : CanonicalPTXName dst) (hs : CanonicalPTXOperand src)
@@ -1316,88 +1345,174 @@ theorem parsePTXInstr_cvt_roundtrip (rm : PTXRoundMode) (dt st : PTXType)
     (by simp [ppPTXInstr, toString, String.toList_append] at hf; omega)
   have hne := ptxTypedToken_ne ("cvt" ++ ppRoundMode rm ++ ppPTXType dt) st
     (by simp [String.toList_append])
-  have hfields : (ptxOpcodeFields ("cvt" ++ ppRoundMode rm ++ ppPTXType dt ++ ppPTXType st).toList).map String.ofList =
-      (ptxOpcodeFields ("cvt" ++ ppRoundMode rm).toList).map String.ofList ++
-      [String.ofList ((ppPTXType dt).toList.drop 1), String.ofList ((ppPTXType st).toList.drop 1)] := by
+  let dtTok := String.ofList ((ppPTXType dt).toList.drop 1)
+  let stTok := String.ofList ((ppPTXType st).toList.drop 1)
+  let rmMods : List String := match rm with
+    | .none => []
+    | .rn => ["rn"]
+    | .rz => ["rz"]
+  have hrm_parts : (ptxOpcodeFields ("cvt" ++ ppRoundMode rm).toList).map String.ofList = "cvt" :: rmMods := by
+    cases rm <;> rfl
+  let parts := "cvt" :: (rmMods ++ [dtTok] ++ [stTok])
+  have hfields : (ptxOpcodeFields ("cvt" ++ ppRoundMode rm ++ ppPTXType dt ++ ppPTXType st).toList).map String.ofList = parts := by
     rw [String.toList_append, ptxOpcodeFields_typed, List.map_append,
-      String.toList_append, ptxOpcodeFields_typed, List.map_append]
-    simp only [List.map_cons, List.map_nil, List.append_assoc, List.cons_append, List.nil_append]
+      String.toList_append, ptxOpcodeFields_typed, List.map_append, hrm_parts]
+    simp only [parts, dtTok, stTok, List.map_cons, List.map_nil, List.append_assoc, List.cons_append, List.nil_append]
+  have hlast : parts.getLast? = some stTok := by
+    simp [parts, List.getLast?_append_of_ne_nil]
+  have hmods : (parts.drop 1).dropLast = rmMods ++ [dtTok] := by
+    simp [parts, List.dropLast_concat]
+  have hdt : parsePTXType (fuel + 1) ("." ++ dtTok).toList = some (dt, []) := by
+    cases dt <;> rfl
   simp only [String.toList_append, String.reduceToList, List.append_assoc,
     List.cons_append, List.nil_append] at ht
-  simp only [ppPTXInstr, toString, String.toList_append, String.reduceToList,
-    List.append_assoc, List.cons_append, List.nil_append]
-  simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
+  conv =>
+    lhs
+    arg 2
+    simp only [ppPTXInstr, toString, String.toList_append, String.reduceToList,
+      List.append_assoc, List.cons_append, List.nil_append]
+  unfold parsePTXInstr
+  simp only [ht, bind, Option.bind, pure, hne.1, hne.2.1, hne.2.2,
     Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
-  rw [hfields]
-  cases rm
-  all_goals
-    simp only [ppRoundMode, String.reduceAppend]
-    simp only [show (ptxOpcodeFields "cvt".toList).map String.ofList = ["cvt"] from rfl,
-      show (ptxOpcodeFields "cvt.rn".toList).map String.ofList = ["cvt", "rn"] from rfl,
-      show (ptxOpcodeFields "cvt.rz".toList).map String.ofList = ["cvt", "rz"] from rfl,
-      List.cons_append, List.nil_append, List.head?_cons,
-      List.getLast?_cons_cons, List.getLast?_singleton, parsePTXType_suffix]
-    simp only [List.drop_succ_cons, List.drop_zero, List.dropLast_cons_cons,
-      List.dropLast_singleton]
-    have hdt : parsePTXType (fuel + 1) ('.' :: (ppPTXType dt).toList.tail) = some (dt, []) := by
-      cases dt <;> rfl
-    simp [stripPrefixChars, hd, hs, hdt]
+  rw [show (ptxOpcodeFields ('c' :: 'v' :: 't' :: ((ppRoundMode rm).toList ++ ((ppPTXType dt).toList ++ (ppPTXType st).toList)))).map String.ofList = parts by
+    simpa [String.toList_append, List.append_assoc] using hfields]
+  simp only [parts, List.head?_cons, hlast, stTok, parsePTXType_suffix, hmods,
+    show ("cvt" == "st") = false from rfl, show ("cvt" == "ld") = false from rfl,
+    show ("cvt" == "cvta") = false from rfl, show ("cvt" == "cvt") = true from rfl,
+    hd, hs, stripPrefixChars]
+  cases rm <;> simp [rmMods, hdt]
 
-set_option maxHeartbeats 10000000 in
+set_option maxHeartbeats 1000000 in
 /-- Every instruction in the syntactically canonical scalar fragment roundtrips. -/
 theorem parsePTXInstr_roundtrip (ins : PTXInstr) (h : CanonicalPTXInstr ins)
     (rest : List Char) (fuel : Nat)
     (hf : (ppPTXInstr ins).toList.length < fuel + 1) :
     parsePTXInstr (fuel + 1) ((ppPTXInstr ins).toList ++ rest) = some (ins, rest) := by
-  cases ins <;> simp only [CanonicalPTXInstr] at h
-  all_goals try contradiction
-  all_goals simp only [ppPTXInstr, toString] at hf ⊢
-  case ldParam => exact parsePTXInstr_ldParam_roundtrip _ _ _ h.1 h.2 rest fuel hf
-  case cvtaToGlobal => exact parsePTXInstr_cvtaToGlobal_roundtrip _ _ _ h.1 h.2 rest fuel hf
-  case cvt => exact parsePTXInstr_cvt_roundtrip _ _ _ _ _ h.1 h.2 rest fuel hf
-  case selp => exact parsePTXInstr_selp_roundtrip _ _ _ _ _ h.1 h.2.2.2 h.2.1 h.2.2.1 rest fuel hf
-  case bra =>
-    apply parsePTXInstr_bra_roundtrip _ h rest (fuel + 1) <;>
-      simp [String.toList_append] at hf <;> omega
-  case ret => exact parsePTXInstr_ret_suffix_roundtrip rest (fuel + 1) (by simp at hf; omega)
-  case barSync =>
-    apply parsePTXInstr_barSync_roundtrip _ rest (fuel + 1) <;>
-      simp [String.toList_append, Nat.toList_repr] at hf ⊢ <;> omega
-  case ldGlobal => exact parsePTXInstr_load_roundtrip "global" _ _ _ (by simp) h.1 h.2 rest fuel hf
-  case ldShared => exact parsePTXInstr_load_roundtrip "shared" _ _ _ (by simp) h.1 h.2 rest fuel hf
-  case ldLocal => exact parsePTXInstr_load_roundtrip "local" _ _ _ (by simp) h.1 h.2 rest fuel hf
-  case ldConst => exact parsePTXInstr_load_roundtrip "const" _ _ _ (by simp) h.1 h.2 rest fuel hf
-  case stGlobal => exact parsePTXInstr_store_roundtrip "global" _ _ _ (by simp) h.1 h.2 rest fuel hf
-  case stShared => exact parsePTXInstr_store_roundtrip "shared" _ _ _ (by simp) h.1 h.2 rest fuel hf
-  case stLocal => exact parsePTXInstr_store_roundtrip "local" _ _ _ (by simp) h.1 h.2 rest fuel hf
-  case stConst => exact parsePTXInstr_store_roundtrip "const" _ _ _ (by simp) h.1 h.2 rest fuel hf
-  case mov => exact parsePTXInstr_unary_roundtrip "mov" _ _ _ (by simp) h.1 h.2 rest fuel hf
-  case bitNot => exact parsePTXInstr_unary_roundtrip "not" _ _ _ (by simp) h.1 h.2 rest fuel hf
-  case neg => exact parsePTXInstr_unary_roundtrip "neg" _ _ _ (by simp) h.1 h.2 rest fuel hf
-  case clz => exact parsePTXInstr_unary_roundtrip "clz" _ _ _ (by simp) h.1 h.2 rest fuel hf
-  case sub => exact parsePTXInstr_binary_roundtrip "sub" _ _ _ _ (by simp) h.1 h.2.1 h.2.2 rest fuel hf
-  case div => exact parsePTXInstr_binary_roundtrip "div" _ _ _ _ (by simp) h.1 h.2.1 h.2.2 rest fuel hf
-  case rem => exact parsePTXInstr_binary_roundtrip "rem" _ _ _ _ (by simp) h.1 h.2.1 h.2.2 rest fuel hf
-  case bitAnd => exact parsePTXInstr_binary_roundtrip "and" _ _ _ _ (by simp) h.1 h.2.1 h.2.2 rest fuel hf
-  case bitOr => exact parsePTXInstr_binary_roundtrip "or" _ _ _ _ (by simp) h.1 h.2.1 h.2.2 rest fuel hf
-  case bitXor => exact parsePTXInstr_binary_roundtrip "xor" _ _ _ _ (by simp) h.1 h.2.1 h.2.2 rest fuel hf
-  case shl => exact parsePTXInstr_binary_roundtrip "shl" _ _ _ _ (by simp) h.1 h.2.1 h.2.2 rest fuel hf
-  case shr => exact parsePTXInstr_binary_roundtrip "shr" _ _ _ _ (by simp) h.1 h.2.1 h.2.2 rest fuel hf
+  cases ins
+  case ldParam ty dst name =>
+    exact parsePTXInstr_ldParam_roundtrip ty dst name h.1 h.2 rest fuel hf
+  case cvtaToGlobal ty dst src =>
+    exact parsePTXInstr_cvtaToGlobal_roundtrip ty dst src h.1 h.2 rest fuel hf
+  case cvt rm dt st dst src =>
+    exact parsePTXInstr_cvt_roundtrip rm dt st dst src h.1 h.2 rest fuel hf
+  case selp ty dst a b pred =>
+    exact parsePTXInstr_selp_roundtrip ty dst pred a b h.1 h.2.2.2 h.2.1 h.2.2.1 rest fuel hf
+  case bra label =>
+    exact parsePTXInstr_bra_roundtrip label h rest (fuel + 1)
+      (by simp [ppPTXInstr, toString, String.toList_append] at hf; omega)
+      (by simp [ppPTXInstr, toString, String.toList_append] at hf; omega)
+  case ret =>
+    exact parsePTXInstr_ret_suffix_roundtrip rest (fuel + 1) (by simp [ppPTXInstr] at hf; omega)
+  case barSync bid =>
+    exact parsePTXInstr_barSync_roundtrip bid rest (fuel + 1)
+      (by simp [ppPTXInstr, toString, String.toList_append, Nat.toList_repr] at hf ⊢; omega)
+      (by simp [ppPTXInstr, toString, String.toList_append] at hf; omega)
+  case ldGlobal ty dst addr =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_load_roundtrip "global" ty dst addr (by simp) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case ldShared ty dst addr =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_load_roundtrip "shared" ty dst addr (by simp) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case ldLocal ty dst addr =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_load_roundtrip "local" ty dst addr (by simp) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case ldConst ty dst addr =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_load_roundtrip "const" ty dst addr (by simp) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case stGlobal ty addr src =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_store_roundtrip "global" ty addr src (by simp) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case stShared ty addr src =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_store_roundtrip "shared" ty addr src (by simp) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case stLocal ty addr src =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_store_roundtrip "local" ty addr src (by simp) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case stConst ty addr src =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_store_roundtrip "const" ty addr src (by simp) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case mov ty dst src =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_unary_roundtrip "mov" ty dst src (Or.inl rfl) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case bitNot ty dst src =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_unary_roundtrip "not" ty dst src (Or.inr (Or.inl rfl)) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case neg ty dst src =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_unary_roundtrip "neg" ty dst src (Or.inr (Or.inr (Or.inl rfl))) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case clz ty dst src =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_unary_roundtrip "clz" ty dst src (Or.inr (Or.inr (Or.inr rfl))) h.1 h.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case sub ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_binary_roundtrip "sub" ty dst a b (by simp) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case div ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_binary_roundtrip "div" ty dst a b (by simp) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case rem ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_binary_roundtrip "rem" ty dst a b (by simp) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case bitAnd ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_binary_roundtrip "and" ty dst a b (by simp) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case bitOr ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_binary_roundtrip "or" ty dst a b (by simp) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case bitXor ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_binary_roundtrip "xor" ty dst a b (by simp) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case shl ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_binary_roundtrip "shl" ty dst a b (by simp) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  case shr ty dst a b =>
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_binary_roundtrip "shr" ty dst a b (by simp) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
   case add rm ty dst a b =>
-    exact parsePTXInstr_modified_binary_roundtrip "add" (ppRoundMode rm) ty dst a b _
-      (Or.inl ⟨rm, rfl, rfl, rfl⟩) h.1 h.2.1 h.2.2 rest fuel hf
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_modified_binary_roundtrip "add" (ppRoundMode rm) ty dst a b _
+        (Or.inl ⟨rm, rfl, rfl, rfl⟩) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
   case mul mode ty dst a b =>
-    exact parsePTXInstr_modified_binary_roundtrip "mul" (ppMulMode mode) ty dst a b _
-      (Or.inr (Or.inl ⟨mode, rfl, rfl, rfl⟩)) h.1 h.2.1 h.2.2 rest fuel hf
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_modified_binary_roundtrip "mul" (ppMulMode mode) ty dst a b _
+        (Or.inr (Or.inl ⟨mode, rfl, rfl, rfl⟩)) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
   case setp cmp ty dst a b =>
-    exact parsePTXInstr_modified_binary_roundtrip "setp" (ppCmpOp cmp) ty dst a b _
-      (Or.inr (Or.inr ⟨cmp, rfl, rfl, rfl⟩)) h.1 h.2.1 h.2.2 rest fuel hf
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_modified_binary_roundtrip "setp" (ppCmpOp cmp) ty dst a b _
+        (Or.inr (Or.inr ⟨cmp, rfl, rfl, rfl⟩)) h.1 h.2.1 h.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
   case mad mode ty dst a b c =>
-    exact parsePTXInstr_ternary_roundtrip "mad" (ppMulMode mode) ty dst a b c _
-      (Or.inr ⟨mode, rfl, rfl, rfl⟩) h.1 h.2.1 h.2.2.1 h.2.2.2 rest fuel hf
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_ternary_roundtrip "mad" (ppMulMode mode) ty dst a b c _
+        (Or.inr ⟨mode, rfl, rfl, rfl⟩) h.1 h.2.1 h.2.2.1 h.2.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
   case fma rm ty dst a b c =>
-    exact parsePTXInstr_ternary_roundtrip "fma" (ppRoundMode rm) ty dst a b c _
-      (Or.inl ⟨rm, rfl, rfl, rfl⟩) h.1 h.2.1 h.2.2.1 h.2.2.2 rest fuel hf
+    simpa [ppPTXInstr, toString, String.append_assoc] using
+      parsePTXInstr_ternary_roundtrip "fma" (ppRoundMode rm) ty dst a b c _
+        (Or.inl ⟨rm, rfl, rfl, rfl⟩) h.1 h.2.1 h.2.2.1 h.2.2.2 rest fuel
+        (by simpa [ppPTXInstr, toString, String.append_assoc] using hf)
+  all_goals exact False.elim h
 
 theorem ppPTXInstr_injective_on_canonical (a b : PTXInstr)
     (ha : CanonicalPTXInstr a) (hb : CanonicalPTXInstr b)

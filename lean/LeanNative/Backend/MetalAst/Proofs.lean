@@ -25,19 +25,58 @@ theorem parseMSLScalarType_roundtrip (ty : MSLType) (h : CanonicalMSLValueType t
     parseMSLScalarType (ppMSLType ty) = some ty := by
   cases ty <;> simp_all [CanonicalMSLValueType, ppMSLType, parseMSLScalarType]
 
-set_option maxHeartbeats 1600000 in
+private theorem parseMSLParamType_pointer_roundtrip (sp : MSLAddressSpace) (isConst : Bool)
+    (el : MSLType) (hel : CanonicalMSLValueType el) (hconst : sp = .constant → isConst = false) :
+    parseMSLParamType (ppMSLType (.pointer sp isConst el)) = some (.pointer sp isConst el) := by
+  have hpel : parseMSLScalarType (ppMSLType el) = some el := parseMSLScalarType_roundtrip el hel
+  have hscalar : parseMSLScalarType (ppMSLType (.pointer sp isConst el)) = none := by
+    cases sp <;> cases isConst <;> cases el <;> first | exact False.elim hel | rfl
+  have hrev (s : String) : (s.toList ++ ['*']).reverse = '*' :: s.toList.reverse := by simp
+  cases sp <;> cases isConst
+  all_goals try exact False.elim (Bool.noConfusion (hconst rfl))
+  all_goals
+    unfold parseMSLParamType
+    rw [hscalar]
+    simp only [ppMSLType, ppMSLAddressSpace, Bool.true_and, Bool.false_and, bne,
+      Bool.false_eq_true, ↓reduceIte, String.toList_append, String.reduceToList,
+      List.append_assoc, List.cons_append, List.nil_append, bind, Option.bind, pure]
+    rw [← String.toList_ofList (ppMSLType el).toList, hrev (String.ofList (ppMSLType el).toList)]
+    simp [String.ofList_toList, hpel]
+
+private theorem parseMSLParamType_ref_roundtrip (sp : MSLAddressSpace)
+    (el : MSLType) (hel : CanonicalMSLValueType el) :
+    parseMSLParamType (ppMSLType (.ref sp el)) = some (.ref sp el) := by
+  have hpel : parseMSLScalarType (ppMSLType el) = some el := parseMSLScalarType_roundtrip el hel
+  have hscalar : parseMSLScalarType (ppMSLType (.ref sp el)) = none := by
+    cases sp <;> cases el <;> first | exact False.elim hel | rfl
+  have hnotconst : ∀ rest, (ppMSLType el).toList ++ ['&'] ≠ 'c' :: 'o' :: 'n' :: 's' :: 't' :: ' ' :: rest := by
+    cases el <;> first | exact False.elim hel | decide
+  have hrev (s : String) : (s.toList ++ ['&']).reverse = '&' :: s.toList.reverse := by simp
+  cases sp
+  all_goals
+    unfold parseMSLParamType
+    rw [hscalar]
+    simp only [ppMSLType, ppMSLAddressSpace, String.toList_append, String.reduceToList,
+      List.append_assoc, List.cons_append, List.nil_append, bind, Option.bind, pure]
+    have hnc : (match (ppMSLType el).toList ++ ['&'] with
+        | 'c' :: 'o' :: 'n' :: 's' :: 't' :: ' ' :: rest => (true, rest)
+        | chars => (false, chars)) = (false, (ppMSLType el).toList ++ ['&']) := by
+      split
+      · rename_i rest heq; exact False.elim (hnotconst rest heq)
+      · rfl
+    rw [hnc, ← String.toList_ofList (ppMSLType el).toList, hrev (String.ofList (ppMSLType el).toList)]
+    simp [String.ofList_toList, hpel]
+
 theorem parseMSLParamType_roundtrip (ty : MSLType) (h : CanonicalMSLType ty) :
     parseMSLParamType (ppMSLType ty) = some ty := by
   cases ty with
-  | pointer sp c el =>
-    cases el <;> simp only [CanonicalMSLType, CanonicalMSLValueType, false_and] at h
-    all_goals try contradiction
-    all_goals cases sp <;> cases c <;> first | exact False.elim (Bool.noConfusion (h.2 rfl)) | decide
-  | ref sp el =>
-    cases el <;> simp only [CanonicalMSLType, CanonicalMSLValueType] at h
-    all_goals try contradiction
-    all_goals cases sp <;> decide
-  | _ => first | contradiction | decide
+  | pointer sp c el => exact parseMSLParamType_pointer_roundtrip sp c el h.1 h.2
+  | ref sp el => exact parseMSLParamType_ref_roundtrip sp el h
+  | threadArr .. | structTy .. => exact False.elim h
+  | _ =>
+    unfold parseMSLParamType
+    rw [parseMSLScalarType_roundtrip _ h]
+    rfl
 
 theorem ppMSLType_injective_on_canonical (a b : MSLType)
     (ha : CanonicalMSLType a) (hb : CanonicalMSLType b)
@@ -565,68 +604,202 @@ theorem parseMSLExpr_paren_step (a : MSLExpr) (ha : CanonicalMSLExpr a)
     rw [he] at pa ⊢
     simp [parseMSLExpr, hn, pa, pt, List.cons_append] at *
 
-set_option maxHeartbeats 4000000 in
+private theorem parseMSLExpr_binary_paren_step (opcode : String) (ctor : MSLExpr → MSLExpr → MSLExpr)
+    (hop : mslBinary opcode = some ctor) (hspace : ∀ c ∈ opcode.toList, c ≠ ' ')
+    (hquestion : ∀ cs, opcode.toList ≠ '?' :: cs)
+    (a b : MSLExpr) (ha : CanonicalMSLExpr a) (rest : List Char) (fuel : Nat) (hf : 2 ≤ fuel)
+    (pa : parseMSLExpr (fuel - 1)
+      ((ppMSLExpr a).toList ++ (' ' :: (opcode.toList ++ ' ' :: ((ppMSLExpr b).toList ++ ')' :: rest)))) =
+      some (a, ' ' :: (opcode.toList ++ ' ' :: ((ppMSLExpr b).toList ++ ')' :: rest))))
+    (pb : parseMSLExpr (fuel - 2) ((ppMSLExpr b).toList ++ ')' :: rest) = some (b, ')' :: rest)) :
+    parseMSLExpr fuel ((("(" ++ ppMSLExpr a ++ " " ++ opcode ++ " " ++ ppMSLExpr b ++ ")").toList) ++ rest) =
+      some (ctor a b, rest) := by
+  obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 2 := ⟨fuel - 2, by omega⟩
+  have hpa : parseMSLExpr (f + 1)
+      ((ppMSLExpr a).toList ++ (' ' :: (opcode.toList ++ ' ' :: ((ppMSLExpr b).toList ++ ')' :: rest)))) =
+      some (a, ' ' :: (opcode.toList ++ ' ' :: ((ppMSLExpr b).toList ++ ')' :: rest))) := by
+    simpa [Nat.add_sub_cancel] using pa
+  have hpb : parseMSLExpr f ((ppMSLExpr b).toList ++ ')' :: rest) = some (b, ')' :: rest) := by
+    simpa [Nat.add_sub_cancel] using pb
+  have htail := parseMSLExprTail_binary_step opcode ctor hop hspace hquestion a b rest f hpb
+  have hparen := parseMSLExpr_paren_step a ha
+    (' ' :: (opcode.toList ++ ' ' :: ((ppMSLExpr b).toList ++ ')' :: rest)))
+    rest (ctor a b) (f + 1) hpa htail
+  simpa only [String.toList_append, String.reduceToList, List.append_assoc,
+    List.cons_append, List.nil_append] using hparen
+
+set_option maxHeartbeats 1000000 in
 theorem parseMSLExpr_roundtrip (e : MSLExpr) (he : CanonicalMSLExpr e)
     (rest : List Char) (hsuf : ValidMSLExprSuffix rest) (fuel : Nat)
     (hf : mslExprFuel e ≤ fuel) :
     parseMSLExpr fuel ((ppMSLExpr e).toList ++ rest) = some (e, rest) := by
-  cases e <;> simp only [CanonicalMSLExpr, mslExprFuel] at he hf
-  all_goals try contradiction
+  cases e
   case var name =>
-    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 1 := ⟨fuel - 1, by omega⟩
-    exact parseMSLExpr_var_roundtrip name he rest hsuf f (by omega)
+    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 1 := ⟨fuel - 1, by simp [mslExprFuel] at hf; omega⟩
+    exact parseMSLExpr_var_roundtrip name he rest hsuf f (by simp [mslExprFuel] at hf; omega)
   case immU64 v =>
-    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 1 := ⟨fuel - 1, by omega⟩
-    exact parseMSLExpr_u64_roundtrip v rest hsuf f (by omega)
-  case immBool b => exact parseMSLExpr_bool_suffix_roundtrip b rest hsuf fuel (by omega)
-  case bitNot a | logNot a | neg a =>
-    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 1 := ⟨fuel - 1, by omega⟩
-    first
-    | apply parseMSLExpr_bitNot_step
-    | apply parseMSLExpr_logNot_step
-    | apply parseMSLExpr_neg_step
-    all_goals exact parseMSLExpr_roundtrip a he _ (by simp [ValidMSLExprSuffix]) f (by omega)
+    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 1 := ⟨fuel - 1, by simp [mslExprFuel] at hf; omega⟩
+    exact parseMSLExpr_u64_roundtrip v rest hsuf f (by simp [mslExprFuel] at hf; omega)
+  case immBool b =>
+    exact parseMSLExpr_bool_suffix_roundtrip b rest hsuf fuel (by simp [mslExprFuel] at hf; omega)
+  case bitNot a =>
+    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 1 := ⟨fuel - 1, by simp [mslExprFuel] at hf; omega⟩
+    exact parseMSLExpr_bitNot_step a rest f
+      (parseMSLExpr_roundtrip a he _ (Or.inl rfl) f (by simp [mslExprFuel] at hf; omega))
+  case logNot a =>
+    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 1 := ⟨fuel - 1, by simp [mslExprFuel] at hf; omega⟩
+    exact parseMSLExpr_logNot_step a rest f
+      (parseMSLExpr_roundtrip a he _ (Or.inl rfl) f (by simp [mslExprFuel] at hf; omega))
+  case neg a =>
+    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 1 := ⟨fuel - 1, by simp [mslExprFuel] at hf; omega⟩
+    exact parseMSLExpr_neg_step a rest f
+      (parseMSLExpr_roundtrip a he _ (Or.inl rfl) f (by simp [mslExprFuel] at hf; omega))
   case cast ty a =>
-    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 1 := ⟨fuel - 1, by omega⟩
+    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 1 := ⟨fuel - 1, by simp [mslExprFuel] at hf; omega⟩
     exact parseMSLExpr_cast_step ty a rest f he.1
-      (parseMSLExpr_roundtrip a he.2 _ (by simp [ValidMSLExprSuffix]) f (by omega))
+      (parseMSLExpr_roundtrip a he.2 _ (Or.inl rfl) f (by simp [mslExprFuel] at hf; omega))
   case clz a =>
-    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 2 := ⟨fuel - 2, by omega⟩
-    exact parseMSLExpr_clz_step a he rest f (by omega)
-      (parseMSLExpr_roundtrip a he _ (by simp [ValidMSLExprSuffix]) f (by omega))
+    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 2 := ⟨fuel - 2, by simp [mslExprFuel] at hf; omega⟩
+    exact parseMSLExpr_clz_step a he rest f (by simp [mslExprFuel] at hf; omega)
+      (parseMSLExpr_roundtrip a he _ (Or.inl rfl) f (by simp [mslExprFuel] at hf; omega))
   case index name a =>
-    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 1 := ⟨fuel - 1, by omega⟩
-    exact parseMSLExpr_index_step name he.1 a rest f (by omega)
-      (parseMSLExpr_roundtrip a he.2 _ (by simp [ValidMSLExprSuffix]) f (by omega))
-  case builtinSelect a b c | fma a b c =>
-    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 4 := ⟨fuel - 4, by omega⟩
+    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 1 := ⟨fuel - 1, by simp [mslExprFuel] at hf; omega⟩
+    exact parseMSLExpr_index_step name he.1 a rest f (by simp [mslExprFuel] at hf; omega)
+      (parseMSLExpr_roundtrip a he.2 _ (Or.inr (Or.inr (Or.inr (Or.inl rfl)))) f (by simp [mslExprFuel] at hf; omega))
+  case builtinSelect a b c =>
+    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 4 := ⟨fuel - 4, by simp [mslExprFuel] at hf; omega⟩
     have hp := parseMSLExprArgs_three_step a b c he.1 he.2.1 he.2.2 rest f
-      (parseMSLExpr_roundtrip a he.1 _ (by simp [ValidMSLExprSuffix]) (f + 2) (by omega))
-      (parseMSLExpr_roundtrip b he.2.1 _ (by simp [ValidMSLExprSuffix]) (f + 1) (by omega))
-      (parseMSLExpr_roundtrip c he.2.2 _ (by simp [ValidMSLExprSuffix]) f (by omega))
-    first
-    | simpa [ppMSLExpr, toString, String.toList_append, List.append_assoc] using
-        parseMSLExpr_builtin_step "select" (Or.inl rfl) a b c _ rest (f + 3) (by omega) hp
-    | simpa [ppMSLExpr, toString, String.toList_append, List.append_assoc] using
-        parseMSLExpr_builtin_step "fma" (Or.inr rfl) a b c _ rest (f + 3) (by omega) hp
+      (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inl rfl)) (f + 2) (by simp [mslExprFuel] at hf; omega))
+      (parseMSLExpr_roundtrip b he.2.1 _ (Or.inr (Or.inl rfl)) (f + 1) (by simp [mslExprFuel] at hf; omega))
+      (parseMSLExpr_roundtrip c he.2.2 _ (Or.inl rfl) f (by simp [mslExprFuel] at hf; omega))
+    simpa [ppMSLExpr, toString, String.toList_append, List.append_assoc] using
+      parseMSLExpr_builtin_step "select" (Or.inl rfl) a b c _ rest (f + 3) (by omega) hp
+  case fma a b c =>
+    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 4 := ⟨fuel - 4, by simp [mslExprFuel] at hf; omega⟩
+    have hp := parseMSLExprArgs_three_step a b c he.1 he.2.1 he.2.2 rest f
+      (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inl rfl)) (f + 2) (by simp [mslExprFuel] at hf; omega))
+      (parseMSLExpr_roundtrip b he.2.1 _ (Or.inr (Or.inl rfl)) (f + 1) (by simp [mslExprFuel] at hf; omega))
+      (parseMSLExpr_roundtrip c he.2.2 _ (Or.inl rfl) f (by simp [mslExprFuel] at hf; omega))
+    simpa [ppMSLExpr, toString, String.toList_append, List.append_assoc] using
+      parseMSLExpr_builtin_step "fma" (Or.inr rfl) a b c _ rest (f + 3) (by omega) hp
   case select a b c =>
-    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 2 := ⟨fuel - 2, by omega⟩
+    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 2 := ⟨fuel - 2, by simp [mslExprFuel] at hf; omega⟩
     simp only [ppMSLExpr, toString, String.toList_append, String.reduceToList,
       List.append_assoc, List.cons_append, List.nil_append]
-    apply parseMSLExpr_paren_step a he.1
-    · exact parseMSLExpr_roundtrip a he.1 _ (by simp [ValidMSLExprSuffix]) (f + 1) (by omega)
-    · exact parseMSLExprTail_select_step a b c rest f
-        (parseMSLExpr_roundtrip b he.2.1 _ (by simp [ValidMSLExprSuffix]) f (by omega))
-        (parseMSLExpr_roundtrip c he.2.2 _ (by simp [ValidMSLExprSuffix]) f (by omega))
-  all_goals
-    rename_i a b
-    obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 2 := ⟨fuel - 2, by omega⟩
-    simp only [ppMSLExpr, toString, String.toList_append, List.append_assoc]
-    apply parseMSLExpr_paren_step a he.1
-    · exact parseMSLExpr_roundtrip a he.1 _ (by simp [ValidMSLExprSuffix]) (f + 1) (by omega)
-    · have pb := parseMSLExpr_roundtrip b he.2 (')' :: rest)
-        (by simp [ValidMSLExprSuffix]) f (by omega)
-      simp [parseMSLExprTail, stripPrefixChars, mslBinary, pb]
+    exact parseMSLExpr_paren_step a he.1 _ rest _ (f + 1)
+      (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (f + 1) (by simp [mslExprFuel] at hf; omega))
+      (parseMSLExprTail_select_step a b c rest f
+        (parseMSLExpr_roundtrip b he.2.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) f (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip c he.2.2 _ (Or.inl rfl) f (by simp [mslExprFuel] at hf; omega)))
+  case add a b =>
+    simpa [ppMSLExpr, toString, String.append_assoc] using
+      parseMSLExpr_binary_paren_step "+" .add rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
+        (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip b he.2 _ (Or.inl rfl) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+  case sub a b =>
+    simpa [ppMSLExpr, toString, String.append_assoc] using
+      parseMSLExpr_binary_paren_step "-" .sub rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
+        (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip b he.2 _ (Or.inl rfl) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+  case mul a b =>
+    simpa [ppMSLExpr, toString, String.append_assoc] using
+      parseMSLExpr_binary_paren_step "*" .mul rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
+        (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip b he.2 _ (Or.inl rfl) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+  case div a b =>
+    simpa [ppMSLExpr, toString, String.append_assoc] using
+      parseMSLExpr_binary_paren_step "/" .div rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
+        (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip b he.2 _ (Or.inl rfl) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+  case rem a b =>
+    simpa [ppMSLExpr, toString, String.append_assoc] using
+      parseMSLExpr_binary_paren_step "%" .rem rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
+        (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip b he.2 _ (Or.inl rfl) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+  case bitAnd a b =>
+    simpa [ppMSLExpr, toString, String.append_assoc] using
+      parseMSLExpr_binary_paren_step "&" .bitAnd rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
+        (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip b he.2 _ (Or.inl rfl) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+  case bitOr a b =>
+    simpa [ppMSLExpr, toString, String.append_assoc] using
+      parseMSLExpr_binary_paren_step "|" .bitOr rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
+        (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip b he.2 _ (Or.inl rfl) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+  case bitXor a b =>
+    simpa [ppMSLExpr, toString, String.append_assoc] using
+      parseMSLExpr_binary_paren_step "^" .bitXor rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
+        (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip b he.2 _ (Or.inl rfl) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+  case shl a b =>
+    simpa [ppMSLExpr, toString, String.append_assoc] using
+      parseMSLExpr_binary_paren_step "<<" .shl rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
+        (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip b he.2 _ (Or.inl rfl) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+  case shr a b =>
+    simpa [ppMSLExpr, toString, String.append_assoc] using
+      parseMSLExpr_binary_paren_step ">>" .shr rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
+        (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip b he.2 _ (Or.inl rfl) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+  case logAnd a b =>
+    simpa [ppMSLExpr, toString, String.append_assoc] using
+      parseMSLExpr_binary_paren_step "&&" .logAnd rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
+        (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip b he.2 _ (Or.inl rfl) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+  case logOr a b =>
+    simpa [ppMSLExpr, toString, String.append_assoc] using
+      parseMSLExpr_binary_paren_step "||" .logOr rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
+        (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip b he.2 _ (Or.inl rfl) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+  case eq a b =>
+    simpa [ppMSLExpr, toString, String.append_assoc] using
+      parseMSLExpr_binary_paren_step "==" .eq rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
+        (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip b he.2 _ (Or.inl rfl) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+  case ne a b =>
+    simpa [ppMSLExpr, toString, String.append_assoc] using
+      parseMSLExpr_binary_paren_step "!=" .ne rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
+        (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip b he.2 _ (Or.inl rfl) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+  case lt a b =>
+    simpa [ppMSLExpr, toString, String.append_assoc] using
+      parseMSLExpr_binary_paren_step "<" .lt rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
+        (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip b he.2 _ (Or.inl rfl) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+  case le a b =>
+    simpa [ppMSLExpr, toString, String.append_assoc] using
+      parseMSLExpr_binary_paren_step "<=" .le rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
+        (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip b he.2 _ (Or.inl rfl) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+  case gt a b =>
+    simpa [ppMSLExpr, toString, String.append_assoc] using
+      parseMSLExpr_binary_paren_step ">" .gt rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
+        (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip b he.2 _ (Or.inl rfl) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+  case ge a b =>
+    simpa [ppMSLExpr, toString, String.append_assoc] using
+      parseMSLExpr_binary_paren_step ">=" .ge rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
+        (parseMSLExpr_roundtrip a he.1 _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
+        (parseMSLExpr_roundtrip b he.2 _ (Or.inl rfl) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+  all_goals exact False.elim he
 termination_by sizeOf e
 
 theorem ppMSLExpr_injective_on_canonical (a b : MSLExpr)

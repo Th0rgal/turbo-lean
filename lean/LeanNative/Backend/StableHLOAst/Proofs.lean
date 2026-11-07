@@ -440,8 +440,313 @@ private theorem scanHLOFields_type (c : Char) (sep : List Char) (ty : TensorType
   subst c
   exact scanHLOFields_no_head ' ' sep _ (tensorType_no_space ty) fuel hf
 
-set_option maxRecDepth 4000 in
-set_option maxHeartbeats 16000000 in
+private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b : String)
+    (op : StableHLOOp) (ty : TensorType)
+    (hopName : (opName.toList.all fun c => c.isAlphanum || c == '_') = true)
+    (hno_cmp : stripPrefixChars "compare ".toList (opName ++ " ").toList = none)
+    (hno_sel : stripPrefixChars "select ".toList (opName ++ " ").toList = none)
+    (hno_res : opName ≠ "reshape")
+    (hno_cnv : opName ≠ "convert")
+    (hno_slc : opName ≠ "slice")
+    (hno_dot : stripPrefixChars "dot_general ".toList (opName ++ " ").toList = none)
+    (hno_cst : stripPrefixChars "constant dense<".toList (opName ++ " ").toList = none)
+    (hbin : parseBinaryOp ("stablehlo." ++ opName) d a b = some op)
+    (hrt : resultTypeOf tenv op = some ty)
+    (hd : CanonicalSSAName d) (ha : CanonicalSSAName a) (hb : CanonicalSSAName b) :
+    parseStableHLOOp tenv (ppTyped d ("stablehlo." ++ opName ++ " %" ++ a ++ ", %" ++ b) (some ty)) =
+      some op := by
+  have hop_excl (c : Char) (hc : (c.isAlphanum || c == '_') = false) : c ∉ opName.toList := by
+    intro hm; have := List.all_eq_true.mp hopName c hm; simp [hc] at this
+  have hty_excl (c : Char) (hc : (c.isDigit || "tensor<>xiufb".toList.contains c) = false) :
+      c ∉ (ppTensorType ty).toList := by
+    have hn (n : Nat) : c ∉ n.repr.toList := by
+      intro hm
+      have hd0 := Nat.isDigit_of_mem_toDigits (b := 10) (n := n) (by omega) (by omega)
+        (by simpa only [Nat.toList_repr] using hm)
+      simp [hd0] at hc
+    have hel : c ∉ (ppElemType ty.elem).toList := by
+      intro hm
+      have hmem : "tensor<>xiufb".toList.contains c || c.isDigit = true := by
+        cases ty.elem <;> simp [ppElemType] at hm <;> rcases hm with _ <;> simp_all
+      cases hd0 : c.isDigit <;> simp_all
+    have hi (ls : List String) (hh : ∀ s ∈ ls, c ∉ s.toList) : c ∉ (String.intercalate "x" ls).toList := by
+      induction ls with
+      | nil => simp
+      | cons s ss ih =>
+        cases ss with
+        | nil => simpa using hh s (by simp)
+        | cons t ts =>
+          rw [String.intercalate_cons_cons]
+          simp only [String.toList_append, List.mem_append, not_or]
+          refine ⟨⟨hh s (by simp), ?_⟩, ih (fun z hz => hh z (by simp [hz]))⟩
+          intro hx; subst hx; simp at hc
+    rcases ty with ⟨shape, elem⟩
+    cases shape with
+    | nil =>
+      rw [show ppTensorType { shape := [], elem := elem } = "tensor<" ++ ppElemType elem ++ ">" from rfl]
+      simp only [String.toList_append, List.mem_append, not_or]
+      refine ⟨⟨?_, hel⟩, ?_⟩ <;> intro hm <;>
+        (have hmem : "tensor<>xiufb".toList.contains c = true := by simp at hm; rcases hm with _ <;> simp_all
+         simp [hmem] at hc)
+    | cons n ns =>
+      have hs := hi ((n :: ns).map Nat.repr) (fun s hs => by obtain ⟨m, _, rfl⟩ := List.mem_map.mp hs; exact hn m)
+      rw [show ppTensorType { shape := n :: ns, elem := elem } =
+          "tensor<" ++ String.intercalate "x" ((n :: ns).map Nat.repr) ++ "x" ++ ppElemType elem ++ ">" by
+        simp [ppTensorType, ppShape, toString, String.append_assoc]]
+      simp only [String.toList_append, List.mem_append, not_or]
+      refine ⟨⟨⟨⟨?_, hs⟩, ?_⟩, hel⟩, ?_⟩ <;> intro hm <;>
+        (have hmem : "tensor<>xiufb".toList.contains c = true := by simp at hm; rcases hm with _ <;> simp_all
+         simp [hmem] at hc)
+  have hsingle (sep : List Char) (xs : List Char) (fuel : Nat) (hne : sep ≠ [])
+      (c : Char) (hc : c ∈ sep) (hn : c ∉ xs) (hf : xs.length < fuel) :
+      scanHLOFields sep fuel xs = some [xs] := by
+    have hz : scanHLOFields sep (fuel - xs.length) [] = some [[]] := by
+      cases hsub : fuel - xs.length <;> [omega; rfl]
+    have hp := scanHLOFields_prefix sep xs [] (fuel - xs.length) [] [] hne
+      (fun x y he _ => by
+        rw [List.append_nil]
+        have hnin : c ∉ y := fun hm => hn (by simp [he, hm])
+        induction sep generalizing y with
+        | nil => simp at hc
+        | cons p ps ih =>
+          cases y with
+          | nil => rfl
+          | cons z zs =>
+            simp only [stripPrefixChars]
+            rcases List.mem_cons.mp hc with hpc | hps
+            · subst p; simp [beq_eq_false_iff_ne.mpr (fun heq => hnin (by simp [heq]))]
+            · split <;> [exact ih zs (by intro h0; subst h0; simp at hps) hps (fun hm => hnin (by simp [hm])); rfl]) hz
+    simpa [Nat.add_sub_of_le (Nat.le_of_lt hf)] using hp
+  let args := "%" ++ a ++ ", %" ++ b
+  let suffix := opName ++ " " ++ args
+  let operation := "%" ++ d ++ " = stablehlo." ++ suffix
+  let annotation := ppTensorType ty
+  have hpp : ppTyped d ("stablehlo." ++ opName ++ " %" ++ a ++ ", %" ++ b) (some ty) =
+      operation ++ " : " ++ annotation := by
+    apply String.ext_iff.mpr
+    simp [ppTyped, operation, suffix, args, annotation, toString, String.toList_append]
+  have hcolon_op : ':' ∉ operation.toList := by
+    simp [operation, suffix, args, String.toList_append, hd.excludes d ':' rfl,
+      hop_excl ':' rfl, ha.excludes a ':' rfl, hb.excludes b ':' rfl]
+  have hcolon_ann : ':' ∉ annotation.toList := hty_excl ':' rfl
+  have hsplit_ann : parseHLOFields " : " (operation ++ " : " ++ annotation) = some [operation, annotation] := by
+    unfold parseHLOFields
+    let sep := " : ".toList
+    let rfuel := sep.length + annotation.toList.length
+    have hr := hsingle sep annotation.toList rfuel (by decide) ':' (by decide) hcolon_ann (by dsimp [rfuel, sep]; omega)
+    have hd_del : scanHLOFields sep (rfuel + 1) (sep ++ annotation.toList) = some [[], annotation.toList] := by
+      rw [scanHLOFields_delimiter sep annotation.toList rfuel (by decide), hr]; rfl
+    have hp := scanHLOFields_prefix sep operation.toList (sep ++ annotation.toList) (rfuel + 1)
+      [] [annotation.toList] (by decide)
+      (fun x y he hy => by
+        cases y with
+        | nil => contradiction
+        | cons c0 cs =>
+          cases cs with
+          | nil => simp [sep, stripPrefixChars]; split <;> [decide; rfl]
+          | cons c1 cs' =>
+            have hc1 : ':' ≠ c1 := fun h => hcolon_op (by subst h; simp [he])
+            simp [sep, stripPrefixChars]; split <;> [simp [hc1]; rfl]) hd_del
+    have hlen : (operation ++ " : " ++ annotation).toList.length + 1 = operation.toList.length + (rfuel + 1) := by
+      simp [rfuel, sep, String.toList_append]; omega
+    have hchars : (operation ++ " : " ++ annotation).toList = operation.toList ++ (sep ++ annotation.toList) := by
+      simp [sep, String.toList_append, List.append_assoc]
+    rw [hlen, hchars, hp]; simp
+  have hdot_suf : '.' ∉ suffix.toList := by
+    simp [suffix, args, String.toList_append, hop_excl '.' rfl, ha.excludes a '.' rfl, hb.excludes b '.' rfl]
+  have hnonmatch (tag : String) (htag_sp : ' ' ∉ tag.toList.dropLast)
+      (htag : stripPrefixChars tag.toList (opName ++ " ").toList = none) :
+      parseHLOFields (" = stablehlo." ++ tag) operation = some [operation] := by
+    let sep := (" = stablehlo." ++ tag).toList
+    have hsep_eq : sep = ' ' :: '=' :: ' ' :: 's' :: 't' :: 'a' :: 'b' :: 'l' :: 'e' :: 'h' :: 'l' :: 'o' :: '.' :: tag.toList := by
+      simp [sep, String.toList_append]
+    have hsep_ne : sep ≠ [] := by simp [hsep_eq]
+    have hafter := hsingle sep suffix.toList (suffix.toList.length + 1) hsep_ne '.' (by simp [hsep_eq]) hdot_suf (by omega)
+    let mid := " = stablehlo.".toList
+    have hno_suf : stripPrefixChars tag.toList suffix.toList = none := by
+      have hsuf_eq : suffix.toList = (opName ++ " ").toList ++ args.toList := by
+        simp [suffix, String.toList_append, List.append_assoc]
+      rw [hsuf_eq]
+      have haux : ∀ (t u v : List Char), stripPrefixChars t u = none → u.getLast? = some ' ' →
+          ' ' ∉ t.dropLast → stripPrefixChars t (u ++ v) = none := by
+        intro t
+        induction t with
+        | nil => intros _ _ h; simp [stripPrefixChars] at h
+        | cons tc tcs ih =>
+          intro u v hno hlast hsp
+          cases u with
+          | nil => simp at hlast
+          | cons uc ucs =>
+            cases ucs with
+            | nil =>
+              simp at hlast; subst uc
+              cases tcs with
+              | nil => simp [stripPrefixChars] at hno
+              | cons tc2 tcs2 =>
+                have hne : tc ≠ ' ' := fun h => by subst tc; simp [List.dropLast_cons_cons] at hsp
+                simp [stripPrefixChars, hne]
+            | cons uc2 ucs2 =>
+              simp only [List.cons_append, stripPrefixChars] at hno ⊢
+              split at hno
+              · rename_i heq; simp only [heq, ↓reduceIte]
+                cases tcs with
+                | nil => simp [stripPrefixChars] at hno
+                | cons tc2 tcs2 =>
+                  exact ih (uc2 :: ucs2) v hno (by simpa using hlast)
+                    (by intro hm; apply hsp; simp [List.dropLast_cons_cons, hm])
+              · rename_i hne; simp [hne]
+      exact haux tag.toList (opName ++ " ").toList args.toList htag
+        (by simp [String.toList_append, List.getLast?_concat]) htag_sp
+    have hmid : ∀ x y, mid = x ++ y → y ≠ [] → stripPrefixChars sep (y ++ suffix.toList) = none := by
+      intro x y he hy
+      cases x with
+      | nil =>
+        simp [List.nil_append] at he; subst he
+        have hs2 : sep = mid ++ tag.toList := by simp [sep, mid, String.toList_append]
+        have happ : ∀ (m t r : List Char), stripPrefixChars (m ++ t) (m ++ r) = stripPrefixChars t r := by
+          intro m; induction m <;> simp_all [stripPrefixChars]
+        rw [hs2, happ]; exact hno_suf
+      | cons c0 xs =>
+        have hm : mid = ' ' :: ['=', ' ', 's', 't', 'a', 'b', 'l', 'e', 'h', 'l', 'o', '.'] := by decide
+        rw [hm, List.cons_append, List.cons.injEq] at he
+        rcases he with ⟨_, he2⟩
+        rcases xs with _ | ⟨_, _ | ⟨_, _ | ⟨_, _ | ⟨_, _ | ⟨_, _ | ⟨_, _ | ⟨_, _ | ⟨_, _ | ⟨_, _ | ⟨_, _ | ⟨_, _ | ⟨_, _⟩⟩⟩⟩⟩⟩⟩⟩⟩⟩⟩⟩
+        all_goals simp only [List.nil_append, List.cons_append, List.cons.injEq] at he2
+        · subst he2; rw [hsep_eq]; rfl
+        · rcases he2 with ⟨_, rfl⟩; rw [hsep_eq]; rfl
+        · rcases he2 with ⟨_, _, rfl⟩; rw [hsep_eq]; rfl
+        · rcases he2 with ⟨_, _, _, rfl⟩; rw [hsep_eq]; rfl
+        · rcases he2 with ⟨_, _, _, _, rfl⟩; rw [hsep_eq]; rfl
+        · rcases he2 with ⟨_, _, _, _, _, rfl⟩; rw [hsep_eq]; rfl
+        · rcases he2 with ⟨_, _, _, _, _, _, rfl⟩; rw [hsep_eq]; rfl
+        · rcases he2 with ⟨_, _, _, _, _, _, _, rfl⟩; rw [hsep_eq]; rfl
+        · rcases he2 with ⟨_, _, _, _, _, _, _, _, rfl⟩; rw [hsep_eq]; rfl
+        · rcases he2 with ⟨_, _, _, _, _, _, _, _, _, rfl⟩; rw [hsep_eq]; rfl
+        · rcases he2 with ⟨_, _, _, _, _, _, _, _, _, _, rfl⟩; rw [hsep_eq]; rfl
+        · rcases he2 with ⟨_, _, _, _, _, _, _, _, _, _, _, rfl⟩; rw [hsep_eq]; rfl
+        · rcases he2 with ⟨_, _, _, _, _, _, _, _, _, _, _, _, hnil⟩
+          simp at hnil; exact False.elim (hy hnil.2)
+    have hmid_scan := scanHLOFields_prefix sep mid suffix.toList (suffix.toList.length + 1)
+      suffix.toList [] hsep_ne hmid hafter
+    let pre := ("%" ++ d).toList
+    have hpre : ∀ x y, pre = x ++ y → y ≠ [] → stripPrefixChars sep (y ++ (mid ++ suffix.toList)) = none := by
+      intro x y he hy
+      cases y with
+      | nil => contradiction
+      | cons z zs =>
+        have hnsp : ' ' ∉ pre := by simp [pre, String.toList_append, hd.excludes d ' ' rfl]
+        have hz : ' ' ≠ z := fun h => hnsp (by subst h; simp [he])
+        rw [hsep_eq]; simp [stripPrefixChars, hz]
+    have hfull := scanHLOFields_prefix sep pre (mid ++ suffix.toList)
+      (mid.length + (suffix.toList.length + 1)) (mid ++ suffix.toList) [] hsep_ne hpre hmid_scan
+    unfold parseHLOFields
+    have hlen : operation.toList.length + 1 = pre.length + (mid.length + (suffix.toList.length + 1)) := by
+      simp [operation, pre, mid, String.toList_append]; omega
+    have hchars : operation.toList = pre ++ (mid ++ suffix.toList) := by
+      simp [operation, pre, mid, String.toList_append, List.append_assoc]
+    rw [hlen, hchars]; change (scanHLOFields sep _ _).map _ = _; rw [hfull]
+    simp only [Option.map_some, List.map_cons, List.map_nil]
+    congr 2; apply String.ext_iff.mpr; simp [operation, pre, mid, String.toList_append, List.append_assoc]
+  have hcmp := hnonmatch "compare " (by decide) hno_cmp
+  have hsel := hnonmatch "select " (by decide) hno_sel
+  have hdot := hnonmatch "dot_general " (by decide) hno_dot
+  have hcst : parseHLOFields " = stablehlo.constant dense<" operation = some [operation] := by
+    unfold parseHLOFields
+    have hlt_op : '<' ∉ operation.toList := by
+      simp [operation, suffix, args, String.toList_append, hd.excludes d '<' rfl,
+        hop_excl '<' rfl, ha.excludes a '<' rfl, hb.excludes b '<' rfl]
+    rw [hsingle (" = stablehlo.constant dense<".toList) operation.toList (operation.toList.length + 1)
+      (by decide) '<' (by decide) hlt_op (by omega)]
+    simp
+  have hst : parseHLOFields " = stablehlo." operation = some ["%" ++ d, suffix] := by
+    unfold parseHLOFields
+    let sep := " = stablehlo.".toList
+    let rfuel := sep.length + suffix.toList.length
+    have hr := hsingle sep suffix.toList rfuel (by decide) '.' (by decide) hdot_suf (by dsimp [rfuel, sep]; omega)
+    have hd_del : scanHLOFields sep (rfuel + 1) (sep ++ suffix.toList) = some [[], suffix.toList] := by
+      rw [scanHLOFields_delimiter sep suffix.toList rfuel (by decide), hr]; rfl
+    have hp := scanHLOFields_prefix sep ("%" ++ d).toList (sep ++ suffix.toList) (rfuel + 1)
+      [] [suffix.toList] (by decide)
+      (fun x y he hy => by
+        cases y with
+        | nil => contradiction
+        | cons z zs =>
+          have hnsp : ' ' ∉ ("%" ++ d).toList := by simp [String.toList_append, hd.excludes d ' ' rfl]
+          have hz : ' ' ≠ z := fun h => hnsp (by subst h; simp [he])
+          simp [sep, stripPrefixChars, hz]) hd_del
+    have hlen : operation.toList.length + 1 = ("%" ++ d).toList.length + (rfuel + 1) := by
+      simp [operation, rfuel, sep, String.toList_append]; omega
+    have hchars : operation.toList = ("%" ++ d).toList ++ (sep ++ suffix.toList) := by
+      simp [operation, sep, String.toList_append, List.append_assoc]
+    rw [hlen, hchars, hp]; simp
+  let payload := "stablehlo." ++ suffix
+  have hdims : parseHLOFields ", dims = " payload = some [payload] := by
+    unfold parseHLOFields
+    have heq_pl : '=' ∉ payload.toList := by
+      simp [payload, suffix, args, String.toList_append, hop_excl '=' rfl, ha.excludes a '=' rfl, hb.excludes b '=' rfl]
+    rw [hsingle (", dims = ".toList) payload.toList (payload.toList.length + 1)
+      (by decide) '=' (by decide) heq_pl (by omega)]
+    simp
+  have hsp_pl : parseHLOFields " " payload =
+      some ["stablehlo." ++ opName, "%" ++ a ++ ",", "%" ++ b] := by
+    have hp := parseHLOFields_intercalate ' ' ["stablehlo." ++ opName, "%" ++ a ++ ",", "%" ++ b] (by simp) (by
+      intro x hx; simp at hx; rcases hx with rfl | rfl | rfl
+      · simp [String.toList_append, hop_excl ' ' rfl]
+      · simp [String.toList_append, ha.excludes a ' ' rfl]
+      · simp [String.toList_append, hb.excludes b ' ' rfl])
+    have heq : payload = String.intercalate " " ["stablehlo." ++ opName, "%" ++ a ++ ",", "%" ++ b] := by
+      apply String.ext_iff.mpr; simp [payload, suffix, args, String.toList_append]
+    rw [heq]; simpa using hp
+  have hpct_pl : parseHLOFields " %" payload =
+      some ["stablehlo." ++ opName, a ++ ",", b] := by
+    have hp := parseHLOFields_intercalate_head ' ' "%" ["stablehlo." ++ opName, a ++ ",", b] (by simp) (by
+      intro x hx; simp at hx; rcases hx with rfl | rfl | rfl
+      · simp [String.toList_append, hop_excl ' ' rfl]
+      · simp [String.toList_append, ha.excludes a ' ' rfl]
+      · simp [String.toList_append, hb.excludes b ' ' rfl])
+    have heq : payload = String.intercalate " %" ["stablehlo." ++ opName, a ++ ",", b] := by
+      apply String.ext_iff.mpr; simp [payload, suffix, args, String.toList_append]
+    rw [heq]; simpa using hp
+  have hsp_op : parseHLOFields " " operation =
+      some ["%" ++ d, "=", "stablehlo." ++ opName, "%" ++ a ++ ",", "%" ++ b] := by
+    have hp := parseHLOFields_intercalate ' '
+      ["%" ++ d, "=", "stablehlo." ++ opName, "%" ++ a ++ ",", "%" ++ b] (by simp) (by
+      intro x hx; simp at hx; rcases hx with rfl | rfl | rfl | rfl | rfl
+      · simp [String.toList_append, hd.excludes d ' ' rfl]
+      · decide
+      · simp [String.toList_append, hop_excl ' ' rfl]
+      · simp [String.toList_append, ha.excludes a ' ' rfl]
+      · simp [String.toList_append, hb.excludes b ' ' rfl])
+    have heq : operation = String.intercalate " "
+        ["%" ++ d, "=", "stablehlo." ++ opName, "%" ++ a ++ ",", "%" ++ b] := by
+      apply String.ext_iff.mpr; simp [operation, suffix, args, String.toList_append]
+    rw [heq]; simpa using hp
+  have hnot_ret : "%" ++ d ≠ "return" := by
+    intro h
+    have := congrArg String.toList h
+    simp [String.toList_append] at this
+  have hnot_res : "stablehlo." ++ opName ≠ "stablehlo.reshape" := by
+    intro h; apply hno_res
+    have := congrArg (fun s : String => String.ofList (s.toList.drop 10)) h
+    simpa [String.toList_append, String.ofList_toList] using this
+  have hnot_cnv : "stablehlo." ++ opName ≠ "stablehlo.convert" := by
+    intro h; apply hno_cnv
+    have := congrArg (fun s : String => String.ofList (s.toList.drop 10)) h
+    simpa [String.toList_append, String.ofList_toList] using this
+  have ha_last : ("%" ++ a ++ ",").toList.getLast? = some ',' := by
+    simp [String.toList_append, List.append_assoc, List.getLast?_concat]
+  have ha_take : String.ofList (("%" ++ a ++ ",").toList.take (("%" ++ a ++ ",").toList.length - 1)) = "%" ++ a := by
+    have heq : ("%" ++ a ++ ",").toList = ("%" ++ a).toList ++ [','] := by
+      simp [String.toList_append, List.append_assoc]
+    rw [heq, List.length_append, List.length_singleton, Nat.add_sub_cancel, List.take_left]
+    exact String.ofList_toList _
+  rw [hpp]
+  unfold parseStableHLOOp
+  simp only [hsplit_ann, hcmp, hsel, hst, hd.parse_roundtrip d, payload, hdims, hsp_pl, hpct_pl,
+    hnot_res, hnot_cnv, hdot, hcst, hsp_op, hnot_ret, ha_last, ha_take,
+    ha.parse_roundtrip a, hb.parse_roundtrip b, hbin, hrt, annotation,
+    bind, Option.bind, pure, bne_self_eq_false, beq_self_eq_true, Bool.false_eq_true, ↓reduceIte]
+
 theorem parseStableHLOOp_binary_roundtrip (tenv : TypeEnv) (d a b : String)
     (op : StableHLOOp)
     (hop : op = .add d a b ∨ op = .subtract d a b ∨ op = .multiply d a b ∨
@@ -454,49 +759,46 @@ theorem parseStableHLOOp_binary_roundtrip (tenv : TypeEnv) (d a b : String)
   cases he : resultTypeOf tenv op with
   | none => simp [he] at ht
   | some ty =>
-    have hdscan := fun sep => scanHLOFields_name ' ' sep d hd rfl
-    have hascan := fun sep => scanHLOFields_name ' ' sep a ha rfl
-    have hbscan := fun sep => scanHLOFields_name ' ' sep b hb rfl
-    have htscan := fun sep => scanHLOFields_type ' ' sep ty rfl
-    have hbend := fun sep => scanHLOFields_no_head ' ' sep b.toList (hb.excludes b ' ' rfl)
-    have hacomma := fun sep => scanHLOFields_name ',' sep a ha rfl
-    have hbcomma := fun sep => scanHLOFields_no_head ',' sep b.toList (hb.excludes b ',' rfl)
     rcases hop with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
-    all_goals
-      simp only [ppStableHLOOp, ppTyped, he, toString]
-    all_goals
-    (
-    unfold parseStableHLOOp parseHLOFields
-    simp only [String.toList_append, String.reduceToList, List.append_assoc,
-      List.cons_append, List.nil_append, List.length_append, List.length_cons]
-    simp only [scanHLOFields, stripPrefixChars,
-      List.isEmpty_cons, Bool.false_eq_true, ↓reduceIte, Char.reduceBEq,
-      bind, Option.bind, pure, Nat.add_assoc]
-    repeat first
-      | (rw [hdscan] <;> try (simp only [Nat.add]; omega))
-      | (rw [hascan] <;> try (simp only [Nat.add]; omega))
-      | (rw [hbscan] <;> try (simp only [Nat.add]; omega))
-      | (rw [htscan] <;> try omega)
-      | (rw [hbend] <;> try omega)
-      | (rw [hacomma] <;> try omega)
-      | (rw [hbcomma] <;> try omega)
-      | simp only [scanHLOFields, stripPrefixChars, List.isEmpty_cons,
-          String.toList_ofList, String.ofList_toList, List.length_append, List.length_cons,
-          List.length_nil,
-          Bool.false_eq_true, ↓reduceIte, Char.reduceBEq, bind, Option.bind, pure,
-          Option.map_some, List.map_cons, List.map_nil, List.append_nil,
-          Nat.add_eq, Nat.add_assoc, Nat.add_sub_cancel_left]
-    have hpd : parseSSAName (String.ofList ('%' :: d.toList)) = some d := by
-      simpa [String.toList_append] using hd.parse_roundtrip d
-    have hpb : parseSSAName (String.ofList ('%' :: b.toList)) = some b := by
-      simpa [String.toList_append] using hb.parse_roundtrip b
-    simp only [String.reduceOfList, hpd, hpb]
-    simp [List.take_succ_cons,
-      ha.parse_roundtrip a, parseBinaryOp, he, String.ofList_append]
-    · change (( '%' :: a.toList) ++ [',']).getLast? = some ','
-      exact List.getLast?_concat
-    all_goals (try simp only [Nat.add_eq]) <;> omega
-    )
+    · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
+        parseStableHLOOp_ppTyped_binary tenv "add" d a b (.add d a b) ty
+          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl rfl he hd ha hb
+    · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
+        parseStableHLOOp_ppTyped_binary tenv "subtract" d a b (.subtract d a b) ty
+          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl rfl he hd ha hb
+    · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
+        parseStableHLOOp_ppTyped_binary tenv "multiply" d a b (.multiply d a b) ty
+          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl rfl he hd ha hb
+    · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
+        parseStableHLOOp_ppTyped_binary tenv "divide" d a b (.divide d a b) ty
+          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl rfl he hd ha hb
+    · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
+        parseStableHLOOp_ppTyped_binary tenv "remainder" d a b (.remainder d a b) ty
+          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl rfl he hd ha hb
+    · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
+        parseStableHLOOp_ppTyped_binary tenv "maximum" d a b (.maximum d a b) ty
+          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl rfl he hd ha hb
+    · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
+        parseStableHLOOp_ppTyped_binary tenv "minimum" d a b (.minimum d a b) ty
+          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl rfl he hd ha hb
+    · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
+        parseStableHLOOp_ppTyped_binary tenv "and" d a b (.and d a b) ty
+          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl rfl he hd ha hb
+    · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
+        parseStableHLOOp_ppTyped_binary tenv "or" d a b (.or d a b) ty
+          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl rfl he hd ha hb
+    · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
+        parseStableHLOOp_ppTyped_binary tenv "xor" d a b (.xor d a b) ty
+          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl rfl he hd ha hb
+    · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
+        parseStableHLOOp_ppTyped_binary tenv "shift_left" d a b (.shiftLeft d a b) ty
+          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl rfl he hd ha hb
+    · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
+        parseStableHLOOp_ppTyped_binary tenv "shift_right_arithmetic" d a b (.shiftRightArithmetic d a b) ty
+          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl rfl he hd ha hb
+    · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
+        parseStableHLOOp_ppTyped_binary tenv "shift_right_logical" d a b (.shiftRightLogical d a b) ty
+          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl rfl he hd ha hb
 
 theorem parseStableHLOOp_add_roundtrip (tenv : TypeEnv) (d a b : String)
     (hd : CanonicalSSAName d) (ha : CanonicalSSAName a) (hb : CanonicalSSAName b)
