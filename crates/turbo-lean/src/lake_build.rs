@@ -4272,6 +4272,8 @@ fn ensure_project_imports_fresh_inner(
             ) {
                 non_root_imports.push(mod_name);
             }
+        } else if mod_name == "Init" {
+            continue;
         } else {
             let tc_lib = match standalone_tc_lib_lean.as_ref() {
                 Some(tc_lib) => tc_lib,
@@ -6103,7 +6105,7 @@ struct PreRebuildModuleBaseline {
     export_dig: String,
     meta_dig: String,
     lake_export_info: Option<crate::module_builder::LakeModuleExportInfo>,
-    ir_pair_dig: Option<([u8; 32], [u8; 32])>,
+    ir_pair_dig: Option<([u8; 32], Option<[u8; 32]>)>,
     olean_pub_sig: crate::zygote::OleanPublicSignatureReply,
     base_pub_sig_digest: Option<String>,
     base_meta_sig_digest: Option<String>,
@@ -6111,15 +6113,17 @@ struct PreRebuildModuleBaseline {
     cur_meta_sig_digest: String,
 }
 
-fn read_module_ir_pair_digest(olean_path: &Path) -> Option<([u8; 32], [u8; 32])> {
+fn read_module_ir_pair_digest(olean_path: &Path) -> Option<([u8; 32], Option<[u8; 32]>)> {
     let ir_path = olean_path.with_extension("ir");
     let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
     let ir_bytes = fs::read(&ir_path).ok()?;
-    let ir_sig_bytes = fs::read(&ir_sig_path).ok()?;
-    Some((
-        *blake3::hash(&ir_bytes).as_bytes(),
-        *blake3::hash(&ir_sig_bytes).as_bytes(),
-    ))
+    let need_sig = crate::module_builder::olean_requires_ir_sig(olean_path);
+    let ir_sig = match fs::read(&ir_sig_path) {
+        Ok(b) => Some(*blake3::hash(&b).as_bytes()),
+        Err(_) if !need_sig => None,
+        Err(_) => return None,
+    };
+    Some((*blake3::hash(&ir_bytes).as_bytes(), ir_sig))
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -13617,7 +13621,7 @@ public def api := by
         std::env::set_var("TURBO_LEAN_STRICT_TOOLCHAIN", "1");
         fs::write(
             proj.join("lean-toolchain"),
-            "leanprover/lean4:v0.0.0-nonexistent-impact-test\n",
+            "leanprover/lean4:v4.99.0-nonexistent-impact-test\n",
         )?;
         let err_tc = compute_impact_report(
             proj.join("Smoke/A.lean"),

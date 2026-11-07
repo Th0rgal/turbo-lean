@@ -4434,16 +4434,16 @@ pub fn run_fast_check_command(
                         &tmp_lean
                     };
                     let compile_dir = if has_main { &lean_dir } else { &staging };
-                    let st1 = Command::new(&lean_bin_path)
+                    let out1 = Command::new(&lean_bin_path)
                         .arg("-c")
                         .arg(&tmp_c)
                         .arg(compile_target)
                         .current_dir(compile_dir)
                         .envs(&env_vars)
-                        .status()
+                        .output()
                         .context("Failed to compile Lean to C via `lean -c`")?;
-                    if !st1.success() {
-                        anyhow::bail!("`lean -c` failed on {}", file.display());
+                    if !out1.status.success() {
+                        return Err(crate::zygote::compiler_failure(&file, &out1));
                     }
                 }
                 drop(tmp_lean);
