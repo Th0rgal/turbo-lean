@@ -5,7 +5,17 @@
 
 extern "C" {
     pub fn turbo_spec_is_closed_section_needed(min_needed_idx: u64, target_idx: u64) -> u8;
+    pub fn turbo_spec_precompute_min_needed_idx(
+        sec_close: u64,
+        first_ref_idx: u64,
+        total_spans: u64,
+    ) -> u64;
     pub fn turbo_spec_can_fission_have(prologue_contains_intro: u8) -> u8;
+    pub fn turbo_spec_sanitize_phase_options(
+        allow_stub: u8,
+        warning_as_error: u8,
+        forbid_sorry_ax: u8,
+    ) -> u8;
     pub fn turbo_spec_sanitize_warning_as_error(allow_stub: u8, warning_as_error: u8) -> u8;
     pub fn turbo_spec_sanitize_forbid_sorry_ax(allow_stub: u8, forbid_sorry_ax: u8) -> u8;
     pub fn turbo_spec_is_sound_decl_summary(
@@ -1673,6 +1683,13 @@ mod tests {
             0,
             u64::MAX
         ));
+        assert!(!leannative_certify_cex_witnesses_safe(
+            1_000_000,
+            u64::MAX,
+            u64::MAX
+        ));
+        assert!(!leannative_certify_cex_witnesses_safe(0, 0, u64::MAX));
+        assert!(!leannative_certify_cex_witnesses_safe(1_000_000, 0, 0));
         assert!(verify_dag_wave_step(0, 4, 8, 16, 4, 4));
         assert!(!verify_dag_wave_step(1, 4, 8, 16, 4, 4));
         assert!(!verify_dag_wave_step(0, 0, 8, 16, 4, 4));
@@ -2115,6 +2132,183 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn test_two_sided_all_turbo_spec_policy_gates_exhaustive() {
+        unsafe {
+            assert_eq!(turbo_spec_is_closed_section_needed(3, 3), 1);
+            assert_eq!(turbo_spec_is_closed_section_needed(3, 5), 1);
+            assert_eq!(turbo_spec_is_closed_section_needed(4, 3), 0);
+
+            assert_eq!(turbo_spec_precompute_min_needed_idx(2, 5, 10), 5);
+            assert_eq!(turbo_spec_precompute_min_needed_idx(5, 5, 10), 10);
+            assert_eq!(turbo_spec_precompute_min_needed_idx(7, 5, 10), 10);
+
+            assert_eq!(turbo_spec_can_fission_have(0), 1);
+            assert_eq!(turbo_spec_can_fission_have(1), 0);
+
+            for allow_stub in [0u8, 1] {
+                for warn_err in [0u8, 1] {
+                    for forbid_sorry in [0u8, 1] {
+                        let exp_w = if allow_stub != 0 { 0 } else { warn_err };
+                        let exp_f = if allow_stub != 0 { 0 } else { 1 };
+                        assert_eq!(
+                            turbo_spec_sanitize_warning_as_error(allow_stub, warn_err),
+                            exp_w
+                        );
+                        assert_eq!(
+                            turbo_spec_sanitize_forbid_sorry_ax(allow_stub, forbid_sorry),
+                            exp_f
+                        );
+                        assert_eq!(
+                            turbo_spec_sanitize_phase_options(allow_stub, warn_err, forbid_sorry),
+                            exp_w | (exp_f << 1)
+                        );
+                    }
+                }
+            }
+
+            for mask in 0u8..16 {
+                let a = mask & 1;
+                let u = (mask >> 1) & 1;
+                let e = (mask >> 2) & 1;
+                let f = (mask >> 3) & 1;
+                assert_eq!(
+                    turbo_spec_is_sound_decl_summary(a, u, e, f),
+                    u8::from(mask == 0)
+                );
+            }
+
+            assert_eq!(turbo_spec_check_statement_pinned(0xAB, 0xAB, 0), 1);
+            assert_eq!(turbo_spec_check_statement_pinned(0xAB, 0xAC, 0), 0);
+            assert_eq!(turbo_spec_check_statement_pinned(0xAB, 0xAB, 1), 0);
+
+            assert_eq!(turbo_spec_node_effective_cost(10, 3, 100, 0), 410);
+            assert_eq!(turbo_spec_node_effective_cost(10, 3, 100, 2), 210);
+
+            for ttl in [0u64, 1] {
+                for healthy in [0u8, 1] {
+                    for sup in [0u8, 1] {
+                        assert_eq!(
+                            turbo_spec_is_remote_eligible(ttl, healthy, sup),
+                            u8::from(ttl > 0 && healthy == 1 && sup == 1)
+                        );
+                    }
+                }
+            }
+
+            assert_eq!(turbo_spec_should_switch_route(100, 99, 1), 1);
+            assert_eq!(turbo_spec_should_switch_route(100, 100, 1), 0);
+            assert_eq!(turbo_spec_should_switch_route(100, 50, 0), 0);
+
+            assert_eq!(turbo_spec_classify_compute_target(4095, 1, 1, 1, 1), 0);
+            assert_eq!(turbo_spec_classify_compute_target(4096, 0, 1, 1, 1), 2);
+            assert_eq!(turbo_spec_classify_compute_target(4096, 1, 0, 0, 1), 1);
+            assert_eq!(turbo_spec_classify_compute_target(4096, 0, 0, 0, 0), 0);
+
+            assert_ne!(turbo_spec_splitmix64(0), turbo_spec_splitmix64(1));
+            assert_eq!(turbo_spec_boundary_u256_limb(0, 0), 0);
+            assert_eq!(turbo_spec_boundary_u256_limb(1, 0), 1);
+            assert_eq!(turbo_spec_boundary_u256_limb(1, 1), 0);
+            assert_eq!(
+                turbo_spec_gen_u256_limb(1, 42, 0, 0),
+                turbo_spec_boundary_u256_limb(1, 0)
+            );
+            assert_ne!(
+                turbo_spec_gen_u256_limb(4096, 42, 0, 0),
+                turbo_spec_gen_u256_limb(4097, 42, 0, 0)
+            );
+
+            assert_eq!(turbo_spec_u256_lt(1, 0, 0, 0, 2, 0, 0, 0), 1);
+            assert_eq!(turbo_spec_u256_lt(2, 0, 0, 0, 2, 0, 0, 0), 0);
+            assert_eq!(turbo_spec_u256_lt(9, 9, 9, 0, 0, 0, 0, 1), 1);
+
+            assert_eq!(turbo_spec_eval_u64_binop(0, 7, 5), 12);
+            assert_eq!(turbo_spec_eval_u64_binop(1, 5, 7), 0);
+            assert_eq!(turbo_spec_eval_u64_binop(3, 9, 0), 0);
+            assert_eq!(turbo_spec_eval_u64_binop(10, 7, 7), 1);
+            assert_eq!(turbo_spec_eval_u64_binop(10, 7, 8), 0);
+
+            for a in [0u8, 1] {
+                for b in [0u8, 1] {
+                    assert_eq!(turbo_spec_step_verdict_consistent(a, b), u8::from(a == b));
+                }
+            }
+
+            assert_eq!(turbo_spec_zygote_lca_reuse_safe(1, 1), 1);
+            assert_eq!(turbo_spec_zygote_lca_reuse_safe(0, 1), 0);
+            assert_eq!(turbo_spec_zygote_lca_reuse_safe(2, 1), 0);
+
+            for pos in [0u8, 1] {
+                for neg in [0u8, 1] {
+                    assert_eq!(
+                        turbo_spec_audit_witness_gate(pos, neg),
+                        u8::from(pos == 1 && neg == 1)
+                    );
+                }
+            }
+
+            assert_eq!(turbo_spec_effective_cone_job_cap(8, 0), 8);
+            assert_eq!(turbo_spec_effective_cone_job_cap(8, 4), 4);
+            assert_eq!(turbo_spec_effective_cone_job_cap(3, 4), 3);
+
+            for d in [0u8, 1] {
+                for v in [0u8, 1] {
+                    assert_eq!(
+                        turbo_spec_is_scope_isolated_for_fast_olean(d, v),
+                        u8::from(d == 0 && v == 0)
+                    );
+                }
+            }
+
+            assert_eq!(turbo_spec_verify_dag_schedule_step(0, 3, 3, 4, 5), 1);
+            assert_eq!(turbo_spec_verify_dag_schedule_step(1, 3, 3, 4, 5), 0);
+            assert_eq!(turbo_spec_verify_dag_schedule_step(0, 2, 3, 4, 5), 0);
+            assert_eq!(turbo_spec_verify_dag_schedule_step(0, 3, 3, 5, 5), 0);
+
+            for mask in 0u8..32 {
+                assert_eq!(
+                    turbo_spec_verify_module_cache_key(
+                        mask & 1,
+                        (mask >> 1) & 1,
+                        (mask >> 2) & 1,
+                        (mask >> 3) & 1,
+                        (mask >> 4) & 1,
+                    ),
+                    u8::from(mask == 31)
+                );
+            }
+
+            for mask in 0u8..128 {
+                let ho = mask & 1;
+                let hi = (mask >> 1) & 1;
+                let im = (mask >> 2) & 1;
+                let hs = (mask >> 3) & 1;
+                let hp = (mask >> 4) & 1;
+                let nc = (mask >> 5) & 1;
+                let hc = (mask >> 6) & 1;
+                let exp =
+                    ho == 1 && hi == 1 && (im == 0 || (hs == 1 && hp == 1)) && (nc == 0 || hc == 1);
+                assert_eq!(
+                    turbo_spec_verify_module_artifact_set(ho, hi, im, hs, hp, nc, hc),
+                    u8::from(exp)
+                );
+            }
+
+            for mask in 0u8..16 {
+                let hc = mask & 1;
+                let hd = (mask >> 1) & 1;
+                let hu = (mask >> 2) & 1;
+                let hf = (mask >> 3) & 1;
+                assert_eq!(
+                    turbo_spec_verify_static_lake_config(hc, hd, hu, hf),
+                    u8::from(hc == 1 && hd == 0 && hu == 0 && hf == 0)
+                );
+            }
+
+            assert_ne!(turbo_spec_combined_step(0), turbo_spec_combined_step(7));
         }
     }
 }

@@ -2396,6 +2396,9 @@ fn check_directory(
     }
     import_res?;
     let mut dir_hasher = blake3::Hasher::new();
+    dir_hasher.update(b"dir-check-v2\n");
+    dir_hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+    dir_hasher.update(b"\n");
     dir_hasher.update(toolchain.as_bytes());
 
     let dir_pkg_cfg = crate::module_builder::optional_package_config(canon_dir)?;

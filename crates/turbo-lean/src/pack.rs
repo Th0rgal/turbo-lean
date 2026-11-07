@@ -467,16 +467,7 @@ pub fn get_store_manifest(store: &TurboStore, only_portable: bool) -> Result<Del
         blob_hashes,
     };
     if only_portable {
-        if let Ok(dm_bytes) = serde_json::to_vec(&dm) {
-            let locks_dir = store.root.join("locks");
-            if let Ok(created) = crate::db::ensure_dir_tracking(&locks_dir, &store.root) {
-                let _ = crate::db::write_bytes_durable(
-                    &locks_dir.join("cached_portable_manifest.json"),
-                    &dm_bytes,
-                    &created,
-                );
-            }
-        }
+        write_cached_portable_manifest_with_epoch(&store.root, &dm, crate::TURBO_LEAN_BUILD_EPOCH);
     }
     Ok(dm)
 }
@@ -540,8 +531,268 @@ pub(crate) fn set_file_mode_unix(path: &Path, mode: u32) {
     let _ = (path, mode);
 }
 
-const DEFERRED_PACK_V4_MAGIC: &[u8; 8] = b"TLDP\x00\x00\x00\x04";
+const DEFERRED_PACK_V5_MAGIC: &[u8; 8] = b"TLDP\x00\x00\x00\x05";
 const DEFERRED_PACK_SPOOL_PREFIX: &str = "deferred_pack_v4.";
+const CACHED_MANIFEST_ENVELOPE_VERSION: u32 = 2;
+const LAST_FULL_EXPORT_MAGIC: &[u8; 8] = b"TLFE\x00\x00\x00\x02";
+const LAST_IMPORT_STAMP_VERSION: &str = "v2";
+
+#[derive(Serialize, Deserialize)]
+struct CachedPortableManifestEnvelope {
+    version: u32,
+    build_epoch: String,
+    manifest: DeltaManifest,
+}
+
+pub(crate) fn write_cached_portable_manifest_with_epoch(
+    store_root: &Path,
+    dm: &DeltaManifest,
+    expected_epoch: &str,
+) {
+    let env = CachedPortableManifestEnvelope {
+        version: CACHED_MANIFEST_ENVELOPE_VERSION,
+        build_epoch: expected_epoch.to_string(),
+        manifest: dm.clone(),
+    };
+    if let Ok(dm_bytes) = serde_json::to_vec(&env) {
+        let locks_dir = store_root.join("locks");
+        if let Ok(created) = crate::db::ensure_dir_tracking(&locks_dir, store_root) {
+            let _ = crate::db::write_bytes_durable(
+                &locks_dir.join("cached_portable_manifest.json"),
+                &dm_bytes,
+                &created,
+            );
+        }
+    }
+}
+
+pub(crate) fn load_cached_portable_manifest_with_epoch(
+    store_root: &Path,
+    expected_epoch: &str,
+) -> Option<DeltaManifest> {
+    let locks_dir = store_root.join("locks");
+    let man_path = locks_dir.join("cached_portable_manifest.json");
+    let (dm_bytes, _) = crate::db::read_regular_nofollow(&man_path)?;
+    match serde_json::from_slice::<CachedPortableManifestEnvelope>(&dm_bytes) {
+        Ok(env)
+            if env.version == CACHED_MANIFEST_ENVELOPE_VERSION
+                && env.build_epoch == expected_epoch =>
+        {
+            Some(env.manifest)
+        }
+        _ => {
+            if fs::remove_file(&man_path).is_ok() {
+                let _ = crate::db::sync_dir(&locks_dir);
+            }
+            None
+        }
+    }
+}
+
+pub(crate) fn encode_last_full_export_with_epoch(
+    n_acts: usize,
+    n_blobs: usize,
+    raw_bytes: u64,
+    stream: &[u8],
+    epoch: &str,
+) -> Vec<u8> {
+    let epoch_bytes = epoch.as_bytes();
+    let mut buf = Vec::with_capacity(8 + 2 + epoch_bytes.len() + 24 + stream.len());
+    buf.extend_from_slice(LAST_FULL_EXPORT_MAGIC);
+    buf.extend_from_slice(&(epoch_bytes.len() as u16).to_le_bytes());
+    buf.extend_from_slice(epoch_bytes);
+    buf.extend_from_slice(&(n_acts as u64).to_le_bytes());
+    buf.extend_from_slice(&(n_blobs as u64).to_le_bytes());
+    buf.extend_from_slice(&raw_bytes.to_le_bytes());
+    buf.extend_from_slice(stream);
+    buf
+}
+
+pub(crate) fn read_last_full_export_with_epoch(
+    store_root: &Path,
+    header_only_shared_cas: bool,
+    expected_epoch: &str,
+) -> Option<(usize, usize, u64, Vec<u8>)> {
+    let locks_dir = store_root.join("locks");
+    let last_file = locks_dir.join(format!(
+        "last_full_export_{}.bin",
+        if header_only_shared_cas { 1 } else { 0 }
+    ));
+    let (cached_bytes, _) = crate::db::read_regular_nofollow(&last_file)?;
+    let parsed = (|| -> Option<(usize, usize, u64, Vec<u8>)> {
+        if cached_bytes.len() < 10 + 24 || &cached_bytes[..8] != LAST_FULL_EXPORT_MAGIC {
+            return None;
+        }
+        let ep_len = u16::from_le_bytes([cached_bytes[8], cached_bytes[9]]) as usize;
+        let meta_off = 10usize.checked_add(ep_len)?;
+        let stream_off = meta_off.checked_add(24)?;
+        if stream_off > cached_bytes.len() {
+            return None;
+        }
+        if &cached_bytes[10..meta_off] != expected_epoch.as_bytes() {
+            return None;
+        }
+        let n_acts = read_u64_le_at(&cached_bytes, meta_off) as usize;
+        let n_blobs = read_u64_le_at(&cached_bytes, meta_off + 8) as usize;
+        let raw_bytes = read_u64_le_at(&cached_bytes, meta_off + 16);
+        Some((
+            n_acts,
+            n_blobs,
+            raw_bytes,
+            cached_bytes[stream_off..].to_vec(),
+        ))
+    })();
+    if parsed.is_none() && fs::remove_file(&last_file).is_ok() {
+        let _ = crate::db::sync_dir(&locks_dir);
+    }
+    parsed
+}
+
+pub(crate) fn format_last_import_stamp_with_epoch(
+    header_hash: &str,
+    n_acts: usize,
+    n_blobs: usize,
+    td: &str,
+    epoch: &str,
+) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        LAST_IMPORT_STAMP_VERSION, epoch, header_hash, n_acts, n_blobs, td
+    )
+}
+
+pub(crate) fn read_last_import_stamp_with_epoch(
+    store_root: &Path,
+    expected_epoch: &str,
+) -> Option<(String, usize, usize, String)> {
+    let locks_dir = store_root.join("locks");
+    let stamp_file = locks_dir.join("last_import_stamp");
+    let (bytes, _) = crate::db::read_regular_nofollow(&stamp_file)?;
+    let parsed = (|| -> Option<(String, usize, usize, String)> {
+        let recorded = std::str::from_utf8(&bytes).ok()?;
+        let mut parts = recorded.split(':');
+        let ver = parts.next()?;
+        let saved_epoch = parts.next()?;
+        let saved_stamp = parts.next()?;
+        let acts_s = parts.next()?;
+        let blobs_s = parts.next()?;
+        let saved_td = parts.next()?;
+        if parts.next().is_some()
+            || ver != LAST_IMPORT_STAMP_VERSION
+            || saved_epoch != expected_epoch
+            || (saved_td != "trusted" && saved_td != "untrusted")
+        {
+            return None;
+        }
+        let n_acts: usize = acts_s.parse().ok()?;
+        let n_blobs: usize = blobs_s.parse().ok()?;
+        Some((
+            saved_stamp.to_string(),
+            n_acts,
+            n_blobs,
+            saved_td.to_string(),
+        ))
+    })();
+    if parsed.is_none() && fs::remove_file(&stamp_file).is_ok() {
+        let _ = crate::db::sync_dir(&locks_dir);
+    }
+    parsed
+}
+
+/// Durably purge orphan warm-DB sidecars (`last_import_stamp`, `last_full_export_{0,1}.bin`, and
+/// `cached_portable_manifest.json` when no deferred-pack spool is pending) if `state.db` is missing
+/// or cold (< 4096 bytes) on `TurboStore::open`.
+pub(crate) fn purge_orphan_locks_sidecars_on_cold_db_durable(store_root: &Path) -> Result<()> {
+    let locks_dir = store_root.join("locks");
+    if !locks_dir.exists() {
+        return Ok(());
+    }
+    let _pub_guard = crate::db::acquire_cas_publication_guard(store_root)?;
+    let _def_lock = acquire_deferred_pack_lock(store_root)?;
+    let has_pending_deferred = !list_pending_deferred_pack_files(&locks_dir)?.is_empty();
+    let mut removed_any = false;
+    for fixed in [
+        "last_import_stamp",
+        "last_full_export_0.bin",
+        "last_full_export_1.bin",
+    ] {
+        match fs::remove_file(locks_dir.join(fixed)) {
+            Ok(()) => removed_any = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if !has_pending_deferred {
+        match fs::remove_file(locks_dir.join("cached_portable_manifest.json")) {
+            Ok(()) => removed_any = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if removed_any {
+        crate::db::sync_dir(&locks_dir)?;
+    }
+    Ok(())
+}
+
+/// Durably purge pre-epoch persistent sidecars and pending deferred-pack spool records from
+/// `<store_root>/locks` during the `uver < 8` SQLite migration before `replay_pending_deferred_packs`
+/// can resurrect pre-epoch actions or stateless import/sync paths can trust stale stamps/manifests.
+pub(crate) fn purge_pre_epoch_locks_sidecars_durable(store_root: &Path) -> Result<()> {
+    let locks_dir = store_root.join("locks");
+    if !locks_dir.exists() {
+        return Ok(());
+    }
+    // Respect global lock order `gc_publish.lock` -> `deferred_pack.lock`.
+    let _pub_guard = crate::db::acquire_cas_publication_guard(store_root)?;
+    let _def_lock = acquire_deferred_pack_lock(store_root)?;
+    let mut removed_any = false;
+    for fixed in [
+        "last_import_stamp",
+        "cached_portable_manifest.json",
+        "last_full_export_0.bin",
+        "last_full_export_1.bin",
+        "deferred_pack_v3.domain",
+        "deferred_pack_v3.bin",
+    ] {
+        match fs::remove_file(locks_dir.join(fixed)) {
+            Ok(()) => removed_any = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let entries = match fs::read_dir(&locks_dir) {
+        Ok(rd) => Some(rd),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    if let Some(rd) = entries {
+        for entry in rd {
+            let entry = entry?;
+            let fname = entry.file_name();
+            let Some(name) = fname.to_str() else {
+                continue;
+            };
+            let is_deferred_spool = (name.starts_with("deferred_pack")
+                && name != "deferred_pack.lock")
+                || name.starts_with(".deferred_pack")
+                || name.starts_with(".last_import_stamp.")
+                || name.starts_with(".cached_portable_manifest.json.")
+                || name.starts_with(".last_full_export_");
+            if is_deferred_spool {
+                match fs::remove_file(entry.path()) {
+                    Ok(()) => removed_any = true,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+    }
+    if removed_any {
+        crate::db::sync_dir(&locks_dir)?;
+    }
+    Ok(())
+}
 
 pub(crate) struct DeferredPackLockGuard {
     file: fs::File,
@@ -623,6 +874,18 @@ pub(crate) fn replay_pending_deferred_packs_inner(
     store: &mut TurboStore,
     already_holds_gc_or_pub_lock: bool,
 ) -> Result<()> {
+    replay_pending_deferred_packs_inner_with_epoch(
+        store,
+        already_holds_gc_or_pub_lock,
+        crate::TURBO_LEAN_BUILD_EPOCH,
+    )
+}
+
+pub(crate) fn replay_pending_deferred_packs_inner_with_epoch(
+    store: &mut TurboStore,
+    already_holds_gc_or_pub_lock: bool,
+    expected_epoch: &str,
+) -> Result<()> {
     let locks_dir = store.root.join("locks");
     let _ = fs::remove_file(locks_dir.join("deferred_pack_v3.domain"));
     if list_pending_deferred_pack_files(&locks_dir)?.is_empty() {
@@ -651,7 +914,9 @@ pub(crate) fn replay_pending_deferred_packs_inner(
                 break;
             }
         };
-        let Some((deferred_td, manifest)) = decode_deferred_pack_record(&pack_bytes) else {
+        let Some((deferred_td, manifest)) =
+            decode_deferred_pack_record_with_epoch(&pack_bytes, expected_epoch)
+        else {
             if fs::remove_file(&spool_path).is_ok() {
                 removed_any = true;
             }
@@ -703,7 +968,28 @@ pub(crate) fn replay_pending_deferred_packs(store: &mut TurboStore) -> Result<()
     replay_pending_deferred_packs_inner(store, false)
 }
 
-fn stage_deferred_pack_record_locked(store_root: &Path, td: &str, v3_bytes: &[u8]) -> bool {
+pub(crate) fn encode_deferred_pack_record_with_epoch(
+    td: &str,
+    v3_bytes: &[u8],
+    epoch: &str,
+) -> Vec<u8> {
+    let td_byte: u8 = if td == "trusted" { 1 } else { 0 };
+    let epoch_bytes = epoch.as_bytes();
+    let mut rec = Vec::with_capacity(8 + 1 + 2 + epoch_bytes.len() + v3_bytes.len());
+    rec.extend_from_slice(DEFERRED_PACK_V5_MAGIC);
+    rec.push(td_byte);
+    rec.extend_from_slice(&(epoch_bytes.len() as u16).to_le_bytes());
+    rec.extend_from_slice(epoch_bytes);
+    rec.extend_from_slice(v3_bytes);
+    rec
+}
+
+fn stage_deferred_pack_record_locked_with_epoch(
+    store_root: &Path,
+    td: &str,
+    v3_bytes: &[u8],
+    epoch: &str,
+) -> bool {
     let Ok(locks_dir) = crate::db::ensure_store_locks_dir_durable(store_root) else {
         return false;
     };
@@ -730,11 +1016,7 @@ fn stage_deferred_pack_record_locked(store_root: &Path, td: &str, v3_bytes: &[u8
         std::process::id(),
         seq
     );
-    let td_byte: u8 = if td == "trusted" { 1 } else { 0 };
-    let mut rec = Vec::with_capacity(9 + v3_bytes.len());
-    rec.extend_from_slice(DEFERRED_PACK_V4_MAGIC);
-    rec.push(td_byte);
-    rec.extend_from_slice(v3_bytes);
+    let rec = encode_deferred_pack_record_with_epoch(td, v3_bytes, epoch);
     if crate::db::write_bytes_durable(&locks_dir.join(spool_name), &rec, &created).is_err() {
         return false;
     }
@@ -742,31 +1024,73 @@ fn stage_deferred_pack_record_locked(store_root: &Path, td: &str, v3_bytes: &[u8
     true
 }
 
+fn stage_deferred_pack_record_locked(store_root: &Path, td: &str, v3_bytes: &[u8]) -> bool {
+    stage_deferred_pack_record_locked_with_epoch(
+        store_root,
+        td,
+        v3_bytes,
+        crate::TURBO_LEAN_BUILD_EPOCH,
+    )
+}
+
 #[cfg(test)]
-pub(crate) fn stage_deferred_pack_record(store_root: &Path, td: &str, v3_bytes: &[u8]) -> bool {
+pub(crate) fn stage_deferred_pack_record_with_epoch(
+    store_root: &Path,
+    td: &str,
+    v3_bytes: &[u8],
+    epoch: &str,
+) -> bool {
     // Enforce global lock order `gc_publish.lock` -> `deferred_pack.lock`.
     let Ok(_pub_guard) = crate::db::acquire_cas_publication_guard(store_root) else {
         return false;
     };
-    stage_deferred_pack_record_locked(store_root, td, v3_bytes)
+    stage_deferred_pack_record_locked_with_epoch(store_root, td, v3_bytes, epoch)
 }
 
-pub fn decode_deferred_pack_record(buf: &[u8]) -> Option<(&'static str, PackManifest)> {
-    if buf.len() >= 9 + 16 && &buf[..8] == DEFERRED_PACK_V4_MAGIC {
-        let td = match buf[8] {
-            1 => "trusted",
-            0 => "untrusted",
-            _ => return None,
-        };
-        let manifest = try_parse_v3_header(&buf[9..])?;
-        Some((td, manifest))
-    } else {
-        let manifest = try_parse_v3_header(buf)?;
-        Some(("untrusted", manifest))
+#[cfg(test)]
+pub(crate) fn stage_deferred_pack_record(store_root: &Path, td: &str, v3_bytes: &[u8]) -> bool {
+    stage_deferred_pack_record_with_epoch(store_root, td, v3_bytes, crate::TURBO_LEAN_BUILD_EPOCH)
+}
+
+pub(crate) fn decode_deferred_pack_record_with_epoch(
+    buf: &[u8],
+    expected_epoch: &str,
+) -> Option<(&'static str, PackManifest)> {
+    if buf.len() < 11 + 16 || &buf[..8] != DEFERRED_PACK_V5_MAGIC {
+        return None;
     }
+    let td = match buf[8] {
+        1 => "trusted",
+        0 => "untrusted",
+        _ => return None,
+    };
+    let ep_len = u16::from_le_bytes([buf[9], buf[10]]) as usize;
+    let hdr_off = 11usize.checked_add(ep_len)?;
+    if hdr_off + 16 > buf.len() || &buf[11..hdr_off] != expected_epoch.as_bytes() {
+        return None;
+    }
+    let manifest = try_parse_v3_header(&buf[hdr_off..])?;
+    Some((td, manifest))
+}
+
+#[cfg(test)]
+pub fn decode_deferred_pack_record(buf: &[u8]) -> Option<(&'static str, PackManifest)> {
+    decode_deferred_pack_record_with_epoch(buf, crate::TURBO_LEAN_BUILD_EPOCH)
 }
 
 pub fn save_cached_portable_manifest_from_pack(store_root: &Path, manifest: &PackManifest) {
+    save_cached_portable_manifest_from_pack_with_epoch(
+        store_root,
+        manifest,
+        crate::TURBO_LEAN_BUILD_EPOCH,
+    );
+}
+
+pub(crate) fn save_cached_portable_manifest_from_pack_with_epoch(
+    store_root: &Path,
+    manifest: &PackManifest,
+    epoch: &str,
+) {
     let mut action_keys = Vec::with_capacity(manifest.actions.len());
     let mut blob_set = HashSet::new();
     for a in &manifest.actions {
@@ -789,16 +1113,7 @@ pub fn save_cached_portable_manifest_from_pack(store_root: &Path, manifest: &Pac
         action_keys,
         blob_hashes,
     };
-    if let Ok(dm_bytes) = serde_json::to_vec(&dm) {
-        let locks_dir = store_root.join("locks");
-        if let Ok(created) = crate::db::ensure_dir_tracking(&locks_dir, store_root) {
-            let _ = crate::db::write_bytes_durable(
-                &locks_dir.join("cached_portable_manifest.json"),
-                &dm_bytes,
-                &created,
-            );
-        }
-    }
+    write_cached_portable_manifest_with_epoch(store_root, &dm, epoch);
 }
 
 pub fn try_stateless_cold_pull_sync_with_domain(
@@ -846,18 +1161,31 @@ pub fn try_stateless_cold_pull_sync_with_domain(
 }
 
 pub fn try_stateless_noop_pull_sync(store_root: &Path, base_url: &str) -> bool {
+    try_stateless_noop_pull_sync_with_epoch(store_root, base_url, crate::TURBO_LEAN_BUILD_EPOCH)
+}
+
+pub(crate) fn try_stateless_noop_pull_sync_with_epoch(
+    store_root: &Path,
+    base_url: &str,
+    expected_epoch: &str,
+) -> bool {
     let locks_dir = store_root.join("locks");
+    let db_warm = fs::metadata(store_root.join("state.db"))
+        .map(|m| m.len() >= 4096)
+        .unwrap_or(false);
+    if !db_warm {
+        if fs::remove_file(locks_dir.join("cached_portable_manifest.json")).is_ok() {
+            let _ = crate::db::sync_dir(&locks_dir);
+        }
+        return false;
+    }
     if list_pending_deferred_pack_files(&locks_dir)
         .map(|v| !v.is_empty())
         .unwrap_or(false)
     {
         return false;
     }
-    let man_path = locks_dir.join("cached_portable_manifest.json");
-    let Ok(dm_bytes) = fs::read(&man_path) else {
-        return false;
-    };
-    let Ok(dm) = serde_json::from_slice::<DeltaManifest>(&dm_bytes) else {
+    let Some(dm) = load_cached_portable_manifest_with_epoch(store_root, expected_epoch) else {
         return false;
     };
     if dm.action_keys.is_empty() && dm.blob_hashes.is_empty() {
@@ -885,20 +1213,42 @@ pub fn try_stateless_push_sync(
     store_root: &Path,
     base_url: &str,
 ) -> Option<((usize, usize, u64, u64, bool), Option<DeltaManifest>)> {
+    try_stateless_push_sync_with_epoch(store_root, base_url, crate::TURBO_LEAN_BUILD_EPOCH)
+}
+
+#[allow(clippy::type_complexity)]
+pub(crate) fn try_stateless_push_sync_with_epoch(
+    store_root: &Path,
+    base_url: &str,
+    expected_epoch: &str,
+) -> Option<((usize, usize, u64, u64, bool), Option<DeltaManifest>)> {
     let locks_dir = store_root.join("locks");
+    let db_warm = fs::metadata(store_root.join("state.db"))
+        .map(|m| m.len() >= 4096)
+        .unwrap_or(false);
+    if !db_warm {
+        let mut removed = false;
+        for f in [
+            "cached_portable_manifest.json",
+            "last_full_export_0.bin",
+            "last_full_export_1.bin",
+        ] {
+            if fs::remove_file(locks_dir.join(f)).is_ok() {
+                removed = true;
+            }
+        }
+        if removed {
+            let _ = crate::db::sync_dir(&locks_dir);
+        }
+        return None;
+    }
     if list_pending_deferred_pack_files(&locks_dir)
         .map(|v| !v.is_empty())
         .unwrap_or(false)
     {
         return None;
     }
-    let man_path = locks_dir.join("cached_portable_manifest.json");
-    let Ok(dm_bytes) = fs::read(&man_path) else {
-        return None;
-    };
-    let Ok(dm) = serde_json::from_slice::<DeltaManifest>(&dm_bytes) else {
-        return None;
-    };
+    let dm = load_cached_portable_manifest_with_epoch(store_root, expected_epoch)?;
     if dm.action_keys.is_empty() && dm.blob_hashes.is_empty() {
         return None;
     }
@@ -915,45 +1265,45 @@ pub fn try_stateless_push_sync(
     };
     if remote_dm.action_keys.is_empty() && remote_dm.blob_hashes.is_empty() {
         let is_loopback = is_loopback_http_url(base_url);
-        let last_file = store_root.join("locks").join(format!(
+        let last_file = locks_dir.join(format!(
             "last_full_export_{}.bin",
             if is_loopback { 1 } else { 0 }
         ));
         if !is_loopback || shared_cas_blobs_dir().exists() {
-            if let Some((cached_bytes, _)) = crate::db::read_regular_nofollow(&last_file) {
-                if cached_bytes.len() >= 24 {
-                    let n_acts = read_u64_le_at(&cached_bytes, 0) as usize;
-                    let n_blobs = read_u64_le_at(&cached_bytes, 8) as usize;
-                    let raw_bytes = read_u64_le_at(&cached_bytes, 16);
-                    let push_bytes = &cached_bytes[24..];
-                    if n_acts == dm.action_keys.len()
-                        && n_blobs == dm.blob_hashes.len()
-                        && verify_cached_pack_stream_integrity_at_root(
-                            store_root, push_bytes, n_acts, n_blobs, raw_bytes,
-                        )
+            if let Some((n_acts, n_blobs, raw_bytes, push_bytes)) =
+                read_last_full_export_with_epoch(store_root, is_loopback, expected_epoch)
+            {
+                if n_acts == dm.action_keys.len()
+                    && n_blobs == dm.blob_hashes.len()
+                    && verify_cached_pack_stream_integrity_at_root(
+                        store_root,
+                        &push_bytes,
+                        n_acts,
+                        n_blobs,
+                        raw_bytes,
+                    )
+                {
+                    let pushed_pack_bytes =
+                        if is_loopback && push_bytes.starts_with(b"TLPK\x00\x00\x00\x03") {
+                            (push_bytes.len() as u64) + raw_bytes
+                        } else {
+                            push_bytes.len() as u64
+                        };
+                    if http_request(
+                        "POST",
+                        &format!("{}/import-delta", base_url),
+                        "application/octet-stream",
+                        &push_bytes,
+                    )
+                    .is_ok()
                     {
-                        let pushed_pack_bytes =
-                            if is_loopback && push_bytes.starts_with(b"TLPK\x00\x00\x00\x03") {
-                                (push_bytes.len() as u64) + raw_bytes
-                            } else {
-                                push_bytes.len() as u64
-                            };
-                        if http_request(
-                            "POST",
-                            &format!("{}/import-delta", base_url),
-                            "application/octet-stream",
-                            push_bytes,
-                        )
-                        .is_ok()
-                        {
-                            return Some((
-                                (n_acts, n_blobs, raw_bytes, pushed_pack_bytes, false),
-                                None,
-                            ));
-                        }
-                    } else {
-                        let _ = fs::remove_file(&last_file);
+                        return Some((
+                            (n_acts, n_blobs, raw_bytes, pushed_pack_bytes, false),
+                            None,
+                        ));
                     }
+                } else if fs::remove_file(&last_file).is_ok() {
+                    let _ = crate::db::sync_dir(&locks_dir);
                 }
             }
         }
@@ -1389,15 +1739,20 @@ pub fn export_pack_with_filter_mode_and_signing_key(
                                             "last_full_export_{}.bin",
                                             if header_only_shared_cas { 1 } else { 0 }
                                         ));
-                                        if !last_file.exists() {
-                                            let mut full_cache =
-                                                Vec::with_capacity(24 + stream.len());
-                                            full_cache
-                                                .extend_from_slice(&(n_acts as u64).to_le_bytes());
-                                            full_cache
-                                                .extend_from_slice(&(n_blobs as u64).to_le_bytes());
-                                            full_cache.extend_from_slice(&raw_bytes.to_le_bytes());
-                                            full_cache.extend_from_slice(&stream);
+                                        if read_last_full_export_with_epoch(
+                                            &store.root,
+                                            header_only_shared_cas,
+                                            crate::TURBO_LEAN_BUILD_EPOCH,
+                                        )
+                                        .is_none()
+                                        {
+                                            let full_cache = encode_last_full_export_with_epoch(
+                                                n_acts,
+                                                n_blobs,
+                                                raw_bytes,
+                                                &stream,
+                                                crate::TURBO_LEAN_BUILD_EPOCH,
+                                            );
                                             let _ = crate::db::write_bytes_durable(
                                                 &last_file,
                                                 &full_cache,
@@ -1410,11 +1765,11 @@ pub fn export_pack_with_filter_mode_and_signing_key(
                                         }
                                     }
                                 }
-                                if !store
-                                    .root
-                                    .join("locks")
-                                    .join("cached_portable_manifest.json")
-                                    .exists()
+                                if load_cached_portable_manifest_with_epoch(
+                                    &store.root,
+                                    crate::TURBO_LEAN_BUILD_EPOCH,
+                                )
+                                .is_none()
                                     && stream.len() >= 16
                                 {
                                     let hlen = read_u64_le_at(&stream, 8) as usize;
@@ -1526,23 +1881,48 @@ pub fn export_pack_with_filter_mode_and_signing_key(
                                             ) {
                                                 let last_0 =
                                                     locks_dir.join("last_full_export_0.bin");
+                                                let last_0_buf = encode_last_full_export_with_epoch(
+                                                    n_acts,
+                                                    n_blobs,
+                                                    raw_bytes,
+                                                    &stream,
+                                                    crate::TURBO_LEAN_BUILD_EPOCH,
+                                                );
                                                 let _ = crate::db::write_bytes_durable(
-                                                    &last_0, &cache_buf, &created,
+                                                    &last_0,
+                                                    &last_0_buf,
+                                                    &created,
                                                 );
                                                 let last_1 =
                                                     locks_dir.join("last_full_export_1.bin");
-                                                if !last_1.exists() {
+                                                if read_last_full_export_with_epoch(
+                                                    &store.root,
+                                                    true,
+                                                    crate::TURBO_LEAN_BUILD_EPOCH,
+                                                )
+                                                .is_none()
+                                                {
+                                                    let last_1_buf =
+                                                        encode_last_full_export_with_epoch(
+                                                            n_acts,
+                                                            n_blobs,
+                                                            raw_bytes,
+                                                            &v3_cached[24..],
+                                                            crate::TURBO_LEAN_BUILD_EPOCH,
+                                                        );
                                                     let _ = crate::db::write_bytes_durable(
-                                                        &last_1, &v3_cached, &created,
+                                                        &last_1,
+                                                        &last_1_buf,
+                                                        &created,
                                                     );
                                                 }
                                             }
                                         }
-                                        if !store
-                                            .root
-                                            .join("locks")
-                                            .join("cached_portable_manifest.json")
-                                            .exists()
+                                        if load_cached_portable_manifest_with_epoch(
+                                            &store.root,
+                                            crate::TURBO_LEAN_BUILD_EPOCH,
+                                        )
+                                        .is_none()
                                         {
                                             save_cached_portable_manifest_from_pack(
                                                 &store.root,
@@ -1858,20 +2238,29 @@ pub fn export_pack_with_filter_mode_and_signing_key(
                         "last_full_export_{}.bin",
                         if header_only_shared_cas { 1 } else { 0 }
                     ));
-                    let _ = crate::db::write_bytes_durable(&last_file, &cache_buf, &created);
+                    let last_buf = encode_last_full_export_with_epoch(
+                        n_acts,
+                        n_blobs,
+                        total_raw_bytes,
+                        &pack_stream,
+                        crate::TURBO_LEAN_BUILD_EPOCH,
+                    );
+                    let _ = crate::db::write_bytes_durable(&last_file, &last_buf, &created);
                 }
             }
             if !header_only_shared_cas {
                 if let Some(s) = cache_file.to_str() {
                     if let Some(v3_str) = s.strip_suffix("_0.bin") {
                         let v3_file = std::path::PathBuf::from(format!("{}_1.bin", v3_str));
-                        let mut v3_buf = Vec::with_capacity(24 + 16 + header_json.len());
+                        let mut v3_stream = Vec::with_capacity(16 + header_json.len());
+                        v3_stream.extend_from_slice(b"TLPK\x00\x00\x00\x03");
+                        v3_stream.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
+                        v3_stream.extend_from_slice(&header_json);
+                        let mut v3_buf = Vec::with_capacity(24 + v3_stream.len());
                         v3_buf.extend_from_slice(&(n_acts as u64).to_le_bytes());
                         v3_buf.extend_from_slice(&(n_blobs as u64).to_le_bytes());
                         v3_buf.extend_from_slice(&total_raw_bytes.to_le_bytes());
-                        v3_buf.extend_from_slice(b"TLPK\x00\x00\x00\x03");
-                        v3_buf.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
-                        v3_buf.extend_from_slice(&header_json);
+                        v3_buf.extend_from_slice(&v3_stream);
                         let _ = crate::shm_cache::atomic_write_shm(&v3_file, &v3_buf);
                         if only_portable {
                             let locks_dir = store.root.join("locks");
@@ -1879,7 +2268,18 @@ pub fn export_pack_with_filter_mode_and_signing_key(
                                 crate::db::ensure_dir_tracking(&locks_dir, &store.root)
                             {
                                 let last_v3 = locks_dir.join("last_full_export_1.bin");
-                                let _ = crate::db::write_bytes_durable(&last_v3, &v3_buf, &created);
+                                let last_v3_buf = encode_last_full_export_with_epoch(
+                                    n_acts,
+                                    n_blobs,
+                                    total_raw_bytes,
+                                    &v3_stream,
+                                    crate::TURBO_LEAN_BUILD_EPOCH,
+                                );
+                                let _ = crate::db::write_bytes_durable(
+                                    &last_v3,
+                                    &last_v3_buf,
+                                    &created,
+                                );
                             }
                         }
                     }
@@ -2246,26 +2646,42 @@ pub fn try_stateless_warm_import_with_domain(
     trusted_pubkey: Option<&str>,
     allow_unattested_trusted: bool,
 ) -> Option<(usize, usize)> {
+    try_stateless_warm_import_with_domain_and_epoch(
+        store_root,
+        input_path,
+        requested_domain,
+        trusted_pubkey,
+        allow_unattested_trusted,
+        crate::TURBO_LEAN_BUILD_EPOCH,
+    )
+}
+
+pub(crate) fn try_stateless_warm_import_with_domain_and_epoch(
+    store_root: &Path,
+    input_path: &Path,
+    requested_domain: Option<&str>,
+    trusted_pubkey: Option<&str>,
+    allow_unattested_trusted: bool,
+    expected_epoch: &str,
+) -> Option<(usize, usize)> {
     let locks_dir = store_root.join("locks");
+    let db_warm = fs::metadata(store_root.join("state.db"))
+        .map(|m| m.len() >= 4096)
+        .unwrap_or(false);
+    if !db_warm {
+        if fs::remove_file(locks_dir.join("last_import_stamp")).is_ok() {
+            let _ = crate::db::sync_dir(&locks_dir);
+        }
+        return None;
+    }
     if list_pending_deferred_pack_files(&locks_dir)
         .map(|v| !v.is_empty())
         .unwrap_or(false)
     {
         return None;
     }
-    let stamp_file = locks_dir.join("last_import_stamp");
-    let recorded = fs::read_to_string(&stamp_file).ok()?;
-    let (saved_stamp, acts_s, blobs_s, saved_td) = {
-        let mut parts = recorded.split(':');
-        (
-            parts.next()?,
-            parts.next()?,
-            parts.next()?,
-            parts.next().unwrap_or("trusted"),
-        )
-    };
-    let n_acts: usize = acts_s.parse().ok()?;
-    let n_blobs: usize = blobs_s.parse().ok()?;
+    let (saved_stamp, n_acts, n_blobs, saved_td) =
+        read_last_import_stamp_with_epoch(store_root, expected_epoch)?;
     let (_, _, header_buf) = read_pack_header_from_file(input_path)?;
     let manifest = serde_json::from_slice::<PackManifest>(&header_buf).ok()?;
     let td = resolve_pack_import_trust_domain(
@@ -2328,12 +2744,12 @@ pub(crate) fn finish_import_from_prestaged_shared_cas_inner(
     };
     let header_json = serde_json::to_vec(manifest).unwrap_or_default();
     let header_hash = blake3::hash(&header_json).to_hex().to_string();
-    let stamp_val = format!(
-        "{}:{}:{}:{}",
-        header_hash,
+    let stamp_val = format_last_import_stamp_with_epoch(
+        &header_hash,
         manifest.actions.len(),
         staged_blobs.len(),
-        td
+        td,
+        crate::TURBO_LEAN_BUILD_EPOCH,
     );
     let store_root = store.root.clone();
     let locks_dir = store_root.join("locks");
@@ -2407,18 +2823,6 @@ pub(crate) fn finish_import_from_prestaged_shared_cas_inner(
         0
     };
     if effective_newly_written == 0 && !has_pending_deferred && !manifest.actions.is_empty() {
-        if fs::read_to_string(&stamp_file)
-            .map(|s| s == stamp_val)
-            .unwrap_or(false)
-        {
-            if installed_replayed > 0 {
-                store.sync_sqlite_durable()?;
-            }
-            if td == "trusted" {
-                save_cached_portable_manifest_from_pack(&store.root, manifest);
-            }
-            return Ok((manifest.actions.len(), effective_blobs.len()));
-        }
         let existing_completed: i64 = store
             .conn
             .query_row(
@@ -2438,8 +2842,17 @@ pub(crate) fn finish_import_from_prestaged_shared_cas_inner(
                             .unwrap_or(false))
             })
         {
-            store.sync_sqlite_durable()?;
-            write_stamp()?;
+            if fs::read_to_string(&stamp_file)
+                .map(|s| s == stamp_val)
+                .unwrap_or(false)
+            {
+                if installed_replayed > 0 {
+                    store.sync_sqlite_durable()?;
+                }
+            } else {
+                store.sync_sqlite_durable()?;
+                write_stamp()?;
+            }
             if td == "trusted" {
                 save_cached_portable_manifest_from_pack(&store.root, manifest);
             }
@@ -2909,6 +3322,7 @@ pub fn compile_fastcheck_c_to_bin(
         let tc_lib_lean = tc_root.join("lib").join("lean");
         if clang_bin.exists() && tc_lib_lean.exists() {
             let mut cmd = Command::new(&clang_bin);
+            crate::module_builder::scrub_untrusted_env(&mut cmd);
             cmd.arg("-O1")
                 .arg("-DNDEBUG")
                 .arg(format!("-I{}", tc_root.join("include").display()))
@@ -2941,6 +3355,7 @@ pub fn compile_fastcheck_c_to_bin(
     }
 
     let mut link_cmd = Command::new(leanc_bin);
+    crate::module_builder::scrub_untrusted_env(&mut link_cmd);
     link_cmd
         .arg("-O3")
         .arg(tmp_c)
@@ -2963,7 +3378,9 @@ pub fn compile_fastcheck_c_to_bin(
     if out2.status.success() {
         return Ok(out2);
     }
-    Command::new(leanc_bin)
+    let mut fallback_cmd = Command::new(leanc_bin);
+    crate::module_builder::scrub_untrusted_env(&mut fallback_cmd);
+    fallback_cmd
         .arg("-O3")
         .arg(tmp_c)
         .arg("-o")
@@ -2982,7 +3399,9 @@ pub fn compute_fastcheck_binary_key(is_cu: bool, effective_source: &str) -> Stri
 
 pub fn compute_fastcheck_binary_key_parts(is_cu: bool, src_text: &str, suffix: &str) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"fastcheck-bin:v2:absolute-tools:");
+    hasher.update(b"fastcheck-bin:v3:absolute-tools:");
+    hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+    hasher.update(b":");
     hasher.update(std::env::consts::ARCH.as_bytes());
     hasher.update(if is_cu { b":cuda:" } else { b":lean_c_o3:" });
     hasher.update(src_text.as_bytes());
@@ -3088,7 +3507,9 @@ pub(crate) fn ensure_shared_fastcheck_out(shared_bin: &Path) {
     }
     let mut attempt = 0;
     let out = loop {
-        match Command::new(shared_bin).output() {
+        let mut cmd = Command::new(shared_bin);
+        crate::module_builder::scrub_untrusted_env(&mut cmd);
+        match cmd.output() {
             Ok(o) => break o,
             Err(e) if e.raw_os_error() == Some(26) && attempt < 10 => {
                 attempt += 1;
@@ -3124,7 +3545,9 @@ pub fn run_or_read_cached_fastcheck_bin(cached_bin: &Path) -> Result<(bool, Stri
     let out = {
         let mut attempt = 0;
         loop {
-            match Command::new(cached_bin).output() {
+            let mut cmd = Command::new(cached_bin);
+            crate::module_builder::scrub_untrusted_env(&mut cmd);
+            match cmd.output() {
                 Ok(o) => break o,
                 Err(e) if e.raw_os_error() == Some(26) && attempt < 10 => {
                     attempt += 1;
@@ -5902,8 +6325,8 @@ pub(crate) mod tests {
         assert!(dir_wt.join("build/lib/lean/Good.olean").exists());
         assert!(!dir_wt.join("build/lib/lean/EvilInjected.olean").exists());
 
-        // 3. Atomic single-file deferred pack record (`TLDP\x00\x00\x00\x04` + domain byte + V3 header)
-        //    preserves `untrusted` across concurrent `TurboStore::open` calls and legacy header-only fallback.
+        // 3. Atomic single-file deferred pack record (`TLDP\x00\x00\x00\x05` + domain byte + epoch + V3 header)
+        //    preserves `untrusted` across concurrent `TurboStore::open` calls and rejects unbound header-only records.
         let dir_cold =
             std::env::temp_dir().join(format!("turbo_lean_pack_cold_def_{}", next_tmp_id()));
         let _ = fs::remove_dir_all(&dir_cold);
@@ -5913,8 +6336,17 @@ pub(crate) mod tests {
         raw_v3.extend_from_slice(b"TLPK\x00\x00\x00\x03");
         raw_v3.extend_from_slice(&(raw_hdr.len() as u64).to_le_bytes());
         raw_v3.extend_from_slice(&raw_hdr);
+        assert!(
+            decode_deferred_pack_record(&raw_v3).is_none(),
+            "unbound legacy V3 deferred record must be rejected"
+        );
+        let bound_v5 = encode_deferred_pack_record_with_epoch(
+            "untrusted",
+            &raw_v3,
+            crate::TURBO_LEAN_BUILD_EPOCH,
+        );
         assert_eq!(
-            decode_deferred_pack_record(&raw_v3).map(|(td, _)| td),
+            decode_deferred_pack_record(&bound_v5).map(|(td, _)| td),
             Some("untrusted")
         );
         assert!(try_stateless_cold_import_with_domain(
@@ -6145,16 +6577,19 @@ pub(crate) mod tests {
             }],
         };
         let claim_hdr = serde_json::to_vec(&claim_manifest)?;
-        let mut claim_v4 = Vec::new();
-        claim_v4.extend_from_slice(DEFERRED_PACK_V4_MAGIC);
-        claim_v4.push(1u8);
-        claim_v4.extend_from_slice(b"TLPK\x00\x00\x00\x03");
-        claim_v4.extend_from_slice(&(claim_hdr.len() as u64).to_le_bytes());
-        claim_v4.extend_from_slice(&claim_hdr);
+        let mut claim_v3 = Vec::new();
+        claim_v3.extend_from_slice(b"TLPK\x00\x00\x00\x03");
+        claim_v3.extend_from_slice(&(claim_hdr.len() as u64).to_le_bytes());
+        claim_v3.extend_from_slice(&claim_hdr);
+        let claim_v5 = encode_deferred_pack_record_with_epoch(
+            "trusted",
+            &claim_v3,
+            crate::TURBO_LEAN_BUILD_EPOCH,
+        );
         let orphan_claim_path = root_crash
             .join("locks")
             .join("deferred_pack_v3.claim.999999.1");
-        fs::write(&orphan_claim_path, &claim_v4)?;
+        fs::write(&orphan_claim_path, &claim_v5)?;
 
         // Stage a newer valid pack (`pack_b`) while the crashed `.claim.` file is present.
         assert!(try_stateless_cold_import_with_domain(
@@ -6999,6 +7434,357 @@ pub(crate) mod tests {
             &real_gh,
             &[]
         ));
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_uver7_migration_purges_locks_sidecars_and_pending_deferred_spools() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("turbo_lean_uver7_locks_purge_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        // Create an export archive from a separate source store so we have valid V3/V2 pack bytes.
+        let src_dir = dir.join("src");
+        let mut src_store = TurboStore::open(Some(&src_dir))?;
+        let payload = b"pre-epoch-v7-blob";
+        let bh = src_store.store_immutable_blob(payload, "olean", "trusted", 0)?;
+        if let SingleflightOutcome::Leader(lease) = src_store.acquire_singleflight(
+            "pre-epoch-v7-action",
+            "v4.35.0",
+            "module_unit",
+            "trusted",
+        )? {
+            src_store.publish_action(
+                &lease,
+                &[BlobEntry {
+                    blob_hash: bh.clone(),
+                    kind: "olean".into(),
+                    size_bytes: payload.len() as u64,
+                    rel_path: "build/lib/lean/PreEpoch.olean".into(),
+                }],
+                1,
+                0,
+                1,
+                "trusted",
+            )?;
+        }
+        let pack_path = dir.join("pre_epoch.tlpack");
+        export_pack(&src_store, &pack_path, true)?;
+        let (_, _, _, v3_bytes) = export_pack_filtered_with_mode(
+            &src_store,
+            true,
+            &HashSet::new(),
+            &HashSet::new(),
+            true,
+        )?;
+
+        // Open target store, seed pre-epoch sidecars + pending deferred spool, downgrade to uver = 7.
+        let dst_dir = dir.join("dst");
+        let store = TurboStore::open(Some(&dst_dir))?;
+        let (_, _) = prestage_blobs_from_shared_cas(
+            &dst_dir,
+            &try_parse_v3_header(&v3_bytes).expect("v3 header"),
+        )
+        .expect("prestage");
+        let locks_dir = dst_dir.join("locks");
+        fs::create_dir_all(&locks_dir)?;
+
+        // Seed current-epoch-looking and pre-epoch sidecars + pending spools + locks that must survive.
+        assert!(stage_deferred_pack_record_with_epoch(
+            &dst_dir,
+            "trusted",
+            &v3_bytes,
+            crate::TURBO_LEAN_BUILD_EPOCH
+        ));
+        fs::write(locks_dir.join("deferred_pack_v3.bin"), &v3_bytes)?;
+        fs::write(locks_dir.join("deferred_pack_v3.domain"), b"trusted")?;
+        fs::write(
+            locks_dir.join("deferred_pack_v3.claim.999999.1.bin"),
+            &v3_bytes,
+        )?;
+        fs::write(
+            locks_dir.join("last_import_stamp"),
+            format_last_import_stamp_with_epoch(
+                "deadbeef",
+                1,
+                1,
+                "trusted",
+                crate::TURBO_LEAN_BUILD_EPOCH,
+            ),
+        )?;
+        write_cached_portable_manifest_with_epoch(
+            &dst_dir,
+            &DeltaManifest {
+                action_keys: vec!["pre-epoch-v7-action".into()],
+                blob_hashes: vec![bh.clone()],
+            },
+            crate::TURBO_LEAN_BUILD_EPOCH,
+        );
+        fs::write(
+            locks_dir.join("last_full_export_0.bin"),
+            encode_last_full_export_with_epoch(
+                1,
+                1,
+                payload.len() as u64,
+                &v3_bytes,
+                crate::TURBO_LEAN_BUILD_EPOCH,
+            ),
+        )?;
+        fs::write(
+            locks_dir.join("last_full_export_1.bin"),
+            encode_last_full_export_with_epoch(
+                1,
+                1,
+                payload.len() as u64,
+                &v3_bytes,
+                crate::TURBO_LEAN_BUILD_EPOCH,
+            ),
+        )?;
+        fs::write(locks_dir.join("store_tree_durable.v1"), b"1")?;
+
+        store.conn.execute_batch("PRAGMA user_version = 7;")?;
+        drop(store);
+
+        // Reopen triggers uver < 8 migration BEFORE replay_pending_deferred_packs.
+        let migrated = TurboStore::open(Some(&dst_dir))?;
+        let uv: i64 = migrated
+            .conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
+        assert_eq!(uv, 8);
+        assert!(
+            !migrated.has_cached_action_readonly("pre-epoch-v7-action", "trusted")?,
+            "pre-v8 pending deferred-pack spools must be purged before replay_pending_deferred_packs"
+        );
+        assert!(list_pending_deferred_pack_files(&locks_dir)?.is_empty());
+        assert!(!locks_dir.join("deferred_pack_v3.domain").exists());
+        assert!(!locks_dir.join("last_import_stamp").exists());
+        assert!(!locks_dir.join("cached_portable_manifest.json").exists());
+        assert!(!locks_dir.join("last_full_export_0.bin").exists());
+        assert!(!locks_dir.join("last_full_export_1.bin").exists());
+        assert!(locks_dir.join("store_tree_durable.v1").exists());
+        assert!(locks_dir.join("gc_publish.lock").exists());
+        assert!(locks_dir.join("deferred_pack.lock").exists());
+        drop(migrated);
+
+        // Stateless warm import and sync helpers must NOT short-circuit after the migration purge.
+        assert!(
+            try_stateless_warm_import_with_domain(&dst_dir, &pack_path, None, None, true).is_none()
+        );
+        assert!(!try_stateless_noop_pull_sync(
+            &dst_dir,
+            "http://127.0.0.1:9"
+        ));
+        assert!(try_stateless_push_sync(&dst_dir, "http://127.0.0.1:9").is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_epoch_mismatch_and_same_epoch_locks_sidecars_and_spools() -> Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("turbo_lean_epoch_locks_sidecars_{}", next_tmp_id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let src_dir = dir.join("src");
+        let mut src = TurboStore::open(Some(&src_dir))?;
+        let payload = b"epoch-sidecar-blob";
+        let bh = src.store_immutable_blob(payload, "olean", "trusted", 0)?;
+        if let SingleflightOutcome::Leader(lease) =
+            src.acquire_singleflight("epoch-sidecar-act", "v4.35.0", "module_unit", "trusted")?
+        {
+            src.publish_action(
+                &lease,
+                &[BlobEntry {
+                    blob_hash: bh.clone(),
+                    kind: "olean".into(),
+                    size_bytes: payload.len() as u64,
+                    rel_path: "build/lib/lean/EpochSidecar.olean".into(),
+                }],
+                1,
+                0,
+                1,
+                "trusted",
+            )?;
+        }
+        let pack_path = dir.join("epoch_sidecar.tlpack");
+        export_pack(&src, &pack_path, true)?;
+        let (_, _, _, v3_bytes) =
+            export_pack_filtered_with_mode(&src, true, &HashSet::new(), &HashSet::new(), true)?;
+        let manifest = try_parse_v3_header(&v3_bytes).expect("v3 header");
+
+        // 1. User_version = 8 store with foreign-epoch (`epoch_b`) sidecars & deferred spool:
+        //    readers/replay must fail closed and delete the mismatched files.
+        let dst_dir = dir.join("dst");
+        let store = TurboStore::open(Some(&dst_dir))?;
+        let (_, _) = prestage_blobs_from_shared_cas(&dst_dir, &manifest).expect("prestage");
+        drop(store);
+
+        let epoch_b = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        assert_ne!(epoch_b, crate::TURBO_LEAN_BUILD_EPOCH);
+        let locks_dir = dst_dir.join("locks");
+
+        let (_, _, header_buf) = read_pack_header_from_file(&pack_path).expect("pack header");
+        let header_hash = blake3::hash(&header_buf).to_hex().to_string();
+        fs::write(
+            locks_dir.join("last_import_stamp"),
+            format_last_import_stamp_with_epoch(&header_hash, 1, 1, "untrusted", epoch_b),
+        )?;
+        write_cached_portable_manifest_with_epoch(
+            &dst_dir,
+            &DeltaManifest {
+                action_keys: vec!["epoch-sidecar-act".into()],
+                blob_hashes: vec![bh.clone()],
+            },
+            epoch_b,
+        );
+        fs::write(
+            locks_dir.join("last_full_export_0.bin"),
+            encode_last_full_export_with_epoch(1, 1, payload.len() as u64, &v3_bytes, epoch_b),
+        )?;
+        fs::write(
+            locks_dir.join("last_full_export_1.bin"),
+            encode_last_full_export_with_epoch(1, 1, payload.len() as u64, &v3_bytes, epoch_b),
+        )?;
+
+        // Mismatched sidecars fail closed AND are unlinked on read.
+        assert!(
+            try_stateless_warm_import_with_domain(&dst_dir, &pack_path, None, None, false)
+                .is_none()
+        );
+        assert!(!locks_dir.join("last_import_stamp").exists());
+
+        assert!(
+            load_cached_portable_manifest_with_epoch(&dst_dir, crate::TURBO_LEAN_BUILD_EPOCH)
+                .is_none()
+        );
+        assert!(!locks_dir.join("cached_portable_manifest.json").exists());
+
+        assert!(
+            read_last_full_export_with_epoch(&dst_dir, false, crate::TURBO_LEAN_BUILD_EPOCH)
+                .is_none()
+        );
+        assert!(!locks_dir.join("last_full_export_0.bin").exists());
+        assert!(
+            read_last_full_export_with_epoch(&dst_dir, true, crate::TURBO_LEAN_BUILD_EPOCH)
+                .is_none()
+        );
+        assert!(!locks_dir.join("last_full_export_1.bin").exists());
+
+        // Legacy/unbound sidecars (v1 stamp, raw DeltaManifest JSON, raw 24-byte export header) also fail closed & unlink.
+        fs::write(
+            locks_dir.join("last_import_stamp"),
+            format!("{}:1:1:untrusted", header_hash),
+        )?;
+        assert!(
+            try_stateless_warm_import_with_domain(&dst_dir, &pack_path, None, None, false)
+                .is_none()
+        );
+        assert!(!locks_dir.join("last_import_stamp").exists());
+
+        fs::write(
+            locks_dir.join("cached_portable_manifest.json"),
+            serde_json::to_vec(&DeltaManifest {
+                action_keys: vec!["epoch-sidecar-act".into()],
+                blob_hashes: vec![bh.clone()],
+            })?,
+        )?;
+        assert!(
+            load_cached_portable_manifest_with_epoch(&dst_dir, crate::TURBO_LEAN_BUILD_EPOCH)
+                .is_none()
+        );
+        assert!(!locks_dir.join("cached_portable_manifest.json").exists());
+
+        let mut legacy_export = Vec::new();
+        legacy_export.extend_from_slice(&1u64.to_le_bytes());
+        legacy_export.extend_from_slice(&1u64.to_le_bytes());
+        legacy_export.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        legacy_export.extend_from_slice(&v3_bytes);
+        fs::write(locks_dir.join("last_full_export_0.bin"), &legacy_export)?;
+        assert!(
+            read_last_full_export_with_epoch(&dst_dir, false, crate::TURBO_LEAN_BUILD_EPOCH)
+                .is_none()
+        );
+        assert!(!locks_dir.join("last_full_export_0.bin").exists());
+
+        // Mismatched-epoch deferred spool on uver = 8 store must be rejected & deleted on open without replaying.
+        assert!(stage_deferred_pack_record_with_epoch(
+            &dst_dir, "trusted", &v3_bytes, epoch_b
+        ));
+        assert_eq!(list_pending_deferred_pack_files(&locks_dir)?.len(), 1);
+        let reopened = TurboStore::open(Some(&dst_dir))?;
+        assert!(
+            !reopened.has_cached_action_readonly("epoch-sidecar-act", "trusted")?,
+            "foreign-epoch deferred spool must never replay into SQLite"
+        );
+        assert!(
+            list_pending_deferred_pack_files(&locks_dir)?.is_empty(),
+            "foreign-epoch deferred spool must be unlinked on replay"
+        );
+        drop(reopened);
+
+        // 2. Same-epoch warm/cold paths continue to work, AND wiped SQLite + stale stamp fails closed.
+        let cold_dir = dir.join("cold_same_epoch");
+        let cold_counts = try_stateless_cold_import_with_domain(
+            &cold_dir,
+            &pack_path,
+            Some("trusted"),
+            None,
+            true,
+        )
+        .expect("same-epoch cold stateless import");
+        assert_eq!(cold_counts, (1, 1));
+        let mut warm_store = TurboStore::open(Some(&cold_dir))?;
+        assert!(warm_store.has_cached_action_readonly("epoch-sidecar-act", "trusted")?);
+        assert!(
+            load_cached_portable_manifest_with_epoch(&cold_dir, crate::TURBO_LEAN_BUILD_EPOCH)
+                .is_some()
+        );
+
+        // Populate same-epoch warm stamp via full import_pack_with_policy, then verify warm hit.
+        let imp_counts =
+            import_pack_with_policy(&mut warm_store, &pack_path, Some("trusted"), None, true)?;
+        assert_eq!(imp_counts, (1, 1));
+        drop(warm_store);
+        assert_eq!(
+            try_stateless_warm_import_with_domain(
+                &cold_dir,
+                &pack_path,
+                Some("trusted"),
+                None,
+                true
+            ),
+            Some((1, 1))
+        );
+
+        // If SQLite actions are wiped while a same-epoch `last_import_stamp` remains,
+        // `import_pack_with_policy` must verify SQLite action presence and re-import instead of short-circuiting.
+        let mut wiped_actions = TurboStore::open(Some(&cold_dir))?;
+        wiped_actions
+            .conn
+            .execute("DELETE FROM action_outputs", [])?;
+        wiped_actions.conn.execute("DELETE FROM actions", [])?;
+        assert!(cold_dir.join("locks/last_import_stamp").exists());
+        import_pack_with_policy(&mut wiped_actions, &pack_path, Some("trusted"), None, true)?;
+        assert!(
+            wiped_actions.has_cached_action_readonly("epoch-sidecar-act", "trusted")?,
+            "import_pack_with_policy must re-populate SQLite even when last_import_stamp matches"
+        );
+        drop(wiped_actions);
+
+        // If `state.db` itself is deleted while `locks/last_import_stamp` remains, stateless warm import must refuse & unlink.
+        fs::remove_file(cold_dir.join("state.db"))?;
+        assert!(try_stateless_warm_import_with_domain(
+            &cold_dir,
+            &pack_path,
+            Some("trusted"),
+            None,
+            true
+        )
+        .is_none());
+        assert!(!cold_dir.join("locks/last_import_stamp").exists());
 
         let _ = fs::remove_dir_all(&dir);
         Ok(())

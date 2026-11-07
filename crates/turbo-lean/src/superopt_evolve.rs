@@ -368,7 +368,9 @@ pub fn export_bundle_to_pack(
         verify_bundle_with_lean_core(&verifier, &staging.bundle_path())?;
     }
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"turbo-lean:superopt-evolve:v1\0");
+    hasher.update(b"turbo-lean:superopt-evolve:v2\0");
+    hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+    hasher.update(b"\0");
     hasher.update(target.as_bytes());
     hasher.update(b"\0");
     if let Some(g) = args.generations {
