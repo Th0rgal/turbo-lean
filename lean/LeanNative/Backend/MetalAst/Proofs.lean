@@ -31,15 +31,28 @@ private theorem parseMSLParamType_pointer_roundtrip (sp : MSLAddressSpace) (isCo
   have hpel : parseMSLScalarType (ppMSLType el) = some el := parseMSLScalarType_roundtrip el hel
   have hscalar : parseMSLScalarType (ppMSLType (.pointer sp isConst el)) = none := by
     cases sp <;> cases isConst <;> cases el <;> first | exact False.elim hel | rfl
+  have hnotconst : ∀ rest, (ppMSLType el).toList ++ ['*'] ≠ 'c' :: 'o' :: 'n' :: 's' :: 't' :: ' ' :: rest := by
+    intro rest heq
+    cases el <;> first | exact False.elim hel | simp [ppMSLType] at heq
+  have hnc : (match (ppMSLType el).toList ++ ['*'] with
+      | 'c' :: 'o' :: 'n' :: 's' :: 't' :: ' ' :: rest => (true, rest)
+      | chars => (false, chars)) = (false, (ppMSLType el).toList ++ ['*']) := by
+    split
+    · rename_i rest heq; exact False.elim (hnotconst rest heq)
+    · rfl
   have hrev (l : List Char) : (l ++ ['*']).reverse = '*' :: l.reverse := by simp
   cases sp <;> cases isConst
   all_goals try exact False.elim (Bool.noConfusion (hconst rfl))
   all_goals
     unfold parseMSLParamType
     rw [hscalar]
-    simp only [ppMSLType, ppMSLAddressSpace, Bool.true_and, Bool.false_and, bne,
+    simp only [ppMSLType, ppMSLAddressSpace, bne_self_eq_false, bne_iff_ne, ne_eq,
+      reduceCtorEq, not_false_eq_true, decide_true, Bool.true_and, Bool.false_and,
       Bool.false_eq_true, ↓reduceIte, String.toList_append, String.reduceToList,
       List.append_assoc, List.cons_append, List.nil_append]
+    dsimp only [bind, Option.bind, pure]
+    try rw [hnc]
+    dsimp only
     rw [hrev]
     simp [List.reverse_reverse, String.ofList_toList, hpel]
 

@@ -1165,9 +1165,17 @@ theorem parsePTXInstr_modified_binary_roundtrip (opcode modifier : String) (ty :
         [String.ofList ((ppPTXType ty).toList.drop 1)] by
       simpa [String.toList_append, List.map_append] using hfields, htok_parts, List.cons_append]
   have hlast : parts.getLast? = some (String.ofList ((ppPTXType ty).toList.drop 1)) := by
-    cases mods <;> rfl
+    dsimp only [parts]
+    rcases hop with ⟨rm, _, rfl, _⟩ | ⟨mode, _, rfl, _⟩ | ⟨cmp, _, rfl, _⟩
+    · cases rm <;> rfl
+    · cases mode <;> rfl
+    · cases cmp <;> rfl
   have hmods : (parts.drop 1).dropLast = mods := by
-    cases mods <;> rfl
+    dsimp only [parts]
+    rcases hop with ⟨rm, _, rfl, _⟩ | ⟨mode, _, rfl, _⟩ | ⟨cmp, _, rfl, _⟩
+    · cases rm <;> rfl
+    · cases mode <;> rfl
+    · cases cmp <;> rfl
   have hop_not_st : (opcode == "st") = false := by
     rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
   have hop_not_ld : (opcode == "ld") = false := by
@@ -1291,9 +1299,15 @@ theorem parsePTXInstr_ternary_roundtrip (opcode modifier : String) (ty : PTXType
         [String.ofList ((ppPTXType ty).toList.drop 1)] by
       simpa [String.toList_append, List.map_append] using hfields, htok_parts, List.cons_append]
   have hlast : parts.getLast? = some (String.ofList ((ppPTXType ty).toList.drop 1)) := by
-    cases mods <;> rfl
+    dsimp only [parts]
+    rcases hop with ⟨rm, _, rfl, _⟩ | ⟨mode, _, rfl, _⟩
+    · cases rm <;> rfl
+    · cases mode <;> rfl
   have hmods : (parts.drop 1).dropLast = mods := by
-    cases mods <;> rfl
+    dsimp only [parts]
+    rcases hop with ⟨rm, _, rfl, _⟩ | ⟨mode, _, rfl, _⟩
+    · cases rm <;> rfl
+    · cases mode <;> rfl
   have hop_not_st : (opcode == "st") = false := by
     rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
   have hop_not_ld : (opcode == "ld") = false := by

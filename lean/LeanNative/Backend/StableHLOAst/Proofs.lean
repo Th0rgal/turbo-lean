@@ -464,11 +464,12 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
       have hd0 := Nat.isDigit_of_mem_toDigits (b := 10) (n := n) (by omega) (by omega)
         (by simpa only [Nat.toList_repr] using hm)
       simp [hd0] at hc
+    have hlit_all : ∀ d ∈ "tensor<>xiufbi186324".toList, (d.isDigit || "tensor<>xiufb".toList.contains d) = true := by
+      decide
     have hlit : ∀ d ∈ "tensor<>xiufbi186324".toList, c ≠ d := by
       intro d hd heq
       subst heq
-      have hmem : (c.isDigit || "tensor<>xiufb".toList.contains c) = true := by
-        revert hd; decide
+      have hmem := hlit_all c hd
       rw [hmem] at hc
       contradiction
     have hel : c ∉ (ppElemType ty.elem).toList := by
@@ -519,22 +520,26 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
       cases hsub : fuel - xs.length with
       | zero => omega
       | succ k => rfl
+    have hstrip_none : ∀ (s y : List Char), c ∈ s → c ∉ y → stripPrefixChars s y = none := by
+      intro s
+      induction s with
+      | nil => intros _ h; simp at h
+      | cons p ps ih =>
+        intro y hcs hnin
+        cases y with
+        | nil => rfl
+        | cons z zs =>
+          simp only [stripPrefixChars]
+          rcases List.mem_cons.mp hcs with rfl | hps
+          · have hne_cz : (c == z) = false := beq_eq_false_iff_ne.mpr (fun heq => hnin (by simp [heq]))
+            simp [hne_cz]
+          · split
+            · exact ih zs hps (fun hm => hnin (by simp [hm]))
+            · rfl
     have hp := scanHLOFields_prefix sep xs [] (fuel - xs.length) [] [] hne
       (fun x y he _ => by
         rw [List.append_nil]
-        have hnin : c ∉ y := fun hm => hn (by simp [he, hm])
-        induction sep generalizing y with
-        | nil => simp at hc
-        | cons p ps ih =>
-          cases y with
-          | nil => rfl
-          | cons z zs =>
-            simp only [stripPrefixChars]
-            rcases List.mem_cons.mp hc with hpc | hps
-            · subst p; simp [beq_eq_false_iff_ne.mpr (fun heq => hnin (by simp [heq]))]
-            · split
-              · exact ih zs (by intro h0; subst h0; simp at hps) hps (fun hm => hnin (by simp [hm]))
-              · rfl) hz
+        exact hstrip_none sep y hc (fun hm => hn (by simp [he, hm]))) hz
     simpa [Nat.add_sub_of_le (Nat.le_of_lt hf)] using hp
   let args := "%" ++ a ++ ", %" ++ b
   let suffix := opName ++ " " ++ args
@@ -562,10 +567,17 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
         | nil => contradiction
         | cons c0 cs =>
           cases cs with
-          | nil => simp [sep, stripPrefixChars]; split <;> [decide; rfl]
+          | nil =>
+            simp only [sep, List.cons_append, List.nil_append, stripPrefixChars]
+            split
+            · decide
+            · rfl
           | cons c1 cs' =>
-            have hc1 : ':' ≠ c1 := fun h => hcolon_op (by subst h; simp [he])
-            simp [sep, stripPrefixChars]; split <;> [simp [hc1]; rfl]) hd_del
+            have hc1 : (':' == c1) = false := beq_eq_false_iff_ne.mpr (fun h => hcolon_op (by subst h; simp [he]))
+            simp only [sep, List.cons_append, List.nil_append, stripPrefixChars]
+            split
+            · simp [hc1]
+            · rfl) hd_del
     have hlen : (operation ++ " : " ++ annotation).toList.length + 1 = operation.toList.length + (rfuel + 1) := by
       simp [rfuel, sep, String.toList_append]; omega
     have hchars : (operation ++ " : " ++ annotation).toList = operation.toList ++ (sep ++ annotation.toList) := by
