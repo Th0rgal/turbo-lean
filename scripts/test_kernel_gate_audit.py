@@ -427,6 +427,46 @@ class KernelGateAudit(unittest.TestCase):
             bad_helper,
         )
 
+    def test_recursion_over_prefix_stub_accepted_and_unexempt_sorry_rejected(self) -> None:
+        stub_rec_src = (
+            "theorem modulus_pos : 0 < 256 := sorry\n"
+            "def modWrap (n : Nat) : Fin 256 := ⟨n % 256, Nat.mod_lt n modulus_pos⟩\n"
+            "def powBySquaring (b e : Fin 256) : Fin 256 :=\n"
+            "  if h : e.val == 0 then modWrap 1\n"
+            "  else have : e.val / 2 < e.val := Nat.div_lt_self (by omega) (by decide)\n"
+            "       powBySquaring (modWrap (b.val * b.val)) ⟨e.val / 2, by omega⟩\n"
+            "termination_by e.val\n"
+            "theorem target_thm : (modWrap 1).val = 1 := rfl\n"
+        )
+        live_mode = f"allow_stub:{'target_thm'.encode().hex()}:{'modulus_pos'.encode().hex()}"
+        req = f"Init\t{stub_rec_src.encode().hex()}\t{live_mode}\n"
+        res = subprocess.run([str(ZYGOTE)], input=req, env=self.env,
+                             capture_output=True, text=True, timeout=120)
+        live_ok = json.loads(res.stdout.strip().splitlines()[-1])
+        self.assertTrue(live_ok["ok"], live_ok)
+
+        live_strict = self.shard_audit("Init", stub_rec_src)
+        self.assertFalse(live_strict["ok"], live_strict)
+
+        req_allow_sorry = f"Init\t{stub_rec_src.encode().hex()}\tallow_sorry\n"
+        res_allow_sorry = subprocess.run([str(ZYGOTE)], input=req_allow_sorry, env=self.env,
+                                         capture_output=True, text=True, timeout=120)
+        live_allow_sorry = json.loads(res_allow_sorry.stdout.strip().splitlines()[-1])
+        self.assertTrue(live_allow_sorry["ok"], live_allow_sorry)
+        self.assertIn("modulus_pos", live_allow_sorry.get("sorry_decls", []))
+
+        fx_path = self.tmp / "FxStubRecShard.lean"
+        fx_olean = Path(self.env["LEAN_PATH"].split(":")[-1]) / "FxStubRecShard.olean"
+        fx_path.write_text(stub_rec_src)
+        subprocess.run(["lean", "-o", str(fx_olean), str(fx_path)],
+                       cwd=self.tmp, env=self.env, check=True, capture_output=True, text=True)
+        shard_ok = self.audit("--shard", "--stub-ok=modulus_pos", "FxStubRecShard")
+        self.assertTrue(shard_ok["ok"], shard_ok)
+        shard_no_stub = self.audit("--shard", "FxStubRecShard")
+        self.assertFalse(shard_no_stub["ok"], shard_no_stub)
+        shard_allow_sorry = self.audit("--allow-sorry", "FxStubRecShard")
+        self.assertTrue(shard_allow_sorry["ok"], shard_allow_sorry)
+
     def test_realized_module_reexports_accepted_and_tampered_duplicates_rejected(self) -> None:
         r = self.audit("FxRealizeA", "FxRealizeB", "FxRealizeBridge", "FxRealizeConsumer")
         self.assertTrue(r["ok"], r)

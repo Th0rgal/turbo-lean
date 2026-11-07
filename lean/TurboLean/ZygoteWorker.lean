@@ -443,7 +443,8 @@ def canonicalName : Name → String
     without traversing into the stubbed proof bodies (`v.value`) of `.thmInfo` declarations
     that were already present in `beforeMap` or that `opaqueStub` marks opaque. -/
 def collectDeclAxioms (beforeMap : Lean.PHashMap Name ConstantInfo) (afterEnv : Environment) (rootName : Name)
-    (opaqueStub : Name → Bool := fun _ => false) : Array Name := Id.run do
+    (opaqueStub : Name → Bool := fun _ => false)
+    (localModIdx? : Option ModuleIdx := none) : Array Name := Id.run do
   let afterMap := afterEnv.constants.map₂
   let mut todo : Array Name := #[rootName]
   let mut visited : Std.HashMap Name Bool := {}
@@ -455,7 +456,13 @@ def collectDeclAxioms (beforeMap : Lean.PHashMap Name ConstantInfo) (afterEnv : 
     if visited[curr]?.getD false then
       continue
     visited := visited.insert curr true
-    match afterMap.find? curr with
+    let localCinfo? := match afterMap.find? curr with
+      | some ci => some ci
+      | none =>
+        match localModIdx? with
+        | some mIdx => if afterEnv.getModuleIdxFor? curr == some mIdx then afterEnv.find? curr else none
+        | none => none
+    match localCinfo? with
     | some cinfo =>
       match cinfo with
       | .axiomInfo v =>
@@ -543,20 +550,28 @@ def isCoreRecCombinator (env : Environment) (c : Name) : Bool :=
     (env.header.moduleNames[idx.toNat]?).any fun m => m.getRoot == `Init || m.getRoot == `Lean
 
 def checkRecAuditThmDecl (patterns : List String) (levelParams : List Name) (type value : Expr)
-    (localAxioms : Array Name := #[]) : MetaM Unit := do
+    (localAxioms : Array Name := #[])
+    (opaqueStub : Name → Bool := fun _ => false)
+    (allowSorry : Bool := false)
+    (localModIdx? : Option ModuleIdx := none) : MetaM Unit := do
+  let sorryAxName := Name.mkSimple ("sor" ++ "ryAx")
   let name ← mkFreshUserName `_recAuditThm
   addDecl (.thmDecl { name, levelParams, type, value })
   let env ← getEnv
-  let axs := collectDeclAxioms {} env name
-  unless axs.all (fun ax => localAxioms.contains ax || isAllowedAxiom patterns ax) do
+  let axs := collectDeclAxioms {} env name opaqueStub localModIdx?
+  unless axs.all (fun ax =>
+      localAxioms.contains ax || isAllowedAxiom patterns ax || (allowSorry && ax == sorryAxName)) do
     throwError "disallowed axiom in recursion proof"
 
-def checkRecAuditDefEqKernel (patterns : List String) (levelParams : List Name) (lhs rhs : Expr) : MetaM Unit := do
+def checkRecAuditDefEqKernel (patterns : List String) (levelParams : List Name) (lhs rhs : Expr)
+    (opaqueStub : Name → Bool := fun _ => false)
+    (allowSorry : Bool := false)
+    (localModIdx? : Option ModuleIdx := none) : MetaM Unit := do
   let goal ← Meta.mkEq lhs rhs
   let proof ← Meta.mkFreshExprSyntheticOpaqueMVar goal
   Meta.withTransparency .all <| withOptions (Meta.smartUnfolding.set · false) proof.mvarId!.refl
   let proof ← instantiateMVars proof
-  checkRecAuditThmDecl patterns levelParams goal proof
+  checkRecAuditThmDecl patterns levelParams goal proof #[] opaqueStub allowSorry localModIdx?
 
 def unfoldCliqueAuxThms (fresh : Array Name) (e : Expr) : CoreM Expr := withoutExporting do
   let env ← getEnv
@@ -604,7 +619,10 @@ def reconstructStructuralClique (preDefs : Array PreDefinition) (perms : FixedPa
     values.mapIdxM fun i v => Meta.lambdaTelescope v fun ys _ =>
       Meta.mkLambdaFVars (perms.perms[i]!.buildArgs xs ys) (result[i]!.beta ys)
 
-def checkStructuralClique (patterns : List String) (peers : Array Name) (fresh : Array Name) (defs : Array PreDefinition) : MetaM Bool := do
+def checkStructuralClique (patterns : List String) (peers : Array Name) (fresh : Array Name) (defs : Array PreDefinition)
+    (opaqueStub : Name → Bool := fun _ => false)
+    (allowSorry : Bool := false)
+    (localModIdx? : Option ModuleIdx := none) : MetaM Bool := do
   try
     withoutModifyingEnv do
       let defs ← withoutModifyingEnv do
@@ -641,7 +659,7 @@ def checkStructuralClique (patterns : List String) (peers : Array Name) (fresh :
               withoutModifyingEnv do
                 for i in [:peers.size] do
                   let ci ← getConstInfoDefn peers[i]!
-                  checkRecAuditDefEqKernel patterns ci.levelParams ci.value result[i]!
+                  checkRecAuditDefEqKernel patterns ci.levelParams ci.value result[i]! opaqueStub allowSorry localModIdx?
               return true
           catch _ => pure ()
         return false
@@ -752,7 +770,9 @@ def declMatchesAuditScope (env : Environment) (beforeMap : Lean.PHashMap Name Co
   | none => env.constants.map₂.contains name && !beforeMap.contains name
 
 def checkWFClique (patterns : List String) (beforeMap : Lean.PHashMap Name ConstantInfo) (modIdx? : Option ModuleIdx)
-    (peers : Array Name) (fresh : Array Name) (defs : Array PreDefinition) : MetaM Bool := do
+    (peers : Array Name) (fresh : Array Name) (defs : Array PreDefinition)
+    (opaqueStub : Name → Bool := fun _ => false)
+    (allowSorry : Bool := false) : MetaM Bool := do
   try
     withoutModifyingEnv do
       let defs ← defs.mapM fun d => return { d with value := (← WF.floatRecApp d.value) }
@@ -786,7 +806,7 @@ def checkWFClique (patterns : List String) (beforeMap : Lean.PHashMap Name Const
       let nonRecCi ← getConstInfoDefn nonRecName
       unless nonRecCi.safety == .safe && nonRecCi.levelParams == defs[0]!.levelParams do
         return false
-      checkRecAuditDefEqKernel patterns nonRecCi.levelParams nonRecCi.type unaryPreDef.type
+      checkRecAuditDefEqKernel patterns nonRecCi.levelParams nonRecCi.type unaryPreDef.type opaqueStub allowSorry modIdx?
       if nonRecName != peers[0]! then
         let freshUnary ← mkFreshUserName `_recAuditUnary
         let expectedDefs ← WF.preDefsFromUnaryNonRec perms argsPacker
@@ -796,7 +816,7 @@ def checkWFClique (patterns : List String) (beforeMap : Lean.PHashMap Name Const
           let ci ← getConstInfoDefn peers[i]!
           let expectedVal := expectedDefs[i]!.value.replace fun sub =>
             if sub.isConstOf freshUnary then some (.const nonRecName sub.constLevels!) else none
-          checkRecAuditDefEqKernel patterns ci.levelParams ci.value expectedVal
+          checkRecAuditDefEqKernel patterns ci.levelParams ci.value expectedVal opaqueStub allowSorry modIdx?
       let (_, wfPreprocessProof) ← withoutModifyingEnv do
         addAsAxiom unaryPreDef
         let r ← WF.preprocess unaryPreDef.value
@@ -844,7 +864,7 @@ def checkWFClique (patterns : List String) (beforeMap : Lean.PHashMap Name Const
             let allVars := #[g] ++ fixedArgs ++ #[x]
             let thmType ← Meta.mkForallFVars allVars eqOpen
             let thmVal ← Meta.mkLambdaFVars allVars openProof
-            checkRecAuditThmDecl patterns nonRecCi.levelParams thmType thmVal
+            checkRecAuditThmDecl patterns nonRecCi.levelParams thmType thmVal #[] opaqueStub allowSorry modIdx?
             Meta.lambdaTelescope unaryPreDef.value fun uxs ubody => do
               addAsAxiom unaryPreDef
               let pStep ← wfPreprocessProof.addExtraArgs uxs
@@ -857,13 +877,15 @@ def checkWFClique (patterns : List String) (beforeMap : Lean.PHashMap Name Const
                   instantiateMVars m
               let rawThmType ← Meta.mkForallFVars uxs rawEq
               let rawThmVal ← Meta.mkLambdaFVars uxs rawProof
-              checkRecAuditThmDecl patterns nonRecCi.levelParams rawThmType rawThmVal #[unaryPreDef.declName]
+              checkRecAuditThmDecl patterns nonRecCi.levelParams rawThmType rawThmVal #[unaryPreDef.declName] opaqueStub allowSorry modIdx?
             return true
   catch _ =>
     return false
 
 def checkPFClique (patterns : List String) (beforeMap : Lean.PHashMap Name ConstantInfo) (modIdx? : Option ModuleIdx)
-    (peers : Array Name) (fresh : Array Name) (defs : Array PreDefinition) : MetaM Bool := do
+    (peers : Array Name) (fresh : Array Name) (defs : Array PreDefinition)
+    (opaqueStub : Name → Bool := fun _ => false)
+    (allowSorry : Bool := false) : MetaM Bool := do
   try
     withoutModifyingEnv do
       let defs ← withoutModifyingEnv do
@@ -894,7 +916,7 @@ def checkPFClique (patterns : List String) (beforeMap : Lean.PHashMap Name Const
         let types ← defs.mapIdxM (perms.perms[·]!.instantiateForall ·.type fixedArgs)
         let packedType ← PProdN.pack 0 types
         let expectedNonRecType ← Meta.mkForallFVars fixedArgs packedType
-        checkRecAuditDefEqKernel patterns nonRecCi.levelParams nonRecCi.type expectedNonRecType
+        checkRecAuditDefEqKernel patterns nonRecCi.levelParams nonRecCi.type expectedNonRecType opaqueStub allowSorry modIdx?
         if nonRecName != peers[0]! then
           for fidx in [:peers.size] do
             let ci ← getConstInfoDefn peers[fidx]!
@@ -906,7 +928,7 @@ def checkPFClique (patterns : List String) (beforeMap : Lean.PHashMap Name Const
               let val := PProdN.proj peers.size fidx packedType val
               let val := mkAppN val varying
               Meta.mkLambdaFVars (etaReduce := true) params val
-            checkRecAuditDefEqKernel patterns ci.levelParams ci.value expectedWrapper
+            checkRecAuditDefEqKernel patterns ci.levelParams ci.value expectedWrapper opaqueStub allowSorry modIdx?
         let expectedFs ← withoutExporting do defs.mapIdxM fun funIdx preDef => do
           let body ← perms.perms[funIdx]!.instantiateLambda preDef.value fixedArgs
           Meta.withLocalDeclD (← mkFreshUserName `f) packedType fun f => do
@@ -934,13 +956,15 @@ def checkPFClique (patterns : List String) (beforeMap : Lean.PHashMap Name Const
         let proof ← instantiateMVars proof
         let thmType ← Meta.mkForallFVars fixedArgs eqF
         let thmVal ← Meta.mkLambdaFVars fixedArgs proof
-        checkRecAuditThmDecl patterns nonRecCi.levelParams thmType thmVal
+        checkRecAuditThmDecl patterns nonRecCi.levelParams thmType thmVal #[] opaqueStub allowSorry modIdx?
         return true
   catch _ =>
     return false
 
 def checkRecursionCliqueMeta (patterns : List String) (beforeMap : Lean.PHashMap Name ConstantInfo)
-    (modIdx? : Option ModuleIdx) (peers : Array Name) : MetaM Bool := withoutExporting do
+    (modIdx? : Option ModuleIdx) (peers : Array Name)
+    (opaqueStub : Name → Bool := fun _ => false)
+    (allowSorry : Bool := false) : MetaM Bool := withoutExporting do
   let fresh ← peers.mapM fun _ => mkFreshUserName `_recAuditPeer
   let rename (e : Expr) : Expr := e.replace fun sub => do
     let .const n us := sub | none
@@ -959,16 +983,18 @@ def checkRecursionCliqueMeta (patterns : List String) (beforeMap : Lean.PHashMap
         return .continue
     defs := defs.push { (default : PreDefinition) with
       declName := fresh[i]!, type := ci.type, value := val, levelParams := ci.levelParams }
-  if (← checkStructuralClique patterns peers fresh defs) then return true
-  if (← checkWFClique patterns beforeMap modIdx? peers fresh defs) then return true
-  if (← checkPFClique patterns beforeMap modIdx? peers fresh defs) then return true
+  if (← checkStructuralClique patterns peers fresh defs opaqueStub allowSorry modIdx?) then return true
+  if (← checkWFClique patterns beforeMap modIdx? peers fresh defs opaqueStub allowSorry) then return true
+  if (← checkPFClique patterns beforeMap modIdx? peers fresh defs opaqueStub allowSorry) then return true
   return false
 
 partial def isCompilerPartialRecDefn (env : Environment) (hydratedEnvRef : IO.Ref (Option Environment))
     (cliqueCacheRef : IO.Ref (Std.HashMap (Option ModuleIdx × Name) Bool))
     (patterns : List String) (beforeMap : Lean.PHashMap Name ConstantInfo)
     (modIdx? : Option ModuleIdx) (cinfo : ConstantInfo)
-    (visiting : Array (Option ModuleIdx × Name) := #[]) : IO Bool := do
+    (visiting : Array (Option ModuleIdx × Name) := #[])
+    (opaqueStub : Name → Bool := fun _ => false)
+    (allowSorry : Bool := false) : IO Bool := do
   let .defnInfo dVal := cinfo | return false
   if dVal.safety != .partial ||
      dVal.all.isEmpty ||
@@ -1033,7 +1059,9 @@ partial def isCompilerPartialRecDefn (env : Environment) (hydratedEnvRef : IO.Re
           let some refCi := env.find? c | return (← recordResult false)
           let refScope? := env.getModuleIdxFor? c
           let refBeforeMap := if refScope?.isSome then ({} : Lean.PHashMap Name ConstantInfo) else beforeMap
-          unless (← isCompilerPartialRecDefn env hydratedEnvRef cliqueCacheRef patterns refBeforeMap refScope? refCi nextVisiting) do
+          let refStub := if refScope? == modIdx? then opaqueStub else fun _ => false
+          let refAllowSorry := if refScope? == modIdx? then allowSorry else false
+          unless (← isCompilerPartialRecDefn env hydratedEnvRef cliqueCacheRef patterns refBeforeMap refScope? refCi nextVisiting refStub refAllowSorry) do
             return (← recordResult false)
   let hydratedEnv ← match ← hydratedEnvRef.get with
     | some hEnv => pure hEnv
@@ -1043,7 +1071,7 @@ partial def isCompilerPartialRecDefn (env : Environment) (hydratedEnvRef : IO.Re
       pure hEnv
   let opts := maxHeartbeats.set {} 2000000
   let ok ← try
-    let (res, _) ← (Meta.MetaM.run' (withCurrHeartbeats <| checkRecursionCliqueMeta patterns beforeMap modIdx? peers)).toIO
+    let (res, _) ← (Meta.MetaM.run' (withCurrHeartbeats <| checkRecursionCliqueMeta patterns beforeMap modIdx? peers opaqueStub allowSorry)).toIO
       { fileName := "<recursion-audit>", fileMap := default, options := opts,
         maxRecDepth := 100000, maxHeartbeats := Core.getMaxHeartbeats opts }
       { env := hydratedEnv }
@@ -1276,7 +1304,7 @@ def auditNewKernelDecls
     if cinfo.isUnsafe then
       violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} declaration `{name}` is forbidden"]
     if (cinfo.isPartial || (Lean.Compiler.isUnsafeRecName? name).isSome) &&
-       !(← isCompilerPartialRecDefn afterEnv hydratedEnvRef cliqueCacheRef patterns beforeMap none cinfo) then
+       !(← isCompilerPartialRecDefn afterEnv hydratedEnvRef cliqueCacheRef patterns beforeMap none cinfo #[] stubExempt allowSorry) then
       violations := violations ++ [s!"[TurboLean.KernelGate] forged or unpaired _unsafe_rec/partial declaration `{name}` is forbidden"]
     let isNestedInd := match cinfo with
       | .inductInfo iVal => iVal.isNested
@@ -2479,7 +2507,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
              !unsafeAllowed declName then
             violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} declaration `{declName}` in `{rawStr}` is forbidden"]
           if (cinfo.isPartial || (Lean.Compiler.isUnsafeRecName? declName).isSome) &&
-             !(← isCompilerPartialRecDefn env hydratedEnvRef cliqueCacheRef patterns {} (some modIdx) cinfo) then
+             !(← isCompilerPartialRecDefn env hydratedEnvRef cliqueCacheRef patterns {} (some modIdx) cinfo #[] stubs.contains allowSorry) then
             violations := violations ++ [s!"[TurboLean.KernelGate] forged or unpaired _unsafe_rec/partial declaration `{declName}` in `{rawStr}` is forbidden"]
           if (Lean.isExtern env declName || (Lean.Compiler.getImplementedBy? env declName).isSome) &&
              !isWhitelistedInitExecBridge env modIdx declName &&
