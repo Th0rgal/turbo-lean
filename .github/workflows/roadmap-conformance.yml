@@ -74,7 +74,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/alive2-tv
-          key: ${{ runner.os }}-alive2-llvm18-2547695358b01758a01f4bdab2ced70178189074-v2
+          key: ${{ runner.os }}-alive2-llvm18-2547695358b01758a01f4bdab2ced70178189074-v3
 
       - name: Build or restore pinned Alive2 (alive-tv) binary for Stage 2B gate
         run: |

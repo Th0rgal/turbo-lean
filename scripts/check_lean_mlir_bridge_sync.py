@@ -28,6 +28,8 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 BRIDGE_DIR = ROOT_DIR / "verification" / "lean-mlir-bridge"
 
 PINNED_LEAN_MLIR_REV = "b8c4a771319a044854a4bbb49b8821381ef86ff8"
+PINNED_MATHLIB_REV = "2100ee662d0d4b3233534f70716a04f15f74c300"
+PINNED_CLI_REV = "726b98c53e2da249c1de768fbbbb5e67bc9cef60"
 PINNED_SSA_SHAS = {
     "SSA/Projects/InstCombine/ForStd.lean": "501e7dcba9deade04ee6c979a387fe2bee49768bc3e9d18aa39b0de690a38488",
     "SSA/Projects/InstCombine/LLVM/SimpSet.lean": "1b439d5d23fb6c82aa2942efc0a559ca829da46c3c74b36137a362310b046220",
@@ -152,6 +154,10 @@ def check_bridge_tree(root_dir: Path, sync_mirrors: bool = False) -> dict[str, o
     else:
         try:
             mf = json.loads(manifest.read_text(encoding="utf-8"))
+            if mf.get("name") != "«lean-mlir-bridge»":
+                errors.append(
+                    f"lake-manifest.json root `name` must be guillemet-escaped '«lean-mlir-bridge»', got {mf.get('name')!r}"
+                )
             pkgs = {p.get("name"): p for p in mf.get("packages", [])}
             lm_pkg = pkgs.get("LeanMLIR")
             if not lm_pkg:
@@ -160,10 +166,19 @@ def check_bridge_tree(root_dir: Path, sync_mirrors: bool = False) -> dict[str, o
                 errors.append(
                     f"lake-manifest.json LeanMLIR rev mismatch: {lm_pkg.get('rev')} != {PINNED_LEAN_MLIR_REV}"
                 )
-            cli_pkg = pkgs.get("Cli")
-            if not cli_pkg or "mhuisi/lean4-cli" not in str(cli_pkg.get("url", "")):
+            ml_pkg = pkgs.get("mathlib")
+            if not ml_pkg or ml_pkg.get("rev") != PINNED_MATHLIB_REV:
                 errors.append(
-                    "lake-manifest.json Cli package must point to reachable https://github.com/mhuisi/lean4-cli.git"
+                    f"lake-manifest.json mathlib rev mismatch: {ml_pkg.get('rev') if ml_pkg else None} != {PINNED_MATHLIB_REV}"
+                )
+            cli_pkg = pkgs.get("Cli")
+            if (
+                not cli_pkg
+                or "lean4-cli" not in str(cli_pkg.get("url", ""))
+                or cli_pkg.get("rev") != PINNED_CLI_REV
+            ):
+                errors.append(
+                    f"lake-manifest.json Cli package must point to https://github.com/leanprover/lean4-cli.git @ {PINNED_CLI_REV}"
                 )
         except Exception as exc:
             errors.append(f"Invalid lake-manifest.json: {exc}")

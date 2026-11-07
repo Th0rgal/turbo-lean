@@ -138,13 +138,18 @@ def ensure_alive_tv(cache_dir: Path, llvm_dir: str | None = None) -> Path:
             raise RuntimeError(f"Pinned Alive2 SHA mismatch: {head_sha} != {PINNED_ALIVE2_COMMIT}")
 
         # Ubuntu's packaged llvm-18-dev sets LLVM_ENABLE_EH=OFF in LLVMConfig.cmake while
-        # LLVM_ENABLE_RTTI=ON. Alive2's `alive-tv` builds cleanly with `-fexceptions` enabled on
-        # Alive2's own translation units, so relax only the CMake configure guard.
+        # LLVM_ENABLE_RTTI=ON, causing AddLLVM.cmake's `add_llvm_executable(alive-tv ...)` to
+        # append `-fno-exceptions` *after* CMAKE_CXX_FLAGS. Relax the CMake configure guard and
+        # force `LLVM_ENABLE_EH=ON` + explicit `-fexceptions` on `alive-tv` (which uses `try/catch`).
         cmake_file = src_dir / "CMakeLists.txt"
         cmake_txt = cmake_file.read_text(encoding="utf-8")
         cmake_txt = cmake_txt.replace(
             '  if (NOT LLVM_ENABLE_EH)\n    message(FATAL_ERROR "LLVM must be built with \'-DLLVM_ENABLE_EH=ON\'")\n  endif()',
-            '  if (NOT LLVM_ENABLE_EH)\n    message(STATUS "LLVM_ENABLE_EH is OFF in distro LLVM; enabling -fexceptions for Alive2 targets")\n  endif()',
+            '  set(LLVM_ENABLE_EH ON)\n  set(LLVM_REQUIRES_EH ON)',
+        )
+        cmake_txt = cmake_txt.replace(
+            '  add_llvm_executable(alive-tv\n    "tools/alive-tv.cpp"\n  )',
+            '  add_llvm_executable(alive-tv\n    "tools/alive-tv.cpp"\n  )\n  target_compile_options(alive-tv PRIVATE -fexceptions -frtti)',
         )
         cmake_file.write_text(cmake_txt, encoding="utf-8")
 
