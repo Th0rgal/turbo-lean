@@ -440,6 +440,7 @@ private theorem scanHLOFields_type (c : Char) (sep : List Char) (ty : TensorType
   subst c
   exact scanHLOFields_no_head ' ' sep _ (tensorType_no_space ty) fuel hf
 
+set_option maxHeartbeats 800000 in
 private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b : String)
     (op : StableHLOOp) (ty : TensorType)
     (hopName : (opName.toList.all fun c => c.isAlphanum || c == '_') = true)

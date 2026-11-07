@@ -1315,12 +1315,6 @@ theorem parsePTXInstr_ternary_roundtrip (opcode modifier : String) (ty : PTXType
     rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
   have hop_not_cvt : (opcode == "cvt") = false := by
     rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
-  have hop_allow : (opcode == "add" || opcode == "mul" || opcode == "mad" || opcode == "fma" ||
-      opcode == "setp") = true := by
-    rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
-  have hop_guard : (!(opcode == "add" || opcode == "mul" || opcode == "mad" || opcode == "fma" ||
-      opcode == "setp") && !mods.isEmpty) = false := by
-    rw [hop_allow]; rfl
   have hop_not_selp : (opcode == "selp") = false := by
     rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
   have hop_not_setp : (opcode == "setp") = false := by
@@ -1336,7 +1330,7 @@ theorem parsePTXInstr_ternary_roundtrip (opcode modifier : String) (ty : PTXType
     Bool.false_eq_true, ↓reduceIte, stripPrefixChars, beq_self_eq_true]
   rw [hparts]
   simp only [hhead, hlast, parsePTXType_suffix, hmods,
-    hop_not_st, hop_not_ld, hop_not_cvta, hop_not_cvt, hop_guard,
+    hop_not_st, hop_not_ld, hop_not_cvta, hop_not_cvt,
     hd, ha, hb, hc, hop_not_selp, hop_not_setp, stripPrefixChars, beq_self_eq_true, pure, ↓reduceIte, Bool.false_eq_true]
   rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩
   · cases rm <;> rfl
@@ -1381,8 +1375,6 @@ theorem parsePTXInstr_cvt_roundtrip (rm : PTXRoundMode) (dt st : PTXType)
     cases rm <;> rfl
   have hmods : (parts.drop 1).dropLast = rmMods ++ [dtTok] := by
     cases rm <;> rfl
-  have hdt : parsePTXType (fuel + 1) ("." ++ dtTok).toList = some (dt, []) := by
-    cases dt <;> rfl
   have hhead : parts.head? = some "cvt" := rfl
   simp only [String.toList_append, String.reduceToList, List.append_assoc,
     List.cons_append, List.nil_append] at ht
@@ -1398,7 +1390,7 @@ theorem parsePTXInstr_cvt_roundtrip (rm : PTXRoundMode) (dt st : PTXType)
     show ("cvt" == "st") = false from rfl, show ("cvt" == "ld") = false from rfl,
     show ("cvt" == "cvta") = false from rfl, show ("cvt" == "cvt") = true from rfl,
     hd, hs, stripPrefixChars, beq_self_eq_true, pure, ↓reduceIte, Bool.false_eq_true]
-  cases rm <;> simp [rmMods, hdt]
+  cases rm <;> simp [rmMods, dtTok, parsePTXType_suffix]
 
 set_option maxHeartbeats 1000000 in
 /-- Every instruction in the syntactically canonical scalar fragment roundtrips. -/

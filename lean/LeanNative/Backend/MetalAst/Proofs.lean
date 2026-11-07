@@ -605,7 +605,23 @@ private theorem parseMSLExpr_binary_paren_step (opcode : String) (ctor : MSLExpr
   simpa only [String.toList_append, String.reduceToList, List.append_assoc,
     List.cons_append, List.nil_append] using hparen
 
-set_option maxHeartbeats 1000000 in
+private theorem parseMSLExpr_roundtrip_binary_op (opcode : String) (ctor : MSLExpr → MSLExpr → MSLExpr)
+    (hop : mslBinary opcode = some ctor) (hspace : ∀ c ∈ opcode.toList, c ≠ ' ')
+    (hquestion : ∀ cs, opcode.toList ≠ '?' :: cs)
+    (a b : MSLExpr) (ha : CanonicalMSLExpr a) (rest : List Char) (fuel : Nat)
+    (hf : mslExprFuel a + mslExprFuel b + 4 ≤ fuel)
+    (ihA : ∀ r, ValidMSLExprSuffix r → ∀ f, mslExprFuel a ≤ f →
+      parseMSLExpr f ((ppMSLExpr a).toList ++ r) = some (a, r))
+    (ihB : ∀ r, ValidMSLExprSuffix r → ∀ f, mslExprFuel b ≤ f →
+      parseMSLExpr f ((ppMSLExpr b).toList ++ r) = some (b, r)) :
+    parseMSLExpr fuel ((("(" ++ ppMSLExpr a ++ " " ++ opcode ++ " " ++ ppMSLExpr b ++ ")").toList) ++ rest) =
+      some (ctor a b, rest) := by
+  exact parseMSLExpr_binary_paren_step opcode ctor hop hspace hquestion
+    a b ha rest fuel (by omega)
+    (ihA _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by omega))
+    (ihB _ (Or.inl rfl) (fuel - 2) (by omega))
+
+set_option maxHeartbeats 800000 in
 theorem parseMSLExpr_roundtrip (e : MSLExpr) (he : CanonicalMSLExpr e)
     (rest : List Char) (hsuf : ValidMSLExprSuffix rest) (fuel : Nat)
     (hf : mslExprFuel e ≤ fuel) :
@@ -680,112 +696,76 @@ theorem parseMSLExpr_roundtrip (e : MSLExpr) (he : CanonicalMSLExpr e)
         (parseMSLExpr_roundtrip c he.2.2 _ (hs_rparen _) f (by simp [mslExprFuel] at hf; omega)))
   case add a b =>
     simpa [ppMSLExpr, toString, String.append_assoc] using
-      parseMSLExpr_binary_paren_step "+" .add rfl (by decide) (by intro _ h; cases h)
-        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
-        (parseMSLExpr_roundtrip a he.1 _ (hs_space _) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
-        (parseMSLExpr_roundtrip b he.2 _ (hs_rparen _) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+      parseMSLExpr_roundtrip_binary_op "+" .add rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel hf (parseMSLExpr_roundtrip a he.1) (parseMSLExpr_roundtrip b he.2)
   case sub a b =>
     simpa [ppMSLExpr, toString, String.append_assoc] using
-      parseMSLExpr_binary_paren_step "-" .sub rfl (by decide) (by intro _ h; cases h)
-        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
-        (parseMSLExpr_roundtrip a he.1 _ (hs_space _) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
-        (parseMSLExpr_roundtrip b he.2 _ (hs_rparen _) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+      parseMSLExpr_roundtrip_binary_op "-" .sub rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel hf (parseMSLExpr_roundtrip a he.1) (parseMSLExpr_roundtrip b he.2)
   case mul a b =>
     simpa [ppMSLExpr, toString, String.append_assoc] using
-      parseMSLExpr_binary_paren_step "*" .mul rfl (by decide) (by intro _ h; cases h)
-        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
-        (parseMSLExpr_roundtrip a he.1 _ (hs_space _) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
-        (parseMSLExpr_roundtrip b he.2 _ (hs_rparen _) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+      parseMSLExpr_roundtrip_binary_op "*" .mul rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel hf (parseMSLExpr_roundtrip a he.1) (parseMSLExpr_roundtrip b he.2)
   case div a b =>
     simpa [ppMSLExpr, toString, String.append_assoc] using
-      parseMSLExpr_binary_paren_step "/" .div rfl (by decide) (by intro _ h; cases h)
-        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
-        (parseMSLExpr_roundtrip a he.1 _ (hs_space _) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
-        (parseMSLExpr_roundtrip b he.2 _ (hs_rparen _) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+      parseMSLExpr_roundtrip_binary_op "/" .div rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel hf (parseMSLExpr_roundtrip a he.1) (parseMSLExpr_roundtrip b he.2)
   case rem a b =>
     simpa [ppMSLExpr, toString, String.append_assoc] using
-      parseMSLExpr_binary_paren_step "%" .rem rfl (by decide) (by intro _ h; cases h)
-        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
-        (parseMSLExpr_roundtrip a he.1 _ (hs_space _) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
-        (parseMSLExpr_roundtrip b he.2 _ (hs_rparen _) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+      parseMSLExpr_roundtrip_binary_op "%" .rem rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel hf (parseMSLExpr_roundtrip a he.1) (parseMSLExpr_roundtrip b he.2)
   case bitAnd a b =>
     simpa [ppMSLExpr, toString, String.append_assoc] using
-      parseMSLExpr_binary_paren_step "&" .bitAnd rfl (by decide) (by intro _ h; cases h)
-        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
-        (parseMSLExpr_roundtrip a he.1 _ (hs_space _) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
-        (parseMSLExpr_roundtrip b he.2 _ (hs_rparen _) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+      parseMSLExpr_roundtrip_binary_op "&" .bitAnd rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel hf (parseMSLExpr_roundtrip a he.1) (parseMSLExpr_roundtrip b he.2)
   case bitOr a b =>
     simpa [ppMSLExpr, toString, String.append_assoc] using
-      parseMSLExpr_binary_paren_step "|" .bitOr rfl (by decide) (by intro _ h; cases h)
-        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
-        (parseMSLExpr_roundtrip a he.1 _ (hs_space _) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
-        (parseMSLExpr_roundtrip b he.2 _ (hs_rparen _) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+      parseMSLExpr_roundtrip_binary_op "|" .bitOr rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel hf (parseMSLExpr_roundtrip a he.1) (parseMSLExpr_roundtrip b he.2)
   case bitXor a b =>
     simpa [ppMSLExpr, toString, String.append_assoc] using
-      parseMSLExpr_binary_paren_step "^" .bitXor rfl (by decide) (by intro _ h; cases h)
-        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
-        (parseMSLExpr_roundtrip a he.1 _ (hs_space _) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
-        (parseMSLExpr_roundtrip b he.2 _ (hs_rparen _) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+      parseMSLExpr_roundtrip_binary_op "^" .bitXor rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel hf (parseMSLExpr_roundtrip a he.1) (parseMSLExpr_roundtrip b he.2)
   case shl a b =>
     simpa [ppMSLExpr, toString, String.append_assoc] using
-      parseMSLExpr_binary_paren_step "<<" .shl rfl (by decide) (by intro _ h; cases h)
-        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
-        (parseMSLExpr_roundtrip a he.1 _ (hs_space _) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
-        (parseMSLExpr_roundtrip b he.2 _ (hs_rparen _) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+      parseMSLExpr_roundtrip_binary_op "<<" .shl rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel hf (parseMSLExpr_roundtrip a he.1) (parseMSLExpr_roundtrip b he.2)
   case shr a b =>
     simpa [ppMSLExpr, toString, String.append_assoc] using
-      parseMSLExpr_binary_paren_step ">>" .shr rfl (by decide) (by intro _ h; cases h)
-        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
-        (parseMSLExpr_roundtrip a he.1 _ (hs_space _) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
-        (parseMSLExpr_roundtrip b he.2 _ (hs_rparen _) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+      parseMSLExpr_roundtrip_binary_op ">>" .shr rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel hf (parseMSLExpr_roundtrip a he.1) (parseMSLExpr_roundtrip b he.2)
   case logAnd a b =>
     simpa [ppMSLExpr, toString, String.append_assoc] using
-      parseMSLExpr_binary_paren_step "&&" .logAnd rfl (by decide) (by intro _ h; cases h)
-        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
-        (parseMSLExpr_roundtrip a he.1 _ (hs_space _) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
-        (parseMSLExpr_roundtrip b he.2 _ (hs_rparen _) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+      parseMSLExpr_roundtrip_binary_op "&&" .logAnd rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel hf (parseMSLExpr_roundtrip a he.1) (parseMSLExpr_roundtrip b he.2)
   case logOr a b =>
     simpa [ppMSLExpr, toString, String.append_assoc] using
-      parseMSLExpr_binary_paren_step "||" .logOr rfl (by decide) (by intro _ h; cases h)
-        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
-        (parseMSLExpr_roundtrip a he.1 _ (hs_space _) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
-        (parseMSLExpr_roundtrip b he.2 _ (hs_rparen _) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+      parseMSLExpr_roundtrip_binary_op "||" .logOr rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel hf (parseMSLExpr_roundtrip a he.1) (parseMSLExpr_roundtrip b he.2)
   case eq a b =>
     simpa [ppMSLExpr, toString, String.append_assoc] using
-      parseMSLExpr_binary_paren_step "==" .eq rfl (by decide) (by intro _ h; cases h)
-        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
-        (parseMSLExpr_roundtrip a he.1 _ (hs_space _) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
-        (parseMSLExpr_roundtrip b he.2 _ (hs_rparen _) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+      parseMSLExpr_roundtrip_binary_op "==" .eq rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel hf (parseMSLExpr_roundtrip a he.1) (parseMSLExpr_roundtrip b he.2)
   case ne a b =>
     simpa [ppMSLExpr, toString, String.append_assoc] using
-      parseMSLExpr_binary_paren_step "!=" .ne rfl (by decide) (by intro _ h; cases h)
-        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
-        (parseMSLExpr_roundtrip a he.1 _ (hs_space _) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
-        (parseMSLExpr_roundtrip b he.2 _ (hs_rparen _) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+      parseMSLExpr_roundtrip_binary_op "!=" .ne rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel hf (parseMSLExpr_roundtrip a he.1) (parseMSLExpr_roundtrip b he.2)
   case lt a b =>
     simpa [ppMSLExpr, toString, String.append_assoc] using
-      parseMSLExpr_binary_paren_step "<" .lt rfl (by decide) (by intro _ h; cases h)
-        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
-        (parseMSLExpr_roundtrip a he.1 _ (hs_space _) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
-        (parseMSLExpr_roundtrip b he.2 _ (hs_rparen _) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+      parseMSLExpr_roundtrip_binary_op "<" .lt rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel hf (parseMSLExpr_roundtrip a he.1) (parseMSLExpr_roundtrip b he.2)
   case le a b =>
     simpa [ppMSLExpr, toString, String.append_assoc] using
-      parseMSLExpr_binary_paren_step "<=" .le rfl (by decide) (by intro _ h; cases h)
-        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
-        (parseMSLExpr_roundtrip a he.1 _ (hs_space _) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
-        (parseMSLExpr_roundtrip b he.2 _ (hs_rparen _) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+      parseMSLExpr_roundtrip_binary_op "<=" .le rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel hf (parseMSLExpr_roundtrip a he.1) (parseMSLExpr_roundtrip b he.2)
   case gt a b =>
     simpa [ppMSLExpr, toString, String.append_assoc] using
-      parseMSLExpr_binary_paren_step ">" .gt rfl (by decide) (by intro _ h; cases h)
-        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
-        (parseMSLExpr_roundtrip a he.1 _ (hs_space _) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
-        (parseMSLExpr_roundtrip b he.2 _ (hs_rparen _) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+      parseMSLExpr_roundtrip_binary_op ">" .gt rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel hf (parseMSLExpr_roundtrip a he.1) (parseMSLExpr_roundtrip b he.2)
   case ge a b =>
     simpa [ppMSLExpr, toString, String.append_assoc] using
-      parseMSLExpr_binary_paren_step ">=" .ge rfl (by decide) (by intro _ h; cases h)
-        a b he.1 rest fuel (by simp [mslExprFuel] at hf; omega)
-        (parseMSLExpr_roundtrip a he.1 _ (hs_space _) (fuel - 1) (by simp [mslExprFuel] at hf; omega))
-        (parseMSLExpr_roundtrip b he.2 _ (hs_rparen _) (fuel - 2) (by simp [mslExprFuel] at hf; omega))
+      parseMSLExpr_roundtrip_binary_op ">=" .ge rfl (by decide) (by intro _ h; cases h)
+        a b he.1 rest fuel hf (parseMSLExpr_roundtrip a he.1) (parseMSLExpr_roundtrip b he.2)
   all_goals exact False.elim he
 termination_by sizeOf e
 
