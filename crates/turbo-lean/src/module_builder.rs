@@ -12614,25 +12614,35 @@ fn pkg_non_lake_tree_digest(pkg: &PackageConfig) -> Option<String> {
     Some(h.finalize().to_hex().to_string())
 }
 
+fn required_lake_recipe_names(
+    root_pkg_root: &Path,
+    pkg: &PackageConfig,
+    is_untrusted: bool,
+) -> Vec<String> {
+    if is_untrusted {
+        return Vec::new();
+    }
+    let pkg_has_precompile =
+        pkg.precompile_modules || pkg.libs.iter().any(|l| l.precompile_modules == Some(true));
+    let materialize_custom_targets = pkg.pkg_root == root_pkg_root || pkg_has_precompile;
+    pkg.custom_targets
+        .iter()
+        .filter(|_| materialize_custom_targets)
+        .cloned()
+        .chain(
+            pkg.extern_libs
+                .iter()
+                .filter(|e| e.is_dynamic_recipe)
+                .map(|e| e.name.clone()),
+        )
+        .collect()
+}
+
 fn materialize_lake_recipes(cfg: &ProjectConfig, is_untrusted: bool) -> Result<ProjectConfig> {
-    let recipe_names = |pkg: &PackageConfig| -> Vec<String> {
-        if is_untrusted {
-            return Vec::new();
-        }
-        pkg.custom_targets
-            .iter()
-            .cloned()
-            .chain(
-                pkg.extern_libs
-                    .iter()
-                    .filter(|e| e.is_dynamic_recipe)
-                    .map(|e| e.name.clone()),
-            )
-            .collect()
-    };
+    let root_pkg_root = cfg.root_pkg.pkg_root.clone();
     if std::iter::once(&cfg.root_pkg)
         .chain(&cfg.dep_pkgs)
-        .all(|p| recipe_names(p).is_empty())
+        .all(|p| required_lake_recipe_names(&root_pkg_root, p, is_untrusted).is_empty())
     {
         return Ok(cfg.clone());
     }
@@ -12640,7 +12650,7 @@ fn materialize_lake_recipes(cfg: &ProjectConfig, is_untrusted: bool) -> Result<P
     let mut workspace = blake3::Hasher::new();
     workspace.update(b"turbo-lean-lake-recipes-v1\n");
     for pkg in std::iter::once(&mut resolved.root_pkg).chain(&mut resolved.dep_pkgs) {
-        let names = recipe_names(pkg);
+        let names = required_lake_recipe_names(&root_pkg_root, pkg, is_untrusted);
         if names.is_empty() {
             continue;
         }
@@ -15168,19 +15178,12 @@ pub(crate) fn workspace_lake_inputs_digest(cfg: &ProjectConfig) -> Result<String
 
 fn validate_materialized_artifacts(cfg: &ProjectConfig) -> Result<()> {
     for pkg in std::iter::once(&cfg.root_pkg).chain(&cfg.dep_pkgs) {
-        if !cfg.is_untrusted {
-            for name in pkg.custom_targets.iter().chain(
-                pkg.extern_libs
-                    .iter()
-                    .filter(|e| e.is_dynamic_recipe)
-                    .map(|e| &e.name),
-            ) {
-                anyhow::ensure!(
-                    pkg.inputs.iter().any(|i| &i.name == name),
-                    "Lake recipe `{}/{name}` has not been materialized",
-                    pkg.name
-                );
-            }
+        for name in required_lake_recipe_names(&cfg.root_pkg.pkg_root, pkg, cfg.is_untrusted) {
+            anyhow::ensure!(
+                pkg.inputs.iter().any(|i| i.name == name),
+                "Lake recipe `{}/{name}` has not been materialized",
+                pkg.name
+            );
         }
         for ext in &pkg.extern_libs {
             let path = ext
@@ -40082,14 +40085,17 @@ globs = ["Down.+"]
             root.join("lakefile.lean"),
             "import Lake\nopen Lake DSL\npackage app where\n@[default_target]\nlean_lib App where\n",
         )?;
-        fs::write(root.join("App.lean"), "prelude\nimport PwDep\ndef x : Nat := pwVal\n")?;
+        fs::write(
+            root.join("App.lean"),
+            "prelude\nimport PwDep\nimport ProofWidgets\ndef x : Nat := pwVal + pwHelper\n",
+        )?;
 
         let pw_dir = root.join(".lake/packages/proofwidgets");
         fs::create_dir_all(pw_dir.join("widget/js"))?;
         fs::write(pw_dir.join("widget/js/hello.tsx"), "export default {}\n")?;
         fs::write(
             pw_dir.join("lakefile.lean"),
-            "import Lake\nopen Lake DSL System\npackage ProofWidgets where\n  preferReleaseBuild := true\ndef widgetDir : FilePath := \"widget\"\ninput_dir widgetJsAllTs where\n  path := widgetDir / \"js\"\n  filter := .extension <| .mem #[\"ts\", \"tsx\"]\ntarget widgetJsAll pkg : Unit := do\n  return .nil\n@[default_target]\nlean_lib ProofWidgets where\n  needs := #[widgetJsAll]\n",
+            "import Lake\nopen Lake DSL System\npackage ProofWidgets where\n  preferReleaseBuild := true\ndef widgetDir : FilePath := \"widget\"\ninput_dir widgetJsAllTs where\n  path := widgetDir / \"js\"\n  filter := .extension <| .mem #[\"ts\", \"tsx\"]\ntarget widgetJsAll pkg : Unit := do\n  return .nil\ntarget widgetJsAllDev pkg : Unit := do\n  return .nil\n@[default_target]\nlean_lib ProofWidgets where\n  needs := #[widgetJsAll]\n",
         )?;
         fs::write(
             pw_dir.join("ProofWidgets.lean"),
@@ -40174,10 +40180,16 @@ globs = ["Down.+"]
             .dep_pkgs
             .iter()
             .find(|p| p.name == "ProofWidgets")
-            .expect("ProofWidgets parsed");
+            .expect("ProofWidgets parsed")
+            .clone();
         assert_eq!(pw_pkg.base_name, "proofwidgets");
         assert_eq!(pw_pkg.inputs.len(), 1);
+        assert_eq!(
+            pw_pkg.custom_targets,
+            vec!["widgetJsAll".to_string(), "widgetJsAllDev".to_string()]
+        );
         assert_eq!(pw_pkg.libs[0].custom_target_needs, vec!["widgetJsAll".to_string()]);
+        assert!(!workspace_lake_inputs_digest(&cfg)?.is_empty());
 
         let write_fake_leantar_artifacts =
             |olean_path: &Path, dep_h: u64| -> Result<()> {
@@ -40333,7 +40345,7 @@ globs = ["Down.+"]
             .find(|mp| mp.name == "proofwidgets")
             .unwrap()
             .rev = Some(pw_rev2);
-        let pw_spec = resolve_module_in_package(pw_pkg, false, "ProofWidgets").expect("PW spec");
+        let pw_spec = resolve_module_in_package(&pw_pkg, false, "ProofWidgets").expect("PW spec");
         write_fake_leantar_artifacts(&spec_olean_path(&pw_spec), 0x123456789abcdef0)?;
         let mut cache3 = LakeClosureCache::default();
         cache3.ignore_mtime_skew = true;
@@ -40342,6 +40354,11 @@ globs = ["Down.+"]
             lake_closure_export_info(&cfg, &pw_spec, true, &mut cache3, &mut visiting3).is_some(),
             "clean git-pinned custom-target-needs package must verify"
         );
+        fs::write(dep_dir.join("PwDep.lean"), dep_src)?;
+        let dag = build_module_dag(&cfg, &[])?;
+        assert!(dag.nodes.contains_key("App"));
+        assert!(!dag.nodes.contains_key("ProofWidgets"));
+        assert!(!compute_module_cas_key(&cfg, &dag.nodes["App"], &[], false)?.is_empty());
         // Dirty tracked custom-target input (`widget/js/hello.tsx`) must fail closed even when `.lean` is untouched.
         fs::write(pw_dir.join("widget/js/hello.tsx"), "export default { pwned: true }\n")?;
         let mut cache_tsx = LakeClosureCache::default();
