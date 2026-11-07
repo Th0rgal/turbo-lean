@@ -28,25 +28,19 @@ theorem parseMSLScalarType_roundtrip (ty : MSLType) (h : CanonicalMSLValueType t
 private theorem parseMSLParamType_pointer_roundtrip (sp : MSLAddressSpace) (isConst : Bool)
     (el : MSLType) (hel : CanonicalMSLValueType el) (hconst : sp = .constant → isConst = false) :
     parseMSLParamType (ppMSLType (.pointer sp isConst el)) = some (.pointer sp isConst el) := by
-  have hpel : parseMSLScalarType (ppMSLType el) = some el := parseMSLScalarType_roundtrip el hel
-  have hscalar : parseMSLScalarType (ppMSLType (.pointer sp isConst el)) = none := by
-    cases sp <;> cases isConst <;> cases el <;> first | exact False.elim hel | rfl
   cases isConst <;> cases sp <;> cases el <;>
     first
     | exact False.elim hel
     | exact False.elim (Bool.noConfusion (hconst rfl))
-    | (unfold parseMSLParamType; rw [hscalar]; simp [ppMSLType, ppMSLAddressSpace, hpel])
+    | rfl
 
 private theorem parseMSLParamType_ref_roundtrip (sp : MSLAddressSpace)
     (el : MSLType) (hel : CanonicalMSLValueType el) :
     parseMSLParamType (ppMSLType (.ref sp el)) = some (.ref sp el) := by
-  have hpel : parseMSLScalarType (ppMSLType el) = some el := parseMSLScalarType_roundtrip el hel
-  have hscalar : parseMSLScalarType (ppMSLType (.ref sp el)) = none := by
-    cases sp <;> cases el <;> first | exact False.elim hel | rfl
   cases sp <;> cases el <;>
     first
     | exact False.elim hel
-    | (unfold parseMSLParamType; rw [hscalar]; simp [ppMSLType, ppMSLAddressSpace, hpel])
+    | rfl
 
 theorem parseMSLParamType_roundtrip (ty : MSLType) (h : CanonicalMSLType ty) :
     parseMSLParamType (ppMSLType ty) = some ty := by

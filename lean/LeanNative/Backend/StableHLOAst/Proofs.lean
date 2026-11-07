@@ -897,33 +897,16 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
   rw [hunary]
   dsimp only [bind, Option.bind]
   rw [hdot, hcst, hsp_op]
-  have hmatch_bin :
-      (match ["%" ++ d, "=", "stablehlo." ++ opName, "%" ++ a ++ ",", "%" ++ b] with
-      | ["return", arg] => do
-        let name ← parseSSAName arg
-        let ty ← tenv name
-        if annotation == ppTensorType ty then some (StableHLOOp.returnOp name) else none
-      | [dst, "=", opcode, argA, argB] => do
-        let dst ← parseSSAName dst
-        let aChars := argA.toList
-        if aChars.getLast? != some ',' then none else do
-          let a ← parseSSAName (String.ofList (aChars.take (aChars.length - 1)))
-          let b ← parseSSAName argB
-          let op ← parseBinaryOp opcode dst a b
-          let ty ← resultTypeOf tenv op
-          if annotation == ppTensorType ty then some op else none
-      | _ => none) =
-      (do
-        let dst ← parseSSAName ("%" ++ d)
-        let aChars := ("%" ++ a ++ ",").toList
-        if aChars.getLast? != some ',' then none else do
-          let a ← parseSSAName (String.ofList (aChars.take (aChars.length - 1)))
-          let b ← parseSSAName ("%" ++ b)
-          let op ← parseBinaryOp ("stablehlo." ++ opName) dst a b
-          let ty ← resultTypeOf tenv op
-          if annotation == ppTensorType ty then some op else none) := rfl
   dsimp only [bind, Option.bind]
-  rw [hmatch_bin]
+  change (do
+      let dst ← parseSSAName ("%" ++ d)
+      let aChars := ("%" ++ a ++ ",").toList
+      if aChars.getLast? != some ',' then none else do
+        let a ← parseSSAName (String.ofList (aChars.take (aChars.length - 1)))
+        let b ← parseSSAName ("%" ++ b)
+        let op ← parseBinaryOp ("stablehlo." ++ opName) dst a b
+        let ty ← resultTypeOf tenv op
+        if annotation == ppTensorType ty then some op else none) = some op
   rw [hd.parse_roundtrip d]
   dsimp only [bind, Option.bind]
   rw [ha_last]
