@@ -5961,7 +5961,14 @@ fn seed_trusted_statement_dependencies(
                     let clone_repo = scratch.0.join("repo.git");
                     let out = crate::trusted_tools::git(project)?
                         .env("GIT_ALLOW_PROTOCOL", "file")
-                        .args(["clone", "--local", "--bare", "--quiet", "--no-hardlinks", "--template="])
+                        .args([
+                            "clone",
+                            "--local",
+                            "--bare",
+                            "--quiet",
+                            "--no-hardlinks",
+                            "--template=",
+                        ])
                         .arg("--")
                         .arg(&source)
                         .arg(&clone_repo)
@@ -5986,7 +5993,10 @@ fn seed_trusted_statement_dependencies(
                         None,
                     )?;
                     let build_in_target = target.join(&dep.build_dir);
-                    if build_in_target.starts_with(&target) && build_in_target != target && build_in_target.exists() {
+                    if build_in_target.starts_with(&target)
+                        && build_in_target != target
+                        && build_in_target.exists()
+                    {
                         if build_in_target.is_dir() {
                             fs::remove_dir_all(&build_in_target)?;
                         } else {
@@ -6037,15 +6047,22 @@ fn seed_trusted_statement_dependencies(
 }
 
 // Share source-root resolution between stock compilation and digest reporting.
-fn statement_source_modules(
+fn statement_source_modules_with_trust(
     project: &Path,
     pkg: &crate::module_builder::PackageConfig,
     scope: Option<&Path>,
+    is_untrusted: bool,
 ) -> Result<BTreeMap<String, (PathBuf, PathBuf)>> {
     let (_, manifest_packages, _) = crate::module_builder::parse_lake_manifest(project, false)?;
     let canon_project = project
         .canonicalize()
         .unwrap_or_else(|_| project.to_path_buf());
+    let assurance_mods = if !is_untrusted && scope.is_none() {
+        let allowed = splitter::allowed_axioms();
+        crate::module_builder::discover_trusted_assurance_surface(project, pkg, &allowed).mod_names
+    } else {
+        std::collections::HashSet::new()
+    };
     let mut dep_roots: Vec<PathBuf> = manifest_packages
         .into_iter()
         .filter_map(|mp| {
@@ -6086,6 +6103,9 @@ fn statement_source_modules(
             .with_extension("")
             .to_string_lossy()
             .replace('/', ".");
+        if assurance_mods.contains(&name) {
+            continue;
+        }
         anyhow::ensure!(
             modules
                 .insert(name.clone(), (source, root.clone()))
@@ -6106,7 +6126,14 @@ fn stock_statement_build_with_trust(
     scope: Option<&Path>,
     is_untrusted: bool,
 ) -> Result<()> {
-    if scope.is_none() {
+    let pkg = crate::module_builder::resolve_package_config(project, true)?;
+    let assurance_libs = if !is_untrusted && scope.is_none() {
+        let allowed = splitter::allowed_axioms();
+        crate::module_builder::discover_trusted_assurance_surface(project, &pkg, &allowed).lib_names
+    } else {
+        std::collections::HashSet::new()
+    };
+    if scope.is_none() && (is_untrusted || assurance_libs.is_empty()) {
         let mut command = statement_lake_command(project, is_untrusted)?;
         command.arg("build");
         let out = crate::module_builder::run_command_with_timeout(
@@ -6122,13 +6149,13 @@ fn stock_statement_build_with_trust(
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    let pkg = crate::module_builder::resolve_package_config(project, true)?;
     let lib_dir = project.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
-    let mut modules = statement_source_modules(project, &pkg, scope)?;
+    let mut modules = statement_source_modules_with_trust(project, &pkg, scope, is_untrusted)?;
     if scope.is_some() && !modules.is_empty() {
         // Expand `scope` with transitive project-local `.lean` imports so standalone or
         // unbuilt local imports compile before scoped statement modules.
-        let all_project_modules = statement_source_modules(project, &pkg, None)?;
+        let all_project_modules =
+            statement_source_modules_with_trust(project, &pkg, None, is_untrusted)?;
         let mut queue: Vec<String> = modules.keys().cloned().collect();
         while let Some(cur) = queue.pop() {
             let Some((src_path, _)) = modules.get(&cur) else {
@@ -6164,7 +6191,7 @@ fn stock_statement_build_with_trust(
             for lib in pkg
                 .libs
                 .iter()
-                .filter(|lib| !lib.needs.is_empty())
+                .filter(|lib| !lib.needs.is_empty() && !assurance_libs.contains(&lib.name))
                 .filter(|lib| crate::module_builder::lib_can_build_module(lib, &name))
             {
                 if !input_targets.contains(&lib.name) {
@@ -6671,7 +6698,9 @@ fn built_kernel_statement_report_bound(
     let pkg = crate::module_builder::resolve_package_config(project, true)?;
     let lib_dir = project.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
     let mut modules = BTreeMap::new();
-    for (module, (source, root)) in statement_source_modules(project, &pkg, scope)? {
+    for (module, (source, root)) in
+        statement_source_modules_with_trust(project, &pkg, scope, is_untrusted)?
+    {
         if let Some(snap) = bound_snap {
             anyhow::ensure!(
                 snap.entries.get(&module).and_then(|e| e.as_ref()).is_some(),
@@ -6965,7 +6994,8 @@ fn certify_head_statement_modules_and_replay(
     let lib_dir = head_project
         .join(&cfg.root_pkg.build_dir)
         .join(&cfg.root_pkg.lean_lib_dir);
-    let statement_modules = statement_source_modules(head_project, &cfg.root_pkg, scope)?;
+    let statement_modules =
+        statement_source_modules_with_trust(head_project, &cfg.root_pkg, scope, is_untrusted)?;
     if statement_modules.is_empty() {
         return Ok((None, None));
     }
@@ -7848,7 +7878,8 @@ fn head_statement_report_cache_action_key(
     snap: &crate::zygote::ClosureSnapshot,
 ) -> Option<String> {
     let _ = crate::zygote::ensure_bound_audit_closure(snap, "head_stmt_report_cache_key").ok()?;
-    let mods = statement_source_modules(head_project, &cfg.root_pkg, scope).ok()?;
+    let mods =
+        statement_source_modules_with_trust(head_project, &cfg.root_pkg, scope, false).ok()?;
     let mut h = blake3::Hasher::new();
     h.update(b"turbo-lean:head-stmt-report:v2\0");
     h.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
@@ -8003,9 +8034,9 @@ fn kernel_statement_changes_with_trust(
     let trusted_statement_build = |proj: &Path, is_disposable_snapshot: bool| -> Result<()> {
         let pkg = crate::module_builder::resolve_package_config(proj, true)?;
         let lib_dir = proj.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
-        let mut mods = statement_source_modules(proj, &pkg, statement_scope)?;
+        let mut mods = statement_source_modules_with_trust(proj, &pkg, statement_scope, false)?;
         if statement_scope.is_some() && !mods.is_empty() {
-            let all_project_modules = statement_source_modules(proj, &pkg, None)?;
+            let all_project_modules = statement_source_modules_with_trust(proj, &pkg, None, false)?;
             let mut queue: Vec<String> = mods.keys().cloned().collect();
             while let Some(cur) = queue.pop() {
                 let Some((src_path, _)) = mods.get(&cur) else {
@@ -8145,7 +8176,7 @@ fn kernel_statement_changes_with_trust(
             .is_ok();
         }
         let all_built = native_ok
-            && statement_source_modules(proj, &pkg, statement_scope)?
+            && statement_source_modules_with_trust(proj, &pkg, statement_scope, false)?
                 .values()
                 .all(|(source, root)| {
                     let is_mod = fs::read_to_string(source)
@@ -8264,10 +8295,12 @@ fn kernel_statement_changes_with_trust(
                 return None;
             }
             let pkg = crate::module_builder::resolve_package_config(&head_project, true).ok()?;
-            let mut mods = statement_source_modules(&head_project, &pkg, statement_scope).ok()?;
+            let mut mods =
+                statement_source_modules_with_trust(&head_project, &pkg, statement_scope, false)
+                    .ok()?;
             if statement_scope.is_some() && !mods.is_empty() {
                 let all_project_modules =
-                    statement_source_modules(&head_project, &pkg, None).ok()?;
+                    statement_source_modules_with_trust(&head_project, &pkg, None, false).ok()?;
                 let mut queue: Vec<String> = mods.keys().cloned().collect();
                 while let Some(cur) = queue.pop() {
                     let Some((src_path, _)) = mods.get(&cur) else {
@@ -8666,7 +8699,11 @@ fn compare_kernel_statements(
         .collect()
 }
 
-fn pr_verify_file_worker_jobs(is_untrusted: bool, available_cpus: usize, files_len: usize) -> usize {
+fn pr_verify_file_worker_jobs(
+    is_untrusted: bool,
+    available_cpus: usize,
+    files_len: usize,
+) -> usize {
     let base = available_cpus.max(1);
     let capped = if is_untrusted { base.min(2) } else { base };
     capped.min(files_len.max(1))
@@ -8742,13 +8779,39 @@ pub fn run_pr_verify_command(
         )?;
     let _ = classify_t0;
 
+    let base_policy = StatementPolicy::at(&canon_dir, &base);
+    let trusted_assurance = if !is_untrusted && scope.is_none() {
+        crate::module_builder::optional_package_config(&canon_dir)
+            .ok()
+            .flatten()
+            .map(|pkg| {
+                crate::module_builder::discover_trusted_assurance_surface(
+                    &canon_dir,
+                    &pkg,
+                    &base_policy.axioms,
+                )
+            })
+            .unwrap_or_default()
+    } else {
+        crate::module_builder::TrustedAssuranceSurface::default()
+    };
+
     for (file, split) in &current_splits {
+        let canon_file = canon_dir
+            .join(file)
+            .canonicalize()
+            .unwrap_or_else(|_| canon_dir.join(file));
+        let is_trusted_assurance_script = !is_untrusted
+            && scope.is_none()
+            && !split.hygiene.has_checking_weakening_option
+            && split.shards.is_empty()
+            && trusted_assurance.canon_paths.contains(&canon_file);
         anyhow::ensure!(
-            !split.hygiene.has_checking_weakening,
+            !split.hygiene.has_checking_weakening || is_trusted_assurance_script,
             "Soundness hygiene violation in {file}: {:?}",
-            split.hygiene.disallowed_items()
+            split.hygiene.disallowed_items_under(&base_policy.axioms)
         );
-        anyhow::ensure!(!split.hygiene.native_violation(),
+        anyhow::ensure!(!split.hygiene.native_violation_under(&base_policy.axioms),
             "[TurboLean.KernelGate] native_decide/bv_decide in {file} requires the base project's axiom allowlist");
     }
 
@@ -8773,10 +8836,17 @@ pub fn run_pr_verify_command(
     let mut lake_rechecked_modules = 0usize;
     let mut untrusted_deps_built = false;
     let mut standalone_overlays: Vec<crate::lake_build::StandaloneOleanOverlay> = Vec::new();
+    let is_assurance_rel = |rel: &String| -> bool {
+        let p = canon_dir.join(rel);
+        trusted_assurance
+            .canon_paths
+            .contains(&p.canonicalize().unwrap_or(p))
+    };
     let mut trusted_replay_targets: Vec<PathBuf> = shards_by_file
         .keys()
         .chain(classification.modified_files.iter())
         .chain(classification.altered_interface_files.iter())
+        .filter(|f| !is_assurance_rel(f))
         .map(|f| canon_dir.join(f))
         .collect();
     let mut trusted_replay_mods: Vec<String> = Vec::new();
@@ -8799,22 +8869,47 @@ pub fn run_pr_verify_command(
                 standalone_overlays.push(ov);
             }
         } else {
-            let (rechecked_count, rechecked_files, rechecked_mods, overlay) =
-                crate::lake_build::lake_recheck_dependents_with_store(
+            let mut certifiable_altered = Vec::new();
+            let mut assurance_altered = Vec::new();
+            for f in &classification.altered_interface_files {
+                if is_assurance_rel(f) {
+                    assurance_altered.push(f.clone());
+                } else {
+                    certifiable_altered.push(f.clone());
+                }
+            }
+            if !certifiable_altered.is_empty() {
+                let (rechecked_count, rechecked_files, rechecked_mods, overlay) =
+                    crate::lake_build::lake_recheck_dependents_with_store(
+                        Some(store),
+                        &canon_dir,
+                        &certifiable_altered,
+                        Some(&base),
+                        true,
+                    )?;
+                lake_rechecked_modules = rechecked_count;
+                trusted_replay_targets.extend(rechecked_files);
+                trusted_replay_mods.extend(rechecked_mods);
+                if let Some(ov) = overlay {
+                    verification_trust
+                        .extra_ro_olean_dirs
+                        .push(ov.olean_dir.clone());
+                    standalone_overlays.push(ov);
+                }
+            }
+            let modified_assurance: Vec<String> = assurance_altered
+                .into_iter()
+                .filter(|f| classification.modified_files.contains(f))
+                .collect();
+            if !modified_assurance.is_empty() {
+                let (assur_count, _, _, _) = crate::lake_build::lake_recheck_dependents_with_store(
                     Some(store),
                     &canon_dir,
-                    &classification.altered_interface_files,
+                    &modified_assurance,
                     Some(&base),
-                    true,
+                    false,
                 )?;
-            lake_rechecked_modules = rechecked_count;
-            trusted_replay_targets.extend(rechecked_files);
-            trusted_replay_mods.extend(rechecked_mods);
-            if let Some(ov) = overlay {
-                verification_trust
-                    .extra_ro_olean_dirs
-                    .push(ov.olean_dir.clone());
-                standalone_overlays.push(ov);
+                lake_rechecked_modules += assur_count;
             }
         }
     }
@@ -18138,7 +18233,10 @@ end ParityNs
             let dep_in_pkgs = app_proj.join(".lake/packages/dep");
             fs::create_dir_all(&dep_origin)?;
             fs::create_dir_all(&app_proj)?;
-            fs::write(dep_origin.join("lean-toolchain"), "leanprover/lean4:v4.31.0\n")?;
+            fs::write(
+                dep_origin.join("lean-toolchain"),
+                "leanprover/lean4:v4.31.0\n",
+            )?;
             fs::write(
                 dep_origin.join("lakefile.toml"),
                 "name = \"dep\"\ndefaultTargets = [\"Dep\"]\n[[lean_lib]]\nname = \"Dep\"\nroots = [\"Dep\"]\n",
@@ -18179,7 +18277,10 @@ end ParityNs
                 .status()?;
             anyhow::ensure!(clone_st.success(), "clone dep_origin failed");
 
-            fs::write(app_proj.join("lean-toolchain"), "leanprover/lean4:v4.31.0\n")?;
+            fs::write(
+                app_proj.join("lean-toolchain"),
+                "leanprover/lean4:v4.31.0\n",
+            )?;
             fs::write(
                 app_proj.join("lakefile.toml"),
                 format!(
@@ -18211,7 +18312,8 @@ end ParityNs
             fs::write(app_proj.join("App.lean"), "prelude\nimport Dep\n")?;
 
             crate::module_builder::reset_lake_inputs_tag_memo();
-            let cfg_clean = crate::module_builder::resolve_project_config_with_trust(&app_proj, false)?;
+            let cfg_clean =
+                crate::module_builder::resolve_project_config_with_trust(&app_proj, false)?;
             let dep_cfg = cfg_clean
                 .dep_pkgs
                 .iter()
@@ -18321,5 +18423,157 @@ end ParityNs
             crate::module_builder::module_compile_timeout_secs_from(Some("1200"), false),
             1200
         );
+    }
+
+    #[test]
+    fn test_pr_verify_trusted_allows_sink_assurance_targets_after_lake_input_change_and_rejects_imported_run_cmd(
+    ) -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_pr_assurance_sink_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        let run = || -> Result<()> {
+            fs::create_dir_all(proj.join("scripts/.assurance_fixtures/Fixture"))?;
+            fs::create_dir_all(proj.join("contracts"))?;
+            fs::write(
+                proj.join("lean-toolchain"),
+                include_str!("../../../lean/lean-toolchain"),
+            )?;
+            fs::write(proj.join(".gitignore"), ".lake/\n")?;
+            fs::write(proj.join("contracts/Sample.sol"), "// v1\n")?;
+            fs::write(
+                proj.join("lakefile.lean"),
+                concat!(
+                    "import Lake\nopen Lake DSL\n\npackage «proj»\n\n",
+                    "input_dir solInputs where\n  path := \"contracts\"\n  filter := .extension \"sol\"\n  text := true\n\n",
+                    "@[default_target]\nlean_lib «MainLib» where\n  roots := #[`MainLib]\n  needs := #[solInputs]\n\n",
+                    "lean_lib «PrintAxioms» where\n  roots := #[`PrintAxioms]\n\n",
+                    "lean_lib «AssuranceFixtures» where\n  srcDir := \"scripts/.assurance_fixtures\"\n  roots := #[`Fixture.Bad]\n\n",
+                    "lean_lib «Assurance» where\n  srcDir := \"scripts\"\n  roots := #[`Controls]\n",
+                ),
+            )?;
+            fs::write(
+                proj.join("MainLib.lean"),
+                "theorem main_ok : (1 : Nat) = 1 := rfl\n",
+            )?;
+            fs::write(
+                proj.join("PrintAxioms.lean"),
+                "import Lean\nimport MainLib\nrun_cmd Lean.logInfo \"audit ok\"\n",
+            )?;
+            fs::write(
+                proj.join("scripts/.assurance_fixtures/Fixture/Bad.lean"),
+                "theorem fixture_bad : False := sorry\n",
+            )?;
+            fs::write(
+                proj.join("scripts/Controls.lean"),
+                "import Lean\nimport Fixture.Bad\nrun_cmd Lean.logInfo \"control ok\"\n",
+            )?;
+            git_init_and_commit(&proj, "base with assurance targets")?;
+
+            // Change a Lake `input_dir` file and proof-edit MainLib: `lake_inputs_changed` marks all `.lean` files.
+            fs::write(proj.join("contracts/Sample.sol"), "// v2\n")?;
+            fs::write(
+                proj.join("MainLib.lean"),
+                "theorem main_ok : (1 : Nat) = 1 := by rfl\n",
+            )?;
+            let mut store = TurboStore::open(Some(&dir.join("cache")))?;
+            crate::check::run_check_command(
+                &mut store,
+                false,
+                false,
+                proj.join("MainLib.lean"),
+                None,
+                proj.clone(),
+                Some(1),
+                false,
+                None,
+            )?;
+            let receipt_path = dir.join("receipt.json");
+            run_pr_verify_command(
+                &mut store,
+                true,
+                proj.clone(),
+                "HEAD".to_string(),
+                "trusted".to_string(),
+                false,
+                Some(receipt_path.clone()),
+                None,
+                None,
+                None,
+                false,
+                1,
+                None,
+            )?;
+            assert!(receipt_path.exists());
+
+            // Now make `MainLib` import `PrintAxioms`: breaks the closed sink-cone invariant and must fail closed!
+            let _ = fs::remove_file(&receipt_path);
+            fs::write(
+                proj.join("MainLib.lean"),
+                "import PrintAxioms\ntheorem main_ok : (1 : Nat) = 1 := by rfl\n",
+            )?;
+            let err = run_pr_verify_command(
+                &mut store,
+                true,
+                proj.clone(),
+                "HEAD".to_string(),
+                "trusted".to_string(),
+                false,
+                Some(receipt_path.clone()),
+                None,
+                None,
+                None,
+                false,
+                1,
+                None,
+            )
+            .unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("Soundness hygiene violation") && msg.contains("PrintAxioms"),
+                "importing a run_cmd module from a theorem module must fail closed, got: {msg}"
+            );
+            // Editing an assurance script so `run_cmd` fails must also fail closed in `pr-verify`.
+            fs::write(
+                proj.join("MainLib.lean"),
+                "theorem main_ok : (1 : Nat) = 1 := by rfl\n",
+            )?;
+            fs::write(
+                proj.join("PrintAxioms.lean"),
+                "import Lean\nimport MainLib\nrun_cmd throwError \"audit regression\"\n",
+            )?;
+            let err_broken = run_pr_verify_command(
+                &mut store,
+                true,
+                proj.clone(),
+                "HEAD".to_string(),
+                "trusted".to_string(),
+                false,
+                Some(receipt_path.clone()),
+                None,
+                None,
+                None,
+                false,
+                1,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                format!("{err_broken:#}").contains("PrintAxioms")
+                    || format!("{err_broken:#}").contains("audit regression"),
+                "broken edited assurance script must fail pr-verify, got: {err_broken:#}"
+            );
+            assert!(!receipt_path.exists());
+            Ok(())
+        };
+        let res = run();
+        let _ = fs::remove_dir_all(&dir);
+        res
     }
 }

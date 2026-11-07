@@ -5116,14 +5116,59 @@ fn compute_project_dependent_closure_inner(
     let cfg = crate::module_builder::resolve_project_config_with_trust(canon_dir, is_untrusted)?;
     let roots = package_source_roots(canon_dir, &cfg.root_pkg);
     let root_base = crate::module_builder::pkg_target_base_name(&cfg.root_pkg);
-    let mut dag_seeds: Vec<String> = cfg
+    let edited: HashSet<PathBuf> = edits
+        .iter()
+        .map(|e| canon_dir.join(e))
+        .map(|p| p.canonicalize().unwrap_or(p))
+        .collect();
+    let assurance = if !is_untrusted {
+        let allowed = splitter::allowed_axioms();
+        crate::module_builder::discover_trusted_assurance_surface(
+            canon_dir,
+            &cfg.root_pkg,
+            &allowed,
+        )
+    } else {
+        crate::module_builder::TrustedAssuranceSurface::default()
+    };
+    let mut dag_seeds: Vec<String> =
+        cfg.root_pkg
+            .libs
+            .iter()
+            .filter(|l| {
+                !assurance.lib_names.contains(&l.name)
+                    || crate::module_builder::expand_lib_configured_modules(&cfg.root_pkg, l)
+                        .is_ok_and(|pairs| {
+                            pairs.iter().any(|(_, p)| {
+                                edited.contains(&p.canonicalize().unwrap_or_else(|_| p.clone()))
+                            })
+                        })
+            })
+            .map(|l| format!("@{}/{}", root_base, l.name))
+            .collect();
+    let mut lake_seeds: Vec<String> = cfg
         .root_pkg
         .libs
         .iter()
-        .map(|l| format!("@{}/{}", root_base, l.name))
+        .filter(|l| dag_seeds.contains(&format!("@{}/{}", root_base, l.name)))
+        .map(|l| l.name.clone())
         .collect();
-    let mut lake_seeds: Vec<String> = cfg.root_pkg.libs.iter().map(|l| l.name.clone()).collect();
     for exe in &cfg.root_pkg.exes {
+        if assurance.exe_names.contains(&exe.name) {
+            let exe_edited =
+                crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, &exe.root)
+                    .is_some_and(|spec| {
+                        edited.contains(
+                            &spec
+                                .src_path
+                                .canonicalize()
+                                .unwrap_or_else(|_| spec.src_path),
+                        )
+                    });
+            if !exe_edited {
+                continue;
+            }
+        }
         let exe_dag_target = format!("@{}/{}:default", root_base, exe.name);
         if !dag_seeds.contains(&exe_dag_target) {
             dag_seeds.push(exe_dag_target);
@@ -5133,11 +5178,6 @@ fn compute_project_dependent_closure_inner(
             lake_seeds.push(exe_lake_target);
         }
     }
-    let edited: HashSet<PathBuf> = edits
-        .iter()
-        .map(|e| canon_dir.join(e))
-        .map(|p| p.canonicalize().unwrap_or(p))
-        .collect();
     let mut deleted = Vec::new();
     for e in edited.iter().filter(|e| !e.exists()) {
         for r in &roots {
@@ -5164,7 +5204,7 @@ fn compute_project_dependent_closure_inner(
     } else {
         crate::module_builder::build_module_dag_with_trust(&cfg, &dag_seeds, false).ok()
     };
-    let standalone_all = discover_standalone_project_modules(
+    let mut standalone_all = discover_standalone_project_modules(
         canon_dir,
         &cfg,
         dag_opt.as_ref(),
@@ -5172,6 +5212,10 @@ fn compute_project_dependent_closure_inner(
         is_untrusted,
         strict_graph,
     )?;
+    if !is_untrusted && !assurance.mod_names.is_empty() {
+        standalone_all
+            .retain(|m, s| !assurance.mod_names.contains(m) || edited.contains(&s.src_path));
+    }
 
     if let Some(dag) = dag_opt {
         let edited_dag_modules: Vec<String> = dag
@@ -5727,17 +5771,30 @@ fn check_and_audit_standalone_modules(
         if !ld_library_path_env.is_empty() {
             env_vars.insert("LD_LIBRARY_PATH".to_string(), ld_library_path_env);
         }
+        let allowed = splitter::allowed_axioms();
+        let assurance = crate::module_builder::discover_trusted_assurance_surface(
+            canon_dir,
+            &cfg.root_pkg,
+            &allowed,
+        );
         for spec in standalone_modules {
             let src_text = fs::read_to_string(&spec.src_path)?;
             let split = splitter::split_lean_source(&src_text, &[]);
+            let canon_spec = spec
+                .src_path
+                .canonicalize()
+                .unwrap_or_else(|_| spec.src_path.clone());
+            let is_assurance = !split.hygiene.has_checking_weakening_option
+                && split.shards.is_empty()
+                && assurance.canon_paths.contains(&canon_spec);
             anyhow::ensure!(
-                !split.hygiene.has_checking_weakening,
+                !split.hygiene.has_checking_weakening || is_assurance,
                 "Soundness hygiene violation in {}: {:?}",
                 spec.src_path.display(),
-                split.hygiene.disallowed_items()
+                split.hygiene.disallowed_items_under(&allowed)
             );
             anyhow::ensure!(
-                !split.hygiene.native_violation(),
+                !split.hygiene.native_violation_under(&allowed),
                 "[TurboLean.KernelGate] native_decide/bv_decide in {} requires the base project's axiom allowlist",
                 spec.src_path.display()
             );
@@ -5809,18 +5866,21 @@ fn check_and_audit_standalone_modules(
         }
         let mod_names: Vec<String> = standalone_modules
             .iter()
+            .filter(|s| !assurance.mod_names.contains(&s.module_name))
             .map(|s| s.module_name.clone())
             .collect();
-        crate::zygote::audit_compiled_modules_with_zygote_options(
-            store,
-            &cfg,
-            &mod_names,
-            &combined_lp,
-            std::slice::from_ref(&olean_out_dir),
-            false,
-            allow_sorry,
-        )
-        .context("Standalone module `.olean` failed in-kernel soundness & replay audit")?;
+        if !mod_names.is_empty() {
+            crate::zygote::audit_compiled_modules_with_zygote_options(
+                store,
+                &cfg,
+                &mod_names,
+                &combined_lp,
+                std::slice::from_ref(&olean_out_dir),
+                false,
+                allow_sorry,
+            )
+            .context("Standalone module `.olean` failed in-kernel soundness & replay audit")?;
+        }
     }
 
     let overlay = if retain_oleans {
@@ -5905,7 +5965,26 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                 ensure_modules_and_imports_replayed(store, &dir, &clean_files, &clean_mods)?;
             }
         } else {
-            ensure_modules_and_imports_replayed(store, &dir, &rechecked_files, &rechecked_mods)?;
+            let assurance = crate::module_builder::optional_package_config(&dir)
+                .ok()
+                .flatten()
+                .map(|pkg| {
+                    let allowed = splitter::allowed_axioms();
+                    crate::module_builder::discover_trusted_assurance_surface(&dir, &pkg, &allowed)
+                })
+                .unwrap_or_default();
+            let mut replay_files = Vec::with_capacity(rechecked_files.len());
+            let mut replay_mods = Vec::with_capacity(rechecked_mods.len());
+            for (rf, rm) in rechecked_files.iter().zip(rechecked_mods.iter()) {
+                let canon_rf = rf.canonicalize().unwrap_or_else(|_| rf.clone());
+                if !assurance.canon_paths.contains(&canon_rf) && !assurance.mod_names.contains(rm) {
+                    replay_files.push(rf.clone());
+                    replay_mods.push(rm.clone());
+                }
+            }
+            if !replay_files.is_empty() {
+                ensure_modules_and_imports_replayed(store, &dir, &replay_files, &replay_mods)?;
+            }
         }
         eprintln!(
             "[turbo-lean] Lake re-checked {} modules (0: all libraries)",
@@ -5914,6 +5993,23 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
     } else if lake_inputs_changed_since_manifest(&dir) {
         if let Ok(cfg) = crate::module_builder::resolve_project_config(&dir) {
             let root_base = crate::module_builder::pkg_target_base_name(&cfg.root_pkg);
+            let allowed = splitter::allowed_axioms();
+            let assurance = crate::module_builder::discover_trusted_assurance_surface(
+                &dir,
+                &cfg.root_pkg,
+                &allowed,
+            );
+            let target_canon = file.canonicalize().unwrap_or_else(|_| file.clone());
+            let target_in_assurance = assurance
+                .canon_paths
+                .iter()
+                .any(|ap| ap == &target_canon || ap.starts_with(&target_canon));
+            let keep_root_lib = |lib: &crate::module_builder::LeanLibConfig| -> bool {
+                target_in_assurance || !assurance.lib_names.contains(&lib.name)
+            };
+            let keep_root_exe = |exe: &crate::module_builder::LeanExeConfig| -> bool {
+                target_in_assurance || !assurance.exe_names.contains(&exe.name)
+            };
             let mut input_libs: Vec<String> = Vec::new();
             let mut input_exes: Vec<String> = Vec::new();
             let mut input_exe_dag_seeds: Vec<String> = Vec::new();
@@ -5922,10 +6018,15 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                     cfg.root_pkg
                         .libs
                         .iter()
-                        .filter(|l| !l.needs.is_empty())
+                        .filter(|l| !l.needs.is_empty() && keep_root_lib(l))
                         .map(|l| l.name.clone()),
                 );
-                for e in cfg.root_pkg.exes.iter().filter(|e| !e.needs.is_empty()) {
+                for e in cfg
+                    .root_pkg
+                    .exes
+                    .iter()
+                    .filter(|e| !e.needs.is_empty() && keep_root_exe(e))
+                {
                     input_exes.push(format!("@{}/{}:exe", root_base, e.name));
                     input_exe_dag_seeds.push(format!("@{}/{}:default", root_base, e.name));
                 }
@@ -5952,8 +6053,13 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
             input_exe_dag_seeds.sort();
             input_exe_dag_seeds.dedup();
             if (!input_libs.is_empty() || !input_exes.is_empty()) && has_lake_config(&dir) {
-                let mut lib_seeds: Vec<String> =
-                    cfg.root_pkg.libs.iter().map(|l| l.name.clone()).collect();
+                let mut lib_seeds: Vec<String> = cfg
+                    .root_pkg
+                    .libs
+                    .iter()
+                    .filter(|l| keep_root_lib(l))
+                    .map(|l| l.name.clone())
+                    .collect();
                 lib_seeds.extend(input_libs.iter().cloned());
                 lib_seeds.sort();
                 lib_seeds.dedup();
@@ -5962,6 +6068,7 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                     .root_pkg
                     .libs
                     .iter()
+                    .filter(|l| keep_root_lib(l))
                     .map(|l| format!("@{}/{}", root_base, l.name))
                     .collect();
                 dag_seeds.extend(input_libs.iter().cloned());
@@ -5969,6 +6076,7 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                     cfg.root_pkg
                         .exes
                         .iter()
+                        .filter(|e| keep_root_exe(e))
                         .map(|e| format!("@{}/{}:default", root_base, e.name)),
                 );
                 dag_seeds.extend(input_exe_dag_seeds);
@@ -5979,6 +6087,7 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                     .root_pkg
                     .exes
                     .iter()
+                    .filter(|e| keep_root_exe(e))
                     .map(|e| format!("@{}/{}:exe", root_base, e.name))
                     .collect();
                 lake_exe_seeds.extend(input_exes.iter().cloned());
@@ -6035,7 +6144,15 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                             ordered_targets.push(t);
                         }
                     }
-                    closure_files = collect_project_lean_files(&dir, false, None);
+                    closure_files = collect_project_lean_files(&dir, false, None)
+                        .into_iter()
+                        .filter(|f| {
+                            target_in_assurance
+                                || !assurance
+                                    .canon_paths
+                                    .contains(&f.canonicalize().unwrap_or_else(|_| f.clone()))
+                        })
+                        .collect();
                     closure_mods = closure_files
                         .iter()
                         .filter_map(|f| f.strip_prefix(&dir).ok())
@@ -6070,7 +6187,7 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                             &clean_mods,
                         )?;
                     }
-                } else {
+                } else if !closure_files.is_empty() {
                     ensure_modules_and_imports_replayed(
                         store,
                         &dir,
@@ -6078,13 +6195,18 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                         &closure_mods,
                     )?;
                 }
-                let _ = fs::remove_file(verified_sources_manifest_path(&dir));
-                for dp in &cfg.dep_pkgs {
-                    let _ = fs::remove_file(
-                        dp.pkg_root
-                            .join(&dp.build_dir)
-                            .join(".turbo_verified_sources.json"),
-                    );
+                if allow_sorry
+                    || worktree_auto_link_disabled(&dir)
+                    || crate::module_builder::hydrate_project_traces(&dir).is_err()
+                {
+                    let _ = fs::remove_file(verified_sources_manifest_path(&dir));
+                    for dp in &cfg.dep_pkgs {
+                        let _ = fs::remove_file(
+                            dp.pkg_root
+                                .join(&dp.build_dir)
+                                .join(".turbo_verified_sources.json"),
+                        );
+                    }
                 }
             }
         }
@@ -7198,7 +7320,17 @@ pub(crate) fn lake_recheck_dependents_with_store_and_options(
                     store_root_buf.as_deref()
                 }
             };
-            let cutoff_attempted = if !allow_sorry {
+            let allowed = splitter::allowed_axioms();
+            let assurance = crate::module_builder::discover_trusted_assurance_surface(
+                canon_dir,
+                &closure.cfg.root_pkg,
+                &allowed,
+            );
+            let touches_assurance = closure
+                .edited_dag_modules
+                .iter()
+                .any(|m| assurance.mod_names.contains(m));
+            let cutoff_attempted = if !allow_sorry && !touches_assurance {
                 if let (Some(sr), Some(dag)) = (store_root, closure.dag.as_ref()) {
                     let stage1_targets =
                         lake_refresh_targets(canon_dir, &closure.edited_dag_modules);

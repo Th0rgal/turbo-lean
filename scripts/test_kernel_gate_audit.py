@@ -483,6 +483,42 @@ class KernelGateAudit(unittest.TestCase):
         self.assertFalse(bad["ok"], bad)
         self.assertTrue(any("unsafe declaration `badUnsafe`" in v for v in bad["violations"]), bad)
 
+    def test_cross_module_custom_monad_wf_recursion_accepted_under_load_exts_false(self) -> None:
+        out_dir = Path(self.env["LEAN_PATH"].split(":")[-1])
+        base_src = self.tmp / "FxMonadBase.lean"
+        caller_src = self.tmp / "FxMonadCaller.lean"
+        base_src.write_text(
+            "abbrev AuditM := Except String\n"
+            "inductive AuditStmt where\n"
+            "  | leaf (n : Nat)\n"
+            "  | seq (xs : List AuditStmt)\n"
+        )
+        caller_src.write_text(
+            "import FxMonadBase\n"
+            "def evalAuditStmt : AuditStmt → AuditM Nat\n"
+            "  | .leaf n => pure n\n"
+            "  | .seq xs => do\n"
+            "      let mut acc := 0\n"
+            "      for x in xs do\n"
+            "        acc := acc + (← evalAuditStmt x)\n"
+            "      pure acc\n"
+            "termination_by s => sizeOf s\n"
+            "decreasing_by\n"
+            "  simp_wf\n"
+            "  have h := List.sizeOf_lt_of_mem ‹x ∈ xs›\n"
+            "  omega\n"
+        )
+        subprocess.run(
+            ["lean", "-o", str(out_dir / "FxMonadBase.olean"), str(base_src)],
+            cwd=self.tmp, env=self.env, check=True, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["lean", "-o", str(out_dir / "FxMonadCaller.olean"), str(caller_src)],
+            cwd=self.tmp, env=self.env, check=True, capture_output=True, text=True,
+        )
+        r = self.audit("FxMonadBase", "FxMonadCaller")
+        self.assertTrue(r["ok"], r)
+
 
 if __name__ == "__main__":
     unittest.main()
