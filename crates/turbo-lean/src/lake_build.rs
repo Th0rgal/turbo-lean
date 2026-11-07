@@ -588,9 +588,11 @@ pub(crate) fn resolve_lake_env(
         return Ok((cached, true));
     }
 
-    let shm_env_path = store
-        .fast_staging_dir()
-        .join(format!("lake_env_v1_{}.json", project_key));
+    let shm_env_path = store.fast_staging_dir().join(format!(
+        "lake_env_v2_{}_{}.json",
+        crate::build_epoch_short(),
+        project_key
+    ));
     if let Ok(bytes) = fs::read(&shm_env_path) {
         if let Ok(mut env_map) = serde_json::from_slice::<HashMap<String, String>>(&bytes) {
             if !env_map.is_empty() {
@@ -624,9 +626,11 @@ pub(crate) fn resolve_or_share_lake_env(
         merge_caller_lean_path(&mut m);
         return Ok(Some((m, false)));
     }
-    let shm_env_path = store
-        .fast_staging_dir()
-        .join(format!("lake_env_v1_{}.json", env_key));
+    let shm_env_path = store.fast_staging_dir().join(format!(
+        "lake_env_v2_{}_{}.json",
+        crate::build_epoch_short(),
+        env_key
+    ));
     if let Ok(bytes) = fs::read(&shm_env_path) {
         if let Ok(mut env_map) = serde_json::from_slice::<HashMap<String, String>>(&bytes) {
             if !env_map.is_empty() {
@@ -778,7 +782,9 @@ pub(crate) fn compute_shard_key_with_args(
     // v8: replay-audited verdicts + 3-byte `/--` and `/-!` docstring/module-doc opener fix.
     // The verifier provenance versions are bound too, so pre-replay receipts never match
     // and any later scanner/replay bump retires every older receipt.
-    key_hasher.update(b"theorem-shard-v8:");
+    key_hasher.update(b"theorem-shard-v9:");
+    key_hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+    key_hasher.update(b":");
     key_hasher.update(&crate::zygote::ZYGOTE_SCANNER_VERSION.to_le_bytes());
     key_hasher.update(&crate::zygote::ZYGOTE_REPLAY_VERSION.to_le_bytes());
     key_hasher.update(toolchain.as_bytes());
@@ -951,6 +957,8 @@ struct ShmSingleOleanDigestEntry {
     sample_key: [u8; 32],
     digest: String,
     deps: Vec<String>,
+    #[serde(default)]
+    epoch: String,
 }
 
 fn shm_single_olean_cache_file_name(olean_path: &Path) -> String {
@@ -1070,7 +1078,10 @@ pub(crate) fn compute_single_olean_digest_and_imports_with_stats(
                 crate::shm_cache::read_verified_private_shm_file("olean_iface_v2", shm_file_name)
             {
                 if let Ok(entry) = serde_json::from_slice::<ShmSingleOleanDigestEntry>(&shm_bytes) {
-                    if entry.stats == cur_stats && entry.sample_key == sample_key {
+                    if entry.epoch == crate::TURBO_LEAN_BUILD_EPOCH
+                        && entry.stats == cur_stats
+                        && entry.sample_key == sample_key
+                    {
                         if let Ok(mut g) = memo.lock() {
                             if crate::module_builder::current_memo_window() == window {
                                 if g.len() >= 65536 {
@@ -1160,6 +1171,7 @@ pub(crate) fn compute_single_olean_digest_and_imports_with_stats(
                     sample_key: post_sample,
                     digest: dig.clone(),
                     deps: olean_deps.clone(),
+                    epoch: crate::TURBO_LEAN_BUILD_EPOCH.to_string(),
                 };
                 if let Ok(shm_bytes) = serde_json::to_vec(&shm_entry) {
                     let _ = crate::shm_cache::write_verified_private_shm_file(
@@ -1968,7 +1980,9 @@ pub(crate) fn compute_single_stat_hash(pk: &str, ms: i64, mn: i64, sz: i64) -> S
     // v10 includes checking-weakening hygiene fields in cached file splits.
     // v11 invalidates splits computed before 3-byte `/--`/`/-!` docstring & raw/interp lexing fixes.
     // v12-v15 include nested `/--` inside outer block comments/literals fix and retroactive attribute_targets.
-    h.update(b"single-stat-split:v15\n");
+    h.update(b"single-stat-split:v16\n");
+    h.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+    h.update(b"\n");
     h.update(pk.as_bytes());
     h.update(b":");
     h.update(&ms.to_le_bytes());
@@ -1994,7 +2008,9 @@ pub(crate) fn compact_split_for_shm_cache(split: &splitter::SplitResult) -> spli
 
 pub(crate) fn compute_stat_slice_hash(stats: &[(String, i64, i64, i64)]) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(b"project-stat-splits:v13\n");
+    h.update(b"project-stat-splits:v14\n");
+    h.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+    h.update(b"\n");
     for (pk, ms, mn, sz) in stats {
         h.update(pk.as_bytes());
         h.update(b":");
@@ -2030,7 +2046,9 @@ pub(crate) fn load_project_stat_summary_cached(
 
     let summary_path = if paths.len() <= 2048 && valid_stats.len() == paths.len() {
         let mut key_h = blake3::Hasher::new();
-        key_h.update(b"project-stat-summary-v5\n");
+        key_h.update(b"project-stat-summary-v6\n");
+        key_h.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+        key_h.update(b"\n");
         key_h.update(compute_stat_slice_hash(&valid_stats).as_bytes());
         key_h.update(b"\n");
         if let Some(ref tag) = lake_inputs_tag {
@@ -2153,7 +2171,9 @@ pub(crate) fn compute_project_interface_key_fast_summary(
     // outputs predate the replay. The provenance versions retire outputs across later bumps.
     // v7: bind canonical workspace Lake config digest, global C-emission flags, custom CC env,
     // and full native/package `.lake/build` outputs.
-    hasher.update(b"turbo-lean-build-v7\n");
+    hasher.update(b"turbo-lean-build-v8\n");
+    hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+    hasher.update(b"\n");
 
     hasher.update(&crate::zygote::ZYGOTE_SCANNER_VERSION.to_le_bytes());
     hasher.update(&crate::zygote::ZYGOTE_REPLAY_VERSION.to_le_bytes());
@@ -2549,7 +2569,9 @@ pub(crate) fn split_and_audit_with_hashes_cached(
 
     let shm_proj_path = if files.len() <= 128 {
         let mut ch = blake3::Hasher::new();
-        ch.update(b"project-content-splits:v12\n");
+        ch.update(b"project-content-splits:v13\n");
+        ch.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+        ch.update(b"\n");
         for (_, fk) in &file_keys {
             ch.update(fk.as_bytes());
             ch.update(b"\n");
@@ -3059,8 +3081,23 @@ pub(crate) fn are_all_project_oleans_replayed_in_store(
         }
         let olean_path = resolve_project_olean_for_rel_path(canon_dir, rel_path);
         if olean_path.is_file() {
-            if !replay_batch.is_replayed_in_store(store, &cfg, &lean_path, &olean_path) {
-                return false;
+            match infer_module_name_from_olean_path(&cfg, &olean_path) {
+                Some((mod_name, true)) => {
+                    if !replay_batch.is_audited_in_store(
+                        store,
+                        &cfg,
+                        &lean_path,
+                        &mod_name,
+                        &olean_path,
+                    ) {
+                        return false;
+                    }
+                }
+                _ => {
+                    if !replay_batch.is_replayed_in_store(store, &cfg, &lean_path, &olean_path) {
+                        return false;
+                    }
+                }
             }
             if let Ok((imps, _)) =
                 crate::module_builder::read_olean_binary_imports_cached(&olean_path)
@@ -3069,6 +3106,7 @@ pub(crate) fn are_all_project_oleans_replayed_in_store(
             }
         }
     }
+    let allowed_axioms = crate::splitter::allowed_axioms();
     let mut seen = HashSet::new();
     while let Some(m) = worklist.pop() {
         if !seen.insert(m.clone()) {
@@ -3084,8 +3122,28 @@ pub(crate) fn are_all_project_oleans_replayed_in_store(
         ) {
             continue;
         }
-        if !replay_batch.is_replayed_in_store(store, &cfg, &lean_path, &path) {
-            return false;
+        if crate::module_builder::is_root_project_olean_path(&cfg, &path) {
+            if !replay_batch.is_audited_in_store(store, &cfg, &lean_path, &m, &path) {
+                return false;
+            }
+        } else {
+            let Ok(needs_audit) =
+                crate::module_builder::verify_imported_package_module_source_hygiene(
+                    &cfg,
+                    &m,
+                    &path,
+                    &allowed_axioms,
+                )
+            else {
+                return false;
+            };
+            if needs_audit {
+                if !replay_batch.is_audited_in_store(store, &cfg, &lean_path, &m, &path) {
+                    return false;
+                }
+            } else if !replay_batch.is_replayed_in_store(store, &cfg, &lean_path, &path) {
+                return false;
+            }
         }
         let Ok((imps, _)) = crate::module_builder::read_olean_binary_imports_cached(&path) else {
             return false;
@@ -4828,14 +4886,26 @@ pub(crate) fn has_lake_config(canon_dir: &Path) -> bool {
 /// theorem proof bodies (proof irrelevance makes those invisible to other declarations). Files
 /// new since `rev` are not local. Outside a git repository nothing is reported.
 pub(crate) fn nonlocal_edits(files: &[PathBuf], rev: &str) -> Vec<String> {
+    let has_git_ancestor_or_env = |dir: &Path| {
+        if std::env::var_os("GIT_DIR").is_some() || std::env::var_os("GIT_WORK_TREE").is_some() {
+            return true;
+        }
+        let canon = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        canon
+            .ancestors()
+            .any(|a| fs::symlink_metadata(a.join(".git")).is_ok())
+    };
     let is_nonlocal = |f: &PathBuf| {
         let Ok(cur) = fs::read_to_string(f) else {
             return false;
         };
         let name = f.file_name().unwrap_or_default().to_string_lossy();
         let parent = f.parent().unwrap_or(Path::new("."));
+        if !has_git_ancestor_or_env(parent) {
+            return false;
+        }
         let Ok(mut git) = crate::trusted_tools::git(parent) else {
-            return true; // A missing trusted Git must invalidate reuse.
+            return true; // A missing trusted Git inside a repository must invalidate reuse.
         };
         let base = git
             .arg("-C")
@@ -8515,7 +8585,9 @@ fn stage_build_candidates(
     candidates.dedup_by(|a, b| a.2 == b.2);
 
     let mut sh = blake3::Hasher::new();
-    sh.update(b"lake-build-ingest:v2\n");
+    sh.update(b"lake-build-ingest:v3\n");
+    sh.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+    sh.update(b"\n");
     for (_, kind, rel_path, ms, mn, sz, mode, _) in &candidates {
         sh.update(rel_path.as_bytes());
         sh.update(b":");
@@ -11357,7 +11429,14 @@ public theorem downstream_c (n : Nat) : n + 0 = n := downstream_b n
         fs::write(proj.join("Smoke/B.lean"), b_src)?;
         fs::write(proj.join("Smoke/C.lean"), c_src)?;
 
-        let git_bin = std::env::var("TURBO_LEAN_GIT").unwrap_or_else(|_| "git".to_string());
+        let Some(git_bin) = crate::trusted_tools::discover_or_skip_trusted_git_for_test(&proj)?
+        else {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Ok(());
+        };
+        if std::env::var_os("TURBO_LEAN_GIT").is_none() {
+            std::env::set_var("TURBO_LEAN_GIT", &git_bin);
+        }
         let run_git = |args: &[&str]| -> Result<()> {
             let st = Command::new(&git_bin)
                 .current_dir(&proj)
@@ -13539,7 +13618,14 @@ public def api := by
             "module\npublic import Smoke.A\npublic theorem b_thm : 1 + 1 = 2 := a_thm\n",
         )?;
 
-        let git_bin = std::env::var("TURBO_LEAN_GIT").unwrap_or_else(|_| "git".to_string());
+        let Some(git_bin) = crate::trusted_tools::discover_or_skip_trusted_git_for_test(&proj)?
+        else {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Ok(());
+        };
+        if std::env::var_os("TURBO_LEAN_GIT").is_none() {
+            std::env::set_var("TURBO_LEAN_GIT", &git_bin);
+        }
         let run_git = |args: &[&str]| -> Result<()> {
             let st = Command::new(&git_bin)
                 .current_dir(&proj)

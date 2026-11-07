@@ -822,10 +822,19 @@ pub fn serve_cas_http_with_auth(
                             }
                         }
                         Err(e) => {
+                            let msg = e.to_string();
+                            let status = if msg.contains("precomputed_bin_key")
+                                || msg.contains("local_path")
+                                || msg.contains("Invalid filename")
+                            {
+                                400
+                            } else {
+                                500
+                            };
                             let _ = write_json_response(
                                 &mut stream,
-                                500,
-                                &serde_json::json!({"status": "error", "error": e.to_string()}),
+                                status,
+                                &serde_json::json!({"status": "error", "ok": false, "error": msg}),
                             );
                         }
                     }
@@ -1553,7 +1562,9 @@ fn hash_framed_slice(h: &mut blake3::Hasher, items: &[String]) {
 fn context_bound_http_key(key: &str, ctx: &HttpShardReceiptContext) -> String {
     let base = server_receipt_key(key);
     let mut h = blake3::Hasher::new();
-    h.update(b"http-shard-context-v9:");
+    h.update(b"http-shard-context-v10:");
+    h.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+    h.update(b":");
     h.update(&crate::zygote::ZYGOTE_SCANNER_VERSION.to_le_bytes());
     h.update(&crate::zygote::ZYGOTE_REPLAY_VERSION.to_le_bytes());
     hash_framed_str(&mut h, &base);
@@ -2484,17 +2495,19 @@ fn execute_fastcheck_payload_deferred(
 
     if is_cu {
         fs::create_dir_all(&staging)?;
-        let bin_key = if !req.precomputed_bin_key.is_empty() {
-            req.precomputed_bin_key.clone()
-        } else {
-            compute_fastcheck_binary_key(true, &req.source)
-        };
+        let expected_bin_key = compute_fastcheck_binary_key(true, &req.source);
+        if !req.precomputed_bin_key.is_empty() && req.precomputed_bin_key != expected_bin_key {
+            anyhow::bail!("precomputed_bin_key mismatch against server-computed CUDA source key");
+        }
+        let bin_key = expected_bin_key;
         validate_precomputed_bin_key(&bin_key)?;
         let cached_bin = canon_bin_dir.join(&bin_key);
         if cached_bin.parent() != Some(canon_bin_dir.as_path()) {
             anyhow::bail!("cached_bin path escaped fastcheck_bins");
         }
-        let compile_cache_hit = cached_bin.exists();
+        let compile_cache_hit = fs::symlink_metadata(&cached_bin)
+            .map(|m| m.file_type().is_file())
+            .unwrap_or(false);
 
         if !compile_cache_hit {
             let nvcc_bin = if Path::new("/usr/local/cuda/bin/nvcc").exists() {
@@ -2502,11 +2515,17 @@ fn execute_fastcheck_payload_deferred(
             } else {
                 "nvcc"
             };
-            let tmp_cu = staging.join(format!("http_fc_{}_{}.cu", pid, ts));
-            let tmp_bin = staging.join(format!("http_fc_{}_{}.bin", pid, ts));
-            fs::write(&tmp_cu, &req.source)?;
+            let tmp_cu = crate::shm_cache::StagedTempFile::write(
+                staging.join(format!("http_fc_{}_{}.cu", pid, ts)),
+                &req.source,
+            )?;
+            let tmp_bin = crate::shm_cache::StagedTempFile::reserve(
+                staging.join(format!("http_fc_{}_{}.bin", pid, ts)),
+            )?;
 
-            let compile_out = Command::new(nvcc_bin)
+            let mut nvcc_cmd = Command::new(nvcc_bin);
+            crate::module_builder::scrub_untrusted_env(&mut nvcc_cmd);
+            let compile_out = nvcc_cmd
                 .arg("-O3")
                 .arg("-arch=native")
                 .arg(&tmp_cu)
@@ -2515,20 +2534,26 @@ fn execute_fastcheck_payload_deferred(
                 .arg(&tmp_bin)
                 .output()
                 .with_context(|| format!("Failed to execute `{}`", nvcc_bin))?;
-            let _ = fs::remove_file(&tmp_cu);
+            drop(tmp_cu);
             if !compile_out.status.success() {
                 let stderr = String::from_utf8_lossy(&compile_out.stderr);
                 let stdout = String::from_utf8_lossy(&compile_out.stdout);
                 anyhow::bail!("`nvcc -O3` failed:\n{}\n{}", stdout, stderr);
             }
             if fs::rename(&tmp_bin, &cached_bin).is_err() {
-                fs::copy(&tmp_bin, &cached_bin)?;
-                let _ = fs::remove_file(&tmp_bin);
+                let tmp_dest = crate::shm_cache::StagedTempFile::reserve(
+                    canon_bin_dir.join(format!("http_fc_{}_{}.dest.tmp", pid, ts)),
+                )?;
+                fs::copy(&tmp_bin, &tmp_dest)?;
+                fs::rename(&tmp_dest, &cached_bin)?;
             }
+            drop(tmp_bin);
         }
 
         let run_t0 = std::time::Instant::now();
-        let out = Command::new(&cached_bin)
+        let mut run_cmd = Command::new(&cached_bin);
+        crate::module_builder::scrub_untrusted_env(&mut run_cmd);
+        let out = run_cmd
             .env("CUDA_MODULE_LOADING", "LAZY")
             .output()
             .context("Failed to execute compiled CUDA fast-check binary")?;
@@ -2554,19 +2579,23 @@ fn execute_fastcheck_payload_deferred(
         let has_main = req
             .has_main
             .unwrap_or_else(|| req.source.contains("def main"));
-        let bin_key = if !req.precomputed_bin_key.is_empty() {
-            req.precomputed_bin_key.clone()
-        } else if has_main {
+        let expected_bin_key = if has_main {
             compute_fastcheck_binary_key(false, &req.source)
         } else {
             compute_fastcheck_binary_key_parts(false, &req.source, FASTCHECK_NO_MAIN_SUFFIX)
         };
+        if !req.precomputed_bin_key.is_empty() && req.precomputed_bin_key != expected_bin_key {
+            anyhow::bail!("precomputed_bin_key mismatch against server-computed Lean source key");
+        }
+        let bin_key = expected_bin_key;
         validate_precomputed_bin_key(&bin_key)?;
         let cached_bin = canon_bin_dir.join(&bin_key);
         if cached_bin.parent() != Some(canon_bin_dir.as_path()) {
             anyhow::bail!("cached_bin path escaped fastcheck_bins");
         }
-        let compile_cache_hit = cached_bin.exists();
+        let compile_cache_hit = fs::symlink_metadata(&cached_bin)
+            .map(|m| m.file_type().is_file())
+            .unwrap_or(false);
         let mut deferred_pop = None;
 
         if !compile_cache_hit {
@@ -2641,7 +2670,9 @@ fn execute_fastcheck_payload_deferred(
                 let mut out1_ok = false;
                 if let Some(ref fast_src) = cgen_fast_src {
                     tmp_lean.overwrite(fast_src.as_bytes())?;
-                    if let Ok(o) = Command::new(&lean_bin)
+                    let mut c1 = Command::new(&lean_bin);
+                    crate::module_builder::scrub_untrusted_env(&mut c1);
+                    if let Ok(o) = c1
                         .arg(format!("--root={}", staging.display()))
                         .arg("-c")
                         .arg(&tmp_c)
@@ -2655,7 +2686,9 @@ fn execute_fastcheck_payload_deferred(
                 }
                 if !out1_ok {
                     tmp_lean.overwrite(src_text.as_bytes())?;
-                    let out1 = Command::new(&lean_bin)
+                    let mut c1 = Command::new(&lean_bin);
+                    crate::module_builder::scrub_untrusted_env(&mut c1);
+                    let out1 = c1
                         .arg(format!("--root={}", staging.display()))
                         .arg("-c")
                         .arg(&tmp_c)
@@ -3965,6 +3998,25 @@ mod bind_auth_tests {
             format!("{err:#}").contains("kernel statement type mismatch"),
             "unexpected error: {err:#}"
         );
+
+        // `/fast-check` rejects mismatched `precomputed_bin_key` fail-closed.
+        let bad_fc = crate::pack::FastCheckHttpRequest {
+            filename: "probe.c".to_string(),
+            source: "int main(void) { return 0; }\n".to_string(),
+            gpu: false,
+            precomputed_bin_key: "forged_bin_key_deadbeef".to_string(),
+            has_main: Some(true),
+            local_path: String::new(),
+        };
+        let fc_err = match execute_fastcheck_payload_deferred(&store, &bad_fc) {
+            Ok(_) => panic!("mismatched precomputed_bin_key must fail closed"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{fc_err:#}").contains("precomputed_bin_key mismatch"),
+            "unexpected fastcheck error: {fc_err:#}"
+        );
+
         let _ = fs::remove_dir_all(dir);
         Ok(())
     }

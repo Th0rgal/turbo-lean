@@ -2909,6 +2909,7 @@ pub fn compile_fastcheck_c_to_bin(
         let tc_lib_lean = tc_root.join("lib").join("lean");
         if clang_bin.exists() && tc_lib_lean.exists() {
             let mut cmd = Command::new(&clang_bin);
+            crate::module_builder::scrub_untrusted_env(&mut cmd);
             cmd.arg("-O1")
                 .arg("-DNDEBUG")
                 .arg(format!("-I{}", tc_root.join("include").display()))
@@ -2941,6 +2942,7 @@ pub fn compile_fastcheck_c_to_bin(
     }
 
     let mut link_cmd = Command::new(leanc_bin);
+    crate::module_builder::scrub_untrusted_env(&mut link_cmd);
     link_cmd
         .arg("-O3")
         .arg(tmp_c)
@@ -2963,7 +2965,9 @@ pub fn compile_fastcheck_c_to_bin(
     if out2.status.success() {
         return Ok(out2);
     }
-    Command::new(leanc_bin)
+    let mut fallback_cmd = Command::new(leanc_bin);
+    crate::module_builder::scrub_untrusted_env(&mut fallback_cmd);
+    fallback_cmd
         .arg("-O3")
         .arg(tmp_c)
         .arg("-o")
@@ -2982,7 +2986,9 @@ pub fn compute_fastcheck_binary_key(is_cu: bool, effective_source: &str) -> Stri
 
 pub fn compute_fastcheck_binary_key_parts(is_cu: bool, src_text: &str, suffix: &str) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"fastcheck-bin:v2:absolute-tools:");
+    hasher.update(b"fastcheck-bin:v3:absolute-tools:");
+    hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+    hasher.update(b":");
     hasher.update(std::env::consts::ARCH.as_bytes());
     hasher.update(if is_cu { b":cuda:" } else { b":lean_c_o3:" });
     hasher.update(src_text.as_bytes());
@@ -3088,7 +3094,9 @@ pub(crate) fn ensure_shared_fastcheck_out(shared_bin: &Path) {
     }
     let mut attempt = 0;
     let out = loop {
-        match Command::new(shared_bin).output() {
+        let mut cmd = Command::new(shared_bin);
+        crate::module_builder::scrub_untrusted_env(&mut cmd);
+        match cmd.output() {
             Ok(o) => break o,
             Err(e) if e.raw_os_error() == Some(26) && attempt < 10 => {
                 attempt += 1;
@@ -3124,7 +3132,9 @@ pub fn run_or_read_cached_fastcheck_bin(cached_bin: &Path) -> Result<(bool, Stri
     let out = {
         let mut attempt = 0;
         loop {
-            match Command::new(cached_bin).output() {
+            let mut cmd = Command::new(cached_bin);
+            crate::module_builder::scrub_untrusted_env(&mut cmd);
+            match cmd.output() {
                 Ok(o) => break o,
                 Err(e) if e.raw_os_error() == Some(26) && attempt < 10 => {
                     attempt += 1;

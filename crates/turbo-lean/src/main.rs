@@ -43,6 +43,15 @@ pub use gpu_fastcheck::*;
 pub use lake_build::*;
 pub use pr_verify::*;
 
+/// Deterministic BLAKE3 digest of all Rust sources, Lean specs/workers, and compiled C-ABI inputs
+/// baked at build time by `crates/turbo-lean/build.rs`.
+pub const TURBO_LEAN_BUILD_EPOCH: &str = env!("TURBO_LEAN_BUILD_EPOCH");
+
+/// Fixed-width 16-hex prefix of [`TURBO_LEAN_BUILD_EPOCH`] for compact `/dev/shm` and filename tags.
+pub fn build_epoch_short() -> &'static str {
+    &TURBO_LEAN_BUILD_EPOCH[..16]
+}
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use db::TurboStore;

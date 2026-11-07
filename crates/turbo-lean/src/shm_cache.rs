@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Schema version for `/dev/shm` project stat summaries, split caches, and daemon state files.
-pub const SHM_CACHE_SCHEMA_VERSION: u32 = 1;
+pub const SHM_CACHE_SCHEMA_VERSION: u32 = 2;
 
 /// Default `/dev/shm` cache quota in MiB when `TURBO_LEAN_MAX_SHM_MB` is unset.
 pub const DEFAULT_MAX_SHM_MB: u64 = 512;
@@ -43,7 +43,11 @@ pub fn staging_shm_dir() -> PathBuf {
     } else {
         std::env::temp_dir()
     };
-    base.join(format!("turbo-lean-staging-{}", uid))
+    base.join(format!(
+        "turbo-lean-staging-{}-{}",
+        uid,
+        crate::build_epoch_short()
+    ))
 }
 
 /// Persistent per-user cache root for the store.
@@ -1795,7 +1799,10 @@ mod tests {
 
         let manifest_path = project.join(".lake/build/.turbo_verified_manifest.json");
         super::atomic_write_shm(&manifest_path, b"{\"ok\":true}")?;
-        assert_eq!(fs::read(sticky_build.join(".turbo_verified_manifest.json"))?, b"{\"ok\":true}");
+        assert_eq!(
+            fs::read(sticky_build.join(".turbo_verified_manifest.json"))?,
+            b"{\"ok\":true}"
+        );
 
         // Leaf lockfile symlinks inside symlinked `.lake/build` still fail closed via O_NOFOLLOW.
         let planted_lock = project.join(".lake/build/.turbo_publish.lock");
@@ -2780,6 +2787,79 @@ mod tests {
         ));
         #[cfg(test)]
         crate::zygote::digest_test_hooks::clear();
+        match prev_staging {
+            Some(v) => std::env::set_var("TURBO_LEAN_STAGING_DIR", v),
+            None => std::env::remove_var("TURBO_LEAN_STAGING_DIR"),
+        }
+        let _ = fs::remove_dir_all(&root);
+        match run_res {
+            Ok(r) => r,
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    }
+
+    #[test]
+    fn test_shm_schema_v2_and_epoch_mismatch_rejected() -> anyhow::Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(SHM_CACHE_SCHEMA_VERSION, 2);
+        let prev_staging = std::env::var_os("TURBO_LEAN_STAGING_DIR");
+        std::env::remove_var("TURBO_LEAN_STAGING_DIR");
+        let default_dir = staging_shm_dir();
+        if let Some(ref v) = prev_staging {
+            std::env::set_var("TURBO_LEAN_STAGING_DIR", v);
+        }
+        assert!(default_dir
+            .to_string_lossy()
+            .ends_with(&format!("-{}", crate::build_epoch_short())));
+
+        let root = std::env::temp_dir().join(format!(
+            "turbo_lean_shm_epoch_mismatch_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let staging = root.join("staging");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root)?;
+        std::env::set_var("TURBO_LEAN_STAGING_DIR", &staging);
+
+        let run_res =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> anyhow::Result<()> {
+                let lean_src = root.join("EpochMod.lean");
+                fs::write(&lean_src, "theorem forged_epoch : False := sorry\n")?;
+                std::thread::sleep(std::time::Duration::from_millis(2200));
+                crate::module_builder::reset_lake_inputs_tag_memo();
+                let clean = crate::module_builder::load_source_hygiene_cached(&lean_src)?;
+                assert!(!clean.is_clean_for_certification());
+
+                let sh_key = &blake3::hash(lean_src.to_string_lossy().as_bytes())
+                    .to_hex()
+                    .to_string()[..28];
+                let sh_file = format!("sh_{sh_key}.json");
+                let raw = read_verified_private_shm_file("src_hygiene_v2", &sh_file)
+                    .expect("legitimate shm hygiene entry");
+                let mut val: serde_json::Value = serde_json::from_slice(&raw)?;
+                assert_eq!(
+                    val.get("epoch").and_then(|v| v.as_str()),
+                    Some(crate::TURBO_LEAN_BUILD_EPOCH)
+                );
+                // Forge a clean hygiene report under a mismatched epoch; load must reject it and re-scan source.
+                val["epoch"] = serde_json::Value::String("0".repeat(64));
+                val["hygiene"]["sorry_count"] = serde_json::json!(0);
+                write_verified_private_shm_file(
+                    "src_hygiene_v2",
+                    &sh_file,
+                    &serde_json::to_vec(&val)?,
+                )?;
+                crate::module_builder::reset_lake_inputs_tag_memo();
+                let rescan = crate::module_builder::load_source_hygiene_cached(&lean_src)?;
+                assert!(
+                    !rescan.is_clean_for_certification(),
+                    "mismatched SHM epoch must be rejected and trigger fresh source scan"
+                );
+                Ok(())
+            }));
         match prev_staging {
             Some(v) => std::env::set_var("TURBO_LEAN_STAGING_DIR", v),
             None => std::env::remove_var("TURBO_LEAN_STAGING_DIR"),
