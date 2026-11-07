@@ -5961,7 +5961,14 @@ fn seed_trusted_statement_dependencies(
                     let clone_repo = scratch.0.join("repo.git");
                     let out = crate::trusted_tools::git(project)?
                         .env("GIT_ALLOW_PROTOCOL", "file")
-                        .args(["clone", "--local", "--bare", "--quiet", "--no-hardlinks", "--template="])
+                        .args([
+                            "clone",
+                            "--local",
+                            "--bare",
+                            "--quiet",
+                            "--no-hardlinks",
+                            "--template=",
+                        ])
                         .arg("--")
                         .arg(&source)
                         .arg(&clone_repo)
@@ -5986,7 +5993,10 @@ fn seed_trusted_statement_dependencies(
                         None,
                     )?;
                     let build_in_target = target.join(&dep.build_dir);
-                    if build_in_target.starts_with(&target) && build_in_target != target && build_in_target.exists() {
+                    if build_in_target.starts_with(&target)
+                        && build_in_target != target
+                        && build_in_target.exists()
+                    {
                         if build_in_target.is_dir() {
                             fs::remove_dir_all(&build_in_target)?;
                         } else {
@@ -8666,7 +8676,11 @@ fn compare_kernel_statements(
         .collect()
 }
 
-fn pr_verify_file_worker_jobs(is_untrusted: bool, available_cpus: usize, files_len: usize) -> usize {
+fn pr_verify_file_worker_jobs(
+    is_untrusted: bool,
+    available_cpus: usize,
+    files_len: usize,
+) -> usize {
     let base = available_cpus.max(1);
     let capped = if is_untrusted { base.min(2) } else { base };
     capped.min(files_len.max(1))
@@ -8949,6 +8963,7 @@ pub fn run_pr_verify_command(
         let mut attested_file_shards = Vec::with_capacity(file_shards.len());
         for ((k, shard, fast_ok), att) in file_shards.into_iter().zip(attested) {
             all_edited_keys.push(k.clone());
+            all_edited_keys.push(pack::client_attested_receipt_key(&k));
             attested_file_shards.push((k, shard, fast_ok, att.kernel_type_hash));
         }
         attested_shards_by_file.push((rel_path, attested_file_shards));
@@ -8975,15 +8990,29 @@ pub fn run_pr_verify_command(
         let mut uncached = Vec::new();
         let mut can_fast_olean = !is_untrusted && strictly_clean;
         for (k, sh, fast_ok, kth) in file_shards {
-            if strictly_clean
-                && cached_set.contains(&k)
-                && store.has_attested_decl_receipt(&k, &trust_domain, sh.decl_name(), &kth)
-            {
+            let client_att_k = pack::client_attested_receipt_key(&k);
+            let raw_present = cached_set.contains(&k);
+            let client_att_present = cached_set.contains(&client_att_k);
+            let raw_attested = strictly_clean
+                && raw_present
+                && store.has_attested_decl_receipt(&k, &trust_domain, sh.decl_name(), &kth);
+            let client_attested = strictly_clean
+                && client_att_present
+                && store.has_attested_decl_receipt(
+                    &client_att_k,
+                    &trust_domain,
+                    sh.decl_name(),
+                    &kth,
+                );
+            if raw_present && !raw_attested {
+                store.invalidate_action_for_reattestation(&k)?;
+            }
+            if client_att_present && !client_attested {
+                store.invalidate_action_for_reattestation(&client_att_k)?;
+            }
+            if raw_attested || client_attested {
                 shard_cache_hits += 1;
             } else {
-                if cached_set.contains(&k) {
-                    store.invalidate_action_for_reattestation(&k)?;
-                }
                 if !fast_ok {
                     can_fast_olean = false;
                 }
@@ -18138,7 +18167,10 @@ end ParityNs
             let dep_in_pkgs = app_proj.join(".lake/packages/dep");
             fs::create_dir_all(&dep_origin)?;
             fs::create_dir_all(&app_proj)?;
-            fs::write(dep_origin.join("lean-toolchain"), "leanprover/lean4:v4.31.0\n")?;
+            fs::write(
+                dep_origin.join("lean-toolchain"),
+                "leanprover/lean4:v4.31.0\n",
+            )?;
             fs::write(
                 dep_origin.join("lakefile.toml"),
                 "name = \"dep\"\ndefaultTargets = [\"Dep\"]\n[[lean_lib]]\nname = \"Dep\"\nroots = [\"Dep\"]\n",
@@ -18179,7 +18211,10 @@ end ParityNs
                 .status()?;
             anyhow::ensure!(clone_st.success(), "clone dep_origin failed");
 
-            fs::write(app_proj.join("lean-toolchain"), "leanprover/lean4:v4.31.0\n")?;
+            fs::write(
+                app_proj.join("lean-toolchain"),
+                "leanprover/lean4:v4.31.0\n",
+            )?;
             fs::write(
                 app_proj.join("lakefile.toml"),
                 format!(
@@ -18211,7 +18246,8 @@ end ParityNs
             fs::write(app_proj.join("App.lean"), "prelude\nimport Dep\n")?;
 
             crate::module_builder::reset_lake_inputs_tag_memo();
-            let cfg_clean = crate::module_builder::resolve_project_config_with_trust(&app_proj, false)?;
+            let cfg_clean =
+                crate::module_builder::resolve_project_config_with_trust(&app_proj, false)?;
             let dep_cfg = cfg_clean
                 .dep_pkgs
                 .iter()

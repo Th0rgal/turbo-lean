@@ -1282,14 +1282,6 @@ fn prepare_stateless_remote_file(
     )))
 }
 
-fn rollback_inflight(store_opt: &Option<TurboStore>, inflight_tx_open: bool) {
-    if inflight_tx_open {
-        if let Some(ref st) = store_opt {
-            st.rollback_inflight_publish();
-        }
-    }
-}
-
 fn stateless_imports_replayed_in_store(
     ro_store: &TurboStore,
     canon_dir: &Path,
@@ -1426,8 +1418,9 @@ pub fn try_stateless_remote_check(
         .zip(&attested)
         .map(|(s, att)| (s.decl_name().to_string(), att.kernel_type_hash.clone()))
         .collect();
-    let file_lean_args =
-        crate::module_builder::try_resolve_lean_args_for_path(&canon_dir, Some(&canon_file))?;
+    let file_lean_args = crate::module_builder::validate_effective_lean_args(
+        &crate::module_builder::try_resolve_lean_args_for_path(&canon_dir, Some(&canon_file))?,
+    )?;
     let req_items: Vec<pack::CheckShardBatchItem> = split
         .shards
         .iter()
@@ -1452,63 +1445,11 @@ pub fn try_stateless_remote_check(
         lean_args: file_lean_args,
     })?;
 
-    let mut store_opt: Option<TurboStore> = None;
-    let mut inflight_tx_open = false;
-    let mut publish_items = Vec::new();
-    let resp_bytes = match pack::http_request_with_inflight(
-        "POST",
-        &endpoint,
-        "application/json",
-        &req_body,
-        || {
-            if let Ok(st) = TurboStore::open(Some(cache_root)) {
-                let now = db::now_unix();
-                publish_items.reserve(req_items.len());
-                for item in &req_items {
-                    let clean_decl = item
-                        .decl_name
-                        .strip_prefix("_root_.")
-                        .unwrap_or(&item.decl_name);
-                    if let Ok(r_bytes) = make_attested_shard_receipt_bytes(
-                        clean_decl,
-                        &item.prefix_env_hash,
-                        &item.stmt_hash,
-                        &item.proof_hash,
-                        now,
-                        item.expected_kernel_type_hash.as_deref(),
-                    ) {
-                        publish_items.push((
-                            item.shard_key.clone(),
-                            clean_decl.to_string(),
-                            r_bytes,
-                            1i64,
-                        ));
-                    }
-                }
-                if publish_items.len() == req_items.len()
-                    && st
-                        .begin_inflight_publish_theorem_shards(
-                            &toolchain,
-                            "trusted",
-                            &publish_items,
-                        )
-                        .is_ok()
-                {
-                    inflight_tx_open = true;
-                }
-                store_opt = Some(st);
-            }
-        },
-    ) {
-        Ok(b) => b,
-        Err(_) => {
-            rollback_inflight(&store_opt, inflight_tx_open);
-            return Ok(false);
-        }
+    let Ok(resp_bytes) = pack::http_request("POST", &endpoint, "application/json", &req_body)
+    else {
+        return Ok(false);
     };
-
     let Ok(resp) = serde_json::from_slice::<pack::CheckShardsBatchResponse>(&resp_bytes) else {
-        rollback_inflight(&store_opt, inflight_tx_open);
         return Ok(false);
     };
     if !resp.ok
@@ -1518,17 +1459,35 @@ pub fn try_stateless_remote_check(
         )
         .is_err()
     {
-        rollback_inflight(&store_opt, inflight_tx_open);
         return Ok(false);
     }
 
-    let mut store = match store_opt {
-        Some(st) => st,
-        None => TurboStore::open(Some(cache_root))?,
-    };
-    if inflight_tx_open {
-        store.commit_inflight_publish()?;
-    } else if !publish_items.is_empty() {
+    let now = db::now_unix();
+    let per_shard_ms = ((resp.elapsed_ms as i64) / (req_items.len() as i64).max(1)).max(1);
+    let mut publish_items = Vec::with_capacity(req_items.len());
+    for item in &req_items {
+        let clean_decl = item
+            .decl_name
+            .strip_prefix("_root_.")
+            .unwrap_or(&item.decl_name);
+        let r_bytes = make_attested_shard_receipt_bytes(
+            clean_decl,
+            &item.prefix_env_hash,
+            &item.stmt_hash,
+            &item.proof_hash,
+            now,
+            item.expected_kernel_type_hash.as_deref(),
+        )?;
+        publish_items.push((
+            item.shard_key.clone(),
+            clean_decl.to_string(),
+            r_bytes,
+            per_shard_ms,
+        ));
+    }
+
+    let mut store = TurboStore::open(Some(cache_root))?;
+    if !publish_items.is_empty() {
         store.batch_publish_theorem_shards(&toolchain, "trusted", &publish_items)?;
     }
 
@@ -1617,8 +1576,9 @@ pub fn try_stateless_remote_single_decl_check(
         attested.decl_name.clone(),
         attested.kernel_type_hash.clone(),
     )];
-    let file_lean_args =
-        crate::module_builder::try_resolve_lean_args_for_path(&canon_dir, Some(&canon_file))?;
+    let file_lean_args = crate::module_builder::validate_effective_lean_args(
+        &crate::module_builder::try_resolve_lean_args_for_path(&canon_dir, Some(&canon_file))?,
+    )?;
     let shard_key = compute_shard_key_with_args(&toolchain, shard, &file_lean_args);
     let rooted_target = shard.rooted_name();
     let single_set = HashSet::from([rooted_target.clone()]);
@@ -1673,51 +1633,11 @@ pub fn try_stateless_remote_single_decl_check(
         expected_kernel_type_hash: Some(attested.kernel_type_hash.clone()),
     })?;
 
-    let mut store_opt: Option<TurboStore> = None;
-    let mut inflight_tx_open = false;
-    let mut prestaged_receipt: Option<Vec<u8>> = None;
-    let resp_bytes = match pack::http_request_with_inflight(
-        "POST",
-        &endpoint,
-        "application/json",
-        &req_body,
-        || {
-            if let Ok(st) = TurboStore::open(Some(cache_root)) {
-                if let Ok(r_bytes) = make_attested_shard_receipt_bytes(
-                    target_decl,
-                    &shard.prefix_env_hash,
-                    &shard.stmt_hash,
-                    &shard.proof_hash,
-                    db::now_unix(),
-                    Some(&attested.kernel_type_hash),
-                ) {
-                    let items = [(
-                        shard_key.clone(),
-                        target_decl.to_string(),
-                        r_bytes.clone(),
-                        1,
-                    )];
-                    if st
-                        .begin_inflight_publish_theorem_shards(&toolchain, "trusted", &items)
-                        .is_ok()
-                    {
-                        inflight_tx_open = true;
-                    }
-                    prestaged_receipt = Some(r_bytes);
-                }
-                store_opt = Some(st);
-            }
-        },
-    ) {
-        Ok(b) => b,
-        Err(_) => {
-            rollback_inflight(&store_opt, inflight_tx_open);
-            return Ok(false);
-        }
+    let Ok(resp_bytes) = pack::http_request("POST", &endpoint, "application/json", &req_body)
+    else {
+        return Ok(false);
     };
-
     let Ok(resp_json) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) else {
-        rollback_inflight(&store_opt, inflight_tx_open);
         return Ok(false);
     };
     let remote_status = resp_json
@@ -1726,7 +1646,6 @@ pub fn try_stateless_remote_single_decl_check(
         .unwrap_or("unknown")
         .to_string();
     if remote_status != "remote_theorem_verified" && remote_status != "remote_theorem_cache_hit" {
-        rollback_inflight(&store_opt, inflight_tx_open);
         return Ok(false);
     }
     let remote_type_ok = resp_json
@@ -1742,7 +1661,6 @@ pub fn try_stateless_remote_single_decl_check(
                 crate::zygote::verify_attested_decl_types(&m, &expected_type_pair).is_ok()
             });
     if !remote_type_ok {
-        rollback_inflight(&store_opt, inflight_tx_open);
         return Ok(false);
     }
 
@@ -1752,35 +1670,25 @@ pub fn try_stateless_remote_single_decl_check(
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
 
-    let mut store = match store_opt {
-        Some(st) => st,
-        None => TurboStore::open(Some(cache_root))?,
-    };
-    if inflight_tx_open {
-        store.commit_inflight_publish()?;
-    } else {
-        let receipt = match prestaged_receipt {
-            Some(r) => r,
-            None => make_attested_shard_receipt_bytes(
-                target_decl,
-                &shard.prefix_env_hash,
-                &shard.stmt_hash,
-                &shard.proof_hash,
-                db::now_unix(),
-                Some(&attested.kernel_type_hash),
-            )?,
-        };
-        store.batch_publish_theorem_shards(
-            &toolchain,
-            "trusted",
-            &[(
-                shard_key.clone(),
-                target_decl.to_string(),
-                receipt,
-                (server_elapsed_ms as i64).max(dur_ms),
-            )],
-        )?;
-    }
+    let receipt = make_attested_shard_receipt_bytes(
+        target_decl,
+        &shard.prefix_env_hash,
+        &shard.stmt_hash,
+        &shard.proof_hash,
+        db::now_unix(),
+        Some(&attested.kernel_type_hash),
+    )?;
+    let mut store = TurboStore::open(Some(cache_root))?;
+    store.batch_publish_theorem_shards(
+        &toolchain,
+        "trusted",
+        &[(
+            shard_key.clone(),
+            target_decl.to_string(),
+            receipt,
+            (server_elapsed_ms as i64).max(dur_ms),
+        )],
+    )?;
 
     cache_shm_stat_split(&store, &canon_file, &active_src, &split, dep_hashes);
     crate::lake_build::recheck_dependents_if_nonlocal(&store, &canon_dir, &canon_file)?;
@@ -3876,12 +3784,17 @@ fn check_single_decl(
     if split.hygiene.is_clean_for_certification() {
         if let Some(remote_url) = remote_http {
             if db_warm_on_open
-                && store.has_attested_decl_receipt(
+                && (store.has_attested_decl_receipt(
                     &shard_key,
                     "trusted",
                     target_decl,
                     &attested.kernel_type_hash,
-                )
+                ) || store.has_attested_decl_receipt(
+                    &pack::client_attested_receipt_key(&shard_key),
+                    "trusted",
+                    target_decl,
+                    &attested.kernel_type_hash,
+                ))
             {
                 let elapsed_ms = t0.elapsed().as_millis();
                 let out_json = make_cache_hit_json(false, elapsed_ms);
@@ -3950,8 +3863,6 @@ fn check_single_decl(
             let mut remote_status = String::from("unknown");
             let mut fast_olean_used = false;
             let mut last_err: Option<anyhow::Error> = None;
-            let mut prestaged_receipt: Option<Vec<u8>> = None;
-            let mut inflight_tx_open = false;
 
             let full_shard_src: String;
             let mut candidates = fast_candidates;
@@ -3965,6 +3876,8 @@ fn check_single_decl(
                 candidates.push((full_shard_src.as_str(), false));
             }
 
+            let effective_remote_args =
+                crate::module_builder::validate_effective_lean_args(&file_lean_args)?;
             for (cand_src, is_fast) in &candidates {
                 let is_fast = *is_fast;
                 let req_body = serde_json::to_vec(&pack::CheckShardHttpRequest {
@@ -3979,86 +3892,64 @@ fn check_single_decl(
                     lean_path: local_lean_path.clone(),
                     skip_cas_lock: false,
                     allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
-                    lean_args: file_lean_args.clone(),
+                    lean_args: effective_remote_args.clone(),
                     targets: vec![rooted_target.clone()],
                     expected_kernel_type_hash: Some(attested.kernel_type_hash.clone()),
                 })?;
-                match pack::http_request_with_inflight(
-                    "POST",
-                    &endpoint,
-                    "application/json",
-                    &req_body,
-                    || {
-                        if db_warm_on_open && !inflight_tx_open {
-                            if let Ok(r_bytes) = make_attested_shard_receipt_bytes(
-                                target_decl,
-                                &shard.prefix_env_hash,
-                                &shard.stmt_hash,
-                                &shard.proof_hash,
-                                db::now_unix(),
-                                Some(&attested.kernel_type_hash),
-                            ) {
-                                let items = [(
-                                    shard_key.clone(),
-                                    target_decl.to_string(),
-                                    r_bytes.clone(),
-                                    1,
-                                )];
-                                if store
-                                    .begin_inflight_publish_theorem_shards(
-                                        toolchain, "trusted", &items,
-                                    )
-                                    .is_ok()
-                                {
-                                    inflight_tx_open = true;
-                                }
-                                prestaged_receipt = Some(r_bytes);
-                            }
-                        }
-                    },
-                ) {
+                match pack::http_request("POST", &endpoint, "application/json", &req_body) {
                     Ok(resp_bytes) => {
-                        if let Ok(rj) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
-                            let st = rj
-                                .get("status")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("unknown")
-                                .to_string();
-                            if st == "remote_theorem_verified" || st == "remote_theorem_cache_hit" {
-                                let remote_type_ok = rj
-                                    .get("kernel_type_hash")
+                        match serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
+                            Ok(rj) => {
+                                let st = rj
+                                    .get("status")
                                     .and_then(|v| v.as_str())
-                                    .is_some_and(|h| h == attested.kernel_type_hash)
-                                    || rj
-                                        .get("decl_types")
-                                        .and_then(|v| {
-                                            serde_json::from_value::<
-                                                std::collections::BTreeMap<String, String>,
-                                            >(v.clone())
-                                            .ok()
-                                        })
-                                        .is_some_and(|m| {
-                                            crate::zygote::verify_attested_decl_types(
-                                                &m,
-                                                &expected_type_pair,
-                                            )
-                                            .is_ok()
-                                        });
-                                if remote_type_ok {
-                                    resp_json = rj;
-                                    remote_status = st;
-                                    fast_olean_used = is_fast;
-                                    last_err = None;
-                                    break;
+                                    .unwrap_or("unknown")
+                                    .to_string();
+                                if st == "remote_theorem_verified"
+                                    || st == "remote_theorem_cache_hit"
+                                {
+                                    let remote_type_ok = rj
+                                        .get("kernel_type_hash")
+                                        .and_then(|v| v.as_str())
+                                        .is_some_and(|h| h == attested.kernel_type_hash)
+                                        || rj
+                                            .get("decl_types")
+                                            .and_then(|v| {
+                                                serde_json::from_value::<
+                                                    std::collections::BTreeMap<String, String>,
+                                                >(
+                                                    v.clone()
+                                                )
+                                                .ok()
+                                            })
+                                            .is_some_and(|m| {
+                                                crate::zygote::verify_attested_decl_types(
+                                                    &m,
+                                                    &expected_type_pair,
+                                                )
+                                                .is_ok()
+                                            });
+                                    if remote_type_ok {
+                                        resp_json = rj;
+                                        remote_status = st;
+                                        fast_olean_used = is_fast;
+                                        last_err = None;
+                                        break;
+                                    }
+                                    last_err = Some(anyhow::anyhow!(
+                                        "Remote shard check for `{target_decl}` on {endpoint} missed or mismatched `kernel_type_hash`"
+                                    ));
+                                } else {
+                                    last_err = Some(anyhow::anyhow!(
+                                        "Remote shard check failed on {}: {}",
+                                        endpoint,
+                                        rj
+                                    ));
                                 }
+                            }
+                            Err(e) => {
                                 last_err = Some(anyhow::anyhow!(
-                                "Remote shard check for `{target_decl}` on {endpoint} missed or mismatched `kernel_type_hash`"
-                            ));
-                            } else {
-                                last_err = Some(anyhow::anyhow!(
-                                    "Remote shard check failed on {}: {}",
-                                    endpoint,
-                                    rj
+                                    "Remote shard check on {endpoint} returned invalid JSON: {e}"
                                 ));
                             }
                         }
@@ -4087,7 +3978,7 @@ fn check_single_decl(
                     lean_path: local_lean_path.clone(),
                     skip_cas_lock: false,
                     allowed_axioms: Some(splitter::extra_allowed_axiom_patterns()),
-                    lean_args: file_lean_args.clone(),
+                    lean_args: effective_remote_args,
                     targets: vec![rooted_target],
                     expected_kernel_type_hash: Some(attested.kernel_type_hash.clone()),
                 })?;
@@ -4131,9 +4022,6 @@ fn check_single_decl(
                 }
             }
             if let Some(err) = last_err {
-                if inflight_tx_open {
-                    store.rollback_inflight_publish();
-                }
                 return Err(err);
             }
 
@@ -4142,31 +4030,24 @@ fn check_single_decl(
                 .get("server_elapsed_ms")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            if inflight_tx_open {
-                store.commit_inflight_publish()?;
-            } else {
-                let receipt = match prestaged_receipt {
-                    Some(r) => r,
-                    None => make_attested_shard_receipt_bytes(
-                        target_decl,
-                        &shard.prefix_env_hash,
-                        &shard.stmt_hash,
-                        &shard.proof_hash,
-                        db::now_unix(),
-                        Some(&attested.kernel_type_hash),
-                    )?,
-                };
-                store.batch_publish_theorem_shards(
-                    toolchain,
-                    "trusted",
-                    &[(
-                        shard_key.clone(),
-                        target_decl.to_string(),
-                        receipt,
-                        (server_elapsed_ms as i64).max(dur_ms),
-                    )],
-                )?;
-            }
+            let receipt = make_attested_shard_receipt_bytes(
+                target_decl,
+                &shard.prefix_env_hash,
+                &shard.stmt_hash,
+                &shard.proof_hash,
+                db::now_unix(),
+                Some(&attested.kernel_type_hash),
+            )?;
+            store.batch_publish_theorem_shards(
+                toolchain,
+                "trusted",
+                &[(
+                    shard_key.clone(),
+                    target_decl.to_string(),
+                    receipt,
+                    (server_elapsed_ms as i64).max(dur_ms),
+                )],
+            )?;
 
             let (_, out_json) = emit_remote_decl_result(
                 json_output,
@@ -4185,6 +4066,30 @@ fn check_single_decl(
             )?;
             return Ok(out_json);
         }
+    }
+
+    if split.hygiene.is_clean_for_certification()
+        && db_warm_on_open
+        && store.has_attested_decl_receipt(
+            &pack::client_attested_receipt_key(&shard_key),
+            "trusted",
+            target_decl,
+            &attested.kernel_type_hash,
+        )
+    {
+        let elapsed_ms = t0.elapsed().as_millis();
+        let out_json = make_cache_hit_json(false, elapsed_ms);
+        if emit_stdout {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&out_json)?);
+            } else {
+                println!(
+                    "[turbo-lean] SHARD CACHE HIT `{}` (coalesced=false, {} ms)",
+                    target_decl, elapsed_ms
+                );
+            }
+        }
+        return Ok(out_json);
     }
 
     let t0 = &prewarm_local_check_zygote(store, canon_dir, toolchain, t0)?;
@@ -5461,8 +5366,15 @@ fn check_single_file(
         .iter()
         .map(|shard| compute_shard_key_with_args(toolchain, shard, &file_lean_args))
         .collect();
+    let client_attested_keys: Vec<String> = file_shard_keys
+        .iter()
+        .map(|k| pack::client_attested_receipt_key(k))
+        .collect();
     let cached_map = if db_warm_on_open {
-        store.batch_get_theorem_shards(&file_shard_keys, "trusted")?
+        let mut lookup_keys = Vec::with_capacity(file_shard_keys.len() * 2);
+        lookup_keys.extend(file_shard_keys.iter().cloned());
+        lookup_keys.extend(client_attested_keys.iter().cloned());
+        store.batch_get_theorem_shards(&lookup_keys, "trusted")?
     } else {
         HashMap::new()
     };
@@ -5497,22 +5409,37 @@ fn check_single_file(
     let hygiene_strictly_clean = split.hygiene.is_clean_for_certification();
     for (idx, shard) in split.shards.iter().enumerate() {
         let shard_key = file_shard_keys[idx].clone();
-        let is_attested_hit = if allow_sorry {
+        let client_att_key = &client_attested_keys[idx];
+        let raw_present = cached_map.contains_key(&shard_key);
+        let client_att_present = cached_map.contains_key(client_att_key);
+        let hygiene_ok_for_hit = if allow_sorry {
             hygiene_strictly_clean
                 || (split.hygiene.is_clean_modulo_sorry()
                     && !shard_text_contains_sorry_or_admit(shard))
         } else {
             hygiene_strictly_clean
-        } && cached_map.contains_key(&shard_key)
-            && attested_kths.get(&shard_key).is_some_and(|kth| {
+        };
+        let kth_opt = attested_kths.get(&shard_key);
+        let raw_attested = hygiene_ok_for_hit
+            && raw_present
+            && kth_opt.is_some_and(|kth| {
                 store.has_attested_decl_receipt(&shard_key, "trusted", shard.decl_name(), kth)
             });
-        if is_attested_hit {
+        let client_attested = hygiene_strictly_clean
+            && !allow_sorry
+            && client_att_present
+            && kth_opt.is_some_and(|kth| {
+                store.has_attested_decl_receipt(client_att_key, "trusted", shard.decl_name(), kth)
+            });
+        if raw_present && !raw_attested {
+            store.invalidate_action_for_reattestation(&shard_key)?;
+        }
+        if !allow_sorry && client_att_present && !client_attested {
+            store.invalidate_action_for_reattestation(client_att_key)?;
+        }
+        if raw_attested || client_attested {
             hits += 1;
         } else {
-            if cached_map.contains_key(&shard_key) {
-                store.invalidate_action_for_reattestation(&shard_key)?;
-            }
             uncached_shards.push((shard_key, shard));
         }
     }
@@ -10203,5 +10130,652 @@ theorem after_macro : ext_magic = 7 := rfl
         );
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_remote_http_check_never_stages_cas_blobs_before_attestation_and_reuses_client_attested_receipts(
+    ) -> Result<()> {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Mutex,
+        };
+
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let toolchain = include_str!("../../../lean/lean-toolchain").trim();
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_check_post_att_http_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let proj = tmp_dir.join("proj");
+        fs::create_dir_all(proj.join("Mathlib"))?;
+        fs::write(proj.join("lean-toolchain"), format!("{toolchain}\n"))?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"post_att_pkg\"\ndefaultTargets = [\"Mathlib\", \"Mod\"]\n\n[[lean_lib]]\nname = \"Mathlib\"\nglobs = [\"Mathlib.+\"]\n\n[[lean_lib]]\nname = \"Mod\"\n",
+        )?;
+        fs::write(
+            proj.join("Mathlib/Dummy.lean"),
+            "def dummyMath : Nat := 1\n",
+        )?;
+        let src = "import Mathlib.Dummy\nnamespace PostAtt\ntheorem thm1 : 2 + 2 = 4 := rfl\ntheorem thm2 : 3 + 3 = 6 := rfl\nend PostAtt\n";
+        let mod_file = proj.join("Mod.lean");
+        fs::write(&mod_file, src)?;
+
+        let probe_cache = tmp_dir.join("probe_cache");
+        let mut probe_store = TurboStore::open(Some(&probe_cache))?;
+        let Ok((_ev, lean_bin)) =
+            crate::pack::resolve_server_lean_env_and_bin(&probe_store, toolchain, "")
+        else {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Ok(());
+        };
+        if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
+            let _ = fs::remove_dir_all(&tmp_dir);
+            return Ok(());
+        }
+        crate::module_builder::reset_lake_inputs_tag_memo();
+        crate::lake_build::run_build_command(
+            &mut probe_store,
+            false,
+            Vec::new(),
+            proj.clone(),
+            "trusted".to_string(),
+            0,
+            false,
+        )?;
+        assert!(
+            proj.join(".lake/build/lib/lean/Mathlib/Dummy.olean")
+                .is_file(),
+            "Mathlib/Dummy.olean must exist after build"
+        );
+        drop(probe_store);
+
+        let copy_dir_recursive = |from: &Path, to: &Path| -> Result<()> {
+            let mut stack = vec![(from.to_path_buf(), to.to_path_buf())];
+            while let Some((src_d, dst_d)) = stack.pop() {
+                fs::create_dir_all(&dst_d)?;
+                for ent in fs::read_dir(&src_d)? {
+                    let ent = ent?;
+                    let p = ent.path();
+                    let target = dst_d.join(ent.file_name());
+                    if p.is_dir() {
+                        stack.push((p, target));
+                    } else if p.is_file() {
+                        fs::copy(&p, &target)?;
+                    }
+                }
+            }
+            Ok(())
+        };
+
+        let canon_proj = proj.canonicalize().unwrap_or_else(|_| proj.clone());
+        let canon_file = mod_file.canonicalize().unwrap_or_else(|_| mod_file.clone());
+        let local_lean_path = resolve_remote_lean_path(&canon_proj, None);
+        let dep_hashes = compute_imported_olean_interface_hashes(
+            src,
+            &canon_proj,
+            (!local_lean_path.is_empty()).then_some(local_lean_path.as_str()),
+        );
+        let split = split_lean_source(src, &dep_hashes);
+        let shard_refs: Vec<&splitter::TheoremShard> = split.shards.iter().collect();
+        let attested = confirm_file_decl_identities_with_budget(
+            src,
+            &shard_refs,
+            &canon_proj,
+            &canon_file,
+            false,
+            None,
+        )?;
+        assert_eq!(attested.len(), 2);
+        let kth1 = attested[0].kernel_type_hash.clone();
+        let kth2 = attested[1].kernel_type_hash.clone();
+        let wrong_kth = "0".repeat(64);
+
+        let count_blob_files = |root: &Path| -> usize {
+            let blobs_dir = root.join("blobs");
+            if !blobs_dir.exists() {
+                return 0;
+            }
+            let mut n = 0usize;
+            if let Ok(rd) = fs::read_dir(&blobs_dir) {
+                for ent in rd.flatten() {
+                    let p = ent.path();
+                    if p.is_dir() {
+                        if let Ok(sub) = fs::read_dir(&p) {
+                            n += sub.flatten().filter(|f| f.path().is_file()).count();
+                        }
+                    } else if p.is_file() {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+        let count_db_rows = |st: &TurboStore| -> (i64, i64) {
+            let acts: i64 = st
+                .conn
+                .query_row("SELECT COUNT(*) FROM actions", [], |r| r.get(0))
+                .unwrap_or(0);
+            let blobs: i64 = st
+                .conn
+                .query_row("SELECT COUNT(*) FROM blobs", [], |r| r.get(0))
+                .unwrap_or(0);
+            (acts, blobs)
+        };
+
+        #[derive(Clone)]
+        enum MockReply {
+            CloseImmediately,
+            StatusBody(u16, String),
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let remote_url = format!("http://{}", listener.local_addr()?);
+        let scripted: Arc<Mutex<std::collections::VecDeque<MockReply>>> =
+            Arc::new(Mutex::new(std::collections::VecDeque::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let scripted_bg = Arc::clone(&scripted);
+        let stop_bg = Arc::clone(&stop);
+        let server_handle = std::thread::spawn(move || {
+            while !stop_bg.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ =
+                            stream.set_read_timeout(Some(std::time::Duration::from_millis(250)));
+                        let mut buf = [0u8; 16384];
+                        let _ = stream.read(&mut buf);
+                        let reply = scripted_bg
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .pop_front()
+                            .unwrap_or(MockReply::StatusBody(500, "unexpected".to_string()));
+                        match reply {
+                            MockReply::CloseImmediately => {
+                                drop(stream);
+                            }
+                            MockReply::StatusBody(code, body) => {
+                                let reason = if code == 200 {
+                                    "OK"
+                                } else {
+                                    "Internal Server Error"
+                                };
+                                let resp = format!(
+                                    "HTTP/1.1 {code} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(resp.as_bytes());
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let test_res = (|| -> Result<()> {
+            // 1) `try_stateless_remote_check` batch path: failed/malformed/unattested/mismatched responses
+            //    must NOT write any new rows or blob files under `cache_root/blobs/`.
+            let stateless_batch_cache = tmp_dir.join("stateless_batch_cache");
+            copy_dir_recursive(&probe_cache, &stateless_batch_cache)?;
+            let baseline_blobs = count_blob_files(&stateless_batch_cache);
+            let baseline_rows = {
+                let st = TurboStore::open(Some(&stateless_batch_cache))?;
+                count_db_rows(&st)
+            };
+            {
+                let mut q = scripted.lock().unwrap_or_else(|e| e.into_inner());
+                q.push_back(MockReply::CloseImmediately);
+                q.push_back(MockReply::StatusBody(500, r#"{"error":"boom"}"#.into()));
+                q.push_back(MockReply::StatusBody(200, "not-json".into()));
+                q.push_back(MockReply::StatusBody(
+                    200,
+                    r#"{"ok":false,"verified_count":0,"cache_hits":0,"elapsed_ms":1.0,"exit_code":1,"stdout":"","stderr":"bad","error":"bad","verified_decl_types":{}}"#.into(),
+                ));
+                q.push_back(MockReply::StatusBody(
+                    200,
+                    r#"{"ok":true,"verified_count":2,"cache_hits":0,"elapsed_ms":1.0,"exit_code":0,"stdout":"","stderr":"","error":null,"verified_decl_types":{}}"#.into(),
+                ));
+                q.push_back(MockReply::StatusBody(
+                    200,
+                    serde_json::json!({
+                        "ok": true,
+                        "verified_count": 2,
+                        "cache_hits": 0,
+                        "elapsed_ms": 1.0,
+                        "exit_code": 0,
+                        "stdout": "",
+                        "stderr": "",
+                        "error": null,
+                        "verified_decl_types": {
+                            "PostAtt.thm1": kth1,
+                            "PostAtt.thm2": wrong_kth
+                        }
+                    })
+                    .to_string(),
+                ));
+            }
+            for attempt in 0..6 {
+                let ok = try_stateless_remote_check(
+                    &stateless_batch_cache,
+                    false,
+                    &mod_file,
+                    None,
+                    &proj,
+                    Some(2),
+                    &remote_url,
+                )?;
+                assert!(!ok, "stateless batch attempt {attempt} must fall back");
+                let st_check = TurboStore::open(Some(&stateless_batch_cache))?;
+                assert_eq!(
+                    count_db_rows(&st_check),
+                    baseline_rows,
+                    "stateless batch attempt {attempt} must not insert DB rows before attestation"
+                );
+                drop(st_check);
+                assert_eq!(
+                    count_blob_files(&stateless_batch_cache),
+                    baseline_blobs,
+                    "stateless batch attempt {attempt} must write 0 new CAS blob files"
+                );
+            }
+            // Valid attested batch response publishes both receipts.
+            scripted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(MockReply::StatusBody(
+                    200,
+                    serde_json::json!({
+                        "ok": true,
+                        "verified_count": 2,
+                        "cache_hits": 0,
+                        "elapsed_ms": 4.0,
+                        "exit_code": 0,
+                        "stdout": "",
+                        "stderr": "",
+                        "error": null,
+                        "verified_decl_types": {
+                            "PostAtt.thm1": kth1,
+                            "PostAtt.thm2": kth2
+                        }
+                    })
+                    .to_string(),
+                ));
+            assert!(try_stateless_remote_check(
+                &stateless_batch_cache,
+                false,
+                &mod_file,
+                None,
+                &proj,
+                Some(2),
+                &remote_url,
+            )?);
+            let st_batch = TurboStore::open(Some(&stateless_batch_cache))?;
+            assert_eq!(
+                count_db_rows(&st_batch),
+                (baseline_rows.0 + 2, baseline_rows.1 + 2)
+            );
+            assert_eq!(count_blob_files(&stateless_batch_cache), baseline_blobs + 2);
+            drop(st_batch);
+
+            // 2) `try_stateless_remote_single_decl_check` (`decl = Some(...)`): zero new CAS artifacts before
+            //    attestation, followed by publication on valid attested response (plus pure empty-cache check
+            //    on a standalone `import Init` + `import Mathlib.Dummy` pruned module if needed).
+            let stateless_decl_cache = tmp_dir.join("stateless_decl_cache");
+            copy_dir_recursive(&probe_cache, &stateless_decl_cache)?;
+            let decl_baseline_blobs = count_blob_files(&stateless_decl_cache);
+            let decl_baseline_rows = {
+                let st = TurboStore::open(Some(&stateless_decl_cache))?;
+                count_db_rows(&st)
+            };
+            {
+                let mut q = scripted.lock().unwrap_or_else(|e| e.into_inner());
+                q.clear();
+                q.push_back(MockReply::CloseImmediately);
+                q.push_back(MockReply::StatusBody(500, "err".into()));
+                q.push_back(MockReply::StatusBody(200, "{bad_json".into()));
+                q.push_back(MockReply::StatusBody(
+                    200,
+                    r#"{"status":"remote_theorem_failed"}"#.into(),
+                ));
+                q.push_back(MockReply::StatusBody(
+                    200,
+                    r#"{"status":"remote_theorem_verified"}"#.into(),
+                ));
+                q.push_back(MockReply::StatusBody(
+                    200,
+                    serde_json::json!({
+                        "status": "remote_theorem_verified",
+                        "kernel_type_hash": wrong_kth
+                    })
+                    .to_string(),
+                ));
+            }
+            for attempt in 0..6 {
+                let ok = try_stateless_remote_check(
+                    &stateless_decl_cache,
+                    false,
+                    &mod_file,
+                    Some("PostAtt.thm1"),
+                    &proj,
+                    Some(1),
+                    &remote_url,
+                )?;
+                assert!(!ok, "stateless decl attempt {attempt} must fall back");
+                let st_check = TurboStore::open(Some(&stateless_decl_cache))?;
+                assert_eq!(
+                    count_db_rows(&st_check),
+                    decl_baseline_rows,
+                    "stateless decl attempt {attempt} must not insert DB rows before attestation"
+                );
+                drop(st_check);
+                assert_eq!(
+                    count_blob_files(&stateless_decl_cache),
+                    decl_baseline_blobs,
+                    "stateless decl attempt {attempt} must write 0 new CAS blob files"
+                );
+            }
+            scripted
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back(MockReply::StatusBody(
+                    200,
+                    serde_json::json!({
+                        "status": "remote_theorem_verified",
+                        "kernel_type_hash": kth1,
+                        "server_elapsed_ms": 3
+                    })
+                    .to_string(),
+                ));
+            assert!(try_stateless_remote_check(
+                &stateless_decl_cache,
+                false,
+                &mod_file,
+                Some("PostAtt.thm1"),
+                &proj,
+                Some(1),
+                &remote_url,
+            )?);
+            let st_decl = TurboStore::open(Some(&stateless_decl_cache))?;
+            assert_eq!(
+                count_db_rows(&st_decl),
+                (decl_baseline_rows.0 + 1, decl_baseline_rows.1 + 1)
+            );
+            assert_eq!(
+                count_blob_files(&stateless_decl_cache),
+                decl_baseline_blobs + 1
+            );
+            drop(st_decl);
+
+            // 2b) Pure empty-cache stateless check (`import Init /- \nimport Mathlib -/`):
+            //     `dep_hashes` is empty (`Init` only) while `pruned_imports_shard_source` succeeds,
+            //     so `try_stateless_remote_check` needs NO `TurboStore` at all before attestation
+            //     and must NOT create `state.db` or `blobs/` on any rejected HTTP reply!
+            let pure_src = "import Init /-\nimport Mathlib -/\nnamespace PureAtt\ntheorem pthm1 : 5 + 5 = 10 := rfl\nend PureAtt\n";
+            if splitter::build_pruned_imports_shard_source(
+                pure_src,
+                &HashSet::from(["_root_.PureAtt.pthm1".to_string()]),
+            )
+            .is_some()
+            {
+                let pure_file = proj.join("PureMod.lean");
+                fs::write(&pure_file, pure_src)?;
+                let empty_stateless_cache = tmp_dir.join("empty_stateless_cache");
+                {
+                    let mut q = scripted.lock().unwrap_or_else(|e| e.into_inner());
+                    q.clear();
+                    q.push_back(MockReply::StatusBody(500, "boom".into()));
+                    q.push_back(MockReply::StatusBody(500, "boom".into()));
+                }
+                assert!(!try_stateless_remote_check(
+                    &empty_stateless_cache,
+                    false,
+                    &pure_file,
+                    None,
+                    &proj,
+                    Some(1),
+                    &remote_url,
+                )?);
+                assert!(
+                    !empty_stateless_cache.join("state.db").exists(),
+                    "empty stateless batch check must not create state.db before attestation"
+                );
+                assert!(!try_stateless_remote_check(
+                    &empty_stateless_cache,
+                    false,
+                    &pure_file,
+                    Some("PureAtt.pthm1"),
+                    &proj,
+                    Some(1),
+                    &remote_url,
+                )?);
+                assert!(
+                    !empty_stateless_cache.join("state.db").exists(),
+                    "empty stateless single-decl check must not create state.db before attestation"
+                );
+                let _ = fs::remove_file(&pure_file);
+            }
+
+            // 3) Warm `check_single_decl` (`run_check_command_inner` with `db_warm_on_open = true`):
+            //    failed/malformed/mismatched HTTP responses (including fallback candidate attempts)
+            //    leave 0 blobs and 0 actions in `TurboStore`.
+            let warm_decl_cache = tmp_dir.join("warm_decl_cache");
+            let mut warm_store = TurboStore::open(Some(&warm_decl_cache))?;
+            for replies in [
+                vec![MockReply::CloseImmediately, MockReply::CloseImmediately],
+                vec![
+                    MockReply::StatusBody(200, "{not-json".into()),
+                    MockReply::StatusBody(200, "{not-json".into()),
+                ],
+                vec![
+                    MockReply::StatusBody(
+                        200,
+                        serde_json::json!({
+                            "status": "remote_theorem_verified",
+                            "kernel_type_hash": wrong_kth
+                        })
+                        .to_string(),
+                    ),
+                    MockReply::StatusBody(
+                        200,
+                        serde_json::json!({
+                            "status": "remote_theorem_verified",
+                            "kernel_type_hash": wrong_kth
+                        })
+                        .to_string(),
+                    ),
+                ],
+            ] {
+                {
+                    let mut q = scripted.lock().unwrap_or_else(|e| e.into_inner());
+                    q.clear();
+                    q.extend(replies);
+                }
+                let err = run_check_command_inner(
+                    &mut warm_store,
+                    true,
+                    true,
+                    false,
+                    false,
+                    mod_file.clone(),
+                    Some("PostAtt.thm1".to_string()),
+                    proj.clone(),
+                    None,
+                    false,
+                    Some(remote_url.clone()),
+                    false,
+                );
+                assert!(
+                    err.is_err(),
+                    "warm check_single_decl must fail on bad remote reply"
+                );
+                assert_eq!(
+                    count_db_rows(&warm_store),
+                    (0, 0),
+                    "failed warm check_single_decl must insert 0 DB rows"
+                );
+                assert_eq!(
+                    count_blob_files(&warm_decl_cache),
+                    0,
+                    "failed warm check_single_decl must stage 0 CAS blob files"
+                );
+            }
+            {
+                let mut q = scripted.lock().unwrap_or_else(|e| e.into_inner());
+                q.clear();
+                q.push_back(MockReply::StatusBody(
+                    200,
+                    serde_json::json!({
+                        "status": "remote_theorem_verified",
+                        "decl_types": { "PostAtt.thm1": kth1 },
+                        "server_elapsed_ms": 2
+                    })
+                    .to_string(),
+                ));
+            }
+            let ok_decl_val = run_check_command_inner(
+                &mut warm_store,
+                true,
+                true,
+                false,
+                false,
+                mod_file.clone(),
+                Some("PostAtt.thm1".to_string()),
+                proj.clone(),
+                None,
+                false,
+                Some(remote_url.clone()),
+                false,
+            )?;
+            assert_eq!(ok_decl_val["status"], "remote_theorem_verified");
+            assert_eq!(count_db_rows(&warm_store), (1, 1));
+            assert_eq!(count_blob_files(&warm_decl_cache), 1);
+
+            // 4) Warm `check_single_file` remote batch offload publishes `client-attested-v1:<shard_key>`
+            //    and subsequent warm `check_single_file` + `check_single_decl` reuse it with 0 HTTP calls,
+            //    while directory-level unattested `batch_get_theorem_shards(&raw_keys, "trusted")` stays empty!
+            let batch_reuse_cache = tmp_dir.join("batch_reuse_cache");
+            let mut reuse_store = TurboStore::open(Some(&batch_reuse_cache))?;
+            {
+                let mut q = scripted.lock().unwrap_or_else(|e| e.into_inner());
+                q.clear();
+                q.push_back(MockReply::StatusBody(
+                    200,
+                    serde_json::json!({
+                        "ok": true,
+                        "verified_count": 2,
+                        "cache_hits": 0,
+                        "elapsed_ms": 3.0,
+                        "exit_code": 0,
+                        "stdout": "",
+                        "stderr": "",
+                        "error": null,
+                        "verified_decl_types": {
+                            "PostAtt.thm1": kth1,
+                            "PostAtt.thm2": kth2
+                        }
+                    })
+                    .to_string(),
+                ));
+            }
+            let first_file_val = run_check_command_inner(
+                &mut reuse_store,
+                true,
+                true,
+                false,
+                false,
+                mod_file.clone(),
+                None,
+                proj.clone(),
+                Some(2),
+                false,
+                Some(remote_url.clone()),
+                false,
+            )?;
+            assert_eq!(first_file_val["status"], "file_verified");
+            assert_eq!(first_file_val["mode"], "remote_coalesced_shards");
+            assert_eq!(first_file_val["shard_hits"], 0);
+            assert_eq!(first_file_val["shard_misses"], 2);
+
+            let raw_keys: Vec<String> = split
+                .shards
+                .iter()
+                .map(|s| compute_shard_key_with_args(toolchain, s, &[]))
+                .collect();
+            assert!(
+                reuse_store
+                    .batch_get_theorem_shards(&raw_keys, "trusted")?
+                    .is_empty(),
+                "raw unattested shard keys must remain absent so unattested batch callers cannot trust them"
+            );
+
+            // Queue is empty: any HTTP call would hit default 500 and fail!
+            scripted.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            let second_file_val = run_check_command_inner(
+                &mut reuse_store,
+                true,
+                true,
+                false,
+                false,
+                mod_file.clone(),
+                None,
+                proj.clone(),
+                Some(2),
+                false,
+                Some(remote_url.clone()),
+                false,
+            )?;
+            assert_eq!(second_file_val["status"], "all_shards_cached");
+            assert_eq!(second_file_val["shard_hits"], 2);
+            assert_eq!(second_file_val["shard_misses"], 0);
+
+            let warm_remote_decl_hit = run_check_command_inner(
+                &mut reuse_store,
+                true,
+                true,
+                false,
+                false,
+                mod_file.clone(),
+                Some("PostAtt.thm2".to_string()),
+                proj.clone(),
+                None,
+                false,
+                Some(remote_url.clone()),
+                false,
+            )?;
+            assert_eq!(warm_remote_decl_hit["status"], "theorem_cache_hit");
+
+            let warm_local_decl_hit = run_check_command_inner(
+                &mut reuse_store,
+                true,
+                true,
+                false,
+                false,
+                mod_file.clone(),
+                Some("PostAtt.thm1".to_string()),
+                proj.clone(),
+                None,
+                false,
+                None,
+                false,
+            )?;
+            assert_eq!(warm_local_decl_hit["status"], "theorem_cache_hit");
+
+            Ok(())
+        })();
+
+        stop.store(true, Ordering::Release);
+        let _ = server_handle.join();
+        let _ = fs::remove_dir_all(&tmp_dir);
+        test_res
     }
 }
