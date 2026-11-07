@@ -39,8 +39,10 @@ MIRRORED_FILES = (
     "LeanNative/Backend/LLVMAst/Eval.lean",
 )
 
+# Pre-filter scan outside Lean comments; kernel-level enforcement is `#verify_lean_mlir_bridge_axioms`
+# (`Lean.collectAxioms` in `LeanMLIRBridge.lean`).
 FORBIDDEN_PROOF_TOKENS = re.compile(
-    r"\b(?:sorry|admit|native_decide|trustCompiler|ofReduceBool)\b|^\s*axiom\s+",
+    r"\b(?:sorry|sorryAx|admit|axiom|native_decide|trustCompiler|ofReduceBool)\b",
     re.M,
 )
 
@@ -49,12 +51,16 @@ def sha256_file(p: Path) -> str:
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
-def strip_lean_comments(text: str) -> str:
+def strip_lean_comments_and_strings(text: str) -> str:
     out: list[str] = []
     depth = 0
+    in_str = False
     i = 0
     while i < len(text):
-        if text.startswith("/-", i):
+        if depth == 0 and not in_str and text.startswith("--", i):
+            while i < len(text) and text[i] != "\n":
+                i += 1
+        elif not in_str and text.startswith("/-", i):
             depth += 1
             i += 2
         elif depth and text.startswith("-/", i):
@@ -63,10 +69,25 @@ def strip_lean_comments(text: str) -> str:
         elif depth:
             out.append("\n" if text[i] == "\n" else " ")
             i += 1
+        elif in_str:
+            if text[i] == "\\" and i + 1 < len(text):
+                out.append("  ")
+                i += 2
+            elif text[i] == '"':
+                in_str = False
+                out.append('"')
+                i += 1
+            else:
+                out.append("\n" if text[i] == "\n" else " ")
+                i += 1
+        elif text[i] == '"':
+            in_str = True
+            out.append('"')
+            i += 1
         else:
             out.append(text[i])
             i += 1
-    return re.sub(r"--[^\n]*", "", "".join(out))
+    return "".join(out)
 
 
 def check_bridge_tree(root_dir: Path, sync_mirrors: bool = False) -> dict[str, object]:
@@ -126,7 +147,9 @@ def check_bridge_tree(root_dir: Path, sync_mirrors: bool = False) -> dict[str, o
             errors.append('lakefile.toml missing subDir = "LeanMLIR"')
 
     manifest = bridge_root / "lake-manifest.json"
-    if manifest.is_file():
+    if not manifest.is_file():
+        errors.append(f"Missing committed {manifest}")
+    else:
         try:
             mf = json.loads(manifest.read_text(encoding="utf-8"))
             pkgs = {p.get("name"): p for p in mf.get("packages", [])}
@@ -137,16 +160,24 @@ def check_bridge_tree(root_dir: Path, sync_mirrors: bool = False) -> dict[str, o
                 errors.append(
                     f"lake-manifest.json LeanMLIR rev mismatch: {lm_pkg.get('rev')} != {PINNED_LEAN_MLIR_REV}"
                 )
+            cli_pkg = pkgs.get("Cli")
+            if not cli_pkg or "mhuisi/lean4-cli" not in str(cli_pkg.get("url", "")):
+                errors.append(
+                    "lake-manifest.json Cli package must point to reachable https://github.com/mhuisi/lean4-cli.git"
+                )
         except Exception as exc:
             errors.append(f"Invalid lake-manifest.json: {exc}")
 
     # 4. Scan bridge proof files for forbidden tokens (outside comments) and axiom audit gate
     root_bridge_lean = bridge_root / "LeanMLIRBridge.lean"
     if root_bridge_lean.is_file():
-        rb_txt = strip_lean_comments(root_bridge_lean.read_text(encoding="utf-8"))
-        if "#verify_lean_mlir_bridge_axioms" not in rb_txt:
+        rb_raw = root_bridge_lean.read_text(encoding="utf-8")
+        if "#verify_lean_mlir_bridge_axioms" not in strip_lean_comments_and_strings(rb_raw):
             errors.append("LeanMLIRBridge.lean missing `#verify_lean_mlir_bridge_axioms` gate")
-        bridged_refs = re.findall(r"``LeanMLIRBridge\.[A-Za-z0-9_?']+", rb_txt)
+        bridged_refs = re.findall(
+            r"``LeanMLIRBridge\.[A-Za-z0-9_?']+",
+            strip_lean_comments_and_strings(rb_raw),
+        )
         if len(bridged_refs) < 30:
             errors.append(
                 f"LeanMLIRBridge.lean audits only {len(bridged_refs)} bridged theorems (expected >= 30)"
@@ -161,7 +192,7 @@ def check_bridge_tree(root_dir: Path, sync_mirrors: bool = False) -> dict[str, o
         if not pf.is_file():
             errors.append(f"Missing proof file: {pf}")
             continue
-        stripped = strip_lean_comments(pf.read_text(encoding="utf-8"))
+        stripped = strip_lean_comments_and_strings(pf.read_text(encoding="utf-8"))
         m = FORBIDDEN_PROOF_TOKENS.search(stripped)
         if m:
             errors.append(f"Forbidden token `{m.group(0).strip()}` in {pf.relative_to(root_dir)}")
@@ -199,15 +230,22 @@ class SelfTests(unittest.TestCase):
                 BRIDGE_DIR / "lakefile.toml",
                 root / "verification" / "lean-mlir-bridge" / "lakefile.toml",
             )
+            shutil.copy2(
+                BRIDGE_DIR / "lake-manifest.json",
+                root / "verification" / "lean-mlir-bridge" / "lake-manifest.json",
+            )
             b_root = root / "verification" / "lean-mlir-bridge"
             (b_root / "LeanMLIRBridge").mkdir(parents=True, exist_ok=True)
             (b_root / "LeanMLIRBridge.lean").write_text("import LeanMLIRBridge.Bisim\n")
-            (b_root / "LeanMLIRBridge" / "Bisim.lean").write_text("theorem bad : True := by sorry\n")
+            (b_root / "LeanMLIRBridge" / "Bisim.lean").write_text(
+                'def msg := "string with -- sorry and axiom"\nprivate noncomputable axiom sneaky : False\n',
+                encoding="utf-8",
+            )
             rep = check_bridge_tree(root)
             self.assertFalse(rep["ok"])
             errs = "\n".join(str(e) for e in rep["errors"])
             self.assertIn("Drift detected", errs)
-            self.assertIn("Forbidden token `sorry`", errs)
+            self.assertIn("Forbidden token `axiom`", errs)
 
 
 def main() -> int:

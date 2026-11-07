@@ -924,10 +924,11 @@ theorem stepInstr_select_eq_op_denote (mod_ : LLVMModule) (fuel : Nat) (st : Exe
   rw [stepInstr_select_bisim mod_ fuel st dst condOp w tOp eOp xc xt xe hc ht he]
   rfl
 
-/-! ## Compositional Straight-Line Block Bisimulation (`execInstrs`) -/
+/-! ## Compositional Straight-Line Instruction-List Composition (`execInstrs`) -/
 
-/-- Inductive straight-line SSA trace relating `LLVMAst.execInstrs` to a chain of `LLVM.IntW`
-denotations in `opencompl/lean-mlir`. -/
+/-- Inductive straight-line SSA instruction-step trace composing per-instruction `LLVMAst.stepInstr`
+bisimulation steps into `LLVMAst.execInstrs` (pure SSA straight-line blocks; CFG terminators, phi
+wiring, and linear memory remain covered by Stages 2A/2B and `LLVMAst.Proofs`). -/
 inductive StraightLineBisim (mod_ : LLVMModule) (fuel : Nat) :
     ExecState → List LLVMInstr → ExecState → Prop where
   | nil (st : ExecState) :

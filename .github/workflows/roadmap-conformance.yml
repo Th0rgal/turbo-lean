@@ -74,9 +74,9 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/alive2-tv
-          key: ${{ runner.os }}-alive2-llvm18-2547695358b01758a01f4bdab2ced70178189074-v1
+          key: ${{ runner.os }}-alive2-llvm18-2547695358b01758a01f4bdab2ced70178189074-v2
 
-      - name: Ensure pinned Alive2 (alive-tv) binary
+      - name: Build or restore pinned Alive2 (alive-tv) binary for Stage 2B gate
         run: |
           python3 scripts/run_alive2_tv.py --self-test
           mkdir -p "$HOME/.cache/alive2-tv"
@@ -168,9 +168,7 @@ jobs:
       - name: Fetch Mathlib olean cache & build LeanMLIRBridge (0 sorryAx kernel audit)
         working-directory: verification/lean-mlir-bridge
         run: |
-          if [ ! -f lake-manifest.json ]; then
-            lake update LeanMLIR
-          fi
+          test -f lake-manifest.json
           lake exe cache get
           lake build LeanMLIRBridge
           python3 ../../scripts/check_lean_mlir_bridge_sync.py --json

@@ -8,6 +8,14 @@ git = "https://github.com/opencompl/lean-mlir.git"
 rev = "b8c4a771319a044854a4bbb49b8821381ef86ff8"
 subDir = "LeanMLIR"
 
+# Override mathlib4-nightly-testing's force-pushed `leanprover/lean4-cli` nightly-testing ref
+# (`d9fc8ae2...` is unadvertised on `leanprover/lean4-cli` but preserved on `mhuisi/lean4-cli`,
+# matching upstream `opencompl/lean-mlir`'s root `lakefile.toml`).
+[[require]]
+name = "Cli"
+git = "https://github.com/mhuisi/lean4-cli.git"
+rev = "d9fc8ae23024be37424a189982c92356e37935c8"
+
 [[lean_lib]]
 name = "SSA"
 

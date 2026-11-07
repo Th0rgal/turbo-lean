@@ -63,8 +63,8 @@ entry:
     return module_ir.rstrip() + "\n" + wrapper
 
 
-def run_lli_u64(lli_bin: str, opt_bin: str | None, ir_path: Path, verify_ir: bool = True) -> int:
-    if verify_ir and opt_bin:
+def run_lli_u64(lli_bin: str, opt_bin: str, ir_path: Path, verify_ir: bool = True) -> int:
+    if verify_ir:
         chk = subprocess.run(
             [opt_bin, "-passes=verify", "-disable-output", str(ir_path)],
             capture_output=True,
@@ -87,7 +87,11 @@ def run_lli_u64(lli_bin: str, opt_bin: str | None, ir_path: Path, verify_ir: boo
             raise RuntimeError(
                 f"lli --force-interpreter crashed with signal {-proc.returncode} on {ir_path}:\n{proc.stderr}"
             )
-        if proc.stderr and ("LLVM ERROR" in proc.stderr or "Cannot execute" in proc.stderr):
+        if proc.stderr and (
+            "LLVM ERROR" in proc.stderr
+            or "Cannot execute" in proc.stderr
+            or "error:" in proc.stderr.lower()
+        ):
             raise RuntimeError(f"lli --force-interpreter error on {ir_path}:\n{proc.stderr}")
         byte_val = proc.returncode & 0xFF
         word |= byte_val << (8 * byte_idx)
@@ -123,7 +127,7 @@ entry:
         }
 
 
-def run_suite(core_bin: Path, lli_bin: str, opt_bin: str | None) -> dict[str, Any]:
+def run_suite(core_bin: Path, lli_bin: str, opt_bin: str) -> dict[str, Any]:
     proc = subprocess.run(
         [str(core_bin), "llvm-diff-suite"],
         capture_output=True,
@@ -153,7 +157,7 @@ def run_suite(core_bin: Path, lli_bin: str, opt_bin: str | None) -> dict[str, An
                 expected_word = int(vec["expectedWord"])
                 ir_file = tmp / f"{cid}_v{v_idx}.ll"
                 ir_file.write_text(build_lli_harness_ir(ir_text, fn_name, inputs), encoding="utf-8")
-                actual_word = run_lli_u64(lli_bin, opt_bin, ir_file, verify_ir=(v_idx == 0))
+                actual_word = run_lli_u64(lli_bin, opt_bin, ir_file, verify_ir=True)
                 total_vectors += 1
                 if actual_word != expected_word:
                     mismatches.append(
@@ -174,7 +178,7 @@ def run_suite(core_bin: Path, lli_bin: str, opt_bin: str | None) -> dict[str, An
                     expected_word = int(vec["expectedWord"])
                     neg_file = tmp / f"{cid}_neg_v{v_idx}.ll"
                     neg_file.write_text(build_lli_harness_ir(neg_ir, fn_name, inputs), encoding="utf-8")
-                    neg_word = run_lli_u64(lli_bin, opt_bin, neg_file, verify_ir=(v_idx == 0))
+                    neg_word = run_lli_u64(lli_bin, opt_bin, neg_file, verify_ir=True)
                     if neg_word != expected_word:
                         diverged_on = {
                             "case": cid,
@@ -248,6 +252,9 @@ def main() -> int:
         return 1
 
     opt_bin = args.opt_bin or find_llvm_tool(["opt-18", "opt"])
+    if not opt_bin:
+        print("[FAIL] Missing `opt` / `opt-18` binary (install llvm-18)", file=sys.stderr)
+        return 1
     report = run_suite(core_bin, lli_bin, opt_bin)
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")

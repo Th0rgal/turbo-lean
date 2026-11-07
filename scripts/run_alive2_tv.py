@@ -71,7 +71,11 @@ def parse_alive_tv_output(stdout: str, stderr: str, returncode: int) -> dict[str
         and failed == 0
         and errors == 0
     )
-    rejected = incorrect >= 1 or "Transformation doesn't verify!" in combined
+    rejected = (
+        errors == 0
+        and returncode != 0
+        and (incorrect >= 1 or "Transformation doesn't verify!" in combined)
+    )
     return {
         "returncode": returncode,
         "correct": correct,
@@ -144,6 +148,13 @@ def ensure_alive_tv(cache_dir: Path, llvm_dir: str | None = None) -> Path:
         )
         cmake_file.write_text(cmake_txt, encoding="utf-8")
 
+        # GCC 13/14+ libstdc++ (Ubuntu 24.04) removed transitive <algorithm>/<cstdint>/<limits>/<numeric>
+        # includes that Alive2's pinned LLVM-18 snapshot relied on. Pre-including those four standard
+        # headers keeps every Alive2 translation unit compiling cleanly without patching upstream sources.
+        cxx_flags = (
+            "-fexceptions -frtti -Wno-error "
+            "-include algorithm -include cstdint -include limits -include numeric"
+        )
         cmake_cmd = [
             "cmake",
             "-GNinja",
@@ -155,7 +166,7 @@ def ensure_alive_tv(cache_dir: Path, llvm_dir: str | None = None) -> Path:
             "-DBUILD_LLVM_UTILS=ON",
             "-DBUILD_TV=OFF",
             f"-DLLVM_DIR={llvm_dir}",
-            "-DCMAKE_CXX_FLAGS=-fexceptions -frtti -Wno-error",
+            f"-DCMAKE_CXX_FLAGS={cxx_flags}",
         ]
         subprocess.run(cmake_cmd, check=True)
         jobs = str(min(os.cpu_count() or 2, 8))
@@ -175,12 +186,13 @@ def run_alive_pair(
     src_path: Path,
     tgt_path: Path,
     extra_flags: list[str] | None = None,
+    disable_undef_input: bool = False,
 ) -> dict[str, Any]:
     flags = [
         "--smt-to=20000",
         "--src-unroll=4",
         "--tgt-unroll=4",
-        "--disable-undef-input",
+        *(["--disable-undef-input"] if disable_undef_input else []),
         *(extra_flags or []),
     ]
     proc = subprocess.run(
@@ -230,7 +242,9 @@ def run_suite(core_bin: Path, alive_tv: str, opt_bin: str) -> dict[str, Any]:
                 capture_output=True,
                 text=True,
             )
-            res = run_alive_pair(alive_tv, src_ll, tgt_ll)
+            # Pipeline -O0 vs -O3 lowers pure LNIR functions whose ABI entry points receive
+            # well-defined scalar/pointer arguments from the Lean runtime/C-ABI boundary.
+            res = run_alive_pair(alive_tv, src_ll, tgt_ll, disable_undef_input=True)
             res["id"] = label
             positive_results.append(res)
 
@@ -323,6 +337,20 @@ Summary:
         self.assertFalse(d["verified"])
         self.assertTrue(d["rejected"])
         self.assertEqual(d["incorrect"], 1)
+
+    def test_parse_error_is_not_clean_rejection(self) -> None:
+        sample_err = """
+ERROR: Could not parse IR
+Summary:
+  0 correct transformations
+  1 incorrect transformations
+  0 failed-to-prove transformations
+  1 Alive2 errors
+"""
+        d = parse_alive_tv_output(sample_err, "", 1)
+        self.assertFalse(d["verified"])
+        self.assertFalse(d["rejected"])
+        self.assertEqual(d["alive2_errors"], 1)
 
 
 def main() -> int:
