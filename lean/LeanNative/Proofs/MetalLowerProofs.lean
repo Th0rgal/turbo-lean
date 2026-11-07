@@ -12,6 +12,113 @@ open LeanNative.Backend.MetalLower
 open LeanNative.Proofs
 open LeanNative.Proofs.MetalLowerSpec
 
+/-- The scalar lowerer stays in the unambiguous scalar grammar provided its variable
+spellings are valid identifiers. This premise is about names, not parser success. -/
+theorem lowerScalar_canonical (idxName : String) (idxVar : Nat) (e : ScalarExpr)
+    (hidx : MetalAst.CanonicalMSLName idxName)
+    (hvars : ∀ id : Nat, MetalAst.CanonicalMSLName s!"v{id}") :
+    MetalAst.CanonicalMSLExpr (lowerScalar idxName idxVar e) := by
+  induction e with
+  | constU64 n => trivial
+  | constBool b => cases b <;> trivial
+  | var id =>
+    unfold lowerScalar
+    split
+    · exact hidx
+    · exact hvars id
+  | binOp op l r hl hr =>
+    cases op <;> simp_all [lowerScalar, m63, u, MetalAst.CanonicalMSLExpr]
+  | unaryOp op a ha =>
+    cases op <;> simp_all [lowerScalar, u, MetalAst.CanonicalMSLExpr]
+  | select c t f hc ht hf => simp_all [lowerScalar, u, MetalAst.CanonicalMSLExpr]
+  | fma a b c ha hb hc => simp_all [lowerScalar, MetalAst.CanonicalMSLExpr]
+
+theorem canonicalBlock_ofList (stmts : List MetalAst.MSLStmt) :
+    MetalAst.CanonicalMSLBlock (.ofList stmts) ↔
+      ∀ stmt ∈ stmts, MetalAst.CanonicalMSLStmt stmt := by
+  induction stmts with
+  | nil => simp [MetalAst.MSLBlock.ofList, MetalAst.CanonicalMSLBlock]
+  | cons s ss ih => simp [MetalAst.MSLBlock.ofList, MetalAst.CanonicalMSLBlock, ih]
+
+theorem bufParam_type_canonical (name : String) (idx : Nat) (isConst : Bool) :
+    MetalAst.CanonicalMSLType (bufParam name idx isConst).ty := by
+  simp [bufParam, MetalAst.CanonicalMSLType, MetalAst.CanonicalMSLValueType]
+
+theorem guarded_canonical (inner : List MetalAst.MSLStmt)
+    (h : ∀ stmt ∈ inner, MetalAst.CanonicalMSLStmt stmt) :
+    ∀ stmt ∈ guarded inner, MetalAst.CanonicalMSLStmt stmt := by
+  have hg : MetalAst.CanonicalMSLName "gid" := by simp [MetalAst.CanonicalMSLName, MetalAst.mslNameChar]; decide
+  have hn : MetalAst.CanonicalMSLName "n" := by simp [MetalAst.CanonicalMSLName, MetalAst.mslNameChar]; decide
+  simpa [guarded, MetalAst.CanonicalMSLStmt, MetalAst.CanonicalMSLExpr,
+    MetalAst.CanonicalMSLBlock, canonicalBlock_ofList, hg, hn] using h
+
+theorem storeOut_canonical (rhs : MetalAst.MSLExpr) (h : MetalAst.CanonicalMSLExpr rhs) :
+    MetalAst.CanonicalMSLStmt (storeOut rhs) := by
+  have ho : MetalAst.CanonicalMSLBindingName "out" := by
+    simp [MetalAst.CanonicalMSLBindingName, MetalAst.CanonicalMSLName, MetalAst.mslNameChar,
+      MetalAst.parseMSLScalarType]; decide
+  have hg : MetalAst.CanonicalMSLName "gid" := by simp [MetalAst.CanonicalMSLName, MetalAst.mslNameChar]; decide
+  exact ⟨ho, hg, h⟩
+
+theorem kernelOf_canonical (name : String) (nIn : Nat) (compute : MetalAst.MSLExpr)
+    (hn : MetalAst.CanonicalMSLName name)
+    (hi : ∀ i : Nat, MetalAst.CanonicalMSLName s!"in{i}")
+    (hc : MetalAst.CanonicalMSLExpr compute) :
+    MetalAst.CanonicalMSLKernel (kernelOf name nIn compute) := by
+  have ho : MetalAst.CanonicalMSLName "out" := by simp [MetalAst.CanonicalMSLName, MetalAst.mslNameChar]; decide
+  have hl : MetalAst.CanonicalMSLName "n" := by simp [MetalAst.CanonicalMSLName, MetalAst.mslNameChar]; decide
+  have hg : MetalAst.CanonicalMSLName "gid" := by simp [MetalAst.CanonicalMSLName, MetalAst.mslNameChar]; decide
+  refine ⟨hn, ?_, rfl, guarded_canonical _ (by simpa using storeOut_canonical compute hc)⟩
+  intro param hp
+  simp only [kernelOf, List.mem_append, List.mem_map, List.mem_cons, List.not_mem_nil, or_false] at hp
+  rcases hp with ⟨i, _, rfl⟩ | rfl | rfl | rfl
+  all_goals simp [bufParam, lenParam, gidParam, MetalAst.CanonicalMSLType,
+    MetalAst.CanonicalMSLValueType, ho, hl, hg]
+  exact hi i
+
+theorem lowerKind_canonical (name : String) (kind : ParallelKernelKind)
+    (hn : MetalAst.CanonicalMSLName name)
+    (hi : ∀ i : Nat, MetalAst.CanonicalMSLName s!"in{i}")
+    (hv : ∀ i : Nat, MetalAst.CanonicalMSLName s!"v{i}") :
+    MetalAst.CanonicalMSLKernel (lowerKind name kind) := by
+  have hg : MetalAst.CanonicalMSLName "gid" := by simp [MetalAst.CanonicalMSLName, MetalAst.mslNameChar]; decide
+  have hg64 : MetalAst.CanonicalMSLName "gid64" := by simp [MetalAst.CanonicalMSLName, MetalAst.mslNameChar]; decide
+  have hl : MetalAst.CanonicalMSLName "n" := by simp [MetalAst.CanonicalMSLName, MetalAst.mslNameChar]; decide
+  have he (i : Nat) : MetalAst.CanonicalMSLExpr (elem s!"in{i}") := ⟨hi i, hg⟩
+  cases kind with
+  | mapScaleAdd s b | zipAdd | zipMul | saxpy a =>
+    apply kernelOf_canonical _ _ _ hn hi
+    all_goals
+      simp [MetalAst.CanonicalMSLExpr, elem, MetalAst.CanonicalMSLName, MetalAst.mslNameChar]
+      decide
+  | dotProduct => simp [lowerKind, MetalAst.CanonicalMSLKernel, MetalAst.CanonicalMSLStmt, hn]
+  | stencil1D3Pt l c r =>
+    have hp := (kernelOf_canonical name 1 (.immU64 0) hn hi trivial).2.1
+    refine ⟨hn, hp, rfl, guarded_canonical _ ?_⟩
+    simp [MetalAst.CanonicalMSLStmt, MetalAst.CanonicalMSLBlock,
+      MetalAst.CanonicalMSLExpr, storeOut, elem, u,
+      MetalAst.CanonicalMSLBindingName, MetalAst.CanonicalMSLName, MetalAst.mslNameChar,
+      MetalAst.parseMSLScalarType]
+    decide
+  | customScalar idx inputs body =>
+    have hp := (kernelOf_canonical name inputs.length (.immU64 0) hn hi trivial).2.1
+    refine ⟨hn, hp, rfl, guarded_canonical _ ?_⟩
+    simp only [List.mem_append, List.mem_cons, List.not_mem_nil, or_false, List.mem_map]
+    intro stmt hs
+    rcases hs with (rfl | ⟨i, _, rfl⟩) | rfl
+    · exact ⟨trivial, hg64, Or.inl rfl, hg⟩
+    · exact ⟨trivial, hv _, he i⟩
+    · exact storeOut_canonical _ (lowerScalar_canonical _ _ _ hg64 hv)
+
+theorem lowerKind_roundtrip (name : String) (kind : ParallelKernelKind)
+    (hn : MetalAst.CanonicalMSLName name)
+    (hi : ∀ i : Nat, MetalAst.CanonicalMSLName s!"in{i}")
+    (hv : ∀ i : Nat, MetalAst.CanonicalMSLName s!"v{i}")
+    (fuel : Nat) (hf : MetalAst.mslKernelFuel (lowerKind name kind) ≤ fuel) :
+    MetalAst.parseMSLKernel fuel (MetalAst.ppMSLKernel (lowerKind name kind)) =
+      some (lowerKind name kind) :=
+  MetalAst.parseMSLKernel_roundtrip _ (lowerKind_canonical name kind hn hi hv) fuel hf
+
 theorem lowerScalar_inferExprType (g : MetalAst.MSLGroupState) (ls : MetalAst.MSLLocals)
     (idxName : String) (idxVar : Nat) (boundVars : List Nat) (e : ScalarExpr) (s : Bool)
     (hsort : inferScalarSort boundVars e = some s)

@@ -130,60 +130,79 @@ def emitMetalMatMulTiledKernel (fnName : String) : String :=
     "    if (row < dim && col < dim) {\n        C[row * dim + col] = acc;\n    }\n}"
   ]
 
-def emitMetalScalarExpr (e : ScalarExpr) : String :=
-  match e with
-  | .constU64 v => s!"{v}UL"
-  | .constBool b => if b then "1UL" else "0UL"
-  | .var id => s!"v{id}"
-  | .binOp op l r =>
-    let ls := emitMetalScalarExpr l
-    let rs := emitMetalScalarExpr r
-    match op with
-    | .add => s!"({ls} + {rs})"
-    | .sub => s!"({ls} - {rs})"
-    | .mul => s!"({ls} * {rs})"
-    | .div => s!"(({rs} == 0UL) ? 0UL : ({ls} / {rs}))"
-    | .mod => s!"(({rs} == 0UL) ? 0UL : ({ls} % {rs}))"
-    | .bitAnd => s!"({ls} & {rs})"
-    | .bitOr => s!"({ls} | {rs})"
-    | .bitXor => s!"({ls} ^ {rs})"
-    | .shl => s!"({ls} << ({rs} & 63UL))"
-    | .shr => s!"({ls} >> ({rs} & 63UL))"
-    | .sar => s!"((ulong)(((long){ls}) >> ({rs} & 63UL)))"
-    | .eq => s!"(({ls} == {rs}) ? 1UL : 0UL)"
-    | .lt => s!"(({ls} < {rs}) ? 1UL : 0UL)"
-    | .le => s!"(({ls} <= {rs}) ? 1UL : 0UL)"
-    | .clmul64 => s!"ln_clmul64({ls}, {rs})"
-    | .clmul64Hi => s!"ln_clmul64_hi({ls}, {rs})"
-    | .eor3 => s!"({ls} ^ ({rs} >> 32UL) ^ ({rs} & 0xffffffffUL))"
-    | _ => s!"({ls} ^ {rs})"
-  | .unaryOp op a =>
-    let as_ := emitMetalScalarExpr a
-    match op with
-    | .not => s!"(~{as_})"
-    | .neg => s!"(0UL - {as_})"
-    | .clz256 => s!"((ulong)clz({as_}))"
-  | .select c t e =>
-    s!"((({emitMetalScalarExpr c}) != 0UL) ? ({emitMetalScalarExpr t}) : ({emitMetalScalarExpr e}))"
-  | .fma a b c =>
-    s!"(({emitMetalScalarExpr a}) * ({emitMetalScalarExpr b}) + ({emitMetalScalarExpr c}))"
+def maxVarPlusOne : ScalarExpr → Nat
+  | .var id => id + 1
+  | .binOp _ l r => max (maxVarPlusOne l) (maxVarPlusOne r)
+  | .unaryOp _ a => maxVarPlusOne a
+  | .select a b c | .fma a b c => max (maxVarPlusOne a) (max (maxVarPlusOne b) (maxVarPlusOne c))
+  | _ => 0
 
-def emitMetalCodeBody (c : LNIRCode) (indent : String := "    ") : Option String :=
+/-- Helpers outside the scalar lowerer's supported fragment retain their library ABI. -/
+def usesMetalScalarHelper : ScalarExpr → Bool
+  | .binOp op l r =>
+    (match op with | .clmul64 | .clmul64Hi => true | _ => false) ||
+      usesMetalScalarHelper l || usesMetalScalarHelper r
+  | .unaryOp op a => (match op with | .clz256 => true | _ => false) || usesMetalScalarHelper a
+  | .select a b c | .fma a b c =>
+    usesMetalScalarHelper a || usesMetalScalarHelper b || usesMetalScalarHelper c
+  | _ => false
+
+def lowerMetalScalarExpr (e : ScalarExpr) : MSLExpr :=
+  if !usesMetalScalarHelper e then lowerScalar "" (maxVarPlusOne e) e else
+  match e with
+  | .constU64 n => .immU64 n.toBitVec
+  | .constBool b => u (if b then 1 else 0)
+  | .var id => v id
+  | .binOp op l r =>
+    let ls := lowerMetalScalarExpr l
+    let rs := lowerMetalScalarExpr r
+    match op with
+    | .add | .addChecked256 => .add ls rs
+    | .sub | .subChecked256 => .sub ls rs
+    | .mul | .mulChecked256 => .mul ls rs
+    | .div => .select (.eq rs (u 0)) (u 0) (.div ls rs)
+    | .mod => .select (.eq rs (u 0)) ls (.rem ls rs)
+    | .bitAnd => .bitAnd ls rs
+    | .bitOr => .bitOr ls rs
+    | .bitXor | .gf2Affine => .bitXor ls rs
+    | .shl => .shl ls (m63 rs)
+    | .shr => .shr ls (m63 rs)
+    | .sar => .cast .ulong (.shr (.cast .long ls) (m63 rs))
+    | .eq => .cast .ulong (.eq ls rs)
+    | .lt => .cast .ulong (.lt ls rs)
+    | .le => .cast .ulong (.le ls rs)
+    | .clmul64 => .call "ln_clmul64" (.cons ls (.cons rs .nil))
+    | .clmul64Hi => .call "ln_clmul64_hi" (.cons ls (.cons rs .nil))
+    | .eor3 => .bitXor (.bitXor ls (.shr rs (u 32))) (.bitAnd rs (.immU64 0xffffffff#64))
+  | .unaryOp op a =>
+    let as_ := lowerMetalScalarExpr a
+    match op with
+    | .not => .bitNot as_
+    | .neg => .sub (u 0) as_
+    | .clz256 => .cast .ulong (.clz as_)
+  | .select c t e =>
+    .select (.ne (lowerMetalScalarExpr c) (u 0)) (lowerMetalScalarExpr t) (lowerMetalScalarExpr e)
+  | .fma a b c =>
+    .add (.mul (lowerMetalScalarExpr a) (lowerMetalScalarExpr b)) (lowerMetalScalarExpr c)
+
+def emitMetalScalarExpr (e : ScalarExpr) : String := ppMSLExpr (lowerMetalScalarExpr e)
+
+def lowerMetalCodeBody (c : LNIRCode) : Option MSLBlock :=
   match c with
   | .letBind dst _ (.scalar e) k => do
-    let rest ← emitMetalCodeBody k indent
-    some s!"{indent}ulong v{dst} = {emitMetalScalarExpr e};\n{rest}"
+    return .cons (.varDecl .ulong s!"v{dst}" (lowerMetalScalarExpr e)) (← lowerMetalCodeBody k)
   | .letBind dst _ (.call fnName args _ _) k => do
-    let rest ← emitMetalCodeBody k indent
-    let argStr := String.intercalate ", " (args.map fun a => s!"v{a}")
-    some s!"{indent}ulong v{dst} = {fnName}({argStr});\n{rest}"
-  | .incRef _ _ k | .decRef _ _ k => emitMetalCodeBody k indent
+    return .cons (.varDecl .ulong s!"v{dst}"
+      (.call fnName (MSLExprList.ofList (args.map v)))) (← lowerMetalCodeBody k)
+  | .incRef _ _ k | .decRef _ _ k => lowerMetalCodeBody k
   | .ite cv t e => do
-    let tb ← emitMetalCodeBody t (indent ++ "    ")
-    let eb ← emitMetalCodeBody e (indent ++ "    ")
-    some s!"{indent}if (v{cv} != 0UL) \{\n{tb}\n{indent}} else \{\n{eb}\n{indent}}"
-  | .ret v => some s!"{indent}return v{v};"
+    return .cons (.ifElse (.ne (v cv) (u 0)) (← lowerMetalCodeBody t)
+      (← lowerMetalCodeBody e)) .nil
+  | .ret id => some (.cons (.returnVal (v id)) .nil)
   | _ => none
+
+def emitMetalCodeBody (c : LNIRCode) (indent : String := "    ") : Option String :=
+  (lowerMetalCodeBody c).map fun body => String.intercalate "\n" (ppMSLBlockLines indent body)
 
 def emitMetalDeclKernel (d : LNIRDecl) : Option String :=
   let fnName := s!"lean_native_metal_decl_{d.name}"
@@ -217,14 +236,15 @@ def emitMetalDeclKernel (d : LNIRDecl) : Option String :=
       let isI64Ty : LNIRType → Bool | .i64 => true | _ => false
       if isI64Ty d.retTy && !d.params.isEmpty && d.params.all (fun p => isI64Ty p.ty) &&
           (d.name.toList.reverse.take 8 != "___boxed".toList.reverse) then
-        match emitMetalCodeBody d.body "    " with
-        | some bodyStr =>
-          let paramSig := String.intercalate ", " (d.params.map fun p => s!"ulong v{p.id}")
-          let devFn := s!"inline ulong {d.name}({paramSig}) \{\n{bodyStr}\n}"
-          let inBufs := (List.range d.params.length).map fun idx => s!"device const ulong* in{idx}"
-          let allBufs := inBufs ++ ["device ulong* out", "constant ulong& n"]
-          let callArgs := String.intercalate ", " ((List.range d.params.length).map fun idx => s!"in{idx}[gid]")
-          let kernFn := emitMetal1DKernel fnName allBufs s!"out[gid] = {d.name}({callArgs});"
+        match lowerMetalCodeBody d.body with
+        | some body =>
+          let devFn := ppMSLFuncDecl {
+            retTy := .ulong
+            name := d.name
+            params := d.params.map (fun p => { ty := .ulong, name := s!"v{p.id}" })
+            body := body }
+          let callArgs := MSLExprList.ofList ((List.range d.params.length).map fun idx => elem s!"in{idx}")
+          let kernFn := ppMSLKernel (kernelOf fnName d.params.length (.call d.name callArgs))
           some (devFn ++ "\n\n" ++ kernFn)
         | none => none
       else none

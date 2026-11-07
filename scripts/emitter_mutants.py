@@ -237,9 +237,26 @@ def make_worktree(parent: Path, name: str) -> Path:
     return path
 
 
+def rmtree_writable(path: Path) -> None:
+    if not path.exists():
+        return
+
+    def _onerror(func, p, _exc_info):
+        try:
+            parent_dir = os.path.dirname(p)
+            if parent_dir:
+                os.chmod(parent_dir, 0o700)
+            os.chmod(p, 0o700)
+            func(p)
+        except OSError:
+            pass
+
+    shutil.rmtree(path, onerror=_onerror)
+
+
 def remove_worktree(path: Path) -> None:
     git(["worktree", "remove", "--force", str(path)], ROOT, check=False)
-    shutil.rmtree(path, ignore_errors=True)
+    rmtree_writable(path)
 
 
 def apply_patch(root: Path, mutation: dict) -> tuple[int, str]:
@@ -370,6 +387,7 @@ def evaluate_mutation(
     log_dir: Path,
     baseline_hashes: dict[str, str | None],
     lake_snapshot: Path | None = None,
+    check_subset: tuple[str, ...] = CHECK_ORDER,
 ) -> dict:
     if mutation.get("not_applicable"):
         return not_applicable_record(root, mutation)
@@ -397,12 +415,12 @@ def evaluate_mutation(
 
     try:
         checks, hashes, rebuild_meta = run_pinned_checks(
-            root, env, spec, log_dir, lake_snapshot=lake_snapshot
+            root, env, spec, log_dir, check_subset=check_subset, lake_snapshot=lake_snapshot
         )
     finally:
         revert_worktree(root)
 
-    outcome, killers, infra_checks = classify(checks)
+    outcome, killers, infra_checks = classify(checks, order=check_subset)
     if checks["C1"]["exit"] == 0 and checks["C2"]["exit"] == 0 and not rebuild_meta["all_default_targets_built"]:
         outcome = "INFRA_FAILED"
         killers = []
@@ -477,10 +495,15 @@ def summarize(rows: list[dict], spec: dict, expected_universe: list[str], target
     }
 
 
-def run_suite(output: Path, logs: Path, only_ids: list[str] | None = None) -> dict:
+def run_suite(
+    output: Path,
+    logs: Path,
+    only_ids: list[str] | None = None,
+    check_subset: tuple[str, ...] = CHECK_ORDER,
+) -> dict:
     spec = load_spec()
     if logs.exists():
-        shutil.rmtree(logs)
+        rmtree_writable(logs)
     logs.mkdir(parents=True, exist_ok=True)
     parent = Path(tempfile.mkdtemp(prefix="emitter-mutants-", dir=str(ROOT.parent)))
     commit_sha = git(["rev-parse", "HEAD"], ROOT).stdout.strip()
@@ -505,8 +528,10 @@ def run_suite(output: Path, logs: Path, only_ids: list[str] | None = None) -> di
         if snapshot_seed.is_dir():
             shutil.copytree(snapshot_seed, snapshot, symlinks=True)
 
-        baseline_checks, baseline_hashes, baseline_rebuild = run_pinned_checks(work, env, spec, logs / "baseline")
-        base_outcome, base_killed, base_infra = classify(baseline_checks)
+        baseline_checks, baseline_hashes, baseline_rebuild = run_pinned_checks(
+            work, env, spec, logs / "baseline", check_subset=check_subset
+        )
+        base_outcome, base_killed, base_infra = classify(baseline_checks, order=check_subset)
         baseline_passed = base_outcome == "SURVIVED" and baseline_rebuild["all_default_targets_built"]
         failed_baseline = base_killed + base_infra
         if not baseline_rebuild["all_default_targets_built"]:
@@ -537,7 +562,14 @@ def run_suite(output: Path, logs: Path, only_ids: list[str] | None = None) -> di
             ]
             for mutation in selected_mutations:
                 rec = evaluate_mutation(
-                    work, mutation, spec, env, logs / mutation["id"], baseline_hashes, lake_snapshot=snapshot
+                    work,
+                    mutation,
+                    spec,
+                    env,
+                    logs / mutation["id"],
+                    baseline_hashes,
+                    lake_snapshot=snapshot,
+                    check_subset=check_subset,
                 )
                 report["mutations"].append(rec)
             summary = summarize(report["mutations"], spec, expected_universe, targeted=only_ids is not None)
@@ -547,7 +579,7 @@ def run_suite(output: Path, logs: Path, only_ids: list[str] | None = None) -> di
         remove_worktree(work)
     finally:
         git(["worktree", "prune"], ROOT, check=False)
-        shutil.rmtree(parent, ignore_errors=True)
+        rmtree_writable(parent)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -595,8 +627,8 @@ def run_fixtures(logs: Path, full_checks: bool = False) -> dict:
                     "id": "F1_build_breaking",
                     "backend": "llvm",
                     "file": "lean/LeanNative/Backend/LLVM.lean",
-                    "search": "| .sub    => emitLine s!\"  {res} = sub {tyStr} {lVal}, {rVal}\"; return res",
-                    "replace": "| .sub    => emitLine (__B0_FIXTURE_BUILD_BREAK__); return res",
+                    "search": "emitLine s!\"  {res} = sub{fl} {tyStr} {lVal}, {rVal}\"; return res",
+                    "replace": "emitLine (__B0_FIXTURE_BUILD_BREAK__); return res",
                     "expected_match_count": 1,
                 },
                 ("C1",),
@@ -608,8 +640,8 @@ def run_fixtures(logs: Path, full_checks: bool = False) -> dict:
                     "id": "F2_comment_only",
                     "backend": "llvm",
                     "file": "lean/LeanNative/Backend/LLVM.lean",
-                    "search": "| .sub    => emitLine s!\"  {res} = sub {tyStr} {lVal}, {rVal}\"; return res",
-                    "replace": "| .sub    => emitLine s!\"  {res} = sub {tyStr} {lVal}, {rVal}\"; return res -- B0 comment-only fixture",
+                    "search": "emitLine s!\"  {res} = sub{fl} {tyStr} {lVal}, {rVal}\"; return res",
+                    "replace": "emitLine s!\"  {res} = sub{fl} {tyStr} {lVal}, {rVal}\"; return res -- B0 comment-only fixture",
                     "expected_match_count": 1,
                 },
                 comment_subset,
@@ -701,7 +733,7 @@ def run_fixtures(logs: Path, full_checks: bool = False) -> dict:
         remove_worktree(work)
     finally:
         git(["worktree", "prune"], ROOT, check=False)
-        shutil.rmtree(parent, ignore_errors=True)
+        rmtree_writable(parent)
 
     return {
         "schema": "emitter-mutants-fixtures-v1",
@@ -730,6 +762,28 @@ def run_unit_tests() -> bool:
                 [sys.executable, "-c", f"print({output!r}); raise SystemExit({exit_code})"],
                 self.root, os.environ.copy(), self.root / "command.log", self.spec["infra_signatures"],
             )
+
+        def test_active_mutants_apply_to_current_sources(self):
+            active = [m for m in self.spec["mutations"] if not m.get("not_applicable")]
+            self.assertEqual({m["id"] for m in active}, {f"M{i}" for i in range(1, 11)})
+            for mutation in active:
+                with self.subTest(mutant=mutation["id"]):
+                    self.assertEqual(mutation["expected_match_count"], 1)
+                    source = ROOT / mutation["file"]
+                    target = self.root / mutation["file"]
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, target)
+                    before = target.read_text(encoding="utf-8")
+                    self.assertEqual(before.count(mutation["search"]), 1)
+                    # Isolate application from the checkout and only mock the
+                    # reporting diff; exercise the runner's real patch function.
+                    with patch(__name__ + ".git", return_value=subprocess.CompletedProcess([], 0, "fixture diff", "")):
+                        count, diff = apply_patch(self.root, mutation)
+                    self.assertEqual(count, 1)
+                    self.assertTrue(diff)
+                    self.assertEqual(target.read_text(encoding="utf-8"),
+                        before.replace(mutation["search"], mutation["replace"], 1))
+                    self.assertNotEqual(target.read_text(encoding="utf-8"), before)
 
         def rows(self) -> list[dict]:
             return [{"id": mid, "backend": "llvm", "outcome": "SURVIVED"} for mid in COMPARISON_UNIVERSE]
@@ -901,38 +955,105 @@ def run_unit_tests() -> bool:
                     self.assertEqual(record["outcome"], expected)
                     self.assertEqual(record["not_applicable"]["removed_in_verified"], expected == "NOT_APPLICABLE")
 
+        def test_verify_kills_uses_full_check_order(self):
+            import io
+            from contextlib import redirect_stdout
+            captured = {}
+
+            def fake_run_suite(out_path, logs_path, only_ids=None, check_subset=CHECK_ORDER):
+                captured["check_subset"] = tuple(check_subset)
+                active_expected = sum(1 for m in self.spec["mutations"] if not m.get("not_applicable"))
+                return {
+                    "run_outcome": "CONCLUSIVE",
+                    "summary": {"counts": {"KILLED": active_expected, "SURVIVED": 0}},
+                }
+
+            buf = io.StringIO()
+            with patch(__name__ + ".run_unit_tests", return_value=True), patch(
+                __name__ + ".run_suite", side_effect=fake_run_suite
+            ), patch.object(sys, "argv", ["emitter_mutants.py", "--verify-kills"]), redirect_stdout(buf):
+                rc = main()
+            self.assertEqual(rc, 0)
+            self.assertEqual(captured["check_subset"], CHECK_ORDER)
+            self.assertEqual(json.loads(buf.getvalue())["check_subset"], list(CHECK_ORDER))
+
     return unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(RunnerTests)).wasSuccessful()
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--unit-tests", action="store_true", help="run runner regression tests without build tools")
+    parser.add_argument("--verify-kills", action="store_true", help="run unit tests and full B-3 mutation suite requiring 100% active mutant kills")
     parser.add_argument("--fixtures", action="store_true", help="run the 4 required self-test fixtures")
     parser.add_argument("--full-fixtures", action="store_true", help="include C3/C4 in F2/F4 fixtures (for CI)")
     parser.add_argument("--fixtures-output", type=Path, help="optional path to write fixture JSON report")
     parser.add_argument("--only", help="comma-separated subset of mutation IDs for targeted testing")
-    parser.add_argument("--output", type=Path, default=ROOT / "emitter-mutation-report.json")
-    parser.add_argument("--logs", type=Path, default=ROOT / "emitter-mutation-logs")
+    parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument("--logs", type=Path, default=None)
     args = parser.parse_args()
 
     if args.unit_tests:
         return 0 if run_unit_tests() else 1
 
     if args.fixtures:
-        report = run_fixtures(args.logs, full_checks=args.full_fixtures)
-        text = json.dumps(report, indent=2, sort_keys=True) + "\n"
-        if args.fixtures_output:
-            args.fixtures_output.parent.mkdir(parents=True, exist_ok=True)
-            args.fixtures_output.write_text(text, encoding="utf-8")
-        print(text, end="")
-        return 0 if report["passed"] else 1
+        fix_tmp = tempfile.TemporaryDirectory(prefix="emitter-fixtures-logs-") if args.logs is None else None
+        try:
+            logs_path = args.logs or Path(fix_tmp.name)
+            report = run_fixtures(logs_path, full_checks=args.full_fixtures)
+            text = json.dumps(report, indent=2, sort_keys=True) + "\n"
+            if args.fixtures_output:
+                args.fixtures_output.parent.mkdir(parents=True, exist_ok=True)
+                args.fixtures_output.write_text(text, encoding="utf-8")
+            print(text, end="")
+            return 0 if report["passed"] else 1
+        finally:
+            if fix_tmp is not None:
+                fix_tmp.cleanup()
 
     only_ids = [item.strip() for item in args.only.split(",") if item.strip()] if args.only else None
-    report = run_suite(args.output, args.logs, only_ids=only_ids)
+    if args.verify_kills:
+        if not run_unit_tests():
+            return 1
+        active_expected = sum(1 for m in load_spec()["mutations"] if not m.get("not_applicable"))
+        verify_subset = CHECK_ORDER
+        tmp_ctx = tempfile.TemporaryDirectory(prefix="emitter-verify-kills-") if (args.output is None and args.logs is None) else None
+        try:
+            base_dir = Path(tmp_ctx.name) if tmp_ctx is not None else ROOT
+            out_path = args.output or (base_dir / "emitter-mutation-report.json")
+            logs_path = args.logs or (base_dir / "emitter-mutation-logs")
+            report = run_suite(out_path, logs_path, only_ids=only_ids, check_subset=verify_subset)
+            counts = report.get("summary", {}).get("counts", {})
+            all_killed = (
+                report["run_outcome"] == "CONCLUSIVE"
+                and counts.get("SURVIVED", 0) == 0
+                and counts.get("KILLED", 0) == active_expected
+            )
+            print(
+                json.dumps(
+                    {
+                        "all_active_killed": all_killed,
+                        "check_subset": list(verify_subset),
+                        "expected_active_kills": active_expected,
+                        "run_outcome": report["run_outcome"],
+                        "summary": report.get("summary", {}),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return 0 if all_killed else 1
+        finally:
+            if tmp_ctx is not None:
+                rmtree_writable(Path(tmp_ctx.name))
+                tmp_ctx.cleanup()
+
+    out_path = args.output or (ROOT / "emitter-mutation-report.json")
+    logs_path = args.logs or (ROOT / "emitter-mutation-logs")
+    report = run_suite(out_path, logs_path, only_ids=only_ids)
     print(
         json.dumps(
             {
-                "output": str(args.output),
+                "output": str(out_path),
                 "run_outcome": report["run_outcome"],
                 "summary": report.get("summary", {}),
             },

@@ -1,10 +1,16 @@
 import LeanNative.IR.Types
 import LeanNative.IR.AST
+import LeanNative.Backend.LLVMLower
 
 namespace LeanNative.Backend.LLVM
 
 open LeanSys.Par
 open LeanNative.IR
+
+/-- Typed-AST emission for the fragment accepted by `LLVMLower`, retaining its
+explicit failure result for unsupported declarations. -/
+def emitDeclLLVMViaAST (d : LNIRDecl) : Option String :=
+  (LLVMLower.lowerModuleWithFacts d).map LLVMAst.PP.ppModule
 
 def sanitizeSymbol (s : String) : String :=
   let res := String.ofList (s.toList.map fun c => if c.isAlphanum || c == '_' then c else '_')

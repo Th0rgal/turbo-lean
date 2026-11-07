@@ -431,6 +431,7 @@ pub(crate) fn confirm_file_decl_identities_with_extra_dirs(
         }) {
             out.push(att);
         } else {
+            let probe_started = request_started.unwrap_or_else(Instant::now);
             out.push(confirm_decl_identity_with_extra_dirs(
                 src,
                 shard,
