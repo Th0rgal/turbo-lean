@@ -1390,6 +1390,7 @@ theorem parsePTXInstr_cvt_roundtrip (rm : PTXRoundMode) (dt st : PTXType)
     show ("cvt" == "st") = false from rfl, show ("cvt" == "ld") = false from rfl,
     show ("cvt" == "cvta") = false from rfl, show ("cvt" == "cvt") = true from rfl,
     hd, hs, stripPrefixChars, beq_self_eq_true, pure, ↓reduceIte, Bool.false_eq_true]
+  dsimp only [rmMods, dtTok]
   cases rm <;> cases dt <;> rfl
 
 set_option maxHeartbeats 1000000 in
