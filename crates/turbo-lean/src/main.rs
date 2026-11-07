@@ -13,9 +13,7 @@
 //! - [`splitter`]: Stateful AST Command Splitter, Scope Tracker, and Axiom Hygiene Scanner
 //! - [`zygote`]: Persistent Lean 4 Zygote daemon and Prefix-Tree `fork()` Copy-on-Write cache
 
-pub mod accel_fastcheck;
 pub mod accelerators;
-pub mod cas;
 mod check;
 pub mod cluster;
 mod db;
@@ -34,7 +32,6 @@ pub mod shm_cache;
 mod splitter;
 pub mod superopt_evolve;
 mod trusted_tools;
-pub mod verify;
 #[cfg(all(test, unix))]
 mod worktree_test_support;
 pub mod zygote;
