@@ -39433,7 +39433,7 @@ globs = ["Down.+"]
             root.join("lakefile.lean"),
             "import Lake\nopen Lake DSL\npackage app where\n@[default_target]\nlean_lib App where\n",
         )?;
-        fs::write(root.join("App.lean"), "import PwDep\ndef x : Nat := pwVal\n")?;
+        fs::write(root.join("App.lean"), "prelude\nimport PwDep\ndef x : Nat := pwVal\n")?;
 
         let pw_dir = root.join(".lake/packages/proofwidgets");
         fs::create_dir_all(pw_dir.join("widget/js"))?;
@@ -39442,7 +39442,10 @@ globs = ["Down.+"]
             pw_dir.join("lakefile.lean"),
             "import Lake\nopen Lake DSL System\npackage ProofWidgets where\n  preferReleaseBuild := true\ndef widgetDir : FilePath := \"widget\"\ninput_dir widgetJsAllTs where\n  path := widgetDir / \"js\"\n  filter := .extension <| .mem #[\"ts\", \"tsx\"]\ntarget widgetJsAll pkg : Unit := do\n  return .nil\n@[default_target]\nlean_lib ProofWidgets where\n  needs := #[widgetJsAll]\n",
         )?;
-        fs::write(pw_dir.join("ProofWidgets.lean"), "def pwHelper : Nat := 1\n")?;
+        fs::write(
+            pw_dir.join("ProofWidgets.lean"),
+            "prelude\ndef pwHelper : Nat := 1\n",
+        )?;
 
         let dep_dir = root.join(".lake/packages/pwdep");
         fs::create_dir_all(&dep_dir)?;
@@ -39450,7 +39453,7 @@ globs = ["Down.+"]
             dep_dir.join("lakefile.lean"),
             "import Lake\nopen Lake DSL\npackage PwDep where\n@[default_target]\nlean_lib PwDep where\n",
         )?;
-        let dep_src = "def pwVal : Nat := 42\n";
+        let dep_src = "prelude\ndef pwVal : Nat := 42\n";
         fs::write(dep_dir.join("PwDep.lean"), dep_src)?;
 
         let mut git_init = crate::trusted_tools::git(root)?;
@@ -39516,6 +39519,7 @@ globs = ["Down.+"]
         let fake_githash = "0123456789abcdef0123456789abcdef01234567";
         cfg.lean_githash = fake_githash.to_string();
         cfg.lean_bin = PathBuf::from("/bin/true");
+        cfg.toolchain_lib_lean = PathBuf::new();
 
         let pw_pkg = cfg
             .dep_pkgs
@@ -39633,7 +39637,7 @@ globs = ["Down.+"]
         );
 
         // Tampering with source invalidates inputless depHash verification.
-        fs::write(dep_dir.join("PwDep.lean"), "def pwVal : Nat := 99\n")?;
+        fs::write(dep_dir.join("PwDep.lean"), "prelude\ndef pwVal : Nat := 99\n")?;
         let mut cache2 = LakeClosureCache::default();
         cache2.ignore_mtime_skew = true;
         let mut visiting2 = HashSet::new();
@@ -39700,7 +39704,10 @@ globs = ["Down.+"]
             "dirty non-.lean tracked input in git-pinned custom-target-needs package must fail closed"
         );
         fs::write(pw_dir.join("widget/js/hello.tsx"), "export default {}\n")?;
-        fs::write(pw_dir.join("ProofWidgets.lean"), "def pwHelper : Nat := 2\n")?;
+        fs::write(
+            pw_dir.join("ProofWidgets.lean"),
+            "prelude\ndef pwHelper : Nat := 2\n",
+        )?;
         let mut cache4 = LakeClosureCache::default();
         cache4.ignore_mtime_skew = true;
         let mut visiting4 = HashSet::new();
@@ -39728,7 +39735,7 @@ globs = ["Down.+"]
             root.join("lakefile.lean"),
             "import Lake\nopen Lake DSL\npackage app where\n@[default_target]\nlean_lib App where\n",
         )?;
-        let root_sorry_src = "import SearchDep.Syntax\ntheorem badRoot : False := sorry\n";
+        let root_sorry_src = "prelude\nimport SearchDep.Syntax\ntheorem badRoot : False := sorry\n";
         fs::write(root.join("App.lean"), root_sorry_src)?;
 
         let dep_dir = root.join(".lake/packages/searchdep");
@@ -39739,7 +39746,7 @@ globs = ["Down.+"]
         )?;
         // Mimics `LeanSearchClient.Syntax`: non-root git-pinned dependency mentioning `IO.getEnv`
         // (forcing native DAG compilation) and referencing `sorryAx` in helper/meta code.
-        let dep_src = "def queryUrl : IO (Option String) := IO.getEnv \"LEANSEARCHCLIENT_URL\"\ndef mkFallbackRef : String := s!\"{``sorryAx}\"\n";
+        let dep_src = "prelude\ndef queryUrl : IO (Option String) := IO.getEnv \"LEANSEARCHCLIENT_URL\"\ndef mkFallbackRef : String := s!\"{``sorryAx}\"\n";
         fs::write(dep_dir.join("SearchDep/Syntax.lean"), dep_src)?;
 
         fs::write(
@@ -39762,6 +39769,7 @@ globs = ["Down.+"]
         let fake_githash = "0123456789abcdef0123456789abcdef01234567";
         cfg.lean_githash = fake_githash.to_string();
         cfg.lean_bin = PathBuf::from("/bin/true");
+        cfg.toolchain_lib_lean = PathBuf::new();
 
         let dag = build_module_dag_with_trust(&cfg, &[], false)?;
         let dep_node = dag
