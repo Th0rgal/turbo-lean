@@ -3556,6 +3556,7 @@ fn resolve_untrusted_pr_project_config(
         manifest_packages: Vec::new(),
         dep_pkgs: Vec::new(),
         canonical_config_digest: String::new(),
+        is_untrusted: true,
     })
 }
 
