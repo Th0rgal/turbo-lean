@@ -1198,8 +1198,7 @@ theorem parsePTXInstr_modified_binary_roundtrip (opcode modifier : String) (ty :
   unfold parsePTXInstr
   simp only [ht, bind, Option.bind, pure, hne.1, hne.2.1, hne.2.2,
     Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
-  rw [show (ptxOpcodeFields ((opcode ++ modifier).toList ++ (ppPTXType ty).toList)).map String.ofList = parts by
-    simpa [String.toList_append, List.append_assoc] using hparts]
+  rw [hparts]
   simp only [List.head?_cons, hlast, parsePTXType_suffix, hmods,
     hop_not_st, hop_not_ld, hop_not_cvta, hop_not_cvt, hop_allow, Bool.not_true, Bool.false_and,
     hd, ha, hb, hop_not_selp, stripPrefixChars, bind, Option.bind, pure]
@@ -1332,8 +1331,7 @@ theorem parsePTXInstr_ternary_roundtrip (opcode modifier : String) (ty : PTXType
   unfold parsePTXInstr
   simp only [ht, bind, Option.bind, pure, hne.1, hne.2.1, hne.2.2,
     Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
-  rw [show (ptxOpcodeFields ((opcode ++ modifier).toList ++ (ppPTXType ty).toList)).map String.ofList = parts by
-    simpa [String.toList_append, List.append_assoc] using hparts]
+  rw [hparts]
   simp only [List.head?_cons, hlast, parsePTXType_suffix, hmods,
     hop_not_st, hop_not_ld, hop_not_cvta, hop_not_cvt, hop_allow, Bool.not_true, Bool.false_and,
     hd, ha, hb, hc, hop_not_selp, hop_not_setp, stripPrefixChars, bind, Option.bind, pure]
@@ -1392,10 +1390,7 @@ theorem parsePTXInstr_cvt_roundtrip (rm : PTXRoundMode) (dt st : PTXType)
   unfold parsePTXInstr
   simp only [ht, bind, Option.bind, pure, hne.1, hne.2.1, hne.2.2,
     Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
-  have hfields' : (ptxOpcodeFields ('c' :: 'v' :: 't' :: ((ppRoundMode rm).toList ++ ((ppPTXType dt).toList ++ (ppPTXType st).toList)))).map String.ofList = parts := by
-    simpa only [String.toList_append, String.reduceToList, List.append_assoc,
-      List.cons_append, List.nil_append] using hfields
-  rw [hfields']
+  rw [hfields]
   simp only [List.head?_cons, hlast, stTok, parsePTXType_suffix, hmods,
     show ("cvt" == "st") = false from rfl, show ("cvt" == "ld") = false from rfl,
     show ("cvt" == "cvta") = false from rfl, show ("cvt" == "cvt") = true from rfl,

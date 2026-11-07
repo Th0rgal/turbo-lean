@@ -41,20 +41,33 @@ private theorem parseMSLParamType_pointer_roundtrip (sp : MSLAddressSpace) (isCo
     · rename_i rest heq; exact False.elim (hnotconst rest heq)
     · rfl
   have hrev (l : List Char) : (l ++ ['*']).reverse = '*' :: l.reverse := by simp
-  cases sp <;> cases isConst
-  all_goals try exact False.elim (Bool.noConfusion (hconst rfl))
-  all_goals
-    unfold parseMSLParamType
-    rw [hscalar]
-    simp only [ppMSLType, ppMSLAddressSpace, bne_self_eq_false, bne_iff_ne, ne_eq,
-      reduceCtorEq, not_false_eq_true, decide_true, Bool.true_and, Bool.false_and,
-      Bool.false_eq_true, ↓reduceIte, String.toList_append, String.reduceToList,
-      List.append_assoc, List.cons_append, List.nil_append]
-    dsimp only [bind, Option.bind, pure]
-    try rw [hnc]
-    dsimp only
-    rw [hrev]
-    simp [List.reverse_reverse, String.ofList_toList, hpel]
+  cases isConst with
+  | false =>
+    cases sp
+    all_goals
+      unfold parseMSLParamType
+      rw [hscalar]
+      simp only [ppMSLType, ppMSLAddressSpace, Bool.false_and, Bool.false_eq_true, ↓reduceIte,
+        String.toList_append, String.reduceToList, List.append_assoc, List.cons_append]
+      dsimp only [bind, Option.bind, pure]
+      rw [hnc]
+      dsimp only
+      rw [hrev]
+      simp [List.reverse_reverse, String.ofList_toList, hpel]
+  | true =>
+    cases sp
+    case constant => exact False.elim (Bool.noConfusion (hconst rfl))
+    all_goals
+      unfold parseMSLParamType
+      rw [hscalar]
+      simp only [ppMSLType, ppMSLAddressSpace, show (MSLAddressSpace.device != .constant) = true from rfl,
+        show (MSLAddressSpace.thread != .constant) = true from rfl,
+        show (MSLAddressSpace.threadgroup != .constant) = true from rfl,
+        Bool.true_and, ↓reduceIte, String.toList_append, String.reduceToList,
+        List.append_assoc, List.cons_append]
+      dsimp only [bind, Option.bind, pure]
+      rw [hrev]
+      simp [List.reverse_reverse, String.ofList_toList, hpel]
 
 private theorem parseMSLParamType_ref_roundtrip (sp : MSLAddressSpace)
     (el : MSLType) (hel : CanonicalMSLValueType el) :
@@ -77,9 +90,11 @@ private theorem parseMSLParamType_ref_roundtrip (sp : MSLAddressSpace)
     unfold parseMSLParamType
     rw [hscalar]
     simp only [ppMSLType, ppMSLAddressSpace, String.toList_append, String.reduceToList,
-      List.append_assoc, List.cons_append, List.nil_append]
+      List.append_assoc, List.cons_append]
     dsimp only [bind, Option.bind, pure]
-    rw [hnc, hrev]
+    rw [hnc]
+    dsimp only
+    rw [hrev]
     simp [List.reverse_reverse, String.ofList_toList, hpel]
 
 theorem parseMSLParamType_roundtrip (ty : MSLType) (h : CanonicalMSLType ty) :
@@ -92,7 +107,7 @@ theorem parseMSLParamType_roundtrip (ty : MSLType) (h : CanonicalMSLType ty) :
   | .void | .bool | .uchar | .ushort | .uint | .int | .ulong | .long
   | .half | .float | .double | .uint2 | .uint3 | .uint4 | .ulong2 | .atomicUint | .u256 =>
     unfold parseMSLParamType
-    rw [parseMSLScalarType_roundtrip _ h]
+    rw [parseMSLScalarType_roundtrip ty h]
     rfl
 
 theorem ppMSLType_injective_on_canonical (a b : MSLType)
@@ -661,7 +676,10 @@ theorem parseMSLExpr_roundtrip (e : MSLExpr) (he : CanonicalMSLExpr e)
   case immU64 v =>
     obtain ⟨f, rfl⟩ : ∃ f, fuel = f + 1 := ⟨fuel - 1, by simp [mslExprFuel] at hf; omega⟩
     exact parseMSLExpr_u64_roundtrip v rest hsuf f
-      (by have hf' : v.toNat.repr.toList.length + 4 ≤ f + 1 := by simpa [mslExprFuel] using hf; omega)
+      (by
+        have hf' : v.toNat.repr.toList.length + 4 ≤ f + 1 := by
+          simpa only [mslExprFuel] using hf
+        omega)
   case immBool b =>
     exact parseMSLExpr_bool_suffix_roundtrip b rest hsuf fuel (by simp [mslExprFuel] at hf; omega)
   case bitNot a =>
