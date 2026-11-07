@@ -614,11 +614,10 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
               simp at hlast; subst uc
               cases tcs with
               | nil =>
-                have : (' ' == tc) = false := by
-                  cases htc : ' ' == tc
-                  · rfl
-                  · simp [stripPrefixChars, beq_comm.mp htc] at hno
-                simp [stripPrefixChars, beq_comm.mp this]
+                simp only [stripPrefixChars] at hno ⊢
+                split at hno
+                · simp at hno
+                · rename_i hne; simp [hne]
               | cons tc2 tcs2 =>
                 have hne : tc ≠ ' ' := fun h => by subst tc; simp [List.dropLast_cons_cons] at hsp
                 simp [stripPrefixChars, hne]
@@ -661,8 +660,7 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
         · rcases he2 with ⟨_, _, _, _, _, _, _, _, _, rfl⟩; rw [hsep_eq]; rfl
         · rcases he2 with ⟨_, _, _, _, _, _, _, _, _, _, rfl⟩; rw [hsep_eq]; rfl
         · rcases he2 with ⟨_, _, _, _, _, _, _, _, _, _, _, rfl⟩; rw [hsep_eq]; rfl
-        · rcases he2 with ⟨_, _, _, _, _, _, _, _, _, _, _, _, hnil⟩
-          simp at hnil; exact False.elim (hy hnil.2)
+        · simp [List.cons_append] at he2
     have hmid_scan := scanHLOFields_prefix sep mid suffix.toList (suffix.toList.length + 1)
       suffix.toList [] hsep_ne hmid hafter
     let pre := ("%" ++ d).toList
@@ -734,6 +732,7 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
     have heq : payload = String.intercalate " " ["stablehlo." ++ opName, "%" ++ a ++ ",", "%" ++ b] := by
       apply String.ext_iff.mpr; simp [payload, suffix, args, String.toList_append]
     rw [heq]; simpa using hp
+  have hbp_excl_sp : ' ' ∉ b.toList := hb.excludes b ' ' rfl
   have hpct_pl : parseHLOFields " %" payload =
       some ["stablehlo." ++ opName, a ++ ",", b] := by
     have hp := parseHLOFields_intercalate_head ' ' "%" ["stablehlo." ++ opName, a ++ ",", b] (by simp) (by
@@ -742,7 +741,7 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
       rcases hx with rfl | rfl | rfl
       · simp [String.toList_append, hop_excl ' ' rfl]
       · simp [String.toList_append, ha.excludes a ' ' rfl]
-      · exact hb.excludes b ' ' rfl)
+      · exact hbp_excl_sp)
     have heq : payload = String.intercalate " %" ["stablehlo." ++ opName, a ++ ",", b] := by
       apply String.ext_iff.mpr; simp [payload, suffix, args, String.toList_append]
     rw [heq]; simpa using hp
@@ -757,7 +756,7 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
       · decide
       · simp [String.toList_append, hop_excl ' ' rfl]
       · simp [String.toList_append, ha.excludes a ' ' rfl]
-      · simp [String.toList_append, hb.excludes b ' ' rfl])
+      · simp [String.toList_append, hbp_excl_sp])
     have heq : operation = String.intercalate " "
         ["%" ++ d, "=", "stablehlo." ++ opName, "%" ++ a ++ ",", "%" ++ b] := by
       apply String.ext_iff.mpr; simp [operation, suffix, args, String.toList_append]
@@ -772,14 +771,14 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
     simpa [String.toList_append, String.ofList_toList] using this
   have ha_last : (("%" ++ a ++ ",").toList.getLast? != some ',') = false := by
     have heq : ("%" ++ a ++ ",").toList = ("%" ++ a).toList ++ [','] := by
-      simp [String.toList_append, List.append_assoc]
+      simp [String.toList_append]
     rw [heq, List.getLast?_concat]
     decide
   have ha_take : String.ofList (("%" ++ a ++ ",").toList.take (("%" ++ a ++ ",").toList.length - 1)) = "%" ++ a := by
     have heq : ("%" ++ a ++ ",").toList = ("%" ++ a).toList ++ [','] := by
-      simp [String.toList_append, List.append_assoc]
+      simp [String.toList_append]
     rw [heq, List.length_append, List.length_singleton, Nat.add_sub_cancel, List.take_left]
-    exact String.ofList_toList ("%" ++ a)
+    exact String.ofList_toList _
   have hunary :
       (do
         if let some [arg, dims] := parseHLOFields ", dims = " payload then
@@ -806,7 +805,11 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
   unfold parseStableHLOOp
   rw [hsplit_ann]
   dsimp only [bind, Option.bind]
-  rw [hcmp, hsel, hst, hd.parse_roundtrip d]
+  rw [hcmp, hsel]
+  dsimp only [bind, Option.bind]
+  rw [hst]
+  dsimp only [bind, Option.bind]
+  rw [hd.parse_roundtrip d]
   dsimp only [bind, Option.bind]
   change (do
     if let some (src, makeOp) :=
@@ -882,7 +885,9 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
         let ty ← resultTypeOf tenv op
         if annotation == ppTensorType ty then some op else none
     | _ => none) = some op
-  rw [hunary, hdot, hcst, hsp_op]
+  rw [hunary]
+  dsimp only [bind, Option.bind]
+  rw [hdot, hcst, hsp_op]
   dsimp only [bind, Option.bind]
   rw [hd.parse_roundtrip d]
   dsimp only [bind, Option.bind]

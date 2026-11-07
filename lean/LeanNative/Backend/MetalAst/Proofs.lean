@@ -48,7 +48,7 @@ private theorem parseMSLParamType_pointer_roundtrip (sp : MSLAddressSpace) (isCo
       unfold parseMSLParamType
       rw [hscalar]
       simp only [ppMSLType, ppMSLAddressSpace, Bool.false_and, Bool.false_eq_true, ↓reduceIte,
-        String.toList_append, String.reduceToList, List.append_assoc, List.cons_append]
+        String.toList_append, String.reduceToList, List.append_assoc, List.cons_append, List.nil_append]
       dsimp only [bind, Option.bind, pure]
       rw [hnc]
       dsimp only
@@ -64,7 +64,7 @@ private theorem parseMSLParamType_pointer_roundtrip (sp : MSLAddressSpace) (isCo
         show (MSLAddressSpace.thread != .constant) = true from rfl,
         show (MSLAddressSpace.threadgroup != .constant) = true from rfl,
         Bool.true_and, ↓reduceIte, String.toList_append, String.reduceToList,
-        List.append_assoc, List.cons_append]
+        List.append_assoc, List.cons_append, List.nil_append]
       dsimp only [bind, Option.bind, pure]
       rw [hrev]
       simp [List.reverse_reverse, String.ofList_toList, hpel]
@@ -90,7 +90,7 @@ private theorem parseMSLParamType_ref_roundtrip (sp : MSLAddressSpace)
     unfold parseMSLParamType
     rw [hscalar]
     simp only [ppMSLType, ppMSLAddressSpace, String.toList_append, String.reduceToList,
-      List.append_assoc, List.cons_append]
+      List.append_assoc, List.cons_append, List.nil_append]
     dsimp only [bind, Option.bind, pure]
     rw [hnc]
     dsimp only
@@ -99,15 +99,16 @@ private theorem parseMSLParamType_ref_roundtrip (sp : MSLAddressSpace)
 
 theorem parseMSLParamType_roundtrip (ty : MSLType) (h : CanonicalMSLType ty) :
     parseMSLParamType (ppMSLType ty) = some ty := by
-  match ty with
-  | .pointer sp c el => exact parseMSLParamType_pointer_roundtrip sp c el h.1 h.2
-  | .ref sp el => exact parseMSLParamType_ref_roundtrip sp el h
-  | .threadArr .. => exact False.elim h
-  | .structTy .. => exact False.elim h
-  | .void | .bool | .uchar | .ushort | .uint | .int | .ulong | .long
-  | .half | .float | .double | .uint2 | .uint3 | .uint4 | .ulong2 | .atomicUint | .u256 =>
+  match ty, h with
+  | .pointer sp c el, ⟨hel, hc⟩ => exact parseMSLParamType_pointer_roundtrip sp c el hel hc
+  | .ref sp el, hel => exact parseMSLParamType_ref_roundtrip sp el hel
+  | .threadArr .., h => exact False.elim h
+  | .structTy .., h => exact False.elim h
+  | .void, h | .bool, h | .uchar, h | .ushort, h | .uint, h | .int, h | .ulong, h | .long, h
+  | .half, h | .float, h | .double, h | .uint2, h | .uint3, h | .uint4, h | .ulong2, h
+  | .atomicUint, h | .u256, h =>
     unfold parseMSLParamType
-    rw [parseMSLScalarType_roundtrip ty h]
+    rw [parseMSLScalarType_roundtrip _ h]
     rfl
 
 theorem ppMSLType_injective_on_canonical (a b : MSLType)

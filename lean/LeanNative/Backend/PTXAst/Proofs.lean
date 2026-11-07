@@ -1195,13 +1195,12 @@ theorem parsePTXInstr_modified_binary_roundtrip (opcode modifier : String) (ty :
     arg 2
     simp only [String.toList_append, String.reduceToList, List.append_assoc,
       List.cons_append, List.nil_append]
-  unfold parsePTXInstr
-  simp only [ht, bind, Option.bind, pure, hne.1, hne.2.1, hne.2.2,
-    Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
+  simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
+    Bool.false_eq_true, ↓reduceIte, stripPrefixChars, beq_self_eq_true]
   rw [hparts]
   simp only [List.head?_cons, hlast, parsePTXType_suffix, hmods,
     hop_not_st, hop_not_ld, hop_not_cvta, hop_not_cvt, hop_allow, Bool.not_true, Bool.false_and,
-    hd, ha, hb, hop_not_selp, stripPrefixChars, bind, Option.bind, pure]
+    hd, ha, hb, hop_not_selp, stripPrefixChars, beq_self_eq_true, bind, Option.bind, pure]
   rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩ | ⟨cmp, rfl, rfl, rfl⟩
   · cases rm <;> rfl
   · cases mode <;> rfl
@@ -1328,13 +1327,12 @@ theorem parsePTXInstr_ternary_roundtrip (opcode modifier : String) (ty : PTXType
     arg 2
     simp only [String.toList_append, String.reduceToList, List.append_assoc,
       List.cons_append, List.nil_append]
-  unfold parsePTXInstr
-  simp only [ht, bind, Option.bind, pure, hne.1, hne.2.1, hne.2.2,
-    Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
+  simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
+    Bool.false_eq_true, ↓reduceIte, stripPrefixChars, beq_self_eq_true]
   rw [hparts]
   simp only [List.head?_cons, hlast, parsePTXType_suffix, hmods,
     hop_not_st, hop_not_ld, hop_not_cvta, hop_not_cvt, hop_allow, Bool.not_true, Bool.false_and,
-    hd, ha, hb, hc, hop_not_selp, hop_not_setp, stripPrefixChars, bind, Option.bind, pure]
+    hd, ha, hb, hc, hop_not_selp, hop_not_setp, stripPrefixChars, beq_self_eq_true, bind, Option.bind, pure]
   rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩
   · cases rm <;> rfl
   · cases mode <;> rfl
@@ -1387,14 +1385,13 @@ theorem parsePTXInstr_cvt_roundtrip (rm : PTXRoundMode) (dt st : PTXType)
     arg 2
     simp only [ppPTXInstr, toString, String.toList_append, String.reduceToList,
       List.append_assoc, List.cons_append, List.nil_append]
-  unfold parsePTXInstr
-  simp only [ht, bind, Option.bind, pure, hne.1, hne.2.1, hne.2.2,
-    Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
+  simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
+    Bool.false_eq_true, ↓reduceIte, stripPrefixChars, beq_self_eq_true]
   rw [hfields]
   simp only [List.head?_cons, hlast, stTok, parsePTXType_suffix, hmods,
     show ("cvt" == "st") = false from rfl, show ("cvt" == "ld") = false from rfl,
     show ("cvt" == "cvta") = false from rfl, show ("cvt" == "cvt") = true from rfl,
-    hd, hs, stripPrefixChars, bind, Option.bind, pure]
+    hd, hs, stripPrefixChars, beq_self_eq_true, bind, Option.bind, pure]
   cases rm <;> simp [rmMods, dtTok, String.toList_append, String.toList_ofList, hdt]
 
 set_option maxHeartbeats 1000000 in
