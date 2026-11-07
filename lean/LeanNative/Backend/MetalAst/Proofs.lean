@@ -43,9 +43,10 @@ private theorem parseMSLParamType_pointer_roundtrip (sp : MSLAddressSpace) (isCo
     cases sp <;> {
       simp only [ppMSLType, ppMSLAddressSpace, Bool.false_and, Bool.false_eq_true, ↓reduceIte,
         String.toList_append, String.reduceToList, List.cons_append, List.nil_append]
+      dsimp only [Option.bind]
       split
       · rename_i rest heq; exact False.elim (hnotconst rest heq)
-      · dsimp only; rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
+      · rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
     }
   | true =>
     cases sp
@@ -53,15 +54,15 @@ private theorem parseMSLParamType_pointer_roundtrip (sp : MSLAddressSpace) (isCo
     case device =>
       simp only [ppMSLType, ppMSLAddressSpace, show (MSLAddressSpace.device != .constant) = true from rfl,
         Bool.true_and, ↓reduceIte, String.toList_append, String.reduceToList, List.cons_append, List.nil_append]
-      dsimp only; rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
+      dsimp only [Option.bind]; rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
     case thread =>
       simp only [ppMSLType, ppMSLAddressSpace, show (MSLAddressSpace.thread != .constant) = true from rfl,
         Bool.true_and, ↓reduceIte, String.toList_append, String.reduceToList, List.cons_append, List.nil_append]
-      dsimp only; rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
+      dsimp only [Option.bind]; rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
     case threadgroup =>
       simp only [ppMSLType, ppMSLAddressSpace, show (MSLAddressSpace.threadgroup != .constant) = true from rfl,
         Bool.true_and, ↓reduceIte, String.toList_append, String.reduceToList, List.cons_append, List.nil_append]
-      dsimp only; rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
+      dsimp only [Option.bind]; rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
 
 private theorem parseMSLParamType_ref_roundtrip (sp : MSLAddressSpace)
     (el : MSLType) (hel : CanonicalMSLValueType el) :
@@ -79,9 +80,10 @@ private theorem parseMSLParamType_ref_roundtrip (sp : MSLAddressSpace)
   cases sp <;> {
     simp only [ppMSLType, ppMSLAddressSpace, String.toList_append, String.reduceToList,
       List.cons_append, List.nil_append]
+    dsimp only [Option.bind]
     split
     · rename_i rest heq; exact False.elim (hnotconst rest heq)
-    · dsimp only; rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
+    · rw [hrev]; simp [List.reverse_reverse, String.ofList_toList, hpel]
   }
 
 theorem parseMSLParamType_roundtrip (ty : MSLType) (h : CanonicalMSLType ty) :
