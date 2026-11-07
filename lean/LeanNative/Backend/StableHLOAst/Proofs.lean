@@ -614,10 +614,10 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
               simp at hlast; subst uc
               cases tcs with
               | nil =>
-                simp only [stripPrefixChars] at hno ⊢
+                simp only [stripPrefixChars] at hno
                 split at hno
-                · simp at hno
-                · rename_i hne; simp [hne]
+                · simp [stripPrefixChars] at hno
+                · rename_i hne; simp [stripPrefixChars, hne]
               | cons tc2 tcs2 =>
                 have hne : tc ≠ ' ' := fun h => by subst tc; simp [List.dropLast_cons_cons] at hsp
                 simp [stripPrefixChars, hne]
@@ -644,6 +644,12 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
           intro m; induction m <;> simp_all [stripPrefixChars]
         rw [hs2, happ]; exact hno_suf
       | cons c0 xs =>
+        have hlen_le : xs.length + 1 + y.length = 13 := by
+          have := congrArg List.length he
+          simp [mid] at this
+          omega
+        have hy_pos : 0 < y.length := List.length_pos_iff.mpr hy
+        have hxs_lt : xs.length < 12 := by omega
         have hm : mid = ' ' :: ['=', ' ', 's', 't', 'a', 'b', 'l', 'e', 'h', 'l', 'o', '.'] := by decide
         rw [hm, List.cons_append, List.cons.injEq] at he
         rcases he with ⟨_, he2⟩
@@ -660,7 +666,7 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
         · rcases he2 with ⟨_, _, _, _, _, _, _, _, _, rfl⟩; rw [hsep_eq]; rfl
         · rcases he2 with ⟨_, _, _, _, _, _, _, _, _, _, rfl⟩; rw [hsep_eq]; rfl
         · rcases he2 with ⟨_, _, _, _, _, _, _, _, _, _, _, rfl⟩; rw [hsep_eq]; rfl
-        · simp [List.cons_append] at he2
+        · simp at hxs_lt; omega
     have hmid_scan := scanHLOFields_prefix sep mid suffix.toList (suffix.toList.length + 1)
       suffix.toList [] hsep_ne hmid hafter
     let pre := ("%" ++ d).toList
@@ -682,9 +688,12 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
     rw [hlen, hchars]; change (scanHLOFields sep _ _).map _ = _; rw [hfull]
     simp only [Option.map_some, List.map_cons, List.map_nil]
     congr 2; apply String.ext_iff.mpr; simp [operation, pre, mid, String.toList_append, List.append_assoc]
-  have hcmp := hnonmatch "compare " (by decide) hno_cmp
-  have hsel := hnonmatch "select " (by decide) hno_sel
-  have hdot := hnonmatch "dot_general " (by decide) hno_dot
+  have hcmp : parseHLOFields " = stablehlo.compare " operation = some [operation] :=
+    hnonmatch "compare " (by decide) hno_cmp
+  have hsel : parseHLOFields " = stablehlo.select " operation = some [operation] :=
+    hnonmatch "select " (by decide) hno_sel
+  have hdot : parseHLOFields " = stablehlo.dot_general " operation = some [operation] :=
+    hnonmatch "dot_general " (by decide) hno_dot
   have hcst : parseHLOFields " = stablehlo.constant dense<" operation = some [operation] := by
     unfold parseHLOFields
     have hlt_op : '<' ∉ operation.toList := by
@@ -778,7 +787,7 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
     have heq : ("%" ++ a ++ ",").toList = ("%" ++ a).toList ++ [','] := by
       simp [String.toList_append]
     rw [heq, List.length_append, List.length_singleton, Nat.add_sub_cancel, List.take_left]
-    exact String.ofList_toList _
+    exact String.ofList_toList (s := "%" ++ a)
   have hunary :
       (do
         if let some [arg, dims] := parseHLOFields ", dims = " payload then

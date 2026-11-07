@@ -1198,9 +1198,10 @@ theorem parsePTXInstr_modified_binary_roundtrip (opcode modifier : String) (ty :
   simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
     Bool.false_eq_true, ↓reduceIte, stripPrefixChars, beq_self_eq_true]
   rw [hparts]
-  simp only [List.head?_cons, hlast, parsePTXType_suffix, hmods,
+  dsimp only [parts, List.head?_cons]
+  simp only [hlast, parsePTXType_suffix, hmods,
     hop_not_st, hop_not_ld, hop_not_cvta, hop_not_cvt, hop_allow, Bool.not_true, Bool.false_and,
-    hd, ha, hb, hop_not_selp, stripPrefixChars, beq_self_eq_true, bind, Option.bind, pure]
+    hd, ha, hb, hop_not_selp, stripPrefixChars, beq_self_eq_true, bind, Option.bind, pure, ↓reduceIte, Bool.false_eq_true]
   rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩ | ⟨cmp, rfl, rfl, rfl⟩
   · cases rm <;> rfl
   · cases mode <;> rfl
@@ -1330,9 +1331,10 @@ theorem parsePTXInstr_ternary_roundtrip (opcode modifier : String) (ty : PTXType
   simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
     Bool.false_eq_true, ↓reduceIte, stripPrefixChars, beq_self_eq_true]
   rw [hparts]
-  simp only [List.head?_cons, hlast, parsePTXType_suffix, hmods,
+  dsimp only [parts, List.head?_cons]
+  simp only [hlast, parsePTXType_suffix, hmods,
     hop_not_st, hop_not_ld, hop_not_cvta, hop_not_cvt, hop_allow, Bool.not_true, Bool.false_and,
-    hd, ha, hb, hc, hop_not_selp, hop_not_setp, stripPrefixChars, beq_self_eq_true, bind, Option.bind, pure]
+    hd, ha, hb, hc, hop_not_selp, hop_not_setp, stripPrefixChars, beq_self_eq_true, bind, Option.bind, pure, ↓reduceIte, Bool.false_eq_true]
   rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩
   · cases rm <;> rfl
   · cases mode <;> rfl
@@ -1388,10 +1390,11 @@ theorem parsePTXInstr_cvt_roundtrip (rm : PTXRoundMode) (dt st : PTXType)
   simp only [parsePTXInstr, ht, bind, Option.bind, hne.1, hne.2.1, hne.2.2,
     Bool.false_eq_true, ↓reduceIte, stripPrefixChars, beq_self_eq_true]
   rw [hfields]
-  simp only [List.head?_cons, hlast, stTok, parsePTXType_suffix, hmods,
+  dsimp only [parts, List.head?_cons]
+  simp only [hlast, stTok, parsePTXType_suffix, hmods,
     show ("cvt" == "st") = false from rfl, show ("cvt" == "ld") = false from rfl,
     show ("cvt" == "cvta") = false from rfl, show ("cvt" == "cvt") = true from rfl,
-    hd, hs, stripPrefixChars, beq_self_eq_true, bind, Option.bind, pure]
+    hd, hs, stripPrefixChars, beq_self_eq_true, bind, Option.bind, pure, ↓reduceIte, Bool.false_eq_true]
   cases rm <;> simp [rmMods, dtTok, String.toList_append, String.toList_ofList, hdt]
 
 set_option maxHeartbeats 1000000 in
