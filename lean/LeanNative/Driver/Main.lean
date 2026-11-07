@@ -58,6 +58,7 @@ def runMain (args : List String) : IO UInt32 := do
     if let some rc ← dispatchSharedCommand "lean-native" (frontendHook allowRcAdt) args then
       return rc
     match args with
+    | "llvm-diff-suite" :: rest => LeanNative.Driver.LLVMDiffCLI.run rest
     | "build-exe" :: rest    => runBuildExe rest
     | "audit-axioms" :: rest => runAuditAxioms rest
     | "turbo-status" :: _    => runTurboStatus

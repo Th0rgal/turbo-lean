@@ -24,6 +24,9 @@ jobs:
       run_lean_build: ${{ steps.plan.outputs.run_lean_build }}
       conformance_seeds: ${{ steps.plan.outputs.conformance_seeds }}
       run_conformance_full: ${{ steps.plan.outputs.run_conformance_full }}
+      llvm_backend: ${{ steps.plan.outputs.llvm_backend }}
+      ci_scripts: ${{ steps.plan.outputs.ci_scripts }}
+      force_full: ${{ steps.plan.outputs.force_full }}
       impact_digest: ${{ steps.plan.outputs.impact_digest }}
       inputs_unchanged: ${{ steps.plan.outputs.inputs_unchanged }}
     steps:
@@ -35,6 +38,10 @@ jobs:
           python3 scripts/ci_impact_plan.py --self-test
           python3 scripts/sync_docs_inventory.py --check
           python3 scripts/emitter_mutants.py --unit-tests
+          python3 scripts/run_llvm_lli_diff.py --self-test
+          python3 scripts/run_alive2_tv.py --self-test
+          python3 scripts/check_lean_mlir_bridge_sync.py --self-test
+          python3 scripts/check_lean_mlir_bridge_sync.py
       - id: plan
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
@@ -61,7 +68,20 @@ jobs:
       - name: Provision sanitizer & compiler runtime dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential clang gcc
+          sudo apt-get install -y --no-install-recommends build-essential clang gcc cmake ninja-build llvm-18 llvm-18-dev llvm-18-tools libz3-dev re2c zlib1g-dev libzstd-dev
+
+      - name: Cache Alive2 translation-validation binary (alive-tv)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/alive2-tv
+          key: ${{ runner.os }}-alive2-llvm18-2547695358b01758a01f4bdab2ced70178189074-v1
+
+      - name: Ensure pinned Alive2 (alive-tv) binary
+        run: |
+          python3 scripts/run_alive2_tv.py --self-test
+          mkdir -p "$HOME/.cache/alive2-tv"
+          python3 -c "import sys; sys.path.insert(0, 'scripts'); from pathlib import Path; import run_alive2_tv as m; p = m.ensure_alive_tv(Path.home()/'.cache/alive2-tv'); print('alive-tv ready at', p)"
+          echo "$HOME/.cache/alive2-tv/bin" >> "$GITHUB_PATH"
 
       - name: Cache Lean toolchain, Cargo registry, and build artifacts
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -100,3 +120,58 @@ jobs:
 
       - name: Run full scalar/tuple/Stage-1D frontend & SymbolicTV conformance suite
         run: python3 -m unittest -v scripts/test_scalar_frontend.py
+
+  lean-mlir-bridge:
+    needs: impact
+    if: >-
+      needs.impact.outputs.run_lean_build == 'true' &&
+      (needs.impact.outputs.llvm_backend == 'true' ||
+       needs.impact.outputs.ci_scripts == 'true' ||
+       needs.impact.outputs.force_full == 'true')
+    name: Stage 2C opencompl/lean-mlir Bisimulation Bridge (0 sorryAx)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact LLVMAst <-> lean-mlir-bridge synchronization & upstream SHA pins
+        run: |
+          python3 scripts/check_lean_mlir_bridge_sync.py --self-test
+          python3 scripts/check_lean_mlir_bridge_sync.py --json
+
+      - name: Cache Lean nightly toolchain & lean-mlir/Mathlib build artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.elan
+            verification/lean-mlir-bridge/.lake
+          key: ${{ runner.os }}-lean-mlir-bridge-${{ hashFiles('verification/lean-mlir-bridge/lean-toolchain', 'verification/lean-mlir-bridge/lakefile.toml', 'verification/lean-mlir-bridge/lake-manifest.json', 'verification/lean-mlir-bridge/**/*.lean') }}
+          restore-keys: |
+            ${{ runner.os }}-lean-mlir-bridge-${{ hashFiles('verification/lean-mlir-bridge/lean-toolchain', 'verification/lean-mlir-bridge/lakefile.toml') }}-
+            ${{ runner.os }}-lean-mlir-bridge-
+
+      - name: Setup Lean toolchain for verification/lean-mlir-bridge
+        run: |
+          BRIDGE_TC="$(tr -d '[:space:]' < verification/lean-mlir-bridge/lean-toolchain)"
+          if [ ! -x "$HOME/.elan/bin/elan" ]; then
+            curl --retry 5 --retry-all-errors -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain "$BRIDGE_TC"
+          else
+            "$HOME/.elan/bin/elan" toolchain install "$BRIDGE_TC"
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          (cd verification/lean-mlir-bridge && "$HOME/.elan/bin/lean" --version)
+
+      - name: Fetch Mathlib olean cache & build LeanMLIRBridge (0 sorryAx kernel audit)
+        working-directory: verification/lean-mlir-bridge
+        run: |
+          if [ ! -f lake-manifest.json ]; then
+            lake update LeanMLIR
+          fi
+          lake exe cache get
+          lake build LeanMLIRBridge
+          python3 ../../scripts/check_lean_mlir_bridge_sync.py --json
+

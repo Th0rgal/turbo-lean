@@ -1,0 +1,18 @@
+name = "lean-mlir-bridge"
+version = "0.1.0"
+defaultTargets = ["LeanMLIRBridge"]
+
+[[require]]
+name = "LeanMLIR"
+git = "https://github.com/opencompl/lean-mlir.git"
+rev = "b8c4a771319a044854a4bbb49b8821381ef86ff8"
+subDir = "LeanMLIR"
+
+[[lean_lib]]
+name = "SSA"
+
+[[lean_lib]]
+name = "LeanNative"
+
+[[lean_lib]]
+name = "LeanMLIRBridge"

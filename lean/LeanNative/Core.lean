@@ -91,6 +91,7 @@ import LeanNative.Proofs.AsyncStateMachineProofs
 import LeanNative.Transform.CostAutotune
 import LeanNative.Proofs.CostAutotuneSoundness
 import LeanNative.Driver.CostAutotuneCLI
+import LeanNative.Driver.LLVMDiffCLI
 
 namespace LeanNative.Core
 

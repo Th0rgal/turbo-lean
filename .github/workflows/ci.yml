@@ -33,6 +33,10 @@ jobs:
           python3 scripts/ci_impact_plan.py --self-test
           python3 scripts/sync_docs_inventory.py --check
           python3 scripts/emitter_mutants.py --unit-tests
+          python3 scripts/run_llvm_lli_diff.py --self-test
+          python3 scripts/run_alive2_tv.py --self-test
+          python3 scripts/check_lean_mlir_bridge_sync.py --self-test
+          python3 scripts/check_lean_mlir_bridge_sync.py
       - id: plan
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
