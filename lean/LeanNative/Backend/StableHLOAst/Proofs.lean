@@ -446,8 +446,6 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
     (hopName : (opName.toList.all fun c => c.isAlphanum || c == '_') = true)
     (hno_cmp : stripPrefixChars "compare ".toList (opName ++ " ").toList = none)
     (hno_sel : stripPrefixChars "select ".toList (opName ++ " ").toList = none)
-    (hno_res : opName ≠ "reshape")
-    (hno_cnv : opName ≠ "convert")
     (hno_slc : opName ≠ "slice")
     (hno_dot : stripPrefixChars "dot_general ".toList (opName ++ " ").toList = none)
     (hbin : parseBinaryOp ("stablehlo." ++ opName) d a b = some op)
@@ -912,7 +910,7 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
   dsimp only [bind, Option.bind]
   rw [ha_last]
   simp only [Bool.false_eq_true, ↓reduceIte, ha_take, ha.parse_roundtrip a, hb.parse_roundtrip b,
-    hbin, hrt, annotation, bind, Option.bind, beq_self_eq_true]
+    hbin, hrt, annotation, beq_self_eq_true]
 
 theorem parseStableHLOOp_binary_roundtrip (tenv : TypeEnv) (d a b : String)
     (op : StableHLOOp)
@@ -929,43 +927,43 @@ theorem parseStableHLOOp_binary_roundtrip (tenv : TypeEnv) (d a b : String)
     rcases hop with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl
     · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
         parseStableHLOOp_ppTyped_binary tenv "add" d a b (.add d a b) ty
-          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl he hd ha hb
+          (by decide) rfl rfl (by decide) rfl rfl he hd ha hb
     · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
         parseStableHLOOp_ppTyped_binary tenv "subtract" d a b (.subtract d a b) ty
-          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl he hd ha hb
+          (by decide) rfl rfl (by decide) rfl rfl he hd ha hb
     · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
         parseStableHLOOp_ppTyped_binary tenv "multiply" d a b (.multiply d a b) ty
-          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl he hd ha hb
+          (by decide) rfl rfl (by decide) rfl rfl he hd ha hb
     · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
         parseStableHLOOp_ppTyped_binary tenv "divide" d a b (.divide d a b) ty
-          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl he hd ha hb
+          (by decide) rfl rfl (by decide) rfl rfl he hd ha hb
     · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
         parseStableHLOOp_ppTyped_binary tenv "remainder" d a b (.remainder d a b) ty
-          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl he hd ha hb
+          (by decide) rfl rfl (by decide) rfl rfl he hd ha hb
     · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
         parseStableHLOOp_ppTyped_binary tenv "maximum" d a b (.maximum d a b) ty
-          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl he hd ha hb
+          (by decide) rfl rfl (by decide) rfl rfl he hd ha hb
     · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
         parseStableHLOOp_ppTyped_binary tenv "minimum" d a b (.minimum d a b) ty
-          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl he hd ha hb
+          (by decide) rfl rfl (by decide) rfl rfl he hd ha hb
     · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
         parseStableHLOOp_ppTyped_binary tenv "and" d a b (.and d a b) ty
-          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl he hd ha hb
+          (by decide) rfl rfl (by decide) rfl rfl he hd ha hb
     · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
         parseStableHLOOp_ppTyped_binary tenv "or" d a b (.or d a b) ty
-          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl he hd ha hb
+          (by decide) rfl rfl (by decide) rfl rfl he hd ha hb
     · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
         parseStableHLOOp_ppTyped_binary tenv "xor" d a b (.xor d a b) ty
-          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl he hd ha hb
+          (by decide) rfl rfl (by decide) rfl rfl he hd ha hb
     · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
         parseStableHLOOp_ppTyped_binary tenv "shift_left" d a b (.shiftLeft d a b) ty
-          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl he hd ha hb
+          (by decide) rfl rfl (by decide) rfl rfl he hd ha hb
     · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
         parseStableHLOOp_ppTyped_binary tenv "shift_right_arithmetic" d a b (.shiftRightArithmetic d a b) ty
-          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl he hd ha hb
+          (by decide) rfl rfl (by decide) rfl rfl he hd ha hb
     · simpa [ppStableHLOOp, he, toString, String.append_assoc] using
         parseStableHLOOp_ppTyped_binary tenv "shift_right_logical" d a b (.shiftRightLogical d a b) ty
-          (by decide) rfl rfl (by decide) (by decide) (by decide) rfl rfl he hd ha hb
+          (by decide) rfl rfl (by decide) rfl rfl he hd ha hb
 
 theorem parseStableHLOOp_add_roundtrip (tenv : TypeEnv) (d a b : String)
     (hd : CanonicalSSAName d) (ha : CanonicalSSAName a) (hb : CanonicalSSAName b)

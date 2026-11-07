@@ -618,8 +618,9 @@ private theorem parseMSLExpr_roundtrip_binary_op (opcode : String) (ctor : MSLEx
       some (ctor a b, rest) := by
   exact parseMSLExpr_binary_paren_step opcode ctor hop hspace hquestion
     a b ha rest fuel (by omega)
-    (ihA _ (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by omega))
-    (ihB _ (Or.inl rfl) (fuel - 2) (by omega))
+    (ihA (' ' :: (opcode.toList ++ ' ' :: ((ppMSLExpr b).toList ++ ')' :: rest)))
+      (Or.inr (Or.inr (Or.inr (Or.inr rfl)))) (fuel - 1) (by omega))
+    (ihB (')' :: rest) (Or.inl rfl) (fuel - 2) (by omega))
 
 set_option maxHeartbeats 800000 in
 theorem parseMSLExpr_roundtrip (e : MSLExpr) (he : CanonicalMSLExpr e)
