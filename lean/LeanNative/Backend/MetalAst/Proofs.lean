@@ -83,7 +83,7 @@ private theorem canonicalMSLType_no_special_char (ty : MSLType) (h : CanonicalMS
     c ∉ (ppMSLType ty).toList := by
   have hsp (sp : MSLAddressSpace) : c ∉ (ppMSLAddressSpace sp).toList := by
     rcases hc with rfl | rfl | rfl | rfl <;> (cases sp <;> decide)
-  have hconst_str : c ∉ " const ".toList := by
+  have hconst_str : c ∉ [' ', 'c', 'o', 'n', 's', 't', ' '] := by
     rcases hc with rfl | rfl | rfl | rfl <;> decide
   have hspace : c ≠ ' ' := by rcases hc with rfl | rfl | rfl | rfl <;> decide
   have hstar : c ≠ '*' := by rcases hc with rfl | rfl | rfl | rfl <;> decide
@@ -96,14 +96,20 @@ private theorem canonicalMSLType_no_special_char (ty : MSLType) (h : CanonicalMS
     · cases sp
       case constant => exact False.elim (Bool.noConfusion (h.2 rfl))
       case device =>
+        have hcs := hconst_str
+        simp only [List.mem_cons, List.not_mem_nil, or_false] at hcs
         simp [ppMSLType, show (MSLAddressSpace.device != .constant) = true from rfl,
-          String.toList_append, hsp .device, hel, hconst_str, hstar]
+          String.toList_append, hsp .device, hel, hcs, hstar]
       case thread =>
+        have hcs := hconst_str
+        simp only [List.mem_cons, List.not_mem_nil, or_false] at hcs
         simp [ppMSLType, show (MSLAddressSpace.thread != .constant) = true from rfl,
-          String.toList_append, hsp .thread, hel, hconst_str, hstar]
+          String.toList_append, hsp .thread, hel, hcs, hstar]
       case threadgroup =>
+        have hcs := hconst_str
+        simp only [List.mem_cons, List.not_mem_nil, or_false] at hcs
         simp [ppMSLType, show (MSLAddressSpace.threadgroup != .constant) = true from rfl,
-          String.toList_append, hsp .threadgroup, hel, hconst_str, hstar]
+          String.toList_append, hsp .threadgroup, hel, hcs, hstar]
   | ref sp el =>
     have hel := canonicalMSLValueType_no_special_char el h c hc
     simp [ppMSLType, String.toList_append, hsp sp, hel, hspace, hamp]
