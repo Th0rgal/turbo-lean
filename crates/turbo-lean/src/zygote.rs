@@ -107,7 +107,9 @@ pub(crate) const ZYGOTE_SCANNER_VERSION: u32 = 5;
 /// so every persisted verdict must carry this version. Bump when the replay is strengthened.
 /// v2: trusted non-root dependency modules (compiled, CAS-restored or prebuilt) are replayed
 /// too; v1 outputs may import an unreplayed dependency `.olean`.
-pub(crate) const ZYGOTE_REPLAY_VERSION: u32 = 2;
+/// v3: duplicate realized theorems in Lean 4.35 `module` closures are audited for axioms and
+/// kernel-checked under fresh names rather than skipped when already present in `base`.
+pub(crate) const ZYGOTE_REPLAY_VERSION: u32 = 3;
 
 /// Fail-closed provenance gate for every persisted verifier verdict: it must have been vetted
 /// by the current stderr scanner *and* produced under the current kernel replay.
@@ -3295,6 +3297,15 @@ pub(crate) fn ensure_zygote_binary(
     ensure_zygote_binary_at(&store.root, lean_bin, env_vars)
 }
 
+pub(crate) fn compiler_failure(source: &Path, out: &std::process::Output) -> anyhow::Error {
+    anyhow::anyhow!(
+        "`lean -c` failed on {}:\n{}\n{}",
+        source.display(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
 pub(crate) fn ensure_zygote_binary_at(
     store_root: &Path,
     lean_bin: &Path,
@@ -3429,9 +3440,7 @@ pub(crate) fn ensure_zygote_binary_at(
             .output()
             .with_context(|| format!("Failed to compile {stem}.lean to C"))?;
         if !out.status.success() {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            anyhow::bail!("`lean -c` failed on {stem}.lean:\n{stdout}{stderr}");
+            return Err(compiler_failure(Path::new(&format!("{stem}.lean")), &out));
         }
         let c_out = Command::new(leanc_bin)
             .arg(c_opt)
@@ -10253,6 +10262,23 @@ mod tests {
                 && joined_msgs.contains("42")
         );
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_compiler_failure_preserves_both_diagnostic_streams() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: b"source.lean: error: missing instance".to_vec(),
+            stderr: b"compiler stderr".to_vec(),
+        };
+        let err = compiler_failure(Path::new("source.lean"), &out);
+        let text = err.to_string();
+        assert!(
+            text.contains("source.lean: error: missing instance"),
+            "{text}"
+        );
+        assert!(text.contains("compiler stderr"), "{text}");
     }
 
     #[test]

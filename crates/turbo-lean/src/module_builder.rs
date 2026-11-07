@@ -1565,6 +1565,18 @@ fn resolve_toolchain_compiler_with_roots(
     is_untrusted: bool,
     explicit_elan_roots: Option<&[PathBuf]>,
 ) -> Result<(PathBuf, String, PathBuf, PathBuf)> {
+    if let Some(version) = extract_toolchain_version_token(toolchain) {
+        let mut parts = version.split('.');
+        if let (Some(major), Some(minor)) = (
+            parts.next().and_then(|s| s.parse::<u32>().ok()),
+            parts.next().and_then(|s| s.parse::<u32>().ok()),
+        ) {
+            anyhow::ensure!(
+                (major, minor) >= (4, 31),
+                "Unsupported Lean toolchain `{toolchain}`: turbo-lean requires Lean >= 4.31.0; update lean-toolchain and rebuild the project with Lake"
+            );
+        }
+    }
     let canon_proj = project_dir
         .canonicalize()
         .unwrap_or_else(|_| project_dir.to_path_buf());
@@ -5636,10 +5648,18 @@ fn parse_lakefile_lean_inner(
                 line_no
             );
         }
-        if indent == 0 && current_block == (DeclBlock::Package { braced: true }) && trimmed == "}" {
-            current_block = DeclBlock::None;
-            block_keys.clear();
-            continue;
+        if indent == 0 && current_block == (DeclBlock::Package { braced: true }) {
+            if trimmed == "}" {
+                current_block = DeclBlock::None;
+                block_keys.clear();
+                continue;
+            }
+            anyhow::bail!(
+                "Unclosed `package ... {{` block before `{}` in {} at line {}: fail-closed static Lake config gate",
+                trimmed,
+                lean_path.display(),
+                line_no
+            );
         }
         // Lake continues a field's expression on a column-0 `++` or closing-bracket line; the
         // field reader above stops at column 0, so such a line fails closed.
@@ -6115,9 +6135,10 @@ fn parse_lakefile_lean_inner(
                             .flatten();
                         match key {
                             "path" => {
-                                let bindings_opt =
-                                    (!is_root_pkg && lakefile_is_plain_with_policy(&clean, is_root_pkg))
-                                        .then_some((&lean_option_bindings, line_no));
+                                let bindings_opt = (!is_root_pkg
+                                    && !lean_option_bindings.scoped
+                                    && lakefile_is_plain_with_policy(&clean, false))
+                                .then_some((&lean_option_bindings, line_no));
                                 input.path =
                                     checked_input_path(&parse_lean_path_literal_with_bindings(
                                         key,
@@ -6148,6 +6169,12 @@ fn parse_lakefile_lean_inner(
                 }
             }
         }
+    }
+    if current_block == (DeclBlock::Package { braced: true }) {
+        anyhow::bail!(
+            "Unclosed `package ... {{` block in {}: fail-closed static Lake config gate",
+            lean_path.display()
+        );
     }
     check_empty_roots(&pkg, &empty_roots)?;
     if let Some(inp) = pkg
@@ -6885,18 +6912,18 @@ fn finalize_package_config(
         .libs
         .iter()
         .find_map(|l| {
-            let need = l
-                .needs
-                .iter()
-                .find(|n| !pkg.inputs.iter().any(|i| &i.name == *n))?;
+            let need = l.needs.iter().find(|n| {
+                !pkg.inputs.iter().any(|i| &i.name == *n)
+                    && (is_root_pkg || !pkg.custom_targets.contains(n))
+            })?;
             Some(("library", l.name.clone(), need.clone()))
         })
         .or_else(|| {
             pkg.exes.iter().find_map(|e| {
-                let need = e
-                    .needs
-                    .iter()
-                    .find(|n| !pkg.inputs.iter().any(|i| &i.name == *n))?;
+                let need = e.needs.iter().find(|n| {
+                    !pkg.inputs.iter().any(|i| &i.name == *n)
+                        && (is_root_pkg || !pkg.custom_targets.contains(n))
+                })?;
                 Some(("executable", e.name.clone(), need.clone()))
             })
         });
@@ -10295,6 +10322,34 @@ pub(crate) fn dep_pkg_import_pins_consistent(
     true
 }
 
+fn lean_version_requires_ir_sig(version: &str) -> bool {
+    let mut parts = version.trim_start_matches('v').split('.');
+    match (
+        parts.next().and_then(|s| s.parse::<u32>().ok()),
+        parts.next().and_then(|s| s.parse::<u32>().ok()),
+    ) {
+        (Some(major), Some(minor)) => (major, minor) >= (4, 33),
+        _ => true,
+    }
+}
+
+pub(crate) fn olean_requires_ir_sig(olean_path: &Path) -> bool {
+    read_olean_header_version_and_githash(olean_path)
+        .is_none_or(|(version, _)| lean_version_requires_ir_sig(&version))
+}
+
+fn module_ir_sig_hash(olean_path: &Path, require_sidecars: bool) -> Result<Option<u64>> {
+    if !olean_requires_ir_sig(olean_path) {
+        return Ok(None);
+    }
+    verify_and_hash_artifact_bytes(
+        &olean_path.with_extension("ir.sig"),
+        require_sidecars,
+        require_sidecars,
+    )
+    .map(Some)
+}
+
 fn compute_module_arts_traces(
     olean_path: &Path,
     is_mod: bool,
@@ -10308,37 +10363,26 @@ fn compute_module_arts_traces(
     let srv_path = PathBuf::from(format!("{}.server", olean_path.display()));
     let priv_path = PathBuf::from(format!("{}.private", olean_path.display()));
     let ir_path = olean_path.with_extension("ir");
-    let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
     let srv_h = verify_and_hash_artifact_bytes(&srv_path, require_sidecars, require_sidecars)?;
     let priv_h = verify_and_hash_artifact_bytes(&priv_path, require_sidecars, require_sidecars)?;
-    let ir_sig_h_opt = if ir_sig_path.exists() {
-        Some(verify_and_hash_artifact_bytes(
-            &ir_sig_path,
-            require_sidecars,
-            require_sidecars,
-        )?)
-    } else {
-        None
-    };
+    let ir_sig_h = module_ir_sig_hash(olean_path, require_sidecars)?;
     let ir_h = verify_and_hash_artifact_bytes(&ir_path, require_sidecars, require_sidecars)?;
-    let (meta_t, all_t) = if let Some(ir_sig_h) = ir_sig_h_opt {
-        let meta_t = lake_mix_hash(lake_mix_hash(lake_mix_hash(1723, olean_h), ir_sig_h), ir_h);
-        let all_t = lake_mix_hash(
-            lake_mix_hash(
-                lake_mix_hash(lake_mix_hash(lake_mix_hash(1723, olean_h), srv_h), priv_h),
-                ir_sig_h,
-            ),
-            ir_h,
-        );
-        (meta_t, all_t)
-    } else {
-        let meta_t = lake_mix_hash(lake_mix_hash(1723, olean_h), ir_h);
-        let all_t = lake_mix_hash(
-            lake_mix_hash(lake_mix_hash(lake_mix_hash(1723, olean_h), ir_h), srv_h),
-            priv_h,
-        );
-        (meta_t, all_t)
+    let Some(ir_sig_h) = ir_sig_h else {
+        let meta_t = lake_mix_hash(arts_trace, ir_h);
+        return Ok((
+            arts_trace,
+            meta_t,
+            lake_mix_hash(lake_mix_hash(meta_t, srv_h), priv_h),
+        ));
     };
+    let meta_t = lake_mix_hash(lake_mix_hash(lake_mix_hash(1723, olean_h), ir_sig_h), ir_h);
+    let all_t = lake_mix_hash(
+        lake_mix_hash(
+            lake_mix_hash(lake_mix_hash(lake_mix_hash(1723, olean_h), srv_h), priv_h),
+            ir_sig_h,
+        ),
+        ir_h,
+    );
     Ok((arts_trace, meta_t, all_t))
 }
 
@@ -10353,16 +10397,11 @@ fn verify_trace_outputs_against_artifacts_ext(
     let srv_path = PathBuf::from(format!("{}.server", olean_path.display()));
     let priv_path = PathBuf::from(format!("{}.private", olean_path.display()));
     let ir_path = olean_path.with_extension("ir");
-    let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
     let mod_comp_hashes = if is_module {
         Some((
             verify_and_hash_artifact_bytes(&srv_path, true, true)?,
             verify_and_hash_artifact_bytes(&priv_path, true, true)?,
-            if ir_sig_path.exists() {
-                Some(verify_and_hash_artifact_bytes(&ir_sig_path, true, true)?)
-            } else {
-                None
-            },
+            module_ir_sig_hash(olean_path, true)?,
             verify_and_hash_artifact_bytes(&ir_path, true, true)?,
         ))
     } else {
@@ -18083,15 +18122,10 @@ fn write_lake_module_hashes_and_trace_with_memo(
         None
     };
     let mod_companions_res = if node.is_module {
-        let ir_sig_res_opt = if ir_sig_path.exists() {
-            Some(verify_and_hash_artifact_bytes(&ir_sig_path, false, false))
-        } else {
-            None
-        };
         Some((
             verify_and_hash_artifact_bytes(&srv_path, false, false),
             verify_and_hash_artifact_bytes(&priv_path, false, false),
-            ir_sig_res_opt,
+            module_ir_sig_hash(&node.olean_path, false),
             verify_and_hash_artifact_bytes(&ir_path, false, false),
         ))
     } else {
@@ -18107,9 +18141,9 @@ fn write_lake_module_hashes_and_trace_with_memo(
         && olean_h_res.is_ok()
         && ilean_h_res.is_ok()
         && c_h_res.as_ref().is_none_or(|r| r.is_ok())
-        && mod_companions_res.as_ref().is_none_or(|(s, p, rs_opt, r)| {
-            s.is_ok() && p.is_ok() && rs_opt.as_ref().is_none_or(|rs| rs.is_ok()) && r.is_ok()
-        });
+        && mod_companions_res
+            .as_ref()
+            .is_none_or(|(s, p, rs, r)| s.is_ok() && p.is_ok() && rs.is_ok() && r.is_ok());
     let header = parse_header_info(&src_raw);
     let mut import_entries = Vec::new();
     let mut dep_trace_fresh = header.header_error.is_none() && header.is_module == node.is_module;
@@ -18314,26 +18348,21 @@ fn write_lake_module_hashes_and_trace_with_memo(
         }
     };
     let mod_companion_hashes =
-        if let Some((Ok(srv_h), Ok(priv_h), ir_sig_res_opt, Ok(ir_h))) = mod_companions_res {
+        if let Some((Ok(srv_h), Ok(priv_h), Ok(ir_sig_h_opt), Ok(ir_h))) = mod_companions_res {
             for (p, h) in [(&srv_path, srv_h), (&priv_path, priv_h), (&ir_path, ir_h)] {
                 sidecar_writes.push((
                     PathBuf::from(format!("{}.hash", p.display())),
                     format!("{:016x}", h).into_bytes(),
                 ));
             }
-            let ir_sig_h_opt = match ir_sig_res_opt {
-                Some(Ok(ir_sig_h)) => {
-                    sidecar_writes.push((
-                        PathBuf::from(format!("{}.hash", ir_sig_path.display())),
-                        format!("{:016x}", ir_sig_h).into_bytes(),
-                    ));
-                    Some(ir_sig_h)
-                }
-                _ => {
-                    let _ = fs::remove_file(format!("{}.hash", ir_sig_path.display()));
-                    None
-                }
-            };
+            if let Some(ir_sig_h) = ir_sig_h_opt {
+                sidecar_writes.push((
+                    PathBuf::from(format!("{}.hash", ir_sig_path.display())),
+                    format!("{:016x}", ir_sig_h).into_bytes(),
+                ));
+            } else {
+                let _ = fs::remove_file(format!("{}.hash", ir_sig_path.display()));
+            }
             Some((srv_h, priv_h, ir_sig_h_opt, ir_h))
         } else {
             for p in [&srv_path, &priv_path, &ir_sig_path, &ir_path] {
@@ -19030,7 +19059,7 @@ fn query_toolchain_native_spec(lean_bin: &Path) -> Result<ToolchainNativeSpec> {
         "  IO.println s!\"TARGET\\t{System.Platform.target}\"",
         "  IO.println s!\"IS_WINDOWS\\t{System.Platform.isWindows}\"",
         "  IO.println s!\"IS_OSX\\t{System.Platform.isOSX}\"",
-        "  IO.println s!\"IS_LINUX\\t{System.Platform.isLinux}\"",
+        "  IO.println s!\"IS_LINUX\\t{(System.Platform.target.splitOn \"-\").contains \"linux\"}\"",
         "  for f in Lean.Compiler.FFI.getCFlags'.push \"-Wno-unused-command-line-argument\" do",
         "    IO.println s!\"CFLAG\\t{f}\"",
         &format!("  for f in Lean.Compiler.FFI.getInternalCFlags \"{ROOT_SENTINEL}\" do"),
@@ -20006,7 +20035,11 @@ fn publish_module_artifacts_atomic(
         (tmp_srv, &dst_srv, node.is_module),
         (tmp_priv, &dst_priv, node.is_module),
         (tmp_ir, &dst_ir, node.is_module),
-        (tmp_ir_sig, &dst_ir_sig, node.is_module),
+        (
+            tmp_ir_sig,
+            &dst_ir_sig,
+            node.is_module && olean_requires_ir_sig(tmp_olean),
+        ),
         (tmp_c, &node.c_path, node.needs_c),
         (&tmp_ltar, &dst_ltar, false),
         (&tmp_ltar_hash, &dst_ltar_hash, false),
@@ -21756,7 +21789,8 @@ fn probe_warm_on_disk_module_candidate(
     if node.is_module {
         let ir_path = node.olean_path.with_extension("ir");
         let ir_sig_path = PathBuf::from(format!("{}.sig", ir_path.display()));
-        let needs_ir_sig = !lake_trace_uses_nested_mod_deps(&cfg.toolchain);
+        let needs_ir_sig = !lake_trace_uses_nested_mod_deps(&cfg.toolchain)
+            || olean_requires_ir_sig(&node.olean_path);
         if !is_regular_nonempty_file(&ir_path)
             || (needs_ir_sig && !is_regular_nonempty_file(&ir_sig_path))
         {
@@ -26124,6 +26158,67 @@ lean_lib Other where
 lean_lib Later where
   globs := #[.one `Smoke.Shared]
 "#;
+    #[test]
+    fn test_issue355_dependency_configuration_syntax_and_security() {
+        let dir = make_temp_test_dir("issue355_config");
+        let lf = dir.join("lakefile.lean");
+        fs::create_dir_all(dir.join("widget/src")).unwrap();
+        fs::write(dir.join("widget/package.json"), "{}").unwrap();
+        fs::write(dir.join("widget/src/main.ts"), "export {}").unwrap();
+        let evmyul = "import Lake\nopen Lake DSL System\npackage «evmyul» {\n  moreLeanArgs := #[\"-DautoImplicit=false\"]\n  moreServerOptions := #[⟨`autoImplicit, false⟩]\n}\ndef cloneWithCache (url : String) := do\n  if true then dbg_trace s!\"Cloning: {url}\"; pure ()\ntarget ffi.o pkg : FilePath := do\n  pure (pkg.buildDir / \"ffi.o\")\nextern_lib libleanffi pkg := do\n  discard <| IO.Process.run {cmd := \"git\", args := #[\"status\"]}\nlean_lib «EvmYul»\n";
+        let widgets = "import Lake\nopen Lake DSL System\npackage proofwidgets where\ndef widgetDir : FilePath := \"widget\"\nnonrec def Lake.Package.widgetDir (pkg : Package) : FilePath :=\n  pkg.dir / widgetDir\ndef Lake.Package.runNpmCommand (pkg : Package) := do\n  pure ()\ninput_file widgetPackageJson where\n  path := widgetDir / \"package.json\"\ninput_dir widgetJsSrcs where\n  path := widgetDir / \"src\"\n  filter := .extension <| .mem #[\"ts\", \"tsx\", \"js\", \"jsx\"]\n  text := true\ntarget widgetJsAll pkg : Unit :=\n  pure ()\nlean_lib ProofWidgets where\n  needs := #[widgetJsAll]\n".to_string();
+        for src in [evmyul, widgets.as_str()] {
+            fs::write(&lf, src).unwrap();
+            let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+            assert_eq!(pkg.libs.len(), 1);
+            assert!(parse_lakefile_lean(&dir, &lf, true).is_err());
+        }
+        fs::write(&lf, &widgets).unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+        assert_eq!(pkg.inputs[0].path, Path::new("widget/package.json"));
+        assert_eq!(pkg.inputs[1].path, Path::new("widget/src"));
+        assert!(pkg.libs[0].needs.is_empty());
+        assert!(pkg.libs[0].unsupported.is_some());
+        assert!(pkg.unsupported.is_none());
+        for bad in [
+            evmyul.replace("-DautoImplicit=false", "-Dwarn.sorry=false"),
+            evmyul.replace(
+                "moreServerOptions := #[⟨`autoImplicit, false⟩]",
+                "srcDir := \"../escape\"",
+            ),
+            evmyul.replace(
+                "moreServerOptions := #[⟨`autoImplicit, false⟩]",
+                "libName := \"x\"; moreLeanArgs := #[\"-Dwarn.sorry=false\"]",
+            ),
+            evmyul.replace("  if true then", "  lean_lib Hidden\n  if true then"),
+            evmyul.replace("}\ndef clone", "def clone"),
+            widgets.replace("needs := #[widgetJsAll]", "needs := #[missing]"),
+            widgets.replace("\"widget\"", "\"../escape\""),
+            widgets.replace("def widgetDir", "def LeanOption.mk := 0\ndef widgetDir"),
+        ] {
+            fs::write(&lf, &bad).unwrap();
+            assert!(parse_lakefile_lean(&dir, &lf, false).is_err(), "{bad}");
+        }
+        for field in [
+            "plugins := #[`evil]",
+            "dynlibs := #[\"evil\"]",
+            "backend := .llvm",
+            "moreLeancArgs := #[\"-DEVIL\"]",
+        ] {
+            fs::write(
+                &lf,
+                evmyul.replace("moreServerOptions := #[⟨`autoImplicit, false⟩]", field),
+            )
+            .unwrap();
+            let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+            assert!(
+                pkg.unsupported.is_some() || pkg.native_unsupported.is_some(),
+                "{field}"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn test_parse_lakefile_lean_input_targets_and_needs() {
         let dir = make_temp_test_dir("input_targets");
@@ -35163,6 +35258,153 @@ root = "Main"
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_minimum_lean_toolchain_guidance() {
+        for toolchain in [
+            "leanprover/lean4:v4.24.0",
+            "leanprover/lean4:v4.30.9",
+            "v3.99.0",
+        ] {
+            let err =
+                resolve_toolchain_compiler_with_roots(Path::new("/"), toolchain, true, Some(&[]))
+                    .unwrap_err()
+                    .to_string();
+            assert!(err.contains(toolchain), "{err}");
+            assert!(err.contains("requires Lean >= 4.31.0"), "{err}");
+            assert!(err.contains("update lean-toolchain"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_lake_trace_toolchain_compatibility() -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        for version in ["4.31.0", "4.33.1", "4.35.0"] {
+            let toolchain = PathBuf::from(format!(
+                "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v{version}"
+            ));
+            if !toolchain.join("bin/lake").is_file() {
+                continue;
+            }
+            for platform in [
+                "",
+                "platformIndependent = true\n",
+                "platformIndependent = false\n",
+            ] {
+                let dir = make_temp_test_dir("trace_toolchain_compatibility");
+                fs::write(
+                    dir.join("lean-toolchain"),
+                    format!("leanprover/lean4:v{version}\n"),
+                )?;
+                fs::write(
+                    dir.join("lakefile.toml"),
+                    format!("name = \"probe\"\n[[lean_lib]]\nname = \"Probe\"\n{platform}"),
+                )?;
+                fs::create_dir_all(dir.join("Probe"))?;
+                fs::write(
+                    dir.join("Probe/Dep.lean"),
+                    "module\npublic def dep : Nat := 1\n",
+                )?;
+                let src = "module\npublic import Probe.Dep\npublic def probe : Nat := dep\n";
+                fs::write(dir.join("Probe.lean"), src)?;
+                let output = Command::new(toolchain.join("bin/lake"))
+                    .args(["build", "Probe"])
+                    .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+                    .current_dir(&dir)
+                    .output()?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "{version}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let olean = dir.join(".lake/build/lib/lean/Probe.olean");
+                let ir_dir = dir.join(".lake/build/ir");
+                assert_eq!(olean_requires_ir_sig(&olean), version != "4.31.0");
+                let mut raw: serde_json::Value =
+                    serde_json::from_slice(&fs::read(olean.with_extension("trace"))?)?;
+                assert_eq!(
+                    raw["inputs"].as_array().unwrap().len(),
+                    if version == "4.31.0" {
+                        8
+                    } else if platform.contains("false") {
+                        10
+                    } else {
+                        9
+                    }
+                );
+                verify_module_lake_sidecars(&olean, Some(&ir_dir), "Probe", src, true, true)?;
+                assert!(verify_module_lake_sidecars(
+                    &olean,
+                    Some(&ir_dir),
+                    "Probe",
+                    "changed",
+                    true,
+                    true
+                )
+                .is_err());
+                let (arts, meta, all) = compute_module_arts_traces(&olean, true, true)?;
+                let hash = |p: &Path| verify_and_hash_artifact_bytes(p, true, true).unwrap();
+                assert_eq!(arts, lake_mix_hash(1723, hash(&olean)));
+                if version == "4.31.0" {
+                    assert_eq!(meta, lake_mix_hash(arts, hash(&olean.with_extension("ir"))));
+                    assert_eq!(
+                        all,
+                        lake_mix_hash(
+                            lake_mix_hash(meta, hash(&olean.with_extension("olean.server"))),
+                            hash(&olean.with_extension("olean.private"))
+                        )
+                    );
+                }
+                let cfg = resolve_project_config(&dir)?;
+                if platform.contains("false") {
+                    query_toolchain_native_spec(&cfg.lean_bin)?;
+                }
+                let spec = resolve_module_in_package(&cfg.root_pkg, true, "Probe").unwrap();
+                assert!(lake_closure_export_info(
+                    &cfg,
+                    &spec,
+                    false,
+                    &mut LakeClosureCache::default(),
+                    &mut HashSet::new()
+                )
+                .is_some());
+                let dag = build_module_dag(&cfg, &["Probe".into()])?;
+                let node = &dag.nodes["Probe"];
+                let digest = compute_olean_artifact_set_digest(&olean)?;
+                write_lake_module_hashes_and_trace(&cfg, &dag, node, &digest, Some(&digest), true)?;
+                let written: serde_json::Value =
+                    serde_json::from_slice(&fs::read(olean.with_extension("trace"))?)?;
+                let src_idx = if version == "4.31.0" {
+                    2
+                } else if platform.contains("false") {
+                    4
+                } else {
+                    3
+                };
+                raw["inputs"][src_idx][0] = written["inputs"][src_idx][0].clone();
+                assert_eq!(written["inputs"], raw["inputs"]);
+                assert_eq!(written["depHash"], raw["depHash"]);
+                assert_eq!(written["outputs"], raw["outputs"]);
+                verify_module_lake_sidecars(&olean, Some(&ir_dir), "Probe", src, true, true)?;
+                if version != "4.31.0" {
+                    fs::remove_file(olean.with_extension("ir.sig"))?;
+                    assert!(compute_module_arts_traces(&olean, true, true).is_err());
+                    assert!(verify_module_lake_sidecars(
+                        &olean,
+                        Some(&ir_dir),
+                        "Probe",
+                        src,
+                        true,
+                        true
+                    )
+                    .is_err());
+                }
+                fs::remove_dir_all(dir)?;
+            }
+        }
+        Ok(())
     }
 
     #[test]

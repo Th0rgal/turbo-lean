@@ -227,6 +227,23 @@ fn resolve_identity_probe_context(
     Ok((lean_args, env))
 }
 
+/// Build the local zygote before the request timer starts, but only on the local miss path.
+/// Remote checks and full cache hits never call this, so they do not need a local Lean compiler.
+fn prewarm_local_check_zygote(
+    store: &TurboStore,
+    canon_dir: &Path,
+    toolchain: &str,
+    t0: &Instant,
+) -> Result<Instant> {
+    if crate::zygote::invocation_timeout_ms().is_some() {
+        return Ok(*t0);
+    }
+    let (lean_bin, _, _, _) =
+        crate::module_builder::resolve_toolchain_compiler(canon_dir, toolchain)?;
+    crate::zygote::ensure_zygote_binary(store, &lean_bin, &HashMap::new())?;
+    Ok(Instant::now())
+}
+
 /// Confirm the selected source declaration and its canonical kernel statement type in Lean's
 /// environment, independently of textual scope tracking. This probe replaces only the proof:
 /// false statements must still have an attested identity before Stage-1 can attribute a
@@ -2669,6 +2686,7 @@ fn check_directory(
         return Ok(out_json);
     }
 
+    let t0 = &prewarm_local_check_zygote(store, canon_dir, toolchain, t0)?;
     let effective_jobs = default_parallel_jobs(jobs).min(uncached_files.len());
     let _staging_dir = store.fast_staging_dir();
     let pid = std::process::id();
@@ -3576,6 +3594,7 @@ fn check_single_decl(
         };
         let (env_vars, env_cache_hit) = resolve_lake_env(store, canon_dir)?;
         let lean_bin = resolve_lean_bin(canon_dir)?;
+        let t0 = &prewarm_local_check_zygote(store, canon_dir, toolchain, t0)?;
         let local_lean_path = resolve_remote_lean_path(canon_dir, Some(&env_vars));
         let mut stub_targets: Vec<String> = single_set.iter().cloned().collect();
         stub_targets.sort();
@@ -4164,6 +4183,7 @@ fn check_single_decl(
         }
     }
 
+    let t0 = &prewarm_local_check_zygote(store, canon_dir, toolchain, t0)?;
     let singleflight_outcome =
         match store.acquire_singleflight(&shard_key, toolchain, "theorem_shard", "trusted")? {
             SingleflightOutcome::CacheHit { outputs, coalesced } => {
@@ -5467,6 +5487,7 @@ fn check_single_file(
         }
         let (env_vars, env_cache_hit) = resolve_lake_env(store, canon_dir)?;
         let lean_bin = resolve_lean_bin(canon_dir)?;
+        let t0 = &prewarm_local_check_zygote(store, canon_dir, toolchain, t0)?;
         let local_lean_path = resolve_remote_lean_path(canon_dir, Some(&env_vars));
         let orig_display = file.display().to_string();
         let mut file_used_sorry = split.hygiene.has_sorry;
@@ -6103,6 +6124,7 @@ fn check_single_file(
         }
     }
 
+    let t0 = &prewarm_local_check_zygote(store, canon_dir, toolchain, t0)?;
     let use_parallel_shards =
         hygiene_strictly_clean && split.eligible_for_sharding && !uncached_shards.is_empty();
 
@@ -9906,5 +9928,71 @@ theorem after_macro : ext_magic = 7 := rfl
         );
 
         let _ = fs::remove_dir_all(&tmp_dir);
+    }
+
+    #[test]
+    fn test_cached_directory_check_does_not_require_local_toolchain_compiler() -> Result<()> {
+        let tmp_dir = std::env::temp_dir().join(format!(
+            "turbo_cached_dir_no_compiler_{}",
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&tmp_dir);
+        let proj = tmp_dir.join("proj");
+        let store_root = tmp_dir.join("store");
+        fs::create_dir_all(&proj)?;
+        let missing_tc = "leanprover/lean4:v4.99.0-uninstalled-test";
+        fs::write(proj.join("lean-toolchain"), format!("{missing_tc}\n"))?;
+        let src = "theorem cached_dir_thm : True := trivial\n";
+        fs::write(proj.join("Main.lean"), src)?;
+
+        let split = split_lean_source(src, &[]);
+        let shard = &split.shards[0];
+        let shard_key = compute_shard_key_with_args(missing_tc, shard, &[]);
+        let receipt = make_shard_receipt_bytes(
+            shard.decl_name(),
+            &shard.prefix_env_hash,
+            &shard.stmt_hash,
+            &shard.proof_hash,
+            db::now_unix(),
+        )?;
+
+        let mut store = TurboStore::open(Some(&store_root))?;
+        store.batch_put_theorem_shards(
+            missing_tc,
+            &[(shard_key, shard.decl_name().to_string(), receipt, 1)],
+        )?;
+
+        let res = run_check_command_inner(
+            &mut store,
+            true,
+            true,
+            false,
+            false,
+            proj.clone(),
+            None,
+            proj.clone(),
+            Some(1),
+            false,
+            None,
+            false,
+        );
+        if crate::trusted_tools::git(&proj).is_ok() {
+            let val = res.expect("cached directory check must succeed without local compiler");
+            assert_eq!(val["status"], "all_shards_cached");
+            assert_eq!(val["shard_hits"], 1);
+        } else {
+            let msg = format!("{:#}", res.unwrap_err());
+            assert!(
+                msg.contains("has no Lake config: refusing to pass"),
+                "cache hit must not resolve a local compiler before the Lake-less dependent gate: {msg}"
+            );
+            assert!(
+                !msg.contains("Could not locate installed `lean` compiler binary"),
+                "cache hit resolved a local compiler: {msg}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&tmp_dir);
+        Ok(())
     }
 }
