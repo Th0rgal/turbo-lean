@@ -303,6 +303,10 @@ private def loweredLnirDecls : List (String × LNIRDecl × Option (LLVMFn × Str
   let dShl := mkBinScalarDecl "lnir_shl64" .i64 (.binOp .shl (.var 0) (.var 1))
   let dUlt := mkBinScalarDecl "lnir_ult64" .i1 (.binOp .lt (.var 0) (.var 1))
   let dDiv := mkBinScalarDecl "lnir_udiv64" .i64 (.binOp .div (.var 0) (.var 1))
+  let dDivPow2 := mkBinScalarDecl "lnir_udiv_pow2" .i64
+    (.binOp .div (.var 0) (.binOp .shl (.constU64 1) (.var 1)))
+  let dDivU8 := mkBinScalarDecl "lnir_udiv_u8" .i64
+    (.binOp .div (.binOp .bitAnd (.var 0) (.constU64 255)) (.binOp .bitAnd (.var 1) (.constU64 255)))
   let dIte : LNIRDecl :=
     { name := "lnir_ite_diamond"
     , params := [{ id := 0, name := "a", ty := .i64 }, { id := 1, name := "b", ty := .i64 }]
@@ -316,6 +320,8 @@ private def loweredLnirDecls : List (String × LNIRDecl × Option (LLVMFn × Str
   , ("lowered_lnir_shl64", dShl, some ({ mutantM2 with name := "lnir_shl64" }, "M2 shl lowered as lshr"))
   , ("lowered_lnir_ult64", dUlt, some ({ mutantM3 with name := "lnir_ult64" }, "M3 ult relaxed to ule"))
   , ("lowered_lnir_udiv64_zero_safe", dDiv, none)
+  , ("lowered_lnir_udiv_pow2", dDivPow2, none)
+  , ("lowered_lnir_udiv_u8", dDivU8, none)
   , ("lowered_lnir_ite_diamond", dIte, none) ]
 
 def buildAllDiffCases : List DiffCase :=
@@ -394,9 +400,15 @@ def buildAlive2MutantFixturesJson : Json :=
   let loweredPositives : List Json :=
     loweredLnirDecls.filterMap fun (cid, decl, _) => do
       let fn ← lowerDeclWithFacts decl
+      let optPasses :=
+        if cid == "lowered_lnir_udiv64_zero_safe" then
+          "mem2reg,early-cse,gvn,sccp,simplifycfg,bdce,adce,dse"
+        else
+          "default<O2>"
       some (Json.mkObj [
         ("id", Json.str cid),
         ("fnName", Json.str fn.name),
+        ("optPasses", Json.str optPasses),
         ("srcIr", Json.str (PP.ppModule (modOfFn fn)))
       ])
   Json.mkObj [

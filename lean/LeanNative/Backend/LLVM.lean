@@ -1381,7 +1381,7 @@ def emitParForLoop (outVar lenVar : VarId) (inputs : List VarId) (elemTy : LNIRT
     emitLine s!"  {nextAcc} = add i64 {accVal}, {resVal}"
   else do
     emitTypedArrayStore "p_out" outData ivVal resVal elemTy
-  let addOp := if opt then "add nuw nsw i64" else "add i64"
+  let addOp := if opt then "add nuw i64" else "add i64"
   let loopMd := if opt then ", !llvm.loop !0" else ", !llvm.loop !3"
   emitLine s!"  br label %{latchLbl}\n{latchLbl}:\n  {nextIv} = {addOp} {ivVal}, 1\n  br label %{condLbl}{loopMd}\n{exitLbl}:"
   if isDot then
@@ -1540,7 +1540,7 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
           la != accVar && la != idxVar && lb != accVar && lb != idxVar
         | .exclusiveObj o => o != accVar && o != idxVar }
     emitLine s!"{latchLbl}:"
-    let addOp := if opt then "add nuw nsw i64" else "add i64"
+    let addOp := if opt then "add nuw i64" else "add i64"
     emitLine s!"  {idxNext} = {addOp} {curIdx}, 1"
     let isVecLoop := loopBodyHasArrayMem stepBody
     let loopMd :=

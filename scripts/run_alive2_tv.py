@@ -36,6 +36,13 @@ SUMMARY_INCORRECT_RE = re.compile(r"^\s*(\d+)\s+incorrect transformations?\b", r
 SUMMARY_FAILED_RE = re.compile(r"^\s*(\d+)\s+failed-to-prove transformations?\b", re.M)
 SUMMARY_ALIVE_ERR_RE = re.compile(r"^\s*(\d+)\s+Alive2 errors?\b", re.M)
 USER_FN_DEF_RE = re.compile(r"^define\s+dso_local\b[^\n]*?@([A-Za-z0-9_.$]+)\s*\(", re.M)
+USER_FN_BLOCK_RE = re.compile(
+    r"^define\s+dso_local\b[^\n]*?@([A-Za-z0-9_.$]+)\s*\([^{]*\{.*?\n\}",
+    re.M | re.S,
+)
+CALL_CALLEE_RE = re.compile(r"\bcall\b[^\n@]*@([A-Za-z0-9_.$]+)\s*\(")
+UNSUPPORTED_ALIVE2_TYPE_RE = re.compile(r"\bi512\b")
+SAFE_INLINED_HELPERS = frozenset({"lean_native_box_u64", "lean_native_unbox_u64"})
 
 
 def extract_user_functions(ir_text: str) -> list[str]:
@@ -45,6 +52,41 @@ def extract_user_functions(ir_text: str) -> list[str]:
     for m in USER_FN_DEF_RE.finditer(ir_text):
         seen.setdefault(m.group(1), None)
     return list(seen.keys())
+
+
+def extract_alive2_supported_functions(ir_text: str) -> list[str]:
+    """Extract `define dso_local` functions supported by per-function `alive-tv` checking:
+    excludes functions using `i512` arithmetic or external runtime/trap calls (while allowing
+    pure `weak_odr` tagging helpers in `SAFE_INLINED_HELPERS` that are inlined before TV)."""
+    supported: list[str] = []
+    seen: set[str] = set()
+    for m in USER_FN_BLOCK_RE.finditer(ir_text):
+        fn_name = m.group(1)
+        body = m.group(0)
+        if fn_name in seen:
+            continue
+        seen.add(fn_name)
+        if UNSUPPORTED_ALIVE2_TYPE_RE.search(body):
+            continue
+        callees = {cm.group(1) for cm in CALL_CALLEE_RE.finditer(body)}
+        if not callees.issubset(SAFE_INLINED_HELPERS):
+            continue
+        supported.append(fn_name)
+    return supported
+
+
+def inline_pure_helpers_for_tv(opt_bin: str, src_ll: Path, out_ll: Path) -> None:
+    """Strip `noinline`/`optnone` on baseline IR and run `inline,dce` so pure `weak_odr`
+    tagging helpers (`@lean_native_box_u64`) are inlined prior to per-function `alive-tv`."""
+    raw = src_ll.read_text(encoding="utf-8")
+    relaxed = re.sub(r"\b(?:noinline|optnone)\s*", "", raw)
+    out_ll.write_text(relaxed, encoding="utf-8")
+    subprocess.run(
+        [opt_bin, "-S", "-passes=inline,dce", str(out_ll), "-o", str(out_ll)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def find_tool(names: list[str]) -> str | None:
@@ -240,15 +282,16 @@ def run_suite(core_bin: Path, alive_tv: str, opt_bin: str) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="tl-alive2-tv-") as tmp_dir:
         tmp = Path(tmp_dir)
 
-        # 1. Pipeline pairs: compile-llvm -O0 vs -O3 on canonical benchmark & fastcheck sample
+        # 1. Pipeline pairs: compile-llvm --baseline vs -O3 on canonical benchmark & fastcheck sample
         for corpus_flag, label in (
             ("--canonical-benchmark", "pipeline_canonical_O0_vs_O3"),
             ("--fastcheck-sample", "pipeline_fastcheck_O0_vs_O3"),
         ):
+            raw_src_ll = tmp / f"{label}_raw_src.ll"
             src_ll = tmp / f"{label}_src.ll"
             tgt_ll = tmp / f"{label}_tgt.ll"
             subprocess.run(
-                [str(core_bin), "compile-llvm", corpus_flag, "-O0", "-o", str(src_ll)],
+                [str(core_bin), "compile-llvm", corpus_flag, "--baseline", "-o", str(raw_src_ll)],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -259,15 +302,16 @@ def run_suite(core_bin: Path, alive_tv: str, opt_bin: str) -> dict[str, Any]:
                 capture_output=True,
                 text=True,
             )
-            # Pipeline -O0 vs -O3 lowers pure LNIR functions whose ABI entry points receive
+            inline_pure_helpers_for_tv(opt_bin, raw_src_ll, src_ll)
+            # Pipeline --baseline vs -O3 lowers pure LNIR functions whose ABI entry points receive
             # well-defined scalar/pointer arguments from the Lean runtime/C-ABI boundary.
-            # Scope `--func` to compiled user/ABI functions (`define dso_local ...`) so
-            # `weak_odr` runtime helpers (`atomicrmw`, `@llvm.trap`, `@llvm.vscale`) are not parsed.
-            src_fns = extract_user_functions(src_ll.read_text(encoding="utf-8"))
-            tgt_fns = set(extract_user_functions(tgt_ll.read_text(encoding="utf-8")))
+            # Scope `--func` to Alive2-supported `define dso_local` functions (excluding `i512`
+            # arithmetic and external storage/heap runtime calls that Alive2 cannot model).
+            src_fns = extract_alive2_supported_functions(src_ll.read_text(encoding="utf-8"))
+            tgt_fns = set(extract_alive2_supported_functions(tgt_ll.read_text(encoding="utf-8")))
             shared_fns = [fn for fn in src_fns if fn in tgt_fns]
             if not shared_fns:
-                raise RuntimeError(f"No user functions found in {label}")
+                raise RuntimeError(f"No Alive2-supported user functions found in {label}")
             fn_flags = [f"--func={fn}" for fn in shared_fns]
             res = run_alive_pair(
                 alive_tv,
@@ -280,7 +324,7 @@ def run_suite(core_bin: Path, alive_tv: str, opt_bin: str) -> dict[str, Any]:
             res["checked_functions"] = shared_fns
             positive_results.append(res)
 
-        # 2. Lowered LNIR -> LLVMAst modules vs LLVM `opt -passes='default<O2>'`
+        # 2. Lowered LNIR -> LLVMAst modules vs LLVM `opt` passes
         # `LLVMAst.Eval` models `PoisonOr Val` (determined bitvectors + poison, without `undef`),
         # matching `compile-llvm`'s `noundef` ABI boundary via `--disable-undef-input`.
         for item in fixtures["loweredPositives"]:
@@ -288,14 +332,16 @@ def run_suite(core_bin: Path, alive_tv: str, opt_bin: str) -> dict[str, Any]:
             src_ll = tmp / f"{pid}_src.ll"
             tgt_ll = tmp / f"{pid}_tgt.ll"
             src_ll.write_text(item["srcIr"], encoding="utf-8")
+            opt_passes = item.get("optPasses", "default<O2>")
             subprocess.run(
-                [opt_bin, "-S", "-passes=default<O2>", str(src_ll), "-o", str(tgt_ll)],
+                [opt_bin, "-S", f"-passes={opt_passes}", str(src_ll), "-o", str(tgt_ll)],
                 check=True,
                 capture_output=True,
                 text=True,
             )
             res = run_alive_pair(alive_tv, src_ll, tgt_ll, disable_undef_input=True)
             res["id"] = pid
+            res["opt_passes"] = opt_passes
             positive_results.append(res)
 
         # 3. Negative mutant rejection (M1..M5): alive-tv MUST reject every mutant
@@ -382,6 +428,22 @@ Summary:
         self.assertEqual(
             extract_user_functions(sample_ir),
             ["collatz_steps", "lean_native_abi_collatz_steps"],
+        )
+
+    def test_extract_alive2_supported_functions_filters_i512_and_extern_calls(self) -> None:
+        sample_ir = (
+            "define dso_local i64 @collatz_steps(i64 noundef %v0, i64 noundef %v1) #0 {\n"
+            "entry:\n  ret i64 %v0\n}\n\n"
+            "define dso_local i64 @tuple_accum_sum(i64 noundef %v0, i64 noundef %v1) #1 {\n"
+            "entry:\n  %b = call ptr @lean_native_box_u64(i64 %v0)\n  ret i64 %v1\n}\n\n"
+            "define dso_local i256 @evm_muldiv_wad_u256(i256 %a, i256 %b, i256 %w) #0 {\n"
+            "entry:\n  %z = zext i256 %a to i512\n  ret i256 %a\n}\n\n"
+            "define dso_local ptr @sarray_scale_bias(ptr %arr, i64 %s, i64 %b) #0 {\n"
+            "entry:\n  %e = call ptr @lean_native_ensure_exclusive(ptr %arr)\n  ret ptr %e\n}\n"
+        )
+        self.assertEqual(
+            extract_alive2_supported_functions(sample_ir),
+            ["collatz_steps", "tuple_accum_sum"],
         )
 
     def test_parse_error_is_not_clean_rejection(self) -> None:
