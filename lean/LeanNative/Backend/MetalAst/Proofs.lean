@@ -23,7 +23,7 @@ namespace LeanNative.Backend.MetalAst
 
 theorem parseMSLScalarType_roundtrip (ty : MSLType) (h : CanonicalMSLValueType ty) :
     parseMSLScalarType (ppMSLType ty) = some ty := by
-  cases ty <;> simp_all [CanonicalMSLValueType, ppMSLType, parseMSLScalarType]
+  cases ty <;> first | exact False.elim h | rfl
 
 private theorem parseMSLParamType_pointer_roundtrip (sp : MSLAddressSpace) (isConst : Bool)
     (el : MSLType) (hel : CanonicalMSLValueType el) (hconst : sp = .constant → isConst = false) :
@@ -72,19 +72,39 @@ theorem scanMSLToken_append (delimiter : Char) (token rest : List Char)
     have hs : delimiter ∉ cs := fun hm => h (by simp [hm])
     simp [scanMSLToken, hc, ih hs]
 
-theorem canonicalMSLType_no_closeParen (ty : MSLType) (h : CanonicalMSLType ty) :
-    ')' ∉ (ppMSLType ty).toList := by
+private theorem canonicalMSLValueType_no_special_char (el : MSLType) (h : CanonicalMSLValueType el)
+    (c : Char) (hc : c = ')' ∨ c = '[' ∨ c = '\n' ∨ c = ',') :
+    c ∉ (ppMSLType el).toList := by
+  rcases hc with rfl | rfl | rfl | rfl <;>
+    (cases el <;> first | exact False.elim h | decide)
+
+private theorem canonicalMSLType_no_special_char (ty : MSLType) (h : CanonicalMSLType ty)
+    (c : Char) (hc : c = ')' ∨ c = '[' ∨ c = '\n' ∨ c = ',') :
+    c ∉ (ppMSLType ty).toList := by
+  have hsp (sp : MSLAddressSpace) : c ∉ (ppMSLAddressSpace sp).toList := by
+    rcases hc with rfl | rfl | rfl | rfl <;> (cases sp <;> decide)
+  have hconst_str : c ∉ "const ".toList := by
+    rcases hc with rfl | rfl | rfl | rfl <;> decide
+  have hspace : c ≠ ' ' := by rcases hc with rfl | rfl | rfl | rfl <;> decide
+  have hstar : c ≠ '*' := by rcases hc with rfl | rfl | rfl | rfl <;> decide
+  have hamp : c ≠ '&' := by rcases hc with rfl | rfl | rfl | rfl <;> decide
   cases ty with
-  | pointer sp c el =>
-    cases el <;> simp only [CanonicalMSLType, CanonicalMSLValueType, false_and] at h
-    all_goals try contradiction
-    all_goals cases sp <;> cases c
-    all_goals first | exact False.elim (Bool.noConfusion (h.2 rfl)) | decide
+  | pointer sp isConst el =>
+    have hel := canonicalMSLValueType_no_special_char el h.1 c hc
+    cases isConst <;>
+      simp [ppMSLType, String.toList_append, hsp sp, hel, hconst_str, hspace, hstar]
   | ref sp el =>
-    cases el <;> simp only [CanonicalMSLType, CanonicalMSLValueType] at h
-    all_goals try contradiction
-    all_goals cases sp <;> decide
-  | _ => first | contradiction | decide
+    have hel := canonicalMSLValueType_no_special_char el h c hc
+    simp [ppMSLType, String.toList_append, hsp sp, hel, hspace, hamp]
+  | threadArr _ _ _ => exact False.elim h
+  | structTy _ => exact False.elim h
+  | void | bool | uchar | ushort | uint | int | ulong | long
+  | half | float | double | uint2 | uint3 | uint4 | ulong2 | atomicUint | u256 =>
+    exact canonicalMSLValueType_no_special_char _ (by simpa [CanonicalMSLType] using h) c hc
+
+theorem canonicalMSLType_no_closeParen (ty : MSLType) (h : CanonicalMSLType ty) :
+    ')' ∉ (ppMSLType ty).toList :=
+  canonicalMSLType_no_special_char ty h ')' (Or.inl rfl)
 
 theorem parseMSLType_roundtrip (ty : MSLType) (h : CanonicalMSLType ty)
     (rest : List Char) :
@@ -117,7 +137,17 @@ theorem scanMSLName_append (name rest : List Char) (fuel : Nat)
 theorem parseMSLExpr_bool_roundtrip (b : Bool) (rest : List Char) :
     parseMSLExpr 8 ((ppMSLExpr (.immBool b)).toList ++ ')' :: rest) =
       some (.immBool b, ')' :: rest) := by
-  cases b <;> simp [parseMSLExpr, ppMSLExpr, scanMSLName, mslNameChar]
+  cases b
+  · have hscan := scanMSLName_append ['f', 'a', 'l', 's', 'e'] (')' :: rest) 7 (by decide)
+      (Or.inr ⟨')', rest, rfl, rfl⟩) (by decide)
+    simpa only [ppMSLExpr, Bool.false_eq_true, ↓reduceIte, String.reduceToList] using
+      (show parseMSLExpr 8 (['f', 'a', 'l', 's', 'e'] ++ ')' :: rest) = some (.immBool false, ')' :: rest) by
+        simp only [parseMSLExpr, hscan]; rfl)
+  · have hscan := scanMSLName_append ['t', 'r', 'u', 'e'] (')' :: rest) 7 (by decide)
+      (Or.inr ⟨')', rest, rfl, rfl⟩) (by decide)
+    simpa only [ppMSLExpr, ↓reduceIte, String.reduceToList] using
+      (show parseMSLExpr 8 (['t', 'r', 'u', 'e'] ++ ')' :: rest) = some (.immBool true, ')' :: rest) by
+        simp only [parseMSLExpr, hscan]; rfl)
 
 theorem validMSLExprSuffix_nameBoundary (rest : List Char) (h : ValidMSLExprSuffix rest) :
     rest = [] ∨ ∃ c cs, rest = c :: cs ∧ mslNameChar c = false := by
@@ -822,18 +852,8 @@ theorem parseMSLParamDeclChars_roundtrip (ty : MSLType) (name : String)
     parseMSLParamType_roundtrip ty ht]
 
 theorem canonicalMSLType_no_openBracket (ty : MSLType) (h : CanonicalMSLType ty) :
-    '[' ∉ (ppMSLType ty).toList := by
-  cases ty with
-  | pointer sp c el =>
-    cases el <;> simp only [CanonicalMSLType, CanonicalMSLValueType, false_and] at h
-    all_goals try contradiction
-    all_goals cases sp <;> cases c
-    all_goals first | exact False.elim (Bool.noConfusion (h.2 rfl)) | decide
-  | ref sp el =>
-    cases el <;> simp only [CanonicalMSLType, CanonicalMSLValueType] at h
-    all_goals try contradiction
-    all_goals cases sp <;> decide
-  | _ => first | contradiction | decide
+    '[' ∉ (ppMSLType ty).toList :=
+  canonicalMSLType_no_special_char ty h '[' (Or.inr (Or.inl rfl))
 
 theorem parseMSLParam_roundtrip (p : MSLParamDecl)
     (ht : CanonicalMSLType p.ty) (hn : CanonicalMSLName p.name) (fuel : Nat) :
@@ -1285,20 +1305,9 @@ theorem canonicalMSLParam_no_newline_comma (p : MSLParamDecl)
     '\n' ∉ (ppMSLParam p).toList ∧ ',' ∉ (ppMSLParam p).toList := by
   have hname (c : Char) (hc : mslNameChar c = false) : c ∉ p.name.toList := by
     intro hm; have hh := hn.2.1 c hm; rw [hc] at hh; contradiction
-  have hty : '\n' ∉ (ppMSLType p.ty).toList ∧ ',' ∉ (ppMSLType p.ty).toList := by
-    rcases p with ⟨ty, name, attr⟩
-    change '\n' ∉ (ppMSLType ty).toList ∧ ',' ∉ (ppMSLType ty).toList
-    cases ty with
-    | pointer sp c el =>
-      cases el <;> simp only [CanonicalMSLType, CanonicalMSLValueType, false_and] at ht
-      all_goals try contradiction
-      all_goals cases sp <;> cases c
-      all_goals first | exact False.elim (Bool.noConfusion (ht.2 rfl)) | decide
-    | ref sp el =>
-      cases el <;> simp only [CanonicalMSLType, CanonicalMSLValueType] at ht
-      all_goals try contradiction
-      all_goals cases sp <;> decide
-    | _ => first | contradiction | decide
+  have hty : '\n' ∉ (ppMSLType p.ty).toList ∧ ',' ∉ (ppMSLType p.ty).toList :=
+    ⟨canonicalMSLType_no_special_char p.ty ht '\n' (Or.inr (Or.inr (Or.inl rfl))),
+     canonicalMSLType_no_special_char p.ty ht ',' (Or.inr (Or.inr (Or.inr rfl)))⟩
   have hattr (a : MSLAttr) : '\n' ∉ (ppMSLAttr a).toList ∧ ',' ∉ (ppMSLAttr a).toList := by
     cases a with
     | buffer n =>
@@ -1310,11 +1319,19 @@ theorem canonicalMSLParam_no_newline_comma (p : MSLParamDecl)
       simp only [Nat.toList_repr] at hd
       simp [ppMSLAttr, toString, String.toList_append, hd '\n' rfl, hd ',' rfl]
     | _ => decide
-  cases p with
-  | mk ty name attr =>
-    cases ty <;> first
-      | contradiction
-      | cases attr <;> simp_all [ppMSLParam, String.toList_append, hname '\n' rfl, hname ',' rfl]
+  have hpp : ppMSLParam p =
+      match p.attr with
+      | none => ppMSLType p.ty ++ " " ++ p.name
+      | some a => "    " ++ ppMSLType p.ty ++ " " ++ p.name ++ " [[" ++ ppMSLAttr a ++ "]]" := by
+    rcases p with ⟨ty, name, attr⟩
+    cases ty <;> cases attr <;> first | rfl | exact False.elim ht
+  rw [hpp]
+  cases ha : p.attr with
+  | none =>
+    simp [String.toList_append, hty.1, hty.2, hname '\n' rfl, hname ',' rfl]
+  | some a =>
+    have ha' := hattr a
+    simp [String.toList_append, hty.1, hty.2, hname '\n' rfl, hname ',' rfl, ha'.1, ha'.2]
 
 theorem ppMSLParam_nonempty (p : MSLParamDecl) (ht : CanonicalMSLType p.ty)
     (hn : CanonicalMSLName p.name) : (ppMSLParam p).toList ≠ [] := by
