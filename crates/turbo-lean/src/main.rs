@@ -439,6 +439,24 @@ enum Commands {
         #[arg(long)]
         require_nonempty: bool,
     },
+    #[command(
+        about = "Source-level human spec card: contract surface, syntactic refs, hygiene, and audit witnesses"
+    )]
+    SpecCard {
+        #[arg(required = true, num_args = 1.., help = "Path(s) to .lean file(s) or directory(s)")]
+        files: Vec<PathBuf>,
+        #[arg(long, help = "Declaration name to card")]
+        decl: Option<String>,
+        #[arg(long, help = "Policy preset: permissive, default, or strict-proofs")]
+        policy: Option<String>,
+        #[arg(long, help = "Explicit turbo-lean.toml or JSON policy configuration")]
+        config: Option<PathBuf>,
+        #[arg(
+            long,
+            help = "Keep declarations extract_public_signature treats as public"
+        )]
+        public_only: bool,
+    },
     /// Deterministic fast evaluation of a Lean file (preserving all info/warning/error messages and stdout, drop-in for `lean <file.lean>`)
     Eval {
         /// Path to the Lean file to evaluate
@@ -956,6 +974,23 @@ fn run(cli: Cli) -> Result<()> {
             forbid_namespaces,
             forbid_decl_kinds,
             require_nonempty,
+        );
+    }
+    if let Commands::SpecCard {
+        ref files,
+        ref decl,
+        ref policy,
+        ref config,
+        public_only,
+    } = cli.command
+    {
+        return gpu_fastcheck::run_spec_card_command(
+            files,
+            decl.as_deref(),
+            cli.json,
+            policy.as_deref(),
+            config.as_deref(),
+            public_only,
         );
     }
     if let Commands::RemotePrebuild {
@@ -1861,6 +1896,21 @@ fn run(cli: Cli) -> Result<()> {
             &forbid_namespaces,
             &forbid_decl_kinds,
             require_nonempty,
+        ),
+
+        Commands::SpecCard {
+            files,
+            decl,
+            policy,
+            config,
+            public_only,
+        } => gpu_fastcheck::run_spec_card_command(
+            &files,
+            decl.as_deref(),
+            cli.json,
+            policy.as_deref(),
+            config.as_deref(),
+            public_only,
         ),
 
         Commands::Eval {

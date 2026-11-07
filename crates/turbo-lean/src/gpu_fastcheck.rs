@@ -6,6 +6,10 @@ pub use crate::cluster::c_abi;
 mod audit_spec;
 pub use audit_spec::*;
 
+#[path = "spec_card.rs"]
+mod spec_card;
+pub use spec_card::run_spec_card_command;
+
 fn parse_metric_between(line: &str, prefix: &str, suffix: &str) -> Option<f64> {
     let rest = &line[line.find(prefix)? + prefix.len()..];
     rest[..rest.find(suffix)?].trim().parse().ok()
