@@ -6962,11 +6962,18 @@ fn stamp_manifest_after_lake_cutoff_rebuild(
         let hygiene = splitter::audit_hygiene(&splitter::strip_lean_comments(
             &fs::read_to_string(&node.src_path).unwrap_or_default(),
         ));
-        if hygiene.has_sorry
-            || hygiene.has_axiom
-            || hygiene.native_violation()
-            || hygiene.has_trust_compiler
-            || hygiene.has_checking_weakening
+        let checking_weakening_bad =
+            if crate::module_builder::node_is_git_pinned_manifest_package(cfg, node) {
+                hygiene.has_checking_weakening_option
+            } else {
+                hygiene.has_checking_weakening
+            };
+        if (node.is_root_pkg
+            && (hygiene.has_sorry
+                || hygiene.has_axiom
+                || hygiene.native_violation()
+                || hygiene.has_trust_compiler))
+            || checking_weakening_bad
         {
             return Ok(());
         }

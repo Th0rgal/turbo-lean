@@ -5710,7 +5710,85 @@ fn package_has_lean_elab_host_effects(pkg: &crate::module_builder::PackageConfig
 }
 
 fn package_may_read_host_state(pkg: &crate::module_builder::PackageConfig) -> bool {
-    package_has_lean_elab_host_effects(pkg)
+    let Ok(dep_root) = pkg.pkg_root.canonicalize() else {
+        return true;
+    };
+    let build_abs = dep_root.join(&pkg.build_dir);
+    let pkgs_abs = dep_root.join(&pkg.packages_dir);
+    let lake_abs = dep_root.join(".lake");
+    let build_lean_abs = build_abs.join(&pkg.lean_lib_dir);
+    let has_any_built_olean = build_lean_abs.is_dir();
+    let norm_sub = |p: &Path| -> PathBuf {
+        let mut out = PathBuf::new();
+        for c in p.components() {
+            match c {
+                std::path::Component::CurDir => {}
+                std::path::Component::ParentDir => {
+                    out.pop();
+                }
+                other => out.push(other),
+            }
+        }
+        out
+    };
+    let pkg_src_base = norm_sub(&dep_root.join(&pkg.src_dir));
+    let mut lib_roots: Vec<PathBuf> = pkg
+        .libs
+        .iter()
+        .map(|l| match &l.src_dir {
+            Some(sd) => norm_sub(&pkg_src_base.join(sd)),
+            None => pkg_src_base.clone(),
+        })
+        .collect();
+    if lib_roots.is_empty() {
+        lib_roots.push(pkg_src_base);
+    }
+    lib_roots.sort();
+    lib_roots.dedup();
+    let mut stack = vec![dep_root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else {
+            return true;
+        };
+        for ent in rd {
+            let Ok(ent) = ent else {
+                return true;
+            };
+            let p = ent.path();
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if name == ".git" || p == build_abs || p == pkgs_abs || p == lake_abs {
+                continue;
+            }
+            let Ok(st) = fs::symlink_metadata(&p) else {
+                return true;
+            };
+            if st.file_type().is_symlink() {
+                continue;
+            }
+            if st.is_dir() {
+                stack.push(p);
+            } else if st.is_file() && name.ends_with(".lean") {
+                if p == dep_root.join("lakefile.lean") {
+                    continue;
+                }
+                let built_olean_exists = lib_roots.iter().any(|lr| {
+                    p.strip_prefix(lr).ok().is_some_and(|rel| {
+                        build_lean_abs.join(rel.with_extension("olean")).is_file()
+                    })
+                });
+                if has_any_built_olean && !built_olean_exists {
+                    continue;
+                }
+                let Ok(src) = fs::read_to_string(&p) else {
+                    return true;
+                };
+                if splitter::source_may_read_host_state(&src) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn is_pinned_git_manifest_dep(
@@ -5722,6 +5800,7 @@ fn is_pinned_git_manifest_dep(
         mp.pkg_type == "git"
             && mp.rev.as_deref().is_some_and(|r| !r.is_empty())
             && (mp.name == dep.name
+                || (!dep.base_name.is_empty() && mp.name == dep.base_name)
                 || mp.dir == dep.pkg_root
                 || mp
                     .dir
