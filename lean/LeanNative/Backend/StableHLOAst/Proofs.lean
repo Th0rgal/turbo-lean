@@ -464,11 +464,18 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
       have hd0 := Nat.isDigit_of_mem_toDigits (b := 10) (n := n) (by omega) (by omega)
         (by simpa only [Nat.toList_repr] using hm)
       simp [hd0] at hc
+    have hlit : ∀ d ∈ "tensor<>xiufbi186324".toList, c ≠ d := by
+      intro d hd heq
+      subst heq
+      have hmem : (c.isDigit || "tensor<>xiufb".toList.contains c) = true := by
+        revert hd; decide
+      rw [hmem] at hc
+      contradiction
     have hel : c ∉ (ppElemType ty.elem).toList := by
       intro hm
-      have hmem : "tensor<>xiufb".toList.contains c || c.isDigit = true := by
-        cases ty.elem <;> simp [ppElemType] at hm <;> rcases hm with _ <;> simp_all
-      cases hd0 : c.isDigit <;> simp_all
+      have hsub : ∀ x ∈ (ppElemType ty.elem).toList, x ∈ "tensor<>xiufbi186324".toList := by
+        cases ty.elem <;> decide
+      exact hlit c (hsub c hm) rfl
     have hi (ls : List String) (hh : ∀ s ∈ ls, c ∉ s.toList) : c ∉ (String.intercalate "x" ls).toList := by
       induction ls with
       | nil => simp
@@ -479,29 +486,39 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
           rw [String.intercalate_cons_cons]
           simp only [String.toList_append, List.mem_append, not_or]
           refine ⟨⟨hh s (by simp), ?_⟩, ih (fun z hz => hh z (by simp [hz]))⟩
-          intro hx; subst hx; simp at hc
+          intro hx
+          simp only [String.reduceToList, List.mem_singleton] at hx
+          exact hlit c (by subst hx; decide) rfl
     rcases ty with ⟨shape, elem⟩
     cases shape with
     | nil =>
       rw [show ppTensorType { shape := [], elem := elem } = "tensor<" ++ ppElemType elem ++ ">" from rfl]
       simp only [String.toList_append, List.mem_append, not_or]
-      refine ⟨⟨?_, hel⟩, ?_⟩ <;> intro hm <;>
-        (have hmem : "tensor<>xiufb".toList.contains c = true := by simp at hm; rcases hm with _ <;> simp_all
-         simp [hmem] at hc)
+      refine ⟨⟨?_, hel⟩, ?_⟩
+      · intro hm
+        exact hlit c ((show ∀ x ∈ "tensor<".toList, x ∈ "tensor<>xiufbi186324".toList by decide) c hm) rfl
+      · intro hm
+        exact hlit c ((show ∀ x ∈ ">".toList, x ∈ "tensor<>xiufbi186324".toList by decide) c hm) rfl
     | cons n ns =>
       have hs := hi ((n :: ns).map Nat.repr) (fun s hs => by obtain ⟨m, _, rfl⟩ := List.mem_map.mp hs; exact hn m)
       rw [show ppTensorType { shape := n :: ns, elem := elem } =
           "tensor<" ++ String.intercalate "x" ((n :: ns).map Nat.repr) ++ "x" ++ ppElemType elem ++ ">" by
         simp [ppTensorType, ppShape, toString, String.append_assoc]]
       simp only [String.toList_append, List.mem_append, not_or]
-      refine ⟨⟨⟨⟨?_, hs⟩, ?_⟩, hel⟩, ?_⟩ <;> intro hm <;>
-        (have hmem : "tensor<>xiufb".toList.contains c = true := by simp at hm; rcases hm with _ <;> simp_all
-         simp [hmem] at hc)
+      refine ⟨⟨⟨⟨?_, hs⟩, ?_⟩, hel⟩, ?_⟩
+      · intro hm
+        exact hlit c ((show ∀ x ∈ "tensor<".toList, x ∈ "tensor<>xiufbi186324".toList by decide) c hm) rfl
+      · intro hm
+        exact hlit c ((show ∀ x ∈ "x".toList, x ∈ "tensor<>xiufbi186324".toList by decide) c hm) rfl
+      · intro hm
+        exact hlit c ((show ∀ x ∈ ">".toList, x ∈ "tensor<>xiufbi186324".toList by decide) c hm) rfl
   have hsingle (sep : List Char) (xs : List Char) (fuel : Nat) (hne : sep ≠ [])
       (c : Char) (hc : c ∈ sep) (hn : c ∉ xs) (hf : xs.length < fuel) :
       scanHLOFields sep fuel xs = some [xs] := by
     have hz : scanHLOFields sep (fuel - xs.length) [] = some [[]] := by
-      cases hsub : fuel - xs.length <;> [omega; rfl]
+      cases hsub : fuel - xs.length with
+      | zero => omega
+      | succ k => rfl
     have hp := scanHLOFields_prefix sep xs [] (fuel - xs.length) [] [] hne
       (fun x y he _ => by
         rw [List.append_nil]
@@ -515,7 +532,9 @@ private theorem parseStableHLOOp_ppTyped_binary (tenv : TypeEnv) (opName d a b :
             simp only [stripPrefixChars]
             rcases List.mem_cons.mp hc with hpc | hps
             · subst p; simp [beq_eq_false_iff_ne.mpr (fun heq => hnin (by simp [heq]))]
-            · split <;> [exact ih zs (by intro h0; subst h0; simp at hps) hps (fun hm => hnin (by simp [hm])); rfl]) hz
+            · split
+              · exact ih zs (by intro h0; subst h0; simp at hps) hps (fun hm => hnin (by simp [hm]))
+              · rfl) hz
     simpa [Nat.add_sub_of_le (Nat.le_of_lt hf)] using hp
   let args := "%" ++ a ++ ", %" ++ b
   let suffix := opName ++ " " ++ args

@@ -1165,9 +1165,9 @@ theorem parsePTXInstr_modified_binary_roundtrip (opcode modifier : String) (ty :
         [String.ofList ((ppPTXType ty).toList.drop 1)] by
       simpa [String.toList_append, List.map_append] using hfields, htok_parts, List.cons_append]
   have hlast : parts.getLast? = some (String.ofList ((ppPTXType ty).toList.drop 1)) := by
-    simp [parts, List.getLast?_append_of_ne_nil]
+    cases mods <;> rfl
   have hmods : (parts.drop 1).dropLast = mods := by
-    simp [parts, List.dropLast_concat]
+    cases mods <;> rfl
   have hop_not_st : (opcode == "st") = false := by
     rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
   have hop_not_ld : (opcode == "ld") = false := by
@@ -1189,10 +1189,12 @@ theorem parsePTXInstr_modified_binary_roundtrip (opcode modifier : String) (ty :
       List.cons_append, List.nil_append]
   unfold parsePTXInstr
   simp only [ht, bind, Option.bind, pure, hne.1, hne.2.1, hne.2.2,
-    Bool.false_eq_true, ↓reduceIte, stripPrefixChars, hparts]
-  simp only [parts, List.head?_cons, hlast, parsePTXType_suffix, hmods,
+    Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
+  rw [show (ptxOpcodeFields ((opcode ++ modifier).toList ++ (ppPTXType ty).toList)).map String.ofList = parts by
+    simpa [String.toList_append, List.append_assoc] using hparts]
+  simp only [List.head?_cons, hlast, parsePTXType_suffix, hmods,
     hop_not_st, hop_not_ld, hop_not_cvta, hop_not_cvt, hop_allow, Bool.not_true, Bool.false_and,
-    hd, ha, hb, hop_not_selp, stripPrefixChars]
+    hd, ha, hb, hop_not_selp, stripPrefixChars, bind, Option.bind, pure]
   rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩ | ⟨cmp, rfl, rfl, rfl⟩
   · cases rm <;> rfl
   · cases mode <;> rfl
@@ -1289,9 +1291,9 @@ theorem parsePTXInstr_ternary_roundtrip (opcode modifier : String) (ty : PTXType
         [String.ofList ((ppPTXType ty).toList.drop 1)] by
       simpa [String.toList_append, List.map_append] using hfields, htok_parts, List.cons_append]
   have hlast : parts.getLast? = some (String.ofList ((ppPTXType ty).toList.drop 1)) := by
-    simp [parts, List.getLast?_append_of_ne_nil]
+    cases mods <;> rfl
   have hmods : (parts.drop 1).dropLast = mods := by
-    simp [parts, List.dropLast_concat]
+    cases mods <;> rfl
   have hop_not_st : (opcode == "st") = false := by
     rcases hop with ⟨_, rfl, _, _⟩ | ⟨_, rfl, _, _⟩ <;> rfl
   have hop_not_ld : (opcode == "ld") = false := by
@@ -1315,10 +1317,12 @@ theorem parsePTXInstr_ternary_roundtrip (opcode modifier : String) (ty : PTXType
       List.cons_append, List.nil_append]
   unfold parsePTXInstr
   simp only [ht, bind, Option.bind, pure, hne.1, hne.2.1, hne.2.2,
-    Bool.false_eq_true, ↓reduceIte, stripPrefixChars, hparts]
-  simp only [parts, List.head?_cons, hlast, parsePTXType_suffix, hmods,
+    Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
+  rw [show (ptxOpcodeFields ((opcode ++ modifier).toList ++ (ppPTXType ty).toList)).map String.ofList = parts by
+    simpa [String.toList_append, List.append_assoc] using hparts]
+  simp only [List.head?_cons, hlast, parsePTXType_suffix, hmods,
     hop_not_st, hop_not_ld, hop_not_cvta, hop_not_cvt, hop_allow, Bool.not_true, Bool.false_and,
-    hd, ha, hb, hc, hop_not_selp, hop_not_setp, stripPrefixChars]
+    hd, ha, hb, hc, hop_not_selp, hop_not_setp, stripPrefixChars, bind, Option.bind, pure]
   rcases hop with ⟨rm, rfl, rfl, rfl⟩ | ⟨mode, rfl, rfl, rfl⟩
   · cases rm <;> rfl
   · cases mode <;> rfl
@@ -1359,10 +1363,10 @@ theorem parsePTXInstr_cvt_roundtrip (rm : PTXRoundMode) (dt st : PTXType)
       String.toList_append, ptxOpcodeFields_typed, List.map_append, hrm_parts]
     simp only [parts, dtTok, stTok, List.map_cons, List.map_nil, List.append_assoc, List.cons_append, List.nil_append]
   have hlast : parts.getLast? = some stTok := by
-    simp [parts, List.getLast?_append_of_ne_nil]
+    cases rm <;> rfl
   have hmods : (parts.drop 1).dropLast = rmMods ++ [dtTok] := by
-    simp [parts, List.dropLast_concat]
-  have hdt : parsePTXType (fuel + 1) ("." ++ dtTok).toList = some (dt, []) := by
+    cases rm <;> rfl
+  have hdt : parsePTXType (fuel + 1) ('.' :: (ppPTXType dt).toList.drop 1) = some (dt, []) := by
     cases dt <;> rfl
   simp only [String.toList_append, String.reduceToList, List.append_assoc,
     List.cons_append, List.nil_append] at ht
@@ -1374,13 +1378,15 @@ theorem parsePTXInstr_cvt_roundtrip (rm : PTXRoundMode) (dt st : PTXType)
   unfold parsePTXInstr
   simp only [ht, bind, Option.bind, pure, hne.1, hne.2.1, hne.2.2,
     Bool.false_eq_true, ↓reduceIte, stripPrefixChars]
-  rw [show (ptxOpcodeFields ('c' :: 'v' :: 't' :: ((ppRoundMode rm).toList ++ ((ppPTXType dt).toList ++ (ppPTXType st).toList)))).map String.ofList = parts by
-    simpa [String.toList_append, List.append_assoc] using hfields]
-  simp only [parts, List.head?_cons, hlast, stTok, parsePTXType_suffix, hmods,
+  have hfields' : (ptxOpcodeFields ('c' :: 'v' :: 't' :: ((ppRoundMode rm).toList ++ ((ppPTXType dt).toList ++ (ppPTXType st).toList)))).map String.ofList = parts := by
+    simpa only [String.toList_append, String.reduceToList, List.append_assoc,
+      List.cons_append, List.nil_append] using hfields
+  rw [hfields']
+  simp only [List.head?_cons, hlast, stTok, parsePTXType_suffix, hmods,
     show ("cvt" == "st") = false from rfl, show ("cvt" == "ld") = false from rfl,
     show ("cvt" == "cvta") = false from rfl, show ("cvt" == "cvt") = true from rfl,
-    hd, hs, stripPrefixChars]
-  cases rm <;> simp [rmMods, hdt]
+    hd, hs, stripPrefixChars, bind, Option.bind, pure]
+  cases rm <;> simp [rmMods, dtTok, String.toList_append, String.toList_ofList, hdt]
 
 set_option maxHeartbeats 1000000 in
 /-- Every instruction in the syntactically canonical scalar fragment roundtrips. -/
