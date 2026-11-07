@@ -10,7 +10,7 @@ use std::process::Command;
 
 const BLAKE3_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/Blake3.lean");
 const STATEMENT_HASH_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/StatementHash.lean");
-const ZYGOTE_FORK_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/ZygoteFork.lean");
+const ZYGOTE_FORK_LEAN_SRC: &str = include_str!("zygote_fork_posix.lean");
 const ZYGOTE_WORKER_LEAN_SRC: &str = include_str!("../../../lean/TurboLean/ZygoteWorker.lean");
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

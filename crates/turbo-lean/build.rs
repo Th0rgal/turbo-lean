@@ -149,6 +149,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../lean/LeanNative/Spec.lean");
     println!("cargo:rerun-if-changed=../../lean/lean-toolchain");
     println!("cargo:rerun-if-changed=../../lean/lakefile.lean");
+    println!("cargo:rerun-if-changed=src/zygote_fork_posix.lean");
     println!("cargo:rerun-if-changed=build.rs");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
