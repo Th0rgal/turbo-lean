@@ -3,4 +3,5 @@
 {"decl_name":"sdk_cut_fission_full","stmt_src":"theorem sdk_cut_fission_full (n : Nat) : n + 0 = n","body_src":"by\n  have h1 : n + 0 = n := by rfl\n  have h2 : n = n := by rfl\n  exact h1","imports_csv":"Init","available_constants":[],"budget_ms":25}
 {"decl_name":"sdk_cut_fission_attr","stmt_src":"@[simp] private lemma sdk_cut_fission_attr (n : Nat) : n + 0 = n","body_src":"by\n  have h1 (m : Nat) : m + 0 = m := by rfl\n  exact h1 n","imports_csv":"Init","available_constants":[],"budget_ms":25}
 {"decl_name":"sdk_cut_fission_binders","stmt_src":"(n : Nat) : n + 0 = n","body_src":"by\n  have h1 : n + 0 = n := by rfl\n  have h2 : n = n := by rfl\n  exact h1","imports_csv":"Init","available_constants":[],"budget_ms":25}
+{"decl_name":"sdk_cut_fission_bare_colon","stmt_src":": 0 + 0 = 0","body_src":"by\n  have h1 : 0 + 0 = 0 := by rfl\n  exact h1","imports_csv":"Init","available_constants":[],"budget_ms":25}
 {"decl_name":"sdk_noop_rfl","stmt_src":"theorem sdk_noop_rfl (x : UInt64) : x = x","body_src":"by rfl","imports_csv":"Init","available_constants":[],"budget_ms":25}

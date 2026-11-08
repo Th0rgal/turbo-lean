@@ -585,6 +585,7 @@ def extract_have_cuts(decl_name: str, stmt_src: str, body_src: str) -> list[str]
         sig_split = split_top_level_colon(stmt_trimmed)
         if sig_split is not None:
             binders, goal_ty = sig_split
+            binders = binders.strip()
         elif not stmt_trimmed.startswith((":", "(", "{", "[")):
             binders, goal_ty = "", stmt_trimmed
         else:

@@ -760,7 +760,7 @@ class AcceleratorSdkTestSuite(unittest.TestCase):
             self.assertTrue(saw_abstain)
             self.assertEqual(
                 set(subgoal_cases),
-                {"sdk_cut_fission_full", "sdk_cut_fission_attr", "sdk_cut_fission_binders"},
+                {"sdk_cut_fission_full", "sdk_cut_fission_attr", "sdk_cut_fission_binders", "sdk_cut_fission_bare_colon"},
             )
             for shard in subgoal_cases["sdk_cut_fission_full"]:
                 self.assertTrue(shard.startswith("theorem sdk_cut_fission_full (n : Nat)"), shard)
@@ -770,6 +770,15 @@ class AcceleratorSdkTestSuite(unittest.TestCase):
             self.assertIn("(h1 : ∀ (m : Nat), m + 0 = m)", subgoal_cases["sdk_cut_fission_attr"][1])
             for shard in subgoal_cases["sdk_cut_fission_binders"]:
                 self.assertTrue(shard.startswith("theorem sdk_cut_fission_binders (n : Nat)"), shard)
+            self.assertEqual(
+                subgoal_cases["sdk_cut_fission_bare_colon"][0],
+                "theorem sdk_cut_fission_bare_colon : 0 + 0 = 0 := by rfl",
+            )
+            self.assertTrue(
+                subgoal_cases["sdk_cut_fission_bare_colon"][1].startswith(
+                    "theorem sdk_cut_fission_bare_colon (h1 : 0 + 0 = 0) : 0 + 0 = 0 := by"
+                )
+            )
 
     def test_03_lnir_wire_opt_fixtures_and_adversarial_gate(self) -> None:
         lines = (FIXTURES_DIR / "lnir_opt_requests.jsonl").read_text(encoding="utf-8").splitlines()
@@ -818,6 +827,70 @@ class AcceleratorSdkTestSuite(unittest.TestCase):
             parse_single_decl_wire(sample_req["wire"] + "|F_facts|not_a_nat")
         with self.assertRaises(ValueError):
             parse_single_decl_wire(sample_req["wire"] + "|F_facts|1|F_excl|0|EXTRA_TOKEN")
+
+        checked_same_ub_src_wire = (
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|63686b5f73616d655f7562|A_L2|0|"
+            "2|0|61|0|T_u256|1|62|0|T_u256|T_u256|"
+            "C_let|2|T_u256|E_scalar|S_bin|B_add|S_var|0|S_u64|0|"
+            "C_let|3|T_u256|E_scalar|S_bin|B_addChecked256|S_var|2|S_var|1|"
+            "C_ret|3"
+        )
+        checked_same_ub_cand_wire = (
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|63686b5f73616d655f7562|A_L2|0|"
+            "2|0|61|0|T_u256|1|62|0|T_u256|T_u256|"
+            "C_let|3|T_u256|E_scalar|S_bin|B_addChecked256|S_var|0|S_var|1|"
+            "C_ret|3"
+        )
+        c_chk_before, c_chk_after = verify_opt_plugin_gate_64(
+            parse_single_decl_wire(checked_same_ub_src_wire),
+            parse_single_decl_wire(checked_same_ub_cand_wire),
+            "x86_64",
+        )
+        self.assertLess(c_chk_after, c_chk_before)
+
+        clz256_src_wire = (
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|636c7a3235365f7a65726f|A_L2|0|"
+            "1|0|78|0|T_u256|T_i1|"
+            "C_let|1|T_u256|E_scalar|S_un|U_clz256|S_var|0|"
+            "C_let|2|T_u256|E_scalar|S_bin|B_sub|S_var|0|S_var|0|"
+            "C_let|3|T_u256|E_scalar|S_un|U_not|S_var|2|"
+            "C_let|4|T_u256|E_scalar|S_bin|B_shr|S_var|3|S_u64|255|"
+            "C_let|5|T_u256|E_scalar|S_bin|B_shl|S_var|4|S_u64|8|"
+            "C_let|6|T_i1|E_scalar|S_bin|B_eq|S_var|1|S_var|5|"
+            "C_ret|6"
+        )
+        clz256_bad_cand_wire = (
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|636c7a3235365f7a65726f|A_L2|0|"
+            "1|0|78|0|T_u256|T_i1|"
+            "C_let|6|T_i1|E_scalar|S_bool|0|"
+            "C_ret|6"
+        )
+        with self.assertRaises(ValueError):
+            verify_opt_plugin_gate_64(
+                parse_single_decl_wire(clz256_src_wire),
+                parse_single_decl_wire(clz256_bad_cand_wire),
+                "x86_64",
+            )
+
+        div_ub_intro_src_wire = (
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|6469765f75625f696e74726f|A_L2|0|"
+            "2|0|61|0|T_u256|1|62|0|T_u256|T_u256|"
+            "C_let|2|T_u256|E_scalar|S_bin|B_mul|S_var|0|S_var|1|"
+            "C_let|3|T_u256|E_scalar|S_bin|B_add|S_var|2|S_var|0|"
+            "C_ret|3"
+        )
+        div_ub_intro_cand_wire = (
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|6469765f75625f696e74726f|A_L2|0|"
+            "2|0|61|0|T_u256|1|62|0|T_u256|T_u256|"
+            "C_let|3|T_u256|E_scalar|S_bin|B_div|S_var|0|S_var|1|"
+            "C_ret|3"
+        )
+        with self.assertRaises(ValueError):
+            verify_opt_plugin_gate_64(
+                parse_single_decl_wire(div_ub_intro_src_wire),
+                parse_single_decl_wire(div_ub_intro_cand_wire),
+                "x86_64",
+            )
 
         ub_erasing_src_wire = (
             "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|75625f726566696e65|A_L2|0|"
