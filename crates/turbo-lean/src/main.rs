@@ -1147,11 +1147,7 @@ fn run(cli: Cli) -> Result<()> {
     let resolved_cache_root = cli
         .cache_dir
         .clone()
-        .or_else(|| std::env::var("TURBO_LEAN_HOME").ok().map(PathBuf::from))
-        .unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            PathBuf::from(home).join(".cache").join("turbo-lean")
-        });
+        .unwrap_or_else(shm_cache::cache_root);
     let db_warm_on_open = fs::metadata(resolved_cache_root.join("state.db"))
         .map(|m| m.len() >= 4096)
         .unwrap_or(false);

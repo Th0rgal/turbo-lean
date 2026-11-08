@@ -8150,16 +8150,38 @@ pub(crate) struct CutoffPinBaseline {
     pub(crate) cuts_off_meta: bool,
 }
 
+pub(crate) fn source_uses_include_str(src_raw: &str) -> bool {
+    let comment_free = crate::splitter::strip_lean_comments(src_raw);
+    let clean = crate::splitter::strip_string_literals(&comment_free);
+    let unquoted = clean.replace(['«', '»'], "");
+    ["include_str", "include_str?", "include_bin", "include_bin?"]
+        .iter()
+        .any(|seg| crate::splitter::contains_lean_ident_segment(&unquoted, seg))
+}
+
+pub(crate) fn module_directly_depends_on_lake_inputs(
+    cfg: &ProjectConfig,
+    _pkg_root: &Path,
+    mod_name: &str,
+    src_raw: &str,
+) -> bool {
+    !input_bearing_libs_for_module(cfg, mod_name).is_empty()
+        || !input_bearing_exes_for_module(cfg, mod_name).is_empty()
+        || source_uses_include_str(src_raw)
+}
+
 #[derive(Default)]
 pub(crate) struct LakeClosureCache {
     manifests: HashMap<(PathBuf, bool), CachedPkgManifest>,
-    exp_memo: HashMap<(PathBuf, String, bool), Option<LakeModuleExportInfo>>,
-    pb_exp_memo: HashMap<(PathBuf, bool), Option<LakeModuleExportInfo>>,
-    pinned_memo: HashSet<(PathBuf, String, String, bool)>,
+    exp_memo: HashMap<(PathBuf, String, bool, bool), Option<LakeModuleExportInfo>>,
+    pb_exp_memo: HashMap<(PathBuf, bool, bool), Option<LakeModuleExportInfo>>,
+    pinned_memo: HashSet<(PathBuf, String, String, bool, bool)>,
     cutoff_pins: HashMap<(PathBuf, String), CutoffPinBaseline>,
     clean_git_pin_memo: HashMap<PathBuf, bool>,
+    input_dep_memo: HashMap<(PathBuf, String), bool>,
     pub(crate) post_lake_refresh: bool,
     pub(crate) ignore_mtime_skew: bool,
+    pub(crate) allow_stale_manifest_hydration: bool,
 }
 
 impl LakeClosureCache {
@@ -8170,8 +8192,12 @@ impl LakeClosureCache {
         strict_policy: bool,
         info: LakeModuleExportInfo,
     ) {
+        self.exp_memo.insert(
+            (pkg_root.clone(), module_name.clone(), strict_policy, false),
+            Some(info),
+        );
         self.exp_memo
-            .insert((pkg_root, module_name, strict_policy), Some(info));
+            .insert((pkg_root, module_name, strict_policy, true), Some(info));
     }
 
     pub(crate) fn seed_cutoff_module_pin(
@@ -8248,6 +8274,71 @@ impl LakeClosureCache {
             (pkg_root, strict_policy),
             CachedPkgManifest { raw, validated },
         );
+    }
+
+    pub(crate) fn module_closure_depends_on_lake_inputs(
+        &mut self,
+        cfg: &ProjectConfig,
+        spec: &DiscoveredModuleSpec,
+    ) -> bool {
+        let mut visiting = HashSet::new();
+        self.module_closure_depends_on_lake_inputs_inner(cfg, spec, &mut visiting)
+    }
+
+    fn module_closure_depends_on_lake_inputs_inner(
+        &mut self,
+        cfg: &ProjectConfig,
+        spec: &DiscoveredModuleSpec,
+        visiting: &mut HashSet<(PathBuf, String)>,
+    ) -> bool {
+        let key = (spec.pkg_root.clone(), spec.module_name.clone());
+        if let Some(&cached) = self.input_dep_memo.get(&key) {
+            return cached;
+        }
+        if !visiting.insert(key.clone()) {
+            return true;
+        }
+        let had_cycle_ancestor = visiting.len() > 1;
+        let res = (|| -> bool {
+            let Ok(src_raw) = fs::read_to_string(&spec.src_path) else {
+                return true;
+            };
+            if module_directly_depends_on_lake_inputs(
+                cfg,
+                &spec.pkg_root,
+                &spec.module_name,
+                &src_raw,
+            ) {
+                return true;
+            }
+            let hdr = parse_header_info(&src_raw);
+            if hdr.header_error.is_some() {
+                return true;
+            }
+            for imp in &hdr.imports {
+                let site = match resolve_module_in_package(&cfg.root_pkg, true, imp) {
+                    Some(rs) => ImportSite::Module(Box::new(rs)),
+                    None => resolve_import_site(cfg, imp),
+                };
+                match site {
+                    ImportSite::Toolchain => {}
+                    ImportSite::Module(sub_spec) => {
+                        if self.module_closure_depends_on_lake_inputs_inner(
+                            cfg, &sub_spec, visiting,
+                        ) {
+                            return true;
+                        }
+                    }
+                    ImportSite::Prebuilt(_) | ImportSite::Unresolved => return true,
+                }
+            }
+            false
+        })();
+        visiting.remove(&key);
+        if !res || !had_cycle_ancestor {
+            self.input_dep_memo.insert(key, res);
+        }
+        res
     }
 }
 
@@ -8779,7 +8870,9 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
                     _ => false,
                 }
             });
-        if imp_tainted || spec_source_has_disallowed_elab_host_effects(cfg, &spec, &src_raw) {
+        if imp_tainted
+            || crate::splitter::source_may_execute_elab_host_effects(&src_raw, false)
+        {
             tainted.insert((spec.pkg_root.clone(), spec.module_name.clone()));
             crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
             purged_any = true;
@@ -9671,12 +9764,92 @@ fn resolve_source_spec_for_prebuilt_olean(
     None
 }
 
+fn root_module_includes_all_covered_by_lake_inputs(
+    cfg: &ProjectConfig,
+    mod_name: &str,
+    src_path: &Path,
+    src_raw: &str,
+) -> bool {
+    if !source_uses_include_str(src_raw) {
+        return true;
+    }
+    let Some(rel_paths) = crate::splitter::extract_include_relative_paths(src_raw) else {
+        return false;
+    };
+    if rel_paths.is_empty() {
+        return false;
+    }
+    let pkg = &cfg.root_pkg;
+    let needed: BTreeSet<&str> = pkg
+        .libs
+        .iter()
+        .filter(|lib| lib_can_build_module(lib, mod_name))
+        .flat_map(|lib| lib.needs.iter().map(String::as_str))
+        .chain(
+            pkg.exes
+                .iter()
+                .filter(|exe| exe.root == mod_name)
+                .flat_map(|exe| exe.needs.iter().map(String::as_str)),
+        )
+        .collect();
+    if needed.is_empty() {
+        return false;
+    }
+    let Ok(canon_pkg_root) = fs::canonicalize(&pkg.pkg_root) else {
+        return false;
+    };
+    let Some(src_dir) = src_path.parent() else {
+        return false;
+    };
+    for rel in &rel_paths {
+        let candidate = src_dir.join(rel);
+        let Ok(canon_target) = fs::canonicalize(&candidate) else {
+            return false;
+        };
+        if !canon_target.starts_with(&canon_pkg_root)
+            || check_input_file_is_contained_regular_file(&canon_pkg_root, &canon_target).is_err()
+        {
+            return false;
+        }
+        let covered = pkg.inputs.iter().any(|inp| {
+            if !needed.contains(inp.name.as_str()) || inp.unsupported.is_some() {
+                return false;
+            }
+            let Ok(checked) = checked_input_path(&inp.path) else {
+                return false;
+            };
+            let Ok(canon_inp) = fs::canonicalize(pkg.pkg_root.join(checked)) else {
+                return false;
+            };
+            if inp.is_dir {
+                canon_target.starts_with(&canon_inp)
+                    && canon_target != canon_inp
+                    && inp.matches_extension(canon_target.extension())
+            } else {
+                canon_target == canon_inp
+            }
+        });
+        if !covered {
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) fn spec_source_has_disallowed_elab_host_effects(
     cfg: &ProjectConfig,
     spec: &DiscoveredModuleSpec,
     src_raw: &str,
 ) -> bool {
-    if !spec.is_root_pkg && is_git_pinned_manifest_package(cfg, spec) {
+    if spec.is_root_pkg {
+        crate::splitter::source_may_read_host_state(src_raw)
+            || !root_module_includes_all_covered_by_lake_inputs(
+                cfg,
+                &spec.module_name,
+                &spec.src_path,
+                src_raw,
+            )
+    } else if is_git_pinned_manifest_package(cfg, spec) {
         crate::splitter::source_may_read_host_state(src_raw)
     } else {
         crate::splitter::source_may_execute_elab_host_effects(src_raw, false)
@@ -9693,7 +9866,11 @@ fn prebuilt_closure_export_info(
     pb_closure_opt: Option<&mut Vec<(String, PathBuf)>>,
 ) -> Option<LakeModuleExportInfo> {
     let canon = fs::canonicalize(olean_path).unwrap_or_else(|_| olean_path.to_path_buf());
-    let memo_key = (canon.clone(), strict_policy);
+    let memo_key = (
+        canon.clone(),
+        strict_policy,
+        cache.allow_stale_manifest_hydration,
+    );
     if pb_closure_opt.is_none() {
         if let Some(cached) = cache.pb_exp_memo.get(&memo_key) {
             return *cached;
@@ -9911,6 +10088,7 @@ fn lake_closure_export_info_inner(
         spec.pkg_root.clone(),
         spec.module_name.clone(),
         strict_policy,
+        cache.allow_stale_manifest_hydration,
     );
     if out_closure_opt.is_none() {
         if let Some(cached) = cache.exp_memo.get(&memo_key) {
@@ -9947,17 +10125,44 @@ fn lake_closure_export_info_inner(
         let rel_slash = module_name_to_rel_slash(&spec.module_name);
         let expected_lake_inputs = workspace_lake_inputs_digest(cfg).ok()?;
         let rel_src = spec_rel_src(spec);
-        let cached_manifest =
-            load_cached_pkg_manifest(&mut cache.manifests, cfg, spec, strict_policy)?;
-        let raw_has_entry = matches!(
-            cached_manifest.raw.as_ref(),
-            Some(Ok(m)) if m.modules.contains_key(&rel_src)
-        );
-        let manifest_entry = cached_manifest
-            .validated
-            .as_ref()
-            .and_then(|m| m.modules.get(&rel_src))
-            .cloned();
+        let allow_stale_hydration = cache.allow_stale_manifest_hydration && !strict_policy;
+        let (raw_has_entry, raw_is_some, raw_pkg_matched_entry, mut manifest_entry) = {
+            let cached_manifest =
+                load_cached_pkg_manifest(&mut cache.manifests, cfg, spec, strict_policy)?;
+            let raw_has = matches!(
+                cached_manifest.raw.as_ref(),
+                Some(Ok(m)) if m.modules.contains_key(&rel_src)
+            );
+            let raw_some = cached_manifest.raw.is_some();
+            let raw_matched = if allow_stale_hydration {
+                match cached_manifest.raw.as_ref() {
+                    Some(Ok(m))
+                        if m.pkg_name == spec.pkg_name
+                            && m.toolchain == cfg.toolchain
+                            && m.lean_githash == cfg.lean_githash
+                            && m.pkg_config_digest == spec.pkg_config_digest =>
+                    {
+                        m.modules.get(&rel_src).cloned()
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let validated_entry = cached_manifest
+                .validated
+                .as_ref()
+                .and_then(|m| m.modules.get(&rel_src))
+                .cloned();
+            (raw_has, raw_some, raw_matched, validated_entry)
+        };
+        if allow_stale_hydration && manifest_entry.is_none() {
+            if let Some(raw_entry) = raw_pkg_matched_entry {
+                if !cache.module_closure_depends_on_lake_inputs(cfg, spec) {
+                    manifest_entry = Some(raw_entry);
+                }
+            }
+        }
         let needs_c = spec.precompile_modules || spec.is_exe_target;
         verify_module_lake_sidecars_inner_opts_ext(
             &olean_path,
@@ -9973,13 +10178,14 @@ fn lake_closure_export_info_inner(
         .ok()?;
         let (arts_trace, meta_arts_trace, all_arts_trace) =
             compute_module_arts_traces(&olean_path, is_mod, false).ok()?;
-        if raw_has_entry && manifest_entry.is_none() {
+        if raw_has_entry && manifest_entry.is_none() && !allow_stale_hydration {
             return None;
         }
         if manifest_entry.is_none()
             && !cache.post_lake_refresh
+            && !allow_stale_hydration
             && !expected_lake_inputs.is_empty()
-            && ((spec.is_root_pkg && cached_manifest.raw.is_some())
+            && ((spec.is_root_pkg && raw_is_some)
                 || (!is_git_pinned_manifest_package(cfg, spec)
                     && package_by_root(cfg, &spec.pkg_root).is_some_and(|p| !p.inputs.is_empty())))
         {
@@ -9987,20 +10193,39 @@ fn lake_closure_export_info_inner(
         }
 
         let has_valid_turbo_entry = if let Some(ref entry) = manifest_entry {
+            let entry_inputs_ok = entry.lake_inputs_digest == expected_lake_inputs
+                || (allow_stale_hydration
+                    && !cache.module_closure_depends_on_lake_inputs(cfg, spec));
             if (strict_policy && spec.is_root_pkg && !entry.kernel_audited)
-                || entry.lake_inputs_digest != expected_lake_inputs
+                || !entry_inputs_ok
                 || blake3::hash(src_raw.as_bytes()).to_hex().as_str() != entry.src_blake3
                 || !entry_artifacts_current(cfg, &olean_path, entry)
             {
-                return None;
+                if allow_stale_hydration {
+                    manifest_entry = None;
+                    false
+                } else {
+                    return None;
+                }
+            } else {
+                true
             }
-            true
         } else {
             false
         };
 
         if !has_valid_turbo_entry {
             if strict_policy && spec.is_root_pkg {
+                return None;
+            }
+            if allow_stale_hydration
+                && !expected_lake_inputs.is_empty()
+                && !is_git_pinned_manifest_package(cfg, spec)
+                && package_by_root(cfg, &spec.pkg_root).is_some_and(|p| !p.inputs.is_empty())
+                && source_uses_include_str(&src_raw)
+                && input_bearing_libs_for_module(cfg, &spec.module_name).is_empty()
+                && input_bearing_exes_for_module(cfg, &spec.module_name).is_empty()
+            {
                 return None;
             }
             if spec.native_unsupported.is_some()
@@ -10445,7 +10670,9 @@ pub(crate) fn dep_pkg_import_pins_consistent(
     };
     let mut seen: HashMap<(PathBuf, String), String> = HashMap::new();
     let mut stack = vec![(spec, OwnedImportPinSpec::from_spec(pin_spec))];
-    let use_global_memo = cache.cutoff_pins.is_empty() && !cache.post_lake_refresh;
+    let use_global_memo = cache.cutoff_pins.is_empty()
+        && !cache.post_lake_refresh
+        && !cache.allow_stale_manifest_hydration;
     while let Some((cur, req)) = stack.pop() {
         let key = (cur.pkg_root.clone(), cur.module_name.clone());
         let req_spec = req.as_spec();
@@ -10456,21 +10683,52 @@ pub(crate) fn dep_pkg_import_pins_consistent(
             continue;
         }
         let rel_src = spec_rel_src(&cur);
-        let Some(cached_manifest) =
-            load_cached_pkg_manifest(&mut cache.manifests, cfg, &cur, strict_policy)
-        else {
-            return false;
+        let (raw_has_entry, raw_is_some, raw_pkg_matched_entry, validated_entry) = {
+            let Some(cached_manifest) =
+                load_cached_pkg_manifest(&mut cache.manifests, cfg, &cur, strict_policy)
+            else {
+                return false;
+            };
+            let raw_has = matches!(
+                cached_manifest.raw.as_ref(),
+                Some(Ok(m)) if m.modules.contains_key(&rel_src)
+            );
+            let raw_some = cached_manifest.raw.is_some();
+            let raw_matched = if !strict_policy && cache.allow_stale_manifest_hydration {
+                match (
+                    cached_manifest.raw.as_ref(),
+                    package_by_root(cfg, &cur.pkg_root),
+                ) {
+                    (Some(Ok(m)), Some(pkg))
+                        if m.pkg_name == pkg.name
+                            && m.toolchain == cfg.toolchain
+                            && m.lean_githash == cfg.lean_githash
+                            && m.pkg_config_digest == pkg.config_digest =>
+                    {
+                        m.modules.get(&rel_src).cloned()
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let val = cached_manifest
+                .validated
+                .as_ref()
+                .and_then(|m| m.modules.get(&rel_src))
+                .cloned();
+            (raw_has, raw_some, raw_matched, val)
         };
-        let raw_has_entry = matches!(
-            cached_manifest.raw.as_ref(),
-            Some(Ok(m)) if m.modules.contains_key(&rel_src)
-        );
-        let Some(entry) = cached_manifest
-            .validated
-            .as_ref()
-            .and_then(|m| m.modules.get(&rel_src))
-            .cloned()
-        else {
+        let entry_opt = match validated_entry {
+            Some(e) => Some(e),
+            None => match raw_pkg_matched_entry {
+                Some(raw_e) if !cache.module_closure_depends_on_lake_inputs(cfg, &cur) => {
+                    Some(raw_e)
+                }
+                _ => None,
+            },
+        };
+        let Some(entry) = entry_opt else {
             let olean_path = spec_olean_path(&cur);
             let pin_matches_lake = olean_digest_is(cfg, &olean_path, &req.full_pin)
                 || fs::read_to_string(&cur.src_path)
@@ -10491,10 +10749,11 @@ pub(crate) fn dep_pkg_import_pins_consistent(
                         _ => false,
                     });
             if (strict_policy && (cur.is_root_pkg || !is_git_pinned_manifest_package(cfg, &cur)))
-                || raw_has_entry
+                || (raw_has_entry && !cache.allow_stale_manifest_hydration)
                 || (!cache.post_lake_refresh
+                    && !cache.allow_stale_manifest_hydration
                     && !expected_lake_inputs.is_empty()
-                    && ((cur.is_root_pkg && cached_manifest.raw.is_some())
+                    && ((cur.is_root_pkg && raw_is_some)
                         || (!is_git_pinned_manifest_package(cfg, &cur)
                             && package_by_root(cfg, &cur.pkg_root)
                                 .is_some_and(|p| !p.inputs.is_empty()))))
@@ -10534,6 +10793,7 @@ pub(crate) fn dep_pkg_import_pins_consistent(
             key.1.clone(),
             actual_pin.clone(),
             strict_policy,
+            cache.allow_stale_manifest_hydration,
         );
         if cache.pinned_memo.contains(&cache_pin_key)
             || (strict_policy
@@ -10548,8 +10808,12 @@ pub(crate) fn dep_pkg_import_pins_consistent(
             }
             continue;
         }
+        let entry_inputs_ok = entry.lake_inputs_digest == expected_lake_inputs
+            || (!strict_policy
+                && cache.allow_stale_manifest_hydration
+                && !cache.module_closure_depends_on_lake_inputs(cfg, &cur));
         let artifacts_ok = (!strict_policy || !cur.is_root_pkg || entry.kernel_audited)
-            && entry.lake_inputs_digest == expected_lake_inputs
+            && entry_inputs_ok
             && entry_artifacts_current(cfg, &olean_path, &entry);
         let src_ok = blake3::hash(src.as_bytes()).to_hex().as_str() == entry.src_blake3;
         let sidecars_ok = verify_module_lake_sidecars(
@@ -10586,9 +10850,13 @@ pub(crate) fn dep_pkg_import_pins_consistent(
         seen.insert(key, actual_pin);
     }
     for ((pkg, module), pin) in &seen {
-        cache
-            .pinned_memo
-            .insert((pkg.clone(), module.clone(), pin.clone(), strict_policy));
+        cache.pinned_memo.insert((
+            pkg.clone(),
+            module.clone(),
+            pin.clone(),
+            strict_policy,
+            cache.allow_stale_manifest_hydration,
+        ));
     }
     if strict_policy && use_global_memo {
         if let Ok(mut m) = memo.0.lock() {
@@ -11781,6 +12049,7 @@ pub(crate) fn compile_overlay_modules_direct(
             false,
             None,
             true,
+            1,
         )?;
         let _ = publish_staged_module_compile_output(&node, staged)?;
         overlay_dag.nodes.insert(mod_name.clone(), node);
@@ -11839,7 +12108,7 @@ pub(crate) fn compile_disposable_snapshot_dirty_modules_direct(
             }
         }
         let staged =
-            compile_single_module_staged(cfg, dag, node, &lean_lp, &ld_lp, false, None, true)?;
+            compile_single_module_staged(cfg, dag, node, &lean_lp, &ld_lp, false, None, true, 1)?;
         let _ = publish_staged_module_compile_output(node, staged)?;
     }
     Ok(())
@@ -21226,6 +21495,24 @@ pub(crate) fn validate_untrusted_sandbox_search_paths(
     Ok(())
 }
 
+pub(crate) fn per_worker_lean_num_threads(
+    raw_env: Option<&str>,
+    host_cores: usize,
+    compile_pool_size: usize,
+) -> usize {
+    let pool = compile_pool_size.max(1);
+    let cores = host_cores.max(1);
+    let configured = raw_env
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0);
+    if pool <= 1 {
+        configured.unwrap_or(cores)
+    } else {
+        let fair_share = (cores / pool).max(1);
+        configured.map_or(fair_share, |c| c.min(fair_share))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_module_compile_command(
     cfg: &ProjectConfig,
@@ -21239,6 +21526,7 @@ fn build_module_compile_command(
     ld_library_path_env: &str,
     is_untrusted: bool,
     bwrap_bin: Option<&Path>,
+    compile_pool_size: usize,
 ) -> Result<Command> {
     let stack_kb = if is_untrusted {
         "262144".to_string()
@@ -21315,12 +21603,21 @@ fn build_module_compile_command(
         scrub_untrusted_env(&mut c);
         c
     } else {
+        let host_cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let lean_threads = per_worker_lean_num_threads(
+            std::env::var("LEAN_NUM_THREADS").ok().as_deref(),
+            host_cores,
+            compile_pool_size,
+        );
         let mut c = Command::new(&cfg.lean_bin);
         c.current_dir(&node.pkg_root)
             .env("PATH", verifier_path(&cfg.lean_bin))
             .env("LEAN_PATH", lean_path_env)
             .env("LD_LIBRARY_PATH", ld_library_path_env)
-            .env("LEAN_STACK_SIZE_KB", &stack_kb);
+            .env("LEAN_STACK_SIZE_KB", &stack_kb)
+            .env("LEAN_NUM_THREADS", lean_threads.to_string());
         c
     };
     // When `is_untrusted`, pass Lean's `-M 4096 -j 4` (4096 MB internal allocator limit and 4
@@ -21391,6 +21688,7 @@ fn compile_single_module_staged(
     is_untrusted: bool,
     bwrap_bin: Option<&Path>,
     preserve_lake: bool,
+    compile_pool_size: usize,
 ) -> Result<StagedModuleCompileOutput> {
     let t0 = Instant::now();
     record_scheduler_test_event(
@@ -21436,6 +21734,7 @@ fn compile_single_module_staged(
         ld_library_path_env,
         is_untrusted,
         bwrap_bin,
+        compile_pool_size,
     )?;
     let timeout_secs = module_compile_timeout_secs(is_untrusted);
     let output = run_command_with_timeout(
@@ -21970,7 +22269,15 @@ fn node_source_has_disallowed_elab_host_effects(
     node: &ModuleNode,
     src_raw: &str,
 ) -> bool {
-    if node_is_git_pinned_manifest_package(cfg, node) {
+    if node.is_root_pkg {
+        crate::splitter::source_may_read_host_state(src_raw)
+            || !root_module_includes_all_covered_by_lake_inputs(
+                cfg,
+                &node.module_name,
+                &node.src_path,
+                src_raw,
+            )
+    } else if node_is_git_pinned_manifest_package(cfg, node) {
         crate::splitter::source_may_read_host_state(src_raw)
     } else {
         crate::splitter::source_may_execute_elab_host_effects(src_raw, false)
@@ -24015,6 +24322,13 @@ fn discover_all_package_module_specs(
 }
 
 pub fn hydrate_project_traces(project_dir: &Path) -> Result<HydrateTracesReport> {
+    hydrate_project_traces_with_store(project_dir, None)
+}
+
+pub(crate) fn hydrate_project_traces_with_store(
+    project_dir: &Path,
+    store_opt: Option<&TurboStore>,
+) -> Result<HydrateTracesReport> {
     reset_lake_inputs_tag_memo();
     let t0 = std::time::Instant::now();
     let canon_dir = project_dir
@@ -24044,6 +24358,7 @@ pub fn hydrate_project_traces(project_dir: &Path) -> Result<HydrateTracesReport>
     let kernel_policy_digest = crate::splitter::current_kernel_policy_digest();
 
     let mut report = HydrateTracesReport::default();
+    let mut scanned_pkgs: Vec<&PackageConfig> = Vec::new();
     let mut pkg_specs: Vec<(&PackageConfig, bool, Vec<DiscoveredModuleSpec>)> = Vec::new();
     for (is_root, pkg) in
         std::iter::once((true, &cfg.root_pkg)).chain(cfg.dep_pkgs.iter().map(|dp| (false, dp)))
@@ -24052,6 +24367,7 @@ pub fn hydrate_project_traces(project_dir: &Path) -> Result<HydrateTracesReport>
             continue;
         }
         report.packages_scanned += 1;
+        scanned_pkgs.push(pkg);
         let assurance = if is_root {
             discover_trusted_assurance_surface(&pkg.pkg_root, pkg, &allowed_axioms)
         } else {
@@ -24071,12 +24387,16 @@ pub fn hydrate_project_traces(project_dir: &Path) -> Result<HydrateTracesReport>
     }
 
     if pkg_specs.is_empty() {
+        for pkg in &scanned_pkgs {
+            let _ = fs::remove_file(pkg.pkg_root.join(".lake/build/.turbo_verified_sources.json"));
+        }
         report.elapsed_ms = t0.elapsed().as_millis();
         return Ok(report);
     }
 
     let mut cache = LakeClosureCache {
         ignore_mtime_skew: true,
+        allow_stale_manifest_hydration: true,
         ..Default::default()
     };
     let mut verified_specs: Vec<(DiscoveredModuleSpec, PathBuf)> = Vec::new();
@@ -24092,6 +24412,9 @@ pub fn hydrate_project_traces(project_dir: &Path) -> Result<HydrateTracesReport>
     }
 
     if verified_specs.is_empty() {
+        for pkg in &scanned_pkgs {
+            let _ = fs::remove_file(pkg.pkg_root.join(".lake/build/.turbo_verified_sources.json"));
+        }
         report.elapsed_ms = t0.elapsed().as_millis();
         return Ok(report);
     }
@@ -24121,6 +24444,7 @@ pub fn hydrate_project_traces(project_dir: &Path) -> Result<HydrateTracesReport>
         String,
         String,
         bool,
+        PathBuf,
         String,
         Vec<String>,
         String,
@@ -24177,6 +24501,7 @@ pub fn hydrate_project_traces(project_dir: &Path) -> Result<HydrateTracesReport>
                             spec.module_name.clone(),
                             rel_src,
                             spec.is_root_pkg,
+                            olean_path.clone(),
                             src_b3,
                             hdr.imports,
                             dig,
@@ -24196,15 +24521,20 @@ pub fn hydrate_project_traces(project_dir: &Path) -> Result<HydrateTracesReport>
     let mut mod_digests: HashMap<(PathBuf, String), String> = HashMap::new();
     let mut ready_mods: Vec<ComputedMod> = Vec::new();
     for item in computed.into_iter().flatten() {
-        mod_digests.insert((item.0.clone(), item.1.clone()), item.6.clone());
+        mod_digests.insert((item.0.clone(), item.1.clone()), item.7.clone());
         ready_mods.push(item);
     }
 
     let mut prebuilt_digests: HashMap<PathBuf, String> = HashMap::new();
     let mut updates_by_pkg: HashMap<PathBuf, Vec<(String, VerifiedDepModuleEntry)>> =
         HashMap::new();
+    let mut replay_audit_ctx = store_opt.map(|st| {
+        let (replay_lp, _) = build_lean_search_path(&cfg, false);
+        let batch = ReplayLookupBatchCache::new(st, &cfg, &replay_lp);
+        (st, replay_lp, batch)
+    });
 
-    for (pkg_root, _mod_name, rel_src, is_root_pkg, src_b3, imports, olean_dig, stat_fp) in
+    for (pkg_root, mod_name, rel_src, is_root_pkg, olean_path, src_b3, imports, olean_dig, stat_fp) in
         ready_mods
     {
         let mut import_pins: BTreeMap<String, String> = BTreeMap::new();
@@ -24265,15 +24595,23 @@ pub fn hydrate_project_traces(project_dir: &Path) -> Result<HydrateTracesReport>
             .is_some_and(|e| {
                 e.kernel_audited && e.src_blake3 == src_b3 && e.olean_artifact_digest == olean_dig
             });
+        let store_kernel_audited = is_root_pkg
+            && !prev_kernel_audited
+            && replay_audit_ctx
+                .as_mut()
+                .is_some_and(|(st, lp, batch)| {
+                    batch.is_audited_in_store(st, &cfg, lp, &mod_name, &olean_path)
+                });
         let entry = VerifiedDepModuleEntry {
             src_blake3: src_b3,
             olean_artifact_digest: olean_dig,
             lake_inputs_digest: expected_lake_inputs.clone(),
             // Never forge `kernel_audited = true` on root-package modules without replay:
-            // preserve an existing matching `kernel_audited` bit; dependency packages only use
+            // preserve an existing matching `kernel_audited` bit (or a verified `TurboStore`
+            // kernel audit when `store_opt` is provided); dependency packages only use
             // `.turbo_verified_sources.json` for freshness while `TurboStore` enforces replay.
             kernel_audited: if is_root_pkg {
-                prev_kernel_audited
+                prev_kernel_audited || store_kernel_audited
             } else {
                 false
             },
@@ -24288,45 +24626,33 @@ pub fn hydrate_project_traces(project_dir: &Path) -> Result<HydrateTracesReport>
             .push((rel_src, entry));
     }
 
-    for (pkg, _, _) in &pkg_specs {
-        let Some(entries) = updates_by_pkg.remove(&pkg.pkg_root) else {
-            continue;
-        };
-        if entries.is_empty() {
-            continue;
-        }
+    for pkg in &scanned_pkgs {
         let build_dir = pkg.pkg_root.join(".lake/build");
-        let _ = fs::create_dir_all(&build_dir);
         let manifest_path = build_dir.join(".turbo_verified_sources.json");
-        let mut manifest = existing_manifests
-            .remove(&pkg.pkg_root)
-            .map(|mut m| {
-                if m.allowed_axioms != allowed_axioms
-                    || m.kernel_policy_digest != kernel_policy_digest
-                {
-                    for e in m.modules.values_mut() {
-                        e.kernel_audited = false;
-                    }
-                    m.allowed_axioms = allowed_axioms.clone();
-                    m.kernel_policy_digest = kernel_policy_digest.clone();
-                }
-                m.lake_inputs_digest = expected_lake_inputs.clone();
-                m.workspace_config_digest = cfg.canonical_config_digest.clone();
-                m
-            })
-            .unwrap_or_else(|| VerifiedDepManifest {
-                pkg_name: pkg.name.clone(),
-                toolchain: cfg.toolchain.clone(),
-                lean_githash: cfg.lean_githash.clone(),
-                pkg_config_digest: pkg.config_digest.clone(),
-                lake_inputs_digest: expected_lake_inputs.clone(),
-                workspace_config_digest: cfg.canonical_config_digest.clone(),
-                allowed_axioms: allowed_axioms.clone(),
-                kernel_policy_digest: kernel_policy_digest.clone(),
-                modules: BTreeMap::new(),
-                cfg: None,
-                dep_import_memo: DepImportMemo::default(),
-            });
+        let keep_empty_root_inputs =
+            pkg.pkg_root == cfg.root_pkg.pkg_root && !expected_lake_inputs.is_empty();
+        let entries = match updates_by_pkg.remove(&pkg.pkg_root) {
+            Some(v) if !v.is_empty() || keep_empty_root_inputs => v,
+            _ if keep_empty_root_inputs => Vec::new(),
+            _ => {
+                let _ = fs::remove_file(&manifest_path);
+                continue;
+            }
+        };
+        let _ = fs::create_dir_all(&build_dir);
+        let mut manifest = VerifiedDepManifest {
+            pkg_name: pkg.name.clone(),
+            toolchain: cfg.toolchain.clone(),
+            lean_githash: cfg.lean_githash.clone(),
+            pkg_config_digest: pkg.config_digest.clone(),
+            lake_inputs_digest: expected_lake_inputs.clone(),
+            workspace_config_digest: cfg.canonical_config_digest.clone(),
+            allowed_axioms: allowed_axioms.clone(),
+            kernel_policy_digest: kernel_policy_digest.clone(),
+            modules: BTreeMap::new(),
+            cfg: None,
+            dep_import_memo: DepImportMemo::default(),
+        };
         for (rel_src, entry) in entries {
             manifest.modules.insert(rel_src, entry);
             report.entries_written += 1;
@@ -24746,7 +25072,7 @@ pub(crate) fn build_project_modules_native_with_options(
     let audit_pool_size = if is_untrusted || explicit_audit_batch_cfg.is_some() {
         1
     } else {
-        max_jobs.min(4).min(dag.nodes.len()).max(1)
+        (max_jobs / 4).clamp(1, 2).min(dag.nodes.len()).max(1)
     };
     let audit_work_queue: std::sync::Mutex<VecDeque<Vec<String>>> =
         std::sync::Mutex::new(VecDeque::new());
@@ -24793,6 +25119,7 @@ pub(crate) fn build_project_modules_native_with_options(
                     is_untrusted,
                     bwrap_ref,
                     preserve_lake,
+                    compile_pool_size,
                 );
                 let _ = tx.send(SchedulerEvent::CompileFinished {
                     mod_name,
@@ -25401,6 +25728,20 @@ pub(crate) fn build_project_modules_native_with_options(
                     });
                 }
                 if !batch_mods.is_empty() {
+                    let coalesce_snapshot = !is_untrusted
+                        && explicit_audit_batch_cfg.is_none()
+                        && in_flight_compiles > 0
+                        && batch_mods.len() < 16
+                        && !(in_flight_compiles < compile_pool_size
+                            && batch_mods.iter().any(|m| {
+                                dependents.get(m).is_some_and(|deps| !deps.is_empty())
+                            }));
+                    if coalesce_snapshot {
+                        for m in batch_mods.into_iter().rev() {
+                            pending_audit_queue.push_front(m);
+                        }
+                        break;
+                    }
                     if profile_phases {
                         eprintln!(
                             "[turbo-lean][profile] audit_dispatch: n={} (elapsed={}ms)",
@@ -33973,6 +34314,7 @@ globs = ["Demo.+"]
             &ld_env,
             true,
             Some(Path::new("/usr/bin/bwrap")),
+            1,
         )
         .unwrap();
         assert_eq!(
@@ -34017,6 +34359,7 @@ globs = ["Demo.+"]
             &ld_env,
             true,
             None,
+            1,
         )
         .unwrap_err()
         .to_string();
@@ -34039,6 +34382,7 @@ globs = ["Demo.+"]
             &ld_env,
             true,
             Some(Path::new("/usr/bin/bwrap")),
+            1,
         )
         .unwrap_err()
         .to_string();
@@ -41931,6 +42275,105 @@ end Fixture
         fs::write(dep.join("EvmYul/Untracked.lean"), "def bad := 1\n")?;
         reset_lake_inputs_tag_memo();
         assert!(!is_clean_pinned_git_checkout(&dep, &rev, Some(dep_pkg)));
+
+        crate::zygote::purge_snapshot_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_per_worker_lean_num_threads_avoids_pool_oversubscription() {
+        assert_eq!(per_worker_lean_num_threads(Some("8"), 8, 8), 1);
+        assert_eq!(per_worker_lean_num_threads(None, 8, 8), 1);
+        assert_eq!(per_worker_lean_num_threads(Some("8"), 8, 2), 4);
+        assert_eq!(per_worker_lean_num_threads(Some("2"), 8, 2), 2);
+        assert_eq!(per_worker_lean_num_threads(Some("8"), 8, 1), 8);
+        assert_eq!(per_worker_lean_num_threads(None, 8, 1), 8);
+    }
+
+    #[test]
+    fn test_source_uses_include_str_detects_bin_and_qualified_variants() {
+        assert!(source_uses_include_str("def a := include_str \"x.txt\"\n"));
+        assert!(source_uses_include_str("def b := Lean.include_str \"x.txt\"\n"));
+        assert!(source_uses_include_str("def c := include_bin \"x.bin\"\n"));
+        assert!(source_uses_include_str("def d := Lean.include_bin? \"x.bin\"\n"));
+        assert!(!source_uses_include_str("def e := \"include_str not real\"\n"));
+        assert!(!source_uses_include_str("-- include_bin \"commented.bin\"\ndef f := 1\n"));
+    }
+
+    #[test]
+    fn test_root_pure_elaborator_module_caches_in_cas_and_manifest() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "tl_root_pure_elab_cas_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let proj = dir.join("proj");
+        let store_dir = dir.join("store");
+        fs::create_dir_all(proj.join("Verity"))?;
+        let tc = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean/lean-toolchain"),
+        )?;
+        fs::write(proj.join("lean-toolchain"), &tc)?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"verity\"\ndefaultTargets = [\"Verity\"]\n[[lean_lib]]\nname = \"Verity\"\n",
+        )?;
+        let macro_src = "import Lean\nsyntax (name := checkContractCmd) \"#check_contract_nop\" : command\n@[command_elab checkContractCmd]\ndef elabCheckContract : Lean.Elab.Command.CommandElab := fun _ => pure ()\n";
+        let leaf_src = "import Verity.Macro\n#check_contract_nop\ntheorem leaf_ok : 1 + 1 = 2 := rfl\n";
+        let root_src = "import Verity.Leaf\n";
+        fs::write(proj.join("Verity/Macro.lean"), macro_src)?;
+        fs::write(proj.join("Verity/Leaf.lean"), leaf_src)?;
+        fs::write(proj.join("Verity.lean"), root_src)?;
+        let canon = fs::canonicalize(&proj)?;
+        let mut store = TurboStore::open(Some(&store_dir))?;
+        let r1 = build_project_modules_native(
+            &mut store,
+            &canon,
+            &[],
+            "trusted",
+            2,
+            false,
+            true,
+            None,
+        )?;
+        assert_eq!(r1.modules_compiled, 3);
+        let manifest_path = canon.join(".lake/build/.turbo_verified_sources.json");
+        let manifest_raw = fs::read_to_string(&manifest_path)?;
+        assert!(
+            manifest_raw.contains("Verity/Macro.lean") && manifest_raw.contains("Verity/Leaf.lean"),
+            "pure root elaborator and its dependents must record verified source manifest entries: {manifest_raw}"
+        );
+        let _ = fs::remove_dir_all(canon.join(".lake/build"));
+        reset_lake_inputs_tag_memo();
+        let r2 = build_project_modules_native(
+            &mut store,
+            &canon,
+            &[],
+            "trusted",
+            2,
+            false,
+            true,
+            None,
+        )?;
+        assert_eq!(r2.modules_compiled, 0);
+        assert_eq!(r2.modules_cached, 3);
+
+        // Untracked `include_str` in a root module (no Lake `inputs`/`needs`) must NOT enter
+        // Module CAS or `.turbo_verified_sources.json`, so editing the referenced file invalidates cleanly.
+        fs::write(canon.join("Verity/secret.txt"), "v1")?;
+        fs::write(
+            canon.join("Verity/Untracked.lean"),
+            "def embedded : String := include_str \"secret.txt\"\n",
+        )?;
+        let cfg_u = resolve_project_config(&canon)?;
+        let spec_u = resolve_module_in_package(&cfg_u.root_pkg, true, "Verity.Untracked")
+            .expect("Untracked module resolves");
+        let src_u = fs::read_to_string(&spec_u.src_path)?;
+        assert!(
+            spec_source_has_disallowed_elab_host_effects(&cfg_u, &spec_u, &src_u),
+            "root module with untracked include_str must be flagged as host-effecting"
+        );
 
         crate::zygote::purge_snapshot_dir(&dir);
         let _ = fs::remove_dir_all(&dir);

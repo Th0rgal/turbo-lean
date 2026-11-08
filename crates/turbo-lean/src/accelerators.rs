@@ -371,11 +371,7 @@ fn distilled_hints_shm_path() -> std::path::PathBuf {
 }
 
 fn distilled_hints_disk_path() -> Option<std::path::PathBuf> {
-    std::env::var("TURBO_LEAN_HOME")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .map(|p| std::path::PathBuf::from(p).join("distilled_hints.json"))
+    crate::shm_cache::configured_cache_root_env().map(|p| p.join("distilled_hints.json"))
 }
 
 /// Record kernel-distilled constants (`used_constants`) for `(decl_name, stmt_src)` in
@@ -447,11 +443,7 @@ fn distilled_nodes_shm_path() -> std::path::PathBuf {
 }
 
 fn distilled_nodes_disk_path() -> Option<std::path::PathBuf> {
-    std::env::var("TURBO_LEAN_HOME")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .map(|p| std::path::PathBuf::from(p).join("distilled_proof_nodes.json"))
+    crate::shm_cache::configured_cache_root_env().map(|p| p.join("distilled_proof_nodes.json"))
 }
 
 /// Persist proof-size metrics only when local telemetry is enabled for this workspace.

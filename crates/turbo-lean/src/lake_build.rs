@@ -4139,8 +4139,26 @@ pub(crate) fn lake_refresh_targets(canon_dir: &Path, modules: &[String]) -> Vec<
     let any_matching_exe = modules
         .iter()
         .any(|m| !crate::module_builder::exe_targets_for_module(&cfg, m).is_empty());
+    let qualify_non_root_mod = |m: &str| -> String {
+        if m.starts_with('+')
+            || m.starts_with('@')
+            || m.contains('/')
+            || crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, m).is_some()
+        {
+            return m.to_string();
+        }
+        if cfg
+            .dep_pkgs
+            .iter()
+            .any(|dp| crate::module_builder::resolve_module_in_package(dp, false, m).is_some())
+        {
+            format!("+{m}")
+        } else {
+            m.to_string()
+        }
+    };
     if !any_inputs && !any_matching_exe {
-        return modules.to_vec();
+        return modules.iter().map(|m| qualify_non_root_mod(m)).collect();
     }
     let mut input_lib_targets: Vec<String> = Vec::new();
     let mut other_targets: Vec<String> = Vec::new();
@@ -4153,7 +4171,7 @@ pub(crate) fn lake_refresh_targets(canon_dir: &Path, modules: &[String]) -> Vec<
         let exes = crate::module_builder::exe_targets_for_module(&cfg, m);
         input_lib_targets.extend(libs.iter().cloned());
         if libs.is_empty() && exes.is_empty() {
-            other_targets.push(m.clone());
+            other_targets.push(qualify_non_root_mod(m));
         } else {
             other_targets.extend(exes);
         }
@@ -4465,8 +4483,23 @@ fn ensure_project_imports_fresh_inner(
                 .map(|s| crate::splitter::source_may_execute_elab_host_effects(&s, false))
                 .unwrap_or(true);
 
+        let opt_out = worktree_auto_link_disabled(canon_dir);
+        let closure_uses_lake_inputs = opt_out
+            || match root_cfg.as_ref() {
+                Some(cfg) => crate::module_builder::resolve_module_in_package(
+                    &cfg.root_pkg,
+                    true,
+                    &info.mod_name,
+                )
+                .map_or(true, |spec| {
+                    closure_cache.module_closure_depends_on_lake_inputs(cfg, &spec)
+                }),
+                None => true,
+            };
+
         let pkg_inputs_stale = !verify_only
             && root_lake_inputs_stale
+            && closure_uses_lake_inputs
             && (olean_meta.is_some()
                 || (info.is_lake_target && (build_missing || root_pkg_has_inputs)));
 
@@ -4486,7 +4519,8 @@ fn ensure_project_imports_fresh_inner(
                             || m.toolchain != cfg.toolchain
                             || m.lean_githash != cfg.lean_githash
                             || m.pkg_config_digest != cfg.root_pkg.config_digest
-                            || m.lake_inputs_digest != expected_lake_inputs
+                            || (closure_uses_lake_inputs
+                                && m.lake_inputs_digest != expected_lake_inputs)
                     }
                     None => true,
                 }
@@ -4499,7 +4533,8 @@ fn ensure_project_imports_fresh_inner(
                 (Some(m), Some(ch)) => match m.modules.get(&dep_rel) {
                     Some(e) => {
                         e.src_blake3 != *ch
-                            || e.lake_inputs_digest != expected_lake_inputs
+                            || (closure_uses_lake_inputs
+                                && e.lake_inputs_digest != expected_lake_inputs)
                             || (olean_meta.is_some()
                                 && !(m.cfg.as_ref().is_some_and(|cfg| {
                                     crate::module_builder::entry_artifacts_current(
@@ -4510,30 +4545,48 @@ fn ensure_project_imports_fresh_inner(
                                             &info.mod_name,
                                         ))
                                 }) && hdr_by_mod.get(&info.mod_name).is_some_and(|hdr| {
-                                    entry_import_pins_fresh_for_build(m, e, hdr, &mut closure_cache)
+                                    let prev_allow = closure_cache.allow_stale_manifest_hydration;
+                                    closure_cache.allow_stale_manifest_hydration = !opt_out;
+                                    let ok = entry_import_pins_fresh_for_build(
+                                        m,
+                                        e,
+                                        hdr,
+                                        &mut closure_cache,
+                                    );
+                                    closure_cache.allow_stale_manifest_hydration = prev_allow;
+                                    ok
                                 })))
                     }
                     None => {
                         !verify_only
                             && has_lake_inputs
+                            && closure_uses_lake_inputs
                             && (olean_meta.is_some()
                                 || (info.is_lake_target && root_pkg_has_inputs))
                     }
                 },
-                (None, _) => !verify_only && info.is_lake_target && root_pkg_has_inputs,
+                (None, _) => {
+                    !verify_only
+                        && info.is_lake_target
+                        && root_pkg_has_inputs
+                        && closure_uses_lake_inputs
+                }
                 _ => false,
             };
         let lake_root_stale = info.is_lake_target
             && !has_manifest_entry
             && olean_meta.is_some()
             && root_cfg.as_ref().is_some_and(|cfg| {
-                crate::module_builder::root_pkg_lake_module_stale(
+                let prev_allow = closure_cache.allow_stale_manifest_hydration;
+                closure_cache.allow_stale_manifest_hydration = !opt_out;
+                let stale = crate::module_builder::root_pkg_lake_module_stale(
                     cfg,
                     &mut closure_cache,
                     &info.mod_name,
-                )
+                );
+                closure_cache.allow_stale_manifest_hydration = prev_allow;
+                stale
             });
-        let opt_out = worktree_auto_link_disabled(canon_dir);
         let cryptographically_verified = !opt_out
             && olean_meta.is_some()
             && !src_elab_host_effects_stale
@@ -6092,7 +6145,9 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
             input_exes.dedup();
             input_exe_dag_seeds.sort();
             input_exe_dag_seeds.dedup();
-            if (!input_libs.is_empty() || !input_exes.is_empty()) && has_lake_config(&dir) {
+            let has_pkg_inputs = !cfg.root_pkg.inputs.is_empty()
+                || cfg.dep_pkgs.iter().any(|dp| !dp.inputs.is_empty());
+            if has_pkg_inputs && has_lake_config(&dir) {
                 let mut lib_seeds: Vec<String> = cfg
                     .root_pkg
                     .libs
@@ -6135,6 +6190,7 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                 lake_exe_seeds.dedup();
 
                 let mut ordered_targets = input_libs.clone();
+                let mut bypass_lake_cache = false;
                 let closure_files: Vec<PathBuf>;
                 let closure_mods: Vec<String>;
                 if let Ok(dag) =
@@ -6142,14 +6198,45 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                 {
                     let mut closure: std::collections::BTreeSet<String> = dag
                         .nodes
-                        .keys()
-                        .filter(|m| {
-                            !crate::module_builder::input_bearing_libs_for_module(&cfg, m)
+                        .iter()
+                        .filter_map(|(m, n)| {
+                            let spec_has_include_str =
+                                crate::module_builder::resolve_module_in_package(
+                                    &cfg.root_pkg,
+                                    true,
+                                    m,
+                                )
+                                .or_else(|| match crate::module_builder::resolve_import_site(&cfg, m)
+                                {
+                                    crate::module_builder::ImportSite::Module(s) => Some(*s),
+                                    _ => None,
+                                })
+                                .is_some_and(|spec| {
+                                    fs::read_to_string(&spec.src_path)
+                                        .map(|s| {
+                                            crate::module_builder::module_directly_depends_on_lake_inputs(
+                                                &cfg,
+                                                &spec.pkg_root,
+                                                &spec.module_name,
+                                                &s,
+                                            )
+                                        })
+                                        .unwrap_or(true)
+                                });
+                            if !crate::module_builder::input_bearing_libs_for_module(&cfg, m)
                                 .is_empty()
                                 || !crate::module_builder::input_bearing_exes_for_module(&cfg, m)
                                     .is_empty()
+                                || spec_has_include_str
+                                || fs::read_to_string(&n.src_path)
+                                    .map(|s| crate::module_builder::source_uses_include_str(&s))
+                                    .unwrap_or(false)
+                            {
+                                Some(m.clone())
+                            } else {
+                                None
+                            }
                         })
-                        .cloned()
                         .collect();
                     let mut changed = !closure.is_empty();
                     while changed {
@@ -6168,6 +6255,33 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                         .filter_map(|m| dag.nodes.get(m).map(|n| n.src_path.clone()))
                         .collect();
                     closure_mods = closure.into_iter().collect();
+                    for m in &closure_mods {
+                        if let Some(spec) = crate::module_builder::resolve_module_in_package(
+                            &cfg.root_pkg,
+                            true,
+                            m,
+                        )
+                        .or_else(|| match crate::module_builder::resolve_import_site(&cfg, m) {
+                            crate::module_builder::ImportSite::Module(s) => Some(*s),
+                            _ => None,
+                        }) {
+                            let has_target_needs =
+                                !crate::module_builder::input_bearing_libs_for_module(&cfg, m)
+                                    .is_empty()
+                                    || !crate::module_builder::input_bearing_exes_for_module(
+                                        &cfg, m,
+                                    )
+                                    .is_empty();
+                            if !has_target_needs
+                                && fs::read_to_string(&spec.src_path)
+                                    .map(|s| crate::module_builder::source_uses_include_str(&s))
+                                    .unwrap_or(false)
+                            {
+                                remove_spec_build_artifacts_checked(&spec)?;
+                                bypass_lake_cache = true;
+                            }
+                        }
+                    }
                     for t in lake_refresh_targets(&dir, &closure_mods) {
                         if !ordered_targets.contains(&t) {
                             ordered_targets.push(t);
@@ -6200,11 +6314,13 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                         .collect();
                 }
 
-                eprintln!(
-                    "[turbo-lean] Lake file inputs changed: re-checking input-bearing targets and dependents ({}) with Lake",
-                    ordered_targets.join(", ")
-                );
-                lake_build_modules(&dir, &ordered_targets, None)?;
+                if !ordered_targets.is_empty() {
+                    eprintln!(
+                        "[turbo-lean] Lake file inputs changed: re-checking input-bearing targets and dependents ({}) with Lake",
+                        ordered_targets.join(", ")
+                    );
+                    lake_build_modules_opts(&dir, &ordered_targets, None, bypass_lake_cache)?;
+                }
                 if allow_sorry {
                     let sorry_mod_set = purge_workspace_sorry_artifacts_and_manifest(
                         &dir,
@@ -6237,7 +6353,8 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                 }
                 if allow_sorry
                     || worktree_auto_link_disabled(&dir)
-                    || crate::module_builder::hydrate_project_traces(&dir).is_err()
+                    || crate::module_builder::hydrate_project_traces_with_store(&dir, Some(store))
+                        .is_err()
                 {
                     let _ = fs::remove_file(verified_sources_manifest_path(&dir));
                     for dp in &cfg.dep_pkgs {
@@ -10446,6 +10563,22 @@ mod tests {
             lake_refresh_targets(&plain, &["P.A".to_string(), "Main".to_string()]),
             vec!["@plain/runner:exe".to_string(), "P.A".to_string()],
             "a lean_exe root module must translate to @<pkg>/<exe>:exe so Lake relinks the binary"
+        );
+        let dep_dir = plain.join(".lake/packages/dep");
+        fs::create_dir_all(dep_dir.join("Dep"))?;
+        fs::write(
+            dep_dir.join("lakefile.toml"),
+            "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\nglobs = [\"Dep.+\"]\n",
+        )?;
+        fs::write(dep_dir.join("Dep/D.lean"), "def dVal : Nat := 1\n")?;
+        fs::write(
+            plain.join("lake-manifest.json"),
+            "{\"version\":\"1.1.0\",\"packagesDir\":\".lake/packages\",\"packages\":[{\"type\":\"path\",\"name\":\"dep\",\"dir\":\".lake/packages/dep\"}]}\n",
+        )?;
+        assert_eq!(
+            lake_refresh_targets(&plain, &["Dep.D".to_string()]),
+            vec!["+Dep.D".to_string()],
+            "a dependency module without input-bearing libs must be qualified with `+` so Lake builds it"
         );
         let _ = fs::remove_dir_all(&plain);
         let _ = fs::remove_dir_all(&proj);

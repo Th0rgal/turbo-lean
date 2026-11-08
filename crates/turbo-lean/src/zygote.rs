@@ -931,11 +931,7 @@ fn portable_pidfile_paths(
         .collect();
     let root = store_root
         .map(Path::to_path_buf)
-        .or_else(|| std::env::var_os("TURBO_LEAN_HOME").map(PathBuf::from))
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_else(|| "/tmp".into()))
-                .join(".cache/turbo-lean")
-        });
+        .unwrap_or_else(crate::shm_cache::cache_root);
     // A legacy root entry may describe a different namespace. Explicitly scoped
     // signalling excludes it, but liveness must conservatively veto deletion
     // even when only that legacy PID file remains.

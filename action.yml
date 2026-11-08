@@ -124,7 +124,16 @@ runs:
         BIN_DIR="$HOME/.cache/turbo-lean-action-bin/bin"
         mkdir -p "$BIN_DIR"
         ACTION_SRC_HASH=$(sha256sum "$GITHUB_ACTION_PATH/Cargo.lock" "$GITHUB_ACTION_PATH/crates/turbo-lean/build.rs" "$GITHUB_ACTION_PATH/crates/turbo-lean/src/"*.rs "$GITHUB_ACTION_PATH/crates/turbo-lean/src/"*.json "$GITHUB_ACTION_PATH/lean/lean-toolchain" "$GITHUB_ACTION_PATH/lean/TurboLean/"*.lean "$GITHUB_ACTION_PATH/lean/LeanNative/Proofs/"*.lean 2>/dev/null | sha256sum | awk '{print $1}')
-        if [ -x "$GITHUB_ACTION_PATH/target/release/turbo-lean" ]; then
+        ACTION_HEAD_SHA=$(git -C "$GITHUB_ACTION_PATH" rev-parse HEAD 2>/dev/null || true)
+        PREBUILT_BIN=$(command -v turbo-lean 2>/dev/null || true)
+        PREBUILT_COMMIT=""
+        if [ -n "$PREBUILT_BIN" ] && [ -x "$PREBUILT_BIN" ]; then
+          PREBUILT_COMMIT=$(cat "$(dirname "$PREBUILT_BIN")/../.commit" 2>/dev/null || true)
+        fi
+        if [ -n "$ACTION_HEAD_SHA" ] && [ "$PREBUILT_COMMIT" = "$ACTION_HEAD_SHA" ] && [ -z "$(git -C "$GITHUB_ACTION_PATH" status --porcelain 2>/dev/null || true)" ]; then
+          cp "$PREBUILT_BIN" "$BIN_DIR/turbo-lean"
+          echo "$ACTION_SRC_HASH" > "$BIN_DIR/.src_hash"
+        elif [ -x "$GITHUB_ACTION_PATH/target/release/turbo-lean" ]; then
           cp "$GITHUB_ACTION_PATH/target/release/turbo-lean" "$BIN_DIR/turbo-lean"
           echo "$ACTION_SRC_HASH" > "$BIN_DIR/.src_hash"
         elif [ ! -x "$BIN_DIR/turbo-lean" ] || [ "$(cat "$BIN_DIR/.src_hash" 2>/dev/null || true)" != "$ACTION_SRC_HASH" ]; then
