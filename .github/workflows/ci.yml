@@ -80,15 +80,33 @@ jobs:
           key: ${{ runner.os }}-ci-cargo-lean-${{ needs.impact.outputs.impact_digest }}
           restore-keys: |
             ${{ runner.os }}-ci-cargo-lean-
+            ${{ runner.os }}-roadmap-cargo-lean-
 
       - name: Setup Lean 4 toolchain
         run: |
+          set -euo pipefail
           TOOLCHAIN="$(tr -d '[:space:]' < lean/lean-toolchain)"
-          if [ ! -x "$HOME/.elan/bin/elan" ]; then
-            curl --retry 5 --retry-all-errors -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain "$TOOLCHAIN"
-          else
-            "$HOME/.elan/bin/elan" toolchain install "$TOOLCHAIN"
+          BACKOFFS=(2 4 8 16 20)
+          READY=0
+          for ATTEMPT in 1 2 3 4 5 6; do
+            if { [ -x "$HOME/.elan/bin/elan" ] || { curl --retry 5 --retry-all-errors -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none; }; } \
+              && [ -x "$HOME/.elan/bin/elan" ] \
+              && { "$HOME/.elan/bin/elan" toolchain list | grep -Fq "$TOOLCHAIN" || "$HOME/.elan/bin/elan" toolchain install "$TOOLCHAIN"; }; then
+              READY=1
+              break
+            fi
+            rm -rf "$HOME/.elan/tmp"
+            if [ "$ATTEMPT" -lt 6 ]; then
+              DELAY="${BACKOFFS[$((ATTEMPT - 1))]}"
+              echo "elan setup attempt ${ATTEMPT}/6 failed; retrying in ${DELAY}s..." >&2
+              sleep "$DELAY"
+            fi
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "elan setup failed after 6 attempts for $TOOLCHAIN" >&2
+            exit 1
           fi
+          "$HOME/.elan/bin/elan" default "$TOOLCHAIN"
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
           echo "${GITHUB_WORKSPACE}/lean/.lake/build/bin" >> "$GITHUB_PATH"
           (cd lean && "$HOME/.elan/bin/lean" --version)
@@ -221,12 +239,29 @@ jobs:
 
       - name: Setup Lean 4 toolchain
         run: |
+          set -euo pipefail
           TOOLCHAIN="$(tr -d '[:space:]' < lean/lean-toolchain)"
-          if [ ! -x "$HOME/.elan/bin/elan" ]; then
-            curl --retry 5 --retry-all-errors -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain "$TOOLCHAIN"
-          else
-            "$HOME/.elan/bin/elan" toolchain install "$TOOLCHAIN"
+          BACKOFFS=(2 4 8 16 20)
+          READY=0
+          for ATTEMPT in 1 2 3 4 5 6; do
+            if { [ -x "$HOME/.elan/bin/elan" ] || { curl --retry 5 --retry-all-errors -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none; }; } \
+              && [ -x "$HOME/.elan/bin/elan" ] \
+              && { "$HOME/.elan/bin/elan" toolchain list | grep -Fq "$TOOLCHAIN" || "$HOME/.elan/bin/elan" toolchain install "$TOOLCHAIN"; }; then
+              READY=1
+              break
+            fi
+            rm -rf "$HOME/.elan/tmp"
+            if [ "$ATTEMPT" -lt 6 ]; then
+              DELAY="${BACKOFFS[$((ATTEMPT - 1))]}"
+              echo "elan setup attempt ${ATTEMPT}/6 failed; retrying in ${DELAY}s..." >&2
+              sleep "$DELAY"
+            fi
+          done
+          if [ "$READY" -ne 1 ]; then
+            echo "elan setup failed after 6 attempts for $TOOLCHAIN" >&2
+            exit 1
           fi
+          "$HOME/.elan/bin/elan" default "$TOOLCHAIN"
           echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
           echo "${GITHUB_WORKSPACE}/lean/.lake/build/bin" >> "$GITHUB_PATH"
           (cd lean && "$HOME/.elan/bin/lean" --version)
