@@ -268,5 +268,7 @@ LEAN
 
 if [ "$SKIP_LAKE_BUILD" != "1" ]; then
   cargo check --locked --release -j 1
+else
+  cargo metadata --locked --format-version 1 >/dev/null
 fi
 echo "[turbo-lean] ALL CI VERIFICATION GATES PASSED (0 sorryAx)"

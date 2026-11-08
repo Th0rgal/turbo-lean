@@ -106,8 +106,8 @@ jobs:
           (cd lean && lake build)
           ./lean/.lake/build/bin/lean-native-core self-test
           ./lean/.lake/build/bin/turbo-lean-native self-test
-          cargo build --release
-          cargo test --release
+          cargo build --release --locked
+          cargo test --release --locked
           ./target/release/turbo-lean --version
           SKIP_LAKE_BUILD=1 SKIP_TRUSTED_CI_VERIFY=1 ./scripts/ci_verify.sh
 
