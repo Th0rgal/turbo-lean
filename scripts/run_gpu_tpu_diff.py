@@ -77,9 +77,21 @@ STABLEHLO_WHEELS: dict[str, tuple[str, str]] = {
 }
 
 NUMPY_WHEELS: dict[str, tuple[str, str]] = {
+    "cp310": (
+        "https://files.pythonhosted.org/packages/c2/07/"
+        "2e5cc71193e3ef3a219ffcf6ca4858e46ea2be09c026ddd480d596b32867/"
+        "numpy-2.2.4-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "adf8c1d66f432ce577d0197dceaac2ac00c0759f573f28516246351c58a85020",
+    ),
+    "cp311": (
+        "https://files.pythonhosted.org/packages/c5/5c/"
+        "ceefca458559f0ccc7a982319f37ed07b0d7b526964ae6cc61f8ad1b6119/"
+        "numpy-2.2.4-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+        "f4162988a360a29af158aeb4a2f4f09ffed6a969c9776f8f3bdee9b06a8ab7e5",
+    ),
     "cp312": (
-        "https://files.pythonhosted.org/packages/39/04/"
-        "78f2e3a1f76340a9f6972ffe6fd27af69cb3adf6f2aa8d6b7d1b6423d5fb/"
+        "https://files.pythonhosted.org/packages/02/e2/"
+        "e2cbb8d634151aab9528ef7b8bab52ee4ab10e076509285602c2a3a686e0/"
         "numpy-2.2.4-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
         "4f92084defa704deadd4e0a5ab1dc52d8ac9e8a8ef617f3fbb853e79b0ea3592",
     ),
@@ -155,16 +167,13 @@ def download_verified(url: str, dest: Path, expected_sha256: str | None = None) 
     tmp.replace(dest)
 
 
-def fetch_pypi_wheel_url_sha(pkg: str, version: str, py_tag: str) -> tuple[str, str]:
-    meta_url = f"https://pypi.org/pypi/{pkg}/{version}/json"
-    req = urllib.request.Request(meta_url, headers={"User-Agent": "turbo-lean-ci/1.0"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = json.load(resp)
-    for item in data.get("urls", []):
-        fn = item.get("filename", "")
-        if fn.endswith(".whl") and py_tag in fn and "manylinux" in fn and "x86_64" in fn:
-            return item["url"], item["digests"]["sha256"]
-    raise RuntimeError(f"No matching manylinux x86_64 wheel for {pkg}=={version} ({py_tag})")
+def safe_extract_zip(zf: zipfile.ZipFile, dest_dir: Path) -> None:
+    root = dest_dir.resolve()
+    for info in zf.infolist():
+        target = (dest_dir / info.filename).resolve()
+        if target != root and root not in target.parents:
+            raise RuntimeError(f"Refusing zip path traversal entry: {info.filename}")
+    zf.extractall(dest_dir)
 
 
 def ensure_gpu_tpu_tools(cache_dir: Path) -> tuple[str, Path | None]:
@@ -201,14 +210,13 @@ def ensure_gpu_tpu_tools(cache_dir: Path) -> tuple[str, Path | None]:
     try:
         import numpy as _np  # noqa: F401
     except ImportError:
-        if py_tag in NUMPY_WHEELS:
-            np_url, np_sha = NUMPY_WHEELS[py_tag]
-        else:
-            np_url, np_sha = fetch_pypi_wheel_url_sha("numpy", "2.2.4", py_tag)
+        if py_tag not in NUMPY_WHEELS:
+            raise RuntimeError(f"Unsupported Python ABI tag {py_tag} for pinned numpy wheel")
+        np_url, np_sha = NUMPY_WHEELS[py_tag]
         np_whl = cache_dir / f"numpy-2.2.4-{py_tag}.whl"
         download_verified(np_url, np_whl, np_sha)
         with zipfile.ZipFile(np_whl) as zf:
-            zf.extractall(site_dir)
+            safe_extract_zip(zf, site_dir)
 
     if py_tag not in STABLEHLO_WHEELS:
         raise RuntimeError(f"Unsupported Python ABI tag {py_tag} for prebuilt OpenXLA stablehlo wheel")
@@ -218,7 +226,7 @@ def ensure_gpu_tpu_tools(cache_dir: Path) -> tuple[str, Path | None]:
     shlo_whl = cache_dir / f"stablehlo-1.12.1-{py_tag}.whl"
     download_verified(shlo_url, shlo_whl, shlo_sha)
     with zipfile.ZipFile(shlo_whl) as zf:
-        zf.extractall(site_dir)
+        safe_extract_zip(zf, site_dir)
 
     if str(site_dir) not in sys.path:
         sys.path.insert(0, str(site_dir))
