@@ -117,6 +117,9 @@ enum Commands {
         /// Seed TheoremProofCAS with all verified theorem shards after build completes
         #[arg(long, default_value_t = false)]
         seed_shards: bool,
+        /// Exclude project-relative file/directory globs (e.g. `experiments/**`; repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
     },
     /// Hydrate `.turbo_verified_sources.json` content-addressed manifests from existing `.olean` + Lake `.trace` artifacts (mtime-immune after git checkout/rebase)
     HydrateTraces {
@@ -161,6 +164,9 @@ enum Commands {
         /// Run in untrusted mode (alias for `--mode untrusted`)
         #[arg(long, default_value_t = false)]
         untrusted: bool,
+        /// Exclude project-relative file/directory globs (e.g. `experiments/**`; repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
     },
     /// Read-only public-signature & dependent blast-radius analyzer (`turbo-lean impact <file>`)
     Impact {
@@ -321,6 +327,9 @@ enum Commands {
         /// Kernel verification engine (`auto`, `standard`, `con-leche`, or `both`)
         #[arg(long)]
         kernel: Option<String>,
+        /// Exclude project-relative file/directory globs (e.g. `experiments/**`; repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
     },
     /// Seed TheoremProofCAS with theorem shards from verified/hygienic project modules in a single SQLite transaction
     SeedShards {
@@ -333,6 +342,9 @@ enum Commands {
         /// Require a pre-compiled .olean in .lake/build/lib/lean for each seeded module
         #[arg(long, default_value_t = false)]
         require_olean: bool,
+        /// Exclude project-relative file/directory globs (e.g. `experiments/**`; repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
     },
     /// Adopt up-to-date on-disk .olean artifacts into per-module CAS after batched kernel audit/replay
     SeedOleans {
@@ -345,6 +357,9 @@ enum Commands {
         /// Maximum parallel module workers (0 = auto)
         #[arg(short = 'j', long, default_value_t = 0)]
         jobs: usize,
+        /// Exclude project-relative file/directory globs (e.g. `experiments/**`; repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
     },
     /// Verify a cryptographic CI verification receipt and detect any altered theorem statements in < 1 ms
     VerifyReceipt {
@@ -404,6 +419,9 @@ enum Commands {
         /// Kernel verification engine (`auto`, `standard`, `con-leche`, or `both`)
         #[arg(long)]
         kernel: Option<String>,
+        /// Exclude project-relative file/directory globs (e.g. `experiments/**`; repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
     },
     /// Unified sub-millisecond to few-millisecond agent verification funnel:
     /// Stage 0 (hygiene & cone cache) -> Stage 1 (spec vacuity & certified fast-check with hypothesis suggestion) -> Stage 2 (Zygote kernel verification)
@@ -774,6 +792,42 @@ fn run(cli: Cli) -> Result<()> {
         ),
         _ => (None, None),
     };
+    let cli_excludes: &[String] = match &cli.command {
+        Commands::Build { exclude, .. }
+        | Commands::Check { exclude, .. }
+        | Commands::CiVerify { exclude, .. }
+        | Commands::SeedShards { exclude, .. }
+        | Commands::SeedOleans { exclude, .. }
+        | Commands::PrVerify { exclude, .. } => exclude.as_slice(),
+        _ => &[],
+    };
+    let normalized_cli_excludes: Vec<String> = cli_excludes
+        .iter()
+        .flat_map(|s| s.split(','))
+        .map(|s| s.trim().replace('\\', "/").trim_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if normalized_cli_excludes.is_empty() {
+        std::env::remove_var(splitter::CLI_EXCLUDE_ENV);
+    } else {
+        std::env::set_var(splitter::CLI_EXCLUDE_ENV, normalized_cli_excludes.join(","));
+    }
+    let exclude_root_dir: Option<PathBuf> = match &cli.command {
+        Commands::CiVerify {
+            project_dir,
+            base: None,
+            ..
+        } => Some(project_dir.clone()),
+        _ => dir.clone(),
+    };
+    if let Some(ref er) = exclude_root_dir {
+        let canon_er = er.canonicalize().unwrap_or_else(|_| er.clone());
+        std::env::set_var(splitter::EXCLUDE_ROOT_ENV, canon_er);
+    } else {
+        std::env::remove_var(splitter::EXCLUDE_ROOT_ENV);
+    }
+    let exclude_from_config =
+        std::env::var(splitter::EXCLUDE_FROM_CONFIG_ENV).as_deref() == Ok("1");
     let kernel_from_config =
         std::env::var(kernel::KERNEL_ENGINE_FROM_CONFIG_ENV).as_deref() == Ok("1");
     if matches!(&cli.command, Commands::CiVerify { base: None, .. }) {
@@ -782,6 +836,8 @@ fn run(cli: Cli) -> Result<()> {
         for key in [
             splitter::ALLOWED_AXIOMS_ENV,
             splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV,
+            splitter::EXCLUDE_ENV,
+            splitter::EXCLUDE_FROM_CONFIG_ENV,
             "TURBO_LEAN_ALLOWED_CSIMP",
             "TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG",
             "TURBO_LEAN_ALLOWED_UNSAFE",
@@ -816,6 +872,10 @@ fn run(cli: Cli) -> Result<()> {
     if impl_by_from_config && dir.is_none() {
         std::env::remove_var("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY");
         std::env::remove_var("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY_FROM_CONFIG");
+    }
+    if exclude_from_config && dir.is_none() {
+        std::env::remove_var(splitter::EXCLUDE_ENV);
+        std::env::remove_var(splitter::EXCLUDE_FROM_CONFIG_ENV);
     }
     if kernel_from_config && dir.is_none() {
         std::env::remove_var(kernel::KERNEL_ENGINE_ENV);
@@ -880,6 +940,14 @@ fn run(cli: Cli) -> Result<()> {
                 allow.unwrap_or_default().join(","),
             );
             std::env::set_var(splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV, "1");
+        }
+        if rev.is_some() || std::env::var_os(splitter::EXCLUDE_ENV).is_none() || exclude_from_config
+        {
+            let cfg_excludes =
+                accelerators::toml_string_array(&config, "project", "exclude").unwrap_or_default();
+            let merged = splitter::configured_exclude_patterns(&cfg_excludes);
+            std::env::set_var(splitter::EXCLUDE_ENV, merged.join(","));
+            std::env::set_var(splitter::EXCLUDE_FROM_CONFIG_ENV, "1");
         }
         let timeout_secs = match &cli.command {
             Commands::Check { timeout, .. } if *timeout > 0 => Some(*timeout),
@@ -1471,6 +1539,7 @@ fn run(cli: Cli) -> Result<()> {
             trust_domain,
             pin_level,
             seed_shards,
+            ..
         } => lake_build::run_build_command(
             &mut store,
             cli.json,
@@ -1498,6 +1567,7 @@ fn run(cli: Cli) -> Result<()> {
             allow_sorry,
             mode,
             untrusted,
+            ..
         } => {
             let env_trust_untrusted = std::env::var("TURBO_LEAN_TRUST_DOMAIN")
                 .ok()
@@ -1796,6 +1866,7 @@ fn run(cli: Cli) -> Result<()> {
             project_dir,
             trust_domain,
             require_olean,
+            ..
         } => pr_verify::run_seed_shards_command(
             &mut store,
             cli.json,
@@ -1808,6 +1879,7 @@ fn run(cli: Cli) -> Result<()> {
             project_dir,
             targets,
             jobs,
+            ..
         } => module_builder::run_seed_oleans_command(
             &mut store,
             cli.json,

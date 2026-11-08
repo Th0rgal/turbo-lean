@@ -1455,6 +1455,10 @@ fn invoke_agent_step_json(
                 crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV,
             ),
             (
+                crate::splitter::EXCLUDE_ENV,
+                crate::splitter::EXCLUDE_FROM_CONFIG_ENV,
+            ),
+            (
                 "TURBO_LEAN_ALLOWED_CSIMP",
                 "TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG",
             ),
@@ -1727,7 +1731,7 @@ pub fn mcp_tools_list_value() -> serde_json::Value {
             mcp_tool_schema("turbo_check_decl", "Check a single declaration or file in isolation with PrefixEnv sharding and compact diagnostics.", json!({"file":{"type":"string"},"decl":{"type":"string"},"project_dir":{"type":"string"},"compact":{"type":"boolean","default":true}}), &["file"]),
             mcp_tool_schema("turbo_fast_check", "Unified multi-backend (`auto` | `cpu` | `gpu` | `tpu`) single-theorem or batch counterexample search with local witness re-certification (0 false positives).", json!({"file":{"type":"string"},"decl":{"type":"string"},"stmt_src":{"type":"string"},"items":{"type":"array"},"backend":{"type":"string","default":"auto"},"compact":{"type":"boolean","default":true}}), &[]),
             mcp_tool_schema("turbo_audit_spec", "Run Tier 1 (vacuity, tautology, constant shadowing) & Tier 2 (unused private decls, horizontal packing) specification audit on a Lean file or declaration in < 1 ms.", json!({"file":{"type":"string"},"decl":{"type":"string"},"require_nonempty":{"type":"boolean","default":false}}), &["file"]),
-            mcp_tool_schema("turbo_pr_verify", "Git-aware incremental PR verifier: diffs against `--base` and verifies modified theorem proofs in isolation.", json!({"project_dir":{"type":"string","default":"."},"base":{"type":"string","default":"HEAD"},"mode":{"type":"string","default":"trusted"},"disallow_statement_changes":{"type":"boolean","default":false}}), &[]),
+            mcp_tool_schema("turbo_pr_verify", "Git-aware incremental PR verifier: diffs against `--base` and verifies modified theorem proofs in isolation.", json!({"project_dir":{"type":"string","default":"."},"base":{"type":"string","default":"HEAD"},"mode":{"type":"string","default":"trusted"},"disallow_statement_changes":{"type":"boolean","default":false},"exclude":{"type":"array","items":{"type":"string"}}}), &[]),
             mcp_tool_schema("turbo_cluster_status", "Return live multi-backend & federated cluster health, Law 15 optimal route selection, and the Lean C-ABI vs Rust speed audit.", json!({"bench_cabi":{"type":"boolean","default":true}}), &[]),
         ]
     })
@@ -1910,10 +1914,16 @@ pub fn handle_mcp_jsonrpc_request(
                         if mode == "untrusted" {
                             cmd.env("TURBO_LEAN_TRUST_PROJECT_TELEMETRY", "0");
                         }
+                        cmd.env_remove(crate::splitter::CLI_EXCLUDE_ENV);
+                        cmd.env_remove(crate::splitter::EXCLUDE_ROOT_ENV);
                         for (val_k, cfg_k) in [
                             (
                                 crate::splitter::ALLOWED_AXIOMS_ENV,
                                 crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV,
+                            ),
+                            (
+                                crate::splitter::EXCLUDE_ENV,
+                                crate::splitter::EXCLUDE_FROM_CONFIG_ENV,
                             ),
                             (
                                 "TURBO_LEAN_ALLOWED_CSIMP",
@@ -1941,6 +1951,14 @@ pub fn handle_mcp_jsonrpc_request(
                         }
                         if disallow_stmt {
                             cmd.arg("--disallow-statement-changes");
+                        }
+                        if let Some(arr) = args.get("exclude").and_then(|v| v.as_array()) {
+                            for item in arr.iter().filter_map(|v| v.as_str()) {
+                                let t = item.trim();
+                                if !t.is_empty() {
+                                    cmd.arg("--exclude").arg(t);
+                                }
+                            }
                         }
                         match cmd.output() {
                             Ok(o) => {
