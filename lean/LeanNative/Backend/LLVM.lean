@@ -1381,7 +1381,7 @@ def emitParForLoop (outVar lenVar : VarId) (inputs : List VarId) (elemTy : LNIRT
     emitLine s!"  {nextAcc} = add i64 {accVal}, {resVal}"
   else do
     emitTypedArrayStore "p_out" outData ivVal resVal elemTy
-  let addOp := if opt then "add nuw nsw i64" else "add i64"
+  let addOp := if opt then "add nuw i64" else "add i64"
   let loopMd := if opt then ", !llvm.loop !0" else ", !llvm.loop !3"
   emitLine s!"  br label %{latchLbl}\n{latchLbl}:\n  {nextIv} = {addOp} {ivVal}, 1\n  br label %{condLbl}{loopMd}\n{exitLbl}:"
   if isDot then
@@ -1540,7 +1540,7 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
           la != accVar && la != idxVar && lb != accVar && lb != idxVar
         | .exclusiveObj o => o != accVar && o != idxVar }
     emitLine s!"{latchLbl}:"
-    let addOp := if opt then "add nuw nsw i64" else "add i64"
+    let addOp := if opt then "add nuw i64" else "add i64"
     emitLine s!"  {idxNext} = {addOp} {curIdx}, 1"
     let isVecLoop := loopBodyHasArrayMem stepBody
     let loopMd :=
@@ -1635,8 +1635,9 @@ def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_
     let pTy := if rawPTy == "void" then "ptr" else rawPTy
     let zAttr := sigLLVMAttr target p.ty
     let attrs :=
-      if optimized && pTy == "ptr" then " noalias noundef"
-      else if optimized && (pTy == "i8" || pTy == "i16" || pTy == "i32" || pTy == "i64" || pTy == "i256" || pTy == "double") then
+      if pTy == "ptr" then
+        if optimized then " noalias noundef" else " noundef"
+      else if pTy == "i8" || pTy == "i16" || pTy == "i32" || pTy == "i64" || pTy == "i256" || pTy == "double" then
         " " ++ zAttr ++ "noundef"
       else if zAttr != "" then " zeroext"
       else ""

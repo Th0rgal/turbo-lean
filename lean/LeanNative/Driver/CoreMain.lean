@@ -8,6 +8,7 @@ def main (args : List String) : IO UInt32 := do
     if let some rc ← dispatchSharedCommand "lean-native-core" none args then
       return rc
     match args with
+    | "llvm-diff-suite" :: rest => LeanNative.Driver.LLVMDiffCLI.run rest
     | "self-test" :: _ => runCoreSelfTest "lean-native-core"
     | "--version" :: _ | "-v" :: _ =>
       IO.println s!"lean-native-core v{LeanNative.Core.coreVersion}"

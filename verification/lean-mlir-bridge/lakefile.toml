@@ -1,0 +1,26 @@
+name = "lean-mlir-bridge"
+version = "0.1.0"
+defaultTargets = ["LeanMLIRBridge"]
+
+[[require]]
+name = "LeanMLIR"
+git = "https://github.com/opencompl/lean-mlir.git"
+rev = "b8c4a771319a044854a4bbb49b8821381ef86ff8"
+subDir = "LeanMLIR"
+
+# Override mathlib4-nightly-testing's force-pushed `leanprover/lean4-cli` nightly-testing ref
+# (`d9fc8ae2...` was GC'd after force-push; `v4.27.0-rc1` `726b98c5...` builds cleanly under
+# `leanprover/lean4:nightly-2025-12-01`).
+[[require]]
+name = "Cli"
+git = "https://github.com/leanprover/lean4-cli.git"
+rev = "726b98c53e2da249c1de768fbbbb5e67bc9cef60"
+
+[[lean_lib]]
+name = "SSA"
+
+[[lean_lib]]
+name = "LeanNative"
+
+[[lean_lib]]
+name = "LeanMLIRBridge"
