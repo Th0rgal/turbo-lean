@@ -16,6 +16,7 @@ protocol contracts in under 1 second using Python 3 standard library only:
 """
 import argparse
 import json
+import re
 import shlex
 import subprocess
 import sys
@@ -36,6 +37,30 @@ BOUNDARY_U64 = (
     (1 << 31) - 1, 1 << 31, (1 << 32) - 1, 1 << 32,
     (1 << 63) - 1, 1 << 63, MASK64 - 1, MASK64,
 )
+
+BOUNDARY_U256 = (
+    0,
+    1,
+    0xFFFFFFFFFFFFFFFF,
+    (1 << 128) - 1,
+    1 << 255,
+    MASK256,
+)
+
+BOUNDARY_U256_PAIRS = (
+    (0, 0),
+    (1, 0),
+    (MASK256, 1),
+    (0, 1),
+    (1 << 255, 2),
+    (0xFFFFFFFFFFFFFFFF, (1 << 128) - 1),
+    (1, 1),
+    (MASK256, MASK256),
+)
+
+
+class EvalUBError(Exception):
+    """Runtime undefined behavior matching `LeanNative.Semantics.UBError` (not a structural AST/type bug)."""
 
 TARGET_COST_PROFILES: dict[str, dict[str, int]] = {
     "x86_64": {
@@ -371,14 +396,14 @@ def eval_bin_op(op: str, v1: Val, v2: Val) -> Val:
             return v1
         if t1 == "u256" and t2 == "u256":
             if int(b) == 0:
-                raise ValueError("divisionByZero")
+                raise EvalUBError("divisionByZero")
             return ("u256", (int(a) // int(b)) & MASK256)
     elif op == "B_mod":
         if t1 == "u64" and t2 == "u64":
             return ("u64", 0 if int(b) == 0 else (int(a) % int(b)) & MASK64)
         if t1 == "u256" and t2 == "u256":
             if int(b) == 0:
-                raise ValueError("divisionByZero")
+                raise EvalUBError("divisionByZero")
             return ("u256", (int(a) % int(b)) & MASK256)
     elif op == "B_bitAnd":
         if t1 == "u64" and t2 == "u64":
@@ -457,19 +482,19 @@ def eval_bin_op(op: str, v1: Val, v2: Val) -> Val:
         wa, wb = to_u256(v1), to_u256(v2)
         if wa is not None and wb is not None:
             if wa + wb > MASK256:
-                raise ValueError("addChecked256 overflow")
+                raise EvalUBError("addChecked256 overflow")
             return ("u256", wa + wb)
     elif op == "B_subChecked256":
         wa, wb = to_u256(v1), to_u256(v2)
         if wa is not None and wb is not None:
             if wa < wb:
-                raise ValueError("subChecked256 underflow")
+                raise EvalUBError("subChecked256 underflow")
             return ("u256", wa - wb)
     elif op == "B_mulChecked256":
         wa, wb = to_u256(v1), to_u256(v2)
         if wa is not None and wb is not None:
             if wa * wb > MASK256:
-                raise ValueError("mulChecked256 overflow")
+                raise EvalUBError("mulChecked256 overflow")
             return ("u256", wa * wb)
     elif op in ("B_clmul64", "B_clmul64Hi", "B_gf2Affine", "B_eor3"):
         if t1 == "u64" and t2 == "u64":
@@ -539,7 +564,7 @@ def eval_scalar_ast(node: ScalarAst, env: dict[int, Val]) -> Val:
     raise ValueError(f"unsupported ScalarAst node: {node}")
 
 
-def param_val_for_type(pty: tuple[str, ...], raw_word: int) -> Val:
+def param_val_for_type(pty: tuple[str, ...], raw_word: int, state_idx: int = 0, p_idx: int = 0) -> Val:
     tag = pty[0]
     if tag == "T_i1":
         return ("bool", (raw_word & 1) != 0)
@@ -550,6 +575,12 @@ def param_val_for_type(pty: tuple[str, ...], raw_word: int) -> Val:
     if tag == "T_i32":
         return ("u64", raw_word & 0xFFFFFFFF)
     if tag in ("T_u256", "T_i256"):
+        if state_idx < len(BOUNDARY_U256_PAIRS):
+            pair = BOUNDARY_U256_PAIRS[state_idx]
+            return ("u256", pair[p_idx & 1])
+        b_idx = state_idx - len(BOUNDARY_U256_PAIRS)
+        if b_idx < len(BOUNDARY_U256) * 2:
+            return ("u256", BOUNDARY_U256[(b_idx + p_idx * 3) % len(BOUNDARY_U256)])
         w0 = raw_word & MASK64
         w1 = splitmix64(w0 ^ 1)
         w2 = splitmix64(w0 ^ 2)
@@ -560,8 +591,11 @@ def param_val_for_type(pty: tuple[str, ...], raw_word: int) -> Val:
     return ("u64", raw_word & MASK64)
 
 
-def eval_decl_val(decl: ParsedDecl, args: list[int]) -> Val:
-    env = {pid: param_val_for_type(pty, val) for (pid, _n, _b, pty), val in zip(decl.params, args)}
+def eval_decl_val(decl: ParsedDecl, args: list[int], state_idx: int = 0) -> Val:
+    env = {
+        pid: param_val_for_type(pty, val, state_idx, p_idx)
+        for p_idx, ((pid, _n, _b, pty), val) in enumerate(zip(decl.params, args))
+    }
     for dst, _ty, expr in decl.lets:
         env[dst] = eval_scalar_ast(expr, env)
     if decl.ret_var not in env:
@@ -630,6 +664,7 @@ def verify_opt_plugin_gate_64(src: ParsedDecl, cand: ParsedDecl, target: str) ->
     if src_sig != cand_sig or src.ret_ty != cand.ret_ty:
         raise ValueError(f"Signature mismatch: {(src_sig, src.ret_ty)} != {(cand_sig, cand.ret_ty)}")
     arity = len(src.params)
+    non_vacuous_count = 0
     for state_idx in range(64):
         vec: list[int] = []
         for p_idx in range(arity):
@@ -637,10 +672,21 @@ def verify_opt_plugin_gate_64(src: ParsedDecl, cand: ParsedDecl, target: str) ->
                 vec.append(BOUNDARY_U64[(state_idx + p_idx * 5) % len(BOUNDARY_U64)])
             else:
                 vec.append(splitmix64(state_idx * 131 + p_idx * 17 + 1))
-        v_src = eval_decl_val(src, vec)
-        v_cand = eval_decl_val(cand, vec)
+        try:
+            v_src = eval_decl_val(src, vec, state_idx)
+        except EvalUBError:
+            continue
+        non_vacuous_count += 1
+        try:
+            v_cand = eval_decl_val(cand, vec, state_idx)
+        except EvalUBError as exc:
+            raise ValueError(
+                f"64-state UB refinement violation on state {state_idx} ({vec}): src={v_src!r}, cand raised UB {exc}"
+            ) from exc
         if v_src != v_cand:
             raise ValueError(f"64-state equivalence mismatch on {vec}: src={v_src!r} != cand={v_cand!r}")
+    if non_vacuous_count == 0:
+        raise ValueError("64-state refinement vacuous: source raised EvalUBError on all 64 samples")
     c_before = decl_scalar_cost(src, target)
     c_after = decl_scalar_cost(cand, target)
     if c_after > c_before:
@@ -654,15 +700,21 @@ def run_single_stdio_request(cmd: list[str], line: str, timeout_ms: int) -> tupl
         cmd,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         text=True,
     )
     try:
-        out, _ = proc.communicate(payload, timeout=max(timeout_ms, 1) / 1000.0)
+        out, err = proc.communicate(payload, timeout=max(timeout_ms, 1) / 1000.0)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
         return None, True
+    if proc.returncode != 0:
+        err_snip = (err or "").strip()
+        raise RuntimeError(
+            f"Plugin {cmd!r} exited with non-zero code {proc.returncode}"
+            + (f": {err_snip}" if err_snip else "")
+        )
     first_line = out.splitlines()[0] if out.splitlines() else ""
     return first_line, False
 
@@ -684,6 +736,7 @@ class AcceleratorSdkTestSuite(unittest.TestCase):
         lines = (FIXTURES_DIR / "tactic_requests.jsonl").read_text(encoding="utf-8").splitlines()
         seen_kinds: set[str] = set()
         saw_abstain = False
+        subgoal_cases: dict[str, list[str]] = {}
         for line in lines:
             if not line.strip():
                 continue
@@ -695,14 +748,28 @@ class AcceleratorSdkTestSuite(unittest.TestCase):
                 saw_abstain = True
             else:
                 seen_kinds.add(cert["kind"])
-                if is_default and cert["kind"] == "subgoal_cuts":
-                    expected_prefix = f"theorem {req['decl_name']}"
+                if cert["kind"] == "subgoal_cuts":
+                    subgoal_cases[req["decl_name"]] = cert["cuts"]
                     for shard in cert["cuts"]:
-                        self.assertTrue(shard.startswith(expected_prefix), shard)
                         self.assertIn(":=", shard)
+                        header_part = shard.split(":=", 1)[0]
+                        decl_kw_hits = re.findall(r"\b(?:theorem|lemma)\b", header_part)
+                        self.assertEqual(len(decl_kw_hits), 1, f"Invalid or duplicate theorem/lemma header in shard: {shard!r}")
         if is_default:
             self.assertEqual(seen_kinds, {"rewritten_proof", "counterexample_found", "subgoal_cuts"})
             self.assertTrue(saw_abstain)
+            self.assertEqual(
+                set(subgoal_cases),
+                {"sdk_cut_fission_full", "sdk_cut_fission_attr", "sdk_cut_fission_binders"},
+            )
+            for shard in subgoal_cases["sdk_cut_fission_full"]:
+                self.assertTrue(shard.startswith("theorem sdk_cut_fission_full (n : Nat)"), shard)
+            for shard in subgoal_cases["sdk_cut_fission_attr"]:
+                self.assertTrue(shard.startswith("@[simp] private lemma sdk_cut_fission_attr (n : Nat)"), shard)
+            self.assertIn("(m : Nat) : m + 0 = m := by rfl", subgoal_cases["sdk_cut_fission_attr"][0])
+            self.assertIn("(h1 : ∀ (m : Nat), m + 0 = m)", subgoal_cases["sdk_cut_fission_attr"][1])
+            for shard in subgoal_cases["sdk_cut_fission_binders"]:
+                self.assertTrue(shard.startswith("theorem sdk_cut_fission_binders (n : Nat)"), shard)
 
     def test_03_lnir_wire_opt_fixtures_and_adversarial_gate(self) -> None:
         lines = (FIXTURES_DIR / "lnir_opt_requests.jsonl").read_text(encoding="utf-8").splitlines()
@@ -752,7 +819,70 @@ class AcceleratorSdkTestSuite(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse_single_decl_wire(sample_req["wire"] + "|F_facts|1|F_excl|0|EXTRA_TOKEN")
 
+        ub_erasing_src_wire = (
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|75625f726566696e65|A_L2|0|"
+            "2|0|61|0|T_u256|1|62|0|T_u256|T_u256|"
+            "C_let|2|T_u256|E_scalar|S_bin|B_addChecked256|S_var|0|S_var|1|"
+            "C_ret|2"
+        )
+        ub_erasing_cand_wire = (
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|75625f726566696e65|A_L2|0|"
+            "2|0|61|0|T_u256|1|62|0|T_u256|T_u256|"
+            "C_let|2|T_u256|E_scalar|S_bin|B_add|S_var|0|S_var|1|"
+            "C_ret|2"
+        )
+        ub_src_decl = parse_single_decl_wire(ub_erasing_src_wire)
+        ub_cand_decl = parse_single_decl_wire(ub_erasing_cand_wire)
+        c_ub_before, c_ub_after = verify_opt_plugin_gate_64(ub_src_decl, ub_cand_decl, "x86_64")
+        self.assertLess(c_ub_after, c_ub_before)
+
+        ub_intro_src_wire = (
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|75625f696e74726f|A_L2|0|"
+            "2|0|61|0|T_u256|1|62|0|T_u256|T_u256|"
+            "C_let|2|T_u256|E_scalar|S_bin|B_mul|S_var|0|S_var|1|"
+            "C_let|3|T_u256|E_scalar|S_bin|B_add|S_var|0|S_var|1|"
+            "C_ret|3"
+        )
+        ub_intro_cand_wire = (
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|75625f696e74726f|A_L2|0|"
+            "2|0|61|0|T_u256|1|62|0|T_u256|T_u256|"
+            "C_let|3|T_u256|E_scalar|S_bin|B_addChecked256|S_var|0|S_var|1|"
+            "C_ret|3"
+        )
+        with self.assertRaises(ValueError):
+            verify_opt_plugin_gate_64(
+                parse_single_decl_wire(ub_intro_src_wire),
+                parse_single_decl_wire(ub_intro_cand_wire),
+                "x86_64",
+            )
+
+        always_ub_wire = (
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|616c776179735f7562|A_L2|0|"
+            "1|0|61|0|T_u256|T_u256|"
+            "C_let|1|T_u256|E_scalar|S_bin|B_sub|S_var|0|S_var|0|"
+            "C_let|2|T_u256|E_scalar|S_bin|B_div|S_var|0|S_var|1|"
+            "C_ret|2"
+        )
+        always_ub_decl = parse_single_decl_wire(always_ub_wire)
+        with self.assertRaises(ValueError):
+            verify_opt_plugin_gate_64(always_ub_decl, always_ub_decl, "x86_64")
+
         if self.plugin_cmd == [sys.executable, str(DEFAULT_PLUGIN)]:
+            trap_dce_wire = (
+                "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|747261705f646365|A_L2|0|"
+                "2|0|61|0|T_u256|1|62|0|T_u256|T_u256|"
+                "C_let|2|T_u256|E_scalar|S_bin|B_addChecked256|S_var|0|S_var|1|"
+                "C_let|3|T_u256|E_scalar|S_bin|B_div|S_var|0|S_var|1|"
+                "C_ret|0"
+            )
+            t_out, t_to = run_single_stdio_request(
+                self.plugin_cmd,
+                json.dumps({"decl_name": "trap_dce", "target": "x86_64", "budget_ms": 50, "wire": trap_dce_wire}),
+                timeout_ms=1000,
+            )
+            self.assertFalse(t_to)
+            self.assertIsNone(extract_wire_response(t_out or ""))
+
             bool_wire = (
                 "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|626f6f6c5f6e6f6f70|A_L2|0|"
                 "1|0|62|0|T_i1|T_i1|C_let|1|T_i1|E_scalar|S_un|U_not|S_var|0|C_ret|1"
@@ -791,38 +921,53 @@ class AcceleratorSdkTestSuite(unittest.TestCase):
             ln for ln in (FIXTURES_DIR / "adversarial_requests.jsonl").read_text(encoding="utf-8").splitlines()
             if ln.strip()
         ]
-        is_default = self.plugin_cmd == [sys.executable, str(DEFAULT_PLUGIN)]
         for ln in adv_lines:
             out_line, timed_out = run_single_stdio_request(self.plugin_cmd, ln, timeout_ms=500)
             self.assertFalse(timed_out)
             if out_line:
                 self.assertIsNone(validate_tactic_certificate(out_line))
-        if is_default:
-            for bad_budget in (False, True):
-                b_line = json.dumps({
-                    "decl_name": "bool_budget_tactic",
-                    "stmt_src": "(a b : Nat) (h1 : a = b) : a + 0 = b",
-                    "body_src": "by simp [h1]",
-                    "imports_csv": "Init",
-                    "available_constants": ["Nat.add_zero", "h1"],
-                    "budget_ms": bad_budget,
-                })
-                out_line, timed_out = run_single_stdio_request(self.plugin_cmd, b_line, timeout_ms=500)
-                self.assertFalse(timed_out)
-                self.assertIsNone(validate_tactic_certificate(out_line or ""))
-            proc = subprocess.Popen(
-                self.plugin_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            out, _err = proc.communicate("\n".join(adv_lines) + "\n", timeout=3.0)
-            self.assertEqual(proc.returncode, 0)
-            resp_lines = [ln for ln in out.splitlines() if ln.strip()]
-            self.assertEqual(len(resp_lines), len(adv_lines))
-            for ln in resp_lines:
-                self.assertIsNone(validate_tactic_certificate(ln))
+        for bad_budget in (False, True):
+            b_line = json.dumps({
+                "decl_name": "bool_budget_tactic",
+                "stmt_src": "theorem bool_budget_tactic (a b : Nat) (h1 : a = b) : a + 0 = b",
+                "body_src": "by simp [h1]",
+                "imports_csv": "Init",
+                "available_constants": ["Nat.add_zero", "h1"],
+                "budget_ms": bad_budget,
+            })
+            out_line, timed_out = run_single_stdio_request(self.plugin_cmd, b_line, timeout_ms=500)
+            self.assertFalse(timed_out)
+            self.assertIsNone(validate_tactic_certificate(out_line or ""))
+
+        valid_probe = json.dumps({
+            "decl_name": "stream_survival_probe",
+            "stmt_src": "theorem stream_survival_probe (a b : Nat) (h1 : a = b) : a + 0 = b",
+            "body_src": "by simp [h1]",
+            "imports_csv": "Init",
+            "available_constants": ["Nat.add_zero", "h1"],
+            "budget_ms": 25,
+        })
+        batch_lines = [*adv_lines, valid_probe]
+        proc = subprocess.Popen(
+            self.plugin_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        out, err = proc.communicate("\n".join(batch_lines) + "\n", timeout=3.0)
+        self.assertEqual(proc.returncode, 0, f"Plugin crashed on adversarial JSONL stream: {err}")
+        resp_lines = [ln for ln in out.splitlines() if ln.strip()]
+        self.assertEqual(len(resp_lines), len(batch_lines))
+        for ln in resp_lines[:-1]:
+            self.assertIsNone(validate_tactic_certificate(ln))
+        probe_cert = validate_tactic_certificate(resp_lines[-1])
+        if self.plugin_cmd == [sys.executable, str(DEFAULT_PLUGIN)]:
+            self.assertIsNotNone(probe_cert)
+
+        crashing_cmd = [sys.executable, "-c", "import sys; sys.stderr.write('boom\\n'); raise SystemExit(2)"]
+        with self.assertRaises(RuntimeError):
+            run_single_stdio_request(crashing_cmd, valid_probe, timeout_ms=500)
 
     def test_05_timeout_and_kill_isolation(self) -> None:
         hang_cmd = [sys.executable, str(DEFAULT_PLUGIN), "--simulate-hang-ms", "5000"]
@@ -836,6 +981,48 @@ class AcceleratorSdkTestSuite(unittest.TestCase):
         self.assertTrue(timed_out)
         self.assertIsNone(out_line)
         self.assertLess(elapsed_ms, 1500.0)
+
+        probe = '{"decl_name":"budget_eof_probe","stmt_src":"theorem budget_eof_probe : True","body_src":"by trivial","imports_csv":"Init","available_constants":[],"budget_ms":25}'
+        t1 = time.monotonic()
+        p_out, p_timed_out = run_single_stdio_request(self.plugin_cmd, probe, timeout_ms=500)
+        p_elapsed_ms = (time.monotonic() - t1) * 1000.0
+        self.assertFalse(p_timed_out)
+        self.assertLess(p_elapsed_ms, 500.0)
+        validate_tactic_certificate(p_out or "")
+
+        eof_proc = subprocess.Popen(
+            self.plugin_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        eof_out, eof_err = eof_proc.communicate("", timeout=1.0)
+        self.assertEqual(eof_proc.returncode, 0, eof_err)
+        self.assertEqual(eof_out.strip(), "")
+
+        if self.plugin_cmd == [sys.executable, str(DEFAULT_PLUGIN)]:
+            oneshot_cmd = [*self.plugin_cmd, "--one-shot"]
+            valid_two = (
+                '{"decl_name":"os1","stmt_src":"theorem os1 (a b : Nat) (h1 : a = b) : a + 0 = b","body_src":"by simp [h1]","imports_csv":"Init","available_constants":["Nat.add_zero","h1"],"budget_ms":25}\n'
+                '{"decl_name":"os2","stmt_src":"theorem os2 (a b : Nat) (h1 : a = b) : a + 0 = b","body_src":"by simp [h1]","imports_csv":"Init","available_constants":["Nat.add_zero","h1"],"budget_ms":25}\n'
+            )
+            os_proc = subprocess.Popen(
+                oneshot_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            os_out, os_err = os_proc.communicate(valid_two, timeout=1.0)
+            self.assertEqual(os_proc.returncode, 0, os_err)
+            os_lines = [ln for ln in os_out.splitlines() if ln.strip()]
+            self.assertEqual(len(os_lines), 1)
+            self.assertIsNotNone(validate_tactic_certificate(os_lines[0]))
+
+            os_adv_out, os_adv_to = run_single_stdio_request(oneshot_cmd, "{not-valid-json", timeout_ms=500)
+            self.assertFalse(os_adv_to)
+            self.assertIsNone(validate_tactic_certificate(os_adv_out or ""))
 
 
 def resolve_plugin_cmd(raw: str | None) -> list[str]:

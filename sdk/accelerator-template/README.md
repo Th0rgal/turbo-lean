@@ -45,10 +45,10 @@ trigger_tactics = [] # empty = run on all declarations; or e.g. ["simp", "omega"
 
 ### Request (`stdin`, one UTF-8 JSON object + `\n`)
 
-Matches `AcceleratorInput` in `crates/turbo-lean/src/accelerators.rs`:
+Matches `AcceleratorInput` in `crates/turbo-lean/src/accelerators.rs`. In real host calls (`check.rs:4838` via `shard.signature_text` and `gpu_fastcheck.rs:6387` via `extract_shard_stmt_and_proof`), `stmt_src` is typically the full Lean declaration header before `:=` (including optional attributes/modifiers such as `@[simp] private theorem foo (n : Nat) : ...`); standalone callers and unit tests may also pass binder-only or bare-goal `stmt_src` (`"(n : Nat) : n + 0 = n"` or `"n + 0 = n"`), so plugins emitting `subgoal_cuts` should accept both forms without duplicating `theorem`/`lemma` headers:
 
 ```json
-{"decl_name":"sdk_simp_distill","stmt_src":"(a b : Nat) (h1 : a = b) : a + 0 = b","body_src":"by simp [h1]","imports_csv":"Init","available_constants":["Nat.add_zero","h1"],"budget_ms":25}
+{"decl_name":"sdk_simp_distill","stmt_src":"theorem sdk_simp_distill (a b : Nat) (h1 : a = b) : a + 0 = b","body_src":"by simp [h1]","imports_csv":"Init","available_constants":["Nat.add_zero","h1"],"budget_ms":25}
 ```
 
 ### Response (`stdout`, one UTF-8 JSON line + `\n` within `min(timeout_ms, budget_ms)`)
@@ -64,9 +64,9 @@ Emit `{}` (or `null` / empty line) to abstain, or one `AcceleratorCertificate` (
    {"kind":"counterexample_found","witness_summary":"a = 0, b = 0 violates strict inequality a + b < a","suggested_hypothesis":"h_pos : 0 < b","accelerator_name":"plugin:sdk-template"}
    ```
 3. **Parallel Subgoal Cuts (`subgoal_cuts`)**:
-   Each entry in `cuts` is a standalone, self-contained `sub_decl_source` theorem declaration (`theorem <decl_name> <binders><promoted_hyps> : <cut_ty_or_goal> := <rhs>`) matching `CutFissionAccelerator` (`builtin:cut-fission` in `crates/turbo-lean/src/accelerators.rs`):
+   Each entry in `cuts` is a standalone, self-contained `sub_decl_source` theorem/lemma declaration (`<decl_header_or_theorem_name> <binders><promoted_hyps><cut_binders> : <cut_ty_or_goal> := <rhs>`) matching `splitter::fission_theorem_have_blocks` / `CutFissionAccelerator` (`builtin:cut-fission` in `crates/turbo-lean/src/accelerators.rs`):
    ```json
-   {"kind":"subgoal_cuts","cuts":["theorem sdk_cut_fission (n : Nat) : n + 0 = n := by rfl","theorem sdk_cut_fission (n : Nat) (h1 : n + 0 = n) : n = n := by rfl","theorem sdk_cut_fission (n : Nat) (h1 : n + 0 = n) (h2 : n = n) : n + 0 = n := by\n  exact h1"],"accelerator_name":"plugin:sdk-template"}
+   {"kind":"subgoal_cuts","cuts":["theorem sdk_cut_fission_full (n : Nat) : n + 0 = n := by rfl","theorem sdk_cut_fission_full (n : Nat) (h1 : n + 0 = n) : n = n := by rfl","theorem sdk_cut_fission_full (n : Nat) (h1 : n + 0 = n) (h2 : n = n) : n + 0 = n := by\n  exact h1"],"accelerator_name":"plugin:sdk-template"}
    ```
    > **Host replay status**: `rewritten_proof` certificates from external plugins are speculatively replayed in `crates/turbo-lean/src/check.rs` today, whereas external `subgoal_cuts` certificates are surfaced as advisory `rewrite_suggestions` (`"applied": false`) in `agent-step` (`crates/turbo-lean/src/gpu_fastcheck.rs`) while built-in `fission_theorem_have_blocks` runs `ZygoteWorker` sub-shard replay directly in `check.rs`.
 

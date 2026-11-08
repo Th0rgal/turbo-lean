@@ -335,6 +335,25 @@ def optimize_straight_line_code(
         bindings.append((dst, ty_toks, opt_expr))
 
 
+def scalar_expr_may_trap(node: ScalarNode, type_env: dict[int, tuple[str, ...]]) -> bool:
+    if any(scalar_expr_may_trap(ch, type_env) for ch in node.children):
+        return True
+    if node.kind == "bin":
+        op = str(node.val)
+        if op in ("B_addChecked256", "B_subChecked256", "B_mulChecked256"):
+            return True
+        if op in ("B_div", "B_mod"):
+            lhs, rhs = node.children
+            l_ty = infer_scalar_type(lhs, type_env)
+            r_ty = infer_scalar_type(rhs, type_env)
+            if l_ty in U64_TYPES and r_ty in U64_TYPES:
+                return False
+            if op == "B_div" and rhs.kind == "u64" and int(rhs.val) == 1:
+                return False
+            return True
+    return False
+
+
 def handle_lnir_opt_request(req: dict) -> dict:
     wire = req.get("wire")
     if not isinstance(wire, str) or not wire.startswith("LNIR_WIRE_V1|"):
@@ -389,7 +408,7 @@ def handle_lnir_opt_request(req: dict) -> dict:
 
         kept_rev: list[tuple[int, list[str], ScalarNode]] = []
         for dst, ty_toks, expr in reversed(bindings):
-            if dst in used:
+            if dst in used or scalar_expr_may_trap(expr, type_env):
                 kept_rev.append((dst, ty_toks, expr))
                 used |= collect_vars(expr)
             else:
@@ -409,12 +428,106 @@ def handle_lnir_opt_request(req: dict) -> dict:
         return {}
 
 
-def split_top_level_colon(s: str) -> tuple[str, str] | None:
+DECL_MODIFIERS = frozenset({
+    "private", "protected", "noncomputable", "scoped", "local",
+    "unsafe", "partial", "nonrec", "public", "meta",
+})
+
+
+def strip_leading_attr_block(s: str) -> str | None:
+    if not s.startswith("@["):
+        return None
     depth = 0
-    i = 0
+    i = 1
+    in_str = False
     while i < len(s):
         ch = s[i]
-        if ch in "([{":
+        if in_str:
+            if ch == "\\" and i + 1 < len(s):
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return s[i + 1 :]
+        i += 1
+    return None
+
+
+def strip_leading_set_option_in(s: str) -> str | None:
+    if not s.startswith("set_option") or (len(s) > 10 and not s[10].isspace()):
+        return None
+    m = re.match(r'^set_option\s+\S+\s+(?:"(?:\\.|[^"\\])*"|\S+)\s+in(?=\s|$)', s)
+    return s[m.end() :] if m else None
+
+
+def strip_decl_prefixes(s: str) -> str:
+    rest = s.lstrip()
+    while rest:
+        if rest.startswith("/--"):
+            end = rest.find("-/", 3)
+            if end != -1:
+                rest = rest[end + 2 :].lstrip()
+                continue
+        after_attr = strip_leading_attr_block(rest)
+        if after_attr is not None:
+            rest = after_attr.lstrip()
+            continue
+        after_opt = strip_leading_set_option_in(rest)
+        if after_opt is not None:
+            rest = after_opt.lstrip()
+            continue
+        matched_mod = False
+        for mod in DECL_MODIFIERS:
+            if rest.startswith(mod) and (len(rest) == len(mod) or rest[len(mod)].isspace()):
+                after_mod = rest[len(mod) :].lstrip()
+                if mod in ("noncomputable", "public", "meta") and (
+                    after_mod == "section" or after_mod.startswith(("section ", "import "))
+                ):
+                    break
+                rest = after_mod
+                matched_mod = True
+                break
+        if not matched_mod:
+            break
+    return rest
+
+
+def has_decl_header(stmt_trimmed: str) -> bool:
+    rest = strip_decl_prefixes(stmt_trimmed)
+    for kw in ("theorem", "lemma"):
+        if rest.startswith(kw) and len(rest) > len(kw) and rest[len(kw)].isspace():
+            after_kw = rest[len(kw) :].lstrip()
+            if after_kw and not after_kw[0].isdigit() and after_kw[0] not in ":({[":
+                return True
+    return False
+
+
+def split_top_level_colon(s: str, start_idx: int = 0) -> tuple[str, str] | None:
+    depth = 0
+    i = start_idx
+    in_str = False
+    while i < len(s):
+        ch = s[i]
+        if in_str:
+            if ch == "\\" and i + 1 < len(s):
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "([{":
             depth += 1
         elif ch in ")]}":
             depth = max(0, depth - 1)
@@ -430,9 +543,20 @@ def split_top_level_colon(s: str) -> tuple[str, str] | None:
 def split_top_level_assign(s: str) -> tuple[str, str] | None:
     depth = 0
     i = 0
+    in_str = False
     while i + 1 < len(s):
         ch = s[i]
-        if ch in "([{":
+        if in_str:
+            if ch == "\\" and i + 2 <= len(s):
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "([{":
             depth += 1
         elif ch in ")]}":
             depth = max(0, depth - 1)
@@ -448,13 +572,24 @@ def extract_have_cuts(decl_name: str, stmt_src: str, body_src: str) -> list[str]
     body_trimmed = body_src.strip()
     if not stmt_trimmed or not body_trimmed:
         return []
-    sig_split = split_top_level_colon(stmt_trimmed)
-    if sig_split is not None:
-        binders, goal_ty = sig_split
-    elif not stmt_trimmed.startswith((":", "(", "{", "[")):
-        binders, goal_ty = "", stmt_trimmed
+    if has_decl_header(stmt_trimmed):
+        after_prefixes = strip_decl_prefixes(stmt_trimmed)
+        prefix_offset = len(stmt_trimmed) - len(after_prefixes)
+        sig_split = split_top_level_colon(stmt_trimmed, prefix_offset)
+        if sig_split is None:
+            return []
+        binder_prefix, goal_ty = sig_split
+        if not binder_prefix:
+            return []
     else:
-        return []
+        sig_split = split_top_level_colon(stmt_trimmed)
+        if sig_split is not None:
+            binders, goal_ty = sig_split
+        elif not stmt_trimmed.startswith((":", "(", "{", "[")):
+            binders, goal_ty = "", stmt_trimmed
+        else:
+            return []
+        binder_prefix = f"theorem {eff_name} {binders}" if binders else f"theorem {eff_name}"
     if not goal_ty:
         return []
 
@@ -470,7 +605,7 @@ def extract_have_cuts(decl_name: str, stmt_src: str, body_src: str) -> list[str]
     if len(lines) < 2:
         return []
 
-    have_cuts: list[tuple[str, str, str]] = []
+    have_cuts: list[tuple[str, str, str, str]] = []
     concl_lines: list[str] = []
     for idx, ln in enumerate(lines):
         if idx + 1 < len(lines) and ln.startswith("have ") and not concl_lines:
@@ -481,23 +616,35 @@ def extract_have_cuts(decl_name: str, stmt_src: str, body_src: str) -> list[str]
             colon_split = split_top_level_colon(lhs)
             if colon_split is None:
                 return []
-            ident, cut_ty = colon_split
-            ident = ident.strip()
-            if not ident or any(c.isspace() for c in ident) or not cut_ty or not rhs:
+            lhs_head, cut_ty = colon_split
+            lhs_head = lhs_head.strip()
+            if not lhs_head or not cut_ty or not rhs:
                 return []
-            have_cuts.append((ident, cut_ty, rhs))
+            m_ident = re.match(r"^([^\s({[:]+)(.*)$", lhs_head)
+            if m_ident is None:
+                return []
+            ident = m_ident.group(1)
+            cut_binders_raw = m_ident.group(2).strip()
+            if not ident or ident == "_" or ident[0].isdigit():
+                return []
+            if cut_binders_raw and not cut_binders_raw.startswith(("(", "{", "[")):
+                return []
+            cut_binders = f" {cut_binders_raw}" if cut_binders_raw else ""
+            have_cuts.append((ident, cut_binders, cut_ty, rhs))
         else:
             concl_lines.append(ln)
 
     if not have_cuts or not concl_lines:
         return []
 
-    binder_prefix = f"theorem {eff_name} {binders}" if binders else f"theorem {eff_name}"
     promoted = ""
     shards: list[str] = []
-    for ident, cut_ty, rhs in have_cuts:
-        shards.append(f"{binder_prefix}{promoted} : {cut_ty} := {rhs}")
-        promoted += f" ({ident} : {cut_ty})"
+    for ident, cut_binders, cut_ty, rhs in have_cuts:
+        shards.append(f"{binder_prefix}{promoted}{cut_binders} : {cut_ty} := {rhs}")
+        if cut_binders:
+            promoted += f" ({ident} : ∀{cut_binders}, {cut_ty})"
+        else:
+            promoted += f" ({ident} : {cut_ty})"
     concl_body = "\n  ".join(concl_lines)
     shards.append(f"{binder_prefix}{promoted} : {goal_ty} := by\n  {concl_body}")
     return shards if len(shards) >= 2 else []
@@ -561,6 +708,7 @@ def main() -> int:
         print("{}", flush=True)
         return 0
 
+    one_shot = "--one-shot" in sys.argv
     for raw_line in sys.stdin:
         line = raw_line.strip()
         if not line:
@@ -569,9 +717,13 @@ def main() -> int:
             req = json.loads(line)
         except json.JSONDecodeError:
             print("{}", flush=True)
+            if one_shot:
+                break
             continue
         resp = handle_request(req)
         print(json.dumps(resp, separators=(",", ":")), flush=True)
+        if one_shot:
+            break
     return 0
 
 

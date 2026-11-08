@@ -87,10 +87,19 @@ def detect_unsound_kernel_mutant(stmt: str) -> tuple[str, str] | None:
     return None
 
 
-def handle_req(req: dict) -> dict:
+def handle_req(req: object) -> dict:
+    if not isinstance(req, dict):
+        return {}
+    budget = req.get("budget_ms", 25)
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
+        return {}
     stmt = req.get("stmt_src", "")
     body = req.get("body_src", "")
     avail = req.get("available_constants", [])
+    if not isinstance(stmt, str) or not isinstance(body, str):
+        return {}
+    if not isinstance(avail, list) or not all(isinstance(c, str) for c in avail):
+        return {}
 
     if mut := detect_unsound_kernel_mutant(stmt):
         witness, hyp = mut
@@ -152,5 +161,9 @@ if __name__ == "__main__":
         sys.exit(0)
     for line in sys.stdin:
         if line.strip():
-            req = json.loads(line)
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError:
+                print("{}", flush=True)
+                continue
             print(json.dumps(handle_req(req)), flush=True)
