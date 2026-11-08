@@ -83,6 +83,7 @@ jobs:
           key: ${{ runner.os }}-ci-cargo-lean-${{ needs.impact.outputs.impact_digest }}
           restore-keys: |
             ${{ runner.os }}-ci-cargo-lean-
+            ${{ runner.os }}-roadmap-cargo-lean-
 
       - name: Setup Lean 4 toolchain
         run: |
