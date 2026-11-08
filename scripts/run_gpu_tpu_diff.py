@@ -40,6 +40,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 import urllib.request
@@ -83,6 +84,46 @@ NUMPY_WHEELS: dict[str, tuple[str, str]] = {
         "4f92084defa704deadd4e0a5ab1dc52d8ac9e8a8ef617f3fbb853e79b0ea3592",
     ),
 }
+
+STANDALONE_CP312_URL = (
+    "https://github.com/astral-sh/python-build-standalone/releases/download/20261026/"
+    "cpython-3.12.16%2B20261026-x86_64-unknown-linux-gnu-install_only.tar.gz"
+)
+STANDALONE_CP312_SHA256 = "6a79e922e50006b601f29e688407659da1c2b86ebcd4e9c7254cf234be8b89de"
+
+
+def find_compatible_python(cache_dir: Path) -> str | None:
+    """Locate an installed CPython 3.10..3.12 binary if current `sys.executable` lacks StableHLO wheels."""
+    candidates: list[Path] = [cache_dir / "python312" / "python" / "bin" / "python3"]
+    for ver in ("python3.12", "python3.11", "python3.10"):
+        w = shutil.which(ver)
+        if w:
+            candidates.append(Path(w))
+    for tc_root in (Path("/opt/hostedtoolcache/Python"), Path(os.environ.get("RUNNER_TOOL_CACHE", "")) / "Python"):
+        if tc_root.is_dir():
+            for minor in ("3.12", "3.11", "3.10"):
+                candidates.extend(sorted(tc_root.glob(f"{minor}.*/x64/bin/python3"), reverse=True))
+    for cand in candidates:
+        if cand.is_file() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None
+
+
+def ensure_compatible_python(cache_dir: Path) -> str:
+    found = find_compatible_python(cache_dir)
+    if found:
+        return found
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    archive = cache_dir / "cpython-3.12.16-x86_64-linux.tar.gz"
+    download_verified(STANDALONE_CP312_URL, archive, STANDALONE_CP312_SHA256)
+    dest_dir = cache_dir / "python312"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(archive, "r:gz") as tf:
+        tf.extractall(dest_dir, filter="data")
+    py_bin = dest_dir / "python" / "bin" / "python3"
+    if not py_bin.is_file():
+        raise RuntimeError(f"Expected python3 binary at {py_bin}")
+    return str(py_bin)
 
 MASK64 = (1 << 64) - 1
 MASK32 = (1 << 32) - 1
@@ -1325,6 +1366,17 @@ def main() -> int:
     ap.add_argument("--self-test", action="store_true", help="Run harness unit self-tests (and OpenXLA check if available)")
     ap.add_argument("--receipt", type=Path, default=None)
     args = ap.parse_args()
+
+    py_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    if py_tag not in STABLEHLO_WHEELS and not os.environ.get("_TL_GPU_DIFF_REEXEC"):
+        if args.ensure_tools:
+            compat_py = ensure_compatible_python(args.tools_cache_dir)
+        else:
+            compat_py = find_compatible_python(args.tools_cache_dir)
+        if compat_py:
+            child_env = dict(os.environ, _TL_GPU_DIFF_REEXEC="1")
+            proc = subprocess.run([compat_py, str(Path(__file__).resolve()), *sys.argv[1:]], env=child_env)
+            return proc.returncode
 
     if args.ensure_tools:
         ptxas_bin, site_dir = ensure_gpu_tpu_tools(args.tools_cache_dir)
