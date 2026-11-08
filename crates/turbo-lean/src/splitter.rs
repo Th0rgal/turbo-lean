@@ -1272,7 +1272,7 @@ fn strip_string_literals_inner(
     )
 }
 
-fn strip_string_literals(src: &str) -> std::borrow::Cow<'_, str> {
+pub(crate) fn strip_string_literals(src: &str) -> std::borrow::Cow<'_, str> {
     strip_string_literals_inner(src, false)
 }
 
@@ -1678,6 +1678,9 @@ pub(crate) fn source_may_read_host_state(src: &str) -> bool {
         .iter()
         .any(|w| contains_lean_word(&unquoted, w))
     {
+        return true;
+    }
+    if contains_lean_attribute_word(&unquoted, &["extern", "implemented_by", "csimp"]) {
         return true;
     }
     const QUALIFIED_HOST_READS: &[&str] = &[
@@ -14268,6 +14271,16 @@ public def api := by
             shard_names(&split_lean_source(same_line_indented_cont, &[])),
             vec!["after_f"]
         );
+
+        assert!(!source_may_read_host_state(
+            "@[command_elab checkContractCmd]\ndef elabCheckContract : Lean.Elab.Command.CommandElab := fun _ => pure ()\n"
+        ));
+        assert!(source_may_read_host_state(
+            "@[extern \"my_c_host_fn\"]\nopaque readHost : Unit → Nat\n"
+        ));
+        assert!(source_may_read_host_state(
+            "open IO in\nelab \"read_env\" : term => do\n  let _ ← getEnv \"SECRET\"\n  return Lean.mkNatLit 0\n"
+        ));
     }
 }
 
