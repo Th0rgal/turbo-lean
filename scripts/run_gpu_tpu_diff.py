@@ -1452,13 +1452,14 @@ kernel void k_div(
         self.assertNotEqual(race_rc, 0, "TSan must trap on concurrent cross-lane write race")
 
     def test_stablehlo_isolated_bootstrap_and_eval(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ln-shlo-missing-") as empty_dir:
+            with self.assertRaises(RuntimeError):
+                _eval_stablehlo_isolated("module @m {}", [], Path(empty_dir))
+
         cache_dir = Path(os.environ.get("GPU_TPU_TOOLS_CACHE", "/tmp/tl-gpu-tpu-tools"))
         try:
             ensure_openxla_stablehlo(cache_dir)
         except ImportError:
-            with tempfile.TemporaryDirectory(prefix="ln-shlo-missing-") as empty_dir:
-                with self.assertRaises(RuntimeError):
-                    _eval_stablehlo_isolated("module @m {}", [], Path(empty_dir))
             self.skipTest("OpenXLA stablehlo wheel not cached locally")
 
         sub_mlir = """module @mod_sub {
@@ -1516,6 +1517,7 @@ def main() -> int:
             sys.path.insert(0, str(site_cand))
         ptxas_bin = find_ptxas(args.tools_cache_dir) or ""
         site_dir = site_cand if site_cand.is_dir() else None
+    os.environ["GPU_TPU_TOOLS_CACHE"] = str(args.tools_cache_dir.resolve())
 
     if args.self_test:
         suite = unittest.defaultTestLoader.loadTestsFromTestCase(GPUDiffRunnerSelfTests)
