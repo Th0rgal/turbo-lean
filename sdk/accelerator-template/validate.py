@@ -30,7 +30,7 @@ FIXTURES_DIR = SDK_DIR / "fixtures"
 DEFAULT_PLUGIN = SDK_DIR / "plugin.py"
 MASK64 = (1 << 64) - 1
 MASK256 = (1 << 256) - 1
-Val = tuple[str, int | bool]
+Val = tuple[str, object]
 
 BOUNDARY_U64 = (
     0, 1, 2, 3, 7, 15, 31, 32, 63, 64,
@@ -437,7 +437,7 @@ def eval_bin_op(op: str, v1: Val, v2: Val) -> Val:
             return ("u64", (int(a) << (int(b) & 63)) & MASK64)
         if t2 == "u64" and int(b) == 0:
             return v1
-        if t1 == "u256" and t2 == "u64":
+        if t1 == "u256" and t2 == "u256":
             sh = int(b)
             return ("u256", 0 if sh >= 256 else (int(a) << sh) & MASK256)
     elif op == "B_shr":
@@ -445,7 +445,7 @@ def eval_bin_op(op: str, v1: Val, v2: Val) -> Val:
             return ("u64", (int(a) >> (int(b) & 63)) & MASK64)
         if t2 == "u64" and int(b) == 0:
             return v1
-        if t1 == "u256" and t2 == "u64":
+        if t1 == "u256" and t2 == "u256":
             sh = int(b)
             return ("u256", 0 if sh >= 256 else (int(a) >> sh) & MASK256)
     elif op == "B_sar":
@@ -456,7 +456,7 @@ def eval_bin_op(op: str, v1: Val, v2: Val) -> Val:
             sign_bit = (la >> 63) & 1
             res = (shifted | ((MASK64 << (64 - sh)) & MASK64)) if (sign_bit != 0 and sh != 0) else shifted
             return ("u64", res & MASK64)
-        if t1 == "u256" and t2 == "u64":
+        if t1 == "u256" and t2 == "u256":
             la = int(a) & MASK256
             sh = int(b)
             is_neg = ((la >> 255) & 1) != 0
@@ -506,7 +506,7 @@ def eval_bin_op(op: str, v1: Val, v2: Val) -> Val:
             if op == "B_gf2Affine":
                 return ("u64", gf2_affine(la, lb))
             return ("u64", eor3_u64(la, lb))
-    raise ValueError(f"evalBinOp type/op error: {op} on {v1!r}, {v2!r}")
+    raise EvalUBError(f"typeError: evalBinOp {op} on {v1!r}, {v2!r}")
 
 
 def eval_unary_op(op: str, v: Val) -> Val:
@@ -527,7 +527,7 @@ def eval_unary_op(op: str, v: Val) -> Val:
         w = to_u256(v)
         if w is not None:
             return ("u256", 256 if w == 0 else 256 - w.bit_length())
-    raise ValueError(f"evalUnaryOp type/op error: {op} on {v!r}")
+    raise EvalUBError(f"typeError: evalUnaryOp {op} on {v!r}")
 
 
 def eval_scalar_ast(node: ScalarAst, env: dict[int, Val]) -> Val:
@@ -538,7 +538,7 @@ def eval_scalar_ast(node: ScalarAst, env: dict[int, Val]) -> Val:
     if node.kind == "var":
         idx = int(node.val)
         if idx not in env:
-            raise ValueError(f"unbound SSA variable %{idx}")
+            raise EvalUBError(f"unboundVar %{idx}")
         return env[idx]
     if node.kind == "un":
         return eval_unary_op(str(node.val), eval_scalar_ast(node.args[0], env))
@@ -549,7 +549,7 @@ def eval_scalar_ast(node: ScalarAst, env: dict[int, Val]) -> Val:
         elif ct in ("u64", "u256"):
             take_then = int(cv) != 0
         else:
-            raise ValueError(f"select condition must be bool, u64, or u256, got {ct!r}")
+            raise EvalUBError(f"typeError: select condition must be bool, u64, or u256, got {ct!r}")
         return eval_scalar_ast(node.args[1] if take_then else node.args[2], env)
     if node.kind == "fma":
         va = eval_scalar_ast(node.args[0], env)
@@ -564,6 +564,30 @@ def eval_scalar_ast(node: ScalarAst, env: dict[int, Val]) -> Val:
     raise ValueError(f"unsupported ScalarAst node: {node}")
 
 
+def parse_tuple_field_types(pty: tuple[str, ...]) -> list[tuple[str, ...]]:
+    cur = Cursor(list(pty))
+    if cur.next() != "T_tuple":
+        return []
+    cnt = cur.next_nat()
+    return [parse_type(cur) for _ in range(cnt)]
+
+
+def sample_tuple_field_val(fty: tuple[str, ...], seed: int, depth: int = 8) -> Val:
+    r = splitmix64(seed)
+    tag = fty[0]
+    if tag == "T_i1":
+        return ("bool", (r & 1) == 1)
+    if tag in ("T_u256", "T_i256"):
+        return ("u256", (r % 16) + 1)
+    if depth > 0 and tag == "T_tuple":
+        sub_tys = parse_tuple_field_types(fty)
+        return (
+            "tuple",
+            tuple(sample_tuple_field_val(sub, seed + idx * 37 + 11, depth - 1) for idx, sub in enumerate(sub_tys)),
+        )
+    return ("u64", (r % 16) + 1)
+
+
 def param_val_for_type(pty: tuple[str, ...], raw_word: int, state_idx: int = 0, p_idx: int = 0) -> Val:
     tag = pty[0]
     if tag == "T_i1":
@@ -574,6 +598,8 @@ def param_val_for_type(pty: tuple[str, ...], raw_word: int, state_idx: int = 0, 
         return ("u64", raw_word & 0xFFFF)
     if tag == "T_i32":
         return ("u64", raw_word & 0xFFFFFFFF)
+    if tag in ("T_i64", "T_usize"):
+        return ("u64", raw_word & MASK64)
     if tag in ("T_u256", "T_i256"):
         if state_idx < len(BOUNDARY_U256_PAIRS):
             pair = BOUNDARY_U256_PAIRS[state_idx]
@@ -586,9 +612,25 @@ def param_val_for_type(pty: tuple[str, ...], raw_word: int, state_idx: int = 0, 
         w2 = splitmix64(w0 ^ 2)
         w3 = splitmix64(w0 ^ 3)
         return ("u256", w0 | (w1 << 64) | (w2 << 128) | (w3 << 192))
+    if tag == "T_sarray":
+        return ("sarrayId", p_idx + 1)
+    if tag == "T_rawPtr":
+        return ("rawPtrId", p_idx + 1)
+    if tag == "T_storageMap":
+        return ("storageMapId", p_idx + 1)
+    if tag in ("T_objPtr", "T_taggedPtr"):
+        return ("u64", 1) if (state_idx + p_idx) % 5 == 0 else ("objPtr", p_idx + 1)
+    if tag == "T_tuple":
+        field_tys = parse_tuple_field_types(pty)
+        return (
+            "tuple",
+            tuple(sample_tuple_field_val(fty, (raw_word & MASK64) + idx * 17) for idx, fty in enumerate(field_tys)),
+        )
+    if tag in ("T_f16", "T_f32", "T_f64"):
+        return ("float", (tag, raw_word & MASK64))
     if tag == "T_unit":
         return ("unit", 0)
-    return ("u64", raw_word & MASK64)
+    raise ValueError(f"unsupported LNIRType in param_val_for_type: {pty!r}")
 
 
 def eval_decl_val(decl: ParsedDecl, args: list[int], state_idx: int = 0) -> Val:
@@ -658,11 +700,84 @@ def extract_wire_response(raw_line: str) -> str | None:
     raise ValueError(f"Invalid LNIR opt response payload: {trimmed!r}")
 
 
+def is_word_fact_ty(ty: tuple[str, ...]) -> bool:
+    return ty in (("T_i64",), ("T_usize",))
+
+
+def is_raw_ptr_fact_ty(ty: tuple[str, ...]) -> bool:
+    return len(ty) >= 1 and ty[0] == "T_rawPtr"
+
+
+def is_excl_fact_ty(ty: tuple[str, ...]) -> bool:
+    return len(ty) >= 1 and (ty[0] == "T_sarray" or ty == ("T_objPtr",))
+
+
+def collect_decl_var_tys(decl: ParsedDecl) -> dict[int, tuple[str, ...]]:
+    var_tys: dict[int, tuple[str, ...]] = {pid: pty for pid, _n, _b, pty in decl.params}
+    for dst, ty, _expr in decl.lets:
+        var_tys[dst] = ty
+    return var_tys
+
+
+def fact_vars_in_scope(var_tys: dict[int, tuple[str, ...]], fact: tuple[str, ...]) -> bool:
+    tag = fact[0]
+    if tag == "F_lt":
+        ti, tn = var_tys.get(int(fact[1])), var_tys.get(int(fact[2]))
+        return ti is not None and tn is not None and is_word_fact_ty(ti) and is_word_fact_ty(tn)
+    if tag in ("F_add", "F_sub", "F_mul"):
+        ta, tb = var_tys.get(int(fact[1])), var_tys.get(int(fact[2]))
+        return ta is not None and tb is not None and is_word_fact_ty(ta) and is_word_fact_ty(tb)
+    if tag == "F_aln":
+        tp = var_tys.get(int(fact[1]))
+        return tp is not None and (is_raw_ptr_fact_ty(tp) or is_word_fact_ty(tp))
+    if tag == "F_disj":
+        ta, tb = var_tys.get(int(fact[1])), var_tys.get(int(fact[2]))
+        tla, tlb = var_tys.get(int(fact[3])), var_tys.get(int(fact[4]))
+        return (
+            ta is not None and tb is not None and tla is not None and tlb is not None
+            and is_raw_ptr_fact_ty(ta) and is_raw_ptr_fact_ty(tb)
+            and is_word_fact_ty(tla) and is_word_fact_ty(tlb)
+        )
+    if tag == "F_excl":
+        to = var_tys.get(int(fact[1]))
+        return to is not None and is_excl_fact_ty(to)
+    return False
+
+
+def check_scalar_ast_branches(node: ScalarAst, env: dict[int, Val]) -> None:
+    if node.kind == "var":
+        idx = int(node.val)
+        if idx not in env:
+            raise ValueError(f"unbound SSA variable %{idx} in candidate expression")
+        return
+    for ch in node.args:
+        check_scalar_ast_branches(ch, env)
+    if node.kind == "sel":
+        for branch_idx in (1, 2):
+            try:
+                eval_scalar_ast(node.args[branch_idx], env)
+            except EvalUBError as exc:
+                msg = str(exc)
+                if msg.startswith(("typeError", "unboundVar")):
+                    raise ValueError(f"S_sel branch {branch_idx} failed validation: {msg}") from exc
+
+
+def validate_cand_decl_static(src: ParsedDecl, cand: ParsedDecl) -> None:
+    src_fact_set = set(src.facts)
+    cand_var_tys = collect_decl_var_tys(cand)
+    for fact in cand.facts:
+        if fact not in src_fact_set:
+            raise ValueError(f"Candidate fabricated RetainedFact not present in source: {fact!r}")
+        if not fact_vars_in_scope(cand_var_tys, fact):
+            raise ValueError(f"Candidate RetainedFact out of scope or ill-typed: {fact!r}")
+
+
 def verify_opt_plugin_gate_64(src: ParsedDecl, cand: ParsedDecl, target: str) -> tuple[int, int]:
     src_sig = [(pid, pty) for pid, _n, _b, pty in src.params]
     cand_sig = [(pid, pty) for pid, _n, _b, pty in cand.params]
     if src_sig != cand_sig or src.ret_ty != cand.ret_ty:
         raise ValueError(f"Signature mismatch: {(src_sig, src.ret_ty)} != {(cand_sig, cand.ret_ty)}")
+    validate_cand_decl_static(src, cand)
     arity = len(src.params)
     non_vacuous_count = 0
     for state_idx in range(64):
@@ -678,7 +793,16 @@ def verify_opt_plugin_gate_64(src: ParsedDecl, cand: ParsedDecl, target: str) ->
             continue
         non_vacuous_count += 1
         try:
-            v_cand = eval_decl_val(cand, vec, state_idx)
+            cand_env = {
+                pid: param_val_for_type(pty, val, state_idx, p_idx)
+                for p_idx, ((pid, _n, _b, pty), val) in enumerate(zip(cand.params, vec))
+            }
+            for dst, _ty, expr in cand.lets:
+                check_scalar_ast_branches(expr, cand_env)
+                cand_env[dst] = eval_scalar_ast(expr, cand_env)
+            if cand.ret_var not in cand_env:
+                raise ValueError(f"unbound return variable %{cand.ret_var}")
+            v_cand = cand_env[cand.ret_var]
         except EvalUBError as exc:
             raise ValueError(
                 f"64-state UB refinement violation on state {state_idx} ({vec}): src={v_src!r}, cand raised UB {exc}"
@@ -1096,6 +1220,232 @@ class AcceleratorSdkTestSuite(unittest.TestCase):
             os_adv_out, os_adv_to = run_single_stdio_request(oneshot_cmd, "{not-valid-json", timeout_ms=500)
             self.assertFalse(os_adv_to)
             self.assertIsNone(validate_tactic_certificate(os_adv_out or ""))
+
+    def test_06_reviewer_regressions_p1_and_p2(self) -> None:
+        is_default = self.plugin_cmd == [sys.executable, str(DEFAULT_PLUGIN)]
+
+        # P1-B.1: 256-bit shift semantics in eval_bin_op & 64-state gate
+        self.assertEqual(eval_bin_op("B_shl", ("u256", 3), ("u256", 2)), ("u256", 12))
+        self.assertEqual(eval_bin_op("B_shl", ("u256", 3), ("u256", 256)), ("u256", 0))
+        self.assertEqual(eval_bin_op("B_shl", ("u256", 3), ("u64", 0)), ("u256", 3))
+        self.assertEqual(eval_bin_op("B_shr", ("u256", 12), ("u256", 2)), ("u256", 3))
+        self.assertEqual(eval_bin_op("B_shr", ("u256", 12), ("u64", 0)), ("u256", 12))
+        self.assertEqual(eval_bin_op("B_sar", ("u256", 1 << 255), ("u256", 1)), ("u256", 3 << 254))
+        self.assertEqual(eval_bin_op("B_sar", ("u256", 1 << 255), ("u256", 0)), ("u256", 1 << 255))
+        with self.assertRaises(EvalUBError):
+            eval_bin_op("B_shl", ("u256", 3), ("u64", 1))
+        with self.assertRaises(EvalUBError):
+            eval_bin_op("B_shr", ("u256", 3), ("u64", 1))
+        with self.assertRaises(EvalUBError):
+            eval_bin_op("B_sar", ("u256", 3), ("u64", 0))
+        with self.assertRaises(EvalUBError):
+            eval_bin_op("B_sar", ("u256", 3), ("u64", 1))
+
+        # Rewriting u256 `x + x` into `B_shl(x, S_u64(1))` MUST FAIL the 64-input gate (typeError UB)
+        u256_add_src = parse_single_decl_wire(
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|753235365f616464|A_L2|0|"
+            "1|0|78|0|T_u256|T_u256|C_let|1|T_u256|E_scalar|S_bin|B_add|S_var|0|S_var|0|C_ret|1"
+        )
+        u256_bad_shl_cand = parse_single_decl_wire(
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|753235365f616464|A_L2|0|"
+            "1|0|78|0|T_u256|T_u256|C_let|1|T_u256|E_scalar|S_bin|B_shl|S_var|0|S_u64|1|C_ret|1"
+        )
+        with self.assertRaises(ValueError):
+            verify_opt_plugin_gate_64(u256_add_src, u256_bad_shl_cand, "x86_64")
+
+        # Valid `(T_u256, T_u256)` shift must NOT crash validate.py
+        u256_shl_src = parse_single_decl_wire(
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|753235365f73686c|A_L2|0|"
+            "2|0|61|0|T_u256|1|62|0|T_u256|T_u256|"
+            "C_let|2|T_u256|E_scalar|S_bin|B_add|S_var|0|S_u64|0|"
+            "C_let|3|T_u256|E_scalar|S_bin|B_shl|S_var|2|S_var|1|C_ret|3"
+        )
+        u256_shl_cand = parse_single_decl_wire(
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|753235365f73686c|A_L2|0|"
+            "2|0|61|0|T_u256|1|62|0|T_u256|T_u256|"
+            "C_let|3|T_u256|E_scalar|S_bin|B_shl|S_var|0|S_var|1|C_ret|3"
+        )
+        c_shl_before, c_shl_after = verify_opt_plugin_gate_64(u256_shl_src, u256_shl_cand, "x86_64")
+        self.assertLess(c_shl_after, c_shl_before)
+
+        # P1-B.2: Non-u64 parameter types (`T_sarray`, `T_rawPtr`, `T_objPtr`, `T_taggedPtr`,
+        # `T_storageMap`, `T_tuple`, `T_f16`, `T_f32`, `T_f64`) must not be sampled as raw u64 words;
+        # rewriting `B_sub(p0, 0)` to `B_bitAnd(p0, MASK64)` on `T_sarray` must FAIL.
+        for non_u64_ty_toks in (
+            "T_sarray|T_i8",
+            "T_rawPtr|T_i8",
+            "T_objPtr",
+            "T_taggedPtr",
+            "T_storageMap",
+            "T_tuple|1|T_i64",
+            "T_f16",
+            "T_f32",
+            "T_f64",
+        ):
+            sarr_src = parse_single_decl_wire(
+                f"LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|6e6f6e5f753634|A_L2|0|"
+                f"1|0|70|0|{non_u64_ty_toks}|{non_u64_ty_toks}|"
+                f"C_let|1|{non_u64_ty_toks}|E_scalar|S_bin|B_sub|S_var|0|S_u64|0|C_ret|1"
+            )
+            sarr_bad_cand = parse_single_decl_wire(
+                f"LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|6e6f6e5f753634|A_L2|0|"
+                f"1|0|70|0|{non_u64_ty_toks}|{non_u64_ty_toks}|"
+                f"C_let|1|{non_u64_ty_toks}|E_scalar|S_bin|B_bitAnd|S_var|0|S_u64|{MASK64}|C_ret|1"
+            )
+            with self.assertRaises(ValueError, msg=f"Failed to reject bitAnd mask on {non_u64_ty_toks}"):
+                verify_opt_plugin_gate_64(sarr_src, sarr_bad_cand, "x86_64")
+
+        # P2.3: verify_opt_plugin_gate_64 must evaluate both S_sel branches (catching unbound SSA / ill-typed dead branch)
+        sel_src = parse_single_decl_wire(
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|73656c5f67617465|A_L2|0|"
+            "1|0|78|0|T_i64|T_i64|C_let|1|T_i64|E_scalar|S_bin|B_add|S_var|0|S_u64|0|C_ret|1"
+        )
+        sel_unbound_cand = parse_single_decl_wire(
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|73656c5f67617465|A_L2|0|"
+            "1|0|78|0|T_i64|T_i64|C_let|1|T_i64|E_scalar|S_sel|S_bool|1|S_var|0|S_var|99|C_ret|1"
+        )
+        with self.assertRaises(ValueError):
+            verify_opt_plugin_gate_64(sel_src, sel_unbound_cand, "x86_64")
+
+        sel_illtyped_cand = parse_single_decl_wire(
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|73656c5f67617465|A_L2|0|"
+            "1|0|78|0|T_i64|T_i64|C_let|1|T_i64|E_scalar|S_sel|S_bool|1|S_var|0|S_bin|B_lt|S_bool|1|S_bool|0|C_ret|1"
+        )
+        with self.assertRaises(ValueError):
+            verify_opt_plugin_gate_64(sel_src, sel_illtyped_cand, "x86_64")
+
+        # P2.3b: verify_opt_plugin_gate_64 must reject fabricated or out-of-scope F_facts
+        fabricated_fact_cand = parse_single_decl_wire(
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|73656c5f67617465|A_L2|0|"
+            "1|0|78|0|T_i64|T_i64|C_let|1|T_i64|E_scalar|S_var|0|C_ret|1|F_facts|1|F_add|0|0|1|1"
+        )
+        with self.assertRaises(ValueError):
+            verify_opt_plugin_gate_64(sel_src, fabricated_fact_cand, "x86_64")
+
+        out_of_scope_fact_src = parse_single_decl_wire(
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|666163745f73636f7065|A_L2|0|"
+            "1|0|78|0|T_i64|T_i64|"
+            "C_let|1|T_i64|E_scalar|S_bin|B_add|S_var|0|S_u64|0|"
+            "C_let|2|T_i64|E_scalar|S_var|0|C_ret|2|F_facts|1|F_lt|0|1"
+        )
+        out_of_scope_fact_cand = parse_single_decl_wire(
+            "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|666163745f73636f7065|A_L2|0|"
+            "1|0|78|0|T_i64|T_i64|"
+            "C_let|2|T_i64|E_scalar|S_var|0|C_ret|2|F_facts|1|F_lt|0|1"
+        )
+        with self.assertRaises(ValueError):
+            verify_opt_plugin_gate_64(out_of_scope_fact_src, out_of_scope_fact_cand, "x86_64")
+
+        if is_default:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("sdk_plugin_mod", DEFAULT_PLUGIN)
+            assert spec is not None and spec.loader is not None
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules["sdk_plugin_mod"] = mod
+            spec.loader.exec_module(mod)
+
+            # P1-A.1: Idiomatic multiline `have` block with indented sub-tactics
+            cuts_multi = mod.extract_have_cuts(
+                "multi_have",
+                "theorem multi_have (n : Nat) : n + 0 = n",
+                "by\n  have h1 : n + 0 = n := by\n    rfl\n  exact h1",
+            )
+            self.assertEqual(
+                cuts_multi,
+                [
+                    "theorem multi_have (n : Nat) : n + 0 = n := by\n  rfl",
+                    "theorem multi_have (n : Nat) (h1 : n + 0 = n) : n + 0 = n := by\n  exact h1",
+                ],
+            )
+
+            # P1-A.2: Binder collision rejection (`theorem foo (h1 : Nat)` with `have h1 : 0 = 0`)
+            cuts_collide = mod.extract_have_cuts(
+                "foo",
+                "theorem foo (h1 : Nat) : 0 = 0",
+                "by\n  have h1 : 0 = 0 := by rfl\n  exact h1",
+            )
+            self.assertEqual(cuts_collide, [])
+
+            # Also reject collision between two `have` cuts (`have h1 ...` then `have h1 ...`)
+            cuts_dup_have = mod.extract_have_cuts(
+                "foo_dup",
+                "theorem foo_dup (n : Nat) : 0 = 0",
+                "by\n  have h1 : 0 = 0 := by rfl\n  have h1 : 0 = 0 := by rfl\n  exact h1",
+            )
+            self.assertEqual(cuts_dup_have, [])
+
+            # P1-A.3: `split_top_level_colon` must ignore colons inside `«...»` guillemets and `':'` char literals
+            self.assertEqual(
+                mod.split_top_level_colon("theorem «foo:bar» (c : Char := ':') : c = ':'"),
+                ("theorem «foo:bar» (c : Char := ':')", "c = ':'"),
+            )
+            cuts_guillemet = mod.extract_have_cuts(
+                "«foo:bar»",
+                "theorem «foo:bar» : ':' = ':'",
+                "by\n  have «h:1» : ':' = ':' := by rfl\n  exact «h:1»",
+            )
+            self.assertEqual(
+                cuts_guillemet,
+                [
+                    "theorem «foo:bar» : ':' = ':' := by rfl",
+                    "theorem «foo:bar» («h:1» : ':' = ':') : ':' = ':' := by\n  exact «h:1»",
+                ],
+            )
+
+            # P2.1: SSA variable rebind (`dst` rebound) must use latest binding and DCE dead first rebind
+            rebind_wire = (
+                "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|726562696e64|A_L2|0|"
+                "2|0|61|0|T_i64|1|62|0|T_i64|T_i64|"
+                "C_let|2|T_i64|E_scalar|S_var|0|"
+                "C_let|2|T_i64|E_scalar|S_bin|B_add|S_var|1|S_u64|0|"
+                "C_let|3|T_i64|E_scalar|S_var|2|C_ret|3"
+            )
+            rb_resp = mod.handle_lnir_opt_request(
+                {"decl_name": "rebind", "target": "x86_64", "budget_ms": 50, "wire": rebind_wire}
+            )
+            self.assertIn("wire", rb_resp)
+            rb_src = parse_single_decl_wire(rebind_wire)
+            rb_cand = parse_single_decl_wire(rb_resp["wire"])
+            verify_opt_plugin_gate_64(rb_src, rb_cand, "x86_64")
+            self.assertEqual(rb_cand.lets, [])
+            self.assertEqual(rb_cand.ret_var, 1)
+
+            # P2.1b: Rebinding a parameter id (`0`) must not fold later `S_var|0` back to pre-rebind `S_var|0`!
+            rebind_param_wire = (
+                "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|726562696e645f70|A_L2|0|"
+                "2|0|61|0|T_i64|1|62|0|T_i64|T_i64|"
+                "C_let|2|T_i64|E_scalar|S_var|0|"
+                "C_let|0|T_i64|E_scalar|S_var|1|"
+                "C_let|3|T_i64|E_scalar|S_bin|B_add|S_var|2|S_var|0|C_ret|3"
+            )
+            rbp_resp = mod.handle_lnir_opt_request(
+                {"decl_name": "rebind_p", "target": "x86_64", "budget_ms": 50, "wire": rebind_param_wire}
+            )
+            if "wire" in rbp_resp:
+                verify_opt_plugin_gate_64(
+                    parse_single_decl_wire(rebind_param_wire),
+                    parse_single_decl_wire(rbp_resp["wire"]),
+                    "x86_64",
+                )
+
+            # P2.2: Multi-use `B_mul` must NOT be inlined into `S_fma` when it increases scalar cost on `target`
+            multi_mul_wire = (
+                "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|6d756c74695f6d756c|A_L2|0|"
+                "3|0|61|0|T_i64|1|62|0|T_i64|2|63|0|T_i64|T_i64|"
+                "C_let|3|T_i64|E_scalar|S_bin|B_mul|S_var|0|S_var|1|"
+                "C_let|4|T_i64|E_scalar|S_bin|B_add|S_var|3|S_var|2|"
+                "C_let|5|T_i64|E_scalar|S_bin|B_bitXor|S_var|4|S_var|3|C_ret|5"
+            )
+            for tgt in ("x86_64", "arm64", "cuda_ptx", "apple_metal"):
+                mm_resp = mod.handle_lnir_opt_request(
+                    {"decl_name": "multi_mul", "target": tgt, "budget_ms": 50, "wire": multi_mul_wire}
+                )
+                if "wire" in mm_resp:
+                    verify_opt_plugin_gate_64(
+                        parse_single_decl_wire(multi_mul_wire),
+                        parse_single_decl_wire(mm_resp["wire"]),
+                        tgt,
+                    )
 
 
 def resolve_plugin_cmd(raw: str | None) -> list[str]:
