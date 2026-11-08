@@ -66,23 +66,27 @@ private def evalPTXOut (k : PTXKernel) (nIn : Nat) (inputs : List (List UInt64))
 
 private def mkPTXKernelCase (id : String) (name : String) (kind : ParallelKernelKind)
     (inputSets : List (List (List UInt64)))
-    (mutant? : Option (PTXKernel × String) := none) : Option PTXCase := do
+    (mutant? : Option (PTXKernel × String) := none) : Except String PTXCase := do
+  if inputSets.isEmpty then
+    throw s!"[PTX:{id}] empty input vector set"
   let nIn := LeanNative.Backend.PTXLower.kernelArity kind
   let k := LeanNative.Backend.PTXLower.lowerKind name kind
   let modText := ppPTXModule { kernels := [k] }
   let vecs ← inputSets.mapM fun ins => do
     let len := (ins[0]?.getD []).length
-    let expLnir ← lnirOut kind ins len
-    let expPtx ← evalPTXOut k nIn ins
+    let some expLnir := lnirOut kind ins len
+      | throw s!"[PTX:{id}] LNIR reference evaluation failed on inputs {repr ins}"
+    let some expPtx := evalPTXOut k nIn ins
+      | throw s!"[PTX:{id}] PTXAst reference evaluation failed on inputs {repr ins}"
     if expLnir == expPtx then
-      some { inputs := ins, expected := expPtx : PTXSimtVector }
+      pure { inputs := ins, expected := expPtx : PTXSimtVector }
     else
-      none
+      throw s!"[PTX:{id}] two-sided evaluator mismatch: LNIR={repr expLnir} vs PTXAst={repr expPtx}"
   let (negText?, negReason?) :=
     match mutant? with
     | none => (none, none)
     | some (mk, r) => (some (ppPTXModule { kernels := [mk] }), some r)
-  some
+  pure
     { id := id
     , kernelName := k.name
     , arity := nIn
@@ -111,23 +115,27 @@ private def evalMetalOut (k : MSLKernelDecl) (nIn : Nat) (inputs : List (List UI
 
 private def mkMetalKernelCase (id : String) (name : String) (kind : ParallelKernelKind)
     (inputSets : List (List (List UInt64)))
-    (mutant? : Option (MSLKernelDecl × String) := none) : Option MetalCase := do
+    (mutant? : Option (MSLKernelDecl × String) := none) : Except String MetalCase := do
+  if inputSets.isEmpty then
+    throw s!"[Metal:{id}] empty input vector set"
   let nIn := LeanNative.Backend.MetalLower.kernelArity kind
   let k := LeanNative.Backend.MetalLower.lowerKind name kind
   let modText := ppMSLModule { kernels := [k] }
   let vecs ← inputSets.mapM fun ins => do
     let len := (ins[0]?.getD []).length
-    let expLnir ← lnirOut kind ins len
-    let expMsl ← evalMetalOut k nIn ins
+    let some expLnir := lnirOut kind ins len
+      | throw s!"[Metal:{id}] LNIR reference evaluation failed on inputs {repr ins}"
+    let some expMsl := evalMetalOut k nIn ins
+      | throw s!"[Metal:{id}] MetalAst reference evaluation failed on inputs {repr ins}"
     if expLnir == expMsl then
-      some { inputs := ins, expected := expMsl : MetalVector }
+      pure { inputs := ins, expected := expMsl : MetalVector }
     else
-      none
+      throw s!"[Metal:{id}] two-sided evaluator mismatch: LNIR={repr expLnir} vs MetalAst={repr expMsl}"
   let (negText?, negReason?) :=
     match mutant? with
     | none => (none, none)
     | some (mk, r) => (some (ppMSLModule { kernels := [mk] }), some r)
-  some
+  pure
     { id := id
     , kernelName := k.name
     , arity := nIn
@@ -162,19 +170,21 @@ private def matUi64Val (rows cols : Nat) (ws : List UInt64) : TensorVal :=
 
 private def mkStableHLOCase (id : String) (modName : String) (f : FuncOp)
     (argSets : List (List TensorVal))
-    (mutant? : Option (FuncOp × String) := none) : Option StableHLOCase := do
+    (mutant? : Option (FuncOp × String) := none) : Except String StableHLOCase := do
+  if argSets.isEmpty then
+    throw s!"[StableHLO:{id}] empty argument vector set"
   let m : ModuleOp := { name := modName, funcs := [f] }
   let vecs ← argSets.mapM fun args => do
     match evalFuncOp f args with
-    | .ok tv => some { args := args, expected := tv : StableHLOVector }
-    | .error _ => none
+    | .ok tv => pure { args := args, expected := tv : StableHLOVector }
+    | .error err => throw s!"[StableHLO:{id}] evalFuncOp failed: {repr err}"
   let (negText?, negReason?) :=
     match mutant? with
     | none => (none, none)
     | some (mf, r) =>
       let mm : ModuleOp := { name := modName ++ "_mutant", funcs := [{ mf with name := f.name }] }
       (some (ppModuleOp mm), some r)
-  some
+  pure
     { id := id
     , fnName := f.name
     , mlirText := ppModuleOp m
@@ -199,7 +209,7 @@ private def mkTernScalarDecl (name : String) (retTy : LNIRType) (se : ScalarExpr
   , body := .letBind 3 retTy (.scalar se) (.ret 3)
   , isGpuCand := true }
 
-private def buildPTXCases : Option (List PTXCase) := do
+private def buildPTXCases : Except String (List PTXCase) := do
   let vecs1 : List (List (List UInt64)) :=
     [ [[0, 1, 7, 42]], [[10, 20, 30, 40, 50]], [[0xffffffffffffffff, 0x8000000000000000, 3]] ]
   let vecs2 : List (List (List UInt64)) :=
@@ -226,9 +236,9 @@ private def buildPTXCases : Option (List PTXCase) := do
   let c8 ← mkPTXKernelCase "ptx_custom_div_zero_safe" "ln_ptx_div" (.customScalar 9 [0, 1] divBody) vecs2
   let c9 ← mkPTXKernelCase "ptx_custom_shl_mask" "ln_ptx_shl" (.customScalar 9 [0, 1] shlBody) vecs2
   let c10 ← mkPTXKernelCase "ptx_custom_select_fma_mod" "ln_ptx_mix" (.customScalar 9 [0, 1] mixBody) vecs2
-  some [c1, c2, c3, c4, c5, c6, c7, c8, c9, c10]
+  pure [c1, c2, c3, c4, c5, c6, c7, c8, c9, c10]
 
-private def buildMetalCases : Option (List MetalCase) := do
+private def buildMetalCases : Except String (List MetalCase) := do
   let vecs1 : List (List (List UInt64)) :=
     [ [[0, 1, 7, 42]], [[10, 20, 30, 40, 50]], [[0xffffffffffffffff, 0x8000000000000000, 3]] ]
   let vecs2 : List (List (List UInt64)) :=
@@ -253,7 +263,7 @@ private def buildMetalCases : Option (List MetalCase) := do
     (some (metalMutantM10Kernel "ln_msl_shl" 9 [0, 1] shlBody, "M10 narrowed shift mask & 31UL"))
   let m8 ← mkMetalKernelCase "metal_custom_sub" "ln_msl_sub" (.customScalar 9 [0, 1] subBody) vecs2
   let m9 ← mkMetalKernelCase "metal_custom_select_fma" "ln_msl_mix" (.customScalar 9 [0, 1] mixBody) vecs2
-  some [m1, m2, m3, m4, m5, m6, m7, m8, m9]
+  pure [m1, m2, m3, m4, m5, m6, m7, m8, m9]
 
 private def hloSignedShiftRemFn : FuncOp :=
   let ty : TensorType := { shape := [], elem := .i64 }
@@ -290,7 +300,7 @@ private def hloTensorOpsFn : FuncOp :=
       , .add "res" "sum_all" "elem1"
       , .returnOp "res" ] }
 
-private def buildStableHLOCases : Option (List StableHLOCase) := do
+private def buildStableHLOCases : Except String (List StableHLOCase) := do
   let scPairs : List (List TensorVal) :=
     [ [scUi64Val 5, scUi64Val 2]
     , [scUi64Val 2, scUi64Val 5]
@@ -328,12 +338,12 @@ private def buildStableHLOCases : Option (List StableHLOCase) := do
           (.parFor 3 2 [0, 1] .i64 .dotProduct
             (.letBind 4 .i64 (.scalar (.constU64 0))
               (.letBind 5 .i64 (.sarrayGet 3 4 .i64) (.ret 5)))) }
-  let fSub ← lowerToStableHLO dSub 0
-  let fShl ← lowerToStableHLO dShl 0
-  let fDiv ← lowerToStableHLO dDiv 0
-  let fIte ← lowerToStableHLO dIte 0
-  let fSaxpy ← lowerToStableHLO dSaxpyVec 4
-  let fDot ← lowerToStableHLO dDotSlice 4
+  let some fSub := lowerToStableHLO dSub 0 | throw "lowerToStableHLO failed on lnir_hlo_sub"
+  let some fShl := lowerToStableHLO dShl 0 | throw "lowerToStableHLO failed on lnir_hlo_shl"
+  let some fDiv := lowerToStableHLO dDiv 0 | throw "lowerToStableHLO failed on lnir_hlo_div"
+  let some fIte := lowerToStableHLO dIte 0 | throw "lowerToStableHLO failed on lnir_hlo_ite_select"
+  let some fSaxpy := lowerToStableHLO dSaxpyVec 4 | throw "lowerToStableHLO failed on lnir_hlo_saxpy_vec4"
+  let some fDot := lowerToStableHLO dDotSlice 4 | throw "lowerToStableHLO failed on lnir_hlo_dot_vec4"
   let vec4Pairs : List (List TensorVal) :=
     [ [vecUi64Val [1, 2, 3, 4], vecUi64Val [10, 20, 30, 40]]
     , [vecUi64Val [0xffffffffffffffff, 0, 7, 9], vecUi64Val [1, 42, 3, 5]] ]
@@ -351,7 +361,7 @@ private def buildStableHLOCases : Option (List StableHLOCase) := do
   let s6 ← mkStableHLOCase "hlo_lowered_dot_vec4" "mod_dot" fDot vec4Pairs
   let s7 ← mkStableHLOCase "hlo_signed_sdiv_srem_ashr" "mod_signed" hloSignedShiftRemFn scSignedPairs
   let s8 ← mkStableHLOCase "hlo_dot_reduce_slice_dyn" "mod_tensor" hloTensorOpsFn mat2Pairs
-  some [s1, s2, s3, s4, s5, s6, s7, s8]
+  pure [s1, s2, s3, s4, s5, s6, s7, s8]
 
 private def ptxCaseToJson (c : PTXCase) : Json :=
   let base : List (String × Json) :=
@@ -425,12 +435,15 @@ private def snarkProbeModule : LNIRModule :=
           (.binOp .bitAnd (.binOp .bitXor (.var 0) (.var 1)) (.constU64 0xffffffff)) ] }
 
 def run (_args : List String) : IO UInt32 := do
-  let some ptxCases := buildPTXCases
-    | do IO.eprintln "[gpu-tpu-diff-suite] PTX case synthesis or evaluator check failed"; return 1
-  let some metalCases := buildMetalCases
-    | do IO.eprintln "[gpu-tpu-diff-suite] Metal case synthesis or evaluator check failed"; return 1
-  let some hloCases := buildStableHLOCases
-    | do IO.eprintln "[gpu-tpu-diff-suite] StableHLO case synthesis or evaluator check failed"; return 1
+  let ptxCases ← match buildPTXCases with
+    | .ok cs => pure cs
+    | .error err => do IO.eprintln s!"[gpu-tpu-diff-suite] PTX case synthesis failed: {err}"; return 1
+  let metalCases ← match buildMetalCases with
+    | .ok cs => pure cs
+    | .error err => do IO.eprintln s!"[gpu-tpu-diff-suite] Metal case synthesis failed: {err}"; return 1
+  let hloCases ← match buildStableHLOCases with
+    | .ok cs => pure cs
+    | .error err => do IO.eprintln s!"[gpu-tpu-diff-suite] StableHLO case synthesis failed: {err}"; return 1
   let prodPTX := emitPTXModule probeMod
   let prodStableHLO := emitStableHLOModule probeMod
   let prodMetal := emitMetalModule snarkProbeModule

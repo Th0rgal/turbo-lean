@@ -22,12 +22,12 @@ mutant rejection (`M6..M10` and `H1..H3`):
        StableHLO reference interpreter (`mlir.dialects.stablehlo.eval_module`), checking bit-exact tensor
        output agreement and rejecting mutants `H1` (`subtract` swap), `H2` (unmasked `shift_left >= 64`),
        and `H3` (unguarded `divide` by zero).
-  3. Apple Metal MSL 3.0 (`clang++ -std=c++17 -O1 -Wall -Wextra -fsanitize=address,undefined`):
+  3. Apple Metal MSL 3.0 (`clang++ -std=c++17 -O1 -pthread -Wall -Wextra -fsanitize=address,undefined` + `-fsanitize=thread`):
      - Compiles the full production `emitMetalModule` (including `ln_u256`, `ln_clmul64`, `dot_reduce_u64`,
        `matmul_tiled_u64`, SNARK `F_{2^128}` NTT, BLAKE3, and `emitFastCheckMetal`) plus every `MetalLower`
-       kernel as host C++17 with ASan + UBSan (`-fno-sanitize-recover=all`), executing multi-thread grids
-       and verifying bit-exact 64-bit agreement while rejecting `M9` (unguarded `/ 0` caught by UBSan) and
-       `M10` (`& 31UL` narrowed shift mask).
+       kernel as host C++17 with ASan + UBSan (`-fno-sanitize-recover=all`) and concurrent `std::thread` TSan
+       race checking across grid lanes, verifying bit-exact 64-bit agreement while rejecting `M9` (unguarded
+       `/ 0` caught by UBSan) and `M10` (`& 31UL` narrowed shift mask).
 """
 from __future__ import annotations
 
@@ -174,6 +174,19 @@ def safe_extract_zip(zf: zipfile.ZipFile, dest_dir: Path) -> None:
         if target != root and root not in target.parents:
             raise RuntimeError(f"Refusing zip path traversal entry: {info.filename}")
     zf.extractall(dest_dir)
+
+
+def ensure_openxla_stablehlo(cache_dir: Path) -> Path | None:
+    """Activate cached `site-packages` and verify `numpy` + `mlir.dialects.stablehlo` import cleanly."""
+    for rel in ("site-packages", f"site-cp{sys.version_info.major}{sys.version_info.minor}"):
+        site_dir = cache_dir / rel
+        if site_dir.is_dir() and str(site_dir) not in sys.path:
+            sys.path.insert(0, str(site_dir))
+    import numpy as _np  # noqa: F401
+    from mlir.dialects import stablehlo as _shlo  # noqa: F401
+
+    site_pkg = cache_dir / "site-packages"
+    return site_pkg if site_pkg.is_dir() else None
 
 
 def ensure_gpu_tpu_tools(cache_dir: Path) -> tuple[str, Path | None]:
@@ -818,15 +831,27 @@ def _eval_stablehlo_isolated(
 ) -> tuple[int, tuple[list[int], str, list[int]] | None]:
     """Run `eval_stablehlo_with_openxla` in a child process so C++ `llvm::APInt`
     assertions (e.g., unguarded division-by-zero mutant `H3` hitting `SIGABRT`)
-    are cleanly caught as non-zero return codes instead of aborting the harness."""
+    are cleanly caught as non-zero return codes instead of aborting the harness.
+
+    Crucially, child bootstrap/import failures MUST raise `RuntimeError` in the
+    parent so setup regressions never masquerade as killed mutants."""
     code = (
         "import json, sys\n"
         "from pathlib import Path\n"
         f"sys.path.insert(0, {repr(str(Path(__file__).resolve().parent))})\n"
         "import run_gpu_tpu_diff as rgt\n"
         "req = json.loads(sys.stdin.read())\n"
-        "rgt.ensure_openxla_stablehlo(Path(req['cache']))\n"
-        "out = rgt.eval_stablehlo_with_openxla(req['mlir'], req['args'])\n"
+        "try:\n"
+        "    rgt.ensure_openxla_stablehlo(Path(req['cache']))\n"
+        "except Exception as exc:\n"
+        "    print(json.dumps({'bootstrap_error': f'{type(exc).__name__}: {exc}'}))\n"
+        "    sys.exit(99)\n"
+        "print('__SHLO_BOOTSTRAP_OK__', flush=True)\n"
+        "try:\n"
+        "    out = rgt.eval_stablehlo_with_openxla(req['mlir'], req['args'])\n"
+        "except Exception as exc:\n"
+        "    print(json.dumps({'eval_error': f'{type(exc).__name__}: {exc}'}))\n"
+        "    sys.exit(2)\n"
         "print(json.dumps({'ok': list(out)}))\n"
     )
     proc = subprocess.run(
@@ -836,14 +861,21 @@ def _eval_stablehlo_isolated(
         text=True,
         timeout=60,
     )
+    if proc.returncode == 99 or "__SHLO_BOOTSTRAP_OK__" not in proc.stdout:
+        raise RuntimeError(
+            "Isolated OpenXLA StableHLO child failed before evaluation "
+            f"(rc={proc.returncode}):\nstdout={proc.stdout}\nstderr={proc.stderr}"
+        )
     if proc.returncode != 0:
         return proc.returncode, None
     for ln in reversed(proc.stdout.splitlines()):
         ln = ln.strip()
         if ln.startswith("{"):
-            data = json.loads(ln)["ok"]
-            return 0, (list(data[0]), str(data[1]), [int(x) for x in data[2]])
-    return 1, None
+            msg = json.loads(ln)
+            if "ok" in msg:
+                data = msg["ok"]
+                return 0, (list(data[0]), str(data[1]), [int(x) for x in data[2]])
+    raise RuntimeError(f"Isolated OpenXLA StableHLO child returned rc=0 without result payload:\n{proc.stdout}")
 
 
 # ---------------------------------------------------------------------------
@@ -855,6 +887,7 @@ METAL_CXX17_SHIM = r"""
 #include <cstring>
 #include <cmath>
 #include <atomic>
+#include <thread>
 #include <type_traits>
 #include <cstdio>
 #include <vector>
@@ -942,8 +975,13 @@ def translate_msl_to_cxx17(msl_text: str) -> str:
     return src
 
 
-def compile_and_check_metal_module(clangxx: str, msl_text: str, extra_main_cpp: str) -> tuple[int, str, str]:
-    cpp_src = translate_msl_to_cxx17(msl_text) + "\n" + extra_main_cpp
+def compile_and_check_metal_module(
+    clangxx: str,
+    msl_text: str,
+    extra_main_cpp: str,
+    sanitizer: str = "address,undefined",
+) -> tuple[int, str, str]:
+    cpp_src = translate_msl_to_cxx17(msl_text) + "\n#undef thread\n#undef constant\n#undef device\n#undef kernel\n#undef threadgroup\n" + extra_main_cpp
     with tempfile.TemporaryDirectory(prefix="ln-msl-") as tmp:
         cpp_path = Path(tmp) / "kernel.cpp"
         bin_path = Path(tmp) / "kernel_runner"
@@ -953,11 +991,12 @@ def compile_and_check_metal_module(clangxx: str, msl_text: str, extra_main_cpp: 
                 clangxx,
                 "-std=c++17",
                 "-O1",
+                "-pthread",
                 "-Wall",
                 "-Wextra",
                 "-Wno-unused-parameter",
                 "-Wno-unused-variable",
-                "-fsanitize=address,undefined",
+                f"-fsanitize={sanitizer}",
                 "-fno-sanitize-recover=all",
                 str(cpp_path),
                 "-o",
@@ -972,6 +1011,7 @@ def compile_and_check_metal_module(clangxx: str, msl_text: str, extra_main_cpp: 
         env = os.environ.copy()
         env["UBSAN_OPTIONS"] = "halt_on_error=1:print_stacktrace=1"
         env["ASAN_OPTIONS"] = "detect_leaks=0:halt_on_error=1"
+        env["TSAN_OPTIONS"] = "halt_on_error=1:second_deadlock_stack=1"
         run = subprocess.run(
             [str(bin_path)],
             capture_output=True,
@@ -988,8 +1028,9 @@ def run_metal_1d_case_vectors(
     kernel_name: str,
     arity: int,
     vectors: list[dict[str, Any]],
+    check_tsan: bool = True,
 ) -> tuple[int, list[list[int]], str]:
-    """Compile a lowered Metal 1D kernel once for all test vectors and execute over an over-provisioned grid."""
+    """Compile a lowered Metal 1D kernel once for all test vectors and execute concurrent `std::thread` grid lanes under ASan+UBSan and TSan."""
     lines = ["int main() {"]
     for vi, vec in enumerate(vectors):
         ins: list[list[int]] = vec["inputs"]
@@ -999,18 +1040,28 @@ def run_metal_1d_case_vectors(
             lines.append(f"  std::vector<metal::ulong> in_{vi}_{j} = {{{init_vals}}};")
         lines.append(f"  std::vector<metal::ulong> out_{vi}({max(1, n)}, 0ULL);")
         lines.append(f"  const metal::ulong len_{vi} = {n}ULL;")
-        # Launch n + 3 threads to exercise the `gid < n` SIMT guard under ASan!
+        # Launch n + 3 concurrent std::thread lanes to exercise both `gid < n` bounds under ASan/UBSan and cross-lane race freedom under TSan!
         call_args = [f"in_{vi}_{j}.data()" for j in range(arity)] + [f"out_{vi}.data()", f"len_{vi}", "gid"]
-        lines.append(f"  for (metal::uint gid = 0; gid < {n + 3}u; ++gid) {{")
-        lines.append(f"    {kernel_name}({', '.join(call_args)});")
+        lines.append("  {")
+        lines.append("    std::vector<std::thread> grid_threads;")
+        lines.append(f"    grid_threads.reserve({n + 3}u);")
+        lines.append(f"    for (metal::uint gid = 0; gid < {n + 3}u; ++gid) {{")
+        lines.append(f"      grid_threads.emplace_back([&, gid]() {{ {kernel_name}({', '.join(call_args)}); }});")
+        lines.append("    }")
+        lines.append("    for (auto& th : grid_threads) th.join();")
         lines.append("  }")
         lines.append(f'  std::printf("VEC {vi}:");')
         lines.append(f"  for (size_t i = 0; i < {n}; ++i) std::printf(\" %llu\", (unsigned long long)out_{vi}[i]);")
         lines.append('  std::printf("\\n");')
     lines.append("  return 0;\n}")
-    rc, stdout, stderr = compile_and_check_metal_module(clangxx, msl_text, "\n".join(lines))
+    main_cpp = "\n".join(lines)
+    rc, stdout, stderr = compile_and_check_metal_module(clangxx, msl_text, main_cpp, sanitizer="address,undefined")
     if rc != 0:
         return rc, [], stderr
+    if check_tsan:
+        tsan_rc, _, tsan_err = compile_and_check_metal_module(clangxx, msl_text, main_cpp, sanitizer="thread")
+        if tsan_rc != 0:
+            return tsan_rc, [], tsan_err
     results: list[list[int]] = []
     for line in stdout.strip().splitlines():
         if line.startswith("VEC "):
@@ -1103,12 +1154,18 @@ int main() {
     if (d.l0 != a.l0 || d.l1 != a.l1 || d.l2 != a.l2 || d.l3 != a.l3) return 3;
     if (ln_clmul64(0x87ULL, 0x87ULL) != (0x87ULL ^ (0x87ULL << 1) ^ (0x87ULL << 2) ^ (0x87ULL << 7))) return 4;
 
-    // 2. Execute SNARK F_{2^128} butterfly kernel over 4 lanes
+    // 2. Execute SNARK F_{2^128} butterfly kernel concurrently across 6 std::thread lanes
     metal::ulong2 top[4] = { {1, 2}, {3, 4}, {5, 6}, {7, 8} };
     metal::ulong2 bot[4] = { {9, 10}, {11, 12}, {13, 14}, {15, 16} };
     const metal::ulong2 tw_ident = { 1ULL, 0ULL };
-    for (metal::uint gid = 0; gid < 6u; ++gid) {
-        lean_native_kernel_ntt_butterfly_f128(top, bot, tw_ident, 4ULL, gid);
+    {
+        std::vector<std::thread> ts;
+        for (metal::uint gid = 0; gid < 6u; ++gid) {
+            ts.emplace_back([&, gid]() {
+                lean_native_kernel_ntt_butterfly_f128(top, bot, tw_ident, 4ULL, gid);
+            });
+        }
+        for (auto& t : ts) t.join();
     }
     // For gid=0, tw=(1,0) is multiplicative identity in F_{2^128}: p = bot[0] = (9,10),
     // top'[0] = (1^9, 2^10) = (8, 8), bot'[0] = (8^9, 8^10) = (1, 2).
@@ -1125,9 +1182,10 @@ int main() {
     return 0;
 }
 """
-    rc, _, err = compile_and_check_metal_module(clangxx, prod_metal, harness)
-    if rc != 0:
-        raise RuntimeError(f"Production emitMetalModule ASan/UBSan check failed (rc={rc}):\n{err}")
+    for san in ("address,undefined", "thread"):
+        rc, _, err = compile_and_check_metal_module(clangxx, prod_metal, harness, sanitizer=san)
+        if rc != 0:
+            raise RuntimeError(f"Production emitMetalModule {san} check failed (rc={rc}):\n{err}")
 
     fc_harness = r"""
 int main() {
@@ -1136,20 +1194,27 @@ int main() {
     metal::atomic_uint sat_cnt(0u);
     metal::atomic_uint cex_flag(0u);
     ln_u256 witness[2] = {};
-    for (metal::uint gid = 0; gid < 4u; ++gid) {
-        lean_native_fastcheck_metal_kernel(seed, rounds, &sat_cnt, &cex_flag, witness, gid);
+    {
+        std::vector<std::thread> ts;
+        for (metal::uint gid = 0; gid < 4u; ++gid) {
+            ts.emplace_back([&, gid]() {
+                lean_native_fastcheck_metal_kernel(seed, rounds, &sat_cnt, &cex_flag, witness, gid);
+            });
+        }
+        for (auto& t : ts) t.join();
     }
     return (sat_cnt.load() == 32u) ? 0 : 7;
 }
 """
-    fc_rc, _, fc_err = compile_and_check_metal_module(clangxx, prod_fastcheck, fc_harness)
-    if fc_rc != 0:
-        raise RuntimeError(f"Production emitFastCheckMetal ASan/UBSan check failed (rc={fc_rc}):\n{fc_err}")
+    for san in ("address,undefined", "thread"):
+        fc_rc, _, fc_err = compile_and_check_metal_module(clangxx, prod_fastcheck, fc_harness, sanitizer=san)
+        if fc_rc != 0:
+            raise RuntimeError(f"Production emitFastCheckMetal {san} check failed (rc={fc_rc}):\n{fc_err}")
 
-    return {"u256ClmulSnarkBlake3Verified": True, "fastCheckMetalVerified": True}
+    return {"u256ClmulSnarkBlake3Verified": True, "fastCheckMetalVerified": True, "tsanGridRaceVerified": True}
 
 
-def run_m6_mlir_mutant_check(prod_tpu_mlir: str) -> None:
+def run_m6_mlir_mutant_check(prod_tpu_mlir: str) -> int:
     """Verify OpenXLA `eval_module` executes an extracted TPU v6e vector op and rejects M6 shift swap."""
     fn_mlir = """
 module @m6_probe {
@@ -1171,6 +1236,7 @@ module @m6_probe {
     if neg_words == pos_words:
         raise RuntimeError("M6 shift swap mutant was not killed by OpenXLA eval_module")
     verify_stablehlo_mlir_module(prod_tpu_mlir)
+    return 1
 
 
 def run_suite_from_payload(
@@ -1181,8 +1247,15 @@ def run_suite_from_payload(
 ) -> dict[str, Any]:
     prod = payload["productionModules"]
     ptx_prod_summary = run_production_ptx_checks(ptxas_bin, prod["ptxModule"])
-    run_m6_mlir_mutant_check(prod["stablehloTpuModule"])
+    m6_probe_killed = run_m6_mlir_mutant_check(prod["stablehloTpuModule"])
     metal_prod_summary = run_production_metal_checks(clangxx, prod["metalModule"], prod["metalFastCheckModule"])
+
+    if len(payload["ptxCases"]) < 10:
+        raise RuntimeError(f"Expected >= 10 PTX differential cases, got {len(payload['ptxCases'])}")
+    if len(payload["stablehloCases"]) < 8:
+        raise RuntimeError(f"Expected >= 8 StableHLO differential cases, got {len(payload['stablehloCases'])}")
+    if len(payload["metalCases"]) < 9:
+        raise RuntimeError(f"Expected >= 9 Metal differential cases, got {len(payload['metalCases'])}")
 
     ptx_vectors_checked = 0
     ptx_mutants_killed = 0
@@ -1191,6 +1264,8 @@ def run_suite_from_payload(
         kname = case["kernelName"]
         arity = case["arity"]
         ptx_text = case["ptxText"]
+        if not case["vectors"]:
+            raise RuntimeError(f"[PTX:{cid}] empty test vector list")
         rc, log = compile_ptx_with_ptxas(ptxas_bin, ptx_text, arch="sm_90")
         if rc != 0:
             raise RuntimeError(f"[PTX:{cid}] ptxas -Werror failed:\n{log}")
@@ -1218,10 +1293,12 @@ def run_suite_from_payload(
             ptx_mutants_killed += 1
 
     hlo_vectors_checked = 0
-    hlo_mutants_killed = 0
+    hlo_case_mutants_killed = 0
     for case in payload["stablehloCases"]:
         cid = case["id"]
         mlir_text = case["mlirText"]
+        if not case["vectors"]:
+            raise RuntimeError(f"[StableHLO:{cid}] empty test vector list")
         for vec in case["vectors"]:
             exp = vec["expected"]
             got_shape, _, got_words = eval_stablehlo_with_openxla(mlir_text, vec["args"])
@@ -1248,7 +1325,7 @@ def run_suite_from_payload(
                 raise RuntimeError(
                     f"[StableHLO:{cid}] Negative mutant ({case.get('negativeMutantReason')}) was NOT killed!"
                 )
-            hlo_mutants_killed += 1
+            hlo_case_mutants_killed += 1
 
     metal_vectors_checked = 0
     metal_mutants_killed = 0
@@ -1258,9 +1335,11 @@ def run_suite_from_payload(
         arity = case["arity"]
         msl_text = case["mslText"]
         vecs = case["vectors"]
+        if not vecs:
+            raise RuntimeError(f"[Metal:{cid}] empty test vector list")
         rc, outs, err = run_metal_1d_case_vectors(clangxx, msl_text, kname, arity, vecs)
         if rc != 0:
-            raise RuntimeError(f"[Metal:{cid}] clang++ ASan/UBSan execution failed (rc={rc}):\n{err}")
+            raise RuntimeError(f"[Metal:{cid}] clang++ ASan/UBSan/TSan execution failed (rc={rc}):\n{err}")
         for vec, got in zip(vecs, outs):
             if got != vec["expected"]:
                 raise RuntimeError(f"[Metal:{cid}] Metal host mismatch: got {got}, expected {vec['expected']}")
@@ -1282,7 +1361,9 @@ def run_suite_from_payload(
         "ptxMutantsKilled": ptx_mutants_killed,
         "stablehloCases": len(payload["stablehloCases"]),
         "stablehloVectorsChecked": hlo_vectors_checked,
-        "stablehloMutantsKilled": hlo_mutants_killed + 1,  # +1 for M6 shift swap probe
+        "stablehloCaseMutantsKilled": hlo_case_mutants_killed,
+        "stablehloM6ProbeKilled": m6_probe_killed,
+        "stablehloMutantsKilled": hlo_case_mutants_killed + m6_probe_killed,
         "metalCases": len(payload["metalCases"]),
         "metalVectorsChecked": metal_vectors_checked,
         "metalMutantsKilled": metal_mutants_killed,
@@ -1363,6 +1444,47 @@ kernel void k_div(
         bad_msl = msl.replace("(in1[(ulong)gid] == 0UL) ? 0UL : (in0[(ulong)gid] / in1[(ulong)gid])", "in0[(ulong)gid] / in1[(ulong)gid]")
         bad_rc, _, _ = run_metal_1d_case_vectors(clangxx, bad_msl, "k_div", 2, vecs)
         self.assertNotEqual(bad_rc, 0, "UBSan must trap on unguarded Metal division by zero")
+
+        # Verify concurrent std::thread + TSan harness catches an intentional cross-lane data race.
+        race_msl = msl.replace("out[(ulong)gid] =", "out[0UL] =")
+        race_vecs = [{"inputs": [[18, 7, 9, 3], [3, 1, 3, 1]], "expected": [6, 7, 3, 3]}]
+        race_rc, _, _ = run_metal_1d_case_vectors(clangxx, race_msl, "k_div", 2, race_vecs, check_tsan=True)
+        self.assertNotEqual(race_rc, 0, "TSan must trap on concurrent cross-lane write race")
+
+    def test_stablehlo_isolated_bootstrap_and_eval(self) -> None:
+        cache_dir = Path(os.environ.get("GPU_TPU_TOOLS_CACHE", "/tmp/tl-gpu-tpu-tools"))
+        try:
+            ensure_openxla_stablehlo(cache_dir)
+        except ImportError:
+            with tempfile.TemporaryDirectory(prefix="ln-shlo-missing-") as empty_dir:
+                with self.assertRaises(RuntimeError):
+                    _eval_stablehlo_isolated("module @m {}", [], Path(empty_dir))
+            self.skipTest("OpenXLA stablehlo wheel not cached locally")
+
+        sub_mlir = """module @mod_sub {
+  func.func @f(%a: tensor<ui64>, %b: tensor<ui64>) -> tensor<ui64> {
+    %0 = stablehlo.subtract %a, %b : tensor<ui64>
+    return %0 : tensor<ui64>
+  }
+}
+"""
+        args = [{"shape": [], "elem": "ui64", "words": [9]}, {"shape": [], "elem": "ui64", "words": [4]}]
+        rc_ok, out_ok = _eval_stablehlo_isolated(sub_mlir, args, cache_dir)
+        self.assertEqual(rc_ok, 0)
+        self.assertEqual(out_ok, ([], "ui64", [5]))
+
+        # H1-style operand swap returns rc=0 with a genuinely diverged tensor value (not an AttributeError!)
+        swap_mlir = sub_mlir.replace("%a, %b", "%b, %a")
+        rc_sw, out_sw = _eval_stablehlo_isolated(swap_mlir, args, cache_dir)
+        self.assertEqual(rc_sw, 0)
+        assert out_sw is not None
+        self.assertNotEqual(out_sw[2], [5])
+
+        # H3-style unguarded division by zero traps cleanly inside the isolated child without killing parent
+        div_mlir = sub_mlir.replace("stablehlo.subtract", "stablehlo.divide")
+        div0_args = [{"shape": [], "elem": "ui64", "words": [18]}, {"shape": [], "elem": "ui64", "words": [0]}]
+        rc_d0, out_d0 = _eval_stablehlo_isolated(div_mlir, div0_args, cache_dir)
+        self.assertTrue(rc_d0 != 0 or (out_d0 is not None and out_d0[2] != [0]))
 
 
 def main() -> int:
