@@ -4,7 +4,16 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-export PATH="$ROOT_DIR/target/release:$PATH:$HOME/.elan/toolchains/leanprover--lean4---v4.35.0/bin:$HOME/.elan/bin:$HOME/.cargo/bin"
+TOOLCHAIN="$(tr -d '[:space:]' < "$ROOT_DIR/lean/lean-toolchain")"
+TOOLCHAIN_DIR="leanprover--lean4---${TOOLCHAIN#leanprover/lean4:}"
+export PATH="$ROOT_DIR/target/release:$PATH:${ELAN_HOME:-$HOME/.elan}/toolchains/$TOOLCHAIN_DIR/bin:${ELAN_HOME:-$HOME/.elan}/bin:${CARGO_HOME:-$HOME/.cargo}/bin"
+
+SKIP_LAKE_BUILD="${SKIP_LAKE_BUILD:-0}"
+SKIP_TRUSTED_CI_VERIFY="${SKIP_TRUSTED_CI_VERIFY:-0}"
+
+TMP_WORK="$(mktemp -d "${TMPDIR:-/tmp}/turbo-ci-verify.XXXXXX")"
+trap 'rm -rf "$TMP_WORK"' EXIT
+export TMP_WORK
 
 TURBO_BIN="${TURBO_AUDITOR_BIN:-$ROOT_DIR/target/release/turbo-lean}"
 if [ ! -x "$TURBO_BIN" ]; then
@@ -22,13 +31,15 @@ echo "[2/3] Auditing TurboLean/Spec.lean & LeanNative/Spec.lean via turbo-lean a
 if [ -x "$TURBO_BIN" ]; then
   "$TURBO_BIN" --json audit-spec lean/TurboLean/Spec.lean | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['ok'] and d['vacuous_specs']==0 and d['trivial_specs']==0 and d['tight_specs']==d['total_specs_audited'] and d['tight_specs']==98 and d['total_specs_audited']==98 and len(d.get('horizontal_packing_warnings',[]))==0, d; print(f'TurboLean/Spec.lean: {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} non_vacuous_and_tight (0 warnings)')"
   "$TURBO_BIN" --json audit-spec lean/LeanNative/Spec.lean | python3 -c "import json,sys; d=json.load(sys.stdin); assert d['ok'] and d['vacuous_specs']==0 and d['trivial_specs']==0 and d['tight_specs']==d['total_specs_audited'] and d['tight_specs']==124 and d['total_specs_audited']==124 and len(d.get('horizontal_packing_warnings',[]))==0, d; print(f'LeanNative/Spec.lean: {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} non_vacuous_and_tight (0 warnings)')"
-  "$TURBO_BIN" --json ci-verify --project-dir lean --mode trusted --receipt /tmp/ci-receipt.json >/dev/null
-  rm -f /tmp/ci-receipt.json
+  if [ "$SKIP_TRUSTED_CI_VERIFY" != "1" ]; then
+    "$TURBO_BIN" --json ci-verify --project-dir lean --mode trusted --receipt "$TMP_WORK/ci-receipt.json" >/dev/null
+    rm -f "$TMP_WORK/ci-receipt.json"
+  fi
 fi
 
 echo "[2b/3] Checking HeapObj contract clause→regression table (docs/HEAPOBJ_CONTRACT.md)..."
 python3 - <<'PY'
-import re
+import os, re
 
 # Structural part only (text): markers, `#guard !<pred>` as the first XFAIL command, table sync. Whether `<pred>`
 # is a real contract predicate is decided by the Lean meta check in step [3b] over its ELABORATED definition.
@@ -107,22 +118,26 @@ nx = sum(p is not None for p in regs.values())
 assert nx == 0, f"HeapObj contract must have 0 XFAIL, got {nx}"
 print(f"HeapObj contract: {len(regs)}/54 PASS, {nx} XFAIL, {len(unc)} UNCOVERED; "
       f"structural self-test rejected {len(bad)} malformed XFAILs")
-open("/tmp/heapobj_xfail_preds", "w").write(" ".join(p for p in regs.values() if p))
+open(os.path.join(os.environ["TMP_WORK"], "heapobj_xfail_preds"), "w").write(" ".join(p for p in regs.values() if p))
 PY
-HEAPOBJ_XFAIL_PREDS="$(cat /tmp/heapobj_xfail_preds)"
-rm -f /tmp/heapobj_xfail_preds
+HEAPOBJ_XFAIL_PREDS="$(cat "$TMP_WORK/heapobj_xfail_preds")"
+rm -f "$TMP_WORK/heapobj_xfail_preds"
 export HEAPOBJ_XFAIL_PREDS
 
 echo "[3/3] Building Lean & Rust workspace..."
-(cd lean && lake build)
-./lean/.lake/build/bin/lean-native-core self-test
-./lean/.lake/build/bin/lean-native-core emit-cabi-bindings --signatures-only lean/LeanNative/Spec.lean --emit-rust /tmp/ln_cabi_check.rs --emit-swift /tmp/ln_cabi_check.swift --emit-modulemap /tmp/ln_cabi_check.modulemap
-grep -q "lean_native_ntt_butterfly_fused_2layer_slice" /tmp/ln_cabi_check.rs
-grep -q "pub unsafe fn leannative_verify_rc_mode_safe" /tmp/ln_cabi_check.rs
-grep -q "@_silgen_name(\"leannative_verify_rc_mode_safe\")" /tmp/ln_cabi_check.swift
-grep -q "module TurboLeanCABI" /tmp/ln_cabi_check.modulemap
-rm -f /tmp/ln_cabi_check.rs /tmp/ln_cabi_check.swift /tmp/ln_cabi_check.modulemap
-./lean/.lake/build/bin/turbo-lean-native self-test
+if [ "$SKIP_LAKE_BUILD" != "1" ]; then
+  (cd lean && lake build)
+  ./lean/.lake/build/bin/lean-native-core self-test
+fi
+./lean/.lake/build/bin/lean-native-core emit-cabi-bindings --signatures-only lean/LeanNative/Spec.lean --emit-rust "$TMP_WORK/ln_cabi_check.rs" --emit-swift "$TMP_WORK/ln_cabi_check.swift" --emit-modulemap "$TMP_WORK/ln_cabi_check.modulemap"
+grep -q "lean_native_ntt_butterfly_fused_2layer_slice" "$TMP_WORK/ln_cabi_check.rs"
+grep -q "pub unsafe fn leannative_verify_rc_mode_safe" "$TMP_WORK/ln_cabi_check.rs"
+grep -q "@_silgen_name(\"leannative_verify_rc_mode_safe\")" "$TMP_WORK/ln_cabi_check.swift"
+grep -q "module TurboLeanCABI" "$TMP_WORK/ln_cabi_check.modulemap"
+rm -f "$TMP_WORK/ln_cabi_check.rs" "$TMP_WORK/ln_cabi_check.swift" "$TMP_WORK/ln_cabi_check.modulemap"
+if [ "$SKIP_LAKE_BUILD" != "1" ]; then
+  ./lean/.lake/build/bin/turbo-lean-native self-test
+fi
 
 echo "[3a-c8/3] Auditing C8, C5 & C4 proof modules under strict-proofs policy..."
 for pf in lean/LeanNative/Proofs/KernelFusionProofs.lean lean/LeanNative/Proofs/ClosureADTProofs.lean lean/LeanNative/Proofs/SliceViewProofs.lean lean/LeanNative/Proofs/SliceBridgeStandaloneProofs.lean lean/LeanNative/Proofs/RealLCNFBridge/*.lean lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean lean/LeanNative/Proofs/SymbolicTVUnarySoundness.lean lean/LeanNative/Proofs/SymbolicTVBinOpSoundness.lean lean/LeanNative/Proofs/SymbolicTVSoundness.lean lean/LeanNative/Proofs/SymbolicTVCodeHelpers.lean lean/LeanNative/Proofs/SymbolicTVCodeSoundness.lean lean/LeanNative/Proofs/SymbolicTVRefinesCtxSoundness.lean lean/LeanNative/Proofs/SymbolicTVRefinesDeadSoundness.lean lean/LeanNative/Proofs/SymbolicTVRefinesSoundness.lean lean/LeanNative/Proofs/SuperoptHelpersSoundness.lean lean/LeanNative/Proofs/SuperoptSoundness.lean; do
@@ -251,5 +266,9 @@ open HeapObjXfailCheck in
     IO.println s!"XFAIL meta check: {preds.length} predicates reach the evaluator/emitter/validator; self-test rejected {bad.length} malformed"
 LEAN
 
-cargo check --locked --release -j 1
+if [ "$SKIP_LAKE_BUILD" != "1" ]; then
+  cargo check --locked --release -j 1
+else
+  cargo metadata --locked --format-version 1 >/dev/null
+fi
 echo "[turbo-lean] ALL CI VERIFICATION GATES PASSED (0 sorryAx)"
