@@ -3093,19 +3093,6 @@ pub(super) fn audit_single_decl_spec_with_defs(
     (res, pos_w, neg_w)
 }
 
-#[allow(dead_code)]
-pub(super) fn audit_single_decl_spec_full(
-    decl: &ExtractedDecl,
-    local_defs: &[LocalDefUnfolding],
-) -> ((bool, bool, String), String, String, Vec<String>) {
-    let (res, pos_w, neg_w, drop_hyps, _) = audit_single_decl_spec_full_with_policy(
-        decl,
-        local_defs,
-        &AuditSpecPolicyConfig::default(),
-    );
-    (res, pos_w, neg_w, drop_hyps)
-}
-
 #[allow(clippy::type_complexity)]
 pub(super) fn audit_single_decl_spec_full_with_policy(
     decl: &ExtractedDecl,
