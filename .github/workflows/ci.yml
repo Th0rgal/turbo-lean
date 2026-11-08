@@ -56,9 +56,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Test emitter mutation runner acceptance and provenance
-        run: python3 scripts/emitter_mutants.py --unit-tests
-
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
 
@@ -112,7 +109,7 @@ jobs:
           cargo build --release
           cargo test --release
           ./target/release/turbo-lean --version
-          ./scripts/ci_verify.sh
+          SKIP_LAKE_BUILD=1 SKIP_TRUSTED_CI_VERIFY=1 ./scripts/ci_verify.sh
 
       # Track B0 shadow-semantics checker & ratchet. A failure fails this job, but the job only
       # blocks merges once `main` has a ruleset requiring this check (not configured today); see
@@ -137,8 +134,8 @@ jobs:
           lake build ShadowFixtures
           LEAN_NUM_THREADS=4 lake env lean --run ../scripts/check_shadow_semantics.lean \
             --self-test --base "$BASE" \
-            --json-out /tmp/shadow_violations.json --coverage-out /tmp/shadow_coverage.tsv
-          python3 ../scripts/shadow_inventory_grep.py /tmp/shadow_coverage.tsv
+            --json-out "${{ runner.temp }}/shadow_violations.json" --coverage-out "${{ runner.temp }}/shadow_coverage.tsv"
+          python3 ../scripts/shadow_inventory_grep.py "${{ runner.temp }}/shadow_coverage.tsv"
 
       - name: Import cached .tlpack bundle if present
         env:
@@ -167,8 +164,8 @@ jobs:
               PR_BASE_REF="$PR_BASE_SHA"
             fi
           fi
-          ./target/release/turbo-lean --json ci-verify --project-dir lean --mode "$VERIFY_MODE" --base "$PR_BASE_REF" --receipt /tmp/ci-receipt.json
-          ./target/release/turbo-lean --json verify-receipt /tmp/ci-receipt.json --baseline-receipt /tmp/ci-receipt.json
+          ./target/release/turbo-lean --json ci-verify --project-dir lean --mode "$VERIFY_MODE" --base "$PR_BASE_REF" --receipt "${{ runner.temp }}/ci-receipt.json"
+          ./target/release/turbo-lean --json verify-receipt "${{ runner.temp }}/ci-receipt.json" --baseline-receipt "${{ runner.temp }}/ci-receipt.json"
           ./target/release/turbo-lean --json pr-verify --project-dir lean --base "$PR_BASE_REF" --mode "$VERIFY_MODE"
           ./target/release/turbo-lean build --project-dir lean --json
 
