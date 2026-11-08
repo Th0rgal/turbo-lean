@@ -742,7 +742,7 @@ def emitStableHLOModule (m : LNIRModule) : String :=
     if !ok then acc
     else
        match extractParForRegions d.body with
-       | [] => acc
+       | [] | (_, _, _, _, .customScalar _ _ _) :: _ => acc
        | (_, _, _, elemTy, firstK) :: _ => acc ++ [emitStableHLODeclFunc s!"decl_{d.name}" elemTy firstK]
   ) []
   String.intercalate "\n\n" ([header] ++ builtinFuncs ++ declFuncs ++ ["}"]) ++ "\n"

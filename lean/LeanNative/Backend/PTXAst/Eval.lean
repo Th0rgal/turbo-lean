@@ -2191,13 +2191,13 @@ def ppPTXOperand : PTXOperand → String
   | .immF64 bits => s!"0d{toHexFixed bits.toNat 16}"
   | .sym s       => s
 
-/-- Render a `PTXAddr` bracketed memory operand. -/
+/-- Render a `PTXAddr` bracketed memory operand (`[%rd+8]` / `[%rd+-8]` per NVIDIA PTX ISA). -/
 def ppPTXAddr : PTXAddr → String
   | .paramSym name => s!"[{name}]"
   | .regOffset r off =>
-    if off = 0 then s!"[{r}]" else if off > 0 then s!"[{r}+{off}]" else s!"[{r}{off}]"
+    if off = 0 then s!"[{r}]" else s!"[{r}+{off}]"
   | .symOffset s off =>
-    if off = 0 then s!"[{s}]" else if off > 0 then s!"[{s}+{off}]" else s!"[{s}{off}]"
+    if off = 0 then s!"[{s}]" else s!"[{s}+{off}]"
 
 /-- Render a `PTXPredGuard` (`@%p1 ` or `@!%p1 `). -/
 def ppPredGuard (g : PTXPredGuard) : String :=
@@ -2456,19 +2456,25 @@ def parsePTXOperand (fuel : Nat) (input : List Char) : Option (PTXOperand × Lis
 
 /-- Address names use the same lexer; offsets are signed decimal byte offsets.
 Zero-offset symbols have the unique `paramSym` representation. -/
+def parsePTXAddrOffset (fuel : Nat) (input : List Char) : Option (Int × List Char) :=
+  match input with
+  | '+' :: '-' :: cs => do
+    let (ds, rest) ← scanPTXName fuel cs
+    return (-(Int.ofNat (← (String.ofList ds).toNat?)), rest)
+  | '+' :: cs => do
+    let (ds, rest) ← scanPTXName fuel cs
+    return (Int.ofNat (← (String.ofList ds).toNat?), rest)
+  | '-' :: cs => do
+    let (ds, rest) ← scanPTXName fuel cs
+    return (-(Int.ofNat (← (String.ofList ds).toNat?)), rest)
+  | _ => some (0, input)
+
 def parsePTXAddr (fuel : Nat) (input : List Char) : Option (PTXAddr × List Char) := do
   let input ← stripPrefixChars ['['] input
   let (chars, rest) ← scanPTXName fuel input
   if chars.isEmpty then none else do
     let name := String.ofList chars
-    let (offset, rest) ← (show Option (Int × List Char) from match rest with
-      | '+' :: cs => do
-        let (ds, rest) ← scanPTXName fuel cs
-        return (Int.ofNat (← (String.ofList ds).toNat?), rest)
-      | '-' :: cs => do
-        let (ds, rest) ← scanPTXName fuel cs
-        return (-(Int.ofNat (← (String.ofList ds).toNat?)), rest)
-      | _ => some (0, rest))
+    let (offset, rest) ← parsePTXAddrOffset fuel rest
     let rest ← stripPrefixChars [']'] rest
     return ((if name.startsWith "%" then .regOffset name offset
       else if offset == 0 then .paramSym name else .symOffset name offset), rest)
@@ -2703,6 +2709,7 @@ def parsePTXKernel (fuel : Nat) (text : String) : Option PTXKernel := do
 #guard parsePTXOperand 32 "18446744073709551616;".toList = none
 #guard parsePTXOperand 32 "-12]".toList = some (.immS64 (-12), [']'])
 #guard parsePTXOperand 32 "0f80000000;".toList = some (.immF32 2147483648, [';'])
+#guard parsePTXAddr 32 "[%rd1+-8],".toList = some (.regOffset "%rd1" (-8), [','])
 #guard parsePTXAddr 32 "[%rd1-8],".toList = some (.regOffset "%rd1" (-8), [','])
 #guard parsePTXStmt 32 "    @!%p1 sub.u64 %rd2, %rd1, 1;".toList =
   some (.instr (some { predReg := "%p1", negated := true })

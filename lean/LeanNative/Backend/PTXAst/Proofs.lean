@@ -544,7 +544,7 @@ theorem parsePTXAddr_reg_zero_roundtrip (name : String)
   have hs := scanPTXName_append name.toList (']' :: rest) fuel hn.2
     (Or.inr ⟨']', rest, rfl, rfl⟩) hf
   have hne : name ≠ "" := by intro h; exact hn.1 (by simp [h])
-  simp [parsePTXAddr, ppPTXAddr, toString, String.toList_append, List.append_assoc,
+  simp [parsePTXAddr, parsePTXAddrOffset, ppPTXAddr, toString, String.toList_append, List.append_assoc,
     stripPrefixChars, hs, hne]
   simpa using hp
 
@@ -716,7 +716,7 @@ theorem parsePTXInstr_ldParam_roundtrip (ty : PTXType) (dst name : String)
   have hnonempty : name ≠ "" := by intro h; exact hn.1.1 (by simp [h])
   have ha : parsePTXAddr (fuel + 1) ('[' :: (name.toList ++ ']' :: ';' :: rest)) =
       some (.paramSym name, ';' :: rest) := by
-    simp [parsePTXAddr, stripPrefixChars, hs, hnonempty]
+    simp [parsePTXAddr, parsePTXAddrOffset, stripPrefixChars, hs, hnonempty]
     simpa using hp
   have hne := ptxTypedToken_ne "ld.param" ty (by decide)
   have hfields := congrArg (List.map String.ofList) (ptxOpcodeFields_typed "ld.param".toList ty)
@@ -775,7 +775,7 @@ theorem parsePTXAddr_param_roundtrip (name : String)
   have hs := scanPTXName_append name.toList (']' :: rest) fuel hn.2
     (Or.inr ⟨']', rest, rfl, rfl⟩) hf
   have hne : name ≠ "" := by intro h; exact hn.1 (by simp [h])
-  simp [parsePTXAddr, ppPTXAddr, toString, String.toList_append, List.append_assoc,
+  simp [parsePTXAddr, parsePTXAddrOffset, ppPTXAddr, toString, String.toList_append, List.append_assoc,
     stripPrefixChars, hs, hne]
   simpa using hp
 
@@ -796,8 +796,7 @@ theorem parsePTXAddr_offset_roundtrip (name : String) (offset : Int)
     (fuel : Nat) (hf : name.toList.length < fuel)
     (ho : offset.natAbs.repr.toList.length < fuel) :
     parsePTXAddr fuel
-      ((if offset = 0 then s!"[{name}]"
-        else if offset > 0 then s!"[{name}+{offset}]" else s!"[{name}{offset}]").toList ++ rest) =
+      ((if offset = 0 then s!"[{name}]" else s!"[{name}+{offset}]").toList ++ rest) =
       some ((if name.startsWith "%" then .regOffset name offset
         else if offset = 0 then .paramSym name else .symOffset name offset), rest) := by
   have hne : name ≠ "" := by intro h; exact hn.1 (by simp [h])
@@ -807,7 +806,7 @@ theorem parsePTXAddr_offset_roundtrip (name : String) (offset : Int)
     | zero =>
       have hs := scanPTXName_append name.toList (']' :: rest) fuel hn.2
         (Or.inr ⟨']', _, rfl, rfl⟩) hf
-      simp [parsePTXAddr, toString, String.toList_append, List.append_assoc,
+      simp [parsePTXAddr, parsePTXAddrOffset, toString, String.toList_append, List.append_assoc,
         stripPrefixChars, hs, hne]
     | succ n =>
       have hz : (n : Int) + 1 ≠ 0 := by omega
@@ -818,20 +817,47 @@ theorem parsePTXAddr_offset_roundtrip (name : String) (offset : Int)
         (Or.inr ⟨'+', _, rfl, rfl⟩) hf
       have hd := scanPTXName_append (n + 1).repr.toList (']' :: rest) fuel
         (natRepr_ptxNameChars _) (Or.inr ⟨']', _, rfl, rfl⟩) ho
+      have hno_minus : ∀ cs, Nat.toDigits 10 (n + 1) ++ ']' :: rest ≠ '-' :: cs := by
+        intro cs hEq
+        cases hrepr : Nat.toDigits 10 (n + 1) with
+        | nil =>
+          rw [hrepr] at hEq; simp at hEq
+        | cons c tl =>
+          have hmem : c ∈ (n + 1).repr.toList := by simp [Nat.toList_repr, hrepr]
+          have hptx := natRepr_ptxNameChars (n + 1) c hmem
+          rw [hrepr] at hEq
+          injection hEq with hc _
+          subst hc
+          exact absurd hptx (by decide)
       simp only [Nat.toList_repr] at hs hd
+      have hoff : parsePTXAddrOffset fuel ('+' :: (Nat.toDigits 10 (n + 1) ++ ']' :: rest)) =
+          some ((n : Int) + 1, ']' :: rest) := by
+        unfold parsePTXAddrOffset
+        split
+        · rename_i cs hEq
+          injection hEq with _ htl
+          exact False.elim (hno_minus cs htl)
+        · rename_i cs _ hEq
+          injection hEq with _ htl
+          rw [← htl]
+          simp [hd, hdigit]
+        · rename_i cs hEq
+          nomatch hEq
+        · rename_i h1 h2 _
+          exact False.elim (h2 (Nat.toDigits 10 (n + 1) ++ ']' :: rest) rfl)
       simp [parsePTXAddr, toString, Int.repr, String.toList_append, List.append_assoc,
-        stripPrefixChars, hs, hd, hne, hz, hdigit]
+        stripPrefixChars, hs, hoff, hne, hz]
   | negSucc n =>
     have hdigit : (String.ofList (Nat.toDigits 10 (n + 1))).toNat? = some (n + 1) :=
       Nat.toNat?_repr (n + 1)
     have hneg : -((n : Int) + 1) = Int.negSucc n := rfl
     have hs := scanPTXName_append name.toList
-      ('-' :: ((n + 1).repr.toList ++ ']' :: rest)) fuel hn.2
-      (Or.inr ⟨'-', _, rfl, rfl⟩) hf
+      ('+' :: '-' :: ((n + 1).repr.toList ++ ']' :: rest)) fuel hn.2
+      (Or.inr ⟨'+', _, rfl, rfl⟩) hf
     have hd := scanPTXName_append (n + 1).repr.toList (']' :: rest) fuel
       (natRepr_ptxNameChars _) (Or.inr ⟨']', _, rfl, rfl⟩) ho
     simp only [Nat.toList_repr] at hs hd
-    simp [parsePTXAddr, toString, Int.repr, String.toList_append, List.append_assoc,
+    simp [parsePTXAddr, parsePTXAddrOffset, toString, Int.repr, String.toList_append, List.append_assoc,
       stripPrefixChars, hs, hd, hne, hdigit, hneg]
 
 theorem parsePTXAddr_roundtrip (a : PTXAddr) (ha : CanonicalPTXAddr a)
@@ -2320,9 +2346,9 @@ theorem ptx_const_store_traps (stmts : List PTXStmt) (cta : PTXCTAState) (th : P
     execNonBarrierInstr stmts cta th (.stConst ty addr src) = .readOnlyWrite .const byteAddr := by
   simp [execNonBarrierInstr, PTXOutcome.bind, h_addr]
 
-/-- Negative register address displacements render as `[%rd-8]` (never invalid `[%rd+-8]`). -/
+/-- Negative register address displacements render as `[%rd+-8]` per NVIDIA PTX `ptxas` grammar. -/
 theorem ppPTXAddr_neg_displacement (r : String) :
-    ppPTXAddr (.regOffset r (-8)) = "[" ++ r ++ "-8]" := by
+    ppPTXAddr (.regOffset r (-8)) = "[" ++ r ++ "+-8]" := by
   have hstr : toString (-8 : Int) = "-8" := rfl
   simp [ppPTXAddr, hstr, String.append_assoc]
   rfl

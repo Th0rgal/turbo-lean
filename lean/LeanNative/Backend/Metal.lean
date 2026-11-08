@@ -287,7 +287,7 @@ def emitMetalModule (m : LNIRModule) : String :=
                          m.decls.any (fun d => d.name == "snark_fast_ntt_btf_u_lo")
   let snarkFastNttKernel := if hasSnarkFastNtt then [
     String.intercalate "\n" [
-      "inline uint4 ln_gf128_mulx(uint4 v) {",
+      "inline uint4 ln_gf128_mulx_ct(uint4 v) {",
       "    uint msb = v.w >> 31u;",
       "    uint4 sh = uint4(v.x << 1u, (v.y << 1u) | (v.x >> 31u), (v.z << 1u) | (v.y >> 31u), (v.w << 1u) | (v.z >> 31u));",
       "    sh.x ^= (0u - msb) & 0x87u;",
@@ -304,9 +304,9 @@ def emitMetalModule (m : LNIRModule) : String :=
       "    uint4 a4 = uint4((uint)a.x, (uint)(a.x >> 32UL), (uint)a.y, (uint)(a.y >> 32UL));",
       "    uint4 b4 = uint4((uint)b.x, (uint)(b.x >> 32UL), (uint)b.y, (uint)(b.y >> 32UL));",
       "    uint4 t1 = a4;",
-      "    uint4 t2 = ln_gf128_mulx(t1);",
-      "    uint4 t4 = ln_gf128_mulx(t2);",
-      "    uint4 t8 = ln_gf128_mulx(t4);",
+      "    uint4 t2 = ln_gf128_mulx_ct(t1);",
+      "    uint4 t4 = ln_gf128_mulx_ct(t2);",
+      "    uint4 t8 = ln_gf128_mulx_ct(t4);",
       "    uint4 tab[16];",
       "    tab[0] = uint4(0u); tab[1] = t1; tab[2] = t2; tab[3] = t1 ^ t2;",
       "    tab[4] = t4; tab[5] = t4 ^ t1; tab[6] = t4 ^ t2; tab[7] = t4 ^ t2 ^ t1;",
