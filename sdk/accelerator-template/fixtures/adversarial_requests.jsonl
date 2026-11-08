@@ -1,0 +1,6 @@
+not-json-at-all
+["unexpected","json","array"]
+{"decl_name":"corrupt_wire_req","target":"x86_64","budget_ms":25,"wire":"LNIR_WIRE_V1|ZZZZ_BAD_HEX|1"}
+{"decl_name":"truncated_wire_req","target":"x86_64","budget_ms":25,"wire":"LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl"}
+{"decl_name":12345,"stmt_src":null,"body_src":{},"available_constants":"not-a-list","budget_ms":-5}
+{}

@@ -1,0 +1,4 @@
+{"decl_name":"sdk_simp_distill","stmt_src":"(a b : Nat) (h1 : a = b) : a + 0 = b","body_src":"by simp [h1]","imports_csv":"Init","available_constants":["Nat.add_zero","h1","Eq","Nat"],"budget_ms":25}
+{"decl_name":"sdk_buggy_strict_lt","stmt_src":"(a b : Nat) : a + b < a","body_src":"by omega","imports_csv":"Init","available_constants":[],"budget_ms":25}
+{"decl_name":"sdk_cut_fission","stmt_src":"(n : Nat) : n + 0 = n","body_src":"by\n  have h1 : n + 0 = n := by rfl\n  have h2 : n = n := by rfl\n  exact h1","imports_csv":"Init","available_constants":[],"budget_ms":25}
+{"decl_name":"sdk_noop_rfl","stmt_src":"(x : UInt64) : x = x","body_src":"by rfl","imports_csv":"Init","available_constants":[],"budget_ms":25}

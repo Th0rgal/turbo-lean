@@ -117,9 +117,23 @@ turbo-lean export -o cache.tlpack && turbo-lean import cache.tlpack
 
 ---
 
+## Contributing Zero-TCB Accelerators & Open Challenges
+
+External tactic accelerators, counterexample finders, and `LNIR_WIRE_V1` superoptimizers run out-of-process over single-line JSONL `stdin`/`stdout` behind `SpeculativeGate` (`untrusted_accelerator_kernel_replay_sound`, `untrusted_opt_plugin_tv_gate_sound`)—no Lean 4 compiler build is needed to author or validate a plugin:
+
+```bash
+python3 sdk/accelerator-template/validate.py
+TURBO_LEAN_ACCELERATORS_CONFIG=sdk/accelerator-template/accelerators.example.json turbo-lean accelerators
+```
+
+See [`sdk/accelerator-template/`](sdk/accelerator-template/README.md) for the zero-dependency starter kit and [`roadmap/OPEN_CHALLENGES.md`](roadmap/OPEN_CHALLENGES.md) for Track A (zero-TCB plugins) and Track B (`G1`–`G5` core verification) challenges.
+
+---
+
 ## Repository Layout
 
 - [`lean/TurboLean/`](lean/TurboLean/) — Incremental verification specs, C-ABI policy gates (`PolicyGates.lean`, `Spec.lean`), statement hashing, in-kernel axiom inspector, and warm `ZygoteWorker`.
 - [`lean/LeanNative/`](lean/LeanNative/) — Verified `LNIR` compiler: `LCNF` bridge (`IR/`, `Frontend/`), verified optimization & superoptimization passes (`Transform/`), operational semantics (`Semantics/`), Target-IR ASTs & emitters (`Backend/`), and machine-checked soundness proofs (`Proofs/`).
 - [`crates/turbo-lean/`](crates/turbo-lean/) — Rust CLI, MCP server, DAG module scheduler, `bwrap` sandboxed PR verifier, CAS/Zygote orchestrator, and C-ABI bridge.
-- [`roadmap/`](roadmap/README.md) — North-Star goals ([`GOALS.md`](roadmap/GOALS.md)), cheat-proof theorem contracts ([`VALIDATION_CONTRACTS.md`](roadmap/VALIDATION_CONTRACTS.md)), 3-way differential conformance ([`CONFORMANCE_SUITE.md`](roadmap/CONFORMANCE_SUITE.md)), and Maxwell oracle pointer ([`MAXWELL_STRATEGIES.md`](roadmap/MAXWELL_STRATEGIES.md)).
+- [`sdk/accelerator-template/`](sdk/accelerator-template/README.md) & [`plugins/`](plugins/) — Zero-TCB JSONL-stdio accelerator & `LNIR` superoptimizer starter kit, offline validator (`validate.py`), and domain plugin examples.
+- [`roadmap/`](roadmap/README.md) — North-Star goals ([`GOALS.md`](roadmap/GOALS.md)), open contributor challenges ([`OPEN_CHALLENGES.md`](roadmap/OPEN_CHALLENGES.md)), cheat-proof theorem contracts ([`VALIDATION_CONTRACTS.md`](roadmap/VALIDATION_CONTRACTS.md)), 3-way differential conformance ([`CONFORMANCE_SUITE.md`](roadmap/CONFORMANCE_SUITE.md)), and Maxwell oracle pointer ([`MAXWELL_STRATEGIES.md`](roadmap/MAXWELL_STRATEGIES.md)).

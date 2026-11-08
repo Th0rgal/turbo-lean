@@ -46,6 +46,7 @@ jobs:
           python3 scripts/run_gpu_tpu_diff.py --self-test
           python3 scripts/check_lnsym_bridge_sync.py --self-test
           python3 scripts/check_lnsym_bridge_sync.py
+          python3 sdk/accelerator-template/validate.py
       - id: plan
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
