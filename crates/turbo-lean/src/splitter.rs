@@ -1685,6 +1685,7 @@ pub(crate) fn source_may_read_host_state(src: &str) -> bool {
     }
     const QUALIFIED_HOST_READS: &[&str] = &[
         "IO.FS",
+        "IO.Prim",
         "IO.Process",
         "System.Process",
         "IO.getEnv",
@@ -1738,14 +1739,17 @@ pub(crate) fn source_may_read_host_state(src: &str) -> bool {
     {
         return true;
     }
-    let has_open_io_or_sys = unquoted.lines().any(|line| {
+    let has_open_or_ns_io_or_sys = unquoted.lines().any(|line| {
         let t = line.trim_start();
-        (t.starts_with("open ") || t.contains(" open "))
+        (t.starts_with("open ")
+            || t.contains(" open ")
+            || t.starts_with("namespace ")
+            || t.contains(" namespace "))
             && (contains_lean_ident_segment(t, "IO")
                 || contains_lean_ident_segment(t, "System")
                 || contains_lean_ident_segment(t, "DateTime"))
     });
-    if has_open_io_or_sys
+    if has_open_or_ns_io_or_sys
         && ["getEnv", "Process", "rand", "getStdin", "stdin", "now"]
             .iter()
             .any(|seg| contains_lean_ident_segment(&unquoted, seg))
@@ -1765,52 +1769,54 @@ pub(crate) fn source_may_read_host_state(src: &str) -> bool {
             }
         }
     }
-    if contains_lean_word(&unquoted, "include_str") {
+    for kw in ["include_str?", "include_str", "include_bin?", "include_bin"] {
+        if !contains_lean_ident_segment(&unquoted, kw) {
+            continue;
+        }
         let mut search_from = 0usize;
-        while let Some(rel_idx) = comment_free[search_from..].find("include_str") {
+        while let Some(rel_idx) = comment_free[search_from..].find(kw) {
             let idx = search_from + rel_idx;
-            search_from = idx + "include_str".len();
+            search_from = idx + kw.len();
             let prev_ok = idx == 0
                 || !comment_free[..idx]
                     .chars()
                     .next_back()
-                    .is_some_and(|c| is_lean_id_rest(c) || c == '.');
-            if !prev_ok {
+                    .is_some_and(|c| is_lean_id_rest(c) || c == '»');
+            let next_ok = search_from >= comment_free.len()
+                || !comment_free[search_from..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| is_lean_id_rest(c) || c == '«');
+            if !prev_ok || !next_ok {
                 continue;
             }
-            let tail = &comment_free[search_from..];
-            let expr_end = tail.find('\n').unwrap_or(tail.len());
-            let line = &tail[..expr_end];
-            let mut in_str = false;
-            let mut cur_lit = String::new();
-            let mut lits = Vec::new();
-            let mut chars = line.chars().peekable();
-            while let Some(ch) = chars.next() {
-                if in_str {
-                    if ch == '\\' {
-                        if let Some(esc) = chars.next() {
-                            cur_lit.push(esc);
-                        }
-                    } else if ch == '"' {
-                        in_str = false;
-                        lits.push(std::mem::take(&mut cur_lit));
-                    } else {
-                        cur_lit.push(ch);
-                    }
-                } else if ch == '"' {
-                    in_str = true;
-                }
-            }
-            if lits.is_empty() {
+            let Some(lits) = parse_include_literal_segments(&comment_free[search_from..]) else {
                 return true;
-            }
+            };
             let mut up_count = 0usize;
             for (k, lit) in lits.iter().enumerate() {
                 if (k == 0 && (lit.starts_with('/') || lit.starts_with('\\') || lit.contains(':')))
                     || lit.split(['/', '\\']).any(|seg| seg == "..")
                 {
-                    if lit == ".." {
-                        up_count += 1;
+                    let segs: Vec<&str> = lit
+                        .split(['/', '\\'])
+                        .filter(|seg| !seg.is_empty())
+                        .collect();
+                    if !(k == 0
+                        && (lit.starts_with('/') || lit.starts_with('\\') || lit.contains(':')))
+                        && segs.iter().any(|&seg| seg == "..")
+                    {
+                        let mut depth = 0isize;
+                        let mut min_depth = 0isize;
+                        for seg in segs {
+                            if seg == ".." {
+                                depth -= 1;
+                                min_depth = min_depth.min(depth);
+                            } else if seg != "." {
+                                depth += 1;
+                            }
+                        }
+                        up_count += (-min_depth) as usize;
                     } else {
                         return true;
                     }
@@ -1822,6 +1828,114 @@ pub(crate) fn source_may_read_host_state(src: &str) -> bool {
         }
     }
     false
+}
+
+/// Parses every `include_str` / `include_str?` / `include_bin` / `include_bin?` call in
+/// `src_raw` into its joined `PathBuf` literal argument. Returns `None` if any call uses a
+/// non-literal expression (interpolation, variable, macro, or unclosed string).
+pub(crate) fn extract_include_relative_paths(src_raw: &str) -> Option<Vec<std::path::PathBuf>> {
+    let comment_free = strip_lean_comments(src_raw);
+    let clean = strip_string_literals_inner(&comment_free, true);
+    let unquoted = clean.replace(['«', '»'], "");
+    let mut out = Vec::new();
+    for kw in ["include_str?", "include_str", "include_bin?", "include_bin"] {
+        if !contains_lean_ident_segment(&unquoted, kw) {
+            continue;
+        }
+        let mut search_from = 0usize;
+        while let Some(rel_idx) = comment_free[search_from..].find(kw) {
+            let idx = search_from + rel_idx;
+            search_from = idx + kw.len();
+            let prev_ok = idx == 0
+                || !comment_free[..idx]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| is_lean_id_rest(c) || c == '»');
+            let next_ok = search_from >= comment_free.len()
+                || !comment_free[search_from..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| is_lean_id_rest(c) || c == '«');
+            if !prev_ok || !next_ok {
+                continue;
+            }
+            let lits = parse_include_literal_segments(&comment_free[search_from..])?;
+            let mut p = std::path::PathBuf::new();
+            for (k, lit) in lits.iter().enumerate() {
+                if k == 0 && (lit.starts_with('/') || lit.starts_with('\\') || lit.contains(':')) {
+                    return None;
+                }
+                p.push(lit);
+            }
+            out.push(p);
+        }
+    }
+    Some(out)
+}
+
+fn parse_include_literal_segments(tail: &str) -> Option<Vec<String>> {
+    let mut chars = tail.chars().peekable();
+    let mut lits = Vec::new();
+    let mut paren_depth = 0usize;
+    let mut expecting_seg = true;
+    while let Some(&ch) = chars.peek() {
+        if ch.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if expecting_seg {
+            if ch == '(' {
+                paren_depth += 1;
+                chars.next();
+                continue;
+            }
+            if ch != '"' {
+                return None;
+            }
+            chars.next();
+            let mut lit = String::new();
+            let mut closed = false;
+            while let Some(sc) = chars.next() {
+                if sc == '\\' {
+                    match chars.next()? {
+                        'n' => lit.push('\n'),
+                        'r' => lit.push('\r'),
+                        't' => lit.push('\t'),
+                        '\\' => lit.push('\\'),
+                        '"' => lit.push('"'),
+                        '\'' => lit.push('\''),
+                        _ => return None,
+                    }
+                } else if sc == '"' {
+                    closed = true;
+                    break;
+                } else {
+                    lit.push(sc);
+                }
+            }
+            if !closed {
+                return None;
+            }
+            lits.push(lit);
+            expecting_seg = false;
+        } else if ch == ')' && paren_depth > 0 {
+            paren_depth -= 1;
+            chars.next();
+        } else if ch == '/' {
+            chars.next();
+            if chars.peek() == Some(&'/') {
+                return None;
+            }
+            expecting_seg = true;
+        } else {
+            break;
+        }
+    }
+    if expecting_seg || paren_depth != 0 || lits.is_empty() {
+        None
+    } else {
+        Some(lits)
+    }
 }
 
 fn contains_word(haystack: &str, word: &str) -> bool {
@@ -14281,6 +14395,43 @@ public def api := by
         assert!(source_may_read_host_state(
             "open IO in\nelab \"read_env\" : term => do\n  let _ ← getEnv \"SECRET\"\n  return Lean.mkNatLit 0\n"
         ));
+        assert!(source_may_read_host_state(
+            "def absBin : ByteArray := Lean.include_bin \"/etc/hostname\"\n"
+        ));
+        assert!(!source_may_read_host_state(
+            "def relBin : ByteArray := include_bin \"..\" / \"build\" / \"w.bin\"\n"
+        ));
+        assert!(!source_may_read_host_state(
+            "def relSol : String := include_str \"../Data/a.sol\"\n"
+        ));
+        assert!(source_may_read_host_state(
+            "def escapeSingleLit : String := include_str \"../../../secret.txt\"\n"
+        ));
+        assert!(source_may_read_host_state(
+            "namespace IO\nelab \"ns_env\" : term => do\n  let k := \"SECRET\"\n  let _ ← getEnv k\n  return Lean.mkNatLit 0\nend IO\n"
+        ));
+        assert!(source_may_read_host_state(
+            "def multilineAbs : String := include_str\n  \"/etc/hostname\"\n"
+        ));
+        assert!(source_may_read_host_state(
+            "def multilineEscape : String := include_str \"..\" /\n  \"..\" / \"..\" / \"secret.txt\"\n"
+        ));
+        assert!(!source_may_read_host_state(
+            "def multilineRel : String := include_str\n  \"..\" /\n  \"Data\" / \"a.sol\"\n"
+        ));
+        assert_eq!(
+            extract_include_relative_paths(
+                "def a := include_str\n  \"..\" /\n  \"Data\" / \"a.sol\"\ndef b := Lean.include_bin (\"../Data/b.bin\")\n"
+            ),
+            Some(vec![
+                std::path::PathBuf::from("../Data/a.sol"),
+                std::path::PathBuf::from("../Data/b.bin"),
+            ])
+        );
+        assert_eq!(
+            extract_include_relative_paths("def dyn (p : System.FilePath) := include_str p\n"),
+            None
+        );
     }
 }
 

@@ -4139,8 +4139,26 @@ pub(crate) fn lake_refresh_targets(canon_dir: &Path, modules: &[String]) -> Vec<
     let any_matching_exe = modules
         .iter()
         .any(|m| !crate::module_builder::exe_targets_for_module(&cfg, m).is_empty());
+    let qualify_non_root_mod = |m: &str| -> String {
+        if m.starts_with('+')
+            || m.starts_with('@')
+            || m.contains('/')
+            || crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, m).is_some()
+        {
+            return m.to_string();
+        }
+        if cfg
+            .dep_pkgs
+            .iter()
+            .any(|dp| crate::module_builder::resolve_module_in_package(dp, false, m).is_some())
+        {
+            format!("+{m}")
+        } else {
+            m.to_string()
+        }
+    };
     if !any_inputs && !any_matching_exe {
-        return modules.to_vec();
+        return modules.iter().map(|m| qualify_non_root_mod(m)).collect();
     }
     let mut input_lib_targets: Vec<String> = Vec::new();
     let mut other_targets: Vec<String> = Vec::new();
@@ -4153,7 +4171,7 @@ pub(crate) fn lake_refresh_targets(canon_dir: &Path, modules: &[String]) -> Vec<
         let exes = crate::module_builder::exe_targets_for_module(&cfg, m);
         input_lib_targets.extend(libs.iter().cloned());
         if libs.is_empty() && exes.is_empty() {
-            other_targets.push(m.clone());
+            other_targets.push(qualify_non_root_mod(m));
         } else {
             other_targets.extend(exes);
         }
@@ -6210,10 +6228,9 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                                 || !crate::module_builder::input_bearing_exes_for_module(&cfg, m)
                                     .is_empty()
                                 || spec_has_include_str
-                                || (!cfg.root_pkg.inputs.is_empty()
-                                    && fs::read_to_string(&n.src_path)
-                                        .map(|s| crate::module_builder::source_uses_include_str(&s))
-                                        .unwrap_or(false))
+                                || fs::read_to_string(&n.src_path)
+                                    .map(|s| crate::module_builder::source_uses_include_str(&s))
+                                    .unwrap_or(false)
                             {
                                 Some(m.clone())
                             } else {
@@ -10546,6 +10563,22 @@ mod tests {
             lake_refresh_targets(&plain, &["P.A".to_string(), "Main".to_string()]),
             vec!["@plain/runner:exe".to_string(), "P.A".to_string()],
             "a lean_exe root module must translate to @<pkg>/<exe>:exe so Lake relinks the binary"
+        );
+        let dep_dir = plain.join(".lake/packages/dep");
+        fs::create_dir_all(dep_dir.join("Dep"))?;
+        fs::write(
+            dep_dir.join("lakefile.toml"),
+            "name = \"dep\"\n[[lean_lib]]\nname = \"Dep\"\nglobs = [\"Dep.+\"]\n",
+        )?;
+        fs::write(dep_dir.join("Dep/D.lean"), "def dVal : Nat := 1\n")?;
+        fs::write(
+            plain.join("lake-manifest.json"),
+            "{\"version\":\"1.1.0\",\"packagesDir\":\".lake/packages\",\"packages\":[{\"type\":\"path\",\"name\":\"dep\",\"dir\":\".lake/packages/dep\"}]}\n",
+        )?;
+        assert_eq!(
+            lake_refresh_targets(&plain, &["Dep.D".to_string()]),
+            vec!["+Dep.D".to_string()],
+            "a dependency module without input-bearing libs must be qualified with `+` so Lake builds it"
         );
         let _ = fs::remove_dir_all(&plain);
         let _ = fs::remove_dir_all(&proj);
