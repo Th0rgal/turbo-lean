@@ -258,6 +258,8 @@ pub struct PackageConfig {
     #[serde(default)]
     pub inputs: Vec<InputTargetConfig>,
     pub config_digest: String,
+    #[serde(default)]
+    pub(crate) pre_recipe_config_digest: String,
     /// Why turbo-lean cannot build this dependency's modules like Lake (a compile-affecting
     /// setting it does not mirror). A root package fails to parse instead; a dependency can
     /// still be used through Lake's own fresh build outputs.
@@ -3396,6 +3398,7 @@ fn parse_lakefile_toml_inner(
         custom_targets: Vec::new(),
         inputs: Vec::new(),
         config_digest: String::new(),
+        pre_recipe_config_digest: String::new(),
         unsupported: None,
         native_unsupported: None,
         link_unsupported: None,
@@ -5573,6 +5576,7 @@ fn parse_lakefile_lean_inner(
         custom_targets: Vec::new(),
         inputs: Vec::new(),
         config_digest: String::new(),
+        pre_recipe_config_digest: String::new(),
         unsupported: pkg_unsupported,
         native_unsupported: None,
         link_unsupported: None,
@@ -7068,6 +7072,7 @@ fn finalize_package_config(
         check_allowed_opts(opts, &format!("{scope}.leanOptions"))?;
     }
     pkg.config_digest = compute_package_config_digest(pkg, raw_hash);
+    pkg.pre_recipe_config_digest = pkg.config_digest.clone();
     Ok(())
 }
 
@@ -7121,6 +7126,111 @@ fn resolve_package_config_file(
 /// and dependency packages in `.lake/packages/*`).
 pub fn resolve_project_config(project_dir: &Path) -> Result<ProjectConfig> {
     resolve_project_config_with_trust(project_dir, false)
+}
+
+pub(crate) fn compute_canonical_project_config_digest(
+    toolchain: &str,
+    lean_githash: &str,
+    root_pkg: &PackageConfig,
+    manifest_hash_opt: Option<&str>,
+    manifest_packages: &[ManifestPackageEntry],
+    dep_pkgs: &[PackageConfig],
+) -> String {
+    let mut ch = blake3::Hasher::new();
+    ch.update(b"turbo-lean-project-config-v3\n");
+    update_hasher_lp(&mut ch, crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+    update_hasher_lp(&mut ch, toolchain.as_bytes());
+    update_hasher_lp(&mut ch, lean_githash.as_bytes());
+    update_hasher_lp(&mut ch, root_pkg.config_digest.as_bytes());
+    match manifest_hash_opt {
+        Some(mh) => {
+            ch.update(&[1]);
+            update_hasher_lp(&mut ch, mh.as_bytes());
+        }
+        None => {
+            ch.update(&[0]);
+        }
+    }
+    ch.update(&(manifest_packages.len() as u64).to_le_bytes());
+    for mp in manifest_packages {
+        update_hasher_lp(&mut ch, mp.name.as_bytes());
+        match mp.rev {
+            Some(ref rev) => {
+                ch.update(&[1]);
+                update_hasher_lp(&mut ch, rev.as_bytes());
+            }
+            None => {
+                ch.update(&[0]);
+            }
+        }
+    }
+    ch.update(&(dep_pkgs.len() as u64).to_le_bytes());
+    for dp in dep_pkgs {
+        update_hasher_lp(&mut ch, dp.name.as_bytes());
+        update_hasher_lp(&mut ch, dp.base_name.as_bytes());
+        update_hasher_lp(&mut ch, dp.config_digest.as_bytes());
+    }
+    ch.finalize().to_hex().to_string()
+}
+
+pub(crate) fn fold_materialized_recipe_config_digests<'a>(
+    root_pkg_root: &Path,
+    base_canonical_config_digest: &str,
+    pkgs: impl Iterator<Item = &'a mut PackageConfig>,
+    is_untrusted: bool,
+) -> String {
+    let mut pkgs: Vec<&mut PackageConfig> = pkgs.collect();
+    if pkgs
+        .iter()
+        .all(|p| required_lake_recipe_names(root_pkg_root, p, is_untrusted).is_empty())
+    {
+        return base_canonical_config_digest.to_string();
+    }
+    let mut workspace = blake3::Hasher::new();
+    workspace.update(b"turbo-lean-lake-recipes-v1\n");
+    for pkg in pkgs.iter_mut() {
+        let names = required_lake_recipe_names(root_pkg_root, pkg, is_untrusted);
+        if names.is_empty() {
+            continue;
+        }
+        let mut digest = blake3::Hasher::new();
+        update_hasher_lp(&mut digest, pkg.pre_recipe_config_digest.as_bytes());
+        for name in &names {
+            if let Some(inp) = pkg.inputs.iter().find(|i| &i.name == name) {
+                update_hasher_lp(&mut digest, name.as_bytes());
+                update_hasher_lp(&mut digest, inp.path.as_os_str().as_encoded_bytes());
+                update_hasher_lp(&mut digest, inp.blake3.as_bytes());
+            }
+        }
+        pkg.config_digest = digest.finalize().to_hex().to_string();
+        update_hasher_lp(&mut workspace, pkg.config_digest.as_bytes());
+    }
+    let native_digest = workspace.finalize();
+    let mut canonical = blake3::Hasher::new();
+    update_hasher_lp(&mut canonical, base_canonical_config_digest.as_bytes());
+    update_hasher_lp(&mut canonical, native_digest.as_bytes());
+    let out_canonical = canonical.finalize().to_hex().to_string();
+    for pkg in pkgs.iter_mut() {
+        let mut digest = blake3::Hasher::new();
+        update_hasher_lp(&mut digest, pkg.config_digest.as_bytes());
+        update_hasher_lp(&mut digest, native_digest.as_bytes());
+        pkg.config_digest = digest.finalize().to_hex().to_string();
+    }
+    out_canonical
+}
+
+pub(crate) fn assign_manifest_dep_base_name(
+    dep_cfg: &mut PackageConfig,
+    manifest_name: &str,
+    raw_cfg_bytes: &[u8],
+) {
+    let assigned = clean_lake_ident(manifest_name);
+    if !assigned.is_empty() && assigned != dep_cfg.base_name {
+        dep_cfg.base_name = assigned;
+        let raw_hash = blake3::hash(raw_cfg_bytes).to_hex().to_string();
+        dep_cfg.config_digest = compute_package_config_digest(dep_cfg, &raw_hash);
+        dep_cfg.pre_recipe_config_digest = dep_cfg.config_digest.clone();
+    }
 }
 
 /// Resolve the full workspace `ProjectConfig` with explicit `is_untrusted` policy.
@@ -7213,6 +7323,7 @@ pub fn resolve_project_config_with_trust(
                         .map(|b| blake3::hash(&b).to_hex().to_string())
                         .unwrap_or_default();
                     dep_cfg.config_digest = compute_package_config_digest(&dep_cfg, &raw_hash);
+                    dep_cfg.pre_recipe_config_digest = dep_cfg.config_digest.clone();
                 }
             }
             dep_pkgs.push(dep_cfg);
@@ -7256,41 +7367,14 @@ pub fn resolve_project_config_with_trust(
             }
         }
     }
-    let mut ch = blake3::Hasher::new();
-    ch.update(b"turbo-lean-project-config-v3\n");
-    update_hasher_lp(&mut ch, crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
-    update_hasher_lp(&mut ch, toolchain.as_bytes());
-    update_hasher_lp(&mut ch, lean_githash.as_bytes());
-    update_hasher_lp(&mut ch, root_pkg.config_digest.as_bytes());
-    match manifest_hash_opt {
-        Some(ref mh) => {
-            ch.update(&[1]);
-            update_hasher_lp(&mut ch, mh.as_bytes());
-        }
-        None => {
-            ch.update(&[0]);
-        }
-    }
-    ch.update(&(manifest_packages.len() as u64).to_le_bytes());
-    for mp in &manifest_packages {
-        update_hasher_lp(&mut ch, mp.name.as_bytes());
-        match mp.rev {
-            Some(ref rev) => {
-                ch.update(&[1]);
-                update_hasher_lp(&mut ch, rev.as_bytes());
-            }
-            None => {
-                ch.update(&[0]);
-            }
-        }
-    }
-    ch.update(&(dep_pkgs.len() as u64).to_le_bytes());
-    for dp in &dep_pkgs {
-        update_hasher_lp(&mut ch, dp.name.as_bytes());
-        update_hasher_lp(&mut ch, dp.base_name.as_bytes());
-        update_hasher_lp(&mut ch, dp.config_digest.as_bytes());
-    }
-    let canonical_config_digest = ch.finalize().to_hex().to_string();
+    let canonical_config_digest = compute_canonical_project_config_digest(
+        &toolchain,
+        &lean_githash,
+        &root_pkg,
+        manifest_hash_opt.as_deref(),
+        &manifest_packages,
+        &dep_pkgs,
+    );
     let cfg = ProjectConfig {
         toolchain,
         lean_bin,
@@ -13109,7 +13193,7 @@ pub(crate) fn seed_materialized_lake_recipes_into_snapshot_pkg(
     Ok(())
 }
 
-fn required_lake_recipe_names(
+pub(crate) fn required_lake_recipe_names(
     root_pkg_root: &Path,
     pkg: &PackageConfig,
     is_untrusted: bool,
@@ -13142,8 +13226,6 @@ fn materialize_lake_recipes(cfg: &ProjectConfig, is_untrusted: bool) -> Result<P
         return Ok(cfg.clone());
     }
     let mut resolved = cfg.clone();
-    let mut workspace = blake3::Hasher::new();
-    workspace.update(b"turbo-lean-lake-recipes-v1\n");
     for pkg in std::iter::once(&mut resolved.root_pkg).chain(&mut resolved.dep_pkgs) {
         let names = required_lake_recipe_names(&root_pkg_root, pkg, is_untrusted);
         if names.is_empty() {
@@ -13257,8 +13339,6 @@ fn materialize_lake_recipes(cfg: &ProjectConfig, is_untrusted: bool) -> Result<P
             }
             queried
         };
-        let mut digest = blake3::Hasher::new();
-        update_hasher_lp(&mut digest, pkg.config_digest.as_bytes());
         for (name, canonical, hash) in artifacts {
             let target = format!("@{}/{}", pkg.base_name, name);
             let mut input = InputTargetConfig {
@@ -13274,15 +13354,6 @@ fn materialize_lake_recipes(cfg: &ProjectConfig, is_untrusted: bool) -> Result<P
             };
             (input.blake3, input.lake_hash) = hash_input_target(&pkg.pkg_root, &input)?;
             pkg.inputs.push(input);
-            update_hasher_lp(&mut digest, name.as_bytes());
-            update_hasher_lp(
-                &mut digest,
-                canonical
-                    .strip_prefix(&root)?
-                    .as_os_str()
-                    .as_encoded_bytes(),
-            );
-            update_hasher_lp(&mut digest, hash.as_bytes());
             if let Some(ext) = pkg.extern_libs.iter_mut().find(|e| e.name == name) {
                 anyhow::ensure!(
                     canonical
@@ -13295,20 +13366,13 @@ fn materialize_lake_recipes(cfg: &ProjectConfig, is_untrusted: bool) -> Result<P
                 ext.static_artifact_blake3 = Some(hash);
             }
         }
-        pkg.config_digest = digest.finalize().to_hex().to_string();
-        update_hasher_lp(&mut workspace, pkg.config_digest.as_bytes());
     }
-    let native_digest = workspace.finalize();
-    let mut canonical = blake3::Hasher::new();
-    update_hasher_lp(&mut canonical, cfg.canonical_config_digest.as_bytes());
-    update_hasher_lp(&mut canonical, native_digest.as_bytes());
-    resolved.canonical_config_digest = canonical.finalize().to_hex().to_string();
-    for pkg in std::iter::once(&mut resolved.root_pkg).chain(&mut resolved.dep_pkgs) {
-        let mut digest = blake3::Hasher::new();
-        update_hasher_lp(&mut digest, pkg.config_digest.as_bytes());
-        update_hasher_lp(&mut digest, native_digest.as_bytes());
-        pkg.config_digest = digest.finalize().to_hex().to_string();
-    }
+    resolved.canonical_config_digest = fold_materialized_recipe_config_digests(
+        &root_pkg_root,
+        &cfg.canonical_config_digest,
+        std::iter::once(&mut resolved.root_pkg).chain(resolved.dep_pkgs.iter_mut()),
+        is_untrusted,
+    );
     Ok(resolved)
 }
 
