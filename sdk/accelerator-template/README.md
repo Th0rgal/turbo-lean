@@ -64,9 +64,11 @@ Emit `{}` (or `null` / empty line) to abstain, or one `AcceleratorCertificate` (
    {"kind":"counterexample_found","witness_summary":"a = 0, b = 0 violates strict inequality a + b < a","suggested_hypothesis":"h_pos : 0 < b","accelerator_name":"plugin:sdk-template"}
    ```
 3. **Parallel Subgoal Cuts (`subgoal_cuts`)**:
+   Each entry in `cuts` is a standalone, self-contained `sub_decl_source` theorem declaration (`theorem <decl_name> <binders><promoted_hyps> : <cut_ty_or_goal> := <rhs>`) matching `CutFissionAccelerator` (`builtin:cut-fission` in `crates/turbo-lean/src/accelerators.rs`):
    ```json
-   {"kind":"subgoal_cuts","cuts":["have h1 : n + 0 = n := by rfl","have h2 : n = n := by rfl","exact h1"],"accelerator_name":"plugin:sdk-template"}
+   {"kind":"subgoal_cuts","cuts":["theorem sdk_cut_fission (n : Nat) : n + 0 = n := by rfl","theorem sdk_cut_fission (n : Nat) (h1 : n + 0 = n) : n = n := by rfl","theorem sdk_cut_fission (n : Nat) (h1 : n + 0 = n) (h2 : n = n) : n + 0 = n := by\n  exact h1"],"accelerator_name":"plugin:sdk-template"}
    ```
+   > **Host replay status**: `rewritten_proof` certificates from external plugins are speculatively replayed in `crates/turbo-lean/src/check.rs` today, whereas external `subgoal_cuts` certificates are surfaced as advisory `rewrite_suggestions` (`"applied": false`) in `agent-step` (`crates/turbo-lean/src/gpu_fastcheck.rs`) while built-in `fission_theorem_have_blocks` runs `ZygoteWorker` sub-shard replay directly in `check.rs`.
 
 ---
 

@@ -28,6 +28,8 @@ SDK_DIR = Path(__file__).resolve().parent
 FIXTURES_DIR = SDK_DIR / "fixtures"
 DEFAULT_PLUGIN = SDK_DIR / "plugin.py"
 MASK64 = (1 << 64) - 1
+MASK256 = (1 << 256) - 1
+Val = tuple[str, int | bool]
 
 BOUNDARY_U64 = (
     0, 1, 2, 3, 7, 15, 31, 32, 63, 64,
@@ -36,10 +38,22 @@ BOUNDARY_U64 = (
 )
 
 TARGET_COST_PROFILES: dict[str, dict[str, int]] = {
-    "x86_64": {"addSub": 1, "bitwise": 1, "shift": 1, "cmp": 1, "mul": 4, "divMod": 24, "fma": 3, "select": 2},
-    "arm64": {"addSub": 1, "bitwise": 1, "shift": 1, "cmp": 1, "mul": 4, "divMod": 24, "fma": 2, "select": 2},
-    "cuda_ptx": {"addSub": 1, "bitwise": 1, "shift": 1, "cmp": 1, "mul": 5, "divMod": 36, "fma": 2, "select": 2},
-    "apple_metal": {"addSub": 1, "bitwise": 1, "shift": 1, "cmp": 1, "mul": 5, "divMod": 36, "fma": 2, "select": 2},
+    "x86_64": {
+        "addSub": 1, "bitwise": 1, "shift": 1, "cmp": 1, "mul": 4, "divMod": 24,
+        "fma": 3, "select": 2, "clz256": 2, "addSubChecked256": 3, "mulChecked256": 4,
+    },
+    "arm64": {
+        "addSub": 1, "bitwise": 1, "shift": 1, "cmp": 1, "mul": 4, "divMod": 24,
+        "fma": 2, "select": 2, "clz256": 2, "addSubChecked256": 3, "mulChecked256": 4,
+    },
+    "cuda_ptx": {
+        "addSub": 1, "bitwise": 1, "shift": 1, "cmp": 1, "mul": 5, "divMod": 36,
+        "fma": 2, "select": 2, "clz256": 2, "addSubChecked256": 3, "mulChecked256": 5,
+    },
+    "apple_metal": {
+        "addSub": 1, "bitwise": 1, "shift": 1, "cmp": 1, "mul": 5, "divMod": 36,
+        "fma": 2, "select": 2, "clz256": 2, "addSubChecked256": 3, "mulChecked256": 5,
+    },
 }
 
 
@@ -121,8 +135,8 @@ def validate_tactic_certificate(raw_line: str) -> dict | None:
         if set(obj) != req:
             raise ValueError(f"subgoal_cuts keys mismatch: {set(obj)} != {req}")
         cuts = obj["cuts"]
-        if not isinstance(cuts, list) or not cuts or not all(isinstance(c, str) and c.strip() for c in cuts):
-            raise ValueError("subgoal_cuts.cuts must be a non-empty list of non-empty strings")
+        if not isinstance(cuts, list) or len(cuts) < 2 or not all(isinstance(c, str) and c.strip() for c in cuts):
+            raise ValueError("subgoal_cuts.cuts must be a list of >= 2 non-empty strings")
         if not isinstance(obj["accelerator_name"], str) or not obj["accelerator_name"].strip():
             raise ValueError("subgoal_cuts.accelerator_name must be non-empty")
     else:
@@ -147,6 +161,7 @@ class ParsedDecl:
     ret_ty: tuple[str, ...]
     lets: list[tuple[int, tuple[str, ...], ScalarAst]]
     ret_var: int
+    facts: tuple[tuple[str, ...], ...] = ()
 
 
 class Cursor:
@@ -221,6 +236,23 @@ def parse_scalar_ast(cur: Cursor) -> ScalarAst:
     raise ValueError(f"unsupported ScalarExpr tag: {tag!r}")
 
 
+def parse_fact(cur: Cursor) -> tuple[str, ...]:
+    tag = cur.next()
+    if tag in ("F_lt", "F_aln"):
+        return (tag, str(cur.next_nat()), str(cur.next_nat()))
+    if tag in ("F_add", "F_sub", "F_mul"):
+        a = str(cur.next_nat())
+        b = str(cur.next_nat())
+        nsw = "1" if cur.next_bool() else "0"
+        nuw = "1" if cur.next_bool() else "0"
+        return (tag, a, b, nsw, nuw)
+    if tag == "F_disj":
+        return (tag, str(cur.next_nat()), str(cur.next_nat()), str(cur.next_nat()), str(cur.next_nat()))
+    if tag == "F_excl":
+        return (tag, str(cur.next_nat()))
+    raise ValueError(f"unknown RetainedFact tag: {tag!r}")
+
+
 def parse_single_decl_wire(wire: str) -> ParsedDecl:
     cur = Cursor(wire.strip().split("|"))
     if cur.next() != "LNIR_WIRE_V1":
@@ -230,6 +262,8 @@ def parse_single_decl_wire(wire: str) -> ParsedDecl:
         raise ValueError("expected single-declaration LNIRModule")
     name = cur.next_hex()
     assurance = cur.next()
+    if assurance not in ("A_L0", "A_L1", "A_L2", "A_L3", "A_L4", "A_TEST"):
+        raise ValueError(f"unknown AssuranceLevel token: {assurance!r}")
     is_gpu = cur.next_bool()
     plen = cur.next_nat()
     params: list[tuple[int, str, bool, tuple[str, ...]]] = []
@@ -254,72 +288,280 @@ def parse_single_decl_wire(wire: str) -> ParsedDecl:
         if etag != "E_scalar":
             raise ValueError(f"unsupported LNIRExpr tag in template validator: {etag!r}")
         lets.append((dst, ty, parse_scalar_ast(cur)))
+    facts: list[tuple[str, ...]] = []
     if cur.i != len(cur.toks):
-        if cur.toks[cur.i] != "F_facts":
-            raise ValueError(f"unexpected trailing wire tokens: {cur.toks[cur.i:]}")
-    return ParsedDecl(mod_name, name, assurance, is_gpu, params, ret_ty, lets, ret_var)
+        if cur.next() != "F_facts":
+            raise ValueError(f"unexpected trailing wire tokens: {cur.toks[cur.i - 1:]}")
+        flen = cur.next_nat()
+        for _ in range(flen):
+            facts.append(parse_fact(cur))
+    if cur.i != len(cur.toks):
+        raise ValueError(f"unexpected trailing wire tokens after F_facts: {cur.toks[cur.i:]}")
+    return ParsedDecl(mod_name, name, assurance, is_gpu, params, ret_ty, lets, ret_var, tuple(facts))
 
 
-def eval_scalar_ast(node: ScalarAst, env: dict[int, int]) -> int:
+def clmul64(a: int, b: int) -> int:
+    acc = 0
+    for i in range(64):
+        if ((b >> i) & 1) == 1:
+            acc ^= (a << i) & MASK64
+    return acc & MASK64
+
+
+def clmul64_hi(a: int, b: int) -> int:
+    acc = 0
+    for i in range(1, 64):
+        if ((b >> i) & 1) == 1:
+            acc ^= (a >> (64 - i)) & MASK64
+    return acc & MASK64
+
+
+def gf2_affine(x: int, m: int) -> int:
+    xb = x & 0xFF
+    acc = 0
+    for i in range(8):
+        row = (m >> (i * 8)) & 0xFF
+        dot = (row & xb).bit_count() & 1
+        acc |= dot << i
+    return acc
+
+
+def eor3_u64(a: int, b: int) -> int:
+    return (a ^ ((b >> 32) & 0xFFFFFFFF) ^ (b & 0xFFFFFFFF)) & MASK64
+
+
+def to_u256(v: Val) -> int | None:
+    if v[0] in ("u64", "u256"):
+        return int(v[1]) & MASK256
+    return None
+
+
+def eval_bin_op(op: str, v1: Val, v2: Val) -> Val:
+    t1, a = v1
+    t2, b = v2
+    if op == "B_add":
+        if t1 == "u64" and t2 == "u64":
+            return ("u64", (int(a) + int(b)) & MASK64)
+        if t2 == "u64" and int(b) == 0:
+            return v1
+        if t1 == "u64" and int(a) == 0:
+            return v2
+        if t1 == "u256" and t2 == "u256":
+            return ("u256", (int(a) + int(b)) & MASK256)
+    elif op == "B_sub":
+        if t1 == "u64" and t2 == "u64":
+            return ("u64", (int(a) - int(b)) & MASK64)
+        if t2 == "u64" and int(b) == 0:
+            return v1
+        if t1 == "u256" and t2 == "u256":
+            return ("u256", (int(a) - int(b)) & MASK256)
+    elif op == "B_mul":
+        if t1 == "u64" and t2 == "u64":
+            return ("u64", (int(a) * int(b)) & MASK64)
+        if t2 == "u64" and int(b) == 1:
+            return v1
+        if t1 == "u64" and int(a) == 1:
+            return v2
+        if t1 == "u256" and t2 == "u256":
+            return ("u256", (int(a) * int(b)) & MASK256)
+    elif op == "B_div":
+        if t1 == "u64" and t2 == "u64":
+            return ("u64", 0 if int(b) == 0 else (int(a) // int(b)) & MASK64)
+        if t2 == "u64" and int(b) == 1:
+            return v1
+        if t1 == "u256" and t2 == "u256":
+            if int(b) == 0:
+                raise ValueError("divisionByZero")
+            return ("u256", (int(a) // int(b)) & MASK256)
+    elif op == "B_mod":
+        if t1 == "u64" and t2 == "u64":
+            return ("u64", 0 if int(b) == 0 else (int(a) % int(b)) & MASK64)
+        if t1 == "u256" and t2 == "u256":
+            if int(b) == 0:
+                raise ValueError("divisionByZero")
+            return ("u256", (int(a) % int(b)) & MASK256)
+    elif op == "B_bitAnd":
+        if t1 == "u64" and t2 == "u64":
+            return ("u64", int(a) & int(b))
+        if t1 == "u256" and t2 == "u256":
+            return ("u256", int(a) & int(b))
+        if v1 == v2:
+            return v1
+    elif op == "B_bitOr":
+        if t1 == "u64" and t2 == "u64":
+            return ("u64", int(a) | int(b))
+        if t2 == "u64" and int(b) == 0:
+            return v1
+        if t1 == "u64" and int(a) == 0:
+            return v2
+        if t1 == "u256" and t2 == "u256":
+            return ("u256", int(a) | int(b))
+        if v1 == v2:
+            return v1
+    elif op == "B_bitXor":
+        if t1 == "u64" and t2 == "u64":
+            return ("u64", int(a) ^ int(b))
+        if t2 == "u64" and int(b) == 0:
+            return v1
+        if t1 == "u64" and int(a) == 0:
+            return v2
+        if t1 == "u256" and t2 == "u256":
+            return ("u256", int(a) ^ int(b))
+    elif op == "B_shl":
+        if t1 == "u64" and t2 == "u64":
+            return ("u64", (int(a) << (int(b) & 63)) & MASK64)
+        if t2 == "u64" and int(b) == 0:
+            return v1
+        if t1 == "u256" and t2 == "u64":
+            sh = int(b)
+            return ("u256", 0 if sh >= 256 else (int(a) << sh) & MASK256)
+    elif op == "B_shr":
+        if t1 == "u64" and t2 == "u64":
+            return ("u64", (int(a) >> (int(b) & 63)) & MASK64)
+        if t2 == "u64" and int(b) == 0:
+            return v1
+        if t1 == "u256" and t2 == "u64":
+            sh = int(b)
+            return ("u256", 0 if sh >= 256 else (int(a) >> sh) & MASK256)
+    elif op == "B_sar":
+        if t1 == "u64" and t2 == "u64":
+            la = int(a) & MASK64
+            sh = int(b) & 63
+            shifted = la >> sh
+            sign_bit = (la >> 63) & 1
+            res = (shifted | ((MASK64 << (64 - sh)) & MASK64)) if (sign_bit != 0 and sh != 0) else shifted
+            return ("u64", res & MASK64)
+        if t1 == "u256" and t2 == "u64":
+            la = int(a) & MASK256
+            sh = int(b)
+            is_neg = ((la >> 255) & 1) != 0
+            if sh >= 256:
+                return ("u256", MASK256 if is_neg else 0)
+            if sh == 0:
+                return ("u256", la)
+            logical = la >> sh
+            if not is_neg:
+                return ("u256", logical)
+            mask = (1 << 256) - (1 << (256 - sh))
+            return ("u256", (logical | mask) & MASK256)
+    elif op == "B_eq":
+        if (t1 == "u64" and t2 == "u64") or (t1 == "u256" and t2 == "u256") or (t1 == "bool" and t2 == "bool"):
+            return ("bool", a == b)
+    elif op == "B_lt":
+        if (t1 == "u64" and t2 == "u64") or (t1 == "u256" and t2 == "u256"):
+            return ("bool", int(a) < int(b))
+    elif op == "B_le":
+        if (t1 == "u64" and t2 == "u64") or (t1 == "u256" and t2 == "u256"):
+            return ("bool", int(a) <= int(b))
+    elif op == "B_addChecked256":
+        wa, wb = to_u256(v1), to_u256(v2)
+        if wa is not None and wb is not None:
+            if wa + wb > MASK256:
+                raise ValueError("addChecked256 overflow")
+            return ("u256", wa + wb)
+    elif op == "B_subChecked256":
+        wa, wb = to_u256(v1), to_u256(v2)
+        if wa is not None and wb is not None:
+            if wa < wb:
+                raise ValueError("subChecked256 underflow")
+            return ("u256", wa - wb)
+    elif op == "B_mulChecked256":
+        wa, wb = to_u256(v1), to_u256(v2)
+        if wa is not None and wb is not None:
+            if wa * wb > MASK256:
+                raise ValueError("mulChecked256 overflow")
+            return ("u256", wa * wb)
+    elif op in ("B_clmul64", "B_clmul64Hi", "B_gf2Affine", "B_eor3"):
+        if t1 == "u64" and t2 == "u64":
+            la, lb = int(a) & MASK64, int(b) & MASK64
+            if op == "B_clmul64":
+                return ("u64", clmul64(la, lb))
+            if op == "B_clmul64Hi":
+                return ("u64", clmul64_hi(la, lb))
+            if op == "B_gf2Affine":
+                return ("u64", gf2_affine(la, lb))
+            return ("u64", eor3_u64(la, lb))
+    raise ValueError(f"evalBinOp type/op error: {op} on {v1!r}, {v2!r}")
+
+
+def eval_unary_op(op: str, v: Val) -> Val:
+    t, x = v
+    if op == "U_not":
+        if t == "bool":
+            return ("bool", not bool(x))
+        if t == "u64":
+            return ("u64", (~int(x)) & MASK64)
+        if t == "u256":
+            return ("u256", (~int(x)) & MASK256)
+    elif op == "U_neg":
+        if t == "u64":
+            return ("u64", (-int(x)) & MASK64)
+        if t == "u256":
+            return ("u256", (-int(x)) & MASK256)
+    elif op == "U_clz256":
+        w = to_u256(v)
+        if w is not None:
+            return ("u256", 256 if w == 0 else 256 - w.bit_length())
+    raise ValueError(f"evalUnaryOp type/op error: {op} on {v!r}")
+
+
+def eval_scalar_ast(node: ScalarAst, env: dict[int, Val]) -> Val:
     if node.kind == "u64":
-        return int(node.val) & MASK64
+        return ("u64", int(node.val) & MASK64)
     if node.kind == "bool":
-        return 1 if node.val else 0
+        return ("bool", bool(node.val))
     if node.kind == "var":
         idx = int(node.val)
         if idx not in env:
             raise ValueError(f"unbound SSA variable %{idx}")
         return env[idx]
     if node.kind == "un":
-        v = eval_scalar_ast(node.args[0], env)
-        if node.val == "U_not":
-            return (~v) & MASK64
-        if node.val == "U_neg":
-            return (-v) & MASK64
-        raise ValueError(f"unsupported UnaryOp {node.val!r}")
+        return eval_unary_op(str(node.val), eval_scalar_ast(node.args[0], env))
     if node.kind == "sel":
-        c = eval_scalar_ast(node.args[0], env)
-        return eval_scalar_ast(node.args[1] if c != 0 else node.args[2], env)
+        ct, cv = eval_scalar_ast(node.args[0], env)
+        if ct == "bool":
+            take_then = bool(cv)
+        elif ct in ("u64", "u256"):
+            take_then = int(cv) != 0
+        else:
+            raise ValueError(f"select condition must be bool, u64, or u256, got {ct!r}")
+        return eval_scalar_ast(node.args[1] if take_then else node.args[2], env)
     if node.kind == "fma":
-        a = eval_scalar_ast(node.args[0], env)
-        b = eval_scalar_ast(node.args[1], env)
-        c = eval_scalar_ast(node.args[2], env)
-        return ((a * b) + c) & MASK64
+        va = eval_scalar_ast(node.args[0], env)
+        vb = eval_scalar_ast(node.args[1], env)
+        vab = eval_bin_op("B_mul", va, vb)
+        vc = eval_scalar_ast(node.args[2], env)
+        return eval_bin_op("B_add", vab, vc)
     if node.kind == "bin":
         l = eval_scalar_ast(node.args[0], env)
         r = eval_scalar_ast(node.args[1], env)
-        op = node.val
-        if op == "B_add":
-            return (l + r) & MASK64
-        if op == "B_sub":
-            return (l - r) & MASK64
-        if op == "B_mul":
-            return (l * r) & MASK64
-        if op == "B_div":
-            return 0 if r == 0 else (l // r) & MASK64
-        if op == "B_mod":
-            return 0 if r == 0 else (l % r) & MASK64
-        if op == "B_bitAnd":
-            return l & r
-        if op == "B_bitOr":
-            return l | r
-        if op == "B_bitXor":
-            return l ^ r
-        if op == "B_shl":
-            return (l << (r & 63)) & MASK64
-        if op == "B_shr":
-            return (l >> (r & 63)) & MASK64
-        if op == "B_eq":
-            return 1 if l == r else 0
-        if op == "B_lt":
-            return 1 if l < r else 0
-        if op == "B_le":
-            return 1 if l <= r else 0
+        return eval_bin_op(str(node.val), l, r)
     raise ValueError(f"unsupported ScalarAst node: {node}")
 
 
-def eval_decl_u64(decl: ParsedDecl, args: list[int]) -> int:
-    env = {pid: (val & MASK64) for (pid, _n, _b, _t), val in zip(decl.params, args)}
+def param_val_for_type(pty: tuple[str, ...], raw_word: int) -> Val:
+    tag = pty[0]
+    if tag == "T_i1":
+        return ("bool", (raw_word & 1) != 0)
+    if tag == "T_i8":
+        return ("u64", raw_word & 0xFF)
+    if tag == "T_i16":
+        return ("u64", raw_word & 0xFFFF)
+    if tag == "T_i32":
+        return ("u64", raw_word & 0xFFFFFFFF)
+    if tag in ("T_u256", "T_i256"):
+        w0 = raw_word & MASK64
+        w1 = splitmix64(w0 ^ 1)
+        w2 = splitmix64(w0 ^ 2)
+        w3 = splitmix64(w0 ^ 3)
+        return ("u256", w0 | (w1 << 64) | (w2 << 128) | (w3 << 192))
+    if tag == "T_unit":
+        return ("unit", 0)
+    return ("u64", raw_word & MASK64)
+
+
+def eval_decl_val(decl: ParsedDecl, args: list[int]) -> Val:
+    env = {pid: param_val_for_type(pty, val) for (pid, _n, _b, pty), val in zip(decl.params, args)}
     for dst, _ty, expr in decl.lets:
         env[dst] = eval_scalar_ast(expr, env)
     if decl.ret_var not in env:
@@ -331,18 +573,23 @@ def scalar_expr_cost(node: ScalarAst, profile: dict[str, int]) -> int:
     if node.kind in ("u64", "bool", "var"):
         return 0
     if node.kind == "un":
-        return 1 + scalar_expr_cost(node.args[0], profile)
+        op_cost = profile["clz256"] if node.val == "U_clz256" else profile["bitwise"]
+        return op_cost + scalar_expr_cost(node.args[0], profile)
     if node.kind == "sel":
         return profile["select"] + sum(scalar_expr_cost(a, profile) for a in node.args)
     if node.kind == "fma":
         return profile["fma"] + sum(scalar_expr_cost(a, profile) for a in node.args)
     if node.kind == "bin":
         op = str(node.val)
-        sub = scalar_expr_cost(node.args[0], profile) + scalar_expr_cost(node.args[1], profile)
+        lhs, rhs = node.args
+        sub = scalar_expr_cost(lhs, profile) + scalar_expr_cost(rhs, profile)
+        dup_penalty = 1 if (op == "B_add" and lhs == rhs) else 0
         if op in ("B_add", "B_sub"):
-            return profile["addSub"] + sub
-        if op in ("B_bitAnd", "B_bitOr", "B_bitXor"):
+            return profile["addSub"] + dup_penalty + sub
+        if op in ("B_bitAnd", "B_bitOr", "B_bitXor", "B_eor3"):
             return profile["bitwise"] + sub
+        if op in ("B_clmul64", "B_clmul64Hi", "B_gf2Affine"):
+            return 1 + sub
         if op in ("B_shl", "B_shr", "B_sar"):
             return profile["shift"] + sub
         if op in ("B_eq", "B_lt", "B_le"):
@@ -351,7 +598,11 @@ def scalar_expr_cost(node: ScalarAst, profile: dict[str, int]) -> int:
             return profile["mul"] + sub
         if op in ("B_div", "B_mod"):
             return profile["divMod"] + sub
-    return 4
+        if op in ("B_addChecked256", "B_subChecked256"):
+            return profile["addSubChecked256"] + sub
+        if op == "B_mulChecked256":
+            return profile["mulChecked256"] + sub
+    raise ValueError(f"unsupported ScalarAst cost node: {node}")
 
 
 def decl_scalar_cost(decl: ParsedDecl, target: str) -> int:
@@ -386,10 +637,10 @@ def verify_opt_plugin_gate_64(src: ParsedDecl, cand: ParsedDecl, target: str) ->
                 vec.append(BOUNDARY_U64[(state_idx + p_idx * 5) % len(BOUNDARY_U64)])
             else:
                 vec.append(splitmix64(state_idx * 131 + p_idx * 17 + 1))
-        v_src = eval_decl_u64(src, vec)
-        v_cand = eval_decl_u64(cand, vec)
+        v_src = eval_decl_val(src, vec)
+        v_cand = eval_decl_val(cand, vec)
         if v_src != v_cand:
-            raise ValueError(f"64-state equivalence mismatch on {vec}: src={v_src} != cand={v_cand}")
+            raise ValueError(f"64-state equivalence mismatch on {vec}: src={v_src!r} != cand={v_cand!r}")
     c_before = decl_scalar_cost(src, target)
     c_after = decl_scalar_cost(cand, target)
     if c_after > c_before:
@@ -429,6 +680,7 @@ class AcceleratorSdkTestSuite(unittest.TestCase):
             validate_accelerator_config_dict({"enabled": True, "bogus_field": 1})
 
     def test_02_tactic_accelerator_fixtures(self) -> None:
+        is_default = self.plugin_cmd == [sys.executable, str(DEFAULT_PLUGIN)]
         lines = (FIXTURES_DIR / "tactic_requests.jsonl").read_text(encoding="utf-8").splitlines()
         seen_kinds: set[str] = set()
         saw_abstain = False
@@ -443,7 +695,12 @@ class AcceleratorSdkTestSuite(unittest.TestCase):
                 saw_abstain = True
             else:
                 seen_kinds.add(cert["kind"])
-        if self.plugin_cmd == [sys.executable, str(DEFAULT_PLUGIN)]:
+                if is_default and cert["kind"] == "subgoal_cuts":
+                    expected_prefix = f"theorem {req['decl_name']}"
+                    for shard in cert["cuts"]:
+                        self.assertTrue(shard.startswith(expected_prefix), shard)
+                        self.assertIn(":=", shard)
+        if is_default:
             self.assertEqual(seen_kinds, {"rewritten_proof", "counterexample_found", "subgoal_cuts"})
             self.assertTrue(saw_abstain)
 
@@ -471,7 +728,6 @@ class AcceleratorSdkTestSuite(unittest.TestCase):
             self.assertGreaterEqual(strict_improvements, 2)
             self.assertGreaterEqual(abstentions, 1)
 
-        # Verify our gate itself kills an unsound ALU corruption mutant (B_add -> B_sub).
         sample_req = json.loads(lines[0])
         src_sample = parse_single_decl_wire(sample_req["wire"])
         corrupt_wire = sample_req["wire"].replace("|B_mul|", "|B_sub|", 1)
@@ -479,12 +735,81 @@ class AcceleratorSdkTestSuite(unittest.TestCase):
         with self.assertRaises(ValueError):
             verify_opt_plugin_gate_64(src_sample, corrupt_decl, "x86_64")
 
+        self.assertEqual(eval_unary_op("U_not", ("bool", True)), ("bool", False))
+        self.assertEqual(eval_unary_op("U_not", ("bool", False)), ("bool", True))
+        self.assertEqual(eval_bin_op("B_sar", ("u64", 1 << 63), ("u64", 4)), ("u64", 0xF800000000000000))
+        self.assertEqual(eval_bin_op("B_sar", ("u64", 1 << 63), ("u64", 0)), ("u64", 1 << 63))
+        var0 = ScalarAst("var", 0)
+        var1 = ScalarAst("var", 1)
+        self.assertEqual(scalar_expr_cost(ScalarAst("bin", "B_add", (var0, var0)), TARGET_COST_PROFILES["x86_64"]), 2)
+        self.assertEqual(scalar_expr_cost(ScalarAst("bin", "B_add", (var0, var1)), TARGET_COST_PROFILES["x86_64"]), 1)
+        valid_facts_decl = parse_single_decl_wire(
+            sample_req["wire"] + "|F_facts|2|F_lt|0|1|F_add|0|1|1|0"
+        )
+        self.assertEqual(len(valid_facts_decl.facts), 2)
+        with self.assertRaises(ValueError):
+            parse_single_decl_wire(sample_req["wire"] + "|F_facts|not_a_nat")
+        with self.assertRaises(ValueError):
+            parse_single_decl_wire(sample_req["wire"] + "|F_facts|1|F_excl|0|EXTRA_TOKEN")
+
+        if self.plugin_cmd == [sys.executable, str(DEFAULT_PLUGIN)]:
+            bool_wire = (
+                "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|626f6f6c5f6e6f6f70|A_L2|0|"
+                "1|0|62|0|T_i1|T_i1|C_let|1|T_i1|E_scalar|S_un|U_not|S_var|0|C_ret|1"
+            )
+            b_out, b_to = run_single_stdio_request(
+                self.plugin_cmd,
+                json.dumps({"decl_name": "bool_noop", "target": "x86_64", "budget_ms": 50, "wire": bool_wire}),
+                timeout_ms=1000,
+            )
+            self.assertFalse(b_to)
+            self.assertIsNone(extract_wire_response(b_out or ""))
+
+            rhs_fma_wire = (
+                "LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|7268735f666d61|A_L2|0|"
+                "3|0|61|0|T_i64|1|62|0|T_i64|2|63|0|T_i64|T_i64|"
+                "C_let|3|T_i64|E_scalar|S_bin|B_add|S_var|0|S_var|0|"
+                "C_let|4|T_i64|E_scalar|S_bin|B_mul|S_var|1|S_var|2|"
+                "C_let|5|T_i64|E_scalar|S_bin|B_add|S_var|3|S_var|4|C_ret|5"
+            )
+            f_out, f_to = run_single_stdio_request(
+                self.plugin_cmd,
+                json.dumps({"decl_name": "rhs_fma", "target": "arm64", "budget_ms": 50, "wire": rhs_fma_wire}),
+                timeout_ms=1000,
+            )
+            self.assertFalse(f_to)
+            f_cand_wire = extract_wire_response(f_out or "")
+            self.assertIsNotNone(f_cand_wire)
+            f_src = parse_single_decl_wire(rhs_fma_wire)
+            f_cand = parse_single_decl_wire(f_cand_wire or "")
+            c0, c1 = verify_opt_plugin_gate_64(f_src, f_cand, "arm64")
+            self.assertLess(c1, c0)
+            self.assertIn("|S_fma|S_var|1|S_var|2|S_var|3|", f_cand_wire or "")
+
     def test_04_malformed_and_adversarial_inputs_fail_safe(self) -> None:
         adv_lines = [
             ln for ln in (FIXTURES_DIR / "adversarial_requests.jsonl").read_text(encoding="utf-8").splitlines()
             if ln.strip()
         ]
-        if self.plugin_cmd == [sys.executable, str(DEFAULT_PLUGIN)]:
+        is_default = self.plugin_cmd == [sys.executable, str(DEFAULT_PLUGIN)]
+        for ln in adv_lines:
+            out_line, timed_out = run_single_stdio_request(self.plugin_cmd, ln, timeout_ms=500)
+            self.assertFalse(timed_out)
+            if out_line:
+                self.assertIsNone(validate_tactic_certificate(out_line))
+        if is_default:
+            for bad_budget in (False, True):
+                b_line = json.dumps({
+                    "decl_name": "bool_budget_tactic",
+                    "stmt_src": "(a b : Nat) (h1 : a = b) : a + 0 = b",
+                    "body_src": "by simp [h1]",
+                    "imports_csv": "Init",
+                    "available_constants": ["Nat.add_zero", "h1"],
+                    "budget_ms": bad_budget,
+                })
+                out_line, timed_out = run_single_stdio_request(self.plugin_cmd, b_line, timeout_ms=500)
+                self.assertFalse(timed_out)
+                self.assertIsNone(validate_tactic_certificate(out_line or ""))
             proc = subprocess.Popen(
                 self.plugin_cmd,
                 stdin=subprocess.PIPE,
@@ -498,12 +823,6 @@ class AcceleratorSdkTestSuite(unittest.TestCase):
             self.assertEqual(len(resp_lines), len(adv_lines))
             for ln in resp_lines:
                 self.assertIsNone(validate_tactic_certificate(ln))
-        else:
-            for ln in adv_lines:
-                out_line, timed_out = run_single_stdio_request(self.plugin_cmd, ln, timeout_ms=500)
-                self.assertFalse(timed_out)
-                if out_line:
-                    self.assertIsNone(validate_tactic_certificate(out_line))
 
     def test_05_timeout_and_kill_isolation(self) -> None:
         hang_cmd = [sys.executable, str(DEFAULT_PLUGIN), "--simulate-hang-ms", "5000"]

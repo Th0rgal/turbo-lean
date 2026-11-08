@@ -101,6 +101,9 @@ class WireCursor:
         return s
 
 
+U64_TYPES = frozenset({("T_i64",), ("T_usize",)})
+
+
 def parse_type_tokens(cur: WireCursor) -> list[str]:
     tag = cur.next()
     if tag in ATOMIC_TYPES:
@@ -114,6 +117,46 @@ def parse_type_tokens(cur: WireCursor) -> list[str]:
             out.extend(parse_type_tokens(cur))
         return out
     raise ValueError(f"unknown LNIRType token: {tag}")
+
+
+def parse_fact_tokens(cur: WireCursor) -> list[str]:
+    tag = cur.next()
+    if tag in ("F_lt", "F_aln"):
+        return [tag, str(cur.next_nat()), str(cur.next_nat())]
+    if tag in ("F_add", "F_sub", "F_mul"):
+        a = str(cur.next_nat())
+        b = str(cur.next_nat())
+        nsw = "1" if cur.next_bool() else "0"
+        nuw = "1" if cur.next_bool() else "0"
+        return [tag, a, b, nsw, nuw]
+    if tag == "F_disj":
+        return [tag, str(cur.next_nat()), str(cur.next_nat()), str(cur.next_nat()), str(cur.next_nat())]
+    if tag == "F_excl":
+        return [tag, str(cur.next_nat())]
+    raise ValueError(f"unknown RetainedFact tag: {tag}")
+
+
+def parse_trailing_facts(cur: WireCursor) -> tuple[list[str], set[int]]:
+    if cur.idx == len(cur.tokens):
+        return [], set()
+    if cur.next() != "F_facts":
+        raise ValueError("unexpected trailing wire tokens")
+    cnt = cur.next_nat()
+    out = ["F_facts", str(cnt)]
+    fact_vars: set[int] = set()
+    for _ in range(cnt):
+        ftoks = parse_fact_tokens(cur)
+        tag = ftoks[0]
+        if tag in ("F_lt", "F_add", "F_sub", "F_mul"):
+            fact_vars.update({int(ftoks[1]), int(ftoks[2])})
+        elif tag in ("F_aln", "F_excl"):
+            fact_vars.add(int(ftoks[1]))
+        elif tag == "F_disj":
+            fact_vars.update({int(ftoks[1]), int(ftoks[2]), int(ftoks[3]), int(ftoks[4])})
+        out.extend(ftoks)
+    if cur.idx != len(cur.tokens):
+        raise ValueError("unexpected trailing wire tokens after F_facts")
+    return out, fact_vars
 
 
 def parse_scalar(cur: WireCursor) -> ScalarNode:
@@ -163,25 +206,78 @@ def encode_scalar(node: ScalarNode) -> list[str]:
     raise ValueError(f"invalid ScalarNode: {node}")
 
 
-def rewrite_scalar(node: ScalarNode, scalar_env: dict[int, ScalarNode]) -> ScalarNode:
+def infer_scalar_type(node: ScalarNode, type_env: dict[int, tuple[str, ...]]) -> tuple[str, ...] | None:
+    if node.kind == "u64":
+        return ("T_i64",)
+    if node.kind == "bool":
+        return ("T_i1",)
+    if node.kind == "var":
+        return type_env.get(int(node.val))
+    if node.kind == "un":
+        arg_ty = infer_scalar_type(node.children[0], type_env)
+        if node.val == "U_clz256":
+            return ("T_u256",) if arg_ty in U64_TYPES or arg_ty == ("T_u256",) else None
+        if node.val == "U_neg":
+            return arg_ty if arg_ty in U64_TYPES or arg_ty == ("T_u256",) else None
+        if node.val == "U_not":
+            return arg_ty if arg_ty in U64_TYPES or arg_ty in (("T_i1",), ("T_u256",)) else None
+        return None
+    if node.kind == "sel":
+        cond_ty = infer_scalar_type(node.children[0], type_env)
+        t_ty = infer_scalar_type(node.children[1], type_env)
+        e_ty = infer_scalar_type(node.children[2], type_env)
+        if cond_ty in (("T_i1",), ("T_i64",), ("T_usize",), ("T_u256",)) and t_ty is not None and t_ty == e_ty:
+            return t_ty
+        return None
+    if node.kind == "fma":
+        if all(infer_scalar_type(ch, type_env) in U64_TYPES for ch in node.children):
+            return ("T_i64",)
+        return None
+    if node.kind == "bin":
+        op = str(node.val)
+        l_ty = infer_scalar_type(node.children[0], type_env)
+        r_ty = infer_scalar_type(node.children[1], type_env)
+        if op in ("B_eq", "B_lt", "B_le"):
+            if op == "B_eq" and l_ty == ("T_i1",) and r_ty == ("T_i1",):
+                return ("T_i1",)
+            if (l_ty in U64_TYPES and r_ty in U64_TYPES) or (l_ty == ("T_u256",) and r_ty == ("T_u256",)):
+                return ("T_i1",)
+            return None
+        if op in ("B_addChecked256", "B_subChecked256", "B_mulChecked256"):
+            return ("T_u256",)
+        if l_ty in U64_TYPES and r_ty in U64_TYPES:
+            return ("T_i64",)
+        if l_ty == ("T_u256",) and r_ty == ("T_u256",) and op not in ("B_clmul64", "B_clmul64Hi", "B_gf2Affine", "B_eor3"):
+            return ("T_u256",)
+    return None
+
+
+def is_u64_node(node: ScalarNode, type_env: dict[int, tuple[str, ...]]) -> bool:
+    return infer_scalar_type(node, type_env) in U64_TYPES
+
+
+def rewrite_scalar(
+    node: ScalarNode,
+    scalar_env: dict[int, ScalarNode],
+    type_env: dict[int, tuple[str, ...]],
+) -> ScalarNode:
     if node.kind == "var" and int(node.val) in scalar_env:
         bound = scalar_env[int(node.val)]
-        if bound.kind in ("u64", "bool", "var"):
+        if bound.kind in ("u64", "bool", "var") and type_env.get(int(node.val)) == infer_scalar_type(bound, type_env):
             return bound
     if node.children:
-        node = ScalarNode(node.kind, node.val, tuple(rewrite_scalar(ch, scalar_env) for ch in node.children))
+        node = ScalarNode(node.kind, node.val, tuple(rewrite_scalar(ch, scalar_env, type_env) for ch in node.children))
 
     if node.kind == "bin":
         op = str(node.val)
         lhs, rhs = node.children
-        if lhs.kind == "var" and int(lhs.val) in scalar_env:
-            lhs_def = scalar_env[int(lhs.val)]
-        else:
-            lhs_def = lhs
-        if rhs.kind == "var" and int(rhs.val) in scalar_env:
-            rhs_def = scalar_env[int(rhs.val)]
-        else:
-            rhs_def = rhs
+        lhs_is_u64 = is_u64_node(lhs, type_env)
+        rhs_is_u64 = is_u64_node(rhs, type_env)
+        if not (lhs_is_u64 and rhs_is_u64):
+            return node
+
+        lhs_def = scalar_env[int(lhs.val)] if lhs.kind == "var" and int(lhs.val) in scalar_env else lhs
+        rhs_def = scalar_env[int(rhs.val)] if rhs.kind == "var" and int(rhs.val) in scalar_env else rhs
 
         if op in ("B_add", "B_sub", "B_bitOr", "B_bitXor", "B_shl", "B_shr") and rhs.kind == "u64" and rhs.val == 0:
             return lhs
@@ -199,56 +295,43 @@ def rewrite_scalar(node: ScalarNode, scalar_env: dict[int, ScalarNode]) -> Scala
         if op == "B_add":
             if lhs_def.kind == "bin" and lhs_def.val == "B_mul":
                 a, b = lhs_def.children
-                return ScalarNode("fma", None, (a, b, rhs))
-            if rhs_def.kind == "bin" and rhs_def.val == "B_mul":
+                if is_u64_node(a, type_env) and is_u64_node(b, type_env):
+                    return ScalarNode("fma", None, (a, b, rhs))
+            elif rhs_def.kind == "bin" and rhs_def.val == "B_mul":
                 a, b = rhs_def.children
-                return ScalarNode("fma", None, (a, b, lhs))
+                if is_u64_node(a, type_env) and is_u64_node(b, type_env):
+                    return ScalarNode("fma", None, (a, b, lhs))
     return node
 
 
-def optimize_straight_line_code(cur: WireCursor) -> tuple[list[str], bool] | None:
+def optimize_straight_line_code(
+    cur: WireCursor,
+    param_types: dict[int, tuple[str, ...]],
+) -> tuple[list[tuple[int, list[str], ScalarNode]], int, dict[int, ScalarNode], dict[int, tuple[str, ...]], bool] | None:
     bindings: list[tuple[int, list[str], ScalarNode]] = []
     scalar_env: dict[int, ScalarNode] = {}
+    type_env: dict[int, tuple[str, ...]] = dict(param_types)
     changed = False
     while True:
         tag = cur.next()
         if tag == "C_ret":
             ret_v = cur.next_nat()
-            if ret_v in scalar_env and scalar_env[ret_v].kind == "var":
-                ret_v = int(scalar_env[ret_v].val)
-                changed = True
-            used: set[int] = {ret_v}
-
-            def collect_vars(n: ScalarNode) -> set[int]:
-                out = {int(n.val)} if n.kind == "var" else set()
-                for ch in n.children:
-                    out |= collect_vars(ch)
-                return out
-
-            kept_rev: list[tuple[int, list[str], ScalarNode]] = []
-            for dst, ty_toks, expr in reversed(bindings):
-                if dst in used:
-                    kept_rev.append((dst, ty_toks, expr))
-                    used |= collect_vars(expr)
-                else:
-                    changed = True
-            out_toks: list[str] = []
-            for dst, ty_toks, expr in reversed(kept_rev):
-                out_toks.extend(["C_let", str(dst), *ty_toks, "E_scalar", *encode_scalar(expr)])
-            out_toks.extend(["C_ret", str(ret_v)])
-            return out_toks, changed
+            return bindings, ret_v, scalar_env, type_env, changed
         if tag != "C_let":
             return None
         dst = cur.next_nat()
         ty_toks = parse_type_tokens(cur)
+        ty_tuple = tuple(ty_toks)
         expr_tag = cur.next()
         if expr_tag != "E_scalar":
             return None
         raw_expr = parse_scalar(cur)
-        opt_expr = rewrite_scalar(raw_expr, scalar_env)
+        opt_expr = rewrite_scalar(raw_expr, scalar_env, type_env) if ty_tuple in U64_TYPES else raw_expr
         if opt_expr != raw_expr:
             changed = True
-        scalar_env[dst] = opt_expr
+        type_env[dst] = ty_tuple
+        if ty_tuple in U64_TYPES and is_u64_node(opt_expr, type_env):
+            scalar_env[dst] = opt_expr
         bindings.append((dst, ty_toks, opt_expr))
 
 
@@ -275,6 +358,7 @@ def handle_lnir_opt_request(req: dict) -> dict:
         is_gpu = "1" if cur.next_bool() else "0"
         param_len = cur.next_nat()
         param_toks: list[str] = []
+        param_types: dict[int, tuple[str, ...]] = {}
         for _ in range(param_len):
             pid = cur.next_nat()
             pname_hex = cur.next()
@@ -282,17 +366,40 @@ def handle_lnir_opt_request(req: dict) -> dict:
                 return {}
             pborrow = "1" if cur.next_bool() else "0"
             pty = parse_type_tokens(cur)
+            param_types[pid] = tuple(pty)
             param_toks.extend([str(pid), pname_hex, pborrow, *pty])
         ret_ty = parse_type_tokens(cur)
-        opt_res = optimize_straight_line_code(cur)
+        opt_res = optimize_straight_line_code(cur, param_types)
         if opt_res is None:
             return {}
-        code_toks, changed = opt_res
-        fact_toks = cur.tokens[cur.idx:]
-        if fact_toks and fact_toks[0] != "F_facts":
-            return {}
+        bindings, ret_v, scalar_env, type_env, changed = opt_res
+        fact_toks, fact_vars = parse_trailing_facts(cur)
+        if ret_v in scalar_env and scalar_env[ret_v].kind == "var":
+            cand_v = int(scalar_env[ret_v].val)
+            if type_env.get(cand_v) == type_env.get(ret_v):
+                ret_v = cand_v
+                changed = True
+        used: set[int] = {ret_v, *fact_vars}
+
+        def collect_vars(n: ScalarNode) -> set[int]:
+            out = {int(n.val)} if n.kind == "var" else set()
+            for ch in n.children:
+                out |= collect_vars(ch)
+            return out
+
+        kept_rev: list[tuple[int, list[str], ScalarNode]] = []
+        for dst, ty_toks, expr in reversed(bindings):
+            if dst in used:
+                kept_rev.append((dst, ty_toks, expr))
+                used |= collect_vars(expr)
+            else:
+                changed = True
         if not changed:
             return {}
+        code_toks: list[str] = []
+        for dst, ty_toks, expr in reversed(kept_rev):
+            code_toks.extend(["C_let", str(dst), *ty_toks, "E_scalar", *encode_scalar(expr)])
+        code_toks.extend(["C_ret", str(ret_v)])
         cand_tokens = [
             "LNIR_WIRE_V1", mod_hex, "1", "D_decl", name_hex, assurance, is_gpu,
             str(param_len), *param_toks, *ret_ty, *code_toks, *fact_toks,
@@ -302,22 +409,106 @@ def handle_lnir_opt_request(req: dict) -> dict:
         return {}
 
 
-def extract_have_cuts(body_src: str) -> list[str]:
-    cuts: list[str] = []
-    for line in body_src.splitlines():
-        s = line.strip()
-        if s.startswith("have ") and ":=" in s:
-            cuts.append(s)
-        elif s.startswith("exact ") and cuts:
-            cuts.append(s)
-    return cuts if len(cuts) >= 3 else []
+def split_top_level_colon(s: str) -> tuple[str, str] | None:
+    depth = 0
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif ch == ":" and depth == 0:
+            if i + 1 < len(s) and s[i + 1] == "=":
+                i += 2
+                continue
+            return s[:i].rstrip(), s[i + 1 :].strip()
+        i += 1
+    return None
+
+
+def split_top_level_assign(s: str) -> tuple[str, str] | None:
+    depth = 0
+    i = 0
+    while i + 1 < len(s):
+        ch = s[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth = max(0, depth - 1)
+        elif ch == ":" and s[i + 1] == "=" and depth == 0:
+            return s[:i].rstrip(), s[i + 2 :].strip()
+        i += 1
+    return None
+
+
+def extract_have_cuts(decl_name: str, stmt_src: str, body_src: str) -> list[str]:
+    eff_name = decl_name.strip() or "fission_thm"
+    stmt_trimmed = stmt_src.strip()
+    body_trimmed = body_src.strip()
+    if not stmt_trimmed or not body_trimmed:
+        return []
+    sig_split = split_top_level_colon(stmt_trimmed)
+    if sig_split is not None:
+        binders, goal_ty = sig_split
+    elif not stmt_trimmed.startswith((":", "(", "{", "[")):
+        binders, goal_ty = "", stmt_trimmed
+    else:
+        return []
+    if not goal_ty:
+        return []
+
+    after_by = body_trimmed
+    if after_by == "by" or after_by.startswith(("by ", "by\n", "by\t")):
+        after_by = after_by[2:].strip()
+    else:
+        return []
+    if not after_by:
+        return []
+
+    lines = [ln.strip() for ln in after_by.splitlines() if ln.strip()]
+    if len(lines) < 2:
+        return []
+
+    have_cuts: list[tuple[str, str, str]] = []
+    concl_lines: list[str] = []
+    for idx, ln in enumerate(lines):
+        if idx + 1 < len(lines) and ln.startswith("have ") and not concl_lines:
+            assign_split = split_top_level_assign(ln[5:].strip())
+            if assign_split is None:
+                return []
+            lhs, rhs = assign_split
+            colon_split = split_top_level_colon(lhs)
+            if colon_split is None:
+                return []
+            ident, cut_ty = colon_split
+            ident = ident.strip()
+            if not ident or any(c.isspace() for c in ident) or not cut_ty or not rhs:
+                return []
+            have_cuts.append((ident, cut_ty, rhs))
+        else:
+            concl_lines.append(ln)
+
+    if not have_cuts or not concl_lines:
+        return []
+
+    binder_prefix = f"theorem {eff_name} {binders}" if binders else f"theorem {eff_name}"
+    promoted = ""
+    shards: list[str] = []
+    for ident, cut_ty, rhs in have_cuts:
+        shards.append(f"{binder_prefix}{promoted} : {cut_ty} := {rhs}")
+        promoted += f" ({ident} : {cut_ty})"
+    concl_body = "\n  ".join(concl_lines)
+    shards.append(f"{binder_prefix}{promoted} : {goal_ty} := by\n  {concl_body}")
+    return shards if len(shards) >= 2 else []
 
 
 def handle_tactic_request(req: dict) -> dict:
+    decl_name = req.get("decl_name", "fission_thm")
     stmt = req.get("stmt_src")
     body = req.get("body_src")
     avail = req.get("available_constants", [])
-    if not isinstance(stmt, str) or not isinstance(body, str):
+    if not isinstance(decl_name, str) or not isinstance(stmt, str) or not isinstance(body, str):
         return {}
     if not isinstance(avail, list) or not all(isinstance(x, str) for x in avail):
         return {}
@@ -341,7 +532,7 @@ def handle_tactic_request(req: dict) -> dict:
                 "estimated_speedup_hint": "9.5x",
             }
 
-    cuts = extract_have_cuts(body_stripped)
+    cuts = extract_have_cuts(decl_name, stmt, body_stripped)
     if cuts:
         return {
             "kind": "subgoal_cuts",
@@ -355,7 +546,7 @@ def handle_request(req: object) -> dict:
     if not isinstance(req, dict):
         return {}
     budget = req.get("budget_ms", 25)
-    if isinstance(budget, (int, float)) and budget <= 0:
+    if isinstance(budget, bool) or not isinstance(budget, (int, float)) or budget <= 0:
         return {}
     if "wire" in req and "stmt_src" not in req:
         return handle_lnir_opt_request(req)
