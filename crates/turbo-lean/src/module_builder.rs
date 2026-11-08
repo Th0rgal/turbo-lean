@@ -8073,7 +8073,7 @@ pub(crate) struct LakeClosureCache {
     pb_exp_memo: HashMap<(PathBuf, bool), Option<LakeModuleExportInfo>>,
     pinned_memo: HashSet<(PathBuf, String, String, bool)>,
     cutoff_pins: HashMap<(PathBuf, String), CutoffPinBaseline>,
-    clean_git_pin_memo: HashMap<PathBuf, Option<HashSet<PathBuf>>>,
+    clean_git_pin_memo: HashMap<PathBuf, bool>,
     pub(crate) post_lake_refresh: bool,
     pub(crate) ignore_mtime_skew: bool,
 }
@@ -9227,6 +9227,30 @@ fn compute_expected_lake_module_dep_hash(
 #[allow(clippy::type_complexity)]
 static CLEAN_GIT_PIN_MEMO: OnceLock<Mutex<HashMap<(PathBuf, String), (u64, bool)>>> =
     OnceLock::new();
+static TRUSTED_SNAPSHOT_GIT_PIN_DIRS: OnceLock<Mutex<HashSet<(PathBuf, String)>>> = OnceLock::new();
+
+pub(crate) fn mark_trusted_snapshot_git_pinned_dir(pkg_root: &Path, expected_rev: &str) {
+    if let Ok(canon) = pkg_root.canonicalize() {
+        let set = TRUSTED_SNAPSHOT_GIT_PIN_DIRS.get_or_init(|| Mutex::new(HashSet::new()));
+        if let Ok(mut g) = set.lock() {
+            if g.len() >= 1024 {
+                g.clear();
+            }
+            g.insert((canon, expected_rev.trim().to_ascii_lowercase()));
+        }
+    }
+}
+
+pub(crate) fn unmark_trusted_snapshot_root(snapshot_root: &Path) {
+    let canon = snapshot_root
+        .canonicalize()
+        .unwrap_or_else(|_| snapshot_root.to_path_buf());
+    if let Some(set) = TRUSTED_SNAPSHOT_GIT_PIN_DIRS.get() {
+        if let Ok(mut g) = set.lock() {
+            g.retain(|(p, _)| !p.starts_with(&canon));
+        }
+    }
+}
 
 pub(crate) fn manifest_pinned_git_rev_for_pkg<'a>(
     cfg: &'a ProjectConfig,
@@ -9257,7 +9281,108 @@ pub(crate) fn manifest_pinned_git_rev_for_pkg<'a>(
         .and_then(|mp| mp.rev.as_deref().map(str::trim))
 }
 
-pub(crate) fn is_clean_pinned_git_checkout(pkg_root: &Path, expected_rev: &str) -> bool {
+pub(crate) fn package_gitlink_touches_lean(rel: &Path, pkg: &PackageConfig) -> bool {
+    let norm = |p: &Path| -> PathBuf {
+        p.components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect()
+    };
+    let rel = norm(rel);
+    let has_lean_custom_target = pkg.precompile_modules
+        || pkg.libs.iter().any(|l| {
+            !l.custom_target_needs.is_empty()
+                || l.precompile_modules == Some(true)
+                || l.default_facets
+                    .iter()
+                    .any(|f| matches!(f.as_str(), "shared" | "LeanLib.sharedFacet"))
+        })
+        || pkg.exes.iter().any(|e| !e.custom_target_needs.is_empty())
+        || pkg
+            .custom_targets
+            .iter()
+            .any(|ct| pkg.default_targets.iter().any(|dt| dt == ct));
+    if rel.as_os_str().is_empty()
+        || pkg.unsupported.is_some()
+        || (!pkg.custom_targets.is_empty() && has_lean_custom_target)
+        || rel.extension().is_some_and(|e| e == "lean")
+    {
+        return true;
+    }
+    if let Some(name) = rel.file_name().and_then(|n| n.to_str()) {
+        if matches!(
+            name,
+            "lakefile.lean" | "lakefile.toml" | "lake-manifest.json" | "lean-toolchain"
+        ) || (rel.parent().is_some_and(|p| p.as_os_str().is_empty())
+            && matches!(rel.file_stem().and_then(|s| s.to_str()), Some("lakefile")))
+        {
+            return true;
+        }
+    }
+    let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+    let base = norm(&pkg.src_dir);
+    for path in [&pkg.build_dir, &pkg.packages_dir] {
+        let np = norm(path);
+        let rel_np = np.strip_prefix(&pkg.pkg_root).unwrap_or(&np);
+        if overlaps(&rel, rel_np) {
+            return true;
+        }
+    }
+    for inp in &pkg.inputs {
+        let np = norm(&inp.path);
+        let rel_np = np.strip_prefix(&pkg.pkg_root).unwrap_or(&np);
+        if overlaps(&rel, rel_np) {
+            return true;
+        }
+    }
+    if pkg.libs.is_empty() && pkg.exes.is_empty() {
+        return overlaps(&rel, &base);
+    }
+    let module_prefix = |root: &Path, module: &str| {
+        let first = module.split('.').next().unwrap_or(module);
+        norm(&root.join(first))
+    };
+    for lib in &pkg.libs {
+        let root = match &lib.src_dir {
+            Some(dir) => norm(&base.join(dir)),
+            None => base.clone(),
+        };
+        if lib.globs.is_empty() && lib.roots.is_empty() && overlaps(&rel, &root) {
+            return true;
+        }
+        let names = lib
+            .roots
+            .iter()
+            .map(String::as_str)
+            .chain(lib.globs.iter().map(|g| match g {
+                GlobSpec::One(n) | GlobSpec::Submodules(n) | GlobSpec::AndSubmodules(n) => {
+                    n.as_str()
+                }
+            }));
+        for name in names {
+            let prefix = module_prefix(&root, name);
+            if overlaps(&rel, &prefix) || overlaps(&rel, &prefix.with_extension("lean")) {
+                return true;
+            }
+        }
+    }
+    for exe in &pkg.exes {
+        let root = match &exe.src_dir {
+            Some(dir) => norm(&base.join(dir)),
+            None => base.clone(),
+        };
+        let prefix = module_prefix(&root, &exe.root);
+        if overlaps(&rel, &prefix) || overlaps(&rel, &prefix.with_extension("lean")) {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn is_clean_pinned_git_checkout(
+    pkg_root: &Path,
+    expected_rev: &str,
+    pkg_opt: Option<&PackageConfig>,
+) -> bool {
     let expected = expected_rev.trim();
     if expected.is_empty()
         || expected.starts_with('-')
@@ -9270,10 +9395,17 @@ pub(crate) fn is_clean_pinned_git_checkout(pkg_root: &Path, expected_rev: &str) 
         return false;
     };
     if !canon.join(".git").exists() {
-        return false;
+        return TRUSTED_SNAPSHOT_GIT_PIN_DIRS
+            .get()
+            .and_then(|s| s.lock().ok())
+            .is_some_and(|g| g.contains(&(canon, expected.to_ascii_lowercase())));
     }
+    let cfg_tag = pkg_opt.map(|p| p.config_digest.clone()).unwrap_or_default();
     let window = current_memo_window();
-    let key = (canon.clone(), expected.to_ascii_lowercase());
+    let key = (
+        canon.clone(),
+        format!("{}:{cfg_tag}", expected.to_ascii_lowercase()),
+    );
     let memo = CLEAN_GIT_PIN_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
     if let Ok(guard) = memo.lock() {
         if let Some(&(cached_win, ok)) = guard.get(&key) {
@@ -9283,9 +9415,25 @@ pub(crate) fn is_clean_pinned_git_checkout(pkg_root: &Path, expected_rev: &str) 
         }
     }
     let computed = (|| -> Option<bool> {
-        if crate::trusted_tools::reject_gitlinks(&canon, &[expected], Path::new(".")).is_err() {
+        let mut allowed_gitlinks: Vec<PathBuf> = Vec::new();
+        if crate::trusted_tools::reject_gitlinks_filtered(
+            &canon,
+            &[expected],
+            Path::new("."),
+            |rel| {
+                let touches = pkg_opt.is_none_or(|pkg| package_gitlink_touches_lean(rel, pkg));
+                if !touches {
+                    allowed_gitlinks.push(rel.to_path_buf());
+                }
+                touches
+            },
+        )
+        .is_err()
+        {
             return Some(false);
         }
+        allowed_gitlinks.sort();
+        allowed_gitlinks.dedup();
         let mut rev_cmd = crate::trusted_tools::git(&canon).ok()?;
         let rev_out = rev_cmd
             .args([
@@ -9321,7 +9469,24 @@ pub(crate) fn is_clean_pinned_git_checkout(pkg_root: &Path, expected_rev: &str) 
         if !st_out.status.success() {
             return Some(false);
         }
-        Some(st_out.stdout.iter().all(|&b| b == 0))
+        let entries = st_out.stdout.split(|&b| b == 0).filter(|s| !s.is_empty());
+        for rec in entries {
+            if rec.len() < 4 {
+                return Some(false);
+            }
+            let xy = &rec[..2];
+            let Ok(rel_str) = std::str::from_utf8(&rec[3..]) else {
+                return Some(false);
+            };
+            let rel = Path::new(rel_str);
+            if xy.contains(&b'R') || xy.contains(&b'C') {
+                return Some(false);
+            }
+            if !allowed_gitlinks.iter().any(|gl| gl == rel) {
+                return Some(false);
+            }
+        }
+        Some(true)
     })()
     .unwrap_or(false);
     if let Ok(mut guard) = memo.lock() {
@@ -9349,79 +9514,11 @@ fn spec_in_clean_git_pinned_manifest_package(
     else {
         return false;
     };
-    let clean_opt = cache
+    let pkg_opt = package_by_root(cfg, &spec.pkg_root);
+    *cache
         .clean_git_pin_memo
         .entry(spec_canon.clone())
-        .or_insert_with(|| {
-            if !expected_rev.bytes().all(|b| b.is_ascii_hexdigit())
-                || !matches!(expected_rev.len(), 40 | 64)
-            {
-                return None;
-            }
-            if crate::trusted_tools::reject_gitlinks(&spec_canon, &[expected_rev], Path::new("."))
-                .is_err()
-            {
-                return None;
-            }
-            let mut rev_cmd = crate::trusted_tools::git(&spec_canon).ok()?;
-            let rev_out = rev_cmd
-                .args([
-                    "--no-optional-locks",
-                    "-C",
-                    &spec_canon.to_string_lossy(),
-                    "rev-parse",
-                    "HEAD",
-                ])
-                .output()
-                .ok()?;
-            if !rev_out.status.success() {
-                return None;
-            }
-            let head_rev = String::from_utf8_lossy(&rev_out.stdout);
-            if !head_rev.trim().eq_ignore_ascii_case(expected_rev) {
-                return None;
-            }
-            let mut st_cmd = crate::trusted_tools::git(&spec_canon).ok()?;
-            let st_out = st_cmd
-                .args([
-                    "--no-optional-locks",
-                    "-C",
-                    &spec_canon.to_string_lossy(),
-                    "status",
-                    "--porcelain",
-                    "-z",
-                    "-uall",
-                    crate::trusted_tools::NO_SUBMODULES,
-                ])
-                .output()
-                .ok()?;
-            if !st_out.status.success() {
-                return None;
-            }
-            let mut dirty = HashSet::new();
-            let mut entries = st_out.stdout.split(|&b| b == 0).filter(|s| !s.is_empty());
-            while let Some(rec) = entries.next() {
-                if rec.len() < 4 {
-                    dirty.insert(spec_canon.clone());
-                    continue;
-                }
-                let xy = &rec[..2];
-                let path_bytes = &rec[3..];
-                let rel = PathBuf::from(String::from_utf8_lossy(path_bytes).into_owned());
-                dirty.insert(spec_canon.join(&rel));
-                if xy.contains(&b'R') || xy.contains(&b'C') {
-                    if let Some(orig) = entries.next() {
-                        let orig_rel = PathBuf::from(String::from_utf8_lossy(orig).into_owned());
-                        dirty.insert(spec_canon.join(orig_rel));
-                    }
-                }
-            }
-            Some(dirty)
-        });
-    let Some(dirty_set) = clean_opt.as_ref() else {
-        return false;
-    };
-    dirty_set.is_empty()
+        .or_insert_with(|| is_clean_pinned_git_checkout(&spec_canon, expected_rev, pkg_opt))
 }
 
 fn prebuilt_artifact_traces(
@@ -11667,7 +11764,13 @@ pub(crate) fn compile_disposable_snapshot_dirty_modules_direct(
 fn is_git_pinned_manifest_package(cfg: &ProjectConfig, spec: &DiscoveredModuleSpec) -> bool {
     !spec.is_root_pkg
         && manifest_pinned_git_rev_for_pkg(cfg, &spec.pkg_name, &spec.pkg_base_name, &spec.pkg_root)
-            .is_some_and(|rev| is_clean_pinned_git_checkout(&spec.pkg_root, rev))
+            .is_some_and(|rev| {
+                is_clean_pinned_git_checkout(
+                    &spec.pkg_root,
+                    rev,
+                    package_by_root(cfg, &spec.pkg_root),
+                )
+            })
 }
 
 #[allow(clippy::type_complexity)]
@@ -12923,6 +13026,87 @@ fn pkg_non_lake_tree_digest(pkg: &PackageConfig) -> Option<String> {
         h.update(digest);
     }
     Some(h.finalize().to_hex().to_string())
+}
+
+pub(crate) fn seed_materialized_lake_recipes_into_snapshot_pkg(
+    cfg: &ProjectConfig,
+    src_pkg: &PackageConfig,
+    dst_pkg_root: &Path,
+) -> Result<()> {
+    let names = required_lake_recipe_names(&cfg.root_pkg.pkg_root, src_pkg, cfg.is_untrusted);
+    if names.is_empty() {
+        return Ok(());
+    }
+    let src_root = src_pkg.pkg_root.canonicalize()?;
+    let mut raw_hashes: HashMap<String, String> = HashMap::with_capacity(names.len());
+    for name in &names {
+        let Some(inp) = src_pkg.inputs.iter().find(|i| &i.name == name) else {
+            continue;
+        };
+        let src_art = src_root.join(&inp.path).canonicalize()?;
+        anyhow::ensure!(
+            src_art.starts_with(&src_root) && src_art.is_file(),
+            "Materialized Lake artifact `{}/{name}` escaped package root",
+            src_pkg.name
+        );
+        let (actual_input_hash, _) = hash_input_target(&src_pkg.pkg_root, inp)?;
+        anyhow::ensure!(
+            actual_input_hash == inp.blake3,
+            "Materialized Lake artifact `{}/{name}` changed on disk",
+            src_pkg.name
+        );
+        let bytes = fs::read(&src_art)?;
+        let raw_hash = blake3::hash(&bytes).to_hex().to_string();
+        if let Some(ext) = src_pkg.extern_libs.iter().find(|e| &e.name == name) {
+            anyhow::ensure!(
+                ext.static_artifact_blake3.as_ref() == Some(&raw_hash),
+                "Materialized extern library `{}/{name}` changed on disk",
+                src_pkg.name
+            );
+        }
+        let dst_art = dst_pkg_root.join(&inp.path);
+        if let Some(parent) = dst_art.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&dst_art, &bytes)?;
+        raw_hashes.insert(name.clone(), raw_hash);
+    }
+    let dst_canon = dst_pkg_root.canonicalize()?;
+    let mut dummy_pkg = src_pkg.clone();
+    dummy_pkg.pkg_root = dst_canon.clone();
+    if let (Some(td), Ok(raw_dst_cfg)) = (
+        pkg_non_lake_tree_digest(&dummy_pkg),
+        resolve_package_config(&dst_canon, false),
+    ) {
+        let mut items = Vec::with_capacity(names.len());
+        for name in &names {
+            if let (Some(inp), Some(raw_h)) = (
+                src_pkg.inputs.iter().find(|i| &i.name == name),
+                raw_hashes.get(name),
+            ) {
+                let dst_art = dst_canon.join(&inp.path).canonicalize()?;
+                items.push((name.clone(), dst_art, raw_h.clone()));
+            }
+        }
+        if items.len() == names.len() {
+            let key = (
+                cfg.lean_bin.clone(),
+                cfg.lean_githash.clone(),
+                dst_canon,
+                raw_dst_cfg.config_digest,
+                names,
+                td,
+            );
+            let memo = LAKE_RECIPE_MEMO.get_or_init(|| Mutex::new(HashMap::new()));
+            if let Ok(mut g) = memo.lock() {
+                if g.len() >= 256 {
+                    g.clear();
+                }
+                g.insert(key, items);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn required_lake_recipe_names(
@@ -21708,7 +21892,13 @@ pub(crate) fn ensure_imported_oleans_replayed_with_roots_and_axioms(
 pub(crate) fn node_is_git_pinned_manifest_package(cfg: &ProjectConfig, node: &ModuleNode) -> bool {
     !node.is_root_pkg
         && manifest_pinned_git_rev_for_pkg(cfg, &node.pkg_name, &node.pkg_base_name, &node.pkg_root)
-            .is_some_and(|rev| is_clean_pinned_git_checkout(&node.pkg_root, rev))
+            .is_some_and(|rev| {
+                is_clean_pinned_git_checkout(
+                    &node.pkg_root,
+                    rev,
+                    package_by_root(cfg, &node.pkg_root),
+                )
+            })
 }
 
 fn node_source_has_disallowed_elab_host_effects(
@@ -41453,6 +41643,230 @@ end Fixture
                 || format!("{bad_err:#}").contains("disallowed axiom"),
             "unexpected error when referencing git-pinned native_decide theorem: {bad_err:#}"
         );
+
+        crate::zygote::purge_snapshot_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_git_pinned_dep_non_lean_gitlink_and_c_helper_target_hygiene() -> Result<()> {
+        let _env_guard = native_build_env_guard();
+        let dir = make_temp_test_dir("git_pinned_dep_non_lean_gitlink");
+        let sub_origin = dir.join("eth_tests_sub");
+        let dep_origin = dir.join("evmyul_origin");
+        let proj = dir.join("proj");
+        let dep = proj.join(".lake/packages/evmyul");
+        let store_dir = dir.join("store");
+        fs::create_dir_all(&sub_origin)?;
+        fs::create_dir_all(dep_origin.join("EvmYul/Specs"))?;
+        fs::create_dir_all(proj.join("Verity"))?;
+        let tc = include_str!("../../../lean/lean-toolchain");
+        fs::write(dep_origin.join("lean-toolchain"), tc)?;
+        fs::write(proj.join("lean-toolchain"), tc)?;
+        fs::write(sub_origin.join("fixture.json"), "{}\n")?;
+        let git_bin = std::env::var_os("TURBO_LEAN_GIT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("git"));
+        for (repo_dir, msg) in [(&sub_origin, "sub_init")] {
+            for args in [
+                vec!["init"],
+                vec!["config", "user.email", "t@e.com"],
+                vec!["config", "user.name", "T"],
+                vec!["add", "."],
+                vec!["commit", "-m", msg],
+            ] {
+                let st = Command::new(&git_bin)
+                    .args(&args)
+                    .current_dir(repo_dir)
+                    .status()?;
+                anyhow::ensure!(st.success(), "git init {msg} failed on {args:?}");
+            }
+        }
+        let sub_sha = String::from_utf8(
+            Command::new(&git_bin)
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&sub_origin)
+                .output()?
+                .stdout,
+        )?
+        .trim()
+        .to_string();
+        fs::write(dep_origin.join(".gitignore"), "/*.olean\n/.lake/\n/sha2/\n")?;
+        fs::write(
+            dep_origin.join(".gitmodules"),
+            format!(
+                "[submodule \"EthereumTests\"]\n\tpath = EthereumTests\n\turl = {}\n",
+                sub_origin.display()
+            ),
+        )?;
+        fs::write(
+            dep_origin.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL System\n\npackage «evmyul» {\n  moreLeanArgs := #[\"-DautoImplicit=false\"]\n  moreServerOptions := #[⟨`autoImplicit, false⟩]\n}\n\ntarget cloneSha2 pkg : FilePath := do\n  inputTextFile (pkg.dir / \"lakefile.lean\")\n\n@[default_target]\nlean_lib «EvmYul»\n",
+        )?;
+        fs::write(
+            dep_origin.join("EvmYul/Specs/Bridge.lean"),
+            "def evmSafe : Nat := 42\ntheorem unused_bv : (1 : BitVec 8) + 1 = 2 := by decide\ntheorem unused_native : 1 + 1 = 2 := by native_decide\n",
+        )?;
+        fs::write(
+            dep_origin.join("EvmYul.lean"),
+            "import EvmYul.Specs.Bridge\n",
+        )?;
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@e.com"],
+            vec!["config", "user.name", "T"],
+            vec!["add", "."],
+        ] {
+            let st = Command::new(&git_bin)
+                .args(&args)
+                .current_dir(&dep_origin)
+                .status()?;
+            anyhow::ensure!(st.success(), "git prep dep_origin failed on {args:?}");
+        }
+        let st_gl = Command::new(&git_bin)
+            .current_dir(&dep_origin)
+            .args([
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{sub_sha},EthereumTests"),
+            ])
+            .status()?;
+        anyhow::ensure!(st_gl.success(), "git update-index EthereumTests failed");
+        let st_cm = Command::new(&git_bin)
+            .current_dir(&dep_origin)
+            .args(["commit", "-m", "init_evmyul"])
+            .status()?;
+        anyhow::ensure!(st_cm.success(), "git commit dep_origin failed");
+        let rev = String::from_utf8(
+            Command::new(&git_bin)
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&dep_origin)
+                .output()?
+                .stdout,
+        )?
+        .trim()
+        .to_string();
+        fs::create_dir_all(dep.parent().unwrap())?;
+        let clone_st = Command::new(&git_bin)
+            .env("GIT_ALLOW_PROTOCOL", "file")
+            .args(["clone", "--quiet"])
+            .arg(&dep_origin)
+            .arg(&dep)
+            .status()?;
+        anyhow::ensure!(clone_st.success(), "git clone dep_origin failed");
+        let sub_init = Command::new(&git_bin)
+            .env("GIT_ALLOW_PROTOCOL", "file")
+            .current_dir(&dep)
+            .args(["submodule", "update", "--init", "--quiet"])
+            .status()?;
+        anyhow::ensure!(sub_init.success(), "git submodule update --init failed");
+        // Dirty the non-Lean submodule and populate gitignored `sha2/` just like sticky CI disks.
+        fs::write(dep.join("EthereumTests/untracked.json"), "{}\n")?;
+        fs::create_dir_all(dep.join("sha2"))?;
+        fs::write(dep.join("sha2/sha-256.c"), "int x = 0;\n")?;
+
+        fs::write(
+            proj.join("lakefile.toml"),
+            format!(
+                "name = \"verity\"\ndefaultTargets = [\"Verity\"]\n[[require]]\nname = \"evmyul\"\ngit = {:?}\nrev = {:?}\n[[lean_lib]]\nname = \"Verity\"\n",
+                dep_origin.to_string_lossy(),
+                rev
+            ),
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [{
+                    "type": "git",
+                    "scope": "",
+                    "name": "evmyul",
+                    "manifestFile": "lake-manifest.json",
+                    "rev": rev,
+                    "inherited": false,
+                    "configFile": "lakefile.lean",
+                    "inputRev": rev,
+                    "url": dep_origin.to_string_lossy()
+                }]
+            })
+            .to_string(),
+        )?;
+        let root_src = "import EvmYul.Specs.Bridge\ntheorem verity_ok : evmSafe = 42 := rfl\n";
+        fs::write(proj.join("Verity/Core.lean"), root_src)?;
+        fs::write(proj.join("Verity.lean"), "import Verity.Core\n")?;
+
+        reset_lake_inputs_tag_memo();
+        let cfg = resolve_project_config(&proj)?;
+        if let Some(evmyul_lf) = std::env::var_os("TURBO_TEST_EVMYUL_LAKEFILE") {
+            let real_evmyul = PathBuf::from(evmyul_lf);
+            let real_pkg = parse_lakefile_lean(real_evmyul.parent().unwrap(), &real_evmyul, false)?;
+            assert!(!package_gitlink_touches_lean(
+                Path::new("EthereumTests"),
+                &real_pkg
+            ));
+            assert!(package_gitlink_touches_lean(
+                Path::new("EvmYul/Sub"),
+                &real_pkg
+            ));
+            assert!(package_gitlink_touches_lean(
+                Path::new("Conform/Sub"),
+                &real_pkg
+            ));
+        }
+        let dep_pkg = cfg
+            .dep_pkgs
+            .iter()
+            .find(|p| p.name == "evmyul")
+            .expect("evmyul resolved");
+        assert!(!package_gitlink_touches_lean(
+            Path::new("EthereumTests"),
+            dep_pkg
+        ));
+        assert!(package_gitlink_touches_lean(
+            Path::new("EvmYul/Sub"),
+            dep_pkg
+        ));
+        assert!(is_clean_pinned_git_checkout(&dep, &rev, Some(dep_pkg)));
+        assert!(
+            !is_clean_pinned_git_checkout(&dep, &rev, None),
+            "without resolved PackageConfig, any 160000 gitlink must fail closed"
+        );
+
+        let mut store = TurboStore::open(Some(&store_dir))?;
+        let canon = fs::canonicalize(&proj)?;
+        let mut file_hashes = std::collections::BTreeMap::new();
+        for (rel, body) in [
+            ("Verity/Core.lean", root_src),
+            ("Verity.lean", "import Verity.Core\n"),
+        ] {
+            file_hashes.insert(
+                rel.to_string(),
+                blake3::hash(body.as_bytes()).to_hex().to_string(),
+            );
+        }
+        build_project_modules_native(
+            &mut store,
+            &canon,
+            &[],
+            "trusted",
+            1,
+            false,
+            true,
+            Some(&file_hashes),
+        )?;
+        crate::lake_build::ensure_project_and_imported_oleans_replayed_in_store(
+            &store,
+            &canon,
+            &file_hashes,
+        )?;
+
+        // Fail closed if a tracked file in the Lean package is modified or untracked outside gitignored/non-Lean-gitlink paths.
+        fs::write(dep.join("EvmYul/Untracked.lean"), "def bad := 1\n")?;
+        reset_lake_inputs_tag_memo();
+        assert!(!is_clean_pinned_git_checkout(&dep, &rev, Some(dep_pkg)));
 
         crate::zygote::purge_snapshot_dir(&dir);
         let _ = fs::remove_dir_all(&dir);

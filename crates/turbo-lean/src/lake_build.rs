@@ -5158,12 +5158,7 @@ fn compute_project_dependent_closure_inner(
             let exe_edited =
                 crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, &exe.root)
                     .is_some_and(|spec| {
-                        edited.contains(
-                            &spec
-                                .src_path
-                                .canonicalize()
-                                .unwrap_or_else(|_| spec.src_path),
-                        )
+                        edited.contains(&spec.src_path.canonicalize().unwrap_or(spec.src_path))
                     });
             if !exe_edited {
                 continue;
