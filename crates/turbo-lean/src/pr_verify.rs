@@ -5393,18 +5393,26 @@ fn seed_base_statement_dependencies(
     head_project: &Path,
     head_cfg: &crate::module_builder::ProjectConfig,
     seed_matching_head_deps: bool,
+    is_untrusted: bool,
 ) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
 
     if seed_matching_head_deps {
         seed_statement_dependencies(base_project, head_cfg)?;
     }
-    let (_, manifest_packages, _) = crate::module_builder::parse_lake_manifest(base_project, true)?;
+    let (_, manifest_packages, _) =
+        crate::module_builder::parse_lake_manifest(base_project, is_untrusted)?;
     let canon_head = head_project
         .canonicalize()
         .unwrap_or_else(|_| head_project.to_path_buf());
     for mp in manifest_packages {
         let target = mp.dir;
+        if !is_untrusted && !target.starts_with(base_project) {
+            if mp.pkg_type == "path" {
+                continue;
+            }
+            ensure_statement_snapshot_path(base_project, &target)?;
+        }
         ensure_statement_snapshot_path(base_project, &target)?;
         if target.exists() {
             continue;
@@ -8213,13 +8221,14 @@ fn kernel_statement_changes_with_trust(
         ensure_statement_lake_project(&base_project)?;
         if let Some(cfg) = untrusted_cfg {
             clear_untrusted_statement_build_products(&base_project)?;
-            seed_base_statement_dependencies(&base_project, project, cfg, true)?;
+            seed_base_statement_dependencies(&base_project, project, cfg, true, true)?;
             stock_statement_build_with_trust(&base_project, statement_scope, true)?;
         } else {
             if let Some(ref cfg) = trusted_cfg {
                 let (_, base_mps, _) =
-                    crate::module_builder::parse_lake_manifest(&base_project, true)?;
+                    crate::module_builder::parse_lake_manifest(&base_project, false)?;
                 let mut filtered_cfg = cfg.clone();
+                let mut had_unseeded_git_dep = false;
                 filtered_cfg.dep_pkgs.retain(|dep| {
                     let Some(rel) = trusted_dep_snapshot_rel_path(cfg, dep) else {
                         return false;
@@ -8228,7 +8237,7 @@ fn kernel_statement_changes_with_trust(
                         return true;
                     };
                     let base_target = base_project.join(rel);
-                    base_mps.iter().any(|bmp| {
+                    let matches_base = base_mps.iter().any(|bmp| {
                         bmp.pkg_type == "git"
                             && bmp.dir == base_target
                             && bmp
@@ -8236,15 +8245,19 @@ fn kernel_statement_changes_with_trust(
                                 .as_deref()
                                 .map(str::trim)
                                 .is_some_and(|r| r.eq_ignore_ascii_case(head_rev))
-                    })
+                    });
+                    if !matches_base {
+                        had_unseeded_git_dep = true;
+                    }
+                    matches_base
                 });
                 seed_trusted_statement_dependencies(&base_project, &filtered_cfg)?;
-                if filtered_cfg.dep_pkgs.len() < cfg.dep_pkgs.len()
+                if had_unseeded_git_dep
                     || base_mps
                         .iter()
                         .any(|bmp| bmp.pkg_type == "git" && !bmp.dir.exists())
                 {
-                    seed_base_statement_dependencies(&base_project, project, cfg, false)?;
+                    seed_base_statement_dependencies(&base_project, project, cfg, false, false)?;
                 }
             }
             trusted_statement_build(&base_project, true)?;
