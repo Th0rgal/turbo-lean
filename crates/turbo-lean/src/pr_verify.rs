@@ -356,6 +356,11 @@ fn git_head_tree_cache_paths(
         h.update(b":inputs:");
         h.update(tag.as_bytes());
     }
+    let active_excludes = crate::splitter::active_exclude_patterns();
+    if !active_excludes.is_empty() {
+        h.update(b":exclude:");
+        h.update(active_excludes.join(",").as_bytes());
+    }
     let key_hex = h.finalize().to_hex();
     let short_key = &key_hex[..24];
     let staging = store.fast_staging_dir();
@@ -1745,6 +1750,175 @@ fn parse_staged_base_package_config(
     result
 }
 
+fn pkg_matches_manifest_name(pkg: &crate::module_builder::PackageConfig, mp_name: &str) -> bool {
+    let clean_mp = crate::module_builder::clean_lake_ident(mp_name);
+    pkg.name == mp_name
+        || (!clean_mp.is_empty()
+            && (pkg.base_name == clean_mp
+                || crate::module_builder::clean_lake_ident(&pkg.name) == clean_mp))
+}
+
+fn find_pinned_git_dep_for_pkg<'a, V>(
+    map: &'a std::collections::HashMap<String, V>,
+    pkg: &crate::module_builder::PackageConfig,
+) -> Option<&'a V> {
+    map.get(&pkg.name).or_else(|| {
+        map.iter()
+            .find(|(k, _)| pkg_matches_manifest_name(pkg, k))
+            .map(|(_, v)| v)
+    })
+}
+
+fn strip_materialized_recipe_inputs(
+    root_pkg_root: &Path,
+    pkg: &crate::module_builder::PackageConfig,
+    is_untrusted: bool,
+) -> (
+    crate::module_builder::PackageConfig,
+    Vec<crate::module_builder::InputTargetConfig>,
+) {
+    let recipe_names =
+        crate::module_builder::required_lake_recipe_names(root_pkg_root, pkg, is_untrusted);
+    if recipe_names.is_empty() {
+        return (pkg.clone(), Vec::new());
+    }
+    let mut declarative = pkg.clone();
+    if !declarative.pre_recipe_config_digest.is_empty() {
+        declarative.config_digest = declarative.pre_recipe_config_digest.clone();
+    }
+    let mut recipes = Vec::new();
+    declarative.inputs.retain(|i| {
+        if recipe_names.iter().any(|rn| rn == &i.name) {
+            recipes.push(i.clone());
+            false
+        } else {
+            true
+        }
+    });
+    (declarative, recipes)
+}
+
+fn in_repo_pkg_non_lake_files_unchanged(
+    canon_repo_root: &Path,
+    canon_pkg_root: &Path,
+    pkg: &crate::module_builder::PackageConfig,
+    base_ref: &str,
+) -> bool {
+    if base_ref.is_empty()
+        || base_ref.starts_with('-')
+        || !canon_pkg_root.starts_with(canon_repo_root)
+    {
+        return false;
+    }
+    let mut allowed_gitlinks: Vec<PathBuf> = Vec::new();
+    let revs: &[&str] = if base_ref == "HEAD" {
+        &["HEAD"]
+    } else {
+        &[base_ref, "HEAD"]
+    };
+    if crate::trusted_tools::reject_gitlinks_filtered(
+        canon_repo_root,
+        revs,
+        canon_pkg_root,
+        |repo_rel| {
+            let touches = repo_rel
+                .strip_prefix(
+                    canon_pkg_root
+                        .strip_prefix(canon_repo_root)
+                        .unwrap_or(Path::new("")),
+                )
+                .ok()
+                .is_none_or(|pkg_rel| {
+                    crate::module_builder::package_gitlink_touches_lean(pkg_rel, pkg)
+                });
+            if !touches {
+                allowed_gitlinks.push(repo_rel.to_path_buf());
+            }
+            touches
+        },
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let Ok(diff_cmd_out) = crate::trusted_tools::git(canon_repo_root).and_then(|mut c| {
+        c.args([
+            "--no-optional-locks",
+            "-C",
+            &canon_repo_root.to_string_lossy(),
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            crate::trusted_tools::NO_SUBMODULES,
+            "--name-only",
+            "-z",
+            base_ref,
+            "--",
+            &canon_pkg_root.to_string_lossy(),
+        ])
+        .output()
+        .map_err(Into::into)
+    }) else {
+        return false;
+    };
+    if !diff_cmd_out.status.success() {
+        return false;
+    }
+    for raw in diff_cmd_out
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+    {
+        let Ok(rel_s) = std::str::from_utf8(raw) else {
+            return false;
+        };
+        let rel_p = Path::new(rel_s);
+        if rel_p.components().any(|c| c.as_os_str() == ".lake") {
+            continue;
+        }
+        if !allowed_gitlinks.iter().any(|gl| gl == rel_p) {
+            return false;
+        }
+    }
+    let Ok(untracked_out) = crate::trusted_tools::git(canon_repo_root).and_then(|mut c| {
+        c.args([
+            "--no-optional-locks",
+            "-C",
+            &canon_repo_root.to_string_lossy(),
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z",
+            "--",
+            &canon_pkg_root.to_string_lossy(),
+        ])
+        .output()
+        .map_err(Into::into)
+    }) else {
+        return false;
+    };
+    if !untracked_out.status.success() {
+        return false;
+    }
+    for raw in untracked_out
+        .stdout
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+    {
+        let Ok(rel_s) = std::str::from_utf8(raw) else {
+            return false;
+        };
+        let rel_p = Path::new(rel_s);
+        if rel_p.components().any(|c| c.as_os_str() == ".lake") {
+            continue;
+        }
+        if !allowed_gitlinks.iter().any(|gl| gl == rel_p) {
+            return false;
+        }
+    }
+    true
+}
+
 fn lake_input_files_changed_since_base(
     repo_root: &Path,
     proj_prefix: &str,
@@ -1786,8 +1960,9 @@ fn lake_input_files_changed_since_base(
         let Ok(canon_pkg_root) = fs::canonicalize(&p.pkg_root) else {
             return true;
         };
+        let (decl_pkg, recipe_inputs) = strip_materialized_recipe_inputs(&pkg.pkg_root, p, false);
         if !is_root {
-            if let Some((dep_git_dir, dep_rev)) = pinned_git_deps.get(&p.name) {
+            if let Some((dep_git_dir, dep_rev)) = find_pinned_git_dep_for_pkg(&pinned_git_deps, p) {
                 let Ok(canon_dep_git_root) = fs::canonicalize(dep_git_dir) else {
                     return true;
                 };
@@ -1809,14 +1984,27 @@ fn lake_input_files_changed_since_base(
                             return true;
                         }
                     }
+                    let mut p_for_pin = p.clone();
+                    p_for_pin.pkg_root = canon_pkg_root.clone();
+                    if !recipe_inputs.is_empty()
+                        && !crate::module_builder::is_clean_pinned_git_checkout(
+                            &canon_dep_git_root,
+                            dep_rev,
+                            Some(&p_for_pin),
+                        )
+                    {
+                        return true;
+                    }
                     let dep_prefix = rel_sub.to_string_lossy().replace('\\', "/");
-                    if package_input_files_changed_in_git_repo(
-                        &canon_dep_git_root,
-                        &dep_prefix,
-                        p,
-                        &canon_pkg_root,
-                        dep_rev,
-                    ) {
+                    if !decl_pkg.inputs.is_empty()
+                        && package_input_files_changed_in_git_repo(
+                            &canon_dep_git_root,
+                            &dep_prefix,
+                            &decl_pkg,
+                            &canon_pkg_root,
+                            dep_rev,
+                        )
+                    {
                         return true;
                     }
                     continue;
@@ -1841,17 +2029,24 @@ fn lake_input_files_changed_since_base(
                 }
             }
         }
+        if !recipe_inputs.is_empty()
+            && !in_repo_pkg_non_lake_files_unchanged(&canon_repo_root, &canon_pkg_root, p, base_ref)
+        {
+            return true;
+        }
         let Ok(pkg_repo_rel) = canon_pkg_root.strip_prefix(&canon_repo_root) else {
             return true;
         };
         let pkg_prefix = pkg_repo_rel.to_string_lossy().replace('\\', "/");
-        if package_input_files_changed_in_git_repo(
-            &canon_repo_root,
-            &pkg_prefix,
-            p,
-            &canon_pkg_root,
-            base_ref,
-        ) {
+        if !decl_pkg.inputs.is_empty()
+            && package_input_files_changed_in_git_repo(
+                &canon_repo_root,
+                &pkg_prefix,
+                &decl_pkg,
+                &canon_pkg_root,
+                base_ref,
+            )
+        {
             return true;
         }
     }
@@ -2085,9 +2280,12 @@ fn resolve_base_lake_inputs_tag(
     canon_dir: &Path,
     base_ref: &str,
     base_pkg_cfg: Option<&crate::module_builder::PackageConfig>,
-    cur_dep_pkgs: &[crate::module_builder::PackageConfig],
+    cur_project_cfg: Option<&crate::module_builder::ProjectConfig>,
     is_untrusted: bool,
 ) -> Result<Option<String>> {
+    let cur_dep_pkgs: &[crate::module_builder::PackageConfig] = cur_project_cfg
+        .map(|cfg| cfg.dep_pkgs.as_slice())
+        .unwrap_or(&[]);
     let Some(mut root_pkg) = base_pkg_cfg.cloned() else {
         return Ok(None);
     };
@@ -2122,12 +2320,40 @@ fn resolve_base_lake_inputs_tag(
         None
     };
 
+    let root_recipe_names =
+        crate::module_builder::required_lake_recipe_names(canon_dir, &root_pkg, is_untrusted);
     if hash_package_inputs_from_git_tree(&canon_repo_root, &sha, &mut root_pkg).is_none() {
         return Ok(Some(
             crate::module_builder::fresh_unresolved_lake_inputs_tag(
                 "base-root-inputs-unresolvable",
             ),
         ));
+    }
+    if !root_recipe_names.is_empty() {
+        let Some(cur_cfg) = cur_project_cfg else {
+            return Ok(Some(
+                crate::module_builder::fresh_unresolved_lake_inputs_tag(
+                    "base-root-recipes-missing-cur-cfg",
+                ),
+            ));
+        };
+        if !in_repo_pkg_non_lake_files_unchanged(&canon_repo_root, canon_dir, &root_pkg, base_ref) {
+            return Ok(Some(
+                crate::module_builder::fresh_unresolved_lake_inputs_tag(
+                    "base-root-recipes-files-changed",
+                ),
+            ));
+        }
+        let (_, cur_recipes) =
+            strip_materialized_recipe_inputs(canon_dir, &cur_cfg.root_pkg, is_untrusted);
+        if cur_recipes.len() != root_recipe_names.len() {
+            return Ok(Some(
+                crate::module_builder::fresh_unresolved_lake_inputs_tag(
+                    "base-root-recipes-unmaterialized",
+                ),
+            ));
+        }
+        root_pkg.inputs.extend(cur_recipes);
     }
 
     let cur_manifest_revs: std::collections::HashMap<String, (PathBuf, Option<String>)> =
@@ -2144,8 +2370,15 @@ fn resolve_base_lake_inputs_tag(
             .unwrap_or_default();
 
     let mut base_dep_pkgs: Vec<crate::module_builder::PackageConfig> = Vec::new();
-    if let Some((_, manifest_packages, _)) = base_manifest_opt {
-        for mp in manifest_packages {
+    let (base_manifest_packages, base_manifest_hash): (
+        Vec<crate::module_builder::ManifestPackageEntry>,
+        Option<String>,
+    ) = match base_manifest_opt {
+        Some((_, pkgs, mh)) => (pkgs, mh),
+        None => (Vec::new(), None),
+    };
+    if base_manifest_hash.is_some() || !base_manifest_packages.is_empty() {
+        for mp in &base_manifest_packages {
             let in_repo = mp.dir.starts_with(&canon_repo_root)
                 && mp
                     .dir
@@ -2187,6 +2420,16 @@ fn resolve_base_lake_inputs_tag(
                                         "Failed to parse base dependency Lake config at {base_ref}:{cand_p}"
                                     )
                                 })?;
+                        crate::module_builder::assign_manifest_dep_base_name(
+                            &mut dep_cfg,
+                            &mp.name,
+                            raw_dep.as_bytes(),
+                        );
+                        let dep_recipe_names = crate::module_builder::required_lake_recipe_names(
+                            canon_dir,
+                            &dep_cfg,
+                            is_untrusted,
+                        );
                         if hash_package_inputs_from_git_tree(&canon_repo_root, &sha, &mut dep_cfg)
                             .is_none()
                         {
@@ -2195,6 +2438,47 @@ fn resolve_base_lake_inputs_tag(
                                     "base-dep-inputs-unresolvable",
                                 ),
                             ));
+                        }
+                        if !dep_recipe_names.is_empty() {
+                            let Ok(canon_dep_dir) = fs::canonicalize(&mp.dir) else {
+                                return Ok(Some(
+                                    crate::module_builder::fresh_unresolved_lake_inputs_tag(
+                                        "base-in-repo-dep-recipes-uncanonicalizable",
+                                    ),
+                                ));
+                            };
+                            let Some(cur_dep) = cur_dep_pkgs
+                                .iter()
+                                .find(|d| pkg_matches_manifest_name(d, &mp.name))
+                            else {
+                                return Ok(Some(
+                                    crate::module_builder::fresh_unresolved_lake_inputs_tag(
+                                        "base-in-repo-dep-recipes-unmaterialized",
+                                    ),
+                                ));
+                            };
+                            if !in_repo_pkg_non_lake_files_unchanged(
+                                &canon_repo_root,
+                                &canon_dep_dir,
+                                &dep_cfg,
+                                base_ref,
+                            ) {
+                                return Ok(Some(
+                                    crate::module_builder::fresh_unresolved_lake_inputs_tag(
+                                        "base-in-repo-dep-recipes-files-changed",
+                                    ),
+                                ));
+                            }
+                            let (_, cur_recipes) =
+                                strip_materialized_recipe_inputs(canon_dir, cur_dep, is_untrusted);
+                            if cur_recipes.len() != dep_recipe_names.len() {
+                                return Ok(Some(
+                                    crate::module_builder::fresh_unresolved_lake_inputs_tag(
+                                        "base-in-repo-dep-recipes-mismatch",
+                                    ),
+                                ));
+                            }
+                            dep_cfg.inputs.extend(cur_recipes);
                         }
                         parsed_dep = Some(dep_cfg);
                         break;
@@ -2217,7 +2501,10 @@ fn resolve_base_lake_inputs_tag(
             {
                 let dep_rev = mp.rev.as_deref().unwrap();
                 let (dep_git_dir, _) = cur_manifest_revs.get(&mp.name).unwrap();
-                if let Some(cur_dep) = cur_dep_pkgs.iter().find(|d| d.name == mp.name) {
+                if let Some(cur_dep) = cur_dep_pkgs
+                    .iter()
+                    .find(|d| pkg_matches_manifest_name(d, &mp.name))
+                {
                     if cur_dep.unsupported.is_some()
                         || cur_dep.inputs.iter().any(|i| i.unsupported.is_some())
                     {
@@ -2227,8 +2514,9 @@ fn resolve_base_lake_inputs_tag(
                             ),
                         ));
                     }
-                    let mut base_dep = cur_dep.clone();
-                    if !base_dep.inputs.is_empty() {
+                    let (mut base_dep, dep_recipes) =
+                        strip_materialized_recipe_inputs(canon_dir, cur_dep, is_untrusted);
+                    if !base_dep.inputs.is_empty() || !dep_recipes.is_empty() {
                         let (Ok(canon_dep_git_root), Ok(canon_dep_pkg_root)) = (
                             fs::canonicalize(dep_git_dir),
                             fs::canonicalize(&base_dep.pkg_root),
@@ -2248,13 +2536,29 @@ fn resolve_base_lake_inputs_tag(
                                 ),
                             ));
                         }
+                        let mut cur_dep_for_pin = cur_dep.clone();
+                        cur_dep_for_pin.pkg_root = canon_dep_pkg_root.clone();
+                        if !dep_recipes.is_empty()
+                            && !crate::module_builder::is_clean_pinned_git_checkout(
+                                &canon_dep_git_root,
+                                dep_rev,
+                                Some(&cur_dep_for_pin),
+                            )
+                        {
+                            return Ok(Some(
+                                crate::module_builder::fresh_unresolved_lake_inputs_tag(
+                                    "base-git-dep-dirty-recipe-checkout",
+                                ),
+                            ));
+                        }
                         base_dep.pkg_root = canon_dep_pkg_root;
-                        if hash_package_inputs_from_git_tree(
-                            &canon_dep_git_root,
-                            dep_rev,
-                            &mut base_dep,
-                        )
-                        .is_none()
+                        if !base_dep.inputs.is_empty()
+                            && hash_package_inputs_from_git_tree(
+                                &canon_dep_git_root,
+                                dep_rev,
+                                &mut base_dep,
+                            )
+                            .is_none()
                         {
                             return Ok(Some(
                                 crate::module_builder::fresh_unresolved_lake_inputs_tag(
@@ -2262,6 +2566,7 @@ fn resolve_base_lake_inputs_tag(
                                 ),
                             ));
                         }
+                        base_dep.inputs.extend(dep_recipes);
                     }
                     base_dep_pkgs.push(base_dep);
                 } else if !cur_dep_pkgs.is_empty() {
@@ -2277,8 +2582,20 @@ fn resolve_base_lake_inputs_tag(
                 // unsupported Lake constructs), it contributes nothing to the workspace Lake-inputs
                 // digest; otherwise we cannot reconstruct its `base_ref` inputs from git and return
                 // the uncacheable sentinel.
-                if let Some(cur_dep) = cur_dep_pkgs.iter().find(|d| d.name == mp.name) {
-                    if cur_dep.unsupported.is_none() && cur_dep.inputs.is_empty() {
+                if let Some(cur_dep) = cur_dep_pkgs
+                    .iter()
+                    .find(|d| pkg_matches_manifest_name(d, &mp.name))
+                {
+                    if cur_dep.unsupported.is_none()
+                        && cur_dep.inputs.is_empty()
+                        && cur_dep.custom_targets.is_empty()
+                        && cur_dep.extern_libs.is_empty()
+                    {
+                        let mut clean_dep = cur_dep.clone();
+                        if !clean_dep.pre_recipe_config_digest.is_empty() {
+                            clean_dep.config_digest = clean_dep.pre_recipe_config_digest.clone();
+                        }
+                        base_dep_pkgs.push(clean_dep);
                         continue;
                     }
                 }
@@ -2289,7 +2606,11 @@ fn resolve_base_lake_inputs_tag(
                 ));
             }
         }
-    } else if !cur_dep_pkgs.is_empty() && cur_dep_pkgs.iter().any(|d| !d.inputs.is_empty()) {
+    } else if !cur_dep_pkgs.is_empty()
+        && cur_dep_pkgs.iter().any(|d| {
+            !d.inputs.is_empty() || !d.custom_targets.is_empty() || !d.extern_libs.is_empty()
+        })
+    {
         return Ok(Some(
             crate::module_builder::fresh_unresolved_lake_inputs_tag(
                 "base-no-manifest-with-dep-inputs",
@@ -2298,6 +2619,58 @@ fn resolve_base_lake_inputs_tag(
     }
 
     let mut digest = String::new();
+    if std::iter::once(&root_pkg)
+        .chain(base_dep_pkgs.iter())
+        .any(|p| !p.custom_targets.is_empty() || !p.extern_libs.is_empty())
+    {
+        let Some(cur_cfg) = cur_project_cfg else {
+            return Ok(Some(
+                crate::module_builder::fresh_unresolved_lake_inputs_tag(
+                    "base-native-digest-missing-cur-cfg",
+                ),
+            ));
+        };
+        let base_tc_raw = fetch_git_blobs_batch(
+            &canon_repo_root,
+            &sha,
+            &[
+                join_proj_prefix(&prefix, "lean-toolchain"),
+                "lean-toolchain".to_string(),
+            ],
+        )
+        .ok()
+        .and_then(|mut m| {
+            m.remove(&join_proj_prefix(&prefix, "lean-toolchain"))
+                .or_else(|| m.remove("lean-toolchain"))
+        });
+        let base_toolchain = base_tc_raw
+            .as_deref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| cur_cfg.toolchain.clone());
+        if base_toolchain != cur_cfg.toolchain {
+            return Ok(Some(
+                crate::module_builder::fresh_unresolved_lake_inputs_tag(
+                    "base-native-digest-toolchain-changed",
+                ),
+            ));
+        }
+        let pre_recipe_canon = crate::module_builder::compute_canonical_project_config_digest(
+            &base_toolchain,
+            &cur_cfg.lean_githash,
+            &root_pkg,
+            base_manifest_hash.as_deref(),
+            &base_manifest_packages,
+            &base_dep_pkgs,
+        );
+        let base_canon_cfg_digest = crate::module_builder::fold_materialized_recipe_config_digests(
+            canon_dir,
+            &pre_recipe_canon,
+            std::iter::once(&mut root_pkg).chain(base_dep_pkgs.iter_mut()),
+            is_untrusted,
+        );
+        digest.push_str(&format!("native:{base_canon_cfg_digest}\n"));
+    }
     for p in std::iter::once(&root_pkg)
         .chain(base_dep_pkgs.iter())
         .filter(|p| !p.inputs.is_empty())
@@ -2431,17 +2804,14 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
     } else {
         crate::module_builder::resolve_project_config(canon_dir).ok()
     };
-    let cur_dep_pkgs: &[crate::module_builder::PackageConfig] = untrusted_cfg
-        .or(owned_project_cfg.as_ref())
-        .map(|cfg| cfg.dep_pkgs.as_slice())
-        .unwrap_or(&[]);
+    let cur_project_cfg = untrusted_cfg.or(owned_project_cfg.as_ref());
     let mut base_lake_inputs_tag = resolve_base_lake_inputs_tag(
         store,
         &repo_root,
         canon_dir,
         base_ref,
         base_pkg_cfg.as_ref(),
-        cur_dep_pkgs,
+        cur_project_cfg,
         is_untrusted,
     )?;
     let cur_lake_inputs_tag = match untrusted_cfg.or(owned_project_cfg.as_ref()) {
@@ -3006,6 +3376,9 @@ pub(crate) fn load_and_classify_pr_from_git_scoped(
         } else {
             continue;
         };
+        if crate::splitter::rel_path_excluded(&rel_path) {
+            continue;
+        }
         if !entries_by_rel_path.contains_key(&rel_path)
             && !rel_to_repo_rel.iter().any(|(r, _, _, _)| r == &rel_path)
         {
@@ -3544,6 +3917,7 @@ fn resolve_untrusted_pr_project_config(
         custom_targets: Vec::new(),
         inputs: Vec::new(),
         config_digest: String::new(),
+        pre_recipe_config_digest: String::new(),
         unsupported: None,
         native_unsupported: None,
         link_unsupported: None,
@@ -3920,6 +4294,10 @@ pub fn run_ci_verify_command(
                 hasher.update(format!(":{tag}:{trimmed}\n").as_bytes());
             }
         }
+    }
+    let active_excludes = crate::splitter::active_exclude_patterns();
+    if !active_excludes.is_empty() {
+        hasher.update(format!(":exclude:{}\n", active_excludes.join(",")).as_bytes());
     }
     crate::lake_build::update_with_lake_input_digests(&mut hasher, &canon_dir)?;
 
@@ -4434,6 +4812,7 @@ struct StatementPolicy {
     csimp: Vec<String>,
     unsafe_decls: Vec<String>,
     implemented_by: Vec<String>,
+    excludes: Vec<String>,
 }
 
 impl StatementPolicy {
@@ -4443,6 +4822,8 @@ impl StatementPolicy {
         let config = splitter::read_project_config(project, Some(base))
             .ok()
             .flatten()
+            .unwrap_or_default();
+        let cfg_excludes = crate::accelerators::toml_string_array(&config, "project", "exclude")
             .unwrap_or_default();
         Self {
             axioms: splitter::allowed_axioms_with_extra(
@@ -4459,6 +4840,7 @@ impl StatementPolicy {
                 "allow",
             )
             .unwrap_or_default(),
+            excludes: splitter::configured_exclude_patterns(&cfg_excludes),
         }
     }
 
@@ -6936,6 +7318,7 @@ struct StatementPolicyEnvGuard(
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
 );
 
 impl StatementPolicyEnvGuard {
@@ -6945,6 +7328,7 @@ impl StatementPolicyEnvGuard {
             std::env::var("TURBO_LEAN_ALLOWED_CSIMP").ok(),
             std::env::var("TURBO_LEAN_ALLOWED_UNSAFE").ok(),
             std::env::var("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY").ok(),
+            std::env::var(splitter::EXCLUDE_ENV).ok(),
         );
         std::env::set_var(splitter::ALLOWED_AXIOMS_ENV, policy.axioms.join(","));
         std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", policy.csimp.join(","));
@@ -6953,6 +7337,7 @@ impl StatementPolicyEnvGuard {
             "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY",
             policy.implemented_by.join(","),
         );
+        std::env::set_var(splitter::EXCLUDE_ENV, policy.excludes.join(","));
         guard
     }
 }
@@ -6964,11 +7349,32 @@ impl Drop for StatementPolicyEnvGuard {
             ("TURBO_LEAN_ALLOWED_CSIMP", &self.1),
             ("TURBO_LEAN_ALLOWED_UNSAFE", &self.2),
             ("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY", &self.3),
+            (splitter::EXCLUDE_ENV, &self.4),
         ] {
             match val {
                 Some(v) => std::env::set_var(k, v),
                 None => std::env::remove_var(k),
             }
+        }
+    }
+}
+
+struct ExcludeRootEnvGuard(Option<String>);
+
+impl ExcludeRootEnvGuard {
+    fn enter(root: &Path) -> Self {
+        let prev = std::env::var(splitter::EXCLUDE_ROOT_ENV).ok();
+        let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        std::env::set_var(splitter::EXCLUDE_ROOT_ENV, canon);
+        Self(prev)
+    }
+}
+
+impl Drop for ExcludeRootEnvGuard {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(v) => std::env::set_var(splitter::EXCLUDE_ROOT_ENV, v),
+            None => std::env::remove_var(splitter::EXCLUDE_ROOT_ENV),
         }
     }
 }
@@ -7901,6 +8307,8 @@ fn head_statement_report_cache_action_key(
     if let Some(sc) = scope {
         h.update(sc.to_string_lossy().as_bytes());
     }
+    h.update(b"\0");
+    h.update(crate::splitter::current_kernel_policy_digest().as_bytes());
     h.update(b"\x01");
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (module, (source, _)) in &mods {
@@ -8218,6 +8626,7 @@ fn kernel_statement_changes_with_trust(
         let baseline =
             StatementSnapshot::at_scoped(&repo, base, &proj_rel_in_repo, base_pkg_cfg.as_ref())?;
         let base_project = baseline.path.join(&proj_rel_in_repo);
+        let _base_exclude_root_guard = ExcludeRootEnvGuard::enter(&base_project);
         ensure_statement_lake_project(&base_project)?;
         if let Some(cfg) = untrusted_cfg {
             clear_untrusted_statement_build_products(&base_project)?;
@@ -8270,6 +8679,7 @@ fn kernel_statement_changes_with_trust(
             None,
         )?;
         if let Some(ref pre_key) = base_cache_key {
+            drop(_base_exclude_root_guard);
             if let Ok(post_cfg) = crate::module_builder::resolve_project_config(project) {
                 if base_statement_cache_action_key(
                     &repo,
@@ -8321,6 +8731,7 @@ fn kernel_statement_changes_with_trust(
         .as_ref()
         .map(|s| s.path.join(&proj_rel_in_repo))
         .unwrap_or_else(|| project.to_path_buf());
+    let _head_exclude_root_guard = ExcludeRootEnvGuard::enter(&head_project);
     let try_head_overlay =
         || -> Option<(crate::check::PrivateScratchDir, KernelStatementReport)> {
             if is_untrusted || head_snapshot.is_some() {
@@ -8646,6 +9057,7 @@ fn kernel_statement_changes_with_trust(
         } else {
             head_project
         };
+        let _snap_head_exclude_root_guard = ExcludeRootEnvGuard::enter(&head_project);
         if is_untrusted {
             stock_statement_build_with_trust(&head_project, statement_scope, true)?;
         } else {
@@ -11805,6 +12217,7 @@ end Fixture
             csimp: vec!["*".into()],
             unsafe_decls: vec!["*".into()],
             implemented_by: vec!["*".into()],
+            excludes: Vec::new(),
         };
         report.csimp.clear();
         for forbidden in ["sorryAx", "Lean.trustCompiler"] {
@@ -13108,7 +13521,7 @@ allow = [
             &canon1,
             &base1,
             Some(&base_pkg1),
-            &cur_cfg1.dep_pkgs,
+            Some(&cur_cfg1),
             false,
         )?
         .expect("base lake inputs tag");
@@ -13166,7 +13579,7 @@ allow = [
             &canon2,
             &base2,
             Some(&base_pkg2),
-            &cur_cfg2.dep_pkgs,
+            Some(&cur_cfg2),
             false,
         )?
         .expect("base lake inputs tag");
@@ -18783,6 +19196,19 @@ end ParityNs
             let (seeded_files, seeded_shards, _) =
                 seed_project_theorem_shards(&mut store, &proj, tc.trim(), "trusted", false)?;
             assert!(seeded_files >= 1 && seeded_shards >= 1);
+            // Assert `load_and_classify_pr_from_git` does NOT report `lake_inputs_changed == true`
+            // (so unchanged `test/StandaloneProof.lean` stays out of `modified_files`), even when
+            // `evmyul` has `target cloneSha2` + `extern_lib libleanffi` + gitignored `sha2/libpre.a`
+            // + dirty non-Lean `EthereumTests/` submodule checkout.
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            let canon_proj = proj.canonicalize()?;
+            let (classified, _, _, _) =
+                load_and_classify_pr_from_git(&store, &canon_proj, "HEAD", tc.trim())?;
+            assert_eq!(
+                classified.modified_files,
+                vec!["Verity/Basic.lean"],
+                "materialized extern_lib/custom recipes on clean pinned git dep must not trigger lake_inputs_changed across all root files"
+            );
             let receipt = dir.join("receipt.json");
             run_pr_verify_command(
                 &mut store,
@@ -18997,6 +19423,165 @@ end ParityNs
                 None,
             )?;
             assert!(receipt2.is_file());
+            Ok(())
+        };
+        let res = run();
+        crate::zygote::purge_snapshot_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        res
+    }
+
+    #[test]
+    fn test_pr_verify_manifest_renamed_git_dep_and_path_excludes() -> Result<()> {
+        let _env_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_pr_verify_exclude_and_renamed_dep_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+
+        struct ExcludeTestClean;
+        impl Drop for ExcludeTestClean {
+            fn drop(&mut self) {
+                std::env::remove_var(crate::splitter::EXCLUDE_ENV);
+                std::env::remove_var(crate::splitter::EXCLUDE_FROM_CONFIG_ENV);
+                std::env::remove_var(crate::splitter::CLI_EXCLUDE_ENV);
+                std::env::remove_var(crate::splitter::EXCLUDE_ROOT_ENV);
+            }
+        }
+        let _clean = ExcludeTestClean;
+
+        let run = || -> Result<()> {
+            let proj = dir.join("proj");
+            fs::create_dir_all(&proj)?;
+            let tc = include_str!("../../../lean/lean-toolchain");
+            fs::write(proj.join(".gitignore"), "/.lake/\n")?;
+            fs::write(proj.join("lean-toolchain"), tc)?;
+            // Dependency declares `package ProofWidgets` (capitalized), while `lake-manifest.json`
+            // records `"name": "proofwidgets"` (lowercase), exercising `pkg_matches_manifest_name`.
+            let pw_dep = proj.join(".lake/packages/proofwidgets");
+            fs::create_dir_all(pw_dep.join("ProofWidgets"))?;
+            fs::create_dir_all(pw_dep.join("widget"))?;
+            fs::write(
+                pw_dep.join("lakefile.lean"),
+                "import Lake\nopen Lake DSL\npackage ProofWidgets\ninput_file widgetPkgJson where\n  path := \"widget/package.json\"\n  text := true\n@[default_target]\nlean_lib ProofWidgets where\n  globs := #[.one `ProofWidgets.Basic]\n  needs := #[widgetPkgJson]\n",
+            )?;
+            fs::write(
+                pw_dep.join("ProofWidgets/Basic.lean"),
+                "def pwVal : Nat := 7\n",
+            )?;
+            fs::write(pw_dep.join("widget/package.json"), "{\"v\":1}\n")?;
+            git_init_and_commit(&pw_dep, "pw init")?;
+            let pw_rev = resolve_git_commit_sha(&pw_dep, "HEAD")?;
+
+            fs::write(
+                proj.join("lakefile.toml"),
+                "name = \"demo\"\ndefaultTargets = [\"Demo\"]\n[[lean_lib]]\nname = \"Demo\"\n",
+            )?;
+            fs::write(
+                proj.join("lake-manifest.json"),
+                serde_json::json!({
+                    "version": "1.1.0",
+                    "packagesDir": ".lake/packages",
+                    "packages": [{
+                        "type": "git",
+                        "scope": "leanprover-community",
+                        "name": "proofwidgets",
+                        "manifestFile": "lake-manifest.json",
+                        "rev": pw_rev,
+                        "inherited": true,
+                        "configFile": "lakefile.lean",
+                        "inputRev": pw_rev,
+                        "url": "https://example.invalid/ProofWidgets4"
+                    }]
+                })
+                .to_string(),
+            )?;
+            fs::write(
+                proj.join("turbo-lean.toml"),
+                "[project]\nexclude = [\"experiments/**\"]\n",
+            )?;
+            fs::create_dir_all(proj.join("Demo"))?;
+            fs::create_dir_all(proj.join("experiments/sub"))?;
+            fs::write(proj.join("Demo/A.lean"), "theorem a : 1 + 1 = 2 := rfl\n")?;
+            fs::write(proj.join("Demo/B.lean"), "theorem b : 2 + 2 = 4 := rfl\n")?;
+            fs::write(proj.join("Demo.lean"), "import Demo.A\nimport Demo.B\n")?;
+            // Put an invalid/uncompilable Lean file and a theorem with sorry inside `experiments/**`
+            // on base and delete/modify them on HEAD: with `exclude = ["experiments/**"]`, neither
+            // `collect_project_lean_files`, `load_and_classify_pr_from_git`, nor `StatementSnapshot`
+            // should touch `experiments/**`.
+            fs::write(
+                proj.join("experiments/Broken.lean"),
+                "import NonExistentExperimentalPkg\ntheorem bad : False := sorry\n",
+            )?;
+            fs::write(
+                proj.join("experiments/sub/DeletedExp.lean"),
+                "theorem deleted_exp : 1 = 1 := rfl\n",
+            )?;
+            git_init_and_commit(&proj, "base")?;
+
+            // Remove `experiments/sub/DeletedExp.lean`, edit `Demo/A.lean` proof, and also attempt
+            // to sneak `Demo/**` into untrusted working-tree `turbo-lean.toml` (must be ignored
+            // because policy is pinned to `--base`!).
+            fs::remove_file(proj.join("experiments/sub/DeletedExp.lean"))?;
+            fs::write(
+                proj.join("Demo/A.lean"),
+                "theorem a : 1 + 1 = 2 := by decide\n",
+            )?;
+            fs::write(
+                proj.join("turbo-lean.toml"),
+                "[project]\nexclude = [\"experiments/**\", \"Demo/**\"]\n",
+            )?;
+
+            let canon_proj = proj.canonicalize()?;
+            std::env::set_var(crate::splitter::EXCLUDE_ENV, "experiments/**");
+            std::env::set_var(crate::splitter::EXCLUDE_FROM_CONFIG_ENV, "1");
+            std::env::set_var(crate::splitter::EXCLUDE_ROOT_ENV, &canon_proj);
+
+            let mut collected: Vec<String> =
+                crate::lake_build::collect_project_lean_files(&canon_proj, true, None)
+                    .into_iter()
+                    .map(|p| rel_path_from_dir(&p, &canon_proj))
+                    .collect();
+            collected.sort();
+            assert_eq!(collected, vec!["Demo.lean", "Demo/A.lean", "Demo/B.lean"]);
+
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            let mut store = TurboStore::open(Some(&dir.join("store")))?;
+            let (classified, _, _, _) =
+                load_and_classify_pr_from_git(&store, &canon_proj, "HEAD", tc.trim())?;
+            assert_eq!(
+                classified.modified_files,
+                vec!["Demo/A.lean"],
+                "renamed ProofWidgets/proofwidgets git dep must not mark Demo/B.lean modified, and deleted experiments/** file must be ignored"
+            );
+
+            // `StatementPolicy::at(&canon_proj, "HEAD")` must read `exclude = ["experiments/**"]`
+            // from `HEAD`, ignoring the working-tree attempt to exclude `Demo/**`.
+            let policy = StatementPolicy::at(&canon_proj, "HEAD");
+            assert_eq!(policy.excludes, vec!["experiments/**"]);
+
+            let receipt = dir.join("receipt.json");
+            run_pr_verify_command(
+                &mut store,
+                true,
+                proj.clone(),
+                "HEAD".to_string(),
+                "trusted".to_string(),
+                true,
+                Some(receipt.clone()),
+                None,
+                None,
+                None,
+                false,
+                4,
+                None,
+            )?;
+            assert!(receipt.is_file());
             Ok(())
         };
         let res = run();

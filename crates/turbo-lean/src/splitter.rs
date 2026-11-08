@@ -67,6 +67,75 @@ pub const STANDARD_AXIOMS: [&str; 3] = ["propext", "Quot.sound", "Classical.choi
 /// `main` sets it from the project config, so zygote workers and daemons inherit the same policy.
 pub const ALLOWED_AXIOMS_ENV: &str = "TURBO_LEAN_ALLOWED_AXIOMS";
 pub const ALLOWED_AXIOMS_FROM_CONFIG_ENV: &str = "TURBO_LEAN_ALLOWED_AXIOMS_FROM_CONFIG";
+pub const EXCLUDE_ENV: &str = "TURBO_LEAN_EXCLUDE";
+pub const EXCLUDE_FROM_CONFIG_ENV: &str = "TURBO_LEAN_EXCLUDE_FROM_CONFIG";
+pub const CLI_EXCLUDE_ENV: &str = "TURBO_LEAN_CLI_EXCLUDE";
+pub const EXCLUDE_ROOT_ENV: &str = "TURBO_LEAN_EXCLUDE_ROOT";
+
+pub fn configured_exclude_patterns(config_excludes: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = config_excludes
+        .iter()
+        .map(|s| s.trim().replace('\\', "/").trim_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if let Ok(cli_raw) = std::env::var(CLI_EXCLUDE_ENV) {
+        for p in cli_raw.split(',') {
+            let norm = p.trim().replace('\\', "/").trim_matches('/').to_string();
+            if !norm.is_empty() {
+                out.push(norm);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+pub fn active_exclude_patterns() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for key in [EXCLUDE_ENV, CLI_EXCLUDE_ENV] {
+        if let Ok(raw) = std::env::var(key) {
+            for p in raw.split(',') {
+                let norm = p.trim().replace('\\', "/").trim_matches('/').to_string();
+                if !norm.is_empty() {
+                    out.push(norm);
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+pub(crate) fn exclude_pattern_matches_rel_path(pat: &str, rel: &str) -> bool {
+    let pat = pat.trim().replace('\\', "/").trim_matches('/').to_string();
+    let rel = rel.trim().replace('\\', "/").trim_matches('/').to_string();
+    if pat.is_empty() || rel.is_empty() || rel == "lakefile.lean" {
+        return false;
+    }
+    if let Some(dir_prefix) = pat.strip_suffix("/**") {
+        let dp = dir_prefix.trim_end_matches('/');
+        if dp.is_empty() {
+            return true;
+        }
+        if rel == dp || rel.starts_with(&format!("{dp}/")) {
+            return true;
+        }
+    }
+    if !pat.contains('*') && rel.starts_with(&format!("{pat}/")) {
+        return true;
+    }
+    glob_match(&pat, &rel)
+}
+
+pub(crate) fn rel_path_excluded(rel: &str) -> bool {
+    let patterns = active_exclude_patterns();
+    !patterns.is_empty()
+        && patterns
+            .iter()
+            .any(|p| exclude_pattern_matches_rel_path(p, rel))
+}
 
 /// Extra non-standard axiom patterns currently configured in `TURBO_LEAN_ALLOWED_AXIOMS`.
 pub fn extra_allowed_axiom_patterns() -> Vec<String> {
@@ -231,7 +300,13 @@ pub(crate) fn current_kernel_policy_digest() -> String {
     let csimp = normalized_policy_env_vec("TURBO_LEAN_ALLOWED_CSIMP");
     let unsafe_decls = normalized_policy_env_vec("TURBO_LEAN_ALLOWED_UNSAFE");
     let impl_by = normalized_policy_env_vec("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY");
-    if axioms.is_empty() && csimp.is_empty() && unsafe_decls.is_empty() && impl_by.is_empty() {
+    let excludes = active_exclude_patterns();
+    if axioms.is_empty()
+        && csimp.is_empty()
+        && unsafe_decls.is_empty()
+        && impl_by.is_empty()
+        && excludes.is_empty()
+    {
         return String::new();
     }
     let mut h = blake3::Hasher::new();
@@ -245,6 +320,14 @@ pub(crate) fn current_kernel_policy_digest() -> String {
         h.update(tag.as_bytes());
         h.update(b":");
         for item in list {
+            h.update(&(item.len() as u64).to_le_bytes());
+            h.update(item.as_bytes());
+        }
+        h.update(b"\n");
+    }
+    if !excludes.is_empty() {
+        h.update(b"exclude:");
+        for item in &excludes {
             h.update(&(item.len() as u64).to_le_bytes());
             h.update(item.as_bytes());
         }

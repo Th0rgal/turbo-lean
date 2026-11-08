@@ -2288,6 +2288,10 @@ pub(crate) fn compute_project_interface_key_fast_summary(
             }
         }
     }
+    let active_excludes = crate::splitter::active_exclude_patterns();
+    if !active_excludes.is_empty() {
+        hasher.update(format!(":exclude:{}\n", active_excludes.join(",")).as_bytes());
+    }
     update_with_lake_input_digests(&mut hasher, project_dir)?;
 
     let lean_files = collect_project_lean_files(project_dir, true, None);
@@ -3441,6 +3445,33 @@ pub(crate) fn collect_project_lean_files(
     include_lakefile: bool,
     scope: Option<&Path>,
 ) -> Vec<PathBuf> {
+    let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let apply_excludes = !crate::splitter::active_exclude_patterns().is_empty()
+        && !canon_root
+            .components()
+            .any(|c| c.as_os_str() == "packages" || c.as_os_str() == ".lake")
+        && match std::env::var(crate::splitter::EXCLUDE_ROOT_ENV) {
+            Ok(er) if !er.trim().is_empty() => {
+                let canon_er = Path::new(er.trim())
+                    .canonicalize()
+                    .unwrap_or_else(|_| PathBuf::from(er.trim()));
+                canon_root == canon_er || (scope.is_none() && canon_root.starts_with(&canon_er))
+            }
+            _ => true,
+        };
+    let exclude_base = match std::env::var(crate::splitter::EXCLUDE_ROOT_ENV) {
+        Ok(er) if !er.trim().is_empty() => {
+            let canon_er = Path::new(er.trim())
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(er.trim()));
+            if canon_root.starts_with(&canon_er) {
+                canon_er
+            } else {
+                canon_root.clone()
+            }
+        }
+        _ => canon_root.clone(),
+    };
     let walk_root = match scope {
         Some(sc) => {
             let joined = if sc.is_absolute() {
@@ -3480,6 +3511,20 @@ pub(crate) fn collect_project_lean_files(
                 && !fname.starts_with(".turbo_statement_dump_")
                 && (include_lakefile || fname != "lakefile.lean")
             {
+                if apply_excludes && fname != "lakefile.lean" {
+                    let canon_p = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+                    let rel = canon_p
+                        .strip_prefix(&exclude_base)
+                        .or_else(|_| p.strip_prefix(root))
+                        .ok()
+                        .map(|r| r.to_string_lossy().replace('\\', "/"));
+                    if rel
+                        .as_deref()
+                        .is_some_and(crate::splitter::rel_path_excluded)
+                    {
+                        continue;
+                    }
+                }
                 lean_files.push(p.to_path_buf());
             }
         }
