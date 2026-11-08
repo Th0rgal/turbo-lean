@@ -50,14 +50,24 @@ pub fn staging_shm_dir() -> PathBuf {
     ))
 }
 
+pub fn configured_cache_root_env() -> Option<PathBuf> {
+    let non_empty = |k: &str| {
+        std::env::var(k)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    non_empty("TURBO_LEAN_HOME")
+        .or_else(|| non_empty("TURBO_LEAN_CACHE_DIR"))
+        .map(PathBuf::from)
+}
+
 /// Persistent per-user cache root for the store.
 pub fn cache_root() -> PathBuf {
-    std::env::var("TURBO_LEAN_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
-                .join(".cache/turbo-lean")
-        })
+    configured_cache_root_env().unwrap_or_else(|| {
+        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
+            .join(".cache/turbo-lean")
+    })
 }
 
 /// Package publication protocol (independent of HOME/TURBO_LEAN_HOME): every new reader
@@ -2868,6 +2878,30 @@ mod tests {
         match run_res {
             Ok(r) => r,
             Err(p) => std::panic::resume_unwind(p),
+        }
+    }
+
+    #[test]
+    fn test_cache_root_honors_turbo_lean_home_then_cache_dir() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_home_override = std::env::var("TURBO_LEAN_HOME").ok();
+        let prev_cache_dir = std::env::var("TURBO_LEAN_CACHE_DIR").ok();
+        std::env::remove_var("TURBO_LEAN_HOME");
+        std::env::set_var("TURBO_LEAN_CACHE_DIR", "/tmp/tl-cache-dir-fallback");
+        assert_eq!(cache_root(), PathBuf::from("/tmp/tl-cache-dir-fallback"));
+        std::env::set_var("TURBO_LEAN_HOME", "/tmp/tl-home-primary");
+        assert_eq!(cache_root(), PathBuf::from("/tmp/tl-home-primary"));
+        std::env::set_var("TURBO_LEAN_HOME", "   ");
+        assert_eq!(cache_root(), PathBuf::from("/tmp/tl-cache-dir-fallback"));
+        match prev_home_override {
+            Some(v) => std::env::set_var("TURBO_LEAN_HOME", v),
+            None => std::env::remove_var("TURBO_LEAN_HOME"),
+        }
+        match prev_cache_dir {
+            Some(v) => std::env::set_var("TURBO_LEAN_CACHE_DIR", v),
+            None => std::env::remove_var("TURBO_LEAN_CACHE_DIR"),
         }
     }
 }

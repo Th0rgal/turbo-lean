@@ -3606,11 +3606,8 @@ pub(super) fn resolve_audit_spec_cache_dir() -> Option<PathBuf> {
     if let Some(cli_cache) = cli_global_cache_dir_override() {
         return ensure_private_cache_dir(&cli_cache.join("audit-spec-cache-v1")).ok();
     }
-    if let Some(cache_base) = non_empty_env("TURBO_LEAN_CACHE_DIR") {
-        return ensure_private_cache_dir(&cache_base.join("audit-spec-cache-v1")).ok();
-    }
-    if let Some(home_base) = non_empty_env("TURBO_LEAN_HOME") {
-        return ensure_private_cache_dir(&home_base.join("audit-spec-cache-v1")).ok();
+    if let Some(base) = crate::shm_cache::configured_cache_root_env() {
+        return ensure_private_cache_dir(&base.join("audit-spec-cache-v1")).ok();
     }
     if let Some(staging_override) = non_empty_env("TURBO_LEAN_STAGING_DIR") {
         return ensure_private_cache_dir(&staging_override.join("audit-spec-cache-v1")).ok();
