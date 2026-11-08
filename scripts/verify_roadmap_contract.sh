@@ -53,10 +53,10 @@ if [ ! -x "$ZYGOTE_BIN" ]; then
   exit 1
 fi
 
-echo "=== [1/7] Spec & Documentation Pinning Ratchet (Contract V1) ==="
+echo "=== [1/8] Spec & Documentation Pinning Ratchet (Contract V1) ==="
 python3 "$ROOT_DIR/scripts/sync_docs_inventory.py" --check
 
-echo "=== [2/7] Multi-Hop Vacuity, Tightness & Packing Audit (audit-spec v2) ==="
+echo "=== [2/8] Multi-Hop Vacuity, Tightness & Packing Audit (audit-spec v2) ==="
 "$TURBO_BIN" --json audit-spec lean/TurboLean/Spec.lean | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
@@ -83,7 +83,7 @@ assert len(d.get('droppable_hypotheses', [])) == 0, d
 print(f'  [OK] MutantSuite.lean (M6): {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} tight (0 vacuous, 0 trivial, 0 droppable)')
 "
 
-echo "=== [2b/7] Configurable Anti-Reward-Hacking & Shadow-Namespace Gate (audit-spec v2.1, Contract V1/V2/V3) ==="
+echo "=== [2b/8] Configurable Anti-Reward-Hacking & Shadow-Namespace Gate (audit-spec v2.1, Contract V1/V2/V3) ==="
 "$TURBO_BIN" --json audit-spec --policy strict-proofs lean/LeanNative/Proofs/ lean/LeanNative/Transform/ lean/TurboLean/ConLeche.lean lean/TurboLean/ElabAudit.lean | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
@@ -93,7 +93,7 @@ assert len(d.get('stub_defs', [])) == 0, d
 print(f'  [OK] audit-spec v2.1 (strict-proofs) on M2-M5 proof & transform modules: {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} tight (0 vacuous, 0 trivial, 0 stub_defs, 0 forbidden_scope_decls)')
 "
 
-echo "=== [3/7] In-Kernel Transitive Axiom Gate (Lean.collectAxioms) ==="
+echo "=== [3/8] In-Kernel Transitive Axiom Gate (Lean.collectAxioms) ==="
 "$CORE_BIN" audit-axioms --json | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
@@ -126,7 +126,7 @@ assert not missing, f'Missing mandatory theorems in AxiomAudit: {missing}'
 print(f'  [OK] AxiomAudit: {d[\"theoremsAudited\"]} theorems verified in kernel (0 sorryAx, 0 trustCompiler)')
 "
 
-echo "=== [4/7] Verified Pass Contract & Bridge/CoreCLI Hygiene Gate (Contract V2, M4 & M5) ==="
+echo "=== [4/8] Verified Pass Contract & Bridge/CoreCLI Hygiene Gate (Contract V2, M4 & M5) ==="
 grep -q "structure VerifiedCodePassContract" lean/LeanNative/Transform/Pass.lean
 grep -q "def verifiedAlgebraicPeepholeContract : VerifiedCodePassContract" lean/LeanNative/Transform/AlgebraicOpt.lean
 grep -q "def verifiedEqSatContract.*: VerifiedCodePassContract" lean/LeanNative/Transform/EqSat.lean
@@ -152,7 +152,7 @@ assert d['verified'] is True and d['overallAssurance'] == 'VerifiedKernelProof',
 print(f'  [OK] Kernel-Proved Pass Certificates (--verified-kernel-only): verified={d[\"verified\"]}, assurance={d[\"overallAssurance\"]}, decls={len(d[\"declSummaries\"])}')
 "
 
-echo "=== [5/7] Segregated Plugin & Adversarial Mutant Gate (Law 1) ==="
+echo "=== [5/8] Segregated Plugin & Adversarial Mutant Gate (Law 1) ==="
 "$CORE_BIN" plugins --canonical-benchmark --test-adversarial --json | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
@@ -161,13 +161,13 @@ assert all(a['tvVerified'] for a in d['declAudits']), d
 print(f'  [OK] Segregated Plugins: accepted={d[\"acceptedCount\"]}, rejected={d[\"rejectedCount\"]}, adversarialRejected={d[\"adversarialRejected\"]}')
 "
 
-echo "=== [6/7] 3-Way Differential Conformance Suite, Grammar-Guided LCNF Fuzzer & P0 Trust Boundary ==="
+echo "=== [6/8] 3-Way Differential Conformance Suite, Grammar-Guided LCNF Fuzzer & P0 Trust Boundary ==="
 python3 "$ROOT_DIR/scripts/run_conformance_suite.py" --tier C1,C4 --fuzz-seeds "${CONFORMANCE_SEEDS:-32}" --asan --ubsan
 python3 -m unittest -v "$ROOT_DIR/scripts/test_p0_trust_boundary.py"
 python3 -m unittest -v "$ROOT_DIR/scripts/test_kernel_gate_audit.py"
 python3 "$ROOT_DIR/scripts/emitter_mutants.py" --unit-tests
 
-echo "=== [7/7] Stage 2 LLVM Differential (lli), Alive2 Translation Validation & lean-mlir Bridge Gate ==="
+echo "=== [7/8] Stage 2 LLVM Differential (lli), Alive2 Translation Validation & lean-mlir Bridge Gate ==="
 python3 "$ROOT_DIR/scripts/run_llvm_lli_diff.py" --self-test
 python3 "$ROOT_DIR/scripts/run_alive2_tv.py" --self-test
 python3 "$ROOT_DIR/scripts/check_lean_mlir_bridge_sync.py" --self-test
@@ -187,6 +187,20 @@ elif [ "${GITHUB_ACTIONS:-}" = "true" ] || [ "${CI:-}" = "true" ]; then
   exit 1
 else
   echo "  [SKIP] alive-tv not installed locally; run_alive2_tv.py --self-test passed (full suite enforced in CI)"
+fi
+
+echo "=== [8/8] Stage 3 GPU/TPU Differential (ptxas, OpenXLA StableHLO, Metal MSL 3.0) & LNSym Bridge Gate ==="
+python3 "$ROOT_DIR/scripts/run_gpu_tpu_diff.py" --self-test
+python3 "$ROOT_DIR/scripts/check_lnsym_bridge_sync.py" --self-test
+python3 "$ROOT_DIR/scripts/check_lnsym_bridge_sync.py"
+GPU_TPU_CACHE="${GPU_TPU_TOOLS_CACHE:-$HOME/.cache/gpu-tpu-tools}"
+if [ "${GITHUB_ACTIONS:-}" = "true" ] || [ "${CI:-}" = "true" ]; then
+  python3 "$ROOT_DIR/scripts/run_gpu_tpu_diff.py" --ensure-tools --tools-cache-dir "$GPU_TPU_CACHE" --core-bin "$CORE_BIN"
+elif ( [ -n "${PTXAS:-}" ] || command -v ptxas >/dev/null 2>&1 || [ -x "$GPU_TPU_CACHE/bin/ptxas" ] ) && \
+     PYTHONPATH="${GPU_TPU_CACHE}/site-packages${PYTHONPATH:+:$PYTHONPATH}" python3 -c "from mlir.dialects import stablehlo" >/dev/null 2>&1; then
+  python3 "$ROOT_DIR/scripts/run_gpu_tpu_diff.py" --tools-cache-dir "$GPU_TPU_CACHE" --core-bin "$CORE_BIN"
+else
+  echo "  [SKIP] ptxas / OpenXLA stablehlo wheel not cached locally; run_gpu_tpu_diff.py --self-test passed (full suite enforced in CI)"
 fi
 
 echo "=== LOCAL VALIDATION GATES PASSED (scalar corpus; full roadmap coverage remains open) ==="

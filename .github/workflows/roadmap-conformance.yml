@@ -25,6 +25,7 @@ jobs:
       conformance_seeds: ${{ steps.plan.outputs.conformance_seeds }}
       run_conformance_full: ${{ steps.plan.outputs.run_conformance_full }}
       llvm_backend: ${{ steps.plan.outputs.llvm_backend }}
+      gpu_tpu_backend: ${{ steps.plan.outputs.gpu_tpu_backend }}
       ci_scripts: ${{ steps.plan.outputs.ci_scripts }}
       force_full: ${{ steps.plan.outputs.force_full }}
       impact_digest: ${{ steps.plan.outputs.impact_digest }}
@@ -42,6 +43,9 @@ jobs:
           python3 scripts/run_alive2_tv.py --self-test
           python3 scripts/check_lean_mlir_bridge_sync.py --self-test
           python3 scripts/check_lean_mlir_bridge_sync.py
+          python3 scripts/run_gpu_tpu_diff.py --self-test
+          python3 scripts/check_lnsym_bridge_sync.py --self-test
+          python3 scripts/check_lnsym_bridge_sync.py
       - id: plan
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
@@ -82,6 +86,17 @@ jobs:
           mkdir -p "$HOME/.cache/alive2-tv"
           python3 -c "import sys; sys.path.insert(0, 'scripts'); from pathlib import Path; import run_alive2_tv as m; p = m.ensure_alive_tv(Path.home()/'.cache/alive2-tv'); print('alive-tv ready at', p)"
           echo "$HOME/.cache/alive2-tv/bin" >> "$GITHUB_PATH"
+
+      - name: Cache Stage 3 GPU/TPU tool wheels (ptxas 12.9.86 & OpenXLA StableHLO 1.12.1)
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/gpu-tpu-tools
+          key: ${{ runner.os }}-gpu-tpu-tools-ptxas12986-stablehlo1121-v1
+
+      - name: Provision or restore pinned ptxas & OpenXLA StableHLO wheels for Stage 3A/3B/3C gate
+        run: |
+          python3 scripts/run_gpu_tpu_diff.py --ensure-tools --tools-cache-dir "$HOME/.cache/gpu-tpu-tools" --self-test
+          echo "GPU_TPU_TOOLS_CACHE=$HOME/.cache/gpu-tpu-tools" >> "$GITHUB_ENV"
 
       - name: Cache Lean toolchain, Cargo registry, and build artifacts
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
@@ -172,4 +187,55 @@ jobs:
           lake exe cache get
           lake build LeanMLIRBridge
           python3 ../../scripts/check_lean_mlir_bridge_sync.py --json
+
+  lnsym-bridge:
+    needs: impact
+    if: >-
+      needs.impact.outputs.run_lean_build == 'true' &&
+      (needs.impact.outputs.gpu_tpu_backend == 'true' ||
+       needs.impact.outputs.ci_scripts == 'true' ||
+       needs.impact.outputs.force_full == 'true')
+    name: Stage 3D leanprover/LNSym Armv8 Bisimulation Bridge (0 sorryAx, 0 bv_decide)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify exact LNSym model slice synchronization & upstream SHA pins
+        run: |
+          python3 scripts/check_lnsym_bridge_sync.py --self-test
+          python3 scripts/check_lnsym_bridge_sync.py --json
+
+      - name: Cache Lean v4.35.0 toolchain & leanprover/LNSym build artifacts
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.elan
+            verification/lnsym-bridge/.lake
+          key: ${{ runner.os }}-lnsym-bridge-${{ hashFiles('verification/lnsym-bridge/lean-toolchain', 'verification/lnsym-bridge/lakefile.toml', 'verification/lnsym-bridge/lake-manifest.json', 'verification/lnsym-bridge/**/*.lean') }}
+          restore-keys: |
+            ${{ runner.os }}-lnsym-bridge-${{ hashFiles('verification/lnsym-bridge/lean-toolchain', 'verification/lnsym-bridge/lakefile.toml') }}-
+            ${{ runner.os }}-lnsym-bridge-
+
+      - name: Setup Lean toolchain for verification/lnsym-bridge
+        run: |
+          BRIDGE_TC="$(tr -d '[:space:]' < verification/lnsym-bridge/lean-toolchain)"
+          if [ ! -x "$HOME/.elan/bin/elan" ]; then
+            curl --retry 5 --retry-all-errors -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain "$BRIDGE_TC"
+          else
+            "$HOME/.elan/bin/elan" toolchain install "$BRIDGE_TC"
+          fi
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+          (cd verification/lnsym-bridge && "$HOME/.elan/bin/lean" --version)
+
+      - name: Build LNSymBridge against upstream leanprover/LNSym (0 sorryAx, 0 bv_decide kernel audit)
+        working-directory: verification/lnsym-bridge
+        run: |
+          test -f lake-manifest.json
+          lake build LNSymBridge
+          python3 ../../scripts/check_lnsym_bridge_sync.py --json
 
