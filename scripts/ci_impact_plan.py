@@ -46,8 +46,15 @@ def classify(paths, event="pull_request", ref=""):
         elif p.startswith("lean/LeanNative/Backend/"):
             domains["llvm_backend" if "LLVM" in p else "gpu_tpu_backend"] = True
             full = True
+        elif p.startswith("verification/lean-mlir-bridge/"):
+            domains["llvm_backend"] = True
+            full = True
+        elif p.startswith("verification/lnsym-bridge/"):
+            domains["gpu_tpu_backend"] = True
+            full = True
         elif p.startswith("verification/"):
             domains["llvm_backend"] = True
+            domains["gpu_tpu_backend"] = True
             full = True
         elif p.startswith("lean/LeanNative/"):
             domains["lean_ir_semantics"] = True
@@ -114,7 +121,13 @@ class Tests(unittest.TestCase):
         pv = classify(["verification/lean-mlir-bridge/LeanMLIRBridge/Bisimulation.lean"])
         for k in ("llvm_backend", "run_lean_build", "run_conformance_full"):
             self.assertTrue(pv[k])
+        self.assertFalse(pv["gpu_tpu_backend"])
         self.assertEqual(pv["conformance_seeds"], 50)
+        pl = classify(["verification/lnsym-bridge/LNSymBridge/Bisimulation.lean"])
+        for k in ("gpu_tpu_backend", "run_lean_build", "run_conformance_full"):
+            self.assertTrue(pl[k])
+        self.assertFalse(pl["llvm_backend"])
+        self.assertEqual(pl["conformance_seeds"], 50)
 
     def test_cli(self):
         p = classify(["crates/turbo-lean/src/cli.rs"])

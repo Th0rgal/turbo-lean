@@ -1,0 +1,11 @@
+name = "lnsym-bridge"
+version = "0.1.0"
+defaultTargets = ["LNSymBridge"]
+
+[[require]]
+name = "lnsym"
+git = "https://github.com/leanprover/LNSym.git"
+rev = "49f8a1d9e46f8dcfc345f4bc15d35b0ba845ff5c"
+
+[[lean_lib]]
+name = "LNSymBridge"

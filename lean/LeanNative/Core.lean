@@ -92,6 +92,7 @@ import LeanNative.Transform.CostAutotune
 import LeanNative.Proofs.CostAutotuneSoundness
 import LeanNative.Driver.CostAutotuneCLI
 import LeanNative.Driver.LLVMDiffCLI
+import LeanNative.Driver.GPUDiffCLI
 
 namespace LeanNative.Core
 
