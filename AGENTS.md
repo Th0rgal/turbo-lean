@@ -5,7 +5,7 @@
 `turbo-lean` (unifying `TurboLean` and `LeanNative`), `lean-sys`, and `orb` form a co-designed formal verification, native compilation, and systems runtime stack for Lean 4:
 
 - **`turbo-lean` (`lean/TurboLean/` + `crates/turbo-lean/` — Incremental Verification, Zygote Elaboration & Counterexample Triage)**:
-  Partitions Lean modules into topological dependency cones and sub-proof cuts, caches artifacts across content-addressed memory and persistent stores, orchestrates warm `Command.State` Zygote workers, exposes an MCP server (`turbo_fast_check`, `turbo_agent_step`, `turbo_audit_spec`, `turbo_check`, `turbo_pr_verify`, `turbo_status`) with structured counterexample triage (`CandidateBug | SpecTooStrong | ReferenceDiscrepancy`), and enforces an in-kernel soundness gate (`0 sorryAx`, `0 native_decide`, `0 trustCompiler`, statement pinning, and nested-inductive hygiene).
+  Partitions Lean modules into topological dependency cones and sub-proof cuts, caches artifacts across content-addressed memory and persistent stores, orchestrates warm `Command.State` Zygote workers, exposes an MCP server (`turbo_fast_check`, `turbo_agent_step`, `turbo_audit_spec`, `turbo_check_decl`, `turbo_pr_verify`, `turbo_cluster_status`) with structured counterexample triage (`CandidateBug | SpecTooStrong | ReferenceDiscrepancy`), and enforces an in-kernel soundness gate (`0 sorryAx`, `0 native_decide`, `0 trustCompiler`, statement pinning, and nested-inductive hygiene).
 - **`LeanNative` (`lean/LeanNative/` — Verified `LNIR` Native Compiler, Acceleration Plugins & Hardware Fast-Check)**:
   Embedded directly in `lean/LeanNative/`. Lowers pure Lean 4 / `LNIR` (`letBind`, `incRef`, `decRef`, `call`, `parFor`, 256-bit arithmetic) via `@[simd]`, `@[gpu]`, `@[tpu]`, and `@[superopt]` plugins into verified C-ABI SIMD, LLVM IR, NVIDIA PTX, Apple Metal 3.0, and Cloud TPU v6e (`StableHLO` / `Pallas`) kernels. Certifies counterexamples (`leannative_certify_cex_witnesses`, `leannative_fastcheck_rewrite_step`) and spec non-vacuity via executable operational semantics (`evalCode`) and symbolic translation validation (`CodeRefines`) with **803 `AxiomAudit`-verified `LeanNative.*` theorems** (808 unique audited theorems overall; `<!-- inventory:leannative_tight_specs -->124/124<!-- /inventory:leannative_tight_specs -->` tight specs in `lean/LeanNative/Spec.lean`).
 - **`lean-sys` & `orb` (`Th0rgal/lean-sys` & `Th0rgal/sandboxed.sh` — Verified Systems & Orchestration Kernels)**:
@@ -21,7 +21,7 @@ Agent / CLI / MCP ──► Stage 0: Cone & CAS Filter (`TurboLean/Spec.lean` + 
 
 ---
 
-## 2. Seven Non-Negotiable Engineering Rules
+## 2. Eight Non-Negotiable Engineering Rules
 
 1. **Zero Model-Code Gap via Direct C-ABI (`@[inline, export]`)**:
    Executable decision gates, cost models, counterexample triage rules, and state transitions affecting soundness or routing live in `lean/TurboLean/Spec.lean`, `lean/TurboLean/PolicyGates.lean` (C-ABI gates; `lean/TurboLean/Kernel.lean` is an export alias), and `lean/LeanNative/Spec.lean` (with zero compiler-frontend dependencies) and are compiled directly to unboxed C-ABI primitives (`<!-- inventory:turbo_cabi_exports -->80<!-- /inventory:turbo_cabi_exports -->` symbols in `libturbo_spec_cabi.a`). Host runtimes call the compiled Lean specification directly instead of re-implementing shadow logic in Rust.
