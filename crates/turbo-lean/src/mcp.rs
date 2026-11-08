@@ -1722,7 +1722,7 @@ fn mcp_tool_schema(
     serde_json::json!({ "name": name, "description": desc, "inputSchema": schema })
 }
 
-/// Return the MCP `"tools/list"` definitions for the 6 universal `turbo-lean` tools.
+/// Return the MCP `"tools/list"` definitions for the 7 universal `turbo-lean` tools.
 pub fn mcp_tools_list_value() -> serde_json::Value {
     use serde_json::json;
     json!({
@@ -1733,6 +1733,7 @@ pub fn mcp_tools_list_value() -> serde_json::Value {
             mcp_tool_schema("turbo_audit_spec", "Run Tier 1 (vacuity, tautology, constant shadowing) & Tier 2 (unused private decls, horizontal packing) specification audit on a Lean file or declaration in < 1 ms.", json!({"file":{"type":"string"},"decl":{"type":"string"},"require_nonempty":{"type":"boolean","default":false}}), &["file"]),
             mcp_tool_schema("turbo_pr_verify", "Git-aware incremental PR verifier: diffs against `--base` and verifies modified theorem proofs in isolation.", json!({"project_dir":{"type":"string","default":"."},"base":{"type":"string","default":"HEAD"},"mode":{"type":"string","default":"trusted"},"disallow_statement_changes":{"type":"boolean","default":false},"exclude":{"type":"array","items":{"type":"string"}}}), &[]),
             mcp_tool_schema("turbo_cluster_status", "Return live multi-backend & federated cluster health, Law 15 optimal route selection, and the Lean C-ABI vs Rust speed audit.", json!({"bench_cabi":{"type":"boolean","default":true}}), &[]),
+            mcp_tool_schema("turbo_agent_analytics", "Read or reset the shared `/dev/shm` multi-agent telemetry, token-savings, and declaration bottleneck ledger.", json!({"reset":{"type":"boolean","default":false}}), &[]),
         ]
     })
 }
@@ -2212,7 +2213,7 @@ mod tests {
         assert_eq!(init_resp["result"]["serverInfo"]["name"], "turbo-lean-mcp");
         assert_eq!(init_resp["result"]["serverInfo"]["version"], "0.5.0");
 
-        // 2. Test `tools/list` returns the 6 universal MCP tools
+        // 2. Test `tools/list` returns the 7 universal MCP tools
         let list_req =
             serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}});
         let list_resp = handle_mcp_jsonrpc_request(&list_req, None, None)
@@ -2220,7 +2221,7 @@ mod tests {
         let tools = list_resp["result"]["tools"]
             .as_array()
             .expect("tools array");
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 7);
         let tool_names: Vec<&str> = tools
             .iter()
             .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
@@ -2234,7 +2235,16 @@ mod tests {
                 "turbo_audit_spec",
                 "turbo_pr_verify",
                 "turbo_cluster_status",
+                "turbo_agent_analytics",
             ]
+        );
+        assert_eq!(
+            tools[6]["inputSchema"]["properties"]["reset"]["type"],
+            "boolean"
+        );
+        assert_eq!(
+            tools[6]["inputSchema"]["properties"]["reset"]["default"],
+            false
         );
 
         // 3. Test `compact_for_llm` reduces payload size by > 4x (`compact_bytes * 4 <= verbose_bytes`)
@@ -2311,6 +2321,17 @@ mod tests {
                 .unwrap_or(0)
                 > 500
         );
+        let reset_req = serde_json::json!({
+            "jsonrpc": "2.0", "id": 6, "method": "tools/call",
+            "params": { "name": "turbo_agent_analytics", "arguments": { "reset": true } }
+        });
+        let reset_resp = handle_mcp_jsonrpc_request(&reset_req, None, None).unwrap();
+        let reset_val: serde_json::Value =
+            serde_json::from_str(reset_resp["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(reset_val["total_calls"], 0);
+        assert_eq!(reset_val["stage1_tpu_rejects"], 0);
+        assert_eq!(reset_val["estimated_tokens_saved"], 0);
 
         // 7. Test Content-Length framing reader roundtrip
         let framed_body = r#"{"jsonrpc":"2.0","id":9,"method":"ping"}"#;

@@ -2448,7 +2448,7 @@ fn execute_check_shards_batch_payload_deferred(
     ))
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn execute_fastcheck_payload(
     store: &TurboStore,
     req: &FastCheckHttpRequest,

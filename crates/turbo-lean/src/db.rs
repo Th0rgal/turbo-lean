@@ -14,14 +14,6 @@ pub fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
-#[allow(dead_code)]
-pub fn boot_id() -> String {
-    fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .unwrap_or_else(|_| "unknown-boot".to_string())
-        .trim()
-        .to_string()
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlobEntry {
     pub blob_hash: String,

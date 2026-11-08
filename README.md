@@ -97,7 +97,9 @@ turbo-lean export -o cache.tlpack && turbo-lean import cache.tlpack
 ### GitHub Action (`uses: Th0rgal/turbo-lean@main`)
 
 ```yaml
+# (a) Untrusted PR verification (`pull_request`) with statement pinning & receipt output
 - name: Incremental Lean 4 PR Verification
+  id: verify
   uses: Th0rgal/turbo-lean@main
   with:
     project-dir: "."
@@ -106,6 +108,31 @@ turbo-lean export -o cache.tlpack && turbo-lean import cache.tlpack
     base-ref: "origin/main"
     disallow-statement-changes: "true"
     receipt-path: "receipt.json"
+
+# (b) Main-branch CI verification (`push`) with portable .tlpack CAS & GDSF GC
+- name: Lean 4 CI Verification & Portable CAS Seed
+  id: ci
+  uses: Th0rgal/turbo-lean@main
+  with:
+    project-dir: "."
+    command: "ci-verify"
+    mode: "trusted"
+    seed-shards: "true"
+    cache-key-prefix: "turbo-lean-cas"
+    max-reclaimable-bytes: "2147483648"
+    receipt-path: "ci-receipt.json"
+
+# (c) Optional remote prebuild fetch (outputs: status, interface-hash, action-key, theorem-shards, failing-module, artifact-sha256)
+- name: Fetch Remote Prebuild Artifact
+  id: prebuild
+  uses: Th0rgal/turbo-lean@main
+  with:
+    project-dir: "."
+    command: "remote-prebuild"
+    remote-prebuild-url: ${{ vars.TURBO_LEAN_PREBUILD_URL }}
+    remote-prebuild-output: "prebuild.export.zst"
+    remote-prebuild-format: "export.zst"
+    remote-prebuild-timeout-secs: "300"
 ```
 
 ---
