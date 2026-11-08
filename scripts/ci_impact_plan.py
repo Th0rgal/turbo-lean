@@ -25,18 +25,24 @@ def is_doc(path):
     )
 
 
+def is_sdk(path):
+    return path.startswith("sdk/")
+
+
 def classify(paths, event="pull_request", ref=""):
     force = event in {"workflow_dispatch", "schedule"} or (
         event == "push" and ref in {"main", "refs/heads/main"}
     )
-    domains = dict.fromkeys(("ci_scripts", "rust_cli", "lean_turbo",
+    domains = dict.fromkeys(("ci_scripts", "sdk", "rust_cli", "lean_turbo",
                             "lean_ir_semantics", "llvm_backend",
                             "gpu_tpu_backend", "c_abi_runtime"), False)
     full = force
     for p in paths:
         if is_doc(p):
             continue
-        if p.startswith(("scripts/", ".github/")):
+        if is_sdk(p):
+            domains["sdk"] = True
+        elif p.startswith(("scripts/", ".github/")):
             domains["ci_scripts"] = True
             full = True
         elif p.startswith("crates/turbo-lean/src/") and p.endswith("cli.rs"):
@@ -59,15 +65,16 @@ def classify(paths, event="pull_request", ref=""):
         elif p.startswith("lean/LeanNative/"):
             domains["lean_ir_semantics"] = True
             full = True
-        elif p.startswith(("runtime/", "crates/")):
+        elif p.startswith(("runtime/", "crates/", "plugins/")):
             domains["c_abi_runtime"] = True
             full = True
         else:
             # Unknown inputs, manifests, dependencies and policy fail closed.
             full = True
     docs = bool(paths) and all(map(is_doc, paths))
+    preflight_only = bool(paths) and all(is_doc(p) or is_sdk(p) for p in paths)
     return dict(domains, docs_only=docs, force_full=force,
-                run_lean_build=force or not docs,
+                run_lean_build=force or not preflight_only,
                 run_conformance_full=full,
                 conformance_seeds=64 if force else 50 if full else 16)
 
@@ -84,8 +91,10 @@ def tree_digest(head):
     # Git blob identities transitively include contents; tree records also bind
     # file modes, paths and submodule commits. No checkout-dependent reads.
     records = git("ls-tree", "-rz", "--full-tree", head).split(b"\0")
-    return digest_records(r for r in records if r and not is_doc(
-        r.split(b"\t", 1)[1].decode("utf-8", "surrogateescape")))
+    return digest_records(r for r in records if r and not (
+        is_doc(p := r.split(b"\t", 1)[1].decode("utf-8", "surrogateescape"))
+        or is_sdk(p)
+    ))
 
 
 def plan_trees(base, head, event, ref):
@@ -96,9 +105,16 @@ def plan_trees(base, head, event, ref):
     plan["impact_digest"] = tree_digest(head)
     plan["base_impact_digest"] = tree_digest(base)
     plan["inputs_unchanged"] = plan["impact_digest"] == plan["base_impact_digest"]
-    # A path-based docs-only decision must also agree with immutable-tree
+    # A path-based docs/sdk-only decision must also agree with immutable-tree
     # content identity. This is an impact gate, not a successful-build receipt.
-    plan["run_lean_build"] = (plan["force_full"] or not plan["docs_only"]
+    preflight_only = plan["docs_only"] or (
+        plan["sdk"] and not any(
+            plan[k] for k in ("ci_scripts", "rust_cli", "lean_turbo",
+                              "lean_ir_semantics", "llvm_backend",
+                              "gpu_tpu_backend", "c_abi_runtime")
+        ) and not plan["run_conformance_full"]
+    )
+    plan["run_lean_build"] = (plan["force_full"] or not preflight_only
                               or not plan["inputs_unchanged"])
     return plan, paths
 
@@ -128,6 +144,29 @@ class Tests(unittest.TestCase):
             self.assertTrue(pl[k])
         self.assertFalse(pl["llvm_backend"])
         self.assertEqual(pl["conformance_seeds"], 50)
+
+    def test_sdk_and_plugins(self):
+        ps = classify(["sdk/accelerator-template/plugin.py"])
+        self.assertTrue(ps["sdk"])
+        self.assertFalse(ps["docs_only"])
+        self.assertFalse(ps["run_lean_build"])
+        self.assertFalse(ps["run_conformance_full"])
+        self.assertEqual(ps["conformance_seeds"], 16)
+        pm = classify(["README.md", "sdk/accelerator-template/validate.py"])
+        self.assertTrue(pm["sdk"])
+        self.assertFalse(pm["docs_only"])
+        self.assertFalse(pm["run_lean_build"])
+        self.assertFalse(pm["run_conformance_full"])
+        pp = classify(["plugins/verity_yul_plugin.py"])
+        self.assertTrue(pp["c_abi_runtime"])
+        self.assertTrue(pp["run_lean_build"])
+        self.assertTrue(pp["run_conformance_full"])
+        self.assertEqual(pp["conformance_seeds"], 50)
+        for event, ref in (("push", "refs/heads/main"),
+                           ("workflow_dispatch", ""), ("schedule", "")):
+            pf = classify(["sdk/accelerator-template/plugin.py"], event, ref)
+            for k in ("force_full", "run_lean_build", "run_conformance_full"):
+                self.assertTrue(pf[k])
 
     def test_cli(self):
         p = classify(["crates/turbo-lean/src/cli.rs"])
@@ -211,6 +250,24 @@ class Tests(unittest.TestCase):
             renamed = plan(before_rename)
             self.assertEqual(renamed["changed_files"], ["README.md", "policy.txt"])
             self.assertTrue(renamed["run_conformance_full"])
+            (root / "sdk").mkdir()
+            (root / "sdk" / "foo.py").write_text("print(1)\n")
+            sdk_base = commit()
+            (root / "sdk" / "foo.py").write_text("print(2)\n")
+            sdk_edit = commit()
+            sdk_plan = plan(sdk_base, sdk_edit)
+            self.assertTrue(sdk_plan["sdk"])
+            self.assertFalse(sdk_plan["run_lean_build"])
+            self.assertTrue(sdk_plan["inputs_unchanged"])
+            (root / "crates").mkdir()
+            (root / "sdk" / "foo.py").rename(root / "crates" / "foo.rs")
+            sdk_renamed_head = commit()
+            sdk_renamed = plan(sdk_edit, sdk_renamed_head)
+            self.assertEqual(sorted(sdk_renamed["changed_files"]), ["crates/foo.rs", "sdk/foo.py"])
+            self.assertTrue(sdk_renamed["c_abi_runtime"])
+            self.assertTrue(sdk_renamed["run_lean_build"])
+            self.assertTrue(sdk_renamed["run_conformance_full"])
+            self.assertFalse(sdk_renamed["inputs_unchanged"])
             for event in ("workflow_dispatch", "schedule"):
                 forced = plan(base, docs, "--event", event)
                 self.assertTrue(forced["force_full"])
@@ -226,7 +283,14 @@ def verify_plan_invariants(plan):
         digest = plan.get(key, "")
         if not (isinstance(digest, str) and len(digest) == 64):
             raise AssertionError(f"invalid {key}: {digest!r}")
-    expected_build = (plan["force_full"] or not plan["docs_only"]
+    preflight_only = plan["docs_only"] or (
+        plan.get("sdk", False) and not any(
+            plan[k] for k in ("ci_scripts", "rust_cli", "lean_turbo",
+                              "lean_ir_semantics", "llvm_backend",
+                              "gpu_tpu_backend", "c_abi_runtime")
+        ) and not plan["run_conformance_full"]
+    )
+    expected_build = (plan["force_full"] or not preflight_only
                       or not plan["inputs_unchanged"])
     if plan["run_lean_build"] != expected_build:
         raise AssertionError(f"run_lean_build mismatch: {plan}")

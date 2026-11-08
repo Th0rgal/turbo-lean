@@ -1,0 +1,9 @@
+not-json-at-all
+["unexpected","json","array"]
+{"decl_name":"corrupt_wire_req","target":"x86_64","budget_ms":25,"wire":"LNIR_WIRE_V1|ZZZZ_BAD_HEX|1"}
+{"decl_name":"truncated_wire_req","target":"x86_64","budget_ms":25,"wire":"LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl"}
+{"decl_name":"corrupt_facts_req","target":"x86_64","budget_ms":25,"wire":"LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|6d756c5f74776f5f6164645f7a65726f|A_L2|0|1|0|78|0|T_i64|T_i64|C_let|1|T_i64|E_scalar|S_bin|B_mul|S_var|0|S_u64|2|C_let|2|T_i64|E_scalar|S_bin|B_add|S_var|1|S_u64|0|C_ret|2|F_facts|not_a_nat"}
+{"decl_name":"bool_budget_false","target":"x86_64","budget_ms":false,"wire":"LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|6d756c5f74776f5f6164645f7a65726f|A_L2|0|1|0|78|0|T_i64|T_i64|C_let|1|T_i64|E_scalar|S_bin|B_mul|S_var|0|S_u64|2|C_let|2|T_i64|E_scalar|S_bin|B_add|S_var|1|S_u64|0|C_ret|2"}
+{"decl_name":"bool_budget_true","target":"x86_64","budget_ms":true,"wire":"LNIR_WIRE_V1|506c7567696e53696e676c65|1|D_decl|6d756c5f74776f5f6164645f7a65726f|A_L2|0|1|0|78|0|T_i64|T_i64|C_let|1|T_i64|E_scalar|S_bin|B_mul|S_var|0|S_u64|2|C_let|2|T_i64|E_scalar|S_bin|B_add|S_var|1|S_u64|0|C_ret|2"}
+{"decl_name":12345,"stmt_src":null,"body_src":{},"available_constants":"not-a-list","budget_ms":-5}
+{}

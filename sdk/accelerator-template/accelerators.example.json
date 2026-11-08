@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "default_budget_ms": 25,
+  "disabled_builtins": [],
+  "external": [
+    {
+      "name": "plugin:sdk-template",
+      "command": ["python3", "sdk/accelerator-template/plugin.py"],
+      "timeout_ms": 25,
+      "trigger_tactics": []
+    }
+  ]
+}
