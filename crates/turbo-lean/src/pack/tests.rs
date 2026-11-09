@@ -319,7 +319,7 @@ fn test_fastcheck_binary_cas_cache_hit() -> Result<()> {
         .unwrap_or("")
         .contains("Checked 1,000,000 256-bit states"));
 
-    // Verify shared-bin sidecar self-healing on empty `"0\n"` and preservation on non-empty counterexamples:
+    // Verify shared-bin sidecar self-healing on failed (`0\n...`) sidecars and non-caching of failing binaries:
     let shared_staging = dir.join("shared_staging");
     save_compiled_bin_to_shared(&shared_staging, src, &cached_bin);
     let shared_bin = shared_fastcheck_cgen_path(&shared_staging, src);
@@ -328,13 +328,36 @@ fn test_fastcheck_binary_cas_cache_hit() -> Result<()> {
     assert!(fs::read_to_string(shared_bin.with_extension("out"))?.starts_with("1\n"));
     fs::write(
         shared_bin.with_extension("out"),
-        b"0\ncounterexample: x = 7\n",
+        b"0\nuncertified crash output\n",
     )?;
     ensure_shared_fastcheck_out(&shared_bin);
-    assert_eq!(
-        fs::read_to_string(shared_bin.with_extension("out"))?,
-        "0\ncounterexample: x = 7\n"
-    );
+    assert!(fs::read_to_string(shared_bin.with_extension("out"))?.starts_with("1\n"));
+
+    let fail_src = "def main : IO Unit := throw (IO.userError \"boom\")\n";
+    let fail_key = compute_fastcheck_binary_key(false, fail_src);
+    let fail_bin = bin_dir.join(&fail_key);
+    fs::write(&fail_bin, b"#!/bin/sh\necho 'boom'\nexit 1\n")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&fail_bin)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&fail_bin, perms)?;
+    }
+    let fail_req = FastCheckHttpRequest {
+        filename: "fail.lean".into(),
+        source: fail_src.into(),
+        gpu: false,
+        precomputed_bin_key: String::new(),
+        has_main: Some(true),
+        local_path: String::new(),
+    };
+    let fail_res = execute_fastcheck_payload(&store, &fail_req)?;
+    assert_eq!(fail_res["status"].as_str(), Some("execution_failed"));
+    assert_eq!(fail_res["ok"].as_bool(), Some(false));
+    assert_eq!(fail_res["lean_native_certified"].as_bool(), Some(false));
+    assert_eq!(fail_res["certification"].as_str(), Some("unavailable"));
+    assert!(!fail_bin.with_extension("out").exists());
 
     let _ = fs::remove_dir_all(&dir);
     Ok(())

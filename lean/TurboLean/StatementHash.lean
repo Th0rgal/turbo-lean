@@ -64,6 +64,45 @@ private def quotJson : QuotKind → Json
 def statement (c : ConstantInfo) (normName : Name → Name := id) : Json :=
   node "statement-v1" #[toJson (c.levelParams.map (nameJson normName)), exprJson normName c.type]
 
+private def moduleToSuffix : Name → String
+  | .anonymous => ""
+  | .num n _ => moduleToSuffix n
+  | .str n s => moduleToSuffix n ++ "_" ++ s.decapitalize
+
+private def isAnonInstIndexTail (post : String) : Bool :=
+  post.isEmpty ||
+    (post.startsWith "_" &&
+      (((post.drop 1).toString.splitOn "_").all fun seg => !seg.isEmpty && seg.all Char.isDigit))
+
+private def normalizeLocalAnonInstance (localMod? : Option Name) (n : Name) : Name :=
+  match localMod? with
+  | none => n
+  | some mod =>
+    let modSuffix := moduleToSuffix mod.getRoot
+    let fixLeaf : Name → Name
+      | .str p s =>
+        if !modSuffix.isEmpty && s.startsWith "inst" then
+          match (s.splitOn modSuffix).reverse with
+          | post :: revPre =>
+            if !revPre.isEmpty then
+              let pre := String.intercalate modSuffix revPre.reverse
+              if pre.length > "inst".length && isAnonInstIndexTail post then
+                .str p (pre ++ post)
+              else
+                .str p s
+            else
+              .str p s
+          | [] => .str p s
+        else
+          .str p s
+      | other => other
+    let n1 := n.modifyBase fixLeaf
+    if n1.hasMacroScopes then
+      let view := Lean.extractMacroScopes n1
+      if view.ctx == mod then { view with ctx := .anonymous }.review else n1
+    else
+      n1
+
 def normalizeLocalPrivateName (localMod? : Option Name) (n : Name) : Name :=
   match Lean.privatePrefix? n with
   | some pfx =>
@@ -71,43 +110,43 @@ def normalizeLocalPrivateName (localMod? : Option Name) (n : Name) : Name :=
       | some m => pfx == Lean.mkPrivateNameCore m .anonymous || pfx == Lean.mkPrivateNameCore .anonymous .anonymous
       | none => pfx == Lean.mkPrivateNameCore .anonymous .anonymous
     if isLocal then
-      Lean.mkPrivateNameCore .anonymous (Lean.privateToUserName n)
+      Lean.mkPrivateNameCore .anonymous (normalizeLocalAnonInstance localMod? (Lean.privateToUserName n))
     else
       n
-  | none => n
+  | none => normalizeLocalAnonInstance localMod? n
 
 -- Theorems contribute their type, never their proof (proof irrelevance).
 -- Recursor reduction rules and inductive/constructor metadata are kernel inputs too.
-private def interface (c : ConstantInfo) : Json × Array Name := Id.run do
+private def interface (c : ConstantInfo) (normName : Name → Name := id) : Json × Array Name := Id.run do
   let mut deps := c.type.getUsedConstants
   let kind ← match c with
     | .defnInfo v =>
       deps := deps ++ v.value.getUsedConstants
-      pure <| node "definition" #[exprJson id v.value, hintsJson v.hints, toJson (reprStr v.safety)]
+      pure <| node "definition" #[exprJson normName v.value, hintsJson v.hints, toJson (reprStr v.safety)]
     | .opaqueInfo v =>
       deps := deps ++ v.value.getUsedConstants
-      pure <| node "opaque" #[exprJson id v.value, toJson v.isUnsafe]
+      pure <| node "opaque" #[exprJson normName v.value, toJson v.isUnsafe]
     | .thmInfo _ => pure <| node "theorem"
     | .axiomInfo v => pure <| node "axiom" #[toJson v.isUnsafe]
     | .quotInfo v => pure <| node "quotient" #[quotJson v.kind]
     | .inductInfo v =>
       deps := deps ++ v.all.toArray ++ v.ctors.toArray
       pure <| node "inductive" #[toJson v.numParams, toJson v.numIndices,
-        toJson (v.all.map (nameJson id)), toJson (v.ctors.map (nameJson id)),
+        toJson (v.all.map (nameJson normName)), toJson (v.ctors.map (nameJson normName)),
         toJson v.numNested, toJson v.isRec, toJson v.isUnsafe, toJson v.isReflexive]
     | .ctorInfo v =>
       deps := deps.push v.induct
-      pure <| node "constructor" #[nameJson id v.induct, toJson v.cidx,
+      pure <| node "constructor" #[nameJson normName v.induct, toJson v.cidx,
         toJson v.numParams, toJson v.numFields, toJson v.isUnsafe]
     | .recInfo v =>
       deps := deps ++ v.all.toArray
       for r in v.rules do
         deps := deps.push r.ctor ++ r.rhs.getUsedConstants
-      pure <| node "recursor" #[toJson (v.all.map (nameJson id)), toJson v.numParams,
+      pure <| node "recursor" #[toJson (v.all.map (nameJson normName)), toJson v.numParams,
         toJson v.numIndices, toJson v.numMotives, toJson v.numMinors, toJson v.k,
         toJson v.isUnsafe, toJson (v.rules.map fun r =>
-          node "rule" #[nameJson id r.ctor, toJson r.nfields, exprJson id r.rhs])]
-  return (node "interface-v1" #[statement c, kind], deps)
+          node "rule" #[nameJson normName r.ctor, toJson r.nfields, exprJson normName r.rhs])]
+  return (node "interface-v1" #[statement c normName, kind], deps)
 
 private def emit (j : Json) : IO Unit := do (← IO.getStdout).putStrLn j.compress
 
@@ -216,6 +255,7 @@ def collectAxiomsCached (env : Environment) (c : Name) (memo : AxiomMemo) : Arra
 def dumpWithState (env : Environment) (mod : Name) (seenInit : NameSet := {})
     (axMemoInit : AxiomMemo := {}) : IO (NameSet × AxiomMemo) := do
   let some idx := env.getModuleIdx? mod | throw <| IO.userError s!"missing module {mod}"
+  let normName := normalizeLocalPrivateName (some mod)
   let mut pending : Array Name := #[]
   let mut unsafeDecls : Array (String × String) := #[]
   let mut unsafeInductives : Array String := #[]
@@ -251,7 +291,7 @@ def dumpWithState (env : Environment) (mod : Name) (seenInit : NameSet := {})
         implByDecls := implByDecls.push (c.name.toString, (Lean.privateToUserName c.name).toString)
     if c.isTheorem then
       emit <| Json.mkObj [("theorem", toJson c.name.toString),
-        ("statement", statement c), ("deps", toJson (c.type.getUsedConstants.map Name.toString))]
+        ("statement", statement c normName), ("deps", toJson (c.type.getUsedConstants.map Name.toString))]
       pending := pending ++ c.type.getUsedConstants
   for extraName in mdata.extraConstNames do
     if Lean.isExtern env extraName then
@@ -270,7 +310,13 @@ def dumpWithState (env : Environment) (mod : Name) (seenInit : NameSet := {})
     if seen.contains n then continue
     seen := seen.insert n
     let some c := env.find? n | throw <| IO.userError s!"missing constant {n}"
-    let (payload, deps) := interface c
+    let cNormName := match env.getModuleIdxFor? n with
+      | some cIdx =>
+        match env.header.moduleNames[cIdx.toNat]? with
+        | some cMod => normalizeLocalPrivateName (some cMod)
+        | none => id
+      | none => id
+    let (payload, deps) := interface c cNormName
     emit <| Json.mkObj [("constant", toJson n.toString), ("interface", payload),
       ("deps", toJson (deps.map Name.toString))]
     pending := pending ++ deps

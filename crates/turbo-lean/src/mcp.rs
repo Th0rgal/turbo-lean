@@ -1102,9 +1102,7 @@ impl StepVerdict {
             .and_then(|v| v.as_str())
             .unwrap_or(if compact_ok { "ok" } else { "error" })
             .to_string();
-        let is_cex = compact.get("kind").and_then(|v| v.as_str()) == Some("cex")
-            || status == "counterexample_rejected"
-            || status == "counterexample_found";
+        let is_cex = compact.get("kind").and_then(|v| v.as_str()) == Some("cex");
         let res = Self {
             ok: compact_ok,
             status,
@@ -1145,13 +1143,23 @@ pub fn compact_for_llm(verbose: &serde_json::Value) -> serde_json::Value {
         .unwrap_or(1.0);
     let verbose_bytes = serde_json::to_vec(verbose).map(|v| v.len()).unwrap_or(1680);
 
-    let is_cex = status == "counterexample_rejected"
-        || status == "counterexample_found"
-        || verbose
-            .get("violations")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0)
-            > 0;
+    let raw_violations = verbose
+        .get("violations")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let explicitly_uncertified = verbose
+        .get("lean_native_certified")
+        .and_then(|v| v.as_bool())
+        == Some(false);
+    let is_uncertified_violation = status == "uncertified_violation"
+        || (explicitly_uncertified
+            && (raw_violations > 0
+                || status == "counterexample_found"
+                || status == "counterexample_rejected"));
+    let is_cex = !is_uncertified_violation
+        && (status == "counterexample_rejected"
+            || status == "counterexample_found"
+            || raw_violations > 0);
     if is_cex {
         let witness = extract_compact_witness(verbose);
         let fix_hint_opt = verbose
@@ -1186,16 +1194,20 @@ pub fn compact_for_llm(verbose: &serde_json::Value) -> serde_json::Value {
         });
     }
 
-    let is_verified = verbose.get("verified").and_then(|v| v.as_bool()) == Some(true)
-        || matches!(
-            status,
-            "verified"
-                | "theorem_verified"
-                | "theorem_cache_hit"
-                | "all_shards_cached"
-                | "file_verified"
-                | "ok"
-        );
+    let explicitly_unverified = verbose.get("verified").and_then(|v| v.as_bool()) == Some(false)
+        || verbose.get("ok").and_then(|v| v.as_bool()) == Some(false);
+    let is_verified = !is_uncertified_violation
+        && !explicitly_unverified
+        && (verbose.get("verified").and_then(|v| v.as_bool()) == Some(true)
+            || matches!(
+                status,
+                "verified"
+                    | "theorem_verified"
+                    | "theorem_cache_hit"
+                    | "all_shards_cached"
+                    | "file_verified"
+                    | "ok"
+            ));
     if is_verified {
         let stage = if status.contains("cache") || status == "all_shards_cached" {
             "cas_hit"
@@ -1306,9 +1318,11 @@ pub fn execute_fast_check(
                     let proj_root = project_dir
                         .map(Path::to_path_buf)
                         .unwrap_or_else(|| crate::lake_build::find_project_root(&resolved_path));
+                    let df =
+                        decl.filter(|d| !d.is_empty() && !matches!(*d, "auto" | "fastcheck_decl"));
                     match crate::gpu_fastcheck::extract_confirmed_fastcheck_pairs(
                         &src_text,
-                        decl,
+                        df,
                         &proj_root,
                         &resolved_path,
                     ) {
@@ -2822,5 +2836,43 @@ mod tests {
             "malformed project_dir/turbo-lean.toml must fail closed: {bad_cfg}"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_uncertified_violation_verdict_is_consistent_non_cex_error() {
+        for verbose in [
+            serde_json::json!({
+                "status": "uncertified_violation",
+                "ok": false,
+                "verified": false,
+                "decl": "suspect_thm",
+                "violations": 3,
+                "lean_native_certified": false,
+                "error": "Candidate violation could not be certified locally"
+            }),
+            serde_json::json!({
+                "status": "execution_failed",
+                "ok": false,
+                "decl": "suspect_thm",
+                "lean_native_certified": false,
+                "certification": "unavailable"
+            }),
+            serde_json::json!({
+                "status": "ok",
+                "ok": true,
+                "verified": true,
+                "decl": "suspect_thm",
+                "violations": 1,
+                "lean_native_certified": false
+            }),
+        ] {
+            let verdict = StepVerdict::from_verbose(verbose);
+            assert!(!verdict.ok);
+            assert!(!verdict.is_cex);
+            assert_eq!(verdict.to_full_json()["ok"], false);
+            let compact = verdict.to_compact_json();
+            assert_eq!(compact["ok"], false);
+            assert_eq!(compact["kind"], "error");
+        }
     }
 }

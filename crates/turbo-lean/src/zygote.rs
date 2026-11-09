@@ -124,20 +124,83 @@ pub(crate) fn verifier_provenance_ok(scanner_version: u32, replay_version: u32) 
 #[allow(dead_code)]
 pub fn query_lean_native_core_worker(
     method: &str,
-    _extra_fields_json: Option<&str>,
+    extra_fields_json: Option<&str>,
 ) -> Result<serde_json::Value> {
     let custom_nonexistent = std::env::var("LEAN_NATIVE_CORE_BIN")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .is_some_and(|s| !Path::new(s.trim()).is_file());
-    let cabi_certified = !custom_nonexistent
-        && crate::c_abi::leannative_certify_cex_witnesses_safe(1_000_000, 0, u64::MAX)
-        && match method {
-            "eval-cex" | "compile-fastcheck" => {
-                crate::gpu_fastcheck::canonical_cex_kernel_certified()
+    let mut eval_decl_name = "candidate_witness".to_string();
+    let (eval_certified, eval_reason) = if method != "eval-cex" || custom_nonexistent {
+        (false, Some("missing_witness"))
+    } else if let Some(extra) = extra_fields_json {
+        let parsed = serde_json::from_str::<serde_json::Value>(extra).ok();
+        let lhs = parsed
+            .as_ref()
+            .and_then(|v| v.get("lhs").or_else(|| v.get("lhs_value")))
+            .and_then(|v| v.as_str());
+        let rhs = parsed
+            .as_ref()
+            .and_then(|v| v.get("rhs").or_else(|| v.get("rhs_value")))
+            .and_then(|v| v.as_str());
+        let stmt = parsed
+            .as_ref()
+            .and_then(|v| v.get("stmt").or_else(|| v.get("stmt_src")))
+            .and_then(|v| v.as_str());
+        let decl_name = parsed
+            .as_ref()
+            .and_then(|v| v.get("decl").or_else(|| v.get("declName")))
+            .and_then(|v| v.as_str())
+            .unwrap_or("candidate_witness");
+        let bindings = parsed
+            .as_ref()
+            .and_then(|v| v.get("bindings"))
+            .and_then(|v| {
+                if let Some(arr) = v.as_array() {
+                    arr.iter()
+                        .map(|pair| {
+                            let items = pair.as_array()?;
+                            Some((
+                                items.first()?.as_str()?.to_string(),
+                                items.get(1)?.as_str()?.to_string(),
+                            ))
+                        })
+                        .collect::<Option<Vec<_>>>()
+                } else if let Some(obj) = v.as_object() {
+                    obj.iter()
+                        .map(|(k, val)| Some((k.clone(), val.as_str()?.to_string())))
+                        .collect::<Option<Vec<_>>>()
+                } else {
+                    None
+                }
+            });
+        let witness_summary = parsed
+            .as_ref()
+            .and_then(|v| v.get("witness_summary"))
+            .and_then(|v| v.as_str());
+        if let Some(stmt_src) = stmt {
+            eval_decl_name = decl_name.to_string();
+            crate::gpu_fastcheck::certify_standalone_statement_witness_via_lean_kernel(
+                decl_name,
+                stmt_src,
+                bindings,
+                witness_summary,
+                lhs,
+                rhs,
+            )
+        } else {
+            match (
+                lhs.and_then(crate::gpu_fastcheck::parse_u64_witness_str),
+                rhs.and_then(crate::gpu_fastcheck::parse_u64_witness_str),
+            ) {
+                (Some(l), Some(r)) if l == r => (false, Some("lhs_eq_rhs")),
+                (Some(_), Some(_)) => (false, Some("statement_required")),
+                _ => (false, Some("missing_witness")),
             }
-            _ => true,
-        };
+        }
+    } else {
+        (false, Some("missing_witness"))
+    };
     let result = match method {
         "ping" => serde_json::json!({
             "status": "pong",
@@ -164,12 +227,14 @@ pub fn query_lean_native_core_worker(
             "fallback": custom_nonexistent
         }),
         "eval-cex" => serde_json::json!({
-            "declName": "evm_constrained_buggy_prop",
-            "certified": cabi_certified,
-            "overallAssurance": if custom_nonexistent { "FallbackUnverified" } else { "VerifiedKernelProof" },
-            "fallback": custom_nonexistent,
-            "falsePositives": 0,
-            "theorem": "LeanNative.Backend.certifyCounterexample_no_false_positive"
+            "declName": eval_decl_name,
+            "certified": eval_certified,
+            "overallAssurance": if eval_certified { "VerifiedKernelProof" } else { "FallbackUnverified" },
+            "fallback": !eval_certified,
+            "falsePositives": u8::from(!eval_certified),
+            "certification": if eval_certified { "lean_kernel" } else { "unavailable" },
+            "reason": eval_reason,
+            "theorem": "LeanNative.Backend.FastCheck.certifyCounterexample_no_false_positive"
         }),
         "compile-fastcheck" => serde_json::json!({
             "schemaVersion": "lean-native-fastcheck-v1",
@@ -177,9 +242,10 @@ pub fn query_lean_native_core_worker(
             "numSamplesPerDecl": 1024,
             "useConstraintProp": true,
             "totalDecls": 2,
-            "counterexamplesFound": usize::from(cabi_certified),
+            "counterexamplesFound": 0,
             "vacuousPasses": 0,
             "falsePositives": 0,
+            "certification": "unavailable",
             "declResults": [],
             "fallback": custom_nonexistent
         }),
@@ -10392,20 +10458,81 @@ mod tests {
                 ),
                 "verify-certs" => assert_eq!(result["verified"].as_bool(), Some(true)),
                 "eval-cex" => {
-                    let is_fb = result["fallback"].as_bool().unwrap_or(false)
-                        || resp["fallback"].as_bool().unwrap_or(false);
+                    assert_eq!(result["certified"].as_bool(), Some(false));
                     assert_eq!(
-                        (
-                            result["certified"].as_bool(),
-                            result["falsePositives"].as_u64()
-                        ),
-                        (Some(!is_fb), Some(0))
+                        result["overallAssurance"].as_str(),
+                        Some("FallbackUnverified")
                     );
+                    assert_eq!(result["certification"].as_str(), Some("unavailable"));
+                    assert_eq!(result["falsePositives"].as_u64(), Some(1));
                 }
                 _ => unreachable!(),
             }
         }
         assert!(t0.elapsed().as_secs_f64() * 1000.0 / 20.0 < 5.0);
+
+        let raw_pair =
+            query_lean_native_core_worker("eval-cex", Some(r#"{"lhs":"0x1","rhs":"0x0"}"#))
+                .unwrap();
+        assert_eq!(raw_pair["result"]["certified"].as_bool(), Some(false));
+        assert_eq!(raw_pair["result"]["falsePositives"].as_u64(), Some(1));
+        assert_eq!(
+            raw_pair["result"]["certification"].as_str(),
+            Some("unavailable")
+        );
+        assert_eq!(
+            raw_pair["result"]["reason"].as_str(),
+            Some("statement_required")
+        );
+        let equal = query_lean_native_core_worker("eval-cex", Some(r#"{"lhs":"0x1","rhs":"0x1"}"#))
+            .unwrap();
+        assert_eq!(equal["result"]["certified"].as_bool(), Some(false));
+        assert_eq!(equal["result"]["reason"].as_str(), Some("lhs_eq_rhs"));
+        let garbage =
+            query_lean_native_core_worker("eval-cex", Some(r#"{"lhs":"garbage","rhs":"0x0"}"#))
+                .unwrap();
+        assert_eq!(garbage["result"]["certified"].as_bool(), Some(false));
+        assert_eq!(garbage["result"]["falsePositives"].as_u64(), Some(1));
+        assert_eq!(
+            garbage["result"]["reason"].as_str(),
+            Some("missing_witness")
+        );
+
+        let bogus_extra = serde_json::json!({
+            "decl": "good_u64_refl",
+            "stmt_src": "theorem good_u64_refl (a : UInt64) : a = a := by rfl",
+            "bindings": [["a", "0"]],
+            "lhs": "0",
+            "rhs": "1",
+        })
+        .to_string();
+        let uncertified = query_lean_native_core_worker("eval-cex", Some(&bogus_extra)).unwrap();
+        assert_eq!(uncertified["result"]["certified"], false);
+        assert_eq!(
+            uncertified["result"]["overallAssurance"],
+            "FallbackUnverified"
+        );
+        assert_eq!(uncertified["result"]["falsePositives"], 1);
+
+        if crate::lake_build::resolve_lean_bin(Path::new(".")).is_ok() {
+            let genuine_extra = serde_json::json!({
+                "decl": "bad_u64_add",
+                "stmt_src": "theorem bad_u64_add (a : UInt64) : a + 1 = a := by sorry",
+                "bindings": [["a", "0"]],
+                "lhs": "1",
+                "rhs": "0",
+            })
+            .to_string();
+            let certified =
+                query_lean_native_core_worker("eval-cex", Some(&genuine_extra)).unwrap();
+            assert_eq!(certified["result"]["certified"], true);
+            assert_eq!(
+                certified["result"]["overallAssurance"],
+                "VerifiedKernelProof"
+            );
+            assert_eq!(certified["result"]["certification"], "lean_kernel");
+            assert_eq!(certified["result"]["falsePositives"], 0);
+        }
     }
 
     #[test]
