@@ -16169,6 +16169,14 @@ private def localHidden : Nat := 7
 
 theorem uses_local_private : localHidden = localHidden := rfl
 
+class TagVal (α : Type) where
+  tag : α → Nat
+
+instance : TagVal Nat where
+  tag n := n + localHidden
+
+theorem uses_anon_inst : TagVal.tag (3 : Nat) = TagVal.tag (3 : Nat) := rfl
+
 theorem «a.b» : True := True.intro
 namespace a
 theorem b : False → True := fun h => False.elim h
@@ -16200,16 +16208,22 @@ end ParityNs
         );
         fs::remove_file(&helper)?;
         let dump_str = std::str::from_utf8(&dump_out.stdout)?;
-        let mut stmt_hash_from_dump = None;
+        let _parsed_dump = parse_kernel_statement_dump(&dump_out.stdout, "ParityMod")?;
+        let mut stmt_hashes_from_dump = BTreeMap::new();
         for line in dump_str.lines().filter(|l| !l.is_empty()) {
             let row: KernelDumpRow = serde_json::from_str(line)?;
-            if row.theorem.as_deref() == Some("ParityNs.poly_proj_let") {
+            if let Some(thm_name) = row.theorem.as_deref() {
                 let raw_stmt = raw_statement_payload(line, "statement")?;
-                stmt_hash_from_dump = Some(blake3::hash(raw_stmt.as_bytes()).to_hex().to_string());
+                stmt_hashes_from_dump.insert(
+                    thm_name.to_string(),
+                    blake3::hash(raw_stmt.as_bytes()).to_hex().to_string(),
+                );
             }
         }
-        let expected_hash =
-            stmt_hash_from_dump.expect("theorem statement row in StatementHash.lean");
+        let expected_hash = stmt_hashes_from_dump
+            .get("ParityNs.poly_proj_let")
+            .cloned()
+            .expect("theorem statement row in StatementHash.lean");
 
         // 2. Confirm `confirm_decl_identity_with_trust` (`ZygoteWorker.lean --decl-identity`)
         //    produces the exact same `statement-v1` BLAKE3 digest.
@@ -16224,9 +16238,9 @@ end ParityNs
         assert_eq!(att.decl_name, "ParityNs.poly_proj_let");
         assert_eq!(att.kernel_type_hash, expected_hash);
 
-        // 3. Private constant statement-hash parity across fresh probe nonces, single-decl check,
-        //    and `.olean` shard audit (`4434869304`), plus lossless dotted guillemet `«a.b»` vs `a.b`
-        //    separation (`4435128239`).
+        // 3. Private constant and local anonymous instance statement-hash parity across
+        //    `StatementHash.dump`, fresh probe nonces, single-decl check, and `.olean` shard audit,
+        //    plus lossless dotted guillemet `«a.b»` vs `a.b` separation (`4435128239`).
         let priv_shard = split
             .shards
             .iter()
@@ -16242,6 +16256,29 @@ end ParityNs
             att_priv_1.kernel_type_hash, att_priv_2.kernel_type_hash,
             "local private constant statement hash must be invariant across probe nonces"
         );
+        assert_eq!(
+            Some(&att_priv_1.kernel_type_hash),
+            stmt_hashes_from_dump.get("ParityNs.uses_local_private"),
+            "StatementHash.dump and ZygoteWorker must produce identical statement-v1 hash on private def"
+        );
+
+        let anon_inst_shard = split
+            .shards
+            .iter()
+            .find(|s| s.decl_name() == "ParityNs.uses_anon_inst")
+            .expect("shard for uses_anon_inst");
+        let att_anon_inst = crate::check::confirm_decl_identity_with_trust(
+            src,
+            anon_inst_shard,
+            &dir,
+            &mod_file,
+            false,
+        )?;
+        assert_eq!(
+            Some(&att_anon_inst.kernel_type_hash),
+            stmt_hashes_from_dump.get("ParityNs.uses_anon_inst"),
+            "StatementHash.dump and ZygoteWorker must produce identical statement-v1 hash on anonymous local instance"
+        );
         let cache_dir = dir.join("cache");
         let mut store = TurboStore::open(Some(&cache_dir))?;
         let check_priv = crate::check::evaluate_check_command_value(
@@ -16251,6 +16288,13 @@ end ParityNs
             dir.clone(),
         )?;
         assert_eq!(check_priv["status"], "theorem_verified");
+        let check_anon = crate::check::evaluate_check_command_value(
+            &mut store,
+            mod_file.clone(),
+            Some("ParityNs.uses_anon_inst".to_string()),
+            dir.clone(),
+        )?;
+        assert_eq!(check_anon["status"], "theorem_verified");
 
         let guil_shard = split
             .shards

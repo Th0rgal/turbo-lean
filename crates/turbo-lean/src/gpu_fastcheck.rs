@@ -2314,7 +2314,7 @@ pub(crate) fn canonical_cex_kernel_certified() -> bool {
     ok
 }
 
-fn parse_u64_witness_str(raw: &str) -> Option<u64> {
+pub(crate) fn parse_u64_witness_str(raw: &str) -> Option<u64> {
     let s = raw.trim();
     if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         u64::from_str_radix(&hex.replace('_', ""), 16).ok()
@@ -3303,6 +3303,46 @@ fn build_standalone_decl_src(decl_name: &str, stmt_src: &str) -> Option<(String,
     };
     let decl = extract_lean_theorem(&strip_lean_comments(&full_decl_src), None).ok()?;
     Some((full_decl_src, decl))
+}
+
+pub(crate) fn certify_standalone_statement_witness_via_lean_kernel(
+    decl_name: &str,
+    stmt_src: &str,
+    bindings_opt: Option<Vec<(String, String)>>,
+    witness_summary_opt: Option<&str>,
+    lhs_opt: Option<&str>,
+    rhs_opt: Option<&str>,
+) -> (bool, Option<&'static str>) {
+    let Some((full_decl_src, decl)) = build_standalone_decl_src(decl_name, stmt_src) else {
+        return (false, Some("unparseable_statement"));
+    };
+    let ce = if let Some(bindings) = bindings_opt {
+        CounterexampleWitness {
+            state_idx: 0,
+            bindings,
+            lhs_value: lhs_opt.unwrap_or_default().to_string(),
+            rhs_value: rhs_opt.unwrap_or_default().to_string(),
+        }
+    } else if let Some(summary) = witness_summary_opt.filter(|s| !s.trim().is_empty()) {
+        extract_witness_from_summary(summary)
+    } else {
+        return (false, Some("missing_witness"));
+    };
+    let has_value_params = decl
+        .binders
+        .iter()
+        .any(|(_, ty)| classify_stage1_param_kind(ty).is_some() || ty.trim() == "Int");
+    if has_value_params && ce.bindings.is_empty() {
+        return (false, Some("witness_not_bound"));
+    }
+    if build_decl_cex_refutation_body(&full_decl_src, &decl, &ce, "_turbo_cex_refute").is_none() {
+        return (false, Some("witness_not_bound"));
+    }
+    if certify_standalone_decl_cex_via_lean_kernel(&full_decl_src, &decl, &ce) {
+        (true, None)
+    } else {
+        (false, Some("not_a_counterexample"))
+    }
 }
 
 pub(crate) fn try_lnir_fast_reject_kernel_certified(
@@ -4533,7 +4573,8 @@ pub fn run_fast_check_command(
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
-                    "status": if status_ok { "ok" } else { "counterexample_found" },
+                    "status": if status_ok { "ok" } else { "execution_failed" },
+                    "ok": status_ok,
                     "mode": "native_cpu_perceus",
                     "backend": backend_pref,
                     "routed_node_id": routed_node_id,
@@ -4543,8 +4584,8 @@ pub fn run_fast_check_command(
                     "exec_us": exec_us,
                     "total_ms": t0.elapsed().as_millis(),
                     "n_states": 1_000_000u64,
-                    "false_positives": 0u64,
                     "lean_native_certified": false,
+                    "certification": "unavailable",
                     "throughput_mstates_s": ((1_000_000.0 / (exec_us.max(1) as f64)) * 100.0).round() / 100.0,
                     "output": stdout.trim()
                 }))?
