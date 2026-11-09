@@ -36,7 +36,7 @@ def classify(paths, event="pull_request", ref=""):
     domains = dict.fromkeys(("ci_scripts", "sdk", "rust_cli", "lean_turbo",
                             "lean_ir_semantics", "llvm_backend",
                             "gpu_tpu_backend", "con_leche_kernel",
-                            "c_abi_runtime"), False)
+                            "sail_riscv_backend", "c_abi_runtime"), False)
     full = force
     for p in paths:
         if is_doc(p):
@@ -48,6 +48,10 @@ def classify(paths, event="pull_request", ref=""):
             full = True
         elif p.startswith("crates/turbo-lean/src/") and p.endswith("cli.rs"):
             domains["rust_cli"] = True
+        elif p == "lean/TurboLean/PolicyGates.lean":
+            domains["lean_turbo"] = True
+            domains["sail_riscv_backend"] = True
+            full = True
         elif p.startswith("lean/TurboLean/"):
             domains["lean_turbo"] = True
         elif p.startswith("lean/LeanNative/Backend/"):
@@ -62,10 +66,14 @@ def classify(paths, event="pull_request", ref=""):
         elif p.startswith("verification/con-leche-bridge/"):
             domains["con_leche_kernel"] = True
             full = True
+        elif p.startswith("verification/sail-riscv-bridge/"):
+            domains["sail_riscv_backend"] = True
+            full = True
         elif p.startswith("verification/"):
             domains["llvm_backend"] = True
             domains["gpu_tpu_backend"] = True
             domains["con_leche_kernel"] = True
+            domains["sail_riscv_backend"] = True
             full = True
         elif p in {
             "crates/turbo-lean/src/kernel.rs",
@@ -74,6 +82,11 @@ def classify(paths, event="pull_request", ref=""):
         }:
             domains["con_leche_kernel"] = True
             domains["c_abi_runtime"] = True
+            full = True
+        elif p == "lean/LeanNative/IR/Types.lean":
+            domains["lean_ir_semantics"] = True
+            domains["gpu_tpu_backend"] = True
+            domains["sail_riscv_backend"] = True
             full = True
         elif p.startswith("lean/LeanNative/"):
             domains["lean_ir_semantics"] = True
@@ -125,7 +138,7 @@ def plan_trees(base, head, event, ref):
             plan[k] for k in ("ci_scripts", "rust_cli", "lean_turbo",
                               "lean_ir_semantics", "llvm_backend",
                               "gpu_tpu_backend", "con_leche_kernel",
-                              "c_abi_runtime")
+                              "sail_riscv_backend", "c_abi_runtime")
         ) and not plan["run_conformance_full"]
     )
     plan["run_lean_build"] = (plan["force_full"] or not preflight_only
@@ -163,7 +176,21 @@ class Tests(unittest.TestCase):
             self.assertTrue(pc[k])
         self.assertFalse(pc["llvm_backend"])
         self.assertFalse(pc["gpu_tpu_backend"])
+        self.assertFalse(pc["sail_riscv_backend"])
         self.assertEqual(pc["conformance_seeds"], 50)
+        pr = classify(["verification/sail-riscv-bridge/SailRiscvBridge/Bisimulation.lean"])
+        for k in ("sail_riscv_backend", "run_lean_build", "run_conformance_full"):
+            self.assertTrue(pr[k])
+        self.assertFalse(pr["llvm_backend"])
+        self.assertFalse(pr["gpu_tpu_backend"])
+        self.assertFalse(pr["con_leche_kernel"])
+        self.assertEqual(pr["conformance_seeds"], 50)
+        ppg = classify(["lean/TurboLean/PolicyGates.lean"])
+        for k in ("lean_turbo", "sail_riscv_backend", "run_lean_build", "run_conformance_full"):
+            self.assertTrue(ppg[k])
+        pt = classify(["lean/LeanNative/IR/Types.lean"])
+        for k in ("lean_ir_semantics", "gpu_tpu_backend", "sail_riscv_backend", "run_lean_build", "run_conformance_full"):
+            self.assertTrue(pt[k])
         for path in ("crates/turbo-lean/src/kernel.rs", "crates/turbo-lean/src/receipt.rs"):
             pk = classify([path])
             for k in ("con_leche_kernel", "c_abi_runtime", "run_lean_build", "run_conformance_full"):
@@ -313,7 +340,7 @@ def verify_plan_invariants(plan):
             plan[k] for k in ("ci_scripts", "rust_cli", "lean_turbo",
                               "lean_ir_semantics", "llvm_backend",
                               "gpu_tpu_backend", "con_leche_kernel",
-                              "c_abi_runtime")
+                              "sail_riscv_backend", "c_abi_runtime")
         ) and not plan["run_conformance_full"]
     )
     expected_build = (plan["force_full"] or not preflight_only
