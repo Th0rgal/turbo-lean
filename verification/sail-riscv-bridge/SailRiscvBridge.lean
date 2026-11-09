@@ -69,12 +69,38 @@ def bridgedTheorems : List Name :=
   , ``SailRiscvBridge.rv64ZbbOrcbSpec_bisim_sail
   , ``SailRiscvBridge.rv64ZbbClzCtz_bisim_sail
   , ``SailRiscvBridge.rv64ZbbCpop_bisim_sail
+  , ``SailRiscvBridge.rv64iEffectiveAddr_ext_data_get_addr_bisim
+  , ``SailRiscvBridge.rv64iAlignedAddr_bisim_sail
+  , ``SailRiscvBridge.rv64iLoadExtend_bisim_sail
+  , ``SailRiscvBridge.rv64iStoreTruncate_bisim_sail
+  , ``SailRiscvBridge.write_ram_plain_bisim_sail
+  , ``SailRiscvBridge.read_ram_plain_bisim_sail
+  , ``SailRiscvBridge.sailStoreRamExec_sp_ra_bisim
+  , ``SailRiscvBridge.sailLoadRamExec_sp_ra_bisim
+  , ``SailRiscvBridge.rv64StoreLoadBytes_roundtrip_1
+  , ``SailRiscvBridge.rv64StoreLoadBytes_roundtrip_2
+  , ``SailRiscvBridge.rv64StoreLoadBytes_roundtrip_4
+  , ``SailRiscvBridge.rv64StoreLoadBytes_roundtrip_8
+  , ``SailRiscvBridge.rv64StoreThenLoad_roundtrip_bisim
+  , ``SailRiscvBridge.rvcRegIdx_creg2reg_idx_bisim
+  , ``SailRiscvBridge.rvcNopIllegal_bisim_sail
+  , ``SailRiscvBridge.rvcStackPointerAddi_bisim_sail
+  , ``SailRiscvBridge.rvcLiLui_bisim_sail
+  , ``SailRiscvBridge.rvcAluImmShift_bisim_sail
+  , ``SailRiscvBridge.rvcAluReg_bisim_sail
+  , ``SailRiscvBridge.rvcLoad_bisim_sail
+  , ``SailRiscvBridge.rvcStore_bisim_sail
+  , ``SailRiscvBridge.rvcBranch_bisim_sail
+  , ``SailRiscvBridge.rvcJumpExpand_bisim_sail
+  , ``SailRiscvBridge.rvcJalr_x1_state_bisim_sail
+  , ``SailRiscvBridge.rvcZcbExpand_bisim_sail
+  , ``SailRiscvBridge.rvcZcbDirectSailM_x8_bisim
   ]
 
 theorem bridgedTheorems_nodup : bridgedTheorems.Nodup := by
   decide
 
-def minAuditedTheorems : Nat := 54
+def minAuditedTheorems : Nat := 80
 
 def allowedAxioms : List Name :=
   [``propext, ``Classical.choice, ``Quot.sound]
