@@ -1,23 +1,19 @@
 import C2ProtocolMachine.Types
 
-def stepFrameMachine (ph : FramePhase) (rem : UInt8) (acc : UInt16) (b : UInt8) : FramePhase × (UInt8 × UInt16) :=
+def stepFramePhase (ph : FramePhase) (b : UInt8) : FramePhase :=
   match ph with
-  | .syncWait =>
-    if b == 0xAA then (.lenByte, (0, 0x00AA)) else (.syncWait, (0, acc))
-  | .lenByte =>
-    if b == 0 then (.checksumByte, (0, acc ^^^ 0x00FF))
-    else if b > 32 then (.fault, (0, 0xDEAD))
-    else (.bodyStream, (b, acc + b.toUInt16))
-  | .bodyStream =>
-    if b == 0x7D then (.escaped, (rem, acc ^^^ 0x007D))
-    else if rem <= 1 then (.checksumByte, (0, (acc <<< 1) ^^^ b.toUInt16))
-    else (.bodyStream, (rem - 1, (acc <<< 1) ^^^ b.toUInt16))
-  | .escaped =>
-    let unesc := b ^^^ 0x20
-    if rem <= 1 then (.checksumByte, (0, (acc + unesc.toUInt16) ^^^ 0x55AA))
-    else (.bodyStream, (rem - 1, acc + unesc.toUInt16))
-  | .checksumByte =>
-    if (acc.toUInt8 ^^^ b) == 0 then (.syncWait, (0, acc + 1))
-    else (.fault, (0, acc ^^^ b.toUInt16))
-  | .fault =>
-    if b == 0xAA then (.lenByte, (0, 0x00AA)) else (.fault, (rem, acc))
+  | .syncWait => if b == 0xAA then .lenByte else .syncWait
+  | .lenByte => if b == 0 then .checksumByte else .bodyStream
+  | .bodyStream => if b == 0x7D then .escaped else .checksumByte
+  | .escaped => .bodyStream
+  | .checksumByte => if (b &&& 1) == 0 then .syncWait else .fault
+  | .fault => .fault
+
+def stepFrameAcc (ph : FramePhase) (acc : UInt16) (b : UInt8) : UInt16 :=
+  match ph with
+  | .syncWait => acc + 0x00AA
+  | .lenByte => acc + b.toUInt16
+  | .bodyStream => (acc <<< 1) ^^^ b.toUInt16
+  | .escaped => acc + (b ^^^ 0x20).toUInt16
+  | .checksumByte => acc ^^^ b.toUInt16
+  | .fault => 0xDEAD

@@ -3,13 +3,13 @@ import C2ProtocolMachine.Transition
 
 @[export c2_protocol_step6]
 def c2_protocol_step6 (x0 : UInt64) : UInt64 :=
-  let s1 := stepFrameMachine .syncWait 0 0 x0.toUInt8
-  let s2 := stepFrameMachine s1.1 s1.2.1 s1.2.2 (x0 >>> 8).toUInt8
-  let s3 := stepFrameMachine s2.1 s2.2.1 s2.2.2 (x0 >>> 16).toUInt8
-  let s4 := stepFrameMachine s3.1 s3.2.1 s3.2.2 (x0 >>> 24).toUInt8
-  let s5 := stepFrameMachine s4.1 s4.2.1 s4.2.2 (x0 >>> 32).toUInt8
-  let s6 := stepFrameMachine s5.1 s5.2.1 s5.2.2 (x0 >>> 40).toUInt8
-  (phaseCode s6.1 <<< 32) ||| (s6.2.1.toUInt64 <<< 16) ||| s6.2.2.toUInt64
+  let b0 := x0.toUInt8
+  let b1 := (x0 >>> 8).toUInt8
+  let p1 := stepFramePhase .syncWait b0
+  let a1 := stepFrameAcc p1 0 b0
+  let p2 := stepFramePhase p1 b1
+  let a2 := stepFrameAcc p2 a1 b1
+  (phaseCode p2 <<< 32) ||| a2.toUInt64
 
 @[export c2_usize_stencil_clamp]
 def c2_usize_stencil_clamp (x0 : UInt64) : UInt64 :=

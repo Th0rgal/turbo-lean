@@ -567,30 +567,30 @@ def s1b_enum_branch (tag : UInt8) (x : UInt64) (y : UInt64) : UInt64 :=
 def swarAddBytes (a b : UInt64) : UInt64 :=
   let lo := (a &&& 0x7F7F7F7F7F7F7F7F) + (b &&& 0x7F7F7F7F7F7F7F7F)
   lo ^^^ ((a ^^^ b) &&& 0x8080808080808080)
-def mixSipRound (v0 v1 : UInt64) : UInt64 × UInt64 :=
+def mixSipHalf0 (v0 v1 : UInt64) : UInt64 :=
   let u0 := v0 + v1
   let u1 := rotl64 v1 13 ^^^ u0
-  let u0' := rotl64 u0 32
-  let w0 := u0' + u1
-  let w1 := rotl64 u1 17 ^^^ w0
-  (w0, rotl64 w0 21 ^^^ w1)
-def clmulStep4 (a b : UInt32) : UInt64 :=
+  rotl64 u0 32 + u1
+def mixSipHalf1 (v0 v1 : UInt64) : UInt64 :=
+  rotl64 v1 13 ^^^ (v0 + v1)
+def clmulStep2 (a b : UInt32) : UInt64 :=
   let a64 := a.toUInt64
   let p0 := if (b &&& 1) != 0 then a64 else 0
   let p1 := if (b &&& 2) != 0 then a64 <<< 1 else 0
-  let p2 := if (b &&& 4) != 0 then a64 <<< 2 else 0
-  let p3 := if (b &&& 8) != 0 then a64 <<< 3 else 0
-  p0 ^^^ p1 ^^^ p2 ^^^ p3
+  p0 ^^^ p1
 '''
         exprs = [
-            '''(let p := mixSipRound x0 (x0 ^^^ 0x736F6D6570736575)
-                let q := if (p.1 &&& 1) == 0 then mixSipRound p.1 p.2 else mixSipRound p.2 p.1
-                swarAddBytes q.1 q.2)''',
+            '''(let y0 := x0 ^^^ 0x736F6D6570736575
+                let p0 := mixSipHalf0 x0 y0
+                let p1 := mixSipHalf1 x0 y0
+                let in0 := if (p0 &&& 1) == 0 then p0 else p1
+                let in1 := if (p0 &&& 1) == 0 then p1 else p0
+                swarAddBytes (mixSipHalf0 in0 in1) (mixSipHalf1 in0 in1))''',
             '''(let lo32 := x0.toUInt32
                 let hi32 := (x0 >>> 32).toUInt32
-                let c0 := clmulStep4 lo32 (hi32 &&& 15)
-                let c1 := clmulStep4 hi32 ((lo32 >>> 4) &&& 15)
-                rotl64 (c0 ^^^ (c1 <<< 4)) (x0 &&& 63))''',
+                let c0 := clmulStep2 lo32 (hi32 &&& 3)
+                let c1 := clmulStep2 hi32 ((lo32 >>> 2) &&& 3)
+                rotl64 (c0 ^^^ (c1 <<< 2)) (x0 &&& 63))''',
             '''(let b0 := x0.toUInt8
                 let b1 := (x0 >>> 8).toUInt8
                 let w16 := (x0 >>> 16).toUInt16
@@ -624,49 +624,46 @@ def clmulStep4 (a b : UInt32) : UInt64 :=
   | escape
   | done
 
-def stepParseState (st : ParseState) (byte : UInt8) : ParseState × UInt16 :=
+def stepParseTag (st : ParseState) (byte : UInt8) : ParseState :=
   match st with
-  | .idle =>
-    if byte == 0x7E then (.header, 1) else (.idle, 0)
-  | .header =>
-    if byte == 0 then (.done, 2) else (.payload, byte.toUInt16)
-  | .payload =>
-    if byte == 0x7D then (.escape, 4)
-    else if byte == 0x7E then (.done, 8)
-    else (.payload, byte.toUInt16 + 16)
-  | .escape => (.payload, (byte ^^^ 0x20).toUInt16 + 32)
-  | .done => (.done, 64)
+  | .idle => if byte == 0x7E then .header else .idle
+  | .header => if byte == 0 then .done else .payload
+  | .payload => if byte == 0x7D then .escape else .done
+  | .escape => .payload
+  | .done => .done
 
-def crcByteStep (crc : UInt32) (b : UInt8) : UInt32 :=
-  let c0 := crc ^^^ b.toUInt32
+def stepParseEmit (st : ParseState) (byte : UInt8) : UInt16 :=
+  match st with
+  | .idle => 1
+  | .header => byte.toUInt16
+  | .payload => byte.toUInt16 + 16
+  | .escape => (byte ^^^ 0x20).toUInt16 + 32
+  | .done => 64
+
+def crcStep2 (crc : UInt32) (b : UInt8) : UInt32 :=
+  let c0 := crc ^^^ (b &&& 3).toUInt32
   let c1 := if (c0 &&& 1) != 0 then (c0 >>> 1) ^^^ (0xEDB88320 : UInt32) else c0 >>> 1
-  let c2 := if (c1 &&& 1) != 0 then (c1 >>> 1) ^^^ (0xEDB88320 : UInt32) else c1 >>> 1
-  let c3 := if (c2 &&& 1) != 0 then (c2 >>> 1) ^^^ (0xEDB88320 : UInt32) else c2 >>> 1
-  if (c3 &&& 1) != 0 then (c3 >>> 1) ^^^ (0xEDB88320 : UInt32) else c3 >>> 1
+  if (c1 &&& 1) != 0 then (c1 >>> 1) ^^^ (0xEDB88320 : UInt32) else c1 >>> 1
 '''
         exprs = [
             '''(let b0 := x0.toUInt8
                 let b1 := (x0 >>> 8).toUInt8
-                let b2 := (x0 >>> 16).toUInt8
-                let b3 := (x0 >>> 24).toUInt8
-                let s1 := stepParseState .idle b0
-                let s2 := stepParseState s1.1 b1
-                let s3 := stepParseState s2.1 b2
-                let s4 := stepParseState s3.1 b3
+                let st1 := stepParseTag .idle b0
+                let em1 := stepParseEmit st1 b0
+                let st2 := stepParseTag st1 b1
+                let em2 := stepParseEmit st2 b1
                 let tagCode : UInt64 :=
-                  match s4.1 with
+                  match st2 with
                   | .idle => 0
                   | .header => 1
                   | .payload => 2
                   | .escape => 3
                   | .done => 4
-                (tagCode <<< 32) ||| (s1.2 + s2.2 * 3 + s3.2 * 7 + s4.2 * 11).toUInt64)''',
+                (tagCode <<< 32) ||| (em1 + em2 * 3).toUInt64)''',
             '''(let crc0 : UInt32 := 0xFFFFFFFF
-                let crc1 := crcByteStep crc0 x0.toUInt8
-                let crc2 := crcByteStep crc1 (x0 >>> 8).toUInt8
-                let crc3 := crcByteStep crc2 (x0 >>> 16).toUInt8
-                let crc4 := crcByteStep crc3 (x0 >>> 24).toUInt8
-                (~~~crc4).toUInt64 ^^^ ((x0 >>> 32).toUInt32.toUInt64 <<< 32))''',
+                let crc1 := crcStep2 crc0 x0.toUInt8
+                let crc2 := crcStep2 crc1 (x0 >>> 8).toUInt8
+                (~~~crc2).toUInt64 ^^^ ((x0 >>> 32).toUInt32.toUInt64 <<< 32))''',
         ]
         inputs = (
             0x0000007E,

@@ -26,8 +26,9 @@ Executes two complementary verification layers against the stock Lean 4 `v4.35.0
        * `trap_ubsan_signed_shift` -> `runtime error:` (UndefinedBehaviorSanitizer)
 
   2. **Multi-Threaded `lean_mark_mt` & COW Exclusivity ThreadSanitizer (`-fsanitize=thread -DLEAN_TSAN`) Gate**:
-     - Compiles with `/usr/bin/clang++ -fsanitize=thread -DLEAN_TSAN` (probing host ASLR compatibility first;
-       fails closed in CI if TSan cannot execute).
+     - Compiles with `/usr/bin/clang++ -fsanitize=thread -DLEAN_TSAN` (matching `lean.h`'s
+       `__has_feature(thread_sanitizer)` / `LEAN_TSAN` guard explicitly while probing host ASLR
+       compatibility first; fails closed in CI if TSan cannot execute).
      - Verifies `0` data races across 4 concurrent pthreads performing `lean_inc_ref` / `lean_dec_ref`
        and `lean_sarray_ensure_exclusive` COW clones on a `lean_mark_mt`-promoted object graph.
      - Runs mandatory **positive TSan race traps** (`rc != 0` with `ThreadSanitizer: data race`):
@@ -757,6 +758,7 @@ def run_sanitizer_suite(
                 "-g",
                 "-fno-omit-frame-pointer",
                 "-fsanitize=thread",
+                "-DLEAN_TSAN",
                 str(tsan_cpp),
                 *link_flags,
                 "-o",

@@ -3,9 +3,10 @@ import C2BitwiseScan.Scan
 
 @[export c2_bitwise_scan_digest]
 def c2_bitwise_scan_digest (x0 : UInt64) : UInt64 :=
-  let r := scanEightBytesTagMask x0
-  let mixed := swarAddBytes64 r.1 (rotl64Word x0 17)
-  mixed ^^^ (r.2.toUInt64 <<< 32) ^^^ r.2.toUInt64
+  let tags := scanTwoBytesTagMask x0
+  let crc := scanTwoBytesCrc32 x0
+  let mixed := swarAddBytes64 tags (rotl64Word x0 17)
+  mixed ^^^ (crc.toUInt64 <<< 32) ^^^ crc.toUInt64
 
 @[export c2_swar_sip_mix]
 def c2_swar_sip_mix (x0 : UInt64) : UInt64 :=
