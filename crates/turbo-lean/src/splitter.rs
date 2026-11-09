@@ -1664,12 +1664,22 @@ pub(crate) fn source_may_execute_elab_host_effects(src: &str, reject_pure_macros
     false
 }
 
+/// Returns true if `src` uses `@[extern]`, `@[implemented_by]`, or `@[csimp]` attributes
+/// (which can redirect root-package elaboration/evaluation to unverified runtime replacements).
+pub(crate) fn source_has_runtime_replacement_attribute(src: &str) -> bool {
+    let comment_free = strip_lean_comments(src);
+    let clean = strip_string_literals_inner(&comment_free, true);
+    let unquoted = clean.replace(['«', '»'], "");
+    contains_lean_attribute_word(&unquoted, &["extern", "implemented_by", "csimp"])
+}
+
 /// Returns true if `src` may read external host state (filesystem, environment variables,
 /// subprocesses, sockets, monotonic/wall clocks, randomness, or out-of-package `include_str`)
 /// during elaboration inside a git-pinned dependency package. Pure `MetaM`/`TacticM`/`CommandElabM`
 /// metaprograms (`elab`, `macro_rules`, `simproc`, `initialize`, `@[tactic]`, `MonadEnv.getEnv`,
-/// `Lean.Server.RequestM`, `IO.Ref`, etc.) remain allowed so git-pinned dependencies such as
-/// `Mathlib`, `Batteries`, `Aesop`, `Qq`, and `ProofWidgets` can reuse verified `.olean` caches.
+/// `Lean.Server.RequestM`, `IO.Ref`, `@[implemented_by]`, `@[csimp]`, etc.) remain allowed so
+/// git-pinned dependencies such as `Mathlib`, `Batteries`, `Aesop`, `Qq`, and `ProofWidgets` can
+/// reuse verified `.olean` caches.
 pub(crate) fn source_may_read_host_state(src: &str) -> bool {
     let comment_free = strip_lean_comments(src);
     let clean = strip_string_literals_inner(&comment_free, true);
@@ -1678,9 +1688,6 @@ pub(crate) fn source_may_read_host_state(src: &str) -> bool {
         .iter()
         .any(|w| contains_lean_word(&unquoted, w))
     {
-        return true;
-    }
-    if contains_lean_attribute_word(&unquoted, &["extern", "implemented_by", "csimp"]) {
         return true;
     }
     const QUALIFIED_HOST_READS: &[&str] = &[
@@ -14389,8 +14396,17 @@ public def api := by
         assert!(!source_may_read_host_state(
             "@[command_elab checkContractCmd]\ndef elabCheckContract : Lean.Elab.Command.CommandElab := fun _ => pure ()\n"
         ));
-        assert!(source_may_read_host_state(
+        assert!(!source_may_read_host_state(
+            "@[implemented_by scanlMFast]\ndef scanlM : Unit := ()\n@[csimp]\ntheorem map_eq : True := trivial\n"
+        ));
+        assert!(source_has_runtime_replacement_attribute(
             "@[extern \"my_c_host_fn\"]\nopaque readHost : Unit → Nat\n"
+        ));
+        assert!(source_has_runtime_replacement_attribute(
+            "@[implemented_by scanlMFast]\ndef scanlM : Unit := ()\n"
+        ));
+        assert!(source_has_runtime_replacement_attribute(
+            "@[csimp]\ntheorem map_eq : True := trivial\n"
         ));
         assert!(source_may_read_host_state(
             "open IO in\nelab \"read_env\" : term => do\n  let _ ← getEnv \"SECRET\"\n  return Lean.mkNatLit 0\n"
