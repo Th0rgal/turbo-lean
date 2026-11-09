@@ -10,6 +10,7 @@ def main (args : List String) : IO UInt32 := do
     match args with
     | "llvm-diff-suite" :: rest => LeanNative.Driver.LLVMDiffCLI.run rest
     | "gpu-tpu-diff-suite" :: rest => LeanNative.Driver.GPUDiffCLI.run rest
+    | "target-ir-fuzz-suite" :: rest => LeanNative.Driver.TargetIRFuzzCLI.run rest
     | "self-test" :: _ => runCoreSelfTest "lean-native-core"
     | "--version" :: _ | "-v" :: _ =>
       IO.println s!"lean-native-core v{LeanNative.Core.coreVersion}"

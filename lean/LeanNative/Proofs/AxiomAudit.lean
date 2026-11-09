@@ -49,6 +49,7 @@ import LeanNative.Proofs.AsyncStateMachineProofs
 import LeanNative.Proofs.ProofRetentionProofs
 import LeanNative.Proofs.CostAutotuneSoundness
 import LeanNative.Proofs.SliceBridgeStandaloneProofs
+import LeanNative.Proofs.TargetIRFuzzProofs
 
 namespace LeanNative.Proofs
 
@@ -764,9 +765,19 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.autotuneSuperoptModule_sound
   , ``LeanNative.Proofs.costAutotune_amdahl_gate_nonvacuous
   , ``LeanNative.Proofs.ablateSitesLeaveOneOut_sound
+  , ``LeanNative.Proofs.llvm_sdiv64_min_neg1_ub
+  , ``LeanNative.Proofs.llvm_null_load_ub
+  , ``LeanNative.Proofs.llvm_null_store_ub
+  , ``LeanNative.Proofs.llvm_oob_gep_inbounds_load_ub
+  , ``LeanNative.Proofs.stablehlo_sdiv64_min_neg1_eq
+  , ``LeanNative.Proofs.stablehlo_srem64_min_neg1_zero
+  , ``LeanNative.Proofs.stablehlo_sdiv_zero_traps
+  , ``LeanNative.Proofs.stablehlo_clampStart_bounds
+  , ``LeanNative.Proofs.msl_shift_out_of_range_traps
+  , ``LeanNative.Proofs.ptx_rem_zero_traps
   ]
 
-#guard auditedTheoremNames.length == 808
+#guard auditedTheoremNames.length == 818
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/

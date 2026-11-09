@@ -99,10 +99,14 @@ def classify(paths, event="pull_request", ref=""):
             full = True
     docs = bool(paths) and all(map(is_doc, paths))
     preflight_only = bool(paths) and all(is_doc(p) or is_sdk(p) for p in paths)
+    run_fuzz = force or any(
+        domains[k] for k in ("ci_scripts", "lean_ir_semantics", "llvm_backend", "gpu_tpu_backend")
+    )
     return dict(domains, docs_only=docs, force_full=force,
                 run_lean_build=force or not preflight_only,
                 run_conformance_full=full,
-                conformance_seeds=64 if force else 50 if full else 16)
+                conformance_seeds=64 if force else 50 if full else 16,
+                target_ir_fuzz_seeds=64 if force else 32 if run_fuzz else 0)
 
 
 def digest_records(records):
@@ -152,6 +156,7 @@ class Tests(unittest.TestCase):
         self.assertTrue(p["docs_only"])
         self.assertFalse(p["run_lean_build"])
         self.assertFalse(p["run_conformance_full"])
+        self.assertEqual(p["target_ir_fuzz_seeds"], 0)
         for path in ("AGENTS.md", "docs/tool.py", "unknown.file"):
             self.assertFalse(classify([path])["docs_only"])
             self.assertTrue(classify([path])["run_conformance_full"])
@@ -161,16 +166,22 @@ class Tests(unittest.TestCase):
         for k in ("gpu_tpu_backend", "run_lean_build", "run_conformance_full"):
             self.assertTrue(p[k])
         self.assertEqual(p["conformance_seeds"], 50)
+        self.assertEqual(p["target_ir_fuzz_seeds"], 32)
         pv = classify(["verification/lean-mlir-bridge/LeanMLIRBridge/Bisimulation.lean"])
         for k in ("llvm_backend", "run_lean_build", "run_conformance_full"):
             self.assertTrue(pv[k])
         self.assertFalse(pv["gpu_tpu_backend"])
         self.assertEqual(pv["conformance_seeds"], 50)
+        self.assertEqual(pv["target_ir_fuzz_seeds"], 32)
         pl = classify(["verification/lnsym-bridge/LNSymBridge/Bisimulation.lean"])
         for k in ("gpu_tpu_backend", "run_lean_build", "run_conformance_full"):
             self.assertTrue(pl[k])
         self.assertFalse(pl["llvm_backend"])
         self.assertEqual(pl["conformance_seeds"], 50)
+        self.assertEqual(pl["target_ir_fuzz_seeds"], 32)
+        pi = classify(["lean/LeanNative/Driver/TargetIRFuzzCLI.lean"])
+        self.assertTrue(pi["lean_ir_semantics"])
+        self.assertEqual(pi["target_ir_fuzz_seeds"], 32)
         pc = classify(["verification/con-leche-bridge/ConLecheBridge/Soundness.lean"])
         for k in ("con_leche_kernel", "run_lean_build", "run_conformance_full"):
             self.assertTrue(pc[k])
@@ -234,6 +245,7 @@ class Tests(unittest.TestCase):
             for k in ("force_full", "run_lean_build", "run_conformance_full"):
                 self.assertTrue(p[k])
             self.assertEqual(p["conformance_seeds"], 64)
+            self.assertEqual(p["target_ir_fuzz_seeds"], 64)
 
     def test_mixed_and_empty(self):
         self.assertFalse(classify(["README.md", "Cargo.lock"])["docs_only"])
@@ -350,6 +362,7 @@ def verify_plan_invariants(plan):
     if plan["force_full"] and not (
         plan["run_lean_build"] and plan["run_conformance_full"]
         and plan["conformance_seeds"] == 64
+        and plan["target_ir_fuzz_seeds"] == 64
     ):
         raise AssertionError(f"force_full invariant failed: {plan}")
 
