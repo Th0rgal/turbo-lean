@@ -401,17 +401,17 @@ fn parse_accepted_declarations(stdout: &str) -> Option<u64> {
     None
 }
 
-fn resolve_scratch_tmpdir(explicit_tmpdir: Option<&Path>) -> PathBuf {
+fn resolve_scratch_tmpdir(explicit_tmpdir: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = explicit_tmpdir {
-        return p.to_path_buf();
+        return Some(p.to_path_buf());
     }
     if let Ok(raw) = std::env::var("TMPDIR") {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
-            return PathBuf::from(trimmed);
+            return Some(PathBuf::from(trimmed));
         }
     }
-    std::env::temp_dir()
+    None
 }
 
 fn classify_con_leche_status(
@@ -501,8 +501,10 @@ pub fn verify_olean_modules_with_con_leche(
     let tmpdir = resolve_scratch_tmpdir(scratch_tmpdir);
 
     let mut cmd = Command::new(binary_path);
-    cmd.env("TMPDIR", &tmpdir)
-        .arg("--verified")
+    if let Some(ref td) = tmpdir {
+        cmd.env("TMPDIR", td);
+    }
+    cmd.arg("--verified")
         .arg(format!("--jobs={jobs}"))
         .arg("--olean")
         .arg(format!("--search-path={joined_sp}"));
@@ -550,8 +552,11 @@ pub fn verify_ndjson_with_con_leche(
     let jobs = bounded_con_leche_jobs(requested_jobs);
     let tmpdir = resolve_scratch_tmpdir(scratch_tmpdir);
 
-    let out = Command::new(binary_path)
-        .env("TMPDIR", &tmpdir)
+    let mut cmd = Command::new(binary_path);
+    if let Some(ref td) = tmpdir {
+        cmd.env("TMPDIR", td);
+    }
+    let out = cmd
         .arg("--verified")
         .arg(format!("--jobs={jobs}"))
         .arg("--")
@@ -650,6 +655,29 @@ mod tests {
                 msg.contains("leanprover/lean4:v4.35.0"),
                 "unexpected error: {msg}"
             );
+        }
+    }
+
+    #[test]
+    fn test_resolve_scratch_tmpdir_explicit_and_inherited_default() {
+        let explicit = Path::new("/tmp/turbo-con-leche-explicit");
+        assert_eq!(
+            resolve_scratch_tmpdir(Some(explicit)),
+            Some(explicit.to_path_buf())
+        );
+        let prev = std::env::var_os("TMPDIR");
+        std::env::remove_var("TMPDIR");
+        assert_eq!(resolve_scratch_tmpdir(None), None);
+        std::env::set_var("TMPDIR", "   ");
+        assert_eq!(resolve_scratch_tmpdir(None), None);
+        std::env::set_var("TMPDIR", "/tmp/turbo-con-leche-env");
+        assert_eq!(
+            resolve_scratch_tmpdir(None),
+            Some(PathBuf::from("/tmp/turbo-con-leche-env"))
+        );
+        match prev {
+            Some(v) => std::env::set_var("TMPDIR", v),
+            None => std::env::remove_var("TMPDIR"),
         }
     }
 }

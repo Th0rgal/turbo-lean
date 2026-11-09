@@ -1,0 +1,12 @@
+name = "sail-riscv-bridge"
+version = "0.1.0"
+defaultTargets = ["SailRiscvBridge"]
+moreLeanArgs = ["--tstack=400000"]
+
+[[require]]
+name = "Lean_RV64D"
+git = "https://github.com/opencompl/sail-riscv-lean.git"
+rev = "51c635c460125ac87955d061fcd902ce03b8011f"
+
+[[lean_lib]]
+name = "SailRiscvBridge"

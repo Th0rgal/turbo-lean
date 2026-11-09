@@ -606,20 +606,19 @@ def main() -> int:
 
     needs_core_gates = any(t != "C3" for t in tiers)
     try:
-        if needs_core_gates or CORE.is_file():
-            if needs_core_gates or os.access(CORE, os.X_OK):
-                certs = command_json("verify-certs", "--canonical-benchmark", "--json")
-                plugins = command_json("plugins", "--canonical-benchmark", "--test-adversarial", "--json")
-                if certs.get("verified") is not True or not certs.get("declSummaries"):
-                    failures.append({"stage": "certificate_chain", "detail": certs})
-                if (
-                    plugins.get("adversarialRejected") is not True
-                    or type(plugins.get("rejectedCount")) is not int
-                    or plugins["rejectedCount"] < 1
-                    or not plugins.get("declAudits")
-                    or any(r.get("tvVerified") is not True for r in plugins["declAudits"])
-                ):
-                    failures.append({"stage": "adversarial_plugin_gate", "detail": plugins})
+        if needs_core_gates or (CORE.is_file() and os.access(CORE, os.X_OK)):
+            certs = command_json("verify-certs", "--canonical-benchmark", "--json")
+            plugins = command_json("plugins", "--canonical-benchmark", "--test-adversarial", "--json")
+            if certs.get("verified") is not True or not certs.get("declSummaries"):
+                failures.append({"stage": "certificate_chain", "detail": certs})
+            if (
+                plugins.get("adversarialRejected") is not True
+                or type(plugins.get("rejectedCount")) is not int
+                or plugins["rejectedCount"] < 1
+                or not plugins.get("declAudits")
+                or any(r.get("tvVerified") is not True for r in plugins["declAudits"])
+            ):
+                failures.append({"stage": "adversarial_plugin_gate", "detail": plugins})
 
         for tier in tiers:
             if tier == "C1":
