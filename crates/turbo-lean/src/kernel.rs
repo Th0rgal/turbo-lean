@@ -1,11 +1,18 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, ExitStatus};
 use std::str::FromStr;
 
 pub const KERNEL_ENGINE_ENV: &str = "TURBO_LEAN_KERNEL_ENGINE";
 pub const KERNEL_ENGINE_FROM_CONFIG_ENV: &str = "TURBO_LEAN_KERNEL_ENGINE_FROM_CONFIG";
+pub const CON_LECHE_BIN_ENV: &str = "TURBO_CON_LECHE_BIN";
+pub const PINNED_CON_LECHE_REV: &str = "501589f5680d9599dee1bcef30a420bc8924c490";
+pub const PINNED_CON_LECHE_TOOLCHAIN: &str = "leanprover/lean4:v4.35.0";
+pub const BRIDGE_CON_LECHE_BIN_REL: &str =
+    "verification/con-leche-bridge/.lake/packages/con-leche/.lake/build/bin/con-leche";
+pub const DEFAULT_MAX_CON_LECHE_JOBS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelEngineSelection {
@@ -286,6 +293,279 @@ pub fn resolve_project_kernel_provenance(
         .unwrap_or_else(|_| project_dir.to_path_buf());
     let tc = crate::lake_build::detect_toolchain(&canon_dir);
     resolve_kernel_engine(requested, &tc)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConLecheVerdict {
+    Accepted,
+    Rejected,
+    Declined,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConLecheRunReport {
+    pub verdict: ConLecheVerdict,
+    pub exit_code: i32,
+    pub binary_path: PathBuf,
+    pub con_leche_rev: String,
+    pub jobs: usize,
+    pub accepted_declarations: Option<u64>,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+pub fn bounded_con_leche_jobs(requested: Option<usize>) -> usize {
+    match requested {
+        Some(n) => n.clamp(1, DEFAULT_MAX_CON_LECHE_JOBS),
+        None => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(2)
+            .clamp(1, DEFAULT_MAX_CON_LECHE_JOBS),
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.metadata()
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+pub fn discover_con_leche_binary(workspace_root: Option<&Path>) -> Result<PathBuf> {
+    if let Ok(raw) = std::env::var(CON_LECHE_BIN_ENV) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            if is_executable_file(&p) {
+                return Ok(p.canonicalize().unwrap_or(p));
+            }
+            anyhow::bail!(
+                "`{CON_LECHE_BIN_ENV}` points to missing or non-executable `con-leche` binary: `{}`",
+                p.display()
+            );
+        }
+    }
+
+    let mut roots: Vec<PathBuf> = Vec::new();
+    if let Some(root) = workspace_root {
+        roots.push(root.to_path_buf());
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut cur: Option<&Path> = Some(cwd.as_path());
+        while let Some(dir) = cur {
+            roots.push(dir.to_path_buf());
+            cur = dir.parent();
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let mut cur = exe.parent();
+        while let Some(dir) = cur {
+            roots.push(dir.to_path_buf());
+            cur = dir.parent();
+        }
+    }
+
+    for root in roots {
+        let candidate = root.join(BRIDGE_CON_LECHE_BIN_REL);
+        if is_executable_file(&candidate) {
+            return Ok(candidate.canonicalize().unwrap_or(candidate));
+        }
+    }
+
+    anyhow::bail!(
+        "Verified `con-leche` binary not found (expected `{CON_LECHE_BIN_ENV}` or `{BRIDGE_CON_LECHE_BIN_REL}` built at rev `{PINNED_CON_LECHE_REV}`)"
+    )
+}
+
+fn parse_accepted_declarations(stdout: &str) -> Option<u64> {
+    for line in stdout.lines().rev() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("con-leche: accepted ") {
+            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+            if let Ok(n) = digits.parse::<u64>() {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_scratch_tmpdir(explicit_tmpdir: Option<&Path>) -> PathBuf {
+    if let Some(p) = explicit_tmpdir {
+        return p.to_path_buf();
+    }
+    if let Ok(raw) = std::env::var("TMPDIR") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    std::env::temp_dir()
+}
+
+fn classify_con_leche_status(
+    status: ExitStatus,
+    binary_path: PathBuf,
+    jobs: usize,
+    stdout: String,
+    stderr: String,
+) -> Result<ConLecheRunReport> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            anyhow::bail!(
+                "`con-leche` terminated by signal {sig} (fail-closed kernel abort; stderr: {})",
+                stderr.trim()
+            );
+        }
+    }
+    let Some(code) = status.code() else {
+        anyhow::bail!(
+            "`con-leche` terminated without exit code (fail-closed kernel abort; stderr: {})",
+            stderr.trim()
+        );
+    };
+    let verdict = match code {
+        0 => ConLecheVerdict::Accepted,
+        1 => ConLecheVerdict::Rejected,
+        2 => ConLecheVerdict::Declined,
+        3 => anyhow::bail!(
+            "`con-leche` failed with usage/malformed/internal error (exit 3): {}",
+            stderr.trim()
+        ),
+        other => anyhow::bail!(
+            "`con-leche` exited with unexpected status {other} (fail-closed): {}",
+            stderr.trim()
+        ),
+    };
+    let accepted_declarations = if verdict == ConLecheVerdict::Accepted {
+        parse_accepted_declarations(&stdout)
+    } else {
+        None
+    };
+    Ok(ConLecheRunReport {
+        verdict,
+        exit_code: code,
+        binary_path,
+        con_leche_rev: PINNED_CON_LECHE_REV.to_string(),
+        jobs,
+        accepted_declarations,
+        stdout,
+        stderr,
+    })
+}
+
+pub fn verify_olean_modules_with_con_leche(
+    binary_path: &Path,
+    search_paths: &[PathBuf],
+    root_modules: &[String],
+    constants: &[String],
+    requested_jobs: Option<usize>,
+    scratch_tmpdir: Option<&Path>,
+) -> Result<ConLecheRunReport> {
+    if !is_executable_file(binary_path) {
+        anyhow::bail!(
+            "`con-leche` binary is missing or not executable: `{}`",
+            binary_path.display()
+        );
+    }
+    if search_paths.is_empty() {
+        anyhow::bail!("`con-leche --olean` requires at least one `--search-path` directory");
+    }
+    if root_modules.is_empty() {
+        anyhow::bail!("`con-leche --olean` requires at least one root module name");
+    }
+    for m in root_modules {
+        let trimmed = m.trim();
+        if trimmed.is_empty() || trimmed.starts_with('-') {
+            anyhow::bail!("Invalid `con-leche` root module name `{m}`");
+        }
+    }
+    let jobs = bounded_con_leche_jobs(requested_jobs);
+    let joined_sp = std::env::join_paths(search_paths)
+        .context("Failed to join `--search-path` entries for `con-leche`")?
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("Non-UTF-8 `--search-path` entry passed to `con-leche`"))?;
+    let tmpdir = resolve_scratch_tmpdir(scratch_tmpdir);
+
+    let mut cmd = Command::new(binary_path);
+    cmd.env("TMPDIR", &tmpdir)
+        .arg("--verified")
+        .arg(format!("--jobs={jobs}"))
+        .arg("--olean")
+        .arg(format!("--search-path={joined_sp}"));
+    for c in constants {
+        let trimmed = c.trim();
+        if trimmed.is_empty() {
+            anyhow::bail!("Empty `--constant` name passed to `con-leche`");
+        }
+        cmd.arg(format!("--constant={trimmed}"));
+    }
+    cmd.arg("--");
+    for m in root_modules {
+        cmd.arg(m.trim());
+    }
+
+    let out = cmd.output().with_context(|| {
+        format!(
+            "Failed to spawn `con-leche` binary `{}`",
+            binary_path.display()
+        )
+    })?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    classify_con_leche_status(out.status, binary_path.to_path_buf(), jobs, stdout, stderr)
+}
+
+pub fn verify_ndjson_with_con_leche(
+    binary_path: &Path,
+    ndjson_file: &Path,
+    requested_jobs: Option<usize>,
+    scratch_tmpdir: Option<&Path>,
+) -> Result<ConLecheRunReport> {
+    if !is_executable_file(binary_path) {
+        anyhow::bail!(
+            "`con-leche` binary is missing or not executable: `{}`",
+            binary_path.display()
+        );
+    }
+    if !ndjson_file.is_file() {
+        anyhow::bail!(
+            "`con-leche` NDJSON stream file does not exist: `{}`",
+            ndjson_file.display()
+        );
+    }
+    let jobs = bounded_con_leche_jobs(requested_jobs);
+    let tmpdir = resolve_scratch_tmpdir(scratch_tmpdir);
+
+    let out = Command::new(binary_path)
+        .env("TMPDIR", &tmpdir)
+        .arg("--verified")
+        .arg(format!("--jobs={jobs}"))
+        .arg("--")
+        .arg(ndjson_file)
+        .output()
+        .with_context(|| {
+            format!(
+                "Failed to spawn `con-leche` binary `{}`",
+                binary_path.display()
+            )
+        })?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    classify_con_leche_status(out.status, binary_path.to_path_buf(), jobs, stdout, stderr)
 }
 
 #[cfg(test)]

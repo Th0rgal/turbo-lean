@@ -1,0 +1,11 @@
+name = "con-leche-bridge"
+version = "0.1.0"
+defaultTargets = ["ConLecheBridge"]
+
+[[require]]
+name = "con-leche"
+git = "https://github.com/leanprover/con-leche.git"
+rev = "501589f5680d9599dee1bcef30a420bc8924c490"
+
+[[lean_lib]]
+name = "ConLecheBridge"

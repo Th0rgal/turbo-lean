@@ -4,6 +4,34 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod c_abi {
+    pub fn route_kernel_engine(requested_engine: u8, con_leche_supported: bool) -> u8 {
+        match (requested_engine, con_leche_supported) {
+            (0, false) => 1,
+            (0, true) => 2,
+            (1, _) => 1,
+            (2, true) => 2,
+            (2, false) => 0,
+            (3, true) => 3,
+            (3, false) => 0,
+            _ => 0,
+        }
+    }
+}
+
+mod lake_build {
+    use std::path::Path;
+    pub fn detect_toolchain(project_dir: &Path) -> String {
+        std::fs::read_to_string(project_dir.join("lean-toolchain"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "unknown".to_string())
+    }
+}
+
+#[allow(dead_code)]
+#[path = "../src/kernel.rs"]
+mod kernel;
+
 struct KernelTestFixture {
     root: PathBuf,
 }
@@ -526,5 +554,271 @@ fn pr_and_ci_verify_base_policy_isolation_and_receipt_verification() {
     assert_err(
         &pr_downgrade_attempt,
         "pr-verify cannot downgrade base [kernel] engine = con-leche",
+    );
+}
+
+#[cfg(unix)]
+fn write_executable_script(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::write(path, body).unwrap();
+    let mut perms = fs::metadata(path).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn con_leche_exit_code_protocol_and_verified_cli_flags() {
+    let f = KernelTestFixture::new("con_leche_runner");
+    let mock_bin = f.root.join("mock-con-leche.sh");
+    let args_log = f.root.join("args.log");
+    let sp_dir = f.root.join("oleans");
+    let scratch_dir = f.root.join("scratch-tmp");
+    fs::create_dir_all(&sp_dir).unwrap();
+    fs::create_dir_all(&scratch_dir).unwrap();
+
+    write_executable_script(
+        &mock_bin,
+        &format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"{}\"\nprintf 'TMPDIR=%s\\n' \"$TMPDIR\" >> \"{}\"\ncase \"$MOCK_CODE\" in\n  0)\n    echo 'con-leche: accepted 42 declarations (--verified)'\n    exit 0\n    ;;\n  1)\n    echo 'con-leche: rejected: invalid declaration' >&2\n    exit 1\n    ;;\n  2)\n    echo 'con-leche: declined: unsupported feature' >&2\n    exit 2\n    ;;\n  3)\n    echo 'con-leche: usage/internal error' >&2\n    exit 3\n    ;;\n  134)\n    echo 'con-leche: panic abort' >&2\n    exit 134\n    ;;\n  sigabrt)\n    kill -ABRT $$\n    ;;\nesac\n",
+            args_log.display(),
+            args_log.display()
+        ),
+    );
+
+    let search_paths = vec![sp_dir.clone()];
+    let roots = vec!["DemoMod".to_string()];
+
+    // Exit 0 -> Accepted, parses declaration count, passes --verified and never --trusted.
+    std::env::set_var("MOCK_CODE", "0");
+    let rep_ok = kernel::verify_olean_modules_with_con_leche(
+        &mock_bin,
+        &search_paths,
+        &roots,
+        &["DemoMod.thm".to_string()],
+        Some(99),
+        Some(&scratch_dir),
+    )
+    .unwrap();
+    assert_eq!(rep_ok.verdict, kernel::ConLecheVerdict::Accepted);
+    assert_eq!(rep_ok.exit_code, 0);
+    assert_eq!(rep_ok.con_leche_rev, kernel::PINNED_CON_LECHE_REV);
+    assert_eq!(rep_ok.jobs, kernel::DEFAULT_MAX_CON_LECHE_JOBS);
+    assert_eq!(rep_ok.accepted_declarations, Some(42));
+    let logged = fs::read_to_string(&args_log).unwrap();
+    assert!(logged.lines().any(|l| l == "--verified"), "{logged}");
+    assert!(!logged.contains("--trusted"), "{logged}");
+    assert!(
+        logged
+            .lines()
+            .any(|l| l == format!("--jobs={}", kernel::DEFAULT_MAX_CON_LECHE_JOBS)),
+        "{logged}"
+    );
+    assert!(logged.lines().any(|l| l == "--olean"), "{logged}");
+    assert!(
+        logged.lines().any(|l| l == "--constant=DemoMod.thm"),
+        "{logged}"
+    );
+    assert!(
+        logged
+            .lines()
+            .any(|l| l == format!("TMPDIR={}", scratch_dir.display())),
+        "{logged}"
+    );
+
+    // Exit 1 -> Rejected
+    std::env::set_var("MOCK_CODE", "1");
+    let rep_rej = kernel::verify_olean_modules_with_con_leche(
+        &mock_bin,
+        &search_paths,
+        &roots,
+        &[],
+        Some(2),
+        Some(&scratch_dir),
+    )
+    .unwrap();
+    assert_eq!(rep_rej.verdict, kernel::ConLecheVerdict::Rejected);
+    assert_eq!(rep_rej.exit_code, 1);
+    assert_eq!(rep_rej.accepted_declarations, None);
+
+    // Exit 2 -> Declined
+    std::env::set_var("MOCK_CODE", "2");
+    let rep_dec = kernel::verify_olean_modules_with_con_leche(
+        &mock_bin,
+        &search_paths,
+        &roots,
+        &[],
+        Some(2),
+        Some(&scratch_dir),
+    )
+    .unwrap();
+    assert_eq!(rep_dec.verdict, kernel::ConLecheVerdict::Declined);
+    assert_eq!(rep_dec.exit_code, 2);
+
+    // Exit 3, 134, and SIGABRT -> fail-closed Err
+    for fatal_mode in ["3", "134", "sigabrt"] {
+        std::env::set_var("MOCK_CODE", fatal_mode);
+        let err = kernel::verify_olean_modules_with_con_leche(
+            &mock_bin,
+            &search_paths,
+            &roots,
+            &[],
+            Some(2),
+            Some(&scratch_dir),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("exit 3") || msg.contains("134") || msg.contains("signal"),
+            "unexpected error for {fatal_mode}: {msg}"
+        );
+    }
+    std::env::remove_var("MOCK_CODE");
+
+    // NDJSON invocation also enforces --verified and fails closed on missing input.
+    let ndjson_path = f.root.join("sample.ndjson");
+    fs::write(&ndjson_path, "{}\n").unwrap();
+    std::env::set_var("MOCK_CODE", "0");
+    let nd_ok =
+        kernel::verify_ndjson_with_con_leche(&mock_bin, &ndjson_path, Some(2), Some(&scratch_dir))
+            .unwrap();
+    assert_eq!(nd_ok.verdict, kernel::ConLecheVerdict::Accepted);
+    std::env::remove_var("MOCK_CODE");
+}
+
+#[cfg(unix)]
+#[test]
+fn real_con_leche_binary_verifies_valid_and_rejects_adversarial_olean_if_built() {
+    let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let Ok(con_leche_bin) = kernel::discover_con_leche_binary(Some(&repo_root)) else {
+        return;
+    };
+    let f = KernelTestFixture::new("real_con_leche");
+    let olean_dir = f.root.join("lib");
+    let scratch_dir = f.root.join("tmp");
+    fs::create_dir_all(&olean_dir).unwrap();
+    fs::create_dir_all(&scratch_dir).unwrap();
+
+    // Locate the v4.35.0 `lean` compiler cleanly even when no elan default toolchain is configured.
+    fs::write(
+        olean_dir.join("lean-toolchain"),
+        format!("{}\n", kernel::PINNED_CON_LECHE_TOOLCHAIN),
+    )
+    .unwrap();
+    let lean_bin = Command::new("elan")
+        .current_dir(&olean_dir)
+        .args(["which", "lean"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()))
+        .unwrap_or_else(|| PathBuf::from("lean"));
+
+    let valid_src = olean_dir.join("ValidPrelude.lean");
+    fs::write(
+        &valid_src,
+        "module\nprelude\npublic section\ninductive Yes : Prop where\n  | intro\ntheorem yes : Yes := Yes.intro\nend\n",
+    )
+    .unwrap();
+    let comp_valid = Command::new(&lean_bin)
+        .current_dir(&olean_dir)
+        .args([
+            "-R",
+            olean_dir.to_str().unwrap(),
+            "-o",
+            olean_dir.join("ValidPrelude.olean").to_str().unwrap(),
+            valid_src.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_ok(&comp_valid, "compile ValidPrelude.lean");
+
+    let rep_valid = kernel::verify_olean_modules_with_con_leche(
+        &con_leche_bin,
+        std::slice::from_ref(&olean_dir),
+        &["ValidPrelude".to_string()],
+        &[],
+        Some(2),
+        Some(&scratch_dir),
+    )
+    .unwrap();
+    assert_eq!(rep_valid.verdict, kernel::ConLecheVerdict::Accepted);
+    assert_eq!(rep_valid.exit_code, 0);
+    assert!(rep_valid.accepted_declarations.unwrap_or(0) >= 1);
+
+    // Adversarial Nat.div axiom spoofing: accepted by `lean` under `prelude`, rejected (exit 1) by `con-leche --verified`.
+    let spoof_src = olean_dir.join("SpoofNatDiv.lean");
+    fs::write(
+        &spoof_src,
+        "module\nprelude\npublic section\nset_option genCtorIdx false in\ninductive Nat where\n  | zero : Nat\n  | succ (n : Nat) : Nat\naxiom Nat.div : Nat -> Nat -> Nat\nend\n",
+    )
+    .unwrap();
+    let comp_spoof = Command::new(&lean_bin)
+        .current_dir(&olean_dir)
+        .args([
+            "-R",
+            olean_dir.to_str().unwrap(),
+            "-o",
+            olean_dir.join("SpoofNatDiv.olean").to_str().unwrap(),
+            spoof_src.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_ok(&comp_spoof, "compile SpoofNatDiv.lean");
+
+    let rep_spoof = kernel::verify_olean_modules_with_con_leche(
+        &con_leche_bin,
+        std::slice::from_ref(&olean_dir),
+        &["SpoofNatDiv".to_string()],
+        &[],
+        Some(2),
+        Some(&scratch_dir),
+    )
+    .unwrap();
+    assert_eq!(rep_spoof.verdict, kernel::ConLecheVerdict::Rejected);
+    assert_eq!(rep_spoof.exit_code, 1);
+
+    // Missing module on search path -> exit 3 -> fail-closed Err.
+    let err_missing = kernel::verify_olean_modules_with_con_leche(
+        &con_leche_bin,
+        std::slice::from_ref(&olean_dir),
+        &["NoSuchModuleAnywhere".to_string()],
+        &[],
+        Some(2),
+        Some(&scratch_dir),
+    )
+    .unwrap_err();
+    assert!(err_missing.to_string().contains("exit 3"));
+
+    // Even when `TURBO_CON_LECHE_BIN` points at the real built binary, `turbo-lean check --kernel con-leche`
+    // STILL fails closed until full project `.olean` closure replay is wired into `check`/`pr-verify`/`ci-verify`.
+    let proj = f.root.join("cli_proj");
+    fs::create_dir_all(&proj).unwrap();
+    fs::write(
+        proj.join("lean-toolchain"),
+        format!("{}\n", kernel::PINNED_CON_LECHE_TOOLCHAIN),
+    )
+    .unwrap();
+    fs::write(proj.join("Sample.lean"), "theorem t : 1 + 1 = 2 := rfl\n").unwrap();
+    let cli_fail = f
+        .cli("still_fail_closed")
+        .env(kernel::CON_LECHE_BIN_ENV, &con_leche_bin)
+        .args([
+            "--json",
+            "check",
+            "--kernel",
+            "con-leche",
+            proj.join("Sample.lean").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_err(
+        &cli_fail,
+        "CLI --kernel con-leche remains fail-closed even when binary exists",
     );
 }
