@@ -24,6 +24,7 @@ jobs:
       run_lean_build: ${{ steps.plan.outputs.run_lean_build }}
       conformance_seeds: ${{ steps.plan.outputs.conformance_seeds }}
       run_conformance_full: ${{ steps.plan.outputs.run_conformance_full }}
+      lean_turbo: ${{ steps.plan.outputs.lean_turbo }}
       llvm_backend: ${{ steps.plan.outputs.llvm_backend }}
       gpu_tpu_backend: ${{ steps.plan.outputs.gpu_tpu_backend }}
       con_leche_kernel: ${{ steps.plan.outputs.con_leche_kernel }}
@@ -311,11 +312,14 @@ jobs:
     if: >-
       needs.impact.outputs.run_lean_build == 'true' &&
       (needs.impact.outputs.sail_riscv_backend == 'true' ||
+       needs.impact.outputs.lean_turbo == 'true' ||
        needs.impact.outputs.ci_scripts == 'true' ||
        needs.impact.outputs.force_full == 'true')
     name: Stage 3E opencompl/sail-riscv-lean RV64 Bisimulation Bridge (0 sorryAx, 0 bv_decide)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    env:
+      LEAN_NUM_THREADS: "2"
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

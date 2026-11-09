@@ -604,7 +604,7 @@ def main() -> int:
         parser.error(str(err))
         return 2
 
-    needs_core_gates = any(t != "C3" for t in tiers)
+    needs_core_gates = any(t in ("C1", "C4") for t in tiers)
     try:
         if needs_core_gates or (CORE.is_file() and os.access(CORE, os.X_OK)):
             certs = command_json("verify-certs", "--canonical-benchmark", "--json")
