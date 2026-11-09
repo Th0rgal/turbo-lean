@@ -1313,9 +1313,61 @@ class TargetIRFuzzSelfTests(unittest.TestCase):
         self.assertEqual(main(["--seeds", "-1"]), 2)
         self.assertEqual(main(["--backends", "   "]), 2)
         self.assertEqual(main(["--backends", "llvm,unknown_backend"]), 2)
+        with tempfile.TemporaryDirectory(prefix="tl-fuzz-reexec-") as td:
+            fake_py = Path(td) / "fake_py312.sh"
+            fake_py.write_text(
+                "#!/bin/sh\n"
+                '[ "$_TL_TARGET_IR_FUZZ_REEXEC" = "1" ] && [ "$2" = "--seeds" ] && exit 42\n'
+                "exit 9\n",
+                encoding="utf-8",
+            )
+            fake_py.chmod(0o755)
+            orig_ensure = gpu_diff.ensure_compatible_python
+            orig_env = os.environ.pop("_TL_TARGET_IR_FUZZ_REEXEC", None)
+            try:
+                gpu_diff.ensure_compatible_python = lambda _d: str(fake_py)
+                rc_reexec = _maybe_reexec_compatible_python(
+                    py_tag="cp314",
+                    ensure_tools=True,
+                    tools_cache_dir=Path(td),
+                    raw_argv=["--seeds", "4", "--ensure-tools"],
+                )
+                self.assertEqual(rc_reexec, 42)
+                self.assertIsNone(
+                    _maybe_reexec_compatible_python(
+                        py_tag="cp312",
+                        ensure_tools=True,
+                        tools_cache_dir=Path(td),
+                        raw_argv=["--seeds", "4", "--ensure-tools"],
+                    )
+                )
+            finally:
+                gpu_diff.ensure_compatible_python = orig_ensure
+                if orig_env is not None:
+                    os.environ["_TL_TARGET_IR_FUZZ_REEXEC"] = orig_env
 
 
 VALID_BACKENDS = ("llvm", "ptx", "stablehlo", "metal")
+
+
+def _maybe_reexec_compatible_python(
+    *,
+    py_tag: str,
+    ensure_tools: bool,
+    tools_cache_dir: Path,
+    raw_argv: list[str],
+) -> int | None:
+    if py_tag in gpu_diff.STABLEHLO_WHEELS or os.environ.get("_TL_TARGET_IR_FUZZ_REEXEC"):
+        return None
+    if ensure_tools:
+        compat_py = gpu_diff.ensure_compatible_python(tools_cache_dir)
+    else:
+        compat_py = gpu_diff.find_compatible_python(tools_cache_dir)
+    if not compat_py:
+        return None
+    child_env = dict(os.environ, _TL_TARGET_IR_FUZZ_REEXEC="1")
+    proc = subprocess.run([compat_py, str(Path(__file__).resolve()), *raw_argv], env=child_env)
+    return proc.returncode
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1357,6 +1409,17 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
+
+    if "stablehlo" in backends:
+        py_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+        reexec_rc = _maybe_reexec_compatible_python(
+            py_tag=py_tag,
+            ensure_tools=args.ensure_tools,
+            tools_cache_dir=args.tools_cache_dir,
+            raw_argv=list(argv) if argv is not None else sys.argv[1:],
+        )
+        if reexec_rc is not None:
+            return reexec_rc
 
     if args.ensure_tools and ("ptx" in backends or "stablehlo" in backends):
         gpu_diff.ensure_gpu_tpu_tools(args.tools_cache_dir)
