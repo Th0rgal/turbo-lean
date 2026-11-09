@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
@@ -401,17 +402,29 @@ fn parse_accepted_declarations(stdout: &str) -> Option<u64> {
     None
 }
 
-fn resolve_scratch_tmpdir(explicit_tmpdir: Option<&Path>) -> Option<PathBuf> {
-    if let Some(p) = explicit_tmpdir {
+fn resolve_scratch_tmpdir_with_env(
+    explicit: Option<&Path>,
+    env_tmpdir: Option<&OsStr>,
+) -> Option<PathBuf> {
+    if let Some(p) = explicit {
         return Some(p.to_path_buf());
     }
-    if let Ok(raw) = std::env::var("TMPDIR") {
-        let trimmed = raw.trim();
+    let os_val = env_tmpdir?;
+    if let Some(s) = os_val.to_str() {
+        let trimmed = s.trim();
         if !trimmed.is_empty() {
             return Some(PathBuf::from(trimmed));
         }
+        return None;
+    }
+    if !os_val.is_empty() {
+        return Some(PathBuf::from(os_val));
     }
     None
+}
+
+fn resolve_scratch_tmpdir(explicit_tmpdir: Option<&Path>) -> Option<PathBuf> {
+    resolve_scratch_tmpdir_with_env(explicit_tmpdir, std::env::var_os("TMPDIR").as_deref())
 }
 
 fn classify_con_leche_status(
@@ -665,19 +678,18 @@ mod tests {
             resolve_scratch_tmpdir(Some(explicit)),
             Some(explicit.to_path_buf())
         );
-        let prev = std::env::var_os("TMPDIR");
-        std::env::remove_var("TMPDIR");
-        assert_eq!(resolve_scratch_tmpdir(None), None);
-        std::env::set_var("TMPDIR", "   ");
-        assert_eq!(resolve_scratch_tmpdir(None), None);
-        std::env::set_var("TMPDIR", "/tmp/turbo-con-leche-env");
         assert_eq!(
-            resolve_scratch_tmpdir(None),
+            resolve_scratch_tmpdir_with_env(Some(explicit), Some(OsStr::new("/tmp/ignored"))),
+            Some(explicit.to_path_buf())
+        );
+        assert_eq!(resolve_scratch_tmpdir_with_env(None, None), None);
+        assert_eq!(
+            resolve_scratch_tmpdir_with_env(None, Some(OsStr::new("   "))),
+            None
+        );
+        assert_eq!(
+            resolve_scratch_tmpdir_with_env(None, Some(OsStr::new(" /tmp/turbo-con-leche-env "))),
             Some(PathBuf::from("/tmp/turbo-con-leche-env"))
         );
-        match prev {
-            Some(v) => std::env::set_var("TMPDIR", v),
-            None => std::env::remove_var("TMPDIR"),
-        }
     }
 }

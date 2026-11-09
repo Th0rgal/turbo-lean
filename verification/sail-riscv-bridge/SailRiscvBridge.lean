@@ -29,6 +29,24 @@ def bridgedTheorems : List Name :=
   , ``SailRiscvBridge.clmul64_eq_sail_carryless_mul_lo
   , ``SailRiscvBridge.clmul64Hi_eq_sail_carryless_mul_hi
   , ``SailRiscvBridge.clmul64_pair_eq_sail_carryless_mul
+  , ``SailRiscvBridge.riscvDivS64Spec_bisim_sail
+  , ``SailRiscvBridge.riscvRemS64Spec_bisim_sail
+  , ``SailRiscvBridge.riscvDivRemS64Spec_euclidean
+  , ``SailRiscvBridge.mult_to_bits_half_high_signed_eq_mulh
+  , ``SailRiscvBridge.mult_to_bits_half_high_signed_unsigned_eq_mulhsu
+  , ``SailRiscvBridge.sail_carryless_mulr_eq_extract_carryless_mul
+  , ``SailRiscvBridge.clmul64RSpec_bisim_sail
+  , ``SailRiscvBridge.sail_carryless_mul_comm
+  , ``SailRiscvBridge.clmul64_comm
+  , ``SailRiscvBridge.clmul64Hi_comm
+  , ``SailRiscvBridge.clmul64_direct_order_bisim_sail
+  , ``SailRiscvBridge.rv64iRtypeSpec_bisim_sail
+  , ``SailRiscvBridge.rv64iItypeSpec_bisim_sail
+  , ``SailRiscvBridge.rv64iShiftIopSpec_bisim_sail
+  , ``SailRiscvBridge.get_arch_pc_run
+  , ``SailRiscvBridge.rv64iUtypeSpec_bisim_sail_x1
+  , ``SailRiscvBridge.rv64iBtypeTakenSpec_bisim_sail
+  , ``SailRiscvBridge.sailBtypeTakenCore_complement
   ]
 
 def allowedAxioms : List Name :=
