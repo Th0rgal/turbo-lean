@@ -725,9 +725,10 @@ def eval_stablehlo_trap_isolated(
     mlir_text: str,
     args_spec: list[dict[str, Any]],
     tools_cache_dir: Path,
-) -> int:
+) -> tuple[int, str, str]:
     """Run OpenXLA `eval_stablehlo_multiwidth` in a child process so C++ `llvm::APInt`
-    `SIGABRT` traps on `/ 0` and `% 0` return a clean non-zero exit code."""
+    `SIGABRT` traps on `/ 0` and `% 0` return a clean non-zero exit code without
+    conflating harness/Python exceptions with genuine OpenXLA interpreter traps."""
     code = (
         "import json, sys\n"
         "from pathlib import Path\n"
@@ -744,9 +745,9 @@ def eval_stablehlo_trap_isolated(
         "try:\n"
         "    out = rtf.eval_stablehlo_multiwidth(req['mlir'], req['args'])\n"
         "except Exception as exc:\n"
-        "    print(json.dumps({'eval_error': f'{type(exc).__name__}: {exc}'}))\n"
-        "    sys.exit(2)\n"
-        "print(json.dumps({'ok': list(out)}))\n"
+        "    print(json.dumps({'eval_error': f'{type(exc).__name__}: {exc}'}), flush=True)\n"
+        "    sys.exit(98)\n"
+        "print(json.dumps({'ok': list(out)}), flush=True)\n"
     )
     proc = subprocess.run(
         [sys.executable, "-c", code],
@@ -759,7 +760,14 @@ def eval_stablehlo_trap_isolated(
         raise RuntimeError(
             f"Isolated OpenXLA child bootstrap failed (rc={proc.returncode}):\n{proc.stdout}\n{proc.stderr}"
         )
-    return proc.returncode
+    if proc.returncode == 98:
+        # Distinguish genuine MLIR/OpenXLA evaluation errors (`MLIRError` / `ValueError` from MLIR)
+        # from unexpected harness bugs (AttributeError, TypeError, KeyError, NameError, etc.).
+        if '"MLIRError:' not in proc.stdout:
+            raise RuntimeError(
+                f"Isolated OpenXLA child failed with unexpected Python exception:\n{proc.stdout}\n{proc.stderr}"
+            )
+    return proc.returncode, proc.stdout, proc.stderr
 
 
 def run_stablehlo_case(tools_cache_dir: Path, case: dict[str, Any]) -> None:
@@ -805,7 +813,7 @@ def run_stablehlo_case(tools_cache_dir: Path, case: dict[str, Any]) -> None:
             if not rejected:
                 raise RuntimeError(f"[{cid}] OpenXLA verifier accepted static invalid {trap_cls} MLIR!")
         else:
-            rc = eval_stablehlo_trap_isolated(mlir_text, args_spec, tools_cache_dir)
+            rc, _, _ = eval_stablehlo_trap_isolated(mlir_text, args_spec, tools_cache_dir)
             if rc == 0:
                 raise RuntimeError(f"[{cid}] OpenXLA eval_module did NOT trap on runtime {trap_cls}!")
 
@@ -991,6 +999,8 @@ def _exec_metal_host_kernel(
 
 def run_metal_case(clangxx: str, case: dict[str, Any]) -> None:
     cid = case["id"]
+    if case.get("roundtripScope") not in (None, "kernel", "block"):
+        raise RuntimeError(f"[{cid}] unexpected roundtripScope: {case.get('roundtripScope')!r}")
     if not case.get("roundtripVerified", False):
         raise RuntimeError(f"[{cid}] in-Lean roundtripVerified flag is false")
     kname = case["kernelName"]
@@ -1127,9 +1137,12 @@ class TargetIRFuzzSelfTests(unittest.TestCase):
         self.assertEqual(ctx2.exception.trap_class, "dataRace")
 
     def test_llvm_native_asan_ubsan_trap(self) -> None:
+        strict_tools = os.environ.get("TARGET_IR_FUZZ_STRICT_TOOLS", "").lower() == "true"
         clang_bin = find_clang_c()
         opt_bin = llvm_diff.find_llvm_tool(["opt-18", "opt-19", "opt"])
         if not clang_bin or not opt_bin:
+            if strict_tools:
+                self.fail(f"Required clang/opt missing under strict mode: clang={clang_bin}, opt={opt_bin}")
             self.skipTest("clang/opt not available")
         oob_case = {
             "id": "selftest_llvm_oob",
@@ -1153,8 +1166,11 @@ class TargetIRFuzzSelfTests(unittest.TestCase):
         self.assertNotEqual(rc, 0)
 
     def test_metal_tsan_and_asan_traps(self) -> None:
+        strict_tools = os.environ.get("TARGET_IR_FUZZ_STRICT_TOOLS", "").lower() == "true"
         clangxx = gpu_diff.find_clangxx()
         if not clangxx:
+            if strict_tools:
+                self.fail("Required clang++ missing under strict mode")
             self.skipTest("clang++ not available")
         race_msl = (
             "#include <metal_stdlib>\nusing namespace metal;\n\n"
@@ -1175,10 +1191,29 @@ class TargetIRFuzzSelfTests(unittest.TestCase):
         )
         self.assertNotEqual(rc_race, 0)
 
+    def test_cli_flags_and_fail_closed_validation(self) -> None:
+        args_core = parse_args(["--core-bin", "/tmp/lean-native-core", "--seeds", "4"])
+        self.assertEqual(args_core.lean_bin, Path("/tmp/lean-native-core"))
+        args_lean = parse_args(["--lean-bin", "/tmp/lean-native", "--seeds", "8"])
+        self.assertEqual(args_lean.lean_bin, Path("/tmp/lean-native"))
+        self.assertEqual(main(["--seeds", "0"]), 2)
+        self.assertEqual(main(["--seeds", "-1"]), 2)
+        self.assertEqual(main(["--backends", "   "]), 2)
+        self.assertEqual(main(["--backends", "llvm,unknown_backend"]), 2)
+
+
+VALID_BACKENDS = ("llvm", "ptx", "stablehlo", "metal")
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--lean-bin", type=Path, help="Path to `lean-native-core` or `lean-native`")
+    p.add_argument(
+        "--core-bin",
+        "--lean-bin",
+        dest="lean_bin",
+        type=Path,
+        help="Path to `lean-native-core` or `lean-native`",
+    )
     p.add_argument("--suite-json", type=Path, help="Pre-generated `target-ir-fuzz-suite` JSON file")
     p.add_argument("--seed-start", type=int, default=0)
     p.add_argument("--seeds", type=int, default=16)
@@ -1201,9 +1236,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if ok else 1
 
     backends = [b.strip() for b in args.backends.split(",") if b.strip()]
-    if not backends or args.seeds <= 0:
-        print(f"[target-ir-fuzz] skipped (seeds={args.seeds}, backends={backends})")
-        return 0
+    unknown = [b for b in backends if b not in VALID_BACKENDS]
+    if not backends or unknown or args.seeds <= 0:
+        print(
+            f"[target-ir-fuzz] ERROR: invalid non-empty fuzz configuration required "
+            f"(seeds={args.seeds}, backends={backends}, unknown={unknown})",
+            file=sys.stderr,
+        )
+        return 2
 
     if args.ensure_tools and ("ptx" in backends or "stablehlo" in backends):
         gpu_diff.ensure_gpu_tpu_tools(args.tools_cache_dir)
@@ -1212,7 +1252,7 @@ def main(argv: list[str] | None = None) -> int:
         payload = json.loads(args.suite_json.read_text(encoding="utf-8"))
     else:
         if not args.lean_bin or not args.lean_bin.is_file():
-            raise RuntimeError(f"--lean-bin not found: {args.lean_bin}")
+            raise RuntimeError(f"--core-bin / --lean-bin not found: {args.lean_bin}")
         self_chk = subprocess.run(
             [str(args.lean_bin), "target-ir-fuzz-suite", "--self-test"],
             capture_output=True,

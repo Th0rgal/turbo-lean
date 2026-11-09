@@ -99,7 +99,7 @@ def classify(paths, event="pull_request", ref=""):
             full = True
     docs = bool(paths) and all(map(is_doc, paths))
     preflight_only = bool(paths) and all(is_doc(p) or is_sdk(p) for p in paths)
-    run_fuzz = force or any(
+    run_fuzz = force or full or any(
         domains[k] for k in ("ci_scripts", "lean_ir_semantics", "llvm_backend", "gpu_tpu_backend")
     )
     return dict(domains, docs_only=docs, force_full=force,
@@ -359,6 +359,8 @@ def verify_plan_invariants(plan):
                       or not plan["inputs_unchanged"])
     if plan["run_lean_build"] != expected_build:
         raise AssertionError(f"run_lean_build mismatch: {plan}")
+    if plan["run_conformance_full"] and plan["target_ir_fuzz_seeds"] < 32:
+        raise AssertionError(f"run_conformance_full requires target_ir_fuzz_seeds >= 32: {plan}")
     if plan["force_full"] and not (
         plan["run_lean_build"] and plan["run_conformance_full"]
         and plan["conformance_seeds"] == 64
