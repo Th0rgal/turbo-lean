@@ -158,10 +158,12 @@ def check_bridge_tree(root_dir: Path) -> dict[str, object]:
             errors.append("ConLecheBridge.lean missing `#verify_con_leche_bridge_axioms` gate")
         if "Lean.collectAxioms" not in rb_stripped:
             errors.append("ConLecheBridge.lean missing `Lean.collectAxioms` audit")
-        if "bridgedTheorems.Nodup" not in rb_stripped:
-            errors.append("ConLecheBridge.lean missing `bridgedTheorems.Nodup` uniqueness theorem")
-        if "minAuditedTheorems" not in rb_stripped:
-            errors.append("ConLecheBridge.lean missing `minAuditedTheorems` floor")
+        if "theorem bridgedTheorems_nodup : bridgedTheorems.Nodup" not in rb_stripped:
+            errors.append("ConLecheBridge.lean missing `theorem bridgedTheorems_nodup : bridgedTheorems.Nodup` uniqueness theorem")
+        if f"def minAuditedTheorems : Nat := {MIN_AUDITED_THEOREMS}" not in rb_stripped:
+            errors.append(
+                f"ConLecheBridge.lean missing exact `def minAuditedTheorems : Nat := {MIN_AUDITED_THEOREMS}` floor"
+            )
         bridged_refs = re.findall(r"``ConLecheBridge\.[A-Za-z0-9_?.']+", rb_stripped)
         if len(bridged_refs) != len(set(bridged_refs)):
             seen_refs: set[str] = set()
@@ -274,13 +276,17 @@ class SelfTests(unittest.TestCase):
             b_root = self._copy_minimal_tree(root)
             orig = (b_root / "ConLecheBridge.lean").read_text(encoding="utf-8")
             (b_root / "ConLecheBridge.lean").write_text(
-                orig.replace("bridgedTheorems.Nodup", "True"),
+                orig.replace("bridgedTheorems.Nodup", "True").replace(
+                    f"def minAuditedTheorems : Nat := {MIN_AUDITED_THEOREMS}",
+                    "def minAuditedTheorems : Nat := 9",
+                ),
                 encoding="utf-8",
             )
             rep = check_bridge_tree(root)
             self.assertFalse(rep["ok"])
             errs = "\n".join(str(e) for e in rep["errors"])
-            self.assertIn("missing `bridgedTheorems.Nodup` uniqueness theorem", errs)
+            self.assertIn("bridgedTheorems.Nodup", errs)
+            self.assertIn(f"def minAuditedTheorems : Nat := {MIN_AUDITED_THEOREMS}", errs)
 
 
 def main() -> int:
