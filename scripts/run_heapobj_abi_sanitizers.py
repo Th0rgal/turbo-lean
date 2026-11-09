@@ -177,27 +177,27 @@ def lean_runtime_link_flags(lean_prefix: Path) -> list[str]:
 
 FALLBACK_CABI_SLICE_HEADER = """/* Fallback CAbiEmit LP64 slice header (used only when --core-bin is not built) */
 #pragma once
+#ifndef LEAN_NATIVE_GENERATED_C_ABI_H
+#define LEAN_NATIVE_GENERATED_C_ABI_H
 #include <stdint.h>
 #include <stddef.h>
-typedef struct lean_native_flat_slice_t {
-  const void* data;
-  size_t len;
-  size_t byte_stride;
-} lean_native_flat_slice_t;
-typedef struct lean_native_mut_slice_t {
-  void* data;
-  size_t len;
-  size_t byte_stride;
-} lean_native_mut_slice_t;
+typedef struct { const void* data; size_t len; size_t stride_bytes; } lean_native_flat_slice_t;
+typedef struct { void* data; size_t len; size_t cap; } lean_native_mut_slice_t;
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 #if defined(__LP64__) || defined(_LP64)
-_Static_assert(sizeof(lean_native_flat_slice_t) == 24, "flat_slice size");
-_Static_assert(_Alignof(lean_native_flat_slice_t) == 8, "flat_slice align");
-_Static_assert(offsetof(lean_native_flat_slice_t, data) == 0, "flat_slice.data");
-_Static_assert(offsetof(lean_native_flat_slice_t, len) == 8, "flat_slice.len");
-_Static_assert(offsetof(lean_native_flat_slice_t, byte_stride) == 16, "flat_slice.byte_stride");
-_Static_assert(sizeof(lean_native_mut_slice_t) == 24, "mut_slice size");
-_Static_assert(_Alignof(lean_native_mut_slice_t) == 8, "mut_slice align");
+_Static_assert(sizeof(lean_native_flat_slice_t) == 24, "lean_native_flat_slice_t size");
+_Static_assert(_Alignof(lean_native_flat_slice_t) == 8, "lean_native_flat_slice_t align");
+_Static_assert(offsetof(lean_native_flat_slice_t, data) == 0, "lean_native_flat_slice_t.data offset");
+_Static_assert(offsetof(lean_native_flat_slice_t, len) == 8, "lean_native_flat_slice_t.len offset");
+_Static_assert(offsetof(lean_native_flat_slice_t, stride_bytes) == 16, "lean_native_flat_slice_t.stride_bytes offset");
+_Static_assert(sizeof(lean_native_mut_slice_t) == 24, "lean_native_mut_slice_t size");
+_Static_assert(_Alignof(lean_native_mut_slice_t) == 8, "lean_native_mut_slice_t align");
+_Static_assert(offsetof(lean_native_mut_slice_t, data) == 0, "lean_native_mut_slice_t.data offset");
+_Static_assert(offsetof(lean_native_mut_slice_t, len) == 8, "lean_native_mut_slice_t.len offset");
+_Static_assert(offsetof(lean_native_mut_slice_t, cap) == 16, "lean_native_mut_slice_t.cap offset");
 #endif
+#endif
+#endif /* LEAN_NATIVE_GENERATED_C_ABI_H */
 """
 
 
@@ -223,7 +223,31 @@ void lean_runtime_mark_multi_threaded(void);
 extern "C" uint64_t collatz_steps(uint64_t n, uint64_t steps);
 extern "C" lean_object* lean_native_abi_collatz_steps(lean_object* n, lean_object* steps);
 extern "C" void* sarray_scale_bias(void* xs, uint64_t a, uint64_t b);
+extern "C" void lean_native_evm_sload(void* m_ptr, const void* slot_ptr, void* val_out) {
+    (void)m_ptr;
+    (void)slot_ptr;
+    memset(val_out, 0, 32);
+}
+extern "C" void lean_native_evm_sstore(void* m_ptr, const void* slot_ptr, const void* val_ptr) {
+    (void)m_ptr;
+    (void)slot_ptr;
+    (void)val_ptr;
+}
+extern "C" uint64_t lean_native_trm_matryoshka_parity_u64(uint64_t x) {
+    return static_cast<uint64_t>(__builtin_popcountll(x) & 1);
+}
 #endif
+
+static_assert(sizeof(lean_native_flat_slice_t) == 24, "lean_native_flat_slice_t 24-byte LP64 layout");
+static_assert(alignof(lean_native_flat_slice_t) == 8, "lean_native_flat_slice_t 8-byte align");
+static_assert(offsetof(lean_native_flat_slice_t, data) == 0, "flat_slice.data offset 0");
+static_assert(offsetof(lean_native_flat_slice_t, len) == 8, "flat_slice.len offset 8");
+static_assert(offsetof(lean_native_flat_slice_t, stride_bytes) == 16, "flat_slice.stride_bytes offset 16");
+static_assert(sizeof(lean_native_mut_slice_t) == 24, "lean_native_mut_slice_t 24-byte LP64 layout");
+static_assert(alignof(lean_native_mut_slice_t) == 8, "lean_native_mut_slice_t 8-byte align");
+static_assert(offsetof(lean_native_mut_slice_t, data) == 0, "mut_slice.data offset 0");
+static_assert(offsetof(lean_native_mut_slice_t, len) == 8, "mut_slice.len offset 8");
+static_assert(offsetof(lean_native_mut_slice_t, cap) == 16, "mut_slice.cap offset 16");
 
 static_assert(sizeof(lean_object) == 8, "lean_object 8-byte header");
 static_assert(offsetof(lean_object, m_rc) == 0, "m_rc offset 0");
@@ -376,7 +400,7 @@ static int run_clean_suite(void) {
     const uint8_t* raw_bytes = static_cast<const uint8_t*>(view.data);
     for (size_t i = 0; i < view.len; ++i) {
         uint64_t elem = 0;
-        memcpy(&elem, raw_bytes + i * view.byte_stride, sizeof(uint64_t));
+        memcpy(&elem, raw_bytes + i * view.stride_bytes, sizeof(uint64_t));
         acc += elem;
     }
     if (acc != (11ULL + 22ULL + 33ULL + 44ULL)) return 31;
@@ -436,9 +460,9 @@ int main(int argc, char** argv) {
     }
     if (strcmp(mode, "trap_asan_cabi_slice_oob") == 0) {
         uint64_t* buf = static_cast<uint64_t*>(malloc(4 * sizeof(uint64_t)));
-        lean_native_mut_slice_t mslice = { buf, 4, sizeof(uint64_t) };
+        lean_native_mut_slice_t mslice = { buf, 4, 4 };
         volatile uint64_t* p = static_cast<uint64_t*>(mslice.data);
-        p[mslice.len] = 0xBAD00BULL; // One-past-end write caught by ASan
+        p[mslice.cap] = 0xBAD00BULL; // One-past-end write caught by ASan
         free(buf);
         return 0;
     }
@@ -673,7 +697,19 @@ def run_sanitizer_suite(
             asan_ll = fuzz_san.instrument_llvm_ir_for_asan(raw_ll)
             asan_ll_path.write_text(asan_ll, encoding="utf-8")
             subprocess.run(
-                [clang, "-O1", "-g", "-Wno-override-module", "-fsanitize=address", "-c", str(asan_ll_path), "-o", str(obj_path)],
+                [
+                    clang,
+                    "-O1",
+                    "-g",
+                    "-fdata-sections",
+                    "-ffunction-sections",
+                    "-Wno-override-module",
+                    "-fsanitize=address",
+                    "-c",
+                    str(asan_ll_path),
+                    "-o",
+                    str(obj_path),
+                ],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -861,6 +897,86 @@ class HeapObjSanitizerSelfTests(unittest.TestCase):
         bad = run_sanitizer_suite(core_bin_arg="/nonexistent/lean-native-core", require_tsan=False)
         self.assertFalse(bad["ok"])
         self.assertEqual(bad["status"], "missing_requested_core_bin")
+
+    def test_compiled_lnir_kernel_cabi_header_link_and_exec(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="turbo_stage5_mock_core_") as tmp:
+            mock_core = Path(tmp) / "mock-lean-native-core"
+            mock_core.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "from pathlib import Path\n"
+                "args = sys.argv[1:]\n"
+                "if args[0] == 'emit-cabi-bindings':\n"
+                "    out = Path(args[args.index('--emit-header') + 1])\n"
+                "    out.write_text('''#pragma once\n"
+                "#ifndef LEAN_NATIVE_GENERATED_C_ABI_H\n"
+                "#define LEAN_NATIVE_GENERATED_C_ABI_H\n"
+                "#include <stdint.h>\n"
+                "#include <stddef.h>\n"
+                "typedef struct { const void* data; size_t len; size_t stride_bytes; } lean_native_flat_slice_t;\n"
+                "typedef struct { void* data; size_t len; size_t cap; } lean_native_mut_slice_t;\n"
+                "#ifdef __cplusplus\n"
+                "extern \"C\" {\n"
+                "#endif\n"
+                "uint64_t collatz_steps(uint64_t n, uint64_t steps);\n"
+                "void* sarray_scale_bias(void* arr, uint64_t scale, uint64_t bias);\n"
+                "const uint64_t* evm_erc20_transfer_u256(void* mapVar, const uint64_t* senderSlot, const uint64_t* receiverSlot, const uint64_t* amount);\n"
+                "#ifdef __cplusplus\n"
+                "}\n"
+                "#endif\n"
+                "#endif\n''', encoding='utf-8')\n"
+                "elif args[0] == 'compile-llvm':\n"
+                "    out = Path(args[args.index('-o') + 1])\n"
+                "    out.write_text('''target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n"
+                "target triple = \"x86_64-unknown-linux-gnu\"\n"
+                "declare void @lean_native_evm_sload(ptr, ptr, ptr)\n"
+                "declare void @lean_native_evm_sstore(ptr, ptr, ptr)\n"
+                "declare i64 @lean_native_trm_matryoshka_parity_u64(i64)\n"
+                "define dso_local i64 @collatz_steps(i64 %n, i64 %steps) #0 {\n"
+                "entry:\n"
+                "  %acc0 = add i64 %n, %steps\n"
+                "  ret i64 %acc0\n"
+                "}\n"
+                "define dso_local ptr @lean_native_abi_collatz_steps(ptr %a0, ptr %a1) #0 {\n"
+                "entry:\n"
+                "  %r0 = ptrtoint ptr %a0 to i64\n"
+                "  %u0 = lshr i64 %r0, 1\n"
+                "  %r1 = ptrtoint ptr %a1 to i64\n"
+                "  %u1 = lshr i64 %r1, 1\n"
+                "  %c = call i64 @collatz_steps(i64 %u0, i64 %u1)\n"
+                "  %sh = shl i64 %c, 1\n"
+                "  %tg = or i64 %sh, 1\n"
+                "  %bp = inttoptr i64 %tg to ptr\n"
+                "  ret ptr %bp\n"
+                "}\n"
+                "define dso_local ptr @sarray_scale_bias(ptr %arr, i64 %scale, i64 %bias) #0 {\n"
+                "entry:\n"
+                "  %data = getelementptr inbounds i8, ptr %arr, i64 24\n"
+                "  %v0 = load i64, ptr %data, align 8\n"
+                "  %m0 = mul i64 %v0, %scale\n"
+                "  %a0 = add i64 %m0, %bias\n"
+                "  store i64 %a0, ptr %data, align 8\n"
+                "  %p3 = getelementptr inbounds i64, ptr %data, i64 3\n"
+                "  %v3 = load i64, ptr %p3, align 8\n"
+                "  %m3 = mul i64 %v3, %scale\n"
+                "  %a3 = add i64 %m3, %bias\n"
+                "  store i64 %a3, ptr %p3, align 8\n"
+                "  ret ptr %arr\n"
+                "}\n"
+                "define dso_local void @evm_erc20_transfer_u256(ptr %out, ptr %map, ptr %s, ptr %r, ptr %amt) #0 {\n"
+                "entry:\n"
+                "  call void @lean_native_evm_sload(ptr %map, ptr %s, ptr %out)\n"
+                "  call void @lean_native_evm_sstore(ptr %map, ptr %r, ptr %amt)\n"
+                "  %par = call i64 @lean_native_trm_matryoshka_parity_u64(i64 7)\n"
+                "  ret void\n"
+                "}\n"
+                "attributes #0 = { nounwind uwtable \"target-cpu\"=\"x86-64-v2\" }\n''', encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            mock_core.chmod(0o755)
+            report = run_sanitizer_suite(core_bin_arg=str(mock_core), require_tsan=False)
+            self.assertTrue(report["ok"], json.dumps(report, indent=2))
+            self.assertGreater(report["asanLsnUbsanClean"]["payload"]["kernelOut"], 0)
 
 
 def main() -> int:
