@@ -46,9 +46,31 @@ FORBIDDEN_PROOF_TOKENS = re.compile(
     re.M,
 )
 FORBIDDEN_IMPORTS = re.compile(
-    r"^\s*import\s+(?:LeanRV64D\s*$|LeanRV64D\.(?:InstsEnd|Step|ZicsrInsts)\b)",
+    r"^\s*import\s+(?:LeanRV64D\s*$|LeanRV64D\.(?:InstsEnd|Step|ZicsrInsts|RiscvExtras)\b)",
     re.M,
 )
+
+UPSTREAM_INSTSEND_REL = ".lake/packages/Lean_RV64D/LeanRV64D/InstsEnd.lean"
+PINNED_INSTSEND_SNIPPET_DIGESTS: dict[str, str] = {
+    "execute_DIV": "4394ab1c2623f0687728cc0ab7c0d317009f11b00ccab473222c19d365ff612c",
+    "execute_REM": "fb4f86ac254fb647f41a41e6f26f765c9087770677b49a2e739e14b8d515db31",
+    "execute_RTYPE": "d1785beb7a32d8a262bdb300b428a8087d67930409e4be1dcac12cc1b5515085",
+    "execute_ITYPE": "1813fbb5a72a8fb1b10596e1707ce461df64c72503576e20634eab120203dfe1",
+    "execute_SHIFTIOP": "c59c039a540b8698df6cd94cfaf2b53eca51328d3ce442f179acd2a2e36722e2",
+    "execute_UTYPE": "9c284f4e64a21d4a129ea96a6ef8c9d759d953ae6788261a0eed4e42e11ccb24",
+    "execute_BTYPE": "3774f7e36ab761a98a6cbf764f93447ea643c51fba6d5f683dcc03812225993b",
+}
+
+
+def extract_instsend_def_snippet(text: str, def_name: str) -> str:
+    marker = f"def {def_name} "
+    s_idx = text.find(marker)
+    if s_idx < 0:
+        raise ValueError(f"Could not locate `{marker.strip()}` in {UPSTREAM_INSTSEND_REL}")
+    e_idx = text.find("\n\n", s_idx)
+    if e_idx < 0:
+        e_idx = len(text)
+    return text[s_idx:e_idx]
 
 
 def sha256_bytes(b: bytes) -> str:
@@ -287,6 +309,25 @@ def check_bridge_tree(root_dir: Path, sync_mirrors: bool = False) -> dict[str, o
         if mi:
             errors.append(f"Forbidden heavy import `{mi.group(0).strip()}` in {rel_str}")
 
+    instsend_path = bridge_root / UPSTREAM_INSTSEND_REL
+    upstream_instsend_checked = False
+    upstream_instsend_digests: dict[str, str] = {}
+    if instsend_path.is_file():
+        upstream_instsend_checked = True
+        try:
+            instsend_txt = instsend_path.read_text(encoding="utf-8")
+            for def_name, expected_sha in PINNED_INSTSEND_SNIPPET_DIGESTS.items():
+                snippet = extract_instsend_def_snippet(instsend_txt, def_name)
+                actual_sha = sha256_bytes(snippet.encode("utf-8"))
+                upstream_instsend_digests[def_name] = actual_sha
+                if actual_sha != expected_sha:
+                    errors.append(
+                        f"Upstream InstsEnd.lean `{def_name}` snippet SHA-256 mismatch: "
+                        f"{actual_sha} != {expected_sha}"
+                    )
+        except Exception as exc:
+            errors.append(f"Upstream InstsEnd.lean snippet check failed: {exc}")
+
     return {
         "ok": len(errors) == 0,
         "pinned_toolchain": PINNED_TOOLCHAIN,
@@ -294,9 +335,143 @@ def check_bridge_tree(root_dir: Path, sync_mirrors: bool = False) -> dict[str, o
         "pinned_sail_rev": PINNED_SAIL_REV,
         "bridged_theorems_count": len(bridged_refs),
         "slice_digests": slice_digests,
+        "upstream_instsend_checked": upstream_instsend_checked,
+        "upstream_instsend_digests": upstream_instsend_digests,
         "proof_files_checked": len(proof_files),
         "errors": errors,
     }
+
+
+SYNTHETIC_EXECUTE_DIV_SNIPPET = """\
+def execute_DIV (rs2 : regidx) (rs1 : regidx) (rd : regidx) (is_unsigned : Bool) : SailM ExecutionResult := do
+  let rs1_bits ← do (rX_bits rs1)
+  let rs2_bits ← do (rX_bits rs2)
+  let rs1_int :=
+    if (is_unsigned : Bool)
+    then (BitVec.toNatInt rs1_bits)
+    else (BitVec.toInt rs1_bits)
+  let rs2_int :=
+    if (is_unsigned : Bool)
+    then (BitVec.toNatInt rs2_bits)
+    else (BitVec.toInt rs2_bits)
+  let quotient :=
+    if ((rs2_int == 0) : Bool)
+    then (Neg.neg 1)
+    else (Int.tdiv rs1_int rs2_int)
+  let quotient :=
+    if (((not is_unsigned) && (quotient ≥b (2 ^i (xlen -i 1)))) : Bool)
+    then (Neg.neg (2 ^i (xlen -i 1)))
+    else quotient
+  (wX_bits rd (to_bits_truncate (l := 64) quotient))
+  (pure RETIRE_SUCCESS)"""
+
+SYNTHETIC_EXECUTE_REM_SNIPPET = """\
+def execute_REM (rs2 : regidx) (rs1 : regidx) (rd : regidx) (is_unsigned : Bool) : SailM ExecutionResult := do
+  let rs1_bits ← do (rX_bits rs1)
+  let rs2_bits ← do (rX_bits rs2)
+  let rs1_int :=
+    if (is_unsigned : Bool)
+    then (BitVec.toNatInt rs1_bits)
+    else (BitVec.toInt rs1_bits)
+  let rs2_int :=
+    if (is_unsigned : Bool)
+    then (BitVec.toNatInt rs2_bits)
+    else (BitVec.toInt rs2_bits)
+  let remainder :=
+    if ((rs2_int == 0) : Bool)
+    then rs1_int
+    else (Int.tmod rs1_int rs2_int)
+  (wX_bits rd (to_bits_truncate (l := 64) remainder))
+  (pure RETIRE_SUCCESS)"""
+
+SYNTHETIC_EXECUTE_RTYPE_SNIPPET = """\
+def execute_RTYPE (rs2 : regidx) (rs1 : regidx) (rd : regidx) (op : rop) : SailM ExecutionResult := do
+  (wX_bits rd
+    (← do
+      match op with
+      | .ADD => (pure ((← (rX_bits rs1)) + (← (rX_bits rs2))))
+      | .SLT =>
+        (pure (zero_extend (m := 64)
+            (bool_to_bit (zopz0zI_s (← (rX_bits rs1)) (← (rX_bits rs2))))))
+      | .SLTU =>
+        (pure (zero_extend (m := 64)
+            (bool_to_bit (zopz0zI_u (← (rX_bits rs1)) (← (rX_bits rs2))))))
+      | .AND => (pure ((← (rX_bits rs1)) &&& (← (rX_bits rs2))))
+      | .OR => (pure ((← (rX_bits rs1)) ||| (← (rX_bits rs2))))
+      | .XOR => (pure ((← (rX_bits rs1)) ^^^ (← (rX_bits rs2))))
+      | .SLL =>
+        (pure (shift_bits_left (← (rX_bits rs1))
+            (Sail.BitVec.extractLsb (← (rX_bits rs2)) (log2_xlen -i 1) 0)))
+      | .SRL =>
+        (pure (shift_bits_right (← (rX_bits rs1))
+            (Sail.BitVec.extractLsb (← (rX_bits rs2)) (log2_xlen -i 1) 0)))
+      | .SUB => (pure ((← (rX_bits rs1)) - (← (rX_bits rs2))))
+      | .SRA =>
+        (pure (shift_bits_right_arith (← (rX_bits rs1))
+            (Sail.BitVec.extractLsb (← (rX_bits rs2)) (log2_xlen -i 1) 0)))))
+  (pure RETIRE_SUCCESS)"""
+
+SYNTHETIC_EXECUTE_ITYPE_SNIPPET = """\
+def execute_ITYPE (imm : (BitVec 12)) (rs1 : regidx) (rd : regidx) (op : iop) : SailM ExecutionResult := do
+  let immext : xlenbits := (sign_extend (m := 64) imm)
+  (wX_bits rd
+    (← do
+      match op with
+      | .ADDI => (pure ((← (rX_bits rs1)) + immext))
+      | .SLTI => (pure (zero_extend (m := 64) (bool_to_bit (zopz0zI_s (← (rX_bits rs1)) immext))))
+      | .SLTIU =>
+        (pure (zero_extend (m := 64) (bool_to_bit (zopz0zI_u (← (rX_bits rs1)) immext))))
+      | .ANDI => (pure ((← (rX_bits rs1)) &&& immext))
+      | .ORI => (pure ((← (rX_bits rs1)) ||| immext))
+      | .XORI => (pure ((← (rX_bits rs1)) ^^^ immext))))
+  (pure RETIRE_SUCCESS)"""
+
+SYNTHETIC_EXECUTE_SHIFTIOP_SNIPPET = """\
+def execute_SHIFTIOP (shamt : (BitVec 6)) (rs1 : regidx) (rd : regidx) (op : sop) : SailM ExecutionResult := do
+  let shamt := (Sail.BitVec.extractLsb shamt (log2_xlen -i 1) 0)
+  (wX_bits rd
+    (← do
+      match op with
+      | .SLLI => (pure (shift_bits_left (← (rX_bits rs1)) shamt))
+      | .SRLI => (pure (shift_bits_right (← (rX_bits rs1)) shamt))
+      | .SRAI => (pure (shift_bits_right_arith (← (rX_bits rs1)) shamt))))
+  (pure RETIRE_SUCCESS)"""
+
+SYNTHETIC_EXECUTE_UTYPE_SNIPPET = """\
+def execute_UTYPE (imm : (BitVec 20)) (rd : regidx) (op : uop) : SailM ExecutionResult := do
+  let off : xlenbits := (sign_extend (m := 64) (imm +++ 0x000#12))
+  (wX_bits rd
+    (← do
+      match op with
+      | .LUI => (pure off)
+      | .AUIPC => (pure ((← (get_arch_pc ())) + off))))
+  (pure RETIRE_SUCCESS)"""
+
+SYNTHETIC_EXECUTE_BTYPE_SNIPPET = """\
+def execute_BTYPE (imm : (BitVec 13)) (rs2 : regidx) (rs1 : regidx) (op : bop) : SailM ExecutionResult := do
+  let taken ← (( do
+    match op with
+    | .BEQ => (pure ((← (rX_bits rs1)) == (← (rX_bits rs2))))
+    | .BNE => (pure ((← (rX_bits rs1)) != (← (rX_bits rs2))))
+    | .BLT => (pure (zopz0zI_s (← (rX_bits rs1)) (← (rX_bits rs2))))
+    | .BGE => (pure (zopz0zKzJ_s (← (rX_bits rs1)) (← (rX_bits rs2))))
+    | .BLTU => (pure (zopz0zI_u (← (rX_bits rs1)) (← (rX_bits rs2))))
+    | .BGEU => (pure (zopz0zKzJ_u (← (rX_bits rs1)) (← (rX_bits rs2)))) ) : SailM Bool )
+  if (taken : Bool)
+  then (jump_to ((← readReg PC) + (sign_extend (m := 64) imm)))
+  else (pure RETIRE_SUCCESS)"""
+
+SYNTHETIC_INSTSEND_TEXT = "\n\n".join(
+    [
+        SYNTHETIC_EXECUTE_UTYPE_SNIPPET,
+        SYNTHETIC_EXECUTE_SHIFTIOP_SNIPPET,
+        SYNTHETIC_EXECUTE_RTYPE_SNIPPET,
+        SYNTHETIC_EXECUTE_REM_SNIPPET,
+        SYNTHETIC_EXECUTE_ITYPE_SNIPPET,
+        SYNTHETIC_EXECUTE_DIV_SNIPPET,
+        SYNTHETIC_EXECUTE_BTYPE_SNIPPET,
+    ]
+) + "\n\n"
 
 
 class SelfTests(unittest.TestCase):
@@ -332,6 +507,44 @@ class SelfTests(unittest.TestCase):
             self.assertIn("Forbidden token `bv_decide`", errs)
             self.assertIn("Forbidden heavy import", errs)
 
+    def test_upstream_instsend_snippet_digests_optional_and_tamper_detected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="sail-riscv-instsend-test-") as tmp:
+            root = Path(tmp)
+            for rel in (POLICY_GATES_REL, TYPES_REL):
+                src = ROOT_DIR / rel
+                dst = root / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+            b_root = root / "verification" / "sail-riscv-bridge"
+            (b_root / "SailRiscvBridge").mkdir(parents=True, exist_ok=True)
+            for fn in ("lean-toolchain", "lakefile.toml", "lake-manifest.json", "SailRiscvBridge.lean"):
+                shutil.copy2(BRIDGE_DIR / fn, b_root / fn)
+            for fn in ("MirroredModel.lean", "Bisimulation.lean"):
+                shutil.copy2(BRIDGE_DIR / "SailRiscvBridge" / fn, b_root / "SailRiscvBridge" / fn)
+
+            rep_absent = check_bridge_tree(root)
+            self.assertTrue(rep_absent["ok"], rep_absent)
+            self.assertFalse(rep_absent["upstream_instsend_checked"])
+            self.assertEqual(rep_absent["upstream_instsend_digests"], {})
+
+            instsend_file = b_root / UPSTREAM_INSTSEND_REL
+            instsend_file.parent.mkdir(parents=True, exist_ok=True)
+            instsend_file.write_text(SYNTHETIC_INSTSEND_TEXT, encoding="utf-8")
+            rep_present = check_bridge_tree(root)
+            self.assertTrue(rep_present["ok"], rep_present)
+            self.assertTrue(rep_present["upstream_instsend_checked"])
+            self.assertEqual(rep_present["upstream_instsend_digests"], PINNED_INSTSEND_SNIPPET_DIGESTS)
+
+            instsend_file.write_text(
+                SYNTHETIC_INSTSEND_TEXT.replace("(Neg.neg 1)", "(0 : Int)", 1),
+                encoding="utf-8",
+            )
+            rep_tampered = check_bridge_tree(root)
+            self.assertFalse(rep_tampered["ok"])
+            self.assertTrue(rep_tampered["upstream_instsend_checked"])
+            errs = "\n".join(str(e) for e in rep_tampered["errors"])
+            self.assertIn("Upstream InstsEnd.lean `execute_DIV` snippet SHA-256 mismatch", errs)
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -355,6 +568,7 @@ def main() -> int:
             f"rev={str(rep['pinned_sail_riscv_rev'])[:12]} "
             f"theorems={rep.get('bridged_theorems_count', 0)} "
             f"slices={len(rep.get('slice_digests', {}))} "
+            f"instsend={rep.get('upstream_instsend_checked', False)} "
             f"proof_files={rep.get('proof_files_checked', 0)}"
         )
     if not rep["ok"]:
