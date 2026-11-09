@@ -11,9 +11,10 @@ Verifies:
    `lakefile.toml` and `lake-manifest.json` pin `leanprover/LNSym` at commit
    `49f8a1d9e46f8dcfc345f4bc15d35b0ba845ff5c` (`ELFSage @ 5820b10ff6594100f736c4009278188e14e96535`,
    `doc-gen4 @ 0e1ffe2e4ba5ecfdfaf15c65b8d3805dbb7134ae`).
-3. `LNSymBridge` proof modules contain `#verify_lnsym_bridge_axioms` (>= 10 audited theorems) and
-   zero `sorry`, `sorryAx`, `admit`, `axiom`, `native_decide`, `bv_decide`, `trustCompiler`, or
-   `ofReduceBool` tokens outside Lean comments/strings.
+3. `LNSymBridge` proof modules contain `#verify_lnsym_bridge_axioms` (>= 24 unique audited theorems
+   via `Lean.collectAxioms` and `bridgedTheorems.Nodup`) and zero `sorry`, `sorryAx`, `admit`,
+   `axiom`, `native_decide`, `bv_decide`, `trustCompiler`, or `ofReduceBool` tokens outside Lean
+   comments/strings.
 """
 from __future__ import annotations
 
@@ -37,6 +38,13 @@ PINNED_DOCGEN4_REV = "0e1ffe2e4ba5ecfdfaf15c65b8d3805dbb7134ae"
 
 TYPES_REL = "lean/LeanNative/IR/Types.lean"
 SEMANTICS_REL = "lean/LeanNative/Backend/Semantics.lean"
+
+PINNED_SLICE_DIGESTS: dict[str, str] = {
+    TYPES_REL: "c12a593956b4f77b7ce8ba7e1d6fea66af7918df9aea989f6cf5dfb62bb13576",
+    SEMANTICS_REL: "b0d3ee9c6f430389d3ec72cf544881f7bb9142fa74e50d9db96f35faae1cc516",
+}
+
+MIN_AUDITED_THEOREMS = 24
 
 FORBIDDEN_PROOF_TOKENS = re.compile(
     r"\b(?:sorry|sorryAx|admit|axiom|native_decide|bv_decide|trustCompiler|ofReduceBool)\b",
@@ -162,6 +170,13 @@ def check_bridge_tree(root_dir: Path, sync_mirrors: bool = False) -> dict[str, o
             c_lnsym = extract_canonical_lnsym_slice(sem_path.read_text(encoding="utf-8"))
             slice_digests[TYPES_REL] = sha256_bytes(c_types.encode("utf-8"))
             slice_digests[SEMANTICS_REL] = sha256_bytes(c_lnsym.encode("utf-8"))
+            for rel_key, expected_sha in PINNED_SLICE_DIGESTS.items():
+                actual_sha = slice_digests.get(rel_key)
+                if actual_sha != expected_sha:
+                    errors.append(
+                        f"Canonical slice SHA-256 mismatch for {rel_key}: "
+                        f"{actual_sha} != {expected_sha}"
+                    )
             if sync_mirrors:
                 mirrored_path.parent.mkdir(parents=True, exist_ok=True)
                 mirrored_path.write_text(render_mirrored_model(c_types, c_lnsym), encoding="utf-8")
@@ -234,14 +249,28 @@ def check_bridge_tree(root_dir: Path, sync_mirrors: bool = False) -> dict[str, o
 
     # Scan proof files for forbidden tokens and axiom audit gate
     root_bridge_lean = bridge_root / "LNSymBridge.lean"
-    if root_bridge_lean.is_file():
+    bridged_refs: list[str] = []
+    if not root_bridge_lean.is_file():
+        errors.append(f"Missing {root_bridge_lean}")
+    else:
         rb_stripped = strip_lean_comments_and_strings(root_bridge_lean.read_text(encoding="utf-8"))
         if "#verify_lnsym_bridge_axioms" not in rb_stripped:
             errors.append("LNSymBridge.lean missing `#verify_lnsym_bridge_axioms` gate")
+        if "Lean.collectAxioms" not in rb_stripped:
+            errors.append("LNSymBridge.lean missing `Lean.collectAxioms` audit")
+        if "bridgedTheorems.Nodup" not in rb_stripped:
+            errors.append("LNSymBridge.lean missing `bridgedTheorems.Nodup` uniqueness theorem")
         bridged_refs = re.findall(r"``LNSymBridge\.[A-Za-z0-9_?']+", rb_stripped)
-        if len(bridged_refs) < 10:
+        if len(bridged_refs) != len(set(bridged_refs)):
+            seen_refs: set[str] = set()
+            dups = sorted({r for r in bridged_refs if r in seen_refs or seen_refs.add(r)})  # type: ignore[func-returns-value]
             errors.append(
-                f"LNSymBridge.lean audits only {len(bridged_refs)} bridged theorems (expected >= 10)"
+                f"LNSymBridge.lean contains duplicate bridged theorem references: {dups}"
+            )
+        if len(set(bridged_refs)) < MIN_AUDITED_THEOREMS:
+            errors.append(
+                f"LNSymBridge.lean audits only {len(set(bridged_refs))} unique bridged theorems "
+                f"(expected >= {MIN_AUDITED_THEOREMS})"
             )
     proof_files = [
         root_bridge_lean,
@@ -261,6 +290,7 @@ def check_bridge_tree(root_dir: Path, sync_mirrors: bool = False) -> dict[str, o
     return {
         "ok": len(errors) == 0,
         "pinned_lnsym_rev": PINNED_LNSYM_REV,
+        "bridged_theorems_count": len(bridged_refs),
         "slice_digests": slice_digests,
         "proof_files_checked": len(proof_files),
         "errors": errors,
@@ -271,6 +301,7 @@ class SelfTests(unittest.TestCase):
     def test_live_repo_passes(self) -> None:
         rep = check_bridge_tree(ROOT_DIR)
         self.assertTrue(rep["ok"], rep)
+        self.assertGreaterEqual(rep["bridged_theorems_count"], MIN_AUDITED_THEOREMS)  # type: ignore[arg-type]
 
     def test_detects_slice_drift_and_bv_decide(self) -> None:
         with tempfile.TemporaryDirectory(prefix="lnsym-sync-test-") as tmp:
@@ -293,9 +324,49 @@ class SelfTests(unittest.TestCase):
             )
             rep = check_bridge_tree(root)
             self.assertFalse(rep["ok"])
-            errs = "\n".join(str(e) for e in rep["errors"])
+            errs = "\n".join(str(e) for e in rep["errors"])  # type: ignore[union-attr]
             self.assertIn("Drift detected", errs)
             self.assertIn("Forbidden token `bv_decide`", errs)
+
+    def test_rejects_duplicate_and_undercounted_bridged_theorems(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="lnsym-thm-ratchet-") as tmp:
+            root = Path(tmp)
+            for rel in (TYPES_REL, SEMANTICS_REL):
+                src = ROOT_DIR / rel
+                dst = root / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+            b_root = root / "verification" / "lnsym-bridge"
+            (b_root / "LNSymBridge").mkdir(parents=True, exist_ok=True)
+            for fn in ("lean-toolchain", "lakefile.toml", "lake-manifest.json"):
+                shutil.copy2(BRIDGE_DIR / fn, b_root / fn)
+            for fn in ("MirroredModel.lean", "Bisimulation.lean"):
+                shutil.copy2(BRIDGE_DIR / "LNSymBridge" / fn, b_root / "LNSymBridge" / fn)
+
+            orig_root_lean = (BRIDGE_DIR / "LNSymBridge.lean").read_text(encoding="utf-8")
+            dup_root_lean = orig_root_lean.replace(
+                "``LNSymBridge.gf128_butterfly_program_run_28_field_spec",
+                "``LNSymBridge.bv128ToQReg_qregToBv128",
+                1,
+            )
+            (b_root / "LNSymBridge.lean").write_text(dup_root_lean, encoding="utf-8")
+            rep_dup = check_bridge_tree(root)
+            self.assertFalse(rep_dup["ok"])
+            errs_dup = "\n".join(str(e) for e in rep_dup["errors"])  # type: ignore[union-attr]
+            self.assertIn("duplicate bridged theorem references", errs_dup)
+
+            short_root_lean = (
+                "import LNSymBridge.Bisimulation\nimport Lean\n"
+                "def bridgedTheorems := [``LNSymBridge.bv128ToQReg_qregToBv128]\n"
+                "theorem bridgedTheorems_nodup : bridgedTheorems.Nodup := by decide\n"
+                "def chk := Lean.collectAxioms\n"
+                "#verify_lnsym_bridge_axioms\n"
+            )
+            (b_root / "LNSymBridge.lean").write_text(short_root_lean, encoding="utf-8")
+            rep_short = check_bridge_tree(root)
+            self.assertFalse(rep_short["ok"])
+            errs_short = "\n".join(str(e) for e in rep_short["errors"])  # type: ignore[union-attr]
+            self.assertIn(f"expected >= {MIN_AUDITED_THEOREMS}", errs_short)
 
 
 def main() -> int:
@@ -317,7 +388,8 @@ def main() -> int:
     else:
         print(
             f"[lnsym-bridge-sync] ok={rep['ok']} "
-            f"rev={rep['pinned_lnsym_rev'][:12]} "
+            f"rev={str(rep['pinned_lnsym_rev'])[:12]} "
+            f"theorems={rep.get('bridged_theorems_count', 0)} "
             f"slices={len(rep.get('slice_digests', {}))} "
             f"proof_files={rep.get('proof_files_checked', 0)}"
         )

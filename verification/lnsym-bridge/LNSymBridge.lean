@@ -27,14 +27,59 @@ def bridgedTheorems : List Name :=
   , ``LNSymBridge.exec_pmull_low_bisim
   , ``LNSymBridge.exec_pmull_high_bisim
   , ``LNSymBridge.exec_eor_16b_bisim
+  , ``LNSymBridge.polynomial_mult_comm
+  , ``LNSymBridge.polynomial_mult_xor_left
+  , ``LNSymBridge.polynomial_mult_xor_right
+  , ``LNSymBridge.clmul64_comm
+  , ``LNSymBridge.clmul64Hi_comm
+  , ``LNSymBridge.mulXMod128_xor
+  , ``LNSymBridge.mulXKMod128_128_one
+  , ``LNSymBridge.gf2PolyMod128_xor
+  , ``LNSymBridge.gf2PolyMod128_low128
+  , ``LNSymBridge.qregToBv128_reduceGF128_eq_gf2PolyMod128
+  , ``LNSymBridge.karatsubaAssemble256_mul_eq_polynomial_mult
+  , ``LNSymBridge.gf2PolyMod128_polynomial_mult_eq_gf128MulSpec
+  , ``LNSymBridge.qregToBv128_mulGF128_eq_gf128MulSpec
+  , ``LNSymBridge.qreg_xor_comm
+  , ``LNSymBridge.qreg_xor_assoc
+  , ``LNSymBridge.qreg_xor_zero
+  , ``LNSymBridge.qreg_zero_xor
+  , ``LNSymBridge.qreg_xor_self
+  , ``LNSymBridge.mulGF128_comm
+  , ``LNSymBridge.mulGF128_assoc
+  , ``LNSymBridge.mulGF128_zero_right
+  , ``LNSymBridge.mulGF128_zero_left
+  , ``LNSymBridge.mulGF128_one_right
+  , ``LNSymBridge.mulGF128_one_left
+  , ``LNSymBridge.mulGF128_xor_distrib_left
+  , ``LNSymBridge.mulGF128_xor_distrib_right
+  , ``LNSymBridge.gf128ButterflyLane_algebraic
+  , ``LNSymBridge.gf128ButterflyLane_recover_uv
+  , ``LNSymBridge.exec_ext_8_bisim
+  , ``LNSymBridge.runArm64_butterflySliceLoop_eq_mapIdx
+  , ``LNSymBridge.gf128_butterfly_program_run_28_field_spec
   ]
+
+theorem bridgedTheorems_nodup : bridgedTheorems.Nodup := by
+  decide
+
+def minAuditedTheorems : Nat := 24
+
+theorem bridgedTheorems_length_ge : bridgedTheorems.length >= minAuditedTheorems := by
+  decide
 
 def allowedAxioms : List Name :=
   [``propext, ``Classical.choice, ``Quot.sound]
 
 elab "#verify_lnsym_bridge_axioms" : command => do
   let env ← getEnv
+  if bridgedTheorems.length < minAuditedTheorems then
+    throwError "Expected at least {minAuditedTheorems} bridged theorems, found {bridgedTheorems.length}"
+  let mut seen : List Name := []
   for thm in bridgedTheorems do
+    if seen.contains thm then
+      throwError "Duplicate bridged theorem {thm} in bridgedTheorems"
+    seen := thm :: seen
     let some _ := env.find? thm
       | throwError "Missing bridged theorem {thm}"
     let axs ← liftCoreM <| Lean.collectAxioms thm
