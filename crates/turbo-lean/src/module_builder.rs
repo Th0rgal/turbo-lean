@@ -8870,9 +8870,7 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
                     _ => false,
                 }
             });
-        if imp_tainted
-            || crate::splitter::source_may_execute_elab_host_effects(&src_raw, false)
-        {
+        if imp_tainted || spec_source_has_disallowed_elab_host_effects(cfg, &spec, &src_raw) {
             tainted.insert((spec.pkg_root.clone(), spec.module_name.clone()));
             crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
             purged_any = true;
@@ -9836,25 +9834,38 @@ fn root_module_includes_all_covered_by_lake_inputs(
     true
 }
 
+fn source_has_disallowed_elab_host_effects_for_module(
+    cfg: &ProjectConfig,
+    is_root_pkg: bool,
+    is_git_pinned: bool,
+    module_name: &str,
+    src_path: &Path,
+    src_raw: &str,
+) -> bool {
+    if is_root_pkg {
+        crate::splitter::source_may_read_host_state(src_raw)
+            || crate::splitter::source_has_disallowed_root_runtime_replacement_attribute(src_raw)
+            || !root_module_includes_all_covered_by_lake_inputs(cfg, module_name, src_path, src_raw)
+    } else if is_git_pinned {
+        crate::splitter::source_may_read_host_state(src_raw)
+    } else {
+        crate::splitter::source_may_execute_elab_host_effects(src_raw, false)
+    }
+}
+
 pub(crate) fn spec_source_has_disallowed_elab_host_effects(
     cfg: &ProjectConfig,
     spec: &DiscoveredModuleSpec,
     src_raw: &str,
 ) -> bool {
-    if spec.is_root_pkg {
-        crate::splitter::source_may_read_host_state(src_raw)
-            || crate::splitter::source_has_runtime_replacement_attribute(src_raw)
-            || !root_module_includes_all_covered_by_lake_inputs(
-                cfg,
-                &spec.module_name,
-                &spec.src_path,
-                src_raw,
-            )
-    } else if is_git_pinned_manifest_package(cfg, spec) {
-        crate::splitter::source_may_read_host_state(src_raw)
-    } else {
-        crate::splitter::source_may_execute_elab_host_effects(src_raw, false)
-    }
+    source_has_disallowed_elab_host_effects_for_module(
+        cfg,
+        spec.is_root_pkg,
+        !spec.is_root_pkg && is_git_pinned_manifest_package(cfg, spec),
+        &spec.module_name,
+        &spec.src_path,
+        src_raw,
+    )
 }
 
 fn prebuilt_closure_export_info(
@@ -11426,7 +11437,7 @@ pub(crate) fn find_dirty_modules_in_otherwise_fresh_dag(
                 return None;
             }
             let src_has_elab_host_effects =
-                crate::splitter::source_may_execute_elab_host_effects(&src_raw, false);
+                node_source_has_disallowed_elab_host_effects(cfg, node, &src_raw);
             let header = parse_header_info(&src_raw);
             if header.header_error.is_some() || header.is_module != node.is_module {
                 return None;
@@ -11734,7 +11745,7 @@ pub(crate) fn seed_verified_fresh_modules_into_disposable_snapshot(
                 dirty_mods.insert(mod_name.clone());
                 continue;
             };
-            if crate::splitter::source_may_execute_elab_host_effects(&dst_src_raw, false) {
+            if node_source_has_disallowed_elab_host_effects(&dst_cfg, node, &dst_src_raw) {
                 dirty_mods.insert(mod_name.clone());
                 continue;
             }
@@ -12120,16 +12131,27 @@ pub(crate) fn compile_disposable_snapshot_dirty_modules_direct(
     Ok(())
 }
 
+fn is_clean_git_pinned_pkg(
+    cfg: &ProjectConfig,
+    is_root_pkg: bool,
+    pkg_name: &str,
+    pkg_base_name: &str,
+    pkg_root: &Path,
+) -> bool {
+    !is_root_pkg
+        && manifest_pinned_git_rev_for_pkg(cfg, pkg_name, pkg_base_name, pkg_root).is_some_and(
+            |rev| is_clean_pinned_git_checkout(pkg_root, rev, package_by_root(cfg, pkg_root)),
+        )
+}
+
 fn is_git_pinned_manifest_package(cfg: &ProjectConfig, spec: &DiscoveredModuleSpec) -> bool {
-    !spec.is_root_pkg
-        && manifest_pinned_git_rev_for_pkg(cfg, &spec.pkg_name, &spec.pkg_base_name, &spec.pkg_root)
-            .is_some_and(|rev| {
-                is_clean_pinned_git_checkout(
-                    &spec.pkg_root,
-                    rev,
-                    package_by_root(cfg, &spec.pkg_root),
-                )
-            })
+    is_clean_git_pinned_pkg(
+        cfg,
+        spec.is_root_pkg,
+        &spec.pkg_name,
+        &spec.pkg_base_name,
+        &spec.pkg_root,
+    )
 }
 
 #[allow(clippy::type_complexity)]
@@ -22259,15 +22281,13 @@ pub(crate) fn ensure_imported_oleans_replayed_with_roots_and_axioms(
 }
 
 pub(crate) fn node_is_git_pinned_manifest_package(cfg: &ProjectConfig, node: &ModuleNode) -> bool {
-    !node.is_root_pkg
-        && manifest_pinned_git_rev_for_pkg(cfg, &node.pkg_name, &node.pkg_base_name, &node.pkg_root)
-            .is_some_and(|rev| {
-                is_clean_pinned_git_checkout(
-                    &node.pkg_root,
-                    rev,
-                    package_by_root(cfg, &node.pkg_root),
-                )
-            })
+    is_clean_git_pinned_pkg(
+        cfg,
+        node.is_root_pkg,
+        &node.pkg_name,
+        &node.pkg_base_name,
+        &node.pkg_root,
+    )
 }
 
 fn node_source_has_disallowed_elab_host_effects(
@@ -22275,20 +22295,14 @@ fn node_source_has_disallowed_elab_host_effects(
     node: &ModuleNode,
     src_raw: &str,
 ) -> bool {
-    if node.is_root_pkg {
-        crate::splitter::source_may_read_host_state(src_raw)
-            || crate::splitter::source_has_runtime_replacement_attribute(src_raw)
-            || !root_module_includes_all_covered_by_lake_inputs(
-                cfg,
-                &node.module_name,
-                &node.src_path,
-                src_raw,
-            )
-    } else if node_is_git_pinned_manifest_package(cfg, node) {
-        crate::splitter::source_may_read_host_state(src_raw)
-    } else {
-        crate::splitter::source_may_execute_elab_host_effects(src_raw, false)
-    }
+    source_has_disallowed_elab_host_effects_for_module(
+        cfg,
+        node.is_root_pkg,
+        !node.is_root_pkg && node_is_git_pinned_manifest_package(cfg, node),
+        &node.module_name,
+        &node.src_path,
+        src_raw,
+    )
 }
 
 fn compute_tainted_elab_host_effect_modules(
@@ -42398,6 +42412,9 @@ end Fixture
 
     #[test]
     fn test_root_pure_elaborator_module_caches_in_cas_and_manifest() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
             "tl_root_pure_elab_cas_{}_{}",
             std::process::id(),
@@ -42439,6 +42456,54 @@ end Fixture
             manifest_raw.contains("Verity/Macro.lean") && manifest_raw.contains("Verity/Leaf.lean"),
             "pure root elaborator and its dependents must record verified source manifest entries: {manifest_raw}"
         );
+        let mut file_hashes = BTreeMap::new();
+        for rel in ["Verity/Macro.lean", "Verity/Leaf.lean", "Verity.lean"] {
+            let b3 = blake3::hash(&fs::read(canon.join(rel))?).to_hex().to_string();
+            file_hashes.insert(rel.to_string(), b3);
+        }
+        assert!(
+            crate::lake_build::are_all_project_oleans_up_to_date(&canon, &file_hashes),
+            "check fast-path must treat verified pure root elaborator closure as up-to-date"
+        );
+        assert_eq!(
+            crate::lake_build::ensure_project_imports_fresh(
+                &canon,
+                &[canon.join("Verity/Leaf.lean")],
+                None,
+                true,
+            )?,
+            0,
+            "ensure_project_imports_fresh must not mark verified pure root elaborator stale"
+        );
+        let snap = dir.join("snap");
+        fs::create_dir_all(snap.join("Verity"))?;
+        fs::write(snap.join("lean-toolchain"), &tc)?;
+        fs::write(
+            snap.join("lakefile.toml"),
+            "name = \"verity\"\ndefaultTargets = [\"Verity\"]\n[[lean_lib]]\nname = \"Verity\"\n",
+        )?;
+        fs::write(snap.join("Verity/Macro.lean"), macro_src)?;
+        fs::write(
+            snap.join("Verity/Leaf.lean"),
+            "import Verity.Macro\n#check_contract_nop\ntheorem leaf_ok : 1 + 1 = 2 := by decide\n",
+        )?;
+        fs::write(snap.join("Verity.lean"), root_src)?;
+        let src_cfg = resolve_project_config(&canon)?;
+        seed_verified_fresh_modules_into_disposable_snapshot(&src_cfg, &snap, &[])?;
+        assert!(
+            snap.join(".lake/build/lib/lean/Verity/Macro.olean").is_file(),
+            "pure root elaborator Verity.Macro must seed into disposable snapshot when Leaf changes"
+        );
+        let snap_cfg = resolve_project_config_with_trust(&snap, false)?;
+        let snap_dag = build_module_dag_for_trusted_statement(&snap_cfg, &["Verity".to_string()])?;
+        let dirty = find_dirty_modules_in_otherwise_fresh_dag(
+            &snap_cfg,
+            &snap_dag,
+            16,
+            &HashSet::new(),
+        )
+        .expect("disposable snapshot with seeded Verity.Macro must resolve dirty cone");
+        assert_eq!(dirty, vec!["Verity.Leaf", "Verity"]);
         let _ = fs::remove_dir_all(canon.join(".lake/build"));
         reset_lake_inputs_tag_memo();
         let r2 = build_project_modules_native(
@@ -42469,13 +42534,59 @@ end Fixture
             spec_source_has_disallowed_elab_host_effects(&cfg_u, &spec_u, &src_u),
             "root module with untracked include_str must be flagged as host-effecting"
         );
+        let impl_by_src = "unsafe def fast : Nat := 0\n@[implemented_by fast]\ndef slow : Nat := 1\n";
+        std::env::remove_var("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY");
         assert!(
-            spec_source_has_disallowed_elab_host_effects(
-                &cfg_u,
-                &spec_u,
-                "unsafe def fast : Nat := 0\n@[implemented_by fast]\ndef slow : Nat := 1\n"
-            ),
-            "root module with @[implemented_by] must still be flagged as host-effecting"
+            spec_source_has_disallowed_elab_host_effects(&cfg_u, &spec_u, impl_by_src),
+            "root module with @[implemented_by] must be flagged when allowlist is empty"
+        );
+        std::env::set_var("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY", "slow");
+        let allowed_ok = !spec_source_has_disallowed_elab_host_effects(&cfg_u, &spec_u, impl_by_src);
+        let extern_still_blocked = spec_source_has_disallowed_elab_host_effects(
+            &cfg_u,
+            &spec_u,
+            "@[extern \"c_fn\"]\nopaque extFn : Nat\n",
+        );
+        let unsafe_io_still_blocked = spec_source_has_disallowed_elab_host_effects(
+            &cfg_u,
+            &spec_u,
+            "unsafe def bad (io : IO Nat) : Nat := match unsafeIO io with | .ok x => x | .error _ => 0\n",
+        );
+        std::env::remove_var("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY");
+        assert!(allowed_ok, "policy-bound @[implemented_by] must allow root module CAS caching");
+        assert!(extern_still_blocked, "@[extern] on root module must remain blocked");
+        assert!(unsafe_io_still_blocked, "unsafeIO on root module must remain blocked");
+
+        let _ = fs::remove_file(canon.join("Verity/Untracked.lean"));
+        let _ = fs::remove_dir_all(canon.join(".lake/build"));
+        fs::write(
+            canon.join("Verity/Macro.lean"),
+            "import Lean\nprivate unsafe def fastHelper : Nat := 1\n@[implemented_by fastHelper]\ndef evalSpec : Nat := 1\nsyntax (name := checkContractCmd) \"#check_contract_nop\" : command\n@[command_elab checkContractCmd]\ndef elabCheckContract : Lean.Elab.Command.CommandElab := fun _ => pure ()\n",
+        )?;
+        reset_lake_inputs_tag_memo();
+        let _u_allow = ScopedEnvVar::set("TURBO_LEAN_ALLOWED_UNSAFE", "fastHelper");
+        let r_impl1 = {
+            let _i_allow = ScopedEnvVar::set("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY", "evalSpec");
+            build_project_modules_native(&mut store, &canon, &[], "trusted", 2, false, true, None)?
+        };
+        assert_eq!(r_impl1.modules_compiled, 3);
+        let _ = fs::remove_dir_all(canon.join(".lake/build"));
+        reset_lake_inputs_tag_memo();
+        let r_impl2 = {
+            let _i_allow = ScopedEnvVar::set("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY", "evalSpec");
+            build_project_modules_native(&mut store, &canon, &[], "trusted", 2, false, true, None)?
+        };
+        assert_eq!(r_impl2.modules_compiled, 0);
+        assert_eq!(r_impl2.modules_cached, 3);
+        let _ = fs::remove_dir_all(canon.join(".lake/build"));
+        reset_lake_inputs_tag_memo();
+        let wrong_policy = {
+            let _i_wrong = ScopedEnvVar::set("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY", "otherFn");
+            build_project_modules_native(&mut store, &canon, &[], "trusted", 2, false, true, None)
+        };
+        assert!(
+            wrong_policy.is_err(),
+            "CAS hit for @[implemented_by] module must fail closed when allowlist omits declaration"
         );
 
         crate::zygote::purge_snapshot_dir(&dir);
