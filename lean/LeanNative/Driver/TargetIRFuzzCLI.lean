@@ -1502,12 +1502,35 @@ def run (args : List String) : IO UInt32 := do
     | .error err =>
       IO.eprintln s!"[target-ir-fuzz-suite] self-test FAILED: {err}"
       return 1
-  let seedStart := (findOptVal args "--seed-start" >>= String.toNat?).getD 0
-  let numSeeds := (findOptVal args "--seeds" >>= String.toNat?).getD 16
+  let seedStart ←
+    match findOptVal args "--seed-start" with
+    | none => pure 0
+    | some s =>
+      match s.toNat? with
+      | some n => pure n
+      | none =>
+        IO.eprintln s!"[target-ir-fuzz-suite] invalid --seed-start: {s}"
+        return 2
+  let numSeeds ←
+    match findOptVal args "--seeds" with
+    | none => pure 16
+    | some s =>
+      match s.toNat? with
+      | some n =>
+        if n == 0 then
+          IO.eprintln "[target-ir-fuzz-suite] --seeds must be > 0"
+          return 2
+        pure n
+      | none =>
+        IO.eprintln s!"[target-ir-fuzz-suite] invalid --seeds: {s}"
+        return 2
   let backends :=
     match findOptVal args "--backends" with
     | some csv => (csv.splitOn ",").map trimStr |>.filter (!·.isEmpty)
     | none => ["llvm", "ptx", "stablehlo", "metal"]
+  if backends.isEmpty || backends.any (fun b => !["llvm", "ptx", "stablehlo", "metal"].contains b) then
+    IO.eprintln s!"[target-ir-fuzz-suite] invalid --backends: {backends}"
+    return 2
   match buildSuiteJson seedStart numSeeds backends with
   | .ok j =>
     IO.println (Json.compress j)

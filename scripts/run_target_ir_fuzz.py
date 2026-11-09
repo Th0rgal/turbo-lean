@@ -67,18 +67,74 @@ MASK32 = 0xFFFF_FFFF
 MASK64 = 0xFFFF_FFFF_FFFF_FFFF
 
 
+def _is_elan_toolchain_path(p: str) -> bool:
+    return ".elan" in p or "leanprover--lean4" in p
+
+
 def find_clang_c() -> str | None:
     env_cc = os.environ.get("CLANG")
     if env_cc and Path(env_cc).is_file() and os.access(env_cc, os.X_OK):
         return env_cc
-    for name in ("clang-18", "clang-19", "clang", "clang-17", "clang-20"):
-        found = shutil.which(name)
-        if found:
-            return found
-    for ver in ("18", "19", "17", "20"):
+    # Prefer system clang binaries first because Lean's bundled `~/.elan/.../bin/clang`
+    # does not ship `libclang_rt.asan*` / `libclang_rt.ubsan*`.
+    for cand in (
+        "/usr/bin/clang",
+        "/usr/bin/clang-19",
+        "/usr/bin/clang-18",
+        "/usr/bin/clang-20",
+        "/usr/bin/clang-17",
+    ):
+        if Path(cand).is_file() and os.access(cand, os.X_OK):
+            return cand
+    for ver in ("19", "18", "20", "17"):
         cand = f"/usr/lib/llvm-{ver}/bin/clang"
         if Path(cand).is_file() and os.access(cand, os.X_OK):
             return cand
+    elan_fallback: str | None = None
+    for name in ("clang-19", "clang-18", "clang-20", "clang-17", "clang"):
+        found = shutil.which(name)
+        if found:
+            if not _is_elan_toolchain_path(found):
+                return found
+            if elan_fallback is None:
+                elan_fallback = found
+    return elan_fallback
+
+
+def find_sanitizer_c_linker(clang_bin: str) -> str | None:
+    """Locate a C compiler/linker capable of linking `-fsanitize=address,undefined` executables.
+    Falls back to system `/usr/bin/clang` or `/usr/bin/gcc` when `clang_bin` is Lean's bundled
+    toolchain `clang` (which lacks `libclang_rt.asan*`)."""
+    san_flags = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
+    cands = [
+        clang_bin,
+        "/usr/bin/clang",
+        "/usr/bin/clang-19",
+        "/usr/bin/clang-18",
+        "/usr/bin/clang-20",
+        shutil.which("gcc"),
+        "/usr/bin/gcc",
+    ]
+    with tempfile.TemporaryDirectory(prefix="ln-fuzz-san-probe-") as tmp_str:
+        tmp = Path(tmp_str)
+        probe_c = tmp / "probe.c"
+        probe_bin = tmp / "probe"
+        probe_c.write_text("int main(void) { return 0; }\n", encoding="utf-8")
+        seen: set[str] = set()
+        for cand in cands:
+            if not cand or cand in seen:
+                continue
+            seen.add(cand)
+            if not (Path(cand).is_file() and os.access(cand, os.X_OK)):
+                continue
+            res = subprocess.run(
+                [cand, "-O0", *san_flags, str(probe_c), "-o", str(probe_bin)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if res.returncode == 0 and probe_bin.is_file():
+                return cand
     return None
 
 
@@ -152,7 +208,12 @@ def run_llvm_valid_case(lli_bin: str, opt_bin: str, case: dict[str, Any]) -> Non
         )
 
 
-def run_llvm_trap_case_native(clang_bin: str, opt_bin: str, case: dict[str, Any]) -> int:
+def run_llvm_trap_case_native(
+    clang_bin: str,
+    opt_bin: str,
+    case: dict[str, Any],
+    sanitizer_linker: str | None = None,
+) -> int:
     """Instrument `@<fnName>` with `sanitize_address` + `opt -passes=asan`, link against a C
     driver compiled with `-fsanitize=address,undefined -fno-sanitize-recover=all`, and execute.
     Returns the child process exit code (must be `!= 0` on UB/trap)."""
@@ -169,10 +230,15 @@ def run_llvm_trap_case_native(clang_bin: str, opt_bin: str, case: dict[str, Any]
     if count != 1:
         raise RuntimeError(f"[{cid}] failed to inject sanitize_address onto @{fn_name}")
 
+    linker = sanitizer_linker or find_sanitizer_c_linker(clang_bin)
+    if not linker:
+        raise RuntimeError(f"[{cid}] no C compiler/linker with ASan+UBSan runtime libraries found")
+
     with tempfile.TemporaryDirectory(prefix="ln-fuzz-llvm-trap-") as tmp_str:
         tmp = Path(tmp_str)
         raw_ll = tmp / "trap_raw.ll"
         asan_ll = tmp / "trap_asan.ll"
+        asan_obj = tmp / "trap_asan.o"
         drv_c = tmp / "driver.c"
         bin_path = tmp / "trap_runner"
 
@@ -208,25 +274,63 @@ def run_llvm_trap_case_native(clang_bin: str, opt_bin: str, case: dict[str, Any]
             encoding="utf-8",
         )
 
-        comp = subprocess.run(
-            [
-                clang_bin,
-                "-O0",
-                "-g",
-                "-Wno-override-module",
-                "-fsanitize=address,undefined",
-                "-fno-sanitize-recover=all",
-                str(asan_ll),
-                str(drv_c),
-                "-o",
-                str(bin_path),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
-        if comp.returncode != 0:
-            raise RuntimeError(f"[{cid}] clang ASan/UBSan link failed:\n{comp.stderr}")
+        san_flags = ["-fsanitize=address,undefined", "-fno-sanitize-recover=all"]
+        if linker == clang_bin:
+            comp = subprocess.run(
+                [
+                    clang_bin,
+                    "-O0",
+                    "-g",
+                    "-Wno-override-module",
+                    *san_flags,
+                    str(asan_ll),
+                    str(drv_c),
+                    "-o",
+                    str(bin_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if comp.returncode != 0:
+                raise RuntimeError(f"[{cid}] clang ASan/UBSan link failed:\n{comp.stderr}")
+        else:
+            # Two-step compile + link so `clang_bin` (including `~/.elan/.../bin/clang`) lowers `asan_ll`
+            # (already instrumented by `opt -passes=asan`) to `.o` while `linker` supplies `libasan`/`libubsan`.
+            comp_obj = subprocess.run(
+                [
+                    clang_bin,
+                    "-O0",
+                    "-g",
+                    "-Wno-override-module",
+                    "-c",
+                    str(asan_ll),
+                    "-o",
+                    str(asan_obj),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if comp_obj.returncode != 0:
+                raise RuntimeError(f"[{cid}] clang -c on trap_asan.ll failed:\n{comp_obj.stderr}")
+            comp = subprocess.run(
+                [
+                    linker,
+                    "-O0",
+                    "-g",
+                    *san_flags,
+                    str(asan_obj),
+                    str(drv_c),
+                    "-o",
+                    str(bin_path),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if comp.returncode != 0:
+                raise RuntimeError(f"[{cid}] sanitizer linker ({linker}) failed:\n{comp.stderr}")
 
         env = os.environ.copy()
         env["ASAN_OPTIONS"] = "detect_leaks=0:halt_on_error=1:abort_on_error=1"
@@ -1077,12 +1181,15 @@ def execute_suite_payload(
     if llvm_cases:
         if not lli_bin or not opt_bin or not clang_bin:
             raise RuntimeError(f"Missing LLVM tools: lli={lli_bin}, opt={opt_bin}, clang={clang_bin}")
+        san_linker = find_sanitizer_c_linker(clang_bin)
+        if not san_linker:
+            raise RuntimeError(f"Missing ASan/UBSan C linker for clang={clang_bin}")
         for c in llvm_cases:
             if c["kind"] == "valid":
                 run_llvm_valid_case(lli_bin, opt_bin, c)
                 counts["llvm_valid"] += 1
             else:
-                rc = run_llvm_trap_case_native(clang_bin, opt_bin, c)
+                rc = run_llvm_trap_case_native(clang_bin, opt_bin, c, sanitizer_linker=san_linker)
                 if rc == 0:
                     raise RuntimeError(f"[{c['id']}] native ASan/UBSan binary exited 0 on {c['trapClass']}!")
                 counts["llvm_trap"] += 1
@@ -1164,6 +1271,12 @@ class TargetIRFuzzSelfTests(unittest.TestCase):
         }
         rc = run_llvm_trap_case_native(clang_bin, opt_bin, oob_case)
         self.assertNotEqual(rc, 0)
+        elan_clang = Path(
+            os.environ.get("ELAN_HOME", str(Path.home() / ".elan"))
+        ) / "toolchains" / "leanprover--lean4---v4.35.0" / "bin" / "clang"
+        if elan_clang.is_file() and os.access(elan_clang, os.X_OK):
+            rc_elan = run_llvm_trap_case_native(str(elan_clang), opt_bin, oob_case)
+            self.assertNotEqual(rc_elan, 0)
 
     def test_metal_tsan_and_asan_traps(self) -> None:
         strict_tools = os.environ.get("TARGET_IR_FUZZ_STRICT_TOOLS", "").lower() == "true"
