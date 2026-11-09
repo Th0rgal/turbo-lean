@@ -689,6 +689,45 @@ private theorem smod_eq_zero_iff_srem_eq_zero {n : Nat} (a b : BitVec n) :
 
 /-- `sdiv` on concrete widths `w ≠ .i1` without UB (`vb ≠ 0` and not `INT_MIN / -1`) coincides
 bit-for-bit with `opencompl/lean-mlir`'s `LLVM.sdiv`. -/
+private theorem sdivOverflow_eq_false_not_intMin_neg_one (w : IntWidth) (va vb : BitVec w.bits)
+    (hw1 : w.bits ≠ 1) (hno_ov : sdivOverflow w va vb = false) :
+    ¬(va = BitVec.intMin w.bits ∧ vb = -1) := by
+  have hpos : 0 < w.bits := w.bits_pos
+  have hw2 : 1 < w.bits := by omega
+  rintro ⟨hmin, hm1⟩
+  unfold sdivOverflow at hno_ov
+  rw [bvSigned_eq_toInt, bvSigned_eq_toInt] at hno_ov
+  have hva_int : va.toInt = -((2 : Int) ^ (w.bits - 1)) := by
+    subst hmin
+    have h2w : 2 ^ w.bits = 2 * 2 ^ (w.bits - 1) := two_pow_eq_two_mul_pred w.bits hpos
+    have hp : 0 < 2 ^ (w.bits - 1) := two_pow_pos_nat (w.bits - 1)
+    have hlt : 2 ^ (w.bits - 1) < 2 ^ w.bits := by omega
+    rw [BitVec.toInt_intMin, Nat.mod_eq_of_lt hlt, int_two_pow_eq_natCast]
+  have hvb_int : vb.toInt = -1 := by
+    subst hm1
+    have h2w : 2 ^ w.bits = 2 * 2 ^ (w.bits - 1) := two_pow_eq_two_mul_pred w.bits hpos
+    have hp1 : 1 < 2 ^ (w.bits - 1) := by
+      cases hwb : w.bits - 1 with
+      | zero => omega
+      | succ k =>
+        have := two_pow_pos_nat k
+        simp [Nat.pow_succ]; omega
+    have hone : (1 : BitVec w.bits).toInt = 1 := BitVec.toInt_one hw2
+    rw [BitVec.toInt_neg, hone]
+    apply Int.bmod_eq_of_le <;> omega
+  simp [hva_int, hvb_int] at hno_ov
+
+private theorem sdiv_mlir_guard_false_of_non_ub (w : IntWidth) (va vb : BitVec w.bits)
+    (hw1 : w.bits ≠ 1) (hb0 : vb ≠ 0#w.bits) (hno_ov : sdivOverflow w va vb = false) :
+    (vb == 0 || (w.bits != 1 && va == BitVec.intMin w.bits && vb == -1)) = false := by
+  have h_intMin := sdivOverflow_eq_false_not_intMin_neg_one w va vb hw1 hno_ov
+  simp only [Bool.or_eq_false_iff, beq_eq_false_iff_ne, ne_eq, Bool.and_eq_false_iff,
+    bne_eq_false_iff_eq]
+  refine ⟨hb0, ?_⟩
+  by_cases h1 : va = BitVec.intMin w.bits
+  · right; intro h2; exact h_intMin ⟨h1, h2⟩
+  · left; right; exact h1
+
 theorem stepInstr_sdiv_bisim_of_non_ub (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
     (dst : RegName) (exact : Bool) (w : IntWidth) (aOp bOp : Operand)
     (va vb : BitVec w.bits)
@@ -699,41 +738,9 @@ theorem stepInstr_sdiv_bisim_of_non_ub (mod_ : LLVMModule) (fuel : Nat) (st : Ex
     (hb : evalOperand st bOp = .bits w vb) :
     stepInstr mod_ fuel st (.sdiv dst exact w aOp bOp) =
       .inr (bindReg st dst (toLLVMVal w (LLVM.sdiv (.value va) (.value vb) { exact := exact }))) := by
-  have hpos : 0 < w.bits := w.bits_pos
-  have hw2 : 1 < w.bits := by omega
-  have h_intMin : ¬(va = BitVec.intMin w.bits ∧ vb = -1) := by
-    rintro ⟨hmin, hm1⟩
-    unfold sdivOverflow at hno_ov
-    rw [bvSigned_eq_toInt, bvSigned_eq_toInt] at hno_ov
-    have hva_int : va.toInt = -((2 : Int) ^ (w.bits - 1)) := by
-      subst hmin
-      have h2w : 2 ^ w.bits = 2 * 2 ^ (w.bits - 1) := two_pow_eq_two_mul_pred w.bits hpos
-      have hp : 0 < 2 ^ (w.bits - 1) := two_pow_pos_nat (w.bits - 1)
-      have hlt : 2 ^ (w.bits - 1) < 2 ^ w.bits := by omega
-      rw [BitVec.toInt_intMin, Nat.mod_eq_of_lt hlt, int_two_pow_eq_natCast]
-    have hvb_int : vb.toInt = -1 := by
-      subst hm1
-      have h2w : 2 ^ w.bits = 2 * 2 ^ (w.bits - 1) := two_pow_eq_two_mul_pred w.bits hpos
-      have hp1 : 1 < 2 ^ (w.bits - 1) := by
-        cases hwb : w.bits - 1 with
-        | zero => omega
-        | succ k =>
-          have := two_pow_pos_nat k
-          simp [Nat.pow_succ]; omega
-      have hone : (1 : BitVec w.bits).toInt = 1 := BitVec.toInt_one hw2
-      rw [BitVec.toInt_neg, hone]
-      apply Int.bmod_eq_of_le <;> omega
-    simp [hva_int, hvb_int] at hno_ov
   have h_sdiv? : LLVM.sdiv? va vb = .value (va.sdiv vb) := by
     unfold LLVM.sdiv?
-    have hcond : (vb == 0 || (w.bits != 1 && va == BitVec.intMin w.bits && vb == -1)) = false := by
-      simp only [Bool.or_eq_false_iff, beq_eq_false_iff_ne, ne_eq, Bool.and_eq_false_iff,
-        bne_eq_false_iff_eq]
-      refine ⟨hb0, ?_⟩
-      by_cases h1 : va = BitVec.intMin w.bits
-      · right; intro h2; exact h_intMin ⟨h1, h2⟩
-      · left; right; exact h1
-    rw [hcond]
+    rw [sdiv_mlir_guard_false_of_non_ub w va vb hw1 hb0 hno_ov]
     rfl
   have h_smod_iff : (va.smod vb = 0#w.bits) ↔ (va.srem vb = 0#w.bits) :=
     smod_eq_zero_iff_srem_eq_zero va vb
@@ -741,6 +748,194 @@ theorem stepInstr_sdiv_bisim_of_non_ub (mod_ : LLVMModule) (fuel : Nat) (st : Ex
     by_cases hsr : va.srem vb = 0#w.bits <;>
     simp [stepInstr, stepInstrWith, divOrRem, ha, hb, hb0, hno_ov, toLLVMVal,
       LLVM.sdiv, h_sdiv?, bvSDiv_eq_sdiv, bvSRem_eq_srem, h_smod_iff, hsr]
+
+/-- `srem` on concrete widths `w ≠ .i1` without UB (`vb ≠ 0` and not `INT_MIN / -1`) coincides
+bit-for-bit with `opencompl/lean-mlir`'s `LLVM.srem`. -/
+theorem stepInstr_srem_bisim_of_non_ub (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (w : IntWidth) (aOp bOp : Operand)
+    (va vb : BitVec w.bits)
+    (hw1 : w.bits ≠ 1)
+    (hb0 : vb ≠ 0#w.bits)
+    (hno_ov : sdivOverflow w va vb = false)
+    (ha : evalOperand st aOp = .bits w va)
+    (hb : evalOperand st bOp = .bits w vb) :
+    stepInstr mod_ fuel st (.srem dst w aOp bOp) =
+      .inr (bindReg st dst (toLLVMVal w (LLVM.srem (.value va) (.value vb)))) := by
+  have h_srem? : LLVM.srem? va vb = .value (va.srem vb) := by
+    unfold LLVM.srem?
+    rw [sdiv_mlir_guard_false_of_non_ub w va vb hw1 hb0 hno_ov]
+    rfl
+  simp [stepInstr, stepInstrWith, divOrRem, ha, hb, hb0, hno_ov, toLLVMVal,
+    LLVM.srem, h_srem?, bvSRem_eq_srem]
+
+/-- At width `.i1`, `bvSigned .i1 1#1 = -1` and `-((2 : Int) ^ 0) = -1`, so `sdivOverflow .i1 va vb`
+holds iff both operands are `1#1` (whereas `opencompl/lean-mlir` treats `i1` `-1 / -1` as `-1`). -/
+private theorem bitvec_i1_cases (v : BitVec (IntWidth.i1.bits)) : v = 0#1 ∨ v = 1#1 := by
+  rcases v with ⟨⟨n, hn⟩⟩
+  change n < 2 at hn
+  have : n = 0 ∨ n = 1 := by omega
+  rcases this with rfl | rfl
+  · left; rfl
+  · right; rfl
+
+theorem sdivOverflow_i1_iff (va vb : BitVec (IntWidth.i1.bits)) :
+    sdivOverflow .i1 va vb = true ↔ va = 1#1 ∧ vb = 1#1 := by
+  rcases bitvec_i1_cases va with rfl | rfl <;>
+    rcases bitvec_i1_cases vb with rfl | rfl <;> decide
+
+/-- Explicit `.i1` discrepancy characterization: for `va = 1#1, vb = 1#1`, `LLVMAst.stepInstr`
+raises `.ub "signed division overflow"` on both `sdiv` and `srem`, while `opencompl/lean-mlir`
+evaluates `LLVM.sdiv` to `.value 1#1` and `LLVM.srem` to `.value 0#1`. -/
+theorem stepInstr_sdiv_srem_i1_allOnes_ub (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (exact : Bool) (aOp bOp : Operand)
+    (ha : evalOperand st aOp = .bits .i1 1#1)
+    (hb : evalOperand st bOp = .bits .i1 1#1) :
+    stepInstr mod_ fuel st (.sdiv dst exact .i1 aOp bOp) = .inl (.ub "signed division overflow") ∧
+    stepInstr mod_ fuel st (.srem dst .i1 aOp bOp) = .inl (.ub "signed division overflow") ∧
+    LLVM.sdiv (.value 1#1) (.value 1#1) { exact := exact } = .value 1#1 ∧
+    LLVM.srem (.value 1#1) (.value 1#1) = .value 0#1 := by
+  have hov : sdivOverflow .i1 1#1 1#1 = true := by decide
+  have hbeq0 : ((1#1 : BitVec (IntWidth.i1.bits)) == 0#(IntWidth.i1.bits)) = false := by decide
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · simp [stepInstr, stepInstrWith, divOrRem, ha, hb, hbeq0, hov]
+  · simp [stepInstr, stepInstrWith, divOrRem, ha, hb, hbeq0, hov]
+  · cases exact <;> decide
+  · decide
+
+/-- `sdiv`: complete exact UB-vs-poison boundary across all `xa xb : LLVM.IntW w.bits`, `exact : Bool`,
+and all widths `w : IntWidth` (including `w = .i1`). -/
+theorem stepInstr_sdiv_ub_or_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (exact : Bool) (w : IntWidth) (aOp bOp : Operand)
+    (xa xb : LLVM.IntW w.bits)
+    (ha : evalOperand st aOp = toLLVMVal w xa)
+    (hb : evalOperand st bOp = toLLVMVal w xb) :
+    match xb with
+    | .poison =>
+      stepInstr mod_ fuel st (.sdiv dst exact w aOp bOp) = .inl (.ub "division by poison")
+    | .value vb =>
+      if vb = 0#w.bits then
+        stepInstr mod_ fuel st (.sdiv dst exact w aOp bOp) = .inl (.ub "division by zero")
+      else
+        match xa with
+        | .poison =>
+          if bvSigned w vb == -1 then
+            stepInstr mod_ fuel st (.sdiv dst exact w aOp bOp) =
+              .inl (.ub "signed division overflow")
+          else
+            stepInstr mod_ fuel st (.sdiv dst exact w aOp bOp) =
+              .inr (bindReg st dst (toLLVMVal w (LLVM.sdiv .poison (.value vb) { exact := exact })))
+        | .value va =>
+          if sdivOverflow w va vb then
+            stepInstr mod_ fuel st (.sdiv dst exact w aOp bOp) =
+              .inl (.ub "signed division overflow")
+          else
+            stepInstr mod_ fuel st (.sdiv dst exact w aOp bOp) =
+              .inr (bindReg st dst (toLLVMVal w (LLVM.sdiv (.value va) (.value vb) { exact := exact }))) := by
+  rcases xb with ⟨none | vb⟩
+  · simp [stepInstr, stepInstrWith, divOrRem, hb, toLLVMVal]
+  · simp only [intW_mk_some] at hb ⊢
+    by_cases h0 : vb = 0#w.bits
+    · subst h0
+      simp [stepInstr, stepInstrWith, divOrRem, hb, toLLVMVal]
+    · simp only [h0, ↓reduceIte]
+      rcases xa with ⟨none | va⟩
+      · simp only [intW_mk_none] at ha ⊢
+        by_cases hbm1 : (bvSigned w vb == -1) = true
+        · simp [stepInstr, stepInstrWith, divOrRem, ha, hb, h0, hbm1, toLLVMVal]
+        · simp [stepInstr, stepInstrWith, divOrRem, ha, hb, h0, hbm1, toLLVMVal, LLVM.sdiv]
+      · simp only [intW_mk_some] at ha ⊢
+        by_cases hov : sdivOverflow w va vb = true
+        · simp [stepInstr, stepInstrWith, divOrRem, ha, hb, h0, hov, toLLVMVal]
+        · simp only [Bool.not_eq_true] at hov
+          simp only [hov, Bool.false_eq_true, ↓reduceIte]
+          by_cases hw1 : w.bits = 1
+          · have hw_i1 : w = .i1 := by cases w <;> simp_all [IntWidth.bits]
+            subst hw_i1
+            rcases bitvec_i1_cases vb with rfl | rfl
+            · exact False.elim (h0 rfl)
+            · rcases bitvec_i1_cases va with rfl | rfl
+              · have hbeq0 : ((1#1 : BitVec (IntWidth.i1.bits)) == 0#(IntWidth.i1.bits)) = false := by decide
+                have hlhs : stepInstr mod_ fuel st (.sdiv dst exact .i1 aOp bOp) =
+                    .inr (bindReg st dst (.bits .i1 0#1)) := by
+                  cases exact <;>
+                    simp [stepInstr, stepInstrWith, divOrRem, ha, hb, toLLVMVal, hbeq0, hov] <;> rfl
+                have hrhs : LLVM.sdiv (.value (0#1 : BitVec (IntWidth.i1.bits))) (.value 1#1)
+                    { exact := exact } = .value 0#1 := by
+                  cases exact <;> decide
+                rw [hlhs, hrhs]
+                rfl
+              · have hov1 : sdivOverflow .i1 1#1 1#1 = true := by decide
+                rw [hov] at hov1
+                cases hov1
+          · exact stepInstr_sdiv_bisim_of_non_ub mod_ fuel st dst exact w aOp bOp va vb
+              hw1 h0 hov ha hb
+
+/-- `srem`: complete exact UB-vs-poison boundary across all `xa xb : LLVM.IntW w.bits`
+and all widths `w : IntWidth` (including `w = .i1`). -/
+theorem stepInstr_srem_ub_or_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (w : IntWidth) (aOp bOp : Operand)
+    (xa xb : LLVM.IntW w.bits)
+    (ha : evalOperand st aOp = toLLVMVal w xa)
+    (hb : evalOperand st bOp = toLLVMVal w xb) :
+    match xb with
+    | .poison =>
+      stepInstr mod_ fuel st (.srem dst w aOp bOp) = .inl (.ub "division by poison")
+    | .value vb =>
+      if vb = 0#w.bits then
+        stepInstr mod_ fuel st (.srem dst w aOp bOp) = .inl (.ub "division by zero")
+      else
+        match xa with
+        | .poison =>
+          if bvSigned w vb == -1 then
+            stepInstr mod_ fuel st (.srem dst w aOp bOp) =
+              .inl (.ub "signed division overflow")
+          else
+            stepInstr mod_ fuel st (.srem dst w aOp bOp) =
+              .inr (bindReg st dst (toLLVMVal w (LLVM.srem .poison (.value vb))))
+        | .value va =>
+          if sdivOverflow w va vb then
+            stepInstr mod_ fuel st (.srem dst w aOp bOp) =
+              .inl (.ub "signed division overflow")
+          else
+            stepInstr mod_ fuel st (.srem dst w aOp bOp) =
+              .inr (bindReg st dst (toLLVMVal w (LLVM.srem (.value va) (.value vb)))) := by
+  rcases xb with ⟨none | vb⟩
+  · simp [stepInstr, stepInstrWith, divOrRem, hb, toLLVMVal]
+  · simp only [intW_mk_some] at hb ⊢
+    by_cases h0 : vb = 0#w.bits
+    · subst h0
+      simp [stepInstr, stepInstrWith, divOrRem, hb, toLLVMVal]
+    · simp only [h0, ↓reduceIte]
+      rcases xa with ⟨none | va⟩
+      · simp only [intW_mk_none] at ha ⊢
+        by_cases hbm1 : (bvSigned w vb == -1) = true
+        · simp [stepInstr, stepInstrWith, divOrRem, ha, hb, h0, hbm1, toLLVMVal]
+        · simp [stepInstr, stepInstrWith, divOrRem, ha, hb, h0, hbm1, toLLVMVal, LLVM.srem]
+      · simp only [intW_mk_some] at ha ⊢
+        by_cases hov : sdivOverflow w va vb = true
+        · simp [stepInstr, stepInstrWith, divOrRem, ha, hb, h0, hov, toLLVMVal]
+        · simp only [Bool.not_eq_true] at hov
+          simp only [hov, Bool.false_eq_true, ↓reduceIte]
+          by_cases hw1 : w.bits = 1
+          · have hw_i1 : w = .i1 := by cases w <;> simp_all [IntWidth.bits]
+            subst hw_i1
+            rcases bitvec_i1_cases vb with rfl | rfl
+            · exact False.elim (h0 rfl)
+            · rcases bitvec_i1_cases va with rfl | rfl
+              · have hbeq0 : ((1#1 : BitVec (IntWidth.i1.bits)) == 0#(IntWidth.i1.bits)) = false := by decide
+                have hlhs : stepInstr mod_ fuel st (.srem dst .i1 aOp bOp) =
+                    .inr (bindReg st dst (.bits .i1 0#1)) := by
+                  simp [stepInstr, stepInstrWith, divOrRem, ha, hb, toLLVMVal, hbeq0, hov]
+                  rfl
+                have hrhs : LLVM.srem (.value (0#1 : BitVec (IntWidth.i1.bits))) (.value 1#1) =
+                    .value 0#1 := by decide
+                rw [hlhs, hrhs]
+                rfl
+              · have hov1 : sdivOverflow .i1 1#1 1#1 = true := by decide
+                rw [hov] at hov1
+                cases hov1
+          · exact stepInstr_srem_bisim_of_non_ub mod_ fuel st dst w aOp bOp va vb
+              hw1 h0 hov ha hb
 
 /-! ## Dialect-Level Bridge (`InstCombine.Op.denote` over `LLVM.Op` / `MOp 0`) -/
 
@@ -756,6 +951,102 @@ theorem stepInstr_add_eq_op_denote (mod_ : LLVMModule) (fuel : Nat) (st : ExecSt
         (InstCombine.Op.denote (InstCombine.LLVM.Op.add w.bits (toNoWrapFlags flags))
           (HVector.cons xa (HVector.cons xb HVector.nil))))) := by
   rw [stepInstr_add_bisim mod_ fuel st dst flags w aOp bOp xa xb ha hb]
+  rfl
+
+theorem stepInstr_sub_eq_op_denote (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (flags : OverflowFlags) (w : IntWidth) (aOp bOp : Operand)
+    (xa xb : LLVM.IntW w.bits)
+    (ha : evalOperand st aOp = toLLVMVal w xa)
+    (hb : evalOperand st bOp = toLLVMVal w xb) :
+    stepInstr mod_ fuel st (.sub dst flags w aOp bOp) =
+      .inr (bindReg st dst (toLLVMVal w
+        (InstCombine.Op.denote (InstCombine.LLVM.Op.sub w.bits (toNoWrapFlags flags))
+          (HVector.cons xa (HVector.cons xb HVector.nil))))) := by
+  rw [stepInstr_sub_bisim mod_ fuel st dst flags w aOp bOp xa xb ha hb]
+  rfl
+
+theorem stepInstr_mul_eq_op_denote (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (flags : OverflowFlags) (w : IntWidth) (aOp bOp : Operand)
+    (xa xb : LLVM.IntW w.bits)
+    (ha : evalOperand st aOp = toLLVMVal w xa)
+    (hb : evalOperand st bOp = toLLVMVal w xb) :
+    stepInstr mod_ fuel st (.mul dst flags w aOp bOp) =
+      .inr (bindReg st dst (toLLVMVal w
+        (InstCombine.Op.denote (InstCombine.LLVM.Op.mul w.bits (toNoWrapFlags flags))
+          (HVector.cons xa (HVector.cons xb HVector.nil))))) := by
+  rw [stepInstr_mul_bisim mod_ fuel st dst flags w aOp bOp xa xb ha hb]
+  rfl
+
+theorem stepInstr_and_eq_op_denote (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (w : IntWidth) (aOp bOp : Operand)
+    (xa xb : LLVM.IntW w.bits)
+    (ha : evalOperand st aOp = toLLVMVal w xa)
+    (hb : evalOperand st bOp = toLLVMVal w xb) :
+    stepInstr mod_ fuel st (.and_ dst w aOp bOp) =
+      .inr (bindReg st dst (toLLVMVal w
+        (InstCombine.Op.denote (InstCombine.LLVM.Op.and w.bits)
+          (HVector.cons xa (HVector.cons xb HVector.nil))))) := by
+  rw [stepInstr_and_bisim mod_ fuel st dst w aOp bOp xa xb ha hb]
+  rfl
+
+theorem stepInstr_or_eq_op_denote (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (w : IntWidth) (aOp bOp : Operand)
+    (xa xb : LLVM.IntW w.bits)
+    (ha : evalOperand st aOp = toLLVMVal w xa)
+    (hb : evalOperand st bOp = toLLVMVal w xb) :
+    stepInstr mod_ fuel st (.or_ dst w aOp bOp) =
+      .inr (bindReg st dst (toLLVMVal w
+        (InstCombine.Op.denote (InstCombine.LLVM.Op.or w.bits { disjoint := false })
+          (HVector.cons xa (HVector.cons xb HVector.nil))))) := by
+  rw [stepInstr_or_bisim mod_ fuel st dst w aOp bOp xa xb ha hb]
+  rfl
+
+theorem stepInstr_xor_eq_op_denote (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (w : IntWidth) (aOp bOp : Operand)
+    (xa xb : LLVM.IntW w.bits)
+    (ha : evalOperand st aOp = toLLVMVal w xa)
+    (hb : evalOperand st bOp = toLLVMVal w xb) :
+    stepInstr mod_ fuel st (.xor dst w aOp bOp) =
+      .inr (bindReg st dst (toLLVMVal w
+        (InstCombine.Op.denote (InstCombine.LLVM.Op.xor w.bits)
+          (HVector.cons xa (HVector.cons xb HVector.nil))))) := by
+  rw [stepInstr_xor_bisim mod_ fuel st dst w aOp bOp xa xb ha hb]
+  rfl
+
+theorem stepInstr_shl_eq_op_denote (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (flags : OverflowFlags) (w : IntWidth) (aOp bOp : Operand)
+    (xa xb : LLVM.IntW w.bits)
+    (ha : evalOperand st aOp = toLLVMVal w xa)
+    (hb : evalOperand st bOp = toLLVMVal w xb) :
+    stepInstr mod_ fuel st (.shl dst flags w aOp bOp) =
+      .inr (bindReg st dst (toLLVMVal w
+        (InstCombine.Op.denote (InstCombine.LLVM.Op.shl w.bits (toNoWrapFlags flags))
+          (HVector.cons xa (HVector.cons xb HVector.nil))))) := by
+  rw [stepInstr_shl_bisim mod_ fuel st dst flags w aOp bOp xa xb ha hb]
+  rfl
+
+theorem stepInstr_lshr_eq_op_denote (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (exact : Bool) (w : IntWidth) (aOp bOp : Operand)
+    (xa xb : LLVM.IntW w.bits)
+    (ha : evalOperand st aOp = toLLVMVal w xa)
+    (hb : evalOperand st bOp = toLLVMVal w xb) :
+    stepInstr mod_ fuel st (.lshr dst exact w aOp bOp) =
+      .inr (bindReg st dst (toLLVMVal w
+        (InstCombine.Op.denote (InstCombine.LLVM.Op.lshr w.bits { exact := exact })
+          (HVector.cons xa (HVector.cons xb HVector.nil))))) := by
+  rw [stepInstr_lshr_bisim mod_ fuel st dst exact w aOp bOp xa xb ha hb]
+  rfl
+
+theorem stepInstr_ashr_eq_op_denote (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (exact : Bool) (w : IntWidth) (aOp bOp : Operand)
+    (xa xb : LLVM.IntW w.bits)
+    (ha : evalOperand st aOp = toLLVMVal w xa)
+    (hb : evalOperand st bOp = toLLVMVal w xb) :
+    stepInstr mod_ fuel st (.ashr dst exact w aOp bOp) =
+      .inr (bindReg st dst (toLLVMVal w
+        (InstCombine.Op.denote (InstCombine.LLVM.Op.ashr w.bits { exact := exact })
+          (HVector.cons xa (HVector.cons xb HVector.nil))))) := by
+  rw [stepInstr_ashr_bisim mod_ fuel st dst exact w aOp bOp xa xb ha hb]
   rfl
 
 theorem stepInstr_icmp_eq_op_denote (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
@@ -781,6 +1072,102 @@ theorem stepInstr_select_eq_op_denote (mod_ : LLVMModule) (fuel : Nat) (st : Exe
         (InstCombine.Op.denote (InstCombine.LLVM.Op.select w.bits)
           (HVector.cons xc (HVector.cons xt (HVector.cons xe HVector.nil)))))) := by
   rw [stepInstr_select_bisim mod_ fuel st dst condOp w tOp eOp xc xt xe hc ht he]
+  rfl
+
+theorem stepInstr_zext_eq_op_denote (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (srcW dstW : IntWidth) (op : Operand)
+    (x : LLVM.IntW srcW.bits)
+    (h_le : srcW.bits ≤ dstW.bits)
+    (hx : evalOperand st op = toLLVMVal srcW x) :
+    stepInstr mod_ fuel st (.zext dst srcW op dstW) =
+      .inr (bindReg st dst (toLLVMVal dstW
+        (InstCombine.Op.denote (InstCombine.LLVM.Op.zext srcW.bits dstW.bits { nneg := false })
+          (HVector.cons x HVector.nil)))) := by
+  rw [stepInstr_zext_bisim mod_ fuel st dst srcW dstW op x h_le hx]
+  rfl
+
+theorem stepInstr_sext_eq_op_denote (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (srcW dstW : IntWidth) (op : Operand)
+    (x : LLVM.IntW srcW.bits)
+    (h_le : srcW.bits ≤ dstW.bits)
+    (hx : evalOperand st op = toLLVMVal srcW x) :
+    stepInstr mod_ fuel st (.sext dst srcW op dstW) =
+      .inr (bindReg st dst (toLLVMVal dstW
+        (InstCombine.Op.denote (InstCombine.LLVM.Op.sext srcW.bits dstW.bits)
+          (HVector.cons x HVector.nil)))) := by
+  rw [stepInstr_sext_bisim mod_ fuel st dst srcW dstW op x h_le hx]
+  rfl
+
+theorem stepInstr_trunc_eq_op_denote (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (srcW dstW : IntWidth) (op : Operand)
+    (x : LLVM.IntW srcW.bits)
+    (h_le : dstW.bits ≤ srcW.bits)
+    (hx : evalOperand st op = toLLVMVal srcW x) :
+    stepInstr mod_ fuel st (.trunc dst srcW op dstW) =
+      .inr (bindReg st dst (toLLVMVal dstW
+        (InstCombine.Op.denote (InstCombine.LLVM.Op.trunc srcW.bits dstW.bits { nsw := false, nuw := false })
+          (HVector.cons x HVector.nil)))) := by
+  rw [stepInstr_trunc_bisim mod_ fuel st dst srcW dstW op x h_le hx]
+  rfl
+
+theorem stepInstr_udiv_eq_op_denote_of_nonzero (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (exact : Bool) (w : IntWidth) (aOp bOp : Operand)
+    (xa : LLVM.IntW w.bits) (vb : BitVec w.bits)
+    (hb0 : vb ≠ 0#w.bits)
+    (ha : evalOperand st aOp = toLLVMVal w xa)
+    (hb : evalOperand st bOp = .bits w vb) :
+    stepInstr mod_ fuel st (.udiv dst exact w aOp bOp) =
+      .inr (bindReg st dst (toLLVMVal w
+        (InstCombine.Op.denote (InstCombine.LLVM.Op.udiv w.bits { exact := exact })
+          (HVector.cons xa (HVector.cons (.value vb) HVector.nil))))) := by
+  have hb' : evalOperand st bOp = toLLVMVal w (.value vb) := hb
+  have h := stepInstr_udiv_ub_or_bisim mod_ fuel st dst exact w aOp bOp xa (.value vb) ha hb'
+  simp only [hb0, ↓reduceIte] at h
+  exact h
+
+theorem stepInstr_urem_eq_op_denote_of_nonzero (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (w : IntWidth) (aOp bOp : Operand)
+    (xa : LLVM.IntW w.bits) (vb : BitVec w.bits)
+    (hb0 : vb ≠ 0#w.bits)
+    (ha : evalOperand st aOp = toLLVMVal w xa)
+    (hb : evalOperand st bOp = .bits w vb) :
+    stepInstr mod_ fuel st (.urem dst w aOp bOp) =
+      .inr (bindReg st dst (toLLVMVal w
+        (InstCombine.Op.denote (InstCombine.LLVM.Op.urem w.bits)
+          (HVector.cons xa (HVector.cons (.value vb) HVector.nil))))) := by
+  have hb' : evalOperand st bOp = toLLVMVal w (.value vb) := hb
+  have h := stepInstr_urem_ub_or_bisim mod_ fuel st dst w aOp bOp xa (.value vb) ha hb'
+  simp only [hb0, ↓reduceIte] at h
+  exact h
+
+theorem stepInstr_sdiv_eq_op_denote_of_non_ub (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (exact : Bool) (w : IntWidth) (aOp bOp : Operand)
+    (va vb : BitVec w.bits)
+    (hw1 : w.bits ≠ 1)
+    (hb0 : vb ≠ 0#w.bits)
+    (hno_ov : sdivOverflow w va vb = false)
+    (ha : evalOperand st aOp = .bits w va)
+    (hb : evalOperand st bOp = .bits w vb) :
+    stepInstr mod_ fuel st (.sdiv dst exact w aOp bOp) =
+      .inr (bindReg st dst (toLLVMVal w
+        (InstCombine.Op.denote (InstCombine.LLVM.Op.sdiv w.bits { exact := exact })
+          (HVector.cons (.value va) (HVector.cons (.value vb) HVector.nil))))) := by
+  rw [stepInstr_sdiv_bisim_of_non_ub mod_ fuel st dst exact w aOp bOp va vb hw1 hb0 hno_ov ha hb]
+  rfl
+
+theorem stepInstr_srem_eq_op_denote_of_non_ub (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (w : IntWidth) (aOp bOp : Operand)
+    (va vb : BitVec w.bits)
+    (hw1 : w.bits ≠ 1)
+    (hb0 : vb ≠ 0#w.bits)
+    (hno_ov : sdivOverflow w va vb = false)
+    (ha : evalOperand st aOp = .bits w va)
+    (hb : evalOperand st bOp = .bits w vb) :
+    stepInstr mod_ fuel st (.srem dst w aOp bOp) =
+      .inr (bindReg st dst (toLLVMVal w
+        (InstCombine.Op.denote (InstCombine.LLVM.Op.srem w.bits)
+          (HVector.cons (.value va) (HVector.cons (.value vb) HVector.nil))))) := by
+  rw [stepInstr_srem_bisim_of_non_ub mod_ fuel st dst w aOp bOp va vb hw1 hb0 hno_ov ha hb]
   rfl
 
 /-! ## Compositional Straight-Line Instruction-List Composition (`execInstrs`) -/
@@ -809,5 +1196,401 @@ theorem execInstrs_of_straightLineBisim {mod_ : LLVMModule} {fuel : Nat}
     unfold stepInstr at h_step
     rw [h_step]
     exact ih
+
+theorem StraightLineBisim.append {mod_ : LLVMModule} {fuel : Nat}
+    {st1 st2 st3 : ExecState} {is1 is2 : List LLVMInstr}
+    (h1 : StraightLineBisim mod_ fuel st1 is1 st2)
+    (h2 : StraightLineBisim mod_ fuel st2 is2 st3) :
+    StraightLineBisim mod_ fuel st1 (is1 ++ is2) st3 := by
+  induction h1 with
+  | nil => exact h2
+  | cons h_step _ ih => exact .cons h_step (ih h2)
+
+theorem execInstrs_append_of_straightLineBisim {mod_ : LLVMModule} {fuel : Nat}
+    {st1 st2 st3 : ExecState} {is1 is2 : List LLVMInstr}
+    (h1 : StraightLineBisim mod_ fuel st1 is1 st2)
+    (h2 : StraightLineBisim mod_ fuel st2 is2 st3) :
+    execInstrs mod_ fuel st1 (is1 ++ is2) = .inr st3 :=
+  execInstrs_of_straightLineBisim (h1.append h2)
+
+/-! ## SSA Register-Valuation Lookup & Pure Straight-Line Frame Preservation -/
+
+@[simp]
+theorem evalOperand_reg_bindReg_same (st : ExecState) (r : RegName) (v : LLVMVal) :
+    evalOperand (bindReg st r v) (.reg r) = v := by
+  simp [evalOperand, lookupReg, bindReg]
+
+@[simp]
+theorem evalOperand_reg_bindReg_ne (st : ExecState) (r r' : RegName) (v : LLVMVal)
+    (hne : r ≠ r') :
+    evalOperand (bindReg st r' v) (.reg r) = evalOperand st (.reg r) := by
+  have hbeq : (r == r') = false := beq_eq_false_iff_ne.mpr hne
+  simp [evalOperand, lookupReg, bindReg, List.lookup_cons, hbeq]
+
+@[simp]
+theorem evalTypedOperand_int_reg (st : ExecState) (w : IntWidth) (r : RegName) :
+    evalTypedOperand st (.int w) (.reg r) = evalOperand st (.reg r) := rfl
+
+/-- SSA register valuation agreement between an `LLVMAst.ExecState` and an abstract valuation
+`ρ : RegName → LLVMVal` on a finite live-register set `live`. -/
+def RegValuationAgrees (st : ExecState) (ρ : RegName → LLVMVal) (live : List RegName) : Prop :=
+  ∀ r, r ∈ live → evalOperand st (.reg r) = ρ r
+
+theorem RegValuationAgrees.bind (st : ExecState) (ρ : RegName → LLVMVal) (live : List RegName)
+    (dst : RegName) (v : LLVMVal)
+    (h : RegValuationAgrees st ρ live) :
+    RegValuationAgrees (bindReg st dst v) (fun r => if r = dst then v else ρ r) (dst :: live) := by
+  intro r hr
+  by_cases heq : r = dst
+  · subst heq
+    simp
+  · rcases List.mem_cons.mp hr with rfl | hmem
+    · exact False.elim (heq rfl)
+    · simp [heq, evalOperand_reg_bindReg_ne st r dst v heq, h r hmem]
+
+/-- Pure register-only SSA instructions (covering the entire `InstCombine.LLVM.Op` integer ALU,
+shift, comparison, cast, select, and div/rem dialect fragment) never mutate linear memory,
+global bindings, or predecessor block labels. -/
+def isPureRegInstr : LLVMInstr → Bool
+  | .add .. | .sub .. | .mul .. | .udiv .. | .sdiv .. | .urem .. | .srem ..
+  | .and_ .. | .or_ .. | .xor .. | .shl .. | .lshr .. | .ashr ..
+  | .icmp .. | .zext .. | .sext .. | .trunc .. | .select .. => true
+  | _ => false
+
+theorem stepInstr_pure_frame {mod_ : LLVMModule} {fuel : Nat} {st st' : ExecState}
+    {ins : LLVMInstr}
+    (hpure : isPureRegInstr ins = true)
+    (hstep : stepInstr mod_ fuel st ins = .inr st') :
+    st'.mem = st.mem ∧ st'.globals = st.globals ∧ st'.prevBlock = st.prevBlock := by
+  have hbind : ∀ (dst : RegName) (v : LLVMVal),
+      (.inr (bindReg st dst v) : ExecOutcome ⊕ ExecState) = .inr st' →
+      st'.mem = st.mem ∧ st'.globals = st.globals ∧ st'.prevBlock = st.prevBlock := by
+    intro dst v h
+    injection h with h'
+    subst h'
+    exact ⟨rfl, rfl, rfl⟩
+  have hite : ∀ (c : Prop) [Decidable c] {x y : ExecOutcome ⊕ ExecState},
+      (x = .inr st' → st'.mem = st.mem ∧ st'.globals = st.globals ∧ st'.prevBlock = st.prevBlock) →
+      (y = .inr st' → st'.mem = st.mem ∧ st'.globals = st.globals ∧ st'.prevBlock = st.prevBlock) →
+      (if c then x else y) = .inr st' →
+      st'.mem = st.mem ∧ st'.globals = st.globals ∧ st'.prevBlock = st.prevBlock := by
+    intro c _ x y hx hy h
+    by_cases hc : c
+    · rw [if_pos hc] at h; exact hx h
+    · rw [if_neg hc] at h; exact hy h
+  have hub : ∀ (msg : String),
+      (.inl (.ub msg) : ExecOutcome ⊕ ExecState) = .inr st' →
+      st'.mem = st.mem ∧ st'.globals = st.globals ∧ st'.prevBlock = st.prevBlock := by
+    intro msg h; nomatch h
+  have hbin : ∀ (dst : RegName) (w : IntWidth) (fl : OverflowFlags) (a b : LLVMVal) (k : String),
+      binResult dst st w fl a b k = .inr st' →
+      st'.mem = st.mem ∧ st'.globals = st.globals ∧ st'.prevBlock = st.prevBlock := by
+    intro dst w fl a b k h
+    unfold binResult at h
+    cases a with
+    | poison => exact hbind _ _ h
+    | ptr _ | floatBits _ _ | aggNil | aggCons _ _ =>
+      cases b <;> first | exact hbind _ _ h | nomatch h
+    | bits wa va =>
+      cases b with
+      | poison => exact hbind _ _ h
+      | ptr _ | floatBits _ _ | aggNil | aggCons _ _ => nomatch h
+      | bits wb vb =>
+        dsimp only at h
+        by_cases ha : wa = w
+        · subst wa
+          by_cases hb : wb = w
+          · subst wb
+            simp only [↓reduceDIte] at h
+            exact hite _ (hbind _ _) (hbind _ _) h
+          · simp [hb] at h
+        · simp [ha] at h
+  have hdiv : ∀ (dst : RegName) (w : IntWidth) (ex : Bool) (a b : LLVMVal) (sg ir : Bool),
+      divOrRem dst st w ex a b sg ir = .inr st' →
+      st'.mem = st.mem ∧ st'.globals = st.globals ∧ st'.prevBlock = st.prevBlock := by
+    intro dst w ex a b sg ir h
+    unfold divOrRem at h
+    cases b with
+    | poison | ptr _ | floatBits _ _ | aggNil | aggCons _ _ => nomatch h
+    | bits wb vb =>
+      dsimp only at h
+      by_cases hb : wb = w
+      · subst wb
+        simp only [↓reduceDIte] at h
+        refine hite _ (hub _) (fun h => ?_) h
+        cases a with
+        | ptr _ | floatBits _ _ | aggNil | aggCons _ _ => nomatch h
+        | poison =>
+          dsimp only at h
+          exact hite _ (hub _) (hbind _ _) h
+        | bits wa va =>
+          dsimp only at h
+          by_cases ha : wa = w
+          · subst wa
+            simp only [↓reduceDIte] at h
+            exact hite _ (hub _) (hite _ (hbind _ _) (hbind _ _)) h
+          · simp [ha] at h
+      · simp [hb] at h
+  have hshf : ∀ (dst : RegName) (w : IntWidth) (fl : OverflowFlags) (ex : Bool) (a b : LLVMVal) (k : String),
+      shiftResult dst st w fl ex a b k = .inr st' →
+      st'.mem = st.mem ∧ st'.globals = st.globals ∧ st'.prevBlock = st.prevBlock := by
+    intro dst w fl ex a b k h
+    unfold shiftResult at h
+    cases a with
+    | poison => exact hbind _ _ h
+    | ptr _ | floatBits _ _ | aggNil | aggCons _ _ =>
+      cases b <;> first | exact hbind _ _ h | nomatch h
+    | bits wa va =>
+      cases b with
+      | poison => exact hbind _ _ h
+      | ptr _ | floatBits _ _ | aggNil | aggCons _ _ => nomatch h
+      | bits wb vb =>
+        dsimp only at h
+        by_cases ha : wa = w
+        · subst wa
+          by_cases hb : wb = w
+          · subst wb
+            simp only [↓reduceDIte] at h
+            exact hite _ (hbind _ _) (hite _ (hbind _ _) (hite _ (hbind _ _) (hbind _ _))) h
+          · simp [hb] at h
+        · simp [ha] at h
+  cases ins <;> simp [isPureRegInstr] at hpure
+  case add dst fl w aOp bOp => exact hbin dst w fl _ _ "add" hstep
+  case sub dst fl w aOp bOp => exact hbin dst w fl _ _ "sub" hstep
+  case mul dst fl w aOp bOp => exact hbin dst w fl _ _ "mul" hstep
+  case and_ dst w aOp bOp => exact hbin dst w .none _ _ "and" hstep
+  case or_ dst w aOp bOp => exact hbin dst w .none _ _ "or" hstep
+  case xor dst w aOp bOp => exact hbin dst w .none _ _ "xor" hstep
+  case udiv dst ex w aOp bOp => exact hdiv dst w ex _ _ false false hstep
+  case sdiv dst ex w aOp bOp => exact hdiv dst w ex _ _ true false hstep
+  case urem dst w aOp bOp => exact hdiv dst w false _ _ false true hstep
+  case srem dst w aOp bOp => exact hdiv dst w false _ _ true true hstep
+  case shl dst fl w aOp bOp => exact hshf dst w fl false _ _ "shl" hstep
+  case lshr dst ex w aOp bOp => exact hshf dst w .none ex _ _ "lshr" hstep
+  case ashr dst ex w aOp bOp => exact hshf dst w .none ex _ _ "ashr" hstep
+  case icmp dst pred ty aOp bOp =>
+    unfold stepInstr at hstep
+    dsimp only [stepInstrWith] at hstep
+    cases ty with
+    | void | float _ | array _ _ | vec _ _ | structFields _ _ => nomatch hstep
+    | int w =>
+      dsimp only at hstep
+      cases ha0 : evalOperand st aOp with
+      | poison => rw [ha0] at hstep; exact hbind _ _ hstep
+      | ptr _ | floatBits _ _ | aggNil | aggCons _ _ =>
+        rw [ha0] at hstep
+        cases hb0 : evalOperand st bOp <;> rw [hb0] at hstep <;>
+          first | exact hbind _ _ hstep | nomatch hstep
+      | bits wa va =>
+        rw [ha0] at hstep
+        cases hb0 : evalOperand st bOp with
+        | poison => rw [hb0] at hstep; exact hbind _ _ hstep
+        | ptr _ | floatBits _ _ | aggNil | aggCons _ _ => rw [hb0] at hstep; nomatch hstep
+        | bits wb vb =>
+          rw [hb0] at hstep
+          dsimp only at hstep
+          by_cases ha : wa = w
+          · subst wa
+            by_cases hb : wb = w
+            · subst wb
+              simp only [↓reduceDIte] at hstep
+              exact hbind _ _ hstep
+            · simp [hb] at hstep
+          · simp [ha] at hstep
+    | ptr _ =>
+      dsimp only at hstep
+      cases ha0 : evalOperand st aOp <;> rw [ha0] at hstep <;>
+        cases hb0 : evalOperand st bOp <;> rw [hb0] at hstep <;>
+        first | exact hbind _ _ hstep | nomatch hstep
+  case zext dst srcW op dstW =>
+    unfold stepInstr at hstep
+    dsimp only [stepInstrWith] at hstep
+    cases hop : evalOperand st op with
+    | poison => rw [hop] at hstep; exact hbind _ _ hstep
+    | ptr _ | floatBits _ _ | aggNil | aggCons _ _ => rw [hop] at hstep; nomatch hstep
+    | bits w v =>
+      rw [hop] at hstep
+      dsimp only at hstep
+      by_cases hw : w = srcW
+      · subst w
+        simp only [↓reduceDIte] at hstep
+        split at hstep
+        · exact hbind _ _ hstep
+        · nomatch hstep
+      · simp [hw] at hstep
+  case sext dst srcW op dstW =>
+    unfold stepInstr at hstep
+    dsimp only [stepInstrWith] at hstep
+    cases hop : evalOperand st op with
+    | poison => rw [hop] at hstep; exact hbind _ _ hstep
+    | ptr _ | floatBits _ _ | aggNil | aggCons _ _ => rw [hop] at hstep; nomatch hstep
+    | bits w v =>
+      rw [hop] at hstep
+      dsimp only at hstep
+      by_cases hw : w = srcW
+      · subst w
+        simp only [↓reduceDIte] at hstep
+        split at hstep
+        · exact hbind _ _ hstep
+        · nomatch hstep
+      · simp [hw] at hstep
+  case trunc dst srcW op dstW =>
+    unfold stepInstr at hstep
+    dsimp only [stepInstrWith] at hstep
+    cases hop : evalOperand st op with
+    | poison => rw [hop] at hstep; exact hbind _ _ hstep
+    | ptr _ | floatBits _ _ | aggNil | aggCons _ _ => rw [hop] at hstep; nomatch hstep
+    | bits w v =>
+      rw [hop] at hstep
+      dsimp only at hstep
+      by_cases hw : w = srcW
+      · subst w
+        simp only [↓reduceDIte] at hstep
+        split at hstep
+        · exact hbind _ _ hstep
+        · nomatch hstep
+      · simp [hw] at hstep
+  case select dst condOp ty tOp eOp =>
+    unfold stepInstr at hstep
+    dsimp only [stepInstrWith] at hstep
+    cases hc : evalOperand st condOp with
+    | poison => rw [hc] at hstep; exact hbind _ _ hstep
+    | ptr _ | floatBits _ _ | aggNil | aggCons _ _ => rw [hc] at hstep; nomatch hstep
+    | bits wc vc =>
+      rw [hc] at hstep
+      cases wc with
+      | i8 | i16 | i32 | i64 | i128 | i256 | i512 => nomatch hstep
+      | i1 =>
+        dsimp only at hstep
+        exact hite _ (hbind _ _) (hbind _ _) hstep
+
+/-- Compositional frame preservation across any straight-line sequence of pure SSA instructions:
+memory, globals, and predecessor block labels remain strictly invariant. -/
+theorem StraightLineBisim.pure_frame {mod_ : LLVMModule} {fuel : Nat}
+    {st st' : ExecState} {is : List LLVMInstr}
+    (h : StraightLineBisim mod_ fuel st is st')
+    (hpure : ∀ ins ∈ is, isPureRegInstr ins = true) :
+    st'.mem = st.mem ∧ st'.globals = st.globals ∧ st'.prevBlock = st.prevBlock := by
+  induction h with
+  | nil => exact ⟨rfl, rfl, rfl⟩
+  | @cons st0 st1 st2 ins rest hstep _ ih =>
+    have hp_head : isPureRegInstr ins = true := hpure ins (List.mem_cons_self ..)
+    have hp_tail : ∀ i ∈ rest, isPureRegInstr i = true :=
+      fun i hi => hpure i (List.mem_cons_of_mem _ hi)
+    rcases stepInstr_pure_frame hp_head hstep with ⟨hm1, hg1, hp1⟩
+    rcases ih hp_tail with ⟨hm2, hg2, hp2⟩
+    exact ⟨hm2.trans hm1, hg2.trans hg1, hp2.trans hp1⟩
+
+/-- Concrete non-vacuous 5-instruction straight-line SSA sequence exercising register-to-register
+forwarding, overflow/shift/comparison/select poison propagation, and non-UB `srem` composition:
+1. `sum = add flags w a b`
+2. `sh  = lshr exact w sum b`
+3. `cmp = icmp slt w sh a`
+4. `sel = select cmp w sh sum`
+5. `out = srem w a b`
+Proved equivalent end-to-end (including `execInstrs`, output register lookup, live input register
+preservation, and memory/globals frame invariance) to composed `InstCombine.Op.denote`. -/
+def straightLineFusedPipeline (w : IntWidth) (flags : OverflowFlags) (exact : Bool)
+    (rA rB rSum rSh rCmp rSel rOut : RegName) : List LLVMInstr :=
+  [ .add rSum flags w (.reg rA) (.reg rB)
+  , .lshr rSh exact w (.reg rSum) (.reg rB)
+  , .icmp rCmp .slt (.int w) (.reg rSh) (.reg rA)
+  , .select rSel (.reg rCmp) (.int w) (.reg rSh) (.reg rSum)
+  , .srem rOut w (.reg rA) (.reg rB)
+  ]
+
+theorem execInstrs_straightLineFusedPipeline_eq_op_denote
+    (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (w : IntWidth) (flags : OverflowFlags) (exact : Bool)
+    (va vb : BitVec w.bits)
+    (hw1 : w.bits ≠ 1)
+    (hb0 : vb ≠ 0#w.bits)
+    (hno_ov : sdivOverflow w va vb = false)
+    (ha : evalOperand st (.reg "a") = .bits w va)
+    (hb : evalOperand st (.reg "b") = .bits w vb) :
+    let vSum := InstCombine.Op.denote (InstCombine.LLVM.Op.add w.bits (toNoWrapFlags flags))
+      (HVector.cons (.value va) (HVector.cons (.value vb) HVector.nil))
+    let vSh := InstCombine.Op.denote (InstCombine.LLVM.Op.lshr w.bits { exact := exact })
+      (HVector.cons vSum (HVector.cons (.value vb) HVector.nil))
+    let vCmp := InstCombine.Op.denote (InstCombine.LLVM.Op.icmp .slt w.bits)
+      (HVector.cons vSh (HVector.cons (.value va) HVector.nil))
+    let vSel := InstCombine.Op.denote (InstCombine.LLVM.Op.select w.bits)
+      (HVector.cons vCmp (HVector.cons vSh (HVector.cons vSum HVector.nil)))
+    let vRem := InstCombine.Op.denote (InstCombine.LLVM.Op.srem w.bits)
+      (HVector.cons (.value va) (HVector.cons (.value vb) HVector.nil))
+    ∃ st',
+      execInstrs mod_ fuel st
+        (straightLineFusedPipeline w flags exact "a" "b" "t_sum" "t_sh" "t_cmp" "t_sel" "t_out") =
+          .inr st' ∧
+      evalOperand st' (.reg "t_sel") = toLLVMVal w vSel ∧
+      evalOperand st' (.reg "t_out") = toLLVMVal w vRem ∧
+      evalOperand st' (.reg "a") = .bits w va ∧
+      evalOperand st' (.reg "b") = .bits w vb ∧
+      st'.mem = st.mem ∧ st'.globals = st.globals ∧ st'.prevBlock = st.prevBlock := by
+  intro vSum vSh vCmp vSel vRem
+  let st1 := bindReg st "t_sum" (toLLVMVal w vSum)
+  let st2 := bindReg st1 "t_sh" (toLLVMVal w vSh)
+  let st3 := bindReg st2 "t_cmp" (toLLVMVal .i1 vCmp)
+  let st4 := bindReg st3 "t_sel" (toLLVMVal w vSel)
+  let st5 := bindReg st4 "t_out" (toLLVMVal w vRem)
+  have hs1 : stepInstr mod_ fuel st (.add "t_sum" flags w (.reg "a") (.reg "b")) = .inr st1 :=
+    stepInstr_add_eq_op_denote mod_ fuel st "t_sum" flags w (.reg "a") (.reg "b")
+      (.value va) (.value vb) ha hb
+  have hb1 : evalOperand st1 (.reg "b") = .bits w vb := by
+    rw [evalOperand_reg_bindReg_ne st "b" "t_sum" _ (by decide), hb]
+  have hs2 : stepInstr mod_ fuel st1 (.lshr "t_sh" exact w (.reg "t_sum") (.reg "b")) = .inr st2 :=
+    stepInstr_lshr_eq_op_denote mod_ fuel st1 "t_sh" exact w (.reg "t_sum") (.reg "b")
+      vSum (.value vb) (evalOperand_reg_bindReg_same ..) hb1
+  have ha2 : evalOperand st2 (.reg "a") = .bits w va := by
+    rw [evalOperand_reg_bindReg_ne st1 "a" "t_sh" _ (by decide),
+        evalOperand_reg_bindReg_ne st "a" "t_sum" _ (by decide), ha]
+  have hs3 : stepInstr mod_ fuel st2 (.icmp "t_cmp" .slt (.int w) (.reg "t_sh") (.reg "a")) = .inr st3 :=
+    stepInstr_icmp_eq_op_denote mod_ fuel st2 "t_cmp" .slt w (.reg "t_sh") (.reg "a")
+      vSh (.value va) (evalOperand_reg_bindReg_same ..) ha2
+  have hsh3 : evalTypedOperand st3 (.int w) (.reg "t_sh") = toLLVMVal w vSh := by
+    rw [evalTypedOperand_int_reg,
+        evalOperand_reg_bindReg_ne st2 "t_sh" "t_cmp" _ (by decide),
+        evalOperand_reg_bindReg_same]
+  have hsum3 : evalTypedOperand st3 (.int w) (.reg "t_sum") = toLLVMVal w vSum := by
+    rw [evalTypedOperand_int_reg,
+        evalOperand_reg_bindReg_ne st2 "t_sum" "t_cmp" _ (by decide),
+        evalOperand_reg_bindReg_ne st1 "t_sum" "t_sh" _ (by decide),
+        evalOperand_reg_bindReg_same]
+  have hs4 : stepInstr mod_ fuel st3
+      (.select "t_sel" (.reg "t_cmp") (.int w) (.reg "t_sh") (.reg "t_sum")) = .inr st4 :=
+    stepInstr_select_eq_op_denote mod_ fuel st3 "t_sel" (.reg "t_cmp") w (.reg "t_sh") (.reg "t_sum")
+      vCmp vSh vSum (evalOperand_reg_bindReg_same ..) hsh3 hsum3
+  have ha4 : evalOperand st4 (.reg "a") = .bits w va := by
+    rw [evalOperand_reg_bindReg_ne st3 "a" "t_sel" _ (by decide),
+        evalOperand_reg_bindReg_ne st2 "a" "t_cmp" _ (by decide), ha2]
+  have hb4 : evalOperand st4 (.reg "b") = .bits w vb := by
+    rw [evalOperand_reg_bindReg_ne st3 "b" "t_sel" _ (by decide),
+        evalOperand_reg_bindReg_ne st2 "b" "t_cmp" _ (by decide),
+        evalOperand_reg_bindReg_ne st1 "b" "t_sh" _ (by decide), hb1]
+  have hs5 : stepInstr mod_ fuel st4 (.srem "t_out" w (.reg "a") (.reg "b")) = .inr st5 :=
+    stepInstr_srem_eq_op_denote_of_non_ub mod_ fuel st4 "t_out" w (.reg "a") (.reg "b")
+      va vb hw1 hb0 hno_ov ha4 hb4
+  have htrace1 : StraightLineBisim mod_ fuel st
+      [ .add "t_sum" flags w (.reg "a") (.reg "b")
+      , .lshr "t_sh" exact w (.reg "t_sum") (.reg "b") ] st2 :=
+    .cons hs1 (.cons hs2 (.nil st2))
+  have htrace2 : StraightLineBisim mod_ fuel st2
+      [ .icmp "t_cmp" .slt (.int w) (.reg "t_sh") (.reg "a")
+      , .select "t_sel" (.reg "t_cmp") (.int w) (.reg "t_sh") (.reg "t_sum")
+      , .srem "t_out" w (.reg "a") (.reg "b") ] st5 :=
+    .cons hs3 (.cons hs4 (.cons hs5 (.nil st5)))
+  have htrace : StraightLineBisim mod_ fuel st
+      (straightLineFusedPipeline w flags exact "a" "b" "t_sum" "t_sh" "t_cmp" "t_sel" "t_out") st5 :=
+    htrace1.append htrace2
+  have hframe := htrace.pure_frame (by
+    intro ins hins
+    simp only [straightLineFusedPipeline, List.mem_cons, List.not_mem_nil, or_false] at hins
+    rcases hins with rfl | rfl | rfl | rfl | rfl <;> rfl)
+  refine ⟨st5, execInstrs_of_straightLineBisim htrace, ?_, ?_, ?_, ?_, hframe⟩
+  · rw [evalOperand_reg_bindReg_ne st4 "t_sel" "t_out" _ (by decide),
+        evalOperand_reg_bindReg_same]
+  · exact evalOperand_reg_bindReg_same ..
+  · rw [evalOperand_reg_bindReg_ne st4 "a" "t_out" _ (by decide), ha4]
+  · rw [evalOperand_reg_bindReg_ne st4 "b" "t_out" _ (by decide), hb4]
 
 end LeanMLIRBridge
