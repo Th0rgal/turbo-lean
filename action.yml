@@ -104,7 +104,15 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        SRC_HASH=$(sha256sum "$GITHUB_ACTION_PATH/Cargo.lock" "$GITHUB_ACTION_PATH/crates/turbo-lean/build.rs" "$GITHUB_ACTION_PATH/crates/turbo-lean/src/"*.rs "$GITHUB_ACTION_PATH/crates/turbo-lean/src/"*.json "$GITHUB_ACTION_PATH/lean/lean-toolchain" "$GITHUB_ACTION_PATH/lean/TurboLean/"*.lean "$GITHUB_ACTION_PATH/lean/LeanNative/Proofs/"*.lean 2>/dev/null | sha256sum | awk '{print $1}')
+        SRC_HASH=$(
+          cd "$GITHUB_ACTION_PATH"
+          SHA256_CMD="sha256sum"
+          command -v sha256sum >/dev/null 2>&1 || SHA256_CMD="shasum -a 256"
+          {
+            find Cargo.lock crates/turbo-lean/Cargo.toml crates/turbo-lean/build.rs crates/turbo-lean/src lean/lean-toolchain lean/lakefile.lean lean/lake-manifest.json lean/LeanNative/Spec.lean -type f -print0 2>/dev/null || true
+            find lean/TurboLean lean/LeanNative/Proofs -type f -name '*.lean' -print0 2>/dev/null || true
+          } | LC_ALL=C sort -zu | { IFS= read -r -d '' first && { printf '%s\0' "$first"; cat; } | xargs -0 $SHA256_CMD || true; } | $SHA256_CMD | awk '{print $1}'
+        )
         echo "src_hash=${SRC_HASH}" >> "$GITHUB_OUTPUT"
 
     - name: Cache turbo-lean CLI binary
@@ -123,7 +131,15 @@ runs:
         export PATH="$HOME/.cargo/bin:$PATH"
         BIN_DIR="$HOME/.cache/turbo-lean-action-bin/bin"
         mkdir -p "$BIN_DIR"
-        ACTION_SRC_HASH=$(sha256sum "$GITHUB_ACTION_PATH/Cargo.lock" "$GITHUB_ACTION_PATH/crates/turbo-lean/build.rs" "$GITHUB_ACTION_PATH/crates/turbo-lean/src/"*.rs "$GITHUB_ACTION_PATH/crates/turbo-lean/src/"*.json "$GITHUB_ACTION_PATH/lean/lean-toolchain" "$GITHUB_ACTION_PATH/lean/TurboLean/"*.lean "$GITHUB_ACTION_PATH/lean/LeanNative/Proofs/"*.lean 2>/dev/null | sha256sum | awk '{print $1}')
+        ACTION_SRC_HASH=$(
+          cd "$GITHUB_ACTION_PATH"
+          SHA256_CMD="sha256sum"
+          command -v sha256sum >/dev/null 2>&1 || SHA256_CMD="shasum -a 256"
+          {
+            find Cargo.lock crates/turbo-lean/Cargo.toml crates/turbo-lean/build.rs crates/turbo-lean/src lean/lean-toolchain lean/lakefile.lean lean/lake-manifest.json lean/LeanNative/Spec.lean -type f -print0 2>/dev/null || true
+            find lean/TurboLean lean/LeanNative/Proofs -type f -name '*.lean' -print0 2>/dev/null || true
+          } | LC_ALL=C sort -zu | { IFS= read -r -d '' first && { printf '%s\0' "$first"; cat; } | xargs -0 $SHA256_CMD || true; } | $SHA256_CMD | awk '{print $1}'
+        )
         ACTION_HEAD_SHA=$(git -C "$GITHUB_ACTION_PATH" rev-parse HEAD 2>/dev/null || true)
         PREBUILT_BIN=$(command -v turbo-lean 2>/dev/null || true)
         PREBUILT_COMMIT=""
