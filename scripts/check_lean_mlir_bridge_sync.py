@@ -10,7 +10,9 @@ Verifies:
    exact SHA-256 digests of `opencompl/lean-mlir` commit `b8c4a771319a044854a4bbb49b8821381ef86ff8`.
 3. `verification/lean-mlir-bridge/lakefile.toml` pins `opencompl/lean-mlir` at commit
    `b8c4a771319a044854a4bbb49b8821381ef86ff8` (`subDir = "LeanMLIR"`), and `LeanMLIRBridge` contains
-   zero `sorry`, `admit`, `axiom`, `native_decide`, or `trustCompiler` tokens.
+   `#verify_lean_mlir_bridge_axioms` (>= 63 unique audited theorems via `Lean.collectAxioms` and
+   `bridgedTheorems.Nodup`) and zero `sorry`, `sorryAx`, `admit`, `axiom`, `native_decide`,
+   `bv_decide`, `trustCompiler`, or `ofReduceBool` tokens outside Lean comments/strings.
 """
 from __future__ import annotations
 
@@ -41,10 +43,12 @@ MIRRORED_FILES = (
     "LeanNative/Backend/LLVMAst/Eval.lean",
 )
 
+MIN_AUDITED_THEOREMS = 63
+
 # Pre-filter scan outside Lean comments; kernel-level enforcement is `#verify_lean_mlir_bridge_axioms`
 # (`Lean.collectAxioms` in `LeanMLIRBridge.lean`).
 FORBIDDEN_PROOF_TOKENS = re.compile(
-    r"\b(?:sorry|sorryAx|admit|axiom|native_decide|trustCompiler|ofReduceBool)\b",
+    r"\b(?:sorry|sorryAx|admit|axiom|native_decide|bv_decide|trustCompiler|ofReduceBool)\b",
     re.M,
 )
 
@@ -185,17 +189,31 @@ def check_bridge_tree(root_dir: Path, sync_mirrors: bool = False) -> dict[str, o
 
     # 4. Scan bridge proof files for forbidden tokens (outside comments) and axiom audit gate
     root_bridge_lean = bridge_root / "LeanMLIRBridge.lean"
-    if root_bridge_lean.is_file():
-        rb_raw = root_bridge_lean.read_text(encoding="utf-8")
-        if "#verify_lean_mlir_bridge_axioms" not in strip_lean_comments_and_strings(rb_raw):
+    bridged_refs: list[str] = []
+    if not root_bridge_lean.is_file():
+        errors.append(f"Missing {root_bridge_lean}")
+    else:
+        rb_stripped = strip_lean_comments_and_strings(root_bridge_lean.read_text(encoding="utf-8"))
+        if "#verify_lean_mlir_bridge_axioms" not in rb_stripped:
             errors.append("LeanMLIRBridge.lean missing `#verify_lean_mlir_bridge_axioms` gate")
+        if "Lean.collectAxioms" not in rb_stripped:
+            errors.append("LeanMLIRBridge.lean missing `Lean.collectAxioms` audit")
+        if "bridgedTheorems.Nodup" not in rb_stripped:
+            errors.append("LeanMLIRBridge.lean missing `bridgedTheorems.Nodup` uniqueness theorem")
         bridged_refs = re.findall(
-            r"``LeanMLIRBridge\.[A-Za-z0-9_?']+",
-            strip_lean_comments_and_strings(rb_raw),
+            r"``LeanMLIRBridge\.[A-Za-z0-9_?.']+",
+            rb_stripped,
         )
-        if len(bridged_refs) < 30:
+        if len(bridged_refs) != len(set(bridged_refs)):
+            seen_refs: set[str] = set()
+            dups = sorted({r for r in bridged_refs if r in seen_refs or seen_refs.add(r)})  # type: ignore[func-returns-value]
             errors.append(
-                f"LeanMLIRBridge.lean audits only {len(bridged_refs)} bridged theorems (expected >= 30)"
+                f"LeanMLIRBridge.lean contains duplicate bridged theorem references: {dups}"
+            )
+        if len(set(bridged_refs)) < MIN_AUDITED_THEOREMS:
+            errors.append(
+                f"LeanMLIRBridge.lean audits only {len(set(bridged_refs))} unique bridged theorems "
+                f"(expected >= {MIN_AUDITED_THEOREMS})"
             )
     proof_files = [
         root_bridge_lean,
@@ -215,6 +233,7 @@ def check_bridge_tree(root_dir: Path, sync_mirrors: bool = False) -> dict[str, o
     return {
         "ok": len(errors) == 0,
         "pinned_lean_mlir_rev": PINNED_LEAN_MLIR_REV,
+        "bridged_theorems_count": len(bridged_refs),
         "mirrored_files": mirror_digests,
         "proof_files_checked": len(proof_files),
         "errors": errors,
@@ -222,45 +241,93 @@ def check_bridge_tree(root_dir: Path, sync_mirrors: bool = False) -> dict[str, o
 
 
 class SelfTests(unittest.TestCase):
+    def _populate_valid_fixture(self, root: Path) -> Path:
+        for rel in MIRRORED_FILES:
+            src = ROOT_DIR / "lean" / rel
+            p1 = root / "lean" / rel
+            p2 = root / "verification" / "lean-mlir-bridge" / rel
+            p1.parent.mkdir(parents=True, exist_ok=True)
+            p2.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, p1)
+            shutil.copy2(src, p2)
+        b_root = root / "verification" / "lean-mlir-bridge"
+        for rel in PINNED_SSA_SHAS:
+            dst = b_root / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(BRIDGE_DIR / rel, dst)
+        for fn in ("lakefile.toml", "lake-manifest.json", "LeanMLIRBridge.lean"):
+            shutil.copy2(BRIDGE_DIR / fn, b_root / fn)
+        (b_root / "LeanMLIRBridge").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(
+            BRIDGE_DIR / "LeanMLIRBridge" / "Bisimulation.lean",
+            b_root / "LeanMLIRBridge" / "Bisimulation.lean",
+        )
+        return b_root
+
     def test_live_repo_passes(self) -> None:
         rep = check_bridge_tree(ROOT_DIR)
         self.assertTrue(rep["ok"], rep)
+        self.assertGreaterEqual(rep["bridged_theorems_count"], MIN_AUDITED_THEOREMS)  # type: ignore[arg-type]
 
     def test_detects_mirror_drift_and_sorry(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mlir-sync-test-") as tmp:
             root = Path(tmp)
-            for rel in MIRRORED_FILES:
-                p1 = root / "lean" / rel
-                p2 = root / "verification" / "lean-mlir-bridge" / rel
-                p1.parent.mkdir(parents=True, exist_ok=True)
-                p2.parent.mkdir(parents=True, exist_ok=True)
-                p1.write_text("def x := 1\n", encoding="utf-8")
-                p2.write_text("def x := 2\n", encoding="utf-8")
-            for rel in PINNED_SSA_SHAS:
-                src = BRIDGE_DIR / rel
-                dst = root / "verification" / "lean-mlir-bridge" / rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
-            shutil.copy2(
-                BRIDGE_DIR / "lakefile.toml",
-                root / "verification" / "lean-mlir-bridge" / "lakefile.toml",
-            )
-            shutil.copy2(
-                BRIDGE_DIR / "lake-manifest.json",
-                root / "verification" / "lean-mlir-bridge" / "lake-manifest.json",
-            )
-            b_root = root / "verification" / "lean-mlir-bridge"
-            (b_root / "LeanMLIRBridge").mkdir(parents=True, exist_ok=True)
-            (b_root / "LeanMLIRBridge.lean").write_text("import LeanMLIRBridge.Bisim\n")
-            (b_root / "LeanMLIRBridge" / "Bisim.lean").write_text(
+            b_root = self._populate_valid_fixture(root)
+            (b_root / MIRRORED_FILES[0]).write_text("def drifted := 2\n", encoding="utf-8")
+            (b_root / "LeanMLIRBridge" / "Bisimulation.lean").write_text(
                 'def msg := "string with -- sorry and axiom"\nprivate noncomputable axiom sneaky : False\n',
                 encoding="utf-8",
             )
             rep = check_bridge_tree(root)
             self.assertFalse(rep["ok"])
-            errs = "\n".join(str(e) for e in rep["errors"])
+            errs = "\n".join(str(e) for e in rep["errors"])  # type: ignore[union-attr]
             self.assertIn("Drift detected", errs)
             self.assertIn("Forbidden token `axiom`", errs)
+
+    def test_detects_bv_decide_and_missing_root_bridge(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mlir-bv-decide-test-") as tmp:
+            root = Path(tmp)
+            b_root = self._populate_valid_fixture(root)
+            (b_root / "LeanMLIRBridge.lean").unlink()
+            (b_root / "LeanMLIRBridge" / "Bisimulation.lean").write_text(
+                'def ok := "-- bv_decide in string"\ntheorem bad (x : BitVec 8) : x = x := by bv_decide\n',
+                encoding="utf-8",
+            )
+            rep = check_bridge_tree(root)
+            self.assertFalse(rep["ok"])
+            errs = "\n".join(str(e) for e in rep["errors"])  # type: ignore[union-attr]
+            self.assertIn("Missing", errs)
+            self.assertIn("LeanMLIRBridge.lean", errs)
+            self.assertIn("Forbidden token `bv_decide`", errs)
+
+    def test_rejects_duplicate_and_undercounted_bridged_theorems(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mlir-thm-ratchet-") as tmp:
+            root = Path(tmp)
+            b_root = self._populate_valid_fixture(root)
+            orig_root_lean = (BRIDGE_DIR / "LeanMLIRBridge.lean").read_text(encoding="utf-8")
+            dup_root_lean = orig_root_lean.replace(
+                "``LeanMLIRBridge.execInstrs_straightLineFusedPipeline_eq_op_denote",
+                "``LeanMLIRBridge.ofLLVMVal?_toLLVMVal",
+                1,
+            )
+            (b_root / "LeanMLIRBridge.lean").write_text(dup_root_lean, encoding="utf-8")
+            rep_dup = check_bridge_tree(root)
+            self.assertFalse(rep_dup["ok"])
+            errs_dup = "\n".join(str(e) for e in rep_dup["errors"])  # type: ignore[union-attr]
+            self.assertIn("duplicate bridged theorem references", errs_dup)
+
+            short_root_lean = (
+                "import LeanMLIRBridge.Bisimulation\nimport Lean\n"
+                "def bridgedTheorems := [``LeanMLIRBridge.ofLLVMVal?_toLLVMVal]\n"
+                "theorem bridgedTheorems_nodup : bridgedTheorems.Nodup := by decide\n"
+                "def chk := Lean.collectAxioms\n"
+                "#verify_lean_mlir_bridge_axioms\n"
+            )
+            (b_root / "LeanMLIRBridge.lean").write_text(short_root_lean, encoding="utf-8")
+            rep_short = check_bridge_tree(root)
+            self.assertFalse(rep_short["ok"])
+            errs_short = "\n".join(str(e) for e in rep_short["errors"])  # type: ignore[union-attr]
+            self.assertIn(f"expected >= {MIN_AUDITED_THEOREMS}", errs_short)
 
 
 def main() -> int:
@@ -282,7 +349,8 @@ def main() -> int:
     else:
         print(
             f"[lean-mlir-bridge-sync] ok={rep['ok']} "
-            f"rev={rep['pinned_lean_mlir_rev'][:12]} "
+            f"rev={str(rep['pinned_lean_mlir_rev'])[:12]} "
+            f"theorems={rep.get('bridged_theorems_count', 0)} "
             f"mirrors={len(rep.get('mirrored_files', {}))} "
             f"proof_files={rep.get('proof_files_checked', 0)}"
         )
