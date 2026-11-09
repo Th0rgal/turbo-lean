@@ -1544,6 +1544,62 @@ fn contains_lean_attribute_word(unquoted: &str, attrs: &[&str]) -> bool {
     false
 }
 
+const ELAB_IO_WORDS: &[&str] = &[
+    "elab",
+    "elab_rules",
+    "drun_elab",
+    "run_elab",
+    "run_cmd",
+    "run_meta",
+    "run_tac",
+    "#eval",
+    "#eval!",
+    "#guard_msgs",
+    "initialize",
+    "builtin_initialize",
+    "simproc",
+    "dsimproc",
+    "simproc_decl",
+    "dsimproc_decl",
+];
+
+const ELAB_EXEC_SEGMENTS: &[&str] = &[
+    "runTac",
+    "evalConst",
+    "evalConstCheck",
+    "evalTerm",
+    "registerBuiltinAttribute",
+    "registerTagAttribute",
+    "registerParametricAttribute",
+    "registerEnvExtension",
+    "mkEnvExtension",
+    "registerSimplePersistentEnvExtension",
+    "registerPersistentEnvExtension",
+];
+
+const ELAB_EXEC_ATTRS: &[&str] = &[
+    "command_elab",
+    "term_elab",
+    "app_elab",
+    "tactic",
+    "init",
+    "builtin_init",
+    "env_linter",
+    "package_check",
+    "cpass",
+    "user_attr",
+    "env_extension",
+    "builtin_env_extension",
+];
+
+fn unquoted_has_elab_exec_trigger(unquoted: &str) -> bool {
+    ELAB_IO_WORDS.iter().any(|w| contains_lean_word(unquoted, w))
+        || ELAB_EXEC_SEGMENTS
+            .iter()
+            .any(|w| contains_lean_ident_segment(unquoted, w))
+        || contains_lean_attribute_word(unquoted, ELAB_EXEC_ATTRS)
+}
+
 /// Returns true if `src` may execute arbitrary `IO` / `CoreM` / `CommandElabM` / `TermElabM` /
 /// `TacticM` / `evalConst` / FFI host effects during elaboration (including under `open IO`,
 /// `run_tac`, attributes like `@[env_linter]`/`@[package_check]`/`@[cpass]`, or `macro`s building
@@ -1553,73 +1609,19 @@ pub(crate) fn source_may_execute_elab_host_effects(src: &str, reject_pure_macros
     let comment_free = strip_lean_comments(src);
     let clean = strip_string_literals_inner(&comment_free, true);
     let unquoted = clean.replace(['«', '»'], "");
-    const ELAB_IO_WORDS: &[&str] = &[
-        "elab",
-        "elab_rules",
-        "drun_elab",
-        "run_elab",
-        "run_cmd",
-        "run_meta",
-        "run_tac",
-        "#eval",
-        "#eval!",
-        "#guard_msgs",
-        "initialize",
-        "builtin_initialize",
-        "simproc",
-        "dsimproc",
-        "simproc_decl",
-        "dsimproc_decl",
-    ];
-    if ELAB_IO_WORDS
-        .iter()
-        .any(|w| contains_lean_word(&unquoted, w))
-    {
-        return true;
-    }
-    const ELAB_IDENT_SEGMENTS: &[&str] = &[
-        "runTac",
-        "evalConst",
-        "evalConstCheck",
-        "evalTerm",
-        "unsafeCast",
-        "unsafeIO",
-        "unsafeBaseIO",
-        "unsafePerformIO",
-        "ptrAddrUnsafe",
-        "lcProof",
-        "registerBuiltinAttribute",
-        "registerTagAttribute",
-        "registerParametricAttribute",
-        "registerEnvExtension",
-        "mkEnvExtension",
-        "registerSimplePersistentEnvExtension",
-        "registerPersistentEnvExtension",
-    ];
-    if ELAB_IDENT_SEGMENTS
+    if unquoted_has_elab_exec_trigger(&unquoted)
+        || [
+            "unsafeCast",
+            "unsafeIO",
+            "unsafeBaseIO",
+            "unsafePerformIO",
+            "ptrAddrUnsafe",
+            "lcProof",
+        ]
         .iter()
         .any(|w| contains_lean_ident_segment(&unquoted, w))
+        || contains_lean_attribute_word(&unquoted, &["extern", "implemented_by", "csimp"])
     {
-        return true;
-    }
-    const ELAB_ATTRS: &[&str] = &[
-        "command_elab",
-        "term_elab",
-        "app_elab",
-        "tactic",
-        "init",
-        "builtin_init",
-        "extern",
-        "implemented_by",
-        "csimp",
-        "env_linter",
-        "package_check",
-        "cpass",
-        "user_attr",
-        "env_extension",
-        "builtin_env_extension",
-    ];
-    if contains_lean_attribute_word(&unquoted, ELAB_ATTRS) {
         return true;
     }
     let has_macro_decl = ["macro", "macro_rules"]
@@ -1664,8 +1666,24 @@ pub(crate) fn source_may_execute_elab_host_effects(src: &str, reject_pure_macros
     false
 }
 
-/// Returns true if `src` uses `@[extern]`, `@[implemented_by]`, or `@[csimp]` attributes
-/// (which can redirect root-package elaboration/evaluation to unverified runtime replacements).
+/// Returns true if `src` uses `@[extern]`, pure-escape `IO` (`unsafeIO` / `unsafeBaseIO` /
+/// `unsafePerformIO`), or unallowlisted `@[implemented_by]`/`@[csimp]` attributes on a
+/// root-package module.
+pub(crate) fn source_has_disallowed_root_runtime_replacement_attribute(src: &str) -> bool {
+    let comment_free = strip_lean_comments(src);
+    let clean = strip_string_literals_inner(&comment_free, true);
+    let unquoted = clean.replace(['«', '»'], "");
+    contains_lean_attribute_word(&unquoted, &["extern"])
+        || ["unsafeIO", "unsafeBaseIO", "unsafePerformIO"]
+            .iter()
+            .any(|w| contains_lean_ident_segment(&unquoted, w))
+        || (!has_nonempty_policy_env("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY")
+            && contains_lean_attribute_word(&unquoted, &["implemented_by"]))
+        || (!has_nonempty_policy_env("TURBO_LEAN_ALLOWED_CSIMP")
+            && contains_lean_attribute_word(&unquoted, &["csimp"]))
+}
+
+#[cfg(test)]
 pub(crate) fn source_has_runtime_replacement_attribute(src: &str) -> bool {
     let comment_free = strip_lean_comments(src);
     let clean = strip_string_literals_inner(&comment_free, true);
@@ -1673,23 +1691,7 @@ pub(crate) fn source_has_runtime_replacement_attribute(src: &str) -> bool {
     contains_lean_attribute_word(&unquoted, &["extern", "implemented_by", "csimp"])
 }
 
-/// Returns true if `src` may read external host state (filesystem, environment variables,
-/// subprocesses, sockets, monotonic/wall clocks, randomness, or out-of-package `include_str`)
-/// during elaboration inside a git-pinned dependency package. Pure `MetaM`/`TacticM`/`CommandElabM`
-/// metaprograms (`elab`, `macro_rules`, `simproc`, `initialize`, `@[tactic]`, `MonadEnv.getEnv`,
-/// `Lean.Server.RequestM`, `IO.Ref`, `@[implemented_by]`, `@[csimp]`, etc.) remain allowed so
-/// git-pinned dependencies such as `Mathlib`, `Batteries`, `Aesop`, `Qq`, and `ProofWidgets` can
-/// reuse verified `.olean` caches.
-pub(crate) fn source_may_read_host_state(src: &str) -> bool {
-    let comment_free = strip_lean_comments(src);
-    let clean = strip_string_literals_inner(&comment_free, true);
-    let unquoted = clean.replace(['«', '»'], "");
-    if ["#eval", "#eval!"]
-        .iter()
-        .any(|w| contains_lean_word(&unquoted, w))
-    {
-        return true;
-    }
+fn unquoted_has_host_read_tokens(comment_free: &str, unquoted: &str) -> bool {
     const QUALIFIED_HOST_READS: &[&str] = &[
         "IO.FS",
         "IO.Prim",
@@ -1714,7 +1716,7 @@ pub(crate) fn source_may_read_host_state(src: &str) -> bool {
     ];
     if QUALIFIED_HOST_READS
         .iter()
-        .any(|q| contains_lean_word(&unquoted, q) || unquoted.contains(&format!("{q}.")))
+        .any(|q| contains_lean_word(unquoted, q) || unquoted.contains(&format!("{q}.")))
     {
         return true;
     }
@@ -1742,7 +1744,7 @@ pub(crate) fn source_may_read_host_state(src: &str) -> bool {
     ];
     if HOST_READ_SEGMENTS
         .iter()
-        .any(|seg| contains_lean_ident_segment(&unquoted, seg))
+        .any(|seg| contains_lean_ident_segment(unquoted, seg))
     {
         return true;
     }
@@ -1759,11 +1761,11 @@ pub(crate) fn source_may_read_host_state(src: &str) -> bool {
     if has_open_or_ns_io_or_sys
         && ["getEnv", "Process", "rand", "getStdin", "stdin", "now"]
             .iter()
-            .any(|seg| contains_lean_ident_segment(&unquoted, seg))
+            .any(|seg| contains_lean_ident_segment(unquoted, seg))
     {
         return true;
     }
-    if contains_lean_ident_segment(&unquoted, "getEnv") {
+    if contains_lean_ident_segment(unquoted, "getEnv") {
         for (idx, _) in comment_free.match_indices("getEnv") {
             let prev_ok = idx == 0
                 || !comment_free[..idx]
@@ -1775,6 +1777,29 @@ pub(crate) fn source_may_read_host_state(src: &str) -> bool {
                 return true;
             }
         }
+    }
+    false
+}
+
+/// Returns true if `src` may read external host state (filesystem, environment variables,
+/// subprocesses, sockets, monotonic/wall clocks, randomness, or out-of-package `include_str`)
+/// during elaboration. Runtime-only `IO` definitions without an elaboration-time execution
+/// trigger (`elab`, `#eval`, `#guard_msgs`, `initialize`, `simproc`, `@[command_elab]`, etc.)
+/// remain allowed so library/CLI modules do not taint elaboration caches.
+pub(crate) fn source_may_read_host_state(src: &str) -> bool {
+    let comment_free = strip_lean_comments(src);
+    let clean = strip_string_literals_inner(&comment_free, true);
+    let unquoted = clean.replace(['«', '»'], "");
+    if ["#eval", "#eval!"]
+        .iter()
+        .any(|w| contains_lean_word(&unquoted, w))
+    {
+        return true;
+    }
+    if unquoted_has_elab_exec_trigger(&unquoted)
+        && unquoted_has_host_read_tokens(&comment_free, &unquoted)
+    {
+        return true;
     }
     for kw in ["include_str?", "include_str", "include_bin?", "include_bin"] {
         if !contains_lean_ident_segment(&unquoted, kw) {
@@ -14148,11 +14173,17 @@ public def api := by
         assert!(source_may_read_host_state(
             "def escapeInclude : String := include_str \"..\" / \"..\" / \"..\" / \"secret.txt\"\n"
         ));
-        assert!(source_may_read_host_state(
+        assert!(!source_may_read_host_state(
             "def stdinRead : IO String := do let s ← IO.getStdin; s.getLine\n"
         ));
-        assert!(source_may_read_host_state(
+        assert!(!source_may_read_host_state(
             "def nowRead : IO Unit := do let _ ← Std.Time.DateTime.now; pure ()\n"
+        ));
+        assert!(source_may_read_host_state(
+            "run_cmd do let s ← IO.getStdin; let _ ← s.getLine\n"
+        ));
+        assert!(source_may_read_host_state(
+            "initialize startTime : Std.Time.DateTime ← Std.Time.DateTime.now\n"
         ));
         assert!(source_may_execute_elab_host_effects(
             "def f : String := s!\"{unsafeCast 0}\"\n",

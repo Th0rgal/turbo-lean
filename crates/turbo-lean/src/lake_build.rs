@@ -2920,7 +2920,26 @@ fn verify_project_module_entry_and_sidecars(
     if actual_src_b3 != expected_src_blake3 {
         return false;
     }
-    if crate::splitter::source_may_execute_elab_host_effects(&src_raw, false) {
+    let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
+    let rel_slash = olean_path
+        .strip_prefix(&lib_lean_dir)
+        .unwrap_or(&olean_path)
+        .with_extension("")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let mod_name = rel_slash.replace('/', ".");
+    let has_disallowed_effects = match manifest.cfg.as_ref().and_then(|cfg| {
+        crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, &mod_name)
+            .map(|spec| (cfg, spec))
+    }) {
+        Some((cfg, spec)) => {
+            crate::module_builder::spec_source_has_disallowed_elab_host_effects(
+                cfg, &spec, &src_raw,
+            )
+        }
+        None => crate::splitter::source_may_execute_elab_host_effects(&src_raw, false),
+    };
+    if has_disallowed_effects {
         return false;
     }
     let hdr = crate::module_builder::parse_header_info(&src_raw);
@@ -2938,14 +2957,6 @@ fn verify_project_module_entry_and_sidecars(
     ) {
         return false;
     }
-    let lib_lean_dir = canon_dir.join(".lake/build/lib/lean");
-    let rel_slash = olean_path
-        .strip_prefix(&lib_lean_dir)
-        .unwrap_or(&olean_path)
-        .with_extension("")
-        .to_string_lossy()
-        .replace('\\', "/");
-    let mod_name = rel_slash.replace('/', ".");
     let needs_c = crate::module_builder::global_emit_c_enabled()
         || hdr.has_c_export
         || manifest.cfg.as_ref().is_some_and(|cfg| {
@@ -4477,23 +4488,27 @@ fn ensure_project_imports_fresh_inner(
             .to_string_lossy()
             .replace('\\', "/");
         let cur_hash = compute_cached_source_blake3(&info.dep_src);
+        let root_spec_opt = root_cfg.as_ref().and_then(|cfg| {
+            crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, &info.mod_name)
+                .map(|spec| (cfg, spec))
+        });
         let src_elab_host_effects_stale = !verify_only
             && olean_meta.is_some()
             && fs::read_to_string(&info.dep_src)
-                .map(|s| crate::splitter::source_may_execute_elab_host_effects(&s, false))
+                .map(|s| match root_spec_opt.as_ref() {
+                    Some((cfg, spec)) => {
+                        crate::module_builder::spec_source_has_disallowed_elab_host_effects(
+                            cfg, spec, &s,
+                        )
+                    }
+                    None => crate::splitter::source_may_execute_elab_host_effects(&s, false),
+                })
                 .unwrap_or(true);
 
         let opt_out = worktree_auto_link_disabled(canon_dir);
         let closure_uses_lake_inputs = opt_out
-            || match root_cfg.as_ref() {
-                Some(cfg) => crate::module_builder::resolve_module_in_package(
-                    &cfg.root_pkg,
-                    true,
-                    &info.mod_name,
-                )
-                .map_or(true, |spec| {
-                    closure_cache.module_closure_depends_on_lake_inputs(cfg, &spec)
-                }),
+            || match root_spec_opt.as_ref() {
+                Some((cfg, spec)) => closure_cache.module_closure_depends_on_lake_inputs(cfg, spec),
                 None => true,
             };
 

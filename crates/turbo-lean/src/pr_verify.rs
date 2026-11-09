@@ -18711,7 +18711,7 @@ end ParityNs
             )?;
             fs::write(
                 dep_origin.join("Dep.lean"),
-                "prelude\ndef depVal : IO (Option String) := IO.getEnv \"TURBO_DUMMY_PIN_ENV\"\n",
+                "prelude\ninitialize depEnv : Option String ← IO.getEnv \"TURBO_DUMMY_PIN_ENV\"\n",
             )?;
             // Commit a fake prebuilt `.olean` inside `.lake/build/lib/lean/` at rev1 to verify
             // `seed_trusted_statement_dependencies` strips `.git`, `.lake`, and `.olean` products.
@@ -19235,6 +19235,19 @@ end ParityNs
                 None,
                 false,
             )?;
+            // Simulate sticky `/srv/verity-ci-cache/lake-packages` where prebuilt `evmyul` `.olean`s
+            // already exist on disk (`has_any_built_olean == true`): `EvmYul/SHA256.lean`'s runtime
+            // `IO.Process.run` definition must NOT reject prebuilt `.olean` reuse.
+            let sticky_evmyul_olean =
+                canon_proj.join(".lake/packages/evmyul/.lake/build/lib/lean/EvmYul/SHA256.olean");
+            fs::create_dir_all(sticky_evmyul_olean.parent().unwrap())?;
+            fs::write(&sticky_evmyul_olean, b"sticky-marker")?;
+            let sticky_cfg = crate::module_builder::resolve_project_config(&canon_proj)?;
+            assert!(
+                !dep_package_has_disallowed_elab_host_effects(&sticky_cfg, &sticky_cfg.dep_pkgs[0]),
+                "prebuilt evmyul .oleans with runtime-only IO definitions must remain reusable"
+            );
+            fs::remove_dir_all(canon_proj.join(".lake/packages/evmyul/.lake"))?;
 
             // Advance `evmyul` to a second commit `dep_rev2` while `HEAD` still pins `dep_rev`
             // as baseline, verifying `seed_base_statement_dependencies` handles changed git revs.
