@@ -47,16 +47,47 @@ def bridgedTheorems : List Name :=
   , ``SailRiscvBridge.rv64iUtypeSpec_bisim_sail_x1
   , ``SailRiscvBridge.rv64iBtypeTakenSpec_bisim_sail
   , ``SailRiscvBridge.sailBtypeTakenCore_complement
+  , ``SailRiscvBridge.rv64iRtypewSpec_bisim_sail
+  , ``SailRiscvBridge.rv64iAddiwSpec_bisim_sail
+  , ``SailRiscvBridge.rv64iShiftIwopSpec_bisim_sail
+  , ``SailRiscvBridge.riscvMulwSpec_bisim_sail
+  , ``SailRiscvBridge.riscvDivwSpec_bisim_sail
+  , ``SailRiscvBridge.riscvDivuwSpec_bisim_sail
+  , ``SailRiscvBridge.riscvRemwSpec_bisim_sail
+  , ``SailRiscvBridge.riscvRemuwSpec_bisim_sail
+  , ``SailRiscvBridge.riscvDivRemW_euclidean
+  , ``SailRiscvBridge.rv64iJalSpec_bisim_sail
+  , ``SailRiscvBridge.rv64iJalrSpec_bisim_sail
+  , ``SailRiscvBridge.rv64iJumpTargetAlignedSpec_bisim_sail
+  , ``SailRiscvBridge.pcAccess_redirect_and_tick_bisim
+  , ``SailRiscvBridge.jal_x1_state_bisim_sail
+  , ``SailRiscvBridge.jalr_same_reg_x1_state_bisim_sail
+  , ``SailRiscvBridge.rv64Zba_bisim_sail
+  , ``SailRiscvBridge.rv64Zbs_bisim_sail
+  , ``SailRiscvBridge.rv64ZbbAluRotExt_bisim_sail
+  , ``SailRiscvBridge.rv64ZbbRev8Spec_bisim_sail
+  , ``SailRiscvBridge.rv64ZbbOrcbSpec_bisim_sail
+  , ``SailRiscvBridge.rv64ZbbClzCtz_bisim_sail
+  , ``SailRiscvBridge.rv64ZbbCpop_bisim_sail
   ]
+
+theorem bridgedTheorems_nodup : bridgedTheorems.Nodup := by
+  decide
+
+def minAuditedTheorems : Nat := 54
 
 def allowedAxioms : List Name :=
   [``propext, ``Classical.choice, ``Quot.sound]
 
 elab "#verify_sail_riscv_bridge_axioms" : command => do
   let env ← getEnv
-  if bridgedTheorems.length < 10 then
-    throwError "Expected at least 10 bridged theorems, found {bridgedTheorems.length}"
+  if bridgedTheorems.length < minAuditedTheorems then
+    throwError "Expected at least {minAuditedTheorems} bridged theorems, found {bridgedTheorems.length}"
+  let mut seen : List Name := []
   for thm in bridgedTheorems do
+    if seen.contains thm then
+      throwError "Duplicate bridged theorem {thm} in bridgedTheorems"
+    seen := thm :: seen
     let some _ := env.find? thm
       | throwError "Missing bridged theorem {thm}"
     let axs ← liftCoreM <| Lean.collectAxioms thm
