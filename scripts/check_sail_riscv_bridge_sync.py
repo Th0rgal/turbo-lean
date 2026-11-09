@@ -13,7 +13,7 @@ Verifies:
    `079463134b9c50450b8393e1566a09fc492a34d9` (`len(packages) == 2`).
 3. `SailRiscvBridge` proof modules never import heavy monolithic generated modules
    (`LeanRV64D.InstsEnd`, `LeanRV64D.Step`, `LeanRV64D.ZicsrInsts`, `LeanRV64D.RiscvExtras`, or root `import LeanRV64D`),
-   contain `#verify_sail_riscv_bridge_axioms` (>= 54 unique audited theorems via `Lean.collectAxioms`
+   contain `#verify_sail_riscv_bridge_axioms` (>= 80 unique audited theorems via `Lean.collectAxioms`
    and `bridgedTheorems.Nodup`), and contain zero `sorry`, `sorryAx`, `admit`, `axiom`, `native_decide`,
    `bv_decide`, `trustCompiler`, or `ofReduceBool` tokens outside Lean comments/strings.
 """
@@ -50,7 +50,7 @@ FORBIDDEN_IMPORTS = re.compile(
     re.M,
 )
 
-MIN_AUDITED_THEOREMS = 54
+MIN_AUDITED_THEOREMS = 80
 
 UPSTREAM_INSTSEND_REL = ".lake/packages/Lean_RV64D/LeanRV64D/InstsEnd.lean"
 PINNED_INSTSEND_SNIPPET_DIGESTS: dict[str, str] = {
@@ -91,6 +91,55 @@ PINNED_INSTSEND_SNIPPET_DIGESTS: dict[str, str] = {
     "execute_CTZW": "47beb551d2158db05ba9e401ea30fbc793c7fa825dd10307eafb8665edd6973c",
     "execute_CPOP": "dc593565e3ae94358c4a67a0969befdbde6e211a3ec038fda5c95ba9b00f6e41",
     "execute_CPOPW": "81a2ab36c9d46ee81040788401a05645b7dbddaa11f253576439a5a337398fdd",
+    "execute_LOAD": "d8fd49cd5044306e782f5f979bd4fffecab43b35c9ec1805b38b61f4c3d37d2d",
+    "execute_STORE": "e505594bb67a93d85b6f42593aef7a739435dd68dc336fbd5da31b377dd4b8e5",
+    "execute_C_NOP": "2853568cf48c19744813c7c356090ed0375f7dd83809eb7a17ed2c917dfdcc2a",
+    "execute_C_NTL": "72614379c8556fbf4e54c0bda02f5ae4028feb21e1e0ca74e631f7aa415cbc8c",
+    "execute_C_ILLEGAL": "882c8768950f55a851fe0e43dd0e4feb89a53e133d24eda793a6b0ffcb5ed0c5",
+    "execute_C_ADDI4SPN": "f7822ce06cbf11f50f8d6b6305d5a215603fd7d6796531bda533d5de81be861a",
+    "execute_C_ADDI16SP": "4f204179d6e96cccd53603589ce3ef8bad14277d10847289c4e3fa88085c93d5",
+    "execute_C_LI": "a37c639083bf5befa923b199a8d30d57038bbd1e9fdd01eb8ec4934aa527c90c",
+    "execute_C_LUI": "72037a9a6772d5b112bb87d7771f60e25af1f6ba2659aa3caee52ba25e3d125d",
+    "execute_C_ADDI": "0e1d8da845af37dc1cd923ae18c79ea2edaac0e9c3691a0b661e3a34ca430a40",
+    "execute_C_ADDIW": "0592baf6248ddbfc4b07e72f34e69b090804ea8c452c6065dcf4f15697cfef7e",
+    "execute_C_ANDI": "e176c6e4cbd56f806596d4e4eb83c9fc747118f914e2ee2c4c6371305f9f3349",
+    "execute_C_SLLI": "7c17e17a52c95cd8eb92c3b1dd1d9103bcb3aac66f594493e3efb9879a25f603",
+    "execute_C_SRLI": "9d5afed0587f534c65958b106746c14e438ab8cb396c5a72f2fece18649c614f",
+    "execute_C_SRAI": "4bd29c39742ea4d27bf3ab57f1ae345aaca92cb14e03e219e0bcb19983dc3a57",
+    "execute_C_MV": "832a651102544000ca3b04c25248d445c154917565485bdcb9552a41b3c27a28",
+    "execute_C_ADD": "9122c9402ba58e4921b8b38ebb7f5f0fb7e5b022bb24746dffbb10e6d6086d0f",
+    "execute_C_SUB": "c85610723741bbda5c9901daec476f5c6f36f0146d5b94fa7e28fc81172e9be2",
+    "execute_C_XOR": "fdd98e9d033d89c704faa970e6ae74520b2b373288c7caee9d0abc8b4483223e",
+    "execute_C_OR": "b7c98b7060ec5d41961c4e197c199a1f36233ab632435df0d0194cd8e2eeacb0",
+    "execute_C_AND": "c76784efc33567477eef844c706b0a45d59153c4251c63d49e3fd9926c2fd1f2",
+    "execute_C_ADDW": "48c8d133999bdd28af6a8b2ba26c21b3134b753be8581060bcf8541bdcdd91f4",
+    "execute_C_SUBW": "21399202108dbf4816e5d1ae1587fcb843dfd5c80dce1c77f6b211810b33c255",
+    "execute_C_LWSP": "8114355d2c94de9af7d428341e50aa04af7ff2a1e60fa45942f676a9f2019242",
+    "execute_C_LDSP": "1e499f3264288c5ac5dd9a5c3de61e6ae4d112ad312cc858798e0c16d42f696e",
+    "execute_C_LW": "5c7eed2066f704f472296d0a0f7fa2bdb32371d7a38b2111506c23062a74c937",
+    "execute_C_LD": "2a36e551616ef4736a02980546bd81b34246ac2c818e08e9f6b2f863e85b9da4",
+    "execute_C_LBU": "fdb9037816e3fc26ba8b641bc7934e23e3ede64dfefbe64f8da634b5a96badf0",
+    "execute_C_LH": "89c8841c5f0c46cab1fc3105542ff240f754cf065924bf03d02f411ff7bd9142",
+    "execute_C_LHU": "7d97c5ce4b23db7b09f67d284d432683c8137524453ec791702dbc954deb4bd1",
+    "execute_C_SWSP": "e2adf8cb7f9513b0382238feb9481a22f347eba05ae0b3d0b500bc97fe9449da",
+    "execute_C_SDSP": "7ec8316ec2daa3cb86990da291b438b9815ea31dddfdb832206a8401009a7658",
+    "execute_C_SW": "4e8ed45436c0fcb5380ae074e6547b2f18174388a9e5f5fa9876ba060f964877",
+    "execute_C_SD": "145dc25f52221acb7fbc059f2db3390c80b80b9f7bb07c8d7bc7b2d2291a6063",
+    "execute_C_SB": "2074a052e2445b0ff92304742c1a762eeeb45924a58cdcf7a408cd97b08958ff",
+    "execute_C_SH": "f431f4c2a7aa01ec045c6d72e155bcc3c2246a178556833743b9c272188e575f",
+    "execute_C_BEQZ": "799e7d48416726cf4c5652d8263ad57d6344dbde9a9ec7a03469fe939859febd",
+    "execute_C_BNEZ": "77a4e396f26db1bde6df9a926bbd2b1e5afef147af99b2585b6720daf9461ec5",
+    "execute_C_J": "1ad945d622a32f3fd83a71ebe4832852a4bf1fa197c2d8880a802541eaec507c",
+    "execute_C_JAL": "179ef89a68c9444a2218e77c5db239eac6ad2baea56964680da10c8ea3c16022",
+    "execute_C_JR": "ec4bab5c3350847a6b644162664ee10aad3016282c508037f2e71cdc48d6a536",
+    "execute_C_JALR": "d6f8b8dc0c61517119459cdef6e42199f779176a617ebd1fc8f52bb8dcde601b",
+    "execute_C_SEXT_B": "18fa5afa79303d53d0879172fa472865b5dcb745072c86cc82765b6d0de298d6",
+    "execute_C_SEXT_H": "6587bbfc867cda04824e53822feab68b5a48d6a32c64a83c74f35319a20fccb6",
+    "execute_C_ZEXT_B": "6f132c8e16022f9612fce6c6d59be7b540be18d5ecfaff8a53c4f2722ef22996",
+    "execute_C_ZEXT_H": "5f0599e12d02aacb3e76a21bb1de10f6d803f9b8b96be40c7a5a7411f8af9abc",
+    "execute_C_ZEXT_W": "f1bd5c7b1797db26bd98caa7a1a635cdca7cf31cb5a60a206f942b3ceba42c07",
+    "execute_C_NOT": "6e456c71aa8c030bf17845036775bf32ea9b1284916c73ca3e41b550d727d318",
+    "execute_C_MUL": "25dda6f4d40b1ff91578122a38247790f777adf78e2593eb8e42a4f4549a5f0b",
 }
 
 
@@ -770,7 +819,232 @@ def execute_CPOP (rs1 : regidx) (rd : regidx) : SailM ExecutionResult := do
 def execute_CPOPW (rs1 : regidx) (rd : regidx) : SailM ExecutionResult := do
   (wX_bits rd
     (to_bits (l := 64) (← (count_ones (Sail.BitVec.extractLsb (← (rX_bits rs1)) 31 0)))))
-  (pure RETIRE_SUCCESS)"""
+  (pure RETIRE_SUCCESS)
+
+def execute_LOAD (imm : (BitVec 12)) (rs1 : regidx) (rd : regidx) (is_unsigned : Bool) (width : Nat) : SailM ExecutionResult := do
+  let offset : xlenbits := (sign_extend (m := 64) imm)
+  assert (width ≤b xlen_bytes) "extensions/I/base_insts.sail:289.28-289.29"
+  match (← (vmem_read rs1 offset width (Load Data) false false false)) with
+  | .Ok data =>
+    (do
+      (wX_bits rd (extend_value is_unsigned data))
+      (pure RETIRE_SUCCESS))
+  | .Err e => (pure e)
+
+def execute_STORE (imm : (BitVec 12)) (rs2 : regidx) (rs1 : regidx) (width : Nat) : SailM ExecutionResult := do
+  let offset : xlenbits := (sign_extend (m := 64) imm)
+  assert (width ≤b xlen_bytes) "extensions/I/base_insts.sail:320.28-320.29"
+  let data ← do (pure (Sail.BitVec.extractLsb (← (rX_bits rs2)) ((width *i 8) -i 1) 0))
+  match (← (vmem_write rs1 offset width data (Store Data) false false false)) with
+  | .Ok _ => (pure RETIRE_SUCCESS)
+  | .Err e => (pure e)
+
+def execute_C_NOP (g__189 : (BitVec 6)) : ExecutionResult :=
+  RETIRE_SUCCESS
+
+def execute_C_NTL (g__188 : ntl_type) : ExecutionResult :=
+  RETIRE_SUCCESS
+
+def execute_C_ILLEGAL (_s : (BitVec 16)) : ExecutionResult :=
+  (Illegal_Instruction ())
+
+def execute_C_ADDI4SPN (rdc : cregidx) (nzimm : (BitVec 8)) : ExecutionResult :=
+  let imm : (BitVec 12) := (0b00#2 +++ (nzimm +++ 0b00#2))
+  let rd := (creg2reg_idx rdc)
+  (ExecuteAs (ITYPE (imm, sp, rd, ADDI)))
+
+def execute_C_ADDI16SP (imm : (BitVec 6)) : ExecutionResult :=
+  let imm : (BitVec 12) := (sign_extend (m := 12) (imm +++ 0x0#4))
+  (ExecuteAs (ITYPE (imm, sp, sp, ADDI)))
+
+def execute_C_LI (imm : (BitVec 6)) (rd : regidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (sign_extend (m := 12) imm)
+  (ExecuteAs (ITYPE (imm, zreg, rd, ADDI)))
+
+def execute_C_LUI (imm : (BitVec 6)) (rd : regidx) : ExecutionResult :=
+  let res : (BitVec 20) := (sign_extend (m := 20) imm)
+  (ExecuteAs (UTYPE (res, rd, LUI)))
+
+def execute_C_ADDI (imm : (BitVec 6)) (rsd : regidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (sign_extend (m := 12) imm)
+  (ExecuteAs (ITYPE (imm, rsd, rsd, ADDI)))
+
+def execute_C_ADDIW (imm : (BitVec 6)) (rsd : regidx) : ExecutionResult :=
+  (ExecuteAs (ADDIW ((sign_extend (m := 12) imm), rsd, rsd)))
+
+def execute_C_ANDI (imm : (BitVec 6)) (rsd : cregidx) : ExecutionResult :=
+  let rsd := (creg2reg_idx rsd)
+  (ExecuteAs (ITYPE ((sign_extend (m := 12) imm), rsd, rsd, ANDI)))
+
+def execute_C_SLLI (shamt : (BitVec 6)) (rsd : regidx) : ExecutionResult :=
+  (ExecuteAs (SHIFTIOP (shamt, rsd, rsd, SLLI)))
+
+def execute_C_SRLI (shamt : (BitVec 6)) (rsd : cregidx) : ExecutionResult :=
+  let rsd := (creg2reg_idx rsd)
+  (ExecuteAs (SHIFTIOP (shamt, rsd, rsd, SRLI)))
+
+def execute_C_SRAI (shamt : (BitVec 6)) (rsd : cregidx) : ExecutionResult :=
+  let rsd := (creg2reg_idx rsd)
+  (ExecuteAs (SHIFTIOP (shamt, rsd, rsd, SRAI)))
+
+def execute_C_MV (rd : regidx) (rs2 : regidx) : ExecutionResult :=
+  (ExecuteAs (RTYPE (rs2, zreg, rd, ADD)))
+
+def execute_C_ADD (rsd : regidx) (rs2 : regidx) : ExecutionResult :=
+  (ExecuteAs (RTYPE (rs2, rsd, rsd, ADD)))
+
+def execute_C_SUB (rsd : cregidx) (rs2 : cregidx) : ExecutionResult :=
+  let rsd := (creg2reg_idx rsd)
+  let rs2 := (creg2reg_idx rs2)
+  (ExecuteAs (RTYPE (rs2, rsd, rsd, SUB)))
+
+def execute_C_XOR (rsd : cregidx) (rs2 : cregidx) : ExecutionResult :=
+  let rsd := (creg2reg_idx rsd)
+  let rs2 := (creg2reg_idx rs2)
+  (ExecuteAs (RTYPE (rs2, rsd, rsd, XOR)))
+
+def execute_C_OR (rsd : cregidx) (rs2 : cregidx) : ExecutionResult :=
+  let rsd := (creg2reg_idx rsd)
+  let rs2 := (creg2reg_idx rs2)
+  (ExecuteAs (RTYPE (rs2, rsd, rsd, OR)))
+
+def execute_C_AND (rsd : cregidx) (rs2 : cregidx) : ExecutionResult :=
+  let rsd := (creg2reg_idx rsd)
+  let rs2 := (creg2reg_idx rs2)
+  (ExecuteAs (RTYPE (rs2, rsd, rsd, AND)))
+
+def execute_C_ADDW (rsd : cregidx) (rs2 : cregidx) : ExecutionResult :=
+  let rsd := (creg2reg_idx rsd)
+  let rs2 := (creg2reg_idx rs2)
+  (ExecuteAs (RTYPEW (rs2, rsd, rsd, ADDW)))
+
+def execute_C_SUBW (rsd : cregidx) (rs2 : cregidx) : ExecutionResult :=
+  let rsd := (creg2reg_idx rsd)
+  let rs2 := (creg2reg_idx rs2)
+  (ExecuteAs (RTYPEW (rs2, rsd, rsd, SUBW)))
+
+def execute_C_LWSP (uimm : (BitVec 6)) (rd : regidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) (uimm +++ 0b00#2))
+  (ExecuteAs (LOAD (imm, sp, rd, false, 4)))
+
+def execute_C_LDSP (uimm : (BitVec 6)) (rd : regidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) (uimm +++ 0b000#3))
+  (ExecuteAs (LOAD (imm, sp, rd, false, 8)))
+
+def execute_C_LW (uimm : (BitVec 5)) (rsc : cregidx) (rdc : cregidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) (uimm +++ 0b00#2))
+  let rd := (creg2reg_idx rdc)
+  let rs := (creg2reg_idx rsc)
+  (ExecuteAs (LOAD (imm, rs, rd, false, 4)))
+
+def execute_C_LD (uimm : (BitVec 5)) (rsc : cregidx) (rdc : cregidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) (uimm +++ 0b000#3))
+  let rd := (creg2reg_idx rdc)
+  let rs := (creg2reg_idx rsc)
+  (ExecuteAs (LOAD (imm, rs, rd, false, 8)))
+
+def execute_C_LBU (uimm : (BitVec 2)) (rdc : cregidx) (rsc1 : cregidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) uimm)
+  let rd := (creg2reg_idx rdc)
+  let rs1 := (creg2reg_idx rsc1)
+  (ExecuteAs (LOAD (imm, rs1, rd, true, 1)))
+
+def execute_C_LH (uimm : (BitVec 2)) (rdc : cregidx) (rsc1 : cregidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) uimm)
+  let rd := (creg2reg_idx rdc)
+  let rs1 := (creg2reg_idx rsc1)
+  (ExecuteAs (LOAD (imm, rs1, rd, false, 2)))
+
+def execute_C_LHU (uimm : (BitVec 2)) (rdc : cregidx) (rsc1 : cregidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) uimm)
+  let rd := (creg2reg_idx rdc)
+  let rs1 := (creg2reg_idx rsc1)
+  (ExecuteAs (LOAD (imm, rs1, rd, true, 2)))
+
+def execute_C_SWSP (uimm : (BitVec 6)) (rs2 : regidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) (uimm +++ 0b00#2))
+  (ExecuteAs (STORE (imm, rs2, sp, 4)))
+
+def execute_C_SDSP (uimm : (BitVec 6)) (rs2 : regidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) (uimm +++ 0b000#3))
+  (ExecuteAs (STORE (imm, rs2, sp, 8)))
+
+def execute_C_SW (uimm : (BitVec 5)) (rsc1 : cregidx) (rsc2 : cregidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) (uimm +++ 0b00#2))
+  let rs1 := (creg2reg_idx rsc1)
+  let rs2 := (creg2reg_idx rsc2)
+  (ExecuteAs (STORE (imm, rs2, rs1, 4)))
+
+def execute_C_SD (uimm : (BitVec 5)) (rsc1 : cregidx) (rsc2 : cregidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) (uimm +++ 0b000#3))
+  let rs1 := (creg2reg_idx rsc1)
+  let rs2 := (creg2reg_idx rsc2)
+  (ExecuteAs (STORE (imm, rs2, rs1, 8)))
+
+def execute_C_SB (uimm : (BitVec 2)) (rsc1 : cregidx) (rsc2 : cregidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) uimm)
+  let rs1 := (creg2reg_idx rsc1)
+  let rs2 := (creg2reg_idx rsc2)
+  (ExecuteAs (STORE (imm, rs2, rs1, 1)))
+
+def execute_C_SH (uimm : (BitVec 2)) (rsc1 : cregidx) (rsc2 : cregidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) uimm)
+  let rs1 := (creg2reg_idx rsc1)
+  let rs2 := (creg2reg_idx rsc2)
+  (ExecuteAs (STORE (imm, rs2, rs1, 2)))
+
+def execute_C_BEQZ (imm : (BitVec 8)) (rs : cregidx) : ExecutionResult :=
+  (ExecuteAs (BTYPE ((sign_extend (m := 13) (imm +++ 0#1)), zreg, (creg2reg_idx rs), BEQ)))
+
+def execute_C_BNEZ (imm : (BitVec 8)) (rs : cregidx) : ExecutionResult :=
+  (ExecuteAs (BTYPE ((sign_extend (m := 13) (imm +++ 0#1)), zreg, (creg2reg_idx rs), BNE)))
+
+def execute_C_J (imm : (BitVec 11)) : ExecutionResult :=
+  (ExecuteAs (JAL ((sign_extend (m := 21) (imm +++ 0#1)), zreg)))
+
+def execute_C_JAL (imm : (BitVec 11)) : ExecutionResult :=
+  (ExecuteAs (JAL ((sign_extend (m := 21) (imm +++ 0#1)), ra)))
+
+def execute_C_JR (rs1 : regidx) : ExecutionResult :=
+  (ExecuteAs (JALR ((zeros (n := 12)), rs1, zreg)))
+
+def execute_C_JALR (rs1 : regidx) : ExecutionResult :=
+  (ExecuteAs (JALR ((zeros (n := 12)), rs1, ra)))
+
+def execute_C_SEXT_B (rsdc : cregidx) : ExecutionResult :=
+  let rsd := (creg2reg_idx rsdc)
+  (ExecuteAs (ZBB_EXTOP (rsd, rsd, SEXTB)))
+
+def execute_C_SEXT_H (rsdc : cregidx) : ExecutionResult :=
+  let rsd := (creg2reg_idx rsdc)
+  (ExecuteAs (ZBB_EXTOP (rsd, rsd, SEXTH)))
+
+def execute_C_ZEXT_B (rsdc : cregidx) : SailM ExecutionResult := do
+  let rsd := (creg2reg_idx rsdc)
+  (wX_bits rsd (zero_extend (m := 64) (Sail.BitVec.extractLsb (← (rX_bits rsd)) 7 0)))
+  (pure RETIRE_SUCCESS)
+
+def execute_C_ZEXT_H (rsdc : cregidx) : ExecutionResult :=
+  let rsd := (creg2reg_idx rsdc)
+  (ExecuteAs (ZBB_EXTOP (rsd, rsd, ZEXTH)))
+
+def execute_C_ZEXT_W (rsdc : cregidx) : ExecutionResult :=
+  let rsd := (creg2reg_idx rsdc)
+  (ExecuteAs (ZBA_RTYPEUW (zreg, rsd, rsd, 0b00#2)))
+
+def execute_C_NOT (rsdc : cregidx) : SailM ExecutionResult := do
+  let r := (creg2reg_idx rsdc)
+  (wX_bits r (Complement.complement (← (rX_bits r))))
+  (pure RETIRE_SUCCESS)
+
+def execute_C_MUL (rsdc : cregidx) (rsc2 : cregidx) : ExecutionResult :=
+  let rd := (creg2reg_idx rsdc)
+  let rs := (creg2reg_idx rsc2)
+  (ExecuteAs
+    (MUL
+      (rs, rd, rd, { result_part := Low
+                     signed_rs1 := Signed
+                     signed_rs2 := Signed })))"""
 
 SYNTHETIC_INSTSEND_TEXT = "\n\n".join(
     [

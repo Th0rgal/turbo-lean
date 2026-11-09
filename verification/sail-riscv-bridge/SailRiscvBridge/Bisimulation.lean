@@ -7,6 +7,10 @@ import LeanRV64D.Arithmetic
 import LeanRV64D.MextInsts
 import LeanRV64D.Regs
 import LeanRV64D.PcAccess
+import LeanRV64D.Types
+import LeanRV64D.AddrChecks
+import LeanRV64D.SplitAccessUtils
+import LeanRV64D.PhysMemInterface
 
 /-!
 # Stage 3E / Milestone `M5` RV64 Formal Bisimulation against `opencompl/sail-riscv-lean`
@@ -15,11 +19,12 @@ Bridges `TurboLean.PolicyGates` (`riscvDivU64Spec`, `riscvRemU64Spec`), RV64M 64
 word multiplication/division/remainder (`MUL`, `MULH`, `MULHSU`, `MULHU`, `MULW`, `DIV`, `DIVU`,
 `REM`, `REMU`, `DIVW`, `DIVUW`, `REMW`, `REMUW`), `LeanNative.IR` Zbc carryless multiplication
 (`clmul64`, `clmul64Hi`, `CLMULR`, and $\mathbb{F}_2[x]$ commutativity), the RV64I base & `*W`
-ALU/shift/`LUI`/`AUIPC`/branch/`JAL`/`JALR` fragment, and RV64 Zba/Zbb/Zbs bit-manipulation
-instructions directly against upstream `opencompl/sail-riscv-lean` (`Lean_RV64D` + `Sail`) on
-`leanprover/lean4:v4.29.0`, avoiding monolithic `LeanRV64D.InstsEnd` / `LeanRV64D.Step` /
-`LeanRV64D.ZicsrInsts` / `LeanRV64D.RiscvExtras` imports so incremental elaboration stays
-lightweight and axiom-clean.
+ALU/shift/`LUI`/`AUIPC`/branch/`JAL`/`JALR` fragment, RV64 Zba/Zbb/Zbs bit-manipulation
+instructions, RV64I Load/Store memory (`LB`/`LBU`/`LH`/`LHU`/`LW`/`LWU`/`LD` & `SB`/`SH`/`SW`/`SD`),
+and RVC compressed (`Zca` / `Zcb` / RV64C) instructions directly against upstream
+`opencompl/sail-riscv-lean` (`Lean_RV64D` + `Sail`) on `leanprover/lean4:v4.29.0`, avoiding
+monolithic `LeanRV64D.InstsEnd` / `LeanRV64D.Step` / `LeanRV64D.ZicsrInsts` /
+`LeanRV64D.RiscvExtras` imports so incremental elaboration stays lightweight and axiom-clean.
 -/
 
 namespace SailRiscvBridge
@@ -2863,5 +2868,1220 @@ theorem rv64ZbbCpop_bisim_sail (rs1_val : BitVec 64)
     rw [h32]
     dsimp [rv64ZbbCpopwSpec]
     rw [to_bits_truncate_eq_ofInt, BitVec.ofInt_natCast]
+
+/-! ## 12. RV64I Load/Store Memory Fragment (`LB`/`LBU`/`LH`/`LHU`/`LW`/`LWU`/`LD` & `SB`/`SH`/`SW`/`SD`) -/
+
+/-- Pure `TurboLean`-side RV64I effective data address calculation (`rs1_val + sext(imm12)`). -/
+def rv64iEffectiveAddrSpec (rs1_val : BitVec 64) (imm : BitVec 12) : BitVec 64 :=
+  rs1_val + imm.signExtend 64
+
+/-- Pure `TurboLean`-side natural alignment predicate for RV64I memory accesses. -/
+def rv64iAlignedAddrSpec (addr : BitVec 64) (width : Nat) : Bool :=
+  addr.toNat % width == 0
+
+/-- Exact upstream Sail `extend_value` functional core (`LeanRV64D/BaseInsts.lean`, lines 496–499):
+    zero-extends when `is_unsigned = true` (`LBU`/`LHU`/`LWU`) and sign-extends otherwise
+    (`LB`/`LH`/`LW`/`LD`). -/
+def sailExtendValueCore {w : Nat} (is_unsigned : Bool) (value : BitVec w) : BitVec 64 :=
+  if is_unsigned then zero_extend (m := 64) value else sign_extend (m := 64) value
+
+/-- Pure `TurboLean`-side RV64I load extension specification across any bit-width `w`. -/
+def rv64iLoadExtendSpec {w : Nat} (is_unsigned : Bool) (value : BitVec w) : BitVec 64 :=
+  if is_unsigned then value.zeroExtend 64 else value.signExtend 64
+
+/-- Exact upstream Sail `execute_STORE` data-slicing core (`LeanRV64D/InstsEnd.lean`, line 67367)
+    specialized to any positive byte-width `width`: `Sail.BitVec.extractLsb rs2_val ((width *i 8) -i 1) 0`. -/
+def sailStoreDataCore (width : Nat) (hw : 0 < width) (rs2_val : BitVec 64) : BitVec (8 * width) :=
+  have hlen : (((Int.ofNat width *i 8) -i 1) -i 0 +i 1).toNat = 8 * width := by
+    change (((width : Int) * 8 - 1) - 0 + 1).toNat = 8 * width
+    omega
+  hlen ▸ Sail.BitVec.extractLsb rs2_val ((Int.ofNat width *i 8) -i 1) 0
+
+/-- Pure `TurboLean`-side RV64I store-data truncation specification (`rs2_val.truncate (8 * width)`). -/
+def rv64iStoreTruncateSpec (width : Nat) (rs2_val : BitVec 64) : BitVec (8 * width) :=
+  rs2_val.truncate (8 * width)
+
+/-- Pure little-endian assembly of `width` consecutive bytes starting at `addr.toNat` in
+    `SequentialState.mem`, matching `Sail.ConcurrencyInterfaceV1.PreSail.readBytes`. -/
+def rv64ReadMemBytesSpec : (width : Nat) → Nat → Std.ExtHashMap Nat (BitVec 8) → Option (BitVec (8 * width))
+  | 0, _, _ => some 0#0
+  | 1, addr, mem =>
+    match mem[addr]? with
+    | some b =>
+      have h : 8 * 1 = 8 := rfl
+      some (h ▸ b)
+    | none => none
+  | n + 1, addr, mem =>
+    match mem[addr]?, rv64ReadMemBytesSpec n (addr + 1) mem with
+    | some b, some hi =>
+      have h : 8 * n + 8 = 8 * (n + 1) := by omega
+      some (h ▸ hi.append b)
+    | _, _ => none
+
+/-- Pure little-endian decomposition writing `width` bytes of `data` into `mem` at `addr .. addr + width - 1`. -/
+def rv64WriteMemBytesSpec (width : Nat) (addr : Nat) (data : BitVec (8 * width))
+    (mem : Std.ExtHashMap Nat (BitVec 8)) : Std.ExtHashMap Nat (BitVec 8) :=
+  (List.ofFn (fun i : Fin width => (addr + i.val, data.extractLsb' (8 * i.val) 8))).foldl
+    (fun m (a, v) => m.insert a v) mem
+
+/-- Exact upstream Sail `execute_LOAD` monadic pipeline (`LeanRV64D/InstsEnd.lean`, lines 69237–69245)
+    over flat physical RAM (`ext_data_get_addr` → `read_ram Read_plain` → `extend_value` → `wX_bits`). -/
+def sailLoadRamExec (imm : BitVec 12) (rs1 rd : regidx) (is_unsigned : Bool) (width : Nat) :
+    SailM ExecutionResult := do
+  let offset : xlenbits := sign_extend (m := 64) imm
+  PreSail.assert (width ≤b Functions.xlen_bytes) "extensions/I/base_insts.sail:289.28-289.29"
+  match (← ext_data_get_addr rs1 offset (.Load .Data) width) with
+  | .Ext_DataAddr_OK (.Virtaddr vaddr) =>
+    let (data, _) ← LeanRV64D.Functions.read_ram .Read_plain (.Physaddr vaddr) width false
+    wX_bits rd (sailExtendValueCore is_unsigned data)
+    pure (.Retire_Success ())
+  | .Ext_DataAddr_Error e => pure (.Ext_DataAddr_Check_Failure e)
+
+/-- Exact upstream Sail `execute_STORE` monadic pipeline (`LeanRV64D/InstsEnd.lean`, lines 67364–67370)
+    over flat physical RAM (`ext_data_get_addr` → `extractLsb` → `write_ram Write_plain`). -/
+def sailStoreRamExec (imm : BitVec 12) (rs2 rs1 : regidx) (width : Nat) (hw : 0 < width) :
+    SailM ExecutionResult := do
+  let offset : xlenbits := sign_extend (m := 64) imm
+  PreSail.assert (width ≤b Functions.xlen_bytes) "extensions/I/base_insts.sail:320.28-320.29"
+  let data : BitVec (8 * width) := sailStoreDataCore width hw (← rX_bits rs2)
+  match (← ext_data_get_addr rs1 offset (.Store .Data) width) with
+  | .Ext_DataAddr_OK (.Virtaddr vaddr) =>
+    let _ ← LeanRV64D.Functions.write_ram .Write_plain (.Physaddr vaddr) width data ()
+    pure (.Retire_Success ())
+  | .Ext_DataAddr_Error e => pure (.Ext_DataAddr_Check_Failure e)
+
+/-- Monadic bisimulation for upstream `LeanRV64D.Functions.ext_data_get_addr` (`AddrChecks.lean`,
+    lines 228–230) on `x2` (`sp`): computes `Ext_DataAddr_OK (Virtaddr (rs1_val + sext(imm12)))`
+    without mutating machine state. -/
+theorem rv64iEffectiveAddr_ext_data_get_addr_bisim (rs1_val : BitVec 64) (imm : BitVec 12)
+    (acc : MemoryAccessType mem_payload) (width : Nat)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hrs1 : s.regs.get? .x2 = some rs1_val) :
+    (ext_data_get_addr sp (sign_extend (m := 64) imm) acc width).run s =
+      .ok (.Ext_DataAddr_OK (.Virtaddr (rv64iEffectiveAddrSpec rs1_val imm))) s := by
+  unfold ext_data_get_addr rv64iEffectiveAddrSpec sp
+  simp [rX_bits, rX, regval_from_reg, zero_extend, Sail.BitVec.zeroExtend,
+    sign_extend, Sail.BitVec.signExtend, Sail.BitVec.toNatInt,
+    readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+  dsimp [EStateM.bind, EStateM.get, EStateM.pure, EStateM.run]
+  rw [hrs1]
+  rfl
+
+/-- Upstream `is_aligned_vaddr` and `is_aligned_paddr` (`SplitAccessUtils.lean`, lines 220–228)
+    and `width_enc_backwards` (`Types.lean`, lines 888–894) agree with `addr.toNat % width == 0`
+    across every access width (in particular all RV64I widths `1, 2, 4, 8`). -/
+theorem rv64iAlignedAddr_bisim_sail (addr : BitVec 64) (width : Nat) :
+    is_aligned_vaddr (.Virtaddr addr) width = rv64iAlignedAddrSpec addr width ∧
+      is_aligned_paddr (.Physaddr addr) width = rv64iAlignedAddrSpec addr width ∧
+      width_enc_backwards 0b00#2 = 1 ∧
+      width_enc_backwards 0b01#2 = 2 ∧
+      width_enc_backwards 0b10#2 = 4 ∧
+      width_enc_backwards 0b11#2 = 8 := by
+  have halign : ((Int.tmod (Sail.BitVec.toNatInt addr) (Int.ofNat width)) == 0) =
+      (addr.toNat % width == 0) := by
+    unfold Sail.BitVec.toNatInt
+    have htmod : Int.tmod (Int.ofNat addr.toNat) (Int.ofNat width) = Int.ofNat (addr.toNat % width) := rfl
+    rw [htmod]
+    apply Bool.eq_iff_iff.mpr
+    simp only [beq_iff_eq]
+    exact ⟨Int.ofNat.inj, congrArg Int.ofNat⟩
+  refine ⟨?_, ?_, rfl, rfl, rfl, rfl⟩
+  · unfold is_aligned_vaddr rv64iAlignedAddrSpec
+    exact halign
+  · unfold is_aligned_paddr rv64iAlignedAddrSpec
+    exact halign
+
+/-- RV64I load-extension bisimulation (`LB`/`LBU`, `LH`/`LHU`, `LW`/`LWU`, `LD`) plus 64-bit
+    `LD` identity (`extend_value false v64 = v64` and `extend_value true v64 = v64`). -/
+theorem rv64iLoadExtend_bisim_sail (is_unsigned : Bool)
+    (b8 : BitVec 8) (b16 : BitVec 16) (b32 : BitVec 32) (b64 : BitVec 64) :
+    rv64iLoadExtendSpec is_unsigned b8 = sailExtendValueCore is_unsigned b8 ∧
+      rv64iLoadExtendSpec is_unsigned b16 = sailExtendValueCore is_unsigned b16 ∧
+      rv64iLoadExtendSpec is_unsigned b32 = sailExtendValueCore is_unsigned b32 ∧
+      rv64iLoadExtendSpec is_unsigned b64 = b64 ∧
+      sailExtendValueCore is_unsigned b64 = b64 := by
+  cases is_unsigned <;> simp [rv64iLoadExtendSpec, sailExtendValueCore,
+    zero_extend, Sail.BitVec.zeroExtend, sign_extend, Sail.BitVec.signExtend]
+
+/-- RV64I store-truncation bisimulation across `SB` (`width = 1`), `SH` (`width = 2`),
+    `SW` (`width = 4`), and `SD` (`width = 8`): Sail's `extractLsb rs2_val ((width *i 8) -i 1) 0`
+    equals `rs2_val.truncate (8 * width)`. -/
+theorem rv64iStoreTruncate_bisim_sail (rs2_val : BitVec 64) :
+    rv64iStoreTruncateSpec 1 rs2_val = sailStoreDataCore 1 (by decide) rs2_val ∧
+      rv64iStoreTruncateSpec 2 rs2_val = sailStoreDataCore 2 (by decide) rs2_val ∧
+      rv64iStoreTruncateSpec 4 rs2_val = sailStoreDataCore 4 (by decide) rs2_val ∧
+      rv64iStoreTruncateSpec 8 rs2_val = sailStoreDataCore 8 (by decide) rs2_val := by
+  refine ⟨?_, ?_, ?_, ?_⟩ <;>
+  · unfold rv64iStoreTruncateSpec sailStoreDataCore Sail.BitVec.extractLsb
+    dsimp only
+    apply BitVec.eq_of_getLsbD_eq
+    intro i _
+    simp [BitVec.extractLsb]
+
+private theorem writeBytes_run_eq_spec {n : Nat} (addr : Nat) (val : BitVec (8 * n))
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    ((PreSail.writeBytes addr val : SailM Bool).run s) =
+      .ok true { s with mem := rv64WriteMemBytesSpec n addr val s.mem } := by
+  unfold PreSail.writeBytes rv64WriteMemBytesSpec
+  generalize (List.ofFn (fun i : Fin n => (addr + i.val, val.extractLsb' (8 * i.val) 8))) = pairs
+  induction pairs generalizing s with
+  | nil => rfl
+  | cons hd tl ih =>
+    rcases hd with ⟨a, b⟩
+    dsimp [List.forM, List.foldl, PreSail.writeByte, modify, modifyGet, MonadStateOf.modifyGet,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.modifyGet, EStateM.pure, EStateM.run]
+    exact ih { s with mem := s.mem.insert a b }
+
+private theorem readByte_run_of_get? (addr : Nat) (b : BitVec 8)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hm : s.mem[addr]? = some b) :
+    ((PreSail.readByte addr : SailM (BitVec 8)).run s) = .ok b s := by
+  unfold PreSail.readByte
+  dsimp [get, getThe, MonadStateOf.get, Bind.bind, Pure.pure,
+    EStateM.bind, EStateM.get, EStateM.pure, EStateM.throw, EStateM.run]
+  rw [hm]
+  rfl
+
+private theorem readBytes_run_of_spec_some :
+    ∀ (n addr : Nat) (s : SequentialState RegisterType trivialChoiceSource) (bytes : BitVec (8 * n)),
+      rv64ReadMemBytesSpec n addr s.mem = some bytes →
+      ((PreSail.readBytes n addr : SailM (BitVec (8 * n) × Option Bool)).run s) = .ok (bytes, none) s
+  | 0, addr, s, bytes, h => by
+    simp only [rv64ReadMemBytesSpec, Option.some.injEq] at h
+    subst h
+    rfl
+  | 1, addr, s, bytes, h => by
+    simp only [rv64ReadMemBytesSpec] at h
+    cases hm : s.mem[addr]? with
+    | none => simp [hm] at h
+    | some b =>
+      simp only [hm, Option.some.injEq] at h
+      subst h
+      have hb := readByte_run_of_get? addr b s hm
+      unfold PreSail.readBytes
+      dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hb ⊢
+      rw [hb]
+  | n + 2, addr, s, bytes, h => by
+    simp only [rv64ReadMemBytesSpec] at h
+    cases hm : s.mem[addr]? with
+    | none => simp [hm] at h
+    | some b =>
+      cases hr : rv64ReadMemBytesSpec (n + 1) (addr + 1) s.mem with
+      | none => simp [hm, hr] at h
+      | some hi =>
+        simp only [hm, hr, Option.some.injEq] at h
+        subst h
+        have ih := readBytes_run_of_spec_some (n + 1) (addr + 1) s hi hr
+        have hb := readByte_run_of_get? addr b s hm
+        change (EStateM.bind (PreSail.readByte addr) fun b' =>
+          EStateM.bind (PreSail.readBytes (n + 1) (addr + 1)) fun __discr =>
+            EStateM.pure (__discr.fst +++ b', __discr.snd)) s = .ok (hi +++ b, none) s
+        dsimp [EStateM.bind, EStateM.pure, EStateM.run] at hb ih ⊢
+        rw [hb]
+        dsimp only
+        rw [ih]
+
+/-- Monadic bisimulation for upstream `LeanRV64D.Functions.write_ram` (`PhysMemInterface.lean`,
+    lines 303–338) in `.Write_plain` mode: updates `SequentialState.mem` in little-endian byte order
+    via `rv64WriteMemBytesSpec` and returns `true`. -/
+theorem write_ram_plain_bisim_sail (width : Nat) (paddr : BitVec 64) (data : BitVec (8 * width))
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    (LeanRV64D.Functions.write_ram .Write_plain (.Physaddr paddr) width data ()).run s =
+      .ok true { s with mem := rv64WriteMemBytesSpec width paddr.toNat data s.mem } := by
+  have hw := writeBytes_run_eq_spec paddr.toNat data s
+  unfold LeanRV64D.Functions.write_ram LeanRV64D.ConcurrencyInterfaceV1.sail_mem_write
+    PreSail.sail_mem_write __WriteRAM_Meta
+  dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hw ⊢
+  rw [hw]
+  rfl
+
+/-- Monadic bisimulation for upstream `LeanRV64D.Functions.read_ram` (`PhysMemInterface.lean`,
+    lines 346–381) in `.Read_plain` mode: reassembles `width` little-endian bytes from
+    `SequentialState.mem` without mutating state whenever all target byte addresses are mapped. -/
+theorem read_ram_plain_bisim_sail (width : Nat) (paddr : BitVec 64) (bytes : BitVec (8 * width))
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hmem : rv64ReadMemBytesSpec width paddr.toNat s.mem = some bytes) :
+    (LeanRV64D.Functions.read_ram .Read_plain (.Physaddr paddr) width false).run s =
+      .ok (bytes, ()) s := by
+  have hr := readBytes_run_of_spec_some width paddr.toNat s bytes hmem
+  unfold LeanRV64D.Functions.read_ram LeanRV64D.ConcurrencyInterfaceV1.sail_mem_read
+    PreSail.sail_mem_read default_meta
+  dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hr ⊢
+  rw [hr]
+  rfl
+
+private theorem wX_bits_ra_run (val : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    (wX_bits ra val).run s = .ok () { s with regs := s.regs.insert .x1 val } := by
+  unfold ra
+  simp [wX_bits, wX, regval_into_reg, xreg_write_callback, reg_name_forwards,
+    encdec_reg_forwards_matches, encdec_reg_forwards, get_config_use_abi_names,
+    LeanRV64D.Functions.not, reg_arch_name_raw_forwards, xreg_full_write_callback,
+    zero_extend, Sail.BitVec.zeroExtend, Sail.BitVec.toNatInt, to_bits, get_slice_int,
+    writeReg, PreSail.writeReg, modify, modifyGet, MonadStateOf.modifyGet]
+  rfl
+
+private theorem rX_bits_ra_run (val : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hx1 : s.regs.get? .x1 = some val) :
+    (rX_bits ra).run s = .ok val s := by
+  unfold ra
+  simp [rX_bits, rX, regval_from_reg, zero_extend, Sail.BitVec.zeroExtend, Sail.BitVec.toNatInt,
+    readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+  dsimp [EStateM.bind, EStateM.get, EStateM.pure, EStateM.run]
+  rw [hx1]
+  rfl
+
+/-- End-to-end `SailM` bisimulation for RV64I `execute_STORE` (`SB`/`SH`/`SW`/`SD`) over flat
+    physical RAM (`rs1 = sp`, `rs2 = ra`): truncates `rs2_val` to `8 * width` bits and commits
+    little-endian bytes at `rs1_val + sext(imm)` without mutating architectural registers. -/
+theorem sailStoreRamExec_sp_ra_bisim (imm : BitVec 12) (width : Nat)
+    (hw : 0 < width) (hmax : (width ≤b Functions.xlen_bytes) = true)
+    (rs1_val rs2_val : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hrs1 : s.regs.get? .x2 = some rs1_val)
+    (hrs2 : s.regs.get? .x1 = some rs2_val) :
+    (sailStoreRamExec imm ra sp width hw).run s =
+      .ok (.Retire_Success ())
+        { s with mem := (rv64WriteMemBytesSpec width
+            (BitVec.toNat (rv64iEffectiveAddrSpec rs1_val imm))
+            (sailStoreDataCore width hw rs2_val) s.mem) } := by
+  have hassert : (PreSail.assert (width ≤b Functions.xlen_bytes)
+      "extensions/I/base_insts.sail:320.28-320.29" : SailM Unit).run s = .ok () s := by
+    unfold PreSail.assert
+    rw [hmax]
+    rfl
+  have hr2 := rX_bits_ra_run rs2_val s hrs2
+  have haddr := rv64iEffectiveAddr_ext_data_get_addr_bisim rs1_val imm (.Store .Data) width s hrs1
+  have hwrite := write_ram_plain_bisim_sail width (rv64iEffectiveAddrSpec rs1_val imm)
+    (sailStoreDataCore width hw rs2_val) s
+  unfold sailStoreRamExec
+  dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hassert hr2 haddr hwrite ⊢
+  rw [hassert]
+  dsimp only
+  rw [hr2]
+  dsimp only
+  rw [haddr]
+  dsimp [EStateM.bind]
+  rw [hwrite]
+  rfl
+
+/-- End-to-end `SailM` bisimulation for RV64I `execute_LOAD` (`LB`/`LBU`/`LH`/`LHU`/`LW`/`LWU`/`LD`)
+    over flat physical RAM (`rs1 = sp`, `rd = ra`): reads `width` little-endian bytes from
+    `rs1_val + sext(imm)` and writes `rv64iLoadExtendSpec is_unsigned bytes` into `x1`. -/
+theorem sailLoadRamExec_sp_ra_bisim (imm : BitVec 12) (is_unsigned : Bool) (width : Nat)
+    (hmax : (width ≤b Functions.xlen_bytes) = true)
+    (rs1_val : BitVec 64) (bytes : BitVec (8 * width))
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hrs1 : s.regs.get? .x2 = some rs1_val)
+    (hmem : rv64ReadMemBytesSpec width (BitVec.toNat (rv64iEffectiveAddrSpec rs1_val imm)) s.mem = some bytes) :
+    (sailLoadRamExec imm sp ra is_unsigned width).run s =
+      .ok (.Retire_Success ())
+        ({ s with regs := s.regs.insert .x1 (rv64iLoadExtendSpec is_unsigned bytes) }) := by
+  have hassert : (PreSail.assert (width ≤b Functions.xlen_bytes)
+      "extensions/I/base_insts.sail:289.28-289.29" : SailM Unit).run s = .ok () s := by
+    unfold PreSail.assert
+    rw [hmax]
+    rfl
+  have haddr := rv64iEffectiveAddr_ext_data_get_addr_bisim rs1_val imm (.Load .Data) width s hrs1
+  have hread := read_ram_plain_bisim_sail width (rv64iEffectiveAddrSpec rs1_val imm) bytes s hmem
+  have hext : sailExtendValueCore is_unsigned bytes = rv64iLoadExtendSpec is_unsigned bytes := by
+    cases is_unsigned <;> simp [sailExtendValueCore, rv64iLoadExtendSpec,
+      zero_extend, Sail.BitVec.zeroExtend, sign_extend, Sail.BitVec.signExtend]
+  have hw1 := wX_bits_ra_run (rv64iLoadExtendSpec is_unsigned bytes) s
+  unfold sailLoadRamExec
+  dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hassert haddr hread hw1 ⊢
+  rw [hassert]
+  dsimp only
+  rw [haddr]
+  dsimp [EStateM.bind]
+  rw [hread]
+  dsimp only
+  rw [hext, hw1]
+  rfl
+
+/-- Little-endian byte roundtrip for `SB` (`width = 1`): reading 1 byte after writing 1 byte at the
+    same address recovers the exact stored byte. -/
+theorem rv64StoreLoadBytes_roundtrip_1 (addr : Nat) (b : BitVec 8)
+    (mem : Std.ExtHashMap Nat (BitVec 8)) :
+    rv64ReadMemBytesSpec 1 addr (rv64WriteMemBytesSpec 1 addr b mem) = some b := by
+  have hb : b.extractLsb' 0 8 = b := by
+    apply BitVec.eq_of_getLsbD_eq
+    intro i hi
+    simp [hi]
+  simp [rv64WriteMemBytesSpec, rv64ReadMemBytesSpec, hb]
+
+private theorem extHashMap_getElem?_insert_ne (m : Std.ExtHashMap Nat (BitVec 8))
+    (k k' : Nat) (v : BitVec 8) (hne : k ≠ k') :
+    (m.insert k v)[k']? = m[k']? := by
+  rw [Std.ExtHashMap.getElem?_insert, beq_false_of_ne hne]
+  rfl
+
+/-- Little-endian byte roundtrip for `SH` (`width = 2`): reading 2 bytes after writing 2 bytes at
+    `addr .. addr + 1` reassembles the exact 16-bit halfword. -/
+theorem rv64StoreLoadBytes_roundtrip_2 (addr : Nat) (val : BitVec 16)
+    (mem : Std.ExtHashMap Nat (BitVec 8)) :
+    rv64ReadMemBytesSpec 2 addr (rv64WriteMemBytesSpec 2 addr val mem) = some val := by
+  simp only [rv64WriteMemBytesSpec, rv64ReadMemBytesSpec, List.ofFn, Fin.foldr, Fin.foldr.loop,
+    List.foldl, Nat.add_zero]
+  rw [extHashMap_getElem?_insert_ne _ _ _ _ (by omega),
+    Std.ExtHashMap.getElem?_insert_self, Std.ExtHashMap.getElem?_insert_self]
+  dsimp only
+  congr 1
+  apply BitVec.eq_of_getLsbD_eq
+  intro i hi
+  simp only [BitVec.append_eq, BitVec.getLsbD_append]
+  by_cases h8 : i < 8
+  · simp [h8]
+  · have hlt : i - 8 < 8 := by omega
+    have hadd : 8 * 1 + (i - 8) = i := by omega
+    simp [h8, hlt, hadd]
+
+/-- Little-endian byte roundtrip for `SW` (`width = 4`): reading 4 bytes after writing 4 bytes at
+    `addr .. addr + 3` reassembles the exact 32-bit word. -/
+theorem rv64StoreLoadBytes_roundtrip_4 (addr : Nat) (val : BitVec 32)
+    (mem : Std.ExtHashMap Nat (BitVec 8)) :
+    rv64ReadMemBytesSpec 4 addr (rv64WriteMemBytesSpec 4 addr val mem) = some val := by
+  simp only [rv64WriteMemBytesSpec, rv64ReadMemBytesSpec, List.ofFn, Fin.foldr, Fin.foldr.loop,
+    List.foldl, Nat.add_zero, Nat.add_assoc]
+  repeat first
+    | rw [Std.ExtHashMap.getElem?_insert_self]
+    | rw [extHashMap_getElem?_insert_ne _ _ _ _ (by omega)]
+  dsimp only
+  congr 1
+  apply BitVec.eq_of_getLsbD_eq
+  intro i hi
+  simp only [BitVec.append_eq, BitVec.getLsbD_append]
+  rcases (show i < 8 ∨ (8 ≤ i ∧ i < 16) ∨ (16 ≤ i ∧ i < 24) ∨ (24 ≤ i ∧ i < 32) by omega) with
+    h | ⟨_, _⟩ | ⟨_, _⟩ | ⟨_, _⟩
+  · simp [h]
+  · have h0 : ¬(i < 8) := by omega
+    have h1 : i - 8 < 8 := by omega
+    have ha : 8 * 1 + (i - 8) = i := by omega
+    simp [h0, h1, ha]
+  · have h0 : ¬(i < 8) := by omega
+    have h1 : ¬(i - 8 < 8) := by omega
+    have h2 : i - 8 - 8 < 8 := by omega
+    have ha : 8 * 2 + (i - 8 - 8) = i := by omega
+    simp [h0, h1, h2, ha]
+  · have h0 : ¬(i < 8) := by omega
+    have h1 : ¬(i - 8 < 8) := by omega
+    have h2 : ¬(i - 8 - 8 < 8) := by omega
+    have h3 : i - 8 - 8 - 8 < 8 := by omega
+    have ha : 8 * 3 + (i - 8 - 8 - 8) = i := by omega
+    simp [h0, h1, h2, h3, ha]
+
+/-- Little-endian byte roundtrip for `SD` (`width = 8`): reading 8 bytes after writing 8 bytes at
+    `addr .. addr + 7` reassembles the exact 64-bit doubleword. -/
+theorem rv64StoreLoadBytes_roundtrip_8 (addr : Nat) (val : BitVec 64)
+    (mem : Std.ExtHashMap Nat (BitVec 8)) :
+    rv64ReadMemBytesSpec 8 addr (rv64WriteMemBytesSpec 8 addr val mem) = some val := by
+  simp only [rv64WriteMemBytesSpec, rv64ReadMemBytesSpec, List.ofFn, Fin.foldr, Fin.foldr.loop,
+    List.foldl, Nat.add_zero, Nat.add_assoc]
+  repeat first
+    | rw [Std.ExtHashMap.getElem?_insert_self]
+    | rw [extHashMap_getElem?_insert_ne _ _ _ _ (by omega)]
+  dsimp only
+  congr 1
+  apply BitVec.eq_of_getLsbD_eq
+  intro i hi
+  simp only [BitVec.append_eq, BitVec.getLsbD_append]
+  rcases (show i < 8 ∨ (8 ≤ i ∧ i < 16) ∨ (16 ≤ i ∧ i < 24) ∨ (24 ≤ i ∧ i < 32) ∨
+      (32 ≤ i ∧ i < 40) ∨ (40 ≤ i ∧ i < 48) ∨ (48 ≤ i ∧ i < 56) ∨ (56 ≤ i ∧ i < 64) by omega) with
+    h | ⟨_, _⟩ | ⟨_, _⟩ | ⟨_, _⟩ | ⟨_, _⟩ | ⟨_, _⟩ | ⟨_, _⟩ | ⟨_, _⟩
+  · simp [h]
+  · have h0 : ¬(i < 8) := by omega
+    have h1 : i - 8 < 8 := by omega
+    have ha : 8 * 1 + (i - 8) = i := by omega
+    simp [h0, h1, ha]
+  · have h0 : ¬(i < 8) := by omega
+    have h1 : ¬(i - 8 < 8) := by omega
+    have h2 : i - 8 - 8 < 8 := by omega
+    have ha : 8 * 2 + (i - 8 - 8) = i := by omega
+    simp [h0, h1, h2, ha]
+  · have h0 : ¬(i < 8) := by omega
+    have h1 : ¬(i - 8 < 8) := by omega
+    have h2 : ¬(i - 8 - 8 < 8) := by omega
+    have h3 : i - 8 - 8 - 8 < 8 := by omega
+    have ha : 8 * 3 + (i - 8 - 8 - 8) = i := by omega
+    simp [h0, h1, h2, h3, ha]
+  · have h0 : ¬(i < 8) := by omega
+    have h1 : ¬(i - 8 < 8) := by omega
+    have h2 : ¬(i - 8 - 8 < 8) := by omega
+    have h3 : ¬(i - 8 - 8 - 8 < 8) := by omega
+    have h4 : i - 8 - 8 - 8 - 8 < 8 := by omega
+    have ha : 8 * 4 + (i - 8 - 8 - 8 - 8) = i := by omega
+    simp [h0, h1, h2, h3, h4, ha]
+  · have h0 : ¬(i < 8) := by omega
+    have h1 : ¬(i - 8 < 8) := by omega
+    have h2 : ¬(i - 8 - 8 < 8) := by omega
+    have h3 : ¬(i - 8 - 8 - 8 < 8) := by omega
+    have h4 : ¬(i - 8 - 8 - 8 - 8 < 8) := by omega
+    have h5 : i - 8 - 8 - 8 - 8 - 8 < 8 := by omega
+    have ha : 8 * 5 + (i - 8 - 8 - 8 - 8 - 8) = i := by omega
+    simp [h0, h1, h2, h3, h4, h5, ha]
+  · have h0 : ¬(i < 8) := by omega
+    have h1 : ¬(i - 8 < 8) := by omega
+    have h2 : ¬(i - 8 - 8 < 8) := by omega
+    have h3 : ¬(i - 8 - 8 - 8 < 8) := by omega
+    have h4 : ¬(i - 8 - 8 - 8 - 8 < 8) := by omega
+    have h5 : ¬(i - 8 - 8 - 8 - 8 - 8 < 8) := by omega
+    have h6 : i - 8 - 8 - 8 - 8 - 8 - 8 < 8 := by omega
+    have ha : 8 * 6 + (i - 8 - 8 - 8 - 8 - 8 - 8) = i := by omega
+    simp [h0, h1, h2, h3, h4, h5, h6, ha]
+  · have h0 : ¬(i < 8) := by omega
+    have h1 : ¬(i - 8 < 8) := by omega
+    have h2 : ¬(i - 8 - 8 < 8) := by omega
+    have h3 : ¬(i - 8 - 8 - 8 < 8) := by omega
+    have h4 : ¬(i - 8 - 8 - 8 - 8 < 8) := by omega
+    have h5 : ¬(i - 8 - 8 - 8 - 8 - 8 < 8) := by omega
+    have h6 : ¬(i - 8 - 8 - 8 - 8 - 8 - 8 < 8) := by omega
+    have h7 : i - 8 - 8 - 8 - 8 - 8 - 8 - 8 < 8 := by omega
+    have ha : 8 * 7 + (i - 8 - 8 - 8 - 8 - 8 - 8 - 8) = i := by omega
+    simp [h0, h1, h2, h3, h4, h5, h6, h7, ha]
+
+/-- End-to-end `SailM` store-then-load roundtrip theorem across `SB`→`LB`/`LBU`, `SH`→`LH`/`LHU`,
+    `SW`→`LW`/`LWU`, and `SD`→`LD`: storing `rs2_val` via `sailStoreRamExec` and immediately
+    reloading via `sailLoadRamExec` at the same `(sp, imm)` effective address writes the exact
+    signed/unsigned extended truncation into `x1` (and for `SD`→`LD`, recovers `rs2_val` verbatim). -/
+theorem rv64StoreThenLoad_roundtrip_bisim (imm : BitVec 12) (is_unsigned : Bool)
+    (rs1_val rs2_val : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hrs1 : s.regs.get? .x2 = some rs1_val)
+    (hrs2 : s.regs.get? .x1 = some rs2_val) :
+    ((do
+        let _ ← sailStoreRamExec imm ra sp 1 (by decide)
+        let _ ← sailLoadRamExec imm sp ra is_unsigned 1
+        rX_bits ra).run s =
+      .ok (rv64iLoadExtendSpec is_unsigned (rs2_val.truncate 8))
+        { s with
+            mem := (rv64WriteMemBytesSpec 1 (BitVec.toNat (rv64iEffectiveAddrSpec rs1_val imm))
+              (rs2_val.truncate 8) s.mem),
+            regs := s.regs.insert .x1 (rv64iLoadExtendSpec is_unsigned (rs2_val.truncate 8)) }) ∧
+    ((do
+        let _ ← sailStoreRamExec imm ra sp 2 (by decide)
+        let _ ← sailLoadRamExec imm sp ra is_unsigned 2
+        rX_bits ra).run s =
+      .ok (rv64iLoadExtendSpec is_unsigned (rs2_val.truncate 16))
+        { s with
+            mem := (rv64WriteMemBytesSpec 2 (BitVec.toNat (rv64iEffectiveAddrSpec rs1_val imm))
+              (rs2_val.truncate 16) s.mem),
+            regs := s.regs.insert .x1 (rv64iLoadExtendSpec is_unsigned (rs2_val.truncate 16)) }) ∧
+    ((do
+        let _ ← sailStoreRamExec imm ra sp 4 (by decide)
+        let _ ← sailLoadRamExec imm sp ra is_unsigned 4
+        rX_bits ra).run s =
+      .ok (rv64iLoadExtendSpec is_unsigned (rs2_val.truncate 32))
+        { s with
+            mem := (rv64WriteMemBytesSpec 4 (BitVec.toNat (rv64iEffectiveAddrSpec rs1_val imm))
+              (rs2_val.truncate 32) s.mem),
+            regs := s.regs.insert .x1 (rv64iLoadExtendSpec is_unsigned (rs2_val.truncate 32)) }) ∧
+    ((do
+        let _ ← sailStoreRamExec imm ra sp 8 (by decide)
+        let _ ← sailLoadRamExec imm sp ra false 8
+        rX_bits ra).run s =
+      .ok rs2_val
+        { s with
+            mem := (rv64WriteMemBytesSpec 8 (BitVec.toNat (rv64iEffectiveAddrSpec rs1_val imm))
+              rs2_val s.mem),
+            regs := s.regs.insert .x1 rs2_val }) := by
+  rcases rv64iStoreTruncate_bisim_sail rs2_val with ⟨ht1, ht2, ht4, ht8⟩
+  have htr64 : rs2_val.truncate 64 = rs2_val := by simp
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · have hst := sailStoreRamExec_sp_ra_bisim imm 1 (by decide) (by decide) rs1_val rs2_val s hrs1 hrs2
+    rw [← ht1] at hst
+    let s1 : SequentialState RegisterType trivialChoiceSource :=
+      { s with mem := (rv64WriteMemBytesSpec 1
+          (BitVec.toNat (rv64iEffectiveAddrSpec rs1_val imm))
+          (rs2_val.truncate 8) s.mem) }
+    have hld := sailLoadRamExec_sp_ra_bisim imm is_unsigned 1 (by decide) rs1_val (rs2_val.truncate 8) s1
+      hrs1 (rv64StoreLoadBytes_roundtrip_1 _ _ _)
+    let s2 : SequentialState RegisterType trivialChoiceSource :=
+      { s1 with regs := s.regs.insert .x1 (rv64iLoadExtendSpec is_unsigned (rs2_val.truncate 8)) }
+    have hrd := rX_bits_ra_run (rv64iLoadExtendSpec is_unsigned (rs2_val.truncate 8)) s2
+      (by simp [s2, Std.ExtDHashMap.get?_insert_self])
+    dsimp [rv64iStoreTruncateSpec] at hst
+    dsimp [Bind.bind, EStateM.bind, EStateM.run, s1, s2] at hst hld hrd ⊢
+    rw [hst]; dsimp only; rw [hld]; dsimp only; exact hrd
+  · have hst := sailStoreRamExec_sp_ra_bisim imm 2 (by decide) (by decide) rs1_val rs2_val s hrs1 hrs2
+    rw [← ht2] at hst
+    let s1 : SequentialState RegisterType trivialChoiceSource :=
+      { s with mem := (rv64WriteMemBytesSpec 2
+          (BitVec.toNat (rv64iEffectiveAddrSpec rs1_val imm))
+          (rs2_val.truncate 16) s.mem) }
+    have hld := sailLoadRamExec_sp_ra_bisim imm is_unsigned 2 (by decide) rs1_val (rs2_val.truncate 16) s1
+      hrs1 (rv64StoreLoadBytes_roundtrip_2 _ _ _)
+    let s2 : SequentialState RegisterType trivialChoiceSource :=
+      { s1 with regs := s.regs.insert .x1 (rv64iLoadExtendSpec is_unsigned (rs2_val.truncate 16)) }
+    have hrd := rX_bits_ra_run (rv64iLoadExtendSpec is_unsigned (rs2_val.truncate 16)) s2
+      (by simp [s2, Std.ExtDHashMap.get?_insert_self])
+    dsimp [rv64iStoreTruncateSpec] at hst
+    dsimp [Bind.bind, EStateM.bind, EStateM.run, s1, s2] at hst hld hrd ⊢
+    rw [hst]; dsimp only; rw [hld]; dsimp only; exact hrd
+  · have hst := sailStoreRamExec_sp_ra_bisim imm 4 (by decide) (by decide) rs1_val rs2_val s hrs1 hrs2
+    rw [← ht4] at hst
+    let s1 : SequentialState RegisterType trivialChoiceSource :=
+      { s with mem := (rv64WriteMemBytesSpec 4
+          (BitVec.toNat (rv64iEffectiveAddrSpec rs1_val imm))
+          (rs2_val.truncate 32) s.mem) }
+    have hld := sailLoadRamExec_sp_ra_bisim imm is_unsigned 4 (by decide) rs1_val (rs2_val.truncate 32) s1
+      hrs1 (rv64StoreLoadBytes_roundtrip_4 _ _ _)
+    let s2 : SequentialState RegisterType trivialChoiceSource :=
+      { s1 with regs := s.regs.insert .x1 (rv64iLoadExtendSpec is_unsigned (rs2_val.truncate 32)) }
+    have hrd := rX_bits_ra_run (rv64iLoadExtendSpec is_unsigned (rs2_val.truncate 32)) s2
+      (by simp [s2, Std.ExtDHashMap.get?_insert_self])
+    dsimp [rv64iStoreTruncateSpec] at hst
+    dsimp [Bind.bind, EStateM.bind, EStateM.run, s1, s2] at hst hld hrd ⊢
+    rw [hst]; dsimp only; rw [hld]; dsimp only; exact hrd
+  · have hst := sailStoreRamExec_sp_ra_bisim imm 8 (by decide) (by decide) rs1_val rs2_val s hrs1 hrs2
+    rw [← ht8] at hst
+    change (sailStoreRamExec imm ra sp 8 (by decide)).run s = .ok (.Retire_Success ())
+      { s with mem := (rv64WriteMemBytesSpec 8
+          (BitVec.toNat (rv64iEffectiveAddrSpec rs1_val imm))
+          (rs2_val.truncate 64) s.mem) } at hst
+    rw [htr64] at hst
+    let s1 : SequentialState RegisterType trivialChoiceSource :=
+      { s with mem := (rv64WriteMemBytesSpec 8
+          (BitVec.toNat (rv64iEffectiveAddrSpec rs1_val imm))
+          rs2_val s.mem) }
+    have hld := sailLoadRamExec_sp_ra_bisim imm false 8 (by decide) rs1_val rs2_val s1
+      hrs1 (rv64StoreLoadBytes_roundtrip_8 _ _ _)
+    have hextId : rv64iLoadExtendSpec false rs2_val = rs2_val := by simp [rv64iLoadExtendSpec]
+    rw [hextId] at hld
+    let s2 : SequentialState RegisterType trivialChoiceSource :=
+      { s1 with regs := s.regs.insert .x1 rs2_val }
+    have hrd := rX_bits_ra_run rs2_val s2 (by simp [s2, Std.ExtDHashMap.get?_insert_self])
+    dsimp [Bind.bind, EStateM.bind, EStateM.run, s1, s2] at hst hld hrd ⊢
+    rw [hst]; dsimp only; rw [hld]; dsimp only; exact hrd
+
+/-! ## 13. RVC Compressed Instruction Fragment (`Zca` / `Zcb` / RV64C) -/
+
+/-- Pure `TurboLean`-side RVC 3-bit compressed register index decoding (`creg2reg_idx`,
+    `LeanRV64D/Types.lean`, lines 223–225): maps `i : BitVec 3` (`0..7`) to architectural
+    register index `x8..x15` (`8#5 + i.zeroExtend 5`). -/
+def rvcRegIdxSpec (i : BitVec 3) : regidx :=
+  .Regidx (8#5 + i.zeroExtend 5)
+
+/-- RVC compressed register index decoding (`creg2reg_idx`) bisimulation: proves `creg2reg_idx`
+    matches `rvcRegIdxSpec`, yields architectural indices in `[8, 15]`, and never aliases `zreg` (`x0`). -/
+theorem rvcRegIdx_creg2reg_idx_bisim (i : BitVec 3) :
+    regidx_bits (creg2reg_idx (.Cregidx i)) = regidx_bits (rvcRegIdxSpec i) ∧
+      creg2reg_idx (.Cregidx i) = rvcRegIdxSpec i ∧
+      8 ≤ (regidx_bits (creg2reg_idx (.Cregidx i))).toNat ∧
+      (regidx_bits (creg2reg_idx (.Cregidx i))).toNat < 16 ∧
+      creg2reg_idx (.Cregidx i) ≠ zreg := by
+  have hbits : regidx_bits (creg2reg_idx (.Cregidx i)) = regidx_bits (rvcRegIdxSpec i) := by
+    revert i; decide
+  have hlo : 8 ≤ (regidx_bits (creg2reg_idx (.Cregidx i))).toNat := by
+    revert i; decide
+  have hhi : (regidx_bits (creg2reg_idx (.Cregidx i))).toNat < 16 := by
+    revert i; decide
+  have hreg : creg2reg_idx (.Cregidx i) = rvcRegIdxSpec i := by
+    unfold creg2reg_idx rvcRegIdxSpec
+    exact congrArg regidx.Regidx hbits
+  have hnz : creg2reg_idx (.Cregidx i) ≠ zreg := by
+    intro h
+    have hz : (regidx_bits (creg2reg_idx (.Cregidx i))).toNat = (regidx_bits zreg).toNat :=
+      congrArg (fun r => (regidx_bits r).toNat) h
+    have hz0 : (regidx_bits zreg).toNat = 0 := by decide
+    omega
+  exact ⟨hbits, hreg, hlo, hhi, hnz⟩
+
+/-- Exact upstream Sail RVC no-op / illegal functional cores (`LeanRV64D/InstsEnd.lean`,
+    lines 71546–71555, 71627–71628). -/
+def sailCNopExec (_imm : BitVec 6) : ExecutionResult :=
+  .Retire_Success ()
+
+def sailCNtlExec (_ntl : ntl_type) : ExecutionResult :=
+  .Retire_Success ()
+
+def sailCIllegalExec (_s : BitVec 16) : ExecutionResult :=
+  .Illegal_Instruction ()
+
+/-- RVC `C.NOP`, `C.NTL`, and `C.ILLEGAL` dispatch bisimulation: `C.NOP` and `C.NTL` retire
+    directly as `.Retire_Success ()` without architectural side effects, while `C.ILLEGAL`
+    always produces `.Illegal_Instruction ()`. -/
+theorem rvcNopIllegal_bisim_sail (imm : BitVec 6) (ntl : ntl_type) (enc : BitVec 16) :
+    sailCNopExec imm = .Retire_Success () ∧
+      sailCNtlExec ntl = .Retire_Success () ∧
+      sailCIllegalExec enc = .Illegal_Instruction () := by
+  exact ⟨rfl, rfl, rfl⟩
+
+/-- Exact upstream Sail RVC stack-pointer & immediate `ExecuteAs` expansions
+    (`LeanRV64D/InstsEnd.lean`, lines 71579–71586, 71696–71707). -/
+def sailCAddi4spnExec (rdc : cregidx) (nzimm : BitVec 8) : ExecutionResult :=
+  let imm : BitVec 12 := (0b00#2 +++ (nzimm +++ 0b00#2))
+  let rd := creg2reg_idx rdc
+  .ExecuteAs (.ITYPE (imm, sp, rd, .ADDI))
+
+def sailCAddi16spExec (imm : BitVec 6) : ExecutionResult :=
+  let imm : BitVec 12 := sign_extend (m := 12) (imm +++ 0x0#4)
+  .ExecuteAs (.ITYPE (imm, sp, sp, .ADDI))
+
+def sailCLiExec (imm : BitVec 6) (rd : regidx) : ExecutionResult :=
+  let imm : BitVec 12 := sign_extend (m := 12) imm
+  .ExecuteAs (.ITYPE (imm, zreg, rd, .ADDI))
+
+def sailCLuiExec (imm : BitVec 6) (rd : regidx) : ExecutionResult :=
+  let res : BitVec 20 := sign_extend (m := 20) imm
+  .ExecuteAs (.UTYPE (res, rd, .LUI))
+
+/-- RVC `C.ADDI4SPN` and `C.ADDI16SP` stack-pointer arithmetic bisimulation: proves `C.ADDI4SPN`
+    expands to `ADDI rd', sp, zext(nzimm) * 4` (4-byte aligned non-negative offset) and
+    `C.ADDI16SP` expands to `ADDI sp, sp, sext(imm) * 16` (16-byte aligned signed offset). -/
+theorem rvcStackPointerAddi_bisim_sail (i : BitVec 3) (nzimm : BitVec 8)
+    (imm6 : BitVec 6) (sp_val : BitVec 64) :
+    sailCAddi4spnExec (.Cregidx i) nzimm =
+      .ExecuteAs (.ITYPE ((nzimm.zeroExtend 12) <<< 2, sp, rvcRegIdxSpec i, .ADDI)) ∧
+    sailItypeCore .ADDI sp_val (0b00#2 +++ (nzimm +++ 0b00#2)) =
+      sp_val + ((nzimm.zeroExtend 64) <<< 2) ∧
+    sailCAddi16spExec imm6 =
+      .ExecuteAs (.ITYPE ((imm6.signExtend 12) <<< 4, sp, sp, .ADDI)) ∧
+    sailItypeCore .ADDI sp_val (sign_extend (m := 12) (imm6 +++ 0x0#4)) =
+      sp_val + ((imm6.signExtend 64) <<< 4) := by
+  have himm4 : (0b00#2 +++ (nzimm +++ 0b00#2) : BitVec 12) = (nzimm.zeroExtend 12) <<< 2 := by
+    revert nzimm; decide
+  have himm4_64 : sign_extend (m := 64) (0b00#2 +++ (nzimm +++ 0b00#2) : BitVec 12) =
+      (nzimm.zeroExtend 64) <<< 2 := by
+    revert nzimm; decide
+  have himm16 : sign_extend (m := 12) (imm6 +++ 0x0#4) = (imm6.signExtend 12) <<< 4 := by
+    revert imm6; decide
+  have himm16_64 : sign_extend (m := 64) (sign_extend (m := 12) (imm6 +++ 0x0#4)) =
+      (imm6.signExtend 64) <<< 4 := by
+    revert imm6; decide
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · simp [sailCAddi4spnExec, himm4, (rvcRegIdx_creg2reg_idx_bisim i).2.1]
+  · dsimp only [sailItypeCore]
+    rw [himm4_64]
+  · simp [sailCAddi16spExec, himm16]
+  · dsimp only [sailItypeCore]
+    rw [himm16_64]
+
+/-- RVC `C.LI` and `C.LUI` immediate generation bisimulation: proves `C.LI` expands to
+    `ADDI rd, x0, sext(imm6)` yielding `imm6.signExtend 64`, and `C.LUI` expands to
+    `LUI rd, sext20(imm6)` yielding `(imm6.signExtend 64) <<< 12`. -/
+theorem rvcLiLui_bisim_sail (imm6 : BitVec 6) (rd : regidx) :
+    sailCLiExec imm6 rd = .ExecuteAs (.ITYPE (imm6.signExtend 12, zreg, rd, .ADDI)) ∧
+    sailItypeCore .ADDI 0#64 (sign_extend (m := 12) imm6) = imm6.signExtend 64 ∧
+    sailCLuiExec imm6 rd = .ExecuteAs (.UTYPE (imm6.signExtend 20, rd, .LUI)) ∧
+    rv64iUtypeSpec .LUI 0#64 (sign_extend (m := 20) imm6) = (imm6.signExtend 64) <<< 12 := by
+  have hli12 : sign_extend (m := 12) imm6 = imm6.signExtend 12 := rfl
+  have hli64 : sign_extend (m := 64) (sign_extend (m := 12) imm6) = imm6.signExtend 64 := by
+    revert imm6; decide
+  have hlui20 : sign_extend (m := 20) imm6 = imm6.signExtend 20 := rfl
+  have hlui64 : rv64iUtypeSpec .LUI 0#64 (sign_extend (m := 20) imm6) = (imm6.signExtend 64) <<< 12 := by
+    revert imm6; decide
+  refine ⟨by simp [sailCLiExec, hli12], ?_, by simp [sailCLuiExec, hlui20], hlui64⟩
+  dsimp only [sailItypeCore]
+  rw [hli64]
+  simp
+
+/-- Exact upstream Sail RVC immediate/shift ALU `ExecuteAs` expansions
+    (`LeanRV64D/InstsEnd.lean`, lines 71500–71510, 71679–71681, 71693–71694, 71705–71707). -/
+def sailCAddiExec (imm : BitVec 6) (rsd : regidx) : ExecutionResult :=
+  let imm : BitVec 12 := sign_extend (m := 12) imm
+  .ExecuteAs (.ITYPE (imm, rsd, rsd, .ADDI))
+
+def sailCAddiwExec (imm : BitVec 6) (rsd : regidx) : ExecutionResult :=
+  .ExecuteAs (.ADDIW (sign_extend (m := 12) imm, rsd, rsd))
+
+def sailCAndiExec (imm : BitVec 6) (rsd : cregidx) : ExecutionResult :=
+  let rsd := creg2reg_idx rsd
+  .ExecuteAs (.ITYPE (sign_extend (m := 12) imm, rsd, rsd, .ANDI))
+
+def sailCSlliExec (shamt : BitVec 6) (rsd : regidx) : ExecutionResult :=
+  .ExecuteAs (.SHIFTIOP (shamt, rsd, rsd, .SLLI))
+
+def sailCSrliExec (shamt : BitVec 6) (rsd : cregidx) : ExecutionResult :=
+  let rsd := creg2reg_idx rsd
+  .ExecuteAs (.SHIFTIOP (shamt, rsd, rsd, .SRLI))
+
+def sailCSraiExec (shamt : BitVec 6) (rsd : cregidx) : ExecutionResult :=
+  let rsd := creg2reg_idx rsd
+  .ExecuteAs (.SHIFTIOP (shamt, rsd, rsd, .SRAI))
+
+/-- RVC `C.ADDI`, `C.ADDIW`, `C.ANDI`, `C.SLLI`, `C.SRLI`, and `C.SRAI` canonical expansion and
+    value bisimulation against RV64I `ITYPE` / `ADDIW` / `SHIFTIOP` specifications. -/
+theorem rvcAluImmShift_bisim_sail (imm6 shamt6 : BitVec 6) (rsd : regidx) (i : BitVec 3)
+    (rsd_val : BitVec 64) :
+    sailCAddiExec imm6 rsd = .ExecuteAs (.ITYPE (imm6.signExtend 12, rsd, rsd, .ADDI)) ∧
+    sailItypeCore .ADDI rsd_val (sign_extend (m := 12) imm6) = rsd_val + imm6.signExtend 64 ∧
+    sailCAddiwExec imm6 rsd = .ExecuteAs (.ADDIW (imm6.signExtend 12, rsd, rsd)) ∧
+    sailAddiwCore rsd_val (sign_extend (m := 12) imm6) =
+      (rsd_val.truncate 32 + imm6.signExtend 32).signExtend 64 ∧
+    sailCAndiExec imm6 (.Cregidx i) =
+      .ExecuteAs (.ITYPE (imm6.signExtend 12, rvcRegIdxSpec i, rvcRegIdxSpec i, .ANDI)) ∧
+    sailItypeCore .ANDI rsd_val (sign_extend (m := 12) imm6) = rsd_val &&& imm6.signExtend 64 ∧
+    sailCSlliExec shamt6 rsd = .ExecuteAs (.SHIFTIOP (shamt6, rsd, rsd, .SLLI)) ∧
+    sailCSrliExec shamt6 (.Cregidx i) =
+      .ExecuteAs (.SHIFTIOP (shamt6, rvcRegIdxSpec i, rvcRegIdxSpec i, .SRLI)) ∧
+    sailCSraiExec shamt6 (.Cregidx i) =
+      .ExecuteAs (.SHIFTIOP (shamt6, rvcRegIdxSpec i, rvcRegIdxSpec i, .SRAI)) := by
+  have hc := (rvcRegIdx_creg2reg_idx_bisim i).2.1
+  have sext64 : sign_extend (m := 64) (sign_extend (m := 12) imm6) = imm6.signExtend 64 := by
+    revert imm6; decide
+  have sext32 : (imm6.signExtend 12).signExtend 32 = imm6.signExtend 32 := by
+    revert imm6; decide
+  refine ⟨rfl, ?_, rfl, ?_, ?_, ?_, rfl, ?_, ?_⟩
+  · dsimp only [sailItypeCore]
+    rw [sext64]
+  · change sailAddiwCore rsd_val (imm6.signExtend 12) = _
+    rw [← rv64iAddiwSpec_bisim_sail rsd_val (imm6.signExtend 12)]
+    dsimp only [rv64iAddiwSpec]
+    rw [sext32]
+  · simp [sailCAndiExec, sign_extend, Sail.BitVec.signExtend, hc]
+  · dsimp only [sailItypeCore]
+    rw [sext64]
+  · simp [sailCSrliExec, hc]
+  · simp [sailCSraiExec, hc]
+
+/-- Exact upstream Sail RVC register-register ALU `ExecuteAs` expansions
+    (`LeanRV64D/InstsEnd.lean`, lines 71469–71472, 71484–71492, 71541–71544, 71557–71558,
+    71683–71691, 71709–71710). -/
+def sailCMvExec (rd rs2 : regidx) : ExecutionResult :=
+  .ExecuteAs (.RTYPE (rs2, zreg, rd, .ADD))
+
+def sailCAddExec (rsd rs2 : regidx) : ExecutionResult :=
+  .ExecuteAs (.RTYPE (rs2, rsd, rsd, .ADD))
+
+def sailCSubExec (rsd rs2 : cregidx) : ExecutionResult :=
+  .ExecuteAs (.RTYPE (creg2reg_idx rs2, creg2reg_idx rsd, creg2reg_idx rsd, .SUB))
+
+def sailCXorExec (rsd rs2 : cregidx) : ExecutionResult :=
+  .ExecuteAs (.RTYPE (creg2reg_idx rs2, creg2reg_idx rsd, creg2reg_idx rsd, .XOR))
+
+def sailCOrExec (rsd rs2 : cregidx) : ExecutionResult :=
+  .ExecuteAs (.RTYPE (creg2reg_idx rs2, creg2reg_idx rsd, creg2reg_idx rsd, .OR))
+
+def sailCAndExec (rsd rs2 : cregidx) : ExecutionResult :=
+  .ExecuteAs (.RTYPE (creg2reg_idx rs2, creg2reg_idx rsd, creg2reg_idx rsd, .AND))
+
+def sailCAddwExec (rsd rs2 : cregidx) : ExecutionResult :=
+  .ExecuteAs (.RTYPEW (creg2reg_idx rs2, creg2reg_idx rsd, creg2reg_idx rsd, .ADDW))
+
+def sailCSubwExec (rsd rs2 : cregidx) : ExecutionResult :=
+  .ExecuteAs (.RTYPEW (creg2reg_idx rs2, creg2reg_idx rsd, creg2reg_idx rsd, .SUBW))
+
+/-- RVC register-register ALU (`C.MV`, `C.ADD`, `C.SUB`, `C.XOR`, `C.OR`, `C.AND`, `C.ADDW`, `C.SUBW`)
+    canonical expansion and value bisimulation against RV64I `RTYPE` and `RTYPEW`. -/
+theorem rvcAluReg_bisim_sail (rd rs2 : regidx) (i1 i2 : BitVec 3) (v1 v2 : BitVec 64) :
+    sailCMvExec rd rs2 = .ExecuteAs (.RTYPE (rs2, zreg, rd, .ADD)) ∧
+    sailRtypeCore .ADD 0#64 v2 = v2 ∧
+    sailCAddExec rd rs2 = .ExecuteAs (.RTYPE (rs2, rd, rd, .ADD)) ∧
+    sailRtypeCore .ADD v1 v2 = v1 + v2 ∧
+    sailCSubExec (.Cregidx i1) (.Cregidx i2) =
+      .ExecuteAs (.RTYPE (rvcRegIdxSpec i2, rvcRegIdxSpec i1, rvcRegIdxSpec i1, .SUB)) ∧
+    sailCXorExec (.Cregidx i1) (.Cregidx i2) =
+      .ExecuteAs (.RTYPE (rvcRegIdxSpec i2, rvcRegIdxSpec i1, rvcRegIdxSpec i1, .XOR)) ∧
+    sailCOrExec (.Cregidx i1) (.Cregidx i2) =
+      .ExecuteAs (.RTYPE (rvcRegIdxSpec i2, rvcRegIdxSpec i1, rvcRegIdxSpec i1, .OR)) ∧
+    sailCAndExec (.Cregidx i1) (.Cregidx i2) =
+      .ExecuteAs (.RTYPE (rvcRegIdxSpec i2, rvcRegIdxSpec i1, rvcRegIdxSpec i1, .AND)) ∧
+    sailCAddwExec (.Cregidx i1) (.Cregidx i2) =
+      .ExecuteAs (.RTYPEW (rvcRegIdxSpec i2, rvcRegIdxSpec i1, rvcRegIdxSpec i1, .ADDW)) ∧
+    sailCSubwExec (.Cregidx i1) (.Cregidx i2) =
+      .ExecuteAs (.RTYPEW (rvcRegIdxSpec i2, rvcRegIdxSpec i1, rvcRegIdxSpec i1, .SUBW)) := by
+  have hc1 := (rvcRegIdx_creg2reg_idx_bisim i1).2.1
+  have hc2 := (rvcRegIdx_creg2reg_idx_bisim i2).2.1
+  refine ⟨rfl, by simp [sailRtypeCore], rfl, rfl, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  all_goals simp [sailCSubExec, sailCXorExec, sailCOrExec, sailCAndExec, sailCAddwExec, sailCSubwExec, hc1, hc2]
+
+/-- Exact upstream Sail RVC compressed load `ExecuteAs` expansions (`LeanRV64D/InstsEnd.lean`,
+    lines 71569–71577, 71587–71613), covering `C.LWSP`, `C.LDSP`, `C.LW`, `C.LD`, `C.LBU`, `C.LH`, `C.LHU`. -/
+def sailCLwspExec (uimm : BitVec 6) (rd : regidx) : ExecutionResult :=
+  .ExecuteAs (.LOAD (zero_extend (m := 12) (uimm +++ 0b00#2), sp, rd, false, 4))
+
+def sailCLdspExec (uimm : BitVec 6) (rd : regidx) : ExecutionResult :=
+  .ExecuteAs (.LOAD (zero_extend (m := 12) (uimm +++ 0b000#3), sp, rd, false, 8))
+
+def sailCLwExec (uimm : BitVec 5) (rsc rdc : cregidx) : ExecutionResult :=
+  .ExecuteAs (.LOAD (zero_extend (m := 12) (uimm +++ 0b00#2), creg2reg_idx rsc, creg2reg_idx rdc, false, 4))
+
+def sailCLdExec (uimm : BitVec 5) (rsc rdc : cregidx) : ExecutionResult :=
+  .ExecuteAs (.LOAD (zero_extend (m := 12) (uimm +++ 0b000#3), creg2reg_idx rsc, creg2reg_idx rdc, false, 8))
+
+def sailCLbuExec (uimm : BitVec 2) (rdc rsc1 : cregidx) : ExecutionResult :=
+  .ExecuteAs (.LOAD (zero_extend (m := 12) uimm, creg2reg_idx rsc1, creg2reg_idx rdc, true, 1))
+
+def sailCLhExec (uimm : BitVec 2) (rdc rsc1 : cregidx) : ExecutionResult :=
+  .ExecuteAs (.LOAD (zero_extend (m := 12) uimm, creg2reg_idx rsc1, creg2reg_idx rdc, false, 2))
+
+def sailCLhuExec (uimm : BitVec 2) (rdc rsc1 : cregidx) : ExecutionResult :=
+  .ExecuteAs (.LOAD (zero_extend (m := 12) uimm, creg2reg_idx rsc1, creg2reg_idx rdc, true, 2))
+
+/-- RVC compressed load (`C.LWSP`, `C.LDSP`, `C.LW`, `C.LD`, `C.LBU`, `C.LH`, `C.LHU`) canonical
+    expansion and scaled non-negative effective-address bisimulation (`base + zext(uimm) * scale`). -/
+theorem rvcLoad_bisim_sail (uimm6 : BitVec 6) (uimm5 : BitVec 5) (uimm2 : BitVec 2)
+    (rd : regidx) (ic1 ic2 : BitVec 3) (base : BitVec 64) :
+    sailCLwspExec uimm6 rd =
+      .ExecuteAs (.LOAD ((uimm6.zeroExtend 12) <<< 2, sp, rd, false, 4)) ∧
+    rv64iEffectiveAddrSpec base (zero_extend (m := 12) (uimm6 +++ 0b00#2)) =
+      base + ((uimm6.zeroExtend 64) <<< 2) ∧
+    sailCLdspExec uimm6 rd =
+      .ExecuteAs (.LOAD ((uimm6.zeroExtend 12) <<< 3, sp, rd, false, 8)) ∧
+    rv64iEffectiveAddrSpec base (zero_extend (m := 12) (uimm6 +++ 0b000#3)) =
+      base + ((uimm6.zeroExtend 64) <<< 3) ∧
+    sailCLwExec uimm5 (.Cregidx ic1) (.Cregidx ic2) =
+      .ExecuteAs (.LOAD ((uimm5.zeroExtend 12) <<< 2, rvcRegIdxSpec ic1, rvcRegIdxSpec ic2, false, 4)) ∧
+    sailCLdExec uimm5 (.Cregidx ic1) (.Cregidx ic2) =
+      .ExecuteAs (.LOAD ((uimm5.zeroExtend 12) <<< 3, rvcRegIdxSpec ic1, rvcRegIdxSpec ic2, false, 8)) ∧
+    sailCLbuExec uimm2 (.Cregidx ic2) (.Cregidx ic1) =
+      .ExecuteAs (.LOAD (uimm2.zeroExtend 12, rvcRegIdxSpec ic1, rvcRegIdxSpec ic2, true, 1)) ∧
+    sailCLhExec uimm2 (.Cregidx ic2) (.Cregidx ic1) =
+      .ExecuteAs (.LOAD (uimm2.zeroExtend 12, rvcRegIdxSpec ic1, rvcRegIdxSpec ic2, false, 2)) ∧
+    sailCLhuExec uimm2 (.Cregidx ic2) (.Cregidx ic1) =
+      .ExecuteAs (.LOAD (uimm2.zeroExtend 12, rvcRegIdxSpec ic1, rvcRegIdxSpec ic2, true, 2)) := by
+  have hc1 := (rvcRegIdx_creg2reg_idx_bisim ic1).2.1
+  have hc2 := (rvcRegIdx_creg2reg_idx_bisim ic2).2.1
+  have hw6 : zero_extend (m := 12) (uimm6 +++ 0b00#2) = (uimm6.zeroExtend 12) <<< 2 := by
+    revert uimm6; decide
+  have hw6_64 : (zero_extend (m := 12) (uimm6 +++ 0b00#2)).signExtend 64 = (uimm6.zeroExtend 64) <<< 2 := by
+    revert uimm6; decide
+  have hd6 : zero_extend (m := 12) (uimm6 +++ 0b000#3) = (uimm6.zeroExtend 12) <<< 3 := by
+    revert uimm6; decide
+  have hd6_64 : (zero_extend (m := 12) (uimm6 +++ 0b000#3)).signExtend 64 = (uimm6.zeroExtend 64) <<< 3 := by
+    revert uimm6; decide
+  have hw5 : zero_extend (m := 12) (uimm5 +++ 0b00#2) = (uimm5.zeroExtend 12) <<< 2 := by
+    revert uimm5; decide
+  have hd5 : zero_extend (m := 12) (uimm5 +++ 0b000#3) = (uimm5.zeroExtend 12) <<< 3 := by
+    revert uimm5; decide
+  have hb2 : zero_extend (m := 12) uimm2 = uimm2.zeroExtend 12 := rfl
+  refine ⟨by simp [sailCLwspExec, hw6], ?_, by simp [sailCLdspExec, hd6], ?_,
+    by simp [sailCLwExec, hw5, hc1, hc2], by simp [sailCLdExec, hd5, hc1, hc2],
+    by simp [sailCLbuExec, hb2, hc1, hc2], by simp [sailCLhExec, hb2, hc1, hc2],
+    by simp [sailCLhuExec, hb2, hc1, hc2]⟩
+  · simp [rv64iEffectiveAddrSpec, hw6_64]
+  · simp [rv64iEffectiveAddrSpec, hd6_64]
+
+/-- Exact upstream Sail RVC compressed store `ExecuteAs` expansions (`LeanRV64D/InstsEnd.lean`,
+    lines 71474–71482, 71511–71515, 71525–71539), covering `C.SWSP`, `C.SDSP`, `C.SW`, `C.SD`, `C.SB`, `C.SH`. -/
+def sailCSwspExec (uimm : BitVec 6) (rs2 : regidx) : ExecutionResult :=
+  .ExecuteAs (.STORE (zero_extend (m := 12) (uimm +++ 0b00#2), rs2, sp, 4))
+
+def sailCSdspExec (uimm : BitVec 6) (rs2 : regidx) : ExecutionResult :=
+  .ExecuteAs (.STORE (zero_extend (m := 12) (uimm +++ 0b000#3), rs2, sp, 8))
+
+def sailCSwExec (uimm : BitVec 5) (rsc1 rsc2 : cregidx) : ExecutionResult :=
+  .ExecuteAs (.STORE (zero_extend (m := 12) (uimm +++ 0b00#2), creg2reg_idx rsc2, creg2reg_idx rsc1, 4))
+
+def sailCSdExec (uimm : BitVec 5) (rsc1 rsc2 : cregidx) : ExecutionResult :=
+  .ExecuteAs (.STORE (zero_extend (m := 12) (uimm +++ 0b000#3), creg2reg_idx rsc2, creg2reg_idx rsc1, 8))
+
+def sailCSbExec (uimm : BitVec 2) (rsc1 rsc2 : cregidx) : ExecutionResult :=
+  .ExecuteAs (.STORE (zero_extend (m := 12) uimm, creg2reg_idx rsc2, creg2reg_idx rsc1, 1))
+
+def sailCShExec (uimm : BitVec 2) (rsc1 rsc2 : cregidx) : ExecutionResult :=
+  .ExecuteAs (.STORE (zero_extend (m := 12) uimm, creg2reg_idx rsc2, creg2reg_idx rsc1, 2))
+
+/-- RVC compressed store (`C.SWSP`, `C.SDSP`, `C.SW`, `C.SD`, `C.SB`, `C.SH`) canonical expansion
+    and scaled effective-address bisimulation. -/
+theorem rvcStore_bisim_sail (uimm6 : BitVec 6) (uimm5 : BitVec 5) (uimm2 : BitVec 2)
+    (rs2 : regidx) (ic1 ic2 : BitVec 3) (base : BitVec 64) :
+    sailCSwspExec uimm6 rs2 =
+      .ExecuteAs (.STORE ((uimm6.zeroExtend 12) <<< 2, rs2, sp, 4)) ∧
+    sailCSdspExec uimm6 rs2 =
+      .ExecuteAs (.STORE ((uimm6.zeroExtend 12) <<< 3, rs2, sp, 8)) ∧
+    sailCSwExec uimm5 (.Cregidx ic1) (.Cregidx ic2) =
+      .ExecuteAs (.STORE ((uimm5.zeroExtend 12) <<< 2, rvcRegIdxSpec ic2, rvcRegIdxSpec ic1, 4)) ∧
+    rv64iEffectiveAddrSpec base (zero_extend (m := 12) (uimm5 +++ 0b00#2)) =
+      base + ((uimm5.zeroExtend 64) <<< 2) ∧
+    sailCSdExec uimm5 (.Cregidx ic1) (.Cregidx ic2) =
+      .ExecuteAs (.STORE ((uimm5.zeroExtend 12) <<< 3, rvcRegIdxSpec ic2, rvcRegIdxSpec ic1, 8)) ∧
+    rv64iEffectiveAddrSpec base (zero_extend (m := 12) (uimm5 +++ 0b000#3)) =
+      base + ((uimm5.zeroExtend 64) <<< 3) ∧
+    sailCSbExec uimm2 (.Cregidx ic1) (.Cregidx ic2) =
+      .ExecuteAs (.STORE (uimm2.zeroExtend 12, rvcRegIdxSpec ic2, rvcRegIdxSpec ic1, 1)) ∧
+    sailCShExec uimm2 (.Cregidx ic1) (.Cregidx ic2) =
+      .ExecuteAs (.STORE (uimm2.zeroExtend 12, rvcRegIdxSpec ic2, rvcRegIdxSpec ic1, 2)) := by
+  have hc1 := (rvcRegIdx_creg2reg_idx_bisim ic1).2.1
+  have hc2 := (rvcRegIdx_creg2reg_idx_bisim ic2).2.1
+  have hw6 : zero_extend (m := 12) (uimm6 +++ 0b00#2) = (uimm6.zeroExtend 12) <<< 2 := by
+    revert uimm6; decide
+  have hd6 : zero_extend (m := 12) (uimm6 +++ 0b000#3) = (uimm6.zeroExtend 12) <<< 3 := by
+    revert uimm6; decide
+  have hw5 : zero_extend (m := 12) (uimm5 +++ 0b00#2) = (uimm5.zeroExtend 12) <<< 2 := by
+    revert uimm5; decide
+  have hw5_64 : (zero_extend (m := 12) (uimm5 +++ 0b00#2)).signExtend 64 = (uimm5.zeroExtend 64) <<< 2 := by
+    revert uimm5; decide
+  have hd5 : zero_extend (m := 12) (uimm5 +++ 0b000#3) = (uimm5.zeroExtend 12) <<< 3 := by
+    revert uimm5; decide
+  have hd5_64 : (zero_extend (m := 12) (uimm5 +++ 0b000#3)).signExtend 64 = (uimm5.zeroExtend 64) <<< 3 := by
+    revert uimm5; decide
+  have hb2 : zero_extend (m := 12) uimm2 = uimm2.zeroExtend 12 := rfl
+  refine ⟨by simp [sailCSwspExec, hw6], by simp [sailCSdspExec, hd6],
+    by simp [sailCSwExec, hw5, hc1, hc2], ?_, by simp [sailCSdExec, hd5, hc1, hc2], ?_,
+    by simp [sailCSbExec, hb2, hc1, hc2], by simp [sailCShExec, hb2, hc1, hc2]⟩
+  · simp [rv64iEffectiveAddrSpec, hw5_64]
+  · simp [rv64iEffectiveAddrSpec, hd5_64]
+
+/-- Exact upstream Sail RVC branch & jump `ExecuteAs` expansions (`LeanRV64D/InstsEnd.lean`,
+    lines 71615–71625, 71673–71677), covering `C.BEQZ`, `C.BNEZ`, `C.J`, `C.JAL`, `C.JR`, `C.JALR`. -/
+def sailCBeqzExec (imm : BitVec 8) (rs : cregidx) : ExecutionResult :=
+  .ExecuteAs (.BTYPE (sign_extend (m := 13) (imm +++ 0#1), zreg, creg2reg_idx rs, .BEQ))
+
+def sailCBnezExec (imm : BitVec 8) (rs : cregidx) : ExecutionResult :=
+  .ExecuteAs (.BTYPE (sign_extend (m := 13) (imm +++ 0#1), zreg, creg2reg_idx rs, .BNE))
+
+def sailCJExec (imm : BitVec 11) : ExecutionResult :=
+  .ExecuteAs (.JAL (sign_extend (m := 21) (imm +++ 0#1), zreg))
+
+def sailCJalExec (imm : BitVec 11) : ExecutionResult :=
+  .ExecuteAs (.JAL (sign_extend (m := 21) (imm +++ 0#1), ra))
+
+def sailCJrExec (rs1 : regidx) : ExecutionResult :=
+  .ExecuteAs (.JALR (zeros (n := 12), rs1, zreg))
+
+def sailCJalrExec (rs1 : regidx) : ExecutionResult :=
+  .ExecuteAs (.JALR (zeros (n := 12), rs1, ra))
+
+/-- Pure `TurboLean`-side RVC compressed branch (`C.BEQZ` / `C.BNEZ`) next-PC specification:
+    compressed instructions have 2-byte fallthrough `pc + 2#64`, and branch to
+    `pc + ((imm8.signExtend 64) <<< 1)` when `rs_val == 0#64` (`C.BEQZ`) or `rs_val != 0#64` (`C.BNEZ`). -/
+def rvcBranchNextPcSpec (is_bnez : Bool) (pc rs_val : BitVec 64) (imm8 : BitVec 8) : BitVec 64 :=
+  let taken := if is_bnez then rs_val != 0#64 else rs_val == 0#64
+  if taken then pc + ((imm8.signExtend 64) <<< 1) else pc + 2#64
+
+/-- RVC compressed branch (`C.BEQZ` / `C.BNEZ`) canonical expansion and 2-byte fallthrough
+    next-PC bisimulation: proves `C.BEQZ`/`C.BNEZ` expand to `BEQ`/`BNE` against `zreg` (`0#64`)
+    with 2-byte-aligned target offset `(imm8.signExtend 64) <<< 1` and untaken fallthrough `pc + 2#64`. -/
+theorem rvcBranch_bisim_sail (imm8 : BitVec 8) (ic : BitVec 3) (pc rs_val : BitVec 64) :
+    sailCBeqzExec imm8 (.Cregidx ic) =
+      .ExecuteAs (.BTYPE ((imm8.signExtend 13) <<< 1, zreg, rvcRegIdxSpec ic, .BEQ)) ∧
+    sailCBnezExec imm8 (.Cregidx ic) =
+      .ExecuteAs (.BTYPE ((imm8.signExtend 13) <<< 1, zreg, rvcRegIdxSpec ic, .BNE)) ∧
+    (if sailBtypeTakenCore .BEQ rs_val 0#64
+      then pc + sign_extend (m := 64) (sign_extend (m := 13) (imm8 +++ 0#1))
+      else pc + 2#64) = rvcBranchNextPcSpec false pc rs_val imm8 ∧
+    (if sailBtypeTakenCore .BNE rs_val 0#64
+      then pc + sign_extend (m := 64) (sign_extend (m := 13) (imm8 +++ 0#1))
+      else pc + 2#64) = rvcBranchNextPcSpec true pc rs_val imm8 := by
+  have hc := (rvcRegIdx_creg2reg_idx_bisim ic).2.1
+  have himm13 : sign_extend (m := 13) (imm8 +++ 0#1) = (imm8.signExtend 13) <<< 1 := by
+    revert imm8; decide
+  have himm64 : sign_extend (m := 64) (sign_extend (m := 13) (imm8 +++ 0#1)) =
+      (imm8.signExtend 64) <<< 1 := by
+    revert imm8; decide
+  refine ⟨by simp [sailCBeqzExec, himm13, hc], by simp [sailCBnezExec, himm13, hc], ?_, ?_⟩
+  · simp [rvcBranchNextPcSpec, sailBtypeTakenCore, himm64]
+  · simp [rvcBranchNextPcSpec, sailBtypeTakenCore, himm64]
+
+/-- RVC compressed jump (`C.J`, `C.JAL`, `C.JR`, `C.JALR`) canonical expansion bisimulation. -/
+theorem rvcJumpExpand_bisim_sail (imm11 : BitVec 11) (rs1 : regidx) :
+    sailCJExec imm11 = .ExecuteAs (.JAL ((imm11.signExtend 21) <<< 1, zreg)) ∧
+    sailCJalExec imm11 = .ExecuteAs (.JAL ((imm11.signExtend 21) <<< 1, ra)) ∧
+    sailCJrExec rs1 = .ExecuteAs (.JALR (0#12, rs1, zreg)) ∧
+    sailCJalrExec rs1 = .ExecuteAs (.JALR (0#12, rs1, ra)) := by
+  have himm21 : sign_extend (m := 21) (imm11 +++ 0#1) = (imm11.signExtend 21) <<< 1 := by
+    revert imm11; decide
+  exact ⟨by simp [sailCJExec, himm21], by simp [sailCJalExec, himm21], rfl, rfl⟩
+
+/-- End-to-end `SailM` 2-byte compressed `C.JALR` (`rd = ra = x1`, `rs1 = x1`) state-transition
+    bisimulation (`Step.lean` lines 369–373 + `execute_C_JALR` → `execute_JALR`):
+    compressed fetch sets `nextPC := BitVec.addInt PC 2` (`pc + 2#64`), so `C.JALR x1` reads the
+    pre-call `x1` value (`rs1_val`), clears target bit 0 (`rs1_val &&& ~~~1#64`), writes the 2-byte
+    return link `pc + 2#64` into `x1`, and ticks `PC` to the aligned target. -/
+theorem rvcJalr_x1_state_bisim_sail (pc rs1_val : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    ((do
+        writeReg .PC pc
+        wX_bits ra rs1_val
+        writeReg .nextPC (BitVec.addInt (← readReg .PC) 2)
+        let link_address ← get_next_pc ()
+        let target := (← rX_bits ra) + sign_extend (m := 64) (zeros (n := 12))
+        set_next_pc (Sail.BitVec.update target 0 0#1)
+        wX_bits ra link_address
+        tick_pc ()
+        let link_out ← rX_bits ra
+        let pc_out ← get_arch_pc ()
+        pure (link_out, pc_out)).run s) =
+      .ok (pc + 2#64, rs1_val &&& ~~~1#64)
+        { s with regs := ((((((s.regs.insert .PC pc).insert .x1 rs1_val).insert .nextPC (pc + 2#64)).insert
+            .nextPC (Sail.BitVec.update rs1_val 0 0#1)).insert
+            .x1 (pc + 2#64)).insert
+            .PC (Sail.BitVec.update rs1_val 0 0#1)) } := by
+  have hadd2 : BitVec.addInt pc 2 = pc + 2#64 := by
+    simp [BitVec.addInt]
+  have hclr : Sail.BitVec.update rs1_val 0 0#1 = rs1_val &&& ~~~1#64 := by
+    have h0 := (rv64iJalrSpec_bisim_sail pc rs1_val 0#12).1
+    simpa [rv64iJalrSpec, sailJalrCore, sign_extend, Sail.BitVec.signExtend] using
+      (congrArg Prod.snd h0).symm
+  rw [← hclr]
+  simp [ra, set_next_pc, get_next_pc, get_arch_pc, tick_pc,
+    redirect_callback, pc_write_callback,
+    wX_bits, rX_bits, wX, rX, regval_into_reg, regval_from_reg,
+    xreg_write_callback, reg_name_forwards, encdec_reg_forwards_matches,
+    encdec_reg_forwards, get_config_use_abi_names, LeanRV64D.Functions.not,
+    reg_arch_name_raw_forwards, xreg_full_write_callback,
+    zeros, sign_extend, Sail.BitVec.signExtend, zero_extend, Sail.BitVec.zeroExtend,
+    Sail.BitVec.toNatInt, to_bits, get_slice_int,
+    writeReg, PreSail.writeReg, readReg, PreSail.readReg,
+    modify, modifyGet, MonadStateOf.modifyGet, get, getThe, MonadStateOf.get]
+  dsimp [EStateM.modifyGet, EStateM.get, EStateM.pure, EStateM.map, EStateM.run, Functor.map]
+  simp [hadd2, Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self,
+    Pure.pure, estate_pure_def]
+
+/-- Exact upstream Sail `Zcb` compressed bit/multiply instructions (`LeanRV64D/InstsEnd.lean`,
+    lines 71456–71467, 71517–71523, 71549–71552, 71560–71567):
+    - `C.ZEXT.B` and `C.NOT` execute directly in `SailM`
+    - `C.SEXT.B`, `C.SEXT.H`, `C.ZEXT.H`, `C.ZEXT.W`, `C.MUL` expand via `ExecuteAs` -/
+def sailCZextBExec (rsdc : cregidx) : SailM ExecutionResult := do
+  let rsd := creg2reg_idx rsdc
+  wX_bits rsd (zero_extend (m := 64) (Sail.BitVec.extractLsb (← rX_bits rsd) 7 0))
+  pure (.Retire_Success ())
+
+def sailCNotExec (rsdc : cregidx) : SailM ExecutionResult := do
+  let r := creg2reg_idx rsdc
+  wX_bits r (Complement.complement (← rX_bits r))
+  pure (.Retire_Success ())
+
+def sailCSextBExec (rsdc : cregidx) : ExecutionResult :=
+  let rsd := creg2reg_idx rsdc
+  .ExecuteAs (.ZBB_EXTOP (rsd, rsd, .SEXTB))
+
+def sailCSextHExec (rsdc : cregidx) : ExecutionResult :=
+  let rsd := creg2reg_idx rsdc
+  .ExecuteAs (.ZBB_EXTOP (rsd, rsd, .SEXTH))
+
+def sailCZextHExec (rsdc : cregidx) : ExecutionResult :=
+  let rsd := creg2reg_idx rsdc
+  .ExecuteAs (.ZBB_EXTOP (rsd, rsd, .ZEXTH))
+
+def sailCZextWExec (rsdc : cregidx) : ExecutionResult :=
+  let rsd := creg2reg_idx rsdc
+  .ExecuteAs (.ZBA_RTYPEUW (zreg, rsd, rsd, 0b00#2))
+
+def sailCMulExec (rsdc rsc2 : cregidx) : ExecutionResult :=
+  let rd := creg2reg_idx rsdc
+  let rs := creg2reg_idx rsc2
+  .ExecuteAs (.MUL (rs, rd, rd, { result_part := .Low, signed_rs1 := .Signed, signed_rs2 := .Signed }))
+
+/-- `Zcb` `ExecuteAs` extensions (`C.SEXT.B`, `C.SEXT.H`, `C.ZEXT.H`, `C.ZEXT.W`, `C.MUL`)
+    canonical expansion and value bisimulation: proves `C.ZEXT.W` (`ADD.UW rsd, rsd, x0`) zero-extends
+    the low 32 bits `(x.truncate 32).zeroExtend 64`, `C.SEXT.B`/`C.SEXT.H`/`C.ZEXT.H` match `ZBB_EXTOP`,
+    and `C.MUL` matches 64-bit `x * y`. -/
+theorem rvcZcbExpand_bisim_sail (ic1 ic2 : BitVec 3) (x : BitVec 64) :
+    sailCSextBExec (.Cregidx ic1) =
+      .ExecuteAs (.ZBB_EXTOP (rvcRegIdxSpec ic1, rvcRegIdxSpec ic1, .SEXTB)) ∧
+    sailCSextHExec (.Cregidx ic1) =
+      .ExecuteAs (.ZBB_EXTOP (rvcRegIdxSpec ic1, rvcRegIdxSpec ic1, .SEXTH)) ∧
+    sailCZextHExec (.Cregidx ic1) =
+      .ExecuteAs (.ZBB_EXTOP (rvcRegIdxSpec ic1, rvcRegIdxSpec ic1, .ZEXTH)) ∧
+    sailCZextWExec (.Cregidx ic1) =
+      .ExecuteAs (.ZBA_RTYPEUW (zreg, rvcRegIdxSpec ic1, rvcRegIdxSpec ic1, 0b00#2)) ∧
+    sailZbaRtypeuwCore 0b00#2 x 0#64 = (x.truncate 32).zeroExtend 64 ∧
+    sailCMulExec (.Cregidx ic1) (.Cregidx ic2) =
+      .ExecuteAs (.MUL (rvcRegIdxSpec ic2, rvcRegIdxSpec ic1, rvcRegIdxSpec ic1,
+        { result_part := .Low, signed_rs1 := .Signed, signed_rs2 := .Signed })) := by
+  have hc1 := (rvcRegIdx_creg2reg_idx_bisim ic1).2.1
+  have hc2 := (rvcRegIdx_creg2reg_idx_bisim ic2).2.1
+  have hzextw : sailZbaRtypeuwCore 0b00#2 x 0#64 = (x.truncate 32).zeroExtend 64 := by
+    rw [← (rv64Zba_bisim_sail 0b00#2 0#6 x 0#64).2.1]
+    simp [rv64ZbaRtypeuwSpec]
+  exact ⟨by simp [sailCSextBExec, hc1], by simp [sailCSextHExec, hc1],
+    by simp [sailCZextHExec, hc1], by simp [sailCZextWExec, hc1],
+    hzextw, by simp [sailCMulExec, hc1, hc2]⟩
+
+/-- Direct `SailM` bisimulation for `Zcb` `execute_C_ZEXT_B` and `execute_C_NOT` (`cregidx = 0#3`,
+    architectural register `x8` / `s0`): proves `C.ZEXT.B` masks to `(val.truncate 8).zeroExtend 64`
+    (`val &&& 0xff#64`), `C.NOT` bitwise-inverts `~~~val`, and `C.NOT` is involutive in `SailM`. -/
+theorem rvcZcbDirectSailM_x8_bisim (val : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hx8 : s.regs.get? .x8 = some val) :
+    (sailCZextBExec (.Cregidx 0#3)).run s =
+      .ok (.Retire_Success ())
+        { s with regs := s.regs.insert .x8 ((val.truncate 8).zeroExtend 64) } ∧
+    (val.truncate 8).zeroExtend 64 = val &&& 0xff#64 ∧
+    (sailCNotExec (.Cregidx 0#3)).run s =
+      .ok (.Retire_Success ())
+        { s with regs := s.regs.insert .x8 (~~~val) } ∧
+    ((do
+        let _ ← sailCNotExec (.Cregidx 0#3)
+        let _ ← sailCNotExec (.Cregidx 0#3)
+        rX_bits (creg2reg_idx (.Cregidx 0#3))).run s) =
+      .ok val { s with regs := (s.regs.insert .x8 (~~~val)).insert .x8 val } := by
+  have hzext8 : zero_extend (m := 64) (Sail.BitVec.extractLsb val 7 0) =
+      (val.truncate 8).zeroExtend 64 := by
+    dsimp only [zero_extend, Sail.BitVec.zeroExtend, Sail.BitVec.extractLsb,
+      BitVec.extractLsb, BitVec.extractLsb', Nat.shiftRight_zero, BitVec.truncate_eq_setWidth]
+    exact congrArg (BitVec.setWidth 64) (BitVec.setWidth_eq _).symm
+  have hmask8 : (val.truncate 8).zeroExtend 64 = val &&& 0xff#64 := by
+    apply BitVec.eq_of_getLsbD_eq
+    intro k hk
+    have h255 : (0xff#64).getLsbD k = decide (k < 8) := by
+      rw [BitVec.getLsbD_eq_getElem hk]
+      revert k hk
+      decide
+    dsimp only [BitVec.zeroExtend_eq_setWidth, BitVec.truncate_eq_setWidth]
+    rw [BitVec.getLsbD_setWidth, BitVec.getLsbD_setWidth, BitVec.getLsbD_and, h255]
+    by_cases h8 : k < 8 <;> simp [hk, h8]
+  have hr8 : (rX_bits (creg2reg_idx (.Cregidx 0#3))).run s = .ok val s := by
+    simp [creg2reg_idx, rX_bits, rX, regval_from_reg, zero_extend, Sail.BitVec.zeroExtend,
+      Sail.BitVec.toNatInt, readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+    dsimp [EStateM.bind, EStateM.get, EStateM.pure, EStateM.run]
+    rw [hx8]
+    rfl
+  have hw8 : ∀ (v : BitVec 64) (st : SequentialState RegisterType trivialChoiceSource),
+      (wX_bits (creg2reg_idx (.Cregidx 0#3)) v).run st =
+        .ok () { st with regs := st.regs.insert .x8 v } := by
+    intro v st
+    simp [creg2reg_idx, wX_bits, wX, regval_into_reg, xreg_write_callback, reg_name_forwards,
+      encdec_reg_forwards_matches, encdec_reg_forwards, get_config_use_abi_names,
+      LeanRV64D.Functions.not, reg_arch_name_raw_forwards,
+      xreg_full_write_callback, zero_extend, Sail.BitVec.zeroExtend, Sail.BitVec.toNatInt,
+      to_bits, get_slice_int,
+      writeReg, PreSail.writeReg, modify, modifyGet, MonadStateOf.modifyGet]
+    rfl
+  refine ⟨?_, hmask8, ?_, ?_⟩
+  · unfold sailCZextBExec
+    dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hr8 hw8 ⊢
+    rw [hr8]
+    dsimp only
+    rw [hzext8, hw8]
+  · unfold sailCNotExec
+    dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hr8 hw8 ⊢
+    rw [hr8]
+    dsimp only
+    change (match wX_bits (creg2reg_idx (.Cregidx 0#3)) (~~~val) s with
+      | .ok _ s' => EStateM.Result.ok (ExecutionResult.Retire_Success ()) s'
+      | .error e s' => EStateM.Result.error e s') = _
+    rw [hw8]
+  · have hn1 : (sailCNotExec (.Cregidx 0#3)).run s =
+        .ok (.Retire_Success ()) { s with regs := s.regs.insert .x8 (~~~val) } := by
+      unfold sailCNotExec
+      dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hr8 hw8 ⊢
+      rw [hr8]
+      dsimp only
+      change (match wX_bits (creg2reg_idx (.Cregidx 0#3)) (~~~val) s with
+        | .ok _ s' => EStateM.Result.ok (ExecutionResult.Retire_Success ()) s'
+        | .error e s' => EStateM.Result.error e s') = _
+      rw [hw8]
+    let s1 : SequentialState RegisterType trivialChoiceSource :=
+      { s with regs := s.regs.insert .x8 (~~~val) }
+    have hr8_s1 : (rX_bits (creg2reg_idx (.Cregidx 0#3))).run s1 = .ok (~~~val) s1 := by
+      simp [s1, creg2reg_idx, rX_bits, rX, regval_from_reg, zero_extend, Sail.BitVec.zeroExtend,
+        Sail.BitVec.toNatInt, readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+      dsimp [EStateM.bind, EStateM.get, EStateM.pure, EStateM.run]
+      simp [Std.ExtDHashMap.get?_insert_self]
+      rfl
+    have hn2 : (sailCNotExec (.Cregidx 0#3)).run s1 =
+        .ok (.Retire_Success ()) { s1 with regs := s1.regs.insert .x8 val } := by
+      unfold sailCNotExec
+      dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hr8_s1 hw8 ⊢
+      rw [hr8_s1]
+      dsimp only
+      change (match wX_bits (creg2reg_idx (.Cregidx 0#3)) (~~~~~~val) s1 with
+        | .ok _ s' => EStateM.Result.ok (ExecutionResult.Retire_Success ()) s'
+        | .error e s' => EStateM.Result.error e s') = _
+      rw [BitVec.not_not, hw8]
+    let s2 : SequentialState RegisterType trivialChoiceSource :=
+      { s1 with regs := s1.regs.insert .x8 val }
+    have hr8_s2 : (rX_bits (creg2reg_idx (.Cregidx 0#3))).run s2 = .ok val s2 := by
+      simp [s2, creg2reg_idx, rX_bits, rX, regval_from_reg, zero_extend, Sail.BitVec.zeroExtend,
+        Sail.BitVec.toNatInt, readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+      dsimp [EStateM.bind, EStateM.get, EStateM.pure, EStateM.run]
+      simp [Std.ExtDHashMap.get?_insert_self]
+      rfl
+    dsimp [Bind.bind, EStateM.bind, EStateM.run, s1, s2] at hn1 hn2 hr8_s2 ⊢
+    rw [hn1]; dsimp only; rw [hn2]; dsimp only; exact hr8_s2
 
 end SailRiscvBridge
