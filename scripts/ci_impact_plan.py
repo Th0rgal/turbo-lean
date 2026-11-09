@@ -69,6 +69,11 @@ def classify(paths, event="pull_request", ref=""):
         elif p.startswith("verification/sail-riscv-bridge/"):
             domains["sail_riscv_backend"] = True
             full = True
+        elif p.startswith("verification/c2-lake-packages/"):
+            domains["lean_ir_semantics"] = True
+            domains["llvm_backend"] = True
+            domains["c_abi_runtime"] = True
+            full = True
         elif p.startswith("verification/"):
             domains["llvm_backend"] = True
             domains["gpu_tpu_backend"] = True
@@ -87,6 +92,10 @@ def classify(paths, event="pull_request", ref=""):
             domains["lean_ir_semantics"] = True
             domains["gpu_tpu_backend"] = True
             domains["sail_riscv_backend"] = True
+            full = True
+        elif p == "lean/LeanNative/Proofs/HeapObjMtAbiProofs.lean":
+            domains["lean_ir_semantics"] = True
+            domains["c_abi_runtime"] = True
             full = True
         elif p.startswith("lean/LeanNative/"):
             domains["lean_ir_semantics"] = True
@@ -207,6 +216,15 @@ class Tests(unittest.TestCase):
             for k in ("con_leche_kernel", "c_abi_runtime", "run_lean_build", "run_conformance_full"):
                 self.assertTrue(pk[k])
             self.assertEqual(pk["conformance_seeds"], 50)
+        ph = classify(["lean/LeanNative/Proofs/HeapObjMtAbiProofs.lean"])
+        for k in ("lean_ir_semantics", "c_abi_runtime", "run_lean_build", "run_conformance_full"):
+            self.assertTrue(ph[k])
+        pc2 = classify(["verification/c2-lake-packages/C2BitwiseScan/C2BitwiseScan.lean"])
+        for k in ("lean_ir_semantics", "llvm_backend", "c_abi_runtime", "run_lean_build", "run_conformance_full"):
+            self.assertTrue(pc2[k])
+        self.assertFalse(pc2["gpu_tpu_backend"])
+        self.assertFalse(pc2["con_leche_kernel"])
+        self.assertFalse(pc2["sail_riscv_backend"])
 
     def test_sdk_and_plugins(self):
         ps = classify(["sdk/accelerator-template/plugin.py"])

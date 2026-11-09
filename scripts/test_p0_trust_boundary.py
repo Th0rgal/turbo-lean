@@ -650,8 +650,12 @@ class TestP0TrustBoundary(unittest.TestCase):
     def test_13_tiered_conformance_and_sanitizer_gates_fail_closed(self) -> None:
         suite = ROOT / "scripts" / "run_conformance_suite.py"
         for bad_tier in ("C2", "C3"):
+            clean_env = dict(os.environ)
+            clean_env.pop("TURBO_C2_PACKAGES_DIR", None)
+            clean_env.pop("TURBO_CON_LECHE_BIN", None)
             res = subprocess.run(
                 [sys.executable, str(suite), "--tier", bad_tier, "--json"],
+                env=clean_env,
                 capture_output=True,
                 text=True,
             )
@@ -659,6 +663,14 @@ class TestP0TrustBoundary(unittest.TestCase):
             rep = json.loads(res.stdout)
             self.assertFalse(rep["ok"])
             self.assertEqual(rep["tierResults"][bad_tier]["status"], "BLOCKED_MISSING_DEPENDENCY")
+
+        missing_c2 = subprocess.run(
+            [sys.executable, str(suite), "--tier", "C2", "--c2-packages-dir", "/nonexistent/c2-packages", "--json"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertNotEqual(missing_c2.returncode, 0)
+        self.assertEqual(json.loads(missing_c2.stdout)["tierResults"]["C2"]["status"], "BLOCKED_MISSING_DEPENDENCY")
 
         bad_arg = subprocess.run(
             [sys.executable, str(suite), "--tier", "C99"],
