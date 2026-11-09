@@ -14171,4 +14171,174 @@ public def api := by
         let _ = fs::remove_dir_all(&tmp_dir);
         Ok(())
     }
+
+    #[test]
+    fn test_ensure_project_imports_fresh_accepts_git_pinned_implemented_by_and_custom_target_dep() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "tl_fresh_git_pinned_dep_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let proj = dir.join("proj");
+        let ext_pkgs = dir.join("shared_pkgs");
+        let bat_dir = ext_pkgs.join("batteries");
+        let pw_dir = ext_pkgs.join("proofwidgets");
+        fs::create_dir_all(proj.join("Verity"))?;
+        fs::create_dir_all(proj.join(".lake"))?;
+        fs::create_dir_all(bat_dir.join("Batteries"))?;
+        fs::create_dir_all(pw_dir.join("ProofWidgets"))?;
+        fs::create_dir_all(pw_dir.join("widget/js"))?;
+
+        let tc = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean/lean-toolchain"),
+        )?;
+        fs::write(proj.join("lean-toolchain"), &tc)?;
+        fs::write(bat_dir.join("lean-toolchain"), &tc)?;
+        fs::write(pw_dir.join("lean-toolchain"), &tc)?;
+
+        fs::write(bat_dir.join(".gitignore"), "/.lake/\n")?;
+        fs::write(
+            bat_dir.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage batteries where\n@[default_target]\nlean_lib Batteries where\n",
+        )?;
+        fs::write(
+            bat_dir.join("Batteries/Fast.lean"),
+            "unsafe def scanFast (n : Nat) : Nat := n\n@[implemented_by scanFast]\ndef scanSpec (n : Nat) : Nat := n\n@[csimp]\ntheorem scan_eq : @scanSpec = @scanSpec := rfl\n",
+        )?;
+        fs::write(bat_dir.join("Batteries.lean"), "import Batteries.Fast\n")?;
+
+        fs::write(pw_dir.join(".gitignore"), "/.lake/\n")?;
+        fs::write(pw_dir.join("widget/js/ofRpcMethod.js"), "export default {}\n")?;
+        fs::write(
+            pw_dir.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL System\npackage proofwidgets where\ntarget widgetJsAll pkg : Unit := do\n  return .nil\n@[default_target]\nlean_lib ProofWidgets where\n  needs := #[widgetJsAll]\n",
+        )?;
+        fs::write(
+            pw_dir.join("ProofWidgets/OfRpc.lean"),
+            "def rpcJs : String := include_str \"..\" / \"widget\" / \"js\" / \"ofRpcMethod.js\"\n",
+        )?;
+        fs::write(pw_dir.join("ProofWidgets.lean"), "import ProofWidgets.OfRpc\n")?;
+
+        let init_commit = |repo: &Path| -> Result<String> {
+            assert!(crate::trusted_tools::git(repo)?
+                .args(["init", "-q"])
+                .arg(repo)
+                .status()?
+                .success());
+            assert!(crate::trusted_tools::git(repo)?
+                .arg("-C")
+                .arg(repo)
+                .args(["add", "."])
+                .status()?
+                .success());
+            assert!(crate::trusted_tools::git(repo)?
+                .arg("-C")
+                .arg(repo)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@e",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "commit",
+                    "-qm",
+                    "init",
+                ])
+                .status()?
+                .success());
+            Ok(String::from_utf8(
+                crate::trusted_tools::git(repo)?
+                    .arg("-C")
+                    .arg(repo)
+                    .args(["rev-parse", "HEAD"])
+                    .output()?
+                    .stdout,
+            )?
+            .trim()
+            .to_string())
+        };
+        let bat_rev = init_commit(&bat_dir)?;
+        let pw_rev = init_commit(&pw_dir)?;
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&ext_pkgs, proj.join(".lake/packages"))?;
+
+        fs::write(
+            proj.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage verity where\nrequire batteries from \".lake/packages/batteries\"\nrequire proofwidgets from \".lake/packages/proofwidgets\"\n@[default_target]\nlean_lib Verity where\n",
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            serde_json::to_string_pretty(&serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [
+                    {
+                        "type": "git",
+                        "name": "batteries",
+                        "rev": bat_rev,
+                        "url": "https://example.invalid/batteries",
+                        "inherited": false,
+                        "configFile": "lakefile.lean"
+                    },
+                    {
+                        "type": "git",
+                        "name": "proofwidgets",
+                        "rev": pw_rev,
+                        "url": "https://example.invalid/proofwidgets",
+                        "inherited": false,
+                        "configFile": "lakefile.lean"
+                    }
+                ]
+            }))?,
+        )?;
+        let target_file = proj.join("Verity/Target.lean");
+        fs::write(
+            &target_file,
+            "import Batteries\nimport ProofWidgets\ntheorem ok : scanSpec 3 = 3 := rfl\n",
+        )?;
+        fs::write(proj.join("Verity.lean"), "import Verity.Target\n")?;
+
+        let canon = fs::canonicalize(&proj)?;
+        crate::module_builder::reset_lake_inputs_tag_memo();
+        let rebuilt = ensure_project_imports_fresh(
+            &canon,
+            std::slice::from_ref(&target_file),
+            Some(tc.trim()),
+            true,
+        )?;
+        assert!(rebuilt >= 1, "first call must Lake-build missing dep imports");
+        // Second call must hit 0 stale imports without re-invoking Lake!
+        let rebuilt2 = ensure_project_imports_fresh(
+            &canon,
+            std::slice::from_ref(&target_file),
+            Some(tc.trim()),
+            true,
+        )?;
+        assert_eq!(
+            rebuilt2, 0,
+            "Lake-built git-pinned @[implemented_by]/@[csimp] + custom-target-needs deps must verify fresh"
+        );
+        let mut store = crate::TurboStore::open(Some(&dir.join("store")))?;
+        let build_rep = crate::module_builder::build_project_modules_native(
+            &mut store,
+            &canon,
+            &[],
+            "trusted",
+            2,
+            false,
+            true,
+            None,
+        )?;
+        assert_eq!(
+            build_rep.modules_compiled, 2,
+            "turbo-lean build must reuse prebuilt ProofWidgets & Batteries oleans and compile only Verity.Target + Verity"
+        );
+
+        crate::zygote::purge_snapshot_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
 }

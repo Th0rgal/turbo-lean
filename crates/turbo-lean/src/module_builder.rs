@@ -9843,6 +9843,7 @@ pub(crate) fn spec_source_has_disallowed_elab_host_effects(
 ) -> bool {
     if spec.is_root_pkg {
         crate::splitter::source_may_read_host_state(src_raw)
+            || crate::splitter::source_has_runtime_replacement_attribute(src_raw)
             || !root_module_includes_all_covered_by_lake_inputs(
                 cfg,
                 &spec.module_name,
@@ -10572,8 +10573,13 @@ fn lake_closure_export_info_inner(
                 let inputs_arr = tv.get("inputs").and_then(|v| v.as_array())?;
                 let expected_opts_and_args_ok =
                     verify_lake_trace_options_and_args(spec, &tv, base_idx + 2);
+                let extra_dep_ok = if !spec.custom_target_needs.is_empty() {
+                    spec_in_clean_git_pinned_manifest_package(cfg, spec, cache)
+                } else {
+                    actual_extra_dep_h == expected_extra_dep_h
+                };
                 if actual_imports_h != expected_imports_h
-                    || actual_extra_dep_h != expected_extra_dep_h
+                    || !extra_dep_ok
                     || actual_libs_h != empty_libs
                     || inputs_arr
                         .get(base_idx)
@@ -22271,6 +22277,7 @@ fn node_source_has_disallowed_elab_host_effects(
 ) -> bool {
     if node.is_root_pkg {
         crate::splitter::source_may_read_host_state(src_raw)
+            || crate::splitter::source_has_runtime_replacement_attribute(src_raw)
             || !root_module_includes_all_covered_by_lake_inputs(
                 cfg,
                 &node.module_name,
@@ -41246,7 +41253,7 @@ globs = ["Down.+"]
         )?;
         fs::write(
             pw_dir.join("ProofWidgets.lean"),
-            "prelude\ndef pwHelper : Nat := 1\n",
+            "prelude\nunsafe def pwFast : Nat := 1\n@[implemented_by pwFast]\ndef pwHelper : Nat := 1\n",
         )?;
 
         let dep_dir = root.join(".lake/packages/pwdep");
@@ -41586,7 +41593,9 @@ globs = ["Down.+"]
         )?;
         reset_lake_inputs_tag_memo();
         let pw_spec = resolve_module_in_package(&pw_pkg, false, "ProofWidgets").expect("PW spec");
-        write_fake_leantar_artifacts(&spec_olean_path(&pw_spec), 0x123456789abcdef0)?;
+        let pw_src = "prelude\nunsafe def pwFast : Nat := 1\n@[implemented_by pwFast]\ndef pwHelper : Nat := 1\n";
+        let pw_olean = spec_olean_path(&pw_spec);
+        write_fake_leantar_artifacts(&pw_olean, 0x123456789abcdef0)?;
         let mut cache3 = LakeClosureCache {
             ignore_mtime_skew: true,
             ..Default::default()
@@ -41595,6 +41604,92 @@ globs = ["Down.+"]
         assert!(
             lake_closure_export_info(&cfg, &pw_spec, true, &mut cache3, &mut visiting3).is_some(),
             "clean git-pinned custom-target-needs package must verify"
+        );
+        // Lake-built `.trace` WITH `inputs` (where `ProofWidgets:extraDep` embeds custom target `widgetJsAll` hash)
+        // must also verify cleanly on clean git-pinned packages and reuse prebuilt `.olean` in `build_module_dag`.
+        let pw_o_h = fs::read_to_string(format!("{}.hash", pw_olean.display()))?;
+        let pw_i_h =
+            fs::read_to_string(format!("{}.hash", pw_olean.with_extension("ilean").display()))?;
+        let pw_inputs = serde_json::json!([
+            [
+                "ProofWidgets:deps",
+                [
+                    [
+                        "deps",
+                        [
+                            [
+                                "proofwidgets/ProofWidgets:extraDep",
+                                [
+                                    ["@ProofWidgets:extraDep", "00000000000006bb"],
+                                    ["proofwidgets/widgetJsAll", "fedcba9876543210"]
+                                ]
+                            ],
+                            ["imports", "00000000000006bb"]
+                        ]
+                    ],
+                    [
+                        "libs",
+                        [
+                            ["import dynlibs", "00000000000006bb"],
+                            ["package external libraries", "00000000000006bb"],
+                            ["module dynlibs", "00000000000006bb"],
+                            ["module plugins", "00000000000006bb"]
+                        ]
+                    ]
+                ]
+            ],
+            [
+                format!("Lean 4.31.0, commit {fake_githash}"),
+                format!("{:016x}", lake_hash_bytes(fake_githash.as_bytes()))
+            ],
+            [
+                pw_spec.src_path.to_string_lossy(),
+                format!("{:016x}", lake_hash_text(pw_src))
+            ],
+            ["options", "00000000000006bb"],
+            [
+                "isModule: false",
+                format!("{:016x}", lake_mix_hash(LAKE_NIL_HASH, 13))
+            ],
+            [
+                "Module.name: ProofWidgets",
+                format!("{:016x}", lake_hash_name("ProofWidgets"))
+            ],
+            [
+                "Package.id?: (some ProofWidgets)",
+                format!("{:016x}", lake_hash_pkg_id("ProofWidgets"))
+            ],
+            ["Module.leanArgs: #[]", "00000000000006bb"]
+        ]);
+        let pw_dep_h = lake_input_hash(&pw_inputs)?;
+        fs::write(
+            pw_olean.with_extension("trace"),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": "2025-09-10",
+                "depHash": format!("{pw_dep_h:016x}"),
+                "inputs": pw_inputs,
+                "outputs": {
+                    "m": false,
+                    "o": [format!("{}.olean", pw_o_h.trim())],
+                    "i": format!("{}.ilean", pw_i_h.trim())
+                }
+            }))?,
+        )?;
+        let mut cache3_inputs = LakeClosureCache {
+            ignore_mtime_skew: true,
+            ..Default::default()
+        };
+        let mut visiting3_inputs = HashSet::new();
+        assert!(
+            lake_closure_export_info(
+                &cfg,
+                &pw_spec,
+                true,
+                &mut cache3_inputs,
+                &mut visiting3_inputs,
+            )
+            .is_some(),
+            "Lake-built inputs-bearing .trace for clean git-pinned custom-target-needs + @[implemented_by] package must verify"
         );
         fs::write(dep_dir.join("PwDep.lean"), dep_src)?;
         reset_lake_inputs_tag_memo();
@@ -42373,6 +42468,14 @@ end Fixture
         assert!(
             spec_source_has_disallowed_elab_host_effects(&cfg_u, &spec_u, &src_u),
             "root module with untracked include_str must be flagged as host-effecting"
+        );
+        assert!(
+            spec_source_has_disallowed_elab_host_effects(
+                &cfg_u,
+                &spec_u,
+                "unsafe def fast : Nat := 0\n@[implemented_by fast]\ndef slow : Nat := 1\n"
+            ),
+            "root module with @[implemented_by] must still be flagged as host-effecting"
         );
 
         crate::zygote::purge_snapshot_dir(&dir);
