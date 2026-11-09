@@ -90,9 +90,11 @@ import LeanNative.Driver.CoreCLI
 import LeanNative.Proofs.AsyncStateMachineProofs
 import LeanNative.Transform.CostAutotune
 import LeanNative.Proofs.CostAutotuneSoundness
+import LeanNative.Proofs.TargetIRFuzzProofs
 import LeanNative.Driver.CostAutotuneCLI
 import LeanNative.Driver.LLVMDiffCLI
 import LeanNative.Driver.GPUDiffCLI
+import LeanNative.Driver.TargetIRFuzzCLI
 
 namespace LeanNative.Core
 

@@ -59,6 +59,8 @@ def runMain (args : List String) : IO UInt32 := do
       return rc
     match args with
     | "llvm-diff-suite" :: rest => LeanNative.Driver.LLVMDiffCLI.run rest
+    | "gpu-tpu-diff-suite" :: rest => LeanNative.Driver.GPUDiffCLI.run rest
+    | "target-ir-fuzz-suite" :: rest => LeanNative.Driver.TargetIRFuzzCLI.run rest
     | "build-exe" :: rest    => runBuildExe rest
     | "audit-axioms" :: rest => runAuditAxioms rest
     | "turbo-status" :: _    => runTurboStatus

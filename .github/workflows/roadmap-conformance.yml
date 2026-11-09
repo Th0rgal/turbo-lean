@@ -23,6 +23,7 @@ jobs:
     outputs:
       run_lean_build: ${{ steps.plan.outputs.run_lean_build }}
       conformance_seeds: ${{ steps.plan.outputs.conformance_seeds }}
+      target_ir_fuzz_seeds: ${{ steps.plan.outputs.target_ir_fuzz_seeds }}
       run_conformance_full: ${{ steps.plan.outputs.run_conformance_full }}
       lean_turbo: ${{ steps.plan.outputs.lean_turbo }}
       llvm_backend: ${{ steps.plan.outputs.llvm_backend }}
@@ -53,6 +54,7 @@ jobs:
           python3 scripts/check_con_leche_bridge_sync.py
           python3 scripts/check_sail_riscv_bridge_sync.py --self-test
           python3 scripts/check_sail_riscv_bridge_sync.py
+          python3 scripts/run_target_ir_fuzz.py --self-test
           python3 sdk/accelerator-template/validate.py
       - id: plan
         env:
@@ -139,6 +141,7 @@ jobs:
       - name: Run Contract V5 checklist & 3-way ASan/UBSan conformance gate
         env:
           CONFORMANCE_SEEDS: ${{ needs.impact.outputs.conformance_seeds }}
+          TARGET_IR_FUZZ_SEEDS: ${{ needs.impact.outputs.target_ir_fuzz_seeds }}
         run: ./scripts/verify_roadmap_contract.sh
 
       - name: Run full scalar/tuple/Stage-1D frontend & SymbolicTV conformance suite
