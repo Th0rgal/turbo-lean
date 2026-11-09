@@ -35,7 +35,8 @@ def classify(paths, event="pull_request", ref=""):
     )
     domains = dict.fromkeys(("ci_scripts", "sdk", "rust_cli", "lean_turbo",
                             "lean_ir_semantics", "llvm_backend",
-                            "gpu_tpu_backend", "c_abi_runtime"), False)
+                            "gpu_tpu_backend", "con_leche_kernel",
+                            "c_abi_runtime"), False)
     full = force
     for p in paths:
         if is_doc(p):
@@ -58,9 +59,21 @@ def classify(paths, event="pull_request", ref=""):
         elif p.startswith("verification/lnsym-bridge/"):
             domains["gpu_tpu_backend"] = True
             full = True
+        elif p.startswith("verification/con-leche-bridge/"):
+            domains["con_leche_kernel"] = True
+            full = True
         elif p.startswith("verification/"):
             domains["llvm_backend"] = True
             domains["gpu_tpu_backend"] = True
+            domains["con_leche_kernel"] = True
+            full = True
+        elif p in {
+            "crates/turbo-lean/src/kernel.rs",
+            "crates/turbo-lean/src/receipt.rs",
+            "crates/turbo-lean/tests/pluggable_kernel_cli.rs",
+        }:
+            domains["con_leche_kernel"] = True
+            domains["c_abi_runtime"] = True
             full = True
         elif p.startswith("lean/LeanNative/"):
             domains["lean_ir_semantics"] = True
@@ -111,7 +124,8 @@ def plan_trees(base, head, event, ref):
         plan["sdk"] and not any(
             plan[k] for k in ("ci_scripts", "rust_cli", "lean_turbo",
                               "lean_ir_semantics", "llvm_backend",
-                              "gpu_tpu_backend", "c_abi_runtime")
+                              "gpu_tpu_backend", "con_leche_kernel",
+                              "c_abi_runtime")
         ) and not plan["run_conformance_full"]
     )
     plan["run_lean_build"] = (plan["force_full"] or not preflight_only
@@ -144,6 +158,17 @@ class Tests(unittest.TestCase):
             self.assertTrue(pl[k])
         self.assertFalse(pl["llvm_backend"])
         self.assertEqual(pl["conformance_seeds"], 50)
+        pc = classify(["verification/con-leche-bridge/ConLecheBridge/Soundness.lean"])
+        for k in ("con_leche_kernel", "run_lean_build", "run_conformance_full"):
+            self.assertTrue(pc[k])
+        self.assertFalse(pc["llvm_backend"])
+        self.assertFalse(pc["gpu_tpu_backend"])
+        self.assertEqual(pc["conformance_seeds"], 50)
+        for path in ("crates/turbo-lean/src/kernel.rs", "crates/turbo-lean/src/receipt.rs"):
+            pk = classify([path])
+            for k in ("con_leche_kernel", "c_abi_runtime", "run_lean_build", "run_conformance_full"):
+                self.assertTrue(pk[k])
+            self.assertEqual(pk["conformance_seeds"], 50)
 
     def test_sdk_and_plugins(self):
         ps = classify(["sdk/accelerator-template/plugin.py"])
@@ -287,7 +312,8 @@ def verify_plan_invariants(plan):
         plan.get("sdk", False) and not any(
             plan[k] for k in ("ci_scripts", "rust_cli", "lean_turbo",
                               "lean_ir_semantics", "llvm_backend",
-                              "gpu_tpu_backend", "c_abi_runtime")
+                              "gpu_tpu_backend", "con_leche_kernel",
+                              "c_abi_runtime")
         ) and not plan["run_conformance_full"]
     )
     expected_build = (plan["force_full"] or not preflight_only

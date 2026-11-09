@@ -4,14 +4,21 @@
 The former Python reference formulas and C runtime stubs were not independent
 Lean execution. They are deliberately excluded from acceptance. Full loop
 (`seqFor`), upstream 250+ `lean4/tests/lean/run`, ecosystem Lake packages
-(`C2`), `con-leche` holdouts (`C3`), and hardware target qualification remain
-open and fail closed when requested via `--tier`.
+(`C2`), and hardware target qualification remain open (`C2` fails closed when
+requested via `--tier`). Tier `C3` runs the `R1`–`R6` cross-regime holdout
+portfolio and adversarial `.olean` rejection battery through pinned upstream
+`leanprover/con-leche --verified` when provisioned via `TURBO_CON_LECHE_BIN`
+(or `--con-leche-bin`), and fails closed (`BLOCKED_MISSING_DEPENDENCY`)
+otherwise.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -22,6 +29,12 @@ import fuzz_lcnf_conformance as fuzz
 
 ROOT = Path(__file__).resolve().parent.parent
 CORE = ROOT / "lean/.lake/build/bin/lean-native-core"
+PINNED_CON_LECHE_REV = "501589f5680d9599dee1bcef30a420bc8924c490"
+PINNED_CON_LECHE_TOOLCHAIN = "leanprover/lean4:v4.35.0"
+BRIDGE_CON_LECHE_BIN = (
+    ROOT
+    / "verification/con-leche-bridge/.lake/packages/con-leche/.lake/build/bin/con-leche"
+)
 
 VALID_TIERS = ("C1", "C2", "C3", "C4")
 C1_CORPUS_TESTS = (
@@ -31,6 +44,122 @@ C1_CORPUS_TESTS = (
     "ScalarFrontend.test_chained_boolean_join_points_and_tuple_helpers",
     "ScalarFrontend.test_unsigned_casts_and_input_dependent_boolean_branches",
     "ScalarFrontend.test_stage1b_narrow_abi_usize_bool_enums_joinpoints_and_divmod_zero",
+)
+
+C3_HOLDOUT_REGIMES: tuple[tuple[str, str, str], ...] = (
+    (
+        "R1",
+        "HoldoutR1Algebra",
+        """/- Regime R1: Commutative semiring / monoid algebraic identities. -/
+structure CommMonoidCarrier (α : Type u) where
+  op : α → α → α
+  one : α
+  op_assoc : ∀ a b c, op (op a b) c = op a (op b c)
+  op_comm : ∀ a b, op a b = op b a
+  one_op : ∀ a, op one a = a
+
+def natAddMonoid : CommMonoidCarrier Nat where
+  op := Nat.add
+  one := 0
+  op_assoc := Nat.add_assoc
+  op_comm := Nat.add_comm
+  one_op := Nat.zero_add
+
+theorem r1_four_way_reassoc {α : Type u} (M : CommMonoidCarrier α) (a b c d : α) :
+    M.op (M.op a b) (M.op c d) = M.op (M.op a c) (M.op b d) := by
+  rw [M.op_assoc a b (M.op c d)]
+  rw [← M.op_assoc b c d, M.op_comm b c, M.op_assoc c b d]
+  rw [← M.op_assoc a c (M.op b d)]
+
+theorem r1_nat_instance (x y z w : Nat) :
+    (x + y) + (z + w) = (x + z) + (y + w) :=
+  r1_four_way_reassoc natAddMonoid x y z w
+""",
+    ),
+    (
+        "R2",
+        "HoldoutR2Analysis",
+        """/- Regime R2: Order bounds, discrete Lipschitz / triangle inequalities. -/
+def natDist (a b : Nat) : Nat := (a - b) + (b - a)
+
+theorem r2_natDist_self (a : Nat) : natDist a a = 0 := by
+  simp [natDist]
+
+theorem r2_natDist_symm (a b : Nat) : natDist a b = natDist b a := by
+  simp [natDist, Nat.add_comm]
+
+theorem r2_monotone_step_bound (a b k : Nat) (h : a ≤ b) :
+    a + k ≤ b + k ∧ k + a ≤ k + b :=
+  ⟨Nat.add_le_add_right h k, Nat.add_le_add_left h k⟩
+""",
+    ),
+    (
+        "R3",
+        "HoldoutR3Combinatorics",
+        """/- Regime R3: Finite combinatorics, list reversals, and length invariants. -/
+def pairSwap {α β : Type u} (p : α × β) : β × α := (p.2, p.1)
+
+theorem r3_pairSwap_involutive {α β : Type u} (p : α × β) :
+    pairSwap (pairSwap p) = p := by
+  cases p
+  rfl
+
+theorem r3_append_length_invariant {α : Type u} (xs ys zs : List α) :
+    (xs ++ ys ++ zs).length = xs.length + (ys.length + zs.length) := by
+  simp [List.length_append, Nat.add_assoc]
+""",
+    ),
+    (
+        "R4",
+        "HoldoutR4Foundations",
+        """/- Regime R4: Higher-universe indexed inductives and quotient soundness lifts. -/
+inductive TermTree (α : Type u) : Nat → Type u where
+  | leaf : α → TermTree α 0
+  | node : {n : Nat} → TermTree α n → TermTree α n → TermTree α (n + 1)
+
+def treeDepth {α : Type u} {n : Nat} (_ : TermTree α n) : Nat := n
+
+theorem r4_node_depth {α : Type u} {n : Nat} (l r : TermTree α n) :
+    treeDepth (TermTree.node l r) = treeDepth l + 1 := rfl
+
+def modTwoRel (a b : Nat) : Prop := a % 2 = b % 2
+
+def parityLift : Quot modTwoRel → Nat :=
+  Quot.lift (fun n => n % 2) (fun _ _ h => h)
+
+theorem r4_quot_parity_sound (a b : Nat) (h : modTwoRel a b) :
+    parityLift (Quot.mk modTwoRel a) = parityLift (Quot.mk modTwoRel b) := by
+  exact congrArg parityLift (Quot.sound h)
+""",
+    ),
+    (
+        "R5",
+        "HoldoutR5SystemsBitwise",
+        """/- Regime R5: Verified systems & fixed-width UInt64 XOR involutive masking. -/
+def xorCipher (word key : UInt64) : UInt64 :=
+  word ^^^ key
+
+theorem r5_uint64_xor_roundtrip (w k : UInt64) :
+    xorCipher (xorCipher w k) k = w := by
+  simp [xorCipher, UInt64.xor_assoc, UInt64.xor_self, UInt64.xor_zero]
+""",
+    ),
+    (
+        "R6",
+        "HoldoutR6StencilPhysics",
+        """/- Regime R6: 1D discrete conservation / telescoping stencil invariant. -/
+def stencilFluxSum : List Nat → Nat
+  | [] => 0
+  | x :: xs => x + stencilFluxSum xs
+
+theorem r6_stencilFluxSum_append (xs ys : List Nat) :
+    stencilFluxSum (xs ++ ys) = stencilFluxSum xs + stencilFluxSum ys := by
+  induction xs with
+  | nil => simp [stencilFluxSum]
+  | cons x xs ih =>
+    simp [stencilFluxSum, ih, Nat.add_assoc]
+""",
+    ),
 )
 
 
@@ -59,6 +188,317 @@ def command_json(*args: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise RuntimeError("Expected a structured gate report")
     return value
+
+
+def resolve_con_leche_bin(cli_bin: str | None) -> Path | None:
+    raw = (cli_bin if cli_bin is not None else os.environ.get("TURBO_CON_LECHE_BIN", "")).strip()
+    if not raw:
+        return None
+    if raw == "auto":
+        cand = BRIDGE_CON_LECHE_BIN
+    else:
+        cand = Path(raw)
+    if cand.is_file() and os.access(cand, os.X_OK):
+        return cand.resolve()
+    return None
+
+
+def find_v435_lean_and_init() -> tuple[Path, Path] | None:
+    candidates: list[str | None] = [
+        fuzz.find_lean_binary(),
+        shutil.which("lean"),
+        str(Path.home() / ".elan/toolchains/leanprover--lean4---v4.35.0/bin/lean"),
+        "/root/.elan/toolchains/leanprover--lean4---v4.35.0/bin/lean",
+        "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin/lean",
+    ]
+    for elan_cand in [shutil.which("elan"), "/var/lib/orb-node/work/caches/elan/bin/elan"]:
+        if elan_cand and Path(elan_cand).is_file() and os.access(elan_cand, os.X_OK):
+            try:
+                out = subprocess.run(
+                    [elan_cand, "which", "lean"],
+                    cwd=ROOT / "verification" / "con-leche-bridge"
+                    if (ROOT / "verification" / "con-leche-bridge").is_dir()
+                    else ROOT,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip()
+                if out:
+                    candidates.insert(0, out)
+            except (OSError, subprocess.SubprocessError):
+                pass
+    seen: set[str] = set()
+    for cand in candidates:
+        if not cand or cand in seen:
+            continue
+        seen.add(cand)
+        p = Path(cand)
+        if not (p.is_file() and os.access(p, os.X_OK)):
+            continue
+        try:
+            ver = subprocess.run(
+                [str(p), "--version"],
+                cwd=ROOT / "lean" if (ROOT / "lean").is_dir() else ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout
+            if "4.35.0" not in ver:
+                continue
+            prefix = subprocess.run(
+                [str(p), "--print-prefix"],
+                cwd=ROOT / "lean" if (ROOT / "lean").is_dir() else ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            lean_bin = Path(prefix) / "bin" / "lean"
+            init_dir = Path(prefix) / "lib" / "lean"
+            if lean_bin.is_file() and (init_dir / "Init.olean").is_file():
+                return lean_bin, init_dir
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return None
+
+
+def corrupt_private_theorem_proof(olean_dir: Path, mod_name: str, thm_suffix: str, replacement_const: str) -> None:
+    parts: dict[str, tuple[int, bytearray]] = {}
+    for ext in ("olean", "olean.server", "olean.private"):
+        fp = olean_dir / f"{mod_name}.{ext}"
+        if fp.is_file():
+            buf = bytearray(fp.read_bytes())
+            base_addr = struct.unpack_from("<Q", buf, 80)[0]
+            parts[ext] = (base_addr, buf)
+
+    def at(addr: int) -> tuple[bytearray, int]:
+        for base_addr, buf in parts.values():
+            off = addr - base_addr
+            if 0 <= off < len(buf):
+                return buf, off
+        raise RuntimeError(f"Address {addr:#x} outside `.olean` parts for {mod_name}")
+
+    def fld(addr: int, idx: int) -> int:
+        buf, off = at(addr)
+        return struct.unpack_from("<Q", buf, off + 8 + 8 * idx)[0]
+
+    def setfld(addr: int, idx: int, val: int) -> None:
+        buf, off = at(addr)
+        struct.pack_into("<Q", buf, off + 8 + 8 * idx, val)
+
+    def decode_name(addr: int) -> str:
+        if addr == 1:
+            return ""
+        prefix = decode_name(fld(addr, 0))
+        b0, o0 = at(addr)
+        if b0[o0 + 7] == 2:
+            seg = str(fld(addr, 1) >> 1)
+        else:
+            sb, so = at(fld(addr, 1))
+            sz = struct.unpack_from("<Q", sb, so + 8)[0]
+            seg = sb[so + 32 : so + 32 + sz - 1].decode("utf-8")
+        return f"{prefix}.{seg}" if prefix else seg
+
+    def const_map(ext: str) -> dict[str, int]:
+        _, buf = parts[ext]
+        arr_buf, arr_off = at(fld(struct.unpack_from("<Q", buf, 88)[0], 2))
+        count = struct.unpack_from("<Q", arr_buf, arr_off + 8)[0]
+        out: dict[str, int] = {}
+        for i in range(count):
+            c_ptr = struct.unpack_from("<Q", arr_buf, arr_off + 24 + 8 * i)[0]
+            cname = decode_name(fld(fld(fld(c_ptr, 0), 0), 0))
+            out[cname] = c_ptr
+        return out
+
+    priv_consts = const_map("olean.private")
+    target_names = [k for k in priv_consts if k.endswith(thm_suffix)]
+    if len(target_names) != 1 or replacement_const not in priv_consts:
+        raise RuntimeError(
+            f"Expected unique `{thm_suffix}` and `{replacement_const}` in {mod_name}.olean.private; got {list(priv_consts)}"
+        )
+    thm_val_ptr = fld(priv_consts[target_names[0]], 0)
+    repl_val_expr_ptr = fld(priv_consts[replacement_const], 0)
+    setfld(thm_val_ptr, 1, fld(repl_val_expr_ptr, 1))
+    for ext, (_, buf) in parts.items():
+        (olean_dir / f"{mod_name}.{ext}").write_bytes(buf)
+
+
+def run_c3_corpus(con_leche_bin_arg: str | None) -> dict[str, Any]:
+    con_leche_bin = resolve_con_leche_bin(con_leche_bin_arg)
+    if con_leche_bin is None:
+        return {
+            "tier": "C3",
+            "ok": False,
+            "status": "BLOCKED_MISSING_DEPENDENCY",
+            "reason": (
+                "Cross-regime holdouts (R1-R6) require provisioned upstream leanprover/con-leche "
+                f"binary via TURBO_CON_LECHE_BIN or --con-leche-bin (expected rev {PINNED_CON_LECHE_REV})"
+            ),
+        }
+    lean_env = find_v435_lean_and_init()
+    if lean_env is None:
+        return {
+            "tier": "C3",
+            "ok": False,
+            "status": "BLOCKED_MISSING_DEPENDENCY",
+            "reason": f"Lean toolchain {PINNED_CON_LECHE_TOOLCHAIN} (`Init.olean`) not found for C3 `.olean` compilation",
+        }
+    lean_bin, init_dir = lean_env
+    jobs = max(1, min(4, os.cpu_count() or 2))
+
+    with tempfile.TemporaryDirectory(prefix="turbo_c3_con_leche_") as tmp:
+        tmp_path = Path(tmp)
+        holdout_dir = tmp_path / "holdouts"
+        adv_dir = tmp_path / "adversarial"
+        scratch_tmp = tmp_path / "scratch"
+        holdout_dir.mkdir(parents=True, exist_ok=True)
+        adv_dir.mkdir(parents=True, exist_ok=True)
+        scratch_tmp.mkdir(parents=True, exist_ok=True)
+
+        sub_env = dict(os.environ)
+        sub_env["TMPDIR"] = str(scratch_tmp)
+
+        compiled_holdouts: list[dict[str, Any]] = []
+        root_modules: list[str] = []
+        for regime_id, mod_name, src_code in C3_HOLDOUT_REGIMES:
+            src_file = holdout_dir / f"{mod_name}.lean"
+            olean_file = holdout_dir / f"{mod_name}.olean"
+            src_file.write_text(src_code, encoding="utf-8")
+            comp = subprocess.run(
+                [str(lean_bin), "-R", str(holdout_dir), "-o", str(olean_file), str(src_file)],
+                cwd=holdout_dir,
+                env=sub_env,
+                capture_output=True,
+                text=True,
+            )
+            if comp.returncode != 0 or not olean_file.is_file():
+                return {
+                    "tier": "C3",
+                    "ok": False,
+                    "status": "holdout_compilation_failed",
+                    "regime": regime_id,
+                    "module": mod_name,
+                    "stderr": ((comp.stdout or "") + "\n" + (comp.stderr or "")).strip()[-1200:],
+                }
+            compiled_holdouts.append(
+                {
+                    "regime": regime_id,
+                    "module": mod_name,
+                    "oleanSha256": hashlib.sha256(olean_file.read_bytes()).hexdigest(),
+                }
+            )
+            root_modules.append(mod_name)
+
+        holdout_search_path = f"{holdout_dir}:{init_dir}"
+        holdout_cmd = [
+            str(con_leche_bin),
+            "--verified",
+            f"--jobs={jobs}",
+            "--olean",
+            f"--search-path={holdout_search_path}",
+            "--",
+            *root_modules,
+        ]
+        holdout_res = subprocess.run(holdout_cmd, cwd=holdout_dir, env=sub_env, capture_output=True, text=True)
+        holdouts_accepted = holdout_res.returncode == 0 and "accepted " in (holdout_res.stdout or "")
+
+        # Compile adversarial `.olean` fixtures modeled on upstream `con-leche/tests/olean.sh`.
+        adv_sources = {
+            "Tiny": (
+                "module\nprelude\npublic section\ninductive T : Type where\n  | a\n  | b\nend\n"
+            ),
+            "ClashA": (
+                "module\nprelude\npublic import Tiny\npublic section\ndef clash : T := T.a\nend\n"
+            ),
+            "ClashB": (
+                "module\nprelude\npublic import Tiny\npublic section\ndef clash : T := T.b\nend\n"
+            ),
+            "NpAx": (
+                "module\nprelude\npublic section\nset_option genCtorIdx false in\n"
+                "inductive Nat where\n  | zero : Nat\n  | succ (n : Nat) : Nat\n"
+                "axiom Nat.div : Nat → Nat → Nat\nend\n"
+            ),
+            "PrivUnused": (
+                "module\nprelude\npublic section\ninductive Yes : Prop where\n  | intro\n"
+                "inductive Two : Type where\n  | a\n  | b\ndef two : Two := Two.a\nend\n"
+                "private theorem secret : Yes := Yes.intro\n"
+            ),
+        }
+        adv_env = dict(sub_env)
+        adv_env["LEAN_PATH"] = str(adv_dir)
+        for mod_name, src_txt in adv_sources.items():
+            sf = adv_dir / f"{mod_name}.lean"
+            of = adv_dir / f"{mod_name}.olean"
+            sf.write_text(src_txt, encoding="utf-8")
+            cp = subprocess.run(
+                [str(lean_bin), "-R", str(adv_dir), "-o", str(of), str(sf)],
+                cwd=adv_dir,
+                env=adv_env,
+                capture_output=True,
+                text=True,
+            )
+            if cp.returncode != 0 or not of.is_file():
+                return {
+                    "tier": "C3",
+                    "ok": False,
+                    "status": "adversarial_fixture_compile_failed",
+                    "module": mod_name,
+                    "stderr": (cp.stderr or "")[-1200:],
+                }
+
+        corrupt_dir = tmp_path / "corrupt_priv"
+        shutil.copytree(adv_dir, corrupt_dir)
+        corrupt_private_theorem_proof(corrupt_dir, "PrivUnused", ".secret", "two")
+
+        adversarial_checks: list[dict[str, Any]] = []
+        adv_matrix: list[tuple[str, int, Path, list[str]]] = [
+            ("conflicting_constants_ClashA_ClashB", 1, adv_dir, ["ClashA", "ClashB"]),
+            ("spoofed_nat_div_axiom_NpAx", 1, adv_dir, ["NpAx"]),
+            ("unreferenced_private_theorem_clean_control", 0, adv_dir, ["PrivUnused"]),
+            ("corrupted_private_theorem_proof_PrivUnused", 1, corrupt_dir, ["PrivUnused"]),
+            ("missing_module_fail_closed", 3, adv_dir, ["NoSuchModuleInC3"]),
+        ]
+        for case_name, expected_rc, sp_dir, mods in adv_matrix:
+            rc_res = subprocess.run(
+                [
+                    str(con_leche_bin),
+                    "--verified",
+                    "--jobs=2",
+                    "--olean",
+                    f"--search-path={sp_dir}",
+                    "--",
+                    *mods,
+                ],
+                cwd=sp_dir,
+                env=sub_env,
+                capture_output=True,
+                text=True,
+            )
+            adversarial_checks.append(
+                {
+                    "case": case_name,
+                    "expectedExit": expected_rc,
+                    "actualExit": rc_res.returncode,
+                    "matched": rc_res.returncode == expected_rc,
+                }
+            )
+
+        adv_all_matched = all(c["matched"] for c in adversarial_checks)
+        ok = holdouts_accepted and adv_all_matched
+        return {
+            "tier": "C3",
+            "ok": ok,
+            "status": "passed_con_leche_verified_holdouts" if ok else "failed_con_leche_holdouts",
+            "conLecheBin": str(con_leche_bin),
+            "conLecheRev": PINNED_CON_LECHE_REV,
+            "leanToolchain": PINNED_CON_LECHE_TOOLCHAIN,
+            "jobs": jobs,
+            "regimesChecked": [h["regime"] for h in compiled_holdouts],
+            "holdoutModules": compiled_holdouts,
+            "holdoutExitCode": holdout_res.returncode,
+            "holdoutStdoutTail": (holdout_res.stdout or "").strip()[-400:],
+            "holdoutStderrTail": (holdout_res.stderr or "").strip()[-800:],
+            "adversarialChecks": adversarial_checks,
+        }
 
 
 def run_c1_corpus(asan: bool, ubsan: bool) -> dict[str, Any]:
@@ -137,7 +577,12 @@ def main() -> int:
         dest="tiers",
         action="append",
         default=None,
-        help="Comma-separated conformance tiers (C1,C2,C3,C4). Default: C4; C2/C3 fail closed until wired.",
+        help="Comma-separated conformance tiers (C1,C2,C3,C4). Default: C4; C2 fails closed; C3 requires TURBO_CON_LECHE_BIN / --con-leche-bin.",
+    )
+    parser.add_argument(
+        "--con-leche-bin",
+        default=None,
+        help="Path to verified `con-leche` binary (or `auto` for verification/con-leche-bridge build) for `--tier C3`.",
     )
     parser.add_argument("--asan", action="store_true", help="Instrument compiled LLVM IR + C driver with AddressSanitizer")
     parser.add_argument(
@@ -159,16 +604,22 @@ def main() -> int:
         parser.error(str(err))
         return 2
 
+    needs_core_gates = any(t != "C3" for t in tiers)
     try:
-        certs = command_json("verify-certs", "--canonical-benchmark", "--json")
-        plugins = command_json("plugins", "--canonical-benchmark", "--test-adversarial", "--json")
-        if certs.get("verified") is not True or not certs.get("declSummaries"):
-            failures.append({"stage": "certificate_chain", "detail": certs})
-        if (plugins.get("adversarialRejected") is not True
-                or type(plugins.get("rejectedCount")) is not int or plugins["rejectedCount"] < 1
-                or not plugins.get("declAudits")
-                or any(r.get("tvVerified") is not True for r in plugins["declAudits"])):
-            failures.append({"stage": "adversarial_plugin_gate", "detail": plugins})
+        if needs_core_gates or CORE.is_file():
+            if needs_core_gates or os.access(CORE, os.X_OK):
+                certs = command_json("verify-certs", "--canonical-benchmark", "--json")
+                plugins = command_json("plugins", "--canonical-benchmark", "--test-adversarial", "--json")
+                if certs.get("verified") is not True or not certs.get("declSummaries"):
+                    failures.append({"stage": "certificate_chain", "detail": certs})
+                if (
+                    plugins.get("adversarialRejected") is not True
+                    or type(plugins.get("rejectedCount")) is not int
+                    or plugins["rejectedCount"] < 1
+                    or not plugins.get("declAudits")
+                    or any(r.get("tvVerified") is not True for r in plugins["declAudits"])
+                ):
+                    failures.append({"stage": "adversarial_plugin_gate", "detail": plugins})
 
         for tier in tiers:
             if tier == "C1":
@@ -186,14 +637,10 @@ def main() -> int:
                 tier_results["C2"] = c2
                 failures.append({"stage": "tier_C2_unimplemented", "detail": c2})
             elif tier == "C3":
-                c3 = {
-                    "tier": "C3",
-                    "ok": False,
-                    "status": "BLOCKED_MISSING_DEPENDENCY",
-                    "reason": "Cross-regime holdouts (R1-R6) require upstream leanprover/con-leche vendoring and real .olean replay",
-                }
+                c3 = run_c3_corpus(args.con_leche_bin)
                 tier_results["C3"] = c3
-                failures.append({"stage": "tier_C3_unimplemented", "detail": c3})
+                if c3.get("ok") is not True:
+                    failures.append({"stage": "tier_C3_con_leche_holdouts", "detail": c3})
             elif tier == "C4":
                 execution = fuzz.run_fuzzer(args.fuzz_seeds, asan=args.asan, ubsan=args.ubsan)
                 tier_results["C4"] = execution
@@ -202,6 +649,17 @@ def main() -> int:
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as error:
         failures.append({"stage": "execution_failure", "detail": str(error)})
 
+    missing_coverage = [
+        "alias_RC_seqFor_llvm",
+        "upstream_lean4_run_250",
+        "tier_C2_ecosystem_packages",
+        *(
+            []
+            if tier_results.get("C3", {}).get("ok") is True
+            else ["tier_C3_sealed_corpus_and_cas_replay"]
+        ),
+        "target_qualification",
+    ]
     report = {
         "schemaVersion": "turbo-lean-conformance-v2",
         "ok": not failures,
@@ -212,7 +670,7 @@ def main() -> int:
         "ubsanScope": "c_driver_and_link_runtime_only_not_llvm_ir" if args.ubsan else "disabled",
         "scope": "scalar_three_engine_and_separate_certificate_plugin_gates",
         "fullRoadmapAccepted": False,
-        "missingCoverage": ["alias_RC_seqFor_llvm", "upstream_lean4_run_250", "tier_C2_ecosystem_packages", "tier_C3_con_leche_holdouts", "target_qualification"],
+        "missingCoverage": missing_coverage,
         "divergences": len(failures),
         "divergenceDetails": failures,
         "lcnfFuzzSeedsChecked": execution.get("checked", 0),
