@@ -30,6 +30,7 @@ import LeanNative.Proofs.ClosureADTProofs
 import LeanNative.Proofs.SliceViewProofs
 import LeanNative.Proofs.UnboxedRegionProofs
 import LeanNative.Proofs.HeapObjAbiProofs
+import LeanNative.Proofs.HeapObjMtAbiProofs
 import LeanNative.Proofs.LLVMLowerProofs
 import LeanNative.Proofs.StableHLOLowerProofs
 import LeanNative.Proofs.PTXLowerProofs
@@ -775,9 +776,26 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.stablehlo_clampStart_bounds
   , ``LeanNative.Proofs.msl_shift_out_of_range_traps
   , ``LeanNative.Proofs.ptx_rem_zero_traps
+  , ``LeanNative.Proofs.HeapObjMtAbi.rc_mode_partition
+  , ``LeanNative.Proofs.HeapObjMtAbi.isUnstuckMt_unsigned_iff_signed
+  , ``LeanNative.Proofs.HeapObjMtAbi.isNeverFreed_unsigned_iff_of_not_st
+  , ``LeanNative.Proofs.HeapObjMtAbi.markMt_st_becomes_mt
+  , ``LeanNative.Proofs.HeapObjMtAbi.markMt_non_st_idempotent
+  , ``LeanNative.Proofs.HeapObjMtAbi.mt_inc_ref_sticky_frozen
+  , ``LeanNative.Proofs.HeapObjMtAbi.mt_inc_ref_stays_mt_no_underflow
+  , ``LeanNative.Proofs.HeapObjMtAbi.mt_dec_ref_sticky_drop_never_frees
+  , ``LeanNative.Proofs.HeapObjMtAbi.mt_dec_ref_last_triggers_free
+  , ``LeanNative.Proofs.HeapObjMtAbi.mt_dec_ref_shared_stays_mt_live
+  , ``LeanNative.Proofs.HeapObjMtAbi.markLinear_preserves_elem_size_and_header
+  , ``LeanNative.Proofs.HeapObjMtAbi.sarray_elem_size_roundtrip_under_markLinear
+  , ``LeanNative.Proofs.HeapObjMtAbi.runtime_tag_classes_disjoint
+  , ``LeanNative.Proofs.HeapObjMtAbi.closure_layout_fields_disjoint
+  , ``LeanNative.Proofs.HeapObjMtAbi.external_layout_fields_disjoint
+  , ``LeanNative.Proofs.HeapObjMtAbi.sarray_header_and_elems_disjoint
+  , ``LeanNative.Proofs.HeapObjMtAbi.sarrayAllocWouldOverflow64_false_iff
   ]
 
-#guard auditedTheoremNames.length == 818
+#guard auditedTheoremNames.length == 835
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/

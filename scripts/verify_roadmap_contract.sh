@@ -53,10 +53,10 @@ if [ ! -x "$ZYGOTE_BIN" ]; then
   exit 1
 fi
 
-echo "=== [1/9] Spec & Documentation Pinning Ratchet (Contract V1) ==="
+echo "=== [1/10] Spec & Documentation Pinning Ratchet (Contract V1) ==="
 python3 "$ROOT_DIR/scripts/sync_docs_inventory.py" --check
 
-echo "=== [2/9] Multi-Hop Vacuity, Tightness & Packing Audit (audit-spec v2) ==="
+echo "=== [2/10] Multi-Hop Vacuity, Tightness & Packing Audit (audit-spec v2) ==="
 "$TURBO_BIN" --json audit-spec lean/TurboLean/Spec.lean | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
@@ -83,7 +83,7 @@ assert len(d.get('droppable_hypotheses', [])) == 0, d
 print(f'  [OK] MutantSuite.lean (M6): {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} tight (0 vacuous, 0 trivial, 0 droppable)')
 "
 
-echo "=== [2b/9] Configurable Anti-Reward-Hacking & Shadow-Namespace Gate (audit-spec v2.1, Contract V1/V2/V3) ==="
+echo "=== [2b/10] Configurable Anti-Reward-Hacking & Shadow-Namespace Gate (audit-spec v2.1, Contract V1/V2/V3) ==="
 "$TURBO_BIN" --json audit-spec --policy strict-proofs lean/LeanNative/Proofs/ lean/LeanNative/Transform/ lean/TurboLean/ConLeche.lean lean/TurboLean/ElabAudit.lean | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
@@ -93,12 +93,12 @@ assert len(d.get('stub_defs', [])) == 0, d
 print(f'  [OK] audit-spec v2.1 (strict-proofs) on M2-M5 proof & transform modules: {d[\"tight_specs\"]}/{d[\"total_specs_audited\"]} tight (0 vacuous, 0 trivial, 0 stub_defs, 0 forbidden_scope_decls)')
 "
 
-echo "=== [3/9] In-Kernel Transitive Axiom Gate (Lean.collectAxioms) ==="
+echo "=== [3/10] In-Kernel Transitive Axiom Gate (Lean.collectAxioms) ==="
 "$CORE_BIN" audit-axioms --json | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 assert d['passed'] is True, d
-assert d['theoremsAudited'] >= 235, d
+assert d['theoremsAudited'] >= 835, d
 assert d['forbiddenAxiomsFound'] == [], d
 names = {r['theoremName'] for r in d['results']}
 required = [
@@ -130,13 +130,17 @@ required = [
     'LeanNative.Proofs.stablehlo_clampStart_bounds',
     'LeanNative.Proofs.msl_shift_out_of_range_traps',
     'LeanNative.Proofs.ptx_rem_zero_traps',
+    'LeanNative.Proofs.HeapObjMtAbi.mt_dec_ref_last_triggers_free',
+    'LeanNative.Proofs.HeapObjMtAbi.mt_inc_ref_stays_mt_no_underflow',
+    'LeanNative.Proofs.HeapObjMtAbi.sarray_elem_size_roundtrip_under_markLinear',
+    'LeanNative.Proofs.HeapObjMtAbi.sarrayAllocWouldOverflow64_false_iff',
 ]
 missing = [r for r in required if r not in names]
 assert not missing, f'Missing mandatory theorems in AxiomAudit: {missing}'
 print(f'  [OK] AxiomAudit: {d[\"theoremsAudited\"]} theorems verified in kernel (0 sorryAx, 0 trustCompiler)')
 "
 
-echo "=== [4/9] Verified Pass Contract & Bridge/CoreCLI Hygiene Gate (Contract V2, M4 & M5) ==="
+echo "=== [4/10] Verified Pass Contract & Bridge/CoreCLI Hygiene Gate (Contract V2, M4 & M5) ==="
 grep -q "structure VerifiedCodePassContract" lean/LeanNative/Transform/Pass.lean
 grep -q "def verifiedAlgebraicPeepholeContract : VerifiedCodePassContract" lean/LeanNative/Transform/AlgebraicOpt.lean
 grep -q "def verifiedEqSatContract.*: VerifiedCodePassContract" lean/LeanNative/Transform/EqSat.lean
@@ -162,7 +166,7 @@ assert d['verified'] is True and d['overallAssurance'] == 'VerifiedKernelProof',
 print(f'  [OK] Kernel-Proved Pass Certificates (--verified-kernel-only): verified={d[\"verified\"]}, assurance={d[\"overallAssurance\"]}, decls={len(d[\"declSummaries\"])}')
 "
 
-echo "=== [5/9] Segregated Plugin & Adversarial Mutant Gate (Law 1) ==="
+echo "=== [5/10] Segregated Plugin & Adversarial Mutant Gate (Law 1) ==="
 "$CORE_BIN" plugins --canonical-benchmark --test-adversarial --json | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
@@ -171,13 +175,13 @@ assert all(a['tvVerified'] for a in d['declAudits']), d
 print(f'  [OK] Segregated Plugins: accepted={d[\"acceptedCount\"]}, rejected={d[\"rejectedCount\"]}, adversarialRejected={d[\"adversarialRejected\"]}')
 "
 
-echo "=== [6/9] 3-Way Differential Conformance Suite, Grammar-Guided LCNF Fuzzer & P0 Trust Boundary ==="
-python3 "$ROOT_DIR/scripts/run_conformance_suite.py" --tier C1,C4 --fuzz-seeds "${CONFORMANCE_SEEDS:-32}" --asan --ubsan
+echo "=== [6/10] 3-Way Differential Conformance Suite (C1, Provisioned C2 Lake Packages, C4), Grammar-Guided LCNF Fuzzer & P0 Trust Boundary ==="
+python3 "$ROOT_DIR/scripts/run_conformance_suite.py" --tier C1,C2,C4 --c2-packages-dir auto --fuzz-seeds "${CONFORMANCE_SEEDS:-32}" --asan --ubsan
 python3 -m unittest -v "$ROOT_DIR/scripts/test_p0_trust_boundary.py"
 python3 -m unittest -v "$ROOT_DIR/scripts/test_kernel_gate_audit.py"
 python3 "$ROOT_DIR/scripts/emitter_mutants.py" --unit-tests
 
-echo "=== [7/9] Stage 2 LLVM Differential (lli), Alive2 Translation Validation & lean-mlir Bridge Gate ==="
+echo "=== [7/10] Stage 2 LLVM Differential (lli), Alive2 Translation Validation & lean-mlir Bridge Gate ==="
 python3 "$ROOT_DIR/scripts/run_llvm_lli_diff.py" --self-test
 python3 "$ROOT_DIR/scripts/run_alive2_tv.py" --self-test
 python3 "$ROOT_DIR/scripts/check_lean_mlir_bridge_sync.py" --self-test
@@ -199,7 +203,7 @@ else
   echo "  [SKIP] alive-tv not installed locally; run_alive2_tv.py --self-test passed (full suite enforced in CI)"
 fi
 
-echo "=== [8/9] Stage 3 GPU/TPU Differential (ptxas, OpenXLA StableHLO, Metal MSL 3.0) & LNSym / Sail-RISC-V / ConLeche Bridge Gates ==="
+echo "=== [8/10] Stage 3 GPU/TPU Differential (ptxas, OpenXLA StableHLO, Metal MSL 3.0) & LNSym / Sail-RISC-V / ConLeche Bridge Gates ==="
 python3 "$ROOT_DIR/scripts/run_gpu_tpu_diff.py" --self-test
 python3 "$ROOT_DIR/scripts/check_lnsym_bridge_sync.py" --self-test
 python3 "$ROOT_DIR/scripts/check_lnsym_bridge_sync.py"
@@ -217,7 +221,7 @@ else
   echo "  [SKIP] ptxas / OpenXLA stablehlo wheel not cached locally; run_gpu_tpu_diff.py --self-test passed (full suite enforced in CI)"
 fi
 
-echo "=== [9/9] Stage 4 Target-IR 4-Backend Differential & Sanitizer/UB Fuzzing Gate ==="
+echo "=== [9/10] Stage 4 Target-IR 4-Backend Differential & Sanitizer/UB Fuzzing Gate ==="
 TARGET_IR_FUZZ_STRICT_TOOLS="${CI:-${GITHUB_ACTIONS:-}}" python3 "$ROOT_DIR/scripts/run_target_ir_fuzz.py" --self-test
 "$CORE_BIN" target-ir-fuzz-suite --self-test
 FUZZ_SEEDS="${TARGET_IR_FUZZ_SEEDS:-16}"
@@ -237,4 +241,12 @@ else
   echo "  [SKIP] lli / ptxas / OpenXLA stablehlo not all cached locally; run_target_ir_fuzz.py --self-test and target-ir-fuzz-suite --self-test passed (full 4-backend suite enforced in CI)"
 fi
 
-echo "=== LOCAL VALIDATION GATES PASSED (scalar corpus; full roadmap coverage remains open) ==="
+echo "=== [10/10] Stage 5 Unwrapped libleanrt.a HeapObj/ABI ASan/LSan/UBSan & TSan Stress Gate ==="
+python3 "$ROOT_DIR/scripts/run_heapobj_abi_sanitizers.py" --self-test
+if [ "${GITHUB_ACTIONS:-}" = "true" ] || [ "${CI:-}" = "true" ]; then
+  python3 "$ROOT_DIR/scripts/run_heapobj_abi_sanitizers.py" --core-bin "$CORE_BIN" --require-tsan
+else
+  python3 "$ROOT_DIR/scripts/run_heapobj_abi_sanitizers.py" --core-bin "$CORE_BIN"
+fi
+
+echo "=== LOCAL VALIDATION GATES PASSED (scalar + multi-module Lake C2 fixtures; full roadmap coverage remains open) ==="

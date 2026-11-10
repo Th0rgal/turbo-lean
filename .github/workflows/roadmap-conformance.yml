@@ -30,6 +30,7 @@ jobs:
       gpu_tpu_backend: ${{ steps.plan.outputs.gpu_tpu_backend }}
       con_leche_kernel: ${{ steps.plan.outputs.con_leche_kernel }}
       sail_riscv_backend: ${{ steps.plan.outputs.sail_riscv_backend }}
+      c_abi_runtime: ${{ steps.plan.outputs.c_abi_runtime }}
       ci_scripts: ${{ steps.plan.outputs.ci_scripts }}
       force_full: ${{ steps.plan.outputs.force_full }}
       impact_digest: ${{ steps.plan.outputs.impact_digest }}
@@ -138,7 +139,7 @@ jobs:
           (cd lean && lake build lean-native lean-native-core turbo-zygote)
           cargo build --release -p turbo-lean
 
-      - name: Run Contract V5 checklist & 3-way ASan/UBSan conformance gate
+      - name: Run Contract V5 checklist, C1/C2/C4 3-way ASan/UBSan conformance & Stage 5 libleanrt ASan/LSan/UBSan/TSan gate
         env:
           CONFORMANCE_SEEDS: ${{ needs.impact.outputs.conformance_seeds }}
           TARGET_IR_FUZZ_SEEDS: ${{ needs.impact.outputs.target_ir_fuzz_seeds }}

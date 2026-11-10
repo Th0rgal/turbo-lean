@@ -41,6 +41,7 @@ import LeanNative.Proofs.ClosureADTProofs
 import LeanNative.Proofs.SliceViewProofs
 import LeanNative.Proofs.UnboxedRegionProofs
 import LeanNative.Proofs.HeapObjAbiProofs
+import LeanNative.Proofs.HeapObjMtAbiProofs
 import LeanNative.Proofs.LLVMLowerProofs
 import LeanNative.Proofs.StableHLOLowerProofs
 import LeanNative.Proofs.PTXLowerProofs
