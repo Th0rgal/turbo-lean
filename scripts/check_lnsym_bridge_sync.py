@@ -11,7 +11,7 @@ Verifies:
    `lakefile.toml` and `lake-manifest.json` pin `leanprover/LNSym` at commit
    `49f8a1d9e46f8dcfc345f4bc15d35b0ba845ff5c` (`ELFSage @ 5820b10ff6594100f736c4009278188e14e96535`,
    `doc-gen4 @ 0e1ffe2e4ba5ecfdfaf15c65b8d3805dbb7134ae`).
-3. `LNSymBridge` proof modules contain `#verify_lnsym_bridge_axioms` (>= 24 unique audited theorems
+3. `LNSymBridge` proof modules contain `#verify_lnsym_bridge_axioms` (>= 50 unique audited theorems
    via `Lean.collectAxioms` and `bridgedTheorems.Nodup`) and zero `sorry`, `sorryAx`, `admit`,
    `axiom`, `native_decide`, `bv_decide`, `trustCompiler`, or `ofReduceBool` tokens outside Lean
    comments/strings.
@@ -44,7 +44,7 @@ PINNED_SLICE_DIGESTS: dict[str, str] = {
     SEMANTICS_REL: "b0d3ee9c6f430389d3ec72cf544881f7bb9142fa74e50d9db96f35faae1cc516",
 }
 
-MIN_AUDITED_THEOREMS = 24
+MIN_AUDITED_THEOREMS = 50
 
 FORBIDDEN_PROOF_TOKENS = re.compile(
     r"\b(?:sorry|sorryAx|admit|axiom|native_decide|bv_decide|trustCompiler|ofReduceBool)\b",

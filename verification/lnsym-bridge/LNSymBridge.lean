@@ -58,12 +58,19 @@ def bridgedTheorems : List Name :=
   , ``LNSymBridge.exec_ext_8_bisim
   , ``LNSymBridge.runArm64_butterflySliceLoop_eq_mapIdx
   , ``LNSymBridge.gf128_butterfly_program_run_28_field_spec
+  , ``LNSymBridge.sha512_k_eq_fips
+  , ``LNSymBridge.sha512_h0_eq_fips
+  , ``LNSymBridge.aes_sbox_eq_fips
+  , ``LNSymBridge.aes_sbox_injective
+  , ``LNSymBridge.aes_rcon_eq_fips
+  , ``LNSymBridge.gcm_r_eq_nist_sp800_38d
+  , ``LNSymBridge.gf128_butterfly_twiddle_sha_lane
   ]
 
 theorem bridgedTheorems_nodup : bridgedTheorems.Nodup := by
   decide
 
-def minAuditedTheorems : Nat := 24
+def minAuditedTheorems : Nat := 50
 
 theorem bridgedTheorems_length_ge : bridgedTheorems.length >= minAuditedTheorems := by
   decide
