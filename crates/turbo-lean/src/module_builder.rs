@@ -8185,6 +8185,15 @@ pub(crate) struct LakeClosureCache {
 }
 
 impl LakeClosureCache {
+    pub(crate) fn for_project(cfg: &ProjectConfig) -> Self {
+        Self {
+            ignore_mtime_skew: !crate::lake_build::worktree_auto_link_disabled(
+                &cfg.root_pkg.pkg_root,
+            ),
+            ..Default::default()
+        }
+    }
+
     pub(crate) fn seed_module_export_info(
         &mut self,
         pkg_root: PathBuf,
@@ -8576,7 +8585,7 @@ pub(crate) fn import_pin_current(
     imp: &str,
     pin: Option<ImportPinSpec<'_>>,
 ) -> bool {
-    let mut cache = LakeClosureCache::default();
+    let mut cache = LakeClosureCache::for_project(cfg);
     import_pin_current_with_policy(cfg, memo, &mut cache, imp, pin, true)
 }
 
@@ -8778,7 +8787,7 @@ pub(crate) fn forget_refreshed_dep_module(cfg: &ProjectConfig, imp: &str) {
         let rel = spec_rel_src(&spec);
         let is_root_imp = spec.pkg_root == root_key.0 && spec.module_name == root_key.1;
         let should_drop = manifest.modules.get(&rel).is_some_and(|entry| {
-            let mut cache = LakeClosureCache::default();
+            let mut cache = LakeClosureCache::for_project(cfg);
             is_root_imp
                 || !dep_pkg_import_pins_consistent(
                     cfg,
@@ -9092,6 +9101,42 @@ fn fold_lake_export_traces(
     }
 }
 
+fn verify_trace_options_value(lean_options: &LeanOptionsMap, opt_val: &serde_json::Value) -> bool {
+    if lean_options.is_empty() {
+        return opt_val.as_str() == Some("00000000000006bb")
+            || opt_val.as_array().is_some_and(Vec::is_empty);
+    }
+    let Some(arr) = opt_val.as_array() else {
+        return false;
+    };
+    if arr.len() != lean_options.len() {
+        return false;
+    }
+    let mut expected: BTreeSet<(String, String)> = BTreeSet::new();
+    for (k, v) in lean_options {
+        let cap = format!("-D{}={}", k.to_lean_string(), v.as_cli_flag_value());
+        let hex = format!("{:016x}", lake_hash_text(&cap));
+        expected.insert((cap, hex));
+    }
+    let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+    for item in arr {
+        let Some(p) = item.as_array() else {
+            return false;
+        };
+        if p.len() != 2 {
+            return false;
+        }
+        let (Some(c), Some(h)) = (p[0].as_str(), p[1].as_str()) else {
+            return false;
+        };
+        let pair = (c.to_string(), h.to_string());
+        if !expected.contains(&pair) || !seen.insert(pair) {
+            return false;
+        }
+    }
+    seen.len() == expected.len()
+}
+
 fn verify_lake_trace_options_and_args(
     spec: &DiscoveredModuleSpec,
     tv: &serde_json::Value,
@@ -9103,42 +9148,11 @@ fn verify_lake_trace_options_and_args(
     let Some(opt_pair) = inputs_arr.get(opt_idx).and_then(|v| v.as_array()) else {
         return false;
     };
-    if opt_pair.len() != 2 || opt_pair[0].as_str() != Some("options") {
+    if opt_pair.len() != 2
+        || opt_pair[0].as_str() != Some("options")
+        || !verify_trace_options_value(&spec.lean_options, &opt_pair[1])
+    {
         return false;
-    }
-    if spec.lean_options.is_empty() {
-        let empty_ok = opt_pair[1].as_str() == Some("00000000000006bb")
-            || opt_pair[1].as_array().is_some_and(Vec::is_empty);
-        if !empty_ok {
-            return false;
-        }
-    } else {
-        let Some(arr) = opt_pair[1].as_array() else {
-            return false;
-        };
-        if arr.len() != spec.lean_options.len() {
-            return false;
-        }
-        let expected: Vec<(String, String)> = spec
-            .lean_options
-            .iter()
-            .map(|(k, v)| {
-                let cap = format!("-D{}={}", k.to_lean_string(), v.as_cli_flag_value());
-                let hex = format!("{:016x}", lake_hash_text(&cap));
-                (cap, hex)
-            })
-            .collect();
-        for (item, (exp_cap, exp_hex)) in arr.iter().zip(expected.iter()) {
-            let Some(p) = item.as_array() else {
-                return false;
-            };
-            if p.len() != 2
-                || p[0].as_str() != Some(exp_cap.as_str())
-                || p[1].as_str() != Some(exp_hex.as_str())
-            {
-                return false;
-            }
-        }
     }
     let Some(args_pair) = inputs_arr.get(opt_idx + 4).and_then(|v| v.as_array()) else {
         return false;
@@ -11589,24 +11603,14 @@ pub(crate) fn find_dirty_modules_in_otherwise_fresh_dag(
             {
                 return None;
             }
-            let expected_opts_val = if node.lean_options.is_empty() {
-                serde_json::json!("00000000000006bb")
-            } else {
-                let mut opt_entries = Vec::with_capacity(node.lean_options.len());
-                for (k, v) in &node.lean_options {
-                    let flag = format!("-D{}={}", k.to_lean_string(), v.as_cli_flag_value());
-                    opt_entries.push(serde_json::json!([
-                        flag,
-                        format!("{:016x}", lake_hash_text(&flag))
-                    ]));
-                }
-                serde_json::Value::Array(opt_entries)
-            };
-            let expected_opts_h = lake_input_hash(&expected_opts_val).ok();
-            let actual_opts_h = tv
-                .pointer(&format!("/inputs/{}/1", base_idx + 2))
-                .and_then(|v| lake_input_hash(v).ok());
-            if expected_opts_h.is_none() || expected_opts_h != actual_opts_h {
+            if tv
+                .pointer(&format!("/inputs/{}/0", base_idx + 2))
+                .and_then(|v| v.as_str())
+                != Some("options")
+                || tv
+                    .pointer(&format!("/inputs/{}/1", base_idx + 2))
+                    .is_none_or(|v| !verify_trace_options_value(&node.lean_options, v))
+            {
                 return None;
             }
             let expected_is_mod_h = format!(
@@ -11875,24 +11879,14 @@ pub(crate) fn seed_verified_fresh_modules_into_disposable_snapshot(
                     dirty_mods.insert(mod_name.clone());
                     continue;
                 }
-                let expected_opts_val = if node.lean_options.is_empty() {
-                    serde_json::json!("00000000000006bb")
-                } else {
-                    let mut opt_entries = Vec::with_capacity(node.lean_options.len());
-                    for (k, v) in &node.lean_options {
-                        let flag = format!("-D{}={}", k.to_lean_string(), v.as_cli_flag_value());
-                        opt_entries.push(serde_json::json!([
-                            flag,
-                            format!("{:016x}", lake_hash_text(&flag))
-                        ]));
-                    }
-                    serde_json::Value::Array(opt_entries)
-                };
-                let expected_opts_h = lake_input_hash(&expected_opts_val).ok();
-                let actual_opts_h = tv
-                    .pointer(&format!("/inputs/{}/1", base_idx + 2))
-                    .and_then(|v| lake_input_hash(v).ok());
-                if expected_opts_h.is_none() || expected_opts_h != actual_opts_h {
+                if tv
+                    .pointer(&format!("/inputs/{}/0", base_idx + 2))
+                    .and_then(|v| v.as_str())
+                    != Some("options")
+                    || tv
+                        .pointer(&format!("/inputs/{}/1", base_idx + 2))
+                        .is_none_or(|v| !verify_trace_options_value(&node.lean_options, v))
+                {
                     dirty_mods.insert(mod_name.clone());
                     continue;
                 }
@@ -18702,7 +18696,7 @@ fn compute_lake_export_info_opts(
             }
         }
     } else {
-        let mut pb_cache = LakeClosureCache::default();
+        let mut pb_cache = LakeClosureCache::for_project(cfg);
         let pb_info = prebuilt_olean_export_info(cfg, false, &olean_path, &mut pb_cache)
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -18848,6 +18842,9 @@ pub(crate) fn format_lake_trace_log_stdout(trace_log: &[serde_json::Value]) -> S
         let Some(lvl) = entry.get("level").and_then(|v| v.as_str()) else {
             continue;
         };
+        if lvl == "trace" {
+            continue;
+        }
         let Some(msg) = entry.get("message").and_then(|v| v.as_str()) else {
             continue;
         };
@@ -22749,10 +22746,6 @@ fn probe_warm_on_disk_module_candidate(
             None
         }
     });
-    if raw_has_entry && validated_entry.is_none() {
-        return None;
-    }
-
     let manifest_matched = if let Some(entry) = validated_entry {
         if raw_imp_dynlibs.is_empty()
             && entry.lake_inputs_digest == expected_ws_inputs
@@ -22792,13 +22785,20 @@ fn probe_warm_on_disk_module_candidate(
                 }
             })
         } else {
-            return None;
+            false
         }
     } else {
         false
     };
-    if raw_has_entry && !manifest_matched {
-        return None;
+    if !manifest_matched {
+        let uses_include_str = source_uses_include_str(&src_raw);
+        let inputs_may_be_unverified_in_trace = !expected_ws_inputs.is_empty()
+            && uses_include_str
+            && input_bearing_libs_for_module(cfg, &node.module_name).is_empty()
+            && input_bearing_exes_for_module(cfg, &node.module_name).is_empty();
+        if raw_has_entry || inputs_may_be_unverified_in_trace {
+            return None;
+        }
     }
 
     let clean_stale_ltar_bc = || -> bool {
@@ -23076,31 +23076,11 @@ fn probe_warm_on_disk_module_candidate(
 
     let opt_idx = base_idx + 2;
     let opt_pair = inputs_arr.get(opt_idx).and_then(|v| v.as_array())?;
-    if opt_pair.len() != 2 || opt_pair[0].as_str() != Some("options") {
+    if opt_pair.len() != 2
+        || opt_pair[0].as_str() != Some("options")
+        || !verify_trace_options_value(&node.lean_options, &opt_pair[1])
+    {
         return None;
-    }
-    if node.lean_options.is_empty() {
-        let empty_ok = opt_pair[1].as_str() == Some("00000000000006bb")
-            || opt_pair[1].as_array().is_some_and(Vec::is_empty);
-        if !empty_ok {
-            return None;
-        }
-    } else {
-        let arr = opt_pair[1].as_array()?;
-        if arr.len() != node.lean_options.len() {
-            return None;
-        }
-        for (item, (k, v)) in arr.iter().zip(node.lean_options.iter()) {
-            let cap = format!("-D{}={}", k.to_lean_string(), v.as_cli_flag_value());
-            let hex = format!("{:016x}", lake_hash_text(&cap));
-            let p = item.as_array()?;
-            if p.len() != 2
-                || p[0].as_str() != Some(cap.as_str())
-                || p[1].as_str() != Some(hex.as_str())
-            {
-                return None;
-            }
-        }
     }
 
     let args_pair = inputs_arr.get(opt_idx + 4).and_then(|v| v.as_array())?;
@@ -23997,7 +23977,7 @@ fn run_audit_or_replay_batch_worker_bound(
         .filter(|&v| v > 0);
     let audit_chunk_sz = match explicit_audit_batch {
         Some(sz) => sz,
-        None if !is_untrusted => 64,
+        None if !is_untrusted => 128,
         None => scheduler_audit_batch_size(),
     };
 
@@ -24407,10 +24387,42 @@ pub(crate) fn hydrate_project_traces_with_store(
         }
     }
 
-    if pkg_specs.is_empty() {
-        for pkg in &scanned_pkgs {
-            let _ = fs::remove_file(pkg.pkg_root.join(".lake/build/.turbo_verified_sources.json"));
+    let write_empty_manifests_with_root_inputs = |pkgs: &[&PackageConfig]| -> Result<()> {
+        for pkg in pkgs {
+            let build_dir = pkg.pkg_root.join(".lake/build");
+            let manifest_path = build_dir.join(".turbo_verified_sources.json");
+            if pkg.pkg_root == cfg.root_pkg.pkg_root && !expected_lake_inputs.is_empty() {
+                let _ = fs::create_dir_all(&build_dir);
+                let manifest = VerifiedDepManifest {
+                    pkg_name: pkg.name.clone(),
+                    toolchain: cfg.toolchain.clone(),
+                    lean_githash: cfg.lean_githash.clone(),
+                    pkg_config_digest: pkg.config_digest.clone(),
+                    lake_inputs_digest: expected_lake_inputs.clone(),
+                    workspace_config_digest: cfg.canonical_config_digest.clone(),
+                    allowed_axioms: allowed_axioms.clone(),
+                    kernel_policy_digest: kernel_policy_digest.clone(),
+                    modules: BTreeMap::new(),
+                    cfg: None,
+                    dep_import_memo: DepImportMemo::default(),
+                };
+                let json_bytes = serde_json::to_vec(&manifest)?;
+                let tmp_path = build_dir.join(format!(
+                    ".turbo_verified_sources.{}.{}.tmp",
+                    std::process::id(),
+                    crate::pack::next_tmp_id()
+                ));
+                write_file_atomic(&tmp_path, &json_bytes)?;
+                fs::rename(&tmp_path, &manifest_path)?;
+            } else {
+                let _ = fs::remove_file(&manifest_path);
+            }
         }
+        Ok(())
+    };
+
+    if pkg_specs.is_empty() {
+        write_empty_manifests_with_root_inputs(&scanned_pkgs)?;
         report.elapsed_ms = t0.elapsed().as_millis();
         return Ok(report);
     }
@@ -24433,9 +24445,7 @@ pub(crate) fn hydrate_project_traces_with_store(
     }
 
     if verified_specs.is_empty() {
-        for pkg in &scanned_pkgs {
-            let _ = fs::remove_file(pkg.pkg_root.join(".lake/build/.turbo_verified_sources.json"));
-        }
+        write_empty_manifests_with_root_inputs(&scanned_pkgs)?;
         report.elapsed_ms = t0.elapsed().as_millis();
         return Ok(report);
     }
@@ -25363,6 +25373,8 @@ pub(crate) fn build_project_modules_native_with_options(
                                             },
                                         );
                                     wipe_existing_module_artifacts_opts(node, preserve_c_obj);
+                                    shared_exp_memo.remove(&(mod_name.clone(), false));
+                                    shared_exp_memo.remove(&(mod_name.clone(), true));
                                     store.materialize_into_worktree(
                                         target_root,
                                         &project_name,
@@ -25423,6 +25435,8 @@ pub(crate) fn build_project_modules_native_with_options(
                                 };
                                 if restored.is_none() && !preserve_lake {
                                     wipe_existing_module_artifacts(node);
+                                    shared_exp_memo.remove(&(mod_name.clone(), false));
+                                    shared_exp_memo.remove(&(mod_name.clone(), true));
                                     replay_batch.invalidate_memo();
                                 }
                                 restored
@@ -25575,6 +25589,8 @@ pub(crate) fn build_project_modules_native_with_options(
                                 "Worktree opt-out prevents compiling uncached module `{mod_name}`; build with Lake first"
                             );
                             wipe_node_locked(node, preserve_lake)?;
+                            shared_exp_memo.remove(&(mod_name.clone(), false));
+                            shared_exp_memo.remove(&(mod_name.clone(), true));
                         }
                         let prio = b_levels.get(&mod_name).copied().unwrap_or(1);
                         compile_keys.insert(mod_name.clone(), mod_key);
@@ -25638,7 +25654,7 @@ pub(crate) fn build_project_modules_native_with_options(
             {
                 let batch_limit = match explicit_audit_batch_cfg {
                     Some(sz) => sz,
-                    None if !is_untrusted => 64,
+                    None if !is_untrusted => 128,
                     None => scheduler_audit_batch_size(),
                 };
                 let mut batch_mods = Vec::with_capacity(pending_audit_queue.len().min(batch_limit));
@@ -25751,8 +25767,8 @@ pub(crate) fn build_project_modules_native_with_options(
                 if !batch_mods.is_empty() {
                     let coalesce_snapshot = !is_untrusted
                         && explicit_audit_batch_cfg.is_none()
-                        && in_flight_compiles > 0
-                        && batch_mods.len() < 16
+                        && (in_flight_compiles > 0 || !ready_compile_heap.is_empty())
+                        && batch_mods.len() < 64
                         && !(in_flight_compiles < compile_pool_size
                             && batch_mods.iter().any(|m| {
                                 dependents.get(m).is_some_and(|deps| !deps.is_empty())
@@ -25838,6 +25854,8 @@ pub(crate) fn build_project_modules_native_with_options(
                             let node = dag.nodes.get(&mod_name).expect("compiled module in dag");
                             match publish_staged_module_compile_output(node, staged) {
                                 Ok((dur_ms, stdout_str, dig)) => {
+                                    shared_exp_memo.remove(&(mod_name.clone(), false));
+                                    shared_exp_memo.remove(&(mod_name.clone(), true));
                                     replay_batch.invalidate_memo();
                                     pending_audit_meta.insert(
                                         mod_name.clone(),
@@ -25897,6 +25915,12 @@ pub(crate) fn build_project_modules_native_with_options(
                             audited_waiting_ancestors.insert(mod_name, mod_outcome);
                         }
                     }
+                    let mut pending_snap_records: Vec<(
+                        usize,
+                        std::sync::Arc<crate::zygote::ClosureSnapshot>,
+                        Vec<String>,
+                        Vec<String>,
+                    )> = Vec::new();
                     while let Some((mod_name, (mod_audit_res, snap_auth_opt))) =
                         finalize_queue.pop_front()
                     {
@@ -26047,6 +26071,8 @@ pub(crate) fn build_project_modules_native_with_options(
                                                 if let Some(dn) = dag.nodes.get(d) {
                                                     let _ = wipe_node_locked(dn, d_pres);
                                                 }
+                                                shared_exp_memo.remove(&(d.clone(), false));
+                                                shared_exp_memo.remove(&(d.clone(), true));
                                             }
                                         }
                                         if !to_invalidate.is_empty() {
@@ -26078,6 +26104,8 @@ pub(crate) fn build_project_modules_native_with_options(
                                         std::slice::from_ref(&mod_name),
                                     );
                                     wipe_node_locked(node, preserve_lake)?;
+                                    shared_exp_memo.remove(&(mod_name.clone(), false));
+                                    shared_exp_memo.remove(&(mod_name.clone(), true));
                                     replay_batch.invalidate_memo();
                                     let prio = b_levels.get(&mod_name).copied().unwrap_or(1);
                                     compile_keys.insert(mod_name.clone(), mod_key);
@@ -26239,31 +26267,30 @@ pub(crate) fn build_project_modules_native_with_options(
                                     ))) = snap_auth_opt
                                     {
                                         if record_rep || record_aud {
-                                            let rep_slice = if record_rep {
-                                                std::slice::from_ref(&mod_name)
-                                            } else {
-                                                &[]
-                                            };
-                                            let aud_slice = if record_aud {
-                                                std::slice::from_ref(&mod_name)
-                                            } else {
-                                                &[]
-                                            };
-                                            if let Err(e) =
-                                                crate::zygote::record_snapshot_modules_in_store(
-                                                    store,
-                                                    &cfg,
-                                                    snap,
-                                                    rep_slice,
-                                                    aud_slice,
-                                                    &lean_path_env,
-                                                    None,
-                                                )
-                                            {
-                                                fatal_err = Some(e);
-                                                break;
+                                            let ptr = std::sync::Arc::as_ptr(snap) as usize;
+                                            let entry_idx = pending_snap_records
+                                                .iter()
+                                                .position(|(p, _, _, _)| *p == ptr)
+                                                .unwrap_or_else(|| {
+                                                    let idx = pending_snap_records.len();
+                                                    pending_snap_records.push((
+                                                        ptr,
+                                                        std::sync::Arc::clone(snap),
+                                                        Vec::new(),
+                                                        Vec::new(),
+                                                    ));
+                                                    idx
+                                                });
+                                            if record_rep {
+                                                pending_snap_records[entry_idx]
+                                                    .2
+                                                    .push(mod_name.clone());
                                             }
-                                            replay_batch.invalidate_memo();
+                                            if record_aud {
+                                                pending_snap_records[entry_idx]
+                                                    .3
+                                                    .push(mod_name.clone());
+                                            }
                                         }
                                     }
                                 }
@@ -26404,6 +26431,23 @@ pub(crate) fn build_project_modules_native_with_options(
                                 break;
                             }
                         }
+                    }
+                    if fatal_err.is_none() && !pending_snap_records.is_empty() {
+                        for (_, snap, rep_mods, aud_mods) in pending_snap_records {
+                            if let Err(e) = crate::zygote::record_snapshot_modules_in_store(
+                                store,
+                                &cfg,
+                                &snap,
+                                &rep_mods,
+                                &aud_mods,
+                                &lean_path_env,
+                                None,
+                            ) {
+                                fatal_err = Some(e);
+                                break;
+                            }
+                        }
+                        replay_batch.invalidate_memo();
                     }
                 }
                 SchedulerEvent::CasHashFinished {
@@ -42589,6 +42633,84 @@ end Fixture
             "CAS hit for @[implemented_by] module must fail closed when allowlist omits declaration"
         );
 
+        crate::zygote::purge_snapshot_dir(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_trace_options_order_independent_and_warm_on_disk_lake_trace_fallback() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut expected = LeanOptionsMap::new();
+        expected.insert(
+            LeanName::from_str_to_name("autoImplicit")?,
+            LeanOptionValue::Bool(false),
+        );
+        expected.insert(
+            LeanName::from_str_to_name("weak.linter.mathlibStandardSet")?,
+            LeanOptionValue::Bool(true),
+        );
+        let cap_auto = "-DautoImplicit=false";
+        let cap_lint = "-Dweak.linter.mathlibStandardSet=true";
+        let hex_auto = format!("{:016x}", lake_hash_text(cap_auto));
+        let hex_lint = format!("{:016x}", lake_hash_text(cap_lint));
+        let reversed_json = serde_json::json!([
+            [cap_lint, hex_lint],
+            [cap_auto, hex_auto]
+        ]);
+        assert!(
+            verify_trace_options_value(&expected, &reversed_json),
+            "verify_trace_options_value must be order-independent across Lake option serialization orders"
+        );
+        let mismatched_json = serde_json::json!([
+            ["-Dweak.linter.mathlibStandardSet=false", hex_lint],
+            [cap_auto, hex_auto]
+        ]);
+        assert!(!verify_trace_options_value(&expected, &mismatched_json));
+
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_warm_trace_fallback_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("Pkg"))?;
+        let tc = include_str!("../../../lean/lean-toolchain");
+        fs::write(dir.join("lean-toolchain"), tc)?;
+        fs::write(
+            dir.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage pkg\n@[default_target]\nlean_lib Pkg\n",
+        )?;
+        fs::write(dir.join("Pkg/A.lean"), "theorem a_ok : 1 + 1 = 2 := rfl\n")?;
+        fs::write(
+            dir.join("Pkg.lean"),
+            "import Pkg.A\ntheorem root_ok : 2 + 2 = 4 := rfl\n",
+        )?;
+        let canon = dir.canonicalize()?;
+        let cfg = resolve_project_config(&canon)?;
+        let lake_bin = cfg.lean_bin.parent().expect("lean bin parent").join("lake");
+        let stock_st = Command::new(&lake_bin)
+            .current_dir(&canon)
+            .env("SANDBOXED_ALLOW_RAW_LAKE", "1")
+            .arg("build")
+            .status()?;
+        anyhow::ensure!(stock_st.success(), "stock lake build failed");
+        // Simulate a sticky CI cache with fresh Lake `.trace`/`.hash` artifacts, skewed mtimes,
+        // and no `.turbo_verified_sources.json` / empty CAS store.
+        let _ = fs::remove_file(canon.join(".lake/build/.turbo_verified_sources.json"));
+        let mut store = TurboStore::open(Some(&canon.join(".turbo-store")))?;
+        reset_lake_inputs_tag_memo();
+        let rep = build_project_modules_native(&mut store, &canon, &[], "trusted", 2, false, true, None)?;
+        assert_eq!(
+            rep.modules_compiled, 0,
+            "fresh stock Lake artifacts with valid .trace/.hash must warm-adopt without recompiling"
+        );
+        assert!(
+            canon.join(".lake/build/.turbo_verified_sources.json").is_file(),
+            "warm-adopted build must persist root .turbo_verified_sources.json"
+        );
         crate::zygote::purge_snapshot_dir(&dir);
         let _ = fs::remove_dir_all(&dir);
         Ok(())
