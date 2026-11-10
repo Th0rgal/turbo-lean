@@ -6857,6 +6857,10 @@ fn compile_standalone_statement_modules(
     } else {
         None
     };
+    let host_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let raw_lean_threads = std::env::var("LEAN_NUM_THREADS").ok();
     while !standalone.is_empty() {
         let mut ready = Vec::new();
         for (name, (source, _)) in &standalone {
@@ -6877,6 +6881,14 @@ fn compile_standalone_statement_modules(
             !ready.is_empty(),
             "Import cycle in standalone statement modules"
         );
+        let mut to_compile: Vec<(
+            String,
+            PathBuf,
+            PathBuf,
+            PathBuf,
+            bool,
+            Option<crate::db::SingleflightLease>,
+        )> = Vec::new();
         for name in ready {
             let (source, root) = standalone.remove(&name).unwrap();
             let rel_source = source.strip_prefix(&root)?;
@@ -6954,8 +6966,28 @@ fn compile_standalone_statement_modules(
                     let _ = fs::remove_file(&cand);
                 }
             }
+            to_compile.push((name, source, root, output, header.is_module, pending_lease));
+        }
+        if to_compile.is_empty() {
+            continue;
+        }
+        let wave_workers = host_cores.clamp(1, 8).min(to_compile.len());
+        let per_worker_threads = crate::module_builder::per_worker_lean_num_threads(
+            raw_lean_threads.as_deref(),
+            host_cores,
+            wave_workers,
+        );
+        let compile_one = |name: &str,
+                           source: &Path,
+                           root: &Path,
+                           output: &Path,
+                           is_mod: bool|
+         -> Result<i64> {
             let t0 = std::time::Instant::now();
             let mut command = statement_lean_command(project, is_untrusted)?;
+            if !is_untrusted {
+                command.env("LEAN_NUM_THREADS", per_worker_threads.to_string());
+            }
             command.args(&pkg.weak_lean_args).args(&pkg.more_lean_args);
             for (key, value) in &pkg.lean_options {
                 command.arg(format!(
@@ -6965,24 +6997,18 @@ fn compile_standalone_statement_modules(
                 ));
             }
             command
-                .arg(&source)
+                .arg(source)
                 .arg("-R")
-                .arg(&root)
+                .arg(root)
                 .arg("-o")
-                .arg(&output);
+                .arg(output);
             let out = crate::module_builder::run_command_with_timeout(
                 &mut command,
                 std::time::Duration::from_secs(1800),
                 is_untrusted,
             )?;
-            let artifacts_valid = out.status.success()
-                && standalone_artifacts_present_on_disk(&output, header.is_module);
-            if !artifacts_valid {
-                if let (Some(lease), Some(st)) = (pending_lease.take(), store.as_deref_mut()) {
-                    st.remove_singleflight_done(&lease.action_key);
-                    drop(lease);
-                }
-            }
+            let artifacts_valid =
+                out.status.success() && standalone_artifacts_present_on_disk(output, is_mod);
             anyhow::ensure!(
                 out.status.success(),
                 "Stock Lean statement module {name} failed:\n{}\n{}",
@@ -6991,48 +7017,121 @@ fn compile_standalone_statement_modules(
             );
             anyhow::ensure!(
                 artifacts_valid,
-                "Stock Lean statement module {name} produced incomplete artifact set (is_module={})",
-                header.is_module
+                "Stock Lean statement module {name} produced incomplete artifact set (is_module={is_mod})"
             );
-            if let (Some(lease), Some(st)) = (pending_lease.take(), store.as_deref_mut()) {
-                let dur_ms = t0.elapsed().as_millis() as i64;
-                let mut blob_items = Vec::new();
-                let mut read_ok = true;
-                for (kind, abs_path) in crate::module_builder::olean_artifact_paths(&output) {
-                    if is_regular_nonempty_standalone_artifact(&abs_path) {
-                        match (fs::read(&abs_path), abs_path.strip_prefix(lib_dir)) {
-                            (Ok(bytes), Ok(rel_p)) => {
-                                let sz = bytes.len() as u64;
-                                let rel_str = rel_p.to_string_lossy().replace('\\', "/");
-                                blob_items.push((
-                                    String::new(),
-                                    bytes,
-                                    kind.to_string(),
-                                    rel_str,
-                                    sz,
-                                ));
+            Ok(t0.elapsed().as_millis() as i64)
+        };
+        let mut outcomes: Vec<Option<Result<i64>>> =
+            (0..to_compile.len()).map(|_| None).collect();
+        if wave_workers <= 1 {
+            for (idx, (name, source, root, output, is_mod, _)) in to_compile.iter().enumerate() {
+                let res = compile_one(name, source, root, output, *is_mod);
+                let failed = res.is_err();
+                outcomes[idx] = Some(res);
+                if failed {
+                    break;
+                }
+            }
+        } else {
+            let next_idx = std::sync::atomic::AtomicUsize::new(0);
+            let aborted = std::sync::atomic::AtomicBool::new(false);
+            let slots: Vec<std::sync::Mutex<Option<Result<i64>>>> = (0..to_compile.len())
+                .map(|_| std::sync::Mutex::new(None))
+                .collect();
+            std::thread::scope(|s| {
+                for _ in 0..wave_workers {
+                    s.spawn(|| loop {
+                        if aborted.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if idx >= to_compile.len() {
+                            break;
+                        }
+                        let (ref name, ref source, ref root, ref output, is_mod, _) =
+                            to_compile[idx];
+                        let res = compile_one(name, source, root, output, is_mod);
+                        if res.is_err() {
+                            aborted.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        if let Ok(mut g) = slots[idx].lock() {
+                            *g = Some(res);
+                        }
+                    });
+                }
+            });
+            for (idx, slot) in slots.into_iter().enumerate() {
+                outcomes[idx] = slot.into_inner().unwrap_or(None);
+            }
+        }
+        let mut first_err: Option<anyhow::Error> = None;
+        for ((_, _, _, output, _, mut pending_lease), res_opt) in
+            to_compile.into_iter().zip(outcomes)
+        {
+            match res_opt {
+                Some(Ok(dur_ms)) => {
+                    if let (Some(lease), Some(st)) = (pending_lease.take(), store.as_deref_mut()) {
+                        let mut blob_items = Vec::new();
+                        let mut read_ok = true;
+                        for (kind, abs_path) in
+                            crate::module_builder::olean_artifact_paths(&output)
+                        {
+                            if is_regular_nonempty_standalone_artifact(&abs_path) {
+                                match (fs::read(&abs_path), abs_path.strip_prefix(lib_dir)) {
+                                    (Ok(bytes), Ok(rel_p)) => {
+                                        let sz = bytes.len() as u64;
+                                        let rel_str = rel_p.to_string_lossy().replace('\\', "/");
+                                        blob_items.push((
+                                            String::new(),
+                                            bytes,
+                                            kind.to_string(),
+                                            rel_str,
+                                            sz,
+                                        ));
+                                    }
+                                    _ => {
+                                        read_ok = false;
+                                        break;
+                                    }
+                                }
                             }
-                            _ => {
-                                read_ok = false;
-                                break;
+                        }
+                        if read_ok && !blob_items.is_empty() {
+                            let pub_res: Result<()> = (|| {
+                                let _pub_guard =
+                                    crate::db::acquire_cas_publication_guard(&st.root)?;
+                                let entries =
+                                    st.batch_store_immutable_blobs(&blob_items, "trusted", 0)?;
+                                st.publish_action(&lease, &entries, dur_ms, 0, 0, "trusted")?;
+                                Ok(())
+                            })();
+                            if pub_res.is_err() {
+                                st.remove_singleflight_done(&lease.action_key);
                             }
+                        } else {
+                            st.remove_singleflight_done(&lease.action_key);
                         }
                     }
                 }
-                if read_ok && !blob_items.is_empty() {
-                    let pub_res: Result<()> = (|| {
-                        let _pub_guard = crate::db::acquire_cas_publication_guard(&st.root)?;
-                        let entries = st.batch_store_immutable_blobs(&blob_items, "trusted", 0)?;
-                        st.publish_action(&lease, &entries, dur_ms, 0, 0, "trusted")?;
-                        Ok(())
-                    })();
-                    if pub_res.is_err() {
+                Some(Err(e)) => {
+                    if let (Some(lease), Some(st)) = (pending_lease.take(), store.as_deref_mut()) {
                         st.remove_singleflight_done(&lease.action_key);
+                        drop(lease);
                     }
-                } else {
-                    st.remove_singleflight_done(&lease.action_key);
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+                None => {
+                    if let (Some(lease), Some(st)) = (pending_lease.take(), store.as_deref_mut()) {
+                        st.remove_singleflight_done(&lease.action_key);
+                        drop(lease);
+                    }
                 }
             }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
         }
     }
     Ok(())
@@ -7076,6 +7175,161 @@ fn built_kernel_statement_report(
     )
 }
 
+fn source_declares_top_level_main(src: &str) -> bool {
+    let stripped = splitter::strip_lean_comments(src);
+    let mut ns_depth: usize = 0;
+    for raw_line in stripped.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "namespace" || line.starts_with("namespace ") {
+            ns_depth = ns_depth.saturating_add(1);
+            continue;
+        }
+        if line == "section" || line.starts_with("section ") {
+            ns_depth = ns_depth.saturating_add(1);
+            continue;
+        }
+        if line == "end" || line.starts_with("end ") {
+            ns_depth = ns_depth.saturating_sub(1);
+            continue;
+        }
+        if ns_depth > 0 {
+            continue;
+        }
+        if line.contains("@[main]") {
+            return true;
+        }
+        let mut rest = line;
+        loop {
+            rest = rest.trim_start();
+            if let Some(after_attr) = rest.strip_prefix("@[") {
+                if let Some(end_idx) = after_attr.find(']') {
+                    rest = &after_attr[end_idx + 1..];
+                    continue;
+                }
+            }
+            let mut progressed = false;
+            for kw in [
+                "public",
+                "private",
+                "protected",
+                "noncomputable",
+                "partial",
+                "unsafe",
+                "scoped",
+            ] {
+                if let Some(tail) = rest.strip_prefix(kw) {
+                    if tail.starts_with(char::is_whitespace) {
+                        rest = tail;
+                        progressed = true;
+                        break;
+                    }
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        for decl_kw in ["def", "abbrev", "opaque", "axiom", "constant"] {
+            if let Some(tail) = rest.strip_prefix(decl_kw) {
+                if tail.starts_with(char::is_whitespace) {
+                    let after_kw = tail.trim_start();
+                    if let Some(after_main) = after_kw.strip_prefix("main") {
+                        if after_main.is_empty()
+                            || after_main.starts_with(|c: char| {
+                                c.is_whitespace()
+                                    || matches!(c, ':' | '(' | '{' | '[' | '.' | '⦃')
+                            })
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn partition_statement_dump_batches(
+    modules: &BTreeMap<String, String>,
+    source_paths: &BTreeMap<String, PathBuf>,
+) -> Vec<Vec<String>> {
+    let mut direct_main = std::collections::HashSet::<String>::new();
+    let mut local_imports = BTreeMap::<String, Vec<String>>::new();
+    for (m, src_path) in source_paths {
+        if let Ok(src) = fs::read_to_string(src_path) {
+            if source_declares_top_level_main(&src) {
+                direct_main.insert(m.clone());
+            }
+            let hdr = crate::module_builder::parse_header_info(&src);
+            local_imports.insert(
+                m.clone(),
+                hdr.imports
+                    .into_iter()
+                    .filter(|imp| source_paths.contains_key(imp))
+                    .collect(),
+            );
+        }
+    }
+    fn has_trans_main(
+        m: &str,
+        direct_main: &std::collections::HashSet<String>,
+        local_imports: &BTreeMap<String, Vec<String>>,
+        memo: &mut BTreeMap<String, bool>,
+        visiting: &mut std::collections::HashSet<String>,
+    ) -> bool {
+        if let Some(&v) = memo.get(m) {
+            return v;
+        }
+        if direct_main.contains(m) {
+            memo.insert(m.to_string(), true);
+            return true;
+        }
+        if !visiting.insert(m.to_string()) {
+            return false;
+        }
+        let found = local_imports.get(m).is_some_and(|imps| {
+            imps.iter()
+                .any(|imp| has_trans_main(imp, direct_main, local_imports, memo, visiting))
+        });
+        visiting.remove(m);
+        memo.insert(m.to_string(), found);
+        found
+    }
+    let mut memo = BTreeMap::new();
+    let mut visiting = std::collections::HashSet::new();
+    let mut clean_batch = Vec::new();
+    let mut main_modules = Vec::new();
+    for m in modules.keys() {
+        if has_trans_main(m, &direct_main, &local_imports, &mut memo, &mut visiting) {
+            main_modules.push(m.clone());
+        } else {
+            clean_batch.push(m.clone());
+        }
+    }
+    if main_modules.len() == 1 {
+        clean_batch.push(main_modules.pop().unwrap());
+    } else if let Some(first_direct_idx) = main_modules.iter().position(|m| {
+        direct_main.contains(m)
+            && local_imports
+                .get(m)
+                .is_none_or(|imps| imps.iter().all(|imp| !memo.get(imp).copied().unwrap_or(false)))
+    }) {
+        clean_batch.push(main_modules.remove(first_direct_idx));
+    }
+    let mut batches = Vec::new();
+    if !clean_batch.is_empty() {
+        batches.push(clean_batch);
+    }
+    for m in main_modules {
+        batches.push(vec![m]);
+    }
+    batches
+}
+
 fn built_kernel_statement_report_bound(
     project: &Path,
     scope: Option<&Path>,
@@ -7087,6 +7341,7 @@ fn built_kernel_statement_report_bound(
     let pkg = crate::module_builder::resolve_package_config(project, true)?;
     let lib_dir = project.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
     let mut modules = BTreeMap::new();
+    let mut source_paths = BTreeMap::new();
     for (module, (source, root)) in
         statement_source_modules_with_trust(project, &pkg, scope, is_untrusted)?
     {
@@ -7106,6 +7361,7 @@ fn built_kernel_statement_report_bound(
                 source.display()
             );
         }
+        source_paths.insert(module.clone(), source.clone());
         modules.insert(
             module,
             source.strip_prefix(project)?.to_string_lossy().to_string(),
@@ -7186,26 +7442,35 @@ fn built_kernel_statement_report_bound(
         None
     };
     let _guard = HelperGuard(helper_opt.clone());
-    // Distinct executables may define the same constant (`main`). Compatible
-    // modules share one import, while incompatible groups split into fresh OS
-    // processes. Never re-import oleans into a process with old mapped regions.
-    let mut batches = vec![modules.keys().cloned().collect::<Vec<_>>()];
-    let mut report = KernelStatementReport::default();
-    let mut remaining = modules.clone();
-    while let Some(mut batch) = batches.pop() {
-        if let Some(snap) = bound_snap {
-            let _ = crate::zygote::ensure_bound_audit_closure(snap, "stmt_report_before_batch")?;
-        }
-        let (mut command, batch_pinned_fd) =
-            if let Some((ref sr, ref cfg, ref full_lp, ref extra_ro, pinned_fd)) = zygote_cfg {
+    // Distinct executables may define the same constant (`main`). Pre-partition
+    // `main`-declaring modules into isolated batches and execute batches across
+    // bounded worker threads, falling back to binary splitting on any conflict.
+    let initial_batches = partition_statement_dump_batches(&modules, &source_paths);
+    let helper_ref = helper_opt.as_deref();
+    let zygote_ref = zygote_cfg.as_ref();
+    let run_batch_tree = |root_batch: Vec<String>| -> Result<(KernelStatementReport, Vec<String>)> {
+        let mut stack = vec![root_batch];
+        let mut sub_report = KernelStatementReport::default();
+        let mut dumped_mods = Vec::new();
+        while let Some(mut batch) = stack.pop() {
+            if let Some(snap) = bound_snap {
+                let _ =
+                    crate::zygote::ensure_bound_audit_closure(snap, "stmt_report_before_batch")?;
+            }
+            let (mut command, batch_pinned_fd) = if let Some((
+                ref sr,
+                ref cfg,
+                ref full_lp,
+                ref extra_ro,
+                pinned_fd,
+            )) = zygote_ref
+            {
                 let (mut cmd, _) =
                     crate::zygote::kernel_reader_command(sr, cfg, full_lp, extra_ro, is_untrusted)?;
                 cmd.arg("--statement-dump").args(&batch);
-                (cmd, pinned_fd)
+                (cmd, *pinned_fd)
             } else {
-                let helper = helper_opt
-                    .as_ref()
-                    .context("Missing statement dump helper script")?;
+                let helper = helper_ref.context("Missing statement dump helper script")?;
                 let mut cmd = statement_lean_command(project, is_untrusted)?;
                 if let Some(ov) = overlay_lib_dir {
                     let (base_lp, _) = crate::module_builder::resolve_project_config_with_trust(
@@ -7224,65 +7489,143 @@ fn built_kernel_statement_report_bound(
                 cmd.arg("--run").arg(helper).args(&batch);
                 (cmd, None)
             };
-        let out = crate::module_builder::run_command_with_timeout_pinned_fd(
-            &mut command,
-            std::time::Duration::from_secs(600),
-            is_untrusted,
-            batch_pinned_fd,
-        )?;
-        if let Some(snap) = bound_snap {
-            let _ = crate::zygote::ensure_bound_audit_closure(snap, "stmt_report_after_batch")?;
-        }
-        if !out.status.success() && batch.len() > 1 {
-            let right = batch.split_off(batch.len() / 2);
-            batches.push(right);
-            batches.push(batch);
-            continue;
-        }
-        anyhow::ensure!(
-            out.status.success(),
-            "Cannot dump kernel statements for {batch:?}:\n{}\n{}",
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let mut shared_constants = BTreeMap::<String, SharedKernelConstantEntry>::new();
-        let mut chunk = Vec::new();
-        let mut seen_in_batch = std::collections::BTreeSet::<String>::new();
-        for line in out.stdout.split_inclusive(|&c| c == b'\n') {
-            chunk.extend_from_slice(line);
-            let row: KernelDumpRow =
-                serde_json::from_slice(line).context("Invalid kernel statement JSONL")?;
-            if row.audit.is_some() {
-                report.audits.push(serde_json::from_slice(line)?);
+            let out = crate::module_builder::run_command_with_timeout_pinned_fd(
+                &mut command,
+                std::time::Duration::from_secs(600),
+                is_untrusted,
+                batch_pinned_fd,
+            )?;
+            if let Some(snap) = bound_snap {
+                let _ =
+                    crate::zygote::ensure_bound_audit_closure(snap, "stmt_report_after_batch")?;
             }
-            if let Some(module) = row.module.as_deref() {
-                let rel = remaining
-                    .remove(module)
-                    .with_context(|| format!("Unexpected kernel statement module {module}"))?;
-                seen_in_batch.insert(module.to_string());
-                report
-                    .csimp
-                    .extend(row.csimp.context("Missing csimp audit")?);
-                report.axiom_decls.extend(row.axiom_decls);
-                report.unsafe_decls.extend(row.unsafe_decls);
-                report.unsafe_inductives.extend(row.unsafe_inductives);
-                report.implemented_by.extend(row.implemented_by);
-                report.extern_decls.extend(row.extern_decls);
-                let in_scope = scope.is_none_or(|p| Path::new(&rel).starts_with(p));
-                for (name, digest) in
-                    parse_kernel_statement_dump_with_shared(&chunk, module, &mut shared_constants)?
-                {
-                    if in_scope {
-                        report.statements.insert(format!("{rel}::{name}"), digest);
-                    }
+            if !out.status.success() && batch.len() > 1 {
+                let right = batch.split_off(batch.len() / 2);
+                stack.push(right);
+                stack.push(batch);
+                continue;
+            }
+            anyhow::ensure!(
+                out.status.success(),
+                "Cannot dump kernel statements for {batch:?}:\n{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let expected_in_batch: std::collections::HashSet<&str> =
+                batch.iter().map(String::as_str).collect();
+            let mut shared_constants = BTreeMap::<String, SharedKernelConstantEntry>::new();
+            let mut chunk = Vec::new();
+            let mut seen_in_batch = std::collections::BTreeSet::<String>::new();
+            for line in out.stdout.split_inclusive(|&c| c == b'\n') {
+                chunk.extend_from_slice(line);
+                let row: KernelDumpRow =
+                    serde_json::from_slice(line).context("Invalid kernel statement JSONL")?;
+                if row.audit.is_some() {
+                    sub_report.audits.push(serde_json::from_slice(line)?);
                 }
-                chunk.clear();
+                if let Some(module) = row.module.as_deref() {
+                    anyhow::ensure!(
+                        expected_in_batch.contains(module) && seen_in_batch.insert(module.to_string()),
+                        "Unexpected kernel statement module {module}"
+                    );
+                    let rel = modules
+                        .get(module)
+                        .with_context(|| format!("Unexpected kernel statement module {module}"))?;
+                    dumped_mods.push(module.to_string());
+                    sub_report
+                        .csimp
+                        .extend(row.csimp.context("Missing csimp audit")?);
+                    sub_report.axiom_decls.extend(row.axiom_decls);
+                    sub_report.unsafe_decls.extend(row.unsafe_decls);
+                    sub_report.unsafe_inductives.extend(row.unsafe_inductives);
+                    sub_report.implemented_by.extend(row.implemented_by);
+                    sub_report.extern_decls.extend(row.extern_decls);
+                    let in_scope = scope.is_none_or(|p| Path::new(rel).starts_with(p));
+                    for (name, digest) in parse_kernel_statement_dump_with_shared(
+                        &chunk,
+                        module,
+                        &mut shared_constants,
+                    )? {
+                        if in_scope {
+                            sub_report.statements.insert(format!("{rel}::{name}"), digest);
+                        }
+                    }
+                    chunk.clear();
+                }
+            }
+            anyhow::ensure!(
+                chunk.is_empty() && seen_in_batch.len() == batch.len(),
+                "Incomplete kernel statement dump for batch {batch:?}"
+            );
+        }
+        Ok((sub_report, dumped_mods))
+    };
+
+    let worker_cap = std::thread::available_parallelism()
+        .map(|n| n.get().clamp(1, 6))
+        .unwrap_or(4)
+        .min(initial_batches.len());
+    let mut batch_results: Vec<Option<Result<(KernelStatementReport, Vec<String>)>>> =
+        (0..initial_batches.len()).map(|_| None).collect();
+    if worker_cap <= 1 {
+        for (idx, b) in initial_batches.into_iter().enumerate() {
+            let res = run_batch_tree(b);
+            let failed = res.is_err();
+            batch_results[idx] = Some(res);
+            if failed {
+                break;
             }
         }
-        anyhow::ensure!(
-            chunk.is_empty() && seen_in_batch.len() == batch.len(),
-            "Incomplete kernel statement dump for batch {batch:?}"
-        );
+    } else {
+        let next_idx = std::sync::atomic::AtomicUsize::new(0);
+        let aborted = std::sync::atomic::AtomicBool::new(false);
+        let slots: Vec<std::sync::Mutex<Option<Result<(KernelStatementReport, Vec<String>)>>>> =
+            (0..initial_batches.len())
+                .map(|_| std::sync::Mutex::new(None))
+                .collect();
+        std::thread::scope(|s| {
+            for _ in 0..worker_cap {
+                s.spawn(|| loop {
+                    if aborted.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if idx >= initial_batches.len() {
+                        break;
+                    }
+                    let res = run_batch_tree(initial_batches[idx].clone());
+                    if res.is_err() {
+                        aborted.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if let Ok(mut g) = slots[idx].lock() {
+                        *g = Some(res);
+                    }
+                });
+            }
+        });
+        for (idx, slot) in slots.into_iter().enumerate() {
+            batch_results[idx] = slot.into_inner().unwrap_or(None);
+        }
+    }
+
+    let mut report = KernelStatementReport::default();
+    let mut remaining = modules.clone();
+    for res_opt in batch_results {
+        let (sub, dumped) = res_opt.context("Statement dump worker aborted")??;
+        for m in dumped {
+            anyhow::ensure!(
+                remaining.remove(&m).is_some(),
+                "Duplicate kernel statement module {m}"
+            );
+        }
+        report.statements.extend(sub.statements);
+        report.audits.extend(sub.audits);
+        report.csimp.extend(sub.csimp);
+        report.axiom_decls.extend(sub.axiom_decls);
+        report.unsafe_decls.extend(sub.unsafe_decls);
+        report.unsafe_inductives.extend(sub.unsafe_inductives);
+        report.implemented_by.extend(sub.implemented_by);
+        report.extern_decls.extend(sub.extern_decls);
     }
     anyhow::ensure!(remaining.is_empty(), "Incomplete kernel statement dump");
     if let Some(snap) = bound_snap {
@@ -8855,9 +9198,6 @@ fn kernel_statement_changes_with_trust(
                 16,
                 &proof_only_base_trace_src_hashes,
             )?;
-            if dirty_mods.is_empty() {
-                return None;
-            }
             let scratch_base = crate::check::verified_private_temp_scratch_base().ok()?;
             let ov_guard =
                 crate::check::PrivateScratchDir::create(&scratch_base, "turbo_head_stmt_ov")
@@ -8875,6 +9215,10 @@ fn kernel_statement_changes_with_trust(
                 let base_lib_dir = head_project.join(&pkg.build_dir).join(&pkg.lean_lib_dir);
                 let (base_lp, _) = crate::module_builder::build_lean_search_path(cfg, true);
                 let ov_lp = format!("{}:{base_lp}", ov_lib.display());
+                let host_cores = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4);
+                let raw_lean_threads = std::env::var("LEAN_NUM_THREADS").ok();
                 let mut pending: BTreeMap<String, (PathBuf, PathBuf, String, Vec<String>, bool)> =
                     BTreeMap::new();
                 for (name, (source, root)) in standalone {
@@ -8896,6 +9240,7 @@ fn kernel_statement_changes_with_trust(
                     if ready.is_empty() {
                         return None;
                     }
+                    let mut wave_compiles: Vec<(PathBuf, PathBuf, PathBuf, bool)> = Vec::new();
                     for name in ready {
                         let (source, root, src_str, imps, is_mod) = pending.remove(&name)?;
                         let rel = source.strip_prefix(&root).ok()?;
@@ -8965,24 +9310,74 @@ fn kernel_statement_changes_with_trust(
                             if let Some(parent) = output.parent() {
                                 fs::create_dir_all(parent).ok()?;
                             }
-                            let mut cmd = statement_lean_command(&head_project, false).ok()?;
-                            cmd.env("LEAN_PATH", &ov_lp);
-                            cmd.args(&pkg.weak_lean_args).args(&pkg.more_lean_args);
-                            for (k, v) in &pkg.lean_options {
-                                cmd.arg(format!("-D{}={}", k.to_lean_string(), v.raw_cli_value()));
+                            wave_compiles.push((source, root, output, is_mod));
+                        }
+                    }
+                    if !wave_compiles.is_empty() {
+                        let wave_workers = host_cores.clamp(1, 8).min(wave_compiles.len());
+                        let per_worker_threads =
+                            crate::module_builder::per_worker_lean_num_threads(
+                                raw_lean_threads.as_deref(),
+                                host_cores,
+                                wave_workers,
+                            );
+                        let compile_ok = std::sync::atomic::AtomicBool::new(true);
+                        let next_idx = std::sync::atomic::AtomicUsize::new(0);
+                        std::thread::scope(|s| {
+                            for _ in 0..wave_workers {
+                                s.spawn(|| loop {
+                                    if !compile_ok.load(std::sync::atomic::Ordering::Relaxed) {
+                                        break;
+                                    }
+                                    let idx =
+                                        next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if idx >= wave_compiles.len() {
+                                        break;
+                                    }
+                                    let (ref source, ref root, ref output, is_mod) =
+                                        wave_compiles[idx];
+                                    let ok = (|| -> Option<bool> {
+                                        let mut cmd =
+                                            statement_lean_command(&head_project, false).ok()?;
+                                        cmd.env("LEAN_PATH", &ov_lp);
+                                        cmd.env(
+                                            "LEAN_NUM_THREADS",
+                                            per_worker_threads.to_string(),
+                                        );
+                                        cmd.args(&pkg.weak_lean_args).args(&pkg.more_lean_args);
+                                        for (k, v) in &pkg.lean_options {
+                                            cmd.arg(format!(
+                                                "-D{}={}",
+                                                k.to_lean_string(),
+                                                v.raw_cli_value()
+                                            ));
+                                        }
+                                        cmd.arg(source).arg("-R").arg(root).arg("-o").arg(output);
+                                        let out =
+                                            crate::module_builder::run_command_with_timeout(
+                                                &mut cmd,
+                                                std::time::Duration::from_secs(300),
+                                                false,
+                                            )
+                                            .ok()?;
+                                        Some(
+                                            out.status.success()
+                                                && standalone_artifacts_present_on_disk(
+                                                    output, is_mod,
+                                                ),
+                                        )
+                                    })()
+                                    .unwrap_or(false);
+                                    if !ok {
+                                        compile_ok
+                                            .store(false, std::sync::atomic::Ordering::Relaxed);
+                                        break;
+                                    }
+                                });
                             }
-                            cmd.arg(&source).arg("-R").arg(&root).arg("-o").arg(&output);
-                            let out = crate::module_builder::run_command_with_timeout(
-                                &mut cmd,
-                                std::time::Duration::from_secs(300),
-                                false,
-                            )
-                            .ok()?;
-                            if !out.status.success()
-                                || !standalone_artifacts_present_on_disk(&output, is_mod)
-                            {
-                                return None;
-                            }
+                        });
+                        if !compile_ok.load(std::sync::atomic::Ordering::Relaxed) {
+                            return None;
                         }
                     }
                 }
@@ -19601,5 +19996,61 @@ end ParityNs
         crate::zygote::purge_snapshot_dir(&dir);
         let _ = fs::remove_dir_all(&dir);
         res
+    }
+
+    #[test]
+    fn test_partition_statement_dump_batches_isolates_multiple_main_modules() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_stmt_main_part_{}_{}",
+            std::process::id(),
+            pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir)?;
+        let a = dir.join("LibA.lean");
+        let b = dir.join("CliOne.lean");
+        let c = dir.join("CliTwo.lean");
+        let d = dir.join("UsesCliOne.lean");
+        let e = dir.join("NamespacedMain.lean");
+        fs::write(&a, "theorem t_a : 1 = 1 := rfl\n")?;
+        fs::write(&b, "import LibA\ndef main : IO Unit := pure ()\n")?;
+        fs::write(&c, "import LibA\npublic def main (args : List String) : IO UInt32 := pure 0\n")?;
+        fs::write(&d, "import CliOne\ntheorem t_d : 2 = 2 := rfl\n")?;
+        fs::write(&e, "namespace Foo\ndef main : Nat := 3\nend Foo\n")?;
+        let mut modules = BTreeMap::new();
+        let mut paths = BTreeMap::new();
+        for (m, p) in [
+            ("LibA", a),
+            ("CliOne", b),
+            ("CliTwo", c),
+            ("UsesCliOne", d),
+            ("NamespacedMain", e),
+        ] {
+            modules.insert(m.to_string(), format!("{m}.lean"));
+            paths.insert(m.to_string(), p);
+        }
+        let batches = partition_statement_dump_batches(&modules, &paths);
+        assert_eq!(
+            batches.len(),
+            3,
+            "expected primary batch (LibA + NamespacedMain + 1 direct main) plus 2 isolated main batches, got {batches:?}"
+        );
+        assert!(batches[0].contains(&"LibA".to_string()));
+        assert!(batches[0].contains(&"NamespacedMain".to_string()));
+        let all: std::collections::BTreeSet<String> =
+            batches.iter().flatten().cloned().collect();
+        assert_eq!(all.len(), 5);
+        for batch in &batches {
+            let main_cnt = batch
+                .iter()
+                .filter(|m| matches!(m.as_str(), "CliOne" | "CliTwo" | "UsesCliOne"))
+                .count();
+            assert!(
+                main_cnt <= 1,
+                "no batch may combine multiple conflicting top-level `main` closures: {batch:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

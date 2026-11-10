@@ -1183,6 +1183,9 @@ pub(crate) mod digest_test_hooks {
         set_forced_ts_granularity_ns(None);
         set_forced_ts_granularity_shared_ns(None);
     }
+    pub(crate) fn has_active_hooks() -> bool {
+        HOOKS.with(|h| !h.borrow().is_empty()) || forced_ts_granularity_ns().is_some()
+    }
     pub(super) fn run(name: &'static str) {
         let Some(mut hook) = HOOKS.with(|h| h.borrow_mut().remove(name)) else {
             return;
@@ -1192,6 +1195,18 @@ pub(crate) mod digest_test_hooks {
         HOOKS.with(|h| {
             h.borrow_mut().entry(name).or_insert(hook);
         });
+    }
+}
+
+#[inline(always)]
+fn has_active_digest_test_hook() -> bool {
+    #[cfg(test)]
+    {
+        digest_test_hooks::has_active_hooks()
+    }
+    #[cfg(not(test))]
+    {
+        false
     }
 }
 
@@ -1386,6 +1401,10 @@ struct FileRead {
 ///
 /// `Ok(None)`: no such file. `Err`: not a regular file, or unreadable.
 fn read_file_digest(path: &Path) -> Result<Option<FileRead>, ()> {
+    read_file_digest_opts(path, true)
+}
+
+fn read_file_digest_opts(path: &Path, need_olean_deps: bool) -> Result<Option<FileRead>, ()> {
     use std::io::Read;
     let not_found = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
     let canon = match fs::canonicalize(path) {
@@ -1403,13 +1422,14 @@ fn read_file_digest(path: &Path) -> Result<Option<FileRead>, ()> {
         return Err(());
     }
     let pre = OleanFileStatSig::from_meta(&pre_meta);
-    let parse_deps = canon.extension().is_some_and(|e| e == "olean");
+    let is_olean = canon.extension().is_some_and(|e| e == "olean");
+    let parse_deps = need_olean_deps && is_olean;
     let key = (canon.clone(), pre.dev, pre.ino);
     let trusted = dev_records_subsecond_timestamps(&pre);
     let memo = FILE_DIGEST_MEMO.get_or_init(Default::default);
     if trusted {
         if let Some(hit) = memo.lock().ok().and_then(|g| g.get(&key).cloned()) {
-            if hit.sig == pre {
+            if hit.sig == pre && (!parse_deps || hit.deps.is_some()) {
                 return Ok(Some(FileRead {
                     canon,
                     sig: pre,
@@ -1433,7 +1453,7 @@ fn read_file_digest(path: &Path) -> Result<Option<FileRead>, ()> {
         .map(|(imps, _)| imps.into_iter().map(|i| i.module).collect::<Vec<String>>());
     let stable = post == pre;
     if stable
-        && (!parse_deps || deps.is_some())
+        && (!is_olean || deps.is_some())
         && trusted
         && read_started_ns > 0
         && pre.ctime_ns() < read_started_ns - STAT_TRUST_WINDOW_NS
@@ -2388,16 +2408,66 @@ fn materialize_closure(
     };
     // Re-hash every snapshot file through its own handle; return the verified tuples.
     let verify = |dir: &Path| -> Result<Vec<(PathBuf, OleanFileStatSig)>, SnapshotError> {
-        let mut verified = Vec::new();
-        for (rel, hash, _) in &files {
+        let verify_one = |(rel, hash, _): &(PathBuf, Option<String>, PathBuf)|
+         -> Result<Option<(PathBuf, OleanFileStatSig)>, SnapshotError> {
             let path = dir.join(rel);
-            match read_file_digest(&path).map_err(|_| SnapshotError::Io)? {
+            match read_file_digest_opts(&path, false).map_err(|_| SnapshotError::Io)? {
                 // Opened by its canonical path: a symlink inside the snapshot is not ours.
                 Some(r) if Some(&r.hash) == hash.as_ref() && r.stable && r.canon == path => {
-                    verified.push((path, r.sig))
+                    Ok(Some((path, r.sig)))
                 }
-                None if hash.is_none() => {}
-                _ => return Err(SnapshotError::Changed),
+                None if hash.is_none() => Ok(None),
+                _ => Err(SnapshotError::Changed),
+            }
+        };
+        let par_workers = if files.len() >= 32 && !has_active_digest_test_hook() {
+            std::thread::available_parallelism()
+                .map(|n| n.get().min(8))
+                .unwrap_or(4)
+                .min(files.len())
+        } else {
+            1
+        };
+        if par_workers <= 1 {
+            let mut verified = Vec::with_capacity(files.len());
+            for item in &files {
+                if let Some(v) = verify_one(item)? {
+                    verified.push(v);
+                }
+            }
+            return Ok(verified);
+        }
+        let next_idx = std::sync::atomic::AtomicUsize::new(0);
+        let aborted = std::sync::atomic::AtomicBool::new(false);
+        let slots: Vec<std::sync::Mutex<Option<Result<Option<(PathBuf, OleanFileStatSig)>, SnapshotError>>>> =
+            (0..files.len()).map(|_| std::sync::Mutex::new(None)).collect();
+        std::thread::scope(|s| {
+            for _ in 0..par_workers {
+                s.spawn(|| loop {
+                    if aborted.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if idx >= files.len() {
+                        break;
+                    }
+                    let res = verify_one(&files[idx]);
+                    if res.is_err() {
+                        aborted.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if let Ok(mut g) = slots[idx].lock() {
+                        *g = Some(res);
+                    }
+                });
+            }
+        });
+        let mut verified = Vec::with_capacity(files.len());
+        for slot in slots {
+            match slot.into_inner().unwrap_or(None) {
+                Some(Ok(Some(v))) => verified.push(v),
+                Some(Ok(None)) => {}
+                Some(Err(e)) => return Err(e),
+                None => return Err(SnapshotError::Changed),
             }
         }
         Ok(verified)
@@ -2472,22 +2542,74 @@ fn materialize_closure(
         }
         #[cfg(not(unix))]
         fs::create_dir(&tmp)?;
+        let mut parents = std::collections::BTreeSet::new();
+        let mut copy_jobs: Vec<(&Path, &str, &Path, PathBuf)> = Vec::with_capacity(files.len());
         for (rel, hash, src) in &files {
-            let Some(hash) = hash else { continue };
+            let Some(hash) = hash.as_deref() else {
+                continue;
+            };
             let dst = tmp.join(rel);
             if let Some(parent) = dst.parent() {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::DirBuilderExt;
-                    fs::DirBuilder::new()
-                        .recursive(true)
-                        .mode(0o700)
-                        .create(parent)?;
+                if parent != tmp {
+                    parents.insert(parent.to_path_buf());
                 }
-                #[cfg(not(unix))]
-                fs::create_dir_all(parent)?;
             }
-            copy_verified_snapshot_file(&blobs, hash, src, &dst)?;
+            copy_jobs.push((rel.as_path(), hash, src.as_path(), dst));
+        }
+        for parent in parents {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(&parent)?;
+            }
+            #[cfg(not(unix))]
+            fs::create_dir_all(&parent)?;
+        }
+        let par_workers = if copy_jobs.len() >= 32 && !has_active_digest_test_hook() {
+            std::thread::available_parallelism()
+                .map(|n| n.get().min(8))
+                .unwrap_or(4)
+                .min(copy_jobs.len())
+        } else {
+            1
+        };
+        if par_workers <= 1 {
+            for (_, hash, src, dst) in &copy_jobs {
+                copy_verified_snapshot_file(&blobs, hash, src, dst)?;
+            }
+        } else {
+            let next_idx = std::sync::atomic::AtomicUsize::new(0);
+            let first_err: std::sync::Mutex<Option<SnapshotError>> = std::sync::Mutex::new(None);
+            let aborted = std::sync::atomic::AtomicBool::new(false);
+            std::thread::scope(|s| {
+                for _ in 0..par_workers {
+                    s.spawn(|| loop {
+                        if aborted.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        let idx = next_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if idx >= copy_jobs.len() {
+                            break;
+                        }
+                        let (_, hash, src, ref dst) = copy_jobs[idx];
+                        if let Err(e) = copy_verified_snapshot_file(&blobs, hash, src, dst) {
+                            aborted.store(true, std::sync::atomic::Ordering::Relaxed);
+                            if let Ok(mut g) = first_err.lock() {
+                                if g.is_none() {
+                                    *g = Some(e);
+                                }
+                            }
+                            break;
+                        }
+                    });
+                }
+            });
+            if let Some(e) = first_err.into_inner().unwrap_or(None) {
+                return Err(e);
+            }
         }
         Ok(())
     })();
@@ -2538,7 +2660,7 @@ fn copy_verified_snapshot_file(
 /// The verified blob holding `hash`, copied from `src` if not yet present.
 fn ensure_closure_blob(blobs: &Path, hash: &str, src: &Path) -> Result<PathBuf, SnapshotError> {
     let blob = blobs.join(hash);
-    match read_file_digest(&blob) {
+    match read_file_digest_opts(&blob, false) {
         Ok(Some(r)) if r.hash == hash && r.stable => return Ok(blob),
         Ok(None) => {}
         // Not what its name says: replace it.
@@ -2554,7 +2676,7 @@ fn ensure_closure_blob(blobs: &Path, hash: &str, src: &Path) -> Result<PathBuf, 
         perms.set_readonly(true);
         fs::set_permissions(&tmp, perms)?;
         // The source may have changed since it was hashed: only its verified bytes count.
-        match read_file_digest(&tmp) {
+        match read_file_digest_opts(&tmp, false) {
             Ok(Some(r)) if r.hash == hash && r.stable => {}
             _ => return Err(SnapshotError::Changed),
         }
@@ -2570,7 +2692,7 @@ fn ensure_closure_blob(blobs: &Path, hash: &str, src: &Path) -> Result<PathBuf, 
                 return Ok(());
             }
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::AlreadyExists {
-                if let Ok(Some(r)) = read_file_digest(&blob) {
+                if let Ok(Some(r)) = read_file_digest_opts(&blob, false) {
                     if r.hash == hash && r.stable {
                         let _ = fs::remove_file(&tmp);
                         return Ok(());

@@ -6193,14 +6193,7 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                 dag_seeds.sort();
                 dag_seeds.dedup();
 
-                let mut lake_exe_seeds: Vec<String> = cfg
-                    .root_pkg
-                    .exes
-                    .iter()
-                    .filter(|e| keep_root_exe(e))
-                    .map(|e| format!("@{}/{}:exe", root_base, e.name))
-                    .collect();
-                lake_exe_seeds.extend(input_exes.iter().cloned());
+                let mut lake_exe_seeds: Vec<String> = input_exes.clone();
                 lake_exe_seeds.sort();
                 lake_exe_seeds.dedup();
 
@@ -6297,14 +6290,66 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                             }
                         }
                     }
-                    for t in lake_refresh_targets(&dir, &closure_mods) {
-                        if !ordered_targets.contains(&t) {
-                            ordered_targets.push(t);
+                    let all_fresh_on_disk = !bypass_lake_cache && {
+                        let mut fresh_cache =
+                            crate::module_builder::LakeClosureCache::for_project(&cfg);
+                        fresh_cache.allow_stale_manifest_hydration = true;
+                        let mut all_ok = true;
+                        for m in &closure_mods {
+                            let spec_opt = crate::module_builder::resolve_module_in_package(
+                                &cfg.root_pkg,
+                                true,
+                                m,
+                            )
+                            .or_else(|| match crate::module_builder::resolve_import_site(&cfg, m) {
+                                crate::module_builder::ImportSite::Module(s) => Some(*s),
+                                _ => None,
+                            });
+                            let mod_ok = spec_opt.is_some_and(|spec| {
+                                let mut vis = HashSet::new();
+                                crate::module_builder::lake_closure_export_info(
+                                    &cfg,
+                                    &spec,
+                                    false,
+                                    &mut fresh_cache,
+                                    &mut vis,
+                                )
+                                .is_some()
+                            });
+                            if !mod_ok {
+                                all_ok = false;
+                                break;
+                            }
                         }
-                    }
-                    for t in input_exes {
-                        if !ordered_targets.contains(&t) {
-                            ordered_targets.push(t);
+                        if all_ok {
+                            let check_exes: Vec<String> = lake_refresh_targets(&dir, &closure_mods)
+                                .into_iter()
+                                .chain(input_exes.iter().cloned())
+                                .filter(|t| t.ends_with(":exe"))
+                                .collect();
+                            if !check_exes.is_empty()
+                                && !crate::module_builder::verify_project_native_and_c_sidecars_up_to_date(
+                                    &cfg,
+                                    &check_exes,
+                                )
+                            {
+                                all_ok = false;
+                            }
+                        }
+                        all_ok
+                    };
+                    if all_fresh_on_disk {
+                        ordered_targets.clear();
+                    } else {
+                        for t in lake_refresh_targets(&dir, &closure_mods) {
+                            if !ordered_targets.contains(&t) {
+                                ordered_targets.push(t);
+                            }
+                        }
+                        for t in input_exes {
+                            if !ordered_targets.contains(&t) {
+                                ordered_targets.push(t);
+                            }
                         }
                     }
                 } else {
@@ -6731,7 +6776,7 @@ fn compute_stage2_dependent_closure_after_cutoff(
 
     let expected_lake_inputs =
         crate::module_builder::workspace_lake_inputs_digest(&closure.cfg).ok();
-    let mut closure_cache = LakeClosureCache::default();
+    let mut closure_cache = LakeClosureCache::for_project(&closure.cfg);
     closure_cache.insert_pre_pkg_manifest(
         closure.cfg.root_pkg.pkg_root.clone(),
         strict_policy,
