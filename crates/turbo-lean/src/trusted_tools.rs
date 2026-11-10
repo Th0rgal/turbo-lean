@@ -6,7 +6,26 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-const SYSTEM_BINS: [&str; 5] = ["/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin", "/sbin"];
+const SYSTEM_BINS: [&str; 6] = [
+    "/usr/bin",
+    "/bin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/sbin",
+    "/run/current-system/sw/bin",
+];
+
+pub(crate) fn trusted_sys_path() -> String {
+    match option_env!("TURBO_LEAN_NIX_SYS_PATH") {
+        Some(nix_p) if !nix_p.is_empty() => {
+            format!("{nix_p}:/run/current-system/sw/bin:/usr/bin:/bin")
+        }
+        _ if Path::new("/run/current-system/sw/bin").is_dir() => {
+            "/run/current-system/sw/bin:/usr/bin:/bin".to_string()
+        }
+        _ => "/usr/bin:/bin".to_string(),
+    }
+}
 
 pub(crate) fn outside_checkout(path: &Path, project: &Path) -> Result<PathBuf> {
     anyhow::ensure!(
@@ -46,11 +65,17 @@ pub(crate) fn outside_checkout(path: &Path, project: &Path) -> Result<PathBuf> {
 
 pub(crate) fn system_executable(path: &Path, project: &Path) -> Result<PathBuf> {
     let path = outside_checkout(path, project)?;
+    let in_nix_store_bin = path.starts_with("/nix/store/")
+        && path
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == "bin");
     anyhow::ensure!(
-        SYSTEM_BINS
-            .iter()
-            .filter_map(|p| Path::new(p).canonicalize().ok())
-            .any(|bin| path.parent() == Some(bin.as_path())),
+        in_nix_store_bin
+            || SYSTEM_BINS
+                .iter()
+                .filter_map(|p| Path::new(p).canonicalize().ok())
+                .any(|bin| path.parent() == Some(bin.as_path())),
         "Executable is outside trusted system bin directories: {}",
         path.display()
     );
@@ -59,12 +84,20 @@ pub(crate) fn system_executable(path: &Path, project: &Path) -> Result<PathBuf> 
 
 pub(crate) fn system_command(name: &str) -> Result<Command> {
     let project = std::env::current_dir()?;
-    let bin = SYSTEM_BINS
-        .iter()
-        .find_map(|dir| system_executable(&Path::new(dir).join(name), &project).ok())
+    let nix_bin = option_env!("TURBO_LEAN_NIX_SYS_PATH")
+        .into_iter()
+        .flat_map(|s| s.split(':'))
+        .filter(|d| !d.is_empty())
+        .find_map(|dir| system_executable(&Path::new(dir).join(name), &project).ok());
+    let bin = nix_bin
+        .or_else(|| {
+            SYSTEM_BINS
+                .iter()
+                .find_map(|dir| system_executable(&Path::new(dir).join(name), &project).ok())
+        })
         .with_context(|| format!("No trusted system executable for {name}"))?;
     let mut command = Command::new(bin);
-    command.env_clear().env("PATH", "/usr/bin:/bin");
+    command.env_clear().env("PATH", trusted_sys_path());
     Ok(command)
 }
 
@@ -132,7 +165,7 @@ fn checked_git(path: PathBuf) -> Result<PathBuf> {
     let out = Command::new(&path)
         .arg("version")
         .env_clear()
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", trusted_sys_path())
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .current_dir("/")
@@ -176,11 +209,16 @@ fn resolve_trusted_git_uncached(project: &Path) -> Result<PathBuf> {
             .with_context(|| format!("Invalid TURBO_LEAN_GIT={}", raw.display()))?;
         return checked_git(vetted);
     }
+    if let Some(nix_git) = option_env!("TURBO_LEAN_NIX_DEFAULT_GIT").filter(|s| !s.is_empty()) {
+        if let Ok(vetted) = outside_checkout(Path::new(nix_git), project) {
+            return checked_git(vetted);
+        }
+    }
     let candidate = SYSTEM_BINS
         .iter()
         .find_map(|dir| system_executable(&Path::new(dir).join("git"), project).ok())
         .context(
-            "No trusted system Git in /usr/bin, /bin, /usr/local/bin, /usr/sbin, or /sbin; \
+            "No trusted system Git in /usr/bin, /bin, /usr/local/bin, /usr/sbin, /sbin, or /run/current-system/sw/bin; \
              set TURBO_LEAN_GIT=/abs/path/to/git outside all checkouts",
         )?;
     checked_git(candidate)
@@ -199,11 +237,12 @@ pub(crate) fn git(project: &Path) -> Result<GitCommand> {
         .map_err(|e| anyhow::anyhow!("Trusted Git unavailable: {e}"))?;
     let program = outside_checkout(program, project)?;
     let home = PrivateHome::new()?;
+    let sys_path = trusted_sys_path();
     let prepare = |extra: &[String]| {
         let mut command = Command::new(&program);
         command
             .env_clear()
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", &sys_path)
             .env("HOME", &home.0)
             .env("XDG_CONFIG_HOME", &home.0)
             .env("GIT_CONFIG_NOSYSTEM", "1")
