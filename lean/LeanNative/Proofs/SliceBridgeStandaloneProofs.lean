@@ -74,7 +74,8 @@ theorem evalSliceUget_of_lower
     · simp [hvi] at hlow
     · simp only [hvi, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hlow
       cases hg : ((fnName == ``ByteArray.uget && lnirTypeEq elemTy .i8 && lnirTypeEq retTy .i8) ||
-          (fnName == ``FloatArray.uget && lnirTypeEq elemTy .f64 && lnirTypeEq retTy .f64))
+          (fnName == ``FloatArray.uget && lnirTypeEq elemTy .f64 && lnirTypeEq retTy .f64) ||
+          (arch.isFreestandingEmbedded && fnName == ``ByteArray.get! && lnirTypeEq elemTy .i8 && lnirTypeEq retTy .i8))
       · simp [hg] at hlow
       · simp only [hg, ↓reduceIte] at hlow
         injection hlow with h'

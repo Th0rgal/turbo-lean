@@ -20,7 +20,7 @@ def evalScalarMask? (arch : TargetArch) : LNIRType → Option UInt64
   | .i16 => some 0xFFFF
   | .i32 => some 0xFFFFFFFF
   | .usize =>
-    if arch.isWasm then some 0xFFFFFFFF
+    if arch.isILP32 then some 0xFFFFFFFF
     else if arch == .nvptx64 || arch == .hybridCpuGpu then none
     else some 0xFFFFFFFFFFFFFFFF
   | .i64 => some 0xFFFFFFFFFFFFFFFF

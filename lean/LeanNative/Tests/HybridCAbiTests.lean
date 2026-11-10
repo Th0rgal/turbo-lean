@@ -328,8 +328,16 @@ def runClangC11ConformanceSuite : IO Bool := do
     ("bundle-combined-32", stripPragmaOnce hdr32 ++ "\n" ++ shim32, .wasm32),
     ("emitCAbiHeader-x86_64", modHdr64, .x86_64),
     ("emitCAbiHeader-wasm32", modHdr32, .wasm32),
+    ("emitCAbiHeader-thumbv6m", stripPragmaOnce (emitCAbiHeader diverseCAbiModule .thumbv6m), .thumbv6m),
+    ("emitCAbiHeader-thumbv8mMain", stripPragmaOnce (emitCAbiHeader diverseCAbiModule .thumbv8mMain), .thumbv8mMain),
+    ("emitCAbiHeader-riscv32imac", stripPragmaOnce (emitCAbiHeader diverseCAbiModule .riscv32imac), .riscv32imac),
+    ("bundle-hdr-32-thumbv6m", stripPragmaOnce hdr32, .thumbv6m),
+    ("bundle-hdr-32-thumbv8mMain", stripPragmaOnce hdr32, .thumbv8mMain),
+    ("bundle-hdr-32-riscv32imac", stripPragmaOnce hdr32, .riscv32imac),
     ("emitCAbiHeaderFromSigs-dual-x86_64", dualHdr, .x86_64),
     ("emitCAbiHeaderFromSigs-dual-wasm32", dualHdr, .wasm32),
+    ("emitCAbiHeaderFromSigs-dual-thumbv6m", dualHdr, .thumbv6m),
+    ("emitCAbiHeaderFromSigs-dual-riscv32imac", dualHdr, .riscv32imac),
     ("zero-copy-slice-hdr-64", sliceHdr64, .x86_64),
     ("zero-copy-slice-hdr-32", sliceHdr32, .wasm32)
   ]

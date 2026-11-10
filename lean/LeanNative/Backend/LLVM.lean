@@ -37,7 +37,7 @@ def sigLLVMType (target : TargetArch := .x86_64) : LNIRType → String
   | .i16 => "i16"
   | .i32 => "i32"
   | .f64 => "double"
-  | .usize => if target.isWasm then "i32" else "i64"
+  | .usize => if target.isILP32 then "i32" else "i64"
   | ty => slotLLVMType ty
 
 def sigLLVMAttr (target : TargetArch := .x86_64) : LNIRType → String
@@ -125,7 +125,7 @@ def exprHasHeapOps : LNIRExpr → Bool
   | _ => false
 
 /-- Syntactic check whether an `LNIRCode` block performs RC or heap operations. -/
-partial def codeHasHeapOps : LNIRCode → Bool
+def codeHasHeapOps : LNIRCode → Bool
   | .incRef _ _ _ | .decRef _ _ _ => true
   | .letBind _ _ rhs k => exprHasHeapOps rhs || codeHasHeapOps k
   | .rawStore _ _ _ _ k => codeHasHeapOps k
@@ -134,14 +134,14 @@ partial def codeHasHeapOps : LNIRCode → Bool
   | .ret _ | .unreachable => false
 
 /-- Syntactic check whether an `LNIRCode` block contains a data-parallel `parFor` loop. -/
-partial def codeHasParFor : LNIRCode → Bool
+def codeHasParFor : LNIRCode → Bool
   | .parFor _ _ _ _ _ _ => true
   | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k => codeHasParFor k
   | .ite _ t e | .seqFor _ _ _ _ _ _ t e => codeHasParFor t || codeHasParFor e
   | .ret _ | .unreachable => false
 
 /-- Syntactic check whether an `LNIRCode` block contains EVM 256-bit `.storageLoad` or `.storageStore`. -/
-partial def codeHasStorageOps : LNIRCode → Bool
+def codeHasStorageOps : LNIRCode → Bool
   | .letBind _ _ (.storageLoad _ _) _ | .letBind _ _ (.storageStore _ _ _) _ => true
   | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k | .parFor _ _ _ _ _ k => codeHasStorageOps k
   | .ite _ t e | .seqFor _ _ _ _ _ _ t e => codeHasStorageOps t || codeHasStorageOps e
@@ -465,12 +465,12 @@ private def sarrayElemSuffix : LNIRType → String
   | .i32 | .f32 => "_e4"
   | _ => ""
 
-/-- Emit target-aware `lean_sarray_object.m_size` load (byte offset 8, `size_t` = `i32` on `wasm32`, `i64` on 64-bit). -/
+/-- Emit target-aware `lean_sarray_object.m_size` load (byte offset 8, `size_t` = `i32` on ILP32 targets, `i64` on 64-bit). -/
 private def emitSarraySizeLoad (pfx arrPtr : String) : EmitM String := do
   let target := (← get).target
   let szPtr ← freshTmp (pfx ++ "_ptr")
   emitLine s!"  {szPtr} = getelementptr inbounds i8, ptr {arrPtr}, i64 8"
-  if target.isWasm then
+  if target.isILP32 then
     let sz32 ← freshTmp (pfx ++ "_u32")
     let szVal ← freshTmp (pfx ++ "_val")
     emitLine s!"  {sz32} = load i32, ptr {szPtr}, align 4"
@@ -505,7 +505,7 @@ private def emitSarrayHeaderStores (pfx outArr nVal : String) (elemBytes : Nat) 
   emitLine s!"  {tgPtr} = getelementptr inbounds i8, ptr {outArr}, i64 7"
   emitLine s!"  store i8 248, ptr {tgPtr}, align 1"
   emitLine s!"  {szPtr} = getelementptr inbounds i8, ptr {outArr}, i64 8"
-  if target.isWasm then
+  if target.isILP32 then
     let n32 ← freshTmp (pfx ++ "_n32")
     emitLine s!"  {n32} = trunc i64 {nVal} to i32"
     emitLine s!"  store i32 {n32}, ptr {szPtr}, align 4"
@@ -516,9 +516,9 @@ private def emitSarrayHeaderStores (pfx outArr nVal : String) (elemBytes : Nat) 
     emitLine s!"  {capPtr} = getelementptr inbounds i8, ptr {outArr}, i64 16"
     emitLine s!"  store i64 {nVal}, ptr {capPtr}, align 8"
 
-/-- Byte offset of `lean_sarray_object.m_data[]` (`16` on 32-bit `wasm32`, `24` on 64-bit targets). -/
+/-- Byte offset of `lean_sarray_object.m_data[]` (`16` on 32-bit ILP32 targets, `24` on 64-bit targets). -/
 private def sarrayDataByteOffset (target : TargetArch) : Nat :=
-  if target.isWasm then 16 else 24
+  if target.isILP32 then 16 else 24
 
 private def emitSarrayDataPtr (pfx arrPtr : String) : EmitM String := do
   let target := (← get).target
@@ -526,7 +526,7 @@ private def emitSarrayDataPtr (pfx arrPtr : String) : EmitM String := do
   emitLine s!"  {dataPtr} = getelementptr inbounds i8, ptr {arrPtr}, i64 {sarrayDataByteOffset target}"
   return dataPtr
 
-/-- Emit target-ABI `@malloc` (`i32` on `wasm32`, `i64` on 64-bit) with `size_t` overflow trap. -/
+/-- Emit target-ABI `@malloc` (`i32` on ILP32 targets, `i64` on 64-bit) with `size_t` overflow trap. -/
 private def emitTargetMalloc (pfx outArr bytesVal : String) (elemBound? : Option (String × UInt64) := none) : EmitM Unit := do
   let target := (← get).target
   let emitTrapIf (ovfCond : String) : EmitM Unit := do
@@ -534,7 +534,7 @@ private def emitTargetMalloc (pfx outArr bytesVal : String) (elemBound? : Option
     let okLbl ← freshLabel (pfx ++ "_alloc_ok")
     emitLine s!"  br i1 {ovfCond}, label %{trapLbl}, label %{okLbl}"
     emitLine s!"{trapLbl}:\n  call void @llvm.trap()\n  unreachable\n{okLbl}:"
-  if target.isWasm then
+  if target.isILP32 then
     let ovfBytes ← freshTmp (pfx ++ "_ovf_b")
     let ovfCond ← match elemBound? with
       | some (nVal, maxElems) =>
@@ -912,7 +912,8 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
   | .mkTuple fields =>
     let dstSlotTy ← getVarSlotType dst
     let llvmTy := slotLLVMType dstSlotTy
-    if !opt then
+    let rcMode := (← get).rcMode
+    if !opt && rcMode != .freestanding then
       -- In baseline mode, simulate boxed heap tuple allocation cost
       let f0 ← match fields[0]? with
         | some v => loadVarAsI64 v
@@ -1613,7 +1614,7 @@ def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_
   let retTypeStr := sigLLVMAttr target d.retTy ++ sigLLVMType target d.retTy
   let isWordParam (id : VarId) : Bool :=
     match d.params.find? (·.id == id) with
-    | some p => p.ty == .i64 || (p.ty == .usize && !target.isWasm)
+    | some p => p.ty == .i64 || (p.ty == .usize && !target.isILP32)
     | none => false
   let isRawPtrParam (id : VarId) : Bool :=
     match d.params.find? (·.id == id) with
@@ -1796,7 +1797,7 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
       if elemShift == 0 then "  %bytes_data = add i64 %sz, 0"
       else s!"  %bytes_data = shl i64 %sz, {elemShift}"
     let loadSzAndStoreCap :=
-      if target.isWasm then
+      if target.isILP32 then
         "  %sz_ptr = getelementptr inbounds i8, ptr %arr, i64 8\n" ++
         "  %sz32 = load i32, ptr %sz_ptr, align 4\n" ++
         "  %sz = zext i32 %sz32 to i64\n" ++
@@ -1975,7 +1976,7 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
       "declare { i256, i1 } @llvm.uadd.with.overflow.i256(i256, i256) #2\ndeclare { i256, i1 } @llvm.usub.with.overflow.i256(i256, i256) #2\ndeclare { i256, i1 } @llvm.umul.with.overflow.i256(i256, i256) #2",
       "declare i256 @llvm.ctlz.i256(i256, i1 immarg) #2\ndeclare void @llvm.trap()",
       "declare void @lean_native_evm_sload(ptr, ptr, ptr)\ndeclare void @lean_native_evm_sstore(ptr, ptr, ptr)\ndeclare i64 @lean_native_trm_matryoshka_parity_u64(i64)",
-      (if target.isWasm then "declare noalias ptr @malloc(i32 noundef)" else "declare noalias ptr @malloc(i64 noundef)") ++
+      (if target.isILP32 then "declare noalias ptr @malloc(i32 noundef)" else "declare noalias ptr @malloc(i64 noundef)") ++
         "\ndeclare void @free(ptr noundef)\ndeclare void @llvm.memcpy.p0.p0.i64(ptr noalias nocapture writeonly, ptr noalias nocapture readonly, i64, i1 immarg)"
     ],
     mkU256LimbOpFn "lean_native_u256_uadd_limbs" "uadd",
@@ -1986,7 +1987,7 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
     -- `m_tag`); a strong definition from the Lean runtime takes precedence at link time.
     s!"define weak_odr dso_local ptr @lean_alloc_ctor(i32 %tag, i32 %nobjs, i32 %ssz) {attr} \{\nentry:\n" ++
       "  %n64 = zext i32 %nobjs to i64\n  %s64 = zext i32 %ssz to i64\n" ++
-      (if target.isWasm then
+      (if target.isILP32 then
         "  %w64 = shl i64 %n64, 2\n  %b0 = add i64 %w64, %s64\n  %b64 = add i64 %b0, 8\n" ++
         "  %c_ovf = icmp ugt i64 %b64, 4294967295\n  br i1 %c_ovf, label %ctor_trap, label %ctor_ok\n" ++
         "ctor_trap:\n  call void @llvm.trap()\n  unreachable\nctor_ok:\n  %b = trunc i64 %b64 to i32\n" ++
@@ -2318,13 +2319,20 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
     vectorization (`!llvm.loop.vectorize.scalable.enable = true`) when `isa.sve2` holds, or
     fixed-width 128-bit NEON vectorization on `arm64Baseline`/`appleA15`/`appleA16_A17`.
     On `wasm32`, emits portable scalar WASM by default unless `wasmSimd128` is explicitly requested (`P0/P3`). -/
-def emitMetadataFooter (target : TargetArch) (isaOverride? : Option IsaLevel := none) (wasmSimd128 : Bool := false) : String :=
+def emitMetadataFooter (target : TargetArch) (isaOverride? : Option IsaLevel := none)
+    (wasmSimd128 : Bool := false) (freestanding : Bool := target.isFreestandingEmbedded) : String :=
   let isa := isaOverride?.getD target.isaLevel
   let cpuAttr :=
     if target.isWasm then
       if wasmSimd128 then "\"target-features\"=\"+simd128\"" else ""
-    else if !target.isAArch64 then
+    else if target == .thumbv6m || target == .thumbv8mMain then
+      ""
+    else if target == .riscv32imac then
+      "\"target-features\"=\"+m,+a,+c\""
+    else if target == .x86_64 || target == .hybridCpuGpu then
       "\"target-cpu\"=\"x86-64-v2\""
+    else if !target.isAArch64 then
+      ""
     else if target.isMacOS then
       let macCpu := if isa == IsaLevel.appleA15 then "apple-m2" else isa.appleCpuName
       s!"\"target-cpu\"=\"{macCpu}\" \"target-features\"=\"{isa.llvmTargetFeatures},+rcpc\""
@@ -2338,18 +2346,20 @@ def emitMetadataFooter (target : TargetArch) (isaOverride? : Option IsaLevel := 
       else "!8 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 false}"
     else "!8 = !{!\"llvm.loop.vectorize.width\", i32 4}"
   let sve2AttrLine :=
-    if target.isAArch64 then
+    if target.isAArch64 && !freestanding then
       [s!"attributes #3 = \{ nounwind uwtable \"target-features\"=\"{IsaLevel.tensorG3.llvmTargetFeatures}\" }"]
     else []
   let sve2MetaLines :=
-    if target.isAArch64 then
+    if target.isAArch64 && !freestanding then
       [ "!9 = distinct !{!9, !1, !7, !10}",
         "!10 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}" ]
     else []
-  let attr0Body := if cpuAttr.isEmpty then "nounwind uwtable" else s!"nounwind uwtable {cpuAttr}"
+  let baseFnAttrs := if freestanding then "nounwind" else "nounwind uwtable"
+  let attr0Body := if cpuAttr.isEmpty then baseFnAttrs else s!"{baseFnAttrs} {cpuAttr}"
+  let attr1Body := if freestanding then "noinline nounwind optnone" else "noinline nounwind optnone uwtable"
   String.intercalate "\n" ([
     s!"attributes #0 = \{ {attr0Body} }",
-    "attributes #1 = { noinline nounwind optnone uwtable }",
+    s!"attributes #1 = \{ {attr1Body} }",
     "attributes #2 = { nocallback nofree nosync nounwind willreturn memory(none) }"
   ] ++ sve2AttrLine ++ [
     "",
@@ -2417,7 +2427,7 @@ def localScalarSigsOfModule (m : LNIRModule) : List (String × List LNIRType × 
       some (d.name, d.params.map (·.ty), d.retTy)
     else none
 
-private partial def findUnsupportedLLVMCallInCodeAux (localSigs : List (String × List LNIRType × LNIRType)) : LNIRCode → Option String
+def findUnsupportedLLVMCallInCodeAux (localSigs : List (String × List LNIRType × LNIRType)) : LNIRCode → Option String
   | .letBind _ ty (.call callee args _ isExt) k =>
     let ok := !isExt && (
       (callee == "lean_native_box_u64" && args.length == 1 && slotLLVMType ty == "ptr") ||
@@ -2451,9 +2461,57 @@ def findUnsupportedLLVMCall? (m : LNIRModule) (target : TargetArch := .x86_64) :
   let sigs := localScalarSigsOfModule m
   m.decls.findSome? fun d => (findUnsupportedLLVMCallInDecl sigs d target).map (d.name, ·)
 
+/-- Syntactic check whether an `LNIRCode` block calls any heap/runtime helper (`malloc`, boxing, CoW, or `extern`). -/
+def codeHasHeapRuntimeCalls : LNIRCode → Bool
+  | .letBind _ _ (.call callee _ _ isExt) k =>
+    isExt ||
+    callee == "lean_native_box_u64" ||
+    callee == "lean_native_unbox_u64" ||
+    callee == "lean_native_ensure_exclusive" ||
+    callee == "lean_alloc_ctor" ||
+    callee == "lean_mark_mt" ||
+    callee == "malloc" ||
+    callee == "free" ||
+    codeHasHeapRuntimeCalls k
+  | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k | .parFor _ _ _ _ _ k =>
+    codeHasHeapRuntimeCalls k
+  | .ite _ t e | .seqFor _ _ _ _ _ _ t e =>
+    codeHasHeapRuntimeCalls t || codeHasHeapRuntimeCalls e
+  | .ret _ | .unreachable => false
+
+/-- Fail-closed freestanding verification gate for a single `LNIRDecl` (zero `libleanrt.a`, zero `malloc`/`lean_alloc_*`). -/
+def checkFreestandingDecl (localSigs : List (String × List LNIRType × LNIRType)) (d : LNIRDecl)
+    (target : TargetArch := .x86_64) : Option String :=
+  if codeHasHeapOps d.body then some "heap_ops_forbidden_in_freestanding"
+  else if selectDeclRcMode d != .freestanding then some "non_freestanding_rc_mode"
+  else if codeHasStorageOps d.body then some "evm_storage_ops_forbidden_in_freestanding"
+  else if codeHasHeapRuntimeCalls d.body then some "heap_runtime_call_forbidden_in_freestanding"
+  else findUnsupportedLLVMCallInDecl localSigs d target
+
+/-- Fail-closed freestanding verification gate across all declarations in `m`. -/
+def checkFreestandingModule (m : LNIRModule) (target : TargetArch := .x86_64) : Option (String × String) :=
+  let sigs := localScalarSigsOfModule m
+  m.decls.findSome? fun d => (checkFreestandingDecl sigs d target).map (d.name, ·)
+
+/-- Minimal pure LLVM intrinsic declarations for freestanding embedded emission (zero `@malloc`, zero `@free`,
+    zero `@lean_alloc_ctor`, zero `@lean_native_inc`/`dec`, zero hosted runtime helpers). -/
+def emitFreestandingIntrinsics : String :=
+  String.intercalate "\n" [
+    "; --- LeanNative Freestanding Intrinsics (zero heap / zero runtime) ---",
+    "declare { i64, i1 } @llvm.uadd.with.overflow.i64(i64, i64) #2",
+    "declare { i64, i1 } @llvm.usub.with.overflow.i64(i64, i64) #2",
+    "declare { i256, i1 } @llvm.uadd.with.overflow.i256(i256, i256) #2",
+    "declare { i256, i1 } @llvm.usub.with.overflow.i256(i256, i256) #2",
+    "declare { i256, i1 } @llvm.umul.with.overflow.i256(i256, i256) #2",
+    "declare i256 @llvm.ctlz.i256(i256, i1 immarg) #2",
+    "declare void @llvm.trap()"
+  ]
+
 def emitLLVMModule (optimized : Bool) (m : LNIRModule) (target : TargetArch := .x86_64)
-    (isaOverride? : Option IsaLevel := none) (wasmSimd128 : Bool := false) : String :=
-  let modeStr := if optimized then "optimized" else "baseline"
+    (isaOverride? : Option IsaLevel := none) (wasmSimd128 : Bool := false)
+    (freestanding : Bool := target.isFreestandingEmbedded) : String :=
+  let modeStr := if freestanding then (if optimized then "freestanding.optimized" else "freestanding.baseline")
+                 else (if optimized then "optimized" else "baseline")
   let header := String.intercalate "\n" [
     s!"; ModuleID = '{m.moduleName}.{modeStr}'",
     s!"source_filename = \"{m.moduleName}.lean\"",
@@ -2462,18 +2520,33 @@ def emitLLVMModule (optimized : Bool) (m : LNIRModule) (target : TargetArch := .
   ]
   let localScalarSigs := localScalarSigsOfModule m
   let declStrs := m.decls.map (emitDeclLLVM optimized · target localScalarSigs isaOverride?)
-  let abiWrapperStrs := if optimized then (m.decls.map (emitLLVMABIWrapperDecl · target)).filter (!·.isEmpty) else []
-  let runtimeStr := emitRuntimeAndCAbiHelpers optimized target
-  let footer := emitMetadataFooter target isaOverride? wasmSimd128
+  let abiWrapperStrs :=
+    if optimized && !freestanding then (m.decls.map (emitLLVMABIWrapperDecl · target)).filter (!·.isEmpty)
+    else []
+  let runtimeStr := if freestanding then emitFreestandingIntrinsics else emitRuntimeAndCAbiHelpers optimized target
+  let footer := emitMetadataFooter target isaOverride? wasmSimd128 freestanding
   String.intercalate "\n\n" ([header, runtimeStr] ++ declStrs ++ abiWrapperStrs ++ [footer]) ++ "\n"
 
 def emitLLVMBaseline (m : LNIRModule) (target : TargetArch := .x86_64)
-    (isaOverride? : Option IsaLevel := none) (wasmSimd128 : Bool := false) : String :=
-  emitLLVMModule false m target isaOverride? wasmSimd128
+    (isaOverride? : Option IsaLevel := none) (wasmSimd128 : Bool := false)
+    (freestanding : Bool := target.isFreestandingEmbedded) : String :=
+  emitLLVMModule false m target isaOverride? wasmSimd128 freestanding
 
 def emitLLVMOptimized (m : LNIRModule) (target : TargetArch := .x86_64)
-    (isaOverride? : Option IsaLevel := none) (wasmSimd128 : Bool := false) : String :=
-  emitLLVMModule true m target isaOverride? wasmSimd128
+    (isaOverride? : Option IsaLevel := none) (wasmSimd128 : Bool := false)
+    (freestanding : Bool := target.isFreestandingEmbedded) : String :=
+  emitLLVMModule true m target isaOverride? wasmSimd128 freestanding
+
+/-- Fail-closed freestanding LLVM IR emitter: rejects any module whose declarations have
+    `codeHasHeapOps d.body == true`, `selectDeclRcMode d != .freestanding`, EVM storage ops,
+    heap runtime calls, or unsupported external/RC-ADT constructs before emitting pure freestanding IR. -/
+def emitLLVMFreestanding? (m : LNIRModule) (target : TargetArch) (optimized : Bool := true)
+    (isaOverride? : Option IsaLevel := none) (wasmSimd128 : Bool := false) : Except String String :=
+  match checkFreestandingModule m target with
+  | some (dName, reason) =>
+    .error s!"Freestanding verification gate rejected '{dName}': {reason}"
+  | none =>
+    .ok (emitLLVMModule optimized m target isaOverride? wasmSimd128 true)
 
 /-- C5 decl-level: a heap param that is only `incRef`/`decRef`'d (no heap expr in the body) is still rejected. -/
 private def rcParamOnlyDecl : LNIRDecl where
@@ -2542,6 +2615,9 @@ end LeanNative.Backend.LLVM
 
 namespace LeanNative.Backend
 
-export LeanNative.Backend.LLVM (emitLLVMBaseline emitLLVMOptimized emitLLVMABIWrapperDecl findUnsupportedLLVMCall?)
+export LeanNative.Backend.LLVM (
+  emitLLVMBaseline emitLLVMOptimized emitLLVMABIWrapperDecl findUnsupportedLLVMCall?
+  checkFreestandingDecl checkFreestandingModule emitLLVMFreestanding?
+)
 
 end LeanNative.Backend

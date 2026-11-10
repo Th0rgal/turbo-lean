@@ -105,7 +105,7 @@ def widthOf (arch : TargetArch) (ty : LNIRType) : Nat :=
   | .i8 => 8
   | .i16 => 16
   | .i32 => 32
-  | .usize => if arch.isWasm then 32 else 64
+  | .usize => if arch.isILP32 then 32 else 64
   | _ => 64
 
 def maskOf (arch : TargetArch) (ty : LNIRType) : BitVec 64 :=
@@ -196,7 +196,7 @@ def uintPrimMask? (arch : TargetArch) (nm : Lean.Name) : Option (LNIRType × Bit
   else if nm == ``UInt32 then some (.i32, 0xFFFFFFFF#64)
   else if nm == ``UInt64 then some (.i64, 0xFFFFFFFFFFFFFFFF#64)
   else if nm == ``USize && archSupportsUSize arch then
-    some (.usize, if arch.isWasm then 0xFFFFFFFF#64 else 0xFFFFFFFFFFFFFFFF#64)
+    some (.usize, if arch.isILP32 then 0xFFFFFFFF#64 else 0xFFFFFFFFFFFFFFFF#64)
   else none
 
 def canonicalCastEval (fuel : Nat)
@@ -459,7 +459,8 @@ def evalSliceCall? (arch : TargetArch) (fn : Lean.Name) (env : LEnv) (st : HeapS
   | some ([vArr, vIdx], [.sarray elemTy, idxTy]) =>
     if validIdx idxTy &&
        ((fn == ``ByteArray.uget && lnirTypeEq elemTy .i8 && lnirTypeEq ty .i8) ||
-        (fn == ``FloatArray.uget && lnirTypeEq elemTy .f64 && lnirTypeEq ty .f64)) then
+        (fn == ``FloatArray.uget && lnirTypeEq elemTy .f64 && lnirTypeEq ty .f64) ||
+        (arch.isFreestandingEmbedded && fn == ``ByteArray.get! && lnirTypeEq elemTy .i8 && lnirTypeEq ty .i8)) then
       some (match vArr, vIdx with
         | .sarrayId bufId, .u64 idx =>
           (st.readElem bufId idx.toNat).map (fun v => (.u64 (maskElemVal elemTy v), st, none))
