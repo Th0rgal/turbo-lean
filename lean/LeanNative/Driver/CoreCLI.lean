@@ -752,9 +752,15 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
     TargetArch.wasm32.triple == "wasm32-unknown-unknown" && TargetArch.iosSimArm64.symbolPrefix == "_"
   let sve2AsmOk ← do
     let androidIr := emitLLVMOptimized optMod .androidArm64
-    let tmpLl := "/tmp/ln_sve2_verify.ll"
+    let tmpDir := (← IO.getEnv "TMPDIR").getD "/tmp"
+    let tmpLl := s!"{tmpDir}/ln_sve2_verify.ll"
     let home := (← IO.getEnv "HOME").getD "/root"
-    let clangCandidates := [s!"{home}/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang", s!"{home}/.elan/toolchains/leanprover--lean4---v4.31.0/bin/clang", "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang", "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin/clang"]
+    let sysroot := (← IO.getEnv "LEAN_SYSROOT").getD ""
+    let rawClangEnv := (← IO.getEnv "LEAN_NATIVE_CLANG_RAW").getD ""
+    let clangCandidates :=
+      (if rawClangEnv.isEmpty then [] else [rawClangEnv]) ++
+      (if sysroot.isEmpty then [] else [s!"{sysroot}/bin/clang"]) ++
+      [s!"{home}/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang", s!"{home}/.elan/toolchains/leanprover--lean4---v4.31.0/bin/clang", "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang", "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin/clang"]
     let mut clangCmd := "clang"
     for cand in clangCandidates do
       if ← System.FilePath.pathExists cand then clangCmd := cand; break
