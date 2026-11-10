@@ -95,12 +95,27 @@ def bridgedTheorems : List Name :=
   , ``SailRiscvBridge.rvcJalr_x1_state_bisim_sail
   , ``SailRiscvBridge.rvcZcbExpand_bisim_sail
   , ``SailRiscvBridge.rvcZcbDirectSailM_x8_bisim
+  , ``SailRiscvBridge.rv64ZaamoEncdec_bisim_sail
+  , ``SailRiscvBridge.rv64ZaamoAlu_bisim_sail
+  , ``SailRiscvBridge.rv64ZacasRegPair_bisim_sail
+  , ``SailRiscvBridge.sailAmo64RamExec_bisim_sail
+  , ``SailRiscvBridge.rv64ZalrscFlagsAndWidths_bisim_sail
+  , ``SailRiscvBridge.rv64ZalrscRamAndScStatus_bisim_sail
+  , ``SailRiscvBridge.rv64ZicsrOpAndAccess_bisim_sail
+  , ``SailRiscvBridge.rv64ZicsrPrivAndReadOnlyCheck_bisim_sail
+  , ``SailRiscvBridge.rv64PrivEffectiveAndTvm_bisim_sail
+  , ``SailRiscvBridge.rv64Satp64ModeDecode_bisim_sail
+  , ``SailRiscvBridge.rv64Sv39Sv48CanonicalVaddr_bisim_sail
+  , ``SailRiscvBridge.rv64SvPtePermissionsAndDirtyBits_bisim_sail
+  , ``SailRiscvBridge.rv64TranslationException_bisim_sail
+  , ``SailRiscvBridge.rv64TlbMatchPpnAndSfence_bisim_sail
+  , ``SailRiscvBridge.rv64SfenceVmaAndTlbLookup_bisim_sail
   ]
 
 theorem bridgedTheorems_nodup : bridgedTheorems.Nodup := by
   decide
 
-def minAuditedTheorems : Nat := 80
+def minAuditedTheorems : Nat := 95
 
 def allowedAxioms : List Name :=
   [``propext, ``Classical.choice, ``Quot.sound]
