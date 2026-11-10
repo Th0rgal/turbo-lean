@@ -13,7 +13,7 @@ Verifies:
    `079463134b9c50450b8393e1566a09fc492a34d9` (`len(packages) == 2`).
 3. `SailRiscvBridge` proof modules never import heavy monolithic generated modules
    (`LeanRV64D.InstsEnd`, `LeanRV64D.Step`, `LeanRV64D.ZicsrInsts`, `LeanRV64D.RiscvExtras`, or root `import LeanRV64D`),
-   contain `#verify_sail_riscv_bridge_axioms` (>= 80 unique audited theorems via `Lean.collectAxioms`
+   contain `#verify_sail_riscv_bridge_axioms` (>= 95 unique audited theorems via `Lean.collectAxioms`
    and `bridgedTheorems.Nodup`), and contain zero `sorry`, `sorryAx`, `admit`, `axiom`, `native_decide`,
    `bv_decide`, `trustCompiler`, or `ofReduceBool` tokens outside Lean comments/strings.
 """
@@ -50,7 +50,7 @@ FORBIDDEN_IMPORTS = re.compile(
     re.M,
 )
 
-MIN_AUDITED_THEOREMS = 80
+MIN_AUDITED_THEOREMS = 95
 
 UPSTREAM_INSTSEND_REL = ".lake/packages/Lean_RV64D/LeanRV64D/InstsEnd.lean"
 PINNED_INSTSEND_SNIPPET_DIGESTS: dict[str, str] = {
@@ -140,6 +140,12 @@ PINNED_INSTSEND_SNIPPET_DIGESTS: dict[str, str] = {
     "execute_C_ZEXT_W": "f1bd5c7b1797db26bd98caa7a1a635cdca7cf31cb5a60a206f942b3ceba42c07",
     "execute_C_NOT": "6e456c71aa8c030bf17845036775bf32ea9b1284916c73ca3e41b550d727d318",
     "execute_C_MUL": "25dda6f4d40b1ff91578122a38247790f777adf78e2593eb8e42a4f4549a5f0b",
+    "execute_AMO": "a0c60a48aec119016ddefa49376f41d260bcf627245d3f925f2ee4d2a599a9ba",
+    "execute_LOADRES": "16514a4cdb1f5d31309bec92d304f44465a3e9f773ea9564eb6bf9c53f3684c4",
+    "execute_STORECON": "1ea03f4e591d602a3bc838d8832739d7865bac2ef0fc2367c25f18fdca15dbd4",
+    "execute_CSRReg": "6c57ac097cc2f2359cb68f1a52d677a9eede596904ef3d26da9d9f7224308016",
+    "execute_CSRImm": "70e72178239c122d3322f1c3903deb2bc5dfa97fb4dee84fe38ff3d0f29fdcf8",
+    "execute_SFENCE_VMA": "10cd8bf0c03470ebfb502ad0a3660cf173221cf7128c5475820942c11564fea3",
 }
 
 
@@ -1044,7 +1050,160 @@ def execute_C_MUL (rsdc : cregidx) (rsc2 : cregidx) : ExecutionResult :=
     (MUL
       (rs, rd, rd, { result_part := Low
                      signed_rs1 := Signed
-                     signed_rs2 := Signed })))"""
+                     signed_rs2 := Signed })))
+
+def execute_AMO (op : amoop) (aq : Bool) (rl : Bool) (rs2 : regidx) (rs1 : regidx) (width : Nat) (rd : regidx) : SailM ExecutionResult := SailME.run do
+  let width := width
+  assert (width ≤b (xlen_bytes *i 2)) "extensions/A/zaamo_insts.sail:73.32-73.33"
+  let access := (Atomic (op, aq, rl, Data, Data))
+  let vaddr ← (( do
+    match (← (get_transformed_data_addr rs1 (zeros (n := 64)) access width)) with
+    | .Ext_DataAddr_Error e => SailME.throw ((Ext_DataAddr_Check_Failure e) : ExecutionResult)
+    | .Ext_DataAddr_OK vaddr => (pure vaddr) ) : SailME ExecutionResult virtaddr )
+  if ((not (is_aligned_vaddr vaddr width)) : Bool)
+  then
+    (do
+      match (plat_misaligned_exception access false) with
+      | .some .AccessFault =>
+        SailME.throw (← do
+            (memory_exception vaddr (E_SAMO_Access_Fault ())))
+      | .some .AlignmentException =>
+        SailME.throw (← do
+            (memory_exception vaddr (E_SAMO_Addr_Align ())))
+      | none => (pure ()))
+  else (pure ())
+  let (addr, pbmt) ← (( do
+    match (← (translateAddr vaddr access)) with
+    | .Err (e, _) =>
+      SailME.throw (← do
+          (memory_exception vaddr e))
+    | .Ok (addr, pbmt, _) => (pure (addr, pbmt)) ) : SailME ExecutionResult
+    (physaddr × page_based_mem_type) )
+  let loaded ← (( do
+    match (← (mem_write_ea addr width access pbmt (aq && rl) rl true)) with
+    | .Err (exc_addr, e) =>
+      SailME.throw (← do
+          assert (exc_addr == addr) "extensions/A/zaamo_insts.sail:104.29-104.30"
+          (memory_exception vaddr e))
+    | .Ok _ =>
+      (do
+        match (← (mem_read access pbmt addr width aq (aq && rl) true)) with
+        | .Err (exc_addr, e) =>
+          SailME.throw (← do
+              assert (exc_addr == addr) "extensions/A/zaamo_insts.sail:110.31-110.32"
+              (memory_exception vaddr e))
+        | .Ok loaded => (pure loaded)) ) : SailME ExecutionResult (BitVec (width * 8)) )
+  let rs2_val ← (( do
+    if ((width ≤b xlen_bytes) : Bool)
+    then (pure (trunc (m := (width *i 8)) (← (rX_bits rs2))))
+    else (pure (trunc (m := (width *i 8)) (← (rX_pair_bits rs2)))) ) : SailME ExecutionResult
+    (BitVec (width * 8)) )
+  let result : (BitVec (width * 8)) :=
+    match op with
+    | .AMOSWAP => rs2_val
+    | .AMOADD => (rs2_val + loaded)
+    | .AMOXOR => (rs2_val ^^^ loaded)
+    | .AMOAND => (rs2_val &&& loaded)
+    | .AMOOR => (rs2_val ||| loaded)
+    | .AMOMIN =>
+      (if ((zopz0zI_s rs2_val loaded) : Bool)
+      then rs2_val
+      else loaded)
+    | .AMOMAX =>
+      (if ((zopz0zK_s rs2_val loaded) : Bool)
+      then rs2_val
+      else loaded)
+    | .AMOMINU =>
+      (if ((zopz0zI_u rs2_val loaded) : Bool)
+      then rs2_val
+      else loaded)
+    | .AMOMAXU =>
+      (if ((zopz0zK_u rs2_val loaded) : Bool)
+      then rs2_val
+      else loaded)
+    | .AMOCAS => rs2_val
+  if (((op == AMOCAS) && (loaded != (← do
+           if ((width ≤b xlen_bytes) : Bool)
+           then (pure (trunc (m := (width *i 8)) (← (rX_bits rd))))
+           else (pure (trunc (m := (width *i 8)) (← (rX_pair_bits rd))))))) : Bool)
+  then
+    (do
+      if ((width ≤b xlen_bytes) : Bool)
+      then (wX_bits rd (sign_extend (m := 64) loaded))
+      else (wX_pair_bits rd (sign_extend (m := (64 *i 2)) loaded))
+      (pure RETIRE_SUCCESS))
+  else
+    (do
+      match (← (mem_write_value addr width (sign_extend (m := (8 *i width)) result) access pbmt
+          (aq && rl) rl true)) with
+      | .Ok true =>
+        (do
+          if ((width ≤b xlen_bytes) : Bool)
+          then (wX_bits rd (sign_extend (m := 64) loaded))
+          else (wX_pair_bits rd (sign_extend (m := (64 *i 2)) loaded))
+          (pure RETIRE_SUCCESS))
+      | .Ok false =>
+        (internal_error "extensions/A/zaamo_insts.sail" 153 "AMO got false from mem_write_value")
+      | .Err (exc_addr, e) =>
+        (do
+          assert (exc_addr == addr) "extensions/A/zaamo_insts.sail:156.29-156.30"
+          (memory_exception vaddr e)))
+
+def execute_LOADRES (aq : Bool) (rl : Bool) (rs1 : regidx) (width : Nat) (rd : regidx) : SailM ExecutionResult := do
+  assert (width ≤b xlen_bytes) "extensions/A/zalrsc_insts.sail:43.28-43.29"
+  match (← (vmem_read rs1 (zeros (n := 64)) width (LoadReserved (aq, rl, Data)) aq (aq && rl) true)) with
+  | .Ok data =>
+    (do
+      (wX_bits rd (sign_extend (m := 64) data))
+      (pure RETIRE_SUCCESS))
+  | .Err e => (pure e)
+
+def execute_STORECON (aq : Bool) (rl : Bool) (rs2 : regidx) (rs1 : regidx) (width : Nat) (rd : regidx) : SailM ExecutionResult := do
+  assert (width ≤b xlen_bytes) "extensions/A/zalrsc_insts.sail:68.28-68.29"
+  let data ← do (pure (Sail.BitVec.extractLsb (← (rX_bits rs2)) ((width *i 8) -i 1) 0))
+  match (← (vmem_write rs1 (zeros (n := 64)) width data (StoreConditional (aq, rl, Data))
+      (aq && rl) rl true)) with
+  | .Ok b =>
+    (do
+      (wX_bits rd (zero_extend (m := 64) (bool_bit_forwards (! b))))
+      (cancel_reservation ())
+      (pure RETIRE_SUCCESS))
+  | .Err e => (pure e)
+
+def execute_CSRReg (csr : (BitVec 12)) (rs1 : regidx) (rd : regidx) (op : csrop) : SailM ExecutionResult := do
+  let access_type := (csr_access_type op (rd == zreg) (rs1 == zreg))
+  (doCSR csr (← (rX_bits rs1)) rd op access_type)
+
+def execute_CSRImm (csr : (BitVec 12)) (imm : (BitVec 5)) (rd : regidx) (op : csrop) : SailM ExecutionResult := do
+  let access_type := (csr_access_type op (rd == zreg) (imm == (zeros (n := 5))))
+  (doCSR csr (zero_extend (m := 64) imm) rd op access_type)
+
+def execute_SFENCE_VMA (rs1 : regidx) (rs2 : regidx) : SailM ExecutionResult := do
+  let addr ← do
+    if ((bne rs1 zreg) : Bool)
+    then (pure (some (← (rX_bits rs1))))
+    else (pure none)
+  let asid ← do
+    if ((bne rs2 zreg) : Bool)
+    then (pure (some (Sail.BitVec.extractLsb (← (rX_bits rs2)) (asidlen -i 1) 0)))
+    else (pure none)
+  match (← readReg cur_privilege) with
+  | .User => (pure (Illegal_Instruction ()))
+  | .Supervisor =>
+    (do
+      match (_get_Mstatus_TVM (← readReg mstatus)) with
+      | 1 => (pure (Illegal_Instruction ()))
+      | _ =>
+        (do
+          (flush_TLB asid addr)
+          (pure RETIRE_SUCCESS)))
+  | .Machine =>
+    (do
+      (flush_TLB asid addr)
+      (pure RETIRE_SUCCESS))
+  | .VirtualUser => (pure (Virtual_Instruction ()))
+  | .VirtualSupervisor =>
+    (internal_error "extensions/I/base_insts.sail" 692 "Hypervisor extension not supported")"""
 
 SYNTHETIC_INSTSEND_TEXT = "\n\n".join(
     [

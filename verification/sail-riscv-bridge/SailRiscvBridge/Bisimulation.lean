@@ -11,6 +11,20 @@ import LeanRV64D.Types
 import LeanRV64D.AddrChecks
 import LeanRV64D.SplitAccessUtils
 import LeanRV64D.PhysMemInterface
+import LeanRV64D.Arith
+import LeanRV64D.AextTypes
+import LeanRV64D.ZaamoInsts
+import LeanRV64D.ZicsrTypes
+import LeanRV64D.IsaVersion
+import LeanRV64D.MemAddrtype
+import LeanRV64D.SysRegs
+import LeanRV64D.SysControl
+import LeanRV64D.VmemTypes
+import LeanRV64D.VmemPte
+import LeanRV64D.VmemPtw
+import LeanRV64D.VmemTlb
+import LeanRV64D.Mem
+import LeanRV64D.Vmem
 
 /-!
 # Stage 3E / Milestone `M5` RV64 Formal Bisimulation against `opencompl/sail-riscv-lean`
@@ -21,9 +35,10 @@ word multiplication/division/remainder (`MUL`, `MULH`, `MULHSU`, `MULHU`, `MULW`
 (`clmul64`, `clmul64Hi`, `CLMULR`, and $\mathbb{F}_2[x]$ commutativity), the RV64I base & `*W`
 ALU/shift/`LUI`/`AUIPC`/branch/`JAL`/`JALR` fragment, RV64 Zba/Zbb/Zbs bit-manipulation
 instructions, RV64I Load/Store memory (`LB`/`LBU`/`LH`/`LHU`/`LW`/`LWU`/`LD` & `SB`/`SH`/`SW`/`SD`),
-and RVC compressed (`Zca` / `Zcb` / RV64C) instructions directly against upstream
-`opencompl/sail-riscv-lean` (`Lean_RV64D` + `Sail`) on `leanprover/lean4:v4.29.0`, avoiding
-monolithic `LeanRV64D.InstsEnd` / `LeanRV64D.Step` / `LeanRV64D.ZicsrInsts` /
+RVC compressed (`Zca` / `Zcb` / RV64C) instructions, and RV64A (`Zaamo` / `Zacas` / `Zalrsc`),
+`Zicsr` / privileged-mode checks, and `Sv39` / `Sv48` virtual-memory PTE/SATP/TLB semantics directly
+against upstream `opencompl/sail-riscv-lean` (`Lean_RV64D` + `Sail`) on `leanprover/lean4:v4.29.0`,
+avoiding monolithic `LeanRV64D.InstsEnd` / `LeanRV64D.Step` / `LeanRV64D.ZicsrInsts` /
 `LeanRV64D.RiscvExtras` imports so incremental elaboration stays lightweight and axiom-clean.
 -/
 
@@ -4083,5 +4098,909 @@ theorem rvcZcbDirectSailM_x8_bisim (val : BitVec 64)
       rfl
     dsimp [Bind.bind, EStateM.bind, EStateM.run, s1, s2] at hn1 hn2 hr8_s2 ⊢
     rw [hn1]; dsimp only; rw [hn2]; dsimp only; exact hr8_s2
+
+/-! ## 9. RV64A (`Zaamo` / `Zacas` / `Zalrsc`), `Zicsr` / Privileged, & `Sv39` / `Sv48` VMem Bisimulation (Stage 3E.6) -/
+
+/-- Pure reference ALU core for `Zaamo` / `Zacas` (`AMOSWAP`, `AMOADD`, `AMOXOR`, `AMOAND`, `AMOOR`,
+    `AMOMIN`, `AMOMAX`, `AMOMINU`, `AMOMAXU`, `AMOCAS`) over arbitrary bit-width `n`. -/
+def rv64AmoAluSpec {n : Nat} (op : amoop) (rs2_val loaded : BitVec n) : BitVec n :=
+  match op with
+  | .AMOSWAP => rs2_val
+  | .AMOADD => rs2_val + loaded
+  | .AMOXOR => rs2_val ^^^ loaded
+  | .AMOAND => rs2_val &&& loaded
+  | .AMOOR => rs2_val ||| loaded
+  | .AMOMIN => if BitVec.slt rs2_val loaded then rs2_val else loaded
+  | .AMOMAX => if BitVec.slt loaded rs2_val then rs2_val else loaded
+  | .AMOMINU => if BitVec.ult rs2_val loaded then rs2_val else loaded
+  | .AMOMAXU => if BitVec.ult loaded rs2_val then rs2_val else loaded
+  | .AMOCAS => rs2_val
+
+/-- Exact mirror of the ALU computation in upstream `LeanRV64D.Functions.execute_AMO`
+    (`InstsEnd.lean`, lines 71839–71862, SHA-256 pinned in `scripts/check_sail_riscv_bridge_sync.py`). -/
+def sailAmoAluCore {width : Nat} (op : amoop) (rs2_val loaded : BitVec (width * 8)) :
+    BitVec (width * 8) :=
+  match op with
+  | .AMOSWAP => rs2_val
+  | .AMOADD => rs2_val + loaded
+  | .AMOXOR => rs2_val ^^^ loaded
+  | .AMOAND => rs2_val &&& loaded
+  | .AMOOR => rs2_val ||| loaded
+  | .AMOMIN => if zopz0zI_s rs2_val loaded then rs2_val else loaded
+  | .AMOMAX => if zopz0zK_s rs2_val loaded then rs2_val else loaded
+  | .AMOMINU => if zopz0zI_u rs2_val loaded then rs2_val else loaded
+  | .AMOMAXU => if zopz0zK_u rs2_val loaded then rs2_val else loaded
+  | .AMOCAS => rs2_val
+
+/-- `Zaamo` / `Zacas` opcode encoding (`encdec_amoop_forwards` / `encdec_amoop_backwards` /
+    `encdec_amoop_backwards_matches`) and memory-access classification (`is_amo_access`,
+    `is_load_store`, `is_store_conditional`) bisimulation in `SailM`. -/
+theorem rv64ZaamoEncdec_bisim_sail (op : amoop) (aq rl : Bool)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    encdec_amoop_forwards_matches op = true ∧
+    encdec_amoop_backwards_matches (encdec_amoop_forwards op) = true ∧
+    (encdec_amoop_backwards (encdec_amoop_forwards op)).run s = .ok op s ∧
+    is_amo_access (.Atomic (op, aq, rl, .Data, .Data)) = true ∧
+    is_load_store (.Atomic (op, aq, rl, mem_payload.Data, mem_payload.Data)) = true ∧
+    is_store_conditional (.Atomic (op, aq, rl, mem_payload.Data, mem_payload.Data)) = false := by
+  cases op <;> exact ⟨rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `Zaamo` / `Zacas` ALU value bisimulation against upstream `execute_AMO`: proves exact bit-level
+    agreement across all 10 `amoop` variants (`width = 1, 2, 4, 8, 16`, i.e., `.B`/`.H`/`.W`/`.D`/`.Q`)
+    and commutativity of `AMOADD`/`AMOXOR`/`AMOAND`/`AMOOR`. -/
+theorem rv64ZaamoAlu_bisim_sail {width : Nat} (op : amoop)
+    (rs2_val loaded : BitVec (width * 8)) :
+    sailAmoAluCore op rs2_val loaded = rv64AmoAluSpec op rs2_val loaded ∧
+    sailAmoAluCore .AMOADD rs2_val loaded = sailAmoAluCore .AMOADD loaded rs2_val ∧
+    sailAmoAluCore .AMOXOR rs2_val loaded = sailAmoAluCore .AMOXOR loaded rs2_val ∧
+    sailAmoAluCore .AMOAND rs2_val loaded = sailAmoAluCore .AMOAND loaded rs2_val ∧
+    sailAmoAluCore .AMOOR rs2_val loaded = sailAmoAluCore .AMOOR loaded rs2_val := by
+  have hslt : ∀ a b : BitVec (width * 8), zopz0zI_s a b = BitVec.slt a b := by
+    intro a b
+    rfl
+  have hsgt : ∀ a b : BitVec (width * 8), zopz0zK_s a b = BitVec.slt b a := by
+    intro a b
+    unfold zopz0zK_s BitVec.slt
+    rfl
+  have hult : ∀ a b : BitVec (width * 8), zopz0zI_u a b = BitVec.ult a b := by
+    intro a b
+    unfold zopz0zI_u Sail.BitVec.toNatInt BitVec.ult
+    change decide ((a.toNat : Int) < (b.toNat : Int)) = decide (a.toNat < b.toNat)
+    apply Bool.eq_iff_iff.mpr
+    simp only [decide_eq_true_eq]
+    omega
+  have hugt : ∀ a b : BitVec (width * 8), zopz0zK_u a b = BitVec.ult b a := by
+    intro a b
+    unfold zopz0zK_u Sail.BitVec.toNatInt BitVec.ult
+    change decide ((a.toNat : Int) > (b.toNat : Int)) = decide (b.toNat < a.toNat)
+    apply Bool.eq_iff_iff.mpr
+    simp only [decide_eq_true_eq]
+    omega
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · cases op <;> simp [sailAmoAluCore, rv64AmoAluSpec, hslt, hsgt, hult, hugt]
+  · simp [sailAmoAluCore, BitVec.add_comm]
+  · simp [sailAmoAluCore, BitVec.xor_comm]
+  · simp [sailAmoAluCore, BitVec.and_comm]
+  · simp [sailAmoAluCore, BitVec.or_comm]
+
+/-- Direct `SailM` bisimulation for RV64 `Zacas` 128-bit register-pair accessors (`rX_pair_bits` /
+    `wX_pair_bits` in `Regs.lean`, lines 720–732): proves `zreg` (`x0`) reads `0#128` and ignores
+    pair writes, while even register pair `(x2, x3)` (`sp`, `gp`) packs `hi +++ lo` and unpacks
+    `data[63:0]` / `data[127:64]` with exact roundtrip in `SailM`. -/
+theorem rv64ZacasRegPair_bisim_sail (lo hi : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hlo : s.regs.get? .x2 = some lo)
+    (hhi : s.regs.get? .x3 = some hi) :
+    (rX_pair_bits zreg).run s = .ok (0#(64 * 2)) s ∧
+    (wX_pair_bits zreg (hi +++ lo)).run s = .ok () s ∧
+    (rX_pair_bits sp).run s = .ok (hi +++ lo) s ∧
+    (wX_pair_bits sp (hi +++ lo)).run s =
+      .ok () { s with regs := (s.regs.insert .x2 lo).insert .x3 hi } := by
+  have hr2 : (rX_bits sp).run s = .ok lo s := by
+    unfold sp rX_bits rX regval_from_reg zero_extend Sail.BitVec.zeroExtend Sail.BitVec.toNatInt
+    simp [readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+    dsimp [EStateM.bind, EStateM.get, EStateM.pure, EStateM.run]
+    rw [hlo]; rfl
+  have hreg3 : regidx_offset_range sp 1 = .Regidx 3#5 := by
+    unfold sp regidx_offset_range
+    rfl
+  have hr3 : (rX_bits (regidx_offset_range sp 1)).run s = .ok hi s := by
+    rw [hreg3]
+    unfold rX_bits rX regval_from_reg Sail.BitVec.toNatInt
+    simp [readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+    dsimp [EStateM.bind, EStateM.get, EStateM.pure, EStateM.run]
+    rw [hhi]; rfl
+  have hlo_ext : Sail.BitVec.extractLsb (hi +++ lo) (Functions.xlen -i 1) 0 = lo := by
+    apply BitVec.eq_of_getLsbD_eq
+    intro k hk
+    change (BitVec.extractLsb 63 0 (hi +++ lo)).getLsbD k = lo.getLsbD k
+    have hk' : k < 64 := hk
+    rw [BitVec.getLsbD_extractLsb]
+    simp only [Nat.zero_add, Nat.sub_zero, BitVec.getLsbD_append]
+    simp [hk']
+  have hhi_ext : Sail.BitVec.extractLsb (hi +++ lo) ((Functions.xlen *i 2) -i 1) Functions.xlen = hi := by
+    apply BitVec.eq_of_getLsbD_eq
+    intro k hk
+    change (BitVec.extractLsb 127 64 (hi +++ lo)).getLsbD k = hi.getLsbD k
+    have hk' : k < 64 := hk
+    have hk64 : ¬(64 + k < 64) := by omega
+    have hsub : 64 + k - 64 = k := by omega
+    rw [BitVec.getLsbD_extractLsb]
+    simp only [show 127 - 64 + 1 = 64 by decide, BitVec.getLsbD_append]
+    simp [hk', hk64, hsub]
+  have hw2 : ∀ (v : BitVec 64) (st : SequentialState RegisterType trivialChoiceSource),
+      (wX_bits sp v).run st = .ok () { st with regs := st.regs.insert .x2 v } := by
+    intro v st
+    unfold sp
+    simp [wX_bits, wX, regval_into_reg, xreg_write_callback, reg_name_forwards,
+      encdec_reg_forwards_matches, encdec_reg_forwards, get_config_use_abi_names,
+      LeanRV64D.Functions.not, reg_arch_name_raw_forwards, xreg_full_write_callback,
+      zero_extend, Sail.BitVec.zeroExtend, Sail.BitVec.toNatInt, to_bits, get_slice_int,
+      writeReg, PreSail.writeReg, modify, modifyGet, MonadStateOf.modifyGet]
+    rfl
+  have hw3 : ∀ (v : BitVec 64) (st : SequentialState RegisterType trivialChoiceSource),
+      (wX_bits (regidx_offset_range sp 1) v).run st = .ok () { st with regs := st.regs.insert .x3 v } := by
+    intro v st
+    rw [hreg3]
+    simp [wX_bits, wX, regval_into_reg, xreg_write_callback, reg_name_forwards,
+      encdec_reg_forwards_matches, encdec_reg_forwards, get_config_use_abi_names,
+      LeanRV64D.Functions.not, reg_arch_name_raw_forwards, xreg_full_write_callback,
+      zero_extend, Sail.BitVec.zeroExtend, Sail.BitVec.toNatInt, to_bits, get_slice_int,
+      writeReg, PreSail.writeReg, modify, modifyGet, MonadStateOf.modifyGet]
+    rfl
+  refine ⟨rfl, rfl, ?_, ?_⟩
+  · unfold rX_pair_bits
+    have hbne : bne sp zreg = true := rfl
+    rw [hbne]
+    dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hr2 hr3 ⊢
+    rw [hr3]; dsimp only; rw [hr2]
+  · unfold wX_pair_bits
+    have hbne : bne sp zreg = true := rfl
+    rw [hbne]
+    dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hw2 hw3 ⊢
+    rw [hlo_ext, hhi_ext, hw2]; dsimp only; rw [hw3]
+
+/-- Physical-RAM execution core of upstream `execute_AMO` (`InstsEnd.lean`, lines 71793–71888) for
+    64-bit (`width = 8`, `.D`) `Zaamo` / `Zacas` operations over aligned flat physical RAM. -/
+def sailAmo64RamExec (op : amoop) (rs2 rs1 rd : regidx) : SailM ExecutionResult := do
+  let vaddr ← match ← ext_data_get_addr rs1 (zeros (n := 64)) (.Atomic (op, false, false, .Data, .Data)) 8 with
+    | .Ext_DataAddr_Error e => pure (ExecutionResult.Ext_DataAddr_Check_Failure e)
+    | .Ext_DataAddr_OK (.Virtaddr va) => do
+      let (loaded_le, _) ← LeanRV64D.Functions.read_ram .Read_plain (.Physaddr va) 8 false
+      let loaded : BitVec (8 * 8) := loaded_le
+      let rs2_val : BitVec (8 * 8) := trunc (m := 64) (← rX_bits rs2)
+      let result : BitVec (8 * 8) := sailAmoAluCore (width := 8) op rs2_val loaded
+      let rd_cmp : BitVec (8 * 8) := trunc (m := 64) (← rX_bits rd)
+      if (op == .AMOCAS) && (loaded != rd_cmp) then
+        wX_bits rd (sign_extend (m := 64) loaded)
+        pure (.Retire_Success ())
+      else
+        let ok ← LeanRV64D.Functions.write_ram .Write_plain (.Physaddr va) 8
+          (sign_extend (m := 64) result) ()
+        if ok then
+          wX_bits rd (sign_extend (m := 64) loaded)
+          pure (.Retire_Success ())
+        else
+          internal_error "extensions/A/zaamo_insts.sail" 153 "AMO got false from mem_write_value"
+  pure vaddr
+
+/-- End-to-end `SailM` bisimulation for 64-bit `Zaamo` & `Zacas` (`AMOCAS.D` match vs. mismatch and
+    all 9 `Zaamo` RMW operations) over flat physical RAM (`rs1 = sp`, `rs2 = gp`, `rd = ra`):
+    proves `Zaamo` and matching `AMOCAS.D` atomically write `rv64AmoAluSpec op rs2_val loaded` to
+    memory while writing the old `loaded` value to `rd`, whereas mismatching `AMOCAS.D` leaves RAM
+    untouched and still updates `rd` with `loaded`. -/
+theorem sailAmo64RamExec_bisim_sail (op : amoop) (addr rs2_val rd_old : BitVec 64)
+    (loaded : BitVec (8 * 8))
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hrs1 : s.regs.get? .x2 = some addr)
+    (hrs2 : s.regs.get? .x3 = some rs2_val)
+    (hrd : s.regs.get? .x1 = some rd_old)
+    (hmem : rv64ReadMemBytesSpec 8 addr.toNat s.mem = some loaded) :
+    (sailAmo64RamExec op (.Regidx 0b00011#5) sp ra).run s =
+      .ok (.Retire_Success ())
+        (if op == .AMOCAS && loaded != rd_old then
+          { s with regs := s.regs.insert .x1 loaded }
+        else
+          { s with
+            mem := rv64WriteMemBytesSpec 8 addr.toNat (rv64AmoAluSpec op rs2_val loaded) s.mem
+            regs := s.regs.insert .x1 loaded }) := by
+  have haddr := rv64iEffectiveAddr_ext_data_get_addr_bisim addr 0#12
+    (.Atomic (op, false, false, .Data, .Data)) 8 s hrs1
+  have hz : rv64iEffectiveAddrSpec addr 0#12 = addr := by
+    simp [rv64iEffectiveAddrSpec]
+  rw [hz] at haddr
+  have hread := read_ram_plain_bisim_sail 8 addr loaded s hmem
+  have hr3 : (rX_bits (.Regidx 0b00011#5)).run s = .ok rs2_val s := by
+    unfold rX_bits rX regval_from_reg Sail.BitVec.toNatInt
+    simp [readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+    dsimp [EStateM.bind, EStateM.get, EStateM.pure, EStateM.run]
+    rw [hrs2]; rfl
+  have hr1 := rX_bits_ra_run rd_old s hrd
+  have halu : sailAmoAluCore (width := 8) op rs2_val loaded = rv64AmoAluSpec op rs2_val loaded :=
+    (rv64ZaamoAlu_bisim_sail (width := 8) op rs2_val loaded).1
+  have hsext_ld : sign_extend (m := 64) loaded = loaded := by
+    simp [sign_extend, Sail.BitVec.signExtend]
+  have hsext_res : sign_extend (m := 64) (rv64AmoAluSpec op rs2_val loaded) =
+      rv64AmoAluSpec op rs2_val loaded := by
+    simp [sign_extend, Sail.BitVec.signExtend]
+  have htrunc64 : ∀ v : BitVec 64, trunc (m := 64) v = v := by
+    intro v
+    simp [trunc, Sail.BitVec.truncate]
+  unfold sailAmo64RamExec
+  have hzero64 : zeros (n := 64) = sign_extend (m := 64) 0#12 := rfl
+  rw [hzero64]
+  dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at haddr hread hr3 hr1 ⊢
+  rw [haddr]; dsimp [EStateM.bind]
+  rw [hread]; dsimp [EStateM.bind]
+  rw [hr3]; dsimp [EStateM.bind]
+  rw [hr1]; dsimp [EStateM.bind]
+  rw [htrunc64, htrunc64, halu]
+  cases hcas : (op == .AMOCAS && loaded != rd_old)
+  · dsimp [EStateM.bind, EStateM.pure]
+    have hwrite := write_ram_plain_bisim_sail 8 addr (rv64AmoAluSpec op rs2_val loaded) s
+    dsimp [EStateM.run] at hwrite
+    rw [hsext_res, hwrite]; dsimp [EStateM.bind, EStateM.pure]
+    have hw1 := wX_bits_ra_run loaded
+      { s with mem := rv64WriteMemBytesSpec 8 addr.toNat (rv64AmoAluSpec op rs2_val loaded) s.mem }
+    dsimp [EStateM.run] at hw1
+    rw [hsext_ld, hw1]
+  · dsimp [EStateM.bind, EStateM.pure]
+    have hw1 := wX_bits_ra_run loaded s
+    dsimp [EStateM.run] at hw1
+    rw [hsext_ld, hw1]
+
+/-- `Zalrsc` memory ordering flag mapping (`read_kind_of_flags`, `write_kind_of_flags` in `Mem.lean`,
+    lines 232–267) and RV64 width gate (`lrsc_width_valid` in `PlatformConfig.lean`, lines 6650–6654)
+    bisimulation in `SailM`. -/
+theorem rv64ZalrscFlagsAndWidths_bisim_sail
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    lrsc_width_valid 4 = true ∧
+    lrsc_width_valid 8 = true ∧
+    lrsc_width_valid 1 = false ∧
+    lrsc_width_valid 2 = false ∧
+    (read_kind_of_flags false false false).run s = .ok .Read_plain s ∧
+    (read_kind_of_flags false false true).run s = .ok .Read_RISCV_reserved s ∧
+    (read_kind_of_flags true false true).run s = .ok .Read_RISCV_reserved_acquire s ∧
+    (read_kind_of_flags true true true).run s = .ok .Read_RISCV_reserved_strong_acquire s ∧
+    (write_kind_of_flags false false false).run s = .ok .Write_plain s ∧
+    (write_kind_of_flags false false true).run s = .ok .Write_RISCV_conditional s ∧
+    (write_kind_of_flags false true true).run s = .ok .Write_RISCV_conditional_release s ∧
+    (write_kind_of_flags true true true).run s = .ok .Write_RISCV_conditional_strong_release s :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Monadic bisimulation for upstream `read_ram` and `write_ram` (`PhysMemInterface.lean`,
+    lines 303–381) under `Zalrsc` reserved/conditional access kinds (`Read_RISCV_reserved*` and
+    `Write_RISCV_conditional*`), plus the exact `execute_STORECON` (`InstsEnd.lean`, line 67358)
+    destination status encoding (`0#64` on success `b = true`, `1#64` on failure `b = false`). -/
+theorem rv64ZalrscRamAndScStatus_bisim_sail (width : Nat) (paddr : BitVec 64)
+    (bytes data : BitVec (8 * width)) (b : Bool)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hmem : rv64ReadMemBytesSpec width paddr.toNat s.mem = some bytes) :
+    (LeanRV64D.Functions.read_ram .Read_RISCV_reserved (.Physaddr paddr) width false).run s =
+      .ok (bytes, ()) s ∧
+    (LeanRV64D.Functions.read_ram .Read_RISCV_reserved_acquire (.Physaddr paddr) width false).run s =
+      .ok (bytes, ()) s ∧
+    (LeanRV64D.Functions.write_ram .Write_RISCV_conditional (.Physaddr paddr) width data ()).run s =
+      .ok true { s with mem := rv64WriteMemBytesSpec width paddr.toNat data s.mem } ∧
+    (LeanRV64D.Functions.write_ram .Write_RISCV_conditional_release (.Physaddr paddr) width data ()).run s =
+      .ok true { s with mem := rv64WriteMemBytesSpec width paddr.toNat data s.mem } ∧
+    zero_extend (m := 64) (bool_bit_forwards (!b)) = (if b then 0#64 else 1#64) := by
+  have hr := readBytes_run_of_spec_some width paddr.toNat s bytes hmem
+  have hw := writeBytes_run_eq_spec paddr.toNat data s
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · unfold LeanRV64D.Functions.read_ram LeanRV64D.ConcurrencyInterfaceV1.sail_mem_read
+      PreSail.sail_mem_read default_meta
+    dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hr ⊢
+    rw [hr]; rfl
+  · unfold LeanRV64D.Functions.read_ram LeanRV64D.ConcurrencyInterfaceV1.sail_mem_read
+      PreSail.sail_mem_read default_meta
+    dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hr ⊢
+    rw [hr]; rfl
+  · unfold LeanRV64D.Functions.write_ram LeanRV64D.ConcurrencyInterfaceV1.sail_mem_write
+      PreSail.sail_mem_write __WriteRAM_Meta
+    dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hw ⊢
+    rw [hw]; rfl
+  · unfold LeanRV64D.Functions.write_ram LeanRV64D.ConcurrencyInterfaceV1.sail_mem_write
+      PreSail.sail_mem_write __WriteRAM_Meta
+    dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hw ⊢
+    rw [hw]; rfl
+  · cases b <;> rfl
+
+/-- Exact mirror of `csr_access_type` (`ZicsrInsts.lean`, lines 259–266; used by `execute_CSRReg` /
+    `execute_CSRImm` in `InstsEnd.lean`, lines 71721–71727) and the `doCSR` (`ZicsrInsts.lean`,
+    lines 22268–22272) bitwise update rule. -/
+def sailCsrAccessType (op : csrop) (rd_is_x0 rs1_imm_is_zero : Bool) : CSRAccessType :=
+  match (op, rd_is_x0, rs1_imm_is_zero) with
+  | (.CSRRW, true, _) => .CSRWrite
+  | (.CSRRW, false, _) => .CSRReadWrite
+  | (.CSRRS, _, true) => .CSRRead
+  | (.CSRRC, _, true) => .CSRRead
+  | (.CSRRS, _, false) => .CSRReadWrite
+  | (.CSRRC, _, false) => .CSRReadWrite
+
+def sailCsrWriteValCore (op : csrop) (read_val rs1_val : BitVec 64) : BitVec 64 :=
+  match op with
+  | .CSRRW => rs1_val
+  | .CSRRS => read_val ||| rs1_val
+  | .CSRRC => read_val &&& ~~~rs1_val
+
+/-- `Zicsr` opcode encoding (`encdec_csrop_forwards`, `csrop_of_num`/`num_of_csrop`), access-type
+    dispatch (`CSRRW x0` suppresses CSR read; `CSRRS`/`CSRRC` with zero `rs1`/`uimm` suppresses CSR
+    write), and bitwise CSR update algebra (`CSRRS`/`CSRRC` zero identity, idempotence, and clear). -/
+theorem rv64ZicsrOpAndAccess_bisim_sail (op : csrop) (rd_x0 : Bool) (csr_val mask : BitVec 64) :
+    encdec_csrop_forwards .CSRRW = 0b01#2 ∧
+    encdec_csrop_forwards .CSRRS = 0b10#2 ∧
+    encdec_csrop_forwards .CSRRC = 0b11#2 ∧
+    sailCsrAccessType .CSRRW true false = .CSRWrite ∧
+    sailCsrAccessType .CSRRW false true = .CSRReadWrite ∧
+    sailCsrAccessType .CSRRS rd_x0 true = .CSRRead ∧
+    sailCsrAccessType .CSRRC rd_x0 true = .CSRRead ∧
+    sailCsrAccessType .CSRRS rd_x0 false = .CSRReadWrite ∧
+    sailCsrAccessType .CSRRC rd_x0 false = .CSRReadWrite ∧
+    sailCsrWriteValCore .CSRRW csr_val mask = mask ∧
+    sailCsrWriteValCore .CSRRS csr_val 0#64 = csr_val ∧
+    sailCsrWriteValCore .CSRRC csr_val 0#64 = csr_val ∧
+    sailCsrWriteValCore .CSRRS (sailCsrWriteValCore .CSRRS csr_val mask) mask =
+      sailCsrWriteValCore .CSRRS csr_val mask ∧
+    (sailCsrWriteValCore .CSRRC csr_val mask) &&& mask = 0#64 ∧
+    (op = .CSRRW ∨ op = .CSRRS ∨ op = .CSRRC) := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ?_, ?_, ?_, ?_, ?_⟩
+  · simp [sailCsrWriteValCore]
+  · have hones64 : ~~~(0#64) = BitVec.allOnes 64 := by decide
+    unfold sailCsrWriteValCore
+    rw [hones64, BitVec.and_allOnes]
+  · simp [sailCsrWriteValCore, BitVec.or_assoc]
+  · simp [sailCsrWriteValCore, BitVec.and_assoc]
+  · cases op <;> simp
+
+/-- `Zicsr` privilege-field extraction, read-only address check (`csrAccess`, `csrPriv`,
+    `check_CSR_access` in `SysControl.lean`, lines 238–261), and `SailM` execution core of
+    `execute_CSRReg` / `execute_CSRImm` (`InstsEnd.lean`, lines 71721–71728; `doCSR` in
+    `ZicsrInsts.lean`, lines 22241–22279): proves CSR bits `[11:10] = 0b11` reject writes
+    (`CSRWrite` / `CSRReadWrite`) while allowing `CSRRead`, CSR bits `[9:8]` compare against
+    privilege bits (`0b00`, `0b01`, `0b11`) via `zopz0zKzJ_u`, and `SailM` `mscratch` (`0x340`)
+    execution atomically updates `.mscratch` and `rd` on `CSRRW`/`CSRRS`/`CSRRC` while leaving
+    `.mscratch` untouched on `CSRRead` (`rs1 = x0`). -/
+def sailCsrMscratchExec (csr : BitVec 12) (rs1 rd : regidx) (op : csrop) : SailM ExecutionResult := do
+  let access_type := sailCsrAccessType op (rd == zreg) (rs1 == zreg)
+  let priv ← readReg .cur_privilege
+  let priv_bits : BitVec 2 := match priv with
+    | .User | .VirtualUser => 0b00#2
+    | .Supervisor | .VirtualSupervisor => 0b01#2
+    | .Machine => 0b11#2
+  if !(check_CSR_access csr access_type && zopz0zKzJ_u priv_bits (csrPriv csr)) then
+    pure (.Illegal_Instruction ())
+  else
+    let read_val ← if bne access_type .CSRWrite then readReg .mscratch else pure (zeros (n := 64))
+    if access_type == .CSRRead then
+      wX_bits rd read_val
+      pure (.Retire_Success ())
+    else
+      let rs1_val ← rX_bits rs1
+      let write_val := sailCsrWriteValCore op read_val rs1_val
+      writeReg .mscratch write_val
+      wX_bits rd read_val
+      pure (.Retire_Success ())
+
+theorem rv64ZicsrPrivAndReadOnlyCheck_bisim_sail (csr : BitVec 12)
+    (op : csrop) (old_csr rs1_val : BitVec 64)
+    (sM sU : SequentialState RegisterType trivialChoiceSource)
+    (hprivM : sM.regs.get? .cur_privilege = some .Machine)
+    (hmscratch : sM.regs.get? .mscratch = some old_csr)
+    (hrs1 : sM.regs.get? .x2 = some rs1_val)
+    (hprivU : sU.regs.get? .cur_privilege = some .User) :
+    csrAccess csr = csr.extractLsb 11 10 ∧
+    csrPriv csr = csr.extractLsb 9 8 ∧
+    check_CSR_access csr .CSRRead = true ∧
+    check_CSR_access csr .CSRWrite = (csr.extractLsb 11 10 != 0b11#2) ∧
+    check_CSR_access csr .CSRReadWrite = (csr.extractLsb 11 10 != 0b11#2) ∧
+    zopz0zKzJ_u 0b11#2 (csrPriv csr) = true ∧
+    zopz0zKzJ_u 0b01#2 (csrPriv csr) = BitVec.ule (csr.extractLsb 9 8) 0b01#2 ∧
+    zopz0zKzJ_u 0b00#2 (csrPriv csr) = (csr.extractLsb 9 8 == 0b00#2) ∧
+    (sailCsrMscratchExec 0x340#12 sp ra .CSRRS).run sU = .ok (.Illegal_Instruction ()) sU ∧
+    (sailCsrMscratchExec 0xF11#12 sp ra .CSRRW).run sM = .ok (.Illegal_Instruction ()) sM ∧
+    (sailCsrMscratchExec 0x340#12 zreg ra .CSRRS).run sM =
+      .ok (.Retire_Success ()) { sM with regs := sM.regs.insert .x1 old_csr } ∧
+    (sailCsrMscratchExec 0x340#12 sp ra op).run sM =
+      .ok (.Retire_Success ())
+        { sM with regs := (sM.regs.insert .mscratch (sailCsrWriteValCore op old_csr rs1_val)).insert .x1 old_csr } := by
+  have hge_m : zopz0zKzJ_u 0b11#2 (csrPriv csr) = true := by
+    unfold zopz0zKzJ_u Sail.BitVec.toNatInt
+    change decide ((3 : Int) ≥ ((csrPriv csr).toNat : Int)) = true
+    rw [decide_eq_true_eq]
+    have hlt := (csrPriv csr).isLt
+    omega
+  have hge_s : zopz0zKzJ_u 0b01#2 (csrPriv csr) = BitVec.ule (csr.extractLsb 9 8) 0b01#2 := by
+    unfold zopz0zKzJ_u csrPriv Sail.BitVec.extractLsb Sail.BitVec.toNatInt BitVec.ule
+    change decide ((1 : Int) ≥ ((csr.extractLsb 9 8).toNat : Int)) =
+      decide ((csr.extractLsb 9 8).toNat ≤ 1)
+    apply Bool.eq_iff_iff.mpr
+    simp only [decide_eq_true_eq]
+    omega
+  have hge_u : zopz0zKzJ_u 0b00#2 (csrPriv csr) = (csr.extractLsb 9 8 == 0b00#2) := by
+    unfold zopz0zKzJ_u csrPriv Sail.BitVec.extractLsb Sail.BitVec.toNatInt
+    change decide ((0 : Int) ≥ ((csr.extractLsb 9 8).toNat : Int)) =
+      (csr.extractLsb 9 8 == 0b00#2)
+    apply Bool.eq_iff_iff.mpr
+    simp only [decide_eq_true_eq, beq_iff_eq]
+    constructor
+    · intro h
+      apply BitVec.eq_of_toNat_eq
+      change (csr.extractLsb 9 8).toNat = 0
+      omega
+    · intro h
+      rw [h]
+      decide
+  have hr2 : ∀ (st : SequentialState RegisterType trivialChoiceSource),
+      st.regs.get? .x2 = some rs1_val → (rX_bits sp).run st = .ok rs1_val st := by
+    intro st hst
+    unfold sp rX_bits rX regval_from_reg zero_extend Sail.BitVec.zeroExtend Sail.BitVec.toNatInt
+    simp [readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+    dsimp [EStateM.bind, EStateM.get, EStateM.pure, EStateM.run]
+    rw [hst]; rfl
+  refine ⟨rfl, rfl, rfl, ?_, ?_, hge_m, hge_s, hge_u, ?_, ?_, ?_, ?_⟩
+  · unfold check_CSR_access LeanRV64D.Functions.not csrAccess Sail.BitVec.extractLsb
+    change (!((true || false) && (BitVec.extractLsb 11 10 csr == 3#2))) =
+      (!(BitVec.extractLsb 11 10 csr == 3#2))
+    simp
+  · unfold check_CSR_access LeanRV64D.Functions.not csrAccess Sail.BitVec.extractLsb
+    change (!((false || true) && (BitVec.extractLsb 11 10 csr == 3#2))) =
+      (!(BitVec.extractLsb 11 10 csr == 3#2))
+    simp
+  · unfold sailCsrMscratchExec
+    simp [sailCsrAccessType, check_CSR_access, LeanRV64D.Functions.not, csrAccess, csrPriv,
+      zopz0zKzJ_u, Sail.BitVec.extractLsb, Sail.BitVec.toNatInt,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.get, EStateM.pure, EStateM.run, hprivU]
+  · have hra : (ra == zreg) = false := rfl
+    have hsp : (sp == zreg) = false := rfl
+    unfold sailCsrMscratchExec
+    simp [hra, hsp, sailCsrAccessType, check_CSR_access, LeanRV64D.Functions.not, csrAccess, csrPriv,
+      zopz0zKzJ_u, Sail.BitVec.extractLsb, Sail.BitVec.toNatInt,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.get, EStateM.pure, EStateM.run, hprivM]
+    rfl
+  · have hw1 := wX_bits_ra_run old_csr sM
+    dsimp [EStateM.run] at hw1
+    unfold sailCsrMscratchExec
+    have hacc : sailCsrAccessType .CSRRS (ra == zreg) (zreg == zreg) = .CSRRead := rfl
+    have hchk : (!(check_CSR_access 0x340#12 .CSRRead && zopz0zKzJ_u 0b11#2 (csrPriv 0x340#12))) = false := by decide
+    have hbne : bne CSRAccessType.CSRRead .CSRWrite = true := rfl
+    rw [hacc]
+    simp only [readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+    dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.get, EStateM.pure, EStateM.run]
+    rw [hprivM]; dsimp [EStateM.bind, EStateM.get, EStateM.pure]
+    rw [hchk]; dsimp [EStateM.bind, EStateM.get, EStateM.pure]
+    rw [hbne]; dsimp [EStateM.bind, EStateM.get, EStateM.pure]
+    rw [hmscratch]; dsimp [EStateM.bind, EStateM.get, EStateM.pure]
+    have hbeqr : (CSRAccessType.CSRRead == .CSRRead) = true := rfl
+    rw [hbeqr]; dsimp [EStateM.bind, EStateM.pure]
+    rw [hw1]
+  · have hr_sp := hr2 sM hrs1
+    dsimp [EStateM.run] at hr_sp
+    unfold sailCsrMscratchExec
+    have hacc : sailCsrAccessType op (ra == zreg) (sp == zreg) = .CSRReadWrite := by
+      cases op <;> rfl
+    have hchk : (!(check_CSR_access 0x340#12 .CSRReadWrite && zopz0zKzJ_u 0b11#2 (csrPriv 0x340#12))) = false := by decide
+    have hbne : bne CSRAccessType.CSRReadWrite .CSRWrite = true := rfl
+    have hbeqr : (CSRAccessType.CSRReadWrite == .CSRRead) = false := rfl
+    rw [hacc]
+    simp only [readReg, PreSail.readReg, writeReg, PreSail.writeReg,
+      modify, modifyGet, MonadStateOf.modifyGet, get, getThe, MonadStateOf.get]
+    dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.get, EStateM.modifyGet, EStateM.pure, EStateM.run]
+    rw [hprivM]; dsimp [EStateM.bind, EStateM.get, EStateM.modifyGet, EStateM.pure]
+    rw [hchk]; dsimp [EStateM.bind, EStateM.get, EStateM.modifyGet, EStateM.pure]
+    rw [hbne]; dsimp [EStateM.bind, EStateM.get, EStateM.modifyGet, EStateM.pure]
+    rw [hmscratch]; dsimp [EStateM.bind, EStateM.get, EStateM.modifyGet, EStateM.pure]
+    rw [hbeqr]; dsimp [EStateM.bind, EStateM.get, EStateM.modifyGet, EStateM.pure]
+    rw [hr_sp]; dsimp [EStateM.bind, EStateM.get, EStateM.modifyGet, EStateM.pure]
+    have hw1 := wX_bits_ra_run old_csr
+      { sM with regs := sM.regs.insert .mscratch (sailCsrWriteValCore op old_csr rs1_val) }
+    dsimp [EStateM.run] at hw1
+    rw [hw1]
+
+/-- Privileged architecture, `mstatus` VM-control fields (`MPRV`/`MPP`/`TVM`/`MXR`/`SUM`), and
+    synchronous trap formation (`privLevel_bits_backwards` / `privLevel_bits_forwards`,
+    `effectivePrivilege`, and `make_sync_exception` in `Types.lean`, `SysRegs.lean`, and
+    `SysControl.lean`): proves `privLevel` roundtrips in `SailM`, `MPRV = 1` overrides data-access
+    privilege to `MPP` (`Supervisor` / `User`) while leaving `InstructionFetch` at `cur_privilege`,
+    `mstatus` bits `[20:18]` extract `TVM`/`MXR`/`SUM`, and `make_sync_exception` populates `xtval`
+    for page faults while clearing `xtval` (`none`) on `ECALL`. -/
+theorem rv64PrivEffectiveAndTvm_bisim_sail (p : Privilege) (mstatus_val vaddr : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    (privLevel_bits_forwards (privLevel_bits_backwards p)).run s = .ok p s ∧
+    (effectivePrivilege (.InstructionFetch ()) mstatus_val p).run s = .ok p s ∧
+    (_get_Mstatus_MPRV mstatus_val = 0#1 →
+      (effectivePrivilege (.Load .Data) mstatus_val p).run s = .ok p s) ∧
+    (_get_Mstatus_MPRV mstatus_val = 1#1 → _get_Mstatus_MPP mstatus_val = 0b01#2 →
+      (effectivePrivilege (.Load .Data) mstatus_val .Machine).run s = .ok .Supervisor s) ∧
+    (_get_Mstatus_MPRV mstatus_val = 1#1 → _get_Mstatus_MPP mstatus_val = 0b00#2 →
+      (effectivePrivilege (.Store .Data) mstatus_val .Machine).run s = .ok .User s) ∧
+    _get_Mstatus_TVM mstatus_val = mstatus_val.extractLsb 20 20 ∧
+    _get_Mstatus_MXR mstatus_val = mstatus_val.extractLsb 19 19 ∧
+    _get_Mstatus_SUM mstatus_val = mstatus_val.extractLsb 18 18 ∧
+    make_sync_exception (.E_U_EnvCall ()) vaddr =
+      { trap := .E_U_EnvCall (), excinfo := none, ext := none } ∧
+    make_sync_exception (.E_Load_Page_Fault ()) vaddr =
+      { trap := .E_Load_Page_Fault (), excinfo := some vaddr, ext := none } := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, rfl, rfl, rfl, rfl, rfl⟩
+  · cases p <;> rfl
+  · unfold effectivePrivilege
+    have hne : bne (MemoryAccessType.InstructionFetch (k_a := mem_payload) ())
+        (MemoryAccessType.InstructionFetch (k_a := mem_payload) ()) = false := rfl
+    rw [hne]; rfl
+  · intro hmprv
+    unfold effectivePrivilege
+    rw [hmprv]; simp
+  · intro hmprv hmpp
+    unfold effectivePrivilege
+    have hne : bne (MemoryAccessType.Load mem_payload.Data)
+        (MemoryAccessType.InstructionFetch (k_a := mem_payload) ()) = true := rfl
+    rw [hne, hmprv, hmpp]; rfl
+  · intro hmprv hmpp
+    unfold effectivePrivilege
+    have hne : bne (MemoryAccessType.Store mem_payload.Data)
+        (MemoryAccessType.InstructionFetch (k_a := mem_payload) ()) = true := rfl
+    rw [hne, hmprv, hmpp]; rfl
+
+/-- RV64 `satp` CSR layout (`Mode` `[63:60]`, `ASID` `[59:44]`, `PPN` `[43:0]`), `SATPMode` decoding
+    (`Bare = 0`, `Sv39 = 8`, `Sv48 = 9`, `Sv57 = 10`; `Sv32 = 1` rejected on `RV64`), and virtual
+    address width (`satp_mode_width_forwards` / `satp_mode_width_backwards`) bisimulation. -/
+theorem rv64Satp64ModeDecode_bisim_sail (mode : BitVec 4) (asid : BitVec 16) (ppn : BitVec 44)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    Functions.asidlen = 16 ∧
+    Functions.pagesize_bits = 12 ∧
+    Functions.physaddr_bits = 56 ∧
+    _get_Satp64_Mode (mode +++ (asid +++ ppn)) = mode ∧
+    _get_Satp64_Asid (mode +++ (asid +++ ppn)) = asid ∧
+    _get_Satp64_PPN (mode +++ (asid +++ ppn)) = ppn ∧
+    satpMode_of_bits .RV64 0x0#4 = some .Bare ∧
+    satpMode_of_bits .RV64 0x1#4 = none ∧
+    satpMode_of_bits .RV64 0x8#4 = some .Sv39 ∧
+    satpMode_of_bits .RV64 0x9#4 = some .Sv48 ∧
+    satpMode_of_bits .RV64 0xA#4 = some .Sv57 ∧
+    (satp_mode_width_forwards .Sv39).run s = .ok 39 s ∧
+    (satp_mode_width_forwards .Sv48).run s = .ok 48 s ∧
+    satp_mode_width_backwards 39 = .Sv39 ∧
+    satp_mode_width_backwards 48 = .Sv48 := by
+  have hmode : _get_Satp64_Mode (mode +++ (asid +++ ppn)) = mode := by
+    apply BitVec.eq_of_getLsbD_eq
+    intro k hk
+    change (BitVec.extractLsb 63 60 (mode +++ (asid +++ ppn))).getLsbD k = mode.getLsbD k
+    have hk' : k < 4 := hk
+    have hk60 : ¬(60 + k < 60) := by omega
+    have hsub : 60 + k - 60 = k := by omega
+    rw [BitVec.getLsbD_extractLsb]
+    simp only [show 63 - 60 + 1 = 4 by decide, BitVec.getLsbD_append]
+    simp [hk', hk60, hsub]
+  have hasid : _get_Satp64_Asid (mode +++ (asid +++ ppn)) = asid := by
+    apply BitVec.eq_of_getLsbD_eq
+    intro k hk
+    change (BitVec.extractLsb 59 44 (mode +++ (asid +++ ppn))).getLsbD k = asid.getLsbD k
+    have hk' : k < 16 := hk
+    have hk60 : 44 + k < 60 := by omega
+    have hk44 : ¬(44 + k < 44) := by omega
+    have hsub : 44 + k - 44 = k := by omega
+    rw [BitVec.getLsbD_extractLsb]
+    simp only [show 59 - 44 + 1 = 16 by decide, BitVec.getLsbD_append]
+    simp [hk', hk60, hk44, hsub]
+  have hppn : _get_Satp64_PPN (mode +++ (asid +++ ppn)) = ppn := by
+    apply BitVec.eq_of_getLsbD_eq
+    intro k hk
+    change (BitVec.extractLsb 43 0 (mode +++ (asid +++ ppn))).getLsbD k = ppn.getLsbD k
+    have hk' : k < 44 := hk
+    have hk60 : k < 60 := by omega
+    rw [BitVec.getLsbD_extractLsb]
+    simp only [Nat.zero_add, show 43 - 0 + 1 = 44 by decide, BitVec.getLsbD_append]
+    simp [hk', hk60]
+  exact ⟨rfl, rfl, rfl, hmode, hasid, hppn, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `Sv39` (39-bit) and `Sv48` (48-bit) canonical sign-extended virtual address check from upstream
+    `translateAddr` (`Vmem.lean`, lines 537–539): proves `vaddr == sign_extend 64 (vaddr[sv_width-1:0])`
+    accepts canonical user (`0x0000_0000_8000_1000`) and kernel-high (`0xFFFF_FFC0_0000_0000` for
+    `Sv39`, `0xFFFF_8000_0000_0000` for `Sv48`) addresses while rejecting non-canonical hole
+    addresses (`0x0000_0040_0000_0000` in `Sv39`, `0x0000_8000_0000_0000` in `Sv48`). -/
+def rv64SvCanonicalVaddrSpec (sv_width : Nat) (vaddr : BitVec 64) : Bool :=
+  vaddr == sign_extend (m := 64) (Sail.BitVec.extractLsb vaddr ((Int.ofNat sv_width) -i 1) 0)
+
+theorem rv64Sv39Sv48CanonicalVaddr_bisim_sail (lo38 : BitVec 38) (lo47 : BitVec 47) :
+    rv64SvCanonicalVaddrSpec 39 (0#26 +++ lo38) = true ∧
+    rv64SvCanonicalVaddrSpec 39 (BitVec.allOnes 26 +++ lo38) = true ∧
+    rv64SvCanonicalVaddrSpec 39 0x0000004000000000#64 = false ∧
+    rv64SvCanonicalVaddrSpec 48 (0#17 +++ lo47) = true ∧
+    rv64SvCanonicalVaddrSpec 48 (BitVec.allOnes 17 +++ lo47) = true ∧
+    rv64SvCanonicalVaddrSpec 48 0x0000800000000000#64 = false := by
+  have hsv39_pos : rv64SvCanonicalVaddrSpec 39 (0#26 +++ lo38) = true := by
+    simp only [rv64SvCanonicalVaddrSpec, beq_iff_eq]
+    apply BitVec.eq_of_getLsbD_eq
+    intro k hk
+    change (0#26 +++ lo38).getLsbD k =
+      ((BitVec.extractLsb 38 0 (0#26 +++ lo38)).signExtend 64).getLsbD k
+    rw [BitVec.getLsbD_signExtend]
+    have hk64 : k < 64 := hk
+    simp only [hk64, decide_true, Bool.true_and]
+    by_cases hk39 : k < 39
+    · rw [if_pos hk39, BitVec.getLsbD_extractLsb]
+      simp [hk39]
+    · rw [if_neg hk39]
+      have hmsb : (BitVec.extractLsb 38 0 (0#26 +++ lo38)).msb = false := by
+        rw [BitVec.msb_eq_getLsbD_last, BitVec.getLsbD_extractLsb]
+        simp only [Nat.zero_add, show 38 - 0 + 1 - 1 = 38 by decide, show 38 - 0 + 1 = 39 by decide,
+          BitVec.getLsbD_append]
+        simp
+      have hk38 : ¬(k < 38) := by omega
+      rw [hmsb]
+      simp only [BitVec.getLsbD_append]
+      simp [hk38]
+  have hsv39_neg : rv64SvCanonicalVaddrSpec 39 (BitVec.allOnes 26 +++ lo38) = true := by
+    simp only [rv64SvCanonicalVaddrSpec, beq_iff_eq]
+    apply BitVec.eq_of_getLsbD_eq
+    intro k hk
+    change (BitVec.allOnes 26 +++ lo38).getLsbD k =
+      ((BitVec.extractLsb 38 0 (BitVec.allOnes 26 +++ lo38)).signExtend 64).getLsbD k
+    rw [BitVec.getLsbD_signExtend]
+    have hk64 : k < 64 := hk
+    simp only [hk64, decide_true, Bool.true_and]
+    by_cases hk39 : k < 39
+    · rw [if_pos hk39, BitVec.getLsbD_extractLsb]
+      simp [hk39]
+    · rw [if_neg hk39]
+      have hmsb : (BitVec.extractLsb 38 0 (BitVec.allOnes 26 +++ lo38)).msb = true := by
+        rw [BitVec.msb_eq_getLsbD_last, BitVec.getLsbD_extractLsb]
+        simp only [Nat.zero_add, show 38 - 0 + 1 - 1 = 38 by decide, show 38 - 0 + 1 = 39 by decide,
+          BitVec.getLsbD_append]
+        simp
+      have hk38 : ¬(k < 38) := by omega
+      have hk26 : k - 38 < 26 := by omega
+      rw [hmsb]
+      simp only [BitVec.getLsbD_append]
+      rw [if_neg hk38]
+      exact BitVec.getLsbD_allOnes.trans (decide_eq_true hk26)
+  have hsv48_pos : rv64SvCanonicalVaddrSpec 48 (0#17 +++ lo47) = true := by
+    simp only [rv64SvCanonicalVaddrSpec, beq_iff_eq]
+    apply BitVec.eq_of_getLsbD_eq
+    intro k hk
+    change (0#17 +++ lo47).getLsbD k =
+      ((BitVec.extractLsb 47 0 (0#17 +++ lo47)).signExtend 64).getLsbD k
+    rw [BitVec.getLsbD_signExtend]
+    have hk64 : k < 64 := hk
+    simp only [hk64, decide_true, Bool.true_and]
+    by_cases hk48 : k < 48
+    · rw [if_pos hk48, BitVec.getLsbD_extractLsb]
+      simp [hk48]
+    · rw [if_neg hk48]
+      have hmsb : (BitVec.extractLsb 47 0 (0#17 +++ lo47)).msb = false := by
+        rw [BitVec.msb_eq_getLsbD_last, BitVec.getLsbD_extractLsb]
+        simp only [Nat.zero_add, show 47 - 0 + 1 - 1 = 47 by decide, show 47 - 0 + 1 = 48 by decide,
+          BitVec.getLsbD_append]
+        simp
+      have hk47 : ¬(k < 47) := by omega
+      rw [hmsb]
+      simp only [BitVec.getLsbD_append]
+      simp [hk47]
+  have hsv48_neg : rv64SvCanonicalVaddrSpec 48 (BitVec.allOnes 17 +++ lo47) = true := by
+    simp only [rv64SvCanonicalVaddrSpec, beq_iff_eq]
+    apply BitVec.eq_of_getLsbD_eq
+    intro k hk
+    change (BitVec.allOnes 17 +++ lo47).getLsbD k =
+      ((BitVec.extractLsb 47 0 (BitVec.allOnes 17 +++ lo47)).signExtend 64).getLsbD k
+    rw [BitVec.getLsbD_signExtend]
+    have hk64 : k < 64 := hk
+    simp only [hk64, decide_true, Bool.true_and]
+    by_cases hk48 : k < 48
+    · rw [if_pos hk48, BitVec.getLsbD_extractLsb]
+      simp [hk48]
+    · rw [if_neg hk48]
+      have hmsb : (BitVec.extractLsb 47 0 (BitVec.allOnes 17 +++ lo47)).msb = true := by
+        rw [BitVec.msb_eq_getLsbD_last, BitVec.getLsbD_extractLsb]
+        simp only [Nat.zero_add, show 47 - 0 + 1 - 1 = 47 by decide, show 47 - 0 + 1 = 48 by decide,
+          BitVec.getLsbD_append]
+        simp
+      have hk47 : ¬(k < 47) := by omega
+      have hk17 : k - 47 < 17 := by omega
+      rw [hmsb]
+      simp only [BitVec.getLsbD_append]
+      rw [if_neg hk47]
+      exact BitVec.getLsbD_allOnes.trans (decide_eq_true hk17)
+  exact ⟨hsv39_pos, hsv39_neg, by decide, hsv48_pos, hsv48_neg, by decide⟩
+
+/-- `Sv39` / `Sv48` 64-bit Page Table Entry (`PTE`) extraction (`ext_bits_of_PTE` `[63:54]`,
+    `PPN_of_PTE` `[53:10]`, `pte_is_non_leaf`), permission check (`check_PTE_permission` in
+    `VmemPte.lean`, lines 292–377: `Atomic` requires `R ∧ W`, `SUM` governs `Supervisor` access to
+    `U = 1` pages, `MXR` makes `X = 1` pages readable), and dirty/accessed bit updates
+    (`update_PTE_Bits`, lines 379–401). -/
+theorem rv64SvPtePermissionsAndDirtyBits_bisim_sail
+    (ext : BitVec 10) (ppn : BitVec 44) (rsw : BitVec 2) (op : amoop)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    ext_bits_of_PTE (ext +++ (ppn +++ (rsw +++ 0b00000001#8))) = ext ∧
+    PPN_of_PTE (ext +++ (ppn +++ (rsw +++ 0b00000001#8))) = ppn ∧
+    pte_is_non_leaf 0b00000001#8 = true ∧
+    pte_is_non_leaf 0b00000011#8 = false ∧
+    (check_PTE_permission (.Atomic (op, false, false, .Data, .Data)) .User false false
+      0b00010111#8 0#10 ()).run s = .ok (.PTE_Check_Success ()) s ∧
+    (check_PTE_permission (.Atomic (op, false, false, .Data, .Data)) .User false false
+      0b00010011#8 0#10 ()).run s = .ok (.PTE_Check_Failure ((), .PTE_No_Permission ())) s ∧
+    (check_PTE_permission (.Load .Data) .Supervisor false false
+      0b00010011#8 0#10 ()).run s = .ok (.PTE_Check_Failure ((), .PTE_No_Permission ())) s ∧
+    (check_PTE_permission (.Load .Data) .Supervisor false true
+      0b00010011#8 0#10 ()).run s = .ok (.PTE_Check_Success ()) s ∧
+    (check_PTE_permission (.Load .Data) .User true false
+      0b00011001#8 0#10 ()).run s = .ok (.PTE_Check_Success ()) s ∧
+    update_PTE_Bits (0#56 +++ 0b00010111#8) (.Load .Data) = some (0#56 +++ 0b01010111#8) ∧
+    update_PTE_Bits (0#56 +++ 0b00010111#8) (.Atomic (op, false, false, .Data, .Data)) =
+      some (0#56 +++ 0b11010111#8) ∧
+    update_PTE_Bits (0#56 +++ 0b11010111#8) (.Store .Data) = none := by
+  have hext : ext_bits_of_PTE (ext +++ (ppn +++ (rsw +++ 0b00000001#8))) = ext := by
+    apply BitVec.eq_of_getLsbD_eq
+    intro k hk
+    change (BitVec.extractLsb 63 54 (ext +++ (ppn +++ (rsw +++ 0b00000001#8)))).getLsbD k = ext.getLsbD k
+    have hk' : k < 10 := hk
+    have hk54 : ¬(54 + k < 54) := by omega
+    have hsub : 54 + k - 54 = k := by omega
+    rw [BitVec.getLsbD_extractLsb]
+    simp only [show 63 - 54 + 1 = 10 by decide, BitVec.getLsbD_append]
+    simp [hk', hk54, hsub]
+  have hppn : PPN_of_PTE (ext +++ (ppn +++ (rsw +++ 0b00000001#8))) = ppn := by
+    apply BitVec.eq_of_getLsbD_eq
+    intro k hk
+    change (BitVec.extractLsb 53 10 (ext +++ (ppn +++ (rsw +++ 0b00000001#8)))).getLsbD k = ppn.getLsbD k
+    have hk' : k < 44 := by simpa using hk
+    have hk54 : 10 + k < 54 := by omega
+    have hk10 : ¬(10 + k < 10) := by omega
+    have hsub : 10 + k - 10 = k := by omega
+    rw [BitVec.getLsbD_extractLsb]
+    simp only [show 53 - 10 + 1 = 44 by decide, BitVec.getLsbD_append]
+    simp [hk', hk54, hk10, hsub]
+  refine ⟨hext, hppn, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ?_, ?_, ?_⟩
+  · decide
+  · simp [update_PTE_Bits, is_prefetch_access]
+    decide
+  · decide
+
+/-- `Sv39` / `Sv48` page-table-walk fault mapping (`translationException` in `VmemPtw.lean`,
+    lines 223–266): proves `PTW_No_Access` yields Access Faults while `PTW_Invalid_PTE` /
+    `PTW_No_Permission` / `PTW_Misaligned` / `PTW_PTE_Needs_Update` yield Page Faults across
+    `InstructionFetch`, `Load`, `LoadReserved`, `Store`, `StoreConditional`, and `Atomic`. -/
+theorem rv64TranslationException_bisim_sail (op : amoop) (aq rl : Bool)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    (translationException (.InstructionFetch ()) (.PTW_No_Access ())).run s =
+      .ok (.E_Fetch_Access_Fault ()) s ∧
+    (translationException (.InstructionFetch ()) (.PTW_Invalid_PTE ())).run s =
+      .ok (.E_Fetch_Page_Fault ()) s ∧
+    (translationException (.Load .Data) (.PTW_No_Access ())).run s =
+      .ok (.E_Load_Access_Fault ()) s ∧
+    (translationException (.LoadReserved (aq, rl, .Data)) (.PTW_No_Permission ())).run s =
+      .ok (.E_Load_Page_Fault ()) s ∧
+    (translationException (.Store .Data) (.PTW_Invalid_PTE ())).run s =
+      .ok (.E_SAMO_Page_Fault ()) s ∧
+    (translationException (.StoreConditional (aq, rl, .Data)) (.PTW_No_Access ())).run s =
+      .ok (.E_SAMO_Access_Fault ()) s ∧
+    (translationException (.StoreConditional (aq, rl, .Data)) (.PTW_No_Permission ())).run s =
+      .ok (.E_SAMO_Page_Fault ()) s ∧
+    (translationException (.Atomic (op, aq, rl, .Data, .Data)) (.PTW_No_Access ())).run s =
+      .ok (.E_SAMO_Access_Fault ()) s ∧
+    (translationException (.Atomic (op, aq, rl, .Data, .Data)) (.PTW_PTE_Needs_Update ())).run s =
+      .ok (.E_SAMO_Page_Fault ()) s :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- `Sv39` / `Sv48` TLB entry matching (`match_TLB_Entry`), superpage PPN reconstruction
+    (`tlb_get_ppn` with `levelMask`), and `SFENCE.VMA` selective/full invalidation predicate
+    (`flush_TLB_Entry` in `VmemTlb.lean`, lines 232–289): proves `global = true` entries match any
+    `ASID` and survive ASID-scoped flushes (`flush_TLB_Entry ent (some asid) none = false`), whereas
+    `SFENCE.VMA x0, x0` (`asid = none, vaddr = none`) flushes every TLB entry including global ones,
+    and 4 KiB (`levelMask = 0`) pages return `ent.ppn` directly. -/
+theorem rv64TlbMatchPpnAndSfence_bisim_sail (asid other_asid : BitVec 16) (vpn39 : BitVec 27)
+    (ppn : BitVec 44) (pte : BitVec 64) (pa : physaddr) :
+    let entGlobal : TLB_Entry :=
+      { asid := asid, global := true, pte := pte, pteAddr := pa,
+        levelMask := 0#45, vpn := sign_extend (m := 45) vpn39, ppn := ppn }
+    let entLocal : TLB_Entry :=
+      { asid := asid, global := false, pte := pte, pteAddr := pa,
+        levelMask := 0#45, vpn := sign_extend (m := 45) vpn39, ppn := ppn }
+    match_TLB_Entry entGlobal other_asid (sign_extend (m := 45) vpn39) = true ∧
+    match_TLB_Entry entLocal other_asid (sign_extend (m := 45) vpn39) = (asid == other_asid) ∧
+    tlb_get_ppn 39 entLocal vpn39 = ppn ∧
+    flush_TLB_Entry entGlobal none none = true ∧
+    flush_TLB_Entry entLocal none none = true ∧
+    flush_TLB_Entry entGlobal (some asid) none = false ∧
+    flush_TLB_Entry entLocal (some other_asid) none = (asid == other_asid) := by
+  dsimp only
+  have hones45 : (Complement.complement (0#45)) = BitVec.allOnes 45 := by decide
+  have hppn : tlb_get_ppn 39
+      { asid := asid, global := false, pte := pte, pteAddr := pa,
+        levelMask := 0#45, vpn := sign_extend (m := 45) vpn39, ppn := ppn } vpn39 = ppn := by
+    apply BitVec.eq_of_getLsbD_eq
+    intro k hk
+    have hk' : k < 44 := by simpa using hk
+    unfold tlb_get_ppn trunc Sail.BitVec.truncate zero_extend Sail.BitVec.zeroExtend
+    dsimp only
+    change (BitVec.truncate 44 (BitVec.zeroExtend 64 ppn ||| (sign_extend (m := 64) vpn39 &&& 0#64))).getLsbD k =
+      ppn.getLsbD k
+    simp [hk']
+  refine ⟨?_, ?_, hppn, rfl, rfl, ?_, ?_⟩
+  · unfold match_TLB_Entry
+    dsimp only
+    rw [hones45, BitVec.and_allOnes]
+    simp
+  · unfold match_TLB_Entry
+    dsimp only
+    rw [hones45, BitVec.and_allOnes]
+    simp only [Bool.false_or, beq_self_eq_true, Bool.and_true]
+    rfl
+  · unfold flush_TLB_Entry LeanRV64D.Functions.not
+    simp
+  · unfold flush_TLB_Entry LeanRV64D.Functions.not
+    simp only [Bool.not_false, Bool.and_true]
+    rfl
+
+/-- Direct `SailM` bisimulation for `execute_SFENCE_VMA` (`InstsEnd.lean`, lines 67724–67749) and
+    `reset_TLB` / `add_to_TLB` / `lookup_TLB` (`VmemTlb.lean`, lines 266–329): proves `User`-mode and
+    `mstatus.TVM = 1` `Supervisor`-mode `SFENCE.VMA` trap with `Illegal_Instruction ()`, while
+    adding an `Sv39` 4 KiB entry (`level = 0`) to a freshly reset TLB hits on `lookup_TLB 39` at
+    `tlb_hash 39 vpn` in `SailM`. -/
+def sailSfenceVmaPrivCheckExec (rs1 rs2 : regidx) : SailM ExecutionResult := do
+  let addr ← if bne rs1 zreg then pure (some (← rX_bits rs1)) else pure none
+  let asid ← if bne rs2 zreg then pure (some (Sail.BitVec.extractLsb (← rX_bits rs2) (Functions.asidlen -i 1) 0)) else pure none
+  match ← readReg .cur_privilege with
+  | .User => pure (.Illegal_Instruction ())
+  | .Supervisor =>
+    match _get_Mstatus_TVM (← readReg .mstatus) with
+    | 1 => pure (.Illegal_Instruction ())
+    | _ => do flush_TLB asid addr; pure (.Retire_Success ())
+  | .Machine => do flush_TLB asid addr; pure (.Retire_Success ())
+  | .VirtualUser => pure (.Virtual_Instruction ())
+  | .VirtualSupervisor => internal_error "extensions/I/base_insts.sail" 692 "Hypervisor extension not supported"
+
+theorem rv64SfenceVmaAndTlbLookup_bisim_sail (asid : BitVec 16) (vpn : BitVec 27)
+    (ppn : BitVec 44) (pte : BitVec 64) (pa : physaddr)
+    (sU sTvm sM : SequentialState RegisterType trivialChoiceSource)
+    (hprivU : sU.regs.get? .cur_privilege = some .User)
+    (hprivS : sTvm.regs.get? .cur_privilege = some .Supervisor)
+    (hmstatusTvm : sTvm.regs.get? .mstatus = some (1#64 <<< 20)) :
+    (sailSfenceVmaPrivCheckExec zreg zreg).run sU = .ok (.Illegal_Instruction ()) sU ∧
+    (sailSfenceVmaPrivCheckExec zreg zreg).run sTvm = .ok (.Illegal_Instruction ()) sTvm ∧
+    (match ((do
+        reset_TLB ()
+        add_to_TLB 39 asid vpn ppn pte pa 0 false
+        let hit ← lookup_TLB 39 asid vpn
+        pure hit.isSome).run sM) with
+      | .ok b _ => b
+      | .error _ _ => false) = true := by
+  refine ⟨?_, ?_, ?_⟩
+  · unfold sailSfenceVmaPrivCheckExec
+    have hbne : bne zreg zreg = false := rfl
+    rw [hbne]
+    simp [readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+    dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.get, EStateM.pure, EStateM.run]
+    rw [hprivU]; rfl
+  · unfold sailSfenceVmaPrivCheckExec
+    have hbne : bne zreg zreg = false := rfl
+    rw [hbne]
+    simp only [readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+    dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.get, EStateM.pure, EStateM.run]
+    rw [hprivS]; dsimp [EStateM.bind, EStateM.get, EStateM.pure]
+    rw [hmstatusTvm]; dsimp [EStateM.bind, EStateM.pure]
+    rfl
+  · have hidx : tlb_hash 39 vpn < 64 := by
+      unfold tlb_hash Functions.num_tlb_entries_exp Sail.BitVec.toNatInt Sail.BitVec.extractLsb
+      exact (BitVec.extractLsb 5 0 vpn).isLt
+    have hvec : ∀ (e : TLB_Entry),
+        ((vectorUpdate (vectorInit (n := 64) (none : Option TLB_Entry)) (tlb_hash 39 vpn) (some e))[tlb_hash 39 vpn]!) =
+        some e := by
+      intro e
+      unfold vectorUpdate vectorInit Vector.set!
+      simp [GetElem?.getElem!, decidableGetElem?, hidx]
+    unfold reset_TLB add_to_TLB lookup_TLB
+    simp [writeReg, PreSail.writeReg, readReg, PreSail.readReg,
+      modify, modifyGet, MonadStateOf.modifyGet, get, getThe, MonadStateOf.get,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.get,
+      EStateM.modifyGet, EStateM.pure, EStateM.run, hvec, match_TLB_Entry]
+    rw [if_pos ?_]
+    · rfl
+    · apply BitVec.eq_of_getLsbD_eq
+      intro k hk
+      have hk45 : k < 45 := by simpa using hk
+      unfold zero_extend sign_extend Sail.BitVec.zeroExtend Sail.BitVec.signExtend ones sail_ones
+      simp [hk45]
 
 end SailRiscvBridge
