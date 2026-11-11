@@ -3249,6 +3249,8 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
         ByBlock { base_col: usize, bind_col: usize },
         // Each nested alternatives parser owns its arms and their tactic sequence.
         TacticAlts { floor_col: usize, saw_with: bool, arm_col: Option<usize> },
+        TacticHeader,
+        TacticBranches(usize),
         DoBlock(usize),
         Calc { base_col: usize, rhs: bool },
     }
@@ -3260,6 +3262,8 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
     let (mut seen_colon, mut at_line_first) = (initial_seen_colon, false);
     let mut first_arm_split: Option<usize> = None;
     let mut at_tactic_head = false;
+    // An aligned token can continue a required term rather than start a tactic.
+    let mut term_pending = false;
 
     while i < bytes.len() {
         let c = bytes[i];
@@ -3287,11 +3291,12 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
             let col = col_at(i);
             while match scopes.last().copied() {
                 Some(StmtScope::ByBlock { base_col, .. }) => col < base_col,
+                Some(StmtScope::TacticBranches(base_col)) => col < base_col,
                 Some(StmtScope::TacticAlts { floor_col, saw_with, arm_col }) => if !saw_with { !cmd[i..].starts_with("with") } else if c == b'|' { col < arm_col.unwrap_or(floor_col) } else { col <= arm_col.unwrap_or(floor_col) },
                 Some(StmtScope::DoBlock(base_col)) => col < base_col,
                 Some(StmtScope::Calc { base_col, .. }) => col <= base_col,
-                Some(StmtScope::LocalValue(base_col)) => col <= base_col,
-                Some(StmtScope::LocalBind { col: ac, .. }) => col <= ac && c != b'|' && !(c == b':' && bytes.get(i + 1) == Some(&b'=')) && scopes.iter().any(|s| matches!(s, StmtScope::ByBlock { .. })),
+                Some(StmtScope::LocalValue(base_col)) => col <= base_col && !term_pending,
+                Some(StmtScope::LocalBind { col: ac, .. }) => col <= ac && !term_pending && c != b'|' && !(c == b':' && bytes.get(i + 1) == Some(&b'=')) && scopes.iter().any(|s| matches!(s, StmtScope::ByBlock { .. })),
                 Some(StmtScope::MatchArms { match_col, floor_col, arm_col }) => if c == b'|' { arm_col.is_some_and(|ac| col < ac) } else { col <= floor_col || col <= match_col.min(arm_col.unwrap_or(match_col)) },
                 Some(StmtScope::LocalArms(ac)) => col <= ac && c != b'|',
                 _ => false,
@@ -3330,6 +3335,7 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
             scopes.pop();
         }
         if let Some(end) = scan_lean_norm_literal_end(cmd, i) {
+            term_pending = false;
             i = end;
             continue;
         }
@@ -3343,10 +3349,17 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
             i += if c == b'.' { 1 } else { "·".len() };
             continue;
         }
-        let in_by = matches!(scopes.last(), Some(StmtScope::ByWaitFirst(_) | StmtScope::ByBlock { .. } | StmtScope::TacticAlts { .. }));
+        let in_by = matches!(scopes.last(), Some(StmtScope::ByWaitFirst(_) | StmtScope::ByBlock { .. } | StmtScope::TacticAlts { .. } | StmtScope::TacticHeader | StmtScope::TacticBranches(_)));
         if line_first && depth_zero {
-            at_tactic_head = matches!(scopes.last(), Some(StmtScope::ByBlock { base_col, .. }) if col_at(i) == *base_col)
+            at_tactic_head |= !term_pending && matches!(scopes.last(), Some(StmtScope::ByBlock { base_col, .. }) if col_at(i) == *base_col)
                 && c != b'.' && !cmd[..i].trim_end().ends_with('.');
+        }
+        if depth_zero && bytes[i..].starts_with(b"<;>") {
+            at_tactic_head = in_by;
+            term_pending = false;
+            if matches!(scopes.last(), Some(StmtScope::TacticAlts { saw_with: false, .. })) { scopes.pop(); }
+            i += 3;
+            continue;
         }
         if depth_zero
             && seen_colon
@@ -3361,6 +3374,7 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                     && cmd[kw_end + 1..].chars().next().is_none_or(|ch| !is_lean_id_first(ch) && ch != '«' && ch != '.');
                 if bytes.get(kw_end) == Some(&b'.') && !focusing_by {
                     at_tactic_head = false;
+                    term_pending = false;
                     i = kw_end;
                     continue;
                 }
@@ -3368,13 +3382,18 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                 if kw == "with" {
                     let owner = scopes.iter().rposition(|scope| !matches!(scope,
                         StmtScope::ByBlock { .. } | StmtScope::ByWaitFirst(_) | StmtScope::Show
-                        | StmtScope::LocalValue(_) | StmtScope::LocalArms(_) | StmtScope::MatchArms { .. }
+                        | StmtScope::LocalValue(_) | StmtScope::LocalArms(_) | StmtScope::MatchArms { .. } | StmtScope::DoBlock(_)
                         | StmtScope::TacticAlts { saw_with: true, .. } | StmtScope::Calc { rhs: true, .. }));
                     if let Some(owner) = owner.filter(|&n| matches!(scopes[n], StmtScope::MatchHeader { .. } | StmtScope::TacticAlts { saw_with: false, .. })) {
                         scopes.truncate(owner + 1);
                     }
                 }
                 match &cmd[i..kw_end] {
+                    "case" | "case'" | "next" | "conv" if in_by && at_tactic_head => scopes.push(StmtScope::TacticHeader),
+                    "first" if in_by && at_tactic_head => {
+                        let col = scopes.iter().rev().find_map(|s| if let StmtScope::ByBlock { base_col, .. } = s { Some(*base_col) } else { None }).unwrap_or(col_at(i));
+                        scopes.push(StmtScope::TacticBranches(col));
+                    }
                     "where" if !in_by => {
                         first_arm_split.get_or_insert(i);
                         break;
@@ -3421,25 +3440,29 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                     }
                     _ => {}
                 }
-                at_tactic_head = false;
+                term_pending = matches!(kw, "exact" | "refine" | "refine'" | "apply" | "eapply" | "fapply" | "change" | "convert" | "use" | "exists" | "fun" | "λ" | "from");
+                at_tactic_head = in_by && at_tactic_head && (matches!(kw, "try" | "all_goals" | "any_goals" | "focus" | "repeat" | "repeat'" | "iterate") || kw.bytes().all(|b| b.is_ascii_digit()));
                 i = kw_end + usize::from(focusing_by);
                 continue;
             }
         }
         match c {
-            b'=' if depth_zero && bytes.get(i + 1) == Some(&b'>') && matches!(scopes.last(), Some(StmtScope::TacticAlts { saw_with: true, .. })) => {
+            b'=' if depth_zero && bytes.get(i + 1) == Some(&b'>') && matches!(scopes.last(), Some(StmtScope::TacticAlts { saw_with: true, .. } | StmtScope::TacticHeader)) => {
+                if matches!(scopes.last(), Some(StmtScope::TacticHeader)) { scopes.pop(); }
                 scopes.push(StmtScope::ByWaitFirst(BlockKind::By));
+                term_pending = false;
                 i += 2;
                 continue;
             }
             b'(' => paren += 1,
-            b')' => paren = (paren - 1).max(0),
+            b')' => { paren = (paren - 1).max(0); term_pending = false; }
             b'[' => bracket += 1,
-            b']' => bracket = (bracket - 1).max(0),
+            b']' => { bracket = (bracket - 1).max(0); term_pending = false; }
             b'{' => brace += 1,
-            b'}' => brace = (brace - 1).max(0),
+            b'}' => { brace = (brace - 1).max(0); term_pending = false; }
             b';' if depth_zero && seen_colon => {
                 at_tactic_head = true;
+                term_pending = false;
                 if matches!(scopes.last(), Some(StmtScope::TacticAlts { saw_with: false, .. })) { scopes.pop(); }
                 if matches!(scopes.last(), Some(StmtScope::Calc { rhs: true, .. })) {
                     scopes.pop();
@@ -3449,10 +3472,11 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                 }
             }
             b':' if depth_zero => {
+                term_pending = true;
                 if bytes.get(i + 1) == Some(&b'=') {
                     // Completed terms expose the scope owning this assignment.
                     // A tactic block cannot itself consume a term assignment.
-                    while matches!(scopes.last(), Some(StmtScope::Show | StmtScope::LocalArms(_) | StmtScope::LocalValue(_) | StmtScope::MatchArms { .. } | StmtScope::ByBlock { .. } | StmtScope::TacticAlts { .. } | StmtScope::Calc { rhs: true, .. })) {
+                    while matches!(scopes.last(), Some(StmtScope::Show | StmtScope::LocalArms(_) | StmtScope::LocalValue(_) | StmtScope::MatchArms { .. } | StmtScope::ByBlock { .. } | StmtScope::TacticAlts { .. } | StmtScope::TacticBranches(_) | StmtScope::Calc { rhs: true, .. })) {
                         scopes.pop();
                     }
                     if let Some(StmtScope::Calc { rhs, .. }) = scopes.last_mut() {
@@ -3482,6 +3506,13 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                 let next_ok = !matches!(bytes.get(i + 1), Some(b'|' | b'>'));
                 let prev_ok = i == 0 || !matches!(bytes[i - 1], b'|' | b'<');
                 if next_ok && prev_ok {
+                    if let Some(owner) = scopes.iter().rposition(|s| !matches!(s, StmtScope::ByBlock { .. } | StmtScope::LocalValue(_) | StmtScope::LocalArms(_) | StmtScope::Show)).filter(|&n| matches!(scopes[n], StmtScope::TacticBranches(_))) {
+                        scopes.truncate(owner + 1);
+                        scopes.push(StmtScope::ByWaitFirst(BlockKind::By));
+                        term_pending = false;
+                        i += 1;
+                        continue;
+                    }
                     while line_first && is_pattern_match_arm_at(cmd, i) && matches!(scopes.last(), Some(StmtScope::ByBlock { .. } | StmtScope::Show | StmtScope::TacticAlts { saw_with: false, .. })) {
                         scopes.pop();
                     }
@@ -3514,7 +3545,19 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                     }
                 }
             }
-            _ => {}
+            _ => {
+                if depth_zero && bytes[i..].starts_with("←".as_bytes()) {
+                    if let Some(StmtScope::LocalBind { col, .. }) = scopes.last().copied() {
+                        scopes.pop();
+                        scopes.push(StmtScope::LocalValue(col));
+                    }
+                }
+                if cmd.is_char_boundary(i) {
+                    let ch = cmd[i..].chars().next().unwrap();
+                    term_pending = matches!(ch, '=' | '>' | '<' | '+' | '-' | '*' | '/' | '∧' | '∨' | '→' | '←' | ',');
+                    if !ch.is_ascii_digit() { at_tactic_head = false; }
+                }
+            }
         }
         i += 1;
     }
@@ -14731,6 +14774,69 @@ public def api := by
             let stub = format_stubbed_decl_span(&cmd, &sig, proof);
             assert!(stub.contains(sig.trim()), "{stub}");
             assert!(!stub.contains(":= helper := sorry"), "{stub}");
+        }
+    }
+
+    #[test]
+    fn test_statement_do_scrutinees_and_tactic_heads() {
+        let mut cases: Vec<(String, String)> = vec![
+            ("theorem t1 : match Id.run do pure true with | true => 1 = 1 | false => 2 = 2 ".into(), ":= rfl".into()),
+            ("theorem t1b : match Id.run do let b ← pure true; pure b with | true => 1 = 1 | false => 2 = 2 ".into(), ":= rfl".into()),
+            ("theorem t2 : (b : Bool) → match Id.run do pure b with | true => 1 = 1 | false => 2 = 2".into(), "\n  | true => rfl\n  | false => rfl".into()),
+            ("theorem t3 : Bool → match Id.run do pure true with | true => True | false => True".into(), "\n  | _ => helper\nwhere\n  helper : True := trivial".into()),
+            ("theorem t4 : Id.run do\n    let b := true\n    pure (b = true)\n  ".into(), ":= rfl".into()),
+            ("theorem c13 (obtain : Prop) (h : obtain) :\n    by\n      exact\n      obtain\n  ".into(), ":= h".into()),
+            ("theorem c13b (obtain : Prop) (h : obtain) : by\n  exact\n  obtain ".into(), ":= h".into()),
+            ("theorem t : match Id.run do let x ←\n  pure true; pure x with | true => True | false => True ".into(), ":= trivial".into()),
+        ];
+        let mut tactics: Vec<String> = [
+            "exact fun (obtain : Prop) => obtain",
+            "first | obtain ⟨x, _y⟩ := h; exact x | trivial",
+            "cases b; case true => obtain ⟨x, _y⟩ := h; exact x\n         case false => exact True",
+            "cases b; case' true => obtain ⟨x, _y⟩ := h; exact x\n         case false => exact True",
+            "cases b <;> next => obtain ⟨x, _y⟩ := h; exact x",
+            "conv => lhs; rfl\n  exact True",
+            "all_goals cases b with\n  | true => exact True\n  | false => exact True",
+            "skip <;> obtain ⟨x, _y⟩ := h; exact x",
+            "\n  try simpa only\n  obtain ⟨x, _y⟩ := h\n  exact x",
+            "\n  have _p : True := by\n    exact\n    True.intro\n  obtain ⟨x, _y⟩ := h\n  exact x",
+        ].into_iter().map(str::to_string).collect();
+        for prefix in ["try", "all_goals", "any_goals", "focus", "repeat", "repeat'", "iterate", "iterate 2"] {
+            tactics.push(format!("{prefix} obtain ⟨x, _y⟩ := h; exact x"));
+            for binder in ["set x := True", "have' x := True", "let' x := True", "replace h := h"] {
+                tactics.push(format!("{prefix} {binder}; exact True"));
+            }
+        }
+        for tactic in tactics {
+            cases.push((format!("theorem t (b : Bool) (h : Prop × Prop) : by {tactic}\n"), ":= by trivial".into()));
+        }
+        for tactic in ["exact", "refine", "refine'", "apply", "eapply", "fapply", "change", "convert", "use", "exists"] {
+            for name in ["obtain", "set", "replace", "have'", "let'", "cases", "induction"] {
+                cases.push((format!("theorem t ({name} : Prop) (h : {name}) : by\n  {tactic}\n  {name} "), ":= h".into()));
+            }
+        }
+        for term in ["fun (obtain : Prop) =>\n  obtain", "True ∧\n  obtain", "let x :=\n  obtain; x", "show Prop from\n  obtain"] {
+            cases.push((format!("theorem t (obtain : Prop) : by\n  exact {term}\n"), ":= h".into()));
+        }
+        for ty in [
+            "have _ : True := by\n  have _h :\n  obtain := hp\n  exact trivial\nTrue",
+            "have _ : True := by\n  let x :=\n  obtain\n  exact trivial\nTrue",
+            "Bool → by\n  first\n  | obtain ⟨x, y⟩ := h; exact x\n  | exact True",
+        ] {
+            let sig = format!("theorem t (obtain : Prop) (hp : obtain) : {ty}");
+            let tail = if ty.starts_with("Bool") { "\n| _ => hp" } else { ":= trivial" };
+            cases.push((sig, tail.into()));
+        }
+        // A zero-argument tactic is complete at the next aligned token.
+        cases.push(("theorem t : by\n  simpa\n  obtain ⟨x, y⟩ := h\n  exact x ".into(), ":= h".into()));
+        for (sig, tail) in cases {
+            let cmd = format!("{sig}{tail}");
+            let proof = tail.strip_prefix(":=").unwrap_or(&tail);
+            assert_eq!(split_at_top_level_assign(&cmd), Some((sig.as_str(), proof)), "{cmd}");
+            let split = split_lean_source(&cmd, &[]);
+            assert_eq!(split.shards.len(), 1, "{cmd}");
+            assert_eq!(split.shards[0].signature_text.trim(), sig.trim(), "{cmd}");
+            assert!(stub_identity_probe_src(&cmd).contains(sig.trim()), "{cmd}");
         }
     }
 
