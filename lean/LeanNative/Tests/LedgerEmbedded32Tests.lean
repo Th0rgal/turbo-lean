@@ -86,6 +86,25 @@ def heapAllocRejectModule : LNIRModule :=
     (ir.splitOn "uwtable").length == 1
   | .error _ => false
 
+/-- Regression guard for Cortex-M0+ (`thumbv6m`) freestanding 64-bit multiplication:
+    `emitLLVMFreestanding?` must expand `i64 * i64` via 32-bit partial products without
+    emitting raw `mul i64` or referencing `__aeabi_lmul`. -/
+def thumbv6mMul64Module : LNIRModule :=
+  { moduleName := "ledger_thumbv6m_mul64"
+  , decls := [{
+      name := "mul64_partial_products"
+      params := [{ id := 0, name := "a", ty := .i64 }, { id := 1, name := "b", ty := .i64 }]
+      retTy := .i64
+      body := .letBind 2 .i64 (.scalar (.binOp .mul (.var 0) (.var 1))) (.ret 2)
+    }] }
+
+#guard match emitLLVMFreestanding? thumbv6mMul64Module .thumbv6m with
+  | .ok ir =>
+    (ir.splitOn "mul i64").length == 1 &&
+    (ir.splitOn "__aeabi_lmul").length == 1 &&
+    (ir.splitOn "mul i32").length > 1
+  | .error _ => false
+
 /-- Concrete end-to-end `LLVMLower` + `emitLLVMFreestanding?` + `clang -c` + `llvm-nm -u` + `-fstack-usage`
     smoke suite across `.thumbv6m`, `.thumbv8mMain`, and `.riscv32imac`. -/
 def runLedgerEmbeddedClangSmokeSuite (clangBin : String := "clang") : IO Bool := do
