@@ -12240,6 +12240,71 @@ globs = ["Demo.+"]
     }
 
     #[test]
+    fn kernel_statement_auxiliaries_414() -> Result<()> {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo-aux-414-{}-{}", std::process::id(), pack::next_tmp_id()
+        ));
+        fs::create_dir_all(dir.join("Fixture"))?;
+        fs::write(dir.join(".gitignore"), ".lake/\n")?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(dir.join("lakefile.toml"),
+            "name = \"aux-fixture\"\ndefaultTargets = [\"Fixture\"]\n[[lean_lib]]\nname = \"Fixture\"\nglobs = [\"Fixture.+\"]\n")?;
+        let file = dir.join("Fixture/Lemmas.lean");
+        let source = r#"import Lean
+namespace Fixture
+def double (n : Nat) := n + n
+theorem double_eq_two_mul (n : Nat) : double n = 2 * n := by
+  simp only [double]; omega
+private theorem private_double (n : Nat) : double n = 2 * n := by
+  simp only [double]; omega
+private theorem priv_thm : 1 + 1 = 2 := rfl
+theorem outer : True := by trivial
+where
+  helper : True := trivial
+theorem «_proof_1» : True := trivial
+end Fixture
+"#;
+        fs::write(&file, source)?;
+        git_init_and_commit(&dir, "baseline")?;
+        stock_statement_build(&dir)?;
+        let before = built_kernel_statements(&dir, None)?;
+        assert_eq!(before.len(), 6, "{before:?}");
+        let report = built_kernel_statement_report(&dir, None, false, None, None)?;
+        assert!(report.audits.iter().any(|row| row.audit.ends_with("._proof_1_2")));
+        assert!(report.audits.iter().any(|row| row.audit.ends_with(".eq_1")));
+        fs::write(&file, source.replace("simp only [double]", "unfold double"))?;
+        stock_statement_build(&dir)?;
+        assert_eq!(before, built_kernel_statements(&dir, None)?);
+        let mut store = TurboStore::open(Some(&dir.join(".lake/gate-cache")))?;
+        run_pr_verify_command(
+            &mut store, true, dir.clone(), "HEAD".into(), "trusted".into(),
+            true, None, None, None, None, false, 0, None,
+        )?;
+        for (old, new, suffix, deleted) in [
+            ("theorem double_eq_two_mul (n : Nat) : double n = 2 * n := by\n  simp only [double]; omega\n", "", ".double_eq_two_mul", true),
+            ("private theorem priv_thm : 1 + 1 = 2 := rfl\n", "", ".priv_thm", true),
+            ("priv_thm : 1 + 1 = 2", "priv_thm : 2 + 2 = 4", ".priv_thm", false),
+            ("helper : True := trivial", "helper : 1 = 1 := rfl", ".outer.helper", false),
+            ("«_proof_1» : True := trivial", "«_proof_1» : 1 = 1 := rfl", "._proof_1", false),
+            ("theorem «_proof_1» : True := trivial\n", "", "._proof_1", true),
+        ] {
+            fs::write(&file, source.replace(old, new))?;
+            stock_statement_build(&dir)?;
+            let key = before.keys().find(|key| key.ends_with(suffix))
+                .expect("source theorem must be pinned");
+            let expected = format!("{key}{}", if deleted { " (deleted)" } else { "" });
+            assert_eq!(compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?),
+                vec![expected], "{suffix}");
+        }
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn kernel_statement_large_literals_remain_exact() -> Result<()> {
         let dir = std::env::temp_dir().join(format!(
             "turbo-statement-naturals-{}-{}",
