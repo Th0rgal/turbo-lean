@@ -41,6 +41,8 @@ pub struct ZygoteEvalReply {
     pub env_cache_hit: bool,
     #[serde(default)]
     pub prefix_cache_hit: bool,
+    #[serde(default)]
+    pub compact_prefix: bool,
     pub import_us: u64,
     #[serde(default)]
     pub prefix_us: u64,
@@ -261,8 +263,8 @@ struct ZygoteLruEntry {
 /// Machine-wide `/dev/shm` LRU RSS governor across all concurrent `ZygoteWorker` processes.
 /// Bounds total resident memory across multi-worktree agent runs to `TURBO_LEAN_MAX_TOTAL_ZYGOTE_RSS_MB`
 /// (defaulting to the detected `MemoryBudgetGovernor::detect().budget_mb` clamped to `1024..=12288` MiB).
-pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
-    let max_total_mb = std::env::var("TURBO_LEAN_MAX_TOTAL_ZYGOTE_RSS_MB")
+fn max_total_zygote_rss_mb() -> u64 {
+    std::env::var("TURBO_LEAN_MAX_TOTAL_ZYGOTE_RSS_MB")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&mb| mb >= 256)
@@ -270,8 +272,11 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
             crate::shm_cache::MemoryBudgetGovernor::detect()
                 .budget_mb
                 .clamp(2048, 12_288)
-        });
-    let max_entries = std::env::var("TURBO_LEAN_MAX_ZYGOTE_PROCESSES")
+        })
+}
+
+fn max_zygote_processes() -> usize {
+    std::env::var("TURBO_LEAN_MAX_ZYGOTE_PROCESSES")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n >= 1)
@@ -279,8 +284,15 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
             crate::shm_cache::MemoryBudgetGovernor::detect()
                 .recommended_parallel_workers(1024)
                 .clamp(8, 16)
-        });
-    let shm_dir = crate::shm_cache::staging_shm_dir();
+        })
+}
+
+pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
+    let max_total_mb = max_total_zygote_rss_mb();
+    let max_entries = max_zygote_processes();
+    let Some(shm_dir) = crate::shm_cache::ensure_verified_private_staging_dir(None) else {
+        return;
+    };
     let reg_path = shm_dir.join("zygote_lru_registry.json");
     let lock_path = shm_dir.join("zygote_lru_registry.lock");
     let now_ms = std::time::SystemTime::now()
@@ -331,10 +343,9 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
                     }
                     continue;
                 }
-                if kept_entries.len() < max_entries {
-                    running_rss_mb = running_rss_mb.saturating_add(entry.rss_mb);
-                    kept_entries.push(entry);
-                }
+                // Young or active processes still consume memory even over the limit.
+                running_rss_mb = running_rss_mb.saturating_add(entry.rss_mb);
+                kept_entries.push(entry);
             }
             kept_entries.sort_by_key(|e| e.last_used_ms);
             *entries = kept_entries;
@@ -345,9 +356,10 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
 /// Drop pooled children before returning from a CLI invocation or shutting down a server.
 pub(crate) fn clear_zygote_pool() {
     if let Some(pool) = ZYGOTE_POOL.get() {
-        if let Ok(mut pool) = pool.lock() {
-            pool.clear();
-        }
+        pool.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+    if let Some(masters) = ZYGOTE_MASTERS.get() {
+        masters.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
@@ -360,6 +372,11 @@ extern "C" fn cleanup_one_shot() {
     if let Some((dir, _)) = ONE_SHOT_DIR.get() {
         let _ = fs::remove_dir_all(dir);
     }
+}
+
+#[cfg(unix)]
+extern "C" fn cleanup_zygote_processes() {
+    clear_zygote_pool();
 }
 
 #[cfg(test)]
@@ -1114,11 +1131,12 @@ struct WorkerCrashDiagnostics {
 }
 
 pub struct ZygoteWorkerProcess {
-    pub child: std::process::Child,
+    pub child: Option<std::process::Child>,
+    clone_pid: Option<u32>,
     // Linux parent-death signals follow the spawning thread, so keep it alive with the worker.
     _owner: std::sync::mpsc::Sender<()>,
-    stdin: std::process::ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
+    stdin: WorkerInput,
+    stdout: BufReader<WorkerOutput>,
     stderr_tail: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     stderr_scan: std::sync::Arc<StderrScan>,
     #[cfg(target_os = "linux")]
@@ -1128,6 +1146,101 @@ pub struct ZygoteWorkerProcess {
     warm_prefix_tree: Vec<(String, String)>,
     warm_imports: std::collections::HashMap<String, String>,
     pub request_count: usize,
+    cold_import_us: Option<u64>,
+    is_master: bool,
+    _master: Option<std::sync::Arc<ZygoteMasterEntry>>,
+}
+
+#[cfg(unix)]
+type WorkerInput = std::fs::File;
+#[cfg(unix)]
+type WorkerOutput = std::fs::File;
+#[cfg(not(unix))]
+type WorkerInput = std::process::ChildStdin;
+#[cfg(not(unix))]
+type WorkerOutput = std::process::ChildStdout;
+
+fn worker_input(input: std::process::ChildStdin) -> WorkerInput {
+    #[cfg(unix)]
+    { std::fs::File::from(std::os::fd::OwnedFd::from(input)) }
+    #[cfg(not(unix))]
+    { input }
+}
+
+fn worker_output(output: std::process::ChildStdout) -> WorkerOutput {
+    #[cfg(unix)]
+    { std::fs::File::from(std::os::fd::OwnedFd::from(output)) }
+    #[cfg(not(unix))]
+    { output }
+}
+
+impl ZygoteWorkerProcess {
+    fn pid(&self) -> u32 {
+        self.clone_pid.unwrap_or_else(|| self.child.as_ref().unwrap().id())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fork_clone(&mut self, deadline: std::time::Instant) -> Result<Self> {
+        use std::os::unix::{io::OwnedFd, net::UnixListener};
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        use std::os::unix::ffi::OsStrExt;
+        let sock_dir = crate::shm_cache::ensure_verified_private_staging_dir(None)
+            .ok_or_else(|| anyhow::anyhow!("verified private staging directory unavailable"))?;
+        let path = sock_dir.join(format!("clone-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+        anyhow::ensure!(path.with_extension("err").as_os_str().as_bytes().len() < 104,
+            "clone socket path too long");
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); let _ = std::fs::remove_file(self.0.with_extension("err")); }
+        }
+        let _cleanup = Cleanup(path.clone());
+        let listener = UnixListener::bind(&path)?;
+        let errors = UnixListener::bind(path.with_extension("err"))?;
+        writeln!(self.stdin, "fork_clone:{}", path.display())?;
+        self.stdin.flush()?;
+        let mut reply = String::new();
+        read_line_with_timeout(&mut self.stdout, &mut reply, deadline)?;
+        let pid: u32 = reply.trim().strip_prefix("clone ").ok_or_else(|| anyhow::anyhow!("clone unavailable"))?.parse()?;
+        let accept = |l: UnixListener| -> Result<std::os::unix::net::UnixStream> {
+            l.set_nonblocking(true)?;
+            loop {
+                match l.accept() {
+                    Ok((s, _)) => return Ok(s),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(1)),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        };
+        let channels = (|| Ok::<_, anyhow::Error>((accept(listener)?, accept(errors)?)))();
+        let (stream, mut err) = match channels {
+            Ok(c) => c,
+            Err(e) => { unsafe { libc::kill(pid as i32, libc::SIGKILL); } return Err(e); }
+        };
+        let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let stderr_scan = std::sync::Arc::new(StderrScan::default());
+        let (tail, scan) = (stderr_tail.clone(), stderr_scan.clone());
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = [0; 1024];
+            while let Ok(n) = err.read(&mut buf) {
+                if n == 0 { break; }
+                scan.feed(&buf[..n]);
+                if let Ok(mut t) = tail.lock() {
+                    t.extend_from_slice(&buf[..n]);
+                    let excess = t.len().saturating_sub(ZYGOTE_STDERR_TAIL_CAP);
+                    t.drain(..excess);
+                }
+            }
+        });
+        Ok(Self {
+            child: None, clone_pid: Some(pid), _owner: self._owner.clone(),
+            stdin: std::fs::File::from(OwnedFd::from(stream.try_clone()?)),
+            stdout: BufReader::new(std::fs::File::from(OwnedFd::from(stream))),
+            stderr_tail, stderr_scan, pinned_snapshot_dir: self.pinned_snapshot_dir,
+            spawn_lean_path: self.spawn_lean_path.clone(), warm_prefixes: self.warm_prefixes.clone(),
+            warm_prefix_tree: self.warm_prefix_tree.clone(), warm_imports: self.warm_imports.clone(), request_count: 0, cold_import_us: None, is_master: false, _master: None,
+        })
+    }
 }
 
 #[allow(dead_code)]
@@ -1137,16 +1250,51 @@ extern "C" {
 
 impl Drop for ZygoteWorkerProcess {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(child) = &mut self.child {
+            // Let a master kill and reap its clones before reaping the master itself.
+            if self.is_master {
+                let _ = self.stdin.write_all(b"shutdown\n");
+                let _ = self.stdin.flush();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        #[cfg(unix)]
+        if let Some(pid) = self.clone_pid {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+        }
     }
 }
 
 type ZygoteChild = ZygoteWorkerProcess;
 
+struct ZygoteMasterEntry {
+    worker: std::sync::Mutex<ZygoteWorkerProcess>,
+    pid: u32,
+    last_used_seq: std::sync::atomic::AtomicU64,
+}
+
+impl ZygoteMasterEntry {
+    fn touch(&self) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        self.last_used_seq.store(NEXT.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+        govern_machine_wide_zygote_rss(self.pid, measure_process_rss_mb(self.pid));
+    }
+}
+
 #[allow(clippy::type_complexity)]
 static ZYGOTE_POOL: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<(String, String, String), Vec<ZygoteWorkerProcess>>>,
+> = std::sync::OnceLock::new();
+
+#[allow(clippy::type_complexity)]
+static ZYGOTE_MASTERS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(String, String, String), std::sync::Arc<ZygoteMasterEntry>>>,
 > = std::sync::OnceLock::new();
 
 /// Test-only fault injection: named callbacks fired at race-sensitive points of the digest /
@@ -3194,7 +3342,7 @@ fn build_worker_crash_diagnostics(
     peak_rss_mb: u64,
     last_request: &str,
 ) -> WorkerCrashDiagnostics {
-    let (exit_code, exit_signal) = collect_worker_exit_status(&mut worker.child);
+    let (exit_code, exit_signal) = worker.child.as_mut().map(collect_worker_exit_status).unwrap_or((None, None));
     let stderr_tail = snapshot_worker_stderr_tail(&worker.stderr_tail);
     let mut details: Vec<String> = Vec::new();
     if let Some(code) = exit_code {
@@ -5865,7 +6013,7 @@ static ZYGOTE_LEAN_PATH_CACHE: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 
 fn read_line_with_timeout(
-    reader: &mut BufReader<std::process::ChildStdout>,
+    reader: &mut BufReader<WorkerOutput>,
     line: &mut String,
     deadline: std::time::Instant,
 ) -> std::io::Result<Option<usize>> {
@@ -7177,10 +7325,11 @@ fn eval_with_zygote_pool_attempt(
             });
         }
         Ok(ZygoteWorkerProcess {
-            child,
+            child: Some(child),
+            clone_pid: None,
             _owner: owner,
-            stdin,
-            stdout,
+            stdin: worker_input(stdin),
+            stdout: BufReader::new(worker_output(stdout.into_inner())),
             stderr_tail,
             stderr_scan,
             #[cfg(target_os = "linux")]
@@ -7190,6 +7339,9 @@ fn eval_with_zygote_pool_attempt(
             warm_prefix_tree: Vec::new(),
             warm_imports: std::collections::HashMap::new(),
             request_count: 0,
+            cold_import_us: None,
+            is_master: false,
+            _master: None,
         })
     };
 
@@ -7199,6 +7351,13 @@ fn eval_with_zygote_pool_attempt(
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&mb| mb > 0)
         .unwrap_or_else(|| governor.worker_rss_limit_mb());
+    let effective_rss_limit_mb = if std::env::var("TURBO_LEAN_WORKER_RSS_LIMIT_MB").is_ok()
+        || std::env::var("TURBO_LEAN_MAX_MEMORY_MB").is_ok()
+    {
+        worker_rss_limit_mb
+    } else {
+        worker_rss_limit_mb.max(2048)
+    };
     let max_global_idle = std::env::var("TURBO_LEAN_MAX_IDLE_ZYGOTES")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
@@ -7226,7 +7385,7 @@ fn eval_with_zygote_pool_attempt(
 
     let worker_timeout = |worker: &ZygoteChild, req_id: &str| WorkerReqOutcome::TimedOut {
         elapsed_us: request_started.elapsed().as_micros() as u64,
-        peak_rss_mb: measure_process_rss_mb(worker.child.id()),
+        peak_rss_mb: measure_process_rss_mb(worker.pid()),
         stderr_tail: snapshot_worker_stderr_tail(&worker.stderr_tail),
         last_request: req_id.to_string(),
     };
@@ -7254,7 +7413,8 @@ fn eval_with_zygote_pool_attempt(
             if std::time::Instant::now() >= deadline {
                 return worker_timeout(worker, req_id);
             }
-            let pid = worker.child.id();
+            let pid = worker.pid();
+            if worker.clone_pid.is_some() { run_digest_test_hook("cloned_worker_request"); }
             let rss_before = measure_process_rss_mb(pid);
             let scan_before = worker.stderr_scan.snapshot();
             if let Err(e) = worker
@@ -7293,6 +7453,10 @@ fn eval_with_zygote_pool_attempt(
                 }
                 Ok(Some(_)) => match serde_json::from_str::<ZygoteEvalReply>(resp_line.trim()) {
                     Ok(mut parsed) => {
+                        if let Some(us) = worker.cold_import_us.take() {
+                            parsed.env_cache_hit = false;
+                            parsed.import_us = us;
+                        }
                         let rss_after = measure_process_rss_mb(pid);
                         parsed.rss_delta_mb = (rss_after as i64) - (rss_before as i64);
                         parsed.peak_rss_mb = rss_after.max(rss_before);
@@ -7330,6 +7494,95 @@ fn eval_with_zygote_pool_attempt(
             }
         };
 
+    let acquire_worker = || -> Result<ZygoteChild> {
+        #[cfg(target_os = "linux")]
+        if !lake_inputs_uncacheable && closure.label().is_some() && !daemon_disabled() {
+            let masters = ZYGOTE_MASTERS.get_or_init(|| {
+                // Explicit CLI exits bypass OneShotGuard::drop and static destructors.
+                unsafe { libc::atexit(cleanup_zygote_processes); }
+                Default::default()
+            });
+            let cached = masters.lock().map_err(|_| anyhow::anyhow!("Zygote masters poisoned"))?
+                .get(&pool_key).cloned();
+            let mut entry = cached;
+            if let Some(existing) = &entry {
+                let worker = existing.worker.lock().map_err(|_| anyhow::anyhow!("Zygote master poisoned"))?;
+                let matches = worker.pinned_snapshot_dir == expected_pinned_dir
+                    && worker.spawn_lean_path == effective_lean_path;
+                drop(worker);
+                if !matches {
+                    let mut map = masters.lock().unwrap_or_else(|e| e.into_inner());
+                    if map.get(&pool_key).is_some_and(|e| std::sync::Arc::ptr_eq(e, existing)) {
+                        map.remove(&pool_key);
+                    }
+                    drop(map);
+                    entry = None;
+                }
+            }
+            if entry.is_none() {
+                let mut master = spawn_zygote_worker()?;
+                let warm = attach_host_closure_digest(&format!("{}\t\tstrict\n", imports_csv), host_closure_digest);
+                if let WorkerReqOutcome::Reply(rep) = run_worker_req(&mut master, &warm, "warm clone master") {
+                    if rep.ok && rep.import_ok && closure.binding() == ClosureBinding::Bound {
+                        master.warm_imports.insert(imports_csv.clone(), closure_pool_digest.clone());
+                        master.cold_import_us = Some(rep.import_us);
+                        let rss = measure_process_rss_mb(master.pid());
+                        if rss > effective_rss_limit_mb {
+                            return Ok(master);
+                        }
+                        master.is_master = true;
+                        let candidate = std::sync::Arc::new(ZygoteMasterEntry {
+                            pid: master.pid(), worker: std::sync::Mutex::new(master),
+                            last_used_seq: std::sync::atomic::AtomicU64::new(0),
+                        });
+                        candidate.touch();
+                        let max_cached = std::env::var("TURBO_LEAN_MAX_ZYGOTE_MASTERS")
+                            .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(||
+                                (governor.recommended_parallel_workers(1024) / 2).clamp(1, 4))
+                            .min(max_zygote_processes().saturating_sub(1));
+                        let mut retired = Vec::new();
+                        let mut map = masters.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(existing) = map.get(&pool_key) {
+                            entry = Some(existing.clone());
+                        } else {
+                            while !map.is_empty() && (map.len() >= max_cached
+                                || map.values().map(|e| measure_process_rss_mb(e.pid)).sum::<u64>()
+                                    .saturating_add(rss) > max_total_zygote_rss_mb()) {
+                                let key = map.iter().min_by_key(|(_, e)| (
+                                    std::sync::Arc::strong_count(e) != 1,
+                                    e.last_used_seq.load(std::sync::atomic::Ordering::Relaxed),
+                                )).unwrap().0.clone();
+                                retired.push(map.remove(&key).unwrap());
+                            }
+                            if max_cached > 0 && rss <= max_total_zygote_rss_mb() {
+                                map.insert(pool_key.clone(), candidate.clone());
+                            }
+                            entry = Some(candidate.clone());
+                        }
+                        drop(map);
+                        drop(retired);
+                    }
+                }
+            }
+            if let Some(entry) = entry {
+                entry.touch();
+                let mut master = entry.worker.lock().map_err(|_| anyhow::anyhow!("Zygote master poisoned"))?;
+                if let Ok(mut worker) = master.fork_clone(deadline) {
+                    mark_closure_snapshot_used(host_closure_digest);
+                    worker.cold_import_us = master.cold_import_us.take();
+                    worker._master = Some(entry.clone());
+                    return Ok(worker);
+                }
+                drop(master);
+                let mut map = masters.lock().unwrap_or_else(|e| e.into_inner());
+                if map.get(&pool_key).is_some_and(|e| std::sync::Arc::ptr_eq(e, &entry)) {
+                    map.remove(&pool_key);
+                }
+            }
+        }
+        spawn_zygote_worker()
+    };
+
     #[allow(clippy::type_complexity)]
     let return_worker_to_pool = |pool_mutex: &std::sync::Mutex<
         std::collections::HashMap<(String, String, String), Vec<ZygoteWorkerProcess>>,
@@ -7345,15 +7598,8 @@ fn eval_with_zygote_pool_attempt(
             drop(w);
             return;
         }
-        let pid = w.child.id();
+        let pid = w.pid();
         let worker_rss_mb = measure_process_rss_mb(pid);
-        let effective_rss_limit_mb = if std::env::var("TURBO_LEAN_WORKER_RSS_LIMIT_MB").is_ok()
-            || std::env::var("TURBO_LEAN_MAX_MEMORY_MB").is_ok()
-        {
-            worker_rss_limit_mb
-        } else {
-            worker_rss_limit_mb.max(2048)
-        };
         if worker_rss_mb > effective_rss_limit_mb {
             drop(w);
             return;
@@ -7487,7 +7733,7 @@ fn eval_with_zygote_pool_attempt(
                 mark_closure_snapshot_used(host_closure_digest);
             }
             while workers.len() < needed {
-                workers.push(spawn_zygote_worker()?);
+                workers.push(acquire_worker()?);
             }
 
             let req_lines: Vec<String> = blocks
@@ -7895,7 +8141,7 @@ fn eval_with_zygote_pool_attempt(
         ));
     }
     if worker.is_none() {
-        worker = Some(spawn_zygote_worker()?);
+        worker = Some(acquire_worker()?);
     }
 
     let mut w = worker.unwrap();
@@ -12868,10 +13114,11 @@ mod tests {
             }
             let _ = child.wait();
             ZygoteWorkerProcess {
-                child,
+                child: Some(child),
+                clone_pid: None,
                 _owner: std::sync::mpsc::channel().0,
-                stdin,
-                stdout,
+                stdin: worker_input(stdin),
+                stdout: BufReader::new(worker_output(stdout.into_inner())),
                 stderr_tail,
                 stderr_scan: Default::default(),
                 #[cfg(target_os = "linux")]
@@ -12881,6 +13128,9 @@ mod tests {
                 warm_prefix_tree: Vec::new(),
                 warm_imports: std::collections::HashMap::new(),
                 request_count: 1,
+                cold_import_us: None,
+                is_master: false,
+                _master: None,
             }
         };
 
@@ -15327,12 +15577,135 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn test_zygote_master_eviction_preserves_checked_out_clone() {
+        let (dir, store, mut env, lean) = open_test_zygote_env("master_eviction").expect("Lean toolchain");
+        fs::write(dir.join("EvictionSeed.olean"), compile_test_olean(&lean, &dir,
+            "EvictionSeed", "def evictionSeed : Nat := 7\n")).unwrap();
+        env.insert("LEAN_PATH".into(), dir.to_string_lossy().into_owned());
+        let pid = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = pid.clone();
+        digest_test_hooks::set("cloned_worker_request", move || {
+            let mut masters = ZYGOTE_MASTERS.get().unwrap().lock().unwrap();
+            let key = masters.iter().find(|(_, e)| e.worker.lock().unwrap()
+                .warm_imports.contains_key("EvictionSeed")).unwrap().0.clone();
+            let entry = masters.remove(&key).unwrap();
+            seen.set(entry.pid);
+            let registry: Vec<ZygoteLruEntry> = serde_json::from_slice(&fs::read(
+                crate::shm_cache::staging_shm_dir().join("zygote_lru_registry.json")).unwrap()).unwrap();
+            assert!(registry.iter().any(|e| e.pid == entry.pid && e.rss_mb > 0));
+            drop(masters);
+            drop(entry);
+            assert!(Path::new(&format!("/proc/{}", seen.get())).exists());
+        });
+        let reply = eval_with_zygote_pool_for_targets(&store, "leanprover/lean4:v4.35.0",
+            &env["LEAN_PATH"], &env, &lean,
+            "import EvictionSeed\ntheorem eviction_ok : evictionSeed = 7 := rfl\n",
+            &["eviction_ok".into()], None, &[]).unwrap();
+        digest_test_hooks::clear();
+        assert!(reply.ok, "{:?}", reply.errors);
+        assert_ne!(pid.get(), 0, "must evaluate a checked-out clone");
+        let mut retired = Vec::new();
+        let mut pool = ZYGOTE_POOL.get().unwrap().lock().unwrap();
+        for workers in pool.values_mut() {
+            let mut i = 0;
+            while i < workers.len() {
+                if workers[i]._master.as_ref().is_some_and(|e| e.pid == pid.get()) {
+                    retired.push(workers.swap_remove(i));
+                } else { i += 1; }
+            }
+        }
+        drop(pool);
+        assert!(Path::new(&format!("/proc/{}", pid.get())).exists());
+        drop(retired);
+        assert!(!Path::new(&format!("/proc/{}", pid.get())).exists(), "last clone must reap master");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_zygote_master_rss_cap() {
+        if std::env::var_os("TURBO_LEAN_TEST_MASTER_RSS_CHILD").is_none() {
+            let staging = std::env::temp_dir().join(format!("turbo-master-rss-staging-{}", std::process::id()));
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "zygote::tests::test_zygote_master_rss_cap", "--nocapture"])
+                .env("TURBO_LEAN_TEST_MASTER_RSS_CHILD", "1")
+                .env("TURBO_LEAN_WORKER_RSS_LIMIT_MB", "1")
+                .env("TURBO_LEAN_STAGING_DIR", &staging)
+                .output().unwrap();
+            let _ = fs::remove_dir_all(staging);
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
+        let (dir, store, mut env, lean) = open_test_zygote_env("master_rss_cap").expect("Lean toolchain");
+        crate::shm_cache::ensure_verified_private_staging_dir(None).expect("private staging");
+        fs::write(dir.join("RssSeed.olean"), compile_test_olean(&lean, &dir,
+            "RssSeed", "def rssSeed : Nat := 7\n")).unwrap();
+        env.insert("LEAN_PATH".into(), dir.to_string_lossy().into_owned());
+        let reply = eval_with_zygote_pool_for_targets(&store, "leanprover/lean4:v4.35.0",
+            &env["LEAN_PATH"], &env, &lean,
+            "import RssSeed\ntheorem rss_ok : rssSeed = 7 := rfl\n",
+            &["rss_ok".into()], None, &[]).unwrap();
+        assert!(reply.ok, "{:?}", reply.errors);
+        assert!(ZYGOTE_MASTERS.get().unwrap().lock().unwrap().is_empty(), "oversized master must not be pinned");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(crate::shm_cache::staging_shm_dir()).unwrap()
+            .permissions().mode() & 0o777, 0o700);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_zygote_cow_fork_concurrent_pool_miss() {
+        let (dir, _store, mut env, lean) = open_test_zygote_env("clone_pool").expect("Lean toolchain");
+        fs::write(dir.join("ClonePool.olean"), compile_test_olean(&lean, &dir, "ClonePool", "def cloneSeed : Nat := 7\n")).unwrap();
+        env.insert("LEAN_PATH".into(), dir.to_string_lossy().into_owned());
+        eval_with_zygote_pool_for_targets(&_store, "leanprover/lean4:v4.35.0", &dir.to_string_lossy(), &env, &lean, "import ClonePool\ntheorem clone_warm : True := trivial\n", &["clone_warm".into()], None, &[]).unwrap();
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..4).map(|i| {
+                let (env, lean) = (&env, &lean);
+                s.spawn(move || {
+                    let (_dir, store, _, _) = open_test_zygote_env(&format!("clone_thread_{i}")).unwrap();
+                    let cloned = std::rc::Rc::new(std::cell::Cell::new(false));
+                    let seen = cloned.clone();
+                    digest_test_hooks::set("cloned_worker_request", move || seen.set(true));
+                    let code = format!("import ClonePool\ntheorem clone_pool_{i} : cloneSeed = 7 := rfl\n");
+                    let r = eval_with_zygote_pool_for_targets(&store, "leanprover/lean4:v4.35.0", &env["LEAN_PATH"], env, lean, &code, &[format!("clone_pool_{i}")], None, &[]).unwrap();
+                    assert!(r.ok && r.kernel_gate_active, "{:?}", r.errors);
+                    assert!(r.env_cache_hit, "clone must inherit the imported environment");
+                    assert_eq!(r.import_us, 0);
+                    assert!(cloned.get(), "request must execute in a fork clone");
+                    let bad = code.replace("rfl", "by sorry");
+                    assert!(!eval_with_zygote_pool_for_targets(&store, "leanprover/lean4:v4.35.0", &env["LEAN_PATH"], env, lean, &bad, &[format!("clone_pool_{i}")], None, &[]).unwrap().ok);
+                    digest_test_hooks::clear();
+                })
+            }).collect();
+            for h in handles { h.join().unwrap(); }
+        });
+        #[cfg(target_os = "linux")]
+        {
+            let masters = ZYGOTE_MASTERS.get().unwrap().lock().unwrap();
+            assert!(!masters.is_empty(), "test must exercise a live master");
+            let mut pids: Vec<_> = masters.values().map(|w| w.pid).collect();
+            drop(masters);
+            pids.extend(ZYGOTE_POOL.get().unwrap().lock().unwrap().values()
+                .flatten().map(|w| w.pid()));
+            clear_zygote_pool();
+            assert!(ZYGOTE_MASTERS.get().unwrap().lock().unwrap().is_empty());
+            assert!(ZYGOTE_POOL.get().unwrap().lock().unwrap().is_empty());
+            for pid in pids {
+                assert!(!Path::new(&format!("/proc/{pid}")).exists(), "worker {pid} must be killed and reaped");
+            }
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn test_zygote_cow_fork_race_candidates_and_sorry_rejection() {
         let Some((tmp_dir, store, env_vars, lean_bin)) = open_test_zygote_env("cow_fork_race")
         else {
             return;
         };
-        let prefix = "import Init\ndef baseVal : Nat := 21\n";
+        let prefix = "import Init\ndef seedVal : Nat := 20\ndef baseVal : Nat := seedVal + 1\n";
         let cands_ok = vec![
             "theorem race_t : baseVal + baseVal = 42 := by exact False.elim sorry".to_string(),
             "theorem race_t : baseVal + baseVal = 999 := by rfl".to_string(),
@@ -15352,10 +15725,28 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
         assert!(
             rep.ok && rep.import_ok && rep.kernel_gate_active,
             "expected valid candidate to win race: {:?}",
-            rep.errors
+            (rep.errors.clone(), rep.stderr_tail.clone())
         );
         assert_eq!(rep.winning_candidate_idx, Some(2));
+        assert!(rep.compact_prefix, "prefix compaction must succeed at runtime: {rep:?}");
         assert!(!rep.used_sorry && rep.sorry_decls.is_empty());
+
+        for prefix in [
+            "import Init\nprivate def hiddenSeed : Nat := 21\n",
+            "import Init\n@[simp] theorem prefix_simp : True := trivial\n",
+            "import Init\nlocal instance : Inhabited Nat := ⟨21⟩\n",
+            "import Init\nnamespace ScopedPrefix\nscoped instance : Inhabited Nat := ⟨21⟩\nend ScopedPrefix\n",
+            "import Init\nnoncomputable def opaqueSeed : Nat := 21\n",
+            "import Init\nnamespace StillOpen\ndef seed : Nat := 21\n",
+            "import Init\nopen Nat\ndef seed : Nat := 21\n",
+        ] {
+            let rep = eval_candidates_race_via_zygote(
+                &store, "leanprover/lean4:v4.35.0", "", &env_vars, &lean_bin,
+                prefix, &["theorem scoped_body : True := trivial\n".into()], &[],
+            ).unwrap();
+            assert!(rep.ok, "checkpoint replay failed for {prefix}: {rep:?}");
+            assert!(!rep.compact_prefix, "scoped/modifier prefix must retain its checkpoint: {prefix}");
+        }
 
         let cands_sorry_only = vec!["theorem race_bad : baseVal = 999 := by sorry".to_string()];
         let rep_bad = eval_candidates_race_via_zygote(
