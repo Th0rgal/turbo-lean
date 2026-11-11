@@ -3230,20 +3230,27 @@ pub(crate) fn extract_shard_stmt_and_proof(src: &str, shard: &TheoremShard) -> (
 /// and after local bindings inside the theorem's return type), OR when there is no top-level `:=`,
 /// at the first top-level equation-compiler pattern-matching arm (`\n  | pat => proof`) after the top-level `:`.
 fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
+    split_at_top_level_assign_inner(cmd, false)
+}
+
+fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Option<(&str, &str)> {
     #[derive(Clone, Copy)]
     enum StmtScope {
         LocalBind(usize),
+        LocalValue,
         LocalArms(usize),
+        MatchHeader,
+        MatchArms,
         Show,
-        ByWaitFirst(Option<usize>),
-        ByBlock { base_col: usize, stmt_assign: bool },
+        ByWaitFirst { enclosing_col: usize, line: usize },
+        ByBlock { base_col: usize, inline: bool },
     }
     let col_at = |idx: usize| cmd[cmd[..idx].rfind('\n').map_or(0, |k| k + 1)..idx].chars().count();
     let bytes = cmd.as_bytes();
     let (mut paren, mut bracket, mut brace, mut strict_brace) = (0i32, 0i32, 0i32, 0i32);
     let (mut i, lead_ws) = (0usize, cmd.len() - cmd.trim_start().len());
     let mut scopes: Vec<StmtScope> = Vec::new();
-    let (mut seen_colon, mut seen_match, mut at_line_first) = (false, false, false);
+    let (mut seen_colon, mut seen_match, mut at_line_first) = (initial_seen_colon, false, false);
     let mut first_arm_split: Option<usize> = None;
 
     while i < bytes.len() {
@@ -3272,26 +3279,20 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
             let col = col_at(i);
             while match scopes.last().copied() {
                 Some(StmtScope::ByBlock { base_col, .. }) => col < base_col,
-                Some(StmtScope::ByWaitFirst(Some(mc))) => col <= mc,
+                Some(StmtScope::ByWaitFirst { enclosing_col, .. }) => col <= enclosing_col,
+                Some(StmtScope::LocalValue) => true,
                 Some(StmtScope::LocalArms(ac)) => col <= ac && c != b'|',
                 _ => false,
             } {
                 scopes.pop();
             }
-            if let Some(StmtScope::ByBlock { stmt_assign, .. }) = scopes.last_mut() {
-                *stmt_assign = false;
-            }
         }
-        if depth_zero && seen_colon && matches!(scopes.last(), Some(StmtScope::ByWaitFirst(_))) {
+        if let Some(StmtScope::ByWaitFirst { enclosing_col, line }) = scopes.last().copied().filter(|_| depth_zero && seen_colon) {
             scopes.pop();
-            scopes.push(StmtScope::ByBlock { base_col: col_at(i), stmt_assign: false });
-        }
-        if depth_zero && seen_colon && bytes[i..].starts_with("·".as_bytes()) {
-            if let Some(StmtScope::ByBlock { stmt_assign, .. }) = scopes.last_mut() {
-                *stmt_assign = false;
-            }
-            i += "·".len();
-            continue;
+            // Keep inline blocks conservatively open to the enclosing line's
+            // layout floor: a later arm/continuation may be left of tactic one.
+            let same_line = !cmd[line..i].contains('\n');
+            scopes.push(StmtScope::ByBlock { base_col: if same_line { enclosing_col + 1 } else { col_at(i) }, inline: same_line });
         }
         if let Some(end) = scan_lean_norm_literal_end(cmd, i) {
             i = end;
@@ -3302,10 +3303,10 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
             i += "⦃".len();
             continue;
         }
-        let in_by = matches!(scopes.last(), Some(StmtScope::ByWaitFirst(_) | StmtScope::ByBlock { .. }));
+        let in_by = matches!(scopes.last(), Some(StmtScope::ByWaitFirst { .. } | StmtScope::ByBlock { .. }));
         if depth_zero
             && seen_colon
-            && i > lead_ws
+            && (i > lead_ws || initial_seen_colon)
             && cmd.is_char_boundary(i)
             && cmd[..i].chars().next_back().is_none_or(|ch| !is_lean_ident_continuation(ch) && ch != '.')
         {
@@ -3316,21 +3317,21 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
                         first_arm_split.get_or_insert(i);
                         break;
                     }
-                    "match" if !in_by && scopes.is_empty() => seen_match = true,
-                    "by" => {
-                        let min_col = scopes.iter().rev().find_map(|s| match *s {
-                            StmtScope::LocalBind(col) | StmtScope::LocalArms(col) => Some(col),
-                            StmtScope::ByBlock { base_col, .. } => Some(base_col),
-                            _ => None,
-                        });
-                        scopes.push(StmtScope::ByWaitFirst(min_col));
-                    }
-                    "have" | "haveI" | "let" | "letI" | "let_fun" | "obtain" | "set" | "rcases" if in_by => {
-                        if let Some(StmtScope::ByBlock { stmt_assign, .. }) = scopes.last_mut() {
-                            *stmt_assign = true;
-                        }
-                    }
                     _ if in_by => {}
+                    "match" if scopes.is_empty() => seen_match = true,
+                    "match" => scopes.push(StmtScope::MatchHeader),
+                    "with" if matches!(scopes.last(), Some(StmtScope::MatchHeader)) => {
+                        scopes.pop();
+                        scopes.push(StmtScope::MatchArms);
+                    }
+                    "by" | "do" | "calc" => {
+                        if matches!(scopes.last(), Some(StmtScope::Show)) {
+                            scopes.pop();
+                        }
+                        let line = cmd[..i].rfind('\n').map_or(0, |k| k + 1);
+                        let enclosing_col = cmd[line..].chars().take_while(|c| matches!(c, ' ' | '\t')).count();
+                        scopes.push(StmtScope::ByWaitFirst { enclosing_col, line: i });
+                    }
                     "haveI" | "have" | "letI" | "let_fun" | "let" => scopes.push(StmtScope::LocalBind(col_at(i))),
                     "show" => scopes.push(StmtScope::Show),
                     "from" if matches!(scopes.last(), Some(StmtScope::Show | StmtScope::LocalBind(_) | StmtScope::LocalArms(_))) => {
@@ -3350,36 +3351,29 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
             b'{' => brace += 1,
             b'}' => brace = (brace - 1).max(0),
             b';' if depth_zero && seen_colon => {
-                while matches!(scopes.last(), Some(StmtScope::LocalArms(_))) {
+                // An inline tactic term used as a local binding's type can end
+                // at the semicolon; do not unwind an enclosing arm as well.
+                if matches!(scopes.last(), Some(StmtScope::ByBlock { inline: true, .. }))
+                    && matches!(scopes.iter().rev().nth(1), Some(StmtScope::LocalBind(_)))
+                {
                     scopes.pop();
                 }
-                if let Some(StmtScope::ByBlock { stmt_assign, .. }) = scopes.last_mut() {
-                    *stmt_assign = false;
+                if matches!(scopes.last(), Some(StmtScope::LocalValue | StmtScope::LocalArms(_))) {
+                    scopes.pop();
                 }
             }
             b':' if depth_zero => {
                 if bytes.get(i + 1) == Some(&b'=') {
-                    while matches!(scopes.last(), Some(StmtScope::Show | StmtScope::LocalArms(_))) {
+                    while matches!(scopes.last(), Some(StmtScope::Show | StmtScope::LocalArms(_) | StmtScope::LocalValue | StmtScope::MatchArms)) {
                         scopes.pop();
-                    }
-                    loop {
-                        match scopes.last_mut() {
-                            Some(StmtScope::ByBlock { stmt_assign, .. }) if *stmt_assign => {
-                                *stmt_assign = false;
-                                break;
-                            }
-                            Some(StmtScope::ByBlock { .. } | StmtScope::ByWaitFirst(_)) => {
-                                scopes.pop();
-                            }
-                            _ => break,
-                        }
                     }
                     if matches!(scopes.last(), Some(StmtScope::ByBlock { .. })) {
                         i += 2;
                         continue;
                     }
-                    if matches!(scopes.last(), Some(StmtScope::LocalBind(_))) {
+                    if let Some(StmtScope::LocalBind(_)) = scopes.last().copied() {
                         scopes.pop();
+                        scopes.push(StmtScope::LocalValue);
                         i += 2;
                         continue;
                     }
@@ -8831,7 +8825,7 @@ fn binder_group_has_complete_explicit_type(inner: &str) -> bool {
                     let lhs = &inner[..i];
                     let rhs = &inner[i + 1..];
                     // Split off optional `:= default_val` at top level of the binder group.
-                    let (ty_slice, def_opt) = split_at_top_level_assign(rhs)
+                    let (ty_slice, def_opt) = split_at_top_level_assign_inner(rhs, true)
                         .map_or((rhs, None), |(ty, def_v)| (ty, Some(def_v)));
                     if !binder_lhs_all_valid_binder_names(lhs) {
                         return false;
@@ -14356,17 +14350,72 @@ public def api := by
             "let _x : Nat := by\n      have _f : Nat → P | _ => hp\n      exact 0\n    P",
             "let x : let n := 1; Fin n := ⟨0, by decide⟩\n    x.val = 0",
             "let _x : by skip; exact Nat := 0\n    P",
+            "let _x : by\n      skip; exact Nat\n    := 0\n    P",
             "let _x : show Type from Nat := 0\n    P",
             "have _h : show Prop from True := trivial\n    P",
             "let f : Nat → Nat | _ => 0\n    f 1 = 0",
             "let f : Nat → Nat\n      | 0 => 0\n      | n + 1 => n\n    f 1 = 0",
+            // B1: match alternatives belong to the binding's type, not its value.
+            "let x : match b with | true => Nat | false => Nat := 0; x = 0",
+            "let x : match b with\n      | true => Nat\n      | false => Nat\n      := 0\n    x = 0",
+            "let x : match b with | true => match c with | true => Nat | false => Nat | false => Nat := 0; P",
+            // B2/B3: all assignments inside an indented tactic block are local.
+            "have h : P := by\n      let n : Nat\n        := 0\n      have h :\n        P := hp\n      exact h\n    P",
+            "have h : P := by\n      let x : let n := 1; Fin n := ⟨0, by decide⟩\n      replace h := hp\n      have' h := hp\n      let' x := 0\n      exact h\n    P",
+            "have h : P := by\n      calc\n        a = b := h1\n        _ = c := h2\n    P",
+            "have h : P := by\n      run_tac do\n        let mut x := 0\n        x := x + 1\n      exact hp\n    P",
+            "let x := do\n      let mut n := 0\n      n := n + 1\n      pure n\n    P",
+            "have h := calc\n      a = b := h1\n      _ = c := h2\n    P",
+            // B4/B5: inline first tactics and show ... by respect line layout.
+            "have hq : Q := by cases h with\n      | intro hp hq => exact hq\n    Q",
+            "have h : P := by refine ?_\n      obtain ⟨x⟩ := hx\n      exact hp\n    P",
+            // B6: a nested binding's semicolon does not finish its outer arms.
+            "let f : Nat → Nat\n      | 0 => let y := 1; y\n      | n + 1 => n\n    P",
+            "let f : Bool → Nat | true => 1 | false => 0; P",
+            "let f : Bool → Nat | true => let y := 1; y | false => 0; P",
             "have_lemma my_let haveX let_lemma αhave haveα Foo.have Foo.let .have .let",
         ] {
             let sig = format!("theorem have_lemma (h : (have : P := val; P)) :\n    {ty} ");
             let cmd = format!("{sig}:= by have h := val; let x := val; exact h");
-            let (actual, proof) = split_at_top_level_assign(&cmd).unwrap();
+            let (actual, proof) = split_at_top_level_assign(&cmd).unwrap_or_else(|| panic!("no split: {ty}"));
             assert_eq!(actual, sig, "{ty}");
             assert!(proof.starts_with(" by have h :="));
+        }
+    }
+
+    #[test]
+    fn test_statement_by_layout_and_binder_type_assignment() {
+        for ty in ["show Prop by exact True", "show Prop by\n      exact True"] {
+            let sig = format!("theorem t :\n    {ty}\n    ");
+            let cmd = format!("{sig}:= body");
+            assert_eq!(split_at_top_level_assign(&cmd), Some((sig.as_str(), " body")));
+        }
+        for indent in ["", "  "] {
+            for tactic in [
+                "cases h with\n  | intro hp hq => exact hq",
+                "refine ?_\n  obtain ⟨x⟩ := hx\n  exact hp",
+                "\n  let n : Nat\n    := 0\n  have h :\n    P := hp\n  exact h",
+            ] {
+                let ty = format!("have h : P := by {tactic}")
+                    .replace('\n', &format!("\n{indent}"));
+                let sig = format!("theorem t :\n{indent}{ty}\n{indent}P\n{indent}");
+                let cmd = format!("{sig}:=\n  body");
+                assert_eq!(split_at_top_level_assign(&cmd), Some((sig.as_str(), "\n  body")), "{cmd}");
+            }
+        }
+        // B7: the binder colon was already consumed before scanning its type.
+        for rhs in [
+            "let n := 1; Fin n",
+            "let n := 1; Fin n := zero",
+            "let n := 1; Fin n := _",
+            "let n := 1; Fin n :=",
+        ] {
+            let binder = format!("x : {rhs}");
+            assert_eq!(binder_group_has_complete_explicit_type(&binder), !rhs.ends_with(['_', '=']), "{binder}");
+            let (ty, default) = split_at_top_level_assign_inner(rhs, true)
+                .map_or((rhs, None), |(ty, value)| (ty, Some(value)));
+            assert_eq!(ty.trim(), "let n := 1; Fin n");
+            assert_eq!(default.is_some(), rhs.matches(":=").count() == 2);
         }
     }
 
