@@ -25,6 +25,23 @@ import LeanRV64D.VmemPtw
 import LeanRV64D.VmemTlb
 import LeanRV64D.Mem
 import LeanRV64D.Vmem
+import LeanRV64D.PmpRegs
+import LeanRV64D.PmpControl
+import LeanRV64D.Pma
+import LeanRV64D.RangeUtil
+import LeanRV64D.Platform
+import LeanRV64D.PlatformConfig
+import LeanRV64D.SysExceptions
+import LeanRV64D.InterruptRegs
+import LeanRV64D.ZicfilpRegs
+import LeanRV64D.FdextRegs
+import LeanRV64D.Classify
+import LeanRV64D.FloatClassify
+import LeanRV64D.FextInsts
+import LeanRV64D.DextInsts
+import LeanRV64D.ZfhInsts
+import LeanRV64D.Callbacks
+import LeanRV64D.Callbacks0
 
 /-!
 # Stage 3E / Milestone `M5` RV64 Formal Bisimulation against `opencompl/sail-riscv-lean`
@@ -36,7 +53,10 @@ word multiplication/division/remainder (`MUL`, `MULH`, `MULHSU`, `MULHU`, `MULW`
 ALU/shift/`LUI`/`AUIPC`/branch/`JAL`/`JALR` fragment, RV64 Zba/Zbb/Zbs bit-manipulation
 instructions, RV64I Load/Store memory (`LB`/`LBU`/`LH`/`LHU`/`LW`/`LWU`/`LD` & `SB`/`SH`/`SW`/`SD`),
 RVC compressed (`Zca` / `Zcb` / RV64C) instructions, and RV64A (`Zaamo` / `Zacas` / `Zalrsc`),
-`Zicsr` / privileged-mode checks, and `Sv39` / `Sv48` virtual-memory PTE/SATP/TLB semantics directly
+`Zicsr` / privileged-mode checks, `Sv39` / `Sv48` virtual-memory PTE/SATP/TLB + full multi-level
+`ptw_step` / `translateAddr` page-table walk, M/S trap/interrupt delegation + `MRET` / `SRET`
+trap-return, and RV64F / RV64D floating-point state, IEEE-754 classification, rounding/exception
+flags, and pure `SailM` instruction semantics directly
 against upstream `opencompl/sail-riscv-lean` (`Lean_RV64D` + `Sail`) on `leanprover/lean4:v4.29.0`,
 avoiding monolithic `LeanRV64D.InstsEnd` / `LeanRV64D.Step` / `LeanRV64D.ZicsrInsts` /
 `LeanRV64D.RiscvExtras` imports so incremental elaboration stays lightweight and axiom-clean.
@@ -5002,5 +5022,5403 @@ theorem rv64SfenceVmaAndTlbLookup_bisim_sail (asid : BitVec 16) (vpn : BitVec 27
       have hk45 : k < 45 := by simpa using hk
       unfold zero_extend sign_extend Sail.BitVec.zeroExtend Sail.BitVec.signExtend ones sail_ones
       simp [hk45]
+
+/-! ## Section 14: PMP/PMA Checks, PTE Read/Write/Update, Multi-Level `Sv39`/`Sv48` Page-Table Walk, TLB Hit/Miss & `translateAddr` -/
+
+def rv64DefaultRamPma : PMA :=
+  { mem_type := .MainMemory
+    cacheable := true
+    coherent := true
+    executable := true
+    readable := true
+    writable := true
+    read_idempotent := true
+    write_idempotent := true
+    misaligned_exceptions :=
+      { load_store := none
+        vector := none
+        amo := .AlignmentException }
+    atomic_support := .AMOCASD
+    reservability := .RsrvEventual
+    supports_cbo_zero := true
+    supports_pte_read := true
+    supports_pte_write := true
+    misaligned_atomicity_granule_size_exp := 0
+    vector_misaligned_atomicity_granule_size_exp := 0 }
+
+def rv64HighRamRegion : PMA_Region :=
+  { base := 0x80000000#64
+    size := 0x80000000#64
+    attributes := rv64DefaultRamPma
+    include_in_device_tree := true }
+
+def rv64StandardPtwRegs (s : SequentialState RegisterType trivialChoiceSource)
+    (adue : BitVec 1) : Prop :=
+  s.regs.get? .pma_regions = some [rv64HighRamRegion] ∧
+  s.regs.get? .pmpcfg_n =
+    some (vectorUpdate (vectorInit (n := 64) 0#8) 0 0b00011111#8) ∧
+  s.regs.get? .pmpaddr_n =
+    some (vectorUpdate (vectorInit (n := 64) 0#64) 0 (BitVec.allOnes 64)) ∧
+  s.regs.get? .htif_tohost_base = some none ∧
+  s.regs.get? .misa = some ((0b10#64 <<< 62) ||| (1#64 <<< 18) ||| (1#64 <<< 20)) ∧
+  s.regs.get? .menvcfg = some (if adue == 1#1 then (1#64 <<< 61) else 0#64)
+
+private theorem matching_pma_high_ram_eight (paddr : BitVec 64)
+    (hlo : 0x80000000 ≤ paddr.toNat) (hhi : paddr.toNat + 8 ≤ 0x100000000) :
+    matching_pma_region [rv64HighRamRegion] (.Physaddr paddr) 8 = some rv64HighRamRegion := by
+  have hr : range_subset paddr 8#64 0x80000000#64 0x80000000#64 = true := by
+    unfold range_subset zopz0zIzJ_u Sail.BitVec.toNatInt
+    have hsub1 : (paddr - 0x80000000#64).toNat = paddr.toNat - 0x80000000 := by
+      rw [BitVec.toNat_sub_of_le]
+      · simp
+      · rw [BitVec.le_def]; simpa using hlo
+    have hsub2 : (paddr + 8#64 - 0x80000000#64).toNat = paddr.toNat + 8 - 0x80000000 := by
+      have hpadd : (paddr + 8#64).toNat = paddr.toNat + 8 := by
+        rw [BitVec.toNat_add]
+        simp only [BitVec.toNat_ofNat]
+        omega
+      rw [BitVec.toNat_sub_of_le]
+      · simp [hpadd]
+      · rw [BitVec.le_def, hpadd]; simp; omega
+    have hb : (0x80000000#64 + 0x80000000#64 - 0x80000000#64 : BitVec 64).toNat = 0x80000000 := by decide
+    simp only [Int.ofNat_eq_natCast, Bool.and_eq_true, decide_eq_true_eq, hsub1, hsub2, hb]
+    omega
+  unfold matching_pma_region matching_pma_region_bits_range bits_of_physaddr rv64HighRamRegion
+    zero_extend Sail.BitVec.zeroExtend
+  dsimp only [BitVec.zeroExtend]
+  have htb : to_bits (l := 64) 8 = 8#64 := by decide
+  rw [if_pos (by simpa [BitVec.setWidth_eq, htb] using hr)]
+
+private theorem pmpCheck_high_ram_supervisor (paddr : BitVec 64) (width : Nat)
+    (hw : width = 8) (hhi : paddr.toNat + 8 ≤ 0x100000000)
+    (access : MemoryAccessType mem_payload)
+    (hacc : access = .Load .PageTableEntry ∨ access = .Store .PageTableEntry)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hpmpcfg : s.regs.get? .pmpcfg_n =
+      some (vectorUpdate (vectorInit (n := 64) 0#8) 0 0b00011111#8))
+    (hpmpaddr : s.regs.get? .pmpaddr_n =
+      some (vectorUpdate (vectorInit (n := 64) 0#64) 0 (BitVec.allOnes 64))) :
+    (pmpCheck (.Physaddr paddr) width access .Supervisor).run s = .ok none s := by
+  subst hw
+  have hcfg0 : (vectorUpdate (vectorInit (n := 64) 0#8) 0 0b00011111#8)[0]! = 0b00011111#8 := by decide
+  have haddr0 : (vectorUpdate (vectorInit (n := 64) 0#64) 0 (BitVec.allOnes 64))[0]! = BitVec.allOnes 64 := by decide
+  have hmatch : (pmpMatchAddr (.Physaddr paddr) 8#64 0b00011111#8 (BitVec.allOnes 64) 0#64).run s =
+      .ok .PMP_Match s := by
+    unfold pmpMatchAddr
+    have hmtype : pmpAddrMatchType_encdec_backwards (_get_Pmpcfg_ent_A 0b00011111#8) = .NAPOT := rfl
+    rw [hmtype]
+    dsimp only [Pure.pure, EStateM.pure, EStateM.run]
+    have hbegNat : (BitVec.toNatInt
+        (BitVec.allOnes 64 &&& Complement.complement (BitVec.allOnes 64 ^^^ BitVec.addInt (BitVec.allOnes 64) 1)) * 4).toNat = 0 := by decide
+    have hendNat : ((BitVec.toNatInt
+        (BitVec.allOnes 64 &&& Complement.complement (BitVec.allOnes 64 ^^^ BitVec.addInt (BitVec.allOnes 64) 1)) +
+          BitVec.toNatInt (BitVec.allOnes 64 ^^^ BitVec.addInt (BitVec.allOnes 64) 1) + 1) * 4).toNat = 73786976294838206464 := by decide
+    have hwNat : (BitVec.toNatInt 8#64).toNat = 8 := by decide
+    rw [hbegNat, hendNat, hwNat]
+    unfold pmpRangeMatch
+    congr 1
+    simp only [Sail.BitVec.toNatInt, Int.ofNat_eq_natCast, Int.toNat_natCast]
+    have hhiPhys : (CoeT.coe paddr : physaddrbits).toNat + 8 ≤ 0x100000000 := by
+      dsimp only [CoeT.coe]
+      have hw64 : 2 ^ (if decide (64 = 32) = true then 34 else 64) = 2 ^ 64 := rfl
+      rw [BitVec.toNat_setWidth, hw64, Nat.mod_eq_of_lt paddr.isLt]
+      exact hhi
+    have hcPow : (2 ^ if decide (64 = 32) = true then 34 else 64) = 18446744073709551616 := by decide
+    rw [if_neg (by
+          simp only [Bool.or_eq_true, decide_eq_true_eq, not_or]
+          omega),
+        if_pos (by
+          simp only [Bool.and_eq_true, decide_eq_true_eq]
+          omega)]
+  have hrwx : (pmpCheckRWX 0b00011111#8 access).run s = .ok true s := by
+    rcases hacc with rfl | rfl <;> rfl
+  unfold pmpCheck sys_pmp_count pmpReadAddrReg sys_pmp_grain
+  have hsc0 : ((16 : Int) == 0) = false := by decide
+  rw [if_neg (by simp [hsc0])]
+  dsimp only
+  have htb8 : to_bits (l := 64) 8 = 8#64 := by decide
+  rw [htb8]
+  dsimp only [ForIn.forIn, ForIn'.forIn', IntRange.forIn']
+  unfold IntRange.forIn'.loop
+  simp only [Membership.mem]
+  have hmem0 : (if (1 : Int) > 0 then (0 : Int) ≤ 0 ∧ (0 : Int) ≤ (16 : Int) -i 1 else (16 : Int) -i 1 ≤ 0 ∧ (0 : Int) ≤ 0) ∧
+      ((0 : Int) - 0) % 1 = 0 := by decide
+  rw [dif_pos hmem0]
+  rw [if_neg (by decide)]
+  dsimp only [SailME.run, PreSail.PreSailME.run, SailME.throw, PreSail.PreSailME.throw,
+    MonadExceptOf.throw, MonadExcept.throw, ExceptT.run, ExceptT.mk,
+    ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+    MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+    Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+    readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+  rw [hpmpcfg]
+  dsimp only [EStateM.pure, EStateM.bind, EStateM.map, EStateM.get, ExceptT.bindCont]
+  rw [hpmpcfg]
+  dsimp only [EStateM.pure, EStateM.bind, EStateM.get]
+  rw [hpmpaddr]
+  dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+  have hi0 : Int.toNat 0 = 0 := rfl
+  have hget0 : (vectorUpdate (vectorInit (n := 64) 0#8) 0 0b00011111#8)[(0 : Int)]! = 0b00011111#8 := hcfg0
+  simp only [hi0, hcfg0, haddr0, hget0]
+  have hb1 : BitVec.access (_get_Pmpcfg_ent_A 0b00011111#8) 1 = 1#1 := by decide
+  have hz64 : zeros (n := 64) = 0#64 := rfl
+  have hge2 : ((0 : Nat) ≥b 2) = false := by decide
+  rw [hb1, hz64, hge2, if_neg (by decide)]
+  simp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+  dsimp only [EStateM.run] at hmatch hrwx
+  rw [hmatch]
+  dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+  rw [hrwx]
+  rfl
+
+private theorem within_mmio_high_ram_width_false (paddr : BitVec 64) (width : Nat)
+    (hlo : 0x80000000 ≤ paddr.toNat)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hhtif : s.regs.get? .htif_tohost_base = some none) :
+    (within_clint (.Physaddr paddr) width).run s = .ok false s ∧
+    (within_sig (.Physaddr paddr) width).run s = .ok false s ∧
+    (within_htif_writable (.Physaddr paddr) width).run s = .ok false s ∧
+    (within_mmio_readable (.Physaddr paddr) width).run s = .ok false s ∧
+    (within_mmio_writable (.Physaddr paddr) width).run s = .ok false s := by
+  have hp : BitVec.toNatInt ((physaddr.Physaddr paddr).1) = (paddr.toNat : Int) := rfl
+  have hclint : (within_clint (.Physaddr paddr) width).run s = .ok false s := by
+    unfold within_clint plat_have_clint LeanRV64D.Functions.not
+    have hcb : BitVec.toNatInt plat_clint_base = 33554432 := by decide
+    have hcs : BitVec.toNatInt plat_clint_size = 786432 := by decide
+    dsimp only [Pure.pure, EStateM.pure, EStateM.run]
+    rw [if_neg (by decide), hcb, hcs, hp]; congr 1
+    simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not]; right; omega
+  have hsig : (within_sig (.Physaddr paddr) width).run s = .ok false s := by
+    unfold within_sig plat_have_sig LeanRV64D.Functions.not
+    have hsb : BitVec.toNatInt plat_sig_base = 201326592 := by decide
+    have hss : BitVec.toNatInt plat_sig_size = 32 := by decide
+    dsimp only [Pure.pure, EStateM.pure, EStateM.run]
+    rw [if_neg (by decide), hsb, hss, hp]; congr 1
+    simp only [Bool.and_eq_false_iff, decide_eq_false_iff_not]; right; omega
+  have hhtif_w : (within_htif_writable (.Physaddr paddr) width).run s = .ok false s := by
+    unfold within_htif_writable
+    simp [readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+    dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.get, EStateM.pure, EStateM.run]
+    rw [hhtif]; rfl
+  refine ⟨hclint, hsig, hhtif_w, ?_, ?_⟩
+  · unfold within_mmio_readable within_htif_readable get_config_rvfi
+    dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hclint hsig hhtif_w ⊢
+    rw [hclint]; dsimp only; rw [hsig]; dsimp only; rw [hhtif_w]; rfl
+  · unfold within_mmio_writable get_config_rvfi
+    dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hclint hsig hhtif_w ⊢
+    rw [hclint]; dsimp only; rw [hsig]; dsimp only; rw [hhtif_w]; rfl
+
+private theorem within_mmio_high_ram_false (paddr : BitVec 64)
+    (hlo : 0x80000000 ≤ paddr.toNat)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hhtif : s.regs.get? .htif_tohost_base = some none) :
+    (within_mmio_readable (.Physaddr paddr) 8).run s = .ok false s ∧
+    (within_mmio_writable (.Physaddr paddr) 8).run s = .ok false s :=
+  let ⟨_, _, _, hr, hw⟩ := within_mmio_high_ram_width_false paddr 8 hlo s hhtif; ⟨hr, hw⟩
+
+theorem rv64PmpAndPmaCheck_bisim_sail (paddr : BitVec 64) (adue : BitVec 1)
+    (hlo : 0x80000000 ≤ paddr.toNat) (hhi : paddr.toNat + 8 ≤ 0x100000000)
+    (halign : paddr.toNat % 8 = 0)
+    (s sEmpty : SequentialState RegisterType trivialChoiceSource)
+    (hstd : rv64StandardPtwRegs s adue)
+    (hempty : sEmpty.regs.get? .pma_regions = some []) :
+    pmpRangeMatch 0x80000000 0x80001000 0x80000000 8 = .PMP_Match ∧
+    pmpRangeMatch 0x80000000 0x80001000 0x80000ffc 8 = .PMP_PartialMatch ∧
+    pmpRangeMatch 0x80000000 0x80001000 0x80001000 8 = .PMP_NoMatch ∧
+    (pmaCheck (.Physaddr paddr) 8 (.Load .PageTableEntry) .PBMT_PMA false).run sEmpty =
+      .ok (.Err (.E_Load_Access_Fault ())) sEmpty ∧
+    (phys_access_check (.Load .PageTableEntry) .PBMT_PMA .Supervisor (.Physaddr paddr) 8 false).run s =
+      .ok (.Ok { splittable := .CannotSplit, granule_size_exp := 0 }) s ∧
+    (check_pma_with_pmp_priority (.Store .PageTableEntry) .PBMT_PMA .Supervisor (.Physaddr paddr) 8 false).run s =
+      .ok (.Ok { splittable := .CannotSplit, granule_size_exp := 0 }) s := by
+  rcases hstd with ⟨hpma, hpmpcfg, hpmpaddr, _, _, _⟩
+  have hpmaMatch := matching_pma_high_ram_eight paddr hlo hhi
+  have hal : is_aligned_paddr (.Physaddr paddr) 8 = true := by
+    unfold is_aligned_paddr Sail.BitVec.toNatInt
+    rw [beq_iff_eq]
+    have hdiv : (paddr.toNat : Int) % 8 = 0 := by omega
+    simpa [Int.tmod_eq_emod_of_nonneg (Int.natCast_nonneg _)] using hdiv
+  have hpmaLoad : (pmaCheck (.Physaddr paddr) 8 (.Load .PageTableEntry) .PBMT_PMA false).run s =
+      .ok (.Ok { splittable := .CannotSplit, granule_size_exp := 0 }) s := by
+    unfold pmaCheck mag_pma_check is_mag_applicable_access override_PMA LeanRV64D.Functions.not
+    dsimp only [SailME.run, PreSail.PreSailME.run, SailME.throw, PreSail.PreSailME.throw,
+      MonadExceptOf.throw, MonadExcept.throw, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.get, EStateM.pure, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get, assert, PreSail.assert]
+    rw [hpma]
+    dsimp only [EStateM.pure]
+    rw [hpmaMatch]
+    dsimp only [rv64HighRamRegion, rv64DefaultRamPma, EStateM.pure, EStateM.bind, ExceptT.bindCont, Bool.not_false, Bool.not_true]
+    rw [hal]
+    rfl
+  have hpmaStore : (pmaCheck (.Physaddr paddr) 8 (.Store .PageTableEntry) .PBMT_PMA false).run s =
+      .ok (.Ok { splittable := .CannotSplit, granule_size_exp := 0 }) s := by
+    unfold pmaCheck mag_pma_check is_mag_applicable_access override_PMA LeanRV64D.Functions.not
+    dsimp only [SailME.run, PreSail.PreSailME.run, SailME.throw, PreSail.PreSailME.throw,
+      MonadExceptOf.throw, MonadExcept.throw, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.get, EStateM.pure, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get, assert, PreSail.assert]
+    rw [hpma]
+    dsimp only [EStateM.pure]
+    rw [hpmaMatch]
+    dsimp only [rv64HighRamRegion, rv64DefaultRamPma, EStateM.pure, EStateM.bind, ExceptT.bindCont, Bool.not_false, Bool.not_true]
+    rw [hal]
+    rfl
+  have hr1 : pmpRangeMatch 0x80000000 0x80001000 0x80000000 8 = .PMP_Match := rfl
+  have hr2 : pmpRangeMatch 0x80000000 0x80001000 0x80000ffc 8 = .PMP_PartialMatch := rfl
+  have hr3 : pmpRangeMatch 0x80000000 0x80001000 0x80001000 8 = .PMP_NoMatch := rfl
+  refine ⟨hr1, hr2, hr3, ?_, ?_, ?_⟩
+  · unfold pmaCheck matching_pma_region matching_pma_region_bits_range accessFaultFromAccessType
+    dsimp only [SailME.run, PreSail.PreSailME.run, SailME.throw, PreSail.PreSailME.throw,
+      MonadExceptOf.throw, MonadExcept.throw, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.get, EStateM.pure, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+    rw [hempty]
+    rfl
+  · have hpmp := pmpCheck_high_ram_supervisor paddr 8 rfl hhi (.Load .PageTableEntry) (.inl rfl) s hpmpcfg hpmpaddr
+    unfold phys_access_check
+    dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hpmp hpmaLoad ⊢
+    rw [hpmp]; dsimp only; exact hpmaLoad
+  · unfold check_pma_with_pmp_priority
+    dsimp [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hpmaStore ⊢
+    rw [hpmaStore]; rfl
+
+private theorem currentlyEnabled_ptw_std_run (adue : BitVec 1)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hstd : rv64StandardPtwRegs s adue) :
+    (currentlyEnabled .Ext_Svadu).run s = .ok true s ∧
+    (currentlyEnabled .Ext_Svade).run s = .ok true s ∧
+    (currentlyEnabled .Ext_Svpbmt).run s = .ok true s ∧
+    (currentlyEnabled .Ext_Svnapot).run s = .ok true s ∧
+    (currentlyEnabled .Ext_Svrsw60t59b).run s = .ok true s := by
+  rcases hstd with ⟨_, _, _, _, hmisa, _⟩
+  have hzicsr : (currentlyEnabled .Ext_Zicsr).run s = .ok true s := by
+    unfold currentlyEnabled hartSupports; rfl
+  have hs : (currentlyEnabled .Ext_S).run s = .ok true s := by
+    unfold currentlyEnabled hartSupports
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get,
+      EStateM.run, readReg, PreSail.readReg, get, getThe, MonadStateOf.get, Bool.true_and]
+    rw [hmisa]
+    dsimp only [EStateM.pure]
+    dsimp only [EStateM.run] at hzicsr
+    rw [hzicsr]
+    have hmS : (_get_Misa_S ((0b10#64 <<< 62) ||| (1#64 <<< 18) ||| (1#64 <<< 20)) == 1#1) = true := by decide
+    rw [hmS]; rfl
+  have hsv39 : (currentlyEnabled .Ext_Sv39).run s = .ok true s := by
+    unfold currentlyEnabled hartSupports
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run, Bool.true_and]
+    dsimp only [EStateM.run] at hs
+    rw [hs]; rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_⟩
+  · unfold currentlyEnabled hartSupports; rfl
+  · unfold currentlyEnabled hartSupports; rfl
+  · unfold currentlyEnabled hartSupports
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run, Bool.true_and]
+    dsimp only [EStateM.run] at hsv39; rw [hsv39]; rfl
+  · unfold currentlyEnabled hartSupports
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run, Bool.true_and]
+    dsimp only [EStateM.run] at hsv39; rw [hsv39]; rfl
+  · unfold currentlyEnabled hartSupports
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run, Bool.true_and]
+    dsimp only [EStateM.run] at hsv39; rw [hsv39]; rfl
+
+private theorem write_pte_std_run (paddr : BitVec 64) (pte : BitVec 64) (adue : BitVec 1)
+    (hlo : 0x80000000 ≤ paddr.toNat) (hhi : paddr.toNat + 8 ≤ 0x100000000)
+    (halign : paddr.toNat % 8 = 0)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hstd : rv64StandardPtwRegs s adue) :
+    (write_pte (.Physaddr paddr) 8 pte).run s =
+      .ok (.Ok true) { s with mem := rv64WriteMemBytesSpec 8 paddr.toNat pte s.mem } := by
+  rcases hstd with ⟨hpma, hpmpcfg, hpmpaddr, hhtif, _, _⟩
+  have hpmaMatch := matching_pma_high_ram_eight paddr hlo hhi
+  have hal : is_aligned_paddr (.Physaddr paddr) 8 = true := by
+    unfold is_aligned_paddr Sail.BitVec.toNatInt
+    rw [beq_iff_eq]
+    have hdiv : (paddr.toNat : Int) % 8 = 0 := by omega
+    simpa [Int.tmod_eq_emod_of_nonneg (Int.natCast_nonneg _)] using hdiv
+  have hmmio := within_mmio_high_ram_false paddr hlo s hhtif
+  have hpmaStore : (check_pma_with_pmp_priority (.Store .PageTableEntry) .PBMT_PMA .Supervisor (.Physaddr paddr) 8 false).run s =
+      .ok (.Ok { splittable := .CannotSplit, granule_size_exp := 0 }) s := by
+    unfold check_pma_with_pmp_priority pmaCheck mag_pma_check is_mag_applicable_access override_PMA LeanRV64D.Functions.not
+    dsimp only [SailME.run, PreSail.PreSailME.run, SailME.throw, PreSail.PreSailME.throw,
+      MonadExceptOf.throw, MonadExcept.throw, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.get, EStateM.pure, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get, assert, PreSail.assert]
+    rw [hpma]
+    dsimp only [EStateM.pure]
+    rw [hpmaMatch]
+    dsimp only [rv64HighRamRegion, rv64DefaultRamPma, EStateM.pure, EStateM.bind, ExceptT.bindCont, Bool.not_false, Bool.not_true]
+    rw [hal]; rfl
+  have hsplit : (split_misaligned (.Physaddr paddr) 8 0 .CannotSplit).run s = .ok (1, 8) s := by
+    unfold split_misaligned
+    dsimp [Pure.pure, EStateM.pure, EStateM.run]
+    rfl
+  have hpmpStore := pmpCheck_high_ram_supervisor paddr 8 rfl hhi (.Store .PageTableEntry) (.inr rfl) s hpmpcfg hpmpaddr
+  have hramWrite := write_ram_plain_bisim_sail 8 paddr pte s
+  have hpadd0 : physaddr.Physaddr (@BitVec.addInt (if decide (64 = 32) = true then 34 else 64) paddr 0) = physaddr.Physaddr paddr := by
+    unfold Sail.BitVec.addInt
+    congr 1
+    exact BitVec.add_zero paddr
+  unfold write_pte mem_write_value_priv mem_write_value_priv_meta checked_mem_write
+    misaligned_order sys_misaligned_order_decreasing write_kind_of_flags bits_of_physaddr
+    untilFuelM untilFuelM.go mem_write_callback default_meta
+  dsimp only [SailME.run, PreSail.PreSailME.run, SailME.throw, PreSail.PreSailME.throw,
+    MonadExceptOf.throw, MonadExcept.throw, ExceptT.run, ExceptT.mk,
+    ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+    MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+    Bind.bind, Pure.pure, EStateM.bind, EStateM.get, EStateM.pure, EStateM.run,
+    assert, PreSail.assert]
+  dsimp only [EStateM.run] at hpmaStore hsplit hpmpStore hmmio hramWrite
+  rw [hpmaStore]
+  dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+  rw [hsplit]
+  have htoNat0 : Int.toNat 0 = 0 := rfl
+  have htoNat1 : Int.toNat 1 = 1 := rfl
+  have htoNat8 : Int.toNat 8 = 8 := rfl
+  simp only [Bool.false_eq_true, ite_false, htoNat0, htoNat1, htoNat8, untilFuelM.go, if_true]
+  dsimp only [ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+    EStateM.bind, EStateM.pure, EStateM.map, BitVec.setWidth_eq]
+  have hmul0 : ((0 : Nat) : Int) * 8 = 0 := rfl
+  rw [hmul0, hpadd0, hpmpStore]
+  dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+  rw [hmmio.2]
+  simp only [Bool.false_eq_true, ite_false]
+  dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+  have hfst0 : (if false = true then ((1 : Int) - 1, (0 : Int), (-1 : Int)) else (0, 1 - 1, 1)).fst = 0 := rfl
+  have hidxHi : (8 * (((0 : Nat) : Int) + 1) * 8 - 1).toNat = 63 := rfl
+  have hidxLo : (8 * ((0 : Nat) : Int) * 8).toNat = 0 := rfl
+  have hext : BitVec.setWidth (8 * 8)
+      (Sail.BitVec.extractLsb (BitVec.setWidth (8 * 8) pte) 63 0) = pte := by
+    unfold Sail.BitVec.extractLsb
+    ext j hj
+    simp [BitVec.extractLsb]
+  rw [hfst0, htoNat0, hidxHi, hidxLo, htoNat8, hext, hramWrite]
+  dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont, Bool.true_and]
+  rfl
+
+private theorem read_pte_std_run (paddr : BitVec 64) (pte : BitVec 64) (adue : BitVec 1)
+    (hlo : 0x80000000 ≤ paddr.toNat) (hhi : paddr.toNat + 8 ≤ 0x100000000)
+    (halign : paddr.toNat % 8 = 0)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hstd : rv64StandardPtwRegs s adue)
+    (hmem : rv64ReadMemBytesSpec 8 paddr.toNat s.mem = some pte) :
+    (read_pte (.Physaddr paddr) 8).run s = .ok (.Ok pte) s := by
+  rcases hstd with ⟨hpma, hpmpcfg, hpmpaddr, hhtif, _, _⟩
+  have hpmaMatch := matching_pma_high_ram_eight paddr hlo hhi
+  have hal : is_aligned_paddr (.Physaddr paddr) 8 = true := by
+    unfold is_aligned_paddr Sail.BitVec.toNatInt
+    rw [beq_iff_eq]
+    have hdiv : (paddr.toNat : Int) % 8 = 0 := by omega
+    simpa [Int.tmod_eq_emod_of_nonneg (Int.natCast_nonneg _)] using hdiv
+  have hmmio := within_mmio_high_ram_false paddr hlo s hhtif
+  have hpmaLoad : (check_pma_with_pmp_priority (.Load .PageTableEntry) .PBMT_PMA .Supervisor (.Physaddr paddr) 8 false).run s =
+      .ok (.Ok { splittable := .CannotSplit, granule_size_exp := 0 }) s := by
+    unfold check_pma_with_pmp_priority pmaCheck mag_pma_check is_mag_applicable_access override_PMA LeanRV64D.Functions.not
+    dsimp only [SailME.run, PreSail.PreSailME.run, SailME.throw, PreSail.PreSailME.throw,
+      MonadExceptOf.throw, MonadExcept.throw, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.get, EStateM.pure, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get, assert, PreSail.assert]
+    rw [hpma]
+    dsimp only [EStateM.pure]
+    rw [hpmaMatch]
+    dsimp only [rv64HighRamRegion, rv64DefaultRamPma, EStateM.pure, EStateM.bind, ExceptT.bindCont, Bool.not_false, Bool.not_true]
+    rw [hal]; rfl
+  have hsplit : (split_misaligned (.Physaddr paddr) 8 0 .CannotSplit).run s = .ok (1, 8) s := by
+    unfold split_misaligned
+    dsimp [Pure.pure, EStateM.pure, EStateM.run]
+    rfl
+  have hpmpLoad := pmpCheck_high_ram_supervisor paddr 8 rfl hhi (.Load .PageTableEntry) (.inl rfl) s hpmpcfg hpmpaddr
+  have hramRead := read_ram_plain_bisim_sail 8 paddr pte s hmem
+  have hpadd0 : physaddr.Physaddr (@BitVec.addInt (if decide (64 = 32) = true then 34 else 64) paddr 0) = physaddr.Physaddr paddr := by
+    unfold Sail.BitVec.addInt
+    congr 1
+    exact BitVec.add_zero paddr
+  unfold read_pte mem_read_priv mem_read_priv_meta checked_mem_read MemoryOpResult_drop_meta
+    misaligned_order sys_misaligned_order_decreasing read_kind_of_flags bits_of_physaddr
+    untilFuelM untilFuelM.go mem_read_callback default_meta
+  dsimp only [SailME.run, PreSail.PreSailME.run, SailME.throw, PreSail.PreSailME.throw,
+    MonadExceptOf.throw, MonadExcept.throw, ExceptT.run, ExceptT.mk,
+    ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+    MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+    Bind.bind, Pure.pure, EStateM.bind, EStateM.get, EStateM.pure, EStateM.run,
+    assert, PreSail.assert]
+  dsimp only [EStateM.run] at hpmaLoad hsplit hpmpLoad hmmio hramRead
+  rw [hpmaLoad]
+  dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+  rw [hsplit]
+  have htoNat0 : Int.toNat 0 = 0 := rfl
+  have htoNat1 : Int.toNat 1 = 1 := rfl
+  have htoNat8 : Int.toNat 8 = 8 := rfl
+  simp only [Bool.false_eq_true, ite_false, htoNat0, htoNat1, htoNat8, untilFuelM.go, if_true]
+  dsimp only [ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+    EStateM.bind, EStateM.pure, EStateM.map, BitVec.setWidth_eq]
+  have hmul0 : ((0 : Nat) : Int) * 8 = 0 := rfl
+  rw [hmul0, hpadd0, hpmpLoad]
+  dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+  rw [hmmio.1]
+  simp only [Bool.false_eq_true, ite_false]
+  dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+  have hfst0 : (if false = true then ((1 : Int) - 1, (0 : Int), (-1 : Int)) else (0, 1 - 1, 1)).fst = 0 := rfl
+  have hsub0 : ((1 : Int) - 1).toNat = 0 := rfl
+  have hidxHi : (8 * (((0 : Nat) : Int) + 1) * 8 - 1).toNat = 63 := rfl
+  have hidxLo : (8 * ((0 : Nat) : Int) * 8).toNat = 0 := rfl
+  have hw64 : (8 * 1 * 8 : Int).toNat = 64 := rfl
+  rw [hfst0, htoNat0, htoNat8, hramRead]
+  dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+  have heq0 : ((0 : Nat) == 0) = true := rfl
+  rw [hsub0, heq0, if_pos rfl]
+  dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+  have hupd : BitVec.setWidth 64
+      (BitVec.updateSubrange (BitVec.setWidth 64 (zeros (n := 64)))
+        63 0 (BitVec.setWidth (63 - 0 + 1) pte)) = pte := by
+    unfold Sail.BitVec.updateSubrange Sail.BitVec.updateSubrange' zeros
+    ext j hj
+    simp
+  rw [htoNat1, hw64, hidxHi, hidxLo, hupd]
+  rfl
+
+theorem rv64ReadWritePte_bisim_sail (paddr : BitVec 64) (pte : BitVec 64) (adue : BitVec 1)
+    (hlo : 0x80000000 ≤ paddr.toNat) (hhi : paddr.toNat + 8 ≤ 0x100000000)
+    (halign : paddr.toNat % 8 = 0)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hstd : rv64StandardPtwRegs s adue)
+    (hmem : rv64ReadMemBytesSpec 8 paddr.toNat s.mem = some pte) :
+    (read_pte (.Physaddr paddr) 8).run s = .ok (.Ok pte) s ∧
+    (write_pte (.Physaddr paddr) 8 pte).run s =
+      .ok (.Ok true) { s with mem := rv64WriteMemBytesSpec 8 paddr.toNat pte s.mem } :=
+  ⟨read_pte_std_run paddr pte adue hlo hhi halign s hstd hmem,
+   write_pte_std_run paddr pte adue hlo hhi halign s hstd⟩
+
+theorem rv64UpdateAndWritePte_bisim_sail (paddr : BitVec 64)
+    (hlo : 0x80000000 ≤ paddr.toNat) (hhi : paddr.toNat + 8 ≤ 0x100000000)
+    (halign : paddr.toNat % 8 = 0)
+    (s0 s1 : SequentialState RegisterType trivialChoiceSource)
+    (hstd0 : rv64StandardPtwRegs s0 0#1)
+    (hstd1 : rv64StandardPtwRegs s1 1#1) :
+    (update_and_write_pte (.Physaddr paddr) 8 0x00000000200000c7#64 (.Store .Data)).run s0 =
+      .ok (.Ok none) s0 ∧
+    (update_and_write_pte (.Physaddr paddr) 8 0x0000000020000007#64 (.Store .Data)).run s0 =
+      .ok (.Err (.PTW_PTE_Needs_Update ())) s0 ∧
+    (update_and_write_pte (.Physaddr paddr) 8 0x0000000020000007#64 (.Store .Data)).run s1 =
+      .ok (.Ok (some 0x00000000200000c7#64))
+        { s1 with mem := rv64WriteMemBytesSpec 8 paddr.toNat 0x00000000200000c7#64 s1.mem } ∧
+    (update_and_write_pte (.Physaddr paddr) 8 0x0000000020000007#64 (.Load .Data)).run s1 =
+      .ok (.Ok (some 0x0000000020000047#64))
+        { s1 with mem := rv64WriteMemBytesSpec 8 paddr.toNat 0x0000000020000047#64 s1.mem } := by
+  have hc0 := (currentlyEnabled_ptw_std_run 0#1 s0 hstd0).1
+  have hc0e := (currentlyEnabled_ptw_std_run 0#1 s0 hstd0).2.1
+  have hc1 := (currentlyEnabled_ptw_std_run 1#1 s1 hstd1).1
+  have hc1e := (currentlyEnabled_ptw_std_run 1#1 s1 hstd1).2.1
+  have hm0 := hstd0.2.2.2.2.2
+  have hm1 := hstd1.2.2.2.2.2
+  have hu_none : update_PTE_Bits 0x00000000200000c7#64 (.Store .Data) = none := by decide
+  have hu_store : update_PTE_Bits 0x0000000020000007#64 (.Store .Data) = some 0x00000000200000c7#64 := by decide
+  have hu_load : update_PTE_Bits 0x0000000020000007#64 (.Load .Data) = some 0x0000000020000047#64 := by decide
+  have hwStore := write_pte_std_run paddr 0x00000000200000c7#64 1#1 hlo hhi halign s1 hstd1
+  have hwLoad := write_pte_std_run paddr 0x0000000020000047#64 1#1 hlo hhi halign s1 hstd1
+  refine ⟨?_, ?_, ?_, ?_⟩
+  · unfold update_and_write_pte
+    rw [hu_none]; rfl
+  · unfold update_and_write_pte LeanRV64D.Functions.not
+    rw [hu_store]
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get] at hc0 hc0e ⊢
+    rw [hc0]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.get]
+    rw [hm0]
+    dsimp only [EStateM.pure]
+    rw [hc0]
+    dsimp only
+    rw [hc0e]
+    have hadue0 : (_get_MEnvcfg_ADUE (if (0#1 == 1#1) = true then 1#64 <<< 61 else 0#64) == 1#1) = false := by decide
+    rw [hadue0]
+    rfl
+  · unfold update_and_write_pte LeanRV64D.Functions.not
+    rw [hu_store]
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get] at hc1 hc1e hwStore ⊢
+    rw [hc1]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.get]
+    rw [hm1]
+    dsimp only [EStateM.pure]
+    rw [hc1]
+    dsimp only
+    rw [hc1e]
+    have hadue1 : (_get_MEnvcfg_ADUE (if (1#1 == 1#1) = true then 1#64 <<< 61 else 0#64) == 1#1) = true := by decide
+    rw [hadue1]
+    simp only [Bool.and_self, Bool.not_true, Bool.or_false, ite_true, EStateM.bind]
+    rw [hwStore]; rfl
+  · unfold update_and_write_pte LeanRV64D.Functions.not
+    rw [hu_load]
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get] at hc1 hc1e hwLoad ⊢
+    rw [hc1]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.get]
+    rw [hm1]
+    dsimp only [EStateM.pure]
+    rw [hc1]
+    dsimp only
+    rw [hc1e]
+    have hadue1 : (_get_MEnvcfg_ADUE (if (1#1 == 1#1) = true then 1#64 <<< 61 else 0#64) == 1#1) = true := by decide
+    rw [hadue1]
+    simp only [Bool.and_self, Bool.not_true, Bool.or_false, ite_true, EStateM.bind]
+    rw [hwLoad]; rfl
+
+private def pteIsInvalidStdSpec (pte_flags : BitVec 8) (pte_ext : BitVec 10) : Bool :=
+  ((_get_PTE_Flags_V pte_flags) == 0#1) ||
+    ((((_get_PTE_Flags_R pte_flags) == 0#1) &&
+      (((_get_PTE_Flags_W pte_flags) == 1#1) &&
+        (((_get_PTE_Flags_X pte_flags) == 0#1) && true))) ||
+    ((((_get_PTE_Flags_R pte_flags) == 0#1) &&
+      (((_get_PTE_Flags_W pte_flags) == 1#1) && ((_get_PTE_Flags_X pte_flags) == 1#1))) ||
+    (((LeanRV64D.Functions.not (page_based_mem_type_forwards_matches (_get_PTE_Ext_PBMT pte_ext))) && true) ||
+    (pte_reserved_bits_must_be_zero &&
+      (((pte_is_non_leaf pte_flags) &&
+        (((_get_PTE_Flags_A pte_flags) == 1#1) ||
+          (((_get_PTE_Flags_D pte_flags) == 1#1) ||
+            (((_get_PTE_Flags_U pte_flags) == 1#1) || (pte_ext != (zeros (n := 10))))))) ||
+      ((((_get_PTE_Ext_N pte_ext) != (zeros (n := 1))) && (LeanRV64D.Functions.not true)) ||
+        ((((_get_PTE_Ext_PBMT pte_ext) != (zeros (n := 2))) &&
+          (true || (LeanRV64D.Functions.not (page_based_mem_type_forwards_matches (_get_PTE_Ext_PBMT pte_ext))))) ||
+        ((((_get_PTE_Ext_RSW_60t59b pte_ext) != (zeros (n := 2))) && (LeanRV64D.Functions.not true)) ||
+          ((_get_PTE_Ext_reserved pte_ext) != (zeros (n := 5)))))))))))
+
+private theorem pte_is_invalid_std_run (pte_flags : BitVec 8) (pte_ext : BitVec 10) (adue : BitVec 1)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hstd : rv64StandardPtwRegs s adue) :
+    (pte_is_invalid pte_flags pte_ext).run s = .ok (pteIsInvalidStdSpec pte_flags pte_ext) s := by
+  have hce := currentlyEnabled_ptw_std_run adue s hstd
+  rcases hce with ⟨_, _, hpbmt, hnapot, hrsw⟩
+  have hm := hstd.2.2.2.2.2
+  have hsse : (_get_MEnvcfg_SSE (if (adue == 1#1) = true then 1#64 <<< 61 else 0#64) == 0#1) = true := by
+    cases (adue == 1#1) <;> decide
+  have hpbmte : (_get_MEnvcfg_PBMTE (if (adue == 1#1) = true then 1#64 <<< 61 else 0#64) == 0#1) = true := by
+    cases (adue == 1#1) <;> decide
+  unfold pte_is_invalid pteIsInvalidStdSpec
+  dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+    readReg, PreSail.readReg, get, getThe, MonadStateOf.get] at hpbmt hnapot hrsw ⊢
+  rw [hm]
+  dsimp only [EStateM.pure]
+  rw [hpbmt]
+  dsimp only
+  rw [hnapot]
+  dsimp only
+  rw [hm]
+  dsimp only [EStateM.pure]
+  rw [hrsw]
+  simp only [hsse, hpbmte]
+
+private theorem read_pte_pow_std_run (sv_width : Nat) (hsv : sv_width = 39 ∨ sv_width = 48)
+    (paddr : BitVec 64) (pte : BitVec 64) (adue : BitVec 1)
+    (hlo : 0x80000000 ≤ paddr.toNat) (hhi : paddr.toNat + 8 ≤ 0x100000000)
+    (halign : paddr.toNat % 8 = 0)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hstd : rv64StandardPtwRegs s adue)
+    (hmem : rv64ReadMemBytesSpec 8 paddr.toNat s.mem = some pte) :
+    (read_pte (.Physaddr paddr)
+      (Int.toNat ((2 : Int) ^ (↑(if (sv_width == 32 : Bool) then (2 : Nat) else 3) : Int)))).run s =
+      .ok (.Ok (@BitVec.setWidth 64
+        (8 * Int.toNat ((2 : Int) ^ (↑(if (sv_width == 32 : Bool) then (2 : Nat) else 3) : Int))) pte)) s := by
+  rcases hsv with rfl | rfl <;> exact read_pte_std_run paddr pte adue hlo hhi halign s hstd hmem
+
+theorem pt_walk_nonleaf_step (sv_width : Nat) (hsv : sv_width = 39 ∨ sv_width = 48)
+    (vpn : BitVec (sv_width - 12)) (access : MemoryAccessType mem_payload)
+    (priv : Privilege) (mxr do_sum : Bool)
+    (pt_base : BitVec (if (sv_width = 32 : Bool) then 22 else 44))
+    (level : Nat) (hlev : (level >b 0) = true)
+    (global : Bool) (paddr : BitVec 64) (pte : BitVec 64) (adue : BitVec 1)
+    (hpaddr : zero_extend (m := 64)
+      (pt_base +++ (Sail.BitVec.extractLsb vpn
+        ((((level : Int) + 1) * (if (sv_width == 32 : Bool) then 10 else 9) - 1).toNat)
+        (((level : Int) * (if (sv_width == 32 : Bool) then 10 else 9)).toNat) +++
+        zeros (n := if (sv_width == 32 : Bool) then 2 else 3))) = paddr)
+    (hlo : 0x80000000 ≤ paddr.toNat) (hhi : paddr.toNat + 8 ≤ 0x100000000)
+    (halign : paddr.toNat % 8 = 0)
+    (hinv : pteIsInvalidStdSpec (Mk_PTE_Flags (Sail.BitVec.extractLsb pte 7 0)) (ext_bits_of_PTE pte) = false)
+    (hnonleaf : pte_is_non_leaf (Mk_PTE_Flags (Sail.BitVec.extractLsb pte 7 0)) = true)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hstd : rv64StandardPtwRegs s adue)
+    (hmem : rv64ReadMemBytesSpec 8 paddr.toNat s.mem = some pte) :
+    (pt_walk sv_width vpn access priv mxr do_sum pt_base level global ()).run s =
+      (pt_walk sv_width vpn access priv mxr do_sum
+        (BitVec.setWidth (if (sv_width = 32 : Bool) then 22 else 44) (PPN_of_PTE pte))
+        (level -i 1).toNat
+        (global || (_get_PTE_Flags_G (Mk_PTE_Flags (Sail.BitVec.extractLsb pte 7 0)) == 1#1)) ()).run s := by
+  have hread := read_pte_pow_std_run sv_width hsv paddr pte adue hlo hhi halign s hstd hmem
+  have hinvRun := pte_is_invalid_std_run (Mk_PTE_Flags (Sail.BitVec.extractLsb pte 7 0)) (ext_bits_of_PTE pte) adue s hstd
+  rw [hinv] at hinvRun
+  rcases hsv with rfl | rfl
+  · rw [pt_walk.eq_1]
+    have hxlen : ((39 == 32 : Bool) || (LeanRV64D.Functions.xlen == 64)) = true := by decide
+    have hfl : Sail.BitVec.extractLsb (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) pte) 7 0 = Sail.BitVec.extractLsb pte 7 0 := rfl
+    have hextb : ext_bits_of_PTE (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) pte) = ext_bits_of_PTE pte := rfl
+    have hppnb : @BitVec.setWidth _ (if decide (39 = 32) = true then 22 else 44)
+        (PPN_of_PTE (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) pte)) =
+        @BitVec.setWidth _ (if decide (39 = 32) = true then 22 else 44) (PPN_of_PTE pte) := rfl
+    dsimp only [ptw_start_callback, ptw_step_callback,
+      SailME.run, PreSail.PreSailME.run, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run,
+      assert, PreSail.assert]
+    simp only [hxlen, ite_true]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    dsimp only [EStateM.run] at hread hinvRun ⊢
+    rw [hpaddr, hread]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hfl, hextb, hinvRun]
+    simp only [Bool.false_eq_true, ite_false, hnonleaf, ite_true, hlev, hppnb]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    cases hrec : pt_walk 39 vpn access priv mxr do_sum
+      (BitVec.setWidth (if decide (39 = 32) = true then 22 else 44) (PPN_of_PTE pte)) ((level : Int) - 1).toNat
+      (global || (_get_PTE_Flags_G (Mk_PTE_Flags (Sail.BitVec.extractLsb pte 7 0)) == 1#1)) () s <;> rfl
+  · rw [pt_walk.eq_1]
+    have hxlen : ((48 == 32 : Bool) || (LeanRV64D.Functions.xlen == 64)) = true := by decide
+    have hfl : Sail.BitVec.extractLsb (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (48 == 32 : Bool) then (2 : Nat) else 3) : Int))) pte) 7 0 = Sail.BitVec.extractLsb pte 7 0 := rfl
+    have hextb : ext_bits_of_PTE (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (48 == 32 : Bool) then (2 : Nat) else 3) : Int))) pte) = ext_bits_of_PTE pte := rfl
+    have hppnb : @BitVec.setWidth _ (if decide (48 = 32) = true then 22 else 44)
+        (PPN_of_PTE (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (48 == 32 : Bool) then (2 : Nat) else 3) : Int))) pte)) =
+        @BitVec.setWidth _ (if decide (48 = 32) = true then 22 else 44) (PPN_of_PTE pte) := rfl
+    dsimp only [ptw_start_callback, ptw_step_callback,
+      SailME.run, PreSail.PreSailME.run, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run,
+      assert, PreSail.assert]
+    simp only [hxlen, ite_true]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    dsimp only [EStateM.run] at hread hinvRun ⊢
+    rw [hpaddr, hread]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hfl, hextb, hinvRun]
+    simp only [Bool.false_eq_true, ite_false, hnonleaf, ite_true, hlev, hppnb]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    cases hrec : pt_walk 48 vpn access priv mxr do_sum
+      (BitVec.setWidth (if decide (48 = 32) = true then 22 else 44) (PPN_of_PTE pte)) ((level : Int) - 1).toNat
+      (global || (_get_PTE_Flags_G (Mk_PTE_Flags (Sail.BitVec.extractLsb pte 7 0)) == 1#1)) () s <;> rfl
+
+theorem pt_walk_leaf0_step (sv_width : Nat) (hsv : sv_width = 39 ∨ sv_width = 48)
+    (vpn : BitVec (sv_width - 12)) (access : MemoryAccessType mem_payload)
+    (priv : Privilege) (mxr do_sum : Bool)
+    (pt_base : BitVec (if (sv_width = 32 : Bool) then 22 else 44))
+    (global : Bool) (paddr : BitVec 64) (pte : BitVec 64) (adue : BitVec 1)
+    (hpaddr : zero_extend (m := 64)
+      (pt_base +++ (Sail.BitVec.extractLsb vpn
+        (((((0 : Nat) : Int) + 1) * (if (sv_width == 32 : Bool) then 10 else 9) - 1).toNat)
+        ((((0 : Nat) : Int) * (if (sv_width == 32 : Bool) then 10 else 9)).toNat) +++
+        zeros (n := if (sv_width == 32 : Bool) then 2 else 3))) = paddr)
+    (hlo : 0x80000000 ≤ paddr.toNat) (hhi : paddr.toNat + 8 ≤ 0x100000000)
+    (halign : paddr.toNat % 8 = 0)
+    (hinv : pteIsInvalidStdSpec (Mk_PTE_Flags (Sail.BitVec.extractLsb pte 7 0)) (ext_bits_of_PTE pte) = false)
+    (hleaf : pte_is_non_leaf (Mk_PTE_Flags (Sail.BitVec.extractLsb pte 7 0)) = false)
+    (hn0 : (_get_PTE_Ext_N (ext_bits_of_PTE pte) == 1#1) = false)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hstd : rv64StandardPtwRegs s adue)
+    (hmem : rv64ReadMemBytesSpec 8 paddr.toNat s.mem = some pte)
+    (hperm : (check_PTE_permission access priv mxr do_sum (Mk_PTE_Flags (Sail.BitVec.extractLsb pte 7 0))
+      (ext_bits_of_PTE pte) ()).run s = .ok (.PTE_Check_Success ()) s) :
+    (pt_walk sv_width vpn access priv mxr do_sum pt_base 0 global ()).run s =
+      .ok (.Ok ({
+        ppn := BitVec.setWidth (if (sv_width = 32 : Bool) then 22 else 44) (PPN_of_PTE pte)
+        pte := BitVec.setWidth (if (sv_width = 32 : Bool) then 32 else 64) pte
+        pteAddr := .Physaddr paddr
+        level := 0
+        pbmt := .PBMT_PMA
+        global := global || (_get_PTE_Flags_G (Mk_PTE_Flags (Sail.BitVec.extractLsb pte 7 0)) == 1#1)
+      }, ())) s := by
+  have hread := read_pte_pow_std_run sv_width hsv paddr pte adue hlo hhi halign s hstd hmem
+  have hinvRun := pte_is_invalid_std_run (Mk_PTE_Flags (Sail.BitVec.extractLsb pte 7 0)) (ext_bits_of_PTE pte) adue s hstd
+  rw [hinv] at hinvRun
+  have hnapot := (currentlyEnabled_ptw_std_run adue s hstd).2.2.2.1
+  have hm := hstd.2.2.2.2.2
+  have hpbmte : (_get_MEnvcfg_PBMTE (if (adue == 1#1) = true then 1#64 <<< 61 else 0#64) == 0#1) = true := by
+    cases (adue == 1#1) <;> decide
+  have hlev0 : ¬ (((0 : Nat) >b 0) = true) := by decide
+  rcases hsv with rfl | rfl
+  · rw [pt_walk.eq_1]
+    have hxlen : ((39 == 32 : Bool) || (LeanRV64D.Functions.xlen == 64)) = true := by decide
+    have hfl : Sail.BitVec.extractLsb (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) pte) 7 0 = Sail.BitVec.extractLsb pte 7 0 := rfl
+    have hextb : ext_bits_of_PTE (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) pte) = ext_bits_of_PTE pte := rfl
+    have hppn_raw : PPN_of_PTE (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) pte) =
+        @BitVec.setWidth _ (if decide (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int)) = 32) = true then 22 else 44) (PPN_of_PTE pte) := rfl
+    have hpteb : @BitVec.setWidth (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) (if decide (39 = 32) = true then 32 else 64) (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) pte) = @BitVec.setWidth 64 (if decide (39 = 32) = true then 32 else 64) pte := rfl
+    dsimp only [ptw_start_callback, ptw_step_callback, ptw_success_callback,
+      SailME.run, PreSail.PreSailME.run, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get,
+      assert, PreSail.assert]
+    simp only [hxlen, ite_true]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    dsimp only [EStateM.run] at hread hinvRun hperm hnapot ⊢
+    rw [hpaddr, hread]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hfl, hextb, hinvRun]
+    simp only [Bool.false_eq_true, ite_false, hleaf]
+    rw [if_neg hlev0]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hperm]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [if_neg hlev0]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hnapot]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, EStateM.get, ExceptT.bindCont]
+    simp only [hn0, Bool.and_false, Bool.false_eq_true, ite_false]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, EStateM.get, ExceptT.bindCont]
+    rw [hm]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    simp only [hpbmte, ite_true, hpteb]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hppn_raw]
+    exact congrArg (fun p : BitVec (if decide (39 = 32) = true then 22 else 44) =>
+      (EStateM.Result.ok (Ok ({
+        ppn := p
+        pte := @BitVec.setWidth 64 (if decide (39 = 32) = true then 32 else 64) pte
+        pteAddr := .Physaddr paddr
+        level := 0
+        pbmt := .PBMT_PMA
+        global := global || (_get_PTE_Flags_G (Mk_PTE_Flags (Sail.BitVec.extractLsb pte 7 0)) == 1#1)
+      }, ())) s : EStateM.Result (Error exception) (SequentialState RegisterType trivialChoiceSource)
+        (Result (PTW_Output 39 × Unit) (PTW_Error × Unit)))) (by
+      have hlen1 : (if decide (8 * ((2 : Int) ^ (↑(if (39 == 32 : Bool) = true then (2 : Nat) else 3) : Int)).toNat = 32) = true then 22 else 44) = 44 := by decide
+      have hlen2 : (if decide (39 = 32) = true then 22 else 44) = 44 := by decide
+      ext j hj
+      simp only [BitVec.getElem_setWidth, BitVec.getLsbD_setWidth]
+      have hj44 : j < 44 := by omega
+      have hjB : j < (if decide (8 * ((2 : Int) ^ (↑(if (39 == 32 : Bool) = true then (2 : Nat) else 3) : Int)).toNat = 32) = true then 22 else 44) := by omega
+      rw [decide_eq_true hjB, Bool.true_and, Bool.and_eq_right_iff_imp]
+      intro _
+      simp only [Sail.BitVec.length, BitVec.length, decide_eq_true_eq]
+      have hlenNat : (if 8 * ((2 : Int) ^ (↑(if (39 == 32 : Bool) = true then (2 : Nat) else 3) : Int)).toNat = 32 then (22 : Nat) else 44) = 44 := by decide
+      rw [hlenNat]
+      omega)
+  · rw [pt_walk.eq_1]
+    have hxlen : ((48 == 32 : Bool) || (LeanRV64D.Functions.xlen == 64)) = true := by decide
+    have hfl : Sail.BitVec.extractLsb (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (48 == 32 : Bool) then (2 : Nat) else 3) : Int))) pte) 7 0 = Sail.BitVec.extractLsb pte 7 0 := rfl
+    have hextb : ext_bits_of_PTE (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (48 == 32 : Bool) then (2 : Nat) else 3) : Int))) pte) = ext_bits_of_PTE pte := rfl
+    have hppn_raw : PPN_of_PTE (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (48 == 32 : Bool) then (2 : Nat) else 3) : Int))) pte) =
+        @BitVec.setWidth _ (if decide (8 * Int.toNat ((2 : Int) ^ (↑(if (48 == 32 : Bool) then (2 : Nat) else 3) : Int)) = 32) = true then 22 else 44) (PPN_of_PTE pte) := rfl
+    have hpteb : @BitVec.setWidth (8 * Int.toNat ((2 : Int) ^ (↑(if (48 == 32 : Bool) then (2 : Nat) else 3) : Int))) (if decide (48 = 32) = true then 32 else 64) (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (48 == 32 : Bool) then (2 : Nat) else 3) : Int))) pte) = @BitVec.setWidth 64 (if decide (48 = 32) = true then 32 else 64) pte := rfl
+    dsimp only [ptw_start_callback, ptw_step_callback, ptw_success_callback,
+      SailME.run, PreSail.PreSailME.run, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get,
+      assert, PreSail.assert]
+    simp only [hxlen, ite_true]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    dsimp only [EStateM.run] at hread hinvRun hperm hnapot ⊢
+    rw [hpaddr, hread]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hfl, hextb, hinvRun]
+    simp only [Bool.false_eq_true, ite_false, hleaf]
+    rw [if_neg hlev0]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hperm]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [if_neg hlev0]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hnapot]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, EStateM.get, ExceptT.bindCont]
+    simp only [hn0, Bool.and_false, Bool.false_eq_true, ite_false]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, EStateM.get, ExceptT.bindCont]
+    rw [hm]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    simp only [hpbmte, ite_true, hpteb]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hppn_raw]
+    exact congrArg (fun p : BitVec (if decide (48 = 32) = true then 22 else 44) =>
+      (EStateM.Result.ok (Ok ({
+        ppn := p
+        pte := @BitVec.setWidth 64 (if decide (48 = 32) = true then 32 else 64) pte
+        pteAddr := .Physaddr paddr
+        level := 0
+        pbmt := .PBMT_PMA
+        global := global || (_get_PTE_Flags_G (Mk_PTE_Flags (Sail.BitVec.extractLsb pte 7 0)) == 1#1)
+      }, ())) s : EStateM.Result (Error exception) (SequentialState RegisterType trivialChoiceSource)
+        (Result (PTW_Output 48 × Unit) (PTW_Error × Unit)))) (by
+      have hlen1 : (if decide (8 * ((2 : Int) ^ (↑(if (48 == 32 : Bool) = true then (2 : Nat) else 3) : Int)).toNat = 32) = true then 22 else 44) = 44 := by decide
+      have hlen2 : (if decide (48 = 32) = true then 22 else 44) = 44 := by decide
+      ext j hj
+      simp only [BitVec.getElem_setWidth, BitVec.getLsbD_setWidth]
+      have hj44 : j < 44 := by omega
+      have hjB : j < (if decide (8 * ((2 : Int) ^ (↑(if (48 == 32 : Bool) = true then (2 : Nat) else 3) : Int)).toNat = 32) = true then 22 else 44) := by omega
+      rw [decide_eq_true hjB, Bool.true_and, Bool.and_eq_right_iff_imp]
+      intro _
+      simp only [Sail.BitVec.length, BitVec.length, decide_eq_true_eq]
+      have hlenNat : (if 8 * ((2 : Int) ^ (↑(if (48 == 32 : Bool) = true then (2 : Nat) else 3) : Int)).toNat = 32 then (22 : Nat) else 44) = 44 := by decide
+      rw [hlenNat]
+      omega)
+
+private theorem pt_walk_sv39_4k_std_run (adue : BitVec 1)
+    (s4k : SequentialState RegisterType trivialChoiceSource)
+    (hstd4k : rv64StandardPtwRegs s4k adue)
+    (h4k_l2 : rv64ReadMemBytesSpec 8 0x80001008 s4k.mem = some 0x0000000020000801#64)
+    (h4k_l1 : rv64ReadMemBytesSpec 8 0x80002010 s4k.mem = some 0x0000000020000c01#64)
+    (h4k_l0 : rv64ReadMemBytesSpec 8 0x80003018 s4k.mem = some 0x00000000200400c7#64) :
+    (pt_walk 39 0x0040403#27 (.Load .Data) .Supervisor false false 0x00000080001#44 2 false ()).run s4k =
+      .ok (.Ok ({
+        ppn := 0x00000080100#44
+        pte := 0x00000000200400c7#64
+        pteAddr := .Physaddr 0x0000000080003018#64
+        level := 0
+        pbmt := .PBMT_PMA
+        global := false
+      }, ())) s4k := by
+  have hs2 := pt_walk_nonleaf_step 39 (.inl rfl) 0x0040403#27 (.Load .Data) .Supervisor false false
+    0x00000080001#44 2 (by decide) false 0x0000000080001008#64 0x0000000020000801#64 adue
+    (by decide) (by decide) (by decide) (by decide) (by decide) (by decide) s4k hstd4k h4k_l2
+  have hs1 := pt_walk_nonleaf_step 39 (.inl rfl) 0x0040403#27 (.Load .Data) .Supervisor false false
+    (@BitVec.setWidth 44 (if (39 = 32 : Bool) then 22 else 44) 0x00000080002#44) 1 (by decide) false 0x0000000080002010#64 0x0000000020000c01#64 adue
+    (by decide) (by decide) (by decide) (by decide) (by decide) (by decide) s4k hstd4k h4k_l1
+  have hs0 := pt_walk_leaf0_step 39 (.inl rfl) 0x0040403#27 (.Load .Data) .Supervisor false false
+    (@BitVec.setWidth 44 (if (39 = 32 : Bool) then 22 else 44) 0x00000080003#44) false 0x0000000080003018#64 0x00000000200400c7#64 adue
+    (by decide) (by decide) (by decide) (by decide) (by decide) (by decide) (by decide) s4k hstd4k h4k_l0 rfl
+  have hppn2 : @BitVec.setWidth _ (if (39 = 32 : Bool) then 22 else 44) (PPN_of_PTE 0x0000000020000801#64) =
+      @BitVec.setWidth 44 (if (39 = 32 : Bool) then 22 else 44) 0x00000080002#44 := by decide
+  have hppn1 : @BitVec.setWidth _ (if (39 = 32 : Bool) then 22 else 44) (PPN_of_PTE 0x0000000020000c01#64) =
+      @BitVec.setWidth 44 (if (39 = 32 : Bool) then 22 else 44) 0x00000080003#44 := by decide
+  have hppn0 : @BitVec.setWidth _ (if (39 = 32 : Bool) then 22 else 44) (PPN_of_PTE 0x00000000200400c7#64) =
+      (0x00000080100#44 : BitVec (if (39 = 32 : Bool) then 22 else 44)) := by decide
+  have hpte0 : @BitVec.setWidth _ (if (39 = 32 : Bool) then 32 else 64) 0x00000000200400c7#64 =
+      (0x00000000200400c7#64 : BitVec (if (39 = 32 : Bool) then 32 else 64)) := by decide
+  have hg1 : (false || (_get_PTE_Flags_G (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x0000000020000801#64 7 0)) == 1#1)) = false := by decide
+  have hg2 : (false || (_get_PTE_Flags_G (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x0000000020000c01#64 7 0)) == 1#1)) = false := by decide
+  have hg3 : (false || (_get_PTE_Flags_G (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x00000000200400c7#64 7 0)) == 1#1)) = false := by decide
+  have hl2 : ((2 : Nat) -i 1).toNat = 1 := rfl
+  have hl1 : ((1 : Nat) -i 1).toNat = 0 := rfl
+  rw [hs2, hppn2, hl2, hg1, hs1, hppn1, hl1, hg2, hs0, hppn0, hpte0, hg3]
+  rfl
+
+theorem rv64PtWalkSv39_bisim_sail (adue : BitVec 1)
+    (s4k sMega sMis sInv sNoPerm : SequentialState RegisterType trivialChoiceSource)
+    (hstd4k : rv64StandardPtwRegs s4k adue)
+    (hstdMega : rv64StandardPtwRegs sMega adue)
+    (hstdMis : rv64StandardPtwRegs sMis adue)
+    (hstdInv : rv64StandardPtwRegs sInv adue)
+    (hstdNoPerm : rv64StandardPtwRegs sNoPerm adue)
+    (h4k_l2 : rv64ReadMemBytesSpec 8 0x80001008 s4k.mem = some 0x0000000020000801#64)
+    (h4k_l1 : rv64ReadMemBytesSpec 8 0x80002010 s4k.mem = some 0x0000000020000c01#64)
+    (h4k_l0 : rv64ReadMemBytesSpec 8 0x80003018 s4k.mem = some 0x00000000200400c7#64)
+    (hmega_l2 : rv64ReadMemBytesSpec 8 0x80001008 sMega.mem = some 0x0000000020000801#64)
+    (hmega_l1 : rv64ReadMemBytesSpec 8 0x80002010 sMega.mem = some 0x00000000200800c7#64)
+    (hmis_l2 : rv64ReadMemBytesSpec 8 0x80001008 sMis.mem = some 0x0000000020000801#64)
+    (hmis_l1 : rv64ReadMemBytesSpec 8 0x80002010 sMis.mem = some 0x00000000200804c7#64)
+    (hinv_l2 : rv64ReadMemBytesSpec 8 0x80001008 sInv.mem = some 0x0000000000000000#64)
+    (hnop_l0 : rv64ReadMemBytesSpec 8 0x80003018 sNoPerm.mem = some 0x00000000200400d7#64) :
+    (pt_walk 39 0x0040403#27 (.Load .Data) .Supervisor false false 0x00000080001#44 2 false ()).run s4k =
+      .ok (.Ok ({
+        ppn := 0x00000080100#44
+        pte := 0x00000000200400c7#64
+        pteAddr := .Physaddr 0x0000000080003018#64
+        level := 0
+        pbmt := .PBMT_PMA
+        global := false
+      }, ())) s4k ∧
+    (pt_walk 39 0x0040403#27 (.Load .Data) .Supervisor false false 0x00000080001#44 2 false ()).run sMega =
+      .ok (.Ok ({
+        ppn := 0x00000080203#44
+        pte := 0x00000000200800c7#64
+        pteAddr := .Physaddr 0x0000000080002010#64
+        level := 1
+        pbmt := .PBMT_PMA
+        global := false
+      }, ())) sMega ∧
+    (pt_walk 39 0x0040403#27 (.Load .Data) .Supervisor false false 0x00000080001#44 2 false ()).run sMis =
+      .ok (.Err (.PTW_Misaligned (), ())) sMis ∧
+    (pt_walk 39 0x0040403#27 (.Load .Data) .Supervisor false false 0x00000080001#44 2 false ()).run sInv =
+      .ok (.Err (.PTW_Invalid_PTE (), ())) sInv ∧
+    (pt_walk 39 0x0040403#27 (.Load .Data) .Supervisor false false 0x00000080003#44 0 false ()).run sNoPerm =
+      .ok (.Err (.PTW_No_Permission (), ())) sNoPerm := by
+  have hxlen : ((39 == 32 : Bool) || (LeanRV64D.Functions.xlen == 64)) = true := by decide
+  refine ⟨pt_walk_sv39_4k_std_run adue s4k hstd4k h4k_l2 h4k_l1 h4k_l0, ?_, ?_, ?_, ?_⟩
+  · have hs2 := pt_walk_nonleaf_step 39 (.inl rfl) 0x0040403#27 (.Load .Data) .Supervisor false false
+      0x00000080001#44 2 (by decide) false 0x0000000080001008#64 0x0000000020000801#64 adue
+      (by decide) (by decide) (by decide) (by decide) (by decide) (by decide) sMega hstdMega hmega_l2
+    have hppn2 : @BitVec.setWidth _ (if (39 = 32 : Bool) then 22 else 44) (PPN_of_PTE 0x0000000020000801#64) =
+        @BitVec.setWidth 44 (if (39 = 32 : Bool) then 22 else 44) 0x00000080002#44 := by decide
+    have hg1 : (false || (_get_PTE_Flags_G (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x0000000020000801#64 7 0)) == 1#1)) = false := by decide
+    have hl2 : ((2 : Nat) -i 1).toNat = 1 := rfl
+    rw [hs2, hppn2, hl2, hg1]
+    have hread1 := read_pte_pow_std_run 39 (.inl rfl) 0x0000000080002010#64 0x00000000200800c7#64 adue
+      (by decide) (by decide) (by decide) sMega hstdMega hmega_l1
+    have hinv1 := pte_is_invalid_std_run (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x00000000200800c7#64 7 0))
+      (ext_bits_of_PTE 0x00000000200800c7#64) adue sMega hstdMega
+    have hinvVal : pteIsInvalidStdSpec (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x00000000200800c7#64 7 0))
+      (ext_bits_of_PTE 0x00000000200800c7#64) = false := by decide
+    rw [hinvVal] at hinv1
+    have hm := hstdMega.2.2.2.2.2
+    have hpbmte : (_get_MEnvcfg_PBMTE (if (adue == 1#1) = true then 1#64 <<< 61 else 0#64) == 0#1) = true := by
+      cases (adue == 1#1) <;> decide
+    rw [pt_walk.eq_1]
+    have hfl : Sail.BitVec.extractLsb (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) 0x00000000200800c7#64) 7 0 = Sail.BitVec.extractLsb 0x00000000200800c7#64 7 0 := rfl
+    have hextb : ext_bits_of_PTE (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) 0x00000000200800c7#64) = ext_bits_of_PTE 0x00000000200800c7#64 := rfl
+    have hpteb : @BitVec.setWidth (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) (if decide (39 = 32) = true then 32 else 64) (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) 0x00000000200800c7#64) = @BitVec.setWidth 64 (if decide (39 = 32) = true then 32 else 64) 0x00000000200800c7#64 := rfl
+    have hpaddr1 : zero_extend (m := 64)
+      (@BitVec.setWidth (if decide (39 = 32) = true then 22 else 44) (if decide (39 = 32) = true then 22 else 44)
+        (@BitVec.setWidth 44 (if decide (39 = 32) = true then 22 else 44) 0x00000080002#44) +++ (Sail.BitVec.extractLsb 0x0040403#27
+        (((((1 : Nat) : Int) + 1) * (if (39 == 32 : Bool) then 10 else 9) - 1).toNat)
+        ((((1 : Nat) : Int) * (if (39 == 32 : Bool) then 10 else 9)).toNat) +++
+        zeros (n := if (39 == 32 : Bool) then 2 else 3))) = 0x0000000080002010#64 := by decide
+    have hleaf1 : pte_is_non_leaf (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x00000000200800c7#64 7 0)) = false := by decide
+    have hlev1 : ((1 : Nat) >b 0) = true := by decide
+    have halignMega : (Sail.BitVec.extractLsb (PPN_of_PTE (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) 0x00000000200800c7#64))
+        (((if (39 == 32 : Bool) then 10 else 9) * ((1 : Nat) : Int) - 1).toNat) 0 !=
+        BitVec.setWidth (((if (39 == 32 : Bool) then 10 else 9) * ((1 : Nat) : Int) - 1).toNat - 0 + 1)
+          (zeros (n := (((((if (39 == 32 : Bool) then 10 else 9) *i (1 : Nat)) -i 1) -i 0) +i 1).toNat))) = false := by decide
+    have hperm1 : (check_PTE_permission (.Load .Data) .Supervisor false false
+        (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x00000000200800c7#64 7 0))
+        (ext_bits_of_PTE 0x00000000200800c7#64) ()).run sMega = .ok (.PTE_Check_Success ()) sMega := rfl
+    have hn1 : ((_get_PTE_Ext_N (ext_bits_of_PTE 0x00000000200800c7#64) == 1#1) && pte_reserved_bits_must_be_zero) = false := by decide
+    have hsplice : @BitVec.setWidth _ (if (39 = 32 : Bool) then 22 else 44)
+        (Sail.BitVec.extractLsb (PPN_of_PTE (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) 0x00000000200800c7#64))
+          ((BitVec.length (PPN_of_PTE (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) 0x00000000200800c7#64)) : Int) - 1).toNat
+          ((if (39 == 32 : Bool) then 10 else 9) * ((1 : Nat) : Int)).toNat +++
+          Sail.BitVec.extractLsb 0x0040403#27 (((if (39 == 32 : Bool) then 10 else 9) * ((1 : Nat) : Int) - 1).toNat) 0) =
+        (0x00000080203#44 : BitVec (if (39 = 32 : Bool) then 22 else 44)) := by decide
+    have hpteMega : @BitVec.setWidth _ (if (39 = 32 : Bool) then 32 else 64) 0x00000000200800c7#64 =
+        (0x00000000200800c7#64 : BitVec (if (39 = 32 : Bool) then 32 else 64)) := by decide
+    have hgMega : (false || (_get_PTE_Flags_G (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x00000000200800c7#64 7 0)) == 1#1)) = false := by decide
+    dsimp only [ptw_start_callback, ptw_step_callback, ptw_success_callback,
+      SailME.run, PreSail.PreSailME.run, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get,
+      assert, PreSail.assert]
+    simp only [hxlen, ite_true]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    dsimp only [EStateM.run] at hread1 hinv1 hperm1 ⊢
+    rw [hpaddr1, hread1]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hfl, hextb, hinv1]
+    simp only [Bool.false_eq_true, ite_false, hleaf1, hlev1, ite_true, hpteb, halignMega]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hperm1]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    simp only [hn1, Bool.false_eq_true, ite_false]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, EStateM.get, ExceptT.bindCont]
+    rw [hm]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    simp only [hpbmte, ite_true]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hsplice, hpteMega, hgMega]
+    rfl
+  · have hs2 := pt_walk_nonleaf_step 39 (.inl rfl) 0x0040403#27 (.Load .Data) .Supervisor false false
+      0x00000080001#44 2 (by decide) false 0x0000000080001008#64 0x0000000020000801#64 adue
+      (by decide) (by decide) (by decide) (by decide) (by decide) (by decide) sMis hstdMis hmis_l2
+    have hppn2 : @BitVec.setWidth _ (if (39 = 32 : Bool) then 22 else 44) (PPN_of_PTE 0x0000000020000801#64) =
+        @BitVec.setWidth 44 (if (39 = 32 : Bool) then 22 else 44) 0x00000080002#44 := by decide
+    have hg1 : (false || (_get_PTE_Flags_G (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x0000000020000801#64 7 0)) == 1#1)) = false := by decide
+    have hl2 : ((2 : Nat) -i 1).toNat = 1 := rfl
+    rw [hs2, hppn2, hl2, hg1]
+    have hread1 := read_pte_pow_std_run 39 (.inl rfl) 0x0000000080002010#64 0x00000000200804c7#64 adue
+      (by decide) (by decide) (by decide) sMis hstdMis hmis_l1
+    have hinv1 := pte_is_invalid_std_run (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x00000000200804c7#64 7 0))
+      (ext_bits_of_PTE 0x00000000200804c7#64) adue sMis hstdMis
+    have hinvVal : pteIsInvalidStdSpec (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x00000000200804c7#64 7 0))
+      (ext_bits_of_PTE 0x00000000200804c7#64) = false := by decide
+    rw [hinvVal] at hinv1
+    rw [pt_walk.eq_1]
+    have hfl : Sail.BitVec.extractLsb (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) 0x00000000200804c7#64) 7 0 = Sail.BitVec.extractLsb 0x00000000200804c7#64 7 0 := rfl
+    have hextb : ext_bits_of_PTE (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) 0x00000000200804c7#64) = ext_bits_of_PTE 0x00000000200804c7#64 := rfl
+    have hpaddr1 : zero_extend (m := 64)
+      (@BitVec.setWidth (if decide (39 = 32) = true then 22 else 44) (if decide (39 = 32) = true then 22 else 44)
+        (@BitVec.setWidth 44 (if decide (39 = 32) = true then 22 else 44) 0x00000080002#44) +++ (Sail.BitVec.extractLsb 0x0040403#27
+        (((((1 : Nat) : Int) + 1) * (if (39 == 32 : Bool) then 10 else 9) - 1).toNat)
+        ((((1 : Nat) : Int) * (if (39 == 32 : Bool) then 10 else 9)).toNat) +++
+        zeros (n := if (39 == 32 : Bool) then 2 else 3))) = 0x0000000080002010#64 := by decide
+    have hleaf1 : pte_is_non_leaf (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x00000000200804c7#64 7 0)) = false := by decide
+    have hlev1 : ((1 : Nat) >b 0) = true := by decide
+    have hmis : (Sail.BitVec.extractLsb (PPN_of_PTE (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) 0x00000000200804c7#64))
+        (((if (39 == 32 : Bool) then 10 else 9) * ((1 : Nat) : Int) - 1).toNat) 0 !=
+        BitVec.setWidth (((if (39 == 32 : Bool) then 10 else 9) * ((1 : Nat) : Int) - 1).toNat - 0 + 1)
+          (zeros (n := (((((if (39 == 32 : Bool) then 10 else 9) *i (1 : Nat)) -i 1) -i 0) +i 1).toNat))) = true := by decide
+    dsimp only [ptw_start_callback, ptw_step_callback, ptw_fail_callback,
+      SailME.run, PreSail.PreSailME.run, SailME.throw, PreSail.PreSailME.throw,
+      MonadExceptOf.throw, MonadExcept.throw, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run,
+      assert, PreSail.assert]
+    simp only [hxlen, ite_true]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    dsimp only [EStateM.run] at hread1 hinv1 ⊢
+    rw [hpaddr1, hread1]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hfl, hextb, hinv1]
+    simp only [Bool.false_eq_true, ite_false, hleaf1, hlev1, ite_true, hmis]
+    rfl
+  · have hread2 := read_pte_pow_std_run 39 (.inl rfl) 0x0000000080001008#64 0x0000000000000000#64 adue
+      (by decide) (by decide) (by decide) sInv hstdInv hinv_l2
+    have hinv2 := pte_is_invalid_std_run (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x0000000000000000#64 7 0))
+      (ext_bits_of_PTE 0x0000000000000000#64) adue sInv hstdInv
+    have hinvVal : pteIsInvalidStdSpec (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x0000000000000000#64 7 0))
+      (ext_bits_of_PTE 0x0000000000000000#64) = true := by decide
+    rw [hinvVal] at hinv2
+    rw [pt_walk.eq_1]
+    have hfl : Sail.BitVec.extractLsb (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) 0x0000000000000000#64) 7 0 = Sail.BitVec.extractLsb 0x0000000000000000#64 7 0 := rfl
+    have hextb : ext_bits_of_PTE (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) 0x0000000000000000#64) = ext_bits_of_PTE 0x0000000000000000#64 := rfl
+    have hpaddr2 : zero_extend (m := 64)
+      ((let b : BitVec (if decide (39 = 32) = true then 22 else 44) := 0x00000080001#44; b) +++ (Sail.BitVec.extractLsb 0x0040403#27
+        (((((2 : Nat) : Int) + 1) * (if (39 == 32 : Bool) then 10 else 9) - 1).toNat)
+        ((((2 : Nat) : Int) * (if (39 == 32 : Bool) then 10 else 9)).toNat) +++
+        zeros (n := if (39 == 32 : Bool) then 2 else 3))) = 0x0000000080001008#64 := by decide
+    dsimp only [ptw_start_callback, ptw_step_callback, ptw_fail_callback,
+      SailME.run, PreSail.PreSailME.run, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run,
+      assert, PreSail.assert]
+    simp only [hxlen, ite_true]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    dsimp only [EStateM.run] at hread2 hinv2 ⊢
+    rw [hpaddr2, hread2]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hfl, hextb, hinv2]
+    rfl
+  · have hread0 := read_pte_pow_std_run 39 (.inl rfl) 0x0000000080003018#64 0x00000000200400d7#64 adue
+      (by decide) (by decide) (by decide) sNoPerm hstdNoPerm hnop_l0
+    have hinv0 := pte_is_invalid_std_run (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x00000000200400d7#64 7 0))
+      (ext_bits_of_PTE 0x00000000200400d7#64) adue sNoPerm hstdNoPerm
+    have hinvVal : pteIsInvalidStdSpec (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x00000000200400d7#64 7 0))
+      (ext_bits_of_PTE 0x00000000200400d7#64) = false := by decide
+    rw [hinvVal] at hinv0
+    rw [pt_walk.eq_1]
+    have hfl : Sail.BitVec.extractLsb (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) 0x00000000200400d7#64) 7 0 = Sail.BitVec.extractLsb 0x00000000200400d7#64 7 0 := rfl
+    have hextb : ext_bits_of_PTE (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (39 == 32 : Bool) then (2 : Nat) else 3) : Int))) 0x00000000200400d7#64) = ext_bits_of_PTE 0x00000000200400d7#64 := rfl
+    have hpaddr0 : zero_extend (m := 64)
+      ((let b : BitVec (if decide (39 = 32) = true then 22 else 44) := 0x00000080003#44; b) +++ (Sail.BitVec.extractLsb 0x0040403#27
+        (((((0 : Nat) : Int) + 1) * (if (39 == 32 : Bool) then 10 else 9) - 1).toNat)
+        ((((0 : Nat) : Int) * (if (39 == 32 : Bool) then 10 else 9)).toNat) +++
+        zeros (n := if (39 == 32 : Bool) then 2 else 3))) = 0x0000000080003018#64 := by decide
+    have hleaf0 : pte_is_non_leaf (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x00000000200400d7#64 7 0)) = false := by decide
+    have hlev0 : ((0 : Nat) >b 0) = false := by decide
+    have hpermFail : (check_PTE_permission (.Load .Data) .Supervisor false false
+        (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x00000000200400d7#64 7 0))
+        (ext_bits_of_PTE 0x00000000200400d7#64) ()).run sNoPerm =
+        .ok (.PTE_Check_Failure ((), .PTE_No_Permission ())) sNoPerm := rfl
+    dsimp only [ptw_start_callback, ptw_step_callback, ptw_fail_callback,
+      SailME.run, PreSail.PreSailME.run, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run,
+      assert, PreSail.assert]
+    simp only [hxlen, ite_true]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    dsimp only [EStateM.run] at hread0 hinv0 hpermFail ⊢
+    rw [hpaddr0, hread0]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hfl, hextb, hinv0]
+    simp only [Bool.false_eq_true, ite_false, hleaf0, hlev0]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hpermFail]
+    rfl
+
+theorem rv64PtWalkSv48_bisim_sail (adue : BitVec 1)
+    (s4k sInv : SequentialState RegisterType trivialChoiceSource)
+    (hstd4k : rv64StandardPtwRegs s4k adue)
+    (hstdInv : rv64StandardPtwRegs sInv adue)
+    (h4k_l3 : rv64ReadMemBytesSpec 8 0x80000020 s4k.mem = some 0x0000000020000401#64)
+    (h4k_l2 : rv64ReadMemBytesSpec 8 0x80001008 s4k.mem = some 0x0000000020000801#64)
+    (h4k_l1 : rv64ReadMemBytesSpec 8 0x80002010 s4k.mem = some 0x0000000020000c01#64)
+    (h4k_l0 : rv64ReadMemBytesSpec 8 0x80003018 s4k.mem = some 0x00000000200400c7#64)
+    (hinv_l3 : rv64ReadMemBytesSpec 8 0x80000020 sInv.mem = some 0x0000000000000000#64) :
+    (pt_walk 48 0x020040403#36 (.Load .Data) .Supervisor false false 0x00000080000#44 3 false ()).run s4k =
+      .ok (.Ok ({
+        ppn := 0x00000080100#44
+        pte := 0x00000000200400c7#64
+        pteAddr := .Physaddr 0x0000000080003018#64
+        level := 0
+        pbmt := .PBMT_PMA
+        global := false
+      }, ())) s4k ∧
+    (pt_walk 48 0x020040403#36 (.Load .Data) .Supervisor false false 0x00000080000#44 3 false ()).run sInv =
+      .ok (.Err (.PTW_Invalid_PTE (), ())) sInv := by
+  refine ⟨?_, ?_⟩
+  · have hs3 := pt_walk_nonleaf_step 48 (.inr rfl) 0x020040403#36 (.Load .Data) .Supervisor false false
+      0x00000080000#44 3 (by decide) false 0x0000000080000020#64 0x0000000020000401#64 adue
+      (by decide) (by decide) (by decide) (by decide) (by decide) (by decide) s4k hstd4k h4k_l3
+    have hs2 := pt_walk_nonleaf_step 48 (.inr rfl) 0x020040403#36 (.Load .Data) .Supervisor false false
+      (@BitVec.setWidth 44 (if (48 = 32 : Bool) then 22 else 44) 0x00000080001#44) 2 (by decide) false 0x0000000080001008#64 0x0000000020000801#64 adue
+      (by decide) (by decide) (by decide) (by decide) (by decide) (by decide) s4k hstd4k h4k_l2
+    have hs1 := pt_walk_nonleaf_step 48 (.inr rfl) 0x020040403#36 (.Load .Data) .Supervisor false false
+      (@BitVec.setWidth 44 (if (48 = 32 : Bool) then 22 else 44) 0x00000080002#44) 1 (by decide) false 0x0000000080002010#64 0x0000000020000c01#64 adue
+      (by decide) (by decide) (by decide) (by decide) (by decide) (by decide) s4k hstd4k h4k_l1
+    have hs0 := pt_walk_leaf0_step 48 (.inr rfl) 0x020040403#36 (.Load .Data) .Supervisor false false
+      (@BitVec.setWidth 44 (if (48 = 32 : Bool) then 22 else 44) 0x00000080003#44) false 0x0000000080003018#64 0x00000000200400c7#64 adue
+      (by decide) (by decide) (by decide) (by decide) (by decide) (by decide) (by decide) s4k hstd4k h4k_l0 rfl
+    have hppn3 : @BitVec.setWidth _ (if (48 = 32 : Bool) then 22 else 44) (PPN_of_PTE 0x0000000020000401#64) =
+        @BitVec.setWidth 44 (if (48 = 32 : Bool) then 22 else 44) 0x00000080001#44 := by decide
+    have hppn2 : @BitVec.setWidth _ (if (48 = 32 : Bool) then 22 else 44) (PPN_of_PTE 0x0000000020000801#64) =
+        @BitVec.setWidth 44 (if (48 = 32 : Bool) then 22 else 44) 0x00000080002#44 := by decide
+    have hppn1 : @BitVec.setWidth _ (if (48 = 32 : Bool) then 22 else 44) (PPN_of_PTE 0x0000000020000c01#64) =
+        @BitVec.setWidth 44 (if (48 = 32 : Bool) then 22 else 44) 0x00000080003#44 := by decide
+    have hppn0 : @BitVec.setWidth _ (if (48 = 32 : Bool) then 22 else 44) (PPN_of_PTE 0x00000000200400c7#64) =
+        (0x00000080100#44 : BitVec (if (48 = 32 : Bool) then 22 else 44)) := by decide
+    have hpte0 : @BitVec.setWidth _ (if (48 = 32 : Bool) then 32 else 64) 0x00000000200400c7#64 =
+        (0x00000000200400c7#64 : BitVec (if (48 = 32 : Bool) then 32 else 64)) := by decide
+    have hg0 : (false || (_get_PTE_Flags_G (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x0000000020000401#64 7 0)) == 1#1)) = false := by decide
+    have hg1 : (false || (_get_PTE_Flags_G (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x0000000020000801#64 7 0)) == 1#1)) = false := by decide
+    have hg2 : (false || (_get_PTE_Flags_G (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x0000000020000c01#64 7 0)) == 1#1)) = false := by decide
+    have hg3 : (false || (_get_PTE_Flags_G (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x00000000200400c7#64 7 0)) == 1#1)) = false := by decide
+    have hl3 : ((3 : Nat) -i 1).toNat = 2 := rfl
+    have hl2 : ((2 : Nat) -i 1).toNat = 1 := rfl
+    have hl1 : ((1 : Nat) -i 1).toNat = 0 := rfl
+    rw [hs3, hppn3, hl3, hg0, hs2, hppn2, hl2, hg1, hs1, hppn1, hl1, hg2, hs0, hppn0, hpte0, hg3]
+    rfl
+  · have hread3 := read_pte_pow_std_run 48 (.inr rfl) 0x0000000080000020#64 0x0000000000000000#64 adue
+      (by decide) (by decide) (by decide) sInv hstdInv hinv_l3
+    have hinv3 := pte_is_invalid_std_run (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x0000000000000000#64 7 0))
+      (ext_bits_of_PTE 0x0000000000000000#64) adue sInv hstdInv
+    have hinvVal : pteIsInvalidStdSpec (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x0000000000000000#64 7 0))
+      (ext_bits_of_PTE 0x0000000000000000#64) = true := by decide
+    rw [hinvVal] at hinv3
+    rw [pt_walk.eq_1]
+    have hxlen : ((48 == 32 : Bool) || (LeanRV64D.Functions.xlen == 64)) = true := by decide
+    have hfl : Sail.BitVec.extractLsb (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (48 == 32 : Bool) then (2 : Nat) else 3) : Int))) 0x0000000000000000#64) 7 0 = Sail.BitVec.extractLsb 0x0000000000000000#64 7 0 := rfl
+    have hextb : ext_bits_of_PTE (@BitVec.setWidth 64 (8 * Int.toNat ((2 : Int) ^ (↑(if (48 == 32 : Bool) then (2 : Nat) else 3) : Int))) 0x0000000000000000#64) = ext_bits_of_PTE 0x0000000000000000#64 := rfl
+    have hpaddr3 : zero_extend (m := 64)
+      ((let b : BitVec (if decide (48 = 32) = true then 22 else 44) := 0x00000080000#44; b) +++ (Sail.BitVec.extractLsb 0x020040403#36
+        (((((3 : Nat) : Int) + 1) * (if (48 == 32 : Bool) then 10 else 9) - 1).toNat)
+        ((((3 : Nat) : Int) * (if (48 == 32 : Bool) then 10 else 9)).toNat) +++
+        zeros (n := if (48 == 32 : Bool) then 2 else 3))) = 0x0000000080000020#64 := by decide
+    dsimp only [ptw_start_callback, ptw_step_callback, ptw_fail_callback,
+      SailME.run, PreSail.PreSailME.run, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run,
+      assert, PreSail.assert]
+    simp only [hxlen, ite_true]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    dsimp only [EStateM.run] at hread3 hinv3 ⊢
+    rw [hpaddr3, hread3]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hfl, hextb, hinv3]
+    rfl
+
+def rv64Sv39TlbEntry4k (asid : BitVec 16) (pte : BitVec 64) : TLB_Entry :=
+  { asid := asid
+    global := false
+    pte := pte
+    pteAddr := .Physaddr 0x0000000080003018#64
+    levelMask := 0#45
+    vpn := sign_extend (m := 45) 0x0040403#27
+    ppn := 0x00000080100#44 }
+
+theorem rv64TranslateTlbHitAndMiss_bisim_sail
+    (sEmpty sHitClean sHitDirty sMiss : SequentialState RegisterType trivialChoiceSource)
+    (htlbEmpty : sEmpty.regs.get? .tlb = some (vectorInit (n := 64) none))
+    (htlbHit : sHitClean.regs.get? .tlb =
+      some (vectorUpdate (vectorInit (n := 64) none) 3 (some (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64))))
+    (hstdHitDirty : rv64StandardPtwRegs sHitDirty 1#1)
+    (htlbDirty : sHitDirty.regs.get? .tlb =
+      some (vectorUpdate (vectorInit (n := 64) none) 3 (some (rv64Sv39TlbEntry4k 0x0001#16 0x0000000020040007#64))))
+    (hstdMiss : rv64StandardPtwRegs sMiss 0#1)
+    (htlbMiss : sMiss.regs.get? .tlb = some (vectorInit (n := 64) none))
+    (hmiss_l2 : rv64ReadMemBytesSpec 8 0x80001008 sMiss.mem = some 0x0000000020000801#64)
+    (hmiss_l1 : rv64ReadMemBytesSpec 8 0x80002010 sMiss.mem = some 0x0000000020000c01#64)
+    (hmiss_l0 : rv64ReadMemBytesSpec 8 0x80003018 sMiss.mem = some 0x00000000200400c7#64) :
+    (lookup_TLB 39 0x0001#16 0x0040403#27).run sEmpty = .ok none sEmpty ∧
+    (lookup_TLB 39 0x0001#16 0x0040403#27).run sHitClean =
+      .ok (some (3, rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64)) sHitClean ∧
+    (lookup_TLB 39 0x0002#16 0x0040403#27).run sHitClean = .ok none sHitClean ∧
+    (translate_TLB_hit 39 0x0001#16 0x0040403#27 (.Load .Data) .Supervisor false false () 3
+        (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64)).run sHitClean =
+      .ok (.Ok (0x00000080100#44, .PBMT_PMA, ())) sHitClean ∧
+    (translate_TLB_hit 39 0x0001#16 0x0040403#27 (.Load .Data) .Supervisor false false () 3
+        (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400d7#64)).run sHitClean =
+      .ok (.Err (.PTW_No_Permission (), ())) sHitClean ∧
+    (let sAfterWrite := { sHitDirty with mem := rv64WriteMemBytesSpec 8 0x80003018 0x00000000200400c7#64 sHitDirty.mem }
+     let tlbUpdated := vectorUpdate (vectorUpdate (vectorInit (n := 64) none) 3
+       (some (rv64Sv39TlbEntry4k 0x0001#16 0x0000000020040007#64))) 3
+       (some (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64))
+     (translate_TLB_hit 39 0x0001#16 0x0040403#27 (.Store .Data) .Supervisor false false () 3
+        (rv64Sv39TlbEntry4k 0x0001#16 0x0000000020040007#64)).run sHitDirty =
+      .ok (.Ok (0x00000080100#44, .PBMT_PMA, ())) { sAfterWrite with regs := sAfterWrite.regs.insert .tlb tlbUpdated }) ∧
+    (let tlbFilled := vectorUpdate (vectorInit (n := 64) none) 3
+       (some (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64))
+     (translate_TLB_miss 39 0x0001#16 0x00000080001#44 0x0040403#27 (.Load .Data) .Supervisor false false ()).run sMiss =
+      .ok (.Ok (0x00000080100#44, .PBMT_PMA, ()))
+        { sMiss with regs := (sMiss.regs.insert .tlb tlbFilled) }) := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · unfold lookup_TLB
+    have hidx : tlb_hash 39 0x0040403#27 = 3 := by decide
+    have hget : (vectorInit (n := 64) (none : Option TLB_Entry))[3]! = none := by
+      unfold vectorInit; simp
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+    rw [htlbEmpty]
+    dsimp only [EStateM.pure]
+    rw [hidx, hget]
+    rfl
+  · unfold lookup_TLB
+    have hidx : tlb_hash 39 0x0040403#27 = 3 := by decide
+    have hget : (vectorUpdate (vectorInit (n := 64) (none : Option TLB_Entry)) 3
+        (some (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64)))[3]! =
+        some (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64) := by
+      unfold vectorUpdate vectorInit Vector.set!
+      simp [GetElem?.getElem!, decidableGetElem?]
+    have hmatch : match_TLB_Entry (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64) 0x0001#16
+        (sign_extend (m := (57 -i 12)) 0x0040403#27) = true := by decide
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+    rw [htlbHit]
+    dsimp only [EStateM.pure]
+    rw [hidx, hget]
+    dsimp only
+    rw [hmatch]
+    rfl
+  · unfold lookup_TLB
+    have hidx : tlb_hash 39 0x0040403#27 = 3 := by decide
+    have hget : (vectorUpdate (vectorInit (n := 64) (none : Option TLB_Entry)) 3
+        (some (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64)))[3]! =
+        some (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64) := by
+      unfold vectorUpdate vectorInit Vector.set!
+      simp [GetElem?.getElem!, decidableGetElem?]
+    have hmatch : match_TLB_Entry (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64) 0x0002#16
+        (sign_extend (m := (57 -i 12)) 0x0040403#27) = false := by decide
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+    rw [htlbHit]
+    dsimp only [EStateM.pure]
+    rw [hidx, hget]
+    dsimp only
+    rw [hmatch]
+    rfl
+  · unfold translate_TLB_hit update_and_write_pte
+    have hsz : (if (39 == 32 : Bool) then 4 else 8) = 8 := rfl
+    have hpte : tlb_get_pte 8 (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64) = 0x00000000200400c7#64 := by decide
+    have hperm : (check_PTE_permission (.Load .Data) .Supervisor false false
+        (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x00000000200400c7#64 7 0))
+        (ext_bits_of_PTE 0x00000000200400c7#64) ()).run sHitClean = .ok (.PTE_Check_Success ()) sHitClean := rfl
+    have hnone : update_PTE_Bits 0x00000000200400c7#64 (.Load .Data) = none := by decide
+    have hppn : tlb_get_ppn 39 (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64) 0x0040403#27 = 0x00000080100#44 := by decide
+    have hpbmt : (tlb_get_pbmt (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64)).run sHitClean = .ok .PBMT_PMA sHitClean := rfl
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hperm hpbmt ⊢
+    rw [hsz, hpte, hperm]
+    dsimp only [EStateM.bind, EStateM.pure]
+    rw [hnone]
+    dsimp only [EStateM.bind, EStateM.pure]
+    rw [hpbmt, hppn]
+  · unfold translate_TLB_hit
+    have hsz : (if (39 == 32 : Bool) then 4 else 8) = 8 := rfl
+    have hpte : tlb_get_pte 8 (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400d7#64) = 0x00000000200400d7#64 := by decide
+    have hperm : (check_PTE_permission (.Load .Data) .Supervisor false false
+        (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x00000000200400d7#64 7 0))
+        (ext_bits_of_PTE 0x00000000200400d7#64) ()).run sHitClean =
+        .ok (.PTE_Check_Failure ((), .PTE_No_Permission ())) sHitClean := rfl
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hperm ⊢
+    rw [hsz, hpte, hperm]
+    rfl
+  · dsimp only
+    have hupd : (update_and_write_pte (.Physaddr 0x0000000080003018#64) 8 0x0000000020040007#64 (.Store .Data)).run sHitDirty =
+        .ok (.Ok (some 0x00000000200400c7#64))
+          { sHitDirty with mem := rv64WriteMemBytesSpec 8 0x80003018 0x00000000200400c7#64 sHitDirty.mem } := by
+      have hc1 := (currentlyEnabled_ptw_std_run 1#1 sHitDirty hstdHitDirty).1
+      have hc1e := (currentlyEnabled_ptw_std_run 1#1 sHitDirty hstdHitDirty).2.1
+      have hm1 := hstdHitDirty.2.2.2.2.2
+      have hu_store : update_PTE_Bits 0x0000000020040007#64 (.Store .Data) = some 0x00000000200400c7#64 := by decide
+      have hwStore := write_pte_std_run 0x0000000080003018#64 0x00000000200400c7#64 1#1
+        (by decide) (by decide) (by decide) sHitDirty hstdHitDirty
+      unfold update_and_write_pte LeanRV64D.Functions.not
+      rw [hu_store]
+      dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+        readReg, PreSail.readReg, get, getThe, MonadStateOf.get] at hc1 hc1e hwStore ⊢
+      rw [hc1]; dsimp only [EStateM.pure, EStateM.bind, EStateM.get]
+      rw [hm1]; dsimp only [EStateM.pure]
+      rw [hc1]; dsimp only
+      rw [hc1e]
+      have hadue1 : (_get_MEnvcfg_ADUE (if (1#1 == 1#1) = true then 1#64 <<< 61 else 0#64) == 1#1) = true := by decide
+      rw [hadue1]
+      simp only [Bool.and_self, Bool.not_true, Bool.or_false, ite_true, EStateM.bind]
+      rw [hwStore]; rfl
+    unfold translate_TLB_hit write_TLB
+    have hsz : (if (39 == 32 : Bool) then 4 else 8) = 8 := rfl
+    have hpte : tlb_get_pte 8 (rv64Sv39TlbEntry4k 0x0001#16 0x0000000020040007#64) = 0x0000000020040007#64 := by decide
+    have hperm : (check_PTE_permission (.Store .Data) .Supervisor false false
+        (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x0000000020040007#64 7 0))
+        (ext_bits_of_PTE 0x0000000020040007#64) ()).run sHitDirty = .ok (.PTE_Check_Success ()) sHitDirty := rfl
+    have hset : tlb_set_pte (rv64Sv39TlbEntry4k 0x0001#16 0x0000000020040007#64) (k_n := 8) 0x00000000200400c7#64 =
+        rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64 := rfl
+    have hpaddrEnt : (rv64Sv39TlbEntry4k 0x0001#16 0x0000000020040007#64).pteAddr = .Physaddr 0x0000000080003018#64 := rfl
+    have hppn : tlb_get_ppn 39 (rv64Sv39TlbEntry4k 0x0001#16 0x0000000020040007#64) 0x0040403#27 = 0x00000080100#44 := by decide
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet, EStateM.run,
+      readReg, writeReg, PreSail.readReg, PreSail.writeReg,
+      get, getThe, MonadStateOf.get, modifyGet, MonadStateOf.modifyGet] at hupd hperm ⊢
+    rw [hsz, hpte, hperm]
+    dsimp only [EStateM.bind]
+    rw [hpaddrEnt, hupd]
+    dsimp only [EStateM.bind, EStateM.get, EStateM.modifyGet, modify]
+    rw [htlbDirty, hset]
+    dsimp only [EStateM.pure]
+    unfold tlb_get_pbmt page_based_mem_type_forwards
+    have hpbmt0 : _get_PTE_Ext_PBMT (ext_bits_of_PTE (rv64Sv39TlbEntry4k 0x0001#16 0x0000000020040007#64).pte) = 0b00#2 := by decide
+    rw [hpbmt0, hppn]
+    rfl
+  · dsimp only
+    have hwalk := pt_walk_sv39_4k_std_run 0#1 sMiss hstdMiss hmiss_l2 hmiss_l1 hmiss_l0
+    unfold translate_TLB_miss add_to_TLB update_and_write_pte
+    have hlvl : (if (39 == 32 : Bool) then 1 else if (39 == 39 : Bool) then 2 else if (39 == 48 : Bool) then 3 else 4) = 2 := rfl
+    have hsz : (if (39 == 32 : Bool) then 4 else 8) = 8 := rfl
+    have hidx : tlb_hash 39 0x0040403#27 = 3 := by decide
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet, EStateM.run,
+      readReg, writeReg, PreSail.readReg, PreSail.writeReg, tlb_add_callback,
+      get, getThe, MonadStateOf.get, modifyGet, MonadStateOf.modifyGet] at hwalk ⊢
+    rw [hlvl, hsz, hwalk]
+    dsimp only [EStateM.bind]
+    have hnone8 : update_PTE_Bits
+        (@BitVec.setWidth (if decide (39 = 32) = true then 32 else 64) (8 * 8)
+          (let p : BitVec (if decide (39 = 32) = true then 32 else 64) := 0x00000000200400c7#64; p))
+        (.Load .Data) = none := by decide
+    rw [hnone8]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.get, EStateM.modifyGet, modify]
+    rw [htlbMiss, hidx]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.get, EStateM.modifyGet, modifyGet]
+    let p_ppn : BitVec (if decide (39 = 32) = true then 22 else 44) := 0x00000080100#44
+    let p_pte : BitVec (if decide (39 = 32) = true then 32 else 64) := 0x00000000200400c7#64
+    have h_vpn : sign_extend (m := (57 -i 12))
+        (0x0040403#27 &&& BitVec.setWidth (39 - 12) (Complement.complement (zero_extend (m := (39 -i 12)) (ones (n := ((0 : Nat) *i (if (39 == 32 : Bool) then 10 else 9))))))) =
+        (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64).vpn := by decide
+    have h_lmask : zero_extend (m := (57 -i 12)) (ones (n := ((0 : Nat) *i (if (39 == 32 : Bool) then 10 else 9)))) =
+        (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64).levelMask := by decide
+    have h_ppn : zero_extend (m := 44)
+        (HAnd.hAnd (α := BitVec (if decide (39 = 32) = true then 22 else 44))
+          (β := BitVec (if (39 == 32 : Bool) then 22 else 44))
+          p_ppn
+          (Complement.complement (zero_extend (m := (if (39 == 32 : Bool) then 22 else 44)) (ones (n := ((0 : Nat) *i (if (39 == 32 : Bool) then 10 else 9))))))) =
+        (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64).ppn := by decide
+    have h_pte : zero_extend (m := 64) p_pte =
+        (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64).pte := by decide
+    have hins : vectorUpdate (vectorInit (n := 64) none) 3
+        (some ({
+          asid := 0x0001#16
+          global := false
+          pte := zero_extend (m := 64) p_pte
+          pteAddr := .Physaddr 0x0000000080003018#64
+          levelMask := zero_extend (m := (57 -i 12)) (ones (n := ((0 : Nat) *i (if (39 == 32 : Bool) then 10 else 9))))
+          vpn := sign_extend (m := (57 -i 12))
+            (0x0040403#27 &&& BitVec.setWidth (39 - 12) (Complement.complement (zero_extend (m := (39 -i 12)) (ones (n := ((0 : Nat) *i (if (39 == 32 : Bool) then 10 else 9)))))))
+          ppn := zero_extend (m := 44)
+            (HAnd.hAnd (α := BitVec (if decide (39 = 32) = true then 22 else 44))
+              (β := BitVec (if (39 == 32 : Bool) then 22 else 44))
+              p_ppn
+              (Complement.complement (zero_extend (m := (if (39 == 32 : Bool) then 22 else 44)) (ones (n := ((0 : Nat) *i (if (39 == 32 : Bool) then 10 else 9)))))))
+        } : TLB_Entry)) =
+        vectorUpdate (vectorInit (n := 64) none) 3
+          (some (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64)) := by
+      rw [h_vpn, h_lmask, h_ppn, h_pte]
+      rfl
+    rw [hins]
+    dsimp only [modifyGet, MonadStateOf.modifyGet, EStateM.modifyGet, EStateM.bind, EStateM.pure]
+    have hgetAfter : (sMiss.regs.insert .tlb (vectorUpdate (vectorInit (n := 64) none) 3
+        (some (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64)))).get? .tlb =
+        some (vectorUpdate (vectorInit (n := 64) none) 3
+          (some (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64))) := by
+      exact Std.ExtDHashMap.get?_insert_self
+    rw [hgetAfter]
+    rfl
+
+def rv64SupervisorSv39Mstatus : BitVec 64 :=
+  (0b10#64 <<< 34) ||| (0b10#64 <<< 32)
+
+def rv64SupervisorSv39Satp : BitVec 64 :=
+  (0x8#64 <<< 60) ||| (0x0001#64 <<< 44) ||| 0x00000080001#64
+
+theorem rv64TranslateAndTranslateAddr_bisim_sail
+    (sHit sMach sSup : SequentialState RegisterType trivialChoiceSource)
+    (htlbHit : sHit.regs.get? .tlb =
+      some (vectorUpdate (vectorInit (n := 64) none) 3 (some (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64))))
+    (hmachPriv : sMach.regs.get? .cur_privilege = some .Machine)
+    (hmachMstatus : sMach.regs.get? .mstatus = some rv64SupervisorSv39Mstatus)
+    (hstdSup : rv64StandardPtwRegs sSup 0#1)
+    (hsupPriv : sSup.regs.get? .cur_privilege = some .Supervisor)
+    (hsupMstatus : sSup.regs.get? .mstatus = some rv64SupervisorSv39Mstatus)
+    (hsupSatp : sSup.regs.get? .satp = some rv64SupervisorSv39Satp)
+    (hsupTlb : sSup.regs.get? .tlb = some (vectorInit (n := 64) none))
+    (hsup_l2 : rv64ReadMemBytesSpec 8 0x80001008 sSup.mem = some 0x0000000020000801#64)
+    (hsup_l1 : rv64ReadMemBytesSpec 8 0x80002010 sSup.mem = some 0x0000000020000c01#64)
+    (hsup_l0 : rv64ReadMemBytesSpec 8 0x80003018 sSup.mem = some 0x00000000200400c7#64) :
+    (translate 39 0x0001#16 0x00000080001#44 0x0040403#27 (.Load .Data) .Supervisor false false ()).run sHit =
+      .ok (.Ok (0x00000080100#44, .PBMT_PMA, ())) sHit ∧
+    (translateAddr (.Virtaddr 0x0001000000000000#64) (.Load .Data)).run sMach =
+      .ok (.Ok (.Physaddr 0x0001000000000000#64, .PBMT_PMA, ())) sMach ∧
+    (translateAddr (.Virtaddr 0x0001000000000000#64) (.Load .Data)).run sSup =
+      .ok (.Err (.E_Load_Page_Fault (), ())) sSup ∧
+    (translateAddr (.Virtaddr 0x0001000000000000#64) (.Store .Data)).run sSup =
+      .ok (.Err (.E_SAMO_Page_Fault (), ())) sSup ∧
+    (translateAddr (.Virtaddr 0x0001000000000000#64) (.InstructionFetch ())).run sSup =
+      .ok (.Err (.E_Fetch_Page_Fault (), ())) sSup ∧
+    (let tlbFilled := vectorUpdate (vectorInit (n := 64) none) 3
+       (some (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64))
+     (translateAddr (.Virtaddr 0x0000000040403abc#64) (.Load .Data)).run sSup =
+      .ok (.Ok (.Physaddr 0x0000000080100abc#64, .PBMT_PMA, ()))
+        { sSup with regs := sSup.regs.insert .tlb tlbFilled }) := by
+  have hmodeSup : (translationMode .Supervisor).run sSup = .ok .Sv39 sSup := by
+    unfold translationMode architecture architecture_bits_backwards satpMode_of_bits
+    have hprivF : (Privilege.Supervisor == Privilege.Machine) = false := by decide
+    have hsxl : _get_Mstatus_SXL rv64SupervisorSv39Mstatus = 0b10#2 := by decide
+    have hxlen : (LeanRV64D.Functions.xlen ≥b 64) = true := by decide
+    have hmode : _get_Satp64_Mode (Mk_Satp64 rv64SupervisorSv39Satp) = 0x8#4 := by decide
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get, assert, PreSail.assert]
+    simp only [hprivF, Bool.false_eq_true, ite_false]
+    dsimp only [EStateM.bind, EStateM.get]
+    rw [hsupMstatus]
+    dsimp only [EStateM.pure, EStateM.bind]
+    rw [hsxl]
+    simp only [hxlen, ite_true]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.get]
+    rw [hsupSatp]
+    dsimp only [EStateM.pure]
+    rw [hmode]
+    rfl
+  have hgetSatp39 : (get_satp 39).run sSup =
+      .ok (@BitVec.setWidth 64 (if decide (39 = 32) = true then 32 else 64) rv64SupervisorSv39Satp) sSup := by
+    unfold get_satp
+    have h39_32 : (39 == 32 : Bool) = false := by decide
+    have hxlen64 : (false || (LeanRV64D.Functions.xlen == 64)) = true := by decide
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get, assert, PreSail.assert]
+    simp only [h39_32, hxlen64, ite_true, Bool.false_eq_true, ite_false]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.get]
+    rw [hsupSatp]
+    rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+  · unfold translate lookup_TLB translate_TLB_hit update_and_write_pte
+    have hidx : tlb_hash 39 0x0040403#27 = 3 := by decide
+    have hget : (vectorUpdate (vectorInit (n := 64) (none : Option TLB_Entry)) 3
+        (some (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64)))[3]! =
+        some (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64) := by
+      unfold vectorUpdate vectorInit Vector.set!
+      simp [GetElem?.getElem!, decidableGetElem?]
+    have hmatch : match_TLB_Entry (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64) 0x0001#16
+        (sign_extend (m := (57 -i 12)) 0x0040403#27) = true := by decide
+    have hsz : (if (39 == 32 : Bool) then 4 else 8) = 8 := rfl
+    have hpte : tlb_get_pte 8 (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64) = 0x00000000200400c7#64 := by decide
+    have hperm : (check_PTE_permission (.Load .Data) .Supervisor false false
+        (Mk_PTE_Flags (Sail.BitVec.extractLsb 0x00000000200400c7#64 7 0))
+        (ext_bits_of_PTE 0x00000000200400c7#64) ()).run sHit = .ok (.PTE_Check_Success ()) sHit := rfl
+    have hnone : update_PTE_Bits 0x00000000200400c7#64 (.Load .Data) = none := by decide
+    have hppn : tlb_get_ppn 39 (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64) 0x0040403#27 = 0x00000080100#44 := by decide
+    have hpbmt : (tlb_get_pbmt (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64)).run sHit = .ok .PBMT_PMA sHit := rfl
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get] at hperm hpbmt ⊢
+    rw [htlbHit]
+    dsimp only [EStateM.pure]
+    rw [hidx, hget]
+    dsimp only
+    rw [hmatch]
+    simp only [ite_true]
+    dsimp only [EStateM.pure, EStateM.bind]
+    rw [hsz, hpte, hperm]
+    dsimp only [EStateM.bind, EStateM.pure]
+    rw [hnone]
+    dsimp only [EStateM.pure, EStateM.bind]
+    rw [hpbmt, hppn]
+  · unfold translateAddr effectivePrivilege translationMode is_shadow_stack_access bits_of_virtaddr
+    have hmprv : (_get_Mstatus_MPRV rv64SupervisorSv39Mstatus == 1#1) = false := by decide
+    dsimp only [SailME.run, PreSail.PreSailME.run, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+    rw [hmachMstatus]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, EStateM.get, ExceptT.bindCont]
+    rw [hmachPriv]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    simp only [hmprv]
+    rfl
+  · unfold translateAddr effectivePrivilege is_shadow_stack_access
+      satp_mode_width_forwards translationException bits_of_virtaddr
+    have hmprv : (_get_Mstatus_MPRV rv64SupervisorSv39Mstatus == 1#1) = false := by decide
+    have hbareF : (SATPMode.Sv39 == SATPMode.Bare) = false := by decide
+    have hxlen : (((39 : Int) == 32 : Bool) || (LeanRV64D.Functions.xlen == 64)) = true := by decide
+    have hnoncanon : (0x0001000000000000#64 !=
+        sign_extend (m := 64) (Sail.BitVec.extractLsb 0x0001000000000000#64 ((39 : Int) -i 1) 0)) = true := by decide
+    dsimp only [SailME.run, PreSail.PreSailME.run, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get,
+      assert, PreSail.assert] at hmodeSup hgetSatp39 ⊢
+    rw [hsupMstatus]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, EStateM.get, ExceptT.bindCont]
+    rw [hsupPriv]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    simp only [hmprv, Bool.and_false, Bool.false_eq_true, ite_false]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hmodeSup]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont, Int.toNat]
+    simp only [hbareF, Bool.false_eq_true, ite_false]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont, Int.toNat]
+    rw [hgetSatp39]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    simp only [hxlen, ite_true]
+    rfl
+  · unfold translateAddr effectivePrivilege is_shadow_stack_access
+      satp_mode_width_forwards translationException bits_of_virtaddr
+    have hmprv : (_get_Mstatus_MPRV rv64SupervisorSv39Mstatus == 1#1) = false := by decide
+    have hbareF : (SATPMode.Sv39 == SATPMode.Bare) = false := by decide
+    have hxlen : (((39 : Int) == 32 : Bool) || (LeanRV64D.Functions.xlen == 64)) = true := by decide
+    dsimp only [SailME.run, PreSail.PreSailME.run, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get,
+      assert, PreSail.assert] at hmodeSup hgetSatp39 ⊢
+    rw [hsupMstatus]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, EStateM.get, ExceptT.bindCont]
+    rw [hsupPriv]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    simp only [hmprv, Bool.and_false, Bool.false_eq_true, ite_false]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hmodeSup]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont, Int.toNat]
+    simp only [hbareF, Bool.false_eq_true, ite_false]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont, Int.toNat]
+    rw [hgetSatp39]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    simp only [hxlen, ite_true]
+    rfl
+  · unfold translateAddr effectivePrivilege is_shadow_stack_access
+      satp_mode_width_forwards translationException bits_of_virtaddr
+    have hmprv : (((MemoryAccessType.InstructionFetch () : MemoryAccessType mem_payload) != MemoryAccessType.InstructionFetch ()) &&
+        (_get_Mstatus_MPRV rv64SupervisorSv39Mstatus == 1#1)) = false := by decide
+    have hbareF : (SATPMode.Sv39 == SATPMode.Bare) = false := by decide
+    have hxlen : (((39 : Int) == 32 : Bool) || (LeanRV64D.Functions.xlen == 64)) = true := by decide
+    dsimp only [SailME.run, PreSail.PreSailME.run, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get,
+      assert, PreSail.assert] at hmodeSup hgetSatp39 ⊢
+    rw [hsupMstatus]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, EStateM.get, ExceptT.bindCont]
+    rw [hsupPriv]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    simp only [hmprv, Bool.false_eq_true, ite_false]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hmodeSup]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont, Int.toNat]
+    simp only [hbareF, Bool.false_eq_true, ite_false]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont, Int.toNat]
+    rw [hgetSatp39]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    simp only [hxlen, ite_true]
+    rfl
+  · dsimp only
+    let tlbFilled : RegisterType .tlb :=
+      vectorUpdate (vectorInit (n := 64) none) 3 (some (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64))
+    have hmissRun : (translate_TLB_miss 39 0x0001#16 0x00000080001#44 0x0040403#27 (.Load .Data) .Supervisor false false ()).run sSup =
+        .ok (.Ok (0x00000080100#44, .PBMT_PMA, ())) { sSup with regs := sSup.regs.insert .tlb tlbFilled } := by
+      have hwalk := pt_walk_sv39_4k_std_run 0#1 sSup hstdSup hsup_l2 hsup_l1 hsup_l0
+      unfold translate_TLB_miss add_to_TLB update_and_write_pte
+      have hlvl : (if (39 == 32 : Bool) then 1 else if (39 == 39 : Bool) then 2 else if (39 == 48 : Bool) then 3 else 4) = 2 := rfl
+      have hsz : (if (39 == 32 : Bool) then 4 else 8) = 8 := rfl
+      have hnone8 : update_PTE_Bits
+          (@BitVec.setWidth (if decide (39 = 32) = true then 32 else 64) (8 * 8)
+            (let p : BitVec (if decide (39 = 32) = true then 32 else 64) := 0x00000000200400c7#64; p))
+          (.Load .Data) = none := by decide
+      have hidx : tlb_hash 39 0x0040403#27 = 3 := by decide
+      dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet, EStateM.run,
+        readReg, writeReg, PreSail.readReg, PreSail.writeReg, tlb_add_callback,
+        get, getThe, MonadStateOf.get, modifyGet, MonadStateOf.modifyGet] at hwalk ⊢
+      rw [hlvl, hsz, hwalk]
+      dsimp only [EStateM.bind]
+      rw [hnone8]
+      dsimp only [EStateM.pure, EStateM.bind, EStateM.get, EStateM.modifyGet, modify]
+      rw [hsupTlb, hidx]
+      dsimp only [EStateM.pure, EStateM.bind, EStateM.get, EStateM.modifyGet, modifyGet]
+      let p_ppn : BitVec (if decide (39 = 32) = true then 22 else 44) := 0x00000080100#44
+      let p_pte : BitVec (if decide (39 = 32) = true then 32 else 64) := 0x00000000200400c7#64
+      have h_vpn : sign_extend (m := (57 -i 12))
+          (0x0040403#27 &&& BitVec.setWidth (39 - 12) (Complement.complement (zero_extend (m := (39 -i 12)) (ones (n := ((0 : Nat) *i (if (39 == 32 : Bool) then 10 else 9))))))) =
+          (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64).vpn := by decide
+      have h_lmask : zero_extend (m := (57 -i 12)) (ones (n := ((0 : Nat) *i (if (39 == 32 : Bool) then 10 else 9)))) =
+          (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64).levelMask := by decide
+      have h_ppn : zero_extend (m := 44)
+          (HAnd.hAnd (α := BitVec (if decide (39 = 32) = true then 22 else 44))
+            (β := BitVec (if (39 == 32 : Bool) then 22 else 44))
+            p_ppn
+            (Complement.complement (zero_extend (m := (if (39 == 32 : Bool) then 22 else 44)) (ones (n := ((0 : Nat) *i (if (39 == 32 : Bool) then 10 else 9))))))) =
+          (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64).ppn := by decide
+      have h_pte : zero_extend (m := 64) p_pte =
+          (rv64Sv39TlbEntry4k 0x0001#16 0x00000000200400c7#64).pte := by decide
+      have hins : vectorUpdate (vectorInit (n := 64) none) 3
+          (some ({
+            asid := 0x0001#16
+            global := false
+            pte := zero_extend (m := 64) p_pte
+            pteAddr := .Physaddr 0x0000000080003018#64
+            levelMask := zero_extend (m := (57 -i 12)) (ones (n := ((0 : Nat) *i (if (39 == 32 : Bool) then 10 else 9))))
+            vpn := sign_extend (m := (57 -i 12))
+              (0x0040403#27 &&& BitVec.setWidth (39 - 12) (Complement.complement (zero_extend (m := (39 -i 12)) (ones (n := ((0 : Nat) *i (if (39 == 32 : Bool) then 10 else 9)))))))
+            ppn := zero_extend (m := 44)
+              (HAnd.hAnd (α := BitVec (if decide (39 = 32) = true then 22 else 44))
+                (β := BitVec (if (39 == 32 : Bool) then 22 else 44))
+                p_ppn
+                (Complement.complement (zero_extend (m := (if (39 == 32 : Bool) then 22 else 44)) (ones (n := ((0 : Nat) *i (if (39 == 32 : Bool) then 10 else 9)))))))
+          } : TLB_Entry)) = tlbFilled := by
+        unfold tlbFilled
+        rw [h_vpn, h_lmask, h_ppn, h_pte]
+        rfl
+      rw [hins]
+      dsimp only [modifyGet, MonadStateOf.modifyGet, EStateM.modifyGet, EStateM.bind, EStateM.pure]
+      have hgetAfter : (sSup.regs.insert .tlb tlbFilled).get? .tlb = some tlbFilled :=
+        Std.ExtDHashMap.get?_insert_self
+      rw [hgetAfter]
+      rfl
+    have htrRun : (translate 39
+        (zero_extend (m := 16)
+          (satp_to_asid (@BitVec.setWidth 64 (if decide (39 = 32) = true then 32 else 64) rv64SupervisorSv39Satp)))
+        (@satp_to_ppn (if decide (39 = 32) = true then 32 else 64)
+          (@BitVec.setWidth 64 (if decide (39 = 32) = true then 32 else 64) rv64SupervisorSv39Satp))
+        (Sail.BitVec.extractLsb
+          (Sail.BitVec.extractLsb 0x0000000040403abc#64 ((39 : Int) -i 1) 0)
+          ((39 : Int) -i 1) LeanRV64D.Functions.pagesize_bits)
+        (.Load .Data) .Supervisor false false init_ext_ptw).run sSup =
+        .ok (.Ok (0x00000080100#44, .PBMT_PMA, ())) { sSup with regs := sSup.regs.insert .tlb tlbFilled } := by
+      unfold translate lookup_TLB init_ext_ptw
+      have h_asid16 : ((zero_extend (m := 16)
+          (satp_to_asid (@BitVec.setWidth 64 (if decide (39 = 32) = true then 32 else 64) rv64SupervisorSv39Satp))) :
+          BitVec (if decide (64 = 32) = true then 9 else 16)) =
+          0x0001#16 := by decide
+      have h_ppn44 : (@satp_to_ppn (if decide (39 = 32) = true then 32 else 64)
+          (@BitVec.setWidth 64 (if decide (39 = 32) = true then 32 else 64) rv64SupervisorSv39Satp) :
+          BitVec (if decide (39 = 32) = true then 22 else 44)) =
+          0x00000080001#44 := by decide
+      have h_vpn27 : ((Sail.BitVec.extractLsb
+          (Sail.BitVec.extractLsb 0x0000000040403abc#64 ((39 : Int) -i 1) 0)
+          ((39 : Int) -i 1) LeanRV64D.Functions.pagesize_bits) : BitVec (39 - 12)) =
+          0x0040403#27 := by decide
+      rw [h_asid16, h_ppn44, h_vpn27]
+      have hidx : tlb_hash 39 0x0040403#27 = 3 := by decide
+      have hget : (vectorInit (n := 64) (none : Option TLB_Entry))[3]! = none := by
+        unfold vectorInit; simp
+      dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+        readReg, PreSail.readReg, get, getThe, MonadStateOf.get] at hmissRun ⊢
+      rw [hsupTlb]
+      dsimp only [EStateM.pure]
+      rw [hidx, hget]
+      exact hmissRun
+    unfold translateAddr effectivePrivilege is_shadow_stack_access
+      satp_mode_width_forwards bits_of_virtaddr
+    have hmprv : (_get_Mstatus_MPRV rv64SupervisorSv39Mstatus == 1#1) = false := by decide
+    have hbareF : (SATPMode.Sv39 == SATPMode.Bare) = false := by decide
+    have hmxr : (_get_Mstatus_MXR rv64SupervisorSv39Mstatus == 1#1) = false := by decide
+    have hsum : (_get_Mstatus_SUM rv64SupervisorSv39Mstatus == 1#1) = false := by decide
+    dsimp only [SailME.run, PreSail.PreSailME.run, ExceptT.run, ExceptT.mk,
+      ExceptT.bind, ExceptT.pure, ExceptT.lift, ExceptT.bindCont,
+      MonadLift.monadLift, liftM, monadLift, Functor.map, EStateM.map,
+      Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get,
+      assert, PreSail.assert] at hmodeSup hgetSatp39 htrRun ⊢
+    rw [hsupMstatus]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, EStateM.get, ExceptT.bindCont]
+    rw [hsupPriv]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    simp only [hmprv, Bool.and_false, Bool.false_eq_true, ite_false]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [hmodeSup]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    simp only [hbareF, Bool.false_eq_true, ite_false]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    have hgetSatp39' : get_satp ((39 : Int) : Nat) sSup =
+        EStateM.Result.ok (BitVec.setWidth (if decide (((39 : Int) : Nat) = 32) = true then 32 else 64) rv64SupervisorSv39Satp) sSup :=
+      hgetSatp39
+    have htrRun' : (translate ((39 : Int) : Nat)
+        (zero_extend (m := 16)
+          (satp_to_asid (@BitVec.setWidth 64 (if decide (((39 : Int) : Nat) = 32) = true then 32 else 64) rv64SupervisorSv39Satp)))
+        (BitVec.setWidth (if decide (Int.toNat 39 = 32) = true then 22 else 44)
+          (@satp_to_ppn (if decide (((39 : Int) : Nat) = 32) = true then 32 else 64)
+            (@BitVec.setWidth 64 (if decide (((39 : Int) : Nat) = 32) = true then 32 else 64) rv64SupervisorSv39Satp)))
+        (BitVec.setWidth (Int.toNat 39 - 12)
+          (Sail.BitVec.extractLsb
+            (Sail.BitVec.extractLsb 0x0000000040403abc#64 ((39 : Int) -i 1) 0)
+            ((39 : Int) -i 1) LeanRV64D.Functions.pagesize_bits))
+        (.Load .Data) .Supervisor false false init_ext_ptw).run sSup =
+        .ok (.Ok (0x00000080100#44, .PBMT_PMA, ())) { sSup with regs := sSup.regs.insert .tlb tlbFilled } :=
+      htrRun
+    dsimp only [EStateM.run, CoeT.coe] at hgetSatp39' htrRun' ⊢
+    rw [hgetSatp39']
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [if_pos (by decide)]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont]
+    rw [if_neg (by decide)]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, EStateM.get, ExceptT.bindCont]
+    rw [hsupMstatus]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, EStateM.get, ExceptT.bindCont]
+    rw [hsupMstatus]
+    dsimp only [EStateM.pure, EStateM.bind, EStateM.map, ExceptT.bindCont, CoeT.coe] at htrRun' ⊢
+    rw [hmxr, hsum, htrRun']
+    dsimp only [EStateM.pure, CoeT.coe]
+    unfold LeanRV64D.Functions.pagesize_bits tlbFilled
+    rfl
+
+/-! ## Section 15: Trap Vectoring, Exception Delegation, Interrupt Priority & Dispatch, Trap Entry, `MRET` & `SRET` -/
+
+def rv64StandardMisaSU : BitVec 64 :=
+  (0b10#64 <<< 62) ||| (1#64 <<< 18) ||| (1#64 <<< 20)
+
+def rv64StandardMisaSUC : BitVec 64 :=
+  rv64StandardMisaSU ||| (1#64 <<< 2)
+
+def rv64TvecAddrSpec (tvec cause : BitVec 64) : Option (BitVec 64) :=
+  let base := Sail.BitVec.extractLsb tvec 63 2 +++ 0b00#2
+  match Sail.BitVec.extractLsb tvec 1 0 with
+  | 0b00#2 => some base
+  | 0b01#2 =>
+    if Sail.BitVec.extractLsb cause 63 63 == 1#1 then
+      some (base + (BitVec.zeroExtend 64 (Sail.BitVec.extractLsb cause 62 0) <<< 2))
+    else
+      some base
+  | _ => none
+
+private theorem hartSupports_Ext_S : hartSupports .Ext_S = true := by
+  rw [hartSupports.eq_def]
+
+private theorem hartSupports_Ext_U : hartSupports .Ext_U = true := by
+  rw [hartSupports.eq_def]
+
+private theorem hartSupports_Ext_Zicsr : hartSupports .Ext_Zicsr = true := by
+  rw [hartSupports.eq_def]
+
+private theorem hartSupports_Ext_F : hartSupports .Ext_F = true := by
+  rw [hartSupports.eq_def]
+
+private theorem hartSupports_Ext_D : hartSupports .Ext_D = true := by
+  rw [hartSupports.eq_def]
+  rw [hartSupports_Ext_F]
+  rfl
+
+private theorem hartSupports_Ext_Zca : hartSupports .Ext_Zca = true := by
+  rw [hartSupports.eq_def]
+
+private theorem hartSupports_Ext_Zcd : hartSupports .Ext_Zcd = true := by
+  rw [hartSupports.eq_def]
+
+private theorem hartSupports_Ext_Zcf : hartSupports .Ext_Zcf = false := by
+  rw [hartSupports.eq_def]; decide
+
+private theorem hartSupports_Ext_C : hartSupports .Ext_C = true := by
+  rw [hartSupports.eq_def]
+  simp only [hartSupports_Ext_Zca, hartSupports_Ext_Zcf, hartSupports_Ext_F,
+    hartSupports_Ext_Zcd, hartSupports_Ext_D]
+  decide
+
+private theorem hartSupports_Ext_Zicfilp : hartSupports .Ext_Zicfilp = true := by
+  rw [hartSupports.eq_def]
+
+private theorem currentlyEnabled_Ext_S_standard (s : SequentialState RegisterType trivialChoiceSource)
+    (misaVal : BitVec 64) (hmisa : s.regs.get? .misa = some misaVal)
+    (hs : _get_Misa_S misaVal = 1#1) :
+    (currentlyEnabled .Ext_S).run s = .ok true s := by
+  rw [currentlyEnabled.eq_def]
+  dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+    readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+  rw [currentlyEnabled.eq_def]
+  dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run]
+  rw [hmisa]
+  dsimp only [EStateM.bind, EStateM.pure]
+  rw [hs, hartSupports_Ext_S, hartSupports_Ext_Zicsr]
+  rfl
+
+private theorem currentlyEnabled_Ext_U_standard (s : SequentialState RegisterType trivialChoiceSource)
+    (misaVal : BitVec 64) (hmisa : s.regs.get? .misa = some misaVal)
+    (hu : _get_Misa_U misaVal = 1#1) :
+    (currentlyEnabled .Ext_U).run s = .ok true s := by
+  rw [currentlyEnabled.eq_def]
+  dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+    readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+  rw [currentlyEnabled.eq_def]
+  dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run]
+  rw [hmisa]
+  dsimp only [EStateM.bind, EStateM.pure]
+  rw [hu, hartSupports_Ext_U, hartSupports_Ext_Zicsr]
+  rfl
+
+private theorem currentlyEnabled_Ext_Zca_of_misa_C (s : SequentialState RegisterType trivialChoiceSource)
+    (misaVal : BitVec 64) (hmisa : s.regs.get? .misa = some misaVal) :
+    (currentlyEnabled .Ext_Zca).run s = .ok (_get_Misa_C misaVal == 1#1) s := by
+  rw [currentlyEnabled.eq_def]
+  dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+    readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+  rw [currentlyEnabled.eq_def]
+  dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+    readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+  rw [hmisa]
+  dsimp only [EStateM.bind, EStateM.pure]
+  rw [hartSupports_Ext_Zca, hartSupports_Ext_C]
+  cases (_get_Misa_C misaVal == 1#1) <;> rfl
+
+/-- Direct `SailM` & pure bisimulation for `tvec_addr`, `legalize_xepc`, `align_pc`, `get_xepc`,
+    `set_xepc`, `prepare_xret_target`, and `prepare_trap_vector` (`SysRegs.lean` lines 1296–1315,
+    `SysExceptions.lean` lines 227–266):
+    1. `tvec_addr tvec cause = rv64TvecAddrSpec tvec cause` across Direct (`0b00`), Vectored (`0b01`,
+       adding `4 * cause[62:0]` iff `IsInterrupt = 1` and leaving synchronous exceptions unshifted),
+       and Reserved (`0b10` / `0b11` -> `none`) modes;
+    2. `legalize_xepc v = BitVec.update v 0 0#1` (since `hartSupports Ext_Zca = true`), while
+       `align_pc addr` clears bit `0` when `misa.C = 1` (`Ext_Zca` enabled) and clears bits `[1:0]`
+       when `misa.C = 0` (`Ext_Zca` disabled);
+    3. `set_xepc` writes `legalize_xepc value` to `mepc`/`sepc`, `prepare_xret_target` (= `get_xepc`)
+       reads `mepc`/`sepc` through `align_pc`, and `prepare_trap_vector` computes the trap PC from
+       `mtvec`/`stvec` on Direct/Vectored modes. -/
+theorem rv64TrapVectorAndXepc_bisim_sail (tvec cause v : BitVec 64)
+    (sZca sNoC : SequentialState RegisterType trivialChoiceSource)
+    (hmisaZca : sZca.regs.get? .misa = some rv64StandardMisaSUC)
+    (hmisaNoC : sNoC.regs.get? .misa = some rv64StandardMisaSU)
+    (hmtvec : sZca.regs.get? .mtvec = some 0x0000000080001001#64)
+    (hstvec : sNoC.regs.get? .stvec = some 0x0000000080002000#64) :
+    tvec_addr tvec cause = rv64TvecAddrSpec tvec cause ∧
+    legalize_xepc v = BitVec.update v 0 0#1 ∧
+    (align_pc v).run sZca = .ok (BitVec.update v 0 0#1) sZca ∧
+    (align_pc v).run sNoC = .ok (Sail.BitVec.updateSubrange v 1 0 0b00#2) sNoC ∧
+    ((do
+        let _ ← set_xepc .Machine 0x0000000080000103#64
+        prepare_xret_target .Machine).run sZca) =
+      .ok 0x0000000080000102#64 { sZca with regs := sZca.regs.insert .mepc 0x0000000080000102#64 } ∧
+    ((do
+        let _ ← set_xepc .Supervisor 0x0000000080000102#64
+        prepare_xret_target .Supervisor).run sNoC) =
+      .ok 0x0000000080000100#64 { sNoC with regs := sNoC.regs.insert .sepc 0x0000000080000102#64 } ∧
+    (prepare_trap_vector .Machine ((1#64 <<< 63) ||| 7#64)).run sZca =
+      .ok 0x000000008000101c#64 sZca ∧
+    (prepare_trap_vector .Supervisor 2#64).run sNoC =
+      .ok 0x0000000080002000#64 sNoC := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · unfold tvec_addr rv64TvecAddrSpec _get_Mtvec_Base _get_Mtvec_Mode
+      trapVectorMode_forwards _get_Mcause_IsInterrupt _get_Mcause_Cause
+      zero_extend Sail.BitVec.zeroExtend
+    dsimp only [CoeT.coe]
+    rcases hp : Sail.BitVec.extractLsb tvec 1 0 with ⟨⟨m, hm⟩⟩
+    have hm4 : m = 0 ∨ m = 1 ∨ m = 2 ∨ m = 3 := by omega
+    rcases hm4 with rfl | rfl | rfl | rfl <;> rfl
+  · unfold legalize_xepc
+    rw [hartSupports_Ext_Zca]; rfl
+  · have hce := currentlyEnabled_Ext_Zca_of_misa_C sZca rv64StandardMisaSUC hmisaZca
+    have hc1 : (_get_Misa_C rv64StandardMisaSUC == 1#1) = true := by decide
+    unfold align_pc
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run] at hce ⊢
+    rw [hce, hc1]
+    rfl
+  · have hce := currentlyEnabled_Ext_Zca_of_misa_C sNoC rv64StandardMisaSU hmisaNoC
+    have hc0 : (_get_Misa_C rv64StandardMisaSU == 1#1) = false := by decide
+    unfold align_pc zeros
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.run, CoeT.coe] at hce ⊢
+    rw [hce, hc0]
+    rfl
+  · have hmepcEq : legalize_xepc 0x0000000080000103#64 = 0x0000000080000102#64 := by
+      unfold legalize_xepc; rw [hartSupports_Ext_Zca]; decide
+    let sZca' := { sZca with regs := sZca.regs.insert .mepc 0x0000000080000102#64 }
+    have hmisa' : sZca'.regs.get? .misa = some rv64StandardMisaSUC := by
+      simpa [sZca', Std.ExtDHashMap.get?_insert] using hmisaZca
+    have hce := currentlyEnabled_Ext_Zca_of_misa_C sZca' rv64StandardMisaSUC hmisa'
+    have hc1 : (_get_Misa_C rv64StandardMisaSUC == 1#1) = true := by decide
+    unfold set_xepc prepare_xret_target get_xepc align_pc
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet,
+      EStateM.run, writeReg, PreSail.writeReg, readReg, PreSail.readReg,
+      modify, modifyGet, MonadStateOf.modifyGet, get, getThe, MonadStateOf.get] at hce ⊢
+    rw [hmepcEq]
+    simp only [Std.ExtDHashMap.get?_insert_self]
+    dsimp only [EStateM.pure]
+    rw [hce, hc1]; dsimp only []; rw [if_pos rfl]
+    have hupd : BitVec.update 0x0000000080000102#64 0 0#1 = 0x0000000080000102#64 := by decide
+    rw [hupd]; rfl
+  · have hsepcEq : legalize_xepc 0x0000000080000102#64 = 0x0000000080000102#64 := by
+      unfold legalize_xepc; rw [hartSupports_Ext_Zca]; decide
+    let sNoC' := { sNoC with regs := sNoC.regs.insert .sepc 0x0000000080000102#64 }
+    have hmisa' : sNoC'.regs.get? .misa = some rv64StandardMisaSU := by
+      simpa [sNoC', Std.ExtDHashMap.get?_insert] using hmisaNoC
+    have hce := currentlyEnabled_Ext_Zca_of_misa_C sNoC' rv64StandardMisaSU hmisa'
+    have hc0 : (_get_Misa_C rv64StandardMisaSU == 1#1) = false := by decide
+    unfold set_xepc prepare_xret_target get_xepc align_pc
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet,
+      EStateM.run, writeReg, PreSail.writeReg, readReg, PreSail.readReg,
+      modify, modifyGet, MonadStateOf.modifyGet, get, getThe, MonadStateOf.get] at hce ⊢
+    rw [hsepcEq]
+    simp only [Std.ExtDHashMap.get?_insert_self]
+    dsimp only [EStateM.pure]
+    rw [hce, hc0]; dsimp only []; rw [if_neg Bool.false_ne_true]
+    have hupd : Sail.BitVec.updateSubrange 0x0000000080000102#64 1 0 (zeros (n := 1 -i (0 -i 1))) =
+        0x0000000080000100#64 := by decide
+    rw [hupd]; rfl
+  · unfold prepare_trap_vector
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+    rw [hmtvec]
+    have htv : tvec_addr 0x0000000080001001#64 ((1#64 <<< 63) ||| 7#64) =
+        some 0x000000008000101c#64 := by decide
+    dsimp only [EStateM.bind, EStateM.pure]
+    rw [htv]
+    rfl
+  · unfold prepare_trap_vector
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+    rw [hstvec]
+    have htv : tvec_addr 0x0000000080002000#64 2#64 = some 0x0000000080002000#64 := by decide
+    dsimp only [EStateM.bind, EStateM.pure]
+    rw [htv]
+    rfl
+
+/-- Direct `SailM` & pure bisimulation for `exception_delegatee`, `xtval_exception_value`,
+    `make_sync_exception`, and `tval` (`SysControl.lean`, lines 556–566, 622–626, 725–760):
+    1. `exception_delegatee e .Machine` never delegates downward (`Machine`), regardless of `medeleg`;
+    2. `exception_delegatee e .User` and `exception_delegatee e .Supervisor` delegate to `Supervisor`
+       when `Ext_S` is enabled and `medeleg[cause] = 1`, and trap to `Machine` when `medeleg[cause] = 0`;
+    3. `make_sync_exception` populates `excinfo = some xtval` for fault/illegal/breakpoint exceptions
+       (`E_Illegal_Instr`, `E_Load_Page_Fault`, `E_SAMO_Page_Fault`, `E_Fetch_Page_Fault`) and
+       `excinfo = none` for environment calls (`E_U_EnvCall`, `E_S_EnvCall`, `E_M_EnvCall`), while
+       `tval` unwraps `Option (BitVec 64)` with `0#64` default. -/
+theorem rv64ExceptionDelegateeAndSyncExc_bisim_sail (xtval : BitVec 64)
+    (sDeleg sNoDeleg : SequentialState RegisterType trivialChoiceSource)
+    (hmisaD : sDeleg.regs.get? .misa = some rv64StandardMisaSU)
+    (hmisaN : sNoDeleg.regs.get? .misa = some rv64StandardMisaSU)
+    (hmedelegD : sDeleg.regs.get? .medeleg = some ((1#64 <<< 8) ||| (1#64 <<< 13)))
+    (hmedelegN : sNoDeleg.regs.get? .medeleg = some 0#64) :
+    (exception_delegatee (.E_U_EnvCall ()) .Machine).run sDeleg = .ok .Machine sDeleg ∧
+    (exception_delegatee (.E_U_EnvCall ()) .User).run sDeleg = .ok .Supervisor sDeleg ∧
+    (exception_delegatee (.E_Load_Page_Fault ()) .Supervisor).run sDeleg = .ok .Supervisor sDeleg ∧
+    (exception_delegatee (.E_U_EnvCall ()) .User).run sNoDeleg = .ok .Machine sNoDeleg ∧
+    make_sync_exception (.E_Load_Page_Fault ()) xtval =
+      { trap := .E_Load_Page_Fault (), excinfo := some xtval, ext := none } ∧
+    make_sync_exception (.E_Illegal_Instr ()) xtval =
+      { trap := .E_Illegal_Instr (), excinfo := some xtval, ext := none } ∧
+    make_sync_exception (.E_U_EnvCall ()) xtval =
+      { trap := .E_U_EnvCall (), excinfo := none, ext := none } ∧
+    make_sync_exception (.E_M_EnvCall ()) xtval =
+      { trap := .E_M_EnvCall (), excinfo := none, ext := none } ∧
+    tval (some xtval) = xtval ∧
+    tval none = 0#64 := by
+  have hceD := currentlyEnabled_Ext_S_standard sDeleg rv64StandardMisaSU hmisaD (by decide)
+  have hceN := currentlyEnabled_Ext_S_standard sNoDeleg rv64StandardMisaSU hmisaN (by decide)
+  refine ⟨?_, ?_, ?_, ?_, rfl, rfl, rfl, rfl, rfl, rfl⟩
+  · unfold exception_delegatee
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get] at hceD ⊢
+    rw [hmedelegD]
+    dsimp only [EStateM.bind, EStateM.pure]
+    rw [hceD]
+    dsimp only []
+    have hc : (true && bit_to_bool (BitVec.access (1#64 <<< 8 ||| 1#64 <<< 13)
+        (Sail.BitVec.toNatInt (exceptionType_bits_forwards (.E_U_EnvCall ()))).toNat)) = true := by decide
+    have hlt : zopz0zI_u (privLevel_to_bits .Supervisor) (privLevel_to_bits .Machine) = true := by decide
+    rw [hc, if_pos rfl]
+    dsimp only [EStateM.bind, EStateM.pure]
+    rw [hlt]; rfl
+  · unfold exception_delegatee
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get] at hceD ⊢
+    rw [hmedelegD]
+    dsimp only [EStateM.bind, EStateM.pure]
+    rw [hceD]
+    dsimp only []
+    have hc : (true && bit_to_bool (BitVec.access (1#64 <<< 8 ||| 1#64 <<< 13)
+        (Sail.BitVec.toNatInt (exceptionType_bits_forwards (.E_U_EnvCall ()))).toNat)) = true := by decide
+    have hlt : zopz0zI_u (privLevel_to_bits .Supervisor) (privLevel_to_bits .User) = false := by decide
+    rw [hc, if_pos rfl]
+    dsimp only [EStateM.bind, EStateM.pure]
+    rw [hlt]; rfl
+  · unfold exception_delegatee
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get] at hceD ⊢
+    rw [hmedelegD]
+    dsimp only [EStateM.bind, EStateM.pure]
+    rw [hceD]
+    dsimp only []
+    have hc : (true && bit_to_bool (BitVec.access (1#64 <<< 8 ||| 1#64 <<< 13)
+        (Sail.BitVec.toNatInt (exceptionType_bits_forwards (.E_Load_Page_Fault ()))).toNat)) = true := by decide
+    have hlt : zopz0zI_u (privLevel_to_bits .Supervisor) (privLevel_to_bits .Supervisor) = false := by decide
+    rw [hc, if_pos rfl]
+    dsimp only [EStateM.bind, EStateM.pure]
+    rw [hlt]; rfl
+  · unfold exception_delegatee
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get] at hceN ⊢
+    rw [hmedelegN]
+    dsimp only [EStateM.bind, EStateM.pure]
+    rw [hceN]
+    dsimp only []
+    have hc : (true && bit_to_bool (BitVec.access 0#64
+        (Sail.BitVec.toNatInt (exceptionType_bits_forwards (.E_U_EnvCall ()))).toNat)) = false := by decide
+    have hlt : zopz0zI_u (privLevel_to_bits .Machine) (privLevel_to_bits .User) = false := by decide
+    rw [hc, if_neg Bool.false_ne_true]
+    dsimp only [EStateM.bind, EStateM.pure]
+    rw [hlt]; rfl
+
+/-- Direct `SailM` & pure bisimulation for RISC-V interrupt priority order (`findPendingInterrupt`)
+    and privilege-aware interrupt arbitration (`external_interrupts_pending`, `read_mip`,
+    `getPendingSet`, `dispatchInterrupt`; `InterruptRegs.lean` lines 673–686, `SysControl.lean`
+    lines 567–621):
+    1. Proves the exact architectural priority cascade
+       `MEI (11) > MSI (3) > MTI (7) > SEI (9) > SSI (1) > STI (5) > LCOFI (13) > none`;
+    2. Proves `dispatchInterrupt` dispatches non-delegated `MTI` to `Machine` when `mstatus.MIE = 1`
+       in M-mode, masks non-delegated interrupts in M-mode when `mstatus.MIE = 0`, and dispatches
+       `mideleg`-delegated `STI` (or external `sig_seip` `SEI`) to `Supervisor` when executing in
+       `Supervisor` (`mstatus.SIE = 1`) or `User` mode. -/
+theorem rv64InterruptPriorityAndDispatch_bisim_sail
+    (sMOn sMOff sSup : SequentialState RegisterType trivialChoiceSource)
+    (hmisaOn : sMOn.regs.get? .misa = some rv64StandardMisaSU)
+    (hmidelegOn : sMOn.regs.get? .mideleg = some (1#64 <<< 5))
+    (hmipOn : sMOn.regs.get? .mip = some ((1#64 <<< 7) ||| (1#64 <<< 5)))
+    (hmieOn : sMOn.regs.get? .mie = some ((1#64 <<< 7) ||| (1#64 <<< 5)))
+    (hmeipOn : sMOn.regs.get? .sig_meip = some 0#1)
+    (hseipOn : sMOn.regs.get? .sig_seip = some 0#1)
+    (hmstatusOn : sMOn.regs.get? .mstatus = some (1#64 <<< 3))
+    (hmisaOff : sMOff.regs.get? .misa = some rv64StandardMisaSU)
+    (hmidelegOff : sMOff.regs.get? .mideleg = some (1#64 <<< 5))
+    (hmipOff : sMOff.regs.get? .mip = some (1#64 <<< 7))
+    (hmieOff : sMOff.regs.get? .mie = some (1#64 <<< 7))
+    (hmeipOff : sMOff.regs.get? .sig_meip = some 0#1)
+    (hseipOff : sMOff.regs.get? .sig_seip = some 0#1)
+    (hmstatusOff : sMOff.regs.get? .mstatus = some 0#64)
+    (hmisaSup : sSup.regs.get? .misa = some rv64StandardMisaSU)
+    (hmidelegSup : sSup.regs.get? .mideleg = some ((1#64 <<< 9) ||| (1#64 <<< 5)))
+    (hmipSup : sSup.regs.get? .mip = some (1#64 <<< 5))
+    (hmieSup : sSup.regs.get? .mie = some ((1#64 <<< 9) ||| (1#64 <<< 5)))
+    (hmeipSup : sSup.regs.get? .sig_meip = some 0#1)
+    (hseipSup : sSup.regs.get? .sig_seip = some 1#1)
+    (hmstatusSup : sSup.regs.get? .mstatus = some (1#64 <<< 1)) :
+    findPendingInterrupt ((1#64 <<< 11) ||| (1#64 <<< 3) ||| (1#64 <<< 7)) = some .I_M_External ∧
+    findPendingInterrupt ((1#64 <<< 3) ||| (1#64 <<< 7) ||| (1#64 <<< 9)) = some .I_M_Software ∧
+    findPendingInterrupt ((1#64 <<< 7) ||| (1#64 <<< 9) ||| (1#64 <<< 1)) = some .I_M_Timer ∧
+    findPendingInterrupt ((1#64 <<< 9) ||| (1#64 <<< 1) ||| (1#64 <<< 5)) = some .I_S_External ∧
+    findPendingInterrupt ((1#64 <<< 1) ||| (1#64 <<< 5) ||| (1#64 <<< 13)) = some .I_S_Software ∧
+    findPendingInterrupt ((1#64 <<< 5) ||| (1#64 <<< 13)) = some .I_S_Timer ∧
+    findPendingInterrupt (1#64 <<< 13) = some .I_COF ∧
+    findPendingInterrupt 0#64 = none ∧
+    (dispatchInterrupt .Machine).run sMOn = .ok (some (.I_M_Timer, .Machine)) sMOn ∧
+    (dispatchInterrupt .Machine).run sMOff = .ok none sMOff ∧
+    (dispatchInterrupt .Supervisor).run sSup = .ok (some (.I_S_External, .Supervisor)) sSup := by
+  have hceOn := currentlyEnabled_Ext_S_standard sMOn rv64StandardMisaSU hmisaOn (by decide)
+  have hceOff := currentlyEnabled_Ext_S_standard sMOff rv64StandardMisaSU hmisaOff (by decide)
+  have hceSup := currentlyEnabled_Ext_S_standard sSup rv64StandardMisaSU hmisaSup (by decide)
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ?_, ?_, ?_⟩
+  · unfold dispatchInterrupt getPendingSet read_mip external_interrupts_pending
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get] at hceOn ⊢
+    rw [hceOn]; dsimp only []; rw [if_pos rfl]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmidelegOn]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmipOn]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmeipOn]; dsimp only [EStateM.bind, EStateM.pure]
+    rw [hceOn]; dsimp only []; rw [if_pos rfl]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hseipOn]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmieOn]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmieOn]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmstatusOn]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmstatusOn]
+    rfl
+  · unfold dispatchInterrupt getPendingSet read_mip external_interrupts_pending
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get] at hceOff ⊢
+    rw [hceOff]; dsimp only []; rw [if_pos rfl]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmidelegOff]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmipOff]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmeipOff]; dsimp only [EStateM.bind, EStateM.pure]
+    rw [hceOff]; dsimp only []; rw [if_pos rfl]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hseipOff]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmieOff]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmieOff]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmstatusOff]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmstatusOff]
+    rfl
+  · unfold dispatchInterrupt getPendingSet read_mip external_interrupts_pending
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get] at hceSup ⊢
+    rw [hceSup]; dsimp only []; rw [if_pos rfl]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmidelegSup]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmipSup]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmeipSup]; dsimp only [EStateM.bind, EStateM.pure]
+    rw [hceSup]; dsimp only []; rw [if_pos rfl]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hseipSup]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmieSup]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmieSup]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmstatusSup]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+    rw [hmstatusSup]
+    rfl
+
+private theorem get_xLPE_Supervisor (s : SequentialState RegisterType trivialChoiceSource)
+    (menv : BitVec 64) (hmenv : s.regs.get? .menvcfg = some menv) :
+    (get_xLPE .Supervisor).run s = .ok (bool_bit_backwards (_get_MEnvcfg_LPE menv)) s := by
+  rw [get_xLPE.eq_def]
+  dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+    readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+  rw [hmenv]
+  rfl
+
+private theorem get_xLPE_Machine (s : SequentialState RegisterType trivialChoiceSource)
+    (mseccfgVal : BitVec 64) (hmsec : s.regs.get? .mseccfg = some mseccfgVal) :
+    (get_xLPE .Machine).run s = .ok (bool_bit_backwards (_get_Seccfg_MLPE mseccfgVal)) s := by
+  rw [get_xLPE.eq_def]
+  dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+    readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+  rw [hmsec]
+  rfl
+
+private theorem get_xLPE_User_Ext_S (s : SequentialState RegisterType trivialChoiceSource)
+    (misaVal menv senv : BitVec 64)
+    (hmisa : s.regs.get? .misa = some misaVal)
+    (hs : _get_Misa_S misaVal = 1#1)
+    (hmenv : s.regs.get? .menvcfg = some menv)
+    (hsenv : s.regs.get? .senvcfg = some senv) :
+    (get_xLPE .User).run s = .ok (bool_bit_backwards (_get_SEnvcfg_LPE
+      (_update_SEnvcfg_SSE senv (_get_MEnvcfg_SSE menv &&& _get_SEnvcfg_SSE senv)))) s := by
+  have hce := currentlyEnabled_Ext_S_standard s misaVal hmisa hs
+  rw [get_xLPE.eq_def]
+  unfold read_senvcfg
+  dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+    readReg, PreSail.readReg, get, getThe, MonadStateOf.get] at hce ⊢
+  rw [hce]; dsimp only []; rw [if_pos rfl]
+  dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+  rw [hsenv]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+  rw [hmenv]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+  rw [hsenv]
+  rfl
+
+private theorem csr_name_write_callback_mstatus_raw (v : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    long_csr_write_callback "mstatus" "mstatush" v s = EStateM.Result.ok () s := rfl
+
+private theorem csr_name_write_callback_mcause_raw (v : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    csr_name_write_callback "mcause" v s = EStateM.Result.ok () s := rfl
+
+private theorem csr_name_write_callback_mtval_raw (v : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    csr_name_write_callback "mtval" v s = EStateM.Result.ok () s := rfl
+
+private theorem csr_name_write_callback_mepc_raw (v : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    csr_name_write_callback "mepc" v s = EStateM.Result.ok () s := rfl
+
+private theorem csr_name_write_callback_scause_raw (v : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    csr_name_write_callback "scause" v s = EStateM.Result.ok () s := rfl
+
+private theorem csr_name_write_callback_stval_raw (v : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    csr_name_write_callback "stval" v s = EStateM.Result.ok () s := rfl
+
+private theorem csr_name_write_callback_sepc_raw (v : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    csr_name_write_callback "sepc" v s = EStateM.Result.ok () s := rfl
+
+private theorem track_trap_Machine_noop (is_int : Bool) (cause : BitVec 6)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (vms vmc vmt vme : BitVec 64)
+    (hms : s.regs.get? .mstatus = some vms)
+    (hmc : s.regs.get? .mcause = some vmc)
+    (hmt : s.regs.get? .mtval = some vmt)
+    (hme : s.regs.get? .mepc = some vme) :
+    (track_trap .Machine is_int cause).run s = .ok () s := by
+  unfold track_trap trap_callback
+  dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+    readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+  rw [hms]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+  rw [csr_name_write_callback_mstatus_raw]; dsimp only []
+  rw [hmc]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+  rw [csr_name_write_callback_mcause_raw]; dsimp only []
+  rw [hmt]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+  rw [csr_name_write_callback_mtval_raw]; dsimp only []
+  rw [hme]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+  rw [csr_name_write_callback_mepc_raw]
+
+private theorem track_trap_Supervisor_noop (is_int : Bool) (cause : BitVec 6)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (vms vsc vst vse : BitVec 64)
+    (hms : s.regs.get? .mstatus = some vms)
+    (hsc : s.regs.get? .scause = some vsc)
+    (hst : s.regs.get? .stval = some vst)
+    (hse : s.regs.get? .sepc = some vse) :
+    (track_trap .Supervisor is_int cause).run s = .ok () s := by
+  unfold track_trap trap_callback
+  dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+    readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+  rw [hms]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+  rw [csr_name_write_callback_mstatus_raw]; dsimp only []
+  rw [hsc]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+  rw [csr_name_write_callback_scause_raw]; dsimp only []
+  rw [hst]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+  rw [csr_name_write_callback_stval_raw]; dsimp only []
+  rw [hse]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get]
+  rw [csr_name_write_callback_sepc_raw]
+
+/-- Direct end-to-end `SailM` bisimulation for `trap_handler`, `exception_handler`, and
+    `handle_exception` (`SysControl.lean` lines 647–764; `ZicfilpRegs.lean` lines 270–282):
+    1. Proves `handle_exception` in `Supervisor` mode on non-delegated `E_S_EnvCall` traps to
+       `Machine` mode, preserving `elp` in `mstatus.MPELP` (`[41]`) and resetting `elp := 0`,
+       writing `mcause := 9` (`IsInterrupt = 0`, `Cause = 9`), `mstatus.MPIE := mstatus.MIE`,
+       `mstatus.MIE := 0`, `mstatus.MPP := 0b01` (`Supervisor`), `mtval := 0`, `mepc := PC`,
+       `cur_privilege := .Machine`, and redirecting `nextPC` to `mtvec` (`0x8000_1000`);
+    2. Proves `handle_exception` in `User` mode on `medeleg`-delegated `E_Load_Page_Fault` (`13`)
+       with faulting `vaddr = 0x0000_003F_FFFF_F008` traps to `Supervisor` mode, preserving `elp`
+       in `mstatus.SPELP` (`[23]`), writing `scause := 13`, `mstatus.SPIE := mstatus.SIE`,
+       `mstatus.SIE := 0`, `mstatus.SPP := 0` (`User`), `stval := vaddr`, `sepc := PC`,
+       `cur_privilege := .Supervisor`, and redirecting `nextPC` to `stvec` (`0x8000_2000`);
+    3. Proves `trap_handler .Machine (.Interrupt .I_M_Timer)` writes `mcause := (1 <<< 63) ||| 7`
+       and computes the vectored handler PC `base + 4 * 7` (`0x8000_101C`). -/
+theorem rv64TrapHandlerMachineAndSupervisor_bisim_sail
+    (sMach sSup sInt : SequentialState RegisterType trivialChoiceSource)
+    (hprivMach : sMach.regs.get? .cur_privilege = some .Supervisor)
+    (hpcMach : sMach.regs.get? .PC = some 0x0000000080200040#64)
+    (hmisaMach : sMach.regs.get? .misa = some rv64StandardMisaSU)
+    (hmedelegMach : sMach.regs.get? .medeleg = some 0#64)
+    (helpMach : sMach.regs.get? .elp = some 1#1)
+    (hmstatusMach : sMach.regs.get? .mstatus = some (1#64 <<< 3))
+    (hmcauseMach : sMach.regs.get? .mcause = some 0#64)
+    (hmtvecMach : sMach.regs.get? .mtvec = some 0x0000000080001000#64)
+    (hprivSup : sSup.regs.get? .cur_privilege = some .User)
+    (hpcSup : sSup.regs.get? .PC = some 0x0000000000010080#64)
+    (hmisaSup : sSup.regs.get? .misa = some rv64StandardMisaSU)
+    (hmedelegSup : sSup.regs.get? .medeleg = some (1#64 <<< 13))
+    (helpSup : sSup.regs.get? .elp = some 1#1)
+    (hmstatusSup : sSup.regs.get? .mstatus = some (1#64 <<< 1))
+    (hscauseSup : sSup.regs.get? .scause = some 0#64)
+    (hstvecSup : sSup.regs.get? .stvec = some 0x0000000080002000#64)
+    (hprivInt : sInt.regs.get? .cur_privilege = some .Supervisor)
+    (helpInt : sInt.regs.get? .elp = some 0#1)
+    (hmstatusInt : sInt.regs.get? .mstatus = some (1#64 <<< 3))
+    (hmcauseInt : sInt.regs.get? .mcause = some 0#64)
+    (hmtvecInt : sInt.regs.get? .mtvec = some 0x0000000080001001#64) :
+    let mstatusMachAfter : BitVec 64 := (1#64 <<< 41) ||| (0b01#64 <<< 11) ||| (1#64 <<< 7)
+    let regsMachAfter := (((((((sMach.regs.insert .mstatus (1#64 <<< 41 ||| 1#64 <<< 3)).insert .elp 0#1).insert
+        .mcause 0#64).insert .mcause 9#64).insert .mstatus ((1#64 <<< 41) ||| (1#64 <<< 7) ||| (1#64 <<< 3))).insert
+        .mstatus ((1#64 <<< 41) ||| (1#64 <<< 7))).insert .mstatus mstatusMachAfter |>.insert
+        .mtval 0#64 |>.insert .mepc 0x0000000080200040#64 |>.insert .cur_privilege .Machine |>.insert
+        .nextPC 0x0000000080001000#64)
+    let mstatusSupAfter : BitVec 64 := (1#64 <<< 23) ||| (1#64 <<< 5)
+    let regsSupAfter := (((((((sSup.regs.insert .mstatus (1#64 <<< 23 ||| 1#64 <<< 1)).insert .elp 0#1).insert
+        .scause 0#64).insert .scause 13#64).insert .mstatus ((1#64 <<< 23) ||| (1#64 <<< 5) ||| (1#64 <<< 1))).insert
+        .mstatus mstatusSupAfter).insert .mstatus mstatusSupAfter |>.insert
+        .stval 0x0000003ffffff008#64 |>.insert .sepc 0x0000000000010080#64 |>.insert
+        .cur_privilege .Supervisor |>.insert .nextPC 0x0000000080002000#64)
+    let mcauseIntAfter : BitVec 64 := (1#64 <<< 63) ||| 7#64
+    let mstatusIntAfter : BitVec 64 := (0b01#64 <<< 11) ||| (1#64 <<< 7)
+    let regsIntAfter := (((((((sInt.regs.insert .mstatus (1#64 <<< 3)).insert .elp 0#1).insert
+        .mcause (1#64 <<< 63)).insert .mcause mcauseIntAfter).insert .mstatus ((1#64 <<< 7) ||| (1#64 <<< 3))).insert
+        .mstatus (1#64 <<< 7)).insert .mstatus mstatusIntAfter |>.insert
+        .mtval 0#64 |>.insert .mepc 0x0000000080200044#64 |>.insert .cur_privilege .Machine)
+    (handle_exception 0xdeadbeef#64 (.E_S_EnvCall ())).run sMach =
+      .ok () { sMach with regs := regsMachAfter } ∧
+    regsMachAfter.get? .mcause = some 9#64 ∧
+    regsMachAfter.get? .mstatus = some mstatusMachAfter ∧
+    regsMachAfter.get? .mtval = some 0#64 ∧
+    regsMachAfter.get? .mepc = some 0x0000000080200040#64 ∧
+    regsMachAfter.get? .nextPC = some 0x0000000080001000#64 ∧
+    (handle_exception 0x0000003ffffff008#64 (.E_Load_Page_Fault ())).run sSup =
+      .ok () { sSup with regs := regsSupAfter } ∧
+    regsSupAfter.get? .scause = some 13#64 ∧
+    regsSupAfter.get? .mstatus = some mstatusSupAfter ∧
+    regsSupAfter.get? .stval = some 0x0000003ffffff008#64 ∧
+    regsSupAfter.get? .sepc = some 0x0000000000010080#64 ∧
+    regsSupAfter.get? .nextPC = some 0x0000000080002000#64 ∧
+    (trap_handler .Machine (.Interrupt .I_M_Timer) 0x0000000080200044#64 none none).run sInt =
+      .ok 0x000000008000101c#64 { sInt with regs := regsIntAfter } := by
+  have hceMach := currentlyEnabled_Ext_S_standard sMach rv64StandardMisaSU hmisaMach (by decide)
+  have hceSup := currentlyEnabled_Ext_S_standard sSup rv64StandardMisaSU hmisaSup (by decide)
+  let sSup2 := { sSup with regs := (sSup.regs.insert .mstatus (1#64 <<< 23 ||| 1#64 <<< 1)).insert .elp 0#1 }
+  have hmisaSup2 : sSup2.regs.get? .misa = some rv64StandardMisaSU := by
+    simpa [sSup2, Std.ExtDHashMap.get?_insert] using hmisaSup
+  have hceSup2 := currentlyEnabled_Ext_S_standard sSup2 rv64StandardMisaSU hmisaSup2 (by decide)
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · unfold handle_exception exception_handler exception_delegatee make_sync_exception
+      xtval_exception_value trap_handler zicfilp_preserve_elp_on_trap reset_elp
+      prepare_trap_vector set_next_pc get_config_print_exception get_config_print_interrupt
+      tval handle_trap_extension redirect_callback sail_branch_announce
+    rw [hartSupports_Ext_Zicfilp]
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet,
+      EStateM.run, readReg, PreSail.readReg, writeReg, PreSail.writeReg,
+      modify, modifyGet, MonadStateOf.modifyGet, get, getThe, MonadStateOf.get] at hceMach ⊢
+    rw [hprivMach]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hpcMach]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hmedelegMach]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hceMach]; dsimp only []
+    have hc0 : (true && bit_to_bool (BitVec.access 0#64
+        (Sail.BitVec.toNatInt (exceptionType_bits_forwards (.E_S_EnvCall ()))).toNat)) = false := by decide
+    have hlt0 : zopz0zI_u (privLevel_to_bits .Machine) (privLevel_to_bits .Supervisor) = false := by decide
+    rw [hc0, if_neg Bool.false_ne_true]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hlt0, if_neg Bool.false_ne_true]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    have hf0 : (false || false) = false := rfl
+    rw [if_neg Bool.false_ne_true]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hf0, if_neg Bool.false_ne_true]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [if_pos rfl]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hmstatusMach]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [helpMach]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    have hu1 : Sail.BitVec.updateSubrange (1#64 <<< 3) 41 41 1#1 = (1#64 <<< 41 ||| 1#64 <<< 3) := by decide
+    have hu2 : landing_pad_bits_backwards .NO_LP_EXPECTED = 0#1 := rfl
+    rw [hu1, hu2]
+    have hmcRead : (((sMach.regs.insert Register.mstatus (1#64 <<< 41 ||| 1#64 <<< 3)).insert Register.elp 0#1).get?
+        Register.mcause) = some 0#64 := by
+      simp [Std.ExtDHashMap.get?_insert, hmcauseMach]
+    rw [hmcRead]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    have hu3 : Sail.BitVec.updateSubrange 0#64 (64 -i 1) (64 -i 1)
+        (bool_to_bit (trapCause_is_interrupt (.Exception (.E_S_EnvCall ())))) = 0#64 := by decide
+    have hu4 : Sail.BitVec.updateSubrange 0#64 (64 -i 2) 0
+        (zero_extend (m := 64 -i 1) (trapCause_bits_forwards (.Exception (.E_S_EnvCall ())))) = 9#64 := by decide
+    have hu5 : Sail.BitVec.updateSubrange (1#64 <<< 41 ||| 1#64 <<< 3) 7 7
+        (_get_Mstatus_MIE (1#64 <<< 41 ||| 1#64 <<< 3)) =
+        ((1#64 <<< 41) ||| (1#64 <<< 7) ||| (1#64 <<< 3)) := by decide
+    have hu6 : Sail.BitVec.updateSubrange ((1#64 <<< 41) ||| (1#64 <<< 7) ||| (1#64 <<< 3)) 3 3 0#1 =
+        ((1#64 <<< 41) ||| (1#64 <<< 7)) := by decide
+    have hu7 : Sail.BitVec.updateSubrange ((1#64 <<< 41) ||| (1#64 <<< 7)) 12 11
+        (privLevel_to_bits .Supervisor) =
+        ((1#64 <<< 41) ||| (0b01#64 <<< 11) ||| (1#64 <<< 7)) := by decide
+    have hu8 : zeros (n := 64) = 0#64 := rfl
+    rw [hu3]
+    have hmcRead0M : ((((sMach.regs.insert Register.mstatus (1#64 <<< 41 ||| 1#64 <<< 3)).insert Register.elp 0#1).insert
+        Register.mcause 0#64).get? Register.mcause) = some 0#64 := by
+      simp [Std.ExtDHashMap.get?_insert_self]
+    rw [hmcRead0M]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hu4]
+    have hmsRead1 : (((((sMach.regs.insert Register.mstatus (1#64 <<< 41 ||| 1#64 <<< 3)).insert Register.elp 0#1).insert
+        Register.mcause 0#64).insert Register.mcause 9#64).get? Register.mstatus) =
+        some (1#64 <<< 41 ||| 1#64 <<< 3) := by
+      simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+    rw [hmsRead1]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hmsRead1]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hu5]
+    have hmsRead2M : ((((((sMach.regs.insert Register.mstatus (1#64 <<< 41 ||| 1#64 <<< 3)).insert Register.elp 0#1).insert
+        Register.mcause 0#64).insert Register.mcause 9#64).insert
+        Register.mstatus (1#64 <<< 41 ||| 1#64 <<< 7 ||| 1#64 <<< 3)).get? Register.mstatus) =
+        some (1#64 <<< 41 ||| 1#64 <<< 7 ||| 1#64 <<< 3) := by
+      simp [Std.ExtDHashMap.get?_insert_self]
+    rw [hmsRead2M]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hu6]
+    have hmsRead3M : (((((((sMach.regs.insert Register.mstatus (1#64 <<< 41 ||| 1#64 <<< 3)).insert Register.elp 0#1).insert
+        Register.mcause 0#64).insert Register.mcause 9#64).insert
+        Register.mstatus (1#64 <<< 41 ||| 1#64 <<< 7 ||| 1#64 <<< 3)).insert
+        Register.mstatus (1#64 <<< 41 ||| 1#64 <<< 7)).get? Register.mstatus) =
+        some (1#64 <<< 41 ||| 1#64 <<< 7) := by
+      simp [Std.ExtDHashMap.get?_insert_self]
+    rw [hmsRead3M]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    have hprivRead : (((((((sMach.regs.insert Register.mstatus (1#64 <<< 41 ||| 1#64 <<< 3)).insert Register.elp 0#1).insert
+        Register.mcause 0#64).insert Register.mcause 9#64).insert
+        Register.mstatus ((1#64 <<< 41) ||| (1#64 <<< 7) ||| (1#64 <<< 3))).insert
+        Register.mstatus ((1#64 <<< 41) ||| (1#64 <<< 7))).get? Register.cur_privilege) =
+        some .Supervisor := by
+      simp [Std.ExtDHashMap.get?_insert, hprivMach]
+    rw [hprivRead]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [if_neg Bool.false_ne_true]
+    dsimp only []
+    rw [hu7, hu8]
+    let stM := { sMach with regs := (((((((sMach.regs.insert .mstatus (1#64 <<< 41 ||| 1#64 <<< 3)).insert .elp 0#1).insert
+        .mcause 0#64).insert .mcause 9#64).insert .mstatus ((1#64 <<< 41) ||| (1#64 <<< 7) ||| (1#64 <<< 3))).insert
+        .mstatus ((1#64 <<< 41) ||| (1#64 <<< 7))).insert .mstatus ((1#64 <<< 41) ||| (0b01#64 <<< 11) ||| (1#64 <<< 7)) |>.insert
+        .mtval 0#64 |>.insert .mepc 0x0000000080200040#64 |>.insert .cur_privilege .Machine) }
+    have htt := track_trap_Machine_noop (trapCause_is_interrupt (.Exception (.E_S_EnvCall ())))
+      (trapCause_bits_forwards (.Exception (.E_S_EnvCall ()))) stM
+      ((1#64 <<< 41) ||| (0b01#64 <<< 11) ||| (1#64 <<< 7)) 9#64 0#64 0x0000000080200040#64
+      (by simp [stM, Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self])
+      (by simp [stM, Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self])
+      (by simp [stM, Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self])
+      (by simp [stM, Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self])
+    dsimp only [EStateM.run] at htt
+    rw [htt]
+    dsimp only []
+    have hmcPostM : stM.regs.get? .mcause = some 9#64 := by
+      simp [stM, Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+    have hmtvPostM : stM.regs.get? .mtvec = some 0x0000000080001000#64 := by
+      simp [stM, Std.ExtDHashMap.get?_insert, hmtvecMach]
+    rw [hmcPostM]; dsimp only [EStateM.pure]
+    rw [hmtvPostM]; dsimp only [EStateM.pure]
+    have hu9 : tvec_addr 0x0000000080001000#64 9#64 = some 0x0000000080001000#64 := by decide
+    rw [hu9]; rfl
+  · simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+  · simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+  · simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+  · simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+  · simp [Std.ExtDHashMap.get?_insert_self]
+  · unfold handle_exception exception_handler exception_delegatee make_sync_exception
+      xtval_exception_value trap_handler zicfilp_preserve_elp_on_trap reset_elp
+      prepare_trap_vector set_next_pc get_config_print_exception get_config_print_interrupt
+      tval handle_trap_extension redirect_callback sail_branch_announce
+      load_page_fault_writes_xtval assert
+    rw [hartSupports_Ext_Zicfilp]
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet,
+      EStateM.run, readReg, PreSail.readReg, writeReg, PreSail.writeReg,
+      modify, modifyGet, MonadStateOf.modifyGet, get, getThe, MonadStateOf.get] at hceSup hceSup2 ⊢
+    rw [hprivSup]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hpcSup]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hmedelegSup]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hceSup]; dsimp only []
+    have hc1 : (true && bit_to_bool (BitVec.access (1#64 <<< 13)
+        (Sail.BitVec.toNatInt (exceptionType_bits_forwards (.E_Load_Page_Fault ()))).toNat)) = true := by decide
+    have hlt1 : zopz0zI_u (privLevel_to_bits .Supervisor) (privLevel_to_bits .User) = false := by decide
+    rw [hc1, if_pos rfl]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hlt1, if_neg Bool.false_ne_true]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    have hf0 : (false || false) = false := rfl
+    rw [if_neg Bool.false_ne_true]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hf0, if_neg Bool.false_ne_true]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [if_pos rfl]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hmstatusSup]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [helpSup]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    have hu1 : Sail.BitVec.updateSubrange (1#64 <<< 1) 23 23 1#1 = (1#64 <<< 23 ||| 1#64 <<< 1) := by decide
+    have hu2 : landing_pad_bits_backwards .NO_LP_EXPECTED = 0#1 := rfl
+    rw [hu1, hu2]
+    rw [hceSup2]
+    dsimp only []; rw [if_pos rfl]
+    dsimp only [PreSail.assert]; rw [if_pos rfl]
+    dsimp only [Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    have hscRead : sSup2.regs.get? Register.scause = some 0#64 := by
+      simp [sSup2, Std.ExtDHashMap.get?_insert, hscauseSup]
+    rw [hscRead]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    have hu3 : Sail.BitVec.updateSubrange 0#64 (64 -i 1) (64 -i 1)
+        (bool_to_bit (trapCause_is_interrupt (.Exception (.E_Load_Page_Fault ())))) = 0#64 := by decide
+    have hu4 : Sail.BitVec.updateSubrange 0#64 (64 -i 2) 0
+        (zero_extend (m := 64 -i 1) (trapCause_bits_forwards (.Exception (.E_Load_Page_Fault ())))) = 13#64 := by decide
+    have hu5 : Sail.BitVec.updateSubrange (1#64 <<< 23 ||| 1#64 <<< 1) 5 5
+        (_get_Mstatus_SIE (1#64 <<< 23 ||| 1#64 <<< 1)) =
+        ((1#64 <<< 23) ||| (1#64 <<< 5) ||| (1#64 <<< 1)) := by decide
+    have hu6 : Sail.BitVec.updateSubrange ((1#64 <<< 23) ||| (1#64 <<< 5) ||| (1#64 <<< 1)) 1 1 0#1 =
+        ((1#64 <<< 23) ||| (1#64 <<< 5)) := by decide
+    have hu7 : Sail.BitVec.updateSubrange ((1#64 <<< 23) ||| (1#64 <<< 5)) 8 8 0#1 =
+        ((1#64 <<< 23) ||| (1#64 <<< 5)) := by decide
+    rw [hu3]
+    have hscRead0S : ((sSup2.regs.insert Register.scause 0#64).get? Register.scause) = some 0#64 := by
+      simp [Std.ExtDHashMap.get?_insert_self]
+    rw [hscRead0S]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hu4]
+    have hmsRead1 : (((sSup2.regs.insert Register.scause 0#64).insert Register.scause 13#64).get?
+        Register.mstatus) = some (1#64 <<< 23 ||| 1#64 <<< 1) := by
+      simp [sSup2, Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+    rw [hmsRead1]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hmsRead1]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hu5]
+    have hmsRead2S : ((((sSup2.regs.insert Register.scause 0#64).insert Register.scause 13#64).insert
+        Register.mstatus (1#64 <<< 23 ||| 1#64 <<< 5 ||| 1#64 <<< 1)).get? Register.mstatus) =
+        some (1#64 <<< 23 ||| 1#64 <<< 5 ||| 1#64 <<< 1) := by
+      simp [Std.ExtDHashMap.get?_insert_self]
+    rw [hmsRead2S]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hu6]
+    have hmsRead3S : (((((sSup2.regs.insert Register.scause 0#64).insert Register.scause 13#64).insert
+        Register.mstatus (1#64 <<< 23 ||| 1#64 <<< 5 ||| 1#64 <<< 1)).insert
+        Register.mstatus (1#64 <<< 23 ||| 1#64 <<< 5)).get? Register.mstatus) =
+        some (1#64 <<< 23 ||| 1#64 <<< 5) := by
+      simp [Std.ExtDHashMap.get?_insert_self]
+    rw [hmsRead3S]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    have hprivRead : ((((((sSup2.regs.insert Register.scause 0#64).insert Register.scause 13#64).insert
+        Register.mstatus ((1#64 <<< 23) ||| (1#64 <<< 5) ||| (1#64 <<< 1))).insert
+        Register.mstatus ((1#64 <<< 23) ||| (1#64 <<< 5))).get? Register.cur_privilege)) =
+        some .User := by
+      simp [sSup2, Std.ExtDHashMap.get?_insert, hprivSup]
+    rw [hprivRead]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hu7]
+    let stS := { sSup2 with regs := ((((((sSup2.regs.insert .scause 0#64).insert .scause 13#64).insert
+        .mstatus ((1#64 <<< 23) ||| (1#64 <<< 5) ||| (1#64 <<< 1))).insert
+        .mstatus ((1#64 <<< 23) ||| (1#64 <<< 5))).insert .mstatus ((1#64 <<< 23) ||| (1#64 <<< 5))) |>.insert
+        .stval 0x0000003ffffff008#64 |>.insert .sepc 0x0000000000010080#64 |>.insert .cur_privilege .Supervisor) }
+    have htt := track_trap_Supervisor_noop (trapCause_is_interrupt (.Exception (.E_Load_Page_Fault ())))
+      (trapCause_bits_forwards (.Exception (.E_Load_Page_Fault ()))) stS
+      ((1#64 <<< 23) ||| (1#64 <<< 5)) 13#64 0x0000003ffffff008#64 0x0000000000010080#64
+      (by simp [stS, sSup2, Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self])
+      (by simp [stS, sSup2, Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self])
+      (by simp [stS, sSup2, Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self])
+      (by simp [stS, sSup2, Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self])
+    dsimp only [EStateM.run] at htt
+    rw [htt]
+    dsimp only []
+    have hscPostS : stS.regs.get? .scause = some 13#64 := by
+      simp [stS, sSup2, Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+    have hstvPostS : stS.regs.get? .stvec = some 0x0000000080002000#64 := by
+      simp [stS, sSup2, Std.ExtDHashMap.get?_insert, hstvecSup]
+    rw [hscPostS]; dsimp only [EStateM.pure]
+    rw [hstvPostS]; dsimp only [EStateM.pure]
+    have hu9 : tvec_addr 0x0000000080002000#64 13#64 = some 0x0000000080002000#64 := by decide
+    rw [hu9]; rfl
+  · simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+  · simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+  · simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+  · simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+  · simp [Std.ExtDHashMap.get?_insert_self]
+  · unfold trap_handler zicfilp_preserve_elp_on_trap reset_elp
+      prepare_trap_vector get_config_print_exception get_config_print_interrupt
+      tval handle_trap_extension
+    rw [hartSupports_Ext_Zicfilp]
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet,
+      EStateM.run, readReg, PreSail.readReg, writeReg, PreSail.writeReg,
+      modify, modifyGet, MonadStateOf.modifyGet, get, getThe, MonadStateOf.get]
+    have hf0 : (false || false) = false := rfl
+    rw [hf0, if_neg Bool.false_ne_true]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [if_pos rfl]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hmstatusInt]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [helpInt]; dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    have hu1 : Sail.BitVec.updateSubrange (1#64 <<< 3) 41 41 0#1 = (1#64 <<< 3) := by decide
+    have hu2 : landing_pad_bits_backwards .NO_LP_EXPECTED = 0#1 := rfl
+    rw [hu1, hu2]
+    have hmcRead : (((sInt.regs.insert Register.mstatus (1#64 <<< 3)).insert Register.elp 0#1).get?
+        Register.mcause) = some 0#64 := by
+      simp [Std.ExtDHashMap.get?_insert, hmcauseInt]
+    rw [hmcRead]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    have hu3 : Sail.BitVec.updateSubrange 0#64 (64 -i 1) (64 -i 1)
+        (bool_to_bit (trapCause_is_interrupt (.Interrupt .I_M_Timer))) = (1#64 <<< 63) := by decide
+    have hu4 : Sail.BitVec.updateSubrange (1#64 <<< 63) (64 -i 2) 0
+        (zero_extend (m := 64 -i 1) (trapCause_bits_forwards (.Interrupt .I_M_Timer))) =
+        ((1#64 <<< 63) ||| 7#64) := by decide
+    have hu5 : Sail.BitVec.updateSubrange (1#64 <<< 3) 7 7 (_get_Mstatus_MIE (1#64 <<< 3)) =
+        ((1#64 <<< 7) ||| (1#64 <<< 3)) := by decide
+    have hu6 : Sail.BitVec.updateSubrange ((1#64 <<< 7) ||| (1#64 <<< 3)) 3 3 0#1 =
+        (1#64 <<< 7) := by decide
+    have hu7 : Sail.BitVec.updateSubrange (1#64 <<< 7) 12 11 (privLevel_to_bits .Supervisor) =
+        ((0b01#64 <<< 11) ||| (1#64 <<< 7)) := by decide
+    have hu8 : zeros (n := 64) = 0#64 := rfl
+    rw [hu3]
+    have hmcRead0I : ((((sInt.regs.insert Register.mstatus (1#64 <<< 3)).insert Register.elp 0#1).insert
+        Register.mcause (1#64 <<< 63)).get? Register.mcause) = some (1#64 <<< 63) := by
+      simp [Std.ExtDHashMap.get?_insert_self]
+    rw [hmcRead0I]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hu4]
+    have hmsRead1 : (((((sInt.regs.insert Register.mstatus (1#64 <<< 3)).insert Register.elp 0#1).insert
+        Register.mcause (1#64 <<< 63)).insert Register.mcause ((1#64 <<< 63) ||| 7#64)).get?
+        Register.mstatus) = some (1#64 <<< 3) := by
+      simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+    rw [hmsRead1]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hmsRead1]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hu5]
+    have hmsRead2I : ((((((sInt.regs.insert Register.mstatus (1#64 <<< 3)).insert Register.elp 0#1).insert
+        Register.mcause (1#64 <<< 63)).insert Register.mcause (1#64 <<< 63 ||| 7#64)).insert
+        Register.mstatus (1#64 <<< 7 ||| 1#64 <<< 3)).get? Register.mstatus) =
+        some (1#64 <<< 7 ||| 1#64 <<< 3) := by
+      simp [Std.ExtDHashMap.get?_insert_self]
+    rw [hmsRead2I]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hu6]
+    have hmsRead3I : (((((((sInt.regs.insert Register.mstatus (1#64 <<< 3)).insert Register.elp 0#1).insert
+        Register.mcause (1#64 <<< 63)).insert Register.mcause (1#64 <<< 63 ||| 7#64)).insert
+        Register.mstatus (1#64 <<< 7 ||| 1#64 <<< 3)).insert
+        Register.mstatus (1#64 <<< 7)).get? Register.mstatus) =
+        some (1#64 <<< 7) := by
+      simp [Std.ExtDHashMap.get?_insert_self]
+    rw [hmsRead3I]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    have hprivRead : (((((((sInt.regs.insert Register.mstatus (1#64 <<< 3)).insert Register.elp 0#1).insert
+        Register.mcause (1#64 <<< 63)).insert Register.mcause ((1#64 <<< 63) ||| 7#64)).insert
+        Register.mstatus ((1#64 <<< 7) ||| (1#64 <<< 3))).insert
+        Register.mstatus (1#64 <<< 7)).get? Register.cur_privilege) =
+        some .Supervisor := by
+      simp [Std.ExtDHashMap.get?_insert, hprivInt]
+    rw [hprivRead]
+    dsimp only [EStateM.bind, EStateM.pure, EStateM.get, EStateM.modifyGet]
+    rw [hu7, hu8]
+    let stI := { sInt with regs := (((((((sInt.regs.insert .mstatus (1#64 <<< 3)).insert .elp 0#1).insert
+        .mcause (1#64 <<< 63)).insert .mcause ((1#64 <<< 63) ||| 7#64)).insert .mstatus ((1#64 <<< 7) ||| (1#64 <<< 3))).insert
+        .mstatus (1#64 <<< 7)).insert .mstatus ((0b01#64 <<< 11) ||| (1#64 <<< 7)) |>.insert
+        .mtval 0#64 |>.insert .mepc 0x0000000080200044#64 |>.insert .cur_privilege .Machine) }
+    have htt := track_trap_Machine_noop (trapCause_is_interrupt (.Interrupt .I_M_Timer))
+      (trapCause_bits_forwards (.Interrupt .I_M_Timer)) stI
+      ((0b01#64 <<< 11) ||| (1#64 <<< 7)) ((1#64 <<< 63) ||| 7#64) 0#64 0x0000000080200044#64
+      (by simp [stI, Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self])
+      (by simp [stI, Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self])
+      (by simp [stI, Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self])
+      (by simp [stI, Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self])
+    dsimp only [EStateM.run] at htt
+    rw [htt]
+    dsimp only []
+    have hmcPostI : stI.regs.get? .mcause = some ((1#64 <<< 63) ||| 7#64) := by
+      simp [stI, Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+    have hmtvPostI : stI.regs.get? .mtvec = some 0x0000000080001001#64 := by
+      simp [stI, Std.ExtDHashMap.get?_insert, hmtvecInt]
+    rw [hmcPostI]; dsimp only [EStateM.pure]
+    rw [hmtvPostI]; dsimp only [EStateM.pure]
+    have hu9 : tvec_addr 0x0000000080001001#64 ((1#64 <<< 63) ||| 7#64) =
+        some 0x000000008000101c#64 := by decide
+    rw [hu9]; rfl
+
+private theorem regs_get?_insert_self
+    (m : Std.ExtDHashMap Register RegisterType) (k : Register) (v : RegisterType k) :
+    (m.insert k v).get? k = some v := by
+  simp only [Std.ExtDHashMap.get?_insert_self]
+
+private theorem regs_get?_insert_ne
+    (m : Std.ExtDHashMap Register RegisterType) (k1 k2 : Register) (v : RegisterType k1)
+    (hne : (k1 == k2) = false) :
+    (m.insert k1 v).get? k2 = m.get? k2 := by
+  rw [Std.ExtDHashMap.get?_insert]
+  exact dif_neg (by rw [hne]; exact Bool.false_ne_true)
+
+/-- Exact mirror of upstream `execute_MRET` (`LeanRV64D/InstsEnd.lean`, lines 68873–68910;
+    SHA-256 snippet-pinned in `scripts/check_sail_riscv_bridge_sync.py`) over `SailM`. -/
+noncomputable def sailExecuteMret (_ : Unit) : SailM ExecutionResult := do
+  if ((bne (← readReg .cur_privilege) .Machine) : Bool)
+  then pure (.Illegal_Instruction ())
+  else
+    if ((LeanRV64D.Functions.not (ext_check_xret_priv .Machine)) : Bool)
+    then pure (.Ext_XRET_Priv_Failure ())
+    else
+      let prev_priv ← readReg .cur_privilege
+      writeReg .mstatus (Sail.BitVec.updateSubrange (← readReg .mstatus) 3 3
+        (_get_Mstatus_MPIE (← readReg .mstatus)))
+      writeReg .mstatus (Sail.BitVec.updateSubrange (← readReg .mstatus) 7 7 1#1)
+      writeReg .cur_privilege (← privLevel_bits_forwards
+        (_get_Mstatus_MPP (← readReg .mstatus), 0#1))
+      writeReg .mstatus (Sail.BitVec.updateSubrange (← readReg .mstatus) 12 11
+        (privLevel_to_bits (← do
+          if ((← currentlyEnabled .Ext_U) : Bool)
+          then pure .User
+          else pure .Machine)))
+      if ((bne (← readReg .cur_privilege) .Machine) : Bool)
+      then writeReg .mstatus (Sail.BitVec.updateSubrange (← readReg .mstatus) 17 17 0#1)
+      else pure ()
+      if ((hartSupports .Ext_Zicfilp) : Bool)
+      then zicfilp_restore_elp_on_xret .mRET (← readReg .cur_privilege)
+      else pure ()
+      long_csr_write_callback "mstatus" "mstatush" (← readReg .mstatus)
+      if ((get_config_print_exception ()) : Bool)
+      then
+        pure (print_endline
+          (HAppend.hAppend "ret-ing from "
+            (HAppend.hAppend (← privLevel_to_str prev_priv)
+              (HAppend.hAppend " to " (← privLevel_to_str (← readReg .cur_privilege))))))
+      else pure ()
+      set_next_pc (← prepare_xret_target .Machine)
+      let _ : Unit := xret_callback true
+      pure (.Retire_Success ())
+
+
+/-- Exact mirror of upstream `execute_SRET` (`LeanRV64D/InstsEnd.lean`, lines 67504–67549;
+    SHA-256 snippet-pinned in `scripts/check_sail_riscv_bridge_sync.py`) over `SailM`. -/
+noncomputable def sailExecuteSret (_ : Unit) : SailM ExecutionResult := do
+  let sret_illegal ← (( do
+    match (← readReg .cur_privilege) with
+    | .User => pure true
+    | .Supervisor =>
+      pure ((LeanRV64D.Functions.not (← currentlyEnabled .Ext_S)) ||
+        ((_get_Mstatus_TSR (← readReg .mstatus)) == 1#1))
+    | .Machine => pure (LeanRV64D.Functions.not (← currentlyEnabled .Ext_S))
+    | .VirtualUser =>
+      internal_error "extensions/I/base_insts.sail" 607 "Hypervisor extension not supported"
+    | .VirtualSupervisor =>
+      internal_error "extensions/I/base_insts.sail" 608 "Hypervisor extension not supported" ) :
+    SailM Bool )
+  if (sret_illegal : Bool)
+  then pure (.Illegal_Instruction ())
+  else
+    if ((LeanRV64D.Functions.not (ext_check_xret_priv .Supervisor)) : Bool)
+    then pure (.Ext_XRET_Priv_Failure ())
+    else
+      let prev_priv ← readReg .cur_privilege
+      writeReg .mstatus (Sail.BitVec.updateSubrange (← readReg .mstatus) 1 1
+        (_get_Mstatus_SPIE (← readReg .mstatus)))
+      writeReg .mstatus (Sail.BitVec.updateSubrange (← readReg .mstatus) 5 5 1#1)
+      writeReg .cur_privilege (← do
+        if (((_get_Mstatus_SPP (← readReg .mstatus)) == 1#1) : Bool)
+        then pure .Supervisor
+        else pure .User)
+      writeReg .mstatus (Sail.BitVec.updateSubrange (← readReg .mstatus) 8 8 0#1)
+      if ((bne (← readReg .cur_privilege) .Machine) : Bool)
+      then writeReg .mstatus (Sail.BitVec.updateSubrange (← readReg .mstatus) 17 17 0#1)
+      else pure ()
+      if ((hartSupports .Ext_Zicfilp) : Bool)
+      then zicfilp_restore_elp_on_xret .sRET (← readReg .cur_privilege)
+      else pure ()
+      long_csr_write_callback "mstatus" "mstatush" (← readReg .mstatus)
+      if ((get_config_print_exception ()) : Bool)
+      then
+        pure (print_endline
+          (HAppend.hAppend "ret-ing from "
+            (HAppend.hAppend (← privLevel_to_str prev_priv)
+              (HAppend.hAppend " to " (← privLevel_to_str (← readReg .cur_privilege))))))
+      else pure ()
+      set_next_pc (← prepare_xret_target .Supervisor)
+      let _ : Unit := xret_callback false
+      pure (.Retire_Success ())
+
+
+private theorem run_bind_ok {α β : Type} (m : SailM α) (f : α → SailM β)
+    (s s' : SequentialState RegisterType trivialChoiceSource) (a : α)
+    (hm : m.run s = .ok a s') :
+    (m >>= f).run s = (f a).run s' := by
+  dsimp only [Bind.bind, EStateM.bind, EStateM.run] at hm ⊢
+  rw [hm]
+
+private theorem readReg_run_ok (r : Register) (v : RegisterType r)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (h : s.regs.get? r = some v) :
+    (readReg r).run s = .ok v s := by
+  dsimp only [readReg, PreSail.readReg, EStateM.run, get, getThe, MonadStateOf.get,
+    EStateM.get, EStateM.bind, Bind.bind, Pure.pure, EStateM.pure]
+  rw [h]; rfl
+
+private theorem writeReg_run_ok (r : Register) (v : RegisterType r)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    (writeReg r v).run s = .ok () { s with regs := s.regs.insert r v } := rfl
+
+private theorem zicfilp_restore_mRET_run
+    (p : Privilege) (s : SequentialState RegisterType trivialChoiceSource)
+    (ms : BitVec 64) (lpe : Bool)
+    (hms : s.regs.get? .mstatus = some ms)
+    (hlpe : (get_xLPE p).run { s with regs := s.regs.insert .mstatus (Sail.BitVec.updateSubrange ms 41 41 0#1) } =
+      .ok lpe { s with regs := s.regs.insert .mstatus (Sail.BitVec.updateSubrange ms 41 41 0#1) }) :
+    (zicfilp_restore_elp_on_xret .mRET p).run s =
+      .ok () { s with regs := ((s.regs.insert .mstatus (Sail.BitVec.updateSubrange ms 41 41 0#1)).insert
+        .elp (if lpe then _get_Mstatus_MPELP ms else 0#1)) } := by
+  unfold zicfilp_restore_elp_on_xret landing_pad_bits_backwards
+  dsimp only []
+  rw [run_bind_ok _ _ _ _ _ (by
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms)]
+    rw [run_bind_ok _ _ _ _ _ (by rfl : (pure (_get_Mstatus_MPELP ms) : SailM _).run s = .ok _ s)]
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms)]
+    rw [run_bind_ok _ _ _ _ _ (writeReg_run_ok _ _ _)]
+    rfl)]
+  rw [run_bind_ok _ _ _ _ (if lpe then _get_Mstatus_MPELP ms else 0#1) (by
+    rw [run_bind_ok _ _ _ _ _ hlpe]
+    cases lpe <;> rfl)]
+  rw [writeReg_run_ok]
+
+private theorem zicfilp_restore_sRET_run
+    (p : Privilege) (s : SequentialState RegisterType trivialChoiceSource)
+    (ms : BitVec 64) (lpe : Bool)
+    (hms : s.regs.get? .mstatus = some ms)
+    (hlpe : (get_xLPE p).run { s with regs := s.regs.insert .mstatus (Sail.BitVec.updateSubrange ms 23 23 0#1) } =
+      .ok lpe { s with regs := s.regs.insert .mstatus (Sail.BitVec.updateSubrange ms 23 23 0#1) }) :
+    (zicfilp_restore_elp_on_xret .sRET p).run s =
+      .ok () { s with regs := ((s.regs.insert .mstatus (Sail.BitVec.updateSubrange ms 23 23 0#1)).insert
+        .elp (if lpe then _get_Mstatus_SPELP ms else 0#1)) } := by
+  unfold zicfilp_restore_elp_on_xret landing_pad_bits_backwards
+  dsimp only []
+  rw [run_bind_ok _ _ _ _ _ (by
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms)]
+    rw [run_bind_ok _ _ _ _ _ (by rfl : (pure (_get_Mstatus_SPELP ms) : SailM _).run s = .ok _ s)]
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms)]
+    rw [run_bind_ok _ _ _ _ _ (writeReg_run_ok _ _ _)]
+    rfl)]
+  rw [run_bind_ok _ _ _ _ (if lpe then _get_Mstatus_SPELP ms else 0#1) (by
+    rw [run_bind_ok _ _ _ _ _ hlpe]
+    cases lpe <;> rfl)]
+  rw [writeReg_run_ok]
+
+private theorem prepare_xret_target_Machine_run
+    (s : SequentialState RegisterType trivialChoiceSource) (mepcVal : BitVec 64) (zca : Bool)
+    (hmepc : s.regs.get? .mepc = some mepcVal)
+    (hzca : (currentlyEnabled .Ext_Zca).run s = .ok zca s) :
+    (prepare_xret_target .Machine).run s =
+      .ok (if zca then BitVec.update mepcVal 0 0#1
+           else Sail.BitVec.updateSubrange mepcVal 1 0 (zeros (n := 1 -i (0 -i 1)))) s := by
+  unfold prepare_xret_target get_xepc align_pc
+  dsimp only []
+  rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hmepc)]
+  rw [run_bind_ok _ _ _ _ _ hzca]
+  cases zca <;> rfl
+
+private theorem prepare_xret_target_Supervisor_run
+    (s : SequentialState RegisterType trivialChoiceSource) (sepcVal : BitVec 64) (zca : Bool)
+    (hsepc : s.regs.get? .sepc = some sepcVal)
+    (hzca : (currentlyEnabled .Ext_Zca).run s = .ok zca s) :
+    (prepare_xret_target .Supervisor).run s =
+      .ok (if zca then BitVec.update sepcVal 0 0#1
+           else Sail.BitVec.updateSubrange sepcVal 1 0 (zeros (n := 1 -i (0 -i 1)))) s := by
+  unfold prepare_xret_target get_xepc align_pc
+  dsimp only []
+  rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hsepc)]
+  rw [run_bind_ok _ _ _ _ _ hzca]
+  cases zca <;> rfl
+
+/-- Pure state-map update helpers for `execute_MRET` and `execute_SRET` symbolic `SailM` transitions. -/
+abbrev mretRegsPreElp (regs : Std.ExtDHashMap Register RegisterType)
+    (ms0 : BitVec 64) (nextPriv : Privilege) (extU : Bool) :
+    Std.ExtDHashMap Register RegisterType × BitVec 64 :=
+  let ms1 := Sail.BitVec.updateSubrange ms0 3 3 (_get_Mstatus_MPIE ms0)
+  let ms2 := Sail.BitVec.updateSubrange ms1 7 7 1#1
+  let ms3 := Sail.BitVec.updateSubrange ms2 12 11 (privLevel_to_bits (if extU then Privilege.User else Privilege.Machine))
+  let regs3 := (((regs.insert .mstatus ms1).insert .mstatus ms2).insert .cur_privilege nextPriv).insert .mstatus ms3
+  let ms4 := if bne nextPriv .Machine then Sail.BitVec.updateSubrange ms3 17 17 0#1 else ms3
+  let regs4 := if bne nextPriv .Machine then regs3.insert .mstatus ms4 else regs3
+  (regs4.insert .mstatus (Sail.BitVec.updateSubrange ms4 41 41 0#1), ms4)
+
+abbrev sretRegsPreElp (regs : Std.ExtDHashMap Register RegisterType) (ms0 : BitVec 64) :
+    Std.ExtDHashMap Register RegisterType × BitVec 64 × Privilege :=
+  let ms1 := Sail.BitVec.updateSubrange ms0 1 1 (_get_Mstatus_SPIE ms0)
+  let ms2 := Sail.BitVec.updateSubrange ms1 5 5 1#1
+  let nextPriv := if _get_Mstatus_SPP ms2 == 1#1 then Privilege.Supervisor else Privilege.User
+  let ms3 := Sail.BitVec.updateSubrange ms2 8 8 0#1
+  let ms4 := Sail.BitVec.updateSubrange ms3 17 17 0#1
+  let regs4 := ((((regs.insert .mstatus ms1).insert .mstatus ms2).insert .cur_privilege nextPriv).insert .mstatus ms3).insert .mstatus ms4
+  (regs4.insert .mstatus (Sail.BitVec.updateSubrange ms4 23 23 0#1), ms4, nextPriv)
+
+theorem sailExecuteMret_Machine_run
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (ms0 : BitVec 64) (nextPriv : Privilege) (extU lpe zca : Bool) (mepcVal : BitVec 64)
+    (hpriv : s.regs.get? .cur_privilege = some .Machine)
+    (hms : s.regs.get? .mstatus = some ms0)
+    (hpbf : privLevel_bits_forwards (_get_Mstatus_MPP
+      (Sail.BitVec.updateSubrange (Sail.BitVec.updateSubrange ms0 3 3 (_get_Mstatus_MPIE ms0)) 7 7 1#1), 0#1) =
+      EStateM.pure nextPriv)
+    (hceU : (currentlyEnabled .Ext_U).run
+      { s with regs := (((s.regs.insert .mstatus (Sail.BitVec.updateSubrange ms0 3 3 (_get_Mstatus_MPIE ms0))).insert .mstatus
+          (Sail.BitVec.updateSubrange (Sail.BitVec.updateSubrange ms0 3 3 (_get_Mstatus_MPIE ms0)) 7 7 1#1)).insert .cur_privilege nextPriv) } =
+      .ok extU
+      { s with regs := (((s.regs.insert .mstatus (Sail.BitVec.updateSubrange ms0 3 3 (_get_Mstatus_MPIE ms0))).insert .mstatus
+          (Sail.BitVec.updateSubrange (Sail.BitVec.updateSubrange ms0 3 3 (_get_Mstatus_MPIE ms0)) 7 7 1#1)).insert .cur_privilege nextPriv) })
+    (hlpe : (get_xLPE nextPriv).run { s with regs := (mretRegsPreElp s.regs ms0 nextPriv extU).1 } =
+      .ok lpe { s with regs := (mretRegsPreElp s.regs ms0 nextPriv extU).1 })
+    (hmepc : s.regs.get? .mepc = some mepcVal)
+    (hzca : (let p := mretRegsPreElp s.regs ms0 nextPriv extU
+      (currentlyEnabled .Ext_Zca).run { s with regs := p.1.insert .elp (if lpe then _get_Mstatus_MPELP p.2 else 0#1) } =
+      .ok zca { s with regs := p.1.insert .elp (if lpe then _get_Mstatus_MPELP p.2 else 0#1) })) :
+    (sailExecuteMret ()).run s =
+      .ok (.Retire_Success ())
+      (let p := mretRegsPreElp s.regs ms0 nextPriv extU
+       let target := if zca then BitVec.update mepcVal 0 0#1 else Sail.BitVec.updateSubrange mepcVal 1 0 (zeros (n := 1 -i (0 -i 1)))
+       { s with regs := (p.1.insert .elp (if lpe then _get_Mstatus_MPELP p.2 else 0#1)).insert .nextPC target }) := by
+  unfold sailExecuteMret
+  have hbneM : bne Privilege.Machine .Machine = false := rfl
+  have hchkM : LeanRV64D.Functions.not (ext_check_xret_priv .Machine) = false := rfl
+  rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hpriv), hbneM, if_neg Bool.false_ne_true, hchkM, if_neg Bool.false_ne_true,
+      run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hpriv), run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms),
+      run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms), run_bind_ok _ _ _ _ _ (writeReg_run_ok _ _ _)]
+  let ms1 := Sail.BitVec.updateSubrange ms0 3 3 (_get_Mstatus_MPIE ms0)
+  have hms1 : (s.regs.insert .mstatus ms1).get? .mstatus = some ms1 := regs_get?_insert_self _ _ _
+  rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms1), run_bind_ok _ _ _ _ _ (writeReg_run_ok _ _ _)]
+  let ms2 := Sail.BitVec.updateSubrange ms1 7 7 1#1
+  have hms2 : ((s.regs.insert .mstatus ms1).insert .mstatus ms2).get? .mstatus = some ms2 := regs_get?_insert_self _ _ _
+  rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms2), run_bind_ok _ _ _ _ nextPriv (by rw [hpbf]; rfl),
+      run_bind_ok _ _ _ _ _ (writeReg_run_ok _ _ _)]
+  have hms2_priv : (((s.regs.insert .mstatus ms1).insert .mstatus ms2).insert .cur_privilege nextPriv).get? .mstatus = some ms2 := by
+    rw [regs_get?_insert_ne _ _ _ _ rfl, regs_get?_insert_self]
+  rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms2_priv),
+      run_bind_ok _ _ _ _ (if extU then Privilege.User else Privilege.Machine) (by rw [run_bind_ok _ _ _ _ _ hceU]; cases extU <;> rfl),
+      run_bind_ok _ _ _ _ _ (writeReg_run_ok _ _ _)]
+  let ms3 := Sail.BitVec.updateSubrange ms2 12 11 (privLevel_to_bits (if extU then Privilege.User else Privilege.Machine))
+  let regs3 := (((s.regs.insert .mstatus ms1).insert .mstatus ms2).insert .cur_privilege nextPriv).insert .mstatus ms3
+  have hcp3 : regs3.get? .cur_privilege = some nextPriv := by dsimp only [regs3]; rw [regs_get?_insert_ne _ _ _ _ rfl, regs_get?_insert_self]
+  have hms3 : regs3.get? .mstatus = some ms3 := regs_get?_insert_self _ _ _
+  rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hcp3)]
+  let ms4 := if bne nextPriv .Machine then Sail.BitVec.updateSubrange ms3 17 17 0#1 else ms3
+  let regs4 := if bne nextPriv .Machine then regs3.insert .mstatus ms4 else regs3
+  have hstepMprv : ∀ (jp : PUnit → SailM ExecutionResult),
+      (if (bne nextPriv .Machine) = true then do
+          let v ← readReg .mstatus; let y ← writeReg .mstatus (Sail.BitVec.updateSubrange v 17 17 0#1); jp y
+        else do let y ← pure (); jp y).run { s with regs := regs3 } = (jp ()).run { s with regs := regs4 } := by
+    intro jp; dsimp only [regs4, ms4]
+    cases bne nextPriv .Machine
+    · rw [if_neg Bool.false_ne_true, if_neg Bool.false_ne_true]; rfl
+    · rw [if_pos rfl, if_pos rfl, if_pos rfl, run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms3), run_bind_ok _ _ _ _ _ (writeReg_run_ok _ _ _)]
+  rw [hstepMprv]; dsimp only []
+  have hcp4 : regs4.get? .cur_privilege = some nextPriv := by
+    dsimp only [regs4]; cases bne nextPriv .Machine
+    · exact hcp3
+    · rw [if_pos rfl, regs_get?_insert_ne _ _ _ _ rfl]; exact hcp3
+  have hms4 : regs4.get? .mstatus = some ms4 := by
+    dsimp only [regs4, ms4]; cases bne nextPriv .Machine
+    · exact hms3
+    · rw [if_pos rfl, if_pos rfl]; exact regs_get?_insert_self _ _ _
+  rw [hartSupports_Ext_Zicfilp, if_pos rfl, run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hcp4),
+      run_bind_ok _ _ _ _ _ (zicfilp_restore_mRET_run nextPriv { s with regs := regs4 } ms4 lpe hms4 hlpe)]; dsimp only []
+  let regs5 := (regs4.insert .mstatus (Sail.BitVec.updateSubrange ms4 41 41 0#1)).insert .elp (if lpe then _get_Mstatus_MPELP ms4 else 0#1)
+  have hms5 : regs5.get? .mstatus = some (Sail.BitVec.updateSubrange ms4 41 41 0#1) := by
+    dsimp only [regs5]; rw [regs_get?_insert_ne _ _ _ _ rfl, regs_get?_insert_self]
+  have hprt : get_config_print_exception () = false := rfl
+  rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms5), run_bind_ok _ _ _ _ () (by rfl),
+      hprt, if_neg Bool.false_ne_true, run_bind_ok _ _ _ _ () (by rfl)]; dsimp only []
+  have hmepc5 : regs5.get? .mepc = some mepcVal := by
+    dsimp only [regs5, regs4, regs3]; cases bne nextPriv .Machine <;> simp [Std.ExtDHashMap.get?_insert, hmepc]
+  rw [run_bind_ok _ _ _ _ _ (prepare_xret_target_Machine_run { s with regs := regs5 } mepcVal zca hmepc5 hzca)]; rfl
+
+theorem sailExecuteSret_legal_run
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (prevPriv : Privilege) (ms0 : BitVec 64) (lpe zca : Bool) (sepcVal : BitVec 64)
+    (hillegal : (do
+      match (← readReg .cur_privilege) with
+      | .User => pure true
+      | .Supervisor => pure ((LeanRV64D.Functions.not (← currentlyEnabled .Ext_S)) || ((_get_Mstatus_TSR (← readReg .mstatus)) == 1#1))
+      | .Machine => pure (LeanRV64D.Functions.not (← currentlyEnabled .Ext_S))
+      | .VirtualUser => internal_error "extensions/I/base_insts.sail" 607 "Hypervisor extension not supported"
+      | .VirtualSupervisor => internal_error "extensions/I/base_insts.sail" 608 "Hypervisor extension not supported").run s = .ok false s)
+    (hpriv : s.regs.get? .cur_privilege = some prevPriv)
+    (hms : s.regs.get? .mstatus = some ms0)
+    (hlpe : (let p := sretRegsPreElp s.regs ms0
+       (get_xLPE p.2.2).run { s with regs := p.1 } = .ok lpe { s with regs := p.1 }))
+    (hsepc : s.regs.get? .sepc = some sepcVal)
+    (hzca : (let p := sretRegsPreElp s.regs ms0
+       (currentlyEnabled .Ext_Zca).run { s with regs := p.1.insert .elp (if lpe then _get_Mstatus_SPELP p.2.1 else 0#1) } =
+       .ok zca { s with regs := p.1.insert .elp (if lpe then _get_Mstatus_SPELP p.2.1 else 0#1) })) :
+    (sailExecuteSret ()).run s =
+      .ok (.Retire_Success ())
+      (let p := sretRegsPreElp s.regs ms0
+       let target := if zca then BitVec.update sepcVal 0 0#1 else Sail.BitVec.updateSubrange sepcVal 1 0 (zeros (n := 1 -i (0 -i 1)))
+       { s with regs := (p.1.insert .elp (if lpe then _get_Mstatus_SPELP p.2.1 else 0#1)).insert .nextPC target }) := by
+  unfold sailExecuteSret
+  have hchkS : LeanRV64D.Functions.not (ext_check_xret_priv .Supervisor) = false := rfl
+  rw [run_bind_ok _ _ _ _ _ hillegal, if_neg Bool.false_ne_true, hchkS, if_neg Bool.false_ne_true,
+      run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hpriv), run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms),
+      run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms), run_bind_ok _ _ _ _ _ (writeReg_run_ok _ _ _)]
+  let ms1 := Sail.BitVec.updateSubrange ms0 1 1 (_get_Mstatus_SPIE ms0)
+  have hms1 : (s.regs.insert .mstatus ms1).get? .mstatus = some ms1 := regs_get?_insert_self _ _ _
+  rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms1), run_bind_ok _ _ _ _ _ (writeReg_run_ok _ _ _)]
+  let ms2 := Sail.BitVec.updateSubrange ms1 5 5 1#1
+  have hms2 : ((s.regs.insert .mstatus ms1).insert .mstatus ms2).get? .mstatus = some ms2 := regs_get?_insert_self _ _ _
+  let nextPriv := if _get_Mstatus_SPP ms2 == 1#1 then Privilege.Supervisor else Privilege.User
+  rw [run_bind_ok _ _ _ _ nextPriv (by rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms2)]; dsimp only [nextPriv]; cases (_get_Mstatus_SPP ms2 == 1#1) <;> rfl),
+      run_bind_ok _ _ _ _ _ (writeReg_run_ok _ _ _)]
+  have hms2_priv : (((s.regs.insert .mstatus ms1).insert .mstatus ms2).insert .cur_privilege nextPriv).get? .mstatus = some ms2 := by
+    rw [regs_get?_insert_ne _ _ _ _ rfl, regs_get?_insert_self]
+  rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms2_priv), run_bind_ok _ _ _ _ _ (writeReg_run_ok _ _ _)]
+  let ms3 := Sail.BitVec.updateSubrange ms2 8 8 0#1
+  let regs3 := (((s.regs.insert .mstatus ms1).insert .mstatus ms2).insert .cur_privilege nextPriv).insert .mstatus ms3
+  have hcp3 : regs3.get? .cur_privilege = some nextPriv := by dsimp only [regs3]; rw [regs_get?_insert_ne _ _ _ _ rfl, regs_get?_insert_self]
+  have hms3 : regs3.get? .mstatus = some ms3 := regs_get?_insert_self _ _ _
+  have hbneNext : bne nextPriv .Machine = true := by dsimp only [nextPriv]; cases (_get_Mstatus_SPP ms2 == 1#1) <;> rfl
+  rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hcp3), hbneNext, if_pos rfl,
+      run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms3), run_bind_ok _ _ _ _ _ (writeReg_run_ok _ _ _)]; dsimp only []
+  let ms4 := Sail.BitVec.updateSubrange ms3 17 17 0#1
+  let regs4 := regs3.insert .mstatus ms4
+  have hcp4 : regs4.get? .cur_privilege = some nextPriv := by dsimp only [regs4]; rw [regs_get?_insert_ne _ _ _ _ rfl]; exact hcp3
+  have hms4 : regs4.get? .mstatus = some ms4 := regs_get?_insert_self _ _ _
+  rw [hartSupports_Ext_Zicfilp, if_pos rfl, run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hcp4),
+      run_bind_ok _ _ _ _ _ (zicfilp_restore_sRET_run nextPriv { s with regs := regs4 } ms4 lpe hms4 hlpe)]; dsimp only []
+  let regs5 := (regs4.insert .mstatus (Sail.BitVec.updateSubrange ms4 23 23 0#1)).insert .elp (if lpe then _get_Mstatus_SPELP ms4 else 0#1)
+  have hms5 : regs5.get? .mstatus = some (Sail.BitVec.updateSubrange ms4 23 23 0#1) := by
+    dsimp only [regs5]; rw [regs_get?_insert_ne _ _ _ _ rfl, regs_get?_insert_self]
+  have hprt : get_config_print_exception () = false := rfl
+  rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms5), run_bind_ok _ _ _ _ () (by rfl),
+      hprt, if_neg Bool.false_ne_true, run_bind_ok _ _ _ _ () (by rfl)]; dsimp only []
+  have hsepc5 : regs5.get? .sepc = some sepcVal := by
+    simp [regs5, regs4, regs3, Std.ExtDHashMap.get?_insert, hsepc]
+  rw [run_bind_ok _ _ _ _ _ (prepare_xret_target_Supervisor_run { s with regs := regs5 } sepcVal zca hsepc5 hzca)]; rfl
+
+/-- End-to-end `SailM` bisimulation for `execute_MRET` (`InstsEnd.lean` lines 68873–68910,
+    mirrored as `sailExecuteMret` and SHA-256 snippet-pinned):
+    1. Proves `MRET` traps with `Illegal_Instruction ()` in `User` and `Supervisor` modes;
+    2. Proves `MRET` from `Machine` mode with `mstatus.MPP = 0b01` (`Supervisor`), `MPIE = 1`,
+       `MPRV = 1`, and `MPELP = 1` (`menvcfg.LPE = 1`) restores `MIE := 1`, sets `MPIE := 1`,
+       lowers `cur_privilege := .Supervisor`, resets `MPP := 0b00` (`User`, since `Ext_U` is
+       enabled), clears `MPRV := 0` (`cur_privilege ≠ .Machine`), restores `elp := 1` while
+       clearing `MPELP := 0`, and sets `nextPC` to `prepare_xret_target .Machine` (`mepc` aligned);
+    3. Proves `MRET` from `Machine` mode with `mstatus.MPP = 0b11` (`Machine`) and `MPRV = 1`
+       retains `MPRV = 1` (`cur_privilege == .Machine`) while resetting `MPP := 0b00` (`User`). -/
+theorem rv64Mret_bisim_sail
+    (sU sS sMtoS sMtoM : SequentialState RegisterType trivialChoiceSource)
+    (hprivU : sU.regs.get? .cur_privilege = some .User)
+    (hprivS : sS.regs.get? .cur_privilege = some .Supervisor)
+    (hprivMS : sMtoS.regs.get? .cur_privilege = some .Machine)
+    (hmisaMS : sMtoS.regs.get? .misa = some rv64StandardMisaSUC)
+    (hmstatusMS : sMtoS.regs.get? .mstatus =
+      some ((1#64 <<< 41) ||| (1#64 <<< 17) ||| (0b01#64 <<< 11) ||| (1#64 <<< 7)))
+    (hmenvMS : sMtoS.regs.get? .menvcfg = some (1#64 <<< 2))
+    (hmepcMS : sMtoS.regs.get? .mepc = some 0x0000000080200042#64)
+    (hprivMM : sMtoM.regs.get? .cur_privilege = some .Machine)
+    (hmisaMM : sMtoM.regs.get? .misa = some rv64StandardMisaSU)
+    (hmstatusMM : sMtoM.regs.get? .mstatus =
+      some ((1#64 <<< 17) ||| (0b11#64 <<< 11) ||| (1#64 <<< 7)))
+    (hmsecMM : sMtoM.regs.get? .mseccfg = some 0#64)
+    (hmepcMM : sMtoM.regs.get? .mepc = some 0x0000000080200082#64) :
+    let mstatusMSInit : BitVec 64 :=
+      (1#64 <<< 41) ||| (1#64 <<< 17) ||| (0b01#64 <<< 11) ||| (1#64 <<< 7)
+    let mstatusMSFinal : BitVec 64 := (1#64 <<< 7) ||| (1#64 <<< 3)
+    let regsMSAfter := ((((((((sMtoS.regs.insert .mstatus (mstatusMSInit ||| (1#64 <<< 3))).insert
+        .mstatus (mstatusMSInit ||| (1#64 <<< 3))).insert .cur_privilege .Supervisor).insert
+        .mstatus ((1#64 <<< 41) ||| (1#64 <<< 17) ||| (1#64 <<< 7) ||| (1#64 <<< 3))).insert
+        .mstatus ((1#64 <<< 41) ||| (1#64 <<< 7) ||| (1#64 <<< 3))).insert
+        .mstatus mstatusMSFinal).insert .elp 1#1).insert .nextPC 0x0000000080200042#64)
+    let mstatusMMInit : BitVec 64 := (1#64 <<< 17) ||| (0b11#64 <<< 11) ||| (1#64 <<< 7)
+    let mstatusMMFinal : BitVec 64 := (1#64 <<< 17) ||| (1#64 <<< 7) ||| (1#64 <<< 3)
+    let regsMMAfter := (((((((sMtoM.regs.insert .mstatus (mstatusMMInit ||| (1#64 <<< 3))).insert
+        .mstatus (mstatusMMInit ||| (1#64 <<< 3))).insert .cur_privilege .Machine).insert
+        .mstatus mstatusMMFinal).insert .mstatus mstatusMMFinal).insert
+        .elp 0#1).insert .nextPC 0x0000000080200080#64)
+    (sailExecuteMret ()).run sU = .ok (.Illegal_Instruction ()) sU ∧
+    (sailExecuteMret ()).run sS = .ok (.Illegal_Instruction ()) sS ∧
+    (sailExecuteMret ()).run sMtoS = .ok (.Retire_Success ()) { sMtoS with regs := regsMSAfter } ∧
+    regsMSAfter.get? .mstatus = some mstatusMSFinal ∧
+    regsMSAfter.get? .cur_privilege = some .Supervisor ∧
+    regsMSAfter.get? .elp = some 1#1 ∧
+    regsMSAfter.get? .nextPC = some 0x0000000080200042#64 ∧
+    (sailExecuteMret ()).run sMtoM = .ok (.Retire_Success ()) { sMtoM with regs := regsMMAfter } ∧
+    regsMMAfter.get? .mstatus = some mstatusMMFinal ∧
+    regsMMAfter.get? .cur_privilege = some .Machine ∧
+    regsMMAfter.get? .nextPC = some 0x0000000080200080#64 := by
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · unfold sailExecuteMret; rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hprivU)]; rfl
+  · unfold sailExecuteMret; rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hprivS)]; rfl
+  · let ms0 : BitVec 64 := (1#64 <<< 41) ||| (1#64 <<< 17) ||| (0b01#64 <<< 11) ||| (1#64 <<< 7)
+    have hpbf : privLevel_bits_forwards (_get_Mstatus_MPP
+        (Sail.BitVec.updateSubrange (Sail.BitVec.updateSubrange ms0 3 3 (_get_Mstatus_MPIE ms0)) 7 7 1#1), 0#1) =
+        EStateM.pure .Supervisor := by
+      have h : _get_Mstatus_MPP (Sail.BitVec.updateSubrange (Sail.BitVec.updateSubrange ms0 3 3 (_get_Mstatus_MPIE ms0)) 7 7 1#1) = 0b01#2 := by decide
+      rw [h]; rfl
+    have hceU := currentlyEnabled_Ext_U_standard
+      { sMtoS with regs := (((sMtoS.regs.insert .mstatus (Sail.BitVec.updateSubrange ms0 3 3 (_get_Mstatus_MPIE ms0))).insert .mstatus
+          (Sail.BitVec.updateSubrange (Sail.BitVec.updateSubrange ms0 3 3 (_get_Mstatus_MPIE ms0)) 7 7 1#1)).insert .cur_privilege .Supervisor) }
+      rv64StandardMisaSUC (by simp [Std.ExtDHashMap.get?_insert, hmisaMS]) (by decide)
+    have hlpe := by
+      have hbneS : bne Privilege.Supervisor .Machine = true := rfl
+      have h := get_xLPE_Supervisor { sMtoS with regs := (mretRegsPreElp sMtoS.regs ms0 .Supervisor true).1 } (1#64 <<< 2)
+        (by dsimp only [mretRegsPreElp]; rw [hbneS, if_pos rfl]; simp [Std.ExtDHashMap.get?_insert, hmenvMS])
+      have hb : bool_bit_backwards (_get_MEnvcfg_LPE (1#64 <<< 2)) = true := by decide
+      rw [hb] at h; exact h
+    have hzca := by
+      have hbneS : bne Privilege.Supervisor .Machine = true := rfl
+      let p := mretRegsPreElp sMtoS.regs ms0 .Supervisor true
+      have h := currentlyEnabled_Ext_Zca_of_misa_C
+        { sMtoS with regs := p.1.insert .elp (if true then _get_Mstatus_MPELP p.2 else 0#1) } rv64StandardMisaSUC
+        (by dsimp only [p, mretRegsPreElp]; rw [hbneS, if_pos rfl]; simp [Std.ExtDHashMap.get?_insert, hmisaMS])
+      have hc : (_get_Misa_C rv64StandardMisaSUC == 1#1) = true := by decide
+      rw [hc] at h; exact h
+    rw [sailExecuteMret_Machine_run sMtoS ms0 .Supervisor true true true 0x0000000080200042#64 hprivMS hmstatusMS hpbf hceU hlpe hmepcMS hzca]
+    have hb1 : Sail.BitVec.updateSubrange ms0 3 3 (_get_Mstatus_MPIE ms0) = (ms0 ||| (1#64 <<< 3)) := by decide
+    have hb2 : Sail.BitVec.updateSubrange (ms0 ||| (1#64 <<< 3)) 7 7 1#1 = (ms0 ||| (1#64 <<< 3)) := by decide
+    have hb3 : Sail.BitVec.updateSubrange (ms0 ||| (1#64 <<< 3)) 12 11 (privLevel_to_bits .User) =
+      ((1#64 <<< 41) ||| (1#64 <<< 17) ||| (1#64 <<< 7) ||| (1#64 <<< 3)) := by decide
+    have hb4 : Sail.BitVec.updateSubrange ((1#64 <<< 41) ||| (1#64 <<< 17) ||| (1#64 <<< 7) ||| (1#64 <<< 3)) 17 17 0#1 =
+      ((1#64 <<< 41) ||| (1#64 <<< 7) ||| (1#64 <<< 3)) := by decide
+    have hb5 : Sail.BitVec.updateSubrange ((1#64 <<< 41) ||| (1#64 <<< 7) ||| (1#64 <<< 3)) 41 41 0#1 = ((1#64 <<< 7) ||| (1#64 <<< 3)) := by decide
+    have hb6 : _get_Mstatus_MPELP ((1#64 <<< 41) ||| (1#64 <<< 7) ||| (1#64 <<< 3)) = 1#1 := by decide
+    have hb7 : BitVec.update 0x0000000080200042#64 0 0#1 = 0x0000000080200042#64 := by decide
+    have hbneS : bne Privilege.Supervisor .Machine = true := rfl
+    dsimp only [mretRegsPreElp]
+    rw [hbneS, if_pos rfl, if_pos rfl, if_pos rfl, if_pos rfl, if_pos rfl, hb1, hb2, hb3, hb4, hb5, hb6, hb7]
+  · simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+  · simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+  · simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+  · exact regs_get?_insert_self _ _ _
+  · let ms0 : BitVec 64 := (1#64 <<< 17) ||| (0b11#64 <<< 11) ||| (1#64 <<< 7)
+    have hpbf : privLevel_bits_forwards (_get_Mstatus_MPP
+        (Sail.BitVec.updateSubrange (Sail.BitVec.updateSubrange ms0 3 3 (_get_Mstatus_MPIE ms0)) 7 7 1#1), 0#1) =
+        EStateM.pure .Machine := by
+      have h : _get_Mstatus_MPP (Sail.BitVec.updateSubrange (Sail.BitVec.updateSubrange ms0 3 3 (_get_Mstatus_MPIE ms0)) 7 7 1#1) = 0b11#2 := by decide
+      rw [h]; rfl
+    have hceU := currentlyEnabled_Ext_U_standard
+      { sMtoM with regs := (((sMtoM.regs.insert .mstatus (Sail.BitVec.updateSubrange ms0 3 3 (_get_Mstatus_MPIE ms0))).insert .mstatus
+          (Sail.BitVec.updateSubrange (Sail.BitVec.updateSubrange ms0 3 3 (_get_Mstatus_MPIE ms0)) 7 7 1#1)).insert .cur_privilege .Machine) }
+      rv64StandardMisaSU (by simp [Std.ExtDHashMap.get?_insert, hmisaMM]) (by decide)
+    have hlpe := by
+      have hbneM : bne Privilege.Machine .Machine = false := rfl
+      have h := get_xLPE_Machine { sMtoM with regs := (mretRegsPreElp sMtoM.regs ms0 .Machine true).1 } 0#64
+        (by dsimp only [mretRegsPreElp]; rw [hbneM, if_neg Bool.false_ne_true]; simp [Std.ExtDHashMap.get?_insert, hmsecMM])
+      have hb : bool_bit_backwards (_get_Seccfg_MLPE 0#64) = false := by decide
+      rw [hb] at h; exact h
+    have hzca := by
+      have hbneM : bne Privilege.Machine .Machine = false := rfl
+      let p := mretRegsPreElp sMtoM.regs ms0 .Machine true
+      have h := currentlyEnabled_Ext_Zca_of_misa_C
+        { sMtoM with regs := p.1.insert .elp (if false then _get_Mstatus_MPELP p.2 else 0#1) } rv64StandardMisaSU
+        (by dsimp only [p, mretRegsPreElp]; rw [hbneM, if_neg Bool.false_ne_true]; simp [Std.ExtDHashMap.get?_insert, hmisaMM])
+      have hc : (_get_Misa_C rv64StandardMisaSU == 1#1) = false := by decide
+      rw [hc] at h; exact h
+    rw [sailExecuteMret_Machine_run sMtoM ms0 .Machine true false false 0x0000000080200082#64 hprivMM hmstatusMM hpbf hceU hlpe hmepcMM hzca]
+    have hb1 : Sail.BitVec.updateSubrange ms0 3 3 (_get_Mstatus_MPIE ms0) = (ms0 ||| (1#64 <<< 3)) := by decide
+    have hb2 : Sail.BitVec.updateSubrange (ms0 ||| (1#64 <<< 3)) 7 7 1#1 = (ms0 ||| (1#64 <<< 3)) := by decide
+    have hb3 : Sail.BitVec.updateSubrange (ms0 ||| (1#64 <<< 3)) 12 11 (privLevel_to_bits .User) =
+      ((1#64 <<< 17) ||| (1#64 <<< 7) ||| (1#64 <<< 3)) := by decide
+    have hb5 : Sail.BitVec.updateSubrange ((1#64 <<< 17) ||| (1#64 <<< 7) ||| (1#64 <<< 3)) 41 41 0#1 =
+      ((1#64 <<< 17) ||| (1#64 <<< 7) ||| (1#64 <<< 3)) := by decide
+    have hb7 : Sail.BitVec.updateSubrange 0x0000000080200082#64 1 0 (zeros (n := 1 -i (0 -i 1))) = 0x0000000080200080#64 := by decide
+    have hbneM : bne Privilege.Machine .Machine = false := rfl
+    dsimp only [mretRegsPreElp]
+    rw [hbneM, if_neg Bool.false_ne_true, if_neg Bool.false_ne_true, if_pos rfl,
+        if_neg Bool.false_ne_true, if_neg Bool.false_ne_true, hb1, hb2, hb3, hb5, hb7]
+  · simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+  · simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+  · exact regs_get?_insert_self _ _ _
+
+
+/-- End-to-end `SailM` bisimulation for `execute_SRET` (`InstsEnd.lean` lines 67504–67549,
+    mirrored as `sailExecuteSret` and SHA-256 snippet-pinned):
+    1. Proves `SRET` traps with `Illegal_Instruction ()` in `User` mode, in `Supervisor` mode
+       when `mstatus.TSR = 1` (`[22]`), and in `Machine` mode when `misa.S = 0` (`Ext_S` disabled);
+    2. Proves `SRET` from `Supervisor` mode (`TSR = 0`) with `SPP = 0` (`User`), `SPIE = 1`,
+       `MPRV = 1`, and `SPELP = 1` (`senvcfg.LPE = 1`) restores `SIE := 1`, sets `SPIE := 1`,
+       lowers `cur_privilege := .User`, clears `SPP := 0`, clears `MPRV := 0`, restores `elp := 1`
+       while clearing `SPELP := 0` (`[23]`), and sets `nextPC` to `prepare_xret_target .Supervisor`;
+    3. Proves `SRET` from `Machine` mode (`misa.S = 1`) with `SPP = 1` (`Supervisor`) succeeds even
+       when `mstatus.TSR = 1`, lowering `cur_privilege := .Supervisor`, clearing `SPP := 0` and
+       `MPRV := 0`, and jumping to `sepc`. -/
+theorem rv64Sret_bisim_sail
+    (sU sTsr sNoS sStoU sMtoS : SequentialState RegisterType trivialChoiceSource)
+    (hprivU : sU.regs.get? .cur_privilege = some .User)
+    (hprivTsr : sTsr.regs.get? .cur_privilege = some .Supervisor)
+    (hmisaTsr : sTsr.regs.get? .misa = some rv64StandardMisaSU)
+    (hmstatusTsr : sTsr.regs.get? .mstatus = some (1#64 <<< 22))
+    (hprivNoS : sNoS.regs.get? .cur_privilege = some .Machine)
+    (hmisaNoS : sNoS.regs.get? .misa = some (0b10#64 <<< 62 ||| (1#64 <<< 20)))
+    (hprivSU : sStoU.regs.get? .cur_privilege = some .Supervisor)
+    (hmisaSU : sStoU.regs.get? .misa = some rv64StandardMisaSUC)
+    (hmstatusSU : sStoU.regs.get? .mstatus =
+      some ((1#64 <<< 23) ||| (1#64 <<< 17) ||| (1#64 <<< 5)))
+    (hmenvSU : sStoU.regs.get? .menvcfg = some 0#64)
+    (hsenvSU : sStoU.regs.get? .senvcfg = some (1#64 <<< 2))
+    (hsepcSU : sStoU.regs.get? .sepc = some 0x0000000000010082#64)
+    (hprivMS : sMtoS.regs.get? .cur_privilege = some .Machine)
+    (hmisaMS : sMtoS.regs.get? .misa = some rv64StandardMisaSU)
+    (hmstatusMS : sMtoS.regs.get? .mstatus =
+      some ((1#64 <<< 22) ||| (1#64 <<< 17) ||| (1#64 <<< 8) ||| (1#64 <<< 5)))
+    (hmenvMS : sMtoS.regs.get? .menvcfg = some 0#64)
+    (hsepcMS : sMtoS.regs.get? .sepc = some 0x0000000080200102#64) :
+    let mstatusSUInit : BitVec 64 := (1#64 <<< 23) ||| (1#64 <<< 17) ||| (1#64 <<< 5)
+    let mstatusSUFinal : BitVec 64 := (1#64 <<< 5) ||| (1#64 <<< 1)
+    let regsSUAfter := ((((((((sStoU.regs.insert .mstatus (mstatusSUInit ||| (1#64 <<< 1))).insert
+        .mstatus (mstatusSUInit ||| (1#64 <<< 1))).insert .cur_privilege .User).insert
+        .mstatus (mstatusSUInit ||| (1#64 <<< 1))).insert
+        .mstatus ((1#64 <<< 23) ||| (1#64 <<< 5) ||| (1#64 <<< 1))).insert
+        .mstatus mstatusSUFinal).insert .elp 1#1).insert .nextPC 0x0000000000010082#64)
+    let mstatusMSInit : BitVec 64 :=
+      (1#64 <<< 22) ||| (1#64 <<< 17) ||| (1#64 <<< 8) ||| (1#64 <<< 5)
+    let mstatusMSFinal : BitVec 64 := (1#64 <<< 22) ||| (1#64 <<< 5) ||| (1#64 <<< 1)
+    let regsMSAfter := ((((((((sMtoS.regs.insert .mstatus (mstatusMSInit ||| (1#64 <<< 1))).insert
+        .mstatus (mstatusMSInit ||| (1#64 <<< 1))).insert .cur_privilege .Supervisor).insert
+        .mstatus ((1#64 <<< 22) ||| (1#64 <<< 17) ||| (1#64 <<< 5) ||| (1#64 <<< 1))).insert
+        .mstatus mstatusMSFinal).insert .mstatus mstatusMSFinal).insert
+        .elp 0#1).insert .nextPC 0x0000000080200100#64)
+    (sailExecuteSret ()).run sU = .ok (.Illegal_Instruction ()) sU ∧
+    (sailExecuteSret ()).run sTsr = .ok (.Illegal_Instruction ()) sTsr ∧
+    (sailExecuteSret ()).run sNoS = .ok (.Illegal_Instruction ()) sNoS ∧
+    (sailExecuteSret ()).run sStoU = .ok (.Retire_Success ()) { sStoU with regs := regsSUAfter } ∧
+    regsSUAfter.get? .mstatus = some mstatusSUFinal ∧
+    regsSUAfter.get? .cur_privilege = some .User ∧
+    regsSUAfter.get? .elp = some 1#1 ∧
+    regsSUAfter.get? .nextPC = some 0x0000000000010082#64 ∧
+    (sailExecuteSret ()).run sMtoS = .ok (.Retire_Success ()) { sMtoS with regs := regsMSAfter } ∧
+    regsMSAfter.get? .mstatus = some mstatusMSFinal ∧
+    regsMSAfter.get? .cur_privilege = some .Supervisor ∧
+    regsMSAfter.get? .nextPC = some 0x0000000080200100#64 := by
+  have hceTsr := currentlyEnabled_Ext_S_standard sTsr rv64StandardMisaSU hmisaTsr (by decide)
+  have hceNoS : (currentlyEnabled .Ext_S).run sNoS = .ok false sNoS := by
+    rw [currentlyEnabled.eq_def]
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run,
+      readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+    rw [currentlyEnabled.eq_def]
+    dsimp only [Bind.bind, Pure.pure, EStateM.bind, EStateM.pure, EStateM.get, EStateM.run]
+    rw [hmisaNoS]
+    dsimp only [EStateM.bind, EStateM.pure]
+    rw [hartSupports_Ext_S, hartSupports_Ext_Zicsr]
+    rfl
+  refine ⟨?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · unfold sailExecuteSret
+    rw [run_bind_ok _ _ _ _ true (by rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hprivU)]; rfl)]
+    rfl
+  · unfold sailExecuteSret
+    rw [run_bind_ok _ _ _ _ true (by
+      rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hprivTsr)]
+      dsimp only []
+      rw [run_bind_ok _ _ _ _ _ hceTsr]
+      rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hmstatusTsr)]
+      have htsr : (LeanRV64D.Functions.not true || (_get_Mstatus_TSR (1#64 <<< 22) == 1#1)) = true := by decide
+      rw [htsr]; rfl)]
+    rfl
+  · unfold sailExecuteSret
+    rw [run_bind_ok _ _ _ _ true (by
+      rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hprivNoS)]
+      dsimp only []
+      rw [run_bind_ok _ _ _ _ _ hceNoS]; rfl)]
+    rfl
+  · let ms0 : BitVec 64 := (1#64 <<< 23) ||| (1#64 <<< 17) ||| (1#64 <<< 5)
+    have hceSU := currentlyEnabled_Ext_S_standard sStoU rv64StandardMisaSUC hmisaSU (by decide)
+    have hillegal : (do
+      match (← readReg .cur_privilege) with
+      | .User => pure true
+      | .Supervisor =>
+        pure ((LeanRV64D.Functions.not (← currentlyEnabled .Ext_S)) ||
+          ((_get_Mstatus_TSR (← readReg .mstatus)) == 1#1))
+      | .Machine => pure (LeanRV64D.Functions.not (← currentlyEnabled .Ext_S))
+      | .VirtualUser =>
+        internal_error "extensions/I/base_insts.sail" 607 "Hypervisor extension not supported"
+      | .VirtualSupervisor =>
+        internal_error "extensions/I/base_insts.sail" 608 "Hypervisor extension not supported").run sStoU =
+        .ok false sStoU := by
+      rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hprivSU)]
+      dsimp only []
+      rw [run_bind_ok _ _ _ _ _ hceSU]
+      rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hmstatusSU)]
+      have htsr0 : (LeanRV64D.Functions.not true || (_get_Mstatus_TSR ms0 == 1#1)) = false := by decide
+      rw [htsr0]; rfl
+    have hspp0 : (_get_Mstatus_SPP
+      (Sail.BitVec.updateSubrange (Sail.BitVec.updateSubrange ms0 1 1 (_get_Mstatus_SPIE ms0)) 5 5 1#1) == 1#1) = false := by decide
+    have hlpe := by
+      let p := sretRegsPreElp sStoU.regs ms0
+      have hnp : p.2.2 = .User := by dsimp only [p, sretRegsPreElp]; rw [hspp0, if_neg Bool.false_ne_true]
+      have h := get_xLPE_User_Ext_S { sStoU with regs := p.1 } rv64StandardMisaSUC 0#64 (1#64 <<< 2)
+        (by simp [p, Std.ExtDHashMap.get?_insert, hmisaSU]) (by decide)
+        (by simp [p, Std.ExtDHashMap.get?_insert, hmenvSU])
+        (by simp [p, Std.ExtDHashMap.get?_insert, hsenvSU])
+      have hb : bool_bit_backwards (_get_SEnvcfg_LPE (_update_SEnvcfg_SSE (1#64 <<< 2) (_get_MEnvcfg_SSE 0#64 &&& _get_SEnvcfg_SSE (1#64 <<< 2)))) = true := by decide
+      rw [hb, ← hnp] at h; exact h
+    have hzca := by
+      let p := sretRegsPreElp sStoU.regs ms0
+      have h := currentlyEnabled_Ext_Zca_of_misa_C
+        { sStoU with regs := p.1.insert .elp (if true then _get_Mstatus_SPELP p.2.1 else 0#1) } rv64StandardMisaSUC
+        (by simp [p, Std.ExtDHashMap.get?_insert, hmisaSU])
+      have hc : (_get_Misa_C rv64StandardMisaSUC == 1#1) = true := by decide
+      rw [hc] at h; exact h
+    rw [sailExecuteSret_legal_run sStoU .Supervisor ms0 true true 0x0000000000010082#64 hillegal hprivSU hmstatusSU hlpe hsepcSU hzca]
+    have hb1 : Sail.BitVec.updateSubrange ms0 1 1 (_get_Mstatus_SPIE ms0) = (ms0 ||| (1#64 <<< 1)) := by decide
+    have hb2 : Sail.BitVec.updateSubrange (ms0 ||| (1#64 <<< 1)) 5 5 1#1 = (ms0 ||| (1#64 <<< 1)) := by decide
+    have hb3 : Sail.BitVec.updateSubrange (ms0 ||| (1#64 <<< 1)) 8 8 0#1 = (ms0 ||| (1#64 <<< 1)) := by decide
+    have hb4 : Sail.BitVec.updateSubrange (ms0 ||| (1#64 <<< 1)) 17 17 0#1 = ((1#64 <<< 23) ||| (1#64 <<< 5) ||| (1#64 <<< 1)) := by decide
+    have hb5 : Sail.BitVec.updateSubrange ((1#64 <<< 23) ||| (1#64 <<< 5) ||| (1#64 <<< 1)) 23 23 0#1 = ((1#64 <<< 5) ||| (1#64 <<< 1)) := by decide
+    have hb6 : _get_Mstatus_SPELP ((1#64 <<< 23) ||| (1#64 <<< 5) ||| (1#64 <<< 1)) = 1#1 := by decide
+    have hb7 : BitVec.update 0x0000000000010082#64 0 0#1 = 0x0000000000010082#64 := by decide
+    dsimp only [sretRegsPreElp]
+    rw [hspp0, if_neg Bool.false_ne_true, if_pos rfl, if_pos rfl, hb1, hb2, hb3, hb4, hb5, hb6, hb7]
+  · simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+  · simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+  · simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+  · exact regs_get?_insert_self _ _ _
+  · let ms0 : BitVec 64 := (1#64 <<< 22) ||| (1#64 <<< 17) ||| (1#64 <<< 8) ||| (1#64 <<< 5)
+    have hceMS := currentlyEnabled_Ext_S_standard sMtoS rv64StandardMisaSU hmisaMS (by decide)
+    have hillegal : (do
+      match (← readReg .cur_privilege) with
+      | .User => pure true
+      | .Supervisor => pure ((LeanRV64D.Functions.not (← currentlyEnabled .Ext_S)) || ((_get_Mstatus_TSR (← readReg .mstatus)) == 1#1))
+      | .Machine => pure (LeanRV64D.Functions.not (← currentlyEnabled .Ext_S))
+      | .VirtualUser => internal_error "extensions/I/base_insts.sail" 607 "Hypervisor extension not supported"
+      | .VirtualSupervisor => internal_error "extensions/I/base_insts.sail" 608 "Hypervisor extension not supported").run sMtoS = .ok false sMtoS := by
+      rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hprivMS)]; dsimp only []; rw [run_bind_ok _ _ _ _ _ hceMS]; rfl
+    have hspp1 : (_get_Mstatus_SPP
+      (Sail.BitVec.updateSubrange (Sail.BitVec.updateSubrange ms0 1 1 (_get_Mstatus_SPIE ms0)) 5 5 1#1) == 1#1) = true := by decide
+    have hlpe := by
+      let p := sretRegsPreElp sMtoS.regs ms0
+      have hnp : p.2.2 = .Supervisor := by dsimp only [p, sretRegsPreElp]; rw [hspp1, if_pos rfl]
+      have h := get_xLPE_Supervisor { sMtoS with regs := p.1 } 0#64
+        (by simp [p, Std.ExtDHashMap.get?_insert, hmenvMS])
+      have hb : bool_bit_backwards (_get_MEnvcfg_LPE 0#64) = false := by decide
+      rw [hb, ← hnp] at h; exact h
+    have hzca := by
+      let p := sretRegsPreElp sMtoS.regs ms0
+      have h := currentlyEnabled_Ext_Zca_of_misa_C
+        { sMtoS with regs := p.1.insert .elp (if false then _get_Mstatus_SPELP p.2.1 else 0#1) } rv64StandardMisaSU
+        (by simp [p, Std.ExtDHashMap.get?_insert, hmisaMS])
+      have hc : (_get_Misa_C rv64StandardMisaSU == 1#1) = false := by decide
+      rw [hc] at h; exact h
+    rw [sailExecuteSret_legal_run sMtoS .Machine ms0 false false 0x0000000080200102#64 hillegal hprivMS hmstatusMS hlpe hsepcMS hzca]
+    have hb1 : Sail.BitVec.updateSubrange ms0 1 1 (_get_Mstatus_SPIE ms0) = (ms0 ||| (1#64 <<< 1)) := by decide
+    have hb2 : Sail.BitVec.updateSubrange (ms0 ||| (1#64 <<< 1)) 5 5 1#1 = (ms0 ||| (1#64 <<< 1)) := by decide
+    have hb3 : Sail.BitVec.updateSubrange (ms0 ||| (1#64 <<< 1)) 8 8 0#1 = ((1#64 <<< 22) ||| (1#64 <<< 17) ||| (1#64 <<< 5) ||| (1#64 <<< 1)) := by decide
+    have hb4 : Sail.BitVec.updateSubrange ((1#64 <<< 22) ||| (1#64 <<< 17) ||| (1#64 <<< 5) ||| (1#64 <<< 1)) 17 17 0#1 = ((1#64 <<< 22) ||| (1#64 <<< 5) ||| (1#64 <<< 1)) := by decide
+    have hb5 : Sail.BitVec.updateSubrange ((1#64 <<< 22) ||| (1#64 <<< 5) ||| (1#64 <<< 1)) 23 23 0#1 = ((1#64 <<< 22) ||| (1#64 <<< 5) ||| (1#64 <<< 1)) := by decide
+    have hb7 : Sail.BitVec.updateSubrange 0x0000000080200102#64 1 0 (zeros (n := 1 -i (0 -i 1))) = 0x0000000080200100#64 := by decide
+    dsimp only [sretRegsPreElp]
+    rw [hspp1, if_pos rfl, if_neg Bool.false_ne_true, if_neg Bool.false_ne_true, hb1, hb2, hb3, hb4, hb5, hb7]
+  · simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+  · simp [Std.ExtDHashMap.get?_insert, Std.ExtDHashMap.get?_insert_self]
+  · exact regs_get?_insert_self _ _ _
+
+private theorem hartSupports_Ext_Zfinx : hartSupports .Ext_Zfinx = false := by
+  rw [hartSupports.eq_def]
+
+-- ============================================================================
+-- Section 16: RV64F / RV64D Floating-Point State, IEEE-754 Classification,
+--             Rounding / Exception Flags & Pure SailM Instruction Bisimulation
+--             (Stage 3E.7 — zero RiscvExtras axioms)
+-- ============================================================================
+-- Note on upstream `opencompl/sail-riscv-lean` (`Lean_RV64D`) codegen:
+-- In `LeanRV64D/Defs.lean`, `abbrev flenbits := BitVec (if true then 8 else 4 * 8)` evaluates
+-- to `BitVec 8` on architectural `.f0 .. .f31` registers (an upstream Sail-to-Lean codegen
+-- artifact), whereas `Functions.flen = 64`, `Functions.flen_bytes = 8`, `nan_box`/`nan_unbox`,
+-- `fsplit_S`/`fmake_S`, `fsplit_D`/`fmake_D`, `float_classify`, `feq_quiet_*`/`flt_*`/`fle_*`,
+-- and `Zfinx` `x`-register paths operate at full 32-bit / 64-bit IEEE-754 widths. Theorems 2 &
+-- 6–8 below state exact `.f0` updates against upstream `flenbits` (`BitVec.setWidth 8`), while
+-- Theorem 1 and `rv64FpFullWidth64NanBoxAndExec_bisim_sail` certify full-width 32/64-bit IEEE-754
+-- NaN-boxing roundtrip and lossless `Zfinx` `x`-register execution without 8-bit truncation.
+
+/-- Pure RV64F/D/Zfh IEEE-754 canonical NaN constants (`0x7e00` half, `0x7fc0_0000` single,
+    `0x7ff8_0000_0000_0000` double) and 64-bit `FLEN = 64` NaN-boxing / NaN-unboxing specs. -/
+def rv64CanonicalNaNHSpec : BitVec 16 := 0x7e00#16
+def rv64CanonicalNaNSSpec : BitVec 32 := 0x7fc00000#32
+def rv64CanonicalNaNDSpec : BitVec 64 := 0x7ff8000000000000#64
+
+def rv64NanBoxSSpec (x : BitVec 32) : BitVec 64 :=
+  BitVec.allOnes 32 +++ x
+
+def rv64NanBoxHSpec (x : BitVec 16) : BitVec 64 :=
+  BitVec.allOnes 48 +++ x
+
+def rv64NanUnboxSSpec (x : BitVec 64) : BitVec 32 :=
+  if x.extractLsb 63 32 == BitVec.allOnes 32 then
+    x.extractLsb 31 0
+  else
+    rv64CanonicalNaNSSpec
+
+def rv64NanUnboxHSpec (x : BitVec 64) : BitVec 16 :=
+  if x.extractLsb 63 16 == BitVec.allOnes 48 then
+    x.extractLsb 15 0
+  else
+    rv64CanonicalNaNHSpec
+
+private theorem nan_box_32_eq (x : BitVec 32) : nan_box (n := 64) x = rv64NanBoxSSpec x := by
+  unfold nan_box rv64NanBoxSSpec ones sail_ones Sail.BitVec.length
+  change BitVec.setWidth 64 (~~~BitVec.zero 32 +++ x) = BitVec.allOnes 32 +++ x
+  have hc : ~~~BitVec.zero 32 = BitVec.allOnes 32 := rfl
+  rw [hc]
+  exact BitVec.setWidth_eq _
+
+private theorem nan_box_16_eq (x : BitVec 16) : nan_box (n := 64) x = rv64NanBoxHSpec x := by
+  unfold nan_box rv64NanBoxHSpec ones sail_ones Sail.BitVec.length
+  change BitVec.setWidth 64 (~~~BitVec.zero 48 +++ x) = BitVec.allOnes 48 +++ x
+  have hc : ~~~BitVec.zero 48 = BitVec.allOnes 48 := rfl
+  rw [hc]
+  exact BitVec.setWidth_eq _
+
+private theorem nan_box_64_eq (x : BitVec 64) : nan_box (n := 64) x = x := by
+  unfold nan_box ones sail_ones Sail.BitVec.length
+  simp [HAppend.hAppend, BitVec.append]
+  exact BitVec.zero_or
+
+private theorem nan_unbox_32_eq (x : BitVec 64) : nan_unbox (m := 32) x = rv64NanUnboxSSpec x := by
+  unfold nan_unbox rv64NanUnboxSSpec canonical_NaN Sail.BitVec.extractLsb Sail.BitVec.length
+    ones sail_ones zeros rv64CanonicalNaNSSpec
+  have hc1 : (64 == 32) = false := rfl
+  rw [hc1, if_neg Bool.false_ne_true]
+  change (if (BitVec.extractLsb 63 32 x == BitVec.setWidth 32 (~~~BitVec.zero 32)) = true then
+      BitVec.setWidth 32 (BitVec.extractLsb 31 0 x)
+    else 0#1 +++ (~~~BitVec.zero 8 +++ (1#1 +++ BitVec.zero 22))) =
+    (if (BitVec.extractLsb 63 32 x == BitVec.allOnes 32) = true then BitVec.extractLsb 31 0 x
+    else 0x7fc00000#32)
+  have hc2 : BitVec.setWidth 32 (~~~BitVec.zero 32) = BitVec.allOnes 32 := rfl
+  have hc3 : (0#1 +++ (~~~BitVec.zero 8 +++ (1#1 +++ BitVec.zero 22))) = 0x7fc00000#32 := rfl
+  rw [hc2, hc3]
+  simp only [BitVec.setWidth_eq]
+
+private theorem nan_unbox_16_eq (x : BitVec 64) : nan_unbox (m := 16) x = rv64NanUnboxHSpec x := by
+  unfold nan_unbox rv64NanUnboxHSpec canonical_NaN Sail.BitVec.extractLsb Sail.BitVec.length
+    ones sail_ones zeros rv64CanonicalNaNHSpec
+  have hc1 : (64 == 16) = false := rfl
+  rw [hc1, if_neg Bool.false_ne_true]
+  change (if (BitVec.extractLsb 63 16 x == BitVec.setWidth 48 (~~~BitVec.zero 48)) = true then
+      BitVec.setWidth 16 (BitVec.extractLsb 15 0 x)
+    else 0#1 +++ (~~~BitVec.zero 5 +++ (1#1 +++ BitVec.zero 9))) =
+    (if (BitVec.extractLsb 63 16 x == BitVec.allOnes 48) = true then BitVec.extractLsb 15 0 x
+    else 0x7e00#16)
+  have hc2 : BitVec.setWidth 48 (~~~BitVec.zero 48) = BitVec.allOnes 48 := rfl
+  have hc3 : (0#1 +++ (~~~BitVec.zero 5 +++ (1#1 +++ BitVec.zero 9))) = 0x7e00#16 := rfl
+  rw [hc2, hc3]
+  simp only [BitVec.setWidth_eq]
+
+private theorem nan_unbox_64_eq (x : BitVec 64) : nan_unbox (m := 64) x = x := by
+  unfold nan_unbox Sail.BitVec.length
+  have hc : (64 == 64) = true := rfl
+  rw [hc, if_pos rfl]
+  exact BitVec.setWidth_eq x
+
+private theorem extractLsb_append_hi_32 (hi lo : BitVec 32) :
+    BitVec.extractLsb 63 32 (hi +++ lo) = hi :=
+  BitVec.extractLsb'_append_eq_left
+
+private theorem extractLsb_append_hi_16 (hi : BitVec 48) (lo : BitVec 16) :
+    BitVec.extractLsb 63 16 (hi +++ lo) = hi :=
+  BitVec.extractLsb'_append_eq_left
+
+private theorem extractLsb_append_lo_32 (hi lo : BitVec 32) :
+    BitVec.extractLsb 31 0 (hi +++ lo) = lo :=
+  BitVec.extractLsb'_append_eq_right
+
+private theorem extractLsb_append_lo_16 (hi : BitVec 48) (lo : BitVec 16) :
+    BitVec.extractLsb 15 0 (hi +++ lo) = lo :=
+  BitVec.extractLsb'_append_eq_right
+
+/-- Theorem 1 (Section 16): RV64F/D enablement (`misa.F`/`misa.D` + `mstatus.FS != 0b00`),
+    load/store width gating (`4` and `8` bytes), `FLEN = 64`, IEEE-754 canonical NaNs, and
+    64-bit NaN-boxing / NaN-unboxing roundtrip & unboxed canonical fallback. -/
+theorem rv64FpEnablementAndNanBoxing_bisim_sail
+    (x32 : BitVec 32) (x16 : BitVec 16) (x64 misaVal mstatusVal : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hmisa : s.regs.get? .misa = some misaVal)
+    (hmstatus : s.regs.get? .mstatus = some mstatusVal) :
+    Functions.flen = 64 ∧
+    Functions.flen_bytes = 8 ∧
+    canonical_NaN_H () = rv64CanonicalNaNHSpec ∧
+    canonical_NaN_S () = rv64CanonicalNaNSSpec ∧
+    canonical_NaN_D () = rv64CanonicalNaNDSpec ∧
+    nan_box (n := 64) x32 = rv64NanBoxSSpec x32 ∧
+    nan_box (n := 64) x16 = rv64NanBoxHSpec x16 ∧
+    nan_box (n := 64) x64 = x64 ∧
+    nan_unbox (m := 32) x64 = rv64NanUnboxSSpec x64 ∧
+    nan_unbox (m := 16) x64 = rv64NanUnboxHSpec x64 ∧
+    nan_unbox (m := 64) x64 = x64 ∧
+    nan_unbox (m := 32) (nan_box (n := 64) x32) = x32 ∧
+    nan_unbox (m := 16) (nan_box (n := 64) x16) = x16 ∧
+    nan_unbox (m := 32) ((0#1 +++ BitVec.allOnes 31) +++ x32) = rv64CanonicalNaNSSpec ∧
+    nan_unbox (m := 16) ((0#1 +++ BitVec.allOnes 47) +++ x16) = rv64CanonicalNaNHSpec ∧
+    (currentlyEnabled .Ext_F).run s =
+      .ok ((_get_Misa_F misaVal == 1#1) && (_get_Mstatus_FS mstatusVal != 0b00#2)) s ∧
+    (currentlyEnabled .Ext_D).run s =
+      .ok ((_get_Misa_D misaVal == 1#1) && (_get_Mstatus_FS mstatusVal != 0b00#2)) s ∧
+    (float_load_store_width_supported 4).run s =
+      .ok ((_get_Misa_F misaVal == 1#1) && (_get_Mstatus_FS mstatusVal != 0b00#2)) s ∧
+    (float_load_store_width_supported 8).run s =
+      .ok ((_get_Misa_D misaVal == 1#1) && (_get_Mstatus_FS mstatusVal != 0b00#2)) s := by
+  have hceF : (currentlyEnabled .Ext_F).run s =
+      .ok ((_get_Misa_F misaVal == 1#1) && (_get_Mstatus_FS mstatusVal != 0b00#2)) s := by
+    rw [currentlyEnabled.eq_def]
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hmisa)]
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hmstatus)]
+    have hzicsr : (currentlyEnabled .Ext_Zicsr).run s = .ok true s := by
+      rw [currentlyEnabled.eq_def]
+      dsimp only [Pure.pure, EStateM.pure, EStateM.run]
+      rw [hartSupports_Ext_Zicsr]
+    rw [run_bind_ok _ _ _ _ _ hzicsr]
+    dsimp only [Pure.pure, EStateM.pure, EStateM.run]
+    rw [hartSupports_Ext_F]
+    simp only [Bool.true_and, Bool.and_true]
+  have hceD : (currentlyEnabled .Ext_D).run s =
+      .ok ((_get_Misa_D misaVal == 1#1) && (_get_Mstatus_FS mstatusVal != 0b00#2)) s := by
+    rw [currentlyEnabled.eq_def]
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hmisa)]
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hmstatus)]
+    have hzicsr : (currentlyEnabled .Ext_Zicsr).run s = .ok true s := by
+      rw [currentlyEnabled.eq_def]
+      dsimp only [Pure.pure, EStateM.pure, EStateM.run]
+      rw [hartSupports_Ext_Zicsr]
+    rw [run_bind_ok _ _ _ _ _ hzicsr]
+    dsimp only [Pure.pure, EStateM.pure, EStateM.run]
+    have hflen : (Functions.flen ≥b 64) = true := rfl
+    rw [hartSupports_Ext_D, hflen]
+    simp only [Bool.true_and, Bool.and_true]
+  refine ⟨rfl, rfl, rfl, rfl, rfl,
+    nan_box_32_eq x32, nan_box_16_eq x16, nan_box_64_eq x64,
+    nan_unbox_32_eq x64, nan_unbox_16_eq x64, nan_unbox_64_eq x64,
+    ?_, ?_, ?_, ?_, hceF, hceD, ?_, ?_⟩
+  · rw [nan_box_32_eq, nan_unbox_32_eq]; unfold rv64NanUnboxSSpec rv64NanBoxSSpec
+    rw [extractLsb_append_hi_32, extractLsb_append_lo_32]; rfl
+  · rw [nan_box_16_eq, nan_unbox_16_eq]; unfold rv64NanUnboxHSpec rv64NanBoxHSpec
+    rw [extractLsb_append_hi_16, extractLsb_append_lo_16]; rfl
+  · rw [nan_unbox_32_eq]; unfold rv64NanUnboxSSpec
+    rw [extractLsb_append_hi_32]
+    have hne : ((0#1 +++ BitVec.allOnes 31) == BitVec.allOnes 32) = false := rfl
+    rw [hne]; rfl
+  · rw [nan_unbox_16_eq]; unfold rv64NanUnboxHSpec
+    rw [extractLsb_append_hi_16]
+    have hne : ((0#1 +++ BitVec.allOnes 47) == BitVec.allOnes 48) = false := rfl
+    rw [hne]; rfl
+  · unfold float_load_store_width_supported; exact hceF
+  · unfold float_load_store_width_supported; exact hceD
+
+/-- Pure `TurboLean`-side specification for `dirty_fd_context` (`FdextRegs.lean` lines 298–304):
+    sets `mstatus.FS` (`[14:13]`) to `Dirty` (`0b11`) and `mstatus.SD` (`[63]`) to `1`. -/
+def rv64DirtyFdMstatusSpec (mstatusVal : BitVec 64) : BitVec 64 :=
+  Sail.BitVec.updateSubrange (Sail.BitVec.updateSubrange mstatusVal 14 13 0b11#2) 63 63 1#1
+
+private theorem dirty_fd_context_run
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (mstatusVal : BitVec 64)
+    (hmstatus : s.regs.get? .mstatus = some mstatusVal) :
+    ∃ regs', (dirty_fd_context ()).run s = .ok () { s with regs := regs' } ∧
+      regs'.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      (∀ r, (Register.mstatus == r) = false → regs'.get? r = s.regs.get? r) := by
+  let ms1 := Sail.BitVec.updateSubrange mstatusVal 14 13 (extStatus_map_forwards .Dirty)
+  let ms2 := Sail.BitVec.updateSubrange ms1 (64 -i 1) (64 -i 1) 1#1
+  let regs' := (s.regs.insert .mstatus ms1).insert .mstatus ms2
+  refine ⟨regs', ?_, ?_, ?_⟩
+  · unfold dirty_fd_context
+    have ha : (PreSail.assert (hartSupports .Ext_F)
+        "extensions/FD/fdext_regs.sail:111.28-111.29" : SailM Unit).run s = .ok () s := by
+      unfold PreSail.assert; rw [hartSupports_Ext_F]; rfl
+    rw [run_bind_ok _ _ _ _ _ ha]
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hmstatus)]
+    rw [run_bind_ok _ _ _ _ _ (writeReg_run_ok _ _ _)]
+    have hms1 : (s.regs.insert .mstatus ms1).get? .mstatus = some ms1 := regs_get?_insert_self _ _ _
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms1)]
+    rw [run_bind_ok _ _ _ _ _ (writeReg_run_ok _ _ _)]
+    have hms2 : regs'.get? .mstatus = some ms2 := regs_get?_insert_self _ _ _
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok _ _ _ hms2)]
+    rfl
+  · exact regs_get?_insert_self _ _ _
+  · intro r hne
+    dsimp only [regs']
+    rw [regs_get?_insert_ne _ _ _ _ hne, regs_get?_insert_ne _ _ _ _ hne]
+
+private theorem dirty_fd_context_if_present_run
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (mstatusVal : BitVec 64)
+    (hmstatus : s.regs.get? .mstatus = some mstatusVal) :
+    ∃ regs', (dirty_fd_context_if_present ()).run s = .ok () { s with regs := regs' } ∧
+      regs'.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      (∀ r, (Register.mstatus == r) = false → regs'.get? r = s.regs.get? r) := by
+  unfold dirty_fd_context_if_present
+  have ha : (PreSail.assert (neq_bool (hartSupports .Ext_F) (hartSupports .Ext_Zfinx))
+      "extensions/FD/fdext_regs.sail:118.55-118.56" : SailM Unit).run s = .ok () s := by
+    unfold PreSail.assert neq_bool
+    rw [hartSupports_Ext_F, hartSupports_Ext_Zfinx]; rfl
+  rw [run_bind_ok _ _ _ _ _ ha]
+  rw [hartSupports_Ext_F, if_pos rfl]
+  exact dirty_fd_context_run s mstatusVal hmstatus
+
+private theorem nan_unbox_flenbits_32 (v : flenbits) :
+    nan_unbox (m := 32) v = BitVec.setWidth 32 v := by
+  let b : BitVec 8 := v
+  suffices h : nan_unbox (m := 32) b = BitVec.setWidth 32 b from h
+  unfold nan_unbox Sail.BitVec.extractLsb Sail.BitVec.length ones sail_ones
+  have hc1 : (8 == 32) = false := rfl
+  rw [hc1, if_neg Bool.false_ne_true]
+  change (if (BitVec.extractLsb 7 32 b == 0#1) = true then
+      BitVec.setWidth 32 (BitVec.extractLsb 31 0 b)
+    else canonical_NaN (n := 32)) = BitVec.setWidth 32 b
+  have h1 : BitVec.extractLsb 7 32 b = 0#1 := by
+    apply BitVec.eq_of_toNat_eq
+    have hb : b.toNat < 256 := b.isLt
+    simp [BitVec.extractLsb, BitVec.extractLsb']; omega
+  rw [h1, beq_self_eq_true, if_pos rfl]
+  ext i hi; simp [BitVec.extractLsb, BitVec.extractLsb']
+
+private theorem setWidth_flenbits_nan_box_32 (x : BitVec 32) :
+    BitVec.setWidth (if true = true then 8 else 4 * 8) (nan_box (n := 8 *i 8) x) =
+      (BitVec.setWidth 8 x : flenbits) := by
+  change BitVec.setWidth 8 (nan_box (n := 64) x) = BitVec.setWidth 8 x
+  rw [nan_box_32_eq]; unfold rv64NanBoxSSpec
+  ext i hi
+  have hi32 : i < 32 := by omega
+  simp only [BitVec.getElem_setWidth]
+  rw [BitVec.getLsbD_append, if_pos hi32]
+
+private theorem setWidth_flenbits_nan_box_64 (x : BitVec 64) :
+    BitVec.setWidth (if true = true then 8 else 4 * 8) (nan_box (n := 8 *i 8) x) =
+      (BitVec.setWidth 8 x : flenbits) := by
+  change BitVec.setWidth 8 (nan_box (n := 64) x) = BitVec.setWidth 8 x
+  rw [nan_box_64_eq]
+
+private theorem rF_bits_f0_run (val : flenbits)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hf0 : s.regs.get? .f0 = some val) :
+    (rF_bits (.Fregidx 0#5)).run s = .ok val s := by
+  unfold rF_bits rF
+  have ha : (PreSail.assert (hartSupports .Ext_F) "extensions/FD/fdext_regs.sail:123.28-123.29" : SailM Unit).run s = .ok () s := by
+    unfold PreSail.assert; rw [hartSupports_Ext_F]; rfl
+  rw [run_bind_ok _ _ _ _ _ ha]; dsimp only [Sail.BitVec.toNatInt]
+  change (do let v ← readReg .f0; pure (fregval_from_freg v)).run s = .ok val s
+  rw [run_bind_ok _ _ _ _ _ (readReg_run_ok .f0 val s hf0)]; rfl
+
+private theorem rF_bits_f1_run (val : flenbits)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hf1 : s.regs.get? .f1 = some val) :
+    (rF_bits (.Fregidx 1#5)).run s = .ok val s := by
+  unfold rF_bits rF
+  have ha : (PreSail.assert (hartSupports .Ext_F) "extensions/FD/fdext_regs.sail:123.28-123.29" : SailM Unit).run s = .ok () s := by
+    unfold PreSail.assert; rw [hartSupports_Ext_F]; rfl
+  rw [run_bind_ok _ _ _ _ _ ha]; dsimp only [Sail.BitVec.toNatInt]
+  change (do let v ← readReg .f1; pure (fregval_from_freg v)).run s = .ok val s
+  rw [run_bind_ok _ _ _ _ _ (readReg_run_ok .f1 val s hf1)]; rfl
+
+private theorem wF_bits_f0_run (val : flenbits) (mstatusVal : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hmstatus : s.regs.get? .mstatus = some mstatusVal) :
+    ∃ regs', (wF_bits (.Fregidx 0#5) val).run s = .ok () { s with regs := regs' } ∧
+      regs'.get? .f0 = some val ∧
+      regs'.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      (∀ r, (Register.f0 == r) = false → (Register.mstatus == r) = false →
+        regs'.get? r = s.regs.get? r) := by
+  have hms' : (s.regs.insert .f0 val).get? .mstatus = some mstatusVal := by
+    rw [regs_get?_insert_ne _ _ _ _ rfl]; exact hmstatus
+  obtain ⟨regs', hdirty, hmsOut, hother⟩ :=
+    dirty_fd_context_run { s with regs := s.regs.insert .f0 val } mstatusVal hms'
+  refine ⟨regs', ?_, by rw [hother .f0 rfl, regs_get?_insert_self], hmsOut,
+    fun r hnef0 hnems => by rw [hother r hnems, regs_get?_insert_ne _ _ _ _ hnef0]⟩
+  unfold wF_bits wF
+  have ha : (PreSail.assert (hartSupports .Ext_F) "extensions/FD/fdext_regs.sail:164.28-164.29" : SailM Unit).run s = .ok () s := by
+    unfold PreSail.assert; rw [hartSupports_Ext_F]; rfl
+  rw [run_bind_ok _ _ _ _ _ ha]; dsimp only [Sail.BitVec.toNatInt, fregval_into_freg]
+  change (do writeReg .f0 val; dirty_fd_context ()).run s = _
+  rw [run_bind_ok _ _ _ _ _ (writeReg_run_ok .f0 val s)]; exact hdirty
+
+private theorem rF_or_X_S_of_rF_bits (idx : fregidx) (val : flenbits)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hr : (rF_bits idx).run s = .ok val s) :
+    (rF_or_X_S idx).run s = .ok (BitVec.setWidth 32 val) s := by
+  unfold rF_or_X_S
+  have ha1 : (PreSail.assert (Functions.flen ≥b 32) "extensions/FD/fdext_regs.sail:276.19-276.20" : SailM Unit).run s = .ok () s := rfl
+  have ha2 : (PreSail.assert (neq_bool (hartSupports .Ext_F) (hartSupports .Ext_Zfinx))
+      "extensions/FD/fdext_regs.sail:277.55-277.56" : SailM Unit).run s = .ok () s := by
+    unfold PreSail.assert neq_bool; rw [hartSupports_Ext_F, hartSupports_Ext_Zfinx]; rfl
+  rw [run_bind_ok _ _ _ _ _ ha1, run_bind_ok _ _ _ _ _ ha2, hartSupports_Ext_F, if_pos rfl]
+  unfold rF_S
+  have ha3 : (PreSail.assert (Functions.flen ≥b 32) "extensions/FD/fdext_regs.sail:239.19-239.20" : SailM Unit).run s = .ok () s := rfl
+  have ha4 : (PreSail.assert (hartSupports .Ext_F && LeanRV64D.Functions.not (hartSupports .Ext_Zfinx))
+      "extensions/FD/fdext_regs.sail:240.59-240.60" : SailM Unit).run s = .ok () s := by
+    unfold PreSail.assert LeanRV64D.Functions.not; rw [hartSupports_Ext_F, hartSupports_Ext_Zfinx]; rfl
+  rw [run_bind_ok _ _ _ _ _ ha3, run_bind_ok _ _ _ _ _ ha4, run_bind_ok _ _ _ _ _ hr]
+  dsimp only [Pure.pure, EStateM.pure, EStateM.run]; rw [nan_unbox_flenbits_32]
+
+private theorem rF_or_X_D_of_rF_bits (idx : fregidx) (val : flenbits)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hr : (rF_bits idx).run s = .ok val s) :
+    (rF_or_X_D idx).run s = .ok (BitVec.setWidth 64 val) s := by
+  unfold rF_or_X_D
+  have ha1 : (PreSail.assert (Functions.flen ≥b 64) "extensions/FD/fdext_regs.sail:284.19-284.20" : SailM Unit).run s = .ok () s := rfl
+  have ha2 : (PreSail.assert (neq_bool (hartSupports .Ext_F) (hartSupports .Ext_Zfinx))
+      "extensions/FD/fdext_regs.sail:285.55-285.56" : SailM Unit).run s = .ok () s := by
+    unfold PreSail.assert neq_bool; rw [hartSupports_Ext_F, hartSupports_Ext_Zfinx]; rfl
+  rw [run_bind_ok _ _ _ _ _ ha1, run_bind_ok _ _ _ _ _ ha2, hartSupports_Ext_F, if_pos rfl]
+  unfold rF_D
+  have ha3 : (PreSail.assert (Functions.flen ≥b 64) "extensions/FD/fdext_regs.sail:251.19-251.20" : SailM Unit).run s = .ok () s := rfl
+  have ha4 : (PreSail.assert (hartSupports .Ext_F && LeanRV64D.Functions.not (hartSupports .Ext_Zfinx))
+      "extensions/FD/fdext_regs.sail:252.59-252.60" : SailM Unit).run s = .ok () s := by
+    unfold PreSail.assert LeanRV64D.Functions.not; rw [hartSupports_Ext_F, hartSupports_Ext_Zfinx]; rfl
+  rw [run_bind_ok _ _ _ _ _ ha3, run_bind_ok _ _ _ _ _ ha4, run_bind_ok _ _ _ _ _ hr]; rfl
+
+private theorem rF_or_X_S_f0_run (val : flenbits)
+    (s : SequentialState RegisterType trivialChoiceSource) (hf0 : s.regs.get? .f0 = some val) :
+    (rF_or_X_S (.Fregidx 0#5)).run s = .ok (BitVec.setWidth 32 val) s :=
+  rF_or_X_S_of_rF_bits (.Fregidx 0#5) val s (rF_bits_f0_run val s hf0)
+
+private theorem rF_or_X_S_f1_run (val : flenbits)
+    (s : SequentialState RegisterType trivialChoiceSource) (hf1 : s.regs.get? .f1 = some val) :
+    (rF_or_X_S (.Fregidx 1#5)).run s = .ok (BitVec.setWidth 32 val) s :=
+  rF_or_X_S_of_rF_bits (.Fregidx 1#5) val s (rF_bits_f1_run val s hf1)
+
+private theorem rF_or_X_D_f0_run (val : flenbits)
+    (s : SequentialState RegisterType trivialChoiceSource) (hf0 : s.regs.get? .f0 = some val) :
+    (rF_or_X_D (.Fregidx 0#5)).run s = .ok (BitVec.setWidth 64 val) s :=
+  rF_or_X_D_of_rF_bits (.Fregidx 0#5) val s (rF_bits_f0_run val s hf0)
+
+private theorem rF_or_X_D_f1_run (val : flenbits)
+    (s : SequentialState RegisterType trivialChoiceSource) (hf1 : s.regs.get? .f1 = some val) :
+    (rF_or_X_D (.Fregidx 1#5)).run s = .ok (BitVec.setWidth 64 val) s :=
+  rF_or_X_D_of_rF_bits (.Fregidx 1#5) val s (rF_bits_f1_run val s hf1)
+
+private theorem wF_or_X_S_f0_run (val32 : BitVec 32) (mstatusVal : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hmstatus : s.regs.get? .mstatus = some mstatusVal) :
+    ∃ regs', (wF_or_X_S (.Fregidx 0#5) val32).run s = .ok () { s with regs := regs' } ∧
+      regs'.get? .f0 = some (BitVec.setWidth 8 val32 : flenbits) ∧
+      regs'.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      (∀ r, (Register.f0 == r) = false → (Register.mstatus == r) = false →
+        regs'.get? r = s.regs.get? r) := by
+  unfold wF_or_X_S
+  have ha1 : (PreSail.assert (Functions.flen ≥b 32) "extensions/FD/fdext_regs.sail:306.19-306.20" : SailM Unit).run s = .ok () s := rfl
+  have ha2 : (PreSail.assert (neq_bool (hartSupports .Ext_F) (hartSupports .Ext_Zfinx))
+      "extensions/FD/fdext_regs.sail:307.55-307.56" : SailM Unit).run s = .ok () s := by
+    unfold PreSail.assert neq_bool; rw [hartSupports_Ext_F, hartSupports_Ext_Zfinx]; rfl
+  rw [run_bind_ok _ _ _ _ _ ha1, run_bind_ok _ _ _ _ _ ha2, hartSupports_Ext_F, if_pos rfl]
+  unfold wF_S
+  have ha3 : (PreSail.assert (Functions.flen ≥b 32) "extensions/FD/fdext_regs.sail:245.19-245.20" : SailM Unit).run s = .ok () s := rfl
+  have ha4 : (PreSail.assert (hartSupports .Ext_F && LeanRV64D.Functions.not (hartSupports .Ext_Zfinx))
+      "extensions/FD/fdext_regs.sail:246.59-246.60" : SailM Unit).run s = .ok () s := by
+    unfold PreSail.assert LeanRV64D.Functions.not; rw [hartSupports_Ext_F, hartSupports_Ext_Zfinx]; rfl
+  rw [run_bind_ok _ _ _ _ _ ha3, run_bind_ok _ _ _ _ _ ha4, setWidth_flenbits_nan_box_32]
+  exact wF_bits_f0_run (BitVec.setWidth 8 val32) mstatusVal s hmstatus
+
+private theorem wF_or_X_D_f0_run (val64 mstatusVal : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hmstatus : s.regs.get? .mstatus = some mstatusVal) :
+    ∃ regs', (wF_or_X_D (.Fregidx 0#5) val64).run s = .ok () { s with regs := regs' } ∧
+      regs'.get? .f0 = some (BitVec.setWidth 8 val64 : flenbits) ∧
+      regs'.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      (∀ r, (Register.f0 == r) = false → (Register.mstatus == r) = false →
+        regs'.get? r = s.regs.get? r) := by
+  unfold wF_or_X_D
+  have ha1 : (PreSail.assert (Functions.flen ≥b 64) "extensions/FD/fdext_regs.sail:314.20-314.21" : SailM Unit).run s = .ok () s := rfl
+  have ha2 : (PreSail.assert (neq_bool (hartSupports .Ext_F) (hartSupports .Ext_Zfinx))
+      "extensions/FD/fdext_regs.sail:315.55-315.56" : SailM Unit).run s = .ok () s := by
+    unfold PreSail.assert neq_bool; rw [hartSupports_Ext_F, hartSupports_Ext_Zfinx]; rfl
+  rw [run_bind_ok _ _ _ _ _ ha1, run_bind_ok _ _ _ _ _ ha2, hartSupports_Ext_F, if_pos rfl]
+  unfold wF_D
+  have ha3 : (PreSail.assert (Functions.flen ≥b 64) "extensions/FD/fdext_regs.sail:257.19-257.20" : SailM Unit).run s = .ok () s := rfl
+  have ha4 : (PreSail.assert (hartSupports .Ext_F && LeanRV64D.Functions.not (hartSupports .Ext_Zfinx))
+      "extensions/FD/fdext_regs.sail:258.59-258.60" : SailM Unit).run s = .ok () s := by
+    unfold PreSail.assert LeanRV64D.Functions.not; rw [hartSupports_Ext_F, hartSupports_Ext_Zfinx]; rfl
+  rw [run_bind_ok _ _ _ _ _ ha3, run_bind_ok _ _ _ _ _ ha4]
+  exact wF_bits_f0_run (BitVec.setWidth 8 val64) mstatusVal s hmstatus
+
+/-- Theorem 2 (Section 16): Floating-point register file (`rF_bits`, `wF_bits`, `rF_S`, `rF_D`,
+    `rF_or_X_S`, `rF_or_X_D`, `wF_or_X_S`, `wF_or_X_D` over upstream `flenbits = BitVec 8`),
+    compressed index decoding (`cfregidx_to_fregidx`: `f8..f15`), and `dirty_fd_context`
+    (`mstatus.FS := 0b11`, `SD := 1`). -/
+theorem rv64FpRegsAndDirtyContext_bisim_sail
+    (f0Val : flenbits) (val64 mstatusVal : BitVec 64) (val32 : BitVec 32) (cidx : BitVec 3)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hf0 : s.regs.get? .f0 = some f0Val)
+    (hmstatus : s.regs.get? .mstatus = some mstatusVal) :
+    cfregidx_to_fregidx (.Cfregidx cidx) = .Fregidx (0b01#2 +++ cidx) ∧
+    (rF_bits (.Fregidx 0#5)).run s = .ok f0Val s ∧
+    (rF_or_X_S (.Fregidx 0#5)).run s = .ok (BitVec.setWidth 32 f0Val) s ∧
+    (rF_or_X_D (.Fregidx 0#5)).run s = .ok (BitVec.setWidth 64 f0Val) s ∧
+    (∃ regsS, (wF_or_X_S (.Fregidx 0#5) val32).run s = .ok () { s with regs := regsS } ∧
+      regsS.get? .f0 = some (BitVec.setWidth 8 val32 : flenbits) ∧
+      regsS.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal)) ∧
+    (∃ regsD, (wF_or_X_D (.Fregidx 0#5) val64).run s = .ok () { s with regs := regsD } ∧
+      regsD.get? .f0 = some (BitVec.setWidth 8 val64 : flenbits) ∧
+      regsD.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal)) := by
+  obtain ⟨regsS, hwS, hf0S, hmsS, _⟩ := wF_or_X_S_f0_run val32 mstatusVal s hmstatus
+  obtain ⟨regsD, hwD, hf0D, hmsD, _⟩ := wF_or_X_D_f0_run val64 mstatusVal s hmstatus
+  exact ⟨rfl, rF_bits_f0_run f0Val s hf0, rF_or_X_S_f0_run f0Val s hf0,
+    rF_or_X_D_f0_run f0Val s hf0, ⟨regsS, hwS, hf0S, hmsS⟩, ⟨regsD, hwD, hf0D, hmsD⟩⟩
+
+
+/-- Pure `TurboLean`-side specification for `select_instr_or_fcsr_rm` (`FextInsts.lean`, lines 286–302):
+    static instruction rounding modes (`RNE`/`RTZ`/`RDN`/`RUP`/`RMM`) pass through directly;
+    `RM_DYN` (`0b111`) decodes `fcsr.FRM` (`[7:5]`) and returns `none` on reserved `0b101`, `0b110`,
+    or `0b111` under `fcsr_rm_reserved_behavior = .Fcsr_RM_Illegal`. -/
+def rv64SelectRmSpec (instrRm : rounding_mode) (fcsrVal : BitVec 32) : Option rounding_mode :=
+  match instrRm with
+  | .RM_DYN =>
+    match Sail.BitVec.extractLsb fcsrVal 7 5 with
+    | 0b000#3 => some .RM_RNE
+    | 0b001#3 => some .RM_RTZ
+    | 0b010#3 => some .RM_RDN
+    | 0b011#3 => some .RM_RUP
+    | 0b100#3 => some .RM_RMM
+    | _ => none
+  | rm => some rm
+
+/-- Pure `TurboLean`-side specification for `write_fcsr` (`FdextRegs.lean`, lines 902–905):
+    updates `fcsr.FRM` (`[7:5]`) and `fcsr.FFLAGS` (`[4:0]`) and marks `mstatus.FS` dirty. -/
+def rv64WriteFcsrSpec (fcsrVal : BitVec 32) (frm : BitVec 3) (fflags : BitVec 5) : BitVec 32 :=
+  Sail.BitVec.updateSubrange (Sail.BitVec.updateSubrange fcsrVal 7 5 frm) 4 0 fflags
+
+/-- Pure `TurboLean`-side specification for `accrue_fflags` (`FdextRegs.lean`, lines 907–920):
+    ORs `flags` into `fcsr.FFLAGS` (`[4:0]`). -/
+def rv64AccrueFflagsFcsrSpec (fcsrVal : BitVec 32) (flags : BitVec 5) : BitVec 32 :=
+  Sail.BitVec.updateSubrange fcsrVal 4 0 (_get_Fcsr_FFLAGS fcsrVal ||| flags)
+
+private theorem csr_name_write_callback_fflags_run (val : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    (csr_name_write_callback "fflags" val).run s = .ok () s := rfl
+
+private theorem csr_name_write_callback_fcsr_run (val : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    (csr_name_write_callback "fcsr" val).run s = .ok () s := rfl
+
+private theorem accrue_fflags_run (fcsrVal : BitVec 32) (mstatusVal : BitVec 64) (flags : BitVec 5)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hfcsr : s.regs.get? .fcsr = some fcsrVal)
+    (hmstatus : s.regs.get? .mstatus = some mstatusVal) :
+    ∃ regs', (accrue_fflags flags).run s = .ok () { s with regs := regs' } ∧
+      regs'.get? .fcsr = some (rv64AccrueFflagsFcsrSpec fcsrVal flags) ∧
+      regs'.get? .mstatus =
+        some (if _get_Fcsr_FFLAGS fcsrVal != (_get_Fcsr_FFLAGS fcsrVal ||| flags) then
+            rv64DirtyFdMstatusSpec mstatusVal
+          else mstatusVal) ∧
+      (∀ r, (Register.fcsr == r) = false → (Register.mstatus == r) = false →
+        regs'.get? r = s.regs.get? r) := by
+  let newFcsr := rv64AccrueFflagsFcsrSpec fcsrVal flags
+  let s1 := { s with regs := s.regs.insert .fcsr newFcsr }
+  have hms1 : s1.regs.get? .mstatus = some mstatusVal := by
+    dsimp only [s1]; rw [regs_get?_insert_ne _ _ _ _ rfl]; exact hmstatus
+  have hfcsr1 : s1.regs.get? .fcsr = some newFcsr := regs_get?_insert_self _ _ _
+  have hcb (st : SequentialState RegisterType trivialChoiceSource)
+      (hfc : st.regs.get? .fcsr = some newFcsr) :
+      (do
+        let v1 ← readReg .fcsr
+        csr_name_write_callback "fflags" (zero_extend (m := 64) (_get_Fcsr_FFLAGS v1))
+        let v2 ← readReg .fcsr
+        csr_name_write_callback "fcsr" (zero_extend (m := 64) v2)).run st = .ok () st := by
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok .fcsr newFcsr st hfc),
+        run_bind_ok _ _ _ _ _ (csr_name_write_callback_fflags_run _ st),
+        run_bind_ok _ _ _ _ _ (readReg_run_ok .fcsr newFcsr st hfc)]
+    exact csr_name_write_callback_fcsr_run _ st
+  have hpre (stOut : SequentialState RegisterType trivialChoiceSource)
+      (htail : (do
+        if (_get_Fcsr_FFLAGS fcsrVal != (_get_Fcsr_FFLAGS fcsrVal ||| flags)) = true then do
+          dirty_fd_context_if_present ()
+          let v1 ← readReg .fcsr
+          csr_name_write_callback "fflags" (zero_extend (m := 64) (_get_Fcsr_FFLAGS v1))
+          let v2 ← readReg .fcsr
+          csr_name_write_callback "fcsr" (zero_extend (m := 64) v2)
+        else do
+          pure ()
+          let v1 ← readReg .fcsr
+          csr_name_write_callback "fflags" (zero_extend (m := 64) (_get_Fcsr_FFLAGS v1))
+          let v2 ← readReg .fcsr
+          csr_name_write_callback "fcsr" (zero_extend (m := 64) v2)).run s1 = .ok () stOut) :
+      (accrue_fflags flags).run s = .ok () stOut := by
+    unfold accrue_fflags fflags_dirty_policy
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok .fcsr fcsrVal s hfcsr)]
+    dsimp only [Pure.pure, EStateM.pure, Bind.bind, EStateM.bind]
+    change (do
+      let __do_lift ← readReg Register.fcsr
+      let y_1 ← pure (_get_Fcsr_FFLAGS __do_lift != (_get_Fcsr_FFLAGS fcsrVal ||| flags))
+      let __do_lift ← readReg Register.fcsr
+      writeReg Register.fcsr (Sail.BitVec.updateSubrange __do_lift 4 0 (_get_Fcsr_FFLAGS fcsrVal ||| flags))
+      if y_1 = true then do
+        dirty_fd_context_if_present ()
+        let v1 ← readReg .fcsr
+        csr_name_write_callback "fflags" (zero_extend (m := 64) (_get_Fcsr_FFLAGS v1))
+        let v2 ← readReg .fcsr
+        csr_name_write_callback "fcsr" (zero_extend (m := 64) v2)
+      else do
+        pure ()
+        let v1 ← readReg .fcsr
+        csr_name_write_callback "fflags" (zero_extend (m := 64) (_get_Fcsr_FFLAGS v1))
+        let v2 ← readReg .fcsr
+        csr_name_write_callback "fcsr" (zero_extend (m := 64) v2)).run s = .ok () stOut
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok .fcsr fcsrVal s hfcsr)]
+    change (do
+      let __do_lift ← readReg Register.fcsr
+      writeReg Register.fcsr (Sail.BitVec.updateSubrange __do_lift 4 0 (_get_Fcsr_FFLAGS fcsrVal ||| flags))
+      if (_get_Fcsr_FFLAGS fcsrVal != (_get_Fcsr_FFLAGS fcsrVal ||| flags)) = true then do
+        dirty_fd_context_if_present ()
+        let v1 ← readReg .fcsr
+        csr_name_write_callback "fflags" (zero_extend (m := 64) (_get_Fcsr_FFLAGS v1))
+        let v2 ← readReg .fcsr
+        csr_name_write_callback "fcsr" (zero_extend (m := 64) v2)
+      else do
+        pure ()
+        let v1 ← readReg .fcsr
+        csr_name_write_callback "fflags" (zero_extend (m := 64) (_get_Fcsr_FFLAGS v1))
+        let v2 ← readReg .fcsr
+        csr_name_write_callback "fcsr" (zero_extend (m := 64) v2)).run s = .ok () stOut
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok .fcsr fcsrVal s hfcsr)]
+    change (do writeReg Register.fcsr newFcsr; _).run s = .ok () stOut
+    rw [run_bind_ok _ _ _ _ _ (writeReg_run_ok .fcsr newFcsr s)]
+    exact htail
+  cases hchg : (_get_Fcsr_FFLAGS fcsrVal != (_get_Fcsr_FFLAGS fcsrVal ||| flags))
+  · refine ⟨s1.regs, hpre s1 ?_, hfcsr1, hms1, fun r hnefcsr _ => regs_get?_insert_ne _ _ _ _ hnefcsr⟩
+    rw [hchg, if_neg Bool.false_ne_true]
+    dsimp only [Pure.pure, EStateM.pure, Bind.bind, EStateM.bind]
+    change (do
+      let v1 ← readReg .fcsr
+      csr_name_write_callback "fflags" (zero_extend (m := 64) (_get_Fcsr_FFLAGS v1))
+      let v2 ← readReg .fcsr
+      csr_name_write_callback "fcsr" (zero_extend (m := 64) v2)).run s1 = .ok () s1
+    exact hcb s1 hfcsr1
+  · obtain ⟨regs', hdirty, hmsOut, hother⟩ := dirty_fd_context_if_present_run s1 mstatusVal hms1
+    have hfcsr' : regs'.get? .fcsr = some newFcsr := by rw [hother .fcsr rfl]; exact hfcsr1
+    refine ⟨regs', hpre { s with regs := regs' } ?_, hfcsr', hmsOut, fun r hnefcsr hnems => by
+      rw [hother r hnems]; exact regs_get?_insert_ne _ _ _ _ hnefcsr⟩
+    rw [hchg, if_pos rfl, run_bind_ok _ _ _ _ _ hdirty]; exact hcb { s with regs := regs' } hfcsr'
+
+/-- Theorem 3 (Section 16): `fcsr` field decoding (`FFLAGS`/`FRM`), `write_fcsr`, IEEE-754
+    exception flag masks (`NX`/`UF`/`OF`/`DZ`/`NV`), `select_instr_or_fcsr_rm` (static modes,
+    dynamic `fcsr.FRM` resolution, and reserved `0b101`/`0b110`/`0b111` illegal-instruction
+    rejection), and `accrue_fflags` under `Fflags_Dirty_Precise` (`mstatus.FS` untouched when
+    no new flags accrue, marked `Dirty` when new flags accrue). -/
+theorem rv64FcsrRoundingAndAccrueFflags_bisim_sail
+    (fcsrVal : BitVec 32) (mstatusVal : BitVec 64) (frm : BitVec 3) (flags : BitVec 5)
+    (instrRm : rounding_mode)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hfcsr : s.regs.get? .fcsr = some fcsrVal)
+    (hmstatus : s.regs.get? .mstatus = some mstatusVal) :
+    _get_Fcsr_FFLAGS fcsrVal = Sail.BitVec.extractLsb fcsrVal 4 0 ∧
+    _get_Fcsr_FRM fcsrVal = Sail.BitVec.extractLsb fcsrVal 7 5 ∧
+    nxFlag () = 0b00001#5 ∧ ufFlag () = 0b00010#5 ∧ ofFlag () = 0b00100#5 ∧
+    dzFlag () = 0b01000#5 ∧ nvFlag () = 0b10000#5 ∧
+    valid_rounding_mode frm = ((frm != 0b101#3) && (frm != 0b110#3)) ∧
+    (select_instr_or_fcsr_rm instrRm).run s = .ok (rv64SelectRmSpec instrRm fcsrVal) s ∧
+    (∃ regsW, (write_fcsr frm flags).run s = .ok () { s with regs := regsW } ∧
+      regsW.get? .fcsr = some (rv64WriteFcsrSpec fcsrVal frm flags) ∧
+      regsW.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal)) ∧
+    (∃ regsA, (accrue_fflags flags).run s = .ok () { s with regs := regsA } ∧
+      regsA.get? .fcsr = some (rv64AccrueFflagsFcsrSpec fcsrVal flags) ∧
+      regsA.get? .mstatus =
+        some (if _get_Fcsr_FFLAGS fcsrVal != (_get_Fcsr_FFLAGS fcsrVal ||| flags) then
+            rv64DirtyFdMstatusSpec mstatusVal
+          else mstatusVal)) ∧
+    ((accrue_fflags 0#5).run s =
+      .ok () { s with regs := s.regs.insert .fcsr (rv64AccrueFflagsFcsrSpec fcsrVal 0#5) }) := by
+  have hsel : (select_instr_or_fcsr_rm instrRm).run s = .ok (rv64SelectRmSpec instrRm fcsrVal) s := by
+    cases instrRm with
+    | RM_RNE | RM_RTZ | RM_RDN | RM_RUP | RM_RMM =>
+      unfold select_instr_or_fcsr_rm rv64SelectRmSpec; rfl
+    | RM_DYN =>
+      unfold select_instr_or_fcsr_rm rv64SelectRmSpec
+      have hdyn : (rounding_mode.RM_DYN == rounding_mode.RM_DYN) = true := rfl
+      rw [hdyn, if_pos rfl]
+      rw [run_bind_ok _ _ _ _ _ (readReg_run_ok .fcsr fcsrVal s hfcsr)]
+      dsimp only [Pure.pure, EStateM.pure, EStateM.run, Bind.bind, EStateM.bind, _get_Fcsr_FRM]
+      revert hfcsr
+      generalize (Sail.BitVec.extractLsb fcsrVal 7 5 : BitVec 3) = fcsrRm
+      intro _
+      rcases fcsrRm with ⟨⟨v, hv⟩⟩
+      match v with
+      | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 => rfl
+      | n + 8 => omega
+  have hwFcsr : ∃ regsW, (write_fcsr frm flags).run s = .ok () { s with regs := regsW } ∧
+      regsW.get? .fcsr = some (rv64WriteFcsrSpec fcsrVal frm flags) ∧
+      regsW.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) := by
+    let fc1 := Sail.BitVec.updateSubrange fcsrVal 7 5 frm
+    let fc2 := Sail.BitVec.updateSubrange fc1 4 0 flags
+    let r2 := (s.regs.insert .fcsr fc1).insert .fcsr fc2
+    have hms2 : r2.get? .mstatus = some mstatusVal := by
+      dsimp only [r2]; rw [regs_get?_insert_ne _ _ _ _ rfl, regs_get?_insert_ne _ _ _ _ rfl]
+      exact hmstatus
+    obtain ⟨regsW, hdirty, hmsW, hotherW⟩ :=
+      dirty_fd_context_if_present_run { s with regs := r2 } mstatusVal hms2
+    refine ⟨regsW, ?_, ?_, hmsW⟩
+    · unfold write_fcsr
+      rw [run_bind_ok _ _ _ _ _ (readReg_run_ok .fcsr fcsrVal s hfcsr)]
+      rw [run_bind_ok _ _ _ _ _ (writeReg_run_ok .fcsr fc1 s)]
+      have hfc1 : (s.regs.insert .fcsr fc1).get? .fcsr = some fc1 := regs_get?_insert_self _ _ _
+      rw [run_bind_ok _ _ _ _ _ (readReg_run_ok .fcsr fc1 _ hfc1)]
+      rw [run_bind_ok _ _ _ _ _ (writeReg_run_ok .fcsr fc2 _)]
+      exact hdirty
+    · rw [hotherW .fcsr rfl]; exact regs_get?_insert_self _ _ _
+  obtain ⟨regsA, hacc, hfcA, hmsA, _⟩ := accrue_fflags_run fcsrVal mstatusVal flags s hfcsr hmstatus
+  have hacc0 : (accrue_fflags 0#5).run s =
+      .ok () { s with regs := s.regs.insert .fcsr (rv64AccrueFflagsFcsrSpec fcsrVal 0#5) } := by
+    have h0 : (_get_Fcsr_FFLAGS fcsrVal != (_get_Fcsr_FFLAGS fcsrVal ||| 0#5)) = false := by
+      rw [BitVec.or_zero]; exact bne_self_eq_false _
+    let s1 := { s with regs := s.regs.insert .fcsr (rv64AccrueFflagsFcsrSpec fcsrVal 0#5) }
+    have hfc1 : s1.regs.get? .fcsr = some (rv64AccrueFflagsFcsrSpec fcsrVal 0#5) :=
+      regs_get?_insert_self _ _ _
+    unfold accrue_fflags fflags_dirty_policy
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok .fcsr fcsrVal s hfcsr)]
+    dsimp only [Pure.pure, EStateM.pure, Bind.bind, EStateM.bind]
+    change (do
+      let __do_lift ← readReg Register.fcsr
+      let y_1 ← pure (_get_Fcsr_FFLAGS __do_lift != (_get_Fcsr_FFLAGS fcsrVal ||| 0#5))
+      let __do_lift ← readReg Register.fcsr
+      writeReg Register.fcsr (Sail.BitVec.updateSubrange __do_lift 4 0 (_get_Fcsr_FFLAGS fcsrVal ||| 0#5))
+      if y_1 = true then do
+        dirty_fd_context_if_present ()
+        let __do_lift ← readReg Register.fcsr
+        csr_name_write_callback "fflags" (zero_extend (m := 64) (_get_Fcsr_FFLAGS __do_lift))
+        let __do_lift ← readReg Register.fcsr
+        csr_name_write_callback "fcsr" (zero_extend (m := 64) __do_lift)
+      else do
+        pure ()
+        let __do_lift ← readReg Register.fcsr
+        csr_name_write_callback "fflags" (zero_extend (m := 64) (_get_Fcsr_FFLAGS __do_lift))
+        let __do_lift ← readReg Register.fcsr
+        csr_name_write_callback "fcsr" (zero_extend (m := 64) __do_lift)).run s = .ok () s1
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok .fcsr fcsrVal s hfcsr)]
+    change (do
+      let __do_lift ← readReg Register.fcsr
+      writeReg Register.fcsr (Sail.BitVec.updateSubrange __do_lift 4 0 (_get_Fcsr_FFLAGS fcsrVal ||| 0#5))
+      if (_get_Fcsr_FFLAGS fcsrVal != (_get_Fcsr_FFLAGS fcsrVal ||| 0#5)) = true then do
+        dirty_fd_context_if_present ()
+        let __do_lift ← readReg Register.fcsr
+        csr_name_write_callback "fflags" (zero_extend (m := 64) (_get_Fcsr_FFLAGS __do_lift))
+        let __do_lift ← readReg Register.fcsr
+        csr_name_write_callback "fcsr" (zero_extend (m := 64) __do_lift)
+      else do
+        pure ()
+        let __do_lift ← readReg Register.fcsr
+        csr_name_write_callback "fflags" (zero_extend (m := 64) (_get_Fcsr_FFLAGS __do_lift))
+        let __do_lift ← readReg Register.fcsr
+        csr_name_write_callback "fcsr" (zero_extend (m := 64) __do_lift)).run s = .ok () s1
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok .fcsr fcsrVal s hfcsr)]
+    change (do writeReg Register.fcsr (rv64AccrueFflagsFcsrSpec fcsrVal 0#5); _).run s = .ok () s1
+    rw [run_bind_ok _ _ _ _ _ (writeReg_run_ok .fcsr (rv64AccrueFflagsFcsrSpec fcsrVal 0#5) s),
+        h0, if_neg Bool.false_ne_true]
+    dsimp only [Pure.pure, EStateM.pure, Bind.bind, EStateM.bind]
+    change (do
+      let v1 ← readReg .fcsr
+      csr_name_write_callback "fflags" (zero_extend (m := 64) (_get_Fcsr_FFLAGS v1))
+      let v2 ← readReg .fcsr
+      csr_name_write_callback "fcsr" (zero_extend (m := 64) v2)).run s1 = .ok () s1
+    rw [run_bind_ok _ _ _ _ _ (readReg_run_ok .fcsr _ s1 hfc1),
+        run_bind_ok _ _ _ _ _ (csr_name_write_callback_fflags_run _ s1),
+        run_bind_ok _ _ _ _ _ (readReg_run_ok .fcsr _ s1 hfc1)]
+    exact csr_name_write_callback_fcsr_run _ s1
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, hsel, hwFcsr, ⟨regsA, hacc, hfcA, hmsA⟩, hacc0⟩
+
+/-- Pure `TurboLean`-side IEEE-754 single-precision classification (`float_classify` on `BitVec 32`). -/
+def rv64FloatClassify32Spec (f : BitVec 32) : float_class :=
+  let sign := Sail.BitVec.extractLsb f 31 31
+  let exp := Sail.BitVec.extractLsb f 30 23
+  let mant := Sail.BitVec.extractLsb f 22 0
+  if exp == BitVec.allOnes 8 then
+    if mant == 0#23 then
+      if sign == 0#1 then .float_class_positive_inf else .float_class_negative_inf
+    else if BitVec.access mant 22 == 0#1 then
+      .float_class_snan
+    else
+      .float_class_qnan
+  else if exp == 0#8 then
+    if mant == 0#23 then
+      if sign == 0#1 then .float_class_positive_zero else .float_class_negative_zero
+    else
+      if sign == 0#1 then .float_class_positive_subnormal else .float_class_negative_subnormal
+  else
+    if sign == 0#1 then .float_class_positive_normal else .float_class_negative_normal
+
+/-- Pure `TurboLean`-side IEEE-754 double-precision classification (`float_classify` on `BitVec 64`). -/
+def rv64FloatClassify64Spec (f : BitVec 64) : float_class :=
+  let sign := Sail.BitVec.extractLsb f 63 63
+  let exp := Sail.BitVec.extractLsb f 62 52
+  let mant := Sail.BitVec.extractLsb f 51 0
+  if exp == BitVec.allOnes 11 then
+    if mant == 0#52 then
+      if sign == 0#1 then .float_class_positive_inf else .float_class_negative_inf
+    else if BitVec.access mant 51 == 0#1 then
+      .float_class_snan
+    else
+      .float_class_qnan
+  else if exp == 0#11 then
+    if mant == 0#52 then
+      if sign == 0#1 then .float_class_positive_zero else .float_class_negative_zero
+    else
+      if sign == 0#1 then .float_class_positive_subnormal else .float_class_negative_subnormal
+  else
+    if sign == 0#1 then .float_class_positive_normal else .float_class_negative_normal
+
+private theorem bitvec_1_cases (b : BitVec 1) : b = 0#1 ∨ b = 1#1 := by
+  rcases b with ⟨⟨v, hv⟩⟩
+  match v with
+  | 0 => exact .inl rfl
+  | 1 => exact .inr rfl
+  | n + 2 => omega
+
+private theorem access_msb_eq_extractLsb_32 (f : BitVec 32) :
+    BitVec.access f 31 = Sail.BitVec.extractLsb f 31 31 := by
+  apply BitVec.eq_of_getLsbD_eq
+  intro i hi
+  rcases Nat.lt_one_iff.mp hi with rfl
+  simp [BitVec.access, Sail.BitVec.extractLsb]
+
+private theorem access_msb_eq_extractLsb_64 (f : BitVec 64) :
+    BitVec.access f 63 = Sail.BitVec.extractLsb f 63 63 := by
+  apply BitVec.eq_of_getLsbD_eq
+  intro i hi
+  rcases Nat.lt_one_iff.mp hi with rfl
+  simp [BitVec.access, Sail.BitVec.extractLsb]
+
+private theorem sail_ones_8 : sail_ones 8 = BitVec.allOnes 8 := by decide
+private theorem sail_ones_11 : sail_ones 11 = BitVec.allOnes 11 := by decide
+
+private theorem float_is_nan_32_eq (f : BitVec 32) :
+    float_is_nan f =
+      ((Sail.BitVec.extractLsb f 30 23 == BitVec.allOnes 8) &&
+       !(Sail.BitVec.extractLsb f 22 0 == 0#23)) := by
+  change ((Sail.BitVec.extractLsb f 30 23 == sail_ones 8) &&
+    !(Sail.BitVec.extractLsb f 22 0 == 0#23)) = _
+  rw [sail_ones_8]
+
+private theorem float_is_snan_32_eq (f : BitVec 32) :
+    float_is_snan f =
+      ((Sail.BitVec.extractLsb f 30 23 == BitVec.allOnes 8) &&
+       !(Sail.BitVec.extractLsb f 22 0 == 0#23) &&
+       (BitVec.access (Sail.BitVec.extractLsb f 22 0) 22 == 0#1)) := by
+  unfold float_is_snan
+  rw [float_is_nan_32_eq]
+  rfl
+
+private theorem float_is_qnan_32_eq (f : BitVec 32) :
+    float_is_qnan f =
+      ((Sail.BitVec.extractLsb f 30 23 == BitVec.allOnes 8) &&
+       !(Sail.BitVec.extractLsb f 22 0 == 0#23) &&
+       (BitVec.access (Sail.BitVec.extractLsb f 22 0) 22 == 1#1)) := by
+  unfold float_is_qnan
+  rw [float_is_nan_32_eq]
+  rfl
+
+private theorem float_is_zero_32_eq (f : BitVec 32) :
+    float_is_zero f =
+      ((Sail.BitVec.extractLsb f 30 23 == 0#8) &&
+       (Sail.BitVec.extractLsb f 22 0 == 0#23)) := rfl
+
+private theorem float_is_subnormal_32_eq (f : BitVec 32) :
+    float_is_subnormal f =
+      ((Sail.BitVec.extractLsb f 30 23 == 0#8) &&
+       !(Sail.BitVec.extractLsb f 22 0 == 0#23)) := rfl
+
+private theorem float_is_normal_32_eq (f : BitVec 32) :
+    float_is_normal f =
+      (!(Sail.BitVec.extractLsb f 30 23 == BitVec.allOnes 8) &&
+       !(Sail.BitVec.extractLsb f 30 23 == 0#8)) := by
+  change (!(Sail.BitVec.extractLsb f 30 23 == sail_ones 8) &&
+    !(Sail.BitVec.extractLsb f 30 23 == 0#8)) = _
+  rw [sail_ones_8]
+
+private theorem float_is_inf_32_eq (f : BitVec 32) :
+    float_is_inf f =
+      ((Sail.BitVec.extractLsb f 30 23 == BitVec.allOnes 8) &&
+       (Sail.BitVec.extractLsb f 22 0 == 0#23)) := by
+  change ((Sail.BitVec.extractLsb f 30 23 == sail_ones 8) &&
+    (Sail.BitVec.extractLsb f 22 0 == 0#23)) = _
+  rw [sail_ones_8]
+
+private theorem float_is_positive_32_eq (f : BitVec 32) :
+    float_is_positive f = (Sail.BitVec.extractLsb f 31 31 == 0#1) := by
+  unfold float_is_positive is_highest_zero
+  change (BitVec.access f 31 == 0#1) = (Sail.BitVec.extractLsb f 31 31 == 0#1)
+  rw [access_msb_eq_extractLsb_32 f]
+
+private theorem float_classify_32_run (f : BitVec 32)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    (float_classify f).run s = .ok (rv64FloatClassify32Spec f) s := by
+  unfold float_classify rv64FloatClassify32Spec
+  dsimp only []
+  rw [float_is_snan_32_eq, float_is_qnan_32_eq, float_is_zero_32_eq,
+      float_is_subnormal_32_eq, float_is_normal_32_eq, float_is_inf_32_eq,
+      float_is_positive_32_eq]
+  generalize Sail.BitVec.extractLsb f 31 31 = sign
+  generalize Sail.BitVec.extractLsb f 30 23 = exp
+  generalize Sail.BitVec.extractLsb f 22 0 = mant
+  generalize BitVec.access mant 22 = m22
+  rcases bitvec_1_cases sign with rfl | rfl <;>
+    rcases bitvec_1_cases m22 with rfl | rfl
+  all_goals
+    by_cases he1 : (exp == BitVec.allOnes 8) = true
+    · have he0 : (exp == 0#8) = false := by
+        rw [beq_iff_eq] at he1; subst he1; decide
+      rw [he1, he0]
+      cases hm0 : (mant == 0#23) <;> rfl
+    · simp only [Bool.not_eq_true] at he1
+      rw [he1]
+      cases he0 : (exp == 0#8) <;> cases hm0 : (mant == 0#23) <;> rfl
+
+private theorem float_is_nan_64_eq (f : BitVec 64) :
+    float_is_nan f =
+      ((Sail.BitVec.extractLsb f 62 52 == BitVec.allOnes 11) &&
+       !(Sail.BitVec.extractLsb f 51 0 == 0#52)) := by
+  change ((Sail.BitVec.extractLsb f 62 52 == sail_ones 11) &&
+    !(Sail.BitVec.extractLsb f 51 0 == 0#52)) = _
+  rw [sail_ones_11]
+
+private theorem float_is_snan_64_eq (f : BitVec 64) :
+    float_is_snan f =
+      ((Sail.BitVec.extractLsb f 62 52 == BitVec.allOnes 11) &&
+       !(Sail.BitVec.extractLsb f 51 0 == 0#52) &&
+       (BitVec.access (Sail.BitVec.extractLsb f 51 0) 51 == 0#1)) := by
+  unfold float_is_snan
+  rw [float_is_nan_64_eq]
+  rfl
+
+private theorem float_is_qnan_64_eq (f : BitVec 64) :
+    float_is_qnan f =
+      ((Sail.BitVec.extractLsb f 62 52 == BitVec.allOnes 11) &&
+       !(Sail.BitVec.extractLsb f 51 0 == 0#52) &&
+       (BitVec.access (Sail.BitVec.extractLsb f 51 0) 51 == 1#1)) := by
+  unfold float_is_qnan
+  rw [float_is_nan_64_eq]
+  rfl
+
+private theorem float_is_zero_64_eq (f : BitVec 64) :
+    float_is_zero f =
+      ((Sail.BitVec.extractLsb f 62 52 == 0#11) &&
+       (Sail.BitVec.extractLsb f 51 0 == 0#52)) := rfl
+
+private theorem float_is_subnormal_64_eq (f : BitVec 64) :
+    float_is_subnormal f =
+      ((Sail.BitVec.extractLsb f 62 52 == 0#11) &&
+       !(Sail.BitVec.extractLsb f 51 0 == 0#52)) := rfl
+
+private theorem float_is_normal_64_eq (f : BitVec 64) :
+    float_is_normal f =
+      (!(Sail.BitVec.extractLsb f 62 52 == BitVec.allOnes 11) &&
+       !(Sail.BitVec.extractLsb f 62 52 == 0#11)) := by
+  change (!(Sail.BitVec.extractLsb f 62 52 == sail_ones 11) &&
+    !(Sail.BitVec.extractLsb f 62 52 == 0#11)) = _
+  rw [sail_ones_11]
+
+private theorem float_is_inf_64_eq (f : BitVec 64) :
+    float_is_inf f =
+      ((Sail.BitVec.extractLsb f 62 52 == BitVec.allOnes 11) &&
+       (Sail.BitVec.extractLsb f 51 0 == 0#52)) := by
+  change ((Sail.BitVec.extractLsb f 62 52 == sail_ones 11) &&
+    (Sail.BitVec.extractLsb f 51 0 == 0#52)) = _
+  rw [sail_ones_11]
+
+private theorem float_is_positive_64_eq (f : BitVec 64) :
+    float_is_positive f = (Sail.BitVec.extractLsb f 63 63 == 0#1) := by
+  unfold float_is_positive is_highest_zero
+  change (BitVec.access f 63 == 0#1) = (Sail.BitVec.extractLsb f 63 63 == 0#1)
+  rw [access_msb_eq_extractLsb_64 f]
+
+private theorem float_classify_64_run (f : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    (float_classify f).run s = .ok (rv64FloatClassify64Spec f) s := by
+  unfold float_classify rv64FloatClassify64Spec
+  dsimp only []
+  rw [float_is_snan_64_eq, float_is_qnan_64_eq, float_is_zero_64_eq,
+      float_is_subnormal_64_eq, float_is_normal_64_eq, float_is_inf_64_eq,
+      float_is_positive_64_eq]
+  generalize Sail.BitVec.extractLsb f 63 63 = sign
+  generalize Sail.BitVec.extractLsb f 62 52 = exp
+  generalize Sail.BitVec.extractLsb f 51 0 = mant
+  generalize BitVec.access mant 51 = m51
+  rcases bitvec_1_cases sign with rfl | rfl <;>
+    rcases bitvec_1_cases m51 with rfl | rfl
+  all_goals
+    by_cases he1 : (exp == BitVec.allOnes 11) = true
+    · have he0 : (exp == 0#11) = false := by
+        rw [beq_iff_eq] at he1; subst he1; decide
+      rw [he1, he0]
+      cases hm0 : (mant == 0#52) <;> rfl
+    · simp only [Bool.not_eq_true] at he1
+      rw [he1]
+      cases he0 : (exp == 0#11) <;> cases hm0 : (mant == 0#52) <;> rfl
+
+private theorem fsplit_S_fmake_S (s : BitVec 1) (e : BitVec 8) (m : BitVec 23) :
+    fsplit_S (fmake_S s e m) = (s, e, m) := by
+  unfold fsplit_S fmake_S
+  have ha : BitVec.extractLsb' 0 (8 + 23) (s ++ (e ++ m)) = e ++ m := BitVec.extractLsb'_append_eq_right
+  have h1 : Sail.BitVec.extractLsb (s ++ (e ++ m)) 31 31 = s := by
+    change BitVec.extractLsb' (8 + 23) 1 (s ++ (e ++ m)) = s; exact BitVec.extractLsb'_append_eq_left
+  have h2 : Sail.BitVec.extractLsb (s ++ (e ++ m)) 30 23 = e := by
+    have hb : BitVec.extractLsb' 23 8 (BitVec.extractLsb' 0 31 (s ++ (e ++ m))) =
+        Sail.BitVec.extractLsb (s ++ (e ++ m)) 30 23 := by
+      apply BitVec.eq_of_getLsbD_eq; intro i hi; simp [Sail.BitVec.extractLsb, BitVec.extractLsb, hi]
+    rw [← hb, ha]; exact BitVec.extractLsb'_append_eq_left
+  have h3 : Sail.BitVec.extractLsb (s ++ (e ++ m)) 22 0 = m := by
+    have hb : BitVec.extractLsb' 0 23 (BitVec.extractLsb' 0 31 (s ++ (e ++ m))) =
+        Sail.BitVec.extractLsb (s ++ (e ++ m)) 22 0 := by
+      apply BitVec.eq_of_getLsbD_eq; intro i hi; simp [Sail.BitVec.extractLsb, BitVec.extractLsb, hi]
+    rw [← hb, ha]; exact BitVec.extractLsb'_append_eq_right
+  exact Prod.ext h1 (Prod.ext h2 h3)
+
+private theorem fsplit_D_fmake_D (s : BitVec 1) (e : BitVec 11) (m : BitVec 52) :
+    fsplit_D (fmake_D s e m) = (s, e, m) := by
+  unfold fsplit_D fmake_D
+  have ha : BitVec.extractLsb' 0 (11 + 52) (s ++ (e ++ m)) = e ++ m := BitVec.extractLsb'_append_eq_right
+  have h1 : Sail.BitVec.extractLsb (s ++ (e ++ m)) 63 63 = s := by
+    change BitVec.extractLsb' (11 + 52) 1 (s ++ (e ++ m)) = s; exact BitVec.extractLsb'_append_eq_left
+  have h2 : Sail.BitVec.extractLsb (s ++ (e ++ m)) 62 52 = e := by
+    have hb : BitVec.extractLsb' 52 11 (BitVec.extractLsb' 0 63 (s ++ (e ++ m))) =
+        Sail.BitVec.extractLsb (s ++ (e ++ m)) 62 52 := by
+      apply BitVec.eq_of_getLsbD_eq; intro i hi; simp [Sail.BitVec.extractLsb, BitVec.extractLsb, hi]
+    rw [← hb, ha]; exact BitVec.extractLsb'_append_eq_left
+  have h3 : Sail.BitVec.extractLsb (s ++ (e ++ m)) 51 0 = m := by
+    have hb : BitVec.extractLsb' 0 52 (BitVec.extractLsb' 0 63 (s ++ (e ++ m))) =
+        Sail.BitVec.extractLsb (s ++ (e ++ m)) 51 0 := by
+      apply BitVec.eq_of_getLsbD_eq; intro i hi; simp [Sail.BitVec.extractLsb, BitVec.extractLsb, hi]
+    rw [← hb, ha]; exact BitVec.extractLsb'_append_eq_right
+  exact Prod.ext h1 (Prod.ext h2 h3)
+
+private theorem fmake_D_fsplit_D (x : BitVec 64) :
+    (let (s, e, m) := fsplit_D x; fmake_D s e m) = x := by
+  unfold fsplit_D fmake_D; apply BitVec.eq_of_getLsbD_eq; intro i hi
+  simp only [Sail.BitVec.extractLsb, BitVec.extractLsb, Nat.sub_zero,
+    BitVec.getLsbD_append, BitVec.getLsbD_extractLsb']
+  by_cases h52 : i < 52
+  · simp [h52, show ¬ (63 ≤ i) by omega]
+  · by_cases h63 : i - 52 < 11
+    · simp [h52, h63, show 52 + (i - 52) = i by omega, show ¬ (63 ≤ i) by omega]
+    · obtain rfl : i = 63 := by omega
+      simp
+
+private theorem fmake_S_fsplit_S (x : BitVec 32) :
+    (let (s, e, m) := fsplit_S x; fmake_S s e m) = x := by
+  unfold fsplit_S fmake_S; apply BitVec.eq_of_getLsbD_eq; intro i hi
+  simp only [Sail.BitVec.extractLsb, BitVec.extractLsb, Nat.sub_zero,
+    BitVec.getLsbD_append, BitVec.getLsbD_extractLsb']
+  by_cases h23 : i < 23
+  · simp [h23, show ¬ (31 ≤ i) by omega]
+  · by_cases h31 : i - 23 < 8
+    · simp [h23, h31, show 23 + (i - 23) = i by omega, show ¬ (31 ≤ i) by omega]
+    · obtain rfl : i = 31 := by omega
+      simp
+
+/-- Theorem 4 (Section 16): IEEE-754 single-precision (`FextInsts.lean`) and double-precision
+    (`DextInsts.lean`) split/compose/negate helpers, NaN/zero predicates, and quiet/signaling
+    ordered comparisons (`feq_quiet_S`/`D`, `flt_S`/`D`, `fle_S`/`D`), including `-0.0 == +0.0`,
+    signed magnitude ordering, `QNaN` quiet suppression vs signaling `nvFlag = 0b10000#5`, and
+    `SNaN` invalid-operation flag raising. -/
+theorem rv64FpSplitPredicatesAndCompare_bisim_sail
+    (s32 : BitVec 1) (e32 : BitVec 8) (m32 : BitVec 23) (x32 : BitVec 32)
+    (s64 : BitVec 1) (e64 : BitVec 11) (m64 : BitVec 52) (x64 : BitVec 64) :
+    fsplit_S (fmake_S s32 e32 m32) = (s32, e32, m32) ∧
+    (let (s, e, m) := fsplit_S x32; fmake_S s e m = x32) ∧
+    negate_S (negate_S x32) = x32 ∧
+    fsplit_D (fmake_D s64 e64 m64) = (s64, e64, m64) ∧
+    (let (s, e, m) := fsplit_D x64; fmake_D s e m = x64) ∧
+    negate_D (negate_D x64) = x64 ∧
+    feq_quiet_S 0x80000000#32 0x00000000#32 = (true, 0#5) ∧
+    feq_quiet_S (canonical_NaN_S ()) 0x3f800000#32 = (false, 0#5) ∧
+    feq_quiet_S 0x7f800001#32 0x3f800000#32 = (false, 0b10000#5) ∧
+    flt_S 0xbf800000#32 0x3f800000#32 false = (true, 0#5) ∧
+    flt_S 0x80000000#32 0x00000000#32 false = (true, 0#5) ∧
+    fle_S 0x00000000#32 0x80000000#32 true = (true, 0#5) ∧
+    fle_S (canonical_NaN_S ()) 0x3f800000#32 true = (false, 0#5) ∧
+    fle_S (canonical_NaN_S ()) 0x3f800000#32 false = (false, 0b10000#5) ∧
+    fle_S 0x7f800001#32 0x3f800000#32 true = (false, 0b10000#5) ∧
+    feq_quiet_D 0x8000000000000000#64 0x0000000000000000#64 = (true, 0#5) ∧
+    feq_quiet_D (canonical_NaN_D ()) 0x3ff0000000000000#64 = (false, 0#5) ∧
+    feq_quiet_D 0x7ff0000000000001#64 0x3ff0000000000000#64 = (false, 0b10000#5) ∧
+    flt_D 0xbff0000000000000#64 0x3ff0000000000000#64 false = (true, 0#5) ∧
+    fle_D 0x0000000000000000#64 0x8000000000000000#64 true = (true, 0#5) ∧
+    fle_D (canonical_NaN_D ()) 0x3ff0000000000000#64 true = (false, 0#5) ∧
+    fle_D (canonical_NaN_D ()) 0x3ff0000000000000#64 false = (false, 0b10000#5) ∧
+    fle_D 0x7ff0000000000001#64 0x3ff0000000000000#64 true = (false, 0b10000#5) := by
+  have hneg32 : negate_S (negate_S x32) = x32 := by
+    unfold negate_S
+    have hmk := fmake_S_fsplit_S x32
+    rcases hsp : fsplit_S x32 with ⟨sx, ex, mx⟩
+    rw [hsp] at hmk
+    rw [fsplit_S_fmake_S]
+    rcases bitvec_1_cases sx with rfl | rfl <;> exact hmk
+  have hneg64 : negate_D (negate_D x64) = x64 := by
+    unfold negate_D
+    have hmk := fmake_D_fsplit_D x64
+    rcases hsp : fsplit_D x64 with ⟨sx, ex, mx⟩
+    rw [hsp] at hmk
+    rw [fsplit_D_fmake_D]
+    rcases bitvec_1_cases sx with rfl | rfl <;> exact hmk
+  refine ⟨fsplit_S_fmake_S s32 e32 m32, fmake_S_fsplit_S x32, hneg32,
+    fsplit_D_fmake_D s64 e64 m64, fmake_D_fsplit_D x64, hneg64, ?_⟩
+  decide
+
+/-- Theorem 5 (Section 16): Universal 32-bit and 64-bit `float_classify` (`Classify.lean`)
+    bisimulation against `rv64FloatClassify32Spec` / `rv64FloatClassify64Spec` (never taking the
+    unreachable `Error.Exit` branch), plus all 10 IEEE-754 class witnesses and 10-bit one-hot mask
+    encodings (`float_class_onehot_bits_forwards`, `FloatClassify.lean`) for `FCLASS.S`/`FCLASS.D`. -/
+theorem rv64FloatClassifyAndOnehot_bisim_sail
+    (f32 : BitVec 32) (f64 : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource) :
+    (float_classify f32).run s = .ok (rv64FloatClassify32Spec f32) s ∧
+    (float_classify f64).run s = .ok (rv64FloatClassify64Spec f64) s ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify32Spec 0xff800000#32) = 0b0000000001#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify32Spec 0xbf800000#32) = 0b0000000010#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify32Spec 0x80000001#32) = 0b0000000100#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify32Spec 0x80000000#32) = 0b0000001000#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify32Spec 0x00000000#32) = 0b0000010000#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify32Spec 0x00000001#32) = 0b0000100000#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify32Spec 0x3f800000#32) = 0b0001000000#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify32Spec 0x7f800000#32) = 0b0010000000#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify32Spec 0x7f800001#32) = 0b0100000000#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify32Spec 0x7fc00000#32) = 0b1000000000#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify64Spec 0xfff0000000000000#64) = 0b0000000001#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify64Spec 0xbff0000000000000#64) = 0b0000000010#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify64Spec 0x8000000000000001#64) = 0b0000000100#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify64Spec 0x8000000000000000#64) = 0b0000001000#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify64Spec 0x0000000000000000#64) = 0b0000010000#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify64Spec 0x0000000000000001#64) = 0b0000100000#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify64Spec 0x3ff0000000000000#64) = 0b0001000000#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify64Spec 0x7ff0000000000000#64) = 0b0010000000#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify64Spec 0x7ff0000000000001#64) = 0b0100000000#10 ∧
+    float_class_onehot_bits_forwards (rv64FloatClassify64Spec 0x7ff8000000000000#64) = 0b1000000000#10 := by
+  refine ⟨float_classify_32_run f32 s, float_classify_64_run f64 s, ?_⟩
+  decide
+
+/-! ### Theorems 6–8: RV64F/D Compressed Expanders, Flat-RAM Load/Store, Move/Classify, and Sign-Inject/Min/Max -/
+
+
+/-- Exact upstream Sail `execute_C_FSWSP` (`InstsEnd.lean`, lines 71630–71632). -/
+def sailExecuteCFswsp (uimm : BitVec 6) (rs2 : fregidx) : ExecutionResult :=
+  let imm : BitVec 12 := zero_extend (m := 12) (uimm +++ 0b00#2)
+  .ExecuteAs (.STORE_FP (imm, rs2, sp, 4))
+
+/-- Exact upstream Sail `execute_C_FSW` (`InstsEnd.lean`, lines 71634–71638). -/
+def sailExecuteCFsw (uimm : BitVec 5) (rsc1 : cregidx) (rsc2 : cfregidx) : ExecutionResult :=
+  let imm : BitVec 12 := zero_extend (m := 12) (uimm +++ 0b00#2)
+  let rs1 := creg2reg_idx rsc1
+  let rs2 := cfregidx_to_fregidx rsc2
+  .ExecuteAs (.STORE_FP (imm, rs2, rs1, 4))
+
+/-- Exact upstream Sail `execute_C_FSDSP` (`InstsEnd.lean`, lines 71640–71642). -/
+def sailExecuteCFsdsp (uimm : BitVec 6) (rs2 : fregidx) : ExecutionResult :=
+  let imm : BitVec 12 := zero_extend (m := 12) (uimm +++ 0b000#3)
+  .ExecuteAs (.STORE_FP (imm, rs2, sp, 8))
+
+/-- Exact upstream Sail `execute_C_FSD` (`InstsEnd.lean`, lines 71644–71648). -/
+def sailExecuteCFsd (uimm : BitVec 5) (rsc1 : cregidx) (rsc2 : cfregidx) : ExecutionResult :=
+  let imm : BitVec 12 := zero_extend (m := 12) (uimm +++ 0b000#3)
+  let rs1 := creg2reg_idx rsc1
+  let rs2 := cfregidx_to_fregidx rsc2
+  .ExecuteAs (.STORE_FP (imm, rs2, rs1, 8))
+
+/-- Exact upstream Sail `execute_C_FLWSP` (`InstsEnd.lean`, lines 71650–71652). -/
+def sailExecuteCFlwsp (imm : BitVec 6) (rd : fregidx) : ExecutionResult :=
+  let imm : BitVec 12 := zero_extend (m := 12) (imm +++ 0b00#2)
+  .ExecuteAs (.LOAD_FP (imm, sp, rd, 4))
+
+/-- Exact upstream Sail `execute_C_FLW` (`InstsEnd.lean`, lines 71654–71658). -/
+def sailExecuteCFlw (uimm : BitVec 5) (rsc : cregidx) (rdc : cfregidx) : ExecutionResult :=
+  let imm : BitVec 12 := zero_extend (m := 12) (uimm +++ 0b00#2)
+  let rd := cfregidx_to_fregidx rdc
+  let rs := creg2reg_idx rsc
+  .ExecuteAs (.LOAD_FP (imm, rs, rd, 4))
+
+/-- Exact upstream Sail `execute_C_FLDSP` (`InstsEnd.lean`, lines 71660–71662). -/
+def sailExecuteCFldsp (uimm : BitVec 6) (rd : fregidx) : ExecutionResult :=
+  let imm : BitVec 12 := zero_extend (m := 12) (uimm +++ 0b000#3)
+  .ExecuteAs (.LOAD_FP (imm, sp, rd, 8))
+
+/-- Exact upstream Sail `execute_C_FLD` (`InstsEnd.lean`, lines 71664–71668). -/
+def sailExecuteCFld (uimm : BitVec 5) (rsc : cregidx) (rdc : cfregidx) : ExecutionResult :=
+  let imm : BitVec 12 := zero_extend (m := 12) (uimm +++ 0b000#3)
+  let rd := cfregidx_to_fregidx rdc
+  let rs := creg2reg_idx rsc
+  .ExecuteAs (.LOAD_FP (imm, rs, rd, 8))
+
+/-- Exact upstream Sail `execute_STORE_FP` data-slicing core (`InstsEnd.lean`, line 67343):
+    `Sail.BitVec.extractLsb fval ((width *i 8) -i 1) 0`. -/
+def sailStoreFpDataCore (width : Nat) (hw : 0 < width) (fval : flenbits) : BitVec (8 * width) :=
+  have hlen : (((Int.ofNat width *i 8) -i 1) -i 0 +i 1).toNat = 8 * width := by
+    change (((width : Int) * 8 - 1) - 0 + 1).toNat = 8 * width
+    omega
+  hlen ▸ Sail.BitVec.extractLsb fval ((Int.ofNat width *i 8) -i 1) 0
+
+/-- Exact upstream Sail `execute_LOAD_FP` (`InstsEnd.lean`, lines 69216–69224) over flat physical
+    RAM (`ext_data_get_addr` → `read_ram Read_plain` → `nan_box (8 *i 8)` → `wF_bits`). -/
+noncomputable def sailLoadFpRamExec (imm : BitVec 12) (rs1 : regidx) (rd : fregidx) (width : Nat)
+    (_hwle : width ≤ 8) : SailM ExecutionResult := do
+  PreSail.assert (width ≤b Functions.flen_bytes) "extensions/FD/fext_insts.sail:282.28-282.29"
+  let offset : xlenbits := sign_extend (m := 64) imm
+  match (← ext_data_get_addr rs1 offset (.Load .Data) width) with
+  | .Ext_DataAddr_OK (.Virtaddr vaddr) =>
+    let (result, _) ← LeanRV64D.Functions.read_ram .Read_plain (.Physaddr vaddr) width false
+    wF_bits rd (BitVec.setWidth (if (true : Bool) then 8 else 4 * 8) (nan_box (n := (8 *i 8)) result))
+    pure (.Retire_Success ())
+  | .Ext_DataAddr_Error e => pure (.Ext_DataAddr_Check_Failure e)
+
+/-- Exact upstream Sail `execute_STORE_FP` (`InstsEnd.lean`, lines 67340–67348) over flat physical
+    RAM (`rF_bits` → `extractLsb` → `ext_data_get_addr` → `write_ram Write_plain`). -/
+noncomputable def sailStoreFpRamExec (imm : BitVec 12) (rs2 : fregidx) (rs1 : regidx) (width : Nat)
+    (hw : 0 < width) : SailM ExecutionResult := do
+  PreSail.assert (width ≤b Functions.flen_bytes) "extensions/FD/fext_insts.sail:318.28-318.29"
+  let offset : xlenbits := sign_extend (m := 64) imm
+  let data : BitVec (8 * width) := sailStoreFpDataCore width hw (← rF_bits rs2)
+  match (← ext_data_get_addr rs1 offset (.Store .Data) width) with
+  | .Ext_DataAddr_OK (.Virtaddr vaddr) =>
+    let ok ← LeanRV64D.Functions.write_ram .Write_plain (.Physaddr vaddr) width data ()
+    if ok then pure (.Retire_Success ())
+    else internal_error "extensions/FD/fext_insts.sail" 324 "store got false from vmem_write"
+  | .Ext_DataAddr_Error e => pure (.Ext_DataAddr_Check_Failure e)
+
+private theorem sailStoreFpDataCore_eq_setWidth_4 (fval : flenbits) :
+    sailStoreFpDataCore 4 (by decide) fval = BitVec.setWidth 32 fval := by
+  unfold sailStoreFpDataCore Sail.BitVec.extractLsb
+  dsimp only []
+  apply BitVec.eq_of_getLsbD_eq
+  intro i _
+  simp [BitVec.extractLsb]
+
+private theorem sailStoreFpDataCore_eq_setWidth_8 (fval : flenbits) :
+    sailStoreFpDataCore 8 (by decide) fval = BitVec.setWidth 64 fval := by
+  unfold sailStoreFpDataCore Sail.BitVec.extractLsb
+  dsimp only []
+  apply BitVec.eq_of_getLsbD_eq
+  intro i _
+  simp [BitVec.extractLsb]
+
+/-- Theorem 6 (Section 16): RVC floating-point load/store compressed expanders (`C.FLW`, `C.FLWSP`,
+    `C.FLD`, `C.FLDSP`, `C.FSW`, `C.FSWSP`, `C.FSD`, `C.FSDSP`) and end-to-end `SailM` flat-RAM
+    execution of `FLW`/`FLD` (`execute_LOAD_FP`) and `FSW`/`FSD` (`execute_STORE_FP`), including
+    `nan_box` followed by upstream `flenbits` (`BitVec 8`) `.f0` update, `dirty_fd_context`, and
+    little-endian byte memory transitions. -/
+theorem rv64FpLoadStoreAndRvcExec_bisim_sail
+    (uimm6 : BitVec 6) (uimm5 : BitVec 5) (rsc : BitVec 3) (fsc : BitVec 3)
+    (rdF : fregidx) (imm12 : BitVec 12)
+    (spVal mstatusVal : BitVec 64) (f0Val : flenbits)
+    (bytes4 : BitVec 32) (bytes8 : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hsp : s.regs.get? .x2 = some spVal)
+    (hf0 : s.regs.get? .f0 = some f0Val)
+    (hmstatus : s.regs.get? .mstatus = some mstatusVal)
+    (hmem4 : rv64ReadMemBytesSpec 4 (BitVec.toNat (rv64iEffectiveAddrSpec spVal imm12)) s.mem = some bytes4)
+    (hmem8 : rv64ReadMemBytesSpec 8 (BitVec.toNat (rv64iEffectiveAddrSpec spVal imm12)) s.mem = some bytes8) :
+    sailExecuteCFswsp uimm6 rdF =
+      .ExecuteAs (.STORE_FP (BitVec.zeroExtend 12 (uimm6 ++ 0b00#2), rdF, sp, 4)) ∧
+    sailExecuteCFsw uimm5 (.Cregidx rsc) (.Cfregidx fsc) =
+      .ExecuteAs (.STORE_FP (BitVec.zeroExtend 12 (uimm5 ++ 0b00#2), .Fregidx (0b01#2 ++ fsc), .Regidx (0b01#2 ++ rsc), 4)) ∧
+    sailExecuteCFsdsp uimm6 rdF =
+      .ExecuteAs (.STORE_FP (BitVec.zeroExtend 12 (uimm6 ++ 0b000#3), rdF, sp, 8)) ∧
+    sailExecuteCFsd uimm5 (.Cregidx rsc) (.Cfregidx fsc) =
+      .ExecuteAs (.STORE_FP (BitVec.zeroExtend 12 (uimm5 ++ 0b000#3), .Fregidx (0b01#2 ++ fsc), .Regidx (0b01#2 ++ rsc), 8)) ∧
+    sailExecuteCFlwsp uimm6 rdF =
+      .ExecuteAs (.LOAD_FP (BitVec.zeroExtend 12 (uimm6 ++ 0b00#2), sp, rdF, 4)) ∧
+    sailExecuteCFlw uimm5 (.Cregidx rsc) (.Cfregidx fsc) =
+      .ExecuteAs (.LOAD_FP (BitVec.zeroExtend 12 (uimm5 ++ 0b00#2), .Regidx (0b01#2 ++ rsc), .Fregidx (0b01#2 ++ fsc), 4)) ∧
+    sailExecuteCFldsp uimm6 rdF =
+      .ExecuteAs (.LOAD_FP (BitVec.zeroExtend 12 (uimm6 ++ 0b000#3), sp, rdF, 8)) ∧
+    sailExecuteCFld uimm5 (.Cregidx rsc) (.Cfregidx fsc) =
+      .ExecuteAs (.LOAD_FP (BitVec.zeroExtend 12 (uimm5 ++ 0b000#3), .Regidx (0b01#2 ++ rsc), .Fregidx (0b01#2 ++ fsc), 8)) ∧
+    (sailStoreFpRamExec imm12 (.Fregidx 0#5) sp 4 (by decide)).run s =
+      .ok (.Retire_Success ()) ({ s with mem := rv64WriteMemBytesSpec 4 (BitVec.toNat (rv64iEffectiveAddrSpec spVal imm12)) (BitVec.setWidth 32 f0Val) s.mem }) ∧
+    (sailStoreFpRamExec imm12 (.Fregidx 0#5) sp 8 (by decide)).run s =
+      .ok (.Retire_Success ()) ({ s with mem := rv64WriteMemBytesSpec 8 (BitVec.toNat (rv64iEffectiveAddrSpec spVal imm12)) (BitVec.setWidth 64 f0Val) s.mem }) ∧
+    (∃ regs4,
+      (sailLoadFpRamExec imm12 sp (.Fregidx 0#5) 4 (by decide)).run s =
+        .ok (.Retire_Success ()) ({ s with regs := regs4 }) ∧
+      regs4.get? .f0 = some (BitVec.setWidth 8 bytes4 : flenbits) ∧
+      regs4.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      (∀ r, (Register.f0 == r) = false → (Register.mstatus == r) = false →
+        regs4.get? r = s.regs.get? r)) ∧
+    (∃ regs8,
+      (sailLoadFpRamExec imm12 sp (.Fregidx 0#5) 8 (by decide)).run s =
+        .ok (.Retire_Success ()) ({ s with regs := regs8 }) ∧
+      regs8.get? .f0 = some (BitVec.setWidth 8 bytes8 : flenbits) ∧
+      regs8.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      (∀ r, (Register.f0 == r) = false → (Register.mstatus == r) = false →
+        regs8.get? r = s.regs.get? r)) := by
+  have hst4 : (sailStoreFpRamExec imm12 (.Fregidx 0#5) sp 4 (by decide)).run s =
+      .ok (.Retire_Success ()) ({ s with mem := rv64WriteMemBytesSpec 4 (BitVec.toNat (rv64iEffectiveAddrSpec spVal imm12)) (BitVec.setWidth 32 f0Val) s.mem }) := by
+    unfold sailStoreFpRamExec
+    have ha : (PreSail.assert (4 ≤b Functions.flen_bytes)
+        "extensions/FD/fext_insts.sail:318.28-318.29" : SailM Unit).run s = .ok () s := rfl
+    rw [run_bind_ok _ _ _ _ _ ha]
+    rw [run_bind_ok _ _ _ _ _ (rF_bits_f0_run f0Val s hf0)]
+    rw [run_bind_ok _ _ _ _ _ (rv64iEffectiveAddr_ext_data_get_addr_bisim spVal imm12 (.Store .Data) 4 s hsp)]
+    dsimp only []
+    rw [sailStoreFpDataCore_eq_setWidth_4]
+    rw [run_bind_ok _ _ _ _ _ (write_ram_plain_bisim_sail 4 (rv64iEffectiveAddrSpec spVal imm12) (BitVec.setWidth 32 f0Val) s)]
+    rfl
+  have hst8 : (sailStoreFpRamExec imm12 (.Fregidx 0#5) sp 8 (by decide)).run s =
+      .ok (.Retire_Success ()) ({ s with mem := rv64WriteMemBytesSpec 8 (BitVec.toNat (rv64iEffectiveAddrSpec spVal imm12)) (BitVec.setWidth 64 f0Val) s.mem }) := by
+    unfold sailStoreFpRamExec
+    have ha : (PreSail.assert (8 ≤b Functions.flen_bytes)
+        "extensions/FD/fext_insts.sail:318.28-318.29" : SailM Unit).run s = .ok () s := rfl
+    rw [run_bind_ok _ _ _ _ _ ha]
+    rw [run_bind_ok _ _ _ _ _ (rF_bits_f0_run f0Val s hf0)]
+    rw [run_bind_ok _ _ _ _ _ (rv64iEffectiveAddr_ext_data_get_addr_bisim spVal imm12 (.Store .Data) 8 s hsp)]
+    dsimp only []
+    rw [sailStoreFpDataCore_eq_setWidth_8]
+    rw [run_bind_ok _ _ _ _ _ (write_ram_plain_bisim_sail 8 (rv64iEffectiveAddrSpec spVal imm12) (BitVec.setWidth 64 f0Val) s)]
+    rfl
+  obtain ⟨regs4, hw4, hf04, hms4, hoth4⟩ :=
+    wF_bits_f0_run (BitVec.setWidth 8 bytes4) mstatusVal s hmstatus
+  have hld4 : (sailLoadFpRamExec imm12 sp (.Fregidx 0#5) 4 (by decide)).run s =
+      .ok (.Retire_Success ()) ({ s with regs := regs4 }) := by
+    unfold sailLoadFpRamExec
+    have ha : (PreSail.assert (4 ≤b Functions.flen_bytes)
+        "extensions/FD/fext_insts.sail:282.28-282.29" : SailM Unit).run s = .ok () s := rfl
+    rw [run_bind_ok _ _ _ _ _ ha]
+    rw [run_bind_ok _ _ _ _ _ (rv64iEffectiveAddr_ext_data_get_addr_bisim spVal imm12 (.Load .Data) 4 s hsp)]
+    dsimp only []
+    rw [run_bind_ok _ _ _ _ _ (read_ram_plain_bisim_sail 4 (rv64iEffectiveAddrSpec spVal imm12) bytes4 s hmem4)]
+    rw [setWidth_flenbits_nan_box_32]
+    rw [run_bind_ok _ _ _ _ _ hw4]
+    rfl
+  obtain ⟨regs8, hw8, hf08, hms8, hoth8⟩ :=
+    wF_bits_f0_run (BitVec.setWidth 8 bytes8) mstatusVal s hmstatus
+  have hld8 : (sailLoadFpRamExec imm12 sp (.Fregidx 0#5) 8 (by decide)).run s =
+      .ok (.Retire_Success ()) ({ s with regs := regs8 }) := by
+    unfold sailLoadFpRamExec
+    have ha : (PreSail.assert (8 ≤b Functions.flen_bytes)
+        "extensions/FD/fext_insts.sail:282.28-282.29" : SailM Unit).run s = .ok () s := rfl
+    rw [run_bind_ok _ _ _ _ _ ha]
+    rw [run_bind_ok _ _ _ _ _ (rv64iEffectiveAddr_ext_data_get_addr_bisim spVal imm12 (.Load .Data) 8 s hsp)]
+    dsimp only []
+    rw [run_bind_ok _ _ _ _ _ (read_ram_plain_bisim_sail 8 (rv64iEffectiveAddrSpec spVal imm12) bytes8 s hmem8)]
+    rw [setWidth_flenbits_nan_box_64]
+    rw [run_bind_ok _ _ _ _ _ hw8]
+    rfl
+  exact ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, hst4, hst8,
+    ⟨regs4, hld4, hf04, hms4, hoth4⟩,
+    ⟨regs8, hld8, hf08, hms8, hoth8⟩⟩
+
+/-- Exact upstream Sail `execute_F_UN_X_TYPE_D` (`InstsEnd.lean`, lines 69300–69313) covering
+    `FCLASS.D` and `FMV.X.D`. -/
+noncomputable def sailExecuteFUnXTypeD (arg0 : fregidx) (arg1 : regidx) (arg2 : f_un_x_op_D) : SailM ExecutionResult := do
+  let merge_var := (arg0, arg1, arg2)
+  match merge_var with
+  | (rs1, rd, .FCLASS_D) =>
+    do
+      let rs1_val ← rF_or_X_D rs1
+      wX_bits rd (zero_extend (m := 64) (float_class_onehot_bits_forwards (← float_classify rs1_val)))
+      pure (.Retire_Success ())
+  | (rs1, rd, .FMV_X_D) =>
+    do
+      PreSail.assert ((Functions.xlen ≥b 64) && (Functions.flen ≥b 64))
+        "extensions/FD/dext_insts.sail:853.32-853.33"
+      wX_bits rd (sign_extend (m := 64) (Sail.BitVec.extractLsb (← rF_bits rs1) 63 0))
+      pure (.Retire_Success ())
+
+/-- Exact upstream Sail `execute_F_UN_TYPE_X_S` (`InstsEnd.lean`, lines 69315–69327) covering
+    `FCLASS.S` and `FMV.X.W`. -/
+noncomputable def sailExecuteFUnTypeXS (arg0 : fregidx) (arg1 : regidx) (arg2 : f_un_op_x_S) : SailM ExecutionResult := do
+  let merge_var := (arg0, arg1, arg2)
+  match merge_var with
+  | (rs1, rd, .FCLASS_S) =>
+    do
+      let rs1_val ← rF_or_X_S rs1
+      wX_bits rd (zero_extend (m := 64) (float_class_onehot_bits_forwards (← float_classify rs1_val)))
+      pure (.Retire_Success ())
+  | (rs1, rd, .FMV_X_W) =>
+    do
+      wX_bits rd (sign_extend (m := 64) (Sail.BitVec.extractLsb (← rF_bits rs1) 31 0))
+      pure (.Retire_Success ())
+
+/-- Exact upstream Sail `execute_F_UN_TYPE_F_S` (`InstsEnd.lean`, lines 69329–69331) covering
+    `FMV.W.X`. -/
+noncomputable def sailExecuteFUnTypeFS (rs1 : regidx) (rd : fregidx) (_op : f_un_op_f_S) : SailM ExecutionResult := do
+  wF_bits rd (BitVec.setWidth (if (true : Bool) then 8 else 4 * 8)
+    (nan_box (n := (8 *i 8)) (Sail.BitVec.extractLsb (← rX_bits rs1) 31 0)))
+  pure (.Retire_Success ())
+
+/-- Exact upstream Sail `execute_F_UN_F_TYPE_D` (`InstsEnd.lean`, lines 69779–69782) covering
+    `FMV.D.X`. -/
+noncomputable def sailExecuteFUnFTypeD (rs1 : regidx) (rd : fregidx) (_op : f_un_f_op_D) : SailM ExecutionResult := do
+  PreSail.assert ((Functions.xlen ≥b 64) && (Functions.flen ≥b 64))
+    "extensions/FD/dext_insts.sail:859.32-859.33"
+  wF_bits rd (BitVec.setWidth (if (true : Bool) then 8 else 4 * 8)
+    (nan_box (n := (8 *i 8)) (Sail.BitVec.extractLsb (← rX_bits rs1) 63 0)))
+  pure (.Retire_Success ())
+
+/-- Theorem 7 (Section 16): RV64F/D bitwise FP↔integer moves and IEEE-754 class instructions
+    (`FMV.X.W`, `FMV.W.X`, `FMV.X.D`, `FMV.D.X`, `FCLASS.S`, `FCLASS.D`):
+    - `FMV.X.W` / `FMV.X.D` / `FCLASS.S` / `FCLASS.D` write `rd` (`ra`/`x1`) without dirtying
+      `mstatus.FS` or touching `fcsr`;
+    - `FMV.W.X` / `FMV.D.X` apply `nan_box` and write the upstream `flenbits` (`BitVec 8`) slice to
+      `f0` while marking `mstatus.FS := 0b11, SD := 1`. -/
+theorem rv64FpMoveAndClassifyExec_bisim_sail
+    (f0Val : flenbits) (raVal mstatusVal : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hf0 : s.regs.get? .f0 = some f0Val)
+    (hra : s.regs.get? .x1 = some raVal)
+    (hmstatus : s.regs.get? .mstatus = some mstatusVal) :
+    (sailExecuteFUnTypeXS (.Fregidx 0#5) ra .FCLASS_S).run s =
+      .ok (.Retire_Success ()) ({ s with regs := s.regs.insert .x1 (BitVec.zeroExtend 64 (float_class_onehot_bits_forwards (rv64FloatClassify32Spec (BitVec.setWidth 32 f0Val)))) }) ∧
+    (sailExecuteFUnTypeXS (.Fregidx 0#5) ra .FMV_X_W).run s =
+      .ok (.Retire_Success ()) ({ s with regs := s.regs.insert .x1 (BitVec.signExtend 64 (Sail.BitVec.extractLsb f0Val 31 0)) }) ∧
+    (sailExecuteFUnXTypeD (.Fregidx 0#5) ra .FCLASS_D).run s =
+      .ok (.Retire_Success ()) ({ s with regs := s.regs.insert .x1 (BitVec.zeroExtend 64 (float_class_onehot_bits_forwards (rv64FloatClassify64Spec (BitVec.setWidth 64 f0Val)))) }) ∧
+    (sailExecuteFUnXTypeD (.Fregidx 0#5) ra .FMV_X_D).run s =
+      .ok (.Retire_Success ()) ({ s with regs := s.regs.insert .x1 (BitVec.signExtend 64 (Sail.BitVec.extractLsb f0Val 63 0)) }) ∧
+    (∃ regsW,
+      (sailExecuteFUnTypeFS ra (.Fregidx 0#5) .FMV_W_X).run s =
+        .ok (.Retire_Success ()) ({ s with regs := regsW }) ∧
+      regsW.get? .f0 = some (BitVec.setWidth 8 (Sail.BitVec.extractLsb raVal 31 0) : flenbits) ∧
+      regsW.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      (∀ r, (Register.f0 == r) = false → (Register.mstatus == r) = false →
+        regsW.get? r = s.regs.get? r)) ∧
+    (∃ regsD,
+      (sailExecuteFUnFTypeD ra (.Fregidx 0#5) .FMV_D_X).run s =
+        .ok (.Retire_Success ()) ({ s with regs := regsD }) ∧
+      regsD.get? .f0 = some (BitVec.setWidth 8 (Sail.BitVec.extractLsb raVal 63 0) : flenbits) ∧
+      regsD.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      (∀ r, (Register.f0 == r) = false → (Register.mstatus == r) = false →
+        regsD.get? r = s.regs.get? r)) := by
+  obtain ⟨regsW, hwW, hf0W, hmsW, hothW⟩ :=
+    wF_bits_f0_run (BitVec.setWidth 8 (Sail.BitVec.extractLsb raVal 31 0)) mstatusVal s hmstatus
+  have hmvWX : (sailExecuteFUnTypeFS ra (.Fregidx 0#5) .FMV_W_X).run s =
+      .ok (.Retire_Success ()) { s with regs := regsW } := by
+    unfold sailExecuteFUnTypeFS
+    rw [run_bind_ok _ _ _ _ _ (rX_bits_ra_run raVal s hra)]
+    rw [setWidth_flenbits_nan_box_32]
+    rw [run_bind_ok _ _ _ _ _ hwW]
+    rfl
+  obtain ⟨regsD, hwD, hf0D, hmsD, hothD⟩ :=
+    wF_bits_f0_run (BitVec.setWidth 8 (Sail.BitVec.extractLsb raVal 63 0)) mstatusVal s hmstatus
+  have hmvDX : (sailExecuteFUnFTypeD ra (.Fregidx 0#5) .FMV_D_X).run s =
+      .ok (.Retire_Success ()) { s with regs := regsD } := by
+    unfold sailExecuteFUnFTypeD
+    have ha : (PreSail.assert ((Functions.xlen ≥b 64) && (Functions.flen ≥b 64))
+        "extensions/FD/dext_insts.sail:859.32-859.33" : SailM Unit).run s = .ok () s := rfl
+    rw [run_bind_ok _ _ _ _ _ ha]
+    rw [run_bind_ok _ _ _ _ _ (rX_bits_ra_run raVal s hra)]
+    rw [setWidth_flenbits_nan_box_64]
+    rw [run_bind_ok _ _ _ _ _ hwD]
+    rfl
+  refine ⟨?_, ?_, ?_, ?_,
+    ⟨regsW, hmvWX, hf0W, hmsW, hothW⟩,
+    ⟨regsD, hmvDX, hf0D, hmsD, hothD⟩⟩
+  · unfold sailExecuteFUnTypeXS
+    dsimp only []
+    rw [run_bind_ok _ _ _ _ _ (rF_or_X_S_f0_run f0Val s hf0)]
+    rw [run_bind_ok _ _ _ _ _ (float_classify_32_run (BitVec.setWidth 32 f0Val) s)]
+    rw [run_bind_ok _ _ _ _ _ (wX_bits_ra_run _ s)]
+    rfl
+  · unfold sailExecuteFUnTypeXS
+    dsimp only []
+    rw [run_bind_ok _ _ _ _ _ (rF_bits_f0_run f0Val s hf0)]
+    rw [run_bind_ok _ _ _ _ _ (wX_bits_ra_run _ s)]
+    rfl
+  · unfold sailExecuteFUnXTypeD
+    dsimp only []
+    rw [run_bind_ok _ _ _ _ _ (rF_or_X_D_f0_run f0Val s hf0)]
+    rw [run_bind_ok _ _ _ _ _ (float_classify_64_run (BitVec.setWidth 64 f0Val) s)]
+    rw [run_bind_ok _ _ _ _ _ (wX_bits_ra_run _ s)]
+    rfl
+  · unfold sailExecuteFUnXTypeD
+    dsimp only []
+    have ha : (PreSail.assert ((Functions.xlen ≥b 64) && (Functions.flen ≥b 64))
+        "extensions/FD/dext_insts.sail:853.32-853.33" : SailM Unit).run s = .ok () s := rfl
+    rw [run_bind_ok _ _ _ _ _ ha]
+    rw [run_bind_ok _ _ _ _ _ (rF_bits_f0_run f0Val s hf0)]
+    rw [run_bind_ok _ _ _ _ _ (wX_bits_ra_run _ s)]
+    rfl
+
+/-- Pure `TurboLean`-side IEEE-754-2008 `minNum`/`maxNum` selector for RV64F `FMIN.S` / `FMAX.S`
+    (matching `execute_F_BIN_TYPE_F_S`, `InstsEnd.lean`, lines 69963–70010). -/
+def rv64FpMinMaxSSpec (isMax : Bool) (v1 v2 : BitVec 32) : BitVec 32 × BitVec 5 :=
+  if isMax then
+    let (v2_le_v1, fflags) := fle_S v2 v1 true
+    let res :=
+      if f_is_NaN_S v1 && f_is_NaN_S v2 then canonical_NaN_S ()
+      else if f_is_NaN_S v1 then v2
+      else if f_is_NaN_S v2 then v1
+      else if f_is_neg_zero_S v1 && f_is_pos_zero_S v2 then v2
+      else if f_is_neg_zero_S v2 && f_is_pos_zero_S v1 then v1
+      else if v2_le_v1 then v1 else v2
+    (res, fflags)
+  else
+    let (v1_le_v2, fflags) := fle_S v1 v2 true
+    let res :=
+      if f_is_NaN_S v1 && f_is_NaN_S v2 then canonical_NaN_S ()
+      else if f_is_NaN_S v1 then v2
+      else if f_is_NaN_S v2 then v1
+      else if f_is_neg_zero_S v1 && f_is_pos_zero_S v2 then v1
+      else if f_is_neg_zero_S v2 && f_is_pos_zero_S v1 then v2
+      else if v1_le_v2 then v1 else v2
+    (res, fflags)
+
+/-- Pure `TurboLean`-side IEEE-754-2008 `minNum`/`maxNum` selector for RV64D `FMIN.D` / `FMAX.D`
+    (matching `execute_F_BIN_F_TYPE_D`, `InstsEnd.lean`, lines 70191–70238). -/
+def rv64FpMinMaxDSpec (isMax : Bool) (v1 v2 : BitVec 64) : BitVec 64 × BitVec 5 :=
+  if isMax then
+    let (v2_le_v1, fflags) := fle_D v2 v1 true
+    let res :=
+      if f_is_NaN_D v1 && f_is_NaN_D v2 then canonical_NaN_D ()
+      else if f_is_NaN_D v1 then v2
+      else if f_is_NaN_D v2 then v1
+      else if f_is_neg_zero_D v1 && f_is_pos_zero_D v2 then v2
+      else if f_is_neg_zero_D v2 && f_is_pos_zero_D v1 then v1
+      else if v2_le_v1 then v1 else v2
+    (res, fflags)
+  else
+    let (v1_le_v2, fflags) := fle_D v1 v2 true
+    let res :=
+      if f_is_NaN_D v1 && f_is_NaN_D v2 then canonical_NaN_D ()
+      else if f_is_NaN_D v1 then v2
+      else if f_is_NaN_D v2 then v1
+      else if f_is_neg_zero_D v1 && f_is_pos_zero_D v2 then v1
+      else if f_is_neg_zero_D v2 && f_is_pos_zero_D v1 then v2
+      else if v1_le_v2 then v1 else v2
+    (res, fflags)
+
+/-- Exact upstream Sail `execute_F_BIN_TYPE_F_S` (`InstsEnd.lean`, lines 69928–70013) covering
+    `FSGNJ.S`, `FSGNJN.S`, `FSGNJX.S`, `FMIN.S`, and `FMAX.S`. -/
+noncomputable def sailExecuteFBinTypeFS (arg0 arg1 arg2 : fregidx) (arg3 : f_bin_op_f_S) : SailM ExecutionResult := do
+  let merge_var := (arg0, arg1, arg2, arg3)
+  match merge_var with
+  | (rs2, rs1, rd, .FSGNJ_S) =>
+    do
+      let rs1_val_S ← rF_or_X_S rs1
+      let rs2_val_S ← rF_or_X_S rs2
+      let (_, e1, m1) := fsplit_S rs1_val_S
+      let (s2, _, _) := fsplit_S rs2_val_S
+      let rd_val_S := fmake_S s2 e1 m1
+      wF_or_X_S rd rd_val_S
+      pure (.Retire_Success ())
+  | (rs2, rs1, rd, .FSGNJN_S) =>
+    do
+      let rs1_val_S ← rF_or_X_S rs1
+      let rs2_val_S ← rF_or_X_S rs2
+      let (_, e1, m1) := fsplit_S rs1_val_S
+      let (s2, _, _) := fsplit_S rs2_val_S
+      let rd_val_S := fmake_S (1#1 ^^^ s2) e1 m1
+      wF_or_X_S rd rd_val_S
+      pure (.Retire_Success ())
+  | (rs2, rs1, rd, .FSGNJX_S) =>
+    do
+      let rs1_val_S ← rF_or_X_S rs1
+      let rs2_val_S ← rF_or_X_S rs2
+      let (s1, e1, m1) := fsplit_S rs1_val_S
+      let (s2, _, _) := fsplit_S rs2_val_S
+      let rd_val_S := fmake_S (s1 ^^^ s2) e1 m1
+      wF_or_X_S rd rd_val_S
+      pure (.Retire_Success ())
+  | (rs2, rs1, rd, .FMIN_S) =>
+    do
+      let rs1_val_S ← rF_or_X_S rs1
+      let rs2_val_S ← rF_or_X_S rs2
+      let is_quiet := true
+      let (rs1_lt_rs2, fflags) := fle_S rs1_val_S rs2_val_S is_quiet
+      let rd_val_S :=
+        if (f_is_NaN_S rs1_val_S && f_is_NaN_S rs2_val_S : Bool) then canonical_NaN_S ()
+        else if (f_is_NaN_S rs1_val_S : Bool) then rs2_val_S
+        else if (f_is_NaN_S rs2_val_S : Bool) then rs1_val_S
+        else if (f_is_neg_zero_S rs1_val_S && f_is_pos_zero_S rs2_val_S : Bool) then rs1_val_S
+        else if (f_is_neg_zero_S rs2_val_S && f_is_pos_zero_S rs1_val_S : Bool) then rs2_val_S
+        else if (rs1_lt_rs2 : Bool) then rs1_val_S else rs2_val_S
+      accrue_fflags fflags
+      wF_or_X_S rd rd_val_S
+      pure (.Retire_Success ())
+  | (rs2, rs1, rd, .FMAX_S) =>
+    do
+      let rs1_val_S ← rF_or_X_S rs1
+      let rs2_val_S ← rF_or_X_S rs2
+      let is_quiet := true
+      let (rs2_lt_rs1, fflags) := fle_S rs2_val_S rs1_val_S is_quiet
+      let rd_val_S :=
+        if (f_is_NaN_S rs1_val_S && f_is_NaN_S rs2_val_S : Bool) then canonical_NaN_S ()
+        else if (f_is_NaN_S rs1_val_S : Bool) then rs2_val_S
+        else if (f_is_NaN_S rs2_val_S : Bool) then rs1_val_S
+        else if (f_is_neg_zero_S rs1_val_S && f_is_pos_zero_S rs2_val_S : Bool) then rs2_val_S
+        else if (f_is_neg_zero_S rs2_val_S && f_is_pos_zero_S rs1_val_S : Bool) then rs1_val_S
+        else if (rs2_lt_rs1 : Bool) then rs1_val_S else rs2_val_S
+      accrue_fflags fflags
+      wF_or_X_S rd rd_val_S
+      pure (.Retire_Success ())
+
+/-- Exact upstream Sail `execute_F_BIN_F_TYPE_D` (`InstsEnd.lean`, lines 70156–70241) covering
+    `FSGNJ.D`, `FSGNJN.D`, `FSGNJX.D`, `FMIN.D`, and `FMAX.D`. -/
+noncomputable def sailExecuteFBinFTypeD (arg0 arg1 arg2 : fregidx) (arg3 : f_bin_f_op_D) : SailM ExecutionResult := do
+  let merge_var := (arg0, arg1, arg2, arg3)
+  match merge_var with
+  | (rs2, rs1, rd, .FSGNJ_D) =>
+    do
+      let rs1_val_D ← rF_or_X_D rs1
+      let rs2_val_D ← rF_or_X_D rs2
+      let (_, e1, m1) := fsplit_D rs1_val_D
+      let (s2, _, _) := fsplit_D rs2_val_D
+      let rd_val_D := fmake_D s2 e1 m1
+      wF_or_X_D rd rd_val_D
+      pure (.Retire_Success ())
+  | (rs2, rs1, rd, .FSGNJN_D) =>
+    do
+      let rs1_val_D ← rF_or_X_D rs1
+      let rs2_val_D ← rF_or_X_D rs2
+      let (_, e1, m1) := fsplit_D rs1_val_D
+      let (s2, _, _) := fsplit_D rs2_val_D
+      let rd_val_D := fmake_D (1#1 ^^^ s2) e1 m1
+      wF_or_X_D rd rd_val_D
+      pure (.Retire_Success ())
+  | (rs2, rs1, rd, .FSGNJX_D) =>
+    do
+      let rs1_val_D ← rF_or_X_D rs1
+      let rs2_val_D ← rF_or_X_D rs2
+      let (s1, e1, m1) := fsplit_D rs1_val_D
+      let (s2, _, _) := fsplit_D rs2_val_D
+      let rd_val_D := fmake_D (s1 ^^^ s2) e1 m1
+      wF_or_X_D rd rd_val_D
+      pure (.Retire_Success ())
+  | (rs2, rs1, rd, .FMIN_D) =>
+    do
+      let rs1_val_D ← rF_or_X_D rs1
+      let rs2_val_D ← rF_or_X_D rs2
+      let is_quiet := true
+      let (rs1_lt_rs2, fflags) := fle_D rs1_val_D rs2_val_D is_quiet
+      let rd_val_D :=
+        if (f_is_NaN_D rs1_val_D && f_is_NaN_D rs2_val_D : Bool) then canonical_NaN_D ()
+        else if (f_is_NaN_D rs1_val_D : Bool) then rs2_val_D
+        else if (f_is_NaN_D rs2_val_D : Bool) then rs1_val_D
+        else if (f_is_neg_zero_D rs1_val_D && f_is_pos_zero_D rs2_val_D : Bool) then rs1_val_D
+        else if (f_is_neg_zero_D rs2_val_D && f_is_pos_zero_D rs1_val_D : Bool) then rs2_val_D
+        else if (rs1_lt_rs2 : Bool) then rs1_val_D else rs2_val_D
+      accrue_fflags fflags
+      wF_or_X_D rd rd_val_D
+      pure (.Retire_Success ())
+  | (rs2, rs1, rd, .FMAX_D) =>
+    do
+      let rs1_val_D ← rF_or_X_D rs1
+      let rs2_val_D ← rF_or_X_D rs2
+      let is_quiet := true
+      let (rs2_lt_rs1, fflags) := fle_D rs2_val_D rs1_val_D is_quiet
+      let rd_val_D :=
+        if (f_is_NaN_D rs1_val_D && f_is_NaN_D rs2_val_D : Bool) then canonical_NaN_D ()
+        else if (f_is_NaN_D rs1_val_D : Bool) then rs2_val_D
+        else if (f_is_NaN_D rs2_val_D : Bool) then rs1_val_D
+        else if (f_is_neg_zero_D rs1_val_D && f_is_pos_zero_D rs2_val_D : Bool) then rs2_val_D
+        else if (f_is_neg_zero_D rs2_val_D && f_is_pos_zero_D rs1_val_D : Bool) then rs1_val_D
+        else if (rs2_lt_rs1 : Bool) then rs1_val_D else rs2_val_D
+      accrue_fflags fflags
+      wF_or_X_D rd rd_val_D
+      pure (.Retire_Success ())
+
+private theorem sailExecMinMaxS_f1_f0_run (isMax : Bool)
+    (f0Val f1Val : flenbits) (fcsrVal : BitVec 32) (mstatusVal : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hf0 : s.regs.get? .f0 = some f0Val)
+    (hf1 : s.regs.get? .f1 = some f1Val)
+    (hfcsr : s.regs.get? .fcsr = some fcsrVal)
+    (hmstatus : s.regs.get? .mstatus = some mstatusVal) :
+    let out := rv64FpMinMaxSSpec isMax (BitVec.setWidth 32 f0Val) (BitVec.setWidth 32 f1Val)
+    ∃ regs,
+      (sailExecuteFBinTypeFS (.Fregidx 1#5) (.Fregidx 0#5) (.Fregidx 0#5)
+        (if isMax then .FMAX_S else .FMIN_S)).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .f0 = some (BitVec.setWidth 8 out.1 : flenbits) ∧
+      regs.get? .fcsr = some (rv64AccrueFflagsFcsrSpec fcsrVal out.2) := by
+  let out := rv64FpMinMaxSSpec isMax (BitVec.setWidth 32 f0Val) (BitVec.setWidth 32 f1Val)
+  obtain ⟨regsA, hacc, hfcA, hmsA, _⟩ := accrue_fflags_run fcsrVal mstatusVal out.2 s hfcsr hmstatus
+  obtain ⟨regsB, hw, hf0B, _, hothB⟩ := wF_or_X_S_f0_run out.1 _ { s with regs := regsA } hmsA
+  refine ⟨regsB, ?_, hf0B, ?_⟩
+  · cases isMax
+    · rw [if_neg Bool.false_ne_true]; unfold sailExecuteFBinTypeFS; dsimp only []
+      rw [run_bind_ok _ _ _ _ _ (rF_or_X_S_f0_run f0Val s hf0),
+          run_bind_ok _ _ _ _ _ (rF_or_X_S_f1_run f1Val s hf1)]
+      change (do accrue_fflags out.2; wF_or_X_S (.Fregidx 0#5) out.1
+                 pure (ExecutionResult.Retire_Success ()) : SailM ExecutionResult).run s = _
+      rw [run_bind_ok _ _ _ _ _ hacc, run_bind_ok _ _ _ _ _ hw]; rfl
+    · rw [if_pos rfl]; unfold sailExecuteFBinTypeFS; dsimp only []
+      rw [run_bind_ok _ _ _ _ _ (rF_or_X_S_f0_run f0Val s hf0),
+          run_bind_ok _ _ _ _ _ (rF_or_X_S_f1_run f1Val s hf1)]
+      change (do accrue_fflags out.2; wF_or_X_S (.Fregidx 0#5) out.1
+                 pure (ExecutionResult.Retire_Success ()) : SailM ExecutionResult).run s = _
+      rw [run_bind_ok _ _ _ _ _ hacc, run_bind_ok _ _ _ _ _ hw]; rfl
+  · rw [hothB .fcsr rfl rfl]; exact hfcA
+
+private theorem sailExecMinMaxD_f1_f0_run (isMax : Bool)
+    (f0Val f1Val : flenbits) (fcsrVal : BitVec 32) (mstatusVal : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hf0 : s.regs.get? .f0 = some f0Val)
+    (hf1 : s.regs.get? .f1 = some f1Val)
+    (hfcsr : s.regs.get? .fcsr = some fcsrVal)
+    (hmstatus : s.regs.get? .mstatus = some mstatusVal) :
+    let out := rv64FpMinMaxDSpec isMax (BitVec.setWidth 64 f0Val) (BitVec.setWidth 64 f1Val)
+    ∃ regs,
+      (sailExecuteFBinFTypeD (.Fregidx 1#5) (.Fregidx 0#5) (.Fregidx 0#5)
+        (if isMax then .FMAX_D else .FMIN_D)).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .f0 = some (BitVec.setWidth 8 out.1 : flenbits) ∧
+      regs.get? .fcsr = some (rv64AccrueFflagsFcsrSpec fcsrVal out.2) := by
+  let out := rv64FpMinMaxDSpec isMax (BitVec.setWidth 64 f0Val) (BitVec.setWidth 64 f1Val)
+  obtain ⟨regsA, hacc, hfcA, hmsA, _⟩ := accrue_fflags_run fcsrVal mstatusVal out.2 s hfcsr hmstatus
+  obtain ⟨regsB, hw, hf0B, _, hothB⟩ := wF_or_X_D_f0_run out.1 _ { s with regs := regsA } hmsA
+  refine ⟨regsB, ?_, hf0B, ?_⟩
+  · cases isMax
+    · rw [if_neg Bool.false_ne_true]; unfold sailExecuteFBinFTypeD; dsimp only []
+      rw [run_bind_ok _ _ _ _ _ (rF_or_X_D_f0_run f0Val s hf0),
+          run_bind_ok _ _ _ _ _ (rF_or_X_D_f1_run f1Val s hf1)]
+      change (do accrue_fflags out.2; wF_or_X_D (.Fregidx 0#5) out.1
+                 pure (ExecutionResult.Retire_Success ()) : SailM ExecutionResult).run s = _
+      rw [run_bind_ok _ _ _ _ _ hacc, run_bind_ok _ _ _ _ _ hw]; rfl
+    · rw [if_pos rfl]; unfold sailExecuteFBinFTypeD; dsimp only []
+      rw [run_bind_ok _ _ _ _ _ (rF_or_X_D_f0_run f0Val s hf0),
+          run_bind_ok _ _ _ _ _ (rF_or_X_D_f1_run f1Val s hf1)]
+      change (do accrue_fflags out.2; wF_or_X_D (.Fregidx 0#5) out.1
+                 pure (ExecutionResult.Retire_Success ()) : SailM ExecutionResult).run s = _
+      rw [run_bind_ok _ _ _ _ _ hacc, run_bind_ok _ _ _ _ _ hw]; rfl
+  · rw [hothB .fcsr rfl rfl]; exact hfcA
+
+/-- Theorem 8 (Section 16): RV64F/D sign-injection (`FSGNJ.S`/`D`, `FSGNJN.S`/`D`, `FSGNJX.S`/`D`)
+    and IEEE-754-2008 minimum/maximum (`FMIN.S`/`D`, `FMAX.S`/`D`) execution bisimulation against
+    `execute_F_BIN_TYPE_F_S` and `execute_F_BIN_F_TYPE_D` (updating `.f0` via upstream `flenbits =
+    BitVec 8`), including NaN canonicalization, single-NaN operand selection, `-0.0` vs `+0.0`
+    tie-breaking, and `accrue_fflags` + `wF_or_X_*` state transitions. -/
+theorem rv64FpSignInjectAndMinMaxExec_bisim_sail
+    (f0Val f1Val : flenbits) (fcsrVal : BitVec 32) (mstatusVal : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hf0 : s.regs.get? .f0 = some f0Val)
+    (hf1 : s.regs.get? .f1 = some f1Val)
+    (hfcsr : s.regs.get? .fcsr = some fcsrVal)
+    (hmstatus : s.regs.get? .mstatus = some mstatusVal) :
+    let v0S := BitVec.setWidth 32 f0Val
+    let v1S := BitVec.setWidth 32 f1Val
+    let (s0S, e0S, m0S) := fsplit_S v0S
+    let (s1S, _, _) := fsplit_S v1S
+    let v0D := BitVec.setWidth 64 f0Val
+    let v1D := BitVec.setWidth 64 f1Val
+    let (s0D, e0D, m0D) := fsplit_D v0D
+    let (s1D, _, _) := fsplit_D v1D
+    (∃ regs, (sailExecuteFBinTypeFS (.Fregidx 1#5) (.Fregidx 0#5) (.Fregidx 0#5) .FSGNJ_S).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .f0 = some (BitVec.setWidth 8 (fmake_S s1S e0S m0S) : flenbits) ∧
+      regs.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      regs.get? .fcsr = some fcsrVal) ∧
+    (∃ regs, (sailExecuteFBinTypeFS (.Fregidx 1#5) (.Fregidx 0#5) (.Fregidx 0#5) .FSGNJN_S).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .f0 = some (BitVec.setWidth 8 (fmake_S (1#1 ^^^ s1S) e0S m0S) : flenbits) ∧
+      regs.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      regs.get? .fcsr = some fcsrVal) ∧
+    (∃ regs, (sailExecuteFBinTypeFS (.Fregidx 1#5) (.Fregidx 0#5) (.Fregidx 0#5) .FSGNJX_S).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .f0 = some (BitVec.setWidth 8 (fmake_S (s0S ^^^ s1S) e0S m0S) : flenbits) ∧
+      regs.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      regs.get? .fcsr = some fcsrVal) ∧
+    (∃ regs, (sailExecuteFBinTypeFS (.Fregidx 1#5) (.Fregidx 0#5) (.Fregidx 0#5) .FMIN_S).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .f0 = some (BitVec.setWidth 8 (rv64FpMinMaxSSpec false v0S v1S).1 : flenbits) ∧
+      regs.get? .fcsr = some (rv64AccrueFflagsFcsrSpec fcsrVal (rv64FpMinMaxSSpec false v0S v1S).2)) ∧
+    (∃ regs, (sailExecuteFBinTypeFS (.Fregidx 1#5) (.Fregidx 0#5) (.Fregidx 0#5) .FMAX_S).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .f0 = some (BitVec.setWidth 8 (rv64FpMinMaxSSpec true v0S v1S).1 : flenbits) ∧
+      regs.get? .fcsr = some (rv64AccrueFflagsFcsrSpec fcsrVal (rv64FpMinMaxSSpec true v0S v1S).2)) ∧
+    (∃ regs, (sailExecuteFBinFTypeD (.Fregidx 1#5) (.Fregidx 0#5) (.Fregidx 0#5) .FSGNJ_D).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .f0 = some (BitVec.setWidth 8 (fmake_D s1D e0D m0D) : flenbits) ∧
+      regs.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      regs.get? .fcsr = some fcsrVal) ∧
+    (∃ regs, (sailExecuteFBinFTypeD (.Fregidx 1#5) (.Fregidx 0#5) (.Fregidx 0#5) .FSGNJN_D).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .f0 = some (BitVec.setWidth 8 (fmake_D (1#1 ^^^ s1D) e0D m0D) : flenbits) ∧
+      regs.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      regs.get? .fcsr = some fcsrVal) ∧
+    (∃ regs, (sailExecuteFBinFTypeD (.Fregidx 1#5) (.Fregidx 0#5) (.Fregidx 0#5) .FSGNJX_D).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .f0 = some (BitVec.setWidth 8 (fmake_D (s0D ^^^ s1D) e0D m0D) : flenbits) ∧
+      regs.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      regs.get? .fcsr = some fcsrVal) ∧
+    (∃ regs, (sailExecuteFBinFTypeD (.Fregidx 1#5) (.Fregidx 0#5) (.Fregidx 0#5) .FMIN_D).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .f0 = some (BitVec.setWidth 8 (rv64FpMinMaxDSpec false v0D v1D).1 : flenbits) ∧
+      regs.get? .fcsr = some (rv64AccrueFflagsFcsrSpec fcsrVal (rv64FpMinMaxDSpec false v0D v1D).2)) ∧
+    (∃ regs, (sailExecuteFBinFTypeD (.Fregidx 1#5) (.Fregidx 0#5) (.Fregidx 0#5) .FMAX_D).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .f0 = some (BitVec.setWidth 8 (rv64FpMinMaxDSpec true v0D v1D).1 : flenbits) ∧
+      regs.get? .fcsr = some (rv64AccrueFflagsFcsrSpec fcsrVal (rv64FpMinMaxDSpec true v0D v1D).2)) ∧
+    rv64FpMinMaxSSpec false (canonical_NaN_S ()) (canonical_NaN_S ()) = (canonical_NaN_S (), 0#5) ∧
+    rv64FpMinMaxSSpec false 0x7f800001#32 0x3f800000#32 = (0x3f800000#32, 0b10000#5) ∧
+    rv64FpMinMaxSSpec false 0x80000000#32 0x00000000#32 = (0x80000000#32, 0#5) ∧
+    rv64FpMinMaxSSpec true 0x80000000#32 0x00000000#32 = (0x00000000#32, 0#5) ∧
+    rv64FpMinMaxDSpec false (canonical_NaN_D ()) (canonical_NaN_D ()) = (canonical_NaN_D (), 0#5) ∧
+    rv64FpMinMaxDSpec false 0x7ff0000000000001#64 0x3ff0000000000000#64 = (0x3ff0000000000000#64, 0b10000#5) ∧
+    rv64FpMinMaxDSpec false 0x8000000000000000#64 0x0000000000000000#64 = (0x8000000000000000#64, 0#5) ∧
+    rv64FpMinMaxDSpec true 0x8000000000000000#64 0x0000000000000000#64 = (0x0000000000000000#64, 0#5) := by
+  dsimp only []
+  let v0S := BitVec.setWidth 32 f0Val
+  let v1S := BitVec.setWidth 32 f1Val
+  let v0D := BitVec.setWidth 64 f0Val
+  let v1D := BitVec.setWidth 64 f1Val
+  have hsgnjS : ∃ regs,
+      (sailExecuteFBinTypeFS (.Fregidx 1#5) (.Fregidx 0#5) (.Fregidx 0#5) .FSGNJ_S).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .f0 = some (BitVec.setWidth 8 (fmake_S (fsplit_S v1S).1 (fsplit_S v0S).2.1 (fsplit_S v0S).2.2) : flenbits) ∧
+      regs.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      regs.get? .fcsr = some fcsrVal := by
+    obtain ⟨regs, hw, hf0', hms', hoth⟩ := wF_or_X_S_f0_run (fmake_S (fsplit_S v1S).1 (fsplit_S v0S).2.1 (fsplit_S v0S).2.2) mstatusVal s hmstatus
+    refine ⟨regs, ?_, hf0', hms', ?_⟩
+    · unfold sailExecuteFBinTypeFS; dsimp only []
+      rw [run_bind_ok _ _ _ _ _ (rF_or_X_S_f0_run f0Val s hf0), run_bind_ok _ _ _ _ _ (rF_or_X_S_f1_run f1Val s hf1)]
+      change (do wF_or_X_S (.Fregidx 0#5) (fmake_S (fsplit_S v1S).1 (fsplit_S v0S).2.1 (fsplit_S v0S).2.2); pure (.Retire_Success ()) : SailM ExecutionResult).run s = _
+      rw [run_bind_ok _ _ _ _ _ hw]; rfl
+    · rw [hoth .fcsr rfl rfl]; exact hfcsr
+  have hsgnjnS : ∃ regs,
+      (sailExecuteFBinTypeFS (.Fregidx 1#5) (.Fregidx 0#5) (.Fregidx 0#5) .FSGNJN_S).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .f0 = some (BitVec.setWidth 8 (fmake_S (1#1 ^^^ (fsplit_S v1S).1) (fsplit_S v0S).2.1 (fsplit_S v0S).2.2) : flenbits) ∧
+      regs.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      regs.get? .fcsr = some fcsrVal := by
+    obtain ⟨regs, hw, hf0', hms', hoth⟩ := wF_or_X_S_f0_run (fmake_S (1#1 ^^^ (fsplit_S v1S).1) (fsplit_S v0S).2.1 (fsplit_S v0S).2.2) mstatusVal s hmstatus
+    refine ⟨regs, ?_, hf0', hms', ?_⟩
+    · unfold sailExecuteFBinTypeFS; dsimp only []
+      rw [run_bind_ok _ _ _ _ _ (rF_or_X_S_f0_run f0Val s hf0), run_bind_ok _ _ _ _ _ (rF_or_X_S_f1_run f1Val s hf1)]
+      change (do wF_or_X_S (.Fregidx 0#5) (fmake_S (1#1 ^^^ (fsplit_S v1S).1) (fsplit_S v0S).2.1 (fsplit_S v0S).2.2); pure (.Retire_Success ()) : SailM ExecutionResult).run s = _
+      rw [run_bind_ok _ _ _ _ _ hw]; rfl
+    · rw [hoth .fcsr rfl rfl]; exact hfcsr
+  have hsgnjxS : ∃ regs,
+      (sailExecuteFBinTypeFS (.Fregidx 1#5) (.Fregidx 0#5) (.Fregidx 0#5) .FSGNJX_S).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .f0 = some (BitVec.setWidth 8 (fmake_S ((fsplit_S v0S).1 ^^^ (fsplit_S v1S).1) (fsplit_S v0S).2.1 (fsplit_S v0S).2.2) : flenbits) ∧
+      regs.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      regs.get? .fcsr = some fcsrVal := by
+    obtain ⟨regs, hw, hf0', hms', hoth⟩ := wF_or_X_S_f0_run (fmake_S ((fsplit_S v0S).1 ^^^ (fsplit_S v1S).1) (fsplit_S v0S).2.1 (fsplit_S v0S).2.2) mstatusVal s hmstatus
+    refine ⟨regs, ?_, hf0', hms', ?_⟩
+    · unfold sailExecuteFBinTypeFS; dsimp only []
+      rw [run_bind_ok _ _ _ _ _ (rF_or_X_S_f0_run f0Val s hf0), run_bind_ok _ _ _ _ _ (rF_or_X_S_f1_run f1Val s hf1)]
+      change (do wF_or_X_S (.Fregidx 0#5) (fmake_S ((fsplit_S v0S).1 ^^^ (fsplit_S v1S).1) (fsplit_S v0S).2.1 (fsplit_S v0S).2.2); pure (.Retire_Success ()) : SailM ExecutionResult).run s = _
+      rw [run_bind_ok _ _ _ _ _ hw]; rfl
+    · rw [hoth .fcsr rfl rfl]; exact hfcsr
+  have hsgnjD : ∃ regs,
+      (sailExecuteFBinFTypeD (.Fregidx 1#5) (.Fregidx 0#5) (.Fregidx 0#5) .FSGNJ_D).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .f0 = some (BitVec.setWidth 8 (fmake_D (fsplit_D v1D).1 (fsplit_D v0D).2.1 (fsplit_D v0D).2.2) : flenbits) ∧
+      regs.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      regs.get? .fcsr = some fcsrVal := by
+    obtain ⟨regs, hw, hf0', hms', hoth⟩ := wF_or_X_D_f0_run (fmake_D (fsplit_D v1D).1 (fsplit_D v0D).2.1 (fsplit_D v0D).2.2) mstatusVal s hmstatus
+    refine ⟨regs, ?_, hf0', hms', ?_⟩
+    · unfold sailExecuteFBinFTypeD; dsimp only []
+      rw [run_bind_ok _ _ _ _ _ (rF_or_X_D_f0_run f0Val s hf0), run_bind_ok _ _ _ _ _ (rF_or_X_D_f1_run f1Val s hf1)]
+      change (do wF_or_X_D (.Fregidx 0#5) (fmake_D (fsplit_D v1D).1 (fsplit_D v0D).2.1 (fsplit_D v0D).2.2); pure (.Retire_Success ()) : SailM ExecutionResult).run s = _
+      rw [run_bind_ok _ _ _ _ _ hw]; rfl
+    · rw [hoth .fcsr rfl rfl]; exact hfcsr
+  have hsgnjnD : ∃ regs,
+      (sailExecuteFBinFTypeD (.Fregidx 1#5) (.Fregidx 0#5) (.Fregidx 0#5) .FSGNJN_D).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .f0 = some (BitVec.setWidth 8 (fmake_D (1#1 ^^^ (fsplit_D v1D).1) (fsplit_D v0D).2.1 (fsplit_D v0D).2.2) : flenbits) ∧
+      regs.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      regs.get? .fcsr = some fcsrVal := by
+    obtain ⟨regs, hw, hf0', hms', hoth⟩ := wF_or_X_D_f0_run (fmake_D (1#1 ^^^ (fsplit_D v1D).1) (fsplit_D v0D).2.1 (fsplit_D v0D).2.2) mstatusVal s hmstatus
+    refine ⟨regs, ?_, hf0', hms', ?_⟩
+    · unfold sailExecuteFBinFTypeD; dsimp only []
+      rw [run_bind_ok _ _ _ _ _ (rF_or_X_D_f0_run f0Val s hf0), run_bind_ok _ _ _ _ _ (rF_or_X_D_f1_run f1Val s hf1)]
+      change (do wF_or_X_D (.Fregidx 0#5) (fmake_D (1#1 ^^^ (fsplit_D v1D).1) (fsplit_D v0D).2.1 (fsplit_D v0D).2.2); pure (.Retire_Success ()) : SailM ExecutionResult).run s = _
+      rw [run_bind_ok _ _ _ _ _ hw]; rfl
+    · rw [hoth .fcsr rfl rfl]; exact hfcsr
+  have hsgnjxD : ∃ regs,
+      (sailExecuteFBinFTypeD (.Fregidx 1#5) (.Fregidx 0#5) (.Fregidx 0#5) .FSGNJX_D).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .f0 = some (BitVec.setWidth 8 (fmake_D ((fsplit_D v0D).1 ^^^ (fsplit_D v1D).1) (fsplit_D v0D).2.1 (fsplit_D v0D).2.2) : flenbits) ∧
+      regs.get? .mstatus = some (rv64DirtyFdMstatusSpec mstatusVal) ∧
+      regs.get? .fcsr = some fcsrVal := by
+    obtain ⟨regs, hw, hf0', hms', hoth⟩ := wF_or_X_D_f0_run (fmake_D ((fsplit_D v0D).1 ^^^ (fsplit_D v1D).1) (fsplit_D v0D).2.1 (fsplit_D v0D).2.2) mstatusVal s hmstatus
+    refine ⟨regs, ?_, hf0', hms', ?_⟩
+    · unfold sailExecuteFBinFTypeD; dsimp only []
+      rw [run_bind_ok _ _ _ _ _ (rF_or_X_D_f0_run f0Val s hf0), run_bind_ok _ _ _ _ _ (rF_or_X_D_f1_run f1Val s hf1)]
+      change (do wF_or_X_D (.Fregidx 0#5) (fmake_D ((fsplit_D v0D).1 ^^^ (fsplit_D v1D).1) (fsplit_D v0D).2.1 (fsplit_D v0D).2.2); pure (.Retire_Success ()) : SailM ExecutionResult).run s = _
+      rw [run_bind_ok _ _ _ _ _ hw]; rfl
+    · rw [hoth .fcsr rfl rfl]; exact hfcsr
+  refine ⟨hsgnjS, hsgnjnS, hsgnjxS,
+    sailExecMinMaxS_f1_f0_run false f0Val f1Val fcsrVal mstatusVal s hf0 hf1 hfcsr hmstatus,
+    sailExecMinMaxS_f1_f0_run true f0Val f1Val fcsrVal mstatusVal s hf0 hf1 hfcsr hmstatus,
+    hsgnjD, hsgnjnD, hsgnjxD,
+    sailExecMinMaxD_f1_f0_run false f0Val f1Val fcsrVal mstatusVal s hf0 hf1 hfcsr hmstatus,
+    sailExecMinMaxD_f1_f0_run true f0Val f1Val fcsrVal mstatusVal s hf0 hf1 hfcsr hmstatus, ?_⟩
+  decide
+
+private theorem rX_bits_sp_run (val : BitVec 64)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hx2 : s.regs.get? .x2 = some val) :
+    (rX_bits sp).run s = .ok val s := by
+  unfold sp
+  simp [rX_bits, rX, regval_from_reg, zero_extend, Sail.BitVec.zeroExtend, Sail.BitVec.toNatInt,
+    readReg, PreSail.readReg, get, getThe, MonadStateOf.get]
+  dsimp [EStateM.bind, EStateM.get, EStateM.pure, EStateM.run]
+  rw [hx2]; rfl
+
+/-- Exact `Zfinx`-mode (`Ext_F = false`, `Ext_Zfinx = true`) `x`-register path of upstream
+    `rF_or_X_S` / `rF_or_X_D` / `wF_or_X_S` / `wF_or_X_D` (`FdextRegs.lean:448–481`), operating
+    over architectural 64-bit general-purpose registers without `flenbits = BitVec 8` truncation. -/
+noncomputable def sailZfinxReadS (i : fregidx) : SailM (BitVec 32) := do
+  pure (Sail.BitVec.extractLsb (← rX_bits (fregidx_to_regidx i)) 31 0)
+
+noncomputable def sailZfinxReadD (i : fregidx) : SailM (BitVec 64) := do
+  pure (Sail.BitVec.extractLsb (← rX_bits (fregidx_to_regidx i)) 63 0)
+
+noncomputable def sailZfinxWriteS (i : fregidx) (data : BitVec 32) : SailM Unit :=
+  wX_bits (fregidx_to_regidx i) (sign_extend (m := 64) data)
+
+noncomputable def sailZfinxWriteD (i : fregidx) (data : BitVec 64) : SailM Unit :=
+  wX_bits (fregidx_to_regidx i) (sign_extend (m := 64) data)
+
+/-- Exact full-width `Zfinx` (`x`-register) RV64F/Zfinx execution of `FSGNJ.S`, `FSGNJN.S`,
+    `FSGNJX.S`, `FMIN.S`, and `FMAX.S` (`FdextRegs.lean:448–475` + `InstsEnd.lean:69928–70013`). -/
+noncomputable def sailZfinxExecBinS (rs2 rs1 rd : fregidx) (op : f_bin_op_f_S) : SailM ExecutionResult := do
+  let v1 ← sailZfinxReadS rs1
+  let v2 ← sailZfinxReadS rs2
+  match op with
+  | .FSGNJ_S =>
+    let (_, e1, m1) := fsplit_S v1; let (s2, _, _) := fsplit_S v2
+    sailZfinxWriteS rd (fmake_S s2 e1 m1); pure (.Retire_Success ())
+  | .FSGNJN_S =>
+    let (_, e1, m1) := fsplit_S v1; let (s2, _, _) := fsplit_S v2
+    sailZfinxWriteS rd (fmake_S (1#1 ^^^ s2) e1 m1); pure (.Retire_Success ())
+  | .FSGNJX_S =>
+    let (s1, e1, m1) := fsplit_S v1; let (s2, _, _) := fsplit_S v2
+    sailZfinxWriteS rd (fmake_S (s1 ^^^ s2) e1 m1); pure (.Retire_Success ())
+  | .FMIN_S =>
+    let (res, fflags) := rv64FpMinMaxSSpec false v1 v2
+    accrue_fflags fflags; sailZfinxWriteS rd res; pure (.Retire_Success ())
+  | .FMAX_S =>
+    let (res, fflags) := rv64FpMinMaxSSpec true v1 v2
+    accrue_fflags fflags; sailZfinxWriteS rd res; pure (.Retire_Success ())
+
+/-- Exact full-width `Zfinx`/`Zdinx` (`x`-register) 64-bit IEEE-754 execution of `FSGNJ.D`,
+    `FSGNJN.D`, `FSGNJX.D`, `FMIN.D`, and `FMAX.D` (`FdextRegs.lean:455–481` +
+    `InstsEnd.lean:70156–70241`). -/
+noncomputable def sailZfinxExecBinD (rs2 rs1 rd : fregidx) (op : f_bin_f_op_D) : SailM ExecutionResult := do
+  let v1 ← sailZfinxReadD rs1
+  let v2 ← sailZfinxReadD rs2
+  match op with
+  | .FSGNJ_D =>
+    let (_, e1, m1) := fsplit_D v1; let (s2, _, _) := fsplit_D v2
+    sailZfinxWriteD rd (fmake_D s2 e1 m1); pure (.Retire_Success ())
+  | .FSGNJN_D =>
+    let (_, e1, m1) := fsplit_D v1; let (s2, _, _) := fsplit_D v2
+    sailZfinxWriteD rd (fmake_D (1#1 ^^^ s2) e1 m1); pure (.Retire_Success ())
+  | .FSGNJX_D =>
+    let (s1, e1, m1) := fsplit_D v1; let (s2, _, _) := fsplit_D v2
+    sailZfinxWriteD rd (fmake_D (s1 ^^^ s2) e1 m1); pure (.Retire_Success ())
+  | .FMIN_D =>
+    let (res, fflags) := rv64FpMinMaxDSpec false v1 v2
+    accrue_fflags fflags; sailZfinxWriteD rd res; pure (.Retire_Success ())
+  | .FMAX_D =>
+    let (res, fflags) := rv64FpMinMaxDSpec true v1 v2
+    accrue_fflags fflags; sailZfinxWriteD rd res; pure (.Retire_Success ())
+
+/-- Theorem 9 (Section 16): Dead-branch platform axiom justification for `Lean_RV64D`.
+    Proves that on all bridged RV64 architectural extensions (`Ext_M`, `Ext_A`, `Ext_F`, `Ext_D`,
+    `Ext_B`, `Ext_S`, `Ext_U`, `Ext_Zicsr`, `Ext_Zca`, `Ext_Zcb`, `Ext_Zcd`, `Ext_Zcf`, `Ext_C`,
+    `Ext_Zicfilp`, `Ext_Zfinx`, `Ext_Zdinx`, `Ext_Sv39`, `Ext_Sv48`, `Ext_Svadu`, `Ext_Svnapot`),
+    `hartSupports` reduces to concrete `Bool` constants without evaluating the experimental-extension
+    axiom `sys_enable_experimental_extensions` (which lives only in `.Ext_Zibi` / `.Ext_Zvabd`), and
+    that across standard high physical RAM (`0x80000000 ≤ paddr.toNat`, `htif_tohost_base = none`)
+    `within_mmio_readable`, `within_mmio_writable`, `mmio_read`, and `mmio_write` never enter the
+    HTIF branch that references `plat_term_write`. -/
+theorem rv64DeadBranchPlatformAxiomsUnreached_bisim_sail
+    (paddr : BitVec 64) (width : Nat) (data : BitVec (8 * width))
+    (hlo : 0x80000000 ≤ paddr.toNat)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hhtif : s.regs.get? .htif_tohost_base = some none) :
+    hartSupports .Ext_M = true ∧
+    hartSupports .Ext_A = true ∧
+    hartSupports .Ext_F = true ∧
+    hartSupports .Ext_D = true ∧
+    hartSupports .Ext_B = true ∧
+    hartSupports .Ext_S = true ∧
+    hartSupports .Ext_U = true ∧
+    hartSupports .Ext_Zicsr = true ∧
+    hartSupports .Ext_Zca = true ∧
+    hartSupports .Ext_Zcb = true ∧
+    hartSupports .Ext_Zcd = true ∧
+    hartSupports .Ext_Zcf = false ∧
+    hartSupports .Ext_C = true ∧
+    hartSupports .Ext_Zicfilp = true ∧
+    hartSupports .Ext_Zfinx = false ∧
+    hartSupports .Ext_Zdinx = false ∧
+    hartSupports .Ext_Sv39 = true ∧
+    hartSupports .Ext_Sv48 = true ∧
+    hartSupports .Ext_Svadu = true ∧
+    hartSupports .Ext_Svnapot = true ∧
+    (within_mmio_readable (.Physaddr paddr) width).run s = .ok false s ∧
+    (within_mmio_writable (.Physaddr paddr) width).run s = .ok false s ∧
+    (mmio_read (.Load .Data) (.Physaddr paddr) width).run s =
+      .ok (.Err (.Physaddr paddr, .E_Load_Access_Fault ())) s ∧
+    (mmio_write (.Physaddr paddr) width data).run s =
+      .ok (.Err (.Physaddr paddr, .E_SAMO_Access_Fault ())) s := by
+  obtain ⟨hclint, hsig, hhtif_w, hmr, hmw⟩ := within_mmio_high_ram_width_false paddr width hlo s hhtif
+  have hmread : (mmio_read (.Load .Data) (.Physaddr paddr) width).run s =
+      .ok (.Err (.Physaddr paddr, .E_Load_Access_Fault ())) s := by
+    unfold mmio_read within_htif_readable accessFaultFromAccessType
+    rw [run_bind_ok _ _ _ _ _ hclint, if_neg Bool.false_ne_true,
+        run_bind_ok _ _ _ _ _ hsig, if_neg Bool.false_ne_true,
+        run_bind_ok _ _ _ _ _ hhtif_w, if_neg Bool.false_ne_true]; rfl
+  have hmwrite : (mmio_write (.Physaddr paddr) width data).run s =
+      .ok (.Err (.Physaddr paddr, .E_SAMO_Access_Fault ())) s := by
+    unfold mmio_write
+    rw [run_bind_ok _ _ _ _ _ hclint, if_neg Bool.false_ne_true,
+        run_bind_ok _ _ _ _ _ hsig, if_neg Bool.false_ne_true,
+        run_bind_ok _ _ _ _ _ hhtif_w, if_neg Bool.false_ne_true]; rfl
+  refine ⟨by rw [hartSupports.eq_def], by rw [hartSupports.eq_def], hartSupports_Ext_F,
+    hartSupports_Ext_D, by rw [hartSupports.eq_def], hartSupports_Ext_S, hartSupports_Ext_U,
+    hartSupports_Ext_Zicsr, hartSupports_Ext_Zca, by rw [hartSupports.eq_def], hartSupports_Ext_Zcd,
+    hartSupports_Ext_Zcf, hartSupports_Ext_C, hartSupports_Ext_Zicfilp, hartSupports_Ext_Zfinx,
+    by rw [hartSupports.eq_def], by rw [hartSupports.eq_def]; decide,
+    by rw [hartSupports.eq_def]; decide, by rw [hartSupports.eq_def],
+    by rw [hartSupports.eq_def]; decide, hmr, hmw, hmread, hmwrite⟩
+
+/-- Theorem 10 (Section 16): Full-width 32/64-bit IEEE-754 NaN-boxing (`FLEN = 64`) and lossless
+    64-bit `Zfinx`/`Zdinx` `x`-register execution bisimulation (without `flenbits = BitVec 8`
+    truncation). Certifies:
+    - Exact 64-bit NaN-boxing (`nan_box (n := 64)`) and NaN-unboxing (`nan_unbox (m := 16/32/64)`)
+      iff characterization: `nan_unbox (m := 32) x64` preserves `x64[31:0]` when `x64[63:32] =
+      allOnes 32` and returns canonical single `QNaN` (`0x7fc0_0000`) otherwise;
+    - Lossless 32-bit and full 64-bit `FSGNJ*`, `FMIN*`, `FMAX*`, and `FCLASS*` execution over
+      64-bit general-purpose registers (`ra`/`x1` and `sp`/`x2`) with `accrue_fflags` updates. -/
+theorem rv64FpFullWidth64NanBoxAndExec_bisim_sail
+    (x1Val x2Val mstatusVal : BitVec 64) (fcsrVal : BitVec 32) (isMax : Bool)
+    (s : SequentialState RegisterType trivialChoiceSource)
+    (hx1 : s.regs.get? .x1 = some x1Val)
+    (hx2 : s.regs.get? .x2 = some x2Val)
+    (hfcsr : s.regs.get? .fcsr = some fcsrVal)
+    (hmstatus : s.regs.get? .mstatus = some mstatusVal) :
+    let v1S := Sail.BitVec.extractLsb x1Val 31 0
+    let v2S := Sail.BitVec.extractLsb x2Val 31 0
+    let (s1S, e1S, m1S) := fsplit_S v1S
+    let (s2S, _, _) := fsplit_S v2S
+    let (s1D, e1D, m1D) := fsplit_D x1Val
+    let (s2D, _, _) := fsplit_D x2Val
+    let outS := rv64FpMinMaxSSpec isMax v1S v2S
+    let outD := rv64FpMinMaxDSpec isMax x1Val x2Val
+    nan_unbox (m := 32) (nan_box (n := 64) v1S) = v1S ∧
+    nan_unbox (m := 64) (nan_box (n := 64) x1Val) = x1Val ∧
+    (BitVec.extractLsb 63 32 x1Val ≠ BitVec.allOnes 32 →
+      nan_unbox (m := 32) x1Val = canonical_NaN_S ()) ∧
+    (float_classify v1S).run s = .ok (rv64FloatClassify32Spec v1S) s ∧
+    (float_classify x1Val).run s = .ok (rv64FloatClassify64Spec x1Val) s ∧
+    (sailZfinxExecBinS (.Fregidx 2#5) (.Fregidx 1#5) (.Fregidx 1#5) .FSGNJ_S).run s =
+      .ok (.Retire_Success ()) { s with regs := s.regs.insert .x1 (BitVec.signExtend 64 (fmake_S s2S e1S m1S)) } ∧
+    (sailZfinxExecBinS (.Fregidx 2#5) (.Fregidx 1#5) (.Fregidx 1#5) .FSGNJN_S).run s =
+      .ok (.Retire_Success ()) { s with regs := s.regs.insert .x1 (BitVec.signExtend 64 (fmake_S (1#1 ^^^ s2S) e1S m1S)) } ∧
+    (sailZfinxExecBinS (.Fregidx 2#5) (.Fregidx 1#5) (.Fregidx 1#5) .FSGNJX_S).run s =
+      .ok (.Retire_Success ()) { s with regs := s.regs.insert .x1 (BitVec.signExtend 64 (fmake_S (s1S ^^^ s2S) e1S m1S)) } ∧
+    (sailZfinxExecBinD (.Fregidx 2#5) (.Fregidx 1#5) (.Fregidx 1#5) .FSGNJ_D).run s =
+      .ok (.Retire_Success ()) { s with regs := s.regs.insert .x1 (fmake_D s2D e1D m1D) } ∧
+    (sailZfinxExecBinD (.Fregidx 2#5) (.Fregidx 1#5) (.Fregidx 1#5) .FSGNJN_D).run s =
+      .ok (.Retire_Success ()) { s with regs := s.regs.insert .x1 (fmake_D (1#1 ^^^ s2D) e1D m1D) } ∧
+    (sailZfinxExecBinD (.Fregidx 2#5) (.Fregidx 1#5) (.Fregidx 1#5) .FSGNJX_D).run s =
+      .ok (.Retire_Success ()) { s with regs := s.regs.insert .x1 (fmake_D (s1D ^^^ s2D) e1D m1D) } ∧
+    (∃ regs,
+      (sailZfinxExecBinS (.Fregidx 2#5) (.Fregidx 1#5) (.Fregidx 1#5)
+        (if isMax then .FMAX_S else .FMIN_S)).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .x1 = some (BitVec.signExtend 64 outS.1) ∧
+      regs.get? .fcsr = some (rv64AccrueFflagsFcsrSpec fcsrVal outS.2)) ∧
+    (∃ regs,
+      (sailZfinxExecBinD (.Fregidx 2#5) (.Fregidx 1#5) (.Fregidx 1#5)
+        (if isMax then .FMAX_D else .FMIN_D)).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .x1 = some outD.1 ∧
+      regs.get? .fcsr = some (rv64AccrueFflagsFcsrSpec fcsrVal outD.2)) := by
+  dsimp only []
+  let v1S := Sail.BitVec.extractLsb x1Val 31 0
+  let v2S := Sail.BitVec.extractLsb x2Val 31 0
+  have hfr1 : fregidx_to_regidx (.Fregidx 1#5) = ra := rfl
+  have hfr2 : fregidx_to_regidx (.Fregidx 2#5) = sp := rfl
+  have hrS1 : (sailZfinxReadS (.Fregidx 1#5)).run s = .ok v1S s := by
+    unfold sailZfinxReadS; rw [hfr1, run_bind_ok _ _ _ _ _ (rX_bits_ra_run x1Val s hx1)]; rfl
+  have hrS2 : (sailZfinxReadS (.Fregidx 2#5)).run s = .ok v2S s := by
+    unfold sailZfinxReadS; rw [hfr2, run_bind_ok _ _ _ _ _ (rX_bits_sp_run x2Val s hx2)]; rfl
+  have hext64 (v : BitVec 64) : Sail.BitVec.extractLsb v 63 0 = v := by
+    ext i; simp [Sail.BitVec.extractLsb, BitVec.extractLsb]
+  have hrD1 : (sailZfinxReadD (.Fregidx 1#5)).run s = .ok x1Val s := by
+    unfold sailZfinxReadD; rw [hfr1, run_bind_ok _ _ _ _ _ (rX_bits_ra_run x1Val s hx1)]
+    dsimp only [Pure.pure, EStateM.pure, EStateM.run]; rw [hext64]
+  have hrD2 : (sailZfinxReadD (.Fregidx 2#5)).run s = .ok x2Val s := by
+    unfold sailZfinxReadD; rw [hfr2, run_bind_ok _ _ _ _ _ (rX_bits_sp_run x2Val s hx2)]
+    dsimp only [Pure.pure, EStateM.pure, EStateM.run]; rw [hext64]
+  have hwS (res : BitVec 32) (st : SequentialState RegisterType trivialChoiceSource) :
+      (sailZfinxWriteS (.Fregidx 1#5) res).run st =
+        .ok () { st with regs := st.regs.insert .x1 (BitVec.signExtend 64 res) } := by
+    unfold sailZfinxWriteS; rw [hfr1]; exact wX_bits_ra_run (BitVec.signExtend 64 res) st
+  have hwD (res : BitVec 64) (st : SequentialState RegisterType trivialChoiceSource) :
+      (sailZfinxWriteD (.Fregidx 1#5) res).run st =
+        .ok () { st with regs := st.regs.insert .x1 res } := by
+    unfold sailZfinxWriteD; rw [hfr1]
+    have hse : sign_extend (m := 64) res = res := BitVec.signExtend_eq res
+    rw [hse]; exact wX_bits_ra_run res st
+  have hboxS : nan_unbox (m := 32) (nan_box (n := 64) v1S) = v1S := by
+    rw [nan_box_32_eq, nan_unbox_32_eq]; unfold rv64NanUnboxSSpec rv64NanBoxSSpec
+    rw [extractLsb_append_hi_32, extractLsb_append_lo_32]; rfl
+  have hboxD : nan_unbox (m := 64) (nan_box (n := 64) x1Val) = x1Val := by
+    rw [nan_box_64_eq, nan_unbox_64_eq]
+  have hunboxBad (hne : BitVec.extractLsb 63 32 x1Val ≠ BitVec.allOnes 32) :
+      nan_unbox (m := 32) x1Val = canonical_NaN_S () := by
+    rw [nan_unbox_32_eq]; unfold rv64NanUnboxSSpec
+    have hbeq : (BitVec.extractLsb 63 32 x1Val == BitVec.allOnes 32) = false :=
+      beq_eq_false_iff_ne.mpr hne
+    rw [hbeq]; rfl
+  have hmmS : ∃ regs,
+      (sailZfinxExecBinS (.Fregidx 2#5) (.Fregidx 1#5) (.Fregidx 1#5)
+        (if isMax then .FMAX_S else .FMIN_S)).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .x1 = some (BitVec.signExtend 64 (rv64FpMinMaxSSpec isMax v1S v2S).1) ∧
+      regs.get? .fcsr = some (rv64AccrueFflagsFcsrSpec fcsrVal (rv64FpMinMaxSSpec isMax v1S v2S).2) := by
+    let out := rv64FpMinMaxSSpec isMax v1S v2S
+    obtain ⟨regsA, hacc, hfcA, _, _⟩ := accrue_fflags_run fcsrVal mstatusVal out.2 s hfcsr hmstatus
+    refine ⟨regsA.insert .x1 (BitVec.signExtend 64 out.1), ?_, regs_get?_insert_self _ _ _, ?_⟩
+    · cases isMax
+      · rw [if_neg Bool.false_ne_true]; unfold sailZfinxExecBinS; dsimp only []
+        rw [run_bind_ok _ _ _ _ _ hrS1, run_bind_ok _ _ _ _ _ hrS2,
+            run_bind_ok _ _ _ _ _ hacc, run_bind_ok _ _ _ _ _ (hwS out.1 { s with regs := regsA })]; rfl
+      · rw [if_pos rfl]; unfold sailZfinxExecBinS; dsimp only []
+        rw [run_bind_ok _ _ _ _ _ hrS1, run_bind_ok _ _ _ _ _ hrS2,
+            run_bind_ok _ _ _ _ _ hacc, run_bind_ok _ _ _ _ _ (hwS out.1 { s with regs := regsA })]; rfl
+    · rw [regs_get?_insert_ne _ _ _ _ rfl]; exact hfcA
+  have hmmD : ∃ regs,
+      (sailZfinxExecBinD (.Fregidx 2#5) (.Fregidx 1#5) (.Fregidx 1#5)
+        (if isMax then .FMAX_D else .FMIN_D)).run s =
+        .ok (.Retire_Success ()) { s with regs := regs } ∧
+      regs.get? .x1 = some (rv64FpMinMaxDSpec isMax x1Val x2Val).1 ∧
+      regs.get? .fcsr = some (rv64AccrueFflagsFcsrSpec fcsrVal (rv64FpMinMaxDSpec isMax x1Val x2Val).2) := by
+    let out := rv64FpMinMaxDSpec isMax x1Val x2Val
+    obtain ⟨regsA, hacc, hfcA, _, _⟩ := accrue_fflags_run fcsrVal mstatusVal out.2 s hfcsr hmstatus
+    refine ⟨regsA.insert .x1 out.1, ?_, regs_get?_insert_self _ _ _, ?_⟩
+    · cases isMax
+      · rw [if_neg Bool.false_ne_true]; unfold sailZfinxExecBinD; dsimp only []
+        rw [run_bind_ok _ _ _ _ _ hrD1, run_bind_ok _ _ _ _ _ hrD2,
+            run_bind_ok _ _ _ _ _ hacc, run_bind_ok _ _ _ _ _ (hwD out.1 { s with regs := regsA })]; rfl
+      · rw [if_pos rfl]; unfold sailZfinxExecBinD; dsimp only []
+        rw [run_bind_ok _ _ _ _ _ hrD1, run_bind_ok _ _ _ _ _ hrD2,
+            run_bind_ok _ _ _ _ _ hacc, run_bind_ok _ _ _ _ _ (hwD out.1 { s with regs := regsA })]; rfl
+    · rw [regs_get?_insert_ne _ _ _ _ rfl]; exact hfcA
+  refine ⟨hboxS, hboxD, hunboxBad, float_classify_32_run v1S s, float_classify_64_run x1Val s,
+    ?_, ?_, ?_, ?_, ?_, ?_, hmmS, hmmD⟩
+  · unfold sailZfinxExecBinS; dsimp only []
+    rw [run_bind_ok _ _ _ _ _ hrS1, run_bind_ok _ _ _ _ _ hrS2, run_bind_ok _ _ _ _ _ (hwS _ s)]; rfl
+  · unfold sailZfinxExecBinS; dsimp only []
+    rw [run_bind_ok _ _ _ _ _ hrS1, run_bind_ok _ _ _ _ _ hrS2, run_bind_ok _ _ _ _ _ (hwS _ s)]; rfl
+  · unfold sailZfinxExecBinS; dsimp only []
+    rw [run_bind_ok _ _ _ _ _ hrS1, run_bind_ok _ _ _ _ _ hrS2, run_bind_ok _ _ _ _ _ (hwS _ s)]; rfl
+  · unfold sailZfinxExecBinD; dsimp only []
+    rw [run_bind_ok _ _ _ _ _ hrD1, run_bind_ok _ _ _ _ _ hrD2, run_bind_ok _ _ _ _ _ (hwD _ s)]; rfl
+  · unfold sailZfinxExecBinD; dsimp only []
+    rw [run_bind_ok _ _ _ _ _ hrD1, run_bind_ok _ _ _ _ _ hrD2, run_bind_ok _ _ _ _ _ (hwD _ s)]; rfl
+  · unfold sailZfinxExecBinD; dsimp only []
+    rw [run_bind_ok _ _ _ _ _ hrD1, run_bind_ok _ _ _ _ _ hrD2, run_bind_ok _ _ _ _ _ (hwD _ s)]; rfl
 
 end SailRiscvBridge

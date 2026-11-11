@@ -13,9 +13,10 @@ Verifies:
    `079463134b9c50450b8393e1566a09fc492a34d9` (`len(packages) == 2`).
 3. `SailRiscvBridge` proof modules never import heavy monolithic generated modules
    (`LeanRV64D.InstsEnd`, `LeanRV64D.Step`, `LeanRV64D.ZicsrInsts`, `LeanRV64D.RiscvExtras`, or root `import LeanRV64D`),
-   contain `#verify_sail_riscv_bridge_axioms` (>= 95 unique audited theorems via `Lean.collectAxioms`
-   and `bridgedTheorems.Nodup`), and contain zero `sorry`, `sorryAx`, `admit`, `axiom`, `native_decide`,
-   `bv_decide`, `trustCompiler`, or `ofReduceBool` tokens outside Lean comments/strings.
+   contain `#verify_sail_riscv_bridge_axioms` (>= 122 unique audited theorems via `Lean.collectAxioms`,
+   `bridgedTheorems.Nodup`, and exact `allowedAxioms` allowlist), and contain zero `sorry`, `sorryAx`,
+   `admit`, `axiom`, `native_decide`, `bv_decide`, `trustCompiler`, or `ofReduceBool` tokens outside
+   Lean comments/strings.
 """
 from __future__ import annotations
 
@@ -50,7 +51,15 @@ FORBIDDEN_IMPORTS = re.compile(
     re.M,
 )
 
-MIN_AUDITED_THEOREMS = 95
+MIN_AUDITED_THEOREMS = 122
+
+EXPECTED_ALLOWED_AXIOMS: tuple[str, ...] = (
+    "propext",
+    "Classical.choice",
+    "Quot.sound",
+    "sys_enable_experimental_extensions",
+    "plat_term_write",
+)
 
 UPSTREAM_INSTSEND_REL = ".lake/packages/Lean_RV64D/LeanRV64D/InstsEnd.lean"
 PINNED_INSTSEND_SNIPPET_DIGESTS: dict[str, str] = {
@@ -146,6 +155,24 @@ PINNED_INSTSEND_SNIPPET_DIGESTS: dict[str, str] = {
     "execute_CSRReg": "6c57ac097cc2f2359cb68f1a52d677a9eede596904ef3d26da9d9f7224308016",
     "execute_CSRImm": "70e72178239c122d3322f1c3903deb2bc5dfa97fb4dee84fe38ff3d0f29fdcf8",
     "execute_SFENCE_VMA": "10cd8bf0c03470ebfb502ad0a3660cf173221cf7128c5475820942c11564fea3",
+    "execute_MRET": "c25bdbffaccf4c1988c68d3dcafcd1684e037e905d964f40ad811ac0b04f3de0",
+    "execute_SRET": "d298f96e0668b557813a5aa31eee8d8059a63c2f698cf9b7e892a52be8111bdf",
+    "execute_LOAD_FP": "d7d87f8a3b92589485975dcee4350c86adefd7c1b650cdb1dc631772a366f789",
+    "execute_STORE_FP": "a49472fd60cbc2fae522995cec0b276689c41178e4650e346bcac9b5cc89f3ae",
+    "execute_C_FSWSP": "5b8cbab7e4a4649cde08a004ecd02a14a77150d83fa63c60ad3eb3f747647cb5",
+    "execute_C_FSW": "ad70d709c3b33c575b5b00ff966141da9d793d204c6cee67357ce6ec5a2797e8",
+    "execute_C_FSDSP": "cd16064404f53b49e2df5aecfd25c13dc8504ac08b7f2c81be5a6065fbfb99e0",
+    "execute_C_FSD": "a1f71bd4d3a6cf0058f3bfcea3d5e90c54272cf93c4337db59be9f67ed3e30d9",
+    "execute_C_FLWSP": "e597209f1be7f362690ded7936113ebd265a18a6f7511f179d8019c0e15414db",
+    "execute_C_FLW": "20cbaa1f3b8b250cabe32e4b0faf49b6769f3ce00ba45d5e880e45e458449b06",
+    "execute_C_FLDSP": "80f4bcdf91252227f3862cddac58bea560d67d266369882a06834fdfe987b7ec",
+    "execute_C_FLD": "1dedbb28666313b1a62bd47ed8dc6dc9777f388c7bf19682f60dc590a173a9a1",
+    "execute_F_UN_X_TYPE_D": "3e5373350da91c361d5fa19c7077f59ddafd7437fb3288254635a1a0369dc00c",
+    "execute_F_UN_TYPE_X_S": "6026f720a9b85ba4477a26543a3d920bd6e91285941c94c94665d38c01691998",
+    "execute_F_UN_TYPE_F_S": "e02fab28303839258388e9834b9e3593b5ba3b71ecbd467bed632886e5c6c841",
+    "execute_F_UN_F_TYPE_D": "b31c835b75c93dbb8098e2a76509f089b8b8bd748645bdb8f921a99c3967c1ae",
+    "execute_F_BIN_TYPE_F_S": "e86f154cb1396b6e18e8081204deaf7e55f89c15c06dd648c69be3e445af0385",
+    "execute_F_BIN_F_TYPE_D": "5c7bef89999f12e5523981555f9d0218fb017ee30d0f1dd2d923f69f3736c63f",
 }
 
 
@@ -370,6 +397,17 @@ def check_bridge_tree(root_dir: Path, sync_mirrors: bool = False) -> dict[str, o
             errors.append("SailRiscvBridge.lean missing `Lean.collectAxioms` audit")
         if "bridgedTheorems.Nodup" not in rb_stripped:
             errors.append("SailRiscvBridge.lean missing `bridgedTheorems.Nodup` uniqueness theorem")
+        if "allowedAxioms.contains" not in rb_stripped:
+            errors.append("SailRiscvBridge.lean missing `allowedAxioms.contains` enforcement")
+        ax_match = re.search(r"\bdef\s+allowedAxioms\s*:\s*List\s+Name\s*:=\s*\[(.*?)\]", rb_stripped, re.S)
+        if not ax_match:
+            errors.append("SailRiscvBridge.lean missing `def allowedAxioms : List Name := [...]` list")
+        else:
+            actual_axioms = tuple(re.findall(r"``([A-Za-z0-9_.?']+)", ax_match.group(1)))
+            if actual_axioms != EXPECTED_ALLOWED_AXIOMS:
+                errors.append(
+                    f"SailRiscvBridge.lean `allowedAxioms` mismatch: {actual_axioms} != {EXPECTED_ALLOWED_AXIOMS}"
+                )
         bridged_refs = re.findall(r"``SailRiscvBridge\.[A-Za-z0-9_?']+", rb_stripped)
         if len(bridged_refs) != len(set(bridged_refs)):
             seen_refs: set[str] = set()
@@ -1203,7 +1241,365 @@ def execute_SFENCE_VMA (rs1 : regidx) (rs2 : regidx) : SailM ExecutionResult := 
       (pure RETIRE_SUCCESS))
   | .VirtualUser => (pure (Virtual_Instruction ()))
   | .VirtualSupervisor =>
-    (internal_error "extensions/I/base_insts.sail" 692 "Hypervisor extension not supported")"""
+    (internal_error "extensions/I/base_insts.sail" 692 "Hypervisor extension not supported")
+
+def execute_MRET (_ : Unit) : SailM ExecutionResult := do
+  if ((bne (← readReg cur_privilege) Machine) : Bool)
+  then (pure (Illegal_Instruction ()))
+  else
+    (do
+      if ((not (ext_check_xret_priv Machine)) : Bool)
+      then (pure (Ext_XRET_Priv_Failure ()))
+      else
+        (do
+          let prev_priv ← do readReg cur_privilege
+          writeReg mstatus (Sail.BitVec.updateSubrange (← readReg mstatus) 3 3
+            (_get_Mstatus_MPIE (← readReg mstatus)))
+          writeReg mstatus (Sail.BitVec.updateSubrange (← readReg mstatus) 7 7 1#1)
+          writeReg cur_privilege (← (privLevel_bits_forwards
+              ((_get_Mstatus_MPP (← readReg mstatus)), 0#1)))
+          writeReg mstatus (Sail.BitVec.updateSubrange (← readReg mstatus) 12 11
+            (privLevel_to_bits
+              (← do
+                if ((← (currentlyEnabled Ext_U)) : Bool)
+                then (pure User)
+                else (pure Machine))))
+          if ((bne (← readReg cur_privilege) Machine) : Bool)
+          then writeReg mstatus (Sail.BitVec.updateSubrange (← readReg mstatus) 17 17 0#1)
+          else (pure ())
+          if ((hartSupports Ext_Zicfilp) : Bool)
+          then (zicfilp_restore_elp_on_xret mRET (← readReg cur_privilege))
+          else (pure ())
+          (long_csr_write_callback "mstatus" "mstatush" (← readReg mstatus))
+          if ((get_config_print_exception ()) : Bool)
+          then
+            (pure (print_endline
+                (HAppend.hAppend "ret-ing from "
+                  (HAppend.hAppend (← (privLevel_to_str prev_priv))
+                    (HAppend.hAppend " to " (← (privLevel_to_str (← readReg cur_privilege))))))))
+          else (pure ())
+          (set_next_pc (← (prepare_xret_target Machine)))
+          let _ : Unit := (xret_callback true)
+          (pure RETIRE_SUCCESS)))
+
+def execute_SRET (_ : Unit) : SailM ExecutionResult := do
+  let sret_illegal ← (( do
+    match (← readReg cur_privilege) with
+    | .User => (pure true)
+    | .Supervisor =>
+      (pure ((not (← (currentlyEnabled Ext_S))) || ((_get_Mstatus_TSR (← readReg mstatus)) == 1#1)))
+    | .Machine => (pure (not (← (currentlyEnabled Ext_S))))
+    | .VirtualUser =>
+      (internal_error "extensions/I/base_insts.sail" 607 "Hypervisor extension not supported")
+    | .VirtualSupervisor =>
+      (internal_error "extensions/I/base_insts.sail" 608 "Hypervisor extension not supported") ) :
+    SailM Bool )
+  if (sret_illegal : Bool)
+  then (pure (Illegal_Instruction ()))
+  else
+    (do
+      if ((not (ext_check_xret_priv Supervisor)) : Bool)
+      then (pure (Ext_XRET_Priv_Failure ()))
+      else
+        (do
+          let prev_priv ← do readReg cur_privilege
+          writeReg mstatus (Sail.BitVec.updateSubrange (← readReg mstatus) 1 1
+            (_get_Mstatus_SPIE (← readReg mstatus)))
+          writeReg mstatus (Sail.BitVec.updateSubrange (← readReg mstatus) 5 5 1#1)
+          writeReg cur_privilege (← do
+            if (((_get_Mstatus_SPP (← readReg mstatus)) == 1#1) : Bool)
+            then (pure Supervisor)
+            else (pure User))
+          writeReg mstatus (Sail.BitVec.updateSubrange (← readReg mstatus) 8 8 0#1)
+          if ((bne (← readReg cur_privilege) Machine) : Bool)
+          then writeReg mstatus (Sail.BitVec.updateSubrange (← readReg mstatus) 17 17 0#1)
+          else (pure ())
+          if ((hartSupports Ext_Zicfilp) : Bool)
+          then (zicfilp_restore_elp_on_xret sRET (← readReg cur_privilege))
+          else (pure ())
+          (long_csr_write_callback "mstatus" "mstatush" (← readReg mstatus))
+          if ((get_config_print_exception ()) : Bool)
+          then
+            (pure (print_endline
+                (HAppend.hAppend "ret-ing from "
+                  (HAppend.hAppend (← (privLevel_to_str prev_priv))
+                    (HAppend.hAppend " to " (← (privLevel_to_str (← readReg cur_privilege))))))))
+          else (pure ())
+          (set_next_pc (← (prepare_xret_target Supervisor)))
+          let _ : Unit := (xret_callback false)
+          (pure RETIRE_SUCCESS)))
+
+def execute_LOAD_FP (imm : (BitVec 12)) (rs1 : regidx) (rd : fregidx) (width : Nat) : SailM ExecutionResult := do
+  assert (width ≤b flen_bytes) "extensions/FD/fext_insts.sail:282.28-282.29"
+  let offset : xlenbits := (sign_extend (m := 64) imm)
+  match (← (vmem_read rs1 offset width (Load Data) false false false)) with
+  | .Ok result =>
+    (do
+      (wF_bits rd (nan_box (n := (8 *i 8)) result))
+      (pure RETIRE_SUCCESS))
+  | .Err e => (pure e)
+
+def execute_STORE_FP (imm : (BitVec 12)) (rs2 : fregidx) (rs1 : regidx) (width : Nat) : SailM ExecutionResult := do
+  assert (width ≤b flen_bytes) "extensions/FD/fext_insts.sail:318.28-318.29"
+  let offset : xlenbits := (sign_extend (m := 64) imm)
+  let data ← do (pure (Sail.BitVec.extractLsb (← (rF_bits rs2)) ((width *i 8) -i 1) 0))
+  match (← (vmem_write rs1 offset width data (Store Data) false false false)) with
+  | .Ok true => (pure RETIRE_SUCCESS)
+  | .Ok false =>
+    (internal_error "extensions/FD/fext_insts.sail" 324 "store got false from vmem_write")
+  | .Err e => (pure e)
+
+def execute_C_FSWSP (uimm : (BitVec 6)) (rs2 : fregidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) (uimm +++ 0b00#2))
+  (ExecuteAs (STORE_FP (imm, rs2, sp, 4)))
+
+def execute_C_FSW (uimm : (BitVec 5)) (rsc1 : cregidx) (rsc2 : cfregidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) (uimm +++ 0b00#2))
+  let rs1 := (creg2reg_idx rsc1)
+  let rs2 := (cfregidx_to_fregidx rsc2)
+  (ExecuteAs (STORE_FP (imm, rs2, rs1, 4)))
+
+def execute_C_FSDSP (uimm : (BitVec 6)) (rs2 : fregidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) (uimm +++ 0b000#3))
+  (ExecuteAs (STORE_FP (imm, rs2, sp, 8)))
+
+def execute_C_FSD (uimm : (BitVec 5)) (rsc1 : cregidx) (rsc2 : cfregidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) (uimm +++ 0b000#3))
+  let rs1 := (creg2reg_idx rsc1)
+  let rs2 := (cfregidx_to_fregidx rsc2)
+  (ExecuteAs (STORE_FP (imm, rs2, rs1, 8)))
+
+def execute_C_FLWSP (imm : (BitVec 6)) (rd : fregidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) (imm +++ 0b00#2))
+  (ExecuteAs (LOAD_FP (imm, sp, rd, 4)))
+
+def execute_C_FLW (uimm : (BitVec 5)) (rsc : cregidx) (rdc : cfregidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) (uimm +++ 0b00#2))
+  let rd := (cfregidx_to_fregidx rdc)
+  let rs := (creg2reg_idx rsc)
+  (ExecuteAs (LOAD_FP (imm, rs, rd, 4)))
+
+def execute_C_FLDSP (uimm : (BitVec 6)) (rd : fregidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) (uimm +++ 0b000#3))
+  (ExecuteAs (LOAD_FP (imm, sp, rd, 8)))
+
+def execute_C_FLD (uimm : (BitVec 5)) (rsc : cregidx) (rdc : cfregidx) : ExecutionResult :=
+  let imm : (BitVec 12) := (zero_extend (m := 12) (uimm +++ 0b000#3))
+  let rd := (cfregidx_to_fregidx rdc)
+  let rs := (creg2reg_idx rsc)
+  (ExecuteAs (LOAD_FP (imm, rs, rd, 8)))
+
+def execute_F_UN_X_TYPE_D (arg0 : fregidx) (arg1 : regidx) (arg2 : f_un_x_op_D) : SailM ExecutionResult := do
+  let merge_var := (arg0, arg1, arg2)
+  match merge_var with
+  | (rs1, rd, .FCLASS_D) =>
+    (do
+      let rs1_val ← do (rF_or_X_D rs1)
+      (wX_bits rd
+        (zero_extend (m := 64) (float_class_onehot_bits_forwards (← (float_classify rs1_val)))))
+      (pure RETIRE_SUCCESS))
+  | (rs1, rd, .FMV_X_D) =>
+    (do
+      assert ((xlen ≥b 64) && (flen ≥b 64)) "extensions/FD/dext_insts.sail:853.32-853.33"
+      (wX_bits rd (sign_extend (m := 64) (Sail.BitVec.extractLsb (← (rF_bits rs1)) 63 0)))
+      (pure RETIRE_SUCCESS))
+
+def execute_F_UN_TYPE_X_S (arg0 : fregidx) (arg1 : regidx) (arg2 : f_un_op_x_S) : SailM ExecutionResult := do
+  let merge_var := (arg0, arg1, arg2)
+  match merge_var with
+  | (rs1, rd, .FCLASS_S) =>
+    (do
+      let rs1_val ← do (rF_or_X_S rs1)
+      (wX_bits rd
+        (zero_extend (m := 64) (float_class_onehot_bits_forwards (← (float_classify rs1_val)))))
+      (pure RETIRE_SUCCESS))
+  | (rs1, rd, .FMV_X_W) =>
+    (do
+      (wX_bits rd (sign_extend (m := 64) (Sail.BitVec.extractLsb (← (rF_bits rs1)) 31 0)))
+      (pure RETIRE_SUCCESS))
+
+def execute_F_UN_TYPE_F_S (rs1 : regidx) (rd : fregidx) (id_2 : f_un_op_f_S) : SailM ExecutionResult := do
+  (wF_bits rd (nan_box (n := (8 *i 8)) (Sail.BitVec.extractLsb (← (rX_bits rs1)) 31 0)))
+  (pure RETIRE_SUCCESS)
+
+def execute_F_UN_F_TYPE_D (rs1 : regidx) (rd : fregidx) (id_2 : f_un_f_op_D) : SailM ExecutionResult := do
+  assert ((xlen ≥b 64) && (flen ≥b 64)) "extensions/FD/dext_insts.sail:859.32-859.33"
+  (wF_bits rd (nan_box (n := (8 *i 8)) (Sail.BitVec.extractLsb (← (rX_bits rs1)) 63 0)))
+  (pure RETIRE_SUCCESS)
+
+def execute_F_BIN_TYPE_F_S (arg0 : fregidx) (arg1 : fregidx) (arg2 : fregidx) (arg3 : f_bin_op_f_S) : SailM ExecutionResult := do
+  let merge_var := (arg0, arg1, arg2, arg3)
+  match merge_var with
+  | (rs2, rs1, rd, .FSGNJ_S) =>
+    (do
+      let rs1_val_S ← do (rF_or_X_S rs1)
+      let rs2_val_S ← do (rF_or_X_S rs2)
+      let (s1, e1, m1) := (fsplit_S rs1_val_S)
+      let (s2, e2, m2) := (fsplit_S rs2_val_S)
+      let rd_val_S := (fmake_S s2 e1 m1)
+      (wF_or_X_S rd rd_val_S)
+      (pure RETIRE_SUCCESS))
+  | (rs2, rs1, rd, .FSGNJN_S) =>
+    (do
+      let rs1_val_S ← do (rF_or_X_S rs1)
+      let rs2_val_S ← do (rF_or_X_S rs2)
+      let (s1, e1, m1) := (fsplit_S rs1_val_S)
+      let (s2, e2, m2) := (fsplit_S rs2_val_S)
+      let rd_val_S := (fmake_S (1#1 ^^^ s2) e1 m1)
+      (wF_or_X_S rd rd_val_S)
+      (pure RETIRE_SUCCESS))
+  | (rs2, rs1, rd, .FSGNJX_S) =>
+    (do
+      let rs1_val_S ← do (rF_or_X_S rs1)
+      let rs2_val_S ← do (rF_or_X_S rs2)
+      let (s1, e1, m1) := (fsplit_S rs1_val_S)
+      let (s2, e2, m2) := (fsplit_S rs2_val_S)
+      let rd_val_S := (fmake_S (s1 ^^^ s2) e1 m1)
+      (wF_or_X_S rd rd_val_S)
+      (pure RETIRE_SUCCESS))
+  | (rs2, rs1, rd, .FMIN_S) =>
+    (do
+      let rs1_val_S ← do (rF_or_X_S rs1)
+      let rs2_val_S ← do (rF_or_X_S rs2)
+      let is_quiet := true
+      let (rs1_lt_rs2, fflags) := (fle_S rs1_val_S rs2_val_S is_quiet)
+      let rd_val_S :=
+        if (((f_is_NaN_S rs1_val_S) && (f_is_NaN_S rs2_val_S)) : Bool)
+        then (canonical_NaN_S ())
+        else
+          (if ((f_is_NaN_S rs1_val_S) : Bool)
+          then rs2_val_S
+          else
+            (if ((f_is_NaN_S rs2_val_S) : Bool)
+            then rs1_val_S
+            else
+              (if (((f_is_neg_zero_S rs1_val_S) && (f_is_pos_zero_S rs2_val_S)) : Bool)
+              then rs1_val_S
+              else
+                (if (((f_is_neg_zero_S rs2_val_S) && (f_is_pos_zero_S rs1_val_S)) : Bool)
+                then rs2_val_S
+                else
+                  (if (rs1_lt_rs2 : Bool)
+                  then rs1_val_S
+                  else rs2_val_S)))))
+      (accrue_fflags fflags)
+      (wF_or_X_S rd rd_val_S)
+      (pure RETIRE_SUCCESS))
+  | (rs2, rs1, rd, .FMAX_S) =>
+    (do
+      let rs1_val_S ← do (rF_or_X_S rs1)
+      let rs2_val_S ← do (rF_or_X_S rs2)
+      let is_quiet := true
+      let (rs2_lt_rs1, fflags) := (fle_S rs2_val_S rs1_val_S is_quiet)
+      let rd_val_S :=
+        if (((f_is_NaN_S rs1_val_S) && (f_is_NaN_S rs2_val_S)) : Bool)
+        then (canonical_NaN_S ())
+        else
+          (if ((f_is_NaN_S rs1_val_S) : Bool)
+          then rs2_val_S
+          else
+            (if ((f_is_NaN_S rs2_val_S) : Bool)
+            then rs1_val_S
+            else
+              (if (((f_is_neg_zero_S rs1_val_S) && (f_is_pos_zero_S rs2_val_S)) : Bool)
+              then rs2_val_S
+              else
+                (if (((f_is_neg_zero_S rs2_val_S) && (f_is_pos_zero_S rs1_val_S)) : Bool)
+                then rs1_val_S
+                else
+                  (if (rs2_lt_rs1 : Bool)
+                  then rs1_val_S
+                  else rs2_val_S)))))
+      (accrue_fflags fflags)
+      (wF_or_X_S rd rd_val_S)
+      (pure RETIRE_SUCCESS))
+
+def execute_F_BIN_F_TYPE_D (arg0 : fregidx) (arg1 : fregidx) (arg2 : fregidx) (arg3 : f_bin_f_op_D) : SailM ExecutionResult := do
+  let merge_var := (arg0, arg1, arg2, arg3)
+  match merge_var with
+  | (rs2, rs1, rd, .FSGNJ_D) =>
+    (do
+      let rs1_val_D ← do (rF_or_X_D rs1)
+      let rs2_val_D ← do (rF_or_X_D rs2)
+      let (s1, e1, m1) := (fsplit_D rs1_val_D)
+      let (s2, e2, m2) := (fsplit_D rs2_val_D)
+      let rd_val_D := (fmake_D s2 e1 m1)
+      (wF_or_X_D rd rd_val_D)
+      (pure RETIRE_SUCCESS))
+  | (rs2, rs1, rd, .FSGNJN_D) =>
+    (do
+      let rs1_val_D ← do (rF_or_X_D rs1)
+      let rs2_val_D ← do (rF_or_X_D rs2)
+      let (s1, e1, m1) := (fsplit_D rs1_val_D)
+      let (s2, e2, m2) := (fsplit_D rs2_val_D)
+      let rd_val_D := (fmake_D (1#1 ^^^ s2) e1 m1)
+      (wF_or_X_D rd rd_val_D)
+      (pure RETIRE_SUCCESS))
+  | (rs2, rs1, rd, .FSGNJX_D) =>
+    (do
+      let rs1_val_D ← do (rF_or_X_D rs1)
+      let rs2_val_D ← do (rF_or_X_D rs2)
+      let (s1, e1, m1) := (fsplit_D rs1_val_D)
+      let (s2, e2, m2) := (fsplit_D rs2_val_D)
+      let rd_val_D := (fmake_D (s1 ^^^ s2) e1 m1)
+      (wF_or_X_D rd rd_val_D)
+      (pure RETIRE_SUCCESS))
+  | (rs2, rs1, rd, .FMIN_D) =>
+    (do
+      let rs1_val_D ← do (rF_or_X_D rs1)
+      let rs2_val_D ← do (rF_or_X_D rs2)
+      let is_quiet := true
+      let (rs1_lt_rs2, fflags) := (fle_D rs1_val_D rs2_val_D is_quiet)
+      let rd_val_D :=
+        if (((f_is_NaN_D rs1_val_D) && (f_is_NaN_D rs2_val_D)) : Bool)
+        then (canonical_NaN_D ())
+        else
+          (if ((f_is_NaN_D rs1_val_D) : Bool)
+          then rs2_val_D
+          else
+            (if ((f_is_NaN_D rs2_val_D) : Bool)
+            then rs1_val_D
+            else
+              (if (((f_is_neg_zero_D rs1_val_D) && (f_is_pos_zero_D rs2_val_D)) : Bool)
+              then rs1_val_D
+              else
+                (if (((f_is_neg_zero_D rs2_val_D) && (f_is_pos_zero_D rs1_val_D)) : Bool)
+                then rs2_val_D
+                else
+                  (if (rs1_lt_rs2 : Bool)
+                  then rs1_val_D
+                  else rs2_val_D)))))
+      (accrue_fflags fflags)
+      (wF_or_X_D rd rd_val_D)
+      (pure RETIRE_SUCCESS))
+  | (rs2, rs1, rd, .FMAX_D) =>
+    (do
+      let rs1_val_D ← do (rF_or_X_D rs1)
+      let rs2_val_D ← do (rF_or_X_D rs2)
+      let is_quiet := true
+      let (rs2_lt_rs1, fflags) := (fle_D rs2_val_D rs1_val_D is_quiet)
+      let rd_val_D :=
+        if (((f_is_NaN_D rs1_val_D) && (f_is_NaN_D rs2_val_D)) : Bool)
+        then (canonical_NaN_D ())
+        else
+          (if ((f_is_NaN_D rs1_val_D) : Bool)
+          then rs2_val_D
+          else
+            (if ((f_is_NaN_D rs2_val_D) : Bool)
+            then rs1_val_D
+            else
+              (if (((f_is_neg_zero_D rs1_val_D) && (f_is_pos_zero_D rs2_val_D)) : Bool)
+              then rs2_val_D
+              else
+                (if (((f_is_neg_zero_D rs2_val_D) && (f_is_pos_zero_D rs1_val_D)) : Bool)
+                then rs1_val_D
+                else
+                  (if (rs2_lt_rs1 : Bool)
+                  then rs1_val_D
+                  else rs2_val_D)))))
+      (accrue_fflags fflags)
+      (wF_or_X_D rd rd_val_D)
+      (pure RETIRE_SUCCESS))"""
 
 SYNTHETIC_INSTSEND_TEXT = "\n\n".join(
     [
@@ -1317,6 +1713,16 @@ class SelfTests(unittest.TestCase):
             errs = "\n".join(str(e) for e in rep_dup["errors"])
             self.assertIn("duplicate bridged theorem references", errs)
             self.assertIn(f"expected >= {MIN_AUDITED_THEOREMS}", errs)
+
+            tampered_ax_lean = orig_root_lean.replace(
+                "``plat_term_write",
+                "``plat_term_write\n  , ``riscv_f32Add",
+                1,
+            )
+            (b_root / "SailRiscvBridge.lean").write_text(tampered_ax_lean, encoding="utf-8")
+            rep_ax = check_bridge_tree(root)
+            self.assertFalse(rep_ax["ok"])
+            self.assertIn("`allowedAxioms` mismatch", "\n".join(str(e) for e in rep_ax["errors"]))
 
 
 def main() -> int:
