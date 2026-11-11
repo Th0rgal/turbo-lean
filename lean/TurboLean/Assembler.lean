@@ -286,9 +286,7 @@ theorem relative_cone_sorry_prefix_sound (p : Name) (prefixStubs₁ prefixStubs�
 
 theorem relativeConeDeclClean_rejects_stub (p : Name) (stubs : List Name)
     (h : stubs.contains p = true) : relativeConeDeclClean [p] stubs = false := by
-  dsimp only [relativeConeDeclClean, List.all]
-  rw [h]
-  simp
+  simp only [relativeConeDeclClean, List.all, h, Bool.not_true, Bool.and_false, Bool.false_and]
 
 abbrev KernelEnvState.allDistinctIds : List Nat → Bool :=
   TurboLean.Spec.allDistinctBy (· == ·)
