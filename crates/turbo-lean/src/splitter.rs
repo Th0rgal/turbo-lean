@@ -3230,95 +3230,117 @@ pub(crate) fn extract_shard_stmt_and_proof(src: &str, shard: &TheoremShard) -> (
 /// and after local bindings inside the theorem's return type), OR when there is no top-level `:=`,
 /// at the first top-level equation-compiler pattern-matching arm (`\n  | pat => proof`) after the top-level `:`.
 fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
+    #[derive(Clone, Copy)]
+    enum StmtScope {
+        LocalBind(usize),
+        LocalArms(usize),
+        Show,
+        ByWaitFirst(Option<usize>),
+        ByBlock { base_col: usize, stmt_assign: bool },
+    }
+    let col_at = |idx: usize| cmd[cmd[..idx].rfind('\n').map_or(0, |k| k + 1)..idx].chars().count();
     let bytes = cmd.as_bytes();
-    let mut paren = 0i32;
-    let mut bracket = 0i32;
-    let mut brace = 0i32;
-    let mut strict_brace = 0i32;
-    let mut i = 0usize;
-    let mut pending_local_assigns = 0usize;
-    let mut seen_top_level_colon = false;
-    let mut seen_top_level_match_after_colon = false;
-    let mut first_top_level_arm_split: Option<usize> = None;
+    let (mut paren, mut bracket, mut brace, mut strict_brace) = (0i32, 0i32, 0i32, 0i32);
+    let (mut i, lead_ws) = (0usize, cmd.len() - cmd.trim_start().len());
+    let mut scopes: Vec<StmtScope> = Vec::new();
+    let (mut seen_colon, mut seen_match, mut at_line_first) = (false, false, false);
+    let mut first_arm_split: Option<usize> = None;
 
     while i < bytes.len() {
         let c = bytes[i];
+        if c == b'\n' {
+            at_line_first = true;
+            i += 1;
+            continue;
+        }
+        if c.is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
         if let Some((end, _)) = scan_lean_block_comment_end(cmd, i) {
             i = end;
             continue;
         }
         if i + 1 < bytes.len() && c == b'-' && bytes[i + 1] == b'-' {
-            i += 2;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
+            i += 2 + bytes[i + 2..].iter().position(|&b| b == b'\n').unwrap_or(bytes.len() - i - 2);
+            continue;
+        }
+        let depth_zero = paren == 0 && bracket == 0 && brace == 0 && strict_brace == 0;
+        let line_first = std::mem::replace(&mut at_line_first, false);
+
+        if depth_zero && line_first && seen_colon {
+            let col = col_at(i);
+            while match scopes.last().copied() {
+                Some(StmtScope::ByBlock { base_col, .. }) => col < base_col,
+                Some(StmtScope::ByWaitFirst(Some(mc))) => col <= mc,
+                Some(StmtScope::LocalArms(ac)) => col <= ac && c != b'|',
+                _ => false,
+            } {
+                scopes.pop();
             }
+            if let Some(StmtScope::ByBlock { stmt_assign, .. }) = scopes.last_mut() {
+                *stmt_assign = false;
+            }
+        }
+        if depth_zero && seen_colon && matches!(scopes.last(), Some(StmtScope::ByWaitFirst(_))) {
+            scopes.pop();
+            scopes.push(StmtScope::ByBlock { base_col: col_at(i), stmt_assign: false });
+        }
+        if depth_zero && seen_colon && bytes[i..].starts_with("·".as_bytes()) {
+            if let Some(StmtScope::ByBlock { stmt_assign, .. }) = scopes.last_mut() {
+                *stmt_assign = false;
+            }
+            i += "·".len();
             continue;
         }
         if let Some(end) = scan_lean_norm_literal_end(cmd, i) {
             i = end;
             continue;
         }
-        if bytes[i..].starts_with("⦃".as_bytes()) {
-            strict_brace += 1;
+        if bytes[i..].starts_with("⦃".as_bytes()) || bytes[i..].starts_with("⦄".as_bytes()) {
+            strict_brace = (strict_brace + if bytes[i..].starts_with("⦃".as_bytes()) { 1 } else { -1 }).max(0);
             i += "⦃".len();
             continue;
         }
-        if bytes[i..].starts_with("⦄".as_bytes()) {
-            strict_brace = (strict_brace - 1).max(0);
-            i += "⦄".len();
-            continue;
-        }
-        if paren == 0
-            && bracket == 0
-            && brace == 0
-            && strict_brace == 0
-            && seen_top_level_colon
-            && i > cmd.len() - cmd.trim_start().len()
+        let in_by = matches!(scopes.last(), Some(StmtScope::ByWaitFirst(_) | StmtScope::ByBlock { .. }));
+        if depth_zero
+            && seen_colon
+            && i > lead_ws
             && cmd.is_char_boundary(i)
-            && cmd[..i].chars().next_back().is_none_or(|c| !is_lean_ident_continuation(c) && c != '.')
+            && cmd[..i].chars().next_back().is_none_or(|ch| !is_lean_ident_continuation(ch) && ch != '.')
         {
-            let keyword = ["haveI", "have", "letI", "let_fun", "let", "from"]
-                .into_iter().find(|kw| bytes[i..].starts_with(kw.as_bytes())
-                    && cmd[i + kw.len()..].chars().next()
-                        .is_none_or(|c| !is_lean_ident_continuation(c) && c != '.'));
-            if let Some(kw) = keyword {
-                // Delimited binder types are already skipped by the depth guards.
-                // `from` supplies a have's value without an assignment token.
-                if kw == "from" {
-                    pending_local_assigns = pending_local_assigns.saturating_sub(1);
-                } else {
-                    pending_local_assigns += 1;
+            let kw_end = i + cmd[i..].chars().take_while(|&ch| is_lean_ident_continuation(ch)).map(char::len_utf8).sum::<usize>();
+            if kw_end > i && bytes.get(kw_end) != Some(&b'.') {
+                match &cmd[i..kw_end] {
+                    "where" if !in_by => {
+                        first_arm_split.get_or_insert(i);
+                        break;
+                    }
+                    "match" if !in_by && scopes.is_empty() => seen_match = true,
+                    "by" => {
+                        let min_col = scopes.iter().rev().find_map(|s| match *s {
+                            StmtScope::LocalBind(col) | StmtScope::LocalArms(col) => Some(col),
+                            StmtScope::ByBlock { base_col, .. } => Some(base_col),
+                            _ => None,
+                        });
+                        scopes.push(StmtScope::ByWaitFirst(min_col));
+                    }
+                    "have" | "haveI" | "let" | "letI" | "let_fun" | "obtain" | "set" | "rcases" if in_by => {
+                        if let Some(StmtScope::ByBlock { stmt_assign, .. }) = scopes.last_mut() {
+                            *stmt_assign = true;
+                        }
+                    }
+                    _ if in_by => {}
+                    "haveI" | "have" | "letI" | "let_fun" | "let" => scopes.push(StmtScope::LocalBind(col_at(i))),
+                    "show" => scopes.push(StmtScope::Show),
+                    "from" if matches!(scopes.last(), Some(StmtScope::Show | StmtScope::LocalBind(_) | StmtScope::LocalArms(_))) => {
+                        scopes.pop();
+                    }
+                    _ => {}
                 }
-                i += kw.len();
+                i = kw_end;
                 continue;
             }
-        }
-        if paren == 0
-            && bracket == 0
-            && brace == 0
-            && strict_brace == 0
-            && seen_top_level_colon
-            && i + 5 <= bytes.len()
-            && &bytes[i..i + 5] == b"where"
-            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
-            && (i + 5 == bytes.len() || bytes[i + 5].is_ascii_whitespace())
-        {
-            first_top_level_arm_split.get_or_insert(i);
-            break;
-        }
-        if paren == 0
-            && bracket == 0
-            && brace == 0
-            && strict_brace == 0
-            && seen_top_level_colon
-            && i + 5 < bytes.len()
-            && &bytes[i..i + 5] == b"match"
-            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
-            && bytes[i + 5].is_ascii_whitespace()
-        {
-            seen_top_level_match_after_colon = true;
-            i += 5;
-            continue;
         }
         match c {
             b'(' => paren += 1,
@@ -3327,53 +3349,75 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
             b']' => bracket = (bracket - 1).max(0),
             b'{' => brace += 1,
             b'}' => brace = (brace - 1).max(0),
-            b':' if paren == 0 && bracket == 0 && brace == 0 && strict_brace == 0 => {
-                if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
-                    if pending_local_assigns > 0 {
-                        pending_local_assigns -= 1;
+            b';' if depth_zero && seen_colon => {
+                while matches!(scopes.last(), Some(StmtScope::LocalArms(_))) {
+                    scopes.pop();
+                }
+                if let Some(StmtScope::ByBlock { stmt_assign, .. }) = scopes.last_mut() {
+                    *stmt_assign = false;
+                }
+            }
+            b':' if depth_zero => {
+                if bytes.get(i + 1) == Some(&b'=') {
+                    while matches!(scopes.last(), Some(StmtScope::Show | StmtScope::LocalArms(_))) {
+                        scopes.pop();
+                    }
+                    loop {
+                        match scopes.last_mut() {
+                            Some(StmtScope::ByBlock { stmt_assign, .. }) if *stmt_assign => {
+                                *stmt_assign = false;
+                                break;
+                            }
+                            Some(StmtScope::ByBlock { .. } | StmtScope::ByWaitFirst(_)) => {
+                                scopes.pop();
+                            }
+                            _ => break,
+                        }
+                    }
+                    if matches!(scopes.last(), Some(StmtScope::ByBlock { .. })) {
+                        i += 2;
+                        continue;
+                    }
+                    if matches!(scopes.last(), Some(StmtScope::LocalBind(_))) {
+                        scopes.pop();
                         i += 2;
                         continue;
                     }
                     return Some((&cmd[..i], &cmd[i + 2..]));
-                } else {
-                    let prev = if i > 0 { Some(bytes[i - 1]) } else { None };
-                    let next = bytes.get(i + 1).copied();
-                    let is_op = matches!(prev, Some(b':' | b'=' | b'<' | b'>' | b'!'))
-                        || matches!(next, Some(b':' | b'>'));
-                    if !is_op {
-                        seen_top_level_colon = true;
-                    }
+                }
+                let is_op = matches!(i.checked_sub(1).map(|k| bytes[k]), Some(b':' | b'=' | b'<' | b'>' | b'!'))
+                    || matches!(bytes.get(i + 1), Some(b':' | b'>'));
+                if !is_op {
+                    seen_colon = true;
                 }
             }
-            b';' if paren == 0 && bracket == 0 && brace == 0 && strict_brace == 0 => {
-                pending_local_assigns = 0;
-            }
-            b'|' if paren == 0
-                && bracket == 0
-                && brace == 0
-                && strict_brace == 0
-                && seen_top_level_colon =>
-            {
-                let next_ok =
-                    i + 1 >= bytes.len() || (bytes[i + 1] != b'|' && bytes[i + 1] != b'>');
-                let prev_ok = i == 0 || (bytes[i - 1] != b'|' && bytes[i - 1] != b'<');
+            b'|' if depth_zero && seen_colon && !in_by => {
+                let next_ok = !matches!(bytes.get(i + 1), Some(b'|' | b'>'));
+                let prev_ok = i == 0 || !matches!(bytes[i - 1], b'|' | b'<');
                 if next_ok && prev_ok {
-                    let mut k = i;
-                    while k > 0 && (bytes[k - 1] == b' ' || bytes[k - 1] == b'\t') {
-                        k -= 1;
+                    if let Some(StmtScope::LocalBind(col)) = scopes.last().copied() {
+                        if is_pattern_match_arm_at(cmd, i) {
+                            scopes.pop();
+                            scopes.push(StmtScope::LocalArms(col));
+                            i += 1;
+                            continue;
+                        }
                     }
-                    if k > 0
-                        && (bytes[k - 1] == b'\n' || bytes[k - 1] == b'\r')
-                        && is_pattern_match_arm_at(cmd, i)
-                    {
-                        let mut nl_idx = k - 1;
-                        if nl_idx > 0 && bytes[nl_idx] == b'\n' && bytes[nl_idx - 1] == b'\r' {
-                            nl_idx -= 1;
+                    if scopes.is_empty() && line_first && is_pattern_match_arm_at(cmd, i) {
+                        let mut k = i;
+                        while k > 0 && matches!(bytes[k - 1], b' ' | b'\t') {
+                            k -= 1;
                         }
-                        if !seen_top_level_match_after_colon {
-                            return Some((&cmd[..nl_idx], &cmd[nl_idx..]));
+                        if k > 0 && matches!(bytes[k - 1], b'\n' | b'\r') {
+                            let mut nl_idx = k - 1;
+                            if nl_idx > 0 && bytes[nl_idx] == b'\n' && bytes[nl_idx - 1] == b'\r' {
+                                nl_idx -= 1;
+                            }
+                            if !seen_match {
+                                return Some((&cmd[..nl_idx], &cmd[nl_idx..]));
+                            }
+                            first_arm_split.get_or_insert(nl_idx);
                         }
-                        first_top_level_arm_split.get_or_insert(nl_idx);
                     }
                 }
             }
@@ -3381,10 +3425,7 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
         }
         i += 1;
     }
-    if let Some(nl_idx) = first_top_level_arm_split {
-        return Some((&cmd[..nl_idx], &cmd[nl_idx..]));
-    }
-    None
+    first_arm_split.map(|nl_idx| (&cmd[..nl_idx], &cmd[nl_idx..]))
 }
 
 struct PriorDeclEntry {
@@ -14308,10 +14349,20 @@ public def api := by
             "haveI : P := val; let x := val; have h : P := val\n P",
             "(have h : P := val; P)", "(letI x := val; P)",
             "have h : P from val; P", "have h : P from val\n P",
-            "have ⟨h, k⟩ := val; P", "have h : P; P",
+            "have ⟨h, k⟩ := val; P", "have : P := by have x := 1; exact h\n    P",
+            "have : P := by\n      have h : P\n      · exact hp\n      · exact h\n    P",
+            "have : P := by obtain ⟨_, hp⟩ := h; exact hp\n    P",
+            "have : P := by\n      cases h with\n      | inl hp => exact hp\n      | inr hp => exact hp\n    P",
+            "let _x : Nat := by\n      have _f : Nat → P | _ => hp\n      exact 0\n    P",
+            "let x : let n := 1; Fin n := ⟨0, by decide⟩\n    x.val = 0",
+            "let _x : by skip; exact Nat := 0\n    P",
+            "let _x : show Type from Nat := 0\n    P",
+            "have _h : show Prop from True := trivial\n    P",
+            "let f : Nat → Nat | _ => 0\n    f 1 = 0",
+            "let f : Nat → Nat\n      | 0 => 0\n      | n + 1 => n\n    f 1 = 0",
             "have_lemma my_let haveX let_lemma αhave haveα Foo.have Foo.let .have .let",
         ] {
-            let sig = format!("theorem have_lemma (h : (have : P := val; P)) : {ty} ");
+            let sig = format!("theorem have_lemma (h : (have : P := val; P)) :\n    {ty} ");
             let cmd = format!("{sig}:= by have h := val; let x := val; exact h");
             let (actual, proof) = split_at_top_level_assign(&cmd).unwrap();
             assert_eq!(actual, sig, "{ty}");
