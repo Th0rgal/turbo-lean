@@ -1744,8 +1744,7 @@ def environmentOnlyPrefix (env : Environment) (code : String) : Bool := Id.run d
     if next.pos == state.pos || msgs.hasErrors then return false
     if syn.isOfKind ``Lean.Parser.Command.eoi then break
     if !syn.isOfKind ``Lean.Parser.Command.declaration then return false
-    let text := (code.toRawSubstring.extract state.pos next.pos).toString.trimAscii.toString
-    if !(["def ", "theorem "].any (fun p => text.startsWith p)) then return false
+    if syn[0][1].getNumArgs > 0 then return false -- attributes may introduce local/scoped state
     state := next
   return true
 
@@ -4246,8 +4245,11 @@ def main (args : List String) : IO Unit := do
             let prefDeclTypes := if !evalMode then TurboLean.ZygoteWorker.collectNewTheoremTypeHashes baseEnv ckptState.env (isProbeStub || allowSorry) fastMap else []
             TurboLean.ZygoteWorker.emitZygoteReply stdout emitOk none kgActive true envCacheHit prefixCacheHit importUs prefixUs 0 prefHbs prefPtNodes (if emitOk then 1 else 0) prefOut prefMsgs emitErrs prefUsed prefDeclTypes emitSorryDecls
           else
+            let targetState := match compactCache[fullPrefixKey]? with
+              | some env => if !evalMode && emitOlean?.isNone then Command.mkState env {} ckptState.scopes.head!.opts else ckptState
+              | none => ckptState
             let (ok, elabUs, dHbs, ptNodes, errs, dMsgs, dOut, usedConsts, declTypes, sorryDecls, finalSt) ←
-              TurboLean.ZygoteWorker.runCommandsFromState ckptState bodyCode fn allowStub evalMode stubTargets stubs
+              TurboLean.ZygoteWorker.runCommandsFromState targetState bodyCode fn allowStub evalMode stubTargets stubs
                 (strictPrefix := strictAll) (requiredTargets := some requiredTargets) (fastMap := fastMap) (includeStubsInDeclTypes := isProbeStub)
                 (allowSorry := allowSorry)
             let mut finalOk := ok

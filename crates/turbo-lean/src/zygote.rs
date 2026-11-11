@@ -7353,6 +7353,7 @@ fn eval_with_zygote_pool_attempt(
                 return worker_timeout(worker, req_id);
             }
             let pid = worker.pid();
+            if worker.clone_pid.is_some() { run_digest_test_hook("cloned_worker_request"); }
             let rss_before = measure_process_rss_mb(pid);
             let scan_before = worker.stderr_scan.snapshot();
             if let Err(e) = worker
@@ -7444,13 +7445,13 @@ fn eval_with_zygote_pool_attempt(
                     if rep.ok && rep.import_ok && closure.binding() == ClosureBinding::Bound {
                         master.warm_imports.insert(imports_csv.clone(), closure_pool_digest.clone());
                         master.cold_import_us = Some(rep.import_us);
-                        if masters.len() >= 4 { masters.clear(); }
+                        if masters.len() >= 4 { if let Some(key) = masters.keys().next().cloned() { masters.remove(&key); } }
                         masters.insert(pool_key.clone(), master);
                     }
                 }
             }
             if let Some(master) = masters.get_mut(&pool_key) {
-                if master.pinned_snapshot_dir == expected_pinned_dir {
+                if master.pinned_snapshot_dir == expected_pinned_dir && master.spawn_lean_path == effective_lean_path {
                     if let Ok(mut worker) = master.fork_clone(deadline) {
                         worker.cold_import_us = master.cold_import_us.take();
                         return Ok(worker);
@@ -15471,11 +15472,18 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
                 let (env, lean) = (&env, &lean);
                 s.spawn(move || {
                     let (_dir, store, _, _) = open_test_zygote_env(&format!("clone_thread_{i}")).unwrap();
+                    let cloned = std::rc::Rc::new(std::cell::Cell::new(false));
+                    let seen = cloned.clone();
+                    digest_test_hooks::set("cloned_worker_request", move || seen.set(true));
                     let code = format!("import ClonePool\ntheorem clone_pool_{i} : cloneSeed = 7 := rfl\n");
                     let r = eval_with_zygote_pool_for_targets(&store, "leanprover/lean4:v4.35.0", &env["LEAN_PATH"], env, lean, &code, &[format!("clone_pool_{i}")], None, &[]).unwrap();
                     assert!(r.ok && r.kernel_gate_active, "{:?}", r.errors);
                     assert!(r.env_cache_hit, "clone must inherit the imported environment");
                     assert_eq!(r.import_us, 0);
+                    assert!(cloned.get(), "request must execute in a fork clone");
+                    let bad = code.replace("rfl", "by sorry");
+                    assert!(!eval_with_zygote_pool_for_targets(&store, "leanprover/lean4:v4.35.0", &env["LEAN_PATH"], env, lean, &bad, &[format!("clone_pool_{i}")], None, &[]).unwrap().ok);
+                    digest_test_hooks::clear();
                 })
             }).collect();
             for h in handles { h.join().unwrap(); }
