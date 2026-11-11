@@ -143,6 +143,9 @@ inductive TargetArch where
   | iosSimArm64
   | androidArm64
   | wasm32
+  | thumbv6m
+  | thumbv8mMain
+  | riscv32imac
   | nvptx64
   | hybridCpuGpu
   deriving Repr, DecidableEq, Inhabited, BEq
@@ -157,6 +160,9 @@ def triple : TargetArch → String
   | .iosSimArm64  => "arm64-apple-ios-simulator"
   | .androidArm64 => "aarch64-linux-android"
   | .wasm32       => "wasm32-unknown-unknown"
+  | .thumbv6m     => "thumbv6m-none-eabi"
+  | .thumbv8mMain => "thumbv8m.main-none-eabi"
+  | .riscv32imac  => "riscv32imac-unknown-none-elf"
   | .nvptx64      => "nvptx64-nvidia-cuda"
   | .hybridCpuGpu => "hybrid-cpu-nvptx64"
 
@@ -184,10 +190,21 @@ def isWasm : TargetArch → Bool
   | .wasm32 => true
   | _ => false
 
+/-- True for 32-bit ILP32 data-model targets (4-byte pointers and `size_t`/`usize`). -/
+def isILP32 : TargetArch → Bool
+  | .wasm32 | .thumbv6m | .thumbv8mMain | .riscv32imac => true
+  | _ => false
+
+/-- True for bare-metal freestanding embedded Ledger targets (BOLOS ARM Thumb & Vanadium RV32IMAC). -/
+def isFreestandingEmbedded : TargetArch → Bool
+  | .thumbv6m | .thumbv8mMain | .riscv32imac => true
+  | _ => false
+
 def llvmTriple : TargetArch → String
   | .macosArm64  => "arm64-apple-macosx14.0.0"
   | .iosArm64    => "arm64-apple-ios16.0.0"
   | .iosSimArm64 => "arm64-apple-ios16.0.0-simulator"
+  | .riscv32imac => "riscv32-unknown-none-elf"
   | t            => t.triple
 
 def dataLayout : TargetArch → String
@@ -195,6 +212,8 @@ def dataLayout : TargetArch → String
   | .arm64 | .androidArm64 => "e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128"
   | .macosArm64 | .iosArm64 | .iosSimArm64 => "e-m:o-i64:64-i128:128-n32:64-S128"
   | .wasm32 => "e-m:e-p:32:32-p10:8:8-p20:8:8-i64:64-n32:64-S128-ni:1:10:20"
+  | .thumbv6m | .thumbv8mMain => "e-m:e-p:32:32-Fi8-i64:64-v128:64:128-a:0:32-n32-S64"
+  | .riscv32imac => "e-m:e-p:32:32-i64:64-n32-S128"
   | .nvptx64 => "e-i64:64-i128:128-v16:16-v32:32-n16:32:64"
 
 /-- Default compile-time `IsaLevel` baseline for an AArch64 `TargetArch`
@@ -218,6 +237,12 @@ def clangFlags (t : TargetArch) (isaOverride? : Option IsaLevel := none) (wasmSi
   | .wasm32       =>
     let simdFlags := if wasmSimd128 then #["-msimd128"] else #[]
     #["--target=wasm32-unknown-unknown", "-O3", "-Wno-override-module"] ++ simdFlags
+  | .thumbv6m     =>
+    #["--target=thumbv6m-none-eabi", "-Oz", "-ffreestanding", "-fno-builtin", "-nostdlib", "-ffunction-sections", "-fdata-sections", "-fstack-usage", "-Wno-override-module"]
+  | .thumbv8mMain =>
+    #["--target=thumbv8m.main-none-eabi", "-Oz", "-ffreestanding", "-fno-builtin", "-nostdlib", "-ffunction-sections", "-fdata-sections", "-fstack-usage", "-Wno-override-module"]
+  | .riscv32imac  =>
+    #["--target=riscv32-unknown-none-elf", "-march=rv32imac", "-mabi=ilp32", "-Oz", "-ffreestanding", "-fno-builtin", "-nostdlib", "-ffunction-sections", "-fdata-sections", "-fstack-usage", "-Wno-override-module"]
   | _             => #[s!"--target={t.triple}", "-O3", "-fPIC", "-Wno-override-module"]
 
 end TargetArch

@@ -55,6 +55,9 @@ def parseTargetArch? : String → Option TargetArch
   | "ios-sim" | "ios-sim-arm64" | "arm64-apple-ios-simulator" => some .iosSimArm64
   | "android" | "android-arm64" | "aarch64-linux-android" | "pixel8" => some .androidArm64
   | "wasm" | "wasm32" | "wasm32-unknown-unknown" => some .wasm32
+  | "thumbv6m" | "thumbv6m-none-eabi" | "bolos-v6m" => some .thumbv6m
+  | "thumbv8m.main" | "thumbv8m-main" | "thumbv8mMain" | "thumbv8m.main-none-eabi" | "bolos-v8m" => some .thumbv8mMain
+  | "riscv32imac" | "riscv32imac-unknown-none-elf" | "riscv32-unknown-none-elf" | "rv32imac" | "vanadium" => some .riscv32imac
   | "nvptx" | "nvptx64" | "ptx" | "cuda" => some .nvptx64
   | "hybrid" | "hybrid-cpu-nvptx64" => some .hybridCpuGpu
   | _ => none
@@ -62,7 +65,7 @@ def parseTargetArch? : String → Option TargetArch
 def parseTargetArchIO (raw : String) : IO TargetArch := do
   match parseTargetArch? raw with
   | some t => return t
-  | none => throw <| IO.userError s!"[lean-native] Unsupported target architecture '{raw}' (expected x86_64, arm64, macos-arm64, ios-arm64, ios-sim-arm64, android-arm64, wasm32, nvptx64, or hybrid)"
+  | none => throw <| IO.userError s!"[lean-native] Unsupported target architecture '{raw}' (expected x86_64, arm64, macos-arm64, ios-arm64, ios-sim-arm64, android-arm64, wasm32, thumbv6m, thumbv8m.main, riscv32imac, nvptx64, or hybrid)"
 
 def parseTargetArch (raw : String) : TargetArch :=
   (parseTargetArch? raw).getD .x86_64

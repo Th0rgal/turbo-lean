@@ -360,15 +360,28 @@ def lowerDecl (d : LNIRDecl) : Option LLVMFn := do
   else
     none
 
+/-- Wrap a lowered `LLVMFn` into a single-function `LLVMModule` for `target`. -/
+def modOfFnForTarget (target : TargetArch) (fn : LLVMFn) : LLVMModule :=
+  { dataLayout := target.dataLayout
+  , triple := target.llvmTriple
+  , fns := [fn] }
+
 /-- Wrap a lowered `LLVMFn` into a single-function `LLVMModule`. -/
 def modOfFn (fn : LLVMFn) : LLVMModule :=
-  { dataLayout := TargetArch.x86_64.dataLayout
-  , triple := TargetArch.x86_64.llvmTriple
-  , fns := [fn] }
+  modOfFnForTarget .x86_64 fn
+
+/-- Lower an `LNIRDecl` to a single-function `LLVMModule` for `target`. -/
+def lowerModuleForTarget (target : TargetArch) (d : LNIRDecl) : Option LLVMModule :=
+  (lowerDecl d).map (modOfFnForTarget target)
+
+/-- Lower and pretty-print an `LNIRDecl` for `target` via `LLVMAst.PP.ppModule`. -/
+def ppLoweredDeclForTarget (target : TargetArch) (d : LNIRDecl) : Option String := do
+  let m ← lowerModuleForTarget target d
+  some (PP.ppModule m)
 
 /-- Lower an `LNIRDecl` to a single-function `LLVMModule`. -/
 def lowerModule (d : LNIRDecl) : Option LLVMModule :=
-  (lowerDecl d).map modOfFn
+  lowerModuleForTarget .x86_64 d
 
 /-- Lower and pretty-print an `LNIRDecl` via `LLVMAst.PP.ppModule`. -/
 def ppLoweredDecl (d : LNIRDecl) : Option String := do

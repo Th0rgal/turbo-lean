@@ -43,35 +43,26 @@ def findFlagValue (args : List String) (flag : String) (defaultVal : String) : S
   ((args.zip (args.drop 1)).find? (fun (f, _) => f == flag)).map Prod.snd |>.getD defaultVal
 
 def hasFlag (args : List String) (flag : String) : Bool := args.contains flag
-
 def hasTelemetryOptIn (args : List String) : Bool :=
   ["--telemetry", "--telemetry=metrics", "--telemetry=local", "--telemetry=full"].any args.contains &&
   !(args.contains "--no-telemetry" || args.contains "--telemetry=off" || args.contains "--telemetry=0")
-
 def valueTakingFlags : List String :=
   ["-o", "--arch", "--target", "--profile", "--sm", "--samples", "--lean",
-   "--input", "--lnir", "--emit-header", "--header", "--emit-rust", "--rust",
+   "--input", "--lnir", "--emit-header", "--header", "--emit-ll", "--emit-obj", "--emit-rust", "--rust",
    "--emit-fixtures", "--fixtures", "--emit-asm", "--asm", "--telemetry-spool",
    "--decl", "--args", "--cases-file", "--batch-file", "--fuel", "--clang-bin", "--ar-bin", "--emit-swift",
    "--swift", "--emit-modulemap", "--modulemap", "--emit-xcframework", "--xcframework",
    "--emit-swift-package-skeleton", "--base", "--artifact-bundle", "--stochastic-bundle",
    "--samples-json", "--corpus-json"]
-
 def validateValueTakingFlags : List String → IO Unit :=
   LeanNative.Driver.CostAutotuneCLI.validateFlagValues valueTakingFlags
-
 /-- The single input selected by `--lnir`, `--input`, `--lean` or a positional path (`flag = ""`: none given). -/
 structure InputSel where
   flag : String := ""
   path : String := ""
   deriving Repr, Inhabited, BEq
-
-/-- A `.lean` source to elaborate / extract signatures from (`--lnir` always parses LNIR wire/JSON). -/
 def InputSel.isLeanSource (s : InputSel) : Bool := s.flag != "--lnir" && s.path.endsWith ".lean"
-
 def moduleSelectorFlags : List String := ["--canonical-benchmark", "--canonical", "--fastcheck-sample", "--slot-regression"]
-
-/-- Every input selector in `args`, in order (`"<positional>"` for a bare path; explicit module-selector flags count too). -/
 def collectInputSelectors : List String → List (String × String)
   | [] => []
   | f :: v :: rest =>
@@ -80,8 +71,6 @@ def collectInputSelectors : List String → List (String × String)
     else if valueTakingFlags.contains f || (f == "--opt" && v.startsWith "-O") then collectInputSelectors rest
     else if f.startsWith "-" then collectInputSelectors (v :: rest) else ("<positional>", f) :: collectInputSelectors (v :: rest)
   | [a] => if moduleSelectorFlags.contains a then [(a, "")] else if a.startsWith "-" then [] else [("<positional>", a)]
-
-/-- Resolve the input ONCE; >1 selector (any mix of `--lnir` / `--input` / `--lean` / positional / module-flag) is a hard error. -/
 def resolveInput (args : List String) : IO InputSel := do
   match collectInputSelectors args with
   | [] => return {}
@@ -89,7 +78,6 @@ def resolveInput (args : List String) : IO InputSel := do
   | sels =>
     let fmt := sels.map fun (f, p) => if p.isEmpty then f else s!"{f} {p}"
     throw <| IO.userError s!"[lean-native] Conflicting input selectors ({", ".intercalate fmt}): pass exactly one of --lnir / --input / --lean / <positional>"
-
 structure CoreCLIOptions where
   inputPath : String := ""
   outputPath : String := ""
@@ -176,7 +164,7 @@ def loadInputModule (elaborateHook? : Option (String → TargetArch → IO LNIRM
         throw <| IO.userError s!"[lean-native-core] Cannot parse '{inFile}' as LNIR wire/JSON (use full 'lean-native' for .lean source elaboration)"
 
 private def writeOrPrint (outPath text : String) (msg? : Option String := none) : IO UInt32 := do
-  if outPath.isEmpty then IO.println text else writeTextAtomic outPath text; if let some m := msg? then IO.println m
+  if outPath.isEmpty then IO.println text else do writeTextAtomic outPath text; if let some m := msg? then IO.println m
   return 0
 private def writeAndPrintJsonOrSummary (outPath jsonText summaryText : String) (jsonFlag : Bool) : IO Unit := do
   if !outPath.isEmpty then writeTextAtomic outPath jsonText
@@ -192,57 +180,44 @@ def rejectLeanSourceWithoutFrontend (tag cmd : String) (elaborateHook? : Option 
 def runEmitCAbiBindings (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule))
     (args : List String) (preloaded? : Option (InputSel × LNIRModule) := none) : IO UInt32 := do
   validateValueTakingFlags args
-  -- one resolved input feeds BOTH signature extraction and the Stage 1D / A_L0 validation below
   let sel ← match preloaded? with | some (s, _) => pure s | none => resolveInput args
   let rawArch := findFlagValue args "--arch" (findFlagValue args "--target" "")
-  let width? ← if rawArch.isEmpty then pure none else (some ∘ ArchWidth.ofTargetArch) <$> parseTargetArchIO rawArch
-  let leanPath := sel.path
-  let hdrPath := findFlagValue args "--emit-header" (findFlagValue args "--header" "")
-  let rsPath := findFlagValue args "--emit-rust" (findFlagValue args "--rust" "")
-  let swiftPath := findFlagValue args "--emit-swift" (findFlagValue args "--swift" "")
-  let modMapPath := findFlagValue args "--emit-modulemap" (findFlagValue args "--modulemap" "")
-  let fixPath := findFlagValue args "--emit-fixtures" (findFlagValue args "--fixtures" "")
-  let outPath := findFlagValue args "-o" ""
-  let jsonFlag := hasFlag args "--json"
-  let sigOnly := hasFlag args "--signatures-only"
-  let isLean := sel.isLeanSource
+  let parsedArch? ← if rawArch.isEmpty then pure none else some <$> parseTargetArchIO rawArch
+  let (freestanding, width?) := (hasFlag args "--freestanding" || (parsedArch?.map (·.isFreestandingEmbedded) |>.getD false), parsedArch?.map ArchWidth.ofTargetArch)
+  let (leanPath, hdrPath, rsPath) := (sel.path, findFlagValue args "--emit-header" (findFlagValue args "--header" ""), findFlagValue args "--emit-rust" (findFlagValue args "--rust" ""))
+  let (swiftPath, modMapPath, fixPath) := (findFlagValue args "--emit-swift" (findFlagValue args "--swift" ""), findFlagValue args "--emit-modulemap" (findFlagValue args "--modulemap" ""), findFlagValue args "--emit-fixtures" (findFlagValue args "--fixtures" ""))
+  let (outPath, jsonFlag, sigOnly, isLean) := (findFlagValue args "-o" "", hasFlag args "--json", hasFlag args "--signatures-only", sel.isLeanSource)
   if sigOnly && !isLean then throw <| IO.userError s!"[{tag}] --signatures-only requires a .lean source input"
-  -- P-cert C4: without the elaborating frontend a `.lean` source cannot pass the Stage 1D (RC-ADT) gate, so
-  -- bindings come only from `--signatures-only` (scalar exported signatures, recorded as ungated).
+  if sigOnly && freestanding then throw <| IO.userError s!"[{tag}] --freestanding cannot be combined with --signatures-only"
   if isLean && elaborateHook?.isNone && !sigOnly then
     throw <| IO.userError s!"[{tag}] Cannot apply the Stage 1D (RC-ADT) gate to '{leanPath}' without the elaborating frontend; use full 'lean-native', or pass --signatures-only for scalar exported-signature bindings"
   let loadMod : IO LNIRModule := match preloaded? with | some (_, m) => pure m | none => loadInputModule elaborateHook? args (sel? := some sel)
+  let enforceFreestanding (m : LNIRModule) : IO Unit := do
+    if freestanding then
+      if let some (dName, reason) := checkFreestandingModule m (parsedArch?.getD .x86_64) then
+        throw <| IO.userError s!"[{tag}] Freestanding verification gate rejected '{dName}': {reason}"
   let (sigs, guards, srcLabel) ←
     if isLean && sigOnly then
       if !(← System.FilePath.pathExists leanPath) then throw <| IO.userError s!"[lean-native] Input file '{leanPath}' does not exist"
       match extractSignaturesOnlyCAbi (← readLeanSourceExpandingUmbrella leanPath) with
-      | .ok (s, g) => pure (s, g, leanPath)
-      | .error e => throw <| IO.userError s!"[{tag}] --signatures-only: {e} in '{leanPath}'"
+      | .ok (s, g) => pure (s, g, leanPath) | .error e => throw <| IO.userError s!"[{tag}] --signatures-only: {e} in '{leanPath}'"
     else if isLean then
       if !(← System.FilePath.pathExists leanPath) then throw <| IO.userError s!"[lean-native] Input file '{leanPath}' does not exist"
       let (s, g) := extractLeanSourceCAbiAndGuards (← readLeanSourceExpandingUmbrella leanPath)
-      -- C4: (only reachable with the elaborating frontend) ingest first so a Stage 1D (RC-ADT) decl is a hard error
-      -- before any prototype is emitted, even when the source signatures alone would have produced a header.
-      let m ← loadMod
-      pure (if s.isEmpty then moduleToCAbiSigs (runDefaultPipeline m).1 else s, g, leanPath)
+      let optM := (runDefaultPipeline (← loadMod)).1; enforceFreestanding optM
+      pure (if s.isEmpty then moduleToCAbiSigs optM else s, g, leanPath)
     else
-      let m ← loadMod
-      pure (moduleToCAbiSigs (runDefaultPipeline m).1, [], if leanPath.isEmpty then m.moduleName else leanPath)
+      let m ← loadMod; let optM := (runDefaultPipeline m).1; enforceFreestanding optM
+      pure (moduleToCAbiSigs optM, [], if leanPath.isEmpty then m.moduleName else leanPath)
   let note? := if sigOnly then some signaturesOnlyMarker else none
-  let hdrText := emitCAbiHeaderFromSigs sigs note? width?
-  let rsText := emitCAbiRustFromSigs sigs note?
-  let swiftText := emitCAbiSwiftFromSigs sigs (note? := note?)
-  let fixText := emitGuardFixturesJson srcLabel sigs guards note?
+  let (hdrText, rsText, swiftText, fixText) := (emitCAbiHeaderFromSigs sigs note? width?, emitCAbiRustFromSigs sigs note?, emitCAbiSwiftFromSigs sigs (note? := note?), emitGuardFixturesJson srcLabel sigs guards note?)
   if !hdrPath.isEmpty then writeTextAtomic hdrPath hdrText
   if !rsPath.isEmpty then writeTextAtomic rsPath rsText
   if !swiftPath.isEmpty then writeTextAtomic swiftPath swiftText
-  if !modMapPath.isEmpty then
-    let hdrBase := if hdrPath.isEmpty then "turbo_lean_cabi.h" else ((System.FilePath.mk hdrPath).fileName.getD "turbo_lean_cabi.h")
-    writeTextAtomic modMapPath (emitModuleMap "TurboLeanCABI" hdrBase note?)
+  if !modMapPath.isEmpty then writeTextAtomic modMapPath (emitModuleMap "TurboLeanCABI" (if hdrPath.isEmpty then "turbo_lean_cabi.h" else ((System.FilePath.mk hdrPath).fileName.getD "turbo_lean_cabi.h")) note?)
   if !fixPath.isEmpty then writeTextAtomic fixPath fixText
   if !outPath.isEmpty then writeTextAtomic outPath (if jsonFlag then fixText else hdrText)
-  if jsonFlag || (hdrPath.isEmpty && rsPath.isEmpty && swiftPath.isEmpty && modMapPath.isEmpty && fixPath.isEmpty && outPath.isEmpty) then
-    IO.print fixText
+  if jsonFlag || [hdrPath, rsPath, swiftPath, modMapPath, fixPath, outPath].all (·.isEmpty) then IO.print fixText
   else IO.println s!"[{tag}] Emitted C-ABI bindings (exports={sigs.length}, guards={guards.length}, header={hdrPath}, rust={rsPath}, swift={swiftPath}, fixtures={fixPath}{if sigOnly then s!", {signaturesOnlyMarker}" else ""})"
   return 0
 
@@ -268,23 +243,40 @@ def runCompileMode (tag : String) (elaborateHook? : Option (String → TargetArc
   else if opts.emitPTX then writeOrPrint opts.outputPath (emitPTXModule optMod opts.smArch)
   else if opts.emitMetal then writeOrPrint opts.outputPath (emitMetalModule optMod)
   else
-    writeOrPrint opts.outputPath (if opts.isBaseline then emitLLVMBaseline optMod opts.arch none wasmSimd128 else emitLLVMOptimized optMod opts.arch none wasmSimd128)
+    let freestanding := hasFlag args "--freestanding" || opts.arch.isFreestandingEmbedded
+    if freestanding then
+      match emitLLVMFreestanding? optMod opts.arch (!opts.isBaseline) none wasmSimd128 with
+      | .error err => throw <| IO.userError s!"[{tag}] {err}"
+      | .ok irText => writeOrPrint opts.outputPath irText
+    else
+      writeOrPrint opts.outputPath (if opts.isBaseline then emitLLVMBaseline optMod opts.arch none wasmSimd128 false else emitLLVMOptimized optMod opts.arch none wasmSimd128 false)
 
 def runCompileLLVM (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
   validateValueTakingFlags args
   let arch ← parseTargetArchIO (findFlagValue args "--arch" (findFlagValue args "--target" "x86_64"))
   let isBaseline := hasFlag args "--baseline"
   let wasmSimd128 := hasFlag args "--wasm-simd128"
+  let freestanding := hasFlag args "--freestanding" || arch.isFreestandingEmbedded
   let outPath := findFlagValue args "-o" ""
   let baseMod ← if hasFlag args "--slot-regression" then pure slotTypeRegressionModule else loadInputModule elaborateHook? args
   if hasTelemetryOptIn args then
     let telCfg ← TelemetryConfig.probe args
     let _ ← emitModuleTelemetryEvents telCfg .x86_64 false baseMod
   let (modToEmit, _) ← if isBaseline then pure (baseMod, []) else runOptPipelineWithArgs args false baseMod
+  if freestanding && !(hasFlag args "--slot-regression") then
+    match emitLLVMFreestanding? modToEmit arch (!isBaseline) none wasmSimd128 with
+    | .error err => throw <| IO.userError s!"[{tag}] {err}"
+    | .ok irText =>
+      let hdrPath := findFlagValue args "--emit-header" (findFlagValue args "--header" "")
+      if !hdrPath.isEmpty then
+        let sigs := moduleToCAbiSigs modToEmit
+        writeTextAtomic hdrPath (emitCAbiHeaderFromSigs sigs (width? := some (ArchWidth.ofTargetArch arch)))
+      return (← writeOrPrint outPath irText
+        (some s!"[{tag}] Wrote freestanding LLVM 18 IR ({arch.triple}, baseline={isBaseline}, decls={modToEmit.decls.length}) to {outPath}"))
   -- `--slot-regression` is the fixed in-tree slot-typing fixture (its `ptr` slots are the point of the test)
   if let some (dName, callee) := if hasFlag args "--slot-regression" then none else findUnsupportedLLVMCall? modToEmit arch then
     throw <| IO.userError s!"[{tag}] Unsupported external or non-scalar call '{callee}' in '{dName}'"
-  let irText := if isBaseline then emitLLVMBaseline modToEmit arch none wasmSimd128 else emitLLVMOptimized modToEmit arch none wasmSimd128
+  let irText := if isBaseline then emitLLVMBaseline modToEmit arch none wasmSimd128 false else emitLLVMOptimized modToEmit arch none wasmSimd128 false
   writeOrPrint outPath irText (some s!"[{tag}] Wrote LLVM 18 IR ({arch.triple}, baseline={isBaseline}, decls={modToEmit.decls.length}) to {outPath}")
 
 def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
@@ -292,17 +284,12 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → Targ
   let arch ← parseTargetArchIO (findFlagValue args "--arch" (findFlagValue args "--target" "x86_64"))
   if arch == .nvptx64 || arch == .hybridCpuGpu || arch == .wasm32 then
     throw <| IO.userError s!"[{tag}] Static archive verification unsupported for {arch.triple}"
-  let wasmSimd128 := hasFlag args "--wasm-simd128"
-  let outPath := findFlagValue args "-o" "/tmp/liblean_native_kernels.a"
+  let (wasmSimd128, jsonFlag, outPath) := (hasFlag args "--wasm-simd128", hasFlag args "--json", findFlagValue args "-o" "/tmp/liblean_native_kernels.a")
   let headerPath := findFlagValue args "--emit-header" (findFlagValue args "--header" (outPath ++ ".h"))
-  let rustPath := findFlagValue args "--emit-rust" (findFlagValue args "--rust" "")
-  let swiftPath := findFlagValue args "--emit-swift" (findFlagValue args "--swift" "")
+  let (rustPath, swiftPath) := (findFlagValue args "--emit-rust" (findFlagValue args "--rust" ""), findFlagValue args "--emit-swift" (findFlagValue args "--swift" ""))
   let xcfwDir := findFlagValue args "--emit-xcframework" (findFlagValue args "--xcframework" (findFlagValue args "--emit-swift-package-skeleton" ""))
-  let fixPath := findFlagValue args "--emit-fixtures" (findFlagValue args "--fixtures" "")
-  let asmPath := findFlagValue args "--emit-asm" (findFlagValue args "--asm" "")
-  let clangBin := findFlagValue args "--clang-bin" "clang"
-  let arBin := findFlagValue args "--ar-bin" ""
-  let jsonFlag := hasFlag args "--json"
+  let (fixPath, asmPath) := (findFlagValue args "--emit-fixtures" (findFlagValue args "--fixtures" ""), findFlagValue args "--emit-asm" (findFlagValue args "--asm" ""))
+  let (clangBin, arBin) := (findFlagValue args "--clang-bin" "clang", findFlagValue args "--ar-bin" "")
   if !xcfwDir.isEmpty then throw <| IO.userError s!"[{tag}] XCFramework packaging is unsupported; emit a standalone archive instead"
   let destinations := ([outPath, headerPath, rustPath, swiftPath, fixPath, asmPath].filter (!·.isEmpty)).map (fun p => (System.FilePath.mk p).normalize.toString)
   if destinations.eraseDups.length != destinations.length then throw <| IO.userError s!"[{tag}] Output paths must be distinct"
@@ -312,16 +299,17 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → Targ
   rejectLeanSourceWithoutFrontend tag "compile-static-lib" elaborateHook? args
   let baseMod ← loadInputModule elaborateHook? args (sel? := some sel)
   let (optMod, _) ← runOptPipelineWithArgs args false baseMod
+  let freestanding := hasFlag args "--freestanding" || arch.isFreestandingEmbedded
+  if freestanding then
+    if let some (dName, reason) := checkFreestandingModule optMod arch then
+      throw <| IO.userError s!"[{tag}] Freestanding verification gate rejected '{dName}': {reason}"
   if let some (dName, callee) := findUnsupportedLLVMCall? optMod arch then
     throw <| IO.userError s!"[{tag}] Unsupported external or non-scalar call '{callee}' in '{dName}'"
-  let (sigs, guards) ←
-    if sel.isLeanSource then
-      let src ← readLeanSourceExpandingUmbrella sel.path
-      let (srcSigs, srcGuards) := extractLeanSourceCAbiAndGuards src
+  let (sigs, guards) ← if sel.isLeanSource then
+      let (srcSigs, srcGuards) := extractLeanSourceCAbiAndGuards (← readLeanSourceExpandingUmbrella sel.path)
       pure (if srcSigs.isEmpty then moduleToCAbiSigs optMod else srcSigs, srcGuards)
     else pure (moduleToCAbiSigs optMod, [])
-  let irText := emitLLVMOptimized optMod arch none wasmSimd128
-  let hdrText := emitCAbiHeaderFromSigs sigs (width? := some (ArchWidth.ofTargetArch arch))
+  let (irText, hdrText) := (emitLLVMOptimized optMod arch none wasmSimd128 freestanding, emitCAbiHeaderFromSigs sigs (width? := some (ArchWidth.ofTargetArch arch)))
   let nonce ← IO.monoNanosNow
   let (tmpLl, tmpObj, tmpArchive, tmpAsm) := (s!"{outPath}.{nonce}.tmp.ll", s!"{outPath}.{nonce}.tmp.o", s!"{outPath}.{nonce}.tmp.a", s!"{asmPath}.{nonce}.tmp.s")
   IO.FS.writeFile tmpLl irText
@@ -333,8 +321,7 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → Targ
   if !asmPath.isEmpty then
     let (asmOk, asmErr) ← runCmd clangBin (cpuFlags ++ #["-S", tmpLl, "-o", tmpAsm])
     if !asmOk then
-      try IO.FS.removeFile tmpLl catch _ => pure ()
-      try IO.FS.removeFile tmpAsm catch _ => pure ()
+      (try IO.FS.removeFile tmpLl catch _ => pure ()); (try IO.FS.removeFile tmpAsm catch _ => pure ())
       throw <| IO.userError s!"[{tag}] Failed to emit assembly via '{clangBin}': {asmErr}"
     let rawAsm ← try IO.FS.readFile tmpAsm catch _ => pure ""
     try IO.FS.removeFile tmpAsm catch _ => pure ()
@@ -349,43 +336,28 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → Targ
     throw <| IO.userError s!"[{tag}] Failed to compile object for {arch.triple} via '{clangBin}' (previous output preserved): {clangErr}"
   let objBytes ← IO.FS.readBinFile tmpObj
   let (objValid, objFormatDesc) := verifyObjectBytesForTarget arch objBytes
-  if !objValid then
-    try IO.FS.removeFile tmpObj catch _ => pure ()
-    throw <| IO.userError s!"[{tag}] Object verification failed for {arch.triple}: {objFormatDesc}"
-  let (builtArchive, arErr) ←
-    if !arBin.isEmpty then runCmd arBin #["rcs", tmpArchive, tmpObj]
-    else do
-      let (ok1, err1) ← runCmd "llvm-ar" #["rcs", tmpArchive, tmpObj]
-      if ok1 then pure (true, "")
-      else let (ok2, err2) ← runCmd "ar" #["rcs", tmpArchive, tmpObj]; pure (ok2, if err1.isEmpty then err2 else s!"{err1}; {err2}")
+  if !objValid then do (try IO.FS.removeFile tmpObj catch _ => pure ()); throw <| IO.userError s!"[{tag}] Object verification failed for {arch.triple}: {objFormatDesc}"
+  let (builtArchive, arErr) ← if !arBin.isEmpty then runCmd arBin #["rcs", tmpArchive, tmpObj] else do
+    let (ok1, err1) ← runCmd "llvm-ar" #["rcs", tmpArchive, tmpObj]
+    if ok1 then pure (true, "") else do let (ok2, err2) ← runCmd "ar" #["rcs", tmpArchive, tmpObj]; pure (ok2, if err1.isEmpty then err2 else s!"{err1}; {err2}")
   try IO.FS.removeFile tmpObj catch _ => pure ()
-  if !builtArchive then
-    try IO.FS.removeFile tmpArchive catch _ => pure ()
-    throw <| IO.userError s!"[{tag}] Failed to build static archive for {arch.triple} (previous output preserved): {arErr}"
+  if !builtArchive then do (try IO.FS.removeFile tmpArchive catch _ => pure ()); throw <| IO.userError s!"[{tag}] Failed to build static archive for {arch.triple} (previous output preserved): {arErr}"
   let (archValid, archDesc) ← verifyStaticArchiveFile tmpArchive objBytes
-  if !archValid then
-    try IO.FS.removeFile tmpArchive catch _ => pure ()
-    throw <| IO.userError s!"[{tag}] Static archive verification failed: {archDesc}"
+  if !archValid then do (try IO.FS.removeFile tmpArchive catch _ => pure ()); throw <| IO.userError s!"[{tag}] Static archive verification failed: {archDesc}"
   let bundlePath := findFlagValue args "--artifact-bundle" ""
-  let mut pendingRenames : List (String × String) := []
-  let mut backups : List (String × String) := []
-  let mut installed : List String := []
+  let (pendingRenames, backups, installed) := (([] : List (String × String)), ([] : List (String × String)), ([] : List String))
+  let mut pendingRenames := pendingRenames; let mut backups := backups; let mut installed := installed
   let toStage : List (String × String) :=
-    ([(headerPath, hdrText), (rustPath, emitCAbiRustFromSigs sigs),
-      (swiftPath, emitCAbiSwiftFromSigs sigs), (fixPath, emitGuardFixturesJson optMod.moduleName sigs guards)] ++
+    ([(headerPath, hdrText), (rustPath, emitCAbiRustFromSigs sigs), (swiftPath, emitCAbiSwiftFromSigs sigs), (fixPath, emitGuardFixturesJson optMod.moduleName sigs guards)] ++
      (match stagedCleanAsm with | some cleanAsm => [(asmPath, cleanAsm)] | none => [])).filter (fun (d, _) => !d.isEmpty)
   let mut publishedGeneration := ""
   if !bundlePath.isEmpty then
-    try
-      publishedGeneration ← publishArtifactBundle bundlePath ((outPath, ← IO.FS.readBinFile tmpArchive) ::
-        toStage.map (fun (dest, text) => (dest, text.toUTF8)))
-    finally
-      try IO.FS.removeFile tmpArchive catch _ => pure ()
+    try publishedGeneration ← publishArtifactBundle bundlePath ((outPath, ← IO.FS.readBinFile tmpArchive) :: toStage.map (fun (dest, text) => (dest, text.toUTF8)))
+    finally try IO.FS.removeFile tmpArchive catch _ => pure ()
   else
     pendingRenames := toStage.map (fun (dest, _) => (s!"{dest}.tmp.{nonce}.stage", dest))
     try
-      for (dest, text) in toStage do
-        IO.FS.writeFile s!"{dest}.tmp.{nonce}.stage" text
+      for (dest, text) in toStage do IO.FS.writeFile s!"{dest}.tmp.{nonce}.stage" text
       for (_, dest) in (tmpArchive, outPath) :: pendingRenames do
         if ← System.FilePath.pathExists dest then
           let backup := s!"{dest}.tmp.{nonce}.backup"
@@ -401,10 +373,78 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → Targ
     for (backup, _) in backups do try IO.FS.removeFile backup catch _ => pure ()
   let published (path : String) := if bundlePath.isEmpty || path.isEmpty then path
     else (System.FilePath.mk publishedGeneration / (System.FilePath.mk path).fileName.getD "").toString
-  if jsonFlag then
-    IO.println s!"\{\"status\":\"compiled_static_lib\",\"archive\":true,\"objectFormat\":\"{objFormatDesc}\",\"target\":\"{arch.triple}\",\"bundle\":\"{bundlePath}\",\"generation\":\"{publishedGeneration}\",\"publication\":\"{if bundlePath.isEmpty then "per-file-atomic" else "generation-pointer"}\",\"library\":\"{published outPath}\",\"asm\":\"{published asmPath}\",\"header\":\"{published headerPath}\",\"rust\":\"{published rustPath}\",\"decls\":{optMod.decls.length}}"
-  else
-    IO.println s!"[{tag}] Wrote C-ABI static library ({published outPath}, archive=true, format={objFormatDesc}) and header ({published headerPath}, decls={optMod.decls.length})"
+  IO.println (if jsonFlag then s!"\{\"status\":\"compiled_static_lib\",\"archive\":true,\"objectFormat\":\"{objFormatDesc}\",\"target\":\"{arch.triple}\",\"bundle\":\"{bundlePath}\",\"generation\":\"{publishedGeneration}\",\"publication\":\"{if bundlePath.isEmpty then "per-file-atomic" else "generation-pointer"}\",\"library\":\"{published outPath}\",\"asm\":\"{published asmPath}\",\"header\":\"{published headerPath}\",\"rust\":\"{published rustPath}\",\"decls\":{optMod.decls.length}}"
+    else s!"[{tag}] Wrote C-ABI static library ({published outPath}, archive=true, format={objFormatDesc}) and header ({published headerPath}, decls={optMod.decls.length})")
+  return 0
+
+/-- Freestanding Ledger/embedded C99 library emitter (`emit-freestanding-c-lib`). -/
+def runEmitFreestandingCLib (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
+  validateValueTakingFlags args
+  let arch ← parseTargetArchIO (findFlagValue args "--target" (findFlagValue args "--arch" "thumbv6m"))
+  if arch == .nvptx64 || arch == .hybridCpuGpu then
+    throw <| IO.userError s!"[{tag}] emit-freestanding-c-lib unsupported for GPU target {arch.triple}"
+  let (isBaseline, wasmSimd128, jsonFlag) := (hasFlag args "--baseline", hasFlag args "--wasm-simd128", hasFlag args "--json")
+  let outPath := findFlagValue args "-o" s!"/tmp/liblean_freestanding_{arch.triple}.a"
+  let stemPath :=
+    if outPath.endsWith ".a" || outPath.endsWith ".o" then (outPath.dropEnd 2).toString
+    else if outPath.endsWith ".ll" then (outPath.dropEnd 3).toString else outPath
+  let llPath := findFlagValue args "--emit-ll" (if outPath.endsWith ".ll" then outPath else stemPath ++ ".ll")
+  let hdrPath := findFlagValue args "--emit-header" (findFlagValue args "--header" (stemPath ++ ".h"))
+  let objPath := findFlagValue args "--emit-obj" (if outPath.endsWith ".o" then outPath else if outPath.endsWith ".a" then stemPath ++ ".o" else "")
+  let (archivePath, clangBin, arBin) := (if outPath.endsWith ".a" then outPath else "", findFlagValue args "--clang-bin" "clang", findFlagValue args "--ar-bin" "")
+  let noObj := hasFlag args "--no-obj" || (outPath.endsWith ".ll" && (findFlagValue args "--emit-obj" "").isEmpty)
+  let sel ← resolveInput args
+  rejectLeanSourceWithoutFrontend tag "emit-freestanding-c-lib" elaborateHook? args
+  let baseMod ← loadInputModule elaborateHook? args (sel? := some sel)
+  let (optMod, _) ← if isBaseline then pure (baseMod, []) else runOptPipelineWithArgs args false baseMod
+  let irText ← match emitLLVMFreestanding? optMod arch (!isBaseline) none wasmSimd128 with
+    | .ok ir => pure ir | .error err => throw <| IO.userError s!"[{tag}] {err}"
+  let sigs ← if sel.isLeanSource then
+      let (srcSigs, _) := extractLeanSourceCAbiAndGuards (← readLeanSourceExpandingUmbrella sel.path)
+      pure (if srcSigs.isEmpty then moduleToCAbiSigs optMod else srcSigs)
+    else pure (moduleToCAbiSigs optMod)
+  let hdrText := emitCAbiHeaderFromSigs sigs (width? := some (ArchWidth.ofTargetArch arch))
+  if (hdrText.splitOn "<stdlib.h>").length > 1 || (hdrText.splitOn "<stdio.h>").length > 1 then
+    throw <| IO.userError s!"[{tag}] Internal invariant violation: hosted header detected in freestanding C99 header"
+  writeTextAtomic llPath irText; writeTextAtomic hdrPath hdrText
+  if noObj then
+    IO.println (if jsonFlag then s!"\{\"status\":\"emitted_freestanding_ir_and_header\",\"target\":\"{arch.triple}\",\"ll\":\"{llPath}\",\"header\":\"{hdrPath}\",\"decls\":{optMod.decls.length}}"
+      else s!"[{tag}] Wrote freestanding LLVM IR ({llPath}) and C99 header ({hdrPath}) for {arch.triple} (decls={optMod.decls.length})")
+    return 0
+  let effObjPath := if objPath.isEmpty then stemPath ++ ".o" else objPath
+  let ensureFlag (fs : Array String) (f : String) : Array String := if fs.contains f then fs else fs.push f
+  let clangFlags := ["-ffreestanding", "-fno-builtin", "-nostdlib", "-ffunction-sections", "-fdata-sections", "-fstack-usage"].foldl ensureFlag (arch.clangFlags none wasmSimd128)
+  let clangRes ← IO.Process.output { cmd := clangBin, args := clangFlags ++ #["-c", llPath, "-o", effObjPath] }
+  if clangRes.exitCode != 0 || !(← System.FilePath.pathExists effObjPath) then
+    throw <| IO.userError s!"[{tag}] Failed to compile freestanding object for {arch.triple} via '{clangBin}': {clangRes.stderr.trimAscii.toString}"
+  let objBytes ← IO.FS.readBinFile effObjPath
+  let (objValid, objFormatDesc) := verifyObjectBytesForTarget arch objBytes
+  if !objValid then throw <| IO.userError s!"[{tag}] Freestanding object verification failed for {arch.triple}: {objFormatDesc}"
+  let nmRes ← try
+      let r ← IO.Process.output { cmd := "llvm-nm", args := #[effObjPath] }
+      if r.exitCode == 0 then pure r else IO.Process.output { cmd := "nm", args := #[effObjPath] }
+    catch _ => IO.Process.output { cmd := "nm", args := #[effObjPath] }
+  if nmRes.exitCode != 0 then throw <| IO.userError s!"[{tag}] Symbol audit ('llvm-nm') failed on '{effObjPath}': {nmRes.stderr.trimAscii.toString}"
+  let nmLines := (nmRes.stdout.splitOn "\n").map (·.trimAscii.toString) |>.filter (!·.isEmpty)
+  let undefSyms := nmLines.filter fun ln => ln.startsWith "U " || (ln.splitOn " U ").length > 1
+  if !undefSyms.isEmpty then throw <| IO.userError s!"[{tag}] Freestanding object '{effObjPath}' has forbidden undefined runtime symbols: {", ".intercalate undefSyms}"
+  let forbiddenSubstrs := ["malloc", "free", "lean_alloc_", "lean_inc", "lean_dec", "lean_mark_mt", "lean_native_ensure_exclusive", "lean_native_box_u64"]
+  let badHeapSyms := nmLines.filter fun ln => forbiddenSubstrs.any fun sub => (ln.splitOn sub).length > 1
+  if !badHeapSyms.isEmpty then throw <| IO.userError s!"[{tag}] Freestanding object '{effObjPath}' references forbidden heap/runtime symbols: {", ".intercalate badHeapSyms}"
+  let suPath := if effObjPath.endsWith ".o" then (effObjPath.dropEnd 2).toString ++ ".su" else effObjPath ++ ".su"
+  let suExists ← System.FilePath.pathExists suPath
+  if !archivePath.isEmpty then
+    let runAr (cmd : String) : IO (Bool × String) := do
+      try let r ← IO.Process.output { cmd, args := #["rcs", archivePath, effObjPath] }; return (r.exitCode == 0, r.stderr.trimAscii.toString)
+      catch e => return (false, toString e)
+    let (arOk, arErr) ← if !arBin.isEmpty then runAr arBin else do
+      let (ok1, err1) ← runAr "llvm-ar"
+      if ok1 then pure (true, "") else do let (ok2, err2) ← runAr "ar"; pure (ok2, if err1.isEmpty then err2 else s!"{err1}; {err2}")
+    if !arOk then throw <| IO.userError s!"[{tag}] Failed to package freestanding archive '{archivePath}': {arErr}"
+    let (archValid, archDesc) ← verifyStaticArchiveFile archivePath objBytes
+    if !archValid then throw <| IO.userError s!"[{tag}] Freestanding archive verification failed: {archDesc}"
+  IO.println (if jsonFlag then s!"\{\"status\":\"compiled_freestanding_c_lib\",\"target\":\"{arch.triple}\",\"objectFormat\":\"{objFormatDesc}\",\"ll\":\"{llPath}\",\"header\":\"{hdrPath}\",\"object\":\"{effObjPath}\",\"archive\":\"{archivePath}\",\"stackUsage\":\"{if suExists then suPath else ""}\",\"undefinedSymbols\":0,\"decls\":{optMod.decls.length}}"
+    else s!"[{tag}] Wrote freestanding C99 bundle for {arch.triple} (format={objFormatDesc}, ll={llPath}, header={hdrPath}, obj={effObjPath}{if archivePath.isEmpty then "" else s!", archive={archivePath}"}{if suExists then s!", stackUsage={suPath}" else ""}, undefSyms=0, decls={optMod.decls.length})")
   return 0
 
 def runCompileMLIR (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
@@ -427,40 +467,29 @@ def runCompileMetal (tag : String) (elaborateHook? : Option (String → TargetAr
   let baseMod ← loadInputModule elaborateHook? args isFastCheck
   let mslText ← if isFastCheck then pure (emitFastCheckMetal baseMod) else pure (emitMetalModule (← runOptPipelineWithArgs args false baseMod).1)
   let (valid, errs) := validateMetalShader mslText
-  if !valid then IO.eprintln s!"[{tag}] Metal shader validation errors: {errs}"; return 1
+  if !valid then do IO.eprintln s!"[{tag}] Metal shader validation errors: {errs}"; return 1
   writeOrPrint outPath mslText (some s!"[{tag}] Wrote Apple Metal Shading Language 3.0 (fastcheck={isFastCheck}, valid={valid}) to {outPath}")
 
 def runCompileFastCheck (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
-  let outPath := findFlagValue args "-o" ""
-  let smArch := findFlagValue args "--sm" "sm_90"
-  let numSamples := (findFlagValue args "--samples" "4096").toNat?.getD 4096
-  let useConstraintProp := !(hasFlag args "--no-constraint-prop")
-  let jsonFlag := hasFlag args "--json"
+  let (outPath, smArch, numSamples) := (findFlagValue args "-o" "", findFlagValue args "--sm" "sm_90", (findFlagValue args "--samples" "4096").toNat?.getD 4096)
+  let (useConstraintProp, jsonFlag) := (!(hasFlag args "--no-constraint-prop"), hasFlag args "--json")
   let mod ← loadInputModule elaborateHook? args true
-  if hasFlag args "--c-abi" || hasFlag args "--emit-c-abi" then
-    writeOrPrint outPath (LeanNative.Backend.emitFastCheckCABI mod) (some s!"[{tag}] Wrote FastCheck Zero-Boxing C-ABI SIMD source to {outPath}")
-  else if hasFlag args "--emit-llvm" then
-    writeOrPrint outPath (emitFastCheckLLVM mod) (some s!"[{tag}] Wrote FastCheck SIMD LLVM 18 IR to {outPath}")
-  else if hasFlag args "--emit-ptx" then
-    writeOrPrint outPath (emitFastCheckPTX mod smArch) (some s!"[{tag}] Wrote FastCheck NVIDIA PTX 8.0 ({smArch}) to {outPath}")
-  else if hasFlag args "--emit-metal" then
-    writeOrPrint outPath (emitFastCheckMetal mod) (some s!"[{tag}] Wrote FastCheck Apple Metal 3.0 shader to {outPath}")
+  if hasFlag args "--c-abi" || hasFlag args "--emit-c-abi" then writeOrPrint outPath (LeanNative.Backend.emitFastCheckCABI mod) (some s!"[{tag}] Wrote FastCheck Zero-Boxing C-ABI SIMD source to {outPath}")
+  else if hasFlag args "--emit-llvm" then writeOrPrint outPath (emitFastCheckLLVM mod) (some s!"[{tag}] Wrote FastCheck SIMD LLVM 18 IR to {outPath}")
+  else if hasFlag args "--emit-ptx" then writeOrPrint outPath (emitFastCheckPTX mod smArch) (some s!"[{tag}] Wrote FastCheck NVIDIA PTX 8.0 ({smArch}) to {outPath}")
+  else if hasFlag args "--emit-metal" then writeOrPrint outPath (emitFastCheckMetal mod) (some s!"[{tag}] Wrote FastCheck Apple Metal 3.0 shader to {outPath}")
   else
     let report := runFastCheckModule mod numSamples useConstraintProp
-    writeAndPrintJsonOrSummary outPath report.toJson report.formatSummary jsonFlag
-    return 0
+    writeAndPrintJsonOrSummary outPath report.toJson report.formatSummary jsonFlag; return 0
 
 def runCompileHybrid (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
-  let outPath := findFlagValue args "-o" ""
-  let profilePath := findFlagValue args "--profile" ""
+  let (outPath, profilePath) := (findFlagValue args "-o" "", findFlagValue args "--profile" "")
   let mut minGpuElems : Nat := 65536
   if !profilePath.isEmpty then
-    let profRaw ← IO.FS.readFile profilePath
-    match HardwareCostProfile.fromJson? profRaw with
+    match HardwareCostProfile.fromJson? (← IO.FS.readFile profilePath) with
     | some p => minGpuElems := p.minGpuElements
     | none => throw <| IO.userError s!"[{tag}] Failed to parse hardware profile from '{profilePath}'"
-  let baseMod ← loadInputModule elaborateHook? args
-  let (optMod, _) ← runOptPipelineWithArgs args false baseMod
+  let (optMod, _) ← runOptPipelineWithArgs args false (← loadInputModule elaborateHook? args)
   let plan := partitionModule optMod minGpuElems
   let glueText := emitHybridHostGlue plan
   writeOrPrint outPath glueText
@@ -754,12 +783,8 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
     let androidIr := emitLLVMOptimized optMod .androidArm64
     let tmpDir := (← IO.getEnv "TMPDIR").getD "/tmp"
     let tmpLl := s!"{tmpDir}/ln_sve2_verify.ll"
-    let home := (← IO.getEnv "HOME").getD "/root"
-    let sysroot := (← IO.getEnv "LEAN_SYSROOT").getD ""
-    let rawClangEnv := (← IO.getEnv "LEAN_NATIVE_CLANG_RAW").getD ""
-    let clangCandidates :=
-      (if rawClangEnv.isEmpty then [] else [rawClangEnv]) ++
-      (if sysroot.isEmpty then [] else [s!"{sysroot}/bin/clang"]) ++
+    let (home, sysroot, rawClangEnv) := ((← IO.getEnv "HOME").getD "/root", (← IO.getEnv "LEAN_SYSROOT").getD "", (← IO.getEnv "LEAN_NATIVE_CLANG_RAW").getD "")
+    let clangCandidates := (if rawClangEnv.isEmpty then [] else [rawClangEnv]) ++ (if sysroot.isEmpty then [] else [s!"{sysroot}/bin/clang"]) ++
       [s!"{home}/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang", s!"{home}/.elan/toolchains/leanprover--lean4---v4.31.0/bin/clang", "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang", "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin/clang"]
     let mut clangCmd := "clang"
     for cand in clangCandidates do
@@ -768,15 +793,12 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
       IO.FS.writeFile tmpLl androidIr
       let out ← IO.Process.output { cmd := clangCmd, args := #["--target=aarch64-linux-android29", "-O3", "-Wno-override-module", "-S", tmpLl, "-o", "-"] }
       try IO.FS.removeFile tmpLl catch _ => pure ()
-      if out.exitCode != 0 then pure false
-      else
+      if out.exitCode != 0 then pure false else
         let asm := out.stdout
         let baseAsm := match asm.splitOn "lean_native_cpu_saxpy_u64__baseline:" with | _ :: after :: _ => (after.splitOn ".Lfunc_end").headD "" | _ => ""
         let sve2Asm := match asm.splitOn "lean_native_cpu_saxpy_u64__sve2:" with | _ :: after :: _ => (after.splitOn ".Lfunc_end").headD "" | _ => ""
         pure (!baseAsm.isEmpty && !sve2Asm.isEmpty && (baseAsm.splitOn "cntd").length == 1 && (baseAsm.splitOn "ld1d").length == 1 && (baseAsm.splitOn "st1d").length == 1 && (sve2Asm.splitOn "cntd").length > 1 && (sve2Asm.splitOn "ld1d").length > 1 && (sve2Asm.splitOn "mad").length > 1 && (sve2Asm.splitOn "st1d").length > 1)
-    catch _ =>
-      try IO.FS.removeFile tmpLl catch _ => pure ()
-      pure false
+    catch _ => (try IO.FS.removeFile tmpLl catch _ => pure ()); pure false
   let gpuHeadroomOk := gpuHeadroomOk && sve2AsmOk
   let specRaw ← if ← System.FilePath.pathExists "LeanNative/Spec.lean" then IO.FS.readFile "LeanNative/Spec.lean" else pure ""
   -- P-cert C4: the core binary has no elaborating frontend, so Spec.lean bindings use the `--signatures-only` path
@@ -833,9 +855,12 @@ def printCoreUsage (tag : String) (hasFrontend : Bool) : IO Unit := do
   let fe (xs : List String) : List String := if hasFrontend then xs else []
   let lines := [s!"{tag} v0.5.0 — Formally Validated Lean 4 Optimizer, TV, FastCheck & Multi-Target Codegen", s!"Usage: {tag} <command> [options]", "Commands:"] ++
     fe ["  build-exe          Compile a .lean source file directly to a native executable (<file.lean> -o <bin>)"] ++ [
-    "  compile-llvm       Emit baseline or optimized LLVM 18 IR (--input <file>, --arch <target>, --baseline, -o <path>)",
+    "  compile-llvm       Emit baseline or optimized LLVM 18 IR (--input <file>, --arch <target>, --freestanding, --baseline, -o <path>)",
+    "  emit-llvm          Alias of compile-llvm (--target thumbv6m|thumbv8m.main|riscv32imac, --freestanding, -o <path>)",
     "  compile-static-lib Emit C-ABI static library (.a) + C header (.h) (--input <file>, -o <lib.a>, --header <lib.h>)",
-    "  emit-cabi-bindings Emit C/Rust/Swift/modulemap/fixture bindings (--emit-header|--emit-rust|--emit-swift|--emit-modulemap|--emit-fixtures <path>)"] ++
+    "  emit-freestanding-c-lib Emit verified freestanding .ll + C99 .h + .o/.a + .su (--target thumbv6m|thumbv8m.main|riscv32imac, -o <lib.a>)",
+    "  emit-cabi-bindings Emit C/Rust/Swift/modulemap/fixture bindings (--emit-header|--emit-rust|--emit-swift|--emit-modulemap|--emit-fixtures <path>)",
+    "  emit-c-abi         Alias of emit-cabi-bindings (--target <arch>, --freestanding, --emit-header <lib.h>)"] ++
     (if hasFrontend then [] else [
     "                     A .lean input needs the full 'lean-native' frontend (Stage 1D RC-ADT gate); here it is a hard error unless",
     "                     --signatures-only: bindings from exported source signatures only, no helper/RC-ADT runtime prototypes,",
@@ -865,77 +890,54 @@ def runAuditAxioms (args : List String) : IO UInt32 := do
   let report := verifiedAxiomAuditReport
   IO.println (if hasFlag args "--json" then report.toJson else report.formatSummary)
   return if report.passed then 0 else 1
-
-/-- Binding text is not evidence of executed SNARK kernels or ISA qualification. -/
 def runBenchSnarkKernels (args : List String) : IO UInt32 := do
-  if hasFlag args "--json" then
-    IO.println "{\"ok\":false,\"status\":\"BLOCKED_MISSING_DEPENDENCY\",\"benchmarkExecuted\":false,\"reason\":\"Real SNARK kernel implementations and an execution benchmark are unavailable\"}"
-  else
-    IO.eprintln "[bench-snark-kernels] BLOCKED_MISSING_DEPENDENCY: real SNARK kernels and an execution benchmark are unavailable"
+  if hasFlag args "--json" then IO.println "{\"ok\":false,\"status\":\"BLOCKED_MISSING_DEPENDENCY\",\"benchmarkExecuted\":false,\"reason\":\"Real SNARK kernel implementations and an execution benchmark are unavailable\"}"
+  else IO.eprintln "[bench-snark-kernels] BLOCKED_MISSING_DEPENDENCY: real SNARK kernels and an execution benchmark are unavailable"
   return 2
 
 def runEvalLNIR (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
-  let declName := findFlagValue args "--decl" ""
-  let argsRaw := findFlagValue args "--args" ""
-  let casesFile := findFlagValue args "--cases-file" ""
+  let (declName, argsRaw, casesFile) := (findFlagValue args "--decl" "", findFlagValue args "--args" "", findFlagValue args "--cases-file" "")
   let arch ← parseTargetArchIO (findFlagValue args "--arch" (findFlagValue args "--target" "x86_64"))
-  let fuel := (findFlagValue args "--fuel" "4096").toNat?.getD 4096
-  let useOpt := hasFlag args "--opt" || hasFlag args "--optimized"
-  let useVerifiedOnly := hasFlag args "--verified-kernel-only"
-  let batchJson := hasFlag args "--batch-json"
+  let (fuel, useOpt, useVerifiedOnly, batchJson) := ((findFlagValue args "--fuel" "4096").toNat?.getD 4096, hasFlag args "--opt" || hasFlag args "--optimized", hasFlag args "--verified-kernel-only", hasFlag args "--batch-json")
   let baseMod ← loadInputModule elaborateHook? args false false true
   let (mod, _) ← if !useOpt then pure (baseMod, []) else runOptPipelineWithArgs args useVerifiedOnly baseMod
-  if !casesFile.isEmpty then
-    return (← runEvalCasesFile fuel arch mod casesFile)
+  if !casesFile.isEmpty then return (← runEvalCasesFile fuel arch mod casesFile)
   let findUniqueDecl (name : String) : IO LNIRDecl := do
     match mod.decls.filter (fun d => d.name == name) with
     | [d] => pure d
-    | [] =>
-      match mod.decls.filter (fun d => d.name.endsWith ("." ++ name)) with
+    | [] => match mod.decls.filter (fun d => d.name.endsWith ("." ++ name)) with
       | [d] => pure d
       | _ => throw <| IO.userError s!"[lean-native] Declaration '{name}' missing or ambiguous in module '{mod.moduleName}'"
     | _ => throw <| IO.userError s!"[lean-native] Declaration '{name}' missing or ambiguous in module '{mod.moduleName}'"
   if batchJson then
     if !argsRaw.isEmpty && argsRaw.contains ':' then
-      let entries := (argsRaw.splitOn ";").map (·.trimAscii.toString) |>.filter (!·.isEmpty)
-      let mut rows : List String := []
-      let mut allOk := true
-      for entry in entries do
+      let mut (rows, allOk) := (([] : List String), true)
+      for entry in (argsRaw.splitOn ";").map (·.trimAscii.toString) |>.filter (!·.isEmpty) do
         let kv := entry.splitOn ":"
         if kv.length != 2 then throw <| IO.userError s!"[lean-native] Invalid named batch entry '{entry}'"
-        let d ← findUniqueDecl (kv.headD "")
-        let dArgs ← parseU64ArgsCsv ((kv.drop 1).headD "")
-        if dArgs.length != d.params.length then
-          throw <| IO.userError s!"[lean-native] Declaration '{d.name}' expects {d.params.length} args, got {dArgs.length}"
+        let d ← findUniqueDecl (kv.headD ""); let dArgs ← parseU64ArgsCsv ((kv.drop 1).headD "")
+        if dArgs.length != d.params.length then throw <| IO.userError s!"[lean-native] Declaration '{d.name}' expects {d.params.length} args, got {dArgs.length}"
         let (rJson, rOk) := evalDeclWithU64Args fuel d dArgs arch
         if !rOk then allOk := false
         rows := rows ++ [rJson]
-      IO.println s!"[{String.intercalate "," rows}]"
-      return if allOk then 0 else 1
+      IO.println s!"[{String.intercalate "," rows}]"; return if allOk then 0 else 1
     let parsedArgs ← parseU64ArgsCsv argsRaw
-    let mut rows : List String := []
-    let mut allOk := true
-    let mut declIdx : Nat := 0
+    let mut (rows, allOk, declIdx) := (([] : List String), true, (0 : Nat))
     for d in mod.decls do
       let argVal : UInt64 := (parsedArgs[declIdx]?).orElse (fun _ => parsedArgs.head?) |>.getD 0
       declIdx := declIdx + 1
       let (rJson, rOk) := evalDeclWithU64Args fuel d (d.params.map (fun _ => argVal)) arch
       if !rOk then allOk := false
       rows := rows ++ [rJson]
-    IO.println s!"[{String.intercalate "," rows}]"
-    return if allOk then 0 else 1
-  let targetDecl ←
-    if declName.isEmpty then
-      match mod.decls.head? with
-      | some d => pure d
-      | none => throw <| IO.userError "[lean-native] Module contains 0 declarations"
+    IO.println s!"[{String.intercalate "," rows}]"; return if allOk then 0 else 1
+  let targetDecl ← if declName.isEmpty then
+      match mod.decls.head? with | some d => pure d | none => throw <| IO.userError "[lean-native] Module contains 0 declarations"
     else findUniqueDecl declName
   let parsedArgs ← parseU64ArgsCsv argsRaw
   if parsedArgs.length != targetDecl.params.length then
     throw <| IO.userError s!"[lean-native] Declaration '{targetDecl.name}' expects {targetDecl.params.length} args, got {parsedArgs.length}"
   let (jsonRow, ok) := evalDeclWithU64Args fuel targetDecl parsedArgs arch
-  IO.println jsonRow
-  return if ok then 0 else 1
+  IO.println jsonRow; return if ok then 0 else 1
 
 def rcAdtSupportedCommands : List String := ["emit-lnir", "eval-lnir", "validate-tv", "verify-certs"]
 
@@ -947,50 +949,47 @@ def dispatchSharedCommand (tag : String) (elaborateHook? : Option (String → Ta
   let isCabiFallback := !(args.headD "").startsWith "compile" && (hasFlag args "--c-abi" || hasFlag args "--emit-c-abi")
   if hasFlag args "--allow-rc-adt" && (!(rcAdtSupportedCommands.contains (args.headD "")) || isCabiFallback) then
     throw <| IO.userError "[lean-native] --allow-rc-adt is only supported by emit-lnir, eval-lnir, validate-tv, and verify-certs"
-  if hasFlag args "--signatures-only" && (args.head? != some "emit-cabi-bindings" || elaborateHook?.isSome) then
+  if hasFlag args "--signatures-only" && ((args.head? != some "emit-cabi-bindings" && args.head? != some "emit-c-abi") || elaborateHook?.isSome) then
     throw <| IO.userError "[lean-native] --signatures-only is only supported by lean-native-core emit-cabi-bindings (the full frontend applies the Stage 1D gate)"
   if args.head? != some "eval-lnir" && (args.contains "--args" || args.contains "--cases-file") then
     throw <| IO.userError "[lean-native] --args / --cases-file are only supported by eval-lnir"
-  let rest := args.drop 1
-  let effArgs := if args.head? == some "--c-abi" || args.head? == some "--emit-c-abi" || isCabiFallback then args else rest
-  -- every input-reading command resolves its input once, up front: conflicting selectors are a hard error here
-  let readsInput := ["compile", "compile-llvm", "compile-static-lib", "compile-mlir", "compile-ptx", "compile-metal",
-       "compile-hybrid", "compile-fastcheck", "superopt", "plugins", "telemetry", "verify-certs",
-       "validate-tv", "eval-lnir", "emit-lnir", "emit-cabi-bindings", "compile-c-abi",
-       "--c-abi", "--emit-c-abi"].contains (args.headD "") || isCabiFallback
+  let effArgs := if args.head? == some "--c-abi" || args.head? == some "--emit-c-abi" || isCabiFallback then args else args.drop 1
+  let readsInput := ["compile", "compile-llvm", "emit-llvm", "compile-static-lib", "emit-freestanding-c-lib",
+       "compile-mlir", "compile-ptx", "compile-metal", "compile-hybrid", "compile-fastcheck", "superopt",
+       "plugins", "telemetry", "verify-certs", "validate-tv", "eval-lnir", "emit-lnir", "emit-cabi-bindings",
+       "emit-c-abi", "compile-c-abi", "--c-abi", "--emit-c-abi"].contains (args.headD "") || isCabiFallback
   let sel ← if readsInput then resolveInput effArgs else pure {}
-  if readsInput && sel.flag == "--slot-regression" && args.head? != some "compile-llvm" then
+  if readsInput && sel.flag == "--slot-regression" && args.head? != some "compile-llvm" && args.head? != some "emit-llvm" then
     throw <| IO.userError "[lean-native] --slot-regression is only supported by compile-llvm"
   if readsInput && sel.flag.isEmpty && sel.path.isEmpty then
     throw <| IO.userError "[lean-native] Explicit input required (or --canonical-benchmark / --fastcheck-sample)"
   match args with
-  | "audit-axioms" :: rest       => some <$> runAuditAxioms rest
-  | "calibrate-cost" :: rest     => some <$> LeanNative.Driver.CostAutotuneCLI.run rest
+  | "audit-axioms" :: rest => some <$> runAuditAxioms rest
+  | "calibrate-cost" :: rest => some <$> LeanNative.Driver.CostAutotuneCLI.run rest
   | "bench-snark-kernels" :: rest => some <$> runBenchSnarkKernels rest
-  | "eval-lnir" :: rest          => some <$> runEvalLNIR elaborateHook? rest
-  | "compile-llvm" :: rest       => some <$> runCompileLLVM tag elaborateHook? rest
+  | "eval-lnir" :: rest => some <$> runEvalLNIR elaborateHook? rest
+  | "compile-llvm" :: rest | "emit-llvm" :: rest => some <$> runCompileLLVM tag elaborateHook? rest
   | "compile-static-lib" :: rest => some <$> runCompileStaticLib tag elaborateHook? rest
-  | "emit-cabi-bindings" :: rest => some <$> runEmitCAbiBindings tag elaborateHook? rest
-  | "compile-c-abi" :: rest      => do
-    rejectLeanSourceWithoutFrontend tag "compile-c-abi" elaborateHook? rest
-    some <$> runEmitCAbiBindings tag elaborateHook? rest
-  | "compile-mlir" :: rest       => some <$> runCompileMLIR tag elaborateHook? rest
-  | "compile-ptx" :: rest       => some <$> runCompilePTX tag elaborateHook? rest
-  | "compile-metal" :: rest     => some <$> runCompileMetal tag elaborateHook? rest
+  | "emit-freestanding-c-lib" :: rest => some <$> runEmitFreestandingCLib tag elaborateHook? rest
+  | "emit-cabi-bindings" :: rest | "emit-c-abi" :: rest => some <$> runEmitCAbiBindings tag elaborateHook? rest
+  | "compile-c-abi" :: rest => do rejectLeanSourceWithoutFrontend tag "compile-c-abi" elaborateHook? rest; some <$> runEmitCAbiBindings tag elaborateHook? rest
+  | "compile-mlir" :: rest => some <$> runCompileMLIR tag elaborateHook? rest
+  | "compile-ptx" :: rest => some <$> runCompilePTX tag elaborateHook? rest
+  | "compile-metal" :: rest => some <$> runCompileMetal tag elaborateHook? rest
   | "compile-fastcheck" :: rest => some <$> runCompileFastCheck tag elaborateHook? rest
-  | "compile-hybrid" :: rest    => some <$> runCompileHybrid tag elaborateHook? rest
-  | "compile" :: rest           => some <$> runCompileMode tag elaborateHook? rest
+  | "compile-hybrid" :: rest => some <$> runCompileHybrid tag elaborateHook? rest
+  | "compile" :: rest => some <$> runCompileMode tag elaborateHook? rest
   | "--c-abi" :: _ | "--emit-c-abi" :: _ => some <$> runCompileMode tag elaborateHook? args
-  | "--self-test" :: _          => some <$> runCoreSelfTest tag
-  | "superopt" :: rest          => some <$> runSuperopt elaborateHook? rest
-  | "plugins" :: rest           => some <$> runPlugins elaborateHook? rest
-  | "telemetry" :: rest         => some <$> runTelemetry elaborateHook? rest
-  | "pr-verify" :: rest         => some <$> runPRVerify tag rest
-  | "turbo-plugin" :: _         => some <$> runTurboPlugin
-  | "verify-certs" :: rest      => some <$> runVerifyCerts tag elaborateHook? rest
-  | "validate-tv" :: rest       => some <$> runValidateTV elaborateHook? rest
-  | "emit-lnir" :: rest         => some <$> runEmitLNIR tag elaborateHook? rest
-  | "worker" :: _               => some <$> runWorker tag
+  | "--self-test" :: _ => some <$> runCoreSelfTest tag
+  | "superopt" :: rest => some <$> runSuperopt elaborateHook? rest
+  | "plugins" :: rest => some <$> runPlugins elaborateHook? rest
+  | "telemetry" :: rest => some <$> runTelemetry elaborateHook? rest
+  | "pr-verify" :: rest => some <$> runPRVerify tag rest
+  | "turbo-plugin" :: _ => some <$> runTurboPlugin
+  | "verify-certs" :: rest => some <$> runVerifyCerts tag elaborateHook? rest
+  | "validate-tv" :: rest => some <$> runValidateTV elaborateHook? rest
+  | "emit-lnir" :: rest => some <$> runEmitLNIR tag elaborateHook? rest
+  | "worker" :: _ => some <$> runWorker tag
   | _ => if hasFlag args "--c-abi" || hasFlag args "--emit-c-abi" then some <$> runCompileMode tag elaborateHook? args else return none
 
 end LeanNative.Driver.CoreCLI

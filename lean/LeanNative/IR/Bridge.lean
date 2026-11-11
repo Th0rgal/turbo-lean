@@ -40,7 +40,8 @@ def lowerNamedCall (fnName : Lean.Name) (args : Array (Lean.Compiler.LCNF.Arg pu
   let isCanonicalSliceCall :=
     !isLocal &&
     (fnName == ``ByteArray.usize || fnName == ``FloatArray.usize ||
-     fnName == ``ByteArray.uget || fnName == ``FloatArray.uget)
+     fnName == ``ByteArray.uget || fnName == ``FloatArray.uget ||
+     (st.arch.isFreestandingEmbedded && fnName == ``ByteArray.get!))
   let argVars ← args.toList.mapM (fun a => do
     match a with
     | .fvar fvarId =>
@@ -179,7 +180,7 @@ def ingestLCNFDeclGenericWithState {pu} (decl : Lean.Compiler.LCNF.Decl pu)
           | some (.sarray .f64) => .sarray .f64
           | _ => rawPTy
         else rawPTy
-      checkBridgeType s!"parameter `{p.binderName}` of `{decl.name}`" p.type pTy allowInternalObj (!isExported)
+      checkBridgeType s!"parameter `{p.binderName}` of `{decl.name}`" p.type pTy allowInternalObj (!isExported || arch.isFreestandingEmbedded)
       let vid ← internFVar p.fvarId pTy true
       lnirParams := lnirParams ++ [{ id := vid, name := p.binderName.toString, ty := pTy, borrow := p.borrow || isSupportedSliceType pTy }]
       pIdx := pIdx + 1
