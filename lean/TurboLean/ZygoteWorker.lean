@@ -1744,11 +1744,15 @@ def environmentOnlyPrefix (env : Environment) (code : String) : Bool := Id.run d
     if next.pos == state.pos || msgs.hasErrors then return false
     if syn.isOfKind ``Lean.Parser.Command.eoi then break
     if !syn.isOfKind ``Lean.Parser.Command.declaration then return false
-    if syn[0][1].getNumArgs > 0 then return false -- attributes may introduce local/scoped state
+    -- Only a doc comment is harmless. Inspect every modifier, not just attributes.
+    if (syn[0].getArgs.extract 1 syn[0].getNumArgs).any (fun s => s.getNumArgs > 0) then return false
+    if (syn.find? fun s => s.isOfKind ``Lean.Parser.Term.attrKind && s[0].getNumArgs > 0).isSome then return false
     state := next
   return true
 
-def compactPrefix? (baseEnv finalEnv : Environment) (imports : Array Import) : IO (Option Environment) := do
+def compactPrefix? (baseEnv finalEnv : Environment) (imports : Array Import) (level : OLeanLevel) : IO (Option Environment) := do
+  if finalEnv.constants.map₂.foldl (fun bad n _ => bad ||
+      (canonicalName (Lean.privateToUserName n)).startsWith "_turbo_verify_") false then return none
   let (clean, _, _) ← auditNewKernelDecls baseEnv finalEnv (fun _ => false) false
   if !clean then return none
   let oldPath ← searchPathRef.get
@@ -1759,13 +1763,14 @@ def compactPrefix? (baseEnv finalEnv : Environment) (imports : Array Import) : I
   let modName := Name.mkSimple s!"TurboPrefix_{pid}_{stamp}"
   let path := System.FilePath.mk staging / s!"{modName}.olean"
   try
-    if ← writeVerifiedOutlineOlean baseEnv (finalEnv.setMainModule modName) modName path then
+    if ← writeVerifiedModuleOlean baseEnv (finalEnv.setMainModule modName) modName path then
       searchPathRef.set (System.FilePath.mk staging :: oldPath)
-      result := some (← Lean.importModules (imports.push { module := modName }) {} 1025 #[] false true)
+      try discard <| Lake.importModulesUsingCache #[{ module := .anonymous }] {} 0 catch _ => pure ()
+      result := some (← Lean.importModules (imports.push { module := modName }) {} 1025 #[] false true level)
   catch _ => pure ()
   searchPathRef.set oldPath
-  for ext in ["", ".server", ".private"] do
-    try IO.FS.removeFile (System.FilePath.mk s!"{path}{ext}") catch _ => pure ()
+  for ext in ["", ".server", ".private", ".ir", ".ir.sig", ".olean", ".olean.server", ".olean.private"] do
+    try IO.FS.removeFile (System.FilePath.mk s!"{staging}/{modName}{ext}") catch _ => pure ()
   return result
 
 /-- Elaborate and kernel-typecheck `bodyCode` on top of an immutable `baseEnv : Lean.Environment`
@@ -3773,9 +3778,13 @@ def main (args : List String) : IO Unit := do
   -- different cached environment. Bind this process to the first `importsCsv` it serves.
   let mut boundImports? : Option String := none
   let mut poisoned := false
+  let mut clones : Array UInt32 := #[]
   while true do
     let line ← stdin.getLine
-    if line.isEmpty then
+    if line.isEmpty || line.trimAscii.toString == "shutdown" then
+      clones ← TurboLean.ZygoteFork.reapClones clones
+      for pid in clones do TurboLean.ZygoteFork.posixKillSigkill pid
+      for pid in clones do discard <| TurboLean.ZygoteFork.posixWaitPid pid
       break
     let trimmed := line.trimAscii.toString
     if trimmed.isEmpty then
@@ -3786,12 +3795,13 @@ def main (args : List String) : IO Unit := do
       else
         try
           stdout.flush
-          TurboLean.ZygoteFork.reapClones
+          clones ← TurboLean.ZygoteFork.reapClones clones
           TurboLean.ZygoteFork.finalizeTaskManager
           let pid ← try TurboLean.ZygoteFork.posixForkRaw catch e =>
             TurboLean.ZygoteFork.initTaskManager
             throw e
           if pid == 0 then
+            clones := #[]
             let path := (trimmed.drop 11).toString
             try
               TurboLean.ZygoteFork.connectCloneChannel path 0
@@ -3799,6 +3809,7 @@ def main (args : List String) : IO Unit := do
               TurboLean.ZygoteFork.initTaskManagerUsing 2
             catch _ => TurboLean.ZygoteFork.posixExitImmediate 1
           else
+            clones := clones.push pid
             TurboLean.ZygoteFork.initTaskManager
             stdout.putStrLn s!"clone {pid}"
         catch _ => stdout.putStrLn "unavailable"
@@ -4124,15 +4135,23 @@ def main (args : List String) : IO Unit := do
         | _, true =>
           TurboLean.ZygoteWorker.emitZygoteReply stdout false (if isRaceCandidates then some "null" else none) kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs prefErrs []
         | some ckptState, false =>
-          -- Scoped commands retain the complete Command.State replay path.
-          if !evalMode && emitOlean?.isNone && !allowSorry && !compactCache.contains fullPrefixKey &&
+          -- Imported prefixes leave map₂: only body-only checks without fast-verify mappings
+          -- may use them. All prefix declarations are audited without stub exemptions first.
+          let compactEligible := !evalMode && emitOlean?.isNone && !allowSorry &&
+            fastMap.isEmpty && !isProbeStub && !isBatchFission &&
+            (isRaceCandidates || (requiredTargets.length == 1 &&
+              requiredTargets.all (fun n => !(TurboLean.ZygoteWorker.declaresHostName ckptState.env [] n)))) &&
+            ckptState.scopes.length == 1 && (ckptState.scopes.head?.any fun scope =>
+              scope.currNamespace == .anonymous && scope.openDecls.isEmpty && scope.varDecls.isEmpty)
+          if compactEligible && !compactCache.contains fullPrefixKey &&
               TurboLean.ZygoteWorker.environmentOnlyPrefix baseEnv prefixCode then
-                if let some env ← TurboLean.ZygoteWorker.compactPrefix? baseEnv ckptState.env imports then
+                if let some env ← TurboLean.ZygoteWorker.compactPrefix? baseEnv ckptState.env imports (if isMod then .exported else .private) then
                   if compactOrder.size >= maxCheckpoints then
                     if let some key := compactOrder[0]? then compactCache := compactCache.erase key
                     compactOrder := compactOrder.extract 1 compactOrder.size
                   compactCache := compactCache.insert fullPrefixKey env
                   compactOrder := compactOrder.push fullPrefixKey
+          let compactEnv? := if compactEligible then compactCache[fullPrefixKey]? else none
           if !prefixCacheHit then
             if stateCache.size >= maxCheckpoints then
               match stateCacheOrder[0]? with
@@ -4170,7 +4189,6 @@ def main (args : List String) : IO Unit := do
             if hexSubs.isEmpty then
               TurboLean.ZygoteWorker.emitZygoteReply stdout false (some "null") kgActive true envCacheHit prefixCacheHit importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs [] []
             else
-              let compactEnv? := compactCache[fullPrefixKey]?
               let evalCandForkFromBase := fun (sc : String) => do
                 let scHasExplicitStub := (sc.splitOn (":= " ++ ("sor" ++ "ry"))).length > 1
                 if scHasExplicitStub then
@@ -4185,7 +4203,7 @@ def main (args : List String) : IO Unit := do
               let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed, rDeclTypes) ←
                 TurboLean.ZygoteWorker.runRaceCandidatesSubs hexSubs evalFromCkpt false (some evalCandForkFromBase)
               if !rOk && rErrs.contains TurboLean.ZygoteWorker.runtimePanicErr then poisoned := true
-              TurboLean.ZygoteWorker.emitZygoteReply stdout rOk (some winIdx) kgActive true envCacheHit prefixCacheHit importUs prefixUs rElabUs rHbs rNodes rVer rOut rMsgs rErrs rUsed rDeclTypes
+              TurboLean.ZygoteWorker.emitZygoteReply stdout rOk (some winIdx) kgActive true envCacheHit prefixCacheHit importUs prefixUs rElabUs rHbs rNodes rVer rOut rMsgs rErrs rUsed rDeclTypes [] s!",\"compact_prefix\":{compactEnv?.isSome}"
           else if bodyCode.trimAscii.toString.isEmpty then
             let mut emitOk := true
             let mut emitErrs : List String := []
@@ -4245,9 +4263,9 @@ def main (args : List String) : IO Unit := do
             let prefDeclTypes := if !evalMode then TurboLean.ZygoteWorker.collectNewTheoremTypeHashes baseEnv ckptState.env (isProbeStub || allowSorry) fastMap else []
             TurboLean.ZygoteWorker.emitZygoteReply stdout emitOk none kgActive true envCacheHit prefixCacheHit importUs prefixUs 0 prefHbs prefPtNodes (if emitOk then 1 else 0) prefOut prefMsgs emitErrs prefUsed prefDeclTypes emitSorryDecls
           else
-            let targetState := match compactCache[fullPrefixKey]? with
-              | some env => if !evalMode && emitOlean?.isNone then Command.mkState env {} ckptState.scopes.head!.opts else ckptState
-              | none => ckptState
+            let targetState := match compactEnv?, ckptState.scopes.head? with
+              | some env, some scope => Command.mkState env {} scope.opts
+              | _, _ => ckptState
             let (ok, elabUs, dHbs, ptNodes, errs, dMsgs, dOut, usedConsts, declTypes, sorryDecls, finalSt) ←
               TurboLean.ZygoteWorker.runCommandsFromState targetState bodyCode fn allowStub evalMode stubTargets stubs
                 (strictPrefix := strictAll) (requiredTargets := some requiredTargets) (fastMap := fastMap) (includeStubsInDeclTypes := isProbeStub)

@@ -41,6 +41,8 @@ pub struct ZygoteEvalReply {
     pub env_cache_hit: bool,
     #[serde(default)]
     pub prefix_cache_hit: bool,
+    #[serde(default)]
+    pub compact_prefix: bool,
     pub import_us: u64,
     #[serde(default)]
     pub prefix_us: u64,
@@ -345,9 +347,10 @@ pub fn govern_machine_wide_zygote_rss(current_pid: u32, current_rss_mb: u64) {
 /// Drop pooled children before returning from a CLI invocation or shutting down a server.
 pub(crate) fn clear_zygote_pool() {
     if let Some(pool) = ZYGOTE_POOL.get() {
-        if let Ok(mut pool) = pool.lock() {
-            pool.clear();
-        }
+        pool.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+    if let Some(masters) = ZYGOTE_MASTERS.get() {
+        masters.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 }
 
@@ -360,6 +363,11 @@ extern "C" fn cleanup_one_shot() {
     if let Some((dir, _)) = ONE_SHOT_DIR.get() {
         let _ = fs::remove_dir_all(dir);
     }
+}
+
+#[cfg(unix)]
+extern "C" fn cleanup_zygote_processes() {
+    clear_zygote_pool();
 }
 
 #[cfg(test)]
@@ -1130,6 +1138,7 @@ pub struct ZygoteWorkerProcess {
     warm_imports: std::collections::HashMap<String, String>,
     pub request_count: usize,
     cold_import_us: Option<u64>,
+    is_master: bool,
 }
 
 #[cfg(unix)]
@@ -1215,7 +1224,7 @@ impl ZygoteWorkerProcess {
             stdout: BufReader::new(std::fs::File::from(OwnedFd::from(stream))),
             stderr_tail, stderr_scan, pinned_snapshot_dir: self.pinned_snapshot_dir,
             spawn_lean_path: self.spawn_lean_path.clone(), warm_prefixes: self.warm_prefixes.clone(),
-            warm_prefix_tree: self.warm_prefix_tree.clone(), warm_imports: self.warm_imports.clone(), request_count: 0, cold_import_us: None,
+            warm_prefix_tree: self.warm_prefix_tree.clone(), warm_imports: self.warm_imports.clone(), request_count: 0, cold_import_us: None, is_master: false,
         })
     }
 }
@@ -1228,6 +1237,15 @@ extern "C" {
 impl Drop for ZygoteWorkerProcess {
     fn drop(&mut self) {
         if let Some(child) = &mut self.child {
+            // Let a master kill and reap its clones before reaping the master itself.
+            if self.is_master {
+                let _ = self.stdin.write_all(b"shutdown\n");
+                let _ = self.stdin.flush();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -1243,6 +1261,11 @@ type ZygoteChild = ZygoteWorkerProcess;
 #[allow(clippy::type_complexity)]
 static ZYGOTE_POOL: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<(String, String, String), Vec<ZygoteWorkerProcess>>>,
+> = std::sync::OnceLock::new();
+
+#[allow(clippy::type_complexity)]
+static ZYGOTE_MASTERS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(String, String, String), ZygoteChild>>,
 > = std::sync::OnceLock::new();
 
 /// Test-only fault injection: named callbacks fired at race-sensitive points of the digest /
@@ -7288,6 +7311,7 @@ fn eval_with_zygote_pool_attempt(
             warm_imports: std::collections::HashMap::new(),
             request_count: 0,
             cold_import_us: None,
+            is_master: false,
         })
     };
 
@@ -7436,8 +7460,11 @@ fn eval_with_zygote_pool_attempt(
     let acquire_worker = || -> Result<ZygoteChild> {
         #[cfg(target_os = "linux")]
         if !lake_inputs_uncacheable && closure.label().is_some() && !daemon_disabled() {
-            static MASTERS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<(String, String, String), ZygoteChild>>> = std::sync::OnceLock::new();
-            let mut masters = MASTERS.get_or_init(Default::default).lock().map_err(|_| anyhow::anyhow!("Zygote masters poisoned"))?;
+            let mut masters = ZYGOTE_MASTERS.get_or_init(|| {
+                // Explicit CLI exits bypass OneShotGuard::drop and static destructors.
+                unsafe { libc::atexit(cleanup_zygote_processes); }
+                Default::default()
+            }).lock().map_err(|_| anyhow::anyhow!("Zygote masters poisoned"))?;
             if !masters.contains_key(&pool_key) {
                 let mut master = spawn_zygote_worker()?;
                 let warm = attach_host_closure_digest(&format!("{}\t\tstrict\n", imports_csv), host_closure_digest);
@@ -7445,6 +7472,7 @@ fn eval_with_zygote_pool_attempt(
                     if rep.ok && rep.import_ok && closure.binding() == ClosureBinding::Bound {
                         master.warm_imports.insert(imports_csv.clone(), closure_pool_digest.clone());
                         master.cold_import_us = Some(rep.import_us);
+                        master.is_master = true;
                         if masters.len() >= 4 { if let Some(key) = masters.keys().next().cloned() { masters.remove(&key); } }
                         masters.insert(pool_key.clone(), master);
                     }
@@ -7453,6 +7481,7 @@ fn eval_with_zygote_pool_attempt(
             if let Some(master) = masters.get_mut(&pool_key) {
                 if master.pinned_snapshot_dir == expected_pinned_dir && master.spawn_lean_path == effective_lean_path {
                     if let Ok(mut worker) = master.fork_clone(deadline) {
+                        mark_closure_snapshot_used(host_closure_digest);
                         worker.cold_import_us = master.cold_import_us.take();
                         return Ok(worker);
                     }
@@ -13016,6 +13045,7 @@ mod tests {
                 warm_imports: std::collections::HashMap::new(),
                 request_count: 1,
                 cold_import_us: None,
+                is_master: false,
             }
         };
 
@@ -15488,6 +15518,21 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
             }).collect();
             for h in handles { h.join().unwrap(); }
         });
+        #[cfg(target_os = "linux")]
+        {
+            let masters = ZYGOTE_MASTERS.get().unwrap().lock().unwrap();
+            assert!(!masters.is_empty(), "test must exercise a live master");
+            let mut pids: Vec<_> = masters.values().map(|w| w.pid()).collect();
+            drop(masters);
+            pids.extend(ZYGOTE_POOL.get().unwrap().lock().unwrap().values()
+                .flatten().map(|w| w.pid()));
+            clear_zygote_pool();
+            assert!(ZYGOTE_MASTERS.get().unwrap().lock().unwrap().is_empty());
+            assert!(ZYGOTE_POOL.get().unwrap().lock().unwrap().is_empty());
+            for pid in pids {
+                assert!(!Path::new(&format!("/proc/{pid}")).exists(), "worker {pid} must be killed and reaped");
+            }
+        }
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -15520,7 +15565,25 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
             (rep.errors.clone(), rep.stderr_tail.clone())
         );
         assert_eq!(rep.winning_candidate_idx, Some(2));
+        assert!(rep.compact_prefix, "prefix compaction must succeed at runtime: {rep:?}");
         assert!(!rep.used_sorry && rep.sorry_decls.is_empty());
+
+        for prefix in [
+            "import Init\nprivate def hiddenSeed : Nat := 21\n",
+            "import Init\n@[simp] theorem prefix_simp : True := trivial\n",
+            "import Init\nlocal instance : Inhabited Nat := ⟨21⟩\n",
+            "import Init\nnamespace ScopedPrefix\nscoped instance : Inhabited Nat := ⟨21⟩\nend ScopedPrefix\n",
+            "import Init\nnoncomputable def opaqueSeed : Nat := 21\n",
+            "import Init\nnamespace StillOpen\ndef seed : Nat := 21\n",
+            "import Init\nopen Nat\ndef seed : Nat := 21\n",
+        ] {
+            let rep = eval_candidates_race_via_zygote(
+                &store, "leanprover/lean4:v4.35.0", "", &env_vars, &lean_bin,
+                prefix, &["theorem scoped_body : True := trivial\n".into()], &[],
+            ).unwrap();
+            assert!(rep.ok, "checkpoint replay failed for {prefix}: {rep:?}");
+            assert!(!rep.compact_prefix, "scoped/modifier prefix must retain its checkpoint: {prefix}");
+        }
 
         let cands_sorry_only = vec!["theorem race_bad : baseVal = 999 := by sorry".to_string()];
         let rep_bad = eval_candidates_race_via_zygote(

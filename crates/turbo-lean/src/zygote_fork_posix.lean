@@ -48,15 +48,18 @@ opaque posixClose (fd : UInt32) : IO Unit
 
 /-- Invoke POSIX `fork()`. Caller MUST call `finalizeTaskManager` before and `initTaskManager*` after.
     Returns `0` in the child process and `childPid > 0` in the parent process. -/
-@[extern c inline "({ extern int fork(void); int pid = fork(); (pid < 0) ? lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(\"fork() failed\"))) : lean_io_result_mk_ok(lean_box_uint32((uint32_t)pid)); })"]
+@[extern c inline "({ extern int fork(void); extern int getpid(void); extern int getppid(void); extern int prctl(int, ...) __attribute__((weak)); extern void _exit(int) __attribute__((noreturn)); int parent = getpid(); int pid = fork(); if (pid == 0 && prctl && (prctl(1, 9, 0, 0, 0) != 0 || getppid() != parent)) _exit(1); (pid < 0) ? lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(\"fork() failed\"))) : lean_io_result_mk_ok(lean_box_uint32((uint32_t)pid)); })"]
 opaque posixForkRaw : IO UInt32
 
 /-- Connect a private clone channel; the child replaces all protocol and diagnostic descriptors. -/
-@[extern c inline "({ extern int socket(int,int,int); extern int connect(int,const void*,unsigned); extern int dup2(int,int); extern int close(int); struct { unsigned short family; char path[108]; } a = {1,{0}}; const char *p = lean_string_cstr(#1); int fd = -1; if (__builtin_strlen(p) < sizeof(a.path)) { __builtin_strcpy(a.path,p); fd = socket(1,1,0); if (fd >= 0 && connect(fd,&a,sizeof(a)) != 0) { close(fd); fd = -1; } } if (fd >= 0) { dup2(fd,(int)(#2)); if ((uint32_t)(#2) == 0) dup2(fd,1); close(fd); } fd < 0 ? lean_io_result_mk_error(lean_mk_io_user_error(lean_mk_string(\"clone connect failed\"))) : lean_io_result_mk_ok(lean_box(0)); })"]
+@[extern c inline "({ extern int socket(int,int,int); extern int connect(int,const void*,unsigned); extern int dup2(int,int); extern int fcntl(int,int,...); extern int close(int); extern void _exit(int) __attribute__((noreturn)); struct { unsigned short family; char path[108]; } a = {1,{0}}; const char *p = lean_string_cstr(#1); if (__builtin_strlen(p) >= sizeof(a.path)) _exit(1); __builtin_strcpy(a.path,p); int fd = socket(1,1 | 02000000,0); if (fd < 0) _exit(1); if (connect(fd,&a,sizeof(a)) != 0) { close(fd); _exit(1); } int target = (int)(#2); if (fd != target) { if (dup2(fd,target) < 0) { close(fd); _exit(1); } close(fd); } else if (fcntl(fd,2,0) < 0) { close(fd); _exit(1); } if (target == 0 && dup2(0,1) < 0) _exit(1); lean_io_result_mk_ok(lean_box(0)); })"]
 opaque connectCloneChannel (path : @& String) (target : UInt32) : IO Unit
 
-@[extern c inline "({ extern int waitpid(int,int*,int); int s; while (waitpid(-1,&s,1) > 0) {} lean_io_result_mk_ok(lean_box(0)); })"]
-opaque reapClones : IO Unit
+@[extern c inline "({ extern int waitpid(int,int*,int); extern int *__errno_location(void); int s, r; do { r = waitpid((int)(#1),&s,1); } while (r < 0 && *__errno_location() == 4); lean_io_result_mk_ok(lean_box(r == 0)); })"]
+opaque cloneRunning (pid : UInt32) : IO Bool
+
+def reapClones (pids : Array UInt32) : IO (Array UInt32) :=
+  pids.filterM cloneRunning
 
 /-- Terminate the current forked child process immediately via POSIX `_exit(code)` without flushing parent stdio buffers. -/
 @[extern c inline "({ extern void _exit(int) __attribute__((noreturn)); _exit((int)(#1)); lean_io_result_mk_ok(lean_box(0)); })"]
