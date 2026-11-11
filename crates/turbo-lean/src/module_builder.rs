@@ -1668,6 +1668,15 @@ fn resolve_toolchain_compiler_with_roots(
             candidate_bins.push(exact_tc);
         }
     }
+    if candidate_bins.is_empty() {
+        if let Some(nix_lean) = option_env!("TURBO_LEAN_NIX_DEFAULT_LEAN").filter(|s| !s.is_empty())
+        {
+            let p = PathBuf::from(nix_lean);
+            if p.is_file() {
+                candidate_bins.push(p);
+            }
+        }
+    }
     let strict_tc = is_untrusted
         || !is_toolchain_eligible_for_fleet_fallback(toolchain)
         || std::env::var("TURBO_LEAN_STRICT_TOOLCHAIN")
@@ -1782,7 +1791,7 @@ fn resolve_toolchain_compiler_with_roots(
         }
     }
     let githash_out = Command::new(&canon_bin)
-        .env("PATH", "/usr/bin:/bin")
+        .env("PATH", crate::trusted_tools::trusted_sys_path())
         .arg("--githash")
         .output()
         .context("Failed to execute `lean --githash`")?;
@@ -1807,7 +1816,12 @@ fn resolve_toolchain_compiler_with_roots(
         && has_specific_tc
         && !path_has_toolchain_component(&canon_bin, &tc_dir_name)
     {
-        if is_untrusted
+        let is_nix_default = option_env!("TURBO_LEAN_NIX_DEFAULT_LEAN")
+            .filter(|s| !s.is_empty())
+            .and_then(|p| Path::new(p).canonicalize().ok())
+            .as_deref()
+            == Some(canon_bin.as_path());
+        if (is_untrusted && !is_nix_default)
             || path_is_inside_any_toolchains_dir(&canon_bin)
             || path_is_elan_proxy_bin(&canon_bin)
         {
@@ -1842,7 +1856,7 @@ fn resolve_toolchain_compiler_with_roots(
             .unwrap_or(false)
         {
             let ver_out = Command::new(&canon_bin)
-                .env("PATH", "/usr/bin:/bin")
+                .env("PATH", crate::trusted_tools::trusted_sys_path())
                 .arg("--version")
                 .output()
                 .context("Failed to execute `lean --version` for toolchain verification")?;
@@ -2027,9 +2041,10 @@ impl PackageConfig {
 
 /// Only the resolved toolchain and fixed system utilities, never caller/project bins.
 pub(crate) fn verifier_path(lean: &Path) -> String {
+    let sys = crate::trusted_tools::trusted_sys_path();
     match lean.parent().filter(|p| p.is_absolute()) {
-        Some(bin) => format!("{}:/usr/bin:/bin", bin.display()),
-        None => "/usr/bin:/bin".into(),
+        Some(bin) => format!("{}:{sys}", bin.display()),
+        None => sys,
     }
 }
 
@@ -20030,6 +20045,12 @@ fn lake_cc_and_flags(cfg: &ProjectConfig) -> Result<LakeCcSpec> {
             validate_cc_outside_workspace(cfg, Path::new(&lean_cc))?,
             true,
         )
+    } else if let Some(nix_cc) = option_env!("TURBO_LEAN_NIX_DEFAULT_CC").filter(|s| !s.is_empty())
+    {
+        (
+            validate_cc_outside_workspace(cfg, Path::new(nix_cc))?,
+            true,
+        )
     } else if bundled_clang.is_file() {
         let canon_clang = bundled_clang.canonicalize().with_context(|| {
             format!(
@@ -21283,17 +21304,23 @@ pub(crate) fn probe_bwrap_sandbox(project: &Path) -> Option<PathBuf> {
         }
         return None;
     }
-    probe_bwrap_candidates(project, &["/usr/bin/bwrap", "/bin/bwrap"])
+    let mut cands = Vec::new();
+    if let Some(nix_bw) = option_env!("TURBO_LEAN_NIX_BWRAP").filter(|s| !s.is_empty()) {
+        cands.push(nix_bw);
+    }
+    cands.extend(["/usr/bin/bwrap", "/bin/bwrap", "/run/current-system/sw/bin/bwrap"]);
+    probe_bwrap_candidates(project, &cands)
 }
 
 fn probe_bwrap_candidates(project: &Path, candidates: &[&str]) -> Option<PathBuf> {
+    let sys_path = crate::trusted_tools::trusted_sys_path();
     for candidate in candidates {
         let Ok(cand) = crate::trusted_tools::system_executable(Path::new(candidate), project)
         else {
             continue;
         };
         let mut probe = Command::new(&cand);
-        probe.env_clear().env("PATH", "/usr/bin:/bin");
+        probe.env_clear().env("PATH", &sys_path);
         probe.args([
             "--unshare-all",
             "--new-session",
@@ -21301,7 +21328,7 @@ fn probe_bwrap_candidates(project: &Path, candidates: &[&str]) -> Option<PathBuf
             "--clearenv",
             "--setenv",
             "PATH",
-            "/usr/bin:/bin",
+            &sys_path,
             "--dev",
             "/dev",
             "--proc",
@@ -21309,14 +21336,23 @@ fn probe_bwrap_candidates(project: &Path, candidates: &[&str]) -> Option<PathBuf
             "--tmpfs",
             "/tmp",
         ]);
-        for sys_dir in ["/usr", "/bin", "/lib", "/lib64", "/etc"] {
+        for sys_dir in ["/usr", "/bin", "/lib", "/lib64", "/etc", "/nix", "/run/current-system/sw"]
+        {
             let p = Path::new(sys_dir);
             if p.exists() {
                 probe.arg("--ro-bind").arg(p).arg(p);
             }
         }
+        let probe_bin = ["/usr/bin/true", "/bin/true", "/run/current-system/sw/bin/true"]
+            .into_iter()
+            .find(|p| Path::new(p).exists())
+            .unwrap_or("/bin/sh");
+        if probe_bin == "/bin/sh" {
+            probe.args(["/bin/sh", "-c", "true"]);
+        } else {
+            probe.arg(probe_bin);
+        }
         if probe
-            .arg("/usr/bin/true")
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -21608,6 +21644,8 @@ fn build_module_compile_command(
             "/bin",
             "/lib",
             "/lib64",
+            "/nix",
+            "/run/current-system/sw",
             "/etc/ld.so.cache",
             "/etc/localtime",
         ] {

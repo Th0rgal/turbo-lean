@@ -105,9 +105,19 @@ def thumbv6mMul64Module : LNIRModule :=
     (ir.splitOn "mul i32").length > 1
   | .error _ => false
 
+/-- Resolve an LLVM `llvm-nm` binary on PATH or versioned LLVM directories. -/
+private def resolveLlvmNm : IO String := do
+  for cand in ["llvm-nm", "llvm-nm-19", "llvm-nm-18", "llvm-nm-20", "/usr/lib/llvm-19/bin/llvm-nm", "/usr/lib/llvm-18/bin/llvm-nm"] do
+    try
+      let out ← IO.Process.output { cmd := cand, args := #["--version"] }
+      if out.exitCode == 0 then return cand
+    catch _ => pure ()
+  return "llvm-nm"
+
 /-- Concrete end-to-end `LLVMLower` + `emitLLVMFreestanding?` + `clang -c` + `llvm-nm -u` + `-fstack-usage`
     smoke suite across `.thumbv6m`, `.thumbv8mMain`, and `.riscv32imac`. -/
 def runLedgerEmbeddedClangSmokeSuite (clangBin : String := "clang") : IO Bool := do
+  let nmBin ← resolveLlvmNm
   let pid ← IO.monoNanosNow
   let targets : List TargetArch := [.thumbv6m, .thumbv8mMain, .riscv32imac]
   for arch in targets do
@@ -129,7 +139,7 @@ def runLedgerEmbeddedClangSmokeSuite (clangBin : String := "clang") : IO Bool :=
       return false
     let lowBytes ← IO.FS.readBinFile lowObj
     let (lowElfOk, _) := verifyObjectBytesForTarget arch lowBytes
-    let lowNm ← IO.Process.output { cmd := "llvm-nm", args := #["-u", lowObj] }
+    let lowNm ← IO.Process.output { cmd := nmBin, args := #["-u", lowObj] }
     let lowSuOk ← System.FilePath.pathExists lowSu
     let lowSuTxt ← if lowSuOk then IO.FS.readFile lowSu else pure ""
     try IO.FS.removeFile lowObj catch _ => pure ()
@@ -155,8 +165,8 @@ def runLedgerEmbeddedClangSmokeSuite (clangBin : String := "clang") : IO Bool :=
       return false
     let fsBytes ← IO.FS.readBinFile fsObj
     let (fsElfOk, _) := verifyObjectBytesForTarget arch fsBytes
-    let fsNmU ← IO.Process.output { cmd := "llvm-nm", args := #["-u", fsObj] }
-    let fsNmAll ← IO.Process.output { cmd := "llvm-nm", args := #[fsObj] }
+    let fsNmU ← IO.Process.output { cmd := nmBin, args := #["-u", fsObj] }
+    let fsNmAll ← IO.Process.output { cmd := nmBin, args := #[fsObj] }
     let fsSuOk ← System.FilePath.pathExists fsSu
     let fsSuTxt ← if fsSuOk then IO.FS.readFile fsSu else pure ""
     try IO.FS.removeFile fsObj catch _ => pure ()

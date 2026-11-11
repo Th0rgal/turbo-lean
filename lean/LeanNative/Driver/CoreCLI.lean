@@ -780,25 +780,23 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
     TargetArch.wasm32.triple == "wasm32-unknown-unknown" && TargetArch.iosSimArm64.symbolPrefix == "_"
   let sve2AsmOk ← do
     let androidIr := emitLLVMOptimized optMod .androidArm64
-    let tmpLl := "/tmp/ln_sve2_verify.ll"
-    let home := (← IO.getEnv "HOME").getD "/root"
-    let clangCandidates := [s!"{home}/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang", s!"{home}/.elan/toolchains/leanprover--lean4---v4.31.0/bin/clang", "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang", "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin/clang"]
+    let tmpDir := (← IO.getEnv "TMPDIR").getD "/tmp"
+    let tmpLl := s!"{tmpDir}/ln_sve2_verify.ll"
+    let (home, sysroot, rawClangEnv) := ((← IO.getEnv "HOME").getD "/root", (← IO.getEnv "LEAN_SYSROOT").getD "", (← IO.getEnv "LEAN_NATIVE_CLANG_RAW").getD "")
+    let clangCandidates := (if rawClangEnv.isEmpty then [] else [rawClangEnv]) ++ (if sysroot.isEmpty then [] else [s!"{sysroot}/bin/clang"]) ++
+      [s!"{home}/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang", s!"{home}/.elan/toolchains/leanprover--lean4---v4.31.0/bin/clang", "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang", "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin/clang"]
     let mut clangCmd := "clang"
-    for cand in clangCandidates do
-      if ← System.FilePath.pathExists cand then clangCmd := cand; break
+    for cand in clangCandidates do if ← System.FilePath.pathExists cand then clangCmd := cand; break
     try
       IO.FS.writeFile tmpLl androidIr
       let out ← IO.Process.output { cmd := clangCmd, args := #["--target=aarch64-linux-android29", "-O3", "-Wno-override-module", "-S", tmpLl, "-o", "-"] }
       try IO.FS.removeFile tmpLl catch _ => pure ()
-      if out.exitCode != 0 then pure false
-      else
+      if out.exitCode != 0 then pure false else
         let asm := out.stdout
         let baseAsm := match asm.splitOn "lean_native_cpu_saxpy_u64__baseline:" with | _ :: after :: _ => (after.splitOn ".Lfunc_end").headD "" | _ => ""
         let sve2Asm := match asm.splitOn "lean_native_cpu_saxpy_u64__sve2:" with | _ :: after :: _ => (after.splitOn ".Lfunc_end").headD "" | _ => ""
         pure (!baseAsm.isEmpty && !sve2Asm.isEmpty && (baseAsm.splitOn "cntd").length == 1 && (baseAsm.splitOn "ld1d").length == 1 && (baseAsm.splitOn "st1d").length == 1 && (sve2Asm.splitOn "cntd").length > 1 && (sve2Asm.splitOn "ld1d").length > 1 && (sve2Asm.splitOn "mad").length > 1 && (sve2Asm.splitOn "st1d").length > 1)
-    catch _ =>
-      try IO.FS.removeFile tmpLl catch _ => pure ()
-      pure false
+    catch _ => (try IO.FS.removeFile tmpLl catch _ => pure ()); pure false
   let gpuHeadroomOk := gpuHeadroomOk && sve2AsmOk
   let specRaw ← if ← System.FilePath.pathExists "LeanNative/Spec.lean" then IO.FS.readFile "LeanNative/Spec.lean" else pure ""
   -- P-cert C4: the core binary has no elaborating frontend, so Spec.lean bindings use the `--signatures-only` path
