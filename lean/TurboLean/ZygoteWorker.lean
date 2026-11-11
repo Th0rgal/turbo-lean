@@ -2500,9 +2500,19 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
     (stubs : Std.HashSet Name := {})
     (unsafePatterns : List String := []) (implByPatterns : List String := [])
     (skipChildReplay : Bool := false)
-    (allowSorry : Bool := false) : IO (List String × List String) := do
+    (allowSorry : Bool := false) (isImportAudit : Bool := false) : IO (List String × List String) := do
   let sorryAxName := Name.mkSimple ("sor" ++ "ryAx")
-  let csimpAllowed := fun name : Name => csimpPatterns.any (globMatch ·.toList name.toString.toList)
+  -- Independent replay below authenticates theorem values. Import mode additionally checks
+  -- their complete axiom closure, even when a permissive caller allows native evaluation.
+  let verifiedCSimp := fun name : Name =>
+    (env.find? name).any fun ci => ci.isTheorem && (ci.type.eq?).isSome &&
+      (collectDeclAxioms {} env name).all (fun ax =>
+        ax != sorryAxName && ax != `Lean.trustCompiler &&
+        !(ax.toString.splitOn "ofReduceBool").length > 1 &&
+        !(ax.toString.splitOn "native_decide").length > 1 && isAllowedAxiom patterns ax)
+  let csimpAllowed := fun name : Name =>
+    if isImportAudit then verifiedCSimp name
+    else csimpPatterns.any (globMatch ·.toList name.toString.toList)
   let nameMatchesPolicy := fun (pats : List String) (name : Name) =>
     let raw := name.toString.toList
     let usr := (Lean.privateToUserName name).toString.toList
@@ -2541,6 +2551,27 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
               for u in tv.type.getUsedConstants ++ tv.value.getUsedConstants do
                 allRoots := allRoots.push u
   let axMap := collectForbiddenAxiomsByDecl env allRoots patterns stubs
+  -- Helper implementations are not logical roots. Follow kernel types and values from
+  -- safe declarations, never compiler IR or implemented_by edges. A safe caller that
+  -- actually mentions a bridge brings it back into the audited cone.
+  let kernelCone : Std.HashSet Name := Id.run do
+    if !isImportAudit then return {}
+    let mut work := allRoots.filter fun n => (env.find? n).any fun ci =>
+      !ci.isUnsafe && !Lean.isMarkedMeta env n && !Lean.isExtern env n &&
+        (Lean.Compiler.getImplementedBy? env n).isNone &&
+        !((env.getModuleIdxFor? n).bind fun idx =>
+          safeUnsafeCallWrapperBridgeParent? env idx n).isSome
+    let mut seen : Std.HashSet Name := {}
+    while !work.isEmpty do
+      let n := work.back!
+      work := work.pop
+      if seen.contains n then continue
+      seen := seen.insert n
+      if let some ci := env.find? n then
+        for used in ci.getUsedConstantsAsSet.toArray do
+          if !seen.contains used then work := work.push used
+    return seen
+  let auditHelper := fun n => !isImportAudit || kernelCone.contains n
   let hydratedEnvRef ← IO.mkRef (none : Option Environment)
   let cliqueCacheRef ← IO.mkRef ({} : Std.HashMap (Option ModuleIdx × Name) Bool)
   for (rawStr, nm) in targets do
@@ -2567,7 +2598,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
           if let some (lhs, rhs) := csimpReplacementPair? env cinfo.type then
             if !cinfo.isTheorem || !csimpAllowed declName then
               csimpCandidates := csimpCandidates.push (declName, lhs, rhs)
-          if cinfo.isUnsafe &&
+          if cinfo.isUnsafe && auditHelper declName &&
              !isWhitelistedInitExecUnsafe env modIdx cinfo &&
              !((safeUnsafeCallWrapperParent? env modIdx cinfo).any (fun pc => unsafeAllowed pc.name)) &&
              !unsafeAllowed declName then
@@ -2575,7 +2606,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
           if (cinfo.isPartial || (Lean.Compiler.isUnsafeRecName? declName).isSome) &&
              !(← isCompilerPartialRecDefn env hydratedEnvRef cliqueCacheRef patterns {} (some modIdx) cinfo #[] stubs.contains allowSorry) then
             violations := violations ++ [s!"[TurboLean.KernelGate] forged or unpaired _unsafe_rec/partial declaration `{declName}` in `{rawStr}` is forbidden"]
-          if (Lean.isExtern env declName || (Lean.Compiler.getImplementedBy? env declName).isSome) &&
+          if auditHelper declName && (Lean.isExtern env declName || (Lean.Compiler.getImplementedBy? env declName).isSome) &&
              !isWhitelistedInitExecBridge env modIdx declName &&
              !((safeUnsafeCallWrapperBridgeParent? env modIdx declName).any (fun pc => unsafeAllowed pc.name)) &&
              !isPinnedFfiOpaque env ffiAllow modIdx cinfo &&
@@ -2681,7 +2712,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
                     if fwdHit || revHit then
                       violations := violations ++ [s!"[TurboLean.KernelGate] local csimp replacement `{thmName}` ({lhs} <-> {rhs}) rewrote compiled code of `{callerName}` in `{rawStr}`{kernelPolicyHint "csimp" thmName}"]
         for extraName in mdata.extraConstNames do
-          if (Lean.isExtern env extraName || (Lean.Compiler.getImplementedBy? env extraName).isSome) &&
+          if auditHelper extraName && (Lean.isExtern env extraName || (Lean.Compiler.getImplementedBy? env extraName).isSome) &&
              !isWhitelistedInitExecBridge env modIdx extraName &&
              !((safeUnsafeCallWrapperBridgeParent? env modIdx extraName).any (fun pc => unsafeAllowed pc.name)) &&
              !((env.find? extraName).any (isPinnedFfiOpaque env ffiAllow modIdx)) &&
@@ -2698,7 +2729,12 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
   let checkCSimpEntry (e : Lean.Compiler.CSimp.Entry) : List String := Id.run do
     if !entryTouchesTarget e then
       return []
-    if (env.find? e.thmName).any (·.isTheorem) && csimpAllowed e.thmName then
+    let matchesEntry := (env.find? e.thmName).any fun ci =>
+      match ci.type.eq? with
+      | some (_, .const lhs _, .const rhs _) => lhs == e.fromDeclName && rhs == e.toDeclName
+      | _ => false
+    if (env.find? e.thmName).any (·.isTheorem) && csimpAllowed e.thmName &&
+        (!isImportAudit || matchesEntry) then
       return []
     let mut out : List String := []
     let mut seenMod : Std.HashMap ModuleIdx Bool := {}
@@ -2786,7 +2822,8 @@ def auditShardModule (target : String × Name) (ffiAllow : Array (Name × Name �
     return ([s!"[TurboLean.KernelGate] failed to import `{target.1}` for audit: {e}"], #[], [], [])
 
 def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name × Name × String) := #[])
-    (skipChildReplay : Bool := false) (allowSorry : Bool := false) : IO (List String) := do
+    (skipChildReplay : Bool := false) (allowSorry : Bool := false)
+    (isImportAudit : Bool := false) : IO (List String) := do
   if slice.isEmpty then
     return []
   let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
@@ -2810,7 +2847,7 @@ def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name ×
     pure (Except.error (toString e))
   match batchRes with
   | .ok env =>
-    let (vs, _) ← auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns {} unsafePatterns implByPatterns skipChildReplay allowSorry
+    let (vs, _) ← auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns {} unsafePatterns implByPatterns skipChildReplay allowSorry isImportAudit
     return vs
   | .error errMsg =>
     if slice.size == 1 then
@@ -2824,11 +2861,12 @@ def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name ×
       s!"--ffi-allow={m}={d}={sym}"
     let replayFlags : Array String := if skipChildReplay then #["--skip-child-replay"] else #[]
     let sorryFlags : Array String := if allowSorry then #["--allow-sorry"] else #[]
+    let importFlags : Array String := if isImportAudit then #["--audit-imports"] else #[]
     let runSubSlice (sub : Array (String × Name)) : IO (List String) := do
       let modFlags := sub.map (·.1)
       let child ← IO.Process.output {
         cmd := app
-        args := #["--audit-modules"] ++ replayFlags ++ sorryFlags ++ ffiFlags ++ modFlags
+        args := #["--audit-modules"] ++ importFlags ++ replayFlags ++ sorryFlags ++ ffiFlags ++ modFlags
       }
       if child.exitCode == 0 then
         return []
@@ -2845,7 +2883,8 @@ def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name ×
     return v1 ++ v2
 
 def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Name × String) := #[])
-    (skipChildReplay : Bool := false) (allowSorry : Bool := false) : IO (Bool × List String) := do
+    (skipChildReplay : Bool := false) (allowSorry : Bool := false)
+    (isImportAudit : Bool := false) : IO (Bool × List String) := do
   let mut parsed : Array (String × Name) := #[]
   let mut initViolations : List String := []
   for raw in modNames do
@@ -2858,7 +2897,7 @@ def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Nam
         parsed := parsed.push (trimmed, nm)
   if parsed.isEmpty then
     return (initViolations.isEmpty, initViolations)
-  let sliceViolations ← auditModuleSlice parsed ffiAllow skipChildReplay allowSorry
+  let sliceViolations ← auditModuleSlice parsed ffiAllow skipChildReplay allowSorry isImportAudit
   let allViolations := initViolations ++ sliceViolations
   return (allViolations.isEmpty, allViolations)
 
@@ -3682,6 +3721,8 @@ def main (args : List String) : IO Unit := do
     let (fastMapArgs, rest) := rest.partition (·.startsWith "--fast-map=")
     let (allowSorryFlags, rest) := rest.partition (· == "--allow-sorry")
     let (skipReplayFlags, rest) := rest.partition (· == "--skip-child-replay")
+    let (importAuditFlags, rest) := rest.partition (· == "--audit-imports")
+    let isImportAudit := !importAuditFlags.isEmpty || (← IO.getEnv "TURBO_LEAN_AUDIT_IMPORTS") == some "1"
     let (shardFlag, mods) := rest.partition (· == "--shard")
     let allowSorry := !allowSorryFlags.isEmpty
     let ffiAllow := ffiArgs.toArray.filterMap fun a =>
@@ -3705,7 +3746,7 @@ def main (args : List String) : IO Unit := do
     let (ok, violations, decls, declTypes, sorryDecls) ← match shardFlag.isEmpty, audited, fastMapOpt with
       | true, _, _ =>
         if stubArgs.isEmpty && fastMapArgs.isEmpty then
-          let (ok, vs) ← TurboLean.ZygoteWorker.auditCompiledModules mods ffiAllow (!skipReplayFlags.isEmpty) allowSorry
+          let (ok, vs) ← TurboLean.ZygoteWorker.auditCompiledModules mods ffiAllow (!skipReplayFlags.isEmpty) allowSorry isImportAudit
           pure (ok, vs, none, none, [])
         else pure (false, ["[TurboLean.KernelGate] --stub-ok / --fast-map requires --shard"], none, none, [])
       | false, _, none =>
