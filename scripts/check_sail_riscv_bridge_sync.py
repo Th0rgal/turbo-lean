@@ -13,9 +13,10 @@ Verifies:
    `079463134b9c50450b8393e1566a09fc492a34d9` (`len(packages) == 2`).
 3. `SailRiscvBridge` proof modules never import heavy monolithic generated modules
    (`LeanRV64D.InstsEnd`, `LeanRV64D.Step`, `LeanRV64D.ZicsrInsts`, `LeanRV64D.RiscvExtras`, or root `import LeanRV64D`),
-   contain `#verify_sail_riscv_bridge_axioms` (>= 116 unique audited theorems via `Lean.collectAxioms`
-   and `bridgedTheorems.Nodup`), and contain zero `sorry`, `sorryAx`, `admit`, `axiom`, `native_decide`,
-   `bv_decide`, `trustCompiler`, or `ofReduceBool` tokens outside Lean comments/strings.
+   contain `#verify_sail_riscv_bridge_axioms` (>= 122 unique audited theorems via `Lean.collectAxioms`,
+   `bridgedTheorems.Nodup`, and exact `allowedAxioms` allowlist), and contain zero `sorry`, `sorryAx`,
+   `admit`, `axiom`, `native_decide`, `bv_decide`, `trustCompiler`, or `ofReduceBool` tokens outside
+   Lean comments/strings.
 """
 from __future__ import annotations
 
@@ -50,7 +51,15 @@ FORBIDDEN_IMPORTS = re.compile(
     re.M,
 )
 
-MIN_AUDITED_THEOREMS = 116
+MIN_AUDITED_THEOREMS = 122
+
+EXPECTED_ALLOWED_AXIOMS: tuple[str, ...] = (
+    "propext",
+    "Classical.choice",
+    "Quot.sound",
+    "sys_enable_experimental_extensions",
+    "plat_term_write",
+)
 
 UPSTREAM_INSTSEND_REL = ".lake/packages/Lean_RV64D/LeanRV64D/InstsEnd.lean"
 PINNED_INSTSEND_SNIPPET_DIGESTS: dict[str, str] = {
@@ -388,6 +397,17 @@ def check_bridge_tree(root_dir: Path, sync_mirrors: bool = False) -> dict[str, o
             errors.append("SailRiscvBridge.lean missing `Lean.collectAxioms` audit")
         if "bridgedTheorems.Nodup" not in rb_stripped:
             errors.append("SailRiscvBridge.lean missing `bridgedTheorems.Nodup` uniqueness theorem")
+        if "allowedAxioms.contains" not in rb_stripped:
+            errors.append("SailRiscvBridge.lean missing `allowedAxioms.contains` enforcement")
+        ax_match = re.search(r"\bdef\s+allowedAxioms\s*:\s*List\s+Name\s*:=\s*\[(.*?)\]", rb_stripped, re.S)
+        if not ax_match:
+            errors.append("SailRiscvBridge.lean missing `def allowedAxioms : List Name := [...]` list")
+        else:
+            actual_axioms = tuple(re.findall(r"``([A-Za-z0-9_.?']+)", ax_match.group(1)))
+            if actual_axioms != EXPECTED_ALLOWED_AXIOMS:
+                errors.append(
+                    f"SailRiscvBridge.lean `allowedAxioms` mismatch: {actual_axioms} != {EXPECTED_ALLOWED_AXIOMS}"
+                )
         bridged_refs = re.findall(r"``SailRiscvBridge\.[A-Za-z0-9_?']+", rb_stripped)
         if len(bridged_refs) != len(set(bridged_refs)):
             seen_refs: set[str] = set()
@@ -1693,6 +1713,16 @@ class SelfTests(unittest.TestCase):
             errs = "\n".join(str(e) for e in rep_dup["errors"])
             self.assertIn("duplicate bridged theorem references", errs)
             self.assertIn(f"expected >= {MIN_AUDITED_THEOREMS}", errs)
+
+            tampered_ax_lean = orig_root_lean.replace(
+                "``plat_term_write",
+                "``plat_term_write\n  , ``riscv_f32Add",
+                1,
+            )
+            (b_root / "SailRiscvBridge.lean").write_text(tampered_ax_lean, encoding="utf-8")
+            rep_ax = check_bridge_tree(root)
+            self.assertFalse(rep_ax["ok"])
+            self.assertIn("`allowedAxioms` mismatch", "\n".join(str(e) for e in rep_ax["errors"]))
 
 
 def main() -> int:

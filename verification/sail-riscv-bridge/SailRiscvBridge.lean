@@ -118,6 +118,8 @@ def bridgedTheorems : List Name :=
   , ``SailRiscvBridge.rv64PmpAndPmaCheck_bisim_sail
   , ``SailRiscvBridge.rv64ReadWritePte_bisim_sail
   , ``SailRiscvBridge.rv64UpdateAndWritePte_bisim_sail
+  , ``SailRiscvBridge.pt_walk_nonleaf_step
+  , ``SailRiscvBridge.pt_walk_leaf0_step
   , ``SailRiscvBridge.rv64PtWalkSv39_bisim_sail
   , ``SailRiscvBridge.rv64PtWalkSv48_bisim_sail
   , ``SailRiscvBridge.rv64TranslateTlbHitAndMiss_bisim_sail
@@ -126,6 +128,8 @@ def bridgedTheorems : List Name :=
   , ``SailRiscvBridge.rv64ExceptionDelegateeAndSyncExc_bisim_sail
   , ``SailRiscvBridge.rv64InterruptPriorityAndDispatch_bisim_sail
   , ``SailRiscvBridge.rv64TrapHandlerMachineAndSupervisor_bisim_sail
+  , ``SailRiscvBridge.sailExecuteMret_Machine_run
+  , ``SailRiscvBridge.sailExecuteSret_legal_run
   , ``SailRiscvBridge.rv64Mret_bisim_sail
   , ``SailRiscvBridge.rv64Sret_bisim_sail
   , ``SailRiscvBridge.rv64FpEnablementAndNanBoxing_bisim_sail
@@ -136,13 +140,15 @@ def bridgedTheorems : List Name :=
   , ``SailRiscvBridge.rv64FpLoadStoreAndRvcExec_bisim_sail
   , ``SailRiscvBridge.rv64FpMoveAndClassifyExec_bisim_sail
   , ``SailRiscvBridge.rv64FpSignInjectAndMinMaxExec_bisim_sail
+  , ``SailRiscvBridge.rv64DeadBranchPlatformAxiomsUnreached_bisim_sail
+  , ``SailRiscvBridge.rv64FpFullWidth64NanBoxAndExec_bisim_sail
   ]
 
 set_option maxRecDepth 4096 in
 theorem bridgedTheorems_nodup : bridgedTheorems.Nodup := by
   decide
 
-def minAuditedTheorems : Nat := 116
+def minAuditedTheorems : Nat := 122
 
 def allowedAxioms : List Name :=
   [ ``propext
