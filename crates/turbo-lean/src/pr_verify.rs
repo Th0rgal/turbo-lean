@@ -12248,6 +12248,11 @@ globs = ["Demo.+"]
         let dir = std::env::temp_dir().join(format!(
             "turbo-aux-414-{}-{}", std::process::id(), pack::next_tmp_id()
         ));
+        struct DirGuard(PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+        }
+        let _guard = DirGuard(dir.clone());
         fs::create_dir_all(dir.join("Fixture"))?;
         fs::write(dir.join(".gitignore"), ".lake/\n")?;
         fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
@@ -12257,6 +12262,9 @@ globs = ["Demo.+"]
         let source = r#"import Lean
 namespace Fixture
 def double (n : Nat) := n + n
+def branch : Nat → Nat
+  | 0 => 0
+  | n + 1 => branch n + 1
 theorem double_eq_two_mul (n : Nat) : double n = 2 * n := by
   simp only [double]; omega
 private theorem private_double (n : Nat) : double n = 2 * n := by
@@ -12266,19 +12274,32 @@ theorem outer : True := by trivial
 where
   helper : True := trivial
 theorem «_proof_1» : True := trivial
+private theorem «_proof_2» : True := trivial
+theorem eq_def : True := trivial
+theorem induct : True := trivial
 end Fixture
 "#;
         fs::write(&file, source)?;
         git_init_and_commit(&dir, "baseline")?;
         stock_statement_build(&dir)?;
         let before = built_kernel_statements(&dir, None)?;
-        assert_eq!(before.len(), 6, "{before:?}");
+        assert_eq!(before.len(), 9, "{before:?}");
         let report = built_kernel_statement_report(&dir, None, false, None, None)?;
         assert!(report.audits.iter().any(|row| row.audit.ends_with("._proof_1_2")));
         assert!(report.audits.iter().any(|row| row.audit.ends_with(".eq_1")));
-        fs::write(&file, source.replace("simp only [double]", "unfold double"))?;
+        let churn = source.replace("simp only [double]", "unfold double").replace(
+            "theorem outer : True := by trivial",
+            "theorem outer : True := by\n  have _ := branch.eq_def\n  have _ := branch.congr_simp\n  have _ := branch.induct\n  trivial",
+        );
+        fs::write(&file, churn)?;
         stock_statement_build(&dir)?;
-        assert_eq!(before, built_kernel_statements(&dir, None)?);
+        let after = built_kernel_statements(&dir, None)?;
+        assert!(compare_kernel_statements(&before, &after).is_empty());
+        assert!(compare_kernel_statements(&after, &before).is_empty());
+        let report = built_kernel_statement_report(&dir, None, false, None, None)?;
+        for suffix in [".branch.eq_def", ".branch.congr_simp", ".branch.induct"] {
+            assert!(report.audits.iter().any(|row| row.audit.ends_with(suffix)), "{suffix}");
+        }
         let mut store = TurboStore::open(Some(&dir.join(".lake/gate-cache")))?;
         run_pr_verify_command(
             &mut store, true, dir.clone(), "HEAD".into(), "trusted".into(),
@@ -12289,8 +12310,12 @@ end Fixture
             ("private theorem priv_thm : 1 + 1 = 2 := rfl\n", "", ".priv_thm", true),
             ("priv_thm : 1 + 1 = 2", "priv_thm : 2 + 2 = 4", ".priv_thm", false),
             ("helper : True := trivial", "helper : 1 = 1 := rfl", ".outer.helper", false),
-            ("«_proof_1» : True := trivial", "«_proof_1» : 1 = 1 := rfl", "._proof_1", false),
-            ("theorem «_proof_1» : True := trivial\n", "", "._proof_1", true),
+            ("\ntheorem «_proof_1» : True := trivial", "\ntheorem «_proof_1» : 1 = 1 := rfl", "::Fixture._proof_1", false),
+            ("\ntheorem «_proof_1» : True := trivial\n", "\n", "::Fixture._proof_1", true),
+            ("«_proof_2» : True := trivial", "«_proof_2» : 1 = 1 := rfl", "._proof_2", false),
+            ("private theorem «_proof_2» : True := trivial\n", "", "._proof_2", true),
+            ("eq_def : True := trivial", "eq_def : 1 = 1 := rfl", ".eq_def", false),
+            ("induct : True := trivial", "induct : 1 = 1 := rfl", ".induct", false),
         ] {
             fs::write(&file, source.replace(old, new))?;
             stock_statement_build(&dir)?;
@@ -12300,7 +12325,37 @@ end Fixture
             assert_eq!(compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?),
                 vec![expected], "{suffix}");
         }
-        fs::remove_dir_all(dir)?;
+        fs::write(&file, "private theorem «_proof_1» : True := trivial\n")?;
+        stock_statement_build(&dir)?;
+        let private_before = built_kernel_statements(&dir, None)?;
+        assert_eq!(private_before.len(), 1);
+        for edited in ["private theorem «_proof_1» : 1 = 1 := rfl\n", ""] {
+            fs::write(&file, edited)?;
+            stock_statement_build(&dir)?;
+            assert_eq!(compare_kernel_statements(&private_before, &built_kernel_statements(&dir, None)?).len(), 1);
+        }
+        // Both escaped visibilities must retain source ranges under the module system.
+        let module_source = "module\nimport Lean\npublic theorem «_proof_1» : True := by trivial\nprivate theorem «_proof_2» : True := by trivial\n";
+        fs::write(&file, module_source)?;
+        stock_statement_build(&dir)?;
+        let before = built_kernel_statements(&dir, None)?;
+        assert_eq!(before.len(), 2, "{before:?}");
+        fs::write(&file, module_source.replace("by trivial", "by\n  have h : True := by trivial\n  exact h"))?;
+        stock_statement_build(&dir)?;
+        let after = built_kernel_statements(&dir, None)?;
+        assert!(compare_kernel_statements(&before, &after).is_empty());
+        assert!(compare_kernel_statements(&after, &before).is_empty());
+        for name in ["_proof_1", "_proof_2"] {
+            fs::write(&file, module_source.replace(
+                &format!("«{name}» : True := by trivial"),
+                &format!("«{name}» : 1 = 1 := rfl"),
+            ))?;
+            stock_statement_build(&dir)?;
+            let key = before.keys().find(|key| key.ends_with(name)).unwrap();
+            assert_eq!(compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?),
+                vec![key.clone()]);
+        }
+        println!("auxiliary proof/realization churn passes symmetrically; escaped public/private and reserved user statements remain pinned (including module headers)");
         Ok(())
     }
 

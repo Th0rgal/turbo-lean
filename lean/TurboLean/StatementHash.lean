@@ -214,12 +214,24 @@ def collectAxiomsCached (env : Environment) (c : Name) (memo : AxiomMemo) : Arra
 
 -- Import the union once: repeated importModules calls keep mapped olean regions alive.
 -- The encoding uses constant names, never import-order-dependent module indices.
-private def isAuxiliaryTheorem (env : Environment) (n : Name) : Bool :=
+private def isAuxiliaryTheorem (env : Environment) (mod : Name) (n : Name) : Bool :=
   -- Source ranges distinguish escaped user names (e.g. «_proof_1») from auxiliaries.
   -- Strip private prefixes so private theorems remain statement-pinned.
   let sourceDeclared := (declRangeExt.find? env n <|>
     declRangeExt.find? (level := .server) env n).isSome
-  !sourceDeclared && internal (Lean.privateToUserName n)
+  let userName := Lean.privateToUserName n
+  !sourceDeclared && (internal userName || match userName with
+    | .str p s =>
+      -- Lean 4.35 realization suffixes (Meta/{Eqns,CongrTheorems}, FunInd,
+      -- PartialFixpoint/Induction, BVDecide/Normalize/Enums, CtorIdxHInj).
+      -- isReservedName uses mkEqLikeNameFor's anonymous env.mainModule here.
+      (env.contains p || env.contains (mkPrivateNameCore mod p)) &&
+        (s ∈ ["eq_def", "eq_unfold", "congr_simp", "induct", "induct_unfolding",
+          "mutual_induct", "mutual_induct_unfolding", "fun_cases", "fun_cases_unfolding",
+          "fixpoint_induct", "mutual_fixpoint_induct", "partial_correctness",
+          "eq_iff_enumToBitVec_eq", "enumToBitVec_le", "eq_cond_enumToBitVec", "hinj"] ||
+          (s.startsWith "hcongr_" && (s.drop 7).toNat?.isSome))
+    | _ => false)
 where
   internal (n : Name) : Bool :=
     n.isInternalDetail || n.hasMacroScopes || match n with
@@ -262,7 +274,7 @@ def dumpWithState (env : Environment) (mod : Name) (seenInit : NameSet := {})
         unsafeDecls := unsafeDecls.push (pc.name.toString, (Lean.privateToUserName pc.name).toString)
       | none =>
         implByDecls := implByDecls.push (c.name.toString, (Lean.privateToUserName c.name).toString)
-    if c.isTheorem && !isAuxiliaryTheorem env c.name then
+    if c.isTheorem && !isAuxiliaryTheorem env mod c.name then
       emit <| Json.mkObj [("theorem", toJson c.name.toString),
         ("statement", statement c), ("deps", toJson (c.type.getUsedConstants.map Name.toString))]
       pending := pending ++ c.type.getUsedConstants
@@ -307,6 +319,8 @@ def statementHashCliMain (args : List String) : IO Unit := do
   let leanCmd := (← IO.getEnv "LEAN").getD "lean"
   initSearchPath (← findSysroot leanCmd)
   let imports : Array Import := args.toArray.map fun mod => { module := mod.toName, importAll := true }
+  -- importAll + .private load .olean.server/.private too: module-header private
+  -- user declarations need their ranges to override auxiliary-looking names.
   let env ← importModules imports {} 0 #[] true false .private
   let mut seen : NameSet := {}
   let mut axMemo : TurboLean.StatementHash.AxiomMemo := {}
