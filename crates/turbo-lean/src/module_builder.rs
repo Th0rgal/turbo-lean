@@ -5290,6 +5290,7 @@ fn resolve_lean_options_in(
             );
             elem = inner.trim();
         }
+        anyhow::ensure!(!elem.is_empty() && lean_scan(elem, ",")?.0.len() == 1, "Expected one `leanOptions` push element");
         let mut map = resolve_lean_options_in(&base, bindings, line, depth + 1, cache)?;
         map.extend(parse_lean_options_expr(&format!("#[{elem}]"))?);
         return Ok(map);
@@ -5668,6 +5669,7 @@ fn parse_lakefile_lean_inner(
         }
     }
     let mut current_block = DeclBlock::None;
+    let mut braced_target = false;
     let mut pending_default_target = false;
     let mut empty_roots: BTreeSet<usize> = BTreeSet::new();
     // Lake keeps only the last assignment of a repeated field; fail closed instead.
@@ -5682,6 +5684,16 @@ fn parse_lakefile_lean_inner(
         i += 1;
         if trimmed.is_empty() {
             continue;
+        }
+        if indent == 0 && braced_target {
+            anyhow::ensure!(trimmed == "}", "Unclosed braced Lake target: fail-closed static Lake config gate");
+            braced_target = false;
+            current_block = DeclBlock::None;
+            block_keys.clear();
+            continue;
+        }
+        if indent == 0 && trimmed.ends_with('{') {
+            braced_target = trimmed.starts_with("lean_lib ") || trimmed.starts_with("lean_exe ");
         }
         // A target declared on an indented line would be skipped below; Lake reads it.
         if indent > 0
@@ -6229,6 +6241,7 @@ fn parse_lakefile_lean_inner(
             }
         }
     }
+    anyhow::ensure!(!braced_target, "Unclosed braced Lake target: fail-closed static Lake config gate");
     if current_block == (DeclBlock::Package { braced: true }) {
         anyhow::bail!(
             "Unclosed `package ... {{` block in {}: fail-closed static Lake config gate",
@@ -6326,7 +6339,7 @@ where
                 });
             let tail = (words.next(), words.next());
             let tail_ok = matches!(tail, (None | Some("where"), None))
-                || (!is_root_pkg && kw == "package" && tail == (Some("{"), None));
+                || (!is_root_pkg && matches!(kw, "package" | "lean_lib" | "lean_exe") && tail == (Some("{"), None));
             if !name_ok || !tail_ok {
                 anyhow::bail!(
                     "Unsupported `{}` header `{}` in {} at line {}: fail-closed static Lake config gate",
@@ -7070,6 +7083,25 @@ fn finalize_package_config(
             let (p, h) = check_extern_lib_artifact(&pkg.pkg_root, &pkg.build_dir, &ext.name);
             ext.static_artifact_path = p;
             ext.static_artifact_blake3 = h;
+        }
+    }
+    // Static Lake configuration may disable warnings; verification must never inherit that.
+    // Normalize before validation so CLI/request boundaries retain their stricter contract.
+    for (more, weak, opts) in std::iter::once((&mut pkg.more_lean_args, &mut pkg.weak_lean_args, &mut pkg.lean_options))
+        .chain(pkg.libs.iter_mut().map(|l| (&mut l.more_lean_args, &mut l.weak_lean_args, &mut l.lean_options)))
+        .chain(pkg.exes.iter_mut().map(|e| (&mut e.more_lean_args, &mut e.weak_lean_args, &mut e.lean_options)))
+    {
+        for arg in more.iter_mut().chain(weak) {
+            if matches!(arg.as_str(), "-Dwarn.sorry=false" | "-Dweak.warn.sorry=false") {
+                *arg = arg.replace("=false", "=true");
+            }
+        }
+        for (key, value) in opts {
+            if matches!(key.to_lean_string().as_str(), "warn.sorry" | "weak.warn.sorry")
+                && matches!(value, LeanOptionValue::Bool(false))
+            {
+                *value = LeanOptionValue::Bool(true);
+            }
         }
     }
     let check_allowed_args = |args: &[String], scope: &str| -> Result<()> {
@@ -27143,7 +27175,7 @@ mod tests {
                                     } else {
                                         parse_lakefile_toml(&dir, &path, root)
                                     };
-                                    if allowed {
+                                    if allowed || (matches!(key.as_str(), "warn.sorry" | "weak.warn.sorry") && value == "false") {
                                         result.unwrap_or_else(|e| {
                                             panic!("{format}/{scope}/{field}/{arg}: {e:#}")
                                         });
@@ -27225,7 +27257,7 @@ lean_lib Later where
         assert!(pkg.libs[0].unsupported.is_some());
         assert!(pkg.unsupported.is_none());
         for bad in [
-            evmyul.replace("-DautoImplicit=false", "-Dwarn.sorry=false"),
+            evmyul.replace("-DautoImplicit=false", "-Ddebug.skipKernelTC=true"),
             evmyul.replace(
                 "moreServerOptions := #[⟨`autoImplicit, false⟩]",
                 "srcDir := \"../escape\"",
@@ -29119,6 +29151,44 @@ lean_exe «demo-exe» where
     }
 
     #[test]
+    fn test_static_sorry_options_are_forced_on() {
+        let dir = make_temp_test_dir("static_sorry");
+        for key in ["warn.sorry", "weak.warn.sorry"] {
+            for (file, source) in [
+                ("lakefile.toml", format!("name = \"demo\"\nmoreLeanArgs = [\"-D{key}=false\"]\nweakLeanArgs = [\"-D{key}=false\"]\n[leanOptions]\n{key} = false\n[[lean_lib]]\nname = \"Demo\"\n")),
+                ("lakefile.lean", format!("import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`{key}, false⟩]\n  moreLeanArgs := #[\"-D{key}=false\"]\n  weakLeanArgs := #[\"-D{key}=false\"]\n")),
+            ] {
+                let path = dir.join(file);
+                fs::write(&path, &source).unwrap();
+                let cfg = resolve_project_config(&dir).unwrap();
+                let pkg = &cfg.root_pkg;
+                let lib = &pkg.libs[0];
+                let (opts, strong, weak) = compose_effective_args(pkg, &lib.lean_options, &lib.more_lean_args, &lib.weak_lean_args);
+                let args = compose_flat_filtered_args_with_options(&weak, &strong, &opts);
+                assert!(args.contains(&format!("-D{key}=true")), "{args:?}");
+                assert!(!args.iter().any(|a| a.ends_with("sorry=false")));
+                for bad in ["debug.skipKernelTC", "pp.all"] {
+                    fs::write(&path, source.replace(key, bad).replace("false", "true")).unwrap();
+                    assert!(resolve_project_config(&dir).is_err());
+                }
+                fs::remove_file(path).unwrap();
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test] #[ignore = "requires warm PFR and Mathlib fixtures via TURBO_LEAN_WARM_ROOT"]
+    fn test_warm_pfr_static_configs() {
+        let root = PathBuf::from(std::env::var_os("TURBO_LEAN_WARM_ROOT").unwrap());
+        resolve_project_config(&root.join("pfr")).unwrap();
+        for entry in fs::read_dir(root.join("pfr/.lake/packages")).unwrap() {
+            resolve_package_config(&entry.unwrap().path(), false).unwrap();
+        }
+        let fixture = root.join("fixtures/mathlib-v4.35.0-lakefile.lean");
+        parse_lakefile_lean(fixture.parent().unwrap(), &fixture, false).unwrap();
+    }
+
+    #[test]
     fn test_computed_lean_options_scopes_continuations_and_lexing() {
         let dir = make_temp_test_dir("lean_opts_regress");
         let lf = dir.join("lakefile.lean");
@@ -29144,13 +29214,8 @@ lean_exe «demo-exe» where
             }
             assert!(parse(&src.replace("⟨`linter.b, true⟩", "arbitraryCode")).is_err());
         }
-        let deep = format!(
-            "#[]{}",
-            ".push ⟨`linter.a, true⟩".repeat(LEAN_OPTIONS_MAX_DEPTH + 1)
-        );
-        assert!(
-            resolve_lean_options_expr(&deep, &LakefileBindings::default(), usize::MAX).is_err()
-        );
+        let deep = format!("#[]{}", ".push ⟨`linter.a, true⟩".repeat(LEAN_OPTIONS_MAX_DEPTH + 1));
+        assert!(resolve_lean_options_expr(&deep, &LakefileBindings::default(), usize::MAX).is_err());
         // A same-named binding inside a namespace makes the reference ambiguous: fail closed
         // rather than pick a body (Lake would resolve the global one).
         let scoped = "import Lake\nopen Lake DSL\nabbrev opts : Array LeanOption := #[⟨`autoImplicit, false⟩]\nnamespace Other\nabbrev opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\nend Other\npackage demo\nlean_lib Demo where\n  leanOptions := opts\n";
@@ -29215,11 +29280,8 @@ lean_exe «demo-exe» where
             .contains("leanOptions"));
         // `leanOptions` pass the same flag gate as `moreLeanArgs`.
         let sorry_off = "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`warn.sorry, false⟩]\n";
-        let err = parse(sorry_off).unwrap_err().to_string();
-        assert!(
-            err.contains("warn.sorry") && err.contains("fail-closed"),
-            "{err}"
-        );
+        let pkg = parse(sorry_off).unwrap();
+        assert_eq!(opts(&pkg).values().next(), Some(&LeanOptionValue::Bool(true)));
         // Modified or attributed declarations are not bindings (same line or previous line).
         for decl in [
             "private abbrev opts : Array LeanOption := #[⟨`linter.a, true⟩]",
@@ -29246,14 +29308,13 @@ lean_exe «demo-exe» where
         let lib = |opts_expr: &str, prelude: &str| {
             format!("import Lake\nopen Lake DSL\n{prelude}package demo\nlean_lib Demo where\n  leanOptions := {opts_expr}\n")
         };
-        // `weak.warn.sorry=false` disables the sorry warning too, directly or via the weak map.
-        assert!(parse(&lib("#[⟨`weak.warn.sorry, false⟩]", "")).is_err());
+        // Static weak options are normalized too, including the weak-prefix map.
+        assert_eq!(opts(&parse(&lib("#[⟨`weak.warn.sorry, false⟩]", "")).unwrap()).values().next(), Some(&LeanOptionValue::Bool(true)));
         let ws = "abbrev ws : Array LeanOption := #[⟨`warn.sorry, false⟩]\n";
-        assert!(parse(&lib(
+        assert_eq!(opts(&parse(&lib(
             "ws.map fun s ↦ { s with name := `weak ++ s.name }",
             ws
-        ))
-        .is_err());
+        )).unwrap()).values().next(), Some(&LeanOptionValue::Bool(true)));
         // Option names must be name literals; LeanOption.mk validates key and value.
         for e in [
             "#[⟨optKey, false⟩]",
