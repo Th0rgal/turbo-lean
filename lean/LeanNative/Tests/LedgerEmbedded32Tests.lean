@@ -71,7 +71,10 @@ def heapAllocRejectModule : LNIRModule :=
     (ir.splitOn "i32 noundef %arg_v1").length > 1 &&
     (ir.splitOn "@malloc").length == 1 &&
     (ir.splitOn "@lean_alloc_ctor").length == 1 &&
-    (ir.splitOn "uwtable").length == 1
+    (ir.splitOn "uwtable").length == 1 &&
+    (ir.splitOn "minsize optsize").length > 1 &&
+    TargetArch.thumbv6m.clangFlags.contains "-ffunction-sections" &&
+    TargetArch.thumbv6m.clangFlags.contains "-fdata-sections"
   | .error _ => false
 
 #guard match emitLLVMFreestanding? ledgerSliceAndScalarModule .riscv32imac with

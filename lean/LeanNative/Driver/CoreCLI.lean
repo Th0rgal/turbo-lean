@@ -497,7 +497,7 @@ def runEmitFreestandingCLib (tag : String) (elaborateHook? : Option (String → 
   let ensureFlag (fs : Array String) (f : String) : Array String :=
     if fs.contains f then fs else fs.push f
   let clangFlags :=
-    ensureFlag (ensureFlag (ensureFlag (ensureFlag baseFlags "-ffreestanding") "-fno-builtin") "-nostdlib") "-fstack-usage"
+    ["-ffreestanding", "-fno-builtin", "-nostdlib", "-ffunction-sections", "-fdata-sections", "-fstack-usage"].foldl ensureFlag baseFlags
   let clangRes ← IO.Process.output { cmd := clangBin, args := clangFlags ++ #["-c", llPath, "-o", effObjPath] }
   if clangRes.exitCode != 0 || !(← System.FilePath.pathExists effObjPath) then
     throw <| IO.userError s!"[{tag}] Failed to compile freestanding object for {arch.triple} via '{clangBin}': {clangRes.stderr.trimAscii.toString}"

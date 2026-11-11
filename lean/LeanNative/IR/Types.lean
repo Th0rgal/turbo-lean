@@ -238,11 +238,11 @@ def clangFlags (t : TargetArch) (isaOverride? : Option IsaLevel := none) (wasmSi
     let simdFlags := if wasmSimd128 then #["-msimd128"] else #[]
     #["--target=wasm32-unknown-unknown", "-O3", "-Wno-override-module"] ++ simdFlags
   | .thumbv6m     =>
-    #["--target=thumbv6m-none-eabi", "-Oz", "-ffreestanding", "-fno-builtin", "-nostdlib", "-fstack-usage", "-Wno-override-module"]
+    #["--target=thumbv6m-none-eabi", "-Oz", "-ffreestanding", "-fno-builtin", "-nostdlib", "-ffunction-sections", "-fdata-sections", "-fstack-usage", "-Wno-override-module"]
   | .thumbv8mMain =>
-    #["--target=thumbv8m.main-none-eabi", "-Oz", "-ffreestanding", "-fno-builtin", "-nostdlib", "-fstack-usage", "-Wno-override-module"]
+    #["--target=thumbv8m.main-none-eabi", "-Oz", "-ffreestanding", "-fno-builtin", "-nostdlib", "-ffunction-sections", "-fdata-sections", "-fstack-usage", "-Wno-override-module"]
   | .riscv32imac  =>
-    #["--target=riscv32-unknown-none-elf", "-march=rv32imac", "-mabi=ilp32", "-Oz", "-ffreestanding", "-fno-builtin", "-nostdlib", "-fstack-usage", "-Wno-override-module"]
+    #["--target=riscv32-unknown-none-elf", "-march=rv32imac", "-mabi=ilp32", "-Oz", "-ffreestanding", "-fno-builtin", "-nostdlib", "-ffunction-sections", "-fdata-sections", "-fstack-usage", "-Wno-override-module"]
   | _             => #[s!"--target={t.triple}", "-O3", "-fPIC", "-Wno-override-module"]
 
 end TargetArch

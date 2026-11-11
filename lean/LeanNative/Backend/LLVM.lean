@@ -2354,7 +2354,10 @@ def emitMetadataFooter (target : TargetArch) (isaOverride? : Option IsaLevel := 
       [ "!9 = distinct !{!9, !1, !7, !10}",
         "!10 = !{!\"llvm.loop.vectorize.scalable.enable\", i1 true}" ]
     else []
-  let baseFnAttrs := if freestanding then "nounwind" else "nounwind uwtable"
+  let baseFnAttrs :=
+    if freestanding then
+      if target.isFreestandingEmbedded then "nounwind minsize optsize" else "nounwind"
+    else "nounwind uwtable"
   let attr0Body := if cpuAttr.isEmpty then baseFnAttrs else s!"{baseFnAttrs} {cpuAttr}"
   let attr1Body := if freestanding then "noinline nounwind optnone" else "noinline nounwind optnone uwtable"
   String.intercalate "\n" ([
