@@ -909,6 +909,15 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
   let st ← get
   let opt := st.optimized
   match expr with
+  | .scalar (.var sv) =>
+    if slotLLVMType ty == "ptr" then
+      copyVarSlot dst sv
+    else if ty.is256Bit || (← scalarExprIs256Bit (.var sv)) then
+      let val256 ← emitScalarExpr256 (.var sv)
+      storeI256ToVar dst val256
+    else
+      let val ← emitScalarExpr (.var sv)
+      storeI64ToVar dst val
   | .scalar e =>
     let is256 ← scalarExprIs256Bit e
     if ty.is256Bit || is256 then
@@ -1177,7 +1186,7 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
       let arrPtr ← loadVarAsPtr args.head!
       let szVal ← emitSarraySizeLoad "sz" arrPtr
       storeI64ToVar dst szVal
-    else if !isExt && slotLLVMType ty == "i64" then
+    else if !isExt && (slotLLVMType ty == "i64" || slotLLVMType ty == "ptr") then
       match localSig? with
       | some (paramTys, retSigTy) =>
         let argVals ← (args.zip paramTys).mapM fun (argVar, pTy) => do
@@ -1210,7 +1219,11 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
         let rAttr := sigLLVMAttr st.target retSigTy
         if llvmRTy == "void" then
           emitLine s!"  call void @{sanitizeSymbol callee}({argSig})"
-          storeI64ToVar dst "0"
+          if slotLLVMType ty == "ptr" then storePtrToVar dst "null" else storeI64ToVar dst "0"
+        else if llvmRTy == "ptr" then
+          let callRes ← freshTmp "call_ptr"
+          emitLine s!"  {callRes} = call {rAttr}ptr @{sanitizeSymbol callee}({argSig})"
+          storePtrToVar dst callRes
         else
           let callRes ← freshTmp "call"
           emitLine s!"  {callRes} = call {rAttr}{llvmRTy} @{sanitizeSymbol callee}({argSig})"
@@ -1226,7 +1239,7 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
           storeI64ToVar dst callRes64
       | none =>
         emitLine "  call void @llvm.trap()"
-        storeI64ToVar dst "0"
+        if slotLLVMType ty == "ptr" then storePtrToVar dst "null" else storeI64ToVar dst "0"
     else
       emitLine "  call void @llvm.trap()"
       let sTy := slotLLVMType ty
@@ -1672,7 +1685,7 @@ def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_
     let zAttr := sigLLVMAttr target p.ty
     let attrs :=
       if pTy == "ptr" then
-        if optimized then " noalias noundef" else " noundef"
+        if optimized && !(p.ty matches (.rawPtr _)) then " noalias noundef" else " noundef"
       else if pTy == "i8" || pTy == "i16" || pTy == "i32" || pTy == "i64" || pTy == "i256" || pTy == "double" then
         " " ++ zAttr ++ "noundef"
       else if zAttr != "" then " zeroext"
@@ -2459,9 +2472,13 @@ def emitLLVMABIWrapperDecl (d : LNIRDecl) (target : TargetArch := .x86_64) : Str
 
 def localScalarSigsOfModule (m : LNIRModule) : List (String × List LNIRType × LNIRType) :=
   let isLocalParamTy (ty : LNIRType) : Bool :=
-    isABIScalarIntType ty || ty == .f64 || (match ty with | .sarray _ => true | _ => false)
+    isABIScalarIntType ty || ty == .f64 || ty == .unit ||
+      (match ty with | .sarray _ | .rawPtr _ => true | _ => false)
+  let isLocalRetTy (ty : LNIRType) : Bool :=
+    isABIScalarIntType ty || ty == .f64 || ty == .unit ||
+      (match ty with | .rawPtr _ => true | _ => false)
   m.decls.filterMap fun d =>
-    if !isExternDecl d && (isABIScalarIntType d.retTy || d.retTy == .f64) && d.params.all (fun p => isLocalParamTy p.ty) then
+    if !isExternDecl d && isLocalRetTy d.retTy && d.params.all (fun p => isLocalParamTy p.ty) then
       some (d.name, d.params.map (·.ty), d.retTy)
     else none
 
@@ -2472,7 +2489,10 @@ def findUnsupportedLLVMCallInCodeAux (localSigs : List (String × List LNIRType 
       (callee == "lean_native_unbox_u64" && args.length == 1 && slotLLVMType ty == "i64") ||
       (callee == "lean_native_ensure_exclusive" && args.length == 1 && slotLLVMType ty == "ptr") ||
       (callee == "lean_native_sarray_len" && args.length == 1 && slotLLVMType ty == "i64") ||
-      (slotLLVMType ty == "i64" && localSigs.any (fun (nm, pTys, _) => nm == callee && pTys.length == args.length)))
+      (localSigs.any (fun (nm, pTys, rTy) =>
+        nm == callee && pTys.length == args.length &&
+        ((slotLLVMType ty == "i64" && slotLLVMType rTy == "i64") ||
+         (slotLLVMType ty == "ptr" && slotLLVMType rTy == "ptr")))))
     if !ok then some callee else findUnsupportedLLVMCallInCodeAux localSigs k
   | .letBind _ _ (.ctorGetScalar _ _ _) _ => some "ctorGetScalar"
   | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k | .parFor _ _ _ _ _ k =>

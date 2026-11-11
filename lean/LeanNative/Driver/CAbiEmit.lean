@@ -7,9 +7,10 @@ namespace LeanNative.Driver.CoreCLI
 open LeanNative.IR
 open LeanNative.IR.Codec
 
-private def lnirTypeToCType : LNIRType → String
+def lnirTypeToCType : LNIRType → String
   | .i1 | .i8 => "uint8_t" | .i16 | .f16 => "uint16_t" | .i32 => "uint32_t" | .i64 | .tuple _ => "uint64_t"
   | .usize => "size_t" | .u256 | .i256 => "const uint64_t*" | .f32 => "float" | .f64 => "double"
+  | .rawPtr .i8 => "uint8_t*" | .rawPtr .i16 => "uint16_t*" | .rawPtr .i32 => "const uint32_t*"
   | .rawPtr _ | .sarray _ | .objPtr | .taggedPtr | .storageMap => "void*" | .unit => "void"
 
 /-- C pointer and `size_t` width. Native LP64 targets are 8 bytes; `wasm32` is 4 bytes. -/
@@ -53,7 +54,8 @@ pointer to a non-empty slice.
 /-- Unboxed C99 scalar or slice-struct value carried by a generated binding. -/
 inductive C99ScalarType where
   | u8 | i8 | bool | cBool | u16 | i16 | u32 | i32 | u64 | i64 | usize | f32 | f64
-  | ptr | constPtr | u8Ptr | constU8Ptr | u64Ptr | constU64Ptr | f64Ptr | constF64Ptr
+  | ptr | constPtr | u8Ptr | constU8Ptr | u16Ptr | constU16Ptr | u32Ptr | constU32Ptr
+  | u64Ptr | constU64Ptr | f64Ptr | constF64Ptr
   | flatSlice | mutSlice
   deriving Repr, DecidableEq, Inhabited
 
@@ -67,6 +69,7 @@ def sizeOf (ty : C99ScalarType) (width : ArchWidth := .bits64) : Nat :=
   | .u32 | .i32 | .f32 => 4
   | .u64 | .i64 | .f64 => 8
   | .usize | .ptr | .constPtr | .u8Ptr | .constU8Ptr
+  | .u16Ptr | .constU16Ptr | .u32Ptr | .constU32Ptr
   | .u64Ptr | .constU64Ptr | .f64Ptr | .constF64Ptr => width.ptrBytes
   | .flatSlice | .mutSlice => 3 * width.ptrBytes
 
@@ -85,6 +88,8 @@ def cSpelling : C99ScalarType → String
   | .f32 => "float" | .f64 => "double"
   | .ptr => "void*" | .constPtr => "const void*"
   | .u8Ptr => "uint8_t*" | .constU8Ptr => "const uint8_t*"
+  | .u16Ptr => "uint16_t*" | .constU16Ptr => "const uint16_t*"
+  | .u32Ptr => "uint32_t*" | .constU32Ptr => "const uint32_t*"
   | .u64Ptr => "uint64_t*" | .constU64Ptr => "const uint64_t*"
   | .f64Ptr => "double*" | .constF64Ptr => "const double*"
   | .flatSlice => "lean_native_flat_slice_t" | .mutSlice => "lean_native_mut_slice_t"
@@ -109,6 +114,10 @@ def ofCSpelling? (raw : String) : Option C99ScalarType :=
   else if t == "const void*" then some .constPtr
   else if t == "uint8_t*" then some .u8Ptr
   else if t == "const uint8_t*" then some .constU8Ptr
+  else if t == "uint16_t*" then some .u16Ptr
+  else if t == "const uint16_t*" then some .constU16Ptr
+  else if t == "uint32_t*" then some .u32Ptr
+  else if t == "const uint32_t*" then some .constU32Ptr
   else if t == "uint64_t*" then some .u64Ptr
   else if t == "const uint64_t*" then some .constU64Ptr
   else if t == "double*" then some .f64Ptr
@@ -350,9 +359,10 @@ def emitPinnedSliceStaticAsserts (flatLayout mutLayout : C99StructLayout)
     "#endif",
     "#endif" ]
 
-private def lnirTypeToRustType : LNIRType → String
+def lnirTypeToRustType : LNIRType → String
   | .i1 | .i8 => "u8" | .i16 | .f16 => "u16" | .i32 => "u32" | .i64 | .tuple _ => "u64"
   | .usize => "usize" | .u256 | .i256 => "*const u64" | .f32 => "f32" | .f64 => "f64"
+  | .rawPtr .i8 => "*mut u8" | .rawPtr .i16 => "*mut u16" | .rawPtr .i32 => "*const u32"
   | .rawPtr _ | .sarray _ | .objPtr | .taggedPtr | .storageMap => "*mut core::ffi::c_void" | .unit => "()"
 
 structure CAbiBindingSig where
@@ -383,7 +393,7 @@ def emitC99FnProto (sig : C99FnSig) : String :=
     else String.intercalate ", " (sig.params.map fun p => s!"{p.ty.cSpelling} {p.name}")
   s!"{sig.retCSpelling} {sig.cSymbol}({params});"
 
-private def mapLeanTypeStr (tyRaw : String) : String × String :=
+def mapLeanTypeStr (tyRaw : String) : String × String :=
   let raw := tyRaw.trimAscii.toString
   let t := (if raw.startsWith "@&" then (raw.drop 2).trimAscii else raw.trimAscii).toString
   if t == "Bool" || t == "UInt8" then ("uint8_t", "u8")
@@ -393,7 +403,11 @@ private def mapLeanTypeStr (tyRaw : String) : String × String :=
   else if t == "Int64" || t == "Int" then ("int64_t", "i64")
   else if t == "USize" then ("size_t", "usize")
   else if t == "Float" then ("double", "f64")
-  else if t == "ByteArray" then ("const uint8_t*", "*const u8")
+  else if t == "Unit" then ("void", "()")
+  else if t == "ByteArray" || t == "ConstBytes" then ("const uint8_t*", "*const u8")
+  else if t == "MutBytes" then ("uint8_t*", "*mut u8")
+  else if t == "ConstU32s" then ("const uint32_t*", "*const u32")
+  else if t == "MutU16s" then ("uint16_t*", "*mut u16")
   else ("const void*", "*const core::ffi::c_void")
 
 /-- `(names : Ty)` groups as `(name, rawTy)`; a group without `:` yields `(…, "")`. -/
@@ -447,7 +461,7 @@ def extractLeanSourceCAbiAndGuards (raw : String) : List CAbiBindingSig × List 
       if tr.startsWith "def " || tr.startsWith "abbrev " then
         match symOpt with
         | some sym =>
-          let headerLines := tr :: (rest.take 3 |>.takeWhile (fun l =>
+          let headerLines := tr :: (rest.take 12 |>.takeWhile (fun l =>
             let t := l.trimAscii.toString
             !(t.startsWith "def ") && !(t.startsWith "@[") && !(t.startsWith "/--") && !(t.startsWith "--")))
           let fullSig := String.intercalate " " (headerLines.map (·.trimAscii.toString))
@@ -650,6 +664,10 @@ private def cTypeToSwiftType (cTy : String) : String :=
   else if cTy == "void" then "Void"
   else if cTy == "const uint8_t*" then "UnsafePointer<UInt8>?"
   else if cTy == "uint8_t*" then "UnsafeMutablePointer<UInt8>?"
+  else if cTy == "const uint16_t*" then "UnsafePointer<UInt16>?"
+  else if cTy == "uint16_t*" then "UnsafeMutablePointer<UInt16>?"
+  else if cTy == "const uint32_t*" then "UnsafePointer<UInt32>?"
+  else if cTy == "uint32_t*" then "UnsafeMutablePointer<UInt32>?"
   else if cTy == "const uint64_t*" then "UnsafePointer<UInt64>?"
   else if cTy == "uint64_t*" then "UnsafeMutablePointer<UInt64>?"
   else if cTy == "const double*" then "UnsafePointer<Double>?"

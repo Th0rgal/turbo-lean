@@ -379,15 +379,31 @@ private def envVarHasSarray (env : List (VarId × LNIRType)) (v : VarId) : Bool 
   | some t => t.containsSarray
   | none => false
 
+mutual
+  private def tyHasBoxedSarray : LNIRType → Bool
+    | .sarray _ => true
+    | .tuple fs => listHasBoxedSarray fs
+    | _ => false
+
+  private def listHasBoxedSarray : List LNIRType → Bool
+    | [] => false
+    | t :: ts => tyHasBoxedSarray t || listHasBoxedSarray ts
+end
+
+private def envVarHasBoxedSarray (env : List (VarId × LNIRType)) (v : VarId) : Bool :=
+  match env.lookup v with
+  | some t => tyHasBoxedSarray t
+  | none => false
+
 private def checkCallArgsCompat (env : List (VarId × LNIRType))
     (localSigs : List (String × List LNIRType × LNIRType))
     (callee : String) (args : List VarId) (dstTy : LNIRType) : Option String :=
   let anyBufArg := args.any (envVarHasSarray env)
-  if dstTy.containsSarray then
-    some "inconsistent_elem_type"
-  else
-    match localSigs.find? (fun (nm, pTys, _) => nm == callee && pTys.length == args.length) with
-    | some (_, pTys, _) =>
+  match localSigs.find? (fun (nm, pTys, _) => nm == callee && pTys.length == args.length) with
+  | some (_, pTys, rTy) =>
+    if (dstTy.containsSarray || rTy.containsSarray) && dstTy != rTy then
+      some "inconsistent_elem_type"
+    else
       let rec go : List VarId → List LNIRType → Option String
         | [], [] => none
         | av :: avs, pt :: pts =>
@@ -396,8 +412,14 @@ private def checkCallArgsCompat (env : List (VarId × LNIRType))
           | none => go avs pts
         | _, _ => some "inconsistent_elem_type"
       go args pTys
-    | none =>
-      if anyBufArg then some "inconsistent_elem_type" else none
+  | none =>
+    if localSigs.isEmpty then
+      if tyHasBoxedSarray dstTy || args.any (envVarHasBoxedSarray env) then
+        some "inconsistent_elem_type"
+      else none
+    else if dstTy.containsSarray || anyBufArg then
+      some "inconsistent_elem_type"
+    else none
 
 private def checkExprElemTypes (env : List (VarId × LNIRType))
     (localSigs : List (String × List LNIRType × LNIRType))

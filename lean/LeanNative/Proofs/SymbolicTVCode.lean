@@ -365,8 +365,12 @@ def symExecCode (fuel : Nat) (unrollBound : Nat) (st : SymExecState) (code : LNI
           | some 1 => stInit0.markU64Var accVar
           | some 2 => stInit0.markU256Var accVar
           | _ => stInit0
-      let stAfterLoop := symExecLoopUnroll loopBound 0 idxVar accVar ((stInit.clearVarSortTags idxVar).markU64Var idxVar)
-        (fun s => symExecCode fuel' loopBound s stepBody false)
+      let stAfterLoop :=
+        if loopBound == 0 then stInit.markUnsupported
+        else
+          let innerBound := if loopBound > 1 then 1 else 0
+          symExecLoopUnroll loopBound 0 idxVar accVar ((stInit.clearVarSortTags idxVar).markU64Var idxVar)
+            (fun s => symExecCode fuel' innerBound s stepBody false)
       symExecCode fuel' loopBound stAfterLoop k retExpand
     | .parFor outVar _lenVar inputs _elemTy _kernel k =>
       let stInputs := inputs.foldl (fun cur iv =>

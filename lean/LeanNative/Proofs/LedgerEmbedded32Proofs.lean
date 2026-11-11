@@ -384,4 +384,219 @@ theorem ledgerBip32Varint_e2e_nonvacuous
 #guard (ppLoweredDeclForTarget .thumbv8mMain ledgerBip32VarintDecl).isSome
 #guard (ppLoweredDeclForTarget .riscv32imac ledgerBip32VarintDecl).isSome
 
+/-! ## 4. Flat Pointer, Bounded Loop (`seqFor`), `Unit` (`void`), and Helper Call Proofs -/
+
+/-- All typed flat C99 pointer types (`const uint8_t*`, `uint8_t*`, `const uint16_t*`, `uint16_t*`,
+    `const uint32_t*`, `uint32_t*`) have exact 4-byte size and 4-byte alignment on ILP32 Ledger targets. -/
+theorem flatPtr_size4_align4_on_ledger32
+    (arch : TargetArch) (ty : C99ScalarType)
+    (hArch : isLedgerEmbeddedTarget arch)
+    (hTy : ty = .constU8Ptr ∨ ty = .u8Ptr ∨ ty = .constU16Ptr ∨
+           ty = .u16Ptr ∨ ty = .constU32Ptr ∨ ty = .u32Ptr) :
+    C99ScalarType.sizeOf ty (ArchWidth.ofTargetArch arch) = 4 ∧
+    C99ScalarType.alignOf ty (ArchWidth.ofTargetArch arch) = 4 := by
+  rw [archWidth_ofTargetArch_ledger arch hArch]
+  rcases hTy with rfl | rfl | rfl | rfl | rfl | rfl <;> exact ⟨rfl, rfl⟩
+
+/-- All typed flat C99 pointer types have exact 8-byte size and 8-byte alignment on 64-bit `x86_64`. -/
+theorem flatPtr_size8_align8_on_x86_64 (ty : C99ScalarType)
+    (hTy : ty = .constU8Ptr ∨ ty = .u8Ptr ∨ ty = .constU16Ptr ∨
+           ty = .u16Ptr ∨ ty = .constU32Ptr ∨ ty = .u32Ptr) :
+    C99ScalarType.sizeOf ty (ArchWidth.ofTargetArch .x86_64) = 8 ∧
+    C99ScalarType.alignOf ty (ArchWidth.ofTargetArch .x86_64) = 8 := by
+  rcases hTy with rfl | rfl | rfl | rfl | rfl | rfl <;> exact ⟨rfl, rfl⟩
+
+/-- Exact C99 and Rust FFI type emission for `.rawPtr (.i8 | .i16 | .i32)` and `.unit`. -/
+theorem lnirType_flatPtr_c_and_rust_abi :
+    lnirTypeToCType (.rawPtr .i8) = "uint8_t*" ∧
+    lnirTypeToCType (.rawPtr .i16) = "uint16_t*" ∧
+    lnirTypeToCType (.rawPtr .i32) = "const uint32_t*" ∧
+    lnirTypeToCType .unit = "void" ∧
+    lnirTypeToRustType (.rawPtr .i8) = "*mut u8" ∧
+    lnirTypeToRustType (.rawPtr .i16) = "*mut u16" ∧
+    lnirTypeToRustType (.rawPtr .i32) = "*const u32" ∧
+    lnirTypeToRustType .unit = "()" :=
+  ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Concrete freestanding declarations exercising `.rawPtr (.i8 | .i16 | .i32)`, `.rawLoad`,
+    `.rawStore`, bounded `.seqFor`, and `.unit` (`void`) return. -/
+def ledgerBytesEqDecl : LNIRDecl :=
+  { name := "llb_bytes_eq"
+  , params := [ { id := 0, name := "a", ty := .rawPtr .i8 }
+              , { id := 1, name := "b", ty := .rawPtr .i8 }
+              , { id := 2, name := "len", ty := .i32 } ]
+  , retTy := .i8
+  , body :=
+      .letBind 3 .i32 (.scalar (.constU64 0))
+        (.seqFor 4 3 2 5 3 .i32
+          (.letBind 6 .i8 (.rawLoad 0 4 .i8)
+            (.letBind 7 .i8 (.rawLoad 1 4 .i8)
+              (.letBind 8 .i32 (.scalar (.binOp .bitXor (.var 6) (.var 7)))
+                (.letBind 9 .i32 (.scalar (.binOp .bitOr (.var 5) (.var 8)))
+                  (.ret 9)))))
+          (.letBind 10 .i1 (.scalar (.binOp .eq (.var 5) (.constU64 0)))
+            (.ite 10
+              (.letBind 11 .i8 (.scalar (.constU64 1)) (.ret 11))
+              (.letBind 12 .i8 (.scalar (.constU64 0)) (.ret 12))))) }
+
+def ledgerSumU32Decl : LNIRDecl :=
+  { name := "llb_sum_u32"
+  , params := [ { id := 0, name := "arr", ty := .rawPtr .i32 }
+              , { id := 1, name := "len", ty := .i32 } ]
+  , retTy := .i64
+  , body :=
+      .letBind 2 .i64 (.scalar (.constU64 0))
+        (.seqFor 3 2 1 4 2 .i64
+          (.letBind 5 .i32 (.rawLoad 0 3 .i32)
+            (.letBind 6 .i64 (.scalar (.binOp .add (.var 4) (.var 5)))
+              (.ret 6)))
+          (.ret 4)) }
+
+def ledgerSortU16Decl : LNIRDecl :=
+  { name := "llb_sort_u16"
+  , params := [ { id := 0, name := "arr", ty := .rawPtr .i16 }
+              , { id := 1, name := "count", ty := .i32 } ]
+  , retTy := .unit
+  , body :=
+      .letBind 2 .i64 (.scalar (.constU64 0))
+        (.seqFor 3 2 1 4 2 .i64
+          (.letBind 5 .i16 (.rawLoad 0 3 .i16)
+            (.rawStore 0 3 5 .i16 (.ret 2)))
+          (.letBind 6 .unit (.scalar (.constU64 0)) (.ret 6))) }
+
+def ledgerSwapU8HelperDecl : LNIRDecl :=
+  { name := "l_swap_u8_helper"
+  , params := [ { id := 0, name := "buf", ty := .rawPtr .i8 }
+              , { id := 1, name := "i", ty := .i32 }
+              , { id := 2, name := "j", ty := .i32 } ]
+  , retTy := .unit
+  , body :=
+      .letBind 3 .i8 (.rawLoad 0 1 .i8)
+        (.letBind 4 .i8 (.rawLoad 0 2 .i8)
+          (.rawStore 0 1 4 .i8
+            (.rawStore 0 2 3 .i8
+              (.letBind 5 .unit (.scalar (.constU64 0)) (.ret 5))))) }
+
+/-- Concrete freestanding LNIR module exercising `.rawPtr (.i8 | .i16 | .i32)`, `.rawLoad`,
+    `.rawStore`, bounded `.seqFor`, `.unit` (`void`) return, and intra-module helper calls. -/
+def ledgerFlatPtrLoopModule : LNIRModule :=
+  { moduleName := "ledger_flat_ptr_loops"
+  , decls := [
+      ledgerBytesEqDecl,
+      ledgerSumU32Decl,
+      ledgerSortU16Decl,
+      ledgerSwapU8HelperDecl,
+      { name := "llb_swap_u8_entry"
+      , params := [ { id := 0, name := "buf", ty := .rawPtr .i8 }
+                  , { id := 1, name := "i", ty := .i32 }
+                  , { id := 2, name := "j", ty := .i32 } ]
+      , retTy := .unit
+      , body :=
+          .letBind 3 .unit (.call "l_swap_u8_helper" [0, 1, 2] .unit false)
+            (.ret 3) }
+    ] }
+
+/-- Every typed flat C99 pointer field placed by `placeC99Fields` on a 32-bit Ledger target
+    has exact 4-byte size, 4-byte alignment, and a 4-byte-aligned byte offset. -/
+theorem placeC99Fields_ledger32_flatPtr_aligned4
+    (arch : TargetArch) (specs : List C99FieldSpec)
+    (placed : List C99FieldLayout) (finalAlign : Nat) (f : C99FieldLayout)
+    (hArch : isLedgerEmbeddedTarget arch)
+    (hPlace : placeC99Fields specs (ArchWidth.ofTargetArch arch) = some (placed, finalAlign))
+    (hf : f ∈ placed)
+    (hPtr : f.ty = .constU8Ptr ∨ f.ty = .u8Ptr ∨ f.ty = .constU16Ptr ∨
+            f.ty = .u16Ptr ∨ f.ty = .constU32Ptr ∨ f.ty = .u32Ptr) :
+    f.size = 4 ∧ f.align = 4 ∧ 4 ∣ f.offset := by
+  unfold placeC99Fields at hPlace
+  rcases placeC99FieldsFrom_spec specs 0 1 (ArchWidth.ofTargetArch arch) placed finalAlign (by decide) hPlace with
+    ⟨_, _, hall, _⟩
+  rcases hall f hf with ⟨⟨_, hmod⟩, hszEq, halEq, _⟩
+  have hdvd : f.align ∣ f.offset := Nat.dvd_of_mod_eq_zero hmod
+  rcases flatPtr_size4_align4_on_ledger32 arch f.ty hArch hPtr with ⟨hsz4, hal4⟩
+  rw [hsz4] at hszEq
+  rw [hal4] at halEq
+  rw [halEq] at hdvd
+  exact ⟨hszEq, halEq, hdvd⟩
+
+/-- Universal freestanding gate preservation for flat-pointer `.rawLoad`:
+    binding a `.rawLoad` introduces zero heap ops, zero EVM storage ops, and zero heap runtime calls. -/
+theorem rawLoad_preserves_freestanding_gates
+    (dst : VarId) (dstTy : LNIRType) (pv iv : VarId) (et : LNIRType) (k : LNIRCode) :
+    codeHasHeapOps (.letBind dst dstTy (.rawLoad pv iv et) k) = codeHasHeapOps k ∧
+    codeHasStorageOps (.letBind dst dstTy (.rawLoad pv iv et) k) = codeHasStorageOps k ∧
+    codeHasHeapRuntimeCalls (.letBind dst dstTy (.rawLoad pv iv et) k) = codeHasHeapRuntimeCalls k :=
+  ⟨rfl, rfl, rfl⟩
+
+/-- Universal freestanding gate preservation for flat-pointer `.rawStore`:
+    sequencing a `.rawStore` introduces zero heap ops, zero EVM storage ops, and zero heap runtime calls. -/
+theorem rawStore_preserves_freestanding_gates
+    (pv iv vv : VarId) (et : LNIRType) (k : LNIRCode) :
+    codeHasHeapOps (.rawStore pv iv vv et k) = codeHasHeapOps k ∧
+    codeHasStorageOps (.rawStore pv iv vv et k) = codeHasStorageOps k ∧
+    codeHasHeapRuntimeCalls (.rawStore pv iv vv et k) = codeHasHeapRuntimeCalls k :=
+  ⟨rfl, rfl, rfl⟩
+
+/-- Universal freestanding gate preservation for bounded `.seqFor` loops:
+    if both `step` and `k` are free of heap ops, EVM storage ops, and heap runtime calls,
+    then `.seqFor` is also guaranteed free of all three. -/
+theorem seqFor_preserves_freestanding_gates
+    (idxVar loVar hiVar accVar accInit : VarId) (accTy : LNIRType) (step k : LNIRCode)
+    (hStepHeap : codeHasHeapOps step = false) (hKHeap : codeHasHeapOps k = false)
+    (hStepStor : codeHasStorageOps step = false) (hKStor : codeHasStorageOps k = false)
+    (hStepRt : codeHasHeapRuntimeCalls step = false) (hKRt : codeHasHeapRuntimeCalls k = false) :
+    codeHasHeapOps (.seqFor idxVar loVar hiVar accVar accInit accTy step k) = false ∧
+    codeHasStorageOps (.seqFor idxVar loVar hiVar accVar accInit accTy step k) = false ∧
+    codeHasHeapRuntimeCalls (.seqFor idxVar loVar hiVar accVar accInit accTy step k) = false := by
+  simp [codeHasHeapOps, codeHasStorageOps, codeHasHeapRuntimeCalls,
+    hStepHeap, hKHeap, hStepStor, hKStor, hStepRt, hKRt]
+
+/-- Soundness of `.unit` (`void`) return declarations and scalar `.rawPtr` parameters in freestanding mode:
+    `.unit` and `.rawPtr (.i8 | .i16 | .i32)` carry no heap objects (`containsHeapObject = false`),
+    `slotLLVMType .unit = "i64"` enables intra-module `void` helper calls, and `selectDeclRcMode` is `.freestanding`. -/
+theorem unit_and_flatPtr_freestanding_properties (d : LNIRDecl)
+    (hRet : d.retTy = .unit)
+    (hNoHeap : codeHasHeapOps d.body = false) :
+    selectDeclRcMode d = .freestanding ∧
+    d.retTy.containsHeapObject = false ∧
+    (LNIRType.rawPtr .i8).containsHeapObject = false ∧
+    (LNIRType.rawPtr .i16).containsHeapObject = false ∧
+    (LNIRType.rawPtr .i32).containsHeapObject = false ∧
+    slotLLVMType d.retTy = "i64" := by
+  rw [hRet]
+  exact ⟨selectDeclRcMode_eq_freestanding_of_no_heap d hNoHeap, rfl, rfl, rfl, rfl, rfl⟩
+
+/-- Decomposition of `checkFreestandingDecl = none`: any accepted declaration is heap-free,
+    uses `.freestanding` RC mode, contains no RC-ADT heap types, and passes `d.checkElemTypes localSigs`. -/
+theorem checkFreestandingDecl_full_sound
+    (localSigs : List (String × List LNIRType × LNIRType)) (d : LNIRDecl) (target : TargetArch)
+    (hOk : checkFreestandingDecl localSigs d target = none) :
+    codeHasHeapOps d.body = false ∧
+    selectDeclRcMode d = .freestanding ∧
+    d.containsRcAdt = false ∧
+    d.checkElemTypes localSigs = none := by
+  have hNoHeap := checkFreestandingDecl_no_heap localSigs d target hOk
+  have hRc := checkFreestandingDecl_rcMode_freestanding localSigs d target hOk
+  rcases checkFreestandingDecl_no_storage_or_runtime_calls localSigs d target hOk with ⟨_, _, hUnsup⟩
+  unfold findUnsupportedLLVMCallInDecl at hUnsup
+  cases hCall : findUnsupportedLLVMCallInCode localSigs d.body with
+  | some err =>
+    simp [hCall] at hUnsup
+  | none =>
+    simp only [hCall] at hUnsup
+    cases hAdt : d.containsRcAdt with
+    | true =>
+      simp [hAdt] at hUnsup
+    | false =>
+      simp [hAdt] at hUnsup
+      exact ⟨hNoHeap, hRc, rfl, hUnsup⟩
+
+#guard checkFreestandingModule ledgerFlatPtrLoopModule .thumbv6m == none
+#guard checkFreestandingModule ledgerFlatPtrLoopModule .thumbv8mMain == none
+#guard checkFreestandingModule ledgerFlatPtrLoopModule .riscv32imac == none
+#guard checkFreestandingModule ledgerFlatPtrLoopModule .x86_64 == none
+#guard (emitLLVMFreestanding? ledgerFlatPtrLoopModule .thumbv6m).isOk
+#guard (emitLLVMFreestanding? ledgerFlatPtrLoopModule .thumbv8mMain).isOk
+#guard (emitLLVMFreestanding? ledgerFlatPtrLoopModule .riscv32imac).isOk
+#guard (emitLLVMFreestanding? ledgerFlatPtrLoopModule .x86_64).isOk
+
 end LeanNative.Proofs.LedgerEmbedded32

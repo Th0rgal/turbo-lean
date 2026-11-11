@@ -494,7 +494,10 @@ def flattenInlinedHelperBody (d : LNIRDecl) : LNIRDecl :=
 
 def normalizeAndInlineLocalDefs (m : LNIRModule) : LNIRModule :=
   let step (cur : LNIRModule) : LNIRModule :=
-    let helpers := (cur.decls.filter (fun d => isSimpleInlinableBody d.name d.body)).map flattenInlinedHelperBody
+    let helpers := (cur.decls.filter (fun d =>
+      isSimpleInlinableBody d.name d.body &&
+      !d.retTy.containsSarray && d.retTy != .unit &&
+      d.params.all (fun p => !p.ty.containsSarray && p.ty != .unit))).map flattenInlinedHelperBody
     if helpers.isEmpty then cur
     else
       { cur with decls := cur.decls.map fun d =>

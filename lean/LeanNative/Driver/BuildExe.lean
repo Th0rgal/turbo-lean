@@ -95,6 +95,7 @@ def withElaboratedFrontend {α : Type} (filePath : String) (modName : Lean.Name)
   let rawInput ← IO.FS.readFile filePath
   let input ← expandUmbrellaSubmodules filePath rawInput
   let opts : Lean.Options := {}
+  unsafe Lean.enableInitializersExecution
   let some env ← Lean.Elab.runFrontend input opts filePath modName
     | throw <| IO.userError s!"Elaboration failed for {filePath}"
   let coreCtx : Lean.Core.Context := { fileName := filePath, fileMap := filePath.toFileMap, options := opts }

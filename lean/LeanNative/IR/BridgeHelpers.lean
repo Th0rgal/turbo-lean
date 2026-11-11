@@ -3,6 +3,8 @@ import Lean.Compiler.LCNF.Basic
 import Lean.Compiler.LCNF.PhaseExt
 import Lean.Compiler.LCNF.Passes
 import Lean.Compiler.LCNF.PassManager
+import Lean.Compiler.LCNF.ToDecl
+import Lean.Compiler.LCNF.Simp
 import Lean.Compiler.LCNF.ToImpureType
 import Lean.Compiler.LCNF.SimpleGroundExpr
 import Lean.Compiler.NameMangling
@@ -25,6 +27,35 @@ open Lean.Compiler.LCNF
 
 def hasSimpleGroundDecl (env : Lean.Environment) (declName : Lean.Name) : Bool :=
   Lean.Compiler.LCNF.isSimpleGroundDecl env declName
+
+/-- Effect-anchoring combinator used internally during freestanding flat-pointer LCNF preparation so
+    `simp` preserves side-effecting `writeU8` / `writeU16` / `forRangeUnit` bindings before `Return`/`Jmp`. -/
+@[noinline] def leanNativeKeepEffect {α β : Sort _} (_eff : α) (val : β) : β := val
+
+def isFreestandingStubCombinatorLeaf : String → Bool
+  | "readU8" | "readMutU8" | "writeU8" | "readU32" | "readMutU16" | "writeU16"
+  | "forRangeU64" | "forRangeU32" | "forRangeUnit" | "forRange" => true
+  | _ => false
+
+def isFreestandingStubCombinatorName : Lean.Name → Bool
+  | .str _ s => isFreestandingStubCombinatorLeaf s
+  | _ => false
+
+def isFreestandingSideEffectStubName : Lean.Name → Bool
+  | .str _ s =>
+    s == "writeU8" || s == "writeU16" ||
+    s == "forRangeUnit" || s == "forRangeU64" || s == "forRangeU32" || s == "forRange"
+  | _ => false
+
+def flatPtrCombinatorType? : Lean.Name → Option LNIRType
+  | .str _ "ConstBytes" | .str _ "MutBytes" => some (.rawPtr .i8)
+  | .str _ "MutU16s" => some (.rawPtr .i16)
+  | .str _ "ConstU32s" => some (.rawPtr .i32)
+  | _ => none
+
+def isSupportedFlatPtrType : LNIRType → Bool
+  | .rawPtr .i8 | .rawPtr .i16 | .rawPtr .i32 | .rawPtr .i64 => true
+  | _ => false
 
 def mangleDeclName (declName : Lean.Name) : String :=
   if declName == `main then "_lean_main" else declName.mangle
@@ -156,7 +187,8 @@ def isSupportedScalarOrFloat (ty : LNIRType) (arch : TargetArch) : Bool :=
   isSupportedStage1BScalarType ty arch || ty == .f64
 
 def isSupportedParamOrRetType (ty : LNIRType) (arch : TargetArch) (allowSlice : Bool := false) : Bool :=
-  isSupportedStage1BScalarOrTuple ty arch || ty == .f64 || (allowSlice && isSupportedSliceType ty)
+  isSupportedStage1BScalarOrTuple ty arch || ty == .f64 ||
+    isSupportedFlatPtrType ty || (allowSlice && isSupportedSliceType ty)
 
 def exprCodomainIsProp (env? : Option Lean.Environment) (e : Lean.Expr) : Bool :=
   let e := e.consumeMData
@@ -208,6 +240,7 @@ partial def lowerImpureType (e : Lean.Expr) (env? : Option Lean.Environment := n
       else if declName == ``Float then .f64
       else if declName == ``Bool then .i1
       else if declName == ``Unit || declName == ``PUnit || declName == ``lcErased || declName == ``lcVoid then .unit
+      else if let some fpTy := flatPtrCombinatorType? declName then fpTy
       else if declName == ``ByteArray then .sarray .i8
       else if declName == ``FloatArray then .sarray .f64
       else if declName == ``Array then .sarray (args[0]?.map (lowerImpureType · env?) |>.getD .taggedPtr)
@@ -278,7 +311,7 @@ def isSupportedStage1DHeapAdtExpr (env : Lean.Environment) (arch : TargetArch) (
     let args := e.getAppArgs.toList
     match fn with
     | .const declName _ =>
-      if (nullaryEnumScalarType? env e).isSome ||
+      if (nullaryEnumScalarType? env e).isSome || (flatPtrCombinatorType? declName).isSome ||
          declName == ``Prod || declName == ``MProd || declName == ``PProd ||
          declName == ``Bool || declName == ``Unit || declName == ``PUnit || declName == ``Nat ||
          declName == ``String || declName == ``ByteArray || declName == ``FloatArray || declName == ``Array then
@@ -347,6 +380,7 @@ def validateSupportedTypeM (ctx : String) (rawTy : Lean.Expr) (ty : LNIRType) (a
     Lean.throwError s!"[lean-native] Unsupported USize in {ctx} on target `{reprStr arch}`"
   let scalarTupleSliceOk :=
     isSupportedStage1BScalarOrTuple ty arch || (allowFloat && ty == .f64) ||
+      isSupportedFlatPtrType ty ||
       (allowSlice && !arch.isWasm && isSupportedSliceType ty)
   if !(scalarTupleSliceOk || (allowInternalObj && (ty == .objPtr || ty == .taggedPtr))) then
     Lean.throwError s!"[lean-native] Unsupported non-scalar {ctx} type `{rawTy}` (lowered as `{reprStr ty}`)"
@@ -385,11 +419,13 @@ def checkEnvConstSignatureM (env : Lean.Environment) (declName : Lean.Name) (arc
       if !retExpr.hasLooseBVars then
         let rTy := lowerImpureType retExpr (some env)
         if isExported then
-          validateSupportedTypeM s!"exported return type of `{declName}`" retExpr rTy arch false false false
+          if rTy != .unit then
+            validateSupportedTypeM s!"exported return type of `{declName}`" retExpr rTy arch false false false
           if rTy matches (.tuple _) then
             Lean.throwError s!"[lean-native] Unsupported exported tuple return type in `{declName}`"
         else if !(isStage1D && isSupportedStage1DHeapAdtExpr env arch retExpr) then
-          validateSupportedTypeM s!"return type of `{declName}`" retExpr rTy arch false false true
+          if rTy != .unit then
+            validateSupportedTypeM s!"return type of `{declName}`" retExpr rTy arch false false true
   go 0 cinfo.type
 
 def collectEnvExplicitParamTypes (env : Lean.Environment) (declName : Lean.Name) : List LNIRType :=
@@ -417,6 +453,7 @@ structure BridgeState where
   jpMap            : Std.HashMap Lean.FVarId (Array (Lean.Compiler.LCNF.Param .impure) × LNIRCode) := {}
   jpIndexMap       : Std.HashMap Lean.FVarId Nat := {}
   localFunMap      : Std.HashMap Lean.FVarId (List VarId × LNIRCode) := {}
+  liftedClosureMap : Std.HashMap Lean.FVarId (Lean.Name × Array (Lean.Compiler.LCNF.Arg .pure)) := {}
   nextVarId        : VarId := 0
   hasExtern        : Bool := false
   mangledSymbol    : String := ""
@@ -472,7 +509,8 @@ def lowerArg (arg : Lean.Compiler.LCNF.Arg pu) (allowInternalObj : Bool := false
       Lean.throwError "[lean-native] Unsupported higher-order / escaping local function value"
     let vid ← internFVar fvarId
     let vTy ← getVarType vid
-    if !(isSupportedParamOrRetType vTy (← get).arch true || (allowInternalObj && (vTy == .objPtr || vTy == .taggedPtr))) then
+    if !(isSupportedParamOrRetType vTy (← get).arch true || vTy == .unit ||
+         (allowInternalObj && (vTy == .objPtr || vTy == .taggedPtr))) then
       Lean.throwError s!"[lean-native] Unsupported non-scalar argument of type `{reprStr vTy}`"
     return vid
   | .erased => freshBridgeVar .unit
@@ -597,7 +635,7 @@ partial def freshenJoinPointCode (subst : Std.HashMap VarId VarId) (code : LNIRC
     let ty' ← match val' with
       | .scalar (.var sv) =>
         let sTy ← getVarType sv
-        pure (if isUnboxedScalarOrTuple sTy && (ty == .objPtr || ty == .taggedPtr) then sTy else ty)
+        pure (if (isUnboxedScalarOrTuple sTy || isSupportedFlatPtrType sTy) && (ty == .objPtr || ty == .taggedPtr) then sTy else ty)
       | .mkTuple fs => pure (.tuple (← fs.mapM getVarType))
       | .projTuple tv idx =>
         match (← getVarType tv) with
@@ -727,7 +765,8 @@ def tryLowerGfSimdIntrinsic (env : Lean.Environment) (fnName : Lean.Name) (argVa
 def internParams {pu} (params : Array (Lean.Compiler.LCNF.Param pu)) (allowInternalObj : Bool := false) : BridgeM Unit := do
   for p in params do
     let pTy ← lowerBridgeType p.type
-    checkBridgeType "parameter" p.type pTy allowInternalObj
+    if pTy != .unit then
+      checkBridgeType "parameter" p.type pTy allowInternalObj
     let _ ← internFVar p.fvarId pTy true
 
 def lowerRefOp (isInc : Bool) (fvarId : Lean.FVarId) (n : Nat) (kCode : LNIRCode) : BridgeM LNIRCode := do
@@ -1113,8 +1152,10 @@ def lowerJoinPoint {pu} (decl : Lean.Compiler.LCNF.FunDecl pu) (k : Lean.Compile
     (lowerCodeFn : Lean.Compiler.LCNF.Code pu → BridgeM LNIRCode) : BridgeM LNIRCode := do
   if codeHasRecursiveJmp decl.fvarId decl.value then
     Lean.throwError s!"[lean-native] unsupported recursive join point `{decl.fvarId.name}`: no qualified loop lowering"
-  let jpTy ← lowerBridgeType decl.type
-  checkBridgeType "join-point result" decl.type jpTy true
+  let jpRetExpr := decl.type.getForallBody
+  let jpTy ← lowerBridgeType jpRetExpr
+  if jpTy != .unit then
+    checkBridgeType "join-point result" jpRetExpr jpTy true
   let _ ← internFVar decl.fvarId jpTy
   internParams decl.params true
   let impParams := toImpureParams decl.params
@@ -1218,7 +1259,8 @@ def lowerLocalFunDecl {pu} (decl : Lean.Compiler.LCNF.FunDecl pu) (k : Lean.Comp
   let mut pIds : List VarId := []
   for p in decl.params do
     let pTy ← lowerBridgeType p.type
-    checkBridgeType "local function parameter" p.type pTy
+    if pTy != .unit then
+      checkBridgeType "local function parameter" p.type pTy
     let pid ← internFVar p.fvarId pTy true
     pIds := pIds ++ [pid]
   let fBody ← lowerCodeFn decl.value
@@ -1232,11 +1274,27 @@ partial def inlineLocalFunCode (ren : Std.HashMap VarId VarId) (dst : VarId) (ds
     let freshDst ← freshBridgeVar bTy
     let k' ← inlineLocalFunCode (ren.insert bDst freshDst) dst dstTy cont k
     return .letBind freshDst bTy val' k'
+  | .rawStore pv iv vv et k => do
+    let k' ← inlineLocalFunCode ren dst dstTy cont k
+    return .rawStore (ren.getD pv pv) (ren.getD iv iv) (ren.getD vv vv) et k'
   | .ite cv t e => do
     let t' ← inlineLocalFunCode ren dst dstTy cont t
     let e' ← inlineLocalFunCode ren dst dstTy (← freshenJoinPointCode {} cont) e
     return .ite (ren.getD cv cv) t' e'
-  | .ret rv => return .letBind dst dstTy (.scalar (.var (ren.getD rv rv))) cont
+  | .seqFor iv lv hv av ai aty step k => do
+    let freshIv ← freshBridgeVar .i64
+    let freshAv ← freshBridgeVar aty
+    let stepRen := (ren.insert iv freshIv).insert av freshAv
+    let kRen := ren.insert av freshAv
+    let step' ← freshenJoinPointCode stepRen step
+    let k' ← inlineLocalFunCode kRen dst dstTy cont k
+    return .seqFor freshIv (ren.getD lv lv) (ren.getD hv hv) freshAv (ren.getD ai ai) aty step' k'
+  | .ret rv =>
+    let rv' := ren.getD rv rv
+    if dstTy == .unit then
+      return .letBind dst .unit (.scalar (.constU64 0)) cont
+    else
+      return .letBind dst dstTy (.scalar (.var rv')) cont
   | .unreachable => return .unreachable
   | _ => Lean.throwError "[lean-native] Unsupported non-scalar instruction inside local function body"
 
@@ -1420,21 +1478,31 @@ def filterNonInternalHelperDecls (env : Lean.Environment) (rawPairs : List (Lean
     isSupportedStage1BScalarOrTuple ty arch || ty == .objPtr || ty == .taggedPtr
   let keepNames : List String ← rawPairs.filterMapM fun (origName, mangled) => do
     let isExported := (Lean.getExportNameFor? env origName).isSome
+    if !isExported && isFreestandingStubCombinatorName origName then
+      return none
     let isUserConst := (env.find? origName).isSome && !origName.isInternalDetail && !isClosedConstHelperName origName
     if !(isExported || isUserConst) then
       return none
     match mod.decls.find? (·.name == mangled) with
     | none => return none
     | some d =>
+      let isSupportedExportedParam (p : LNIRParam) : Bool :=
+        isSupportedStage1BScalarType p.ty arch || isSupportedFlatPtrType p.ty ||
+        (arch.isFreestandingEmbedded && p.borrow && isSupportedSliceType p.ty)
+      let isSupportedExportedRet (t : LNIRType) : Bool :=
+        isSupportedStage1BScalarType t arch || isSupportedFlatPtrType t || t == .unit
+      let isSupportedUserParam (p : LNIRParam) : Bool :=
+        isSupportedScalarOrFloat p.ty arch || isSupportedFlatPtrType p.ty || (p.borrow && isSupportedSliceType p.ty)
+      let isSupportedUserRet (t : LNIRType) : Bool :=
+        isSupportedScalarOrFloat t arch || isSupportedFlatPtrType t || t == .unit
       let hasExportedNonScalarSig :=
-        d.params.any (fun p => !(isSupportedStage1BScalarType p.ty arch ||
-          (arch.isFreestandingEmbedded && p.borrow && isSupportedSliceType p.ty))) ||
-        !isSupportedStage1BScalarType d.retTy arch ||
-        (inferReturnedType d.body |>.any (fun rt => !isSupportedStage1BScalarType rt arch))
+        d.params.any (fun p => !isSupportedExportedParam p) ||
+        !isSupportedExportedRet d.retTy ||
+        (d.retTy != .unit && (inferReturnedType d.body |>.any (fun rt => !isSupportedExportedRet rt)))
       let hasUserUnsupportedSig :=
-        d.params.any (fun p => !(isSupportedScalarOrFloat p.ty arch || (p.borrow && isSupportedSliceType p.ty))) ||
-        !isSupportedScalarOrFloat d.retTy arch ||
-        (inferReturnedType d.body |>.any (fun rt => !isSupportedScalarOrFloat rt arch))
+        d.params.any (fun p => !isSupportedUserParam p) ||
+        !isSupportedUserRet d.retTy ||
+        (d.retTy != .unit && (inferReturnedType d.body |>.any (fun rt => !isSupportedUserRet rt)))
       if isExported then
         if hasExportedNonScalarSig || codeHasResidualHeapOrTupleAbiOp d.body then
           Lean.throwError s!"[lean-native] Exported function `{origName}` has unsupported non-scalar signature or unlowered tuple/heap operations"
@@ -1464,8 +1532,8 @@ def filterNonInternalHelperDecls (env : Lean.Environment) (rawPairs : List (Lean
     if stage1DMangled.contains d.name then
       if d.params.any (fun p => !isStage1DParamOrRet p.ty) || !isStage1DParamOrRet d.retTy then
         Lean.throwError s!"[lean-native] Live Stage 1D declaration `{d.name}` has unsupported signature"
-    else if d.params.any (fun p => !(isSupportedScalarOrFloat p.ty arch || (p.borrow && isSupportedSliceType p.ty))) ||
-       !isSupportedScalarOrFloat d.retTy arch ||
+    else if d.params.any (fun p => !(isSupportedScalarOrFloat p.ty arch || isSupportedFlatPtrType p.ty || (p.borrow && isSupportedSliceType p.ty))) ||
+       !(isSupportedScalarOrFloat d.retTy arch || isSupportedFlatPtrType d.retTy || d.retTy == .unit) ||
        codeHasResidualHeapOrTupleAbiOp d.body then
       Lean.throwError s!"[lean-native] Live declaration `{d.name}` retains non-scalar signature or unlowered object operations"
   return { mod with decls := filteredDecls }
@@ -2273,10 +2341,255 @@ def expandCompilerAuxDecls (declNames : Array Lean.Name) : Lean.CoreM (Array Lea
         out := out.push red
   return out
 
+private partial def exprUsesFreestandingFlatPtr (e : Lean.Expr) : Bool :=
+  match e with
+  | .const nm _ => (flatPtrCombinatorType? nm).isSome
+  | .app f a => exprUsesFreestandingFlatPtr f || exprUsesFreestandingFlatPtr a
+  | .lam _ d b _ | .forallE _ d b _ => exprUsesFreestandingFlatPtr d || exprUsesFreestandingFlatPtr b
+  | .letE _ t v b _ => exprUsesFreestandingFlatPtr t || exprUsesFreestandingFlatPtr v || exprUsesFreestandingFlatPtr b
+  | .mdata _ b | .proj _ _ b => exprUsesFreestandingFlatPtr b
+  | _ => false
+
+private partial def codeHasSideEffectCombinator (extraEffDecls : Lean.NameSet) (code : Lean.Compiler.LCNF.Code .pure) : Bool :=
+  match code with
+  | .let decl k =>
+    let here := match decl.value with
+      | .const fn _ _ _ => isFreestandingSideEffectStubName fn || extraEffDecls.contains fn
+      | _ => false
+    here || codeHasSideEffectCombinator extraEffDecls k
+  | .fun decl k | .jp decl k =>
+    codeHasSideEffectCombinator extraEffDecls decl.value || codeHasSideEffectCombinator extraEffDecls k
+  | .cases c => c.alts.any (fun alt => codeHasSideEffectCombinator extraEffDecls alt.getCode)
+  | .jmp _ _ | .return _ | .unreach _ => false
+
+private partial def anchorFreestandingEffectsCode (extraEffDecls : Lean.NameSet) (retTy : Lean.Expr)
+    (jpTypes : Std.HashMap Lean.FVarId Lean.Expr) (effs : Array (Lean.FVarId × Lean.Expr))
+    (code : Lean.Compiler.LCNF.Code .pure) : Lean.Compiler.LCNF.CompilerM (Lean.Compiler.LCNF.Code .pure) := do
+  let chainEffects (resId : Lean.FVarId) (resTy : Lean.Expr) (es : Array (Lean.FVarId × Lean.Expr)) :
+      Lean.Compiler.LCNF.CompilerM (Array (Lean.Compiler.LCNF.LetDecl .pure) × Lean.FVarId) := do
+    let mut curId := resId
+    let mut lets : Array (Lean.Compiler.LCNF.LetDecl .pure) := #[]
+    for (efId, efTy) in es do
+      let lv : Lean.Compiler.LCNF.LetValue .pure :=
+        .const ``leanNativeKeepEffect [1, 1] #[.type efTy, .type resTy, .fvar efId, .fvar curId]
+      let fvarId ← Lean.mkFreshFVarId
+      let ld : Lean.Compiler.LCNF.LetDecl .pure := ⟨fvarId, `_eff, resTy, lv⟩
+      lets := lets.push ld
+      curId := fvarId
+    return (lets, curId)
+  match code with
+  | .let decl k =>
+    let isEff := match decl.value with
+      | .const fn _ _ _ => isFreestandingSideEffectStubName fn || extraEffDecls.contains fn
+      | _ => false
+    let effs' := if isEff then effs.push (decl.fvarId, decl.type) else effs
+    return .let decl (← anchorFreestandingEffectsCode extraEffDecls retTy jpTypes effs' k)
+  | .fun decl k =>
+    let body' ← anchorFreestandingEffectsCode extraEffDecls (decl.type.getForallBody) {} #[] decl.value
+    let decl' ← decl.update decl.type decl.params body'
+    return .fun decl' (← anchorFreestandingEffectsCode extraEffDecls retTy jpTypes effs k)
+  | .jp decl k =>
+    let tokTy := Lean.mkConst ``UInt8
+    let tokParam ← Lean.Compiler.LCNF.mkAuxParam tokTy false
+    let jpTypes' := jpTypes.insert decl.fvarId tokTy
+    let jpBody' ← anchorFreestandingEffectsCode extraEffDecls (decl.type.getForallBody) jpTypes' #[(tokParam.fvarId, tokTy)] decl.value
+    let newParams := decl.params.push tokParam
+    let newJpType ← Lean.Compiler.LCNF.mkForallParams newParams (decl.type.getForallBody)
+    let decl' ← decl.update newJpType newParams jpBody'
+    return .jp decl' (← anchorFreestandingEffectsCode extraEffDecls retTy jpTypes' effs k)
+  | .jmp fvarId args =>
+    if let some tokTy := jpTypes[fvarId]? then
+      let unitFVar ← Lean.mkFreshFVarId
+      let unitLd : Lean.Compiler.LCNF.LetDecl .pure := ⟨unitFVar, `_u, tokTy, .lit (.uint8 0)⟩
+      let (lets, tokId) ← chainEffects unitFVar tokTy effs
+      let jmpCode : Lean.Compiler.LCNF.Code .pure := .jmp fvarId (args.push (.fvar tokId))
+      return (#[unitLd] ++ lets).foldr (fun ld acc => .let ld acc) jmpCode
+    else
+      return .jmp fvarId args
+  | .cases c =>
+    let alts' ← c.alts.mapM fun alt => do
+      return alt.updateCode (← anchorFreestandingEffectsCode extraEffDecls c.resultType jpTypes effs alt.getCode)
+    return .cases (c.updateAlts alts')
+  | .return fvarId =>
+    let (lets, finalId) ← chainEffects fvarId retTy effs
+    return lets.foldr (fun ld acc => .let ld acc) (.return finalId)
+  | .unreach t => return .unreach t
+
+private def moduleHasFreestandingFlatPtrOrStubs (env : Lean.Environment) (names : Array Lean.Name) : Bool :=
+  names.any (fun nm =>
+    isFreestandingStubCombinatorName nm ||
+    (match flatPtrCombinatorType? nm with | some _ => true | none => false) ||
+    (match env.find? nm with
+     | some cinfo => exprUsesFreestandingFlatPtr cinfo.type
+     | none => false)) ||
+  env.constants.map₂.toList.any (fun (nm, cinfo) =>
+    isFreestandingStubCombinatorName nm ||
+    (flatPtrCombinatorType? nm).isSome ||
+    exprUsesFreestandingFlatPtr cinfo.type)
+
+private def isSkippableFreestandingAuxName (env : Lean.Environment) (nm : Lean.Name) : Bool :=
+  let rec returnsProp : Lean.Expr → Bool
+    | .forallE _ _ b _ => returnsProp b
+    | .sort u => u.isZero
+    | _ => false
+  if isFreestandingStubCombinatorName nm || (flatPtrCombinatorType? nm).isSome then true
+  else if isCompilerGeneratedAuxDecl env nm || isClosedConstHelperName nm then true
+  else
+    let rec hasAuxPart : Lean.Name → Bool
+      | .str p s =>
+        s == "go" || s == "_unary" || s == "_redArg" || s == "mk" || s == "addr" ||
+        (s.splitOn "_lam_").length > 1 || (s.splitOn "_closed_").length > 1 ||
+        hasAuxPart p
+      | .num p _ => hasAuxPart p
+      | .anonymous => false
+    if hasAuxPart nm then true
+    else
+      let isFlatPtrProj := match nm with | .str p _ => (flatPtrCombinatorType? p).isSome | _ => false
+      if isFlatPtrProj then true
+      else
+        match env.find? nm with
+        | some (.defnInfo dval) => returnsProp dval.type
+        | _ => true
+
+private partial def collectConstNamesPureCode (acc : Array Lean.Name) : Lean.Compiler.LCNF.Code .pure → Array Lean.Name
+  | .let d k =>
+    let acc' := match d.value with
+      | .const fn _ _ _ => acc.push fn
+      | _ => acc
+    collectConstNamesPureCode acc' k
+  | .fun d k | .jp d k => collectConstNamesPureCode (collectConstNamesPureCode acc d.value) k
+  | .cases c => c.alts.foldl (fun a alt => collectConstNamesPureCode a alt.getCode) acc
+  | .jmp _ _ | .return _ | .unreach _ => acc
+
+private def exprReturnsProp : Lean.Expr → Bool
+  | .forallE _ _ b _ => exprReturnsProp b
+  | .sort u => u.isZero
+  | _ => false
+
+private partial def collectBottomUpDeclsM (env : Lean.Environment) (nm : Lean.Name)
+    (state : Lean.NameSet × Array (Lean.Compiler.LCNF.Decl .pure)) :
+    Lean.Compiler.LCNF.CompilerM (Lean.NameSet × Array (Lean.Compiler.LCNF.Decl .pure)) := do
+  let (discovered, allDecls) := state
+  if discovered.contains nm then return state
+  let discovered' := discovered.insert nm
+  let d0 ← Lean.Compiler.LCNF.toDecl nm
+  let mut cur := (discovered', allDecls)
+  if let .code c := d0.value then
+    for fn in collectConstNamesPureCode #[] c do
+      if !isFreestandingStubCombinatorName fn && (flatPtrCombinatorType? fn).isNone then
+        if let some (.defnInfo dval) := env.find? fn then
+          if (env.getModuleIdxFor? fn).isNone && !exprReturnsProp dval.type && !(Lean.isExtern env fn) then
+            cur ← collectBottomUpDeclsM env fn cur
+  return (cur.1, cur.2.push d0)
+
+private partial def collectFinalFreestandingNamesM (env : Lean.Environment) (nm : Lean.Name)
+    (state : Lean.NameSet × Array Lean.Name) : Lean.CoreM (Lean.NameSet × Array Lean.Name) := do
+  let (seen, out) := state
+  if seen.contains nm then return state
+  let mut cur := (seen.insert nm, out.push nm)
+  if let some monoDecl ← Lean.Compiler.LCNF.getMonoDecl? nm then
+    if let .code c := monoDecl.value then
+      for fn in collectConstNamesPureCode #[] c do
+        let s := match fn with | .str _ leaf => leaf | _ => ""
+        let isLiftedOrClosed := (s.splitOn "_lam_").length > 1 || (s.splitOn "_closed_").length > 1
+        if !isLiftedOrClosed && !isFreestandingStubCombinatorName fn && (flatPtrCombinatorType? fn).isNone && (env.getModuleIdxFor? fn).isNone then
+          if let some (.defnInfo dval) := env.find? fn then
+            if !exprReturnsProp dval.type && !(Lean.isExtern env fn) then
+              cur ← collectFinalFreestandingNamesM env fn cur
+  return cur
+
+def prepareFreestandingMonoModuleM (rawDeclNames : Array Lean.Name) : Lean.CoreM (Array Lean.Name) := do
+  let keepEffName := ``leanNativeKeepEffect
+  if ((← getEnv).find? keepEffName).isNone then
+    let u1 := `u_eff
+    let u2 := `u_val
+    let ty := Lean.Expr.forallE `α (.sort (.param u1))
+      (.forallE `β (.sort (.param u2))
+        (.forallE `eff (.bvar 1)
+          (.forallE `val (.bvar 1) (.bvar 2) .default) .default) .implicit) .implicit
+    let val := Lean.Expr.lam `α (.sort (.param u1))
+      (.lam `β (.sort (.param u2))
+        (.lam `eff (.bvar 1)
+          (.lam `val (.bvar 1) (.bvar 0) .default) .default) .implicit) .implicit
+    Lean.addDecl (.defnDecl {
+      name := keepEffName
+      levelParams := [u1, u2]
+      type := ty
+      value := val
+      hints := .opaque
+      safety := .safe
+    })
+  let env0 ← getEnv
+  let allLocalConsts := env0.constants.map₂.toList.map Prod.fst
+  let stubNames := keepEffName :: (allLocalConsts.filter fun nm =>
+    isFreestandingStubCombinatorName nm && (match env0.find? nm with | some (.defnInfo _) => true | _ => false))
+  for s in stubNames do
+    let extData : Lean.ExternAttrData := { entries := [.standard `all s!"__ln_stub_{s.getString!}"] }
+    Lean.modifyEnv fun env => Lean.externAttr.ext.addEntry env (s, extData)
+  let env1 ← getEnv
+  let userTargets := rawDeclNames.filter fun nm => !isSkippableFreestandingAuxName env1 nm
+  Lean.Compiler.LCNF.CompilerM.run do
+    for s in stubNames do
+      let d0 ← Lean.Compiler.LCNF.toDecl s
+      let extData : Lean.ExternAttrData := { entries := [.standard `all s!"__ln_stub_{s.getString!}"] }
+      let dExt := { d0 with value := .extern extData }
+      dExt.saveBase
+      let dm ← dExt.toMono
+      dm.saveMono
+    let mut collectSt : Lean.NameSet × Array (Lean.Compiler.LCNF.Decl .pure) := ({}, #[])
+    for u in userTargets do
+      collectSt ← collectBottomUpDeclsM env1 u collectSt
+    let orderedDecls := collectSt.2
+    let mut sideEffDecls : Lean.NameSet := {}
+    for _ in [0 : orderedDecls.size + 1] do
+      for d0 in orderedDecls do
+        if let .code c := d0.value then
+          if codeHasSideEffectCombinator sideEffDecls c then
+            sideEffDecls := sideEffDecls.insert d0.name
+    let mut anchored : Array (Lean.Compiler.LCNF.Decl .pure) := #[]
+    for d0 in orderedDecls do
+      let d0' ← match d0.value with
+        | .code c =>
+          let c' ← anchorFreestandingEffectsCode sideEffDecls (d0.type.getForallBody) {} #[] c
+          pure { d0 with value := .code c' }
+        | _ => pure d0
+      d0'.saveBase
+      anchored := anchored.push d0'
+    for d0' in anchored do
+      let d1 ← d0'.simp {}
+      d1.saveBase
+      let d2 ← d1.toMono
+      let d3 ← Lean.Compiler.LCNF.withPhase .mono (d2.simp {})
+      d3.saveMono
+  let env2 ← getEnv
+  let mut finalSt : Lean.NameSet × Array Lean.Name := ({}, #[])
+  for u in userTargets do
+    finalSt ← collectFinalFreestandingNamesM env2 u finalSt
+  return finalSt.2
+
 def ingestModuleDeclsWith (ingestImpure : Lean.Compiler.LCNF.Decl .impure → Array Lean.Name → TargetArch → Lean.CoreM LNIRDecl)
     (ingestMono : Lean.Compiler.LCNF.Decl .pure → Array Lean.Name → TargetArch → Lean.CoreM LNIRDecl)
     (rawDeclNames : Array Lean.Name) (moduleName : String := "LeanNative.Ingested")
     (arch : TargetArch := .x86_64) : Lean.CoreM LNIRModule := do
+  let env0 ← getEnv
+  if moduleHasFreestandingFlatPtrOrStubs env0 rawDeclNames then
+    let userNames ← prepareFreestandingMonoModuleM rawDeclNames
+    let env ← getEnv
+    let mut callGraph : Std.HashMap Lean.Name (List Lean.Name) := {}
+    let mut decls : List LNIRDecl := []
+    let mut rawPairs : List (Lean.Name × String) := []
+    for name in userNames do
+      if let some monoDecl ← Lean.Compiler.LCNF.getMonoDecl? name then
+        if let .code c := monoDecl.value then
+          callGraph := callGraph.insert name (collectCodeLocalCallees userNames c)
+        let d ← ingestMono monoDecl userNames arch
+        decls := decls ++ [d]
+        rawPairs := rawPairs ++ [(name, d.name)]
+    if declsHaveMutualCycle callGraph then
+      Lean.throwError s!"[lean-native] unsupported self-tail recursion / mutual recursion in {moduleName}: no qualified loop lowering"
+    let rawMod : LNIRModule := { moduleName := moduleName, decls := decls }
+    validateIngestedModule rawMod
+    return ← filterNonInternalHelperDecls env rawPairs arch (normalizeAndInlineLocalDefs rawMod)
   let declNames ← expandCompilerAuxDecls rawDeclNames
   let env ← getEnv
   let mut callGraph : Std.HashMap Lean.Name (List Lean.Name) := {}

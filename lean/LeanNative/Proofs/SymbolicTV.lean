@@ -29,10 +29,19 @@ def splitMix64Next (state : UInt64) : UInt64 × UInt64 :=
   let out := z2 ^^^ (z2 >>> 31)
   (out, s')
 
+private def codeHasSeqForLoop : LNIRCode → Bool
+  | .seqFor .. => true
+  | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k | .parFor _ _ _ _ _ k =>
+    codeHasSeqForLoop k
+  | .ite _ t e => codeHasSeqForLoop t || codeHasSeqForLoop e
+  | .ret _ | .unreachable => false
+
 /-- Construct a concrete `Val` and update `HeapState` for a parameter of type `LNIRType`.
-    Scalar inputs are drawn from `{1, ..., 8}` so loop bounds and array indices stay within
+    Scalar inputs are drawn from `{1, ..., 8}` (or `{0, ..., 8}` for narrow loop-bound scalars
+    when `hasSeqLoop` is set) so loop bounds and array indices stay within
     the 16-element test buffers while exercising multi-iteration loops and arithmetic paths. -/
-def mkSampleParamVal (seed : UInt64) (paramIdx : Nat) (ty : LNIRType) (st : HeapState) :
+def mkSampleParamVal (seed : UInt64) (paramIdx : Nat) (ty : LNIRType) (st : HeapState)
+    (hasSeqLoop : Bool := false) :
     Val × HeapState :=
   let (r, _) := splitMix64Next (seed + paramIdx.toUInt64 * 31)
   let smallU64 : UInt64 := (r % 8) + 1
@@ -40,17 +49,20 @@ def mkSampleParamVal (seed : UInt64) (paramIdx : Nat) (ty : LNIRType) (st : Heap
   | .i1 => (.bool (r % 2 == 1), st)
   | .i8 =>
     let v : UInt64 :=
-      match paramIdx + (r % 5).toNat with
+      if hasSeqLoop then r % 9
+      else match paramIdx + (r % 5).toNat with
       | 0 => 0 | 1 => 255 | _ => r &&& 0xFF
     (.u64 v, st)
   | .i16 =>
     let v : UInt64 :=
-      match paramIdx + (r % 5).toNat with
+      if hasSeqLoop then r % 9
+      else match paramIdx + (r % 5).toNat with
       | 0 => 0 | 1 => 65535 | _ => r &&& 0xFFFF
     (.u64 v, st)
   | .i32 =>
     let v : UInt64 :=
-      match paramIdx + (r % 5).toNat with
+      if hasSeqLoop then r % 9
+      else match paramIdx + (r % 5).toNat with
       | 0 => 0 | 1 => 0xFFFFFFFF | _ => r &&& 0xFFFFFFFF
     (.u64 v, st)
   | .u256 | .i256 =>
@@ -152,8 +164,9 @@ def mkSampleParamVal (seed : UInt64) (paramIdx : Nat) (ty : LNIRType) (st : Heap
 /-- Build a single sample `(VarEnv × HeapState)` for declaration `d` from `sampleIdx ∈ 0..63`. -/
 def buildDeclSample (d : LNIRDecl) (sampleIdx : Nat) : VarEnv × HeapState :=
   let seed : UInt64 := (sampleIdx.toUInt64 + 1) * 0x9e3779b97f4a7c15
+  let hasLoop := codeHasSeqForLoop d.body
   let (env, st, _) := d.params.foldl (fun (curEnv, curSt, idx) p =>
-    let (v, nextSt) := mkSampleParamVal seed idx p.ty curSt
+    let (v, nextSt) := mkSampleParamVal seed idx p.ty curSt hasLoop
     (curEnv.bind p.id v, nextSt, idx + 1)
   ) (VarEnv.empty, HeapState.empty, 0)
   (env, st)

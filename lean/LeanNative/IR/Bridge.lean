@@ -36,6 +36,19 @@ def tryLowerIntrinsicCall (env : Lean.Environment) (fnName : Lean.Name) (argVars
 def lowerNamedCall (fnName : Lean.Name) (args : Array (Lean.Compiler.LCNF.Arg pu)) (retTy : LNIRType) : BridgeM LNIRExpr := do
   let env ← getEnv
   let st ← get
+  if fnName == ``leanNativeKeepEffect && args.size >= 4 then
+    match args[3]! with
+    | .fvar valId => return .scalar (.var (← internFVar valId))
+    | _ => return .scalar (.constU64 0)
+  match fnName with
+  | .str _ leaf =>
+    if leaf == "readU8" || leaf == "readMutU8" || leaf == "readU32" || leaf == "readMutU16" then
+      if args.size >= 2 then
+        let elemTy : LNIRType := if leaf == "readU32" then .i32 else if leaf == "readMutU16" then .i16 else .i8
+        let pVar ← lowerArg args[args.size - 2]!
+        let idxVar ← lowerArg args[args.size - 1]!
+        return .rawLoad pVar idxVar elemTy
+  | _ => pure ()
   let isLocal := st.localDeclNames.contains fnName || fnName == st.selfDeclName
   let isCanonicalSliceCall :=
     !isLocal &&
@@ -49,7 +62,7 @@ def lowerNamedCall (fnName : Lean.Name) (args : Array (Lean.Compiler.LCNF.Arg pu
         Lean.throwError "[lean-native] Unsupported higher-order / escaping local function value"
       let vid ← internFVar fvarId
       let vTy ← getVarType vid
-      if !(isSupportedParamOrRetType vTy (← get).arch (isLocal || isCanonicalSliceCall) ||
+      if !(isSupportedParamOrRetType vTy (← get).arch (isLocal || isCanonicalSliceCall) || vTy == .unit ||
            (isLocal && (vTy == .objPtr || vTy == .taggedPtr))) then
         Lean.throwError s!"[lean-native] Unsupported non-scalar argument of type `{reprStr vTy}`"
       return vid
@@ -95,6 +108,17 @@ def lowerPureLetValue (lv : Lean.Compiler.LCNF.LetValue .pure) (retTy : LNIRType
     | _ => lowerNamedCall declName args retTy
   | .fvar fvarId args => lowerFVarCall fvarId args retTy
 
+partial def normalizeUnitLoopStep (dummyAccVar : VarId) : LNIRCode → LNIRCode
+  | .letBind d t v k => .letBind d t v (normalizeUnitLoopStep dummyAccVar k)
+  | .rawStore pv iv vv et k => .rawStore pv iv vv et (normalizeUnitLoopStep dummyAccVar k)
+  | .incRef ov c k => .incRef ov c (normalizeUnitLoopStep dummyAccVar k)
+  | .decRef ov c k => .decRef ov c (normalizeUnitLoopStep dummyAccVar k)
+  | .ite cv t e => .ite cv (normalizeUnitLoopStep dummyAccVar t) (normalizeUnitLoopStep dummyAccVar e)
+  | .seqFor iv lv hv av ai aty s k => .seqFor iv lv hv av ai aty s (normalizeUnitLoopStep dummyAccVar k)
+  | .parFor ov lv ins et kern k => .parFor ov lv ins et kern (normalizeUnitLoopStep dummyAccVar k)
+  | .ret _ => .ret dummyAccVar
+  | .unreachable => .unreachable
+
 mutual
 partial def lowerPureAlts (condVar : VarId) (isBool : Bool) (idx : Nat) (alts : List (Lean.Compiler.LCNF.Alt .pure)) : BridgeM LNIRCode := do
   let emitTagBranch (cidx : Nat) (code : Lean.Compiler.LCNF.Code .pure) (rest : List (Lean.Compiler.LCNF.Alt .pure)) : BridgeM LNIRCode := do
@@ -115,10 +139,105 @@ partial def lowerPureAlts (condVar : VarId) (isBool : Bool) (idx : Nat) (alts : 
     | .ctorAlt info code _ => emitTagBranch info.cidx code rest
     | .default code => lowerPureCode code
 
+partial def lowerForRangeStepM (stepFVar : Lean.FVarId) (isUnit : Bool) (idxVar accVar dummyZeroVar : VarId) : BridgeM LNIRCode := do
+  let st ← get
+  let idx32Var ← freshBridgeVar .i32
+  let maskIdx (body : LNIRCode) : LNIRCode :=
+    .letBind idx32Var .i32 (.scalar (.binOp .bitAnd (.var idxVar) (.constU64 0xFFFFFFFF))) body
+  let rawStep ←
+    if let some (pIds, fBody) := st.localFunMap[stepFVar]? then do
+      let expectedArity := if isUnit then 1 else 2
+      if pIds.length != expectedArity then
+        Lean.throwError s!"[lean-native] Invalid `forRange` step closure arity: expected {expectedArity}, got {pIds.length}"
+      let stepSubst :=
+        if isUnit then ({} : Std.HashMap VarId VarId).insert pIds[0]! idx32Var
+        else (({} : Std.HashMap VarId VarId).insert pIds[0]! idx32Var).insert pIds[1]! accVar
+      freshenJoinPointCode stepSubst fBody
+    else if let some (lamName, capArgs) := st.liftedClosureMap[stepFVar]? then do
+      let some lamDecl ← Lean.Compiler.LCNF.getMonoDecl? lamName
+        | Lean.throwError s!"[lean-native] Missing mono declaration for lifted loop closure `{lamName}`"
+      let .code lamBody := lamDecl.value
+        | Lean.throwError s!"[lean-native] Unsupported extern lifted loop closure `{lamName}`"
+      let loopArgCount := if isUnit then 1 else 2
+      if capArgs.size + loopArgCount != lamDecl.params.size then
+        Lean.throwError s!"[lean-native] Lifted loop closure `{lamName}` parameter mismatch ({capArgs.size} + {loopArgCount} vs {lamDecl.params.size})"
+      let capVars ← capArgs.toList.mapM lowerArg
+      let allMappedVars := capVars ++ (if isUnit then [idx32Var] else [idx32Var, accVar])
+      for (lp, mv) in lamDecl.params.toList.zip allMappedVars do
+        modify fun s => { s with fvarToVar := s.fvarToVar.insert lp.fvarId mv }
+      lowerPureCode lamBody
+    else
+      Lean.throwError s!"[lean-native] Unsupported `forRange` step argument `{stepFVar.name}` (must be an inline lambda or non-escaping closure)"
+  let masked := maskIdx rawStep
+  return if isUnit then normalizeUnitLoopStep dummyZeroVar masked else masked
+
 partial def lowerPureCode (code : Lean.Compiler.LCNF.Code .pure) : BridgeM LNIRCode := do
   match code with
   | .let decl k =>
-    let ty ← lowerBridgeType decl.type
+    let rawLetTy ← lowerBridgeType decl.type
+    let envCur ← getEnv
+    let ty :=
+      if rawLetTy == .usize then
+        match decl.value with
+        | .const fnName _ _ _ =>
+          match envCur.find? fnName with
+          | some cinfo =>
+            match lowerImpureType cinfo.type.getForallBody (some envCur) with
+            | .rawPtr et => .rawPtr et
+            | _ => rawLetTy
+          | none => rawLetTy
+        | _ => rawLetTy
+      else rawLetTy
+    if let .const fnName _ args _ := decl.value then
+      if fnName == ``leanNativeKeepEffect && args.size >= 4 then
+        if let .fvar valId := args[3]! then
+          let valVar ← internFVar valId
+          modify fun st => { st with fvarToVar := st.fvarToVar.insert decl.fvarId valVar }
+          return ← lowerPureCode k
+        else
+          let zv ← internFVar decl.fvarId .unit true
+          return .letBind zv .unit (.scalar (.constU64 0)) (← lowerPureCode k)
+      match fnName with
+      | .str _ leaf =>
+        if (leaf == "writeU8" || leaf == "writeU16") && args.size >= 3 then
+          let elemTy : LNIRType := if leaf == "writeU16" then .i16 else .i8
+          let pVar ← lowerArg args[args.size - 3]!
+          let idxVar ← lowerArg args[args.size - 2]!
+          let valVar ← lowerArg args[args.size - 1]!
+          modify fun st => { st with fvarToVar := st.fvarToVar.insert decl.fvarId pVar }
+          return .rawStore pVar idxVar valVar elemTy (← lowerPureCode k)
+        if (leaf == "forRangeU64" || leaf == "forRangeU32") && args.size >= 4 then
+          let accTy : LNIRType := if leaf == "forRangeU32" then .i32 else .i64
+          let loVar ← lowerArg args[args.size - 4]!
+          let hiVar ← lowerArg args[args.size - 3]!
+          let initVar ← lowerArg args[args.size - 2]!
+          let .fvar stepFVar := args[args.size - 1]!
+            | Lean.throwError s!"[lean-native] `{leaf}` step argument must be a function variable"
+          let idxVar ← freshBridgeVar .i64
+          let accVar ← internFVar decl.fvarId accTy true
+          let stepCode ← lowerForRangeStepM stepFVar false idxVar accVar accVar
+          let kCode ← lowerPureCode k
+          return .seqFor idxVar loVar hiVar accVar initVar accTy stepCode kCode
+        if leaf == "forRangeUnit" && args.size >= 3 then
+          let loVar ← lowerArg args[args.size - 3]!
+          let hiVar ← lowerArg args[args.size - 2]!
+          let .fvar stepFVar := args[args.size - 1]!
+            | Lean.throwError s!"[lean-native] `forRangeUnit` step argument must be a function variable"
+          let initVar ← freshBridgeVar .i64
+          let idxVar ← freshBridgeVar .i64
+          let accVar ← freshBridgeVar .i64
+          let _ ← internFVar decl.fvarId .unit true
+          modify fun st => { st with fvarToVar := st.fvarToVar.insert decl.fvarId accVar }
+          let stepCode ← lowerForRangeStepM stepFVar true idxVar accVar initVar
+          let kCode ← lowerPureCode k
+          return .letBind initVar .i64 (.scalar (.constU64 0))
+            (.seqFor idxVar loVar hiVar accVar initVar .i64 stepCode kCode)
+      | _ => pure ()
+      if isClosureOrRuntimeNatExpr decl.type then
+        if let some lamDecl ← Lean.Compiler.LCNF.getMonoDecl? fnName then
+          if args.size <= lamDecl.params.size then
+            modify fun st => { st with liftedClosureMap := st.liftedClosureMap.insert decl.fvarId (fnName, args) }
+            return ← lowerPureCode k
     if ty != .unit then checkBridgeType s!"let binding `{decl.binderName}`" decl.type ty
     if let .fvar fvarId args := decl.value then
       if let some (pIds, fBody) := (← get).localFunMap[fvarId]? then
@@ -179,13 +298,27 @@ def ingestLCNFDeclGenericWithState {pu} (decl : Lean.Compiler.LCNF.Decl pu)
           | some (.sarray .i8) => .sarray .i8
           | some (.sarray .f64) => .sarray .f64
           | _ => rawPTy
+        else if rawPTy == .usize then
+          match envParamTys[pIdx]? with
+          | some (.rawPtr et) => .rawPtr et
+          | _ => rawPTy
         else rawPTy
       checkBridgeType s!"parameter `{p.binderName}` of `{decl.name}`" p.type pTy allowInternalObj (!isExported || arch.isFreestandingEmbedded)
       let vid ← internFVar p.fvarId pTy true
       lnirParams := lnirParams ++ [{ id := vid, name := p.binderName.toString, ty := pTy, borrow := p.borrow || isSupportedSliceType pTy }]
       pIdx := pIdx + 1
-    let retTy ← lowerBridgeType decl.type
-    checkBridgeType s!"return type of `{decl.name}`" decl.type retTy allowInternalObj
+    let rawRetTy ← lowerBridgeType (decl.type.getForallBody)
+    let retTy :=
+      if rawRetTy == .usize then
+        match env.find? decl.name with
+        | some cinfo =>
+          match lowerImpureType cinfo.type.getForallBody (some env) with
+          | .rawPtr et => .rawPtr et
+          | _ => rawRetTy
+        | none => rawRetTy
+      else rawRetTy
+    if retTy != .unit then
+      checkBridgeType s!"return type of `{decl.name}`" (decl.type.getForallBody) retTy allowInternalObj
     match decl.value with
     | .code c =>
       let env ← getEnv

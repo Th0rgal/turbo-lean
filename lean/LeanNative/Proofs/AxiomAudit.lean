@@ -818,9 +818,18 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.LedgerEmbedded32.execFn_modOfFnForTarget_eq
   , ``LeanNative.Proofs.LedgerEmbedded32.lowerModuleForTarget_sound
   , ``LeanNative.Proofs.LedgerEmbedded32.ledgerBip32Varint_e2e_nonvacuous
+  , ``LeanNative.Proofs.LedgerEmbedded32.flatPtr_size4_align4_on_ledger32
+  , ``LeanNative.Proofs.LedgerEmbedded32.flatPtr_size8_align8_on_x86_64
+  , ``LeanNative.Proofs.LedgerEmbedded32.lnirType_flatPtr_c_and_rust_abi
+  , ``LeanNative.Proofs.LedgerEmbedded32.placeC99Fields_ledger32_flatPtr_aligned4
+  , ``LeanNative.Proofs.LedgerEmbedded32.rawLoad_preserves_freestanding_gates
+  , ``LeanNative.Proofs.LedgerEmbedded32.rawStore_preserves_freestanding_gates
+  , ``LeanNative.Proofs.LedgerEmbedded32.seqFor_preserves_freestanding_gates
+  , ``LeanNative.Proofs.LedgerEmbedded32.unit_and_flatPtr_freestanding_properties
+  , ``LeanNative.Proofs.LedgerEmbedded32.checkFreestandingDecl_full_sound
   ]
 
-#guard auditedTheoremNames.length == 859
+#guard auditedTheoremNames.length == 868
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/
