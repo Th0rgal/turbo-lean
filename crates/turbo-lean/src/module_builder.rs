@@ -4953,6 +4953,13 @@ fn lakefile_is_plain_with_policy(clean: &str, is_root_pkg: bool) -> bool {
             return tokens.is_empty();
         }
         let indented = line.starts_with(char::is_whitespace);
+        let inline_attr = ["@[default_target]", "@[test_driver]", "@[lint_driver]"]
+            .iter().any(|a| t.strip_prefix(a).is_some_and(|rest| {
+                let rest = rest.trim();
+                !is_root_pkg && rest.ends_with('{')
+                    && (rest.starts_with("lean_lib ") || rest.starts_with("lean_exe "))
+            }));
+        let tokens = if inline_attr { &tokens[1..] } else { &tokens[..] };
         if !indented {
             in_dep_recipe_body = !is_root_pkg
                 && [
@@ -4967,7 +4974,7 @@ fn lakefile_is_plain_with_policy(clean: &str, is_root_pkg: bool) -> bool {
                 .iter()
                 .any(|kw| t.starts_with(kw))
                 && !t.starts_with([']', ')', '}', '⟩'])
-                && !t.starts_with("++");
+                && !t.starts_with("++") && !t.starts_with("|>");
         }
         let header = matches!(
             tokens.first(),
@@ -5022,6 +5029,7 @@ fn lakefile_is_plain_with_policy(clean: &str, is_root_pkg: bool) -> bool {
             || (t.starts_with(['}', '⟩']) && t.len() > 1)
             || (is_root_pkg && t.starts_with(['}', '⟩']))
             || t.starts_with("++")
+            || t.starts_with("|>")
     })
 }
 
@@ -5120,7 +5128,7 @@ fn collect_lakefile_abbrevs_with_policy(clean: &str, is_root_pkg: bool) -> Lakef
             let next = lines[i];
             let col0 = next.chars().next().is_some_and(|c| !c.is_whitespace());
             let nt = next.trim_start();
-            let continues = nt.starts_with([']', ')', '}', '⟩']) || nt.starts_with("++");
+            let continues = nt.starts_with([']', ')', '}', '⟩']) || nt.starts_with("++") || nt.starts_with("|>");
             let open = lexed.as_ref().is_ok_and(|(_, d)| *d > 0);
             if col0 && !continues && !open {
                 break;
@@ -5263,7 +5271,7 @@ fn resolve_lean_options_in(
             .last()
             .and_then(|p| p.strip_prefix(".push"))
             .map(|elem| (pipes[..pipes.len() - 1].join(" |> "), elem.to_string()))
-    } else if let Some(rest) = s.strip_prefix("Array.push ") {
+    } else if let Some(rest) = s.strip_prefix("Array.push").filter(|r| r.starts_with(char::is_whitespace)).map(str::trim_start) {
         rest.char_indices().find_map(|(i, c)| {
             (c.is_whitespace() && lean_scan(&rest[..i], "").is_ok_and(|(_, d)| d == 0))
                 .then(|| (rest[..i].to_string(), rest[i..].to_string()))
@@ -5640,8 +5648,8 @@ fn parse_lakefile_lean_inner(
         None,
         Package { braced: bool },
         Require,
-        LeanLib(usize),
-        LeanExe(usize),
+        LeanLib { idx: usize, braced: bool },
+        LeanExe { idx: usize, braced: bool },
         Input(usize),
         CustomDoBlock,
     }
@@ -5655,11 +5663,11 @@ fn parse_lakefile_lean_inner(
         fn require() -> Self {
             Self::Require
         }
-        fn lean_lib(idx: usize) -> Self {
-            Self::LeanLib(idx)
+        fn lean_lib(idx: usize, braced: bool) -> Self {
+            Self::LeanLib { idx, braced }
         }
-        fn lean_exe(idx: usize) -> Self {
-            Self::LeanExe(idx)
+        fn lean_exe(idx: usize, braced: bool) -> Self {
+            Self::LeanExe { idx, braced }
         }
         fn input(idx: usize) -> Self {
             Self::Input(idx)
@@ -5669,7 +5677,6 @@ fn parse_lakefile_lean_inner(
         }
     }
     let mut current_block = DeclBlock::None;
-    let mut braced_target = false;
     let mut pending_default_target = false;
     let mut empty_roots: BTreeSet<usize> = BTreeSet::new();
     // Lake keeps only the last assignment of a repeated field; fail closed instead.
@@ -5685,15 +5692,12 @@ fn parse_lakefile_lean_inner(
         if trimmed.is_empty() {
             continue;
         }
-        if indent == 0 && braced_target {
-            anyhow::ensure!(trimmed == "}", "Unclosed braced Lake target: fail-closed static Lake config gate");
-            braced_target = false;
+        let braced = matches!(current_block, DeclBlock::Package { braced: true }
+            | DeclBlock::LeanLib { braced: true, .. } | DeclBlock::LeanExe { braced: true, .. });
+        if braced && trimmed == "}" {
             current_block = DeclBlock::None;
             block_keys.clear();
             continue;
-        }
-        if indent == 0 && trimmed.ends_with('{') {
-            braced_target = trimmed.starts_with("lean_lib ") || trimmed.starts_with("lean_exe ");
         }
         // A target declared on an indented line would be skipped below; Lake reads it.
         if indent > 0
@@ -5718,14 +5722,9 @@ fn parse_lakefile_lean_inner(
                 line_no
             );
         }
-        if indent == 0 && current_block == (DeclBlock::Package { braced: true }) {
-            if trimmed == "}" {
-                current_block = DeclBlock::None;
-                block_keys.clear();
-                continue;
-            }
+        if indent == 0 && braced {
             anyhow::bail!(
-                "Unclosed `package ... {{` block before `{}` in {} at line {}: fail-closed static Lake config gate",
+                "Unclosed braced Lake declaration before `{}` in {} at line {}: fail-closed static Lake config gate",
                 trimmed,
                 lean_path.display(),
                 line_no
@@ -5737,11 +5736,11 @@ fn parse_lakefile_lean_inner(
             && matches!(
                 current_block,
                 DeclBlock::Package { .. }
-                    | DeclBlock::LeanLib(_)
-                    | DeclBlock::LeanExe(_)
+                    | DeclBlock::LeanLib { .. }
+                    | DeclBlock::LeanExe { .. }
                     | DeclBlock::Input(_)
             )
-            && (trimmed.starts_with("++") || trimmed.starts_with([']', ')', '}', '⟩']))
+            && (trimmed.starts_with("++") || trimmed.starts_with("|>") || trimmed.starts_with([']', ')', '}', '⟩']))
         {
             anyhow::bail!(
                 "Unsupported column-0 continuation `{}` in {} at line {}: fail-closed static Lake config gate",
@@ -5755,7 +5754,7 @@ fn parse_lakefile_lean_inner(
             // A helper's term (e.g. Mathlib's `abbrev ... := #[` ... `]`) continues on a
             // column-0 closing-bracket or `++` line; no command starts that way.
             if current_block == DeclBlock::CustomDoBlock
-                && (trimmed.starts_with("++") || trimmed.starts_with([']', ')', '}', '⟩']))
+                && (trimmed.starts_with("++") || trimmed.starts_with("|>") || trimmed.starts_with([']', ')', '}', '⟩']))
             {
                 continue;
             }
@@ -5805,8 +5804,8 @@ fn parse_lakefile_lean_inner(
         match current_block {
             DeclBlock::None | DeclBlock::Require | DeclBlock::CustomDoBlock => continue,
             DeclBlock::Package { .. }
-            | DeclBlock::LeanLib(_)
-            | DeclBlock::LeanExe(_)
+            | DeclBlock::LeanLib { .. }
+            | DeclBlock::LeanExe { .. }
             | DeclBlock::Input(_) => {
                 if tokens_per_line
                     .get(line_no - 1)
@@ -5820,8 +5819,8 @@ fn parse_lakefile_lean_inner(
                 }
                 let Some((k_raw, v_start)) = trimmed.split_once(":=") else {
                     let slot = match current_block {
-                        DeclBlock::LeanLib(idx) => &mut pkg.libs[idx].unsupported,
-                        DeclBlock::LeanExe(idx) => &mut pkg.exes[idx].unsupported,
+                        DeclBlock::LeanLib { idx, .. } => &mut pkg.libs[idx].unsupported,
+                        DeclBlock::LeanExe { idx, .. } => &mut pkg.exes[idx].unsupported,
                         _ => &mut pkg.unsupported,
                     };
                     unsupported_lake_field(
@@ -5879,6 +5878,9 @@ fn parse_lakefile_lean_inner(
                     let next = lines[i + off];
                     let next_indent = next.len() - next.trim_start().len();
                     let next_t = next.trim();
+                    if braced && next_t == "}" && !needs_more {
+                        break;
+                    }
                     let continues = next_indent > indent
                         || (next_indent == indent
                             && (next_t.starts_with("++")
@@ -5963,7 +5965,7 @@ fn parse_lakefile_lean_inner(
                             )?;
                         }
                     },
-                    DeclBlock::LeanLib(lib_idx) => {
+                    DeclBlock::LeanLib { idx: lib_idx, .. } => {
                         let lib = &mut pkg.libs[lib_idx];
                         match key {
                             "srcDir" => {
@@ -6098,7 +6100,7 @@ fn parse_lakefile_lean_inner(
                             }
                         }
                     }
-                    DeclBlock::LeanExe(exe_idx) => {
+                    DeclBlock::LeanExe { idx: exe_idx, .. } => {
                         let exe = &mut pkg.exes[exe_idx];
                         match key {
                             "exeName" => {
@@ -6241,10 +6243,10 @@ fn parse_lakefile_lean_inner(
             }
         }
     }
-    anyhow::ensure!(!braced_target, "Unclosed braced Lake target: fail-closed static Lake config gate");
-    if current_block == (DeclBlock::Package { braced: true }) {
+    if matches!(current_block, DeclBlock::Package { braced: true }
+        | DeclBlock::LeanLib { braced: true, .. } | DeclBlock::LeanExe { braced: true, .. }) {
         anyhow::bail!(
-            "Unclosed `package ... {{` block in {}: fail-closed static Lake config gate",
+            "Unclosed braced Lake declaration in {}: fail-closed static Lake config gate",
             lean_path.display()
         );
     }
@@ -6385,7 +6387,7 @@ where
             native_unsupported: None,
             link_unsupported: None,
         });
-        *current_block = T::lean_lib(idx);
+        *current_block = T::lean_lib(idx, trimmed.ends_with('{'));
         return Ok(());
     }
     if let Some(rest) = trimmed.strip_prefix("lean_exe ") {
@@ -6409,7 +6411,7 @@ where
             native_unsupported: None,
             link_unsupported: None,
         });
-        *current_block = T::lean_exe(idx);
+        *current_block = T::lean_exe(idx, trimmed.ends_with('{'));
         return Ok(());
     }
     for (kw, is_dir) in [("input_file ", false), ("input_dir ", true)] {
@@ -6486,8 +6488,8 @@ trait FromDeclBlock {
     fn none() -> Self;
     fn package(braced: bool) -> Self;
     fn require() -> Self;
-    fn lean_lib(idx: usize) -> Self;
-    fn lean_exe(idx: usize) -> Self;
+    fn lean_lib(idx: usize, braced: bool) -> Self;
+    fn lean_exe(idx: usize, braced: bool) -> Self;
     fn input(idx: usize) -> Self;
     fn custom_do() -> Self;
 }
@@ -6678,7 +6680,25 @@ pub(crate) fn effective_lean_args_digest(args: &[String]) -> Option<String> {
 /// Flatten weak-then-strong Lake args into filtered CLI argv order (matching Lean's setup/CLI
 /// precedence where strong args come after weak args and override matching `-D` keys).
 pub fn compose_flat_filtered_args(weak_args: &[String], strong_args: &[String]) -> Vec<String> {
-    filter_allowed_lean_args(weak_args.iter().chain(strong_args))
+    filter_allowed_lean_args(weak_args.iter().chain(strong_args).map(|a| verification_lake_arg(a)))
+}
+
+// Preserve Lake's raw configuration for trace comparison; strengthen only compiler inputs.
+fn verification_lake_arg(arg: &str) -> &str {
+    match arg {
+        "-Dwarn.sorry=false" => "-Dwarn.sorry=true",
+        "-Dweak.warn.sorry=false" => "-Dweak.warn.sorry=true",
+        _ => arg,
+    }
+}
+
+fn verification_lake_option(key: &LeanName, value: &LeanOptionValue) -> LeanOptionValue {
+    if matches!(key.to_lean_string().as_str(), "warn.sorry" | "weak.warn.sorry")
+        && matches!(value, LeanOptionValue::Bool(false)) {
+        LeanOptionValue::Bool(true)
+    } else {
+        value.clone()
+    }
 }
 
 fn compose_flat_filtered_args_with_options(
@@ -6688,9 +6708,9 @@ fn compose_flat_filtered_args_with_options(
 ) -> Vec<String> {
     let opt_flags: Vec<String> = lean_options
         .iter()
-        .map(|(k, v)| format!("-D{}={}", k.to_lean_string(), v.raw_cli_value()))
+        .map(|(k, v)| format!("-D{}={}", k.to_lean_string(), verification_lake_option(k, v).raw_cli_value()))
         .collect();
-    filter_allowed_lean_args(weak_args.iter().chain(strong_args).chain(&opt_flags))
+    filter_allowed_lean_args(weak_args.iter().chain(strong_args).chain(&opt_flags).map(|a| verification_lake_arg(a)))
 }
 
 /// Resolve filtered package-level Lean compiler flags from `pkg`.
@@ -7085,27 +7105,8 @@ fn finalize_package_config(
             ext.static_artifact_blake3 = h;
         }
     }
-    // Static Lake configuration may disable warnings; verification must never inherit that.
-    // Normalize before validation so CLI/request boundaries retain their stricter contract.
-    for (more, weak, opts) in std::iter::once((&mut pkg.more_lean_args, &mut pkg.weak_lean_args, &mut pkg.lean_options))
-        .chain(pkg.libs.iter_mut().map(|l| (&mut l.more_lean_args, &mut l.weak_lean_args, &mut l.lean_options)))
-        .chain(pkg.exes.iter_mut().map(|e| (&mut e.more_lean_args, &mut e.weak_lean_args, &mut e.lean_options)))
-    {
-        for arg in more.iter_mut().chain(weak) {
-            if matches!(arg.as_str(), "-Dwarn.sorry=false" | "-Dweak.warn.sorry=false") {
-                *arg = arg.replace("=false", "=true");
-            }
-        }
-        for (key, value) in opts {
-            if matches!(key.to_lean_string().as_str(), "warn.sorry" | "weak.warn.sorry")
-                && matches!(value, LeanOptionValue::Bool(false))
-            {
-                *value = LeanOptionValue::Bool(true);
-            }
-        }
-    }
     let check_allowed_args = |args: &[String], scope: &str| -> Result<()> {
-        validate_lean_args(args).map_err(|error| {
+        validate_lean_args(args.iter().map(|a| verification_lake_arg(a))).map_err(|error| {
             anyhow::anyhow!(
                 "{} of {} ({}): {error:#}",
                 scope,
@@ -7116,7 +7117,7 @@ fn finalize_package_config(
     };
     let check_allowed_opts = |opts: &LeanOptionsMap, scope: &str| -> Result<()> {
         for (k, v) in opts {
-            let allowed = is_allowed_lean_option(k, v);
+            let allowed = is_allowed_lean_option(k, &verification_lake_option(k, v));
             if !c_abi::verify_static_lake_config(true, !allowed, false, false) {
                 anyhow::bail!(
                     "Unsupported or unsafe Lean option `{}={}` in {} of {} ({}): fail-closed static Lake config gate",
@@ -17984,11 +17985,11 @@ pub fn compute_module_cas_key_with_dynlibs(
         .strong_args
         .iter()
         .chain(node.weak_args.iter())
-        .all(|a| is_allowed_lean_arg(a))
+        .all(|a| is_allowed_lean_arg(verification_lake_arg(a)))
         && node
             .lean_options
             .iter()
-            .all(|(k, v)| is_allowed_lean_option(k, v));
+            .all(|(k, v)| is_allowed_lean_option(k, &verification_lake_option(k, v)));
     let src_valid = node.src_blake3.len() == 64;
     let cfg_valid = node.pkg_config_digest.len() == 64;
     let deps_sorted_unique = dep_olean_digests.windows(2).all(|w| w[0].0 < w[1].0)
@@ -19694,7 +19695,7 @@ fn build_setup_json(
 ) -> Result<serde_json::Value> {
     let mut setup_options = serde_json::Map::new();
     for (k, v) in &node.lean_options {
-        setup_options.insert(k.to_lean_string(), v.to_json_value());
+        setup_options.insert(k.to_lean_string(), verification_lake_option(k, v).to_json_value());
     }
     let (mut dynlibs, mut plugins) = compute_module_setup_load_order(dag, node);
     if let Some(paths) = import_dynlib_paths {
@@ -21763,10 +21764,10 @@ fn build_module_compile_command(
     }
     // Lake passes `weakLeanArgs` before `moreLeanArgs`.
     for arg in &node.weak_args {
-        cmd.arg(arg);
+        cmd.arg(verification_lake_arg(arg));
     }
     for arg in &node.strong_args {
-        cmd.arg(arg);
+        cmd.arg(verification_lake_arg(arg));
     }
     cmd.arg("-Dwarn.sorry=true")
         .arg("-Ddebug.skipKernelTC=false")
@@ -29165,6 +29166,9 @@ lean_exe «demo-exe» where
                 let lib = &pkg.libs[0];
                 let (opts, strong, weak) = compose_effective_args(pkg, &lib.lean_options, &lib.more_lean_args, &lib.weak_lean_args);
                 let args = compose_flat_filtered_args_with_options(&weak, &strong, &opts);
+                assert!(strong.contains(&format!("-D{key}=false")));
+                let raw_options = serde_json::json!([[format!("-D{key}=false"), format!("{:016x}", lake_hash_text(&format!("-D{key}=false")))]]);
+                assert!(verify_trace_options_value(&opts, &raw_options));
                 assert!(args.contains(&format!("-D{key}=true")), "{args:?}");
                 assert!(!args.iter().any(|a| a.ends_with("sorry=false")));
                 for bad in ["debug.skipKernelTC", "pp.all"] {
@@ -29197,10 +29201,24 @@ lean_exe «demo-exe» where
             parse_lakefile_lean(&dir, &lf, false)
         };
         let opts = |pkg: &PackageConfig| pkg.libs[0].lean_options.clone();
+        let piped_binding = "import Lake\nopen Lake DSL\nabbrev xs : Array LeanOption := #[]\n|>.push ⟨`autoImplicit, false⟩\npackage demo\nlean_lib Demo where\n  leanOptions := xs\n";
+        assert_eq!(opts(&parse(piped_binding).unwrap()).values().next(), Some(&LeanOptionValue::Bool(false)));
+        for target in ["lean_lib", "lean_exe"] {
+            for close in ["}", "  }"] {
+                let src = format!("import Lake\nopen Lake DSL\npackage demo\n@[default_target] {target} Demo {{\n  leanOptions := #[⟨`autoImplicit, false⟩]\n{close}\n");
+                assert!(parse(&src).is_ok(), "{src}");
+                assert!(parse(src.rsplit_once(close).unwrap().0).is_err());
+            }
+        }
+        for field in ["roots := #[`Demo]", "leanOptions := #[]"] {
+            let src = format!("import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  {field}\n|>.push arbitraryCode\n");
+            assert!(parse(&src).is_err(), "{src}");
+        }
         for expr in [
             "xs.push ⟨`linter.a, false⟩ |>.push ⟨`linter.b, true⟩",
             "xs.push (LeanOption.mk `linter.a false)\n  |>.push (⟨`linter.b, true⟩)",
             "Array.push (Array.push xs (⟨`linter.a, false⟩)) (⟨`linter.b, true⟩)",
+            "Array.push\t(Array.push xs (⟨`linter.a, false⟩)) (⟨`linter.b, true⟩)",
             "(xs.push ⟨`linter.a, false⟩).push ⟨`linter.b, true⟩",
         ] {
             let src = format!("import Lake\nopen Lake DSL\nabbrev xs : Array LeanOption := #[⟨`linter.a, true⟩]\npackage demo\nlean_lib Demo where\n  leanOptions := {expr}\n");
@@ -29281,7 +29299,7 @@ lean_exe «demo-exe» where
         // `leanOptions` pass the same flag gate as `moreLeanArgs`.
         let sorry_off = "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`warn.sorry, false⟩]\n";
         let pkg = parse(sorry_off).unwrap();
-        assert_eq!(opts(&pkg).values().next(), Some(&LeanOptionValue::Bool(true)));
+        assert_eq!(opts(&pkg).values().next(), Some(&LeanOptionValue::Bool(false)));
         // Modified or attributed declarations are not bindings (same line or previous line).
         for decl in [
             "private abbrev opts : Array LeanOption := #[⟨`linter.a, true⟩]",
@@ -29308,13 +29326,13 @@ lean_exe «demo-exe» where
         let lib = |opts_expr: &str, prelude: &str| {
             format!("import Lake\nopen Lake DSL\n{prelude}package demo\nlean_lib Demo where\n  leanOptions := {opts_expr}\n")
         };
-        // Static weak options are normalized too, including the weak-prefix map.
-        assert_eq!(opts(&parse(&lib("#[⟨`weak.warn.sorry, false⟩]", "")).unwrap()).values().next(), Some(&LeanOptionValue::Bool(true)));
+        // Static weak options retain Lake's raw values, including the weak-prefix map.
+        assert_eq!(opts(&parse(&lib("#[⟨`weak.warn.sorry, false⟩]", "")).unwrap()).values().next(), Some(&LeanOptionValue::Bool(false)));
         let ws = "abbrev ws : Array LeanOption := #[⟨`warn.sorry, false⟩]\n";
         assert_eq!(opts(&parse(&lib(
             "ws.map fun s ↦ { s with name := `weak ++ s.name }",
             ws
-        )).unwrap()).values().next(), Some(&LeanOptionValue::Bool(true)));
+        )).unwrap()).values().next(), Some(&LeanOptionValue::Bool(false)));
         // Option names must be name literals; LeanOption.mk validates key and value.
         for e in [
             "#[⟨optKey, false⟩]",
