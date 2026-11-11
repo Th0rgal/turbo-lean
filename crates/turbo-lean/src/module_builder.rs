@@ -5256,6 +5256,44 @@ fn resolve_lean_options_in(
         return Ok(map);
     }
     let s = expr.trim();
+    let (pipes, _) = lean_scan(s, "|>")?;
+    let (pushes, _) = lean_scan(s, ".push")?;
+    let push = if pipes.len() > 1 {
+        pipes
+            .last()
+            .and_then(|p| p.strip_prefix(".push"))
+            .map(|elem| (pipes[..pipes.len() - 1].join(" |> "), elem.to_string()))
+    } else if let Some(rest) = s.strip_prefix("Array.push ") {
+        rest.char_indices().find_map(|(i, c)| {
+            (c.is_whitespace() && lean_scan(&rest[..i], "").is_ok_and(|(_, d)| d == 0))
+                .then(|| (rest[..i].to_string(), rest[i..].to_string()))
+        })
+    } else if pushes.len() > 1 {
+        Some((
+            pushes[..pushes.len() - 1].join(".push"),
+            pushes.last().unwrap().clone(),
+        ))
+    } else {
+        None
+    };
+    if let Some((base, elem)) = push {
+        let mut elem = elem.trim();
+        let mut nesting = depth + 1;
+        while let Some(inner) = elem.strip_prefix('(').and_then(|r| r.strip_suffix(')')) {
+            if !lean_scan(inner, "").is_ok_and(|(_, d)| d == 0) {
+                break;
+            }
+            nesting += 1;
+            anyhow::ensure!(
+                nesting <= LEAN_OPTIONS_MAX_DEPTH,
+                "`leanOptions` push nests too deeply"
+            );
+            elem = inner.trim();
+        }
+        let mut map = resolve_lean_options_in(&base, bindings, line, depth + 1, cache)?;
+        map.extend(parse_lean_options_expr(&format!("#[{elem}]"))?);
+        return Ok(map);
+    }
     if s.starts_with('[') || s.starts_with("#[") {
         return parse_lean_options_expr(s);
     }
@@ -5832,6 +5870,7 @@ fn parse_lakefile_lean_inner(
                     let continues = next_indent > indent
                         || (next_indent == indent
                             && (next_t.starts_with("++")
+                                || next_t.starts_with("|>")
                                 || next_t.starts_with([']', ')', '}', '⟩'])));
                     if !needs_more && !continues {
                         break;
@@ -29088,6 +29127,30 @@ lean_exe «demo-exe» where
             parse_lakefile_lean(&dir, &lf, false)
         };
         let opts = |pkg: &PackageConfig| pkg.libs[0].lean_options.clone();
+        for expr in [
+            "xs.push ⟨`linter.a, false⟩ |>.push ⟨`linter.b, true⟩",
+            "xs.push (LeanOption.mk `linter.a false)\n  |>.push (⟨`linter.b, true⟩)",
+            "Array.push (Array.push xs (⟨`linter.a, false⟩)) (⟨`linter.b, true⟩)",
+            "(xs.push ⟨`linter.a, false⟩).push ⟨`linter.b, true⟩",
+        ] {
+            let src = format!("import Lake\nopen Lake DSL\nabbrev xs : Array LeanOption := #[⟨`linter.a, true⟩]\npackage demo\nlean_lib Demo where\n  leanOptions := {expr}\n");
+            let pkg = parse(&src).unwrap();
+            assert_eq!(
+                opts(&pkg),
+                parse_lean_options_expr("#[⟨`linter.a, false⟩, ⟨`linter.b, true⟩]").unwrap()
+            );
+            for bad in ["debug.skipKernelTC", "pp.all"] {
+                assert!(parse(&src.replace("linter.b", bad)).is_err());
+            }
+            assert!(parse(&src.replace("⟨`linter.b, true⟩", "arbitraryCode")).is_err());
+        }
+        let deep = format!(
+            "#[]{}",
+            ".push ⟨`linter.a, true⟩".repeat(LEAN_OPTIONS_MAX_DEPTH + 1)
+        );
+        assert!(
+            resolve_lean_options_expr(&deep, &LakefileBindings::default(), usize::MAX).is_err()
+        );
         // A same-named binding inside a namespace makes the reference ambiguous: fail closed
         // rather than pick a body (Lake would resolve the global one).
         let scoped = "import Lake\nopen Lake DSL\nabbrev opts : Array LeanOption := #[⟨`autoImplicit, false⟩]\nnamespace Other\nabbrev opts : Array LeanOption := #[⟨`autoImplicit, true⟩]\nend Other\npackage demo\nlean_lib Demo where\n  leanOptions := opts\n";
