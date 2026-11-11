@@ -3227,7 +3227,7 @@ pub(crate) fn extract_shard_stmt_and_proof(src: &str, shard: &TheoremShard) -> (
 }
 
 /// Split a top-level theorem/lemma declaration at its top-level `:=` (outside parens/brackets/braces/comments
-/// and after any `let x := v` bindings inside the theorem's return type), OR when there is no top-level `:=`,
+/// and after local bindings inside the theorem's return type), OR when there is no top-level `:=`,
 /// at the first top-level equation-compiler pattern-matching arm (`\n  | pat => proof`) after the top-level `:`.
 fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
     let bytes = cmd.as_bytes();
@@ -3236,7 +3236,7 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
     let mut brace = 0i32;
     let mut strict_brace = 0i32;
     let mut i = 0usize;
-    let mut pending_let_assigns = 0usize;
+    let mut pending_local_assigns = 0usize;
     let mut seen_top_level_colon = false;
     let mut seen_top_level_match_after_colon = false;
     let mut first_top_level_arm_split: Option<usize> = None;
@@ -3272,14 +3272,26 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
             && bracket == 0
             && brace == 0
             && strict_brace == 0
-            && i + 3 < bytes.len()
-            && &bytes[i..i + 3] == b"let"
-            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
-            && bytes[i + 3].is_ascii_whitespace()
+            && seen_top_level_colon
+            && i > cmd.len() - cmd.trim_start().len()
+            && cmd.is_char_boundary(i)
+            && cmd[..i].chars().next_back().is_none_or(|c| !is_lean_ident_continuation(c) && c != '.')
         {
-            pending_let_assigns += 1;
-            i += 3;
-            continue;
+            let keyword = ["haveI", "have", "letI", "let_fun", "let", "from"]
+                .into_iter().find(|kw| bytes[i..].starts_with(kw.as_bytes())
+                    && cmd[i + kw.len()..].chars().next()
+                        .is_none_or(|c| !is_lean_ident_continuation(c) && c != '.'));
+            if let Some(kw) = keyword {
+                // Delimited binder types are already skipped by the depth guards.
+                // `from` supplies a have's value without an assignment token.
+                if kw == "from" {
+                    pending_local_assigns = pending_local_assigns.saturating_sub(1);
+                } else {
+                    pending_local_assigns += 1;
+                }
+                i += kw.len();
+                continue;
+            }
         }
         if paren == 0
             && bracket == 0
@@ -3317,8 +3329,8 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
             b'}' => brace = (brace - 1).max(0),
             b':' if paren == 0 && bracket == 0 && brace == 0 && strict_brace == 0 => {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
-                    if pending_let_assigns > 0 {
-                        pending_let_assigns -= 1;
+                    if pending_local_assigns > 0 {
+                        pending_local_assigns -= 1;
                         i += 2;
                         continue;
                     }
@@ -3332,6 +3344,9 @@ fn split_at_top_level_assign(cmd: &str) -> Option<(&str, &str)> {
                         seen_top_level_colon = true;
                     }
                 }
+            }
+            b';' if paren == 0 && bracket == 0 && brace == 0 && strict_brace == 0 => {
+                pending_local_assigns = 0;
             }
             b'|' if paren == 0
                 && bracket == 0
@@ -14263,6 +14278,45 @@ public def api := by
         assert!(top_doc_split.shards[1]
             .shard_source
             .contains("/-- second doc -/"));
+    }
+
+    #[test]
+    fn test_local_bindings_in_statement_identity() {
+        let first = "theorem getElem_getElem_findIdxs_sub (s : Nat)\n    (h : i < ((xs : List α).findIdxs p s).length) :\n    haveI : (findIdxs p xs s)[i] - s < xs.length := by grind\n    p xs[(xs.findIdxs p s)[i] - s] := by\n  rw [← getElem_filter_eq_getElem_getElem_findIdxs_sub s] <;> grind";
+        let second = "theorem getElem_swap {xs : List α} {i j k : Nat}\n    (hk : k < (xs.swap i j).length) : (xs.swap i j)[k] =\n    if h₁ : k = i ∧ j < xs.length then xs[j] else if h₂ : k = j ∧ i < xs.length then xs[i]\n    else xs[k]'(length_swap ▸ hk) := by\n  obtain (rfl | hi) := Decidable.em (k = i)\n  · simp only [getElem_swap_left, true_and]\n    exact dite_congr rfl (fun _ => rfl) (by simp)\n  · obtain (rfl | hj) := Decidable.em (k = j)\n    · simp [getElem_swap_right, hi]\n    · simp [getElem_swap_of_ne, hi, hj]";
+        let src = format!("namespace List\n{first}\n{second}\nend List\n");
+        let (sig, proof) = split_at_top_level_assign(first).unwrap();
+        assert!(sig.ends_with("p xs[(xs.findIdxs p s)[i] - s] "));
+        assert!(proof.starts_with(" by\n  rw"));
+        assert!(split_at_top_level_assign(second).unwrap().0.ends_with("else xs[k]'(length_swap ▸ hk) "));
+        let probe = stub_identity_probe_src(&src);
+        let split = split_lean_source(&src, &[]);
+        assert_eq!(split.shards.len(), 2);
+        assert_eq!(split.shards[1].decl_name(), "List.getElem_swap");
+        for text in [probe, declaration_identity_prefix(&src, &split.shards[1])] {
+            assert!(text.contains(sig));
+            assert!(text.contains(":= by grind\n    p xs["));
+            assert!(!text.contains("rw [← getElem_filter"));
+        }
+    }
+
+    #[test]
+    fn test_statement_local_assignment_boundaries() {
+        for ty in [
+            "have h : P := val; P", "have h := val; P", "have : P := by tac\n P",
+            "letI x := val; P", "let_fun x := val\n P",
+            "haveI : P := val; let x := val; have h : P := val\n P",
+            "(have h : P := val; P)", "(letI x := val; P)",
+            "have h : P from val; P", "have h : P from val\n P",
+            "have ⟨h, k⟩ := val; P", "have h : P; P",
+            "have_lemma my_let haveX let_lemma αhave haveα Foo.have Foo.let .have .let",
+        ] {
+            let sig = format!("theorem have_lemma (h : (have : P := val; P)) : {ty} ");
+            let cmd = format!("{sig}:= by have h := val; let x := val; exact h");
+            let (actual, proof) = split_at_top_level_assign(&cmd).unwrap();
+            assert_eq!(actual, sig, "{ty}");
+            assert!(proof.starts_with(" by have h :="));
+        }
     }
 
     #[test]
