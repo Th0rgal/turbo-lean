@@ -164,7 +164,7 @@ def loadInputModule (elaborateHook? : Option (String → TargetArch → IO LNIRM
         throw <| IO.userError s!"[lean-native-core] Cannot parse '{inFile}' as LNIR wire/JSON (use full 'lean-native' for .lean source elaboration)"
 
 private def writeOrPrint (outPath text : String) (msg? : Option String := none) : IO UInt32 := do
-  if outPath.isEmpty then IO.println text else writeTextAtomic outPath text; if let some m := msg? then IO.println m
+  if outPath.isEmpty then IO.println text else do writeTextAtomic outPath text; if let some m := msg? then IO.println m
   return 0
 private def writeAndPrintJsonOrSummary (outPath jsonText summaryText : String) (jsonFlag : Bool) : IO Unit := do
   if !outPath.isEmpty then writeTextAtomic outPath jsonText
@@ -321,7 +321,7 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → Targ
   if !asmPath.isEmpty then
     let (asmOk, asmErr) ← runCmd clangBin (cpuFlags ++ #["-S", tmpLl, "-o", tmpAsm])
     if !asmOk then
-      try IO.FS.removeFile tmpLl catch _ => pure (); try IO.FS.removeFile tmpAsm catch _ => pure ()
+      (try IO.FS.removeFile tmpLl catch _ => pure ()); (try IO.FS.removeFile tmpAsm catch _ => pure ())
       throw <| IO.userError s!"[{tag}] Failed to emit assembly via '{clangBin}': {asmErr}"
     let rawAsm ← try IO.FS.readFile tmpAsm catch _ => pure ""
     try IO.FS.removeFile tmpAsm catch _ => pure ()
@@ -336,14 +336,14 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → Targ
     throw <| IO.userError s!"[{tag}] Failed to compile object for {arch.triple} via '{clangBin}' (previous output preserved): {clangErr}"
   let objBytes ← IO.FS.readBinFile tmpObj
   let (objValid, objFormatDesc) := verifyObjectBytesForTarget arch objBytes
-  if !objValid then try IO.FS.removeFile tmpObj catch _ => pure (); throw <| IO.userError s!"[{tag}] Object verification failed for {arch.triple}: {objFormatDesc}"
+  if !objValid then do (try IO.FS.removeFile tmpObj catch _ => pure ()); throw <| IO.userError s!"[{tag}] Object verification failed for {arch.triple}: {objFormatDesc}"
   let (builtArchive, arErr) ← if !arBin.isEmpty then runCmd arBin #["rcs", tmpArchive, tmpObj] else do
     let (ok1, err1) ← runCmd "llvm-ar" #["rcs", tmpArchive, tmpObj]
-    if ok1 then pure (true, "") else let (ok2, err2) ← runCmd "ar" #["rcs", tmpArchive, tmpObj]; pure (ok2, if err1.isEmpty then err2 else s!"{err1}; {err2}")
+    if ok1 then pure (true, "") else do let (ok2, err2) ← runCmd "ar" #["rcs", tmpArchive, tmpObj]; pure (ok2, if err1.isEmpty then err2 else s!"{err1}; {err2}")
   try IO.FS.removeFile tmpObj catch _ => pure ()
-  if !builtArchive then try IO.FS.removeFile tmpArchive catch _ => pure (); throw <| IO.userError s!"[{tag}] Failed to build static archive for {arch.triple} (previous output preserved): {arErr}"
+  if !builtArchive then do (try IO.FS.removeFile tmpArchive catch _ => pure ()); throw <| IO.userError s!"[{tag}] Failed to build static archive for {arch.triple} (previous output preserved): {arErr}"
   let (archValid, archDesc) ← verifyStaticArchiveFile tmpArchive objBytes
-  if !archValid then try IO.FS.removeFile tmpArchive catch _ => pure (); throw <| IO.userError s!"[{tag}] Static archive verification failed: {archDesc}"
+  if !archValid then do (try IO.FS.removeFile tmpArchive catch _ => pure ()); throw <| IO.userError s!"[{tag}] Static archive verification failed: {archDesc}"
   let bundlePath := findFlagValue args "--artifact-bundle" ""
   let (pendingRenames, backups, installed) := (([] : List (String × String)), ([] : List (String × String)), ([] : List String))
   let mut pendingRenames := pendingRenames; let mut backups := backups; let mut installed := installed
@@ -362,7 +362,8 @@ def runCompileStaticLib (tag : String) (elaborateHook? : Option (String → Targ
         if ← System.FilePath.pathExists dest then
           let backup := s!"{dest}.tmp.{nonce}.backup"
           IO.FS.writeBinFile backup (← IO.FS.readBinFile dest); backups := (backup, dest) :: backups
-      for (stg, dest) in (tmpArchive, outPath) :: pendingRenames do IO.FS.rename stg dest; installed := dest :: installed
+      for (stg, dest) in (tmpArchive, outPath) :: pendingRenames do
+        IO.FS.rename stg dest; installed := dest :: installed
     catch e =>
       for dest in installed do try IO.FS.removeFile dest catch _ => pure ()
       for (backup, dest) in backups do try IO.FS.rename backup dest catch _ => pure ()
@@ -438,7 +439,7 @@ def runEmitFreestandingCLib (tag : String) (elaborateHook? : Option (String → 
       catch e => return (false, toString e)
     let (arOk, arErr) ← if !arBin.isEmpty then runAr arBin else do
       let (ok1, err1) ← runAr "llvm-ar"
-      if ok1 then pure (true, "") else let (ok2, err2) ← runAr "ar"; pure (ok2, if err1.isEmpty then err2 else s!"{err1}; {err2}")
+      if ok1 then pure (true, "") else do let (ok2, err2) ← runAr "ar"; pure (ok2, if err1.isEmpty then err2 else s!"{err1}; {err2}")
     if !arOk then throw <| IO.userError s!"[{tag}] Failed to package freestanding archive '{archivePath}': {arErr}"
     let (archValid, archDesc) ← verifyStaticArchiveFile archivePath objBytes
     if !archValid then throw <| IO.userError s!"[{tag}] Freestanding archive verification failed: {archDesc}"
@@ -466,7 +467,7 @@ def runCompileMetal (tag : String) (elaborateHook? : Option (String → TargetAr
   let baseMod ← loadInputModule elaborateHook? args isFastCheck
   let mslText ← if isFastCheck then pure (emitFastCheckMetal baseMod) else pure (emitMetalModule (← runOptPipelineWithArgs args false baseMod).1)
   let (valid, errs) := validateMetalShader mslText
-  if !valid then IO.eprintln s!"[{tag}] Metal shader validation errors: {errs}"; return 1
+  if !valid then do IO.eprintln s!"[{tag}] Metal shader validation errors: {errs}"; return 1
   writeOrPrint outPath mslText (some s!"[{tag}] Wrote Apple Metal Shading Language 3.0 (fastcheck={isFastCheck}, valid={valid}) to {outPath}")
 
 def runCompileFastCheck (tag : String) (elaborateHook? : Option (String → TargetArch → IO LNIRModule)) (args : List String) : IO UInt32 := do
@@ -786,7 +787,8 @@ def runCoreSelfTest (tag : String) : IO UInt32 := do
     let clangCandidates := (if rawClangEnv.isEmpty then [] else [rawClangEnv]) ++ (if sysroot.isEmpty then [] else [s!"{sysroot}/bin/clang"]) ++
       [s!"{home}/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang", s!"{home}/.elan/toolchains/leanprover--lean4---v4.31.0/bin/clang", "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin/clang", "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin/clang"]
     let mut clangCmd := "clang"
-    for cand in clangCandidates do if ← System.FilePath.pathExists cand then clangCmd := cand; break
+    for cand in clangCandidates do
+      if ← System.FilePath.pathExists cand then clangCmd := cand; break
     try
       IO.FS.writeFile tmpLl androidIr
       let out ← IO.Process.output { cmd := clangCmd, args := #["--target=aarch64-linux-android29", "-O3", "-Wno-override-module", "-S", tmpLl, "-o", "-"] }
