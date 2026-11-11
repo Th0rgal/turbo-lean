@@ -1129,6 +1129,7 @@ pub struct ZygoteWorkerProcess {
     warm_prefix_tree: Vec<(String, String)>,
     warm_imports: std::collections::HashMap<String, String>,
     pub request_count: usize,
+    cold_import_us: Option<u64>,
 }
 
 #[cfg(unix)]
@@ -1214,7 +1215,7 @@ impl ZygoteWorkerProcess {
             stdout: BufReader::new(std::fs::File::from(OwnedFd::from(stream))),
             stderr_tail, stderr_scan, pinned_snapshot_dir: self.pinned_snapshot_dir,
             spawn_lean_path: self.spawn_lean_path.clone(), warm_prefixes: self.warm_prefixes.clone(),
-            warm_prefix_tree: self.warm_prefix_tree.clone(), warm_imports: self.warm_imports.clone(), request_count: 0,
+            warm_prefix_tree: self.warm_prefix_tree.clone(), warm_imports: self.warm_imports.clone(), request_count: 0, cold_import_us: None,
         })
     }
 }
@@ -7286,6 +7287,7 @@ fn eval_with_zygote_pool_attempt(
             warm_prefix_tree: Vec::new(),
             warm_imports: std::collections::HashMap::new(),
             request_count: 0,
+            cold_import_us: None,
         })
     };
 
@@ -7389,6 +7391,10 @@ fn eval_with_zygote_pool_attempt(
                 }
                 Ok(Some(_)) => match serde_json::from_str::<ZygoteEvalReply>(resp_line.trim()) {
                     Ok(mut parsed) => {
+                        if let Some(us) = worker.cold_import_us.take() {
+                            parsed.env_cache_hit = false;
+                            parsed.import_us = us;
+                        }
                         let rss_after = measure_process_rss_mb(pid);
                         parsed.rss_delta_mb = (rss_after as i64) - (rss_before as i64);
                         parsed.peak_rss_mb = rss_after.max(rss_before);
@@ -7437,6 +7443,7 @@ fn eval_with_zygote_pool_attempt(
                 if let WorkerReqOutcome::Reply(rep) = run_worker_req(&mut master, &warm, "warm clone master") {
                     if rep.ok && rep.import_ok && closure.binding() == ClosureBinding::Bound {
                         master.warm_imports.insert(imports_csv.clone(), closure_pool_digest.clone());
+                        master.cold_import_us = Some(rep.import_us);
                         if masters.len() >= 4 { masters.clear(); }
                         masters.insert(pool_key.clone(), master);
                     }
@@ -7444,7 +7451,10 @@ fn eval_with_zygote_pool_attempt(
             }
             if let Some(master) = masters.get_mut(&pool_key) {
                 if master.pinned_snapshot_dir == expected_pinned_dir {
-                    if let Ok(worker) = master.fork_clone(deadline) { return Ok(worker); }
+                    if let Ok(mut worker) = master.fork_clone(deadline) {
+                        worker.cold_import_us = master.cold_import_us.take();
+                        return Ok(worker);
+                    }
                 }
                 masters.remove(&pool_key);
             }
@@ -13004,6 +13014,7 @@ mod tests {
                 warm_prefix_tree: Vec::new(),
                 warm_imports: std::collections::HashMap::new(),
                 request_count: 1,
+                cold_import_us: None,
             }
         };
 
@@ -15451,14 +15462,17 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
 
     #[test]
     fn test_zygote_cow_fork_concurrent_pool_miss() {
-        let (dir, _store, env, lean) = open_test_zygote_env("clone_pool").expect("Lean toolchain");
+        let (dir, _store, mut env, lean) = open_test_zygote_env("clone_pool").expect("Lean toolchain");
+        fs::write(dir.join("ClonePool.olean"), compile_test_olean(&lean, &dir, "ClonePool", "def cloneSeed : Nat := 7\n")).unwrap();
+        env.insert("LEAN_PATH".into(), dir.to_string_lossy().into_owned());
+        eval_with_zygote_pool_for_targets(&_store, "leanprover/lean4:v4.35.0", &dir.to_string_lossy(), &env, &lean, "import ClonePool\ntheorem clone_warm : True := trivial\n", &["clone_warm".into()], None, &[]).unwrap();
         std::thread::scope(|s| {
             let handles: Vec<_> = (0..4).map(|i| {
                 let (env, lean) = (&env, &lean);
                 s.spawn(move || {
                     let (_dir, store, _, _) = open_test_zygote_env(&format!("clone_thread_{i}")).unwrap();
-                    let code = format!("import Init\ntheorem clone_pool_{i} : {i} = {i} := rfl\n");
-                    let r = eval_with_zygote_pool_for_targets(&store, "leanprover/lean4:v4.35.0", "", env, lean, &code, &[format!("clone_pool_{i}")], None, &[]).unwrap();
+                    let code = format!("import ClonePool\ntheorem clone_pool_{i} : cloneSeed = 7 := rfl\n");
+                    let r = eval_with_zygote_pool_for_targets(&store, "leanprover/lean4:v4.35.0", &env["LEAN_PATH"], env, lean, &code, &[format!("clone_pool_{i}")], None, &[]).unwrap();
                     assert!(r.ok && r.kernel_gate_active, "{:?}", r.errors);
                     assert!(r.env_cache_hit, "clone must inherit the imported environment");
                     assert_eq!(r.import_us, 0);

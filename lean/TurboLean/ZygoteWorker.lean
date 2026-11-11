@@ -1736,6 +1736,8 @@ def writeVerifiedOutlineOlean (baseEnv finalEnv : Environment) (modName : Name) 
   writeAuditedModuleOlean baseEnv finalEnv modName oleanPath true
 
 def compactPrefix? (baseEnv finalEnv : Environment) (imports : Array Import) : IO (Option Environment) := do
+  let (clean, _, _) ← auditNewKernelDecls baseEnv finalEnv (fun _ => false) false
+  if !clean then return none
   let oldPath ← searchPathRef.get
   let mut result := none
   let some staging ← IO.getEnv "TURBO_LEAN_STAGING_DIR" | return none
@@ -4111,7 +4113,8 @@ def main (args : List String) : IO Unit := do
         | some ckptState, false =>
           -- Only a single declaration is environment-only: namespace/open/section/options
           -- and local commands retain the complete Command.State replay path.
-          if !evalMode && emitOlean?.isNone && !allowSorry && !compactCache.contains fullPrefixKey then
+          if !evalMode && emitOlean?.isNone && !allowSorry && !compactCache.contains fullPrefixKey &&
+              (["def ", "theorem "].any (fun p => prefixCode.trimAscii.toString.startsWith p)) then
             if let .ok syn := Parser.runParserCategory baseEnv `command prefixCode then
               if syn.isOfKind ``Lean.Parser.Command.declaration then
                 if let some env ← TurboLean.ZygoteWorker.compactPrefix? baseEnv ckptState.env imports then
