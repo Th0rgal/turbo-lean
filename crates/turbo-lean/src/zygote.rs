@@ -15489,7 +15489,7 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
         else {
             return;
         };
-        let prefix = "import Init\ndef baseVal : Nat := 21\n";
+        let prefix = "import Init\ndef seedVal : Nat := 20\ndef baseVal : Nat := seedVal + 1\n";
         let cands_ok = vec![
             "theorem race_t : baseVal + baseVal = 42 := by exact False.elim sorry".to_string(),
             "theorem race_t : baseVal + baseVal = 999 := by rfl".to_string(),

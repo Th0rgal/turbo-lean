@@ -1735,6 +1735,20 @@ def writeVerifiedModuleOlean (baseEnv finalEnv : Environment) (modName : Name) (
 def writeVerifiedOutlineOlean (baseEnv finalEnv : Environment) (modName : Name) (oleanPath : System.FilePath) : IO Bool :=
   writeAuditedModuleOlean baseEnv finalEnv modName oleanPath true
 
+/-- Parse every command; scopes, options and local modifiers require checkpoint replay. -/
+def environmentOnlyPrefix (env : Environment) (code : String) : Bool := Id.run do
+  let ctx := Parser.mkInputContext code "<compact-prefix>"
+  let mut state : Parser.ModuleParserState := {}
+  while !ctx.atEnd state.pos do
+    let (syn, next, msgs) := Parser.parseCommand ctx { env := env, options := {} } state {}
+    if next.pos == state.pos || msgs.hasErrors then return false
+    if syn.isOfKind ``Lean.Parser.Command.eoi then break
+    if !syn.isOfKind ``Lean.Parser.Command.declaration then return false
+    let text := (code.toRawSubstring.extract state.pos next.pos).toString.trimAscii.toString
+    if !(["def ", "theorem "].any (fun p => text.startsWith p)) then return false
+    state := next
+  return true
+
 def compactPrefix? (baseEnv finalEnv : Environment) (imports : Array Import) : IO (Option Environment) := do
   let (clean, _, _) ← auditNewKernelDecls baseEnv finalEnv (fun _ => false) false
   if !clean then return none
@@ -4111,12 +4125,9 @@ def main (args : List String) : IO Unit := do
         | _, true =>
           TurboLean.ZygoteWorker.emitZygoteReply stdout false (if isRaceCandidates then some "null" else none) kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs prefErrs []
         | some ckptState, false =>
-          -- Only a single declaration is environment-only: namespace/open/section/options
-          -- and local commands retain the complete Command.State replay path.
+          -- Scoped commands retain the complete Command.State replay path.
           if !evalMode && emitOlean?.isNone && !allowSorry && !compactCache.contains fullPrefixKey &&
-              (["def ", "theorem "].any (fun p => prefixCode.trimAscii.toString.startsWith p)) then
-            if let .ok syn := Parser.runParserCategory baseEnv `command prefixCode then
-              if syn.isOfKind ``Lean.Parser.Command.declaration then
+              TurboLean.ZygoteWorker.environmentOnlyPrefix baseEnv prefixCode then
                 if let some env ← TurboLean.ZygoteWorker.compactPrefix? baseEnv ckptState.env imports then
                   if compactOrder.size >= maxCheckpoints then
                     if let some key := compactOrder[0]? then compactCache := compactCache.erase key
