@@ -36,6 +36,8 @@ pub struct VerificationReceipt {
     pub con_leche_rev: Option<String>,
     pub interface_hash: String,
     pub action_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_csimp_digest: Option<String>,
     pub files_audited: usize,
     pub theorem_shards: usize,
     pub forbidden_constructs_found: usize,
@@ -171,6 +173,7 @@ pub fn compute_receipt_blake3(
     kernel_engine: &str,
     lean_toolchain: &str,
     con_leche_rev: Option<&str>,
+    active_csimp_digest: Option<&str>,
     interface_hash: &str,
     action_key: &str,
     files_audited: usize,
@@ -212,7 +215,96 @@ pub fn compute_receipt_blake3(
         hasher.update(file_ih.as_bytes());
         hasher.update(b"\n");
     }
-    hasher.finalize().to_hex().to_string()
+    bind_active_csimp_digest(&hasher.finalize().to_hex().to_string(), active_csimp_digest)
+}
+
+/// Canonical active compiler-simplification policy and entries. Entries include the
+/// theorem, source, and replacement identities (prefer content-bound identities).
+/// Ordering and duplicate policy/entry observations do not affect the digest.
+pub fn compute_active_csimp_digest(
+    policy: &[String],
+    entries: &[(String, String, String)],
+) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(b"turbo-lean-active-csimp-v1\n");
+    let mut field = |s: &str| {
+        h.update(&(s.len() as u64).to_le_bytes());
+        h.update(s.as_bytes());
+    };
+    for pattern in policy
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect::<BTreeSet<_>>()
+    {
+        field("policy");
+        field(pattern);
+    }
+    for (theorem, from, to) in entries.iter().collect::<BTreeSet<_>>() {
+        field("entry");
+        field(theorem);
+        field(from);
+        field(to);
+    }
+    h.finalize().to_hex().to_string()
+}
+
+fn bind_active_csimp_digest(legacy_hash: &str, digest: Option<&str>) -> String {
+    let Some(digest) = digest else {
+        return legacy_hash.to_owned();
+    };
+    let mut h = blake3::Hasher::new();
+    h.update(b"turbo-lean-receipt-active-csimp-v1\n");
+    for value in [legacy_hash, digest] {
+        h.update(&(value.len() as u64).to_le_bytes());
+        h.update(value.as_bytes());
+    }
+    h.finalize().to_hex().to_string()
+}
+
+impl VerificationReceipt {
+    /// Bind observed entries before signing. A changed digest invalidates any old
+    /// signature, so the caller must sign the updated receipt again.
+    pub fn bind_active_csimp(
+        &mut self,
+        policy: &[String],
+        entries: &[(String, String, String)],
+    ) -> Result<()> {
+        verify_single_receipt_integrity_and_provenance(self, "Cryptographic")?;
+        let digest = compute_active_csimp_digest(policy, entries);
+        let legacy_hash = match self.schema_version {
+            1 => compute_receipt_blake3_v1(
+                self.schema_version,
+                &self.mode,
+                &self.interface_hash,
+                &self.action_key,
+                self.files_audited,
+                self.theorem_shards,
+                self.forbidden_constructs_found,
+                &self.per_file_interfaces,
+            ),
+            _ => compute_receipt_blake3(
+                self.schema_version,
+                &self.mode,
+                self.kernel_engine.as_deref().unwrap_or_default(),
+                self.lean_toolchain.as_deref().unwrap_or_default(),
+                self.con_leche_rev.as_deref(),
+                None,
+                &self.interface_hash,
+                &self.action_key,
+                self.files_audited,
+                self.theorem_shards,
+                self.forbidden_constructs_found,
+                &self.per_file_interfaces,
+            ),
+        };
+        self.receipt_blake3 = bind_active_csimp_digest(&legacy_hash, Some(&digest));
+        self.active_csimp_digest = Some(digest);
+        self.signature_alg = None;
+        self.ed25519_pubkey = None;
+        self.ed25519_signature = None;
+        Ok(())
+    }
 }
 
 /// Compute a keyed HMAC-BLAKE3 authentication tag over `receipt_blake3`.
@@ -324,6 +416,7 @@ pub fn build_verification_receipt_with_provenance(
         kernel_engine,
         &normalized_tc,
         con_leche_rev,
+        None,
         interface_hash,
         action_key,
         files_audited,
@@ -339,6 +432,7 @@ pub fn build_verification_receipt_with_provenance(
         con_leche_rev: con_leche_rev.map(String::from),
         interface_hash: interface_hash.to_string(),
         action_key: action_key.to_string(),
+        active_csimp_digest: None,
         files_audited,
         theorem_shards,
         forbidden_constructs_found,
@@ -489,15 +583,18 @@ fn verify_single_receipt_integrity_and_provenance(
     let toolchain_state = classify_receipt_str_field(receipt.lean_toolchain.as_deref());
     let rev_state = classify_receipt_str_field(receipt.con_leche_rev.as_deref());
     let expected_blake3_opt = match receipt.schema_version {
-        1 => Some(compute_receipt_blake3_v1(
-            receipt.schema_version,
-            &receipt.mode,
-            &receipt.interface_hash,
-            &receipt.action_key,
-            receipt.files_audited,
-            receipt.theorem_shards,
-            receipt.forbidden_constructs_found,
-            &receipt.per_file_interfaces,
+        1 => Some(bind_active_csimp_digest(
+            &compute_receipt_blake3_v1(
+                receipt.schema_version,
+                &receipt.mode,
+                &receipt.interface_hash,
+                &receipt.action_key,
+                receipt.files_audited,
+                receipt.theorem_shards,
+                receipt.forbidden_constructs_found,
+                &receipt.per_file_interfaces,
+            ),
+            receipt.active_csimp_digest.as_deref(),
         )),
         CURRENT_RECEIPT_SCHEMA_VERSION => receipt
             .kernel_engine
@@ -510,6 +607,7 @@ fn verify_single_receipt_integrity_and_provenance(
                     ke,
                     tc,
                     receipt.con_leche_rev.as_deref(),
+                    receipt.active_csimp_digest.as_deref(),
                     &receipt.interface_hash,
                     &receipt.action_key,
                     receipt.files_audited,
@@ -774,6 +872,82 @@ mod tests {
     use super::*;
 
     #[test]
+    fn active_csimp_digest_is_canonical_and_content_sensitive() {
+        let policy = vec![" B.* ".into(), "A.eq".into(), "B.*".into()];
+        let entries = vec![("A.eq".into(), "A.slow".into(), "A.fast".into())];
+        let digest = compute_active_csimp_digest(&policy, &entries);
+        assert_eq!(
+            digest,
+            compute_active_csimp_digest(
+                &["A.eq".into(), "B.*".into()],
+                &[entries[0].clone(), entries[0].clone()]
+            )
+        );
+        assert_ne!(digest, compute_active_csimp_digest(&[], &entries));
+        for column in 0..3 {
+            let mut changed = entries.clone();
+            match column {
+                0 => changed[0].0.push('x'),
+                1 => changed[0].1.push('x'),
+                _ => changed[0].2.push('x'),
+            }
+            assert_ne!(digest, compute_active_csimp_digest(&policy, &changed));
+        }
+        assert_ne!(
+            compute_active_csimp_digest(&["a".into(), "bc".into()], &[]),
+            compute_active_csimp_digest(&["ab".into(), "c".into()], &[])
+        );
+    }
+
+    #[test]
+    fn active_csimp_receipt_binding_preserves_legacy_and_rejects_tampering() {
+        let receipt = build_verification_receipt("trusted", "ih", "act", 1, 1, 0, BTreeMap::new());
+        for schema in [1, 2] {
+            let mut rec = receipt.clone();
+            if schema == 1 {
+                rec.schema_version = 1;
+                rec.kernel_engine = None;
+                rec.lean_toolchain = None;
+                rec.receipt_blake3 = compute_receipt_blake3_v1(
+                    1,
+                    "trusted",
+                    "ih",
+                    "act",
+                    1,
+                    1,
+                    0,
+                    &rec.per_file_interfaces,
+                );
+            }
+            let legacy_hash = rec.receipt_blake3.clone();
+            let json = serde_json::to_value(&rec).unwrap();
+            assert!(json.get("active_csimp_digest").is_none());
+            let decoded: VerificationReceipt = serde_json::from_value(json).unwrap();
+            assert!(verify_receipt_data(&decoded, None, None).is_ok());
+            rec.active_csimp_digest = Some(compute_active_csimp_digest(&[], &[]));
+            assert!(verify_receipt_data(&rec, None, None).is_err());
+            rec.receipt_blake3 =
+                bind_active_csimp_digest(&legacy_hash, rec.active_csimp_digest.as_deref());
+            assert!(verify_receipt_data(&rec, None, None).is_ok());
+            let key = [0x42; 32];
+            rec.bind_active_csimp(&[], &[]).unwrap();
+            assert!(verify_receipt_data(&rec, None, None).is_ok());
+            attach_ed25519_signature(&mut rec, &key);
+            let decoded: VerificationReceipt =
+                serde_json::from_value(serde_json::to_value(&rec).unwrap()).unwrap();
+            assert!(verify_receipt_data_with_policy(&decoded, None, None, None, true).is_ok());
+            for digest in [None, Some(String::new()), Some("forged".into())] {
+                let mut tampered = rec.clone();
+                tampered.active_csimp_digest = digest;
+                assert!(verify_receipt_data(&tampered, None, None).is_err());
+            }
+            rec.bind_active_csimp(&["A.*".into()], &[]).unwrap();
+            assert!(rec.ed25519_signature.is_none());
+            assert!(verify_receipt_data(&rec, None, None).is_ok());
+        }
+    }
+
+    #[test]
     fn test_verification_receipt_integrity_and_altered_file_pinpointing() {
         let mut files_v1 = BTreeMap::new();
         files_v1.insert(
@@ -890,6 +1064,7 @@ mod tests {
             "standard",
             "leanprover/lean4:v4.35.0",
             None,
+            None,
             "ih",
             "act",
             1,
@@ -903,6 +1078,7 @@ mod tests {
             "standard",
             "leanprover/lean4:v4.35.0",
             Some("none"),
+            None,
             "ih",
             "act",
             1,
@@ -916,6 +1092,7 @@ mod tests {
             "standard",
             "leanprover/lean4:v4.35.0",
             Some(""),
+            None,
             "ih",
             "act",
             1,
@@ -997,6 +1174,7 @@ mod tests {
                 r.kernel_engine.as_deref().unwrap(),
                 r.lean_toolchain.as_deref().unwrap(),
                 r.con_leche_rev.as_deref(),
+                r.active_csimp_digest.as_deref(),
                 &r.interface_hash,
                 &r.action_key,
                 r.files_audited,

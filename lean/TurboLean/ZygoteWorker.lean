@@ -1295,6 +1295,10 @@ def declaresHostName (env : Environment) (fastMap : List (String × String)) (t 
       nameMatchesHostTargetExact (userNameComponents origName) exactRoot tc &&
         env.constants.map₂.contains genName)
 
+/-- Keep policy diagnostics actionable without changing their stable violation prefixes. -/
+def kernelPolicyHint (policy : String) (name : Name) : String :=
+  s!"; configure [{policy}] allow = [\"{Lean.privateToUserName name}\"] in turbo-lean.toml"
+
 /-- In-kernel soundness gate auditing all newly added declarations in `afterEnv.constants.map₂`
     (relative to `beforeEnv.constants.map₂`) for unapproved axioms, compiler-trusted evaluation,
     extern/implemented_by bypasses, nested inductives (sea-monster risk), and prior-environment tampering. -/
@@ -1326,7 +1330,7 @@ def auditNewKernelDecls
   let cliqueCacheRef ← IO.mkRef ({} : Std.HashMap (Option ModuleIdx × Name) Bool)
   for (name, cinfo) in orderedNewDecls do
     if cinfo.isUnsafe then
-      violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} declaration `{name}` is forbidden"]
+      violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} declaration `{name}` is forbidden{kernelPolicyHint unsfTag name}"]
     if (cinfo.isPartial || (Lean.Compiler.isUnsafeRecName? name).isSome) &&
        !(← isCompilerPartialRecDefn afterEnv hydratedEnvRef cliqueCacheRef patterns beforeMap none cinfo #[] stubExempt allowSorry) then
       violations := violations ++ [s!"[TurboLean.KernelGate] forged or unpaired _unsafe_rec/partial declaration `{name}` is forbidden"]
@@ -1336,10 +1340,10 @@ def auditNewKernelDecls
     if isNestedInd then
       violations := violations ++ [s!"[TurboLean.KernelGate] nested inductive type `{name}` (sea-monster risk) is forbidden in theorem shards"]
     if Lean.isExtern afterEnv name || (Lean.Compiler.getImplementedBy? afterEnv name).isSome then
-      violations := violations ++ [s!"[TurboLean.KernelGate] extern/implemented_by bypass on `{name}` is forbidden"]
+      violations := violations ++ [s!"[TurboLean.KernelGate] extern/implemented_by bypass on `{name}` is forbidden{kernelPolicyHint "implemented_by" name}"]
     let csimpSt := Lean.Compiler.CSimp.ext.getState afterEnv
     if csimpSt.thmNames.contains name || csimpSt.map.contains name then
-      violations := violations ++ [s!"[TurboLean.KernelGate] csimp replacement bypass on `{name}` is forbidden"]
+      violations := violations ++ [s!"[TurboLean.KernelGate] csimp replacement bypass on `{name}` is forbidden{kernelPolicyHint "csimp" name}"]
     let axs := collectDeclAxioms beforeMap afterEnv name stubExempt
     for ax in axs do
       if !isAllowedAxiom patterns ax then
@@ -2556,7 +2560,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
               violations := violations ++ [s!"[TurboLean.KernelGate] custom axiom `{declName}` in `{rawStr}` is forbidden"]
           | .inductInfo iVal =>
             if iVal.isUnsafe then
-              violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} inductive `{declName}` in `{rawStr}` is forbidden"]
+              violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} inductive `{declName}` in `{rawStr}` is forbidden{kernelPolicyHint unsfTag declName}"]
             if iVal.isNested && !nestedInductiveAllowed env iVal then
               violations := violations ++ [s!"[TurboLean.KernelGate] nested inductive type `{declName}` (sea-monster risk) through a non-core container in `{rawStr}` is forbidden"]
           | _ => pure ()
@@ -2567,7 +2571,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
              !isWhitelistedInitExecUnsafe env modIdx cinfo &&
              !((safeUnsafeCallWrapperParent? env modIdx cinfo).any (fun pc => unsafeAllowed pc.name)) &&
              !unsafeAllowed declName then
-            violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} declaration `{declName}` in `{rawStr}` is forbidden"]
+            violations := violations ++ [s!"[TurboLean.KernelGate] {unsfTag} declaration `{declName}` in `{rawStr}` is forbidden{kernelPolicyHint unsfTag declName}"]
           if (cinfo.isPartial || (Lean.Compiler.isUnsafeRecName? declName).isSome) &&
              !(← isCompilerPartialRecDefn env hydratedEnvRef cliqueCacheRef patterns {} (some modIdx) cinfo #[] stubs.contains allowSorry) then
             violations := violations ++ [s!"[TurboLean.KernelGate] forged or unpaired _unsafe_rec/partial declaration `{declName}` in `{rawStr}` is forbidden"]
@@ -2576,7 +2580,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
              !((safeUnsafeCallWrapperBridgeParent? env modIdx declName).any (fun pc => unsafeAllowed pc.name)) &&
              !isPinnedFfiOpaque env ffiAllow modIdx cinfo &&
              !implByAllowed declName then
-            violations := violations ++ [s!"[TurboLean.KernelGate] extern/implemented_by bypass on `{declName}` in `{rawStr}` is forbidden"]
+            violations := violations ++ [s!"[TurboLean.KernelGate] extern/implemented_by bypass on `{declName}` in `{rawStr}` is forbidden{kernelPolicyHint "implemented_by" declName}"]
           let cinfoAxs : Array Name := Id.run do
             let mut acc := axMap[declName]?.getD #[]
             match cinfo with
@@ -2675,14 +2679,14 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
                                   (compiledConsts.contains lhs || compiledConsts.contains (Lean.Compiler.mkUnsafeRecName lhs) ||
                                     (inlinedLhs && !lhsRhs))
                     if fwdHit || revHit then
-                      violations := violations ++ [s!"[TurboLean.KernelGate] local csimp replacement `{thmName}` ({lhs} <-> {rhs}) rewrote compiled code of `{callerName}` in `{rawStr}`"]
+                      violations := violations ++ [s!"[TurboLean.KernelGate] local csimp replacement `{thmName}` ({lhs} <-> {rhs}) rewrote compiled code of `{callerName}` in `{rawStr}`{kernelPolicyHint "csimp" thmName}"]
         for extraName in mdata.extraConstNames do
           if (Lean.isExtern env extraName || (Lean.Compiler.getImplementedBy? env extraName).isSome) &&
              !isWhitelistedInitExecBridge env modIdx extraName &&
              !((safeUnsafeCallWrapperBridgeParent? env modIdx extraName).any (fun pc => unsafeAllowed pc.name)) &&
              !((env.find? extraName).any (isPinnedFfiOpaque env ffiAllow modIdx)) &&
              !implByAllowed extraName then
-            violations := violations ++ [s!"[TurboLean.KernelGate] extern/implemented_by bypass on auxiliary `{extraName}` in `{rawStr}` is forbidden"]
+            violations := violations ++ [s!"[TurboLean.KernelGate] extern/implemented_by bypass on auxiliary `{extraName}` in `{rawStr}` is forbidden{kernelPolicyHint "implemented_by" extraName}"]
       else
         violations := violations ++ [s!"[TurboLean.KernelGate] module `{rawStr}` index out of bounds"]
   let mut seenCSimp : Std.HashMap Name Bool := {}
@@ -2703,7 +2707,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
         if !(seenMod[idx]?.getD false) then
           if let some modLabel := targetIdxs[idx]? then
             seenMod := seenMod.insert idx true
-            out := out ++ [s!"[TurboLean.KernelGate] csimp replacement `{e.thmName}` ({e.fromDeclName} -> {e.toDeclName}) touching `{modLabel}` is forbidden"]
+            out := out ++ [s!"[TurboLean.KernelGate] csimp replacement `{e.thmName}` ({e.fromDeclName} -> {e.toDeclName}) touching `{modLabel}` is forbidden{kernelPolicyHint "csimp" e.thmName}"]
     return out
   for (modIdx, _) in targetIdxs.toArray do
     for scEntry in Lean.Compiler.CSimp.ext.ext.getModuleEntries env modIdx do
