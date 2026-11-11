@@ -215,7 +215,7 @@ pub fn compute_receipt_blake3(
         hasher.update(file_ih.as_bytes());
         hasher.update(b"\n");
     }
-    bind_active_csimp_digest(&hasher.finalize().to_hex().to_string(), active_csimp_digest)
+    bind_active_csimp_digest(hasher.finalize().to_hex().as_str(), active_csimp_digest)
 }
 
 /// Canonical active compiler-simplification policy and entries. Entries include the
@@ -410,13 +410,16 @@ pub fn build_verification_receipt_with_provenance(
 ) -> VerificationReceipt {
     let schema_version = CURRENT_RECEIPT_SCHEMA_VERSION;
     let normalized_tc = crate::kernel::normalize_lean_toolchain(lean_toolchain);
+    let csimp_policy = crate::splitter::normalized_policy_env_vec("TURBO_LEAN_ALLOWED_CSIMP");
+    let active_csimp_digest = (!csimp_policy.is_empty())
+        .then(|| compute_active_csimp_digest(&csimp_policy, &[]));
     let receipt_blake3 = compute_receipt_blake3(
         schema_version,
         mode,
         kernel_engine,
         &normalized_tc,
         con_leche_rev,
-        None,
+        active_csimp_digest.as_deref(),
         interface_hash,
         action_key,
         files_audited,
@@ -432,7 +435,7 @@ pub fn build_verification_receipt_with_provenance(
         con_leche_rev: con_leche_rev.map(String::from),
         interface_hash: interface_hash.to_string(),
         action_key: action_key.to_string(),
-        active_csimp_digest: None,
+        active_csimp_digest,
         files_audited,
         theorem_shards,
         forbidden_constructs_found,
@@ -901,6 +904,9 @@ mod tests {
 
     #[test]
     fn active_csimp_receipt_binding_preserves_legacy_and_rejects_tampering() {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let receipt = build_verification_receipt("trusted", "ih", "act", 1, 1, 0, BTreeMap::new());
         for schema in [1, 2] {
             let mut rec = receipt.clone();
@@ -948,7 +954,104 @@ mod tests {
     }
 
     #[test]
+    fn build_verification_receipt_auto_binds_allowed_csimp_env() {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct RestoreEnv(Option<String>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", v),
+                    None => std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP"),
+                }
+            }
+        }
+        let _restore = RestoreEnv(std::env::var("TURBO_LEAN_ALLOWED_CSIMP").ok());
+
+        for empty_val in [None, Some(""), Some(" ,  , ")] {
+            match empty_val {
+                Some(v) => std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", v),
+                None => std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP"),
+            }
+            let rec = build_verification_receipt_with_provenance(
+                "trusted",
+                "standard",
+                "leanprover/lean4:v4.35.0",
+                None,
+                "ih",
+                "act",
+                1,
+                1,
+                0,
+                BTreeMap::new(),
+            );
+            assert!(rec.active_csimp_digest.is_none());
+            assert!(verify_receipt_data(&rec, None, None).is_ok());
+        }
+
+        let baseline = build_verification_receipt_with_provenance(
+            "trusted",
+            "standard",
+            "leanprover/lean4:v4.35.0",
+            None,
+            "ih",
+            "act",
+            1,
+            1,
+            0,
+            BTreeMap::new(),
+        );
+
+        std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", " B.* , A.eq , B.* ");
+        let mut bound = build_verification_receipt_with_provenance(
+            "trusted",
+            "standard",
+            "leanprover/lean4:v4.35.0",
+            None,
+            "ih",
+            "act",
+            1,
+            1,
+            0,
+            BTreeMap::new(),
+        );
+        let expected_digest = compute_active_csimp_digest(&["A.eq".into(), "B.*".into()], &[]);
+        assert_eq!(
+            bound.active_csimp_digest.as_deref(),
+            Some(expected_digest.as_str())
+        );
+        assert_ne!(bound.receipt_blake3, baseline.receipt_blake3);
+        assert!(verify_receipt_data(&bound, None, None).is_ok());
+
+        let mut manual = baseline.clone();
+        manual
+            .bind_active_csimp(&["A.eq".into(), "B.*".into()], &[])
+            .unwrap();
+        assert_eq!(bound.receipt_blake3, manual.receipt_blake3);
+        assert_eq!(bound.active_csimp_digest, manual.active_csimp_digest);
+
+        let entries = vec![("A.eq".into(), "A.slow".into(), "A.fast".into())];
+        bound
+            .bind_active_csimp(&["A.eq".into(), "B.*".into()], &entries)
+            .unwrap();
+        let mut manual_entries = baseline;
+        manual_entries
+            .bind_active_csimp(&["A.eq".into(), "B.*".into()], &entries)
+            .unwrap();
+        assert_eq!(bound.receipt_blake3, manual_entries.receipt_blake3);
+        assert_eq!(
+            bound.active_csimp_digest,
+            manual_entries.active_csimp_digest
+        );
+        assert!(verify_receipt_data(&bound, None, None).is_ok());
+    }
+
+    #[test]
     fn test_verification_receipt_integrity_and_altered_file_pinpointing() {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut files_v1 = BTreeMap::new();
         files_v1.insert(
             "TurboLean/Reflection.lean".to_string(),
@@ -1055,6 +1158,9 @@ mod tests {
 
     #[test]
     fn test_receipt_kernel_provenance_domain_separation_and_fail_closed_validation() {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut files = BTreeMap::new();
         files.insert("A.lean".to_string(), "ih_a".to_string());
 
