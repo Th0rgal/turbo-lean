@@ -7,6 +7,7 @@ import Lean.Util.CollectAxioms
 import Lean.Compiler.CSimpAttr
 import Lean.Compiler.ImplementedByAttr
 import Lean.Compiler.ExternAttr
+import Lean.DeclarationRange
 
 open Lean
 namespace TurboLean.StatementHash
@@ -213,6 +214,18 @@ def collectAxiomsCached (env : Environment) (c : Name) (memo : AxiomMemo) : Arra
 
 -- Import the union once: repeated importModules calls keep mapped olean regions alive.
 -- The encoding uses constant names, never import-order-dependent module indices.
+private def isAuxiliaryTheorem (env : Environment) (n : Name) : Bool :=
+  -- Source ranges distinguish escaped user names (e.g. «_proof_1») from auxiliaries.
+  -- Strip private prefixes so private theorems remain statement-pinned.
+  let sourceDeclared := (declRangeExt.find? env n <|>
+    declRangeExt.find? (level := .server) env n).isSome
+  !sourceDeclared && internal (Lean.privateToUserName n)
+where
+  internal (n : Name) : Bool :=
+    n.isInternalDetail || n.hasMacroScopes || match n with
+      | .str p _ | .num p _ => internal p
+      | .anonymous => false
+
 def dumpWithState (env : Environment) (mod : Name) (seenInit : NameSet := {})
     (axMemoInit : AxiomMemo := {}) : IO (NameSet × AxiomMemo) := do
   let some idx := env.getModuleIdx? mod | throw <| IO.userError s!"missing module {mod}"
@@ -249,7 +262,7 @@ def dumpWithState (env : Environment) (mod : Name) (seenInit : NameSet := {})
         unsafeDecls := unsafeDecls.push (pc.name.toString, (Lean.privateToUserName pc.name).toString)
       | none =>
         implByDecls := implByDecls.push (c.name.toString, (Lean.privateToUserName c.name).toString)
-    if c.isTheorem then
+    if c.isTheorem && !isAuxiliaryTheorem env c.name then
       emit <| Json.mkObj [("theorem", toJson c.name.toString),
         ("statement", statement c), ("deps", toJson (c.type.getUsedConstants.map Name.toString))]
       pending := pending ++ c.type.getUsedConstants
