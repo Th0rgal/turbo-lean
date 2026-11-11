@@ -3251,7 +3251,7 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
         TermIf { has_then: bool },
         ByWaitFirst(BlockKind),
         ByBlock { base_col: usize, bind_col: usize, in_conv: bool, arm_inline: bool },
-        TacticAlts { floor_col: usize, saw_with: bool, arm_col: Option<usize> },
+        TacticAlts { floor_col: usize, need_with: bool, saw_with: bool, arm_col: Option<usize> },
         TacticHeader(HeaderKind),
         TacticBranches { base_col: usize, in_conv: bool },
         TacticIf { has_then: bool },
@@ -3272,7 +3272,8 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
         while matches!(scopes.last(), Some(
             StmtScope::Show { .. } | StmtScope::TermFunBody | StmtScope::TermIf { .. } | StmtScope::LocalArms { .. }
             | StmtScope::LocalValue { .. } | StmtScope::MatchArms { .. } | StmtScope::ByBlock { .. }
-            | StmtScope::TacticAlts { .. } | StmtScope::TacticBranches { .. } | StmtScope::Calc { rhs: true, .. }
+            | StmtScope::TacticAlts { need_with: false, .. } | StmtScope::TacticAlts { saw_with: true, .. }
+            | StmtScope::TacticBranches { .. } | StmtScope::Calc { rhs: true, .. }
         )) {
             scopes.pop();
         }
@@ -3305,11 +3306,12 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
             let by_base_at_col = scopes.iter().rev().any(|s| matches!(s, StmtScope::ByBlock { base_col, .. } if col == *base_col));
             let is_from_or_by = cmd[i..].starts_with("from") && cmd[i + 4..].chars().next().is_none_or(|ch| !is_lean_ident_continuation(ch))
                 || cmd[i..].starts_with("by") && cmd[i + 2..].chars().next().is_none_or(|ch| !is_lean_ident_continuation(ch));
+            let is_with_kw = cmd[i..].starts_with("with") && cmd[i + 4..].chars().next().is_none_or(|ch| !is_lean_ident_continuation(ch));
             let mut eff_term_pending = term_pending;
             while match scopes.last().copied() {
-                Some(StmtScope::ByBlock { base_col, arm_inline, .. }) => col < base_col && !(arm_inline && eff_term_pending && matches!(scopes.iter().rev().nth(1), Some(&StmtScope::TacticAlts { floor_col, saw_with: true, arm_col }) if col > arm_col.unwrap_or(floor_col))),
+                Some(StmtScope::ByBlock { base_col, arm_inline, .. }) => col < base_col && !(arm_inline && eff_term_pending && matches!(scopes.iter().rev().nth(1), Some(&StmtScope::TacticAlts { floor_col, saw_with: true, arm_col, .. }) if col > arm_col.unwrap_or(floor_col))),
                 Some(StmtScope::TacticBranches { base_col, .. }) => col < base_col,
-                Some(StmtScope::TacticAlts { floor_col, saw_with, arm_col }) => if !saw_with { !cmd[i..].starts_with("with") } else if c == b'|' { col < arm_col.unwrap_or(floor_col) } else { col <= arm_col.unwrap_or(floor_col) },
+                Some(StmtScope::TacticAlts { floor_col, need_with, saw_with, arm_col }) => if !saw_with { !need_with && !is_with_kw } else if c == b'|' { arm_col.is_some_and(|ac| col < ac) } else { col <= floor_col.max(arm_col.unwrap_or(floor_col)) },
                 Some(StmtScope::DoBlock(base_col)) => col < base_col,
                 Some(StmtScope::Calc { base_col, .. }) => col <= base_col,
                 Some(StmtScope::TermFunBody | StmtScope::TermIf { .. }) => by_base_at_col && !eff_term_pending,
@@ -3322,13 +3324,19 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
             } {
                 match scopes.pop() {
                     Some(StmtScope::LocalValue { in_tactic: false, .. } | StmtScope::LocalArms { in_tactic: false, .. }) => eff_term_pending = true,
-                    Some(StmtScope::ByBlock { .. }) if c != b'|' && matches!(scopes.last(), Some(StmtScope::TacticAlts { saw_with: true, .. })) => {
-                        scopes.pop();
+                    Some(StmtScope::ByBlock { .. }) => {
+                        at_tactic_head = false;
+                        if c != b'|' && matches!(scopes.last(), Some(StmtScope::TacticAlts { saw_with: true, .. })) {
+                            scopes.pop();
+                        }
                     }
                     _ => {}
                 }
             }
             term_pending = eff_term_pending;
+            if term_pending {
+                at_tactic_head = false;
+            }
             if let Some(StmtScope::Calc { rhs, .. }) = scopes.last_mut() {
                 if !(c == b':' && bytes.get(i + 1) == Some(&b'=')) {
                     *rhs = false;
@@ -3395,8 +3403,25 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                 && c != b'.' && !cmd[..i].trim_end().ends_with('.');
         }
         if depth_zero && bytes[i..].starts_with(b"<;>") {
-            while matches!(scopes.last(), Some(StmtScope::Show { in_tactic: true } | StmtScope::TermFunBody | StmtScope::TermIf { .. } | StmtScope::TacticAlts { saw_with: false, .. })) {
-                scopes.pop();
+            if scopes.iter().any(|s| matches!(s,
+                StmtScope::ByWaitFirst(BlockKind::By { .. } | BlockKind::Bullet { .. })
+                | StmtScope::ByBlock { .. }
+                | StmtScope::TacticAlts { saw_with: true, .. }
+                | StmtScope::TacticBranches { .. }
+                | StmtScope::TacticIf { .. }
+            )) {
+                while matches!(scopes.last(), Some(
+                    StmtScope::MatchArms { .. }
+                    | StmtScope::LocalValue { .. }
+                    | StmtScope::LocalArms { .. }
+                    | StmtScope::Show { .. }
+                    | StmtScope::TermFunBody
+                    | StmtScope::TermIf { .. }
+                    | StmtScope::Calc { rhs: true, .. }
+                    | StmtScope::TacticAlts { need_with: false, saw_with: false, .. }
+                )) {
+                    scopes.pop();
+                }
             }
             at_tactic_head = is_tactic_ctx(&scopes);
             term_pending = false;
@@ -3489,7 +3514,26 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                     "cases" | "induction" | "fun_cases" | "fun_induction" if in_by && at_tactic_head && !cur_in_conv => {
                         let line = cmd[..i].rfind('\n').map_or(0, |k| k + 1);
                         let floor_col = cmd[line..].chars().take_while(|c| matches!(c, ' ' | '\t')).count();
-                        scopes.push(StmtScope::TacticAlts { floor_col, saw_with: false, arm_col: None });
+                        scopes.push(StmtScope::TacticAlts { floor_col, need_with: false, saw_with: false, arm_col: None });
+                    }
+                    "intro" if in_by && at_tactic_head && !cur_in_conv => {
+                        let mut next_tok = kw_end;
+                        while next_tok < bytes.len() {
+                            if bytes[next_tok].is_ascii_whitespace() {
+                                next_tok += 1;
+                            } else if let Some((end, _)) = scan_lean_block_comment_end(cmd, next_tok) {
+                                next_tok = end;
+                            } else if bytes[next_tok..].starts_with(b"--") {
+                                next_tok += 2 + bytes[next_tok + 2..].iter().position(|&b| b == b'\n').unwrap_or(bytes.len() - next_tok - 2);
+                            } else {
+                                break;
+                            }
+                        }
+                        if bytes.get(next_tok) == Some(&b'|') && is_pattern_match_arm_at(cmd, next_tok) {
+                            let line = cmd[..i].rfind('\n').map_or(0, |k| k + 1);
+                            let floor_col = cmd[line..].chars().take_while(|c| matches!(c, ' ' | '\t')).count();
+                            scopes.push(StmtScope::TacticAlts { floor_col, need_with: false, saw_with: true, arm_col: None });
+                        }
                     }
                     "with" if matches!(scopes.last(), Some(StmtScope::TacticAlts { .. })) => {
                         if let Some(StmtScope::TacticAlts { saw_with, .. }) = scopes.last_mut() { *saw_with = true; }
@@ -3500,7 +3544,11 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                     "match" => {
                         let line = cmd[..i].rfind('\n').map_or(0, |k| k + 1);
                         let floor_col = cmd[line..].chars().take_while(|c| matches!(c, ' ' | '\t')).count();
-                        scopes.push(StmtScope::MatchHeader { match_col: col_at(i), floor_col });
+                        if in_by && at_tactic_head && !cur_in_conv {
+                            scopes.push(StmtScope::TacticAlts { floor_col, need_with: true, saw_with: false, arm_col: None });
+                        } else {
+                            scopes.push(StmtScope::MatchHeader { match_col: col_at(i), floor_col });
+                        }
                     }
                     "with" if matches!(scopes.last(), Some(StmtScope::MatchHeader { .. })) => {
                         if let Some(StmtScope::MatchHeader { match_col, floor_col }) = scopes.pop() {
@@ -3591,15 +3639,36 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
             b'{' => brace += 1,
             b'}' => { brace = (brace - 1).max(0); term_pending = false; }
             b';' if depth_zero && seen_colon => {
-                while matches!(scopes.last(), Some(StmtScope::TacticAlts { saw_with: false, .. } | StmtScope::Calc { rhs: true, .. } | StmtScope::Show { in_tactic: true } | StmtScope::TermFunBody | StmtScope::TermIf { .. })) {
-                    scopes.pop();
+                if scopes.iter().any(|s| matches!(s,
+                    StmtScope::LocalValue { .. }
+                    | StmtScope::LocalArms { .. }
+                    | StmtScope::ByBlock { .. }
+                    | StmtScope::TacticAlts { saw_with: true, .. }
+                    | StmtScope::TacticBranches { .. }
+                    | StmtScope::TacticIf { .. }
+                )) {
+                    while match scopes.last() {
+                        Some(StmtScope::MatchArms { arm_col: Some(_), .. }) => {
+                            !matches!(scopes.iter().rev().nth(1), Some(StmtScope::DoBlock(_)))
+                        }
+                        Some(
+                            StmtScope::TacticAlts { need_with: false, saw_with: false, .. }
+                            | StmtScope::Calc { rhs: true, .. }
+                            | StmtScope::Show { .. }
+                            | StmtScope::TermFunBody
+                            | StmtScope::TermIf { .. },
+                        ) => true,
+                        _ => false,
+                    } {
+                        scopes.pop();
+                    }
                 }
                 let term_bind_semi = matches!(scopes.last(), Some(StmtScope::LocalValue { in_tactic: false, .. } | StmtScope::LocalArms { in_tactic: false, .. }))
                     && !matches!(scopes.iter().rev().nth(1), Some(StmtScope::DoBlock(_)));
                 if matches!(scopes.last(), Some(StmtScope::LocalValue { .. } | StmtScope::LocalArms { .. })) {
                     scopes.pop();
                 }
-                at_tactic_head = !term_bind_semi;
+                at_tactic_head = !term_bind_semi && is_tactic_ctx(&scopes);
                 term_pending = term_bind_semi;
             }
             b':' if depth_zero => {
@@ -3643,8 +3712,32 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                         i += 1;
                         continue;
                     }
-                    while line_first && is_pattern_match_arm_at(cmd, i) && matches!(scopes.last(), Some(StmtScope::ByBlock { .. } | StmtScope::Show { .. } | StmtScope::TermFunBody | StmtScope::TermIf { .. } | StmtScope::TacticAlts { saw_with: false, .. })) {
-                        scopes.pop();
+                    if is_pattern_match_arm_at(cmd, i) {
+                        if line_first {
+                            while matches!(scopes.last(), Some(
+                                StmtScope::ByBlock { .. }
+                                | StmtScope::LocalValue { .. }
+                                | StmtScope::Show { .. }
+                                | StmtScope::TermFunBody
+                                | StmtScope::TermIf { .. }
+                                | StmtScope::Calc { rhs: true, .. }
+                                | StmtScope::TacticAlts { need_with: false, saw_with: false, .. }
+                            )) {
+                                scopes.pop();
+                            }
+                        } else if let Some(pos) = scopes.iter().rposition(|s| matches!(s, StmtScope::TacticAlts { saw_with: true, .. })) {
+                            if scopes[pos + 1..].iter().all(|s| matches!(s,
+                                StmtScope::ByBlock { .. }
+                                | StmtScope::LocalValue { .. }
+                                | StmtScope::Show { .. }
+                                | StmtScope::TermFunBody
+                                | StmtScope::TermIf { .. }
+                                | StmtScope::Calc { rhs: true, .. }
+                                | StmtScope::TacticAlts { need_with: false, saw_with: false, .. }
+                            )) {
+                                scopes.truncate(pos + 1);
+                            }
+                        }
                     }
                     if let Some(StmtScope::TacticAlts { saw_with: true, arm_col, .. }) = scopes.last_mut() {
                         arm_col.get_or_insert(col_at(i));
@@ -15036,6 +15129,106 @@ public def api := by
             assert_eq!(split.shards.len(), 1, "{cmd}");
             assert_eq!(split.shards[0].signature_text.trim(), sig.trim(), "{cmd}");
             assert!(stub_identity_probe_src(&cmd).contains(sig.trim()), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn test_statement_tactic_match_intro_and_combinator_unwind() {
+        let cases: Vec<(String, String)> = vec![
+            (
+                "theorem t_tac_match (b : Bool) (h : Prop × Prop) (hp : h.1) : show Prop by\n  match b with\n  | true =>\n    obtain ⟨x, _y⟩ := h\n    exact x\n  | false =>\n    obtain ⟨x, _y⟩ := h\n    exact x\n".into(),
+                ":= match b with | true => hp | false => hp".into(),
+            ),
+            (
+                "theorem t_tac_match_multi_scrut (a b : Bool) (h : Prop × Prop) (hp : h.1) : show Prop by\n  match (generalizing := true)\n    a,\n    match b with | true => true | false => false\n  with\n  | true, true =>\n    obtain ⟨x, _y⟩ := h\n    exact x\n  | _, _ =>\n    set z := h.1\n    exact z\n".into(),
+                ":= by cases a <;> cases b <;> exact hp".into(),
+            ),
+            (
+                "theorem t_tac_match_inline (b : Bool) (h : Prop × Prop) (hp : h.1) : show Prop by match b with | true => obtain ⟨x, _y⟩ := h; exact x | false => obtain ⟨x, _y⟩ := h; exact x\n".into(),
+                ":= match b with | true => hp | false => hp".into(),
+            ),
+            (
+                "theorem t_tac_match_eq (b : Bool) (h : Prop × Prop) (hp : h.1) : Bool → show Prop by\n  match b with\n  | true =>\n    obtain ⟨x, _y⟩ := h\n    exact x\n  | false =>\n    obtain ⟨x, _y⟩ := h\n    exact x".into(),
+                "\n| _ => match b with | true => hp | false => hp".into(),
+            ),
+            (
+                "theorem t_intro_match : show Prop from myEx <| by\n  intro\n  | true => exact True\n  | false => exact True\n".into(),
+                ":= ⟨true, trivial⟩".into(),
+            ),
+            (
+                "theorem t_intro_match_inline_by : show Prop from myEx <| by intro\n  | true => exact True\n  | false => exact True\n".into(),
+                ":= ⟨true, trivial⟩".into(),
+            ),
+            (
+                "theorem t_intro_match_col0 : show Prop from myEx <| by\n  intro\n| true => exact True\n| false => exact True\n".into(),
+                ":= ⟨true, trivial⟩".into(),
+            ),
+            (
+                "theorem t_intro_match_comment (h : Prop × Prop) : show Prop from myEx <| by\n  intro /- arms -/\n  | true =>\n    obtain ⟨x, _y⟩ := h\n    exact x\n  | false => exact True\n".into(),
+                ":= ⟨false, trivial⟩".into(),
+            ),
+            (
+                "theorem t_intro_inline_obtain (h : Prop × Prop) : show Prop from myEx <| by intro | true => obtain ⟨x, _y⟩ := h; exact x | false => exact True\n".into(),
+                ":= ⟨false, trivial⟩".into(),
+            ),
+            (
+                "theorem t_intro_inline_both_obtain (h : Prop × Prop) (hp : h.1) : show Prop from myEx <| by intro | true => obtain ⟨x, _y⟩ := h; exact x | false => obtain ⟨x, _y⟩ := h; exact x\n".into(),
+                ":= ⟨true, hp⟩".into(),
+            ),
+            (
+                "theorem t_intro_plain_binders : Bool → (Prop → Prop) → by\n  intro _p\n  exact True".into(),
+                "\n  | _, _ => trivial".into(),
+            ),
+            (
+                "theorem t1 (h : Prop × Prop) (hp : h.1) : by\n  have _h : True := trivial <;> obtain ⟨x, _y⟩ := h <;> exact x\n".into(),
+                ":= hp".into(),
+            ),
+            (
+                "theorem t2 (b : Bool) (h : Prop × Prop) (hp : h.1) : by\n  refine match b with | true => ?_ | false => ?_ <;> obtain ⟨x, _y⟩ := h <;> exact x\n".into(),
+                ":= by cases b <;> exact hp".into(),
+            ),
+            (
+                "theorem t2_local_arms_calc_seq (b : Bool) (h : Prop × Prop) (hp : h.1) : by\n  have _f : Bool → True | true => trivial | false => trivial <;> have _e : 1 = 1 := calc 1 = 1 := rfl <;> suffices _s : True from match b with | true => trivial | false => trivial <;> obtain ⟨x, _y⟩ := h <;> exact x\n".into(),
+                ":= hp".into(),
+            ),
+            (
+                "theorem t3 (b : Bool) (h : Prop × Prop) (hp : h.1) : by\n  have _h : Prop := match b with | true => True | false => True; obtain ⟨x, _y⟩ := h; exact x\n".into(),
+                ":= hp".into(),
+            ),
+            (
+                "theorem t3_refine_match_semi (b : Bool) (h : Prop × Prop) (hp : h.1) : by\n  refine match b with | true => ?_ | false => ?_; all_goals obtain ⟨x, _y⟩ := h; exact x\n".into(),
+                ":= hp".into(),
+            ),
+            (
+                "theorem t4 (obtain : Prop) (hp : obtain) : by\n  exact let _x : Bool := match true with | true => true | false => false;\n  obtain\n".into(),
+                ":= hp".into(),
+            ),
+            (
+                "theorem t4_arms (obtain : Prop) (hp : obtain) : by\n  exact let _f : Bool → Bool | true => true | false => match true with | true => true | false => false;\n  obtain\n".into(),
+                ":= hp".into(),
+            ),
+            (
+                "theorem t4_dedent_after_inner_semi (obtain : Prop) (hp : obtain) : by\n  exact\n  let _x : True := by\n    skip;\n  obtain\n".into(),
+                ":= hp".into(),
+            ),
+            (
+                "theorem t4_term_obtain_then_tactic_obtain (obtain : Nat) (h : Prop × Prop) (hp : h.1) : by\n  have _a : Nat :=\n    let _x := match true with | true => 1 | false => 2;\n    obtain\n  obtain ⟨u, _v⟩ := h\n  exact u\n".into(),
+                ":= hp".into(),
+            ),
+            (
+                "theorem t_do_match_semi (b : Bool) : Bool → Id.run do\n  match b with\n  | true => pure (); pure Prop\n  | false => pure Prop".into(),
+                "\n| _ => trivial".into(),
+            ),
+        ];
+        for (sig, tail) in cases {
+            let cmd = format!("{sig}{tail}");
+            let proof = tail.strip_prefix(":=").unwrap_or(&tail);
+            assert_eq!(split_at_top_level_assign(&cmd), Some((sig.as_str(), proof)), "{cmd}");
+            let full_src = format!("def myEx (p : Bool → Prop) : Prop := ∃ b, p b\n{cmd}");
+            let split = split_lean_source(&full_src, &[]);
+            assert_eq!(split.shards.len(), 1, "{full_src}");
+            assert_eq!(split.shards[0].signature_text.trim(), sig.trim(), "{full_src}");
+            assert!(stub_identity_probe_src(&full_src).contains(sig.trim()), "{full_src}");
         }
     }
 
