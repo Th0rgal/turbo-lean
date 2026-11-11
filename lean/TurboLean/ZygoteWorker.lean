@@ -1735,6 +1735,24 @@ def writeVerifiedModuleOlean (baseEnv finalEnv : Environment) (modName : Name) (
 def writeVerifiedOutlineOlean (baseEnv finalEnv : Environment) (modName : Name) (oleanPath : System.FilePath) : IO Bool :=
   writeAuditedModuleOlean baseEnv finalEnv modName oleanPath true
 
+def compactPrefix? (baseEnv finalEnv : Environment) (imports : Array Import) : IO (Option Environment) := do
+  let oldPath ← searchPathRef.get
+  let mut result := none
+  let some staging ← IO.getEnv "TURBO_LEAN_STAGING_DIR" | return none
+  let pid ← IO.Process.getPID
+  let stamp ← IO.monoNanosNow
+  let modName := Name.mkSimple s!"TurboPrefix_{pid}_{stamp}"
+  let path := System.FilePath.mk staging / s!"{modName}.olean"
+  try
+    if ← writeVerifiedOutlineOlean baseEnv (finalEnv.setMainModule modName) modName path then
+      searchPathRef.set (System.FilePath.mk staging :: oldPath)
+      result := some (← Lean.importModules (imports.push { module := modName }) {} 1025 #[] false true)
+  catch _ => pure ()
+  searchPathRef.set oldPath
+  for ext in ["", ".server", ".private"] do
+    try IO.FS.removeFile (System.FilePath.mk s!"{path}{ext}") catch _ => pure ()
+  return result
+
 /-- Elaborate and kernel-typecheck `bodyCode` on top of an immutable `baseEnv : Lean.Environment`
     without mutating `baseEnv`.
     Returns `(ok, elapsed_us, heartbeats, proof_term_nodes, error_messages, all_messages, captured_stdout, used_constants, decl_types, sorry_decls)`. -/
@@ -3733,6 +3751,8 @@ def main (args : List String) : IO Unit := do
   let mut envCacheOrder : Array String := #[]
   let mut stateCache : Std.HashMap String (String × Command.State × List String × String × Nat) := {}
   let mut stateCacheOrder : Array String := #[]
+  let mut compactCache : Std.HashMap String Environment := {}
+  let mut compactOrder : Array String := #[]
   let mut prefixTreeByImport : Std.HashMap String (Array (String × Command.State × List String × String × Nat)) := {}
   -- Environment extensions registered by one import set are not safe to reuse through a
   -- different cached environment. Bind this process to the first `importsCsv` it serves.
@@ -3744,6 +3764,30 @@ def main (args : List String) : IO Unit := do
       break
     let trimmed := line.trimAscii.toString
     if trimmed.isEmpty then
+      continue
+    if trimmed.startsWith "fork_clone:" then
+      if poisoned || envCache.isEmpty || !(← TurboLean.ZygoteFork.isForkEnabled) then
+        stdout.putStrLn "unavailable"
+      else
+        try
+          stdout.flush
+          TurboLean.ZygoteFork.reapClones
+          TurboLean.ZygoteFork.finalizeTaskManager
+          let pid ← try TurboLean.ZygoteFork.posixForkRaw catch e =>
+            TurboLean.ZygoteFork.initTaskManager
+            throw e
+          if pid == 0 then
+            let path := (trimmed.drop 11).toString
+            try
+              TurboLean.ZygoteFork.connectCloneChannel path 0
+              TurboLean.ZygoteFork.connectCloneChannel (path ++ ".err") 2
+              TurboLean.ZygoteFork.initTaskManagerUsing 2
+            catch _ => TurboLean.ZygoteFork.posixExitImmediate 1
+          else
+            TurboLean.ZygoteFork.initTaskManager
+            stdout.putStrLn s!"clone {pid}"
+        catch _ => stdout.putStrLn "unavailable"
+      stdout.flush
       continue
     if trimmed == "ping" || ((trimmed.splitOn "\"cmd\"").length > 1 && (trimmed.splitOn "\"ping\"").length > 1) then
       stdout.putStrLn "{\"ok\":true,\"status\":\"pong\",\"kernel_gate_active\":true,\"import_ok\":true,\"env_cache_hit\":true,\"prefix_cache_hit\":false,\"import_us\":0,\"prefix_us\":0,\"elab_us\":0,\"heartbeats\":0,\"stdout\":\"\",\"messages\":[],\"errors\":[],\"used_constants\":[]}"
@@ -4065,6 +4109,17 @@ def main (args : List String) : IO Unit := do
         | _, true =>
           TurboLean.ZygoteWorker.emitZygoteReply stdout false (if isRaceCandidates then some "null" else none) kgActive true envCacheHit false importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs prefErrs []
         | some ckptState, false =>
+          -- Only a single declaration is environment-only: namespace/open/section/options
+          -- and local commands retain the complete Command.State replay path.
+          if !evalMode && emitOlean?.isNone && !allowSorry && !compactCache.contains fullPrefixKey then
+            if let .ok syn := Parser.runParserCategory baseEnv `command prefixCode then
+              if syn.isOfKind ``Lean.Parser.Command.declaration then
+                if let some env ← TurboLean.ZygoteWorker.compactPrefix? baseEnv ckptState.env imports then
+                  if compactOrder.size >= maxCheckpoints then
+                    if let some key := compactOrder[0]? then compactCache := compactCache.erase key
+                    compactOrder := compactOrder.extract 1 compactOrder.size
+                  compactCache := compactCache.insert fullPrefixKey env
+                  compactOrder := compactOrder.push fullPrefixKey
           if !prefixCacheHit then
             if stateCache.size >= maxCheckpoints then
               match stateCacheOrder[0]? with
@@ -4102,17 +4157,16 @@ def main (args : List String) : IO Unit := do
             if hexSubs.isEmpty then
               TurboLean.ZygoteWorker.emitZygoteReply stdout false (some "null") kgActive true envCacheHit prefixCacheHit importUs prefixUs 0 prefHbs 0 0 prefOut prefMsgs [] []
             else
-              -- Forked children re-elaborate `prefixCode` + candidate directly over compacted `baseEnv`
-              -- (`m_rc == 0` CoW pages) so live `ckptState` (`Command.State` tasks/refs) is never forked.
+              let compactEnv? := compactCache[fullPrefixKey]?
               let evalCandForkFromBase := fun (sc : String) => do
                 let scHasExplicitStub := (sc.splitOn (":= " ++ ("sor" ++ "ry"))).length > 1
                 if scHasExplicitStub then
                   let raceStubErr := "[TurboLean.KernelGate] explicit " ++ ("sor" ++ "ry") ++ " stub forbidden in race candidate"
                   pure (false, 0, 0, 0, [raceStubErr], [], "", [], [])
                 else
-                  let combined := if prefixCode.endsWith "\n" then prefixCode ++ sc else prefixCode ++ "\n" ++ sc
+                  let combined := if compactEnv?.isSome then sc else if prefixCode.endsWith "\n" then prefixCode ++ sc else prefixCode ++ "\n" ++ sc
                   let (ok, us, hbs, nodes, errs, msgs, outS, used, dts, _) ←
-                    TurboLean.ZygoteWorker.checkShardWithEnv baseEnv combined allowStub false fn none encodedLeanArgs stubTargets stubs
+                    TurboLean.ZygoteWorker.checkShardWithEnv (compactEnv?.getD baseEnv) combined allowStub false fn none encodedLeanArgs stubTargets stubs
                       (requiredTargets := some []) (fastMap := fastMap) (allowSorry := allowSorry)
                   pure (ok, us, hbs, nodes, errs, msgs, outS, used, dts)
               let (rOk, winIdx, rElabUs, rHbs, rNodes, rVer, rOut, rMsgs, rErrs, rUsed, rDeclTypes) ←
