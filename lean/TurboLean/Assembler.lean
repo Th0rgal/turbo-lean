@@ -284,6 +284,12 @@ theorem relative_cone_sorry_prefix_sound (p : Name) (prefixStubs₁ prefixStubs�
     rw [hp, hDisj₂]
     rfl
 
+theorem relativeConeDeclClean_rejects_stub (p : Name) (stubs : List Name)
+    (h : stubs.contains p = true) : relativeConeDeclClean [p] stubs = false := by
+  dsimp only [relativeConeDeclClean, List.all]
+  rw [h]
+  simp
+
 abbrev KernelEnvState.allDistinctIds : List Nat → Bool :=
   TurboLean.Spec.allDistinctBy (· == ·)
 
@@ -510,6 +516,7 @@ def elabTurboBenchmarkKernelReplayJson : CommandElab := fun stx => do
   TurboLean.Assembler.turboVerify_zero_false_positives
   TurboLean.Assembler.kernel_gate_blocks_macro_bypass
   TurboLean.Assembler.relative_cone_sorry_prefix_sound
+  TurboLean.Assembler.relativeConeDeclClean_rejects_stub
   TurboLean.Spec.isSoundDeclSummary_eq_true_iff
   TurboLean.Spec.isSoundKernelExtension_rejects_unsafe_or_axiom
   TurboLean.Spec.statement_pinning_blocks_tampering
