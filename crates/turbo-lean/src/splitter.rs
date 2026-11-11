@@ -3238,14 +3238,14 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
     enum BlockKind { By, Do, Calc }
     #[derive(Clone, Copy)]
     enum StmtScope {
-        LocalBind(usize),
+        LocalBind { col: usize, is_suffices: bool },
         LocalValue(usize),
         LocalArms(usize),
-        MatchHeader,
-        MatchArms { arm_col: Option<usize> },
+        MatchHeader { match_col: usize, floor_col: usize },
+        MatchArms { match_col: usize, floor_col: usize, arm_col: Option<usize> },
         Show,
         ByWaitFirst { enclosing_col: usize, line: usize, kind: BlockKind },
-        ByBlock { base_col: usize, case_arms: bool },
+        ByBlock { base_col: usize, case_floor: Option<usize> },
         DoBlock(usize),
         Calc { base_col: usize, rhs: bool },
     }
@@ -3254,7 +3254,7 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
     let (mut paren, mut bracket, mut brace, mut strict_brace) = (0i32, 0i32, 0i32, 0i32);
     let (mut i, lead_ws) = (0usize, cmd.len() - cmd.trim_start().len());
     let mut scopes: Vec<StmtScope> = Vec::new();
-    let (mut seen_colon, mut seen_match, mut at_line_first) = (initial_seen_colon, false, false);
+    let (mut seen_colon, mut at_line_first) = (initial_seen_colon, false);
     let mut first_arm_split: Option<usize> = None;
 
     while i < bytes.len() {
@@ -3278,24 +3278,25 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
         }
         let depth_zero = paren == 0 && bracket == 0 && brace == 0 && strict_brace == 0;
         let line_first = std::mem::replace(&mut at_line_first, false);
+        let placeholder = c == b'_' && !cmd[i + 1..].chars().next().is_some_and(is_lean_ident_continuation);
 
         if depth_zero && line_first && seen_colon {
             let col = col_at(i);
             while match scopes.last().copied() {
                 // Case alternatives may be left of a same-line local binder.
-                Some(StmtScope::ByBlock { base_col, case_arms }) => col < base_col && !(c == b'|' && case_arms),
+                Some(StmtScope::ByBlock { base_col, case_floor }) => col < base_col && !(c == b'|' && case_floor.is_some_and(|floor| col >= floor)),
                 Some(StmtScope::DoBlock(base_col)) => col < base_col,
-                Some(StmtScope::Calc { base_col, .. }) => col < base_col && c != b'_',
-                Some(StmtScope::LocalValue(_)) => true,
-                Some(StmtScope::LocalBind(ac)) => col <= ac && c != b'|' && !(c == b':' && bytes.get(i + 1) == Some(&b'=')) && scopes.iter().any(|s| matches!(s, StmtScope::ByBlock { .. })),
-                Some(StmtScope::MatchArms { arm_col: Some(ac), .. }) => c == b'|' && col < ac,
+                Some(StmtScope::Calc { base_col, .. }) => col < base_col && !placeholder,
+                Some(StmtScope::LocalValue(base_col)) => col <= base_col,
+                Some(StmtScope::LocalBind { col: ac, .. }) => col <= ac && c != b'|' && !(c == b':' && bytes.get(i + 1) == Some(&b'=')) && scopes.iter().any(|s| matches!(s, StmtScope::ByBlock { .. })),
+                Some(StmtScope::MatchArms { match_col, floor_col, arm_col }) => if c == b'|' { arm_col.is_some_and(|ac| col < ac) } else { col <= floor_col || col <= match_col.min(arm_col.unwrap_or(match_col)) },
                 Some(StmtScope::LocalArms(ac)) => col <= ac && c != b'|',
                 _ => false,
             } {
                 scopes.pop();
             }
             if let Some(StmtScope::Calc { base_col, rhs }) = scopes.last_mut() {
-                if (col == *base_col && !(c == b':' && bytes.get(i + 1) == Some(&b'='))) || c == b'_' {
+                if (col == *base_col && !(c == b':' && bytes.get(i + 1) == Some(&b'='))) || placeholder {
                     *rhs = false;
                 }
             }
@@ -3307,7 +3308,7 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
             let same_line = !cmd[line..i].contains('\n');
             let base_col = if same_line { enclosing_col + 1 } else { col_at(i) };
             scopes.push(match kind {
-                BlockKind::By => StmtScope::ByBlock { base_col, case_arms: false },
+                BlockKind::By => StmtScope::ByBlock { base_col, case_floor: None },
                 BlockKind::Do => StmtScope::DoBlock(base_col),
                 BlockKind::Calc => StmtScope::Calc { base_col: col_at(i), rhs: false },
             });
@@ -3336,32 +3337,38 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                         break;
                     }
                     "cases" | "induction" if in_by => {
-                        if let Some(StmtScope::ByBlock { case_arms, .. }) = scopes.last_mut() {
-                            *case_arms = true;
+                        if let Some(StmtScope::ByBlock { base_col, case_floor }) = scopes.last_mut() {
+                            let line = cmd[..i].rfind('\n').map_or(0, |k| k + 1);
+                            let indent = cmd[line..].chars().take_while(|c| matches!(c, ' ' | '\t')).count();
+                            *case_floor = Some((*base_col).min(indent + 1));
                         }
                     }
-                    "match" if scopes.is_empty() => seen_match = true,
-                    "match" => scopes.push(StmtScope::MatchHeader),
-                    "with" if matches!(scopes.last(), Some(StmtScope::MatchHeader)) => {
-                        scopes.pop();
-                        scopes.push(StmtScope::MatchArms { arm_col: None });
+                    "match" => {
+                        let line = cmd[..i].rfind('\n').map_or(0, |k| k + 1);
+                        let floor_col = cmd[line..].chars().take_while(|c| matches!(c, ' ' | '\t')).count();
+                        scopes.push(StmtScope::MatchHeader { match_col: col_at(i), floor_col });
+                    }
+                    "with" if matches!(scopes.last(), Some(StmtScope::MatchHeader { .. })) => {
+                        if let Some(StmtScope::MatchHeader { match_col, floor_col }) = scopes.pop() {
+                            scopes.push(StmtScope::MatchArms { match_col, floor_col, arm_col: None });
+                        }
                     }
                     "by" | "do" | "calc" => {
-                        if matches!(scopes.last(), Some(StmtScope::Show)) {
+                        if matches!(scopes.last(), Some(StmtScope::Show)) || (&cmd[i..kw_end] == "by" && matches!(scopes.last(), Some(StmtScope::LocalBind { is_suffices: true, .. }))) {
                             scopes.pop();
                         }
                         let line = cmd[..i].rfind('\n').map_or(0, |k| k + 1);
                         let line_indent = cmd[line..].chars().take_while(|c| matches!(c, ' ' | '\t')).count();
                         let enclosing_col = scopes.iter().rev().find_map(|scope| match scope {
-                            StmtScope::LocalBind(col) | StmtScope::LocalValue(col) | StmtScope::LocalArms(col) => Some(*col),
+                            StmtScope::LocalBind { col, .. } | StmtScope::LocalValue(col) | StmtScope::LocalArms(col) => Some(*col),
                             _ => None,
                         }).unwrap_or(line_indent).max(line_indent);
                         let kind = match &cmd[i..kw_end] { "by" => BlockKind::By, "do" => BlockKind::Do, _ => BlockKind::Calc };
                         scopes.push(StmtScope::ByWaitFirst { enclosing_col, line: i, kind });
                     }
-                    "have" | "have'" | "haveI" | "let" | "let'" | "letI" | "let_fun" | "obtain" | "replace" | "suffices" | "set" => scopes.push(StmtScope::LocalBind(col_at(i))),
+                    "have" | "have'" | "haveI" | "let" | "let'" | "letI" | "let_fun" | "obtain" | "replace" | "suffices" | "set" => scopes.push(StmtScope::LocalBind { col: col_at(i), is_suffices: &cmd[i..kw_end] == "suffices" }),
                     "show" => scopes.push(StmtScope::Show),
-                    "from" if matches!(scopes.last(), Some(StmtScope::Show | StmtScope::LocalBind(_) | StmtScope::LocalArms(_))) => {
+                    "from" if matches!(scopes.last(), Some(StmtScope::Show | StmtScope::LocalBind { .. } | StmtScope::LocalArms(_))) => {
                         scopes.pop();
                     }
                     _ => {}
@@ -3401,7 +3408,7 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                         i += 2;
                         continue;
                     }
-                    if let Some(StmtScope::LocalBind(col)) = scopes.last().copied() {
+                    if let Some(StmtScope::LocalBind { col, .. }) = scopes.last().copied() {
                         scopes.pop();
                         scopes.push(StmtScope::LocalValue(col));
                         i += 2;
@@ -3419,13 +3426,13 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                 let next_ok = !matches!(bytes.get(i + 1), Some(b'|' | b'>'));
                 let prev_ok = i == 0 || !matches!(bytes[i - 1], b'|' | b'<');
                 if next_ok && prev_ok {
-                    if line_first && matches!(scopes.last(), Some(StmtScope::ByBlock { case_arms: false, .. })) {
+                    if line_first && matches!(scopes.last(), Some(StmtScope::ByBlock { case_floor: None, .. })) {
                         scopes.pop();
                     }
-                    if let Some(StmtScope::MatchArms { arm_col }) = scopes.last_mut() {
+                    if let Some(StmtScope::MatchArms { arm_col, .. }) = scopes.last_mut() {
                         arm_col.get_or_insert(col_at(i));
                     }
-                    if let Some(StmtScope::LocalBind(col)) = scopes.last().copied() {
+                    if let Some(StmtScope::LocalBind { col, .. }) = scopes.last().copied() {
                         if is_pattern_match_arm_at(cmd, i) {
                             scopes.pop();
                             scopes.push(StmtScope::LocalArms(col));
@@ -3443,10 +3450,7 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                             if nl_idx > 0 && bytes[nl_idx] == b'\n' && bytes[nl_idx - 1] == b'\r' {
                                 nl_idx -= 1;
                             }
-                            if !seen_match {
-                                return Some((&cmd[..nl_idx], &cmd[nl_idx..]));
-                            }
-                            first_arm_split.get_or_insert(nl_idx);
+                            return Some((&cmd[..nl_idx], &cmd[nl_idx..]));
                         }
                     }
                 }
@@ -14513,6 +14517,52 @@ public def api := by
                 assert_eq!(split.shards.len(), 2, "{src}");
                 assert_eq!(split.shards[0].signature_text.trim(), sig.trim());
                 assert!(stub_identity_probe_src(&src).contains(sig.trim()));
+            }
+        }
+    }
+
+    #[test]
+    fn test_statement_review_boundary_regressions() {
+        let cases = [
+            ("theorem t_match_eq : (b : Bool) →\n    match b with\n    | true => 1 = 1\n    | false => 2 = 2", "\n  | true => rfl\n  | false => rfl"),
+            ("theorem t_match_inline (b : Bool) : match b with | true => True | false => True ", ":= by cases b <;> trivial"),
+            ("theorem t_match_assign (b : Bool) :\n    match b with\n    | true => True\n    | false => True\n  ", ":= by cases b <;> trivial"),
+            ("theorem t_let_match (b : Bool) :\n    let x : Nat :=\n      match b with\n      | true => 1\n      | false => 2\n    x = x ", ":= rfl"),
+            ("theorem t_have_match (b : Bool) :\n    have x : Nat :=\n      match b with\n      | true => 1\n      | false => 2\n    x = x ", ":= rfl"),
+            ("theorem t_let_match_eq : (b : Bool) →\n    let x : Nat :=\n      match b with\n      | true => 1\n      | false => 2\n    x = x", "\n  | true => rfl\n  | false => rfl"),
+            ("theorem t_match_dedent (b : Bool) :\n    let x : Nat := match b with | true => 1 | false => 2\n    x = x ", ":= rfl"),
+            ("theorem t_suf_1line :\n    show Prop by exact True <;> suffices _h : Prop by exact True ", ":= trivial"),
+            ("theorem t_suf_from :\n    show Prop by exact True <;> suffices _h : Prop from True ", ":= trivial"),
+            ("theorem t_suf_multiline_where :\n    show Prop by\n      exact True <;>\n        suffices _h : Prop by\n          exact True ", ":=\n  helper\nwhere\n  helper : True := trivial"),
+            ("theorem t_let_by_type :\n    let x : by exact Nat := 0\n    x = x ", ":= rfl"),
+            ("theorem t_have_by_type :\n    have h : by exact True := trivial\n    True ", ":= trivial"),
+            ("theorem t_calc_then_underscore_ident (_x : Nat) :\n    have _h : 1 = 1 := calc 1 = 1 := rfl\n      _ = 1 := rfl\n    _x = _x ", ":= rfl"),
+            ("theorem t_calc_then_root :\n    have _h : 1 = 1 := calc 1 = 1 := rfl\n      _ = 1 := rfl\n    _root_.True ", ":= trivial"),
+            ("theorem t_by_cases_eq (b : Bool) : (x : Bool) →\n    show Prop by\n      cases b with\n      | true => exact True\n      | false => exact True", "\n  | _ => by cases b <;> trivial"),
+            ("theorem t_by_induction_eq (b : Bool) : (x : Bool) →\n    show Prop by\n      induction b with\n      | true => exact True\n      | false => exact True", "\n  | _ => by cases b <;> trivial"),
+            ("theorem t_by_inline_cases_eq (b : Bool) : (x : Bool) →\n    show Prop by cases b with\n      | true => exact True\n      | false => exact True", "\n  | _ => by cases b <;> trivial"),
+        ];
+        for (sig, tail) in cases {
+            let cmd = format!("{sig}{tail}");
+            let proof = tail.strip_prefix(":=").unwrap_or(tail);
+            assert_eq!(split_at_top_level_assign(&cmd), Some((sig, proof)), "{cmd}");
+            let split = split_lean_source(&cmd, &[]);
+            assert_eq!(split.shards.len(), 1, "{cmd}");
+            assert_eq!(split.shards[0].signature_text.trim(), sig.trim(), "{cmd}");
+            assert!(stub_identity_probe_src(&cmd).contains(sig.trim()), "{cmd}");
+            let public = format!("module\npublic {cmd}\n");
+            let changed_proof = format!("module\npublic {sig}{}\n", tail.replace("rfl", "by rfl").replace("trivial", "by trivial"));
+            let summary = extract_public_signature(&public);
+            let changed = extract_public_signature(&changed_proof);
+            assert_eq!(summary.declarations.len(), 1, "{cmd}");
+            assert_eq!(summary.declarations[0].sig_hash, changed.declarations[0].sig_hash, "{cmd}");
+            if sig.contains("t_match_eq") {
+                assert_eq!(summary.public_signature_digest, changed.public_signature_digest, "{cmd}");
+            }
+            let changed_type = public.replacen("True", "False", 1).replacen("1 = 1", "1 = 2", 1);
+            if changed_type != public {
+                assert_ne!(extract_public_signature(&public).public_signature_digest,
+                    extract_public_signature(&changed_type).public_signature_digest, "{cmd}");
             }
         }
     }
