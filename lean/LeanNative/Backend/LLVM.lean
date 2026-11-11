@@ -732,8 +732,43 @@ partial def emitScalarExprWithWidth (tyStr : String) (shiftMask : String) (e : L
       let fl := if is256 then "" else retainedOverflowFlagsStr curFacts .sub lhs rhs
       emitLine s!"  {res} = sub{fl} {tyStr} {lVal}, {rVal}"; return res
     | .mul    =>
-      let fl := if is256 then "" else retainedOverflowFlagsStr curFacts .mul lhs rhs
-      emitLine s!"  {res} = mul{fl} {tyStr} {lVal}, {rVal}"; return res
+      let st ← get
+      if !is256 && st.target == .thumbv6m && st.rcMode == .freestanding then
+        -- ARMv6-M (`thumbv6m-none-eabi`) has native single-cycle 32-bit `muls` (`i32`)
+        -- without any 64-bit multiply instruction, so `mul i64` lowers to an undefined
+        -- `__aeabi_lmul` runtime libcall in freestanding builds. Emit four 32-bit `mul i32`
+        -- partial products (`a0*b0`, `a0*b1`, `a1*b0` -> `muls` directly, `0` libcalls!).
+        let a0 ← freshTmp "m64_a0"; let aHi ← freshTmp "m64_ahi"; let a1 ← freshTmp "m64_a1"
+        let b0 ← freshTmp "m64_b0"; let bHi ← freshTmp "m64_bhi"; let b1 ← freshTmp "m64_b1"
+        let a0L ← freshTmp "m64_a0l"; let a0H ← freshTmp "m64_a0h"
+        let b0L ← freshTmp "m64_b0l"; let b0H ← freshTmp "m64_b0h"
+        let p00 ← freshTmp "m64_p00"; let p01 ← freshTmp "m64_p01"
+        let p10 ← freshTmp "m64_p10"; let p11 ← freshTmp "m64_p11"
+        let p00H ← freshTmp "m64_p00h"; let p01L ← freshTmp "m64_p01l"; let p10L ← freshTmp "m64_p10l"
+        let m1a ← freshTmp "m64_m1a"; let m1 ← freshTmp "m64_m1"
+        let p00L ← freshTmp "m64_p00l"; let m1Sh ← freshTmp "m64_m1sh"; let lo32 ← freshTmp "m64_lo32"
+        let p01H ← freshTmp "m64_p01h"; let p10H ← freshTmp "m64_p10h"; let m1H ← freshTmp "m64_m1h"
+        let c1 ← freshTmp "m64_c1"; let c2 ← freshTmp "m64_c2"; let hiBase ← freshTmp "m64_hib"
+        let abCross1 ← freshTmp "m64_x1"; let abCross2 ← freshTmp "m64_x2"
+        let crossSum ← freshTmp "m64_xs"; let hi32 ← freshTmp "m64_hi32"
+        let lo64 ← freshTmp "m64_lo64"; let hi64 ← freshTmp "m64_hi64"; let hiSh ← freshTmp "m64_hish"
+        emitLine s!"  {a0} = trunc i64 {lVal} to i32\n  {aHi} = lshr i64 {lVal}, 32\n  {a1} = trunc i64 {aHi} to i32"
+        emitLine s!"  {b0} = trunc i64 {rVal} to i32\n  {bHi} = lshr i64 {rVal}, 32\n  {b1} = trunc i64 {bHi} to i32"
+        emitLine s!"  {a0L} = and i32 {a0}, 65535\n  {a0H} = lshr i32 {a0}, 16\n  {b0L} = and i32 {b0}, 65535\n  {b0H} = lshr i32 {b0}, 16"
+        emitLine s!"  {p00} = mul i32 {a0L}, {b0L}\n  {p01} = mul i32 {a0L}, {b0H}\n  {p10} = mul i32 {a0H}, {b0L}\n  {p11} = mul i32 {a0H}, {b0H}"
+        emitLine s!"  {p00H} = lshr i32 {p00}, 16\n  {p01L} = and i32 {p01}, 65535\n  {p10L} = and i32 {p10}, 65535"
+        emitLine s!"  {m1a} = add i32 {p00H}, {p01L}\n  {m1} = add i32 {m1a}, {p10L}"
+        emitLine s!"  {p00L} = and i32 {p00}, 65535\n  {m1Sh} = shl i32 {m1}, 16\n  {lo32} = or i32 {p00L}, {m1Sh}"
+        emitLine s!"  {p01H} = lshr i32 {p01}, 16\n  {p10H} = lshr i32 {p10}, 16\n  {m1H} = lshr i32 {m1}, 16"
+        emitLine s!"  {c1} = add i32 {p11}, {p01H}\n  {c2} = add i32 {c1}, {p10H}\n  {hiBase} = add i32 {c2}, {m1H}"
+        emitLine s!"  {abCross1} = mul i32 {a0}, {b1}\n  {abCross2} = mul i32 {a1}, {b0}"
+        emitLine s!"  {crossSum} = add i32 {abCross1}, {abCross2}\n  {hi32} = add i32 {hiBase}, {crossSum}"
+        emitLine s!"  {lo64} = zext i32 {lo32} to i64\n  {hi64} = zext i32 {hi32} to i64\n  {hiSh} = shl i64 {hi64}, 32"
+        emitLine s!"  {res} = or i64 {hiSh}, {lo64}"
+        return res
+      else
+        let fl := if is256 then "" else retainedOverflowFlagsStr curFacts .mul lhs rhs
+        emitLine s!"  {res} = mul{fl} {tyStr} {lVal}, {rVal}"; return res
     | .bitAnd => emitLine s!"  {res} = and {tyStr} {lVal}, {rVal}"; return res
     | .bitOr  => emitLine s!"  {res} = or {tyStr} {lVal}, {rVal}"; return res
     | .bitXor => emitLine s!"  {res} = xor {tyStr} {lVal}, {rVal}"; return res
