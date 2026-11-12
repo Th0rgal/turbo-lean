@@ -2374,13 +2374,27 @@ def lcnfDeclAlphaEqvModuloSpec (d1 d2 : Lean.Compiler.LCNF.Decl .pure) : Bool :=
       (lcnfPureAlphaEqvModuloSpec c1 c2)) ∅
   | _, _ => false
 
+def isOpaqueBaseStub (d : Lean.Compiler.LCNF.Decl .pure) : Bool :=
+  match d.value with
+  | .extern data => data.entries == [.opaque]
+  | _ => false
+
+#guard isOpaqueBaseStub { (default : Lean.Compiler.LCNF.Decl .pure) with
+  value := .extern { entries := [.opaque] } }
+#guard !isOpaqueBaseStub { (default : Lean.Compiler.LCNF.Decl .pure) with
+  value := .extern { entries := [.standard `all "audit_test"] } }
+#guard !isOpaqueBaseStub { (default : Lean.Compiler.LCNF.Decl .pure) with
+  value := .code (.unreach (.sort .zero)) }
+
 def collectModuleStoredBaseDecls (env : Environment) (modIdx : ModuleIdx) :
     Std.HashMap Name (Lean.Compiler.LCNF.Decl .pure) := Id.run do
   let mut out : Std.HashMap Name (Lean.Compiler.LCNF.Decl .pure) := {}
-  for b in Lean.Compiler.LCNF.baseExt.getModuleEntries env modIdx do
-    out := out.insert b.name b
-  for b in Lean.Compiler.LCNF.baseExt.getModuleEntries (level := .private) env modIdx do
-    out := out.insert b.name b
+  for entries in #[Lean.Compiler.LCNF.baseExt.getModuleEntries env modIdx,
+      Lean.Compiler.LCNF.baseExt.getModuleEntries (level := .private) env modIdx,
+      Lean.Compiler.LCNF.baseExt.getModuleIREntries env modIdx] do
+    for b in entries do
+      if !isOpaqueBaseStub b then
+        out := out.insert b.name b
   return out
 
 partial def collectLcnfPureConsts (c : Lean.Compiler.LCNF.Code .pure) (acc : Std.HashSet Name := {}) : Std.HashSet Name :=
