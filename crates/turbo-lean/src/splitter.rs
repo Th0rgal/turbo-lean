@@ -3267,6 +3267,7 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
     let mut first_arm_split: Option<usize> = None;
     let mut at_tactic_head = false;
     let mut iterate_count_pending = false;
+    let mut simp_only_pending = false;
     // An aligned token can continue a required term rather than start a tactic.
     let mut term_pending = false;
     let unwind_assign_scopes = |scopes: &mut Vec<StmtScope>| {
@@ -3302,6 +3303,12 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
         let depth_zero = paren == 0 && bracket == 0 && brace == 0 && strict_brace == 0;
         let line_first = std::mem::replace(&mut at_line_first, false);
 
+        let simp_only_continuation = std::mem::take(&mut simp_only_pending)
+            && cmd[i..].starts_with("only")
+            && cmd[i + 4..]
+                .chars()
+                .next()
+                .is_none_or(|ch| !is_lean_ident_continuation(ch));
         if depth_zero && line_first && seen_colon {
             let col = col_at(i);
             let by_base_at_col = scopes.iter().rev().any(|s| matches!(s, StmtScope::ByBlock { base_col, .. } if col == *base_col));
@@ -3312,7 +3319,7 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                 StmtScope::ByBlock { base_col, .. } | StmtScope::DoBlock(base_col) if col < *base_col));
             let enclosing_unwinds = |scopes: &[StmtScope]| enclosing_block_closes(scopes)
                 || matches!(scopes.last(), Some(&StmtScope::ByBlock { base_col: eb, .. } | &StmtScope::DoBlock(eb)) if col <= eb);
-            let mut eff_term_pending = term_pending;
+            let mut eff_term_pending = term_pending || simp_only_continuation;
             while match scopes.last().copied() {
                 Some(StmtScope::ByBlock { base_col, arm_inline, chevr, .. }) => {
                     col < base_col && !(arm_inline && eff_term_pending && matches!(scopes.iter().rev().nth(1), Some(&StmtScope::TacticAlts { floor_col, saw_with: true, arm_col, .. }) if col > arm_col.unwrap_or(floor_col)))
@@ -3621,6 +3628,8 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                     scopes.push(StmtScope::ByWaitFirst(BlockKind::By { in_conv: cur_in_conv }));
                     iterate_count_pending = kw == "iterate";
                 }
+                simp_only_pending =
+                    in_by && at_tactic_head && matches!(kw, "simp" | "simp_all" | "dsimp");
                 at_tactic_head = popped_tactic_prefix || tactic_seq_prefix;
                 i = kw_end + usize::from(focusing_by);
                 continue;
@@ -14989,6 +14998,46 @@ public def api := by
                 assert_eq!(split.shards.len(), 1, "{cmd}");
                 assert_eq!(split.shards[0].signature_text.trim(), sig.trim(), "{cmd}");
             }
+        }
+    }
+
+    #[test]
+    fn test_statement_prefix_and_dedented_arm_regressions() {
+        let mut bodies = vec![
+            "  iterate /- count -/ 3\n    skip\n    obtain ⟨x, _y⟩ := h\n    exact x".to_string(),
+            "  conv =>\n    repeat\n      lhs\n      tactic =>\n        obtain ⟨x, _y⟩ := h\n        rfl\n  exact h.1".to_string(),
+        ];
+        for prefix in ["repeat", "try", "focus", "iterate 3"] {
+            bodies.push(format!(
+                "  {prefix} simp; rfl\n  obtain ⟨x, _y⟩ := h\n  exact x"
+            ));
+        }
+        for branch in ["cases b with", "match b with"] {
+            for arm in [
+                "\n  intro x\n  obtain ⟨p, _q⟩ := h\n  exact p",
+                "\n  intro x\n  simp\n    only [x]\n  obtain ⟨p, _q⟩ := h\n  exact p",
+                "\n  intro\n| x =>\n  obtain ⟨p, _q⟩ := h\n  exact p",
+            ] {
+                bodies.push(format!("    {branch}\n| true => {arm}\n| false => {arm}"));
+                for prefix in ["focus", "try"] {
+                    bodies.push(format!("  {prefix}\n    {branch}\n| true => {arm}\n| false => {arm}\n  obtain ⟨p, _q⟩ := h\n  exact p"));
+                }
+                bodies.push(format!("  let _v := Id.run do\n    let _p : Prop := by\n      {branch}\n| true => {arm}\n| false => {arm}\n    pure true\n  obtain ⟨p, _q⟩ := h\n  exact p"));
+            }
+        }
+        for body in bodies {
+            let sig = format!(
+                "theorem t (b : Bool) (h : Prop × Prop) (hp : h.1) : show Prop from by\n{body} "
+            );
+            let cmd = format!("{sig}:= hp");
+            assert_eq!(
+                split_at_top_level_assign(&cmd),
+                Some((sig.as_str(), " hp")),
+                "{cmd}"
+            );
+            let split = split_lean_source(&cmd, &[]);
+            assert_eq!(split.shards.len(), 1, "{cmd}");
+            assert_eq!(split.shards[0].signature_text.trim(), sig.trim(), "{cmd}");
         }
     }
 
