@@ -3266,6 +3266,7 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
     let (mut seen_colon, mut at_line_first) = (initial_seen_colon, false);
     let mut first_arm_split: Option<usize> = None;
     let mut at_tactic_head = false;
+    let mut iterate_count_pending = false;
     // An aligned token can continue a required term rather than start a tactic.
     let mut term_pending = false;
     let unwind_assign_scopes = |scopes: &mut Vec<StmtScope>| {
@@ -3307,11 +3308,18 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
             let is_from_or_by = cmd[i..].starts_with("from") && cmd[i + 4..].chars().next().is_none_or(|ch| !is_lean_ident_continuation(ch))
                 || cmd[i..].starts_with("by") && cmd[i + 2..].chars().next().is_none_or(|ch| !is_lean_ident_continuation(ch));
             let is_with_kw = cmd[i..].starts_with("with") && cmd[i + 4..].chars().next().is_none_or(|ch| !is_lean_ident_continuation(ch));
+            let enclosing_block_closes = |scopes: &[StmtScope]| scopes.iter().any(|s| matches!(s,
+                StmtScope::ByBlock { base_col, .. } | StmtScope::DoBlock(base_col) if col < *base_col));
             let mut eff_term_pending = term_pending;
             while match scopes.last().copied() {
-                Some(StmtScope::ByBlock { base_col, arm_inline, .. }) => col < base_col && !(arm_inline && eff_term_pending && matches!(scopes.iter().rev().nth(1), Some(&StmtScope::TacticAlts { floor_col, saw_with: true, arm_col, .. }) if col > arm_col.unwrap_or(floor_col))),
+                Some(StmtScope::ByBlock { base_col, arm_inline, .. }) => {
+                    col < base_col && !(arm_inline && eff_term_pending && matches!(scopes.iter().rev().nth(1), Some(&StmtScope::TacticAlts { floor_col, saw_with: true, arm_col, .. }) if col > arm_col.unwrap_or(floor_col)))
+                        || c != b'|' && col > base_col && !eff_term_pending
+                            && matches!(scopes.iter().rev().nth(1), Some(StmtScope::TacticAlts { saw_with: true, .. }))
+                            && enclosing_block_closes(&scopes[..scopes.len() - 2])
+                },
                 Some(StmtScope::TacticBranches { base_col, .. }) => col < base_col,
-                Some(StmtScope::TacticAlts { floor_col, need_with, saw_with, arm_col }) => if !saw_with { !need_with && !is_with_kw } else if c == b'|' { arm_col.is_some_and(|ac| col < ac) } else { col <= floor_col.max(arm_col.unwrap_or(floor_col)) },
+                Some(StmtScope::TacticAlts { floor_col, need_with, saw_with, arm_col }) => if !saw_with { !need_with && !is_with_kw } else if c == b'|' { arm_col.is_some_and(|ac| col < ac) } else { col <= arm_col.unwrap_or(floor_col) || enclosing_block_closes(&scopes[..scopes.len() - 1]) },
                 Some(StmtScope::DoBlock(base_col)) => col < base_col,
                 Some(StmtScope::Calc { base_col, .. }) => col <= base_col,
                 Some(StmtScope::TermFunBody | StmtScope::TermIf { .. }) => by_base_at_col && !eff_term_pending,
@@ -3351,6 +3359,10 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
             } else {
                 scopes.push(StmtScope::TermFunBody);
             }
+        }
+        if std::mem::take(&mut iterate_count_pending) && depth_zero && c.is_ascii_digit() {
+            i += cmd[i..].chars().take_while(|&ch| is_lean_ident_continuation(ch)).map(char::len_utf8).sum::<usize>();
+            continue;
         }
         if let Some(StmtScope::ByWaitFirst(kind)) = scopes.last().copied().filter(|_| depth_zero && seen_colon) {
             at_tactic_head = matches!(kind, BlockKind::By { .. } | BlockKind::Bullet { .. });
@@ -3424,6 +3436,9 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                 }
             }
             at_tactic_head = is_tactic_ctx(&scopes);
+            if at_tactic_head {
+                scopes.push(StmtScope::ByWaitFirst(BlockKind::By { in_conv: cur_in_conv }));
+            }
             term_pending = false;
             i += 3;
             continue;
@@ -3593,12 +3608,17 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                     | "apply" | "eapply" | "fapply" | "change" | "convert" | "use" | "exists"
                     | "fun" | "λ" | "from" | "if" | "then" | "else" | "in" | "by_cases"
                 );
-                at_tactic_head = popped_tactic_prefix || in_by && at_tactic_head && (matches!(kw,
+                let tactic_seq_prefix = in_by && at_tactic_head && matches!(kw,
                     "try" | "all_goals" | "any_goals" | "focus" | "repeat" | "repeat'" | "repeat1'" | "iterate"
                     | "classical" | "unhygienic" | "with_reducible" | "with_reducible_and_instances"
                     | "with_unfolding_all" | "with_unfolding_none" | "with_implicit" | "show_term"
                     | "fail_if_success" | "stop" | "decreasing_with"
-                ) || kw.bytes().all(|b| b.is_ascii_digit()));
+                );
+                if tactic_seq_prefix {
+                    scopes.push(StmtScope::ByWaitFirst(BlockKind::By { in_conv: cur_in_conv }));
+                    iterate_count_pending = kw == "iterate";
+                }
+                at_tactic_head = popped_tactic_prefix || tactic_seq_prefix;
                 i = kw_end + usize::from(focusing_by);
                 continue;
             }
@@ -14909,6 +14929,57 @@ public def api := by
             if changed_type != public {
                 assert_ne!(extract_public_signature(&public).public_signature_digest,
                     extract_public_signature(&changed_type).public_signature_digest, "{cmd}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_statement_tactic_seq_prefix_layout() {
+        for prefix in [
+            "try", "all_goals", "any_goals", "focus", "repeat", "repeat'", "repeat1'",
+            "iterate", "iterate 2", "iterate 0x2", "iterate\n      2", "iterate\n      0x2",
+            "classical", "unhygienic", "with_reducible", "with_reducible_and_instances",
+            "with_unfolding_all", "with_unfolding_none", "with_implicit", "show_term",
+            "fail_if_success", "stop", "decreasing_with",
+        ] {
+            let sig = format!("theorem t (h : Prop × Prop) (hp : h.1) : show Prop from by\n  {prefix}\n    skip\n    obtain ⟨x, _y⟩ := h\n    exact x ");
+            let cmd = format!("{sig}:= hp");
+            assert_eq!(split_at_top_level_assign(&cmd), Some((sig.as_str(), " hp")), "{cmd}");
+            let split = split_lean_source(&cmd, &[]);
+            assert_eq!(split.shards.len(), 1, "{cmd}");
+            assert_eq!(split.shards[0].signature_text.trim(), sig.trim(), "{cmd}");
+            assert!(stub_identity_probe_src(&cmd).contains(sig.trim()), "{cmd}");
+        }
+        for body in [
+            "  try skip; obtain ⟨x, _y⟩ := h\n  exact x",
+            "  try obtain ⟨x, _y⟩ := h\n  exact x",
+            "  try skip\n  obtain ⟨x, _y⟩ := h\n  exact x",
+            "  try\n    skip <;>\n    obtain ⟨x, _y⟩ := h\n    exact x",
+            "  try skip <;>\n    obtain ⟨x, _y⟩ := h\n      exact x",
+            "  cases b with | true => try exact True | false => exact True",
+            "  first | try skip | obtain ⟨x, _y⟩ := h; exact x",
+        ] {
+            let sig = format!("theorem t (b : Bool) (h : Prop × Prop) (hp : h.1) : show Prop from by\n{body} ");
+            let cmd = format!("{sig}:= hp");
+            assert_eq!(split_at_top_level_assign(&cmd), Some((sig.as_str(), " hp")), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn test_statement_alternatives_enclosing_dedent() {
+        for (sig, tail) in [
+            ("theorem t (b : Bool) (h : Prop × Prop) (hp : h.1) : by\n    have _h : True := by\n      cases b with\n| true =>\n  trivial\n| false =>\n  trivial\n    obtain ⟨x, _y⟩ := h\n    exact x ", ":= hp"),
+            ("theorem t (b : Bool) :\n    match Id.run do\n      let _p : True := by\n        cases b with\n| true =>\n  trivial\n| false =>\n  trivial\n      pure true\n    with\n    | true => True\n    | false => True ", ":= trivial"),
+            ("theorem t (b : Bool) :\n    have _h : True := by\n      cases b with\n  | true => trivial\n  | false => trivial\n    True ", ":= trivial"),
+            ("theorem t (b : Bool) :\n    have _h : True := by\n      cases b with\n        | true => trivial\n        | false => trivial\n    True ", ":= trivial"),
+            ("theorem t (b : Bool) : Bool → show Prop by\n    cases b with\n  | true => exact True\n  | false => exact True", "\n| _ => by cases b <;> trivial"),
+        ] {
+            for sig in [sig.to_string(), sig.replace("cases", "induction"), sig.replace("cases", "match")] {
+                let cmd = format!("{sig}{tail}");
+                assert_eq!(split_at_top_level_assign(&cmd), Some((sig.as_str(), tail.strip_prefix(":=").unwrap_or(tail))), "{cmd}");
+                let split = split_lean_source(&cmd, &[]);
+                assert_eq!(split.shards.len(), 1, "{cmd}");
+                assert_eq!(split.shards[0].signature_text.trim(), sig.trim(), "{cmd}");
             }
         }
     }
