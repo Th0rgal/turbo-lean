@@ -126,7 +126,8 @@ private def flatPtrLoopIROk (arch : TargetArch) : Bool :=
     (ir.splitOn "align 4").length > 1 &&
     (ir.splitOn "noalias").length == 1 &&
     (ir.splitOn "@malloc").length == 1 &&
-    (ir.splitOn "@lean_alloc_ctor").length == 1
+    (ir.splitOn "@lean_alloc_ctor").length == 1 &&
+    (!arch.isFreestandingEmbedded || (ir.splitOn "!llvm.loop").length == 1)
   | .error _ => false
 
 #guard flatPtrLoopIROk .thumbv6m

@@ -1592,8 +1592,10 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
     let addOp := if opt then "add nuw i64" else "add i64"
     emitLine s!"  {idxNext} = {addOp} {curIdx}, 1"
     let isVecLoop := loopBodyHasArrayMem stepBody
+    let isEmbedded := (← get).target.isFreestandingEmbedded
     let loopMd :=
-      if !opt then ", !llvm.loop !3"
+      if isEmbedded then ""
+      else if !opt then ", !llvm.loop !3"
       else if isVecLoop then ", !llvm.loop !0"
       else ", !llvm.loop !6"
     emitLine s!"  br label %{hdrLbl}{loopMd}"
