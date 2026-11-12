@@ -25,6 +25,7 @@ import Lean.Compiler.NoncomputableAttr
 import Lean.Compiler.ModPkgExt
 import Lean.Compiler.LCNF.PhaseExt
 import Lean.Compiler.LCNF.ToDecl
+import Lean.Compiler.LCNF.Main
 import Lean.Compiler.LCNF.Passes
 import Lean.Compiler.LCNF.AlphaEqv
 import Lean.Compiler.LCNF.SpecInfo
@@ -545,16 +546,19 @@ def hydrateOnePersistentExt {α β σ : Type} [Inhabited σ]
   let newState ← ext.addImportedFn s.importedEntries { env, opts := {} }
   return ext.toEnvExtension.setState env { s with state := newState } (asyncMode := .sync)
 
-def hydrateRecAuditEnv (env0 : Environment) : IO Environment := do
-  if Lean.classExtension.getState env0 |>.outParamMap.contains ``Monad then
-    return env0
+def hydrateMetaAuditEnv (env0 : Environment) : IO Environment := do
   let mut e := env0
   e ← hydrateOnePersistentExt Lean.classExtension e
   e ← hydrateOnePersistentExt Lean.Meta.instanceExtension.ext e
   e ← hydrateOnePersistentExt Lean.Meta.defaultInstanceExtension e
   e ← hydrateOnePersistentExt Lean.reducibilityExtraExt.ext e
-  e ← hydrateOnePersistentExt Lean.Meta.Match.Extension.extension e
-  e ← hydrateOnePersistentExt Lean.Elab.WF.wfPreprocessSimpExtension.ext e
+  hydrateOnePersistentExt Lean.Meta.Match.Extension.extension e
+
+def hydrateRecAuditEnv (env0 : Environment) : IO Environment := do
+  if Lean.classExtension.getState env0 |>.outParamMap.contains ``Monad then
+    return env0
+  let e ← hydrateMetaAuditEnv env0
+  let e ← hydrateOnePersistentExt Lean.Elab.WF.wfPreprocessSimpExtension.ext e
   return e.setMainModule e.mainModule
 
 def isCoreRecCombinator (env : Environment) (c : Name) : Bool :=
@@ -2261,8 +2265,28 @@ def csimpReplacementPair? (env : Environment) (ci : ConstantInfo) : Option (Name
       none
   | _ => none
 
+def compilerAuditCodeViolations (env : Environment) : List String := Id.run do
+  let mut out := []
+  for i in [:env.header.moduleNames.size] do
+    let modIdx : ModuleIdx := i
+    let modName := env.header.moduleNames[i]!
+    for entries in #[Lean.Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleEntries env modIdx,
+        Lean.Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleEntries (level := .private) env modIdx,
+        Lean.Compiler.LCNF.Simp.ConstantFold.folderExt.getModuleIREntries env modIdx] do
+      for entry in entries do
+        out := out ++ [s!"[TurboLean.KernelGate] custom constant folder `{entry.folderDeclName}` in `{modName}` cannot be executed during compiler audit"]
+    for entries in #[Lean.Compiler.LCNF.passManagerExt.getModuleEntries env modIdx,
+        Lean.Compiler.LCNF.passManagerExt.getModuleEntries (level := .private) env modIdx,
+        Lean.Compiler.LCNF.passManagerExt.getModuleIREntries env modIdx] do
+      for entry in entries do
+        out := out ++ [s!"[TurboLean.KernelGate] custom compiler pass installer `{entry}` in `{modName}` cannot be executed during compiler audit"]
+  return out.eraseDups
+
 def hydrateCompilerAuditEnv (env0 : Environment) : IO Environment := do
-  let mut e := env0
+  let codeViolations := compilerAuditCodeViolations env0
+  unless codeViolations.isEmpty do
+    throw <| IO.userError (String.intercalate "\n" codeViolations)
+  let mut e ← hydrateMetaAuditEnv env0
   e ← hydrateOnePersistentExt Lean.Compiler.CSimp.ext.ext e
   e ← hydrateOnePersistentExt Lean.Compiler.inlineAttrs.ext e
   e ← hydrateOnePersistentExt Lean.Compiler.nospecializeAttr.ext e
@@ -2270,12 +2294,21 @@ def hydrateCompilerAuditEnv (env0 : Environment) : IO Environment := do
   e ← hydrateOnePersistentExt Lean.Compiler.specializeAttr.ext e
   e ← hydrateOnePersistentExt Lean.Compiler.implementedByAttr.ext e
   e ← hydrateOnePersistentExt Lean.Compiler.LCNF.specExtension e
-  e ← hydrateOnePersistentExt Lean.Compiler.LCNF.Simp.ConstantFold.folderExt e
-  e ← hydrateOnePersistentExt Lean.Compiler.LCNF.passManagerExt e
-  e ← hydrateOnePersistentExt Lean.Meta.Match.Extension.extension e
-  e ← hydrateOnePersistentExt Lean.classExtension e
-  e ← hydrateOnePersistentExt Lean.Meta.instanceExtension.ext e
-  return e
+  e := Lean.Compiler.LCNF.Simp.ConstantFold.folderExt.modifyState e
+    (fun _ => ([], Lean.Compiler.LCNF.Simp.ConstantFold.builtinFolders))
+  e := Lean.Compiler.LCNF.passManagerExt.modifyState e
+    (fun _ => ([], Lean.Compiler.LCNF.builtinPassManager))
+  for ext in (← Lean.persistentEnvExtensionsRef.get) do
+    if #[`Lean.Compiler.LCNF.impureTypeExt, `Lean.Compiler.LCNF.trivialStructureInfoExt].contains
+        (Lean.privateToUserName ext.name) then
+      e ← hydrateOnePersistentExt ext e
+  return e.setMainModule e.mainModule
+
+def compilerAuditEligible (declName : Name) : CoreM Bool := do
+  let env ← getEnv
+  if Lean.isNoncomputable env declName || Lean.isNoncomputable env (Lean.Compiler.mkUnsafeRecName declName) then
+    return false
+  Lean.Compiler.LCNF.shouldGenerateCode declName
 
 def runPureLcnfPass : Lean.Compiler.LCNF.Pass → Array (Lean.Compiler.LCNF.Decl .pure) →
     Lean.Compiler.LCNF.CompilerM (Array (Lean.Compiler.LCNF.Decl .pure))
@@ -2287,8 +2320,12 @@ def compileSingleBaseLcnfDecl (env : Environment) (declName : Name) :
     IO (Option (Lean.Compiler.LCNF.Decl .pure)) := do
   let action : Lean.Compiler.LCNF.CompilerM (Option (Lean.Compiler.LCNF.Decl .pure)) :=
     Lean.withAtLeastMaxRecDepth 8192 do
-      let initDecl ← Lean.Compiler.LCNF.toDecl declName
-      let mut cur := Lean.Compiler.LCNF.markRecDecls #[initDecl]
+      unless ← compilerAuditEligible declName do return none
+      let some info ← Lean.Compiler.LCNF.getDeclInfo? declName | return none
+      let names := info.all.toArray.map fun n => (Lean.Compiler.isUnsafeRecName? n).getD n
+      let names ← names.filterM (fun n => compilerAuditEligible n)
+      let initDecls ← names.mapM Lean.Compiler.LCNF.toDecl
+      let mut cur := Lean.Compiler.LCNF.markRecDecls initDecls
       let pm ← Lean.Compiler.LCNF.getPassManager
       let mut saved : Option (Lean.Compiler.LCNF.Decl .pure) := none
       for pass in pm.basePasses do
@@ -2311,9 +2348,11 @@ def compileSingleToLcnfDecl (env : Environment) (declName : Name) :
     IO (Option (Lean.Compiler.LCNF.Decl .pure)) := do
   try
     let (d, _) ← Core.CoreM.toIO
-      (Lean.Compiler.LCNF.CompilerM.run (Lean.withAtLeastMaxRecDepth 8192 (Lean.Compiler.LCNF.toDecl declName)))
+      (Lean.Compiler.LCNF.CompilerM.run (Lean.withAtLeastMaxRecDepth 8192 do
+        unless ← compilerAuditEligible declName do return none
+        return some (← Lean.Compiler.LCNF.toDecl declName)))
       { fileName := "<csimp-audit>", fileMap := default, maxHeartbeats := 0 } { env }
-    return some d
+    return d
   catch _ =>
     return none
 
@@ -2661,6 +2700,8 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
     (unsafePatterns : List String := []) (implByPatterns : List String := [])
     (skipChildReplay : Bool := false)
     (allowSorry : Bool := false) (isImportAudit : Bool := false) : IO (List String × List String) := do
+  let codeViolations := compilerAuditCodeViolations env
+  unless codeViolations.isEmpty do return (codeViolations, [])
   let sorryAxName := Name.mkSimple ("sor" ++ "ryAx")
   let app := (← IO.appPath).toString
   let nameMatchesPolicy := fun (pats : List String) (name : Name) =>
@@ -2908,7 +2949,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
         List String × Std.HashSet (Name × Name) :=
       if seen.contains (thmName, callerName) then (acc, seen)
       else
-        (acc ++ [s!"[TurboLean.KernelGate] local csimp replacement `{thmName}` ({lhs} <-> {rhs}) rewrote compiled code of `{callerName}` in `{modLabel}`{kernelPolicyHint "csimp" thmName}"],
+        (acc ++ [s!"[TurboLean.KernelGate] local csimp replacement `{thmName}` ({lhs} -> {rhs}) rewrote compiled code of `{callerName}` in `{modLabel}`{kernelPolicyHint "csimp" thmName}"],
          seen.insert (thmName, callerName))
     let storedBaseMap := collectModuleStoredBaseDecls env modIdx
     let mut reachCache : Std.HashMap (Name × Name) Bool := {}
@@ -2934,20 +2975,21 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
       let (a, s) := pushCaller irDecl.name callerNames seenCallers
       callerNames := a; seenCallers := s
     for callerName in callerNames do
-      if !storedBaseMap.contains callerName || (env.find? callerName).isNone then
-        let compiledConsts := collectCompiledCodeConsts env callerName
-        let ownerInfo? := findOwnerInfo callerName
-        let ownerName := ownerInfo?.map ConstantInfo.name |>.getD callerName
-        let kernelConsts := ownerInfo?.map ConstantInfo.getUsedConstantsAsSet |>.getD {}
-        if !compiledConsts.isEmpty then
-          for (thmName, lhs, rhs) in localCands do
-            if ownerName != lhs && ownerName != rhs then
-              let fwdHit := !isReachableCached lhs rhs &&
-                            (kernelConsts.isEmpty || (kernelConsts.contains lhs && !kernelConsts.contains rhs)) &&
-                            (compiledConsts.contains rhs || compiledConsts.contains (Lean.Compiler.mkUnsafeRecName rhs))
-              if fwdHit then
-                let (o, s) := emitHit thmName lhs rhs callerName out seenLocalHit
-                out := o; seenLocalHit := s
+      let compiledConsts := match storedBaseMap[callerName]? with
+        | some { value := .code code, .. } => collectLcnfPureConsts code
+        | _ => collectCompiledCodeConsts env callerName
+      let ownerInfo? := findOwnerInfo callerName
+      let ownerName := ownerInfo?.map ConstantInfo.name |>.getD callerName
+      let kernelConsts := ownerInfo?.map ConstantInfo.getUsedConstantsAsSet |>.getD {}
+      if !compiledConsts.isEmpty then
+        for (thmName, lhs, rhs) in localCands do
+          if ownerName != lhs && ownerName != rhs then
+            let fwdHit := !isReachableCached lhs rhs &&
+                          (kernelConsts.isEmpty || (kernelConsts.contains lhs && !kernelConsts.contains rhs)) &&
+                          (compiledConsts.contains rhs || compiledConsts.contains (Lean.Compiler.mkUnsafeRecName rhs))
+            if fwdHit then
+              let (o, s) := emitHit thmName lhs rhs callerName out seenLocalHit
+              out := o; seenLocalHit := s
     let mut envMod ← getCompilerAuditEnv
     for scEntry in Lean.Compiler.CSimp.ext.ext.getModuleEntries envMod modIdx do
       match scEntry with
@@ -2959,11 +3001,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
       if (env.find? callerName).isSome then
         let ownerName := (findOwnerInfo callerName).map ConstantInfo.name |>.getD callerName
         match ← compileSingleToLcnfDecl envMod callerName with
-        | none =>
-          for (thmName, lhs, rhs) in localCands do
-            if ownerName != lhs && ownerName != rhs then
-              let (o, s) := emitHit thmName lhs rhs callerName out seenLocalHit
-              out := o; seenLocalHit := s
+        | none => pure ()
         | some tdBase =>
           let mut activeCands : Array (Name × Name × Name) := #[]
           for (thmName, lhs, rhs) in localCands do
@@ -2971,38 +3009,17 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
               let envCand := Lean.Compiler.CSimp.ext.addEntry envMod
                 { fromDeclName := lhs, toDeclName := rhs, thmName := thmName }
               let changed := match ← compileSingleToLcnfDecl envCand callerName with
-                | none => true
+                | none => false
                 | some tdCand => !lcnfDeclAlphaEqv tdBase tdCand
               if changed then
                 activeCands := activeCands.push (thmName, lhs, rhs)
           if !activeCands.isEmpty then
-            let baseMatchesStored := match ← compileSingleBaseLcnfDecl envMod callerName with
-              | some rd => lcnfDeclAlphaEqvModuloSpec bStored rd
-              | none => false
-            if !baseMatchesStored then
-              for (thmName, lhs, rhs) in activeCands do
-                let (o, s) := emitHit thmName lhs rhs callerName out seenLocalHit
-                out := o; seenLocalHit := s
-    if mdata.isModule && storedBaseMap.isEmpty then
-      for callerInfo in mdata.constants do
-        let callerName := callerInfo.name
-        if !(callerInfo matches .thmInfo _ | .axiomInfo _ | .inductInfo _ | .ctorInfo _ | .recInfo _ | .quotInfo _) &&
-           !Lean.Compiler.hasMacroInlineAttribute envMod callerName then
-          match ← compileSingleToLcnfDecl envMod callerName with
-          | none =>
-            for (thmName, lhs, rhs) in localCands do
-              if callerName != lhs && callerName != rhs then
-                let (o, s) := emitHit thmName lhs rhs callerName out seenLocalHit
-                out := o; seenLocalHit := s
-          | some tdBase =>
-            for (thmName, lhs, rhs) in localCands do
-              if !seenLocalHit.contains (thmName, callerName) && callerName != lhs && callerName != rhs then
-                let envCand := Lean.Compiler.CSimp.ext.addEntry envMod
-                  { fromDeclName := lhs, toDeclName := rhs, thmName := thmName }
-                let changed := match ← compileSingleToLcnfDecl envCand callerName with
-                  | none => true
-                  | some tdCand => !lcnfDeclAlphaEqv tdBase tdCand
-                if changed then
+            match ← compileSingleBaseLcnfDecl envMod callerName with
+            | none =>
+              out := out ++ [s!"[TurboLean.KernelGate] failed to reconstruct stored base declaration `{callerName}` in `{modLabel}` for local csimp audit"]
+            | some rd =>
+              if !lcnfDeclAlphaEqvModuloSpec bStored rd then
+                for (thmName, lhs, rhs) in activeCands do
                   let (o, s) := emitHit thmName lhs rhs callerName out seenLocalHit
                   out := o; seenLocalHit := s
     return out

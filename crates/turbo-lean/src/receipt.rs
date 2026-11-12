@@ -411,8 +411,8 @@ pub fn build_verification_receipt_with_provenance(
     let schema_version = CURRENT_RECEIPT_SCHEMA_VERSION;
     let normalized_tc = crate::kernel::normalize_lean_toolchain(lean_toolchain);
     let csimp_policy = crate::splitter::normalized_policy_env_vec("TURBO_LEAN_ALLOWED_CSIMP");
-    let active_csimp_digest = (!csimp_policy.is_empty())
-        .then(|| compute_active_csimp_digest(&csimp_policy, &[]));
+    let active_csimp_digest =
+        (!csimp_policy.is_empty()).then(|| compute_active_csimp_digest(&csimp_policy, &[]));
     let receipt_blake3 = compute_receipt_blake3(
         schema_version,
         mode,
@@ -873,6 +873,215 @@ pub fn run_verify_receipt_command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires Lean 4.35 and lake build TurboLean turbo-zygote"]
+    fn imported_local_csimp_compiler_audit_regressions() {
+        use std::process::Command;
+
+        let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
+        let worker = project
+            .join(".lake/build/bin/turbo-zygote")
+            .canonicalize()
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("turbo_csimp_audit_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        let defs = "@[noinline, expose] def slow (n : Nat) : Nat := n + 1\n@[inline, expose] def fast (n : Nat) : Nat := n + 1\ntheorem replacement : slow = fast := rfl\n";
+        let before = "@[noinline] def before (n : Nat) : Nat := slow n\n";
+        let after = "attribute [local csimp] replacement\n@[noinline] def after (n : Nat) : Nat := slow n\n";
+        let benign = "def TypeAlias := Nat\nnoncomputable def chosen : Nat := Classical.choice (inferInstance : Nonempty Nat)\nstructure Box where\n  value : Nat\n  proof : value = value\nmutual\n  def even : Nat → Bool\n    | 0 => true\n    | n + 1 => odd n\n  def odd : Nat → Bool\n    | 0 => false\n    | n + 1 => even n\nend\n";
+        let recursive = "structure Box where\n  value : Nat\n  proof : value = value\n@[noinline] def boxed (b : Box) : Nat := slow b.value\nmutual\n  @[noinline] def left : Nat → Nat\n    | 0 => slow 0\n    | n + 1 => right n\n  @[noinline] def right : Nat → Nat\n    | 0 => slow 1\n    | n + 1 => left n\nend\n";
+        let cases = [
+            ("AuditPlain", format!("import Lean\n{defs}{before}{after}"), true),
+            ("AuditModule", format!("module\nimport Lean\npublic section\n{defs}{before}{after}"), true),
+            ("AuditPostponed", format!("module\nimport Lean\npublic section\nset_option compiler.postponeCompile true\n{defs}{before}{after}"), false),
+            ("AuditBefore", format!("module\nimport Lean\npublic section\n{defs}{before}attribute [local csimp] replacement\n{benign}"), false),
+            ("AuditMutual", format!("module\nimport Lean\npublic section\n{defs}{recursive}attribute [local csimp] replacement\n"), false),
+            ("AuditScopedUse", "module\nimport AuditScope\npublic section\n@[noinline] def before (n : Nat) := Scope.slow n\nopen scoped Scope\n@[noinline] def after (n : Nat) := Scope.slow n\n".into(), true),
+            ("AuditReverse", format!("module\nimport Lean\npublic section\n{defs}attribute [local csimp] replacement\n@[noinline] def direct (n : Nat) : Nat := fast n\n{benign}"), false),
+            ("AuditUnrelated", format!("module\nimport Lean\npublic section\n{defs}attribute [local csimp] replacement\n{benign}"), false),
+        ];
+        let hooks = [
+            (
+                "AuditFolder",
+                r#"import Lean
+open Lean.Compiler.LCNF.Simp.ConstantFold
+unsafe def auditFolder : Folder := (unsafeIO do
+  if let some path ← IO.getEnv "TURBO_CSIMP_AUDIT_MARKER" then
+    IO.FS.writeFile path "folder executed"
+  return fun _ => pure none).toOption.getD (fun _ => pure none)
+run_meta do registerFolder ``Nat.add ``auditFolder
+"#,
+            ),
+            (
+                "AuditPass",
+                r#"import Lean
+open Lean.Compiler.LCNF
+@[cpass] unsafe def auditPass : PassInstaller where
+  phase := .base
+  install passes := do
+    if let some path ← IO.getEnv "TURBO_CSIMP_AUDIT_MARKER" then
+      IO.FS.writeFile path "pass executed"
+    return passes
+"#,
+            ),
+            (
+                "AuditInitializer",
+                r#"import Lean
+initialize auditMarker : Unit ← do
+  if let some path ← IO.getEnv "TURBO_CSIMP_AUDIT_MARKER" then
+    IO.FS.writeFile path "initializer executed"
+"#,
+            ),
+        ];
+        fs::write(dir.join("AuditScope.lean"), format!("module\nimport Lean\npublic section\nnamespace Scope\n{defs}attribute [scoped csimp] replacement\nend Scope\n")).unwrap();
+        let mut lakefile =
+            String::from("name = \"audit-fixtures\"\n[[lean_lib]]\nname = \"AuditScope\"\n");
+        for (name, source, _) in &cases {
+            fs::write(dir.join(format!("{name}.lean")), source).unwrap();
+            lakefile.push_str(&format!("\n[[lean_lib]]\nname = \"{name}\"\n"));
+        }
+        for (name, source) in &hooks {
+            fs::write(dir.join(format!("{name}.lean")), source).unwrap();
+            lakefile.push_str(&format!("\n[[lean_lib]]\nname = \"{name}\"\n"));
+        }
+        fs::write(dir.join("lakefile.toml"), lakefile).unwrap();
+        let output = Command::new("lake")
+            .arg("build")
+            .args(
+                cases
+                    .iter()
+                    .filter(|(name, _, _)| *name != "AuditPostponed")
+                    .map(|(name, _, _)| *name),
+            )
+            .args(hooks.iter().map(|(name, _)| *name))
+            .env_remove("TURBO_CSIMP_AUDIT_MARKER")
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::write(
+            dir.join("Postponed.setup.json"),
+            serde_json::json!({
+                "name": "AuditPostponed", "isModule": true, "package": "audit-fixtures",
+                "options": {}, "plugins": [], "dynlibs": [], "importArts": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for args in [
+            vec![
+                "env",
+                "lean",
+                "AuditPostponed.lean",
+                "-o",
+                ".lake/build/lib/lean/AuditPostponed.olean",
+                "--setup",
+                "Postponed.setup.json",
+            ],
+            vec![
+                "env",
+                "leanir",
+                "Postponed.setup.json",
+                ".lake/build/lib/lean/AuditPostponed.ir",
+                "Postponed.c",
+            ],
+        ] {
+            let output = Command::new("lake")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        for (name, _, rejected) in &cases {
+            let output = Command::new("lake")
+                .arg("env")
+                .arg(&worker)
+                .args(["--audit-modules", "--skip-child-replay", name])
+                .env_remove("TURBO_LEAN_ALLOWED_CSIMP")
+                .env_remove("TURBO_LEAN_ALLOWED_AXIOMS")
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let result: serde_json::Value = serde_json::from_str(stdout.trim())
+                .unwrap_or_else(|err| panic!("{name}: {err}: {stdout}{stderr}"));
+            assert_eq!(result["ok"], !rejected, "{name}: {stdout}{stderr}");
+            assert!(!stdout.contains("code of `before`"), "{name}: {stdout}");
+            assert!(!stdout.contains("code of `TypeAlias`"), "{name}: {stdout}");
+            assert!(!stdout.contains("code of `chosen`"), "{name}: {stdout}");
+            if *rejected {
+                assert!(
+                    stdout.contains("local csimp replacement"),
+                    "{name}: {stdout}"
+                );
+                assert!(stdout.contains("code of `after`"), "{name}: {stdout}");
+            }
+        }
+        let check_base = r#"import TurboLean.ZygoteWorker
+open Lean TurboLean.ZygoteWorker
+#eval do
+  let raw ← Lean.importModules #[{ module := `AuditMutual, importAll := true }] {} 0 #[] true false .private
+  let env ← hydrateCompilerAuditEnv raw
+  let idx := (env.getModuleIdx? `AuditMutual).get!
+  let stored := collectModuleStoredBaseDecls env idx
+  for name in #[`boxed, `left, `right] do
+    let some actual := stored[name]? | throw <| IO.userError s!"missing stored base: {name}"
+    let some rebuilt ← compileSingleBaseLcnfDecl env name | throw <| IO.userError s!"failed base reconstruction: {name}"
+    unless lcnfDeclAlphaEqvModuloSpec actual rebuilt do
+      throw <| IO.userError s!"base reconstruction differs: {name}"
+"#;
+        fs::write(dir.join("CheckBase.lean"), check_base).unwrap();
+        let output = Command::new("lake")
+            .args(["env", "lean", "CheckBase.lean"])
+            .env("LEAN_PATH", project.join(".lake/build/lib/lean"))
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let marker = dir.join("executed");
+        for (name, _) in &hooks {
+            let output = Command::new("lake")
+                .arg("env")
+                .arg(&worker)
+                .args(["--audit-modules", "--skip-child-replay", name])
+                .env("TURBO_CSIMP_AUDIT_MARKER", &marker)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let result: serde_json::Value = serde_json::from_str(stdout.trim())
+                .unwrap_or_else(|err| panic!("{name}: {err}: {stdout}{stderr}"));
+            if *name != "AuditInitializer" {
+                assert_eq!(result["ok"], false, "{name}: {stdout}{stderr}");
+                assert!(
+                    stdout.contains("cannot be executed during compiler audit"),
+                    "{name}: {stdout}{stderr}"
+                );
+            }
+            assert!(!marker.exists(), "{name} executed imported code");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn active_csimp_digest_is_canonical_and_content_sensitive() {
