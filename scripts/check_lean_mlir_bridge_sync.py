@@ -10,7 +10,7 @@ Verifies:
    exact SHA-256 digests of `opencompl/lean-mlir` commit `b8c4a771319a044854a4bbb49b8821381ef86ff8`.
 3. `verification/lean-mlir-bridge/lakefile.toml` pins `opencompl/lean-mlir` at commit
    `b8c4a771319a044854a4bbb49b8821381ef86ff8` (`subDir = "LeanMLIR"`), and `LeanMLIRBridge` contains
-   `#verify_lean_mlir_bridge_axioms` (>= 63 unique audited theorems via `Lean.collectAxioms` and
+   `#verify_lean_mlir_bridge_axioms` (>= 71 unique audited theorems via `Lean.collectAxioms` and
    `bridgedTheorems.Nodup`) and zero `sorry`, `sorryAx`, `admit`, `axiom`, `native_decide`,
    `bv_decide`, `trustCompiler`, or `ofReduceBool` tokens outside Lean comments/strings.
 """
@@ -43,7 +43,7 @@ MIRRORED_FILES = (
     "LeanNative/Backend/LLVMAst/Eval.lean",
 )
 
-MIN_AUDITED_THEOREMS = 63
+MIN_AUDITED_THEOREMS = 71
 
 # Pre-filter scan outside Lean comments; kernel-level enforcement is `#verify_lean_mlir_bridge_axioms`
 # (`Lean.collectAxioms` in `LeanMLIRBridge.lean`).
