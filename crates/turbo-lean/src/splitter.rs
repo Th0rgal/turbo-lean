@@ -3327,7 +3327,9 @@ fn split_at_top_level_assign_inner(cmd: &str, initial_seen_colon: bool) -> Optio
                             && (chevr && enclosing_unwinds(&scopes[..scopes.len() - 1])
                                 || matches!(scopes.iter().rev().nth(1), Some(StmtScope::TacticAlts { saw_with: true, .. })) && enclosing_unwinds(&scopes[..scopes.len() - 2]))
                 },
-                Some(StmtScope::TacticBranches { base_col, .. }) => col < base_col,
+                Some(StmtScope::TacticBranches { base_col, .. }) => {
+                    col < base_col || col == base_col && c != b'|'
+                }
                 Some(StmtScope::TacticAlts { floor_col, need_with, saw_with, arm_col }) => if !saw_with { !need_with && !is_with_kw } else if c == b'|' { arm_col.is_some_and(|ac| col < ac) } else { col <= arm_col.unwrap_or(floor_col) || arm_col.is_none() && enclosing_block_closes(&scopes[..scopes.len() - 1]) },
                 Some(StmtScope::DoBlock(base_col)) => col < base_col,
                 Some(StmtScope::Calc { base_col, .. }) => col <= base_col,
@@ -15038,6 +15040,32 @@ public def api := by
             let split = split_lean_source(&cmd, &[]);
             assert_eq!(split.shards.len(), 1, "{cmd}");
             assert_eq!(split.shards[0].signature_text.trim(), sig.trim(), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn test_statement_first_branches_aligned_continuation() {
+        for branches in [
+            "first | skip | skip",
+            "first\n  | skip\n  | skip",
+            "first\n    | skip\n    | skip",
+            "try\n    first | skip | skip",
+            "try\n    first\n    | skip\n    | skip",
+        ] {
+            let sig = format!("theorem t (h : Prop × Prop) (hp : h.1) : show Prop from by\n  {branches}\n  obtain ⟨x, _y⟩ := h\n  exact x ");
+            let cmd = format!("{sig}:= hp");
+            assert_eq!(
+                split_at_top_level_assign(&cmd),
+                Some((sig.as_str(), " hp")),
+                "{cmd}"
+            );
+            let src = format!("{cmd}\ntheorem next_thm : True := by trivial\n");
+            let split = split_lean_source(&src, &[]);
+            assert_eq!(split.shards.len(), 2, "{src}");
+            assert_eq!(split.shards[0].signature_text.trim(), sig.trim(), "{src}");
+            assert_eq!(split.shards[0].proof_text.trim(), "hp", "{src}");
+            assert_eq!(split.shards[1].name, "next_thm", "{src}");
+            assert_eq!(split.shards[1].proof_text.trim(), "by trivial", "{src}");
         }
     }
 
