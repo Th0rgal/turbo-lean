@@ -1450,46 +1450,25 @@ pub(crate) fn reject_git_pinned_dep_checking_weakening(source: &str) -> anyhow::
     Ok(())
 }
 
+/// End offsets of whole Lean-identifier `word`s; `dot` makes a `.` neighbour part of the identifier.
+fn lean_word_ends<'a>(h: &'a str, word: &'a str, dot: bool) -> impl Iterator<Item = usize> + 'a {
+    let joins = move |c: char, g: char| is_lean_id_rest(c) || c == g || (dot && c == '.');
+    h.match_indices(word).filter_map(move |(i, _)| {
+        let end = i + word.len();
+        let prev = h[..i].chars().next_back().is_some_and(|c| joins(c, '»'));
+        let next = h[end..].chars().next().is_some_and(|c| joins(c, '«'));
+        (!prev && !next).then_some(end)
+    })
+}
+
 pub(crate) fn contains_lean_word(haystack: &str, word: &str) -> bool {
-    for (idx, _) in haystack.match_indices(word) {
-        let prev_ok = idx == 0
-            || !haystack[..idx]
-                .chars()
-                .next_back()
-                .is_some_and(|c| is_lean_id_rest(c) || c == '»' || c == '.');
-        let end = idx + word.len();
-        let next_ok = end >= haystack.len()
-            || !haystack[end..]
-                .chars()
-                .next()
-                .is_some_and(|c| is_lean_id_rest(c) || c == '«' || c == '.');
-        if prev_ok && next_ok {
-            return true;
-        }
-    }
-    false
+    lean_word_ends(haystack, word, true).next().is_some()
 }
 
 /// Match an identifier component even when qualified by a namespace prefix/suffix (e.g. `IO.getEnv`
 /// or `System.FilePath` as well as bare `getEnv` under `open IO`).
 pub(crate) fn contains_lean_ident_segment(haystack: &str, seg: &str) -> bool {
-    for (idx, _) in haystack.match_indices(seg) {
-        let prev_ok = idx == 0
-            || !haystack[..idx]
-                .chars()
-                .next_back()
-                .is_some_and(|c| is_lean_id_rest(c) || c == '»');
-        let end = idx + seg.len();
-        let next_ok = end >= haystack.len()
-            || !haystack[end..]
-                .chars()
-                .next()
-                .is_some_and(|c| is_lean_id_rest(c) || c == '«');
-        if prev_ok && next_ok {
-            return true;
-        }
-    }
-    false
+    lean_word_ends(haystack, seg, false).next().is_some()
 }
 
 fn contains_lean_attribute_word(unquoted: &str, attrs: &[&str]) -> bool {
@@ -1767,16 +1746,10 @@ fn unquoted_has_host_read_tokens(comment_free: &str, unquoted: &str) -> bool {
         return true;
     }
     if contains_lean_ident_segment(unquoted, "getEnv") {
-        for (idx, _) in comment_free.match_indices("getEnv") {
-            let prev_ok = idx == 0
-                || !comment_free[..idx]
-                    .chars()
-                    .next_back()
-                    .is_some_and(|c| is_lean_id_rest(c) || c == '»');
-            let after = comment_free[idx + "getEnv".len()..].trim_start();
-            if prev_ok && after.starts_with('"') {
-                return true;
-            }
+        if lean_word_ends(&comment_free, "getEnv", false)
+            .any(|end| comment_free[end..].trim_start().starts_with('"'))
+        {
+            return true;
         }
     }
     false
@@ -1971,35 +1944,6 @@ fn parse_include_literal_segments(tail: &str) -> Option<Vec<String>> {
     }
 }
 
-/// `admit` in tactic position: a word not reached through `.` whose next token
-/// ends a tactic (end of line, `;`, `<;>`, `|`, a closing bracket or `,`).
-/// `admit` as a binder, field or applied function (`let admit :=`,
-/// `admit x = true`, `if admit then`, `C.admit r`) is an ordinary identifier.
-/// Fail-closed backstop only: the tactic elaborates to `sorryAx`, which the
-/// kernel axiom check rejects independently.
-fn contains_admit_tactic(line: &str) -> bool {
-    let bytes = line.as_bytes();
-    for (idx, _) in line.match_indices("admit") {
-        let end = idx + "admit".len();
-        let is_ident_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'\'';
-        if idx > 0 && (is_ident_byte(bytes[idx - 1]) || bytes[idx - 1] == b'.') {
-            continue;
-        }
-        if end < bytes.len() && (is_ident_byte(bytes[end]) || bytes[end] == b'?' || bytes[end] == b'!') {
-            continue;
-        }
-        let rest = line[end..].trim_start();
-        if rest.is_empty()
-            || [";", "<;>", "|", ")", "]", "}", "⟩", ","]
-                .iter()
-                .any(|t| rest.starts_with(t))
-        {
-            return true;
-        }
-    }
-    false
-}
-
 fn contains_word(haystack: &str, word: &str) -> bool {
     for (idx, _) in haystack.match_indices(word) {
         let prev_ok = idx == 0
@@ -2014,6 +1958,14 @@ fn contains_word(haystack: &str, word: &str) -> bool {
         }
     }
     false
+}
+
+/// `admit` as a tactic (next token ends it), not a binder/field/application; kernel rejects its `sorryAx` anyway.
+fn contains_admit_tactic(line: &str) -> bool {
+    lean_word_ends(line, "admit", true).any(|end| {
+        let rest = line[end..].trim_start();
+        rest.is_empty() || rest.starts_with([';', '<', '|', ')', ']', '}', '⟩', ','])
+    })
 }
 
 fn is_top_level_command_start(trimmed: &str) -> bool {
@@ -6570,13 +6522,8 @@ fn rename_decl_header_for_fast_check(
     let opt_proof = optimize_fast_check_proof_body(proof_orig);
 
     for kw in ["theorem", "lemma"] {
-        for (kw_pos, _) in sig_clean.match_indices(kw) {
-            if kw_pos > 0 {
-                let prev = sig_clean[..kw_pos].chars().next_back().unwrap_or(' ');
-                if is_lean_id_rest(prev) || prev == '»' || prev == '.' {
-                    continue;
-                }
-            }
+        for kw_end in lean_word_ends(&sig_clean, kw, true) {
+            let kw_pos = kw_end - kw.len();
             let after_kw = &sig_clean[kw_pos + kw.len()..];
             if !after_kw.starts_with(char::is_whitespace) {
                 continue;
@@ -10860,6 +10807,28 @@ pub fn extract_public_signature(src: &str) -> PublicSignatureSummary {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admit_flagged_only_as_tactic() {
+        let flags = |src: &str| audit_hygiene(&strip_lean_comments(src)).has_sorry;
+        for src in [
+            "by admit",
+            "by\n  · admit",
+            "by admit; rfl",
+            "by first | admit | rfl",
+            "by (admit)",
+        ] {
+            assert!(flags(&format!("theorem t : False := {src}")), "{src}");
+        }
+        for src in [
+            "let admit : Bool := x\n  if admit then 1 else 0",
+            "fun (admit : Nat → Bool) => admit x",
+            "C.admit r = true",
+            "if !admit then 0 else 1",
+        ] {
+            assert!(!flags(&format!("def f := {src}")), "{src}");
+        }
+    }
+
     use super::*;
     use std::collections::HashSet;
 
@@ -14515,45 +14484,3 @@ public def api := by
 #[cfg(test)]
 #[path = "../tests/support/discovery.rs"]
 mod corpus_discovery;
-
-#[cfg(test)]
-mod admit_identifier_tests {
-    use super::*;
-
-    fn flags(src: &str) -> bool {
-        audit_hygiene(&strip_lean_comments(src)).has_sorry
-    }
-
-    #[test]
-    fn admit_tactic_is_flagged() {
-        for src in [
-            "theorem t : False := by admit",
-            "theorem t : False := by\n  admit",
-            "theorem t : False := by\n  · admit",
-            "theorem t : False := by admit; rfl",
-            "theorem t : False := by first | admit | rfl",
-            "theorem t : False := by (admit)",
-            "theorem t : False := by\n  admit -- later",
-        ] {
-            assert!(flags(src), "{src}");
-        }
-    }
-
-    #[test]
-    fn admit_identifier_is_not_flagged() {
-        for src in [
-            "def f (x : Nat) : Bool :=\n  let admit : Bool := x > 0\n  if admit then true else false",
-            "def g (admit : Nat → Bool) (x : Nat) : Bool := admit x",
-            "structure Gate where\n  admit : Nat → Bool\n  sound : ∀ x, admit x = true → x > 0",
-            "theorem h (C : Gate) (r : Nat) : C.admit r = C.admit r := rfl",
-            "def k (admit : Bool) : Bool := if !admit then false else true",
-        ] {
-            assert!(!flags(src), "{src}");
-        }
-    }
-
-    #[test]
-    fn sorry_still_flagged() {
-        assert!(flags("theorem t : False := sorry"));
-    }
-}
