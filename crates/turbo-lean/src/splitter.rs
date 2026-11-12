@@ -1963,8 +1963,18 @@ fn contains_word(haystack: &str, word: &str) -> bool {
 /// `admit` as a tactic (next token ends it), not a binder/field/application; kernel rejects its `sorryAx` anyway.
 fn contains_admit_tactic(line: &str) -> bool {
     lean_word_ends(line, "admit", true).any(|end| {
+        let before = line[..end - "admit".len()].trim_end();
+        let prev_ok = before.is_empty()
+            || before.ends_with(['·', ';', '>', '|', '('])
+            || ["by", "try", "repeat", "all_goals", "any_goals", "focus"]
+                .iter()
+                .any(|kw| {
+                    before.strip_suffix(kw).is_some_and(|p| {
+                        p.is_empty() || !p.chars().next_back().is_some_and(is_lean_id_rest)
+                    })
+                });
         let rest = line[end..].trim_start();
-        rest.is_empty() || rest.starts_with([';', '<', '|', ')', ']', '}', '⟩', ','])
+        prev_ok && (rest.is_empty() || rest.starts_with([';', '<', '|', ')']))
     })
 }
 
@@ -10816,6 +10826,12 @@ mod tests {
             "by admit; rfl",
             "by first | admit | rfl",
             "by (admit)",
+            "by try admit",
+            "by repeat admit",
+            "by all_goals admit",
+            "by any_goals admit",
+            "by focus admit",
+            "by trivial <;> admit",
         ] {
             assert!(flags(&format!("theorem t : False := {src}")), "{src}");
         }
@@ -10824,6 +10840,8 @@ mod tests {
             "fun (admit : Nat → Bool) => admit x",
             "C.admit r = true",
             "if !admit then 0 else 1",
+            "by\n  cases admit <;> cases live <;> rfl",
+            "⟨admit, live⟩",
         ] {
             assert!(!flags(&format!("def f := {src}")), "{src}");
         }
