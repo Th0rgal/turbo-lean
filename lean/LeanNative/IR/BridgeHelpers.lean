@@ -2343,8 +2343,11 @@ def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
         let retVar ← freshBridgeVar retTy
         let lnirParams := (decl.params.toList.zip (paramIds.zip paramTypesList)).map fun (p, (vid, pTy)) =>
           { id := vid, name := p.binderName.toString, ty := pTy, borrow := p.borrow : LNIRParam }
-        return { name := metaInfo.mangledSymbol, params := lnirParams, retTy,
-          body := .letBind retVar retTy (.call symbol paramIds retTy false) (.ret retVar),
+        return {
+          name := metaInfo.mangledSymbol
+          params := lnirParams
+          retTy := retTy
+          body := .letBind retVar retTy (.call symbol paramIds retTy false) (.ret retVar)
           assurance := .tested }
       if let some intrExpr := tryLowerGfSimdIntrinsic env decl.name paramIds retTy paramTypesList then
         let retVar ← freshBridgeVar retTy
