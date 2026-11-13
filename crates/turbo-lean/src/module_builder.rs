@@ -34508,6 +34508,7 @@ globs = ["Demo.+"]
 
         let mut store = TurboStore::open(Some(&store_dir)).unwrap();
         // Run across the diamond DAG (Wave 0: Root, Wave 1: Left + Right in parallel, Wave 2: Top)
+        let trace = ScopedSchedulerTrace::start(None);
         crate::check::reset_phases();
         let rep = build_project_modules_native(
             &mut store,
@@ -34523,6 +34524,19 @@ globs = ["Demo.+"]
         assert_eq!(rep.modules_total, 4);
         assert_eq!(rep.modules_compiled, 4);
         assert_eq!(rep.waves_count, 3);
+        let audit_events = trace.take_events();
+        assert!(
+            audit_events
+                .iter()
+                .any(|e| e.kind == "audit_subprocess_start"),
+            "fixture must execute real audit subprocess work: {audit_events:?}"
+        );
+        assert!(
+            audit_events
+                .iter()
+                .any(|e| e.kind == "audit_subprocess_end"),
+            "audit subprocess must finish: {audit_events:?}"
+        );
         let mut timing = serde_json::json!({});
         crate::check::insert_check_timings(&mut timing, std::time::Instant::now());
         assert!(

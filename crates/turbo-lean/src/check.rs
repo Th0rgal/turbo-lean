@@ -157,8 +157,6 @@ mod wallclock_tests {
                 assert!(!inner.outer);
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 drop(inner);
-                // Inner destruction must add exactly nothing, independent of
-                // scheduling jitter or timer resolution.
                 assert_eq!(phase_context().lock().unwrap().kernel_ms, 0);
                 drop(outer);
             });
