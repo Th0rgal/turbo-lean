@@ -10063,6 +10063,7 @@ pub(crate) fn try_zygote_url_check_shard_inner_with_inflight_detailed(
     req: &CheckShardHttpRequest,
     on_inflight: impl FnOnce(),
 ) -> Result<Option<serde_json::Value>> {
+    let _elab_timer = crate::check::PhaseTimer::start("elab");
     if daemon_disabled() {
         return Ok(None);
     }
@@ -10089,6 +10090,7 @@ pub fn try_local_zygote_check_shard_detailed(
     env_vars: &std::collections::HashMap<String, String>,
     req: &CheckShardHttpRequest,
 ) -> Result<Option<serde_json::Value>> {
+    let _elab_timer = crate::check::PhaseTimer::start("elab");
     crate::module_builder::validate_lean_args(&req.lean_args)?;
     crate::splitter::reject_checking_weakening(&req.shard_source)?;
     let Some((base_url, auth_token)) = ensure_local_zygote_daemon_with_token(store, env_vars)
