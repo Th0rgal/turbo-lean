@@ -2256,8 +2256,19 @@ def tryLowerBoundedTailRecBody? (d : LNIRDecl) : Option LNIRCode := do
   let ip ← d.params.find? (·.id == idx)
   let np ← d.params.find? (·.id == bound)
   guard ((ip.ty == .i64 || ip.ty == .usize) && np.ty == ip.ty)
-  let step := if stepThen then t else e
+  let rawStep := if stepThen then t else e
   let exit := if stepThen then e else t
+  -- Impure Bool cases may retain the complementary constructor check followed
+  -- by unreachable. On the selected path its truth value is already fixed.
+  let (stepHeader, stepBranch) := peelTailLets rawStep
+  let step ← match stepBranch with
+    | .ite innerCond body .unreachable => do
+      let test := resolveTailScalar (header ++ stepHeader)
+        (header.length + stepHeader.length + 4) (.var innerCond)
+      guard (test == .binOp .eq (.select (.binOp .lt (.var idx) (.var bound))
+        (.constU64 1) (.constU64 0)) (.constU64 1))
+      some (stepHeader.foldr (fun (v, ty, rhs) k => .letBind v ty rhs k) body)
+    | _ => some rawStep
   let rec exitReturn? : LNIRCode → Option VarId
     | .ret v => some v
     | .letBind _ _ (.scalar _) k | .incRef _ _ k | .decRef _ _ k => exitReturn? k
