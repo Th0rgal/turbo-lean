@@ -3,7 +3,7 @@
 
 Requires the manifest-pinned lean-sys checkout at lean/.lake/packages/lean-sys.
 Uses turbo-lean for Lean artifacts, then sequential C compilation and shared
-Lean runtime linking (turbo-lean build currently does not link executables).
+Lean runtime linking if the installed turbo-lean does not link executables.
 """
 import argparse
 import hashlib
@@ -57,30 +57,42 @@ def main():
     if main_c not in sources:
         raise RuntimeError(f'missing compiler entrypoint: {main_c}')
     sources.append(dep / 'c/lean_sys_shim.c')
-    objdir = evidence / 'objects'
-    objdir.mkdir(exist_ok=True)
-    objects = []
-    for i, source in enumerate(sources):
-        obj = objdir / f'{i:04d}.o'
-        # The bootstrap has no native CPU requirement and exports interpreter symbols.
-        run(['/usr/bin/clang', '-O2', '-DNDEBUG', '-DLEAN_EXPORTING', '-fPIC',
-             '-I', sysroot / 'include', '-c', source, '-o', obj])
-        objects.append(obj)
-        print(f'C {i + 1}/{len(sources)} {source.name}', flush=True)
     binary = project / '.lake/build/bin' / args.target
-    binary.parent.mkdir(parents=True, exist_ok=True)
-    pending = binary.with_suffix('.pending')
-    run(['/usr/bin/clang', '-rdynamic', *objects, '-L', sysroot / 'lib/lean',
-         '-Wl,-rpath,' + str(sysroot / 'lib/lean'), '-lleanshared', '-lpthread', '-ldl',
-         '-lm', '-o', pending])
-    pending.replace(binary)
+    native_from_turbo = binary.is_file() and all(
+        binary.stat().st_mtime_ns >= source.stat().st_mtime_ns for source in sources)
+    if not native_from_turbo:
+        objdir = evidence / 'objects'
+        objdir.mkdir(exist_ok=True)
+        objects = []
+        for i, source in enumerate(sources):
+            obj = objdir / f'{i:04d}.o'
+            # No native CPU requirement; export symbols for the Lean interpreter.
+            run(['/usr/bin/clang', '-O2', '-DNDEBUG', '-DLEAN_EXPORTING', '-fPIC',
+                 '-I', sysroot / 'include', '-c', source, '-o', obj])
+            objects.append(obj)
+            print(f'C {i + 1}/{len(sources)} {source.name}', flush=True)
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        pending = binary.with_suffix('.pending')
+        run(['/usr/bin/clang', '-rdynamic', *objects, '-L', sysroot / 'lib/lean',
+             '-Wl,-rpath,' + str(sysroot / 'lib/lean'), '-lleanshared', '-lpthread', '-ldl',
+             '-lm', '-o', pending])
+        pending.replace(binary)
     run([binary, '--help'])
+    smoke = evidence / 'BootstrapSmoke.lean'
+    smoke.write_text('@[export bootstrap_add]\ndef bootstrapAdd (a b : UInt64) : UInt64 := a + b\n')
+    wire = evidence / 'bootstrap-smoke.lnir'
+    run([binary, 'emit-lnir', smoke, '--wire', '-o', wire])
+    values = json.loads(run([binary, 'eval-lnir', '--lnir', wire, '--batch-json',
+                            '--args', 'bootstrap_add:7,5']))
+    if not any(row['decl'] == 'bootstrap_add' and int(row['value_u64']) == 12 for row in values):
+        raise RuntimeError(f'bootstrap source-ingestion smoke failed: {values}')
     manifest = dict(source=run(['git', 'rev-parse', 'HEAD'], repo),
                     lean_sys_source=run(['git', 'rev-parse', 'HEAD'], dep),
                     lean_version=version, sysroot=str(sysroot), binary=str(binary),
                     sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
                     bytes=binary.stat().st_size, native_sources=len(sources),
-                    linking='dynamic libleanshared; matching Lean toolchain required')
+                    native_linked_by_turbo=native_from_turbo, bootstrap_smoke=values,
+                    linking=run(['ldd', binary]))
     (evidence / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
     print(json.dumps(manifest, indent=2))
 
