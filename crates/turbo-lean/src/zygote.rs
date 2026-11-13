@@ -5123,6 +5123,7 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
     is_untrusted: bool,
     pinned_dir_raw_fd: Option<i32>,
 ) -> Result<()> {
+    let _kernel_timer = crate::check::PhaseTimer::start("kernel");
     for m in mod_names {
         anyhow::ensure!(
             !m.trim().is_empty(),
@@ -5494,6 +5495,7 @@ fn audit_module_batch_exec_pinned_with_mode(
     pinned_dir_raw_fd: Option<i32>,
     audit_imports: bool,
 ) -> Result<()> {
+    let _kernel_timer = crate::check::PhaseTimer::start("kernel");
     if mod_names.is_empty() || mod_names.iter().any(|m| m.trim().is_empty()) {
         anyhow::bail!("In-kernel `.olean` audit received an empty module name: fail-closed");
     }
