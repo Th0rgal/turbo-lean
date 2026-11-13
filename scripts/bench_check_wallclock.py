@@ -121,25 +121,33 @@ def concurrency(args, cache):
             (args.batteries_dir / "lean-toolchain").read_bytes())
         (project / "lakefile.toml").write_text(
             'name = "wallclock_agents"\n[[require]]\nname = "batteries"\n'
-            f'path = "{args.batteries_dir}"\n[[lean_lib]]\nname = "Agent"\n')
+            'git = "https://github.com/leanprover-community/batteries.git"\n'
+            '[[lean_lib]]\nname = "Agent"\n')
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=args.batteries_dir, text=True).strip()
+        packages = project / ".lake/packages"
+        packages.mkdir(parents=True)
+        (packages / "batteries").symlink_to(args.batteries_dir, target_is_directory=True)
         (project / "lake-manifest.json").write_text(json.dumps({
             "version": "1.2.0", "packagesDir": ".lake/packages",
             "name": "wallclock_agents", "lakeDir": ".lake",
-            "packages": [{"type": "path", "name": "batteries",
-                          "dir": str(args.batteries_dir),
+            "packages": [{"type": "git", "name": "batteries",
+                          "url": "https://github.com/leanprover-community/batteries.git",
+                          "rev": revision, "inputRev": revision, "subDir": None,
+                          "manifestFile": "lake-manifest.json",
                           "configFile": "lakefile.toml", "inherited": False}]}))
         directory = project
         files = []
         for i in range(8):
             file = directory / f"Agent{i}.lean"
-            file.write_text("import Batteries.Data.List.Lemmas\n"
+            file.write_text("import Batteries.Data.List.Basic\n"
                             f"theorem agent_work : {i} = {i} := by rfl\n")
             files.append(file)
         # Materialize the exact shared import closure before launching clients.
         # Lake publication during the measured window would benchmark a build
         # race rather than eight checks against one stable environment.
         prepared = subprocess.run(
-            ["lake", "build", "+Batteries.Data.List.Lemmas"], cwd=project,
+            ["lake", "build", "+Batteries.Data.List.Basic"], cwd=project,
             capture_output=True, text=True, timeout=args.timeout + 30, check=False)
         if prepared.returncode:
             raise RuntimeError("concurrency import preparation failed: " + prepared.stderr)
@@ -151,7 +159,7 @@ def concurrency(args, cache):
         if evidence.is_file():
             evidence.write_text("")
         for i, file in enumerate(files):
-            file.write_text("import Batteries.Data.List.Lemmas\n"
+            file.write_text("import Batteries.Data.List.Basic\n"
                             f"theorem agent_work : {i + 100} = {i + 100} := by rfl\n")
         stop = threading.Event()
         peak = [0.0]
