@@ -864,14 +864,14 @@ partial def rewriteImpureUset64LETypes (env : Lean.Environment) :
         else d
       | _ => d
     .let d (rewriteImpureUset64LETypes env k)
-  | .jp d k => .jp { d with value := rewriteImpureUset64LETypes env d.value }
+  | .jp d k => .jp (d.updateCore d.type d.params (rewriteImpureUset64LETypes env d.value))
       (rewriteImpureUset64LETypes env k)
-  | .fun d k h => .fun { d with value := rewriteImpureUset64LETypes env d.value }
+  | .fun d k h => .fun (d.updateCore d.type d.params (rewriteImpureUset64LETypes env d.value))
       (rewriteImpureUset64LETypes env k) h
-  | .cases c => .cases { c with alts := c.alts.map fun alt => match alt with
+  | .cases c => .cases (c.updateAlts (c.alts.map fun alt => match alt with
       | .alt n ps b h => .alt n ps (rewriteImpureUset64LETypes env b) h
       | .ctorAlt info b h => .ctorAlt info (rewriteImpureUset64LETypes env b) h
-      | .default b => .default (rewriteImpureUset64LETypes env b) }
+      | .default b => .default (rewriteImpureUset64LETypes env b)))
   | .inc v n c p k h => .inc v n c p (rewriteImpureUset64LETypes env k) h
   | .dec v n c p q k h => .dec v n c p q (rewriteImpureUset64LETypes env k) h
   | other => other
@@ -2293,7 +2293,7 @@ def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
     (allowRcAdt : Bool := false) : Lean.CoreM LNIRDecl := do
   let env ← getEnv
   let decl := if collectEnvExplicitReturnType? env decl.name == some (.sarray .i8) then
-    { decl with type := Lean.mkConst ``ByteArray,
+    { decl with type := (Lean.mkConst ``ByteArray),
       value := decl.value.mapCode (rewriteImpureUset64LETypes env) }
     else { decl with value := decl.value.mapCode (rewriteImpureUset64LETypes env) }
   if ← declUsesSignedScalarTransitively decl then
