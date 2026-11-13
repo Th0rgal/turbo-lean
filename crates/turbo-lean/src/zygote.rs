@@ -7795,6 +7795,17 @@ fn eval_with_zygote_pool_attempt(
                         mark_runtime_panic(&mut parsed, stderr_panic);
                         parsed.scanner_version = ZYGOTE_SCANNER_VERSION;
                         parsed.replay_version = ZYGOTE_REPLAY_VERSION;
+                        if parsed.ok && parsed.import_ok && worker.clone_pid.is_some() {
+                            // Opt-in benchmark evidence is emitted only after a real
+                            // fork-clone request returns a successful vetted reply.
+                            if let Some(path) = std::env::var_os("TURBO_LEAN_FORK_EVIDENCE") {
+                                if let Ok(mut file) =
+                                    fs::OpenOptions::new().create(true).append(true).open(path)
+                                {
+                                    let _ = writeln!(file, "{} {}", std::process::id(), pid);
+                                }
+                            }
+                        }
                         WorkerReqOutcome::Reply(parsed)
                     }
                     Err(e) => {

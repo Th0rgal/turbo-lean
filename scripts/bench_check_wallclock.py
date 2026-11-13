@@ -37,6 +37,7 @@ def check(binary, project, file, cache, timeout, decl=None, workload=None):
     env = os.environ.copy()
     if workload:
         env["TURBO_WALLCLOCK_WORKLOAD"] = workload
+        env["TURBO_LEAN_FORK_EVIDENCE"] = str(cache / "fork-evidence.log")
     try:
         proc = subprocess.run(command, capture_output=True, text=True,
                               timeout=timeout + 30, check=False, env=env)
@@ -146,6 +147,8 @@ def concurrency(args, cache):
         finally:
             stop.set()
             sampler.join()
+        evidence = cache / "fork-evidence.log"
+        fork_requests = evidence.read_text().splitlines() if evidence.is_file() else []
     walls = sorted(result["external_wall_ms"] for result in results)
     return {"work_units": len(results),
             "error_count": sum(not result["ok"] for result in results),
@@ -153,7 +156,8 @@ def concurrency(args, cache):
             "wall_p50_ms": statistics.median(walls),
             "wall_p95_ms": walls[math.ceil(0.95 * len(walls)) - 1],
              "pss_scope": "peak summed Linux PSS of uniquely marked workload processes",
-             "cow_fork_verified": False,
+             "cow_fork_verified": bool(fork_requests),
+             "successful_fork_requests": fork_requests,
             "warmup": warmup, "results": results}
 
 
@@ -206,7 +210,8 @@ def main():
     return int(any(not row.get("warm_cache_under_100_ms", False)
                    or not row.get("warm_edit_under_500_ms", False)
                    for row in report["latency"])
-               or report["concurrency"]["error_count"] != 0)
+               or report["concurrency"]["error_count"] != 0
+               or not report["concurrency"]["cow_fork_verified"])
 
 
 if __name__ == "__main__":
