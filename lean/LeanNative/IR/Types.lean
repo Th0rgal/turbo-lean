@@ -86,6 +86,39 @@ def gf2Affine (x m : UInt64) : UInt64 :=
 /-- Three-input xor. The third input is the low half of `b`, the second its high half. -/
 def eor3 (a b : UInt64) : UInt64 := a ^^^ (b >>> 32) ^^^ (b &&& 0xffffffff)
 
+/-- Eight independent byte affine maps, with GFNI's high-byte-first matrix rows.
+    The immediate is masked to eight bits, as in the machine instruction. -/
+def gf2Affine64 (x m imm8 : UInt64) : UInt64 :=
+  Fin.foldl 8 (fun out b =>
+    let xb := (x >>> (b.val.toUInt64 * 8)) &&& 0xff
+    let y := Fin.foldl 8 (fun acc i =>
+      let row := m >>> ((7 - i.val.toUInt64) * 8)
+      let parity := Fin.foldl 8 (fun p j =>
+        p ^^^ (((row >>> j.val.toUInt64) &&& 1) &&& ((xb >>> j.val.toUInt64) &&& 1))) 0
+      acc ||| (parity <<< i.val.toUInt64)) 0
+    out ||| ((y ^^^ (imm8 &&& 0xff)) <<< (b.val.toUInt64 * 8))) 0
+
+/-- Intel ternary truth-table order: bit index `(a << 2) | (b << 1) | c`. -/
+def ternaryLogic64 (a b c imm8 : UInt64) : UInt64 :=
+  Fin.foldl 64 (fun out i =>
+    let s := i.val.toUInt64
+    let idx := (((a >>> s) &&& 1) <<< 2) ||| (((b >>> s) &&& 1) <<< 1) ||| ((c >>> s) &&& 1)
+    out ||| (((imm8 >>> idx) &&& 1) <<< s)) 0
+
+/-- Checked little-endian word read at a byte offset; out-of-range reads return zero. -/
+def uget64LE (a : @& ByteArray) (byteOff : USize) : UInt64 :=
+  if byteOff.toNat + 8 <= a.size then
+    Fin.foldl 8 (fun out i =>
+      out ||| ((a.get! (byteOff.toNat + i.val)).toUInt64 <<< (i.val.toUInt64 * 8))) 0
+  else 0
+
+/-- Checked little-endian word update at a byte offset; out-of-range writes do nothing. -/
+def uset64LE (a : ByteArray) (byteOff : USize) (val : UInt64) : ByteArray :=
+  if byteOff.toNat + 8 <= a.size then
+    Fin.foldl 8 (fun out i =>
+      out.set! (byteOff.toNat + i.val) (val >>> (i.val.toUInt64 * 8)).toUInt8) a
+  else a
+
 /-- Variable identifier in LNIR SSA/ANF form. -/
 abbrev VarId := Nat
 

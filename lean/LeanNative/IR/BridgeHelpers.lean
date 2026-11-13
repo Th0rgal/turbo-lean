@@ -175,6 +175,7 @@ def exprCodomainIsProp (env? : Option Lean.Environment) (e : Lean.Expr) : Bool :
   | _ => false
 
 partial def lowerImpureType (e : Lean.Expr) (env? : Option Lean.Environment := none) : LNIRType :=
+  let e := e.consumeMData
   if e == ImpureType.uint8 then .i8
   else if e == ImpureType.uint16 then .i16
   else if e == ImpureType.uint32 then .i32
@@ -371,7 +372,7 @@ def checkEnvConstSignatureM (env : Lean.Environment) (declName : Lean.Name) (arc
       else
         let dTy := lowerImpureType dom (some env)
         if isExported then
-          validateSupportedTypeM s!"exported parameter `{pName}` of `{declName}`" dom dTy arch false false false
+          validateSupportedTypeM s!"exported parameter `{pName}` of `{declName}`" dom dTy arch false (dTy == .sarray .i8) false
           if dTy matches (.tuple _) then
             Lean.throwError s!"[lean-native] Unsupported exported tuple parameter `{pName}` in `{declName}`"
         else if !(isStage1D && isSupportedStage1DHeapAdtExpr env arch dom) then
@@ -381,7 +382,7 @@ def checkEnvConstSignatureM (env : Lean.Environment) (declName : Lean.Name) (arc
       if !retExpr.hasLooseBVars then
         let rTy := lowerImpureType retExpr (some env)
         if isExported then
-          validateSupportedTypeM s!"exported return type of `{declName}`" retExpr rTy arch false false false
+          validateSupportedTypeM s!"exported return type of `{declName}`" retExpr rTy arch false (rTy == .sarray .i8) false
           if rTy matches (.tuple _) then
             Lean.throwError s!"[lean-native] Unsupported exported tuple return type in `{declName}`"
         else if !(isStage1D && isSupportedStage1DHeapAdtExpr env arch retExpr) then
@@ -754,6 +755,76 @@ def tryLowerGfSimdIntrinsic (env : Lean.Environment) (fnName : Lean.Name) (argVa
       (trustedGfSimdIntrinsicOp env fnName).map fun op => .scalar (.binOp op (.var lhs) (.var rhs))
     else none
   | _ => none
+
+private def intrinsicConstNames : Lean.Expr → List Lean.Name
+  | .const n _ => [n]
+  | .app f a => intrinsicConstNames f ++ intrinsicConstNames a
+  | .lam _ t b _ | .forallE _ t b _ => intrinsicConstNames t ++ intrinsicConstNames b
+  | .letE _ t v b _ => intrinsicConstNames t ++ intrinsicConstNames v ++ intrinsicConstNames b
+  | .mdata _ e | .proj _ _ e => intrinsicConstNames e
+  | _ => []
+
+/-- Compare the complete definition graph owned by an intrinsic, including its
+    generated fold helpers. A familiar name or matching signature is insufficient. -/
+def matchesCanonicalIntrinsic (env : Lean.Environment) (actual reference : Lean.Name) : Bool :=
+  let rec check (fuel : Nat) (seen : List Lean.Name) (todo : List Lean.Name) : Bool :=
+    match todo, fuel with
+    | [], _ => true
+    | _ :: _, 0 => false
+    | n :: rest, fuel + 1 =>
+      if seen.contains n then check fuel seen rest
+      else
+        let r := n.replacePrefix actual reference
+        match env.find? n, env.find? r with
+        | some (.defnInfo d), some (.defnInfo rd) =>
+          !Lean.isExtern env n && d.safety == rd.safety && d.levelParams == rd.levelParams &&
+          normalizeIntrinsicDecl actual d.type == normalizeIntrinsicDecl reference rd.type &&
+          normalizeIntrinsicDecl actual d.value == normalizeIntrinsicDecl reference rd.value &&
+          check fuel (n :: seen)
+            (((intrinsicConstNames d.value).filter actual.isPrefixOf).eraseDups ++ rest)
+        | _, _ => false
+  check 256 [] [actual]
+
+def trustedG0IntrinsicCall? (env : Lean.Environment) (fnName : Lean.Name) : Option String := do
+  let (reference, symbol) ← match fnName with
+    | .str _ "uget64LE" => some (``LeanNative.IR.uget64LE, "lean_native_sarray_uget64_le")
+    | .str _ "uset64LE" => some (``LeanNative.IR.uset64LE, "lean_native_sarray_uset64_le")
+    | .str _ "gf2Affine64" => some (``LeanNative.IR.gf2Affine64, "lean_native_gf2_affine64")
+    | .str _ "ternaryLogic64" => some (``LeanNative.IR.ternaryLogic64, "lean_native_ternary_logic64")
+    | _ => none
+  guard (matchesCanonicalIntrinsic env fnName reference)
+  return symbol
+
+def collectEnvExplicitReturnType? (env : Lean.Environment) (name : Lean.Name) : Option LNIRType := do
+  let info ← env.find? name
+  let rec result : Lean.Expr → Lean.Expr
+    | .forallE _ _ body _ => result body
+    | e => e
+  return lowerImpureType (result info.type) (some env)
+
+/-- Recover ByteArray results erased to `lcObj` by impure conversion. Restore
+    types at each call site, without treating every object as a byte array. -/
+partial def rewriteImpureUset64LETypes (env : Lean.Environment) :
+    Lean.Compiler.LCNF.Code .impure → Lean.Compiler.LCNF.Code .impure
+  | .let d k =>
+    let d := match d.value with
+      | .fap n _ _ =>
+        if collectEnvExplicitReturnType? env n == some (.sarray .i8) then
+          { d with type := Lean.mkConst ``ByteArray }
+        else d
+      | _ => d
+    .let d (rewriteImpureUset64LETypes env k)
+  | .jp d k => .jp { d with value := rewriteImpureUset64LETypes env d.value }
+      (rewriteImpureUset64LETypes env k)
+  | .fun d k h => .fun { d with value := rewriteImpureUset64LETypes env d.value }
+      (rewriteImpureUset64LETypes env k) h
+  | .cases c => .cases { c with alts := c.alts.map fun alt => match alt with
+      | .alt n ps b h => .alt n ps (rewriteImpureUset64LETypes env b) h
+      | .ctorAlt info b h => .ctorAlt info (rewriteImpureUset64LETypes env b) h
+      | .default b => .default (rewriteImpureUset64LETypes env b) }
+  | .inc v n c p k h => .inc v n c p (rewriteImpureUset64LETypes env k) h
+  | .dec v n c p q k h => .dec v n c p q (rewriteImpureUset64LETypes env k) h
+  | other => other
 
 def internParams {pu} (params : Array (Lean.Compiler.LCNF.Param pu)) (allowInternalObj : Bool := false) : BridgeM Unit := do
   for p in params do
@@ -1395,7 +1466,9 @@ private def isBuiltinLNIRRuntimeCall (fn : String) : Bool :=
   fn == "lean_native_ctor_tag" || fn == "lean_native_ctor_set" ||
   fn == "lean_native_ctor_set_scalar" || fn == "lean_native_ctor_set_tag" || fn == "lean_native_del_obj" ||
   fn == "lean_native_box_u64" || fn == "lean_native_unbox_u64" ||
-  fn == "lean_native_ensure_exclusive" || fn == "lean_native_sarray_len"
+  fn == "lean_native_ensure_exclusive" || fn == "lean_native_sarray_len" ||
+  fn == "lean_native_sarray_uget64_le" || fn == "lean_native_sarray_uset64_le" ||
+  fn == "lean_native_gf2_affine64" || fn == "lean_native_ternary_logic64"
 
 partial def collectDirectCallees : LNIRCode → List String
   | .letBind _ _ (.call fn _ _ isExt) k =>
@@ -1804,14 +1877,14 @@ partial def checkImpureLetTypesM (code : Lean.Compiler.LCNF.Code .impure) : Brid
       | _ => false
     if !hasStage1DScalarLayout then
       let rawDeclTy ← lowerBridgeType decl.type
-      if rawDeclTy != .unit then checkBridgeType s!"let binding `{decl.binderName}`" decl.type rawDeclTy true
+      if rawDeclTy != .unit then checkBridgeType s!"let binding `{decl.binderName}`" decl.type rawDeclTy true (rawDeclTy == .sarray .i8)
     checkImpureLetTypesM k
   | .jp decl k =>
     let jpTy ← lowerBridgeType decl.type
-    checkBridgeType "join-point result" decl.type jpTy true
+    checkBridgeType "join-point result" decl.type jpTy true (jpTy == .sarray .i8)
     for p in decl.params do
       let pTy ← lowerBridgeType p.type
-      checkBridgeType "parameter" p.type pTy true
+      checkBridgeType "parameter" p.type pTy true (pTy == .sarray .i8)
     checkImpureLetTypesM decl.value
     checkImpureLetTypesM k
   | .cases c =>
@@ -1865,8 +1938,11 @@ def buildRealBridgeCtxM (typeExprs : List Lean.Expr) (ctorSeeds calleeSeeds : Li
       if !gfSimdIntrinsics.any (fun (n, _) => n == fn) then
         gfSimdIntrinsics := gfSimdIntrinsics ++ [(fn, op)]
   let mut localCallees : List (Lean.Name × String) := []
+  for fn in calleeSeeds do
+    if let some symbol := trustedG0IntrinsicCall? env fn then
+      localCallees := localCallees ++ [(fn, symbol)]
   for fn in localNames do
-    if !Lean.isExtern env fn &&
+    if !Lean.isExtern env fn && (trustedG0IntrinsicCall? env fn).isNone &&
        (RealLCNFBridge.lowerCanonicalIntrinsicPure? fn [0, 1] .i64 [.i64, .i64] true st.arch gfSimdIntrinsics).isNone &&
        (trustedGfSimdIntrinsicOp env fn).isNone then
       if !localCallees.any (fun (n, _) => n == fn) then
@@ -2041,6 +2117,10 @@ def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
     (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64)
     (allowRcAdt : Bool := false) : Lean.CoreM LNIRDecl := do
   let env ← getEnv
+  let decl := if collectEnvExplicitReturnType? env decl.name == some (.sarray .i8) then
+    { decl with type := Lean.mkConst ``ByteArray,
+      value := decl.value.mapCode (rewriteImpureUset64LETypes env) }
+    else { decl with value := decl.value.mapCode (rewriteImpureUset64LETypes env) }
   if ← declUsesSignedScalarTransitively decl then
     Lean.throwError s!"[lean-native] Unsupported signed integer type (`Int*` / `ISize`) in `{decl.name}`"
   let metaInfo := getLCNFDeclMetadata env decl.name
@@ -2069,20 +2149,27 @@ def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
           | some (.sarray .f64) => .sarray .f64
           | _ => rawPTy
         else rawPTy
-      if isSupportedSliceType pTy && !p.borrow then
+      if isSupportedSliceType pTy && pTy != .sarray .i8 && !p.borrow then
         Lean.throwError s!"[lean-native] Non-borrowed slice parameter `{p.binderName}` in `{decl.name}` requires borrow (@&)"
-      checkBridgeType s!"parameter `{p.binderName}` of `{decl.name}`" p.type pTy true (!isExported)
+      checkBridgeType s!"parameter `{p.binderName}` of `{decl.name}`" p.type pTy true (!isExported || pTy == .sarray .i8)
       let vid ← internFVar p.fvarId pTy true
       paramTypeMap := paramTypeMap ++ [(p.fvarId, pTy)]
       paramTypesList := paramTypesList ++ [pTy]
       paramIds := paramIds ++ [vid]
       pIdx := pIdx + 1
     let retTy ← lowerBridgeType decl.type
-    checkBridgeType s!"return type of `{decl.name}`" decl.type retTy true
+    checkBridgeType s!"return type of `{decl.name}`" decl.type retTy true (retTy == .sarray .i8)
     match decl.value with
     | .extern _ =>
       Lean.throwError s!"[lean-native] Unsupported `@[extern]` declaration `{decl.name}` in Stage 1B"
     | .code c =>
+      if let some symbol := trustedG0IntrinsicCall? env decl.name then
+        let retVar ← freshBridgeVar retTy
+        let lnirParams := (decl.params.toList.zip (paramIds.zip paramTypesList)).map fun (p, (vid, pTy)) =>
+          { id := vid, name := p.binderName.toString, ty := pTy, borrow := p.borrow : LNIRParam }
+        return { name := metaInfo.mangledSymbol, params := lnirParams, retTy,
+          body := .letBind retVar retTy (.call symbol paramIds retTy false) (.ret retVar),
+          assurance := .tested }
       if let some intrExpr := tryLowerGfSimdIntrinsic env decl.name paramIds retTy paramTypesList then
         let retVar ← freshBridgeVar retTy
         let lnirParams := (decl.params.toList.zip (paramIds.zip paramTypesList)).map fun (p, (vid, pTy)) =>

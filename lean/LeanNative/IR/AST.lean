@@ -383,10 +383,11 @@ private def checkCallArgsCompat (env : List (VarId × LNIRType))
     (localSigs : List (String × List LNIRType × LNIRType))
     (callee : String) (args : List VarId) (dstTy : LNIRType) : Option String :=
   let anyBufArg := args.any (envVarHasSarray env)
-  if dstTy.containsSarray then
+  let sig? := localSigs.find? (fun (nm, pTys, _) => nm == callee && pTys.length == args.length)
+  if dstTy.containsSarray && !(sig?.any (fun (_, _, rTy) => rTy == dstTy)) then
     some "inconsistent_elem_type"
   else
-    match localSigs.find? (fun (nm, pTys, _) => nm == callee && pTys.length == args.length) with
+    match sig? with
     | some (_, pTys, _) =>
       let rec go : List VarId → List LNIRType → Option String
         | [], [] => none
@@ -491,7 +492,12 @@ private def checkExprElemTypes (env : List (VarId × LNIRType))
       if dstTy.containsSarray || args.any (envVarHasSarray env) then some "inconsistent_elem_type"
       else none
     else
-      checkCallArgsCompat env localSigs fn args dstTy
+      checkCallArgsCompat env
+        (("lean_native_sarray_uget64_le", [.sarray .i8, .usize], .i64) ::
+         ("lean_native_sarray_uset64_le", [.sarray .i8, .usize, .i64], .sarray .i8) ::
+         ("lean_native_gf2_affine64", [.i64, .i64, .i64], .i64) ::
+         ("lean_native_ternary_logic64", [.i64, .i64, .i64, .i64], .i64) :: localSigs)
+        fn args dstTy
   | .allocCtor _ ofs sfs =>
     if dstTy.containsSarray || sfs.any (envVarHasSarray env) ||
        ofs.any (fun fv => match env.lookup fv with | some (.tuple _) => envVarHasSarray env fv | some (.rawPtr _) => true | _ => false) then

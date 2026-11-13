@@ -1135,7 +1135,7 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
       let arrPtr ← loadVarAsPtr args.head!
       let szVal ← emitSarraySizeLoad "sz" arrPtr
       storeI64ToVar dst szVal
-    else if !isExt && slotLLVMType ty == "i64" then
+    else if !isExt && (slotLLVMType ty == "i64" || ty == .sarray .i8) then
       match localSig? with
       | some (paramTys, retSigTy) =>
         let argVals ← (args.zip paramTys).mapM fun (argVar, pTy) => do
@@ -1172,16 +1172,19 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
         else
           let callRes ← freshTmp "call"
           emitLine s!"  {callRes} = call {rAttr}{llvmRTy} @{sanitizeSymbol callee}({argSig})"
-          let callRes64 ← if llvmRTy == "i64" then pure callRes
-            else if llvmRTy == "double" then do
-              let bc ← freshTmp "call_rbc"
-              emitLine s!"  {bc} = bitcast double {callRes} to i64"
-              pure bc
-            else do
-              let zx ← freshTmp "call_zx"
-              emitLine s!"  {zx} = zext {llvmRTy} {callRes} to i64"
-              pure zx
-          storeI64ToVar dst callRes64
+          if llvmRTy == "ptr" then
+            storePtrToVar dst callRes
+          else do
+            let callRes64 ← if llvmRTy == "i64" then pure callRes
+              else if llvmRTy == "double" then do
+                let bc ← freshTmp "call_rbc"
+                emitLine s!"  {bc} = bitcast double {callRes} to i64"
+                pure bc
+              else do
+                let zx ← freshTmp "call_zx"
+                emitLine s!"  {zx} = zext {llvmRTy} {callRes} to i64"
+                pure zx
+            storeI64ToVar dst callRes64
       | none =>
         emitLine "  call void @llvm.trap()"
         storeI64ToVar dst "0"
@@ -1629,7 +1632,7 @@ def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_
     let pTy := if rawPTy == "void" then "ptr" else rawPTy
     let zAttr := sigLLVMAttr target p.ty
     let attrs :=
-      if optimized && pTy == "ptr" then " noalias noundef"
+      if optimized && pTy == "ptr" then " noundef"
       else if optimized && (pTy == "i8" || pTy == "i16" || pTy == "i32" || pTy == "i64" || pTy == "i256" || pTy == "double") then
         " " ++ zAttr ++ "noundef"
       else if zAttr != "" then " zeroext"
@@ -1676,6 +1679,84 @@ def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_
     s!"; LNIRDecl: {d.name} (assurance={d.assurance}, isGpuCand={d.isGpuCand}, rcMode={repr rcMode}, isaMask={declIsa.hwcapMask})",
     s!"define dso_local {retTypeStr} @{fnSym}({paramSigStr}) {fnAttr} \{\nentry:"
   ] ++ allocaLines ++ evmScratchLines ++ storeArgLines ++ finalState.lines ++ ["}"])
+
+/-- Checked byte-offset accessors and exact scalar crypto fallback for the
+    canonical slice intrinsics. These helpers are compiler output, not app FFI. -/
+def emitCryptoSliceHelpers (target : TargetArch) : String := Id.run do
+  if target != .x86_64 then return ""
+  let mut lines := [
+    "declare <16 x i8> @llvm.x86.vgf2p8affineqb.128(<16 x i8>, <16 x i8>, i8 immarg)",
+    "declare <64 x i8> @llvm.x86.vgf2p8affineqb.512(<64 x i8>, <64 x i8>, i8 immarg)",
+    "declare <8 x i64> @llvm.x86.pclmulqdq.512(<8 x i64>, <8 x i64>, i8 immarg)",
+    "declare <8 x i64> @llvm.x86.avx512.mask.pternlog.q.512(<8 x i64>, <8 x i64>, <8 x i64>, i32 immarg, i8)",
+    "define weak_odr i64 @lean_native_sarray_uget64_le(ptr %a, i64 %off) #5 {",
+    "entry:",
+    "  %sp = getelementptr i8, ptr %a, i64 8",
+    "  %len = load i64, ptr %sp, align 8",
+    "  %large = icmp uge i64 %len, 8",
+    "  %last = sub i64 %len, 8",
+    "  %fits = icmp ule i64 %off, %last",
+    "  %ok = and i1 %large, %fits",
+    "  br i1 %ok, label %read, label %zero",
+    "read:",
+    "  %data = getelementptr i8, ptr %a, i64 24",
+    "  %p = getelementptr i8, ptr %data, i64 %off",
+    "  %v = load i64, ptr %p, align 1",
+    "  ret i64 %v",
+    "zero:",
+    "  ret i64 0",
+    "}",
+    "define weak_odr ptr @lean_native_sarray_uset64_le(ptr %a, i64 %off, i64 %val) #5 {",
+    "entry:",
+    "  %sp = getelementptr i8, ptr %a, i64 8",
+    "  %len = load i64, ptr %sp, align 8",
+    "  %large = icmp uge i64 %len, 8",
+    "  %last = sub i64 %len, 8",
+    "  %fits = icmp ule i64 %off, %last",
+    "  %ok = and i1 %large, %fits",
+    "  br i1 %ok, label %write, label %skip",
+    "write:",
+    "  %excl = call ptr @lean_native_ensure_exclusive_e1(ptr %a)",
+    "  %data = getelementptr i8, ptr %excl, i64 24",
+    "  %p = getelementptr i8, ptr %data, i64 %off",
+    "  store i64 %val, ptr %p, align 1",
+    "  ret ptr %excl",
+    "skip:",
+    "  ret ptr %a",
+    "}",
+    "define weak_odr i64 @lean_native_gf2_affine64(i64 %x, i64 %m, i64 %imm) #4 {",
+    "entry:",
+    "  %vx = insertelement <2 x i64> zeroinitializer, i64 %x, i32 0",
+    "  %vm = insertelement <2 x i64> zeroinitializer, i64 %m, i32 0",
+    "  %bx = bitcast <2 x i64> %vx to <16 x i8>",
+    "  %bm = bitcast <2 x i64> %vm to <16 x i8>",
+    "  %aff = call <16 x i8> @llvm.x86.vgf2p8affineqb.128(<16 x i8> %bx, <16 x i8> %bm, i8 0)",
+    "  %words = bitcast <16 x i8> %aff to <2 x i64>",
+    "  %low = extractelement <2 x i64> %words, i32 0",
+    "  %ib = and i64 %imm, 255",
+    "  %rep = mul i64 %ib, 72340172838076673",
+    "  %res = xor i64 %low, %rep",
+    "  ret i64 %res",
+    "}",
+    "define weak_odr i64 @lean_native_ternary_logic64(i64 %a, i64 %b, i64 %c, i64 %imm) #5 {",
+    "entry:",
+    "  %na = xor i64 %a, -1",
+    "  %nb = xor i64 %b, -1",
+    "  %nc = xor i64 %c, -1" ]
+  for i in [:8] do
+    let a := if i / 4 == 0 then "%na" else "%a"
+    let b := if i / 2 % 2 == 0 then "%nb" else "%b"
+    let c := if i % 2 == 0 then "%nc" else "%c"
+    let prev := if i == 0 then "0" else s!"%out{i-1}"
+    lines := lines ++ [s!"  %ab{i} = and i64 {a}, {b}",
+      s!"  %abc{i} = and i64 %ab{i}, {c}",
+      s!"  %mask{i} = and i64 %imm, {2^i}",
+      s!"  %on{i} = icmp ne i64 %mask{i}, 0",
+      s!"  %term{i} = select i1 %on{i}, i64 %abc{i}, i64 0",
+      s!"  %out{i} = or i64 {prev}, %term{i}"]
+  return String.intercalate "\n" (lines ++ ["  ret i64 %out7", "}",
+    "attributes #4 = { nounwind uwtable alwaysinline \"target-features\"=\"+avx512f,+avx512bw,+avx512dq,+avx512vl,+vpclmulqdq,+pclmul,+gfni\" }",
+    "attributes #5 = { nounwind uwtable alwaysinline }"])
 
 /-- Emit self-contained `weak_odr` runtime and C ABI benchmark kernels in LLVM 18 opaque-pointer IR. -/
 def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64) : String :=
@@ -2428,8 +2509,12 @@ def emitLLVMABIWrapperDecl (d : LNIRDecl) (target : TargetArch := .x86_64) : Str
 def localScalarSigsOfModule (m : LNIRModule) : List (String × List LNIRType × LNIRType) :=
   let isLocalParamTy (ty : LNIRType) : Bool :=
     isABIScalarIntType ty || ty == .f64 || (match ty with | .sarray _ => true | _ => false)
+  [("lean_native_sarray_uget64_le", [.sarray .i8, .usize], .i64),
+   ("lean_native_sarray_uset64_le", [.sarray .i8, .usize, .i64], .sarray .i8),
+   ("lean_native_gf2_affine64", [.i64, .i64, .i64], .i64),
+   ("lean_native_ternary_logic64", [.i64, .i64, .i64, .i64], .i64)] ++
   m.decls.filterMap fun d =>
-    if !isExternDecl d && (isABIScalarIntType d.retTy || d.retTy == .f64) && d.params.all (fun p => isLocalParamTy p.ty) then
+    if !isExternDecl d && (isABIScalarIntType d.retTy || d.retTy == .f64 || d.retTy == .sarray .i8) && d.params.all (fun p => isLocalParamTy p.ty) then
       some (d.name, d.params.map (·.ty), d.retTy)
     else none
 
@@ -2440,7 +2525,7 @@ private partial def findUnsupportedLLVMCallInCodeAux (localSigs : List (String �
       (callee == "lean_native_unbox_u64" && args.length == 1 && slotLLVMType ty == "i64") ||
       (callee == "lean_native_ensure_exclusive" && args.length == 1 && slotLLVMType ty == "ptr") ||
       (callee == "lean_native_sarray_len" && args.length == 1 && slotLLVMType ty == "i64") ||
-      (slotLLVMType ty == "i64" && localSigs.any (fun (nm, pTys, _) => nm == callee && pTys.length == args.length)))
+      ((slotLLVMType ty == "i64" || ty == .sarray .i8) && localSigs.any (fun (nm, pTys, _) => nm == callee && pTys.length == args.length)))
     if !ok then some callee else findUnsupportedLLVMCallInCodeAux localSigs k
   | .letBind _ _ (.ctorGetScalar _ _ _) _ => some "ctorGetScalar"
   | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k | .parFor _ _ _ _ _ k =>
@@ -2479,7 +2564,7 @@ def emitLLVMModule (optimized : Bool) (m : LNIRModule) (target : TargetArch := .
   let localScalarSigs := localScalarSigsOfModule m
   let declStrs := m.decls.map (emitDeclLLVM optimized · target localScalarSigs isaOverride?)
   let abiWrapperStrs := if optimized then (m.decls.map (emitLLVMABIWrapperDecl · target)).filter (!·.isEmpty) else []
-  let runtimeStr := emitRuntimeAndCAbiHelpers optimized target
+  let runtimeStr := emitRuntimeAndCAbiHelpers optimized target ++ "\n" ++ emitCryptoSliceHelpers target
   let footer := emitMetadataFooter target isaOverride? wasmSimd128
   String.intercalate "\n\n" ([header, runtimeStr] ++ declStrs ++ abiWrapperStrs ++ [footer]) ++ "\n"
 
