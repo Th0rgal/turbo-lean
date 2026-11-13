@@ -173,6 +173,7 @@ class BuildExeP0(unittest.TestCase):
                     [rng.getrandbits(64) for _ in range(3)]) for _ in range(128)]
             for a, b in kv:
                 self.assertEqual(int(run([exe, "K", a, b])), kmul(a, b))
+                self.assertEqual(int(run([exe, "M", a, b])), kmul(a, b))
             for a, b in ev:
                 self.assertEqual(list(map(int, run([exe, "E", *a, *b]).split())), emul(a, b))
             for value in (0, 1 << 63, MASK):
@@ -197,7 +198,7 @@ class BuildExeP0(unittest.TestCase):
                     bounds_cases += 1
             symbols = run(["nm", "--defined-only", exe])
             (out / "symbols.txt").write_text(symbols)
-            for symbol in ("p0_kmul", "p0_emul0", "p0_emul1", "p0_emul2"):
+            for symbol in ("p0_kmul", "p0_masked_mul", "p0_emul0", "p0_emul1", "p0_emul2"):
                 self.assertEqual(len(re.findall(rf"^\w+ T {symbol}$", symbols, re.M)), 1)
                 disasm = run(["objdump", "-d", f"--disassemble={symbol}", exe])
                 (out / f"{symbol}.asm").write_text(disasm)

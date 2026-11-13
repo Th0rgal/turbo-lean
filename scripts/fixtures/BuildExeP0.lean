@@ -7,6 +7,13 @@ def kmul (a b : UInt64) : UInt64 :=
   let hi := clmul64Hi a b
   lo ^^^ clmul64 hi 0x1b ^^^ clmul64 (clmul64Hi hi 0x1b) 0x1b
 
+-- These canonical helpers are [inline]; persisted LCNF loses their calls.
+@[export p0_masked_mul]
+def maskedMul (a b : UInt64) : UInt64 :=
+  let lo := MaskedClmul.nativeClmulLo a b
+  let hi := MaskedClmul.nativeClmulHi a b
+  lo ^^^ clmul64 hi 0x1b ^^^ clmul64 (clmul64Hi hi 0x1b) 0x1b
+
 @[noinline, export p0_emul0]
 def emul0 (a0 a1 a2 b0 b1 b2 : UInt64) : UInt64 :=
   let p0 := kmul a0 b0
@@ -89,6 +96,7 @@ def main (args : List String) : IO Unit := do
   let u := fun (s : String) => s.toNat!.toUInt64
   match args with
   | ["K", a, b] => IO.println (kmul (u a) (u b))
+  | ["M", a, b] => IO.println (maskedMul (u a) (u b))
   | ["E", a0, a1, a2, b0, b1, b2] =>
     IO.println (emul0 (u a0) (u a1) (u a2) (u b0) (u b1) (u b2))
     IO.println (emul1 (u a0) (u a1) (u a2) (u b0) (u b1) (u b2))
