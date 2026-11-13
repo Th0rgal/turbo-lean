@@ -96,25 +96,52 @@ def emitLeanCFromSourceFile (filePath : String) (modName : Lean.Name := `Main)
     (arch : TargetArch := .x86_64) : IO (String × LNIRModule × Array String) :=
   withElaboratedFrontend filePath modName do
     let env ← getEnv
-    let names ← Lean.Compiler.LCNF.getLocalImpureDecls
-    let mut selected := names.filter (fun n => (Lean.getExportNameFor? env n).isSome)
-    for _ in [:names.size] do
-      for n in selected do
-        if let some d ← Lean.Compiler.LCNF.getLocalImpureDecl? n then
-          if let .code c := d.value then
-            for callee in collectCodeLocalCallees names c do
-              if !selected.contains callee then selected := selected.push callee
-    let mod ← ingestModuleDecls selected modName.toString arch
-    let mut objects := #[]
     let sysroot ← resolveLeanSysroot
+    let mut importedModules : Array Lean.Name := #[]
     for n in env.header.moduleNames do
       let olean ← Lean.findOLean n
       if !olean.toString.startsWith sysroot.toString then
-        let obj := ((olean.toString.replace "/lib/lean/" "/ir/").dropEnd 6).toString ++ ".c.o.export"
-        unless ← (System.FilePath.mk obj).pathExists do
-          throwError "[lean-native] missing native object for imported module {n}: {obj}"
+        importedModules := importedModules.push n
+    let belongsToInput (n : Lean.Name) : Bool :=
+      match env.getModuleIdxFor? n with
+      | none => true
+      | some idx => (env.header.moduleNames[idx.toNat]?).any importedModules.contains
+    let names := env.constants.fold (fun acc n _ =>
+      if belongsToInput n then acc.push n else acc) (#[] : Array Lean.Name)
+    let mut selected := names.filter (fun n => (Lean.getExportNameFor? env n).isSome)
+    let mut cursor := 0
+    while cursor < selected.size do
+      let n := selected[cursor]!
+      let callees ← do
+        if let some d ← Lean.Compiler.LCNF.getLocalImpureDecl? n then
+          if let .code c := d.value then return collectCodeLocalCallees names c
+        if let some d ← Lean.Compiler.LCNF.getMonoDecl? n then
+          if let .code c := d.value then return collectCodeLocalCallees names c
+        pure []
+      for callee in callees do
+        if !selected.contains callee then selected := selected.push callee
+      cursor := cursor + 1
+    -- C emission owns the local impure extension. Finish it before importing
+    -- mono LCNF into the native lowering's isolated conversion environment.
+    let cCode ← Lean.Compiler.LCNF.emitC modName
+    let mod ← ingestBuildExeModuleDecls selected modName.toString arch
+    let mut objects := #[]
+    for n in importedModules do
+      let olean ← Lean.findOLean n
+      if !olean.toString.startsWith sysroot.toString then
+        let baseStem := (olean.toString.replace "/lib/lean/" "/ir/").dropEnd 6 |>.toString
+        let altStem := (olean.toString.replace "/lib/lean/" "/native-c/").dropEnd 6 |>.toString
+        let cands := [baseStem ++ ".c.o.export", baseStem ++ ".c.o",
+                      altStem ++ ".c.o.export", altStem ++ ".c.o"]
+        let mut foundObj? : Option String := none
+        for cand in cands do
+          if foundObj?.isNone then
+            if ← (System.FilePath.mk cand).pathExists then
+              foundObj? := some cand
+        let some obj := foundObj?
+          | throwError "[lean-native] missing native object for imported module {n}: {baseStem}.c.o.export"
         objects := objects.push obj
-    return (← Lean.Compiler.LCNF.emitC modName, mod, objects)
+    return (cCode, mod, objects)
 
 /-- P-cert C4/C5 `build-exe` gate (fail closed, checked before any file is written): the Bridge already refuses
     RC-ADT decls without `allowRcAdt`, but the LLVM backend accepts no heap code, so `build-exe` re-checks
@@ -131,7 +158,11 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
   let hostArch : TargetArch :=
     if System.Platform.target.startsWith "aarch64" || System.Platform.target.startsWith "arm64" then .arm64 else .x86_64
   let (cCode, rawMod, importObjects) ← emitLeanCFromSourceFile filePath `Main hostArch
-  let (optMod, _) := LeanNative.Transform.runDefaultPipeline rawMod
+  let optMod : LNIRModule := { rawMod with decls := rawMod.decls.map fun d =>
+    if d.body.nodeSize <= 128 then
+      (LeanNative.Transform.runDefaultPipelineDecl d).1
+    else
+      (LeanNative.Transform.verifiedAlgebraicCorePass.runDecl d).1 }
   if let some err := buildExeLLVMGate? rawMod optMod hostArch then throw <| IO.userError err
   let superoptTgt : LeanNative.Transform.SuperoptTarget :=
     match hostArch with
@@ -142,7 +173,8 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
   if !isBatchOnly then
     let telCfg ← LeanNative.Backend.FastCheck.TelemetryConfig.probe cliArgs
     if telCfg.enabled then
-      let _ ← LeanNative.Transform.emitModuleTelemetryEvents telCfg superoptTgt false rawMod
+      let _ ← LeanNative.Transform.emitModuleTelemetryEvents telCfg superoptTgt false
+        { rawMod with decls := rawMod.decls.filter (fun d => d.body.nodeSize <= 64) }
   let lnirLlPath := s!"{outBin}.lnir.ll"
   let lnirLlText := LeanNative.Backend.LLVM.emitLLVMOptimized optMod hostArch
   IO.FS.writeFile lnirLlPath lnirLlText
@@ -191,7 +223,24 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
     throw <| IO.userError s!"LLVM optimization failed:\n{optOut.stderr}"
 
   let isDarwin := (System.Platform.target.splitOn "darwin").length > 1 || (System.Platform.target.splitOn "apple").length > 1
-  let linkInputs := #[optLlPath, runtimePath] ++ importObjects
+  -- Imported objects also own the original C definitions. Make only symbols
+  -- actually replaced by this native module weak in private object copies.
+  -- Relocations continue to target the strong optimized definition; unrelated
+  -- host code and the shared incremental cache retain their original binding.
+  let replacements := optMod.decls.map fun d =>
+    s!"--weaken-symbol={LeanNative.Backend.LLVM.sanitizeSymbol d.name}"
+  let mut linkedImports : Array String := #[]
+  for i in [:importObjects.size] do
+    let source := importObjects[i]!
+    let dest := s!"{outBin}.import-{i}.o"
+    let copyOut ← IO.Process.output {
+      cmd := "objcopy"
+      args := replacements.toArray ++ #[source, dest]
+    }
+    if copyOut.exitCode != 0 then
+      throw <| IO.userError s!"imported native object preparation failed for {source}:\n{copyOut.stderr}"
+    linkedImports := linkedImports.push dest
+  let linkInputs := #[optLlPath, runtimePath] ++ linkedImports
   let sysLibDir := (sysroot / "lib").toString
   let hasStaticLeanRt ← ((sysroot / "lib" / "lean" / "libleanrt.a").pathExists)
   let hasStaticInit ← ((sysroot / "lib" / "lean" / "libInit.a").pathExists)

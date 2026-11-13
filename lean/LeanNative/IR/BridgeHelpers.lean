@@ -686,29 +686,64 @@ elab "canon_decl_repr% " base:ident " : " target:ident : term => do
   let some (.defnInfo d) := env.find? target.getId | Lean.throwError "missing {target.getId}"
   return Lean.toExpr (normalizeIntrinsicDecl base.getId d.value)
 
+def altClmul64 (a b : UInt64) : UInt64 :=
+  let rec go (i : Nat) (acc : UInt64) : UInt64 :=
+    if _h : i < 64 then
+      let sh := i.toUInt64
+      go (i + 1) (if ((b >>> sh) &&& 1) == 1 then acc ^^^ (a <<< sh) else acc)
+    else acc
+  termination_by 64 - i
+  decreasing_by exact Nat.sub_lt_sub_left _h (Nat.lt_succ_self i)
+  go 0 0
+
+def altClmul64Hi (a b : UInt64) : UInt64 :=
+  let rec go (i : Nat) (acc : UInt64) : UInt64 :=
+    if _h : i < 64 then
+      let sh := i.toUInt64
+      go (i + 1) (if ((b >>> sh) &&& 1) == 1 then acc ^^^ (a >>> (64 - sh)) else acc)
+    else acc
+  termination_by 64 - i
+  decreasing_by exact Nat.sub_lt_sub_left _h (Nat.lt_succ_self i)
+  go 1 0
+
 def canonClmul64Repr : String := canon_decl_repr% LeanNative.IR.clmul64 : LeanNative.IR.clmul64
 def canonClmul64GoRepr : String := canon_decl_repr% LeanNative.IR.clmul64 : LeanNative.IR.clmul64.go._unary
+def canonAltClmul64Repr : String := canon_decl_repr% LeanNative.IR.altClmul64 : LeanNative.IR.altClmul64
+def canonAltClmul64GoRepr : String := canon_decl_repr% LeanNative.IR.altClmul64 : LeanNative.IR.altClmul64.go._unary
 def canonClmul64HiRepr : String := canon_decl_repr% LeanNative.IR.clmul64Hi : LeanNative.IR.clmul64Hi
 def canonClmul64HiGoRepr : String := canon_decl_repr% LeanNative.IR.clmul64Hi : LeanNative.IR.clmul64Hi.go._unary
+def canonAltClmul64HiRepr : String := canon_decl_repr% LeanNative.IR.altClmul64Hi : LeanNative.IR.altClmul64Hi
+def canonAltClmul64HiGoRepr : String := canon_decl_repr% LeanNative.IR.altClmul64Hi : LeanNative.IR.altClmul64Hi.go._unary
 def canonGf2AffineRepr : String := canon_decl_repr% LeanNative.IR.gf2Affine : LeanNative.IR.gf2Affine
 def canonGf2AffineGoRepr : String := canon_decl_repr% LeanNative.IR.gf2Affine : LeanNative.IR.gf2Affine.go._unary
 def canonEor3Repr : String := canon_decl_repr% LeanNative.IR.eor3 : LeanNative.IR.eor3
 
 def trustedGfSimdIntrinsicOp (env : Lean.Environment) (fnName : Lean.Name) : Option BinOp := do
-  let (op, expBody, expGoOpt) ← match fnName with
-    | .str _ "clmul64Hi" => some (BinOp.clmul64Hi, canonClmul64HiRepr, some canonClmul64HiGoRepr)
-    | .str _ "clmul64"   => some (BinOp.clmul64, canonClmul64Repr, some canonClmul64GoRepr)
-    | .str _ "gf2Affine" => some (BinOp.gf2Affine, canonGf2AffineRepr, some canonGf2AffineGoRepr)
-    | .str _ "eor3"      => some (BinOp.eor3, canonEor3Repr, none)
+  let (op, variants) ← match fnName with
+    | .str _ "clmul64Hi" =>
+      some (BinOp.clmul64Hi, [(canonClmul64HiRepr, some canonClmul64HiGoRepr),
+                              (canonAltClmul64HiRepr, some canonAltClmul64HiGoRepr)])
+    | .str _ "clmul64" =>
+      some (BinOp.clmul64, [(canonClmul64Repr, some canonClmul64GoRepr),
+                            (canonAltClmul64Repr, some canonAltClmul64GoRepr)])
+    | .str _ "gf2Affine" => some (BinOp.gf2Affine, [(canonGf2AffineRepr, some canonGf2AffineGoRepr)])
+    | .str _ "eor3"      => some (BinOp.eor3, [(canonEor3Repr, none)])
     | _ => none
   let .defnInfo decl ← env.find? fnName | none
   let u64 := Lean.mkConst ``UInt64
   let sig := Lean.Expr.forallE `a u64 (Lean.Expr.forallE `b u64 u64 .default) .default
   guard (decl.levelParams.isEmpty && decl.safety == .safe && decl.type.eqv sig && !Lean.isExtern env fnName)
-  guard (normalizeIntrinsicDecl fnName decl.value == expBody)
-  if let some expGo := expGoOpt then
-    let .defnInfo goDecl ← env.find? (fnName ++ `go._unary) | none
-    guard (normalizeIntrinsicDecl fnName goDecl.value == expGo)
+  let normBody := normalizeIntrinsicDecl fnName decl.value
+  let matchesVariant (v : String × Option String) : Bool :=
+    let (expBody, expGoOpt) := v
+    if normBody != expBody then false
+    else match expGoOpt with
+      | none => true
+      | some expGo =>
+        match env.find? (fnName ++ `go._unary) with
+        | some (.defnInfo goDecl) => normalizeIntrinsicDecl fnName goDecl.value == expGo
+        | _ => false
+  guard (variants.any matchesVariant)
   return op
 
 def tryLowerGfSimdIntrinsic (env : Lean.Environment) (fnName : Lean.Name) (argVars : List VarId)
@@ -1362,7 +1397,7 @@ private def isBuiltinLNIRRuntimeCall (fn : String) : Bool :=
   fn == "lean_native_box_u64" || fn == "lean_native_unbox_u64" ||
   fn == "lean_native_ensure_exclusive" || fn == "lean_native_sarray_len"
 
-private partial def collectDirectCallees : LNIRCode → List String
+partial def collectDirectCallees : LNIRCode → List String
   | .letBind _ _ (.call fn _ _ isExt) k =>
     if isExt || isBuiltinLNIRRuntimeCall fn then collectDirectCallees k else fn :: collectDirectCallees k
   | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k | .parFor _ _ _ _ _ k =>

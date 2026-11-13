@@ -1,4 +1,5 @@
 import LeanNative.IR.BridgeHelpers
+import Lean.Compiler.LCNF.ToImpure
 
 set_option autoImplicit true
 
@@ -225,8 +226,16 @@ def ingestLCNFImpureDecl (decl : Lean.Compiler.LCNF.Decl .impure)
 
 def ingestLCNFMonoDecl (decl : Lean.Compiler.LCNF.Decl .pure)
     (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64) : Lean.CoreM LNIRDecl := do
-  let (d, endSt) ← ingestLCNFDeclGenericWithState decl lowerPureCode localDeclNames arch false
-  attachBaseDeclFactsM decl.name (extractPureDeclFactsWithBridgeState decl endSt d)
+  -- Imported modules retain mono LCNF, not local impure declarations. The
+  -- conversion registers impure signatures as a side effect; keep that state
+  -- private to this conversion, including when lowering fails.
+  let savedEnv ← getEnv
+  try
+    let ds ← (Lean.Compiler.LCNF.toImpure.run #[decl]).run {} .mono
+    let some d := ds[0]? | Lean.throwError "[lean-native] empty toImpure result"
+    ingestLCNFImpureDecl d localDeclNames arch
+  finally
+    setEnv savedEnv
 
 def ingestModuleDecls (declNames : Array Lean.Name) (moduleName : String := "LeanNative.Ingested")
     (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : Lean.CoreM LNIRModule :=
@@ -240,5 +249,46 @@ def ingestAllLocalDecls (moduleName : String := "LeanNative.Ingested")
   let extraNames := env.constants.map₂.foldl (fun acc name _ =>
     if impureNames.contains name || isCompilerGeneratedAuxDecl env name then acc else acc.push name) #[]
   ingestModuleDecls (filteredImpure ++ extraNames) moduleName arch allowRcAdt
+
+/-- Executables retain Lean C for host code. Only a closed, supported native
+    subgraph may override it; unsupported local exports are still hard errors. -/
+def ingestBuildExeModuleDecls (names : Array Lean.Name) (moduleName : String)
+    (arch : TargetArch := .x86_64) : Lean.CoreM LNIRModule := do
+  let names ← expandCompilerAuxDecls names
+  let env ← getEnv
+  let mut pairs : List (Lean.Name × LNIRDecl) := []
+  for name in names do
+    let savedEnv ← getEnv
+    let d? ← try
+      if let some d ← Lean.Compiler.LCNF.getLocalImpureDecl? name then
+        some <$> ingestLCNFImpureDecl d names arch
+      else if let some d ← Lean.Compiler.LCNF.getMonoDecl? name then
+        some <$> ingestLCNFMonoDecl d names arch
+      else pure none
+    catch e =>
+      if (env.getModuleIdxFor? name).isNone && (Lean.getExportNameFor? env name).isSome then
+        throw e
+      pure none
+    finally
+      setEnv savedEnv
+    if let some d := d? then pairs := pairs ++ [(name, d)]
+  let raw : LNIRModule := { moduleName, decls := pairs.map Prod.snd }
+  let norm := normalizeAndInlineLocalDefs raw
+  let mut clean := norm.decls.filter fun d =>
+    d.params.all (fun p => isSupportedParamOrRetType p.ty arch true) &&
+    isSupportedParamOrRetType d.retTy arch true && !codeHasResidualHeapOrTupleAbiOp d.body
+  -- Remove callers transitively if their callee could not be lowered. Never
+  -- route a scalar native call into a Lean object ABI by guessing its symbol.
+  for _ in [:norm.decls.length] do
+    let kept := clean.map (·.name)
+    clean := clean.filter fun d => (collectDirectCallees d.body).all fun c =>
+      kept.contains c
+  for (name, d) in pairs do
+    if (env.getModuleIdxFor? name).isNone && (Lean.getExportNameFor? env name).isSome &&
+       !clean.any (·.name == d.name) then
+      Lean.throwError s!"[lean-native] Exported function `{name}` calls an unlowered external or non-scalar helper"
+  let result := { norm with decls := clean }
+  validateIngestedModule result
+  return result
 
 end LeanNative.IR
