@@ -43,6 +43,14 @@ def provenance(binary):
                 [os.environ.get("TURBO_LEAN_GIT", "git"), "--version"], text=True).strip()}
 
 
+def require_trusted_git():
+    binary = os.environ.get("TURBO_LEAN_GIT", "git")
+    version = subprocess.check_output([binary, "--version"], text=True).strip()
+    parsed = re.search(r"git version (\d+)\.(\d+)", version)
+    if not parsed or tuple(map(int, parsed.groups())) < (2, 46):
+        raise RuntimeError(f"benchmark requires trusted Git >=2.46, got {version}: {binary}")
+
+
 def check(binary, project, file, cache, timeout, decl=None, workload=None):
     command = [str(binary), "check", str(file), "--json", "--project-dir",
                str(project), "--cache-dir", str(cache), "--timeout", str(timeout)]
@@ -131,6 +139,7 @@ def sample_pss(stop, peak, workload):
 
 
 def concurrency(args, cache):
+    require_trusted_git()
     # Unique theorem bodies force work beyond attested receipt cache hits while
     # sharing an identical imported environment/prefix in the persistent pool.
     with tempfile.TemporaryDirectory(prefix="wallclock-agents-") as tmp:
