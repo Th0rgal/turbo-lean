@@ -19,6 +19,7 @@ def main():
     parser.add_argument('--repo', type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument('--evidence', type=Path, required=True)
     parser.add_argument('--skip-lean-build', action='store_true')
+    parser.add_argument('--target', choices=('lean-native', 'lean-native-core'), default='lean-native')
     args = parser.parse_args()
     repo = args.repo.resolve()
     project = repo / 'lean'
@@ -45,11 +46,14 @@ def main():
     if f'version {required},' not in version:
         raise RuntimeError(f'toolchain mismatch: require {required}, got {version}')
     if not args.skip_lean_build:
-        run(['turbo-lean', 'build', 'lean-native', '--max-memory-mb', '6144'])
+        run(['turbo-lean', 'build', args.target, '--max-memory-mb', '6144'])
     dep = (project / '.lake/packages/lean-sys').resolve()
     sources = sorted((project / '.lake/build/ir').rglob('*.c'))
     sources += sorted((dep / '.lake/build/ir').rglob('*.c'))
-    main_c = project / '.lake/build/ir/LeanNative/Driver/Main.c'
+    entry = 'Main' if args.target == 'lean-native' else 'CoreMain'
+    other_entry = 'CoreMain' if entry == 'Main' else 'Main'
+    sources = [s for s in sources if s != project / f'.lake/build/ir/LeanNative/Driver/{other_entry}.c']
+    main_c = project / f'.lake/build/ir/LeanNative/Driver/{entry}.c'
     if main_c not in sources:
         raise RuntimeError(f'missing compiler entrypoint: {main_c}')
     sources.append(dep / 'c/lean_sys_shim.c')
@@ -63,7 +67,7 @@ def main():
              '-I', sysroot / 'include', '-c', source, '-o', obj])
         objects.append(obj)
         print(f'C {i + 1}/{len(sources)} {source.name}', flush=True)
-    binary = project / '.lake/build/bin/lean-native'
+    binary = project / '.lake/build/bin' / args.target
     binary.parent.mkdir(parents=True, exist_ok=True)
     pending = binary.with_suffix('.pending')
     run(['/usr/bin/clang', '-rdynamic', *objects, '-L', sysroot / 'lib/lean',

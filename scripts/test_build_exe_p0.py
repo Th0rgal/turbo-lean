@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import random
@@ -91,6 +92,54 @@ def zmm_slice_ref(n, seed):
 
 
 class BuildExeP0(unittest.TestCase):
+    def test_imported_export_uses_native_c_fallback_without_mutating_cache(self):
+        with tempfile.TemporaryDirectory(prefix="build-exe-imported-") as tmp:
+            base = Path(os.environ.get("TURBO_P0_EVIDENCE_DIR", tmp)).resolve()
+            project = base / "imported-native-c"
+            project.mkdir(parents=True, exist_ok=True)
+            records = []
+
+            def run(command):
+                p = subprocess.run(list(map(str, command)), cwd=project, text=True,
+                                   capture_output=True, env={**os.environ,
+                                   "LEAN_NUM_THREADS": "1", "TURBO_LEAN_JOBS": "1"})
+                records.append(dict(args=list(map(str, command)), rc=p.returncode,
+                                    stdout=p.stdout, stderr=p.stderr))
+                (project / "commands.json").write_text(json.dumps(records, indent=2))
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                return p.stdout
+
+            (project / "lean-toolchain").write_text((ROOT / "lean/lean-toolchain").read_text())
+            (project / "lakefile.toml").write_text(
+                'name = "P0Imported"\n[[lean_lib]]\nname = "Imported"\n')
+            (project / "Imported.lean").write_text(
+                '@[noinline, export p0_imported_add]\n'
+                'def importedAdd (a b : UInt64) : UInt64 := a + b\n')
+            runner = project / "Runner.lean"
+            runner.write_text('import Imported\ndef main : IO Unit := IO.println (importedAdd 7 5)\n')
+            run(["turbo-lean", "build", "+Imported:c.o.export", "--max-memory-mb", "6144"])
+            original = project / ".lake/build/ir/Imported.c.o.export"
+            fallback = project / ".lake/build/native-c/Imported.c.o"
+            fallback.parent.mkdir(parents=True, exist_ok=True)
+            original.replace(fallback)
+            before = hashlib.sha256(fallback.read_bytes()).hexdigest()
+            exe = project / "runner"
+            run([ROOT / "lean/.lake/build/bin/lean-native", "build-exe", "--input",
+                 runner, "-o", exe, "--standalone"])
+            self.assertEqual(run([exe]).strip(), "12")
+            self.assertEqual(hashlib.sha256(fallback.read_bytes()).hexdigest(), before)
+            self.assertFalse(original.exists())
+            symbols = run(["nm", "--defined-only", exe])
+            self.assertEqual(len(re.findall(r"^\w+ T p0_imported_add$", symbols, re.M)), 1)
+            private = run(["nm", "--defined-only", str(exe) + ".import-0.o"])
+            self.assertRegex(private, r"(?m)^\w+ W p0_imported_add$")
+            disasm = run(["objdump", "-d", "--disassemble=p0_imported_add", exe])
+            (project / "p0_imported_add.asm").write_text(disasm)
+            self.assertNotRegex(disasm, r"\bcall\w*\s")
+            (project / "result.json").write_text(json.dumps(dict(
+                imported_discovery=True, native_c_fallback=True, cache_sha256=before,
+                unique_strong_owner=True)))
+
     def test_standalone_io_native_kernels_and_boxing(self):
         with tempfile.TemporaryDirectory(prefix="build-exe-p0-") as tmp:
             out = Path(os.environ.get("TURBO_P0_EVIDENCE_DIR", tmp)).resolve()
