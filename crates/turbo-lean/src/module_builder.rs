@@ -25427,78 +25427,86 @@ pub(crate) fn build_project_modules_native_with_options(
 
         for _ in 0..compile_pool_size {
             let tx = event_tx.clone();
-            s.spawn(move || loop {
-                let job_opt = {
-                    let mut guard = compile_work_queue_ref
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    while guard.is_empty() && !compile_shutdown_ref.load(Ordering::SeqCst) {
-                        guard = compile_work_cv_ref
-                            .wait(guard)
+            let phase_context = crate::check::phase_context();
+            s.spawn(move || {
+                crate::check::set_phase_context(phase_context);
+                loop {
+                    let job_opt = {
+                        let mut guard = compile_work_queue_ref
+                            .lock()
                             .unwrap_or_else(|e| e.into_inner());
-                    }
-                    if compile_shutdown_ref.load(Ordering::SeqCst) && guard.is_empty() {
-                        None
-                    } else {
-                        guard.pop_front()
-                    }
-                };
-                let Some((mod_name, mod_key)) = job_opt else {
-                    break;
-                };
-                let node = dag_ref.nodes.get(&mod_name).expect("node in dag");
-                let preserve_lake = preserve_project
-                    || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
-                let res = compile_single_module_staged(
-                    cfg_ref,
-                    dag_ref,
-                    node,
-                    lp_ref,
-                    ld_ref,
-                    is_untrusted,
-                    bwrap_ref,
-                    preserve_lake,
-                    compile_pool_size,
-                );
-                let _ = tx.send(SchedulerEvent::CompileFinished {
-                    mod_name,
-                    mod_key,
-                    res,
-                });
+                        while guard.is_empty() && !compile_shutdown_ref.load(Ordering::SeqCst) {
+                            guard = compile_work_cv_ref
+                                .wait(guard)
+                                .unwrap_or_else(|e| e.into_inner());
+                        }
+                        if compile_shutdown_ref.load(Ordering::SeqCst) && guard.is_empty() {
+                            None
+                        } else {
+                            guard.pop_front()
+                        }
+                    };
+                    let Some((mod_name, mod_key)) = job_opt else {
+                        break;
+                    };
+                    let node = dag_ref.nodes.get(&mod_name).expect("node in dag");
+                    let preserve_lake = preserve_project
+                        || crate::lake_build::worktree_auto_link_disabled(&node.pkg_root);
+                    let res = compile_single_module_staged(
+                        cfg_ref,
+                        dag_ref,
+                        node,
+                        lp_ref,
+                        ld_ref,
+                        is_untrusted,
+                        bwrap_ref,
+                        preserve_lake,
+                        compile_pool_size,
+                    );
+                    let _ = tx.send(SchedulerEvent::CompileFinished {
+                        mod_name,
+                        mod_key,
+                        res,
+                    });
+                }
             });
         }
 
         let result_tx = event_tx.clone();
         for _ in 0..audit_pool_size {
             let tx = event_tx.clone();
-            s.spawn(move || loop {
-                let job_opt = {
-                    let mut guard = audit_work_queue_ref
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    while guard.is_empty() && !audit_shutdown_ref.load(Ordering::SeqCst) {
-                        guard = audit_work_cv_ref
-                            .wait(guard)
+            let phase_context = crate::check::phase_context();
+            s.spawn(move || {
+                crate::check::set_phase_context(phase_context);
+                loop {
+                    let job_opt = {
+                        let mut guard = audit_work_queue_ref
+                            .lock()
                             .unwrap_or_else(|e| e.into_inner());
-                    }
-                    if audit_shutdown_ref.load(Ordering::SeqCst) && guard.is_empty() {
-                        None
-                    } else {
-                        guard.pop_front()
-                    }
-                };
-                let Some(batch_mods) = job_opt else {
-                    break;
-                };
-                let res = run_audit_or_replay_batch_worker(
-                    store_root_ref,
-                    cfg_ref,
-                    dag_ref,
-                    &batch_mods,
-                    lp_ref,
-                    is_untrusted,
-                );
-                let _ = tx.send(SchedulerEvent::AuditBatchFinished { batch_mods, res });
+                        while guard.is_empty() && !audit_shutdown_ref.load(Ordering::SeqCst) {
+                            guard = audit_work_cv_ref
+                                .wait(guard)
+                                .unwrap_or_else(|e| e.into_inner());
+                        }
+                        if audit_shutdown_ref.load(Ordering::SeqCst) && guard.is_empty() {
+                            None
+                        } else {
+                            guard.pop_front()
+                        }
+                    };
+                    let Some(batch_mods) = job_opt else {
+                        break;
+                    };
+                    let res = run_audit_or_replay_batch_worker(
+                        store_root_ref,
+                        cfg_ref,
+                        dag_ref,
+                        &batch_mods,
+                        lp_ref,
+                        is_untrusted,
+                    );
+                    let _ = tx.send(SchedulerEvent::AuditBatchFinished { batch_mods, res });
+                }
             });
         }
 
@@ -34497,6 +34505,7 @@ globs = ["Demo.+"]
 
         let mut store = TurboStore::open(Some(&store_dir)).unwrap();
         // Run across the diamond DAG (Wave 0: Root, Wave 1: Left + Right in parallel, Wave 2: Top)
+        crate::check::reset_phases();
         let rep = build_project_modules_native(
             &mut store,
             &proj_dir,
@@ -34511,6 +34520,12 @@ globs = ["Demo.+"]
         assert_eq!(rep.modules_total, 4);
         assert_eq!(rep.modules_compiled, 4);
         assert_eq!(rep.waves_count, 3);
+        let mut timing = serde_json::json!({});
+        crate::check::insert_check_timings(&mut timing, std::time::Instant::now());
+        assert!(
+            timing["phases"]["kernel_ms"].as_i64().unwrap() > 0,
+            "native audit worker kernel time must reach the caller: {timing}"
+        );
 
         // Verify `lake_build::run_build_command` and `pr_verify::run_ci_verify_command` succeed using native builder
         crate::lake_build::run_build_command(

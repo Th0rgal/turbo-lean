@@ -4268,7 +4268,7 @@ pub(super) fn check_single_decl(
                     targets: vec![rooted_target.clone()],
                     expected_kernel_type_hash: Some(attested.kernel_type_hash.clone()),
                 })?;
-                match pack::http_request("POST", &endpoint, "application/json", &req_body) {
+                match super::remote::request_check(&endpoint, &req_body) {
                     Ok(resp_bytes) => {
                         match serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
                             Ok(rj) => {
@@ -4349,9 +4349,7 @@ pub(super) fn check_single_decl(
                     targets: vec![rooted_target],
                     expected_kernel_type_hash: Some(attested.kernel_type_hash.clone()),
                 })?;
-                if let Ok(resp_bytes) =
-                    pack::http_request("POST", &endpoint, "application/json", &req_body)
-                {
+                if let Ok(resp_bytes) = super::remote::request_check(&endpoint, &req_body) {
                     if let Ok(rj) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
                         let st = rj
                             .get("status")

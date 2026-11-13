@@ -151,9 +151,16 @@ mod wallclock_tests {
         std::thread::scope(|scope| {
             scope.spawn(move || {
                 set_phase_context(context);
-                let _outer = PhaseTimer::start("kernel");
-                let _inner = PhaseTimer::start("kernel");
+                let outer = PhaseTimer::start("kernel");
+                let inner = PhaseTimer::start("kernel");
+                assert!(outer.outer);
+                assert!(!inner.outer);
                 std::thread::sleep(std::time::Duration::from_millis(20));
+                drop(inner);
+                // Inner destruction must add exactly nothing, independent of
+                // scheduling jitter or timer resolution.
+                assert_eq!(phase_context().lock().unwrap().kernel_ms, 0);
+                drop(outer);
             });
         });
         let phases = phase_context();

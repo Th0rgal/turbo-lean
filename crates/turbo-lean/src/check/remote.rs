@@ -18,6 +18,15 @@ use super::identity::{
 use super::single_decl::target_hygiene_violations;
 use super::{cache_shm_stat_split, default_parallel_jobs, make_attested_shard_receipt_bytes};
 
+pub(super) fn request_check(endpoint: &str, body: &[u8]) -> Result<Vec<u8>> {
+    let _timer = super::PhaseTimer::start("elab");
+    pack::http_request("POST", endpoint, "application/json", body)
+}
+
+fn timing_footer(result: &serde_json::Value) -> String {
+    format!("wall_ms={} phases={}", result["wall_ms"], result["phases"])
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn emit_remote_decl_result(
     json_output: bool,
@@ -70,14 +79,14 @@ pub(super) fn emit_remote_decl_result(
             println!("{}", serde_json::to_string_pretty(&out_json)?);
         } else {
             println!(
-                "[turbo-lean] {} `{}` via {} (arch={}, server={} ms, total={} ms, wall={} ms)",
+                "[turbo-lean] {} `{}` via {} (arch={}, server={} ms, total={} ms) {}",
                 remote_status.to_uppercase(),
                 target_decl,
                 remote_url,
                 server_arch,
                 server_elapsed_ms,
                 dur_ms,
-                super::process_wall_ms(t0).max(dur_ms)
+                timing_footer(&out_json)
             );
         }
     }
@@ -344,12 +353,9 @@ pub fn try_stateless_remote_check(
         lean_args: file_lean_args,
     })?;
 
-    let remote_timer = super::PhaseTimer::start("elab");
-    let Ok(resp_bytes) = pack::http_request("POST", &endpoint, "application/json", &req_body)
-    else {
+    let Ok(resp_bytes) = request_check(&endpoint, &req_body) else {
         return Ok(false);
     };
-    drop(remote_timer);
     let Ok(resp) = serde_json::from_slice::<pack::CheckShardsBatchResponse>(&resp_bytes) else {
         return Ok(false);
     };
@@ -541,8 +547,7 @@ fn try_stateless_remote_single_decl_check(
         expected_kernel_type_hash: Some(attested.kernel_type_hash.clone()),
     })?;
 
-    let Ok(resp_bytes) = pack::http_request("POST", &endpoint, "application/json", &req_body)
-    else {
+    let Ok(resp_bytes) = request_check(&endpoint, &req_body) else {
         return Ok(false);
     };
     let Ok(resp_json) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) else {
@@ -618,4 +623,40 @@ fn try_stateless_remote_single_decl_check(
         t0,
     )?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod timing_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    #[test]
+    fn remote_request_times_success_and_failure_and_formats_human_footer() {
+        for status in [200, 500] {
+            super::super::reset_phases();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("http://{}/check-shard", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0; 4096];
+                assert!(stream.read(&mut buf).unwrap() > 0);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Test\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                )
+                .unwrap();
+            });
+            let response = request_check(&endpoint, b"{}");
+            assert_eq!(response.is_ok(), status == 200);
+            server.join().unwrap();
+            let mut result = serde_json::json!({"elapsed_ms": 0});
+            super::super::insert_check_timings(&mut result, Instant::now());
+            assert!(result["phases"]["elab_ms"].as_i64().unwrap() >= 20);
+            let footer = timing_footer(&result);
+            assert!(footer.contains("wall_ms="));
+            assert!(footer.contains("phases="));
+            assert!(footer.contains("elab_ms"));
+        }
+    }
 }
