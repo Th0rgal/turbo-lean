@@ -422,6 +422,10 @@ pub fn try_stateless_remote_check(
             resp.verified_count,
             dur_ms
         );
+        println!(
+            "[turbo-lean] wall_ms={} phases={}",
+            out_json["wall_ms"], out_json["phases"]
+        );
     }
     Ok(true)
 }

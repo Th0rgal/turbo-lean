@@ -111,6 +111,7 @@ def concurrency(args, cache):
     # Unique theorem bodies force work beyond attested receipt cache hits while
     # sharing an identical imported environment/prefix in the persistent pool.
     with tempfile.TemporaryDirectory(prefix="wallclock-agents-") as tmp:
+        imported_module = args.agent_import
         project = Path(tmp)
         # Daemon identity includes the executable path. Give this workload its
         # own daemon so inherited PSS markers and fork evidence cannot point at
@@ -140,14 +141,14 @@ def concurrency(args, cache):
         files = []
         for i in range(8):
             file = directory / f"Agent{i}.lean"
-            file.write_text("import Batteries.Data.List.Basic\n"
+            file.write_text(f"import {imported_module}\n"
                             f"theorem agent_work : {i} = {i} := by rfl\n")
             files.append(file)
         # Materialize the exact shared import closure before launching clients.
         # Lake publication during the measured window would benchmark a build
         # race rather than eight checks against one stable environment.
         prepared = subprocess.run(
-            ["lake", "build", "+Batteries.Data.List.Basic"], cwd=project,
+            ["lake", "build", f"+{imported_module}"], cwd=project,
             capture_output=True, text=True, timeout=args.timeout + 30, check=False)
         if prepared.returncode:
             raise RuntimeError("concurrency import preparation failed: " + prepared.stderr)
@@ -159,7 +160,7 @@ def concurrency(args, cache):
         if evidence.is_file():
             evidence.write_text("")
         for i, file in enumerate(files):
-            file.write_text("import Batteries.Data.List.Basic\n"
+            file.write_text(f"import {imported_module}\n"
                             f"theorem agent_work : {i + 100} = {i + 100} := by rfl\n")
         stop = threading.Event()
         peak = [0.0]
@@ -176,6 +177,7 @@ def concurrency(args, cache):
         fork_requests = evidence.read_text().splitlines() if evidence.is_file() else []
     walls = sorted(result["external_wall_ms"] for result in results)
     return {"work_units": len(results),
+             "imported_module": imported_module,
             "error_count": sum(not result["ok"] for result in results),
             "total_pss_mb": round(peak[0], 2),
             "wall_p50_ms": statistics.median(walls),
@@ -214,6 +216,9 @@ def main():
                         default=Path("/var/lib/orb-node/work/bench/pfr"))
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--timeout", type=int, default=120)
+    parser.add_argument("--agent-import", default="Batteries.Data.List.Lemmas",
+                        choices=["Batteries.Data.List.Basic", "Batteries.Data.List.Lemmas"],
+                        help="Explicit workload scope; Basic results do not satisfy Lemmas acceptance")
     args = parser.parse_args()
     if not args.binary.is_file():
         parser.error("build the release binary or pass --binary")
