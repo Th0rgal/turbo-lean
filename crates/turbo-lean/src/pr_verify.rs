@@ -7021,8 +7021,7 @@ fn compile_standalone_statement_modules(
             );
             Ok(t0.elapsed().as_millis() as i64)
         };
-        let mut outcomes: Vec<Option<Result<i64>>> =
-            (0..to_compile.len()).map(|_| None).collect();
+        let mut outcomes: Vec<Option<Result<i64>>> = (0..to_compile.len()).map(|_| None).collect();
         if wave_workers <= 1 {
             for (idx, (name, source, root, output, is_mod, _)) in to_compile.iter().enumerate() {
                 let res = compile_one(name, source, root, output, *is_mod);
@@ -7073,8 +7072,7 @@ fn compile_standalone_statement_modules(
                     if let (Some(lease), Some(st)) = (pending_lease.take(), store.as_deref_mut()) {
                         let mut blob_items = Vec::new();
                         let mut read_ok = true;
-                        for (kind, abs_path) in
-                            crate::module_builder::olean_artifact_paths(&output)
+                        for (kind, abs_path) in crate::module_builder::olean_artifact_paths(&output)
                         {
                             if is_regular_nonempty_standalone_artifact(&abs_path) {
                                 match (fs::read(&abs_path), abs_path.strip_prefix(lib_dir)) {
@@ -7239,8 +7237,7 @@ fn source_declares_top_level_main(src: &str) -> bool {
                     if let Some(after_main) = after_kw.strip_prefix("main") {
                         if after_main.is_empty()
                             || after_main.starts_with(|c: char| {
-                                c.is_whitespace()
-                                    || matches!(c, ':' | '(' | '{' | '[' | '.' | '⦃')
+                                c.is_whitespace() || matches!(c, ':' | '(' | '{' | '[' | '.' | '⦃')
                             })
                         {
                             return true;
@@ -7314,9 +7311,10 @@ fn partition_statement_dump_batches(
         clean_batch.push(main_modules.pop().unwrap());
     } else if let Some(first_direct_idx) = main_modules.iter().position(|m| {
         direct_main.contains(m)
-            && local_imports
-                .get(m)
-                .is_none_or(|imps| imps.iter().all(|imp| !memo.get(imp).copied().unwrap_or(false)))
+            && local_imports.get(m).is_none_or(|imps| {
+                imps.iter()
+                    .all(|imp| !memo.get(imp).copied().unwrap_or(false))
+            })
     }) {
         clean_batch.push(main_modules.remove(first_direct_idx));
     }
@@ -7457,38 +7455,38 @@ fn built_kernel_statement_report_bound(
                 let _ =
                     crate::zygote::ensure_bound_audit_closure(snap, "stmt_report_before_batch")?;
             }
-            let (mut command, batch_pinned_fd) = if let Some((
-                ref sr,
-                ref cfg,
-                ref full_lp,
-                ref extra_ro,
-                pinned_fd,
-            )) = zygote_ref
-            {
-                let (mut cmd, _) =
-                    crate::zygote::kernel_reader_command(sr, cfg, full_lp, extra_ro, is_untrusted)?;
-                cmd.arg("--statement-dump").args(&batch);
-                (cmd, *pinned_fd)
-            } else {
-                let helper = helper_ref.context("Missing statement dump helper script")?;
-                let mut cmd = statement_lean_command(project, is_untrusted)?;
-                if let Some(ov) = overlay_lib_dir {
-                    let (base_lp, _) = crate::module_builder::resolve_project_config_with_trust(
-                        project,
+            let (mut command, batch_pinned_fd) =
+                if let Some((ref sr, ref cfg, ref full_lp, ref extra_ro, pinned_fd)) = zygote_ref {
+                    let (mut cmd, _) = crate::zygote::kernel_reader_command(
+                        sr,
+                        cfg,
+                        full_lp,
+                        extra_ro,
                         is_untrusted,
-                    )
-                    .map(|c| crate::module_builder::build_lean_search_path(&c, true))
-                    .unwrap_or_default();
-                    let new_lp = if base_lp.is_empty() {
-                        ov.display().to_string()
-                    } else {
-                        format!("{}:{base_lp}", ov.display())
-                    };
-                    cmd.env("LEAN_PATH", new_lp);
-                }
-                cmd.arg("--run").arg(helper).args(&batch);
-                (cmd, None)
-            };
+                    )?;
+                    cmd.arg("--statement-dump").args(&batch);
+                    (cmd, *pinned_fd)
+                } else {
+                    let helper = helper_ref.context("Missing statement dump helper script")?;
+                    let mut cmd = statement_lean_command(project, is_untrusted)?;
+                    if let Some(ov) = overlay_lib_dir {
+                        let (base_lp, _) =
+                            crate::module_builder::resolve_project_config_with_trust(
+                                project,
+                                is_untrusted,
+                            )
+                            .map(|c| crate::module_builder::build_lean_search_path(&c, true))
+                            .unwrap_or_default();
+                        let new_lp = if base_lp.is_empty() {
+                            ov.display().to_string()
+                        } else {
+                            format!("{}:{base_lp}", ov.display())
+                        };
+                        cmd.env("LEAN_PATH", new_lp);
+                    }
+                    cmd.arg("--run").arg(helper).args(&batch);
+                    (cmd, None)
+                };
             let out = crate::module_builder::run_command_with_timeout_pinned_fd(
                 &mut command,
                 std::time::Duration::from_secs(600),
@@ -7496,8 +7494,7 @@ fn built_kernel_statement_report_bound(
                 batch_pinned_fd,
             )?;
             if let Some(snap) = bound_snap {
-                let _ =
-                    crate::zygote::ensure_bound_audit_closure(snap, "stmt_report_after_batch")?;
+                let _ = crate::zygote::ensure_bound_audit_closure(snap, "stmt_report_after_batch")?;
             }
             if !out.status.success() && batch.len() > 1 {
                 let right = batch.split_off(batch.len() / 2);
@@ -7525,7 +7522,8 @@ fn built_kernel_statement_report_bound(
                 }
                 if let Some(module) = row.module.as_deref() {
                     anyhow::ensure!(
-                        expected_in_batch.contains(module) && seen_in_batch.insert(module.to_string()),
+                        expected_in_batch.contains(module)
+                            && seen_in_batch.insert(module.to_string()),
                         "Unexpected kernel statement module {module}"
                     );
                     let rel = modules
@@ -7547,7 +7545,9 @@ fn built_kernel_statement_report_bound(
                         &mut shared_constants,
                     )? {
                         if in_scope {
-                            sub_report.statements.insert(format!("{rel}::{name}"), digest);
+                            sub_report
+                                .statements
+                                .insert(format!("{rel}::{name}"), digest);
                         }
                     }
                     chunk.clear();
@@ -7565,8 +7565,8 @@ fn built_kernel_statement_report_bound(
         .map(|n| n.get().clamp(1, 6))
         .unwrap_or(4)
         .min(initial_batches.len());
-    let mut batch_results: Vec<Option<Result<(KernelStatementReport, Vec<String>)>>> =
-        (0..initial_batches.len()).map(|_| None).collect();
+    type BatchResult = Option<Result<(KernelStatementReport, Vec<String>)>>;
+    let mut batch_results: Vec<BatchResult> = (0..initial_batches.len()).map(|_| None).collect();
     if worker_cap <= 1 {
         for (idx, b) in initial_batches.into_iter().enumerate() {
             let res = run_batch_tree(b);
@@ -7579,10 +7579,9 @@ fn built_kernel_statement_report_bound(
     } else {
         let next_idx = std::sync::atomic::AtomicUsize::new(0);
         let aborted = std::sync::atomic::AtomicBool::new(false);
-        let slots: Vec<std::sync::Mutex<Option<Result<(KernelStatementReport, Vec<String>)>>>> =
-            (0..initial_batches.len())
-                .map(|_| std::sync::Mutex::new(None))
-                .collect();
+        let slots: Vec<std::sync::Mutex<BatchResult>> = (0..initial_batches.len())
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
         std::thread::scope(|s| {
             for _ in 0..worker_cap {
                 s.spawn(|| loop {
@@ -9315,12 +9314,11 @@ fn kernel_statement_changes_with_trust(
                     }
                     if !wave_compiles.is_empty() {
                         let wave_workers = host_cores.clamp(1, 8).min(wave_compiles.len());
-                        let per_worker_threads =
-                            crate::module_builder::per_worker_lean_num_threads(
-                                raw_lean_threads.as_deref(),
-                                host_cores,
-                                wave_workers,
-                            );
+                        let per_worker_threads = crate::module_builder::per_worker_lean_num_threads(
+                            raw_lean_threads.as_deref(),
+                            host_cores,
+                            wave_workers,
+                        );
                         let compile_ok = std::sync::atomic::AtomicBool::new(true);
                         let next_idx = std::sync::atomic::AtomicUsize::new(0);
                         std::thread::scope(|s| {
@@ -9340,10 +9338,7 @@ fn kernel_statement_changes_with_trust(
                                         let mut cmd =
                                             statement_lean_command(&head_project, false).ok()?;
                                         cmd.env("LEAN_PATH", &ov_lp);
-                                        cmd.env(
-                                            "LEAN_NUM_THREADS",
-                                            per_worker_threads.to_string(),
-                                        );
+                                        cmd.env("LEAN_NUM_THREADS", per_worker_threads.to_string());
                                         cmd.args(&pkg.weak_lean_args).args(&pkg.more_lean_args);
                                         for (k, v) in &pkg.lean_options {
                                             cmd.arg(format!(
@@ -9353,13 +9348,12 @@ fn kernel_statement_changes_with_trust(
                                             ));
                                         }
                                         cmd.arg(source).arg("-R").arg(root).arg("-o").arg(output);
-                                        let out =
-                                            crate::module_builder::run_command_with_timeout(
-                                                &mut cmd,
-                                                std::time::Duration::from_secs(300),
-                                                false,
-                                            )
-                                            .ok()?;
+                                        let out = crate::module_builder::run_command_with_timeout(
+                                            &mut cmd,
+                                            std::time::Duration::from_secs(300),
+                                            false,
+                                        )
+                                        .ok()?;
                                         Some(
                                             out.status.success()
                                                 && standalone_artifacts_present_on_disk(
@@ -12242,15 +12236,21 @@ globs = ["Demo.+"]
     #[test]
     fn kernel_statement_auxiliaries_414() -> Result<()> {
         let _env_guard = crate::pack::tests::env_test_lock()
-            .lock().unwrap_or_else(|e| e.into_inner());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
-            .lock().unwrap_or_else(|e| e.into_inner());
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!(
-            "turbo-aux-414-{}-{}", std::process::id(), pack::next_tmp_id()
+            "turbo-aux-414-{}-{}",
+            std::process::id(),
+            pack::next_tmp_id()
         ));
         struct DirGuard(PathBuf);
         impl Drop for DirGuard {
-            fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
         }
         let _guard = DirGuard(dir.clone());
         fs::create_dir_all(dir.join("Fixture"))?;
@@ -12285,7 +12285,10 @@ end Fixture
         let before = built_kernel_statements(&dir, None)?;
         assert_eq!(before.len(), 9, "{before:?}");
         let report = built_kernel_statement_report(&dir, None, false, None, None)?;
-        assert!(report.audits.iter().any(|row| row.audit.ends_with("._proof_1_2")));
+        assert!(report
+            .audits
+            .iter()
+            .any(|row| row.audit.ends_with("._proof_1_2")));
         assert!(report.audits.iter().any(|row| row.audit.ends_with(".eq_1")));
         let churn = source.replace("simp only [double]", "unfold double").replace(
             "theorem outer : True := by trivial",
@@ -12298,12 +12301,26 @@ end Fixture
         assert!(compare_kernel_statements(&after, &before).is_empty());
         let report = built_kernel_statement_report(&dir, None, false, None, None)?;
         for suffix in [".branch.eq_def", ".branch.congr_simp", ".branch.induct"] {
-            assert!(report.audits.iter().any(|row| row.audit.ends_with(suffix)), "{suffix}");
+            assert!(
+                report.audits.iter().any(|row| row.audit.ends_with(suffix)),
+                "{suffix}"
+            );
         }
         let mut store = TurboStore::open(Some(&dir.join(".lake/gate-cache")))?;
         run_pr_verify_command(
-            &mut store, true, dir.clone(), "HEAD".into(), "trusted".into(),
-            true, None, None, None, None, false, 0, None,
+            &mut store,
+            true,
+            dir.clone(),
+            "HEAD".into(),
+            "trusted".into(),
+            true,
+            None,
+            None,
+            None,
+            None,
+            false,
+            0,
+            None,
         )?;
         for (old, new, suffix, deleted) in [
             ("theorem double_eq_two_mul (n : Nat) : double n = 2 * n := by\n  simp only [double]; omega\n", "", ".double_eq_two_mul", true),
@@ -12332,7 +12349,11 @@ end Fixture
         for edited in ["private theorem «_proof_1» : 1 = 1 := rfl\n", ""] {
             fs::write(&file, edited)?;
             stock_statement_build(&dir)?;
-            assert_eq!(compare_kernel_statements(&private_before, &built_kernel_statements(&dir, None)?).len(), 1);
+            assert_eq!(
+                compare_kernel_statements(&private_before, &built_kernel_statements(&dir, None)?)
+                    .len(),
+                1
+            );
         }
         // Both escaped visibilities must retain source ranges under the module system.
         let module_source = "module\nimport Lean\npublic theorem «_proof_1» : True := by trivial\nprivate theorem «_proof_2» : True := by trivial\n";
@@ -12340,20 +12361,28 @@ end Fixture
         stock_statement_build(&dir)?;
         let before = built_kernel_statements(&dir, None)?;
         assert_eq!(before.len(), 2, "{before:?}");
-        fs::write(&file, module_source.replace("by trivial", "by\n  have h : True := by trivial\n  exact h"))?;
+        fs::write(
+            &file,
+            module_source.replace("by trivial", "by\n  have h : True := by trivial\n  exact h"),
+        )?;
         stock_statement_build(&dir)?;
         let after = built_kernel_statements(&dir, None)?;
         assert!(compare_kernel_statements(&before, &after).is_empty());
         assert!(compare_kernel_statements(&after, &before).is_empty());
         for name in ["_proof_1", "_proof_2"] {
-            fs::write(&file, module_source.replace(
-                &format!("«{name}» : True := by trivial"),
-                &format!("«{name}» : 1 = 1 := rfl"),
-            ))?;
+            fs::write(
+                &file,
+                module_source.replace(
+                    &format!("«{name}» : True := by trivial"),
+                    &format!("«{name}» : 1 = 1 := rfl"),
+                ),
+            )?;
             stock_statement_build(&dir)?;
             let key = before.keys().find(|key| key.ends_with(name)).unwrap();
-            assert_eq!(compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?),
-                vec![key.clone()]);
+            assert_eq!(
+                compare_kernel_statements(&before, &built_kernel_statements(&dir, None)?),
+                vec![key.clone()]
+            );
         }
         println!("auxiliary proof/realization churn passes symmetrically; escaped public/private and reserved user statements remain pinned (including module headers)");
         Ok(())
@@ -20134,7 +20163,10 @@ end ParityNs
         let e = dir.join("NamespacedMain.lean");
         fs::write(&a, "theorem t_a : 1 = 1 := rfl\n")?;
         fs::write(&b, "import LibA\ndef main : IO Unit := pure ()\n")?;
-        fs::write(&c, "import LibA\npublic def main (args : List String) : IO UInt32 := pure 0\n")?;
+        fs::write(
+            &c,
+            "import LibA\npublic def main (args : List String) : IO UInt32 := pure 0\n",
+        )?;
         fs::write(&d, "import CliOne\ntheorem t_d : 2 = 2 := rfl\n")?;
         fs::write(&e, "namespace Foo\ndef main : Nat := 3\nend Foo\n")?;
         let mut modules = BTreeMap::new();
@@ -20157,8 +20189,7 @@ end ParityNs
         );
         assert!(batches[0].contains(&"LibA".to_string()));
         assert!(batches[0].contains(&"NamespacedMain".to_string()));
-        let all: std::collections::BTreeSet<String> =
-            batches.iter().flatten().cloned().collect();
+        let all: std::collections::BTreeSet<String> = batches.iter().flatten().cloned().collect();
         assert_eq!(all.len(), 5);
         for batch in &batches {
             let main_cnt = batch

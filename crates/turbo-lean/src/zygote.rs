@@ -6006,7 +6006,9 @@ pub(crate) fn run_audited_lean_shard_at_with_full_report(
         cmd.current_dir(dir);
     }
     run_digest_test_hook("audited_shard_before_lean");
+    let elab_timer = crate::check::PhaseTimer::start("elab");
     let out_res = run_lean_command(&mut cmd, timeout_ms);
+    drop(elab_timer);
     reap_processes_with_nonce(&nonce_env_val);
     let out = out_res.context("Failed to execute `lean` on shard fallback")?;
     run_digest_test_hook("audited_shard_after_lean");
@@ -6137,10 +6139,12 @@ pub(crate) fn run_audited_lean_shard_at_with_full_report(
     if let Some(left) = budget_left("the shard audit")? {
         audit_timeout = audit_timeout.min(left);
     }
+    let kernel_timer = crate::check::PhaseTimer::start("kernel");
     let audit_out =
         crate::module_builder::run_command_with_timeout(&mut auditor, audit_timeout, false)
             .context("Failed to execute in-kernel shard auditor (`--audit-modules --shard`)")?;
     let parsed_reply = parse_audit_modules_reply(&audit_out, std::slice::from_ref(&mod_name))?;
+    drop(kernel_timer);
     let decls = parsed_reply.decls.unwrap_or_default();
     let missing: Vec<&String> = audit
         .iter()
@@ -7729,6 +7733,10 @@ fn eval_with_zygote_pool_attempt(
 
     let run_worker_req =
         |worker: &mut ZygoteChild, req_line: &str, req_id: &str| -> WorkerReqOutcome {
+            // The worker protocol does not split elaboration from its inline
+            // kernel checks. Measure the combined request here; kernel_ms is
+            // reserved for separately invoked replay/audit operations.
+            let _elab_timer = crate::check::PhaseTimer::start("elab");
             if std::time::Instant::now() >= deadline {
                 return worker_timeout(worker, req_id);
             }

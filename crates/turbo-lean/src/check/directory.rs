@@ -44,6 +44,8 @@ pub(super) fn check_directory(
         crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(canon_dir, &dir_files);
     }
     fresh_res?;
+    super::record_phase("import_refresh", refresh_start);
+    let kernel_timer = super::PhaseTimer::start("kernel");
     let import_res = crate::module_builder::ensure_imported_oleans_replayed_with_options(
         store,
         canon_dir,
@@ -54,7 +56,7 @@ pub(super) fn check_directory(
         crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(canon_dir, &dir_files);
     }
     import_res?;
-    super::record_phase("import_refresh", refresh_start);
+    drop(kernel_timer);
     let mut dir_hasher = blake3::Hasher::new();
     dir_hasher.update(b"dir-check-v2\n");
     dir_hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
@@ -543,7 +545,9 @@ pub(super) fn check_directory(
                 let tc_ref = toolchain;
                 let lp_ref = &lean_path_str;
 
+                let phases = super::phase_context();
                 handles.push(s.spawn(move || -> Result<Vec<DirBatchItem>> {
+                    super::set_phase_context(phases);
                     let worker_store = TurboStore::open(Some(store_root))?;
                     let mut items = Vec::new();
                     loop {

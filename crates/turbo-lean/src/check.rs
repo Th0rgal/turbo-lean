@@ -48,18 +48,28 @@ pub(super) struct CheckPhaseTimings {
 
 thread_local! {
     static CHECK_START: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
-    static PHASES: std::cell::Cell<CheckPhaseTimings> = const {
-        std::cell::Cell::new(CheckPhaseTimings {
-            hygiene_ms: 0, import_refresh_ms: 0, identity_ms: 0,
-            cache_ms: 0, elab_ms: 0, kernel_ms: 0,
-        })
-    };
+    static PHASES: std::cell::RefCell<std::sync::Arc<std::sync::Mutex<CheckPhaseTimings>>> =
+        std::cell::RefCell::new(std::sync::Arc::new(std::sync::Mutex::new(CheckPhaseTimings::default())));
+}
+
+pub(super) fn reset_phases() {
+    PHASES.with(|p| *p.borrow_mut() = std::sync::Arc::default());
+}
+
+/// Share only the current check's counters with its scoped workers.
+pub(super) fn phase_context() -> std::sync::Arc<std::sync::Mutex<CheckPhaseTimings>> {
+    PHASES.with(|p| p.borrow().clone())
+}
+
+pub(super) fn set_phase_context(context: std::sync::Arc<std::sync::Mutex<CheckPhaseTimings>>) {
+    PHASES.with(|p| *p.borrow_mut() = context);
 }
 
 /// Add measured work, keeping unrelated startup/locking overhead outside phases.
 pub(super) fn record_phase(name: &str, start: Instant) {
     PHASES.with(|cell| {
-        let mut p = cell.get();
+        let context = cell.borrow();
+        let mut p = context.lock().unwrap_or_else(|e| e.into_inner());
         let ms = start.elapsed().as_millis() as i64;
         match name {
             "hygiene" => p.hygiene_ms += ms,
@@ -70,24 +80,58 @@ pub(super) fn record_phase(name: &str, start: Instant) {
             "kernel" => p.kernel_ms += ms,
             _ => unreachable!("unknown check phase"),
         }
-        cell.set(p);
     });
+}
+
+/// Measures an actual operation, including failed attempts. Nested spans of the
+/// same phase are counted only once. Zero means no separately measured work.
+pub(crate) struct PhaseTimer {
+    phase: &'static str,
+    start: Instant,
+    outer: bool,
+}
+
+thread_local! {
+    static ACTIVE_PHASES: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl PhaseTimer {
+    pub(crate) fn start(phase: &'static str) -> Self {
+        let outer = ACTIVE_PHASES.with(|active| {
+            let mut active = active.borrow_mut();
+            let outer = !active.contains(&phase);
+            active.push(phase);
+            outer
+        });
+        Self {
+            phase,
+            start: Instant::now(),
+            outer,
+        }
+    }
+}
+
+impl Drop for PhaseTimer {
+    fn drop(&mut self) {
+        ACTIVE_PHASES.with(|active| {
+            let mut active = active.borrow_mut();
+            let index = active
+                .iter()
+                .rposition(|phase| *phase == self.phase)
+                .expect("active phase");
+            active.remove(index);
+        });
+        if self.outer {
+            record_phase(self.phase, self.start);
+        }
+    }
 }
 
 pub(super) fn insert_check_timings(out: &mut serde_json::Value, t0: Instant) {
     let elapsed = out["elapsed_ms"].as_i64().unwrap_or(0);
     let start = CHECK_START.with(|start| start.get()).unwrap_or(t0);
     let wall = process_wall_ms(start).max(elapsed);
-    let mut phases = PHASES.with(|p| p.get());
-    // Worker telemetry splits the combined elaboration/kernel IPC operation.
-    for (key, value) in [
-        ("zygote_elab_us", &mut phases.elab_ms),
-        ("zygote_kernel_us", &mut phases.kernel_ms),
-    ] {
-        if let Some(us) = out[key].as_u64() {
-            *value = (us / 1000) as i64;
-        }
-    }
+    let phases = PHASES.with(|p| *p.borrow().lock().unwrap_or_else(|e| e.into_inner()));
     out["wall_ms"] = wall.into();
     out["phases"] = serde_json::to_value(phases).expect("phase serialization");
     let summary = out["compact_summary"].as_str().unwrap_or("OK");
@@ -98,6 +142,26 @@ pub(super) fn insert_check_timings(out: &mut serde_json::Value, t0: Instant) {
 #[allow(clippy::items_after_test_module)]
 mod wallclock_tests {
     use super::*;
+
+    #[test]
+    fn phase_context_aggregates_workers_and_deduplicates_nested_spans() {
+        reset_phases();
+        let context = phase_context();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                set_phase_context(context);
+                let _outer = PhaseTimer::start("kernel");
+                let _inner = PhaseTimer::start("kernel");
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            });
+        });
+        let phases = phase_context();
+        let phases = *phases.lock().unwrap();
+        assert!(phases.kernel_ms >= 20);
+        assert_eq!(phases.elab_ms, 0);
+        reset_phases();
+        assert_eq!(phase_context().lock().unwrap().kernel_ms, 0);
+    }
 
     #[test]
     fn check_wallclock_json_and_direct_call() -> Result<()> {
@@ -576,7 +640,7 @@ pub(crate) fn run_check_command_inner(
     }
     let t0 = Instant::now();
     CHECK_START.with(|start| start.set(Some(t0)));
-    PHASES.with(|p| p.set(CheckPhaseTimings::default()));
+    reset_phases();
     let _lifecycle = crate::zygote::lifecycle_lock(false)?;
     let (canon_dir, mut resolved_file) = resolve_check_project_and_target(&file, &project_dir);
     crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
@@ -683,6 +747,8 @@ pub(crate) fn run_check_command_inner(
             );
         }
         fresh_res?;
+        record_phase("import_refresh", refresh_start);
+        let kernel_timer = PhaseTimer::start("kernel");
         let import_res = crate::module_builder::ensure_imported_oleans_replayed_with_options(
             store,
             &canon_dir,
@@ -696,7 +762,7 @@ pub(crate) fn run_check_command_inner(
             );
         }
         import_res?;
-        record_phase("import_refresh", refresh_start);
+        drop(kernel_timer);
     }
     let file_stat_tuple: Option<(i64, i64, i64)> = fs::metadata(&canon_resolved_initial)
         .ok()

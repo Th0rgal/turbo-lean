@@ -169,8 +169,11 @@ See [`sdk/accelerator-template/`](sdk/accelerator-template/README.md) for the ze
 `check --json` reports process-entry `wall_ms` alongside the existing check-local
 `elapsed_ms`, plus `phases` (`hygiene_ms`, `import_refresh_ms`, `identity_ms`,
 `cache_ms`, `elab_ms`, `kernel_ms`). Startup and lock overhead is included in wall
-time but is not attributed to a verification phase. Worker-reported elaboration
-time is used where available; combined audited subprocess work is kernel time.
+time but is not attributed to a verification phase. `elab_ms` measures worker
+requests (including inline kernel checks) or fallback compilation; `kernel_ms`
+measures separately invoked import replay and shard audits. Phases accumulate
+measured operation time across scoped workers, so their sum can exceed wall time.
+Zero means no separately measured whole millisecond, not proof that no work ran.
 
 Run the reproducible harness with prebuilt Lean v4.35.0 projects:
 

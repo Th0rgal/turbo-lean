@@ -1099,7 +1099,9 @@ pub(super) fn check_single_file(
                     let args_ref = &file_lean_args;
                     let kth_ref = &attested_kths;
 
+                    let phases = super::phase_context();
                     handles.push(s.spawn(move || -> Result<Vec<(String, &splitter::TheoremShard, i64)>> {
+                        super::set_phase_context(phases);
                             let worker_store = TurboStore::open(Some(store_root))?;
                             let mut verified = Vec::new();
                             loop {

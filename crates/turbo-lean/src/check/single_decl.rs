@@ -3738,7 +3738,6 @@ pub(super) fn check_single_decl(
         }
         let (env_vars, _) = resolve_lake_env(store, canon_dir)?;
         let lean_bin = resolve_lean_bin(canon_dir)?;
-        let kernel_start = Instant::now();
         let (output, report) = crate::zygote::run_audited_lean_shard_at_with_full_report(
             &store.root,
             &store.fast_staging_dir(),
@@ -3754,7 +3753,6 @@ pub(super) fn check_single_decl(
             &file_lean_args,
             Some(crate::zygote::remaining_timeout_ms(None, *t0)),
         )?;
-        super::record_phase("kernel", kernel_start);
         anyhow::ensure!(
             output.status.success() && !report.used_sorry && report.sorry_decls.is_empty(),
             "Soundness audit failed for `{target_decl}`: {}{}",
@@ -4508,7 +4506,6 @@ pub(super) fn check_single_decl(
         }
         SingleflightOutcome::Leader(lease) => {
             super::record_phase("cache", cache_start);
-            let verification_start = Instant::now();
             let same_as_initial = active_file == resolved_file;
             let canon_file = if same_as_initial {
                 canon_resolved_initial.to_path_buf()
@@ -5504,7 +5501,6 @@ pub(super) fn check_single_decl(
                 }
             }
 
-            super::record_phase("kernel", verification_start);
             let dur_ms = t0.elapsed().as_millis() as i64;
             let distilled_non_core: Vec<String> = used_constants
                 .iter()

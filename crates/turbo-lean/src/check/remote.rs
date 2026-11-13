@@ -229,7 +229,7 @@ pub fn try_stateless_remote_check(
     remote_url: &str,
 ) -> Result<bool> {
     super::CHECK_START.with(|start| start.set(Some(Instant::now())));
-    super::PHASES.with(|p| p.set(super::CheckPhaseTimings::default()));
+    super::reset_phases();
     let (inferred_canon_dir, _) = resolve_check_project_and_target(file, project_dir);
     let kernel_prov = crate::kernel::resolve_kernel_engine(
         crate::kernel::resolve_kernel_selection_from_env(None)?,

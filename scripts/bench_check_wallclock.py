@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -27,15 +28,18 @@ PHASES = (
 )
 
 
-def check(binary, project, file, cache, timeout, decl=None):
+def check(binary, project, file, cache, timeout, decl=None, workload=None):
     command = [str(binary), "check", str(file), "--json", "--project-dir",
                str(project), "--cache-dir", str(cache), "--timeout", str(timeout)]
     if decl:
         command += ["--decl", decl]
     start = time.perf_counter()
+    env = os.environ.copy()
+    if workload:
+        env["TURBO_WALLCLOCK_WORKLOAD"] = workload
     try:
         proc = subprocess.run(command, capture_output=True, text=True,
-                              timeout=timeout + 30, check=False)
+                              timeout=timeout + 30, check=False, env=env)
         external = (time.perf_counter() - start) * 1000
         if proc.returncode:
             return {"ok": False, "external_wall_ms": external,
@@ -82,15 +86,16 @@ def latency_case(args, project, relative, decl, cache):
     return row
 
 
-def sample_pss(stop, peak):
+def sample_pss(stop, peak, workload):
+    # Inherited by children and persistent daemons, unlike ancestry after reparenting.
+    marker = f"TURBO_WALLCLOCK_WORKLOAD={workload}".encode()
     while not stop.wait(0.025):
         total = 0
         for proc in Path("/proc").iterdir():
             if not proc.name.isdigit():
                 continue
             try:
-                cmd = (proc / "cmdline").read_bytes()
-                if not any(x in cmd for x in (b"turbo-lean", b"zygote", b"Zygote")):
+                if marker not in (proc / "environ").read_bytes().split(b"\0"):
                     continue
                 for line in (proc / "smaps_rollup").read_text().splitlines():
                     if line.startswith("Pss:"):
@@ -123,19 +128,21 @@ def concurrency(args, cache):
             file.write_text("import Batteries.Data.List.Lemmas\n"
                             f"theorem agent_work : {i} = {i} := by rfl\n")
             files.append(file)
-        warmup = check(args.binary, project, files[0], cache, args.timeout, "agent_work")
+        workload = uuid.uuid4().hex
+        warmup = check(args.binary, project, files[0], cache, args.timeout,
+                       "agent_work", workload)
         for i, file in enumerate(files):
             file.write_text("import Batteries.Data.List.Lemmas\n"
                             f"theorem agent_work : {i + 100} = {i + 100} := by rfl\n")
         stop = threading.Event()
         peak = [0.0]
-        sampler = threading.Thread(target=sample_pss, args=(stop, peak))
+        sampler = threading.Thread(target=sample_pss, args=(stop, peak, workload))
         sampler.start()
         try:
             with ThreadPoolExecutor(max_workers=8) as executor:
                 results = list(executor.map(
                     lambda file: check(args.binary, project, file, cache,
-                                       args.timeout, "agent_work"), files))
+                                        args.timeout, "agent_work", workload), files))
         finally:
             stop.set()
             sampler.join()
@@ -145,7 +152,8 @@ def concurrency(args, cache):
             "total_pss_mb": round(peak[0], 2),
             "wall_p50_ms": statistics.median(walls),
             "wall_p95_ms": walls[math.ceil(0.95 * len(walls)) - 1],
-            "pss_scope": "peak summed Linux PSS of turbo/zygote processes on this VM",
+             "pss_scope": "peak summed Linux PSS of uniquely marked workload processes",
+             "cow_fork_verified": False,
             "warmup": warmup, "results": results}
 
 

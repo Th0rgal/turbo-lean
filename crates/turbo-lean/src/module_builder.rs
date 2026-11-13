@@ -26223,12 +26223,13 @@ pub(crate) fn build_project_modules_native_with_options(
                             audited_waiting_ancestors.insert(mod_name, mod_outcome);
                         }
                     }
-                    let mut pending_snap_records: Vec<(
+                    type PendingSnapshotRecord = (
                         usize,
                         std::sync::Arc<crate::zygote::ClosureSnapshot>,
                         Vec<String>,
                         Vec<String>,
-                    )> = Vec::new();
+                    );
+                    let mut pending_snap_records: Vec<PendingSnapshotRecord> = Vec::new();
                     while let Some((mod_name, (mod_audit_res, snap_auth_opt))) =
                         finalize_queue.pop_front()
                     {

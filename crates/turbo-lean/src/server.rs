@@ -10,8 +10,8 @@ use crate::pack::{
     run_or_read_cached_fastcheck_bin, save_compiled_bin_to_shared, shared_cas_blobs_dir,
     shared_fastcheck_cgen_path, try_import_from_shared_cas_with_domain, try_parse_v3_header,
     try_populate_cached_bin_from_shared, CheckShardHttpRequest, CheckShardsBatchRequest,
-    CheckShardsBatchResponse, ExportDeltaRequest, FastCheckHttpRequest,
-    FASTCHECK_NO_MAIN_SUFFIX, FASTCHECK_PRELUDE_HARNESS,
+    CheckShardsBatchResponse, ExportDeltaRequest, FastCheckHttpRequest, FASTCHECK_NO_MAIN_SUFFIX,
+    FASTCHECK_PRELUDE_HARNESS,
 };
 use crate::zygote::LocalZygoteDaemonInfo;
 use anyhow::{Context, Result};
@@ -33,16 +33,25 @@ thread_local! {
 
 impl Read for LocalOrTcpStream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self { Self::Tcp(s) => s.read(buf), Self::Unix(s) => s.read(buf) }
+        match self {
+            Self::Tcp(s) => s.read(buf),
+            Self::Unix(s) => s.read(buf),
+        }
     }
 }
 
 impl Write for LocalOrTcpStream {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self { Self::Tcp(s) => s.write(buf), Self::Unix(s) => s.write(buf) }
+        match self {
+            Self::Tcp(s) => s.write(buf),
+            Self::Unix(s) => s.write(buf),
+        }
     }
     fn flush(&mut self) -> std::io::Result<()> {
-        match self { Self::Tcp(s) => s.flush(), Self::Unix(s) => s.flush() }
+        match self {
+            Self::Tcp(s) => s.flush(),
+            Self::Unix(s) => s.flush(),
+        }
     }
 }
 
@@ -250,16 +259,37 @@ mod tests {
 
     #[test]
     fn shard_policy_is_complete_and_untrusted_requests_are_empty() -> anyhow::Result<()> {
-        let root = std::env::temp_dir().join(format!("shard-policy-{}-{}", std::process::id(), crate::pack::next_tmp_id()));
+        let root = std::env::temp_dir().join(format!(
+            "shard-policy-{}-{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
         let store = crate::db::TurboStore::open(Some(&root))?;
-        let policy = crate::zygote::REQUEST_POLICY_KEYS.into_iter()
-            .map(|key| (key.to_string(), "Policy.explicit".to_string())).collect();
+        let policy = crate::zygote::REQUEST_POLICY_KEYS
+            .into_iter()
+            .map(|key| (key.to_string(), "Policy.explicit".to_string()))
+            .collect();
         crate::zygote::set_inbound_policy(policy);
         for domain in ["trusted", "untrusted"] {
             let (_, env, _) = super::HttpShardReceiptContext::resolve_base(
-                &store, "leanprover/lean4:v4.35.0", "", "import Init\n", None, &[], "", domain)?;
+                &store,
+                "leanprover/lean4:v4.35.0",
+                "",
+                "import Init\n",
+                None,
+                &[],
+                "",
+                domain,
+            )?;
             for key in crate::zygote::REQUEST_POLICY_KEYS.into_iter().skip(1) {
-                assert_eq!(env.get(key).map(String::as_str), Some(if domain == "trusted" { "Policy.explicit" } else { "" }));
+                assert_eq!(
+                    env.get(key).map(String::as_str),
+                    Some(if domain == "trusted" {
+                        "Policy.explicit"
+                    } else {
+                        ""
+                    })
+                );
             }
             assert_eq!(env[crate::splitter::ALLOWED_AXIOMS_ENV], "");
         }
@@ -452,16 +482,22 @@ pub fn serve_cas_http_with_auth(
     crate::zygote::ensure_staging_namespace_dir(true)?;
     let listener = TcpListener::bind(listen_addr)
         .with_context(|| format!("Failed to bind turbo-lean server on {}", listen_addr))?;
-    let socket_path = is_daemon.then(|| std::env::var_os("TURBO_LEAN_DAEMON_SOCKET")).flatten().map(std::path::PathBuf::from);
-    let unix_listener = socket_path.as_ref().map(|path| -> Result<_> {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = fs::remove_file(path);
-        let (bind_path, _directory) = crate::zygote::unix_socket_path(path)?;
-        let listener = std::os::unix::net::UnixListener::bind(bind_path)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-        listener.set_nonblocking(true)?;
-        Ok(listener)
-    }).transpose()?;
+    let socket_path = is_daemon
+        .then(|| std::env::var_os("TURBO_LEAN_DAEMON_SOCKET"))
+        .flatten()
+        .map(std::path::PathBuf::from);
+    let unix_listener = socket_path
+        .as_ref()
+        .map(|path| -> Result<_> {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::remove_file(path);
+            let (bind_path, _directory) = crate::zygote::unix_socket_path(path)?;
+            let listener = std::os::unix::net::UnixListener::bind(bind_path)?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            listener.set_nonblocking(true)?;
+            Ok(listener)
+        })
+        .transpose()?;
     if let Ok(state_path) = std::env::var("TURBO_LEAN_DAEMON_STATE_FILE") {
         if let Ok(current_exe) = std::env::current_exe() {
             let (exe_mtime_sec, exe_mtime_nsec, _) = fs::metadata(&current_exe)
@@ -600,7 +636,9 @@ pub fn serve_cas_http_with_auth(
         // Admission and expiry have one owner and one lock. No accepted connection can
         // be waiting for this lock when we decide to close the listening socket.
         let mut state = activity.lock().unwrap();
-        let accepted = unix_listener.as_ref().map(|l| l.accept().map(|(s, _)| LocalOrTcpStream::Unix(s)))
+        let accepted = unix_listener
+            .as_ref()
+            .map(|l| l.accept().map(|(s, _)| LocalOrTcpStream::Unix(s)))
             .filter(|r| !matches!(r, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock))
             .unwrap_or_else(|| {
                 listener
@@ -617,7 +655,9 @@ pub fn serve_cas_http_with_auth(
                     // Withdraw every discovery file before committing to shutdown.
                     drop(listener.take());
                     drop(unix_listener.take());
-                    if let Some(path) = &socket_path { let _ = fs::remove_file(path); }
+                    if let Some(path) = &socket_path {
+                        let _ = fs::remove_file(path);
+                    }
                     let lifecycle = crate::zygote::lifecycle_exclusive_lock()?;
                     for key in [
                         "TURBO_LEAN_DAEMON_STATE_FILE",
@@ -676,7 +716,10 @@ pub fn serve_cas_http_with_auth(
             // rejected 503 opens none. Concurrent handlers are safe because every memo entry
             // records its window; see `module_builder::reset_lake_inputs_tag_memo`.
             crate::module_builder::reset_lake_inputs_tag_memo();
-            struct ConnDropGuard(std::sync::Arc<std::sync::Mutex<ServerActivity>>, Option<std::os::unix::net::UnixStream>);
+            struct ConnDropGuard(
+                std::sync::Arc<std::sync::Mutex<ServerActivity>>,
+                Option<std::os::unix::net::UnixStream>,
+            );
             impl Drop for ConnDropGuard {
                 fn drop(&mut self) {
                     crate::zygote::clear_inbound_policy();
@@ -684,7 +727,8 @@ pub fn serve_cas_http_with_auth(
                         let payload = slot.borrow_mut().take().flatten();
                         if payload.is_some() {
                             if let Some(stream) = &mut self.1 {
-                                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+                                let _ = stream
+                                    .set_read_timeout(Some(std::time::Duration::from_secs(30)));
                                 let _ = stream.read_exact(&mut [0u8; 1]);
                             }
                         }
@@ -694,7 +738,10 @@ pub fn serve_cas_http_with_auth(
                 }
             }
             crate::zygote::clear_inbound_policy();
-            let reply_stream = match &stream { LocalOrTcpStream::Unix(s) => s.try_clone().ok(), _ => None };
+            let reply_stream = match &stream {
+                LocalOrTcpStream::Unix(s) => s.try_clone().ok(),
+                _ => None,
+            };
             LOCAL_REPLY.with(|slot| *slot.borrow_mut() = local_transport.then_some(None));
             let _conn_guard = ConnDropGuard(activity_guard, reply_stream);
             let request_started = std::time::Instant::now();
@@ -721,7 +768,10 @@ pub fn serve_cas_http_with_auth(
                     }
                     if hline.len() >= 15 && hline[..15].eq_ignore_ascii_case("content-length:") {
                         content_len = hline[15..].trim().parse().unwrap_or(0);
-                    } else if let Some((key, value)) = hline.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("x-turbo-shm")) {
+                    } else if let Some((key, value)) = hline
+                        .split_once(':')
+                        .filter(|(k, _)| k.eq_ignore_ascii_case("x-turbo-shm"))
+                    {
                         let _ = key;
                         shared_payload = Some(value.trim().to_string());
                     } else if hline.len() >= 14
@@ -862,7 +912,13 @@ pub fn serve_cas_http_with_auth(
                             );
                             let _ = write_json_response(&mut stream, 200, &reply);
                         }
-                        Err(error) => { let _ = write_json_response(&mut stream, 400, &serde_json::json!({"error": error.to_string()})); }
+                        Err(error) => {
+                            let _ = write_json_response(
+                                &mut stream,
+                                400,
+                                &serde_json::json!({"error": error.to_string()}),
+                            );
+                        }
                     }
                 }
                 ("GET", "/health") | ("GET", "/status") => {
@@ -892,12 +948,12 @@ pub fn serve_cas_http_with_auth(
                 ("GET", "/export-local") | ("GET", "/export") => {
                     if let Ok(reader) = TurboStore::open(store_root_clone.as_deref()) {
                         if let Ok((_, _, _, bytes)) = export_pack_filtered_with_mode(
-                                &reader,
-                                true,
-                                &HashSet::new(),
-                                &HashSet::new(),
-                                path == "/export-local",
-                            ) {
+                            &reader,
+                            true,
+                            &HashSet::new(),
+                            &HashSet::new(),
+                            path == "/export-local",
+                        ) {
                             let _ = write_pack_response(&mut stream, 200, &bytes);
                         }
                     }
@@ -910,7 +966,11 @@ pub fn serve_cas_http_with_auth(
                         if let Ok((actions, blobs, _, bytes)) =
                             export_pack_filtered_bytes(&st_store, true, &ex_actions, &ex_blobs)
                         {
-                            let payload = if path == "/pull-delta" && actions == 0 && blobs == 0 { &[][..] } else { &bytes };
+                            let payload = if path == "/pull-delta" && actions == 0 && blobs == 0 {
+                                &[][..]
+                            } else {
+                                &bytes
+                            };
                             let _ = write_pack_response(&mut stream, 200, payload);
                         }
                     }
@@ -923,9 +983,7 @@ pub fn serve_cas_http_with_auth(
                                 match resolve_pack_import_trust_domain(&manifest, None, None, false)
                                 {
                                     Ok(td) => match try_import_from_shared_cas_with_domain(
-                                        &mut store,
-                                        &manifest,
-                                        td,
+                                        &mut store, &manifest, td,
                                     ) {
                                         Ok(Some(v)) => Some(Ok(v)),
                                         Ok(None) => None,
@@ -1338,11 +1396,14 @@ pub fn serve_cas_http_with_auth(
                         eval_allowed_csv,
                     );
                     for key in crate::zygote::REQUEST_POLICY_KEYS.into_iter().skip(1) {
-                        env_vars.insert(key.to_string(), if caller_authorized_trusted {
-                            req.policy_tags.get(key).cloned().unwrap_or_default()
-                        } else {
-                            String::new()
-                        });
+                        env_vars.insert(
+                            key.to_string(),
+                            if caller_authorized_trusted {
+                                req.policy_tags.get(key).cloned().unwrap_or_default()
+                            } else {
+                                String::new()
+                            },
+                        );
                     }
                     let pre_resolved = if let Some(expected) = req.execution_identity.as_deref() {
                         let (imports, _) = crate::zygote::split_shard_for_zygote(src);
@@ -1670,6 +1731,7 @@ fn compute_server_target_digest(
 }
 
 impl HttpShardReceiptContext {
+    #[allow(clippy::too_many_arguments)]
     fn resolve_base(
         store: &TurboStore,
         toolchain: &str,
@@ -1687,7 +1749,14 @@ impl HttpShardReceiptContext {
         let (mut env_vars, lean_bin) =
             resolve_server_lean_env_and_bin(store, toolchain, req_lean_path)?;
         for (key, value) in crate::zygote::request_policy(&env_vars) {
-            env_vars.insert(key, if trust_domain == "trusted" { value } else { String::new() });
+            env_vars.insert(
+                key,
+                if trust_domain == "trusted" {
+                    value
+                } else {
+                    String::new()
+                },
+            );
         }
         env_vars.insert(
             crate::splitter::ALLOWED_AXIOMS_ENV.to_string(),
@@ -3003,9 +3072,13 @@ fn write_http_response_with_headers(
             let tag = payload.tag();
             *slot.borrow_mut() = Some(Some(payload));
             Ok(Some(tag))
-        } else { Ok(None) }
+        } else {
+            Ok(None)
+        }
     })?;
-    let shared_header = payload.as_ref().map(|tag| format!("X-Turbo-Shm: {tag}\r\n{extra_headers}"));
+    let shared_header = payload
+        .as_ref()
+        .map(|tag| format!("X-Turbo-Shm: {tag}\r\n{extra_headers}"));
     let extra_headers = shared_header.as_deref().unwrap_or(extra_headers);
     let body = if payload.is_some() { &[][..] } else { body };
     let status_text = match status {
