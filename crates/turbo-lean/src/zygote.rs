@@ -7804,7 +7804,14 @@ fn eval_with_zygote_pool_attempt(
                                 if let Ok(mut file) =
                                     fs::OpenOptions::new().create(true).append(true).open(path)
                                 {
-                                    let _ = writeln!(file, "{} {}", std::process::id(), pid);
+                                    let _ = writeln!(
+                                        file,
+                                        "{}",
+                                        serde_json::json!({
+                                            "host_pid": std::process::id(), "worker_pid": pid,
+                                            "request_source": shard_source,
+                                        })
+                                    );
                                 }
                             }
                         }

@@ -8,6 +8,7 @@ process trees and persistent zygote workers, counting each PID once.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -29,6 +30,16 @@ PHASES = (
 )
 
 
+def provenance(binary):
+    def git(*args):
+        return subprocess.check_output(["git", *args], cwd=ROOT, text=True).strip()
+    return {"source_head": git("rev-parse", "HEAD"),
+            "source_tree": git("rev-parse", "HEAD^{tree}"),
+            "source_dirty": bool(git("status", "--porcelain")),
+            "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+            "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+
+
 def check(binary, project, file, cache, timeout, decl=None, workload=None):
     command = [str(binary), "check", str(file), "--json", "--project-dir",
                str(project), "--cache-dir", str(cache), "--timeout", str(timeout)]
@@ -40,16 +51,25 @@ def check(binary, project, file, cache, timeout, decl=None, workload=None):
         env["TURBO_WALLCLOCK_WORKLOAD"] = workload
         env["TURBO_LEAN_FORK_EVIDENCE"] = str(cache / "fork-evidence.log")
     try:
-        proc = subprocess.run(command, capture_output=True, text=True,
-                              timeout=timeout + 30, check=False, env=env)
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, env=env) as proc:
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout + 30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.communicate()
+                raise
+            cli_pid = proc.pid
         external = (time.perf_counter() - start) * 1000
         if proc.returncode:
             return {"ok": False, "external_wall_ms": external,
-                    "error": proc.stderr.strip(), "returncode": proc.returncode}
-        result = json.loads(proc.stdout)
+                    "error": stderr.strip(), "returncode": proc.returncode,
+                    "cli_pid": cli_pid, "decl_requested": decl}
+        result = json.loads(stdout)
         assert result["wall_ms"] >= result["elapsed_ms"]
         assert all(result["phases"][key] >= 0 for key in PHASES)
-        return {"ok": True, "external_wall_ms": external, **result}
+        return {"ok": True, "external_wall_ms": external, **result,
+                "cli_pid": cli_pid, "decl_requested": decl}
     except (subprocess.TimeoutExpired, ValueError, KeyError, AssertionError) as err:
         return {"ok": False, "external_wall_ms": (time.perf_counter() - start) * 1000,
                 "error": str(err)}
@@ -142,7 +162,7 @@ def concurrency(args, cache):
         for i in range(8):
             file = directory / f"Agent{i}.lean"
             file.write_text(f"import {imported_module}\n"
-                            f"theorem agent_work : {i} = {i} := by rfl\n")
+                             f"theorem agent_work_{i} : {i} = {i} := by rfl\n")
             files.append(file)
         # Materialize the exact shared import closure before launching clients.
         # Lake publication during the measured window would benchmark a build
@@ -154,14 +174,14 @@ def concurrency(args, cache):
             raise RuntimeError("concurrency import preparation failed: " + prepared.stderr)
         workload = uuid.uuid4().hex
         warmup = check(binary, project, files[0], cache, args.timeout,
-                       "agent_work", workload)
+                       "agent_work_0", workload)
         evidence = cache / "fork-evidence.log"
         # Warmup is not evidence that any of the eight measured checks forked.
         if evidence.is_file():
             evidence.write_text("")
         for i, file in enumerate(files):
             file.write_text(f"import {imported_module}\n"
-                            f"theorem agent_work : {i + 100} = {i + 100} := by rfl\n")
+                             f"theorem agent_work_{i} : {i + 100} = {i + 100} := by rfl\n")
         stop = threading.Event()
         peak = [0.0]
         sampler = threading.Thread(target=sample_pss, args=(stop, peak, workload))
@@ -169,21 +189,33 @@ def concurrency(args, cache):
         try:
             with ThreadPoolExecutor(max_workers=8) as executor:
                 results = list(executor.map(
-                    lambda file: check(binary, project, file, cache,
-                                        args.timeout, "agent_work", workload), files))
+                    lambda item: check(binary, project, item[1], cache,
+                                        args.timeout, f"agent_work_{item[0]}", workload),
+                    enumerate(files)))
         finally:
             stop.set()
             sampler.join()
-        fork_requests = evidence.read_text().splitlines() if evidence.is_file() else []
+        fork_requests = [json.loads(line) for line in evidence.read_text().splitlines()
+                         ] if evidence.is_file() else []
+        correlations = [{"cli_pid": result.get("cli_pid"),
+                         "decl": result.get("decl_requested"),
+                         "fork_requests": [event for event in fork_requests
+                            if re.search(r"\b" + re.escape(result["decl_requested"]) + r"\b",
+                                         event["request_source"])]}
+                        for result in results]
     walls = sorted(result["external_wall_ms"] for result in results)
     return {"work_units": len(results),
+             "provenance": provenance(args.binary),
              "imported_module": imported_module,
             "error_count": sum(not result["ok"] for result in results),
             "total_pss_mb": round(peak[0], 2),
             "wall_p50_ms": statistics.median(walls),
             "wall_p95_ms": walls[math.ceil(0.95 * len(walls)) - 1],
              "pss_scope": "peak summed Linux PSS of uniquely marked workload processes",
-             "cow_fork_verified": bool(fork_requests),
+              "cow_fork_verified": len({r.get("cli_pid") for r in results}) == 8
+                  and all(r["ok"] and c["fork_requests"]
+                          for r, c in zip(results, correlations)),
+              "work_unit_correlations": correlations,
              "successful_fork_requests": fork_requests,
             "warmup": warmup, "results": results}
 
@@ -229,7 +261,8 @@ def main():
              (args.batteries_dir, "Batteries/Data/List/Lemmas.lean", None),
              (args.pfr_dir, "PFR/Mathlib/Probability/IdentDistrib.lean", None)]
     with tempfile.TemporaryDirectory(prefix="turbo-wallclock-") as tmp:
-        report = {"schema_version": 1, "binary": str(args.binary),
+        report = {"schema_version": 2, "binary": str(args.binary),
+                  "provenance": provenance(args.binary),
                   "cpu_count": os.cpu_count(), "latency": [
                       latency_case(args, project, file, decl, Path(tmp) / str(i))
                       for i, (project, file, decl) in enumerate(cases)]}
