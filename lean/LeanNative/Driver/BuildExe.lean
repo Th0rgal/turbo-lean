@@ -120,7 +120,11 @@ def emitLeanCFromSourceFile (filePath : String) (modName : Lean.Name := `Main)
           pure (match d? with
             | some d => match d.value with | .code c => collectNamedCallees c | _ => []
             | none => [])
-      for callee in callees do
+      -- Source dependencies survive even when persisted LCNF has inlined them.
+      let sourceCallees := match env.find? n with
+        | some (.defnInfo d) => d.value.getUsedConstants.toList
+        | _ => []
+      for callee in (callees ++ sourceCallees) do
         if belongsToInput callee && !Lean.isExtern env callee && !selected.contains callee then
           selected := selected.push callee
       cursor := cursor + 1

@@ -250,6 +250,79 @@ def ingestAllLocalDecls (moduleName : String := "LeanNative.Ingested")
     if impureNames.contains name || isCompilerGeneratedAuxDecl env name then acc else acc.push name) #[]
   ingestModuleDecls (filteredImpure ++ extraNames) moduleName arch allowRcAdt
 
+/-- A small typed source frontend preserves scalar helper calls that Lean's
+    persisted mono LCNF has already inlined. Every accepted node is UInt64;
+    unsupported source forms fall back to the LCNF bridge. This path is tested,
+    not covered by the RealLCNFBridge refinement theorem. -/
+private def tryIngestScalarSource (name : Lean.Name) : Lean.CoreM (Option LNIRDecl) := do
+  let env ← getEnv
+  let some (.defnInfo info) := env.find? name | return none
+  if info.safety != .safe || !info.levelParams.isEmpty || Lean.isExtern env name then return none
+  let action : Lean.MetaM (Option LNIRDecl) := do
+    let u64 := Lean.mkConst ``UInt64
+    let rec signature (ty : Lean.Expr) (count : Nat) : Lean.MetaM (Option Nat) := do
+      let ty ← Lean.Meta.withTransparency .reducible (Lean.Meta.whnf ty)
+      match ty with
+      | .forallE _ t b _ =>
+        if t.hasLooseBVars || (← Lean.Meta.withTransparency .reducible (Lean.Meta.whnf t)) != u64 then return none
+        signature b (count + 1)
+      | _ => return if ty == u64 then some count else none
+    let some arity ← signature info.type 0 | return none
+    if arity == 0 then return none
+    let rec peel (n : Nat) (e : Lean.Expr) (scope : List VarId) : Option (Lean.Expr × List VarId) :=
+      match n, e with
+      | 0, _ => some (e, scope)
+      | n + 1, .lam _ _ b _ => peel n b ((arity - n - 1) :: scope)
+      | _, _ => none
+    let some (body, scope) := peel arity info.value [] | return none
+    let rec lower (fuel : Nat) (e : Lean.Expr) (scope : List VarId)
+        (next : VarId) : Lean.MetaM (Option (List (VarId × LNIRExpr) × VarId × VarId)) := do
+      match fuel with
+      | 0 => return none
+      | fuel + 1 =>
+        match e with
+        | .bvar i => return scope[i]?.map (fun v => ([], v, next))
+        | .mdata _ e => lower fuel e scope next
+        | .letE _ ty v b _ =>
+          if (← Lean.Meta.withTransparency .reducible (Lean.Meta.whnf ty)) != u64 then return none
+          let some (bs, v, next) ← lower fuel v scope next | return none
+          let some (ks, r, next) ← lower fuel b (v :: scope) next | return none
+          return some (bs ++ ks, r, next)
+        | _ =>
+          let e ← Lean.Meta.withTransparency .reducible (Lean.Meta.whnf e)
+          let fn := e.getAppFn
+          let args := e.getAppArgs
+          if fn.isConstOf ``UInt64.ofNat then
+            if let some (.lit (.natVal n)) := args[0]? then
+              return some ([(next, .scalar (.constU64 n.toUInt64))], next, next + 1)
+          let .const callee _ := fn | return none
+          let some calleeInfo := env.find? callee | return none
+          let some n ← signature calleeInfo.type 0 | return none
+          if n != args.size || n == 0 || Lean.isExtern env callee then return none
+          let mut binds := []
+          let mut vars := []
+          let mut next := next
+          for arg in args do
+            let some (bs, v, nx) ← lower fuel arg scope next | return none
+            binds := binds ++ bs
+            vars := vars ++ [v]
+            next := nx
+          let expr? := (tryLowerGfSimdIntrinsic env callee vars .i64 (vars.map fun _ => .i64)).orElse fun _ =>
+            match lookupCanonicalBinOp? callee, vars with
+            | some op, [a, b] => some (.scalar (.binOp op (.var a) (.var b)))
+            | _, _ => match calleeInfo with
+              | .defnInfo d => if d.safety == .safe && d.levelParams.isEmpty then
+                  some (.call (mangleDeclNameInEnv env callee) vars .i64 false) else none
+              | _ => none
+          let some expr := expr? | return none
+          return some (binds ++ [(next, expr)], next, next + 1)
+    let some (binds, result, _) ← lower 512 body scope arity | return none
+    let params := (List.range arity).map fun i =>
+      ({ id := i, name := s!"arg{i}", ty := .i64 } : LNIRParam)
+    let body := binds.foldr (fun (v, e) k => LNIRCode.letBind v .i64 e k) (.ret result)
+    return some { name := mangleDeclNameInEnv env name, params, retTy := .i64, body, assurance := .tested }
+  action.run'
+
 /-- Executables retain Lean C for host code. Only a closed, supported native
     subgraph may override it; unsupported local exports are still hard errors. -/
 def ingestBuildExeModuleDecls (names : Array Lean.Name) (moduleName : String)
@@ -260,7 +333,9 @@ def ingestBuildExeModuleDecls (names : Array Lean.Name) (moduleName : String)
   for name in names do
     let savedEnv ← getEnv
     let d? ← try
-      if let some d ← Lean.Compiler.LCNF.getLocalImpureDecl? name then
+      if let some d ← tryIngestScalarSource name then
+        pure (some d)
+      else if let some d ← Lean.Compiler.LCNF.getLocalImpureDecl? name then
         some <$> ingestLCNFImpureDecl d names arch
       else if let some d ← Lean.Compiler.LCNF.getMonoDecl? name then
         some <$> ingestLCNFMonoDecl d names arch
