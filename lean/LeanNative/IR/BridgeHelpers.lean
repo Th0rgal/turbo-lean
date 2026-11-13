@@ -2293,7 +2293,8 @@ def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
     (allowRcAdt : Bool := false) : Lean.CoreM LNIRDecl := do
   let env ← getEnv
   let decl := if collectEnvExplicitReturnType? env decl.name == some (.sarray .i8) then
-    { decl with type := (Lean.mkConst ``ByteArray),
+    { decl with
+      type := Lean.mkConst ``ByteArray
       value := decl.value.mapCode (rewriteImpureUset64LETypes env) }
     else { decl with value := decl.value.mapCode (rewriteImpureUset64LETypes env) }
   if ← declUsesSignedScalarTransitively decl then
