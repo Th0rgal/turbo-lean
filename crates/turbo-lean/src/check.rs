@@ -240,6 +240,31 @@ mod wallclock_tests {
         let human = String::from_utf8(human.stdout)?;
         assert!(human.contains("wall_ms="), "{human}");
         assert!(human.contains("phases="), "{human}");
+        for target in [&file, &dir] {
+            let output = Command::new(&binary)
+                .args(["check", "--json", "--project-dir"])
+                .arg(&dir)
+                .arg(target)
+                .arg("--cache-dir")
+                .arg(dir.join("cli-cache"))
+                .output()?;
+            anyhow::ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            assert!(result["wall_ms"].as_i64().unwrap() >= result["elapsed_ms"].as_i64().unwrap());
+            assert!(result["phases"].is_object());
+            assert_eq!(
+                result["compact_summary"]
+                    .as_str()
+                    .unwrap()
+                    .matches("wall_ms=")
+                    .count(),
+                1
+            );
+        }
         run_check_command_with_options(
             &mut store,
             true,
