@@ -114,12 +114,13 @@ def emitLeanCFromSourceFile (filePath : String) (modName : Lean.Name := `Main)
       let n := selected[cursor]!
       let callees ← do
         if let some d ← Lean.Compiler.LCNF.getLocalImpureDecl? n then
-          if let .code c := d.value then return collectCodeLocalCallees names c
+          if let .code c := d.value then return collectNamedCallees c
         if let some d ← Lean.Compiler.LCNF.getMonoDecl? n then
-          if let .code c := d.value then return collectCodeLocalCallees names c
+          if let .code c := d.value then return collectNamedCallees c
         pure []
       for callee in callees do
-        if !selected.contains callee then selected := selected.push callee
+        if belongsToInput callee && !Lean.isExtern env callee && !selected.contains callee then
+          selected := selected.push callee
       cursor := cursor + 1
     -- C emission owns the local impure extension. Finish it before importing
     -- mono LCNF into the native lowering's isolated conversion environment.

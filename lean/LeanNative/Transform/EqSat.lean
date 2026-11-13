@@ -109,6 +109,8 @@ partial def isSimpleInlinableBody (_selfName : String) : LNIRCode → Bool
   | .letBind _ _ (.scalar _) k | .letBind _ _ (.mkTuple _) k
   | .letBind _ _ (.projTuple _ _) k | .letBind _ _ (.ctorGetObj _ _) k
   | .incRef _ _ k | .decRef _ _ k => isSimpleInlinableBody _selfName k
+  | .letBind _ _ (.call fn _ _ false) k => fn != _selfName && isSimpleInlinableBody _selfName k
+  | .seqFor _ _ _ _ _ _ step k => isSimpleInlinableBody _selfName step && isSimpleInlinableBody _selfName k
   | .ite _ t e => isSimpleInlinableBody _selfName t && isSimpleInlinableBody _selfName e
   | .ret _ | .unreachable => true
   | _ => false
@@ -155,6 +157,18 @@ partial def spliceInlinedBodyM (paramMap : List (VarId × VarId)) (unboxedLocal 
     let paramMap' := paramMap.filter fun (kId, _) => kId != bDst
     return .letBind (bDst + offset) bTy (.ctorGetObj (renameVarId paramMap offset cv) idx)
       (← spliceInlinedBodyM paramMap' unboxedLocal offset retCont k)
+  | .letBind bDst bTy (.call fn args rty ext) k => do
+    let paramMap' := paramMap.filter fun (v, _) => v != bDst
+    return .letBind (bDst + offset) bTy (.call fn (args.map (renameVarId paramMap offset)) rty ext)
+      (← spliceInlinedBodyM paramMap' unboxedLocal offset retCont k)
+  | .seqFor iv lo hi av ai aty step k => do
+    let iv' := iv + offset
+    let av' := av + offset
+    let loopMap := (iv, iv') :: (av, av') :: paramMap
+    let step' ← spliceInlinedBodyM loopMap (iv :: unboxedLocal) offset (fun v => pure (.ret v)) step
+    let k' ← spliceInlinedBodyM ((av, av') :: paramMap) unboxedLocal offset retCont k
+    return .seqFor iv' (renameVarId paramMap offset lo) (renameVarId paramMap offset hi)
+      av' (renameVarId paramMap offset ai) aty step' k'
   | .incRef ov c k => do
     if unboxedLocal.contains ov then spliceInlinedBodyM paramMap unboxedLocal offset retCont k
     else return .incRef (renameVarId paramMap offset ov) c (← spliceInlinedBodyM paramMap unboxedLocal offset retCont k)

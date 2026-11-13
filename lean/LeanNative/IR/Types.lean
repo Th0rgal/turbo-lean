@@ -119,6 +119,72 @@ def uset64LE (a : ByteArray) (byteOff : USize) (val : UInt64) : ByteArray :=
       out.set! (byteOff.toNat + i.val) (val >>> (i.val.toUInt64 * 8)).toUInt8) a
   else a
 
+/-- Canonical masked carryless-product forms used by existing pure Lean kernels.
+    Recognition checks every referenced helper body, not the exported symbol. -/
+namespace MaskedClmul
+
+@[inline] def nativeSelect (a b i : UInt64) : UInt64 :=
+  a &&& (0 - ((b >>> i) &&& 1))
+
+@[inline] def nativeClmulByte (a b : UInt64) : UInt64 :=
+  nativeSelect a b 0 ^^^ nativeSelect (a <<< 1) b 1 ^^^
+  nativeSelect (a <<< 2) b 2 ^^^ nativeSelect (a <<< 3) b 3 ^^^
+  nativeSelect (a <<< 4) b 4 ^^^ nativeSelect (a <<< 5) b 5 ^^^
+  nativeSelect (a <<< 6) b 6 ^^^ nativeSelect (a <<< 7) b 7
+
+@[inline] def nativeClmulByteHi (a b : UInt64) : UInt64 :=
+  nativeSelect (a >>> 63) b 1 ^^^ nativeSelect (a >>> 62) b 2 ^^^
+  nativeSelect (a >>> 61) b 3 ^^^ nativeSelect (a >>> 60) b 4 ^^^
+  nativeSelect (a >>> 59) b 5 ^^^ nativeSelect (a >>> 58) b 6 ^^^
+  nativeSelect (a >>> 57) b 7
+
+@[inline]
+def nativeClmulLo (a b : UInt64) : UInt64 :=
+  nativeClmulByte a b ^^^ (nativeClmulByte a (b >>> 8) <<< 8) ^^^
+  (nativeClmulByte a (b >>> 16) <<< 16) ^^^ (nativeClmulByte a (b >>> 24) <<< 24) ^^^
+  (nativeClmulByte a (b >>> 32) <<< 32) ^^^ (nativeClmulByte a (b >>> 40) <<< 40) ^^^
+  (nativeClmulByte a (b >>> 48) <<< 48) ^^^ (nativeClmulByte a (b >>> 56) <<< 56)
+
+@[inline] def nativeClmulUpper (a b i j : UInt64) : UInt64 :=
+  (nativeClmulByte a (b >>> i) >>> j) ^^^ (nativeClmulByteHi a (b >>> i) <<< i)
+
+@[inline]
+def nativeClmulHi (a b : UInt64) : UInt64 :=
+  nativeSelect (a >>> 63) b 1 ^^^ nativeSelect (a >>> 62) b 2 ^^^
+  nativeSelect (a >>> 61) b 3 ^^^ nativeSelect (a >>> 60) b 4 ^^^
+  nativeSelect (a >>> 59) b 5 ^^^ nativeSelect (a >>> 58) b 6 ^^^
+  nativeSelect (a >>> 57) b 7 ^^^ nativeSelect (a >>> 56) b 8 ^^^
+  nativeSelect (a >>> 55) b 9 ^^^ nativeSelect (a >>> 54) b 10 ^^^
+  nativeSelect (a >>> 53) b 11 ^^^ nativeSelect (a >>> 52) b 12 ^^^
+  nativeSelect (a >>> 51) b 13 ^^^ nativeSelect (a >>> 50) b 14 ^^^
+  nativeSelect (a >>> 49) b 15 ^^^ nativeSelect (a >>> 48) b 16 ^^^
+  nativeSelect (a >>> 47) b 17 ^^^ nativeSelect (a >>> 46) b 18 ^^^
+  nativeSelect (a >>> 45) b 19 ^^^ nativeSelect (a >>> 44) b 20 ^^^
+  nativeSelect (a >>> 43) b 21 ^^^ nativeSelect (a >>> 42) b 22 ^^^
+  nativeSelect (a >>> 41) b 23 ^^^ nativeSelect (a >>> 40) b 24 ^^^
+  nativeSelect (a >>> 39) b 25 ^^^ nativeSelect (a >>> 38) b 26 ^^^
+  nativeSelect (a >>> 37) b 27 ^^^ nativeSelect (a >>> 36) b 28 ^^^
+  nativeSelect (a >>> 35) b 29 ^^^ nativeSelect (a >>> 34) b 30 ^^^
+  nativeSelect (a >>> 33) b 31 ^^^ nativeSelect (a >>> 32) b 32 ^^^
+  nativeSelect (a >>> 31) b 33 ^^^ nativeSelect (a >>> 30) b 34 ^^^
+  nativeSelect (a >>> 29) b 35 ^^^ nativeSelect (a >>> 28) b 36 ^^^
+  nativeSelect (a >>> 27) b 37 ^^^ nativeSelect (a >>> 26) b 38 ^^^
+  nativeSelect (a >>> 25) b 39 ^^^ nativeSelect (a >>> 24) b 40 ^^^
+  nativeSelect (a >>> 23) b 41 ^^^ nativeSelect (a >>> 22) b 42 ^^^
+  nativeSelect (a >>> 21) b 43 ^^^ nativeSelect (a >>> 20) b 44 ^^^
+  nativeSelect (a >>> 19) b 45 ^^^ nativeSelect (a >>> 18) b 46 ^^^
+  nativeSelect (a >>> 17) b 47 ^^^ nativeSelect (a >>> 16) b 48 ^^^
+  nativeSelect (a >>> 15) b 49 ^^^ nativeSelect (a >>> 14) b 50 ^^^
+  nativeSelect (a >>> 13) b 51 ^^^ nativeSelect (a >>> 12) b 52 ^^^
+  nativeSelect (a >>> 11) b 53 ^^^ nativeSelect (a >>> 10) b 54 ^^^
+  nativeSelect (a >>> 9) b 55 ^^^ nativeSelect (a >>> 8) b 56 ^^^
+  nativeSelect (a >>> 7) b 57 ^^^ nativeSelect (a >>> 6) b 58 ^^^
+  nativeSelect (a >>> 5) b 59 ^^^ nativeSelect (a >>> 4) b 60 ^^^
+  nativeSelect (a >>> 3) b 61 ^^^ nativeSelect (a >>> 2) b 62 ^^^
+  nativeSelect (a >>> 1) b 63
+
+end MaskedClmul
+
 /-- Variable identifier in LNIR SSA/ANF form. -/
 abbrev VarId := Nat
 

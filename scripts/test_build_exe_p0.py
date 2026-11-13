@@ -32,6 +32,64 @@ def emul(a, b):
     return result[:3]
 
 
+def clmul64_pair(a, b):
+    lo = 0
+    for i in range(64):
+        if (b >> i) & 1:
+            lo ^= (a << i) & MASK
+    hi = 0
+    for i in range(1, 64):
+        if (b >> i) & 1:
+            hi ^= (a >> (64 - i)) & MASK
+    return lo, hi
+
+
+def gf2_affine64(x, m, imm8):
+    out = 0
+    for b in range(8):
+        xb = (x >> (b * 8)) & 0xFF
+        acc = 0
+        for i in range(8):
+            row = (m >> ((7 - i) * 8)) & 0xFF
+            p = row & xb
+            parity = bin(p).count("1") & 1
+            acc |= parity << i
+        out |= ((acc ^ (imm8 & 0xFF)) & 0xFF) << (b * 8)
+    return out
+
+
+def ternary_logic64(a, b, c, imm8):
+    na, nb, nc = (~a) & MASK, (~b) & MASK, (~c) & MASK
+    terms = [
+        na & nb & nc,
+        na & nb & c,
+        na & b & nc,
+        na & b & c,
+        a & nb & nc,
+        a & nb & c,
+        a & b & nc,
+        a & b & c,
+    ]
+    out = 0
+    for bit, term in enumerate(terms):
+        if (imm8 >> bit) & 1:
+            out |= term
+    return out & MASK
+
+
+def zmm_slice_ref(n, seed):
+    acc = 0
+    for i in range(n):
+        a = (seed + ((i * 0x9E3779B97F4A7C15) & MASK)) & MASK
+        b = ((seed ^ 0xFEEDFACECAFEBEEF) + ((i * 0xBF58476D1CE4E5B9) & MASK)) & MASK
+        c = (((seed << 7) & MASK) ^ ((i * 0x94D049BB133111EB) & MASK)) & MASK
+        lo, hi = clmul64_pair(a, b)
+        g = gf2_affine64(lo ^ hi, 0x8040201008040201, 0x63)
+        t = ternary_logic64(g, c, a, 0x96)
+        acc ^= t
+    return acc
+
+
 class BuildExeP0(unittest.TestCase):
     def test_standalone_io_native_kernels_and_boxing(self):
         with tempfile.TemporaryDirectory(prefix="build-exe-p0-") as tmp:
@@ -65,6 +123,9 @@ class BuildExeP0(unittest.TestCase):
                 self.assertEqual(list(map(int, run([exe, "E", *a, *b]).split())), emul(a, b))
             for value in (0, 1 << 63, MASK):
                 self.assertEqual(int(run([exe, "I", value])), value)
+            for n_lanes in (0, 1, 7, 8, 9, 16, 25, 64, 73):
+                seed = rng.getrandbits(64)
+                self.assertEqual(int(run([exe, "Z", n_lanes, seed])), zmm_slice_ref(n_lanes, seed))
             symbols = run(["nm", "--defined-only", exe])
             (out / "symbols.txt").write_text(symbols)
             for symbol in ("p0_kmul", "p0_emul0", "p0_emul1", "p0_emul2"):
@@ -73,6 +134,14 @@ class BuildExeP0(unittest.TestCase):
                 (out / f"{symbol}.asm").write_text(disasm)
                 self.assertRegex(disasm, r"\bvp?clmul")
                 self.assertNotRegex(disasm, r"\bcall\w*\s")
+            self.assertEqual(len(re.findall(r"^\w+ T p0_zmm_slice_kernel$", symbols, re.M)), 1)
+            zmm_disasm = run(["objdump", "-d", "--disassemble=p0_zmm_slice_kernel", exe])
+            (out / "p0_zmm_slice_kernel.asm").write_text(zmm_disasm)
+            self.assertRegex(zmm_disasm, r"%zmm")
+            self.assertRegex(zmm_disasm, r"\bvpclmul\w*.*%zmm")
+            self.assertRegex(zmm_disasm, r"\bvgf2p8affineqb\b.*%zmm")
+            self.assertRegex(zmm_disasm, r"\bvpternlogq\b.*%zmm")
+            self.assertRegex(zmm_disasm, r"\bvmovdqu64\b.*%zmm")
             self.assertNotIn("--allow-multiple-definition", (ROOT / "lean/LeanNative/Driver/BuildExe.lean").read_text())
             sysroot = Path(os.environ["LEAN_SYSROOT"])
             harness = out / "boxing.c"

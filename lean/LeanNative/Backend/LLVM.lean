@@ -1198,6 +1198,10 @@ def emitLetExpr (dst : VarId) (ty : LNIRType) (expr : LNIRExpr) : EmitM Unit := 
 /-- Emit inline or baseline reference count adjustment (`incRef` / `decRef`) under `RcMode`. -/
 def emitRefCountOp (isInc : Bool) (objVar : VarId) (count : Nat) : EmitM Unit := do
   let st ← get
+  if (← getVarSlotType objVar) == .sarray .i8 then
+    let p ← loadVarAsPtr objVar
+    emitLine s!"  call void @lean_native_slice_rc(ptr {p}, i64 {count}, i8 {if isInc then 1 else 0})"
+    return ()
   if st.rcMode == .freestanding then return ()
   let objPtr ← loadVarAsPtr objVar
   if st.optimized then
@@ -1410,6 +1414,224 @@ partial def collectSwitchChain (expectedDiscr : Option VarId) (code : LNIRCode) 
 /-- Recursively lower an `LNIRCode` block into LLVM 18 instructions.
     When `loopAccTarget` is `some (accVar, latchLbl)`, `.ret v` inside a `seqFor` step body
     copies `v` into `accVar` and branches to `latchLbl` instead of returning from the function. -/
+private def peelZmmLets : LNIRCode → List (VarId × LNIRType × LNIRExpr) × LNIRCode
+  | .letBind v ty rhs k =>
+    let (lets, tail) := peelZmmLets k
+    ((v, ty, rhs) :: lets, tail)
+  | c => ([], c)
+
+private def resolveZmmScalar (lets : List (VarId × LNIRType × LNIRExpr)) : Nat → ScalarExpr → ScalarExpr
+  | 0, e => e
+  | fuel + 1, .var v =>
+    match lets.reverse.find? (fun (dst, _, _) => dst == v) with
+    | some (_, _, .scalar e) => resolveZmmScalar lets fuel e
+    | _ => .var v
+  | fuel + 1, .binOp .bitAnd x (.constU64 0xffffffffffffffff) => resolveZmmScalar lets fuel x
+  | fuel + 1, .binOp op x y => .binOp op (resolveZmmScalar lets fuel x) (resolveZmmScalar lets fuel y)
+  | fuel + 1, .unaryOp op x => .unaryOp op (resolveZmmScalar lets fuel x)
+  | _, e => e
+
+private def isZmmWordOffset (lets : List (VarId × LNIRType × LNIRExpr)) (idx off : VarId) : Bool :=
+  match resolveZmmScalar lets (lets.length + 4) (.var off) with
+  | .binOp .shl (.var v) (.constU64 3) => v == idx
+  | .binOp .mul (.var v) (.constU64 8) | .binOp .mul (.constU64 8) (.var v) => v == idx
+  | _ => false
+
+private def canEmitZmmScalar : ScalarExpr → Bool
+  | .var _ | .constU64 _ | .constBool _ => true
+  | .unaryOp .not a => canEmitZmmScalar a
+  | .binOp op a b =>
+    (op == .add || op == .sub || op == .mul || op == .bitAnd || op == .bitOr ||
+     op == .bitXor || op == .shl || op == .shr || op == .clmul64 || op == .clmul64Hi) &&
+    canEmitZmmScalar a && canEmitZmmScalar b
+  | _ => false
+
+private def zmmSplat (value : String) : EmitM String := do
+  let lane ← freshTmp "zmm_lane"
+  let out ← freshTmp "zmm_splat"
+  emitLine s!"  {lane} = insertelement <8 x i64> poison, i64 {value}, i32 0"
+  emitLine s!"  {out} = shufflevector <8 x i64> {lane}, <8 x i64> poison, <8 x i32> zeroinitializer"
+  return out
+
+private def zmmConst (v : UInt64) : String :=
+  "<" ++ String.intercalate ", " (List.replicate 8 s!"i64 {v.toNat}") ++ ">"
+
+private partial def emitZmmScalar (env : List (VarId × String)) (idx : VarId) (cur : String) :
+    ScalarExpr → EmitM String
+  | .constU64 v => pure (zmmConst v)
+  | .constBool b => pure (zmmConst (if b then 1 else 0))
+  | .var v => do
+    if let some val := env.lookup v then return val
+    if v != idx then zmmSplat (← loadVarAsI64 v)
+    else
+      let base ← zmmSplat cur
+      let out ← freshTmp "zmm_indices"
+      emitLine s!"  {out} = add <8 x i64> {base}, <i64 0, i64 1, i64 2, i64 3, i64 4, i64 5, i64 6, i64 7>"
+      return out
+  | .unaryOp .not a => do
+    let va ← emitZmmScalar env idx cur a
+    let out ← freshTmp "zmm_not"
+    emitLine s!"  {out} = xor <8 x i64> {va}, {zmmConst 0xffffffffffffffff}"
+    return out
+  | .binOp op a b => do
+    let va ← emitZmmScalar env idx cur a
+    let vb ← emitZmmScalar env idx cur b
+    let out ← freshTmp "zmm_op"
+    if op == .clmul64 || op == .clmul64Hi then
+      let sa ← freshTmp "zmm_odd_a"
+      let sb ← freshTmp "zmm_odd_b"
+      let even ← freshTmp "zmm_clmul_even"
+      let odd ← freshTmp "zmm_clmul_odd"
+      let swap := "<i32 1, i32 0, i32 3, i32 2, i32 5, i32 4, i32 7, i32 6>"
+      emitLine s!"  {sa} = shufflevector <8 x i64> {va}, <8 x i64> poison, <8 x i32> {swap}"
+      emitLine s!"  {sb} = shufflevector <8 x i64> {vb}, <8 x i64> poison, <8 x i32> {swap}"
+      emitLine s!"  {even} = call <8 x i64> @llvm.x86.pclmulqdq.512(<8 x i64> {va}, <8 x i64> {vb}, i8 0)"
+      emitLine s!"  {odd} = call <8 x i64> @llvm.x86.pclmulqdq.512(<8 x i64> {sa}, <8 x i64> {sb}, i8 0)"
+      let mask := if op == .clmul64 then
+        "<i32 0, i32 8, i32 2, i32 10, i32 4, i32 12, i32 6, i32 14>"
+        else "<i32 1, i32 9, i32 3, i32 11, i32 5, i32 13, i32 7, i32 15>"
+      emitLine s!"  {out} = shufflevector <8 x i64> {even}, <8 x i64> {odd}, <8 x i32> {mask}"
+    else
+      let instr := match op with
+        | .add => "add" | .sub => "sub" | .mul => "mul" | .bitAnd => "and"
+        | .bitOr => "or" | .bitXor => "xor" | .shl => "shl" | .shr => "lshr" | _ => "xor"
+      let vb ← if op == .shl || op == .shr then do
+        let masked ← freshTmp "zmm_shift_mask"
+        emitLine s!"  {masked} = and <8 x i64> {vb}, {zmmConst 63}"
+        pure masked
+      else pure vb
+      emitLine s!"  {out} = {instr} <8 x i64> {va}, {vb}"
+    return out
+  | _ => pure "zeroinitializer" -- excluded by canEmitZmmScalar before emission
+
+/-- Vectorize a qualified same-index byte-slice loop, with checked bounds and
+    a scalar remainder. Dead condition lets cannot disqualify the live kernel.
+    Unsupported layouts leave the ordinary scalar emitter untouched. -/
+private def emitZmmSliceLoopWithRem? (idx acc : VarId) (lo hi : String) (body : LNIRCode) : EmitM (Option String) := do
+  let st ← get
+  if !st.optimized || st.target != .x86_64 then return none
+  let (lets, tail) := peelZmmLets body
+  let .ret ret := tail | return none
+  let mut used : List VarId := [ret]
+  let mut live : List (VarId × LNIRType × LNIRExpr) := []
+  for bind@(dst, _, rhs) in lets.reverse do
+    let effect := match rhs with | .call _ _ _ _ => true | _ => false
+    if effect || used.contains dst then
+      live := bind :: live
+      used := (collectExprVars rhs).map Prod.fst ++ used
+  let mut arrays : List VarId := [acc]
+  let mut stores := 0
+  for (dst, _, rhs) in live do
+    match rhs with
+    | .scalar se => if !canEmitZmmScalar se then return none
+    | .call "lean_native_sarray_uget64_le" [a, off] _ false =>
+      if !isZmmWordOffset lets idx off then return none
+      if !arrays.contains a then arrays := a :: arrays
+    | .call "lean_native_sarray_uset64_le" [a, off, _] _ false =>
+      if a != acc || dst != ret || !isZmmWordOffset lets idx off then return none
+      stores := stores + 1
+    | .call "lean_native_gf2_affine64" [_, _, _] _ false => pure ()
+    | .call "lean_native_ternary_logic64" [_, _, _, imm] _ false =>
+      if !(match resolveZmmScalar lets (lets.length + 4) (.var imm) with | .constU64 _ => true | _ => false) then return none
+    | _ => return none
+  if stores != 1 then return none
+  for a in arrays do
+    if (← getVarSlotType a) != .sarray .i8 then return none
+  let check ← freshLabel "zmm_check"
+  let cow ← freshLabel "zmm_cow"
+  let hdr ← freshLabel "zmm_hdr"
+  let step ← freshLabel "zmm_body"
+  let doneLbl ← freshLabel "zmm_tail"
+  let cur ← freshTmp "zmm_idx"
+  let next ← freshTmp "zmm_next"
+  let start ← freshTmp "zmm_scalar_start"
+  emitLine s!"  br label %{check}\n{check}:"
+  let ordered ← freshTmp "zmm_ordered"
+  let remaining ← freshTmp "zmm_remaining"
+  let enough ← freshTmp "zmm_enough"
+  let ok0 ← freshTmp "zmm_ok"
+  emitLine s!"  {ordered} = icmp ule i64 {lo}, {hi}"
+  emitLine s!"  {remaining} = sub i64 {hi}, {lo}"
+  emitLine s!"  {enough} = icmp uge i64 {remaining}, 8"
+  emitLine s!"  {ok0} = and i1 {ordered}, {enough}"
+  let mut ok := ok0
+  let mut ptrs : List (VarId × String) := []
+  for a in arrays do
+    let p ← loadVarAsPtr a
+    ptrs := (a, p) :: ptrs
+    let size ← emitSarraySizeLoad "zmm_size" p
+    let words ← freshTmp "zmm_words"
+    let fits ← freshTmp "zmm_fits"
+    let combined ← freshTmp "zmm_bounds"
+    emitLine s!"  {words} = lshr i64 {size}, 3"
+    emitLine s!"  {fits} = icmp ule i64 {hi}, {words}"
+    emitLine s!"  {combined} = and i1 {ok}, {fits}"
+    ok := combined
+  emitLine s!"  br i1 {ok}, label %{cow}, label %{doneLbl}\n{cow}:"
+  let dst ← freshTmp "zmm_dst"
+  emitLine s!"  {dst} = call ptr @lean_native_bytearray_exclusive(ptr {(ptrs.lookup acc).getD "null"})"
+  storePtrToVar acc dst
+  emitLine s!"  br label %{hdr}\n{hdr}:"
+  emitLine s!"  {cur} = phi i64 [ {lo}, %{cow} ], [ {next}, %{step} ]"
+  let rem ← freshTmp "zmm_rem"
+  let more ← freshTmp "zmm_more"
+  emitLine s!"  {rem} = sub i64 {hi}, {cur}\n  {more} = icmp uge i64 {rem}, 8"
+  emitLine s!"  br i1 {more}, label %{step}, label %{doneLbl}\n{step}:"
+  let byteIdx ← freshTmp "zmm_byte_idx"
+  emitLine s!"  {byteIdx} = shl i64 {cur}, 3"
+  let mut venv : List (VarId × String) := []
+  for (v, _, rhs) in live do
+    match rhs with
+    | .scalar se => venv := (v, ← emitZmmScalar venv idx cur se) :: venv
+    | .call "lean_native_sarray_uget64_le" [a, _] _ false =>
+      let data ← freshTmp "zmm_data"
+      let ptr ← freshTmp "zmm_load_ptr"
+      let out ← freshTmp "zmm_load"
+      let src := if a == acc then dst else (ptrs.lookup a).getD "null"
+      emitLine s!"  {data} = getelementptr i8, ptr {src}, i64 24"
+      emitLine s!"  {ptr} = getelementptr i8, ptr {data}, i64 {byteIdx}"
+      emitLine s!"  {out} = load <8 x i64>, ptr {ptr}, align 1"
+      venv := (v, out) :: venv
+    | .call "lean_native_sarray_uset64_le" [_, _, value] _ false =>
+      let data ← freshTmp "zmm_data"
+      let ptr ← freshTmp "zmm_store_ptr"
+      let val ← emitZmmScalar venv idx cur (.var value)
+      emitLine s!"  {data} = getelementptr i8, ptr {dst}, i64 24"
+      emitLine s!"  {ptr} = getelementptr i8, ptr {data}, i64 {byteIdx}"
+      emitLine s!"  store <8 x i64> {val}, ptr {ptr}, align 1"
+    | .call "lean_native_gf2_affine64" [x, m, imm] _ false =>
+      let vx ← emitZmmScalar venv idx cur (.var x)
+      let vm ← emitZmmScalar venv idx cur (.var m)
+      let vi ← emitZmmScalar venv idx cur (.var imm)
+      let bx ← freshTmp "zmm_gfni_x"
+      let bm ← freshTmp "zmm_gfni_m"
+      let affine ← freshTmp "zmm_affine"
+      let words ← freshTmp "zmm_affine_words"
+      let masked ← freshTmp "zmm_imm"
+      let repeated ← freshTmp "zmm_imm_bytes"
+      let out ← freshTmp "zmm_gfni"
+      emitLine s!"  {bx} = bitcast <8 x i64> {vx} to <64 x i8>"
+      emitLine s!"  {bm} = bitcast <8 x i64> {vm} to <64 x i8>"
+      emitLine s!"  {affine} = call <64 x i8> @llvm.x86.vgf2p8affineqb.512(<64 x i8> {bx}, <64 x i8> {bm}, i8 0)"
+      emitLine s!"  {words} = bitcast <64 x i8> {affine} to <8 x i64>"
+      emitLine s!"  {masked} = and <8 x i64> {vi}, {zmmConst 255}"
+      emitLine s!"  {repeated} = mul <8 x i64> {masked}, {zmmConst 0x0101010101010101}"
+      emitLine s!"  {out} = xor <8 x i64> {words}, {repeated}"
+      venv := (v, out) :: venv
+    | .call "lean_native_ternary_logic64" [a, b, c, imm] _ false =>
+      let va ← emitZmmScalar venv idx cur (.var a)
+      let vb ← emitZmmScalar venv idx cur (.var b)
+      let vc ← emitZmmScalar venv idx cur (.var c)
+      let immediate := match resolveZmmScalar lets (lets.length + 4) (.var imm) with | .constU64 x => x.toNat % 256 | _ => 0
+      let out ← freshTmp "zmm_ternary"
+      emitLine s!"  {out} = call <8 x i64> @llvm.x86.avx512.mask.pternlog.q.512(<8 x i64> {va}, <8 x i64> {vb}, <8 x i64> {vc}, i32 {immediate}, i8 -1)"
+      venv := (v, out) :: venv
+    | _ => pure () -- excluded by qualification
+  emitLine s!"  {next} = add nuw i64 {cur}, 8\n  br label %{hdr}\n{doneLbl}:"
+  emitLine s!"  {start} = phi i64 [ {lo}, %{check} ], [ {cur}, %{hdr} ]"
+  modify fun s => { s with ptrBindings := s.ptrBindings.filter (·.1 != acc) }
+  return some start
+
 partial def emitCode (code : LNIRCode) (retTy : LNIRType)
     (loopAccTarget : Option (VarId × String) := none) : EmitM Unit := do
   let opt := (← get).optimized
@@ -1503,9 +1725,10 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
     emitCode elseBranch retTy loopAccTarget
     modify fun s => { s with ptrBindings := savedPtrs, retainedFacts := savedFacts }
   | .seqFor idxVar loVar hiVar accVar accInit _ stepBody k =>
-    let loVal ← loadVarAsI64 loVar
+    let loRaw ← loadVarAsI64 loVar
     let hiVal ← loadVarAsI64 hiVar
     copyVarSlot accVar accInit
+    let loVal := (← emitZmmSliceLoopWithRem? idxVar accVar loRaw hiVal stepBody).getD loRaw
     let preHdrLbl ← freshLabel "loop_prehdr"
     let hdrLbl ← freshLabel "loop_hdr"
     let bodyLbl ← freshLabel "loop_body"
@@ -1537,7 +1760,7 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
           la != accVar && la != idxVar && lb != accVar && lb != idxVar
         | .exclusiveObj o => o != accVar && o != idxVar }
     emitLine s!"{latchLbl}:"
-    let addOp := if opt then "add nuw nsw i64" else "add i64"
+    let addOp := if opt then "add nuw i64" else "add i64"
     emitLine s!"  {idxNext} = {addOp} {curIdx}, 1"
     let isVecLoop := loopBodyHasArrayMem stepBody
     let loopMd :=
@@ -1603,6 +1826,12 @@ partial def emitCode (code : LNIRCode) (retTy : LNIRType)
                 else if llvmRet == "i8" || llvmRet == "i16" || llvmRet == "i32" || llvmRet == "i64" then s!"  ret {llvmRet} 0"
                 else s!"  ret {llvmRet} zeroinitializer")
 
+private def codeHasByteArrayLoop : LNIRCode → Bool
+  | .seqFor _ _ _ _ _ (.sarray .i8) _ _ => true
+  | .letBind _ _ _ k | .rawStore _ _ _ _ k | .incRef _ _ k | .decRef _ _ k | .parFor _ _ _ _ _ k => codeHasByteArrayLoop k
+  | .ite _ t e | .seqFor _ _ _ _ _ _ t e => codeHasByteArrayLoop t || codeHasByteArrayLoop e
+  | _ => false
+
 /-- Emit an LLVM 18 function definition for a single `LNIRDecl`, parameterized by `IsaLevel`. -/
 def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_64)
     (localScalarSigs : List (String × List LNIRType × LNIRType) := []) (isaOverride? : Option IsaLevel := none) : String :=
@@ -1639,7 +1868,8 @@ def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_
       else ""
     s!"{pTy}{attrs} %arg_v{p.id}"
   let paramSigStr := String.intercalate ", " paramSigs
-  let fnAttr := if optimized then "#0" else "#1"
+  let fnAttr := if optimized && target == .x86_64 && codeHasByteArrayLoop d.body then "#4"
+    else if optimized then "#0" else "#1"
   let allVars := declSlotVars d
   let allocaLines := allVars.foldl (fun acc (vid, ty) =>
     let sTy := slotLLVMType ty
@@ -1685,6 +1915,30 @@ def emitDeclLLVM (optimized : Bool) (d : LNIRDecl) (target : TargetArch := .x86_
 def emitCryptoSliceHelpers (target : TargetArch) : String := Id.run do
   if target != .x86_64 then return ""
   let mut lines := [
+    "declare extern_weak ptr @lean_native_runtime_bytearray_exclusive(ptr)",
+    "declare extern_weak void @lean_native_runtime_slice_rc(ptr, i64, i8)",
+    "define weak_odr ptr @lean_native_bytearray_exclusive(ptr %a) #5 {",
+    "entry:",
+    "  %available = icmp ne ptr @lean_native_runtime_bytearray_exclusive, null",
+    "  br i1 %available, label %ready, label %missing",
+    "missing:",
+    "  call void @llvm.trap()",
+    "  unreachable",
+    "ready:",
+    "  %r = call ptr @lean_native_runtime_bytearray_exclusive(ptr %a)",
+    "  ret ptr %r",
+    "}",
+    "define weak_odr void @lean_native_slice_rc(ptr %a, i64 %count, i8 %inc) #5 {",
+    "entry:",
+    "  %available = icmp ne ptr @lean_native_runtime_slice_rc, null",
+    "  br i1 %available, label %ready, label %missing",
+    "missing:",
+    "  call void @llvm.trap()",
+    "  unreachable",
+    "ready:",
+    "  call void @lean_native_runtime_slice_rc(ptr %a, i64 %count, i8 %inc)",
+    "  ret void",
+    "}",
     "declare <16 x i8> @llvm.x86.vgf2p8affineqb.128(<16 x i8>, <16 x i8>, i8 immarg)",
     "declare <64 x i8> @llvm.x86.vgf2p8affineqb.512(<64 x i8>, <64 x i8>, i8 immarg)",
     "declare <8 x i64> @llvm.x86.pclmulqdq.512(<8 x i64>, <8 x i64>, i8 immarg)",
@@ -1716,7 +1970,7 @@ def emitCryptoSliceHelpers (target : TargetArch) : String := Id.run do
     "  %ok = and i1 %large, %fits",
     "  br i1 %ok, label %write, label %skip",
     "write:",
-    "  %excl = call ptr @lean_native_ensure_exclusive_e1(ptr %a)",
+    "  %excl = call ptr @lean_native_bytearray_exclusive(ptr %a)",
     "  %data = getelementptr i8, ptr %excl, i64 24",
     "  %p = getelementptr i8, ptr %data, i64 %off",
     "  store i64 %val, ptr %p, align 1",
@@ -2455,6 +2709,8 @@ def isExternDecl (d : LNIRDecl) : Bool :=
 
 def leanRuntimeC : String :=
   "#include <lean/lean.h>\n" ++
+  "lean_object *lean_native_runtime_bytearray_exclusive(lean_object *v) { return lean_sarray_ensure_exclusive(v); }\n" ++
+  "void lean_native_runtime_slice_rc(lean_object *v, uint64_t count, uint8_t inc) { while (count--) { if (inc) lean_inc(v); else lean_dec(v); } }\n" ++
   "lean_object *lean_native_runtime_box_u64(uint64_t v) { return lean_box_uint64(v); }\n" ++
   "uint64_t lean_native_runtime_unbox_u64(lean_object *v) { return lean_unbox_uint64(v); }\n" ++
   "lean_object *lean_native_runtime_box_usize(size_t v) { return lean_box_usize(v); }\n" ++

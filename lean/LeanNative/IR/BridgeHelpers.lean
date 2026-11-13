@@ -516,6 +516,20 @@ partial def declsHaveMutualCycle (declMap : Std.HashMap Lean.Name (List Lean.Nam
 def collectCodeLocalCallees {pu} (localSet : Array Lean.Name) (code : Lean.Compiler.LCNF.Code pu) : List Lean.Name :=
   (localSet.toList).filter (fun n => codeHasSelfTailCall n code)
 
+/-- Discover generated and imported helper names directly from the LCNF tree;
+    they need not appear in the environment's source-level constant table. -/
+partial def collectNamedCallees {pu} : Lean.Compiler.LCNF.Code pu → List Lean.Name
+  | .let d k =>
+    let direct := match d.value with
+      | .fap n _ _ | .pap n _ _ | .const n _ _ _ => [n]
+      | _ => []
+    direct ++ collectNamedCallees k
+  | .fun d k _ | .jp d k => collectNamedCallees d.value ++ collectNamedCallees k
+  | .cases c => c.alts.toList.flatMap (fun alt => collectNamedCallees alt.getCode)
+  | .inc _ _ _ _ k _ | .dec _ _ _ _ _ k _ | .del _ k _
+  | .oset _ _ _ k _ | .uset _ _ _ k _ | .sset _ _ _ _ _ k _ | .setTag _ _ k _ => collectNamedCallees k
+  | .jmp _ _ | .return _ | .unreach _ => []
+
 partial def codeReferencesFVar (targetFVar : Lean.FVarId) (code : Lean.Compiler.LCNF.Code pu) : Bool :=
   let argHas (a : Lean.Compiler.LCNF.Arg pu) : Bool :=
     match a with | .fvar id => id == targetFVar | _ => false
@@ -719,7 +733,71 @@ def canonGf2AffineRepr : String := canon_decl_repr% LeanNative.IR.gf2Affine : Le
 def canonGf2AffineGoRepr : String := canon_decl_repr% LeanNative.IR.gf2Affine : LeanNative.IR.gf2Affine.go._unary
 def canonEor3Repr : String := canon_decl_repr% LeanNative.IR.eor3 : LeanNative.IR.eor3
 
+private def intrinsicConstNames : Lean.Expr → List Lean.Name
+  | .const n _ => [n]
+  | .app f a => intrinsicConstNames f ++ intrinsicConstNames a
+  | .lam _ t b _ | .forallE _ t b _ => intrinsicConstNames t ++ intrinsicConstNames b
+  | .letE _ t v b _ => intrinsicConstNames t ++ intrinsicConstNames v ++ intrinsicConstNames b
+  | .mdata _ e | .proj _ _ e => intrinsicConstNames e
+  | _ => []
+
+/-- Capture canonical graphs at compiler-build time. Target programs need not
+    import LeanNative in order to be recognized. -/
+def canonicalIntrinsicGraph (env : Lean.Environment) (root scope : Lean.Name) :
+    Option (List (String × String × String × String)) :=
+  let rec collect (fuel : Nat) (seen : List Lean.Name) (todo : List Lean.Name)
+      (out : List (String × String × String × String)) :=
+    match todo, fuel with
+    | [], _ => some out
+    | _ :: _, 0 => none
+    | n :: rest, fuel + 1 =>
+      if seen.contains n then collect fuel seen rest out
+      else do
+        let some (.defnInfo d) := env.find? n | none
+        guard (!Lean.isExtern env n)
+        let entry := ((n.replacePrefix scope .anonymous).toString,
+          normalizeIntrinsicDecl scope d.type, normalizeIntrinsicDecl scope d.value,
+          s!"{repr d.safety}/{repr d.levelParams}")
+        collect fuel (n :: seen)
+          (((intrinsicConstNames d.value).filter scope.isPrefixOf).eraseDups ++ rest) (out ++ [entry])
+  collect 256 [] [root] []
+
+elab "canon_intrinsic_graph% " scope:ident " : " root:ident : term => do
+  let env ← Lean.getEnv
+  let some graph := canonicalIntrinsicGraph env root.getId scope.getId
+    | Lean.throwError "cannot capture canonical intrinsic graph for {root.getId}"
+  return Lean.toExpr graph
+
+def canonUgetGraph := canon_intrinsic_graph% LeanNative.IR.uget64LE : LeanNative.IR.uget64LE
+def canonUsetGraph := canon_intrinsic_graph% LeanNative.IR.uset64LE : LeanNative.IR.uset64LE
+def canonAffine64Graph := canon_intrinsic_graph% LeanNative.IR.gf2Affine64 : LeanNative.IR.gf2Affine64
+def canonTernaryGraph := canon_intrinsic_graph% LeanNative.IR.ternaryLogic64 : LeanNative.IR.ternaryLogic64
+def canonMaskedLoGraph := canon_intrinsic_graph% LeanNative.IR.MaskedClmul : LeanNative.IR.MaskedClmul.nativeClmulLo
+def canonMaskedHiGraph := canon_intrinsic_graph% LeanNative.IR.MaskedClmul : LeanNative.IR.MaskedClmul.nativeClmulHi
+
+/-- Compare complete bodies and generated helpers against frozen canonical
+    graphs. Names, borrowed metadata and binder spelling alone confer no trust. -/
+def matchesCanonicalIntrinsic (env : Lean.Environment) (actual reference : Lean.Name)
+    (namespaceScope : Bool := false) : Bool := Id.run do
+  let expected := if reference == ``LeanNative.IR.uget64LE then canonUgetGraph
+    else if reference == ``LeanNative.IR.uset64LE then canonUsetGraph
+    else if reference == ``LeanNative.IR.gf2Affine64 then canonAffine64Graph
+    else if reference == ``LeanNative.IR.ternaryLogic64 then canonTernaryGraph
+    else if reference == ``LeanNative.IR.MaskedClmul.nativeClmulLo then canonMaskedLoGraph
+    else if reference == ``LeanNative.IR.MaskedClmul.nativeClmulHi then canonMaskedHiGraph
+    else []
+  if expected.isEmpty then return false
+  let scope := if namespaceScope then actual.getPrefix else actual
+  return canonicalIntrinsicGraph env actual scope == some expected
+
+
 def trustedGfSimdIntrinsicOp (env : Lean.Environment) (fnName : Lean.Name) : Option BinOp := do
+  if let some (op, reference) := (match fnName with
+      | .str _ "nativeClmulLo" => some (BinOp.clmul64, ``LeanNative.IR.MaskedClmul.nativeClmulLo)
+      | .str _ "nativeClmulHi" => some (BinOp.clmul64Hi, ``LeanNative.IR.MaskedClmul.nativeClmulHi)
+      | _ => none) then
+    guard (matchesCanonicalIntrinsic env fnName reference true)
+    return op
   let (op, variants) ← match fnName with
     | .str _ "clmul64Hi" =>
       some (BinOp.clmul64Hi, [(canonClmul64HiRepr, some canonClmul64HiGoRepr),
@@ -756,34 +834,6 @@ def tryLowerGfSimdIntrinsic (env : Lean.Environment) (fnName : Lean.Name) (argVa
     else none
   | _ => none
 
-private def intrinsicConstNames : Lean.Expr → List Lean.Name
-  | .const n _ => [n]
-  | .app f a => intrinsicConstNames f ++ intrinsicConstNames a
-  | .lam _ t b _ | .forallE _ t b _ => intrinsicConstNames t ++ intrinsicConstNames b
-  | .letE _ t v b _ => intrinsicConstNames t ++ intrinsicConstNames v ++ intrinsicConstNames b
-  | .mdata _ e | .proj _ _ e => intrinsicConstNames e
-  | _ => []
-
-/-- Compare the complete definition graph owned by an intrinsic, including its
-    generated fold helpers. A familiar name or matching signature is insufficient. -/
-def matchesCanonicalIntrinsic (env : Lean.Environment) (actual reference : Lean.Name) : Bool :=
-  let rec check (fuel : Nat) (seen : List Lean.Name) (todo : List Lean.Name) : Bool :=
-    match todo, fuel with
-    | [], _ => true
-    | _ :: _, 0 => false
-    | n :: rest, fuel + 1 =>
-      if seen.contains n then check fuel seen rest
-      else
-        let r := n.replacePrefix actual reference
-        match env.find? n, env.find? r with
-        | some (.defnInfo d), some (.defnInfo rd) =>
-          !Lean.isExtern env n && d.safety == rd.safety && d.levelParams == rd.levelParams &&
-          normalizeIntrinsicDecl actual d.type == normalizeIntrinsicDecl reference rd.type &&
-          normalizeIntrinsicDecl actual d.value == normalizeIntrinsicDecl reference rd.value &&
-          check fuel (n :: seen)
-            (((intrinsicConstNames d.value).filter actual.isPrefixOf).eraseDups ++ rest)
-        | _, _ => false
-  check 256 [] [actual]
 
 def trustedG0IntrinsicCall? (env : Lean.Environment) (fnName : Lean.Name) : Option String := do
   let (reference, symbol) ← match fnName with
@@ -829,7 +879,7 @@ partial def rewriteImpureUset64LETypes (env : Lean.Environment) :
 def internParams {pu} (params : Array (Lean.Compiler.LCNF.Param pu)) (allowInternalObj : Bool := false) : BridgeM Unit := do
   for p in params do
     let pTy ← lowerBridgeType p.type
-    checkBridgeType "parameter" p.type pTy allowInternalObj
+    checkBridgeType "parameter" p.type pTy allowInternalObj (pTy == .sarray .i8)
     let _ ← internFVar p.fvarId pTy true
 
 def lowerRefOp (isInc : Bool) (fvarId : Lean.FVarId) (n : Nat) (kCode : LNIRCode) : BridgeM LNIRCode := do
@@ -1216,7 +1266,7 @@ def lowerJoinPoint {pu} (decl : Lean.Compiler.LCNF.FunDecl pu) (k : Lean.Compile
   if codeHasRecursiveJmp decl.fvarId decl.value then
     Lean.throwError s!"[lean-native] unsupported recursive join point `{decl.fvarId.name}`: no qualified loop lowering"
   let jpTy ← lowerBridgeType decl.type
-  checkBridgeType "join-point result" decl.type jpTy true
+  checkBridgeType "join-point result" decl.type jpTy true (jpTy == .sarray .i8)
   let _ ← internFVar decl.fvarId jpTy
   internParams decl.params true
   let impParams := toImpureParams decl.params
@@ -2024,6 +2074,61 @@ def lowerImpureCodeViaRealM (code : Lean.Compiler.LCNF.Code .impure) : BridgeM L
     return lnir
   | .error msg => Lean.throwError msg
 
+mutual
+/-- Typed ByteArray frontend extension: use the existing real bridge for each
+    scalar/call binding, preserving slice RC rather than erasing ownership. -/
+partial def lowerImpureSliceCode (code : Lean.Compiler.LCNF.Code .impure) : BridgeM LNIRCode := do
+  match code with
+  | .let d k =>
+    let segment ← lowerImpureCodeViaRealM (.let d (.return d.fvarId))
+    let continuation ← lowerImpureSliceCode k
+    let rec append : LNIRCode → Option LNIRCode
+      | .letBind v ty rhs rest => .letBind v ty rhs <$> append rest
+      | .ret _ => some continuation
+      | _ => none
+    let some body := append segment
+      | Lean.throwError "[lean-native] unsupported non-linear slice binding"
+    return body
+  | .jp d k => lowerJoinPoint d k lowerImpureSliceCode
+  | .jmp id args => lowerJmpInstr id args
+  | .cases c =>
+    let v ← internFVar c.discr
+    let ty ← getVarType v
+    if !isSupportedStage1BScalarType ty (← get).arch then
+      Lean.throwError "[lean-native] non-scalar slice-loop condition"
+    lowerImpureSliceAlts v (c.typeName == ``Bool || ty == .i1) 0 (orderAlts c.alts.toList)
+  | .inc fv n _ _ k _ =>
+    let v ← internFVar fv
+    let rest ← lowerImpureSliceCode k
+    if (← getVarType v) == .sarray .i8 then return .incRef v n rest
+    lowerRefOp true fv n rest
+  | .dec fv n _ _ _ k _ =>
+    let v ← internFVar fv
+    let rest ← lowerImpureSliceCode k
+    if (← getVarType v) == .sarray .i8 then return .decRef v n rest
+    lowerRefOp false fv n rest
+  | .return fv => return .ret (← internFVar fv)
+  | .unreach _ => return .unreachable
+  | _ => Lean.throwError "[lean-native] unsupported slice-loop object operation"
+
+partial def lowerImpureSliceAlts (v : VarId) (isBool : Bool) (idx : Nat)
+    (alts : List (Lean.Compiler.LCNF.Alt .impure)) : BridgeM LNIRCode := do
+  match alts with
+  | [] => return .unreachable
+  | .default b :: _ => lowerImpureSliceCode b
+  | .ctorAlt info b _ :: rest =>
+    let ty ← getVarType v
+    let cmp ← freshBridgeVar .i1
+    return (RealLCNFBridge.lowerTagBranchPure v ty info.cidx isBool cmp
+      (← lowerImpureSliceCode b) (← lowerImpureSliceAlts v isBool (idx + 1) rest)).1
+  | .alt n ps b _ :: rest =>
+    unless ps.isEmpty do Lean.throwError "[lean-native] unsupported slice-loop payload case"
+    let ty ← getVarType v
+    let cmp ← freshBridgeVar .i1
+    return (RealLCNFBridge.lowerTagBranchPure v ty (← lookupCtorIdx n idx) isBool cmp
+      (← lowerImpureSliceCode b) (← lowerImpureSliceAlts v isBool (idx + 1) rest)).1
+end
+
 partial def pureCodeAstFuel : Lean.Compiler.LCNF.Code .pure → Nat
   | .let _ k => 1 + pureCodeAstFuel k
   | .fun d k _ | .jp d k => 1 + pureCodeAstFuel d.value + pureCodeAstFuel k
@@ -2112,7 +2217,77 @@ def extractPureDeclFactsWithBridgeState (decl : Lean.Compiler.LCNF.Decl .pure)
   let merged := facts.foldl LeanNative.IR.consFact d.retainedFacts
   { d with retainedFacts := merged }
 
-/-- Delegate `Decl .impure` lowering directly to `RealLCNFBridge.lowerRealLCNFDecl` (backed by `lowerRealLCNFDecl_sound`). -/
+private def peelTailLets : LNIRCode → List (VarId × LNIRType × LNIRExpr) × LNIRCode
+  | .letBind v ty rhs k =>
+    let (bs, tail) := peelTailLets k
+    ((v, ty, rhs) :: bs, tail)
+  | c => ([], c)
+
+private def resolveTailScalar (bindings : List (VarId × LNIRType × LNIRExpr)) :
+    Nat → ScalarExpr → ScalarExpr
+  | 0, e => e
+  | fuel + 1, .var v =>
+    match bindings.reverse.find? (fun (dst, _, _) => dst == v) with
+    | some (_, _, .scalar e) => resolveTailScalar bindings fuel e
+    | _ => .var v
+  | fuel + 1, .binOp op a b => .binOp op (resolveTailScalar bindings fuel a) (resolveTailScalar bindings fuel b)
+  | fuel + 1, .unaryOp op a => .unaryOp op (resolveTailScalar bindings fuel a)
+  | fuel + 1, .select c t e => .select (resolveTailScalar bindings fuel c)
+      (resolveTailScalar bindings fuel t) (resolveTailScalar bindings fuel e)
+  | _, e => e
+
+/-- Recognize only a unit-step unsigned bounded loop with one carried value.
+    All other parameters must be invariant and the recursive call must be the
+    returned value. This frontend extension has Tested assurance. -/
+def tryLowerBoundedTailRecBody? (d : LNIRDecl) : Option LNIRCode := do
+  let (header, branch) := peelTailLets d.body
+  guard (header.all fun (_, _, rhs) => match rhs with | .scalar _ => true | _ => false)
+  let .ite cond t e := branch | none
+  let resolved := resolveTailScalar header (header.length + 4) (.var cond)
+  let (idx, bound, stepThen) ← match resolved with
+    | .binOp .lt (.var i) (.var n) => some (i, n, true)
+    | .binOp .eq (.select (.binOp .lt (.var i) (.var n)) (.constU64 1) (.constU64 0)) (.constU64 0) =>
+      some (i, n, false)
+    | .binOp .eq (.select (.binOp .le (.var n) (.var i)) (.constU64 1) (.constU64 0)) (.constU64 0) =>
+      some (i, n, true)
+    | .unaryOp .not (.binOp .lt (.var i) (.var n)) => some (i, n, false)
+    | _ => none
+  guard (idx != bound)
+  let ip ← d.params.find? (·.id == idx)
+  let np ← d.params.find? (·.id == bound)
+  guard ((ip.ty == .i64 || ip.ty == .usize) && np.ty == ip.ty)
+  let step := if stepThen then t else e
+  let exit := if stepThen then e else t
+  let rec exitReturn? : LNIRCode → Option VarId
+    | .ret v => some v
+    | .letBind _ _ (.scalar _) k | .incRef _ _ k | .decRef _ _ k => exitReturn? k
+    | _ => none
+  let exitVar ← exitReturn? exit
+  let (exitBinds, _) := peelTailLets exit
+  let .var acc := resolveTailScalar exitBinds (exitBinds.length + 2) (.var exitVar) | none
+  let ap ← d.params.find? (·.id == acc)
+  guard (acc != idx && acc != bound && ap.ty == d.retTy)
+  let (stepBinds, stepTail) := peelTailLets step
+  let .ret retVar := stepTail | none
+  let (retBind :: revBinds) := stepBinds.reverse | none
+  let (dst, _, .call self args _ false) := retBind | none
+  guard (self == d.name && dst == retVar && args.length == d.params.length)
+  let binds := revBinds.reverse
+  let env := header ++ binds
+  let mut nextAcc := acc
+  for (p, a) in d.params.zip args do
+    if p.id == idx then
+      let next := resolveTailScalar env (env.length + 4) (.var a)
+      guard (next == .binOp .add (.var idx) (.constU64 1) ||
+             next == .binOp .add (.constU64 1) (.var idx))
+    else if p.id == acc then nextAcc := a
+    else guard (a == p.id)
+  let stepBody := (header ++ binds).foldr
+    (fun (v, ty, rhs) k => .letBind v ty rhs k) (.ret nextAcc)
+  return .seqFor idx idx bound acc acc ap.ty stepBody exit
+
+/-- Delegate the supported impure fragment to RealLCNFBridge, with explicitly
+    labeled frontend extensions for canonical intrinsics and bounded loops. -/
 def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
     (localDeclNames : Array Lean.Name := #[]) (arch : TargetArch := .x86_64)
     (allowRcAdt : Bool := false) : Lean.CoreM LNIRDecl := do
@@ -2178,8 +2353,6 @@ def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
           name := metaInfo.mangledSymbol, params := lnirParams, retTy := retTy,
           body := .letBind retVar retTy intrExpr (.ret retVar), assurance := .tested,
           isGpuCand := lnirParams.all (fun p => p.ty.isGpuCompatible) && retTy.isGpuCompatible }
-      if codeHasSelfTailCall decl.name c then
-        Lean.throwError s!"[lean-native] unsupported self-tail recursion in {decl.name}: no qualified loop lowering"
       checkImpureLetTypesM c
       let knownCtors := collectFVarCtors c
       let typeExprs := decl.type :: (decl.params.toList.map (·.type) ++ collectCodeTypeExprs [] c)
@@ -2187,8 +2360,19 @@ def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
       let ctx ← buildRealBridgeCtxM typeExprs (ctors ++ knownCtors.toList.map Prod.snd)
         callees paramTypeMap knownCtors.toList
       let fuel := codeAstFuel c + decl.params.size + 64
-      match RealLCNFBridge.lowerRealLCNFDecl fuel ctx decl metaInfo.mangledSymbol with
+      let lowered ← if paramTypesList.any isSupportedSliceType || retTy == .sarray .i8 then do
+        let body ← lowerImpureSliceCode c
+        let params := (decl.params.toList.zip (paramIds.zip paramTypesList)).map fun (p, (vid, pTy)) =>
+          { id := vid, name := p.binderName.toString, ty := pTy, borrow := p.borrow : LNIRParam }
+        pure (.ok { name := metaInfo.mangledSymbol, params, retTy, body, assurance := .tested } : Except String LNIRDecl)
+      else pure (RealLCNFBridge.lowerRealLCNFDecl fuel ctx decl metaInfo.mangledSymbol)
+      match lowered with
       | .ok d =>
+        let d ← if codeHasSelfTailCall decl.name c then do
+          let some body := tryLowerBoundedTailRecBody? d
+            | Lean.throwError s!"[lean-native] unsupported self-tail recursion in {decl.name}: no qualified loop lowering"
+          pure { d with body, assurance := .tested }
+        else pure d
         let rstAfter := (RealLCNFBridge.internRealParams ctx {} decl.params.toList).2
         let (nextAfter, endVarTypes) := match RealLCNFBridge.lowerRealLCNFCode fuel ctx rstAfter c with
           | .ok (_, rstEnd) => (rstEnd.nextVarId, rstEnd.varTypes)
