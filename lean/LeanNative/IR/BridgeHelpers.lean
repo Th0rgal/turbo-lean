@@ -2373,6 +2373,8 @@ def ingestImpureDeclViaReal (decl : Lean.Compiler.LCNF.Decl .impure)
       match lowered with
       | .ok d =>
         let d ← if codeHasSelfTailCall decl.name c then do
+          if (← IO.getEnv "LEAN_NATIVE_TRACE_LOOPS") == some "1" then
+            IO.eprintln s!"[lean-native] loop candidate {d.name}: {repr d}"
           let some body := tryLowerBoundedTailRecBody? d
             | Lean.throwError s!"[lean-native] unsupported self-tail recursion in {decl.name}: no qualified loop lowering"
           pure { d with body, assurance := .tested }
