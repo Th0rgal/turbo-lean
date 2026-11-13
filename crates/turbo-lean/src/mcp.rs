@@ -1529,9 +1529,14 @@ fn invoke_agent_step_json(
     let cli_bin = resolve_cli_bin();
     if cli_bin.exists() {
         if !crate::zygote::daemon_disabled() {
-            let shared = crate::db::TurboStore::open(cache_dir).ok().and_then(|store| {
-                crate::zygote::ensure_local_zygote_daemon(&store, &std::collections::HashMap::new())
-            });
+            let shared = crate::db::TurboStore::open(cache_dir)
+                .ok()
+                .and_then(|store| {
+                    crate::zygote::ensure_local_zygote_daemon(
+                        &store,
+                        &std::collections::HashMap::new(),
+                    )
+                });
             if shared.is_none() {
                 return serde_json::json!({
                     "status": "error", "ok": false, "verified": false,
@@ -1843,8 +1848,16 @@ pub fn handle_mcp_jsonrpc_request(
     if method == "tools/call"
         && std::env::var_os("TURBO_LEAN_DAEMON").is_none()
         && !crate::zygote::daemon_disabled()
-        && matches!(req.pointer("/params/name").and_then(|v| v.as_str()),
-            Some("turbo_check_decl" | "turbo_agent_step" | "turbo_audit_spec" | "turbo_fast_check" | "turbo_pr_verify"))
+        && matches!(
+            req.pointer("/params/name").and_then(|v| v.as_str()),
+            Some(
+                "turbo_check_decl"
+                    | "turbo_agent_step"
+                    | "turbo_audit_spec"
+                    | "turbo_fast_check"
+                    | "turbo_pr_verify"
+            )
+        )
     {
         let result = crate::zygote::forward_mcp_request(req, default_project_dir, cache_dir);
         return Some(result.unwrap_or_else(|error| serde_json::json!({
@@ -2837,11 +2850,7 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(
-            root.join("lean-toolchain"),
-            "leanprover/lean4:v4.35.0\n",
-        )
-        .unwrap();
+        fs::write(root.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
         fs::write(
             root.join("lakefile.toml"),
             "name = \"fcpol\"\nversion = \"0.1.0\"\ndefaultTargets = [\"FcPol\"]\n\n[[lean_lib]]\nname = \"FcPol\"\nsrcDir = \"src\"\n",
@@ -2886,7 +2895,8 @@ mod tests {
                 }
             }
         });
-        let rejected = handle_mcp_jsonrpc_request(&req, Some(&root), Some(&root.join(".cache"))).unwrap();
+        let rejected =
+            handle_mcp_jsonrpc_request(&req, Some(&root), Some(&root.join(".cache"))).unwrap();
         assert_eq!(
             rejected["result"]["isError"], true,
             "ambient daemon TURBO_LEAN_ALLOWED_CSIMP=* must not leak into turbo_fast_check: {rejected}"
@@ -2899,7 +2909,8 @@ mod tests {
         .unwrap();
         std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP");
         crate::zygote::set_inbound_policy(std::collections::BTreeMap::new());
-        let accepted = handle_mcp_jsonrpc_request(&req, Some(&root), Some(&root.join(".cache"))).unwrap();
+        let accepted =
+            handle_mcp_jsonrpc_request(&req, Some(&root), Some(&root.join(".cache"))).unwrap();
         crate::zygote::clear_inbound_policy();
         match prev_csimp {
             Some(v) => std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", v),
@@ -2911,7 +2922,8 @@ mod tests {
             "target project turbo-lean.toml [csimp] must apply to turbo_fast_check: {accepted}"
         );
         let body: serde_json::Value =
-            serde_json::from_str(accepted["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+            serde_json::from_str(accepted["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
         assert_eq!(body["kind"], "cex", "{body}");
         let _ = fs::remove_dir_all(&root);
     }
