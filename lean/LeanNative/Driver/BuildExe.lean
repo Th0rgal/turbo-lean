@@ -112,12 +112,14 @@ def emitLeanCFromSourceFile (filePath : String) (modName : Lean.Name := `Main)
     let mut cursor := 0
     while cursor < selected.size do
       let n := selected[cursor]!
-      let callees : List Lean.Name ← do
-        if let some d ← Lean.Compiler.LCNF.getLocalImpureDecl? n then
-          if let .code c := d.value then return collectNamedCallees c
-        if let some d ← Lean.Compiler.LCNF.getMonoDecl? n then
-          if let .code c := d.value then return collectNamedCallees c
-        pure []
+      let callees : List Lean.Name ←
+        match ← Lean.Compiler.LCNF.getLocalImpureDecl? n with
+        | some d => pure (match d.value with | .code c => collectNamedCallees c | _ => [])
+        | none => do
+          let d? ← Lean.Compiler.LCNF.getMonoDecl? n
+          pure (match d? with
+            | some d => match d.value with | .code c => collectNamedCallees c | _ => []
+            | none => [])
       for callee in callees do
         if belongsToInput callee && !Lean.isExtern env callee && !selected.contains callee then
           selected := selected.push callee
