@@ -23,3 +23,22 @@ or wipe evidence was supplied to this worker. Expiry/recycling versus wipe
 and the precise missing-push cause remain unverified. Current recovery's own
 anonymous GitHub push failed; no credentials were sought. This does not prove
 the historical push failure mechanism.
+
+## Coordinator lifecycle evidence now published
+
+Read app integration9f5869b9940af259deecbe000a42ff527a40b9d7:plan.md
+incident section. It documents mm5xvnw6ha destruction2026-11-11T00:44:03Z
+with owner_failed before expiry01:00:47Z. Worker had detached29d85f7 and
+uncommitted modifications; final249433-byte patch SHA
+c3b93b720d76d5468375f4d30247488382fec23e84983b570aa0002c81417277
+was generated00:36:16 but no subsequent commit/push or complete off-VM
+harvest receipt was found. Cause: VM destruction carrying unpublished
+compiler state without complete off-VM harvest. TTL expiry and workspace
+wipe are not demonstrated. Initial owner-failure classification cause
+remains unknown; owner_failed does not prove worker tests failed.
+This is coordinator-published evidence; raw lifecycle receipts remain on
+the coordinator. Distinct C1c mmp2t4xd94 was not the C1a fork.
+
+Coordinator confirmed only older compiler ba5b99b and older15388723-byte
+archive4ac1830c... off VM. Latest source and r3 delivery remain pending
+remote-ref/off-VM confirmation; do not conflate these checkpoints.
