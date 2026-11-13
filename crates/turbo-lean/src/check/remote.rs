@@ -342,10 +342,12 @@ pub fn try_stateless_remote_check(
         lean_args: file_lean_args,
     })?;
 
+    let remote_timer = super::PhaseTimer::start("elab");
     let Ok(resp_bytes) = pack::http_request("POST", &endpoint, "application/json", &req_body)
     else {
         return Ok(false);
     };
+    drop(remote_timer);
     let Ok(resp) = serde_json::from_slice::<pack::CheckShardsBatchResponse>(&resp_bytes) else {
         return Ok(false);
     };
