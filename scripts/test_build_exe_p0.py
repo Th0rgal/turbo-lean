@@ -121,6 +121,11 @@ class BuildExeP0(unittest.TestCase):
             original = project / ".lake/build/ir/Imported.c.o.export"
             fallback = project / ".lake/build/native-c/Imported.c.o"
             fallback.parent.mkdir(parents=True, exist_ok=True)
+            # Older turbo-lean caches restore C/olean but omit native sidecars.
+            if not original.exists():
+                sysroot = Path(os.environ["LEAN_SYSROOT"])
+                run(["/usr/bin/clang", "-O2", "-DLEAN_EXPORTING", "-I", sysroot / "include",
+                     "-c", original.with_name("Imported.c"), "-o", original])
             original.replace(fallback)
             before = hashlib.sha256(fallback.read_bytes()).hexdigest()
             exe = project / "runner"

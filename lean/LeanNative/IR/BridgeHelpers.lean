@@ -386,7 +386,7 @@ def checkEnvConstSignatureM (env : Lean.Environment) (declName : Lean.Name) (arc
           if rTy matches (.tuple _) then
             Lean.throwError s!"[lean-native] Unsupported exported tuple return type in `{declName}`"
         else if !(isStage1D && isSupportedStage1DHeapAdtExpr env arch retExpr) then
-          validateSupportedTypeM s!"return type of `{declName}`" retExpr rTy arch false false true
+          validateSupportedTypeM s!"return type of `{declName}`" retExpr rTy arch false (rTy == .sarray .i8) true
   go 0 cinfo.type
 
 def collectEnvExplicitParamTypes (env : Lean.Environment) (declName : Lean.Name) : List LNIRType :=
