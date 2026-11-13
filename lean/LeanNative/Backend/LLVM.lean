@@ -1624,7 +1624,7 @@ private def emitZmmSliceLoopWithRem? (idx acc : VarId) (lo hi : String) (body : 
       let vc ← emitZmmScalar venv idx cur (.var c)
       let immediate := match resolveZmmScalar lets (lets.length + 4) (.var imm) with | .constU64 x => x.toNat % 256 | _ => 0
       let out ← freshTmp "zmm_ternary"
-      emitLine s!"  {out} = call <8 x i64> @llvm.x86.avx512.mask.pternlog.q.512(<8 x i64> {va}, <8 x i64> {vb}, <8 x i64> {vc}, i32 {immediate}, i8 -1)"
+      emitLine s!"  {out} = call <8 x i64> @llvm.x86.avx512.pternlog.q.512(<8 x i64> {va}, <8 x i64> {vb}, <8 x i64> {vc}, i32 {immediate})"
       venv := (v, out) :: venv
     | _ => pure () -- excluded by qualification
   emitLine s!"  {next} = add nuw i64 {cur}, 8\n  br label %{hdr}\n{doneLbl}:"
@@ -1942,7 +1942,7 @@ def emitCryptoSliceHelpers (target : TargetArch) : String := Id.run do
     "declare <16 x i8> @llvm.x86.vgf2p8affineqb.128(<16 x i8>, <16 x i8>, i8 immarg)",
     "declare <64 x i8> @llvm.x86.vgf2p8affineqb.512(<64 x i8>, <64 x i8>, i8 immarg)",
     "declare <8 x i64> @llvm.x86.pclmulqdq.512(<8 x i64>, <8 x i64>, i8 immarg)",
-    "declare <8 x i64> @llvm.x86.avx512.mask.pternlog.q.512(<8 x i64>, <8 x i64>, <8 x i64>, i32 immarg, i8)",
+    "declare <8 x i64> @llvm.x86.avx512.pternlog.q.512(<8 x i64>, <8 x i64>, <8 x i64>, i32 immarg)",
     "define weak_odr i64 @lean_native_sarray_uget64_le(ptr %a, i64 %off) #5 {",
     "entry:",
     "  %sp = getelementptr i8, ptr %a, i64 8",
