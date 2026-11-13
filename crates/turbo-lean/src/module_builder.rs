@@ -24083,6 +24083,7 @@ fn run_audit_chunk_subprocess(
     if mod_names.is_empty() || mod_names.iter().any(|m| m.trim().is_empty()) {
         anyhow::bail!("In-kernel `.olean` audit received an empty module name: fail-closed");
     }
+    let _kernel_timer = crate::check::PhaseTimer::start("kernel");
     record_scheduler_test_event("audit_subprocess_start", mod_names);
     let (mut cmd, timeout) = crate::zygote::kernel_reader_command(
         store_root,
@@ -24397,6 +24398,7 @@ fn run_audit_or_replay_batch_worker_bound(
         }
         record_scheduler_test_event("replay_subprocess_start", std::slice::from_ref(m));
         let res = (|| -> Result<()> {
+            let _kernel_timer = crate::check::PhaseTimer::start("kernel");
             let _ = crate::zygote::ensure_bound_audit_closure(snap, "sched_replay_before_single")?;
             let (mut cmd, timeout) =
                 crate::zygote::kernel_reader_command(store_root, cfg, &snap_lp, &[], false)?;
@@ -34458,6 +34460,7 @@ globs = ["Demo.+"]
         let _env_guard = crate::pack::tests::env_test_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let _batch = ScopedEnvVar::set("TURBO_LEAN_AUDIT_BATCH_SIZE", "4");
         let dir = make_temp_test_dir("diamond");
         let proj_dir = dir.join("diamond_proj");
         let store_dir = dir.join("store");
@@ -34511,7 +34514,7 @@ globs = ["Demo.+"]
             &proj_dir,
             &[],
             "trusted-internal",
-            1,
+            2,
             false,
             true,
             None,
