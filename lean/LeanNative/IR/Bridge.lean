@@ -260,14 +260,17 @@ private def tryIngestScalarSource (name : Lean.Name) : Lean.CoreM (Option LNIRDe
   if info.safety != .safe || !info.levelParams.isEmpty || Lean.isExtern env name then return none
   let action : Lean.MetaM (Option LNIRDecl) := do
     let u64 := Lean.mkConst ``UInt64
-    let rec signature (ty : Lean.Expr) (count : Nat) : Lean.MetaM (Option Nat) := do
-      let ty ← Lean.Meta.withTransparency .reducible (Lean.Meta.whnf ty)
-      match ty with
-      | .forallE _ t b _ =>
-        if t.hasLooseBVars || (← Lean.Meta.withTransparency .reducible (Lean.Meta.whnf t)) != u64 then return none
-        signature b (count + 1)
-      | _ => return if ty == u64 then some count else none
-    let some arity ← signature info.type 0 | return none
+    let rec signature (fuel : Nat) (ty : Lean.Expr) (count : Nat) : Lean.MetaM (Option Nat) := do
+      match fuel with
+      | 0 => return none
+      | fuel + 1 =>
+       let ty ← Lean.Meta.withTransparency .reducible (Lean.Meta.whnf ty)
+       match ty with
+       | .forallE _ t b _ =>
+         if t.hasLooseBVars || (← Lean.Meta.withTransparency .reducible (Lean.Meta.whnf t)) != u64 then return none
+         signature fuel b (count + 1)
+       | _ => return if ty == u64 then some count else none
+    let some arity ← signature 64 info.type 0 | return none
     if arity == 0 then return none
     let rec peel (n : Nat) (e : Lean.Expr) (scope : List VarId) : Option (Lean.Expr × List VarId) :=
       match n, e with
@@ -293,11 +296,11 @@ private def tryIngestScalarSource (name : Lean.Name) : Lean.CoreM (Option LNIRDe
           let fn := e.getAppFn
           let args := e.getAppArgs
           if fn.isConstOf ``UInt64.ofNat then
-            if let some (.lit (.natVal n)) := args[0]? then
+            if let some (Lean.Expr.lit (Lean.Literal.natVal n)) := args[0]? then
               return some ([(next, .scalar (.constU64 n.toUInt64))], next, next + 1)
           let .const callee _ := fn | return none
           let some calleeInfo := env.find? callee | return none
-          let some n ← signature calleeInfo.type 0 | return none
+          let some n ← signature 64 calleeInfo.type 0 | return none
           if n != args.size || n == 0 then return none
           let mut binds := []
           let mut vars := []
