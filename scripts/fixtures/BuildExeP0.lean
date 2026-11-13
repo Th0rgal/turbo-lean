@@ -76,6 +76,12 @@ def mkWordsBA (ws : List UInt64) : ByteArray := Id.run do
     idx := idx + 1
   return ba
 
+@[noinline, export p0_borrowed_get]
+def borrowedGet (a : @& ByteArray) (off : USize) : UInt64 := uget64LE a off
+
+@[noinline, export p0_owned_set]
+def ownedSet (a : ByteArray) (off : USize) (value : UInt64) : ByteArray := uset64LE a off value
+
 def main (args : List String) : IO Unit := do
   let u := fun (s : String) => s.toNat!.toUInt64
   match args with
@@ -85,7 +91,18 @@ def main (args : List String) : IO Unit := do
     IO.println (emul1 (u a0) (u a1) (u a2) (u b0) (u b1) (u b2))
     IO.println (emul2 (u a0) (u a1) (u a2) (u b0) (u b1) (u b2))
   | ["I", x] => IO.println (identity (u x))
-  | ["Z", nStr, seedStr] =>
+  | ["B", sizeStr, offStr, valueStr] =>
+    let size := sizeStr.toNat!
+    let off := offStr.toNat!.toUSize
+    let original := ByteArray.mk ((Array.range size).map fun i => (i * 37 + 11).toUInt8)
+    let changed := ownedSet original off (u valueStr)
+    IO.println (borrowedGet original off)
+    IO.println (borrowedGet changed off)
+    for byte in original.data do IO.println byte
+    for byte in changed.data do IO.println byte
+  | [mode, nStr, seedStr] =>
+    if mode != "Z" && mode != "A" then
+      throw (IO.userError "expected Z or A slice mode")
     let n := nStr.toNat!
     let seed := u seedStr
     let wsA := (List.range n).map fun i => seed + (i.toUInt64 * 0x9e3779b97f4a7c15)
@@ -94,11 +111,13 @@ def main (args : List String) : IO Unit := do
     let baA := mkWordsBA wsA
     let baB := mkWordsBA wsB
     let baC := mkWordsBA wsC
-    let baDst := ByteArray.mk (Array.replicate (n * 8) 0)
+    let baDst := if mode == "A" then baA else ByteArray.mk (Array.replicate (n * 8) 0)
     let out := zmmSliceKernel n.toUInt64 baA baB baC baDst
     let mut acc : UInt64 := 0
     for i in [:n] do
       let got := uget64LE out (i.toUSize * 8)
+      if borrowedGet baA (i.toUSize * 8) != wsA[i]! then
+        throw (IO.userError s!"source alias changed at lane {i}")
       let a := wsA[i]!
       let b := wsB[i]!
       let c := wsC[i]!
@@ -107,4 +126,4 @@ def main (args : List String) : IO Unit := do
         throw (IO.userError s!"Z mismatch at lane {i}: got {got}, expected {exp}")
       acc := acc ^^^ got
     IO.println acc
-  | _ => throw (IO.userError "expected K a b, E a0 a1 a2 b0 b1 b2, I x, or Z n seed")
+  | _ => throw (IO.userError "expected K a b, E a0 a1 a2 b0 b1 b2, I x, Z/A n seed, or B size offset value")
