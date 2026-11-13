@@ -36,21 +36,7 @@ def resolveLeanSysroot : IO System.FilePath := do
   if let some envRoot ← IO.getEnv "LEAN_SYSROOT" then
     if !envRoot.isEmpty then
       return System.FilePath.mk envRoot
-  try
-    Lean.findSysroot
-  catch _ =>
-    let home := (← IO.getEnv "HOME").getD ""
-    let candidates := [
-      s!"{home}/.elan/toolchains/leanprover--lean4---v4.35.0",
-      "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0",
-      "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0",
-      "/var/lib/orb-node/work/caches/elan/toolchains/leanprover--lean4---v4.35.0"
-    ]
-    for c in candidates do
-      let p := System.FilePath.mk c
-      if ← p.pathExists then
-        return p
-    return System.FilePath.mk "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0"
+  Lean.findSysroot
 
 /-- When `filePath` (e.g., `SnarkFast/Kernels.lean`) is an umbrella module that re-exports
     domain submodules in `<filePath_without_.lean>/<Sub>.lean` (`Field`, `Ntt`, `Hashes`, `Pcs`),
@@ -106,13 +92,29 @@ def ingestLeanSourceFile (filePath : String) (moduleName : String := "LeanNative
     (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : IO LNIRModule :=
   normalizeAndInlineLocalDefs <$> withElaboratedFrontend filePath `LeanNativeInput (ingestAllLocalDecls moduleName arch allowRcAdt)
 
-/-- Elaborate `filePath` with `Lean.Elab.runFrontend`, extracting both the Lean 4.31 C module code
-    (`Lean.Compiler.LCNF.emitC modName`) and the lowered `LNIRModule` via `ingestAllLocalDecls`. -/
 def emitLeanCFromSourceFile (filePath : String) (modName : Lean.Name := `Main)
-    (arch : TargetArch := .x86_64) : IO (String × LNIRModule) :=
+    (arch : TargetArch := .x86_64) : IO (String × LNIRModule × Array String) :=
   withElaboratedFrontend filePath modName do
-    let mod ← ingestAllLocalDecls modName.toString arch
-    return (← Lean.Compiler.LCNF.emitC modName, mod)
+    let env ← getEnv
+    let names ← Lean.Compiler.LCNF.getLocalImpureDecls
+    let mut selected := names.filter (fun n => (Lean.getExportNameFor? env n).isSome)
+    for _ in [:names.size] do
+      for n in selected do
+        if let some d ← Lean.Compiler.LCNF.getLocalImpureDecl? n then
+          if let .code c := d.value then
+            for callee in collectCodeLocalCallees names c do
+              if !selected.contains callee then selected := selected.push callee
+    let mod ← ingestModuleDecls selected modName.toString arch
+    let mut objects := #[]
+    let sysroot ← resolveLeanSysroot
+    for n in env.header.moduleNames do
+      let olean ← Lean.findOLean n
+      if !olean.toString.startsWith sysroot.toString then
+        let obj := ((olean.toString.replace "/lib/lean/" "/ir/").dropEnd 6).toString ++ ".c.o.export"
+        unless ← (System.FilePath.mk obj).pathExists do
+          throwError "[lean-native] missing native object for imported module {n}: {obj}"
+        objects := objects.push obj
+    return (← Lean.Compiler.LCNF.emitC modName, mod, objects)
 
 /-- P-cert C4/C5 `build-exe` gate (fail closed, checked before any file is written): the Bridge already refuses
     RC-ADT decls without `allowRcAdt`, but the LLVM backend accepts no heap code, so `build-exe` re-checks
@@ -128,7 +130,7 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
   let sysroot ← resolveLeanSysroot
   let hostArch : TargetArch :=
     if System.Platform.target.startsWith "aarch64" || System.Platform.target.startsWith "arm64" then .arm64 else .x86_64
-  let (cCode, rawMod) ← emitLeanCFromSourceFile filePath `Main hostArch
+  let (cCode, rawMod, importObjects) ← emitLeanCFromSourceFile filePath `Main hostArch
   let (optMod, _) := LeanNative.Transform.runDefaultPipeline rawMod
   if let some err := buildExeLLVMGate? rawMod optMod hostArch then throw <| IO.userError err
   let superoptTgt : LeanNative.Transform.SuperoptTarget :=
@@ -142,7 +144,6 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
     if telCfg.enabled then
       let _ ← LeanNative.Transform.emitModuleTelemetryEvents telCfg superoptTgt false rawMod
   let lnirLlPath := s!"{outBin}.lnir.ll"
-  let lnirOptLlPath := s!"{outBin}.lnir.opt.ll"
   let lnirLlText := LeanNative.Backend.LLVM.emitLLVMOptimized optMod hostArch
   IO.FS.writeFile lnirLlPath lnirLlText
 
@@ -155,14 +156,8 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
   let clangIncDir := (sysroot / "include" / "clang").toString
   let libDir := (sysroot / "lib" / "lean").toString
 
-  let relRuntime : System.FilePath := "runtime/lean_native_runtime.c"
-  let absRuntime : System.FilePath := "/var/lib/spark-admin/jobs/3730b838-a03b-49e3-bbd2-eb51c132a4e7/lean-native/runtime/lean_native_runtime.c"
-  let runtimePath ← if (← relRuntime.pathExists) then pure relRuntime.toString else pure absRuntime.toString
-  let runtimeDir := ((System.FilePath.mk runtimePath).parent.getD (System.FilePath.mk "runtime")).toString
-  let cOptScript : System.FilePath := ((System.FilePath.mk runtimeDir).parent.getD (System.FilePath.mk ".")) / "scripts" / "ln_c_opt.py"
-  let cOptPath := if (← cOptScript.pathExists) then cOptScript.toString else "scripts/ln_c_opt.py"
-  discard <| IO.Process.output { cmd := "python3", args := #[cOptPath, cPath, cPath] }
-
+  let runtimePath := s!"{outBin}.runtime.c"
+  IO.FS.writeFile runtimePath LeanNative.Backend.LLVM.leanRuntimeC
   let sysClang : System.FilePath := "/usr/bin/clang"
   let tcClang : System.FilePath := sysroot / "bin" / "clang"
   let clangCmd ←
@@ -174,45 +169,29 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
 
   let clangEmitOut ← IO.Process.output {
     cmd  := clangCmd
-    args := #["-S", "-emit-llvm", optLevel, "-Xclang", "-disable-llvm-passes", "-DNDEBUG", "-march=native", s!"-I{incDir}", s!"-I{runtimeDir}"] ++ extraIncArgs ++ #[cPath, "-o", rawLlPath]
+    args := #["-S", "-emit-llvm", optLevel, "-Xclang", "-disable-llvm-passes", "-DNDEBUG", "-march=native",
+      s!"-I{incDir}"] ++ extraIncArgs ++ #[cPath, "-o", rawLlPath]
   }
   if clangEmitOut.exitCode != 0 then
     throw <| IO.userError s!"clang -emit-llvm failed:\n{clangEmitOut.stderr}"
 
-  let intrDecls := optMod.decls.filter fun d =>
-    ["l_clmul64Hi", "l_clmul64", "l_gf2Affine", "l_eor3"].any fun s => (d.name.splitOn s).length > 1
-  if !intrDecls.isEmpty then
-    let intrPath := s!"{outBin}.intr.ll"
-    IO.FS.writeFile intrPath ((LeanNative.Backend.LLVM.emitLLVMOptimized { optMod with decls := intrDecls } hostArch).replace ") #0 {" ") alwaysinline #0 {")
-    if (← (System.FilePath.mk "/usr/lib/llvm-18/bin/llvm-link").pathExists) then
-      discard <| IO.Process.output { cmd := "/usr/lib/llvm-18/bin/llvm-link", args := #["-S", rawLlPath, s!"--override={intrPath}", "-o", rawLlPath] }
-    else
-      discard <| IO.Process.output { cmd := "python3", args := #[cOptPath, "--override-ll", rawLlPath, intrPath, rawLlPath] }
+  let mergedLlPath := s!"{outBin}.merged.ll"
+  let mergeOut ← IO.Process.output {
+    cmd := "llvm-link"
+    args := #["-S", rawLlPath, s!"--override={lnirLlPath}", "-o", mergedLlPath]
+  }
+  if mergeOut.exitCode != 0 then
+    throw <| IO.userError s!"LLVM optimized definition merge failed:\n{mergeOut.stderr}"
 
-  let optBin : System.FilePath := "/usr/lib/llvm-18/bin/opt"
-  let hasOptBin ← optBin.pathExists
-  let runOptPass (inLl outLl : String) (fallback : IO String) : IO Unit := do
-    if hasOptBin then
-      try
-        let out ← IO.Process.output {
-          cmd  := optBin.toString
-          args := #["-S", "-passes=default<O3>,loop-vectorize,slp-vectorizer", "-vectorize-loops", "-vectorize-slp", inLl, "-o", outLl]
-        }
-        if out.exitCode == 0 then return ()
-      catch _ => pure ()
-    try
-      let clangIrOut ← IO.Process.output {
-        cmd  := clangCmd
-        args := #["-x", "ir", optLevel, "-S", "-emit-llvm", "-Wno-override-module", inLl, "-o", outLl]
-      }
-      if clangIrOut.exitCode != 0 then IO.FS.writeFile outLl (← fallback)
-    catch _ =>
-      IO.FS.writeFile outLl (← fallback)
-  runOptPass rawLlPath optLlPath (IO.FS.readFile rawLlPath)
-  runOptPass lnirLlPath lnirOptLlPath (pure lnirLlText)
+  let optOut ← IO.Process.output {
+    cmd := "opt"
+    args := #["-S", "-passes=default<O3>,loop-vectorize,slp-vectorizer", mergedLlPath, "-o", optLlPath]
+  }
+  if optOut.exitCode != 0 then
+    throw <| IO.userError s!"LLVM optimization failed:\n{optOut.stderr}"
 
   let isDarwin := (System.Platform.target.splitOn "darwin").length > 1 || (System.Platform.target.splitOn "apple").length > 1
-  let linkInputs := if isDarwin then #[optLlPath, runtimePath] else #[optLlPath, lnirOptLlPath, runtimePath, "-Wl,--allow-multiple-definition"]
+  let linkInputs := #[optLlPath, runtimePath] ++ importObjects
   let sysLibDir := (sysroot / "lib").toString
   let hasStaticLeanRt ← ((sysroot / "lib" / "lean" / "libleanrt.a").pathExists)
   let hasStaticInit ← ((sysroot / "lib" / "lean" / "libInit.a").pathExists)
@@ -225,7 +204,7 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
   let runtimeLinkFlags : Array String ← do
     if useStandaloneStatic then
       let leanLibDir := sysroot / "lib" / "lean"
-      let mut leanArchives := #[(leanLibDir / "libInit.a").toString]
+      let mut leanArchives := #[(leanLibDir / "libInit.a").toString, (leanLibDir / "libLean.a").toString]
       if hasStaticStd then leanArchives := leanArchives.push (leanLibDir / "libStd.a").toString
       leanArchives := leanArchives.push (leanLibDir / "libleanrt.a").toString
       if (← (leanLibDir / "libleancpp.a").pathExists) then
@@ -238,17 +217,14 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
         leanArchives ++ extStatic ++ #["-Wl,--end-group", "-lm", "-lpthread", "-ldl", "-lrt"])
     else
       pure #[s!"-L{libDir}", "-lleanshared", s!"-Wl,-rpath,{libDir}", "-lm", "-lpthread", "-ldl"]
-  let mut linkOut ← IO.Process.output {
-    cmd  := clangCmd
-    args := #[optLevel, "-DNDEBUG", "-march=native", "-Wno-override-module", s!"-I{incDir}", s!"-I{runtimeDir}"] ++
-      extraIncArgs ++ linkInputs ++ runtimeLinkFlags ++ #["-o", outBin]
+  let linkWith (flags : Array String) := IO.Process.output {
+    cmd := clangCmd
+    args := #[optLevel, "-DNDEBUG", "-march=native", "-Wno-override-module", s!"-I{incDir}"] ++
+      extraIncArgs ++ linkInputs ++ flags ++ #["-o", outBin]
   }
+  let mut linkOut ← linkWith runtimeLinkFlags
   if linkOut.exitCode != 0 && useStandaloneStatic && !cliArgs.contains "--standalone" then
-    linkOut ← IO.Process.output {
-      cmd  := clangCmd
-      args := #[optLevel, "-DNDEBUG", "-march=native", "-Wno-override-module", s!"-I{incDir}", s!"-I{runtimeDir}"] ++
-        extraIncArgs ++ linkInputs ++ #[s!"-L{libDir}", "-lleanshared", s!"-Wl,-rpath,{libDir}", "-lm", "-lpthread", "-ldl", "-o", outBin]
-    }
+    linkOut ← linkWith #[s!"-L{libDir}", "-lleanshared", s!"-Wl,-rpath,{libDir}", "-lm", "-lpthread", "-ldl"]
   if linkOut.exitCode != 0 then
     throw <| IO.userError s!"clang native link failed:\n{linkOut.stderr}"
 

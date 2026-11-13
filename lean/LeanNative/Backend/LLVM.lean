@@ -1991,8 +1991,14 @@ def emitRuntimeAndCAbiHelpers (optimized : Bool) (target : TargetArch := .x86_64
       "  %ot = getelementptr inbounds i8, ptr %o, i64 6\n  %n8 = trunc i32 %nobjs to i8\n  store i8 %n8, ptr %ot, align 1\n" ++
       "  %tg = getelementptr inbounds i8, ptr %o, i64 7\n  %t8 = trunc i32 %tag to i8\n  store i8 %t8, ptr %tg, align 1\n" ++
       "  ret ptr %o\n}",
-    s!"define weak_odr dso_local ptr @lean_native_box_u64(i64 %val) {attr} \{\nentry:\n  %sh = shl i64 %val, 1\n  %tagged = or i64 %sh, 1\n  %p = inttoptr i64 %tagged to ptr\n  ret ptr %p\n}",
-    s!"define weak_odr dso_local i64 @lean_native_unbox_u64(ptr %boxed) {attr} \{\nentry:\n  %i = ptrtoint ptr %boxed to i64\n  %v = lshr i64 %i, 1\n  ret i64 %v\n}",
+    String.intercalate "\n\n" (([("u64", "i64"), ("usize", sigLLVMType target .usize), ("u32", "i32")]).flatMap fun (suffix, ty) =>
+      [("box", ty, "ptr"), ("unbox", "ptr", ty)].map fun (op, argTy, retTy) =>
+        let impl := s!"lean_native_runtime_{op}_{suffix}"
+        s!"declare extern_weak {retTy} @{impl}({argTy})\n" ++
+        s!"define weak_odr dso_local {retTy} @lean_native_{op}_{suffix}({argTy} %v) {attr} \{\nentry:\n" ++
+        s!"  %available = icmp ne ptr @{impl}, null\n  br i1 %available, label %ready, label %missing\n" ++
+        "missing:\n  call void @llvm.trap()\n  unreachable\nready:\n" ++
+        s!"  %r = call {retTy} @{impl}({argTy} %v)\n  ret {retTy} %r\n}"),
     mkEnsureExclFn "lean_native_ensure_exclusive" true 3,
     mkEnsureExclFn "lean_native_ensure_exclusive_uninit" false 3,
     mkEnsureExclFn "lean_native_ensure_exclusive_e1" true 0,
@@ -2366,6 +2372,18 @@ def isExternDecl (d : LNIRDecl) : Bool :=
   | .letBind dst _ (.call fn _ _ true) (.ret retVar) => dst == retVar && fn == d.name
   | _ => false
 
+def leanRuntimeC : String :=
+  "#include <lean/lean.h>\n" ++
+  "lean_object *lean_native_runtime_box_u64(uint64_t v) { return lean_box_uint64(v); }\n" ++
+  "uint64_t lean_native_runtime_unbox_u64(lean_object *v) { return lean_unbox_uint64(v); }\n" ++
+  "lean_object *lean_native_runtime_box_usize(size_t v) { return lean_box_usize(v); }\n" ++
+  "size_t lean_native_runtime_unbox_usize(lean_object *v) { return lean_unbox_usize(v); }\n" ++
+  "lean_object *lean_native_runtime_box_u32(uint32_t v) { return lean_box_uint32(v); }\n" ++
+  "uint32_t lean_native_runtime_unbox_u32(lean_object *v) { return lean_unbox_uint32(v); }\n"
+
+def runtimeBoxSuffix? : LNIRType → Option String
+  | .i64 => some "u64" | .usize => some "usize" | .i32 => some "u32" | _ => none
+
 def emitLLVMABIWrapperDecl (d : LNIRDecl) (target : TargetArch := .x86_64) : String :=
   if isExternDecl d || !(d.params.all (fun p => isABIThunkableType p.ty)) || !(isABIThunkableType d.retTy) then ""
   else
@@ -2375,26 +2393,31 @@ def emitLLVMABIWrapperDecl (d : LNIRDecl) (target : TargetArch := .x86_64) : Str
     let (unboxLines, callArgs) := indexedParams.foldl (fun (lines, args) (idx, p) =>
       if p.ty == .unit then
         (lines, args ++ ["ptr null"])
+      else if let some suffix := runtimeBoxSuffix? p.ty then
+        let pTy := sigLLVMType target p.ty
+        (lines ++ [s!"  %unboxed_{idx} = call {pTy} @lean_native_unbox_{suffix}(ptr %abi_arg{idx})"],
+          args ++ [s!"{pTy} {sigLLVMAttr target p.ty}%unboxed_{idx}"])
       else if isABIScalarIntType p.ty then
         let pTy := sigLLVMType target p.ty
         let pAttr := sigLLVMAttr target p.ty
         let baseLines := [s!"  %raw_{idx} = ptrtoint ptr %abi_arg{idx} to i64", s!"  %unboxed_{idx} = lshr i64 %raw_{idx}, 1"]
-        if pTy == "i64" then
-          (lines ++ baseLines, args ++ [s!"i64 %unboxed_{idx}"])
-        else
-          (lines ++ baseLines ++ [s!"  %arg_tr_{idx} = trunc i64 %unboxed_{idx} to {pTy}"], args ++ [s!"{pTy} {pAttr}%arg_tr_{idx}"])
+        (lines ++ baseLines ++ [s!"  %arg_tr_{idx} = trunc i64 %unboxed_{idx} to {pTy}"],
+          args ++ [s!"{pTy} {pAttr}%arg_tr_{idx}"])
       else (lines, args ++ [s!"ptr %abi_arg{idx}"])
     ) ([], [])
     let callArgsStr := String.intercalate ", " callArgs
     let callAndRetLines :=
       if d.retTy == .unit then
         [s!"  call void @{fnSym}({callArgsStr})", "  %boxptr = inttoptr i64 1 to ptr\n  ret ptr %boxptr"]
+      else if let some suffix := runtimeBoxSuffix? d.retTy then
+        let rTy := sigLLVMType target d.retTy
+        [s!"  %ret_raw = call {sigLLVMAttr target d.retTy}{rTy} @{fnSym}({callArgsStr})",
+          s!"  %boxptr = call ptr @lean_native_box_{suffix}({rTy} %ret_raw)", "  ret ptr %boxptr"]
       else if isABIScalarIntType d.retTy then
         let rTy := sigLLVMType target d.retTy
         let rAttr := sigLLVMAttr target d.retTy
-        let callLines :=
-          if rTy == "i64" then [s!"  %ret64 = call i64 @{fnSym}({callArgsStr})"]
-          else [s!"  %ret_raw = call {rAttr}{rTy} @{fnSym}({callArgsStr})", s!"  %ret64 = zext {rTy} %ret_raw to i64"]
+        let callLines := [s!"  %ret_raw = call {rAttr}{rTy} @{fnSym}({callArgsStr})",
+          s!"  %ret64 = zext {rTy} %ret_raw to i64"]
         callLines ++ ["  %shl = shl i64 %ret64, 1\n  %tagged = or i64 %shl, 1\n  %boxptr = inttoptr i64 %tagged to ptr\n  ret ptr %boxptr"]
       else [ s!"  %ret = call ptr @{fnSym}({callArgsStr})\n  ret ptr %ret" ]
     String.intercalate "\n" ([
