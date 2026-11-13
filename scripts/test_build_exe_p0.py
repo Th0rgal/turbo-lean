@@ -126,7 +126,15 @@ class BuildExeP0(unittest.TestCase):
                 sysroot = Path(os.environ["LEAN_SYSROOT"])
                 run(["/usr/bin/clang", "-O2", "-DLEAN_EXPORTING", "-I", sysroot / "include",
                      "-c", original.with_name("Imported.c"), "-o", original])
-            original.replace(fallback)
+            # Native-cache pipelines can already contain a boxed ABI adapter.
+            # Retain its strong cached definition; only the private link copy
+            # may weaken it in favor of the newly emitted optimized owner.
+            adapter_c = project / "cached-adapter.c"
+            adapter_c.write_text('void *lean_native_abi_p0_imported_add(void *a, void *b) { return a; }\n')
+            adapter_o = project / "cached-adapter.o"
+            run(["clang", "-c", adapter_c, "-o", adapter_o])
+            run(["ld", "-r", original, adapter_o, "-o", fallback])
+            original.unlink()
             before = hashlib.sha256(fallback.read_bytes()).hexdigest()
             exe = project / "runner"
             run([ROOT / "lean/.lake/build/bin/lean-native", "build-exe", "--input",
@@ -138,12 +146,14 @@ class BuildExeP0(unittest.TestCase):
             self.assertEqual(len(re.findall(r"^\w+ T p0_imported_add$", symbols, re.M)), 1)
             private = run(["nm", "--defined-only", str(exe) + ".import-0.o"])
             self.assertRegex(private, r"(?m)^\w+ W p0_imported_add$")
+            self.assertRegex(private, r"(?m)^\w+ W lean_native_abi_p0_imported_add$")
+            self.assertEqual(len(re.findall(r"^\w+ T lean_native_abi_p0_imported_add$", symbols, re.M)), 1)
             disasm = run(["objdump", "-d", "--disassemble=p0_imported_add", exe])
             (project / "p0_imported_add.asm").write_text(disasm)
             self.assertNotRegex(disasm, r"\bcall\w*\s")
             (project / "result.json").write_text(json.dumps(dict(
                 imported_discovery=True, native_c_fallback=True, cache_sha256=before,
-                unique_strong_owner=True)))
+                unique_strong_owner=True, cached_abi_adapter=True)))
 
     def test_standalone_io_native_kernels_and_boxing(self):
         with tempfile.TemporaryDirectory(prefix="build-exe-p0-") as tmp:

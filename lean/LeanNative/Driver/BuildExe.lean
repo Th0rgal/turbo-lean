@@ -231,11 +231,14 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
 
   let isDarwin := (System.Platform.target.splitOn "darwin").length > 1 || (System.Platform.target.splitOn "apple").length > 1
   -- Imported objects also own the original C definitions. Make only symbols
-  -- actually replaced by this native module weak in private object copies.
+  -- actually replaced by this native module, including its emitted boxed ABI
+  -- adapter, weak in private object copies.
   -- Relocations continue to target the strong optimized definition; unrelated
   -- host code and the shared incremental cache retain their original binding.
-  let replacements := optMod.decls.map fun d =>
-    s!"--weaken-symbol={LeanNative.Backend.LLVM.sanitizeSymbol d.name}"
+  let replacements := optMod.decls.flatMap fun d =>
+    let kernel := LeanNative.Backend.LLVM.sanitizeSymbol d.name
+    let adapters := (LeanNative.Backend.LLVM.abiWrapperSymbol? d).toList
+    (kernel :: adapters).map fun symbol => s!"--weaken-symbol={symbol}"
   let mut linkedImports : Array String := #[]
   for i in [:importObjects.size] do
     let source := importObjects[i]!

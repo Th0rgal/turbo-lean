@@ -2721,9 +2721,16 @@ def leanRuntimeC : String :=
 def runtimeBoxSuffix? : LNIRType → Option String
   | .i64 => some "u64" | .usize => some "usize" | .i32 => some "u32" | _ => none
 
+/-- The adapter owned by an optimized definition, when one is emitted. Shared
+    by emission and private imported-object symbol preparation. -/
+def abiWrapperSymbol? (d : LNIRDecl) : Option String :=
+  if isExternDecl d || !(d.params.all (fun p => isABIThunkableType p.ty)) || !(isABIThunkableType d.retTy) then none
+  else some ("lean_native_abi_" ++ sanitizeSymbol d.name)
+
 def emitLLVMABIWrapperDecl (d : LNIRDecl) (target : TargetArch := .x86_64) : String :=
-  if isExternDecl d || !(d.params.all (fun p => isABIThunkableType p.ty)) || !(isABIThunkableType d.retTy) then ""
-  else
+  match abiWrapperSymbol? d with
+  | none => ""
+  | some abiSym =>
     let fnSym := sanitizeSymbol d.name
     let indexedParams := (List.range d.params.length).zip d.params
     let abiParamSig := String.intercalate ", " (indexedParams.map fun (idx, _) => s!"ptr %abi_arg{idx}")
@@ -2759,7 +2766,7 @@ def emitLLVMABIWrapperDecl (d : LNIRDecl) (target : TargetArch := .x86_64) : Str
       else [ s!"  %ret = call ptr @{fnSym}({callArgsStr})\n  ret ptr %ret" ]
     String.intercalate "\n" ([
       s!"; Lean 4 C-ABI Wrapper Thunk for {d.name}",
-      s!"define dso_local ptr @lean_native_abi_{fnSym}({abiParamSig}) #0 \{\nentry:"
+      s!"define dso_local ptr @{abiSym}({abiParamSig}) #0 \{\nentry:"
     ] ++ unboxLines ++ callAndRetLines ++ ["}"])
 
 def localScalarSigsOfModule (m : LNIRModule) : List (String × List LNIRType × LNIRType) :=
