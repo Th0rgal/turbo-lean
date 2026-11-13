@@ -129,9 +129,21 @@ def concurrency(args, cache):
             file.write_text("import Batteries.Data.List.Lemmas\n"
                             f"theorem agent_work : {i} = {i} := by rfl\n")
             files.append(file)
+        # Materialize the exact shared import closure before launching clients.
+        # Lake publication during the measured window would benchmark a build
+        # race rather than eight checks against one stable environment.
+        prepared = subprocess.run(
+            ["lake", "build", "+Batteries.Data.List.Lemmas"], cwd=project,
+            capture_output=True, text=True, timeout=args.timeout + 30, check=False)
+        if prepared.returncode:
+            raise RuntimeError("concurrency import preparation failed: " + prepared.stderr)
         workload = uuid.uuid4().hex
         warmup = check(args.binary, project, files[0], cache, args.timeout,
                        "agent_work", workload)
+        evidence = cache / "fork-evidence.log"
+        # Warmup is not evidence that any of the eight measured checks forked.
+        if evidence.is_file():
+            evidence.write_text("")
         for i, file in enumerate(files):
             file.write_text("import Batteries.Data.List.Lemmas\n"
                             f"theorem agent_work : {i + 100} = {i + 100} := by rfl\n")
@@ -147,7 +159,6 @@ def concurrency(args, cache):
         finally:
             stop.set()
             sampler.join()
-        evidence = cache / "fork-evidence.log"
         fork_requests = evidence.read_text().splitlines() if evidence.is_file() else []
     walls = sorted(result["external_wall_ms"] for result in results)
     return {"work_units": len(results),
