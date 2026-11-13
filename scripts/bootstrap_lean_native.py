@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Build a toolchain-matched lean-native without invoking a prebuilt lean-native.
+
+Requires the manifest-pinned lean-sys checkout at lean/.lake/packages/lean-sys.
+Uses turbo-lean for Lean artifacts, then sequential C compilation and shared
+Lean runtime linking (turbo-lean build currently does not link executables).
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import time
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--repo', type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument('--evidence', type=Path, required=True)
+    parser.add_argument('--skip-lean-build', action='store_true')
+    args = parser.parse_args()
+    repo = args.repo.resolve()
+    project = repo / 'lean'
+    evidence = args.evidence.resolve()
+    evidence.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ, 'LEAN_NUM_THREADS': '1', 'TURBO_LEAN_JOBS': '1'}
+    records = []
+
+    def run(command, cwd=project):
+        start = time.monotonic()
+        p = subprocess.run(list(map(str, command)), cwd=cwd, env=env,
+                           text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        records.append(dict(command=list(map(str, command)), cwd=str(cwd),
+                            returncode=p.returncode, seconds=time.monotonic() - start,
+                            output=p.stdout))
+        (evidence / 'commands.json').write_text(json.dumps(records, indent=2) + '\n')
+        if p.returncode:
+            raise RuntimeError(p.stdout or f'command failed: {command}')
+        return p.stdout.strip()
+
+    sysroot = Path(run(['lean', '--print-prefix']))
+    version = run([sysroot / 'bin/lean', '--version'])
+    required = (project / 'lean-toolchain').read_text().strip().split(':v')[-1]
+    if f'version {required},' not in version:
+        raise RuntimeError(f'toolchain mismatch: require {required}, got {version}')
+    if not args.skip_lean_build:
+        run(['turbo-lean', 'build', 'lean-native', '--max-memory-mb', '6144'])
+    dep = (project / '.lake/packages/lean-sys').resolve()
+    sources = sorted((project / '.lake/build/ir').rglob('*.c'))
+    sources += sorted((dep / '.lake/build/ir').rglob('*.c'))
+    main_c = project / '.lake/build/ir/LeanNative/Driver/Main.c'
+    if main_c not in sources:
+        raise RuntimeError(f'missing compiler entrypoint: {main_c}')
+    sources.append(dep / 'c/lean_sys_shim.c')
+    objdir = evidence / 'objects'
+    objdir.mkdir(exist_ok=True)
+    objects = []
+    for i, source in enumerate(sources):
+        obj = objdir / f'{i:04d}.o'
+        # The bootstrap has no native CPU requirement and exports interpreter symbols.
+        run(['/usr/bin/clang', '-O2', '-DNDEBUG', '-DLEAN_EXPORTING', '-fPIC',
+             '-I', sysroot / 'include', '-c', source, '-o', obj])
+        objects.append(obj)
+        print(f'C {i + 1}/{len(sources)} {source.name}', flush=True)
+    binary = project / '.lake/build/bin/lean-native'
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    pending = binary.with_suffix('.pending')
+    run(['/usr/bin/clang', '-rdynamic', *objects, '-L', sysroot / 'lib/lean',
+         '-Wl,-rpath,' + str(sysroot / 'lib/lean'), '-lleanshared', '-lpthread', '-ldl',
+         '-lm', '-o', pending])
+    pending.replace(binary)
+    run([binary, '--help'])
+    manifest = dict(source=run(['git', 'rev-parse', 'HEAD'], repo),
+                    lean_sys_source=run(['git', 'rev-parse', 'HEAD'], dep),
+                    lean_version=version, sysroot=str(sysroot), binary=str(binary),
+                    sha256=hashlib.sha256(binary.read_bytes()).hexdigest(),
+                    bytes=binary.stat().st_size, native_sources=len(sources),
+                    linking='dynamic libleanshared; matching Lean toolchain required')
+    (evidence / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    print(json.dumps(manifest, indent=2))
+
+
+if __name__ == '__main__':
+    main()
