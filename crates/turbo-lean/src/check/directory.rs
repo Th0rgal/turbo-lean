@@ -57,6 +57,7 @@ pub(super) fn check_directory(
     }
     import_res?;
     drop(kernel_timer);
+    let hygiene_timer = super::PhaseTimer::start("hygiene");
     let mut dir_hasher = blake3::Hasher::new();
     dir_hasher.update(b"dir-check-v2\n");
     dir_hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
@@ -134,6 +135,7 @@ pub(super) fn check_directory(
         anyhow::bail!("Soundness hygiene violation in {}", dirty.join("; "));
     }
 
+    drop(hygiene_timer);
     let mut dir_used_sorry = false;
     let mut dir_sorry_decls: Vec<String> = Vec::new();
     let mut dir_sorry_hits = 0usize;
@@ -197,6 +199,7 @@ pub(super) fn check_directory(
         }
     }
 
+    let cache_timer = super::PhaseTimer::start("cache");
     let cached_map = store.batch_get_theorem_shards(&all_shard_keys, "trusted")?;
 
     let mut total_hits = 0usize;
@@ -223,6 +226,7 @@ pub(super) fn check_directory(
         }
     }
 
+    drop(cache_timer);
     let deferred_verified_files = deferred_kernel_gate_files.len();
     if !deferred_kernel_gate_files.is_empty() {
         let (def_env_vars, _) = resolve_lake_env(store, canon_dir)?;

@@ -301,6 +301,7 @@ pub fn try_stateless_remote_check(
         return Ok(false);
     };
     let shard_refs: Vec<&splitter::TheoremShard> = split.shards.iter().collect();
+    let identity_timer = super::PhaseTimer::start("identity");
     let attested = confirm_file_decl_identities_with_budget(
         &active_src,
         &shard_refs,
@@ -309,6 +310,7 @@ pub fn try_stateless_remote_check(
         false,
         Some(t0),
     )?;
+    drop(identity_timer);
     let expected_type_pairs: Vec<(String, String)> = split
         .shards
         .iter()
@@ -468,6 +470,7 @@ fn try_stateless_remote_single_decl_check(
         return Ok(false);
     }
     let target_decl = shard.decl_name();
+    let identity_timer = super::PhaseTimer::start("identity");
     let attested = confirm_decl_identity_with_budget(
         &active_src,
         shard,
@@ -476,6 +479,7 @@ fn try_stateless_remote_single_decl_check(
         false,
         Some(t0),
     )?;
+    drop(identity_timer);
     let expected_type_pair = [(
         attested.decl_name.clone(),
         attested.kernel_type_hash.clone(),
