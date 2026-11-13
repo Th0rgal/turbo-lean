@@ -276,7 +276,7 @@ class BuildExeP0(unittest.TestCase):
                  unsupported, "-o", rejected, "--standalone"], expect=1)
             self.assertIn("non-scalar", records[-1]["stderr"])
             self.assertFalse(rejected.exists())
-            (out / "result.json").write_text(json.dumps(dict(k=len(kv), e=len(ev),
+            (out / "result.json").write_text(json.dumps(dict(k=len(kv), masked_k=len(kv), e=len(ev),
                 uint64=[0, 1 << 63, MASK], standalone=True, native_clmul=True,
                 borrowed_bounds_cases=bounds_cases, slice_alias_cases=9)))
 
