@@ -135,6 +135,7 @@ pub(super) fn insert_check_timings(out: &mut serde_json::Value, t0: Instant) {
     out["wall_ms"] = wall.into();
     out["phases"] = serde_json::to_value(phases).expect("phase serialization");
     let summary = out["compact_summary"].as_str().unwrap_or("OK");
+    let summary = summary.split(" wall_ms=").next().unwrap_or(summary);
     out["compact_summary"] = format!("{summary} wall_ms={wall}").into();
 }
 
@@ -201,7 +202,7 @@ mod wallclock_tests {
             .and_then(Path::parent)
             .unwrap()
             .join("turbo-lean");
-        let output = Command::new(binary)
+        let output = Command::new(&binary)
             .args(["check", "--json", "--decl", "wall_test", "--project-dir"])
             .arg(&dir)
             .arg(&file)
@@ -216,6 +217,29 @@ mod wallclock_tests {
         let cli: serde_json::Value = serde_json::from_slice(&output.stdout)?;
         assert!(cli["wall_ms"].as_i64().unwrap() >= cli["elapsed_ms"].as_i64().unwrap());
         assert!(cli["phases"].is_object());
+        assert_eq!(
+            cli["compact_summary"]
+                .as_str()
+                .unwrap()
+                .matches("wall_ms=")
+                .count(),
+            1
+        );
+        let human = Command::new(&binary)
+            .args(["check", "--decl", "wall_test", "--project-dir"])
+            .arg(&dir)
+            .arg(&file)
+            .arg("--cache-dir")
+            .arg(dir.join("cli-cache"))
+            .output()?;
+        anyhow::ensure!(
+            human.status.success(),
+            "{}",
+            String::from_utf8_lossy(&human.stderr)
+        );
+        let human = String::from_utf8(human.stdout)?;
+        assert!(human.contains("wall_ms="), "{human}");
+        assert!(human.contains("phases="), "{human}");
         run_check_command_with_options(
             &mut store,
             true,
@@ -620,6 +644,52 @@ fn file_suffix_after_prefix_is_comment_only(canon_file: &Path, prefix_len: usize
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_check_command_inner(
+    store: &mut TurboStore,
+    db_warm_on_open: bool,
+    json_output: bool,
+    emit_stdout: bool,
+    emit_olean: bool,
+    file: PathBuf,
+    decl: Option<String>,
+    project_dir: PathBuf,
+    jobs: Option<usize>,
+    parallel_shards: bool,
+    remote_http: Option<String>,
+    allow_sorry: bool,
+) -> Result<serde_json::Value> {
+    let started = Instant::now();
+    let mut result = run_check_command_impl(
+        store,
+        db_warm_on_open,
+        json_output,
+        emit_stdout && !json_output,
+        emit_olean,
+        file,
+        decl,
+        project_dir,
+        jobs,
+        parallel_shards,
+        remote_http,
+        allow_sorry,
+    )?;
+    // Finalize at the command boundary, including every early-return path and
+    // optional artifact emission, before serializing the one JSON response.
+    insert_check_timings(&mut result, started);
+    if emit_stdout {
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        } else {
+            println!(
+                "[turbo-lean] wall_ms={} phases={}",
+                result["wall_ms"], result["phases"]
+            );
+        }
+    }
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_check_command_impl(
     store: &mut TurboStore,
     db_warm_on_open: bool,
     json_output: bool,
