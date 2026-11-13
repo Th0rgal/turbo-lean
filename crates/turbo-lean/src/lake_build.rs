@@ -2932,11 +2932,9 @@ fn verify_project_module_entry_and_sidecars(
         crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, &mod_name)
             .map(|spec| (cfg, spec))
     }) {
-        Some((cfg, spec)) => {
-            crate::module_builder::spec_source_has_disallowed_elab_host_effects(
-                cfg, &spec, &src_raw,
-            )
-        }
+        Some((cfg, spec)) => crate::module_builder::spec_source_has_disallowed_elab_host_effects(
+            cfg, &spec, &src_raw,
+        ),
         None => crate::splitter::source_may_execute_elab_host_effects(&src_raw, false),
     };
     if has_disallowed_effects {
@@ -4602,6 +4600,25 @@ fn ensure_project_imports_fresh_inner(
                 closure_cache.allow_stale_manifest_hydration = prev_allow;
                 stale
             });
+        let src_elab_host_effects_stale = src_elab_host_effects_stale
+            && (fs::read_to_string(&info.dep_src)
+                .map(|s| {
+                    root_spec_opt.as_ref().is_none_or(|(cfg, spec)| {
+                        crate::module_builder::source_ineligible_for_stamp_reuse(
+                            cfg,
+                            &spec.pkg_root,
+                            &spec.module_name,
+                            &spec.src_path,
+                            &s,
+                        )
+                    })
+                })
+                .unwrap_or(true)
+                || opt_out
+                || unusable_manifest
+                || identity_stale
+                || manifest_stale
+                || !has_manifest_entry);
         let cryptographically_verified = !opt_out
             && olean_meta.is_some()
             && !src_elab_host_effects_stale
@@ -4650,7 +4667,13 @@ fn ensure_project_imports_fresh_inner(
                 }
                 _ => false,
             };
-        if src_elab_host_effects_stale
+        let refreshed_sidecars_stale = verify_only
+            && info.is_lake_target
+            && root_cfg.as_ref().is_none_or(|cfg| {
+                !crate::module_builder::root_module_lake_sidecars_current(cfg, &info.mod_name)
+            });
+        if refreshed_sidecars_stale
+            || src_elab_host_effects_stale
             || pkg_inputs_stale
             || manifest_stale
             || lake_root_stale
@@ -4806,6 +4829,7 @@ fn ensure_project_imports_fresh_inner(
         // Lake owns `.lake/build` for target-owned modules (whose files may be hard links into its
         // artifact cache): let Lake bring stale target imports up to date, and purge any stale
         // standalone non-target `.olean`s left in `.lake/build/lib/lean`.
+        let mut locally_rebuilt = None;
         if !lake_targets.is_empty() {
             let bypass_lake_cache = if let Some(ref cfg) = root_cfg {
                 crate::module_builder::purge_elab_host_effect_artifacts_in_closure(
@@ -4828,12 +4852,18 @@ fn ensure_project_imports_fresh_inner(
                 }
                 purged
             };
+            let rebuild_dag = root_cfg
+                .as_ref()
+                .filter(|_| bypass_lake_cache)
+                .map(|cfg| crate::module_builder::build_module_dag(cfg, &lake_targets))
+                .transpose()?;
             lake_build_modules_opts(
                 canon_dir,
                 &lake_refresh_targets(canon_dir, &lake_targets),
                 rev,
                 bypass_lake_cache,
             )?;
+            locally_rebuilt = rebuild_dag;
         }
         for mod_name in &non_target_stale {
             let imp_slash = crate::module_builder::module_name_to_rel_slash(mod_name);
@@ -4865,6 +4895,9 @@ fn ensure_project_imports_fresh_inner(
             }
         }
         ensure_project_imports_fresh_inner(canon_dir, target_files, rev, build_missing, true)?;
+        if let (Some(cfg), Some(dag)) = (root_cfg.as_ref(), locally_rebuilt.as_ref()) {
+            crate::module_builder::record_locally_rebuilt_sources(cfg, dag, &lake_targets)?;
+        }
         return Ok(targets.len());
     }
     if !stale_dep_mods.is_empty() {
@@ -5041,7 +5074,13 @@ pub(crate) fn nonlocal_edits(files: &[PathBuf], rev: &str) -> Vec<String> {
                 .map(|mut git| {
                     git.arg("-C")
                         .arg(parent)
-                        .args(["rev-parse", "--is-inside-work-tree"])
+                        .args([
+                            "rev-parse",
+                            "--verify",
+                            "-q",
+                            "--end-of-options",
+                            &format!("{}^0", rev),
+                        ])
                         .output()
                         .is_ok_and(|o| o.status.success())
                 })
@@ -6021,6 +6060,17 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
     target: &Path,
     allow_sorry: bool,
 ) -> Result<()> {
+    recheck_dependents_if_nonlocal_for_check(store, canon_dir, target, allow_sorry, false, false)
+}
+
+pub(crate) fn recheck_dependents_if_nonlocal_for_check(
+    store: &TurboStore,
+    canon_dir: &Path,
+    target: &Path,
+    allow_sorry: bool,
+    decl_mode: bool,
+    decl_with_sorry_siblings: bool,
+) -> Result<()> {
     let lake_root = target.canonicalize().ok().and_then(|f| {
         f.ancestors()
             .find(|a| has_lake_config(a) || a.join("lake-manifest.json").is_file())
@@ -6041,16 +6091,60 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
     let files = collect_project_lean_files(&dir, false, Some(&file));
     let edits = nonlocal_edits(&files, "HEAD");
     if !edits.is_empty() {
+        if decl_mode && has_lake_config(&dir) {
+            if let Ok(closure) = compute_project_dependent_closure(&dir, &edits, false) {
+                let canon_target = file.canonicalize().unwrap_or_else(|_| file.clone());
+                let has_strict_reverse_dependent = match closure.dag_files.as_ref() {
+                    Some(df) => {
+                        df.iter()
+                            .any(|p| p.canonicalize().unwrap_or_else(|_| p.clone()) != canon_target)
+                            || closure.standalone_modules.iter().any(|s| {
+                                s.src_path
+                                    .canonicalize()
+                                    .unwrap_or_else(|_| s.src_path.clone())
+                                    != canon_target
+                            })
+                    }
+                    None => true,
+                };
+                if !has_strict_reverse_dependent {
+                    if decl_with_sorry_siblings || allow_sorry {
+                        let mut fail_seeds = vec![file.clone()];
+                        for e in &edits {
+                            fail_seeds.push(dir.join(e));
+                        }
+                        purge_sorry_artifacts_after_allow_sorry_failure(&dir, &fail_seeds);
+                    }
+                    return Ok(());
+                }
+            }
+        }
         eprintln!(
             "[turbo-lean] non-local edit in {}: re-checking dependents with Lake",
             edits.join(", ")
         );
-        let (n, rechecked_files, rechecked_mods, _overlay) = if allow_sorry {
-            lake_recheck_dependents_with_store_and_options(None, &dir, &edits, None, false, true)?
+        let recheck_allow_sorry = allow_sorry || decl_with_sorry_siblings;
+        let recheck_res = if recheck_allow_sorry {
+            lake_recheck_dependents_with_store_and_options(
+                None,
+                &dir,
+                &edits,
+                None,
+                !allow_sorry && decl_with_sorry_siblings,
+                true,
+            )
         } else {
-            lake_recheck_dependents_with_store(Some(store), &dir, &edits, None, false)?
+            lake_recheck_dependents_with_store(Some(store), &dir, &edits, None, false)
         };
-        if allow_sorry {
+        if recheck_res.is_err() && recheck_allow_sorry {
+            let mut fail_seeds = vec![file.clone()];
+            for e in &edits {
+                fail_seeds.push(dir.join(e));
+            }
+            purge_sorry_artifacts_after_allow_sorry_failure(&dir, &fail_seeds);
+        }
+        let (n, rechecked_files, rechecked_mods, _overlay) = recheck_res?;
+        if recheck_allow_sorry {
             // Replay only clean modules; purge Lake `.olean` / `.ir` / `.c` artifacts and manifest
             // entries for any module whose source contains `sorry` (or transitively imports a
             // sorry-bearing module across the full DAG + standalone graph, including non-root `srcDir`).
@@ -6059,8 +6153,97 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
             for e in &edits {
                 seed_files.push(dir.join(e));
             }
+            let dependent_audit = (|| -> Result<()> {
+                if allow_sorry || !decl_with_sorry_siblings {
+                    return Ok(());
+                }
+                let cfg = crate::module_builder::resolve_project_config(&dir)?;
+                let canon_target = file.canonicalize().unwrap_or_else(|_| file.clone());
+                let assurance = crate::module_builder::discover_trusted_assurance_surface(
+                    &dir,
+                    &cfg.root_pkg,
+                    &splitter::allowed_axioms(),
+                );
+                let modules: Vec<_> = rechecked_files
+                    .iter()
+                    .zip(&rechecked_mods)
+                    .filter(|(path, module)| {
+                        let canon = path.canonicalize().unwrap_or_else(|_| (*path).clone());
+                        canon != canon_target
+                            && !assurance.canon_paths.contains(&canon)
+                            && !assurance.mod_names.contains(*module)
+                    })
+                    .map(|(_, module)| module.clone())
+                    .collect();
+                if modules.is_empty() {
+                    return Ok(());
+                }
+                let (mut lean_path, _) = crate::module_builder::build_lean_search_path(&cfg, false);
+                let extra: Vec<_> = _overlay
+                    .iter()
+                    .map(|overlay| overlay.olean_dir.clone())
+                    .collect();
+                if let Some(path) = extra.first() {
+                    lean_path = format!("{}:{lean_path}", path.display());
+                }
+                crate::zygote::audit_compiled_modules_with_zygote(
+                    store, &cfg, &modules, &lean_path, &extra, false,
+                )
+                .context("Dependent modules failed strict soundness audit")
+            })();
             let sorry_mod_set =
                 purge_workspace_sorry_artifacts_and_manifest(&dir, &seed_files, &rechecked_mods);
+            dependent_audit?;
+            if !allow_sorry && decl_with_sorry_siblings {
+                let canon_target = file.canonicalize().unwrap_or_else(|_| file.clone());
+                let assurance = crate::module_builder::optional_package_config(&dir)
+                    .ok()
+                    .flatten()
+                    .map(|pkg| {
+                        let allowed = splitter::allowed_axioms();
+                        crate::module_builder::discover_trusted_assurance_surface(
+                            &dir, &pkg, &allowed,
+                        )
+                    })
+                    .unwrap_or_default();
+                for (rf, rm) in rechecked_files.iter().zip(rechecked_mods.iter()) {
+                    let canon_rf = rf.canonicalize().unwrap_or_else(|_| rf.clone());
+                    if canon_rf == canon_target
+                        || assurance.canon_paths.contains(&canon_rf)
+                        || assurance.mod_names.contains(rm)
+                    {
+                        continue;
+                    }
+                    if let Ok(rf_src) = fs::read_to_string(rf) {
+                        let hyg = splitter::audit_hygiene(&splitter::strip_lean_comments(&rf_src));
+                        if !hyg.is_clean_or_deferred_to_kernel_gate() {
+                            let violations: Vec<_> = hyg
+                                .disallowed_items()
+                                .into_iter()
+                                .filter(|v| {
+                                    !splitter::HygieneReport {
+                                        flagged_items: vec![v.clone()],
+                                        ..Default::default()
+                                    }
+                                    .is_clean_or_deferred_to_kernel_gate()
+                                })
+                                .collect();
+                            anyhow::ensure!(
+                                violations.is_empty(),
+                                "Soundness hygiene violation in dependent {}: {}",
+                                rf.display(),
+                                violations.join(", ")
+                            );
+                        }
+                        anyhow::ensure!(
+                            !hyg.has_sorry,
+                            "Dependent module `{}` ({}) contains `sorry`",
+                            rm,
+                            rf.display()
+                        );
+                    }
+                }
+            }
             let mut clean_files = Vec::new();
             let mut clean_mods = Vec::new();
             for (rf, rm) in rechecked_files.iter().zip(rechecked_mods.iter()) {
@@ -6264,15 +6447,15 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                         .collect();
                     closure_mods = closure.into_iter().collect();
                     for m in &closure_mods {
-                        if let Some(spec) = crate::module_builder::resolve_module_in_package(
-                            &cfg.root_pkg,
-                            true,
-                            m,
-                        )
-                        .or_else(|| match crate::module_builder::resolve_import_site(&cfg, m) {
-                            crate::module_builder::ImportSite::Module(s) => Some(*s),
-                            _ => None,
-                        }) {
+                        if let Some(spec) =
+                            crate::module_builder::resolve_module_in_package(&cfg.root_pkg, true, m)
+                                .or_else(|| {
+                                    match crate::module_builder::resolve_import_site(&cfg, m) {
+                                        crate::module_builder::ImportSite::Module(s) => Some(*s),
+                                        _ => None,
+                                    }
+                                })
+                        {
                             let has_target_needs =
                                 !crate::module_builder::input_bearing_libs_for_module(&cfg, m)
                                     .is_empty()
@@ -6290,44 +6473,48 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                             }
                         }
                     }
-                    let all_fresh_on_disk = !bypass_lake_cache && {
-                        let mut fresh_cache =
-                            crate::module_builder::LakeClosureCache::for_project(&cfg);
-                        fresh_cache.allow_stale_manifest_hydration = true;
-                        let mut all_ok = true;
-                        for m in &closure_mods {
-                            let spec_opt = crate::module_builder::resolve_module_in_package(
-                                &cfg.root_pkg,
-                                true,
-                                m,
-                            )
-                            .or_else(|| match crate::module_builder::resolve_import_site(&cfg, m) {
-                                crate::module_builder::ImportSite::Module(s) => Some(*s),
-                                _ => None,
-                            });
-                            let mod_ok = spec_opt.is_some_and(|spec| {
-                                let mut vis = HashSet::new();
-                                crate::module_builder::lake_closure_export_info(
-                                    &cfg,
-                                    &spec,
-                                    false,
-                                    &mut fresh_cache,
-                                    &mut vis,
+                    let all_fresh_on_disk = !bypass_lake_cache
+                        && {
+                            let mut fresh_cache =
+                                crate::module_builder::LakeClosureCache::for_project(&cfg);
+                            fresh_cache.allow_stale_manifest_hydration = true;
+                            let mut all_ok = true;
+                            for m in &closure_mods {
+                                let spec_opt = crate::module_builder::resolve_module_in_package(
+                                    &cfg.root_pkg,
+                                    true,
+                                    m,
                                 )
-                                .is_some()
-                            });
-                            if !mod_ok {
-                                all_ok = false;
-                                break;
+                                .or_else(|| {
+                                    match crate::module_builder::resolve_import_site(&cfg, m) {
+                                        crate::module_builder::ImportSite::Module(s) => Some(*s),
+                                        _ => None,
+                                    }
+                                });
+                                let mod_ok = spec_opt.is_some_and(|spec| {
+                                    let mut vis = HashSet::new();
+                                    crate::module_builder::lake_closure_export_info(
+                                        &cfg,
+                                        &spec,
+                                        false,
+                                        &mut fresh_cache,
+                                        &mut vis,
+                                    )
+                                    .is_some()
+                                });
+                                if !mod_ok {
+                                    all_ok = false;
+                                    break;
+                                }
                             }
-                        }
-                        if all_ok {
-                            let check_exes: Vec<String> = lake_refresh_targets(&dir, &closure_mods)
-                                .into_iter()
-                                .chain(input_exes.iter().cloned())
-                                .filter(|t| t.ends_with(":exe"))
-                                .collect();
-                            if !check_exes.is_empty()
+                            if all_ok {
+                                let check_exes: Vec<String> =
+                                    lake_refresh_targets(&dir, &closure_mods)
+                                        .into_iter()
+                                        .chain(input_exes.iter().cloned())
+                                        .filter(|t| t.ends_with(":exe"))
+                                        .collect();
+                                if !check_exes.is_empty()
                                 && !crate::module_builder::verify_project_native_and_c_sidecars_up_to_date(
                                     &cfg,
                                     &check_exes,
@@ -6335,9 +6522,9 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                             {
                                 all_ok = false;
                             }
-                        }
-                        all_ok
-                    };
+                            }
+                            all_ok
+                        };
                     if all_fresh_on_disk {
                         ordered_targets.clear();
                     } else {
@@ -6427,7 +6614,7 @@ pub(crate) fn recheck_dependents_if_nonlocal_with_options(
                 }
             }
         }
-    } else if allow_sorry && !worktree_auto_link_disabled(&dir) {
+    } else if (allow_sorry || decl_with_sorry_siblings) && !worktree_auto_link_disabled(&dir) {
         // Even when `nonlocal_edits` is empty (e.g. a sorry-bearing upstream import was
         // already committed at `HEAD` and refreshed by `ensure_project_imports_fresh_for_check`),
         // purge any sorry-tainted workspace `.olean` / `.ir` / `.c` artifacts and manifest entries.
@@ -7693,7 +7880,7 @@ pub(crate) fn lake_recheck_dependents_with_store_and_options(
             (0, all_files, fallback_mods)
         }
     };
-    let (_standalone_files, overlay) = check_and_audit_standalone_modules(
+    let (standalone_files, overlay) = check_and_audit_standalone_modules(
         store_opt,
         canon_dir,
         &effective_standalone,
@@ -7703,6 +7890,16 @@ pub(crate) fn lake_recheck_dependents_with_store_and_options(
         retain_standalone_oleans,
         allow_sorry,
     )?;
+    let mut files = files;
+    let mut mods = mods;
+    if retain_standalone_oleans {
+        files.extend(standalone_files);
+        mods.extend(
+            effective_standalone
+                .iter()
+                .map(|spec| spec.module_name.clone()),
+        );
+    }
     let standalone_count = effective_standalone.len();
     Ok((dag_count + standalone_count, files, mods, overlay))
 }
@@ -10409,6 +10606,148 @@ mod tests {
         assert!(olean("A").is_file() && olean("B").is_file());
         assert!(lake(&["build", "--no-build", "P.A"])?.status.success());
         let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn test_verified_import_stamps_refreshed_target_sidecars() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = crate::worktree_test_support::LakeTree::new(
+            "refreshed_sidecars",
+            &[
+                ("P/A.lean", "def a : Nat := 1\n"),
+                ("P/B.lean", "import P.A\ntheorem b : a = 1 := rfl\n"),
+            ],
+        )?;
+        let targets = [tree.project.join("P/B.lean")];
+        ensure_project_imports_fresh_inner(&tree.project, &targets, None, true, true)?;
+        for suffix in ["olean.hash", "ilean.hash", "trace"] {
+            let sidecar = tree
+                .project
+                .join(format!(".lake/build/lib/lean/P/A.{suffix}"));
+            let original = fs::read(&sidecar)?;
+            fs::write(&sidecar, "0")?;
+            assert!(
+                ensure_project_imports_fresh_inner(&tree.project, &targets, None, true, true)
+                    .is_err(),
+                "accepted {suffix}"
+            );
+            fs::write(&sidecar, original)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_local_host_reads_remain_ineligible_for_stamp_reuse() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_host_stamp_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(dir.join("P"))?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            dir.join("lakefile.toml"),
+            "name = \"p\"\n[[lean_lib]]\nname = \"P\"\n",
+        )?;
+        fs::write(dir.join("P/A.lean"), "initialize stampEnv : Option String ← IO.getEnv \"TURBO_STAMP_TEST\"\ndef a : Nat := 1\n")?;
+        fs::write(
+            dir.join("P/B.lean"),
+            "import P.A\ntheorem b : a = 1 := rfl\n",
+        )?;
+        assert!(Command::new("lake")
+            .args(["build", "P.B"])
+            .current_dir(&dir)
+            .output()?
+            .status
+            .success());
+        let target = [dir.join("P/B.lean")];
+        assert_eq!(ensure_project_imports_fresh_for_check(&dir, &target)?, 1);
+        let artifact = dir.join(".lake/build/lib/lean/P/A.olean");
+        let before = fs::metadata(&artifact)?.modified()?;
+        assert!(!load_verified_project_manifest(&dir)
+            .is_some_and(|m| m.modules.contains_key("P/A.lean")));
+        for _ in 0..2 {
+            crate::module_builder::reset_lake_inputs_tag_memo();
+            assert_eq!(ensure_project_imports_fresh_for_check(&dir, &target)?, 1);
+            assert!(fs::metadata(&artifact)?.modified()? >= before);
+        }
+        fs::write(dir.join("P/A.lean"), "initialize stampEnv : Option String ← IO.getEnv \"TURBO_STAMP_TEST_CHANGED\"\ndef a : Nat := 1\n")?;
+        assert_eq!(ensure_project_imports_fresh_for_check(&dir, &target)?, 1);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn test_untracked_include_str_remains_ineligible_for_stamp_reuse() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "turbo_include_stamp_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(dir.join("P"))?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            dir.join("lakefile.toml"),
+            "name = \"p\"\n[[lean_lib]]\nname = \"P\"\n",
+        )?;
+        fs::write(dir.join("P/data.txt"), "before")?;
+        fs::write(
+            dir.join("P/A.lean"),
+            "def data : String := include_str \"data.txt\"\n",
+        )?;
+        fs::write(dir.join("P/B.lean"), "import P.A\n")?;
+        let output = Command::new("lake")
+            .args(["build", "P.B"])
+            .current_dir(&dir)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let target = [dir.join("P/B.lean")];
+        assert_eq!(ensure_project_imports_fresh_for_check(&dir, &target)?, 1);
+        let artifact = dir.join(".lake/build/lib/lean/P/A.olean");
+        let before = fs::read(&artifact)?;
+        fs::write(dir.join("P/data.txt"), "after")?;
+        crate::module_builder::reset_lake_inputs_tag_memo();
+        assert_eq!(ensure_project_imports_fresh_for_check(&dir, &target)?, 1);
+        assert_ne!(
+            before,
+            fs::read(&artifact)?,
+            "data-only edit must rebuild the artifact"
+        );
+        assert!(!load_verified_project_manifest(&dir)
+            .is_some_and(|m| m.modules.contains_key("P/A.lean")));
+        let mut cfg = crate::module_builder::resolve_project_config(&dir)?;
+        let pkg = cfg.root_pkg.clone();
+        let spec = crate::module_builder::resolve_module_in_package(&pkg, false, "P.A")
+            .expect("dependency module");
+        cfg.root_pkg.pkg_root = dir.join("consumer");
+        cfg.dep_pkgs.push(pkg);
+        let src = fs::read_to_string(dir.join("P/A.lean"))?;
+        assert!(
+            crate::module_builder::spec_source_has_disallowed_elab_host_effects(&cfg, &spec, &src)
+        );
+        let mut cache = crate::module_builder::LakeClosureCache::for_project(&cfg);
+        assert!(crate::module_builder::lake_closure_export_info(
+            &cfg,
+            &spec,
+            false,
+            &mut cache,
+            &mut HashSet::new(),
+        )
+        .is_none());
+        fs::remove_dir_all(dir)?;
         Ok(())
     }
 
@@ -14233,7 +14572,8 @@ public def api := by
     }
 
     #[test]
-    fn test_ensure_project_imports_fresh_accepts_git_pinned_implemented_by_and_custom_target_dep() -> Result<()> {
+    fn test_ensure_project_imports_fresh_accepts_git_pinned_implemented_by_and_custom_target_dep(
+    ) -> Result<()> {
         let dir = std::env::temp_dir().join(format!(
             "tl_fresh_git_pinned_dep_{}_{}",
             std::process::id(),
@@ -14269,16 +14609,22 @@ public def api := by
         fs::write(bat_dir.join("Batteries.lean"), "import Batteries.Fast\n")?;
 
         fs::write(pw_dir.join(".gitignore"), "/.lake/\n")?;
-        fs::write(pw_dir.join("widget/js/ofRpcMethod.js"), "export default {}\n")?;
+        fs::write(
+            pw_dir.join("widget/js/ofRpcMethod.js"),
+            "export default {}\n",
+        )?;
         fs::write(
             pw_dir.join("lakefile.lean"),
-            "import Lake\nopen Lake DSL System\npackage proofwidgets where\ntarget widgetJsAll pkg : Unit := do\n  return .nil\n@[default_target]\nlean_lib ProofWidgets where\n  needs := #[widgetJsAll]\n",
+            "import Lake\nopen Lake DSL System\npackage proofwidgets where\ndef widgetDir : FilePath := \"widget\"\ninput_dir widgetJsAllTs where\n  path := widgetDir / \"js\"\n  filter := .extension <| .mem #[\"ts\", \"tsx\", \"js\"]\ntarget widgetJsAll pkg : Unit := do\n  return .nil\n@[default_target]\nlean_lib ProofWidgets where\n  needs := #[widgetJsAll, widgetJsAllTs]\n",
         )?;
         fs::write(
             pw_dir.join("ProofWidgets/OfRpc.lean"),
             "def rpcJs : String := include_str \"..\" / \"widget\" / \"js\" / \"ofRpcMethod.js\"\n",
         )?;
-        fs::write(pw_dir.join("ProofWidgets.lean"), "import ProofWidgets.OfRpc\n")?;
+        fs::write(
+            pw_dir.join("ProofWidgets.lean"),
+            "import ProofWidgets.OfRpc\n",
+        )?;
 
         let init_commit = |repo: &Path| -> Result<String> {
             assert!(crate::trusted_tools::git(repo)?
@@ -14369,7 +14715,10 @@ public def api := by
             Some(tc.trim()),
             true,
         )?;
-        assert!(rebuilt >= 1, "first call must Lake-build missing dep imports");
+        assert!(
+            rebuilt >= 1,
+            "first call must Lake-build missing dep imports"
+        );
         // Second call must hit 0 stale imports without re-invoking Lake!
         let rebuilt2 = ensure_project_imports_fresh(
             &canon,

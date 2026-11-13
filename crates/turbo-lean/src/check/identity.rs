@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,7 +17,7 @@ pub(crate) struct ConfirmedDeclIdentity {
     pub(crate) kernel_type_hash: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct OleanDeclEntry {
     pub(super) decl_name: String,
     pub(super) kernel_type_hash: String,
@@ -89,6 +89,16 @@ fn compile_and_read_probe_identities(
     max_line: usize,
     probe_started: Instant,
 ) -> Result<Vec<OleanDeclEntry>> {
+    let cache_path = (!is_untrusted && extra_ro_olean_dirs.is_empty())
+        .then(|| identity_cache_path(probe, project_dir, lean_args, env?, min_line, max_line))
+        .flatten();
+    if let Some(entries) = cache_path.as_ref().and_then(|path| {
+        read_verified_isolated_artifact(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Vec<OleanDeclEntry>>(&bytes).ok())
+    }) {
+        return Ok(entries);
+    }
     // Three disjoint private (0700, exclusively created) scratch directories separate
     // read-only probe input (`src_scratch`), compiler output (`out_scratch`), and the
     // trusted reader's frozen `.olean` copy (`reader_scratch`).
@@ -172,8 +182,104 @@ fn compile_and_read_probe_identities(
         c1?;
         c2?;
         c3?;
+        if let Some(path) = cache_path {
+            if let Ok(bytes) = serde_json::to_vec(&decls) {
+                let _ = crate::shm_cache::atomic_write_shm(&path, &bytes);
+            }
+        }
         Ok(decls)
     })
+}
+
+fn identity_cache_path(
+    probe: &str,
+    project_dir: &Path,
+    lean_args: &[String],
+    env: &HashMap<String, String>,
+    min_line: usize,
+    max_line: usize,
+) -> Option<PathBuf> {
+    let toolchain = detect_toolchain(project_dir);
+    let (compiler, githash, tc_lib, _) =
+        crate::module_builder::resolve_toolchain_compiler(project_dir, &toolchain).ok()?;
+    let header = crate::module_builder::parse_header_info(probe);
+    if header.header_error.is_some()
+        || splitter::source_may_read_host_state(probe)
+        || crate::module_builder::source_uses_include_str(probe)
+    {
+        return None;
+    }
+    let lean_path = env.get("LEAN_PATH").map(String::as_str).unwrap_or("");
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(lean_path)
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| project_dir.join(p))
+        .collect();
+    dirs.push(tc_lib.clone());
+    let search_dirs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+    let cfg = crate::module_builder::resolve_project_config(project_dir).ok();
+    let mut pending = header.imports;
+    let mut visited = HashSet::new();
+    let mut pins = Vec::new();
+    while let Some(import) = pending.pop() {
+        if !visited.insert(import.clone()) {
+            continue;
+        }
+        let path = crate::module_builder::resolve_olean_along_search_dirs(&search_dirs, &import)?;
+        if crate::module_builder::is_verified_toolchain_olean_file(&tc_lib, Some(&githash), &path) {
+            continue;
+        }
+        let src_path = cfg
+            .as_ref()
+            .and_then(|cfg| {
+                crate::module_builder::resolve_source_spec_for_prebuilt_olean(cfg, &path)
+                    .map(|spec| spec.src_path)
+            })
+            .unwrap_or_else(|| path.with_extension("lean"));
+        let source = fs::read_to_string(&src_path).ok()?;
+        if splitter::source_may_read_host_state(&source)
+            || crate::module_builder::source_uses_include_str(&source)
+        {
+            return None;
+        }
+        let source_header = crate::module_builder::parse_header_info(&source);
+        if source_header.header_error.is_some() {
+            return None;
+        }
+        pending.extend(source_header.imports);
+        pending.extend(
+            crate::module_builder::read_olean_binary_imports_cached(&path)
+                .ok()?
+                .0
+                .into_iter()
+                .map(|imp| imp.module),
+        );
+        pins.push((
+            import,
+            path.clone(),
+            blake3::hash(source.as_bytes()).to_hex().to_string(),
+            crate::module_builder::compute_olean_artifact_set_digest_with_policy(&path, true)
+                .ok()?,
+        ));
+    }
+    pins.sort();
+    let bytes = serde_json::to_vec(&(
+        2u32,
+        crate::zygote::ZYGOTE_SCANNER_VERSION,
+        crate::zygote::ZYGOTE_REPLAY_VERSION,
+        toolchain,
+        githash,
+        compiler,
+        project_dir,
+        &dirs,
+        crate::module_builder::filter_allowed_lean_args(lean_args),
+        pins,
+        probe,
+        min_line,
+        max_line,
+    ))
+    .ok()?;
+    let root = crate::shm_cache::ensure_verified_private_staging_dir(Some("decl_identities"))?;
+    Some(root.join(format!("{}.json", blake3::hash(&bytes).to_hex())))
 }
 
 type IdentityProbeContext = (Vec<String>, Option<HashMap<String, String>>);
@@ -236,7 +342,6 @@ pub(super) fn prewarm_local_check_zygote(
 /// environment, independently of textual scope tracking. This probe replaces only the proof:
 /// false statements must still have an attested identity before Stage-1 can attribute a
 /// counterexample, and proof verification must match `kernel_type_hash` in the elaborated kernel
-/// environment. No result or identity is cached; unavailable elaboration fails closed.
 pub(crate) fn confirm_decl_identity(
     src: &str,
     shard: &splitter::TheoremShard,
@@ -938,4 +1043,179 @@ pub(crate) fn read_single_isolated_olean(out_dir: &Path, module: &str) -> Result
         out_dir.display()
     );
     read_verified_isolated_artifact(&out_dir.join(&expected_name))
+}
+
+#[cfg(test)]
+mod memo_tests {
+    use super::*;
+
+    #[test]
+    fn identity_memo_rejects_transitive_host_inputs() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tree = crate::worktree_test_support::LakeTree::new(
+            "identity_transitive_inputs",
+            &[
+                ("P/Leaf.lean", "def leaf : Nat := 1\n"),
+                ("P/Middle.lean", "import P.Leaf\ndef middle := leaf\n"),
+                ("P/data.txt", "first"),
+            ],
+        )?;
+        let mut env = HashMap::from([(
+            "LEAN_PATH".into(),
+            tree.project
+                .join(".lake/build/lib/lean")
+                .to_string_lossy()
+                .into_owned(),
+        )]);
+        let probe = "import P.Middle\ntheorem target : middle = 1 := rfl\n";
+        let key = identity_cache_path(probe, &tree.project, &[], &env, 2, 2).unwrap();
+        let leaf = tree.project.join("P/Leaf.lean");
+        for source in [
+            "initialize nonce : Option String ← IO.getEnv \"IDENTITY_TEST_NONCE\"\ndef leaf : Nat := 1\n",
+            "def embedded := include_str \"data.txt\"\ndef leaf : Nat := 1\n",
+        ] {
+            fs::write(&leaf, source)?;
+            for value in ["first", "second"] {
+                env.insert("IDENTITY_TEST_NONCE".into(), value.into());
+                fs::write(tree.project.join("P/data.txt"), value)?;
+                assert!(
+                    identity_cache_path(probe, &tree.project, &[], &env, 2, 2).is_none(),
+                    "transitive input must bypass identity memo: {source}, {value}",
+                );
+            }
+        }
+        fs::write(&leaf, "def leaf : Nat := 2\n")?;
+        assert_ne!(
+            Some(key),
+            identity_cache_path(probe, &tree.project, &[], &env, 2, 2)
+        );
+        let pure_key = identity_cache_path(probe, &tree.project, &[], &env, 2, 2).unwrap();
+        let artifact = tree.project.join(".lake/build/lib/lean/P/Leaf.olean");
+        let mut bytes = fs::read(&artifact)?;
+        bytes.push(0);
+        fs::write(&artifact, bytes)?;
+        assert_ne!(
+            Some(pure_key),
+            identity_cache_path(probe, &tree.project, &[], &env, 2, 2),
+        );
+        fs::remove_file(&leaf)?;
+        assert!(identity_cache_path(probe, &tree.project, &[], &env, 2, 2).is_none());
+        assert!(identity_cache_path(
+            "def embedded := include_str \"P/data.txt\"\n",
+            &tree.project,
+            &[],
+            &env,
+            1,
+            1,
+        )
+        .is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn identity_memo_separates_probe_context_and_rejects_missing_imports() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let scratch = PrivateScratchDir::create(
+            &verified_private_temp_scratch_base()?,
+            "identity_memo_test",
+        )?;
+        let dir = scratch.path.clone();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        let env = HashMap::new();
+        let probe = "theorem memoIdentity : True := by trivial\n";
+        let key = identity_cache_path(probe, &dir, &[], &env, 1, 1).expect("cache key");
+        assert_eq!(
+            Some(key.clone()),
+            identity_cache_path(probe, &dir, &[], &env, 1, 1)
+        );
+        assert_ne!(
+            Some(key.clone()),
+            identity_cache_path(probe, &dir, &[], &env, 1, 2)
+        );
+        assert_ne!(
+            Some(key.clone()),
+            identity_cache_path(
+                "theorem memoIdentity : False := by sorry\n",
+                &dir,
+                &[],
+                &env,
+                1,
+                1
+            )
+        );
+        assert_ne!(
+            Some(key),
+            identity_cache_path(probe, &dir, &["-DmaxRecDepth=2048".into()], &env, 1, 1)
+        );
+        assert!(
+            identity_cache_path("import MissingIdentityImport\n", &dir, &[], &env, 1, 1).is_none()
+        );
+        assert!(identity_cache_path(
+            "initialize x ← IO.getEnv \"MEMO_TEST\"\n",
+            &dir,
+            &[],
+            &env,
+            1,
+            1
+        )
+        .is_none());
+        let first = compile_and_read_probe_identities(
+            probe,
+            &dir,
+            false,
+            &[],
+            Some(&env),
+            &[],
+            1,
+            1,
+            Instant::now(),
+        )?;
+        let second = compile_and_read_probe_identities(
+            probe,
+            &dir,
+            false,
+            &[],
+            Some(&env),
+            &[],
+            1,
+            1,
+            Instant::now(),
+        )?;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].decl_name, second[0].decl_name);
+        assert_eq!(first[0].kernel_type_hash, second[0].kernel_type_hash);
+        let import_path = dir.join("MemoImport.olean");
+        fs::write(dir.join("MemoImport.lean"), "def memoValue : Nat := 1\n")?;
+        let output = std::process::Command::new("lean")
+            .args(["-o", "MemoImport.olean", "MemoImport.lean"])
+            .current_dir(&dir)
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let env = HashMap::from([("LEAN_PATH".into(), dir.to_string_lossy().into_owned())]);
+        let imported_probe = format!("import MemoImport\n{probe}");
+        let old_key =
+            identity_cache_path(&imported_probe, &dir, &[], &env, 2, 2).expect("import memo key");
+        fs::write(&old_key, b"[]")?;
+        let mut bytes = fs::read(&import_path)?;
+        bytes.push(0);
+        fs::write(&import_path, bytes)?;
+        let new_key = identity_cache_path(&imported_probe, &dir, &[], &env, 2, 2)
+            .expect("changed import memo key");
+        assert_ne!(old_key, new_key);
+        assert!(
+            !new_key.exists(),
+            "changed import must miss the old memo entry"
+        );
+        fs::remove_file(old_key)?;
+        scratch.remove()?;
+        Ok(())
+    }
 }
