@@ -37,7 +37,10 @@ def provenance(binary):
             "source_tree": git("rev-parse", "HEAD^{tree}"),
             "source_dirty": bool(git("status", "--porcelain")),
             "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
-            "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+            "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "trusted_git_path": os.environ.get("TURBO_LEAN_GIT", "git"),
+            "trusted_git_version": subprocess.check_output(
+                [os.environ.get("TURBO_LEAN_GIT", "git"), "--version"], text=True).strip()}
 
 
 def check(binary, project, file, cache, timeout, decl=None, workload=None):
