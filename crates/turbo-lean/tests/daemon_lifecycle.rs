@@ -1165,3 +1165,209 @@ fn decl_identity_probe_and_reader_share_timeout_budget() {
     );
     f.wait_for(Duration::from_secs(3), || f.pids().is_empty());
 }
+
+fn call_mcp(
+    f: &Fixture,
+    arguments: serde_json::Value,
+    configure: impl FnOnce(&mut Command),
+) -> serde_json::Value {
+    let input = f.root.join("mcp-input.jsonl");
+    fs::write(&input, format!("{}\n", serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": "turbo_audit_spec", "arguments": arguments}}))).unwrap();
+    let mut cmd = f.command();
+    cmd.arg("mcp").stdin(fs::File::open(input).unwrap());
+    configure(&mut cmd);
+    let output = f.run(cmd);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let rpc: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let text = rpc
+        .pointer("/result/content/0/text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("{rpc}"));
+    serde_json::from_str(text).unwrap()
+}
+
+#[test]
+fn cold_mcp_uses_caller_workspace_and_explicit_project_before_caller_file() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let _serial = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    fs::set_permissions(&f.staging, fs::Permissions::from_mode(0o755)).unwrap();
+    let project = f.root.join("project");
+    fs::create_dir(&project).unwrap();
+    fs::write(project.join("lakefile.toml"), "name = \"project\"\n").unwrap();
+    fs::write(
+        project.join("Quick.lean"),
+        "namespace Blocked\ntheorem probe : True := by trivial\nend Blocked\n",
+    )
+    .unwrap();
+    fs::write(
+        project.join("turbo-lean.toml"),
+        "[audit_spec]\nforbid_namespaces = [\"Blocked\"]\n",
+    )
+    .unwrap();
+    let first = call_mcp(&f, serde_json::json!({"file": "Quick.lean"}), |_| {});
+    assert!(first.get("error").is_none(), "{first}");
+    let state_path = f.root.join("cas/zygote_daemon.json");
+    let first_state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    let explicit = call_mcp(
+        &f,
+        serde_json::json!({"file": "Quick.lean", "project_dir": "project"}),
+        |_| {},
+    );
+    assert!(
+        explicit["forbidden_scope_decls"]
+            .as_array()
+            .is_some_and(|v| !v.is_empty()),
+        "{explicit}"
+    );
+    let implicit = call_mcp(&f, serde_json::json!({"file": "Quick.lean"}), |cmd| {
+        cmd.current_dir(&project);
+    });
+    assert!(
+        implicit["forbidden_scope_decls"]
+            .as_array()
+            .is_some_and(|v| !v.is_empty()),
+        "{implicit}"
+    );
+    let second_state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(first_state["pid"], second_state["pid"]);
+    assert_eq!(fs::metadata(&f.staging).unwrap().mode() & 0o777, 0o755);
+    let fallback = f.root.join("cas/staging/zygote_daemon_cas_orphan");
+    fs::create_dir_all(&fallback).unwrap();
+    f.stop();
+    assert!(!fallback.exists());
+}
+
+#[test]
+fn recorded_binary_identity_mismatch_replaces_daemon_and_cas() {
+    let _serial = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    call_mcp(&f, serde_json::json!({"file": "Quick.lean"}), |_| {});
+    let state = fs::read_dir(&f.staging)
+        .unwrap()
+        .flatten()
+        .find(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("zygote_daemon_cas_")
+        })
+        .unwrap()
+        .path()
+        .join("zygote_daemon.json");
+    let mut info: serde_json::Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+    let old_pid = info["pid"].clone();
+    let marker = state.parent().unwrap().join("old-cas-marker");
+    fs::write(&marker, b"old binary cache").unwrap();
+    info["exe_mtime_nsec"] = serde_json::json!(info["exe_mtime_nsec"].as_i64().unwrap() + 1);
+    fs::write(&state, serde_json::to_vec(&info).unwrap()).unwrap();
+    call_mcp(&f, serde_json::json!({"file": "Quick.lean"}), |_| {});
+    let replacement: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+    assert_ne!(replacement["pid"], old_pid);
+    assert!(!marker.exists());
+    f.stop();
+}
+
+#[test]
+fn shared_daemon_audit_override_is_request_local() {
+    let _serial = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    fs::write(
+        f.root.join("Quick.lean"),
+        "namespace First\ntheorem probe : True := by trivial\nend First\n",
+    )
+    .unwrap();
+    let first = call_mcp(&f, serde_json::json!({"file": "Quick.lean"}), |cmd| {
+        cmd.env(
+            "TURBO_LEAN_AUDIT_SPEC_CONFIG",
+            "[audit_spec]\nforbid_namespaces = [\"First\"]\n",
+        );
+    });
+    assert!(
+        first["forbidden_scope_decls"]
+            .as_array()
+            .is_some_and(|v| !v.is_empty()),
+        "{first}"
+    );
+    let state = f.root.join("cas/zygote_daemon.json");
+    let before: serde_json::Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+    let other = f.root.join("other");
+    fs::create_dir(&other).unwrap();
+    fs::write(other.join("lakefile.toml"), "name = \"other\"\n").unwrap();
+    fs::copy(f.root.join("Quick.lean"), other.join("Quick.lean")).unwrap();
+    let second = call_mcp(&f, serde_json::json!({"file": "Quick.lean"}), |cmd| {
+        cmd.current_dir(&other)
+            .env_remove("TURBO_LEAN_AUDIT_SPEC_CONFIG");
+    });
+    assert!(
+        second["forbidden_scope_decls"]
+            .as_array()
+            .is_some_and(|v| v.is_empty()),
+        "{second}"
+    );
+    let after: serde_json::Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+    assert_eq!(before["pid"], after["pid"]);
+    f.stop();
+}
+
+#[test]
+fn daemon_mcp_sandbox_telemetry_opt_out_does_not_leak() {
+    use std::os::unix::fs::PermissionsExt;
+    let _serial = LIFECYCLE_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    fs::set_permissions(&f.staging, fs::Permissions::from_mode(0o700)).unwrap();
+    let events = f
+        .root
+        .join("home/.cache/turbo-lean/telemetry/turbo_lean_events.jsonl");
+    let event_size = || fs::metadata(&events).map(|meta| meta.len()).unwrap_or(0);
+    let state = f.root.join("cas/zygote_daemon.json");
+    let mut daemon_pid = None;
+    for key in ["SANDBOXED_TELEMETRY", "SANDBOXED_TELEMETRY_MODE"] {
+        let before = event_size();
+        let off = call_mcp(&f, serde_json::json!({"file": "Quick.lean"}), |cmd| {
+            cmd.env_remove("TURBO_LEAN_TELEMETRY")
+                .env_remove("SANDBOXED_TELEMETRY")
+                .env_remove("SANDBOXED_TELEMETRY_MODE")
+                .env(key, "off");
+        });
+        assert!(off.get("error").is_none(), "{off}");
+        assert_eq!(event_size(), before, "{key}=off emitted telemetry");
+        let info: serde_json::Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+        let pid = info["pid"].as_u64().unwrap();
+        assert_eq!(*daemon_pid.get_or_insert(pid), pid);
+        let env = fs::read(format!("/proc/{pid}/environ")).unwrap();
+        for scrubbed in ["SANDBOXED_TELEMETRY", "SANDBOXED_TELEMETRY_MODE"] {
+            assert!(!env
+                .split(|byte| *byte == 0)
+                .any(|entry| entry.starts_with(format!("{scrubbed}=").as_bytes())));
+        }
+        let on = call_mcp(&f, serde_json::json!({"file": "Quick.lean"}), |cmd| {
+            cmd.env_remove("TURBO_LEAN_TELEMETRY")
+                .env_remove("SANDBOXED_TELEMETRY")
+                .env_remove("SANDBOXED_TELEMETRY_MODE");
+        });
+        assert!(on.get("error").is_none(), "{on}");
+        assert!(
+            event_size() > before,
+            "{key} opt-out leaked to the next request"
+        );
+        let after: serde_json::Value = serde_json::from_slice(&fs::read(&state).unwrap()).unwrap();
+        assert_eq!(after["pid"], info["pid"]);
+    }
+    f.stop();
+}

@@ -147,7 +147,6 @@ pub fn is_invoked_by_autonomous_governor() -> bool {
     })
 }
 
-/// Derive a deterministic 16-hex project identifier matching `maxwell` (`telemetry-project-v1:<origin-or-path>`).
 pub fn derive_telemetry_project_id(dir: Option<&Path>) -> String {
     if let Ok(override_id) = std::env::var("SANDBOXED_TELEMETRY_PROJECT_ID") {
         let trimmed = override_id.trim();
@@ -386,7 +385,7 @@ pub fn resolve_telemetry_policy_with_trust(
         "SANDBOXED_TELEMETRY",
         "TURBO_LEAN_TELEMETRY",
     ] {
-        if let Ok(v) = std::env::var(k) {
+        if let Some(v) = crate::zygote::inbound_setting(k) {
             if !v.trim().is_empty() {
                 apply_telemetry_mode_str(&v, &mut enabled, &mut remote, &mut mode);
             }
@@ -1386,17 +1385,109 @@ pub fn execute_fast_check(
 fn resolve_cli_bin() -> PathBuf {
     let mut cli_bin = std::env::current_exe().unwrap_or_default();
     if cli_bin.file_name().and_then(|s| s.to_str()) != Some("turbo-lean") {
-        if let Some(parent_bin) = cli_bin
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("turbo-lean"))
-        {
-            if parent_bin.exists() {
-                cli_bin = parent_bin;
-            }
+        if let Some(parent_bin) = cli_bin.ancestors().skip(1).find_map(|d| {
+            let p = d.join("turbo-lean");
+            p.is_file().then_some(p)
+        }) {
+            cli_bin = parent_bin;
         }
     }
     cli_bin
+}
+
+fn normalize_isolated_mcp_paths(
+    req: &serde_json::Value,
+    file: Option<&str>,
+    project_dir: Option<&Path>,
+    cache_dir: Option<&Path>,
+    cwd: &Path,
+) -> (serde_json::Value, Option<PathBuf>, Option<PathBuf>) {
+    let absolute = |p: &Path| {
+        if p.is_relative() {
+            cwd.join(p)
+        } else {
+            p.to_path_buf()
+        }
+    };
+    let project = project_dir.map(absolute);
+    let resolved = project.clone().or_else(|| {
+        file.filter(|f| !f.trim().is_empty())
+            .map(|f| crate::lake_build::find_project_root(&absolute(Path::new(f))))
+    });
+    let mut req = req.clone();
+    if let Some(args) = req
+        .pointer_mut("/params/arguments")
+        .and_then(|v| v.as_object_mut())
+    {
+        for key in ["project_dir", "file", "cache_dir"] {
+            if let Some(path) = args.get(key).and_then(|v| v.as_str()) {
+                if !path.is_empty() && Path::new(path).is_relative() {
+                    let base = if key == "file" {
+                        project.as_deref().unwrap_or(cwd)
+                    } else {
+                        cwd
+                    };
+                    args.insert(key.into(), serde_json::json!(base.join(path)));
+                }
+            }
+        }
+    }
+    (req, resolved, cache_dir.map(absolute))
+}
+
+fn invoke_mcp_fast_check_isolated(
+    req: &serde_json::Value,
+    file: Option<&str>,
+    project_dir: Option<&Path>,
+    cache_dir: Option<&Path>,
+) -> Option<serde_json::Value> {
+    use std::io::Write;
+    let cli_bin = resolve_cli_bin();
+    if cli_bin.file_name().and_then(|s| s.to_str()) != Some("turbo-lean") || !cli_bin.exists() {
+        return None;
+    }
+    let cwd = std::env::current_dir().ok()?;
+    let (req, resolved_proj, cache_dir) =
+        normalize_isolated_mcp_paths(req, file, project_dir, cache_dir, &cwd);
+    let mut cmd = Command::new(&cli_bin);
+    cmd.env_remove("TURBO_LEAN_DAEMON")
+        .env("TURBO_LEAN_NO_DAEMON", "1")
+        .env("TURBO_LEAN_MCP_ISOLATED", "1")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if let Some(cd) = cache_dir {
+        cmd.arg("--cache-dir").arg(cd);
+    }
+    cmd.arg("mcp");
+    if let Some(ref pd) = resolved_proj {
+        cmd.arg("--project-dir").arg(pd).current_dir(pd);
+    }
+    for (val_k, cfg_k) in [
+        (
+            crate::splitter::EXCLUDE_ENV,
+            crate::splitter::EXCLUDE_FROM_CONFIG_ENV,
+        ),
+        (
+            crate::kernel::KERNEL_ENGINE_ENV,
+            crate::kernel::KERNEL_ENGINE_FROM_CONFIG_ENV,
+        ),
+    ] {
+        if std::env::var(cfg_k).as_deref() == Ok("1") {
+            cmd.env_remove(val_k).env_remove(cfg_k);
+        }
+    }
+    crate::zygote::configure_mcp_child_policy(&mut cmd);
+    let mut child = cmd.spawn().ok()?;
+    let mut line = serde_json::to_vec(&req).ok()?;
+    line.push(b'\n');
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(&line);
+    }
+    let out = child.wait_with_output().ok()?;
+    let rpc: serde_json::Value = serde_json::from_slice(out.stdout.trim_ascii()).ok()?;
+    let text = rpc.pointer("/result/content/0/text")?.as_str()?;
+    serde_json::from_str(text).ok()
 }
 
 fn invoke_agent_step_json(
@@ -1412,7 +1503,7 @@ fn invoke_agent_step_json(
         });
     }
     let decl_clean = decl.filter(|s| !s.is_empty());
-    if file.is_file() {
+    if file.is_file() && crate::zygote::daemon_disabled() {
         if let Ok(mut store) = crate::db::TurboStore::open(cache_dir) {
             match crate::gpu_fastcheck::evaluate_agent_step_value(
                 &mut store,
@@ -1437,7 +1528,19 @@ fn invoke_agent_step_json(
     }
     let cli_bin = resolve_cli_bin();
     if cli_bin.exists() {
+        if !crate::zygote::daemon_disabled() {
+            let shared = crate::db::TurboStore::open(cache_dir).ok().and_then(|store| {
+                crate::zygote::ensure_local_zygote_daemon(&store, &std::collections::HashMap::new())
+            });
+            if shared.is_none() {
+                return serde_json::json!({
+                    "status": "error", "ok": false, "verified": false,
+                    "error": "Shared daemon startup failed; set TURBO_LEAN_NO_DAEMON=1 for in-process execution"
+                });
+            }
+        }
         let mut cmd = Command::new(&cli_bin);
+        cmd.env_remove("TURBO_LEAN_DAEMON");
         cmd.arg("--json");
         if let Some(cd) = cache_dir {
             cmd.arg("--cache-dir").arg(cd);
@@ -1451,35 +1554,19 @@ fn invoke_agent_step_json(
         }
         for (val_k, cfg_k) in [
             (
-                crate::splitter::ALLOWED_AXIOMS_ENV,
-                crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV,
-            ),
-            (
                 crate::splitter::EXCLUDE_ENV,
                 crate::splitter::EXCLUDE_FROM_CONFIG_ENV,
             ),
             (
-                "TURBO_LEAN_ALLOWED_CSIMP",
-                "TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG",
-            ),
-            (
-                "TURBO_LEAN_ALLOWED_UNSAFE",
-                "TURBO_LEAN_ALLOWED_UNSAFE_FROM_CONFIG",
-            ),
-            (
-                "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY",
-                "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY_FROM_CONFIG",
+                crate::kernel::KERNEL_ENGINE_ENV,
+                crate::kernel::KERNEL_ENGINE_FROM_CONFIG_ENV,
             ),
         ] {
             if std::env::var(cfg_k).as_deref() == Ok("1") {
-                cmd.env_remove(val_k);
-                cmd.env_remove(cfg_k);
+                cmd.env_remove(val_k).env_remove(cfg_k);
             }
         }
-        if std::env::var(crate::kernel::KERNEL_ENGINE_FROM_CONFIG_ENV).as_deref() == Ok("1") {
-            cmd.env_remove(crate::kernel::KERNEL_ENGINE_ENV);
-            cmd.env_remove(crate::kernel::KERNEL_ENGINE_FROM_CONFIG_ENV);
-        }
+        crate::zygote::configure_mcp_child_policy(&mut cmd);
         if let Ok(out) = cmd.output() {
             let stdout = String::from_utf8_lossy(&out.stdout);
             if let Ok(mut val) = serde_json::from_str::<serde_json::Value>(stdout.trim()) {
@@ -1745,8 +1832,26 @@ pub fn handle_mcp_jsonrpc_request(
     default_project_dir: Option<&Path>,
     cache_dir: Option<&Path>,
 ) -> Option<serde_json::Value> {
+    let _timeout = crate::zygote::McpTimeoutGuard::new(
+        req.as_object()
+            .and_then(|object| object.get("timeout_ms"))
+            .and_then(|v| v.as_u64()),
+    );
     let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
     let id_opt = req.get("id").cloned();
+    #[cfg(not(test))]
+    if method == "tools/call"
+        && std::env::var_os("TURBO_LEAN_DAEMON").is_none()
+        && !crate::zygote::daemon_disabled()
+        && matches!(req.pointer("/params/name").and_then(|v| v.as_str()),
+            Some("turbo_check_decl" | "turbo_agent_step" | "turbo_audit_spec" | "turbo_fast_check" | "turbo_pr_verify"))
+    {
+        let result = crate::zygote::forward_mcp_request(req, default_project_dir, cache_dir);
+        return Some(result.unwrap_or_else(|error| serde_json::json!({
+            "jsonrpc": "2.0", "id": id_opt.unwrap_or(serde_json::Value::Null),
+            "error": {"code": -32603, "message": format!("Shared daemon request failed: {error:#}")}
+        })));
+    }
 
     if method == "notifications/initialized" || method == "initialized" {
         return id_opt.map(|id| serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} }));
@@ -1788,7 +1893,17 @@ pub fn handle_mcp_jsonrpc_request(
                 .get("project_dir")
                 .and_then(|v| v.as_str())
                 .map(Path::new)
-                .or(default_project_dir);
+                .or_else(|| {
+                    let has_file = args
+                        .get("file")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|f| !f.is_empty());
+                    if has_file && crate::zygote::has_inbound_mcp_policy() {
+                        None
+                    } else {
+                        default_project_dir
+                    }
+                });
             let (payload, is_error) = match tool_name {
                 "turbo_agent_step" | "turbo_check_decl" => {
                     let file_str = args.get("file").and_then(|v| v.as_str()).unwrap_or("");
@@ -1798,16 +1913,12 @@ pub fn handle_mcp_jsonrpc_request(
                         .and_then(|v| v.as_bool())
                         .unwrap_or(true);
                     let tpu = args.get("tpu").and_then(|v| v.as_bool()).unwrap_or(true);
-                    let proj = args
-                        .get("project_dir")
-                        .and_then(|v| v.as_str())
-                        .map(PathBuf::from);
                     let res = execute_mcp_agent_step(
                         Path::new(file_str),
                         decl,
                         compact,
                         tpu,
-                        proj.as_deref().or(default_project_dir),
+                        project_dir,
                         cache_dir,
                     );
                     let err = res.get("ok").and_then(|v| v.as_bool()) == Some(false)
@@ -1831,15 +1942,33 @@ pub fn handle_mcp_jsonrpc_request(
                         .get("compact")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(true);
-                    let res = execute_fast_check(
-                        file,
-                        decl,
-                        stmt_src,
-                        items,
-                        backend,
-                        compact,
-                        project_dir,
-                    );
+                    let needs_isolated_policy = (file.is_some_and(|f| !f.trim().is_empty())
+                        || project_dir.is_some())
+                        && std::env::var_os("TURBO_LEAN_MCP_ISOLATED").is_none();
+                    let res = if needs_isolated_policy {
+                        invoke_mcp_fast_check_isolated(req, file, project_dir, cache_dir)
+                            .unwrap_or_else(|| {
+                                execute_fast_check(
+                                    file,
+                                    decl,
+                                    stmt_src,
+                                    items,
+                                    backend,
+                                    compact,
+                                    project_dir,
+                                )
+                            })
+                    } else {
+                        execute_fast_check(
+                            file,
+                            decl,
+                            stmt_src,
+                            items,
+                            backend,
+                            compact,
+                            project_dir,
+                        )
+                    };
                     let err = res.get("ok").and_then(|v| v.as_bool()) == Some(false)
                         && (res.get("kind").and_then(|v| v.as_str()) == Some("error")
                             || res.get("status").and_then(|v| v.as_str()) == Some("error"));
@@ -1859,7 +1988,12 @@ pub fn handle_mcp_jsonrpc_request(
                         .get("require_nonempty")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    let mut res = execute_mcp_audit_spec(Path::new(file_str), decl, project_dir);
+                    let mut res = if std::env::var_os("TURBO_LEAN_DAEMON").is_some() {
+                        invoke_mcp_fast_check_isolated(req, Some(file_str), project_dir, cache_dir)
+                            .unwrap_or_else(|| serde_json::json!({"ok": false, "status": "error", "error": "Audit subprocess unavailable"}))
+                    } else {
+                        execute_mcp_audit_spec(Path::new(file_str), decl, project_dir)
+                    };
                     crate::gpu_fastcheck::apply_require_nonempty_to_audit_report(
                         &mut res,
                         require_nonempty,
@@ -1871,11 +2005,13 @@ pub fn handle_mcp_jsonrpc_request(
                     (res, err)
                 }
                 "turbo_pr_verify" => {
-                    let proj = args
-                        .get("project_dir")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| default_project_dir.and_then(|p| p.to_str()))
-                        .unwrap_or(".");
+                    let cwd = std::env::current_dir().unwrap_or_default();
+                    let proj = project_dir.unwrap_or(&cwd);
+                    let proj = if proj.is_absolute() {
+                        proj.to_path_buf()
+                    } else {
+                        cwd.join(proj)
+                    };
                     let base = args.get("base").and_then(|v| v.as_str()).unwrap_or("HEAD");
                     let mode = args
                         .get("mode")
@@ -1899,6 +2035,7 @@ pub fn handle_mcp_jsonrpc_request(
                         )
                     } else {
                         let mut cmd = Command::new(&cli_bin);
+                        cmd.env_remove("TURBO_LEAN_DAEMON");
                         cmd.arg("--json");
                         if let Some(cd) = cache_dir {
                             cmd.arg("--cache-dir").arg(cd);
@@ -1906,7 +2043,7 @@ pub fn handle_mcp_jsonrpc_request(
                         cmd.args([
                             "pr-verify",
                             "--project-dir",
-                            proj,
+                            &proj.to_string_lossy(),
                             "--base",
                             base,
                             "--mode",
@@ -1919,36 +2056,17 @@ pub fn handle_mcp_jsonrpc_request(
                         cmd.env_remove(crate::splitter::EXCLUDE_ROOT_ENV);
                         for (val_k, cfg_k) in [
                             (
-                                crate::splitter::ALLOWED_AXIOMS_ENV,
-                                crate::splitter::ALLOWED_AXIOMS_FROM_CONFIG_ENV,
-                            ),
-                            (
                                 crate::splitter::EXCLUDE_ENV,
                                 crate::splitter::EXCLUDE_FROM_CONFIG_ENV,
                             ),
                             (
-                                "TURBO_LEAN_ALLOWED_CSIMP",
-                                "TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG",
-                            ),
-                            (
-                                "TURBO_LEAN_ALLOWED_UNSAFE",
-                                "TURBO_LEAN_ALLOWED_UNSAFE_FROM_CONFIG",
-                            ),
-                            (
-                                "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY",
-                                "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY_FROM_CONFIG",
+                                crate::kernel::KERNEL_ENGINE_ENV,
+                                crate::kernel::KERNEL_ENGINE_FROM_CONFIG_ENV,
                             ),
                         ] {
                             if std::env::var(cfg_k).as_deref() == Ok("1") {
-                                cmd.env_remove(val_k);
-                                cmd.env_remove(cfg_k);
+                                cmd.env_remove(val_k).env_remove(cfg_k);
                             }
-                        }
-                        if std::env::var(crate::kernel::KERNEL_ENGINE_FROM_CONFIG_ENV).as_deref()
-                            == Ok("1")
-                        {
-                            cmd.env_remove(crate::kernel::KERNEL_ENGINE_ENV);
-                            cmd.env_remove(crate::kernel::KERNEL_ENGINE_FROM_CONFIG_ENV);
                         }
                         if disallow_stmt {
                             cmd.arg("--disallow-statement-changes");
@@ -1961,6 +2079,7 @@ pub fn handle_mcp_jsonrpc_request(
                                 }
                             }
                         }
+                        crate::zygote::configure_mcp_child_policy(&mut cmd);
                         match cmd.output() {
                             Ok(o) => {
                                 let exit_ok = o.status.success();
@@ -2194,6 +2313,119 @@ mod tests {
             }
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn isolated_mcp_paths_are_absolute_before_changing_directory() {
+        let cwd = std::env::temp_dir().join("mcp-r8-caller");
+        let req = serde_json::json!({"params":{"arguments":{"project_dir":"child","file":"Main.lean","cache_dir":"cache"}}});
+        let (normalized, project, cache) = normalize_isolated_mcp_paths(
+            &req,
+            Some("Main.lean"),
+            Some(Path::new("child")),
+            Some(Path::new("cache")),
+            &cwd,
+        );
+        assert_eq!(project, Some(cwd.join("child")));
+        assert_eq!(cache, Some(cwd.join("cache")));
+        assert_eq!(
+            normalized.pointer("/params/arguments/project_dir").unwrap(),
+            &serde_json::json!(cwd.join("child"))
+        );
+        assert_eq!(
+            normalized.pointer("/params/arguments/file").unwrap(),
+            &serde_json::json!(cwd.join("child/Main.lean"))
+        );
+        assert_eq!(
+            normalized.pointer("/params/arguments/cache_dir").unwrap(),
+            &serde_json::json!(cwd.join("cache"))
+        );
+        let (again, _, _) = normalize_isolated_mcp_paths(
+            &normalized,
+            None,
+            project.as_deref(),
+            cache.as_deref(),
+            project.as_deref().unwrap(),
+        );
+        assert_eq!(again, normalized);
+    }
+
+    #[test]
+    fn sandbox_telemetry_opt_out_is_request_local() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let scope = ScopedTelemetryTestEnv::new("sandbox_request_policy");
+        for key in ["SANDBOXED_TELEMETRY_MODE", "SANDBOXED_TELEMETRY"] {
+            std::env::set_var(key, "off");
+            crate::zygote::set_inbound_policy(std::collections::BTreeMap::from([(
+                key.to_string(),
+                "off".into(),
+            )]));
+            assert!(!resolve_telemetry_policy(Some(&scope.root)).enabled);
+            crate::zygote::clear_inbound_policy();
+            crate::zygote::set_inbound_policy(std::collections::BTreeMap::from([(
+                key.to_string(),
+                String::new(),
+            )]));
+            assert!(resolve_telemetry_policy(Some(&scope.root)).enabled);
+            crate::zygote::clear_inbound_policy();
+            std::env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn mcp_timeout_scope_reaches_children_and_is_restored() {
+        let before = crate::zygote::invocation_timeout_ms();
+        {
+            let _timeout = crate::zygote::McpTimeoutGuard::new(Some(37));
+            let mut child = Command::new("unused");
+            crate::zygote::configure_mcp_child_policy(&mut child);
+            assert!(child
+                .get_envs()
+                .any(|(key, value)| key == "TURBO_LEAN_TIMEOUT_MS"
+                    && value == Some(std::ffi::OsStr::new("37"))));
+            assert_eq!(crate::zygote::invocation_timeout_ms(), Some(37));
+        }
+        assert_eq!(crate::zygote::invocation_timeout_ms(), before);
+    }
+
+    #[test]
+    fn request_telemetry_and_audit_settings_do_not_cross_projects() {
+        crate::zygote::set_inbound_policy(std::collections::BTreeMap::from([
+            ("TURBO_LEAN_TELEMETRY".into(), "off".into()),
+            (
+                "TURBO_LEAN_AUDIT_SPEC_CONFIG".into(),
+                "[audit_spec]\nforbid_namespaces = [\"First\"]".into(),
+            ),
+        ]));
+        assert!(!resolve_telemetry_policy(None).enabled);
+        let mut first = Command::new("unused");
+        crate::zygote::configure_mcp_child_policy(&mut first);
+        assert!(first
+            .get_envs()
+            .any(|(k, v)| k == "TURBO_LEAN_AUDIT_SPEC_CONFIG" && v.is_some()));
+        crate::zygote::set_inbound_policy(Default::default());
+        for key in ["TURBO_LEAN_TELEMETRY", "TURBO_LEAN_AUDIT_SPEC_CONFIG"] {
+            assert_eq!(crate::zygote::inbound_setting(key), None);
+            let mut second = Command::new("unused");
+            crate::zygote::configure_mcp_child_policy(&mut second);
+            assert!(second.get_envs().any(|(k, v)| k == key && v.is_none()));
+        }
+        crate::zygote::clear_inbound_policy();
+    }
+
+    #[test]
+    fn test_mcp_initialize_and_tools_list() {
+        let cli = resolve_cli_bin();
+        assert!(cli.is_file(), "{}", cli.display());
+        assert_eq!(cli.file_name().unwrap(), "turbo-lean");
+        let initialize = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"});
+        let response = handle_mcp_jsonrpc_request(&initialize, None, None).unwrap();
+        assert_eq!(response["result"]["serverInfo"]["name"], "turbo-lean-mcp");
+        let list = serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"});
+        let response = handle_mcp_jsonrpc_request(&list, None, None).unwrap();
+        assert_eq!(response["result"]["tools"].as_array().unwrap().len(), 7);
     }
 
     #[test]
@@ -2448,7 +2680,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(rpc_fc["result"]["isError"], true);
+        assert_eq!(rpc_fc["result"]["isError"], true, "{rpc_fc}");
 
         let rpc_audit = handle_mcp_jsonrpc_request(
             &serde_json::json!({
@@ -2583,6 +2815,105 @@ mod tests {
             rpc
         );
         let _ = fs::remove_dir_all(&repo_dir);
+    }
+
+    #[test]
+    fn test_mcp_fast_check_isolates_daemon_and_project_policy() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _env_scope = ScopedTelemetryTestEnv::new("fcpol");
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cli_bin = resolve_cli_bin();
+        if cli_bin.file_name().and_then(|s| s.to_str()) != Some("turbo-lean") || !cli_bin.exists() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "turbo_lean_mcp_fcpol_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("lakefile.toml"),
+            "name = \"fcpol\"\nversion = \"0.1.0\"\ndefaultTargets = [\"FcPol\"]\n\n[[lean_lib]]\nname = \"FcPol\"\nsrcDir = \"src\"\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("src/FcPol.lean"),
+            "def slow (n : Nat) : Nat := n\ndef fast (n : Nat) : Nat := n\n@[csimp] theorem slow_eq_fast : @slow = @fast := rfl\n",
+        )
+        .unwrap();
+        let lake_status = Command::new("lake")
+            .args(["build", "FcPol"])
+            .current_dir(&root)
+            .status()
+            .expect("run lake build FcPol");
+        assert!(lake_status.success(), "lake build FcPol must succeed");
+        let probe = root.join("src/Probe.lean");
+        fs::write(
+            &probe,
+            "import FcPol\ntheorem buggy (n : Nat) : n + 1 = 0 := by sorry\n",
+        )
+        .unwrap();
+
+        fs::write(
+            root.join("turbo-lean.toml"),
+            "[worktree]\nauto_link = false\n",
+        )
+        .unwrap();
+        let prev_csimp = std::env::var_os("TURBO_LEAN_ALLOWED_CSIMP");
+        std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", "*");
+        crate::zygote::set_inbound_policy(std::collections::BTreeMap::new());
+        let req = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 95,
+            "method": "tools/call",
+            "params": {
+                "name": "turbo_fast_check",
+                "arguments": {
+                    "file": probe.to_string_lossy(),
+                    "decl": "buggy",
+                    "backend": "cpu"
+                }
+            }
+        });
+        let rejected = handle_mcp_jsonrpc_request(&req, Some(&root), Some(&root.join(".cache"))).unwrap();
+        assert_eq!(
+            rejected["result"]["isError"], true,
+            "ambient daemon TURBO_LEAN_ALLOWED_CSIMP=* must not leak into turbo_fast_check: {rejected}"
+        );
+
+        fs::write(
+            root.join("turbo-lean.toml"),
+            "[worktree]\nauto_link = false\n\n[csimp]\nallow = [\"*\"]\n",
+        )
+        .unwrap();
+        std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP");
+        crate::zygote::set_inbound_policy(std::collections::BTreeMap::new());
+        let accepted = handle_mcp_jsonrpc_request(&req, Some(&root), Some(&root.join(".cache"))).unwrap();
+        crate::zygote::clear_inbound_policy();
+        match prev_csimp {
+            Some(v) => std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", v),
+            None => std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP"),
+        }
+        assert_ne!(
+            accepted["result"]["isError"],
+            serde_json::json!(true),
+            "target project turbo-lean.toml [csimp] must apply to turbo_fast_check: {accepted}"
+        );
+        let body: serde_json::Value =
+            serde_json::from_str(accepted["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(body["kind"], "cex", "{body}");
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
