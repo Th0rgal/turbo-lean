@@ -1250,21 +1250,30 @@ type WorkerOutput = std::process::ChildStdout;
 
 fn worker_input(input: std::process::ChildStdin) -> WorkerInput {
     #[cfg(unix)]
-    { std::fs::File::from(std::os::fd::OwnedFd::from(input)) }
+    {
+        std::fs::File::from(std::os::fd::OwnedFd::from(input))
+    }
     #[cfg(not(unix))]
-    { input }
+    {
+        input
+    }
 }
 
 fn worker_output(output: std::process::ChildStdout) -> WorkerOutput {
     #[cfg(unix)]
-    { std::fs::File::from(std::os::fd::OwnedFd::from(output)) }
+    {
+        std::fs::File::from(std::os::fd::OwnedFd::from(output))
+    }
     #[cfg(not(unix))]
-    { output }
+    {
+        output
+    }
 }
 
 impl ZygoteWorkerProcess {
     fn pid(&self) -> u32 {
-        self.clone_pid.unwrap_or_else(|| self.child.as_ref().unwrap().id())
+        self.clone_pid
+            .unwrap_or_else(|| self.child.as_ref().unwrap().id())
     }
 
     #[cfg(target_os = "linux")]
@@ -1284,7 +1293,10 @@ impl ZygoteWorkerProcess {
         );
         struct Cleanup(PathBuf);
         impl Drop for Cleanup {
-            fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); let _ = std::fs::remove_file(self.0.with_extension("err")); }
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+                let _ = std::fs::remove_file(self.0.with_extension("err"));
+            }
         }
         let _cleanup = Cleanup(path.clone());
         let listener = UnixListener::bind(&path)?;
@@ -1293,7 +1305,11 @@ impl ZygoteWorkerProcess {
         self.stdin.flush()?;
         let mut reply = String::new();
         read_line_with_timeout(&mut self.stdout, &mut reply, deadline)?;
-        let pid: u32 = reply.trim().strip_prefix("clone ").ok_or_else(|| anyhow::anyhow!("clone unavailable"))?.parse()?;
+        let pid: u32 = reply
+            .trim()
+            .strip_prefix("clone ")
+            .ok_or_else(|| anyhow::anyhow!("clone unavailable"))?
+            .parse()?;
         let accept = |l: UnixListener| -> Result<std::os::unix::net::UnixStream> {
             l.set_nonblocking(true)?;
             loop {
@@ -1312,7 +1328,12 @@ impl ZygoteWorkerProcess {
         let channels = (|| Ok::<_, anyhow::Error>((accept(listener)?, accept(errors)?)))();
         let (stream, mut err) = match channels {
             Ok(c) => c,
-            Err(e) => { unsafe { libc::kill(pid as i32, libc::SIGKILL); } return Err(e); }
+            Err(e) => {
+                unsafe {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
+                return Err(e);
+            }
         };
         let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let stderr_scan = std::sync::Arc::new(StderrScan::default());
@@ -1321,7 +1342,9 @@ impl ZygoteWorkerProcess {
             use std::io::Read;
             let mut buf = [0; 1024];
             while let Ok(n) = err.read(&mut buf) {
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 scan.feed(&buf[..n]);
                 if let Ok(mut t) = tail.lock() {
                     t.extend_from_slice(&buf[..n]);
@@ -1331,12 +1354,22 @@ impl ZygoteWorkerProcess {
             }
         });
         Ok(Self {
-            child: None, clone_pid: Some(pid), _owner: self._owner.clone(),
+            child: None,
+            clone_pid: Some(pid),
+            _owner: self._owner.clone(),
             stdin: std::fs::File::from(OwnedFd::from(stream.try_clone()?)),
             stdout: BufReader::new(std::fs::File::from(OwnedFd::from(stream))),
-            stderr_tail, stderr_scan, pinned_snapshot_dir: self.pinned_snapshot_dir,
-            spawn_lean_path: self.spawn_lean_path.clone(), warm_prefixes: self.warm_prefixes.clone(),
-            warm_prefix_tree: self.warm_prefix_tree.clone(), warm_imports: self.warm_imports.clone(), request_count: 0, cold_import_us: None, is_master: false, _master: None,
+            stderr_tail,
+            stderr_scan,
+            pinned_snapshot_dir: self.pinned_snapshot_dir,
+            spawn_lean_path: self.spawn_lean_path.clone(),
+            warm_prefixes: self.warm_prefixes.clone(),
+            warm_prefix_tree: self.warm_prefix_tree.clone(),
+            warm_imports: self.warm_imports.clone(),
+            request_count: 0,
+            cold_import_us: None,
+            is_master: false,
+            _master: None,
         })
     }
 }
@@ -1363,7 +1396,9 @@ impl Drop for ZygoteWorkerProcess {
         }
         #[cfg(unix)]
         if let Some(pid) = self.clone_pid {
-            unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+            unsafe {
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
         }
     }
 }
@@ -1380,7 +1415,8 @@ impl ZygoteMasterEntry {
     fn touch(&self) {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        self.last_used_seq.store(NEXT.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+        self.last_used_seq
+            .store(NEXT.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
         govern_machine_wide_zygote_rss(self.pid, measure_process_rss_mb(self.pid));
     }
 }
@@ -1392,7 +1428,9 @@ static ZYGOTE_POOL: std::sync::OnceLock<
 
 #[allow(clippy::type_complexity)]
 static ZYGOTE_MASTERS: std::sync::OnceLock<
-    std::sync::Mutex<std::collections::HashMap<(String, String, String), std::sync::Arc<ZygoteMasterEntry>>>,
+    std::sync::Mutex<
+        std::collections::HashMap<(String, String, String), std::sync::Arc<ZygoteMasterEntry>>,
+    >,
 > = std::sync::OnceLock::new();
 
 /// Test-only fault injection: named callbacks fired at race-sensitive points of the digest /
@@ -2686,8 +2724,9 @@ fn materialize_closure(
         let next_idx = std::sync::atomic::AtomicUsize::new(0);
         let aborted = std::sync::atomic::AtomicBool::new(false);
         type VerifiedFile = Result<Option<(PathBuf, OleanFileStatSig)>, SnapshotError>;
-        let slots: Vec<std::sync::Mutex<Option<VerifiedFile>>> =
-            (0..files.len()).map(|_| std::sync::Mutex::new(None)).collect();
+        let slots: Vec<std::sync::Mutex<Option<VerifiedFile>>> = (0..files.len())
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
         std::thread::scope(|s| {
             for _ in 0..par_workers {
                 s.spawn(|| loop {
@@ -2914,7 +2953,9 @@ fn link_immutable_snapshot_file(src: &Path, dst: &Path, hash: &str) -> Result<bo
         let file = fs::File::open(src)?;
         let before = file.metadata()?;
         let mut flags: libc::c_long = 0;
-        let verity = unsafe { libc::ioctl(file.as_raw_fd(), 0x80086601 as libc::c_ulong, &mut flags) } == 0 && flags & 0x00100000 != 0;
+        let verity =
+            unsafe { libc::ioctl(file.as_raw_fd(), 0x80086601 as libc::c_ulong, &mut flags) } == 0
+                && flags & 0x00100000 != 0;
         let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
         let readonly_fs = unsafe {
             libc::fstatvfs(file.as_raw_fd(), stat.as_mut_ptr()) == 0
@@ -2947,7 +2988,10 @@ fn link_immutable_snapshot_file(src: &Path, dst: &Path, hash: &str) -> Result<bo
         Ok(true)
     }
     #[cfg(not(target_os = "linux"))]
-    { let _ = (src, dst, hash); Ok(false) }
+    {
+        let _ = (src, dst, hash);
+        Ok(false)
+    }
 }
 
 /// The verified blob holding `hash`, copied from `src` if not yet present.
@@ -3487,7 +3531,11 @@ fn build_worker_crash_diagnostics(
     peak_rss_mb: u64,
     last_request: &str,
 ) -> WorkerCrashDiagnostics {
-    let (exit_code, exit_signal) = worker.child.as_mut().map(collect_worker_exit_status).unwrap_or((None, None));
+    let (exit_code, exit_signal) = worker
+        .child
+        .as_mut()
+        .map(collect_worker_exit_status)
+        .unwrap_or((None, None));
     let stderr_tail = snapshot_worker_stderr_tail(&worker.stderr_tail);
     let mut details: Vec<String> = Vec::new();
     if let Some(code) = exit_code {
@@ -4267,6 +4315,29 @@ pub(crate) fn record_snapshot_modules_in_store(
     live_lean_path_env: &str,
     extra_root_lib: Option<&Path>,
 ) -> Result<()> {
+    record_snapshot_modules_with_audit_mode(
+        store,
+        cfg,
+        snap,
+        replayed_mods,
+        audited_mods,
+        live_lean_path_env,
+        extra_root_lib,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_snapshot_modules_with_audit_mode(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    snap: &ClosureSnapshot,
+    replayed_mods: &[String],
+    audited_mods: &[String],
+    live_lean_path_env: &str,
+    extra_root_lib: Option<&Path>,
+    audit_imports: bool,
+) -> Result<()> {
     let (snap_lp, _) = ensure_bound_audit_closure(snap, "audit_record_authority")?;
     let parent_snap_lp = snapshot_parent_search_path(snap).unwrap_or(snap_lp);
     let live_batch = crate::module_builder::ReplayLookupBatchCache::new_with_extra_root_lib(
@@ -4347,7 +4418,7 @@ pub(crate) fn record_snapshot_modules_in_store(
                     m
                 )
             })?;
-        let policy_dig = compute_module_audit_policy_digest(cfg, m);
+        let policy_dig = compute_module_audit_policy_digest_with_mode(cfg, m, audit_imports);
         ensure_bound_audit_closure(snap, "audit_record_audited_post")?;
         store.record_kernel_audited_olean(
             &dig,
@@ -4770,17 +4841,86 @@ pub(crate) fn replay_and_audit_modules_with_zygote_snapshot(
     Ok(Some(snap))
 }
 
+/// Audit dependencies without treating their compiler helpers as root declarations.
+/// Replay remains mandatory: Lake sidecars can be forged alongside the artifact.
+pub(crate) fn audit_imported_modules_with_zygote(
+    store: &TurboStore,
+    cfg: &crate::module_builder::ProjectConfig,
+    modules: &[String],
+    lean_path_env: &str,
+    allow_sorry: bool,
+) -> Result<()> {
+    if modules.is_empty() {
+        return Ok(());
+    }
+    let snap = materialize_bound_audit_closure(cfg, modules, lean_path_env)?;
+    let (lp, _) = ensure_bound_audit_closure(&snap, "import_audit_before_replay")?;
+    let pinned_fd = snapshot_pinned_dir_raw_fd(&snap);
+    let parent_lp = snapshot_parent_search_path(&snap).unwrap_or_else(|| lp.clone());
+    kernel_replay_modules_exec_pinned(
+        &store.root,
+        cfg,
+        modules,
+        &parent_lp,
+        &[],
+        false,
+        pinned_fd,
+    )?;
+    for chunk in modules.chunks(audit_batch_size()) {
+        let (lp, _) = ensure_bound_audit_closure(&snap, "import_audit_before_chunk")?;
+        audit_module_batch_exec_pinned_with_mode(
+            &store.root,
+            cfg,
+            chunk,
+            &lp,
+            &[],
+            false,
+            allow_sorry,
+            false,
+            pinned_fd,
+            true,
+        )?;
+    }
+    ensure_live_closure_matches_snapshot(&snap, "import_audit_before_record")?;
+    if !allow_sorry {
+        record_snapshot_modules_with_audit_mode(
+            store,
+            cfg,
+            &snap,
+            modules,
+            modules,
+            lean_path_env,
+            None,
+            true,
+        )?;
+    }
+    ensure_live_closure_matches_snapshot(&snap, "import_audit_complete")?;
+    Ok(())
+}
+
 pub(crate) fn compute_module_audit_policy_digest(
     cfg: &crate::module_builder::ProjectConfig,
     mod_name: &str,
 ) -> String {
+    compute_module_audit_policy_digest_with_mode(cfg, mod_name, false)
+}
+
+pub(crate) fn compute_module_audit_policy_digest_with_mode(
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_name: &str,
+    audit_imports: bool,
+) -> String {
     let base_policy = crate::splitter::current_kernel_policy_digest();
     let ffi_args = pinned_ffi_allow_args(cfg, &[mod_name.to_string()]);
-    if base_policy.is_empty() && ffi_args.is_empty() {
+    if !audit_imports && base_policy.is_empty() && ffi_args.is_empty() {
         return String::new();
     }
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean-audit-policy-v1\n");
+    h.update(if audit_imports {
+        b"turbo-lean-import-audit-policy-v1\n"
+    } else {
+        b"turbo-lean-audit-policy-v1\n"
+    });
     h.update(&(base_policy.len() as u64).to_le_bytes());
     h.update(base_policy.as_bytes());
     for a in &ffi_args {
@@ -4788,6 +4928,18 @@ pub(crate) fn compute_module_audit_policy_digest(
         h.update(a.as_bytes());
     }
     h.finalize().to_hex().to_string()
+}
+
+#[cfg(test)]
+#[test]
+fn import_audit_stamp_cannot_authorize_root_module() -> Result<()> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
+    let cfg = crate::module_builder::resolve_project_config(&root)?;
+    assert_ne!(
+        compute_module_audit_policy_digest_with_mode(&cfg, "TurboLean.Spec", true),
+        compute_module_audit_policy_digest(&cfg, "TurboLean.Spec"),
+    );
+    Ok(())
 }
 
 fn replay_closure_batch_size() -> usize {
@@ -5315,6 +5467,33 @@ fn audit_compiled_module_batch_exec_pinned(
     skip_child_replay: bool,
     pinned_dir_raw_fd: Option<i32>,
 ) -> Result<()> {
+    audit_module_batch_exec_pinned_with_mode(
+        store_root,
+        cfg,
+        mod_names,
+        lean_path_env,
+        extra_ro_binds,
+        is_untrusted,
+        allow_sorry_axiom,
+        skip_child_replay,
+        pinned_dir_raw_fd,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_module_batch_exec_pinned_with_mode(
+    store_root: &Path,
+    cfg: &crate::module_builder::ProjectConfig,
+    mod_names: &[String],
+    lean_path_env: &str,
+    extra_ro_binds: &[PathBuf],
+    is_untrusted: bool,
+    allow_sorry_axiom: bool,
+    skip_child_replay: bool,
+    pinned_dir_raw_fd: Option<i32>,
+    audit_imports: bool,
+) -> Result<()> {
     if mod_names.is_empty() || mod_names.iter().any(|m| m.trim().is_empty()) {
         anyhow::bail!("In-kernel `.olean` audit received an empty module name: fail-closed");
     }
@@ -5328,6 +5507,9 @@ fn audit_compiled_module_batch_exec_pinned(
         cmd.env(crate::splitter::ALLOWED_AXIOMS_ENV, allowed.join(","));
     }
     cmd.arg("--audit-modules");
+    if audit_imports {
+        cmd.arg("--audit-imports");
+    }
     if allow_sorry_axiom && !is_untrusted {
         cmd.arg("--allow-sorry");
     }
@@ -5351,7 +5533,7 @@ fn audit_compiled_module_batch_exec_pinned(
         Ok(_) => Ok(()),
         Err(_) if mod_names.len() > 1 => {
             let mid = mod_names.len() / 2;
-            audit_compiled_module_batch_exec_pinned(
+            audit_module_batch_exec_pinned_with_mode(
                 store_root,
                 cfg,
                 &mod_names[..mid],
@@ -5361,8 +5543,9 @@ fn audit_compiled_module_batch_exec_pinned(
                 allow_sorry_axiom,
                 skip_child_replay,
                 pinned_dir_raw_fd,
+                audit_imports,
             )?;
-            audit_compiled_module_batch_exec_pinned(
+            audit_module_batch_exec_pinned_with_mode(
                 store_root,
                 cfg,
                 &mod_names[mid..],
@@ -5372,6 +5555,7 @@ fn audit_compiled_module_batch_exec_pinned(
                 allow_sorry_axiom,
                 skip_child_replay,
                 pinned_dir_raw_fd,
+                audit_imports,
             )
         }
         Err(e) => Err(e),
@@ -6867,7 +7051,9 @@ pub(crate) fn resolve_zygote_context(
                 .collect()
         });
     let policy = request_policy(env_vars);
-    let policy_digest = blake3::hash(&serde_json::to_vec(&policy).expect("policy serializes")).to_hex().to_string();
+    let policy_digest = blake3::hash(&serde_json::to_vec(&policy).expect("policy serializes"))
+        .to_hex()
+        .to_string();
     let toolchain_policy = format!(
         "{}#{}#{}",
         toolchain,
@@ -7547,7 +7733,9 @@ fn eval_with_zygote_pool_attempt(
                 return worker_timeout(worker, req_id);
             }
             let pid = worker.pid();
-            if worker.clone_pid.is_some() { run_digest_test_hook("cloned_worker_request"); }
+            if worker.clone_pid.is_some() {
+                run_digest_test_hook("cloned_worker_request");
+            }
             let rss_before = measure_process_rss_mb(pid);
             let scan_before = worker.stderr_scan.snapshot();
             if let Err(e) = worker
@@ -7632,21 +7820,32 @@ fn eval_with_zygote_pool_attempt(
         if !lake_inputs_uncacheable && closure.label().is_some() && !daemon_disabled() {
             let masters = ZYGOTE_MASTERS.get_or_init(|| {
                 // Explicit CLI exits bypass OneShotGuard::drop and static destructors.
-                unsafe { libc::atexit(cleanup_zygote_processes); }
+                unsafe {
+                    libc::atexit(cleanup_zygote_processes);
+                }
                 Default::default()
             });
-            let cached = masters.lock().map_err(|_| anyhow::anyhow!("Zygote masters poisoned"))?
-                .get(&pool_key).cloned();
+            let cached = masters
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Zygote masters poisoned"))?
+                .get(&pool_key)
+                .cloned();
             let mut entry = cached;
             if let Some(existing) = &entry {
-                let worker = existing.worker.lock().map_err(|_| anyhow::anyhow!("Zygote master poisoned"))?;
+                let worker = existing
+                    .worker
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Zygote master poisoned"))?;
                 let matches = owned_process_alive(worker.pid())
                     && worker.pinned_snapshot_dir == expected_pinned_dir
                     && worker.spawn_lean_path == effective_lean_path;
                 drop(worker);
                 if !matches {
                     let mut map = masters.lock().unwrap_or_else(|e| e.into_inner());
-                    if map.get(&pool_key).is_some_and(|e| std::sync::Arc::ptr_eq(e, existing)) {
+                    if map
+                        .get(&pool_key)
+                        .is_some_and(|e| std::sync::Arc::ptr_eq(e, existing))
+                    {
                         map.remove(&pool_key);
                     }
                     drop(map);
@@ -7655,10 +7854,17 @@ fn eval_with_zygote_pool_attempt(
             }
             if entry.is_none() {
                 let mut master = spawn_zygote_worker()?;
-                let warm = attach_host_closure_digest(&format!("{}\t\tstrict\n", imports_csv), host_closure_digest);
-                if let WorkerReqOutcome::Reply(rep) = run_worker_req(&mut master, &warm, "warm clone master") {
+                let warm = attach_host_closure_digest(
+                    &format!("{}\t\tstrict\n", imports_csv),
+                    host_closure_digest,
+                );
+                if let WorkerReqOutcome::Reply(rep) =
+                    run_worker_req(&mut master, &warm, "warm clone master")
+                {
                     if rep.ok && rep.import_ok && closure.binding() == ClosureBinding::Bound {
-                        master.warm_imports.insert(imports_csv.clone(), closure_pool_digest.clone());
+                        master
+                            .warm_imports
+                            .insert(imports_csv.clone(), closure_pool_digest.clone());
                         master.cold_import_us = Some(rep.import_us);
                         let rss = measure_process_rss_mb(master.pid());
                         if rss > effective_rss_limit_mb {
@@ -7666,7 +7872,8 @@ fn eval_with_zygote_pool_attempt(
                         }
                         master.is_master = true;
                         let candidate = std::sync::Arc::new(ZygoteMasterEntry {
-                            pid: master.pid(), worker: std::sync::Mutex::new(master),
+                            pid: master.pid(),
+                            worker: std::sync::Mutex::new(master),
                             last_used_seq: std::sync::atomic::AtomicU64::new(0),
                         });
                         candidate.touch();
@@ -7717,7 +7924,10 @@ fn eval_with_zygote_pool_attempt(
             }
             if let Some(entry) = entry {
                 entry.touch();
-                let mut master = entry.worker.lock().map_err(|_| anyhow::anyhow!("Zygote master poisoned"))?;
+                let mut master = entry
+                    .worker
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Zygote master poisoned"))?;
                 if let Ok(mut worker) = master.fork_clone(deadline) {
                     mark_closure_snapshot_used(host_closure_digest);
                     worker.cold_import_us = master.cold_import_us.take();
@@ -7726,7 +7936,10 @@ fn eval_with_zygote_pool_attempt(
                 }
                 drop(master);
                 let mut map = masters.lock().unwrap_or_else(|e| e.into_inner());
-                if map.get(&pool_key).is_some_and(|e| std::sync::Arc::ptr_eq(e, &entry)) {
+                if map
+                    .get(&pool_key)
+                    .is_some_and(|e| std::sync::Arc::ptr_eq(e, &entry))
+                {
                     map.remove(&pool_key);
                 }
             }
@@ -9023,7 +9236,8 @@ pub(crate) fn unix_socket_path(path: &Path) -> Result<(PathBuf, Option<fs::File>
     {
         use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawFd};
         if path.as_os_str().as_bytes().len() >= 100 {
-            let dir = fs::OpenOptions::new().read(true)
+            let dir = fs::OpenOptions::new()
+                .read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
                 .open(path.parent().context("socket directory")?)?;
             let short = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
@@ -9064,12 +9278,22 @@ pub(crate) fn request_policy(
         .collect()
 }
 
-static LOCAL_DAEMON_SOCKETS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, PathBuf>>> = std::sync::OnceLock::new();
+static LOCAL_DAEMON_SOCKETS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
+> = std::sync::OnceLock::new();
 
 fn remember_daemon_socket(url: &str, state_file: &Path) {
     if let Some(parent) = state_file.parent() {
-        if !parent.file_name().is_some_and(|n| n.to_string_lossy().starts_with("zygote_daemon_cas_")) { return; }
-        LOCAL_DAEMON_SOCKETS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+        if !parent
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("zygote_daemon_cas_"))
+        {
+            return;
+        }
+        LOCAL_DAEMON_SOCKETS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(url.to_string(), parent.join("daemon.sock"));
     }
 }
@@ -9081,7 +9305,11 @@ impl LocalPayload {
         use std::os::unix::fs::OpenOptionsExt;
         let root = private_staging_child("transport")?;
         let path = root.join(format!("payload-{}-{}", std::process::id(), next_tmp_id()));
-        let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
         use std::io::Write;
         file.write_all(bytes)?;
         Ok(Self(path))
@@ -9093,11 +9321,28 @@ impl LocalPayload {
 
     pub(crate) fn read(tag: &str) -> Result<Vec<u8>> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        anyhow::ensure!(tag.starts_with("payload-") && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'), "Invalid local payload tag");
-        let path = crate::shm_cache::staging_shm_dir().join("transport").join(tag);
-        let file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path)?;
+        anyhow::ensure!(
+            tag.starts_with("payload-")
+                && tag
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+            "Invalid local payload tag"
+        );
+        let path = crate::shm_cache::staging_shm_dir()
+            .join("transport")
+            .join(tag);
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)?;
         let meta = file.metadata()?;
-        anyhow::ensure!(meta.is_file() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0 && meta.len() <= 64 * 1024 * 1024, "Invalid local payload file");
+        anyhow::ensure!(
+            meta.is_file()
+                && meta.uid() == unsafe { libc::geteuid() }
+                && meta.mode() & 0o077 == 0
+                && meta.len() <= 64 * 1024 * 1024,
+            "Invalid local payload file"
+        );
         use std::io::Read;
         let mut bytes = Vec::with_capacity(meta.len() as usize);
         file.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
@@ -9107,19 +9352,34 @@ impl LocalPayload {
 }
 
 impl Drop for LocalPayload {
-    fn drop(&mut self) { let _ = fs::remove_file(&self.0); }
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 fn http_request_with_timeout_and_token(
-    method: &str, url: &str, content_type: &str, body: &[u8], timeout: Option<u64>,
-    token: Option<&str>, on_inflight: impl FnOnce(),
+    method: &str,
+    url: &str,
+    content_type: &str,
+    body: &[u8],
+    timeout: Option<u64>,
+    token: Option<&str>,
+    on_inflight: impl FnOnce(),
 ) -> Result<Vec<u8>> {
     let socket = url
         .rsplit_once('/')
         .and_then(|(base, _)| LOCAL_DAEMON_SOCKETS.get()?.lock().ok()?.get(base).cloned());
     let Some(socket) = socket.filter(|p| p.exists()) else {
-        return crate::pack::http_request_with_timeout_and_token(method, url, content_type, body, timeout, token, on_inflight);
+        return crate::pack::http_request_with_timeout_and_token(
+            method,
+            url,
+            content_type,
+            body,
+            timeout,
+            token,
+            on_inflight,
+        );
     };
     use std::io::{BufRead, Read, Write};
     let (socket, _directory) = unix_socket_path(&socket)?;
@@ -9127,27 +9387,44 @@ fn http_request_with_timeout_and_token(
     let duration = Some(std::time::Duration::from_millis(timeout.unwrap_or(900_000)));
     stream.set_read_timeout(duration)?;
     stream.set_write_timeout(duration)?;
-    let payload = (body.len() >= 64 * 1024).then(|| LocalPayload::create(body)).transpose()?;
+    let payload = (body.len() >= 64 * 1024)
+        .then(|| LocalPayload::create(body))
+        .transpose()?;
     let wire_body = if payload.is_some() { &[][..] } else { body };
     let path = url.rsplit_once('/').context("Invalid local URL")?.1;
     write!(stream, "{method} /{path} HTTP/1.1\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Turbo-Token: {}\r\n", wire_body.len(), token.unwrap_or(""))?;
-    if let Some(payload) = &payload { write!(stream, "X-Turbo-Shm: {}\r\n", payload.tag())?; }
+    if let Some(payload) = &payload {
+        write!(stream, "X-Turbo-Shm: {}\r\n", payload.tag())?;
+    }
     stream.write_all(b"\r\n")?;
     on_inflight();
     stream.write_all(wire_body)?;
     let mut reader = std::io::BufReader::new(stream);
     let mut line = String::new();
     reader.read_line(&mut line)?;
-    let status: u16 = line.split_whitespace().nth(1).context("Missing local response status")?.parse()?;
+    let status: u16 = line
+        .split_whitespace()
+        .nth(1)
+        .context("Missing local response status")?
+        .parse()?;
     let mut len = 0usize;
     let mut shared = None;
     loop {
         line.clear();
-        anyhow::ensure!(reader.read_line(&mut line)? != 0, "Truncated local response");
-        if line.trim().is_empty() { break; }
+        anyhow::ensure!(
+            reader.read_line(&mut line)? != 0,
+            "Truncated local response"
+        );
+        if line.trim().is_empty() {
+            break;
+        }
         if let Some((key, value)) = line.split_once(':') {
-            if key.eq_ignore_ascii_case("content-length") { len = value.trim().parse()?; }
-            if key.eq_ignore_ascii_case("x-turbo-shm") { shared = Some(value.trim().to_string()); }
+            if key.eq_ignore_ascii_case("content-length") {
+                len = value.trim().parse()?;
+            }
+            if key.eq_ignore_ascii_case("x-turbo-shm") {
+                shared = Some(value.trim().to_string());
+            }
         }
     }
     anyhow::ensure!(len <= 64 * 1024 * 1024, "Local response too large");
@@ -9160,7 +9437,11 @@ fn http_request_with_timeout_and_token(
         reader.read_exact(&mut bytes)?;
         bytes
     };
-    anyhow::ensure!(status == 200, "HTTP request failed ({status}): {}", String::from_utf8_lossy(&bytes));
+    anyhow::ensure!(
+        status == 200,
+        "HTTP request failed ({status}): {}",
+        String::from_utf8_lossy(&bytes)
+    );
     Ok(bytes)
 }
 
@@ -9300,7 +9581,11 @@ fn current_exe_daemon_paths(store: &TurboStore) -> Option<(PathBuf, i64, i64, Pa
     exe_hasher.update(&exe_mtime_nsec.to_le_bytes());
     exe_hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
     exe_hasher.update(b":");
-    exe_hasher.update(std::env::var("ELAN_TOOLCHAIN").unwrap_or_else(|_| "leanprover/lean4:v4.35.0".into()).as_bytes());
+    exe_hasher.update(
+        std::env::var("ELAN_TOOLCHAIN")
+            .unwrap_or_else(|_| "leanprover/lean4:v4.35.0".into())
+            .as_bytes(),
+    );
     let exe_tag = &exe_hasher.finalize().to_hex()[..12];
     let name = format!("zygote_daemon_cas_{}", exe_tag);
     let daemon_cache_dir = private_staging_child(&name)
@@ -9328,7 +9613,13 @@ fn check_existing_daemon_state(
 ) -> Option<(String, String)> {
     let content = fs::read_to_string(path).ok()?;
     let info: LocalZygoteDaemonInfo = serde_json::from_str(&content).ok()?;
-    if !cfg!(test) && !path.parent()?.file_name()?.to_string_lossy().starts_with("zygote_daemon_cas_") {
+    if !cfg!(test)
+        && !path
+            .parent()?
+            .file_name()?
+            .to_string_lossy()
+            .starts_with("zygote_daemon_cas_")
+    {
         return None;
     }
     if info.policy != daemon_policy() {
@@ -9404,7 +9695,9 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
 
     if let Some(hit) = check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, true)
         .or_else(|| {
-            if env_vars.contains_key("TURBO_LEAN_REQUIRE_UNIX_DAEMON") { return None; }
+            if env_vars.contains_key("TURBO_LEAN_REQUIRE_UNIX_DAEMON") {
+                return None;
+            }
             check_existing_daemon_state(
                 &store.root.join("zygote_daemon.json"),
                 exe_mtime_sec,
@@ -9456,7 +9749,10 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
             cmd.env_remove(key);
             cmd.env_remove(format!("{key}_FROM_CONFIG"));
         }
-        cmd.env("TURBO_LEAN_DAEMON_SOCKET", daemon_cache_dir.join("daemon.sock"));
+        cmd.env(
+            "TURBO_LEAN_DAEMON_SOCKET",
+            daemon_cache_dir.join("daemon.sock"),
+        );
         #[cfg(unix)]
         if std::env::var("TURBO_LEAN_KEEP_PROCESS_GROUP").is_err() {
             use std::os::unix::process::CommandExt;
@@ -9556,7 +9852,9 @@ fn wait_for_mcp_transport_child(
 
 #[cfg(not(test))]
 pub(crate) fn forward_mcp_request(
-    req: &serde_json::Value, project_dir: Option<&Path>, cache_dir: Option<&Path>,
+    req: &serde_json::Value,
+    project_dir: Option<&Path>,
+    cache_dir: Option<&Path>,
 ) -> Result<serde_json::Value> {
     let store = TurboStore::open(cache_dir)?;
     let (_, sec, nsec, _, state_file) = current_exe_daemon_paths(&store).context("daemon paths")?;
@@ -9581,7 +9879,11 @@ pub(crate) fn forward_mcp_request(
             .join("daemon.sock"),
     )?;
     let absolute = |path: &Path| -> Result<PathBuf> {
-        Ok(if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) })
+        Ok(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(path)
+        })
     };
     let body = serde_json::to_vec(&serde_json::json!({
         "request": req,
@@ -10140,12 +10442,17 @@ pub fn try_local_zygote_eval_with_args(
         current_exe_daemon_paths(store)
             .and_then(|(_, exe_mtime_sec, exe_mtime_nsec, _, state_file)| {
                 #[cfg(test)]
-                if let Some(injected) = check_existing_daemon_state(&store.root.join("zygote_daemon.json"), exe_mtime_sec, exe_mtime_nsec, false) {
+                if let Some(injected) = check_existing_daemon_state(
+                    &store.root.join("zygote_daemon.json"),
+                    exe_mtime_sec,
+                    exe_mtime_nsec,
+                    false,
+                ) {
                     return Some(injected);
                 }
                 check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, false)
-        .or_else(|| {
-            check_existing_daemon_state(
+                    .or_else(|| {
+                        check_existing_daemon_state(
                             &store.root.join("zygote_daemon.json"),
                             exe_mtime_sec,
                             exe_mtime_nsec,
@@ -10157,7 +10464,10 @@ pub fn try_local_zygote_eval_with_args(
     };
 
     let Some((base_url, auth_token)) = existing_daemon else {
-        anyhow::ensure!(cfg!(test) || daemon_disabled(), "Shared daemon startup failed; set TURBO_LEAN_NO_DAEMON=1 for in-process execution");
+        anyhow::ensure!(
+            cfg!(test) || daemon_disabled(),
+            "Shared daemon startup failed; set TURBO_LEAN_NO_DAEMON=1 for in-process execution"
+        );
         let (rep, executed_binding, executed_identity) = eval_with_resolved_context_opts_with_args(
             store,
             effective_tc,
@@ -10541,7 +10851,10 @@ mod tests {
         }
         INBOUND_POLICY.with(|p| *p.borrow_mut() = None);
         for (key, value) in saved {
-            match value { Some(value) => std::env::set_var(key, value), None => std::env::remove_var(key) }
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
         }
     }
 
@@ -10691,7 +11004,8 @@ mod tests {
     fn long_unix_socket_paths_roundtrip() -> Result<()> {
         use std::io::{Read, Write};
         let dir = private_temp_subdir("long-socket-test").context("private directory")?;
-        let nested = dir.join("nested-directory-name-that-exceeds-the-unix-socket-address-limit".repeat(2));
+        let nested =
+            dir.join("nested-directory-name-that-exceeds-the-unix-socket-address-limit".repeat(2));
         fs::create_dir(&nested)?;
         let path = nested.join("daemon.sock");
         let (short, _dir) = unix_socket_path(&path)?;
@@ -10714,7 +11028,11 @@ mod tests {
         let socket = dir.join(format!("{}.sock", std::process::id()));
         let listener = std::os::unix::net::UnixListener::bind(&socket)?;
         let url = format!("http://transport-test-{}", next_tmp_id());
-        LOCAL_DAEMON_SOCKETS.get_or_init(Default::default).lock().unwrap().insert(url.clone(), socket);
+        LOCAL_DAEMON_SOCKETS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(url.clone(), socket);
         let bytes = vec![b'x'; 2 * 1024 * 1024];
         let expected = bytes.clone();
         let server = std::thread::spawn(move || -> Result<()> {
@@ -10725,29 +11043,55 @@ mod tests {
             loop {
                 line.clear();
                 reader.read_line(&mut line)?;
-                if line.trim().is_empty() { break; }
-                if let Some(value) = line.strip_prefix("X-Turbo-Shm: ") { tag = Some(value.trim().to_string()); }
+                if line.trim().is_empty() {
+                    break;
+                }
+                if let Some(value) = line.strip_prefix("X-Turbo-Shm: ") {
+                    tag = Some(value.trim().to_string());
+                }
             }
-            assert_eq!(LocalPayload::read(tag.as_deref().context("missing shared frame")?)?, expected);
+            assert_eq!(
+                LocalPayload::read(tag.as_deref().context("missing shared frame")?)?,
+                expected
+            );
             let payload = LocalPayload::create(&expected)?;
-            write!(reader.get_mut(), "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Turbo-Shm: {}\r\n\r\n", payload.tag())?;
+            write!(
+                reader.get_mut(),
+                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Turbo-Shm: {}\r\n\r\n",
+                payload.tag()
+            )?;
             let mut ack = [0];
             reader.read_exact(&mut ack)?;
             assert_eq!(ack, [1]);
             Ok(())
         });
         let start = std::time::Instant::now();
-        let reply = http_request_with_timeout_and_token("POST", &format!("{url}/eval"), "application/json", &bytes, Some(5000), Some("test"), || {})?;
+        let reply = http_request_with_timeout_and_token(
+            "POST",
+            &format!("{url}/eval"),
+            "application/json",
+            &bytes,
+            Some(5000),
+            Some("test"),
+            || {},
+        )?;
         assert_eq!(reply, bytes);
         server.join().unwrap()?;
-        eprintln!("shared framing roundtrip: {} bytes each direction in {} us", bytes.len(), start.elapsed().as_micros());
+        eprintln!(
+            "shared framing roundtrip: {} bytes each direction in {} us",
+            bytes.len(),
+            start.elapsed().as_micros()
+        );
         fs::remove_dir_all(dir)?;
         Ok(())
     }
 
     #[test]
     fn request_policy_is_canonical_and_covers_all_tags() {
-        let mut env: std::collections::HashMap<String, String> = REQUEST_POLICY_KEYS.into_iter().map(|k| (k.into(), String::new())).collect();
+        let mut env: std::collections::HashMap<String, String> = REQUEST_POLICY_KEYS
+            .into_iter()
+            .map(|k| (k.into(), String::new()))
+            .collect();
         for key in REQUEST_POLICY_KEYS {
             env.insert(key.into(), " b,a,b ".into());
             assert_eq!(request_policy(&env)[key], "a,b");
@@ -10761,13 +11105,19 @@ mod tests {
         let dir = private_temp_subdir("policy-identity-test").context("private directory")?;
         let store = TurboStore::open(Some(&dir))?;
         let daemon = current_exe_daemon_paths(&store).context("daemon paths")?.4;
-        let mut env: std::collections::HashMap<String, String> = REQUEST_POLICY_KEYS.into_iter().map(|k| (k.into(), String::new())).collect();
+        let mut env: std::collections::HashMap<String, String> = REQUEST_POLICY_KEYS
+            .into_iter()
+            .map(|k| (k.into(), String::new()))
+            .collect();
         let lean_bin = Path::new("/nonexistent-policy-test-lean");
         let base = resolve_zygote_context("policy-test", "", &env, lean_bin, "");
         for key in REQUEST_POLICY_KEYS {
             env.insert(key.into(), "Policy.permitted".into());
             let changed = resolve_zygote_context("policy-test", "", &env, lean_bin, "");
-            assert_ne!(base.closure_pool_digest, changed.closure_pool_digest, "{key}");
+            assert_ne!(
+                base.closure_pool_digest, changed.closure_pool_digest,
+                "{key}"
+            );
             assert_ne!(base.identity, changed.identity, "{key}");
             assert_eq!(daemon, current_exe_daemon_paths(&store).unwrap().4);
             env.insert(key.into(), String::new());
@@ -16659,29 +17009,54 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
     #[test]
     #[cfg(target_os = "linux")]
     fn test_zygote_master_eviction_preserves_checked_out_clone() {
-        let (dir, store, mut env, lean) = open_test_zygote_env("master_eviction").expect("Lean toolchain");
-        fs::write(dir.join("EvictionSeed.olean"), compile_test_olean(&lean, &dir,
-            "EvictionSeed", "def evictionSeed : Nat := 7\n")).unwrap();
+        let (dir, store, mut env, lean) =
+            open_test_zygote_env("master_eviction").expect("Lean toolchain");
+        fs::write(
+            dir.join("EvictionSeed.olean"),
+            compile_test_olean(&lean, &dir, "EvictionSeed", "def evictionSeed : Nat := 7\n"),
+        )
+        .unwrap();
         env.insert("LEAN_PATH".into(), dir.to_string_lossy().into_owned());
         let pid = std::rc::Rc::new(std::cell::Cell::new(0));
         let seen = pid.clone();
         digest_test_hooks::set("cloned_worker_request", move || {
             let mut masters = ZYGOTE_MASTERS.get().unwrap().lock().unwrap();
-            let key = masters.iter().find(|(_, e)| e.worker.lock().unwrap()
-                .warm_imports.contains_key("EvictionSeed")).unwrap().0.clone();
+            let key = masters
+                .iter()
+                .find(|(_, e)| {
+                    e.worker
+                        .lock()
+                        .unwrap()
+                        .warm_imports
+                        .contains_key("EvictionSeed")
+                })
+                .unwrap()
+                .0
+                .clone();
             let entry = masters.remove(&key).unwrap();
             seen.set(entry.pid);
-            let registry: Vec<ZygoteLruEntry> = serde_json::from_slice(&fs::read(
-                crate::shm_cache::staging_shm_dir().join("zygote_lru_registry.json")).unwrap()).unwrap();
+            let registry: Vec<ZygoteLruEntry> = serde_json::from_slice(
+                &fs::read(crate::shm_cache::staging_shm_dir().join("zygote_lru_registry.json"))
+                    .unwrap(),
+            )
+            .unwrap();
             assert!(registry.iter().any(|e| e.pid == entry.pid && e.rss_mb > 0));
             drop(masters);
             drop(entry);
             assert!(Path::new(&format!("/proc/{}", seen.get())).exists());
         });
-        let reply = eval_with_zygote_pool_for_targets(&store, "leanprover/lean4:v4.35.0",
-            &env["LEAN_PATH"], &env, &lean,
+        let reply = eval_with_zygote_pool_for_targets(
+            &store,
+            "leanprover/lean4:v4.35.0",
+            &env["LEAN_PATH"],
+            &env,
+            &lean,
             "import EvictionSeed\ntheorem eviction_ok : evictionSeed = 7 := rfl\n",
-            &["eviction_ok".into()], None, &[]).unwrap();
+            &["eviction_ok".into()],
+            None,
+            &[],
+        )
+        .unwrap();
         digest_test_hooks::clear();
         assert!(reply.ok, "{:?}", reply.errors);
         assert_ne!(pid.get(), 0, "must evaluate a checked-out clone");
@@ -16690,15 +17065,24 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
         for workers in pool.values_mut() {
             let mut i = 0;
             while i < workers.len() {
-                if workers[i]._master.as_ref().is_some_and(|e| e.pid == pid.get()) {
+                if workers[i]
+                    ._master
+                    .as_ref()
+                    .is_some_and(|e| e.pid == pid.get())
+                {
                     retired.push(workers.swap_remove(i));
-                } else { i += 1; }
+                } else {
+                    i += 1;
+                }
             }
         }
         drop(pool);
         assert!(Path::new(&format!("/proc/{}", pid.get())).exists());
         drop(retired);
-        assert!(!Path::new(&format!("/proc/{}", pid.get())).exists(), "last clone must reap master");
+        assert!(
+            !Path::new(&format!("/proc/{}", pid.get())).exists(),
+            "last clone must reap master"
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -16706,31 +17090,63 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
     #[cfg(target_os = "linux")]
     fn test_zygote_master_rss_cap() {
         if std::env::var_os("TURBO_LEAN_TEST_MASTER_RSS_CHILD").is_none() {
-            let staging = std::env::temp_dir().join(format!("turbo-master-rss-staging-{}", std::process::id()));
+            let staging = std::env::temp_dir()
+                .join(format!("turbo-master-rss-staging-{}", std::process::id()));
             let output = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "zygote::tests::test_zygote_master_rss_cap", "--nocapture"])
+                .args([
+                    "--exact",
+                    "zygote::tests::test_zygote_master_rss_cap",
+                    "--nocapture",
+                ])
                 .env("TURBO_LEAN_TEST_MASTER_RSS_CHILD", "1")
                 .env("TURBO_LEAN_WORKER_RSS_LIMIT_MB", "1")
                 .env("TURBO_LEAN_STAGING_DIR", &staging)
-                .output().unwrap();
+                .output()
+                .unwrap();
             let _ = fs::remove_dir_all(staging);
-            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         }
-        let (dir, store, mut env, lean) = open_test_zygote_env("master_rss_cap").expect("Lean toolchain");
+        let (dir, store, mut env, lean) =
+            open_test_zygote_env("master_rss_cap").expect("Lean toolchain");
         crate::shm_cache::ensure_verified_private_staging_dir(None).expect("private staging");
-        fs::write(dir.join("RssSeed.olean"), compile_test_olean(&lean, &dir,
-            "RssSeed", "def rssSeed : Nat := 7\n")).unwrap();
+        fs::write(
+            dir.join("RssSeed.olean"),
+            compile_test_olean(&lean, &dir, "RssSeed", "def rssSeed : Nat := 7\n"),
+        )
+        .unwrap();
         env.insert("LEAN_PATH".into(), dir.to_string_lossy().into_owned());
-        let reply = eval_with_zygote_pool_for_targets(&store, "leanprover/lean4:v4.35.0",
-            &env["LEAN_PATH"], &env, &lean,
+        let reply = eval_with_zygote_pool_for_targets(
+            &store,
+            "leanprover/lean4:v4.35.0",
+            &env["LEAN_PATH"],
+            &env,
+            &lean,
             "import RssSeed\ntheorem rss_ok : rssSeed = 7 := rfl\n",
-            &["rss_ok".into()], None, &[]).unwrap();
+            &["rss_ok".into()],
+            None,
+            &[],
+        )
+        .unwrap();
         assert!(reply.ok, "{:?}", reply.errors);
-        assert!(ZYGOTE_MASTERS.get().unwrap().lock().unwrap().is_empty(), "oversized master must not be pinned");
+        assert!(
+            ZYGOTE_MASTERS.get().unwrap().lock().unwrap().is_empty(),
+            "oversized master must not be pinned"
+        );
         use std::os::unix::fs::PermissionsExt;
-        assert_eq!(fs::metadata(crate::shm_cache::staging_shm_dir()).unwrap()
-            .permissions().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(crate::shm_cache::staging_shm_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -16738,35 +17154,96 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
     fn test_zygote_cow_fork_concurrent_pool_miss() {
         if std::env::var_os("TURBO_LEAN_TEST_POOL_TEARDOWN").is_none() {
             let output = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "zygote::tests::test_zygote_cow_fork_concurrent_pool_miss"])
-                .env("TURBO_LEAN_TEST_POOL_TEARDOWN", "1").output().unwrap();
-            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+                .args([
+                    "--exact",
+                    "zygote::tests::test_zygote_cow_fork_concurrent_pool_miss",
+                ])
+                .env("TURBO_LEAN_TEST_POOL_TEARDOWN", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         }
-        let (dir, _store, mut env, lean) = open_test_zygote_env("clone_pool").expect("Lean toolchain");
-        fs::write(dir.join("ClonePool.olean"), compile_test_olean(&lean, &dir, "ClonePool", "def cloneSeed : Nat := 7\n")).unwrap();
+        let (dir, _store, mut env, lean) =
+            open_test_zygote_env("clone_pool").expect("Lean toolchain");
+        fs::write(
+            dir.join("ClonePool.olean"),
+            compile_test_olean(&lean, &dir, "ClonePool", "def cloneSeed : Nat := 7\n"),
+        )
+        .unwrap();
         env.insert("LEAN_PATH".into(), dir.to_string_lossy().into_owned());
-        eval_with_zygote_pool_for_targets(&_store, "leanprover/lean4:v4.35.0", &dir.to_string_lossy(), &env, &lean, "import ClonePool\ntheorem clone_warm : True := trivial\n", &["clone_warm".into()], None, &[]).unwrap();
+        eval_with_zygote_pool_for_targets(
+            &_store,
+            "leanprover/lean4:v4.35.0",
+            &dir.to_string_lossy(),
+            &env,
+            &lean,
+            "import ClonePool\ntheorem clone_warm : True := trivial\n",
+            &["clone_warm".into()],
+            None,
+            &[],
+        )
+        .unwrap();
         std::thread::scope(|s| {
-            let handles: Vec<_> = (0..4).map(|i| {
-                let (env, lean) = (&env, &lean);
-                s.spawn(move || {
-                    let (_dir, store, _, _) = open_test_zygote_env(&format!("clone_thread_{i}")).unwrap();
-                    let cloned = std::rc::Rc::new(std::cell::Cell::new(false));
-                    let seen = cloned.clone();
-                    digest_test_hooks::set("cloned_worker_request", move || seen.set(true));
-                    let code = format!("import ClonePool\ntheorem clone_pool_{i} : cloneSeed = 7 := rfl\n");
-                    let r = eval_with_zygote_pool_for_targets(&store, "leanprover/lean4:v4.35.0", &env["LEAN_PATH"], env, lean, &code, &[format!("clone_pool_{i}")], None, &[]).unwrap();
-                    assert!(r.ok && r.kernel_gate_active, "{:?}", r.errors);
-                    assert!(r.env_cache_hit, "clone must inherit the imported environment");
-                    assert_eq!(r.import_us, 0);
-                    assert!(cloned.get(), "request must execute in a fork clone");
-                    let bad = code.replace("rfl", "by sorry");
-                    assert!(!eval_with_zygote_pool_for_targets(&store, "leanprover/lean4:v4.35.0", &env["LEAN_PATH"], env, lean, &bad, &[format!("clone_pool_{i}")], None, &[]).unwrap().ok);
-                    digest_test_hooks::clear();
+            let handles: Vec<_> = (0..4)
+                .map(|i| {
+                    let (env, lean) = (&env, &lean);
+                    s.spawn(move || {
+                        let (_dir, store, _, _) =
+                            open_test_zygote_env(&format!("clone_thread_{i}")).unwrap();
+                        let cloned = std::rc::Rc::new(std::cell::Cell::new(false));
+                        let seen = cloned.clone();
+                        digest_test_hooks::set("cloned_worker_request", move || seen.set(true));
+                        let code = format!(
+                            "import ClonePool\ntheorem clone_pool_{i} : cloneSeed = 7 := rfl\n"
+                        );
+                        let r = eval_with_zygote_pool_for_targets(
+                            &store,
+                            "leanprover/lean4:v4.35.0",
+                            &env["LEAN_PATH"],
+                            env,
+                            lean,
+                            &code,
+                            &[format!("clone_pool_{i}")],
+                            None,
+                            &[],
+                        )
+                        .unwrap();
+                        assert!(r.ok && r.kernel_gate_active, "{:?}", r.errors);
+                        assert!(
+                            r.env_cache_hit,
+                            "clone must inherit the imported environment"
+                        );
+                        assert_eq!(r.import_us, 0);
+                        assert!(cloned.get(), "request must execute in a fork clone");
+                        let bad = code.replace("rfl", "by sorry");
+                        assert!(
+                            !eval_with_zygote_pool_for_targets(
+                                &store,
+                                "leanprover/lean4:v4.35.0",
+                                &env["LEAN_PATH"],
+                                env,
+                                lean,
+                                &bad,
+                                &[format!("clone_pool_{i}")],
+                                None,
+                                &[]
+                            )
+                            .unwrap()
+                            .ok
+                        );
+                        digest_test_hooks::clear();
+                    })
                 })
-            }).collect();
-            for h in handles { h.join().unwrap(); }
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
         });
         #[cfg(target_os = "linux")]
         {
@@ -16774,13 +17251,24 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
             assert!(!masters.is_empty(), "test must exercise a live master");
             let mut pids: Vec<_> = masters.values().map(|w| w.pid).collect();
             drop(masters);
-            pids.extend(ZYGOTE_POOL.get().unwrap().lock().unwrap().values()
-                .flatten().map(|w| w.pid()));
+            pids.extend(
+                ZYGOTE_POOL
+                    .get()
+                    .unwrap()
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .flatten()
+                    .map(|w| w.pid()),
+            );
             clear_zygote_pool();
             assert!(ZYGOTE_MASTERS.get().unwrap().lock().unwrap().is_empty());
             assert!(ZYGOTE_POOL.get().unwrap().lock().unwrap().is_empty());
             for pid in pids {
-                assert!(!Path::new(&format!("/proc/{pid}")).exists(), "worker {pid} must be killed and reaped");
+                assert!(
+                    !Path::new(&format!("/proc/{pid}")).exists(),
+                    "worker {pid} must be killed and reaped"
+                );
             }
         }
         let _ = fs::remove_dir_all(dir);
@@ -16815,7 +17303,10 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
             (rep.errors.clone(), rep.stderr_tail.clone())
         );
         assert_eq!(rep.winning_candidate_idx, Some(2));
-        assert!(rep.compact_prefix, "prefix compaction must succeed at runtime: {rep:?}");
+        assert!(
+            rep.compact_prefix,
+            "prefix compaction must succeed at runtime: {rep:?}"
+        );
         assert!(!rep.used_sorry && rep.sorry_decls.is_empty());
 
         for prefix in [

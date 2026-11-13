@@ -5056,8 +5056,12 @@ pub(crate) fn nonlocal_edits(files: &[PathBuf], rev: &str) -> Vec<String> {
         if !has_git_ancestor_or_env(parent) {
             return false;
         }
-        let Ok(mut git) = crate::trusted_tools::git(parent) else {
-            return true; // A missing trusted Git inside a repository must invalidate reuse.
+        let mut git = match crate::trusted_tools::git(parent) {
+            Ok(git) => git,
+            Err(err) => {
+                crate::trusted_tools::warn_git_locality_disabled(parent, &err);
+                return true; // A missing trusted Git inside a repository must invalidate reuse.
+            }
         };
         let base = git
             .arg("-C")

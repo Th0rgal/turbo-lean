@@ -164,3 +164,59 @@ See [`sdk/accelerator-template/`](sdk/accelerator-template/README.md) for the ze
 - [`crates/turbo-lean/`](crates/turbo-lean/) — Rust CLI, MCP server, DAG module scheduler, `bwrap` sandboxed PR verifier, CAS/Zygote orchestrator, and C-ABI bridge.
 - [`sdk/accelerator-template/`](sdk/accelerator-template/README.md) & [`plugins/`](plugins/) — Zero-TCB JSONL-stdio accelerator & `LNIR` superoptimizer starter kit, offline validator (`validate.py`), and domain plugin examples.
 - [`roadmap/`](roadmap/README.md) — North-Star goals ([`GOALS.md`](roadmap/GOALS.md)), open contributor challenges ([`OPEN_CHALLENGES.md`](roadmap/OPEN_CHALLENGES.md)), cheat-proof theorem contracts ([`VALIDATION_CONTRACTS.md`](roadmap/VALIDATION_CONTRACTS.md)), 3-way differential conformance ([`CONFORMANCE_SUITE.md`](roadmap/CONFORMANCE_SUITE.md)), and Maxwell oracle pointer ([`MAXWELL_STRATEGIES.md`](roadmap/MAXWELL_STRATEGIES.md)).
+# Check wallclock benchmark
+
+`check --json` reports process-entry `wall_ms` alongside the existing check-local
+`elapsed_ms`, plus `phases` (`hygiene_ms`, `import_refresh_ms`, `identity_ms`,
+`cache_ms`, `elab_ms`, `kernel_ms`). Startup and lock overhead is included in wall
+time but is not attributed to a verification phase. Worker-reported elaboration
+time is used where available; combined audited subprocess work is kernel time.
+
+Run the reproducible harness with prebuilt Lean v4.35.0 projects:
+
+```sh
+cargo build --release -p turbo-lean
+python3 scripts/bench_check_wallclock.py --json-out bench_wallclock_results.json
+```
+
+Override `--binary`, `--batteries-dir`, or `--pfr-dir` for other checkout locations.
+Cold means an empty turbo store with warm Lake artifacts and OS page cache. Proof
+edits insert a no-op tactic into a proof and restore the original bytes. The
+script preserves errors in JSON and exits nonzero on errors or unmet latency
+goals. `List.length_append` is not declared in Batteries' `Basic.lean` at this
+revision; the declaration case uses `List.headD_eq_head?` instead.
+
+## Measured fixture limitations (16 vCPU, 32 GiB warm VM)
+
+The November 13, 2026 run did **not** establish the `<100 ms` warm-cache or
+`<500 ms` warm-edit targets. The following are external process durations to
+failure, not successful verification latency:
+
+| Input | Cold ms | Warm attempt ms | Proof-edit attempt ms | Result |
+|---|---:|---:|---:|---|
+| Batteries Basic, `List.headD_eq_head?` | 106.2 | 17.6 | 16.9 | Root `csimp` policy rejection |
+| Batteries Basic, full file | 4.9 | 2.4 | 3.4 | Root `csimp` policy rejection |
+| Batteries Lemmas, full file | 17814.1 | 3903.1 | 3893.3 | Root imported Basic `csimp` policy rejection |
+| PFR IdentDistrib, full file | 1437.4 | 612.6 | 600.1 | Missing Mathlib IdentDistrib `.olean` |
+
+Batteries is the root package in the first three cases, so it intentionally
+retains full root-module policy. The concurrent harness instead uses Batteries
+as an imported dependency of a temporary root package, exercising import audit
+and the persistent Zygote pool. Independent replay remains mandatory before an
+import-audit stamp: untrusted Lake traces and manifests alone cannot establish
+that dependency artifacts are well typed.
+
+| work_units | error_count | total_pss_mb | wall_p50_ms | wall_p95_ms |
+|---:|---:|---:|---:|---:|
+| 8 | 4 | 1124.69 | 10012.20 | 10523.64 |
+
+Failures reported stale imports after concurrent Lake refreshes. These figures
+include failed work and are **not** a successful eight-agent scaling result.
+PSS is the peak summed Linux proportional set size of turbo/zygote processes
+on the VM, with each PID counted once. Percentiles use external process wall
+time (nearest-rank p95), including failures. One successful concurrent check
+reported the following phase sample (milliseconds):
+
+| wall | elapsed | hygiene | import refresh | identity | cache | elaboration | kernel |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 10414 | 10412 | 3 | 9772 | 612 | 0 | 2 | 23 |

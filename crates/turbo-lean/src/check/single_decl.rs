@@ -23,7 +23,7 @@ use super::remote::emit_remote_decl_result;
 #[cfg(test)]
 mod regression_tests {
     use super::*;
-    use crate::check::{PrivateScratchDir, verified_private_temp_scratch_base};
+    use crate::check::{verified_private_temp_scratch_base, PrivateScratchDir};
     use crate::splitter::split_lean_source;
     use std::process::Command;
 
@@ -222,19 +222,15 @@ mod regression_tests {
                 "{source}: {tokens:?}"
             );
         }
-        assert!(
-            cone_extract_ident_tokens("«hidden helper»").contains(&"hidden helper".to_string())
-        );
+        assert!(cone_extract_ident_tokens("«hidden helper»").contains(&"hidden helper".to_string()));
         for source in [
             r##""hiddenHelper""##,
             r##"r#"hiddenHelper"#"##,
             r##"s!"hiddenHelper""##,
         ] {
-            assert!(
-                !cone_extract_ident_tokens(source)
-                    .iter()
-                    .any(|name| name == "hiddenHelper")
-            );
+            assert!(!cone_extract_ident_tokens(source)
+                .iter()
+                .any(|name| name == "hiddenHelper"));
         }
     }
 
@@ -1103,18 +1099,14 @@ theorem good : Witness.value = 7 := rfl
             true,
             None,
         )?;
-        assert!(
-            scratch
-                .path
-                .join(".lake/build/lib/lean/P/Good.olean")
-                .is_file()
-        );
-        assert!(
-            !scratch
-                .path
-                .join(".lake/build/lib/lean/P/Wip.olean")
-                .exists()
-        );
+        assert!(scratch
+            .path
+            .join(".lake/build/lib/lean/P/Good.olean")
+            .is_file());
+        assert!(!scratch
+            .path
+            .join(".lake/build/lib/lean/P/Wip.olean")
+            .exists());
         scratch.remove()?;
         Ok(())
     }
@@ -1246,14 +1238,12 @@ theorem good : Witness.value = 7 := rfl
                 "fixture",
             ],
         ] {
-            assert!(
-                std::process::Command::new("git")
-                    .args(args)
-                    .current_dir(&dir)
-                    .output()?
-                    .status
-                    .success()
-            );
+            assert!(std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()?
+                .status
+                .success());
         }
         for sibling in [
             "theorem bad : False := sorry",
@@ -1308,11 +1298,9 @@ theorem good : Witness.value = 7 := rfl
                             .unwrap();
                         let key =
                             compute_shard_key_with_args("leanprover/lean4:v4.35.0", target, &[]);
-                        assert!(
-                            store
-                                .batch_get_theorem_shards(&[key], "trusted")?
-                                .is_empty()
-                        );
+                        assert!(store
+                            .batch_get_theorem_shards(&[key], "trusted")?
+                            .is_empty());
                     }
                 }
             }
@@ -3589,6 +3577,7 @@ pub(super) fn check_single_decl(
     allow_sorry: bool,
 ) -> Result<serde_json::Value> {
     let active_file = resolved_file.to_path_buf();
+    let hygiene_start = Instant::now();
     let mut active_src = recover_decl_source(src, &active_file)?;
 
     let shard_idx =
@@ -3653,6 +3642,8 @@ pub(super) fn check_single_decl(
     if active_src.is_empty() {
         active_src = fs::read_to_string(&active_file)?;
     }
+    super::record_phase("hygiene", hygiene_start);
+    let identity_start = Instant::now();
     let attested = confirm_decl_identity_with_budget(
         &active_src,
         shard,
@@ -3661,6 +3652,8 @@ pub(super) fn check_single_decl(
         false,
         Some(*t0),
     )?;
+    super::record_phase("identity", identity_start);
+    let cache_start = Instant::now();
     let expected_type_pair = [(
         attested.decl_name.clone(),
         attested.kernel_type_hash.clone(),
@@ -3706,6 +3699,8 @@ pub(super) fn check_single_decl(
         });
         insert_allow_sorry_fields(&mut hit_json, allow_sorry, false, &[]);
         kernel_prov.insert_json_fields(&mut hit_json);
+        super::record_phase("cache", cache_start);
+        super::insert_check_timings(&mut hit_json, *t0);
         hit_json
     };
 
@@ -3732,8 +3727,10 @@ pub(super) fn check_single_decl(
                     println!("{}", serde_json::to_string_pretty(&out_json)?);
                 } else {
                     println!(
-                        "[turbo-lean] SHARD CACHE HIT `{}` (coalesced=false, {} ms)",
-                        target_decl, elapsed_ms
+                        "[turbo-lean] SHARD CACHE HIT `{}` (coalesced=false, {} ms, wall={} ms)",
+                        target_decl,
+                        elapsed_ms,
+                        super::process_wall_ms(*t0)
                     );
                 }
             }
@@ -3741,6 +3738,7 @@ pub(super) fn check_single_decl(
         }
         let (env_vars, _) = resolve_lake_env(store, canon_dir)?;
         let lean_bin = resolve_lean_bin(canon_dir)?;
+        let kernel_start = Instant::now();
         let (output, report) = crate::zygote::run_audited_lean_shard_at_with_full_report(
             &store.root,
             &store.fast_staging_dir(),
@@ -3756,6 +3754,7 @@ pub(super) fn check_single_decl(
             &file_lean_args,
             Some(crate::zygote::remaining_timeout_ms(None, *t0)),
         )?;
+        super::record_phase("kernel", kernel_start);
         anyhow::ensure!(
             output.status.success() && !report.used_sorry && report.sorry_decls.is_empty(),
             "Soundness audit failed for `{target_decl}`: {}{}",
@@ -3840,6 +3839,7 @@ pub(super) fn check_single_decl(
         });
         insert_allow_sorry_fields(&mut result, false, false, &[]);
         kernel_prov.insert_json_fields(&mut result);
+        super::insert_check_timings(&mut result, *t0);
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -3873,8 +3873,10 @@ pub(super) fn check_single_decl(
                     println!("{}", serde_json::to_string_pretty(&out_json)?);
                 } else {
                     println!(
-                        "[turbo-lean] SHARD CACHE HIT `{}` (coalesced=false, {} ms)",
-                        target_decl, elapsed_ms
+                        "[turbo-lean] SHARD CACHE HIT `{}` (coalesced=false, {} ms, wall={} ms)",
+                        target_decl,
+                        elapsed_ms,
+                        super::process_wall_ms(*t0)
                     );
                 }
             }
@@ -4138,6 +4140,7 @@ pub(super) fn check_single_decl(
             "elapsed_ms": dur_ms
         });
         kernel_prov.insert_json_fields(&mut out_json);
+        super::insert_check_timings(&mut out_json, *t0);
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -4187,8 +4190,8 @@ pub(super) fn check_single_decl(
                         println!("{}", serde_json::to_string_pretty(&out_json)?);
                     } else {
                         println!(
-                            "[turbo-lean] SHARD CACHE HIT `{}` (coalesced=false, {} ms)",
-                            target_decl, elapsed_ms
+                            "[turbo-lean] SHARD CACHE HIT `{}` (coalesced=false, {} ms, wall={} ms)",
+                            target_decl, elapsed_ms, super::process_wall_ms(*t0)
                         );
                     }
                 }
@@ -4429,6 +4432,7 @@ pub(super) fn check_single_decl(
                 &shard.prefix_env_hash,
                 split.shards.len(),
                 dur_ms,
+                *t0,
             )?;
             return Ok(out_json);
         }
@@ -4455,8 +4459,10 @@ pub(super) fn check_single_decl(
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
             } else {
                 println!(
-                    "[turbo-lean] SHARD CACHE HIT `{}` (coalesced=false, {} ms)",
-                    target_decl, elapsed_ms
+                    "[turbo-lean] SHARD CACHE HIT `{}` (coalesced=false, {} ms, wall={} ms)",
+                    target_decl,
+                    elapsed_ms,
+                    super::process_wall_ms(*t0)
                 );
             }
         }
@@ -4490,14 +4496,19 @@ pub(super) fn check_single_decl(
                     println!("{}", serde_json::to_string_pretty(&out_json)?);
                 } else {
                     println!(
-                        "[turbo-lean] SHARD CACHE HIT `{}` (coalesced={}, {} ms)",
-                        target_decl, coalesced, elapsed_ms
+                        "[turbo-lean] SHARD CACHE HIT `{}` (coalesced={}, {} ms, wall={} ms)",
+                        target_decl,
+                        coalesced,
+                        elapsed_ms,
+                        super::process_wall_ms(*t0)
                     );
                 }
             }
             Ok(out_json)
         }
         SingleflightOutcome::Leader(lease) => {
+            super::record_phase("cache", cache_start);
+            let verification_start = Instant::now();
             let same_as_initial = active_file == resolved_file;
             let canon_file = if same_as_initial {
                 canon_resolved_initial.to_path_buf()
@@ -5493,6 +5504,7 @@ pub(super) fn check_single_decl(
                 }
             }
 
+            super::record_phase("kernel", verification_start);
             let dur_ms = t0.elapsed().as_millis() as i64;
             let distilled_non_core: Vec<String> = used_constants
                 .iter()
@@ -5577,6 +5589,7 @@ pub(super) fn check_single_decl(
             }
             insert_allow_sorry_fields(&mut out_json, allow_sorry, false, &[]);
             kernel_prov.insert_json_fields(&mut out_json);
+            super::insert_check_timings(&mut out_json, *t0);
             if inflight_tx_open {
                 store.commit_inflight_publish_for_lease(&lease.action_key)?;
             } else {
@@ -5638,7 +5651,7 @@ pub(super) fn check_single_decl(
                     println!("{}", serde_json::to_string_pretty(&out_json)?);
                 } else {
                     println!(
-                        "[turbo-lean] SHARD VERIFIED `{}` ({}/{} shards in file, env_cache_hit={}, fast_olean={}, zygote={}, interface_hash={}.., {} ms)",
+                        "[turbo-lean] SHARD VERIFIED `{}` ({}/{} shards in file, env_cache_hit={}, fast_olean={}, zygote={}, interface_hash={}.., {} ms, wall={} ms)",
                         target_decl,
                         1,
                         split.shards.len(),
@@ -5646,7 +5659,8 @@ pub(super) fn check_single_decl(
                         verified_via_fast_olean,
                         verified_via_zygote,
                         &split.interface_hash[..12],
-                        dur_ms
+                        dur_ms,
+                        super::process_wall_ms(*t0)
                     );
                 }
             }

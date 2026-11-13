@@ -17925,6 +17925,39 @@ impl ReplayLookupBatchCache {
         self.is_audited_in_store_with_binds_policy(store, cfg, mod_name, olean_path, binds_policy)
     }
 
+    pub(crate) fn is_import_audited_in_store(
+        &mut self,
+        store: &TurboStore,
+        cfg: &ProjectConfig,
+        mod_name: &str,
+        olean_path: &Path,
+    ) -> bool {
+        if cfg.lean_githash.is_empty() || !self.store_outside_disallowed {
+            return false;
+        }
+        self.refresh_replay_hmac_key(store);
+        let Some(key) = self.replay_hmac_key else {
+            return false;
+        };
+        let Ok(dig) = compute_replayed_olean_ilean_digest(olean_path) else {
+            return false;
+        };
+        let Ok((_, env_dig)) = self.compute_env_digest_and_root(cfg, olean_path, false) else {
+            return false;
+        };
+        store.has_kernel_audited_olean_with_key(
+            &key,
+            &dig,
+            &env_dig,
+            crate::zygote::ZYGOTE_REPLAY_VERSION,
+            &cfg.lean_githash,
+            &crate::zygote::compute_module_audit_policy_digest_with_mode(cfg, mod_name, true),
+        ) && compute_replayed_olean_ilean_digest(olean_path)
+            .ok()
+            .as_deref()
+            == Some(dig.as_str())
+    }
+
     pub(crate) fn disallowed_roots(&self) -> &[PathBuf] {
         &self.disallowed_roots
     }
@@ -22469,7 +22502,7 @@ pub(crate) fn ensure_imported_oleans_replayed_with_roots_and_axioms(
             if !replay_batch.is_audited_in_store(store, &cfg, &replay_lp, m, path) {
                 pending_audit.push(m.clone());
             }
-        } else if !replay_batch.is_replayed_in_store(store, &cfg, &replay_lp, path) {
+        } else if !replay_batch.is_import_audited_in_store(store, &cfg, m, path) {
             pending_replay.push(m.clone());
         }
     }
@@ -22487,8 +22520,14 @@ pub(crate) fn ensure_imported_oleans_replayed_with_roots_and_axioms(
         .context("Imported `.olean` failed in-kernel soundness & replay audit")?;
     }
     if !pending_replay.is_empty() {
-        crate::zygote::kernel_replay_modules_with_zygote(store, &cfg, &pending_replay, &replay_lp)
-            .context("Imported `.olean` failed independent kernel replay")?;
+        crate::zygote::audit_imported_modules_with_zygote(
+            store,
+            &cfg,
+            &pending_replay,
+            &replay_lp,
+            allowed_axioms.iter().any(|a| a == "sorryAx"),
+        )
+        .context("Imported `.olean` failed independent kernel replay and import audit")?;
     }
     Ok(pending_audit.len() + pending_replay.len())
 }
@@ -29520,6 +29559,49 @@ lean_exe «demo-exe» where
         }
         let fixture = root.join("fixtures/mathlib-v4.35.0-lakefile.lean");
         parse_lakefile_lean(fixture.parent().unwrap(), &fixture, false).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires warm Batteries via TURBO_LEAN_WARM_ROOT"]
+    fn test_warm_batteries_import_audit_is_not_root_authority() -> Result<()> {
+        let root = PathBuf::from(std::env::var_os("TURBO_LEAN_WARM_ROOT").unwrap());
+        let batteries = root.join("batteries").canonicalize()?;
+        let dir = make_temp_test_dir("batteries_import_audit");
+        let project = dir.join("app");
+        fs::create_dir_all(&project)?;
+        fs::write(project.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(project.join("lakefile.toml"), format!(
+            "name = \"app\"\n[[require]]\nname = \"batteries\"\npath = \"{}\"\n[[lean_lib]]\nname = \"App\"\n", batteries.display()))?;
+        fs::write(
+            project.join("lake-manifest.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "version": "1.2.0", "packagesDir": ".lake/packages", "name": "app", "lakeDir": ".lake",
+                "packages": [{"type": "path", "name": "batteries", "dir": batteries,
+                    "configFile": "lakefile.toml", "inherited": false}]
+            }))?,
+        )?;
+        let target = project.join("App.lean");
+        fs::write(
+            &target,
+            "import Batteries.Data.List.Lemmas\ntheorem smoke : True := by trivial\n",
+        )?;
+        let store = TurboStore::open(Some(&dir.join("store")))?;
+        let cfg = resolve_project_config(&project)?;
+        let (lp, _) = build_lean_search_path(&cfg, false);
+        assert!(
+            ensure_imported_oleans_replayed(&store, &project, std::slice::from_ref(&target))? > 0
+        );
+        let mut lookup = ReplayLookupBatchCache::new(&store, &cfg, &lp);
+        let module = "Batteries.Data.List.Lemmas";
+        let olean = lookup.resolve_module_olean(module).unwrap();
+        assert!(lookup.is_import_audited_in_store(&store, &cfg, module, &olean));
+        assert!(!lookup.is_audited_in_store(&store, &cfg, &lp, module, &olean));
+        assert_eq!(
+            ensure_imported_oleans_replayed(&store, &project, &[target])?,
+            0
+        );
+        fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]

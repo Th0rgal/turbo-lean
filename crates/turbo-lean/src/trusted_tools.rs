@@ -15,6 +15,50 @@ const SYSTEM_BINS: [&str; 6] = [
     "/run/current-system/sw/bin",
 ];
 
+pub(crate) fn format_git_locality_disabled_warning(err: &anyhow::Error) -> String {
+    format!("[turbo-lean] warning: proof-edit locality disabled ({err}); set TURBO_LEAN_GIT to a Git >= 2.46 binary to avoid full Lake dependent rebuilds")
+}
+
+fn git_locality_warning_repo(dir: &Path) -> Option<PathBuf> {
+    let dir = dir.canonicalize().ok()?;
+    dir.ancestors()
+        .find(|p| p.join(".git").exists())
+        .map(Path::to_path_buf)
+}
+
+pub(crate) fn warn_git_locality_disabled(dir: &Path, err: &anyhow::Error) {
+    static WARNED: OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+    let Some(repo) = git_locality_warning_repo(dir) else {
+        return;
+    };
+    if WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .is_ok_and(|mut seen| seen.insert(repo))
+    {
+        eprintln!("{}", format_git_locality_disabled_warning(err));
+    }
+}
+
+#[cfg(test)]
+mod locality_warning_tests {
+    use super::*;
+
+    #[test]
+    fn git_locality_warning_requires_repo_and_explains_remedy() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("git-locality-warning-{}", std::process::id()));
+        fs::create_dir_all(&dir)?;
+        assert!(git_locality_warning_repo(&dir).is_none());
+        fs::create_dir_all(dir.join(".git"))?;
+        assert_eq!(git_locality_warning_repo(&dir), Some(dir.canonicalize()?));
+        let msg = format_git_locality_disabled_warning(&anyhow::anyhow!("Git 2.43 < 2.46"));
+        assert!(msg.contains("proof-edit locality disabled (Git 2.43 < 2.46)"));
+        assert!(msg.contains("set TURBO_LEAN_GIT to a Git >= 2.46 binary"));
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+}
+
 pub(crate) fn trusted_sys_path() -> String {
     match option_env!("TURBO_LEAN_NIX_SYS_PATH") {
         Some(nix_p) if !nix_p.is_empty() => {

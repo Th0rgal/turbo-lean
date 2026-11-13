@@ -577,6 +577,8 @@ enum DaemonCommands {
 }
 
 fn main() -> Result<()> {
+    let process_start = std::time::Instant::now();
+    check::init_process_start_instant(process_start);
     let cli = Cli::parse();
     // `check` and `agent-step` vouch for declarations, not for the modules that use them: when the
     if matches!(&cli.command, Commands::Daemon { .. }) {
@@ -1144,10 +1146,7 @@ fn run(cli: Cli) -> Result<()> {
         return gpu_fastcheck::run_fast_check_remote_http_stateless(cli.json, file, gpu, http_url);
     }
 
-    let resolved_cache_root = cli
-        .cache_dir
-        .clone()
-        .unwrap_or_else(shm_cache::cache_root);
+    let resolved_cache_root = cli.cache_dir.clone().unwrap_or_else(shm_cache::cache_root);
     let db_warm_on_open = fs::metadata(resolved_cache_root.join("state.db"))
         .map(|m| m.len() >= 4096)
         .unwrap_or(false);

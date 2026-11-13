@@ -34,6 +34,7 @@ pub(super) fn check_directory(
     allow_sorry: bool,
 ) -> Result<serde_json::Value> {
     let dir_files = collect_lean_files(resolved_file);
+    let refresh_start = Instant::now();
     let fresh_res = crate::lake_build::ensure_project_imports_fresh_for_check_with_options(
         canon_dir,
         &dir_files,
@@ -53,6 +54,7 @@ pub(super) fn check_directory(
         crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(canon_dir, &dir_files);
     }
     import_res?;
+    super::record_phase("import_refresh", refresh_start);
     let mut dir_hasher = blake3::Hasher::new();
     dir_hasher.update(b"dir-check-v2\n");
     dir_hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
@@ -282,6 +284,7 @@ pub(super) fn check_directory(
         });
         insert_allow_sorry_fields(&mut out_json, allow_sorry, dir_used_sorry, &dir_sorry_decls);
         kernel_prov.insert_json_fields(&mut out_json);
+        super::insert_check_timings(&mut out_json, *t0);
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -760,6 +763,7 @@ pub(super) fn check_directory(
     });
     insert_allow_sorry_fields(&mut out_json, allow_sorry, dir_used_sorry, &dir_sorry_decls);
     kernel_prov.insert_json_fields(&mut out_json);
+    super::insert_check_timings(&mut out_json, *t0);
     if emit_stdout {
         if json_output {
             println!("{}", serde_json::to_string_pretty(&out_json)?);

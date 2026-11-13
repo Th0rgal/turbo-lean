@@ -44,6 +44,7 @@ pub(super) fn check_single_file(
     remote_http: Option<&str>,
     allow_sorry: bool,
 ) -> Result<serde_json::Value> {
+    let cache_start = Instant::now();
     let file_lean_args = crate::module_builder::try_resolve_lean_args_for_path(
         canon_dir,
         Some(canon_resolved_initial),
@@ -65,6 +66,7 @@ pub(super) fn check_single_file(
     } else {
         HashMap::new()
     };
+    super::record_phase("cache", cache_start);
 
     let mut hits = 0usize;
     let mut uncached_shards = Vec::new();
@@ -81,6 +83,7 @@ pub(super) fn check_single_file(
                 .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
         }
         let shard_refs: Vec<&splitter::TheoremShard> = split.shards.iter().collect();
+        let identity_start = Instant::now();
         let attested = confirm_file_decl_identities_with_budget(
             src,
             &shard_refs,
@@ -89,6 +92,7 @@ pub(super) fn check_single_file(
             false,
             Some(*t0),
         )?;
+        super::record_phase("identity", identity_start);
         for (idx, att) in attested.into_iter().enumerate() {
             attested_kths.insert(file_shard_keys[idx].clone(), att.kernel_type_hash);
         }
@@ -160,6 +164,7 @@ pub(super) fn check_single_file(
                 "elapsed_ms": elapsed_ms
             });
             kernel_prov.insert_json_fields(&mut out_json);
+            super::insert_check_timings(&mut out_json, *t0);
             if emit_stdout {
                 if json_output {
                     println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -435,6 +440,7 @@ pub(super) fn check_single_file(
                 "elapsed_ms": dur_ms
             });
             kernel_prov.insert_json_fields(&mut out_json);
+            super::insert_check_timings(&mut out_json, *t0);
             if emit_stdout {
                 if json_output {
                     println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -591,6 +597,7 @@ pub(super) fn check_single_file(
             "elapsed_ms": dur_ms
         });
         kernel_prov.insert_json_fields(&mut out_json);
+        super::insert_check_timings(&mut out_json, *t0);
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -669,6 +676,7 @@ pub(super) fn check_single_file(
         });
         insert_allow_sorry_fields(&mut out_json, allow_sorry, false, &[]);
         kernel_prov.insert_json_fields(&mut out_json);
+        super::insert_check_timings(&mut out_json, *t0);
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -792,6 +800,7 @@ pub(super) fn check_single_file(
                 "elapsed_ms": dur_ms
             });
             kernel_prov.insert_json_fields(&mut out_json);
+            super::insert_check_timings(&mut out_json, *t0);
             if emit_stdout {
                 if json_output {
                     println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -1344,6 +1353,7 @@ pub(super) fn check_single_file(
         });
         insert_allow_sorry_fields(&mut out_json, allow_sorry, false, &[]);
         kernel_prov.insert_json_fields(&mut out_json);
+        super::insert_check_timings(&mut out_json, *t0);
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -1671,6 +1681,7 @@ pub(super) fn check_single_file(
         });
         insert_allow_sorry_fields(&mut out_json, allow_sorry, false, &[]);
         kernel_prov.insert_json_fields(&mut out_json);
+        super::insert_check_timings(&mut out_json, *t0);
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);

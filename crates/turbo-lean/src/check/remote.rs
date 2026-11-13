@@ -33,6 +33,7 @@ pub(super) fn emit_remote_decl_result(
     prefix_env_hash: &str,
     total_shards_in_file: usize,
     dur_ms: i64,
+    t0: Instant,
 ) -> Result<(u64, serde_json::Value)> {
     let server_arch = resp_json
         .get("server_arch")
@@ -63,18 +64,20 @@ pub(super) fn emit_remote_decl_result(
         "elapsed_ms": dur_ms
     });
     kernel_prov.insert_json_fields(&mut out_json);
+    super::insert_check_timings(&mut out_json, t0);
     if emit_stdout {
         if json_output {
             println!("{}", serde_json::to_string_pretty(&out_json)?);
         } else {
             println!(
-                "[turbo-lean] {} `{}` via {} (arch={}, server={} ms, total={} ms)",
+                "[turbo-lean] {} `{}` via {} (arch={}, server={} ms, total={} ms, wall={} ms)",
                 remote_status.to_uppercase(),
                 target_decl,
                 remote_url,
                 server_arch,
                 server_elapsed_ms,
-                dur_ms
+                dur_ms,
+                super::process_wall_ms(t0).max(dur_ms)
             );
         }
     }
@@ -225,6 +228,8 @@ pub fn try_stateless_remote_check(
     jobs: Option<usize>,
     remote_url: &str,
 ) -> Result<bool> {
+    super::CHECK_START.with(|start| start.set(Some(Instant::now())));
+    super::PHASES.with(|p| p.set(super::CheckPhaseTimings::default()));
     let (inferred_canon_dir, _) = resolve_check_project_and_target(file, project_dir);
     let kernel_prov = crate::kernel::resolve_kernel_engine(
         crate::kernel::resolve_kernel_selection_from_env(None)?,
@@ -405,6 +410,7 @@ pub fn try_stateless_remote_check(
         "elapsed_ms": dur_ms
     });
     kernel_prov.insert_json_fields(&mut out_json);
+    super::insert_check_timings(&mut out_json, t0);
     if json_output {
         println!("{}", serde_json::to_string_pretty(&out_json)?);
     } else {
@@ -599,6 +605,7 @@ fn try_stateless_remote_single_decl_check(
         &shard.prefix_env_hash,
         split.shards.len(),
         dur_ms,
+        t0,
     )?;
     Ok(true)
 }

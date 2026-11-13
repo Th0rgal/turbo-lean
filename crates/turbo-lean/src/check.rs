@@ -20,6 +20,156 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
+static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Set once at CLI entry, before argument parsing, locks, or opening the store.
+pub fn init_process_start_instant(t0: Instant) {
+    let _ = PROCESS_START.set(t0);
+}
+
+pub fn process_wall_ms(fallback_t0: Instant) -> i64 {
+    PROCESS_START
+        .get()
+        .copied()
+        .unwrap_or(fallback_t0)
+        .elapsed()
+        .as_millis() as i64
+}
+
+#[derive(Clone, Copy, Default, serde::Serialize)]
+pub(super) struct CheckPhaseTimings {
+    hygiene_ms: i64,
+    import_refresh_ms: i64,
+    identity_ms: i64,
+    cache_ms: i64,
+    elab_ms: i64,
+    kernel_ms: i64,
+}
+
+thread_local! {
+    static CHECK_START: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    static PHASES: std::cell::Cell<CheckPhaseTimings> = const {
+        std::cell::Cell::new(CheckPhaseTimings {
+            hygiene_ms: 0, import_refresh_ms: 0, identity_ms: 0,
+            cache_ms: 0, elab_ms: 0, kernel_ms: 0,
+        })
+    };
+}
+
+/// Add measured work, keeping unrelated startup/locking overhead outside phases.
+pub(super) fn record_phase(name: &str, start: Instant) {
+    PHASES.with(|cell| {
+        let mut p = cell.get();
+        let ms = start.elapsed().as_millis() as i64;
+        match name {
+            "hygiene" => p.hygiene_ms += ms,
+            "import_refresh" => p.import_refresh_ms += ms,
+            "identity" => p.identity_ms += ms,
+            "cache" => p.cache_ms += ms,
+            "elab" => p.elab_ms += ms,
+            "kernel" => p.kernel_ms += ms,
+            _ => unreachable!("unknown check phase"),
+        }
+        cell.set(p);
+    });
+}
+
+pub(super) fn insert_check_timings(out: &mut serde_json::Value, t0: Instant) {
+    let elapsed = out["elapsed_ms"].as_i64().unwrap_or(0);
+    let start = CHECK_START.with(|start| start.get()).unwrap_or(t0);
+    let wall = process_wall_ms(start).max(elapsed);
+    let mut phases = PHASES.with(|p| p.get());
+    // Worker telemetry splits the combined elaboration/kernel IPC operation.
+    for (key, value) in [
+        ("zygote_elab_us", &mut phases.elab_ms),
+        ("zygote_kernel_us", &mut phases.kernel_ms),
+    ] {
+        if let Some(us) = out[key].as_u64() {
+            *value = (us / 1000) as i64;
+        }
+    }
+    out["wall_ms"] = wall.into();
+    out["phases"] = serde_json::to_value(phases).expect("phase serialization");
+    let summary = out["compact_summary"].as_str().unwrap_or("OK");
+    out["compact_summary"] = format!("{summary} wall_ms={wall}").into();
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod wallclock_tests {
+    use super::*;
+
+    #[test]
+    fn check_wallclock_json_and_direct_call() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("wallclock-{}", crate::pack::next_tmp_id()));
+        fs::create_dir_all(&dir)?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        let file = dir.join("Wall.lean");
+        fs::write(&file, "theorem wall_test : True := by trivial\n")?;
+        let mut store = TurboStore::open(Some(&dir.join("cache")))?;
+        let result = run_check_command_value(
+            &mut store,
+            false,
+            file.clone(),
+            Some("wall_test".into()),
+            dir.clone(),
+            None,
+            false,
+            None,
+        )?;
+        assert!(result["wall_ms"].as_i64().unwrap() >= result["elapsed_ms"].as_i64().unwrap());
+        for field in [
+            "hygiene_ms",
+            "import_refresh_ms",
+            "identity_ms",
+            "cache_ms",
+            "elab_ms",
+            "kernel_ms",
+        ] {
+            assert!(result["phases"][field].as_i64().unwrap() >= 0, "{field}");
+        }
+        assert!(result["compact_summary"]
+            .as_str()
+            .unwrap()
+            .contains("wall_ms="));
+        let binary = std::env::current_exe()?
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("turbo-lean");
+        let output = Command::new(binary)
+            .args(["check", "--json", "--decl", "wall_test", "--project-dir"])
+            .arg(&dir)
+            .arg(&file)
+            .arg("--cache-dir")
+            .arg(dir.join("cli-cache"))
+            .output()?;
+        anyhow::ensure!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let cli: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        assert!(cli["wall_ms"].as_i64().unwrap() >= cli["elapsed_ms"].as_i64().unwrap());
+        assert!(cli["phases"].is_object());
+        run_check_command_with_options(
+            &mut store,
+            true,
+            true,
+            file,
+            Some("wall_test".into()),
+            dir.clone(),
+            None,
+            false,
+            None,
+            false,
+            false,
+        )?;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 use crate::db;
 use crate::db::TurboStore;
@@ -424,8 +574,10 @@ pub(crate) fn run_check_command_inner(
             "`--emit-olean` cannot be combined with `--decl` (must check a full module file)"
         );
     }
-    let _lifecycle = crate::zygote::lifecycle_lock(false)?;
     let t0 = Instant::now();
+    CHECK_START.with(|start| start.set(Some(t0)));
+    PHASES.with(|p| p.set(CheckPhaseTimings::default()));
+    let _lifecycle = crate::zygote::lifecycle_lock(false)?;
     let (canon_dir, mut resolved_file) = resolve_check_project_and_target(&file, &project_dir);
     crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
     let toolchain = detect_toolchain(&canon_dir);
@@ -518,6 +670,7 @@ pub(crate) fn run_check_command_inner(
                 );
             }
         }
+        let refresh_start = Instant::now();
         let fresh_res = crate::lake_build::ensure_project_imports_fresh_for_check_with_options(
             &canon_dir,
             std::slice::from_ref(&canon_resolved_initial),
@@ -543,11 +696,13 @@ pub(crate) fn run_check_command_inner(
             );
         }
         import_res?;
+        record_phase("import_refresh", refresh_start);
     }
     let file_stat_tuple: Option<(i64, i64, i64)> = fs::metadata(&canon_resolved_initial)
         .ok()
         .map(|m| TurboStore::extract_file_stat_tuple(&m));
 
+    let hygiene_start = Instant::now();
     let splits_dir = shm_file_splits_dir(store);
     let st_paths_opt = file_stat_tuple.map(|(ms, mn, sz)| {
         let pk = canon_resolved_initial.to_string_lossy();
@@ -732,6 +887,7 @@ pub(crate) fn run_check_command_inner(
     };
 
     drop(held_split_lock);
+    record_phase("hygiene", hygiene_start);
 
     let decl_mode = decl.is_some();
     let res_or_err: Result<serde_json::Value> = (|| {
