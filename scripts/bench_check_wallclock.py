@@ -12,6 +12,7 @@ import json
 import math
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import tempfile
@@ -111,6 +112,11 @@ def concurrency(args, cache):
     # sharing an identical imported environment/prefix in the persistent pool.
     with tempfile.TemporaryDirectory(prefix="wallclock-agents-") as tmp:
         project = Path(tmp)
+        # Daemon identity includes the executable path. Give this workload its
+        # own daemon so inherited PSS markers and fork evidence cannot point at
+        # an unrelated daemon started by an earlier benchmark.
+        binary = project / "turbo-lean"
+        shutil.copy2(args.binary, binary)
         (project / "lean-toolchain").write_bytes(
             (args.batteries_dir / "lean-toolchain").read_bytes())
         (project / "lakefile.toml").write_text(
@@ -138,7 +144,7 @@ def concurrency(args, cache):
         if prepared.returncode:
             raise RuntimeError("concurrency import preparation failed: " + prepared.stderr)
         workload = uuid.uuid4().hex
-        warmup = check(args.binary, project, files[0], cache, args.timeout,
+        warmup = check(binary, project, files[0], cache, args.timeout,
                        "agent_work", workload)
         evidence = cache / "fork-evidence.log"
         # Warmup is not evidence that any of the eight measured checks forked.
@@ -154,7 +160,7 @@ def concurrency(args, cache):
         try:
             with ThreadPoolExecutor(max_workers=8) as executor:
                 results = list(executor.map(
-                    lambda file: check(args.binary, project, file, cache,
+                    lambda file: check(binary, project, file, cache,
                                         args.timeout, "agent_work", workload), files))
         finally:
             stop.set()
