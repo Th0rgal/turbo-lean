@@ -36,6 +36,8 @@ pub struct VerificationReceipt {
     pub con_leche_rev: Option<String>,
     pub interface_hash: String,
     pub action_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_csimp_digest: Option<String>,
     pub files_audited: usize,
     pub theorem_shards: usize,
     pub forbidden_constructs_found: usize,
@@ -171,6 +173,7 @@ pub fn compute_receipt_blake3(
     kernel_engine: &str,
     lean_toolchain: &str,
     con_leche_rev: Option<&str>,
+    active_csimp_digest: Option<&str>,
     interface_hash: &str,
     action_key: &str,
     files_audited: usize,
@@ -212,7 +215,96 @@ pub fn compute_receipt_blake3(
         hasher.update(file_ih.as_bytes());
         hasher.update(b"\n");
     }
-    hasher.finalize().to_hex().to_string()
+    bind_active_csimp_digest(hasher.finalize().to_hex().as_str(), active_csimp_digest)
+}
+
+/// Canonical active compiler-simplification policy and entries. Entries include the
+/// theorem, source, and replacement identities (prefer content-bound identities).
+/// Ordering and duplicate policy/entry observations do not affect the digest.
+pub fn compute_active_csimp_digest(
+    policy: &[String],
+    entries: &[(String, String, String)],
+) -> String {
+    let mut h = blake3::Hasher::new();
+    h.update(b"turbo-lean-active-csimp-v1\n");
+    let mut field = |s: &str| {
+        h.update(&(s.len() as u64).to_le_bytes());
+        h.update(s.as_bytes());
+    };
+    for pattern in policy
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect::<BTreeSet<_>>()
+    {
+        field("policy");
+        field(pattern);
+    }
+    for (theorem, from, to) in entries.iter().collect::<BTreeSet<_>>() {
+        field("entry");
+        field(theorem);
+        field(from);
+        field(to);
+    }
+    h.finalize().to_hex().to_string()
+}
+
+fn bind_active_csimp_digest(legacy_hash: &str, digest: Option<&str>) -> String {
+    let Some(digest) = digest else {
+        return legacy_hash.to_owned();
+    };
+    let mut h = blake3::Hasher::new();
+    h.update(b"turbo-lean-receipt-active-csimp-v1\n");
+    for value in [legacy_hash, digest] {
+        h.update(&(value.len() as u64).to_le_bytes());
+        h.update(value.as_bytes());
+    }
+    h.finalize().to_hex().to_string()
+}
+
+impl VerificationReceipt {
+    /// Bind observed entries before signing. A changed digest invalidates any old
+    /// signature, so the caller must sign the updated receipt again.
+    pub fn bind_active_csimp(
+        &mut self,
+        policy: &[String],
+        entries: &[(String, String, String)],
+    ) -> Result<()> {
+        verify_single_receipt_integrity_and_provenance(self, "Cryptographic")?;
+        let digest = compute_active_csimp_digest(policy, entries);
+        let legacy_hash = match self.schema_version {
+            1 => compute_receipt_blake3_v1(
+                self.schema_version,
+                &self.mode,
+                &self.interface_hash,
+                &self.action_key,
+                self.files_audited,
+                self.theorem_shards,
+                self.forbidden_constructs_found,
+                &self.per_file_interfaces,
+            ),
+            _ => compute_receipt_blake3(
+                self.schema_version,
+                &self.mode,
+                self.kernel_engine.as_deref().unwrap_or_default(),
+                self.lean_toolchain.as_deref().unwrap_or_default(),
+                self.con_leche_rev.as_deref(),
+                None,
+                &self.interface_hash,
+                &self.action_key,
+                self.files_audited,
+                self.theorem_shards,
+                self.forbidden_constructs_found,
+                &self.per_file_interfaces,
+            ),
+        };
+        self.receipt_blake3 = bind_active_csimp_digest(&legacy_hash, Some(&digest));
+        self.active_csimp_digest = Some(digest);
+        self.signature_alg = None;
+        self.ed25519_pubkey = None;
+        self.ed25519_signature = None;
+        Ok(())
+    }
 }
 
 /// Compute a keyed HMAC-BLAKE3 authentication tag over `receipt_blake3`.
@@ -318,12 +410,16 @@ pub fn build_verification_receipt_with_provenance(
 ) -> VerificationReceipt {
     let schema_version = CURRENT_RECEIPT_SCHEMA_VERSION;
     let normalized_tc = crate::kernel::normalize_lean_toolchain(lean_toolchain);
+    let csimp_policy = crate::splitter::normalized_policy_env_vec("TURBO_LEAN_ALLOWED_CSIMP");
+    let active_csimp_digest =
+        (!csimp_policy.is_empty()).then(|| compute_active_csimp_digest(&csimp_policy, &[]));
     let receipt_blake3 = compute_receipt_blake3(
         schema_version,
         mode,
         kernel_engine,
         &normalized_tc,
         con_leche_rev,
+        active_csimp_digest.as_deref(),
         interface_hash,
         action_key,
         files_audited,
@@ -339,6 +435,7 @@ pub fn build_verification_receipt_with_provenance(
         con_leche_rev: con_leche_rev.map(String::from),
         interface_hash: interface_hash.to_string(),
         action_key: action_key.to_string(),
+        active_csimp_digest,
         files_audited,
         theorem_shards,
         forbidden_constructs_found,
@@ -489,15 +586,18 @@ fn verify_single_receipt_integrity_and_provenance(
     let toolchain_state = classify_receipt_str_field(receipt.lean_toolchain.as_deref());
     let rev_state = classify_receipt_str_field(receipt.con_leche_rev.as_deref());
     let expected_blake3_opt = match receipt.schema_version {
-        1 => Some(compute_receipt_blake3_v1(
-            receipt.schema_version,
-            &receipt.mode,
-            &receipt.interface_hash,
-            &receipt.action_key,
-            receipt.files_audited,
-            receipt.theorem_shards,
-            receipt.forbidden_constructs_found,
-            &receipt.per_file_interfaces,
+        1 => Some(bind_active_csimp_digest(
+            &compute_receipt_blake3_v1(
+                receipt.schema_version,
+                &receipt.mode,
+                &receipt.interface_hash,
+                &receipt.action_key,
+                receipt.files_audited,
+                receipt.theorem_shards,
+                receipt.forbidden_constructs_found,
+                &receipt.per_file_interfaces,
+            ),
+            receipt.active_csimp_digest.as_deref(),
         )),
         CURRENT_RECEIPT_SCHEMA_VERSION => receipt
             .kernel_engine
@@ -510,6 +610,7 @@ fn verify_single_receipt_integrity_and_provenance(
                     ke,
                     tc,
                     receipt.con_leche_rev.as_deref(),
+                    receipt.active_csimp_digest.as_deref(),
                     &receipt.interface_hash,
                     &receipt.action_key,
                     receipt.files_audited,
@@ -774,7 +875,392 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires Lean 4.35 and lake build TurboLean turbo-zygote"]
+    fn imported_local_csimp_compiler_audit_regressions() {
+        use std::process::Command;
+
+        let project = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
+        let worker = project
+            .join(".lake/build/bin/turbo-zygote")
+            .canonicalize()
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("turbo_csimp_audit_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        let defs = "@[noinline, expose] def slow (n : Nat) : Nat := n + 1\n@[inline, expose] def fast (n : Nat) : Nat := n + 1\ntheorem replacement : slow = fast := rfl\n";
+        let before = "@[noinline] def before (n : Nat) : Nat := slow n\n";
+        let after = "attribute [local csimp] replacement\n@[noinline] def after (n : Nat) : Nat := slow n\n";
+        let benign = "def TypeAlias := Nat\nnoncomputable def chosen : Nat := Classical.choice (inferInstance : Nonempty Nat)\nstructure Box where\n  value : Nat\n  proof : value = value\nmutual\n  def even : Nat → Bool\n    | 0 => true\n    | n + 1 => odd n\n  def odd : Nat → Bool\n    | 0 => false\n    | n + 1 => even n\nend\n";
+        let recursive = "structure Box where\n  value : Nat\n  proof : value = value\n@[noinline] def boxed (b : Box) : Nat := slow b.value\nmutual\n  @[noinline] def left : Nat → Nat\n    | 0 => slow 0\n    | n + 1 => right n\n  @[noinline] def right : Nat → Nat\n    | 0 => slow 1\n    | n + 1 => left n\nend\n";
+        let cases = [
+            ("AuditPlain", format!("import Lean\n{defs}{before}{after}"), true),
+            ("AuditModule", format!("module\nimport Lean\npublic section\n{defs}{before}{after}"), true),
+            ("AuditPostponed", format!("module\nimport Lean\npublic section\nset_option compiler.postponeCompile true\n{defs}{before}{after}"), false),
+            ("AuditBefore", format!("module\nimport Lean\npublic section\n{defs}{before}attribute [local csimp] replacement\n{benign}"), false),
+            ("AuditMutual", format!("module\nimport Lean\npublic section\n{defs}{recursive}attribute [local csimp] replacement\n"), false),
+            ("AuditScopedUse", "module\nimport AuditScope\npublic section\n@[noinline] def before (n : Nat) := Scope.slow n\nopen scoped Scope\n@[noinline] def after (n : Nat) := Scope.slow n\n".into(), true),
+            ("AuditReverse", format!("module\nimport Lean\npublic section\n{defs}attribute [local csimp] replacement\n@[noinline] def direct (n : Nat) : Nat := fast n\n{benign}"), false),
+            ("AuditUnrelated", format!("module\nimport Lean\npublic section\n{defs}attribute [local csimp] replacement\n{benign}"), false),
+        ];
+        let hooks = [
+            (
+                "AuditFolder",
+                r#"import Lean
+open Lean.Compiler.LCNF.Simp.ConstantFold
+unsafe def auditFolder : Folder := (unsafeIO do
+  if let some path ← IO.getEnv "TURBO_CSIMP_AUDIT_MARKER" then
+    IO.FS.writeFile path "folder executed"
+  return fun _ => pure none).toOption.getD (fun _ => pure none)
+run_meta do registerFolder ``Nat.add ``auditFolder
+"#,
+            ),
+            (
+                "AuditPass",
+                r#"import Lean
+open Lean.Compiler.LCNF
+@[cpass] unsafe def auditPass : PassInstaller where
+  phase := .base
+  install passes := do
+    if let some path ← IO.getEnv "TURBO_CSIMP_AUDIT_MARKER" then
+      IO.FS.writeFile path "pass executed"
+    return passes
+"#,
+            ),
+            (
+                "AuditInitializer",
+                r#"import Lean
+initialize auditMarker : Unit ← do
+  if let some path ← IO.getEnv "TURBO_CSIMP_AUDIT_MARKER" then
+    IO.FS.writeFile path "initializer executed"
+"#,
+            ),
+        ];
+        fs::write(dir.join("AuditScope.lean"), format!("module\nimport Lean\npublic section\nnamespace Scope\n{defs}attribute [scoped csimp] replacement\nend Scope\n")).unwrap();
+        let mut lakefile =
+            String::from("name = \"audit-fixtures\"\n[[lean_lib]]\nname = \"AuditScope\"\n");
+        for (name, source, _) in &cases {
+            fs::write(dir.join(format!("{name}.lean")), source).unwrap();
+            lakefile.push_str(&format!("\n[[lean_lib]]\nname = \"{name}\"\n"));
+        }
+        for (name, source) in &hooks {
+            fs::write(dir.join(format!("{name}.lean")), source).unwrap();
+            lakefile.push_str(&format!("\n[[lean_lib]]\nname = \"{name}\"\n"));
+        }
+        fs::write(dir.join("lakefile.toml"), lakefile).unwrap();
+        let output = Command::new("lake")
+            .arg("build")
+            .args(
+                cases
+                    .iter()
+                    .filter(|(name, _, _)| *name != "AuditPostponed")
+                    .map(|(name, _, _)| *name),
+            )
+            .args(hooks.iter().map(|(name, _)| *name))
+            .env_remove("TURBO_CSIMP_AUDIT_MARKER")
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::write(
+            dir.join("Postponed.setup.json"),
+            serde_json::json!({
+                "name": "AuditPostponed", "isModule": true, "package": "audit-fixtures",
+                "options": {}, "plugins": [], "dynlibs": [], "importArts": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        for args in [
+            vec![
+                "env",
+                "lean",
+                "AuditPostponed.lean",
+                "-o",
+                ".lake/build/lib/lean/AuditPostponed.olean",
+                "--setup",
+                "Postponed.setup.json",
+            ],
+            vec![
+                "env",
+                "leanir",
+                "Postponed.setup.json",
+                ".lake/build/lib/lean/AuditPostponed.ir",
+                "Postponed.c",
+            ],
+        ] {
+            let output = Command::new("lake")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        for (name, _, rejected) in &cases {
+            let output = Command::new("lake")
+                .arg("env")
+                .arg(&worker)
+                .args(["--audit-modules", "--skip-child-replay", name])
+                .env_remove("TURBO_LEAN_ALLOWED_CSIMP")
+                .env_remove("TURBO_LEAN_ALLOWED_AXIOMS")
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let result: serde_json::Value = serde_json::from_str(stdout.trim())
+                .unwrap_or_else(|err| panic!("{name}: {err}: {stdout}{stderr}"));
+            assert_eq!(result["ok"], !rejected, "{name}: {stdout}{stderr}");
+            assert!(!stdout.contains("code of `before`"), "{name}: {stdout}");
+            assert!(!stdout.contains("code of `TypeAlias`"), "{name}: {stdout}");
+            assert!(!stdout.contains("code of `chosen`"), "{name}: {stdout}");
+            if *rejected {
+                assert!(
+                    stdout.contains("local csimp replacement"),
+                    "{name}: {stdout}"
+                );
+                assert!(stdout.contains("code of `after`"), "{name}: {stdout}");
+            }
+        }
+        let check_base = r#"import TurboLean.ZygoteWorker
+open Lean TurboLean.ZygoteWorker
+#eval do
+  let raw ← Lean.importModules #[{ module := `AuditMutual, importAll := true }] {} 0 #[] true false .private
+  let env ← hydrateCompilerAuditEnv raw
+  let idx := (env.getModuleIdx? `AuditMutual).get!
+  let stored := collectModuleStoredBaseDecls env idx
+  for name in #[`boxed, `left, `right] do
+    let some actual := stored[name]? | throw <| IO.userError s!"missing stored base: {name}"
+    let some rebuilt ← compileSingleBaseLcnfDecl env name | throw <| IO.userError s!"failed base reconstruction: {name}"
+    unless lcnfDeclAlphaEqvModuloSpec actual rebuilt do
+      throw <| IO.userError s!"base reconstruction differs: {name}"
+"#;
+        fs::write(dir.join("CheckBase.lean"), check_base).unwrap();
+        let output = Command::new("lake")
+            .args(["env", "lean", "CheckBase.lean"])
+            .env("LEAN_PATH", project.join(".lake/build/lib/lean"))
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let marker = dir.join("executed");
+        for (name, _) in &hooks {
+            let output = Command::new("lake")
+                .arg("env")
+                .arg(&worker)
+                .args(["--audit-modules", "--skip-child-replay", name])
+                .env("TURBO_CSIMP_AUDIT_MARKER", &marker)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let result: serde_json::Value = serde_json::from_str(stdout.trim())
+                .unwrap_or_else(|err| panic!("{name}: {err}: {stdout}{stderr}"));
+            if *name != "AuditInitializer" {
+                assert_eq!(result["ok"], false, "{name}: {stdout}{stderr}");
+                assert!(
+                    stdout.contains("cannot be executed during compiler audit"),
+                    "{name}: {stdout}{stderr}"
+                );
+            }
+            assert!(!marker.exists(), "{name} executed imported code");
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn active_csimp_digest_is_canonical_and_content_sensitive() {
+        let policy = vec![" B.* ".into(), "A.eq".into(), "B.*".into()];
+        let entries = vec![("A.eq".into(), "A.slow".into(), "A.fast".into())];
+        let digest = compute_active_csimp_digest(&policy, &entries);
+        assert_eq!(
+            digest,
+            compute_active_csimp_digest(
+                &["A.eq".into(), "B.*".into()],
+                &[entries[0].clone(), entries[0].clone()]
+            )
+        );
+        assert_ne!(digest, compute_active_csimp_digest(&[], &entries));
+        for column in 0..3 {
+            let mut changed = entries.clone();
+            match column {
+                0 => changed[0].0.push('x'),
+                1 => changed[0].1.push('x'),
+                _ => changed[0].2.push('x'),
+            }
+            assert_ne!(digest, compute_active_csimp_digest(&policy, &changed));
+        }
+        assert_ne!(
+            compute_active_csimp_digest(&["a".into(), "bc".into()], &[]),
+            compute_active_csimp_digest(&["ab".into(), "c".into()], &[])
+        );
+    }
+
+    #[test]
+    fn active_csimp_receipt_binding_preserves_legacy_and_rejects_tampering() {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let receipt = build_verification_receipt("trusted", "ih", "act", 1, 1, 0, BTreeMap::new());
+        for schema in [1, 2] {
+            let mut rec = receipt.clone();
+            if schema == 1 {
+                rec.schema_version = 1;
+                rec.kernel_engine = None;
+                rec.lean_toolchain = None;
+                rec.receipt_blake3 = compute_receipt_blake3_v1(
+                    1,
+                    "trusted",
+                    "ih",
+                    "act",
+                    1,
+                    1,
+                    0,
+                    &rec.per_file_interfaces,
+                );
+            }
+            let legacy_hash = rec.receipt_blake3.clone();
+            let json = serde_json::to_value(&rec).unwrap();
+            assert!(json.get("active_csimp_digest").is_none());
+            let decoded: VerificationReceipt = serde_json::from_value(json).unwrap();
+            assert!(verify_receipt_data(&decoded, None, None).is_ok());
+            rec.active_csimp_digest = Some(compute_active_csimp_digest(&[], &[]));
+            assert!(verify_receipt_data(&rec, None, None).is_err());
+            rec.receipt_blake3 =
+                bind_active_csimp_digest(&legacy_hash, rec.active_csimp_digest.as_deref());
+            assert!(verify_receipt_data(&rec, None, None).is_ok());
+            let key = [0x42; 32];
+            rec.bind_active_csimp(&[], &[]).unwrap();
+            assert!(verify_receipt_data(&rec, None, None).is_ok());
+            attach_ed25519_signature(&mut rec, &key);
+            let decoded: VerificationReceipt =
+                serde_json::from_value(serde_json::to_value(&rec).unwrap()).unwrap();
+            assert!(verify_receipt_data_with_policy(&decoded, None, None, None, true).is_ok());
+            for digest in [None, Some(String::new()), Some("forged".into())] {
+                let mut tampered = rec.clone();
+                tampered.active_csimp_digest = digest;
+                assert!(verify_receipt_data(&tampered, None, None).is_err());
+            }
+            rec.bind_active_csimp(&["A.*".into()], &[]).unwrap();
+            assert!(rec.ed25519_signature.is_none());
+            assert!(verify_receipt_data(&rec, None, None).is_ok());
+        }
+    }
+
+    #[test]
+    fn build_verification_receipt_auto_binds_allowed_csimp_env() {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct RestoreEnv(Option<String>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", v),
+                    None => std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP"),
+                }
+            }
+        }
+        let _restore = RestoreEnv(std::env::var("TURBO_LEAN_ALLOWED_CSIMP").ok());
+
+        for empty_val in [None, Some(""), Some(" ,  , ")] {
+            match empty_val {
+                Some(v) => std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", v),
+                None => std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP"),
+            }
+            let rec = build_verification_receipt_with_provenance(
+                "trusted",
+                "standard",
+                "leanprover/lean4:v4.35.0",
+                None,
+                "ih",
+                "act",
+                1,
+                1,
+                0,
+                BTreeMap::new(),
+            );
+            assert!(rec.active_csimp_digest.is_none());
+            assert!(verify_receipt_data(&rec, None, None).is_ok());
+        }
+
+        let baseline = build_verification_receipt_with_provenance(
+            "trusted",
+            "standard",
+            "leanprover/lean4:v4.35.0",
+            None,
+            "ih",
+            "act",
+            1,
+            1,
+            0,
+            BTreeMap::new(),
+        );
+
+        std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", " B.* , A.eq , B.* ");
+        let mut bound = build_verification_receipt_with_provenance(
+            "trusted",
+            "standard",
+            "leanprover/lean4:v4.35.0",
+            None,
+            "ih",
+            "act",
+            1,
+            1,
+            0,
+            BTreeMap::new(),
+        );
+        let expected_digest = compute_active_csimp_digest(&["A.eq".into(), "B.*".into()], &[]);
+        assert_eq!(
+            bound.active_csimp_digest.as_deref(),
+            Some(expected_digest.as_str())
+        );
+        assert_ne!(bound.receipt_blake3, baseline.receipt_blake3);
+        assert!(verify_receipt_data(&bound, None, None).is_ok());
+
+        let mut manual = baseline.clone();
+        manual
+            .bind_active_csimp(&["A.eq".into(), "B.*".into()], &[])
+            .unwrap();
+        assert_eq!(bound.receipt_blake3, manual.receipt_blake3);
+        assert_eq!(bound.active_csimp_digest, manual.active_csimp_digest);
+
+        let entries = vec![("A.eq".into(), "A.slow".into(), "A.fast".into())];
+        bound
+            .bind_active_csimp(&["A.eq".into(), "B.*".into()], &entries)
+            .unwrap();
+        let mut manual_entries = baseline;
+        manual_entries
+            .bind_active_csimp(&["A.eq".into(), "B.*".into()], &entries)
+            .unwrap();
+        assert_eq!(bound.receipt_blake3, manual_entries.receipt_blake3);
+        assert_eq!(
+            bound.active_csimp_digest,
+            manual_entries.active_csimp_digest
+        );
+        assert!(verify_receipt_data(&bound, None, None).is_ok());
+    }
+
+    #[test]
     fn test_verification_receipt_integrity_and_altered_file_pinpointing() {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut files_v1 = BTreeMap::new();
         files_v1.insert(
             "TurboLean/Reflection.lean".to_string(),
@@ -881,6 +1367,9 @@ mod tests {
 
     #[test]
     fn test_receipt_kernel_provenance_domain_separation_and_fail_closed_validation() {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut files = BTreeMap::new();
         files.insert("A.lean".to_string(), "ih_a".to_string());
 
@@ -889,6 +1378,7 @@ mod tests {
             "trusted",
             "standard",
             "leanprover/lean4:v4.35.0",
+            None,
             None,
             "ih",
             "act",
@@ -903,6 +1393,7 @@ mod tests {
             "standard",
             "leanprover/lean4:v4.35.0",
             Some("none"),
+            None,
             "ih",
             "act",
             1,
@@ -916,6 +1407,7 @@ mod tests {
             "standard",
             "leanprover/lean4:v4.35.0",
             Some(""),
+            None,
             "ih",
             "act",
             1,
@@ -997,6 +1489,7 @@ mod tests {
                 r.kernel_engine.as_deref().unwrap(),
                 r.lean_toolchain.as_deref().unwrap(),
                 r.con_leche_rev.as_deref(),
+                r.active_csimp_digest.as_deref(),
                 &r.interface_hash,
                 &r.action_key,
                 r.files_audited,
