@@ -119,7 +119,7 @@ def uset64LE (a : ByteArray) (byteOff : USize) (val : UInt64) : ByteArray :=
       out.set! (byteOff.toNat + i.val) (val >>> (i.val.toUInt64 * 8)).toUInt8) a
   else a
 
-/-- Canonical masked carryless-product forms used by existing pure Lean kernels.
+/-! Canonical masked carryless-product forms used by existing pure Lean kernels.
     Recognition checks every referenced helper body, not the exported symbol. -/
 namespace MaskedClmul
 
