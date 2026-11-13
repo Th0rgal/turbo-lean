@@ -76,8 +76,11 @@ def mkWordsBA (ws : List UInt64) : ByteArray := Id.run do
     idx := idx + 1
   return ba
 
-@[noinline, export p0_borrowed_get]
+@[noinline]
 def borrowedGet (a : @& ByteArray) (off : USize) : UInt64 := uget64LE a off
+
+@[noinline, export p0_borrowed_get]
+def checkedGet (a : ByteArray) (off : USize) : UInt64 := borrowedGet a off
 
 @[noinline, export p0_owned_set]
 def ownedSet (a : ByteArray) (off : USize) (value : UInt64) : ByteArray := uset64LE a off value
@@ -96,8 +99,8 @@ def main (args : List String) : IO Unit := do
     let off := offStr.toNat!.toUSize
     let original := ByteArray.mk ((Array.range size).map fun i => (i * 37 + 11).toUInt8)
     let changed := ownedSet original off (u valueStr)
-    IO.println (borrowedGet original off)
-    IO.println (borrowedGet changed off)
+    IO.println (checkedGet original off)
+    IO.println (checkedGet changed off)
     for byte in original.data do IO.println byte
     for byte in changed.data do IO.println byte
   | [mode, nStr, seedStr] =>
