@@ -276,7 +276,7 @@ def ingestBuildExeModuleDecls (names : Array Lean.Name) (moduleName : String)
   let norm := normalizeAndInlineLocalDefs raw
   let mut clean := norm.decls.filter fun d =>
     d.params.all (fun p => isSupportedParamOrRetType p.ty arch true) &&
-    isSupportedParamOrRetType d.retTy arch true && !codeHasResidualHeapOrTupleAbiOp d.body
+    isSupportedParamOrRetType d.retTy arch true && !declHasResidualHeapOrTupleAbiOp d
   -- Remove callers transitively if their callee could not be lowered. Never
   -- route a scalar native call into a Lean object ABI by guessing its symbol.
   for _ in [:norm.decls.length] do

@@ -1552,19 +1552,32 @@ def validateIngestedModule (mod : LNIRModule) : Lean.CoreM Unit := do
     if reachesDeclInCallGraph edges d.name (mod.decls.length + 2) [] callees then
       Lean.throwError s!"[lean-native] Unsupported self-tail recursion / mutual recursion involving `{d.name}`"
 
-partial def codeHasResidualHeapOrTupleAbiOp : LNIRCode → Bool
-  | .letBind _ ty val k =>
+/-- Residual heap operations remain forbidden. Only RC on explicitly typed
+    ByteArrays is supported by the checked Lean runtime adapters. -/
+partial def codeHasResidualHeapOrTupleAbiOp (code : LNIRCode)
+    (byteArrays : List VarId := []) : Bool :=
+  let bind (v : VarId) (ty : LNIRType) :=
+    if ty == .sarray .i8 then v :: byteArrays else byteArrays.filter (· != v)
+  match code with
+  | .letBind v ty val k =>
     (ty == .objPtr || ty == .taggedPtr) ||
     (match val with
       | .allocCtor .. | .ctorGetObj .. | .ctorGetScalar .. | .boxScalar .. | .unboxScalar .. | .isExclusive .. => true
       | .call "lean_native_ctor_set" .. | .call "lean_native_ctor_tag" .. => true
       | .call "lean_native_ctor_set_scalar" .. | .call "lean_native_ctor_set_tag" .. | .call "lean_native_del_obj" .. => true
-      | _ => false) ||
-    codeHasResidualHeapOrTupleAbiOp k
-  | .incRef .. | .decRef .. => true
-  | .rawStore _ _ _ _ k | .parFor _ _ _ _ _ k => codeHasResidualHeapOrTupleAbiOp k
-  | .ite _ t e | .seqFor _ _ _ _ _ _ t e => codeHasResidualHeapOrTupleAbiOp t || codeHasResidualHeapOrTupleAbiOp e
+      | _ => false) || codeHasResidualHeapOrTupleAbiOp k (bind v ty)
+  | .incRef v _ k | .decRef v _ k =>
+    !byteArrays.contains v || codeHasResidualHeapOrTupleAbiOp k byteArrays
+  | .rawStore _ _ _ _ k | .parFor _ _ _ _ _ k => codeHasResidualHeapOrTupleAbiOp k byteArrays
+  | .ite _ t e => codeHasResidualHeapOrTupleAbiOp t byteArrays || codeHasResidualHeapOrTupleAbiOp e byteArrays
+  | .seqFor idx _ _ acc _ ty step k =>
+    let arrays := (bind acc ty).filter (· != idx)
+    codeHasResidualHeapOrTupleAbiOp step arrays || codeHasResidualHeapOrTupleAbiOp k (bind acc ty)
   | .ret _ | .unreachable => false
+
+def declHasResidualHeapOrTupleAbiOp (d : LNIRDecl) : Bool :=
+  codeHasResidualHeapOrTupleAbiOp d.body (d.params.filterMap fun p =>
+    if p.ty == .sarray .i8 then some p.id else none)
 
 def filterNonInternalHelperDecls (env : Lean.Environment) (rawPairs : List (Lean.Name × String))
     (arch : TargetArch) (mod : LNIRModule) : Lean.CoreM LNIRModule := do
@@ -1581,15 +1594,15 @@ def filterNonInternalHelperDecls (env : Lean.Environment) (rawPairs : List (Lean
     | none => return none
     | some d =>
       let hasExportedNonScalarSig :=
-        d.params.any (fun p => !isSupportedStage1BScalarType p.ty arch) ||
-        !isSupportedStage1BScalarType d.retTy arch ||
-        (inferReturnedType d.body |>.any (fun rt => !isSupportedStage1BScalarType rt arch))
+        d.params.any (fun p => !(isSupportedStage1BScalarType p.ty arch || p.ty == .sarray .i8)) ||
+        !(isSupportedStage1BScalarType d.retTy arch || d.retTy == .sarray .i8) ||
+        (inferReturnedType d.body |>.any (fun rt => !(isSupportedStage1BScalarType rt arch || rt == .sarray .i8)))
       let hasUserUnsupportedSig :=
-        d.params.any (fun p => !(isSupportedScalarOrFloat p.ty arch || (p.borrow && isSupportedSliceType p.ty))) ||
-        !isSupportedScalarOrFloat d.retTy arch ||
-        (inferReturnedType d.body |>.any (fun rt => !isSupportedScalarOrFloat rt arch))
+        d.params.any (fun p => !(isSupportedScalarOrFloat p.ty arch || p.ty == .sarray .i8 || (p.borrow && isSupportedSliceType p.ty))) ||
+        !(isSupportedScalarOrFloat d.retTy arch || d.retTy == .sarray .i8) ||
+        (inferReturnedType d.body |>.any (fun rt => !(isSupportedScalarOrFloat rt arch || rt == .sarray .i8)))
       if isExported then
-        if hasExportedNonScalarSig || codeHasResidualHeapOrTupleAbiOp d.body then
+        if hasExportedNonScalarSig || declHasResidualHeapOrTupleAbiOp d then
           Lean.throwError s!"[lean-native] Exported function `{origName}` has unsupported non-scalar signature or unlowered tuple/heap operations"
         return some mangled
       else if stage1DMangled.contains mangled then
@@ -1599,7 +1612,7 @@ def filterNonInternalHelperDecls (env : Lean.Environment) (rawPairs : List (Lean
       else if hasUserUnsupportedSig then
         return none
       else
-        if codeHasResidualHeapOrTupleAbiOp d.body then
+        if declHasResidualHeapOrTupleAbiOp d then
           Lean.throwError s!"[lean-native] Function `{origName}` contains unlowered heap/object operations after helper inlining"
         return some mangled
   let edges := mod.decls.map fun d => (d.name, collectDirectCallees d.body)
@@ -1617,9 +1630,9 @@ def filterNonInternalHelperDecls (env : Lean.Environment) (rawPairs : List (Lean
     if stage1DMangled.contains d.name then
       if d.params.any (fun p => !isStage1DParamOrRet p.ty) || !isStage1DParamOrRet d.retTy then
         Lean.throwError s!"[lean-native] Live Stage 1D declaration `{d.name}` has unsupported signature"
-    else if d.params.any (fun p => !(isSupportedScalarOrFloat p.ty arch || (p.borrow && isSupportedSliceType p.ty))) ||
-       !isSupportedScalarOrFloat d.retTy arch ||
-       codeHasResidualHeapOrTupleAbiOp d.body then
+    else if d.params.any (fun p => !(isSupportedScalarOrFloat p.ty arch || p.ty == .sarray .i8 || (p.borrow && isSupportedSliceType p.ty))) ||
+       !(isSupportedScalarOrFloat d.retTy arch || d.retTy == .sarray .i8) ||
+       declHasResidualHeapOrTupleAbiOp d then
       Lean.throwError s!"[lean-native] Live declaration `{d.name}` retains non-scalar signature or unlowered object operations"
   return { mod with decls := filteredDecls }
 
@@ -2449,6 +2462,12 @@ def ingestModuleDeclsWith (ingestImpure : Lean.Compiler.LCNF.Decl .impure → Ar
       let d ← ingestMono monoDecl declNames arch
       decls := decls ++ [d]
       rawPairs := rawPairs ++ [(name, d.name)]
+  -- Qualified tail loops have no remaining native self call. Keep rejecting
+  -- every source cycle whose edge survived lowering, including mutual cycles.
+  for (name, symbol) in rawPairs do
+    if let some d := decls.find? (·.name == symbol) then
+      if !(collectDirectCallees d.body).contains symbol then
+        callGraph := callGraph.insert name ((callGraph[name]?.getD []).filter (· != name))
   if declsHaveMutualCycle callGraph then
     Lean.throwError s!"[lean-native] unsupported self-tail recursion / mutual recursion in {moduleName}: no qualified loop lowering"
   let rawMod : LNIRModule := { moduleName := moduleName, decls := decls }
