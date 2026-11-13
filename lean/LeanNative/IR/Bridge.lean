@@ -298,7 +298,7 @@ private def tryIngestScalarSource (name : Lean.Name) : Lean.CoreM (Option LNIRDe
           let .const callee _ := fn | return none
           let some calleeInfo := env.find? callee | return none
           let some n ← signature calleeInfo.type 0 | return none
-          if n != args.size || n == 0 || Lean.isExtern env callee then return none
+          if n != args.size || n == 0 then return none
           let mut binds := []
           let mut vars := []
           let mut next := next
@@ -311,12 +311,16 @@ private def tryIngestScalarSource (name : Lean.Name) : Lean.CoreM (Option LNIRDe
             match lookupCanonicalBinOp? callee, vars with
             | some op, [a, b] => some (.scalar (.binOp op (.var a) (.var b)))
             | _, _ => match calleeInfo with
-              | .defnInfo d => if d.safety == .safe && d.levelParams.isEmpty then
+              | .defnInfo d => if d.safety == .safe && d.levelParams.isEmpty && !Lean.isExtern env callee then
                   some (.call (mangleDeclNameInEnv env callee) vars .i64 false) else none
               | _ => none
           let some expr := expr? | return none
           return some (binds ++ [(next, expr)], next, next + 1)
-    let some (binds, result, _) ← lower 512 body scope arity | return none
+    let direct := tryLowerGfSimdIntrinsic env name (List.range arity) .i64 ((List.range arity).map fun _ => .i64)
+    let lowered ← match direct with
+      | some expr => pure (some ([(arity, expr)], arity, arity + 1))
+      | none => lower 512 body scope arity
+    let some (binds, result, _) := lowered | return none
     let params := (List.range arity).map fun i =>
       ({ id := i, name := s!"arg{i}", ty := .i64 } : LNIRParam)
     let body := binds.foldr (fun (v, e) k => LNIRCode.letBind v .i64 e k) (.ret result)
