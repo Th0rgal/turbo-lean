@@ -454,11 +454,13 @@ fn test_stage1_qualified_decl_selection_cli_and_stateful() {
     assert!(build.status().unwrap().success());
     let binary = std::env::current_exe()
         .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("turbo-lean");
+        .ancestors()
+        .skip(1)
+        .find_map(|d| {
+            let p = d.join("turbo-lean");
+            p.is_file().then_some(p)
+        })
+        .unwrap();
     let dir = std::env::temp_dir().join(format!(
         "turbo_stage1_selection_{}",
         crate::pack::next_tmp_id()

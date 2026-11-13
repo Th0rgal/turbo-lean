@@ -10,7 +10,7 @@ use crate::pack::{
     run_or_read_cached_fastcheck_bin, save_compiled_bin_to_shared, shared_cas_blobs_dir,
     shared_fastcheck_cgen_path, try_import_from_shared_cas_with_domain, try_parse_v3_header,
     try_populate_cached_bin_from_shared, CheckShardHttpRequest, CheckShardsBatchRequest,
-    CheckShardsBatchResponse, DeltaManifest, ExportDeltaRequest, FastCheckHttpRequest,
+    CheckShardsBatchResponse, ExportDeltaRequest, FastCheckHttpRequest,
     FASTCHECK_NO_MAIN_SUFFIX, FASTCHECK_PRELUDE_HARNESS,
 };
 use crate::zygote::LocalZygoteDaemonInfo;
@@ -21,6 +21,30 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
+
+enum LocalOrTcpStream {
+    Tcp(std::net::TcpStream),
+    Unix(std::os::unix::net::UnixStream),
+}
+
+thread_local! {
+    static LOCAL_REPLY: std::cell::RefCell<Option<Option<crate::zygote::LocalPayload>>> = const { std::cell::RefCell::new(None) };
+}
+
+impl Read for LocalOrTcpStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self { Self::Tcp(s) => s.read(buf), Self::Unix(s) => s.read(buf) }
+    }
+}
+
+impl Write for LocalOrTcpStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self { Self::Tcp(s) => s.write(buf), Self::Unix(s) => s.write(buf) }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self { Self::Tcp(s) => s.flush(), Self::Unix(s) => s.flush() }
+    }
+}
 
 struct ServerActivity {
     last_completed: std::time::Instant,
@@ -46,10 +70,152 @@ impl ServerActivity {
     }
 }
 
+fn materialize_request_body(body: Vec<u8>, shared: Option<&str>) -> Result<(Vec<u8>, Option<u64>)> {
+    let payload = shared.map(crate::zygote::LocalPayload::read).transpose()?;
+    let timeout = |bytes: &[u8]| {
+        serde_json::from_slice::<serde_json::Value>(bytes)
+            .ok()
+            .and_then(|v| v.get("timeout_ms").and_then(|v| v.as_u64()))
+    };
+    let request_timeout = payload
+        .as_deref()
+        .and_then(timeout)
+        .or_else(|| timeout(&body));
+    Ok((payload.unwrap_or(body), request_timeout))
+}
+
+fn apply_mcp_timeout(request: &mut serde_json::Value, timeout: Option<u64>) {
+    if let (Some(timeout), Some(object)) = (timeout, request.as_object_mut()) {
+        object.insert("timeout_ms".into(), serde_json::json!(timeout));
+    }
+}
+
+fn normalize_mcp_workspace(
+    request: &mut serde_json::Value,
+    project_dir: Option<&Path>,
+    caller_cwd: &Path,
+) -> Option<std::path::PathBuf> {
+    let explicit = request
+        .pointer("/params/arguments/project_dir")
+        .and_then(|v| v.as_str())
+        .map(std::path::PathBuf::from)
+        .or_else(|| project_dir.map(Path::to_path_buf))
+        .map(|p| {
+            if p.is_relative() {
+                caller_cwd.join(p)
+            } else {
+                p
+            }
+        });
+    let base = explicit.as_deref().unwrap_or(caller_cwd);
+    if let Some(args) = request
+        .pointer_mut("/params/arguments")
+        .and_then(|v| v.as_object_mut())
+    {
+        for key in ["file", "cache_dir"] {
+            if let Some(path) = args.get(key).and_then(|v| v.as_str()) {
+                if !path.is_empty() && Path::new(path).is_relative() {
+                    args.insert(key.into(), serde_json::json!(base.join(path)));
+                }
+            }
+        }
+        if let Some(project) = &explicit {
+            args.insert("project_dir".into(), serde_json::json!(project));
+        }
+    }
+    explicit
+}
+
 #[cfg(test)]
 mod tests {
     use super::ServerActivity;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn mcp_workspace_preserves_nested_lake_discovery() {
+        let root = std::env::temp_dir().join(format!("mcp-workspace-r8-{}", std::process::id()));
+        let project = root.join("child");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("lakefile.toml"), "name = \"child\"").unwrap();
+        for file in [
+            "child/Main.lean".to_string(),
+            project.join("Main.lean").to_string_lossy().into_owned(),
+        ] {
+            let mut req = serde_json::json!({"params":{"name":"turbo_fast_check","arguments":{"file":file,"cache_dir":"cache"}}});
+            assert_eq!(super::normalize_mcp_workspace(&mut req, None, &root), None);
+            assert!(req.pointer("/params/arguments/project_dir").is_none());
+            let file = std::path::Path::new(
+                req.pointer("/params/arguments/file")
+                    .unwrap()
+                    .as_str()
+                    .unwrap(),
+            );
+            assert_eq!(crate::lake_build::find_project_root(file), project);
+            assert_eq!(
+                req.pointer("/params/arguments/cache_dir").unwrap(),
+                &serde_json::json!(root.join("cache"))
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mcp_timeout_leaves_non_object_requests_unchanged() {
+        for original in [
+            serde_json::json!([]),
+            serde_json::json!([{"method": "ping"}]),
+            serde_json::Value::Null,
+            serde_json::json!(37),
+            serde_json::json!("request"),
+        ] {
+            let mut request = original.clone();
+            super::apply_mcp_timeout(&mut request, Some(99));
+            assert_eq!(request, original);
+        }
+        let mut request = serde_json::json!({"timeout_ms": 37});
+        super::apply_mcp_timeout(&mut request, None);
+        assert_eq!(request["timeout_ms"], 37);
+        super::apply_mcp_timeout(&mut request, Some(99));
+        assert_eq!(request["timeout_ms"], 99);
+    }
+
+    #[test]
+    fn shared_request_timeout_is_read_after_materialization() -> anyhow::Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("TURBO_LEAN_STAGING_DIR");
+        let root =
+            std::env::temp_dir().join(format!("request-payload-{}", crate::pack::next_tmp_id()));
+        std::env::set_var("TURBO_LEAN_STAGING_DIR", &root);
+        let payload = crate::zygote::LocalPayload::create(br#"{"timeout_ms":37,"request":{}}"#)?;
+        let (bytes, timeout) = super::materialize_request_body(
+            br#"{"timeout_ms":99}"#.to_vec(),
+            Some(&payload.tag()),
+        )?;
+        assert_eq!(timeout, Some(37));
+        assert_eq!(bytes, br#"{"timeout_ms":37,"request":{}}"#);
+        let payload = crate::zygote::LocalPayload::create(br#"{"request":{}}"#)?;
+        assert_eq!(
+            super::materialize_request_body(
+                br#"{"timeout_ms":99}"#.to_vec(),
+                Some(&payload.tag())
+            )?
+            .1,
+            Some(99)
+        );
+        assert_eq!(
+            super::materialize_request_body(br#"{"timeout_ms":71}"#.to_vec(), None)?.1,
+            Some(71)
+        );
+        drop(payload);
+        match previous {
+            Some(value) => std::env::set_var("TURBO_LEAN_STAGING_DIR", value),
+            None => std::env::remove_var("TURBO_LEAN_STAGING_DIR"),
+        }
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
 
     #[test]
     fn admission_and_expiry_share_one_state_machine() {
@@ -80,6 +246,59 @@ mod tests {
         }
         assert!(!state.admit());
         assert_eq!(state.active, 64);
+    }
+
+    #[test]
+    fn shard_policy_is_complete_and_untrusted_requests_are_empty() -> anyhow::Result<()> {
+        let root = std::env::temp_dir().join(format!("shard-policy-{}-{}", std::process::id(), crate::pack::next_tmp_id()));
+        let store = crate::db::TurboStore::open(Some(&root))?;
+        let policy = crate::zygote::REQUEST_POLICY_KEYS.into_iter()
+            .map(|key| (key.to_string(), "Policy.explicit".to_string())).collect();
+        crate::zygote::set_inbound_policy(policy);
+        for domain in ["trusted", "untrusted"] {
+            let (_, env, _) = super::HttpShardReceiptContext::resolve_base(
+                &store, "leanprover/lean4:v4.35.0", "", "import Init\n", None, &[], "", domain)?;
+            for key in crate::zygote::REQUEST_POLICY_KEYS.into_iter().skip(1) {
+                assert_eq!(env.get(key).map(String::as_str), Some(if domain == "trusted" { "Policy.explicit" } else { "" }));
+            }
+            assert_eq!(env[crate::splitter::ALLOWED_AXIOMS_ENV], "");
+        }
+        crate::zygote::clear_inbound_policy();
+        drop(store);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn request_axiom_policy_ignores_ambient_env_when_inbound_policy_is_set() {
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os(crate::splitter::ALLOWED_AXIOMS_ENV);
+        std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, "*");
+
+        crate::zygote::set_inbound_policy(std::collections::BTreeMap::new());
+        let (allowed_empty, csv_empty) = super::resolve_request_axiom_policy(None, "trusted");
+        assert_eq!(csv_empty, "");
+        assert_eq!(allowed_empty.len(), crate::splitter::STANDARD_AXIOMS.len());
+
+        crate::zygote::set_inbound_policy(std::collections::BTreeMap::from([(
+            crate::splitter::ALLOWED_AXIOMS_ENV.to_string(),
+            "Custom.ax".to_string(),
+        )]));
+        let (_, csv_inbound) = super::resolve_request_axiom_policy(None, "trusted");
+        assert_eq!(csv_inbound, "Custom.ax");
+        let (_, csv_untrusted) = super::resolve_request_axiom_policy(None, "untrusted");
+        assert_eq!(csv_untrusted, "");
+
+        crate::zygote::clear_inbound_policy();
+        match prev {
+            Some(v) => std::env::set_var(crate::splitter::ALLOWED_AXIOMS_ENV, v),
+            None => std::env::remove_var(crate::splitter::ALLOWED_AXIOMS_ENV),
+        }
     }
 }
 
@@ -195,6 +414,15 @@ pub fn serve_cas_http_with_auth(
 ) -> Result<()> {
     let is_loopback_bind = is_loopback_listen_addr(listen_addr);
     let is_daemon = std::env::var("TURBO_LEAN_DAEMON").is_ok();
+    if is_daemon {
+        for key in crate::zygote::REQUEST_POLICY_KEYS
+            .into_iter()
+            .chain(crate::zygote::MCP_RUNTIME_POLICY_KEYS)
+        {
+            std::env::remove_var(key);
+            std::env::remove_var(format!("{key}_FROM_CONFIG"));
+        }
+    }
     let env_api_tok = std::env::var("TURBO_LEAN_API_TOKEN").ok();
     let env_daemon_tok = std::env::var("TURBO_LEAN_DAEMON_TOKEN").ok();
     let resolved_token = resolve_server_auth_token(
@@ -221,8 +449,19 @@ pub fn serve_cas_http_with_auth(
         }
     }
     let startup_lifecycle = crate::zygote::lifecycle_lock(false)?;
+    crate::zygote::ensure_staging_namespace_dir(true)?;
     let listener = TcpListener::bind(listen_addr)
         .with_context(|| format!("Failed to bind turbo-lean server on {}", listen_addr))?;
+    let socket_path = is_daemon.then(|| std::env::var_os("TURBO_LEAN_DAEMON_SOCKET")).flatten().map(std::path::PathBuf::from);
+    let unix_listener = socket_path.as_ref().map(|path| -> Result<_> {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::remove_file(path);
+        let (bind_path, _directory) = crate::zygote::unix_socket_path(path)?;
+        let listener = std::os::unix::net::UnixListener::bind(bind_path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        listener.set_nonblocking(true)?;
+        Ok(listener)
+    }).transpose()?;
     if let Ok(state_path) = std::env::var("TURBO_LEAN_DAEMON_STATE_FILE") {
         if let Ok(current_exe) = std::env::current_exe() {
             let (exe_mtime_sec, exe_mtime_nsec, _) = fs::metadata(&current_exe)
@@ -244,23 +483,6 @@ pub fn serve_cas_http_with_auth(
         }
     }
     let store = TurboStore::open(store_root)?;
-    let local_mutation_seq: u64 = 0;
-    let query_data_version = |st: &TurboStore| -> i64 {
-        st.conn
-            .query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
-            .unwrap_or(0)
-    };
-    let init_dv = query_data_version(&store);
-    let cached_manifest: Option<((i64, u64), DeltaManifest, Vec<u8>)> =
-        get_store_manifest(&store, true)
-            .ok()
-            .and_then(|m| serde_json::to_vec(&m).ok().map(|b| (m, b)))
-            .map(|(m, b)| ((init_dv, local_mutation_seq), m, b));
-    let cached_export_local: Option<((i64, u64), Vec<u8>)> =
-        export_pack_filtered_with_mode(&store, true, &HashSet::new(), &HashSet::new(), true)
-            .ok()
-            .map(|(_, _, _, b)| ((init_dv, local_mutation_seq), b));
-    let cached_export: Option<((i64, u64), Vec<u8>)> = None;
 
     // Automatic daemons warm workers on demand. A detached prewarm could still spawn
     // children and recreate staging while the idle watchdog was shutting them down.
@@ -351,22 +573,8 @@ pub fn serve_cas_http_with_auth(
         gpu_enable
     );
 
-    struct ServerSharedState {
-        store: TurboStore,
-        local_mutation_seq: u64,
-        cached_manifest: Option<((i64, u64), DeltaManifest, Vec<u8>)>,
-        cached_export_local: Option<((i64, u64), Vec<u8>)>,
-        cached_export: Option<((i64, u64), Vec<u8>)>,
-    }
-
-    let shared = std::sync::Arc::new(std::sync::Mutex::new(ServerSharedState {
-        store,
-        local_mutation_seq,
-        cached_manifest,
-        cached_export_local,
-        cached_export,
-    }));
-    let store_root_buf = store_root.map(|p| p.to_path_buf());
+    let store_root_buf = Some(store.root.clone());
+    drop(store);
     let expected_token = resolved_token;
     // Count requests and update a monotonic idle clock under one lock: a long request
     // receives a full idle period after completion, and expiry cannot race request entry.
@@ -387,17 +595,29 @@ pub fn serve_cas_http_with_auth(
     drop(startup_lifecycle);
     listener.set_nonblocking(true)?;
     let mut listener = Some(listener);
+    let mut unix_listener = unix_listener;
     loop {
         // Admission and expiry have one owner and one lock. No accepted connection can
         // be waiting for this lock when we decide to close the listening socket.
         let mut state = activity.lock().unwrap();
-        let mut stream = match listener.as_ref().unwrap().accept() {
-            Ok((stream, _)) => stream,
+        let accepted = unix_listener.as_ref().map(|l| l.accept().map(|(s, _)| LocalOrTcpStream::Unix(s)))
+            .filter(|r| !matches!(r, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock))
+            .unwrap_or_else(|| {
+                listener
+                    .as_ref()
+                    .unwrap()
+                    .accept()
+                    .map(|(s, _)| LocalOrTcpStream::Tcp(s))
+            });
+        let mut stream = match accepted {
+            Ok(stream) => stream,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if state.expired(std::time::Instant::now(), idle_timeout) {
                     // Closing refuses any connections queued after accept returned WouldBlock.
                     // Withdraw every discovery file before committing to shutdown.
                     drop(listener.take());
+                    drop(unix_listener.take());
+                    if let Some(path) = &socket_path { let _ = fs::remove_file(path); }
                     let lifecycle = crate::zygote::lifecycle_exclusive_lock()?;
                     for key in [
                         "TURBO_LEAN_DAEMON_STATE_FILE",
@@ -407,9 +627,9 @@ pub fn serve_cas_http_with_auth(
                             let _ = fs::remove_file(path);
                         }
                     }
-                    let _ = fs::remove_file(
-                        shared.lock().unwrap().store.root.join("zygote_daemon.json"),
-                    );
+                    if let Some(root) = &store_root_buf {
+                        let _ = fs::remove_file(root.join("zygote_daemon.json"));
+                    }
                     drop(state);
                     crate::zygote::shutdown_local_daemon(&lifecycle);
                     break;
@@ -420,10 +640,20 @@ pub fn serve_cas_http_with_auth(
             }
             Err(e) => return Err(e.into()),
         };
-        let _ = stream.set_nonblocking(false);
-        let _ = stream.set_nodelay(true);
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+        let local_transport = matches!(stream, LocalOrTcpStream::Unix(_));
+        match &stream {
+            LocalOrTcpStream::Tcp(s) => {
+                let _ = s.set_nonblocking(false);
+                let _ = s.set_nodelay(true);
+                let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+            }
+            LocalOrTcpStream::Unix(s) => {
+                let _ = s.set_nonblocking(false);
+                let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(30)));
+            }
+        }
         if !state.admit() {
             drop(state);
             let _ = write_http_response(
@@ -436,7 +666,6 @@ pub fn serve_cas_http_with_auth(
         }
         drop(state);
         let activity_guard = activity.clone();
-        let shared_ref = shared.clone();
         let store_root_clone = store_root_buf.clone();
         let expected_token_clone = expected_token.clone();
 
@@ -447,14 +676,27 @@ pub fn serve_cas_http_with_auth(
             // rejected 503 opens none. Concurrent handlers are safe because every memo entry
             // records its window; see `module_builder::reset_lake_inputs_tag_memo`.
             crate::module_builder::reset_lake_inputs_tag_memo();
-            struct ConnDropGuard(std::sync::Arc<std::sync::Mutex<ServerActivity>>);
+            struct ConnDropGuard(std::sync::Arc<std::sync::Mutex<ServerActivity>>, Option<std::os::unix::net::UnixStream>);
             impl Drop for ConnDropGuard {
                 fn drop(&mut self) {
+                    crate::zygote::clear_inbound_policy();
+                    LOCAL_REPLY.with(|slot| {
+                        let payload = slot.borrow_mut().take().flatten();
+                        if payload.is_some() {
+                            if let Some(stream) = &mut self.1 {
+                                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+                                let _ = stream.read_exact(&mut [0u8; 1]);
+                            }
+                        }
+                    });
                     let mut state = self.0.lock().unwrap();
                     state.complete(std::time::Instant::now());
                 }
             }
-            let _conn_guard = ConnDropGuard(activity_guard);
+            crate::zygote::clear_inbound_policy();
+            let reply_stream = match &stream { LocalOrTcpStream::Unix(s) => s.try_clone().ok(), _ => None };
+            LOCAL_REPLY.with(|slot| *slot.borrow_mut() = local_transport.then_some(None));
+            let _conn_guard = ConnDropGuard(activity_guard, reply_stream);
             let request_started = std::time::Instant::now();
             let Ok(_lifecycle) = crate::zygote::lifecycle_lock(false) else {
                 return;
@@ -464,6 +706,7 @@ pub fn serve_cas_http_with_auth(
             let mut content_len = 0usize;
             let mut req_token: Option<String> = None;
             let mut req_bearer: Option<String> = None;
+            let mut shared_payload = None;
             let mut body: Vec<u8>;
             {
                 let mut reader = BufReader::new(&mut stream);
@@ -478,6 +721,9 @@ pub fn serve_cas_http_with_auth(
                     }
                     if hline.len() >= 15 && hline[..15].eq_ignore_ascii_case("content-length:") {
                         content_len = hline[15..].trim().parse().unwrap_or(0);
+                    } else if let Some((key, value)) = hline.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("x-turbo-shm")) {
+                        let _ = key;
+                        shared_payload = Some(value.trim().to_string());
                     } else if hline.len() >= 14
                         && hline[..14].eq_ignore_ascii_case("x-turbo-token:")
                     {
@@ -505,9 +751,6 @@ pub fn serve_cas_http_with_auth(
                     return;
                 }
             }
-            let request_timeout_ms = serde_json::from_slice::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|v| v.get("timeout_ms").and_then(|v| v.as_u64()));
             let parts: Vec<&str> = req_line.split_whitespace().collect();
             if parts.len() < 2 {
                 return;
@@ -544,14 +787,84 @@ pub fn serve_cas_http_with_auth(
                 }
             }
             let caller_authorized_trusted = token_verified || (is_daemon && is_loopback_bind);
-
-            let query_dv = |st: &TurboStore| -> i64 {
-                st.conn
-                    .query_row("PRAGMA data_version", [], |r| r.get::<_, i64>(0))
-                    .unwrap_or(0)
-            };
+            if shared_payload.is_some() && (!local_transport || !token_verified) {
+                let _ = write_http_response(
+                    &mut stream,
+                    403,
+                    "application/json",
+                    b"{\"error\":\"local payload requires authenticated Unix transport\"}",
+                );
+                return;
+            }
+            let request_timeout_ms;
+            match materialize_request_body(body, shared_payload.as_deref()) {
+                Ok((bytes, timeout)) => {
+                    body = bytes;
+                    request_timeout_ms = timeout;
+                }
+                Err(error) => {
+                    let _ = write_json_response(
+                        &mut stream,
+                        400,
+                        &serde_json::json!({"error": error.to_string()}),
+                    );
+                    return;
+                }
+            }
+            if let Some(mut policy) = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| {
+                    v.get("policy_tags")
+                        .cloned()
+                        .and_then(|p| {
+                            serde_json::from_value::<std::collections::BTreeMap<String, String>>(p)
+                                .ok()
+                        })
+                        .or_else(|| {
+                            (!caller_authorized_trusted || path == "/mcp")
+                                .then(std::collections::BTreeMap::new)
+                        })
+                })
+            {
+                policy.retain(|key, _| {
+                    crate::zygote::REQUEST_POLICY_KEYS.contains(&key.as_str())
+                        || crate::zygote::MCP_RUNTIME_POLICY_KEYS.contains(&key.as_str())
+                });
+                if !caller_authorized_trusted {
+                    policy.clear();
+                }
+                crate::zygote::set_inbound_policy(policy);
+            } else if !caller_authorized_trusted || path == "/mcp" {
+                crate::zygote::set_inbound_policy(std::collections::BTreeMap::new());
+            }
 
             match (method, path) {
+                ("POST", "/mcp") if local_transport && token_verified => {
+                    #[derive(serde::Deserialize)]
+                    struct McpRequest {
+                        request: serde_json::Value,
+                        project_dir: Option<std::path::PathBuf>,
+                        cache_dir: std::path::PathBuf,
+                        caller_cwd: std::path::PathBuf,
+                    }
+                    match serde_json::from_slice::<McpRequest>(&body) {
+                        Ok(mut req) => {
+                            let explicit_project_dir = normalize_mcp_workspace(
+                                &mut req.request,
+                                req.project_dir.as_deref(),
+                                &req.caller_cwd,
+                            );
+                            apply_mcp_timeout(&mut req.request, request_timeout_ms);
+                            let reply = crate::mcp::handle_mcp_jsonrpc_request(
+                                &req.request,
+                                explicit_project_dir.as_deref().or(Some(&req.caller_cwd)),
+                                Some(&req.cache_dir),
+                            );
+                            let _ = write_json_response(&mut stream, 200, &reply);
+                        }
+                        Err(error) => { let _ = write_json_response(&mut stream, 400, &serde_json::json!({"error": error.to_string()})); }
+                    }
+                }
                 ("GET", "/health") | ("GET", "/status") => {
                     if let Ok(st_store) = TurboStore::open(store_root_clone.as_deref()) {
                         if let Ok(st) = st_store.storage_status() {
@@ -570,143 +883,47 @@ pub fn serve_cas_http_with_auth(
                     }
                 }
                 ("GET", "/manifest") => {
-                    if let Ok(mut g) = shared_ref.lock() {
-                        if !g.store.root.join("state.db").exists() {
-                            if let Ok(fresh) = TurboStore::open(store_root_clone.as_deref()) {
-                                g.store = fresh;
-                                g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
-                            }
-                        }
-                        let stamp = (query_dv(&g.store), g.local_mutation_seq);
-                        if g.cached_manifest.as_ref().map(|(s, _, _)| *s) != Some(stamp) {
-                            if let Ok(manifest) = get_store_manifest(&g.store, true) {
-                                if let Ok(payload) = serde_json::to_vec(&manifest) {
-                                    g.cached_manifest = Some((stamp, manifest, payload));
-                                }
-                            }
-                        }
-                        if let Some((_, _, ref payload)) = g.cached_manifest {
-                            let _ =
-                                write_http_response(&mut stream, 200, "application/json", payload);
+                    if let Ok(reader) = TurboStore::open(store_root_clone.as_deref()) {
+                        if let Ok(manifest) = get_store_manifest(&reader, true) {
+                            let _ = write_json_response(&mut stream, 200, &manifest);
                         }
                     }
                 }
-                ("GET", "/export-local") => {
-                    if let Ok(mut g) = shared_ref.lock() {
-                        let stamp = (query_dv(&g.store), g.local_mutation_seq);
-                        if g.cached_export_local.as_ref().map(|(s, _)| *s) != Some(stamp) {
-                            if let Ok((_, _, _, bytes)) = export_pack_filtered_with_mode(
-                                &g.store,
+                ("GET", "/export-local") | ("GET", "/export") => {
+                    if let Ok(reader) = TurboStore::open(store_root_clone.as_deref()) {
+                        if let Ok((_, _, _, bytes)) = export_pack_filtered_with_mode(
+                                &reader,
                                 true,
                                 &HashSet::new(),
                                 &HashSet::new(),
-                                true,
+                                path == "/export-local",
                             ) {
-                                g.cached_export_local = Some((stamp, bytes));
-                            }
-                        }
-                        if let Some((_, ref bytes)) = g.cached_export_local {
-                            let _ = write_pack_response(&mut stream, 200, bytes);
-                        }
-                    }
-                }
-                ("GET", "/export") => {
-                    if let Ok(mut g) = shared_ref.lock() {
-                        let stamp = (query_dv(&g.store), g.local_mutation_seq);
-                        if g.cached_export.as_ref().map(|(s, _)| *s) != Some(stamp) {
-                            if let Ok((_, _, _, bytes)) = export_pack_filtered_bytes(
-                                &g.store,
-                                true,
-                                &HashSet::new(),
-                                &HashSet::new(),
-                            ) {
-                                g.cached_export = Some((stamp, bytes));
-                            }
-                        }
-                        if let Some((_, ref bytes)) = g.cached_export {
-                            let _ = write_pack_response(&mut stream, 200, bytes);
-                        }
-                    }
-                }
-                ("POST", "/export-delta") => {
-                    let req: ExportDeltaRequest = serde_json::from_slice(&body).unwrap_or_default();
-                    let ex_actions: HashSet<String> = req.exclude_actions.into_iter().collect();
-                    let ex_blobs: HashSet<String> = req.exclude_blobs.into_iter().collect();
-                    if let Ok(st_store) = TurboStore::open(store_root_clone.as_deref()) {
-                        if let Ok((_, _, _, bytes)) =
-                            export_pack_filtered_bytes(&st_store, true, &ex_actions, &ex_blobs)
-                        {
                             let _ = write_pack_response(&mut stream, 200, &bytes);
                         }
                     }
                 }
-                ("POST", "/pull-delta") => {
+                ("POST", "/export-delta") | ("POST", "/pull-delta") => {
                     let req: ExportDeltaRequest = serde_json::from_slice(&body).unwrap_or_default();
-                    if let Ok(mut g) = shared_ref.lock() {
-                        let stamp = (query_dv(&g.store), g.local_mutation_seq);
-                        if req.exclude_actions.is_empty() && req.exclude_blobs.is_empty() {
-                            if g.cached_export.as_ref().map(|(s, _)| *s) != Some(stamp) {
-                                if let Ok((_, _, _, bytes)) = export_pack_filtered_bytes(
-                                    &g.store,
-                                    true,
-                                    &HashSet::new(),
-                                    &HashSet::new(),
-                                ) {
-                                    g.cached_export = Some((stamp, bytes));
-                                }
-                            }
-                            if let Some((_, ref bytes)) = g.cached_export {
-                                let _ = write_pack_response(&mut stream, 200, bytes);
-                            }
-                        } else {
-                            if g.cached_manifest.as_ref().map(|(s, _, _)| *s) != Some(stamp) {
-                                if let Ok(manifest) = get_store_manifest(&g.store, true) {
-                                    if let Ok(payload) = serde_json::to_vec(&manifest) {
-                                        g.cached_manifest = Some((stamp, manifest, payload));
-                                    }
-                                }
-                            }
-                            let ex_actions: HashSet<String> =
-                                req.exclude_actions.into_iter().collect();
-                            let ex_blobs: HashSet<String> = req.exclude_blobs.into_iter().collect();
-                            let has_missing = g
-                                .cached_manifest
-                                .as_ref()
-                                .map(|(_, m, _)| {
-                                    m.action_keys.iter().any(|k| !ex_actions.contains(k))
-                                        || m.blob_hashes.iter().any(|b| !ex_blobs.contains(b))
-                                })
-                                .unwrap_or(true);
-                            if !has_missing {
-                                let _ = write_pack_response(&mut stream, 200, b"");
-                            } else if let Ok((n_acts, n_blobs, _, bytes)) =
-                                export_pack_filtered_bytes(&g.store, true, &ex_actions, &ex_blobs)
-                            {
-                                let payload: &[u8] = if n_acts == 0 && n_blobs == 0 {
-                                    b""
-                                } else {
-                                    &bytes
-                                };
-                                let _ = write_pack_response(&mut stream, 200, payload);
-                            }
+                    let ex_actions: HashSet<String> = req.exclude_actions.into_iter().collect();
+                    let ex_blobs: HashSet<String> = req.exclude_blobs.into_iter().collect();
+                    if let Ok(st_store) = TurboStore::open(store_root_clone.as_deref()) {
+                        if let Ok((actions, blobs, _, bytes)) =
+                            export_pack_filtered_bytes(&st_store, true, &ex_actions, &ex_blobs)
+                        {
+                            let payload = if path == "/pull-delta" && actions == 0 && blobs == 0 { &[][..] } else { &bytes };
+                            let _ = write_pack_response(&mut stream, 200, payload);
                         }
                     }
                 }
                 ("POST", "/import") | ("POST", "/import-delta") => {
-                    if let Ok(mut g) = shared_ref.lock() {
-                        if !g.store.root.join("state.db").exists() {
-                            if let Ok(fresh) = TurboStore::open(store_root_clone.as_deref()) {
-                                g.store = fresh;
-                                g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
-                            }
-                        }
+                    if let Ok(mut store) = TurboStore::open(store_root_clone.as_deref()) {
                         let v3_res: Option<Result<(usize, usize)>> = try_parse_v3_header(&body)
                             .filter(|_| shared_cas_blobs_dir().exists())
                             .and_then(|manifest| {
                                 match resolve_pack_import_trust_domain(&manifest, None, None, false)
                                 {
                                     Ok(td) => match try_import_from_shared_cas_with_domain(
-                                        &mut g.store,
+                                        &mut store,
                                         &manifest,
                                         td,
                                     ) {
@@ -719,13 +936,9 @@ pub fn serve_cas_http_with_auth(
                             });
                         let import_res = match v3_res {
                             Some(r) => r,
-                            None => import_pack_bytes_with_policy(
-                                &mut g.store,
-                                &body,
-                                None,
-                                None,
-                                false,
-                            ),
+                            None => {
+                                import_pack_bytes_with_policy(&mut store, &body, None, None, false)
+                            }
                         };
                         match import_res {
                             Ok((acts, blobs)) => {
@@ -740,15 +953,6 @@ pub fn serve_cas_http_with_auth(
                                     }),
                                 );
                                 drop(stream);
-                                if acts > 0 || blobs > 0 {
-                                    g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
-                                    let stamp = (query_dv(&g.store), g.local_mutation_seq);
-                                    if let Ok(m) = get_store_manifest(&g.store, true) {
-                                        if let Ok(b) = serde_json::to_vec(&m) {
-                                            g.cached_manifest = Some((stamp, m, b));
-                                        }
-                                    }
-                                }
                             }
                             Err(e) => {
                                 let _ = write_json_response(
@@ -864,9 +1068,6 @@ pub fn serve_cas_http_with_auth(
                                     shard_domain,
                                     &items,
                                 );
-                                if let Ok(mut g) = shared_ref.lock() {
-                                    g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
-                                }
                             }
                             let _ = write_json_response(&mut stream, 200, &val);
                             drop(stream);
@@ -901,9 +1102,6 @@ pub fn serve_cas_http_with_auth(
                         Ok((resp, deferred_pub, deferred_hits)) => {
                             if let Some((tc, td, items)) = deferred_pub {
                                 let _ = req_store.batch_publish_theorem_shards(&tc, &td, &items);
-                                if let Ok(mut g) = shared_ref.lock() {
-                                    g.local_mutation_seq = g.local_mutation_seq.wrapping_add(1);
-                                }
                             }
                             let _ = write_json_response(&mut stream, 200, &resp);
                             drop(stream);
@@ -951,6 +1149,8 @@ pub fn serve_cas_http_with_auth(
                         env_vars: Option<std::collections::HashMap<String, String>>,
                         #[serde(default)]
                         allowed_axioms: Option<Vec<String>>,
+                        #[serde(default)]
+                        policy_tags: std::collections::BTreeMap<String, String>,
                         #[serde(default)]
                         timeout_ms: Option<u64>,
                         #[serde(default)]
@@ -1137,6 +1337,13 @@ pub fn serve_cas_http_with_auth(
                         crate::splitter::ALLOWED_AXIOMS_ENV.to_string(),
                         eval_allowed_csv,
                     );
+                    for key in crate::zygote::REQUEST_POLICY_KEYS.into_iter().skip(1) {
+                        env_vars.insert(key.to_string(), if caller_authorized_trusted {
+                            req.policy_tags.get(key).cloned().unwrap_or_default()
+                        } else {
+                            String::new()
+                        });
+                    }
                     let pre_resolved = if let Some(expected) = req.execution_identity.as_deref() {
                         let (imports, _) = crate::zygote::split_shard_for_zygote(src);
                         let actual = crate::zygote::resolve_zygote_context(
@@ -1367,27 +1574,26 @@ fn resolve_request_axiom_policy(
             String::new(),
         );
     }
-    match req_extra {
-        Some(extra) => {
-            let mut cleaned: Vec<String> = extra
-                .iter()
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .map(String::from)
-                .collect();
-            cleaned.sort();
-            cleaned.dedup();
-            let csv = cleaned.join(",");
-            (crate::splitter::allowed_axioms_with_extra(&cleaned), csv)
-        }
-        None => {
-            let mut extra = crate::splitter::extra_allowed_axiom_patterns();
-            extra.sort();
-            extra.dedup();
-            let csv = extra.join(",");
-            (crate::splitter::allowed_axioms_with_extra(&extra), csv)
-        }
-    }
+    let mut cleaned: Vec<String> = match req_extra {
+        Some(extra) => extra
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        None => crate::zygote::request_policy(&Default::default())
+            .remove(crate::splitter::ALLOWED_AXIOMS_ENV)
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+    };
+    cleaned.sort();
+    cleaned.dedup();
+    let csv = cleaned.join(",");
+    (crate::splitter::allowed_axioms_with_extra(&cleaned), csv)
 }
 
 fn source_may_have_hygiene_issue(s: &str) -> bool {
@@ -1472,6 +1678,7 @@ impl HttpShardReceiptContext {
         lean_args_digest: Option<&str>,
         allowed_axioms: &[String],
         allowed_axioms_csv: &str,
+        trust_domain: &str,
     ) -> Result<(
         Self,
         std::collections::HashMap<String, String>,
@@ -1479,6 +1686,9 @@ impl HttpShardReceiptContext {
     )> {
         let (mut env_vars, lean_bin) =
             resolve_server_lean_env_and_bin(store, toolchain, req_lean_path)?;
+        for (key, value) in crate::zygote::request_policy(&env_vars) {
+            env_vars.insert(key, if trust_domain == "trusted" { value } else { String::new() });
+        }
         env_vars.insert(
             crate::splitter::ALLOWED_AXIOMS_ENV.to_string(),
             allowed_axioms_csv.to_string(),
@@ -1834,6 +2044,7 @@ fn execute_check_shard_payload_deferred_with_domain(
         req_args_digest_opt.as_deref(),
         &req_allowed,
         &req_allowed_csv,
+        trust_domain,
     )?;
     let (receipt_ctx, target_digests) =
         base_ctx.with_targets_and_digests(&stub_targets, &parsed_source.shards, &fast_map)?;
@@ -2140,6 +2351,7 @@ fn execute_check_shards_batch_payload_deferred(
         batch_args_digest_opt.as_deref(),
         &req_allowed,
         &req_allowed_csv,
+        trust_domain,
     )?;
     let mut item_key_contexts: Vec<(String, HttpShardReceiptContext)> =
         Vec::with_capacity(req.items.len());
@@ -2785,6 +2997,17 @@ fn write_http_response_with_headers(
     extra_headers: &str,
     body: &[u8],
 ) -> Result<()> {
+    let payload = LOCAL_REPLY.with(|slot| -> Result<_> {
+        if slot.borrow().is_some() && body.len() >= 64 * 1024 {
+            let payload = crate::zygote::LocalPayload::create(body)?;
+            let tag = payload.tag();
+            *slot.borrow_mut() = Some(Some(payload));
+            Ok(Some(tag))
+        } else { Ok(None) }
+    })?;
+    let shared_header = payload.as_ref().map(|tag| format!("X-Turbo-Shm: {tag}\r\n{extra_headers}"));
+    let extra_headers = shared_header.as_deref().unwrap_or(extra_headers);
+    let body = if payload.is_some() { &[][..] } else { body };
     let status_text = match status {
         200 => "OK",
         400 => "Bad Request",

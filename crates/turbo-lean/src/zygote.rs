@@ -1,5 +1,5 @@
 use crate::db::TurboStore;
-use crate::pack::{http_request_with_timeout_and_token, next_tmp_id, CheckShardHttpRequest};
+use crate::pack::{next_tmp_id, CheckShardHttpRequest};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -520,8 +520,67 @@ pub(crate) fn lifecycle_lock(exclusive: bool) -> Result<crate::shm_cache::FlockG
     #[cfg(not(unix))]
     let uid = 0u32;
     let path = PathBuf::from(format!("/tmp/turbo-lean-lifecycle-{uid}.lock"));
-    crate::shm_cache::acquire_flock(&path, exclusive, false)?
-        .context("Could not acquire daemon lifecycle lock")
+    let guard = crate::shm_cache::acquire_flock(&path, exclusive, false)?
+        .context("Could not acquire daemon lifecycle lock")?;
+    if !exclusive {
+        prepare_caller_staging_dir()?;
+    }
+    Ok(guard)
+}
+
+pub(crate) fn ensure_staging_namespace_dir(create_if_missing: bool) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let path = if create_if_missing {
+            Some(crate::shm_cache::staging_shm_dir())
+        } else {
+            std::env::var("TURBO_LEAN_STAGING_DIR")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        };
+        if let Some(path) = path {
+            let sym = match fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    if create_if_missing {
+                        crate::shm_cache::ensure_private_dir_all(&path)?;
+                    }
+                    return Ok(());
+                }
+                Err(e) => return Err(e.into()),
+            };
+            anyhow::ensure!(
+                !sym.file_type().is_symlink() && sym.file_type().is_dir(),
+                "Staging path must be a plain directory: {}",
+                path.display()
+            );
+            let dir = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&path)?;
+            let meta = dir.metadata()?;
+            anyhow::ensure!(
+                meta.dev() == sym.dev()
+                    && meta.ino() == sym.ino()
+                    && meta.uid() == unsafe { libc::geteuid() }
+                    && meta.mode() & 0o022 == 0,
+                "Staging directory must be owned by the caller and not writable by others: {}",
+                path.display()
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    if create_if_missing {
+        fs::create_dir_all(crate::shm_cache::staging_shm_dir())?;
+    }
+    Ok(())
+}
+
+fn prepare_caller_staging_dir() -> Result<()> {
+    ensure_staging_namespace_dir(false)
 }
 
 /// Possession proves that staging teardown holds the user-wide flock exclusively.
@@ -977,8 +1036,17 @@ fn stop_pidfile_daemons(staging: &Path, store_root: Option<&Path>) -> Result<Lif
     Ok(cleanup)
 }
 
+fn private_staging_child(name: &str) -> Result<PathBuf> {
+    ensure_staging_namespace_dir(true)?;
+    let dir = crate::shm_cache::staging_shm_dir().join(name);
+    crate::shm_cache::ensure_private_dir_all(&dir)?;
+    Ok(dir)
+}
+
 pub(crate) fn stop_daemons(store_root: Option<&Path>) -> Result<usize> {
     let lifecycle = lifecycle_exclusive_lock()?;
+    let default_root = crate::shm_cache::cache_root();
+    let store_root = Some(store_root.unwrap_or(&default_root));
     clear_zygote_pool();
     let dir = crate::shm_cache::staging_shm_dir();
     let scope = std::env::var_os("TURBO_LEAN_STAGING_DIR").map(|_| dir.as_path());
@@ -994,6 +1062,26 @@ pub(crate) fn stop_daemons(store_root: Option<&Path>) -> Result<usize> {
             .all(|p| !owned_process_alive(*p)),
         "Daemon processes are still shutting down"
     );
+    for root in [
+        Some(dir.as_path()),
+        store_root,
+        store_root.map(|p| p.join("staging")).as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.flatten() {
+                if entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("zygote_daemon_cas_")
+                {
+                    cleanup.staging.insert(entry.path());
+                }
+            }
+        }
+    }
     cleanup.staging.insert(dir);
     cleanup_lifecycle_staging(cleanup, store_root, &lifecycle)
 }
@@ -1184,11 +1272,16 @@ impl ZygoteWorkerProcess {
         use std::os::unix::{io::OwnedFd, net::UnixListener};
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         use std::os::unix::ffi::OsStrExt;
-        let sock_dir = crate::shm_cache::ensure_verified_private_staging_dir(None)
-            .ok_or_else(|| anyhow::anyhow!("verified private staging directory unavailable"))?;
-        let path = sock_dir.join(format!("clone-{}-{}", std::process::id(), NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
-        anyhow::ensure!(path.with_extension("err").as_os_str().as_bytes().len() < 104,
-            "clone socket path too long");
+        let sock_dir = private_staging_child("fork-sockets")?;
+        let path = sock_dir.join(format!(
+            "clone-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        anyhow::ensure!(
+            path.with_extension("err").as_os_str().as_bytes().len() < 104,
+            "clone socket path too long"
+        );
         struct Cleanup(PathBuf);
         impl Drop for Cleanup {
             fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); let _ = std::fs::remove_file(self.0.with_extension("err")); }
@@ -1206,7 +1299,12 @@ impl ZygoteWorkerProcess {
             loop {
                 match l.accept() {
                     Ok((s, _)) => return Ok(s),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(1)),
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(1))
+                    }
                     Err(e) => return Err(e.into()),
                 }
             }
@@ -2587,7 +2685,8 @@ fn materialize_closure(
         }
         let next_idx = std::sync::atomic::AtomicUsize::new(0);
         let aborted = std::sync::atomic::AtomicBool::new(false);
-        let slots: Vec<std::sync::Mutex<Option<Result<Option<(PathBuf, OleanFileStatSig)>, SnapshotError>>>> =
+        type VerifiedFile = Result<Option<(PathBuf, OleanFileStatSig)>, SnapshotError>;
+        let slots: Vec<std::sync::Mutex<Option<VerifiedFile>>> =
             (0..files.len()).map(|_| std::sync::Mutex::new(None)).collect();
         std::thread::scope(|s| {
             for _ in 0..par_workers {
@@ -2797,12 +2896,58 @@ fn copy_verified_snapshot_file(
     src: &Path,
     dst: &Path,
 ) -> Result<(), SnapshotError> {
+    if link_immutable_snapshot_file(src, dst, hash)? {
+        return Ok(());
+    }
     let blob = ensure_closure_blob(blobs, hash, src)?;
     copy_file_reflink(&blob, dst).map_err(|_| SnapshotError::Changed)?;
     let mut perms = fs::metadata(dst)?.permissions();
     perms.set_readonly(true);
     fs::set_permissions(dst, perms)?;
     Ok(())
+}
+
+fn link_immutable_snapshot_file(src: &Path, dst: &Path, hash: &str) -> Result<bool, SnapshotError> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::{fs::MetadataExt, io::AsRawFd};
+        let file = fs::File::open(src)?;
+        let before = file.metadata()?;
+        let mut flags: libc::c_long = 0;
+        let verity = unsafe { libc::ioctl(file.as_raw_fd(), 0x80086601 as libc::c_ulong, &mut flags) } == 0 && flags & 0x00100000 != 0;
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        let readonly_fs = unsafe {
+            libc::fstatvfs(file.as_raw_fd(), stat.as_mut_ptr()) == 0
+                && stat.assume_init().f_flag & libc::ST_RDONLY != 0
+        };
+        if (!verity && !readonly_fs) || !before.permissions().readonly() {
+            return Ok(false);
+        }
+        if fs::hard_link(src, dst).is_err() {
+            return Ok(false);
+        }
+        let verified = read_file_digest_opts(dst, false)
+            .ok()
+            .flatten()
+            .is_some_and(|r| {
+                r.stable
+                    && r.hash == hash
+                    && r.sig.dev == before.dev()
+                    && r.sig.ino == before.ino()
+                    && fs::metadata(dst).is_ok_and(|after| {
+                        after.len() == before.len()
+                            && after.mtime() == before.mtime()
+                            && after.mtime_nsec() == before.mtime_nsec()
+                    })
+            });
+        if !verified {
+            let _ = fs::remove_file(dst);
+            return Err(SnapshotError::Changed);
+        }
+        Ok(true)
+    }
+    #[cfg(not(target_os = "linux"))]
+    { let _ = (src, dst, hash); Ok(false) }
 }
 
 /// The verified blob holding `hash`, copied from `src` if not yet present.
@@ -5112,17 +5257,8 @@ pub(crate) fn kernel_reader_command(
         if !auditor_ld_library_path.is_empty() {
             c.args(["--setenv", "LD_LIBRARY_PATH", auditor_ld_library_path]);
         }
-        for key in [
-            crate::splitter::ALLOWED_AXIOMS_ENV,
-            "TURBO_LEAN_ALLOWED_CSIMP",
-            "TURBO_LEAN_ALLOWED_UNSAFE",
-            "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY",
-        ] {
-            if let Ok(allow) = std::env::var(key) {
-                if !allow.trim().is_empty() {
-                    c.args(["--setenv", key, &allow]);
-                }
-            }
+        for (key, allow) in request_policy(&Default::default()) {
+            c.args(["--setenv", &key, &allow]);
         }
         c.args(["--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp"]);
         for sys_p in [
@@ -5786,23 +5922,7 @@ pub(crate) fn run_audited_lean_shard_at_with_full_report(
         }
         auditor.env("LD_LIBRARY_PATH", ld);
     }
-    if !env_vars.contains_key(crate::splitter::ALLOWED_AXIOMS_ENV) {
-        auditor.env(
-            crate::splitter::ALLOWED_AXIOMS_ENV,
-            crate::splitter::extra_allowed_axiom_patterns().join(","),
-        );
-    }
-    for key in [
-        "TURBO_LEAN_ALLOWED_CSIMP",
-        "TURBO_LEAN_ALLOWED_UNSAFE",
-        "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY",
-    ] {
-        if !env_vars.contains_key(key) {
-            if let Ok(val) = std::env::var(key) {
-                auditor.env(key, val);
-            }
-        }
-    }
+    auditor.envs(request_policy(env_vars));
     let parsed_shards = crate::splitter::split_lean_source(source, &[]).shards;
     let fast_map = crate::splitter::FastVerifyMap::parse_and_validate(source, &parsed_shards)?;
     for entry in fast_map.entries() {
@@ -6739,11 +6859,20 @@ pub(crate) fn resolve_zygote_context(
                 .map(String::from)
                 .collect()
         })
-        .unwrap_or_else(crate::splitter::extra_allowed_axiom_patterns);
+        .unwrap_or_else(|| {
+            request_policy(env_vars)[crate::splitter::ALLOWED_AXIOMS_ENV]
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        });
+    let policy = request_policy(env_vars);
+    let policy_digest = blake3::hash(&serde_json::to_vec(&policy).expect("policy serializes")).to_hex().to_string();
     let toolchain_policy = format!(
-        "{}#{}",
+        "{}#{}#{}",
         toolchain,
-        crate::splitter::allowed_axioms_with_extra(&extra_axioms).join(",")
+        crate::splitter::allowed_axioms_with_extra(&extra_axioms).join(","),
+        policy_digest
     );
     let olean_digest = if lake_inputs_digest.is_empty() {
         format!("{}:{}", search_path_digest, imported_digest)
@@ -6762,6 +6891,7 @@ pub(crate) fn resolve_zygote_context(
     } else {
         olean_digest.clone()
     };
+    let closure_pool_digest = format!("{closure_pool_digest}#policy:{policy_digest}");
     let compiler_path = fs::canonicalize(lean_bin).unwrap_or_else(|_| lean_bin.to_path_buf());
     let compiler_digest = fs::read(&compiler_path)
         .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
@@ -7085,6 +7215,9 @@ fn eval_with_zygote_pool_attempt(
     request_started: std::time::Instant,
     pre_resolved_context: Option<&ResolvedZygoteContext>,
 ) -> Result<(ZygoteEvalReply, ClosureBinding, String)> {
+    let mut effective_env = env_vars.clone();
+    effective_env.extend(request_policy(env_vars));
+    let env_vars = &effective_env;
     crate::module_builder::validate_lean_args(lean_args)?;
     let default_timeout_ms = if eval_mode { 900_000 } else { 90_000 };
     let effective_timeout_ms = timeout_ms.unwrap_or_else(|| {
@@ -7237,7 +7370,6 @@ fn eval_with_zygote_pool_attempt(
             "GH_TOKEN",
             "GITHUB_TOKEN",
             "OPENAI_API_KEY",
-            "ANTHROPIC_API_KEY",
             "AWS_SECRET_ACCESS_KEY",
             "AWS_SESSION_TOKEN",
             "NPM_TOKEN",
@@ -7245,6 +7377,7 @@ fn eval_with_zygote_pool_attempt(
         ] {
             cmd.env_remove(k);
         }
+        scrub_worker_api_keys(&mut cmd);
         if let Some(sysroot) = lean_bin.parent().and_then(|b| b.parent()) {
             cmd.env("LEAN_SYSROOT", sysroot);
         }
@@ -7507,7 +7640,8 @@ fn eval_with_zygote_pool_attempt(
             let mut entry = cached;
             if let Some(existing) = &entry {
                 let worker = existing.worker.lock().map_err(|_| anyhow::anyhow!("Zygote master poisoned"))?;
-                let matches = worker.pinned_snapshot_dir == expected_pinned_dir
+                let matches = owned_process_alive(worker.pid())
+                    && worker.pinned_snapshot_dir == expected_pinned_dir
                     && worker.spawn_lean_path == effective_lean_path;
                 drop(worker);
                 if !matches {
@@ -7537,21 +7671,38 @@ fn eval_with_zygote_pool_attempt(
                         });
                         candidate.touch();
                         let max_cached = std::env::var("TURBO_LEAN_MAX_ZYGOTE_MASTERS")
-                            .ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(||
-                                (governor.recommended_parallel_workers(1024) / 2).clamp(1, 4))
+                            .ok()
+                            .and_then(|v| v.parse::<usize>().ok())
+                            .unwrap_or_else(|| {
+                                (governor.recommended_parallel_workers(1024) / 2).clamp(1, 4)
+                            })
                             .min(max_zygote_processes().saturating_sub(1));
                         let mut retired = Vec::new();
                         let mut map = masters.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(existing) = map.get(&pool_key) {
                             entry = Some(existing.clone());
                         } else {
-                            while !map.is_empty() && (map.len() >= max_cached
-                                || map.values().map(|e| measure_process_rss_mb(e.pid)).sum::<u64>()
-                                    .saturating_add(rss) > max_total_zygote_rss_mb()) {
-                                let key = map.iter().min_by_key(|(_, e)| (
-                                    std::sync::Arc::strong_count(e) != 1,
-                                    e.last_used_seq.load(std::sync::atomic::Ordering::Relaxed),
-                                )).unwrap().0.clone();
+                            while !map.is_empty()
+                                && (map.len() >= max_cached
+                                    || map
+                                        .values()
+                                        .map(|e| measure_process_rss_mb(e.pid))
+                                        .sum::<u64>()
+                                        .saturating_add(rss)
+                                        > max_total_zygote_rss_mb())
+                            {
+                                let key = map
+                                    .iter()
+                                    .min_by_key(|(_, e)| {
+                                        (
+                                            std::sync::Arc::strong_count(e) != 1,
+                                            e.last_used_seq
+                                                .load(std::sync::atomic::Ordering::Relaxed),
+                                        )
+                                    })
+                                    .unwrap()
+                                    .0
+                                    .clone();
                                 retired.push(map.remove(&key).unwrap());
                             }
                             if max_cached > 0 && rss <= max_total_zygote_rss_mb() {
@@ -7677,6 +7828,9 @@ fn eval_with_zygote_pool_attempt(
                 for k in &matching_keys {
                     if let Some(vec) = pool.get_mut(k) {
                         vec.retain(|w| {
+                            if !owned_process_alive(w.pid()) {
+                                return false;
+                            }
                             #[cfg(target_os = "linux")]
                             {
                                 if w.pinned_snapshot_dir != expected_pinned_dir {
@@ -7762,13 +7916,25 @@ fn eval_with_zygote_pool_attempt(
                     .map(|(mut w, rl)| {
                         s.spawn(move || {
                             let res = run_worker_req(&mut w, &rl, req_id_ref);
-                            (w, res)
+                            (w, res, rl)
                         })
                     })
                     .collect();
                 handles
                     .into_iter()
-                    .map(|h| h.join().expect("Zygote parallel eval thread panicked"))
+                    .map(|h| {
+                        let (mut w, mut res, rl) =
+                            h.join().expect("Zygote parallel eval thread panicked");
+                        if matches!(res, WorkerReqOutcome::Crashed(_))
+                            && std::time::Instant::now() < deadline
+                        {
+                            if let Ok(retry) = spawn_zygote_worker() {
+                                w = retry;
+                                res = run_worker_req(&mut w, &rl, req_id_ref);
+                            }
+                        }
+                        (w, res)
+                    })
                     .collect()
             });
 
@@ -8030,6 +8196,9 @@ fn eval_with_zygote_pool_attempt(
         for k in &matching_keys {
             if let Some(vec) = pool.get_mut(k) {
                 vec.retain(|w| {
+                    if !owned_process_alive(w.pid()) {
+                        return false;
+                    }
                     #[cfg(target_os = "linux")]
                     {
                         if w.pinned_snapshot_dir != expected_pinned_dir {
@@ -8719,8 +8888,6 @@ pub(crate) struct LocalZygoteDaemonInfo {
     pub(crate) exe_mtime_nsec: i64,
     #[serde(default)]
     pub(crate) auth_token: String,
-    /// Axiom policy the daemon (and its zygote workers) enforce;
-    /// reused only under the same `daemon_policy()`.
     #[serde(default)]
     pub(crate) policy: Vec<String>,
     /// Build epoch of the daemon binary; reused only when equal to `TURBO_LEAN_BUILD_EPOCH`.
@@ -8728,17 +8895,283 @@ pub(crate) struct LocalZygoteDaemonInfo {
     pub(crate) build_epoch: String,
 }
 
-/// Timeouts belong to requests; only axiom policy determines daemon identity.
 pub(crate) fn daemon_policy() -> Vec<String> {
-    crate::splitter::allowed_axioms()
+    Vec::new()
+}
+
+fn scrub_worker_api_keys(cmd: &mut Command) {
+    let keys: Vec<_> = cmd
+        .get_envs()
+        .map(|(key, _)| key.to_os_string())
+        .chain(std::env::vars_os().map(|(key, _)| key))
+        .filter(|key| key.as_encoded_bytes().ends_with(b"_API_KEY"))
+        .collect();
+    for key in keys {
+        cmd.env_remove(key);
+    }
+}
+
+pub(crate) const REQUEST_POLICY_KEYS: [&str; 4] = [
+    "TURBO_LEAN_ALLOWED_AXIOMS",
+    "TURBO_LEAN_ALLOWED_CSIMP",
+    "TURBO_LEAN_ALLOWED_UNSAFE",
+    "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY",
+];
+
+pub(crate) const MCP_RUNTIME_POLICY_KEYS: [&str; 5] = [
+    "TURBO_LEAN_AUDIT_SPEC_CONFIG",
+    "TURBO_LEAN_KERNEL_ENGINE",
+    "TURBO_LEAN_TELEMETRY",
+    "SANDBOXED_TELEMETRY_MODE",
+    "SANDBOXED_TELEMETRY",
+];
+
+thread_local! {
+    static MCP_TIMEOUT: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static INBOUND_POLICY: std::cell::RefCell<Option<std::collections::BTreeMap<String, String>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct McpTimeoutGuard(Option<u64>);
+
+impl McpTimeoutGuard {
+    pub(crate) fn new(timeout: Option<u64>) -> Self {
+        Self(MCP_TIMEOUT.with(|slot| slot.replace(timeout.or_else(invocation_timeout_ms))))
+    }
+}
+
+impl Drop for McpTimeoutGuard {
+    fn drop(&mut self) {
+        MCP_TIMEOUT.with(|slot| slot.set(self.0));
+    }
+}
+
+pub(crate) fn set_inbound_policy(policy: std::collections::BTreeMap<String, String>) {
+    INBOUND_POLICY.with(|p| *p.borrow_mut() = Some(policy));
+}
+
+pub(crate) fn clear_inbound_policy() {
+    INBOUND_POLICY.with(|p| *p.borrow_mut() = None);
+    MCP_TIMEOUT.with(|slot| slot.set(None));
+}
+
+fn normalize_mcp_runtime_setting(key: &str, value: String) -> String {
+    let trimmed = value.trim();
+    if key == "TURBO_LEAN_AUDIT_SPEC_CONFIG"
+        && !trimmed.is_empty()
+        && !trimmed.starts_with('{')
+        && !trimmed.contains('\n')
+        && !trimmed.contains('=')
+        && Path::new(trimmed).is_relative()
+    {
+        if let Ok(cwd) = std::env::current_dir() {
+            return cwd.join(trimmed).to_string_lossy().into_owned();
+        }
+    }
+    value
+}
+
+fn mcp_caller_policy() -> std::collections::BTreeMap<String, String> {
+    let mut policy = INBOUND_POLICY
+        .with(|p| p.borrow().clone())
+        .unwrap_or_else(|| {
+            REQUEST_POLICY_KEYS
+                .into_iter()
+                .chain(MCP_RUNTIME_POLICY_KEYS)
+                .filter_map(|key| {
+                    if std::env::var(format!("{key}_FROM_CONFIG")).as_deref() == Ok("1") {
+                        None
+                    } else {
+                        std::env::var(key).ok().map(|value| {
+                            (key.to_string(), normalize_mcp_runtime_setting(key, value))
+                        })
+                    }
+                })
+                .collect()
+        });
+    for key in ["SANDBOXED_TELEMETRY_MODE", "SANDBOXED_TELEMETRY"] {
+        policy.entry(key.to_string()).or_default();
+    }
+    policy
+}
+
+pub(crate) fn has_inbound_mcp_policy() -> bool {
+    INBOUND_POLICY.with(|policy| policy.borrow().is_some())
+}
+
+pub(crate) fn inbound_setting(key: &str) -> Option<String> {
+    INBOUND_POLICY
+        .with(|p| p.borrow().as_ref().map(|p| p.get(key).cloned()))
+        .unwrap_or_else(|| std::env::var(key).ok())
+}
+
+pub(crate) fn configure_mcp_child_policy(cmd: &mut Command) {
+    for key in REQUEST_POLICY_KEYS
+        .into_iter()
+        .chain(MCP_RUNTIME_POLICY_KEYS)
+    {
+        cmd.env_remove(key).env_remove(format!("{key}_FROM_CONFIG"));
+    }
+    cmd.envs(mcp_caller_policy());
+    cmd.env_remove("TURBO_LEAN_TIMEOUT_MS");
+    if let Some(timeout) = invocation_timeout_ms() {
+        cmd.env("TURBO_LEAN_TIMEOUT_MS", timeout.to_string());
+    }
+}
+
+pub(crate) fn unix_socket_path(path: &Path) -> Result<(PathBuf, Option<fs::File>)> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawFd};
+        if path.as_os_str().as_bytes().len() >= 100 {
+            let dir = fs::OpenOptions::new().read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
+                .open(path.parent().context("socket directory")?)?;
+            let short = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()))
+                .join(path.file_name().context("socket name")?);
+            return Ok((short, Some(dir)));
+        }
+    }
+    Ok((path.to_path_buf(), None))
+}
+
+pub(crate) fn request_policy(
+    env: &std::collections::HashMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    REQUEST_POLICY_KEYS
+        .into_iter()
+        .map(|key| {
+            let value = env
+                .get(key)
+                .cloned()
+                .or_else(|| {
+                    INBOUND_POLICY.with(|p| {
+                        p.borrow()
+                            .as_ref()
+                            .map(|p| p.get(key).cloned().unwrap_or_default())
+                    })
+                })
+                .or_else(|| std::env::var(key).ok())
+                .unwrap_or_default();
+            let mut tags: Vec<_> = value
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            tags.sort_unstable();
+            tags.dedup();
+            (key.to_string(), tags.join(","))
+        })
+        .collect()
+}
+
+static LOCAL_DAEMON_SOCKETS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, PathBuf>>> = std::sync::OnceLock::new();
+
+fn remember_daemon_socket(url: &str, state_file: &Path) {
+    if let Some(parent) = state_file.parent() {
+        if !parent.file_name().is_some_and(|n| n.to_string_lossy().starts_with("zygote_daemon_cas_")) { return; }
+        LOCAL_DAEMON_SOCKETS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+            .insert(url.to_string(), parent.join("daemon.sock"));
+    }
+}
+
+pub(crate) struct LocalPayload(PathBuf);
+
+impl LocalPayload {
+    pub(crate) fn create(bytes: &[u8]) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let root = private_staging_child("transport")?;
+        let path = root.join(format!("payload-{}-{}", std::process::id(), next_tmp_id()));
+        let mut file = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path)?;
+        use std::io::Write;
+        file.write_all(bytes)?;
+        Ok(Self(path))
+    }
+
+    pub(crate) fn tag(&self) -> String {
+        self.0.file_name().unwrap().to_string_lossy().into_owned()
+    }
+
+    pub(crate) fn read(tag: &str) -> Result<Vec<u8>> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        anyhow::ensure!(tag.starts_with("payload-") && tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'), "Invalid local payload tag");
+        let path = crate::shm_cache::staging_shm_dir().join("transport").join(tag);
+        let file = fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path)?;
+        let meta = file.metadata()?;
+        anyhow::ensure!(meta.is_file() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o077 == 0 && meta.len() <= 64 * 1024 * 1024, "Invalid local payload file");
+        use std::io::Read;
+        let mut bytes = Vec::with_capacity(meta.len() as usize);
+        file.take(64 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        anyhow::ensure!(bytes.len() as u64 == meta.len(), "Local payload changed");
+        Ok(bytes)
+    }
+}
+
+impl Drop for LocalPayload {
+    fn drop(&mut self) { let _ = fs::remove_file(&self.0); }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn http_request_with_timeout_and_token(
+    method: &str, url: &str, content_type: &str, body: &[u8], timeout: Option<u64>,
+    token: Option<&str>, on_inflight: impl FnOnce(),
+) -> Result<Vec<u8>> {
+    let socket = url
+        .rsplit_once('/')
+        .and_then(|(base, _)| LOCAL_DAEMON_SOCKETS.get()?.lock().ok()?.get(base).cloned());
+    let Some(socket) = socket.filter(|p| p.exists()) else {
+        return crate::pack::http_request_with_timeout_and_token(method, url, content_type, body, timeout, token, on_inflight);
+    };
+    use std::io::{BufRead, Read, Write};
+    let (socket, _directory) = unix_socket_path(&socket)?;
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+    let duration = Some(std::time::Duration::from_millis(timeout.unwrap_or(900_000)));
+    stream.set_read_timeout(duration)?;
+    stream.set_write_timeout(duration)?;
+    let payload = (body.len() >= 64 * 1024).then(|| LocalPayload::create(body)).transpose()?;
+    let wire_body = if payload.is_some() { &[][..] } else { body };
+    let path = url.rsplit_once('/').context("Invalid local URL")?.1;
+    write!(stream, "{method} /{path} HTTP/1.1\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nX-Turbo-Token: {}\r\n", wire_body.len(), token.unwrap_or(""))?;
+    if let Some(payload) = &payload { write!(stream, "X-Turbo-Shm: {}\r\n", payload.tag())?; }
+    stream.write_all(b"\r\n")?;
+    on_inflight();
+    stream.write_all(wire_body)?;
+    let mut reader = std::io::BufReader::new(stream);
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let status: u16 = line.split_whitespace().nth(1).context("Missing local response status")?.parse()?;
+    let mut len = 0usize;
+    let mut shared = None;
+    loop {
+        line.clear();
+        anyhow::ensure!(reader.read_line(&mut line)? != 0, "Truncated local response");
+        if line.trim().is_empty() { break; }
+        if let Some((key, value)) = line.split_once(':') {
+            if key.eq_ignore_ascii_case("content-length") { len = value.trim().parse()?; }
+            if key.eq_ignore_ascii_case("x-turbo-shm") { shared = Some(value.trim().to_string()); }
+        }
+    }
+    anyhow::ensure!(len <= 64 * 1024 * 1024, "Local response too large");
+    let bytes = if let Some(tag) = shared {
+        let bytes = LocalPayload::read(&tag)?;
+        reader.get_mut().write_all(&[1])?;
+        bytes
+    } else {
+        let mut bytes = vec![0; len];
+        reader.read_exact(&mut bytes)?;
+        bytes
+    };
+    anyhow::ensure!(status == 200, "HTTP request failed ({status}): {}", String::from_utf8_lossy(&bytes));
+    Ok(bytes)
 }
 
 pub(crate) fn invocation_timeout_ms() -> Option<u64> {
-    std::env::var("TURBO_LEAN_TIMEOUT_MS")
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+    MCP_TIMEOUT.with(|slot| slot.get()).or_else(|| {
+        std::env::var("TURBO_LEAN_TIMEOUT_MS")
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    })
 }
 
 /// Per-audit / `.olean`-reader budget in milliseconds (`TURBO_LEAN_AUDIT_TIMEOUT_SECS`,
@@ -8801,6 +9234,7 @@ pub(crate) fn run_lean_command(
 fn check_request_body(req: &CheckShardHttpRequest) -> Result<Vec<u8>> {
     let mut value = serde_json::to_value(req)?;
     value["timeout_ms"] = serde_json::to_value(invocation_timeout_ms())?;
+    value["policy_tags"] = serde_json::to_value(request_policy(&Default::default()))?;
     Ok(serde_json::to_vec(&value)?)
 }
 
@@ -8850,23 +9284,32 @@ fn terminate_and_remove_daemon_state_file(state_file: &Path) {
 }
 
 fn current_exe_daemon_paths(store: &TurboStore) -> Option<(PathBuf, i64, i64, PathBuf, PathBuf)> {
-    let current_exe = std::env::current_exe().ok()?;
-    let (exe_mtime_sec, exe_mtime_nsec, _) = fs::metadata(&current_exe)
-        .ok()
-        .map(|m| TurboStore::extract_file_stat_tuple(&m))
-        .unwrap_or((0, 0, 0));
+    let mut current_exe = std::env::current_exe().ok()?;
+    if current_exe.file_name().is_some_and(|n| n != "turbo-lean") {
+        current_exe = current_exe.ancestors().skip(1).find_map(|d| {
+            let p = d.join("turbo-lean");
+            p.is_file().then_some(p)
+        })?;
+    }
+    let metadata = fs::metadata(&current_exe).ok()?;
+    let (exe_mtime_sec, exe_mtime_nsec, _) = TurboStore::extract_file_stat_tuple(&metadata);
     let mut exe_hasher = blake3::Hasher::new();
-    exe_hasher.update(current_exe.to_string_lossy().as_bytes());
-    exe_hasher.update(b":");
+    exe_hasher.update(current_exe.as_os_str().as_encoded_bytes());
+    exe_hasher.update(&metadata.len().to_le_bytes());
+    exe_hasher.update(&exe_mtime_sec.to_le_bytes());
+    exe_hasher.update(&exe_mtime_nsec.to_le_bytes());
     exe_hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
     exe_hasher.update(b":");
-    // One daemon (and theorem CAS) per axiom policy: a pass under one policy is no cache hit
-    // under a stricter one.
-    exe_hasher.update(daemon_policy().join(",").as_bytes());
+    exe_hasher.update(std::env::var("ELAN_TOOLCHAIN").unwrap_or_else(|_| "leanprover/lean4:v4.35.0".into()).as_bytes());
     let exe_tag = &exe_hasher.finalize().to_hex()[..12];
-    let daemon_cache_dir = store
-        .fast_staging_dir()
-        .join(format!("zygote_daemon_cas_{}", exe_tag));
+    let name = format!("zygote_daemon_cas_{}", exe_tag);
+    let daemon_cache_dir = private_staging_child(&name)
+        .or_else(|_| {
+            let dir = store.root.join("staging").join(&name);
+            crate::shm_cache::ensure_private_dir_all(&dir)?;
+            Ok::<_, anyhow::Error>(dir)
+        })
+        .ok()?;
     let state_file = daemon_cache_dir.join("zygote_daemon.json");
     Some((
         current_exe,
@@ -8885,21 +9328,32 @@ fn check_existing_daemon_state(
 ) -> Option<(String, String)> {
     let content = fs::read_to_string(path).ok()?;
     let info: LocalZygoteDaemonInfo = serde_json::from_str(&content).ok()?;
+    if !cfg!(test) && !path.parent()?.file_name()?.to_string_lossy().starts_with("zygote_daemon_cas_") {
+        return None;
+    }
     if info.policy != daemon_policy() {
         return None;
     }
-    if info.build_epoch != crate::TURBO_LEAN_BUILD_EPOCH
-        || info.exe_mtime_sec != exe_mtime_sec
+    if info.exe_mtime_sec != exe_mtime_sec
         || info.exe_mtime_nsec != exe_mtime_nsec
+        || info.build_epoch != crate::TURBO_LEAN_BUILD_EPOCH
     {
         if kill_stale {
             terminate_and_remove_daemon_state_file(path);
+            if let Some(parent) = path.parent().filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("zygote_daemon_cas_"))
+            }) {
+                let _ = fs::remove_dir_all(parent);
+                crate::shm_cache::ensure_private_dir_all(parent).ok()?;
+            }
         }
         return None;
     }
     #[cfg(unix)]
     {
         if info.pid > 0 && unsafe { libc::kill(info.pid as i32, 0) == 0 } {
+            remember_daemon_socket(&format!("http://{}", info.addr), path);
             return Some((format!("http://{}", info.addr), info.auth_token));
         }
         None
@@ -8950,6 +9404,7 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
 
     if let Some(hit) = check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, true)
         .or_else(|| {
+            if env_vars.contains_key("TURBO_LEAN_REQUIRE_UNIX_DAEMON") { return None; }
             check_existing_daemon_state(
                 &store.root.join("zygote_daemon.json"),
                 exe_mtime_sec,
@@ -8974,7 +9429,6 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
             .ok()?
             .port();
         let addr = format!("127.0.0.1:{}", port);
-        let sock_addr: std::net::SocketAddr = addr.parse().ok()?;
         let auth_token = generate_daemon_auth_token(std::process::id(), port);
 
         let mut cmd = Command::new(&current_exe);
@@ -8989,11 +9443,20 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
                 cmd.env(k, v);
             }
         }
+        cmd.env_remove("TURBO_LEAN_TIMEOUT_MS");
         cmd.env("TURBO_LEAN_DAEMON", "1")
             .env("TURBO_LEAN_DAEMON_TOKEN", &auth_token)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        for key in REQUEST_POLICY_KEYS
+            .into_iter()
+            .chain(MCP_RUNTIME_POLICY_KEYS)
+        {
+            cmd.env_remove(key);
+            cmd.env_remove(format!("{key}_FROM_CONFIG"));
+        }
+        cmd.env("TURBO_LEAN_DAEMON_SOCKET", daemon_cache_dir.join("daemon.sock"));
         #[cfg(unix)]
         if std::env::var("TURBO_LEAN_KEEP_PROCESS_GROUP").is_err() {
             use std::os::unix::process::CommandExt;
@@ -9009,14 +9472,15 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
         );
         let mut child = cmd.spawn().ok()?;
         let pid = child.id();
-        let connected = (0..75).any(|_| {
-            std::net::TcpStream::connect_timeout(&sock_addr, std::time::Duration::from_millis(5))
-                .is_ok()
-                || {
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                    false
-                }
-        });
+        let url = format!("http://{}", addr);
+        remember_daemon_socket(&url, &state_file);
+        let connected = wait_for_mcp_transport_child(
+            &url,
+            &auth_token,
+            &daemon_cache_dir.join("daemon.sock"),
+            Some(&mut child),
+        )
+        .is_ok();
         if !connected {
             let _ = child.kill();
             let _ = child.wait();
@@ -9035,13 +9499,126 @@ pub(crate) fn ensure_local_zygote_daemon_with_token(
             write_daemon_state_file_private(&state_file, &json_bytes);
             write_daemon_state_file_private(&store.root.join("zygote_daemon.json"), &json_bytes);
         }
-        Some((format!("http://{}", addr), auth_token))
+        let url = format!("http://{}", addr);
+        remember_daemon_socket(&url, &state_file);
+        Some((url, auth_token))
     })
     .flatten()
 }
 
 static LAST_LOCAL_DAEMON_TOKEN: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
     std::sync::OnceLock::new();
+
+#[cfg(not(test))]
+fn wait_for_mcp_transport(url: &str, token: &str, socket: &Path) -> Result<()> {
+    wait_for_mcp_transport_child(url, token, socket, None)
+}
+
+fn wait_for_mcp_transport_child(
+    url: &str,
+    token: &str,
+    socket: &Path,
+    mut child: Option<&mut std::process::Child>,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    loop {
+        if socket.exists() {
+            if let Ok(bytes) = http_request_with_timeout_and_token(
+                "GET",
+                &format!("{url}/health"),
+                "application/json",
+                &[],
+                Some(250),
+                Some(token),
+                || {},
+            ) {
+                if serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .ok()
+                    .and_then(|v| v.get("ok").and_then(|v| v.as_bool()))
+                    == Some(true)
+                {
+                    return Ok(());
+                }
+            }
+        }
+        anyhow::ensure!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "Shared daemon HTTP startup timed out"
+        );
+        if let Some(c) = child.as_deref_mut() {
+            if c.try_wait().ok().flatten().is_some() {
+                anyhow::bail!("Shared daemon exited before ready");
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) fn forward_mcp_request(
+    req: &serde_json::Value, project_dir: Option<&Path>, cache_dir: Option<&Path>,
+) -> Result<serde_json::Value> {
+    let store = TurboStore::open(cache_dir)?;
+    let (_, sec, nsec, _, state_file) = current_exe_daemon_paths(&store).context("daemon paths")?;
+    let existing = check_existing_daemon_state(&state_file, sec, nsec, false).filter(|_| {
+        state_file
+            .parent()
+            .is_some_and(|p| p.join("daemon.sock").exists())
+    });
+    let (url, token) = existing
+        .or_else(|| {
+            let mut env = std::collections::HashMap::new();
+            env.insert("TURBO_LEAN_REQUIRE_UNIX_DAEMON".into(), "1".into());
+            ensure_local_zygote_daemon_with_token(&store, &env)
+        })
+        .context("Shared daemon startup failed")?;
+    wait_for_mcp_transport(
+        &url,
+        &token,
+        &state_file
+            .parent()
+            .context("daemon directory")?
+            .join("daemon.sock"),
+    )?;
+    let absolute = |path: &Path| -> Result<PathBuf> {
+        Ok(if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir()?.join(path) })
+    };
+    let body = serde_json::to_vec(&serde_json::json!({
+        "request": req,
+        "project_dir": project_dir.map(absolute).transpose()?,
+        "cache_dir": absolute(&store.root)?,
+        "caller_cwd": std::env::current_dir()?,
+        "policy_tags": mcp_caller_policy(),
+        "timeout_ms": req.get("timeout_ms").and_then(|v| v.as_u64()).or_else(invocation_timeout_ms),
+    }))?;
+    let timeout = req
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .or_else(invocation_timeout_ms);
+    let started = std::time::Instant::now();
+    let bytes = loop {
+        match http_request_with_timeout_and_token(
+            "POST",
+            &format!("{url}/mcp"),
+            "application/json",
+            &body,
+            timeout,
+            Some(&token),
+            || {},
+        ) {
+            Ok(bytes) => break bytes,
+            Err(error)
+                if started.elapsed() < std::time::Duration::from_secs(10)
+                    && (is_expired_daemon_transport_error(&error)
+                        || error.to_string().contains("(404)")) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            Err(error) => return Err(error),
+        }
+    };
+    Ok(serde_json::from_slice(&bytes)?)
+}
 
 pub fn ensure_local_zygote_daemon(
     store: &TurboStore,
@@ -9562,9 +10139,13 @@ pub fn try_local_zygote_eval_with_args(
     } else {
         current_exe_daemon_paths(store)
             .and_then(|(_, exe_mtime_sec, exe_mtime_nsec, _, state_file)| {
+                #[cfg(test)]
+                if let Some(injected) = check_existing_daemon_state(&store.root.join("zygote_daemon.json"), exe_mtime_sec, exe_mtime_nsec, false) {
+                    return Some(injected);
+                }
                 check_existing_daemon_state(&state_file, exe_mtime_sec, exe_mtime_nsec, false)
-                    .or_else(|| {
-                        check_existing_daemon_state(
+        .or_else(|| {
+            check_existing_daemon_state(
                             &store.root.join("zygote_daemon.json"),
                             exe_mtime_sec,
                             exe_mtime_nsec,
@@ -9576,6 +10157,7 @@ pub fn try_local_zygote_eval_with_args(
     };
 
     let Some((base_url, auth_token)) = existing_daemon else {
+        anyhow::ensure!(cfg!(test) || daemon_disabled(), "Shared daemon startup failed; set TURBO_LEAN_NO_DAEMON=1 for in-process execution");
         let (rep, executed_binding, executed_identity) = eval_with_resolved_context_opts_with_args(
             store,
             effective_tc,
@@ -9620,7 +10202,8 @@ pub fn try_local_zygote_eval_with_args(
     } else {
         None
     };
-    let allowed_axioms: Vec<String> = env_vars
+    let policy = request_policy(env_vars);
+    let allowed_axioms: Vec<String> = policy
         .get(crate::splitter::ALLOWED_AXIOMS_ENV)
         .map(|s| {
             s.split(',')
@@ -9629,7 +10212,7 @@ pub fn try_local_zygote_eval_with_args(
                 .map(String::from)
                 .collect()
         })
-        .unwrap_or_else(crate::splitter::extra_allowed_axiom_patterns);
+        .unwrap_or_default();
     let body = serde_json::to_vec(&serde_json::json!({
         "toolchain": effective_tc,
         "lean_path": context.lean_path,
@@ -9639,6 +10222,7 @@ pub fn try_local_zygote_eval_with_args(
         "cwd": caller_cwd,
         "env_vars": forwarded_env,
         "allowed_axioms": allowed_axioms,
+        "policy_tags": request_policy(env_vars),
         "timeout_ms": effective_timeout_opt,
         "verify_determinism": false,
         "lean_args": filtered_args
@@ -9712,6 +10296,501 @@ pub fn try_local_zygote_eval_with_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn parallel_cross_file_stale_workers_are_retried() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (dir, store, mut env, lean_bin) = open_test_zygote_env("parallel_cross_file").unwrap();
+        let policy_tag = format!("R7Parallel{}", next_tmp_id());
+        env.insert(
+            crate::splitter::ALLOWED_AXIOMS_ENV.into(),
+            policy_tag.clone(),
+        );
+        let source = "import Init\n-- namespace _TurboCrossFileShard_0\ntheorem r7_first : True := True.intro\n-- namespace _TurboCrossFileShard_1\ntheorem r7_second : True := True.intro\n";
+        let eval = |source: &str| {
+            eval_with_zygote_pool(
+                &store,
+                "leanprover/lean4:v4.35.0",
+                "",
+                &env,
+                &lean_bin,
+                source,
+                false,
+            )
+            .unwrap()
+        };
+        let first = eval(source);
+        assert!(first.ok && first.kernel_gate_active, "{first:?}");
+        let mut held_pipes = Vec::new();
+        let mut stale_pids = Vec::new();
+        {
+            let mut pool = ZYGOTE_POOL.get().unwrap().lock().unwrap();
+            for worker in pool
+                .iter_mut()
+                .filter(|(key, _)| key.0.contains(&policy_tag))
+                .flat_map(|(_, workers)| workers)
+            {
+                stale_pids.push(worker.pid());
+                held_pipes.push(std::mem::replace(
+                    &mut worker.stdin,
+                    fs::File::open("/dev/null").unwrap(),
+                ));
+            }
+        }
+        assert_eq!(stale_pids.len(), 2);
+        let retried = eval(&source.replace("True.intro", "by trivial"));
+        assert!(retried.ok && retried.kernel_gate_active, "{retried:?}");
+        assert!(retried.decl_types.contains_key("r7_first"));
+        assert!(retried.decl_types.contains_key("r7_second"));
+        let pool = ZYGOTE_POOL.get().unwrap().lock().unwrap();
+        assert!(pool
+            .iter()
+            .filter(|(key, _)| key.0.contains(&policy_tag))
+            .flat_map(|(_, workers)| workers)
+            .all(|worker| !stale_pids.contains(&worker.pid())));
+        drop(pool);
+        drop(held_pipes);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_mcp_transport_detects_early_child_exit() {
+        let mut child = Command::new("sh").args(["-c", "exit 7"]).spawn().unwrap();
+        let started = std::time::Instant::now();
+        let error = wait_for_mcp_transport_child(
+            "http://127.0.0.1:1",
+            "unused",
+            &std::env::temp_dir().join(format!("absent-daemon-{}.sock", next_tmp_id())),
+            Some(&mut child),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Shared daemon exited before ready");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn mcp_explicit_kernel_and_relative_audit_policy() {
+        let _guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let keys = [
+            "TURBO_LEAN_KERNEL_ENGINE",
+            "TURBO_LEAN_KERNEL_ENGINE_FROM_CONFIG",
+            "TURBO_LEAN_AUDIT_SPEC_CONFIG",
+            "TURBO_LEAN_AUDIT_SPEC_CONFIG_FROM_CONFIG",
+        ];
+        let saved: Vec<_> = keys
+            .iter()
+            .map(|key| (*key, std::env::var_os(key)))
+            .collect();
+        clear_inbound_policy();
+        std::env::set_var(keys[0], "explicit-engine");
+        std::env::remove_var(keys[1]);
+        std::env::set_var(keys[2], "policy/audit.toml");
+        std::env::remove_var(keys[3]);
+        let policy = mcp_caller_policy();
+        assert_eq!(policy.get(keys[0]).unwrap(), "explicit-engine");
+        assert_eq!(
+            Path::new(policy.get(keys[2]).unwrap()),
+            std::env::current_dir().unwrap().join("policy/audit.toml")
+        );
+        std::env::set_var(keys[1], "1");
+        assert!(!mcp_caller_policy().contains_key(keys[0]));
+        set_inbound_policy(policy);
+        let mut child = Command::new("unused");
+        configure_mcp_child_policy(&mut child);
+        assert!(child
+            .get_envs()
+            .any(|(k, v)| k == keys[0] && v == Some(std::ffi::OsStr::new("explicit-engine"))));
+        set_inbound_policy(Default::default());
+        configure_mcp_child_policy(&mut child);
+        for key in &keys[..2] {
+            assert!(child.get_envs().any(|(k, v)| k == *key && v.is_none()));
+        }
+        clear_inbound_policy();
+        for (key, value) in saved {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+        for inline in [
+            "{\"enabled\":true}",
+            "enabled=true",
+            "[audit]\nenabled=true",
+        ] {
+            assert_eq!(
+                normalize_mcp_runtime_setting(keys[2], inline.into()),
+                inline
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_runtime_policy_preserves_raw_values_separately_from_allowlists() {
+        let raw = " b,a,b ";
+        let env: std::collections::HashMap<_, _> = REQUEST_POLICY_KEYS
+            .into_iter()
+            .chain(MCP_RUNTIME_POLICY_KEYS)
+            .map(|key| (key.to_string(), raw.to_string()))
+            .collect();
+        let canonical = request_policy(&env);
+        assert_eq!(canonical.len(), 4);
+        assert!(canonical.values().all(|value| value == "a,b"));
+        set_inbound_policy(env.into_iter().collect());
+        let mut child = Command::new("unused");
+        configure_mcp_child_policy(&mut child);
+        for key in MCP_RUNTIME_POLICY_KEYS {
+            assert_eq!(inbound_setting(key).as_deref(), Some(raw));
+            assert_eq!(mcp_caller_policy().get(key).map(String::as_str), Some(raw));
+            assert!(child
+                .get_envs()
+                .any(|(name, value)| name == key && value == Some(std::ffi::OsStr::new(raw))));
+        }
+        clear_inbound_policy();
+    }
+
+    #[test]
+    fn worker_api_keys_are_scrubbed_from_command_overrides() {
+        let mut child = Command::new("unused");
+        child.env("TURBO_TEST_API_KEY", "private");
+        scrub_worker_api_keys(&mut child);
+        assert!(child
+            .get_envs()
+            .any(|(key, value)| key == "TURBO_TEST_API_KEY" && value.is_none()));
+    }
+
+    #[test]
+    fn mcp_unset_telemetry_is_forwarded_as_tombstones() {
+        set_inbound_policy(Default::default());
+        let policy = mcp_caller_policy();
+        for key in ["SANDBOXED_TELEMETRY_MODE", "SANDBOXED_TELEMETRY"] {
+            assert_eq!(policy.get(key).map(String::as_str), Some(""));
+            let mut child = Command::new("unused");
+            configure_mcp_child_policy(&mut child);
+            assert!(child
+                .get_envs()
+                .any(|(k, v)| k == key && v == Some(std::ffi::OsStr::new(""))));
+        }
+        clear_inbound_policy();
+    }
+
+    #[test]
+    fn mcp_policy_preserves_only_explicit_cross_project_overrides() {
+        let _guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let saved: Vec<_> = REQUEST_POLICY_KEYS
+            .into_iter()
+            .chain(MCP_RUNTIME_POLICY_KEYS)
+            .flat_map(|key| [key.to_string(), format!("{key}_FROM_CONFIG")])
+            .map(|key| {
+                let value = std::env::var_os(&key);
+                (key, value)
+            })
+            .collect();
+        for key in REQUEST_POLICY_KEYS
+            .into_iter()
+            .chain(MCP_RUNTIME_POLICY_KEYS)
+        {
+            std::env::set_var(key, "*");
+            std::env::set_var(format!("{key}_FROM_CONFIG"), "1");
+        }
+        let captured = mcp_caller_policy();
+        assert_eq!(
+            captured,
+            std::collections::BTreeMap::from([
+                ("SANDBOXED_TELEMETRY_MODE".into(), String::new()),
+                ("SANDBOXED_TELEMETRY".into(), String::new()),
+            ])
+        );
+        set_inbound_policy(captured);
+        let mut child = Command::new("unused");
+        configure_mcp_child_policy(&mut child);
+        for key in REQUEST_POLICY_KEYS
+            .into_iter()
+            .chain(MCP_RUNTIME_POLICY_KEYS)
+        {
+            let expected = key
+                .starts_with("SANDBOXED_TELEMETRY")
+                .then_some(std::ffi::OsStr::new(""));
+            assert!(child.get_envs().any(|(k, v)| k == key && v == expected));
+        }
+        INBOUND_POLICY.with(|p| *p.borrow_mut() = None);
+        for key in REQUEST_POLICY_KEYS
+            .into_iter()
+            .chain(MCP_RUNTIME_POLICY_KEYS)
+        {
+            std::env::remove_var(format!("{key}_FROM_CONFIG"));
+        }
+        set_inbound_policy(mcp_caller_policy());
+        let mut child = Command::new("unused");
+        configure_mcp_child_policy(&mut child);
+        for key in REQUEST_POLICY_KEYS
+            .into_iter()
+            .chain(MCP_RUNTIME_POLICY_KEYS)
+        {
+            assert!(child.get_envs().any(|(k, v)| k == key
+                && v == Some(std::ffi::OsStr::new(&normalize_mcp_runtime_setting(
+                    key,
+                    "*".into()
+                )))));
+        }
+        INBOUND_POLICY.with(|p| *p.borrow_mut() = None);
+        for (key, value) in saved {
+            match value { Some(value) => std::env::set_var(key, value), None => std::env::remove_var(key) }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn caller_staging_dir_preserves_0755_and_rejects_symlinks() -> Result<()> {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let _env_guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _bwrap_guard = crate::module_builder::BWRAP_TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var_os("TURBO_LEAN_STAGING_DIR");
+        let root = private_temp_subdir("staging-mode-test")
+            .context("private directory")?
+            .join(format!("run-{}", next_tmp_id()));
+        fs::create_dir_all(&root)?;
+        let caller_dir = root.join("caller_0755");
+        fs::create_dir(&caller_dir)?;
+        fs::set_permissions(&caller_dir, fs::Permissions::from_mode(0o755))?;
+        std::env::set_var("TURBO_LEAN_STAGING_DIR", &caller_dir);
+        let guard = lifecycle_lock(false)?;
+        assert_eq!(
+            fs::symlink_metadata(&caller_dir)?.permissions().mode() & 0o777,
+            0o755
+        );
+        drop(guard);
+        ensure_staging_namespace_dir(true)?;
+        for name in ["transport", "fork-sockets", "zygote_daemon_cas_test"] {
+            let child = private_staging_child(name)?;
+            assert_eq!(fs::metadata(child)?.permissions().mode() & 0o777, 0o700);
+        }
+        let payload = LocalPayload::create(b"private payload")?;
+        assert_eq!(LocalPayload::read(&payload.tag())?, b"private payload");
+        assert_eq!(
+            fs::symlink_metadata(&caller_dir)?.permissions().mode() & 0o777,
+            0o755
+        );
+
+        let live_link = root.join("live_link");
+        symlink(&caller_dir, &live_link)?;
+        std::env::set_var("TURBO_LEAN_STAGING_DIR", &live_link);
+        assert!(lifecycle_lock(false).is_err());
+        assert!(ensure_staging_namespace_dir(true).is_err());
+
+        let dangling_link = root.join("dangling_link");
+        symlink(root.join("missing_target"), &dangling_link)?;
+        std::env::set_var("TURBO_LEAN_STAGING_DIR", &dangling_link);
+        assert!(lifecycle_lock(false).is_err());
+        assert!(ensure_staging_namespace_dir(true).is_err());
+        assert!(!root.join("missing_target").exists());
+
+        match prev {
+            Some(v) => std::env::set_var("TURBO_LEAN_STAGING_DIR", v),
+            None => std::env::remove_var("TURBO_LEAN_STAGING_DIR"),
+        }
+        fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn dead_zygote_master_is_replaced_with_fresh_master() {
+        let Some((dir, store, mut env, lean)) = open_test_zygote_env("dead_master") else {
+            return;
+        };
+        fs::write(
+            dir.join("DeadMasterSeed.olean"),
+            compile_test_olean(&lean, &dir, "DeadMasterSeed", "def dmSeed : Nat := 11\n"),
+        )
+        .unwrap();
+        env.insert("LEAN_PATH".into(), dir.to_string_lossy().into_owned());
+        let first = eval_with_zygote_pool_for_targets(
+            &store,
+            "leanprover/lean4:v4.35.0",
+            &env["LEAN_PATH"],
+            &env,
+            &lean,
+            "import DeadMasterSeed\ntheorem dm_one : dmSeed = 11 := rfl\n",
+            &["dm_one".into()],
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(first.ok, "{:?}", first.errors);
+        let old_master_pid = {
+            let masters = ZYGOTE_MASTERS.get().unwrap().lock().unwrap();
+            masters
+                .values()
+                .find(|e| {
+                    e.worker
+                        .lock()
+                        .unwrap()
+                        .warm_imports
+                        .contains_key("DeadMasterSeed")
+                })
+                .unwrap()
+                .pid
+        };
+        if let Some(pool) = ZYGOTE_POOL.get() {
+            pool.lock().unwrap().clear();
+        }
+        unsafe {
+            libc::kill(old_master_pid as i32, libc::SIGKILL);
+        }
+        for _ in 0..100 {
+            if !owned_process_alive(old_master_pid) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!owned_process_alive(old_master_pid));
+        let second = eval_with_zygote_pool_for_targets(
+            &store,
+            "leanprover/lean4:v4.35.0",
+            &env["LEAN_PATH"],
+            &env,
+            &lean,
+            "import DeadMasterSeed\ntheorem dm_two : dmSeed = 11 := rfl\n",
+            &["dm_two".into()],
+            None,
+            &[],
+        )
+        .unwrap();
+        assert!(second.ok, "{:?}", second.errors);
+        let new_master_pid = {
+            let masters = ZYGOTE_MASTERS.get().unwrap().lock().unwrap();
+            masters
+                .values()
+                .find(|e| {
+                    e.worker
+                        .lock()
+                        .unwrap()
+                        .warm_imports
+                        .contains_key("DeadMasterSeed")
+                })
+                .unwrap()
+                .pid
+        };
+        assert_ne!(new_master_pid, old_master_pid);
+        assert!(owned_process_alive(new_master_pid));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn long_unix_socket_paths_roundtrip() -> Result<()> {
+        use std::io::{Read, Write};
+        let dir = private_temp_subdir("long-socket-test").context("private directory")?;
+        let nested = dir.join("nested-directory-name-that-exceeds-the-unix-socket-address-limit".repeat(2));
+        fs::create_dir(&nested)?;
+        let path = nested.join("daemon.sock");
+        let (short, _dir) = unix_socket_path(&path)?;
+        let listener = std::os::unix::net::UnixListener::bind(short)?;
+        let (short, _dir) = unix_socket_path(&path)?;
+        let mut client = std::os::unix::net::UnixStream::connect(short)?;
+        let (mut server, _) = listener.accept()?;
+        client.write_all(b"ok")?;
+        let mut bytes = [0; 2];
+        server.read_exact(&mut bytes)?;
+        assert_eq!(&bytes, b"ok");
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn local_transport_large_payload_roundtrip() -> Result<()> {
+        use std::io::{BufRead, Read, Write};
+        let dir = private_temp_subdir("transport-test").context("private directory")?;
+        let socket = dir.join(format!("{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+        let url = format!("http://transport-test-{}", next_tmp_id());
+        LOCAL_DAEMON_SOCKETS.get_or_init(Default::default).lock().unwrap().insert(url.clone(), socket);
+        let bytes = vec![b'x'; 2 * 1024 * 1024];
+        let expected = bytes.clone();
+        let server = std::thread::spawn(move || -> Result<()> {
+            let (stream, _) = listener.accept()?;
+            let mut reader = std::io::BufReader::new(stream);
+            let mut line = String::new();
+            let mut tag = None;
+            loop {
+                line.clear();
+                reader.read_line(&mut line)?;
+                if line.trim().is_empty() { break; }
+                if let Some(value) = line.strip_prefix("X-Turbo-Shm: ") { tag = Some(value.trim().to_string()); }
+            }
+            assert_eq!(LocalPayload::read(tag.as_deref().context("missing shared frame")?)?, expected);
+            let payload = LocalPayload::create(&expected)?;
+            write!(reader.get_mut(), "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Turbo-Shm: {}\r\n\r\n", payload.tag())?;
+            let mut ack = [0];
+            reader.read_exact(&mut ack)?;
+            assert_eq!(ack, [1]);
+            Ok(())
+        });
+        let start = std::time::Instant::now();
+        let reply = http_request_with_timeout_and_token("POST", &format!("{url}/eval"), "application/json", &bytes, Some(5000), Some("test"), || {})?;
+        assert_eq!(reply, bytes);
+        server.join().unwrap()?;
+        eprintln!("shared framing roundtrip: {} bytes each direction in {} us", bytes.len(), start.elapsed().as_micros());
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn request_policy_is_canonical_and_covers_all_tags() {
+        let mut env: std::collections::HashMap<String, String> = REQUEST_POLICY_KEYS.into_iter().map(|k| (k.into(), String::new())).collect();
+        for key in REQUEST_POLICY_KEYS {
+            env.insert(key.into(), " b,a,b ".into());
+            assert_eq!(request_policy(&env)[key], "a,b");
+            env.insert(key.into(), String::new());
+        }
+        assert_eq!(request_policy(&env).len(), 4);
+    }
+
+    #[test]
+    fn daemon_discovery_ignores_request_policy_but_workers_do_not() -> Result<()> {
+        let dir = private_temp_subdir("policy-identity-test").context("private directory")?;
+        let store = TurboStore::open(Some(&dir))?;
+        let daemon = current_exe_daemon_paths(&store).context("daemon paths")?.4;
+        let mut env: std::collections::HashMap<String, String> = REQUEST_POLICY_KEYS.into_iter().map(|k| (k.into(), String::new())).collect();
+        let lean_bin = Path::new("/nonexistent-policy-test-lean");
+        let base = resolve_zygote_context("policy-test", "", &env, lean_bin, "");
+        for key in REQUEST_POLICY_KEYS {
+            env.insert(key.into(), "Policy.permitted".into());
+            let changed = resolve_zygote_context("policy-test", "", &env, lean_bin, "");
+            assert_ne!(base.closure_pool_digest, changed.closure_pool_digest, "{key}");
+            assert_ne!(base.identity, changed.identity, "{key}");
+            assert_eq!(daemon, current_exe_daemon_paths(&store).unwrap().4);
+            env.insert(key.into(), String::new());
+        }
+        drop(store);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn readonly_mode_does_not_authorize_live_source_hardlinks() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = private_temp_subdir("immutable-link-test").context("private directory")?;
+        let src = dir.join("source.olean");
+        let dst = dir.join("snapshot.olean");
+        fs::write(&src, b"immutable only by mode")?;
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o444))?;
+        let hash = blake3::hash(b"immutable only by mode").to_hex().to_string();
+        assert!(!link_immutable_snapshot_file(&src, &dst, &hash).unwrap());
+        assert!(!dst.exists());
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
 
     #[test]
     fn test_finish_check_shard_request_rejection_is_final() {
@@ -14998,6 +16077,7 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
             "fastcheck_bins directory must be tightened to 0700"
         );
 
+        fs::remove_file(&planted).unwrap();
         fs::write(&planted, b"corrupted").unwrap();
         fs::set_permissions(&planted, fs::Permissions::from_mode(0o775)).unwrap();
         let repaired_2 = ensure_zygote_binary_at(&store_2, &cfg.lean_bin, &env_vars).unwrap();
@@ -15656,6 +16736,13 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
 
     #[test]
     fn test_zygote_cow_fork_concurrent_pool_miss() {
+        if std::env::var_os("TURBO_LEAN_TEST_POOL_TEARDOWN").is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "zygote::tests::test_zygote_cow_fork_concurrent_pool_miss"])
+                .env("TURBO_LEAN_TEST_POOL_TEARDOWN", "1").output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            return;
+        }
         let (dir, _store, mut env, lean) = open_test_zygote_env("clone_pool").expect("Lean toolchain");
         fs::write(dir.join("ClonePool.olean"), compile_test_olean(&lean, &dir, "ClonePool", "def cloneSeed : Nat := 7\n")).unwrap();
         env.insert("LEAN_PATH".into(), dir.to_string_lossy().into_owned());
