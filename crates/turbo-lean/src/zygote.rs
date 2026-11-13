@@ -4086,7 +4086,32 @@ pub(crate) fn pinned_ffi_allow_args(
             out.push(format!("--ffi-allow={}={}={}", pin.module, decl, sym));
         }
     }
+    out.extend(project_ffi_allow_args(mod_names));
     out
+}
+
+/// Project-declared FFI from `turbo-lean.toml` (`[ffi] allow = ["Module=decl=c_symbol"]`), limited
+/// to `mod_names`. The worker still requires each entry to be a safe `@[extern]` opaque defined in
+/// that exact module and bound to that exact C symbol, so an entry cannot admit anything broader.
+pub(crate) fn project_ffi_allow_args(mod_names: &[String]) -> Vec<String> {
+    parse_project_ffi_allow(
+        &std::env::var("TURBO_LEAN_ALLOWED_FFI").unwrap_or_default(),
+        mod_names,
+    )
+}
+
+fn parse_project_ffi_allow(raw: &str, mod_names: &[String]) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter_map(|entry| {
+            let mut parts = entry.split('=');
+            let (m, d, s) = (parts.next()?, parts.next()?, parts.next()?);
+            (parts.next().is_none()
+                && ![m, d, s].iter().any(|p| p.is_empty())
+                && mod_names.iter().any(|n| n == m))
+            .then(|| format!("--ffi-allow={m}={d}={s}"))
+        })
+        .collect()
 }
 
 fn audit_batch_size() -> usize {
@@ -11595,6 +11620,15 @@ mod tests {
             &"--ffi-allow=LeanSys.Posix=LeanSys.Posix.rawWriteAll=leansys_write_all".to_string()
         ));
         assert!(pinned_ffi_allow_args(&cfg, &["TurboLean.Spec".to_string()]).is_empty());
+    }
+
+    #[test]
+    fn test_project_ffi_allow_args_scopes_to_audited_modules() {
+        let args = parse_project_ffi_allow(
+            " App.Posix=App.Posix.getpid=app_getpid, Other.M=Other.M.f=f_sym,bad=entry, A=B=C=D ",
+            &["App.Posix".to_string()],
+        );
+        assert_eq!(args, vec!["--ffi-allow=App.Posix=App.Posix.getpid=app_getpid".to_string()]);
     }
 
     #[test]

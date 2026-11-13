@@ -300,11 +300,13 @@ pub(crate) fn current_kernel_policy_digest() -> String {
     let csimp = normalized_policy_env_vec("TURBO_LEAN_ALLOWED_CSIMP");
     let unsafe_decls = normalized_policy_env_vec("TURBO_LEAN_ALLOWED_UNSAFE");
     let impl_by = normalized_policy_env_vec("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY");
+    let ffi = normalized_policy_env_vec("TURBO_LEAN_ALLOWED_FFI");
     let excludes = active_exclude_patterns();
     if axioms.is_empty()
         && csimp.is_empty()
         && unsafe_decls.is_empty()
         && impl_by.is_empty()
+        && ffi.is_empty()
         && excludes.is_empty()
     {
         return String::new();
@@ -316,6 +318,7 @@ pub(crate) fn current_kernel_policy_digest() -> String {
         ("csimp", &csimp),
         ("unsafe", &unsafe_decls),
         ("implemented_by", &impl_by),
+        ("ffi", &ffi),
     ] {
         h.update(tag.as_bytes());
         h.update(b":");

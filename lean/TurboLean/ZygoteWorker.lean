@@ -2522,7 +2522,10 @@ def isPinnedFfiOpaque (env : Environment) (ffiAllow : Array (Name × Name × Str
       (Lean.Compiler.getImplementedBy? env cinfo.name).isNone &&
       env.getModuleIdxFor? cinfo.name == some modIdx &&
       (env.header.moduleNames[modIdx.toNat]?).any fun m =>
-        (Lean.getExternNameFor env `c cinfo.name).any fun sym => ffiAllow.contains (m, cinfo.name, sym)
+        (Lean.getExternNameFor env `c cinfo.name).any fun sym =>
+          -- A private extern is listed under its user-facing name; module and symbol still pin it.
+          ffiAllow.contains (m, cinfo.name, sym) ||
+            ffiAllow.contains (m, Lean.privateToUserName cinfo.name, sym)
   | _ => false
 
 /-- Validated prefix stubs of a compiled shard module (`consts`): the host names each stub by its

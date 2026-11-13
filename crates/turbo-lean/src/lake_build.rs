@@ -814,6 +814,7 @@ pub(crate) fn compute_shard_key_with_args(
         ("csimp", "TURBO_LEAN_ALLOWED_CSIMP"),
         ("unsafe", "TURBO_LEAN_ALLOWED_UNSAFE"),
         ("impl_by", "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY"),
+        ("ffi", "TURBO_LEAN_ALLOWED_FFI"),
     ] {
         if let Ok(val) = std::env::var(env_key) {
             let trimmed = val.trim();
@@ -2280,6 +2281,7 @@ pub(crate) fn compute_project_interface_key_fast_summary(
         ("csimp", "TURBO_LEAN_ALLOWED_CSIMP"),
         ("unsafe", "TURBO_LEAN_ALLOWED_UNSAFE"),
         ("implemented_by", "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY"),
+        ("ffi", "TURBO_LEAN_ALLOWED_FFI"),
     ] {
         if let Ok(val) = std::env::var(env_key) {
             let trimmed = val.trim();
