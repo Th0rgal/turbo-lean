@@ -19,6 +19,7 @@ def main():
     parser.add_argument('--repo', type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument('--evidence', type=Path, required=True)
     parser.add_argument('--skip-lean-build', action='store_true')
+    parser.add_argument('--dynamic', action='store_true', help='link a smaller binary against matching libleanshared')
     parser.add_argument('--target', choices=('lean-native', 'lean-native-core'), default='lean-native')
     args = parser.parse_args()
     repo = args.repo.resolve()
@@ -58,13 +59,18 @@ def main():
         raise RuntimeError(f'missing compiler entrypoint: {main_c}')
     sources.append(dep / 'c/lean_sys_shim.c')
     binary = project / '.lake/build/bin' / args.target
-    native_from_turbo = binary.is_file() and all(
+    native_from_turbo = not args.dynamic and binary.is_file() and all(
         binary.stat().st_mtime_ns >= source.stat().st_mtime_ns for source in sources)
     if not native_from_turbo:
         objdir = evidence / 'objects'
         objdir.mkdir(exist_ok=True)
         objects = []
         for i, source in enumerate(sources):
+            cached = Path(str(source) + '.o.export')
+            if cached.is_file() and cached.stat().st_mtime_ns >= source.stat().st_mtime_ns:
+                objects.append(cached)
+                print(f'Native object {i + 1}/{len(sources)} {source.name}', flush=True)
+                continue
             obj = objdir / f'{i:04d}.o'
             # No native CPU requirement; export symbols for the Lean interpreter.
             run(['/usr/bin/clang', '-O2', '-DNDEBUG', '-DLEAN_EXPORTING', '-fPIC',
