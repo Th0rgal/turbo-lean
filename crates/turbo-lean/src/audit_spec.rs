@@ -1387,10 +1387,12 @@ pub(super) fn unfold_expr_single_step(expr: &str, local_defs: &[LocalDefUnfoldin
 /// local `def`/`abbrev` wrappers cannot hide vacuous preconditions or trivial postconditions.
 pub(super) fn unfold_expr_one_level(expr: &str, local_defs: &[LocalDefUnfolding]) -> String {
     let mut cur = expr.trim().to_string();
-    for _hop in 0..8 {
-        if cur.len() > 2048 {
+    let mut seen = Vec::with_capacity(16);
+    for _hop in 0..16 {
+        if cur.len() > 2048 || seen.contains(&cur) {
             break;
         }
+        seen.push(cur.clone());
         let next = unfold_expr_single_step(&cur, local_defs);
         if next == cur {
             break;
@@ -3355,7 +3357,7 @@ pub(super) fn extract_decls_fast(src: &str, decl_filter: Option<&str>) -> Vec<Ex
 }
 
 /// Schema version for the Blake3 content-addressed `audit-spec` per-file JSON cache.
-pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 21;
+pub const AUDIT_SPEC_CACHE_SCHEMA_VERSION: u32 = 22;
 
 static AUDIT_SPEC_CACHE_TMP_SEQ: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
@@ -4953,5 +4955,34 @@ theorem strict_chain_step (x y : Nat) (hx : 0 < x) (hxy : x < y) : 2 ≤ y := by
         assert_eq!(pair_rep["ok"].as_bool(), Some(true), "{pair_rep}");
         assert_eq!(pair_rep["vacuous_specs"].as_u64(), Some(0), "{pair_rep}");
         assert_eq!(pair_rep["tight_specs"].as_u64(), Some(1), "{pair_rep}");
+
+        // Transitive multi-hop delta unfolding (up to 16 hops with cycle detection) catches
+        // 10-hop local `def`/`abbrev` chains hiding vacuous preconditions or trivial postconditions.
+        let ten_hop_src = "\
+def h0 (x : Nat) : Prop := x < 0
+def h1 (x : Nat) : Prop := h0 x
+def h2 (x : Nat) : Prop := h1 x
+def h3 (x : Nat) : Prop := h2 x
+def h4 (x : Nat) : Prop := h3 x
+def h5 (x : Nat) : Prop := h4 x
+def h6 (x : Nat) : Prop := h5 x
+def h7 (x : Nat) : Prop := h6 x
+def h8 (x : Nat) : Prop := h7 x
+def h9 (x : Nat) : Prop := h8 x
+theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
+  unfold h9 h8 h7 h6 h5 h4 h3 h2 h1 h0 at h
+  omega
+";
+        let ten_hop_rep = audit_spec_file_or_source(
+            Path::new("TenHopVacuous.lean"),
+            Some(ten_hop_src),
+            Some("ten_hop_vacuous"),
+        );
+        assert_eq!(ten_hop_rep["ok"].as_bool(), Some(false), "{ten_hop_rep}");
+        assert_eq!(
+            ten_hop_rep["vacuous_specs"].as_u64(),
+            Some(1),
+            "{ten_hop_rep}"
+        );
     }
 }

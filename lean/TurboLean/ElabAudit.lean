@@ -73,6 +73,20 @@ def verifyHeaderPin (spec : PinnedHeaderSpec) (elaboratedTy : Expr) : Bool :=
   checkNoShadowedConsts spec.globalConsts spec.boundNames elaboratedTy &&
   decide (elaboratedTy = spec.pinnedTypeAst)
 
+/-- Verify `HeaderPin` along with an explicit `pp.all=true` surface representation `surfaceAstStr`:
+    rejects any macro/notation expansion or constant-shadowing spoof whose rendered explicit AST
+    differs from `renderExplicitAST spec.pinnedTypeAst`. -/
+def verifyHeaderPinSurface (spec : PinnedHeaderSpec) (elaboratedTy : Expr) (surfaceAstStr : String) : Bool :=
+  verifyHeaderPin spec elaboratedTy &&
+  decide (surfaceAstStr = renderExplicitAST spec.pinnedTypeAst)
+
+/-- A misleading macro expansion or shadowed constant spoofs `spec` whenever its elaborated
+    expression `spoofedTy` either diverges from `spec.pinnedTypeAst` or references a constant outside
+     the unshadowed `spec.globalConsts \ spec.boundNames` scope. -/
+def IsStatementSpoof (spec : PinnedHeaderSpec) (spoofedTy : Expr) : Prop :=
+  spoofedTy ≠ spec.pinnedTypeAst ∨
+  checkNoShadowedConsts spec.globalConsts spec.boundNames spoofedTy = false
+
 /-! ## `LNIR_EXPR_V1` Binary CAS Proof Term Serialization & Kernel Replay -/
 
 /-- 4-byte magic prefix `"LNE1"` (`[0x4C, 0x4E, 0x45, 0x31]`) for `LNIR_EXPR_V1` CAS proof blobs. -/
@@ -122,6 +136,37 @@ theorem header_pin_prevents_statement_spoofing (spec : PinnedHeaderSpec) (elabor
   rcases h_pin with ⟨⟨_hne, hnoShadow⟩, heq⟩
   refine ⟨heq, hnoShadow, ?_⟩
   rw [heq]
+
+/-- Any misleading macro or constant-shadowing spoof (`IsStatementSpoof spec spoofedTy`) is
+    provably rejected by `verifyHeaderPin` (`verifyHeaderPin spec spoofedTy = false`). -/
+theorem verifyHeaderPin_rejects_statement_spoof (spec : PinnedHeaderSpec) (spoofedTy : Expr)
+    (h_spoof : IsStatementSpoof spec spoofedTy) :
+    verifyHeaderPin spec spoofedTy = false := by
+  cases h_v : verifyHeaderPin spec spoofedTy with
+  | false => rfl
+  | true =>
+    have ⟨heq, hnoShadow, _⟩ := header_pin_prevents_statement_spoofing spec spoofedTy h_v
+    rcases h_spoof with hne | hshadow
+    · exact False.elim (hne heq)
+    · rw [hnoShadow] at hshadow
+      contradiction
+
+/-- Full surface + kernel AST `HeaderPin` soundness (`verifyHeaderPinSurface_sound`):
+    when `verifyHeaderPinSurface spec elaboratedTy surfaceAstStr = true`, the elaborated type
+    equals `spec.pinnedTypeAst`, no constant is shadowed, and the explicit `pp.all=true` surface
+    string matches `renderExplicitAST elaboratedTy`. -/
+theorem verifyHeaderPinSurface_sound (spec : PinnedHeaderSpec) (elaboratedTy : Expr)
+    (surfaceAstStr : String)
+    (h_surf : verifyHeaderPinSurface spec elaboratedTy surfaceAstStr = true) :
+    elaboratedTy = spec.pinnedTypeAst ∧
+    checkNoShadowedConsts spec.globalConsts spec.boundNames elaboratedTy = true ∧
+    surfaceAstStr = renderExplicitAST elaboratedTy := by
+  unfold verifyHeaderPinSurface at h_surf
+  simp only [Bool.and_eq_true, decide_eq_true_eq] at h_surf
+  rcases h_surf with ⟨h_pin, h_str⟩
+  have ⟨heq, hnoShadow, hrender⟩ := header_pin_prevents_statement_spoofing spec elaboratedTy h_pin
+  refine ⟨heq, hnoShadow, ?_⟩
+  rw [h_str, hrender]
 
 /-- Milestone M3 (Item 2): Machine-checked soundness of `LNIR_EXPR_V1` CAS proof replay
     (`cas_proof_replay_sound`, `0 sorryAx`). -/
