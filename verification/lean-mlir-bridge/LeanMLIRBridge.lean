@@ -85,9 +85,17 @@ def bridgedTheorems : List Name :=
   , ``LeanMLIRBridge.atomic_rmw_eval_comm_and_id
   , ``LeanMLIRBridge.stepInstr_atomicrmw_aligned_bisim
   , ``LeanMLIRBridge.stepInstr_atomicrmw_frame
+  , ``LeanMLIRBridge.loadVal_storeTypedVal_int_bisim
+  , ``LeanMLIRBridge.stepInstr_load_ub_and_access_char
+  , ``LeanMLIRBridge.stepInstr_store_ub_and_access_char
+  , ``LeanMLIRBridge.stepInstr_load_int_bisim
+  , ``LeanMLIRBridge.stepInstr_store_int_bisim
+  , ``LeanMLIRBridge.execInstrs_store_then_load_int_roundtrip
+  , ``LeanMLIRBridge.stepInstr_load_frame
+  , ``LeanMLIRBridge.stepInstr_store_int_frame
   ]
 
-def minAuditedTheorems : Nat := 71
+def minAuditedTheorems : Nat := 79
 
 theorem bridgedTheorems_nodup : bridgedTheorems.Nodup := by
   decide
