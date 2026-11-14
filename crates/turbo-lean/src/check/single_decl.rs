@@ -2028,6 +2028,7 @@ pub(super) fn target_hygiene_violations(
             fresh.disallowed_items()
         };
     }
+    items.retain(|item| !item.ends_with(": csimp"));
     items
 }
 
@@ -3132,6 +3133,8 @@ pub(super) fn build_cone_scoped_decl_audit_source(
             matches!(
                 t.as_str(),
                 "simp"
+                    | "grind"
+                    | "simproc"
                     | "ext"
                     | "coe"
                     | "instance"
@@ -3692,6 +3695,27 @@ pub(super) fn maybe_append_hotspot_diagnostics_for_source(
     .unwrap_or_default()
 }
 
+#[test]
+#[ignore = "requires exact upstream Batteries fixture"]
+fn export_exact_lemmas_cone() {
+    let source = fs::read_to_string(
+        "/var/lib/orb-node/work/caches/tl-warm/batteries/Batteries/Data/List/Lemmas.lean",
+    )
+    .unwrap();
+    let split = splitter::split_lean_source(&source, &[]);
+    let shard = &split.shards[splitter::find_decl_shard_index(
+        &split.shards,
+        "List.getElem_filter_eq_getElem_getElem_findIdxs_sub",
+    )
+    .unwrap()
+    .unwrap()];
+    fs::write(
+        "/var/lib/orb-node/work/pr-b2-evidence/lemmas-actual-cone.lean",
+        build_cone_scoped_decl_audit_source(&source, shard),
+    )
+    .unwrap();
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_single_decl(
     store: &mut TurboStore,
@@ -3909,7 +3933,11 @@ pub(super) fn check_single_decl(
         }
         let (env_vars, _) = resolve_lake_env(store, canon_dir)?;
         let lean_bin = resolve_lean_bin(canon_dir)?;
-        if cone_clean_for_certification {
+        if cone_clean_for_certification
+            || (!shard_has_sorry
+                && splitter::audit_hygiene(&splitter::strip_lean_comments(&cone_src))
+                    .is_clean_or_deferred_to_kernel_gate())
+        {
             let lean_path = resolve_remote_lean_path(canon_dir, Some(&env_vars));
             let reply = crate::zygote::eval_with_zygote_pool_for_targets_and_stubs(
                 store,
@@ -3925,7 +3953,8 @@ pub(super) fn check_single_decl(
             )?;
             anyhow::ensure!(
                 reply.import_ok && reply.ok && !reply.crashed && !reply.timed_out,
-                "Cone kernel verification failed for `{target_decl}`: {:?}",
+                "Cone kernel verification failed for `{target_decl}`: {:?} {:?}",
+                reply.errors,
                 reply.messages
             );
             crate::zygote::verify_attested_decl_types(&reply.decl_types, &expected_type_pair)?;

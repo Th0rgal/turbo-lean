@@ -1311,6 +1311,41 @@ def kernelPolicyHint (policy : String) (name : Name) : String :=
 /-- In-kernel soundness gate auditing all newly added declarations in `afterEnv.constants.map₂`
     (relative to `beforeEnv.constants.map₂`) for unapproved axioms, compiler-trusted evaluation,
     extern/implemented_by bypasses, nested inductives (sea-monster risk), and prior-environment tampering. -/
+def verifiedNewCSimp (env : Environment) (theoremName : Name) : IO Bool := do
+  let some (.thmInfo theoremInfo) := env.find? theoremName | return false
+  let some (_, .const fromName fromLevels, .const toName toLevels) := theoremInfo.type.eq? | return false
+  let some fromInfo := env.find? fromName | return false
+  let some toInfo := env.find? toName | return false
+  if fromLevels != toLevels || fromLevels.length != theoremInfo.levelParams.length ||
+      fromLevels.length != fromInfo.levelParams.length || fromLevels.length != toInfo.levelParams.length ||
+      !fromLevels.all (fun | .param name => theoremInfo.levelParams.contains name | _ => false) then return false
+  let mut pending := #[theoremName, fromName, toName]
+  let mut seen : Std.HashSet Name := {}
+  while !pending.isEmpty do
+    let name := pending.back!
+    pending := pending.pop
+    if seen.contains name then continue
+    seen := seen.insert name
+    let some info := env.find? name | return false
+    if let some index := env.getModuleIdxFor? name then
+      if let some moduleName := env.header.moduleNames[index.toNat]? then
+        if moduleName.getRoot == `Init then
+          let library ← IO.FS.realPath ((← Lean.findSysroot) / "lib" / "lean")
+          let artifact ← IO.FS.realPath (← Lean.findOLean moduleName)
+          if artifact.toString.startsWith (library.toString ++ "/") then continue
+    if info.isUnsafe || info.isPartial || Lean.isExtern env name ||
+        (Lean.Compiler.getImplementedBy? env name).isSome then return false
+    if !(collectDeclAxioms {} env name).all (fun ax =>
+        ax == ``propext || ax == ``Classical.choice || ax == ``Quot.sound) then return false
+    for used in info.getUsedConstantsAsSet.toArray do
+      if !seen.contains used then pending := pending.push used
+    if let some entry := (Lean.Compiler.CSimp.ext.getState env).map.find? name then
+      let some (.thmInfo replacement) := env.find? entry.thmName | return false
+      let some (_, .const lhs _, .const rhs _) := replacement.type.eq? | return false
+      if lhs != entry.fromDeclName || rhs != entry.toDeclName then return false
+      pending := pending.push entry.thmName |>.push entry.toDeclName
+  return true
+
 def auditNewKernelDecls
     (beforeEnv afterEnv : Environment)
     (stubExempt : Name → Bool := fun _ => false)
@@ -1351,7 +1386,11 @@ def auditNewKernelDecls
     if Lean.isExtern afterEnv name || (Lean.Compiler.getImplementedBy? afterEnv name).isSome then
       violations := violations ++ [s!"[TurboLean.KernelGate] extern/implemented_by bypass on `{name}` is forbidden"]
     let csimpSt := Lean.Compiler.CSimp.ext.getState afterEnv
-    if csimpSt.thmNames.contains name || csimpSt.map.contains name then
+    let csimpVerified ← if csimpSt.thmNames.contains name then verifiedNewCSimp afterEnv name
+      else match csimpSt.map.find? name with
+        | some entry => verifiedNewCSimp afterEnv entry.thmName
+        | none => pure true
+    if !csimpVerified then
       violations := violations ++ [s!"[TurboLean.KernelGate] csimp replacement bypass on `{name}` is forbidden"]
     let axs := collectDeclAxioms beforeMap afterEnv name stubExempt
     for ax in axs do
@@ -2699,7 +2738,8 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
     (stubs : Std.HashSet Name := {})
     (unsafePatterns : List String := []) (implByPatterns : List String := [])
     (skipChildReplay : Bool := false)
-    (allowSorry : Bool := false) (isImportAudit : Bool := false) : IO (List String × List String) := do
+    (allowSorry : Bool := false) (isImportAudit : Bool := false)
+    (allowVerifiedCSimp : Bool := false) : IO (List String × List String) := do
   let codeViolations := compilerAuditCodeViolations env
   unless codeViolations.isEmpty do return (codeViolations, [])
   let sorryAxName := Name.mkSimple ("sor" ++ "ryAx")
@@ -2872,7 +2912,9 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
     return ok
   let csimpAllowed (name : Name) : IO Bool := do
     if nameMatchesPolicy csimpPatterns name then return true
-    verifiedCSimp name
+    if isImportAudit || allowVerifiedCSimp || (← IO.getEnv "TURBO_LEAN_VERIFY_CSIMP") == some "1" then
+      verifiedCSimp name
+    else return false
   let unsfTag := "un" ++ "safe"
   let mut violations : List String := []
   let mut sorryDecls : List String := []
@@ -3239,7 +3281,7 @@ def auditShardModule (target : String × Name) (ffiAllow : Array (Name × Name �
         if rawNm != userNm && !(seen[rawNm]?.getD false) then
           seen := seen.insert rawNm true
           declTypes := declTypes ++ [(rawNm, h)]
-    let (impViolations, impSorryDecls) ← auditImportedModulesInEnv env #[target] ffiAllow patterns csimpPatterns stubs unsafePatterns implByPatterns false allowSorry
+    let (impViolations, impSorryDecls) ← auditImportedModulesInEnv env #[target] ffiAllow patterns csimpPatterns stubs unsafePatterns implByPatterns false allowSorry false true
     return (stubViolations ++ fastViolations ++ impViolations, decls, declTypes, impSorryDecls)
   catch e =>
     return ([s!"[TurboLean.KernelGate] failed to import `{target.1}` for audit: {e}"], #[], [], [])

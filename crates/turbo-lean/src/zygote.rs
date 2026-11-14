@@ -5509,6 +5509,7 @@ fn audit_module_batch_exec_pinned_with_mode(
         cmd.env(crate::splitter::ALLOWED_AXIOMS_ENV, allowed.join(","));
     }
     cmd.arg("--audit-modules");
+    cmd.env("TURBO_LEAN_VERIFY_CSIMP", "1");
     if audit_imports {
         cmd.arg("--audit-imports");
     }

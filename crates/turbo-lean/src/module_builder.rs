@@ -8968,6 +8968,9 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
         })
         .collect();
     while let Some((spec, expanded)) = stack.pop() {
+        if !spec.is_root_pkg && is_git_pinned_manifest_package(cfg, &spec) {
+            continue;
+        }
         let key = (spec.pkg_root.clone(), spec.module_name.clone());
         if expanded {
             postorder.push(spec);
@@ -12387,7 +12390,10 @@ fn is_clean_git_pinned_pkg(
         )
 }
 
-fn is_git_pinned_manifest_package(cfg: &ProjectConfig, spec: &DiscoveredModuleSpec) -> bool {
+pub(crate) fn is_git_pinned_manifest_package(
+    cfg: &ProjectConfig,
+    spec: &DiscoveredModuleSpec,
+) -> bool {
     is_clean_git_pinned_pkg(
         cfg,
         spec.is_root_pkg,

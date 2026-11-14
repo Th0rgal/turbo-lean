@@ -746,7 +746,7 @@ pub(super) fn check_single_file(
         && splitter::audit_hygiene(&splitter::strip_lean_comments(
             &super::single_decl::build_cone_scoped_decl_audit_source(src, uncached_shards[0].1),
         ))
-        .is_clean_for_certification()
+        .is_clean_or_deferred_to_kernel_gate()
     {
         let (key, shard) = &uncached_shards[0];
         let result = super::run_check_command_inner(
