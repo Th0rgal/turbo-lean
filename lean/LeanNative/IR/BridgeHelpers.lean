@@ -34,7 +34,8 @@ def hasSimpleGroundDecl (env : Lean.Environment) (declName : Lean.Name) : Bool :
 
 def isFreestandingStubCombinatorLeaf : String → Bool
   | "readU8" | "readMutU8" | "writeU8" | "readU32" | "readMutU16" | "writeU16"
-  | "forRangeU64" | "forRangeU32" | "forRangeUnit" | "forRange" => true
+  | "forRangeU64" | "forRangeU32" | "forRangeUnit" | "forRange"
+  | "forRangeBytes" | "forRangeU16s" | "forRangeBytesU32" | "forRangeBytesU64" => true
   | _ => false
 
 def isFreestandingStubCombinatorName : Lean.Name → Bool
@@ -44,7 +45,8 @@ def isFreestandingStubCombinatorName : Lean.Name → Bool
 def isFreestandingSideEffectStubName : Lean.Name → Bool
   | .str _ s =>
     s == "writeU8" || s == "writeU16" ||
-    s == "forRangeUnit" || s == "forRangeU64" || s == "forRangeU32" || s == "forRange"
+    s == "forRangeUnit" || s == "forRangeU64" || s == "forRangeU32" || s == "forRange" ||
+    s == "forRangeBytes" || s == "forRangeU16s" || s == "forRangeBytesU32" || s == "forRangeBytesU64"
   | _ => false
 
 def flatPtrCombinatorType? : Lean.Name → Option LNIRType
@@ -52,6 +54,29 @@ def flatPtrCombinatorType? : Lean.Name → Option LNIRType
   | .str _ "MutU16s" => some (.rawPtr .i16)
   | .str _ "ConstU32s" => some (.rawPtr .i32)
   | _ => none
+
+/-- How a type carries a mutable buffer value: not at all, as the buffer itself, or as `buffer × scalar`. -/
+inductive MutBufKind where
+  | none | buf | pair | bad
+  deriving BEq, Inhabited
+
+def isMutBufTypeName : Lean.Name → Bool
+  | .str _ "MutBytes" | .str _ "MutU16s" => true
+  | _ => false
+
+def exprMentionsMutBuf (e : Lean.Expr) : Bool :=
+  (e.find? fun | .const n _ => isMutBufTypeName n | _ => false).isSome
+
+def mutBufKindOf (e : Lean.Expr) : MutBufKind :=
+  let e := e.consumeMData
+  match e with
+  | .const n _ => if isMutBufTypeName n then .buf else .none
+  | .forallE .. => .none
+  | _ =>
+    if !exprMentionsMutBuf e then .none
+    else match e.getAppFn, e.getAppArgs with
+      | .const ``Prod _, #[.const a _, b] => if isMutBufTypeName a && !exprMentionsMutBuf b then .pair else .bad
+      | _, _ => .bad
 
 def isSupportedFlatPtrType : LNIRType → Bool
   | .rawPtr .i8 | .rawPtr .i16 | .rawPtr .i32 | .rawPtr .i64 => true
@@ -249,7 +274,8 @@ partial def lowerImpureType (e : Lean.Expr) (env? : Option Lean.Environment := n
         | some a, some b =>
           let ta := lowerImpureType a env?
           let tb := lowerImpureType b env?
-          if isFlatUnboxedScalar ta && isFlatUnboxedScalar tb then .tuple [ta, tb] else .objPtr
+          if mutBufKindOf e == .pair then tb
+          else if isFlatUnboxedScalar ta && isFlatUnboxedScalar tb then .tuple [ta, tb] else .objPtr
         | _, _ => .objPtr
       else if let some env := env? then
         if let some enumTy := nullaryEnumScalarType? env e then enumTy
@@ -454,6 +480,12 @@ structure BridgeState where
   jpIndexMap       : Std.HashMap Lean.FVarId Nat := {}
   localFunMap      : Std.HashMap Lean.FVarId (List VarId × LNIRCode) := {}
   liftedClosureMap : Std.HashMap Lean.FVarId (Lean.Name × Array (Lean.Compiler.LCNF.Arg .pure)) := {}
+  /-- Pointer behind each mutable buffer value (a buffer, or a `buffer × scalar` pair whose own
+      variable is the scalar). `checkLinearMutBufDecl` accepted the declaration, so every value
+      of a buffer is the caller's pointer. -/
+  bufPtr           : Std.HashMap Lean.FVarId VarId := {}
+  /-- The declaration returns its mutable buffer: `return` yields unit (`void` in C). -/
+  retBufUnit       : Bool := false
   nextVarId        : VarId := 0
   hasExtern        : Bool := false
   mangledSymbol    : String := ""
@@ -1262,9 +1294,13 @@ def lowerLocalFunDecl {pu} (decl : Lean.Compiler.LCNF.FunDecl pu) (k : Lean.Comp
     if pTy != .unit then
       checkBridgeType "local function parameter" p.type pTy
     let pid ← internFVar p.fvarId pTy true
+    if mutBufKindOf p.type == .buf then
+      modify fun st => { st with bufPtr := st.bufPtr.insert p.fvarId pid }
     pIds := pIds ++ [pid]
+  let outerRetBufUnit := (← get).retBufUnit
+  modify fun st => { st with retBufUnit := false }
   let fBody ← lowerCodeFn decl.value
-  modify fun st => { st with localFunMap := st.localFunMap.insert decl.fvarId (pIds, fBody) }
+  modify fun st => { st with retBufUnit := outerRetBufUnit, localFunMap := st.localFunMap.insert decl.fvarId (pIds, fBody) }
   lowerCodeFn k
 
 partial def inlineLocalFunCode (ren : Std.HashMap VarId VarId) (dst : VarId) (dstTy : LNIRType)
@@ -2567,6 +2603,136 @@ def prepareFreestandingMonoModuleM (rawDeclNames : Array Lean.Name) : Lean.CoreM
     finalSt ← collectFinalFreestandingNamesM env2 u finalSt
   return finalSt.2
 
+/-! ### Linear use of mutable buffers
+
+A mutable buffer (`MutBytes`, `MutU16s`) is a value in the source: a write returns the updated
+buffer. The lowering turns every such value into the caller's pointer and every write into a
+store. The two agree when no buffer value is used again after it was written or passed on, and
+when a function that writes returns the buffer. `checkLinearMutBufDecl` accepts exactly that:
+
+* a declaration or loop step has at most one mutable buffer parameter;
+* a buffer value is given at most once to a write, a buffer loop, a call that returns a buffer,
+  a `(buffer, scalar)` pair, or a `return`, and is not read afterwards;
+* only a function or loop step that returns the buffer may do so, and only on a buffer it
+  received as a parameter (a captured buffer can be read, never written);
+* every value of buffer type comes from one of the forms above. -/
+
+structure LinearBufState where
+  kinds : Std.HashMap Lean.FVarId MutBufKind := {}
+  dead  : Std.HashSet Lean.FVarId := {}
+  owned : Std.HashSet Lean.FVarId := {}
+  funs  : Std.HashMap Lean.FVarId (Lean.Compiler.LCNF.FunDecl .pure) := {}
+  jps   : Std.HashMap Lean.FVarId (Lean.Compiler.LCNF.FunDecl .pure) := {}
+
+private def LinearBufState.live (st : LinearBufState) (f : Lean.FVarId) : Except String Unit :=
+  if st.kinds.contains f && st.dead.contains f then
+    throw s!"buffer value `{f.name}` is used after it was written or passed on"
+  else pure ()
+
+private def LinearBufState.consume (st : LinearBufState) (f : Lean.FVarId) : Except String LinearBufState := do
+  st.live f
+  if !st.owned.contains f then
+    throw s!"buffer value `{f.name}` is written by a function or loop step that does not return it"
+  return { st with dead := st.dead.insert f }
+
+private def LinearBufState.define (st : LinearBufState) (f : Lean.FVarId) (k : MutBufKind) : LinearBufState :=
+  if k == .none then st else { st with kinds := st.kinds.insert f k, owned := st.owned.insert f }
+
+private def LinearBufState.enter (st : LinearBufState) (params : Array (Lean.Compiler.LCNF.Param .pure))
+    (retKind : MutBufKind) : Except String LinearBufState := do
+  if retKind == .bad then throw "unsupported result type containing a mutable buffer"
+  let mut st := { st with owned := {} }
+  let mut n := 0
+  for p in params do
+    match mutBufKindOf p.type with
+    | .none => pure ()
+    | .buf =>
+      n := n + 1
+      st := { st with kinds := st.kinds.insert p.fvarId .buf }
+      if retKind != .none then st := { st with owned := st.owned.insert p.fvarId }
+    | _ => throw s!"unsupported type of parameter `{p.binderName}`: a mutable buffer inside another type"
+  if n > 1 then throw "more than one mutable buffer parameter"
+  return st
+
+private partial def checkLinearBufCode (isCtor : Lean.Name → Bool) (retKind : MutBufKind) (st : LinearBufState)
+    (code : Lean.Compiler.LCNF.Code .pure) : Except String Unit := do
+  let fvarArgs (args : Array (Lean.Compiler.LCNF.Arg .pure)) : List Lean.FVarId :=
+    args.toList.filterMap fun | .fvar f => some f | _ => none
+  let noBufParams (ps : Array (Lean.Compiler.LCNF.Param .pure)) (what : String) : Except String Unit :=
+    if ps.any (mutBufKindOf ·.type != .none) then throw s!"unsupported mutable buffer in {what}" else pure ()
+  match code with
+  | .let decl k =>
+    let resKind := mutBufKindOf decl.type
+    if resKind == .bad then throw s!"unsupported type of `{decl.binderName}`: a mutable buffer inside another type"
+    let mut st := st
+    match decl.value with
+    | .proj _ idx f _ =>
+      match st.kinds[f]? with
+      | some .pair =>
+        if idx == 0 && resKind == .buf then st ← st.consume f
+        else if !(idx == 1 && resKind == .none) then throw s!"unsupported projection of `{f.name}`"
+      | some _ => throw s!"field access on buffer value `{f.name}` (use the read primitives)"
+      | none => if resKind != .none then throw s!"unsupported origin of buffer value `{decl.binderName}`"
+    | .const fn _ args _ =>
+      let fs := if fn == ``leanNativeKeepEffect && args.size >= 4 then fvarArgs #[args[3]!] else fvarArgs args
+      let bufArgs := fs.filter st.kinds.contains
+      if resKind == .none then
+        for f in bufArgs do
+          st.live f
+          if st.kinds[f]? != some .buf then throw s!"`{f.name}` is passed whole to `{fn}`, which does not return it"
+      else
+        if isCtor fn && !(fn == ``Prod.mk && resKind == .pair) then
+          throw s!"buffer value `{decl.binderName}` is built by constructor `{fn}`"
+        match bufArgs with
+        | [f] =>
+          if fn == ``Prod.mk && st.kinds[f]? != some .buf then throw s!"unsupported pair `{decl.binderName}`"
+          st ← st.consume f
+        | _ => throw s!"`{fn}` returns a buffer and must be given exactly one mutable buffer"
+      for f in fs do
+        if let some g := st.funs[f]? then
+          let gRet := mutBufKindOf g.type.getForallBody
+          checkLinearBufCode isCtor gRet (← st.enter g.params gRet) g.value
+    | .fvar f args =>
+      if args.isEmpty && st.kinds.contains f then
+        if st.kinds[f]? != some resKind then throw s!"unsupported copy of `{f.name}`"
+        st ← st.consume f
+      else
+        if resKind != .none || (fvarArgs args).any st.kinds.contains then
+          throw s!"unsupported local function application on a mutable buffer (`{decl.binderName}`)"
+        if let some g := st.funs[f]? then
+          checkLinearBufCode isCtor .none (← st.enter g.params .none) g.value
+    | _ => if resKind != .none then throw s!"unsupported origin of buffer value `{decl.binderName}`"
+    checkLinearBufCode isCtor retKind (st.define decl.fvarId resKind) k
+  | .fun decl k => checkLinearBufCode isCtor retKind { st with funs := st.funs.insert decl.fvarId decl } k
+  | .jp decl k =>
+    noBufParams decl.params "join-point parameters"
+    checkLinearBufCode isCtor retKind { st with jps := st.jps.insert decl.fvarId decl } k
+  | .jmp j args =>
+    if (fvarArgs args).any st.kinds.contains then throw "unsupported mutable buffer passed to a join point"
+    match st.jps[j]? with
+    | some d => checkLinearBufCode isCtor retKind st d.value
+    | none => throw s!"unknown join point `{j.name}`"
+  | .cases c =>
+    for alt in c.alts do
+      if let .alt _ ps _ _ := alt then noBufParams ps "constructor pattern"
+      checkLinearBufCode isCtor retKind st alt.getCode
+  | .return f =>
+    if retKind == .none then
+      if st.kinds.contains f then throw s!"buffer value `{f.name}` returned where the result type has no buffer"
+    else
+      if st.kinds[f]? != some retKind then throw s!"`{f.name}` is returned but is not the buffer result"
+      let _ ← st.consume f
+  | .unreach _ => pure ()
+
+def checkLinearMutBufDecl (env : Lean.Environment) (decl : Lean.Compiler.LCNF.Decl .pure) : Except String Unit := do
+  let .code c := decl.value | return
+  let retKind := mutBufKindOf decl.type.getForallBody
+  -- A one-field buffer structure is erased to its field by the compiler: its values cannot be tracked.
+  if retKind == .none && (env.find? decl.name).any (exprMentionsMutBuf ·.type.getForallBody) then
+    throw "it returns a mutable buffer whose type is a one-field structure; give the type a second field"
+  let isCtor := fun n => env.find? n matches some (.ctorInfo _)
+  checkLinearBufCode isCtor retKind (← ({} : LinearBufState).enter decl.params retKind) c
+
 def ingestModuleDeclsWith (ingestImpure : Lean.Compiler.LCNF.Decl .impure → Array Lean.Name → TargetArch → Lean.CoreM LNIRDecl)
     (ingestMono : Lean.Compiler.LCNF.Decl .pure → Array Lean.Name → TargetArch → Lean.CoreM LNIRDecl)
     (rawDeclNames : Array Lean.Name) (moduleName : String := "LeanNative.Ingested")
@@ -2582,6 +2748,8 @@ def ingestModuleDeclsWith (ingestImpure : Lean.Compiler.LCNF.Decl .impure → Ar
       if let some monoDecl ← Lean.Compiler.LCNF.getMonoDecl? name then
         if let .code c := monoDecl.value then
           callGraph := callGraph.insert name (collectCodeLocalCallees userNames c)
+        if let .error msg := checkLinearMutBufDecl env monoDecl then
+          Lean.throwError s!"[lean-native] mutable buffer not used linearly in `{name}`: {msg}"
         let d ← ingestMono monoDecl userNames arch
         decls := decls ++ [d]
         rawPairs := rawPairs ++ [(name, d.name)]

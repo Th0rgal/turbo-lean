@@ -431,8 +431,16 @@ private def extractReturnTypeRaw? (sig : String) : Option String :=
   let beforeEq := (afterParens.splitOn ":=").headD afterParens
   ((beforeEq.splitOn ":").drop 1).reverse.head?.map (·.trimAscii.toString)
 
+/-- A returned mutable buffer is the caller's own pointer and has no C return value:
+    `MutBytes` is `void`, `MutBytes × T` is `T`. -/
+private def dropReturnedMutBuf (ty : String) : String :=
+  match (ty.splitOn "×").map (·.trimAscii.toString) with
+  | [b] => if b == "MutBytes" || b == "MutU16s" then "Unit" else ty
+  | [b, t] => if b == "MutBytes" || b == "MutU16s" then t else ty
+  | _ => ty
+
 private def extractReturnTypeStr (sig : String) : String × String :=
-  mapLeanTypeStr ((extractReturnTypeRaw? sig).getD "UInt64")
+  mapLeanTypeStr (dropReturnedMutBuf ((extractReturnTypeRaw? sig).getD "UInt64"))
 
 /-- Extract `@[export <sym>]` / `@[inline, export <sym>]` signatures and `#guard` fixtures from `.lean` source text. -/
 def extractLeanSourceCAbiAndGuards (raw : String) : List CAbiBindingSig × List (String × String) :=
