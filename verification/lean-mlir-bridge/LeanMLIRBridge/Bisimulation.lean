@@ -2509,4 +2509,469 @@ theorem stepInstr_store_int_frame
         rwa [hlen]
       rw [ByteMem.readBytesAt_writeBytesAt_disjoint st.mem addr.toNat bs a2.toNat ty2.byteSize hdisj']
 
+/-! ## Stage 2C.10: Stack `.alloca`, Pointer (`.ptr`) Linear-Memory `.load`/`.store`, & End-to-End `alloca → store → load` Pipeline Bisimulation -/
+
+/-- Exact operational and UB characterization for `LLVMAst.stepInstr` on `.alloca`:
+1. When `isPow2 (effectiveAlign ty align) = false`, `stepInstr` returns `.inl (.ub "invalid alignment")`;
+2. When `isPow2 (effectiveAlign ty align) = true` and `st.mem.allocAligned ty.byteSize (effectiveAlign ty align) = none`,
+   `stepInstr` returns `.inl (.ub "alloca out of address space")`;
+3. When `isPow2 (effectiveAlign ty align) = true` and `st.mem.allocAligned ty.byteSize (effectiveAlign ty align) = some (ptr, mem')`:
+   - `stepInstr` succeeds with `.inr (bindReg { st with mem := mem' } dst (.ptr ptr))`;
+   - `ptr ≠ 0#64` (never allocates at null) and `isAligned ptr (effectiveAlign ty align) = true`;
+   - when `0 < ty.byteSize`, `mem'.accessOk ptr ty.byteSize (effectiveAlign ty align) true = true`,
+     `accessCheck mem' ptr ty.byteSize (effectiveAlign ty align) true = none`, and
+     `accessCheck mem' ptr ty.byteSize (effectiveAlign ty align) false = none`;
+   - every register `r ≠ dst`, `globals`, and `prevBlock` are preserved. -/
+theorem stepInstr_alloca_ub_and_bisim
+    (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (ty : LLVMType) (align : Nat) :
+    let effAlign := effectiveAlign ty align
+    (isPow2 effAlign = false →
+      stepInstr mod_ fuel st (.alloca dst ty align) = .inl (.ub "invalid alignment")) ∧
+    (isPow2 effAlign = true →
+      st.mem.allocAligned ty.byteSize effAlign = none →
+      stepInstr mod_ fuel st (.alloca dst ty align) = .inl (.ub "alloca out of address space")) ∧
+    (∀ (ptr : BitVec 64) (mem' : ByteMem),
+      isPow2 effAlign = true →
+      st.mem.allocAligned ty.byteSize effAlign = some (ptr, mem') →
+      let st' := bindReg { st with mem := mem' } dst (.ptr ptr)
+      stepInstr mod_ fuel st (.alloca dst ty align) = .inr st' ∧
+      evalOperand st' (.reg dst) = .ptr ptr ∧
+      ptr ≠ 0#64 ∧
+      isAligned ptr effAlign = true ∧
+      (0 < ty.byteSize →
+        mem'.accessOk ptr ty.byteSize effAlign true = true ∧
+        accessCheck mem' ptr ty.byteSize effAlign true = none ∧
+        accessCheck mem' ptr ty.byteSize effAlign false = none) ∧
+      (∀ r : RegName, r ≠ dst → evalOperand st' (.reg r) = evalOperand st (.reg r)) ∧
+      st'.mem = mem' ∧
+      st'.globals = st.globals ∧
+      st'.prevBlock = st.prevBlock) := by
+  dsimp only
+  refine ⟨?_, ?_, ?_⟩
+  · intro hpow_false
+    unfold stepInstr stepInstrWith
+    simp [hpow_false]
+  · intro hpow_true hnone
+    unfold stepInstr stepInstrWith
+    simp [hpow_true, hnone]
+  · intro ptr mem' hpow_true halloc
+    let st' := bindReg { st with mem := mem' } dst (.ptr ptr)
+    have hstep : stepInstr mod_ fuel st (.alloca dst ty align) = .inr st' := by
+      unfold stepInstr stepInstrWith
+      simp [hpow_true, halloc, st']
+    have hnz : ptr ≠ 0#64 :=
+      ByteMem.allocAligned_nonzero st.mem ty.byteSize (effectiveAlign ty align) true ptr mem' halloc
+    have hal : isAligned ptr (effectiveAlign ty align) = true :=
+      ByteMem.allocAligned_isAligned st.mem ty.byteSize (effectiveAlign ty align) true ptr mem' hpow_true halloc
+    refine ⟨hstep, evalOperand_reg_bindReg_same .., hnz, hal, ?_, ?_, rfl, rfl, rfl⟩
+    · intro hsz
+      have hok : mem'.accessOk ptr ty.byteSize (effectiveAlign ty align) true = true :=
+        ByteMem.allocAligned_accessOk st.mem ty.byteSize (effectiveAlign ty align) true ptr mem' hpow_true hsz halloc
+      have hnull_beq : (ptr == 0#64) = false := beq_eq_false_iff_ne.mpr hnz
+      have hinb_w : mem'.accessInAlloc ptr.toNat ty.byteSize true = true := by
+        unfold ByteMem.accessOk at hok
+        rcases Bool.and_eq_true_iff.mp hok with ⟨_, hinb⟩
+        exact hinb
+      have hinb_r : mem'.accessInAlloc ptr.toNat ty.byteSize false = true := by
+        unfold ByteMem.accessInAlloc at hinb_w ⊢
+        cases hfind : mem'.findAlloc ptr.toNat with
+        | none =>
+          rw [hfind] at hinb_w
+          cases hinb_w
+        | some b =>
+          rw [hfind] at hinb_w
+          rcases Bool.and_eq_true_iff.mp hinb_w with ⟨hbounds, _⟩
+          simp [hbounds]
+      have hacc_w : accessCheck mem' ptr ty.byteSize (effectiveAlign ty align) true = none := by
+        unfold accessCheck
+        rw [hnull_beq, hpow_true, hal, hinb_w]
+        rfl
+      have hacc_r : accessCheck mem' ptr ty.byteSize (effectiveAlign ty align) false = none := by
+        unfold accessCheck
+        rw [hnull_beq, hpow_true, hal, hinb_r]
+        rfl
+      exact ⟨hok, hacc_w, hacc_r⟩
+    · intro r hr
+      rw [evalOperand_reg_bindReg_ne _ r dst _ hr]
+      rfl
+
+/-- Exact disjoint-memory and architectural frame law for `LLVMAst.stepInstr` on `.alloca`:
+when `st.mem.allocAligned ty.byteSize (effectiveAlign ty align) = some (ptr, mem')`, the newly
+allocated block begins at `ptr.toNat = alignUp (Nat.max st.mem.nextAlloc 4096) (effectiveAlign ty align)`
+with span `Nat.max ty.byteSize 1`, every existing memory address outside `[ptr.toNat, ptr.toNat + Nat.max ty.byteSize 1)`
+(in particular every address `< st.mem.nextAlloc`) is unchanged (`readAt` and `readByte`), every
+disjoint integer or typed load (`rangesDisjoint ptr.toNat (Nat.max ty.byteSize 1) a2.toNat ... = true`)
+is unchanged, and every register `r ≠ dst`, `globals`, and `prevBlock` are unchanged. -/
+theorem stepInstr_alloca_frame
+    {mod_ : LLVMModule} {fuel : Nat} {st st' : ExecState}
+    {dst : RegName} {ty : LLVMType} {align : Nat}
+    {ptr : BitVec 64} {mem' : ByteMem}
+    (halloc : st.mem.allocAligned ty.byteSize (effectiveAlign ty align) = some (ptr, mem'))
+    (hstep : stepInstr mod_ fuel st (.alloca dst ty align) = .inr st') :
+    let span := Nat.max ty.byteSize 1
+    st'.mem = mem' ∧
+    st.mem.nextAlloc ≤ ptr.toNat ∧
+    4096 ≤ ptr.toNat ∧
+    (∀ q : Nat, (q < ptr.toNat ∨ ptr.toNat + span ≤ q) →
+      st'.mem.readAt q = st.mem.readAt q ∧ st'.mem.readByte q = st.mem.readByte q) ∧
+    (∀ (a2 : BitVec 64) (w2 : IntWidth),
+      rangesDisjoint ptr.toNat span a2.toNat w2.byteSize = true →
+      st'.mem.loadInt? a2 w2 = st.mem.loadInt? a2 w2) ∧
+    (∀ (a2 : BitVec 64) (ty2 : LLVMType),
+      rangesDisjoint ptr.toNat span a2.toNat ty2.byteSize = true →
+      loadVal st'.mem a2 ty2 = loadVal st.mem a2 ty2) ∧
+    (∀ r : RegName, r ≠ dst → evalOperand st' (.reg r) = evalOperand st (.reg r)) ∧
+    st'.globals = st.globals ∧
+    st'.prevBlock = st.prevBlock := by
+  dsimp only
+  unfold stepInstr stepInstrWith at hstep
+  cases hpow : isPow2 (effectiveAlign ty align) with
+  | false =>
+    simp [hpow] at hstep
+  | true =>
+    simp only [hpow, Bool.not_true, Bool.false_eq_true, ↓reduceIte, halloc] at hstep
+    injection hstep with hst'
+    subst hst'
+    unfold ByteMem.allocAligned at halloc
+    dsimp only at halloc
+    split at halloc
+    case isFalse => contradiction
+    case isTrue hfit =>
+      injection halloc with hpair
+      injection hpair with hptr hmem'
+      subst hptr hmem'
+      let base := ByteMem.alignUp (Nat.max st.mem.nextAlloc 4096) (ByteMem.effectiveAlign (effectiveAlign ty align))
+      let span := Nat.max ty.byteSize 1
+      have hbase_lt : base < 2 ^ 64 := by omega
+      have hptr_toNat : (BitVec.ofNat 64 base).toNat = base := by
+        rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt hbase_lt]
+      have hge_max : Nat.max st.mem.nextAlloc 4096 ≤ base :=
+        ByteMem.alignUp_ge (Nat.max st.mem.nextAlloc 4096) (ByteMem.effectiveAlign (effectiveAlign ty align))
+      have hge_next : st.mem.nextAlloc ≤ base :=
+        Nat.le_trans (Nat.le_max_left _ _) hge_max
+      have hge_4096 : 4096 ≤ base :=
+        Nat.le_trans (Nat.le_max_right _ _) hge_max
+      have hzero_len : (ByteMem.zeroBytes span).length = span := by
+        simp [ByteMem.zeroBytes]
+      let mZero := st.mem.writeBytesAt base (ByteMem.zeroBytes span)
+      let block : AllocBlock :=
+        { base := base, size := span, align := ByteMem.effectiveAlign (effectiveAlign ty align), writable := true }
+      let mAlloc : ByteMem := { mZero with nextAlloc := base + span, allocs := block :: st.mem.allocs }
+      have hreadAt_eq : ∀ a : Nat, mAlloc.readAt a = mZero.readAt a := fun _ => rfl
+      have hreadByte_eq : ∀ a : Nat, mAlloc.readByte a = mZero.readByte a := fun _ => rfl
+      have hreadBytes_eq : ∀ a n : Nat, mAlloc.readBytesAt a n = mZero.readBytesAt a n := by
+        intro a n
+        induction n generalizing a with
+        | zero => rfl
+        | succ k ih =>
+          simp [ByteMem.readBytesAt, hreadByte_eq, ih]
+      refine ⟨rfl, ?_, ?_, ?_, ?_, ?_, ?_, rfl, rfl⟩
+      · rw [hptr_toNat]; exact hge_next
+      · rw [hptr_toNat]; exact hge_4096
+      · intro q hq
+        rw [hptr_toNat] at hq
+        have hout : q < base ∨ base + (ByteMem.zeroBytes span).length ≤ q := by
+          rw [hzero_len]; exact hq
+        have hr := ByteMem.readAt_writeBytesAt_outside st.mem base (ByteMem.zeroBytes span) q hout
+        refine ⟨hr, ?_⟩
+        change mAlloc.readByte q = st.mem.readByte q
+        unfold ByteMem.readByte
+        rw [hreadAt_eq, hr]
+      · intro a2 w2 hdisj
+        rw [hptr_toNat] at hdisj
+        have hdisj' : rangesDisjoint base (ByteMem.zeroBytes span).length a2.toNat w2.byteSize = true := by
+          rwa [hzero_len]
+        change ByteMem.bytesToBv? w2.bits (mAlloc.readBytesAt a2.toNat w2.byteSize) =
+          ByteMem.bytesToBv? w2.bits (st.mem.readBytesAt a2.toNat w2.byteSize)
+        rw [hreadBytes_eq,
+            ByteMem.readBytesAt_writeBytesAt_disjoint st.mem base (ByteMem.zeroBytes span) a2.toNat w2.byteSize hdisj']
+      · intro a2 ty2 hdisj
+        rw [hptr_toNat] at hdisj
+        have hdisj' : rangesDisjoint base (ByteMem.zeroBytes span).length a2.toNat ty2.byteSize = true := by
+          rwa [hzero_len]
+        change deserializeVal ty2 (mAlloc.readBytesAt a2.toNat ty2.byteSize) =
+          deserializeVal ty2 (st.mem.readBytesAt a2.toNat ty2.byteSize)
+        rw [hreadBytes_eq,
+            ByteMem.readBytesAt_writeBytesAt_disjoint st.mem base (ByteMem.zeroBytes span) a2.toNat ty2.byteSize hdisj']
+      · intro r hr
+        rw [evalOperand_reg_bindReg_ne _ r dst _ hr]
+        rfl
+
+/-- Exact equivalence between `LLVMAst.loadVal` / `LLVMAst.storeTypedVal` at pointer type `.ptr as_`
+and `ByteMem.loadPtr?` / `ByteMem.storePtr` / `ByteMem.storePoison`, together with `PoisonOr (BitVec 64)`
+roundtrip and poison-byte tainting across all address spaces `as_ : AddrSpace`:
+1. `loadVal m addr (.ptr as_)` produces `.ptr p` when `m.loadPtr? addr = some p`, and `.poison`
+   when `m.loadPtr? addr = none`;
+2. `storeTypedVal m addr (.ptr as_) (.ptr p) = m.storePtr addr p`;
+3. `storeTypedVal m addr (.ptr as_) .poison = m.storePoison addr 8`;
+4. `(m.storePoison addr 8).loadPtr? addr = none`;
+5. Storing `toLLVMPtrVal x` (`x : PoisonOr (BitVec 64)`) at `addr` and loading `.ptr as2` back from `addr`
+   recovers `toLLVMPtrVal x` identically. -/
+def toLLVMPtrVal : LLVM.IntW 64 → LLVMVal
+  | .value p => .ptr p
+  | .poison => .poison
+
+theorem loadVal_storeTypedVal_ptr_bisim (m : ByteMem) (addr : BitVec 64) (as_ as2 : AddrSpace)
+    (p : BitVec 64) (x : LLVM.IntW 64) :
+    loadVal m addr (.ptr as_) =
+      (match m.loadPtr? addr with
+       | some pv => .ptr pv
+       | none => .poison) ∧
+    storeTypedVal m addr (.ptr as_) (.ptr p) = m.storePtr addr p ∧
+    storeTypedVal m addr (.ptr as_) .poison = m.storePoison addr 8 ∧
+    (m.storePoison addr 8).loadPtr? addr = none ∧
+    loadVal (storeTypedVal m addr (.ptr as_) (toLLVMPtrVal x)) addr (.ptr as2) = toLLVMPtrVal x := by
+  have htake_read : ∀ (m' : ByteMem),
+      (m'.readBytesAt addr.toNat 8).take 8 = m'.readBytesAt addr.toNat 8 :=
+    fun m' => take_eq_self_of_length_eq _ _ (ByteMem.readBytesAt_length m' addr.toNat 8)
+  have hload_eq : ∀ (m' : ByteMem) (as' : AddrSpace),
+      loadVal m' addr (.ptr as') =
+        match m'.loadPtr? addr with
+        | some pv => .ptr pv
+        | none => .poison := by
+    intro m' as'
+    unfold loadVal deserializeVal LLVMType.sizeOfType deserializeValAux LLVMType.byteSize
+      ByteMem.loadPtr? ByteMem.loadInt? IntWidth.bits IntWidth.byteSize
+    rw [htake_read m']
+    rfl
+  have hstore_val : storeTypedVal m addr (.ptr as_) (.ptr p) = m.storePtr addr p := rfl
+  have hstore_poison : storeTypedVal m addr (.ptr as_) .poison = m.storePoison addr 8 := rfl
+  have hload_poison : (m.storePoison addr 8).loadPtr? addr = none :=
+    (loadVal_storeTypedVal_int_bisim m addr .i64 p .poison).2.2.2.1
+  refine ⟨hload_eq m as_, hstore_val, hstore_poison, hload_poison, ?_⟩
+  rcases x with ⟨none | pv⟩
+  · change loadVal (storeTypedVal m addr (.ptr as_) .poison) addr (.ptr as2) = .poison
+    rw [hstore_poison, hload_eq, hload_poison]
+  · change loadVal (storeTypedVal m addr (.ptr as_) (.ptr pv)) addr (.ptr as2) = .ptr pv
+    rw [hload_eq]
+    have hsp : storeTypedVal m addr (.ptr as_) (.ptr pv) = m.storeInt addr .i64 pv := rfl
+    rw [hsp]
+    unfold ByteMem.loadPtr?
+    rw [ByteMem.loadInt?_storeInt_same]
+
+/-- Operational bisimulation for `LLVMAst.stepInstr` on pointer `.load` (`ty = .ptr asPtr`):
+when `accessCheck st.mem addr 8 (effectiveAlign (.ptr asPtr) align) false = none`:
+1. if `st.mem.loadPtr? addr = some p`, `stepInstr` transitions to
+   `bindReg st dst (toLLVMPtrVal (.value p))` (`.ptr p`);
+2. if `st.mem.loadPtr? addr = none` (uninitialized/poison memory slice), `stepInstr` transitions to
+   `bindReg st dst (toLLVMPtrVal .poison)` (`.poison` in `dst`, not UB);
+3. `mem`, `globals`, `prevBlock`, and every other register `r ≠ dst` are preserved. -/
+theorem stepInstr_load_ptr_bisim
+    (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (vol : Bool) (asPtr : AddrSpace) (ptrOp : Operand) (align : Nat) (as_ : AddrSpace)
+    (addr : BitVec 64)
+    (hptr : evalOperand st ptrOp = .ptr addr)
+    (hacc : accessCheck st.mem addr 8 (effectiveAlign (.ptr asPtr) align) false = none) :
+    let val : LLVM.IntW 64 :=
+      match st.mem.loadPtr? addr with
+      | some p => .value p
+      | none => .poison
+    let st' := bindReg st dst (toLLVMPtrVal val)
+    stepInstr mod_ fuel st (.load dst vol (.ptr asPtr) ptrOp align as_) = .inr st' ∧
+    evalOperand st' (.reg dst) = toLLVMPtrVal val ∧
+    (∀ r : RegName, r ≠ dst → evalOperand st' (.reg r) = evalOperand st (.reg r)) ∧
+    st'.mem = st.mem ∧
+    st'.globals = st.globals ∧
+    st'.prevBlock = st.prevBlock := by
+  dsimp only
+  have hload_val : loadVal st.mem addr (.ptr asPtr) =
+      toLLVMPtrVal (match st.mem.loadPtr? addr with | some p => .value p | none => .poison) := by
+    have h1 := (loadVal_storeTypedVal_ptr_bisim st.mem addr asPtr asPtr 0#64 .poison).1
+    rw [h1]
+    cases st.mem.loadPtr? addr <;> rfl
+  have hstep : stepInstr mod_ fuel st (.load dst vol (.ptr asPtr) ptrOp align as_) =
+      .inr (bindReg st dst (toLLVMPtrVal (match st.mem.loadPtr? addr with | some p => .value p | none => .poison))) := by
+    have hacc' : accessCheck st.mem addr (LLVMType.ptr asPtr).byteSize (effectiveAlign (.ptr asPtr) align) false = none := hacc
+    unfold stepInstr stepInstrWith
+    simp only [hptr, hacc', hload_val]
+  refine ⟨hstep, evalOperand_reg_bindReg_same .., ?_, rfl, rfl, rfl⟩
+  intro r hr
+  exact evalOperand_reg_bindReg_ne st r dst _ hr
+
+/-- Operational bisimulation for `LLVMAst.stepInstr` on pointer `.store` (`ty = .ptr asPtr`) across
+all `x : LLVM.IntW 64` (`PoisonOr.value p` and `PoisonOr.poison`):
+when `accessCheck st.mem addr 8 (effectiveAlign (.ptr asPtr) align) true = none` and
+`evalTypedOperand st (.ptr asPtr) valOp = toLLVMPtrVal x`:
+1. `stepInstr` succeeds with `.inr st'` where `st' = { st with mem := storeTypedVal st.mem addr (.ptr asPtr) (toLLVMPtrVal x) }`;
+2. `loadVal st'.mem addr (.ptr asPtr) = toLLVMPtrVal x`;
+3. When `x = .value p`, `st'.mem = st.mem.storePtr addr p` and `st'.mem.loadPtr? addr = some p`;
+4. When `x = .poison`, `st'.mem = st.mem.storePoison addr 8` and `st'.mem.loadPtr? addr = none`;
+5. `regs`, `globals`, and `prevBlock` are strictly unchanged. -/
+theorem stepInstr_store_ptr_bisim
+    (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (vol : Bool) (asPtr : AddrSpace) (valOp ptrOp : Operand) (align : Nat) (as_ : AddrSpace)
+    (addr : BitVec 64) (x : LLVM.IntW 64)
+    (hptr : evalOperand st ptrOp = .ptr addr)
+    (hval : evalTypedOperand st (.ptr asPtr) valOp = toLLVMPtrVal x)
+    (hacc : accessCheck st.mem addr 8 (effectiveAlign (.ptr asPtr) align) true = none) :
+    let st' : ExecState := { st with mem := storeTypedVal st.mem addr (.ptr asPtr) (toLLVMPtrVal x) }
+    stepInstr mod_ fuel st (.store vol (.ptr asPtr) valOp ptrOp align as_) = .inr st' ∧
+    loadVal st'.mem addr (.ptr asPtr) = toLLVMPtrVal x ∧
+    (∀ p : BitVec 64, x = .value p →
+      st'.mem = st.mem.storePtr addr p ∧ st'.mem.loadPtr? addr = some p) ∧
+    (x = .poison →
+      st'.mem = st.mem.storePoison addr 8 ∧ st'.mem.loadPtr? addr = none) ∧
+    st'.regs = st.regs ∧
+    st'.globals = st.globals ∧
+    st'.prevBlock = st.prevBlock := by
+  dsimp only
+  have hstep : stepInstr mod_ fuel st (.store vol (.ptr asPtr) valOp ptrOp align as_) =
+      .inr { st with mem := storeTypedVal st.mem addr (.ptr asPtr) (toLLVMPtrVal x) } := by
+    have hacc' : accessCheck st.mem addr (LLVMType.ptr asPtr).byteSize (effectiveAlign (.ptr asPtr) align) true = none := hacc
+    unfold stepInstr stepInstrWith
+    simp only [hptr, hacc', hval]
+  have hround := (loadVal_storeTypedVal_ptr_bisim st.mem addr asPtr asPtr 0#64 x).2.2.2.2
+  refine ⟨hstep, hround, ?_, ?_, rfl, rfl, rfl⟩
+  · intro p hx
+    subst hx
+    refine ⟨rfl, ?_⟩
+    change (st.mem.storeInt addr .i64 p).loadInt? addr .i64 = some p
+    exact ByteMem.loadInt?_storeInt_same st.mem addr .i64 p
+  · intro hx
+    subst hx
+    rcases loadVal_storeTypedVal_ptr_bisim st.mem addr asPtr asPtr 0#64 .poison with ⟨_, _, hsp, hlp, _⟩
+    exact ⟨hsp, hlp⟩
+
+/-- Exact disjoint-memory and architectural frame law for any successful `stepInstr` on `.store`
+at pointer type `.ptr asPtr`:
+every byte outside `[addr.toNat, addr.toNat + 8)` is unchanged (`readAt` and `readByte`), every
+disjoint integer or typed load (`rangesDisjoint addr.toNat 8 a2.toNat ... = true`) is unchanged,
+and allocation metadata (`allocs`, `nextAlloc`), `regs`, `globals`, and `prevBlock` are unchanged. -/
+theorem stepInstr_store_ptr_frame
+    {mod_ : LLVMModule} {fuel : Nat} {st st' : ExecState}
+    {vol : Bool} {asPtr : AddrSpace} {valOp ptrOp : Operand} {align : Nat} {as_ : AddrSpace}
+    {addr : BitVec 64}
+    (hptr : evalOperand st ptrOp = .ptr addr)
+    (hstep : stepInstr mod_ fuel st (.store vol (.ptr asPtr) valOp ptrOp align as_) = .inr st') :
+    (∀ q : Nat, (q < addr.toNat ∨ addr.toNat + 8 ≤ q) →
+      st'.mem.readAt q = st.mem.readAt q ∧ st'.mem.readByte q = st.mem.readByte q) ∧
+    (∀ (a2 : BitVec 64) (w2 : IntWidth),
+      rangesDisjoint addr.toNat 8 a2.toNat w2.byteSize = true →
+      st'.mem.loadInt? a2 w2 = st.mem.loadInt? a2 w2) ∧
+    (∀ (a2 : BitVec 64) (ty2 : LLVMType),
+      rangesDisjoint addr.toNat 8 a2.toNat ty2.byteSize = true →
+      loadVal st'.mem a2 ty2 = loadVal st.mem a2 ty2) ∧
+    st'.mem.allocs = st.mem.allocs ∧
+    st'.mem.nextAlloc = st.mem.nextAlloc ∧
+    st'.regs = st.regs ∧
+    (∀ r : RegName, evalOperand st' (.reg r) = evalOperand st (.reg r)) ∧
+    st'.globals = st.globals ∧
+    st'.prevBlock = st.prevBlock := by
+  have h_write_allocs : ∀ (m : ByteMem) (base : Nat) (bs : List MemByte),
+      (m.writeBytesAt base bs).allocs = m.allocs ∧
+      (m.writeBytesAt base bs).nextAlloc = m.nextAlloc := by
+    intro m base bs
+    induction bs generalizing m base with
+    | nil => exact ⟨rfl, rfl⟩
+    | cons b rest ih =>
+      simp only [ByteMem.writeBytesAt]
+      exact ih (m.writeAt base b) (base + 1)
+  have h_ser_len : ∀ (v : LLVMVal), (serializeTypedVal (.ptr asPtr) v).length = 8 := by
+    intro v
+    unfold serializeTypedVal LLVMType.sizeOfType serializeTypedValAux
+    cases v with
+    | ptr p =>
+      simp [ByteMem.initBytes_length, ByteMem.bvToLEBytes, ByteMem.natToLEBytes_length]
+    | bits _ _ | floatBits _ _ | poison | aggNil | aggCons _ _ =>
+      exact ByteMem.poisonBytes_length 8
+  unfold stepInstr stepInstrWith at hstep
+  simp only [hptr] at hstep
+  cases hacc : accessCheck st.mem addr (LLVMType.ptr asPtr).byteSize (effectiveAlign (.ptr asPtr) align) true with
+  | some msg =>
+    rw [hacc] at hstep
+    by_cases hm1 : msg = "null pointer"
+    · subst hm1; nomatch hstep
+    · by_cases hm2 : msg = "invalid alignment"
+      · subst hm2; simp at hstep
+      · by_cases hm3 : msg = "misaligned access"
+        · subst hm3; simp at hstep
+        · simp at hstep
+  | none =>
+    rw [hacc] at hstep
+    injection hstep with hst'
+    subst hst'
+    let bs := serializeTypedVal (.ptr asPtr) (evalTypedOperand st (.ptr asPtr) valOp)
+    have hlen : bs.length = 8 := h_ser_len (evalTypedOperand st (.ptr asPtr) valOp)
+    rcases h_write_allocs st.mem addr.toNat bs with ⟨hallocs, hnext⟩
+    refine ⟨?_, ?_, ?_, hallocs, hnext, rfl, fun _ => rfl, rfl, rfl⟩
+    · intro q hq
+      have hout : q < addr.toNat ∨ addr.toNat + bs.length ≤ q := by omega
+      have hr := ByteMem.readAt_writeBytesAt_outside st.mem addr.toNat bs q hout
+      refine ⟨hr, ?_⟩
+      unfold ByteMem.readByte storeTypedVal
+      dsimp only
+      rw [hr]
+    · intro a2 w2 hdisj
+      simp only [ByteMem.loadInt?, storeTypedVal]
+      have hdisj' : rangesDisjoint addr.toNat bs.length a2.toNat w2.byteSize = true := by
+        rwa [hlen]
+      rw [ByteMem.readBytesAt_writeBytesAt_disjoint st.mem addr.toNat bs a2.toNat w2.byteSize hdisj']
+    · intro a2 ty2 hdisj
+      simp only [loadVal, storeTypedVal]
+      have hdisj' : rangesDisjoint addr.toNat bs.length a2.toNat ty2.byteSize = true := by
+        rwa [hlen]
+      rw [ByteMem.readBytesAt_writeBytesAt_disjoint st.mem addr.toNat bs a2.toNat ty2.byteSize hdisj']
+
+/-- End-to-end 3-instruction `alloca` → `store` → `load` stack pipeline bisimulation (`execInstrs` /
+`StraightLineBisim`) across all 8 integer widths `w : IntWidth` and all `x : LLVM.IntW w.bits`
+(`PoisonOr.value v` and `PoisonOr.poison`):
+executing `[.alloca rPtr (.int w) 0, .store volS (.int w) (.reg rVal) (.reg rPtr) 0 asS, .load rOut volL (.int w) (.reg rPtr) 0 asL]`
+with `rVal ≠ rPtr` when `st.mem.allocAligned w.byteSize w.naturalAlign = some (ptr, memAlloc)` and
+`evalOperand st (.reg rVal) = toLLVMVal w x` succeeds without UB, binds `rPtr` to `.ptr ptr` and
+`rOut` to `toLLVMVal w x`, stores `toLLVMVal w x` into the freshly allocated stack slot `ptr`,
+and preserves every register `r` with `r ≠ rOut ∧ r ≠ rPtr`, `globals`, and `prevBlock`. -/
+theorem execInstrs_alloca_store_load_int_roundtrip
+    (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (rPtr rVal rOut : RegName) (volS volL : Bool) (w : IntWidth) (asS asL : AddrSpace)
+    (ptr : BitVec 64) (memAlloc : ByteMem) (x : LLVM.IntW w.bits)
+    (hne_val_ptr : rVal ≠ rPtr)
+    (hval : evalOperand st (.reg rVal) = toLLVMVal w x)
+    (halloc : st.mem.allocAligned w.byteSize w.naturalAlign = some (ptr, memAlloc)) :
+    let st1 : ExecState := bindReg { st with mem := memAlloc } rPtr (.ptr ptr)
+    let st2 : ExecState := { st1 with mem := storeTypedVal memAlloc ptr (.int w) (toLLVMVal w x) }
+    let st3 : ExecState := bindReg st2 rOut (toLLVMVal w x)
+    stepInstr mod_ fuel st (.alloca rPtr (.int w) 0) = .inr st1 ∧
+    stepInstr mod_ fuel st1 (.store volS (.int w) (.reg rVal) (.reg rPtr) 0 asS) = .inr st2 ∧
+    stepInstr mod_ fuel st2 (.load rOut volL (.int w) (.reg rPtr) 0 asL) = .inr st3 ∧
+    execInstrs mod_ fuel st
+      [ .alloca rPtr (.int w) 0
+      , .store volS (.int w) (.reg rVal) (.reg rPtr) 0 asS
+      , .load rOut volL (.int w) (.reg rPtr) 0 asL ] = .inr st3 ∧
+    evalOperand st3 (.reg rOut) = toLLVMVal w x ∧
+    (rOut ≠ rPtr → evalOperand st3 (.reg rPtr) = .ptr ptr) ∧
+    (∀ r : RegName, r ≠ rOut → r ≠ rPtr → evalOperand st3 (.reg r) = evalOperand st (.reg r)) ∧
+    st3.globals = st.globals ∧
+    st3.prevBlock = st.prevBlock := by
+  dsimp only
+  have heff : effectiveAlign (.int w) 0 = w.naturalAlign := rfl
+  have hpow : isPow2 (effectiveAlign (.int w) 0) = true := by
+    rw [heff]
+    exact IntWidth.naturalAlign_isPow2 w
+  have halloc' : st.mem.allocAligned (LLVMType.int w).byteSize (effectiveAlign (.int w) 0) = some (ptr, memAlloc) :=
+    halloc
+  rcases (stepInstr_alloca_ub_and_bisim mod_ fuel st rPtr (.int w) 0).2.2 ptr memAlloc hpow halloc' with
+    ⟨hs1, hptr1, _, _, hacc_both, hreg1, _, _, _⟩
+  rcases hacc_both (IntWidth.byteSize_pos w) with ⟨_, haccS, haccL⟩
+  let st1 : ExecState := bindReg { st with mem := memAlloc } rPtr (.ptr ptr)
+  let st2 : ExecState := { st1 with mem := storeTypedVal memAlloc ptr (.int w) (toLLVMVal w x) }
+  let st3 : ExecState := bindReg st2 rOut (toLLVMVal w x)
+  have hval1 : evalTypedOperand st1 (.int w) (.reg rVal) = toLLVMVal w x := by
+    rw [evalTypedOperand_int_reg, hreg1 rVal hne_val_ptr, hval]
+  rcases execInstrs_store_then_load_int_roundtrip mod_ fuel st1 rOut volS volL w
+      (.reg rVal) (.reg rPtr) 0 0 asS asL ptr x hptr1 hval1 haccS haccL with
+    ⟨hs2, hs3, _, hout3, hreg3, _, _⟩
+  have htrace : StraightLineBisim mod_ fuel st
+      [ .alloca rPtr (.int w) 0
+      , .store volS (.int w) (.reg rVal) (.reg rPtr) 0 asS
+      , .load rOut volL (.int w) (.reg rPtr) 0 asL ] st3 :=
+    .cons hs1 (.cons hs2 (.cons hs3 (.nil st3)))
+  refine ⟨hs1, hs2, hs3, execInstrs_of_straightLineBisim htrace, hout3, ?_, ?_, rfl, rfl⟩
+  · intro hne_out_ptr
+    have hr := hreg3 rPtr hne_out_ptr.symm
+    exact hr.trans hptr1
+  · intro r hr_out hr_ptr
+    have hr := hreg3 r hr_out
+    exact hr.trans (hreg1 r hr_ptr)
+
 end LeanMLIRBridge
