@@ -3,13 +3,18 @@
 
 The former Python reference formulas and C runtime stubs were not independent
 Lean execution. They are deliberately excluded from acceptance. Full loop
-(`seqFor`), upstream 250+ `lean4/tests/lean/run`, ecosystem Lake packages
-(`C2`), and hardware target qualification remain open (`C2` fails closed when
-requested via `--tier`). Tier `C3` runs the `R1`–`R6` cross-regime holdout
-portfolio and adversarial `.olean` rejection battery through pinned upstream
-`leanprover/con-leche --verified` when provisioned via `TURBO_CON_LECHE_BIN`
-(or `--con-leche-bin`), and fails closed (`BLOCKED_MISSING_DEPENDENCY`)
-otherwise.
+(`seqFor`), upstream 250+ `lean4/tests/lean/run`, external ecosystem Lake
+packages (`Batteries`, `SciLean`, `ArkLib`), and hardware target qualification
+remain open. Tier `C2` runs 3-way multi-module Lake package differential
+conformance (`lean -c` + `leanc`, `lean-native emit-lnir --wire` + `eval-lnir`
++ `validate-tv`, and `compile-llvm` + `clang` under ASan/UBSan) when
+provisioned via `TURBO_C2_PACKAGES_DIR` (or `--c2-packages-dir`, including
+`auto` for `verification/c2-lake-packages`), and fails closed
+(`BLOCKED_MISSING_DEPENDENCY`) otherwise. Tier `C3` runs the `R1`–`R6`
+cross-regime holdout portfolio and adversarial `.olean` rejection battery
+through pinned upstream `leanprover/con-leche --verified` when provisioned via
+`TURBO_CON_LECHE_BIN` (or `--con-leche-bin`), and fails closed
+(`BLOCKED_MISSING_DEPENDENCY`) otherwise.
 """
 from __future__ import annotations
 
@@ -35,6 +40,22 @@ BRIDGE_CON_LECHE_BIN = (
     ROOT
     / "verification/con-leche-bridge/.lake/packages/con-leche/.lake/build/bin/con-leche"
 )
+DEFAULT_C2_PACKAGES_DIR = ROOT / "verification/c2-lake-packages"
+C2_LAKE_PACKAGE_SPECS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
+    ("C2BitwiseScan", ("Swar", "Scan"), ("c2_bitwise_scan_digest", "c2_swar_sip_mix")),
+    ("C2FieldButterfly", ("Field", "Butterfly"), ("c2_babybear_radix4", "c2_gf2_clmul_tower")),
+    ("C2ProtocolMachine", ("Types", "Transition"), ("c2_protocol_step6", "c2_usize_stencil_clamp")),
+)
+C2_TEST_VECTORS: tuple[int, ...] = (
+    0,
+    1,
+    42,
+    0x00000000000000AA,
+    0x41393A0A7E7D03AA,
+    0x0123456789ABCDEF,
+    0x8000000000000001,
+    0xFFFFFFFFFFFFFFFF,
+)
 
 VALID_TIERS = ("C1", "C2", "C3", "C4")
 C1_CORPUS_TESTS = (
@@ -44,6 +65,8 @@ C1_CORPUS_TESTS = (
     "ScalarFrontend.test_chained_boolean_join_points_and_tuple_helpers",
     "ScalarFrontend.test_unsigned_casts_and_input_dependent_boolean_branches",
     "ScalarFrontend.test_stage1b_narrow_abi_usize_bool_enums_joinpoints_and_divmod_zero",
+    "ScalarFrontend.test_c1_bitwise_rotations_clmul_swar_and_diamond_merges",
+    "ScalarFrontend.test_c1_multi_enum_state_machine_and_crc_polynomial_fold",
 )
 
 C3_HOLDOUT_REGIMES: tuple[tuple[str, str, str], ...] = (
@@ -201,6 +224,16 @@ def resolve_con_leche_bin(cli_bin: str | None) -> Path | None:
     if cand.is_file() and os.access(cand, os.X_OK):
         return cand.resolve()
     return None
+
+
+def resolve_c2_packages_dir(cli_dir: str | None) -> tuple[str, Path | None]:
+    raw = (cli_dir if cli_dir is not None else os.environ.get("TURBO_C2_PACKAGES_DIR", "")).strip()
+    if not raw:
+        return "", None
+    cand = DEFAULT_C2_PACKAGES_DIR if raw == "auto" else Path(raw)
+    if cand.is_dir():
+        return raw, cand.resolve()
+    return raw, None
 
 
 def find_v435_lean_and_init() -> tuple[Path, Path] | None:
@@ -501,6 +534,322 @@ def run_c3_corpus(con_leche_bin_arg: str | None) -> dict[str, Any]:
         }
 
 
+def run_c2_corpus(cli_dir: str | None, asan: bool, ubsan: bool) -> dict[str, Any]:
+    raw_spec, pkgs_root = resolve_c2_packages_dir(cli_dir)
+    if not raw_spec or pkgs_root is None:
+        return {
+            "tier": "C2",
+            "ok": False,
+            "status": "BLOCKED_MISSING_DEPENDENCY",
+            "requestedPackagesDir": raw_spec or None,
+            "reason": (
+                "Ecosystem Lake codegen corpus requires --c2-packages-dir / TURBO_C2_PACKAGES_DIR "
+                "(use `auto` for verification/c2-lake-packages; external Batteries/SciLean/ArkLib remain open)"
+            ),
+        }
+
+    engines = fuzz.probe_engines(asan=asan, ubsan=ubsan)
+    if not (engines["stock_lean_c"] and engines["lnir_eval"] and engines["c_abi_llvm"]):
+        return {
+            "tier": "C2",
+            "ok": False,
+            "status": "incomplete_missing_engine",
+            "packagesDir": str(pkgs_root),
+            "asan": asan,
+            "ubsan": ubsan,
+            "engines": {
+                "stock_lean_c": engines["stock_lean_c"],
+                "lnir_validate_tv": engines["lnir_eval"],
+                "c_abi_llvm": engines["c_abi_llvm"],
+            },
+        }
+
+    lean_bin = engines["lean_bin"]
+    core_bin = engines["core_bin"]
+    full_bin = engines["full_bin"]
+    clang_bin = engines["clang_bin"]
+    extra_inc = fuzz.clang_extra_flags(clang_bin)
+    lean_prefix = Path(
+        subprocess.run([lean_bin, "--print-prefix"], check=True, capture_output=True, text=True).stdout.strip()
+    )
+    leanc_bin = str(lean_prefix / "bin" / "leanc")
+
+    package_reports: list[dict[str, Any]] = []
+    mismatches: list[dict[str, Any]] = []
+    total_cases = 0
+    total_live_objs = 0
+
+    with tempfile.TemporaryDirectory(prefix="turbo_c2_lake_") as tmp:
+        tmp_root = Path(tmp)
+        for pkg_name, submods, exports in C2_LAKE_PACKAGE_SPECS:
+            src_pkg = pkgs_root / pkg_name
+            req_files = [
+                src_pkg / "lakefile.lean",
+                src_pkg / "lean-toolchain",
+                src_pkg / f"{pkg_name}.lean",
+                *(src_pkg / pkg_name / f"{sub}.lean" for sub in submods),
+            ]
+            missing_files = [str(p.relative_to(pkgs_root)) for p in req_files if not p.is_file()]
+            if missing_files:
+                return {
+                    "tier": "C2",
+                    "ok": False,
+                    "status": "invalid_c2_package_fixture",
+                    "package": pkg_name,
+                    "missingFiles": missing_files,
+                }
+            tc_txt = (src_pkg / "lean-toolchain").read_text(encoding="utf-8").strip()
+            if tc_txt != PINNED_CON_LECHE_TOOLCHAIN:
+                return {
+                    "tier": "C2",
+                    "ok": False,
+                    "status": "toolchain_mismatch",
+                    "package": pkg_name,
+                    "expectedToolchain": PINNED_CON_LECHE_TOOLCHAIN,
+                    "actualToolchain": tc_txt,
+                }
+
+            work_pkg = tmp_root / pkg_name
+            shutil.copytree(src_pkg, work_pkg)
+            sub_env = dict(os.environ)
+            sub_env["LEAN_SYSROOT"] = str(lean_prefix)
+            sub_env["LEAN_PATH"] = f"{work_pkg}{os.pathsep}{lean_prefix / 'lib' / 'lean'}"
+
+            c_units: list[str] = []
+            for sub in submods:
+                sf = work_pkg / pkg_name / f"{sub}.lean"
+                of = work_pkg / pkg_name / f"{sub}.olean"
+                cf = work_pkg / f"{pkg_name}_{sub}.c"
+                subprocess.run(
+                    [lean_bin, "-R", str(work_pkg), "-DautoImplicit=false", "-o", str(of), "-c", str(cf), str(sf)],
+                    cwd=work_pkg,
+                    env=sub_env,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                c_units.append(str(cf))
+
+            umb_f = work_pkg / f"{pkg_name}.lean"
+            umb_o = work_pkg / f"{pkg_name}.olean"
+            umb_c = work_pkg / f"{pkg_name}_root.c"
+            subprocess.run(
+                [lean_bin, "-R", str(work_pkg), "-DautoImplicit=false", "-o", str(umb_o), "-c", str(umb_c), str(umb_f)],
+                cwd=work_pkg,
+                env=sub_env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            c_units.append(str(umb_c))
+
+            call_pairs: list[tuple[str, int]] = [
+                (fn, fuzz.u64(vec)) for fn in exports for vec in C2_TEST_VECTORS
+            ]
+            stock_drv = work_pkg / "StockDriver.lean"
+            stock_drv_c = work_pkg / "StockDriver.c"
+            stock_calls = [f"toString ({fn} {arg})" for fn, arg in call_pairs]
+            stock_drv.write_text(
+                f"import {pkg_name}\n"
+                'def main : IO Unit :=\n  IO.println ("[" ++ String.intercalate "," ['
+                + ", ".join(stock_calls)
+                + '] ++ "]")\n',
+                encoding="utf-8",
+            )
+            subprocess.run(
+                [lean_bin, "-R", str(work_pkg), "-DautoImplicit=false", "-c", str(stock_drv_c), str(stock_drv)],
+                cwd=work_pkg,
+                env=sub_env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            stock_bin = work_pkg / "stock_runner"
+            subprocess.run(
+                [leanc_bin, "-O2", *c_units, str(stock_drv_c), "-o", str(stock_bin)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            stock_vals = [
+                int(x)
+                for x in json.loads(
+                    subprocess.run([str(stock_bin)], check=True, capture_output=True, text=True).stdout
+                )
+            ]
+
+            wire_path = work_pkg / f"{pkg_name}.lnir"
+            subprocess.run(
+                [full_bin, "emit-lnir", "--wire", str(umb_f), "-o", str(wire_path)],
+                cwd=work_pkg,
+                env=sub_env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            tv_json = json.loads(
+                subprocess.run(
+                    [core_bin, "validate-tv", "--lnir", str(wire_path), "--json"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout
+            )
+            wire_tokens = wire_path.read_text(encoding="utf-8").strip().split("|")
+            lowered_decls = [
+                bytes.fromhex(wire_tokens[i + 1]).decode("utf-8")
+                for i, tok in enumerate(wire_tokens)
+                if tok == "D_decl"
+            ]
+            if not set(exports) <= set(lowered_decls):
+                return {
+                    "tier": "C2",
+                    "ok": False,
+                    "status": "missing_lowered_exports",
+                    "package": pkg_name,
+                    "expectedExports": list(exports),
+                    "loweredDecls": lowered_decls,
+                }
+            fuzz.validate_tv_coverage(tv_json, set(lowered_decls))
+
+            lnir_vals: list[int] = []
+            pkg_live_objs = 0
+            for vec in C2_TEST_VECTORS:
+                uvec = fuzz.u64(vec)
+                arg_str = ";".join(f"{fn}:{uvec}" for fn in exports)
+                ev_rows = json.loads(
+                    subprocess.run(
+                        [core_bin, "eval-lnir", "--lnir", str(wire_path), "--args", arg_str, "--opt", "--batch-json"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout
+                )
+                if len(ev_rows) != len(exports) or any(r.get("ok") is not True for r in ev_rows):
+                    return {
+                        "tier": "C2",
+                        "ok": False,
+                        "status": "lnir_eval_failed",
+                        "package": pkg_name,
+                        "rows": ev_rows,
+                    }
+                by_decl = {r["decl"]: int(r["value_u64"]) for r in ev_rows}
+                pkg_live_objs += sum(int(r.get("live_objects", 0)) for r in ev_rows)
+                for fn in exports:
+                    lnir_vals.append(by_decl[fn])
+            # Reorder `lnir_vals` to match `call_pairs` (`for fn in exports for vec in C2_TEST_VECTORS`)
+            lnir_by_pair: dict[tuple[str, int], int] = {}
+            idx_lv = 0
+            for vec in C2_TEST_VECTORS:
+                uvec = fuzz.u64(vec)
+                for fn in exports:
+                    lnir_by_pair[(fn, uvec)] = lnir_vals[idx_lv]
+                    idx_lv += 1
+            ordered_lnir_vals = [lnir_by_pair[pair] for pair in call_pairs]
+            total_live_objs += pkg_live_objs
+
+            ll_path = work_pkg / f"{pkg_name}.ll"
+            ln_bin = work_pkg / "ln_runner"
+            c_drv = work_pkg / "cabi_driver.c"
+            c_decls = ["#include <stdint.h>", "#include <stdio.h>"] + [
+                f"extern uint64_t {fn}(uint64_t);" for fn in exports
+            ]
+            c_body = ["int main(void) {", '  printf("[");']
+            for idx_c, (fn, arg) in enumerate(call_pairs):
+                sep = "," if idx_c > 0 else ""
+                c_body.append(f'  printf("{sep}\\"%llu\\"", (unsigned long long){fn}({arg}ULL));')
+            c_body.extend(['  printf("]\\n");', "  return 0;", "}"])
+            c_drv.write_text("\n".join(c_decls + c_body) + "\n", encoding="utf-8")
+
+            subprocess.run(
+                [core_bin, "compile-llvm", "--no-telemetry", "--lnir", str(wire_path), "-o", str(ll_path)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            raw_ll_sha = fuzz.sha256_bytes(ll_path.read_bytes())
+            san_meta = fuzz.compile_and_link_llvm_driver(
+                clang_bin=clang_bin,
+                extra_inc=extra_inc,
+                ll_path=ll_path,
+                driver_c_path=c_drv,
+                out_bin_path=ln_bin,
+                asan=asan,
+                ubsan=ubsan,
+                sanitizer_linker=engines.get("sanitizer_linker"),
+            )
+            san_verified = (
+                san_meta.get("asan") is asan
+                and san_meta.get("ubsan") is ubsan
+                and (
+                    san_meta.get("compiled_llvm_ir_sha256") != raw_ll_sha
+                    if asan
+                    else san_meta.get("compiled_llvm_ir_sha256") == raw_ll_sha
+                )
+            )
+            run_env = dict(os.environ)
+            if asan:
+                run_env["ASAN_OPTIONS"] = "detect_leaks=0:abort_on_error=1:halt_on_error=1"
+            if ubsan:
+                run_env["UBSAN_OPTIONS"] = "print_stacktrace=1:halt_on_error=1"
+            llvm_vals = [
+                int(x)
+                for x in json.loads(
+                    subprocess.run([str(ln_bin)], env=run_env, check=True, capture_output=True, text=True).stdout
+                )
+            ]
+
+            pkg_mismatches = 0
+            for idx_p, (fn, arg) in enumerate(call_pairs):
+                sv = stock_vals[idx_p]
+                lv = ordered_lnir_vals[idx_p]
+                nv = llvm_vals[idx_p]
+                if sv != lv or lv != nv:
+                    pkg_mismatches += 1
+                    mismatches.append(
+                        {
+                            "package": pkg_name,
+                            "export": fn,
+                            "arg": str(arg),
+                            "stock_lean_c": str(sv),
+                            "lnir_eval": str(lv),
+                            "c_abi_llvm": str(nv),
+                        }
+                    )
+            total_cases += len(call_pairs)
+            package_reports.append(
+                {
+                    "package": pkg_name,
+                    "submodules": list(submods),
+                    "exports": list(exports),
+                    "casesChecked": len(call_pairs),
+                    "liveObjects": pkg_live_objs,
+                    "mismatches": pkg_mismatches,
+                    "sanitizerVerified": san_verified,
+                    "llvmIrSha256": raw_ll_sha,
+                    "compiledLlvmIrSha256": san_meta.get("compiled_llvm_ir_sha256"),
+                }
+            )
+
+    all_san_ok = all(p["sanitizerVerified"] for p in package_reports)
+    ok = len(package_reports) == len(C2_LAKE_PACKAGE_SPECS) and not mismatches and total_live_objs == 0 and all_san_ok
+    return {
+        "tier": "C2",
+        "ok": ok,
+        "status": "passed_multi_module_lake_packages" if ok else "failed_c2_lake_packages",
+        "scope": "in_repo_multi_module_lake_fixtures_not_external_ecosystem",
+        "packagesDir": str(pkgs_root),
+        "packageCount": len(package_reports),
+        "casesChecked": total_cases,
+        "rcLeakCount": total_live_objs,
+        "asan": asan,
+        "ubsan": ubsan,
+        "sanitizerReceiptsVerified": all_san_ok,
+        "packages": package_reports,
+        "mismatches": mismatches,
+    }
+
+
 def run_c1_corpus(asan: bool, ubsan: bool) -> dict[str, Any]:
     engines = fuzz.probe_engines(asan=asan, ubsan=ubsan)
     if not (engines["stock_lean_c"] and engines["lnir_eval"] and engines["c_abi_llvm"]):
@@ -577,7 +926,12 @@ def main() -> int:
         dest="tiers",
         action="append",
         default=None,
-        help="Comma-separated conformance tiers (C1,C2,C3,C4). Default: C4; C2 fails closed; C3 requires TURBO_CON_LECHE_BIN / --con-leche-bin.",
+        help="Comma-separated conformance tiers (C1,C2,C3,C4). Default: C4; C2 requires TURBO_C2_PACKAGES_DIR / --c2-packages-dir; C3 requires TURBO_CON_LECHE_BIN / --con-leche-bin.",
+    )
+    parser.add_argument(
+        "--c2-packages-dir",
+        default=None,
+        help="Path to multi-module Lake package corpus (or `auto` for verification/c2-lake-packages) for `--tier C2`.",
     )
     parser.add_argument(
         "--con-leche-bin",
@@ -627,14 +981,10 @@ def main() -> int:
                 if c1.get("ok") is not True:
                     failures.append({"stage": "tier_C1_scalar_corpus", "detail": c1})
             elif tier == "C2":
-                c2 = {
-                    "tier": "C2",
-                    "ok": False,
-                    "status": "BLOCKED_MISSING_DEPENDENCY",
-                    "reason": "Ecosystem Lake codegen corpus (Batteries, LeanSys, SciLean, ArkLib) is not yet wired into 3-way LeanNative execution",
-                }
+                c2 = run_c2_corpus(args.c2_packages_dir, asan=args.asan, ubsan=args.ubsan)
                 tier_results["C2"] = c2
-                failures.append({"stage": "tier_C2_unimplemented", "detail": c2})
+                if c2.get("ok") is not True:
+                    failures.append({"stage": "tier_C2_lake_packages", "detail": c2})
             elif tier == "C3":
                 c3 = run_c3_corpus(args.con_leche_bin)
                 tier_results["C3"] = c3

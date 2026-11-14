@@ -1593,4 +1593,393 @@ theorem execInstrs_straightLineFusedPipeline_eq_op_denote
   · rw [evalOperand_reg_bindReg_ne st4 "a" "t_out" _ (by decide), ha4]
   · rw [evalOperand_reg_bindReg_ne st4 "b" "t_out" _ (by decide), hb4]
 
+/-! ## Stage 2C.8: Integer Pointer Casts (`inttoptr`/`ptrtoint`), Inbounds Scalar GEP & Atomic RMW -/
+
+/-- Exact complete case characterization of `LLVMAst.stepInstr` on `.inttoptr`:
+1. `.poison` propagates to `.poison`;
+2. `.bits srcW v` with matching width produces `.ptr (v.zeroExtend 64)` (agreeing with
+   `LLVM.zext? 64 v = .value (v.zeroExtend 64)`);
+3. integer width mismatch (`w ≠ srcW`) produces `.inl (.ub "inttoptr width mismatch")`;
+4. any non-integer, non-poison value produces `.inl (.ub "inttoptr on non-integer")`. -/
+theorem stepInstr_inttoptr_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (srcW : IntWidth) (op : Operand) (as_ : AddrSpace) :
+    stepInstr mod_ fuel st (.inttoptr dst srcW op as_) =
+      match evalOperand st op with
+      | .poison => .inr (bindReg st dst .poison)
+      | .bits w v =>
+        if h : w = srcW then .inr (bindReg st dst (.ptr ((h ▸ v).zeroExtend 64)))
+        else .inl (.ub "inttoptr width mismatch")
+      | _ => .inl (.ub "inttoptr on non-integer") := by
+  cases hop : evalOperand st op <;> simp [stepInstr, stepInstrWith, hop]
+
+/-- Exact complete case characterization of `LLVMAst.stepInstr` on `.ptrtoint`:
+1. `.poison` propagates to `.poison`;
+2. `.ptr p` produces `.bits dstW (p.truncate dstW.bits)` (agreeing with
+   `LLVM.trunc? dstW.bits p = .value (p.truncate dstW.bits)`);
+3. any non-pointer, non-poison value produces `.inl (.ub "ptrtoint on non-pointer")`. -/
+theorem stepInstr_ptrtoint_bisim (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (as_ : AddrSpace) (op : Operand) (dstW : IntWidth) :
+    stepInstr mod_ fuel st (.ptrtoint dst as_ op dstW) =
+      match evalOperand st op with
+      | .poison => .inr (bindReg st dst .poison)
+      | .ptr p => .inr (bindReg st dst (.bits dstW (p.truncate dstW.bits)))
+      | _ => .inl (.ub "ptrtoint on non-pointer") := by
+  cases hop : evalOperand st op <;> simp [stepInstr, stepInstrWith, hop]
+
+/-- Exact 64-bit pointer-to-integer-to-pointer roundtrip: casting `p : BitVec 64` via
+`ptrtoint ... to i64` followed by `inttoptr i64 ... to ptr` recovers `.ptr p` identically,
+and preserves memory, globals, and predecessor block labels. -/
+theorem stepInstr_ptrtoint_inttoptr_roundtrip (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (rInt rPtr : RegName) (as1 as2 : AddrSpace) (ptrOp : Operand) (p : BitVec 64)
+    (hp : evalOperand st ptrOp = .ptr p) :
+    let st1 := bindReg st rInt (.bits .i64 p)
+    let st2 := bindReg st1 rPtr (.ptr p)
+    stepInstr mod_ fuel st (.ptrtoint rInt as1 ptrOp .i64) = .inr st1 ∧
+    stepInstr mod_ fuel st1 (.inttoptr rPtr .i64 (.reg rInt) as2) = .inr st2 ∧
+    execInstrs mod_ fuel st
+      [ .ptrtoint rInt as1 ptrOp .i64
+      , .inttoptr rPtr .i64 (.reg rInt) as2 ] = .inr st2 ∧
+    evalOperand st2 (.reg rPtr) = .ptr p ∧
+    st2.mem = st.mem ∧ st2.globals = st.globals ∧ st2.prevBlock = st.prevBlock := by
+  have htrunc : p.truncate (IntWidth.i64.bits) = p := BitVec.setWidth_eq p
+  let st1 := bindReg st rInt (.bits .i64 p)
+  let st2 := bindReg st1 rPtr (.ptr p)
+  have hs1 : stepInstr mod_ fuel st (.ptrtoint rInt as1 ptrOp .i64) = .inr st1 := by
+    rw [stepInstr_ptrtoint_bisim]
+    simp [hp, htrunc, st1]
+  have hs2 : stepInstr mod_ fuel st1 (.inttoptr rPtr .i64 (.reg rInt) as2) = .inr st2 := by
+    rw [stepInstr_inttoptr_bisim]
+    have hreg : evalOperand st1 (.reg rInt) = .bits .i64 p := evalOperand_reg_bindReg_same st rInt _
+    rw [hreg]
+    simp only [↓reduceDIte]
+    change Sum.inr (bindReg st1 rPtr (.ptr (p.setWidth 64))) = Sum.inr st2
+    rw [BitVec.setWidth_eq p]
+  have htrace : StraightLineBisim mod_ fuel st
+      [ .ptrtoint rInt as1 ptrOp .i64
+      , .inttoptr rPtr .i64 (.reg rInt) as2 ] st2 :=
+    .cons hs1 (.cons hs2 (.nil st2))
+  exact ⟨hs1, hs2, execInstrs_of_straightLineBisim htrace,
+    evalOperand_reg_bindReg_same .., rfl, rfl, rfl⟩
+
+/-- Non-negative single-index scalar `gepOffset` and `inboundsInAlloc` verification:
+when `idx` is non-negative (`bvSigned idxW idx ≥ 0`, equivalently `idx.msb = false`),
+`gepIndexSigned idxW idx = Int.ofNat idx.toNat`, `gepOffset ty [(gepIndexSigned idxW idx, idxW)]`
+equals `some (Int.ofNat (idx.toNat * ty.byteSize))`, and whenever an allocation block `blk` is
+found for `base.toNat` containing both `base.toNat` and `base.toNat + idx.toNat * ty.byteSize`
+with natural alignment (`isAligned base ty.abiAlign = true` and `(idx.toNat * ty.byteSize) % ty.abiAlign = 0`)
+and 64-bit no-wrap (`base.toNat + idx.toNat * ty.byteSize < 2 ^ 64`), `inboundsInAlloc` holds and
+the resulting pointer `BitVec.ofNat 64 (base.toNat + idx.toNat * ty.byteSize)` preserves alignment. -/
+theorem gep_scalar_offset_inbounds (m : ByteMem) (ty : LLVMType) (base : BitVec 64)
+    (idxW : IntWidth) (idx : BitVec idxW.bits) (blk : AllocBlock)
+    (h_nonneg : 0 ≤ bvSigned idxW idx)
+    (h_find : m.allocs.find? (fun b => b.base ≤ base.toNat && base.toNat ≤ b.base + b.size) = some blk)
+    (h_base_lo : blk.base ≤ base.toNat)
+    (h_end_hi : base.toNat + idx.toNat * ty.byteSize ≤ blk.base + blk.size)
+    (h_fit : base.toNat + idx.toNat * ty.byteSize < 2 ^ 64)
+    (h_align_base : isAligned base ty.abiAlign = true)
+    (h_align_step : (idx.toNat * ty.byteSize) % ty.abiAlign = 0) :
+    let resNat := base.toNat + idx.toNat * ty.byteSize
+    let resAddr : Int := Int.ofNat base.toNat + Int.ofNat ty.byteSize * gepIndexSigned idxW idx
+    gepIndexSigned idxW idx = Int.ofNat idx.toNat ∧
+    gepOffset ty [(gepIndexSigned idxW idx, idxW)] = some (Int.ofNat (idx.toNat * ty.byteSize)) ∧
+    resAddr = Int.ofNat resNat ∧
+    m.inboundsInAlloc base.toNat resAddr = true ∧
+    isAligned (BitVec.ofNat 64 resNat) ty.abiAlign = true := by
+  have h_idx_eq : gepIndexSigned idxW idx = Int.ofNat idx.toNat := by
+    unfold gepIndexSigned
+    have hpos : 0 < idxW.bits := idxW.bits_pos
+    have h2w : 2 ^ idxW.bits = 2 * 2 ^ (idxW.bits - 1) := two_pow_eq_two_mul_pred idxW.bits hpos
+    have hlt_pow : idx.toNat < 2 ^ idxW.bits := idx.isLt
+    unfold bvSigned at h_nonneg ⊢
+    simp only [Int.ofNat_eq_natCast, int_two_pow_eq_natCast] at h_nonneg ⊢
+    split at h_nonneg <;> split <;> omega
+  have h_off : gepOffset ty [(gepIndexSigned idxW idx, idxW)] =
+      some (Int.ofNat (idx.toNat * ty.byteSize)) := by
+    simp only [gepOffset, h_idx_eq, Int.ofNat_eq_natCast]
+    congr 1
+    rw [Int.natCast_mul, Int.mul_comm]
+  have h_res_eq : Int.ofNat base.toNat + Int.ofNat ty.byteSize * gepIndexSigned idxW idx =
+      Int.ofNat (base.toNat + idx.toNat * ty.byteSize) := by
+    rw [h_idx_eq]
+    simp only [Int.ofNat_eq_natCast, Int.natCast_add, Int.natCast_mul]
+    rw [Int.mul_comm]
+  have h_inb : m.inboundsInAlloc base.toNat
+      (Int.ofNat base.toNat + Int.ofNat ty.byteSize * gepIndexSigned idxW idx) = true := by
+    rw [h_res_eq]
+    unfold ByteMem.inboundsInAlloc
+    have h_not_neg : ¬(Int.ofNat (base.toNat + idx.toNat * ty.byteSize) < 0) :=
+      Int.not_lt.mpr (Int.natCast_nonneg _)
+    have h_tonat : (Int.ofNat (base.toNat + idx.toNat * ty.byteSize)).toNat =
+        base.toNat + idx.toNat * ty.byteSize := rfl
+    simp only [h_not_neg, ↓reduceIte, h_tonat, h_find, Bool.and_eq_true, decide_eq_true_eq]
+    omega
+  have h_aligned_res : isAligned (BitVec.ofNat 64 (base.toNat + idx.toNat * ty.byteSize)) ty.abiAlign = true := by
+    unfold isAligned at h_align_base ⊢
+    rcases Bool.and_eq_true_iff.mp h_align_base with ⟨hp2, hmod_base⟩
+    have hb0 : base.toNat % ty.abiAlign = 0 := beq_iff_eq.mp hmod_base
+    apply Bool.and_eq_true_iff.mpr
+    refine ⟨hp2, beq_iff_eq.mpr ?_⟩
+    rw [BitVec.toNat_ofNat, Nat.mod_eq_of_lt h_fit, Nat.add_mod, hb0, h_align_step, Nat.zero_add,
+        Nat.zero_mod]
+  exact ⟨h_idx_eq, h_off, h_res_eq, h_inb, h_aligned_res⟩
+
+/-- Single-index `getelementptr inbounds` operational bisimulation:
+for a non-poison scalar pointer `base` inside an allocated block `blk` (`blk.base ≤ base.toNat`,
+`base.toNat + idx.toNat * elemW.byteSize ≤ blk.base + blk.size`) with non-negative index `idx`
+of width `idxW`, natural element alignment `isAligned base elemW.naturalAlign = true`, and
+64-bit address fit, `stepInstr` evaluates `.getelementptr dst true (.int elemW) baseOp [(idxW, idxOp)] as_`
+to `.inr (bindReg st dst (.ptr (BitVec.ofNat 64 (base.toNat + idx.toNat * elemW.byteSize))))`
+while preserving natural alignment and leaving memory, globals, and `prevBlock` untouched. -/
+theorem stepInstr_getelementptr_inbounds_scalar_bisim
+    (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (elemW idxW : IntWidth) (baseOp idxOp : Operand) (as_ : AddrSpace)
+    (base : BitVec 64) (idx : BitVec idxW.bits) (blk : AllocBlock)
+    (hbase : evalOperand st baseOp = .ptr base)
+    (hidx : evalOperand st idxOp = .bits idxW idx)
+    (h_nonneg : 0 ≤ bvSigned idxW idx)
+    (h_find : st.mem.allocs.find? (fun b => b.base ≤ base.toNat && base.toNat ≤ b.base + b.size) = some blk)
+    (h_base_lo : blk.base ≤ base.toNat)
+    (h_end_hi : base.toNat + idx.toNat * elemW.byteSize ≤ blk.base + blk.size)
+    (h_fit : base.toNat + idx.toNat * elemW.byteSize < 2 ^ 64)
+    (h_align_base : isAligned base elemW.naturalAlign = true) :
+    let resPtr := BitVec.ofNat 64 (base.toNat + idx.toNat * elemW.byteSize)
+    stepInstr mod_ fuel st (.getelementptr dst true (.int elemW) baseOp [(idxW, idxOp)] as_) =
+      .inr (bindReg st dst (.ptr resPtr)) ∧
+    isAligned resPtr elemW.naturalAlign = true ∧
+    (bindReg st dst (.ptr resPtr)).mem = st.mem ∧
+    (bindReg st dst (.ptr resPtr)).globals = st.globals ∧
+    (bindReg st dst (.ptr resPtr)).prevBlock = st.prevBlock := by
+  have h_step_div : (idx.toNat * elemW.byteSize) % elemW.naturalAlign = 0 := by
+    have hdvd : elemW.naturalAlign ∣ elemW.byteSize := by
+      cases elemW <;> decide
+    exact Nat.mod_eq_zero_of_dvd (dvd_mul_of_dvd_right hdvd idx.toNat)
+  have h_gep := gep_scalar_offset_inbounds st.mem (.int elemW) base idxW idx blk
+    h_nonneg h_find h_base_lo h_end_hi h_fit h_align_base h_step_div
+  rcases h_gep with ⟨h_idx_eq, h_off, h_res_eq, h_inb, h_aligned_res⟩
+  refine ⟨?_, h_aligned_res, rfl, rfl, rfl⟩
+  have h_res_nonneg : ¬(Int.ofNat (base.toNat + idx.toNat * elemW.byteSize) < 0) :=
+    Int.not_lt.mpr (Int.natCast_nonneg _)
+  have h_tonat : (Int.ofNat (base.toNat + idx.toNat * elemW.byteSize)).toNat =
+      base.toNat + idx.toNat * elemW.byteSize := rfl
+  have h_inb_nat : st.mem.inboundsInAlloc base.toNat
+      (Int.ofNat (base.toNat + idx.toNat * elemW.byteSize)) = true := by
+    rwa [h_res_eq] at h_inb
+  unfold stepInstr stepInstrWith gepResult
+  simp only [hbase, hidx, List.any_cons, List.any_nil, Bool.or_false, isPoison,
+    Bool.false_eq_true, ↓reduceIte, List.mapM_cons, List.mapM_nil, Option.pure_def,
+    Option.bind_eq_bind, Option.bind_some, ↓reduceDIte]
+  change (match gepOffset (.int elemW) [(gepIndexSigned idxW idx, idxW)] with
+    | none => (Sum.inl (.ub "getelementptr ill-typed index") : ExecOutcome ⊕ ExecState)
+    | some off =>
+      let resAddr : Int := Int.ofNat base.toNat + off
+      if true && !st.mem.inboundsInAlloc base.toNat resAddr then
+        Sum.inr (bindReg st dst .poison)
+      else if resAddr < 0 then
+        Sum.inl (.ub "getelementptr negative address")
+      else
+        Sum.inr (bindReg st dst (.ptr (BitVec.ofNat 64 resAddr.toNat)))) = _
+  rw [h_off]
+  dsimp only [LLVMType.byteSize]
+  have heq_addr : Int.ofNat base.toNat + Int.ofNat (idx.toNat * elemW.byteSize) =
+      Int.ofNat (base.toNat + idx.toNat * elemW.byteSize) := by
+    simp [Int.ofNat_eq_natCast, Int.natCast_add]
+  rw [heq_addr, h_inb_nat]
+  simp only [Bool.not_true, Bool.and_false, Bool.false_eq_true, ↓reduceIte, h_res_nonneg, h_tonat]
+
+/-- Algebraic and `LLVM.*` correspondence laws for `LLVMAst.evalRMWOp`:
+1. `add`, `sub`, `and_`, `or_`, `xor` match the corresponding `BitVec` operations and
+   upstream `opencompl/lean-mlir` `LLVM.{add?,sub?,and?,or?,xor?}` pure semantics;
+2. `xchg old val = val`;
+3. `and_`, `or_`, and `xor` satisfy exact commutativity and identity laws (`BitVec.allOnes w.bits`
+   for `and_`, `0#w.bits` for `or_` and `xor`). -/
+theorem atomic_rmw_eval_comm_and_id (w : IntWidth) (old val : BitVec w.bits) :
+    evalRMWOp .add w old val = old + val ∧
+    evalRMWOp .sub w old val = old - val ∧
+    evalRMWOp .and_ w old val = (old &&& val) ∧
+    evalRMWOp .or_ w old val = (old ||| val) ∧
+    evalRMWOp .xor w old val = (old ^^^ val) ∧
+    evalRMWOp .xchg w old val = val ∧
+    (PoisonOr.value (evalRMWOp .add w old val) : LLVM.IntW w.bits) = LLVM.add? old val ∧
+    (PoisonOr.value (evalRMWOp .sub w old val) : LLVM.IntW w.bits) = LLVM.sub? old val ∧
+    (PoisonOr.value (evalRMWOp .and_ w old val) : LLVM.IntW w.bits) = LLVM.and? old val ∧
+    (PoisonOr.value (evalRMWOp .or_ w old val) : LLVM.IntW w.bits) = LLVM.or? old val ∧
+    (PoisonOr.value (evalRMWOp .xor w old val) : LLVM.IntW w.bits) = LLVM.xor? old val ∧
+    evalRMWOp .and_ w old val = evalRMWOp .and_ w val old ∧
+    evalRMWOp .or_ w old val = evalRMWOp .or_ w val old ∧
+    evalRMWOp .xor w old val = evalRMWOp .xor w val old ∧
+    evalRMWOp .and_ w old (BitVec.allOnes w.bits) = old ∧
+    evalRMWOp .or_ w old 0#w.bits = old ∧
+    evalRMWOp .xor w old 0#w.bits = old := by
+  refine ⟨rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, rfl, ?_, ?_, ?_, ?_, ?_, ?_⟩
+  · exact BitVec.and_comm old val
+  · exact BitVec.or_comm old val
+  · exact BitVec.xor_comm old val
+  · exact BitVec.and_allOnes
+  · exact BitVec.or_zero
+  · exact BitVec.xor_zero
+
+/-- Operational bisimulation and alignment/UB boundary for `LLVMAst.stepInstr` on `.atomicrmw`:
+1. When `addr ≠ 0#64`, the effective alignment `effAlign := if align == 0 then w.byteSize else align`
+   is a power of two, `isAligned addr effAlign = true`, `st.mem.accessInAlloc addr.toNat w.byteSize true = true`,
+   `st.mem.loadInt? addr w = some old`, and `evalOperand st valOp = .bits w val`, `stepInstr` transitions to
+   `bindReg { st with mem := st.mem.storeInt addr w (evalRMWOp op w old val) } dst (.bits w old)`,
+   yielding `.bits w old` in `dst`, storing `evalRMWOp op w old val` at `addr` (readable via `loadInt?`),
+   and preserving every other register `r ≠ dst`, `globals`, and `prevBlock`.
+2. Conversely, when `addr ≠ 0#64` and `effAlign` is invalid (`isPow2 effAlign = false`), `stepInstr`
+   returns `.inl (.ub "invalid alignment")`; and when `isPow2 effAlign = true` but `addr` is misaligned
+   (`isAligned addr effAlign = false`), `stepInstr` returns `.inl (.ub "misaligned atomicrmw")`
+   without performing a store. -/
+theorem stepInstr_atomicrmw_aligned_bisim
+    (mod_ : LLVMModule) (fuel : Nat) (st : ExecState)
+    (dst : RegName) (op : AtomicRMWOp) (ptrOp valOp : Operand)
+    (w : IntWidth) (ord : AtomicOrdering) (align : Nat) (as_ : AddrSpace)
+    (addr : BitVec 64)
+    (hptr : evalOperand st ptrOp = .ptr addr)
+    (hnonnull : addr ≠ 0#64) :
+    let effAlign := if align == 0 then w.byteSize else align
+    ((isPow2 effAlign = false →
+        stepInstr mod_ fuel st (.atomicrmw dst op ptrOp (.int w) valOp ord align as_) =
+          .inl (.ub "invalid alignment")) ∧
+     (isPow2 effAlign = true → isAligned addr effAlign = false →
+        stepInstr mod_ fuel st (.atomicrmw dst op ptrOp (.int w) valOp ord align as_) =
+          .inl (.ub "misaligned atomicrmw")) ∧
+     (∀ (old val : BitVec w.bits),
+        isPow2 effAlign = true →
+        isAligned addr effAlign = true →
+        st.mem.accessInAlloc addr.toNat w.byteSize true = true →
+        st.mem.loadInt? addr w = some old →
+        evalOperand st valOp = .bits w val →
+        let st' := bindReg { st with mem := st.mem.storeInt addr w (evalRMWOp op w old val) } dst (.bits w old)
+        stepInstr mod_ fuel st (.atomicrmw dst op ptrOp (.int w) valOp ord align as_) = .inr st' ∧
+        evalOperand st' (.reg dst) = .bits w old ∧
+        st'.mem.loadInt? addr w = some (evalRMWOp op w old val) ∧
+        (∀ r, r ≠ dst → evalOperand st' (.reg r) = evalOperand st (.reg r)) ∧
+        st'.globals = st.globals ∧
+        st'.prevBlock = st.prevBlock)) := by
+  dsimp only
+  have hnull_beq : (addr == 0#64) = false := beq_eq_false_iff_ne.mpr hnonnull
+  refine ⟨?_, ?_, ?_⟩
+  · intro hpow_false
+    have hacc : accessCheck st.mem addr w.byteSize (if align == 0 then w.byteSize else align) true =
+        some "invalid alignment" := by
+      unfold accessCheck
+      rw [hnull_beq, hpow_false]
+      rfl
+    unfold stepInstr stepInstrWith
+    simp only [hptr, hacc]
+  · intro hpow_true hal_false
+    have hacc : accessCheck st.mem addr w.byteSize (if align == 0 then w.byteSize else align) true =
+        some "misaligned access" := by
+      unfold accessCheck
+      rw [hnull_beq, hpow_true, hal_false]
+      rfl
+    unfold stepInstr stepInstrWith
+    simp only [hptr, hacc]
+  · intro old val hpow_true hal_true hinb hload hval
+    have hacc : accessCheck st.mem addr w.byteSize (if align == 0 then w.byteSize else align) true = none := by
+      unfold accessCheck
+      rw [hnull_beq, hpow_true, hal_true, hinb]
+      rfl
+    let st' := bindReg { st with mem := st.mem.storeInt addr w (evalRMWOp op w old val) } dst (.bits w old)
+    have hstep : stepInstr mod_ fuel st (.atomicrmw dst op ptrOp (.int w) valOp ord align as_) = .inr st' := by
+      unfold stepInstr stepInstrWith
+      simp only [hptr, hacc, hval, ↓reduceDIte, hload, st']
+    refine ⟨hstep, evalOperand_reg_bindReg_same .., ByteMem.loadInt?_storeInt_same .., ?_, rfl, rfl⟩
+    intro r hr
+    rw [evalOperand_reg_bindReg_ne _ r dst _ hr]
+    rfl
+
+/-- Exact memory and architectural frame law for any successful `stepInstr` on `.atomicrmw`:
+every byte outside `[addr.toNat, addr.toNat + w.byteSize)` is unchanged (`readAt` and `readByte`),
+every disjoint integer load (`rangesDisjoint`) is unchanged, allocation metadata (`allocs`, `nextAlloc`)
+is unchanged, every register `r ≠ dst` is unchanged, and `globals` and `prevBlock` are unchanged. -/
+theorem stepInstr_atomicrmw_frame
+    {mod_ : LLVMModule} {fuel : Nat} {st st' : ExecState}
+    {dst : RegName} {op : AtomicRMWOp} {ptrOp valOp : Operand}
+    {w : IntWidth} {ord : AtomicOrdering} {align : Nat} {as_ : AddrSpace}
+    {addr : BitVec 64}
+    (hptr : evalOperand st ptrOp = .ptr addr)
+    (hstep : stepInstr mod_ fuel st (.atomicrmw dst op ptrOp (.int w) valOp ord align as_) = .inr st') :
+    (∀ q : Nat, (q < addr.toNat ∨ addr.toNat + w.byteSize ≤ q) →
+      st'.mem.readAt q = st.mem.readAt q ∧ st'.mem.readByte q = st.mem.readByte q) ∧
+    (∀ (a2 : BitVec 64) (w2 : IntWidth),
+      rangesDisjoint addr.toNat w.byteSize a2.toNat w2.byteSize = true →
+      st'.mem.loadInt? a2 w2 = st.mem.loadInt? a2 w2) ∧
+    st'.mem.allocs = st.mem.allocs ∧
+    st'.mem.nextAlloc = st.mem.nextAlloc ∧
+    (∀ r : RegName, r ≠ dst → evalOperand st' (.reg r) = evalOperand st (.reg r)) ∧
+    st'.globals = st.globals ∧
+    st'.prevBlock = st.prevBlock := by
+  have h_write_allocs : ∀ (m : ByteMem) (base : Nat) (bs : List MemByte),
+      (m.writeBytesAt base bs).allocs = m.allocs ∧
+      (m.writeBytesAt base bs).nextAlloc = m.nextAlloc := by
+    intro m base bs
+    induction bs generalizing m base with
+    | nil => exact ⟨rfl, rfl⟩
+    | cons b rest ih =>
+      simp only [ByteMem.writeBytesAt]
+      rcases ih (m.writeAt base b) (base + 1) with ⟨ha, hn⟩
+      exact ⟨ha, hn⟩
+  have h_extract : ∃ (bs : List MemByte) (vDst : LLVMVal),
+      bs.length = w.byteSize ∧
+      st' = bindReg { st with mem := st.mem.writeBytesAt addr.toNat bs } dst vDst := by
+    unfold stepInstr stepInstrWith at hstep
+    simp only [hptr] at hstep
+    cases hacc : accessCheck st.mem addr w.byteSize (if align == 0 then w.byteSize else align) true with
+    | some msg =>
+      rw [hacc] at hstep
+      by_cases hm1 : msg = "null pointer"
+      · subst hm1; nomatch hstep
+      · by_cases hm2 : msg = "invalid alignment"
+        · subst hm2; simp at hstep
+        · by_cases hm3 : msg = "misaligned access"
+          · subst hm3; simp at hstep
+          · simp at hstep
+    | none =>
+      rw [hacc] at hstep
+      dsimp only at hstep
+      cases hval : evalOperand st valOp with
+      | poison =>
+        rw [hval] at hstep
+        injection hstep with hst'
+        refine ⟨ByteMem.poisonBytes w.byteSize, .poison, ByteMem.poisonBytes_length w.byteSize, ?_⟩
+        simpa [ByteMem.storePoison] using hst'.symm
+      | ptr _ | floatBits _ _ | aggNil | aggCons _ _ =>
+        rw [hval] at hstep
+        nomatch hstep
+      | bits wv vv =>
+        rw [hval] at hstep
+        dsimp only at hstep
+        by_cases hw : wv = w
+        · subst wv
+          simp only [↓reduceDIte] at hstep
+          cases hld : st.mem.loadInt? addr w with
+          | none =>
+            rw [hld] at hstep
+            nomatch hstep
+          | some old =>
+            rw [hld] at hstep
+            injection hstep with hst'
+            let newBv := evalRMWOp op w old vv
+            refine ⟨ByteMem.initBytes (ByteMem.bvToLEBytes w.byteSize newBv), .bits w old, ?_, ?_⟩
+            · rw [ByteMem.initBytes_length, ByteMem.bvToLEBytes, ByteMem.natToLEBytes_length]
+            · simpa [ByteMem.storeInt, newBv] using hst'.symm
+        · simp [hw] at hstep
+  rcases h_extract with ⟨bs, vDst, hlen, rfl⟩
+  rcases h_write_allocs st.mem addr.toNat bs with ⟨hallocs, hnext⟩
+  refine ⟨?_, ?_, hallocs, hnext, ?_, rfl, rfl⟩
+  · intro q hq
+    have hout : q < addr.toNat ∨ addr.toNat + bs.length ≤ q := by omega
+    have hr := ByteMem.readAt_writeBytesAt_outside st.mem addr.toNat bs q hout
+    refine ⟨hr, ?_⟩
+    simp only [ByteMem.readByte, bindReg, hr]
+  · intro a2 w2 hdisj
+    simp only [ByteMem.loadInt?, bindReg]
+    have hdisj' : rangesDisjoint addr.toNat bs.length a2.toNat w2.byteSize = true := by
+      rwa [hlen]
+    rw [ByteMem.readBytesAt_writeBytesAt_disjoint st.mem addr.toNat bs a2.toNat w2.byteSize hdisj']
+  · intro r hr
+    rw [evalOperand_reg_bindReg_ne _ r dst _ hr]
+    rfl
+
 end LeanMLIRBridge

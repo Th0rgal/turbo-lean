@@ -48,8 +48,10 @@ def runTurboStatus : IO UInt32 := do
 def runFullSelfTest : IO UInt32 := do
   let coreRc ← runCoreSelfTest "lean-native"
   let turboOk ← runFastCheckBridgeSelfTest
+  let ledgerSmokeOk ← LeanNative.Tests.LedgerEmbedded32Tests.runLedgerEmbeddedClangSmokeSuite
   IO.println s!"15. Turbo Lean Receipt & Fast-Check: {if turboOk then "PASSED" else "FAILED"}"
-  return if coreRc == 0 && turboOk then 0 else 1
+  IO.println s!"16. Ledger 32-Bit Freestanding ELF : {if ledgerSmokeOk then "PASSED" else "FAILED"} (thumbv6m, thumbv8m.main, riscv32imac)"
+  return if coreRc == 0 && turboOk && ledgerSmokeOk then 0 else 1
 
 def runMain (args : List String) : IO UInt32 := do
   unsafe Lean.enableInitializersExecution
@@ -59,6 +61,8 @@ def runMain (args : List String) : IO UInt32 := do
       return rc
     match args with
     | "llvm-diff-suite" :: rest => LeanNative.Driver.LLVMDiffCLI.run rest
+    | "gpu-tpu-diff-suite" :: rest => LeanNative.Driver.GPUDiffCLI.run rest
+    | "target-ir-fuzz-suite" :: rest => LeanNative.Driver.TargetIRFuzzCLI.run rest
     | "build-exe" :: rest    => runBuildExe rest
     | "audit-axioms" :: rest => runAuditAxioms rest
     | "turbo-status" :: _    => runTurboStatus

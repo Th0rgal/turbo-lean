@@ -32,6 +32,11 @@ def posixClose (_fd : UInt32) : IO Unit :=
 def posixForkRaw : IO UInt32 :=
   throw <| IO.userError "POSIX fork unavailable in pure-Lean ZygoteFork build"
 
+def connectCloneChannel (_path : @& String) (_target : UInt32) : IO Unit :=
+  throw <| IO.userError "POSIX clone unavailable in pure-Lean ZygoteFork build"
+
+def reapClones (_pids : Array UInt32) : IO (Array UInt32) := pure #[]
+
 def posixExitImmediate (_code : UInt32) : IO Unit :=
   throw <| IO.userError "POSIX exit unavailable in pure-Lean ZygoteFork build"
 

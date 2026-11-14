@@ -515,7 +515,7 @@ private def checkExprElemTypes (env : List (VarId × LNIRType))
   | .constU256 _ =>
     if dstTy.containsSarray then some "inconsistent_elem_type" else none
 
-private partial def checkCodeElemTypes (env : List (VarId × LNIRType))
+private def checkCodeElemTypes (env : List (VarId × LNIRType))
     (localSigs : List (String × List LNIRType × LNIRType))
     (expectedRetTy : LNIRType) :
     LNIRCode → Option String

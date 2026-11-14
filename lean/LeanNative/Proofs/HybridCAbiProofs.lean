@@ -167,13 +167,13 @@ theorem emitSliceStaticAsserts_fail_closed (flat64 mut64 flat32 mut32 : C99Struc
   refine ⟨by simp, by simp, by simp⟩
 
 /-- Pinned-width C11 preprocessor guards (`emitPinnedSliceStaticAsserts`) emit the exact target guard
-    (`__wasm32__` vs `__LP64__ || _LP64`) and fail closed via `#error` on `#else`. -/
+    (`ilp32PreprocGuard` vs `__LP64__ || _LP64`) and fail closed via `#error` on `#else`. -/
 theorem emitPinnedSliceStaticAsserts_fail_closed (flatLayout mutLayout : C99StructLayout)
     (width : ArchWidth) :
     "#else" ∈ emitPinnedSliceStaticAsserts flatLayout mutLayout width ∧
     (match width with
      | .bits32 =>
-       "#if defined(__wasm32__)" ∈ emitPinnedSliceStaticAsserts flatLayout mutLayout width ∧
+       ilp32PreprocGuard ∈ emitPinnedSliceStaticAsserts flatLayout mutLayout width ∧
        "#error \"Mismatched or unsupported C-ABI target: pinned to wasm32 (32-bit)\"" ∈
          emitPinnedSliceStaticAsserts flatLayout mutLayout width
      | .bits64 =>

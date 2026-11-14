@@ -183,10 +183,11 @@ def f32Env : Env :=
 #guard isErr (evalOp baseEnv (.convert "r" "a" .bf16)) (fun _ => true)
 #guard isErr (evalOp baseEnv (.convert "r" "a" .f64)) (fun _ => true)
 
--- [B2]: signed .i32 / .i64 ops, INT_MIN / -1 overflow guard, and .i64 arithmetic right shift
+-- [B2]: signed .i32 / .i64 ops, OpenXLA INT_MIN / -1 = INT_MIN & INT_MIN % -1 = 0, and .i64 arithmetic right shift
 def signed64Env : Env :=
-  (((Env.empty.bind "neg64" (mkTensor [1] .i64 [0x8000000000000000#64])).bind
+  ((((Env.empty.bind "neg64" (mkTensor [1] .i64 [0x8000000000000000#64])).bind
     "m1_64" (mkTensor [1] .i64 [0xFFFFFFFFFFFFFFFF#64])).bind
+    "z64" (mkTensor [1] .i64 [0#64])).bind
     "sh2" (mkTensor [1] .i64 [2#64])).bind
     "sh64" (mkTensor [1] .i64 [64#64])
 
@@ -196,7 +197,13 @@ def signed64Env : Env :=
 #guard lookup? (evalOp signed64Env (.shiftRightArithmetic "r" "neg64" "sh64")) "r" ==
   some (mkTensor [1] .i64 [0xFFFFFFFFFFFFFFFF#64])
 
-#guard isErr (evalOp signed64Env (.divide "r" "neg64" "m1_64"))
+#guard lookup? (evalOp signed64Env (.divide "r" "neg64" "m1_64")) "r" ==
+  some (mkTensor [1] .i64 [0x8000000000000000#64])
+
+#guard lookup? (evalOp signed64Env (.remainder "r" "neg64" "m1_64")) "r" ==
+  some (mkTensor [1] .i64 [0#64])
+
+#guard isErr (evalOp signed64Env (.divide "r" "neg64" "z64"))
   (fun | .divisionByZero => true | _ => false)
 
 #guard lookup? (evalOp signed64Env (.compare "r" "neg64" "m1_64" .lt)) "r" ==

@@ -508,7 +508,8 @@ theorem lowerSliceCallPure_sound (ctx : RealBridgeCtx) (st : RealBridgeState) (l
           · simp [hvIdx] at hs
           · simp only [hvIdx, Bool.not_true, Bool.false_eq_true, Bool.true_and, ↓reduceIte] at hs ho
             cases hg : ((fn == ``ByteArray.uget && lnirTypeEq elemTy .i8 && lnirTypeEq retTy .i8) ||
-                (fn == ``FloatArray.uget && lnirTypeEq elemTy .f64 && lnirTypeEq retTy .f64))
+                (fn == ``FloatArray.uget && lnirTypeEq elemTy .f64 && lnirTypeEq retTy .f64) ||
+                (ctx.arch.isFreestandingEmbedded && fn == ``ByteArray.get! && lnirTypeEq elemTy .i8 && lnirTypeEq retTy .i8))
             · simp [hg] at hs
             · simp only [hg, ↓reduceIte] at hs ho
               injection hs with he; subst he

@@ -41,6 +41,7 @@ import LeanNative.Proofs.ClosureADTProofs
 import LeanNative.Proofs.SliceViewProofs
 import LeanNative.Proofs.UnboxedRegionProofs
 import LeanNative.Proofs.HeapObjAbiProofs
+import LeanNative.Proofs.HeapObjMtAbiProofs
 import LeanNative.Proofs.LLVMLowerProofs
 import LeanNative.Proofs.StableHLOLowerProofs
 import LeanNative.Proofs.PTXLowerProofs
@@ -90,9 +91,11 @@ import LeanNative.Driver.CoreCLI
 import LeanNative.Proofs.AsyncStateMachineProofs
 import LeanNative.Transform.CostAutotune
 import LeanNative.Proofs.CostAutotuneSoundness
+import LeanNative.Proofs.TargetIRFuzzProofs
 import LeanNative.Driver.CostAutotuneCLI
 import LeanNative.Driver.LLVMDiffCLI
 import LeanNative.Driver.GPUDiffCLI
+import LeanNative.Driver.TargetIRFuzzCLI
 
 namespace LeanNative.Core
 

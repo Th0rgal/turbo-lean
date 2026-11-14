@@ -35,7 +35,7 @@ def maxAddr (w : ArchWidth) : Nat := w.addrLimit - 1
 
 /-- `TargetArch` selects the C99 pointer width used by slice typedefs and static asserts. -/
 def ofTargetArch : TargetArch → ArchWidth
-  | .wasm32 => .bits32
+  | .wasm32 | .thumbv6m | .thumbv8mMain | .riscv32imac => .bits32
   | _ => .bits64
 
 end ArchWidth
@@ -302,8 +302,13 @@ def emitInlineC99Typedef (layout : C99StructLayout) : String :=
   let fields := String.intercalate " " (layout.fields.map fun f => s!"{f.ty.cSpelling} {f.name};")
   s!"typedef struct \{ {fields} } {layout.name};"
 
+/-- Preprocessor guard matching supported 32-bit ILP32 targets with 8-byte `uint64_t` alignment
+    (`wasm32`, ARM Thumb/EABI AAPCS, and RISC-V RV32 ILP32), while rejecting x86 `i386` (4-byte `uint64_t` alignment). -/
+def ilp32PreprocGuard : String :=
+  "#if defined(__wasm32__) || (defined(__ARM_ARCH) && !defined(__aarch64__)) || (defined(__riscv) && (__riscv_xlen == 32))"
+
 /-- Render C11 `_Static_assert`s verifying `sizeof`, `_Alignof`, and `offsetof`
-    for computed slice layouts across LP64 and `wasm32`, failing closed on unsupported data models. -/
+    for computed slice layouts across LP64 and supported ILP32 targets, failing closed on unsupported data models. -/
 def emitSliceStaticAsserts (flat64 mut64 flat32 mut32 : C99StructLayout) : List String :=
   let mkChecks (layout : C99StructLayout) : List String :=
     [ s!"_Static_assert(sizeof({layout.name}) == {layout.structSize}, \"{layout.name} size\");",
@@ -311,7 +316,7 @@ def emitSliceStaticAsserts (flat64 mut64 flat32 mut32 : C99StructLayout) : List 
     layout.fields.map fun f =>
       s!"_Static_assert(offsetof({layout.name}, {f.name}) == {f.offset}, \"{layout.name}.{f.name} offset\");"
   [ "#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L",
-    "#if defined(__wasm32__)" ] ++
+    ilp32PreprocGuard ] ++
   mkChecks flat32 ++ mkChecks mut32 ++
   [ "#elif defined(__LP64__) || defined(_LP64)" ] ++
   mkChecks flat64 ++ mkChecks mut64 ++
@@ -327,7 +332,7 @@ def emitPinnedSliceStaticAsserts (flatLayout mutLayout : C99StructLayout)
   let (archGuard, errLine) :=
     match width with
     | .bits32 =>
-      ("#if defined(__wasm32__)",
+      (ilp32PreprocGuard,
        "#error \"Mismatched or unsupported C-ABI target: pinned to wasm32 (32-bit)\"")
     | .bits64 =>
       ("#if defined(__LP64__) || defined(_LP64)",
@@ -379,7 +384,8 @@ def emitC99FnProto (sig : C99FnSig) : String :=
   s!"{sig.retCSpelling} {sig.cSymbol}({params});"
 
 private def mapLeanTypeStr (tyRaw : String) : String × String :=
-  let t := tyRaw.trimAscii.toString
+  let raw := tyRaw.trimAscii.toString
+  let t := (if raw.startsWith "@&" then (raw.drop 2).trimAscii else raw.trimAscii).toString
   if t == "Bool" || t == "UInt8" then ("uint8_t", "u8")
   else if t == "UInt16" then ("uint16_t", "u16")
   else if t == "UInt32" then ("uint32_t", "u32")
@@ -387,6 +393,7 @@ private def mapLeanTypeStr (tyRaw : String) : String × String :=
   else if t == "Int64" || t == "Int" then ("int64_t", "i64")
   else if t == "USize" then ("size_t", "usize")
   else if t == "Float" then ("double", "f64")
+  else if t == "ByteArray" then ("const uint8_t*", "*const u8")
   else ("const void*", "*const core::ffi::c_void")
 
 /-- `(names : Ty)` groups as `(name, rawTy)`; a group without `:` yields `(…, "")`. -/
@@ -550,7 +557,7 @@ def emitCAbiHeaderFromSigs (sigs : List CAbiBindingSig) (note? : Option String :
     | some .bits32 => emitPinnedSliceStaticAsserts flat32 mut32 .bits32
     | some .bits64 => emitPinnedSliceStaticAsserts flat64 mut64 .bits64
     | none => emitSliceStaticAsserts flat64 mut64 flat32 mut32
-  let widthTag := if activeWidth == .bits32 then "wasm32" else "LP64"
+  let widthTag := if activeWidth == .bits32 then "ILP32 (wasm32 / ARM Thumb / RV32)" else "LP64"
   String.intercalate "\n" ([
     "/* Auto-generated C99 Header by lean-native C-ABI Binding Generator */",
     s!"/* ABI Slice Layout ({widthTag}): sizeof({activeFlat.name}) == {activeFlat.structSize}, " ++
@@ -561,6 +568,7 @@ def emitCAbiHeaderFromSigs (sigs : List CAbiBindingSig) (note? : Option String :
     "#define LEAN_NATIVE_GENERATED_C_ABI_H",
     "#include <stdint.h>",
     "#include <stddef.h>",
+    "#include <stdbool.h>",
     emitInlineC99Typedef activeFlat,
     emitInlineC99Typedef activeMut,
     "/* Zero-Runtime SliceOut C-ABI Contract: packed u64 span (start:32 | len:24 | kind:8) */",
@@ -822,6 +830,24 @@ def verifyObjectBytesForTarget (arch : TargetArch) (b : ByteArray) : Bool × Str
                     b.get! 4 == 0x01 && b.get! 5 == 0x00 && b.get! 6 == 0x00 && b.get! 7 == 0x00
       if isWasm then (true, "WASM32 v1")
       else (false, "expected WebAssembly binary magic (\\x00asm\\x01\\x00\\x00\\x00)")
+    | .thumbv6m | .thumbv8mMain =>
+      let isElf32 := b.size >= 52 && b.get! 0 == 0x7F && b.get! 1 == 0x45 &&
+        b.get! 2 == 0x4C && b.get! 3 == 0x46 && b.get! 4 == 1 && b.get! 5 == 1
+      let etype := readU16LE b 16
+      let mach := readU16LE b 18
+      if !isElf32 then (false, "expected ELF32 little-endian header (>= 52 bytes)")
+      else if etype != 1 then (false, s!"expected ELF relocatable object e_type=1 (ET_REL), got {etype}")
+      else if mach != 0x28 then (false, s!"expected ELF e_machine=0x28 (EM_ARM), got {mach}")
+      else (true, "ELF32 ET_REL EM_ARM")
+    | .riscv32imac =>
+      let isElf32 := b.size >= 52 && b.get! 0 == 0x7F && b.get! 1 == 0x45 &&
+        b.get! 2 == 0x4C && b.get! 3 == 0x46 && b.get! 4 == 1 && b.get! 5 == 1
+      let etype := readU16LE b 16
+      let mach := readU16LE b 18
+      if !isElf32 then (false, "expected ELF32 little-endian header (>= 52 bytes)")
+      else if etype != 1 then (false, s!"expected ELF relocatable object e_type=1 (ET_REL), got {etype}")
+      else if mach != 0xF3 then (false, s!"expected ELF e_machine=0xF3 (EM_RISCV), got {mach}")
+      else (true, "ELF32 ET_REL EM_RISCV")
     | _ => (false, s!"unsupported binary object verification target: {arch.triple}")
 
 /-- Require exactly one complete non-index member equal to the compiled object.
@@ -1099,7 +1125,7 @@ def emitC99StructLayoutDecl (layout : C99StructLayout)
       let (archGuard, errLine) :=
         match width with
         | .bits32 =>
-          ("#if defined(__wasm32__)",
+          (ilp32PreprocGuard,
            "#error \"Mismatched or unsupported C-ABI target: pinned to wasm32 (32-bit)\"")
         | .bits64 =>
           ("#if defined(__LP64__) || defined(_LP64)",
@@ -1174,11 +1200,11 @@ def emitValidatedC99Bundle (structs : List (String × List C99FieldSpec)) (fns :
     ]
   let hdrParts :=
     ["#pragma once", "#ifndef LEAN_NATIVE_VALIDATED_C99_BUNDLE_H", "#define LEAN_NATIVE_VALIDATED_C99_BUNDLE_H",
-     "#include <stdint.h>", "#include <stddef.h>"] ++
+     "#include <stdint.h>", "#include <stddef.h>", "#include <stdbool.h>"] ++
     structDecls ++ protos ++
     ["#endif /* LEAN_NATIVE_VALIDATED_C99_BUNDLE_H */"]
   let shimParts :=
-    ["#include <stdint.h>", "#include <stddef.h>",
+    ["#include <stdint.h>", "#include <stddef.h>", "#include <stdbool.h>",
      "#ifndef LEAN_NATIVE_VALIDATED_C99_BUNDLE_H"] ++
     structDecls ++ ["#endif"] ++ protos ++ shims
   let hdr := String.intercalate "\n\n" hdrParts ++ "\n"
@@ -1234,6 +1260,9 @@ def c11SyntaxCheck (src : String) (arch : TargetArch := .x86_64)
       if !extraFlags.isEmpty then extraFlags
       else match arch with
         | .wasm32 => #["--target=wasm32-unknown-unknown", "-ffreestanding"]
+        | .thumbv6m => #["--target=thumbv6m-none-eabi", "-ffreestanding"]
+        | .thumbv8mMain => #["--target=thumbv8m.main-none-eabi", "-ffreestanding"]
+        | .riscv32imac => #["--target=riscv32-unknown-none-elf", "-march=rv32imac", "-mabi=ilp32", "-ffreestanding"]
         | _ => #[]
     let out ← IO.Process.output {
       cmd := clangCmd

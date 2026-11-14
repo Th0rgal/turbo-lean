@@ -77,9 +77,17 @@ def bridgedTheorems : List Name :=
   , ``LeanMLIRBridge.stepInstr_pure_frame
   , ``LeanMLIRBridge.StraightLineBisim.pure_frame
   , ``LeanMLIRBridge.execInstrs_straightLineFusedPipeline_eq_op_denote
+  , ``LeanMLIRBridge.stepInstr_inttoptr_bisim
+  , ``LeanMLIRBridge.stepInstr_ptrtoint_bisim
+  , ``LeanMLIRBridge.stepInstr_ptrtoint_inttoptr_roundtrip
+  , ``LeanMLIRBridge.gep_scalar_offset_inbounds
+  , ``LeanMLIRBridge.stepInstr_getelementptr_inbounds_scalar_bisim
+  , ``LeanMLIRBridge.atomic_rmw_eval_comm_and_id
+  , ``LeanMLIRBridge.stepInstr_atomicrmw_aligned_bisim
+  , ``LeanMLIRBridge.stepInstr_atomicrmw_frame
   ]
 
-def minAuditedTheorems : Nat := 63
+def minAuditedTheorems : Nat := 71
 
 theorem bridgedTheorems_nodup : bridgedTheorems.Nodup := by
   decide

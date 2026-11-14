@@ -4,6 +4,7 @@ import LeanNative.Semantics.Value
 import LeanNative.Semantics.Eval
 import LeanNative.Semantics.Refinement
 import LeanNative.Backend.Semantics
+import LeanNative.Proofs.LedgerEmbedded32Proofs
 
 namespace LeanNative.Backend.Proofs
 

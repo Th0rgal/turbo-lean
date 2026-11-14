@@ -8,9 +8,10 @@ Verifies:
 2. `crates/turbo-lean/src/kernel.rs` pins the exact same `PINNED_CON_LECHE_REV` and
    `PINNED_CON_LECHE_TOOLCHAIN` constants so Rust binary invocation and Lean formal bridge
    pins cannot drift apart.
-3. `ConLecheBridge` proof modules contain `#verify_con_leche_bridge_axioms` (>= 5 audited theorems)
-   and zero `sorry`, `sorryAx`, `admit`, `axiom`, `native_decide`, `bv_decide`, `trustCompiler`,
-   or `ofReduceBool` tokens outside Lean comments/strings.
+3. `ConLecheBridge` proof modules contain `#verify_con_leche_bridge_axioms` (>= 31 unique audited
+   theorems via `Lean.collectAxioms` and `bridgedTheorems.Nodup`) and zero `sorry`, `sorryAx`,
+   `admit`, `axiom`, `native_decide`, `bv_decide`, `trustCompiler`, or `ofReduceBool` tokens
+   outside Lean comments/strings.
 """
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ PINNED_TOOLCHAIN = "leanprover/lean4:v4.35.0"
 PINNED_CON_LECHE_URL = "https://github.com/leanprover/con-leche.git"
 PINNED_CON_LECHE_REV = "501589f5680d9599dee1bcef30a420bc8924c490"
 KERNEL_RS_REL = "crates/turbo-lean/src/kernel.rs"
+MIN_AUDITED_THEOREMS = 31
 
 FORBIDDEN_PROOF_TOKENS = re.compile(
     r"\b(?:sorry|sorryAx|admit|axiom|native_decide|bv_decide|trustCompiler|ofReduceBool)\b",
@@ -156,13 +158,30 @@ def check_bridge_tree(root_dir: Path) -> dict[str, object]:
             errors.append("ConLecheBridge.lean missing `#verify_con_leche_bridge_axioms` gate")
         if "Lean.collectAxioms" not in rb_stripped:
             errors.append("ConLecheBridge.lean missing `Lean.collectAxioms` audit")
-        bridged_refs = re.findall(r"``ConLecheBridge\.[A-Za-z0-9_?']+", rb_stripped)
-        if len(bridged_refs) < 5:
+        if "theorem bridgedTheorems_nodup : bridgedTheorems.Nodup" not in rb_stripped:
+            errors.append("ConLecheBridge.lean missing `theorem bridgedTheorems_nodup : bridgedTheorems.Nodup` uniqueness theorem")
+        if f"def minAuditedTheorems : Nat := {MIN_AUDITED_THEOREMS}" not in rb_stripped:
             errors.append(
-                f"ConLecheBridge.lean audits only {len(bridged_refs)} bridged theorems (expected >= 5)"
+                f"ConLecheBridge.lean missing exact `def minAuditedTheorems : Nat := {MIN_AUDITED_THEOREMS}` floor"
+            )
+        bridged_refs = re.findall(r"``ConLecheBridge\.[A-Za-z0-9_?.']+", rb_stripped)
+        if len(bridged_refs) != len(set(bridged_refs)):
+            seen_refs: set[str] = set()
+            dups = sorted({r for r in bridged_refs if r in seen_refs or seen_refs.add(r)})  # type: ignore[func-returns-value]
+            errors.append(
+                f"ConLecheBridge.lean contains duplicate bridged theorem references: {dups}"
+            )
+        if len(set(bridged_refs)) < MIN_AUDITED_THEOREMS:
+            errors.append(
+                f"ConLecheBridge.lean audits only {len(set(bridged_refs))} unique bridged theorems "
+                f"(expected >= {MIN_AUDITED_THEOREMS})"
             )
 
-    sub_lean_files = sorted((bridge_root / "ConLecheBridge").rglob("*.lean")) if (bridge_root / "ConLecheBridge").is_dir() else []
+    sub_lean_files = (
+        sorted((bridge_root / "ConLecheBridge").rglob("*.lean"))
+        if (bridge_root / "ConLecheBridge").is_dir()
+        else []
+    )
     proof_files = [root_bridge_lean, *sub_lean_files]
     if len(proof_files) < 2:
         errors.append("Expected ConLecheBridge.lean and ConLecheBridge/Soundness.lean")
@@ -184,7 +203,7 @@ def check_bridge_tree(root_dir: Path) -> dict[str, object]:
         "ok": len(errors) == 0,
         "pinned_toolchain": PINNED_TOOLCHAIN,
         "pinned_con_leche_rev": PINNED_CON_LECHE_REV,
-        "bridged_theorems_count": len(bridged_refs),
+        "bridged_theorems_count": len(set(bridged_refs)),
         "proof_files_checked": len(proof_files),
         "file_digests": file_digests,
         "errors": errors,
@@ -192,20 +211,29 @@ def check_bridge_tree(root_dir: Path) -> dict[str, object]:
 
 
 class SelfTests(unittest.TestCase):
+    def _copy_minimal_tree(self, root: Path) -> Path:
+        kdst = root / KERNEL_RS_REL
+        kdst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT_DIR / KERNEL_RS_REL, kdst)
+        b_root = root / "verification" / "con-leche-bridge"
+        (b_root / "ConLecheBridge").mkdir(parents=True, exist_ok=True)
+        for fn in ("lean-toolchain", "lakefile.toml", "lake-manifest.json", "ConLecheBridge.lean"):
+            shutil.copy2(BRIDGE_DIR / fn, b_root / fn)
+        shutil.copy2(
+            BRIDGE_DIR / "ConLecheBridge" / "Soundness.lean",
+            b_root / "ConLecheBridge" / "Soundness.lean",
+        )
+        return b_root
+
     def test_live_repo_passes(self) -> None:
         rep = check_bridge_tree(ROOT_DIR)
         self.assertTrue(rep["ok"], rep)
+        self.assertGreaterEqual(int(rep["bridged_theorems_count"]), MIN_AUDITED_THEOREMS)  # type: ignore[arg-type]
 
     def test_detects_pin_drift_and_forbidden_tokens(self) -> None:
         with tempfile.TemporaryDirectory(prefix="con-leche-sync-test-") as tmp:
             root = Path(tmp)
-            kdst = root / KERNEL_RS_REL
-            kdst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(ROOT_DIR / KERNEL_RS_REL, kdst)
-            b_root = root / "verification" / "con-leche-bridge"
-            (b_root / "ConLecheBridge").mkdir(parents=True, exist_ok=True)
-            for fn in ("lean-toolchain", "lakefile.toml", "lake-manifest.json", "ConLecheBridge.lean"):
-                shutil.copy2(BRIDGE_DIR / fn, b_root / fn)
+            b_root = self._copy_minimal_tree(root)
             drifted_mf = (BRIDGE_DIR / "lake-manifest.json").read_text(encoding="utf-8").replace(
                 PINNED_CON_LECHE_REV, "0" * 40
             )
@@ -219,6 +247,46 @@ class SelfTests(unittest.TestCase):
             errs = "\n".join(str(e) for e in rep["errors"])
             self.assertIn("rev mismatch", errs)
             self.assertIn("Forbidden token `sorry`", errs)
+
+    def test_detects_duplicate_and_undercounted_bridged_theorems(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="con-leche-sync-dup-") as tmp:
+            root = Path(tmp)
+            b_root = self._copy_minimal_tree(root)
+            (b_root / "ConLecheBridge.lean").write_text(
+                "def bridgedTheorems := [\n"
+                "  ``ConLecheBridge.checkDecls_verified_model_exists,\n"
+                "  ``ConLecheBridge.checkDecls_verified_model_exists\n"
+                "]\n"
+                "def minAuditedTheorems : Nat := 31\n"
+                "theorem bridgedTheorems_nodup : bridgedTheorems.Nodup := by decide\n"
+                "-- Lean.collectAxioms inside comment should not count\n"
+                "def audit := Lean.collectAxioms\n"
+                "#verify_con_leche_bridge_axioms\n",
+                encoding="utf-8",
+            )
+            rep = check_bridge_tree(root)
+            self.assertFalse(rep["ok"])
+            errs = "\n".join(str(e) for e in rep["errors"])
+            self.assertIn("duplicate bridged theorem references", errs)
+            self.assertIn(f"expected >= {MIN_AUDITED_THEOREMS}", errs)
+
+    def test_detects_missing_nodup_theorem(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="con-leche-sync-nodup-") as tmp:
+            root = Path(tmp)
+            b_root = self._copy_minimal_tree(root)
+            orig = (b_root / "ConLecheBridge.lean").read_text(encoding="utf-8")
+            (b_root / "ConLecheBridge.lean").write_text(
+                orig.replace("bridgedTheorems.Nodup", "True").replace(
+                    f"def minAuditedTheorems : Nat := {MIN_AUDITED_THEOREMS}",
+                    "def minAuditedTheorems : Nat := 9",
+                ),
+                encoding="utf-8",
+            )
+            rep = check_bridge_tree(root)
+            self.assertFalse(rep["ok"])
+            errs = "\n".join(str(e) for e in rep["errors"])
+            self.assertIn("bridgedTheorems.Nodup", errs)
+            self.assertIn(f"def minAuditedTheorems : Nat := {MIN_AUDITED_THEOREMS}", errs)
 
 
 def main() -> int:

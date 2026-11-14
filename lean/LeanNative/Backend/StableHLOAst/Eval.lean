@@ -194,14 +194,15 @@ def evalSub (env : Env) (d a b : String) : Except ShapeError Env :=
 def evalMul (env : Env) (d a b : String) : Except ShapeError Env :=
   binSame env d a b (fun e x y => elemBin e (· * ·) x y)
 
-/-- Signed division at width `w`. `INT_MIN / -1` and `/ 0` are `divisionByZero`. -/
+/-- Signed division at width `w` matching OpenXLA StableHLO `divide` semantics:
+    `/ 0` returns `.error .divisionByZero`, while `INT_MIN / -1` evaluates to `INT_MIN`. -/
 def sdivWidth (w : Nat) (x y : BitVec 64) : Except ShapeError (BitVec 64) :=
   let x' := maskWidth w x
   let y' := maskWidth w y
   if y' == 0#64 then .error .divisionByZero
   else if w ≥ 64 then
     if x' == 0x8000000000000000#64 && y' == BitVec.allOnes 64 then
-      .error .divisionByZero
+      .ok 0x8000000000000000#64
     else .ok (x'.sdiv y')
   else
     let sign := 2 ^ (w - 1)
@@ -210,20 +211,21 @@ def sdivWidth (w : Nat) (x y : BitVec 64) : Except ShapeError (BitVec 64) :=
     let ax := if negX then 2 ^ w - x'.toNat else x'.toNat
     let ay := if negY then 2 ^ w - y'.toNat else y'.toNat
     if ay == 0 then .error .divisionByZero
-    else if negX && ax == sign && negY && ay == 1 then .error .divisionByZero
+    else if negX && ax == sign && negY && ay == 1 then .ok (maskWidth w (BitVec.ofNat 64 sign))
     else
       let q := ax / ay
       let q' := if negX != negY then 2 ^ w - q else q
       .ok (maskWidth w (BitVec.ofNat 64 q'))
 
-/-- Signed remainder at width `w`, with the same overflow policy as `sdivWidth`. -/
+/-- Signed remainder at width `w` matching OpenXLA StableHLO `remainder` semantics:
+    `% 0` returns `.error .divisionByZero`, while `INT_MIN % -1` evaluates to `0`. -/
 def sremWidth (w : Nat) (x y : BitVec 64) : Except ShapeError (BitVec 64) :=
   let x' := maskWidth w x
   let y' := maskWidth w y
   if y' == 0#64 then .error .divisionByZero
   else if w ≥ 64 then
     if x' == 0x8000000000000000#64 && y' == BitVec.allOnes 64 then
-      .error .divisionByZero
+      .ok 0#64
     else .ok (x'.srem y')
   else
     let sign := 2 ^ (w - 1)
@@ -232,7 +234,7 @@ def sremWidth (w : Nat) (x y : BitVec 64) : Except ShapeError (BitVec 64) :=
     let ax := if negX then 2 ^ w - x'.toNat else x'.toNat
     let ay := if negY then 2 ^ w - y'.toNat else y'.toNat
     if ay == 0 then .error .divisionByZero
-    else if negX && ax == sign && negY && ay == 1 then .error .divisionByZero
+    else if negX && ax == sign && negY && ay == 1 then .ok 0#64
     else
       let r := ax % ay
       let r' := if negX && r != 0 then 2 ^ w - r else r

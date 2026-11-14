@@ -844,6 +844,8 @@ fn run(cli: Cli) -> Result<()> {
             "TURBO_LEAN_ALLOWED_UNSAFE_FROM_CONFIG",
             "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY",
             "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY_FROM_CONFIG",
+            "TURBO_LEAN_ALLOWED_FFI",
+            "TURBO_LEAN_ALLOWED_FFI_FROM_CONFIG",
         ] {
             std::env::remove_var(key);
         }
@@ -868,6 +870,12 @@ fn run(cli: Cli) -> Result<()> {
     if unsafe_from_config && dir.is_none() {
         std::env::remove_var("TURBO_LEAN_ALLOWED_UNSAFE");
         std::env::remove_var("TURBO_LEAN_ALLOWED_UNSAFE_FROM_CONFIG");
+    }
+    let ffi_from_config =
+        std::env::var("TURBO_LEAN_ALLOWED_FFI_FROM_CONFIG").as_deref() == Ok("1");
+    if ffi_from_config && dir.is_none() {
+        std::env::remove_var("TURBO_LEAN_ALLOWED_FFI");
+        std::env::remove_var("TURBO_LEAN_ALLOWED_FFI_FROM_CONFIG");
     }
     if impl_by_from_config && dir.is_none() {
         std::env::remove_var("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY");
@@ -931,6 +939,14 @@ fn run(cli: Cli) -> Result<()> {
                 allow.unwrap_or_default().join(","),
             );
             std::env::set_var("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY_FROM_CONFIG", "1");
+        }
+        if rev.is_some() || std::env::var_os("TURBO_LEAN_ALLOWED_FFI").is_none() || ffi_from_config
+        {
+            // `[ffi] allow = ["Module=decl=c_symbol", ...]`: root-package `@[extern]` opaques the
+            // project declares as trusted FFI, admitted by the kernel gate like pinned FFI packages.
+            let allow = accelerators::toml_string_array(&config, "ffi", "allow");
+            std::env::set_var("TURBO_LEAN_ALLOWED_FFI", allow.unwrap_or_default().join(","));
+            std::env::set_var("TURBO_LEAN_ALLOWED_FFI_FROM_CONFIG", "1");
         }
         if rev.is_some() || std::env::var_os(splitter::ALLOWED_AXIOMS_ENV).is_none() || from_cfg_env
         {

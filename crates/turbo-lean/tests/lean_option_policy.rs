@@ -92,7 +92,7 @@ fn real_binary_rejects_weakening_options_and_kernel_bypass_fixture() {
                         )
                         .unwrap();
                         let out = turbo(&project, &["build"]);
-                        if original_case_allowed(name, value, prefix) {
+                        if original_case_allowed(name, value, prefix) || (name == "warn.sorry" && value == "false" && matches!(*prefix, "" | "weak.")) {
                             assert!(out.status.success(), "{}", output(&out));
                             accepted += 1;
                         } else {
@@ -109,8 +109,8 @@ fn real_binary_rejects_weakening_options_and_kernel_bypass_fixture() {
         }
     }
 
-    assert_eq!((accepted, denied), (36, 1044));
-    println!("Lake/CLI matrix: 864 original configurations + 216 pp/async regressions; 36 safe accepted, 1044 denied");
+    assert_eq!((accepted, denied), (72, 1008));
+    println!("Lake/CLI matrix: 864 original configurations + 216 pp/async regressions; 72 safe accepted, 1008 denied");
 
     // A valid project with real options must still build through the same binary.
     fs::remove_file(project.join("lakefile.toml")).unwrap();
@@ -128,6 +128,57 @@ fn real_binary_rejects_weakening_options_and_kernel_bypass_fixture() {
     let built = turbo(&project, &["build"]);
     assert!(built.status.success(), "{}", output(&built));
     fs::remove_dir_all(project).unwrap();
+}
+
+#[test]
+fn stock_lake_sorry_options_keep_downstream_imports_fresh() {
+    let project = std::env::temp_dir().join(format!("turbo_stock_sorry_{}", std::process::id()));
+    fs::create_dir_all(project.join("Bad")).unwrap();
+    fs::write(project.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+    fs::write(project.join("Bad/Base.lean"), "theorem base : True := True.intro\n").unwrap();
+    fs::write(project.join("Bad.lean"), "import Bad.Base\ntheorem good : True := base\n").unwrap();
+    for key in ["warn.sorry", "weak.warn.sorry"] {
+        for field in FIELDS {
+            let value = if *field == "leanOptions" { format!("{{ {key} = false }}") } else { format!("[\"-D{key}=false\"]") };
+            fs::write(project.join("lakefile.toml"), format!("name = \"fixture\"\n{field} = {value}\n[[lean_lib]]\nname = \"Bad\"\n")).unwrap();
+            let built = Command::new("lake").args(["build", "Bad"]).current_dir(&project).output().unwrap();
+            assert!(built.status.success(), "{}", output(&built));
+            let trace = project.join(".lake/build/lib/lean/Bad/Base.trace");
+            let before = fs::read(&trace).unwrap();
+            let modified = fs::metadata(&trace).unwrap().modified().unwrap();
+            let out = turbo(&project, &["check", "Bad.lean"]);
+            assert!(out.status.success(), "{key} {field}: {}", output(&out));
+            assert!(!output(&out).contains("stale"), "{}", output(&out));
+            assert_eq!(fs::read(&trace).unwrap(), before);
+            assert_eq!(fs::metadata(&trace).unwrap().modified().unwrap(), modified);
+        }
+    }
+    fs::remove_dir_all(project).unwrap();
+}
+
+#[test]
+fn static_sorry_warnings_cannot_hide_sorry_from_verification() {
+    let dir = std::env::temp_dir().join(format!("turbo_static_sorry_{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let project = dir.as_path();
+    fs::write(project.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+    fs::write(project.join("Bad.lean"), "theorem bad : False := sorry\n").unwrap();
+    fs::write(project.join("Main.lean"), "def main : IO Unit := pure ()\n").unwrap();
+    for args in [vec!["init", "-q"], vec!["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "base"]] {
+        assert!(Command::new("git").args(args).current_dir(project).status().unwrap().success());
+    }
+    for format in ["lean", "toml"] {
+        for key in ["warn.sorry", "weak.warn.sorry"] {
+            fs::write(project.join(format!("lakefile.{format}")), lakefile(format, "package", "leanOptions", key, "false")).unwrap();
+            for args in [vec!["build"], vec!["check", "Bad.lean"], vec!["pr-verify", "--mode", "trusted", "--base", "HEAD"], vec!["ci-verify", "--mode", "trusted"]] {
+                let out = turbo(project, &args);
+                assert!(!out.status.success(), "{format} {key} {args:?}: {}", output(&out));
+                assert!(output(&out).to_lowercase().contains("sorry"), "{}", output(&out));
+            }
+        }
+        fs::remove_file(project.join(format!("lakefile.{format}"))).unwrap();
+    }
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

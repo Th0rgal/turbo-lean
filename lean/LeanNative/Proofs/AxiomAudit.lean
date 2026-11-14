@@ -30,6 +30,7 @@ import LeanNative.Proofs.ClosureADTProofs
 import LeanNative.Proofs.SliceViewProofs
 import LeanNative.Proofs.UnboxedRegionProofs
 import LeanNative.Proofs.HeapObjAbiProofs
+import LeanNative.Proofs.HeapObjMtAbiProofs
 import LeanNative.Proofs.LLVMLowerProofs
 import LeanNative.Proofs.StableHLOLowerProofs
 import LeanNative.Proofs.PTXLowerProofs
@@ -49,6 +50,8 @@ import LeanNative.Proofs.AsyncStateMachineProofs
 import LeanNative.Proofs.ProofRetentionProofs
 import LeanNative.Proofs.CostAutotuneSoundness
 import LeanNative.Proofs.SliceBridgeStandaloneProofs
+import LeanNative.Proofs.TargetIRFuzzProofs
+import LeanNative.Proofs.LedgerEmbedded32Proofs
 
 namespace LeanNative.Proofs
 
@@ -764,9 +767,60 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.autotuneSuperoptModule_sound
   , ``LeanNative.Proofs.costAutotune_amdahl_gate_nonvacuous
   , ``LeanNative.Proofs.ablateSitesLeaveOneOut_sound
+  , ``LeanNative.Proofs.llvm_sdiv64_min_neg1_ub
+  , ``LeanNative.Proofs.llvm_null_load_ub
+  , ``LeanNative.Proofs.llvm_null_store_ub
+  , ``LeanNative.Proofs.llvm_oob_gep_inbounds_load_ub
+  , ``LeanNative.Proofs.stablehlo_sdiv64_min_neg1_eq
+  , ``LeanNative.Proofs.stablehlo_srem64_min_neg1_zero
+  , ``LeanNative.Proofs.stablehlo_sdiv_zero_traps
+  , ``LeanNative.Proofs.stablehlo_clampStart_bounds
+  , ``LeanNative.Proofs.msl_shift_out_of_range_traps
+  , ``LeanNative.Proofs.ptx_rem_zero_traps
+  , ``LeanNative.Proofs.HeapObjMtAbi.rc_mode_partition
+  , ``LeanNative.Proofs.HeapObjMtAbi.isUnstuckMt_unsigned_iff_signed
+  , ``LeanNative.Proofs.HeapObjMtAbi.isNeverFreed_unsigned_iff_of_not_st
+  , ``LeanNative.Proofs.HeapObjMtAbi.markMt_st_becomes_mt
+  , ``LeanNative.Proofs.HeapObjMtAbi.markMt_non_st_idempotent
+  , ``LeanNative.Proofs.HeapObjMtAbi.mt_inc_ref_sticky_frozen
+  , ``LeanNative.Proofs.HeapObjMtAbi.mt_inc_ref_stays_mt_no_underflow
+  , ``LeanNative.Proofs.HeapObjMtAbi.mt_dec_ref_sticky_drop_never_frees
+  , ``LeanNative.Proofs.HeapObjMtAbi.mt_dec_ref_last_triggers_free
+  , ``LeanNative.Proofs.HeapObjMtAbi.mt_dec_ref_shared_stays_mt_live
+  , ``LeanNative.Proofs.HeapObjMtAbi.markLinear_preserves_elem_size_and_header
+  , ``LeanNative.Proofs.HeapObjMtAbi.sarray_elem_size_roundtrip_under_markLinear
+  , ``LeanNative.Proofs.HeapObjMtAbi.runtime_tag_classes_disjoint
+  , ``LeanNative.Proofs.HeapObjMtAbi.closure_layout_fields_disjoint
+  , ``LeanNative.Proofs.HeapObjMtAbi.external_layout_fields_disjoint
+  , ``LeanNative.Proofs.HeapObjMtAbi.sarray_header_and_elems_disjoint
+  , ``LeanNative.Proofs.HeapObjMtAbi.sarrayAllocWouldOverflow64_false_iff
+  , ``LeanNative.Proofs.LedgerEmbedded32.isFreestandingEmbedded_iff_ledger
+  , ``LeanNative.Proofs.LedgerEmbedded32.ledger_target_isILP32
+  , ``LeanNative.Proofs.LedgerEmbedded32.archWidth_ofTargetArch_eq_bits32_iff
+  , ``LeanNative.Proofs.LedgerEmbedded32.archWidth_ofTargetArch_ledger
+  , ``LeanNative.Proofs.LedgerEmbedded32.ptrBytes_ledger_eq_four
+  , ``LeanNative.Proofs.LedgerEmbedded32.sigLLVMType_usize_ledger_eq_i32
+  , ``LeanNative.Proofs.LedgerEmbedded32.isNarrowSigType_usize_ledger
+  , ``LeanNative.Proofs.LedgerEmbedded32.flatSlice_layout_ledger32
+  , ``LeanNative.Proofs.LedgerEmbedded32.mutSlice_layout_ledger32
+  , ``LeanNative.Proofs.LedgerEmbedded32.u64_align8_on_ledger32
+  , ``LeanNative.Proofs.LedgerEmbedded32.i64_align8_on_ledger32
+  , ``LeanNative.Proofs.LedgerEmbedded32.placeC99Fields_ledger32_u64_aligned
+  , ``LeanNative.Proofs.LedgerEmbedded32.computeC99StructLayout_ledger32_sound
+  , ``LeanNative.Proofs.LedgerEmbedded32.selectDeclRcMode_eq_freestanding_of_no_heap
+  , ``LeanNative.Proofs.LedgerEmbedded32.selectDeclRcMode_ne_freestanding_of_heap
+  , ``LeanNative.Proofs.LedgerEmbedded32.checkFreestandingDecl_no_heap
+  , ``LeanNative.Proofs.LedgerEmbedded32.checkFreestandingDecl_rcMode_freestanding
+  , ``LeanNative.Proofs.LedgerEmbedded32.checkFreestandingDecl_no_storage_or_runtime_calls
+  , ``LeanNative.Proofs.LedgerEmbedded32.checkFreestandingDecl_rejects_heap_ops
+  , ``LeanNative.Proofs.LedgerEmbedded32.checkFreestandingModule_sound
+  , ``LeanNative.Proofs.LedgerEmbedded32.emitLLVMFreestanding_sound
+  , ``LeanNative.Proofs.LedgerEmbedded32.execFn_modOfFnForTarget_eq
+  , ``LeanNative.Proofs.LedgerEmbedded32.lowerModuleForTarget_sound
+  , ``LeanNative.Proofs.LedgerEmbedded32.ledgerBip32Varint_e2e_nonvacuous
   ]
 
-#guard auditedTheoremNames.length == 808
+#guard auditedTheoremNames.length == 859
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/

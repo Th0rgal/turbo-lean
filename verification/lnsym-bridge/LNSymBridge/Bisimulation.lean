@@ -7,6 +7,10 @@ import Tactics.Aggregate
 import Tactics.CSE
 import Tactics.ClearNamed
 import Arm.Memory.SeparateAutomation
+import Specs.SHA512
+import Specs.AESCommon
+import Specs.AESArm
+import Specs.GCM
 
 namespace LNSymBridge
 
@@ -2106,5 +2110,132 @@ theorem gf128_butterfly_program_run_28_field_spec (s0 sf : _root_.ArmState)
     ⟨herr, hpc, htw', hu', hv'⟩
   rcases gf128ButterflyLane_algebraic u v tw with ⟨halg1, halg2⟩
   exact ⟨herr, hpc, htw', hu'.trans halg1, hv'.trans halg2⟩
+
+/-!
+## Upstream `leanprover/LNSym` FIPS 180-4 / FIPS 197 / SP 800-38D Cryptographic Constants & Butterfly Twiddle
+-/
+
+/-- Explicit FIPS 180-4 Section 4.2.3 SHA-512 round constant table `K[0..79]` (`80 × BitVec 64`),
+    with `K[0] = 0x428a2f98d728ae22` and `K[79] = 0x6c44198c4a475817`. -/
+def fipsSha512K : List (BitVec 64) :=
+  [ 0x428a2f98d728ae22#64, 0x7137449123ef65cd#64, 0xb5c0fbcfec4d3b2f#64, 0xe9b5dba58189dbbc#64
+  , 0x3956c25bf348b538#64, 0x59f111f1b605d019#64, 0x923f82a4af194f9b#64, 0xab1c5ed5da6d8118#64
+  , 0xd807aa98a3030242#64, 0x12835b0145706fbe#64, 0x243185be4ee4b28c#64, 0x550c7dc3d5ffb4e2#64
+  , 0x72be5d74f27b896f#64, 0x80deb1fe3b1696b1#64, 0x9bdc06a725c71235#64, 0xc19bf174cf692694#64
+  , 0xe49b69c19ef14ad2#64, 0xefbe4786384f25e3#64, 0x0fc19dc68b8cd5b5#64, 0x240ca1cc77ac9c65#64
+  , 0x2de92c6f592b0275#64, 0x4a7484aa6ea6e483#64, 0x5cb0a9dcbd41fbd4#64, 0x76f988da831153b5#64
+  , 0x983e5152ee66dfab#64, 0xa831c66d2db43210#64, 0xb00327c898fb213f#64, 0xbf597fc7beef0ee4#64
+  , 0xc6e00bf33da88fc2#64, 0xd5a79147930aa725#64, 0x06ca6351e003826f#64, 0x142929670a0e6e70#64
+  , 0x27b70a8546d22ffc#64, 0x2e1b21385c26c926#64, 0x4d2c6dfc5ac42aed#64, 0x53380d139d95b3df#64
+  , 0x650a73548baf63de#64, 0x766a0abb3c77b2a8#64, 0x81c2c92e47edaee6#64, 0x92722c851482353b#64
+  , 0xa2bfe8a14cf10364#64, 0xa81a664bbc423001#64, 0xc24b8b70d0f89791#64, 0xc76c51a30654be30#64
+  , 0xd192e819d6ef5218#64, 0xd69906245565a910#64, 0xf40e35855771202a#64, 0x106aa07032bbd1b8#64
+  , 0x19a4c116b8d2d0c8#64, 0x1e376c085141ab53#64, 0x2748774cdf8eeb99#64, 0x34b0bcb5e19b48a8#64
+  , 0x391c0cb3c5c95a63#64, 0x4ed8aa4ae3418acb#64, 0x5b9cca4f7763e373#64, 0x682e6ff3d6b2b8a3#64
+  , 0x748f82ee5defb2fc#64, 0x78a5636f43172f60#64, 0x84c87814a1f0ab72#64, 0x8cc702081a6439ec#64
+  , 0x90befffa23631e28#64, 0xa4506cebde82bde9#64, 0xbef9a3f7b2c67915#64, 0xc67178f2e372532b#64
+  , 0xca273eceea26619c#64, 0xd186b8c721c0c207#64, 0xeada7dd6cde0eb1e#64, 0xf57d4f7fee6ed178#64
+  , 0x06f067aa72176fba#64, 0x0a637dc5a2c898a6#64, 0x113f9804bef90dae#64, 0x1b710b35131c471b#64
+  , 0x28db77f523047d84#64, 0x32caab7b40c72493#64, 0x3c9ebe0a15c9bebc#64, 0x431d67c49c100d4c#64
+  , 0x4cc5d4becb3e42b6#64, 0x597f299cfc657e2a#64, 0x5fcb6fab3ad6faec#64, 0x6c44198c4a475817#64 ]
+
+/-- Upstream `SHA2.k_512` (`Specs/SHA512.lean`) matches the 80-entry FIPS 180-4 SHA-512 round
+    constant table (`K0 = 0x428a2f98d728ae22`, `K79 = 0x6c44198c4a475817`). -/
+theorem sha512_k_eq_fips :
+    SHA2.k_512 = fipsSha512K ∧
+    SHA2.k_512.length = 80 ∧
+    SHA2.k_512[0]? = some 0x428a2f98d728ae22#64 ∧
+    SHA2.k_512[79]? = some 0x6c44198c4a475817#64 :=
+  ⟨rfl, rfl, rfl, rfl⟩
+
+/-- Upstream `SHA2.h0_512` (`Specs/SHA512.lean`) matches the FIPS 180-4 Section 5.3.5 initial
+    SHA-512 hash value `H^(0)_0 .. H^(0)_7` (`a = 0x6a09e667f3bcc908 .. h = 0x5be0cd19137e2179`). -/
+theorem sha512_h0_eq_fips :
+    SHA2.h0_512 =
+      { a := 0x6a09e667f3bcc908#64
+      , b := 0xbb67ae8584caa73b#64
+      , c := 0x3c6ef372fe94f82b#64
+      , d := 0xa54ff53a5f1d36f1#64
+      , e := 0x510e527fade682d1#64
+      , f := 0x9b05688c2b3e6c1f#64
+      , g := 0x1f83d9abfb41bd6b#64
+      , h := 0x5be0cd19137e2179#64 } :=
+  rfl
+
+/-- Explicit FIPS 197 Table 4 forward AES S-box (`256 × BitVec 8`),
+    with `sbox[0] = 0x63`, `sbox[1] = 0x7c`, and `sbox[255] = 0x16`. -/
+def fipsAesSbox : List (BitVec 8) :=
+  [ 0x63#8, 0x7c#8, 0x77#8, 0x7b#8, 0xf2#8, 0x6b#8, 0x6f#8, 0xc5#8, 0x30#8, 0x01#8, 0x67#8, 0x2b#8, 0xfe#8, 0xd7#8, 0xab#8, 0x76#8
+  , 0xca#8, 0x82#8, 0xc9#8, 0x7d#8, 0xfa#8, 0x59#8, 0x47#8, 0xf0#8, 0xad#8, 0xd4#8, 0xa2#8, 0xaf#8, 0x9c#8, 0xa4#8, 0x72#8, 0xc0#8
+  , 0xb7#8, 0xfd#8, 0x93#8, 0x26#8, 0x36#8, 0x3f#8, 0xf7#8, 0xcc#8, 0x34#8, 0xa5#8, 0xe5#8, 0xf1#8, 0x71#8, 0xd8#8, 0x31#8, 0x15#8
+  , 0x04#8, 0xc7#8, 0x23#8, 0xc3#8, 0x18#8, 0x96#8, 0x05#8, 0x9a#8, 0x07#8, 0x12#8, 0x80#8, 0xe2#8, 0xeb#8, 0x27#8, 0xb2#8, 0x75#8
+  , 0x09#8, 0x83#8, 0x2c#8, 0x1a#8, 0x1b#8, 0x6e#8, 0x5a#8, 0xa0#8, 0x52#8, 0x3b#8, 0xd6#8, 0xb3#8, 0x29#8, 0xe3#8, 0x2f#8, 0x84#8
+  , 0x53#8, 0xd1#8, 0x00#8, 0xed#8, 0x20#8, 0xfc#8, 0xb1#8, 0x5b#8, 0x6a#8, 0xcb#8, 0xbe#8, 0x39#8, 0x4a#8, 0x4c#8, 0x58#8, 0xcf#8
+  , 0xd0#8, 0xef#8, 0xaa#8, 0xfb#8, 0x43#8, 0x4d#8, 0x33#8, 0x85#8, 0x45#8, 0xf9#8, 0x02#8, 0x7f#8, 0x50#8, 0x3c#8, 0x9f#8, 0xa8#8
+  , 0x51#8, 0xa3#8, 0x40#8, 0x8f#8, 0x92#8, 0x9d#8, 0x38#8, 0xf5#8, 0xbc#8, 0xb6#8, 0xda#8, 0x21#8, 0x10#8, 0xff#8, 0xf3#8, 0xd2#8
+  , 0xcd#8, 0x0c#8, 0x13#8, 0xec#8, 0x5f#8, 0x97#8, 0x44#8, 0x17#8, 0xc4#8, 0xa7#8, 0x7e#8, 0x3d#8, 0x64#8, 0x5d#8, 0x19#8, 0x73#8
+  , 0x60#8, 0x81#8, 0x4f#8, 0xdc#8, 0x22#8, 0x2a#8, 0x90#8, 0x88#8, 0x46#8, 0xee#8, 0xb8#8, 0x14#8, 0xde#8, 0x5e#8, 0x0b#8, 0xdb#8
+  , 0xe0#8, 0x32#8, 0x3a#8, 0x0a#8, 0x49#8, 0x06#8, 0x24#8, 0x5c#8, 0xc2#8, 0xd3#8, 0xac#8, 0x62#8, 0x91#8, 0x95#8, 0xe4#8, 0x79#8
+  , 0xe7#8, 0xc8#8, 0x37#8, 0x6d#8, 0x8d#8, 0xd5#8, 0x4e#8, 0xa9#8, 0x6c#8, 0x56#8, 0xf4#8, 0xea#8, 0x65#8, 0x7a#8, 0xae#8, 0x08#8
+  , 0xba#8, 0x78#8, 0x25#8, 0x2e#8, 0x1c#8, 0xa6#8, 0xb4#8, 0xc6#8, 0xe8#8, 0xdd#8, 0x74#8, 0x1f#8, 0x4b#8, 0xbd#8, 0x8b#8, 0x8a#8
+  , 0x70#8, 0x3e#8, 0xb5#8, 0x66#8, 0x48#8, 0x03#8, 0xf6#8, 0x0e#8, 0x61#8, 0x35#8, 0x57#8, 0xb9#8, 0x86#8, 0xc1#8, 0x1d#8, 0x9e#8
+  , 0xe1#8, 0xf8#8, 0x98#8, 0x11#8, 0x69#8, 0xd9#8, 0x8e#8, 0x94#8, 0x9b#8, 0x1e#8, 0x87#8, 0xe9#8, 0xce#8, 0x55#8, 0x28#8, 0xdf#8
+  , 0x8c#8, 0xa1#8, 0x89#8, 0x0d#8, 0xbf#8, 0xe6#8, 0x42#8, 0x68#8, 0x41#8, 0x99#8, 0x2d#8, 0x0f#8, 0xb0#8, 0x54#8, 0xbb#8, 0x16#8 ]
+
+set_option maxRecDepth 4096 in
+/-- Upstream `AESArm.sbox` (`Specs/AESArm.lean`, backed by `AESCommon.SBOX`) matches all 256 bytes
+    of FIPS 197 Table 4 (`sbox 0x00 = 0x63`, `sbox 0x01 = 0x7c`, `sbox 0xff = 0x16`). -/
+theorem aes_sbox_eq_fips :
+    (List.range 256).map (fun i => AESArm.sbox (BitVec.ofNat 8 i)) = fipsAesSbox ∧
+    (∀ b : BitVec 8,
+      AESArm.sbox b = BitVec.extractLsb' (b.toNat * 8) 8 (BitVec.flatten AESCommon.SBOX)) ∧
+    AESArm.sbox 0x00#8 = 0x63#8 ∧
+    AESArm.sbox 0x01#8 = 0x7c#8 ∧
+    AESArm.sbox 0xff#8 = 0x16#8 := by
+  refine ⟨by decide, ?_, rfl, rfl, rfl⟩
+  apply AESArm.P_of_bv_to_of_nat
+  decide
+
+set_option maxRecDepth 4096 in
+/-- Upstream `AESArm.sbox` (`Specs/AESArm.lean`) is injective on `BitVec 8` (bijection over all
+    256 byte values, certified without introducing a shadow inverse S-box). -/
+theorem aes_sbox_injective :
+    ∀ a b : BitVec 8, AESArm.sbox a = AESArm.sbox b → a = b := by
+  have hdec :
+      ∀ (x : Nat), x < 2 ^ 8 → ∀ (y : Nat), y < 2 ^ 8 →
+        AESArm.sbox (BitVec.ofNat 8 x) = AESArm.sbox (BitVec.ofNat 8 y) →
+        BitVec.ofNat 8 x = BitVec.ofNat 8 y := by
+    decide
+  intro a b hab
+  simpa [BitVec.ofNat_toNat] using hdec a.toNat a.isLt b.toNat b.isLt (by simpa [BitVec.ofNat_toNat] using hab)
+
+/-- Upstream `AESArm.Rcon` (`Specs/AESArm.lean`) matches the 10 FIPS 197 Table 5 round constants
+    in little-endian 32-bit word layout (`0x01 .. 0x36`). -/
+theorem aes_rcon_eq_fips :
+    AESArm.Rcon =
+      [ 0x00000001#32, 0x00000002#32, 0x00000004#32, 0x00000008#32, 0x00000010#32
+      , 0x00000020#32, 0x00000040#32, 0x00000080#32, 0x0000001b#32, 0x00000036#32 ] :=
+  rfl
+
+/-- Upstream `GCM.R` (`Specs/GCM.lean`) matches the NIST SP 800-38D bit-reflected $\mathbb{F}_{2^{128}}$
+    reduction constant `0xe1000000000000000000000000000000#128` (`1 + x + x^2 + x^7` reflected). -/
+theorem gcm_r_eq_nist_sp800_38d :
+    GCM.R = 0xe1000000000000000000000000000000#128 :=
+  rfl
+
+/-- Concrete $\mathbb{F}_{2^{128}}$ butterfly twiddle register built from the upstream SHA-512
+    round constant `K0 = SHA2.k_512[0]` (`0x428a2f98d728ae22`) in the low 64-bit lane. -/
+def sha512K0Twiddle : LNSym.QReg :=
+  ⟨UInt64.ofBitVec (SHA2.k_512[0]?.getD 0#64), 0⟩
+
+/-- One-line corollary binding the upstream `SHA2.k_512` `K0` round constant into the
+    $\mathbb{F}_{2^{128}}$ butterfly lane (`gf128ButterflyLane_algebraic`) and `gf128MulSpec`. -/
+theorem gf128_butterfly_twiddle_sha_lane (u v : LNSym.QReg) :
+    qregToBv128 (LNSym.gf128ButterflyLane u v sha512K0Twiddle).1 =
+      qregToBv128 u ^^^ gf128MulSpec (qregToBv128 v) (0#64 ++ 0x428a2f98d728ae22#64) ∧
+    qregToBv128 (LNSym.gf128ButterflyLane u v sha512K0Twiddle).2 =
+      (qregToBv128 u ^^^ gf128MulSpec (qregToBv128 v) (0#64 ++ 0x428a2f98d728ae22#64)) ^^^
+        qregToBv128 v :=
+  gf128ButterflyLane_algebraic u v sha512K0Twiddle
 
 end LNSymBridge

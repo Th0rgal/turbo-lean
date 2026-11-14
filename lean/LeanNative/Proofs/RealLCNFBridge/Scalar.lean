@@ -106,7 +106,7 @@ private theorem sMask_lt_64 (arch : TargetArch) (ty : LNIRType) (sMask : UInt64)
     · simp only [hus, Bool.false_eq_true, ↓reduceIte] at hm; exact nomatch hm
     · simp only [hus, ↓reduceIte] at hm; injection hm with h; subst h
       cases arch with
-      | wasm32 => exact u64_and_lt x 31 5 (by decide) (by decide)
+      | wasm32 | thumbv6m | thumbv8mMain | riscv32imac => exact u64_and_lt x 31 5 (by decide) (by decide)
       | _ => exact False.elim (by cases h63)
   | _ => exact nomatch hm
 
@@ -258,7 +258,7 @@ theorem lowerLitValuePure_sound (arch : TargetArch) (lit : Lean.Compiler.LCNF.Li
       cases h_sup : archSupportsUSize arch
       · simp [h_sup, throw, throwThe, MonadExceptOf.throw] at h_lower
       · have harch : masked arch .usize x.toBitVec = (x &&& archUSizeMask arch).toBitVec := by
-          cases arch <;> simp [masked, maskOf, widthOf, TargetArch.isWasm, archUSizeMask] <;> rfl
+          cases arch <;> simp [masked, maskOf, widthOf, TargetArch.isILP32, archUSizeMask] <;> rfl
         simp only [h_sup, Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h_lower h_eval
         rw [harch] at h_eval
         cases h_m : scalarWidthMask? retTy arch <;> cases h_i1 : lnirTypeEq retTy .i1 <;>

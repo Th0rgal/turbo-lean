@@ -558,6 +558,129 @@ def s1b_enum_branch (tag : UInt8) (x : UInt64) (y : UInt64) : UInt64 :=
             self.assertEqual(lnir_vals, stock_vals)
             self.assertEqual(llvm_vals, stock_vals)
 
+    def test_c1_bitwise_rotations_clmul_swar_and_diamond_merges(self):
+        engines = fuzzer.probe_engines()
+        self.assertTrue(all(engines[k] for k in ("stock_lean_c", "lnir_eval", "c_abi_llvm")), engines)
+        preamble = '''def rotl64 (x : UInt64) (r : UInt64) : UInt64 :=
+  let s := r &&& 63
+  if s == 0 then x else (x <<< s) ||| (x >>> (64 - s))
+def swarAddBytes (a b : UInt64) : UInt64 :=
+  let lo := (a &&& 0x7F7F7F7F7F7F7F7F) + (b &&& 0x7F7F7F7F7F7F7F7F)
+  lo ^^^ ((a ^^^ b) &&& 0x8080808080808080)
+def mixSipHalf0 (v0 v1 : UInt64) : UInt64 :=
+  let u0 := v0 + v1
+  let u1 := rotl64 v1 13 ^^^ u0
+  rotl64 u0 32 + u1
+def mixSipHalf1 (v0 v1 : UInt64) : UInt64 :=
+  rotl64 v1 13 ^^^ (v0 + v1)
+def clmulStep2 (a b : UInt32) : UInt64 :=
+  let a64 := a.toUInt64
+  let p0 := if (b &&& 1) != 0 then a64 else 0
+  let p1 := if (b &&& 2) != 0 then a64 <<< 1 else 0
+  p0 ^^^ p1
+'''
+        exprs = [
+            '''(let y0 := x0 ^^^ 0x736F6D6570736575
+                let p0 := mixSipHalf0 x0 y0
+                let p1 := mixSipHalf1 x0 y0
+                let in0 := if (p0 &&& 1) == 0 then p0 else p1
+                let in1 := if (p0 &&& 1) == 0 then p1 else p0
+                swarAddBytes (mixSipHalf0 in0 in1) (mixSipHalf1 in0 in1))''',
+            '''(let lo32 := x0.toUInt32
+                let hi32 := (x0 >>> 32).toUInt32
+                let c0 := clmulStep2 lo32 (hi32 &&& 3)
+                let c1 := clmulStep2 hi32 ((lo32 >>> 2) &&& 3)
+                rotl64 (c0 ^^^ (c1 <<< 2)) (x0 &&& 63))''',
+            '''(let b0 := x0.toUInt8
+                let b1 := (x0 >>> 8).toUInt8
+                let w16 := (x0 >>> 16).toUInt16
+                let branchA : UInt64 :=
+                  if b0 < b1 then (w16 + b0.toUInt16).toUInt64 * 257
+                  else if b0 == b1 then (~~~w16).toUInt64 ^^^ x0
+                  else ((w16 / (b1.toUInt16 + 1)).toUInt64 <<< 3)
+                let branchB : UInt64 :=
+                  if (branchA &&& 3) == 0 then swarAddBytes branchA x0
+                  else rotl64 branchA 19 + (b0 ^^^ b1).toUInt64
+                branchA ^^^ branchB)''',
+        ]
+        inputs = (
+            0, 1, 2, 15, 16, 255, 256, 65535, 65536,
+            0x0123456789ABCDEF, 0x8000000000000001, 0xFFFFFFFFFFFFFFFF,
+        )
+        programs = [{"seed": i, "arg0": v, "preamble": preamble, "tree": {"k": "raw_lean", "expr": e}}
+                    for i, (e, v) in enumerate((e, v) for e in exprs for v in inputs)]
+        result = fuzzer.run_three_way_batch(programs, engines)
+        self.assertEqual(result["executed_count"], len(programs))
+        self.assertEqual(result["mismatches"], [])
+        self._assert_batch_sanitizer_receipts(result)
+
+    def test_c1_multi_enum_state_machine_and_crc_polynomial_fold(self):
+        engines = fuzzer.probe_engines()
+        self.assertTrue(all(engines[k] for k in ("stock_lean_c", "lnir_eval", "c_abi_llvm")), engines)
+        preamble = '''inductive ParseState where
+  | idle
+  | header
+  | payload
+  | escape
+  | done
+
+def stepParseTag (st : ParseState) (byte : UInt8) : ParseState :=
+  match st with
+  | .idle => if byte == 0x7E then .header else .idle
+  | .header => if byte == 0 then .done else .payload
+  | .payload => if byte == 0x7D then .escape else .done
+  | .escape => .payload
+  | .done => .done
+
+def stepParseEmit (st : ParseState) (byte : UInt8) : UInt16 :=
+  match st with
+  | .idle => 1
+  | .header => byte.toUInt16
+  | .payload => byte.toUInt16 + 16
+  | .escape => (byte ^^^ 0x20).toUInt16 + 32
+  | .done => 64
+
+def crcStep2 (crc : UInt32) (b : UInt8) : UInt32 :=
+  let c0 := crc ^^^ (b &&& 3).toUInt32
+  let c1 := if (c0 &&& 1) != 0 then (c0 >>> 1) ^^^ (0xEDB88320 : UInt32) else c0 >>> 1
+  if (c1 &&& 1) != 0 then (c1 >>> 1) ^^^ (0xEDB88320 : UInt32) else c1 >>> 1
+'''
+        exprs = [
+            '''(let b0 := x0.toUInt8
+                let b1 := (x0 >>> 8).toUInt8
+                let st1 := stepParseTag .idle b0
+                let em1 := stepParseEmit st1 b0
+                let st2 := stepParseTag st1 b1
+                let em2 := stepParseEmit st2 b1
+                let tagCode : UInt64 :=
+                  match st2 with
+                  | .idle => 0
+                  | .header => 1
+                  | .payload => 2
+                  | .escape => 3
+                  | .done => 4
+                (tagCode <<< 32) ||| (em1 + em2 * 3).toUInt64)''',
+            '''(let crc0 : UInt32 := 0xFFFFFFFF
+                let crc1 := crcStep2 crc0 x0.toUInt8
+                let crc2 := crcStep2 crc1 (x0 >>> 8).toUInt8
+                (~~~crc2).toUInt64 ^^^ ((x0 >>> 32).toUInt32.toUInt64 <<< 32))''',
+        ]
+        inputs = (
+            0x0000007E,
+            0x7E207D057E,
+            0x010203040000007E,
+            0xDEADBEEF7E7D5E7E,
+            0xFFFFFFFFFFFFFFFF,
+            0x0000000000000000,
+            0x123456787E007E7E,
+        )
+        programs = [{"seed": i, "arg0": v, "preamble": preamble, "tree": {"k": "raw_lean", "expr": e}}
+                    for i, (e, v) in enumerate((e, v) for e in exprs for v in inputs)]
+        result = fuzzer.run_three_way_batch(programs, engines)
+        self.assertEqual(result["executed_count"], len(programs))
+        self.assertEqual(result["mismatches"], [])
+        self._assert_batch_sanitizer_receipts(result)
+
     def test_wasm32_usize_semantics_and_gpu_usize_rejection(self):
         engines = fuzzer.probe_engines()
         core_bin = engines["core_bin"]

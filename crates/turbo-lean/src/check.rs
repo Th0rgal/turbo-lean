@@ -312,14 +312,106 @@ pub fn run_check_command_with_options(
     .map(|_| ())
 }
 
+fn resolve_workspace_imported_decl_submodule(
+    canon_dir: &Path,
+    initial_file: &Path,
+    target_decl: &str,
+) -> Result<Option<PathBuf>> {
+    let Ok(initial_src) = fs::read_to_string(initial_file) else {
+        return Ok(None);
+    };
+    let initial_split = split_lean_source(&initial_src, &[]);
+    if splitter::find_decl_shard_index(&initial_split.shards, target_decl)?.is_some() {
+        return Ok(None);
+    }
+    let root_pkg_opt = crate::module_builder::optional_package_config(canon_dir)
+        .ok()
+        .flatten();
+    let resolve_mod_src = |mod_name: &str| -> Option<PathBuf> {
+        if mod_name == "Init" {
+            return None;
+        }
+        if let Some(ref pkg) = root_pkg_opt {
+            if let Some(spec) =
+                crate::module_builder::resolve_module_in_package(pkg, true, mod_name)
+            {
+                if spec.src_path.is_file() {
+                    return Some(spec.src_path);
+                }
+            }
+        }
+        let rel_slash = crate::module_builder::module_name_to_rel_slash(mod_name);
+        crate::lake_build::resolve_project_lean_source(canon_dir, &rel_slash).or_else(|| {
+            let direct = canon_dir.join(format!("{rel_slash}.lean"));
+            direct.is_file().then_some(direct)
+        })
+    };
+
+    let mut queue = std::collections::VecDeque::new();
+    let mut visited = std::collections::HashSet::new();
+    let initial_canon = initial_file
+        .canonicalize()
+        .unwrap_or_else(|_| initial_file.to_path_buf());
+    visited.insert(initial_canon);
+    for imp in crate::module_builder::parse_header_imports(&initial_split.imports_header) {
+        if let Some(p) = resolve_mod_src(&imp) {
+            let cp = p.canonicalize().unwrap_or_else(|_| p.clone());
+            if visited.insert(cp) {
+                queue.push_back(p);
+            }
+        }
+    }
+
+    let mut found = None;
+    while let Some(cand_path) = queue.pop_front() {
+        let Ok(cand_src) = fs::read_to_string(&cand_path) else {
+            continue;
+        };
+        let cand_split = split_lean_source(&cand_src, &[]);
+        if splitter::find_decl_shard_index(&cand_split.shards, target_decl)?.is_some() {
+            anyhow::ensure!(
+                found.is_none(),
+                "Ambiguous declaration `{target_decl}` in imported modules: {} and {}",
+                found
+                    .as_ref()
+                    .map_or_else(String::new, |p: &PathBuf| p.display().to_string()),
+                cand_path.display()
+            );
+            found = Some(cand_path.clone());
+        }
+        for imp in crate::module_builder::parse_header_imports(&cand_split.imports_header) {
+            if let Some(p) = resolve_mod_src(&imp) {
+                let cp = p.canonicalize().unwrap_or_else(|_| p.clone());
+                if visited.insert(cp) {
+                    queue.push_back(p);
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn file_suffix_after_prefix_is_comment_only(canon_file: &Path, prefix_len: usize) -> bool {
+    let Ok(bytes) = fs::read(canon_file) else {
+        return false;
+    };
+    if prefix_len >= bytes.len() {
+        return true;
+    }
+    let Ok(suffix_str) = std::str::from_utf8(&bytes[prefix_len..]) else {
+        return false;
+    };
+    splitter::strip_lean_comments(suffix_str).trim().is_empty()
+}
+
 #[allow(clippy::too_many_arguments)]
-fn run_check_command_inner(
+pub(crate) fn run_check_command_inner(
     store: &mut TurboStore,
     db_warm_on_open: bool,
     json_output: bool,
     emit_stdout: bool,
     emit_olean: bool,
-    file: PathBuf,
+    mut file: PathBuf,
     decl: Option<String>,
     project_dir: PathBuf,
     jobs: Option<usize>,
@@ -334,7 +426,7 @@ fn run_check_command_inner(
     }
     let _lifecycle = crate::zygote::lifecycle_lock(false)?;
     let t0 = Instant::now();
-    let (canon_dir, resolved_file) = resolve_check_project_and_target(&file, &project_dir);
+    let (canon_dir, mut resolved_file) = resolve_check_project_and_target(&file, &project_dir);
     crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
     let toolchain = detect_toolchain(&canon_dir);
     let kernel_prov = crate::kernel::resolve_kernel_engine(
@@ -374,10 +466,58 @@ fn run_check_command_inner(
         };
     }
 
+    if let Some(target_decl) = decl.as_deref() {
+        if resolved_file.is_file() {
+            if let Some(sub_path) =
+                resolve_workspace_imported_decl_submodule(&canon_dir, &resolved_file, target_decl)?
+            {
+                file = sub_path
+                    .strip_prefix(&canon_dir)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|_| sub_path.clone());
+                resolved_file = sub_path;
+            }
+        }
+    }
+
     let canon_resolved_initial = resolved_file
         .canonicalize()
         .unwrap_or_else(|_| resolved_file.clone());
     if canon_resolved_initial.is_file() {
+        if !allow_sorry {
+            let source = fs::read_to_string(&canon_resolved_initial)?;
+            let hygiene = splitter::audit_hygiene(&splitter::strip_lean_comments(&source));
+            if !hygiene.is_clean_or_deferred_to_kernel_gate() {
+                let violations = if let Some(target) = decl.as_deref() {
+                    let split = split_lean_source(&source, &[]);
+                    if let Some(idx) = splitter::find_decl_shard_index(&split.shards, target)? {
+                        let cone = single_decl::audited_cone_source(&source, &split.shards[idx])?;
+                        splitter::audit_hygiene(&splitter::strip_lean_comments(&cone))
+                            .disallowed_items()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    hygiene.disallowed_items()
+                };
+                let violations: Vec<_> = violations
+                    .into_iter()
+                    .filter(|v| {
+                        !splitter::HygieneReport {
+                            flagged_items: vec![v.clone()],
+                            ..Default::default()
+                        }
+                        .is_clean_or_deferred_to_kernel_gate()
+                    })
+                    .collect();
+                anyhow::ensure!(
+                    violations.is_empty(),
+                    "Soundness hygiene violation in {}: {}",
+                    file.display(),
+                    violations.join(", ")
+                );
+            }
+        }
         let fresh_res = crate::lake_build::ensure_project_imports_fresh_for_check_with_options(
             &canon_dir,
             std::slice::from_ref(&canon_resolved_initial),
@@ -424,6 +564,12 @@ fn run_check_command_inner(
             .filter(|c| {
                 compute_imported_olean_interface_hashes(&c.split.imports_header, &canon_dir, None)
                     == c.dep_hashes
+                    && (!c.src_blake3.is_empty()
+                        || (!c.prefix_src.is_empty()
+                            && file_suffix_after_prefix_is_comment_only(
+                                &canon_resolved_initial,
+                                c.prefix_src.len(),
+                            )))
             })
     };
     let mut stat_cached_entry = st_paths_opt
@@ -458,6 +604,9 @@ fn run_check_command_inner(
                 sz,
                 &toolchain,
             )
+        })
+        .filter(|(pref_src, _, _, _)| {
+            file_suffix_after_prefix_is_comment_only(&canon_resolved_initial, pref_src.len())
         })
     {
         known_modified_vs_head = true;
@@ -503,7 +652,13 @@ fn run_check_command_inner(
             &loaded_src,
             &toolchain,
             &dep_hashes,
-        ) {
+        )
+        .filter(|(_, _, cur_prefix_len)| {
+            *cur_prefix_len >= loaded_src.len()
+                || splitter::strip_lean_comments(&loaded_src[*cur_prefix_len..])
+                    .trim()
+                    .is_empty()
+        }) {
             if fast_res.1 == 0 {
                 known_modified_vs_head = true;
             }
@@ -578,6 +733,7 @@ fn run_check_command_inner(
 
     drop(held_split_lock);
 
+    let decl_mode = decl.is_some();
     let res_or_err: Result<serde_json::Value> = (|| {
         if let Some(target_decl) = decl {
             check_single_decl(
@@ -751,7 +907,8 @@ fn run_check_command_inner(
             Ok(out_json)
         }
     })();
-    if res_or_err.is_err() && allow_sorry {
+    let decl_with_sorry_siblings = decl_mode && split.hygiene.has_sorry;
+    if res_or_err.is_err() && (allow_sorry || decl_with_sorry_siblings) {
         crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(
             &canon_dir,
             std::slice::from_ref(&canon_resolved_initial),
@@ -759,13 +916,15 @@ fn run_check_command_inner(
     }
     let res = res_or_err?;
     if !emit_olean {
-        let recheck_res = crate::lake_build::recheck_dependents_if_nonlocal_with_options(
+        let recheck_res = crate::lake_build::recheck_dependents_if_nonlocal_for_check(
             store,
             &canon_dir,
             &resolved_file,
             allow_sorry,
+            decl_mode,
+            decl_with_sorry_siblings,
         );
-        if recheck_res.is_err() && allow_sorry {
+        if recheck_res.is_err() && (allow_sorry || decl_with_sorry_siblings) {
             crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(
                 &canon_dir,
                 std::slice::from_ref(&canon_resolved_initial),

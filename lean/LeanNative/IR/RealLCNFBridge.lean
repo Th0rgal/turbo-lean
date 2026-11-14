@@ -55,14 +55,10 @@ def archSupportsUSize (arch : TargetArch) : Bool :=
   | _ => true
 
 def archUSizeMask (arch : TargetArch) : UInt64 :=
-  match arch with
-  | .wasm32 => 0xFFFFFFFF
-  | _ => 0xFFFFFFFFFFFFFFFF
+  if arch.isILP32 then 0xFFFFFFFF else 0xFFFFFFFFFFFFFFFF
 
 def archUSizeShiftMask (arch : TargetArch) : UInt64 :=
-  match arch with
-  | .wasm32 => 31
-  | _ => 63
+  if arch.isILP32 then 31 else 63
 
 def scalarWidthMask? (ty : LNIRType) (arch : TargetArch := .x86_64) : Option UInt64 :=
   match ty with
@@ -330,7 +326,8 @@ def lowerSliceIntrinsicPure? (fnName : Lean.Name) (argVars : List VarId)
     | some ([arrVar, idxVar], [.sarray elemTy, idxTy]) =>
       if !validIdxArg idxTy then none
       else if (fnName == ``ByteArray.uget && lnirTypeEq elemTy .i8 && lnirTypeEq retTy .i8) ||
-              (fnName == ``FloatArray.uget && lnirTypeEq elemTy .f64 && lnirTypeEq retTy .f64) then
+              (fnName == ``FloatArray.uget && lnirTypeEq elemTy .f64 && lnirTypeEq retTy .f64) ||
+              (arch.isFreestandingEmbedded && fnName == ``ByteArray.get! && lnirTypeEq elemTy .i8 && lnirTypeEq retTy .i8) then
         some (.sarrayGet arrVar idxVar elemTy)
       else
         none

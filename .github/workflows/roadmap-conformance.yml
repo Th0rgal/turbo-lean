@@ -23,12 +23,14 @@ jobs:
     outputs:
       run_lean_build: ${{ steps.plan.outputs.run_lean_build }}
       conformance_seeds: ${{ steps.plan.outputs.conformance_seeds }}
+      target_ir_fuzz_seeds: ${{ steps.plan.outputs.target_ir_fuzz_seeds }}
       run_conformance_full: ${{ steps.plan.outputs.run_conformance_full }}
       lean_turbo: ${{ steps.plan.outputs.lean_turbo }}
       llvm_backend: ${{ steps.plan.outputs.llvm_backend }}
       gpu_tpu_backend: ${{ steps.plan.outputs.gpu_tpu_backend }}
       con_leche_kernel: ${{ steps.plan.outputs.con_leche_kernel }}
       sail_riscv_backend: ${{ steps.plan.outputs.sail_riscv_backend }}
+      c_abi_runtime: ${{ steps.plan.outputs.c_abi_runtime }}
       ci_scripts: ${{ steps.plan.outputs.ci_scripts }}
       force_full: ${{ steps.plan.outputs.force_full }}
       impact_digest: ${{ steps.plan.outputs.impact_digest }}
@@ -53,6 +55,7 @@ jobs:
           python3 scripts/check_con_leche_bridge_sync.py
           python3 scripts/check_sail_riscv_bridge_sync.py --self-test
           python3 scripts/check_sail_riscv_bridge_sync.py
+          python3 scripts/run_target_ir_fuzz.py --self-test
           python3 sdk/accelerator-template/validate.py
       - id: plan
         env:
@@ -136,9 +139,10 @@ jobs:
           (cd lean && lake build lean-native lean-native-core turbo-zygote)
           cargo build --release -p turbo-lean
 
-      - name: Run Contract V5 checklist & 3-way ASan/UBSan conformance gate
+      - name: Run Contract V5 checklist, C1/C2/C4 3-way ASan/UBSan conformance & Stage 5 libleanrt ASan/LSan/UBSan/TSan gate
         env:
           CONFORMANCE_SEEDS: ${{ needs.impact.outputs.conformance_seeds }}
+          TARGET_IR_FUZZ_SEEDS: ${{ needs.impact.outputs.target_ir_fuzz_seeds }}
         run: ./scripts/verify_roadmap_contract.sh
 
       - name: Run full scalar/tuple/Stage-1D frontend & SymbolicTV conformance suite
