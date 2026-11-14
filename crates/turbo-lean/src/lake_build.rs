@@ -4896,7 +4896,8 @@ fn ensure_project_imports_fresh_inner(
         }
         ensure_project_imports_fresh_inner(canon_dir, target_files, rev, build_missing, true)?;
         if let (Some(cfg), Some(dag)) = (root_cfg.as_ref(), locally_rebuilt.as_ref()) {
-            crate::module_builder::record_locally_rebuilt_sources(cfg, dag, &lake_targets)?;
+            let rebuilt_modules = dag.nodes.keys().cloned().collect::<Vec<_>>();
+            crate::module_builder::record_locally_rebuilt_sources(cfg, dag, &rebuilt_modules)?;
         }
         return Ok(targets.len());
     }

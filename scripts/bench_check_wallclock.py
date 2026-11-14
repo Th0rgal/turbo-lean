@@ -94,6 +94,10 @@ def proof_edit(source, decl):
     if not match:
         raise ValueError("no tactic proof found for reversible body edit")
     pos = match.end()
+    if source[pos:].startswith("\n"):
+        tail = source[pos + 1:]
+        indent = re.match(r"[ \t]*", tail).group()
+        return source[:pos] + "\n" + indent + "skip\n" + tail
     return source[:pos] + " skip;" + source[pos:]
 
 

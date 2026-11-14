@@ -2806,7 +2806,6 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
     csimpByFrom := csimpByFrom.insert entry.fromDeclName ((csimpByFrom[entry.fromDeclName]?.getD #[]).push entry)
   let verifiedCache ← IO.mkRef ({} : Std.HashMap Name Bool)
   let verifiedCSimp (name : Name) : IO Bool := do
-    if skipChildReplay then return false
     if let some ok := (← verifiedCache.get)[name]? then return ok
     let check : IO Bool := do
       let some (.thmInfo tv) := env.find? name | return false
