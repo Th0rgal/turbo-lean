@@ -98,6 +98,24 @@ pub(super) fn check_single_file(
         }
     }
     let hygiene_strictly_clean = split.hygiene.is_clean_for_certification();
+    let replay_authority = super::replay_authority(src);
+    let make_attested_shard_receipt_bytes =
+        |decl: &str,
+         prefix: &str,
+         statement: &str,
+         proof: &str,
+         time: i64,
+         kernel_type: Option<&str>| {
+            let receipt = make_attested_shard_receipt_bytes(
+                decl,
+                prefix,
+                statement,
+                proof,
+                time,
+                kernel_type,
+            )?;
+            super::bind_replay_authority(&receipt, &replay_authority)
+        };
     for (idx, shard) in split.shards.iter().enumerate() {
         let shard_key = file_shard_keys[idx].clone();
         let client_att_key = &client_attested_keys[idx];
@@ -116,19 +134,30 @@ pub(super) fn check_single_file(
             && kth_opt.is_some_and(|kth| {
                 store.has_attested_decl_receipt(&shard_key, "trusted", shard.decl_name(), kth)
             });
+        let replay_attested = !allow_sorry
+            && hygiene_deferrable
+            && kth_opt.is_some_and(|kth| {
+                super::has_replay_authority(
+                    store,
+                    &shard_key,
+                    shard.decl_name(),
+                    kth,
+                    &replay_authority,
+                )
+            });
         let client_attested = hygiene_strictly_clean
             && !allow_sorry
             && client_att_present
             && kth_opt.is_some_and(|kth| {
                 store.has_attested_decl_receipt(client_att_key, "trusted", shard.decl_name(), kth)
             });
-        if raw_present && !raw_attested {
+        if raw_present && !raw_attested && !replay_attested {
             store.invalidate_action_for_reattestation(&shard_key)?;
         }
         if !allow_sorry && client_att_present && !client_attested {
             store.invalidate_action_for_reattestation(client_att_key)?;
         }
-        if raw_attested || client_attested {
+        if raw_attested || client_attested || replay_attested {
             hits += 1;
         } else {
             uncached_shards.push((shard_key, shard));
@@ -660,7 +689,7 @@ pub(super) fn check_single_file(
         );
     }
 
-    if hygiene_strictly_clean
+    if (hygiene_strictly_clean || (!allow_sorry && hygiene_deferrable))
         && misses == 0
         && !split.shards.is_empty()
         && split.eligible_for_sharding
@@ -824,7 +853,7 @@ pub(super) fn check_single_file(
     let use_parallel_shards =
         hygiene_strictly_clean && split.eligible_for_sharding && !uncached_shards.is_empty();
 
-    let proj_build_verified = split.hygiene.is_clean_for_certification()
+    let proj_build_verified = hygiene_strictly_clean
         && cached_file_blake3
             .map(|h| is_file_hash_verified_in_lake_build(canon_dir, canon_resolved_initial, h))
             .unwrap_or_else(|| {
@@ -1639,7 +1668,12 @@ pub(super) fn check_single_file(
             }
         }
         let dur_ms = t0.elapsed().as_millis() as i64;
-        if actual_hygiene_strictly_clean && !uncached_shards.is_empty() {
+        if (actual_hygiene_strictly_clean
+            || (!allow_sorry
+                && hygiene_deferrable
+                && super::replay_authority(src) == replay_authority))
+            && !uncached_shards.is_empty()
+        {
             let now = db::now_unix();
             for (shard_key, shard) in uncached_shards {
                 if let SingleflightOutcome::Leader(lease) =
@@ -1657,6 +1691,7 @@ pub(super) fn check_single_file(
                         now,
                         kth_opt,
                     )?;
+                    let receipt = super::bind_replay_authority(&receipt, &replay_authority)?;
                     let rel_path = format!("thm:{}", shard.decl_name());
                     store.publish_action_with_blob(
                         &lease,

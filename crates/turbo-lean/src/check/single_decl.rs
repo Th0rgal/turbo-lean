@@ -548,6 +548,81 @@ theorem good : Witness.value = 7 := rfl
     }
 
     #[test]
+    fn test_verified_csimp_cache_binds_full_source_and_policy() -> Result<()> {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let scratch =
+            PrivateScratchDir::create(&verified_private_temp_scratch_base()?, "csimp_cache")?;
+        fs::write(
+            scratch.path.join("lean-toolchain"),
+            "leanprover/lean4:v4.35.0\n",
+        )?;
+        let file = scratch.path.join("Cone.lean");
+        let source = "def slow (n : Nat) := n\ndef fast (n : Nat) := n\n@[csimp] theorem slow_eq_fast : slow = fast := rfl\ntheorem good : True := True.intro\n";
+        fs::write(&file, source)?;
+        let mut store = TurboStore::open(Some(&scratch.path.join("store")))?;
+        let mut check = || {
+            crate::check::run_check_command_inner(
+                &mut store,
+                true,
+                true,
+                false,
+                false,
+                file.clone(),
+                Some("good".into()),
+                scratch.path.clone(),
+                None,
+                false,
+                None,
+                false,
+            )
+        };
+        assert_eq!(check()?["status"], "theorem_verified");
+        assert_eq!(check()?["status"], "theorem_cache_hit");
+        fs::write(&file, format!("{source}\naxiom forged : False\n"))?;
+        assert_ne!(check()?["status"], "theorem_cache_hit");
+        fs::write(
+            &file,
+            source.replace("slow = fast := rfl", "slow = fast := sorry"),
+        )?;
+        assert!(check().is_err());
+        fs::write(&file, source)?;
+        let previous = std::env::var_os("TURBO_LEAN_ALLOWED_CSIMP");
+        unsafe { std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", "slow_eq_fast") };
+        let changed_policy = check();
+        match previous {
+            Some(value) => unsafe { std::env::set_var("TURBO_LEAN_ALLOWED_CSIMP", value) },
+            None => unsafe { std::env::remove_var("TURBO_LEAN_ALLOWED_CSIMP") },
+        }
+        assert_eq!(changed_policy?["status"], "theorem_verified");
+        let mut check_file = || {
+            crate::check::run_check_command_inner(
+                &mut store,
+                true,
+                true,
+                false,
+                false,
+                file.clone(),
+                None,
+                scratch.path.clone(),
+                None,
+                false,
+                None,
+                false,
+            )
+        };
+        assert_eq!(check_file()?["status"], "file_verified");
+        assert_eq!(check_file()?["status"], "all_shards_cached");
+        fs::write(
+            &file,
+            source.replace("slow = fast := rfl", "slow = fast := sorry"),
+        )?;
+        assert!(check_file().is_err());
+        Ok(())
+    }
+
+    #[test]
     fn test_dirty_mutual_peer_bypasses_attested_cache_hit() -> Result<()> {
         let _guard = crate::pack::tests::env_test_lock()
             .lock()
@@ -3627,6 +3702,16 @@ pub(super) fn check_single_decl(
         );
     }
     let shard_has_sorry = shard_text_contains_sorry_or_admit(shard);
+    anyhow::ensure!(
+        allow_sorry
+            || !split.hygiene.has_sorry
+            || !split
+                .hygiene
+                .flagged_items
+                .iter()
+                .any(|item| item.ends_with(": csimp")),
+        "Deferred csimp authority requires a sorry-free source"
+    );
     let cone_src = if allow_sorry {
         build_cone_scoped_decl_audit_source(&active_src, shard)
     } else {
@@ -3637,7 +3722,13 @@ pub(super) fn check_single_decl(
             .is_clean_for_certification();
     let clean_for_certification = split.hygiene.is_clean_for_certification();
     let allow_attested_cache_hit = clean_for_certification
-        || (split.hygiene.is_clean_modulo_sorry() && cone_clean_for_certification);
+        || (split.hygiene.is_clean_modulo_sorry()
+            && !split
+                .hygiene
+                .flagged_items
+                .iter()
+                .any(|item| item.ends_with(": csimp"))
+            && cone_clean_for_certification);
     // Stat/split caches are not evidence of the identity in the current source.
     if active_src.is_empty() {
         active_src = fs::read_to_string(&active_file)?;
@@ -3662,6 +3753,13 @@ pub(super) fn check_single_decl(
         crate::module_builder::try_resolve_lean_args_for_path(canon_dir, Some(&active_file))?;
 
     let shard_key = compute_shard_key_with_args(toolchain, shard, &file_lean_args);
+    let replay_authority = super::replay_authority(&active_src);
+    let audited_source_key = format!(
+        "audited-source-v1:{}:{}:{}",
+        shard_key,
+        blake3::hash(active_src.as_bytes()).to_hex(),
+        splitter::current_kernel_policy_digest()
+    );
     let make_cache_hit_json = |coalesced: bool, elapsed_ms: u128| {
         let cached_consts =
             crate::accelerators::lookup_distilled_constants(target_decl, &shard.signature_text);
@@ -3705,20 +3803,30 @@ pub(super) fn check_single_decl(
     };
 
     if !allow_sorry && !clean_for_certification {
-        if allow_attested_cache_hit
-            && !shard_has_sorry
+        if !shard_has_sorry
+            && split.hygiene.is_clean_or_deferred_to_kernel_gate()
             && db_warm_on_open
-            && (store.has_attested_decl_receipt(
-                &shard_key,
-                "trusted",
+            && super::has_replay_authority(
+                store,
+                &audited_source_key,
                 target_decl,
                 &attested.kernel_type_hash,
-            ) || store.has_attested_decl_receipt(
-                &pack::client_attested_receipt_key(&shard_key),
-                "trusted",
-                target_decl,
-                &attested.kernel_type_hash,
-            ))
+                &replay_authority,
+            )
+            || allow_attested_cache_hit
+                && !shard_has_sorry
+                && db_warm_on_open
+                && (store.has_attested_decl_receipt(
+                    &shard_key,
+                    "trusted",
+                    target_decl,
+                    &attested.kernel_type_hash,
+                ) || store.has_attested_decl_receipt(
+                    &pack::client_attested_receipt_key(&shard_key),
+                    "trusted",
+                    target_decl,
+                    &attested.kernel_type_hash,
+                ))
         {
             let elapsed_ms = t0.elapsed().as_millis();
             let out_json = make_cache_hit_json(false, elapsed_ms);
@@ -3759,6 +3867,27 @@ pub(super) fn check_single_decl(
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        if !shard_has_sorry && split.hygiene.is_clean_or_deferred_to_kernel_gate() {
+            let receipt = make_attested_shard_receipt_bytes(
+                target_decl,
+                &shard.prefix_env_hash,
+                &shard.stmt_hash,
+                &shard.proof_hash,
+                db::now_unix(),
+                Some(&attested.kernel_type_hash),
+            )?;
+            let receipt = super::bind_replay_authority(&receipt, &replay_authority)?;
+            store.batch_publish_theorem_shards(
+                toolchain,
+                "trusted",
+                &[(
+                    audited_source_key,
+                    target_decl.to_string(),
+                    receipt,
+                    t0.elapsed().as_millis() as i64,
+                )],
+            )?;
+        }
         let mut verified_via_fast_olean = false;
         let rooted_target = shard.rooted_name();
         let prefix = active_src

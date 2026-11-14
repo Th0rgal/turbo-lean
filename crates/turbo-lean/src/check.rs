@@ -361,6 +361,42 @@ pub(crate) fn make_attested_shard_receipt_bytes(
     Ok(serde_json::to_vec(&obj)?)
 }
 
+pub(super) fn replay_authority(source: &str) -> String {
+    format!(
+        "verified-kernel-gate-v1:{}:{}",
+        blake3::hash(source.as_bytes()).to_hex(),
+        splitter::current_kernel_policy_digest()
+    )
+}
+
+pub(super) fn bind_replay_authority(receipt: &[u8], authority: &str) -> Result<Vec<u8>> {
+    let mut value: serde_json::Value = serde_json::from_slice(receipt)?;
+    value["kernel_gate_authority"] = authority.into();
+    Ok(serde_json::to_vec(&value)?)
+}
+
+pub(super) fn has_replay_authority(
+    store: &TurboStore,
+    key: &str,
+    decl: &str,
+    kernel_type: &str,
+    authority: &str,
+) -> bool {
+    let Ok(Some(entries)) = store.get_cached_action_no_hit_bump(key, "trusted") else {
+        return false;
+    };
+    entries.into_iter().any(|entry| {
+        store.outputs_have_attested_decl_receipt(std::slice::from_ref(&entry), decl, kernel_type)
+            && store
+                .read_verified_blob(&entry.blob_hash)
+                .is_some_and(|bytes| {
+                    serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|value| {
+                        value["kernel_gate_authority"].as_str() == Some(authority)
+                    })
+                })
+    })
+}
+
 pub(super) fn write_shm_cached_split(
     st_path: &Path,
     split_key: String,
