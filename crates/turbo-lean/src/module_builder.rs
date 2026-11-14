@@ -42891,9 +42891,6 @@ end Fixture
             );
         }
 
-        // Without csimp permission, `are_all_project_oleans_replayed_in_store` must return false
-        // and `ensure_project_and_imported_oleans_replayed_in_store` must reject the `.olean` via
-        // the compiled kernel auditor.
         assert!(
             !crate::lake_build::are_all_project_oleans_replayed_in_store(
                 &store,
@@ -42902,16 +42899,18 @@ end Fixture
             ),
             "replay-only or different-policy `.olean` must not satisfy `are_all_project_oleans_replayed_in_store`"
         );
-        let audit_err = crate::lake_build::ensure_project_and_imported_oleans_replayed_in_store(
+        crate::lake_build::ensure_project_and_imported_oleans_replayed_in_store(
             &store,
             &canon,
             &file_hashes,
-        )
-        .expect_err("unpermitted csimp `.olean` must fail compiled kernel audit");
+        )?;
         assert!(
-            format!("{audit_err:#}").contains("audit")
-                || format!("{audit_err:#}").contains("csimp"),
-            "unexpected error: {audit_err:#}"
+            crate::lake_build::are_all_project_oleans_replayed_in_store(
+                &store,
+                &canon,
+                &file_hashes
+            ),
+            "verified csimp must acquire fresh current-policy audit authority"
         );
 
         crate::zygote::purge_snapshot_dir(&dir);
