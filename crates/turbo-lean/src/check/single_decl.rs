@@ -1156,7 +1156,7 @@ theorem good : Witness.value = 7 := rfl
         )?;
         fs::write(
             dir.join("Policy.lean"),
-            "unsafe def fast : Nat := 1\n@[implemented_by fast] def slow : Nat := 1\n@[csimp] theorem replacement : slow = slow := rfl\nnamespace N\ntheorem good : True := by trivial\nend N\n",
+            "unsafe def fast : Nat := 1\n@[implemented_by fast] def slow : Nat := 1\ndef csimpFast : Nat := 1\n@[csimp] theorem replacement : slow = csimpFast := rfl\nnamespace N\ntheorem good : True := by trivial\nend N\n",
         )?;
         let policies = [
             ("TURBO_LEAN_ALLOWED_UNSAFE", "fast"),
