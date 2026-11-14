@@ -181,6 +181,99 @@ private def resolveLlvmNm : IO String := do
     catch _ => pure ()
   return "llvm-nm"
 
+/-- Buffer-as-value model: a mutable buffer is a total map, a write returns the updated buffer,
+    a loop carries it. The two-field structure keeps buffer values visible to the compiler. -/
+private def linearBufPrelude : String := "
+structure MutBytes where
+  get : UInt32 → UInt8
+  tok : Unit
+@[noinline] def readMutU8 (p : MutBytes) (idx : UInt32) : UInt8 := p.get idx
+@[noinline] def writeU8 (p : MutBytes) (idx : UInt32) (val : UInt8) : MutBytes :=
+  { get := fun j => if j = idx then val else p.get j, tok := () }
+@[noinline] def forRangeBytes (lo hi : UInt32) (buf : MutBytes) (step : UInt32 → MutBytes → MutBytes) : MutBytes :=
+  let rec go (fuel : Nat) (cur : UInt32) (b : MutBytes) : MutBytes :=
+    match fuel with | 0 => b | f + 1 => go f (cur + 1) (step cur b)
+  if decide (lo < hi) then go (hi - lo).toNat lo buf else buf
+@[noinline] def forRangeBytesU32 (lo hi : UInt32) (buf : MutBytes) (init : UInt32)
+    (step : UInt32 → MutBytes → UInt32 → MutBytes × UInt32) : MutBytes × UInt32 :=
+  let rec go (fuel : Nat) (cur : UInt32) (b : MutBytes) (acc : UInt32) : MutBytes × UInt32 :=
+    match fuel with | 0 => (b, acc) | f + 1 => let r := step cur b acc; go f (cur + 1) r.1 r.2
+  if decide (lo < hi) then go (hi - lo).toNat lo buf init else (buf, init)
+"
+
+/-- Linear programs: every buffer value is used once, and a function that writes returns it. -/
+private def linearBufAccepted : String := "
+def swap (b : MutBytes) (i j : UInt32) : MutBytes :=
+  let x := readMutU8 b i
+  let y := readMutU8 b j
+  writeU8 (writeU8 b i y) j x
+@[export lb_reverse]
+def reverse (b : MutBytes) (n : UInt32) : MutBytes :=
+  forRangeBytes 0 (n >>> 1) b (fun k b => swap b k (n - 1 - k))
+@[export lb_fill_sum]
+def fillSum (b : MutBytes) (n : UInt32) (v : UInt8) : MutBytes × UInt32 :=
+  forRangeBytesU32 0 n b 0 (fun k b acc =>
+    let old := readMutU8 b k
+    (writeU8 b k v, acc + old.toUInt32))
+"
+
+/-- Programs whose value semantics a store-in-place translation would not preserve. -/
+private def linearBufRejected : List (String × String) := [
+  ("read after write", "
+@[export lb_bad] def bad (b : MutBytes) : MutBytes × UInt8 :=
+  let b1 := writeU8 b 0 1
+  (b1, readMutU8 b 0)"),
+  ("two writes of one value", "
+@[export lb_bad] def bad (b : MutBytes) (i : UInt32) : MutBytes × UInt8 :=
+  let b1 := writeU8 b 0 1
+  let b2 := writeU8 b 0 2
+  (b1, readMutU8 b2 i)"),
+  ("write not returned", "
+@[export lb_bad] def bad (b : MutBytes) : UInt8 := readMutU8 (writeU8 b 0 1) 0"),
+  ("step reads the buffer given to its loop", "
+@[export lb_bad] def bad (b : MutBytes) (n : UInt32) : MutBytes :=
+  forRangeBytes 0 n b (fun k x => writeU8 x k (readMutU8 b 0))")]
+
+/-- The buffer-as-value model compiles to in-place stores on every target, runs correctly on the
+    host, exports `void` / the scalar for a returned buffer, and rejects non-linear programs. -/
+def runLinearBufferSuite (clangBin : String := "clang") : IO Bool := do
+  let pid ← IO.monoNanosNow
+  let base := s!"/tmp/ln_linbuf_{pid}"
+  -- `none` on success, else the refusal message.
+  let emit (src : String) (target : String) : IO (Option String) := do
+    IO.FS.writeFile (base ++ ".lean") (linearBufPrelude ++ src)
+    try
+      let rc ← LeanNative.Driver.CoreCLI.runEmitFreestandingCLib "lean-native"
+        (some (fun path arch => LeanNative.IR.ingestLeanSourceFile path path arch false))
+        [base ++ ".lean", "--target", target, "-o", base ++ ".a"]
+      pure (if rc == 0 then none else some s!"exit code {rc}")
+    catch e => pure (some e.toString)
+  let mut ok := true
+  for (_, src) in linearBufRejected do
+    let refusal := (← emit src "x86_64").getD ""
+    ok := ok && (refusal.splitOn "mutable buffer not used linearly").length > 1
+  for target in ["thumbv6m", "thumbv8m.main", "riscv32imac", "x86_64"] do
+    ok := ok && (← emit linearBufAccepted target).isNone
+  let hdr ← try IO.FS.readFile (base ++ ".h") catch _ => pure ""
+  ok := ok && (hdr.splitOn "void lb_reverse(uint8_t* b, uint32_t n);").length > 1 &&
+    (hdr.splitOn "uint32_t lb_fill_sum(uint8_t* b, uint32_t n, uint8_t v);").length > 1
+  IO.FS.writeFile (base ++ ".c") (
+    "#include <assert.h>\n" ++ s!"#include \"{base}.h\"\n" ++
+    "int main(void) {\n" ++
+    "  uint8_t a[5] = {1,2,3,4,5};\n" ++
+    "  lb_reverse(a, 5);\n" ++
+    "  for (int i = 0; i < 5; i++) assert(a[i] == 5 - i);\n" ++
+    "  assert(lb_fill_sum(a, 4, 9) == 14);\n" ++
+    "  for (int i = 0; i < 4; i++) assert(a[i] == 9);\n" ++
+    "  assert(a[4] == 1 && lb_fill_sum(a, 0, 7) == 0 && a[0] == 9);\n" ++
+    "  return 0;\n}\n")
+  let link ← IO.Process.output {
+    cmd := clangBin, args := #["-std=c11", "-Wall", "-Wextra", "-Werror", base ++ ".c", base ++ ".a", "-o", base ++ ".bin"] }
+  ok := ok && link.exitCode == 0 && (← IO.Process.output { cmd := base ++ ".bin" }).exitCode == 0
+  for ext in [".lean", ".a", ".o", ".ll", ".h", ".su", ".c", ".bin"] do
+    try IO.FS.removeFile (base ++ ext) catch _ => pure ()
+  return ok
+
 /-- Concrete end-to-end `LLVMLower` + `emitLLVMFreestanding?` + `clang -c` + `llvm-nm -u` + `-fstack-usage`
     smoke suite across `.thumbv6m`, `.thumbv8mMain`, and `.riscv32imac`. -/
 def runLedgerEmbeddedClangSmokeSuite (clangBin : String := "clang") : IO Bool := do
@@ -416,6 +509,6 @@ def runLedgerEmbeddedClangSmokeSuite (clangBin : String := "clang") : IO Bool :=
   try IO.FS.removeFile srcPath catch _ => pure ()
   try IO.FS.removeFile harnessC catch _ => pure ()
   try IO.FS.removeFile harnessBin catch _ => pure ()
-  return ok
+  return ok && (← runLinearBufferSuite clangBin)
 
 end LeanNative.Tests.LedgerEmbedded32Tests
