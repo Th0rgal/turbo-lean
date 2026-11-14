@@ -359,14 +359,13 @@ impl HygieneReport {
     /// and `[implemented_by]` policies rather than requiring immediate source-level rejection.
     pub(crate) fn is_clean_or_deferred_to_kernel_gate(&self) -> bool {
         let allow_axioms = Self::has_custom_axiom_policy();
-        let allow_csimp = has_nonempty_policy_env("TURBO_LEAN_ALLOWED_CSIMP");
         let allow_unsafe = has_nonempty_policy_env("TURBO_LEAN_ALLOWED_UNSAFE");
         let allow_impl_by = has_nonempty_policy_env("TURBO_LEAN_ALLOWED_IMPLEMENTED_BY");
         self.disallowed_items()
             .into_iter()
             .all(|item| match item_kind(&item) {
                 "axiom" => allow_axioms,
-                "csimp" => allow_csimp,
+                "csimp" => true,
                 "unsafe declaration" => allow_unsafe,
                 "implemented_by" => allow_impl_by,
                 _ => false,

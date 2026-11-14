@@ -4855,7 +4855,7 @@ fn ensure_project_imports_fresh_inner(
             let rebuild_dag = root_cfg
                 .as_ref()
                 .filter(|_| bypass_lake_cache)
-                .map(|cfg| crate::module_builder::build_module_dag(cfg, &lake_targets))
+                .map(|cfg| crate::module_builder::build_lake_refresh_dag(cfg, &lake_targets))
                 .transpose()?;
             lake_build_modules_opts(
                 canon_dir,

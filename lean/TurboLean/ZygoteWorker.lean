@@ -2802,9 +2802,8 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
     for entry in entries.toArray do
       allCSimpEntries := allCSimpEntries.push (none, entry)
   let mut csimpByFrom : Std.HashMap Name (Array Lean.Compiler.CSimp.Entry) := {}
-  if isImportAudit then
-    for (_, entry) in allCSimpEntries do
-      csimpByFrom := csimpByFrom.insert entry.fromDeclName ((csimpByFrom[entry.fromDeclName]?.getD #[]).push entry)
+  for (_, entry) in allCSimpEntries do
+    csimpByFrom := csimpByFrom.insert entry.fromDeclName ((csimpByFrom[entry.fromDeclName]?.getD #[]).push entry)
   let verifiedCache ← IO.mkRef ({} : Std.HashMap Name Bool)
   let verifiedCSimp (name : Name) : IO Bool := do
     if skipChildReplay then return false
@@ -2874,7 +2873,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
     return ok
   let csimpAllowed (name : Name) : IO Bool := do
     if nameMatchesPolicy csimpPatterns name then return true
-    if isImportAudit then verifiedCSimp name else pure false
+    verifiedCSimp name
   let unsfTag := "un" ++ "safe"
   let mut violations : List String := []
   let mut sorryDecls : List String := []

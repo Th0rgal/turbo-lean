@@ -10002,7 +10002,60 @@ pub(crate) fn source_ineligible_for_stamp_reuse(
             .find(|pkg| fs::canonicalize(&pkg.pkg_root).is_ok_and(|root| root == pkg_root))
             .is_some_and(|pkg| {
                 module_includes_all_covered_by_lake_inputs(pkg, module_name, src_path, src_raw)
+                    || tracked_custom_target_includes(cfg, pkg, module_name, src_path, src_raw)
+                        .is_some()
             })
+}
+
+fn tracked_custom_target_includes(
+    cfg: &ProjectConfig,
+    pkg: &PackageConfig,
+    module_name: &str,
+    src_path: &Path,
+    source: &str,
+) -> Option<Vec<(PathBuf, String)>> {
+    if pkg.pkg_root == cfg.root_pkg.pkg_root
+        || !pkg.libs.iter().any(|lib| {
+            lib_can_build_module(lib, module_name) && !lib.custom_target_needs.is_empty()
+        })
+    {
+        return None;
+    }
+    let pin = cfg
+        .manifest_packages
+        .iter()
+        .find(|p| p.name == pkg.name)?
+        .rev
+        .as_deref()?;
+    if !is_clean_pinned_git_checkout(&pkg.pkg_root, pin, Some(pkg)) {
+        return None;
+    }
+    let root = pkg.pkg_root.canonicalize().ok()?;
+    let paths = crate::splitter::extract_include_relative_paths(source)?;
+    if paths.is_empty() {
+        return None;
+    }
+    let mut result = Vec::new();
+    for rel in paths {
+        let path = src_path.parent()?.join(rel).canonicalize().ok()?;
+        check_input_file_is_contained_regular_file(&root, &path).ok()?;
+        let relative = path.strip_prefix(&root).ok()?;
+        let mut git = crate::trusted_tools::git(&root).ok()?;
+        let output = git
+            .args(["-C"])
+            .arg(&root)
+            .args(["ls-files", "--error-unmatch", "--"])
+            .arg(relative)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let digest = blake3::hash(&fs::read(&path).ok()?).to_hex().to_string();
+        result.push((path, digest));
+    }
+    result.sort();
+    Some(result)
 }
 
 fn source_has_disallowed_elab_host_effects_for_module(
@@ -10393,6 +10446,22 @@ fn lake_closure_export_info_inner(
         } else {
             false
         };
+
+        if !cache.post_lake_refresh
+            && !has_valid_turbo_entry
+            && package_by_root(cfg, &spec.pkg_root).is_some_and(|pkg| {
+                tracked_custom_target_includes(
+                    cfg,
+                    pkg,
+                    &spec.module_name,
+                    &spec.src_path,
+                    &src_raw,
+                )
+                .is_some()
+            })
+        {
+            return None;
+        }
 
         if ((!cache.post_lake_refresh || has_valid_turbo_entry)
             && source_ineligible_for_stamp_reuse(
@@ -13038,6 +13107,33 @@ pub(crate) fn discover_trusted_assurance_surface(
 /// Build the deterministic module dependency DAG for `cfg` and requested `targets` (trusted mode).
 pub fn build_module_dag(cfg: &ProjectConfig, targets: &[String]) -> Result<ModuleDag> {
     build_module_dag_with_trust(cfg, targets, false)
+}
+
+pub(crate) fn build_lake_refresh_dag(cfg: &ProjectConfig, targets: &[String]) -> Result<ModuleDag> {
+    let mut refresh_cfg = cfg.clone();
+    for pkg in &mut refresh_cfg.dep_pkgs {
+        for lib in &mut pkg.libs {
+            if !lib.custom_target_needs.is_empty()
+                && lib
+                    .unsupported
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("Unsupported `needs` custom target"))
+            {
+                lib.unsupported = None;
+            }
+        }
+        for exe in &mut pkg.exes {
+            if !exe.custom_target_needs.is_empty()
+                && exe
+                    .unsupported
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("Unsupported `needs` custom target"))
+            {
+                exe.unsupported = None;
+            }
+        }
+    }
+    build_module_dag(&refresh_cfg, targets)
 }
 
 /// Build the deterministic module dependency DAG for `cfg` and requested `targets` with explicit `is_untrusted` policy.
@@ -16183,6 +16279,39 @@ pub(crate) fn module_lake_input_digest(cfg: &ProjectConfig, node: &ModuleNode) -
 pub(crate) fn workspace_lake_inputs_digest(cfg: &ProjectConfig) -> Result<String> {
     validate_materialized_artifacts(cfg)?;
     let mut out = String::new();
+    for pkg in &cfg.dep_pkgs {
+        if !pkg
+            .libs
+            .iter()
+            .any(|lib| !lib.custom_target_needs.is_empty())
+        {
+            continue;
+        }
+        for entry in walkdir::WalkDir::new(pkg.pkg_root.join(&pkg.src_dir))
+            .sort_by_file_name()
+            .into_iter()
+            .filter_entry(|e| !matches!(e.file_name().to_str(), Some(".lake" | ".git")))
+        {
+            let entry = entry?;
+            if !entry.file_type().is_file() || entry.path().extension().is_none_or(|e| e != "lean")
+            {
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(pkg.pkg_root.join(&pkg.src_dir))?
+                .with_extension("");
+            let module_name = relative.to_string_lossy().replace('/', ".");
+            let source = fs::read_to_string(entry.path())?;
+            if let Some(inputs) =
+                tracked_custom_target_includes(cfg, pkg, &module_name, entry.path(), &source)
+            {
+                for (path, digest) in inputs {
+                    out.push_str(&format!("include:{}:{}\n", path.display(), digest));
+                }
+            }
+        }
+    }
     if std::iter::once(&cfg.root_pkg)
         .chain(&cfg.dep_pkgs)
         .any(|p| !p.custom_targets.is_empty() || !p.extern_libs.is_empty())
@@ -29570,6 +29699,100 @@ lean_exe «demo-exe» where
         }
         let fixture = root.join("fixtures/mathlib-v4.35.0-lakefile.lean");
         parse_lakefile_lean(fixture.parent().unwrap(), &fixture, false).unwrap();
+    }
+
+    #[test]
+    fn test_custom_target_tracked_include_binding_and_refresh_only_dag() -> Result<()> {
+        let _guard = native_build_env_guard();
+        let dir = make_temp_test_dir("tracked_custom_include");
+        let app = dir.join("app");
+        let dep = app.join(".lake/packages/widgets");
+        fs::create_dir_all(&dep)?;
+        fs::write(app.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            app.join("lakefile.toml"),
+            "name = \"app\"\n[[lean_lib]]\nname = \"App\"\n",
+        )?;
+        fs::write(dep.join("lakefile.lean"), "import Lake\nopen Lake DSL\npackage widgets\ntarget widgetJsAll pkg : Unit := pure ()\nlean_lib Widgets where\n  needs := #[widgetJsAll]\n")?;
+        fs::write(
+            dep.join("Widgets.lean"),
+            "def widget := include_str \"widget.js\"\n",
+        )?;
+        fs::write(dep.join("widget.js"), "original")?;
+        fs::write(dep.join(".gitignore"), "/.lake/\n")?;
+        for args in [
+            vec!["init", "-q"],
+            vec!["add", "."],
+            vec![
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "fixture",
+            ],
+        ] {
+            let mut git = crate::trusted_tools::git(&dep)?;
+            anyhow::ensure!(git.arg("-C").arg(&dep).args(args).status()?.success());
+        }
+        let mut git = crate::trusted_tools::git(&dep)?;
+        let rev = String::from_utf8(
+            git.arg("-C")
+                .arg(&dep)
+                .args(["rev-parse", "HEAD"])
+                .output()?
+                .stdout,
+        )?
+        .trim()
+        .to_owned();
+        fs::write(
+            app.join("lake-manifest.json"),
+            serde_json::to_vec(
+                &serde_json::json!({"version":"1.2.0","name":"app","packagesDir":".lake/packages","lakeDir":".lake","packages":[{"type":"git","name":"widgets","url":"https://example.invalid/widgets","rev":rev,"inputRev":rev,"subDir":null,"configFile":"lakefile.lean","inherited":false}]}),
+            )?,
+        )?;
+        let cfg = resolve_project_config(&app)?;
+        let pkg = cfg.dep_pkgs.iter().find(|p| p.name == "widgets").unwrap();
+        let source = fs::read_to_string(dep.join("Widgets.lean"))?;
+        let bound = tracked_custom_target_includes(
+            &cfg,
+            pkg,
+            "Widgets",
+            &dep.join("Widgets.lean"),
+            &source,
+        )
+        .unwrap();
+        assert_eq!(bound.len(), 1);
+        let original_inputs = workspace_lake_inputs_digest(&cfg)?;
+        assert!(build_module_dag(&cfg, &["Widgets".into()]).is_err());
+        assert!(build_lake_refresh_dag(&cfg, &["Widgets".into()]).is_ok());
+        fs::write(dep.join("widget.js"), "tampered")?;
+        reset_lake_inputs_tag_memo();
+        assert!(tracked_custom_target_includes(
+            &cfg,
+            pkg,
+            "Widgets",
+            &dep.join("Widgets.lean"),
+            &source
+        )
+        .is_none());
+        assert_ne!(workspace_lake_inputs_digest(&cfg)?, original_inputs);
+        fs::write(dep.join("widget.js"), "original")?;
+        fs::write(dep.join("untracked.js"), "untracked")?;
+        reset_lake_inputs_tag_memo();
+        assert!(tracked_custom_target_includes(
+            &cfg,
+            pkg,
+            "Widgets",
+            &dep.join("Widgets.lean"),
+            "def x := include_str \"untracked.js\""
+        )
+        .is_none());
+        fs::remove_dir_all(dir)?;
+        Ok(())
     }
 
     #[test]
