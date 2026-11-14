@@ -182,7 +182,7 @@ pub fn try_populate_cached_bin_from_shared(
         let _ = fs::create_dir_all(parent);
         let shared_out = shared_bin.with_extension("out");
         if let Ok(text) = fs::read_to_string(&shared_out) {
-            if is_valid_cached_fastcheck_out(&text, false).is_some() {
+            if is_valid_cached_fastcheck_out(&text, true).is_some() {
                 let _ = fs::copy(&shared_out, cached_bin.with_extension("out"));
             }
         }
@@ -212,7 +212,7 @@ pub(crate) fn ensure_shared_fastcheck_out(shared_bin: &Path) {
     }
     let out_file = shared_bin.with_extension("out");
     if let Ok(existing) = fs::read_to_string(&out_file) {
-        if is_valid_cached_fastcheck_out(&existing, false).is_some() {
+        if is_valid_cached_fastcheck_out(&existing, true).is_some() {
             return;
         }
         let _ = fs::remove_file(&out_file);
@@ -237,8 +237,10 @@ pub(crate) fn ensure_shared_fastcheck_out(shared_bin: &Path) {
         }
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
-    if !stdout.trim().is_empty() {
-        write_cached_fastcheck_out_atomic(&out_file, out.status.success(), &stdout);
+    if out.status.success() && !stdout.trim().is_empty() {
+        write_cached_fastcheck_out_atomic(&out_file, true, &stdout);
+    } else if !out.status.success() {
+        let _ = fs::remove_file(&out_file);
     } else {
         let _ = fs::remove_file(shared_bin);
     }
@@ -248,7 +250,7 @@ pub fn run_or_read_cached_fastcheck_bin(cached_bin: &Path) -> Result<(bool, Stri
     let run_t0 = std::time::Instant::now();
     let out_file = cached_bin.with_extension("out");
     if let Ok(cached_text) = fs::read_to_string(&out_file) {
-        if let Some((ok, body)) = is_valid_cached_fastcheck_out(&cached_text, false) {
+        if let Some((ok, body)) = is_valid_cached_fastcheck_out(&cached_text, true) {
             let exec_us = run_t0.elapsed().as_micros().max(1);
             return Ok((ok, body.to_string(), exec_us));
         }
@@ -272,7 +274,9 @@ pub fn run_or_read_cached_fastcheck_bin(cached_bin: &Path) -> Result<(bool, Stri
     let exec_us = run_t0.elapsed().as_micros().max(1);
     let ok = out.status.success();
     let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-    write_cached_fastcheck_out_atomic(&out_file, ok, &stdout);
+    if ok {
+        write_cached_fastcheck_out_atomic(&out_file, true, &stdout);
+    }
     Ok((ok, stdout, exec_us))
 }
 
