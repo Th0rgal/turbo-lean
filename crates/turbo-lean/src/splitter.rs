@@ -6303,6 +6303,34 @@ fn identity_probe_preserves_non_theorem_bodies() {
     assert!(!probe.contains(":= rfl"));
 }
 
+#[test]
+#[ignore = "requires exact upstream Batteries fixture"]
+fn export_exact_lemmas_identity_probes() {
+    let source = std::fs::read_to_string(
+        "/var/lib/orb-node/work/caches/tl-warm/batteries/Batteries/Data/List/Lemmas.lean",
+    )
+    .unwrap();
+    let prefix = source.lines().take(537).collect::<Vec<_>>().join("\n");
+    let source = format!(
+        "{}\nend List\n",
+        prefix.replace(
+            "public import Batteries.Data.List.Basic",
+            "public import Lean\npublic import Batteries.Data.List.Basic"
+        )
+    );
+    let dump = "\nopen Lean Elab Command in\nrun_cmd do\n  let env ← getEnv\n  let some info := env.find? `List.getElem_filter_eq_getElem_getElem_findIdxs_sub | throwError \"missing declaration\"\n  logInfo m!\"{repr info.type}\"\n";
+    for (name, probe) in [
+        ("stubbed", build_file_identity_probe(&source).0),
+        ("real", source),
+    ] {
+        std::fs::write(
+            format!("/var/lib/orb-node/work/pr-b2-evidence/lemmas-{name}-probe.lean"),
+            format!("{probe}{dump}"),
+        )
+        .unwrap();
+    }
+}
+
 fn stub_identity_span(span: &CmdSpan<'_>) -> String {
     if let Some((header, inner, footer)) = split_mutual_block_subspans(span) {
         let inner_texts: Vec<String> = inner.iter().map(stub_identity_span).collect();

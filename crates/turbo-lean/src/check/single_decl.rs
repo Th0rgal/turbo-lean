@@ -618,11 +618,64 @@ theorem good : Witness.value = 7 := rfl
         let edited = check_file()?;
         assert_eq!(edited["shard_hits"], 1);
         assert_eq!(edited["shard_misses"], 1);
+        let edited_source = fs::read_to_string(&file)?;
+        let split = split_lean_source(&edited_source, &[]);
+        let shard = &split.shards[splitter::find_decl_shard_index(&split.shards, "good")?.unwrap()];
+        let key = compute_shard_key_with_args("leanprover/lean4:v4.35.0", shard, &[]);
+        let attested =
+            crate::check::confirm_decl_identity(&edited_source, shard, &scratch.path, &file)?;
+        let authority =
+            super::super::replay_authority(&format!("shard-v1:{key}:{}", split.interface_hash));
+        assert!(super::super::has_replay_authority(
+            &store,
+            &key,
+            "good",
+            &attested.kernel_type_hash,
+            &authority
+        ));
+        let entries = store
+            .get_cached_action_no_hit_bump(&key, "trusted")?
+            .unwrap();
+        let bytes = store.read_verified_blob(&entries[0].blob_hash).unwrap();
+        let forged = super::super::bind_replay_authority(&bytes, "forged-stale-authority")?;
+        store.invalidate_action_for_reattestation(&key)?;
+        store.batch_publish_theorem_shards(
+            "leanprover/lean4:v4.35.0",
+            "trusted",
+            &[(key.clone(), "good".into(), forged, 1)],
+        )?;
+        assert!(store.has_attested_decl_receipt(
+            &key,
+            "trusted",
+            "good",
+            &attested.kernel_type_hash
+        ));
+        assert!(!super::super::has_replay_authority(
+            &store,
+            &key,
+            "good",
+            &attested.kernel_type_hash,
+            &authority
+        ));
         fs::write(
             &file,
             source.replace("slow = fast := rfl", "slow = fast := sorry"),
         )?;
-        assert!(check_file().is_err());
+        assert!(crate::check::run_check_command_inner(
+            &mut store,
+            true,
+            true,
+            false,
+            false,
+            file.clone(),
+            None,
+            scratch.path.clone(),
+            None,
+            false,
+            None,
+            false,
+        )
+        .is_err());
         Ok(())
     }
 
