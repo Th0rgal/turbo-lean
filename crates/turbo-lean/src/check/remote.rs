@@ -230,6 +230,12 @@ pub fn try_stateless_remote_check(
         crate::kernel::resolve_kernel_selection_from_env(None)?,
         &detect_toolchain(&inferred_canon_dir),
     )?;
+    if matches!(
+        kernel_prov.kernel_engine,
+        crate::kernel::ResolvedKernelEngine::ConLeche | crate::kernel::ResolvedKernelEngine::Both
+    ) {
+        return Ok(false);
+    }
     if let Some(target_decl) = decl {
         return try_stateless_remote_single_decl_check(
             cache_root,

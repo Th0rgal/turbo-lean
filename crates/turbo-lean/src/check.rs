@@ -429,9 +429,10 @@ pub(crate) fn run_check_command_inner(
     let (canon_dir, mut resolved_file) = resolve_check_project_and_target(&file, &project_dir);
     crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
     let toolchain = detect_toolchain(&canon_dir);
-    let kernel_prov = crate::kernel::resolve_kernel_engine(
+    let kernel_prov = crate::kernel::resolve_kernel_engine_in_workspace(
         crate::kernel::resolve_kernel_selection_from_env(None)?,
         &toolchain,
+        emit_olean.then_some(canon_dir.as_path()),
     )?;
 
     if resolved_file.is_dir() && decl.is_none() {
@@ -871,6 +872,38 @@ pub(crate) fn run_check_command_inner(
                         exp_gh,
                         olean_path.display()
                     );
+                }
+                if matches!(
+                    kernel_prov.kernel_engine,
+                    crate::kernel::ResolvedKernelEngine::ConLeche
+                        | crate::kernel::ResolvedKernelEngine::Both
+                ) {
+                    let (lp, _ldp) = crate::module_builder::build_lean_search_path(&cfg, false);
+                    let search_paths: Vec<PathBuf> = std::env::split_paths(&lp)
+                        .filter(|p| !p.as_os_str().is_empty())
+                        .collect();
+                    let bin = crate::kernel::discover_con_leche_binary(Some(&canon_dir))?;
+                    let rep = crate::kernel::verify_olean_modules_with_con_leche(
+                        &bin,
+                        &search_paths,
+                        std::slice::from_ref(&mod_spec.module_name),
+                        &[],
+                        None,
+                        None,
+                    )?;
+                    match rep.verdict {
+                        crate::kernel::ConLecheVerdict::Accepted => {}
+                        crate::kernel::ConLecheVerdict::Rejected => anyhow::bail!(
+                            "`con-leche --verified` rejected `--emit-olean` module `{}` (exit 1): {}",
+                            mod_spec.module_name,
+                            rep.stderr.trim()
+                        ),
+                        crate::kernel::ConLecheVerdict::Declined => anyhow::bail!(
+                            "`con-leche --verified` declined `--emit-olean` module `{}` (exit 2): {}",
+                            mod_spec.module_name,
+                            rep.stderr.trim()
+                        ),
+                    }
                 }
                 let total_ms = t0.elapsed().as_millis() as i64;
                 if let Some(obj) = out_json.as_object_mut() {

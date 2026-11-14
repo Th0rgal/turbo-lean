@@ -7932,6 +7932,56 @@ fn certify_head_statement_modules_and_replay(
     all_mods.sort();
     all_mods.dedup();
 
+    let verify_head_snap_with_con_leche =
+        |snap_opt: &Option<crate::zygote::ClosureSnapshot>| -> Result<()> {
+            let sel = crate::kernel::resolve_kernel_selection_from_env(None)?;
+            let prov = crate::kernel::resolve_kernel_engine_in_workspace(
+                sel,
+                &cfg.toolchain,
+                Some(head_project),
+            )?;
+            if !matches!(
+                prov.kernel_engine,
+                crate::kernel::ResolvedKernelEngine::ConLeche
+                    | crate::kernel::ResolvedKernelEngine::Both
+            ) || all_mods.is_empty()
+            {
+                return Ok(());
+            }
+            let search_path_str = if let Some(ref snap) = snap_opt {
+                let (snap_lp, _) =
+                    crate::zygote::ensure_bound_audit_closure(snap, "con_leche_head_stmt")?;
+                snap_lp.to_string()
+            } else {
+                replay_lp.clone()
+            };
+            let search_paths: Vec<PathBuf> = std::env::split_paths(&search_path_str)
+                .filter(|p| !p.as_os_str().is_empty())
+                .collect();
+            let bin = crate::kernel::discover_con_leche_binary(Some(head_project))?;
+            let rep = crate::kernel::verify_olean_modules_with_con_leche(
+                &bin,
+                &search_paths,
+                &all_mods,
+                &[],
+                None,
+                None,
+            )?;
+            match rep.verdict {
+                crate::kernel::ConLecheVerdict::Accepted => Ok(()),
+                crate::kernel::ConLecheVerdict::Rejected => anyhow::bail!(
+                    "`con-leche --verified` rejected head statement `.olean` closure {:?} (exit 1): {}",
+                    all_mods,
+                    rep.stderr.trim()
+                ),
+                crate::kernel::ConLecheVerdict::Declined => anyhow::bail!(
+                    "`con-leche --verified` declined head statement `.olean` closure {:?} (exit 2): {}",
+                    all_mods,
+                    rep.stderr.trim()
+                ),
+            }
+        };
+
     if is_untrusted {
         let snap = crate::zygote::audit_compiled_modules_with_zygote_snapshot(
             store,
@@ -7945,6 +7995,7 @@ fn certify_head_statement_modules_and_replay(
         .context(
             "Head statement build `.olean` failed untrusted in-kernel soundness & replay audit",
         )?;
+        verify_head_snap_with_con_leche(&snap)?;
         Ok((None, snap))
     } else {
         let head_root_set: std::collections::HashSet<&str> =
@@ -8189,7 +8240,9 @@ fn certify_head_statement_modules_and_replay(
                             )
                             .is_ok()
                         {
-                            return Ok((Some(rebuilt_overlay_mods), Some(head_snap)));
+                            let head_snap_opt = Some(head_snap);
+                            verify_head_snap_with_con_leche(&head_snap_opt)?;
+                            return Ok((Some(rebuilt_overlay_mods), head_snap_opt));
                         }
                     }
                 }
@@ -8202,7 +8255,9 @@ fn certify_head_statement_modules_and_replay(
             &full_reqs,
             "Head statement build `.olean` failed in-kernel soundness & replay audit",
         )?;
-        Ok((None, Some(head_snap)))
+        let head_snap_opt = Some(head_snap);
+        verify_head_snap_with_con_leche(&head_snap_opt)?;
+        Ok((None, head_snap_opt))
     }
 }
 
@@ -9630,9 +9685,10 @@ pub fn run_pr_verify_command(
         .canonicalize()
         .unwrap_or_else(|_| project_dir.clone());
     let toolchain = detect_toolchain(&canon_dir);
-    let kernel_prov = crate::kernel::resolve_kernel_engine(
+    let kernel_prov = crate::kernel::resolve_kernel_engine_in_workspace(
         crate::kernel::resolve_kernel_selection_from_env(None)?,
         &toolchain,
+        Some(&canon_dir),
     )?;
     let is_untrusted = mode == "untrusted";
     if !is_untrusted

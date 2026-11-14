@@ -812,6 +812,156 @@ fn ci_verify_executes_con_leche_on_olean_closure_and_rejects_checkout_binary() {
         &evil_out,
         "ci-verify rejects TURBO_CON_LECHE_BIN inside checkout",
     );
+
+    // 4. `check --emit-olean --kernel con-leche` and `pr-verify --kernel con-leche`
+    //    execute `con-leche --verified --olean` on the materialized `.olean` closure,
+    //    fail closed on exit 1 / exit 2, and reject checkout-contained binaries.
+    let emit_ok = f
+        .cli("cl_emit_ok")
+        .env(kernel::CON_LECHE_BIN_ENV, &mock_bin)
+        .env("CI_CON_LECHE_CODE", "0")
+        .args([
+            "--json",
+            "check",
+            "--emit-olean",
+            "--kernel",
+            "con-leche",
+            repo.join("Demo.lean").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_ok(&emit_ok, "check --emit-olean --kernel con-leche");
+    let emit_json: Value = serde_json::from_slice(&emit_ok.stdout).unwrap();
+    assert_eq!(emit_json["kernel_engine"], "con-leche");
+    assert_eq!(emit_json["con_leche_rev"], kernel::PINNED_CON_LECHE_REV);
+    let logged_emit = fs::read_to_string(&args_log).unwrap();
+    assert!(
+        logged_emit.lines().any(|l| l == "--verified"),
+        "{logged_emit}"
+    );
+    assert!(logged_emit.lines().any(|l| l == "--olean"), "{logged_emit}");
+    assert!(logged_emit.lines().any(|l| l == "Demo"), "{logged_emit}");
+
+    let emit_fail = f
+        .cli("cl_emit_fail")
+        .env(kernel::CON_LECHE_BIN_ENV, &mock_bin)
+        .env("CI_CON_LECHE_CODE", "1")
+        .args([
+            "--json",
+            "check",
+            "--emit-olean",
+            "--kernel",
+            "con-leche",
+            repo.join("Demo.lean").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_err(&emit_fail, "check --emit-olean con-leche exit 1");
+
+    // Non-`--emit-olean` `check` still fails closed because `con-leche` verifies `.olean` closures.
+    let no_emit_fail = f
+        .cli("cl_no_emit_fail")
+        .env(kernel::CON_LECHE_BIN_ENV, &mock_bin)
+        .env("CI_CON_LECHE_CODE", "0")
+        .args([
+            "--json",
+            "check",
+            "--kernel",
+            "con-leche",
+            repo.join("Demo.lean").to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_err(
+        &no_emit_fail,
+        "check without --emit-olean rejects --kernel con-leche",
+    );
+
+    // `pr-verify` with `--kernel con-leche` and `--kernel both` verifies head statement `.olean` closure.
+    fs::write(
+        repo.join("Demo.lean"),
+        "theorem sample : 1 + 1 = 2 := by exact rfl\n",
+    )
+    .unwrap();
+    for (tag, req_engine) in [("pr_cl_only", "con-leche"), ("pr_cl_both", "both")] {
+        let pr_receipt = f.root.join(format!("pr-receipt-{tag}.json"));
+        let pr_ok = f
+            .cli(tag)
+            .env(kernel::CON_LECHE_BIN_ENV, &mock_bin)
+            .env("CI_CON_LECHE_CODE", "0")
+            .args([
+                "--json",
+                "pr-verify",
+                "--project-dir",
+                repo.to_str().unwrap(),
+                "--base",
+                "HEAD",
+                "--mode",
+                "trusted",
+                "--kernel",
+                req_engine,
+                "--receipt",
+                pr_receipt.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert_ok(&pr_ok, &format!("pr-verify --kernel {req_engine}"));
+        let pr_v: Value = serde_json::from_slice(&pr_ok.stdout).unwrap();
+        assert_eq!(pr_v["kernel_engine"], req_engine);
+        assert_eq!(pr_v["con_leche_rev"], kernel::PINNED_CON_LECHE_REV);
+        let pr_vr = f
+            .cli(tag)
+            .args(["--json", "verify-receipt", pr_receipt.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert_ok(&pr_vr, &format!("verify-receipt pr-verify {req_engine}"));
+    }
+
+    let pr_bad_receipt = f.root.join("pr-bad-receipt.json");
+    let pr_fail = f
+        .cli("pr_cl_fail")
+        .env(kernel::CON_LECHE_BIN_ENV, &mock_bin)
+        .env("CI_CON_LECHE_CODE", "1")
+        .args([
+            "--json",
+            "pr-verify",
+            "--project-dir",
+            repo.to_str().unwrap(),
+            "--base",
+            "HEAD",
+            "--mode",
+            "trusted",
+            "--kernel",
+            "con-leche",
+            "--receipt",
+            pr_bad_receipt.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_err(&pr_fail, "pr-verify con-leche exit 1");
+    assert!(!pr_bad_receipt.exists());
+
+    let pr_evil = f
+        .cli("pr_cl_evil")
+        .env(kernel::CON_LECHE_BIN_ENV, &in_repo_bin)
+        .args([
+            "--json",
+            "pr-verify",
+            "--project-dir",
+            repo.to_str().unwrap(),
+            "--base",
+            "HEAD",
+            "--mode",
+            "trusted",
+            "--kernel",
+            "con-leche",
+        ])
+        .output()
+        .unwrap();
+    assert_err(
+        &pr_evil,
+        "pr-verify rejects TURBO_CON_LECHE_BIN inside checkout",
+    );
 }
 
 #[cfg(unix)]
