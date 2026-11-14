@@ -614,6 +614,10 @@ theorem good : Witness.value = 7 := rfl
         };
         assert_eq!(check_file()?["status"], "file_verified");
         assert_eq!(check_file()?["status"], "all_shards_cached");
+        fs::write(&file, source.replace("True.intro", "by trivial"))?;
+        let edited = check_file()?;
+        assert_eq!(edited["shard_hits"], 1);
+        assert_eq!(edited["shard_misses"], 1);
         fs::write(
             &file,
             source.replace("slow = fast := rfl", "slow = fast := sorry"),
@@ -995,7 +999,6 @@ theorem good : Witness.value = 7 := rfl
             .unwrap_or_else(|e| e.into_inner());
         for suffix in [
             "unsafe def fast : Nat := 0\nattribute [implemented_by fast] good\n",
-            "@[csimp] theorem replacement : good = 0 := sorry\n",
             "theorem replacement : good = 0 := sorry\nattribute [csimp] replacement\n",
         ] {
             let src = format!("theorem good : 0 = 0 := rfl\n{suffix}");
@@ -1020,6 +1023,10 @@ theorem good : Witness.value = 7 := rfl
             );
         }
         let source = "theorem good : True := True.intro\ndef other : Nat := 0\n@[csimp] theorem replacement : other = other := sorry\n";
+        let split = split_lean_source(source, &[]);
+        let idx = splitter::find_decl_shard_index(&split.shards, "good")?.unwrap();
+        assert!(!audited_cone_source(source, &split.shards[idx])?.contains("replacement"));
+        let source = "def base : Nat := 0\ntheorem good : base = 0 := rfl\n@[csimp] theorem replacement : base = base := rfl\n";
         let split = split_lean_source(source, &[]);
         let idx = splitter::find_decl_shard_index(&split.shards, "good")?.unwrap();
         assert!(!audited_cone_source(source, &split.shards[idx])?.contains("replacement"));
@@ -1059,7 +1066,7 @@ theorem good : Witness.value = 7 := rfl
         )?;
         for source in [
             "import Missing\naxiom bad : True\ntheorem good : True := bad\n",
-            "import Missing\ntheorem good : True := True.intro\n@[csimp] theorem replacement : good = good := sorry\n",
+            "import Missing\ntheorem good : True := True.intro\ntheorem replacement : good = good := sorry\nattribute [csimp] replacement\n",
         ] {
             fs::write(scratch.path.join("Cone.lean"), source)?;
             let mut store = TurboStore::open(Some(
@@ -1092,7 +1099,9 @@ theorem good : Witness.value = 7 := rfl
         let scratch =
             PrivateScratchDir::create(&verified_private_temp_scratch_base()?, "cone_recover")?;
         let prefix = "theorem good : True := True.intro\n";
-        let full = format!("{prefix}@[csimp] theorem replacement : good = good := sorry\n");
+        let full = format!(
+            "{prefix}theorem replacement : good = good := sorry\nattribute [csimp] replacement\n"
+        );
         let file = scratch.path.join("Cone.lean");
         fs::write(&file, &full)?;
         let split = split_lean_source(&full, &[]);
@@ -2930,7 +2939,10 @@ pub(super) fn audited_cone_source(src: &str, shard: &splitter::TheoremShard) -> 
     Ok(cone)
 }
 
-fn build_cone_scoped_decl_audit_source(src: &str, shard: &splitter::TheoremShard) -> String {
+pub(super) fn build_cone_scoped_decl_audit_source(
+    src: &str,
+    shard: &splitter::TheoremShard,
+) -> String {
     let clean = splitter::strip_lean_comments(src);
     if clean.len() != src.len() {
         return src.to_string();
@@ -3075,7 +3087,6 @@ fn build_cone_scoped_decl_audit_source(src: &str, shard: &splitter::TheoremShard
                     | "norm_cast"
                     | "aesop"
                     | "default_instance"
-                    | "csimp"
                     | "implemented_by"
                     | "init"
                     | "builtin_init"
@@ -3114,9 +3125,7 @@ fn build_cone_scoped_decl_audit_source(src: &str, shard: &splitter::TheoremShard
         let explicit_type = cone_split_top_level(signature, &[":"]);
         let has_explicit_type = explicit_type.is_some();
         let result_type = explicit_type.map(|(_, result)| result).unwrap_or("");
-        let simp = attributes
-            .iter()
-            .any(|t| matches!(t.as_str(), "simp" | "csimp"));
+        let simp = attributes.iter().any(|t| t == "simp");
         let default_instance = attributes.iter().any(|t| t == "default_instance");
         let has_out_param = cone_extract_ident_tokens(signature)
             .iter()
@@ -3463,6 +3472,7 @@ fn build_cone_scoped_decl_audit_source(src: &str, shard: &splitter::TheoremShard
     }
     for (idx, node) in nodes.iter().enumerate() {
         if node.top_idx > max_top_idx
+            && node.attachment
             && node
                 .deps
                 .iter()
@@ -3846,6 +3856,61 @@ pub(super) fn check_single_decl(
         }
         let (env_vars, _) = resolve_lake_env(store, canon_dir)?;
         let lean_bin = resolve_lean_bin(canon_dir)?;
+        if cone_clean_for_certification {
+            let lean_path = resolve_remote_lean_path(canon_dir, Some(&env_vars));
+            let reply = crate::zygote::eval_with_zygote_pool_for_targets_and_stubs(
+                store,
+                toolchain,
+                &lean_path,
+                &env_vars,
+                Path::new(&lean_bin),
+                &cone_src,
+                &[shard.rooted_name()],
+                &[],
+                Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                &file_lean_args,
+            )?;
+            anyhow::ensure!(
+                reply.import_ok && reply.ok && !reply.crashed && !reply.timed_out,
+                "Cone kernel verification failed for `{target_decl}`: {:?}",
+                reply.messages
+            );
+            crate::zygote::verify_attested_decl_types(&reply.decl_types, &expected_type_pair)?;
+            let receipt = make_attested_shard_receipt_bytes(
+                target_decl,
+                &shard.prefix_env_hash,
+                &shard.stmt_hash,
+                &shard.proof_hash,
+                db::now_unix(),
+                Some(&attested.kernel_type_hash),
+            )?;
+            let receipt = super::bind_replay_authority(&receipt, &replay_authority)?;
+            store.batch_publish_theorem_shards(
+                toolchain,
+                "trusted",
+                &[(
+                    audited_source_key,
+                    target_decl.to_string(),
+                    receipt,
+                    t0.elapsed().as_millis() as i64,
+                )],
+            )?;
+            let mut result = serde_json::json!({
+                "status": "theorem_verified", "decl": target_decl, "shard_key": shard_key,
+                "elapsed_ms": t0.elapsed().as_millis(), "mode": "zygote_clean_cone",
+            });
+            insert_allow_sorry_fields(&mut result, false, false, &[]);
+            kernel_prov.insert_json_fields(&mut result);
+            super::insert_check_timings(&mut result, *t0);
+            if emit_stdout {
+                if json_output {
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    println!("[turbo-lean] VERIFIED `{target_decl}` (zygote clean cone)");
+                }
+            }
+            return Ok(result);
+        }
         let (output, report) = crate::zygote::run_audited_lean_shard_at_with_full_report(
             &store.root,
             &store.fast_staging_dir(),

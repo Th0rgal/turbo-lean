@@ -6293,6 +6293,16 @@ fn stub_identity_probe_src(src: &str) -> String {
     join_span_texts(&spans, &texts)
 }
 
+#[test]
+fn identity_probe_preserves_non_theorem_bodies() {
+    let source = "def value := 7\nabbrev alias := value\ninstance : Inhabited Nat := ⟨value⟩\nopaque hidden : Nat := value\ntheorem proof : value = 7 := rfl\n";
+    let probe = stub_identity_probe_src(source);
+    for declaration in source.lines().take(4) {
+        assert!(probe.contains(declaration), "{probe}");
+    }
+    assert!(!probe.contains(":= rfl"));
+}
+
 fn stub_identity_span(span: &CmdSpan<'_>) -> String {
     if let Some((header, inner, footer)) = split_mutual_block_subspans(span) {
         let inner_texts: Vec<String> = inner.iter().map(stub_identity_span).collect();
@@ -6305,7 +6315,9 @@ fn stub_identity_span(span: &CmdSpan<'_>) -> String {
             span.end_line,
         );
     }
-    if classify_decl_header(span.clean_text).is_some() {
+    if classify_decl_header(span.clean_text)
+        .is_some_and(|(kind, _)| matches!(kind.as_str(), "theorem" | "lemma"))
+    {
         if let Some((sig, proof)) = split_at_top_level_assign(span.clean_text) {
             return format_stubbed_decl_span(span.orig_text, sig, proof);
         }

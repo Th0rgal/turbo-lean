@@ -99,6 +99,15 @@ pub(super) fn check_single_file(
     }
     let hygiene_strictly_clean = split.hygiene.is_clean_for_certification();
     let replay_authority = super::replay_authority(src);
+    let shard_authorities: HashMap<_, _> = file_shard_keys
+        .iter()
+        .map(|key| {
+            (
+                key.clone(),
+                super::replay_authority(&format!("shard-v1:{key}:{}", split.interface_hash)),
+            )
+        })
+        .collect();
     let make_attested_shard_receipt_bytes =
         |decl: &str,
          prefix: &str,
@@ -114,7 +123,13 @@ pub(super) fn check_single_file(
                 time,
                 kernel_type,
             )?;
-            super::bind_replay_authority(&receipt, &replay_authority)
+            let shard = split
+                .shards
+                .iter()
+                .find(|shard| shard.decl_name() == decl)
+                .context("Missing shard for replay authority")?;
+            let key = compute_shard_key_with_args(toolchain, shard, &file_lean_args);
+            super::bind_replay_authority(&receipt, &shard_authorities[&key])
         };
     for (idx, shard) in split.shards.iter().enumerate() {
         let shard_key = file_shard_keys[idx].clone();
@@ -142,7 +157,7 @@ pub(super) fn check_single_file(
                     &shard_key,
                     shard.decl_name(),
                     kth,
-                    &replay_authority,
+                    &shard_authorities[&shard_key],
                 )
             });
         let client_attested = hygiene_strictly_clean
@@ -722,6 +737,76 @@ pub(super) fn check_single_file(
     }
 
     let requested_jobs = default_parallel_jobs(jobs);
+
+    if !allow_sorry
+        && hygiene_deferrable
+        && !hygiene_strictly_clean
+        && hits > 0
+        && misses == 1
+        && splitter::audit_hygiene(&splitter::strip_lean_comments(
+            &super::single_decl::build_cone_scoped_decl_audit_source(src, uncached_shards[0].1),
+        ))
+        .is_clean_for_certification()
+    {
+        let (key, shard) = &uncached_shards[0];
+        let result = super::run_check_command_inner(
+            store,
+            true,
+            json_output,
+            false,
+            false,
+            resolved_file.to_path_buf(),
+            Some(shard.decl_name().to_string()),
+            canon_dir.to_path_buf(),
+            jobs,
+            false,
+            None,
+            false,
+        )?;
+        anyhow::ensure!(
+            matches!(
+                result["status"].as_str(),
+                Some("theorem_verified" | "theorem_cache_hit")
+            ),
+            "Edited shard did not receive kernel-backed authority"
+        );
+        let kth = attested_kths
+            .get(key)
+            .context("Missing edited-shard statement identity")?;
+        let receipt = make_attested_shard_receipt_bytes(
+            shard.decl_name(),
+            &shard.prefix_env_hash,
+            &shard.stmt_hash,
+            &shard.proof_hash,
+            db::now_unix(),
+            Some(kth),
+        )?;
+        store.batch_publish_theorem_shards(
+            toolchain,
+            "trusted",
+            &[(
+                key.clone(),
+                shard.decl_name().to_string(),
+                receipt,
+                t0.elapsed().as_millis() as i64,
+            )],
+        )?;
+        let mut result = serde_json::json!({
+            "status": "file_verified", "mode": "edited_shard", "file": file.display().to_string(),
+            "shard_hits": hits, "shard_misses": misses, "elapsed_ms": t0.elapsed().as_millis(),
+        });
+        insert_allow_sorry_fields(&mut result, false, false, &[]);
+        kernel_prov.insert_json_fields(&mut result);
+        super::insert_check_timings(&mut result, *t0);
+        if emit_stdout {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&result)?);
+            } else {
+                println!("[turbo-lean] VERIFIED {} (edited shard)", file.display());
+            }
+        }
+        return Ok(result);
+    }
 
     if hygiene_strictly_clean && split.eligible_for_sharding && !uncached_shards.is_empty() {
         if let Some(remote_url) = remote_http {
@@ -1691,7 +1776,6 @@ pub(super) fn check_single_file(
                         now,
                         kth_opt,
                     )?;
-                    let receipt = super::bind_replay_authority(&receipt, &replay_authority)?;
                     let rel_path = format!("thm:{}", shard.decl_name());
                     store.publish_action_with_blob(
                         &lease,
