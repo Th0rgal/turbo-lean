@@ -208,6 +208,37 @@ pub fn probe_con_leche_support(_lean_toolchain: &str) -> Option<String> {
     None
 }
 
+pub fn probe_con_leche_support_for_selection(
+    requested: KernelEngineSelection,
+    lean_toolchain: &str,
+    workspace_root: Option<&Path>,
+) -> Option<String> {
+    if !matches!(
+        requested,
+        KernelEngineSelection::ConLeche | KernelEngineSelection::Both
+    ) {
+        return probe_con_leche_support(lean_toolchain);
+    }
+    if normalize_lean_toolchain(lean_toolchain) != PINNED_CON_LECHE_TOOLCHAIN {
+        return None;
+    }
+    let bin = discover_con_leche_binary(workspace_root).ok()?;
+    if let Some(proj) = workspace_root {
+        let canon_proj = proj.canonicalize().ok()?;
+        let checkout = canon_proj
+            .ancestors()
+            .find(|p| p.join(".git").exists())
+            .unwrap_or(&canon_proj);
+        if bin.starts_with(checkout) || bin.ancestors().any(|p| p.join(".git").exists()) {
+            let expected_bridge_bin = checkout.join(BRIDGE_CON_LECHE_BIN_REL).canonicalize().ok();
+            if expected_bridge_bin.as_ref() != Some(&bin) {
+                return None;
+            }
+        }
+    }
+    Some(PINNED_CON_LECHE_REV.to_string())
+}
+
 pub fn resolve_kernel_selection(
     cli_kernel: Option<&str>,
     caller_env_kernel: Option<&str>,
@@ -244,8 +275,20 @@ pub fn resolve_kernel_engine(
     requested: KernelEngineSelection,
     lean_toolchain: &str,
 ) -> Result<KernelProvenance> {
+    resolve_kernel_engine_in_workspace(requested, lean_toolchain, None)
+}
+
+pub fn resolve_kernel_engine_in_workspace(
+    requested: KernelEngineSelection,
+    lean_toolchain: &str,
+    workspace_root: Option<&Path>,
+) -> Result<KernelProvenance> {
     let lean_toolchain = normalize_lean_toolchain(lean_toolchain);
-    let probed_con_leche_rev = probe_con_leche_support(&lean_toolchain);
+    let probed_con_leche_rev = workspace_root
+        .and_then(|root| {
+            probe_con_leche_support_for_selection(requested, &lean_toolchain, Some(root))
+        })
+        .or_else(|| probe_con_leche_support(&lean_toolchain));
     let routed_tag =
         crate::c_abi::route_kernel_engine(requested.to_c_abi_tag(), probed_con_leche_rev.is_some());
     let Some(kernel_engine) = ResolvedKernelEngine::from_c_abi_tag(routed_tag) else {

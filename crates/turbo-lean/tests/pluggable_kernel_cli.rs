@@ -688,6 +688,134 @@ fn con_leche_exit_code_protocol_and_verified_cli_flags() {
 
 #[cfg(unix)]
 #[test]
+fn ci_verify_executes_con_leche_on_olean_closure_and_rejects_checkout_binary() {
+    let f = KernelTestFixture::new("ci_con_leche");
+    let repo = f.root.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let toolchain = include_str!("../../../lean/lean-toolchain").trim();
+
+    f.run_git(&repo, &["init", "-b", "main"]);
+    fs::write(repo.join("lean-toolchain"), format!("{toolchain}\n")).unwrap();
+    fs::write(
+        repo.join("lakefile.toml"),
+        "name = \"demo\"\ndefaultTargets = [\"Demo\"]\n[[lean_lib]]\nname = \"Demo\"\n",
+    )
+    .unwrap();
+    fs::write(
+        repo.join("Demo.lean"),
+        "theorem sample : 1 + 1 = 2 := rfl\n",
+    )
+    .unwrap();
+    f.run_git(&repo, &["add", "."]);
+    f.run_git(&repo, &["commit", "-m", "initial"]);
+
+    let args_log = f.root.join("ci-con-leche-args.log");
+    let mock_bin = f.root.join("external-con-leche.sh");
+    write_executable_script(
+        &mock_bin,
+        &format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"{}\"\ncase \"${{CI_CON_LECHE_CODE:-0}}\" in\n  0)\n    echo 'con-leche: accepted 7 declarations (--verified)'\n    exit 0\n    ;;\n  1)\n    echo 'con-leche: rejected: adversarial olean' >&2\n    exit 1\n    ;;\n  2)\n    echo 'con-leche: declined: unsupported feature' >&2\n    exit 2\n    ;;\nesac\n",
+            args_log.display()
+        ),
+    );
+
+    // 1. `ci-verify --kernel con-leche` and `--kernel both` execute `con-leche --verified --olean`
+    //    on the built `.olean` closure and emit valid v2 receipts with `con_leche_rev`.
+    for (tag, req_engine) in [("cl_only", "con-leche"), ("cl_both", "both")] {
+        let receipt_path = f.root.join(format!("receipt-{tag}.json"));
+        let out = f
+            .cli(tag)
+            .env(kernel::CON_LECHE_BIN_ENV, &mock_bin)
+            .env("CI_CON_LECHE_CODE", "0")
+            .args([
+                "--json",
+                "ci-verify",
+                "--project-dir",
+                repo.to_str().unwrap(),
+                "--mode",
+                "trusted",
+                "--kernel",
+                req_engine,
+                "--receipt",
+                receipt_path.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert_ok(&out, &format!("ci-verify --kernel {req_engine}"));
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["kernel_engine"], req_engine);
+        assert_eq!(v["kernel_requested"], req_engine);
+        assert_eq!(v["lean_toolchain"], toolchain);
+        assert_eq!(v["con_leche_rev"], kernel::PINNED_CON_LECHE_REV);
+
+        let logged = fs::read_to_string(&args_log).unwrap();
+        assert!(logged.lines().any(|l| l == "--verified"), "{logged}");
+        assert!(logged.lines().any(|l| l == "--olean"), "{logged}");
+        assert!(logged.lines().any(|l| l == "Demo"), "{logged}");
+
+        let vr = f
+            .cli(tag)
+            .args(["--json", "verify-receipt", receipt_path.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert_ok(&vr, &format!("verify-receipt for {req_engine}"));
+        let vr_json: Value = serde_json::from_slice(&vr.stdout).unwrap();
+        assert_eq!(vr_json["kernel_engine"], req_engine);
+        assert_eq!(vr_json["con_leche_rev"], kernel::PINNED_CON_LECHE_REV);
+    }
+
+    // 2. Exit 1 (Rejected) and Exit 2 (Declined) from `con-leche` fail closed and do NOT emit receipts.
+    for code in ["1", "2"] {
+        let bad_receipt = f.root.join(format!("bad-receipt-{code}.json"));
+        let bad_out = f
+            .cli(&format!("cl_fail_{code}"))
+            .env(kernel::CON_LECHE_BIN_ENV, &mock_bin)
+            .env("CI_CON_LECHE_CODE", code)
+            .args([
+                "--json",
+                "ci-verify",
+                "--project-dir",
+                repo.to_str().unwrap(),
+                "--mode",
+                "trusted",
+                "--kernel",
+                "con-leche",
+                "--receipt",
+                bad_receipt.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert_err(&bad_out, &format!("ci-verify con-leche exit {code}"));
+        assert!(!bad_receipt.exists());
+    }
+
+    // 3. A `TURBO_CON_LECHE_BIN` placed inside the project/checkout (outside the pinned bridge path)
+    //    is rejected fail-closed so an untrusted checkout cannot supply its own verifier binary.
+    let in_repo_bin = repo.join("evil-con-leche.sh");
+    write_executable_script(&in_repo_bin, "#!/usr/bin/env bash\nexit 0\n");
+    let evil_out = f
+        .cli("cl_evil")
+        .env(kernel::CON_LECHE_BIN_ENV, &in_repo_bin)
+        .args([
+            "--json",
+            "ci-verify",
+            "--project-dir",
+            repo.to_str().unwrap(),
+            "--mode",
+            "trusted",
+            "--kernel",
+            "con-leche",
+        ])
+        .output()
+        .unwrap();
+    assert_err(
+        &evil_out,
+        "ci-verify rejects TURBO_CON_LECHE_BIN inside checkout",
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn real_con_leche_binary_verifies_valid_and_rejects_adversarial_olean_if_built() {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()

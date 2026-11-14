@@ -4222,9 +4222,10 @@ pub fn run_ci_verify_command(
         "trusted".to_string()
     };
     let toolchain = detect_toolchain(&canon_dir);
-    let kernel_prov = crate::kernel::resolve_kernel_engine(
+    let kernel_prov = crate::kernel::resolve_kernel_engine_in_workspace(
         crate::kernel::resolve_kernel_selection_from_env(None)?,
         &toolchain,
+        Some(&canon_dir),
     )?;
 
     if is_untrusted && crate::module_builder::probe_bwrap_sandbox(&canon_dir).is_none() {
@@ -4457,6 +4458,52 @@ pub fn run_ci_verify_command(
         }
         Ok(())
     };
+    let verify_con_leche_materialized = || -> Result<()> {
+        if !matches!(
+            kernel_prov.kernel_engine,
+            crate::kernel::ResolvedKernelEngine::ConLeche
+                | crate::kernel::ResolvedKernelEngine::Both
+        ) {
+            return Ok(());
+        }
+        let mut root_mods: Vec<String> = ci_dag
+            .nodes
+            .values()
+            .filter(|n| n.is_root_pkg)
+            .map(|n| n.module_name.clone())
+            .collect();
+        root_mods.sort();
+        root_mods.dedup();
+        if root_mods.is_empty() {
+            return Ok(());
+        }
+        let (lp, _ldp) = crate::module_builder::build_lean_search_path(&cfg, is_untrusted);
+        let search_paths: Vec<PathBuf> = std::env::split_paths(&lp)
+            .filter(|p| !p.as_os_str().is_empty())
+            .collect();
+        let bin = crate::kernel::discover_con_leche_binary(Some(&canon_dir))?;
+        let rep = crate::kernel::verify_olean_modules_with_con_leche(
+            &bin,
+            &search_paths,
+            &root_mods,
+            &[],
+            None,
+            None,
+        )?;
+        match rep.verdict {
+            crate::kernel::ConLecheVerdict::Accepted => Ok(()),
+            crate::kernel::ConLecheVerdict::Rejected => anyhow::bail!(
+                "`con-leche --verified` rejected `.olean` module closure {:?} (exit 1): {}",
+                root_mods,
+                rep.stderr.trim()
+            ),
+            crate::kernel::ConLecheVerdict::Declined => anyhow::bail!(
+                "`con-leche --verified` declined `.olean` module closure {:?} (exit 2): {}",
+                root_mods,
+                rep.stderr.trim()
+            ),
+        }
+    };
 
     let has_external_dep_build = crate::lake_build::has_out_of_tree_dep_build_dir(&canon_dir);
     let cached_outputs = if has_external_dep_build {
@@ -4471,6 +4518,7 @@ pub fn run_ci_verify_command(
         } else {
             ensure_project_and_imported_oleans_replayed_in_store(store, &canon_dir, &file_hashes)?;
         }
+        verify_con_leche_materialized()?;
         store.record_attestation(
             &action_key,
             "turbo-lean-ci-gate",
@@ -4509,6 +4557,7 @@ pub fn run_ci_verify_command(
                             &file_hashes,
                         )?;
                     }
+                    verify_con_leche_materialized()?;
                     store.record_attestation(
                         &action_key,
                         "turbo-lean-ci-gate",
@@ -4547,6 +4596,7 @@ pub fn run_ci_verify_command(
                     &file_hashes,
                 )?;
             }
+            verify_con_leche_materialized()?;
 
             let env_key = TurboStore::compute_lake_env_key(&canon_dir);
             let resolved_env = if is_untrusted {

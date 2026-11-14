@@ -200,4 +200,52 @@ theorem cas_proof_replay_sound (env : Env) (blob : List UInt8) (expectedTy prf :
           · contradiction
       | _ => simp [hty] at h_replay
 
+/-- Replay a pinned theorem statement (`spec : PinnedHeaderSpec`) and a distilled `LNIR_EXPR_V1`
+    CAS proof blob (`blob : List UInt8`) directly into a `ConLeche.Decl` inside `env`,
+    bypassing `Lean.Elab` while enforcing both `HeaderPin` anti-spoofing and `ConLeche` kernel
+    typechecking. -/
+def replayPinnedCASDecl (env : Env) (spec : PinnedHeaderSpec) (elaboratedTy : Expr)
+    (blob : List UInt8) : Option Decl :=
+  if verifyHeaderPin spec elaboratedTy then
+    match replayCASProofBlob env blob elaboratedTy with
+    | some prf =>
+      some { name := spec.declName, ty := elaboratedTy, val := prf, wfTag := true }
+    | none => none
+  else
+    none
+
+/-- Machine-checked soundness of `replayPinnedCASDecl` (`replayPinnedCASDecl_sound`, `0 sorryAx`):
+    any replayed declaration `d` satisfies `CICValid env d`, preserves `spec.pinnedTypeAst`
+    with zero constant shadowing, and decodes `d.val` from `blob`. -/
+theorem replayPinnedCASDecl_sound (env : Env) (spec : PinnedHeaderSpec) (elaboratedTy : Expr)
+    (blob : List UInt8) (d : Decl)
+    (h_rep : replayPinnedCASDecl env spec elaboratedTy blob = some d) :
+    d.name = spec.declName ∧
+    d.ty = spec.pinnedTypeAst ∧
+    checkNoShadowedConsts spec.globalConsts spec.boundNames d.ty = true ∧
+    parseExprV1 blob = some d.val ∧
+    CICValid env d := by
+  unfold replayPinnedCASDecl at h_rep
+  split at h_rep
+  · rename_i h_pin
+    cases h_cas : replayCASProofBlob env blob elaboratedTy with
+    | none => simp [h_cas] at h_rep
+    | some prf =>
+      simp only [h_cas, Option.some.injEq] at h_rep
+      subst h_rep
+      have ⟨heqTy, hnoShadow, _⟩ := header_pin_prevents_statement_spoofing spec elaboratedTy h_pin
+      have ⟨hparse, hHasType⟩ := cas_proof_replay_sound env blob elaboratedTy prf h_cas
+      unfold replayCASProofBlob at h_cas
+      rw [hparse] at h_cas
+      cases hty : inferType 64 env [] elaboratedTy with
+      | none => simp [hty] at h_cas
+      | some expSort =>
+        cases expSort with
+        | sort u =>
+          have hSort : HasType env [] elaboratedTy (.sort u) :=
+            inferType_sound 64 env [] elaboratedTy (.sort u) hty
+          exact ⟨rfl, heqTy, hnoShadow, hparse, ⟨rfl, ⟨u, hSort⟩, hHasType⟩⟩
+        | _ => simp [hty] at h_cas
+  · contradiction
+
 end TurboLean.ElabAudit
