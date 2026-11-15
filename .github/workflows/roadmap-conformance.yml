@@ -55,8 +55,6 @@ jobs:
           python3 scripts/check_con_leche_bridge_sync.py
           python3 scripts/check_sail_riscv_bridge_sync.py --self-test
           python3 scripts/check_sail_riscv_bridge_sync.py
-          python3 scripts/h1_lowering_inventory.py --self-test
-          python3 scripts/h1_lowering_inventory.py --check
           python3 scripts/run_target_ir_fuzz.py --self-test
           python3 sdk/accelerator-template/validate.py
       - id: plan

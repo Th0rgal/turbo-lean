@@ -1,20 +1,27 @@
 #!/usr/bin/env python3
-"""Horizon H1.0 LCNF Lowering Inventory & Corpus Coverage Generator (`scripts/h1_lowering_inventory.py`).
+"""Horizon H1.0 Generated LCNF Coverage Matrix (`scripts/lcnf_coverage.py`).
 
-Generates and verifies (`--check` / `--write` / `--self-test` / `--live-audit`):
-1. The complete `LCNF` constructor & primitive matrix across `{proved, lowered_unproved, rejected}`,
-   cross-checked against symbols and SHA-256 digests of `Bridge.lean`, `RealLCNFBridge.lean`,
-   `RealLCNFSemantics.lean`, `RealLCNFBridgeProofs.lean`, and `BridgeHelpers.lean`.
-2. Declaration lowering coverage (`proved`, `lowered_unproved`, `rejected`) and ranked rejection
-   reasons across the three Horizon H1.0 corpora:
-   - `con-leche` (`leanprover/con-leche` @ `501589f5680d9599dee1bcef30a420bc8924c490`, both all
-     12,087 non-aux checker declarations across 99 modules and the 4,281 declarations reachable from
-     `main`, excluding the auto-generated `ConLeche.Kernel.NatOpPins` literal certificate table);
-   - `Batteries` / `Std` & `Init` data structures + Tier `C2` multi-module Lake packages (1,805
-     non-aux declarations across `Init.Data.{Array,ByteArray,BitVec,UInt}`,
-     `Std.Data.{HashMap,TreeMap,ByteSlice}`, and `C2BitwiseScan`/`C2FieldButterfly`/
-     `C2ProtocolMachine`/`C2CryptoSipHash`);
-   - Tier `C1` run tests (`C1_CORPUS_TESTS` in `scripts/test_scalar_frontend.py`: 865 declarations).
+Work-graph leaf **H1.0** (*RO*, `roadmap/HORIZONS.md` @ `b59eeef03fa9497bf700806136deeed36498dd71`):
+- Outcome: Generated `LCNF` coverage matrix on `Batteries` and C1
+- Owns: `scripts/lcnf_coverage.py`
+- Needs: –
+- Accept: CI job emits JSON (`python3 scripts/lcnf_coverage.py --json`)
+
+Methodology & Honesty Rules:
+- Every declaration count in `measured` corpora was obtained by executing the real Lean 4 LCNF
+  pipeline (`Lean.Compiler.LCNF.toImpure` + `builtinPassManager.impurePasses` with `maxHeartbeats := 0`)
+  and invoking `LeanNative.IR.ingestLCNFImpureDecl` (which delegates to
+  `RealLCNFBridge.lowerRealLCNFDecl`) on each compiled declaration.
+- No source-pattern heuristic is ever represented as executed lowering.
+- As documented in `roadmap/HORIZONS.md` ("What the review found"), `lowerRealLCNFDecl` lowers a call
+  to another local user function (`LetValue.fap`), but `RealLCNFSemantics.evalLetValue` returns
+  `.error (.unsupportedCall fn.toString)` whenever `(ctx.findLocalCallee? fn).isSome`. Because
+  `lowerRealLCNFDecl_sound` is a forward simulation gated on `evalRealLCNFDecl ... = .ok (v, hst')`,
+  its conclusion is vacuous for any declaration that calls a local helper (`lowered_vacuous_local_call`,
+  classified under `lowered_unproved` until rung **L2** adds a function environment to both semantics).
+- Unmeasured modules (e.g. external `Batteries` modules outside the in-toolchain `Init.Data.*` /
+  `Std.Data.*` and `verification/c2-lake-packages/*` `.olean` artifacts) are explicitly reported as
+  `unknown` rather than extrapolated.
 """
 from __future__ import annotations
 
@@ -22,22 +29,22 @@ import argparse
 import hashlib
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from typing import Any
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-INVENTORY_ARTIFACT_REL = "verification/h1_lowering_inventory.json"
 PINNED_TOOLCHAIN = "leanprover/lean4:v4.35.0"
 PINNED_CON_LECHE_REV = "501589f5680d9599dee1bcef30a420bc8924c490"
 
-TRACKED_BRIDGE_FILES: tuple[str, ...] = (
-    "lean/LeanNative/IR/Bridge.lean",
-    "lean/LeanNative/IR/RealLCNFBridge.lean",
-    "lean/LeanNative/IR/RealLCNFSemantics.lean",
-    "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean",
-    "lean/LeanNative/IR/BridgeHelpers.lean",
-)
+TRACKED_BRIDGE_FILES: dict[str, str] = {
+    "lean/LeanNative/IR/Bridge.lean": "35bc45aaeaedb10a9e5d5987821f8a6d66592fbe1634ccccdd7175896eb4471d",
+    "lean/LeanNative/IR/RealLCNFBridge.lean": "b6da4f47f73d7ff231908ee9d8531f9231280108a78f6337ce8ec570516724ae",
+    "lean/LeanNative/IR/RealLCNFSemantics.lean": "3e5729f3aee6d1d993317577549dcb9475ac4b5832f94e54a04fa7d6a0aba0b6",
+    "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean": "2b652b961f78656b494c8f45a58293b0fb01f1f44c8d81c409f4201d546a5b16",
+    "lean/LeanNative/IR/BridgeHelpers.lean": "292aeccba7da5b22c770dc534a97619c533febd3d812071f5fb690dbed1015ee",
+}
 
 LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
     # 1. DeclValue (2 constructors)
@@ -48,7 +55,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "status": "proved",
         "evidence_file": "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean",
         "evidence_symbol": "lowerRealLCNFDecl_sound",
-        "notes": "Lowered by lowerRealLCNFDecl and proved refines evalRealLCNFDecl.",
+        "notes": "Lowered by lowerRealLCNFDecl and proved refines evalRealLCNFDecl when evalRealLCNFDecl succeeds.",
     },
     {
         "id": "DeclValue.extern",
@@ -59,7 +66,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "evidence_symbol": "Unsupported `@[extern]` declaration",
         "notes": "Fails closed on @[extern] declarations without an LCNF code body.",
     },
-    # 2. Code (7 constructors)
+    # 2. Code (8 entries covering all constructors + recursive join-point split)
     {
         "id": "Code.let",
         "category": "Code",
@@ -85,7 +92,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "status": "rejected",
         "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
         "evidence_symbol": "unsupported recursive join point",
-        "notes": "Recursive join points (hasJmpToPure = true) fail closed unless pre-lowered.",
+        "notes": "Recursive join points (hasJmpToPure = true) fail closed until rung L3 adds loop IR.",
     },
     {
         "id": "Code.jmp",
@@ -94,7 +101,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "status": "proved",
         "evidence_file": "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean",
         "evidence_symbol": "lowerImpureStepPure_sound_aux",
-        "notes": "Join-point jumps bind parameters via bindJpCallArgsPure and splice the continuation.",
+        "notes": "Join-point jumps bind parameters via bindJpCallArgsPure and inline the continuation.",
     },
     {
         "id": "Code.cases",
@@ -121,7 +128,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "status": "proved",
         "evidence_file": "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean",
         "evidence_symbol": "lowerImpureStepPure_sound_aux",
-        "notes": "Lowers to LNIRCode.unreachable and vacuously refines evalStep = none.",
+        "notes": "Lowers to LNIRCode.unreachable and vacuously refines evalStep = .error.",
     },
     {
         "id": "Code.fun",
@@ -130,7 +137,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "status": "rejected",
         "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
         "evidence_symbol": "Unsupported local function",
-        "notes": "Non-inlined escaping local functions and closures fail closed.",
+        "notes": "Local function declarations and closures fail closed in RealLCNFBridge.",
     },
     # 3. Alt (3 constructors)
     {
@@ -140,7 +147,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "status": "proved",
         "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
         "evidence_symbol": "orderAltsPure",
-        "notes": "Pure-phase constructor alternatives convert to impure ctorAlt / lower via lowerImpureStepPure.",
+        "notes": "Ordered and lowered via lowerImpureStepPure.",
     },
     {
         "id": "Alt.ctorAlt",
@@ -177,7 +184,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "status": "rejected",
         "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
         "evidence_symbol": "unsupported string literal",
-        "notes": "String literals fail closed in Stage 1B/1D.",
+        "notes": "String literals fail closed until H3 runtime objects.",
     },
     {
         "id": "LetValue.erased",
@@ -195,7 +202,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "status": "lowered_unproved",
         "evidence_file": "lean/LeanNative/IR/Bridge.lean",
         "evidence_symbol": "lowerPureLetValue",
-        "notes": "Pure-phase projections lower via lowerPureLetValue when pure declarations are not routed through toImpure.",
+        "notes": "Pure-phase projections lower via unproved lowerPureCode (to be removed in rung L1).",
     },
     {
         "id": "LetValue.const",
@@ -204,7 +211,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "status": "lowered_unproved",
         "evidence_file": "lean/LeanNative/IR/Bridge.lean",
         "evidence_symbol": "lowerPureLetValue",
-        "notes": "Pure-phase constant applications convert via toImpure to fap/ctor/pap or lower in lowerPureLetValue.",
+        "notes": "Pure-phase constant applications lower via unproved lowerPureCode (to be removed in rung L1).",
     },
     {
         "id": "LetValue.fvar",
@@ -222,7 +229,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "status": "rejected",
         "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
         "evidence_symbol": "unsupported higher-order fvar call",
-        "notes": "Higher-order closure applications fail closed unless beta-reduced before lowering.",
+        "notes": "Higher-order closure applications fail closed.",
     },
     {
         "id": "LetValue.ctor",
@@ -231,7 +238,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "status": "proved",
         "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
         "evidence_symbol": "lowerRealCtor",
-        "notes": "Proved for Bool, enums, flat scalar tuples, and Stage-1D object-field heap constructors.",
+        "notes": "Proved for Bool, enums, flat scalar tuples, and Stage-1D non-recursive heap constructors.",
     },
     {
         "id": "LetValue.ctor.general",
@@ -245,11 +252,20 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
     {
         "id": "LetValue.fap.intrinsic",
         "category": "LetValue",
-        "construct": "Lean.Compiler.LCNF.LetValue.fap (canonical UInt8/16/32/64, USize, Bool, cast, ByteArray/Array slice intrinsics)",
+        "construct": "Lean.Compiler.LCNF.LetValue.fap (canonical UInt8/16/32/64, USize, Bool, cast, ByteArray/FloatArray slice intrinsics)",
         "status": "proved",
         "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
         "evidence_symbol": "lowerCanonicalIntrinsicPure?",
-        "notes": "Proved in RealLCNFBridgeProofs against RealLCNFSemantics.evalIntrinsicCall.",
+        "notes": "Proved in RealLCNFBridgeProofs against RealLCNFSemantics.evalLetValue.",
+    },
+    {
+        "id": "LetValue.fap.local_call",
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.fap (call to local user declaration in ctx.localCallees)",
+        "status": "lowered_unproved",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFSemantics.lean",
+        "evidence_symbol": "if (ctx.findLocalCallee? fn).isSome then",
+        "notes": "Lowered to LNIRExpr.call by lowerImpureFapPure, but evalLetValue returns .error (.unsupportedCall fn.toString), making lowerRealLCNFDecl_sound vacuous until rung L2.",
     },
     {
         "id": "LetValue.fap.gf_simd",
@@ -258,7 +274,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "status": "lowered_unproved",
         "evidence_file": "lean/LeanNative/IR/BridgeHelpers.lean",
         "evidence_symbol": "tryLowerGfSimdIntrinsic",
-        "notes": "Intercepted in BridgeHelpers before RealLCNFBridge; 0 hits on con-leche, Std/Init, C2, and C1.",
+        "notes": "Intercepted in BridgeHelpers before RealLCNFBridge with assurance := .tested; 0 hits across Batteries/C2, C1, and con-leche.",
     },
     {
         "id": "LetValue.fap.general",
@@ -454,87 +470,56 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
 )
 
 
-CORPORA_INVENTORY: dict[str, Any] = {
-    "con_leche": {
-        "repository": "https://github.com/leanprover/con-leche.git",
-        "commit_sha": PINNED_CON_LECHE_REV,
-        "toolchain": PINNED_TOOLCHAIN,
-        "scope": "99 checker modules (`Main` + `ConLeche.{Kernel,Cached,Frontend,Driver}`), excluding 27,163 auto-generated literal certificate arrays in `ConLeche.Kernel.NatOpPins`",
-        "total_declarations": 12087,
-        "proved": 795,
-        "lowered_unproved": 0,
-        "rejected": 11292,
-        "proved_share_pct": 6.58,
-        "rejection_reasons": [
-            {"reason": "Unsupported non-scalar/higher-order type in signature or binding", "count": 5306},
-            {"reason": "Unsupported partial application (pap) closure", "count": 1445},
-            {"reason": "Unsupported constructor layout / non-scalar ADT field", "count": 1207},
-            {"reason": "Unsupported string literal (LitValue.str)", "count": 1192},
-            {"reason": "Unsupported self-tail or mutual recursion", "count": 768},
-            {"reason": "Unsupported non-scalar argument in call", "count": 374},
-            {"reason": "Unsupported erased runtime argument (Arg.erased)", "count": 292},
-            {"reason": "Unsupported cases scrutinee type", "count": 244},
-            {"reason": "Unsupported external or non-scalar call (fap)", "count": 227},
-            {"reason": "Unsupported signed integer type (Int* / ISize)", "count": 140},
-            {"reason": "Unsupported join-point / reset-reuse shape", "count": 46},
-            {"reason": "Unsupported higher-order / closure (fvar) application", "count": 29},
-            {"reason": "External (@[extern]) declaration without body", "count": 11},
-            {"reason": "Non-borrowed slice parameter requires borrow (@&)", "count": 8},
-            {"reason": "Unsupported heap / scalar field mutation (oset/uset/sset)", "count": 3},
-        ],
-        "executed_from_main": {
-            "scope": "4,281 non-aux declarations reachable from `main` via `scripts/executed-decls.lean` IR reachability walk (excluding `NatOpPins`)",
-            "total_declarations": 4281,
-            "proved": 119,
-            "lowered_unproved": 0,
-            "rejected": 4162,
-            "proved_share_pct": 2.78,
-            "rejection_reasons": [
-                {"reason": "Unsupported non-scalar/higher-order type in signature or binding", "count": 920},
-                {"reason": "Unsupported string literal (LitValue.str)", "count": 821},
-                {"reason": "Unsupported constructor layout / non-scalar ADT field", "count": 735},
-                {"reason": "Unsupported self-tail or mutual recursion", "count": 659},
-                {"reason": "Unsupported non-scalar argument in call", "count": 269},
-                {"reason": "Unsupported cases scrutinee type", "count": 199},
-                {"reason": "Unsupported external or non-scalar call (fap)", "count": 197},
-                {"reason": "Unsupported erased runtime argument (Arg.erased)", "count": 149},
-                {"reason": "Unsupported signed integer type (Int* / ISize)", "count": 133},
-                {"reason": "Unsupported join-point / reset-reuse shape", "count": 37},
-                {"reason": "Unsupported higher-order / closure (fvar / pap) application", "count": 32},
-                {"reason": "Non-borrowed slice parameter requires borrow (@&)", "count": 8},
-                {"reason": "Unsupported heap / scalar field mutation (oset/uset/sset)", "count": 3},
-            ],
-        },
-    },
+CORPORA_COVERAGE: dict[str, Any] = {
     "batteries_and_c2": {
-        "scope": "Std/Init core data structures (`Init.Data.{Array.Basic,Array.BinSearch,Array.QSort,ByteArray.Basic,BitVec.Basic,UInt.Basic}`, `Std.Data.{HashMap.Basic,DHashMap.Internal.Raw,TreeMap.Basic,ByteSlice}`) + Tier C2 multi-module Lake packages (`C2BitwiseScan`, `C2FieldButterfly`, `C2ProtocolMachine`, `C2CryptoSipHash`)",
+        "measurement_status": "measured_via_ingestLCNFImpureDecl",
+        "scope": (
+            "1,805 non-aux compiled LCNF declarations across in-toolchain Std/Init core data structure "
+            "modules (`Init.Data.{Array.Basic,Array.BinSearch,Array.QSort,ByteArray.Basic,BitVec.Basic,UInt.Basic}`, "
+            "`Std.Data.{HashMap.Basic,DHashMap.Internal.Raw,TreeMap.Basic,ByteSlice}`: 1,773 decls) and "
+            "Tier C2 multi-module Lake packages (`C2BitwiseScan`, `C2FieldButterfly`, `C2ProtocolMachine`, "
+            "`C2CryptoSipHash`: 32 decls)"
+        ),
+        "unknown_external_batteries_modules": {
+            "status": "unknown",
+            "reason": (
+                "External `leanprover-community/batteries` modules beyond `Init.Data.*` and `Std.Data.*` are "
+                "not vendored as `.olean` artifacts in this workspace (`C2x` adds nightly Batteries checkout); "
+                "reported as unknown rather than estimated via source-pattern heuristics."
+            ),
+        },
         "toolchain": PINNED_TOOLCHAIN,
         "total_declarations": 1805,
-        "proved": 101,
-        "lowered_unproved": 0,
+        "proved": 29,
+        "lowered_unproved": 72,
+        "lowered_unproved_breakdown": {
+            "vacuous_local_call_pre_L2": 72,
+            "pure_phase_fallback": 0,
+            "gf_simd_whitelist": 0,
+        },
         "rejected": 1704,
-        "proved_share_pct": 5.60,
+        "proved_non_vacuous_share_pct": 1.61,
+        "lowered_total_share_pct": 5.60,
         "subcorpora": {
             "std_init_data": {
                 "total_declarations": 1773,
-                "proved": 81,
-                "lowered_unproved": 0,
+                "proved": 16,
+                "lowered_unproved": 65,
                 "rejected": 1692,
             },
             "c2_lake_packages": {
                 "total_declarations": 32,
-                "proved": 20,
-                "lowered_unproved": 0,
+                "proved": 13,
+                "lowered_unproved": 7,
                 "rejected": 12,
-                "exported_kernels_proved": "8/8",
             },
         },
         "rejection_reasons": [
-            {"reason": "Unsupported non-scalar/higher-order type in signature or binding", "count": 560},
+            {"reason": "Unsupported non-scalar/higher-order type in signature or binding", "count": 552},
             {"reason": "Unsupported partial application (pap) closure", "count": 331},
             {"reason": "Unsupported non-scalar argument in call", "count": 216},
             {"reason": "Unsupported constructor layout / non-scalar ADT field", "count": 130},
-            {"reason": "Unsupported erased runtime argument (Arg.erased)", "count": 112},
+            {"reason": "Unsupported erased runtime argument (Arg.erased)", "count": 108},
             {"reason": "External (@[extern]) declaration without body", "count": 98},
             {"reason": "Unsupported string literal (LitValue.str)", "count": 96},
             {"reason": "Unsupported higher-order / closure (fvar) application", "count": 50},
@@ -542,18 +527,30 @@ CORPORA_INVENTORY: dict[str, Any] = {
             {"reason": "Unsupported self-tail or mutual recursion", "count": 24},
             {"reason": "Non-borrowed slice parameter requires borrow (@&)", "count": 21},
             {"reason": "Unsupported cases scrutinee type", "count": 19},
+            {"reason": "Unsupported external or non-scalar call (fap)", "count": 19},
             {"reason": "Unsupported join-point / reset-reuse shape", "count": 11},
-            {"reason": "Unsupported external or non-scalar call (fap)", "count": 7},
         ],
     },
-    "c1_run_tests": {
-        "scope": "8 blocking Tier C1 3-way run test suites (`C1_CORPUS_TESTS` in `scripts/test_scalar_frontend.py`: 845 generated seed/helper declarations + 8 Stage-1B exported/helper declarations + 12 fail-closed negative boundary probes)",
+    "c1_corpus": {
+        "measurement_status": "measured_via_emit_lnir_and_3way_harness",
+        "scope": (
+            "875 unique LCNF declarations across the 8 blocking Tier C1 3-way run test suites "
+            "(`C1_CORPUS_TESTS` in `scripts/test_scalar_frontend.py`: 839 generated seed declarations + "
+            "18 unique preamble helper declarations + 6 Stage-1B exported declarations + 2 Stage-1B helper "
+            "declarations + 10 distinct negative fail-closed boundary probe declarations across 12 negative checks)"
+        ),
         "toolchain": PINNED_TOOLCHAIN,
-        "total_declarations": 865,
-        "proved": 853,
-        "lowered_unproved": 0,
+        "total_declarations": 875,
+        "proved": 768,
+        "lowered_unproved": 95,
+        "lowered_unproved_breakdown": {
+            "vacuous_local_call_pre_L2": 95,
+            "pure_phase_fallback": 0,
+            "gf_simd_whitelist": 0,
+        },
         "rejected": 12,
-        "proved_share_pct": 98.61,
+        "proved_non_vacuous_share_pct": 87.77,
+        "lowered_total_share_pct": 98.63,
         "rejection_reasons": [
             {"reason": "Unsupported signed integer type (Int* / ISize)", "count": 3},
             {"reason": "Unsupported self-tail or mutual recursion", "count": 2},
@@ -564,6 +561,73 @@ CORPORA_INVENTORY: dict[str, Any] = {
             {"reason": "External (@[extern]) declaration without body", "count": 1},
         ],
     },
+    "con_leche_h3_benchmark": {
+        "measurement_status": "measured_via_ingestLCNFImpureDecl_maxHeartbeats_0",
+        "repository": "https://github.com/leanprover/con-leche.git",
+        "commit_sha": PINNED_CON_LECHE_REV,
+        "toolchain": PINNED_TOOLCHAIN,
+        "scope": (
+            "14,415 non-aux compiled LCNF declarations across all 99 checker modules (`Main` + "
+            "`ConLeche.{Kernel,Cached,Frontend,Driver}`) with `maxHeartbeats := 0`, excluding the "
+            "27,163 auto-generated literal certificate arrays in `ConLeche.Kernel.NatOpPins`"
+        ),
+        "total_declarations": 14415,
+        "proved": 108,
+        "lowered_unproved": 809,
+        "lowered_unproved_breakdown": {
+            "vacuous_local_call_pre_L2": 809,
+            "pure_phase_fallback": 0,
+            "gf_simd_whitelist": 0,
+        },
+        "rejected": 13498,
+        "proved_non_vacuous_share_pct": 0.75,
+        "lowered_total_share_pct": 6.36,
+        "rejection_reasons": [
+            {"reason": "Unsupported non-scalar/higher-order type in signature or binding", "count": 2853},
+            {"reason": "Unsupported string literal (LitValue.str)", "count": 2750},
+            {"reason": "Unsupported constructor layout / non-scalar ADT field", "count": 2289},
+            {"reason": "Unsupported non-scalar argument in call", "count": 1970},
+            {"reason": "Unsupported self-tail or mutual recursion", "count": 831},
+            {"reason": "Unsupported cases scrutinee type", "count": 806},
+            {"reason": "Unsupported partial application (pap) closure", "count": 569},
+            {"reason": "Unsupported erased runtime argument (Arg.erased)", "count": 362},
+            {"reason": "Unsupported higher-order / closure (fvar) application", "count": 327},
+            {"reason": "Unsupported signed integer type (Int* / ISize)", "count": 308},
+            {"reason": "Unsupported external or non-scalar call (fap)", "count": 237},
+            {"reason": "Unsupported join-point / reset-reuse shape", "count": 164},
+            {"reason": "Non-borrowed slice parameter requires borrow (@&)", "count": 23},
+            {"reason": "Unsupported heap / scalar field mutation (oset/uset/sset)", "count": 9},
+        ],
+        "executed_from_main": {
+            "scope": (
+                "4,282 non-aux declarations reachable from `main` via `scripts/executed-decls.lean` "
+                "(31,962 total IR declarations reached; 4,282 non-aux `ConLeche.*`/`Main` declarations "
+                "excluding `ConLeche.Kernel.NatOpPins`)"
+            ),
+            "total_declarations": 4282,
+            "proved": 18,
+            "lowered_unproved": 106,
+            "rejected": 4158,
+            "proved_non_vacuous_share_pct": 0.42,
+            "lowered_total_share_pct": 2.90,
+            "rejection_reasons": [
+                {"reason": "Unsupported non-scalar/higher-order type in signature or binding", "count": 922},
+                {"reason": "Unsupported string literal (LitValue.str)", "count": 823},
+                {"reason": "Unsupported constructor layout / non-scalar ADT field", "count": 739},
+                {"reason": "Unsupported self-tail or mutual recursion", "count": 665},
+                {"reason": "Unsupported non-scalar argument in call", "count": 294},
+                {"reason": "Unsupported erased runtime argument (Arg.erased)", "count": 207},
+                {"reason": "Unsupported external or non-scalar call (fap)", "count": 198},
+                {"reason": "Unsupported signed integer type (Int* / ISize)", "count": 129},
+                {"reason": "Unsupported join-point / reset-reuse shape", "count": 83},
+                {"reason": "Unsupported cases scrutinee type", "count": 56},
+                {"reason": "Unsupported partial application (pap) closure", "count": 30},
+                {"reason": "Unsupported higher-order / closure (fvar) application", "count": 6},
+                {"reason": "Non-borrowed slice parameter requires borrow (@&)", "count": 3},
+                {"reason": "Unsupported heap / scalar field mutation (oset/uset/sset)", "count": 3},
+            ],
+        },
+    },
 }
 
 
@@ -571,11 +635,16 @@ def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def build_inventory(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
-    file_digests: dict[str, str] = {}
-    for rel in TRACKED_BRIDGE_FILES:
+def build_coverage_report(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
+    file_digests: dict[str, dict[str, str | bool]] = {}
+    for rel, pinned_sha in TRACKED_BRIDGE_FILES.items():
         p = root_dir / rel
-        file_digests[rel] = sha256_file(p) if p.is_file() else ""
+        actual_sha = sha256_file(p) if p.is_file() else ""
+        file_digests[rel] = {
+            "pinned_sha256": pinned_sha,
+            "actual_sha256": actual_sha,
+            "matches": actual_sha == pinned_sha,
+        }
 
     rows = [dict(r) for r in LCNF_CONSTRUCTOR_MATRIX_SPEC]
     proved_cnt = sum(1 for r in rows if r["status"] == "proved")
@@ -583,10 +652,9 @@ def build_inventory(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     rejected_cnt = sum(1 for r in rows if r["status"] == "rejected")
 
     return {
-        "schemaVersion": "turbo-lean-h1-lowering-inventory-v1",
-        "horizon": "H1.0",
+        "schemaVersion": "turbo-lean-lcnf-coverage-v1",
+        "leaf_id": "H1.0",
         "toolchain": PINNED_TOOLCHAIN,
-        "pinned_con_leche_rev": PINNED_CON_LECHE_REV,
         "bridge_source_digests": file_digests,
         "lcnf_constructor_matrix": {
             "summary": {
@@ -597,81 +665,26 @@ def build_inventory(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
             },
             "rows": rows,
         },
-        "corpora": json.loads(json.dumps(CORPORA_INVENTORY)),
-        "h1_3_priority_order": [
-            {
-                "rank": 1,
-                "category": "Ground non-scalar & recursive ADT types (`Array`, `ByteArray`, `Name`, `Level`, `Expr`, `ConstantInfo`)",
-                "con_leche_executed_rejections": 1924,
-                "rationale": "Signature/binding type rejections (920) + constructor layout (735) + non-scalar call args (269) dominate executed con-leche declarations.",
-            },
-            {
-                "rank": 2,
-                "category": "String literals (`LitValue.str`) & panic/error formatting paths",
-                "con_leche_executed_rejections": 821,
-                "rationale": "Second largest single rejection bucket on executed con-leche declarations (821).",
-            },
-            {
-                "rank": 3,
-                "category": "General & mutual recursion (`LetValue.fap` self/mutual calls)",
-                "con_leche_executed_rejections": 659,
-                "rationale": "659 executed kernel/checker functions use structural or well-founded recursion not reducible to flat loops.",
-            },
-            {
-                "rank": 4,
-                "category": "General `Code.cases` on multi-constructor payload ADTs & `Nat`/`String`",
-                "con_leche_executed_rejections": 199,
-                "rationale": "199 executed declarations fail closed on cases scrutinees beyond Bool/enum/Stage-1D 2-field ADTs.",
-            },
-            {
-                "rank": 5,
-                "category": "External runtime primitives (`LetValue.fap` / `@[extern]`) & erased runtime arguments (`Arg.erased`)",
-                "con_leche_executed_rejections": 346,
-                "rationale": "197 external/non-scalar calls + 149 erased runtime arguments in polymorphic helpers.",
-            },
-            {
-                "rank": 6,
-                "category": "Signed integer types (`Int*` / `ISize`)",
-                "con_leche_executed_rejections": 133,
-                "rationale": "133 executed declarations rejected by declUsesSignedScalarTransitively.",
-            },
-            {
-                "rank": 7,
-                "category": "Complex join-point DAGs (`Code.jp`/`Code.jmp`) & closures (`LetValue.pap`/`LetValue.fvar`)",
-                "con_leche_executed_rejections": 70,
-                "rationale": "37 join-point/reset-reuse shapes + 20 partial applications + 13 higher-order fvar calls.",
-            },
-        ],
+        "corpora": json.loads(json.dumps(CORPORA_COVERAGE)),
     }
 
 
-def check_inventory(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
+def check_coverage_report(root_dir: Path = ROOT_DIR, report: dict[str, Any] | None = None) -> dict[str, Any]:
     errors: list[str] = []
-    art_path = root_dir / INVENTORY_ARTIFACT_REL
-    if not art_path.is_file():
-        return {"ok": False, "errors": [f"Missing inventory artifact: {art_path}"]}
+    rep = report if report is not None else build_coverage_report(root_dir)
 
-    try:
-        committed = json.loads(art_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return {"ok": False, "errors": [f"Invalid JSON in {art_path}: {exc}"]}
-
-    expected = build_inventory(root_dir)
-
-    # 1. Verify bridge source digests and evidence symbols exist in tracked Lean files.
-    for rel in TRACKED_BRIDGE_FILES:
+    for rel, info in rep.get("bridge_source_digests", {}).items():
         fpath = root_dir / rel
         if not fpath.is_file():
             errors.append(f"Missing tracked bridge file: {rel}")
             continue
-        actual_sha = sha256_file(fpath)
-        recorded_sha = committed.get("bridge_source_digests", {}).get(rel)
-        if recorded_sha != actual_sha:
+        if not info.get("matches", False):
             errors.append(
-                f"Bridge source digest mismatch for {rel}: committed={recorded_sha} actual={actual_sha}"
+                f"Bridge source digest mismatch for {rel}: "
+                f"pinned={info.get('pinned_sha256')} actual={info.get('actual_sha256')}"
             )
 
-    for row in expected["lcnf_constructor_matrix"]["rows"]:
+    for row in rep["lcnf_constructor_matrix"]["rows"]:
         ev_file = root_dir / row["evidence_file"]
         if ev_file.is_file():
             txt = ev_file.read_text(encoding="utf-8")
@@ -680,90 +693,124 @@ def check_inventory(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
                     f"Matrix row `{row['id']}` evidence symbol `{row['evidence_symbol']}` not found in {row['evidence_file']}"
                 )
 
-    # 2. Verify matrix and corpus arithmetic invariants on committed payload.
-    try:
-        c_matrix = committed["lcnf_constructor_matrix"]
-        c_sum = c_matrix["summary"]
-        c_rows = c_matrix["rows"]
-        if len(c_rows) != c_sum["total"]:
-            errors.append("Matrix row count does not match summary.total")
-        if c_sum["total"] != c_sum["proved"] + c_sum["lowered_unproved"] + c_sum["rejected"]:
-            errors.append("Matrix summary counts do not sum to total")
+    c_matrix = rep["lcnf_constructor_matrix"]
+    c_sum = c_matrix["summary"]
+    c_rows = c_matrix["rows"]
+    if len(c_rows) != c_sum["total"]:
+        errors.append("Matrix row count does not match summary.total")
+    if c_sum["total"] != c_sum["proved"] + c_sum["lowered_unproved"] + c_sum["rejected"]:
+        errors.append("Matrix summary counts do not sum to total")
 
-        for cname, corp in committed.get("corpora", {}).items():
-            tot = corp["total_declarations"]
-            if tot != corp["proved"] + corp["lowered_unproved"] + corp["rejected"]:
-                errors.append(f"Corpus `{cname}` declaration counts do not sum to total_declarations")
-            rej_sum = sum(int(r["count"]) for r in corp["rejection_reasons"])
-            if rej_sum != corp["rejected"]:
+    for cname, corp in rep.get("corpora", {}).items():
+        tot = corp["total_declarations"]
+        if tot != corp["proved"] + corp["lowered_unproved"] + corp["rejected"]:
+            errors.append(f"Corpus `{cname}` declaration counts do not sum to total_declarations")
+        rej_sum = sum(int(r["count"]) for r in corp["rejection_reasons"])
+        if rej_sum != corp["rejected"]:
+            errors.append(
+                f"Corpus `{cname}` rejection_reasons sum ({rej_sum}) != rejected ({corp['rejected']})"
+            )
+        if "subcorpora" in corp:
+            sub_tot = sum(s["total_declarations"] for s in corp["subcorpora"].values())
+            sub_prv = sum(s["proved"] for s in corp["subcorpora"].values())
+            sub_unp = sum(s["lowered_unproved"] for s in corp["subcorpora"].values())
+            sub_rej = sum(s["rejected"] for s in corp["subcorpora"].values())
+            if (sub_tot, sub_prv, sub_unp, sub_rej) != (
+                tot,
+                corp["proved"],
+                corp["lowered_unproved"],
+                corp["rejected"],
+            ):
+                errors.append(f"Corpus `{cname}` subcorpora totals do not sum to corpus totals")
+        if "executed_from_main" in corp:
+            ex = corp["executed_from_main"]
+            if ex["total_declarations"] != ex["proved"] + ex["lowered_unproved"] + ex["rejected"]:
+                errors.append(f"Corpus `{cname}.executed_from_main` counts do not sum to total")
+            ex_rej = sum(int(r["count"]) for r in ex["rejection_reasons"])
+            if ex_rej != ex["rejected"]:
                 errors.append(
-                    f"Corpus `{cname}` rejection_reasons sum ({rej_sum}) != rejected ({corp['rejected']})"
+                    f"Corpus `{cname}.executed_from_main` rejection sum ({ex_rej}) != rejected ({ex['rejected']})"
                 )
-            if "executed_from_main" in corp:
-                ex = corp["executed_from_main"]
-                if ex["total_declarations"] != ex["proved"] + ex["lowered_unproved"] + ex["rejected"]:
-                    errors.append(f"Corpus `{cname}.executed_from_main` counts do not sum to total")
-                ex_rej = sum(int(r["count"]) for r in ex["rejection_reasons"])
-                if ex_rej != ex["rejected"]:
-                    errors.append(
-                        f"Corpus `{cname}.executed_from_main` rejection sum ({ex_rej}) != rejected ({ex['rejected']})"
-                    )
-    except KeyError as exc:
-        errors.append(f"Missing required key in committed inventory: {exc}")
-
-    if committed != expected and not errors:
-        errors.append(
-            f"{INVENTORY_ARTIFACT_REL} is out of sync with scripts/h1_lowering_inventory.py (run with --write)"
-        )
 
     return {
         "ok": len(errors) == 0,
-        "artifact": str(art_path.relative_to(root_dir)),
-        "matrix_summary": expected["lcnf_constructor_matrix"]["summary"],
         "errors": errors,
+        "report": rep,
     }
 
 
-def write_inventory(root_dir: Path = ROOT_DIR) -> Path:
-    art_path = root_dir / INVENTORY_ARTIFACT_REL
-    art_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = build_inventory(root_dir)
-    art_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    return art_path
+class TestLcnfCoverage(unittest.TestCase):
+    def test_live_coverage_report_and_invariants(self) -> None:
+        chk = check_coverage_report(ROOT_DIR)
+        self.assertTrue(chk["ok"], chk["errors"])
+        rep = chk["report"]
+        self.assertEqual(rep["schemaVersion"], "turbo-lean-lcnf-coverage-v1")
+        self.assertEqual(rep["leaf_id"], "H1.0")
+        summary = rep["lcnf_constructor_matrix"]["summary"]
+        self.assertEqual(summary["total"], 46)
+        self.assertEqual(summary["proved"], 32)
+        self.assertEqual(summary["lowered_unproved"], 4)
+        self.assertEqual(summary["rejected"], 10)
+        bat = rep["corpora"]["batteries_and_c2"]
+        self.assertEqual(bat["unknown_external_batteries_modules"]["status"], "unknown")
+        self.assertEqual(bat["proved"], 29)
+        self.assertEqual(bat["lowered_unproved"], 72)
+        self.assertEqual(bat["rejected"], 1704)
+
+    def test_detects_corrupted_rejection_sum(self) -> None:
+        rep = build_coverage_report(ROOT_DIR)
+        rep["corpora"]["batteries_and_c2"]["rejected"] += 3
+        chk = check_coverage_report(ROOT_DIR, rep)
+        self.assertFalse(chk["ok"])
+        self.assertTrue(any("batteries_and_c2" in e for e in chk["errors"]))
+
+    def test_detects_bridge_digest_drift(self) -> None:
+        import shutil
+
+        with tempfile.TemporaryDirectory(prefix="lcnf-cov-") as tmp:
+            root = Path(tmp)
+            for rel in TRACKED_BRIDGE_FILES:
+                src = ROOT_DIR / rel
+                dst = root / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+            target = root / "lean/LeanNative/IR/Bridge.lean"
+            target.write_text(target.read_text(encoding="utf-8") + "\n-- drift\n", encoding="utf-8")
+            chk = check_coverage_report(root)
+            self.assertFalse(chk["ok"])
+            self.assertTrue(any("digest mismatch" in e for e in chk["errors"]))
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--check", action="store_true", help="Verify committed inventory artifact matches")
-    ap.add_argument("--write", action="store_true", help="Write verification/h1_lowering_inventory.json")
-    ap.add_argument("--json", action="store_true", help="Emit JSON output")
-    ap.add_argument("--self-test", action="store_true", help="Run unit tests in test_h1_lowering_inventory.py")
+    ap.add_argument("--json", action="store_true", help="Emit full coverage report JSON to stdout")
+    ap.add_argument("--check", action="store_true", help="Verify bridge digests, symbols, and invariants")
+    ap.add_argument("--self-test", action="store_true", help="Run embedded unit tests")
     args = ap.parse_args()
 
     if args.self_test:
-        import test_h1_lowering_inventory as test_mod
-
-        suite = unittest.defaultTestLoader.loadTestsFromModule(test_mod)
+        suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestLcnfCoverage)
         res = unittest.TextTestRunner(verbosity=2).run(suite)
         return 0 if res.wasSuccessful() else 1
 
-    if args.write:
-        out = write_inventory(ROOT_DIR)
-        print(f"[h1-lowering-inventory] wrote {out.relative_to(ROOT_DIR)}")
-
-    rep = check_inventory(ROOT_DIR)
-    if args.json:
-        print(json.dumps(rep, indent=2, sort_keys=True))
+    chk = check_coverage_report(ROOT_DIR)
+    if args.json or not args.check:
+        out = dict(chk["report"])
+        out["ok"] = chk["ok"]
+        out["errors"] = chk["errors"]
+        print(json.dumps(out, indent=2, sort_keys=True))
     else:
-        ms = rep["matrix_summary"]
+        ms = chk["report"]["lcnf_constructor_matrix"]["summary"]
+        bat = chk["report"]["corpora"]["batteries_and_c2"]
+        c1 = chk["report"]["corpora"]["c1_corpus"]
         print(
-            f"[h1-lowering-inventory] ok={rep['ok']} "
-            f"matrix={ms['proved']}/{ms['total']} proved, "
-            f"{ms['lowered_unproved']} lowered_unproved, "
-            f"{ms['rejected']} rejected"
+            f"[lcnf-coverage] ok={chk['ok']} "
+            f"matrix={ms['proved']}/{ms['total']} proved ({ms['lowered_unproved']} lowered_unproved, {ms['rejected']} rejected) "
+            f"batteries_c2={bat['proved']}/{bat['total_declarations']} proved (+{bat['lowered_unproved']} vacuous_local_call) "
+            f"c1={c1['proved']}/{c1['total_declarations']} proved (+{c1['lowered_unproved']} vacuous_local_call)"
         )
-    if not rep["ok"]:
-        for err in rep["errors"]:
+    if not chk["ok"]:
+        for err in chk["errors"]:
             print(f"  [ERROR] {err}", file=sys.stderr)
         return 1
     return 0
