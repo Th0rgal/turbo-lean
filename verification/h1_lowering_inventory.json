@@ -1,0 +1,730 @@
+{
+  "bridge_source_digests": {
+    "lean/LeanNative/IR/Bridge.lean": "35bc45aaeaedb10a9e5d5987821f8a6d66592fbe1634ccccdd7175896eb4471d",
+    "lean/LeanNative/IR/BridgeHelpers.lean": "292aeccba7da5b22c770dc534a97619c533febd3d812071f5fb690dbed1015ee",
+    "lean/LeanNative/IR/RealLCNFBridge.lean": "b6da4f47f73d7ff231908ee9d8531f9231280108a78f6337ce8ec570516724ae",
+    "lean/LeanNative/IR/RealLCNFSemantics.lean": "3e5729f3aee6d1d993317577549dcb9475ac4b5832f94e54a04fa7d6a0aba0b6",
+    "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean": "2b652b961f78656b494c8f45a58293b0fb01f1f44c8d81c409f4201d546a5b16"
+  },
+  "corpora": {
+    "batteries_and_c2": {
+      "lowered_unproved": 0,
+      "proved": 101,
+      "proved_share_pct": 5.6,
+      "rejected": 1704,
+      "rejection_reasons": [
+        {
+          "count": 560,
+          "reason": "Unsupported non-scalar/higher-order type in signature or binding"
+        },
+        {
+          "count": 331,
+          "reason": "Unsupported partial application (pap) closure"
+        },
+        {
+          "count": 216,
+          "reason": "Unsupported non-scalar argument in call"
+        },
+        {
+          "count": 130,
+          "reason": "Unsupported constructor layout / non-scalar ADT field"
+        },
+        {
+          "count": 112,
+          "reason": "Unsupported erased runtime argument (Arg.erased)"
+        },
+        {
+          "count": 98,
+          "reason": "External (@[extern]) declaration without body"
+        },
+        {
+          "count": 96,
+          "reason": "Unsupported string literal (LitValue.str)"
+        },
+        {
+          "count": 50,
+          "reason": "Unsupported higher-order / closure (fvar) application"
+        },
+        {
+          "count": 29,
+          "reason": "Unsupported signed integer type (Int* / ISize)"
+        },
+        {
+          "count": 24,
+          "reason": "Unsupported self-tail or mutual recursion"
+        },
+        {
+          "count": 21,
+          "reason": "Non-borrowed slice parameter requires borrow (@&)"
+        },
+        {
+          "count": 19,
+          "reason": "Unsupported cases scrutinee type"
+        },
+        {
+          "count": 11,
+          "reason": "Unsupported join-point / reset-reuse shape"
+        },
+        {
+          "count": 7,
+          "reason": "Unsupported external or non-scalar call (fap)"
+        }
+      ],
+      "scope": "Std/Init core data structures (`Init.Data.{Array.Basic,Array.BinSearch,Array.QSort,ByteArray.Basic,BitVec.Basic,UInt.Basic}`, `Std.Data.{HashMap.Basic,DHashMap.Internal.Raw,TreeMap.Basic,ByteSlice}`) + Tier C2 multi-module Lake packages (`C2BitwiseScan`, `C2FieldButterfly`, `C2ProtocolMachine`, `C2CryptoSipHash`)",
+      "subcorpora": {
+        "c2_lake_packages": {
+          "exported_kernels_proved": "8/8",
+          "lowered_unproved": 0,
+          "proved": 20,
+          "rejected": 12,
+          "total_declarations": 32
+        },
+        "std_init_data": {
+          "lowered_unproved": 0,
+          "proved": 81,
+          "rejected": 1692,
+          "total_declarations": 1773
+        }
+      },
+      "toolchain": "leanprover/lean4:v4.35.0",
+      "total_declarations": 1805
+    },
+    "c1_run_tests": {
+      "lowered_unproved": 0,
+      "proved": 853,
+      "proved_share_pct": 98.61,
+      "rejected": 12,
+      "rejection_reasons": [
+        {
+          "count": 3,
+          "reason": "Unsupported signed integer type (Int* / ISize)"
+        },
+        {
+          "count": 2,
+          "reason": "Unsupported self-tail or mutual recursion"
+        },
+        {
+          "count": 2,
+          "reason": "Unsupported non-scalar/higher-order type in signature or binding"
+        },
+        {
+          "count": 2,
+          "reason": "Unsupported constructor layout / non-scalar ADT field"
+        },
+        {
+          "count": 1,
+          "reason": "Unsupported string literal (LitValue.str)"
+        },
+        {
+          "count": 1,
+          "reason": "Unsupported external or non-scalar call (fap)"
+        },
+        {
+          "count": 1,
+          "reason": "External (@[extern]) declaration without body"
+        }
+      ],
+      "scope": "8 blocking Tier C1 3-way run test suites (`C1_CORPUS_TESTS` in `scripts/test_scalar_frontend.py`: 845 generated seed/helper declarations + 8 Stage-1B exported/helper declarations + 12 fail-closed negative boundary probes)",
+      "toolchain": "leanprover/lean4:v4.35.0",
+      "total_declarations": 865
+    },
+    "con_leche": {
+      "commit_sha": "501589f5680d9599dee1bcef30a420bc8924c490",
+      "executed_from_main": {
+        "lowered_unproved": 0,
+        "proved": 119,
+        "proved_share_pct": 2.78,
+        "rejected": 4162,
+        "rejection_reasons": [
+          {
+            "count": 920,
+            "reason": "Unsupported non-scalar/higher-order type in signature or binding"
+          },
+          {
+            "count": 821,
+            "reason": "Unsupported string literal (LitValue.str)"
+          },
+          {
+            "count": 735,
+            "reason": "Unsupported constructor layout / non-scalar ADT field"
+          },
+          {
+            "count": 659,
+            "reason": "Unsupported self-tail or mutual recursion"
+          },
+          {
+            "count": 269,
+            "reason": "Unsupported non-scalar argument in call"
+          },
+          {
+            "count": 199,
+            "reason": "Unsupported cases scrutinee type"
+          },
+          {
+            "count": 197,
+            "reason": "Unsupported external or non-scalar call (fap)"
+          },
+          {
+            "count": 149,
+            "reason": "Unsupported erased runtime argument (Arg.erased)"
+          },
+          {
+            "count": 133,
+            "reason": "Unsupported signed integer type (Int* / ISize)"
+          },
+          {
+            "count": 37,
+            "reason": "Unsupported join-point / reset-reuse shape"
+          },
+          {
+            "count": 32,
+            "reason": "Unsupported higher-order / closure (fvar / pap) application"
+          },
+          {
+            "count": 8,
+            "reason": "Non-borrowed slice parameter requires borrow (@&)"
+          },
+          {
+            "count": 3,
+            "reason": "Unsupported heap / scalar field mutation (oset/uset/sset)"
+          }
+        ],
+        "scope": "4,281 non-aux declarations reachable from `main` via `scripts/executed-decls.lean` IR reachability walk (excluding `NatOpPins`)",
+        "total_declarations": 4281
+      },
+      "lowered_unproved": 0,
+      "proved": 795,
+      "proved_share_pct": 6.58,
+      "rejected": 11292,
+      "rejection_reasons": [
+        {
+          "count": 5306,
+          "reason": "Unsupported non-scalar/higher-order type in signature or binding"
+        },
+        {
+          "count": 1445,
+          "reason": "Unsupported partial application (pap) closure"
+        },
+        {
+          "count": 1207,
+          "reason": "Unsupported constructor layout / non-scalar ADT field"
+        },
+        {
+          "count": 1192,
+          "reason": "Unsupported string literal (LitValue.str)"
+        },
+        {
+          "count": 768,
+          "reason": "Unsupported self-tail or mutual recursion"
+        },
+        {
+          "count": 374,
+          "reason": "Unsupported non-scalar argument in call"
+        },
+        {
+          "count": 292,
+          "reason": "Unsupported erased runtime argument (Arg.erased)"
+        },
+        {
+          "count": 244,
+          "reason": "Unsupported cases scrutinee type"
+        },
+        {
+          "count": 227,
+          "reason": "Unsupported external or non-scalar call (fap)"
+        },
+        {
+          "count": 140,
+          "reason": "Unsupported signed integer type (Int* / ISize)"
+        },
+        {
+          "count": 46,
+          "reason": "Unsupported join-point / reset-reuse shape"
+        },
+        {
+          "count": 29,
+          "reason": "Unsupported higher-order / closure (fvar) application"
+        },
+        {
+          "count": 11,
+          "reason": "External (@[extern]) declaration without body"
+        },
+        {
+          "count": 8,
+          "reason": "Non-borrowed slice parameter requires borrow (@&)"
+        },
+        {
+          "count": 3,
+          "reason": "Unsupported heap / scalar field mutation (oset/uset/sset)"
+        }
+      ],
+      "repository": "https://github.com/leanprover/con-leche.git",
+      "scope": "99 checker modules (`Main` + `ConLeche.{Kernel,Cached,Frontend,Driver}`), excluding 27,163 auto-generated literal certificate arrays in `ConLeche.Kernel.NatOpPins`",
+      "toolchain": "leanprover/lean4:v4.35.0",
+      "total_declarations": 12087
+    }
+  },
+  "h1_3_priority_order": [
+    {
+      "category": "Ground non-scalar & recursive ADT types (`Array`, `ByteArray`, `Name`, `Level`, `Expr`, `ConstantInfo`)",
+      "con_leche_executed_rejections": 1924,
+      "rank": 1,
+      "rationale": "Signature/binding type rejections (920) + constructor layout (735) + non-scalar call args (269) dominate executed con-leche declarations."
+    },
+    {
+      "category": "String literals (`LitValue.str`) & panic/error formatting paths",
+      "con_leche_executed_rejections": 821,
+      "rank": 2,
+      "rationale": "Second largest single rejection bucket on executed con-leche declarations (821)."
+    },
+    {
+      "category": "General & mutual recursion (`LetValue.fap` self/mutual calls)",
+      "con_leche_executed_rejections": 659,
+      "rank": 3,
+      "rationale": "659 executed kernel/checker functions use structural or well-founded recursion not reducible to flat loops."
+    },
+    {
+      "category": "General `Code.cases` on multi-constructor payload ADTs & `Nat`/`String`",
+      "con_leche_executed_rejections": 199,
+      "rank": 4,
+      "rationale": "199 executed declarations fail closed on cases scrutinees beyond Bool/enum/Stage-1D 2-field ADTs."
+    },
+    {
+      "category": "External runtime primitives (`LetValue.fap` / `@[extern]`) & erased runtime arguments (`Arg.erased`)",
+      "con_leche_executed_rejections": 346,
+      "rank": 5,
+      "rationale": "197 external/non-scalar calls + 149 erased runtime arguments in polymorphic helpers."
+    },
+    {
+      "category": "Signed integer types (`Int*` / `ISize`)",
+      "con_leche_executed_rejections": 133,
+      "rank": 6,
+      "rationale": "133 executed declarations rejected by declUsesSignedScalarTransitively."
+    },
+    {
+      "category": "Complex join-point DAGs (`Code.jp`/`Code.jmp`) & closures (`LetValue.pap`/`LetValue.fvar`)",
+      "con_leche_executed_rejections": 70,
+      "rank": 7,
+      "rationale": "37 join-point/reset-reuse shapes + 20 partial applications + 13 higher-order fvar calls."
+    }
+  ],
+  "horizon": "H1.0",
+  "lcnf_constructor_matrix": {
+    "rows": [
+      {
+        "category": "DeclValue",
+        "construct": "Lean.Compiler.LCNF.DeclValue.code",
+        "evidence_file": "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean",
+        "evidence_symbol": "lowerRealLCNFDecl_sound",
+        "id": "DeclValue.code",
+        "notes": "Lowered by lowerRealLCNFDecl and proved refines evalRealLCNFDecl.",
+        "status": "proved"
+      },
+      {
+        "category": "DeclValue",
+        "construct": "Lean.Compiler.LCNF.DeclValue.extern",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "Unsupported `@[extern]` declaration",
+        "id": "DeclValue.extern",
+        "notes": "Fails closed on @[extern] declarations without an LCNF code body.",
+        "status": "rejected"
+      },
+      {
+        "category": "Code",
+        "construct": "Lean.Compiler.LCNF.Code.let",
+        "evidence_file": "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean",
+        "evidence_symbol": "lowerImpureStepPure_sound_aux",
+        "id": "Code.let",
+        "notes": "Lowered by lowerImpureLetDeclPure and proved sound in RealLCNFBridgeProofs.",
+        "status": "proved"
+      },
+      {
+        "category": "Code",
+        "construct": "Lean.Compiler.LCNF.Code.jp (non-recursive DAG)",
+        "evidence_file": "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean",
+        "evidence_symbol": "lowerImpureStepPure_sound_aux",
+        "id": "Code.jp",
+        "notes": "Non-recursive join-point declarations are recorded in RealBridgeState.jpDecls and proved sound.",
+        "status": "proved"
+      },
+      {
+        "category": "Code",
+        "construct": "Lean.Compiler.LCNF.Code.jp (recursive loop)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "unsupported recursive join point",
+        "id": "Code.jp.recursive",
+        "notes": "Recursive join points (hasJmpToPure = true) fail closed unless pre-lowered.",
+        "status": "rejected"
+      },
+      {
+        "category": "Code",
+        "construct": "Lean.Compiler.LCNF.Code.jmp",
+        "evidence_file": "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean",
+        "evidence_symbol": "lowerImpureStepPure_sound_aux",
+        "id": "Code.jmp",
+        "notes": "Join-point jumps bind parameters via bindJpCallArgsPure and splice the continuation.",
+        "status": "proved"
+      },
+      {
+        "category": "Code",
+        "construct": "Lean.Compiler.LCNF.Code.cases (Bool / Nat / scalar / enum / Stage-1D ADT)",
+        "evidence_file": "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean",
+        "evidence_symbol": "lowerImpureStepPure_sound_aux",
+        "id": "Code.cases",
+        "notes": "Proved for Bool, scalar tags, multi-constructor enums, and Stage-1D 1/2-field heap ADTs.",
+        "status": "proved"
+      },
+      {
+        "category": "Code",
+        "construct": "Lean.Compiler.LCNF.Code.return",
+        "evidence_file": "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean",
+        "evidence_symbol": "lowerRealLCNFDecl_sound",
+        "id": "Code.return",
+        "notes": "Returns mapped VarId or active constructor allocation.",
+        "status": "proved"
+      },
+      {
+        "category": "Code",
+        "construct": "Lean.Compiler.LCNF.Code.unreach",
+        "evidence_file": "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean",
+        "evidence_symbol": "lowerImpureStepPure_sound_aux",
+        "id": "Code.unreach",
+        "notes": "Lowers to LNIRCode.unreachable and vacuously refines evalStep = none.",
+        "status": "proved"
+      },
+      {
+        "category": "Code",
+        "construct": "Lean.Compiler.LCNF.Code.fun (local function / closure)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "Unsupported local function",
+        "id": "Code.fun",
+        "notes": "Non-inlined escaping local functions and closures fail closed.",
+        "status": "rejected"
+      },
+      {
+        "category": "Alt",
+        "construct": "Lean.Compiler.LCNF.Alt.alt (.pure phase)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "orderAltsPure",
+        "id": "Alt.alt",
+        "notes": "Pure-phase constructor alternatives convert to impure ctorAlt / lower via lowerImpureStepPure.",
+        "status": "proved"
+      },
+      {
+        "category": "Alt",
+        "construct": "Lean.Compiler.LCNF.Alt.ctorAlt (.impure phase)",
+        "evidence_file": "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean",
+        "evidence_symbol": "lowerImpureStepPure_sound_aux",
+        "id": "Alt.ctorAlt",
+        "notes": "Impure constructor alternatives lower to tag comparisons and proved ite chains.",
+        "status": "proved"
+      },
+      {
+        "category": "Alt",
+        "construct": "Lean.Compiler.LCNF.Alt.default",
+        "evidence_file": "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean",
+        "evidence_symbol": "lowerImpureStepPure_sound_aux",
+        "id": "Alt.default",
+        "notes": "Default case alternative lowers as the fallback branch of the ite chain.",
+        "status": "proved"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.lit (.nat / .uint8 / .uint16 / .uint32 / .uint64 / .usize)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "lowerLitValuePure",
+        "id": "LetValue.lit.num",
+        "notes": "Numeric literals lower to masked constU64 or constBool with proved refinement.",
+        "status": "proved"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.lit (.str)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "unsupported string literal",
+        "id": "LetValue.lit.str",
+        "notes": "String literals fail closed in Stage 1B/1D.",
+        "status": "rejected"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.erased",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "lowerImpureLetValuePure",
+        "id": "LetValue.erased",
+        "notes": "Erased proof/type bindings lower to unit/zero scalar constants when typed as unit/scalar.",
+        "status": "proved"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.proj (.pure phase)",
+        "evidence_file": "lean/LeanNative/IR/Bridge.lean",
+        "evidence_symbol": "lowerPureLetValue",
+        "id": "LetValue.proj",
+        "notes": "Pure-phase projections lower via lowerPureLetValue when pure declarations are not routed through toImpure.",
+        "status": "lowered_unproved"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.const (.pure phase)",
+        "evidence_file": "lean/LeanNative/IR/Bridge.lean",
+        "evidence_symbol": "lowerPureLetValue",
+        "id": "LetValue.const",
+        "notes": "Pure-phase constant applications convert via toImpure to fap/ctor/pap or lower in lowerPureLetValue.",
+        "status": "lowered_unproved"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.fvar (zero-arg alias)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "lowerImpureLetValuePure",
+        "id": "LetValue.fvar",
+        "notes": "Zero-argument fvar aliases copy the mapped variable or active constructor state.",
+        "status": "proved"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.fvar (non-empty args higher-order call)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "unsupported higher-order fvar call",
+        "id": "LetValue.fvar.app",
+        "notes": "Higher-order closure applications fail closed unless beta-reduced before lowering.",
+        "status": "rejected"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.ctor (Bool / Enum / Prod / Stage-1D 1-2 field heap ADT)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "lowerRealCtor",
+        "id": "LetValue.ctor",
+        "notes": "Proved for Bool, enums, flat scalar tuples, and Stage-1D object-field heap constructors.",
+        "status": "proved"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.ctor (general recursive/multi-field/scalar-payload ADT)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "Unsupported payload-carrying constructor",
+        "id": "LetValue.ctor.general",
+        "notes": "General recursive ADTs (>2 fields, mixed scalar/object payloads, or exported heap types) fail closed.",
+        "status": "rejected"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.fap (canonical UInt8/16/32/64, USize, Bool, cast, ByteArray/Array slice intrinsics)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "lowerCanonicalIntrinsicPure?",
+        "id": "LetValue.fap.intrinsic",
+        "notes": "Proved in RealLCNFBridgeProofs against RealLCNFSemantics.evalIntrinsicCall.",
+        "status": "proved"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.fap (GF(2^128) / BabyBear / Goldilocks SIMD intrinsic whitelist)",
+        "evidence_file": "lean/LeanNative/IR/BridgeHelpers.lean",
+        "evidence_symbol": "tryLowerGfSimdIntrinsic",
+        "id": "LetValue.fap.gf_simd",
+        "notes": "Intercepted in BridgeHelpers before RealLCNFBridge; 0 hits on con-leche, Std/Init, C2, and C1.",
+        "status": "lowered_unproved"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.fap (self-tail recursion, mutual recursion, unmodeled external calls)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "Unsupported external or non-scalar call",
+        "id": "LetValue.fap.general",
+        "notes": "Non-inlined recursive calls and unmodeled external functions fail closed.",
+        "status": "rejected"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.pap (partial application closure)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "Unsupported partial application",
+        "id": "LetValue.pap",
+        "notes": "Partial application closure allocation fails closed.",
+        "status": "rejected"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.oproj (tuple / Stage-1D object field projection)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "lowerImpureLetValuePure",
+        "id": "LetValue.oproj",
+        "notes": "Lowers to projTuple or ctorGetObj and is proved sound in RealLCNFBridgeProofs.",
+        "status": "proved"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.uproj (USize field projection)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "lowerImpureLetValuePure",
+        "id": "LetValue.uproj",
+        "notes": "Lowers to projTuple on flat tuples or ctorGetScalar on C1.2 layouts; arbitrary heap uproj fails closed.",
+        "status": "proved"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.sproj (unboxed scalar field projection)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "lowerImpureLetValuePure",
+        "id": "LetValue.sproj",
+        "notes": "Lowers to projTuple on flat scalar tuples or ctorGetScalar on C1.2 layouts; general heap sproj fails closed.",
+        "status": "proved"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.box",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "lowerImpureLetValuePure",
+        "id": "LetValue.box",
+        "notes": "Boxes UInt64/USize/enum tags in flat tuples or Stage-1D heap ADT fields.",
+        "status": "proved"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.unbox",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "lowerImpureLetValuePure",
+        "id": "LetValue.unbox",
+        "notes": "Unboxes scalar/tagged values with proved width masking.",
+        "status": "proved"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.isShared (Stage-1D exclusivity check)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "unintercepted isShared",
+        "id": "LetValue.isShared",
+        "notes": "Lowers to negated isExclusive on Stage-1D heap pointers; non-Stage-1D isShared fails closed.",
+        "status": "proved"
+      },
+      {
+        "category": "LetValue",
+        "construct": "Lean.Compiler.LCNF.LetValue.reset / LetValue.reuse",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "Unsupported heap reset instruction",
+        "id": "LetValue.reset_reuse",
+        "notes": "Legacy pure/impure reset/reuse outside Stage-1D del/setTag/oset fails closed on heap pointers.",
+        "status": "rejected"
+      },
+      {
+        "category": "Code",
+        "construct": "Lean.Compiler.LCNF.Code.inc",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "lowerRefOpPure",
+        "id": "Code.inc",
+        "notes": "Emits LNIRCode.incRef on heap/slice pointers and elides on unboxed scalars.",
+        "status": "proved"
+      },
+      {
+        "category": "Code",
+        "construct": "Lean.Compiler.LCNF.Code.dec",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "lowerRefOpPure",
+        "id": "Code.dec",
+        "notes": "Emits LNIRCode.decRef on heap/slice pointers and elides on unboxed scalars.",
+        "status": "proved"
+      },
+      {
+        "category": "Code",
+        "construct": "Lean.Compiler.LCNF.Code.del",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "lean_native_del_obj",
+        "id": "Code.del",
+        "notes": "Emits lean_native_del_obj in the Stage-1D reset/reuse pattern.",
+        "status": "proved"
+      },
+      {
+        "category": "Code",
+        "construct": "Lean.Compiler.LCNF.Code.setTag (constructor tag mutation)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "lean_native_ctor_set_tag",
+        "id": "Code.setTag",
+        "notes": "Emits lean_native_ctor_set_tag during Stage-1D constructor reuse.",
+        "status": "proved"
+      },
+      {
+        "category": "Code",
+        "construct": "Lean.Compiler.LCNF.Code.oset (Stage-1D object slot mutation)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "lean_native_ctor_set",
+        "id": "Code.oset",
+        "notes": "Emits lean_native_ctor_set on Stage-1D heap objects; fails closed on general heap types.",
+        "status": "proved"
+      },
+      {
+        "category": "Code",
+        "construct": "Lean.Compiler.LCNF.Code.uset (C1.2 USize slot mutation)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "lean_native_ctor_set_scalar",
+        "id": "Code.uset",
+        "notes": "Emits lean_native_ctor_set_scalar on statically known C1.2 layouts; fails closed otherwise.",
+        "status": "proved"
+      },
+      {
+        "category": "Code",
+        "construct": "Lean.Compiler.LCNF.Code.sset (C1.2 scalar slot mutation)",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "Unsupported scalar field mutation",
+        "id": "Code.sset",
+        "notes": "Emits lean_native_ctor_set_scalar on statically known C1.2 layouts; fails closed otherwise.",
+        "status": "proved"
+      },
+      {
+        "category": "Arg",
+        "construct": "Lean.Compiler.LCNF.Arg.fvar",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "lowerRealArg",
+        "id": "Arg.fvar",
+        "notes": "Resolves mapped FVarId in RealBridgeState.fvarMap.",
+        "status": "proved"
+      },
+      {
+        "category": "Arg",
+        "construct": "Lean.Compiler.LCNF.Arg.type",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "collectSliceCallArgsPure",
+        "id": "Arg.type",
+        "notes": "Erased type arguments are filtered in slice/tuple/local-call lowering; runtime positions fail closed.",
+        "status": "proved"
+      },
+      {
+        "category": "Arg",
+        "construct": "Lean.Compiler.LCNF.Arg.erased",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "unsupported erased runtime argument in pure core",
+        "id": "Arg.erased",
+        "notes": "Erased proof/prop arguments are filtered in slice/tuple/local-call lowering; runtime value positions fail closed.",
+        "status": "proved"
+      },
+      {
+        "category": "Type",
+        "construct": "UInt8 / UInt16 / UInt32 / UInt64 / USize / Bool / Multi-Ctor Enum / Flat Prod",
+        "evidence_file": "lean/LeanNative/IR/RealLCNFBridge.lean",
+        "evidence_symbol": "lowerGroundImpureTypeWith",
+        "id": "Type.unsigned_scalars",
+        "notes": "Proved unboxed scalar, USize, enum tag, and flat tuple lowering.",
+        "status": "proved"
+      },
+      {
+        "category": "Type",
+        "construct": "Int / Int8 / Int16 / Int32 / Int64 / ISize",
+        "evidence_file": "lean/LeanNative/IR/BridgeHelpers.lean",
+        "evidence_symbol": "declUsesSignedScalarTransitively",
+        "id": "Type.signed_scalars",
+        "notes": "Transitive scan rejects signed integer types fail-closed before lowering.",
+        "status": "rejected"
+      }
+    ],
+    "summary": {
+      "lowered_unproved": 3,
+      "proved": 32,
+      "rejected": 10,
+      "total": 45
+    }
+  },
+  "pinned_con_leche_rev": "501589f5680d9599dee1bcef30a420bc8924c490",
+  "schemaVersion": "turbo-lean-h1-lowering-inventory-v1",
+  "toolchain": "leanprover/lean4:v4.35.0"
+}

@@ -74,6 +74,9 @@ def classify(paths, event="pull_request", ref=""):
             domains["llvm_backend"] = True
             domains["c_abi_runtime"] = True
             full = True
+        elif p == "verification/h1_lowering_inventory.json":
+            domains["ci_scripts"] = True
+            full = True
         elif p.startswith("verification/"):
             domains["llvm_backend"] = True
             domains["gpu_tpu_backend"] = True
@@ -225,6 +228,10 @@ class Tests(unittest.TestCase):
         self.assertFalse(pc2["gpu_tpu_backend"])
         self.assertFalse(pc2["con_leche_kernel"])
         self.assertFalse(pc2["sail_riscv_backend"])
+        ph1 = classify(["verification/h1_lowering_inventory.json"])
+        for k in ("ci_scripts", "run_lean_build", "run_conformance_full"):
+            self.assertTrue(ph1[k])
+        self.assertFalse(ph1["llvm_backend"])
 
     def test_sdk_and_plugins(self):
         ps = classify(["sdk/accelerator-template/plugin.py"])
