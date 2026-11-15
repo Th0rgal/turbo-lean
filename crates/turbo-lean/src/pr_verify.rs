@@ -8869,6 +8869,25 @@ fn kernel_statement_changes_with_trust(
     untrusted_cfg: Option<&crate::module_builder::ProjectConfig>,
     proof_only_project_rel_files: &[String],
 ) -> Result<Vec<String>> {
+    Ok(kernel_statement_changes_and_csimp_with_trust(
+        store,
+        project,
+        base,
+        scope,
+        untrusted_cfg,
+        proof_only_project_rel_files,
+    )?
+    .0)
+}
+
+fn kernel_statement_changes_and_csimp_with_trust(
+    store: &TurboStore,
+    project: &Path,
+    base: &str,
+    scope: Option<&Path>,
+    untrusted_cfg: Option<&crate::module_builder::ProjectConfig>,
+    proof_only_project_rel_files: &[String],
+) -> Result<(Vec<String>, Vec<(String, String, String)>)> {
     let repo = resolve_git_toplevel(project)?;
     let proj_rel_in_repo = project.strip_prefix(&repo)?.to_path_buf();
     let relative_scope = scope
@@ -9652,7 +9671,10 @@ fn kernel_statement_changes_with_trust(
         }
     };
     policy.audit(&after)?;
-    Ok(compare_kernel_statements(&before, &after.statements))
+    Ok((
+        compare_kernel_statements(&before, &after.statements),
+        after.csimp_entries,
+    ))
 }
 
 fn compare_kernel_statements(
@@ -10100,14 +10122,16 @@ pub fn run_pr_verify_command(
         .filter(|f| !classification.altered_interface_files.contains(f))
         .cloned()
         .collect();
-    classification.statement_edited_theorems = kernel_statement_changes_with_trust(
-        store,
-        &canon_dir,
-        &base,
-        scope.as_deref(),
-        untrusted_pr_cfg.as_ref(),
-        &proof_only_rel_files,
-    )?;
+    let (statement_edited_theorems, active_csimp_entries) =
+        kernel_statement_changes_and_csimp_with_trust(
+            store,
+            &canon_dir,
+            &base,
+            scope.as_deref(),
+            untrusted_pr_cfg.as_ref(),
+            &proof_only_rel_files,
+        )?;
+    classification.statement_edited_theorems = statement_edited_theorems;
     let statement_digest_ms = statement_digest_t0.elapsed().as_millis();
     let is_statement_edit = |source_name: &String| {
         classification
@@ -11173,15 +11197,7 @@ pub fn run_pr_verify_command(
     let mut ver_receipt =
         build_pr_verification_receipt(&mode, &kernel_prov, &base, &classification);
     if !base_policy.csimp.is_empty() {
-        let stmt_rep = built_kernel_statement_report_bound(
-            &canon_dir,
-            scope.as_deref(),
-            is_untrusted,
-            Some(&store.root),
-            None,
-            None,
-        )?;
-        ver_receipt.bind_active_csimp(&base_policy.csimp, &stmt_rep.csimp_entries)?;
+        ver_receipt.bind_active_csimp(&base_policy.csimp, &active_csimp_entries)?;
     }
     emit_verification_receipt_with_signing_key(
         receipt.as_deref(),
