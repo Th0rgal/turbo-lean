@@ -45,6 +45,7 @@ C2_LAKE_PACKAGE_SPECS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] 
     ("C2BitwiseScan", ("Swar", "Scan"), ("c2_bitwise_scan_digest", "c2_swar_sip_mix")),
     ("C2FieldButterfly", ("Field", "Butterfly"), ("c2_babybear_radix4", "c2_gf2_clmul_tower")),
     ("C2ProtocolMachine", ("Types", "Transition"), ("c2_protocol_step6", "c2_usize_stencil_clamp")),
+    ("C2CryptoSipHash", ("SipRound", "Mac"), ("c2_siphash24_word", "c2_chacha_quarter_mix")),
 )
 C2_TEST_VECTORS: tuple[int, ...] = (
     0,
