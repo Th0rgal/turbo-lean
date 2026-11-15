@@ -3454,3 +3454,134 @@ fn test_remote_http_check_never_stages_cas_blobs_before_attestation_and_reuses_c
     let _ = fs::remove_dir_all(&tmp_dir);
     test_res
 }
+
+#[test]
+fn test_check_phase_timings_cover_at_least_90_percent_of_wall() -> Result<()> {
+    let _guard = crate::pack::tests::env_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let toolchain = include_str!("../../../../lean/lean-toolchain").trim();
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "turbo_check_phase_timings_{}_{}",
+        std::process::id(),
+        pack::next_tmp_id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_dir);
+    let proj = tmp_dir.join("proj");
+    fs::create_dir_all(proj.join("Dep"))?;
+    fs::write(proj.join("lean-toolchain"), format!("{toolchain}\n"))?;
+    fs::write(
+        proj.join("lakefile.toml"),
+        "name = \"phase_timing_pkg\"\ndefaultTargets = [\"Dep\", \"Mod\"]\n\n[[lean_lib]]\nname = \"Dep\"\nglobs = [\"Dep.+\"]\n\n[[lean_lib]]\nname = \"Mod\"\n",
+    )?;
+    fs::write(
+        proj.join("Dep/Helper.lean"),
+        "def depHelperVal : Nat := 1\n",
+    )?;
+    let mod_file = proj.join("Mod.lean");
+    fs::write(
+        &mod_file,
+        "import Dep.Helper\nnamespace PhasePkg\ntheorem thm1 : depHelperVal = 1 := rfl\ntheorem thm2 : 2 + 2 = 4 := rfl\nend PhasePkg\n",
+    )?;
+
+    let cache_dir = tmp_dir.join("cache");
+    let mut store = TurboStore::open(Some(&cache_dir))?;
+    let Ok((_ev, lean_bin)) =
+        crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "")
+    else {
+        let _ = fs::remove_dir_all(&tmp_dir);
+        return Ok(());
+    };
+    if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
+        let _ = fs::remove_dir_all(&tmp_dir);
+        return Ok(());
+    }
+    crate::module_builder::reset_lake_inputs_tag_memo();
+    crate::lake_build::run_build_command(
+        &mut store,
+        false,
+        Vec::new(),
+        proj.clone(),
+        "trusted".to_string(),
+        0,
+        false,
+    )?;
+
+    let check_t0 = Instant::now();
+    let mut cold_store = TurboStore::open(Some(&tmp_dir.join("cold_cache")))?;
+    let decl_json = evaluate_check_command_value(
+        &mut cold_store,
+        mod_file.clone(),
+        Some("PhasePkg.thm1".to_string()),
+        proj.clone(),
+    )?;
+    let caller_wall_ms = check_t0.elapsed().as_secs_f64() * 1000.0;
+    let pt = decl_json
+        .get("phase_timings")
+        .context("missing phase_timings in check --decl output")?;
+    let wall_ms = pt["wall_ms"].as_f64().context("missing wall_ms")?;
+    let phase_sum_ms = pt["phase_sum_ms"].as_f64().context("missing phase_sum_ms")?;
+    let phase_covered_ms = pt["phase_covered_ms"]
+        .as_f64()
+        .context("missing phase_covered_ms")?;
+    let phase_overlap_ms = pt["phase_overlap_ms"]
+        .as_f64()
+        .context("missing phase_overlap_ms")?;
+    let coverage_ratio = pt["coverage_ratio"]
+        .as_f64()
+        .context("missing coverage_ratio")?;
+    let elapsed_ms = decl_json["elapsed_ms"]
+        .as_f64()
+        .context("missing elapsed_ms")?;
+
+    assert!(
+        elapsed_ms >= caller_wall_ms * 0.90,
+        "elapsed_ms ({elapsed_ms}) must cover >= 90% of caller wall ({caller_wall_ms})"
+    );
+    assert!(
+        phase_covered_ms >= wall_ms * 0.90 && coverage_ratio >= 0.90,
+        "phase_covered_ms ({phase_covered_ms}) / wall_ms ({wall_ms}) = {coverage_ratio} must be >= 0.90 (pt={pt})"
+    );
+    assert!(
+        phase_covered_ms >= caller_wall_ms * 0.90,
+        "phase_covered_ms ({phase_covered_ms}) must cover >= 90% of caller wall ({caller_wall_ms})"
+    );
+    assert!(
+        (phase_sum_ms - phase_covered_ms - phase_overlap_ms).abs() < 0.05,
+        "phase_sum_ms ({phase_sum_ms}) must equal phase_covered_ms ({phase_covered_ms}) + phase_overlap_ms ({phase_overlap_ms})"
+    );
+    assert!(
+        pt["phases_ms"]["import_refresh"].as_f64().unwrap_or(0.0) > 0.0,
+        "cold check must record import_refresh phase: {pt}"
+    );
+    assert!(
+        pt["phases_ms"]["identity_probe"].as_f64().unwrap_or(0.0) > 0.0,
+        "check --decl must record identity_probe phase: {pt}"
+    );
+    assert!(
+        pt["phases_ms"]["elaboration"].as_f64().unwrap_or(0.0) > 0.0,
+        "cold check --decl must record elaboration phase: {pt}"
+    );
+
+    let file_t0 = Instant::now();
+    let mut cold_file_store = TurboStore::open(Some(&tmp_dir.join("cold_file_cache")))?;
+    let file_json = evaluate_check_command_value(&mut cold_file_store, mod_file.clone(), None, proj.clone())?;
+    let file_caller_wall_ms = file_t0.elapsed().as_secs_f64() * 1000.0;
+    let file_pt = file_json
+        .get("phase_timings")
+        .context("missing phase_timings in single-file check output")?;
+    let file_covered_ms = file_pt["phase_covered_ms"]
+        .as_f64()
+        .context("missing file phase_covered_ms")?;
+    let file_ratio = file_pt["coverage_ratio"]
+        .as_f64()
+        .context("missing file coverage_ratio")?;
+    assert!(
+        file_ratio >= 0.90 && file_covered_ms >= file_caller_wall_ms * 0.90,
+        "file check phase coverage ({file_covered_ms} ms / {file_caller_wall_ms} ms, ratio={file_ratio}) must be >= 0.90: {file_pt}"
+    );
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+    Ok(())
+}
+

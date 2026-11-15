@@ -24,6 +24,7 @@ pub mod matryoshka;
 pub mod mcp;
 pub mod module_builder;
 mod pack;
+pub mod phase_timing;
 mod pr_verify;
 pub mod receipt;
 pub mod remote_prebuild;
