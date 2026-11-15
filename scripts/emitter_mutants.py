@@ -36,8 +36,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SPEC_PATH = Path(__file__).resolve().parent / "emitter_mutants.json"
 CHECK_ORDER = ("C1", "C2", "C3", "C4", "C5", "C6", "C7")
-COMPARISON_UNIVERSE = tuple(f"M{i}" for i in range(1, 12))
-BACKENDS = ("llvm", "mlir", "ptx", "metal", "c-abi")
+COMPARISON_UNIVERSE = tuple(f"M{i}" for i in range(1, 11))
+BACKENDS = ("llvm", "mlir", "ptx", "metal")
 LOG_TAIL = 4000
 BIN_ARTIFACTS = (
     "lean/.lake/build/bin/lean-native",
@@ -341,44 +341,6 @@ def run_pinned_checks(
     return reports, final_hashes, rebuild_meta
 
 
-def not_applicable_record(root: Path, mutation: dict) -> dict:
-    probe_argv = ["grep", "-n", "-E", "emitRustScalarExpr|emitCScalarExpr|wrapping_sub|emitCAbiBody", "lean/"]
-    probe = git(probe_argv, root, check=False)
-    provenance = mutation["not_applicable"]
-    diff_argv = ["diff", "--no-ext-diff", "--unified=0", f"{provenance['removed_in']}^", provenance["removed_in"], "--", mutation["file"]]
-    removal_diff = git(diff_argv, root, check=False)
-    definition = provenance["removed_definition"]
-    removed_lines = [line[1:] for line in removal_diff.stdout.splitlines() if line.startswith("-") and not line.startswith("---")]
-    added_lines = [line[1:] for line in removal_diff.stdout.splitlines() if line.startswith("+") and not line.startswith("+++")]
-    zero_matches = probe.returncode == 1 and not probe.stdout.strip()
-    removal_verified = removal_diff.returncode == 0 and definition in removed_lines and definition not in added_lines
-    evidence = "ZERO_MATCHES" if zero_matches else probe.stdout.strip()
-    detail = dict(mutation["not_applicable"])
-    detail.update({
-        "evidence": evidence,
-        "evidence_exit": probe.returncode,
-        "removed_in_verified": removal_verified,
-        "removal_diff_argv": ["git", *diff_argv],
-        "removal_diff_sha256": hashlib.sha256(removal_diff.stdout.encode()).hexdigest(),
-        "removed_definition_lines": [line for line in removed_lines if line == definition],
-    })
-    return {
-        "id": mutation["id"],
-        "backend": mutation["backend"],
-        "file": mutation["file"],
-        "search": mutation["search"],
-        "replace": mutation["replace"],
-        "expected_match_count": mutation["expected_match_count"],
-        "match_count": 0,
-        "diff": "",
-        "build_hashes": {},
-        "checks": {},
-        "outcome": "NOT_APPLICABLE" if (zero_matches and removal_verified) else "INFRA_FAILED",
-        "killed_by": [],
-        "not_applicable": detail,
-    }
-
-
 def evaluate_mutation(
     root: Path,
     mutation: dict,
@@ -389,9 +351,6 @@ def evaluate_mutation(
     lake_snapshot: Path | None = None,
     check_subset: tuple[str, ...] = CHECK_ORDER,
 ) -> dict:
-    if mutation.get("not_applicable"):
-        return not_applicable_record(root, mutation)
-
     revert_worktree(root)
     count, diff = apply_patch(root, mutation)
     record = {
@@ -449,7 +408,6 @@ def summarize(rows: list[dict], spec: dict, expected_universe: list[str], target
         counts[row["outcome"]] = counts.get(row["outcome"], 0) + 1
 
     decisive = counts.get("KILLED", 0) + counts.get("SURVIVED", 0)
-    not_applicable_ids = [row["id"] for row in rows if row["outcome"] == "NOT_APPLICABLE"]
     apply_failed_ids = [row["id"] for row in rows if row["outcome"] == "APPLY_FAILED"]
     infra_failed_ids = [row["id"] for row in rows if row["outcome"] == "INFRA_FAILED" or row.get("infra_failed_checks")]
     missing_universe_ids = [mid for mid in COMPARISON_UNIVERSE if mid not in by_id]
@@ -461,12 +419,10 @@ def summarize(rows: list[dict], spec: dict, expected_universe: list[str], target
         all_backend = [row for row in rows if row["backend"] == backend]
         selected = [row for row in all_backend if row["outcome"] in {"KILLED", "SURVIVED"}]
         killed = sum(row["outcome"] == "KILLED" for row in selected)
-        na_count = sum(row["outcome"] == "NOT_APPLICABLE" for row in all_backend)
         rates[backend] = {
             "killed": killed,
             "survived": len(selected) - killed,
             "decisive": len(selected),
-            "not_applicable": na_count,
             "kill_rate": None if not selected else round(killed / len(selected), 6),
         }
 
@@ -479,12 +435,11 @@ def summarize(rows: list[dict], spec: dict, expected_universe: list[str], target
         and not missing_universe_ids
         and not unexpected_universe_ids
         and len(rows) == len(by_id) == len(COMPARISON_UNIVERSE)
-        and (decisive + len(not_applicable_ids) == len(COMPARISON_UNIVERSE))
+        and decisive == len(COMPARISON_UNIVERSE)
     )
     return {
         "counts": counts,
         "decisive": decisive,
-        "not_applicable_ids": not_applicable_ids,
         "apply_failed_ids": apply_failed_ids,
         "infra_failed_ids": infra_failed_ids,
         "missing_universe_ids": missing_universe_ids,
@@ -764,7 +719,7 @@ def run_unit_tests() -> bool:
             )
 
         def test_active_mutants_apply_to_current_sources(self):
-            active = [m for m in self.spec["mutations"] if not m.get("not_applicable")]
+            active = self.spec["mutations"]
             self.assertEqual({m["id"] for m in active}, {f"M{i}" for i in range(1, 11)})
             for mutation in active:
                 with self.subTest(mutant=mutation["id"]):
@@ -784,6 +739,21 @@ def run_unit_tests() -> bool:
                     self.assertEqual(target.read_text(encoding="utf-8"),
                         before.replace(mutation["search"], mutation["replace"], 1))
                     self.assertNotEqual(target.read_text(encoding="utf-8"), before)
+
+        def test_stage_b_universe_is_live_applicable_mutants(self):
+            # G5 Stage B (roadmap/GOALS.md): comparison_universe is exactly the
+            # live mutants M1..M10 -- the retired not_applicable M11
+            # (CAbiEmit.lean, removed in bf8ae24) must not linger in it.
+            universe = list(self.spec["comparison_universe"])
+            by_id = {m["id"]: m for m in self.spec["mutations"]}
+            self.assertNotIn("M11", universe)
+            self.assertEqual(tuple(universe), COMPARISON_UNIVERSE)
+            self.assertEqual(set(by_id), set(universe))
+            for mid in universe:
+                with self.subTest(mutant=mid):
+                    mutation = by_id[mid]
+                    self.assertNotIn("not_applicable", mutation)
+                    self.assertTrue((ROOT / mutation["file"]).is_file(), mutation["file"])
 
         def rows(self) -> list[dict]:
             return [{"id": mid, "backend": "llvm", "outcome": "SURVIVED"} for mid in COMPARISON_UNIVERSE]
@@ -906,9 +876,8 @@ def run_unit_tests() -> bool:
         def test_fixed_universe_acceptance(self):
             rows = self.rows()
             rows[1]["outcome"] = "KILLED"
-            rows[-1]["outcome"] = "NOT_APPLICABLE"
             self.assertTrue(self.summary(rows)["conclusive"])
-            for invalid in (rows[:-1], rows + [rows[0]], rows[:-1] + [dict(rows[-1], id="M12")]):
+            for invalid in (rows[:-1], rows + [rows[0]], rows + [dict(rows[0], id="M11")]):
                 self.assertFalse(self.summary(invalid)["conclusive"])
 
         def test_emitter_module_hashes_record_changes(self):
@@ -928,33 +897,6 @@ def run_unit_tests() -> bool:
             self.assertTrue(flag_res["unknown_tier_rejected"], flag_res)
             self.assertFalse(flag_res["used_by_C5"])
 
-        def test_removed_in_requires_emitter_deletion_diff(self):
-            git(["init", "-q"], self.root)
-            git(["config", "user.name", "Runner Test"], self.root)
-            git(["config", "user.email", "runner@example.invalid"], self.root)
-            git(["config", "commit.gpgsign", "false"], self.root)
-            mutation = json.loads(json.dumps(self.spec["mutations"][-1]))
-            path = self.root / mutation["file"]
-            path.parent.mkdir(parents=True)
-            path.write_text(mutation["not_applicable"]["removed_definition"] + "\n  unreachable!\n")
-
-            def commit(message: str) -> str:
-                git(["add", "."], self.root)
-                git(["-c", "commit.gpgsign=false", "commit", "--no-gpg-sign", "-qm", message], self.root)
-                return git(["rev-parse", "HEAD"], self.root).stdout.strip()
-
-            commit("add emitter")
-            (self.root / "unrelated").write_text("unrelated")
-            unrelated = commit("unrelated commit")
-            path.write_text("-- emitter removed\n")
-            removed = commit("remove emitter")
-            for sha, expected in ((unrelated, "INFRA_FAILED"), (removed, "NOT_APPLICABLE")):
-                with self.subTest(commit=sha):
-                    mutation["not_applicable"]["removed_in"] = sha
-                    record = not_applicable_record(self.root, mutation)
-                    self.assertEqual(record["outcome"], expected)
-                    self.assertEqual(record["not_applicable"]["removed_in_verified"], expected == "NOT_APPLICABLE")
-
         def test_verify_kills_uses_full_check_order(self):
             import io
             from contextlib import redirect_stdout
@@ -962,7 +904,7 @@ def run_unit_tests() -> bool:
 
             def fake_run_suite(out_path, logs_path, only_ids=None, check_subset=CHECK_ORDER):
                 captured["check_subset"] = tuple(check_subset)
-                active_expected = sum(1 for m in self.spec["mutations"] if not m.get("not_applicable"))
+                active_expected = len(self.spec["mutations"])
                 return {
                     "run_outcome": "CONCLUSIVE",
                     "summary": {"counts": {"KILLED": active_expected, "SURVIVED": 0}},
@@ -1014,7 +956,7 @@ def main() -> int:
     if args.verify_kills:
         if not run_unit_tests():
             return 1
-        active_expected = sum(1 for m in load_spec()["mutations"] if not m.get("not_applicable"))
+        active_expected = len(load_spec()["mutations"])
         verify_subset = CHECK_ORDER
         tmp_ctx = tempfile.TemporaryDirectory(prefix="emitter-verify-kills-") if (args.output is None and args.logs is None) else None
         try:
