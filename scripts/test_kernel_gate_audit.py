@@ -20,6 +20,39 @@ ROOT = Path(__file__).resolve().parent.parent
 LEAN_DIR = ROOT / "lean"
 ZYGOTE = Path(os.environ.get("TURBO_ZYGOTE_BIN", str(LEAN_DIR / ".lake" / "build" / "bin" / "turbo-zygote")))
 
+# Stage B two-sided `MetaGateSpec` / `CveSubspec` kernel gate surface: a self-contained
+# module carrying the `MetaGateSpec` bundle shape over a compiled-import Verification
+# Entry gate (`cveGate`), with clean two-sided witnesses and one compiled-import
+# (`csimp`) replacement entry.
+FX_META_GATE_SRC = (
+    "structure MetaGateSpec (D : Type) (P : D → Prop) where\n"
+    "  gate : D → Bool\n"
+    "  sound : ∀ d, gate d = true → P d\n"
+    "  complete : ∀ d, P d → gate d = true\n"
+    "  posWitness : D\n"
+    "  negWitness : D\n"
+    "  nonVacuous : gate posWitness = true\n"
+    "  tight : gate negWitness = false\n"
+    "inductive CveEntry where\n"
+    "  | attested : UInt64 → UInt64 → UInt64 → CveEntry\n"
+    "  | unlisted : UInt64 → CveEntry\n"
+    "def cveGate : CveEntry → Bool\n"
+    "  | .attested expected actual receipt => expected == actual && receipt != 0\n"
+    "  | .unlisted _ => false\n"
+    "def CveSafe (e : CveEntry) : Prop := cveGate e = true\n"
+    "def cveSubspec : MetaGateSpec CveEntry CveSafe where\n"
+    "  gate := cveGate\n"
+    "  sound := fun _ h => h\n"
+    "  complete := fun _ h => h\n"
+    "  posWitness := CveEntry.attested 7 7 5\n"
+    "  negWitness := CveEntry.unlisted 7\n"
+    "  nonVacuous := rfl\n"
+    "  tight := rfl\n"
+    "def cveSlow (n : UInt64) : UInt64 := n\n"
+    "def cveFast (n : UInt64) : UInt64 := n\n"
+    "@[csimp] theorem cve_slow_eq : @cveSlow = @cveFast := rfl\n"
+)
+
 FIXTURES = {
     "FxBox": "structure MyBox (α : Type) where\n  v : α\n",
     "FxNestOk": "inductive T where\n  | leaf : Nat → T\n  | node : List T → Array T → Option T → T × T → T\n",
@@ -143,6 +176,13 @@ FIXTURES = {
     "FxUnsafeDef": "unsafe def badUnsafe (n : Nat) : Nat := badUnsafe n\n",
     "FxMainA": "def main : IO Unit := pure ()\ntheorem mainA_ok : (1 : Nat) = 1 := rfl\n",
     "FxMainB": "def main : IO UInt32 := pure 0\ntheorem mainB_ok : (2 : Nat) = 2 := rfl\n",
+    # Stage B two-sided `MetaGateSpec` / `CveSubspec` kernel gate surface: a
+    # self-contained module carrying the MetaGateSpec bundle shape over a compiled-import
+    # Verification Entry gate, with clean two-sided witnesses and one compiled-import
+    # (`csimp`) replacement entry.
+    "FxMetaGateOk": FX_META_GATE_SRC,
+    # Forged tightness witness: the negative side must fail closed on `sorryAx`.
+    "FxMetaGateSorryTight": FX_META_GATE_SRC.replace("  tight := rfl", "  tight := by sorry"),
 }
 
 
@@ -317,6 +357,43 @@ class KernelGateAudit(unittest.TestCase):
 
     def test_csimp_shaped_theorem_accepted_without_attribute(self) -> None:
         self.assertTrue(self.audit("FxCsimpPlain")["ok"])
+
+    def test_meta_gate_cve_subspec_kernel_gate_two_sided(self) -> None:
+        # Stage B two-sided `MetaGateSpec` / `CveSubspec` posture: the attested bundle
+        # (clean `rfl` witnesses on both sides) is admitted exactly when its
+        # compiled-import replacement entry is pinned in the csimp allowlist; a forged
+        # tightness witness (`tight := by sorry`) and the unpinned entry both fail closed.
+        env_allow = dict(self.env, TURBO_LEAN_ALLOWED_CSIMP="cve_slow_eq")
+        res = subprocess.run([str(ZYGOTE), "--audit-modules", "FxMetaGateOk"], env=env_allow,
+                             capture_output=True, text=True, timeout=120)
+        r = json.loads(res.stdout.strip().splitlines()[-1])
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r.get("csimp_entries"), [["cve_slow_eq", "cveSlow", "cveFast"]])
+        self.assert_rejected("FxMetaGateSorryTight", "disallowed axiom `sorryAx`")
+        self.assert_rejected("FxMetaGateOk", "csimp replacement `cve_slow_eq`")
+
+    def test_policy_gates_metaspec_cvesubspec_two_sided_surface(self) -> None:
+        # The canonical kernel gate surface (`lean/TurboLean/PolicyGates.lean`, compiled
+        # into `libturbo_spec_cabi.a`) must carry the pure `MetaGateSpec` bundle mirror
+        # and the compiled-import Verification Entry subspec with two-sided
+        # (accept/reject) theorems, and must still elaborate under the pinned toolchain.
+        policy_gates = ROOT / "lean" / "TurboLean" / "PolicyGates.lean"
+        src = policy_gates.read_text()
+        for token in (
+            "structure MetaGateSpec",
+            "inductive CveEntry",
+            "def cveGate",
+            "def CveSafe",
+            "def cveSubspec",
+            "theorem cve_subspec_accepts_attested",
+            "theorem cve_subspec_rejects_unlisted",
+            "theorem cve_subspec_rejects_digest_mismatch",
+            "theorem cve_subspec_rejects_unbound_receipt",
+        ):
+            self.assertIn(token, src)
+        res = subprocess.run(["lean", str(policy_gates)], cwd=str(ROOT), env=lean_env(),
+                             capture_output=True, text=True, timeout=300)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
 
     def test_bool_check_theorem_not_flagged(self) -> None:
         self.assertTrue(self.audit("FxBoolCheck")["ok"])

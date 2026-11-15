@@ -390,4 +390,75 @@ def combinedStepC (i : UInt64) : UInt64 :=
   needed.toUInt64 ^^^ isSound.toUInt64 ^^^ pinned.toUInt64 ^^^ sm ^^^
   (cost &&& 0xFFFF) ^^^ lt.toUInt64 ^^^ isForbidden.toUInt64
 
+/- Stage B: two-sided `MetaGateSpec` kernel gate surface for compiled-import
+   Verification Entries (`CveSubspec`). Mirrors the external `MetaGateSpec` bundle
+   (`LeanSys.Contracts.MetaGate`) as a pure unboxed record with `rfl` two-sided
+   witnesses, so the C-ABI gate surface can attest acceptance (attested, digest-bound,
+   non-vacuous, tight) and rejection (unlisted, digest mismatch, unbound receipt)
+   without importing `Lean`. No new `turbo_spec_*` exports: these gates stay
+   elaboration-time only. -/
+
+/-- Kernel gate bundle shape: a decidable gate over `D` with soundness/completeness
+    against the admission predicate `P`, plus one positive and one negative witness
+    attesting non-vacuity and tightness. -/
+structure MetaGateSpec (D : Type) (P : D → Prop) where
+  gate : D → Bool
+  sound : ∀ d, gate d = true → P d
+  complete : ∀ d, P d → gate d = true
+  posWitness : D
+  negWitness : D
+  nonVacuous : gate posWitness = true
+  tight : gate negWitness = false
+
+/-- A compiled-import Verification Entry: an attested digest pair bound to a nonzero
+    receipt digest, or an unlisted digest observed without attestation. -/
+inductive CveEntry where
+  | attested : UInt64 → UInt64 → UInt64 → CveEntry
+  | unlisted : UInt64 → CveEntry
+
+/-- Two-sided compiled-import gate: admit an entry only when it is attested, the
+    recorded digest matches the expected import digest, and the receipt digest is
+    bound (nonzero). -/
+@[inline]
+def cveGate (e : CveEntry) : Bool :=
+  match e with
+  | .attested expected actual receipt => expected == actual && receipt != 0
+  | .unlisted _ => false
+
+/-- Admission predicate mirrored by `cveGate`. -/
+def CveSafe (e : CveEntry) : Prop := cveGate e = true
+
+/-- `CveSubspec`: the `MetaGateSpec` bundle for compiled-import Verification Entries
+    with concrete two-sided witnesses. -/
+def cveSubspec : MetaGateSpec CveEntry CveSafe where
+  gate := cveGate
+  sound := fun _ h => h
+  complete := fun _ h => h
+  posWitness := CveEntry.attested 0x1F2E3D4C5B6A7988 0x1F2E3D4C5B6A7988 0x5A5A5A5A5A5A5A5A
+  negWitness := CveEntry.unlisted 0x1F2E3D4C5B6A7988
+  nonVacuous := rfl
+  tight := rfl
+
+theorem cve_subspec_accepts_attested :
+    cveSubspec.gate
+        (CveEntry.attested 0x1F2E3D4C5B6A7988 0x1F2E3D4C5B6A7988 0x5A5A5A5A5A5A5A5A) = true :=
+  rfl
+
+theorem cve_subspec_rejects_unlisted (digest : UInt64) :
+    cveSubspec.gate (CveEntry.unlisted digest) = false := rfl
+
+theorem cve_subspec_rejects_digest_mismatch (expected actual receipt : UInt64)
+    (h : (expected == actual) = false) :
+    cveSubspec.gate (CveEntry.attested expected actual receipt) = false := by
+  simp [cveSubspec, cveGate, h]
+
+theorem cve_subspec_rejects_unbound_receipt (expected receipt : UInt64)
+    (h : (receipt != 0) = false) :
+    cveSubspec.gate (CveEntry.attested expected expected receipt) = false := by
+  simp [cveSubspec, cveGate, h]
+
+theorem cve_subspec_pos_ne_neg : cveSubspec.posWitness ≠ cveSubspec.negWitness := by
+  intro h
+  exact CveEntry.noConfusion h
+
 end TurboLean.PolicyGates

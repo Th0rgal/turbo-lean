@@ -1760,6 +1760,37 @@ pub fn execute_mcp_audit_spec(
     project_dir: Option<&Path>,
 ) -> serde_json::Value {
     let t0 = Instant::now();
+    // Decl-only calls with a per-request workspace must forward `project_dir`: resolve the
+    // target through the project's spec surface (per-target resolution + project policy),
+    // mirroring `turbo-lean audit-spec --decl <decl> <project_dir>`. The workspace may
+    // arrive relative to the caller's CWD. Without a workspace, decl-only keeps the
+    // existing empty-target error.
+    let owned_file: std::borrow::Cow<'_, Path>;
+    let owned_project_dir: Option<std::borrow::Cow<'_, Path>>;
+    if file.as_os_str().is_empty() && decl.is_some() {
+        match project_dir.filter(|pd| !pd.as_os_str().is_empty()) {
+            Some(pd) => {
+                let anchored = if pd.is_relative() {
+                    std::env::current_dir()
+                        .map(|cwd| cwd.join(pd))
+                        .unwrap_or_else(|_| pd.to_path_buf())
+                } else {
+                    pd.to_path_buf()
+                };
+                owned_file = std::borrow::Cow::Owned(anchored.clone());
+                owned_project_dir = Some(std::borrow::Cow::Owned(anchored));
+            }
+            None => {
+                owned_file = std::borrow::Cow::Borrowed(file);
+                owned_project_dir = project_dir.map(std::borrow::Cow::Borrowed);
+            }
+        }
+    } else {
+        owned_file = std::borrow::Cow::Borrowed(file);
+        owned_project_dir = project_dir.map(std::borrow::Cow::Borrowed);
+    }
+    let file: &Path = owned_file.as_ref();
+    let project_dir: Option<&Path> = owned_project_dir.as_deref();
     let resolved_file = if !file.as_os_str().is_empty() && file.is_relative() && !file.exists() {
         project_dir
             .filter(|pd| !pd.as_os_str().is_empty())
@@ -3166,6 +3197,105 @@ mod tests {
             bad_cfg["result"]["isError"], true,
             "malformed project_dir/turbo-lean.toml must fail closed: {bad_cfg}"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_mcp_audit_spec_decl_only_forwards_explicit_project_dir() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!(
+            "turbo_mcp_audit_spec_decl_only_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        let proj = root.join("proj");
+        fs::create_dir_all(proj.join("Specs")).unwrap();
+        fs::write(
+            proj.join("turbo-lean.toml"),
+            "[audit_spec]\nforbid_namespaces = [\"Secret\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            proj.join("Specs/Probe.lean"),
+            "namespace Secret\ntheorem hidden1 (n : Nat) (h : n > 0) : n >= 1 := by omega\nend Secret\ntheorem open1 (n : Nat) (h : n > 0) : n >= 1 := by omega\n",
+        )
+        .unwrap();
+
+        // Decl-only `turbo_audit_spec` with an explicit per-request `project_dir` must
+        // resolve its target through the project (per-target spec resolution + project
+        // policy) instead of failing on an empty target path, mirroring
+        // `turbo-lean audit-spec --decl hidden1 <project_dir>`.
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
+        for (tag, pd_arg) in [
+            ("absolute", proj.to_string_lossy().into_owned()),
+            ("relative", "proj".to_string()),
+        ] {
+            let resp = handle_mcp_jsonrpc_request(
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 95,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "turbo_audit_spec",
+                        "arguments": {
+                            "decl": "hidden1",
+                            "project_dir": pd_arg
+                        }
+                    }
+                }),
+                None,
+                Some(&root.join(".cache")),
+            )
+            .unwrap();
+            let parsed: serde_json::Value =
+                serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            assert_eq!(parsed["ok"], false, "({tag}) {parsed}");
+            assert!(
+                parsed["forbidden_scope_decls"]
+                    .as_array()
+                    .is_some_and(|a| !a.is_empty()),
+                "({tag}) decl-only audit must pick up forbid_namespaces from project_dir: {parsed}"
+            );
+            let reported_file = parsed["file"].as_str().unwrap_or_default();
+            assert!(
+                !reported_file.is_empty(),
+                "({tag}) decl-only audit must report a resolved target file: {parsed}"
+            );
+            assert!(
+                std::path::Path::new(reported_file).starts_with(&proj),
+                "({tag}) resolved target must live under project_dir: {parsed}"
+            );
+        }
+
+        // Decl-only with no workspace at all keeps the existing empty-target error.
+        let no_ws = handle_mcp_jsonrpc_request(
+            &serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 96,
+                "method": "tools/call",
+                "params": {
+                    "name": "turbo_audit_spec",
+                    "arguments": {
+                        "decl": "hidden1"
+                    }
+                }
+            }),
+            None,
+            Some(&root.join(".cache")),
+        )
+        .unwrap();
+        let parsed_no_ws: serde_json::Value =
+            serde_json::from_str(no_ws["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(parsed_no_ws["ok"], false, "{parsed_no_ws}");
+        assert!(
+            parsed_no_ws["error"].as_str().is_some_and(|e| !e.is_empty()),
+            "decl-only without workspace must surface a target error: {parsed_no_ws}"
+        );
+        std::env::set_current_dir(prev_cwd).unwrap();
         let _ = fs::remove_dir_all(&root);
     }
 
