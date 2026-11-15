@@ -859,6 +859,59 @@ fn trusted_git_never_runs_submodule_only_filters() -> Result<()> {
     Ok(())
 }
 
+/// Recorded diagnostic of the first fail-closed trusted-Git fallback in this process, so a
+/// unit test can assert the warning is loud and emitted exactly once.
+#[cfg(test)]
+static GIT_UNAVAILABLE_WARNING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn clear_git_unavailable_warning_for_test() {
+    *GIT_UNAVAILABLE_WARNING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+#[cfg(test)]
+pub(crate) fn git_unavailable_warning_for_test() -> Option<String> {
+    GIT_UNAVAILABLE_WARNING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+#[cfg(test)]
+fn warn_git_unavailable_once(_project: &Path, _reason: &str) {}
+
+#[cfg(test)]
+#[test]
+fn git_unavailable_fallback_warns_loudly_once() -> Result<()> {
+    // Serializes against tests that mutate TURBO_LEAN_GIT (their Git failures must not
+    // interleave with the exactly-once assertions below).
+    let _env_guard = crate::pack::tests::env_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    clear_git_unavailable_warning_for_test();
+    assert!(git_unavailable_warning_for_test().is_none());
+
+    warn_git_unavailable_once(Path::new("/tmp/turbo-p8-proj"), "git 2.43.0 < 2.46");
+    let first = git_unavailable_warning_for_test()
+        .expect("fail-closed trusted-Git fallback must emit a loud one-time warning");
+    assert!(first.contains("WARNING"), "{first}");
+    assert!(first.contains("edit-locality is disabled"), "{first}");
+    assert!(first.contains("Git >= 2.46"), "{first}");
+    assert!(first.contains("TURBO_LEAN_GIT"), "{first}");
+    assert!(first.contains("/tmp/turbo-p8-proj"), "{first}");
+    assert!(first.contains("git 2.43.0 < 2.46"), "{first}");
+
+    // Exactly one diagnostic per process: a second failure stays silent.
+    warn_git_unavailable_once(Path::new("/tmp/turbo-p8-other"), "another failure");
+    assert_eq!(
+        git_unavailable_warning_for_test().as_deref(),
+        Some(first.as_str())
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 #[test]
 fn trusted_git_uncached_resolution_validates_override_and_ci_fail_closed() -> Result<()> {
