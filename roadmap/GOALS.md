@@ -134,7 +134,7 @@ Even with machine-checked proofs, specification blind spots (e.g., mismatched FF
 
 ## Remaining Open Roadmap Items
 
-> **Order of work**: see [`HORIZONS.md`](./HORIZONS.md). `G3.1`/`G3.2` (one proven `LCNF → LNIR` path) come first, measured build speed second, accelerator plugins and the remaining backends last.
+> **Order of work**: see [`HORIZONS.md`](./HORIZONS.md). It also lists which statements below are stale; this section is replaced by one issue per leaf in the roadmap truth pass (`R0`).
 
 ### Priority 0 — Zygote CoW fork pool
 

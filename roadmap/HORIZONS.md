@@ -1,121 +1,198 @@
-# Sequencing: three horizons (`roadmap/HORIZONS.md`)
+# Sequencing and work graph (`roadmap/HORIZONS.md`)
 
-> **Scope**: the order in which the goals in [`GOALS.md`](./GOALS.md) are worked, and why. It adds no theorem contract and changes none in [`VALIDATION_CONTRACTS.md`](./VALIDATION_CONTRACTS.md). Numbers are measured on `main` at `94dbd70` (2026-11-15) and are point-in-time.
+> **Scope**: the order in which the goals in [`GOALS.md`](./GOALS.md) are worked, as a dependency graph of leaf items that agents can take in parallel. It adds no theorem contract and changes none in [`VALIDATION_CONTRACTS.md`](./VALIDATION_CONTRACTS.md). Facts are from `main` at `94dbd70` (2026-11-15) and from sources linked inline; they are point-in-time.
 
-Source: Thomas's roadmap note of 2026-11-14 (prove Lean → IR first; build faster, hypothesis: pure-Lean kernel compiled by `LeanNative`, GPU if it pays; accelerator plugins last).
+Source: Thomas's roadmap note of 2026-11-14 (prove Lean → IR first; build faster, hypothesis: pure-Lean kernel compiled by `LeanNative`, GPU if it pays; accelerator plugins last), then a feasibility review of the code and of published results on 2026-11-15. The review changed two of the three ideas; what changed is said where it applies.
 
-| Horizon | Outcome | Goals it draws on |
+| Horizon | Outcome | Status of the original idea |
 | :--- | :--- | :--- |
-| **H1 (now)** | One formally proven path from Lean (`LCNF`) to `LNIR`. Every other path is deleted or fails closed to the stock Lean backend. | `G3.1`, `G3.2`, `G4` |
-| **H2 (next)** | Builds are faster, measured end to end. The pure-Lean kernel compiled by the H1 path is the first real workload. | `G1`, `G2`, issues `#407`–`#443` |
-| **H3 (later)** | Compiler performance through zero-TCB accelerator plugins driven by telemetry; the remaining backends get proofs. | `G3.3`, `G4`, `G5`, Track A |
+| **H1** | One proven path from `LCNF` to `LNIR` for first-order code with calls and recursion, with a measured coverage number. | Kept, with a smaller exit. Compiling the pure-Lean kernel moves to H3. |
+| **H2** | Faster agent loop and builds, measured end to end. | Kept. The native kernel and the GPU are no longer the levers. |
+| **H3** | Runtime objects, closures, a native kernel as benchmark, accelerator plugins, remaining backends. | Kept, later. |
 
 ---
 
-## Where the compiler stands
+## What the review found
 
-| Part | Size | Proof state |
-| :--- | ---: | :--- |
-| `lean/LeanNative` total | 187 files, 114k LOC | 0 `sorry`, 0 `axiom` |
-| `IR/Bridge.lean` | 245 LOC | entry point; delegates to the paths below |
-| `IR/RealLCNFBridge.lean` + `RealLCNFSemantics.lean` | 2,051 LOC | refinement proved for scalars, flat tuples, bounded Stage-1D ADTs, against an in-repo `LCNF` semantics |
-| `IR/BridgeHelpers.lean` | 2,357 LOC | lowering helpers outside the proved subset |
-| `Backend/` | 32 files, 31k LOC | typed AST printers proved on subsets; string emitters remain |
-| `Driver/CoreCLI.lean` | 11 `compile-*` / `emit-*` commands | one frontend, many emission paths |
+### The compiler (read from the code)
 
-`Bridge.lean` rejects, with `Unsupported …`: higher-order and escaping local functions, partial application, returning closures, signed `Int*` / `ISize`, `@[extern]` declarations, non-scalar external calls, and self tail recursion without a qualified loop lowering.
+- **What is proved.** `lowerRealLCNFDecl_sound` (`Proofs/RealLCNFBridgeProofs.lean`): if lowering succeeds and the source evaluation succeeds, the `LNIR` evaluation gives the same result at the same fuel. It is about the function the driver calls, not a model of it.
+- **What that covers.** One declaration at a time, no user calls, no recursion, scalars, flat tuples and small non-recursive inductives. A call to another user function is lowered, but the source semantics returns `unsupportedCall`, so the theorem says nothing about any declaration that makes one.
+- **What surrounds it unproved.** About 1,100 LOC of `BridgeHelpers.lean` run before and after the proved function (context building, type lowering, an `LCNF` rewrite, post-passes). A second lowering (`lowerPureCode`, a `partial def`) is taken when a declaration has no impure form and has no proof at all. About 250 LOC of helpers are dead.
+- **The source semantics is not independent.** `RealLCNFSemantics` imports the lowerer's file and shares its layout and type-lowering definitions.
+- **The IR lacks the concepts, not only the lowering.** `evalCode` has no function environment; `Val` has no closure, big `Nat`, string or array of objects; `LNIRCode` has no join point or general loop. The LLVM driver refuses any reference-counted inductive.
+- **Consequence.** `con-leche` uses recursive inductives, big `Nat`, arrays, hash maps, strings and `IO`. None of its declarations would lower today (its sources are pinned, not vendored, so this is inferred from its README).
 
-Two facts drive the plan:
+### Build time (from published numbers)
 
-1. **The proved lowering and the lowering that runs are not yet the same object.** A proof about a subset next to 2,357 LOC of unproved helpers proves less than it seems to.
-2. **The source semantics is trusted and in-repo.** `RealLCNFSemantics` is what "correct" means; nothing proves it matches what Lean executes.
+- **The kernel is a small share.** The one full-Mathlib profile found gives typeclass inference 36.5%, `simp` 15.4%, kernel checking 4.7% ([Zulip, undated](https://leanprover-community.github.io/archive/stream/287929-mathlib4/topic/Ways.20to.20speed.20up.20Mathlib.html)). No authoritative 2026 breakdown was found.
+- **Fast kernels already exist and ship.** Lean v4.35 bundles `con-leche`, `lean4lean` and `nanoda` behind `lake check --paranoid`. On Mathlib, `con-leche` reports 0.69× the official kernel's instructions and 100 s wall on 8 workers ([PERF.md](https://github.com/leanprover/con-leche/blob/master/PERF.md)).
+- **Upstream already parallelizes.** Proof bodies, kernel checks and compilation run in parallel within a file; the module system stops private changes at the file boundary; Lake has a content-addressed remote cache ([FRO talk, 2026-04-24](https://lean-lang.org/presentations/20260424_INRIA/)). Still open upstream: incremental elaboration state on disk, starting downstream builds early.
+- **GPU.** No result was found for GPU type checking or proof checking. The credible GPU results nearby are in optimization search (e-graph extraction), not checking.
+
+### Verified compilers (from the literature)
+
+- No mechanized semantics of `LCNF` exists upstream, and the code generator still changes every release. The source semantics is ours to define and to test.
+- No verified compiler from a functional language with closures and reference counting to LLVM was found. Mechanized soundness of Lean-style reference counting (`reset`/`reuse`) appears to be open; the published proofs are on paper.
+- Single-pass semantic-preservation proofs written by agents are demonstrated at the scale of one pass (CertiCoq ANF, about 7,800 lines, [arXiv 2602.20082](https://arxiv.org/abs/2602.20082)).
 
 ---
 
-## H1 — One proven path, Lean → `LNIR`
-
-### Principle: a narrow waist that fails closed
+## H1 — One proven path, first-order code
 
 ```
-LCNF.Decl ──lowerDecl──► Except Unsupported LNIRDecl      (one function, total, no IO)
-                │
-                └─ Unsupported ─► stock Lean C backend for that declaration
+LCNF.Decl ──lowerRealLCNFDecl──► Except Unsupported LNIRDecl      (one function)
+                    │
+                    └─ Unsupported ─► stock Lean backend for that declaration
 ```
 
-- **One lowering function.** `lowerDecl` is the only way `LNIR` is produced from Lean. No flag, stage or command selects another lowering.
-- **One theorem.** `lower_refines : lowerDecl d = .ok d' → Refines (evalLCNF d) (evalLNIR d')`, stated once and hash-pinned like the `V` contracts.
-- **Fail closed, never fall through.** What the proof does not cover returns a typed `Unsupported` and that declaration is compiled by the stock Lean backend. An unproved fast path is not an option the driver has.
-- **Delete, don't keep.** A helper whose cases are covered by the proved path is removed in the same PR (`ΔLOC ≤ 0`, principle 5 of the README).
-- **Backends frozen.** During H1 only the LLVM path through the proved `LLVMAst` printer is maintained. PTX, Metal, StableHLO, Hybrid and C-ABI emission are labelled *unverified tier* in `--help` and receive no features until H3.
+Rules: one lowering function; what the proof does not cover returns `Unsupported` and is compiled by the stock backend; a helper the proved path does not need is deleted in the same PR; backends other than LLVM are an *unverified tier* and get no features until H3.
 
-### Tracks, in order
-
-| Track | Work | Accept |
+| Rung | Outcome | Why it is a rung |
 | :--- | :--- | :--- |
-| **H1.0 Inventory** (read-only) | A generated matrix: each `LCNF` constructor and primitive × {proved, lowered unproved, rejected}. Coverage on three corpora: `con-leche`, `Batteries`, the C1 run tests (share of declarations that lower, and which rejection stops each of the rest). | Matrix is produced by a script in CI, not written by hand. |
-| **H1.1 Attack the semantics** | Differential test of `RealLCNFSemantics` (as an interpreter) against stock Lean execution on the C1 corpus and a grammar fuzzer. Every divergence is a semantics bug to fix before anything is proved on top. | `mismatch_count == 0` on the corpus; divergences reduced into regression tests. |
-| **H1.2 Single path** | Route every ingest through the proved lowering. Unproved helper cases become `Unsupported`. Delete what is now dead. | `Bridge.lean` has one callee; coverage from H1.0 does not drop on the proved subset; `ΔLOC < 0`. |
-| **H1.3 Widen, one constructor at a time** | Order set by the H1.0 rejection counts on `con-leche` (expected: general recursion, closures and partial application, join points and `letrec`, signed integers). Each constructor is one leaf theorem with a frozen statement. | Leaf kernel-checked, `0 sorryAx`; the coverage number moves. |
-| **H1.4 Close** | Compose the leaves into `lower_refines`. Mutate the lowerer and the statement (meta-spec): each mutant must be killed by the proof or the differential test. | Theorem pinned; mutant kill matrix in CI. |
+| **L1 Single path** | The pure lowering and dead helpers are gone. The theorem is stated for the context the driver builds, with no unproved post-pass (each one is proved, validated by a proved checker, or removed). | Today's theorem holds under hypotheses nobody checks. |
+| **L2 Calls** | Both semantics take a function environment. Non-recursive calls between declarations are proved. | Without it the theorem is empty for almost all real code. |
+| **L3 Recursion and loops** | Fuel-indexed calls; `LNIR` gets a join-point / loop construct that replaces inlining a join point at every jump. Self and mutual recursion proved. | Needs the theorem statement redesigned, not one more case. |
 
-**Exit of H1**: `con-leche` (≈1,700 LOC of pure Lean) lowers through `lowerDecl` with no `Unsupported`, and the LLVM build of it agrees with the stock-compiled binary on every `.olean` of the corpus.
+**Exit of H1**: L1–L3 merged, the statement hash-pinned, and a generated coverage number (share of `Batteries` declarations that lower through the proved path, and the rejection that stops each of the rest).
 
-### What makes this reliable
+Reliability measures that go with it:
 
-- **The trusted base is written down.** One file lists it: Lean's kernel, the `LCNF` semantics, the `LNIR` semantics, the LLVM printer, LLVM itself. A PR that grows it says so.
-- **Trusted definitions are tested, since they cannot be proved.** H1.1 for the source side, the 3-way conformance suite (`G5`) for the target side.
-- **Statements are frozen before proofs.** A leaf whose statement turns out false is recorded as a false goal and restated under the spec-change rules; it is not proved around.
-- **The compiler checks itself.** Once `con-leche` compiles natively, the native kernel re-checks the compiler's own correctness proofs in CI, beside the C++ kernel (`--kernel both`).
+- **A written trusted base** (`docs/TRUSTED_BASE.md`): Lean's kernel, the `LCNF` semantics, the `LNIR` semantics, the LLVM printer, LLVM, the Lean runtime.
+- **The source semantics is tested against Lean itself** (differential interpreter test) and its definitions are separated from the lowerer's.
+- **The theorem's shape is stated honestly**: forward simulation on successful runs. A second statement (a source error is never turned into a result) is a later leaf.
+- **Mutants** of the lowerer and of the statement must be killed by the proof or by the differential test.
 
 ---
 
-## H2 — Build faster
+## H2 — Faster, measured
 
-### Measure first
+Turbo-lean's users are agents running `check` on one declaration thousands of times. That loop, not a cold Mathlib build, is the number to move.
 
-The methodology is to find every bottleneck of the loop before optimizing one. The first H2 track is therefore a measurement, on a fixed corpus (`Batteries`, `PFR`, one `Mathlib` slice), of where wall time goes: import, elaboration, kernel check, compiled-import audit, I/O, process start. `B2` already states that cold elaboration dominates; the phase timings from `#408` make that a number.
+| Order | Work | Basis |
+| :-- | :--- | :--- |
+| 1 | **Make timing true** (`#408`: phases cover ≥ 90% of wall) and pin a benchmark. Re-measure the open performance issues; several may be fixed already. | Nothing below can be judged without it. |
+| 2 | **Stop redoing work**: host-effect taint, import rebuilds, closure purges, tree copies (`#407`, `#433`, `#434`, `#438`–`#442`). | Diagnosed waste on every call. |
+| 3 | **One resource budget that reaches every worker** (`#435`, `#437`, `#443`), then parallel replay under it. | Parallelism is bounded by RAM. |
+| 4 | **Skip elaboration on warm hits** with CAS proof replay (`#452`), after measuring its hit rate on real edit sequences. | Elaboration is the dominant phase. |
+| 5 | **Use the bundled kernels** for `--kernel both` and `auto`, with `--jobs`. | Replaces "compile our own kernel for speed". |
+| 6 | Elaboration reuse upstream has not shipped (on-disk incremental state, early downstream start). | Only after 1 shows where cold time goes. |
 
-**Every H2 track states its kill criterion with its target.** A change that does not move the end-to-end number on the corpus is deleted.
+**Changed from the note**: a native `con-leche` is not a speed lever (kernel ≈ 5% of build time, and faster kernels already ship). It stays in H3 as a compiler benchmark. **GPU** is reduced to one measurement (H2.G): the share of loop time in batched hashing or closed decidable evaluation. Under 10% and it closes.
 
-### Candidates, ranked by expected gain against risk
-
-| # | Idea | Why it should pay | Risk / open question |
-| :-- | :--- | :--- | :--- |
-| 1 | **Do not elaborate what is already proved.** `LNIR_EXPR_V1` CAS proof replay (`#452`) on warm hits. | Removes the dominant phase on unchanged declarations. | Hit rate on real edit sequences is unmeasured. |
-| 2 | **Stop redoing work.** Issues `#407`, `#433`, `#438`–`#440`: imports rebuilt per call, taint that disables reuse, closure copies. | Pure waste, already diagnosed. | None beyond the fixes themselves. |
-| 3 | **Check declarations in parallel.** With the import prefix fixed, kernel checks are independent. `con-leche --jobs`, CoW zygote forks. | Scales with cores on replay-heavy commands (`ci-verify`, `pr-verify`, `--kernel both`). | Bounded by RAM, not cores; needs `#435` (caps reaching replay workers). |
-| 4 | **Native pure-Lean kernel.** `con-leche` compiled by the H1 path, tuned for this one workload (arena allocation, hash-consed `Expr`, unboxed `Level`/`Name` ids). | A second, independent kernel that is cheap enough to always run; gives H1 its acceptance workload and H3 its benchmark. | Gains only where kernel time is a real share (measurement above). Upstream reports 0.69× the C++ kernel's instructions already. |
-| 5 | **Distributed and remote reuse.** Content-addressed `.olean` and proof CAS shared across machines; prebuild on `lean.ci`. | Cold builds become downloads. | Trust: every reused artifact must be re-checked or carry a receipt. |
-| 6 | **Faster elaboration itself.** Instance and `simp`-set caches kept across forks, tactic blocks elaborated speculatively in parallel, per-tactic profiles fed back to authors. | Attacks the dominant phase on cold builds. | Largest design surface; needs the profile first. |
-| 7 | **GPU.** | See below. | See below. |
-
-### GPU: a feasibility track, not a plan
-
-Type checking is `whnf`, definitional equality and substitution over pointer-linked terms with data-dependent control flow. That is a poor fit for a GPU, and no result we know of shows a kernel checker gaining from one. The parts of a build that do fit are narrower:
-
-- hashing and content addressing of `.olean` regions and CAS objects (batched BLAKE3);
-- bit-parallel evaluation of closed, decidable terms (`decide`, `bv_decide`-shaped goals) across many inputs;
-- bulk structural hashing for hash-consing large `Expr` DAGs.
-
-One read-only feasibility track measures the share of build time these cover on the corpus. **Kill criterion**: under 10% of wall time addressable, or under 2× end to end on a prototype, and the track closes with its numbers recorded.
+Every H2 leaf carries a before/after on the pinned benchmark; a change that does not move it is reverted.
 
 ---
 
-## H3 — Compiler performance by accelerator plugins
+## H3 — Later
 
-Starts when H1 has closed. Until then, Track A in [`OPEN_CHALLENGES.md`](./OPEN_CHALLENGES.md) stays open to outside contributions but is not staffed.
+In dependency order: recursive inductives with real reference counting, enabled in LLVM (a mechanized soundness proof of `reset`/`reuse` on a core calculus would be a result of its own); runtime objects (`Nat`, `Array`, `String`, external `Init` calls), where the trusted base is really decided; closures and partial application; `IO`. Then `con-leche` compiled natively, as the standing benchmark and as a second kernel that re-checks the compiler's proofs.
 
-- **Plugins stay outside the trusted base.** An accelerator proposes (`rewritten_proof`, `LNIR_WIRE_V1` rewrite, cost profile); the kernel or the total `SymbolicTV` checker disposes. A wrong plugin costs time, never soundness.
-- **Telemetry picks the work.** Per-pass and per-kernel timings, recorded locally by default, rank which pass or plugin is worth writing. The native kernel from H2 is the standing benchmark.
-- **A pass that does not move the benchmark is deleted.**
-- **Then the remaining backends.** PTX, Metal, StableHLO and the upstream bridges (`lean-mlir`, `LNSym`, `sail-riscv-lean`, `G3.3`) move from the unverified tier to proved, one target at a time, in the order telemetry says they are used.
+Accelerator plugins start once there is a benchmark to rank them: untrusted search proposes a rewrite together with a certificate (a rewrite sequence, as proof-producing e-graphs do), a proved checker disposes, telemetry picks what to write, and a pass that does not move the benchmark is deleted. The remaining backends and upstream bridges (`G3.3`, `G4`) follow, in the order telemetry says they are used.
 
 ---
 
-## What this changes in the existing queue
+## Work graph
 
-- `G3.1` and `G3.2` become H1 and move ahead of all backend work.
-- `G3.3` bridge extensions and `G4` emitter unification pause until H3, except fixes.
-- `G1` (`con-leche` over real `.olean`) continues: it is the H1 exit workload and H2 candidate 4.
-- The performance issues `#407`–`#443` and `G2` replay are H2 candidates 1–2 and continue.
-- `G5` conformance continues: it is how the trusted semantics are tested.
+Leaves are sized to one PR and one owner. *RO* means a read-only measurement or feasibility step comes first.
+
+```mermaid
+flowchart LR
+  subgraph Unblock
+    R0[R0 roadmap truth pass]
+    S1[S1 split module_builder.rs]
+    S2[S2 split zygote.rs + lake_build.rs]
+    S3[S3 split BridgeHelpers + ZygoteWorker]
+    HY1[HY1 contract script fragments]
+  end
+  subgraph H2
+    M0[M0 true phase timings] --> M1[M1 pinned bench + re-triage]
+    M1 --> P1[P1 no redone work]
+    S1 --> P1
+    S2 --> P1
+    S2 --> P2[P2 standalone re-check]
+    S2 --> P3[P3 one budget]
+    P3 --> H23[H2.3 parallel replay]
+    M1 --> G2a[G2a replay hit rate] --> G2b[G2b replay on by default]
+    M1 --> H2G[H2.G GPU share]
+    P9[P9 land csimp scan + policy first] --> G1a[G1a csimp in cache keys]
+    P9 --> G1c[G1c auto selects bundled kernel]
+  end
+  subgraph H1
+    H10[H1.0 coverage matrix] --> HF[H1.F freeze statement]
+    H11[H1.1 semantics vs Lean] --> L1[L1 single path]
+    S3 --> L1
+    H10 --> L1
+    L1 --> L2[L2 calls]
+    HF --> L2
+    L2 --> L3[L3 recursion + loops]
+    L3 --> H14[H1.4 mutants + pin]
+  end
+  H14 --> H3[H3 ladder]
+```
+
+| id | Outcome | Owns | Needs | Accept | Size |
+| :-- | :--- | :--- | :--- | :--- | :-- |
+| **R0** | Roadmap says what is true (stale items below); `docs/TRUSTED_BASE.md` | `roadmap/*.md` | – | `sync_docs_inventory.py --check` | S |
+| **HY1** | Contract script split into per-milestone fragments, so proof PRs stop colliding | `scripts/contract.d/` | – | `verify_roadmap_contract.sh` output unchanged | S |
+| **S1** | `module_builder.rs` (43k LOC) split: dag / freshness / host-effects / publish | that file | – | `cargo test --locked`, no public API diff | L |
+| **S2** | `zygote.rs` (17k) and `lake_build.rs` (15k) split by concern | those files | – | same | L |
+| **S3** | `BridgeHelpers.lean` and `ZygoteWorker.lean` split by construct / command | those files | – | contract script; axiom-audit counts unchanged | M |
+| **M0** | `#408`: phase timings cover ≥ 90% of wall | `phase_timing.rs` (new) | – | test asserts the sum | M |
+| **M1** *RO* | Pinned benchmark (`Batteries`, `PFR`), baseline JSON; re-triage `#407`–`#443`; close `#371` | `scripts/bench_check_loop.py` | M0 | script exits 0, JSON committed | M |
+| **P1** | No redone work on a warm hit (`#407` `#433` `#434` `#438`) | host-effects modules | S1 S2 M1 | bench: zero `lake --no-cache` on warm hit | L |
+| **P2** | Standalone re-check: no tree copy, budgeted timeout, `.ir` included (`#440`–`#442`) | `lake_build/standalone` | S2 | three regression tests | M |
+| **P3** | One budget object reaches all workers (`#435` `#437` `#443`) | `zygote/budget` | S2 | rlimit test; `eval --timeout-ms 0` passes | M |
+| **P4** *RO* | Declaration identity probe in O(declaration) (`#409`) | `splitter.rs` | M1 | bench < 200 ms | M |
+| **P5** | Daemon `/eval` identity fix (`#432`) | `server.rs`, `zygote/identity` | S2 | HTTP test returns 200 | S |
+| **P6** | Snapshot leases (`#439`) | `zygote/snapshots` | S2 | two-run test | S |
+| **P7** | `build <Lib>` scope (`#436`) | `module_builder/dag` | S1 | fixture | M |
+| **P8** | Git < 2.46 fails loudly (`#415`) | `trusted_tools.rs` | – | unit test | S |
+| **P9** | Land `#455`; import policy for `csimp` / `unsafe` decided before expensive work (`#411` `#412`) | `kernel.rs`, worker audit | S3 | 140 Batteries calls pass | M |
+| **P10** | Content-hash freshness, `--frozen-cone` (`#339`) | `module_builder/freshness` | S1 | hardlinked-cone fixture, 0 rebuilds | M |
+| **G1a** | `csimp` digest in action and cache keys | `db.rs` keys | P9 | key-diff test | S |
+| **G1b** *RO* | The M2 theorems hold over real `.olean`, or the docs say they are about a model | `ConLeche.lean` | – | contract script | L |
+| **G1c** | `--kernel auto` selects the bundled `con-leche` when the toolchain matches | `kernel.rs` | P9 | selection test | S |
+| **G2a** *RO* | CAS replay hit rate on recorded edit sequences | bench script | M1 | number recorded | S |
+| **G2b** | Replay on by default for warm `check`, or deleted | `lake_build/replay` | G2a S2 | bench delta | M |
+| **H2.3** | Parallel replay under the RAM budget | pool module | P3 | bench scaling | M |
+| **H2.G** *RO* | GPU-addressable share of loop time | doc only | M1 | number against the 10% line | S |
+| **A1** | `#367`: strict `[audit_spec]` TOML | `audit_spec.rs` parser | – | typo-key test fails closed | S |
+| **A2** *RO* | `#367`: kernel-backed witness | `PolicyGates.lean` | A1 | `audit-spec` JSON | L |
+| **L299** | `#299`, one fixture per bullet | lakefile parser | S1 | Lake-parity fixtures | M |
+| **H1.0** *RO* | Generated `LCNF` coverage matrix on `Batteries` and C1 | `scripts/lcnf_coverage.py` | – | CI job emits JSON | M |
+| **H1.1** | `RealLCNFSemantics` as interpreter vs stock Lean; shared definitions separated from the lowerer | `Driver/EvalLCNFCLI.lean` (new) | – | `mismatch_count == 0` | M |
+| **H1.F** | Statement of the H1 theorem frozen and pinned; unverified backends labelled in `--help` | `SpecLocked.lean`, `CoreCLI.lean` | H1.0 | hash pin | S |
+| **L1** | Single path (rung L1) | `Bridge.lean`, helper split | S3 H1.0 H1.1 | one lowering callee; `ΔLOC < 0` | L |
+| **L2** | Calls (rung L2) | `Semantics/Eval.lean`, `Proofs/LowerCalls.lean` | L1 H1.F | leaf `0 sorryAx`; matrix moves | L |
+| **L3** | Recursion and loops (rung L3) | `IR/AST.lean`, `Proofs/LowerRec.lean` | L2 | same | L |
+| **H1.4** | Mutant kill matrix; coverage number published | `Proofs/LowerRefines.lean` | L3 | mutants in CI | M |
+| **C2x** | `Batteries` as nightly C2 conformance | workflow, packages dir | – | `--tier C2` green | M |
+| **C4x** | 10k-seed nightly alias fuzzing | `fuzz_lcnf_conformance.py` | – | nightly green | M |
+| **C1x** | C1 corpus to 250 programs, chosen by the matrix | corpus manifest | H1.0 | `--tier C1` | L |
+
+**Start width**: R0, HY1, S1, S2, S3, M0, P8, A1, G1b, H1.0, H1.1, C2x, C4x have no unmet dependency and disjoint files: thirteen leaves, about eight at once per machine because five need Lean builds.
+
+**Critical path**: H1.0 / H1.1 / S3 → L1 → L2 → L3 → H1.4. Three large proof items in series; nothing shortens it except starting S3, H1.0 and H1.1 now.
+
+**The three splits pay first.** Seven open issues need `module_builder.rs`, nine need `zygote.rs` or `lake_build.rs`, and every H1 rung needs `BridgeHelpers.lean`. Until S1–S3 land, those items cannot run in parallel without conflicting.
+
+---
+
+## Cleanup this implies (R0)
+
+**One owner per kind of fact.** Remaining work: one GitHub issue per leaf, and the "Remaining Open Roadmap Items" section of `GOALS.md` is deleted. Order of work: this file. Theorem signatures: the contract script, with docs linking to it. Coverage status: JSON generated by the conformance runner. Pre-PR commands: `AGENTS.md` (fold `MAXWELL_STRATEGIES.md` into it).
+
+**Stale statements to fix.**
+
+| Where | Says | Is |
+| :--- | :--- | :--- |
+| `GOALS.md` G2 Stage B | queued | landed in `#451`, `#452` |
+| `GOALS.md` G1, `OPEN_CHALLENGES` B1 | wiring `con-leche` into `--kernel` remains | wired as an external binary (`#448`, `#449`); `auto` never selects it; cache-key binding open |
+| `OPEN_CHALLENGES` B1, B2 gates | the M2 / M3 theorems are discharged | they hold over the in-repo `"OLEN"` model, not real `.olean` (the root `README` says so) |
+| `GOALS.md` "Priority 0" | remaining | describes landed behaviour |
+| `GOALS.md` G5 | `CAbiEmit.lean` removed | file exists, 1,275 LOC |
+| `roadmap/README.md` principle 3 | 7,500+ lines of string interpolation in `CoreCLI.lean` | 995 LOC |
+| Issues `#407`, `#409`, `#411` | open, data of 2026-11-10 | verified-import stamps landed since; re-measure in M1 |
+
+**Park, with a note saying why.** `BENDRT_EXPLORATION.md` (529 lines; BRT2–BRT5 contradict the backend freeze; keep BRT0 as input to L3). Track A accelerators until H3. Further theorems on the `"OLEN"` model: either G1b makes them real or they stop. `G4`'s "≥ 50% LOC compression" and `G1`'s "< 0.65× instructions": targets with no consumer and no gate.
