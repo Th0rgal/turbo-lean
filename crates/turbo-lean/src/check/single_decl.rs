@@ -3588,6 +3588,7 @@ pub(super) fn check_single_decl(
     remote_http: Option<&str>,
     allow_sorry: bool,
 ) -> Result<serde_json::Value> {
+    let decl_prep_started = Instant::now();
     let active_file = resolved_file.to_path_buf();
     let mut active_src = recover_decl_source(src, &active_file)?;
 
@@ -3653,6 +3654,7 @@ pub(super) fn check_single_decl(
     if active_src.is_empty() {
         active_src = fs::read_to_string(&active_file)?;
     }
+    crate::phase_timing::record_active_span_since("split_and_hygiene", decl_prep_started);
     let attested = confirm_decl_identity_with_budget(
         &active_src,
         shard,
@@ -3665,6 +3667,7 @@ pub(super) fn check_single_decl(
         attested.decl_name.clone(),
         attested.kernel_type_hash.clone(),
     )];
+    let cas_lookup_started = Instant::now();
     let file_lean_args =
         crate::module_builder::try_resolve_lean_args_for_path(canon_dir, Some(&active_file))?;
 
@@ -3706,6 +3709,7 @@ pub(super) fn check_single_decl(
         });
         insert_allow_sorry_fields(&mut hit_json, allow_sorry, false, &[]);
         kernel_prov.insert_json_fields(&mut hit_json);
+        crate::phase_timing::record_active_span_since("cas_lookup", cas_lookup_started);
         hit_json
     };
 
@@ -3739,6 +3743,7 @@ pub(super) fn check_single_decl(
             }
             return Ok(out_json);
         }
+        let elab_started = Instant::now();
         let (env_vars, _) = resolve_lake_env(store, canon_dir)?;
         let lean_bin = resolve_lean_bin(canon_dir)?;
         let (output, report) = crate::zygote::run_audited_lean_shard_at_with_full_report(
@@ -3840,6 +3845,7 @@ pub(super) fn check_single_decl(
         });
         insert_allow_sorry_fields(&mut result, false, false, &[]);
         kernel_prov.insert_json_fields(&mut result);
+        crate::phase_timing::record_active_span_since("elaboration", elab_started);
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&result)?);
@@ -3887,6 +3893,7 @@ pub(super) fn check_single_decl(
         let (env_vars, env_cache_hit) = resolve_lake_env(store, canon_dir)?;
         let lean_bin = resolve_lean_bin(canon_dir)?;
         let t0 = &prewarm_local_check_zygote(store, canon_dir, toolchain, t0)?;
+        let elab_started = Instant::now();
         let local_lean_path = resolve_remote_lean_path(canon_dir, Some(&env_vars));
         let mut stub_targets: Vec<String> = single_set.iter().cloned().collect();
         stub_targets.sort();
@@ -4138,6 +4145,7 @@ pub(super) fn check_single_decl(
             "elapsed_ms": dur_ms
         });
         kernel_prov.insert_json_fields(&mut out_json);
+        crate::phase_timing::record_active_span_since("elaboration", elab_started);
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -4194,6 +4202,7 @@ pub(super) fn check_single_decl(
                 }
                 return Ok(out_json);
             }
+            let elab_started = Instant::now();
             if active_src.is_empty() {
                 active_src = fs::read_to_string(&active_file)
                     .with_context(|| format!("Failed to read {}", active_file.display()))?;
@@ -4430,6 +4439,7 @@ pub(super) fn check_single_decl(
                 split.shards.len(),
                 dur_ms,
             )?;
+            crate::phase_timing::record_active_span_since("elaboration", elab_started);
             return Ok(out_json);
         }
     }
@@ -4498,6 +4508,7 @@ pub(super) fn check_single_decl(
             Ok(out_json)
         }
         SingleflightOutcome::Leader(lease) => {
+            let elab_started = Instant::now();
             let same_as_initial = active_file == resolved_file;
             let canon_file = if same_as_initial {
                 canon_resolved_initial.to_path_buf()
@@ -5670,6 +5681,7 @@ pub(super) fn check_single_decl(
                 };
                 pack::warm_local_zygote_daemon_nonblocking(store, &ev);
             }
+            crate::phase_timing::record_active_span_since("elaboration", elab_started);
             Ok(out_json)
         }
     }

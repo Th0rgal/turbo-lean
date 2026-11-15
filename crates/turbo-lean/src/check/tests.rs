@@ -3486,8 +3486,7 @@ fn test_check_phase_timings_cover_at_least_90_percent_of_wall() -> Result<()> {
 
     let cache_dir = tmp_dir.join("cache");
     let mut store = TurboStore::open(Some(&cache_dir))?;
-    let Ok((_ev, lean_bin)) =
-        crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "")
+    let Ok((_ev, lean_bin)) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "")
     else {
         let _ = fs::remove_dir_all(&tmp_dir);
         return Ok(());
@@ -3520,7 +3519,9 @@ fn test_check_phase_timings_cover_at_least_90_percent_of_wall() -> Result<()> {
         .get("phase_timings")
         .context("missing phase_timings in check --decl output")?;
     let wall_ms = pt["wall_ms"].as_f64().context("missing wall_ms")?;
-    let phase_sum_ms = pt["phase_sum_ms"].as_f64().context("missing phase_sum_ms")?;
+    let phase_sum_ms = pt["phase_sum_ms"]
+        .as_f64()
+        .context("missing phase_sum_ms")?;
     let phase_covered_ms = pt["phase_covered_ms"]
         .as_f64()
         .context("missing phase_covered_ms")?;
@@ -3565,7 +3566,8 @@ fn test_check_phase_timings_cover_at_least_90_percent_of_wall() -> Result<()> {
 
     let file_t0 = Instant::now();
     let mut cold_file_store = TurboStore::open(Some(&tmp_dir.join("cold_file_cache")))?;
-    let file_json = evaluate_check_command_value(&mut cold_file_store, mod_file.clone(), None, proj.clone())?;
+    let file_json =
+        evaluate_check_command_value(&mut cold_file_store, mod_file.clone(), None, proj.clone())?;
     let file_caller_wall_ms = file_t0.elapsed().as_secs_f64() * 1000.0;
     let file_pt = file_json
         .get("phase_timings")
@@ -3584,4 +3586,3 @@ fn test_check_phase_timings_cover_at_least_90_percent_of_wall() -> Result<()> {
     let _ = fs::remove_dir_all(&tmp_dir);
     Ok(())
 }
-

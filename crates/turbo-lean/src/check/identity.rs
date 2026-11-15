@@ -321,7 +321,8 @@ fn resolve_identity_probe_context(
     Ok((lean_args, env))
 }
 
-/// Build the local zygote before the request timer starts, but only on the local miss path.
+/// Build the local zygote on the local miss path while preserving the caller's command start `t0`
+/// and recording the prewarm duration in the active [`crate::phase_timing::PhaseTimer`].
 /// Remote checks and full cache hits never call this, so they do not need a local Lean compiler.
 pub(super) fn prewarm_local_check_zygote(
     store: &TurboStore,
@@ -332,10 +333,13 @@ pub(super) fn prewarm_local_check_zygote(
     if crate::zygote::invocation_timeout_ms().is_some() {
         return Ok(*t0);
     }
-    let (lean_bin, _, _, _) =
-        crate::module_builder::resolve_toolchain_compiler(canon_dir, toolchain)?;
-    crate::zygote::ensure_zygote_binary(store, &lean_bin, &HashMap::new())?;
-    Ok(Instant::now())
+    crate::phase_timing::record_active_phase("zygote_prewarm", || -> Result<()> {
+        let (lean_bin, _, _, _) =
+            crate::module_builder::resolve_toolchain_compiler(canon_dir, toolchain)?;
+        crate::zygote::ensure_zygote_binary(store, &lean_bin, &HashMap::new())?;
+        Ok(())
+    })?;
+    Ok(*t0)
 }
 
 /// Confirm the selected source declaration and its canonical kernel statement type in Lean's
@@ -370,15 +374,17 @@ pub(crate) fn confirm_decl_identity_with_budget(
     is_untrusted: bool,
     request_started: Option<Instant>,
 ) -> Result<ConfirmedDeclIdentity> {
-    confirm_decl_identity_with_extra_dirs(
-        src,
-        shard,
-        project_dir,
-        file,
-        is_untrusted,
-        &[],
-        request_started,
-    )
+    crate::phase_timing::record_active_phase("identity_probe", || {
+        confirm_decl_identity_with_extra_dirs(
+            src,
+            shard,
+            project_dir,
+            file,
+            is_untrusted,
+            &[],
+            request_started,
+        )
+    })
 }
 
 pub(super) fn confirm_decl_identity_with_extra_dirs(
@@ -464,15 +470,17 @@ pub(crate) fn confirm_file_decl_identities_with_budget(
     is_untrusted: bool,
     request_started: Option<Instant>,
 ) -> Result<Vec<ConfirmedDeclIdentity>> {
-    confirm_file_decl_identities_with_extra_dirs(
-        src,
-        shards,
-        project_dir,
-        file,
-        is_untrusted,
-        &[],
-        request_started,
-    )
+    crate::phase_timing::record_active_phase("identity_probe", || {
+        confirm_file_decl_identities_with_extra_dirs(
+            src,
+            shards,
+            project_dir,
+            file,
+            is_untrusted,
+            &[],
+            request_started,
+        )
+    })
 }
 
 pub(crate) fn confirm_file_decl_identities_with_extra_dirs(
