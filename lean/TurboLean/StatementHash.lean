@@ -345,10 +345,14 @@ def dumpWithState (env : Environment) (mod : Name) (seenInit : NameSet := {})
     emit <| Json.mkObj [("constant", toJson n.toString), ("interface", payload),
       ("deps", toJson (deps.map Name.toString))]
     pending := pending ++ deps
-  let csimp := (Compiler.CSimp.ext.ext.getModuleEntries env idx).map fun entry =>
-    match entry with | .global e | .scoped _ e => e.thmName.toString
+  let csimpEntries := (Compiler.CSimp.ext.ext.getModuleEntries env idx).map fun entry =>
+    match entry with
+    | .global e | .scoped _ e =>
+        #[e.thmName.toString, e.fromDeclName.toString, e.toDeclName.toString]
+  let csimp := csimpEntries.map fun e => e[0]!
   emit <| Json.mkObj [("module", toJson mod.toString), ("complete", toJson true),
     ("csimp", toJson csimp),
+    ("csimp_entries", toJson csimpEntries),
     ("axiom_decls", toJson axiomDecls),
     ("unsafe_decls", toJson unsafeDecls),
     ("unsafe_inductives", toJson unsafeInductives),

@@ -308,6 +308,12 @@ class KernelGateAudit(unittest.TestCase):
 
     def test_global_csimp_rejected(self) -> None:
         self.assert_rejected("FxCsimpGlobal", "csimp replacement `slowGlob_eq`")
+        env_allow = dict(self.env, TURBO_LEAN_ALLOWED_CSIMP="slowGlob_eq")
+        res = subprocess.run([str(ZYGOTE), "--audit-modules", "FxCsimpGlobal"], env=env_allow,
+                             capture_output=True, text=True, timeout=120)
+        r = json.loads(res.stdout.strip().splitlines()[-1])
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r.get("csimp_entries"), [["slowGlob_eq", "slowGlob", "fastGlob"]])
 
     def test_csimp_shaped_theorem_accepted_without_attribute(self) -> None:
         self.assertTrue(self.audit("FxCsimpPlain")["ok"])
