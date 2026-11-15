@@ -1657,3 +1657,43 @@ fn per_target_policy_glob_segments_and_cli_validation() {
         .status
         .success());
 }
+
+#[test]
+fn build_replay_cas_expr_flag_and_elab_audit_contract_v4_m3() {
+    let help = Command::new(env!("CARGO_BIN_EXE_turbo-lean"))
+        .args(["build", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    let help_stdout = String::from_utf8_lossy(&help.stdout);
+    assert!(
+        help_stdout.contains("--replay-cas-expr"),
+        "expected --replay-cas-expr in `turbo-lean build --help`, got:\n{help_stdout}"
+    );
+
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let elab_audit = fs::read_to_string(repo_root.join("lean/TurboLean/ElabAudit.lean")).unwrap();
+    assert!(
+        elab_audit.contains(
+            "theorem header_pin_prevents_statement_spoofing (surf : SurfaceSig) (kType : ConLeche.Expr)"
+        ) && elab_audit.contains(
+            "eraseAnnotations (reparseExplicit (ppExplicit kType)) = eraseAnnotations surf ∧"
+        ) && elab_audit.contains("shadowedBindersCount surf = 0"),
+        "missing Contract V4 M3 header_pin_prevents_statement_spoofing signature"
+    );
+    assert!(
+        elab_audit.contains(
+            "theorem cas_proof_replay_sound (env : ConLeche.Env) (expectedType : ConLeche.Expr) (blob : ByteArray)"
+        ) && elab_audit.contains(
+            "h_replay : verifyCasProofBlob env expectedType blob = true"
+        ) && elab_audit.contains(
+            "∃ (proofTerm : ConLeche.Expr), decodeExprBlob blob = .ok proofTerm ∧"
+        ) && elab_audit.contains("ConLeche.HasType env proofTerm expectedType"),
+        "missing Contract V4 M3 cas_proof_replay_sound signature"
+    );
+}
+
