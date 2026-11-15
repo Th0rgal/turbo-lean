@@ -1760,6 +1760,37 @@ pub fn execute_mcp_audit_spec(
     project_dir: Option<&Path>,
 ) -> serde_json::Value {
     let t0 = Instant::now();
+    // Decl-only calls with a per-request workspace must forward `project_dir`: resolve the
+    // target through the project's spec surface (per-target resolution + project policy),
+    // mirroring `turbo-lean audit-spec --decl <decl> <project_dir>`. The workspace may
+    // arrive relative to the caller's CWD. Without a workspace, decl-only keeps the
+    // existing empty-target error.
+    let owned_file: std::borrow::Cow<'_, Path>;
+    let owned_project_dir: Option<std::borrow::Cow<'_, Path>>;
+    if file.as_os_str().is_empty() && decl.is_some() {
+        match project_dir.filter(|pd| !pd.as_os_str().is_empty()) {
+            Some(pd) => {
+                let anchored = if pd.is_relative() {
+                    std::env::current_dir()
+                        .map(|cwd| cwd.join(pd))
+                        .unwrap_or_else(|_| pd.to_path_buf())
+                } else {
+                    pd.to_path_buf()
+                };
+                owned_file = std::borrow::Cow::Owned(anchored.clone());
+                owned_project_dir = Some(std::borrow::Cow::Owned(anchored));
+            }
+            None => {
+                owned_file = std::borrow::Cow::Borrowed(file);
+                owned_project_dir = project_dir.map(std::borrow::Cow::Borrowed);
+            }
+        }
+    } else {
+        owned_file = std::borrow::Cow::Borrowed(file);
+        owned_project_dir = project_dir.map(std::borrow::Cow::Borrowed);
+    }
+    let file: &Path = owned_file.as_ref();
+    let project_dir: Option<&Path> = owned_project_dir.as_deref();
     let resolved_file = if !file.as_os_str().is_empty() && file.is_relative() && !file.exists() {
         project_dir
             .filter(|pd| !pd.as_os_str().is_empty())
@@ -3196,6 +3227,8 @@ mod tests {
         // resolve its target through the project (per-target spec resolution + project
         // policy) instead of failing on an empty target path, mirroring
         // `turbo-lean audit-spec --decl hidden1 <project_dir>`.
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&root).unwrap();
         for (tag, pd_arg) in [
             ("absolute", proj.to_string_lossy().into_owned()),
             ("relative", "proj".to_string()),
@@ -3262,6 +3295,7 @@ mod tests {
             parsed_no_ws["error"].as_str().is_some_and(|e| !e.is_empty()),
             "decl-only without workspace must surface a target error: {parsed_no_ws}"
         );
+        std::env::set_current_dir(prev_cwd).unwrap();
         let _ = fs::remove_dir_all(&root);
     }
 

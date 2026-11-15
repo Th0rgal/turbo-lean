@@ -5738,29 +5738,11 @@ fn eval_extracted_decl_in_memory(
     let mut satisfied_preconditions = 0u64;
     let mut first_ce: Option<CounterexampleWitness> = None;
 
-    for idx in 0..n_states {
-        let mut env: std::collections::HashMap<String, FastVal> =
-            std::collections::HashMap::with_capacity(params.len());
-        for (p_idx, (p_name, p_kind)) in params.iter().enumerate() {
-            if subst_set.contains(p_name) {
-                continue;
-            }
-            let u = gen_u256_param_rust(idx, seed, p_idx as u64);
-            let val = match p_kind {
-                Stage1ParamKind::U256 => FastVal::U256(u),
-                Stage1ParamKind::U64 | Stage1ParamKind::BitVec64 => FastVal::U64(u[0]),
-                Stage1ParamKind::Nat | Stage1ParamKind::U32 | Stage1ParamKind::BitVec32 => {
-                    FastVal::U64(u[0] & 0xFFFF_FFFF)
-                }
-                Stage1ParamKind::U16 | Stage1ParamKind::BitVec16 => FastVal::U64(u[0] & 0xFFFF),
-                Stage1ParamKind::U8 | Stage1ParamKind::BitVec8 => FastVal::U64(u[0] & 0xFF),
-                Stage1ParamKind::Bool => FastVal::Bool((u[0] & 1) != 0),
-                Stage1ParamKind::StorageKey => FastVal::U64(u[0] & 3),
-                Stage1ParamKind::ContractState => FastVal::ContractState(u[0] ^ 0xA5A5, Vec::new()),
-            };
-            env.insert(p_name.clone(), val);
-        }
-
+    // Evaluate one full state (hypothesis substitution -> precondition gate -> conclusion
+    // check) and record the first counterexample. Returns `None` when the state cannot be
+    // evaluated in this domain (abstain).
+    let mut eval_state = |env: std::collections::HashMap<String, FastVal>, state_idx: u64| -> Option<()> {
+        let mut env = env;
         for (t_name, val_expr) in &subst_ast {
             let mut v = eval_lean_expr_fast_with_domain(val_expr, &env, dom, dom)?;
             if let Some((_, Stage1ParamKind::U256)) = params.iter().find(|(n, _)| n == t_name) {
@@ -5770,16 +5752,10 @@ fn eval_extracted_decl_in_memory(
             }
             env.insert(t_name.clone(), v);
         }
-
-        let mut active = true;
         for h in &remaining_hyps {
             if !eval_lean_expr_fast_with_domain(h, &env, dom, dom)?.as_bool()? {
-                active = false;
-                break;
+                return Some(());
             }
-        }
-        if !active {
-            continue;
         }
         satisfied_preconditions += 1;
 
@@ -5801,13 +5777,194 @@ fn eval_extracted_decl_in_memory(
                     }
                 }
                 first_ce = Some(CounterexampleWitness {
-                    state_idx: idx,
+                    state_idx,
                     bindings,
                     lhs_value: lv.format_witness(),
                     rhs_value: rv.format_witness(),
                 });
             }
         }
+        Some(())
+    };
+
+    // Build one environment: uniform/boundary sweep value per non-substituted param
+    // (substituted params are derived from hypotheses and must not be overridden),
+    // then apply explicit `(param_index, value)` overrides.
+    let build_env = |base_idx: u64, overrides: &[(usize, FastVal)]|
+     -> std::collections::HashMap<String, FastVal> {
+        let mut env: std::collections::HashMap<String, FastVal> =
+            std::collections::HashMap::with_capacity(params.len());
+        for (p_idx, (p_name, p_kind)) in params.iter().enumerate() {
+            if subst_set.contains(p_name) {
+                continue;
+            }
+            let u = gen_u256_param_rust(base_idx, seed, p_idx as u64);
+            let val = match p_kind {
+                Stage1ParamKind::U256 => FastVal::U256(u),
+                Stage1ParamKind::U64 | Stage1ParamKind::BitVec64 => FastVal::U64(u[0]),
+                Stage1ParamKind::Nat | Stage1ParamKind::U32 | Stage1ParamKind::BitVec32 => {
+                    FastVal::U64(u[0] & 0xFFFF_FFFF)
+                }
+                Stage1ParamKind::U16 | Stage1ParamKind::BitVec16 => FastVal::U64(u[0] & 0xFFFF),
+                Stage1ParamKind::U8 | Stage1ParamKind::BitVec8 => FastVal::U64(u[0] & 0xFF),
+                Stage1ParamKind::Bool => FastVal::Bool((u[0] & 1) != 0),
+                Stage1ParamKind::StorageKey => FastVal::U64(u[0] & 3),
+                Stage1ParamKind::ContractState => FastVal::ContractState(u[0] ^ 0xA5A5, Vec::new()),
+            };
+            env.insert(p_name.clone(), val);
+        }
+        for (p_idx, v) in overrides {
+            if let Some((p_name, _)) = params.get(*p_idx) {
+                if !subst_set.contains(p_name) {
+                    env.insert(p_name.clone(), v.clone());
+                }
+            }
+        }
+        env
+    };
+
+    for idx in 0..n_states {
+        let env = build_env(idx, &[]);
+        eval_state(env, idx)?;
+    }
+
+    // Stage B: native diagonal/boundary seeding. The uniform sweep cannot reach
+    // measure-zero diagonals (same-kind params equal at non-zero values) or asymmetric
+    // boundary pairs, and the tightest production callers probe with as few as 32
+    // states. Append a bounded, deterministic schedule of probe states: same-kind
+    // collapse over canonical boundary constants, pairwise aliasing over anchor states,
+    // and asymmetric boundary grids. Substituted params are never overridden, and the
+    // report's `n_states` stays the requested sweep size (probe witnesses report
+    // `state_idx >= n_states`).
+    let mut probe_sched: Vec<(u64, Vec<(usize, FastVal)>)> = Vec::new();
+    let non_subst: Vec<(usize, Stage1ParamKind)> = params
+        .iter()
+        .enumerate()
+        .filter(|(_, (p_name, _))| !subst_set.contains(p_name))
+        .map(|(i, (_, k))| (i, *k))
+        .collect();
+    let canonical_boundary = |kind: Stage1ParamKind| -> Vec<FastVal> {
+        match kind {
+            Stage1ParamKind::U256 => vec![
+                FastVal::U256([0, 0, 0, 0]),
+                FastVal::U256([1, 0, 0, 0]),
+                FastVal::U256([2, 0, 0, 0]),
+                FastVal::U256([0, 0, 0, 0x8000_0000_0000_0000]),
+                FastVal::U256([u64::MAX; 4]),
+            ],
+            Stage1ParamKind::U64 | Stage1ParamKind::BitVec64 => vec![
+                FastVal::U64(0),
+                FastVal::U64(1),
+                FastVal::U64(2),
+                FastVal::U64(0x8000_0000_0000_0000),
+                FastVal::U64(u64::MAX),
+            ],
+            Stage1ParamKind::Nat | Stage1ParamKind::U32 | Stage1ParamKind::BitVec32 => vec![
+                FastVal::U64(0),
+                FastVal::U64(1),
+                FastVal::U64(2),
+                FastVal::U64(0x8000_0000),
+                FastVal::U64(0xFFFF_FFFF),
+            ],
+            Stage1ParamKind::U16 | Stage1ParamKind::BitVec16 => vec![
+                FastVal::U64(0),
+                FastVal::U64(1),
+                FastVal::U64(2),
+                FastVal::U64(0x8000),
+                FastVal::U64(0xFFFF),
+            ],
+            Stage1ParamKind::U8 | Stage1ParamKind::BitVec8 => vec![
+                FastVal::U64(0),
+                FastVal::U64(1),
+                FastVal::U64(2),
+                FastVal::U64(0x80),
+                FastVal::U64(0xFF),
+            ],
+            Stage1ParamKind::Bool => vec![FastVal::Bool(false), FastVal::Bool(true)],
+            Stage1ParamKind::StorageKey => vec![
+                FastVal::U64(0),
+                FastVal::U64(1),
+                FastVal::U64(2),
+                FastVal::U64(3),
+            ],
+            Stage1ParamKind::ContractState => Vec::new(),
+        }
+    };
+    // 1. Same-kind boundary collapse (diagonal at every canonical constant).
+    let collapse_kinds: Vec<Stage1ParamKind> = {
+        let mut seen: Vec<Stage1ParamKind> = Vec::new();
+        for (_, k) in &non_subst {
+            if !matches!(k, Stage1ParamKind::ContractState) && !seen.contains(k) {
+                seen.push(*k);
+            }
+        }
+        seen
+    };
+    for kind in &collapse_kinds {
+        for c in canonical_boundary(*kind) {
+            let overrides: Vec<(usize, FastVal)> = non_subst
+                .iter()
+                .filter(|(_, k)| k == kind)
+                .map(|(i, _)| (*i, c.clone()))
+                .collect();
+            probe_sched.push((0, overrides));
+        }
+    }
+    // 2. Pairwise same-kind aliasing over anchor states (`y := x` diagonals).
+    let alias_anchor_max = n_states.saturating_sub(1).min(1);
+    for anchor in 0..=alias_anchor_max {
+        let base = build_env(anchor, &[]);
+        for a in 0..non_subst.len() {
+            for b in (a + 1)..non_subst.len() {
+                let (ia, ka) = non_subst[a];
+                let (ib, kb) = non_subst[b];
+                if ka != kb {
+                    continue;
+                }
+                let (Some(va), Some(vb)) = (
+                    base.get(&params[ia].0).cloned(),
+                    base.get(&params[ib].0).cloned(),
+                ) else {
+                    continue;
+                };
+                if va == vb {
+                    continue;
+                }
+                probe_sched.push((anchor, vec![(ib, va)]));
+            }
+        }
+    }
+    // 3. Asymmetric boundary grids for scalar kinds (`x = 0 ∧ y = MAX` shapes).
+    for a in 0..non_subst.len() {
+        for b in (a + 1)..non_subst.len() {
+            let (_, ka) = non_subst[a];
+            let (_, kb) = non_subst[b];
+            if ka != kb {
+                continue;
+            }
+            let set = canonical_boundary(ka);
+            if set.len() < 3 {
+                continue;
+            }
+            let zero = set[0].clone();
+            let one = set[1].clone();
+            let max = set[set.len() - 1].clone();
+            for (ca, cb) in [
+                (zero.clone(), one.clone()),
+                (one.clone(), zero.clone()),
+                (zero.clone(), max.clone()),
+                (max.clone(), zero.clone()),
+                (one.clone(), max.clone()),
+                (max, one),
+            ] {
+                probe_sched.push((0, vec![(non_subst[a].0, ca), (non_subst[b].0, cb)]));
+            }
+        }
+    }
+    probe_sched.truncate(128);
+    for (ordinal, (anchor, overrides)) in probe_sched.iter().enumerate() {
+        let env = build_env(*anchor, overrides);
+        eval_state(env, n_states.saturating_add(ordinal as u64))?;
     }
 
     let kernel_ms = t0.elapsed().as_secs_f64() * 1000.0;
