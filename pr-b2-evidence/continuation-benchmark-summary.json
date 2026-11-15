@@ -1,0 +1,276 @@
+{
+  "acceptance": "blocked",
+  "latency": [
+    {
+      "file": "Batteries/Data/List/Basic.lean",
+      "decl": "List.headD_eq_head?",
+      "cold": {
+        "ok": true,
+        "external_wall_ms": 2166.3170060000994,
+        "phases": {
+          "cache_ms": 0,
+          "elab_ms": 921,
+          "hygiene_ms": 9,
+          "identity_ms": 492,
+          "import_refresh_ms": 26,
+          "kernel_ms": 0
+        },
+        "status": "theorem_verified",
+        "wall_ms": 2118
+      },
+      "warm_cache": {
+        "ok": true,
+        "external_wall_ms": 45.47879600067972,
+        "phases": {
+          "cache_ms": 0,
+          "elab_ms": 0,
+          "hygiene_ms": 6,
+          "identity_ms": 1,
+          "import_refresh_ms": 26,
+          "kernel_ms": 0
+        },
+        "status": "theorem_cache_hit",
+        "wall_ms": 44
+      },
+      "warm_edit": {
+        "ok": true,
+        "external_wall_ms": 437.2540750009648,
+        "phases": {
+          "cache_ms": 0,
+          "elab_ms": 226,
+          "hygiene_ms": 9,
+          "identity_ms": 1,
+          "import_refresh_ms": 25,
+          "kernel_ms": 0
+        },
+        "status": "theorem_verified",
+        "wall_ms": 384
+      }
+    },
+    {
+      "file": "Batteries/Data/List/Basic.lean",
+      "decl": null,
+      "cold": {
+        "ok": true,
+        "external_wall_ms": 6404.3674240001565,
+        "phases": {
+          "cache_ms": 0,
+          "elab_ms": 1284,
+          "hygiene_ms": 4,
+          "identity_ms": 1470,
+          "import_refresh_ms": 28,
+          "kernel_ms": 833
+        },
+        "status": "file_verified",
+        "wall_ms": 6402
+      },
+      "warm_cache": {
+        "ok": true,
+        "external_wall_ms": 41.921261999959825,
+        "phases": {
+          "cache_ms": 0,
+          "elab_ms": 0,
+          "hygiene_ms": 0,
+          "identity_ms": 2,
+          "import_refresh_ms": 30,
+          "kernel_ms": 0
+        },
+        "status": "all_shards_cached",
+        "wall_ms": 40
+      },
+      "warm_edit": {
+        "ok": true,
+        "external_wall_ms": 2054.3225889996393,
+        "phases": {
+          "cache_ms": 0,
+          "elab_ms": 242,
+          "hygiene_ms": 8,
+          "identity_ms": 445,
+          "import_refresh_ms": 0,
+          "kernel_ms": 0
+        },
+        "status": "file_verified",
+        "wall_ms": 1996
+      }
+    },
+    {
+      "file": "Batteries/Data/List/Lemmas.lean",
+      "decl": "List.getElem_filter_eq_getElem_getElem_findIdxs_sub",
+      "cold": {
+        "ok": true,
+        "external_wall_ms": 4517.93393799926,
+        "phases": {
+          "cache_ms": 0,
+          "elab_ms": 1186,
+          "hygiene_ms": 5,
+          "identity_ms": 884,
+          "import_refresh_ms": 35,
+          "kernel_ms": 2190
+        },
+        "status": "theorem_verified",
+        "wall_ms": 4515
+      },
+      "warm_cache": {
+        "ok": true,
+        "external_wall_ms": 63.29448699943896,
+        "phases": {
+          "cache_ms": 0,
+          "elab_ms": 0,
+          "hygiene_ms": 5,
+          "identity_ms": 4,
+          "import_refresh_ms": 36,
+          "kernel_ms": 3
+        },
+        "status": "theorem_cache_hit",
+        "wall_ms": 62
+      },
+      "warm_edit": {
+        "ok": true,
+        "external_wall_ms": 2035.6769039990468,
+        "phases": {
+          "cache_ms": 0,
+          "elab_ms": 920,
+          "hygiene_ms": 13,
+          "identity_ms": 5,
+          "import_refresh_ms": 35,
+          "kernel_ms": 920
+        },
+        "status": "theorem_verified",
+        "wall_ms": 2034
+      }
+    },
+    {
+      "file": "Batteries/Data/List/Lemmas.lean",
+      "decl": null,
+      "cold": {
+        "ok": true,
+        "external_wall_ms": 19006.459153000833,
+        "phases": {
+          "cache_ms": 0,
+          "elab_ms": 2737,
+          "hygiene_ms": 8,
+          "identity_ms": 7,
+          "import_refresh_ms": 34,
+          "kernel_ms": 2928
+        },
+        "status": "file_verified",
+        "wall_ms": 19004
+      },
+      "warm_cache": {
+        "ok": true,
+        "external_wall_ms": 60.113890998763964,
+        "phases": {
+          "cache_ms": 2,
+          "elab_ms": 0,
+          "hygiene_ms": 1,
+          "identity_ms": 6,
+          "import_refresh_ms": 35,
+          "kernel_ms": 1
+        },
+        "status": "all_shards_cached",
+        "wall_ms": 58
+      },
+      "warm_edit": {
+        "ok": true,
+        "external_wall_ms": 2698.326656998688,
+        "phases": {
+          "cache_ms": 2,
+          "elab_ms": 1295,
+          "hygiene_ms": 8,
+          "identity_ms": 1228,
+          "import_refresh_ms": 33,
+          "kernel_ms": 1
+        },
+        "status": "file_verified",
+        "wall_ms": 2696
+      }
+    },
+    {
+      "file": "PFR/Mathlib/Probability/IdentDistrib.lean",
+      "decl": "ProbabilityTheory.identDistrib_id",
+      "cold": {
+        "ok": false,
+        "external_wall_ms": 90644.92210499884,
+        "error": "[turbo-lean] ERROR: check timed out after 90s for `ProbabilityTheory.identDistrib_id` in /var/lib/orb-node/work/caches/tl-warm/pfr/PFR/Mathlib/Probability/IdentDistrib.lean",
+        "returncode": 124
+      },
+      "warm_cache": {
+        "ok": false,
+        "external_wall_ms": 90667.47860299984,
+        "error": "[turbo-lean] ERROR: check timed out after 90s for `ProbabilityTheory.identDistrib_id` in /var/lib/orb-node/work/caches/tl-warm/pfr/PFR/Mathlib/Probability/IdentDistrib.lean",
+        "returncode": 124
+      },
+      "warm_edit": {
+        "ok": false,
+        "external_wall_ms": 90693.97699900037,
+        "error": "[turbo-lean] ERROR: check timed out after 90s for `ProbabilityTheory.identDistrib_id` in /var/lib/orb-node/work/caches/tl-warm/pfr/PFR/Mathlib/Probability/IdentDistrib.lean",
+        "returncode": 124
+      }
+    },
+    {
+      "file": "PFR/Mathlib/Probability/IdentDistrib.lean",
+      "decl": null,
+      "cold": {
+        "ok": false,
+        "external_wall_ms": 90689.5244669995,
+        "error": "[turbo-lean] ERROR: check timed out after 90s for /var/lib/orb-node/work/caches/tl-warm/pfr/PFR/Mathlib/Probability/IdentDistrib.lean",
+        "returncode": 124
+      },
+      "warm_cache": {
+        "ok": false,
+        "external_wall_ms": 90555.91242099945,
+        "error": "[turbo-lean] ERROR: check timed out after 90s for /var/lib/orb-node/work/caches/tl-warm/pfr/PFR/Mathlib/Probability/IdentDistrib.lean",
+        "returncode": 124
+      },
+      "warm_edit": {
+        "ok": false,
+        "external_wall_ms": 90611.96029200073,
+        "error": "[turbo-lean] ERROR: check timed out after 90s for /var/lib/orb-node/work/caches/tl-warm/pfr/PFR/Mathlib/Probability/IdentDistrib.lean",
+        "returncode": 124
+      }
+    }
+  ],
+  "concurrency": {
+    "work_units": 8,
+    "provenance": {
+      "source_head": "bae8a0825048723d45d09f728afaf43fc11da49b",
+      "source_tree": "8f543177c2c2c4df371ea6d6663e0bf9cc99ca40",
+      "source_dirty": true,
+      "binary_sha256": "56a4ca93c6ced4e7294eacdfa311a9dda316fafc01d6398575c09dcd7e394193",
+      "harness_sha256": "167dc6d9ce163b99968ad4972f0f03286ffded100128d7ea95ea98181fffe279",
+      "trusted_git_path": "/var/lib/orb-node/work/tools/bin/git",
+      "trusted_git_version": "git version 2.48.1"
+    },
+    "imported_module": "Batteries.Data.List.Lemmas",
+    "error_count": 0,
+    "total_pss_mb": 963.5,
+    "wall_p50_ms": 1211.855461999221,
+    "wall_p95_ms": 1228.849368999363,
+    "pss_scope": "peak summed Linux PSS of uniquely marked workload processes",
+    "cow_fork_verified": true
+  },
+  "regressions": {
+    "python_kernel_suite": {
+      "passed": 18,
+      "failed": 0,
+      "seconds": 21.89,
+      "log": "next-kernel-regressions.log"
+    },
+    "cargo": {
+      "statement_tactics_preserve_prefix_context": "passed",
+      "import_audit_stamp_cannot_authorize_root_module": "passed",
+      "test_trusted_dependency_modules_are_kernel_replayed_before_import": "passed",
+      "test_custom_target_tracked_include_binding_and_refresh_only_dag": "passed",
+      "test_git_pinned_dep_unused_native_decide_allowed_but_used_rejected": "failed",
+      "test_check_runtime_policy_deferral_cli_and_config": "failed"
+    },
+    "cargo_log": "next-cargo-regressions.log"
+  },
+  "blockers": [
+    "PFR declaration and whole-file checks time out at 90 seconds in all three modes.",
+    "Unused native_decide dependency policy regression rejects an unused imported axiom.",
+    "Runtime policy regression rejects the explicitly allowed reflexive csimp entry.",
+    "Whole-file warm edits exceed the 500 ms target.",
+    "Daemon statement hash divergence remains; independent compilation plus exact-hash audit supplies fallback acceptance."
+  ]
+}
