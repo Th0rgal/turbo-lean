@@ -4894,10 +4894,17 @@ fn ensure_project_imports_fresh_inner(
                 crate::module_builder::forget_refreshed_dep_module(cfg, m);
             }
         }
+        let refresh_timer = Instant::now();
         ensure_project_imports_fresh_inner(canon_dir, target_files, rev, build_missing, true)?;
+        if std::env::var_os("TURBO_LEAN_PROFILE_REFRESH").is_some() {
+            eprintln!("post-Lake freshness: {:?}", refresh_timer.elapsed());
+        }
         if let (Some(cfg), Some(dag)) = (root_cfg.as_ref(), locally_rebuilt.as_ref()) {
             let rebuilt_modules = dag.nodes.keys().cloned().collect::<Vec<_>>();
             crate::module_builder::record_locally_rebuilt_sources(cfg, dag, &rebuilt_modules)?;
+            if std::env::var_os("TURBO_LEAN_PROFILE_REFRESH").is_some() {
+                eprintln!("post-Lake source recording: {:?}", refresh_timer.elapsed());
+            }
         }
         return Ok(targets.len());
     }

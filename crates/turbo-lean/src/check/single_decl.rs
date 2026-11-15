@@ -1087,6 +1087,27 @@ theorem good : Witness.value = 7 := rfl
     }
 
     #[test]
+    fn statement_tactics_preserve_prefix_context() {
+        let source = "theorem helper : True := True.intro\ntheorem target : (if (by trivial : True) then True else False) := by trivial\n";
+        let split = split_lean_source(source, &[]);
+        let shard = &split.shards[splitter::find_decl_shard_index(&split.shards, "target")
+            .unwrap()
+            .unwrap()];
+        assert!(
+            shard.signature_text.contains("by"),
+            "{}",
+            shard.signature_text
+        );
+        assert!(build_cone_scoped_decl_audit_source(source, shard).contains("theorem helper"));
+        let source = format!("{source}attribute [csimp] helper\n");
+        let split = split_lean_source(&source, &[]);
+        let shard = &split.shards[splitter::find_decl_shard_index(&split.shards, "target")
+            .unwrap()
+            .unwrap()];
+        assert_eq!(build_cone_scoped_decl_audit_source(&source, shard), source);
+    }
+
+    #[test]
     fn test_cone_headers_after_block_comments() -> Result<()> {
         for prefix in ["/- comment\n-/ ", "/- outer /- inner -/ -/ "] {
             let source = format!(
@@ -2997,6 +3018,25 @@ pub(super) fn build_cone_scoped_decl_audit_source(
     src: &str,
     shard: &splitter::TheoremShard,
 ) -> String {
+    if cone_extract_ident_tokens(&shard.signature_text)
+        .iter()
+        .any(|token| token == "by")
+    {
+        let suffix = src
+            .lines()
+            .skip(shard.end_line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        if suffix.contains("attribute")
+            && (suffix.contains("csimp") || suffix.contains("implemented_by"))
+        {
+            return src.to_string();
+        }
+        return splitter::reconstruct_real_prefix_source(src, &shard.rooted_name())
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| src.to_string());
+    }
     let clean = splitter::strip_lean_comments(src);
     if clean.len() != src.len() {
         return src.to_string();
@@ -3695,27 +3735,6 @@ pub(super) fn maybe_append_hotspot_diagnostics_for_source(
     .unwrap_or_default()
 }
 
-#[test]
-#[ignore = "requires exact upstream Batteries fixture"]
-fn export_exact_lemmas_cone() {
-    let source = fs::read_to_string(
-        "/var/lib/orb-node/work/caches/tl-warm/batteries/Batteries/Data/List/Lemmas.lean",
-    )
-    .unwrap();
-    let split = splitter::split_lean_source(&source, &[]);
-    let shard = &split.shards[splitter::find_decl_shard_index(
-        &split.shards,
-        "List.getElem_filter_eq_getElem_getElem_findIdxs_sub",
-    )
-    .unwrap()
-    .unwrap()];
-    fs::write(
-        "/var/lib/orb-node/work/pr-b2-evidence/lemmas-actual-cone.lean",
-        build_cone_scoped_decl_audit_source(&source, shard),
-    )
-    .unwrap();
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_single_decl(
     store: &mut TurboStore,
@@ -3807,7 +3826,11 @@ pub(super) fn check_single_decl(
     let cone_clean_for_certification =
         splitter::audit_hygiene(&splitter::strip_lean_comments(&cone_src))
             .is_clean_for_certification();
-    let clean_for_certification = split.hygiene.is_clean_for_certification();
+    let statement_has_tactics = cone_extract_ident_tokens(&shard.signature_text)
+        .iter()
+        .any(|token| token == "by");
+    let clean_for_certification =
+        split.hygiene.is_clean_for_certification() && !statement_has_tactics;
     let allow_attested_cache_hit = clean_for_certification
         || (split.hygiene.is_clean_modulo_sorry()
             && !split
@@ -3933,10 +3956,11 @@ pub(super) fn check_single_decl(
         }
         let (env_vars, _) = resolve_lake_env(store, canon_dir)?;
         let lean_bin = resolve_lean_bin(canon_dir)?;
-        if cone_clean_for_certification
-            || (!shard_has_sorry
-                && splitter::audit_hygiene(&splitter::strip_lean_comments(&cone_src))
-                    .is_clean_or_deferred_to_kernel_gate())
+        if !statement_has_tactics
+            && (cone_clean_for_certification
+                || (!shard_has_sorry
+                    && splitter::audit_hygiene(&splitter::strip_lean_comments(&cone_src))
+                        .is_clean_or_deferred_to_kernel_gate()))
         {
             let lean_path = resolve_remote_lean_path(canon_dir, Some(&env_vars));
             let reply = crate::zygote::eval_with_zygote_pool_for_targets_and_stubs(

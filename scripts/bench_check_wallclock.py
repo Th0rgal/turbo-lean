@@ -32,7 +32,7 @@ PHASES = (
 
 def provenance(binary):
     def git(*args):
-        return subprocess.check_output(["git", *args], cwd=ROOT, text=True).strip()
+        return subprocess.check_output([os.environ.get("TURBO_LEAN_GIT", "git"), *args], cwd=ROOT, text=True).strip()
     return {"source_head": git("rev-parse", "HEAD"),
             "source_tree": git("rev-parse", "HEAD^{tree}"),
             "source_dirty": bool(git("status", "--porcelain")),
@@ -274,7 +274,10 @@ def main():
         parser.error("missing Batteries checkout; pass --batteries-dir")
     cases = [(args.batteries_dir, "Batteries/Data/List/Basic.lean", "List.headD_eq_head?"),
              (args.batteries_dir, "Batteries/Data/List/Basic.lean", None),
+             (args.batteries_dir, "Batteries/Data/List/Lemmas.lean",
+              "List.getElem_filter_eq_getElem_getElem_findIdxs_sub"),
              (args.batteries_dir, "Batteries/Data/List/Lemmas.lean", None),
+             (args.pfr_dir, "PFR/Mathlib/Probability/IdentDistrib.lean", "PFR.conc_of_indep'"),
              (args.pfr_dir, "PFR/Mathlib/Probability/IdentDistrib.lean", None)]
     with tempfile.TemporaryDirectory(prefix="turbo-wallclock-") as tmp:
         report = {"schema_version": 2, "binary": str(args.binary),

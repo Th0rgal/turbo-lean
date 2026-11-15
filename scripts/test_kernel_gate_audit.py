@@ -35,6 +35,9 @@ FIXTURES = {
     "def callerI (n : Nat) : Nat := slowI n\n",
     "FxCsimpGlobal": "def slowGlob (n : Nat) : Nat := n + 0\ndef fastGlob (n : Nat) : Nat := n\n"
     "@[csimp] theorem slowGlob_eq : @slowGlob = @fastGlob := by funext n; rfl\n",
+    "FxCsimpPoison": "axiom poison : False\n"
+    "def slowPoison (n : Nat) : Nat := n\ndef fastPoison (n : Nat) : Nat := n + 1\n"
+    "@[csimp] theorem poison_eq : @slowPoison = @fastPoison := False.elim poison\n",
     "FxCsimpPlain": "def slowG : Nat → Nat | 0 => 0 | n + 1 => slowG n + 1\n"
     "def fastG : Nat → Nat | 0 => 0 | n + 1 => fastG n + 1\n"
     "theorem slowG_eq : @slowG = @fastG := by funext n; induction n <;> simp [slowG, fastG, *]\n"
@@ -311,6 +314,13 @@ class KernelGateAudit(unittest.TestCase):
 
     def test_csimp_shaped_theorem_accepted_without_attribute(self) -> None:
         self.assertTrue(self.audit("FxCsimpPlain")["ok"])
+
+    def test_import_csimp_reuse_preserves_axiom_and_replay_gates(self) -> None:
+        replay = subprocess.run([str(ZYGOTE), "--kernel-replay-module", "FxCsimpGlobal"],
+                                env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(replay.returncode, 0, replay.stdout + replay.stderr)
+        self.assertTrue(self.audit("--audit-imports", "--skip-child-replay", "FxCsimpGlobal")["ok"])
+        self.assert_rejected("FxCsimpPoison", "poison", "--audit-imports", "--skip-child-replay")
 
     def test_bool_check_theorem_not_flagged(self) -> None:
         self.assertTrue(self.audit("FxBoolCheck")["ok"])

@@ -6572,6 +6572,23 @@ pub fn reconstruct_single_shard_source(
     )))
 }
 
+pub(crate) fn reconstruct_real_prefix_source(
+    src: &str,
+    target: &str,
+) -> anyhow::Result<Option<String>> {
+    let clean = strip_lean_comments(src);
+    let spans = parse_command_spans(src, &clean);
+    let Some((index, _, scopes)) = build_decl_prefix_and_scopes(&spans, target, src.len())? else {
+        return Ok(None);
+    };
+    let end = spans[index].end_line;
+    Ok(Some(format!(
+        "{}\n{}",
+        src.lines().take(end).collect::<Vec<_>>().join("\n"),
+        format_closing_scopes(&scopes)
+    )))
+}
+
 #[derive(Debug, Clone)]
 pub struct PrefixOutlinePlan {
     pub outline_source: String,

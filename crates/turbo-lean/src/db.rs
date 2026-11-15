@@ -3044,6 +3044,10 @@ impl TurboStore {
         Ok(())
     }
 
+    pub(crate) fn may_have_kernel_audit(&self, digest: &str) -> bool {
+        self.conn.query_row("SELECT EXISTS(SELECT 1 FROM kernel_audited_oleans_auth WHERE artifact_digest = ?1)", [digest], |row| row.get(0)).unwrap_or(false)
+    }
+
     pub(crate) fn has_kernel_audited_olean_with_key(
         &self,
         key: &[u8; 32],

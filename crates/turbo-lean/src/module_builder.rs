@@ -8310,7 +8310,83 @@ pub(crate) fn module_directly_depends_on_lake_inputs(
 }
 
 #[derive(Default)]
+struct FreshnessInputs {
+    files: HashMap<PathBuf, (crate::zygote::OleanFileStatSig, Vec<u8>)>,
+    directories: HashMap<PathBuf, crate::zygote::OleanFileStatSig>,
+    digest: Option<(PathBuf, String, u64, String)>,
+}
+
+impl FreshnessInputs {
+    fn read(&mut self, path: &Path) -> Result<Vec<u8>> {
+        self.directories.insert(
+            path.to_path_buf(),
+            crate::zygote::OleanFileStatSig::from_meta(&fs::symlink_metadata(path)?),
+        );
+        let path = path.canonicalize()?;
+        let metadata = fs::symlink_metadata(&path)?;
+        anyhow::ensure!(
+            metadata.is_file(),
+            "Non-regular freshness input {}",
+            path.display()
+        );
+        let signature = crate::zygote::OleanFileStatSig::from_meta(&metadata);
+        if let Some((previous, bytes)) = self.files.get(&path) {
+            if previous == &signature {
+                return Ok(bytes.clone());
+            }
+        }
+        let bytes = fs::read(&path)?;
+        anyhow::ensure!(
+            crate::zygote::OleanFileStatSig::from_meta(&fs::symlink_metadata(&path)?) == signature,
+            "Freshness input changed during read: {}",
+            path.display()
+        );
+        self.files.insert(path, (signature, bytes.clone()));
+        Ok(bytes)
+    }
+
+    fn unchanged(&self) -> bool {
+        self.files
+            .iter()
+            .map(|(path, (signature, _))| (path, signature))
+            .chain(self.directories.iter())
+            .all(|(path, signature)| {
+                fs::symlink_metadata(path).is_ok_and(|metadata| {
+                    crate::zygote::OleanFileStatSig::from_meta(&metadata) == *signature
+                })
+            })
+    }
+
+    fn workspace_digest(&mut self, cfg: &ProjectConfig) -> Result<String> {
+        let window = current_memo_window();
+        if let Some((root, config, generation, digest)) = &self.digest {
+            if root == &cfg.root_pkg.pkg_root
+                && config == &cfg.canonical_config_digest
+                && *generation == window
+                && self.unchanged()
+            {
+                return Ok(digest.clone());
+            }
+        }
+        *self = Self::default();
+        let digest = workspace_lake_inputs_digest_with_files(cfg, self)?;
+        anyhow::ensure!(
+            window == current_memo_window() && self.unchanged(),
+            "Workspace inputs changed during freshness traversal"
+        );
+        self.digest = Some((
+            cfg.root_pkg.pkg_root.clone(),
+            cfg.canonical_config_digest.clone(),
+            window,
+            digest.clone(),
+        ));
+        Ok(digest)
+    }
+}
+
+#[derive(Default)]
 pub(crate) struct LakeClosureCache {
+    freshness_inputs: FreshnessInputs,
     manifests: HashMap<(PathBuf, bool), CachedPkgManifest>,
     exp_memo: HashMap<(PathBuf, String, bool, bool), Option<LakeModuleExportInfo>>,
     pb_exp_memo: HashMap<(PathBuf, bool, bool), Option<LakeModuleExportInfo>>,
@@ -8408,7 +8484,13 @@ impl LakeClosureCache {
         spec: &DiscoveredModuleSpec,
         strict_policy: bool,
     ) -> Option<&'a CachedPkgManifest> {
-        load_cached_pkg_manifest(&mut self.manifests, cfg, spec, strict_policy)
+        load_cached_pkg_manifest(
+            &mut self.manifests,
+            &mut self.freshness_inputs,
+            cfg,
+            spec,
+            strict_policy,
+        )
     }
 
     pub(crate) fn insert_pre_pkg_manifest(
@@ -8492,11 +8574,12 @@ impl LakeClosureCache {
 
 fn load_cached_pkg_manifest<'a>(
     manifests: &'a mut HashMap<(PathBuf, bool), CachedPkgManifest>,
+    files: &mut FreshnessInputs,
     cfg: &ProjectConfig,
     spec: &DiscoveredModuleSpec,
     strict_policy: bool,
 ) -> Option<&'a CachedPkgManifest> {
-    let expected_lake_inputs = workspace_lake_inputs_digest(cfg).ok()?;
+    let expected_lake_inputs = files.workspace_digest(cfg).ok()?;
     let entry = manifests
         .entry((spec.pkg_root.clone(), strict_policy))
         .or_insert_with(|| {
@@ -9106,8 +9189,13 @@ pub(crate) fn dep_pkg_module_stale(
         ImportSite::Unresolved => return true,
         _ => return false,
     };
-    let Some(cached_manifest) = load_cached_pkg_manifest(&mut cache.manifests, cfg, &spec, false)
-    else {
+    let Some(cached_manifest) = load_cached_pkg_manifest(
+        &mut cache.manifests,
+        &mut cache.freshness_inputs,
+        cfg,
+        &spec,
+        false,
+    ) else {
         return true;
     };
     let olean = spec_olean_path(&spec);
@@ -10017,11 +10105,33 @@ fn tracked_custom_target_includes(
     src_path: &Path,
     source: &str,
 ) -> Option<Vec<(PathBuf, String)>> {
+    tracked_custom_target_includes_with_files(
+        cfg,
+        pkg,
+        module_name,
+        src_path,
+        source,
+        &mut FreshnessInputs::default(),
+    )
+}
+
+fn tracked_custom_target_includes_with_files(
+    cfg: &ProjectConfig,
+    pkg: &PackageConfig,
+    module_name: &str,
+    src_path: &Path,
+    source: &str,
+    files: &mut FreshnessInputs,
+) -> Option<Vec<(PathBuf, String)>> {
     if pkg.pkg_root == cfg.root_pkg.pkg_root
         || !pkg.libs.iter().any(|lib| {
             lib_can_build_module(lib, module_name) && !lib.custom_target_needs.is_empty()
         })
     {
+        return None;
+    }
+    let paths = crate::splitter::extract_include_relative_paths(source)?;
+    if paths.is_empty() {
         return None;
     }
     let pin = cfg
@@ -10034,31 +10144,56 @@ fn tracked_custom_target_includes(
         return None;
     }
     let root = pkg.pkg_root.canonicalize().ok()?;
-    let paths = crate::splitter::extract_include_relative_paths(source)?;
-    if paths.is_empty() {
-        return None;
-    }
-    let mut result = Vec::new();
-    for rel in paths {
-        let path = src_path.parent()?.join(rel).canonicalize().ok()?;
-        check_input_file_is_contained_regular_file(&root, &path).ok()?;
-        let relative = path.strip_prefix(&root).ok()?;
+    type TrackedInputs = HashMap<PathBuf, (u64, HashSet<PathBuf>)>;
+    static TRACKED: OnceLock<Mutex<TrackedInputs>> = OnceLock::new();
+    let window = current_memo_window();
+    let mut tracked = TRACKED
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .ok()?;
+    tracked.retain(|_, (generation, _)| *generation == window);
+    if !tracked
+        .get(&root)
+        .is_some_and(|(generation, _)| *generation == window)
+    {
         let mut git = crate::trusted_tools::git(&root).ok()?;
         let output = git
-            .args(["-C"])
+            .arg("-C")
             .arg(&root)
-            .args(["ls-files", "--error-unmatch", "--"])
-            .arg(relative)
+            .args(["ls-files", "-z"])
             .output()
             .ok()?;
-        if !output.status.success() {
+        if !output.status.success() || current_memo_window() != window {
             return None;
         }
-        let digest = blake3::hash(&fs::read(&path).ok()?).to_hex().to_string();
+        let entries = output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| std::str::from_utf8(path).map(PathBuf::from))
+            .collect::<Result<HashSet<_>, _>>()
+            .ok()?;
+        tracked.insert(root.clone(), (window, entries));
+    }
+    let (_, tracked_paths) = tracked.get(&root)?;
+    let mut result = Vec::new();
+    for rel in paths {
+        let input = src_path.parent()?.join(rel);
+        let path = input.canonicalize().ok()?;
+        files.directories.insert(
+            input.clone(),
+            crate::zygote::OleanFileStatSig::from_meta(&fs::symlink_metadata(&input).ok()?),
+        );
+        check_input_file_is_contained_regular_file(&root, &path).ok()?;
+        if !tracked_paths.contains(path.strip_prefix(&root).ok()?) {
+            return None;
+        }
+        use sha2::Digest;
+        let digest = format!("{:x}", sha2::Sha256::digest(files.read(&path).ok()?));
         result.push((path, digest));
     }
     result.sort();
-    Some(result)
+    (current_memo_window() == window).then_some(result)
 }
 
 fn source_has_disallowed_elab_host_effects_for_module(
@@ -10339,7 +10474,6 @@ fn lake_closure_export_info_inner(
     if !visiting.insert(visit_key.clone()) {
         return None;
     }
-    let had_cycle_ancestor = visiting.len() > 1 || !pb_visiting.is_empty();
     let mut local_pairs: Vec<(String, PathBuf)> = Vec::new();
     let collect_pairs = out_closure_opt.is_some();
     let res = (|| -> Option<LakeModuleExportInfo> {
@@ -10359,12 +10493,17 @@ fn lake_closure_export_info_inner(
         }
         let is_mod = hdr.is_module;
         let rel_slash = module_name_to_rel_slash(&spec.module_name);
-        let expected_lake_inputs = workspace_lake_inputs_digest(cfg).ok()?;
+        let expected_lake_inputs = cache.freshness_inputs.workspace_digest(cfg).ok()?;
         let rel_src = spec_rel_src(spec);
         let allow_stale_hydration = cache.allow_stale_manifest_hydration && !strict_policy;
         let (raw_has_entry, raw_is_some, raw_pkg_matched_entry, mut manifest_entry) = {
-            let cached_manifest =
-                load_cached_pkg_manifest(&mut cache.manifests, cfg, spec, strict_policy)?;
+            let cached_manifest = load_cached_pkg_manifest(
+                &mut cache.manifests,
+                &mut cache.freshness_inputs,
+                cfg,
+                spec,
+                strict_policy,
+            )?;
             let raw_has = matches!(
                 cached_manifest.raw.as_ref(),
                 Some(Ok(m)) if m.modules.contains_key(&rel_src)
@@ -10897,7 +11036,7 @@ fn lake_closure_export_info_inner(
         if let Some(out_pairs) = out_closure_opt {
             out_pairs.extend(local_pairs);
         }
-    } else if out_closure_opt.is_none() && !had_cycle_ancestor {
+    } else if out_closure_opt.is_none() {
         cache.exp_memo.insert(memo_key, None);
     }
     res
@@ -10939,7 +11078,7 @@ pub(crate) fn dep_pkg_import_pins_consistent(
     pin_spec: ImportPinSpec<'_>,
     strict_policy: bool,
 ) -> bool {
-    let Ok(expected_lake_inputs) = workspace_lake_inputs_digest(cfg) else {
+    let Ok(expected_lake_inputs) = cache.freshness_inputs.workspace_digest(cfg) else {
         return false;
     };
     let mut seen: HashMap<(PathBuf, String), String> = HashMap::new();
@@ -10958,9 +11097,13 @@ pub(crate) fn dep_pkg_import_pins_consistent(
         }
         let rel_src = spec_rel_src(&cur);
         let (raw_has_entry, raw_is_some, raw_pkg_matched_entry, validated_entry) = {
-            let Some(cached_manifest) =
-                load_cached_pkg_manifest(&mut cache.manifests, cfg, &cur, strict_policy)
-            else {
+            let Some(cached_manifest) = load_cached_pkg_manifest(
+                &mut cache.manifests,
+                &mut cache.freshness_inputs,
+                cfg,
+                &cur,
+                strict_policy,
+            ) else {
                 return false;
             };
             let raw_has = matches!(
@@ -12566,9 +12709,15 @@ fn is_dep_olean_fresh(
     // accept pre-existing checkout `.olean` files without host `TurboStore` CAS verification).
     // Fail closed (`None`) when the manifest or audited module entry is absent or stale.
     let expected_lake_inputs = memo.expected_lake_inputs.as_deref()?;
-    let manifest = load_cached_pkg_manifest(&mut memo.manifests, cfg, spec, true)?
-        .validated
-        .as_ref()?;
+    let manifest = load_cached_pkg_manifest(
+        &mut memo.manifests,
+        &mut memo.lake_closure_cache.freshness_inputs,
+        cfg,
+        spec,
+        true,
+    )?
+    .validated
+    .as_ref()?;
     let rel_src = src_path
         .strip_prefix(pkg_root)
         .unwrap_or(src_path)
@@ -16283,6 +16432,13 @@ pub(crate) fn module_lake_input_digest(cfg: &ProjectConfig, node: &ModuleNode) -
 /// placeholder string: any deterministic string would compare equal across two runs with different
 /// underlying input bytes, turning cache consumers and manifest guards into false-green hits.
 pub(crate) fn workspace_lake_inputs_digest(cfg: &ProjectConfig) -> Result<String> {
+    workspace_lake_inputs_digest_with_files(cfg, &mut FreshnessInputs::default())
+}
+
+fn workspace_lake_inputs_digest_with_files(
+    cfg: &ProjectConfig,
+    files: &mut FreshnessInputs,
+) -> Result<String> {
     validate_materialized_artifacts(cfg)?;
     let mut out = String::new();
     for pkg in &cfg.dep_pkgs {
@@ -16299,6 +16455,14 @@ pub(crate) fn workspace_lake_inputs_digest(cfg: &ProjectConfig) -> Result<String
             .filter_entry(|e| !matches!(e.file_name().to_str(), Some(".lake" | ".git")))
         {
             let entry = entry?;
+            if entry.file_type().is_dir() {
+                files.directories.insert(
+                    entry.path().canonicalize()?,
+                    crate::zygote::OleanFileStatSig::from_meta(&fs::symlink_metadata(
+                        entry.path(),
+                    )?),
+                );
+            }
             if !entry.file_type().is_file() || entry.path().extension().is_none_or(|e| e != "lean")
             {
                 continue;
@@ -16308,10 +16472,15 @@ pub(crate) fn workspace_lake_inputs_digest(cfg: &ProjectConfig) -> Result<String
                 .strip_prefix(pkg.pkg_root.join(&pkg.src_dir))?
                 .with_extension("");
             let module_name = relative.to_string_lossy().replace('/', ".");
-            let source = fs::read_to_string(entry.path())?;
-            if let Some(inputs) =
-                tracked_custom_target_includes(cfg, pkg, &module_name, entry.path(), &source)
-            {
+            let source = String::from_utf8(files.read(entry.path())?)?;
+            if let Some(inputs) = tracked_custom_target_includes_with_files(
+                cfg,
+                pkg,
+                &module_name,
+                entry.path(),
+                &source,
+                files,
+            ) {
                 for (path, digest) in inputs {
                     out.push_str(&format!("include:{}:{}\n", path.display(), digest));
                 }
@@ -17669,11 +17838,16 @@ impl ReplayLookupBatchCache {
         }
         let mut stack = vec![Frame::Enter(root_id)];
         let mut visiting: HashSet<usize> = HashSet::new();
+        let mut completed = HashSet::new();
         while let Some(frame) = stack.pop() {
             match frame {
                 Frame::Enter(uid) => {
+                    if completed.contains(&uid) {
+                        continue;
+                    }
                     if let Some(ref existing) = self.node_closures[uid] {
                         if self.closure_memo_is_fresh(existing) {
+                            completed.insert(uid);
                             continue;
                         }
                         self.node_closures[uid] = None;
@@ -17729,9 +17903,10 @@ impl ReplayLookupBatchCache {
                         .iter()
                         .copied()
                         .filter(|&cid| {
-                            self.node_closures[cid]
-                                .as_ref()
-                                .is_none_or(|e| !self.closure_memo_is_fresh(e))
+                            !completed.contains(&cid)
+                                && self.node_closures[cid]
+                                    .as_ref()
+                                    .is_none_or(|e| !self.closure_memo_is_fresh(e))
                         })
                         .collect();
                     stack.push(Frame::Exit(
@@ -17774,6 +17949,7 @@ impl ReplayLookupBatchCache {
                         tc_mods: tc_vec,
                         non_tc_mods: non_tc_vec,
                     });
+                    completed.insert(uid);
                 }
             }
         }
@@ -17955,6 +18131,9 @@ impl ReplayLookupBatchCache {
         self.refresh_replay_hmac_key(store);
         let key = self.replay_hmac_key?;
         let dig = compute_replayed_olean_ilean_digest(olean_path).ok()?;
+        if !store.may_have_kernel_audit(&dig) {
+            return None;
+        }
         let (root_id, env_dig) = self
             .compute_env_digest_and_root(cfg, olean_path, binds_policy)
             .ok()?;
@@ -18077,6 +18256,9 @@ impl ReplayLookupBatchCache {
         let Ok(dig) = compute_replayed_olean_ilean_digest(olean_path) else {
             return false;
         };
+        if !store.may_have_kernel_audit(&dig) {
+            return false;
+        }
         let Ok((_, env_dig)) = self.compute_env_digest_and_root(cfg, olean_path, false) else {
             return false;
         };
@@ -21511,7 +21693,20 @@ pub(crate) fn run_command_with_timeout_pinned_fd(
     let err_handle = std::thread::spawn(move || -> Vec<u8> {
         let mut buf = Vec::new();
         if let Some(ref mut r) = stderr_pipe {
-            let _ = std::io::Read::read_to_end(r, &mut buf);
+            if std::env::var_os("TURBO_LEAN_PROFILE_REFRESH").is_some() {
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match std::io::Read::read(r, &mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let _ = std::io::Write::write_all(&mut std::io::stderr(), &chunk[..n]);
+                            buf.extend_from_slice(&chunk[..n]);
+                        }
+                    }
+                }
+            } else {
+                let _ = std::io::Read::read_to_end(r, &mut buf);
+            }
         }
         buf
     });
@@ -21549,7 +21744,10 @@ pub(crate) fn run_command_with_timeout_pinned_fd(
             let _ = child.kill();
             let _ = child.wait();
             let _ = out_handle.join();
-            let _ = err_handle.join();
+            let stderr = err_handle.join().unwrap_or_default();
+            if std::env::var_os("TURBO_LEAN_PROFILE_REFRESH").is_some() {
+                eprintln!("timed out auditor: {}", String::from_utf8_lossy(&stderr));
+            }
             anyhow::bail!("`lean` command timed out after {}ms", timeout.as_millis());
         }
         let sleep_dur = if poll_iter < 25 {
@@ -22631,6 +22829,9 @@ pub(crate) fn ensure_imported_oleans_replayed_with_roots_and_axioms(
     let (replay_lp, _) = build_lean_search_path(&cfg, false);
     let mut replay_batch = ReplayLookupBatchCache::new(store, &cfg, &replay_lp);
     for (m, path) in &imported {
+        if std::env::var_os("TURBO_LEAN_PROFILE_REFRESH").is_some() {
+            eprintln!("import authority lookup: {m}");
+        }
         let needs_audit =
             verify_imported_package_module_source_hygiene(&cfg, m, path, allowed_axioms)?;
         if needs_audit {
@@ -22759,14 +22960,31 @@ pub(crate) fn record_locally_rebuilt_sources(
 ) -> Result<()> {
     let mut full = HashMap::new();
     let mut tiers = HashMap::new();
+    let profile_started = Instant::now();
     for node in dag.nodes.values() {
         for (name, path) in std::iter::once((&node.module_name, &node.olean_path))
             .chain(node.external_olean_deps.iter().map(|(m, p)| (m, p)))
         {
+            if full.contains_key(name) {
+                continue;
+            }
+            if std::env::var_os("TURBO_LEAN_PROFILE_REFRESH").is_some() {
+                eprintln!(
+                    "refresh digest start: {name} {:?}",
+                    profile_started.elapsed()
+                );
+            }
             let td = compute_module_artifact_tier_digests_with_policy(path, true)?;
             full.insert(name.clone(), td.full.clone());
             tiers.insert(name.clone(), td);
         }
+    }
+    if std::env::var_os("TURBO_LEAN_PROFILE_REFRESH").is_some() {
+        eprintln!(
+            "refresh artifact digests: {:?}, modules={}",
+            profile_started.elapsed(),
+            full.len()
+        );
     }
     let inputs = workspace_lake_inputs_digest(cfg)?;
     let mut manifests = HashMap::new();
@@ -22782,10 +23000,23 @@ pub(crate) fn record_locally_rebuilt_sources(
                 &full,
                 &tiers,
                 &mut manifests,
-                false,
+                true,
                 Some(&inputs),
             );
         }
+    }
+    for (root, (manifest, dirty)) in manifests {
+        anyhow::ensure!(
+            !dirty || flush_verified_dep_manifest_atomic(&root, &manifest),
+            "Failed to record refreshed package {}",
+            root.display()
+        );
+    }
+    if std::env::var_os("TURBO_LEAN_PROFILE_REFRESH").is_some() {
+        eprintln!(
+            "refresh manifest recording: {:?}",
+            profile_started.elapsed()
+        );
     }
     Ok(())
 }
@@ -29773,9 +30004,14 @@ lean_exe «demo-exe» where
         .unwrap();
         assert_eq!(bound.len(), 1);
         let original_inputs = workspace_lake_inputs_digest(&cfg)?;
+        let mut freshness = FreshnessInputs::default();
+        assert_eq!(freshness.workspace_digest(&cfg)?, original_inputs);
+        assert_eq!(freshness.workspace_digest(&cfg)?, original_inputs);
         assert!(build_module_dag(&cfg, &["Widgets".into()]).is_err());
         assert!(build_lake_refresh_dag(&cfg, &["Widgets".into()]).is_ok());
         fs::write(dep.join("widget.js"), "tampered")?;
+        assert!(!freshness.unchanged());
+        assert_ne!(freshness.workspace_digest(&cfg)?, original_inputs);
         reset_lake_inputs_tag_memo();
         assert!(tracked_custom_target_includes(
             &cfg,
@@ -29795,6 +30031,23 @@ lean_exe «demo-exe» where
             "Widgets",
             &dep.join("Widgets.lean"),
             "def x := include_str \"untracked.js\""
+        )
+        .is_none());
+        fs::remove_file(dep.join("untracked.js"))?;
+        let mut git = crate::trusted_tools::git(&dep)?;
+        anyhow::ensure!(git
+            .arg("-C")
+            .arg(&dep)
+            .args(["update-index", "--force-remove", "widget.js"])
+            .status()?
+            .success());
+        reset_lake_inputs_tag_memo();
+        assert!(tracked_custom_target_includes(
+            &cfg,
+            pkg,
+            "Widgets",
+            &dep.join("Widgets.lean"),
+            &source
         )
         .is_none());
         fs::remove_dir_all(dir)?;

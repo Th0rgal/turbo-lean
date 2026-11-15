@@ -4153,11 +4153,21 @@ pub(crate) fn materialize_bound_audit_closure(
     mod_names: &[String],
     lean_path_env: &str,
 ) -> Result<ClosureSnapshot> {
+    let profile_started = std::time::Instant::now();
     let tc_opt = (!cfg.toolchain_lib_lean.as_os_str().is_empty())
         .then_some(cfg.toolchain_lib_lean.as_path());
     let csv = mod_names.join(",");
     let mut snap = ClosureSnapshot::take(&csv, lean_path_env, tc_opt);
+    if std::env::var_os("TURBO_LEAN_PROFILE_REFRESH").is_some() {
+        eprintln!("audit closure snapshot: {:?}", profile_started.elapsed());
+    }
     snap.materialize(tc_opt);
+    if std::env::var_os("TURBO_LEAN_PROFILE_REFRESH").is_some() {
+        eprintln!(
+            "audit closure materialization: {:?}",
+            profile_started.elapsed()
+        );
+    }
     anyhow::ensure!(
         snap.materialized.is_some() && snap.binding() == ClosureBinding::Bound,
         "Failed to bind immutable `.olean` closure snapshot across kernel replay/audit phases (concurrent artifact mutation or incomplete closure): fail-closed"
@@ -4866,21 +4876,19 @@ pub(crate) fn audit_imported_modules_with_zygote(
         false,
         pinned_fd,
     )?;
-    for chunk in modules.chunks(audit_batch_size()) {
-        let (lp, _) = ensure_bound_audit_closure(&snap, "import_audit_before_chunk")?;
-        audit_module_batch_exec_pinned_with_mode(
-            &store.root,
-            cfg,
-            chunk,
-            &lp,
-            &[],
-            false,
-            allow_sorry,
-            false,
-            pinned_fd,
-            true,
-        )?;
-    }
+    let (lp, _) = ensure_bound_audit_closure(&snap, "import_audit_before_policy")?;
+    audit_module_batch_exec_pinned_with_mode(
+        &store.root,
+        cfg,
+        modules,
+        &lp,
+        &[],
+        false,
+        allow_sorry,
+        true,
+        pinned_fd,
+        true,
+    )?;
     ensure_live_closure_matches_snapshot(&snap, "import_audit_before_record")?;
     if !allow_sorry {
         record_snapshot_modules_with_audit_mode(
@@ -5162,9 +5170,18 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
             base_cap
         }
     };
+    let profile_started = std::time::Instant::now();
     let batches = build_replay_closure_batches(cfg, mod_names, lean_path_env, slice_cap)
         .unwrap_or_else(|_| mod_names.iter().map(|s| vec![s.clone()]).collect());
+    if std::env::var_os("TURBO_LEAN_PROFILE_REFRESH").is_some() {
+        eprintln!(
+            "replay batches: {}, {:?}",
+            batches.len(),
+            profile_started.elapsed()
+        );
+    }
     let run_replay_slice = |slice: &[String]| -> Result<()> {
+        let slice_started = std::time::Instant::now();
         let (mut cmd, base_timeout) =
             kernel_reader_command(store_root, cfg, lean_path_env, extra_ro_binds, is_untrusted)?;
         let timeout = if slice.len() == 1 {
@@ -5186,6 +5203,15 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
             pinned_dir_raw_fd,
         )
         .context("Failed to execute independent kernel replay")?;
+        if std::env::var_os("TURBO_LEAN_PROFILE_REFRESH").is_some() {
+            eprintln!(
+                "replay slice: {} modules, {:?}, exit={}, stderr={}",
+                slice.len(),
+                slice_started.elapsed(),
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
         if out.status.success() {
             return Ok(());
         }
@@ -5245,6 +5271,9 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
     }
     let bootstrap_env = build_auditor_bootstrap_env(cfg);
     let _ = ensure_zygote_binary_at(store_root, &cfg.lean_bin, &bootstrap_env)?;
+    if std::env::var_os("TURBO_LEAN_PROFILE_REFRESH").is_some() {
+        eprintln!("replay worker ready: {:?}", profile_started.elapsed());
+    }
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     let first_err: std::sync::Mutex<Option<anyhow::Error>> = std::sync::Mutex::new(None);
     std::thread::scope(|s| {
@@ -5532,7 +5561,15 @@ fn audit_module_batch_exec_pinned_with_mode(
         is_untrusted,
         pinned_dir_raw_fd,
     );
-    match out.and_then(|o| parse_audit_modules_reply(&o, mod_names)) {
+    match out.and_then(|o| {
+        if std::env::var_os("TURBO_LEAN_PROFILE_REFRESH").is_some() {
+            eprintln!(
+                "import policy reply: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+        }
+        parse_audit_modules_reply(&o, mod_names)
+    }) {
         Ok(_) => Ok(()),
         Err(_) if mod_names.len() > 1 => {
             let mid = mod_names.len() / 2;
