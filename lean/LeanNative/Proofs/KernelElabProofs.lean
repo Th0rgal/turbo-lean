@@ -23,19 +23,19 @@ theorem olean_mmap_bridge_sound_bridge (bytes : ByteArray) (env : ConLeche.Env)
     (∀ d ∈ env.decls, ConLeche.CICValid env d) :=
   ConLeche.olean_mmap_bridge_sound bytes env h_parse
 
-theorem header_pin_prevents_statement_spoofing_bridge (spec : TurboLean.ElabAudit.PinnedHeaderSpec)
-    (elaboratedTy : ConLeche.Expr)
-    (h_pin : TurboLean.ElabAudit.verifyHeaderPin spec elaboratedTy = true) :
-    elaboratedTy = spec.pinnedTypeAst ∧
-    TurboLean.ElabAudit.checkNoShadowedConsts spec.globalConsts spec.boundNames elaboratedTy = true ∧
-    TurboLean.ElabAudit.renderExplicitAST elaboratedTy = TurboLean.ElabAudit.renderExplicitAST spec.pinnedTypeAst :=
-  TurboLean.ElabAudit.header_pin_prevents_statement_spoofing spec elaboratedTy h_pin
+theorem header_pin_prevents_statement_spoofing_bridge (surf : TurboLean.ElabAudit.SurfaceSig)
+    (kType : ConLeche.Expr)
+    (h_pin : TurboLean.ElabAudit.verifyHeaderPin surf kType = true) :
+    TurboLean.ElabAudit.eraseAnnotations (TurboLean.ElabAudit.reparseExplicit (TurboLean.ElabAudit.ppExplicit kType)) =
+      TurboLean.ElabAudit.eraseAnnotations surf ∧
+    TurboLean.ElabAudit.shadowedBindersCount surf = 0 :=
+  TurboLean.ElabAudit.header_pin_prevents_statement_spoofing surf kType h_pin
 
-theorem cas_proof_replay_sound_bridge (env : ConLeche.Env) (blob : List UInt8)
-    (expectedTy prf : ConLeche.Expr)
-    (h_replay : TurboLean.ElabAudit.replayCASProofBlob env blob expectedTy = some prf) :
-    TurboLean.ElabAudit.parseExprV1 blob = some prf ∧
-    ConLeche.HasType env [] prf expectedTy :=
-  TurboLean.ElabAudit.cas_proof_replay_sound env blob expectedTy prf h_replay
+theorem cas_proof_replay_sound_bridge (env : ConLeche.Env) (expectedType : ConLeche.Expr)
+    (blob : ByteArray)
+    (h_replay : TurboLean.ElabAudit.verifyCasProofBlob env expectedType blob = true) :
+    ∃ (proofTerm : ConLeche.Expr), TurboLean.ElabAudit.decodeExprBlob blob = .ok proofTerm ∧
+      ConLeche.HasType env [] proofTerm expectedType :=
+  TurboLean.ElabAudit.cas_proof_replay_sound env expectedType blob h_replay
 
 end LeanNative.Proofs
