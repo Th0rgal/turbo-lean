@@ -3436,6 +3436,79 @@ mod tests {
     }
 
     #[test]
+    fn test_native_diagonal_seeding_catches_high_bit_diagonal_counterexample() {
+        // Stage B native diagonal/boundary seeding inside the in-memory fast-check
+        // evaluator. The sweep's boundary slots alias params 0/1 only at idx = 17k
+        // (the first nonzero alias lands at idx = 17, the high-half alias at idx >= 34),
+        // and the tightest production caller probes with 32 states, so a diagonal
+        // pinned to the high half (`y >>> 63 = 1`) is unreachable: the sweep reports a
+        // vacuous pass. Seeding must close it deterministically.
+        let diag_buggy = ExtractedDecl {
+            name: "diag_buggy".to_string(),
+            binders: vec![(
+                vec!["x".to_string(), "y".to_string()],
+                "UInt64".to_string(),
+            )],
+            prop_str: "x ^^^ y = 0 → y >>> 63 = 1 → y - x = 1".to_string(),
+        };
+        let (rep, _, _) = eval_extracted_decl_in_memory(&diag_buggy, 32)
+            .expect("UInt64 diagonal decl must be evaluable in memory");
+        assert!(
+            !rep.verified && rep.violations >= 1,
+            "high-half diagonal precondition must yield a violation once seeded: {rep:?}"
+        );
+        let ce = rep
+            .counterexample
+            .as_ref()
+            .expect("diagonal violation must carry a counterexample witness");
+        let x_val = ce
+            .bindings
+            .iter()
+            .find(|(n, _)| n == "x")
+            .map(|(_, v)| v.clone())
+            .expect("witness must bind x");
+        let y_val = ce
+            .bindings
+            .iter()
+            .find(|(n, _)| n == "y")
+            .map(|(_, v)| v.clone())
+            .expect("witness must bind y");
+        assert_eq!(
+            x_val, y_val,
+            "the surfaced counterexample must lie on the seeded diagonal (x == y)"
+        );
+        assert!(
+            !rep.vacuous_precondition_warning,
+            "a seeded diagonal state satisfies the precondition: {rep:?}"
+        );
+
+        // Positive control: the sound high-half diagonal identity stays verified with a
+        // satisfied seeded state instead of a vacuous pass.
+        let diag_ok = ExtractedDecl {
+            name: "diag_ok".to_string(),
+            binders: vec![(
+                vec!["x".to_string(), "y".to_string()],
+                "UInt64".to_string(),
+            )],
+            prop_str: "x ^^^ y = 0 → y >>> 63 = 1 → y - x = 0".to_string(),
+        };
+        let (rep_ok, _, _) = eval_extracted_decl_in_memory(&diag_ok, 32)
+            .expect("UInt64 diagonal decl must be evaluable in memory");
+        assert!(
+            rep_ok.verified && rep_ok.violations == 0,
+            "sound diagonal identity must stay verified: {rep_ok:?}"
+        );
+        assert!(
+            rep_ok.satisfied_preconditions >= 1,
+            "seeding must satisfy the diagonal precondition for the sound identity: {rep_ok:?}"
+        );
+        assert!(
+            !rep_ok.vacuous_precondition_warning,
+            "sound diagonal identity must not be flagged vacuous once seeded: {rep_ok:?}"
+        );
+    }
+
+    #[test]
     fn test_transpile_valid_word256_theorems_and_verify() {
         let lean_src = r#"
 namespace TurboLean.FastCheck
