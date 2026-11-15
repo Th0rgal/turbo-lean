@@ -1147,8 +1147,8 @@ fn milestone_m2_con_leche_contract_v4_and_auto_kernel_routing() {
         assert!(
             specs.iter().any(|s| {
                 s["decl"].as_str() == Some(required_decl)
-                    && s["is_tight"].as_bool() == Some(true)
-                    && s["is_vacuous"].as_bool() == Some(false)
+                    && s["tight"].as_bool() == Some(true)
+                    && s["vacuous"].as_bool() == Some(false)
             }),
             "missing or non-tight required M2 theorem `{required_decl}` in {audit}"
         );
