@@ -8861,6 +8861,7 @@ fn write_cached_json_blob<T: serde::Serialize>(
     }
 }
 
+#[cfg(test)]
 fn kernel_statement_changes_with_trust(
     store: &TurboStore,
     project: &Path,
