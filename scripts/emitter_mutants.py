@@ -785,6 +785,21 @@ def run_unit_tests() -> bool:
                         before.replace(mutation["search"], mutation["replace"], 1))
                     self.assertNotEqual(target.read_text(encoding="utf-8"), before)
 
+        def test_stage_b_universe_is_live_applicable_mutants(self):
+            # G5 Stage B (roadmap/GOALS.md): comparison_universe is exactly the
+            # live mutants M1..M10 -- the retired not_applicable M11
+            # (CAbiEmit.lean, removed in bf8ae24) must not linger in it.
+            universe = list(self.spec["comparison_universe"])
+            by_id = {m["id"]: m for m in self.spec["mutations"]}
+            self.assertNotIn("M11", universe)
+            self.assertEqual(tuple(universe), COMPARISON_UNIVERSE)
+            self.assertEqual(set(by_id), set(universe))
+            for mid in universe:
+                with self.subTest(mutant=mid):
+                    mutation = by_id[mid]
+                    self.assertNotIn("not_applicable", mutation)
+                    self.assertTrue((ROOT / mutation["file"]).is_file(), mutation["file"])
+
         def rows(self) -> list[dict]:
             return [{"id": mid, "backend": "llvm", "outcome": "SURVIVED"} for mid in COMPARISON_UNIVERSE]
 
