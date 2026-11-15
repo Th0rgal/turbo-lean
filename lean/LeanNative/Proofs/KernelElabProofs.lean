@@ -23,6 +23,25 @@ theorem olean_mmap_bridge_sound_bridge (bytes : ByteArray) (env : ConLeche.Env)
     (∀ d ∈ env.decls, ConLeche.CICValid env d) :=
   ConLeche.olean_mmap_bridge_sound bytes env h_parse
 
+theorem kernel_conLeche_olean_mmap_bridge_sound_bridge (bytes : ByteArray) (env : ConLeche.Env)
+    (h_parse : TurboLean.Kernel.ConLeche.parseOleanShard bytes = .ok env) :
+    TurboLean.Kernel.ConLeche.EnvWellFormed env :=
+  TurboLean.Kernel.ConLeche.olean_mmap_bridge_sound bytes env h_parse
+
+theorem kernel_conLeche_verify_decl_sound_bridge (env env' : ConLeche.Env) (d : ConLeche.Decl)
+    (h_wf : TurboLean.Kernel.ConLeche.EnvWellFormed env)
+    (h_ok : TurboLean.Kernel.ConLeche.checkDecl env d = .ok env') :
+    TurboLean.Kernel.ConLeche.EnvWellFormed env' ∧ TurboLean.Kernel.ConLeche.CICValid env d :=
+  TurboLean.Kernel.ConLeche.con_leche_verify_decl_sound env env' d h_wf h_ok
+
+theorem kernel_conLeche_typecheck_rejects_ill_typed_app_bridge (fuel : Nat) (env : ConLeche.Env)
+    (ctx : List ConLeche.Expr) (fn arg dom body argTy : ConLeche.Expr)
+    (h_fn : TurboLean.Kernel.ConLeche.inferType fuel env ctx fn = some (.forallE dom body))
+    (h_arg : TurboLean.Kernel.ConLeche.inferType fuel env ctx arg = some argTy)
+    (h_mismatch : argTy ≠ dom) :
+    TurboLean.Kernel.ConLeche.inferType (fuel + 1) env ctx (.app fn arg) = none :=
+  TurboLean.Kernel.ConLeche.typecheck_rejects_ill_typed_app fuel env ctx fn arg dom body argTy h_fn h_arg h_mismatch
+
 theorem header_pin_prevents_statement_spoofing_bridge (surf : TurboLean.ElabAudit.SurfaceSig)
     (kType : ConLeche.Expr)
     (h_pin : TurboLean.ElabAudit.verifyHeaderPin surf kType = true) :

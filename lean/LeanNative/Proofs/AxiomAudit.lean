@@ -211,6 +211,10 @@ def auditedTheoremNames : List Name :=
   , ``ConLeche.inferType_sound
   , ``ConLeche.con_leche_verify_decl_sound
   , ``ConLeche.olean_mmap_bridge_sound
+  , ``TurboLean.Kernel.ConLeche.verifyDeclsPrefix_append_singleton
+  , ``TurboLean.Kernel.ConLeche.olean_mmap_bridge_sound
+  , ``TurboLean.Kernel.ConLeche.con_leche_verify_decl_sound
+  , ``TurboLean.Kernel.ConLeche.typecheck_rejects_ill_typed_app
   , ``TurboLean.ElabAudit.header_pin_prevents_statement_spoofing
   , ``TurboLean.ElabAudit.cas_proof_replay_sound
   , ``LeanNative.Proofs.mutant1_off_by_one_killed
@@ -820,7 +824,7 @@ def auditedTheoremNames : List Name :=
   , ``LeanNative.Proofs.LedgerEmbedded32.ledgerBip32Varint_e2e_nonvacuous
   ]
 
-#guard auditedTheoremNames.length == 859
+#guard auditedTheoremNames.length == 863
 #guard auditedTheoremNames.eraseDups.length == auditedTheoremNames.length
 
 /-- Per-theorem transitive axiom audit result from `Lean.collectAxioms`. -/
