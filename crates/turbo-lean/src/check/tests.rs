@@ -3454,3 +3454,102 @@ fn test_remote_http_check_never_stages_cas_blobs_before_attestation_and_reuses_c
     let _ = fs::remove_dir_all(&tmp_dir);
     test_res
 }
+
+#[test]
+fn test_zygote_check_mode_statement_hash_matches_frontend_with_nested_tactic_in_type() -> Result<()>
+{
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "turbo_nested_stmt_tactic_hash_{}",
+        crate::pack::next_tmp_id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_dir);
+    let (store_dir, proj_dir) = (tmp_dir.join("store"), tmp_dir.join("proj"));
+    fs::create_dir_all(&store_dir)?;
+    fs::create_dir_all(&proj_dir)?;
+    let toolchain = "leanprover/lean4:v4.35.0";
+    fs::write(proj_dir.join("lean-toolchain"), format!("{toolchain}\n"))?;
+    let store = TurboStore::open(Some(&store_dir))?;
+    let (env_vars, lean_bin) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "")?;
+    if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
+        let _ = fs::remove_dir_all(&tmp_dir);
+        return Ok(());
+    }
+    crate::zygote::ensure_zygote_binary(&store, &lean_bin, &env_vars)?;
+
+    let src = concat!(
+        "module\n",
+        "public section\n",
+        "namespace List\n",
+        "@[expose] def foldrIdx {α : Type u} {β : Type v} (f : Nat → α → β → β) (init : β) :\n",
+        "    (l : List α) → (start : Nat := 0) → β\n",
+        "  | [], _ => init\n",
+        "  | a :: l, s => f s a (foldrIdx f init l (s + 1))\n",
+        "@[expose, inline] def findIdxs (p : α → Bool) (l : List α) (start : Nat := 0) : List Nat :=\n",
+        "  foldrIdx (fun i a is => bif p a then i :: is else is) [] l start\n",
+        "@[simp, grind =] theorem foldrIdx_nil : ([] : List α).foldrIdx f i s = i := rfl\n",
+        "@[simp, grind =] theorem foldrIdx_cons :\n",
+        "    (x :: xs : List α).foldrIdx f i s = f s x (foldrIdx f i xs (s + 1)) := rfl\n",
+        "@[simp, grind =] theorem findIdxs_nil : ([] : List α).findIdxs p s = [] := rfl\n",
+        "@[simp, grind =] theorem findIdxs_cons :\n",
+        "    (x :: xs : List α).findIdxs p s =\n",
+        "    if p x then s :: xs.findIdxs p (s + 1) else xs.findIdxs p (s + 1) := by\n",
+        "  grind [findIdxs]\n",
+        "@[simp, grind =] theorem mem_findIdxs_iff_getElem_sub_pos :\n",
+        "    i ∈ (xs : List α).findIdxs p s ↔ s ≤ i ∧\n",
+        "    ∃ (hix : i - s < xs.length), p xs[i - s] := by\n",
+        "  induction xs generalizing s <;> grind\n",
+        "@[simp, grind =] theorem length_findIdxs : ((xs : List α).findIdxs p s).length = xs.countP p := by\n",
+        "  induction xs generalizing s <;> grind\n",
+        "@[simp] theorem le_getElem_findIdxs (h : i < ((xs : List α).findIdxs p s).length) :\n",
+        "    s ≤ (xs.findIdxs p s)[i] := by grind [getElem_mem]\n",
+        "grind_pattern le_getElem_findIdxs => (xs.findIdxs p s)[i]\n",
+        "@[simp] theorem getElem_findIdxs_lt (h : i < ((xs : List α).findIdxs p s).length) :\n",
+        "    (xs.findIdxs p s)[i] < xs.length + s := by grind [getElem_mem]\n",
+        "grind_pattern getElem_findIdxs_lt => (xs.findIdxs p s)[i]\n",
+        "theorem getElem_filter_eq_getElem_getElem_findIdxs_sub (s : Nat)\n",
+        "    (h : i < ((xs : List α).filter p).length) :\n",
+        "    (xs.filter p)[i] = xs[(xs.findIdxs p s)[i]'(by grind [countP_eq_length_filter]) - s]'(by grind [countP_eq_length_filter]) := by\n",
+        "  induction xs generalizing i s <;> grind [countP_eq_length_filter]\n",
+        "end List\n",
+        "end\n",
+    );
+    let mod_file = proj_dir.join("NestedStmt.lean");
+    fs::write(&mod_file, src)?;
+
+    let split = split_lean_source(src, &[]);
+    let shard_refs: Vec<&splitter::TheoremShard> = split.shards.iter().collect();
+    let attested = confirm_file_decl_identities_with_budget(
+        src,
+        &shard_refs,
+        &proj_dir,
+        &mod_file,
+        false,
+        None,
+    )?;
+    let expected_types: Vec<(String, String)> = attested
+        .iter()
+        .map(|a| (a.decl_name.clone(), a.kernel_type_hash.clone()))
+        .collect();
+    let targets: Vec<String> = split.shards.iter().map(|s| s.rooted_name()).collect();
+
+    let reply = crate::zygote::eval_with_zygote_pool_for_targets_and_stubs(
+        &store,
+        toolchain,
+        "",
+        &env_vars,
+        &lean_bin,
+        src,
+        &targets,
+        &[],
+        None,
+        &[],
+    )?;
+    let _ = fs::remove_dir_all(&tmp_dir);
+    assert!(
+        reply.import_ok && reply.ok,
+        "zygote check failed: {:?}",
+        reply.errors
+    );
+    crate::zygote::verify_attested_decl_types(&reply.decl_types, &expected_types)?;
+    Ok(())
+}
