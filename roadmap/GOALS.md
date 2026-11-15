@@ -134,6 +134,8 @@ Even with machine-checked proofs, specification blind spots (e.g., mismatched FF
 
 ## Remaining Open Roadmap Items
 
+> **Order of work**: see [`HORIZONS.md`](./HORIZONS.md). `G3.1`/`G3.2` (one proven `LCNF → LNIR` path) come first, measured build speed second, accelerator plugins and the remaining backends last.
+
 ### Priority 0 — Zygote CoW fork pool
 
 - **`ZygoteFork` (`CompactedRegion` + POSIX `fork` CoW Isolation)**: `lean/TurboLean/ZygoteFork.lean` (pure-Lean Lake interface; POSIX runtime in `crates/turbo-lean/src/zygote_fork_posix.lean`) and `lean/TurboLean/ZygoteWorker.lean` compact imported `Environment` headers into mmap-style `CompactedRegion` pages and run parallel `race_candidates` tactics (`min(ncpus, 4)`, bounded by `TURBO_LEAN_RACE_FORK_JOBS`) and opt-in per-shard checks (`TURBO_LEAN_ZYGOTE_FORK_SHARDS=1`) inside quiesced-task-manager POSIX `fork` children (`_exit` without C++ atexit destructors, immediate `SIGKILL` + `waitpid` sibling reaping on first `0 sorryAx` kernel-verified winner, fail-closed worker poisoning on `runtimePanicErr`).
