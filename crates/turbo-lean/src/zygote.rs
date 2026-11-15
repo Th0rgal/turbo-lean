@@ -9203,6 +9203,50 @@ impl Drop for LocalPayload {
     fn drop(&mut self) { let _ = fs::remove_file(&self.0); }
 }
 
+/// Maximum accepted bytes per HTTP wire line (request/response head) on the
+/// daemon socket boundary: adversarial framing beyond this is rejected
+/// fail-closed instead of buffered unboundedly.
+pub(crate) const MAX_WIRE_LINE_BYTES: usize = 16 * 1024;
+
+/// Outcome of one bounded wire-line read.
+pub(crate) enum BoundedLine {
+    /// A complete `'\n'`-terminated line was written into the target buffer.
+    Line,
+    /// The line exceeded `MAX_WIRE_LINE_BYTES` (the excess input is unconsumed).
+    TooLong,
+    /// EOF after at least one byte without a terminating `'\n'`.
+    Truncated,
+    /// EOF before any byte of the line.
+    Eof,
+}
+
+/// Read one `'\n'`-terminated wire line into `out` (cleared first), bounded by
+/// `MAX_WIRE_LINE_BYTES`. Never buffers unbounded input: the take-wrapped read
+/// stops at the cap, so a peer streaming an unterminated line cannot grow the
+/// daemon's memory.
+pub(crate) fn read_bounded_line(
+    reader: &mut impl std::io::BufRead,
+    out: &mut String,
+) -> std::io::Result<BoundedLine> {
+    use std::io::Read;
+    out.clear();
+    let mut bytes = Vec::with_capacity(128);
+    reader.take(MAX_WIRE_LINE_BYTES as u64 + 1).read_until(b'\n', &mut bytes)?;
+    if bytes.len() > MAX_WIRE_LINE_BYTES {
+        return Ok(BoundedLine::TooLong);
+    }
+    if bytes.is_empty() {
+        return Ok(BoundedLine::Eof);
+    }
+    match String::from_utf8(bytes) {
+        Ok(line) => {
+            *out = line;
+            Ok(if out.ends_with('\n') { BoundedLine::Line } else { BoundedLine::Truncated })
+        }
+        Err(error) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error.utf8_error())),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn http_request_with_timeout_and_token(
     method: &str, url: &str, content_type: &str, body: &[u8], timeout: Option<u64>,
@@ -9214,7 +9258,7 @@ fn http_request_with_timeout_and_token(
     let Some(socket) = socket.filter(|p| p.exists()) else {
         return crate::pack::http_request_with_timeout_and_token(method, url, content_type, body, timeout, token, on_inflight);
     };
-    use std::io::{BufRead, Read, Write};
+    use std::io::{Read, Write};
     let (socket, _directory) = unix_socket_path(&socket)?;
     let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
     let duration = Some(std::time::Duration::from_millis(timeout.unwrap_or(900_000)));
@@ -9230,13 +9274,20 @@ fn http_request_with_timeout_and_token(
     stream.write_all(wire_body)?;
     let mut reader = std::io::BufReader::new(stream);
     let mut line = String::new();
-    reader.read_line(&mut line)?;
+    match read_bounded_line(&mut reader, &mut line)? {
+        BoundedLine::Line => {}
+        BoundedLine::TooLong => anyhow::bail!("Local response line too large"),
+        _ => anyhow::bail!("Truncated local response"),
+    }
     let status: u16 = line.split_whitespace().nth(1).context("Missing local response status")?.parse()?;
     let mut len = 0usize;
     let mut shared = None;
     loop {
-        line.clear();
-        anyhow::ensure!(reader.read_line(&mut line)? != 0, "Truncated local response");
+        match read_bounded_line(&mut reader, &mut line)? {
+            BoundedLine::Line => {}
+            BoundedLine::TooLong => anyhow::bail!("Local response line too large"),
+            _ => anyhow::bail!("Truncated local response"),
+        }
         if line.trim().is_empty() { break; }
         if let Some((key, value)) = line.split_once(':') {
             if key.eq_ignore_ascii_case("content-length") { len = value.trim().parse()?; }
@@ -10801,8 +10852,105 @@ mod tests {
     }
 
     #[test]
+    fn bounded_wire_lines_reject_oversized_and_truncated_input() {
+        let mut buf = String::new();
+        let mut input: &[u8] = b"short\r\nrest";
+        assert!(matches!(read_bounded_line(&mut input, &mut buf), Ok(BoundedLine::Line)));
+        assert_eq!(buf, "short\r\n");
+        assert!(matches!(read_bounded_line(&mut input, &mut buf), Ok(BoundedLine::Truncated)));
+        assert_eq!(buf, "rest");
+        let mut input: &[u8] = b"";
+        assert!(matches!(read_bounded_line(&mut input, &mut buf), Ok(BoundedLine::Eof)));
+        let mut long = vec![b'A'; MAX_WIRE_LINE_BYTES + 2];
+        long.push(b'\n');
+        assert!(matches!(read_bounded_line(&mut long.as_slice(), &mut buf), Ok(BoundedLine::TooLong)));
+        let mut exact = vec![b'A'; MAX_WIRE_LINE_BYTES - 1];
+        exact.push(b'\n');
+        assert!(matches!(read_bounded_line(&mut exact.as_slice(), &mut buf), Ok(BoundedLine::Line)));
+        assert_eq!(buf, format!("{}\n", "A".repeat(MAX_WIRE_LINE_BYTES - 1)));
+        let mut invalid: &[u8] = b"\xff\xfe\r\n";
+        assert!(read_bounded_line(&mut invalid, &mut buf).is_err());
+    }
+
+    #[test]
+    fn local_transport_rejects_oversized_response_lines() -> Result<()> {
+        use std::io::Write;
+        let dir = private_temp_subdir("transport-flood-test").context("private directory")?;
+        let socket = dir.join(format!("{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+        let url = format!("http://transport-flood-{}", next_tmp_id());
+        LOCAL_DAEMON_SOCKETS.get_or_init(Default::default).lock().unwrap().insert(url.clone(), socket);
+        let server = std::thread::spawn(move || -> Result<()> {
+            use std::io::BufRead;
+            let (stream, _) = listener.accept()?;
+            let mut reader = std::io::BufReader::new(stream);
+            // Read the request head first (like the real daemon) so the client's
+            // writes never race the adversarial response below.
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                    break;
+                }
+            }
+            let mut w = std::io::BufWriter::new(reader.into_inner());
+            // The client is expected to reject the response and hang up; ignore EPIPE.
+            let _ = write!(w, "HTTP/1.1 200 OK\r\nX-Flood: {}\r\n\r\n", "A".repeat(MAX_WIRE_LINE_BYTES + 1));
+            let _ = w.flush();
+            Ok(())
+        });
+        let error = http_request_with_timeout_and_token(
+            "POST", &format!("{url}/eval"), "application/json", b"{}", Some(5000), Some("test"), || {},
+        )
+        .err()
+        .context("expected oversized response line rejection")?;
+        assert!(error.to_string().contains("too large"), "{error}");
+        server.join().unwrap()?;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn local_transport_rejects_garbage_response_status_line() -> Result<()> {
+        use std::io::Write;
+        let dir = private_temp_subdir("transport-garbage-test").context("private directory")?;
+        let socket = dir.join(format!("{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+        let url = format!("http://transport-garbage-{}", next_tmp_id());
+        LOCAL_DAEMON_SOCKETS.get_or_init(Default::default).lock().unwrap().insert(url.clone(), socket);
+        let server = std::thread::spawn(move || -> Result<()> {
+            use std::io::BufRead;
+            let (stream, _) = listener.accept()?;
+            let mut reader = std::io::BufReader::new(stream);
+            // Read the request head first (like the real daemon) so the client's
+            // writes never race the adversarial response below.
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line.trim().is_empty() {
+                    break;
+                }
+            }
+            let mut w = std::io::BufWriter::new(reader.into_inner());
+            // The client is expected to reject the response and hang up; ignore EPIPE.
+            let _ = write!(w, "garbage-without-status\r\n\r\n");
+            let _ = w.flush();
+            Ok(())
+        });
+        let error = http_request_with_timeout_and_token(
+            "POST", &format!("{url}/eval"), "application/json", b"{}", Some(5000), Some("test"), || {},
+        )
+        .err()
+        .context("expected garbage status line rejection")?;
+        assert!(error.to_string().contains("status"), "{error}");
+        server.join().unwrap()?;
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    #[test]
     fn local_transport_large_payload_roundtrip() -> Result<()> {
-        use std::io::{BufRead, Read, Write};
+    use std::io::{Read, Write};
         let dir = private_temp_subdir("transport-test").context("private directory")?;
         let socket = dir.join(format!("{}.sock", std::process::id()));
         let listener = std::os::unix::net::UnixListener::bind(&socket)?;
