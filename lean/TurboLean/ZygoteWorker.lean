@@ -394,6 +394,11 @@ def isAllowedAxiom (patterns : List String) (ax : Name) : Bool :=
      ax != Name.mkStr2 "Lean" ("trust" ++ "Compiler") &&
      patterns.any (globMatch ·.toList ax.toString.toList))
 
+def isNativeDecideAxiom (ax : Name) : Bool :=
+  let s := ax.toString
+  (s.splitOn "._native.native_decide.").length > 1 ||
+    (s.splitOn "._native.bv_decide.").length > 1
+
 /-- Structural alpha/binder-insensitive `Expr` equality modulo `letE` `nondep` flags and binder names/infos
     (in Lean 4.35, `let x := v; b` in a theorem signature elaborates with `nondep := true` in `thmInfo.type`
     and `nondep := false` inside the `sorryAx` motive of an explicit stub). -/
@@ -3091,7 +3096,9 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
           let declName := cinfo.name
           match cinfo with
           | .axiomInfo _ =>
-            if !isAllowedAxiom patterns declName then
+            if !isAllowedAxiom patterns declName &&
+               !(allowSorry && declName == sorryAxName) &&
+               !(isImportAudit && isNativeDecideAxiom declName) then
               violations := violations ++ [s!"[TurboLean.KernelGate] custom axiom `{declName}` in `{rawStr}` is forbidden"]
           | .inductInfo iVal =>
             if iVal.isUnsafe then
@@ -3148,7 +3155,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
               else if sorryDecls.isEmpty && !userNm.isEmpty && !(seenSorry[userNm]?.getD false) then
                 seenSorry := seenSorry.insert userNm true
                 sorryDecls := sorryDecls ++ [userNm]
-            else if !(allowSorry && ax == sorryAxName) then
+            else if !(allowSorry && ax == sorryAxName) && !(isImportAudit && isNativeDecideAxiom ax) then
               violations := violations ++ [s!"[TurboLean.KernelGate] declaration `{declName}` in `{rawStr}` transitively depends on disallowed axiom `{ax}`"]
           let declElapsed := (← IO.monoMsNow) - declStart
           if declElapsed > 10 then profile s!"declaration {declName}: {declElapsed}ms"

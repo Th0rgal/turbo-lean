@@ -1306,7 +1306,7 @@ theorem good : Witness.value = 7 := rfl
         )?;
         fs::write(
             dir.join("Policy.lean"),
-            "unsafe def fast : Nat := 1\n@[implemented_by fast] def slow : Nat := 1\n@[csimp] theorem replacement : slow = slow := rfl\nnamespace N\ntheorem good : True := by trivial\nend N\n",
+            "unsafe def fast : Nat := 1\n@[implemented_by fast] def slow : Nat := 1\ndef csimpFast : Nat := 1\n@[csimp] theorem replacement : slow = csimpFast := rfl\nnamespace N\ntheorem good : True := by trivial\nend N\n",
         )?;
         let policies = [
             ("TURBO_LEAN_ALLOWED_UNSAFE", "fast"),
@@ -3195,9 +3195,11 @@ pub(super) fn build_cone_scoped_decl_audit_source(
                     | "macro"
             )
         });
+        let has_unsafe = attributes.iter().any(|t| t == "unsafe");
         let runtime_attachment = attributes
             .iter()
-            .any(|t| matches!(t.as_str(), "implemented_by" | "csimp"));
+            .any(|t| matches!(t.as_str(), "implemented_by" | "csimp"))
+            || has_unsafe;
         let implicit_dependency = kw != "example"
             && (matches!(
                 kw,
@@ -3957,10 +3959,8 @@ pub(super) fn check_single_decl(
         let (env_vars, _) = resolve_lake_env(store, canon_dir)?;
         let lean_bin = resolve_lean_bin(canon_dir)?;
         if !statement_has_tactics
-            && (cone_clean_for_certification
-                || (!shard_has_sorry
-                    && splitter::audit_hygiene(&splitter::strip_lean_comments(&cone_src))
-                        .is_clean_or_deferred_to_kernel_gate()))
+            && !crate::zygote::daemon_disabled()
+            && cone_clean_for_certification
         {
             let lean_path = resolve_remote_lean_path(canon_dir, Some(&env_vars));
             let reply = crate::zygote::eval_with_zygote_pool_for_targets_and_stubs(

@@ -484,6 +484,10 @@ pub(crate) fn discover_or_skip_trusted_git_for_test(project: &Path) -> Result<Op
         "/opt/homebrew/bin/git",
         "/usr/local/git/bin/git",
         "/nix/var/nix/profiles/default/bin/git",
+        "/nix/store/xgw813vgzl2q0696sq45adpj0xd690jq-git-2.56.0/bin/git",
+        "/var/lib/orb-node/.local/share/git-2.47.3/bin/git",
+        "/var/lib/sandboxed-node/.local/share/git-2.47.3/bin/git",
+        "/tmp/git-2.47.1/git",
     ] {
         candidates.push(PathBuf::from(extra));
     }

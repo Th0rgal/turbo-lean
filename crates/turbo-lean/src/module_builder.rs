@@ -9901,6 +9901,9 @@ pub(crate) fn is_clean_pinned_git_checkout(
             if xy.contains(&b'R') || xy.contains(&b'C') {
                 return Some(false);
             }
+            if xy == b"??" && (rel == Path::new(".lake") || rel.starts_with(".lake/")) {
+                continue;
+            }
             if !allowed_gitlinks.iter().any(|gl| gl == rel) {
                 return Some(false);
             }
@@ -29957,6 +29960,12 @@ lean_exe «demo-exe» where
         )?;
         fs::write(dep.join("widget.js"), "original")?;
         fs::write(dep.join(".gitignore"), "/.lake/\n")?;
+        let Some(git_bin) = crate::trusted_tools::discover_or_skip_trusted_git_for_test(&dep)?
+        else {
+            let _ = fs::remove_dir_all(&dir);
+            return Ok(());
+        };
+        let _git_env = ScopedEnvVar::set("TURBO_LEAN_GIT", &git_bin.to_string_lossy());
         for args in [
             vec!["init", "-q"],
             vec!["add", "."],
@@ -33274,6 +33283,13 @@ lean_lib Smoke where
         // 6. Initialize a git base commit and edit `App.lean`'s proof body so `pr-verify` runs in
         // trusted mode with forged `.turbo_verified_sources.json` manifests on disk: `TurboStore` DB
         // still has no replay row, so `pr-verify` rejects `Dep.Bad` via independent kernel replay.
+        let Some(git_bin) = crate::trusted_tools::discover_or_skip_trusted_git_for_test(&proj)?
+        else {
+            drop(store);
+            let _ = fs::remove_dir_all(&dir);
+            return Ok(());
+        };
+        let _git_env = ScopedEnvVar::set("TURBO_LEAN_GIT", &git_bin.to_string_lossy());
         for args in [
             vec!["init"],
             vec!["config", "user.email", "test@example.com"],
@@ -33287,7 +33303,7 @@ lean_lib Smoke where
             ],
             vec!["commit", "-m", "base"],
         ] {
-            let g = Command::new("git")
+            let g = Command::new(&git_bin)
                 .args(&args)
                 .current_dir(&proj)
                 .output()?;
@@ -43199,9 +43215,12 @@ end Fixture
             "def safeVal : Nat := 7\ntheorem unused_native : 1 + 1 = 2 := by native_decide\n",
         )?;
         fs::write(dep_origin.join("DepBv.lean"), "import DepBv.Bridge\n")?;
-        let git_bin = std::env::var_os("TURBO_LEAN_GIT")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("git"));
+        let Some(git_bin) = crate::trusted_tools::discover_or_skip_trusted_git_for_test(&proj)?
+        else {
+            let _ = fs::remove_dir_all(&dir);
+            return Ok(());
+        };
+        let _git_env = ScopedEnvVar::set("TURBO_LEAN_GIT", &git_bin.to_string_lossy());
         for args in [
             vec!["init"],
             vec!["config", "user.email", "t@e.com"],
