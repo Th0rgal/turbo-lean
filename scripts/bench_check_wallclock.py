@@ -277,7 +277,7 @@ def main():
              (args.batteries_dir, "Batteries/Data/List/Lemmas.lean",
               "List.getElem_filter_eq_getElem_getElem_findIdxs_sub"),
              (args.batteries_dir, "Batteries/Data/List/Lemmas.lean", None),
-             (args.pfr_dir, "PFR/Mathlib/Probability/IdentDistrib.lean", "PFR.conc_of_indep'"),
+              (args.pfr_dir, "PFR/Mathlib/Probability/IdentDistrib.lean", "ProbabilityTheory.identDistrib_id"),
              (args.pfr_dir, "PFR/Mathlib/Probability/IdentDistrib.lean", None)]
     with tempfile.TemporaryDirectory(prefix="turbo-wallclock-") as tmp:
         report = {"schema_version": 2, "binary": str(args.binary),

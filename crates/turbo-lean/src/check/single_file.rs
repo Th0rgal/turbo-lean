@@ -1089,7 +1089,7 @@ pub(super) fn check_single_file(
         let mut coalesced_zygote_err: Option<String> = None;
         if !batch_succeeded {
             let coalesced_src = splitter::build_coalesced_shard_source(src, &uncached_names);
-            match pack::try_local_zygote_check_shard_detailed(
+            let compile_batch = match pack::try_local_zygote_check_shard_detailed(
                 store,
                 &env_vars,
                 &make_batch_zreq(&coalesced_src),
@@ -1104,28 +1104,32 @@ pub(super) fn check_single_file(
                                 .collect()
                         })
                         .unwrap_or_default();
-                    crate::zygote::verify_attested_decl_types(&pairs, &expected_batch_types)?;
-                    batch_succeeded = true;
+                    batch_succeeded =
+                        crate::zygote::verify_attested_decl_types(&pairs, &expected_batch_types)
+                            .is_ok();
+                    !batch_succeeded
                 }
-                Ok(None) => {
-                    let batch_out = crate::zygote::run_audited_lean_shard_with_types(
-                        store,
-                        Path::new(&lean_bin),
-                        &env_vars,
-                        Some(canon_dir),
-                        &coalesced_src,
-                        &uncached_names,
-                        &expected_batch_types,
-                        &file_lean_args,
-                        Some(crate::zygote::remaining_timeout_ms(None, *t0)),
-                    )
-                    .context("Failed to execute `lean` on coalesced shard batch")?;
-                    if batch_out.status.success() {
-                        batch_succeeded = true;
-                    }
-                }
+                Ok(None) => true,
                 Err(e) => {
                     coalesced_zygote_err = Some(e.to_string());
+                    false
+                }
+            };
+            if compile_batch {
+                let batch_out = crate::zygote::run_audited_lean_shard_with_types(
+                    store,
+                    Path::new(&lean_bin),
+                    &env_vars,
+                    Some(canon_dir),
+                    &coalesced_src,
+                    &uncached_names,
+                    &expected_batch_types,
+                    &file_lean_args,
+                    Some(crate::zygote::remaining_timeout_ms(None, *t0)),
+                )
+                .context("Failed to execute `lean` on coalesced shard batch")?;
+                if batch_out.status.success() {
+                    batch_succeeded = true;
                 }
             }
         }
