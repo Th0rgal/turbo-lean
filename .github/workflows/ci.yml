@@ -282,7 +282,7 @@ jobs:
             --fixtures-output emitter-mutation-artifact/emitter-mutation-fixtures.json \
             --logs emitter-mutation-artifact/logs
 
-      - name: Run B-3 emitter mutation suite (M1..M11, C1..C7)
+      - name: Run B-3 emitter mutation suite (M1..M10, C1..C7)
         run: |
           mkdir -p emitter-mutation-artifact
           python3 scripts/emitter_mutants.py \

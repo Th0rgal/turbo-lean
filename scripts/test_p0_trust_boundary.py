@@ -899,7 +899,7 @@ class TestP0TrustBoundary(unittest.TestCase):
         self.assertTrue(em.run_unit_tests())
         spec = em.load_spec()
         ids = [m["id"] for m in spec["mutations"]]
-        self.assertEqual(ids, [f"M{i}" for i in range(1, 12)])
+        self.assertEqual(ids, [f"M{i}" for i in range(1, 11)])
         base_rows = [
             {
                 "id": m["id"],
@@ -927,7 +927,7 @@ class TestP0TrustBoundary(unittest.TestCase):
         self.assertEqual(a_sum["apply_failed_ids"], ["M3"])
         missing_row = em.summarize(base_rows[:-1], spec, ids)
         self.assertFalse(missing_row["conclusive"])
-        self.assertEqual(missing_row["missing_universe_ids"], ["M11"])
+        self.assertEqual(missing_row["missing_universe_ids"], ["M10"])
         targeted_sum = em.summarize(base_rows[:2], spec, ids[:2], targeted=True)
         self.assertFalse(targeted_sum["conclusive"])
         self.assertEqual(targeted_sum["run_outcome"], "TARGETED")
