@@ -84,6 +84,131 @@ fn materialize_request_body(body: Vec<u8>, shared: Option<&str>) -> Result<(Vec<
     Ok((payload.unwrap_or(body), request_timeout))
 }
 
+/// Maximum number of header lines accepted per request head.
+const MAX_HEAD_LINES: usize = 256;
+
+/// Parsed request head (request line + bounded headers).
+struct RequestHead {
+    method: String,
+    path: String,
+    content_len: usize,
+    token: Option<String>,
+    bearer: Option<String>,
+    shared_payload: Option<String>,
+}
+
+/// Deterministic head-level rejection reasons (`HeadError::Io` keeps the
+/// historical silent close for vanished peers; every framing violation gets a
+/// structured HTTP error).
+#[derive(Debug)]
+enum HeadError {
+    Io,
+    Truncated(&'static str),
+    Malformed(&'static str),
+    TooLarge(&'static str),
+}
+
+/// ASCII-case-insensitive prefix test on raw bytes: multi-byte UTF-8 in a
+/// header name or value can never panic (byte-slicing `&line[..n]` would).
+fn line_has_prefix(line: &str, prefix: &str) -> bool {
+    line.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
+}
+
+fn line_value(line: &str, prefix: &str) -> String {
+    line.get(prefix.len()..).unwrap_or("").trim().to_string()
+}
+
+/// Parse the request head with per-line and per-count bounds so adversarial
+/// daemon socket framing (multi-byte header names, oversized lines, header
+/// floods, garbage request lines) is rejected fail-closed: 0 panics, 0
+/// unbounded buffering, 0 hangs.
+fn read_request_head(reader: &mut impl BufRead) -> Result<RequestHead, HeadError> {
+    let mut line = String::new();
+    match crate::zygote::read_bounded_line(reader, &mut line) {
+        Ok(crate::zygote::BoundedLine::Line) => {}
+        Ok(crate::zygote::BoundedLine::TooLong) => {
+            return Err(HeadError::TooLarge("request line too large"))
+        }
+        Ok(_) => return Err(HeadError::Truncated("truncated request head")),
+        Err(_error) => return Err(HeadError::Io),
+    }
+    let mut parts = line.split_whitespace();
+    let (method, path) = match (parts.next(), parts.next()) {
+        (Some(method), Some(path)) => (method.to_string(), path.to_string()),
+        _ => return Err(HeadError::Malformed("malformed request line")),
+    };
+    let mut head = RequestHead {
+        method,
+        path,
+        content_len: 0,
+        token: None,
+        bearer: None,
+        shared_payload: None,
+    };
+    let mut lines = 0usize;
+    loop {
+        match crate::zygote::read_bounded_line(reader, &mut line) {
+            Ok(crate::zygote::BoundedLine::Line) => {}
+            Ok(crate::zygote::BoundedLine::TooLong) => {
+                return Err(HeadError::TooLarge("header line too large"))
+            }
+            Ok(_) => break,
+            Err(_error) => return Err(HeadError::Io),
+        }
+        if line.trim().is_empty() {
+            break;
+        }
+        lines += 1;
+        if lines > MAX_HEAD_LINES {
+            return Err(HeadError::TooLarge("too many header lines"));
+        }
+        if line_has_prefix(&line, "content-length:") {
+            head.content_len = line_value(&line, "content-length:").parse().unwrap_or(0);
+        } else if line_has_prefix(&line, "x-turbo-shm:") {
+            head.shared_payload = Some(line_value(&line, "x-turbo-shm:"));
+        } else if line_has_prefix(&line, "x-turbo-token:") {
+            head.token = Some(line_value(&line, "x-turbo-token:"));
+        } else if line_has_prefix(&line, "authorization:") {
+            let auth = line_value(&line, "authorization:");
+            if line_has_prefix(&auth, "bearer ") {
+                head.bearer = Some(auth.get(7..).unwrap_or_default().trim().to_string());
+            }
+        }
+    }
+    Ok(head)
+}
+
+/// Bounded drain of a rejected request's unread input so the structured error
+/// reply is delivered before the socket closes (avoids RST discards) without
+/// letting a peer hold the handler open (the 2s read timeout bounds each read).
+fn drain_request_remainder(reader: &mut impl Read) {
+    let mut sink = [0u8; 8192];
+    let mut remaining = 1024 * 1024;
+    while remaining > 0 {
+        match reader.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => remaining -= n,
+        }
+    }
+}
+
+/// Answer a head-level rejection with a structured JSON error; `HeadError::Io`
+/// keeps the historical silent close (the peer is gone or timed out).
+fn write_head_rejection(stream: &mut impl Write, error: &HeadError) {
+    let (status, detail) = match error {
+        HeadError::Io => return,
+        HeadError::Truncated(detail) | HeadError::Malformed(detail) => (400u16, *detail),
+        HeadError::TooLarge(detail) => (431, *detail),
+    };
+    let _ = write_json_response(
+        stream,
+        status,
+        &serde_json::json!({"ok": false, "error": "bad_request", "detail": detail}),
+    );
+}
+
 fn apply_mcp_timeout(request: &mut serde_json::Value, timeout: Option<u64>) {
     if let (Some(timeout), Some(object)) = (timeout, request.as_object_mut()) {
         object.insert("timeout_ms".into(), serde_json::json!(timeout));
@@ -124,6 +249,96 @@ fn normalize_mcp_workspace(
         }
     }
     explicit
+}
+
+#[cfg(test)]
+mod request_head_tests {
+    use super::{read_request_head, HeadError};
+
+    fn parse(raw: &[u8]) -> Result<super::RequestHead, HeadError> {
+        read_request_head(&mut &raw[..])
+    }
+
+    #[test]
+    fn valid_head_and_body_framing_parses() {
+        let head = parse(b"POST /mcp HTTP/1.1\r\ncontent-length: 5\r\nx-turbo-token: tok\r\n\r\nhello")
+            .unwrap();
+        assert_eq!(head.method, "POST");
+        assert_eq!(head.path, "/mcp");
+        assert_eq!(head.content_len, 5);
+        assert_eq!(head.token.as_deref(), Some("tok"));
+        assert!(head.bearer.is_none() && head.shared_payload.is_none());
+        let head =
+            parse(b"GET /export-local HTTP/1.1\r\nAuthorization: Bearer abc\r\nX-Turbo-Shm: payload-1-a\r\n\r\n")
+                .unwrap();
+        assert_eq!(head.method, "GET");
+        assert_eq!(head.bearer.as_deref(), Some("abc"));
+        assert_eq!(head.shared_payload.as_deref(), Some("payload-1-a"));
+    }
+
+    #[test]
+    fn multibyte_header_names_and_values_never_panic() {
+        // Regression (M11): `&hline[..15]` / `&auth_val[..7]` byte slicing
+        // panicked on non-char boundaries; framing stays deterministic now.
+        let head = parse("GET /health HTTP/1.1\r\ncontent-lengthé: 5\r\n\r\n".as_bytes()).unwrap();
+        assert_eq!((head.method.as_str(), head.path.as_str(), head.content_len), ("GET", "/health", 0));
+        let head = parse("GET /health HTTP/1.1\r\nauthorization: beareré\r\n\r\n".as_bytes()).unwrap();
+        assert!(head.bearer.is_none());
+        let head = parse("GET /health HTTP/1.1\r\nauthorizationé: bearer abc\r\n\r\n".as_bytes()).unwrap();
+        assert!(head.bearer.is_none());
+    }
+
+    #[test]
+    fn oversized_and_flooded_framing_is_rejected_fail_closed() {
+        let oversized_header = format!("GET /h HTTP/1.1\r\nX-Big: {}\r\n\r\n", "A".repeat(17 * 1024));
+        assert!(matches!(
+            read_request_head(&mut oversized_header.as_bytes()),
+            Err(HeadError::TooLarge("header line too large"))
+        ));
+        let oversized_line = format!("{}\r\n\r\n", "A".repeat(17 * 1024));
+        assert!(matches!(
+            read_request_head(&mut oversized_line.as_bytes()),
+            Err(HeadError::TooLarge("request line too large"))
+        ));
+        let mut flood = b"GET /h HTTP/1.1\r\n".to_vec();
+        for _ in 0..(super::MAX_HEAD_LINES + 1) {
+            flood.extend_from_slice(b"X-Tiny: 1\r\n");
+        }
+        flood.extend_from_slice(b"\r\n");
+        assert!(matches!(
+            read_request_head(&mut flood.as_slice()),
+            Err(HeadError::TooLarge("too many header lines"))
+        ));
+    }
+
+    #[test]
+    fn garbage_and_truncated_framing_is_rejected_fail_closed() {
+        assert!(matches!(
+            parse(b"garbage\r\n\r\n"),
+            Err(HeadError::Malformed("malformed request line"))
+        ));
+        assert!(matches!(parse(b""), Err(HeadError::Truncated("truncated request head"))));
+        // EOF right after the request line ends the head; the body read then
+        // observes the truncation in the handler.
+        let head = parse(b"GET /h HTTP/1.1\r\n").unwrap();
+        assert_eq!((head.method.as_str(), head.path.as_str()), ("GET", "/h"));
+        // Non-numeric content-length degrades to 0, the route layer answers 400.
+        let head = parse(b"GET /h HTTP/1.1\r\ncontent-length: nope\r\n\r\n").unwrap();
+        assert_eq!(head.content_len, 0);
+    }
+
+    #[test]
+    fn duplicate_content_length_is_last_wins_and_case_insensitive() {
+        let head = parse(b"POST /mcp HTTP/1.1\r\ncontent-length: 3\r\nCONTENT-LENGTH: 7\r\n\r\n").unwrap();
+        assert_eq!(head.content_len, 7);
+    }
+
+    #[test]
+    fn oversized_content_length_is_carried_for_the_413_gate() {
+        let head =
+            parse(b"POST /eval HTTP/1.1\r\ncontent-length: 999999999999\r\n\r\n").unwrap();
+        assert_eq!(head.content_len, 999999999999);
+    }
 }
 
 #[cfg(test)]
@@ -702,42 +917,18 @@ pub fn serve_cas_http_with_auth(
                 return;
             };
 
-            let mut req_line = String::new();
-            let mut content_len = 0usize;
-            let mut req_token: Option<String> = None;
-            let mut req_bearer: Option<String> = None;
-            let mut shared_payload = None;
             let mut body: Vec<u8>;
-            {
+            let head = {
                 let mut reader = BufReader::new(&mut stream);
-                if reader.read_line(&mut req_line).is_err() {
-                    return;
-                }
-                let mut hline = String::with_capacity(128);
-                loop {
-                    hline.clear();
-                    if reader.read_line(&mut hline).is_err() || hline.trim().is_empty() {
-                        break;
+                let head = match read_request_head(&mut reader) {
+                    Ok(head) => head,
+                    Err(error) => {
+                        drain_request_remainder(&mut reader);
+                        write_head_rejection(&mut stream, &error);
+                        return;
                     }
-                    if hline.len() >= 15 && hline[..15].eq_ignore_ascii_case("content-length:") {
-                        content_len = hline[15..].trim().parse().unwrap_or(0);
-                    } else if let Some((key, value)) = hline.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("x-turbo-shm")) {
-                        let _ = key;
-                        shared_payload = Some(value.trim().to_string());
-                    } else if hline.len() >= 14
-                        && hline[..14].eq_ignore_ascii_case("x-turbo-token:")
-                    {
-                        req_token = Some(hline[14..].trim().to_string());
-                    } else if hline.len() >= 14
-                        && hline[..14].eq_ignore_ascii_case("authorization:")
-                    {
-                        let auth_val = hline[14..].trim();
-                        if auth_val.len() >= 7 && auth_val[..7].eq_ignore_ascii_case("bearer ") {
-                            req_bearer = Some(auth_val[7..].trim().to_string());
-                        }
-                    }
-                }
-                if content_len > 64 * 1024 * 1024 {
+                };
+                if head.content_len > 64 * 1024 * 1024 {
                     let _ = write_http_response(
                         &mut stream,
                         413,
@@ -746,18 +937,20 @@ pub fn serve_cas_http_with_auth(
                     );
                     return;
                 }
-                body = vec![0u8; content_len];
-                if content_len > 0 && reader.read_exact(&mut body).is_err() {
+                body = vec![0u8; head.content_len];
+                if head.content_len > 0 && reader.read_exact(&mut body).is_err() {
+                    let _ = write_json_response(
+                        &mut stream,
+                        400,
+                        &serde_json::json!({"ok": false, "error": "bad_request", "detail": "truncated request body"}),
+                    );
                     return;
                 }
-            }
-            let parts: Vec<&str> = req_line.split_whitespace().collect();
-            if parts.len() < 2 {
-                return;
-            }
-            let (method, path) = (parts[0], parts[1]);
+                head
+            };
+            let (method, path) = (head.method.as_str(), head.path.as_str());
 
-            let caller_token = req_token.as_deref().or(req_bearer.as_deref());
+            let caller_token = head.token.as_deref().or(head.bearer.as_deref());
             let token_verified = match expected_token_clone.as_deref() {
                 Some(exp_tok) => caller_token
                     .map(|ct| constant_time_eq(ct.as_bytes(), exp_tok.as_bytes()))
@@ -787,7 +980,7 @@ pub fn serve_cas_http_with_auth(
                 }
             }
             let caller_authorized_trusted = token_verified || (is_daemon && is_loopback_bind);
-            if shared_payload.is_some() && (!local_transport || !token_verified) {
+            if head.shared_payload.is_some() && (!local_transport || !token_verified) {
                 let _ = write_http_response(
                     &mut stream,
                     403,
@@ -797,7 +990,7 @@ pub fn serve_cas_http_with_auth(
                 return;
             }
             let request_timeout_ms;
-            match materialize_request_body(body, shared_payload.as_deref()) {
+            match materialize_request_body(body, head.shared_payload.as_deref()) {
                 Ok((bytes, timeout)) => {
                     body = bytes;
                     request_timeout_ms = timeout;
@@ -3021,6 +3214,7 @@ fn write_http_response_with_headers(
         403 => "Forbidden",
         404 => "Not Found",
         413 => "Payload Too Large",
+        431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "Internal Server Error",
