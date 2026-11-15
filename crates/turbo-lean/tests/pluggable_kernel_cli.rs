@@ -1100,3 +1100,105 @@ fn real_con_leche_binary_verifies_valid_and_rejects_adversarial_olean_if_built()
         "CLI --kernel con-leche remains fail-closed even when binary exists",
     );
 }
+
+#[test]
+fn milestone_m2_con_leche_contract_v4_and_auto_kernel_routing() {
+    let f = KernelTestFixture::new("m2_auto_kernel_routing");
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let con_leche_lean = repo_root.join("lean/TurboLean/ConLeche.lean");
+    let src = fs::read_to_string(&con_leche_lean).expect("read lean/TurboLean/ConLeche.lean");
+    assert!(
+        src.contains("namespace TurboLean.Kernel.ConLeche"),
+        "lean/TurboLean/ConLeche.lean must declare `namespace TurboLean.Kernel.ConLeche`"
+    );
+
+    let audit_out = f
+        .cli("m2_audit")
+        .args([
+            "--json",
+            "audit-spec",
+            "--policy",
+            "strict-proofs",
+            con_leche_lean.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_ok(&audit_out, "audit-spec lean/TurboLean/ConLeche.lean");
+    let audit: Value = serde_json::from_slice(&audit_out.stdout).unwrap();
+    assert_eq!(audit["ok"].as_bool(), Some(true), "audit-spec failed: {audit}");
+    assert_eq!(audit["vacuous_specs"].as_u64(), Some(0), "{audit}");
+    assert_eq!(audit["trivial_specs"].as_u64(), Some(0), "{audit}");
+    assert_eq!(
+        audit["droppable_hypotheses"]
+            .as_array()
+            .map(|a| a.len()),
+        Some(0),
+        "{audit}"
+    );
+    let specs = audit["specs"].as_array().expect("specs array");
+    for required_decl in [
+        "TurboLean.Kernel.ConLeche.olean_mmap_bridge_sound",
+        "TurboLean.Kernel.ConLeche.con_leche_verify_decl_sound",
+    ] {
+        assert!(
+            specs.iter().any(|s| {
+                s["decl"].as_str() == Some(required_decl)
+                    && s["tight"].as_bool() == Some(true)
+                    && s["vacuous"].as_bool() == Some(false)
+            }),
+            "missing or non-tight required M2 theorem `{required_decl}` in {audit}"
+        );
+    }
+
+    let proj = f.root.join("proj_v435");
+    fs::create_dir_all(&proj).unwrap();
+    let fake_bin = f.root.join("external-con-leche.sh");
+    write_executable_script(
+        &fake_bin,
+        "#!/usr/bin/env bash\nif [ \"${1:-}\" = \"--version\" ]; then echo 'con-leche 0.1.0'; exit 0; fi\nexit 0\n",
+    );
+
+    let prev = std::env::var_os(kernel::CON_LECHE_BIN_ENV);
+    std::env::set_var(kernel::CON_LECHE_BIN_ENV, &fake_bin);
+    let auto_v435 = kernel::resolve_kernel_engine_in_workspace(
+        kernel::KernelEngineSelection::Auto,
+        kernel::PINNED_CON_LECHE_TOOLCHAIN,
+        Some(&proj),
+    );
+    let auto_v415 = kernel::resolve_kernel_engine_in_workspace(
+        kernel::KernelEngineSelection::Auto,
+        "leanprover/lean4:v4.15.0",
+        Some(&proj),
+    );
+    let auto_no_ws = kernel::resolve_kernel_engine_in_workspace(
+        kernel::KernelEngineSelection::Auto,
+        kernel::PINNED_CON_LECHE_TOOLCHAIN,
+        None,
+    );
+    match prev {
+        Some(v) => std::env::set_var(kernel::CON_LECHE_BIN_ENV, v),
+        None => std::env::remove_var(kernel::CON_LECHE_BIN_ENV),
+    }
+
+    let auto_v435 = auto_v435.unwrap();
+    assert_eq!(auto_v435.requested_engine, kernel::KernelEngineSelection::Auto);
+    assert_eq!(auto_v435.kernel_engine, kernel::ResolvedKernelEngine::ConLeche);
+    assert_eq!(
+        auto_v435.con_leche_rev.as_deref(),
+        Some(kernel::PINNED_CON_LECHE_REV)
+    );
+    assert_eq!(auto_v435.fallback_reason, None);
+
+    let auto_v415 = auto_v415.unwrap();
+    assert_eq!(auto_v415.kernel_engine, kernel::ResolvedKernelEngine::Standard);
+    assert!(auto_v415.fallback_reason.is_some());
+
+    let auto_no_ws = auto_no_ws.unwrap();
+    assert_eq!(auto_no_ws.kernel_engine, kernel::ResolvedKernelEngine::Standard);
+    assert!(auto_no_ws.fallback_reason.is_some());
+}
+

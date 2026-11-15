@@ -215,7 +215,9 @@ pub fn probe_con_leche_support_for_selection(
 ) -> Option<String> {
     if !matches!(
         requested,
-        KernelEngineSelection::ConLeche | KernelEngineSelection::Both
+        KernelEngineSelection::Auto
+            | KernelEngineSelection::ConLeche
+            | KernelEngineSelection::Both
     ) {
         return probe_con_leche_support(lean_toolchain);
     }
