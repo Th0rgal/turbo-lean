@@ -1848,11 +1848,10 @@ def checkShardWithEnv
     (includeStubsInDeclTypes : Bool := false)
     (allowSorry : Bool := false)
     (emitOutlineOlean : Bool := false) : IO (Bool × Nat × Nat × Nat × List String × List String × String × List String × List (String × String) × List String) := do
-  -- Eval mode elaborates with the options `Lean.Elab.runFrontend` forces on the command
-  -- line (snapshot reporting and asynchronous elaboration); check mode keeps `{}`.
-  let initOpts : Options := if evalMode then
-      Elab.async.setIfNotSet (Lean.internal.cmdlineSnapshots.setIfNotSet {} true) true
-    else {}
+  -- Elaborate with `Elab.async` enabled so nested tactic proof-wrapper numbering matches
+  -- `Lean.Elab.runFrontend`; eval mode additionally enables command-line snapshot reporting.
+  let initOpts : Options := Elab.async.setIfNotSet
+      (if evalMode then Lean.internal.cmdlineSnapshots.setIfNotSet {} true else {}) true
   let opts ← applyEncodedLeanArgs initOpts encodedLeanArgs
   let env ← match emitOlean? with
     | some (modName, _) => pure (if modName.isAnonymous then baseEnv else baseEnv.setMainModule modName)
@@ -4563,9 +4562,8 @@ def main (args : List String) : IO Unit := do
             if cachedCode == prefixCode then
               pure (true, 0, some st, [], cachedMsgs, cachedOut, cachedHbs, none)
             else do
-              let initOpts : Options := if evalMode then
-                  Elab.async.setIfNotSet (Lean.internal.cmdlineSnapshots.setIfNotSet {} true) true
-                else {}
+              let initOpts : Options := Elab.async.setIfNotSet
+                  (if evalMode then Lean.internal.cmdlineSnapshots.setIfNotSet {} true else {}) true
               let opts ← TurboLean.ZygoteWorker.applyEncodedLeanArgs initOpts encodedLeanArgs
               let envForPref ← match emitOlean? with
                 | some (modName, _) => pure (if modName.isAnonymous then baseEnv else baseEnv.setMainModule modName)
@@ -4619,9 +4617,8 @@ def main (args : List String) : IO Unit := do
             match deltaRes? with
             | some res => pure res
             | none => do
-              let initOpts : Options := if evalMode then
-                  Elab.async.setIfNotSet (Lean.internal.cmdlineSnapshots.setIfNotSet {} true) true
-                else {}
+              let initOpts : Options := Elab.async.setIfNotSet
+                  (if evalMode then Lean.internal.cmdlineSnapshots.setIfNotSet {} true else {}) true
               let opts ← TurboLean.ZygoteWorker.applyEncodedLeanArgs initOpts encodedLeanArgs
               let envForPref ← match emitOlean? with
                 | some (modName, _) => pure (if modName.isAnonymous then baseEnv else baseEnv.setMainModule modName)
