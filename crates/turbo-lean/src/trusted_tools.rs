@@ -232,7 +232,13 @@ fn resolve_trusted_git_uncached(project: &Path) -> Result<PathBuf> {
 pub(crate) fn git(project: &Path) -> Result<GitCommand> {
     static GIT: OnceLock<std::result::Result<PathBuf, String>> = OnceLock::new();
     let program = GIT
-        .get_or_init(|| resolve_trusted_git_uncached(project).map_err(|e| format!("{e:#}")))
+        .get_or_init(|| {
+            let resolved = resolve_trusted_git_uncached(project);
+            if let Err(err) = &resolved {
+                warn_git_unavailable_once(project, &format!("{err:#}"));
+            }
+            resolved.map_err(|e| format!("{e:#}"))
+        })
         .as_ref()
         .map_err(|e| anyhow::anyhow!("Trusted Git unavailable: {e}"))?;
     let program = outside_checkout(program, project)?;
@@ -861,7 +867,6 @@ fn trusted_git_never_runs_submodule_only_filters() -> Result<()> {
 
 /// Recorded diagnostic of the first fail-closed trusted-Git fallback in this process, so a
 /// unit test can assert the warning is loud and emitted exactly once.
-#[cfg(test)]
 static GIT_UNAVAILABLE_WARNING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
 #[cfg(test)]
@@ -879,8 +884,28 @@ pub(crate) fn git_unavailable_warning_for_test() -> Option<String> {
         .clone()
 }
 
-#[cfg(test)]
-fn warn_git_unavailable_once(_project: &Path, _reason: &str) {}
+/// One loud diagnostic for the fail-closed path of #415: when the trusted Git cannot be
+/// resolved, callers degrade (edit-locality is disabled and every edited file re-checks its
+/// dependents with Lake) while the command still succeeds, so the slowdown must never be
+/// silent. Printed at most once per process.
+fn warn_git_unavailable_once(project: &Path, reason: &str) {
+    let mut warned = GIT_UNAVAILABLE_WARNING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if warned.is_some() {
+        return;
+    }
+    let message = format!(
+        "turbo-lean: WARNING: trusted Git unavailable for {}: {reason}. Failing closed: \
+         edit-locality is disabled and every edited file re-checks its dependents with Lake. \
+         Install Git >= {}.{} outside all checkouts or set TURBO_LEAN_GIT=/abs/path/to/git.",
+        project.display(),
+        MIN_GIT.0,
+        MIN_GIT.1
+    );
+    *warned = Some(message.clone());
+    eprintln!("{message}");
+}
 
 #[cfg(test)]
 #[test]
