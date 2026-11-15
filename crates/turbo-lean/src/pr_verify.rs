@@ -4681,6 +4681,18 @@ pub fn run_ci_verify_command(
         0,
         per_file_interfaces,
     );
+    if csimp_policy_nonempty {
+        let csimp_policy = crate::splitter::normalized_policy_env_vec("TURBO_LEAN_ALLOWED_CSIMP");
+        let stmt_rep = built_kernel_statement_report_bound(
+            &canon_dir,
+            scope.as_deref(),
+            is_untrusted,
+            Some(&store.root),
+            None,
+            None,
+        )?;
+        ver_receipt.bind_active_csimp(&csimp_policy, &stmt_rep.csimp_entries)?;
+    }
     emit_verification_receipt_with_signing_key(
         receipt.as_deref(),
         &mut ver_receipt,
@@ -4851,6 +4863,8 @@ struct KernelStatementReport {
     audits: Vec<KernelAudit>,
     axiom_decls: Vec<String>,
     csimp: Vec<String>,
+    #[serde(default)]
+    csimp_entries: Vec<(String, String, String)>,
     unsafe_decls: Vec<(String, String)>,
     unsafe_inductives: Vec<String>,
     implemented_by: Vec<(String, String)>,
@@ -4950,6 +4964,8 @@ struct KernelDumpRow {
     module: Option<String>,
     complete: Option<bool>,
     csimp: Option<Vec<String>>,
+    #[serde(default)]
+    csimp_entries: Vec<(String, String, String)>,
     #[serde(default)]
     axiom_decls: Vec<String>,
     #[serde(default)]
@@ -7585,6 +7601,7 @@ fn built_kernel_statement_report_bound(
                     sub_report
                         .csimp
                         .extend(row.csimp.context("Missing csimp audit")?);
+                    sub_report.csimp_entries.extend(row.csimp_entries);
                     sub_report.axiom_decls.extend(row.axiom_decls);
                     sub_report.unsafe_decls.extend(row.unsafe_decls);
                     sub_report.unsafe_inductives.extend(row.unsafe_inductives);
@@ -7671,6 +7688,7 @@ fn built_kernel_statement_report_bound(
         report.statements.extend(sub.statements);
         report.audits.extend(sub.audits);
         report.csimp.extend(sub.csimp);
+        report.csimp_entries.extend(sub.csimp_entries);
         report.axiom_decls.extend(sub.axiom_decls);
         report.unsafe_decls.extend(sub.unsafe_decls);
         report.unsafe_inductives.extend(sub.unsafe_inductives);
@@ -8742,7 +8760,7 @@ fn head_statement_report_cache_action_key(
     let mods =
         statement_source_modules_with_trust(head_project, &cfg.root_pkg, scope, false).ok()?;
     let mut h = blake3::Hasher::new();
-    h.update(b"turbo-lean:head-stmt-report:v2\0");
+    h.update(b"turbo-lean:head-stmt-report:v3\0");
     h.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
     h.update(b"\0");
     h.update(cfg.lean_githash.as_bytes());
@@ -11154,6 +11172,17 @@ pub fn run_pr_verify_command(
 
     let mut ver_receipt =
         build_pr_verification_receipt(&mode, &kernel_prov, &base, &classification);
+    if !base_policy.csimp.is_empty() {
+        let stmt_rep = built_kernel_statement_report_bound(
+            &canon_dir,
+            scope.as_deref(),
+            is_untrusted,
+            Some(&store.root),
+            None,
+            None,
+        )?;
+        ver_receipt.bind_active_csimp(&base_policy.csimp, &stmt_rep.csimp_entries)?;
+    }
     emit_verification_receipt_with_signing_key(
         receipt.as_deref(),
         &mut ver_receipt,
@@ -12668,6 +12697,14 @@ end Fixture
         }
         let mut report = built_kernel_statement_report(&dir, None, false, None, None)?;
         assert_eq!(report.csimp, vec!["Fixture.fast_eq"]);
+        assert_eq!(
+            report.csimp_entries,
+            vec![(
+                "Fixture.fast_eq".to_string(),
+                "Fixture.slow".to_string(),
+                "Fixture.fast".to_string()
+            )]
+        );
         assert!(report
             .audits
             .iter()
@@ -12710,6 +12747,17 @@ end Fixture
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             );
+            if expected {
+                let reply = crate::zygote::parse_audit_modules_reply(&out, &["Fixture".into()])?;
+                assert_eq!(
+                    reply.csimp_entries,
+                    vec![(
+                        "Fixture.fast_eq".to_string(),
+                        "Fixture.slow".to_string(),
+                        "Fixture.fast".to_string()
+                    )]
+                );
+            }
         }
         println!("kernel policy compiled auditor: exact csimp permission admitted; wrong/absent permission rejected");
         let cli = std::env::current_exe()?
@@ -12717,13 +12765,17 @@ end Fixture
             .and_then(Path::parent)
             .map(|path| path.join("turbo-lean"))
             .filter(|path| path.is_file());
+        let receipt_path = dir.join(".lake/test-policy-receipt.json");
         let verify = |command: &str, mode: &str, base: &str| -> Result<std::process::Output> {
+            let _ = fs::remove_file(&receipt_path);
             let mut cmd = Command::new(
                 cli.as_ref()
                     .context("Build the release CLI before the policy fixture")?,
             );
             cmd.args(["--no-telemetry", "--json", command, "--project-dir"])
                 .arg(&dir)
+                .arg("--receipt")
+                .arg(&receipt_path)
                 // A policy inherited from another checkout must not override --base.
                 .env("TURBO_LEAN_ALLOWED_CSIMP", "*")
                 .env("TURBO_LEAN_ALLOWED_CSIMP_FROM_CONFIG", "1")
@@ -12781,6 +12833,22 @@ end Fixture
                     "base-allowlisted csimp/native must pass {mode} {command}: {}\n{}",
                     String::from_utf8_lossy(&out.stdout),
                     String::from_utf8_lossy(&out.stderr)
+                );
+                let rec: crate::receipt::VerificationReceipt =
+                    serde_json::from_str(&fs::read_to_string(&receipt_path)?)?;
+                crate::receipt::verify_receipt_data(&rec, None, None)?;
+                let expected_csimp_digest = crate::receipt::compute_active_csimp_digest(
+                    &["Fixture.fast_eq".to_string()],
+                    &[(
+                        "Fixture.fast_eq".to_string(),
+                        "Fixture.slow".to_string(),
+                        "Fixture.fast".to_string(),
+                    )],
+                );
+                assert_eq!(
+                    rec.active_csimp_digest.as_deref(),
+                    Some(expected_csimp_digest.as_str()),
+                    "{mode} {command} receipt must bind active (thm, from, to) csimp entries"
                 );
                 println!(
                     "kernel policy {mode} {command}: base-allowlisted csimp/native_decide admitted"

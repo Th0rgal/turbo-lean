@@ -3993,12 +3993,14 @@ pub(crate) fn ensure_zygote_binary_at(
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct ZygoteAuditModulesReply {
+pub(crate) struct ZygoteAuditModulesReply {
     pub ok: bool,
     #[serde(default)]
     pub audited: Option<Vec<String>>,
     #[serde(default)]
     pub violations: Vec<String>,
+    #[serde(default)]
+    pub csimp_entries: Vec<(String, String, String)>,
     /// `--shard` mode: the module's non-stub theorems, read from the kernel environment.
     #[serde(default)]
     pub decls: Option<Vec<String>>,
@@ -5546,7 +5548,7 @@ pub(crate) fn read_module_public_signature_with_zygote(
 }
 
 /// The auditor's verdict on `mod_names`: its JSON reply when every module passed, else an error.
-fn parse_audit_modules_reply(
+pub(crate) fn parse_audit_modules_reply(
     out: &std::process::Output,
     mod_names: &[String],
 ) -> Result<ZygoteAuditModulesReply> {

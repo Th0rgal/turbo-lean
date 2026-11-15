@@ -2702,9 +2702,10 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
     (stubs : Std.HashSet Name := {})
     (unsafePatterns : List String := []) (implByPatterns : List String := [])
     (skipChildReplay : Bool := false)
-    (allowSorry : Bool := false) (isImportAudit : Bool := false) : IO (List String × List String) := do
+    (allowSorry : Bool := false) (isImportAudit : Bool := false) :
+    IO (List String × List String × List (String × String × String)) := do
   let codeViolations := compilerAuditCodeViolations env
-  unless codeViolations.isEmpty do return (codeViolations, [])
+  unless codeViolations.isEmpty do return (codeViolations, [], [])
   let sorryAxName := Name.mkSimple ("sor" ++ "ryAx")
   let app := (← IO.appPath).toString
   let nameMatchesPolicy := fun (pats : List String) (name : Name) =>
@@ -3185,12 +3186,14 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
       let modLabel := (ownerModIdx?.bind fun idx => env.header.moduleNames[idx.toNat]?.map Name.toString).getD defaultTargetLabel
       out := [s!"[TurboLean.KernelGate] csimp replacement `{e.thmName}` ({e.fromDeclName} -> {e.toDeclName}) touching `{modLabel}` is forbidden{kernelPolicyHint "csimp" e.thmName}"]
     return out
+  let mut activeCSimpEntries : List (String × String × String) := []
   for (ownerModIdx?, entry) in allCSimpEntries do
     let key := (entry.thmName, entry.fromDeclName, entry.toDeclName)
     if !seenCSimp.contains key && (isImportAudit || ownerModIdx?.any targetIdxs.contains || entryTouchesTarget entry) then
       seenCSimp := seenCSimp.insert key
+      activeCSimpEntries := activeCSimpEntries ++ [(entry.thmName.toString, entry.fromDeclName.toString, entry.toDeclName.toString)]
       violations := violations ++ (← checkCSimpEntry entry ownerModIdx?)
-  return (violations, sorryDecls)
+  return (violations, sorryDecls, activeCSimpEntries)
 
 /-- Audit a single compiled shard module: like `auditModuleSlice`, but exempts validated prefix
     stubs named in `stubOk` and also returns the module's non-stub theorems (plus their canonical
@@ -3200,7 +3203,7 @@ def auditImportedModulesInEnv (env : Environment) (targets : Array (String × Na
 def auditShardModule (target : String × Name) (ffiAllow : Array (Name × Name × String))
     (stubOk : Array String) (fastMap : List (String × String) := [])
     (allowSorry : Bool := false) :
-    IO (List String × Array String × List (String × String) × List String) := do
+    IO (List String × Array String × List (String × String) × List String × List (String × String × String)) := do
   let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
     let t := p.trimAscii.toString
     if t.isEmpty then none else some t
@@ -3244,16 +3247,16 @@ def auditShardModule (target : String × Name) (ffiAllow : Array (Name × Name �
         if rawNm != userNm && !(seen[rawNm]?.getD false) then
           seen := seen.insert rawNm true
           declTypes := declTypes ++ [(rawNm, h)]
-    let (impViolations, impSorryDecls) ← auditImportedModulesInEnv env #[target] ffiAllow patterns csimpPatterns stubs unsafePatterns implByPatterns false allowSorry
-    return (stubViolations ++ fastViolations ++ impViolations, decls, declTypes, impSorryDecls)
+    let (impViolations, impSorryDecls, impCSimpEntries) ← auditImportedModulesInEnv env #[target] ffiAllow patterns csimpPatterns stubs unsafePatterns implByPatterns false allowSorry
+    return (stubViolations ++ fastViolations ++ impViolations, decls, declTypes, impSorryDecls, impCSimpEntries)
   catch e =>
-    return ([s!"[TurboLean.KernelGate] failed to import `{target.1}` for audit: {e}"], #[], [], [])
+    return ([s!"[TurboLean.KernelGate] failed to import `{target.1}` for audit: {e}"], #[], [], [], [])
 
 def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name × Name × String) := #[])
     (skipChildReplay : Bool := false) (allowSorry : Bool := false)
-    (isImportAudit : Bool := false) : IO (List String) := do
+    (isImportAudit : Bool := false) : IO (List String × List (String × String × String)) := do
   if slice.isEmpty then
-    return []
+    return ([], [])
   let patterns := (((← IO.getEnv "TURBO_LEAN_ALLOWED_AXIOMS").getD "").splitOn ",").filterMap fun p =>
     let t := p.trimAscii.toString
     if t.isEmpty then none else some t
@@ -3275,12 +3278,12 @@ def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name ×
     pure (Except.error (toString e))
   match batchRes with
   | .ok env =>
-    let (vs, _) ← auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns {} unsafePatterns implByPatterns skipChildReplay allowSorry isImportAudit
-    return vs
+    let (vs, _, csimpEntries) ← auditImportedModulesInEnv env slice ffiAllow patterns csimpPatterns {} unsafePatterns implByPatterns skipChildReplay allowSorry isImportAudit
+    return (vs, csimpEntries)
   | .error errMsg =>
     if slice.size == 1 then
       let (rawStr, _) := slice[0]!
-      return [s!"[TurboLean.KernelGate] failed to import `{rawStr}` for audit: {errMsg}"]
+      return ([s!"[TurboLean.KernelGate] failed to import `{rawStr}` for audit: {errMsg}"], [])
     -- Compacted `.olean` import regions are never unmapped within a single OS process; bisecting
     -- `Lean.importModules` in-process would accumulate mappings across retries and exhaust the
     -- untrusted 8 GiB `RLIMIT_DATA` cap. Spawn fresh OS child processes for each half instead.
@@ -3290,29 +3293,34 @@ def auditModuleSlice (slice : Array (String × Name)) (ffiAllow : Array (Name ×
     let replayFlags : Array String := if skipChildReplay then #["--skip-child-replay"] else #[]
     let sorryFlags : Array String := if allowSorry then #["--allow-sorry"] else #[]
     let importFlags : Array String := if isImportAudit then #["--audit-imports"] else #[]
-    let runSubSlice (sub : Array (String × Name)) : IO (List String) := do
+    let runSubSlice (sub : Array (String × Name)) : IO (List String × List (String × String × String)) := do
       let modFlags := sub.map (·.1)
       let child ← IO.Process.output {
         cmd := app
         args := #["--audit-modules"] ++ importFlags ++ replayFlags ++ sorryFlags ++ ffiFlags ++ modFlags
       }
-      if child.exitCode == 0 then
-        return []
       let lastJson? := (child.stdout.splitOn "\n").reverse.find? fun l =>
         let t := l.trimAscii.toString
         t.startsWith "{" && t.endsWith "}"
+      if child.exitCode == 0 then
+        let subCSimp : List (String × String × String) := Id.run do
+          let some jl := lastJson? | return []
+          let .ok j := Lean.Json.parse jl | return []
+          let .ok arr := j.getObjValAs? (Array (String × String × String)) "csimp_entries" | return []
+          return arr.toList
+        return ([], subCSimp)
       let detail := (lastJson?.getD child.stdout).trimAscii.toString
       let errTail := child.stderr.trimAscii.toString
       let summary := if detail.isEmpty then errTail else if errTail.isEmpty then detail else s!"{detail} ({errTail})"
-      return [s!"[TurboLean.KernelGate] sub-batch audit failed (exit {child.exitCode}) on {modFlags.toList}: {summary}"]
+      return ([s!"[TurboLean.KernelGate] sub-batch audit failed (exit {child.exitCode}) on {modFlags.toList}: {summary}"], [])
     let mid := slice.size / 2
-    let v1 ← runSubSlice (slice.extract 0 mid)
-    let v2 ← runSubSlice (slice.extract mid slice.size)
-    return v1 ++ v2
+    let (v1, c1) ← runSubSlice (slice.extract 0 mid)
+    let (v2, c2) ← runSubSlice (slice.extract mid slice.size)
+    return (v1 ++ v2, c1 ++ c2)
 
 def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Name × String) := #[])
     (skipChildReplay : Bool := false) (allowSorry : Bool := false)
-    (isImportAudit : Bool := false) : IO (Bool × List String) := do
+    (isImportAudit : Bool := false) : IO (Bool × List String × List (String × String × String)) := do
   let mut parsed : Array (String × Name) := #[]
   let mut initViolations : List String := []
   for raw in modNames do
@@ -3324,10 +3332,10 @@ def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Nam
       else
         parsed := parsed.push (trimmed, nm)
   if parsed.isEmpty then
-    return (initViolations.isEmpty, initViolations)
-  let sliceViolations ← auditModuleSlice parsed ffiAllow skipChildReplay allowSorry isImportAudit
+    return (initViolations.isEmpty, initViolations, [])
+  let (sliceViolations, csimpEntries) ← auditModuleSlice parsed ffiAllow skipChildReplay allowSorry isImportAudit
   let allViolations := initViolations ++ sliceViolations
-  return (allViolations.isEmpty, allViolations)
+  return (allViolations.isEmpty, allViolations, csimpEntries)
 
 private def formatInlineAttr (i : Option Compiler.InlineAttributeKind) : String :=
   match i with
@@ -4171,23 +4179,23 @@ def main (args : List String) : IO Unit := do
     let audited := mods.filter (!·.trimAscii.isEmpty)
     -- `--shard` audits exactly one compiled shard module, exempting validated `--stub-ok=` prefix
     -- stubs and reporting its theorems; stubs are never exempt in whole-module audits.
-    let (ok, violations, decls, declTypes, sorryDecls) ← match shardFlag.isEmpty, audited, fastMapOpt with
+    let (ok, violations, decls, declTypes, sorryDecls, csimpEntries) ← match shardFlag.isEmpty, audited, fastMapOpt with
       | true, _, _ =>
         if stubArgs.isEmpty && fastMapArgs.isEmpty then
-          let (ok, vs) ← TurboLean.ZygoteWorker.auditCompiledModules mods ffiAllow (!skipReplayFlags.isEmpty) allowSorry isImportAudit
-          pure (ok, vs, none, none, [])
-        else pure (false, ["[TurboLean.KernelGate] --stub-ok / --fast-map requires --shard"], none, none, [])
+          let (ok, vs, cs) ← TurboLean.ZygoteWorker.auditCompiledModules mods ffiAllow (!skipReplayFlags.isEmpty) allowSorry isImportAudit
+          pure (ok, vs, none, none, [], cs)
+        else pure (false, ["[TurboLean.KernelGate] --stub-ok / --fast-map requires --shard"], none, none, [], [])
       | false, _, none =>
-        pure (false, ["[TurboLean.KernelGate] malformed --fast-map argument"], none, none, [])
+        pure (false, ["[TurboLean.KernelGate] malformed --fast-map argument"], none, none, [], [])
       | false, [m], some fmap =>
         if !skipReplayFlags.isEmpty then
-          pure (false, ["[TurboLean.KernelGate] --skip-child-replay forbidden with --shard"], none, none, [])
+          pure (false, ["[TurboLean.KernelGate] --skip-child-replay forbidden with --shard"], none, none, [], [])
         else
           let nm := TurboLean.ZygoteWorker.parseModuleName m.trimAscii.toString
-          let (vs, ds, dts, sds) ← TurboLean.ZygoteWorker.auditShardModule (m.trimAscii.toString, nm) ffiAllow
+          let (vs, ds, dts, sds, cs) ← TurboLean.ZygoteWorker.auditShardModule (m.trimAscii.toString, nm) ffiAllow
             (stubArgs.toArray.map fun a => (a.drop 10).toString) fmap allowSorry
-          pure (vs.isEmpty && !nm.isAnonymous, vs, some ds, some dts, sds)
-      | false, _, _ => pure (false, ["[TurboLean.KernelGate] --shard audits exactly one module"], none, none, [])
+          pure (vs.isEmpty && !nm.isAnonymous, vs, some ds, some dts, sds, cs)
+      | false, _, _ => pure (false, ["[TurboLean.KernelGate] --shard audits exactly one module"], none, none, [], [])
     let ok := ok && ffiAllow.size == ffiArgs.length
     let declsJson := match decls with
       | some ds => s!",\"decls\":[{TurboLean.ZygoteWorker.jsonStrList ds.toList}]"
@@ -4197,7 +4205,12 @@ def main (args : List String) : IO Unit := do
       | none => ""
     let sorryJson := if sorryDecls.isEmpty then ""
       else s!",\"used_sorry\":true,\"sorry_decls\":[{TurboLean.ZygoteWorker.jsonStrList sorryDecls}]"
-    stdout.putStrLn s!"\{\"ok\":{ok},\"audited\":[{TurboLean.ZygoteWorker.jsonStrList audited}],\"violations\":[{TurboLean.ZygoteWorker.jsonStrList violations}]{declsJson}{declTypesJson}{sorryJson}}"
+    let csimpJson := if csimpEntries.isEmpty then ""
+      else
+        let items := csimpEntries.map fun (t, f, r) =>
+          s!"[\"{TurboLean.ZygoteWorker.jsonEscape t}\",\"{TurboLean.ZygoteWorker.jsonEscape f}\",\"{TurboLean.ZygoteWorker.jsonEscape r}\"]"
+        s!",\"csimp_entries\":[{String.intercalate "," items}]"
+    stdout.putStrLn s!"\{\"ok\":{ok},\"audited\":[{TurboLean.ZygoteWorker.jsonStrList audited}],\"violations\":[{TurboLean.ZygoteWorker.jsonStrList violations}]{declsJson}{declTypesJson}{sorryJson}{csimpJson}}"
     stdout.flush
     if !ok then
       IO.Process.exit 1
