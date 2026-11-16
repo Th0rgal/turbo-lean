@@ -1416,6 +1416,50 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertFalse(chk["ok"])
         self.assertTrue(any("live execution mismatch" in e for e in chk["errors"]))
 
+    def test_never_classifies_more_than_six_join_points_without_running_lowerer(self) -> None:
+        # Point 1: declarations with >6 join points must never skip the lowerer and be
+        # classified as proved/rejected by a module-name heuristic. Either the lowerer
+        # runs on them or they are reported in their own `not_evaluated` class.
+        lean_dir = ROOT_DIR / "lean"
+        _ensure_lean_build(ROOT_DIR)
+        env = _lean_env()
+        # A declaration in a `batch_*` module with >6 join points that takes a String
+        # literal (which the real lowerer rejects). Under the old `jps > 6` shortcut
+        # on `batch_*`, this is misclassified as `proved` without running the lowerer!
+        bad_many_jps = (
+            "namespace batch_99\n"
+            "@[export batch_99_bad]\n"
+            "def bad_many_jps (x : UInt64) : String :=\n"
+            "  let j1 := if x == 1 then 10 else 11\n"
+            "  let j2 := if x == 2 then j1 + 1 else j1 + 2\n"
+            "  let j3 := if x == 3 then j2 + 1 else j2 + 2\n"
+            "  let j4 := if x == 4 then j3 + 1 else j3 + 2\n"
+            "  let j5 := if x == 5 then j4 + 1 else j4 + 2\n"
+            "  let j6 := if x == 6 then j5 + 1 else j5 + 2\n"
+            "  let j7 := if x == 7 then j6 + 1 else j6 + 2\n"
+            '  if j7 == 0 then "zero" else "nonzero"\n'
+            "end batch_99\n"
+        )
+        with tempfile.TemporaryDirectory(prefix="lcnf-jp6-") as tmp:
+            root = Path(tmp)
+            lf = root / "batch_99.lean"
+            lf.write_text(bad_many_jps, encoding="utf-8")
+            subprocess.run(
+                ["lean", f"--root={root}", "-o", str(root / "batch_99.olean"), str(lf)],
+                cwd=str(lean_dir),
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            counts = _run_audit_driver(
+                ROOT_DIR, _lean_audit_driver_for_modules(["batch_99"]), [str(root)]
+            )
+        self.assertEqual(counts[1], 0, f"unlowerable batch_99 decl with >6 join points was counted as proved: {counts}")
+        self.assertNotIn('startsWith "batch_"', _LEAN_AUDIT_DRIVER_HEAD)
+        self.assertNotIn("jps > 6", _LEAN_AUDIT_DRIVER_HEAD)
+
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
