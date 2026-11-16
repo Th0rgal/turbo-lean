@@ -772,6 +772,94 @@ class PfrAndSourceSafety(unittest.TestCase):
             self.assertNotIn("_m1_bench_trial_", src.read_text(), "SIGTERM left the edit behind")
 
 
+class Provenance(unittest.TestCase):
+    """Group 4: the binary's identity and honest noise telemetry."""
+
+    def test_run_records_binary_sha256(self):
+        with tempfile.TemporaryDirectory(prefix="m1-prov-") as td:
+            r = run_bench(Path(td), ["--no-baseline", "--out", str(Path(td) / "o.json")])
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            data = json.loads((Path(td) / "o.json").read_text())
+            sha = (data.get("turbo_lean_binary") or {}).get("sha256")
+            self.assertIsInstance(sha, str, data.get("turbo_lean_binary"))
+            self.assertEqual(len(sha), 64)
+            int(sha, 16)  # hex
+            self.assertIn("turbo_lean_dirty", data)
+
+    def test_rebaseline_refuses_dirty_tree(self):
+        import subprocess as sp
+        with tempfile.TemporaryDirectory(prefix="m1-rebase-") as td:
+            body = ("\n".join(
+                l for l in PfrAndSourceSafety.PFR_STUB.splitlines()
+                if "--no-auto-worktree-link" not in l and "FAKE_COUNTER" not in l
+                and "FAKE_OLEAN" not in l and "sys.exit(1)" not in l
+                and "stale imports" not in l and "print(json.dumps({'error'" not in l)
+                + "\nprint(json.dumps({'status': 'theorem_cache_hit', 'decl': 'd',\n"
+                  "   'elapsed_ms': 50, 'phase_timings': {'wall_ms': 200.0,\n"
+                  "   'coverage_ratio': 0.99, 'phases_ms': {}}})); sys.exit(0)\n")
+            # Build the stub INSIDE a git repo: turbo_lean_commit_for walks up
+            # from the binary to find the enclosing checkout.
+            repo = Path(td) / "tl"
+            (repo / "target" / "release").mkdir(parents=True)
+            stub, gitstub = make_stub_binary(repo / "target" / "release", body)
+            make_fake_projects(Path(td))
+            real_git = __import__("shutil").which("git")
+            def g(*a, **kw):
+                sp.run([real_git, "-C", str(repo)] + list(a), check=True, capture_output=True,
+                       env=dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                                GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t"))
+            g("init", "-q")
+            g("add", "-A")
+            g("commit", "-q", "-m", "init")
+            (repo / "dirty.txt").write_text("uncommitted\n")
+            g("add", "-A")  # staged but uncommitted: still dirty
+            env = dict(os.environ, TURBO_LEAN_GIT=str(gitstub),
+                       TURBO_LEAN_ALLOWED_CSIMP="*", TURBO_LEAN_ALLOWED_UNSAFE="*",
+                       TURBO_LEAN_ALLOWED_IMPLEMENTED_BY="*", FAKE_PFR_FAIL="1")
+            cmd = [sys.executable, str(SCRIPT), "--turbo-lean-bin", str(stub),
+                   "--batteries-dir", str(Path(td) / "batteries"),
+                   "--pfr-dir", str(Path(td) / "pfr"),
+                   "--trials", "1", "--warmup", "0", "--skip-rev-check",
+                   "--allow-busy-node", "--rebaseline", "--no-baseline",
+                   "--out", str(Path(td) / "b.json")]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
+            self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+            self.assertIn("--rebaseline requires a clean", r.stderr)
+
+    def test_psi_parser_reads_some_and_full_lines(self):
+        mod = load_script()
+        text = ("some avg10=0.00 avg60=0.00 avg300=0.00 total=134981125933\n"
+                "full avg10=1.25 avg60=0.00 avg300=0.01 total=0\n")
+        self.assertEqual(mod.parse_psi_lines(text), {"some": 0.0, "full": 1.25})
+        self.assertEqual(mod.parse_psi_lines("garbage"), {"some": None, "full": None})
+        self.assertEqual(mod.parse_psi_lines(""), {"some": None, "full": None})
+
+    def test_sample_psi_reports_real_kernel_values(self):
+        mod = load_script()
+        psi = mod.sample_psi()
+        self.assertIn("load1", psi)
+        for name in ("cpu", "memory", "io"):
+            self.assertIsInstance(psi[name], dict, name)
+            self.assertIn("some", psi[name]) and self.assertIn("full", psi[name])
+        # This test host exposes PSI; a failed read must be null, never 0.0.
+        if any(v is not None for v in psi["cpu"].values()):
+            self.assertIsInstance(psi["cpu"]["some"], float)
+
+    def test_mode_result_keeps_per_trial_load_samples(self):
+        mod = load_script()
+        m = mod.mode_result([100.0, 110.0], [0.99, 0.99], ["theorem_cache_hit"],
+                            psi_lists=[[{"cpu": {"some": 0.1, "full": 0.0},
+                                         "memory": {"some": 0.0, "full": 0.0},
+                                         "io": {"some": 0.0, "full": 0.0}, "load1": 1.5},
+                                        {"cpu": {"some": 0.2, "full": 0.0},
+                                         "memory": {"some": 0.0, "full": 0.0},
+                                         "io": {"some": 0.0, "full": 0.0}, "load1": 2.5}]])
+        loads = [t.get("load1") for t in m["psi_trials"]]
+        self.assertEqual(loads, [1.5, 2.5])
+        self.assertEqual(m["psi_max"]["cpu.some"], 0.2)
+        self.assertIn("psi_contended", m)
+
+
 class EndToEnd(unittest.TestCase):
     """Drive the full script against a stub turbo-lean binary."""
 
