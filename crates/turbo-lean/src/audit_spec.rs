@@ -2126,6 +2126,11 @@ impl AuditSpecPolicyConfig {
     ) -> Result<Option<Self>> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
+            if allow_top_level_toml {
+                anyhow::bail!(
+                    "dedicated audit-spec config is empty; expected an `[audit_spec]`/`[audit-spec]` table or a top-level policy object"
+                );
+            }
             return Ok(None);
         }
         if trimmed.starts_with('{') {
