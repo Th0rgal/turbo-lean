@@ -220,11 +220,29 @@ def mode_result(runs_ms, coverage_ratios, statuses, extra=None, phase_dicts=None
             if any(name in pd for pd in phase_dicts)
         }
     if psi_lists:
-        worst = {k: max((p.get(k, 0.0) for trial in psi_lists for p in trial),
-                        default=0.0) for k in ("cpu", "memory", "io")}
-        out["psi_max_avg10"] = {k: round(v, 2) for k, v in worst.items()}
-        out["psi_contended"] = bool(worst.get("memory", 0.0) > 10.0
-                                    or worst.get("io", 0.0) > 10.0)
+        flat_keys = ("cpu.some", "cpu.full", "memory.some", "memory.full",
+                     "io.some", "io.full", "load1")
+
+        def flatten(p):
+            out = {}
+            for k in flat_keys:
+                if k == "load1":
+                    v = p.get("load1")
+                else:
+                    res_name, field = k.split(".")
+                    v = (p.get(res_name) or {}).get(field)
+                out[k] = round(v, 2) if isinstance(v, (int, float)) else None
+            return out
+        trials = [flatten(p) for trial in psi_lists for p in trial]
+        out["psi_trials"] = trials  # per-trial load samples, kept honestly
+        maxima = {}
+        for k in flat_keys:
+            vals = [t[k] for t in trials if isinstance(t[k], (int, float))]
+            maxima[k] = round(max(vals), 2) if vals else None
+        out["psi_max"] = maxima
+        out["psi_contended"] = bool(any(
+            isinstance(maxima.get(k), (int, float)) and maxima[k] > 10.0
+            for k in ("memory.some", "memory.full", "io.some", "io.full")))
     if extra:
         out.update(extra)
     return out
@@ -539,19 +557,32 @@ def host_id(machine_label):
     }
 
 
+def parse_psi_lines(text: str):
+    """Parse one /proc/pressure file: lines are `some avg10=… …` and
+    `full avg10=… …`. Unreadable or missing fields are null, never 0.0 —
+    a failed read must not masquerade as a quiet system."""
+    out = {"some": None, "full": None}
+    for line in (text or "").splitlines():
+        m = re.match(r"^(some|full)\s+avg10=([0-9.]+)", line.strip())
+        if m:
+            try:
+                out[m.group(1)] = float(m.group(2))
+            except ValueError:
+                pass
+    return out
+
+
 def sample_psi():
     psi = {}
     for name in ("cpu", "memory", "io"):
         try:
-            for line in Path(f"/proc/pressure/{name}").read_text().splitlines():
-                if line.startswith("avg10"):
-                    psi[name] = float(line.split()[1])
-        except (OSError, ValueError, IndexError):
-            pass
+            psi[name] = parse_psi_lines(Path(f"/proc/pressure/{name}").read_text())
+        except OSError:
+            psi[name] = {"some": None, "full": None}
     try:
-        psi["load1"] = os.getloadavg()[0]
+        psi["load1"] = round(os.getloadavg()[0], 2)
     except (OSError, AttributeError):
-        pass
+        psi["load1"] = None
     return psi
 
 
@@ -1131,7 +1162,12 @@ def main(argv=None):
         check_pinned_revs(runner)
         baseline = load_baseline_or_none(args)
         commit, dirty, repo_path = turbo_lean_commit_for(runner.bin, git_bin)
-        binary_sha = None
+        if args.rebaseline and dirty:
+            raise BenchEnvError(
+                f"--rebaseline requires a clean turbo-lean tree at {repo_path}; "
+                "commit or restore the tracked changes first: the committed baseline "
+                "must record honest provenance (commit + dirty flag + binary hash).")
+        binary_sha = hashlib.sha256(runner.bin.read_bytes()).hexdigest()
         h = host_id(args.machine_label)
         settings = {v: os.environ.get(v) for v in RECORDED_ENV_VARS}
         settings["git_version"] = git_human
