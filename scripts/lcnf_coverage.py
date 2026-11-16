@@ -1230,8 +1230,11 @@ def results_document(report: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[
     return {
         "schemaVersion": "turbo-lean-lcnf-coverage-results-v1",
         "toolchain": PINNED_TOOLCHAIN,
-        "commit": head,
-        "generating_commit": head,
+        "measured_source_commit": head,
+        "measured_source_commit_note": (
+            "`measured_source_commit` is the commit of the tree the measurement was taken from "
+            "(recorded when `--write-results` ran, i.e. the parent of the commit that updates this file)."
+        ),
         "corpora": corpora,
     }
 
@@ -1331,8 +1334,8 @@ def check_coverage_report(
                 f"Results file toolchain mismatch: file={baseline_doc.get('toolchain')!r} "
                 f"live={PINNED_TOOLCHAIN!r}"
             )
-        if not baseline_doc.get("commit"):
-            errors.append("Results file is missing the commit it was generated at")
+        if not baseline_doc.get("measured_source_commit"):
+            errors.append("Results file is missing `measured_source_commit`")
         base_corpora = baseline_doc.get("corpora", {})
         live_corpora = rep.get("corpora", {})
         for cname, corp in live_corpora.items():
@@ -1673,7 +1676,7 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertTrue(results_path.is_file(), f"missing committed baseline {results_path}")
         baseline = json.loads(results_path.read_text(encoding="utf-8"))
         self.assertEqual(baseline.get("toolchain"), PINNED_TOOLCHAIN)
-        self.assertTrue(baseline.get("commit"))
+        self.assertTrue(baseline.get("measured_source_commit"))
         self.assertNotIn("con_leche_h3_benchmark", baseline.get("corpora", {}))
 
         rep = build_coverage_report(ROOT_DIR)
@@ -1890,7 +1893,7 @@ class TestLcnfCoverage(unittest.TestCase):
             check=True,
         )
         self.assertIn("measured_source_commit", help_proc.stdout)
-        self.assertIn("tree the measurement was taken from", help_proc.stdout)
+        self.assertIn("measurement was taken from", help_proc.stdout)
 
         rep = build_coverage_report(ROOT_DIR)
         other_commit_doc = json.loads(json.dumps(doc))
@@ -1903,11 +1906,22 @@ class TestLcnfCoverage(unittest.TestCase):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--json", action="store_true", help="Emit full coverage report JSON to stdout")
-    ap.add_argument("--check", action="store_true", help="Verify bridge digests, symbols, and live lowerer execution against committed results")
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help=(
+            "Verify bridge digests, symbols, and live lowerer counts against "
+            "scripts/lcnf_coverage_results.json (`measured_source_commit` records the commit "
+            "of the tree the measurement was taken from and is not compared to HEAD)"
+        ),
+    )
     ap.add_argument(
         "--write-results",
         action="store_true",
-        help="Write the live measurement to scripts/lcnf_coverage_results.json",
+        help=(
+            "Write the live measurement to scripts/lcnf_coverage_results.json, recording "
+            "`measured_source_commit` as the commit of the tree the measurement was taken from"
+        ),
     )
     ap.add_argument("--self-test", action="store_true", help="Run embedded unit tests")
     args = ap.parse_args()

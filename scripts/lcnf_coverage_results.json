@@ -1,5 +1,4 @@
 {
-  "commit": "3c68dc810fcf5dc7103ed75bb052d9ca11053d85",
   "corpora": {
     "c1_corpus": {
       "lowered_unproved": 98,
@@ -28,7 +27,8 @@
       "total_declarations": 1805
     }
   },
-  "generating_commit": "3c68dc810fcf5dc7103ed75bb052d9ca11053d85",
+  "measured_source_commit": "f86281f94644281af2ccce0562f23739ea6c1a89",
+  "measured_source_commit_note": "`measured_source_commit` is the commit of the tree the measurement was taken from (recorded when `--write-results` ran, i.e. the parent of the commit that updates this file).",
   "schemaVersion": "turbo-lean-lcnf-coverage-results-v1",
   "toolchain": "leanprover/lean4:v4.35.0"
 }
