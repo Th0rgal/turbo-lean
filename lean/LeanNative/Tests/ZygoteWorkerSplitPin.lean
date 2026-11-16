@@ -147,6 +147,7 @@ def expectedPublicDecls : List Name := [
   `TurboLean.ZygoteWorker.TimeoutHotspotEntry,
   `TurboLean.ZygoteWorker.SimpHotspotEntry,
   `TurboLean.ZygoteWorker.diagnoseShardHotspots,
+  `TurboLean.ZygoteWorker.instMonadEnvReaderTEnvironmentId_turboLean,
   `main
 ]
 
@@ -182,6 +183,10 @@ def checkZygoteWorkerSplitPin : CoreM Unit := do
   let leakedPrivate := expectedPrivateDecls.filter fun n => env.contains n
   if !leakedPrivate.isEmpty then
     throwError s!"[ZygoteWorkerSplitPin] private declarations leaked into public environment: {leakedPrivate}"
+  let doubledNamespace := (env.constants.toList.map (·.1)).filter
+    fun n => (`TurboLean.ZygoteWorker.TurboLean).isPrefixOf n
+  if !doubledNamespace.isEmpty then
+    throwError s!"[ZygoteWorkerSplitPin] doubled-namespace drift (baseline instance must keep single prefix): {doubledNamespace}"
 
 #eval checkZygoteWorkerSplitPin
 
