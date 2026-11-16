@@ -885,13 +885,43 @@ class EndToEnd(unittest.TestCase):
                     self.assertGreater(wl["modes"][mode]["trials"], 0, (wid, mode))
             # PFR stub fails => blocked as expected.
             self.assertEqual(data["workloads"]["pfr_more_ruzsa_dist"]["status"], "blocked_as_expected")
-            # Same-host comparison of two identical runs must pass.
+
+            # Comparison verdicts must not depend on scheduler timing: feed
+            # FIXED numbers into the comparison. Reusing r1's run as the base
+            # (same provenance/settings) but replacing every measured median
+            # with a constant makes the verdicts deterministic. This replaced
+            # the previous version, which compared two measured runs and
+            # failed on loaded machines when the second run drifted past the
+            # noise band (reviewer's flaky failure).
+            def base_with_fixed_medians(median):
+                base = json.loads(out.read_text())
+                for wid, wl in base["workloads"].items():
+                    if wl.get("expected_status") == "blocked":
+                        continue
+                    for mode in mod.MODES:
+                        m = wl["modes"][mode]
+                        m["median_ms"] = median
+                        m["runs_ms"] = [median] * m["trials"]
+                p = root / f"fixed_{median}.json"
+                p.write_text(json.dumps(base))
+                return p
+            huge = base_with_fixed_medians(1_000_000.0)
             r2 = self._run_bench(root, ["--machine-label", "lab-node-1",
                                         "--out", str(root / "run2.json"),
-                                        "--baseline", str(out)])
+                                        "--baseline", str(huge)])
             self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
             data2 = json.loads((root / "run2.json").read_text())
-            self.assertEqual(data2["verdict"]["verdict"], "pass")
+            self.assertEqual(data2["verdict"]["verdict"], "pass", data2["verdict"])
+            # And the mirror case: a baseline far below any real measurement
+            # must be a regression (exit 1), deterministically.
+            tiny = base_with_fixed_medians(0.001)
+            r4 = self._run_bench(root, ["--machine-label", "lab-node-1",
+                                        "--out", str(root / "run4.json"),
+                                        "--baseline", str(tiny)])
+            self.assertEqual(r4.returncode, 1, r4.stdout + r4.stderr)
+            data4 = json.loads((root / "run4.json").read_text())
+            self.assertEqual(data4["verdict"]["verdict"], "regression", data4["verdict"])
+            self.assertTrue(data4["verdict"]["regressions"], data4["verdict"])
             # Cross-host comparison must be flagged, never a pass.
             r3 = self._run_bench(root, ["--machine-label", "other-runner",
                                         "--out", str(root / "run3.json"),
