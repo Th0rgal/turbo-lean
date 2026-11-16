@@ -228,6 +228,25 @@ class EditedProof(unittest.TestCase):
         # Insertion is idempotent per trial index and restores cleanly.
         self.assertEqual(mod.remove_bench_have(edited), src)
 
+    def test_term_style_proof_wrapping(self):
+        mod = load_script()
+        src = ("theorem parentD_eq {arr : Array UFNode} {i} (h) :\n"
+               "    parentD arr i = arr[i].parent := dite_eq_left _\n")
+        edited = mod.insert_bench_have(src, 3)
+        self.assertIn(":= (have _m1_bench_trial_3 : True := trivial; dite_eq_left _)", edited)
+        self.assertEqual(mod.remove_bench_have(edited), src)
+
+    def test_term_style_multiline_proof(self):
+        mod = load_script()
+        src = ("theorem foo :\n"
+               "    True :=\n"
+               "  trivial\n")
+        edited = mod.insert_bench_have(src, 1)
+        self.assertIn("(have _m1_bench_trial_1 : True := trivial; trivial)", edited)
+        # Whitespace may be normalized; statement and proof term must not change.
+        norm = lambda s: " ".join(s.split())
+        self.assertEqual(norm(mod.remove_bench_have(edited)), norm(src))
+
 
 class EndToEnd(unittest.TestCase):
     """Drive the full script against a stub turbo-lean binary."""

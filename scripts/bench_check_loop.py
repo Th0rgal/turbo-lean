@@ -334,20 +334,39 @@ BENCH_HAVE_RE = re.compile(r"^ *have _m1_bench_trial_\d+ : True := trivial\n", r
 
 
 def insert_bench_have(decl_src: str, trial_index: int) -> str:
-    """Insert a unique `have` into a `:= by` proof body to force a CAS miss."""
+    """Insert a unique `have` into a proof body to force a CAS miss.
+
+    `:= by` proofs gain one tactic line; term-style proofs are wrapped in a
+    parenthesized term-level `have` (same statement, edited proof).
+    """
     marker = ":= by"
     pos = decl_src.find(marker)
-    if pos < 0:
-        raise BenchEnvError("workload proof does not contain ':= by'; cannot insert bench have")
-    end = pos + len(marker)
-    if not decl_src[end:end + 1] == "\n":
-        raise BenchEnvError("':= by' is not at end of its line; cannot insert bench have")
-    return (decl_src[:end] + f"\n  have _m1_bench_trial_{trial_index} : True := trivial"
-            + decl_src[end:])
+    if pos >= 0:
+        end = pos + len(marker)
+        if decl_src[end:end + 1] != "\n":
+            raise BenchEnvError("':= by' is not at end of its line; cannot insert bench have")
+        return (decl_src[:end] + f"\n  have _m1_bench_trial_{trial_index} : True := trivial"
+                + decl_src[end:])
+    sep = decl_src.rfind(":=")
+    if sep < 0:
+        raise BenchEnvError("proof has neither ':= by' nor ':='; cannot insert bench have")
+    rest = decl_src[sep + 2:]
+    term = rest.strip()
+    trailing = rest[len(rest.rstrip()):]
+    if not term:
+        raise BenchEnvError("empty term-style proof; cannot insert bench have")
+    return (decl_src[:sep] + f":= (have _m1_bench_trial_{trial_index} : True := trivial; "
+            + term + ")" + trailing)
+
+
+TERM_UNWRAP_RE = re.compile(r"\(have _m1_bench_trial_\d+ : True := trivial; (.*)\)",
+                            re.S)
 
 
 def remove_bench_have(decl_src: str) -> str:
-    return BENCH_HAVE_RE.sub("", decl_src)
+    """Inverse of insert_bench_have."""
+    unwrapped = TERM_UNWRAP_RE.sub(r"\1", decl_src)
+    return BENCH_HAVE_RE.sub("", unwrapped)
 
 
 TOP_LEVEL_START_RE = re.compile(
@@ -478,14 +497,20 @@ def stop_daemons(bin_path: Path, env):
 # --------------------------------------------------------------- check call
 
 def parse_check_json(stdout: str):
-    """Return the last JSON object printed by `check --json`."""
-    for line in reversed(stdout.splitlines()):
-        line = line.strip()
-        if line.startswith("{"):
-            try:
-                return json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    """Return the JSON object printed by `check --json` (pretty-printed)."""
+    text = (stdout or "").strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    start, end = text.find("{"), text.rfind("}")
+    if 0 <= start < end:
+        try:
+            return json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            return None
     return None
 
 
@@ -567,7 +592,7 @@ class Runner:
         wall_ms = (time.perf_counter_ns() - t0) / 1e6
         parsed = parse_check_json(out or "")
         return {"exit_code": rc, "external_wall_ms": wall_ms, "json": parsed,
-                "stderr_tail": (err or "")[-2000:], "argv": argv, "env": env}
+                "stderr": err or "", "argv": argv, "env": env}
 
     # -- guards -----------------------------------------------------------
     def remove_verified_sources(self, w):
@@ -628,7 +653,7 @@ class Runner:
             if setup["exit_code"] != 0:
                 raise BenchEnvError(
                     f"warm setup run for {w['id']} failed (exit {setup['exit_code']}); "
-                    f"cannot measure warm modes: {setup['stderr_tail'][-500:]}")
+                    f"cannot measure warm modes: {setup['stderr'][-500:]}")
             hit_runs, hit_covs, hit_status = [], [], []
             for _ in range(self.trials):
                 r = self.run_check(w, cache, home, staging, no_daemon=False)
@@ -670,6 +695,7 @@ class Runner:
     def run_pfr_workload(self, w):
         runs, covs, statuses, errors = [], [], [], set()
         exit_code = None
+        stderr_excerpt = ""
         total = self.warmups + self.trials
         for i in range(total):
             d = self.wl_scratch(w["id"]) / f"cold_{i}"
@@ -691,10 +717,14 @@ class Runner:
                 statuses.append(f"exit_{r['exit_code']}")
                 pt = (r.get("json") or {}).get("phase_timings") or {}
                 covs.append(pt.get("coverage_ratio", 0.0))
-                errors.add(classify_error(r["exit_code"], r.get("json"), r["stderr_tail"]))
+                errors.add(classify_error(r["exit_code"], r.get("json"), r["stderr"]))
                 exit_code = r["exit_code"]
+                if not stderr_excerpt and r["stderr"]:
+                    stderr_excerpt = r["stderr"][:500]
         m = mode_result(runs, covs, statuses)
         m["error_classes"] = sorted(errors)
+        if stderr_excerpt:
+            m["stderr_excerpt"] = stderr_excerpt
         return m, exit_code, sorted(errors)[0] if errors else None
 
     # -- whole workloads ---------------------------------------------------
