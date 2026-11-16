@@ -1871,6 +1871,33 @@ class TestLcnfCoverage(unittest.TestCase):
             )
             self.assertTrue(chk["ok"], chk["errors"])
 
+    def test_results_file_records_measured_source_commit_and_documents_it(self) -> None:
+        # Round-2 Point 2: `scripts/lcnf_coverage_results.json` records `measured_source_commit`
+        # (not `commit` / `generating_commit`), states in the file and in `--help` that it is
+        # the commit of the tree the measurement was taken from, and `--check` does not
+        # require it to match `HEAD`.
+        results_path = ROOT_DIR / "scripts" / "lcnf_coverage_results.json"
+        doc = json.loads(results_path.read_text(encoding="utf-8"))
+        self.assertIn("measured_source_commit", doc)
+        self.assertNotIn("commit", doc)
+        self.assertNotIn("generating_commit", doc)
+        self.assertIn("tree the measurement was taken from", doc.get("measured_source_commit_note", ""))
+
+        help_proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--help"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn("measured_source_commit", help_proc.stdout)
+        self.assertIn("tree the measurement was taken from", help_proc.stdout)
+
+        rep = build_coverage_report(ROOT_DIR)
+        other_commit_doc = json.loads(json.dumps(doc))
+        other_commit_doc["measured_source_commit"] = "0123456789abcdef" * 2 + "01234567"
+        chk = check_coverage_report(ROOT_DIR, rep, results=other_commit_doc)
+        self.assertTrue(chk["ok"], chk["errors"])
+
 
 
 def main() -> int:
