@@ -1577,6 +1577,45 @@ class TestLcnfCoverage(unittest.TestCase):
         for field in RESULT_FIELDS:
             self.assertNotIn(field, ext)
 
+    def test_con_leche_reports_natoppins_exclusion_and_rejects_partial_tree(self) -> None:
+        # Point 4: con-leche output must state the NatOpPins exclusion and its reason
+        # with the module count, record how many modules were found against how many
+        # the pinned revision has, and report `not_measured` with a reason when they
+        # differ.
+        import unittest.mock as mock
+
+        with tempfile.TemporaryDirectory(prefix="cl-partial-") as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            lib = root / "lib" / "lean" / "ConLeche" / "Kernel"
+            lib.mkdir(parents=True)
+            for name in ("Name", "Expr", "NatOpPins"):
+                (lib / f"{name}.olean").write_bytes(b"")
+            saved = os.environ.get("TURBO_CON_LECHE_OLEANS")
+            os.environ["TURBO_CON_LECHE_OLEANS"] = str(root / "lib" / "lean")
+            try:
+                with mock.patch.object(
+                    sys.modules[__name__], "_run_audit_driver", return_value=(100, 7, 11, 82)
+                ) as run, mock.patch.object(
+                    sys.modules[__name__], "_git_head", return_value=PINNED_CON_LECHE_REV
+                ):
+                    partial_corp = measure_con_leche(ROOT_DIR)
+            finally:
+                if saved is None:
+                    os.environ.pop("TURBO_CON_LECHE_OLEANS", None)
+                else:
+                    os.environ["TURBO_CON_LECHE_OLEANS"] = saved
+        self.assertEqual(partial_corp["measurement_source"], "not_measured")
+        self.assertEqual(partial_corp.get("module_count"), 2)
+        self.assertEqual(partial_corp.get("expected_module_count"), 102)
+        self.assertIn("NatOpPins", partial_corp.get("reason", ""))
+        self.assertIn("exclusion", partial_corp)
+        self.assertIn("ConLeche.Kernel.NatOpPins", partial_corp["exclusion"]["excluded_modules"])
+        self.assertTrue(partial_corp["exclusion"]["reason"])
+        for field in RESULT_FIELDS:
+            self.assertNotIn(field, partial_corp)
+        run.assert_not_called()
+
 
 
 def main() -> int:
