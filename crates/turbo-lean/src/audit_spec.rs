@@ -2134,6 +2134,14 @@ impl AuditSpecPolicyConfig {
             !(has_underscore && has_hyphen),
             "TOML config cannot specify both `[audit_spec]` and `[audit-spec]`"
         );
+        if (has_underscore || has_hyphen) && allow_top_level_toml {
+            for key in doc.keys() {
+                anyhow::ensure!(
+                    key == "audit_spec" || key == "audit-spec",
+                    "dedicated audit-spec config must not contain top-level entries other than the `[audit_spec]`/`[audit-spec]` table, found `{key}`"
+                );
+            }
+        }
         let Some(sec_val) = doc
             .get("audit_spec")
             .or_else(|| doc.get("audit-spec"))
