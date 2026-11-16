@@ -45,7 +45,13 @@ from typing import Any
 ROOT_DIR = Path(__file__).resolve().parent.parent
 PINNED_TOOLCHAIN = "leanprover/lean4:v4.35.0"
 PINNED_CON_LECHE_REV = "501589f5680d9599dee1bcef30a420bc8924c490"
+# Where a prebuilt, pinned con-leche `.olean` tree may be found. The pin is the
+# `verification/con-leche-bridge` one; nothing is fetched or built here.
+CON_LECHE_OLEANS_ENV = "TURBO_CON_LECHE_OLEANS"
+CON_LECHE_MODULE_PREFIXES = ("ConLeche.Kernel", "ConLeche.Cached", "ConLeche.Frontend", "ConLeche.Driver")
+CON_LECHE_EXCLUDED_MODULES = frozenset({"ConLeche.Kernel.NatOpPins"})
 _LIVE_AUDIT_CACHE: dict[str, dict[str, Any]] = {}
+_CON_LECHE_CACHE: dict[str, dict[str, Any]] = {}
 
 TRACKED_BRIDGE_FILES: dict[str, str] = {
     "lean/LeanNative/IR/Bridge.lean": "35bc45aaeaedb10a9e5d5987821f8a6d66592fbe1634ccccdd7175896eb4471d",
@@ -878,20 +884,91 @@ def _git_head(root_dir: Path) -> str:
         return "unknown"
 
 
-def measure_con_leche(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
-    """Report con-leche as unmeasured here, with the reason and no number.
+def _con_leche_olean_root() -> Path | None:
+    raw = os.environ.get(CON_LECHE_OLEANS_ENV, "").strip()
+    if not raw:
+        return None
+    p = Path(raw)
+    return p if p.is_dir() else None
 
-    A live measurement of the pinned corpus needs a prebuilt `.olean` tree that CI
-    does not have; this function returns `not_measured` rather than carry a stored
-    total. The next commit adds the opt-in live path.
+
+def _con_leche_modules(olean_root: Path) -> list[str]:
+    mods: list[str] = []
+    for olean in olean_root.rglob("*.olean"):
+        rel = olean.relative_to(olean_root).with_suffix("")
+        name = ".".join(rel.parts)
+        if name in CON_LECHE_EXCLUDED_MODULES:
+            continue
+        if name == "ConLeche" or name == "Main" or name.startswith(CON_LECHE_MODULE_PREFIXES):
+            mods.append(name)
+    return sorted(mods)
+
+
+def measure_con_leche(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
+    """Measure the pinned con-leche corpus with the real lowerer, or say why not.
+
+    Nothing is fetched or built: the caller points `TURBO_CON_LECHE_OLEANS` at an
+    already-built tree of the pinned revision. Without one, the corpus is reported
+    as `not_measured` and carries no declaration number.
     """
-    return {
-        "measurement_source": "not_measured",
-        "reason": (
-            "con-leche is not vendored and this invocation has no prebuilt `.olean` tree "
-            f"for the pinned commit {PINNED_CON_LECHE_REV}; no number is carried."
-        ),
+    olean_root = _con_leche_olean_root()
+    cache_key = f"{root_dir.resolve()}|{olean_root}"
+    if cache_key in _CON_LECHE_CACHE:
+        return _CON_LECHE_CACHE[cache_key]
+    if olean_root is None:
+        result = {
+            "measurement_source": "not_measured",
+            "reason": (
+                f"no prebuilt pinned con-leche `.olean` tree: set {CON_LECHE_OLEANS_ENV} to a "
+                f"`lake build` output directory of commit {PINNED_CON_LECHE_REV}; this script "
+                "does not fetch or build that repository."
+            ),
+        }
+        _CON_LECHE_CACHE[cache_key] = result
+        return result
+    # The checkout is the nearest ancestor that is a git work tree.
+    rev = "unknown"
+    probe = olean_root
+    for _ in range(6):
+        if (probe / ".git").exists():
+            rev = _git_head(probe)
+            break
+        probe = probe.parent
+    if rev != PINNED_CON_LECHE_REV:
+        result = {
+            "measurement_source": "not_measured",
+            "reason": (
+                f"prebuilt con-leche tree at `{olean_root}` is revision `{rev}`, not the pinned "
+                f"`{PINNED_CON_LECHE_REV}`"
+            ),
+        }
+        _CON_LECHE_CACHE[cache_key] = result
+        return result
+    modules = _con_leche_modules(olean_root)
+    if not modules:
+        result = {
+            "measurement_source": "not_measured",
+            "reason": f"no `ConLeche.*`/`Main` `.olean` modules under `{olean_root}`",
+        }
+        _CON_LECHE_CACHE[cache_key] = result
+        return result
+    total, proved, unproved, rejected = _run_audit_driver(
+        root_dir, _lean_audit_driver_for_modules(modules), [str(olean_root)]
+    )
+    result = {
+        "measurement_source": "live_invocation",
+        "measured_at_utc": _utc_now(),
+        "repository": "https://github.com/leanprover/con-leche.git",
+        "commit_sha": PINNED_CON_LECHE_REV,
+        "olean_root": str(olean_root),
+        "module_count": len(modules),
+        "total_declarations": total,
+        "proved": proved,
+        "lowered_unproved": unproved,
+        "rejected": rejected,
     }
+    _CON_LECHE_CACHE[cache_key] = result
+    return result
 
 
 def _batteries_unknown_reason() -> str:
@@ -1180,7 +1257,9 @@ class TestLcnfCoverage(unittest.TestCase):
             try:
                 with mock.patch.object(
                     sys.modules[__name__], "_run_audit_driver", return_value=(100, 7, 11, 82)
-                ) as run:
+                ) as run, mock.patch.object(
+                    sys.modules[__name__], "_git_head", return_value=PINNED_CON_LECHE_REV
+                ):
                     corp = measure_con_leche(ROOT_DIR)
             finally:
                 if saved is None:
