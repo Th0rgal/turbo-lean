@@ -105,7 +105,7 @@ WORKLOADS = [
      "file": "Batteries/Data/UnionFind/Basic.lean", "decl": "Batteries.UnionFind.parentD_eq",
      "line": 33},
     {"id": "pfr_more_ruzsa_dist", "repo": "pfr", "expected_status": "blocked",
-     "file": "PFR/MoreRuzsaDist.lean", "decl": "ProbabilityTheory.rdist_of_neg_le", "line": 55,
+     "file": "PFR/MoreRuzsaDist.lean", "decl": "rdist_of_neg_le", "line": 55,
      "extra_args": ["--no-auto-worktree-link"],
      "note": "Never run without --no-auto-worktree-link: the default purges "
              "prebuilt Mathlib .olean files from the checkout."},
