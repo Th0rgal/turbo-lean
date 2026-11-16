@@ -120,6 +120,7 @@ flowchart LR
     M0[M0 true phase timings] --> M1[M1 pinned bench + re-triage]
     M0 --> M1a[M1a provenance schema]
     M1a --> M1c[M1c PFR failure classes]
+    M1c --> M1
     M1 --> M1b[M1b noise narrowing]
     M1 --> P1[P1 no redone work]
     S1 --> P1
@@ -142,6 +143,7 @@ flowchart LR
     H10[H1.0 coverage matrix]
     H10aV[H1.0a-V results schema gate] --> H10aS[H1.0a-S IR-failure honesty]
     H10aS --> H10b[H1.0b external corpus]
+    H10b --> H10
     H10 --> HF[H1.F freeze statement]
     H11[H1.1 semantics vs Lean] --> L1[L1 single path]
     S3a --> L1
@@ -156,6 +158,7 @@ flowchart LR
   S2 --> S3b
   S2 --> S3bE
   S3bE --> S3bM
+  S3bM --> S3b
   S3b --> P9
 ```
 
@@ -166,11 +169,11 @@ flowchart LR
 | **S1** *(done `#463` `fddf22c`)* | `module_builder.rs` (43k LOC) split: dag / freshness / host-effects / publish. Done: the code now lives in `crates/turbo-lean/src/module_builder/{dag,freshness,host_effects,publish}.rs` | that file | – | `cargo test --locked`, no public API diff | L |
 | **S2** *(done `#464` `74fd8e9`)* | `zygote.rs` (17k) and `lake_build.rs` (15k) split by concern. Done: the code now lives in `crates/turbo-lean/src/zygote/{audit,budget,closure,daemon,dispatch,worker}.rs` and `crates/turbo-lean/src/lake_build/{build,cache,env,freshness,impact}.rs` | those files | – | same | L |
 | **S3a** *(done `#468` `af3ae66`)* | `BridgeHelpers.lean` split by construct / command. Done: the helpers now live in `lean/LeanNative/IR/BridgeHelpers/{TypesAndSigs,RealBridgeCtxAndSlices,DeclIngestAndValidation,ScalarDagAndJoinPoints,StateAndIntrinsics,HeapAndConstructors}.lean`, pinned by `lean/LeanNative/Tests/BridgeHelpersSplitPin.lean` | `lean/LeanNative/IR/BridgeHelpers.lean`, new files under `lean/LeanNative/IR/BridgeHelpers/` | – | contract script; axiom-audit counts unchanged | M |
-| **S3b** | `ZygoteWorker.lean` split by construct / command. Unresolved split parent, encoded as `S3b-E` → `S3b-M` (sequential, same paths; embed tests before any move). Draft `#473` (`44ce925b`) contains the pin only and its worker failed execution twice — a pin is not completion | `lean/TurboLean/ZygoteWorker.lean`, its new submodule files, `zygote/worker.rs` (embed + compile list; shared with H2.3 — do not run in parallel) | S2 | contract script; axiom-audit counts unchanged; test that the zygote binary builds from the embedded sources | M |
+| **S3b** | `ZygoteWorker.lean` split by construct / command. Unresolved split parent, encoded as `S3b-E` → `S3b-M` (sequential, same paths; embed tests before any move). Draft `#473` (`44ce925b`) contains the pin only — a pin is not completion | `lean/TurboLean/ZygoteWorker.lean`, its new submodule files, `zygote/worker.rs` (embed + compile list; shared with H2.3 — do not run in parallel) | S2 S3b-M | contract script; axiom-audit counts unchanged; test that the zygote binary builds from the embedded sources | M |
 | **S3b-E** | Embed-side split contract before any move: the embed manifest, cache-key hash inputs, scratch writes and `lean -c` compile list in `zygote/worker.rs` are tested against the embedded sources on the unsplit file; the `#473` pin (`lean/LeanNative/Tests/ZygoteWorkerSplitPin.lean`) is the starting point, not completion | `crates/turbo-lean/src/zygote/worker.rs`, `lean/LeanNative/Tests/ZygoteWorkerSplitPin.lean` | S2 | embed manifest / cache-key / hash-input / scratch-write / compile-list tests green on the unsplit file; the `#473` pin kept | M |
 | **S3b-M** | The pure Lean command move into submodules, with the embeds kept synchronized (same paths as `S3b-E` plus the new Lean submodule files) | `lean/TurboLean/ZygoteWorker.lean`, its new submodule files, plus the `S3b-E` paths | S3b-E | the `S3b` parent's accept: contract script; axiom-audit counts unchanged; the zygote binary builds from the embedded sources | M |
 | **M0** *(done `#461` `8a1d67d`)* | `#408`: phase timings cover ≥ 90% of wall | `phase_timing.rs` (new) | – | test asserts the sum | M |
-| **M1** *RO* | Pinned benchmark (`Batteries`, `PFR`), baseline JSON; re-triage `#407`–`#443`; close `#371`. Decision recorded here and on P1: M1 is accepted on the `Batteries` workload alone, and the `PFR` workload is turned on by P1. Unresolved split parent: provenance schema hardening (`M1a`) then PFR failure-class hardening (`M1c`), sequential child leaves on the same paths; `M1b` (statistical noise narrowing) stays after complete `M1` — do not conflate. `M1` resolves only when both `M1a` and `M1c` are reviewed and green | `scripts/bench_check_loop.py` | M0 | script exits 0, JSON committed | M |
+| **M1** *RO* | Pinned benchmark (`Batteries`, `PFR`), baseline JSON; re-triage `#407`–`#443`; close `#371`. Decision recorded here and on P1: M1 is accepted on the `Batteries` workload alone, and the `PFR` workload is turned on by P1. Unresolved split parent: provenance schema hardening (`M1a`) then PFR failure-class hardening (`M1c`), sequential child leaves on the same paths; `M1b` (statistical noise narrowing) stays after complete `M1` — do not conflate. `M1` resolves only when both `M1a` and `M1c` are reviewed and green | `scripts/bench_check_loop.py` | M0 M1c | script exits 0, JSON committed | M |
 | **M1a** | Provenance schema hardening on the existing draft `#465` (`2edc9db`): the baseline must state `turbo_lean_dirty` as an explicit boolean `false` — missing, null or a string fails — and a malformed baseline is never compared against | `scripts/bench_check_loop.py`, `scripts/test_bench_check_loop.py` | M0 | the 60 tests stay green plus malformed-marker regressions: `--validate-only` fails on a missing, null or non-boolean `turbo_lean_dirty` | S |
 | **M1c** | PFR failure-class hardening, same paths, strictly after `M1a`: a stale lock must not be reported as a stale-import block; expected-vs-actual import errors are narrowed; the full stub check reports an unrelated failure as exit 4 | `scripts/bench_check_loop.py`, `scripts/test_bench_check_loop.py` | M1a | a regression per class: stale lock ≠ stale-import block, narrowed expected/actual import errors, unrelated full-stub failure exits 4 | M |
 | **M1b** | Statistical noise narrowing on the pinned benchmark; stays after complete `M1` (both `M1a` and `M1c` reviewed and green), not part of `M1a`/`M1c` | `scripts/bench_check_loop.py` | M1 | narrowed bands recorded here with their evidence | S |
@@ -195,11 +198,11 @@ flowchart LR
 | **A2** *RO* | `#367`: kernel-backed witness | `PolicyGates.lean` | A1 | `audit-spec` JSON | L |
 | **A1j** | Strict `[audit_spec]` JSON: a misspelled top-level key beside the `audit_spec` / `audit-spec` object fails closed (A1 closed this for TOML only) | `audit_spec.rs` (JSON path) | A1 | test: JSON config with a misspelled top-level key fails closed | S |
 | **L299** | `#299`, one fixture per bullet | `module_builder/dag.rs` (lakefile parser; shared with P7 — do not run in parallel) | S1 | Lake-parity fixtures | M |
-| **H1.0** *RO* | Generated `LCNF` coverage matrix on `Batteries` and C1. Unresolved split parent, encoded as `H1.0a-V` → `H1.0a-S` (same paths, sequential) plus `H1.0b`. Existing draft `#458` (`fd8d618a`) covers the first half and is **blocked**: it must not merge before the defects `H1.0a-V`/`H1.0a-S` harden are fixed | `scripts/lcnf_coverage.py` | – | CI job emits JSON | M |
+| **H1.0** *RO* | Generated `LCNF` coverage matrix on `Batteries` and C1. Unresolved split parent, encoded as `H1.0a-V` → `H1.0a-S` (same paths, sequential) plus `H1.0b`; it resolves only through `H1.0b`. Existing draft `#458` (`fd8d618a`) covers the first half and is **blocked**: it must not merge before the defects `H1.0a-V`/`H1.0a-S` harden are fixed | `scripts/lcnf_coverage.py` | H1.0b | CI job emits JSON | M |
 | **H1.0a-V** | Results schema gate for the coverage matrix: `scripts/lcnf_coverage.py` and the committed results reject altered, missing or extra subcorpora and invalid count sums | `scripts/lcnf_coverage.py`, `scripts/lcnf_coverage_results.json` | – | self-test plus `--check`, and mutations proving every committed nested field is checked | M |
 | **H1.0a-S** | Same paths, after `V`: fail closed on silently dropped module IR failures; investigate the cross-module proof classification and the misleading compiler-aux expansion scope; report honest proof coverage numbers | `scripts/lcnf_coverage.py`, `scripts/lcnf_coverage_results.json` | H1.0a-V | an explicit failure reproduction and honest proof coverage numbers | M |
-| **H1.0b** *RO* | External `Batteries` corpus measurement; remains after the corrected inventory (not part of `H1.0a`) | `scripts/lcnf_coverage.py` (external corpus) | H1.0a-S | the external corpus counted in the matrix, or its blocker recorded with a reason | M |
-| **H1.1** | `RealLCNFSemantics` as interpreter vs stock Lean; shared definitions separated from the lowerer. Stays one leaf and is active again — the earlier controller cancellation was incorrect (draft `#470`); do not split it on a cadence claim | `Driver/EvalLCNFCLI.lean` (new) | – | `mismatch_count == 0` | M |
+| **H1.0b** *RO* | External `Batteries` corpus measurement; remains after the corrected inventory (not part of `H1.0a`); stays blocked while the external corpus is unmeasured | `scripts/lcnf_coverage.py` (external corpus) | H1.0a-S | the external corpus counted in the matrix; while it is unmeasured, `H1.0b` and `H1.0` with its downstream stay blocked — a recorded blocker does not close them | M |
+| **H1.1** | `RealLCNFSemantics` as interpreter vs stock Lean; shared definitions separated from the lowerer. Stays one leaf; do not split | `Driver/EvalLCNFCLI.lean` (new) | – | `mismatch_count == 0` | M |
 | **H1.F** | Statement of the H1 theorem frozen and pinned; unverified backends labelled in `--help` | `SpecLocked.lean`, `CoreCLI.lean` | H1.0 | hash pin | S |
 | **L1** | Single path (rung L1) | `Bridge.lean`, helper split | S3a H1.0 H1.1 | one lowering callee; `ΔLOC < 0` | L |
 | **L2** | Calls (rung L2) | `Semantics/Eval.lean`, `Proofs/LowerCalls.lean` | L1 H1.F | leaf `0 sorryAx`; matrix moves | L |
@@ -211,7 +214,7 @@ flowchart LR
 
 **Start width**: R0, H1.0a-V, M1a, S3b-E, A2, A1j, P2, P3, P5, P6, P7, P10, L299, H1.1, C2x, C4x have no unmet dependency and disjoint files (P7 and L299 share `module_builder/dag.rs` — do not run in parallel): sixteen leaves, about eight at once per machine because six need Lean builds.
 
-**Critical path**: H1.0a-V → H1.0a-S / H1.1 → L1 → L2 → L3 → H1.4. Three large proof items in series; nothing shortens it except starting H1.0a-V and H1.1 now.
+**Critical path**: H1.0a-V → H1.0a-S → H1.0b → H1.0 → L1 → L2 → L3 → H1.4, with H1.1 in parallel into L1. Three large proof items in series; nothing shortens it except starting H1.0a-V and H1.1 now.
 
 **The three splits pay first.** Seven open issues need the module builder, nine need `zygote.rs` or `lake_build.rs`, and every H1 rung needs `BridgeHelpers.lean`. S1, S2 and S3a have landed, so those items are unblocked (`module_builder/{dag,freshness,host_effects,publish}.rs`; `zygote/{audit,budget,closure,daemon,dispatch,worker}.rs`; `lake_build/{build,cache,env,freshness,impact}.rs`; `BridgeHelpers/{TypesAndSigs,RealBridgeCtxAndSlices,DeclIngestAndValidation,ScalarDagAndJoinPoints,StateAndIntrinsics,HeapAndConstructors}.lean`).
 
