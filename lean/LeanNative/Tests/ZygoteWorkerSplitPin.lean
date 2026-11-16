@@ -178,57 +178,58 @@ def expectedPrivateDecls : List Name := [
 
 /-- The 49 baseline-exact compiled private names (module `TurboLean.ZygoteWorker`, mangling
 `_private.TurboLean.ZygoteWorker.0.*`), captured from the `44ce925b` monolith environment.
-Includes source privates and their generated aux decls (matchers, sparse cases, init fns). -/
-def expectedPrivateMangledNames : List Name := [
-`_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatAttrKind,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatAttrKind.match_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatCoeFnType,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatCoeFnType.match_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatConstKind,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatConstKind.match_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatConstantExportPayload,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatConstantExportPayload.match_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatCtorFieldInfo,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatCtorFieldInfo.match_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatDiscrKey,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatDiscrKey.match_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatExternEntry,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatExternEntry.match_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatGrindEntry,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatGrindEntry.match_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatHeadIndex,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatHeadIndex.match_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatHintsStr,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatHintsStr.match_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatInlineAttr,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatInlineAttr.match_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatInstanceEntry,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatLcnfDeclIO,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatLcnfDeclIO.match_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatLcnfDeclIO.match_3,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatLcnfSignature,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatNoConfusionInfo,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatNoConfusionInfo.match_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatQuotStr,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatQuotStr.match_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatReducibilityStatus,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatReducibilityStatus.match_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatSimpEntry,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatSimpEntry.match_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatSimpEntry.match_3,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatTrivialStructOpt,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatTrivialStructOpt.match_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.initFn._@.TurboLean.ZygoteWorker.1241512177._hygCtx._hyg.2,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.isWhitelistedPublicSigExtName,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.walkHotspotMessageData,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.walkHotspotMessageData._sparseCasesOn_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.walkHotspotMessageData._sparseCasesOn_8,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.walkHotspotMessageData._unsafe_rec,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.walkHotspotMessageData.match_1,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.walkHotspotMessageData.match_4,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.walkHotspotMessageData.match_6,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.walkHotspotMessageData.match_8,
-  `_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.«command#emit_zygote_toolchain_shims»
+Compared as rendered strings because numeric name components (private prefix level, matcher
+indices, hygiene digits) cannot appear inside Lean name literals. -/
+def expectedPrivateMangledStrings : List String := [
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatAttrKind",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatAttrKind.match_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatCoeFnType",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatCoeFnType.match_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatConstKind",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatConstKind.match_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatConstantExportPayload",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatConstantExportPayload.match_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatCtorFieldInfo",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatCtorFieldInfo.match_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatDiscrKey",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatDiscrKey.match_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatExternEntry",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatExternEntry.match_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatGrindEntry",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatGrindEntry.match_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatHeadIndex",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatHeadIndex.match_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatHintsStr",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatHintsStr.match_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatInlineAttr",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatInlineAttr.match_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatInstanceEntry",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatLcnfDeclIO",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatLcnfDeclIO.match_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatLcnfDeclIO.match_3",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatLcnfSignature",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatNoConfusionInfo",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatNoConfusionInfo.match_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatQuotStr",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatQuotStr.match_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatReducibilityStatus",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatReducibilityStatus.match_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatSimpEntry",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatSimpEntry.match_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatSimpEntry.match_3",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatTrivialStructOpt",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.formatTrivialStructOpt.match_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.initFn._@.TurboLean.ZygoteWorker.1241512177._hygCtx._hyg.2",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.isWhitelistedPublicSigExtName",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.walkHotspotMessageData",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.walkHotspotMessageData._sparseCasesOn_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.walkHotspotMessageData._sparseCasesOn_8",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.walkHotspotMessageData._unsafe_rec",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.walkHotspotMessageData.match_1",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.walkHotspotMessageData.match_4",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.walkHotspotMessageData.match_6",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.walkHotspotMessageData.match_8",
+  "_private.TurboLean.ZygoteWorker.0.TurboLean.ZygoteWorker.«command#emit_zygote_toolchain_shims»"
 ]
 
 /-- Shim-generated public declarations: the `#emit_zygote_toolchain_shims` invocation is
@@ -281,16 +282,16 @@ def checkZygoteWorkerSplitPin : CoreM Unit := do
     if rootResidentShimPublics.contains n then
       continue
     if let some prev := lastIdx then
-      if idx < prev then
-        throwError s!"[ZygoteWorkerSplitPin] declaration order drift: {n} (module idx {idx}) after module idx {prev}"
+      if idx.toNat < prev.toNat then
+        throwError s!"[ZygoteWorkerSplitPin] declaration order drift: {n} (module idx {idx.toNat}) after module idx {prev.toNat}"
     lastIdx := some idx
-  let actualMangled := (env.constants.toList.map (·.1)).filter
-    fun n => (`_private.TurboLean.ZygoteWorker).isPrefixOf n
-  let actualMangledSorted := actualMangled.toArray.qsort (·.toString < ·.toString)
-  let expectedMangledSorted := (expectedPrivateMangledNames.toArray.qsort (·.toString < ·.toString))
-  if actualMangledSorted != expectedMangledSorted then
-    let missing := expectedPrivateMangledNames.filter fun n => !actualMangled.contains n
-    let extra := actualMangled.filter fun n => !expectedPrivateMangledNames.contains n
+  let actualMangled := ((env.constants.toList.map (·.1)).filter
+    (fun n => (`_private.TurboLean.ZygoteWorker).isPrefixOf n)) |>.map (·.toString)
+  let actualSorted := actualMangled.toArray.qsort (· < ·)
+  let expectedSorted := expectedPrivateMangledStrings.toArray.qsort (· < ·)
+  if actualSorted != expectedSorted then
+    let missing := expectedPrivateMangledStrings.filter fun n => !actualMangled.contains n
+    let extra := actualMangled.filter fun n => !expectedPrivateMangledStrings.contains n
     throwError s!"[ZygoteWorkerSplitPin] compiled private names diverge from baseline (49): missing={missing.take 5} extra={extra.take 5}"
 
   let doubledNamespace := (env.constants.toList.map (·.1)).filter
