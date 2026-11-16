@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -90,9 +91,11 @@ def make_fake_projects(root: Path):
     return bats, pfr
 
 
-def run_bench(root, extra, stub_body=None, env_extra=None):
+def run_bench(root, extra, stub_body=None, env_extra=None, make_projects=True):
     stub, gitstub = make_stub_binary(root, stub_body)
-    bats, pfr = make_fake_projects(root)
+    if make_projects:
+        make_fake_projects(root)
+    bats, pfr = root / "batteries", root / "pfr"
     env = dict(os.environ, TURBO_LEAN_GIT=str(gitstub),
                TURBO_LEAN_ALLOWED_CSIMP="*", TURBO_LEAN_ALLOWED_UNSAFE="*",
                TURBO_LEAN_ALLOWED_IMPLEMENTED_BY="*", FAKE_PFR_FAIL="1")
@@ -620,6 +623,153 @@ def mod_results_like(mod, base, median_ms):
         else:
             fill_workload(mod, res, w["id"], median_ms)
     return res
+
+
+class PfrAndSourceSafety(unittest.TestCase):
+    """Group 3: PFR probes are checked individually; the checkout is sacred."""
+
+    PFR_STUB = (
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys, time\n"
+        "args = sys.argv[1:]\n"
+        "time.sleep(0.04)\n"
+        "cnt_file = os.environ.get('FAKE_COUNTER_FILE')\n"
+        "n = 0\n"
+        "if cnt_file and '--no-auto-worktree-link' in args:\n"
+        "    try: n = int(open(cnt_file).read() or 0)\n"
+        "    except OSError: n = 0\n"
+        "    open(cnt_file, 'w').write(str(n + 1))\n"
+        "if os.environ.get('FAKE_OLEAN_SWAP') and '--no-auto-worktree-link' in args:\n"
+        "    pd = args[args.index('--project-dir') + 1]\n"
+        "    pkg = os.path.join(pd, '.lake', 'packages')\n"
+        "    os.makedirs(pkg, exist_ok=True)\n"
+        "    a = os.path.join(pkg, 'A.olean')\n"
+        "    if os.path.exists(a):\n"
+        "        os.remove(a)\n"
+        "    open(os.path.join(pkg, 'B.olean'), 'w').write('x')\n"
+        "if '--no-auto-worktree-link' in args:\n"
+        "    mode = os.environ.get('FAKE_PFR_MODE', 'fail')\n"
+        "    if mode == 'pass' or (mode == 'pass_first' and n == 0):\n"
+        "        print(json.dumps({'status': 'theorem_verified', 'decl': 'd',\n"
+        "                          'elapsed_ms': 40, 'phase_timings': {\n"
+        "                          'wall_ms': 200.0, 'coverage_ratio': 0.99,\n"
+        "                          'phases_ms': {}}})); sys.exit(0)\n"
+        "    print(json.dumps({'error': 'stale imports: import_refresh fail-closed'}))\n"
+        "    sys.exit(1)\n"
+        "status = 'theorem_cache_hit'\n"
+        "if not os.environ.get('TURBO_LEAN_NO_DAEMON'):\n"
+        "    try:\n"
+        "        body = open(args[-1]).read()\n"
+        "        status = ('theorem_verified' if '_m1_bench_trial_' in body\n"
+        "                  else 'theorem_cache_hit')\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "out = {'status': status, 'decl': 'd', 'elapsed_ms': 50,\n"
+        "       'phase_timings': {'wall_ms': 200.0, 'phase_sum_ms': 199.0,\n"
+        "                         'phase_covered_ms': 199.0, 'phase_overlap_ms': 0.0,\n"
+        "                         'coverage_ratio': 0.99,\n"
+        "                         'phases_ms': {'setup': 10.0, 'elaboration': 189.0}}}\n"
+        "print(json.dumps(out)); sys.exit(0)\n")
+
+    def _run(self, td, extra, env_extra=None, stub_body=None, make_projects=True):
+        return run_bench(Path(td), extra + ["--out", str(Path(td) / "o.json")],
+                         stub_body=stub_body or self.PFR_STUB, env_extra=env_extra,
+                         make_projects=make_projects)
+
+    def test_pfr_unexpected_success_is_stale_even_without_baseline(self):
+        with tempfile.TemporaryDirectory(prefix="m1-pfr-") as td:
+            r = self._run(td, ["--no-baseline"], env_extra={"FAKE_PFR_MODE": "pass"})
+            self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+            self.assertIn("stale_expectation", r.stdout)
+
+    def test_pfr_every_probe_exit_is_checked_not_just_the_last(self):
+        with tempfile.TemporaryDirectory(prefix="m1-pfr-") as td:
+            r = self._run(td, ["--no-baseline"],
+                          env_extra={"FAKE_PFR_MODE": "pass_first",
+                                     "FAKE_COUNTER_FILE": str(Path(td) / "cnt")})
+            self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+            data = json.loads((Path(td) / "o.json").read_text())
+            pfr = data["workloads"]["pfr_more_ruzsa_dist"]
+            self.assertEqual(pfr["status"], "unexpectedly_passing", pfr)
+            self.assertIn(0, pfr["probe_exit_codes"], pfr)
+
+    def test_olean_inventory_guard_catches_offsetting_change(self):
+        with tempfile.TemporaryDirectory(prefix="m1-olean-") as td:
+            # Pre-create one prebuilt dependency artifact; the stub replaces it
+            # with another (same count, different path) during the PFR probe.
+            pkg = Path(td) / "pfr" / ".lake" / "packages"
+            pkg.mkdir(parents=True, exist_ok=True)
+            (pkg / "A.olean").write_bytes(b"m")
+            r = self._run(td, ["--no-baseline"], env_extra={"FAKE_OLEAN_SWAP": "1"})
+            self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+            self.assertIn("inventory", r.stderr)
+
+    def test_olean_inventory_diff_reports_missing_and_extra(self):
+        mod = load_script()
+        missing, extra = mod.diff_olean_inventory({"a.olean", "b.olean"}, {"b.olean", "c.olean"})
+        self.assertEqual(missing, {"a.olean"})
+        self.assertEqual(extra, {"c.olean"})
+
+    def test_dirty_checkout_is_refused(self):
+        import subprocess as sp
+        with tempfile.TemporaryDirectory(prefix="m1-dirty-") as td:
+            real_git = __import__("shutil").which("git")
+            def g(*a):
+                sp.run([real_git, "-C", str(Path(td) / "batteries")] + list(a),
+                       check=True, capture_output=True,
+                       env=dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                                GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t"))
+            run_bench(Path(td), ["--no-baseline"])  # materializes fake projects
+            g("init", "-q")
+            g("add", "-A")
+            g("commit", "-q", "-m", "init")
+            (Path(td) / "batteries" / "Batteries" / "Data" / "List" / "Lemmas.lean").write_text(
+                "theorem dropLast_eq_eraseIdx :\n    True := by\n  trivial\n-- leftover edit\n")
+            r = self._run(td, ["--no-baseline"], make_projects=False)
+            self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+            self.assertIn("dirty", r.stderr)
+
+    def test_sigterm_restores_edited_source(self):
+        import signal as sig
+        body = self.PFR_STUB.replace(
+            "out = {'status': status",
+            "if status == 'theorem_verified' and os.environ.get('FAKE_SLOW_EDIT'):\n"
+            "    time.sleep(3.0)\n"
+            "out = {'status': status")
+        with tempfile.TemporaryDirectory(prefix="m1-term-") as td:
+            # Materialize stub + fake projects with a first (fast) run.
+            r0 = self._run(td, ["--no-baseline"], env_extra={"FAKE_SLOW_EDIT": "1"},
+                           stub_body=body)
+            src = Path(td) / "batteries" / "Batteries" / "Data" / "String" / "Lemmas.lean"
+            original = src.read_text()
+            proc = subprocess.Popen(
+                [sys.executable, str(SCRIPT), "--turbo-lean-bin", str(Path(td) / "fake-turbo-lean"),
+                 "--batteries-dir", str(Path(td) / "batteries"), "--pfr-dir", str(Path(td) / "pfr"),
+                 "--trials", "1", "--warmup", "0", "--skip-rev-check", "--allow-busy-node",
+                 "--no-baseline", "--out", str(Path(td) / "o2.json")],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=dict(os.environ, TURBO_LEAN_GIT=str(Path(td) / "fake-git"),
+                         TURBO_LEAN_ALLOWED_CSIMP="*", TURBO_LEAN_ALLOWED_UNSAFE="*",
+                         TURBO_LEAN_ALLOWED_IMPLEMENTED_BY="*", FAKE_PFR_FAIL="1",
+                         FAKE_SLOW_EDIT="1"))
+            try:
+                edited = False
+                for _ in range(400):
+                    if "_m1_bench_trial_" in src.read_text():
+                        edited = True
+                        break
+                    if proc.poll() is not None:
+                        break
+                    time.sleep(0.05)
+                self.assertTrue(edited, "source was never edited; cannot test SIGTERM restore")
+                proc.send_signal(sig.SIGTERM)
+                rc = proc.wait(timeout=60)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=60)
+            self.assertNotEqual(rc, 0)
+            self.assertNotIn("_m1_bench_trial_", src.read_text(), "SIGTERM left the edit behind")
 
 
 class EndToEnd(unittest.TestCase):
