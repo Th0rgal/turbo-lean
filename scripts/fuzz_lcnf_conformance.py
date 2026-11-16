@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Scalar-only differential conformance probe, not full Tier C4 acceptance.
+"""Differential conformance probe (scalar 3-way + alias 2-way), not full Tier C4 acceptance.
 
-Executes THREE genuinely independent engines on EVERY seed and corpus program:
+Executes THREE genuinely independent engines on EVERY scalar seed and corpus program:
   1. Engine 1 (`stock_lean_c`): Elaborates & compiles the generated `.lean` source file with
      the stock Lean 4 compiler (`lean -c` + `leanc`) and its unmodified runtime.
   2. Engine 2 (`lnir_eval`): Lowers the same `.lean` program to `LNIR` via the real compiler
@@ -11,14 +11,26 @@ Executes THREE genuinely independent engines on EVERY seed and corpus program:
   3. Engine 3 (`leannative_llvm_binary`): Compiles the lowered `LNIRModule` through `LeanNative`'s
      LLVM backend (`lean-native-core compile-llvm`) and `clang` into a native executable and runs it.
 
+Alias tier (C4x): every `seed % 6 == 0` seed above 3 generates a GENUINE alias program — a small
+non-recursive RC inductive (`FuzzPacket`) with two live names for the same heap object, in a
+shared (`foo a a`: one object, two uses) and an exclusive (two distinct objects) variant — the
+repository's proven Stage 1D shape. A wrong reference count (an in-place update observed through
+the old name) or a premature free becomes an observable value difference or a leaked object:
+  - Alias programs run TWO-way: stock Lean C vs `emit-lnir --allow-rc-adt` + `eval-lnir` +
+    `validate-tv`. `compile-llvm` of heap decls must fail closed (asserted per batch; if a future
+    backend accepts them the tier upgrades to three-way automatically).
+  - Every alias eval row must report `live_objects == 0`; leaks are counted in `rc_leak_count`.
+  - `alias_program_count` (with shared/exclusive split) is measured, printed, and held above a
+    stated floor (`>= num_seeds // 8`); a run under the floor fails closed. Passing seeds never
+    silently mean aliasing coverage.
+
 Hard Fail-Closed Contract (`P0`/`P1`):
   - If ANY required engine (`lean`, `lean-native`, `lean-native-core`, `clang`) is missing or not
     executable, `run_fuzzer` returns `ok: False, status: "incomplete_missing_engine"` and exits non-zero.
   - Precomputed `program["value"]` or Python-only fallback is NEVER used as an engine output.
-   - Alias-shaped cases are scalar conditionals; loop-shaped cases are unrolled additions.
-     Neither exercises aliasing, RC, or LNIR seqFor. No RC coverage is claimed.
-   - Every batch execution records SHA-256 digests of the `.lean` source, frontend-lowered `.lnir`,
-    emitted `.ll`, and compiled binaries in the receipt.
+   - Loop-shaped cases are unrolled additions. LNIR seqFor with nonzero trip count is not exercised.
+  - Every batch execution records SHA-256 digests of the `.lean` source, frontend-lowered `.lnir`,
+   emitted `.ll`, and compiled binaries in the receipt.
 """
 
 from __future__ import annotations
@@ -225,6 +237,82 @@ def gen_expr(rng: Rng, depth: int) -> tuple[dict[str, Any], int]:
     return gen_scalar_tree(rng, depth)
 
 
+ALIAS_SEED_MOD = 6
+ALIAS_FLOOR_RATIO = 8
+ALIAS_PREAMBLE = """inductive FuzzPacket where
+  | pkt : (UInt64 × UInt64) → (UInt64 × UInt64) → FuzzPacket
+
+@[inline] def fuzzPacketFold (pkt : FuzzPacket) : UInt64 :=
+  match pkt with
+  | .pkt p q => ((p.1 * 1315423911) + p.2) ^^^ ((q.1 * 2654435761) + q.2)
+
+@[inline] def fuzzPacketStep (pkt : FuzzPacket) (delta : UInt64) : FuzzPacket :=
+  match pkt with
+  | .pkt p q => .pkt (p.1 + delta, p.2 ^^^ delta) (q.1 + (delta <<< 1), q.2 + 17)
+"""
+
+
+def gen_alias_program(seed: int) -> dict[str, Any]:
+    """A genuine alias program: two live names for one heap object.
+
+    `alias_shared` selects the shared variant (one object read through two names,
+    the `foo arr arr` shape) or the exclusive variant (two distinct objects). The
+    step applied through the second name is a reset/reuse decision point: a wrong
+    reference count mutates the shared object in place, which the canary reads
+    (`old_read`) and the combined value (`ret`) observe; a premature free or a
+    cross-object corruption shows up as a value difference or a leaked object.
+    """
+    rng = Rng(splitmix64(seed ^ 0xA11A5A11A5A5A5A5))
+    shared = (seed // ALIAS_SEED_MOD) % 2 == 0
+    idx = rng.choice(4)
+    jdx = rng.choice(4)
+    val = pick_scalar(rng)
+    c1 = pick_scalar(rng)
+    c2 = pick_scalar(rng)
+    arg0 = pick_scalar(rng)
+    return {
+        "k": "alias_program",
+        "seed": seed,
+        "arg0": arg0,
+        "alias_shared": shared,
+        "alias_probe": {"idx": idx, "jdx": jdx, "val": u64(val), "c1": u64(c1), "c2": u64(c2)},
+        "preamble": ALIAS_PREAMBLE,
+    }
+
+
+def program_contains_alias(program: dict[str, Any]) -> bool:
+    """True only for programs with two live names for one heap object."""
+    return program.get("k") == "alias_program"
+
+
+def alias_observations_differ(a: dict[str, Any], b: dict[str, Any]) -> bool:
+    return any(a.get(k) != b.get(k) for k in ("ret", "old_read", "new_read"))
+
+
+def alias_mismatch(
+    program: dict[str, Any],
+    stock_obs: dict[str, Any],
+    lnir_obs: dict[str, Any],
+    llvm_obs: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """A mismatch record when any alias observation differs between engines."""
+    differ = alias_observations_differ(stock_obs, lnir_obs) or (
+        llvm_obs is not None and alias_observations_differ(stock_obs, llvm_obs)
+    )
+    if not differ:
+        return None
+    record = {
+        "seed": program["seed"],
+        "kind": program["k"],
+        "alias_shared": program.get("alias_shared"),
+        "stock_lean_c": {k: str(v) for k, v in stock_obs.items()},
+        "lnir_eval": {k: str(v) for k, v in lnir_obs.items()},
+    }
+    if llvm_obs is not None:
+        record["c_abi_llvm"] = {k: str(v) for k, v in llvm_obs.items()}
+    return record
+
+
 def build_program(seed: int) -> dict[str, Any]:
     if seed == 0:
         return {
@@ -255,6 +343,8 @@ def build_program(seed: int) -> dict[str, Any]:
             "arg0": 5,
             "seed": seed,
         }
+    if seed % ALIAS_SEED_MOD == 0:
+        return gen_alias_program(seed)
     rng = Rng(splitmix64(seed))
     depth = 1 + rng.choice(3)
     arg0 = pick_scalar(rng)
@@ -964,6 +1054,265 @@ def run_three_way_batch(
         }
 
 
+def alias_program_to_lean_lines(program: dict[str, Any]) -> list[str]:
+    """Emit the three exported decls of one alias program (ret, old_read, new_read).
+
+    All three recompute the same aliasing sequence so every observable is a live
+    function of the shared/exclusive reuse decision the lowering must get right.
+    """
+    seed = program["seed"]
+    probe = program["alias_probe"]
+    idx = u64(probe["idx"])
+    jdx = u64(probe["jdx"])
+    val = u64(probe["val"])
+    c1 = u64(probe["c1"])
+    c2 = u64(probe["c2"])
+    init = f"FuzzPacket.pkt (x0, x0 ^^^ ({c1} : UInt64)) (x0 + ({c2} : UInt64), x0 * ({3} : UInt64))"
+    alias = "base" if program["alias_shared"] else (
+        f"FuzzPacket.pkt (x0 ^^^ ({11} : UInt64), x0 + ({13} : UInt64)) (x0 * ({17} : UInt64), x0 + ({19} : UInt64))"
+    )
+    prologue = (
+        f"  let base := {init}\n"
+        f"  let alias := {alias}\n"
+        f"  let stepped := fuzzPacketStep alias (x0 + ({val} : UInt64))\n"
+    )
+    ret_body = (
+        prologue
+        + "  let direct := fuzzPacketFold base\n"
+        + "  let canary := fuzzPacketFold base\n"
+        + f"  let after := fuzzPacketStep base (x0 ^^^ ({val} : UInt64))\n"
+        + f"  (direct + stepped.1.1 + canary) ^^^ (fuzzPacketFold after + ({jdx} : UInt64))"
+    )
+    old_body = prologue + f"  fuzzPacketFold base + stepped.1.2 ^^^ ({idx} : UInt64)"
+    new_body = (
+        prologue
+        + f"  let after := fuzzPacketStep base (x0 ^^^ ({val} : UInt64))\n"
+        + f"  (fuzzPacketFold stepped + fuzzPacketFold after) ^^^ (base.2.2 + ({idx} : UInt64))"
+    )
+    return [
+        f"@[export fuzz_seed_{seed}]",
+        f"def fuzz_seed_{seed} (x0 : UInt64) : UInt64 :=",
+        ret_body,
+        "",
+        f"@[export fuzz_seed_{seed}_old]",
+        f"def fuzz_seed_{seed}_old (x0 : UInt64) : UInt64 :=",
+        old_body,
+        "",
+        f"@[export fuzz_seed_{seed}_new]",
+        f"def fuzz_seed_{seed}_new (x0 : UInt64) : UInt64 :=",
+        new_body,
+        "",
+    ]
+
+
+def alias_decl_names(program: dict[str, Any]) -> list[str]:
+    seed = program["seed"]
+    return [f"fuzz_seed_{seed}", f"fuzz_seed_{seed}_old", f"fuzz_seed_{seed}_new"]
+
+
+def run_alias_batch(
+    programs: list[dict[str, Any]],
+    engines: dict[str, Any],
+    mutate_engine: str | None = None,
+    asan: bool = False,
+    ubsan: bool = False,
+) -> dict[str, Any]:
+    """Execute alias programs two-way (stock Lean C vs LNIR interpreter) with validate-tv.
+
+    compile-llvm of heap decls must fail closed (documented Stage 1D behavior);
+    if a future backend accepts the wire, the batch upgrades to three-way.
+    """
+    lean_bin = engines["lean_bin"]
+    core_bin = engines["core_bin"]
+    full_bin = engines.get("full_bin")
+    if not full_bin:
+        raise RuntimeError("Missing real Lean frontend; core is not a substitute")
+    if not programs:
+        return {
+            "executed_count": 0,
+            "mismatches": [],
+            "live_objects": 0,
+            "leaks": 0,
+            "alias_llvm_fail_closed": True,
+            "alias_llvm_refusal": "no programs",
+            "receipts": [],
+        }
+
+    with tempfile.TemporaryDirectory(prefix="turbo_c4_alias_batch_") as tmp:
+        tmpdir = Path(tmp)
+        lean_lines = ["-- Auto-generated Tier C4 alias batch (C4x)"]
+        lean_lines.append(ALIAS_PREAMBLE)
+        c_driver_decls = ["#include <stdint.h>", "#include <stdio.h>"]
+        c_driver_calls = ["int main(void) {", '  printf("[");']
+        arg_list_strs: list[str] = []
+        decl_order: list[tuple[str, int]] = []
+        for p in programs:
+            lean_lines.extend(alias_program_to_lean_lines(p))
+            arg0 = u64(p["arg0"])
+            for decl in alias_decl_names(p):
+                c_driver_decls.append(f"extern uint64_t {decl}(uint64_t);")
+                sep = "," if decl_order else ""
+                c_driver_calls.append(
+                    f'  printf("{sep}\\"%llu\\"", (unsigned long long){decl}({arg0}ULL));'
+                )
+                arg_list_strs.append(f"{decl}:{arg0}")
+                decl_order.append((decl, p["seed"]))
+        c_driver_calls.append('  printf("]\\n");')
+        c_driver_calls.append("  return 0;")
+        c_driver_calls.append("}")
+
+        lean_src = "\n".join(lean_lines) + "\n"
+        lean_file = tmpdir / "AliasBatch.lean"
+        lean_file.write_text(lean_src, encoding="utf-8")
+
+        stock_source = tmpdir / "StockAlias.lean"
+        stock_calls = [
+            f"toString {decl} {u64(p['arg0'])}"
+            for p in programs
+            for decl in alias_decl_names(p)
+        ]
+        stock_source.write_text(
+            lean_src + '\ndef main : IO Unit :=\n  IO.println ("[" ++ String.intercalate "," ['
+            + ", ".join(stock_calls) + '] ++ "]")\n', encoding="utf-8"
+        )
+        lean_c_file = tmpdir / "AliasBatch.lean.c"
+        subprocess.run(
+            [lean_bin, str(stock_source), "-c", str(lean_c_file)],
+            cwd=str(tmpdir), check=True, capture_output=True, text=True,
+        )
+        driver_c_path = tmpdir / "alias_driver.c"
+        stock_bin_path = tmpdir / "stock_alias_runner"
+        driver_c_path.write_text(
+            "\n".join(c_driver_decls) + "\n" + "\n".join(c_driver_calls) + "\n",
+            encoding="utf-8",
+        )
+        lean_prefix = subprocess.run([lean_bin, "--print-prefix"], check=True, capture_output=True, text=True).stdout.strip()
+        leanc = str(Path(lean_prefix) / "bin" / "leanc")
+        subprocess.run(
+            [leanc, "-O2", str(lean_c_file), "-o", str(stock_bin_path)],
+            check=True, capture_output=True, text=True,
+        )
+        stock_out = subprocess.run([str(stock_bin_path)], check=True, capture_output=True, text=True).stdout
+        stock_flat = [int(x) for x in json.loads(stock_out)]
+        if len(stock_flat) != len(decl_order):
+            raise RuntimeError("Stock alias execution skipped or duplicated rows")
+        stock_obs = [
+            {"ret": stock_flat[i], "old_read": stock_flat[i + 1], "new_read": stock_flat[i + 2]}
+            for i in range(0, len(stock_flat), 3)
+        ]
+        if mutate_engine == "stock_lean_c" and stock_obs:
+            stock_obs[0]["ret"] = u64(stock_obs[0]["ret"] ^ 1)
+
+        wire_path = tmpdir / "alias_batch.lnir"
+        subprocess.run(
+            [full_bin, "emit-lnir", "--wire", "--allow-rc-adt", str(lean_file), "-o", str(wire_path)],
+            check=True, capture_output=True, text=True,
+        )
+        tv_out = subprocess.run(
+            [core_bin, "validate-tv", "--lnir", str(wire_path), "--json"],
+            check=True, capture_output=True, text=True,
+        ).stdout
+        tv_json = json.loads(tv_out)
+        ev_res = subprocess.run(
+            [core_bin, "eval-lnir", "--lnir", str(wire_path), "--args", ";".join(arg_list_strs),
+             "--opt", "--batch-json"],
+            check=True, capture_output=True, text=True,
+        )
+        ev_rows = json.loads(ev_res.stdout)
+        expected_decls = {decl for decl, _ in decl_order}
+        if len(ev_rows) != len(decl_order) or any(r.get("ok") is not True for r in ev_rows) \
+                or {r.get("decl") for r in ev_rows} != expected_decls:
+            raise RuntimeError("Alias evaluation did not execute each exact requested declaration once")
+        ev_by_decl = {r["decl"]: r for r in ev_rows}
+        leaked_rows = [r for r in ev_rows if int(r.get("live_objects", 0)) != 0]
+        lnir_flat = {}
+        for decl, _seed in decl_order:
+            row = ev_by_decl[decl]
+            lnir_flat[decl] = int(row["value_u64"])
+        lnir_obs = []
+        for p in programs:
+            names = alias_decl_names(p)
+            lnir_obs.append({
+                "ret": lnir_flat[names[0]],
+                "old_read": lnir_flat[names[1]],
+                "new_read": lnir_flat[names[2]],
+            })
+        if mutate_engine == "lnir_eval" and lnir_obs:
+            lnir_obs[-1]["new_read"] = u64(lnir_obs[-1]["new_read"] ^ 1)
+
+        llvm_res = subprocess.run(
+            [core_bin, "compile-llvm", "--no-telemetry", "--lnir", str(wire_path), "-o", str(tmpdir / "alias_batch.ll")],
+            capture_output=True, text=True,
+        )
+        llvm_obs: list[dict[str, Any]] | None = None
+        alias_llvm_fail_closed = True
+        alias_llvm_refusal = ""
+        if llvm_res.returncode != 0:
+            alias_llvm_refusal = (llvm_res.stderr or llvm_res.stdout).strip().splitlines()[0][:200] if (llvm_res.stderr or llvm_res.stdout).strip() else "unknown refusal"
+        else:
+            alias_llvm_fail_closed = False
+            ll_path = tmpdir / "alias_batch.ll"
+            ln_bin_path = tmpdir / "ln_alias_runner"
+            driver_c_path.write_text(
+                "\n".join(c_driver_decls) + "\n" + "\n".join(c_driver_calls) + "\n",
+                encoding="utf-8",
+            )
+            san_meta = compile_and_link_llvm_driver(
+                clang_bin=engines["clang_bin"],
+                extra_inc=clang_extra_flags(engines["clang_bin"]),
+                ll_path=ll_path,
+                driver_c_path=driver_c_path,
+                out_bin_path=ln_bin_path,
+                asan=asan,
+                ubsan=ubsan,
+                sanitizer_linker=engines.get("sanitizer_linker"),
+            )
+            run_env = dict(os.environ)
+            if asan:
+                run_env["ASAN_OPTIONS"] = "detect_leaks=0:abort_on_error=1:halt_on_error=1"
+            if ubsan:
+                run_env["UBSAN_OPTIONS"] = "print_stacktrace=1:halt_on_error=1"
+            ln_out = subprocess.run([str(ln_bin_path)], env=run_env, check=True, capture_output=True, text=True).stdout
+            ln_flat = [int(x) for x in json.loads(ln_out)]
+            if len(ln_flat) != len(decl_order):
+                raise RuntimeError("LLVM alias execution skipped or duplicated rows")
+            llvm_obs = [
+                {"ret": ln_flat[i], "old_read": ln_flat[i + 1], "new_read": ln_flat[i + 2]}
+                for i in range(0, len(ln_flat), 3)
+            ]
+            if mutate_engine == "c_abi_llvm" and llvm_obs:
+                llvm_obs[-1]["ret"] = u64(llvm_obs[-1]["ret"] ^ 0xDEAD)
+            san_receipt = {"sanitizers": san_meta, "compiled_llvm_ir_sha256": sha256_bytes(ll_path.read_bytes())}
+
+        mismatches = []
+        for p_i, (p, so, lo) in enumerate(zip(programs, stock_obs, lnir_obs)):
+            vo = llvm_obs[p_i] if llvm_obs is not None else None
+            m = alias_mismatch(p, so, lo, vo)
+            if m is not None:
+                mismatches.append(m)
+
+        receipts = [{
+            "lean_source_sha256": sha256_bytes(lean_file.read_bytes()),
+            "lnir_wire_sha256": sha256_bytes(wire_path.read_bytes()),
+            "stock_binary_sha256": sha256_bytes(stock_bin_path.read_bytes()),
+            "symbolic_tv_passed_decls": tv_json.get("passedDecls", 0),
+            "lnir_eval_executed_decls": len(ev_by_decl),
+            "alias_llvm_fail_closed": alias_llvm_fail_closed,
+            "alias_llvm_refusal": alias_llvm_refusal,
+        }]
+        if alias_llvm_fail_closed is False:
+            receipts[0].update(san_receipt)
+        return {
+            "executed_count": len(programs),
+            "mismatches": mismatches,
+            "live_objects": sum(int(r.get("live_objects", 0)) for r in ev_rows),
+            "leaks": len(leaked_rows),
+            "alias_llvm_fail_closed": alias_llvm_fail_closed,
+            "alias_llvm_refusal": alias_llvm_refusal,
+            "receipts": receipts,
+        }
+
+
 def validate_tv_coverage(report: Any, expected_decls: set[str]) -> None:
     """A successful summary cannot replace executed, named validation obligations."""
     count = len(expected_decls)
@@ -988,6 +1337,14 @@ def validate_tv_coverage(report: Any, expected_decls: set[str]) -> None:
         raise RuntimeError("Translation validation lacks exact successful declaration coverage")
 
 
+SCALAR_CHUNK = 256
+ALIAS_CHUNK = 96
+
+
+def _chunk(items: list[Any], size: int) -> list[list[Any]]:
+    return [items[i:i + size] for i in range(0, len(items), size)] if items else []
+
+
 def run_fuzzer(
     num_seeds: int = 50,
     override_lean: str | None = None,
@@ -998,13 +1355,24 @@ def run_fuzzer(
     ubsan: bool = False,
 ) -> dict[str, Any]:
     n = max(0, num_seeds)
+    programs = [build_program(seed) for seed in range(n)]
+    alias_programs = [p for p in programs if program_contains_alias(p)]
+    scalar_programs = [p for p in programs if not program_contains_alias(p)]
+    alias_floor = n // ALIAS_FLOOR_RATIO
+    alias_counts = {
+        "alias_program_count": len(alias_programs),
+        "alias_shared_count": sum(1 for p in alias_programs if p["alias_shared"]),
+        "alias_exclusive_count": sum(1 for p in alias_programs if not p["alias_shared"]),
+        "alias_floor": alias_floor,
+        "alias_floor_met": len(alias_programs) >= alias_floor,
+    }
     engines = probe_engines(override_lean, override_core, override_clang, asan=asan, ubsan=ubsan)
     all_engines_ready = (
         engines["stock_lean_c"] and engines["lnir_eval"] and engines["c_abi_llvm"]
     )
     if not all_engines_ready:
         return {
-            "schemaVersion": "turbo-lean-lcnf-fuzz-v2",
+            "schemaVersion": "turbo-lean-lcnf-fuzz-v3",
             "tier": "C4",
             "status": "incomplete_missing_engine",
             "ok": False,
@@ -1015,7 +1383,8 @@ def run_fuzzer(
                 "asan": asan,
                 "ubsan": ubsan,
                 "ubsan_scope": "c_driver_and_link_runtime_only_not_llvm_ir" if ubsan else "disabled",
-                "coverage": "scalar_only_no_alias_rc_or_seqFor",
+                "coverage": "scalar_3way_plus_alias_2way_seqfor_unrolled",
+                **alias_counts,
             "parity": "incomplete",
             "engines": {
                 "stock_lean_c": engines["stock_lean_c"],
@@ -1026,42 +1395,88 @@ def run_fuzzer(
             "shrunk_failures": [{"error": "Required conformance engines unavailable; refusing to report pass"}],
         }
 
-    programs = [build_program(seed) for seed in range(n)]
     mismatches = 0
     failures: list[dict[str, Any]] = []
-    try:
-        batch_res = run_three_way_batch(
-            programs, engines, mutate_engine=mutate_engine, asan=asan, ubsan=ubsan
-        )
-    except (subprocess.SubprocessError, OSError, ValueError, RuntimeError) as exc:
-        batch_res = {"executed_count": 0, "mismatches": [], "receipts": {}}
-        failures.append({"error": str(exc), "stderr": getattr(exc, "stderr", None)})
-    mismatches += len(batch_res["mismatches"])
-    failures.extend(batch_res["mismatches"])
+    receipts: list[dict[str, Any]] = []
+    checked = 0
+    scalar_live_objects = 0
+    alias_checked = 0
+    alias_leaks = 0
+    alias_live_objects = 0
+    alias_llvm_all_fail_closed = True
+    alias_refusals: list[str] = []
+    scalar_batches = _chunk(scalar_programs, SCALAR_CHUNK)
+    alias_batches = _chunk(alias_programs, ALIAS_CHUNK)
 
-    checked = batch_res["executed_count"]
-    parity_ok = n > 0 and checked == n and mismatches == 0 and not failures
+    for b_idx, batch in enumerate(scalar_batches):
+        batch_mutate = mutate_engine if (
+            (mutate_engine == "stock_lean_c" and b_idx == 0)
+            or (mutate_engine in ("lnir_eval", "c_abi_llvm") and b_idx == len(scalar_batches) - 1)
+        ) else None
+        try:
+            batch_res = run_three_way_batch(batch, engines, mutate_engine=batch_mutate, asan=asan, ubsan=ubsan)
+        except (subprocess.SubprocessError, OSError, ValueError, RuntimeError) as exc:
+            batch_res = {"executed_count": 0, "mismatches": [], "receipts": {}}
+            failures.append({"error": str(exc), "stderr": getattr(exc, "stderr", None), "stage": "scalar_batch", "index": b_idx})
+        mismatches += len(batch_res["mismatches"])
+        failures.extend(batch_res["mismatches"])
+        checked += batch_res["executed_count"]
+        scalar_live_objects += batch_res.get("live_objects", 0) or 0
+        if isinstance(batch_res.get("receipts"), dict):
+            receipts.append(batch_res["receipts"])
+
+    for b_idx, batch in enumerate(alias_batches):
+        batch_mutate = mutate_engine if (
+            (mutate_engine == "stock_lean_c" and b_idx == 0)
+            or (mutate_engine in ("lnir_eval", "c_abi_llvm") and b_idx == len(alias_batches) - 1)
+        ) else None
+        try:
+            batch_res = run_alias_batch(batch, engines, mutate_engine=batch_mutate, asan=asan, ubsan=ubsan)
+        except (subprocess.SubprocessError, OSError, ValueError, RuntimeError) as exc:
+            batch_res = {"executed_count": 0, "mismatches": [], "receipts": [], "leaks": 0,
+                         "live_objects": 0, "alias_llvm_fail_closed": True, "alias_llvm_refusal": str(exc)}
+            failures.append({"error": str(exc), "stderr": getattr(exc, "stderr", None), "stage": "alias_batch", "index": b_idx})
+        mismatches += len(batch_res["mismatches"])
+        failures.extend(batch_res["mismatches"])
+        checked += batch_res["executed_count"]
+        alias_checked += batch_res["executed_count"]
+        alias_leaks += batch_res.get("leaks", 0)
+        alias_live_objects += batch_res.get("live_objects", 0)
+        alias_llvm_all_fail_closed = alias_llvm_all_fail_closed and bool(batch_res.get("alias_llvm_fail_closed"))
+        if batch_res.get("alias_llvm_refusal"):
+            alias_refusals.append(str(batch_res["alias_llvm_refusal"]))
+        receipts.extend(batch_res.get("receipts", []))
+
+    rc_leak_count = alias_leaks if alias_checked > 0 else None
+    alias_coverage_ok = alias_counts["alias_floor_met"] and (alias_checked == 0 or (alias_leaks == 0 and alias_checked == len(alias_programs)))
+    parity_ok = n > 0 and checked == n and mismatches == 0 and not failures and alias_coverage_ok
     return {
-        "schemaVersion": "turbo-lean-lcnf-fuzz-v2",
+        "schemaVersion": "turbo-lean-lcnf-fuzz-v3",
         "tier": "C4",
-        "status": "passed_scalar_only" if parity_ok else "failed_or_incomplete",
-        "coverage": "scalar_only_no_alias_rc_or_seqFor",
+        "status": ("passed_scalar_plus_alias" if parity_ok and alias_checked > 0
+                   else "passed_scalar_only" if parity_ok else "failed_or_incomplete"),
+        "coverage": "scalar_3way_plus_alias_2way_seqfor_unrolled",
         "ok": parity_ok,
         "seeds": n,
         "checked": checked,
         "mismatch_count": mismatches,
-        "rc_leak_count": None,
+        "rc_leak_count": rc_leak_count,
         "asan": asan,
         "ubsan": ubsan,
         "ubsan_scope": "c_driver_and_link_runtime_only_not_llvm_ir" if ubsan else "disabled",
-        "interpreter_live_objects": batch_res.get("live_objects"),
+        "interpreter_live_objects": scalar_live_objects,
+        "alias_live_objects": alias_live_objects,
+        **alias_counts,
+        "alias_checked": alias_checked,
+        "alias_llvm_fail_closed": alias_llvm_all_fail_closed,
+        "alias_llvm_refusals": alias_refusals[:4],
         "parity": "100%" if (parity_ok and n > 0) else f"{checked - mismatches}/{checked}",
         "engines": {
             "stock_lean_c": engines["stock_lean_c"],
             "lnir_validate_tv": engines["lnir_eval"],
             "c_abi_llvm": engines["c_abi_llvm"],
         },
-        "receipts": batch_res["receipts"],
+        "receipts": receipts,
         "boundary_scalars": list(BOUNDARY_SCALARS),
         "shrunk_failures": failures[:8],
     }
@@ -1087,6 +1502,9 @@ def main() -> int:
         print(
             f"[fuzz-lcnf] {status} seeds={report['seeds']} checked={report['checked']} "
             f"mismatches={report['mismatch_count']} rc_leaks={report['rc_leak_count']} "
+            f"alias={report['alias_program_count']}"
+            f"({report['alias_shared_count']}s/{report['alias_exclusive_count']}x,"
+            f"floor={'met' if report['alias_floor_met'] else 'MISSED'}) "
             f"stock_lean={report['engines']['stock_lean_c']} "
             f"tv={report['engines']['lnir_validate_tv']} "
             f"clang={report['engines']['c_abi_llvm']}"
