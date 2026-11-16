@@ -1353,6 +1353,29 @@ def _chunk(items: list[Any], size: int) -> list[list[Any]]:
     return [items[i:i + size] for i in range(0, len(items), size)] if items else []
 
 
+def merge_fuzz_receipts(scalar_receipts: list[dict[str, Any]], alias_receipts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate per-batch receipts into the historical single-dict shape.
+
+    P0 callers (test_p0_trust_boundary.py) read run_fuzzer()["receipts"] as a
+    dict, so executed/passing declaration counts are summed across batches, the
+    first scalar batch's digests keep their historical top-level keys, and the
+    full per-batch detail stays available under `batch_receipts`.
+    """
+    all_batches = list(scalar_receipts) + list(alias_receipts)
+    first_scalar = next((r for r in scalar_receipts if r), {})
+    last_scalar = next((r for r in reversed(scalar_receipts) if r), {})
+    merged: dict[str, Any] = dict(first_scalar)
+    merged["scalar_batch_count"] = len(scalar_receipts)
+    merged["alias_batch_count"] = len(alias_receipts)
+    for key in ("lnir_eval_executed_decls", "symbolic_tv_passed_decls"):
+        merged[key] = sum(int(r.get(key, 0) or 0) for r in all_batches)
+    merged["stock_runtime"] = last_scalar.get(
+        "stock_runtime", "stock lean -c + leanc (full generated C, no replacements)"
+    )
+    merged["batch_receipts"] = all_batches
+    return merged
+
+
 def run_fuzzer(
     num_seeds: int = 50,
     override_lean: str | None = None,
@@ -1405,7 +1428,8 @@ def run_fuzzer(
 
     mismatches = 0
     failures: list[dict[str, Any]] = []
-    receipts: list[dict[str, Any]] = []
+    scalar_receipts: list[dict[str, Any]] = []
+    alias_receipts: list[dict[str, Any]] = []
     checked = 0
     scalar_live_objects = 0
     alias_checked = 0
@@ -1431,7 +1455,7 @@ def run_fuzzer(
         checked += batch_res["executed_count"]
         scalar_live_objects += batch_res.get("live_objects", 0) or 0
         if isinstance(batch_res.get("receipts"), dict):
-            receipts.append(batch_res["receipts"])
+            scalar_receipts.append(batch_res["receipts"])
 
     for b_idx, batch in enumerate(alias_batches):
         batch_mutate = mutate_engine if (
@@ -1453,7 +1477,9 @@ def run_fuzzer(
         alias_llvm_all_fail_closed = alias_llvm_all_fail_closed and bool(batch_res.get("alias_llvm_fail_closed"))
         if batch_res.get("alias_llvm_refusal"):
             alias_refusals.append(str(batch_res["alias_llvm_refusal"]))
-        receipts.extend(batch_res.get("receipts", []))
+        alias_receipts.extend(batch_res.get("receipts", []))
+
+    receipts = merge_fuzz_receipts(scalar_receipts, alias_receipts)
 
     rc_leak_count = alias_leaks if alias_checked > 0 else None
     alias_coverage_ok = alias_counts["alias_floor_met"] and (alias_checked == 0 or (alias_leaks == 0 and alias_checked == len(alias_programs)))
