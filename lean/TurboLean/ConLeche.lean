@@ -1,11 +1,21 @@
 /-
-  TurboLean.ConLeche (Milestone M2):
-  Self-contained dependent Calculus of Inductive Constructions (CIC) kernel (`ConLeche`)
-  with universe levels (`zero`, `succ`, `max`, `imax`, `param`), de Bruijn lifting &
-  capture-avoiding substitution (`lift`, `subst`, `inst0`), fuel-bounded WHNF & definitional
-  equality (`whnf`, `isDefEq`), inductive typing judgment (`HasType`), bidirectional
-  typechecker (`inferType`, `verifyDecl`), and binary `.olean` declaration shard parser/encoder
-  (`parseOleanShard`, `encodeOleanShard`).
+  TurboLean.ConLeche (Milestone M2 / Wave 1 G1b):
+  Self-contained dependent Calculus of Inductive Constructions (CIC) kernel model (`ConLeche`
+  and `TurboLean.Kernel.ConLeche`) with universe levels (`zero`, `succ`, `max`, `imax`, `param`),
+  de Bruijn lifting & capture-avoiding substitution (`lift`, `subst`, `inst0`), fuel-bounded
+  WHNF & definitional equality (`whnf`, `isDefEq`), inductive typing judgment (`HasType`),
+  bidirectional typechecker (`inferType`, `verifyDecl`, `checkDecl`), and binary `"OLEN"` v1
+  (`0x4F4C454E`) declaration shard model parser/encoder (`parseOleanShard`, `encodeOleanShard`).
+
+  Explicit Model Limitation & H1/H3 Scope (`roadmap/HORIZONS.md` G1b):
+  - `parseOleanShard` / `encodeOleanShard` in this module operate on the in-repo self-contained
+    `"OLEN"` v1 (`0x4F4C454E`) binary shard model format, NOT raw Lean 4 `.olean` compacted
+    memory-region files.
+  - Real Lean 4 `.olean` region files and `lean4export` streams are verified out-of-process by
+    the external `leanprover/con-leche` binary (whose upstream ZFC soundness and `.olean` sparse
+    region reader theorems are bridged in `verification/con-leche-bridge/`), while H1 proves the
+    first-order `LCNF -> LNIR` compiler path and H3 retains compiling `con-leche` natively once
+    recursive inductives, runtime objects, closures, and `IO` are in scope.
 -/
 
 namespace ConLeche
@@ -344,10 +354,12 @@ def encodeOleanShard (env : Env) : ByteArray :=
     acc ++ [idx.toUInt8, if d.wfTag then 1 else 0] ++ encodeOleanExpr d.ty ++ encodeOleanExpr d.val) []
   ByteArray.mk (header ++ body).toArray
 
-/-- Parse and type-check a binary `.olean` shard (`bytes : ByteArray`):
+/-- Parse and type-check a binary `.olean` shard (`bytes : ByteArray`) in the `"OLEN"` v1 model format:
     1. Verifies minimum header size (`bytes.size ≥ 5`) and `"OLEN"` magic (`0x4F, 0x4C, 0x45, 0x4E`).
-    2. Reads `declCount = (bytes.get! 4).toNat`, decodes `declCount` binary declarations, and verifies exact byte consumption (`offEnd == bytes.size`).
-    3. Verifies acyclic incremental prefix typing (`verifyDeclsPrefix [] decls`) and full-environment typing (`decls.all (verifyDecl env)`). -/
+    2. Reads `declCount = (bytes.get! 4).toNat`, decodes `declCount` binary declarations,
+       and verifies exact byte consumption (`offEnd == bytes.size`).
+    3. Verifies acyclic incremental prefix typing (`verifyDeclsPrefix [] decls`)
+       and full-environment typing (`decls.all (verifyDecl env)`). -/
 def parseOleanShard (bytes : ByteArray) : Except String Env :=
   if bytes.size < 5 then
     .error "parseOleanShard: truncated .olean shard (< 5 bytes)"
@@ -549,3 +561,186 @@ theorem olean_mmap_bridge_sound (bytes : ByteArray) (env : Env)
           · contradiction
 
 end ConLeche
+
+namespace TurboLean.Kernel.ConLeche
+
+abbrev Env := _root_.ConLeche.Env
+abbrev Decl := _root_.ConLeche.Decl
+abbrev Expr := _root_.ConLeche.Expr
+abbrev Level := _root_.ConLeche.Level
+abbrev HasType := _root_.ConLeche.HasType
+abbrev CICValid := _root_.ConLeche.CICValid
+abbrev inferType := _root_.ConLeche.inferType
+abbrev verifyDecl := _root_.ConLeche.verifyDecl
+abbrev verifyDeclsPrefix := _root_.ConLeche.verifyDeclsPrefix
+abbrev decodeOleanDecls := _root_.ConLeche.decodeOleanDecls
+abbrev encodeOleanShard := _root_.ConLeche.encodeOleanShard
+abbrev parseOleanShard := _root_.ConLeche.parseOleanShard
+
+/-- Well-formedness invariant (`EnvWellFormed`) for a `ConLeche.Env` kernel environment in the
+    in-repo `"OLEN"` v1 (`0x4F4C454E`) model: the binary shard header carries `"OLEN"` magic
+    (`0x4F4C454E`), every declaration in `env.decls` has a strictly acyclic fresh prefix typing
+    (`verifyDeclsPrefix [] env.decls = true`), and every declaration satisfies the semantic
+    dependent CIC typing predicate (`CICValid env d`). -/
+def EnvWellFormed (env : ConLeche.Env) : Prop :=
+  env.headerMagic = 0x4F4C454E ∧
+  verifyDeclsPrefix [] env.decls = true ∧
+  (∀ d ∈ env.decls, CICValid env d)
+
+/-- Incrementally verify that appending a fresh, well-typed declaration `d` at the end of `rest`
+    preserves `verifyDeclsPrefix acc (rest ++ [d])`. -/
+theorem verifyDeclsPrefix_append_singleton (acc rest : List ConLeche.Decl) (d : ConLeche.Decl)
+    (h_pref : verifyDeclsPrefix acc rest = true)
+    (h_fresh : ((acc ++ rest).any (fun prev => prev.name == d.name)) = false)
+    (h_ver : verifyDecl { decls := acc ++ rest, headerMagic := 0x4F4C454E } d = true) :
+    verifyDeclsPrefix acc (rest ++ [d]) = true := by
+  induction rest generalizing acc with
+  | nil =>
+    have h_fresh0 : (acc.any (fun prev => prev.name == d.name)) = false := by
+      simpa only [List.append_nil] using h_fresh
+    have h_ver0 : verifyDecl { decls := acc, headerMagic := 0x4F4C454E } d = true := by
+      simpa only [List.append_nil] using h_ver
+    unfold verifyDeclsPrefix _root_.ConLeche.verifyDeclsPrefix
+    simp [h_fresh0, h_ver0, _root_.ConLeche.verifyDeclsPrefix]
+  | cons hd tl ih =>
+    unfold verifyDeclsPrefix _root_.ConLeche.verifyDeclsPrefix at h_pref ⊢
+    rcases Bool.and_eq_true_iff.mp h_pref with ⟨h_left, h_tl⟩
+    rcases Bool.and_eq_true_iff.mp h_left with ⟨h_hd_fresh, h_hd_ver⟩
+    have h_assoc : (acc ++ [hd]) ++ tl = acc ++ (hd :: tl) := by simp
+    have h_fresh' : (((acc ++ [hd]) ++ tl).any (fun prev => prev.name == d.name)) = false := by
+      rw [h_assoc]; exact h_fresh
+    have h_ver' : verifyDecl { decls := (acc ++ [hd]) ++ tl, headerMagic := 0x4F4C454E } d = true := by
+      rw [h_assoc]; exact h_ver
+    have h_rec := ih (acc ++ [hd]) h_tl h_fresh' h_ver'
+    simp [h_hd_fresh, h_hd_ver, h_rec]
+
+/-- Incrementally check and admit a candidate kernel declaration `d` into `env` (`checkDecl`):
+    1. Rejects duplicate declaration names (`env.decls.any (fun prev => prev.name == d.name)`).
+    2. Verifies `d` via the bidirectional CIC kernel checker (`verifyDecl env d`).
+    3. Verifies that every declaration in the extended environment `{ env with decls := env.decls ++ [d] }`
+       remains well-typed under `verifyDecl`. -/
+def checkDecl (env : ConLeche.Env) (d : ConLeche.Decl) : Except String ConLeche.Env :=
+  if env.decls.any (fun prev => prev.name == d.name) then
+    .error s!"checkDecl: duplicate declaration `{d.name}` in kernel environment"
+  else if !verifyDecl env d then
+    .error s!"checkDecl: CIC kernel rejected declaration `{d.name}`"
+  else if ({ env with decls := env.decls ++ [d] }).decls.all (verifyDecl { env with decls := env.decls ++ [d] }) then
+    .ok { env with decls := env.decls ++ [d] }
+  else
+    .error s!"checkDecl: extended environment failed closed-world CIC verification for `{d.name}`"
+
+/-- Milestone M2 (Item 1, Contract V4 / G1b): Machine-checked soundness of the `"OLEN"` v1
+    (`.olean` shard model) bridge (`olean_mmap_bridge_sound`, `0 sorryAx`). -/
+theorem olean_mmap_bridge_sound (bytes : ByteArray) (env : ConLeche.Env)
+    (h_parse : parseOleanShard bytes = .ok env) :
+    EnvWellFormed env := by
+  have ⟨_, hmagic, _, hpref, hvalid⟩ := _root_.ConLeche.olean_mmap_bridge_sound bytes env h_parse
+  exact ⟨hmagic, hpref, hvalid⟩
+
+/-- Milestone M2 (Item 2, Contract V4 / G1b): Machine-checked soundness of the `ConLeche` CIC
+    declaration checker (`con_leche_verify_decl_sound`, `0 sorryAx`):
+    given a well-formed environment `env` (`EnvWellFormed env`), whenever `checkDecl env d = .ok env'`,
+    the extended environment `env'` is well-formed (`EnvWellFormed env'`) and `d` is a valid CIC
+    declaration in `env` (`CICValid env d`). -/
+theorem con_leche_verify_decl_sound (env env' : ConLeche.Env) (d : ConLeche.Decl)
+    (h_wf : EnvWellFormed env)
+    (h_ok : checkDecl env d = .ok env') :
+    EnvWellFormed env' ∧ CICValid env d := by
+  rcases h_wf with ⟨h_magic, h_pref, _⟩
+  unfold checkDecl at h_ok
+  split at h_ok
+  · contradiction
+  · rename_i h_not_dup
+    have h_fresh : (env.decls.any (fun prev => prev.name == d.name)) = false :=
+       Bool.eq_false_iff.mpr h_not_dup
+    split at h_ok
+    · contradiction
+    · rename_i h_not_bad_ver
+      have h_ver : verifyDecl env d = true := by
+        cases h_v : verifyDecl env d <;> simp_all
+      split at h_ok
+      · rename_i h_all_env'
+        injection h_ok with h_env'
+        subst h_env'
+        have h_cic_d : CICValid env d :=
+          _root_.ConLeche.con_leche_verify_decl_sound env d h_ver
+        have h_env_eq : ({ decls := env.decls, headerMagic := 0x4F4C454E } : ConLeche.Env) = env := by
+          cases env
+          simp at h_magic
+          subst h_magic
+          rfl
+        have h_ver_canon : verifyDecl { decls := [] ++ env.decls, headerMagic := 0x4F4C454E } d = true := by
+          simpa [h_env_eq] using h_ver
+        have h_pref' : verifyDeclsPrefix [] (env.decls ++ [d]) = true :=
+          verifyDeclsPrefix_append_singleton [] env.decls d h_pref (by simpa using h_fresh) h_ver_canon
+        refine ⟨⟨h_magic, h_pref', ?_⟩, h_cic_d⟩
+        intro d' hd'
+        have h_ver' : verifyDecl { env with decls := env.decls ++ [d] } d' = true :=
+          List.all_eq_true.mp h_all_env' d' hd'
+        exact _root_.ConLeche.con_leche_verify_decl_sound { env with decls := env.decls ++ [d] } d' h_ver'
+      · contradiction
+
+/-- Bidirectional CIC type inference rejects any application `.app fn arg` whose inferred
+    argument type `argTy` disagrees with the function domain `dom` (`typecheck_rejects_ill_typed_app`). -/
+theorem typecheck_rejects_ill_typed_app (fuel : Nat) (env : ConLeche.Env) (ctx : List ConLeche.Expr)
+    (fn arg dom body argTy : ConLeche.Expr)
+    (h_fn : inferType fuel env ctx fn = some (.forallE dom body))
+    (h_arg : inferType fuel env ctx arg = some argTy)
+    (h_mismatch : argTy ≠ dom) :
+    inferType (fuel + 1) env ctx (.app fn arg) = none := by
+  dsimp [inferType, _root_.ConLeche.inferType] at h_fn h_arg ⊢
+  rw [h_fn, h_arg]
+  simp [h_mismatch]
+
+/-! ## Executable Mutant-Kill Conformance Guards (`>= 3` Mutants Killed) -/
+
+/-- Valid baseline environment and declaration (`∀ (A : Sort 0), A → A` proved by `λ A x, x`). -/
+def validKernelDecl : ConLeche.Decl :=
+  { name := "decl_0"
+    ty := .forallE (.sort .zero) (.forallE (.bvar 0) (.bvar 1))
+    val := .lam (.sort .zero) (.lam (.bvar 0) (.bvar 0))
+    wfTag := true }
+
+def validKernelEnv : ConLeche.Env :=
+  { decls := [validKernelDecl], headerMagic := 0x4F4C454E }
+
+-- Positive sanity guards: valid `.olean` shard parses cleanly and `checkDecl` admits `validKernelDecl`.
+#guard (parseOleanShard (encodeOleanShard validKernelEnv)).isOk == true
+#guard (checkDecl { decls := [], headerMagic := 0x4F4C454E } validKernelDecl).isOk == true
+
+/-- Mutant 1 (Corrupted `.olean` Header Magic / Truncated Payload Killed):
+    corrupting the `"OLEN"` magic byte or truncating the `.olean` shard is deterministically
+    rejected by `parseOleanShard`. -/
+def mutant1BadMagicOleanShard : ByteArray :=
+  ByteArray.mk #[0x42, 0x41, 0x44, 0x21, 0x00]
+
+#guard (parseOleanShard mutant1BadMagicOleanShard).isOk == false
+#guard (parseOleanShard (ByteArray.mk #[0x4F, 0x4C, 0x45])).isOk == false
+
+/-- Mutant 2 (Ill-Typed / Sort-Spoofed Declaration Killed):
+    a declaration claiming type `∀ (A : Sort 0), A` (`False`) with value `.sort .zero`
+    is deterministically rejected by `checkDecl` and `parseOleanShard`. -/
+def mutant2IllTypedDecl : ConLeche.Decl :=
+  { name := "decl_0"
+    ty := .forallE (.sort .zero) (.bvar 0)
+    val := .sort .zero
+    wfTag := true }
+
+#guard (checkDecl { decls := [], headerMagic := 0x4F4C454E } mutant2IllTypedDecl).isOk == false
+#guard (parseOleanShard (encodeOleanShard { decls := [mutant2IllTypedDecl], headerMagic := 0x4F4C454E })).isOk == false
+
+/-- Mutant 3 (Duplicate / Cyclic Self-Referential Declaration Killed):
+    1. Re-admitting a duplicate declaration name `"decl_0"` into `validKernelEnv` is rejected by `checkDecl`.
+    2. A non-well-founded declaration (`wfTag := false`) or self-referential circular proof `.const "decl_0" []`
+       is deterministically rejected by `checkDecl` and `parseOleanShard`. -/
+def mutant3CircularSelfRefDecl : ConLeche.Decl :=
+  { name := "decl_0"
+    ty := .sort .zero
+    val := .const "decl_0" []
+    wfTag := true }
+
+#guard (checkDecl validKernelEnv validKernelDecl).isOk == false
+#guard (checkDecl { decls := [], headerMagic := 0x4F4C454E } mutant3CircularSelfRefDecl).isOk == false
+#guard (parseOleanShard (encodeOleanShard { decls := [mutant3CircularSelfRefDecl], headerMagic := 0x4F4C454E })).isOk == false
+
+end TurboLean.Kernel.ConLeche
