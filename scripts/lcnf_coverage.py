@@ -586,12 +586,14 @@ def toImpureDecls (env : Environment) (decls : Array (Decl .pure)) : IO (Array (
 unsafe def auditMods (env : Environment) (mods : Array Name) : IO (Nat × Nat × Nat × Nat × Nat) := do
   -- Fail closed: a module that cannot be converted to impure IR must fail the
   -- audit loudly, never contribute a silent zero, and a module missing from
-  -- the imported environment must be named. The corpus-wide declaration set
-  -- (across ALL measured modules) drives the local-callee classification, the
-  -- call graph, and the bridge context, so a call to a user function declared
-  -- in another measured module is classified exactly like a same-module call
-  -- (a vacuous local call), matching the eval `unsupportedCall` vacuity of
-  -- `lowerRealLCNFDecl_sound` instead of being rejected or counted proved.
+  -- the imported environment must be named. The declaration set of this
+  -- auditMods group (the std, C2, and C1 module groups are audited by separate
+  -- auditMods calls, not one combined group) drives the local-callee
+  -- classification, the call graph, and the bridge context, so a call to a
+  -- user function declared in the same group is classified exactly like a
+  -- same-module call (a vacuous local call), matching the eval
+  -- `unsupportedCall` vacuity of `lowerRealLCNFDecl_sound` instead of being
+  -- rejected or counted proved.
   let mut corpusDecls : Array (Name × Decl .impure) := #[]
   for modName in mods do
     let some modIdx := env.getModuleIdx? modName
@@ -1280,7 +1282,7 @@ def results_document(report: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[
     }
 
 
-def _validate_measured_entry(path: str, entry: Any, errors: list[str]) -> None:
+def _validate_measured_entry(path: str, entry: Any, errors: list[str], depth: int = 0) -> None:
     """Fail-closed validation of one measured baseline corpus/subcorpus entry."""
     if not isinstance(entry, dict):
         errors.append(f"Results file `{path}` must be a JSON object, got {type(entry).__name__}")
@@ -1293,6 +1295,15 @@ def _validate_measured_entry(path: str, entry: Any, errors: list[str]) -> None:
             errors.append(f"Results file `{path}` is marked not_measured yet carries declaration counts")
         if "subcorpora" in entry:
             errors.append(f"Results file `{path}` is marked not_measured yet carries subcorpora")
+        return
+    if depth > 0 and "subcorpora" in entry:
+        # The supported schema is corpus -> subcorpora only. A deeper level has
+        # no live counterpart to compare against, so accepting it would let a
+        # fabricated subtree hide behind a valid parent sum.
+        errors.append(
+            f"Results file `{path}` carries subcorpora at unsupported depth "
+            f"(only corpus -> subcorpora is supported)"
+        )
         return
     for f in RESULT_FIELDS:
         if f not in entry:
@@ -1331,7 +1342,7 @@ def _validate_measured_entry(path: str, entry: Any, errors: list[str]) -> None:
         errors.append(f"Results file `{path}`.subcorpora must be a JSON object, got {type(subs).__name__}")
         return
     for sname, sc in subs.items():
-        _validate_measured_entry(f"{path}.subcorpora.{sname}", sc, errors)
+        _validate_measured_entry(f"{path}.subcorpora.{sname}", sc, errors, depth=depth + 1)
     parent_ints = all(
         f in entry and isinstance(entry[f], int) and not isinstance(entry[f], bool)
         for f in RESULT_FIELDS
@@ -1457,19 +1468,47 @@ def check_coverage_report(
         if rnl is None or not (0 <= rnl <= corp["rejected"]) or not corp.get("rejected_not_lowered_reason"):
             errors.append(f"Corpus `{cname}` missing valid `rejected_not_lowered` / `rejected_not_lowered_reason`")
         if "subcorpora" in corp:
-            sub_tot = sum(s["total_declarations"] for s in corp["subcorpora"].values())
-            sub_prv = sum(s["proved"] for s in corp["subcorpora"].values())
-            sub_unp = sum(s["lowered_unproved"] for s in corp["subcorpora"].values())
-            sub_rej = sum(s["rejected"] for s in corp["subcorpora"].values())
-            sub_rnl = sum(s.get("rejected_not_lowered", 0) for s in corp["subcorpora"].values())
-            if (sub_tot, sub_prv, sub_unp, sub_rej, sub_rnl) != (
-                tot,
-                corp["proved"],
-                corp["lowered_unproved"],
-                corp["rejected"],
-                corp.get("rejected_not_lowered", 0),
-            ):
-                errors.append(f"Corpus `{cname}` subcorpora totals do not sum to corpus totals")
+            subs = corp["subcorpora"]
+            if not isinstance(subs, dict):
+                errors.append(
+                    f"Corpus `{cname}` subcorpora must be a JSON object, got {type(subs).__name__}"
+                )
+            else:
+                for sname, sc in subs.items():
+                    if not isinstance(sc, dict):
+                        errors.append(
+                            f"Corpus `{cname}` subcorpus `{sname}` must be a JSON object, "
+                            f"got {type(sc).__name__}"
+                        )
+                    elif "subcorpora" in sc:
+                        errors.append(
+                            f"Corpus `{cname}` subcorpus `{sname}` carries subcorpora at "
+                            f"unsupported depth (only corpus -> subcorpora is supported)"
+                        )
+                sub_ints = all(
+                    isinstance(sc, dict) and all(f in sc for f in RESULT_FIELDS)
+                    for sc in subs.values()
+                )
+                if not sub_ints:
+                    errors.append(
+                        f"Corpus `{cname}` subcorpora do not all carry the measured fields"
+                    )
+                else:
+                    sub_tot = sum(s["total_declarations"] for s in subs.values())
+                    sub_prv = sum(s["proved"] for s in subs.values())
+                    sub_unp = sum(s["lowered_unproved"] for s in subs.values())
+                    sub_rej = sum(s["rejected"] for s in subs.values())
+                    sub_rnl = sum(s.get("rejected_not_lowered", 0) for s in subs.values())
+                    if (sub_tot, sub_prv, sub_unp, sub_rej, sub_rnl) != (
+                        tot,
+                        corp["proved"],
+                        corp["lowered_unproved"],
+                        corp["rejected"],
+                        corp.get("rejected_not_lowered", 0),
+                    ):
+                        errors.append(
+                            f"Corpus `{cname}` subcorpora totals do not sum to corpus totals"
+                        )
 
     baseline_doc = results
     if baseline_doc is None and require_results:
@@ -1490,7 +1529,12 @@ def check_coverage_report(
                 # External Batteries stays unknown and is not compared.
                 continue
             if corp.get("measurement_source") in ("not_measured", "error"):
-                if corp.get("measurement_source") == "not_measured":
+                # A live corpus that is absent from the baseline can be an honest
+                # skip; a baseline entry is reconciled in the loop below.
+                if (
+                    corp.get("measurement_source") == "not_measured"
+                    and cname not in base_corpora
+                ):
                     skipped_corpora.append(cname)
                 continue
             if cname not in base_corpora:
@@ -1554,12 +1598,30 @@ def check_coverage_report(
                         f"Corpus `{cname}` has subcorpus `{sname}` in scripts/lcnf_coverage_results.json "
                         f"but the live report does not"
                     )
-        for cname in base_corpora:
+        for cname, base_c in base_corpora.items():
             live_c = live_corpora.get(cname)
             if live_c is None:
                 errors.append(f"Corpus `{cname}` is in scripts/lcnf_coverage_results.json but missing from live report")
-            elif live_c.get("measurement_source") == "not_measured" and cname not in skipped_corpora:
-                skipped_corpora.append(cname)
+                continue
+            if not isinstance(base_c, dict):
+                continue  # already named by validate_results_document
+            if base_c.get("measurement_source") == "not_measured":
+                # An honest baseline stub matching a live not_measured report is
+                # an intentional skip (e.g. an external corpus deliberately absent).
+                if live_c.get("measurement_source") == "not_measured" and cname not in skipped_corpora:
+                    skipped_corpora.append(cname)
+                continue
+            live_source = live_c.get("measurement_source")
+            if live_source == "not_measured":
+                errors.append(
+                    f"Corpus `{cname}` is measured in scripts/lcnf_coverage_results.json "
+                    f"but not_measured live; refusing to skip a baseline with counts"
+                )
+            elif live_source == "error":
+                errors.append(
+                    f"Corpus `{cname}` is measured in scripts/lcnf_coverage_results.json "
+                    f"but the live measurement errored; refusing to skip a baseline with counts"
+                )
 
     if verify_live:
         live = execute_live_lean_audit(root_dir)
