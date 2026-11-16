@@ -905,7 +905,8 @@ private def runReferenceProbesIO (baseText : String) (refDefs : List RefProbeDef
     (skipDefs : List SkipProbeDef) : IO (List (String × Except String Nat)) := do
   let ms ← IO.monoMsNow
   let salt ← IO.rand 0 4294967295
-  let pathStr := s!".eval-lcnf-refprobes-{ms}-{salt}.tmp"
+  let tmpBase := (← IO.getEnv "TMPDIR").getD "/tmp"
+  let pathStr := s!"{tmpBase}/.eval-lcnf-refprobes-{ms}-{salt}.tmp"
   let fullName (ns defName : String) : String :=
     if ns.isEmpty then defName else s!"{ns}.{defName}"
   let items : List (String × String × String) :=
