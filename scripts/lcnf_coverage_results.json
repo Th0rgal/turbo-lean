@@ -1,5 +1,5 @@
 {
-  "commit": "4e0f2f2069f97d647433387490638ac970722538",
+  "commit": "3c68dc810fcf5dc7103ed75bb052d9ca11053d85",
   "corpora": {
     "c1_corpus": {
       "lowered_unproved": 98,
@@ -28,7 +28,7 @@
       "total_declarations": 1805
     }
   },
-  "generating_commit": "4e0f2f2069f97d647433387490638ac970722538",
+  "generating_commit": "3c68dc810fcf5dc7103ed75bb052d9ca11053d85",
   "schemaVersion": "turbo-lean-lcnf-coverage-results-v1",
   "toolchain": "leanprover/lean4:v4.35.0"
 }
