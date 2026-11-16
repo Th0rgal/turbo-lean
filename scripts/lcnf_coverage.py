@@ -1719,6 +1719,106 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertGreater(grown["rejected"], base["rejected"])
         self.assertEqual(grown["proved"], base["proved"])
 
+    def test_con_leche_unmapped_pinned_revision_is_named_error(self) -> None:
+        # Round-2 Point 1 (case 1): pinned con-leche revision missing from
+        # CON_LECHE_PINNED_MODULE_COUNTS -> named error and non-zero exit.
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        self.assertIn(PINNED_CON_LECHE_REV, getattr(m, "CON_LECHE_PINNED_MODULE_COUNTS", {}))
+        _CON_LECHE_CACHE.clear()
+        with mock.patch.object(m, "PINNED_CON_LECHE_REV", "deadbeef" * 5):
+            unmapped = measure_con_leche(ROOT_DIR)
+            chk_unmapped = check_coverage_report(
+                ROOT_DIR,
+                {**build_coverage_report(ROOT_DIR), "corpora": {"con_leche_h3_benchmark": unmapped}},
+            )
+        self.assertEqual(unmapped.get("measurement_source"), "error")
+        self.assertEqual(unmapped.get("error_code"), "unmapped_pinned_con_leche_revision")
+        self.assertFalse(chk_unmapped["ok"])
+        self.assertTrue(
+            any("unmapped_pinned_con_leche_revision" in e for e in chk_unmapped["errors"]),
+            chk_unmapped["errors"],
+        )
+
+    def test_con_leche_full_tree_module_count_mismatch_is_named_error(self) -> None:
+        # Round-2 Point 1 (case 2): a full built tree at the pinned revision whose
+        # module count differs from CON_LECHE_PINNED_MODULE_COUNTS[rev] -> named error, non-zero exit.
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        self.assertTrue(hasattr(m, "CON_LECHE_PINNED_MODULE_COUNTS"))
+        with tempfile.TemporaryDirectory(prefix="cl-full-mismatch-") as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            build_dir = root / ".lake" / "build"
+            lib = build_dir / "lib" / "lean"
+            (lib / "ConLeche" / "Kernel").mkdir(parents=True)
+            for name in ("Name", "Expr", "NatOpPins"):
+                (lib / "ConLeche" / "Kernel" / f"{name}.olean").write_bytes(b"")
+            (build_dir / "bin").mkdir(parents=True)
+            (build_dir / "bin" / "con-leche").write_bytes(b"")
+            saved = os.environ.get(CON_LECHE_OLEANS_ENV)
+            os.environ[CON_LECHE_OLEANS_ENV] = str(lib)
+            try:
+                _CON_LECHE_CACHE.clear()
+                with mock.patch.object(
+                    m, "_git_head", return_value=PINNED_CON_LECHE_REV
+                ), mock.patch.dict(m.CON_LECHE_PINNED_MODULE_COUNTS, {PINNED_CON_LECHE_REV: 3}):
+                    full_mismatch = measure_con_leche(ROOT_DIR)
+            finally:
+                if saved is None:
+                    os.environ.pop(CON_LECHE_OLEANS_ENV, None)
+                else:
+                    os.environ[CON_LECHE_OLEANS_ENV] = saved
+        self.assertEqual(full_mismatch.get("measurement_source"), "error")
+        self.assertEqual(full_mismatch.get("error_code"), "con_leche_module_count_mismatch")
+        chk_mismatch = check_coverage_report(
+            ROOT_DIR,
+            {**build_coverage_report(ROOT_DIR), "corpora": {"con_leche_h3_benchmark": full_mismatch}},
+        )
+        self.assertFalse(chk_mismatch["ok"])
+        self.assertTrue(
+            any("con_leche_module_count_mismatch" in e for e in chk_mismatch["errors"]),
+            chk_mismatch["errors"],
+        )
+
+    def test_con_leche_absent_or_partial_tree_stays_not_measured(self) -> None:
+        # Round-2 Point 1 (case 3): an absent or partial tree stays `not_measured` (exit 0)
+        # while CON_LECHE_PINNED_MODULE_COUNTS maps the pinned revision.
+        import unittest.mock as mock
+
+        m = sys.modules[__name__]
+        self.assertIn(PINNED_CON_LECHE_REV, getattr(m, "CON_LECHE_PINNED_MODULE_COUNTS", {}))
+        with tempfile.TemporaryDirectory(prefix="cl-absent-partial-") as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            lib = root / ".lake" / "build" / "lib" / "lean"
+            (lib / "ConLeche" / "Kernel").mkdir(parents=True)
+            for name in ("Name", "Expr", "NatOpPins"):
+                (lib / "ConLeche" / "Kernel" / f"{name}.olean").write_bytes(b"")
+            saved = os.environ.get(CON_LECHE_OLEANS_ENV)
+            try:
+                os.environ[CON_LECHE_OLEANS_ENV] = str(lib)
+                _CON_LECHE_CACHE.clear()
+                with mock.patch.object(m, "_git_head", return_value=PINNED_CON_LECHE_REV):
+                    partial = measure_con_leche(ROOT_DIR)
+                os.environ[CON_LECHE_OLEANS_ENV] = str(root / "nonexistent")
+                _CON_LECHE_CACHE.clear()
+                absent = measure_con_leche(ROOT_DIR)
+            finally:
+                if saved is None:
+                    os.environ.pop(CON_LECHE_OLEANS_ENV, None)
+                else:
+                    os.environ[CON_LECHE_OLEANS_ENV] = saved
+        for res in (partial, absent):
+            self.assertEqual(res.get("measurement_source"), "not_measured")
+            chk = check_coverage_report(
+                ROOT_DIR,
+                {**build_coverage_report(ROOT_DIR), "corpora": {"con_leche_h3_benchmark": res}},
+            )
+            self.assertTrue(chk["ok"], chk["errors"])
+
 
 
 def main() -> int:
