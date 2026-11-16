@@ -519,9 +519,11 @@ CORPUS_SCOPES: dict[str, str] = {
     "c1_corpus": (
         "Non-aux compiled LCNF declarations of the 8 blocking Tier C1 3-way run test suites "
         "(`C1_CORPUS_TESTS` in `scripts/test_scalar_frontend.py`): generated seed declaration "
-        "batches, preamble helper declarations, Stage-1B declarations, negative fail-closed "
-        "boundary declarations, and compiler-generated `_closed` helpers expanded by "
-        "`expandCompilerAuxDecls`. Compiled dynamically into a temporary module tree at run time."
+        "batches, preamble helper declarations, Stage-1B declarations, and negative fail-closed "
+        "boundary declarations. Compiler-generated auxiliary declarations (e.g. lambda-lifted "
+        "`_closed` helpers) are excluded by `isCompilerGeneratedAuxDecl`; they are neither "
+        "measured nor expanded, and no auxiliary expansion is performed by this measurement. "
+        "Compiled dynamically into a temporary module tree at run time."
     ),
 }
 
@@ -579,35 +581,47 @@ def toImpureDecls (env : Environment) (decls : Array (Decl .pure)) : IO (Array (
     return impDecls)
   match res with
   | .ok d => return d
-  | .error _ => return #[]
+  | .error e => throw (IO.userError s!"module toImpure conversion failed: {e}")
 
 unsafe def auditMods (env : Environment) (mods : Array Name) : IO (Nat × Nat × Nat × Nat × Nat) := do
-  let mut tot := 0; let mut prv := 0; let mut unp := 0; let mut rej := 0; let mut cyc := 0
+  -- Fail closed: a module that cannot be converted to impure IR must fail the
+  -- audit loudly, never contribute a silent zero, and a module missing from
+  -- the imported environment must be named. The corpus-wide declaration set
+  -- (across ALL measured modules) drives the local-callee classification, the
+  -- call graph, and the bridge context, so a call to a user function declared
+  -- in another measured module is classified exactly like a same-module call
+  -- (a vacuous local call), matching the eval `unsupportedCall` vacuity of
+  -- `lowerRealLCNFDecl_sound` instead of being rejected or counted proved.
+  let mut corpusDecls : Array (Name × Decl .impure) := #[]
   for modName in mods do
-    if let some modIdx := env.getModuleIdx? modName then
-      let mdecls := monoExt.getModuleEntries env modIdx
-      let impDecls ← toImpureDecls env mdecls
-      let impNonAux := impDecls.filter (fun d => !isCompilerGeneratedAuxDecl env d.name)
-      let modNames := impNonAux.map (·.name)
-      let mut localSet : Std.HashSet Name := {}
-      for n in modNames do localSet := localSet.insert n
-      let mut callGraph : Std.HashMap Name (List Name) := {}
-      for d in impNonAux do
-        if let .code c := d.value then
-          callGraph := callGraph.insert d.name ((collectCodeLocalCallees modNames c).filter (· != d.name))
-      for d in impNonAux do
-        tot := tot + 1
-        if declInMutualCycle callGraph d.name then
-          rej := rej + 1
-          cyc := cyc + 1
-        else
-          let r ← runCoreOnEnv env (ingestLCNFImpureDecl d modNames .x86_64 true)
-          match r with
-          | .ok _ =>
-            let hasCall := match d.value with | .code c => codeHasLocalCall localSet c | .extern _ => false
-            if hasCall then unp := unp + 1 else prv := prv + 1
-          | .error _ =>
-            rej := rej + 1
+    let some modIdx := env.getModuleIdx? modName
+      | throw (IO.userError s!"audit module `{modName}` not found in the imported environment")
+    let mdecls := monoExt.getModuleEntries env modIdx
+    let impDecls ← toImpureDecls env mdecls
+    let impNonAux := impDecls.filter (fun d => !isCompilerGeneratedAuxDecl env d.name)
+    for d in impNonAux do
+      corpusDecls := corpusDecls.push (modName, d)
+  let corpusNames := corpusDecls.map (·.2.name)
+  let mut localSet : Std.HashSet Name := {}
+  for n in corpusNames do localSet := localSet.insert n
+  let mut callGraph : Std.HashMap Name (List Name) := {}
+  for (_, d) in corpusDecls do
+    if let .code c := d.value then
+      callGraph := callGraph.insert d.name ((collectCodeLocalCallees corpusNames c).filter (· != d.name))
+  let mut tot := 0; let mut prv := 0; let mut unp := 0; let mut rej := 0; let mut cyc := 0
+  for (_, d) in corpusDecls do
+    tot := tot + 1
+    if declInMutualCycle callGraph d.name then
+      rej := rej + 1
+      cyc := cyc + 1
+    else
+      let r ← runCoreOnEnv env (ingestLCNFImpureDecl d corpusNames .x86_64 true)
+      match r with
+      | .ok _ =>
+        let hasCall := match d.value with | .code c => codeHasLocalCall localSet c | .extern _ => false
+        if hasCall then unp := unp + 1 else prv := prv + 1
+      | .error _ =>
+        rej := rej + 1
   return (tot, prv, unp, rej, cyc)
 """
 
