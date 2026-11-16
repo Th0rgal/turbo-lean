@@ -236,6 +236,30 @@ class BaselineSchema(unittest.TestCase):
         base2["workloads"].pop("batteries_unionfind_top")
         self.assertTrue(mod.validate_baseline(base2))
 
+    def test_turbo_lean_dirty_marker_must_be_present_and_exactly_boolean_false(self):
+        """DeepSeek review: `is True` accepts missing key, null, "true", numbers."""
+        mod = load_script()
+        base = full_valid_baseline(mod)
+        self.assertEqual(mod.validate_baseline(base), [])  # control: valid false
+
+        missing = json.loads(json.dumps(base))
+        missing.pop("turbo_lean_dirty")
+        errs = mod.validate_baseline(missing)
+        self.assertTrue(any(e.startswith("baseline_missing_turbo_lean_dirty")
+                            for e in errs), errs)
+
+        for bad in (None, "true", "false", "True", 1, 0, 1.0, ["false"], {"dirty": False}):
+            broken = json.loads(json.dumps(base))
+            broken["turbo_lean_dirty"] = bad
+            errs = mod.validate_baseline(broken)
+            self.assertTrue(any(e.startswith("baseline_invalid_turbo_lean_dirty")
+                                for e in errs), (bad, errs))
+
+        dirty = json.loads(json.dumps(base))
+        dirty["turbo_lean_dirty"] = True
+        errs = mod.validate_baseline(dirty)
+        self.assertTrue(any("baseline_dirty_tree" in e for e in errs), errs)
+
 
 class Comparison(unittest.TestCase):
     def setUp(self):
@@ -1068,6 +1092,41 @@ class ComparabilityAndProvenance(unittest.TestCase):
             r = run_bench(Path(td), ["--baseline", str(bp), "--out", str(Path(td) / "o.json")])
             self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertIn("dirty", r.stderr)
+
+    def test_validate_only_cli_rejects_dirty_marker_that_is_not_boolean_false(self):
+        """DeepSeek review: --validate-only passed null and string "true" markers."""
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-validate-only-") as td:
+            def cli(name, mutate):
+                base = full_valid_baseline(mod)
+                mutate(base)
+                p = Path(td) / f"{name}.json"
+                p.write_text(json.dumps(base))
+                return subprocess.run(
+                    [sys.executable, str(SCRIPT), "--validate-only", str(p)],
+                    capture_output=True, text=True, timeout=300)
+
+            ok = cli("valid", lambda b: None)
+            self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+            self.assertIn("OK:", ok.stdout)
+
+            for name, mutate, fragment in (
+                    ("string_true", lambda b: b.__setitem__("turbo_lean_dirty", "true"),
+                     "baseline_invalid_turbo_lean_dirty"),
+                    ("null", lambda b: b.__setitem__("turbo_lean_dirty", None),
+                     "baseline_invalid_turbo_lean_dirty"),
+                    ("number", lambda b: b.__setitem__("turbo_lean_dirty", 1),
+                     "baseline_invalid_turbo_lean_dirty"),
+                    ("missing", lambda b: b.pop("turbo_lean_dirty"),
+                     "baseline_missing_turbo_lean_dirty"),
+                    ("bool_true", lambda b: b.__setitem__("turbo_lean_dirty", True),
+                     "baseline_dirty_tree")):
+                r = cli(name, mutate)
+                self.assertNotEqual(r.returncode, 0, (name, r.stdout + r.stderr))
+                self.assertIn(fragment, r.stdout + r.stderr, name)
+
+            valid_false = cli("valid_false", lambda b: b.__setitem__("turbo_lean_dirty", False))
+            self.assertEqual(valid_false.returncode, 0, valid_false.stdout + valid_false.stderr)
 
     def test_workload_rev_mismatch_refuses_comparison_nonzero_and_prints_both(self):
         mod = load_script()
