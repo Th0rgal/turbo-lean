@@ -110,7 +110,10 @@ def sample_baseline(mod, **overrides):
               "kernel": "Linux 6.8", "cpu_model": "test-cpu", "nproc": 8, "mem_gb": 62},
         trials=5,
         settings={"TURBO_LEAN_GIT": "/fake/git", "TURBO_LEAN_ALLOWED_CSIMP": "*",
-                  "TURBO_LEAN_ALLOWED_UNSAFE": "*", "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY": "*"},
+                  "TURBO_LEAN_ALLOWED_UNSAFE": "*", "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY": "*",
+                  **{v: None for v in ("TURBO_LEAN_HOME", "TURBO_LEAN_STAGING_DIR",
+                                       "TURBO_LEAN_NO_DAEMON", "TURBO_LEAN_NO_REMOTE_TELEMETRY",
+                                       "TURBO_LEAN_TELEMETRY", "TURBO_LEAN_DAEMON_IDLE_SECS")}},
         workloads={w["id"]: mod.empty_workload_result(w) for w in mod.WORKLOADS},
     )
 
@@ -587,10 +590,15 @@ class ImprovementSide(unittest.TestCase):
             if False else self.assertIn("0 regressed, 15 improved, 0 unchanged", v2["summary"])
 
     def test_per_cell_lines_and_summary_are_printed(self):
-        import platform
         with tempfile.TemporaryDirectory(prefix="m1-imp-") as td:
+            # Baseline provenance (host + recorded settings) must match this
+            # run exactly, so derive both from a first --no-baseline run.
+            r0 = run_bench(Path(td), ["--no-baseline", "--out", str(Path(td) / "o0.json")])
+            self.assertEqual(r0.returncode, 0, r0.stdout + r0.stderr)
+            o0 = json.loads((Path(td) / "o0.json").read_text())
             base = full_valid_baseline(self.mod)
-            base["host"]["hostname"] = platform.node()  # same-host comparison
+            base["host"]["hostname"] = o0["host"]["hostname"]
+            base["settings"] = dict(o0["settings"])
             bp = Path(td) / "b.json"
             bp.write_text(json.dumps(base))
             r = run_bench(Path(td), ["--baseline", str(bp), "--out", str(Path(td) / "o.json")])
