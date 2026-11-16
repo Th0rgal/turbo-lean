@@ -1,0 +1,34 @@
+{
+  "commit": "eee1efd63ee329d2d13ac21641d4aca55fed2141",
+  "corpora": {
+    "batteries_and_c2": {
+      "lowered_unproved": 72,
+      "proved": 29,
+      "rejected": 1704,
+      "subcorpora": {
+        "c2_lake_packages": {
+          "lowered_unproved": 7,
+          "proved": 13,
+          "rejected": 12,
+          "total_declarations": 32
+        },
+        "std_init_data": {
+          "lowered_unproved": 65,
+          "proved": 16,
+          "rejected": 1692,
+          "total_declarations": 1773
+        }
+      },
+      "total_declarations": 1805
+    },
+    "c1_corpus": {
+      "lowered_unproved": 98,
+      "proved": 782,
+      "rejected": 22,
+      "total_declarations": 902
+    }
+  },
+  "generating_commit": "eee1efd63ee329d2d13ac21641d4aca55fed2141",
+  "schemaVersion": "turbo-lean-lcnf-coverage-results-v1",
+  "toolchain": "leanprover/lean4:v4.35.0"
+}

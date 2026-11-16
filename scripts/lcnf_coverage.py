@@ -50,6 +50,8 @@ PINNED_CON_LECHE_REV = "501589f5680d9599dee1bcef30a420bc8924c490"
 # Where a prebuilt, pinned con-leche `.olean` tree may be found. The pin is the
 # `verification/con-leche-bridge` one; nothing is fetched or built here.
 CON_LECHE_OLEANS_ENV = "TURBO_CON_LECHE_OLEANS"
+RESULTS_FILE = ROOT_DIR / "scripts" / "lcnf_coverage_results.json"
+RESULT_FIELDS = ("total_declarations", "proved", "lowered_unproved", "rejected")
 CON_LECHE_MODULE_PREFIXES = ("ConLeche.Kernel", "ConLeche.Cached", "ConLeche.Frontend", "ConLeche.Driver")
 CON_LECHE_EXCLUDED_MODULES = frozenset({"ConLeche.Kernel.NatOpPins"})
 _LIVE_AUDIT_CACHE: dict[str, dict[str, Any]] = {}
@@ -826,7 +828,11 @@ def execute_live_lean_audit(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
             pkg_dir = root_dir / "verification" / "c2-lake-packages" / pkg
             lib_dir = pkg_dir / ".lake" / "build" / "lib" / "lean"
             if not lib_dir.is_dir():
+                manifest = pkg_dir / "lake-manifest.json"
+                had_manifest = manifest.exists()
                 subprocess.run(["lake", "build"], cwd=str(pkg_dir), env=env, check=True, capture_output=True, text=True)
+                if not had_manifest and manifest.exists():
+                    manifest.unlink()
             c2_lib_dirs.append(str(lib_dir))
 
         proc = subprocess.run(
@@ -1093,12 +1099,38 @@ def build_coverage_report(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     }
 
 
+def results_document(report: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[str, Any]:
+    """Build the committed baseline (`scripts/lcnf_coverage_results.json`) from a live report."""
+    head = _git_head(root_dir)
+    corpora: dict[str, Any] = {}
+    for cname, corp in report.get("corpora", {}).items():
+        if corp.get("status") == "unknown" or corp.get("measurement_source") != "live_invocation":
+            continue
+        entry: dict[str, Any] = {f: corp[f] for f in RESULT_FIELDS if f in corp}
+        if "subcorpora" in corp:
+            entry["subcorpora"] = {
+                sname: {f: sc[f] for f in RESULT_FIELDS if f in sc}
+                for sname, sc in corp["subcorpora"].items()
+            }
+        corpora[cname] = entry
+    return {
+        "schemaVersion": "turbo-lean-lcnf-coverage-results-v1",
+        "toolchain": PINNED_TOOLCHAIN,
+        "commit": head,
+        "generating_commit": head,
+        "corpora": corpora,
+    }
+
+
 def check_coverage_report(
     root_dir: Path = ROOT_DIR,
     report: dict[str, Any] | None = None,
     verify_live: bool = False,
+    results: dict[str, Any] | None = None,
+    require_results: bool = False,
 ) -> dict[str, Any]:
     errors: list[str] = []
+    skipped_corpora: list[str] = []
     rep = report if report is not None else build_coverage_report(root_dir)
 
     for rel, info in rep.get("bridge_source_digests", {}).items():
@@ -1131,10 +1163,16 @@ def check_coverage_report(
 
     for cname, corp in rep.get("corpora", {}).items():
         source = corp.get("measurement_source")
+        if corp.get("status") == "unknown":
+            if not corp.get("reason"):
+                errors.append(f"Corpus `{cname}` is unknown but gives no reason")
+            if any(k in corp for k in RESULT_FIELDS):
+                errors.append(f"Corpus `{cname}` is unknown yet carries declaration counts")
+            continue
         if source == "not_measured":
             if not corp.get("reason"):
                 errors.append(f"Corpus `{cname}` is not measured but gives no reason")
-            if any(k in corp for k in ("total_declarations", "proved", "lowered_unproved", "rejected")):
+            if any(k in corp for k in RESULT_FIELDS):
                 errors.append(f"Corpus `{cname}` is not measured yet carries declaration counts")
             continue
         if source != "live_invocation":
@@ -1158,18 +1196,66 @@ def check_coverage_report(
                 corp["rejected"],
             ):
                 errors.append(f"Corpus `{cname}` subcorpora totals do not sum to corpus totals")
+
+    baseline_doc = results
+    if baseline_doc is None and require_results:
+        results_path = root_dir / "scripts" / "lcnf_coverage_results.json"
+        if not results_path.is_file():
+            errors.append(f"Missing committed results file: {results_path.relative_to(root_dir)}")
+        else:
+            baseline_doc = json.loads(results_path.read_text(encoding="utf-8"))
+
+    if baseline_doc is not None:
+        if baseline_doc.get("toolchain") != PINNED_TOOLCHAIN:
+            errors.append(
+                f"Results file toolchain mismatch: file={baseline_doc.get('toolchain')!r} "
+                f"live={PINNED_TOOLCHAIN!r}"
+            )
+        if not baseline_doc.get("commit"):
+            errors.append("Results file is missing the commit it was generated at")
+        base_corpora = baseline_doc.get("corpora", {})
+        live_corpora = rep.get("corpora", {})
+        for cname, corp in live_corpora.items():
+            if corp.get("status") == "unknown":
+                # External Batteries stays unknown and is not compared.
+                continue
+            if corp.get("measurement_source") == "not_measured":
+                skipped_corpora.append(cname)
+                continue
+            if cname not in base_corpora:
+                errors.append(f"Corpus `{cname}` was measured live but is missing from scripts/lcnf_coverage_results.json")
+                continue
+            base_c = base_corpora[cname]
+            diffs = [f for f in RESULT_FIELDS if base_c.get(f) != corp.get(f)]
+            if diffs:
+                side_summary = ", ".join(
+                    f"{f}={base_c.get(f)} vs {corp.get(f)}" for f in RESULT_FIELDS
+                )
+                errors.append(
+                    f"Corpus `{cname}` differs from scripts/lcnf_coverage_results.json "
+                    f"(file vs live): {side_summary}"
+                )
+        for cname in base_corpora:
+            live_c = live_corpora.get(cname)
+            if live_c is None:
+                errors.append(f"Corpus `{cname}` is in scripts/lcnf_coverage_results.json but missing from live report")
+            elif live_c.get("measurement_source") == "not_measured" and cname not in skipped_corpora:
+                skipped_corpora.append(cname)
+
     if verify_live:
         live = execute_live_lean_audit(root_dir)
         if not live.get("executed", False):
             errors.append(f"Live Lean lowerer execution failed: {live.get('reason', 'unknown')}")
         else:
             for cname in ("batteries_and_c2", "c1_corpus"):
+                if cname not in live:
+                    continue
                 c_rep = rep.get("corpora", {}).get(cname, {})
                 c_live = live[cname]
                 if c_rep.get("measurement_source") != "live_invocation":
                     errors.append(f"Corpus `{cname}` has no live measurement to compare")
                     continue
-                for field in ("total_declarations", "proved", "lowered_unproved", "rejected"):
+                for field in RESULT_FIELDS:
                     if c_rep[field] != c_live[field]:
                         errors.append(
                             f"Corpus `{cname}` live execution mismatch on `{field}`: "
@@ -1184,7 +1270,7 @@ def check_coverage_report(
                     f"run cannot measure it: {c_fresh.get('reason', 'unknown')}"
                 )
             else:
-                for field in ("total_declarations", "proved", "lowered_unproved", "rejected"):
+                for field in RESULT_FIELDS:
                     if c_rep[field] != c_fresh[field]:
                         errors.append(
                             f"Corpus `con_leche_h3_benchmark` live execution mismatch on `{field}`: "
@@ -1194,6 +1280,7 @@ def check_coverage_report(
     return {
         "ok": len(errors) == 0,
         "errors": errors,
+        "skipped_corpora": skipped_corpora,
         "report": rep,
     }
 
@@ -1479,7 +1566,12 @@ class TestLcnfCoverage(unittest.TestCase):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--json", action="store_true", help="Emit full coverage report JSON to stdout")
-    ap.add_argument("--check", action="store_true", help="Verify bridge digests, symbols, and live lowerer execution")
+    ap.add_argument("--check", action="store_true", help="Verify bridge digests, symbols, and live lowerer execution against committed results")
+    ap.add_argument(
+        "--write-results",
+        action="store_true",
+        help="Write the live measurement to scripts/lcnf_coverage_results.json",
+    )
     ap.add_argument("--self-test", action="store_true", help="Run embedded unit tests")
     args = ap.parse_args()
 
@@ -1488,7 +1580,20 @@ def main() -> int:
         res = unittest.TextTestRunner(verbosity=2).run(suite)
         return 0 if res.wasSuccessful() else 1
 
-    chk = check_coverage_report(ROOT_DIR)
+    if args.write_results and args.check:
+        print("  [ERROR] --write-results and --check are mutually exclusive", file=sys.stderr)
+        return 2
+
+    chk = check_coverage_report(ROOT_DIR, require_results=args.check)
+    if args.write_results:
+        RESULTS_FILE.write_text(
+            json.dumps(results_document(chk["report"], ROOT_DIR), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(f"[lcnf-coverage] wrote {RESULTS_FILE.relative_to(ROOT_DIR)}", file=sys.stderr)
+        if not args.json:
+            return 0 if chk["ok"] else 1
+
     if args.json or not args.check:
         out = dict(chk["report"])
         out["ok"] = chk["ok"]
@@ -1514,7 +1619,7 @@ def main() -> int:
                     f"(+{corp['lowered_unproved']} vacuous_local_call)"
                 )
             else:
-                parts.append(f"{label}=not measured")
+                parts.append(f"{label}=skipped (not measured)")
         print(" ".join(parts))
     if not chk["ok"]:
         for err in chk["errors"]:
