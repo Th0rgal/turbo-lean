@@ -130,6 +130,7 @@ flowchart LR
     L3 --> H14[H1.4 mutants + pin]
   end
   H14 --> H3[H3 ladder]
+  S2 --> S3b
   S3b --> P9
 ```
 
