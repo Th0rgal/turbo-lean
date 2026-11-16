@@ -17353,4 +17353,56 @@ theorem simp_blowup (n : Nat) : stepId n = 1 := by
 
         let _ = fs::remove_dir_all(&tmp_dir);
     }
+
+    #[test]
+    fn test_s2_zygote_public_api_surface_pinned() {
+        let _ = std::mem::size_of::<crate::zygote::TimeoutHotspot>();
+        let _ = std::mem::size_of::<crate::zygote::SimpHotspot>();
+        let _ = std::mem::size_of::<crate::zygote::ZygoteEvalReply>();
+        let _ = std::mem::size_of::<crate::zygote::ZygoteWorkerProcess>();
+        let _ = std::mem::size_of::<crate::zygote::OleanPublicDeclSig>();
+        let _ = std::mem::size_of::<crate::zygote::OleanPublicSignatureReply>();
+        let _ = std::mem::size_of::<crate::zygote::OneShotGuard>();
+        let _ = std::mem::size_of::<crate::zygote::ExclusiveLifecycleLock>();
+        let _ = std::mem::size_of::<crate::zygote::OleanFileStatSig>();
+        let _ = std::mem::size_of::<crate::zygote::OleanEntryDigest>();
+        let _ = std::mem::size_of::<crate::zygote::ClosureSnapshot>();
+        let _ = std::mem::size_of::<crate::zygote::MaterializedClosure>();
+        let _ = std::mem::size_of::<crate::zygote::ClosureBinding>();
+        let _ = std::mem::size_of::<crate::zygote::ZygoteAuditModulesReply>();
+        let _ = std::mem::size_of::<crate::zygote::PinnedFfiPackage>();
+        let _ = std::mem::size_of::<crate::zygote::AuditedShardReport>();
+        let _ = std::mem::size_of::<crate::zygote::ResolvedZygoteContext>();
+        let _ = std::mem::size_of::<crate::zygote::LocalZygoteDaemonInfo>();
+        let _ = std::mem::size_of::<crate::zygote::McpTimeoutGuard>();
+        let _ = std::mem::size_of::<crate::zygote::LocalPayload>();
+        let _ = std::mem::size_of::<crate::zygote::BoundedLine>();
+        let _ = std::mem::size_of::<crate::zygote::ZygoteImportUnavailable>();
+
+        assert_eq!(crate::zygote::ZYGOTE_SCANNER_VERSION, 5);
+        assert_eq!(crate::zygote::ZYGOTE_REPLAY_VERSION, 3);
+        assert!(crate::zygote::verifier_provenance_ok(5, 3));
+        assert!(!crate::zygote::PINNED_FFI_PACKAGES.is_empty());
+        assert_eq!(crate::zygote::REQUEST_POLICY_KEYS.len(), 4);
+        assert_eq!(crate::zygote::MCP_RUNTIME_POLICY_KEYS.len(), 5);
+        assert_eq!(crate::zygote::MAX_WIRE_LINE_BYTES, 16 * 1024);
+        assert_eq!(crate::zygote::IMPORT_UNAVAILABLE_CODE, "zygote_import_unavailable");
+
+        let _ = crate::zygote::query_lean_native_core_worker as fn(&str, Option<&str>) -> Result<serde_json::Value>;
+        let _ = crate::zygote::measure_process_rss_mb as fn(u32) -> u64;
+        let _ = crate::zygote::govern_machine_wide_zygote_rss as fn(u32, u64);
+        let _ = crate::zygote::reap_zygote_workers_and_daemons as fn(Option<&Path>) -> usize;
+        let _ = crate::zygote::compute_imported_oleans_digest as fn(&str, &str) -> String;
+        let _ = crate::zygote::compute_search_path_oleans_digest as fn(&str) -> String;
+        let _ = crate::zygote::split_body_into_prefix_and_decl as fn(&str) -> Option<(String, String, String)>;
+        let _ = crate::zygote::split_eval_body_into_prefix_and_cmds as fn(&str) -> Option<(String, String, String)>;
+        let _ = crate::zygote::parse_zygote_import_entry as fn(&str) -> Option<(String, bool, bool, bool)>;
+        let _ = crate::zygote::split_shard_for_zygote as fn(&str) -> (String, String);
+        let _ = crate::zygote::reply_indicates_timeout_or_heartbeat as fn(&ZygoteEvalReply) -> bool;
+        let _ = crate::zygote::text_indicates_timeout_or_heartbeat as fn(&str) -> bool;
+        let _ = crate::zygote::ensure_local_zygote_daemon
+            as fn(&TurboStore, &std::collections::HashMap<String, String>) -> Option<String>;
+        let _ = crate::zygote::warm_local_zygote_daemon_nonblocking
+            as fn(&TurboStore, &std::collections::HashMap<String, String>);
+    }
 }

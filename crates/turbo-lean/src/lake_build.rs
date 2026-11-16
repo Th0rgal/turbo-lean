@@ -14955,4 +14955,33 @@ public def api := by
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
+
+    #[test]
+    fn test_s2_lake_build_public_api_surface_pinned() {
+        let _ = std::mem::size_of::<crate::lake_build::StandaloneOleanOverlay>();
+        let _ = std::mem::size_of::<crate::lake_build::ImpactReport>();
+        let _ = std::mem::size_of::<crate::lake_build::OleanInterfaceBatchSession>();
+        let _ = std::mem::size_of::<crate::lake_build::ShmCachedFileSplit>();
+        let _ = std::mem::size_of::<crate::lake_build::ShmProjectStatSummary>();
+        let _ = std::mem::size_of::<crate::StandaloneOleanOverlay>();
+        let _ = std::mem::size_of::<crate::ImpactReport>();
+
+        let _ = crate::lake_build::compute_imported_olean_interface_hashes
+            as fn(&str, &Path, Option<&str>) -> Vec<String>;
+        let _ = crate::lake_build::compute_impact_report
+            as fn(PathBuf, Option<PathBuf>, Option<String>) -> Result<ImpactReport>;
+        let _ = crate::lake_build::run_impact_command
+            as fn(bool, PathBuf, Option<PathBuf>, Option<String>) -> Result<()>;
+        let _ = crate::lake_build::dedup_worktree_packages
+            as fn(&TurboStore, &Path) -> Result<serde_json::Value>;
+        let _ = crate::lake_build::run_build_command
+            as fn(&mut TurboStore, bool, Vec<String>, PathBuf, String, i64, bool) -> Result<()>;
+        let _ = crate::lake_build::validate_lnir_expr_v1_blob as fn(&[u8]) -> bool;
+        let _ = crate::lake_build::replay_project_cas_expr_shards
+            as fn(&mut TurboStore, &Path, &str, &str, Option<&[PathBuf]>) -> Result<usize>;
+        let _ = crate::lake_build::run_build_command_with_cas_replay
+            as fn(&mut TurboStore, bool, Vec<String>, PathBuf, String, i64, bool, bool) -> Result<()>;
+        let _ = crate::lake_build::run_hydrate_traces_command as fn(bool, PathBuf) -> Result<()>;
+        assert!(!crate::validate_lnir_expr_v1_blob(b""));
+    }
 }
