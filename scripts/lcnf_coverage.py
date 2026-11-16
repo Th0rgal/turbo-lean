@@ -1445,6 +1445,35 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertNotIn('startsWith "batch_"', _LEAN_AUDIT_DRIVER_HEAD)
         self.assertNotIn("jps > 6", _LEAN_AUDIT_DRIVER_HEAD)
 
+    def test_check_is_a_gate_against_committed_results_file(self) -> None:
+        # Point 2: `--check` must compare the live measurement against the committed
+        # `scripts/lcnf_coverage_results.json` written by `--write-results`, failing
+        # with the corpus name and both sets of counts when they differ, and reporting
+        # unmeasured corpora (con-leche in CI) as skipped while ignoring unknown
+        # external Batteries.
+        results_path = ROOT_DIR / "scripts" / "lcnf_coverage_results.json"
+        self.assertTrue(results_path.is_file(), f"missing committed baseline {results_path}")
+        baseline = json.loads(results_path.read_text(encoding="utf-8"))
+        self.assertEqual(baseline.get("toolchain"), PINNED_TOOLCHAIN)
+        self.assertTrue(baseline.get("commit"))
+        self.assertNotIn("con_leche_h3_benchmark", baseline.get("corpora", {}))
+
+        rep = build_coverage_report(ROOT_DIR)
+        chk_ok = check_coverage_report(ROOT_DIR, rep, results=baseline)
+        self.assertTrue(chk_ok["ok"], chk_ok["errors"])
+        self.assertIn("con_leche_h3_benchmark", chk_ok.get("skipped_corpora", []))
+
+        drifted = json.loads(json.dumps(baseline))
+        first_corpus = next(iter(drifted["corpora"]))
+        drifted["corpora"][first_corpus]["proved"] += 1
+        drifted["corpora"][first_corpus]["rejected"] -= 1
+        chk_bad = check_coverage_report(ROOT_DIR, rep, results=drifted)
+        self.assertFalse(chk_bad["ok"])
+        self.assertTrue(
+            any(first_corpus in e and "proved=" in e for e in chk_bad["errors"]),
+            chk_bad["errors"],
+        )
+
 
 
 def main() -> int:
