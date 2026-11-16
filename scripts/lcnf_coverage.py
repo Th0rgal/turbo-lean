@@ -60,7 +60,15 @@ CON_LECHE_EXCLUSION_REASON = (
     "authored program text; lowering them would measure the wrapper, not the source. "
     "The exclusion is by exact module name and is reported with the module count."
 )
-CON_LECHE_EXPECTED_MODULE_COUNT = 102
+# Pinned con-leche revision -> expected module count after CON_LECHE_EXCLUDED_MODULES.
+# Obtained at commit 501589f5680d9599dee1bcef30a420bc8924c490 by enumerating all `.lean`
+# sources in `git ls-tree -r --name-only 501589f5680d9599dee1bcef30a420bc8924c490` (and
+# matching `.olean` outputs of a full `lake build con-leche`) whose module name is
+# `ConLeche`, `Main`, or starts with `CON_LECHE_MODULE_PREFIXES`, minus `ConLeche.Kernel.NatOpPins`
+# (103 matching modules - 1 excluded = 102).
+CON_LECHE_PINNED_MODULE_COUNTS: dict[str, int] = {
+    "501589f5680d9599dee1bcef30a420bc8924c490": 102,
+}
 _LIVE_AUDIT_CACHE: dict[str, dict[str, Any]] = {}
 _CON_LECHE_CACHE: dict[str, dict[str, Any]] = {}
 
@@ -966,15 +974,46 @@ def _con_leche_modules(olean_root: Path) -> list[str]:
     return sorted(mods)
 
 
+def _is_full_con_leche_build(olean_root: Path) -> bool:
+    """True when `olean_root` sits inside a completed `lake build` that produced the `con-leche` executable."""
+    # Standard Lake layout: `<checkout>/.lake/build/lib/lean` -> sibling `../../bin/con-leche`.
+    for cand in (
+        olean_root.parent.parent / "bin" / "con-leche",
+        olean_root.parent / "bin" / "con-leche",
+    ):
+        if cand.is_file():
+            return True
+    return False
+
+
 def measure_con_leche(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     """Measure the pinned con-leche corpus with the real lowerer, or say why not.
 
     Nothing is fetched or built: the caller points `TURBO_CON_LECHE_OLEANS` at an
-    already-built tree of the pinned revision. Without one, the corpus is reported
-    as `not_measured` and carries no declaration number.
+    already-built tree of the pinned revision. Without one, or on a partial build,
+    the corpus is reported as `not_measured` and carries no declaration number.
+    When `PINNED_CON_LECHE_REV` has no entry in `CON_LECHE_PINNED_MODULE_COUNTS`, or
+    a full built tree at `PINNED_CON_LECHE_REV` has a different module count, this
+    returns `measurement_source = "error"` with a named `error_code`.
     """
+    exclusion = {
+        "excluded_modules": sorted(CON_LECHE_EXCLUDED_MODULES),
+        "reason": CON_LECHE_EXCLUSION_REASON,
+    }
+    expected_count = CON_LECHE_PINNED_MODULE_COUNTS.get(PINNED_CON_LECHE_REV)
+    if expected_count is None:
+        return {
+            "measurement_source": "error",
+            "error_code": "unmapped_pinned_con_leche_revision",
+            "pinned_revision": PINNED_CON_LECHE_REV,
+            "reason": (
+                f"unmapped_pinned_con_leche_revision: PINNED_CON_LECHE_REV={PINNED_CON_LECHE_REV!r} "
+                f"has no expected module count in CON_LECHE_PINNED_MODULE_COUNTS"
+            ),
+            "exclusion": exclusion,
+        }
     olean_root = _con_leche_olean_root(root_dir)
-    cache_key = f"{root_dir.resolve()}|{olean_root}"
+    cache_key = f"{root_dir.resolve()}|{PINNED_CON_LECHE_REV}|{expected_count}|{olean_root}"
     if cache_key in _CON_LECHE_CACHE:
         return _CON_LECHE_CACHE[cache_key]
     if olean_root is None:
@@ -985,11 +1024,8 @@ def measure_con_leche(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
                 f"`lake build` output directory of commit {PINNED_CON_LECHE_REV}; this script "
                 "does not fetch or build that repository."
             ),
-            "expected_module_count": CON_LECHE_EXPECTED_MODULE_COUNT,
-            "exclusion": {
-                "excluded_modules": sorted(CON_LECHE_EXCLUDED_MODULES),
-                "reason": CON_LECHE_EXCLUSION_REASON,
-            },
+            "expected_module_count": expected_count,
+            "exclusion": exclusion,
         }
         _CON_LECHE_CACHE[cache_key] = result
         return result
@@ -1008,42 +1044,51 @@ def measure_con_leche(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
                 f"prebuilt con-leche tree at `{olean_root}` is revision `{rev}`, not the pinned "
                 f"`{PINNED_CON_LECHE_REV}`"
             ),
-            "expected_module_count": CON_LECHE_EXPECTED_MODULE_COUNT,
-            "exclusion": {
-                "excluded_modules": sorted(CON_LECHE_EXCLUDED_MODULES),
-                "reason": CON_LECHE_EXCLUSION_REASON,
-            },
+            "expected_module_count": expected_count,
+            "exclusion": exclusion,
         }
         _CON_LECHE_CACHE[cache_key] = result
         return result
     modules = _con_leche_modules(olean_root)
-    exclusion = {
-        "excluded_modules": sorted(CON_LECHE_EXCLUDED_MODULES),
-        "reason": CON_LECHE_EXCLUSION_REASON,
-    }
     if not modules:
         result = {
             "measurement_source": "not_measured",
             "reason": f"no `ConLeche.*`/`Main` `.olean` modules under `{olean_root}`",
             "module_count": 0,
-            "expected_module_count": CON_LECHE_EXPECTED_MODULE_COUNT,
+            "expected_module_count": expected_count,
             "exclusion": exclusion,
         }
         _CON_LECHE_CACHE[cache_key] = result
         return result
-    if len(modules) != CON_LECHE_EXPECTED_MODULE_COUNT:
-        result = {
-            "measurement_source": "not_measured",
-            "reason": (
-                f"measured module set under `{olean_root}` has {len(modules)} modules, but the "
-                f"pinned revision {PINNED_CON_LECHE_REV} has {CON_LECHE_EXPECTED_MODULE_COUNT} "
-                f"after excluding {', '.join(sorted(CON_LECHE_EXCLUDED_MODULES))} "
-                f"({CON_LECHE_EXCLUSION_REASON}); refusing to measure a partial or stale tree"
-            ),
-            "module_count": len(modules),
-            "expected_module_count": CON_LECHE_EXPECTED_MODULE_COUNT,
-            "exclusion": exclusion,
-        }
+    if len(modules) != expected_count:
+        if _is_full_con_leche_build(olean_root):
+            result = {
+                "measurement_source": "error",
+                "error_code": "con_leche_module_count_mismatch",
+                "commit_sha": PINNED_CON_LECHE_REV,
+                "olean_root": str(olean_root),
+                "module_count": len(modules),
+                "expected_module_count": expected_count,
+                "reason": (
+                    f"con_leche_module_count_mismatch: full con-leche build at `{olean_root}` "
+                    f"(revision {PINNED_CON_LECHE_REV}) has {len(modules)} modules after excluding "
+                    f"{', '.join(sorted(CON_LECHE_EXCLUDED_MODULES))}, expected {expected_count}"
+                ),
+                "exclusion": exclusion,
+            }
+        else:
+            result = {
+                "measurement_source": "not_measured",
+                "reason": (
+                    f"partial con-leche tree under `{olean_root}` has {len(modules)} modules, "
+                    f"whereas pinned revision {PINNED_CON_LECHE_REV} has {expected_count} "
+                    f"after excluding {', '.join(sorted(CON_LECHE_EXCLUDED_MODULES))} "
+                    f"({CON_LECHE_EXCLUSION_REASON}); refusing to measure a partial tree"
+                ),
+                "module_count": len(modules),
+                "expected_module_count": expected_count,
+                "exclusion": exclusion,
+            }
         _CON_LECHE_CACHE[cache_key] = result
         return result
     total, proved, unproved, rejected = _run_audit_driver(
@@ -1056,7 +1101,7 @@ def measure_con_leche(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
         "commit_sha": PINNED_CON_LECHE_REV,
         "olean_root": str(olean_root),
         "module_count": len(modules),
-        "expected_module_count": CON_LECHE_EXPECTED_MODULE_COUNT,
+        "expected_module_count": expected_count,
         "exclusion": exclusion,
         "total_declarations": total,
         "proved": proved,
@@ -1244,6 +1289,12 @@ def check_coverage_report(
             if any(k in corp for k in RESULT_FIELDS):
                 errors.append(f"Corpus `{cname}` is not measured yet carries declaration counts")
             continue
+        if source == "error":
+            code = corp.get("error_code", "corpus_measurement_error")
+            errors.append(
+                f"Corpus `{cname}` error [{code}]: {corp.get('reason', 'no reason given')}"
+            )
+            continue
         if source != "live_invocation":
             errors.append(
                 f"Corpus `{cname}` carries no live measurement: "
@@ -1288,8 +1339,9 @@ def check_coverage_report(
             if corp.get("status") == "unknown":
                 # External Batteries stays unknown and is not compared.
                 continue
-            if corp.get("measurement_source") == "not_measured":
-                skipped_corpora.append(cname)
+            if corp.get("measurement_source") in ("not_measured", "error"):
+                if corp.get("measurement_source") == "not_measured":
+                    skipped_corpora.append(cname)
                 continue
             if cname not in base_corpora:
                 errors.append(f"Corpus `{cname}` was measured live but is missing from scripts/lcnf_coverage_results.json")
@@ -1440,8 +1492,8 @@ class TestLcnfCoverage(unittest.TestCase):
                     sys.modules[__name__], "_run_audit_driver", return_value=(100, 7, 11, 82)
                 ) as run, mock.patch.object(
                     sys.modules[__name__], "_git_head", return_value=PINNED_CON_LECHE_REV
-                ), mock.patch.object(
-                    sys.modules[__name__], "CON_LECHE_EXPECTED_MODULE_COUNT", 2
+                ), mock.patch.dict(
+                    sys.modules[__name__].CON_LECHE_PINNED_MODULE_COUNTS, {PINNED_CON_LECHE_REV: 2}
                 ):
                     corp = measure_con_leche(ROOT_DIR)
             finally:
@@ -1876,6 +1928,8 @@ def main() -> int:
                     f"{label}={corp['proved']}/{corp['total_declarations']} proved "
                     f"(+{corp['lowered_unproved']} vacuous_local_call)"
                 )
+            elif corp.get("measurement_source") == "error":
+                parts.append(f"{label}=error ({corp.get('error_code', 'error')})")
             else:
                 parts.append(f"{label}=skipped (not measured)")
         print(" ".join(parts))
