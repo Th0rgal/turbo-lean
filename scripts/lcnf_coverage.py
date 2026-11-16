@@ -1561,6 +1561,23 @@ class TestLcnfCoverage(unittest.TestCase):
             chk_bad["errors"],
         )
 
+    def test_std_init_and_c2_renamed_and_external_batteries_separate_unknown(self) -> None:
+        # Point 3: the corpus holding Init/Std + C2 is named `std_init_and_c2` (not
+        # `batteries_and_c2`), and external Batteries is its own top-level corpus entry
+        # with status `unknown`.
+        self.assertIn("std_init_and_c2", CORPUS_SCOPES)
+        self.assertNotIn("batteries_and_c2", CORPUS_SCOPES)
+        rep = build_coverage_report(ROOT_DIR)
+        corpora = rep["corpora"]
+        self.assertIn("std_init_and_c2", corpora)
+        self.assertNotIn("batteries_and_c2", corpora)
+        self.assertIn("external_batteries", corpora)
+        ext = corpora["external_batteries"]
+        self.assertEqual(ext.get("status"), "unknown")
+        self.assertTrue(ext.get("reason"))
+        for field in RESULT_FIELDS:
+            self.assertNotIn(field, ext)
+
 
 
 def main() -> int:
