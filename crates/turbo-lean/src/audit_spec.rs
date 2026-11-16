@@ -2033,7 +2033,9 @@ impl AuditSpecPolicyConfig {
             extra_forbid_namespaces,
             extra_forbid_decl_kinds,
         )
-        .unwrap_or_default()
+        .unwrap_or_else(|err| {
+            panic!("audit-spec policy config failed closed (never silently default): {err:#}")
+        })
     }
 
     pub fn try_parse_config_str(text: &str) -> Result<Option<Self>> {
@@ -2094,7 +2096,12 @@ impl AuditSpecPolicyConfig {
     }
 
     pub fn parse_config_str(text: &str) -> Option<Self> {
-        Self::try_parse_config_str(text).ok().flatten()
+        match Self::try_parse_config_str(text) {
+            Ok(cfg) => cfg,
+            Err(err) => panic!(
+                "audit-spec config failed closed (unknown keys are never silently ignored): {err:#}"
+            ),
+        }
     }
 
     pub fn effective_forbidden_for_path(
