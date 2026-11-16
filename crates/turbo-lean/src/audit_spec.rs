@@ -1559,6 +1559,52 @@ enum RawAuditSpecPathRules {
     List(Vec<RawAuditSpecPathRuleItem>),
 }
 
+fn normalized_audit_spec_key(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '_' && *c != '-' && *c != ' ')
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn damerau_levenshtein(a: &[char], b: &[char]) -> usize {
+    let (n, m) = (a.len(), b.len());
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+    let mut d = vec![vec![0usize; m + 1]; n + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for j in 0..=m {
+        d[0][j] = j;
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut v = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                v = v.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = v;
+        }
+    }
+    d[n][m]
+}
+
+/// A top-level table in a config document is a near miss of the accepted
+/// `[audit_spec]`/`[audit-spec]` spellings when its name, lowercased and with
+/// `_`/`-`/spaces removed, is within Damerau-Levenshtein distance 1 of
+/// `auditspec` or `auditspecs`.
+fn is_audit_spec_section_near_miss(name: &str) -> bool {
+    let norm: Vec<char> = normalized_audit_spec_key(name).chars().collect();
+    ["auditspec", "auditspecs"].iter().any(|target| {
+        damerau_levenshtein(&norm, &target.chars().collect::<Vec<_>>()) <= 1
+    })
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawAuditSpecSection {
@@ -2073,6 +2119,15 @@ impl AuditSpecPolicyConfig {
         }
         let doc: toml::Table =
             toml::from_str(trimmed).context("Malformed TOML in project/audit-spec config")?;
+        for key in doc.keys() {
+            if key == "audit_spec" || key == "audit-spec" {
+                continue;
+            }
+            anyhow::ensure!(
+                !is_audit_spec_section_near_miss(key),
+                "near-miss `[audit_spec]` table `{key}` in TOML config; did you mean `[audit_spec]` or `[audit-spec]`? Refusing to silently ignore it"
+            );
+        }
         let has_underscore = doc.contains_key("audit_spec");
         let has_hyphen = doc.contains_key("audit-spec");
         anyhow::ensure!(
