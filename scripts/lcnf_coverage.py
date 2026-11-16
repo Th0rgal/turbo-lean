@@ -2316,6 +2316,110 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertTrue(chk["ok"], chk["errors"])
         self.assertIn("con_leche_h3_benchmark", chk["skipped_corpora"])
 
+    def test_counted_baseline_live_status_truth_table(self) -> None:
+        # SUBLEAF STATUS ONLY: for a baseline corpus carrying measured counts,
+        # the live entry must be a valid measured entry. The complete truth
+        # table: status must be absent/None (the existing measured shape) and
+        # measurement_source must be exactly `live_invocation`; `unknown`,
+        # `not_measured`, `error`, missing/null, wrong types, and unrecognized
+        # values all fail closed. All RESULT_FIELDS must be present integers.
+        # A baseline `not_measured` stub matching live `not_measured` remains a
+        # legitimate skip (covered by the stub test above).
+        baseline = self._v_committed_baseline()
+        rep = self._v_fake_live_report()
+        valid = json.loads(json.dumps(rep["corpora"]["c1_corpus"]))
+        chk_ok = check_coverage_report(ROOT_DIR, rep, results=baseline)
+        self.assertTrue(chk_ok["ok"], chk_ok["errors"])
+
+        def entry(**changes: Any) -> dict[str, Any]:
+            e = json.loads(json.dumps(valid))
+            e.update(changes)
+            return e
+
+        def report(e: dict[str, Any]) -> dict[str, Any]:
+            r = json.loads(json.dumps(rep))
+            r["corpora"]["c1_corpus"] = e
+            return r
+
+        invalid: list[tuple[str, dict[str, Any]]] = []
+        # Exact review repro shape: a live entry that only says unknown with a
+        # reason (the external-corpus shape) must not satisfy a counted baseline.
+        invalid.append(
+            ("status unknown no counts", report({"status": "unknown", "reason": "review repro"}))
+        )
+        invalid.append(("status unknown with counts", report(entry(status="unknown"))))
+        for label, value in (
+            ("status not_measured", "not_measured"),
+            ("status error", "error"),
+            ("status unrecognized", "mystery"),
+            ("status int", 7),
+            ("status bool", True),
+            ("status list", []),
+        ):
+            invalid.append((label, report(entry(status=value))))
+
+        missing_source = entry()
+        missing_source.pop("measurement_source", None)
+        invalid.append(("source missing", report(missing_source)))
+        invalid.append(("source null", report(entry(measurement_source=None))))
+        invalid.append(("source not_measured", report(entry(measurement_source="not_measured"))))
+        invalid.append(("source error", report(entry(measurement_source="error"))))
+        invalid.append(("source unrecognized", report(entry(measurement_source="mystery"))))
+        for label, value in (
+            ("source int", 7),
+            ("source bool", True),
+            ("source list", []),
+            ("source object", {}),
+        ):
+            invalid.append((label, report(entry(measurement_source=value))))
+
+        for field in RESULT_FIELDS:
+            missing_count = entry()
+            missing_count.pop(field, None)
+            invalid.append((f"count missing {field}", report(missing_count)))
+            for label, value in (
+                ("str", "1"),
+                ("bool", True),
+                ("null", None),
+                ("float", 1.5),
+                ("list", []),
+            ):
+                invalid.append(
+                    (f"count {field} {label}", report(entry(**{field: value})))
+                )
+
+        for label, mutant in invalid:
+            chk = check_coverage_report(ROOT_DIR, mutant, results=baseline)
+            self.assertFalse(chk["ok"], f"{label} passed --check")
+            self.assertTrue(
+                any("c1_corpus" in e for e in chk["errors"]),
+                f"{label}: {chk['errors']}",
+            )
+
+    def test_cli_check_rejects_unknown_live_status_for_counted_baseline(self) -> None:
+        # CLI-adversarial status injection: drive `main()` with a live report
+        # whose counted corpus is marked unknown and require the --check path to
+        # return failure with a named error, not exit 0.
+        import contextlib
+        import io
+        import unittest.mock as mock
+
+        rep = self._v_fake_live_report()
+        rep["corpora"]["c1_corpus"] = {
+            "status": "unknown",
+            "reason": "review repro: live status unknown",
+        }
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            sys.modules[__name__], "build_coverage_report", return_value=rep
+        ), mock.patch.object(
+            sys, "argv", ["lcnf_coverage.py", "--check"]
+        ), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = sys.modules[__name__].main()
+        self.assertEqual(rc, 1, f"unknown live status passed CLI --check: {out.getvalue()}")
+        self.assertIn("c1_corpus", err.getvalue())
+        self.assertIn("status", err.getvalue().lower())
+
     # ------------------------------------------------------------------
     # H1.0a-S (split S): honest proof classification and fail-closed
     # measurement (DeepSeek soundness findings against the audit driver;
