@@ -84,10 +84,26 @@ def make_fake_projects(root: Path):
         p = bats / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(body)
+    (bats / "lean-toolchain").write_text("leanprover/lean4:v4.35.0\n")
     pfr = root / "pfr"
     (pfr / "PFR").mkdir(parents=True, exist_ok=True)
+    (pfr / "lean-toolchain").write_text("leanprover/lean4:v4.35.0\n")
     (pfr / "PFR" / "MoreRuzsaDist.lean").write_text(
         "lemma rdist_of_neg_le : True := by trivial\n")
+    bin_dir = root / "fake-bin"
+    bin_dir.mkdir(exist_ok=True)
+    leanstub = bin_dir / "lean"
+    leanstub.write_text("#!/bin/sh\nprintf 'Lean (version 4.35.0, fake)\\n'\n")
+    leanstub.chmod(0o755)
+    real_git = __import__("shutil").which("git") or "/usr/bin/git"
+    git_env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+    for proj in (bats, pfr):
+        if not (proj / ".git").exists():
+            subprocess.run([real_git, "-C", str(proj), "init", "-q"], check=True, env=git_env)
+            subprocess.run([real_git, "-C", str(proj), "add", "-A"], check=True, env=git_env)
+            subprocess.run([real_git, "-C", str(proj), "commit", "-q", "-m", "init"],
+                           check=True, env=git_env)
     return bats, pfr
 
 
@@ -96,7 +112,9 @@ def run_bench(root, extra, stub_body=None, env_extra=None, make_projects=True):
     if make_projects:
         make_fake_projects(root)
     bats, pfr = root / "batteries", root / "pfr"
+    path_prefix = str(root / "fake-bin")
     env = dict(os.environ, TURBO_LEAN_GIT=str(gitstub),
+               PATH=path_prefix + os.pathsep + os.environ.get("PATH", ""),
                TURBO_LEAN_ALLOWED_CSIMP="*", TURBO_LEAN_ALLOWED_UNSAFE="*",
                TURBO_LEAN_ALLOWED_IMPLEMENTED_BY="*", FAKE_PFR_FAIL="1")
     env.update(env_extra or {})
@@ -117,8 +135,14 @@ def sample_baseline(mod, **overrides):
                   **{v: None for v in ("TURBO_LEAN_HOME", "TURBO_LEAN_STAGING_DIR",
                                        "TURBO_LEAN_NO_DAEMON", "TURBO_LEAN_NO_REMOTE_TELEMETRY",
                                        "TURBO_LEAN_TELEMETRY", "TURBO_LEAN_DAEMON_IDLE_SECS")}},
-        workloads={w["id"]: mod.empty_workload_result(w) for w in mod.WORKLOADS},
-    )
+         workloads={w["id"]: mod.empty_workload_result(w) for w in mod.WORKLOADS},
+         turbo_lean_dirty=False,
+         turbo_lean_binary={"path": "/fake/turbo-lean", "sha256": "a" * 64},
+         workload_revs={"batteries": "b" * 40, "pfr": "c" * 40},
+         toolchain={"lean_toolchain": "leanprover/lean4:v4.35.0",
+                    "lean_version": "Lean (version 4.35.0)"},
+     )
+
 
 
 def fill_workload(mod, base, wid, median_ms, rel_spread=0.03, modes=None):
@@ -232,10 +256,15 @@ class Comparison(unittest.TestCase):
 
     def _results(self, scale=1.0, host="bench-host", pfr_exit=1):
         mod = self.mod
+        sb = sample_baseline(mod)
         res = mod.empty_run_result(mod.WORKLOADS, trials=5)
-        res["host"] = dict(sample_baseline(mod)["host"], hostname=host)
-        res["settings"] = sample_baseline(mod)["settings"]
-        res["turbo_lean_commit"] = sample_baseline(mod)["turbo_lean_commit"]
+        res["host"] = dict(sb["host"], hostname=host)
+        res["settings"] = sb["settings"]
+        res["turbo_lean_commit"] = sb["turbo_lean_commit"]
+        res["turbo_lean_dirty"] = sb["turbo_lean_dirty"]
+        res["turbo_lean_binary"] = dict(sb["turbo_lean_binary"])
+        res["workload_revs"] = dict(sb["workload_revs"])
+        res["toolchain"] = dict(sb["toolchain"])
         for wid, ms in (("batteries_list_lemmas_top", 1000.0),
                         ("batteries_string_lemmas_top", 5000.0),
                         ("batteries_rbtree_lemmas_top", 1000.0),
@@ -473,16 +502,8 @@ class BaselineStrictness(unittest.TestCase):
     def test_settings_mismatch_on_fifth_var(self):
         mod = load_script()
         base = full_valid_baseline(mod)
-        res = mod.empty_run_result(mod.WORKLOADS, trials=5)
-        res["host"] = dict(base["host"])
-        res["settings"] = dict(base["settings"])
+        res = mod_results_like(mod, base, 1000.0)
         res["settings"]["TURBO_LEAN_HOME"] = "/somewhere/else"
-        res["turbo_lean_commit"] = base["turbo_lean_commit"]
-        for w in mod.WORKLOADS:
-            if w["expected_status"] == "blocked":
-                res["workloads"][w["id"]] = mod.blocked_workload_result(1, "x", 6000.0)
-            else:
-                fill_workload(mod, res, w["id"], 1000.0)
         verdict = mod.compare_run(base, res)
         self.assertEqual(verdict["verdict"], "comparison_skipped_settings_mismatch")
 
@@ -594,14 +615,16 @@ class ImprovementSide(unittest.TestCase):
 
     def test_per_cell_lines_and_summary_are_printed(self):
         with tempfile.TemporaryDirectory(prefix="m1-imp-") as td:
-            # Baseline provenance (host + recorded settings) must match this
-            # run exactly, so derive both from a first --no-baseline run.
+            # Baseline provenance (host + recorded settings + revs + toolchain)
+            # must match this run, so derive them from a first --no-baseline run.
             r0 = run_bench(Path(td), ["--no-baseline", "--out", str(Path(td) / "o0.json")])
             self.assertEqual(r0.returncode, 0, r0.stdout + r0.stderr)
             o0 = json.loads((Path(td) / "o0.json").read_text())
             base = full_valid_baseline(self.mod)
             base["host"]["hostname"] = o0["host"]["hostname"]
             base["settings"] = dict(o0["settings"])
+            base["workload_revs"] = dict(o0.get("workload_revs") or base["workload_revs"])
+            base["toolchain"] = dict(o0.get("toolchain") or base["toolchain"])
             bp = Path(td) / "b.json"
             bp.write_text(json.dumps(base))
             r = run_bench(Path(td), ["--baseline", str(bp), "--out", str(Path(td) / "o.json")])
@@ -616,6 +639,10 @@ def mod_results_like(mod, base, median_ms):
     res["host"] = dict(base["host"])
     res["settings"] = dict(base["settings"])
     res["turbo_lean_commit"] = base["turbo_lean_commit"]
+    res["turbo_lean_dirty"] = base.get("turbo_lean_dirty")
+    res["turbo_lean_binary"] = dict(base.get("turbo_lean_binary") or {})
+    res["workload_revs"] = dict(base.get("workload_revs") or {})
+    res["toolchain"] = dict(base.get("toolchain") or {})
     for w in mod.WORKLOADS:
         if w["expected_status"] == "blocked":
             res["workloads"][w["id"]] = mod.blocked_workload_result(
@@ -711,18 +738,8 @@ class PfrAndSourceSafety(unittest.TestCase):
         self.assertEqual(extra, {"c.olean"})
 
     def test_dirty_checkout_is_refused(self):
-        import subprocess as sp
         with tempfile.TemporaryDirectory(prefix="m1-dirty-") as td:
-            real_git = __import__("shutil").which("git")
-            def g(*a):
-                sp.run([real_git, "-C", str(Path(td) / "batteries")] + list(a),
-                       check=True, capture_output=True,
-                       env=dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
-                                GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t"))
-            run_bench(Path(td), ["--no-baseline"])  # materializes fake projects
-            g("init", "-q")
-            g("add", "-A")
-            g("commit", "-q", "-m", "init")
+            run_bench(Path(td), ["--no-baseline"])  # materializes fake git projects
             (Path(td) / "batteries" / "Batteries" / "Data" / "List" / "Lemmas.lean").write_text(
                 "theorem dropLast_eq_eraseIdx :\n    True := by\n  trivial\n-- leftover edit\n")
             r = self._run(td, ["--no-baseline"], make_projects=False)
@@ -749,6 +766,7 @@ class PfrAndSourceSafety(unittest.TestCase):
                  "--no-baseline", "--out", str(Path(td) / "o2.json")],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 env=dict(os.environ, TURBO_LEAN_GIT=str(Path(td) / "fake-git"),
+                         PATH=str(Path(td) / "fake-bin") + os.pathsep + os.environ.get("PATH", ""),
                          TURBO_LEAN_ALLOWED_CSIMP="*", TURBO_LEAN_ALLOWED_UNSAFE="*",
                          TURBO_LEAN_ALLOWED_IMPLEMENTED_BY="*", FAKE_PFR_FAIL="1",
                          FAKE_SLOW_EDIT="1"))
@@ -814,6 +832,7 @@ class Provenance(unittest.TestCase):
             (repo / "dirty.txt").write_text("uncommitted\n")
             g("add", "-A")  # staged but uncommitted: still dirty
             env = dict(os.environ, TURBO_LEAN_GIT=str(gitstub),
+                       PATH=str(Path(td) / "fake-bin") + os.pathsep + os.environ.get("PATH", ""),
                        TURBO_LEAN_ALLOWED_CSIMP="*", TURBO_LEAN_ALLOWED_UNSAFE="*",
                        TURBO_LEAN_ALLOWED_IMPLEMENTED_BY="*", FAKE_PFR_FAIL="1")
             cmd = [sys.executable, str(SCRIPT), "--turbo-lean-bin", str(stub),
@@ -895,6 +914,8 @@ class EndToEnd(unittest.TestCase):
             # noise band (reviewer's flaky failure).
             def base_with_fixed_medians(median):
                 base = json.loads(out.read_text())
+                base["turbo_lean_commit"] = "1" * 40
+                base["turbo_lean_dirty"] = False
                 for wid, wl in base["workloads"].items():
                     if wl.get("expected_status") == "blocked":
                         continue
@@ -925,10 +946,172 @@ class EndToEnd(unittest.TestCase):
             # Cross-host comparison must be flagged, never a pass.
             r3 = self._run_bench(root, ["--machine-label", "other-runner",
                                         "--out", str(root / "run3.json"),
-                                        "--baseline", str(out)])
+                                        "--baseline", str(huge)])
             self.assertEqual(r3.returncode, 0, r3.stdout + r3.stderr)
             data3 = json.loads((root / "run3.json").read_text())
             self.assertEqual(data3["verdict"]["verdict"], "comparison_skipped_host_mismatch")
+
+
+class ComparabilityAndProvenance(unittest.TestCase):
+    """Point 1: malformed provenance rejected; incomparable runs refused; binary compared honestly."""
+
+    def test_baseline_rejected_when_dirty_or_provenance_missing(self):
+        mod = load_script()
+        good = full_valid_baseline(mod)
+        self.assertEqual(mod.validate_baseline(good), [])
+
+        dirty = json.loads(json.dumps(good))
+        dirty["turbo_lean_dirty"] = True
+        errs = mod.validate_baseline(dirty)
+        self.assertTrue(any("dirty" in e for e in errs), errs)
+
+        for field in ("turbo_lean_commit", "turbo_lean_binary", "workload_revs", "toolchain"):
+            for bad in (None, "REMOVE"):
+                broken = json.loads(json.dumps(good))
+                if bad == "REMOVE":
+                    broken.pop(field, None)
+                else:
+                    broken[field] = None
+                errs = mod.validate_baseline(broken)
+                self.assertTrue(errs, (field, bad))
+
+        bad_commit = json.loads(json.dumps(good))
+        bad_commit["turbo_lean_commit"] = "not_a_git_checkout"
+        self.assertTrue(mod.validate_baseline(bad_commit))
+
+        bad_bin = json.loads(json.dumps(good))
+        bad_bin["turbo_lean_binary"] = {"path": "/fake", "sha256": None}
+        self.assertTrue(mod.validate_baseline(bad_bin))
+
+        bad_revs = json.loads(json.dumps(good))
+        bad_revs["workload_revs"] = {"batteries": "b" * 40, "pfr": None}
+        self.assertTrue(mod.validate_baseline(bad_revs))
+
+        bad_tc1 = json.loads(json.dumps(good))
+        bad_tc1["toolchain"] = {"lean_toolchain": None, "lean_version": "Lean (version 4.35.0)"}
+        self.assertTrue(mod.validate_baseline(bad_tc1))
+
+        bad_tc2 = json.loads(json.dumps(good))
+        bad_tc2["toolchain"] = {"lean_toolchain": "leanprover/lean4:v4.35.0", "lean_version": None}
+        self.assertTrue(mod.validate_baseline(bad_tc2))
+
+    def test_dirty_baseline_exits_nonzero_with_named_error(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-dirty-base-") as td:
+            base = full_valid_baseline(mod)
+            base["turbo_lean_dirty"] = True
+            bp = Path(td) / "b.json"
+            bp.write_text(json.dumps(base))
+            r = run_bench(Path(td), ["--baseline", str(bp), "--out", str(Path(td) / "o.json")])
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("dirty", r.stderr)
+
+    def test_workload_rev_mismatch_refuses_comparison_nonzero_and_prints_both(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-rev-mis-") as td:
+            r0 = run_bench(Path(td), ["--no-baseline", "--out", str(Path(td) / "o0.json")])
+            self.assertEqual(r0.returncode, 0, r0.stdout + r0.stderr)
+            o0 = json.loads((Path(td) / "o0.json").read_text())
+            base = full_valid_baseline(mod)
+            base["host"]["hostname"] = o0["host"]["hostname"]
+            base["settings"] = dict(o0["settings"])
+            base["toolchain"] = dict(o0.get("toolchain") or full_valid_baseline(mod)["toolchain"])
+            base["workload_revs"] = dict(o0["workload_revs"], batteries="deadbeef" * 5)
+            bp = Path(td) / "b.json"
+            bp.write_text(json.dumps(base))
+            r = run_bench(Path(td), ["--baseline", str(bp), "--out", str(Path(td) / "o.json")])
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            combined = r.stdout + r.stderr
+            self.assertIn("comparison_refused_workload_rev_mismatch", combined)
+            self.assertIn("deadbeef" * 5, combined)
+            self.assertIn(o0["workload_revs"]["batteries"], combined)
+
+    def test_toolchain_mismatch_refuses_comparison_nonzero_and_prints_both(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-tc-mis-") as td:
+            r0 = run_bench(Path(td), ["--no-baseline", "--out", str(Path(td) / "o0.json")])
+            self.assertEqual(r0.returncode, 0, r0.stdout + r0.stderr)
+            o0 = json.loads((Path(td) / "o0.json").read_text())
+            base = full_valid_baseline(mod)
+            base["host"]["hostname"] = o0["host"]["hostname"]
+            base["settings"] = dict(o0["settings"])
+            base["workload_revs"] = dict(o0["workload_revs"])
+            base["toolchain"] = {"lean_toolchain": "leanprover/lean4:v4.34.0",
+                                 "lean_version": "Lean (version 4.34.0, old)"}
+            bp = Path(td) / "b.json"
+            bp.write_text(json.dumps(base))
+            r = run_bench(Path(td), ["--baseline", str(bp), "--out", str(Path(td) / "o.json")])
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            combined = r.stdout + r.stderr
+            self.assertIn("comparison_refused_toolchain_mismatch", combined)
+            self.assertIn("v4.34.0", combined)
+            self.assertIn("v4.35.0", combined)
+
+    def test_different_binary_and_commit_is_compared_and_prints_both(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-diff-bin-") as td:
+            r0 = run_bench(Path(td), ["--no-baseline", "--out", str(Path(td) / "o0.json")])
+            self.assertEqual(r0.returncode, 0, r0.stdout + r0.stderr)
+            o0 = json.loads((Path(td) / "o0.json").read_text())
+            base = full_valid_baseline(mod)
+            for wid, wl in base["workloads"].items():
+                if wl.get("expected_status") == "blocked":
+                    continue
+                for m in wl["modes"].values():
+                    m["median_ms"] = 1_000_000.0
+                    m["runs_ms"] = [1_000_000.0] * m["trials"]
+            base["host"]["hostname"] = o0["host"]["hostname"]
+            base["settings"] = dict(o0["settings"])
+            base["workload_revs"] = dict(o0["workload_revs"])
+            base["toolchain"] = dict(o0.get("toolchain") or full_valid_baseline(mod)["toolchain"])
+            base["turbo_lean_commit"] = "1111111111111111111111111111111111111111"
+            base["turbo_lean_binary"] = {"path": "/old/turbo-lean", "sha256": "2" * 64}
+            bp = Path(td) / "b.json"
+            bp.write_text(json.dumps(base))
+            r = run_bench(Path(td), ["--baseline", str(bp), "--out", str(Path(td) / "o.json")])
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            o = json.loads((Path(td) / "o.json").read_text())
+            v = o["verdict"]
+            self.assertEqual(v["verdict"], "pass")
+            self.assertIs(v["same_binary"], False)
+            self.assertEqual(v["baseline_commit"], "1" * 40)
+            self.assertEqual(v["run_commit"], o["turbo_lean_commit"])
+            self.assertEqual(v["baseline_binary_sha256"], "2" * 64)
+            self.assertEqual(v["run_binary_sha256"], o["turbo_lean_binary"]["sha256"])
+            self.assertIn("1" * 40, r.stdout)
+            self.assertIn(o["turbo_lean_commit"], r.stdout)
+            self.assertIn("2" * 64, r.stdout)
+            self.assertIn(o["turbo_lean_binary"]["sha256"], r.stdout)
+            self.assertNotIn("same binary", r.stdout)
+
+    def test_same_binary_says_same_binary_and_records_toolchain(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-same-bin-") as td:
+            r0 = run_bench(Path(td), ["--no-baseline", "--out", str(Path(td) / "o0.json")])
+            self.assertEqual(r0.returncode, 0, r0.stdout + r0.stderr)
+            o0 = json.loads((Path(td) / "o0.json").read_text())
+            self.assertEqual(o0["toolchain"]["lean_toolchain"], "leanprover/lean4:v4.35.0")
+            self.assertIn("Lean (version 4.35.0", o0["toolchain"]["lean_version"])
+            base = full_valid_baseline(mod)
+            for wid, wl in base["workloads"].items():
+                if wl.get("expected_status") == "blocked":
+                    continue
+                for m in wl["modes"].values():
+                    m["median_ms"] = 1_000_000.0
+                    m["runs_ms"] = [1_000_000.0] * m["trials"]
+            base["host"]["hostname"] = o0["host"]["hostname"]
+            base["settings"] = dict(o0["settings"])
+            base["workload_revs"] = dict(o0["workload_revs"])
+            base["toolchain"] = dict(o0.get("toolchain") or full_valid_baseline(mod)["toolchain"])
+            base["turbo_lean_commit"] = "3" * 40
+            base["turbo_lean_binary"] = dict(o0["turbo_lean_binary"])
+            bp = Path(td) / "b.json"
+            bp.write_text(json.dumps(base))
+            r = run_bench(Path(td), ["--baseline", str(bp), "--out", str(Path(td) / "o.json")])
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            o = json.loads((Path(td) / "o.json").read_text())
+            self.assertIs(o["verdict"]["same_binary"], True)
+            self.assertIn("same binary", r.stdout)
 
 
 if __name__ == "__main__":
