@@ -1266,6 +1266,111 @@ def results_document(report: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[
     }
 
 
+def _validate_measured_entry(path: str, entry: Any, errors: list[str]) -> None:
+    """Fail-closed validation of one measured baseline corpus/subcorpus entry."""
+    if not isinstance(entry, dict):
+        errors.append(f"Results file `{path}` must be a JSON object, got {type(entry).__name__}")
+        return
+    if entry.get("measurement_source") == "not_measured":
+        # An explicit `not_measured` stub is honest only with a reason and no counts.
+        if not entry.get("reason"):
+            errors.append(f"Results file `{path}` is marked not_measured but gives no reason")
+        if any(k in entry for k in RESULT_FIELDS):
+            errors.append(f"Results file `{path}` is marked not_measured yet carries declaration counts")
+        if "subcorpora" in entry:
+            errors.append(f"Results file `{path}` is marked not_measured yet carries subcorpora")
+        return
+    for f in RESULT_FIELDS:
+        if f not in entry:
+            errors.append(f"Results file `{path}` is missing measured field `{f}`")
+            continue
+        v = entry[f]
+        if isinstance(v, bool) or not isinstance(v, int):
+            errors.append(
+                f"Results file `{path}` field `{f}` must be an integer, got {type(v).__name__} {v!r}"
+            )
+        elif v < 0:
+            errors.append(f"Results file `{path}` field `{f}` must be >= 0, got {v}")
+    counts = [
+        entry[f]
+        for f in RESULT_FIELDS
+        if isinstance(entry.get(f), int) and not isinstance(entry.get(f), bool)
+    ]
+    if len(counts) == len(RESULT_FIELDS):
+        tot, prv, unp, rej, rnl = counts
+        if prv + unp + rej != tot:
+            errors.append(
+                f"Results file `{path}` counts do not sum: "
+                f"proved({prv}) + lowered_unproved({unp}) + rejected({rej}) != total_declarations({tot})"
+            )
+        if not 0 <= rnl <= rej:
+            errors.append(
+                f"Results file `{path}` rejected_not_lowered({rnl}) must be within 0..rejected({rej})"
+            )
+        reason = entry.get("rejected_not_lowered_reason")
+        if not isinstance(reason, str) or not reason:
+            errors.append(f"Results file `{path}` is missing valid `rejected_not_lowered_reason`")
+    subs = entry.get("subcorpora")
+    if subs is None:
+        return
+    if not isinstance(subs, dict):
+        errors.append(f"Results file `{path}`.subcorpora must be a JSON object, got {type(subs).__name__}")
+        return
+    for sname, sc in subs.items():
+        _validate_measured_entry(f"{path}.subcorpora.{sname}", sc, errors)
+    parent_ints = all(
+        f in entry and isinstance(entry[f], int) and not isinstance(entry[f], bool)
+        for f in RESULT_FIELDS
+    )
+    sub_ints = all(
+        isinstance(sc, dict)
+        and all(f in sc and isinstance(sc[f], int) and not isinstance(sc[f], bool) for f in RESULT_FIELDS)
+        for sc in subs.values()
+    )
+    if parent_ints and sub_ints:
+        for f in RESULT_FIELDS:
+            summed = sum(sc[f] for sc in subs.values())
+            if summed != entry[f]:
+                errors.append(
+                    f"Results file `{path}` subcorpora {f} sums to {summed} "
+                    f"but the corpus records {entry[f]}"
+                )
+
+
+def validate_results_document(doc: Any) -> list[str]:
+    """Fail-closed structural validation of the committed baseline document.
+
+    Checks `schemaVersion`, `measured_source_commit`, and — for every measured
+    corpus and subcorpus — the presence, integer types, sums, and
+    `rejected_not_lowered` bounds of all defined measured fields, plus honest
+    explicit `not_measured` stubs (reason required, no counts). Returns named
+    errors; never raises.
+    """
+    if not isinstance(doc, dict):
+        return ["Results file must be a JSON object"]
+    errors: list[str] = []
+    if doc.get("schemaVersion") != "turbo-lean-lcnf-coverage-results-v1":
+        errors.append(
+            "Results file schemaVersion must be `turbo-lean-lcnf-coverage-results-v1`, "
+            f"got {doc.get('schemaVersion')!r}"
+        )
+    if doc.get("toolchain") != PINNED_TOOLCHAIN:
+        errors.append(
+            f"Results file toolchain mismatch: file={doc.get('toolchain')!r} "
+            f"live={PINNED_TOOLCHAIN!r}"
+        )
+    msc = doc.get("measured_source_commit")
+    if not isinstance(msc, str) or not msc:
+        errors.append("Results file is missing `measured_source_commit`")
+    corpora = doc.get("corpora", {})
+    if not isinstance(corpora, dict):
+        errors.append("Results file `corpora` must be a JSON object")
+        return errors
+    for cname, entry in corpora.items():
+        _validate_measured_entry(f"corpora.{cname}", entry, errors)
+    return errors
+
+
 def check_coverage_report(
     root_dir: Path = ROOT_DIR,
     report: dict[str, Any] | None = None,
@@ -1361,14 +1466,10 @@ def check_coverage_report(
             baseline_doc = json.loads(results_path.read_text(encoding="utf-8"))
 
     if baseline_doc is not None:
-        if baseline_doc.get("toolchain") != PINNED_TOOLCHAIN:
-            errors.append(
-                f"Results file toolchain mismatch: file={baseline_doc.get('toolchain')!r} "
-                f"live={PINNED_TOOLCHAIN!r}"
-            )
-        if not baseline_doc.get("measured_source_commit"):
-            errors.append("Results file is missing `measured_source_commit`")
-        base_corpora = baseline_doc.get("corpora", {})
+        errors.extend(validate_results_document(baseline_doc))
+        base_corpora = baseline_doc.get("corpora", {}) if isinstance(baseline_doc, dict) else {}
+        if not isinstance(base_corpora, dict):
+            base_corpora = {}
         live_corpora = rep.get("corpora", {})
         for cname, corp in live_corpora.items():
             if corp.get("status") == "unknown":
@@ -1382,6 +1483,13 @@ def check_coverage_report(
                 errors.append(f"Corpus `{cname}` was measured live but is missing from scripts/lcnf_coverage_results.json")
                 continue
             base_c = base_corpora[cname]
+            if not isinstance(base_c, dict):
+                continue  # already named by validate_results_document
+            if base_c.get("measurement_source") == "not_measured":
+                errors.append(
+                    f"Corpus `{cname}` is measured live but scripts/lcnf_coverage_results.json marks it not_measured"
+                )
+                continue
             diffs = [f for f in RESULT_FIELDS if base_c.get(f) != corp.get(f)]
             if diffs:
                 side_summary = ", ".join(
@@ -1391,6 +1499,47 @@ def check_coverage_report(
                     f"Corpus `{cname}` differs from scripts/lcnf_coverage_results.json "
                     f"(file vs live): {side_summary}"
                 )
+            if base_c.get("rejected_not_lowered_reason") != corp.get("rejected_not_lowered_reason"):
+                errors.append(
+                    f"Corpus `{cname}` field `rejected_not_lowered_reason` differs from "
+                    f"scripts/lcnf_coverage_results.json "
+                    f"(file={base_c.get('rejected_not_lowered_reason')!r} vs "
+                    f"live={corp.get('rejected_not_lowered_reason')!r})"
+                )
+            base_subs = base_c.get("subcorpora", {})
+            if not isinstance(base_subs, dict):
+                base_subs = {}  # already named by validate_results_document
+            live_subs = corp.get("subcorpora", {})
+            if not isinstance(live_subs, dict):
+                live_subs = {}
+            for sname, sc in live_subs.items():
+                if sname not in base_subs:
+                    errors.append(
+                        f"Corpus `{cname}` subcorpus `{sname}` is missing from scripts/lcnf_coverage_results.json"
+                    )
+                    continue
+                bsc = base_subs[sname]
+                if not isinstance(bsc, dict):
+                    continue  # already named by validate_results_document
+                for f in RESULT_FIELDS:
+                    if bsc.get(f) != sc.get(f):
+                        errors.append(
+                            f"Corpus `{cname}` subcorpus `{sname}` field `{f}` differs from "
+                            f"scripts/lcnf_coverage_results.json (file={bsc.get(f)} vs live={sc.get(f)})"
+                        )
+                if bsc.get("rejected_not_lowered_reason") != sc.get("rejected_not_lowered_reason"):
+                    errors.append(
+                        f"Corpus `{cname}` subcorpus `{sname}` field `rejected_not_lowered_reason` differs "
+                        f"from scripts/lcnf_coverage_results.json "
+                        f"(file={bsc.get('rejected_not_lowered_reason')!r} vs "
+                        f"live={sc.get('rejected_not_lowered_reason')!r})"
+                    )
+            for sname in base_subs:
+                if sname not in live_subs:
+                    errors.append(
+                        f"Corpus `{cname}` has subcorpus `{sname}` in scripts/lcnf_coverage_results.json "
+                        f"but the live report does not"
+                    )
         for cname in base_corpora:
             live_c = live_corpora.get(cname)
             if live_c is None:
