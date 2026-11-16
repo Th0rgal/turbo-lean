@@ -60,7 +60,7 @@ Agent / CLI / MCP ──► Stage 0: Cone & CAS Filter (`TurboLean/Spec.lean` + 
 - **Verified Native Compiler & Acceleration Plugins**: [`lean/LeanNative/Semantics/Eval.lean`](lean/LeanNative/Semantics/Eval.lean), [`lean/LeanNative/Transform/Plugins.lean`](lean/LeanNative/Transform/Plugins.lean), [`lean/LeanNative/Transform/Superopt.lean`](lean/LeanNative/Transform/Superopt.lean), [`lean/LeanNative/Backend/`](lean/LeanNative/Backend/)
 - **Warm Elaboration & C-ABI Runtime**: [`lean/TurboLean/ZygoteWorker.lean`](lean/TurboLean/ZygoteWorker.lean), [`crates/turbo-lean/src/`](crates/turbo-lean/src/)
 - **CI Verification & Inventory Ratchet**: [`scripts/ci_verify.sh`](scripts/ci_verify.sh), [`scripts/sync_docs_inventory.py`](scripts/sync_docs_inventory.py)
-- **Autonomous Research & Verification Roadmap**: [`roadmap/README.md`](roadmap/README.md) ([`GOALS.md`](roadmap/GOALS.md), [`VALIDATION_CONTRACTS.md`](roadmap/VALIDATION_CONTRACTS.md), [`CONFORMANCE_SUITE.md`](roadmap/CONFORMANCE_SUITE.md), [`MAXWELL_STRATEGIES.md`](roadmap/MAXWELL_STRATEGIES.md))
+- **Autonomous Research & Verification Roadmap**: [`roadmap/README.md`](roadmap/README.md) ([`GOALS.md`](roadmap/GOALS.md), [`VALIDATION_CONTRACTS.md`](roadmap/VALIDATION_CONTRACTS.md), [`CONFORMANCE_SUITE.md`](roadmap/CONFORMANCE_SUITE.md); the Maxwell execution pointer is Section 5 below, with [`roadmap/MAXWELL_STRATEGIES.md`](roadmap/MAXWELL_STRATEGIES.md) kept as a redirect)
 
 ---
 
@@ -72,3 +72,40 @@ Agent / CLI / MCP ──► Stage 0: Cone & CAS Filter (`TurboLean/Spec.lean` + 
    - **Primary**: Minimize agent feedback loop latency $\text{Geomean}(\text{latence\_p50}_{\text{warm}}, \text{latence\_p95}_{\text{edit}}, \text{build}_{\text{cone}})$ and deterministic verification heartbeats.
    - **Secondary**: Maximize Tier-0 (`< 10 ms`) masked proof regeneration rate and `proof_term_nodes` compression.
    - **Resource Envelope**: $\text{RSS}_{\text{peak}} \le \text{RAM}_{\text{cap}}$ and $\Delta\text{LOC} \le 0$ (simplicity ratchet).
+
+---
+
+## 5. Maxwell Execution Pointer (Pre-PR Oracles)
+
+How this repository is proved and optimized is the generic Maxwell method, not a strategy written for one compiler campaign. The method lives in the Orb Library skill `maxwell` (`Th0rgal/orb-library`, `skill/maxwell/`), with three thin subdocuments:
+
+- `references/proof.md` — frozen contracts, one owner per open file, one harvest path, push before the VM dies.
+- `references/compiler.md` — freeze the spec and attack it before implementation; degrade the quorum when a model family is down.
+- `references/optimize.md` — refute fast, measure the real pipeline, delete a pass that does not move it.
+
+This section only names the oracles for `turbo-lean`. It does not choose models, fleet sizes, or telemetry. [`roadmap/GOALS.md`](roadmap/GOALS.md) and [`roadmap/VALIDATION_CONTRACTS.md`](roadmap/VALIDATION_CONTRACTS.md) stay the "what."
+
+### Oracles
+
+Confirm the installed binary with `turbo-lean --version` and `turbo-lean --help` before a prompt names a flag. A flag the binary does not have is not an oracle.
+
+| Question | Command |
+| --- | --- |
+| Does this declaration kernel-check? | `turbo-lean check <file.lean> --decl <Full.Name> --max-memory-mb 6144 --no-auto-worktree-link` |
+| Do deep `--decl` prefix outlines & CoW-forked Zygote pools hold `0 sorryAx`? | `TURBO_LEAN_ZYGOTE_FORK_SHARDS=1 turbo-lean --json check <file.lean> --decl <Full.Name> --max-memory-mb 6144 --no-auto-worktree-link` |
+| Is the spec non-vacuous and tight? | `turbo-lean --json audit-spec [--policy strict-proofs] [--require-nonempty] <Spec.lean>` |
+| Does the diff verify against the base? | `turbo-lean pr-verify --base <ref>` |
+| Does the tree meet the repo gate? | `turbo-lean ci-verify --project-dir <dir>` |
+
+The kernel is the accept. A worker report, a green mission, or a missing tool is not.
+
+### Layer 4 `audit-spec` Fail-Closed Contract & Prerequisites
+
+- **Fail-Closed Exit & JSON Semantics**: `turbo-lean --json audit-spec` exits non-zero whenever `"ok": false` — including vacuous/trivial specs, stub definitions, forbidden scope declarations, malformed or unknown keys in `audit-spec.toml` / `turbo-lean.toml`, unknown `--policy` presets, `--decl` filter misses (`"verdict": "decl_not_found"`), `--require-nonempty` on zero-theorem inputs (`"verdict": "no_specs_found"`), or unreadable paths (`"verdict": "error"`). Multi-file batches resolve per-target ancestor policy configs independently so results are permutation-invariant, and cache entries live in private `0700` directories (`--cache-dir`, `TURBO_LEAN_AUDIT_CACHE_DIR`, or private user staging).
+- **Witness Provenance**: `audit-spec` distinguishes concrete evaluation refutations (`eval_refuted_postcondition(...)`) from syntactic/structural checks on non-executable domains (`heuristic_unverified_*`); only concrete evaluation or Lean kernel replay constitutes a semantic witness.
+- **Stage B Queued Follow-Ups (Cross-Module)**: Forwarding `project_dir` in MCP `turbo_audit_spec`, native diagonal seeding inside `gpu_fastcheck.rs`, transitive compiled-import `csimp` auditing and receipt attestation, and two-sided `MetaGateSpec` / `CveSubspec` Lean gate tests.
+- **Git Runtime Prerequisite (`Git >= 2.46`)**: `pr-verify`, `ci-verify`, and Git-backed Rust integration tests enforce `Git >= 2.46` (`trusted_tools::MIN_GIT`) to mitigate Git worktree/submodule CVEs. On hosts whose system `/usr/bin/git` is older (e.g. `2.43.x`), point `TURBO_LEAN_GIT` at a Git `>= 2.46` binary; `audit-spec` and `tests/audit_spec_cli.rs` run standalone without invoking `git`.
+
+### What this section is not
+
+Model matrices, Best-of-k tables, Empirical-Bayes priors, and warm-pool counts were campaign notes that never became the method. A future campaign that wants a race or a telemetry sink says so in its own document. Select models from what is healthy at dispatch time.
