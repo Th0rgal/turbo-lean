@@ -107,6 +107,8 @@ WORKLOADS = [
     {"id": "pfr_more_ruzsa_dist", "repo": "pfr", "expected_status": "blocked",
      "file": "PFR/MoreRuzsaDist.lean", "decl": "rdist_of_neg_le", "line": 55,
      "extra_args": ["--no-auto-worktree-link"],
+     "expected_error_classes": ["stale_import_refresh_fail_closed",
+                                "declaration_identity_unknown_module_prefix"],
      "note": "Never run without --no-auto-worktree-link: the default purges "
              "prebuilt Mathlib .olean files from the checkout."},
 ]
@@ -128,6 +130,7 @@ VERDICT_EXIT = {
     "comparison_skipped_host_mismatch": 0, "comparison_skipped_settings_mismatch": 0,
     "comparison_refused_workload_rev_mismatch": 4,
     "comparison_refused_toolchain_mismatch": 4,
+    "blocked_workload_unexpected_failure": 4,
     "regression": 1, "measurement_failed": 1, "stale_expectation": 3,
 }
 
@@ -386,7 +389,8 @@ def compare_run(baseline, res):
     """Gate `res` against `baseline`. Never passes a comparison it skipped."""
     verdict = {
         "verdict": None, "regressions": [], "improvements": [], "measured_nothing": [],
-        "comparison_errors": [], "unexpected_successes": [], "pfr_status": None,
+        "comparison_errors": [], "unexpected_successes": [],
+        "unexpected_blocked_failures": [], "pfr_status": None,
         "skipped_reason": None, "same_binary": None,
         "baseline_commit": baseline.get("turbo_lean_commit") if baseline else None,
         "run_commit": res.get("turbo_lean_commit"),
@@ -403,6 +407,23 @@ def compare_run(baseline, res):
         if baseline and wid not in baseline["workloads"]:
             verdict["comparison_errors"].append(
                 f"workload {wid} is in this run's results but not in the baseline")
+    bad_blocked = sorted(
+        wid for wid, w in res["workloads"].items()
+        if w.get("expected_status") == "blocked"
+        and w.get("status") == "blocked_unexpected_failure")
+    if bad_blocked and not verdict["comparison_errors"]:
+        verdict["unexpected_blocked_failures"] = [
+            {"workload": wid,
+             "probe_error_classes": res["workloads"][wid].get("probe_error_classes"),
+             "expected_error_classes": res["workloads"][wid].get("expected_error_classes")}
+            for wid in bad_blocked
+        ]
+        verdict["pfr_status"] = res["workloads"].get("pfr_more_ruzsa_dist", {}).get("status")
+        verdict["verdict"] = "blocked_workload_unexpected_failure"
+        verdict["skipped_reason"] = (
+            f"blocked workload failed with unexpected error class: "
+            f"{verdict['unexpected_blocked_failures']}")
+        return verdict
     healthy = all(
         (w.get("status") == "ok" if w.get("expected_status") != "blocked"
          else w.get("status") in ("blocked_as_expected", "unexpectedly_passing"))
@@ -774,7 +795,16 @@ def classify_error(returncode, parsed, stderr):
         text = str(parsed.get("error", ""))
     text = text + "\n" + (stderr or "")
     low = text.lower()
-    if "stale" in low or "import_refresh" in low or "imports fresh" in low:
+    if "declaration identity unconfirmed" in low and "unknown module prefix" in low:
+        return "declaration_identity_unknown_module_prefix"
+    if "declaration identity unconfirmed" in low:
+        return "declaration_identity_unconfirmed"
+    if "declaration" in low and "not found" in low:
+        return "declaration_not_found"
+    if "failed to read" in low and "no such file" in low:
+        return "source_file_not_found"
+    if ("worktree opt-out prevents refreshing stale imports" in low
+            or "stale" in low or "import_refresh" in low or "imports fresh" in low):
         return "stale_import_refresh_fail_closed"
     if "warn.sorry" in low or "sorry" in low:
         return "warn_sorry_refused"
@@ -1019,8 +1049,9 @@ class Runner:
         before/after each probe inside a `finally`, so a deletion offset by a
         creation is still caught.
         """
-        probe_exits, probe_classes, psis, runs, statuses = [], set(), [], [], []
+        probe_exits, probe_class_list, psis, runs, statuses = [], [], [], [], []
         stderr_excerpt = ""
+        expected_classes = set(w.get("expected_error_classes") or ())
         total = self.warmups + self.trials
         for i in range(total):
             d = self.wl_scratch(w["id"]) / f"cold_{i}"
@@ -1041,29 +1072,44 @@ class Runner:
                         "This must never happen (--no-auto-worktree-link is mandatory).")
             shutil.rmtree(d, ignore_errors=True)
             probe_exits.append(r["exit_code"])
-            probe_classes.add(classify_error(r["exit_code"], r.get("json"), r["stderr"]))
+            cls = (classify_error(r["exit_code"], r.get("json"), r["stderr"])
+                   if r["exit_code"] != 0 else "unexpected_exit_0")
+            probe_class_list.append(cls)
             psis.append([r.get("psi_before") or {}, r.get("psi_after") or {}])
             if i >= self.warmups:
                 runs.append(r["external_wall_ms"])
                 statuses.append(f"exit_{r['exit_code']}")
                 if not stderr_excerpt and r["stderr"]:
                     stderr_excerpt = r["stderr"][:500]
+        probe_classes = set(probe_class_list)
         m = mode_result(runs, [], statuses, psi_lists=psis)
         m["error_classes"] = sorted(probe_classes)
+        m["probe_error_classes"] = probe_class_list
         if stderr_excerpt:
             m["stderr_excerpt"] = stderr_excerpt
-        all_failed = bool(probe_exits) and all(e != 0 for e in probe_exits)
+        any_passed = any(e == 0 for e in probe_exits)
+        all_expected = (bool(probe_exits) and not any_passed
+                        and bool(expected_classes)
+                        and all(c in expected_classes for c in probe_class_list))
+        if any_passed or not probe_exits:
+            status = "unexpectedly_passing"
+        elif all_expected:
+            status = "blocked_as_expected"
+        else:
+            status = "blocked_unexpected_failure"
         entry = {
-            "status": "blocked_as_expected" if all_failed else "unexpectedly_passing",
+            "status": status,
             "expected_status": "blocked",
+            "expected_error_classes": sorted(expected_classes),
             "exit_code": probe_exits[-1] if probe_exits else None,
             "probe_exit_codes": probe_exits,
+            "probe_error_classes": probe_class_list,
             "error_class": sorted(probe_classes)[0] if probe_classes else None,
             "repo": w["repo"], "file": w["file"], "decl": w["decl"],
             "modes": {"cold_no_daemon": m},
         }
-        print(f"  blocked: probe_exits={probe_exits} error_classes={sorted(probe_classes)} "
-              f"median={m['median_ms']}ms", flush=True)
+        print(f"  blocked: status={status} probe_exits={probe_exits} "
+              f"error_classes={sorted(probe_classes)} median={m['median_ms']}ms", flush=True)
         return entry
 
     # -- whole workloads ---------------------------------------------------
