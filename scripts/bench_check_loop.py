@@ -126,6 +126,8 @@ RECORDED_ENV_VARS = [
 VERDICT_EXIT = {
     "pass": 0, "not_compared": 0,
     "comparison_skipped_host_mismatch": 0, "comparison_skipped_settings_mismatch": 0,
+    "comparison_refused_workload_rev_mismatch": 4,
+    "comparison_refused_toolchain_mismatch": 4,
     "regression": 1, "measurement_failed": 1, "stale_expectation": 3,
 }
 
@@ -193,7 +195,8 @@ def empty_workload_result(w):
 def empty_run_result(workloads, trials):
     return {
         "schema_version": SCHEMA_VERSION, "kind": "results", "created_utc": utc_now_iso(),
-        "turbo_lean_commit": None, "host": {}, "trials": trials, "settings": {},
+        "turbo_lean_commit": None, "toolchain": None, "host": {}, "trials": trials,
+        "settings": {},
         "workloads": {w["id"]: empty_workload_result(w) for w in workloads},
     }
 
@@ -268,11 +271,30 @@ def validate_baseline(base):
     if not isinstance(base, dict):
         return ["baseline is not a JSON object"]
     for key in ("schema_version", "kind", "created_utc", "turbo_lean_commit",
+                "turbo_lean_binary", "workload_revs", "toolchain",
                 "host", "trials", "settings", "workloads"):
         if key not in base:
             errs.append(f"missing required key: {key}")
     if "kind" in base and base["kind"] not in ("baseline", "results"):
         errs.append(f"unexpected kind: {base['kind']}")
+    if base.get("turbo_lean_dirty") is True:
+        errs.append("baseline_dirty_tree: turbo_lean_dirty is true")
+    commit = base.get("turbo_lean_commit")
+    if not isinstance(commit, str) or not commit or commit == "not_a_git_checkout":
+        errs.append("baseline_missing_turbo_lean_commit: turbo_lean_commit missing, null, or not a git commit")
+    binary = base.get("turbo_lean_binary")
+    sha = binary.get("sha256") if isinstance(binary, dict) else None
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+        errs.append("baseline_missing_binary_hash: turbo_lean_binary.sha256 missing or invalid")
+    revs = base.get("workload_revs")
+    if not isinstance(revs, dict) or any(
+            not isinstance(revs.get(repo), str) or not revs.get(repo) for repo in PINNED_REVS):
+        errs.append("baseline_missing_workload_revs: workload_revs missing or incomplete")
+    tc = base.get("toolchain")
+    if (not isinstance(tc, dict)
+            or not isinstance(tc.get("lean_toolchain"), str) or not tc.get("lean_toolchain").strip()
+            or not isinstance(tc.get("lean_version"), str) or not tc.get("lean_version").strip()):
+        errs.append("baseline_missing_toolchain: toolchain (lean_toolchain + lean_version) missing or null")
     host = base.get("host") or {}
     for key in ("hostname", "cpu_model", "nproc"):
         if key not in host:
@@ -325,6 +347,27 @@ def settings_match(base, res) -> bool:
     return key(base.get("settings") or {}) == key(res.get("settings") or {})
 
 
+def workload_revs_match(base, res) -> bool:
+    br, rr = base.get("workload_revs") or {}, res.get("workload_revs") or {}
+    return bool(br) and bool(rr) and all(
+        br.get(repo) and br.get(repo) == rr.get(repo) for repo in PINNED_REVS)
+
+
+def toolchain_key(entry):
+    tc = entry.get("toolchain") if isinstance(entry, dict) else None
+    if not isinstance(tc, dict):
+        return None
+    return {"lean_toolchain": tc.get("lean_toolchain"),
+            "lean_version": tc.get("lean_version")}
+
+
+def toolchain_matches(base, res) -> bool:
+    bt, rt = toolchain_key(base), toolchain_key(res)
+    return (bt is not None and rt is not None
+            and bool(bt["lean_toolchain"]) and bool(bt["lean_version"])
+            and bt == rt)
+
+
 def trial_failed(r) -> bool:
     """A trial whose command exited non-zero, reported no status or a failed
     one is a failed measurement, even if a time was parsed."""
@@ -344,7 +387,13 @@ def compare_run(baseline, res):
     verdict = {
         "verdict": None, "regressions": [], "improvements": [], "measured_nothing": [],
         "comparison_errors": [], "unexpected_successes": [], "pfr_status": None,
-        "skipped_reason": None, "same_binary": None, "gates": {},
+        "skipped_reason": None, "same_binary": None,
+        "baseline_commit": baseline.get("turbo_lean_commit") if baseline else None,
+        "run_commit": res.get("turbo_lean_commit"),
+        "baseline_binary_sha256": ((baseline.get("turbo_lean_binary") or {}).get("sha256")
+                                   if baseline else None),
+        "run_binary_sha256": (res.get("turbo_lean_binary") or {}).get("sha256"),
+        "gates": {},
     }
     for wid in baseline["workloads"] if baseline else {}:
         if wid not in res["workloads"]:
@@ -377,7 +426,23 @@ def compare_run(baseline, res):
         verdict["verdict"] = "not_compared"
         verdict["skipped_reason"] = "no baseline given or found"
         return verdict
-    verdict["same_binary"] = (res.get("turbo_lean_commit") == baseline.get("turbo_lean_commit"))
+    b_sha = verdict["baseline_binary_sha256"]
+    r_sha = verdict["run_binary_sha256"]
+    verdict["same_binary"] = bool(b_sha and r_sha and b_sha == r_sha)
+    if not workload_revs_match(baseline, res):
+        verdict["verdict"] = "comparison_refused_workload_rev_mismatch"
+        verdict["skipped_reason"] = (
+            f"baseline workload_revs={baseline.get('workload_revs')} != "
+            f"run workload_revs={res.get('workload_revs')}; "
+            "refusing comparison across different workload revisions")
+        return verdict
+    if not toolchain_matches(baseline, res):
+        verdict["verdict"] = "comparison_refused_toolchain_mismatch"
+        verdict["skipped_reason"] = (
+            f"baseline toolchain={toolchain_key(baseline)} != "
+            f"run toolchain={toolchain_key(res)}; "
+            "refusing comparison across different Lean toolchains")
+        return verdict
     if not host_matches(baseline, res):
         verdict["verdict"] = "comparison_skipped_host_mismatch"
         verdict["skipped_reason"] = (
@@ -626,6 +691,40 @@ def turbo_lean_commit_for(binary: Path, git_bin: str):
                 return rev, dirty, str(repo)
         repo = repo.parent
     return "not_a_git_checkout", None, None
+
+
+def detect_toolchain(dirs):
+    tc_by_repo = {}
+    for repo in sorted(dirs):
+        p = dirs[repo] / "lean-toolchain"
+        if not p.is_file():
+            raise BenchEnvError(f"{repo} lean-toolchain file missing: {p}")
+        val = p.read_text().strip()
+        if not val:
+            raise BenchEnvError(f"{repo} lean-toolchain file is empty: {p}")
+        tc_by_repo[repo] = val
+    unique = sorted(set(tc_by_repo.values()))
+    if len(unique) != 1:
+        raise BenchEnvError(
+            f"workload lean-toolchain files disagree ({tc_by_repo}); "
+            "all pinned workloads must share one Lean toolchain")
+    lean_tc = unique[0]
+    lean_bin = shutil.which("lean")
+    if not lean_bin:
+        elan_lean = Path.home() / ".elan" / "bin" / "lean"
+        if elan_lean.is_file():
+            lean_bin = str(elan_lean)
+    if not lean_bin:
+        raise BenchEnvError("lean binary not found on PATH (needed to record lean --version)")
+    try:
+        lean_ver = subprocess.check_output(
+            [lean_bin, "--version"], cwd=str(dirs["batteries"]),
+            text=True, stderr=subprocess.STDOUT, timeout=30).strip().splitlines()[0].strip()
+    except (OSError, subprocess.SubprocessError, IndexError) as e:
+        raise BenchEnvError(f"failed to run `{lean_bin} --version`: {e}") from e
+    if not lean_ver:
+        raise BenchEnvError(f"`{lean_bin} --version` produced empty output")
+    return {"lean_toolchain": lean_tc, "lean_version": lean_ver, "by_repo": tc_by_repo}
 
 
 # ----------------------------------------------------------- daemon control
@@ -1168,6 +1267,7 @@ def main(argv=None):
                 "commit or restore the tracked changes first: the committed baseline "
                 "must record honest provenance (commit + dirty flag + binary hash).")
         binary_sha = hashlib.sha256(runner.bin.read_bytes()).hexdigest()
+        toolchain = detect_toolchain(runner.dirs)
         h = host_id(args.machine_label)
         settings = {v: os.environ.get(v) for v in RECORDED_ENV_VARS}
         settings["git_version"] = git_human
@@ -1177,6 +1277,7 @@ def main(argv=None):
             "turbo_lean_commit": commit, "turbo_lean_dirty": dirty,
             "turbo_lean_repo": repo_path,
             "turbo_lean_binary": {"path": str(runner.bin), "sha256": binary_sha},
+            "toolchain": toolchain,
             "host": h, "settings": settings, "workload_revs": dict(runner.revs),
             "revs_pinned": (not args.skip_rev_check),
             "node": {"load1_at_start": None if load_at_start is None else round(load_at_start, 2),
@@ -1201,6 +1302,12 @@ def main(argv=None):
         if args.out:
             Path(args.out).write_text(payload + "\n")
         print(payload if not args.out else f"results written to {args.out}")
+        if baseline is not None:
+            same_note = " (same binary)" if verdict.get("same_binary") else ""
+            print(f"COMPARISON PROVENANCE: baseline commit={verdict.get('baseline_commit')} "
+                  f"sha256={verdict.get('baseline_binary_sha256')} -> "
+                  f"run commit={verdict.get('run_commit')} "
+                  f"sha256={verdict.get('run_binary_sha256')}{same_note}")
         for cell in sorted(verdict["gates"]):
             g = verdict["gates"][cell]
             if g.get("baseline_median_ms") is None:
