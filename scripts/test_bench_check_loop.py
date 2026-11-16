@@ -716,6 +716,12 @@ class PfrAndSourceSafety(unittest.TestCase):
          "    if mode == 'id_unconfirmed':\n"
          "        sys.stderr.write(\"Error: Cannot report a verdict: declaration identity unconfirmed for `rdist_of_neg_le`\\nerror: unknown module prefix 'PFR'\\n\")\n"
          "        sys.exit(1)\n"
+         "    if mode == 'stale_lock' or (mode == 'stale_lock_second' and n >= 1):\n"
+         "        print(json.dumps({'error': 'Error: build lock is stale, retry later'}))\n"
+         "        sys.exit(1)\n"
+         "    if mode == 'stale_text':\n"
+         "        print(json.dumps({'error': 'Error: shm cache entry is stale, retry later'}))\n"
+         "        sys.exit(1)\n"
          "    print(json.dumps({'error': 'stale imports: import_refresh fail-closed'}))\n"
 
         "    sys.exit(1)\n"
@@ -795,6 +801,72 @@ class PfrAndSourceSafety(unittest.TestCase):
             self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
             self.assertIn("blocked_workload_unexpected_failure", r.stdout + r.stderr)
             self.assertIn("declaration_not_found", r.stdout + r.stderr)
+
+    def test_generic_stale_lock_failure_is_not_import_refresh_class(self):
+        """DeepSeek2670: 'build lock is stale' matched the broad bare-'stale' rule."""
+        mod = load_script()
+        self.assertEqual(
+            mod.classify_error(1, None, "Error: build lock is stale, retry later"),
+            "exit_1")
+
+    def test_unrelated_stale_text_is_not_import_refresh_class(self):
+        mod = load_script()
+        self.assertEqual(
+            mod.classify_error(1, None, "Error: shm cache entry is stale, retry later"),
+            "exit_1")
+
+    def test_genuine_import_refresh_shapes_keep_expected_class(self):
+        mod = load_script()
+        self.assertEqual(
+            mod.classify_error(1, None, "stale imports: import_refresh fail-closed"),
+            "stale_import_refresh_fail_closed")
+        self.assertEqual(
+            mod.classify_error(1, None, "Error: Worktree opt-out prevents refreshing "
+                                        "stale imports: Mathlib.Data.Fin.Basic"),
+            "stale_import_refresh_fail_closed")
+
+    def test_stale_lock_probe_is_unexpected_failure_not_blocked_as_expected(self):
+        with tempfile.TemporaryDirectory(prefix="m1-pfr-lock-") as td:
+            r = self._run(td, ["--no-baseline"], env_extra={"FAKE_PFR_MODE": "stale_lock"})
+            self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+            combined = r.stdout + r.stderr
+            self.assertIn("blocked_workload_unexpected_failure", combined)
+            data = json.loads((Path(td) / "o.json").read_text())
+            pfr = data["workloads"]["pfr_more_ruzsa_dist"]
+            self.assertEqual(pfr["status"], "blocked_unexpected_failure", pfr)
+            self.assertEqual(pfr["error_class"], "exit_1", pfr)
+            self.assertNotIn("stale_import_refresh_fail_closed",
+                             pfr["probe_error_classes"], pfr)
+
+    def test_unrelated_stale_text_probe_is_unexpected_failure(self):
+        with tempfile.TemporaryDirectory(prefix="m1-pfr-staletext-") as td:
+            r = self._run(td, ["--no-baseline"], env_extra={"FAKE_PFR_MODE": "stale_text"})
+            self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+            self.assertIn("blocked_workload_unexpected_failure", r.stdout + r.stderr)
+
+    def test_mixed_genuine_and_stale_lock_probes_are_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="m1-pfr-mixed-lock-") as td:
+            r = self._run(td, ["--no-baseline"],
+                          env_extra={"FAKE_PFR_MODE": "stale_lock_second",
+                                     "FAKE_COUNTER_FILE": str(Path(td) / "cnt")})
+            self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+            combined = r.stdout + r.stderr
+            self.assertIn("blocked_workload_unexpected_failure", combined)
+            data = json.loads((Path(td) / "o.json").read_text())
+            pfr = data["workloads"]["pfr_more_ruzsa_dist"]
+            self.assertEqual(pfr["status"], "blocked_unexpected_failure", pfr)
+
+    def test_genuine_expected_probe_failure_still_blocked_as_expected(self):
+        with tempfile.TemporaryDirectory(prefix="m1-pfr-genuine-") as td:
+            r = self._run(td, ["--no-baseline"], env_extra={"FAKE_PFR_MODE": "fail"})
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            data = json.loads((Path(td) / "o.json").read_text())
+            pfr = data["workloads"]["pfr_more_ruzsa_dist"]
+            self.assertEqual(pfr["status"], "blocked_as_expected", pfr)
+            self.assertEqual(pfr["error_class"], "stale_import_refresh_fail_closed", pfr)
+            # successes: the active workloads still measure OK in the same run
+            for wid in ("batteries_list_lemmas_top", "batteries_unionfind_top"):
+                self.assertEqual(data["workloads"][wid]["status"], "ok", wid)
 
     def test_pfr_every_probe_exit_is_checked_not_just_the_last(self):
         with tempfile.TemporaryDirectory(prefix="m1-pfr-") as td:
