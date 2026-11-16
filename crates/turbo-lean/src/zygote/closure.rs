@@ -1,4 +1,3 @@
-#[cfg(not(unix))]
 use crate::db::TurboStore;
 use crate::pack::next_tmp_id;
 use anyhow::Result;
