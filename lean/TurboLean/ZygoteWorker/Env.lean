@@ -46,8 +46,6 @@ open Lean Elab
 
 namespace TurboLean.ZygoteWorker
 
-namespace TurboLean.ZygoteWorker
-
 instance : MonadEnv (ReaderT Environment Id) where
   getEnv := read
   modifyEnv _ := pure ()
