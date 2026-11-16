@@ -12,6 +12,7 @@ built binaries exist, so it can never recurse into itself when it is run
 from inside the contract run.
 """
 
+import hashlib
 import os
 import re
 import shutil
@@ -45,6 +46,41 @@ EXPECTED_FINAL_LINE = (
     "=== LOCAL VALIDATION GATES PASSED (scalar + multi-module Lake C2 fixtures; "
     "full roadmap coverage remains open) ==="
 )
+
+# The gate fragments exactly as HY1 left them, in the order the runner
+# sources them (lexicographic, C collation). A later leaf that adds a
+# fragment or changes one must update this list and the hashes below in the
+# same commit, so the pin keeps failing on anything it was not told about.
+EXPECTED_FRAGMENT_NAMES = [
+    "10_docs_pinning_ratchet.sh",
+    "20_audit_spec_v2.sh",
+    "21_audit_spec_strict_proofs.sh",
+    "30_axiom_gate.sh",
+    "40_verified_pass_hygiene.sh",
+    "50_plugin_mutant_gate.sh",
+    "60_conformance_fuzz_trust.sh",
+    "70_llvm_alive2_leanmlir.sh",
+    "80_gpu_tpu_bridges.sh",
+    "90_target_ir_fuzz.sh",
+    "99_heapobj_sanitizers.sh",
+]
+
+# SHA-256 of each fragment's bytes. A gate that is edited, emptied below its
+# header or truncated changes its hash; a later leaf that legitimately
+# changes a fragment updates its hash here in the same commit.
+EXPECTED_FRAGMENT_HASHES = {
+    "10_docs_pinning_ratchet.sh": "ac187453635c45e67abc47e65127f25aeb67c00a8318e6768dd236b2ceddb9ac",
+    "20_audit_spec_v2.sh": "e0e9df7c3c15bc028155d847c77c6f142f47ac73806f5fc0c4d0c5304ef9b951",
+    "21_audit_spec_strict_proofs.sh": "d0c073cae6410d0092a388ff404b2cacaea2e112f1639fe93796af0c066fd15f",
+    "30_axiom_gate.sh": "49e36170e63217edc80887b8d26cb6b199b079596de0abdc54bd6e4104a8f60a",
+    "40_verified_pass_hygiene.sh": "7cbb8ca4782a952d9a2e31466de6d6677273a9f7a49e9386cb3be086d1d997e0",
+    "50_plugin_mutant_gate.sh": "d7463ec4943426b4e235e6706eac9e49f4def2e2eec02437c8b510948763ea43",
+    "60_conformance_fuzz_trust.sh": "fdb3048842442b9a5a3b2f7ee69bcf743afbef69e7f921470c28cfcc688ec10f",
+    "70_llvm_alive2_leanmlir.sh": "78bdb696aa1e89b2300de270d9284902a58dd5a5aeb5bee78ed79cb1b89e0ca2",
+    "80_gpu_tpu_bridges.sh": "c9887ba4b3fa22d0fb6e2c10d4de9fc952a4ca47895c5fff570003e08863b798",
+    "90_target_ir_fuzz.sh": "d547e8e891d7443383ce86f125718c6b2c69439b850f36303584297e88b8c278",
+    "99_heapobj_sanitizers.sh": "e38b638d6d2cba43b8939e90afef0c860b666e7faa91b1198bbb3fa0105e36e2",
+}
 
 ECHO_HEADER_RE = re.compile(r'^echo "(=== .* ===)"\s*$', re.MULTILINE)
 GATE_HEADER_RE = re.compile(r"^=== \[\d+b?/10\] ")
@@ -167,6 +203,27 @@ class ContractScriptShape(unittest.TestCase):
             self.assertTrue(
                 GATE_HEADER_RE.match(line) or FINAL_LINE_RE.match(line),
                 f"unexpected === line not covered by the pin: {line!r}",
+            )
+
+    def test_fragment_files_are_exactly_the_pinned_list(self):
+        if not CONTRACT_D.is_dir():
+            self.skipTest("pre-HY1 layout: fragments are inline in the runner")
+        actual = sorted(p.name for p in CONTRACT_D.glob("*.sh"))
+        self.assertEqual(
+            actual, sorted(EXPECTED_FRAGMENT_NAMES),
+            "contract.d gained, lost or renamed a fragment without the pin being updated",
+        )
+
+    def test_fragment_bodies_match_pinned_hashes(self):
+        if not CONTRACT_D.is_dir():
+            self.skipTest("pre-HY1 layout: fragments are inline in the runner")
+        for name in EXPECTED_FRAGMENT_NAMES:
+            fragment = CONTRACT_D / name
+            self.assertTrue(fragment.is_file(), f"fragment {name} is missing")
+            digest = hashlib.sha256(fragment.read_bytes()).hexdigest()
+            self.assertEqual(
+                digest, EXPECTED_FRAGMENT_HASHES.get(name),
+                f"fragment {name} changed (edited, emptied or truncated) without its pin hash being updated",
             )
 
     def test_any_gate_failure_fails_the_run(self):
