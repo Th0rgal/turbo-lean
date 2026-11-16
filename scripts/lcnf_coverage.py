@@ -2149,6 +2149,111 @@ class TestLcnfCoverage(unittest.TestCase):
             chk_bad["errors"],
         )
 
+    def _nested_leaf_like(self, entry: dict[str, Any]) -> dict[str, Any]:
+        leaf = {f: entry[f] for f in RESULT_FIELDS}
+        leaf["rejected_not_lowered_reason"] = entry["rejected_not_lowered_reason"]
+        return leaf
+
+    def test_rejects_unsupported_deeper_subcorpora_in_baseline(self) -> None:
+        # H1.0a-V2 defect 1: only one nested level was compared, so a fabricated
+        # deeper subcorpus whose counts exactly sum to its parent passed both the
+        # results-file validator and `--check`. Deeper nesting is not a supported
+        # schema; it must fail closed instead of being silently ignored.
+        baseline = self._v_committed_baseline()
+        rep = self._v_fake_live_report()
+        cname = "std_init_and_c2"
+        parent = "std_init_data"
+        entry = baseline["corpora"][cname]["subcorpora"][parent]
+        entry["subcorpora"] = {"fabricated_leaf": self._nested_leaf_like(entry)}
+
+        errs = validate_results_document(baseline)
+        self.assertTrue(
+            any(parent in e and "subcorpora" in e and "depth" in e.lower() for e in errs),
+            f"deeper subcorpus accepted by results validator: {errs}",
+        )
+        chk = check_coverage_report(ROOT_DIR, rep, results=baseline)
+        self.assertFalse(chk["ok"], "fabricated deeper subcorpus passed --check")
+        self.assertTrue(
+            any(parent in e and "subcorpora" in e for e in chk["errors"]),
+            chk["errors"],
+        )
+
+    def test_rejects_unsupported_deeper_subcorpora_in_live_report(self) -> None:
+        # A live report must not be able to smuggle an unsupported deeper level
+        # past comparison either.
+        rep = self._v_fake_live_report()
+        parent = "std_init_data"
+        entry = rep["corpora"]["std_init_and_c2"]["subcorpora"][parent]
+        entry["subcorpora"] = {"fabricated_leaf": self._nested_leaf_like(entry)}
+        chk = check_coverage_report(ROOT_DIR, rep, results=self._v_committed_baseline())
+        self.assertFalse(chk["ok"], "live deeper subcorpus passed --check")
+        self.assertTrue(
+            any(parent in e and "subcorpora" in e for e in chk["errors"]),
+            chk["errors"],
+        )
+
+    def test_nested_missing_extra_type_and_count_fail_closed(self) -> None:
+        # Adversarial nested shapes: missing field, extra fabricated depth, wrong
+        # type, and a count that breaks the parent sum must each yield a named
+        # error, never a silent pass.
+        baseline = self._v_committed_baseline()
+        cname = "std_init_and_c2"
+        parent = "std_init_data"
+        mutations: list[tuple[str, dict[str, Any]]] = []
+
+        missing = json.loads(json.dumps(baseline))
+        del missing["corpora"][cname]["subcorpora"][parent]["proved"]
+        mutations.append(("missing", missing))
+
+        extra = json.loads(json.dumps(baseline))
+        entry = extra["corpora"][cname]["subcorpora"][parent]
+        entry["subcorpora"] = {"fabricated_leaf": self._nested_leaf_like(entry)}
+        mutations.append(("extra-depth", extra))
+
+        wrong_type = json.loads(json.dumps(baseline))
+        wrong_type["corpora"][cname]["subcorpora"][parent]["proved"] = "16"
+        mutations.append(("type", wrong_type))
+
+        bad_count = json.loads(json.dumps(baseline))
+        bad_count["corpora"][cname]["subcorpora"][parent]["total_declarations"] += 1
+        mutations.append(("count", bad_count))
+
+        for label, doc in mutations:
+            errs = validate_results_document(doc)
+            self.assertTrue(errs, f"nested {label} mutation passed results validation")
+
+    def test_measured_baseline_corpus_cannot_be_skipped_as_live_not_measured(self) -> None:
+        # H1.0a-V2 defect 2: a baseline entry with measured counts must fail closed
+        # when the live report says `not_measured`; it must not be recorded as an
+        # honest skip with nothing compared.
+        baseline = self._v_committed_baseline()
+        rep = self._v_fake_live_report()
+        rep["corpora"]["c1_corpus"] = {
+            "measurement_source": "not_measured",
+            "reason": "test: could not measure live",
+        }
+        chk = check_coverage_report(ROOT_DIR, rep, results=baseline)
+        self.assertFalse(chk["ok"], "measured baseline with live not_measured passed --check")
+        self.assertTrue(
+            any("c1_corpus" in e and "not_measured" in e for e in chk["errors"]),
+            chk["errors"],
+        )
+        self.assertNotIn("c1_corpus", chk["skipped_corpora"])
+
+    def test_baseline_not_measured_stub_still_skips_when_live_not_measured(self) -> None:
+        # Preserve intentionally unmeasured external corpora: an honest
+        # `not_measured` baseline stub matching a live `not_measured` report is
+        # still a skip, not an error.
+        baseline = self._v_committed_baseline()
+        baseline["corpora"]["con_leche_h3_benchmark"] = {
+            "measurement_source": "not_measured",
+            "reason": "external corpus intentionally absent",
+        }
+        rep = self._v_fake_live_report()
+        chk = check_coverage_report(ROOT_DIR, rep, results=baseline)
+        self.assertTrue(chk["ok"], chk["errors"])
+        self.assertIn("con_leche_h3_benchmark", chk["skipped_corpora"])
+
     # ------------------------------------------------------------------
     # H1.0a-S (split S): honest proof classification and fail-closed
     # measurement (DeepSeek soundness findings against the audit driver;
