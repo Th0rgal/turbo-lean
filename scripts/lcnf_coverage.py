@@ -293,7 +293,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "status": "lowered_unproved",
         "evidence_file": "lean/LeanNative/IR/BridgeHelpers.lean",
         "evidence_symbol": "tryLowerGfSimdIntrinsic",
-        "notes": "Intercepted in BridgeHelpers before RealLCNFBridge with assurance := .tested; 0 hits across Batteries/C2, C1, and con-leche.",
+        "notes": "Intercepted in BridgeHelpers before RealLCNFBridge with assurance := .tested; 0 hits across Std/Init+C2, C1, and con-leche.",
     },
     {
         "id": "LetValue.fap.general",
@@ -493,7 +493,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
 # measurement numbers: every count in the emitted JSON comes from the audit run of the
 # current invocation (see `build_live_corpora`).
 CORPUS_SCOPES: dict[str, str] = {
-    "batteries_and_c2": (
+    "std_init_and_c2": (
         "Non-aux compiled LCNF declarations across in-toolchain Std/Init core data structure "
         "modules (`Init.Data.{Array.Basic,Array.BinSearch,Array.QSort,ByteArray.Basic,BitVec.Basic,UInt.Basic}`, "
         "`Std.Data.{HashMap.Basic,DHashMap.Internal.Raw,TreeMap.Basic,ByteSlice}`) and Tier C2 "
@@ -853,7 +853,7 @@ def execute_live_lean_audit(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     result = {
         "executed": True,
         "toolchain": PINNED_TOOLCHAIN,
-        "batteries_and_c2": {
+        "std_init_and_c2": {
             "total_declarations": st + c2t,
             "proved": sp + c2p,
             "lowered_unproved": su + c2u,
@@ -1017,27 +1017,23 @@ def build_live_corpora(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     live = execute_live_lean_audit(root_dir)
     corpora: dict[str, Any] = {}
     if not live.get("executed", False):
-        corpora["batteries_and_c2"] = {
+        corpora["std_init_and_c2"] = {
             "measurement_source": "not_measured",
             "reason": f"live audit did not execute: {live.get('reason', 'unknown')}",
         }
-        corpora["c1_corpus"] = dict(corpora["batteries_and_c2"])
+        corpora["c1_corpus"] = dict(corpora["std_init_and_c2"])
     else:
-        bat = live["batteries_and_c2"]
-        corpora["batteries_and_c2"] = {
+        bat = live["std_init_and_c2"]
+        corpora["std_init_and_c2"] = {
             "measurement_source": "live_invocation",
             "measured_at_utc": _utc_now(),
-            "scope": CORPUS_SCOPES["batteries_and_c2"],
+            "scope": CORPUS_SCOPES["std_init_and_c2"],
             "toolchain": PINNED_TOOLCHAIN,
             "total_declarations": bat["total_declarations"],
             "proved": bat["proved"],
             "lowered_unproved": bat["lowered_unproved"],
             "rejected": bat["rejected"],
             "subcorpora": bat["subcorpora"],
-            "unknown_external_batteries_modules": {
-                "status": "unknown",
-                "reason": _batteries_unknown_reason(),
-            },
         }
         c1 = live["c1_corpus"]
         corpora["c1_corpus"] = {
@@ -1050,6 +1046,10 @@ def build_live_corpora(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
             "lowered_unproved": c1["lowered_unproved"],
             "rejected": c1["rejected"],
         }
+    corpora["external_batteries"] = {
+        "status": "unknown",
+        "reason": _batteries_unknown_reason(),
+    }
     corpora["con_leche_h3_benchmark"] = measure_con_leche(root_dir)
     return corpora
 
@@ -1247,7 +1247,7 @@ def check_coverage_report(
         if not live.get("executed", False):
             errors.append(f"Live Lean lowerer execution failed: {live.get('reason', 'unknown')}")
         else:
-            for cname in ("batteries_and_c2", "c1_corpus"):
+            for cname in ("std_init_and_c2", "c1_corpus"):
                 if cname not in live:
                     continue
                 c_rep = rep.get("corpora", {}).get(cname, {})
@@ -1297,9 +1297,9 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertEqual(summary["proved"], 32)
         self.assertEqual(summary["lowered_unproved"], 4)
         self.assertEqual(summary["rejected"], 10)
-        bat = rep["corpora"]["batteries_and_c2"]
+        bat = rep["corpora"]["std_init_and_c2"]
         self.assertEqual(bat["measurement_source"], "live_invocation")
-        self.assertEqual(bat["unknown_external_batteries_modules"]["status"], "unknown")
+        self.assertEqual(rep["corpora"]["external_batteries"]["status"], "unknown")
         self.assertEqual(bat["proved"], 29)
         self.assertEqual(bat["lowered_unproved"], 72)
         self.assertEqual(bat["rejected"], 1704)
@@ -1315,7 +1315,7 @@ class TestLcnfCoverage(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
         data = json.loads(proc.stdout)
-        for cname in ("batteries_and_c2", "c1_corpus"):
+        for cname in ("std_init_and_c2", "c1_corpus"):
             corp = data["corpora"][cname]
             self.assertEqual(
                 corp.get("measurement_source"),
@@ -1397,10 +1397,10 @@ class TestLcnfCoverage(unittest.TestCase):
 
     def test_detects_corrupted_corpus_total(self) -> None:
         rep = build_coverage_report(ROOT_DIR)
-        rep["corpora"]["batteries_and_c2"]["rejected"] += 3
+        rep["corpora"]["std_init_and_c2"]["rejected"] += 3
         chk = check_coverage_report(ROOT_DIR, rep)
         self.assertFalse(chk["ok"])
-        self.assertTrue(any("batteries_and_c2" in e for e in chk["errors"]))
+        self.assertTrue(any("std_init_and_c2" in e for e in chk["errors"]))
 
     def test_detects_bridge_digest_drift(self) -> None:
         import shutil
@@ -1422,10 +1422,10 @@ class TestLcnfCoverage(unittest.TestCase):
         live = execute_live_lean_audit(ROOT_DIR)
         self.assertTrue(live["executed"], live)
         self.assertEqual(live["toolchain"], PINNED_TOOLCHAIN)
-        self.assertEqual(live["batteries_and_c2"]["total_declarations"], 1805)
-        self.assertEqual(live["batteries_and_c2"]["proved"], 29)
-        self.assertEqual(live["batteries_and_c2"]["lowered_unproved"], 72)
-        self.assertEqual(live["batteries_and_c2"]["rejected"], 1704)
+        self.assertEqual(live["std_init_and_c2"]["total_declarations"], 1805)
+        self.assertEqual(live["std_init_and_c2"]["proved"], 29)
+        self.assertEqual(live["std_init_and_c2"]["lowered_unproved"], 72)
+        self.assertEqual(live["std_init_and_c2"]["rejected"], 1704)
         self.assertEqual(live["c1_corpus"]["total_declarations"], 902)
         self.assertEqual(live["c1_corpus"]["proved"], 782)
         self.assertEqual(live["c1_corpus"]["lowered_unproved"], 98)
@@ -1563,14 +1563,13 @@ class TestLcnfCoverage(unittest.TestCase):
 
     def test_std_init_and_c2_renamed_and_external_batteries_separate_unknown(self) -> None:
         # Point 3: the corpus holding Init/Std + C2 is named `std_init_and_c2` (not
-        # `batteries_and_c2`), and external Batteries is its own top-level corpus entry
-        # with status `unknown`.
+        # a misleading Batteries name), and external Batteries is its own top-level
+        # corpus entry with status `unknown`.
         self.assertIn("std_init_and_c2", CORPUS_SCOPES)
-        self.assertNotIn("batteries_and_c2", CORPUS_SCOPES)
+        self.assertEqual(set(CORPUS_SCOPES.keys()), {"std_init_and_c2", "c1_corpus"})
         rep = build_coverage_report(ROOT_DIR)
         corpora = rep["corpora"]
         self.assertIn("std_init_and_c2", corpora)
-        self.assertNotIn("batteries_and_c2", corpora)
         self.assertIn("external_batteries", corpora)
         ext = corpora["external_batteries"]
         self.assertEqual(ext.get("status"), "unknown")
@@ -1625,7 +1624,7 @@ def main() -> int:
             f"({ms['lowered_unproved']} lowered_unproved, {ms['rejected']} rejected)"
         ]
         for label, cname in (
-            ("batteries_c2", "batteries_and_c2"),
+            ("std_init_and_c2", "std_init_and_c2"),
             ("c1", "c1_corpus"),
             ("con_leche", "con_leche_h3_benchmark"),
         ):
