@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "kind": "baseline",
-  "created_utc": "2026-11-16T05:34:12Z",
-  "turbo_lean_commit": "62d07d1ba7972a419247a11c215d870ee1c8e52f",
+  "created_utc": "2026-11-16T06:55:18Z",
+  "turbo_lean_commit": "806c36fcefbbb219e0edb39f2548f0a64e2ba689",
   "host": {
     "hostname": "uruk",
     "machine_label": null,
@@ -24,7 +24,7 @@
     "TURBO_LEAN_TELEMETRY": null,
     "TURBO_LEAN_DAEMON_IDLE_SECS": null,
     "git_version": "git version 2.47.1",
-    "scratch_root": "/tmp/m1-bench-pmvwaioa"
+    "scratch_root": "/tmp/m1-bench-yzjmeqno"
   },
   "workloads": {
     "batteries_list_lemmas_top": {
@@ -37,43 +37,49 @@
       "modes": {
         "cold_no_daemon": {
           "runs_ms": [
-            3602.5,
-            3500.4,
-            3601.4,
-            3480.8,
-            3563.6
+            3372.4,
+            3458.0,
+            3437.3,
+            3393.0,
+            3419.9
           ],
           "trials": 5,
-          "median_ms": 3563.6,
-          "spread_ms": 121.7,
-          "rel_spread": 0.0341,
+          "median_ms": 3419.9,
+          "spread_ms": 85.6,
+          "rel_spread": 0.025,
           "coverage_ratio_min": 1.0,
           "statuses_observed": [
             "exit_0"
           ],
           "phases_ms_median": {
             "cas_lookup": 0.3,
-            "cli_startup": 2.2,
+            "cli_startup": 1.5,
             "dependent_recheck": 10.1,
-            "elaboration": 619.5,
-            "identity_probe": 782.5,
-            "import_refresh": 1974.7,
-            "setup": 78.4,
-            "split_and_hygiene": 45.4
-          }
+            "elaboration": 572.0,
+            "identity_probe": 745.0,
+            "import_refresh": 1937.5,
+            "setup": 82.5,
+            "split_and_hygiene": 41.5
+          },
+          "psi_max_avg10": {
+            "cpu": 0.0,
+            "memory": 0.0,
+            "io": 0.0
+          },
+          "psi_contended": false
         },
         "warm_cache_hit_daemon": {
           "runs_ms": [
-            918.7,
-            881.9,
-            881.0,
-            873.7,
-            864.0
+            911.5,
+            869.1,
+            896.4,
+            871.8,
+            879.5
           ],
           "trials": 5,
-          "median_ms": 881.0,
-          "spread_ms": 54.7,
-          "rel_spread": 0.0621,
+          "median_ms": 879.5,
+          "spread_ms": 42.4,
+          "rel_spread": 0.0482,
           "coverage_ratio_min": 0.9999,
           "statuses_observed": [
             "theorem_cache_hit"
@@ -82,38 +88,50 @@
             "cas_lookup": 0.4,
             "cli_startup": 0.6,
             "dependent_recheck": 4.1,
-            "identity_probe": 762.4,
-            "import_refresh": 69.5,
-            "setup": 15.4,
-            "split_and_hygiene": 26.9
-          }
+            "identity_probe": 752.8,
+            "import_refresh": 70.0,
+            "setup": 15.5,
+            "split_and_hygiene": 27.1
+          },
+          "psi_max_avg10": {
+            "cpu": 0.0,
+            "memory": 0.0,
+            "io": 0.0
+          },
+          "psi_contended": false
         },
         "warm_edited_proof_daemon": {
           "runs_ms": [
-            1396.8,
-            1389.3,
-            1340.0,
-            1318.3,
-            1362.7
+            1257.8,
+            1248.0,
+            1331.0,
+            1262.4,
+            1302.0
           ],
           "trials": 5,
-          "median_ms": 1362.7,
-          "spread_ms": 78.5,
-          "rel_spread": 0.0576,
-          "coverage_ratio_min": 1.0,
+          "median_ms": 1262.4,
+          "spread_ms": 82.9,
+          "rel_spread": 0.0657,
+          "coverage_ratio_min": 0.9999,
           "statuses_observed": [
             "theorem_verified"
           ],
           "phases_ms_median": {
             "cas_lookup": 0.4,
-            "cli_startup": 0.5,
-            "dependent_recheck": 74.1,
-            "elaboration": 288.2,
-            "identity_probe": 877.1,
-            "import_refresh": 67.9,
+            "cli_startup": 0.6,
+            "dependent_recheck": 72.9,
+            "elaboration": 294.7,
+            "identity_probe": 778.9,
+            "import_refresh": 68.6,
             "setup": 15.4,
-            "split_and_hygiene": 39.5
-          }
+            "split_and_hygiene": 40.0
+          },
+          "psi_max_avg10": {
+            "cpu": 0.0,
+            "memory": 0.0,
+            "io": 0.0
+          },
+          "psi_contended": false
         }
       }
     },
@@ -127,83 +145,101 @@
       "modes": {
         "cold_no_daemon": {
           "runs_ms": [
-            14630.9,
-            13757.6,
-            13803.5,
-            13899.8,
-            13721.8
+            13818.1,
+            13896.6,
+            13902.7,
+            13837.7,
+            13860.8
           ],
           "trials": 5,
-          "median_ms": 13803.5,
-          "spread_ms": 909.1,
-          "rel_spread": 0.0659,
+          "median_ms": 13860.8,
+          "spread_ms": 84.6,
+          "rel_spread": 0.0061,
           "coverage_ratio_min": 1.0,
           "statuses_observed": [
             "exit_0"
           ],
           "phases_ms_median": {
-            "cas_lookup": 0.4,
-            "cli_startup": 0.7,
-            "dependent_recheck": 10.2,
-            "elaboration": 602.8,
-            "identity_probe": 821.8,
-            "import_refresh": 12274.8,
-            "setup": 55.7,
-            "split_and_hygiene": 54.9
-          }
+            "cas_lookup": 0.3,
+            "cli_startup": 0.9,
+            "dependent_recheck": 12.7,
+            "elaboration": 566.7,
+            "identity_probe": 774.1,
+            "import_refresh": 12354.2,
+            "setup": 79.2,
+            "split_and_hygiene": 55.6
+          },
+          "psi_max_avg10": {
+            "cpu": 0.0,
+            "memory": 0.0,
+            "io": 0.0
+          },
+          "psi_contended": false
         },
         "warm_cache_hit_daemon": {
           "runs_ms": [
-            1032.0,
-            989.1,
-            993.5,
-            989.0,
-            968.8
+            962.6,
+            950.2,
+            936.6,
+            955.6,
+            953.8
           ],
           "trials": 5,
-          "median_ms": 989.1,
-          "spread_ms": 63.2,
-          "rel_spread": 0.0639,
+          "median_ms": 953.8,
+          "spread_ms": 26.0,
+          "rel_spread": 0.0272,
           "coverage_ratio_min": 0.9999,
           "statuses_observed": [
             "theorem_cache_hit"
           ],
           "phases_ms_median": {
             "cas_lookup": 0.4,
-            "cli_startup": 0.6,
-            "dependent_recheck": 4.2,
-            "identity_probe": 811.4,
-            "import_refresh": 113.4,
-            "setup": 17.9,
+            "cli_startup": 0.5,
+            "dependent_recheck": 4.1,
+            "identity_probe": 771.6,
+            "import_refresh": 114.1,
+            "setup": 18.1,
             "split_and_hygiene": 38.6
-          }
+          },
+          "psi_max_avg10": {
+            "cpu": 0.0,
+            "memory": 0.0,
+            "io": 0.0
+          },
+          "psi_contended": false
         },
         "warm_edited_proof_daemon": {
           "runs_ms": [
-            1507.9,
-            1524.1,
-            1367.2,
-            1490.3,
-            1429.6
+            1240.4,
+            1292.2,
+            1312.7,
+            1254.3,
+            1261.7
           ],
           "trials": 5,
-          "median_ms": 1490.3,
-          "spread_ms": 157.0,
-          "rel_spread": 0.1053,
+          "median_ms": 1261.7,
+          "spread_ms": 72.3,
+          "rel_spread": 0.0573,
           "coverage_ratio_min": 1.0,
           "statuses_observed": [
             "theorem_verified"
           ],
           "phases_ms_median": {
-            "cas_lookup": 0.3,
-            "cli_startup": 0.6,
-            "dependent_recheck": 83.7,
-            "elaboration": 246.4,
-            "identity_probe": 948.1,
-            "import_refresh": 116.9,
+            "cas_lookup": 0.4,
+            "cli_startup": 0.5,
+            "dependent_recheck": 51.5,
+            "elaboration": 239.2,
+            "identity_probe": 775.1,
+            "import_refresh": 114.0,
             "setup": 17.9,
             "split_and_hygiene": 54.9
-          }
+          },
+          "psi_max_avg10": {
+            "cpu": 0.0,
+            "memory": 0.0,
+            "io": 0.0
+          },
+          "psi_contended": false
         }
       }
     },
@@ -217,43 +253,49 @@
       "modes": {
         "cold_no_daemon": {
           "runs_ms": [
-            10360.7,
-            10400.1,
-            10347.4,
-            10502.7,
-            10381.2
+            10267.8,
+            10367.5,
+            10278.2,
+            10428.8,
+            10261.2
           ],
           "trials": 5,
-          "median_ms": 10381.2,
-          "spread_ms": 155.3,
-          "rel_spread": 0.015,
+          "median_ms": 10278.2,
+          "spread_ms": 167.6,
+          "rel_spread": 0.0163,
           "coverage_ratio_min": 1.0,
           "statuses_observed": [
             "exit_0"
           ],
           "phases_ms_median": {
             "cas_lookup": 0.3,
-            "cli_startup": 1.4,
-            "dependent_recheck": 9.2,
-            "elaboration": 1014.7,
-            "identity_probe": 938.9,
-            "import_refresh": 8268.9,
-            "setup": 78.8,
-            "split_and_hygiene": 60.2
-          }
+            "cli_startup": 1.6,
+            "dependent_recheck": 12.1,
+            "elaboration": 957.9,
+            "identity_probe": 907.6,
+            "import_refresh": 8240.6,
+            "setup": 80.2,
+            "split_and_hygiene": 60.8
+          },
+          "psi_max_avg10": {
+            "cpu": 0.0,
+            "memory": 0.0,
+            "io": 0.0
+          },
+          "psi_contended": false
         },
         "warm_cache_hit_daemon": {
           "runs_ms": [
-            1271.5,
-            1242.3,
-            1228.5,
-            1216.1,
-            1188.7
+            1225.4,
+            1177.7,
+            1186.9,
+            1158.0,
+            1148.7
           ],
           "trials": 5,
-          "median_ms": 1228.5,
-          "spread_ms": 82.8,
-          "rel_spread": 0.0674,
+          "median_ms": 1177.7,
+          "spread_ms": 76.7,
+          "rel_spread": 0.0651,
           "coverage_ratio_min": 0.9999,
           "statuses_observed": [
             "theorem_cache_hit"
@@ -261,39 +303,51 @@
           "phases_ms_median": {
             "cas_lookup": 0.4,
             "cli_startup": 0.6,
-            "dependent_recheck": 4.2,
-            "identity_probe": 965.7,
-            "import_refresh": 184.4,
-            "setup": 14.6,
-            "split_and_hygiene": 48.8
-          }
+            "dependent_recheck": 4.0,
+            "identity_probe": 913.0,
+            "import_refresh": 187.0,
+            "setup": 15.0,
+            "split_and_hygiene": 50.1
+          },
+          "psi_max_avg10": {
+            "cpu": 0.0,
+            "memory": 0.0,
+            "io": 0.0
+          },
+          "psi_contended": false
         },
         "warm_edited_proof_daemon": {
           "runs_ms": [
-            1888.1,
-            1748.2,
-            1744.6,
-            1804.3,
-            1770.9
+            1707.9,
+            1620.5,
+            1649.3,
+            1669.5,
+            1627.7
           ],
           "trials": 5,
-          "median_ms": 1770.9,
-          "spread_ms": 143.5,
-          "rel_spread": 0.081,
+          "median_ms": 1649.3,
+          "spread_ms": 87.5,
+          "rel_spread": 0.053,
           "coverage_ratio_min": 1.0,
           "statuses_observed": [
             "theorem_verified"
           ],
           "phases_ms_median": {
             "cas_lookup": 0.4,
-            "cli_startup": 0.6,
-            "dependent_recheck": 69.2,
-            "elaboration": 425.9,
-            "identity_probe": 1034.0,
-            "import_refresh": 183.0,
+            "cli_startup": 0.5,
+            "dependent_recheck": 42.9,
+            "elaboration": 430.1,
+            "identity_probe": 900.3,
+            "import_refresh": 183.5,
             "setup": 14.5,
-            "split_and_hygiene": 60.1
-          }
+            "split_and_hygiene": 60.0
+          },
+          "psi_max_avg10": {
+            "cpu": 0.0,
+            "memory": 0.0,
+            "io": 0.0
+          },
+          "psi_contended": false
         }
       }
     },
@@ -307,43 +361,49 @@
       "modes": {
         "cold_no_daemon": {
           "runs_ms": [
-            12517.5,
-            12550.5,
-            12514.0,
-            12571.3,
-            12592.3
+            12309.5,
+            12370.4,
+            12387.8,
+            12365.8,
+            12320.2
           ],
           "trials": 5,
-          "median_ms": 12550.5,
-          "spread_ms": 78.3,
-          "rel_spread": 0.0062,
+          "median_ms": 12365.8,
+          "spread_ms": 78.4,
+          "rel_spread": 0.0063,
           "coverage_ratio_min": 1.0,
           "statuses_observed": [
             "exit_0"
           ],
           "phases_ms_median": {
-            "cas_lookup": 0.4,
+            "cas_lookup": 0.3,
             "cli_startup": 0.7,
-            "dependent_recheck": 11.9,
-            "elaboration": 2756.7,
-            "identity_probe": 1356.2,
-            "import_refresh": 8263.5,
-            "setup": 77.2,
-            "split_and_hygiene": 60.8
-          }
+            "dependent_recheck": 9.4,
+            "elaboration": 2697.8,
+            "identity_probe": 1288.8,
+            "import_refresh": 8222.7,
+            "setup": 65.5,
+            "split_and_hygiene": 61.6
+          },
+          "psi_max_avg10": {
+            "cpu": 0.0,
+            "memory": 0.0,
+            "io": 0.0
+          },
+          "psi_contended": false
         },
         "warm_cache_hit_daemon": {
           "runs_ms": [
-            1607.1,
-            1588.6,
-            1586.3,
-            1575.7,
-            1585.5
+            1553.0,
+            1553.0,
+            1549.3,
+            1562.8,
+            1567.4
           ],
           "trials": 5,
-          "median_ms": 1586.3,
-          "spread_ms": 31.3,
-          "rel_spread": 0.0198,
+          "median_ms": 1553.0,
+          "spread_ms": 18.1,
+          "rel_spread": 0.0117,
           "coverage_ratio_min": 0.9999,
           "statuses_observed": [
             "theorem_cache_hit"
@@ -351,25 +411,31 @@
           "phases_ms_median": {
             "cas_lookup": 0.4,
             "cli_startup": 0.6,
-            "dependent_recheck": 4.1,
-            "identity_probe": 1332.2,
-            "import_refresh": 180.8,
-            "setup": 14.5,
-            "split_and_hygiene": 49.5
-          }
+            "dependent_recheck": 4.2,
+            "identity_probe": 1297.4,
+            "import_refresh": 181.1,
+            "setup": 14.6,
+            "split_and_hygiene": 49.8
+          },
+          "psi_max_avg10": {
+            "cpu": 0.0,
+            "memory": 0.0,
+            "io": 0.0
+          },
+          "psi_contended": false
         },
         "warm_edited_proof_daemon": {
           "runs_ms": [
-            2435.6,
-            2441.3,
-            2437.5,
-            2448.7,
-            2425.2
+            2288.9,
+            2278.1,
+            2306.4,
+            2296.4,
+            2301.3
           ],
           "trials": 5,
-          "median_ms": 2437.5,
-          "spread_ms": 23.5,
-          "rel_spread": 0.0096,
+          "median_ms": 2296.4,
+          "spread_ms": 28.2,
+          "rel_spread": 0.0123,
           "coverage_ratio_min": 1.0,
           "statuses_observed": [
             "theorem_verified"
@@ -377,13 +443,19 @@
           "phases_ms_median": {
             "cas_lookup": 0.4,
             "cli_startup": 0.6,
-            "dependent_recheck": 41.2,
-            "elaboration": 670.6,
-            "identity_probe": 1458.3,
-            "import_refresh": 185.3,
-            "setup": 14.4,
-            "split_and_hygiene": 62.0
-          }
+            "dependent_recheck": 40.3,
+            "elaboration": 649.4,
+            "identity_probe": 1315.7,
+            "import_refresh": 181.5,
+            "setup": 14.7,
+            "split_and_hygiene": 60.5
+          },
+          "psi_max_avg10": {
+            "cpu": 0.0,
+            "memory": 0.0,
+            "io": 0.0
+          },
+          "psi_contended": false
         }
       }
     },
@@ -397,16 +469,16 @@
       "modes": {
         "cold_no_daemon": {
           "runs_ms": [
-            3759.5,
-            3759.2,
-            3660.2,
-            3736.4,
-            3731.4
+            3744.2,
+            3723.6,
+            3705.1,
+            3712.1,
+            3676.3
           ],
           "trials": 5,
-          "median_ms": 3736.4,
-          "spread_ms": 99.3,
-          "rel_spread": 0.0266,
+          "median_ms": 3712.1,
+          "spread_ms": 67.9,
+          "rel_spread": 0.0183,
           "coverage_ratio_min": 1.0,
           "statuses_observed": [
             "exit_0"
@@ -414,26 +486,32 @@
           "phases_ms_median": {
             "cas_lookup": 0.3,
             "cli_startup": 2.4,
-            "dependent_recheck": 9.5,
-            "elaboration": 522.5,
-            "identity_probe": 709.8,
-            "import_refresh": 2402.2,
-            "setup": 61.0,
-            "split_and_hygiene": 21.0
-          }
+            "dependent_recheck": 14.0,
+            "elaboration": 482.0,
+            "identity_probe": 699.1,
+            "import_refresh": 2423.2,
+            "setup": 64.3,
+            "split_and_hygiene": 30.5
+          },
+          "psi_max_avg10": {
+            "cpu": 0.0,
+            "memory": 0.0,
+            "io": 0.0
+          },
+          "psi_contended": false
         },
         "warm_cache_hit_daemon": {
           "runs_ms": [
-            796.9,
-            795.3,
-            793.7,
-            784.4,
-            800.6
+            812.4,
+            806.4,
+            797.0,
+            791.9,
+            786.8
           ],
           "trials": 5,
-          "median_ms": 795.3,
-          "spread_ms": 16.3,
-          "rel_spread": 0.0205,
+          "median_ms": 797.0,
+          "spread_ms": 25.6,
+          "rel_spread": 0.0321,
           "coverage_ratio_min": 0.9999,
           "statuses_observed": [
             "theorem_cache_hit"
@@ -442,38 +520,50 @@
             "cas_lookup": 0.4,
             "cli_startup": 0.6,
             "dependent_recheck": 4.0,
-            "identity_probe": 711.8,
-            "import_refresh": 54.3,
-            "setup": 6.1,
-            "split_and_hygiene": 13.8
-          }
+            "identity_probe": 711.0,
+            "import_refresh": 54.7,
+            "setup": 6.2,
+            "split_and_hygiene": 13.6
+          },
+          "psi_max_avg10": {
+            "cpu": 0.0,
+            "memory": 0.0,
+            "io": 0.0
+          },
+          "psi_contended": false
         },
         "warm_edited_proof_daemon": {
           "runs_ms": [
-            1061.7,
-            1076.9,
-            1065.2,
-            1095.6,
-            1071.7
+            967.2,
+            943.8,
+            939.0,
+            927.4,
+            1015.3
           ],
           "trials": 5,
-          "median_ms": 1071.7,
-          "spread_ms": 33.9,
-          "rel_spread": 0.0317,
+          "median_ms": 943.8,
+          "spread_ms": 87.8,
+          "rel_spread": 0.093,
           "coverage_ratio_min": 1.0,
           "statuses_observed": [
             "theorem_verified"
           ],
           "phases_ms_median": {
-            "cas_lookup": 0.3,
-            "cli_startup": 0.5,
-            "dependent_recheck": 14.5,
-            "elaboration": 165.0,
-            "identity_probe": 810.3,
-            "import_refresh": 56.9,
-            "setup": 6.2,
-            "split_and_hygiene": 18.6
-          }
+            "cas_lookup": 0.4,
+            "cli_startup": 0.6,
+            "dependent_recheck": 15.3,
+            "elaboration": 170.9,
+            "identity_probe": 688.9,
+            "import_refresh": 56.6,
+            "setup": 6.4,
+            "split_and_hygiene": 18.5
+          },
+          "psi_max_avg10": {
+            "cpu": 0.0,
+            "memory": 0.0,
+            "io": 0.0
+          },
+          "psi_contended": false
         }
       }
     },
@@ -485,20 +575,26 @@
       "modes": {
         "cold_no_daemon": {
           "runs_ms": [
-            2475.1,
-            2467.3,
-            2489.4,
-            2466.5,
-            2470.2
+            2483.7,
+            2497.9,
+            2474.1,
+            2493.8,
+            2473.9
           ],
           "trials": 5,
-          "median_ms": 2470.2,
-          "spread_ms": 23.0,
-          "rel_spread": 0.0093,
+          "median_ms": 2483.7,
+          "spread_ms": 24.0,
+          "rel_spread": 0.0097,
           "coverage_ratio_min": 0.0,
           "statuses_observed": [
             "exit_1"
           ],
+          "psi_max_avg10": {
+            "cpu": 0.0,
+            "memory": 0.0,
+            "io": 0.0
+          },
+          "psi_contended": false,
           "error_classes": [
             "stale_import_refresh_fail_closed"
           ],
@@ -521,6 +617,11 @@
     "pfr": "ebe2d96230b1abb190f74592aace441a0f10fe09"
   },
   "revs_pinned": true,
+  "node": {
+    "load1_at_start": 0.65,
+    "load1_at_end": 1.09,
+    "busy_allowed": false
+  },
   "args": {
     "trials": 5,
     "warmup": 1,
@@ -537,5 +638,5 @@
     "same_binary": null,
     "gates": {}
   },
-  "run_duration_s": 407.7
+  "run_duration_s": 399.6
 }
