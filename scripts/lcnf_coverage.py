@@ -1396,6 +1396,39 @@ def validate_results_document(doc: Any) -> list[str]:
     return errors
 
 
+def _live_measured_status_error(cname: str, corp: Any) -> str | None:
+    """Fail-closed status validation for a live corpus with a counted baseline.
+
+    The existing measured live shape has no `status` (or an explicit null) and
+    `measurement_source == "live_invocation"`. Any other status/source is an
+    unmeasured or malformed entry and must not satisfy a baseline with counts.
+    """
+    if not isinstance(corp, dict):
+        return f"Corpus `{cname}` live entry must be a JSON object, got {type(corp).__name__}"
+    status = corp.get("status")
+    if status is not None:
+        return (
+            f"Corpus `{cname}` is measured in scripts/lcnf_coverage_results.json "
+            f"but the live entry has status {status!r}; counted baselines require "
+            f"a measured live entry"
+        )
+    source = corp.get("measurement_source")
+    if source != "live_invocation":
+        return (
+            f"Corpus `{cname}` is measured in scripts/lcnf_coverage_results.json "
+            f"but the live entry measurement_source is {source!r}, not 'live_invocation'"
+        )
+    for field in RESULT_FIELDS:
+        value = corp.get(field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            return (
+                f"Corpus `{cname}` is measured in scripts/lcnf_coverage_results.json "
+                f"but the live entry field `{field}` is not an integer "
+                f"(got {type(value).__name__} {value!r})"
+            )
+    return None
+
+
 def check_coverage_report(
     root_dir: Path = ROOT_DIR,
     report: dict[str, Any] | None = None,
@@ -1461,6 +1494,17 @@ def check_coverage_report(
                 f"{corp.get('reason', 'no reason given')}"
             )
             continue
+        bad_fields = [
+            field
+            for field in RESULT_FIELDS
+            if isinstance(corp.get(field), bool) or not isinstance(corp.get(field), int)
+        ]
+        if bad_fields:
+            errors.append(
+                f"Corpus `{cname}` live measured entry has non-integer fields: "
+                + ", ".join(bad_fields)
+            )
+            continue
         tot = corp["total_declarations"]
         if tot != corp["proved"] + corp["lowered_unproved"] + corp["rejected"]:
             errors.append(f"Corpus `{cname}` declaration counts do not sum to total_declarations")
@@ -1524,7 +1568,20 @@ def check_coverage_report(
         if not isinstance(base_corpora, dict):
             base_corpora = {}
         live_corpora = rep.get("corpora", {})
+        status_failed: set[str] = set()
         for cname, corp in live_corpora.items():
+            if not isinstance(corp, dict):
+                errors.append(
+                    f"Live corpus `{cname}` must be a JSON object, got {type(corp).__name__}"
+                )
+                continue
+            base_c = base_corpora.get(cname)
+            if isinstance(base_c, dict) and base_c.get("measurement_source") != "not_measured":
+                status_err = _live_measured_status_error(cname, corp)
+                if status_err is not None:
+                    errors.append(status_err)
+                    status_failed.add(cname)
+                    continue
             if corp.get("status") == "unknown":
                 # External Batteries stays unknown and is not compared.
                 continue
@@ -1605,6 +1662,8 @@ def check_coverage_report(
                 continue
             if not isinstance(base_c, dict):
                 continue  # already named by validate_results_document
+            if cname in status_failed:
+                continue  # already named by the counted-baseline status guard
             if base_c.get("measurement_source") == "not_measured":
                 # An honest baseline stub matching a live not_measured report is
                 # an intentional skip (e.g. an external corpus deliberately absent).
