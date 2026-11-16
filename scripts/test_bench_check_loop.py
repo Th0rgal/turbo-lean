@@ -11,6 +11,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
+import os
 import subprocess
 import sys
 import tempfile
@@ -39,10 +40,23 @@ def sample_baseline(mod, **overrides):
     )
 
 
-def fill_workload(mod, baseline, wid, median_ms, rel_spread=0.03):
-    baseline["workloads"][wid] = mod.active_workload_result(
-        wid, {"cold_no_daemon": {"median_ms": median_ms, "rel_spread": rel_spread,
-                                 "trials": 5, "coverage_ratio_min": 0.9998}})
+def fill_workload(mod, base, wid, median_ms, rel_spread=0.03, modes=None):
+    base["workloads"][wid] = mod.active_workload_result(
+        wid, {m: {"median_ms": median_ms, "rel_spread": rel_spread,
+                  "trials": 5, "coverage_ratio_min": 0.9998}
+              for m in (modes or mod.MODES)})
+
+
+def full_valid_baseline(mod):
+    base = sample_baseline(mod)
+    for w in mod.WORKLOADS:
+        if w["expected_status"] == "blocked":
+            base["workloads"][w["id"]] = mod.blocked_workload_result(
+                exit_code=1, error_class="stale_import_refresh_fail_closed",
+                median_ms=6000.0)
+        else:
+            fill_workload(mod, base, w["id"], 1000.0)
+    return base
 
 
 class WorkloadTable(unittest.TestCase):
@@ -94,7 +108,7 @@ class Stats(unittest.TestCase):
 class BaselineSchema(unittest.TestCase):
     def test_validate_requires_provenance(self):
         mod = load_script()
-        base = sample_baseline(mod)
+        base = full_valid_baseline(mod)
         self.assertEqual(mod.validate_baseline(base), [])
         for key in ("host", "turbo_lean_commit", "trials", "settings", "created_utc"):
             broken = json.loads(json.dumps(base))
@@ -106,9 +120,12 @@ class BaselineSchema(unittest.TestCase):
 
     def test_validate_requires_all_workloads(self):
         mod = load_script()
-        base = sample_baseline(mod)
+        base = full_valid_baseline(mod)
         base["workloads"].pop("pfr_more_ruzsa_dist")
         self.assertTrue(mod.validate_baseline(base))
+        base2 = full_valid_baseline(mod)
+        base2["workloads"].pop("batteries_unionfind_top")
+        self.assertTrue(mod.validate_baseline(base2))
 
 
 class Comparison(unittest.TestCase):
@@ -132,6 +149,8 @@ class Comparison(unittest.TestCase):
         mod = self.mod
         res = mod.empty_run_result(mod.WORKLOADS, trials=5)
         res["host"] = dict(sample_baseline(mod)["host"], hostname=host)
+        res["settings"] = sample_baseline(mod)["settings"]
+        res["turbo_lean_commit"] = sample_baseline(mod)["turbo_lean_commit"]
         for wid, ms in (("batteries_list_lemmas_top", 1000.0),
                         ("batteries_string_lemmas_top", 5000.0),
                         ("batteries_rbtree_lemmas_top", 1000.0),
@@ -151,15 +170,21 @@ class Comparison(unittest.TestCase):
     def test_regression_detected(self):
         verdict = self.mod.compare_run(self._baseline(), self._results(scale=1.5))
         self.assertEqual(verdict["verdict"], "regression")
-        self.assertIn("batteries_list_lemmas_top", verdict["regressions"])
+        self.assertTrue(any(r.startswith("batteries_list_lemmas_top/")
+                            for r in verdict["regressions"]))
 
     def test_noisy_workload_within_spread_gate_passes(self):
-        # Baseline spread 20% on this mode: a 1.3x median is noise, not a regression.
+        # Baseline spread 20% on this workload: a 1.3x median is noise, not a
+        # regression; a workload with tight spread at the same scale fails.
         base = self._baseline()
-        base["workloads"]["batteries_list_lemmas_top"]["modes"]["cold_no_daemon"]["rel_spread"] = 0.20
-        res = self._results(scale=1.3)
+        fill_workload(self.mod, base, "batteries_list_lemmas_top", 1000.0, rel_spread=0.20)
+        res = self._results()
+        fill_workload(self.mod, res, "batteries_list_lemmas_top", 1300.0)
         verdict = self.mod.compare_run(base, res)
         self.assertEqual(verdict["verdict"], "pass")
+        tight = self._baseline()
+        verdict2 = self.mod.compare_run(tight, res)
+        self.assertEqual(verdict2["verdict"], "regression")
 
     def test_host_mismatch_is_skipped_never_pass(self):
         verdict = self.mod.compare_run(self._baseline(), self._results(host="other-runner"))
@@ -214,45 +239,72 @@ class EndToEnd(unittest.TestCase):
             "import json, os, sys, time\n"
             "args = sys.argv[1:]\n"
             "time.sleep(0.05)\n"
-            "out = {'status': 'theorem_verified', 'decl': 'd', 'elapsed_ms': 50,\n"
+            "if os.environ.get('FAKE_PFR_FAIL') and '--no-auto-worktree-link' in args:\n"
+            "    print(json.dumps({'error': 'stale imports: import_refresh fail-closed'}))\n"
+            "    sys.exit(1)\n"
+            "status = 'theorem_verified'\n"
+            "if not os.environ.get('TURBO_LEAN_NO_DAEMON'):\n"
+            "    try:\n"
+            "        body = open(args[-1]).read()\n"
+            "        status = ('theorem_verified' if '_m1_bench_trial_' in body\n"
+            "                  else 'theorem_cache_hit')\n"
+            "    except OSError:\n"
+            "        pass\n"
+            "out = {'status': status, 'decl': 'd', 'elapsed_ms': 50,\n"
             "       'phase_timings': {'wall_ms': 50.0, 'phase_sum_ms': 49.0,\n"
             "                         'phase_covered_ms': 49.0, 'phase_overlap_ms': 0.0,\n"
             "                         'coverage_ratio': 0.98,\n"
             "                         'phases_ms': {'setup': 10.0, 'elaboration': 39.0}}}\n"
-            "if os.environ.get('FAKE_PFR_FAIL') and any('--no-auto-worktree-link' in a for a in args):\n"
-            "    out = {'error': 'import_refresh_fail_closed: stale imports'}\n"
-            "    print(json.dumps(out)); sys.exit(1)\n"
             "print(json.dumps(out)); sys.exit(0)\n"
         )
         stub.chmod(0o755)
-        return stub
+        gitstub = root / "fake-git"
+        gitstub.write_text("#!/bin/sh\nprintf 'git version 2.47.1\\n'\n")
+        gitstub.chmod(0o755)
+        return stub, gitstub
 
     def _fake_projects(self, root: Path):
         bats = root / "batteries"
-        (bats / "Batteries" / "Data").mkdir(parents=True)
-        (bats / "Batteries" / "Data" / "Lemmas.lean").write_text(
-            "theorem dummy : True := by trivial\n")
+        files = {
+            "Batteries/Data/List/Lemmas.lean": "theorem dropLast_eq_eraseIdx :\n"
+                                               "    True := by\n  trivial\n",
+            "Batteries/Data/String/Lemmas.lean": "theorem lt_antisymm :\n"
+                                                 "    True := by\n  trivial\n",
+            "Batteries/Recycling/RBTree/Lemmas.lean": (
+                "@[simp] theorem min?_reverse :\n    True := by\n  trivial\n"
+                "theorem ordered_iff :\n    True := by\n  trivial\n"),
+            "Batteries/Data/UnionFind/Basic.lean": "theorem parentD_eq :\n"
+                                                   "    True := by\n  trivial\n",
+        }
+        for rel, body in files.items():
+            p = bats / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(body)
         pfr = root / "pfr"
-        (pfr / "PFR").mkdir(parents=True)
+        (pfr / "PFR").mkdir(parents=True, exist_ok=True)
         (pfr / "PFR" / "MoreRuzsaDist.lean").write_text(
             "lemma rdist_of_neg_le : True := by trivial\n")
         return bats, pfr
+
+    def _run_bench(self, root, extra):
+        stub, gitstub = self._stub_binary(root)
+        bats, pfr = self._fake_projects(root)
+        env = dict(os.environ, TURBO_LEAN_GIT=str(gitstub),
+                   TURBO_LEAN_ALLOWED_CSIMP="*", TURBO_LEAN_ALLOWED_UNSAFE="*",
+                   TURBO_LEAN_ALLOWED_IMPLEMENTED_BY="*", FAKE_PFR_FAIL="1")
+        cmd = [sys.executable, str(SCRIPT), "--turbo-lean-bin", str(stub),
+               "--batteries-dir", str(bats), "--pfr-dir", str(pfr),
+               "--trials", "2", "--warmup", "0", "--skip-rev-check"] + extra
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
 
     def test_full_run_and_comparison(self):
         mod = load_script()
         with tempfile.TemporaryDirectory(prefix="m1-bench-test-") as td:
             root = Path(td)
-            stub = self._stub_binary(root)
-            bats, pfr = self._fake_projects(root)
             out = root / "run.json"
             # Fake projects are not git repos: rev pinning must be skipped explicitly.
-            r1 = subprocess.run(
-                [sys.executable, str(SCRIPT), "--turbo-lean-bin", str(stub),
-                 "--batteries-dir", str(bats), "--pfr-dir", str(pfr),
-                 "--trials", "2", "--warmup", "0", "--skip-rev-check",
-                 "--machine-label", "lab-node-1", "--out", str(out),
-                 "--no-daemon-assume", "--no-baseline"],
-                capture_output=True, text=True, timeout=300)
+            r1 = self._run_bench(root, ["--machine-label", "lab-node-1",
+                                        "--out", str(out), "--no-baseline"])
             self.assertEqual(r1.returncode, 0, r1.stdout + r1.stderr)
             data = json.loads(out.read_text())
             self.assertEqual(data["verdict"]["verdict"], "not_compared")
@@ -265,24 +317,16 @@ class EndToEnd(unittest.TestCase):
             # PFR stub fails => blocked as expected.
             self.assertEqual(data["workloads"]["pfr_more_ruzsa_dist"]["status"], "blocked_as_expected")
             # Same-host comparison of two identical runs must pass.
-            r2 = subprocess.run(
-                [sys.executable, str(SCRIPT), "--turbo-lean-bin", str(stub),
-                 "--batteries-dir", str(bats), "--pfr-dir", str(pfr),
-                 "--trials", "2", "--warmup", "0", "--skip-rev-check",
-                 "--machine-label", "lab-node-1", "--out", str(root / "run2.json"),
-                 "--no-daemon-assume", "--baseline", str(out)],
-                capture_output=True, text=True, timeout=300)
+            r2 = self._run_bench(root, ["--machine-label", "lab-node-1",
+                                        "--out", str(root / "run2.json"),
+                                        "--baseline", str(out)])
             self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
             data2 = json.loads((root / "run2.json").read_text())
             self.assertEqual(data2["verdict"]["verdict"], "pass")
             # Cross-host comparison must be flagged, never a pass.
-            r3 = subprocess.run(
-                [sys.executable, str(SCRIPT), "--turbo-lean-bin", str(stub),
-                 "--batteries-dir", str(bats), "--pfr-dir", str(pfr),
-                 "--trials", "2", "--warmup", "0", "--skip-rev-check",
-                 "--machine-label", "other-runner", "--out", str(root / "run3.json"),
-                 "--no-daemon-assume", "--baseline", str(out)],
-                capture_output=True, text=True, timeout=300)
+            r3 = self._run_bench(root, ["--machine-label", "other-runner",
+                                        "--out", str(root / "run3.json"),
+                                        "--baseline", str(out)])
             self.assertEqual(r3.returncode, 0, r3.stdout + r3.stderr)
             data3 = json.loads((root / "run3.json").read_text())
             self.assertEqual(data3["verdict"]["verdict"], "comparison_skipped_host_mismatch")
