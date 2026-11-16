@@ -1,0 +1,22 @@
+name: leanci-diag
+on: pull_request
+jobs:
+  diag:
+    if: github.head_ref == 'ci/leanci-diag'
+    runs-on: lean-16vcpu-ubuntu-2604
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with: { persist-credentials: false }
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+      - name: env
+        run: |
+          set -x
+          umask; id; ls -ld /tmp /dev/shm "$HOME" "$GITHUB_WORKSPACE" || true
+          echo "TMPDIR=${TMPDIR:-}"; env | grep -E 'TURBO|LEAN|LAKE|BOOST|ELAN|TMP|CARGO|RUST' | sort
+          type -a lake lean elan turbo-lean || true
+          cat /proc/self/status | grep -E 'Umask|Groups'
+          python3 -m pip --version || true
+          mount | grep -E ' /tmp | /dev/shm | /home' || true
+      - name: failing tests
+        run: |
+          cargo test --release --locked -p turbo-lean -- test_round4_agent_step_head_tree_dep_inputs_and_fail_closed_gates test_warm_on_disk_olean_reuse_and_githash_gate --nocapture 2>&1 | tail -80
