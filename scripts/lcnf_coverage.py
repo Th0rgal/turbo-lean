@@ -780,6 +780,27 @@ class TestLcnfCoverage(unittest.TestCase):
             self.assertFalse(chk["ok"])
             self.assertTrue(any("digest mismatch" in e for e in chk["errors"]))
 
+    def test_executes_live_lean_lowerer_on_corpora(self) -> None:
+        live = execute_live_lean_audit(ROOT_DIR)
+        self.assertTrue(live["executed"], live)
+        self.assertEqual(live["toolchain"], PINNED_TOOLCHAIN)
+        self.assertEqual(live["batteries_and_c2"]["total_declarations"], 1805)
+        self.assertEqual(live["batteries_and_c2"]["proved"], 29)
+        self.assertEqual(live["batteries_and_c2"]["lowered_unproved"], 72)
+        self.assertEqual(live["batteries_and_c2"]["rejected"], 1704)
+        self.assertEqual(live["c1_corpus"]["total_declarations"], 902)
+        self.assertEqual(live["c1_corpus"]["proved"], 782)
+        self.assertEqual(live["c1_corpus"]["lowered_unproved"], 98)
+        self.assertEqual(live["c1_corpus"]["rejected"], 22)
+
+    def test_detects_live_execution_count_mismatch(self) -> None:
+        rep = build_coverage_report(ROOT_DIR)
+        rep["corpora"]["c1_corpus"]["proved"] -= 1
+        rep["corpora"]["c1_corpus"]["lowered_unproved"] += 1
+        chk = check_coverage_report(ROOT_DIR, rep, verify_live=True)
+        self.assertFalse(chk["ok"])
+        self.assertTrue(any("live execution mismatch" in e for e in chk["errors"]))
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
