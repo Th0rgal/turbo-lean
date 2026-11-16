@@ -534,6 +534,86 @@ class BaselineStrictness(unittest.TestCase):
             self.assertLess(cold["coverage_ratio_external_min"], 0.90, cold)
 
 
+class ImprovementSide(unittest.TestCase):
+    """Group 2: every cell reports baseline, new, delta, band, and a word."""
+
+    def setUp(self):
+        self.mod = load_script()
+        self.base = full_valid_baseline(self.mod)
+        self.res = mod_results_like(self.mod, self.base, 1000.0)
+
+    def _gates(self, scale):
+        res = mod_results_like(self.mod, self.base, 1000.0 * scale)
+        v = self.mod.compare_run(self.base, res)
+        return v, {k: g for k, g in v["gates"].items()
+                   if g.get("baseline_median_ms") is not None}
+
+    def test_identical_cells_are_unchanged_and_pass(self):
+        v, gates = self._gates(1.0)
+        self.assertEqual(v["verdict"], "pass")
+        self.assertEqual(len(gates), 15)
+        for k, g in gates.items():
+            self.assertEqual(g["verdict"], "unchanged", k)
+            for field in ("baseline_median_ms", "new_median_ms", "delta_ms",
+                          "delta_pct", "noise_band_ms"):
+                self.assertIn(field, g, (k, field))
+
+    def test_improvement_classified_with_symmetric_band(self):
+        # Baseline 1000 ms, no spread, warm floor 10%: tolerance 1125 ms, so the
+        # symmetric band is 125 ms -> improved means strictly below 875 ms.
+        base = full_valid_baseline(self.mod)
+        v1 = self.mod.compare_run(base, mod_results_like(self.mod, base, 880.0))
+        g1 = v1["gates"]["batteries_list_lemmas_top/warm_cache_hit_daemon"]
+        self.assertEqual(g1["verdict"], "unchanged", g1)
+        v2 = self.mod.compare_run(base, mod_results_like(self.mod, base, 870.0))
+        g2 = v2["gates"]["batteries_list_lemmas_top/warm_cache_hit_daemon"]
+        self.assertEqual(g2["verdict"], "improved", g2)
+        self.assertEqual(v2["verdict"], "pass")  # an improvement never fails the run
+        self.assertIn("batteries_list_lemmas_top/warm_cache_hit_daemon", v2["improvements"])
+
+    def test_regression_classification_carries_delta(self):
+        v, gates = self._gates(1.5)
+        self.assertEqual(v["verdict"], "regression")
+        for k, g in gates.items():
+            self.assertEqual(g["verdict"], "regressed", k)
+            self.assertGreater(g["delta_ms"], 0, k)
+            self.assertGreater(g["delta_pct"], 0, k)
+
+    def test_summary_line_counts_all_three_words(self):
+        v, gates = self._gates(1.0)
+        self.assertIn("15 cells: 0 regressed, 0 improved, 15 unchanged", v["summary"])
+        v2, _ = self._gates(0.5)
+        self.assertIn("15 regressed, 0 improved, 0 unchanged", v2["summary"]) \
+            if False else self.assertIn("0 regressed, 15 improved, 0 unchanged", v2["summary"])
+
+    def test_per_cell_lines_and_summary_are_printed(self):
+        import platform
+        with tempfile.TemporaryDirectory(prefix="m1-imp-") as td:
+            base = full_valid_baseline(self.mod)
+            base["host"]["hostname"] = platform.node()  # same-host comparison
+            bp = Path(td) / "b.json"
+            bp.write_text(json.dumps(base))
+            r = run_bench(Path(td), ["--baseline", str(bp), "--out", str(Path(td) / "o.json")])
+            self.assertIn("-> ", r.stdout)
+            self.assertIn("band ±", r.stdout)
+            self.assertIn("SUMMARY: bench_check_loop:", r.stdout)
+            self.assertRegex(r.stdout, r"\d+ cells: \d+ regressed, \d+ improved, \d+ unchanged")
+
+
+def mod_results_like(mod, base, median_ms):
+    res = mod.empty_run_result(mod.WORKLOADS, trials=5)
+    res["host"] = dict(base["host"])
+    res["settings"] = dict(base["settings"])
+    res["turbo_lean_commit"] = base["turbo_lean_commit"]
+    for w in mod.WORKLOADS:
+        if w["expected_status"] == "blocked":
+            res["workloads"][w["id"]] = mod.blocked_workload_result(
+                1, "stale_import_refresh_fail_closed", 6000.0)
+        else:
+            fill_workload(mod, res, w["id"], median_ms)
+    return res
+
+
 class EndToEnd(unittest.TestCase):
     """Drive the full script against a stub turbo-lean binary."""
 

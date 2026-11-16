@@ -389,18 +389,39 @@ def compare_run(baseline, res):
                 verdict["gates"][f"{wid}/{mode}"] = {"verdict": "measured_nothing"}
                 continue
             tol = tolerance_ms(b["median_ms"], b.get("rel_spread", 0.0), mode)
+            band = tol - b["median_ms"]  # noise band, applied in BOTH directions
             new = r["median_ms"]
-            gate = {"baseline_median_ms": b["median_ms"], "baseline_rel_spread": b.get("rel_spread"),
-                    "tolerance_ms": round(tol, 1), "new_median_ms": new,
-                    "verdict": "pass" if new <= tol else "regression"}
+            delta = new - b["median_ms"]
             if new > tol:
+                cls = "regressed"
+            elif new < b["median_ms"] - band:
+                cls = "improved"
+            else:
+                cls = "unchanged"
+            gate = {"baseline_median_ms": b["median_ms"], "baseline_rel_spread": b.get("rel_spread"),
+                    "new_median_ms": new, "delta_ms": round(delta, 1),
+                    "delta_pct": round(100.0 * delta / b["median_ms"], 2),
+                    "noise_band_ms": round(band, 1), "verdict": cls}
+            if cls == "regressed":
                 gate["over_by_ms"] = round(new - tol, 1)
                 verdict["regressions"].append(f"{wid}/{mode}")
-            elif new < b["median_ms"] * 0.8:
+            elif cls == "improved":
+                gate["under_by_ms"] = round((b["median_ms"] - band) - new, 1)
                 verdict["improvements"].append(f"{wid}/{mode}")
             verdict["gates"][f"{wid}/{mode}"] = gate
     if verdict["verdict"] is None:
         verdict["verdict"] = "pass" if not verdict["regressions"] else "regression"
+    if verdict["verdict"] in ("pass", "regression"):
+        cells = sorted((k, g) for k, g in verdict["gates"].items()
+                       if g.get("baseline_median_ms") is not None)
+        n_reg, n_imp = len(verdict["regressions"]), len(verdict["improvements"])
+        line = (f"bench_check_loop: {verdict['verdict']} | {len(cells)} cells: "
+                f"{n_reg} regressed, {n_imp} improved, {len(cells) - n_reg - n_imp} unchanged")
+        if cells:
+            worst_name, worst = max(cells, key=lambda kv: kv[1]["delta_pct"])
+            line += (f" | worst: {worst_name} {worst['delta_ms']:+.1f} ms "
+                     f"({worst['delta_pct']:+.2f}%)")
+        verdict["summary"] = line
     return verdict
 
 
@@ -1049,6 +1070,15 @@ def main(argv=None):
         if args.out:
             Path(args.out).write_text(payload + "\n")
         print(payload if not args.out else f"results written to {args.out}")
+        for cell in sorted(verdict["gates"]):
+            g = verdict["gates"][cell]
+            if g.get("baseline_median_ms") is None:
+                continue
+            print(f"  {cell}: {g['baseline_median_ms']} -> {g['new_median_ms']} ms "
+                  f"({g['delta_ms']:+.1f} ms, {g['delta_pct']:+.2f}%) "
+                  f"band ±{g['noise_band_ms']} ms: {g['verdict']}")
+        if verdict.get("summary"):
+            print(f"SUMMARY: {verdict['summary']}", flush=True)
         print(f"VERDICT: {verdict['verdict']}"
               + (f" ({verdict['skipped_reason']})" if verdict.get("skipped_reason") else "")
               + (f" regressions={verdict['regressions']}" if verdict["regressions"] else "")
