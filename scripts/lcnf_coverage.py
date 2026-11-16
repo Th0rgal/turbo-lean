@@ -16,6 +16,8 @@ Methodology & Honesty Rules:
 - A corpus this invocation cannot measure is emitted as `measurement_source: "not_measured"` with a
   `reason` and no declaration counts; it never falls back to a stored constant.
 - The output carries a `measurement_provenance` block (command, UTC date, revisions).
+- From a clean checkout, `--check` / `--json` build `LeanNative.IR.Bridge` and its cone with
+  `lake build` (~1 min, needs the pinned toolchain and the `lean-sys` checkout Lake fetches).
 - No source-pattern heuristic is ever represented as executed lowering.
 - As documented in `roadmap/HORIZONS.md` ("What the review found"), `lowerRealLCNFDecl` lowers a call
   to another local user function (`LetValue.fap`), but `RealLCNFSemantics.evalLetValue` returns
@@ -686,6 +688,30 @@ def _run_audit_driver(root_dir: Path, driver_src: str, lib_dirs: list[str]) -> t
     return tuple(int(x) for x in raw_lines[-1].split(":", 1)[1].split(","))  # type: ignore[return-value]
 
 
+def _ensure_lean_build(root_dir: Path) -> None:
+    """Build the Lean library the audit driver imports, if it is not built yet.
+
+    `--check` / `--json` must work from a clean checkout, so the one target the driver
+    imports (`LeanNative.IR.Bridge`, and its cone) is built here when its `.olean` is
+    missing. A warm tree is left untouched.
+    """
+    lean_dir = root_dir / "lean"
+    bridge_olean = lean_dir / ".lake" / "build" / "lib" / "lean" / "LeanNative" / "IR" / "Bridge.olean"
+    if bridge_olean.is_file():
+        return
+    proc = subprocess.run(
+        ["lake", "build", "LeanNative.IR.Bridge"],
+        cwd=str(lean_dir),
+        env=_lean_env(),
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"`lake build LeanNative.IR.Bridge` failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        )
+
+
 def execute_live_lean_audit(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     cache_key = str(root_dir.resolve())
     if cache_key in _LIVE_AUDIT_CACHE:
@@ -694,6 +720,7 @@ def execute_live_lean_audit(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     lean_dir = root_dir / "lean"
     if not (lean_dir / "lakefile.lean").is_file() or not (root_dir / "scripts" / "test_scalar_frontend.py").is_file():
         return {"executed": False, "reason": "missing_lean_workspace"}
+    _ensure_lean_build(root_dir)
 
     env = _lean_env()
 
@@ -1322,6 +1349,25 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertEqual(live["c1_corpus"]["proved"], 782)
         self.assertEqual(live["c1_corpus"]["lowered_unproved"], 98)
         self.assertEqual(live["c1_corpus"]["rejected"], 22)
+
+    def test_cold_tree_builds_the_lean_library_once(self) -> None:
+        # A clean CI checkout has no lean/.lake; the script must build what it imports.
+        import unittest.mock as mock
+
+        with tempfile.TemporaryDirectory(prefix="cold-lean-") as tmp:
+            lean = Path(tmp) / "lean"
+            lean.mkdir()
+            with mock.patch.object(sys.modules[__name__], "subprocess") as sp:
+                sp.run.return_value = mock.Mock(returncode=0, stdout="", stderr="")
+                _ensure_lean_build(Path(tmp))
+                self.assertEqual(sp.run.call_count, 1)
+                self.assertEqual(sp.run.call_args.args[0], ["lake", "build", "LeanNative.IR.Bridge"])
+                # A warm tree with the imported olean present is left alone.
+                bridge = lean / ".lake" / "build" / "lib" / "lean" / "LeanNative" / "IR" / "Bridge.olean"
+                bridge.parent.mkdir(parents=True)
+                bridge.write_bytes(b"")
+                _ensure_lean_build(Path(tmp))
+                self.assertEqual(sp.run.call_count, 1)
 
     def test_detects_live_execution_count_mismatch(self) -> None:
         rep = build_coverage_report(ROOT_DIR)
