@@ -686,7 +686,7 @@ class PfrAndSourceSafety(unittest.TestCase):
          "                          'elapsed_ms': 40, 'phase_timings': {\n"
          "                          'wall_ms': 200.0, 'coverage_ratio': 0.99,\n"
          "                          'phases_ms': {}}})); sys.exit(0)\n"
-         "    if mode == 'unexpected':\n"
+         "    if mode == 'unexpected' or (mode == 'unexpected_second' and n == 1):\n"
          "        print(json.dumps({'error': 'Error: Declaration `typo` not found in PFR/MoreRuzsaDist.lean'}))\n"
          "        sys.exit(1)\n"
          "    if mode == 'id_unconfirmed':\n"
@@ -762,6 +762,15 @@ class PfrAndSourceSafety(unittest.TestCase):
                 expected_cls = ("stale_import_refresh_fail_closed" if mode == "fail"
                                 else "declaration_identity_unknown_module_prefix")
                 self.assertEqual(pfr["error_class"], expected_cls)
+
+    def test_pfr_mixed_expected_and_unexpected_probe_failure_is_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="m1-pfr-mixed-") as td:
+            r = self._run(td, ["--no-baseline"],
+                          env_extra={"FAKE_PFR_MODE": "unexpected_second",
+                                     "FAKE_COUNTER_FILE": str(Path(td) / "cnt")})
+            self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+            self.assertIn("blocked_workload_unexpected_failure", r.stdout + r.stderr)
+            self.assertIn("declaration_not_found", r.stdout + r.stderr)
 
     def test_pfr_every_probe_exit_is_checked_not_just_the_last(self):
         with tempfile.TemporaryDirectory(prefix="m1-pfr-") as td:
