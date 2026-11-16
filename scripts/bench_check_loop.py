@@ -280,7 +280,13 @@ def validate_baseline(base):
             errs.append(f"missing required key: {key}")
     if "kind" in base and base["kind"] not in ("baseline", "results"):
         errs.append(f"unexpected kind: {base['kind']}")
-    if base.get("turbo_lean_dirty") is True:
+    if "turbo_lean_dirty" not in base:
+        errs.append("baseline_missing_turbo_lean_dirty: turbo_lean_dirty missing "
+                    "(provenance requires the marker, exactly boolean false)")
+    elif not isinstance(base["turbo_lean_dirty"], bool):
+        errs.append(f"baseline_invalid_turbo_lean_dirty: turbo_lean_dirty must be exactly "
+                    f"boolean false, got {base['turbo_lean_dirty']!r}")
+    elif base["turbo_lean_dirty"]:
         errs.append("baseline_dirty_tree: turbo_lean_dirty is true")
     commit = base.get("turbo_lean_commit")
     if not isinstance(commit, str) or not commit or commit == "not_a_git_checkout":
