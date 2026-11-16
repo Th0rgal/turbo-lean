@@ -43253,4 +43253,124 @@ end Fixture
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
+
+    #[test]
+    fn test_s1_module_builder_public_api_surface_pinned() {
+        use crate::module_builder as mb;
+        let _: fn(&mb::ProjectConfig, &[String]) -> Result<mb::ModuleDag> = mb::build_module_dag;
+        let _: fn(&mb::ProjectConfig, &[String], bool) -> Result<mb::ModuleDag> =
+            mb::build_module_dag_with_trust;
+        let _: fn(
+            &mut TurboStore,
+            &Path,
+            &[String],
+            &str,
+            i64,
+            bool,
+            bool,
+            Option<&BTreeMap<String, String>>,
+        ) -> Result<mb::NativeBuildReport> = mb::build_project_modules_native;
+        let _: fn(&TurboStore, &Path, &str) -> Result<crate::pack::ExportInclusionFilter> =
+            mb::build_cone_export_filter;
+        let _: fn(&str) -> String = mb::clean_lake_ident;
+        let _: fn(&[String], &[String]) -> Vec<String> = mb::compose_flat_filtered_args;
+        let _: fn(&Path) -> Result<String> = mb::compute_dep_export_olean_digest;
+        let _: fn(&Path) -> Result<String> = mb::compute_dep_meta_olean_digest;
+        let _: fn(&[String]) -> Result<Option<String>> = mb::compute_lean_args_digest;
+        let _: fn(
+            &mb::ProjectConfig,
+            &mb::ModuleNode,
+            &[(String, String)],
+            bool,
+        ) -> Result<String> = mb::compute_module_cas_key;
+        let _: fn(
+            &mb::ProjectConfig,
+            &mb::ModuleNode,
+            &[(String, String)],
+            bool,
+            &[(String, String)],
+        ) -> Result<String> = mb::compute_module_cas_key_with_dynlibs;
+        let _: fn(&Path) -> Result<String> = mb::compute_olean_artifact_set_digest;
+        let _: fn(&Path) -> Result<mb::HydrateTracesReport> = mb::hydrate_project_traces;
+        let _: fn(&str) -> bool = mb::is_allowed_lean_arg;
+        let _: fn(&[u8]) -> u64 = mb::lake_hash_bytes;
+        let _: fn(&str) -> u64 = mb::lake_hash_name;
+        let _: fn(&str) -> u64 = mb::lake_hash_pkg_id;
+        let _: fn(&str) -> u64 = mb::lake_hash_text;
+        let _: fn(u64, u64) -> u64 = mb::lake_mix_hash;
+        let _: fn(&[u8], u64) -> u64 = mb::lake_murmur64a;
+        let _: fn(&str, Option<&str>) -> String = mb::lean_mk_module_initialization_stem;
+        let _: fn(&mb::LeanName, &str) -> String = mb::lean_name_mangle;
+        let _: fn(&str) -> String = mb::lean_string_mangle;
+        let _: fn(&str) -> String = mb::module_name_to_rel_slash;
+        let _: fn(&mb::PackageConfig) -> Vec<String> = mb::package_default_lean_args;
+        let _: fn(&str) -> Vec<String> = mb::parse_header_imports;
+        let _: fn(&str) -> mb::HeaderInfo = mb::parse_header_info;
+        let _: fn(&Path, bool) -> Result<(PathBuf, Vec<mb::ManifestPackageEntry>, Option<String>)> =
+            mb::parse_lake_manifest;
+        let _: fn(&Path, &Path, bool) -> Result<mb::PackageConfig> = mb::parse_lakefile_lean;
+        let _: fn(&Path, &Path, bool) -> Result<mb::PackageConfig> = mb::parse_lakefile_toml;
+        let _: fn(&[u8]) -> Option<(Vec<mb::ParsedImport>, bool)> = mb::parse_olean_binary_imports;
+        let _: fn() = mb::reset_lake_inputs_tag_memo;
+        let _: fn(&mb::PackageConfig, &Path) -> Vec<String> = mb::resolve_file_lean_args_in_package;
+        let _: fn(&Path, bool) -> Result<mb::PackageConfig> = mb::resolve_package_config;
+        let _: fn(&Path) -> Result<mb::ProjectConfig> = mb::resolve_project_config;
+        let _: fn(&Path, bool) -> Result<mb::ProjectConfig> = mb::resolve_project_config_with_trust;
+        let _: fn(&Path, &str) -> Result<(PathBuf, String, PathBuf, PathBuf)> =
+            mb::resolve_toolchain_compiler;
+        let _: fn(&Path, &str, bool) -> Result<(PathBuf, String, PathBuf, PathBuf)> =
+            mb::resolve_toolchain_compiler_with_trust;
+        let _: fn(&mut TurboStore, bool, PathBuf, Vec<String>, usize) -> Result<()> =
+            mb::run_seed_oleans_command;
+        let _: fn(&Path, Option<&Path>) -> Result<Vec<String>> = mb::try_resolve_lean_args_for_path;
+        let _: fn(&[String]) -> Result<Vec<String>> = mb::validate_effective_lean_args;
+        let _: fn(
+            &mb::ProjectConfig,
+            &mb::ModuleDag,
+            &mb::ModuleNode,
+            &str,
+            Option<&str>,
+            bool,
+        ) -> Result<()> = mb::write_lake_module_hashes_and_trace;
+        assert_eq!(mb::LAKE_NIL_HASH, 1723);
+        assert!(!mb::FLEET_SYSTEM_ELAN_ROOTS.is_empty());
+        let _ = (
+            std::mem::size_of::<mb::GlobSpec>(),
+            std::mem::size_of::<mb::LeanNamePart>(),
+            std::mem::size_of::<mb::LeanOptionValue>(),
+            std::mem::size_of::<mb::LeanOptionsMap>(),
+            std::mem::size_of::<mb::ExternLibConfig>(),
+            std::mem::size_of::<mb::HeaderInfo>(),
+            std::mem::size_of::<mb::HydrateTracesReport>(),
+            std::mem::size_of::<mb::InputTargetConfig>(),
+            std::mem::size_of::<mb::LeanExeConfig>(),
+            std::mem::size_of::<mb::LeanLibConfig>(),
+            std::mem::size_of::<mb::LeanName>(),
+            std::mem::size_of::<mb::ManifestPackageEntry>(),
+            std::mem::size_of::<mb::ModuleDag>(),
+            std::mem::size_of::<mb::ModuleNode>(),
+            std::mem::size_of::<mb::NativeBuildReport>(),
+            std::mem::size_of::<mb::PackageConfig>(),
+            std::mem::size_of::<mb::ParsedImport>(),
+            std::mem::size_of::<mb::ProjectConfig>(),
+            std::mem::size_of::<mb::SharedLibSpec>(),
+            std::mem::size_of::<mb::DepImportVisibility>(),
+            std::mem::size_of::<mb::ImportSite>(),
+            std::mem::size_of::<mb::CachedPkgManifest>(),
+            std::mem::size_of::<mb::CutoffPinBaseline>(),
+            std::mem::size_of::<mb::DepImportMemo>(),
+            std::mem::size_of::<mb::DiscoveredModuleSpec>(),
+            std::mem::size_of::<mb::LakeClosureCache>(),
+            std::mem::size_of::<mb::LakeModuleExportInfo>(),
+            std::mem::size_of::<mb::ModuleArtifactTierDigests>(),
+            std::mem::size_of::<mb::OwnedImportPinSpec>(),
+            std::mem::size_of::<mb::ReplayLookupBatchCache>(),
+            std::mem::size_of::<mb::ResolvedExeLinkTarget>(),
+            std::mem::size_of::<mb::ToolchainExecutables>(),
+            std::mem::size_of::<mb::TrustedAssuranceSurface>(),
+            std::mem::size_of::<mb::VerifiedDepManifest>(),
+            std::mem::size_of::<mb::VerifiedDepModuleEntry>(),
+            std::mem::size_of::<mb::VerifiedFastStoreAuthority>(),
+        );
+    }
 }
