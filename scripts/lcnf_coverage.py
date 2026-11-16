@@ -8,10 +8,14 @@ Work-graph leaf **H1.0** (*RO*, `roadmap/HORIZONS.md` @ `b59eeef03fa9497bf700806
 - Accept: CI job emits JSON (`python3 scripts/lcnf_coverage.py --json`)
 
 Methodology & Honesty Rules:
-- Every declaration count in `measured` corpora was obtained by executing the real Lean 4 LCNF
-  pipeline (`Lean.Compiler.LCNF.toImpure` + `builtinPassManager.impurePasses` with `maxHeartbeats := 0`)
-  and invoking `LeanNative.IR.ingestLCNFImpureDecl` (which delegates to
-  `RealLCNFBridge.lowerRealLCNFDecl`) on each compiled declaration.
+- Every declaration count emitted by `--json` / `--check` is obtained in that same invocation by
+  executing the real Lean 4 LCNF pipeline (`Lean.Compiler.LCNF.toImpure` +
+  `builtinPassManager.impurePasses` with `maxHeartbeats := 0`) and invoking
+  `LeanNative.IR.ingestLCNFImpureDecl` (which delegates to `RealLCNFBridge.lowerRealLCNFDecl`) on
+  each compiled declaration. No number is emitted that this invocation did not measure.
+- A corpus this invocation cannot measure is emitted as `measurement_source: "not_measured"` with a
+  `reason` and no declaration counts; it never falls back to a stored constant.
+- The output carries a `measurement_provenance` block (command, UTC date, revisions).
 - No source-pattern heuristic is ever represented as executed lowering.
 - As documented in `roadmap/HORIZONS.md` ("What the review found"), `lowerRealLCNFDecl` lowers a call
   to another local user function (`LetValue.fap`), but `RealLCNFSemantics.evalLetValue` returns
@@ -19,14 +23,15 @@ Methodology & Honesty Rules:
   `lowerRealLCNFDecl_sound` is a forward simulation gated on `evalRealLCNFDecl ... = .ok (v, hst')`,
   its conclusion is vacuous for any declaration that calls a local helper (`lowered_vacuous_local_call`,
   classified under `lowered_unproved` until rung **L2** adds a function environment to both semantics).
-- Unmeasured modules (e.g. external `Batteries` modules outside the in-toolchain `Init.Data.*` /
-  `Std.Data.*` and `verification/c2-lake-packages/*` `.olean` artifacts) are explicitly reported as
-  `unknown` rather than extrapolated.
+- External `Batteries` modules outside the in-toolchain `Init.Data.*` / `Std.Data.*` and the
+  `verification/c2-lake-packages/*` `.olean` artifacts are explicitly reported as `unknown` rather
+  than extrapolated; measuring them is a later leaf.
 """
 from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import datetime
 import hashlib
 import json
 import os
@@ -474,164 +479,24 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
 )
 
 
-CORPORA_COVERAGE: dict[str, Any] = {
-    "batteries_and_c2": {
-        "measurement_status": "measured_via_ingestLCNFImpureDecl",
-        "scope": (
-            "1,805 non-aux compiled LCNF declarations across in-toolchain Std/Init core data structure "
-            "modules (`Init.Data.{Array.Basic,Array.BinSearch,Array.QSort,ByteArray.Basic,BitVec.Basic,UInt.Basic}`, "
-            "`Std.Data.{HashMap.Basic,DHashMap.Internal.Raw,TreeMap.Basic,ByteSlice}`: 1,773 decls) and "
-            "Tier C2 multi-module Lake packages (`C2BitwiseScan`, `C2FieldButterfly`, `C2ProtocolMachine`, "
-            "`C2CryptoSipHash`: 32 decls)"
-        ),
-        "unknown_external_batteries_modules": {
-            "status": "unknown",
-            "reason": (
-                "External `leanprover-community/batteries` modules beyond `Init.Data.*` and `Std.Data.*` are "
-                "not vendored as `.olean` artifacts in this workspace (`C2x` adds nightly Batteries checkout); "
-                "reported as unknown rather than estimated via source-pattern heuristics."
-            ),
-        },
-        "toolchain": PINNED_TOOLCHAIN,
-        "total_declarations": 1805,
-        "proved": 29,
-        "lowered_unproved": 72,
-        "lowered_unproved_breakdown": {
-            "vacuous_local_call_pre_L2": 72,
-            "pure_phase_fallback": 0,
-            "gf_simd_whitelist": 0,
-        },
-        "rejected": 1704,
-        "proved_non_vacuous_share_pct": 1.61,
-        "lowered_total_share_pct": 5.60,
-        "subcorpora": {
-            "std_init_data": {
-                "total_declarations": 1773,
-                "proved": 16,
-                "lowered_unproved": 65,
-                "rejected": 1692,
-            },
-            "c2_lake_packages": {
-                "total_declarations": 32,
-                "proved": 13,
-                "lowered_unproved": 7,
-                "rejected": 12,
-            },
-        },
-        "rejection_reasons": [
-            {"reason": "Unsupported non-scalar/higher-order type in signature or binding", "count": 552},
-            {"reason": "Unsupported partial application (pap) closure", "count": 331},
-            {"reason": "Unsupported non-scalar argument in call", "count": 216},
-            {"reason": "Unsupported constructor layout / non-scalar ADT field", "count": 130},
-            {"reason": "Unsupported erased runtime argument (Arg.erased)", "count": 108},
-            {"reason": "External (@[extern]) declaration without body", "count": 98},
-            {"reason": "Unsupported string literal (LitValue.str)", "count": 96},
-            {"reason": "Unsupported higher-order / closure (fvar) application", "count": 50},
-            {"reason": "Unsupported signed integer type (Int* / ISize)", "count": 29},
-            {"reason": "Unsupported self-tail or mutual recursion", "count": 24},
-            {"reason": "Non-borrowed slice parameter requires borrow (@&)", "count": 21},
-            {"reason": "Unsupported cases scrutinee type", "count": 19},
-            {"reason": "Unsupported external or non-scalar call (fap)", "count": 19},
-            {"reason": "Unsupported join-point / reset-reuse shape", "count": 11},
-        ],
-    },
-    "c1_corpus": {
-        "measurement_status": "measured_via_ingestLCNFImpureDecl",
-        "scope": (
-            "902 non-aux compiled LCNF declarations (`!isCompilerGeneratedAuxDecl`) across the 8 blocking "
-            "Tier C1 3-way run test suites (`C1_CORPUS_TESTS` in `scripts/test_scalar_frontend.py`: 839 "
-            "generated seed declarations + 16 preamble helper declarations + 8 Stage-1B declarations + "
-            "15 negative fail-closed boundary declarations + 24 compiler-generated `_closed` helper "
-            "declarations expanded by `expandCompilerAuxDecls`)"
-        ),
-        "toolchain": PINNED_TOOLCHAIN,
-        "total_declarations": 902,
-        "proved": 782,
-        "lowered_unproved": 98,
-        "lowered_unproved_breakdown": {
-            "vacuous_local_call_pre_L2": 98,
-            "pure_phase_fallback": 0,
-            "gf_simd_whitelist": 0,
-        },
-        "rejected": 22,
-        "proved_non_vacuous_share_pct": 86.70,
-        "lowered_total_share_pct": 97.56,
-        "rejection_reasons": [
-            {"reason": "Unsupported signed integer type (Int* / ISize)", "count": 9},
-            {"reason": "Unsupported non-scalar/higher-order type in signature or binding", "count": 5},
-            {"reason": "Unsupported self-tail or mutual recursion", "count": 3},
-            {"reason": "Unsupported string literal (LitValue.str)", "count": 2},
-            {"reason": "Unsupported external or non-scalar call (fap)", "count": 2},
-            {"reason": "External (@[extern]) declaration without body", "count": 1},
-        ],
-    },
-    "con_leche_h3_benchmark": {
-        "measurement_status": "measured_via_ingestLCNFImpureDecl_maxHeartbeats_0",
-        "repository": "https://github.com/leanprover/con-leche.git",
-        "commit_sha": PINNED_CON_LECHE_REV,
-        "toolchain": PINNED_TOOLCHAIN,
-        "scope": (
-            "14,415 non-aux compiled LCNF declarations across all 99 checker modules (`Main` + "
-            "`ConLeche.{Kernel,Cached,Frontend,Driver}`) with `maxHeartbeats := 0`, excluding the "
-            "27,163 auto-generated literal certificate arrays in `ConLeche.Kernel.NatOpPins`"
-        ),
-        "total_declarations": 14415,
-        "proved": 108,
-        "lowered_unproved": 809,
-        "lowered_unproved_breakdown": {
-            "vacuous_local_call_pre_L2": 809,
-            "pure_phase_fallback": 0,
-            "gf_simd_whitelist": 0,
-        },
-        "rejected": 13498,
-        "proved_non_vacuous_share_pct": 0.75,
-        "lowered_total_share_pct": 6.36,
-        "rejection_reasons": [
-            {"reason": "Unsupported non-scalar/higher-order type in signature or binding", "count": 2853},
-            {"reason": "Unsupported string literal (LitValue.str)", "count": 2750},
-            {"reason": "Unsupported constructor layout / non-scalar ADT field", "count": 2289},
-            {"reason": "Unsupported non-scalar argument in call", "count": 1970},
-            {"reason": "Unsupported self-tail or mutual recursion", "count": 831},
-            {"reason": "Unsupported cases scrutinee type", "count": 806},
-            {"reason": "Unsupported partial application (pap) closure", "count": 569},
-            {"reason": "Unsupported erased runtime argument (Arg.erased)", "count": 362},
-            {"reason": "Unsupported higher-order / closure (fvar) application", "count": 327},
-            {"reason": "Unsupported signed integer type (Int* / ISize)", "count": 308},
-            {"reason": "Unsupported external or non-scalar call (fap)", "count": 237},
-            {"reason": "Unsupported join-point / reset-reuse shape", "count": 164},
-            {"reason": "Non-borrowed slice parameter requires borrow (@&)", "count": 23},
-            {"reason": "Unsupported heap / scalar field mutation (oset/uset/sset)", "count": 9},
-        ],
-        "executed_from_main": {
-            "scope": (
-                "4,282 non-aux declarations reachable from `main` via `scripts/executed-decls.lean` "
-                "(31,962 total IR declarations reached; 4,282 non-aux `ConLeche.*`/`Main` declarations "
-                "excluding `ConLeche.Kernel.NatOpPins`)"
-            ),
-            "total_declarations": 4282,
-            "proved": 18,
-            "lowered_unproved": 106,
-            "rejected": 4158,
-            "proved_non_vacuous_share_pct": 0.42,
-            "lowered_total_share_pct": 2.90,
-            "rejection_reasons": [
-                {"reason": "Unsupported non-scalar/higher-order type in signature or binding", "count": 922},
-                {"reason": "Unsupported string literal (LitValue.str)", "count": 823},
-                {"reason": "Unsupported constructor layout / non-scalar ADT field", "count": 739},
-                {"reason": "Unsupported self-tail or mutual recursion", "count": 665},
-                {"reason": "Unsupported non-scalar argument in call", "count": 294},
-                {"reason": "Unsupported erased runtime argument (Arg.erased)", "count": 207},
-                {"reason": "Unsupported external or non-scalar call (fap)", "count": 198},
-                {"reason": "Unsupported signed integer type (Int* / ISize)", "count": 129},
-                {"reason": "Unsupported join-point / reset-reuse shape", "count": 83},
-                {"reason": "Unsupported cases scrutinee type", "count": 56},
-                {"reason": "Unsupported partial application (pap) closure", "count": 30},
-                {"reason": "Unsupported higher-order / closure (fvar) application", "count": 6},
-                {"reason": "Non-borrowed slice parameter requires borrow (@&)", "count": 3},
-                {"reason": "Unsupported heap / scalar field mutation (oset/uset/sset)", "count": 3},
-            ],
-        },
-    },
+# Human-readable scope descriptions for the live-measured corpora. These carry no
+# measurement numbers: every count in the emitted JSON comes from the audit run of the
+# current invocation (see `build_live_corpora`).
+CORPUS_SCOPES: dict[str, str] = {
+    "batteries_and_c2": (
+        "Non-aux compiled LCNF declarations across in-toolchain Std/Init core data structure "
+        "modules (`Init.Data.{Array.Basic,Array.BinSearch,Array.QSort,ByteArray.Basic,BitVec.Basic,UInt.Basic}`, "
+        "`Std.Data.{HashMap.Basic,DHashMap.Internal.Raw,TreeMap.Basic,ByteSlice}`) and Tier C2 "
+        "multi-module Lake packages (`C2BitwiseScan`, `C2FieldButterfly`, `C2ProtocolMachine`, "
+        "`C2CryptoSipHash`); subcorpora `std_init_data` and `c2_lake_packages` split the totals."
+    ),
+    "c1_corpus": (
+        "Non-aux compiled LCNF declarations of the 8 blocking Tier C1 3-way run test suites "
+        "(`C1_CORPUS_TESTS` in `scripts/test_scalar_frontend.py`): generated seed declaration "
+        "batches, preamble helper declarations, Stage-1B declarations, negative fail-closed "
+        "boundary declarations, and compiler-generated `_closed` helpers expanded by "
+        "`expandCompilerAuxDecls`. Compiled dynamically into a temporary module tree at run time."
+    ),
 }
 
 
@@ -639,7 +504,7 @@ def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-_LEAN_AUDIT_DRIVER_SRC = r"""
+_LEAN_AUDIT_DRIVER_HEAD = r"""
 import Lean
 import Lean.Compiler.LCNF
 import Lean.Compiler.LCNF.Main
@@ -732,7 +597,9 @@ unsafe def auditMods (env : Environment) (mods : Array Name) : IO (Nat × Nat ×
             | .error _ =>
               rej := rej + 1
   return (tot, prv, unp, rej)
+"""
 
+_LEAN_AUDIT_DRIVER_SRC = _LEAN_AUDIT_DRIVER_HEAD + r"""
 unsafe def main (args : List String) : IO Unit := do
   enableInitializersExecution
   initSearchPath (← findSysroot) (args.map System.FilePath.mk)
@@ -764,6 +631,55 @@ unsafe def main (args : List String) : IO Unit := do
 """
 
 
+def _lean_audit_driver_for_modules(modules: list[str]) -> str:
+    """The same audit driver, restricted to an explicitly named module set."""
+    names = ",\n    ".join(f"`{m}" for m in modules)
+    return _LEAN_AUDIT_DRIVER_HEAD + f"""
+unsafe def main (args : List String) : IO Unit := do
+  enableInitializersExecution
+  initSearchPath (← findSysroot) (args.map System.FilePath.mk)
+  let mods : Array Name := #[
+    {names}
+  ]
+  let env ← importModules (mods.map (fun m => {{ module := m }})) {{}} (loadExts := true)
+  let (t, p, u, r) ← auditMods env mods
+  IO.println s!"AUDIT_RESULT:{{t}},{{p}},{{u}},{{r}}"
+"""
+
+
+def _lean_env() -> dict[str, str]:
+    env = dict(os.environ)
+    extra_bins = [
+        str(Path.home() / ".elan" / "bin"),
+        "/var/lib/sandboxed-node/.elan/bin",
+        "/var/lib/sandboxed-node/.cargo/bin",
+    ]
+    env["PATH"] = ":".join(extra_bins + [env.get("PATH", "")])
+    return env
+
+
+def _run_audit_driver(root_dir: Path, driver_src: str, lib_dirs: list[str]) -> tuple[int, int, int, int]:
+    """Run one audit driver against `lib_dirs`; return (total, proved, unproved, rejected)."""
+    lean_dir = root_dir / "lean"
+    env = _lean_env()
+    with tempfile.TemporaryDirectory(prefix="lcnf-audit-driver-") as tmp:
+        driver_path = Path(tmp) / "AuditDriver.lean"
+        driver_path.write_text(driver_src, encoding="utf-8")
+        proc = subprocess.run(
+            ["lake", "env", "lean", "--run", str(driver_path), *lib_dirs],
+            cwd=str(lean_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+    if proc.returncode != 0:
+        raise RuntimeError(f"Lean audit driver failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+    raw_lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip().startswith("AUDIT_RESULT:")]
+    if not raw_lines:
+        raise RuntimeError(f"Lean audit driver emitted no AUDIT_RESULT:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+    return tuple(int(x) for x in raw_lines[-1].split(":", 1)[1].split(","))  # type: ignore[return-value]
+
+
 def execute_live_lean_audit(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     cache_key = str(root_dir.resolve())
     if cache_key in _LIVE_AUDIT_CACHE:
@@ -773,13 +689,7 @@ def execute_live_lean_audit(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     if not (lean_dir / "lakefile.lean").is_file() or not (root_dir / "scripts" / "test_scalar_frontend.py").is_file():
         return {"executed": False, "reason": "missing_lean_workspace"}
 
-    env = dict(os.environ)
-    extra_bins = [
-        str(Path.home() / ".elan" / "bin"),
-        "/var/lib/sandboxed-node/.elan/bin",
-        "/var/lib/sandboxed-node/.cargo/bin",
-    ]
-    env["PATH"] = ":".join(extra_bins + [env.get("PATH", "")])
+    env = _lean_env()
 
     sys.path.insert(0, str(root_dir / "scripts"))
     import fuzz_lcnf_conformance as fuzzer  # type: ignore
@@ -950,6 +860,96 @@ def execute_live_lean_audit(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     return result
 
 
+def _utc_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _git_head(root_dir: Path) -> str:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(root_dir),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+        ).stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def measure_con_leche(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
+    """Report con-leche as unmeasured here, with the reason and no number.
+
+    A live measurement of the pinned corpus needs a prebuilt `.olean` tree that CI
+    does not have; this function returns `not_measured` rather than carry a stored
+    total. The next commit adds the opt-in live path.
+    """
+    return {
+        "measurement_source": "not_measured",
+        "reason": (
+            "con-leche is not vendored and this invocation has no prebuilt `.olean` tree "
+            f"for the pinned commit {PINNED_CON_LECHE_REV}; no number is carried."
+        ),
+    }
+
+
+def _batteries_unknown_reason() -> str:
+    return (
+        "External `leanprover-community/batteries` modules beyond `Init.Data.*` and "
+        "`Std.Data.*` are not measured by this invocation (`C2x` adds the nightly "
+        "Batteries checkout); reported as unknown rather than estimated."
+    )
+
+
+def build_live_corpora(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
+    """Shape the emitted corpora from a measurement made in this invocation.
+
+    Every count in a corpus marked `live_invocation` was measured by this call; a
+    corpus that cannot be measured is emitted as `not_measured` with its reason and
+    carries no number. To add a corpus, add one branch here and one entry in
+    `CORPUS_SCOPES`; `check_coverage_report` iterates whatever is emitted.
+    """
+    live = execute_live_lean_audit(root_dir)
+    corpora: dict[str, Any] = {}
+    if not live.get("executed", False):
+        corpora["batteries_and_c2"] = {
+            "measurement_source": "not_measured",
+            "reason": f"live audit did not execute: {live.get('reason', 'unknown')}",
+        }
+        corpora["c1_corpus"] = dict(corpora["batteries_and_c2"])
+    else:
+        bat = live["batteries_and_c2"]
+        corpora["batteries_and_c2"] = {
+            "measurement_source": "live_invocation",
+            "measured_at_utc": _utc_now(),
+            "scope": CORPUS_SCOPES["batteries_and_c2"],
+            "toolchain": PINNED_TOOLCHAIN,
+            "total_declarations": bat["total_declarations"],
+            "proved": bat["proved"],
+            "lowered_unproved": bat["lowered_unproved"],
+            "rejected": bat["rejected"],
+            "subcorpora": bat["subcorpora"],
+            "unknown_external_batteries_modules": {
+                "status": "unknown",
+                "reason": _batteries_unknown_reason(),
+            },
+        }
+        c1 = live["c1_corpus"]
+        corpora["c1_corpus"] = {
+            "measurement_source": "live_invocation",
+            "measured_at_utc": _utc_now(),
+            "scope": CORPUS_SCOPES["c1_corpus"],
+            "toolchain": PINNED_TOOLCHAIN,
+            "total_declarations": c1["total_declarations"],
+            "proved": c1["proved"],
+            "lowered_unproved": c1["lowered_unproved"],
+            "rejected": c1["rejected"],
+        }
+    corpora["con_leche_h3_benchmark"] = measure_con_leche(root_dir)
+    return corpora
+
+
 def build_coverage_report(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     file_digests: dict[str, dict[str, str | bool]] = {}
     for rel, pinned_sha in TRACKED_BRIDGE_FILES.items():
@@ -966,8 +966,10 @@ def build_coverage_report(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     unproved_cnt = sum(1 for r in rows if r["status"] == "lowered_unproved")
     rejected_cnt = sum(1 for r in rows if r["status"] == "rejected")
 
+    corpora = build_live_corpora(root_dir)
+
     return {
-        "schemaVersion": "turbo-lean-lcnf-coverage-v1",
+        "schemaVersion": "turbo-lean-lcnf-coverage-v2-live",
         "leaf_id": "H1.0",
         "toolchain": PINNED_TOOLCHAIN,
         "bridge_source_digests": file_digests,
@@ -980,7 +982,16 @@ def build_coverage_report(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
             },
             "rows": rows,
         },
-        "corpora": json.loads(json.dumps(CORPORA_COVERAGE)),
+        "corpora": corpora,
+        "measurement_provenance": {
+            "command": " ".join([sys.executable, *sys.argv]),
+            "date_utc": _utc_now(),
+            "revisions": {
+                "toolchain": PINNED_TOOLCHAIN,
+                "turbo_lean_head": _git_head(root_dir),
+                "con_leche": PINNED_CON_LECHE_REV,
+            },
+        },
     }
 
 
@@ -1021,14 +1032,22 @@ def check_coverage_report(
         errors.append("Matrix summary counts do not sum to total")
 
     for cname, corp in rep.get("corpora", {}).items():
+        source = corp.get("measurement_source")
+        if source == "not_measured":
+            if not corp.get("reason"):
+                errors.append(f"Corpus `{cname}` is not measured but gives no reason")
+            if any(k in corp for k in ("total_declarations", "proved", "lowered_unproved", "rejected")):
+                errors.append(f"Corpus `{cname}` is not measured yet carries declaration counts")
+            continue
+        if source != "live_invocation":
+            errors.append(
+                f"Corpus `{cname}` carries no live measurement: "
+                f"{corp.get('reason', 'no reason given')}"
+            )
+            continue
         tot = corp["total_declarations"]
         if tot != corp["proved"] + corp["lowered_unproved"] + corp["rejected"]:
             errors.append(f"Corpus `{cname}` declaration counts do not sum to total_declarations")
-        rej_sum = sum(int(r["count"]) for r in corp["rejection_reasons"])
-        if rej_sum != corp["rejected"]:
-            errors.append(
-                f"Corpus `{cname}` rejection_reasons sum ({rej_sum}) != rejected ({corp['rejected']})"
-            )
         if "subcorpora" in corp:
             sub_tot = sum(s["total_declarations"] for s in corp["subcorpora"].values())
             sub_prv = sum(s["proved"] for s in corp["subcorpora"].values())
@@ -1041,29 +1060,37 @@ def check_coverage_report(
                 corp["rejected"],
             ):
                 errors.append(f"Corpus `{cname}` subcorpora totals do not sum to corpus totals")
-        if "executed_from_main" in corp:
-            ex = corp["executed_from_main"]
-            if ex["total_declarations"] != ex["proved"] + ex["lowered_unproved"] + ex["rejected"]:
-                errors.append(f"Corpus `{cname}.executed_from_main` counts do not sum to total")
-            ex_rej = sum(int(r["count"]) for r in ex["rejection_reasons"])
-            if ex_rej != ex["rejected"]:
-                errors.append(
-                    f"Corpus `{cname}.executed_from_main` rejection sum ({ex_rej}) != rejected ({ex['rejected']})"
-                )
-
     if verify_live:
         live = execute_live_lean_audit(root_dir)
         if not live.get("executed", False):
             errors.append(f"Live Lean lowerer execution failed: {live.get('reason', 'unknown')}")
         else:
             for cname in ("batteries_and_c2", "c1_corpus"):
-                c_rep = rep["corpora"][cname]
+                c_rep = rep.get("corpora", {}).get(cname, {})
                 c_live = live[cname]
+                if c_rep.get("measurement_source") != "live_invocation":
+                    errors.append(f"Corpus `{cname}` has no live measurement to compare")
+                    continue
                 for field in ("total_declarations", "proved", "lowered_unproved", "rejected"):
                     if c_rep[field] != c_live[field]:
                         errors.append(
                             f"Corpus `{cname}` live execution mismatch on `{field}`: "
                             f"report={c_rep[field]} live={c_live[field]}"
+                        )
+        c_rep = rep.get("corpora", {}).get("con_leche_h3_benchmark", {})
+        c_fresh = measure_con_leche(root_dir)
+        if c_rep.get("measurement_source") == "live_invocation":
+            if c_fresh.get("measurement_source") != "live_invocation":
+                errors.append(
+                    f"Corpus `con_leche_h3_benchmark` claims a live measurement but a fresh "
+                    f"run cannot measure it: {c_fresh.get('reason', 'unknown')}"
+                )
+            else:
+                for field in ("total_declarations", "proved", "lowered_unproved", "rejected"):
+                    if c_rep[field] != c_fresh[field]:
+                        errors.append(
+                            f"Corpus `con_leche_h3_benchmark` live execution mismatch on `{field}`: "
+                            f"report={c_rep[field]} live={c_fresh[field]}"
                         )
 
     return {
@@ -1078,7 +1105,7 @@ class TestLcnfCoverage(unittest.TestCase):
         chk = check_coverage_report(ROOT_DIR)
         self.assertTrue(chk["ok"], chk["errors"])
         rep = chk["report"]
-        self.assertEqual(rep["schemaVersion"], "turbo-lean-lcnf-coverage-v1")
+        self.assertEqual(rep["schemaVersion"], "turbo-lean-lcnf-coverage-v2-live")
         self.assertEqual(rep["leaf_id"], "H1.0")
         summary = rep["lcnf_constructor_matrix"]["summary"]
         self.assertEqual(summary["total"], 46)
@@ -1086,6 +1113,7 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertEqual(summary["lowered_unproved"], 4)
         self.assertEqual(summary["rejected"], 10)
         bat = rep["corpora"]["batteries_and_c2"]
+        self.assertEqual(bat["measurement_source"], "live_invocation")
         self.assertEqual(bat["unknown_external_batteries_modules"]["status"], "unknown")
         self.assertEqual(bat["proved"], 29)
         self.assertEqual(bat["lowered_unproved"], 72)
@@ -1114,7 +1142,39 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertIn("date_utc", prov)
         self.assertIn("revisions", prov)
 
-    def test_detects_corrupted_rejection_sum(self) -> None:
+    def test_unmeasured_corpus_carries_no_number(self) -> None:
+        # (c): a corpus that cannot be measured is `not_measured` with a reason and no
+        # declaration counts; that is honest output, so `--check` accepts it, but the
+        # corpus never carries a stored fallback number.
+        corp = measure_con_leche(ROOT_DIR)
+        self.assertEqual(corp["measurement_source"], "not_measured")
+        self.assertTrue(corp["reason"])
+        for field in ("total_declarations", "proved", "lowered_unproved", "rejected"):
+            self.assertNotIn(field, corp)
+        rep = build_coverage_report(ROOT_DIR)
+        self.assertEqual(rep["corpora"]["con_leche_h3_benchmark"]["measurement_source"], "not_measured")
+        named = check_coverage_report(ROOT_DIR, rep)
+        self.assertTrue(named["ok"], named["errors"])
+
+    def test_not_measured_corpus_without_reason_fails_check(self) -> None:
+        rep = build_coverage_report(ROOT_DIR)
+        rep["corpora"]["con_leche_h3_benchmark"] = {"measurement_source": "not_measured"}
+        chk = check_coverage_report(ROOT_DIR, rep)
+        self.assertFalse(chk["ok"])
+        self.assertTrue(any("con_leche_h3_benchmark" in e and "reason" in e for e in chk["errors"]))
+
+    def test_not_measured_corpus_with_counts_fails_check(self) -> None:
+        rep = build_coverage_report(ROOT_DIR)
+        rep["corpora"]["con_leche_h3_benchmark"] = {
+            "measurement_source": "not_measured",
+            "reason": "test",
+            "total_declarations": 14415,
+        }
+        chk = check_coverage_report(ROOT_DIR, rep)
+        self.assertFalse(chk["ok"])
+        self.assertTrue(any("con_leche_h3_benchmark" in e and "counts" in e for e in chk["errors"]))
+
+    def test_detects_corrupted_corpus_total(self) -> None:
         rep = build_coverage_report(ROOT_DIR)
         rep["corpora"]["batteries_and_c2"]["rejected"] += 3
         chk = check_coverage_report(ROOT_DIR, rep)
@@ -1171,7 +1231,7 @@ def main() -> int:
         res = unittest.TextTestRunner(verbosity=2).run(suite)
         return 0 if res.wasSuccessful() else 1
 
-    chk = check_coverage_report(ROOT_DIR, verify_live=args.check)
+    chk = check_coverage_report(ROOT_DIR)
     if args.json or not args.check:
         out = dict(chk["report"])
         out["ok"] = chk["ok"]
@@ -1179,14 +1239,26 @@ def main() -> int:
         print(json.dumps(out, indent=2, sort_keys=True))
     else:
         ms = chk["report"]["lcnf_constructor_matrix"]["summary"]
-        bat = chk["report"]["corpora"]["batteries_and_c2"]
-        c1 = chk["report"]["corpora"]["c1_corpus"]
-        print(
+        corpora = chk["report"]["corpora"]
+        parts = [
             f"[lcnf-coverage] ok={chk['ok']} "
-            f"matrix={ms['proved']}/{ms['total']} proved ({ms['lowered_unproved']} lowered_unproved, {ms['rejected']} rejected) "
-            f"batteries_c2={bat['proved']}/{bat['total_declarations']} proved (+{bat['lowered_unproved']} vacuous_local_call) "
-            f"c1={c1['proved']}/{c1['total_declarations']} proved (+{c1['lowered_unproved']} vacuous_local_call)"
-        )
+            f"matrix={ms['proved']}/{ms['total']} proved "
+            f"({ms['lowered_unproved']} lowered_unproved, {ms['rejected']} rejected)"
+        ]
+        for label, cname in (
+            ("batteries_c2", "batteries_and_c2"),
+            ("c1", "c1_corpus"),
+            ("con_leche", "con_leche_h3_benchmark"),
+        ):
+            corp = corpora.get(cname, {})
+            if corp.get("measurement_source") == "live_invocation":
+                parts.append(
+                    f"{label}={corp['proved']}/{corp['total_declarations']} proved "
+                    f"(+{corp['lowered_unproved']} vacuous_local_call)"
+                )
+            else:
+                parts.append(f"{label}=not measured")
+        print(" ".join(parts))
     if not chk["ok"]:
         for err in chk["errors"]:
             print(f"  [ERROR] {err}", file=sys.stderr)
