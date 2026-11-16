@@ -1552,11 +1552,45 @@ struct RawAuditSpecPathRuleItem {
     forbid_namespaces: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 enum RawAuditSpecPathRules {
     Map(std::collections::BTreeMap<String, RawAuditSpecPathRuleBody>),
     List(Vec<RawAuditSpecPathRuleItem>),
+}
+
+impl RawAuditSpecPathRules {
+    fn from_json_value(val: serde_json::Value) -> Result<Self, String> {
+        match val {
+            serde_json::Value::Array(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for (idx, item) in items.into_iter().enumerate() {
+                    let item: RawAuditSpecPathRuleItem = serde_json::from_value(item)
+                        .map_err(|e| format!("invalid `[[audit_spec.path_rules]]` entry #{idx}: {e}"))?;
+                    out.push(item);
+                }
+                Ok(Self::List(out))
+            }
+            serde_json::Value::Object(map) => {
+                let mut out = std::collections::BTreeMap::new();
+                for (glob, body) in map {
+                    let body: RawAuditSpecPathRuleBody = serde_json::from_value(body)
+                        .map_err(|e| format!("invalid `[audit_spec.path_rules.{glob:?}]` entry: {e}"))?;
+                    out.insert(glob, body);
+                }
+                Ok(Self::Map(out))
+            }
+            other => Err(format!(
+                "`path_rules` must be a table or an array of rule tables, found: {other}"
+            )),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RawAuditSpecPathRules {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let val = serde_json::Value::deserialize(deserializer)?;
+        Self::from_json_value(val).map_err(serde::de::Error::custom)
+    }
 }
 
 fn normalized_audit_spec_key(name: &str) -> String {
@@ -5125,6 +5159,22 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
                 "error must name the offending key `forbid_decl_kind`: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn audit_spec_path_rules_valid_map_and_list_still_accepted() {
+        let map_form = "[audit_spec]\n[audit_spec.path_rules.\"src/**\"]\nforbid_decl_kinds = [\"axiom\"]\n";
+        let cfg = AuditSpecPolicyConfig::try_parse_config_str(map_form)
+            .expect("valid map-form path_rules must keep parsing")
+            .expect("config expected");
+        assert_eq!(cfg.path_rules.len(), 1);
+        assert_eq!(cfg.path_rules[0].glob_pattern, "src/**");
+        let list_form = "[audit_spec]\n[[audit_spec.path_rules]]\nglob_pattern = \"lean/**/Proofs/**\"\nallow_decl_names = [\"SymExpr\"]\n";
+        let cfg = AuditSpecPolicyConfig::try_parse_config_str(list_form)
+            .expect("valid list-form path_rules must keep parsing")
+            .expect("config expected");
+        assert_eq!(cfg.path_rules.len(), 1);
+        assert_eq!(cfg.path_rules[0].glob_pattern, "lean/**/Proofs/**");
     }
 
     #[test]
