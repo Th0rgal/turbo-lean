@@ -1163,6 +1163,40 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertFalse(chk["ok"])
         self.assertTrue(any("con_leche_h3_benchmark" in e and "reason" in e for e in chk["errors"]))
 
+    def test_con_leche_numbers_come_from_the_named_olean_tree(self) -> None:
+        # (c): when a prebuilt pinned con-leche tree is named, its totals must come from
+        # running the lowerer over it in this invocation, not from a stored table.
+        import unittest.mock as mock
+
+        with tempfile.TemporaryDirectory(prefix="cl-tree-") as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            lib = root / "lib" / "lean" / "ConLeche" / "Kernel"
+            lib.mkdir(parents=True)
+            for name in ("Name", "Expr", "NatOpPins"):
+                (lib / f"{name}.olean").write_bytes(b"")
+            saved = os.environ.get("TURBO_CON_LECHE_OLEANS")
+            os.environ["TURBO_CON_LECHE_OLEANS"] = str(root / "lib" / "lean")
+            try:
+                with mock.patch.object(
+                    sys.modules[__name__], "_run_audit_driver", return_value=(100, 7, 11, 82)
+                ) as run:
+                    corp = measure_con_leche(ROOT_DIR)
+            finally:
+                if saved is None:
+                    os.environ.pop("TURBO_CON_LECHE_OLEANS", None)
+                else:
+                    os.environ["TURBO_CON_LECHE_OLEANS"] = saved
+        self.assertEqual(corp["measurement_source"], "live_invocation")
+        self.assertEqual(
+            (corp["total_declarations"], corp["proved"], corp["lowered_unproved"], corp["rejected"]),
+            (100, 7, 11, 82),
+        )
+        self.assertEqual(corp["commit_sha"], PINNED_CON_LECHE_REV)
+        run.assert_called_once()
+        # NatOpPins is excluded by name from the measured module set.
+        self.assertNotIn("ConLeche.Kernel.NatOpPins", run.call_args.args[1])
+
     def test_not_measured_corpus_with_counts_fails_check(self) -> None:
         rep = build_coverage_report(ROOT_DIR)
         rep["corpora"]["con_leche_h3_benchmark"] = {
