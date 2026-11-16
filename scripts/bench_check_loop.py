@@ -8,20 +8,35 @@ medians against it. Every performance change in this project must show before
 and after numbers from this script; a change that does not move them is
 reverted.
 
-Typical before/after on one machine (the only comparison this script trusts):
+Typical before/after on one machine (the only comparison this script trusts),
+with the environment it requires (TURBO_LEAN_GIT must be git >= 2.46) and the
+checkout arguments it needs:
 
-    git checkout main    && python3 scripts/bench_check_loop.py --out /tmp/m1_main.json
-    git checkout <branch> && python3 scripts/bench_check_loop.py --baseline /tmp/m1_main.json --out /tmp/m1_branch.json
+    export TURBO_LEAN_GIT=/path/to/git-2.46+ TURBO_LEAN_ALLOWED_CSIMP='*' \
+        TURBO_LEAN_ALLOWED_UNSAFE='*' TURBO_LEAN_ALLOWED_IMPLEMENTED_BY='*'
+    git checkout main && python3 scripts/bench_check_loop.py \
+        --turbo-lean-bin target/release/turbo-lean \
+        --batteries-dir /path/to/batteries --pfr-dir /path/to/pfr \
+        --out /tmp/m1_main.json
+    git checkout <branch> && python3 scripts/bench_check_loop.py \
+        --turbo-lean-bin target/release/turbo-lean \
+        --batteries-dir /path/to/batteries --pfr-dir /path/to/pfr \
+        --baseline /tmp/m1_main.json --strict-comparison --out /tmp/m1_branch.json
+
+`--strict-comparison` means "a comparison really happened": without it a
+skipped comparison exits 0 while saying so; with it the after-run fails unless
+the two runs were actually compared.
 
 Exit codes:
     0  measurements healthy; comparison passed, or was explicitly skipped and
        flagged (`comparison_skipped_*`), or was not requested (`not_compared`).
        The script never reports a pass for a comparison it skipped.
     1  regression, unhealthy measurement, or (with --strict-comparison) a
-       skipped comparison.
+       skipped or absent comparison.
     2  usage error.
     3  stale expectation: a workload expected `blocked` (PFR) passed.
-    4  environment/setup failure (missing env, wrong revs, wrong git, ...).
+    4  environment/setup failure (missing env, wrong revs, wrong git, missing
+       or malformed baseline, ...).
 
 Required environment (validated, fail-closed; all recorded in the output):
     TURBO_LEAN_GIT                     git >= 2.46 binary (system git is refused)
@@ -35,7 +50,9 @@ Python standard library only.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -182,15 +199,17 @@ def empty_run_result(workloads, trials):
 
 
 def mode_result(runs_ms, coverage_ratios, statuses, extra=None, phase_dicts=None,
-                psi_lists=None):
+                psi_lists=None, failed_trials=0, tool_coverage=None):
     xs = list(runs_ms)
     out = {
         "runs_ms": [round(x, 1) for x in xs],
         "trials": len(xs),
+        "failed_trials": failed_trials,
         "median_ms": round(median(xs), 1) if xs else None,
         "spread_ms": round(max(xs) - min(xs), 1) if len(xs) > 1 else 0.0,
         "rel_spread": round(rel_spread(xs), 4) if len(xs) > 1 else 0.0,
-        "coverage_ratio_min": round(min(coverage_ratios), 4) if coverage_ratios else None,
+        "coverage_ratio_min": round(min(tool_coverage), 4) if tool_coverage else None,
+        "coverage_ratio_external_min": round(min(coverage_ratios), 4) if coverage_ratios else None,
         "statuses_observed": sorted(set(statuses)),
     }
     if phase_dicts:
@@ -257,8 +276,16 @@ def validate_baseline(base):
             continue
         for mode in MODES:
             m = modes.get(mode)
-            if not m or not m.get("trials") or m.get("median_ms") is None:
+            trials = m.get("trials") if isinstance(m, dict) else None
+            if not isinstance(m, dict) or not trials or int(trials) <= 0 \
+                    or m.get("median_ms") is None:
                 errs.append(f"{wid}/{mode} has no measured trials")
+                continue
+            med = m["median_ms"]
+            if not isinstance(med, (int, float)) or isinstance(med, bool) \
+                    or math.isnan(med) or math.isinf(med) or med <= 0:
+                errs.append(f"{wid}/{mode} median_ms must be a positive finite "
+                            f"number, got {med!r}")
     return errs
 
 
@@ -275,24 +302,45 @@ def host_matches(base, res) -> bool:
 
 
 def settings_match(base, res) -> bool:
-    key = lambda s: {v: s.get(v) for v in
-                     ("TURBO_LEAN_GIT", "TURBO_LEAN_ALLOWED_CSIMP",
-                      "TURBO_LEAN_ALLOWED_UNSAFE", "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY")}
+    """Every recorded TURBO_LEAN_* setting must agree, not just four keys."""
+    key = lambda s: {v: s.get(v) for v in RECORDED_ENV_VARS}
     return key(base.get("settings") or {}) == key(res.get("settings") or {})
+
+
+def trial_failed(r) -> bool:
+    """A trial whose command exited non-zero, reported no status or a failed
+    one is a failed measurement, even if a time was parsed."""
+    if r.get("exit_code") != 0:
+        return True
+    j = r.get("json")
+    if not isinstance(j, dict):
+        return True
+    status = j.get("status")
+    if not status or status in ("failed", "error"):
+        return True
+    return False
 
 
 def compare_run(baseline, res):
     """Gate `res` against `baseline`. Never passes a comparison it skipped."""
     verdict = {
         "verdict": None, "regressions": [], "improvements": [], "measured_nothing": [],
-        "unexpected_successes": [], "pfr_status": None, "skipped_reason": None,
-        "same_binary": None, "gates": {},
+        "comparison_errors": [], "unexpected_successes": [], "pfr_status": None,
+        "skipped_reason": None, "same_binary": None, "gates": {},
     }
+    for wid in baseline["workloads"] if baseline else {}:
+        if wid not in res["workloads"]:
+            verdict["comparison_errors"].append(
+                f"workload {wid} is in the baseline but not in this run's results")
+    for wid in res["workloads"]:
+        if baseline and wid not in baseline["workloads"]:
+            verdict["comparison_errors"].append(
+                f"workload {wid} is in this run's results but not in the baseline")
     healthy = all(
         (w.get("status") == "ok" if w.get("expected_status") != "blocked"
          else w.get("status") in ("blocked_as_expected", "unexpectedly_passing"))
         for w in res["workloads"].values()
-    )
+    ) and not verdict["comparison_errors"]
     if not healthy:
         verdict["verdict"] = "measurement_failed"
         return verdict
@@ -316,16 +364,24 @@ def compare_run(baseline, res):
         return verdict
     for w in WORKLOADS:
         wid = w["id"]
-        base_w, res_w = baseline["workloads"].get(wid), res["workloads"][wid]
+        base_w, res_w = (baseline.get("workloads") or {}).get(wid), res["workloads"].get(wid)
+        if res_w is None or base_w is None:
+            verdict["comparison_errors"].append(
+                f"workload {wid} present on one side only")
+            verdict["verdict"] = "measurement_failed"
+            continue
         if res_w.get("status") == "unexpectedly_passing":
             verdict["unexpected_successes"].append(wid)
             verdict["verdict"] = "stale_expectation"
             continue
-        if base_w is None:
-            continue
+        if res_w.get("expected_status") == "blocked" or base_w.get("expected_status") == "blocked":
+            continue  # blocked probes record one fail-fast mode; nothing to gate
         for mode in MODES:
             b, r = (base_w.get("modes") or {}).get(mode), (res_w.get("modes") or {}).get(mode)
             if b is None or b.get("median_ms") is None:
+                verdict["comparison_errors"].append(
+                    f"baseline has no measured median for {wid}/{mode}")
+                verdict["verdict"] = "measurement_failed"
                 continue
             if r is None or not r.get("trials") or r.get("median_ms") is None:
                 verdict["regressions"].append(f"{wid}/{mode}")
@@ -651,8 +707,33 @@ class Runner:
                 f"workload source {w['file']} is dirty after restore: {status!r}")
 
     # -- modes ------------------------------------------------------------
+    @staticmethod
+    def split_trials(trial_results):
+        """Partition measured trials: keep only healthy trials' timings.
+
+        A trial whose command exited non-zero, reported no status or a failed
+        one is a failed measurement even if a time was parsed; it is excluded
+        from the median and counted in `failed_trials`.
+        """
+        runs, covs, tool_covs, statuses, phases, psis, failed = [], [], [], [], [], [], 0
+        for r in trial_results:
+            if trial_failed(r):
+                failed += 1
+                continue
+            runs.append(r["external_wall_ms"])
+            statuses.append(str((r.get("json") or {}).get("status") or f"exit_{r['exit_code']}"))
+            pt = (r.get("json") or {}).get("phase_timings") or {}
+            wall = pt.get("wall_ms")
+            covs.append((wall / r["external_wall_ms"])
+                        if isinstance(wall, (int, float)) and wall
+                        and r["external_wall_ms"] > 0 else 0.0)
+            tool_covs.append(pt.get("coverage_ratio") or 0.0)
+            phases.append(pt.get("phases_ms") or {})
+            psis.append([r.get("psi_before") or {}, r.get("psi_after") or {}])
+        return runs, covs, tool_covs, statuses, phases, psis, failed
+
     def run_cold_mode(self, w):
-        runs, covs, statuses, phases, psis = [], [], [], [], []
+        trial_results = []
         total = self.warmups + self.trials
         for i in range(total):
             d = self.wl_scratch(w["id"]) / f"cold_{i}"
@@ -663,13 +744,10 @@ class Runner:
             r = self.run_check(w, cache, home, staging, no_daemon=True)
             shutil.rmtree(d, ignore_errors=True)
             if i >= self.warmups:
-                runs.append(r["external_wall_ms"])
-                statuses.append(f"exit_{r['exit_code']}")
-                pt = (r.get("json") or {}).get("phase_timings") or {}
-                covs.append(pt.get("coverage_ratio", 0.0))
-                phases.append(pt.get("phases_ms") or {})
-                psis.append([r.get("psi_before") or {}, r.get("psi_after") or {}])
-        return mode_result(runs, covs, statuses, phase_dicts=phases, psi_lists=psis)
+                trial_results.append(r)
+        runs, covs, tool_covs, statuses, phases, psis, failed = self.split_trials(trial_results)
+        return mode_result(runs, covs, statuses, phase_dicts=phases, psi_lists=psis,
+                           failed_trials=failed, tool_coverage=tool_covs)
 
     def run_warm_modes(self, w):
         d = self.wl_scratch(w["id"]) / "warm"
@@ -683,22 +761,20 @@ class Runner:
                 raise BenchEnvError(
                     f"warm setup run for {w['id']} failed (exit {setup['exit_code']}); "
                     f"cannot measure warm modes: {setup['stderr'][-500:]}")
-            hit_runs, hit_covs, hit_status, hit_phases, hit_psis = [], [], [], [], []
+            hit_trials = []
             for _ in range(self.trials):
-                r = self.run_check(w, cache, home, staging, no_daemon=False)
-                hit_runs.append(r["external_wall_ms"])
-                pt = (r.get("json") or {}).get("phase_timings") or {}
-                hit_covs.append(pt.get("coverage_ratio", 0.0))
-                hit_status.append(str((r.get("json") or {}).get("status")))
-                hit_phases.append(pt.get("phases_ms") or {})
-                hit_psis.append([r.get("psi_before") or {}, r.get("psi_after") or {}])
-            warm_cache = mode_result(hit_runs, hit_covs, hit_status,
-                                     phase_dicts=hit_phases, psi_lists=hit_psis)
+                hit_trials.append(self.run_check(w, cache, home, staging, no_daemon=False))
+            runs, covs, tool_covs, hit_status, hit_phases, hit_psis, hit_failed = \
+                self.split_trials(hit_trials)
+            warm_cache = mode_result(runs, covs, hit_status, phase_dicts=hit_phases,
+                                     psi_lists=hit_psis, failed_trials=hit_failed,
+                                     tool_coverage=tool_covs)
             if not all(s == "theorem_cache_hit" for s in hit_status):
                 warm_cache["cache_hit_assert_failed"] = hit_status
             edit_runs, edit_covs, edit_status, edit_phases, edit_psis = [], [], [], [], []
             src_path = self.source_path(w)
             original = src_path.read_bytes()
+            edit_trials = []
             try:
                 for i in range(-1, self.trials):
                     src = original.decode()
@@ -712,16 +788,14 @@ class Runner:
                     if i < 0:
                         continue  # settling run: first edit after the cache-hit
                                   # phase pays a one-off penalty; discard it
-                    edit_runs.append(r["external_wall_ms"])
-                    pt = (r.get("json") or {}).get("phase_timings") or {}
-                    edit_covs.append(pt.get("coverage_ratio", 0.0))
-                    edit_status.append(str((r.get("json") or {}).get("status")))
-                    edit_phases.append(pt.get("phases_ms") or {})
-                    edit_psis.append([r.get("psi_before") or {}, r.get("psi_after") or {}])
+                    edit_trials.append(r)
             finally:
                 src_path.write_bytes(original)
-            warm_edit = mode_result(edit_runs, edit_covs, edit_status,
-                                    phase_dicts=edit_phases, psi_lists=edit_psis)
+            runs, covs, tool_covs, edit_status, edit_phases, edit_psis, edit_failed = \
+                self.split_trials(edit_trials)
+            warm_edit = mode_result(runs, covs, edit_status, phase_dicts=edit_phases,
+                                    psi_lists=edit_psis, failed_trials=edit_failed,
+                                    tool_coverage=tool_covs)
             if not all(s == "theorem_verified" for s in edit_status):
                 warm_edit["verified_assert_failed"] = edit_status
             return warm_cache, warm_edit
@@ -784,15 +858,15 @@ class Runner:
         warm_cache, warm_edit = self.run_warm_modes(w)
         print(f"  warm cache-hit median={warm_cache['median_ms']}ms, "
               f"edited median={warm_edit['median_ms']}ms", flush=True)
-        healthy = (
-            cold["trials"] > 0 and cold["coverage_ratio_min"] is not None
-            and cold["coverage_ratio_min"] >= COVERAGE_GATE
-            and warm_cache["trials"] > 0
-            and warm_cache["coverage_ratio_min"] >= COVERAGE_GATE
-            and "cache_hit_assert_failed" not in warm_cache
-            and warm_edit["trials"] > 0
-            and warm_edit["coverage_ratio_min"] >= COVERAGE_GATE
-            and "verified_assert_failed" not in warm_edit)
+
+        def mode_healthy(m, assert_key):
+            return (m["trials"] > 0 and m.get("failed_trials", 0) == 0
+                    and m["coverage_ratio_external_min"] is not None
+                    and m["coverage_ratio_external_min"] >= COVERAGE_GATE
+                    and assert_key not in m)
+        healthy = (mode_healthy(cold, "")
+                   and mode_healthy(warm_cache, "cache_hit_assert_failed")
+                   and mode_healthy(warm_edit, "verified_assert_failed"))
         return {"id": wid, "status": "ok" if healthy else "failed",
                 "repo": w["repo"], "file": w["file"], "decl": w["decl"],
                 "expected_status": "active",
@@ -852,6 +926,35 @@ def check_pinned_revs(runner: Runner):
                 "--skip-rev-check (the JSON then records revs_pinned=false).")
 
 
+def load_baseline_or_none(args):
+    """Load and fully validate the baseline BEFORE any measurement.
+
+    A baseline named on the command line (or found at the default path) that is
+    missing, unreadable, malformed, or lacks a workload, a mode or trials is a
+    setup error, never a warning followed by a silent skip: a comparison that
+    quietly did not happen is how false passes are made.
+    """
+    if args.no_baseline:
+        return None
+    bpath = args.baseline
+    if bpath is None:
+        default = Path(__file__).resolve().parent / "bench_check_loop_baseline.json"
+        if not default.is_file():
+            return None
+        bpath = str(default)
+    try:
+        baseline = json.loads(Path(bpath).read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise BenchEnvError(f"cannot load baseline {bpath}: {e}") from e
+    errs = validate_baseline(baseline)
+    if errs:
+        raise BenchEnvError(
+            f"baseline {bpath} failed validation: " + "; ".join(errs)
+            + " (refusing to run: a comparison against a broken baseline would "
+              "silently skip cells and could pass falsely)")
+    return baseline
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -881,6 +984,11 @@ def main(argv=None):
                     help="validate a baseline/results file and exit")
     args = ap.parse_args(argv)
 
+    if args.trials <= 0:
+        ap.error(f"--trials must be >= 1, got {args.trials}")
+    if args.warmup < 0:
+        ap.error(f"--warmup must be >= 0, got {args.warmup}")
+
     if args.validate_only:
         try:
             data = json.loads(Path(args.validate_only).read_text())
@@ -895,7 +1003,9 @@ def main(argv=None):
                   f"({data.get('turbo_lean_commit')}, host {data.get('host', {}).get('hostname')})")
         return 0 if not errs else 1
     if not args.batteries_dir or not args.pfr_dir:
-        ap.error("--batteries-dir and --pfr-dir are required (unless --validate-only)")
+        ap.error("--batteries-dir and --pfr-dir are required (unless --validate-only); "
+                 "the environment needs TURBO_LEAN_GIT (git >= 2.46) and "
+                 "TURBO_LEAN_ALLOWED_{CSIMP,UNSAFE,IMPLEMENTED_BY}='*'")
 
     git_bin, git_human = validate_environment(args)
     runner = Runner(args)
@@ -903,6 +1013,7 @@ def main(argv=None):
     try:
         load_at_start = require_quiet_node(args)
         check_pinned_revs(runner)
+        baseline = load_baseline_or_none(args)
         commit, dirty, repo_path = turbo_lean_commit_for(runner.bin, git_bin)
         binary_sha = None
         h = host_id(args.machine_label)
@@ -925,22 +1036,6 @@ def main(argv=None):
         for w in WORKLOADS:
             entry = runner.run_workload(w)
             results["workloads"][w["id"]] = entry
-        baseline = None
-        if not args.no_baseline:
-            bpath = args.baseline
-            if bpath is None:
-                default = Path(__file__).resolve().parent / "bench_check_loop_baseline.json"
-                bpath = default if default.is_file() else None
-            if bpath is not None:
-                try:
-                    baseline = json.loads(Path(bpath).read_text())
-                    errs = validate_baseline(baseline)
-                    if errs:
-                        print(f"warning: baseline {bpath} failed validation: {errs}",
-                              file=sys.stderr)
-                        baseline = None
-                except (OSError, json.JSONDecodeError) as e:
-                    print(f"warning: cannot load baseline {bpath}: {e}", file=sys.stderr)
         verdict = compare_run(baseline, results)
         results["verdict"] = verdict
         if args.rebaseline:
@@ -961,7 +1056,9 @@ def main(argv=None):
                  if verdict["unexpected_successes"] else ""), flush=True)
         code = VERDICT_EXIT[verdict["verdict"]]
         if (code == 0 and args.strict_comparison
-                and str(verdict["verdict"]).startswith("comparison_skipped")):
+                and verdict["verdict"] in ("not_compared",
+                                           "comparison_skipped_host_mismatch",
+                                           "comparison_skipped_settings_mismatch")):
             code = 1
         return code
     except BenchEnvError as e:

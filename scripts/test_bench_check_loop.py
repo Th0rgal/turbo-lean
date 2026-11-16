@@ -28,6 +28,81 @@ def load_script():
     return mod
 
 
+def make_stub_binary(root: Path, body: str | None = None):
+    stub = root / "fake-turbo-lean"
+    stub.write_text(body or (
+        "#!/usr/bin/env python3\n"
+        "import json, os, sys, time\n"
+        "args = sys.argv[1:]\n"
+        "time.sleep(0.04)\n"
+        "if os.environ.get('FAKE_PFR_FAIL') and '--no-auto-worktree-link' in args:\n"
+        "    print(json.dumps({'error': 'stale imports: import_refresh fail-closed'}))\n"
+        "    sys.exit(1)\n"
+        "status = 'theorem_verified'\n"
+        "if not os.environ.get('TURBO_LEAN_NO_DAEMON'):\n"
+        "    try:\n"
+        "        body = open(args[-1]).read()\n"
+        "        status = ('theorem_verified' if '_m1_bench_trial_' in body\n"
+        "                  else 'theorem_cache_hit')\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "wall = float(os.environ.get('FAKE_WALL_MS', '200'))\n"
+        "cov = float(os.environ.get('FAKE_COV', '0.99'))\n"
+        "out = {'status': status, 'decl': 'd', 'elapsed_ms': 50,\n"
+        "       'phase_timings': {'wall_ms': wall, 'phase_sum_ms': wall - 1,\n"
+        "                         'phase_covered_ms': wall - 1, 'phase_overlap_ms': 0.0,\n"
+        "                         'coverage_ratio': cov,\n"
+        "                         'phases_ms': {'setup': 10.0, 'elaboration': wall - 11.0}}}\n"
+        "print(json.dumps(out)); sys.exit(0)\n"
+    ))
+    stub.chmod(0o755)
+    real_git = __import__("shutil").which("git") or "/usr/bin/git"
+    gitstub = root / "fake-git"
+    gitstub.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"--version\" ]; then printf 'git version 2.47.1\\n'; exit 0; fi\n"
+        f"exec {real_git} \"$@\"\n")
+    gitstub.chmod(0o755)
+    return stub, gitstub
+
+
+def make_fake_projects(root: Path):
+    bats = root / "batteries"
+    files = {
+        "Batteries/Data/List/Lemmas.lean": "theorem dropLast_eq_eraseIdx :\n"
+                                           "    True := by\n  trivial\n",
+        "Batteries/Data/String/Lemmas.lean": "theorem lt_antisymm :\n"
+                                             "    True := by\n  trivial\n",
+        "Batteries/Recycling/RBTree/Lemmas.lean": (
+            "@[simp] theorem min?_reverse :\n    True := by\n  trivial\n"
+            "theorem ordered_iff :\n    True := by\n  trivial\n"),
+        "Batteries/Data/UnionFind/Basic.lean": "theorem parentD_eq :\n"
+                                               "    True := by\n  trivial\n",
+    }
+    for rel, body in files.items():
+        p = bats / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(body)
+    pfr = root / "pfr"
+    (pfr / "PFR").mkdir(parents=True, exist_ok=True)
+    (pfr / "PFR" / "MoreRuzsaDist.lean").write_text(
+        "lemma rdist_of_neg_le : True := by trivial\n")
+    return bats, pfr
+
+
+def run_bench(root, extra, stub_body=None, env_extra=None):
+    stub, gitstub = make_stub_binary(root, stub_body)
+    bats, pfr = make_fake_projects(root)
+    env = dict(os.environ, TURBO_LEAN_GIT=str(gitstub),
+               TURBO_LEAN_ALLOWED_CSIMP="*", TURBO_LEAN_ALLOWED_UNSAFE="*",
+               TURBO_LEAN_ALLOWED_IMPLEMENTED_BY="*", FAKE_PFR_FAIL="1")
+    env.update(env_extra or {})
+    cmd = [sys.executable, str(SCRIPT), "--turbo-lean-bin", str(stub),
+           "--batteries-dir", str(bats), "--pfr-dir", str(pfr),
+           "--trials", "2", "--warmup", "0", "--skip-rev-check", "--allow-busy-node"] + extra
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
+
+
 def sample_baseline(mod, **overrides):
     return mod.make_baseline(
         turbo_lean_commit="8a1d67dba051f59440c91df828584657efd12605",
@@ -252,73 +327,218 @@ class EditedProof(unittest.TestCase):
         self.assertEqual(norm(mod.remove_bench_have(edited)), norm(src))
 
 
-class EndToEnd(unittest.TestCase):
-    """Drive the full script against a stub turbo-lean binary."""
+class BaselineStrictness(unittest.TestCase):
+    """Group 1: a named baseline is an obligation; skipped is never a pass."""
 
-    def _stub_binary(self, root: Path):
-        stub = root / "fake-turbo-lean"
-        stub.write_text(
+    def test_missing_named_baseline_is_error(self):
+        with tempfile.TemporaryDirectory(prefix="m1-strict-") as td:
+            r = run_bench(Path(td), ["--baseline", str(Path(td) / "nope.json"),
+                                     "--out", str(Path(td) / "o.json")])
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("cannot load baseline", r.stderr)
+
+    def test_malformed_baseline_is_error(self):
+        with tempfile.TemporaryDirectory(prefix="m1-strict-") as td:
+            bad = Path(td) / "bad.json"
+            bad.write_text("{not json at all")
+            r = run_bench(Path(td), ["--baseline", str(bad), "--out", str(Path(td) / "o.json")])
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("cannot load baseline", r.stderr)
+
+    def test_baseline_missing_workload_is_error(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-strict-") as td:
+            base = full_valid_baseline(mod)
+            base["workloads"].pop("batteries_unionfind_top")
+            p = Path(td) / "b.json"
+            p.write_text(json.dumps(base))
+            r = run_bench(Path(td), ["--baseline", str(p), "--out", str(Path(td) / "o.json")])
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("batteries_unionfind_top", r.stderr)
+
+    def test_baseline_missing_mode_is_error(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-strict-") as td:
+            base = full_valid_baseline(mod)
+            del base["workloads"]["batteries_list_lemmas_top"]["modes"]["warm_edited_proof_daemon"]
+            p = Path(td) / "b.json"
+            p.write_text(json.dumps(base))
+            r = run_bench(Path(td), ["--baseline", str(p), "--out", str(Path(td) / "o.json")])
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("warm_edited_proof_daemon", r.stderr)
+
+    def test_baseline_nan_median_is_error(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-strict-") as td:
+            base = full_valid_baseline(mod)
+            base["workloads"]["batteries_list_lemmas_top"]["modes"]["cold_no_daemon"]["median_ms"] = float("nan")
+            p = Path(td) / "b.json"
+            p.write_text(json.dumps(base))  # json.dumps writes NaN, json.loads reads it back
+            r = run_bench(Path(td), ["--baseline", str(p), "--out", str(Path(td) / "o.json")])
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertIn("median_ms", r.stderr)
+
+    def test_baseline_nonpositive_median_is_error(self):
+        mod = load_script()
+        for bad in (0.0, -5.0):
+            with tempfile.TemporaryDirectory(prefix="m1-strict-") as td:
+                base = full_valid_baseline(mod)
+                base["workloads"]["batteries_list_lemmas_top"]["modes"]["cold_no_daemon"]["median_ms"] = bad
+                p = Path(td) / "b.json"
+                p.write_text(json.dumps(base))
+                r = run_bench(Path(td), ["--baseline", str(p), "--out", str(Path(td) / "o.json")])
+                self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_baseline_nonpositive_trials_is_error(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-strict-") as td:
+            base = full_valid_baseline(mod)
+            base["workloads"]["batteries_list_lemmas_top"]["modes"]["cold_no_daemon"]["trials"] = -3
+            p = Path(td) / "b.json"
+            p.write_text(json.dumps(base))
+            r = run_bench(Path(td), ["--baseline", str(p), "--out", str(Path(td) / "o.json")])
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_strict_comparison_makes_not_compared_nonzero(self):
+        with tempfile.TemporaryDirectory(prefix="m1-strict-") as td:
+            r = run_bench(Path(td), ["--no-baseline", "--strict-comparison",
+                                     "--out", str(Path(td) / "o.json")])
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("not_compared", r.stdout)
+
+    def test_strict_comparison_makes_host_mismatch_nonzero(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-strict-") as td:
+            base = full_valid_baseline(mod)
+            base["host"]["hostname"] = "some-other-box"
+            p = Path(td) / "b.json"
+            p.write_text(json.dumps(base))
+            r = run_bench(Path(td), ["--baseline", str(p), "--strict-comparison",
+                                     "--out", str(Path(td) / "o.json")])
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("comparison_skipped_host_mismatch", r.stdout)
+
+    def test_nonpositive_trials_is_usage_error(self):
+        mod = load_script()
+        with tempfile.TemporaryDirectory(prefix="m1-strict-") as td:
+            with self.assertRaises(SystemExit) as cm:
+                mod.main(["--turbo-lean-bin", "x", "--batteries-dir", "b",
+                          "--pfr-dir", "p", "--trials", "0"])
+            self.assertEqual(cm.exception.code, 2)
+
+    def test_workload_on_one_side_only_is_named_error(self):
+        mod = load_script()
+        base = full_valid_baseline(mod)
+        res = mod.empty_run_result(mod.WORKLOADS, trials=5)
+        res["host"] = dict(base["host"])
+        res["settings"] = dict(base["settings"])
+        res["turbo_lean_commit"] = base["turbo_lean_commit"]
+        res["workloads"].pop("batteries_string_lemmas_top")  # results side lost a workload
+        for w in mod.WORKLOADS:
+            if w["id"] == "batteries_string_lemmas_top":
+                continue
+            if w["expected_status"] == "blocked":
+                res["workloads"][w["id"]] = mod.blocked_workload_result(1, "x", 6000.0)
+            else:
+                fill_workload(mod, res, w["id"], 1000.0)
+        verdict = mod.compare_run(base, res)
+        self.assertEqual(verdict["verdict"], "measurement_failed")
+        self.assertTrue(any("batteries_string_lemmas_top" in e and "results" in e
+                            for e in verdict["comparison_errors"]),
+                        verdict["comparison_errors"])
+
+    def test_baseline_workload_missing_from_results_is_named_error(self):
+        mod = load_script()
+        base = full_valid_baseline(mod)
+        res = mod.empty_run_result(mod.WORKLOADS, trials=5)
+        res["host"] = dict(base["host"])
+        res["settings"] = dict(base["settings"])
+        res["turbo_lean_commit"] = base["turbo_lean_commit"]
+        res["workloads"] = {k: v for k, v in res["workloads"].items()
+                            if k != "pfr_more_ruzsa_dist"}
+        for w in mod.WORKLOADS:
+            if w["expected_status"] != "blocked":
+                fill_workload(mod, res, w["id"], 1000.0)
+        verdict = mod.compare_run(base, res)
+        self.assertEqual(verdict["verdict"], "measurement_failed")
+        self.assertTrue(any("pfr_more_ruzsa_dist" in e for e in verdict["comparison_errors"]),
+                        verdict["comparison_errors"])
+
+    def test_settings_mismatch_on_fifth_var(self):
+        mod = load_script()
+        base = full_valid_baseline(mod)
+        res = mod.empty_run_result(mod.WORKLOADS, trials=5)
+        res["host"] = dict(base["host"])
+        res["settings"] = dict(base["settings"])
+        res["settings"]["TURBO_LEAN_HOME"] = "/somewhere/else"
+        res["turbo_lean_commit"] = base["turbo_lean_commit"]
+        for w in mod.WORKLOADS:
+            if w["expected_status"] == "blocked":
+                res["workloads"][w["id"]] = mod.blocked_workload_result(1, "x", 6000.0)
+            else:
+                fill_workload(mod, res, w["id"], 1000.0)
+        verdict = mod.compare_run(base, res)
+        self.assertEqual(verdict["verdict"], "comparison_skipped_settings_mismatch")
+
+    def test_failed_cold_trials_are_not_measured(self):
+        body = (
             "#!/usr/bin/env python3\n"
             "import json, os, sys, time\n"
             "args = sys.argv[1:]\n"
-            "time.sleep(0.05)\n"
-            "if os.environ.get('FAKE_PFR_FAIL') and '--no-auto-worktree-link' in args:\n"
+            "time.sleep(0.04)\n"
+            "if '--no-auto-worktree-link' in args:\n"
             "    print(json.dumps({'error': 'stale imports: import_refresh fail-closed'}))\n"
             "    sys.exit(1)\n"
-            "status = 'theorem_verified'\n"
-            "if not os.environ.get('TURBO_LEAN_NO_DAEMON'):\n"
-            "    try:\n"
-            "        body = open(args[-1]).read()\n"
-            "        status = ('theorem_verified' if '_m1_bench_trial_' in body\n"
-            "                  else 'theorem_cache_hit')\n"
-            "    except OSError:\n"
-            "        pass\n"
-            "out = {'status': status, 'decl': 'd', 'elapsed_ms': 50,\n"
-            "       'phase_timings': {'wall_ms': 50.0, 'phase_sum_ms': 49.0,\n"
-            "                         'phase_covered_ms': 49.0, 'phase_overlap_ms': 0.0,\n"
-            "                         'coverage_ratio': 0.98,\n"
-            "                         'phases_ms': {'setup': 10.0, 'elaboration': 39.0}}}\n"
-            "print(json.dumps(out)); sys.exit(0)\n"
-        )
-        stub.chmod(0o755)
-        gitstub = root / "fake-git"
-        gitstub.write_text("#!/bin/sh\nprintf 'git version 2.47.1\\n'\n")
-        gitstub.chmod(0o755)
-        return stub, gitstub
+            "if os.environ.get('TURBO_LEAN_NO_DAEMON') and 'warm' not in ' '.join(args):\n"
+            "    sys.stderr.write('boom'); sys.exit(1)\n"   # every cold trial fails
+            "out = {'status': 'theorem_cache_hit', 'decl': 'd', 'elapsed_ms': 40,\n"
+            "       'phase_timings': {'wall_ms': 200.0, 'phase_sum_ms': 199.0,\n"
+            "                         'phase_covered_ms': 59.0, 'phase_overlap_ms': 0.0,\n"
+            "                         'coverage_ratio': 0.99,\n"
+            "                         'phases_ms': {'setup': 10.0, 'elaboration': 49.0}}}\n"
+            "print(json.dumps(out)); sys.exit(0)\n")
+        with tempfile.TemporaryDirectory(prefix="m1-fail-") as td:
+            r = run_bench(Path(td), ["--no-baseline", "--out", str(Path(td) / "o.json")],
+                          stub_body=body)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("measurement_failed", r.stdout)
+            data = json.loads((Path(td) / "o.json").read_text())
+            cold = data["workloads"]["batteries_list_lemmas_top"]["modes"]["cold_no_daemon"]
+            self.assertEqual(cold["trials"], 0, cold)          # failed runs measured nothing
+            self.assertEqual(cold["failed_trials"], 2, cold)   # and are counted as failures
 
-    def _fake_projects(self, root: Path):
-        bats = root / "batteries"
-        files = {
-            "Batteries/Data/List/Lemmas.lean": "theorem dropLast_eq_eraseIdx :\n"
-                                               "    True := by\n  trivial\n",
-            "Batteries/Data/String/Lemmas.lean": "theorem lt_antisymm :\n"
-                                                 "    True := by\n  trivial\n",
-            "Batteries/Recycling/RBTree/Lemmas.lean": (
-                "@[simp] theorem min?_reverse :\n    True := by\n  trivial\n"
-                "theorem ordered_iff :\n    True := by\n  trivial\n"),
-            "Batteries/Data/UnionFind/Basic.lean": "theorem parentD_eq :\n"
-                                                   "    True := by\n  trivial\n",
-        }
-        for rel, body in files.items():
-            p = bats / rel
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(body)
-        pfr = root / "pfr"
-        (pfr / "PFR").mkdir(parents=True, exist_ok=True)
-        (pfr / "PFR" / "MoreRuzsaDist.lean").write_text(
-            "lemma rdist_of_neg_le : True := by trivial\n")
-        return bats, pfr
+    def test_coverage_is_external_not_self_reported(self):
+        # Tool claims coverage 0.99, but its internal wall (10 ms) covers only a
+        # fraction of the externally measured wall (~45 ms): must fail.
+        body = (
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys, time\n"
+            "args = sys.argv[1:]\n"
+            "time.sleep(0.04)\n"
+            "if '--no-auto-worktree-link' in args:\n"
+            "    print(json.dumps({'error': 'stale imports: import_refresh fail-closed'}))\n"
+            "    sys.exit(1)\n"
+            "out = {'status': 'theorem_cache_hit', 'decl': 'd', 'elapsed_ms': 10,\n"
+            "       'phase_timings': {'wall_ms': 10.0, 'phase_sum_ms': 9.0,\n"
+            "                         'phase_covered_ms': 9.0, 'phase_overlap_ms': 0.0,\n"
+            "                         'coverage_ratio': 0.99,\n"
+            "                         'phases_ms': {'setup': 5.0, 'elaboration': 4.0}}}\n"
+            "print(json.dumps(out)); sys.exit(0)\n")
+        with tempfile.TemporaryDirectory(prefix="m1-cov-") as td:
+            r = run_bench(Path(td), ["--no-baseline", "--out", str(Path(td) / "o.json")],
+                          stub_body=body)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("measurement_failed", r.stdout)
+            data = json.loads((Path(td) / "o.json").read_text())
+            cold = data["workloads"]["batteries_list_lemmas_top"]["modes"]["cold_no_daemon"]
+            self.assertLess(cold["coverage_ratio_external_min"], 0.90, cold)
+
+
+class EndToEnd(unittest.TestCase):
+    """Drive the full script against a stub turbo-lean binary."""
 
     def _run_bench(self, root, extra):
-        stub, gitstub = self._stub_binary(root)
-        bats, pfr = self._fake_projects(root)
-        env = dict(os.environ, TURBO_LEAN_GIT=str(gitstub),
-                   TURBO_LEAN_ALLOWED_CSIMP="*", TURBO_LEAN_ALLOWED_UNSAFE="*",
-                   TURBO_LEAN_ALLOWED_IMPLEMENTED_BY="*", FAKE_PFR_FAIL="1")
-        cmd = [sys.executable, str(SCRIPT), "--turbo-lean-bin", str(stub),
-               "--batteries-dir", str(bats), "--pfr-dir", str(pfr),
-               "--trials", "2", "--warmup", "0", "--skip-rev-check", "--allow-busy-node"] + extra
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
+        return run_bench(root, extra)
 
     def test_full_run_and_comparison(self):
         mod = load_script()
