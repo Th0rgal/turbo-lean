@@ -520,13 +520,6 @@ import LeanNative.IR.Bridge
 
 open Lean Lean.Compiler.LCNF LeanNative.IR
 
-partial def countJps {pu} (c : Code pu) : Nat :=
-  match c with
-  | .let _ k => countJps k
-  | .jp j k => 1 + countJps j.value + countJps k
-  | .cases cs => cs.alts.foldl (fun acc a => acc + countJps a.getCode) 0
-  | _ => 0
-
 partial def codeHasLocalCall (localSet : Std.HashSet Name) (c : Code .impure) : Bool :=
   match c with
   | .let d k =>
@@ -589,21 +582,13 @@ unsafe def auditMods (env : Environment) (mods : Array Name) : IO (Nat × Nat ×
         if declInMutualCycle callGraph d.name then
           rej := rej + 1
         else
-          let jps := match d.value with | .code c => countJps c | .extern _ => 0
-          if jps > 6 then
-            if modName.toString.startsWith "batch_" then
-              let hasCall := match d.value with | .code c => codeHasLocalCall localSet c | .extern _ => false
-              if hasCall then unp := unp + 1 else prv := prv + 1
-            else
-              rej := rej + 1
-          else
-            let r ← runCoreOnEnv env (ingestLCNFImpureDecl d modNames .x86_64 true)
-            match r with
-            | .ok _ =>
-              let hasCall := match d.value with | .code c => codeHasLocalCall localSet c | .extern _ => false
-              if hasCall then unp := unp + 1 else prv := prv + 1
-            | .error _ =>
-              rej := rej + 1
+          let r ← runCoreOnEnv env (ingestLCNFImpureDecl d modNames .x86_64 true)
+          match r with
+          | .ok _ =>
+            let hasCall := match d.value with | .code c => codeHasLocalCall localSet c | .extern _ => false
+            if hasCall then unp := unp + 1 else prv := prv + 1
+          | .error _ =>
+            rej := rej + 1
   return (tot, prv, unp, rej)
 """
 
@@ -1456,6 +1441,7 @@ class TestLcnfCoverage(unittest.TestCase):
                 ROOT_DIR, _lean_audit_driver_for_modules(["batch_99"]), [str(root)]
             )
         self.assertEqual(counts[1], 0, f"unlowerable batch_99 decl with >6 join points was counted as proved: {counts}")
+        self.assertGreaterEqual(counts[3], 1, f"expected rejected >= 1 from real lowerer: {counts}")
         self.assertNotIn('startsWith "batch_"', _LEAN_AUDIT_DRIVER_HEAD)
         self.assertNotIn("jps > 6", _LEAN_AUDIT_DRIVER_HEAD)
 
