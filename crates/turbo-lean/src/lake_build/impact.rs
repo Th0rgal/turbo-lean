@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::splitter;
+use crate::splitter::{self, split_lean_source};
 
 use super::*;
 
