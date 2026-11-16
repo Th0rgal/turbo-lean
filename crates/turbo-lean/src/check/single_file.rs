@@ -440,6 +440,7 @@ pub(super) fn check_single_file(
                 "elapsed_ms": dur_ms
             });
             kernel_prov.insert_json_fields(&mut out_json);
+            crate::phase_timing::record_active_span_since("elaboration", elab_started);
             if emit_stdout {
                 if json_output {
                     println!("{}", serde_json::to_string_pretty(&out_json)?);

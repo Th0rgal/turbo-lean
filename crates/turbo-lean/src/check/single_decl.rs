@@ -3709,12 +3709,11 @@ pub(super) fn check_single_decl(
         });
         insert_allow_sorry_fields(&mut hit_json, allow_sorry, false, &[]);
         kernel_prov.insert_json_fields(&mut hit_json);
-        crate::phase_timing::record_active_span_since("cas_lookup", cas_lookup_started);
         hit_json
     };
 
     if !allow_sorry && !clean_for_certification {
-        if allow_attested_cache_hit
+        let dirty_hit = allow_attested_cache_hit
             && !shard_has_sorry
             && db_warm_on_open
             && (store.has_attested_decl_receipt(
@@ -3727,8 +3726,9 @@ pub(super) fn check_single_decl(
                 "trusted",
                 target_decl,
                 &attested.kernel_type_hash,
-            ))
-        {
+            ));
+        crate::phase_timing::record_active_span_since("cas_lookup", cas_lookup_started);
+        if dirty_hit {
             let elapsed_ms = t0.elapsed().as_millis();
             let out_json = make_cache_hit_json(false, elapsed_ms);
             if emit_stdout {
@@ -3862,7 +3862,7 @@ pub(super) fn check_single_decl(
         // Always route `allow_sorry` through this branch even when `file` itself is lexically
         // `sorry`-free so a transitive `sorryAx` dependency from an imported workspace module
         // is reported as `verified_modulo_sorry` (and never cached in `TheoremProofCAS`).
-        if !shard_has_sorry
+        let sorry_clean_hit = !shard_has_sorry
             && allow_attested_cache_hit
             && db_warm_on_open
             && store.has_attested_decl_receipt(
@@ -3870,8 +3870,9 @@ pub(super) fn check_single_decl(
                 "trusted",
                 target_decl,
                 &attested.kernel_type_hash,
-            )
-        {
+            );
+        crate::phase_timing::record_active_span_since("cas_lookup", cas_lookup_started);
+        if sorry_clean_hit {
             let elapsed_ms = t0.elapsed().as_millis();
             let out_json = make_cache_hit_json(false, elapsed_ms);
             if emit_stdout {
@@ -3887,13 +3888,13 @@ pub(super) fn check_single_decl(
             return Ok(out_json);
         }
 
+        let t0 = &prewarm_local_check_zygote(store, canon_dir, toolchain, t0)?;
+        let elab_started = Instant::now();
         let rooted_target = shard.rooted_name();
         let single_set = HashSet::from([rooted_target.clone()]);
         let full_shard_src = cone_src.clone();
         let (env_vars, env_cache_hit) = resolve_lake_env(store, canon_dir)?;
         let lean_bin = resolve_lean_bin(canon_dir)?;
-        let t0 = &prewarm_local_check_zygote(store, canon_dir, toolchain, t0)?;
-        let elab_started = Instant::now();
         let local_lean_path = resolve_remote_lean_path(canon_dir, Some(&env_vars));
         let mut stub_targets: Vec<String> = single_set.iter().cloned().collect();
         stub_targets.sort();
@@ -4175,7 +4176,7 @@ pub(super) fn check_single_decl(
 
     if split.hygiene.is_clean_for_certification() {
         if let Some(remote_url) = remote_http {
-            if db_warm_on_open
+            let remote_local_hit = db_warm_on_open
                 && (store.has_attested_decl_receipt(
                     &shard_key,
                     "trusted",
@@ -4186,8 +4187,9 @@ pub(super) fn check_single_decl(
                     "trusted",
                     target_decl,
                     &attested.kernel_type_hash,
-                ))
-            {
+                ));
+            crate::phase_timing::record_active_span_since("cas_lookup", cas_lookup_started);
+            if remote_local_hit {
                 let elapsed_ms = t0.elapsed().as_millis();
                 let out_json = make_cache_hit_json(false, elapsed_ms);
                 if emit_stdout {
@@ -4449,15 +4451,16 @@ pub(super) fn check_single_decl(
         "Internal invariant violation: dirty file reached TheoremProofCAS path for `{target_decl}`"
     );
 
-    if !shard_has_sorry
+    let local_client_hit = !shard_has_sorry
         && db_warm_on_open
         && store.has_attested_decl_receipt(
             &pack::client_attested_receipt_key(&shard_key),
             "trusted",
             target_decl,
             &attested.kernel_type_hash,
-        )
-    {
+        );
+    crate::phase_timing::record_active_span_since("cas_lookup", cas_lookup_started);
+    if local_client_hit {
         let elapsed_ms = t0.elapsed().as_millis();
         let out_json = make_cache_hit_json(false, elapsed_ms);
         if emit_stdout {
@@ -4474,6 +4477,7 @@ pub(super) fn check_single_decl(
     }
 
     let t0 = &prewarm_local_check_zygote(store, canon_dir, toolchain, t0)?;
+    let sf_lookup_started = Instant::now();
     let singleflight_outcome =
         match store.acquire_singleflight(&shard_key, toolchain, "theorem_shard", "trusted")? {
             SingleflightOutcome::CacheHit { outputs, coalesced } => {
@@ -4490,6 +4494,7 @@ pub(super) fn check_single_decl(
             }
             other => other,
         };
+    crate::phase_timing::record_active_span_since("cas_lookup", sf_lookup_started);
 
     match singleflight_outcome {
         SingleflightOutcome::CacheHit { coalesced, .. } => {

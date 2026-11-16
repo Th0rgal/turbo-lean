@@ -132,12 +132,11 @@ impl PhaseTimer {
 
     pub fn record_span_ns(&self, name: &'static str, start_ns: u64, end_ns: u64) {
         let end_ns = end_ns.max(start_ns);
-        let dur_ns = end_ns - start_ns;
+        let dur_ns = (end_ns - start_ns).max(1);
+        let end_ns = start_ns.saturating_add(dur_ns);
         let mut guard = self.ledger.lock().unwrap_or_else(|e| e.into_inner());
         *guard.phases_ns.entry(name).or_insert(0) += dur_ns;
-        if dur_ns > 0 {
-            guard.intervals.push(PhaseInterval { start_ns, end_ns });
-        }
+        guard.intervals.push(PhaseInterval { start_ns, end_ns });
     }
 
     pub fn finish(&self) -> PhaseTimingReport {

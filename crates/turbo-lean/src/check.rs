@@ -424,7 +424,7 @@ pub(crate) fn run_check_command_inner(
             "`--emit-olean` cannot be combined with `--decl` (must check a full module file)"
         );
     }
-    let phase_timer = crate::phase_timing::PhaseTimer::new();
+    let phase_timer = crate::phase_timing::active_phase_timer().unwrap_or_default();
     let _phase_guard = crate::phase_timing::activate_phase_timer(&phase_timer);
     let setup_started = Instant::now();
     let _lifecycle = crate::zygote::lifecycle_lock(false)?;

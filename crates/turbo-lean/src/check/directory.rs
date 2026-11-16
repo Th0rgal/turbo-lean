@@ -139,12 +139,14 @@ pub(super) fn check_directory(
     let mut dir_sorry_hits = 0usize;
     let mut dir_sorry_misses = 0usize;
     for sf in &sorry_files {
+        let sorry_prep_started = Instant::now();
         let mut sf_src =
             fs::read_to_string(sf).with_context(|| format!("Failed to read {}", sf.display()))?;
         let sf_canon = sf.canonicalize().unwrap_or_else(|_| sf.clone());
         let sf_deps = compute_imported_olean_interface_hashes(&sf_src, canon_dir, None);
         let sf_split = split_lean_source(&sf_src, &sf_deps);
         let sf_b3 = blake3::hash(sf_src.as_bytes()).to_hex().to_string();
+        crate::phase_timing::record_active_span_since("split_and_hygiene", sorry_prep_started);
         let sf_res = check_single_file(
             store,
             true,

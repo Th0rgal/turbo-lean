@@ -581,7 +581,13 @@ enum DaemonCommands {
 }
 
 fn main() -> Result<()> {
+    let process_t0 = std::time::Instant::now();
     let cli = Cli::parse();
+    let check_phase_timer = matches!(&cli.command, Commands::Check { .. })
+        .then(|| phase_timing::PhaseTimer::from_start(process_t0));
+    let _check_phase_guard = check_phase_timer
+        .as_ref()
+        .map(phase_timing::activate_phase_timer);
     // `check` and `agent-step` vouch for declarations, not for the modules that use them: when the
     if matches!(&cli.command, Commands::Daemon { .. }) {
         return run(cli);
@@ -602,6 +608,7 @@ fn main() -> Result<()> {
     } else {
         Some(zygote::OneShotGuard::new(cli.no_daemon)?)
     };
+    phase_timing::record_active_span_since("cli_startup", process_t0);
     run(cli)
 }
 
@@ -615,6 +622,7 @@ pub(crate) fn apply_global_cli_env(cli: &Cli) {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    let run_setup_started = std::time::Instant::now();
     apply_global_cli_env(&cli);
     if let Commands::Daemon {
         command: DaemonCommands::Stop,
@@ -1669,6 +1677,7 @@ fn run(cli: Cli) -> Result<()> {
                     }
                 });
             }
+            phase_timing::record_active_span_since("setup", run_setup_started);
             let res = check::run_check_command_with_options(
                 &mut store,
                 db_warm_on_open,
