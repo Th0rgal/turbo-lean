@@ -810,7 +810,8 @@ def classify_error(returncode, parsed, stderr):
     if "failed to read" in low and "no such file" in low:
         return "source_file_not_found"
     if ("worktree opt-out prevents refreshing stale imports" in low
-            or "stale" in low or "import_refresh" in low or "imports fresh" in low):
+            or ("stale imports" in low and "import_refresh" in low)
+            or "fail-closed import freshness gate" in low):
         return "stale_import_refresh_fail_closed"
     if "warn.sorry" in low or "sorry" in low:
         return "warn_sorry_refused"
