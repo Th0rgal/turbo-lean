@@ -1,6 +1,6 @@
 # Sequencing and work graph (`roadmap/HORIZONS.md`)
 
-> **Scope**: the order in which the goals in [`GOALS.md`](./GOALS.md) are worked, as a dependency graph of leaf items that agents can take in parallel. It adds no theorem contract and changes none in [`VALIDATION_CONTRACTS.md`](./VALIDATION_CONTRACTS.md). Facts are from `main` at `94dbd70` (2026-11-15) and from sources linked inline; they are point-in-time.
+> **Scope**: the order in which the goals in [`GOALS.md`](./GOALS.md) are worked, as a dependency graph of leaf items that agents can take in parallel. It adds no theorem contract and changes none in [`VALIDATION_CONTRACTS.md`](./VALIDATION_CONTRACTS.md). Facts are from `main` at `94dbd70` (2026-11-15), reconciled to `main` at `fddf22c` (2026-11-16) by R0, and from sources linked inline; they are point-in-time.
 
 Source: Thomas's roadmap note of 2026-11-14 (prove Lean → IR first; build faster, hypothesis: pure-Lean kernel compiled by `LeanNative`, GPU if it pays; accelerator plugins last), then a feasibility review of the code and of published results on 2026-11-15. The review changed two of the three ideas; what changed is said where it applies.
 
@@ -94,7 +94,7 @@ Accelerator plugins start once there is a benchmark to rank them: untrusted sear
 
 ## Work graph
 
-Leaves are sized to one PR and one owner. *RO* means a read-only measurement or feasibility step comes first.
+Leaves are sized to one PR and one owner; the table below is the count of record, with 38 leaves. *RO* means a read-only measurement or feasibility step comes first.
 
 ```mermaid
 flowchart LR
@@ -135,31 +135,32 @@ flowchart LR
 | :-- | :--- | :--- | :--- | :--- | :-- |
 | **R0** | Roadmap says what is true (stale items below); `docs/TRUSTED_BASE.md` | `roadmap/*.md` | – | `sync_docs_inventory.py --check` | S |
 | **HY1** | Contract script split into per-milestone fragments, so proof PRs stop colliding | `scripts/contract.d/` | – | `verify_roadmap_contract.sh` output unchanged | S |
-| **S1** | `module_builder.rs` (43k LOC) split: dag / freshness / host-effects / publish | that file | – | `cargo test --locked`, no public API diff | L |
+| **S1** *(done `#463` `fddf22c`)* | `module_builder.rs` (43k LOC) split: dag / freshness / host-effects / publish. Done: the code now lives in `crates/turbo-lean/src/module_builder/{dag,freshness,host_effects,publish}.rs` | that file | – | `cargo test --locked`, no public API diff | L |
 | **S2** | `zygote.rs` (17k) and `lake_build.rs` (15k) split by concern | those files | – | same | L |
 | **S3** | `BridgeHelpers.lean` and `ZygoteWorker.lean` split by construct / command | those files | – | contract script; axiom-audit counts unchanged | M |
-| **M0** | `#408`: phase timings cover ≥ 90% of wall | `phase_timing.rs` (new) | – | test asserts the sum | M |
-| **M1** *RO* | Pinned benchmark (`Batteries`, `PFR`), baseline JSON; re-triage `#407`–`#443`; close `#371` | `scripts/bench_check_loop.py` | M0 | script exits 0, JSON committed | M |
-| **P1** | No redone work on a warm hit (`#407` `#433` `#434` `#438`) | host-effects modules | S1 S2 M1 | bench: zero `lake --no-cache` on warm hit | L |
+| **M0** *(done `#461` `8a1d67d`)* | `#408`: phase timings cover ≥ 90% of wall | `phase_timing.rs` (new) | – | test asserts the sum | M |
+| **M1** *RO* | Pinned benchmark (`Batteries`, `PFR`), baseline JSON; re-triage `#407`–`#443`; close `#371`. Decision recorded here and on P1: M1 is accepted on the `Batteries` workload alone, and the `PFR` workload is turned on by P1 | `scripts/bench_check_loop.py` | M0 | script exits 0, JSON committed | M |
+| **P1** | No redone work on a warm hit (`#407` `#433` `#434` `#438`). Decision recorded here and on M1: M1 is accepted on the `Batteries` workload alone, and the `PFR` workload is turned on by P1 | `module_builder/host_effects.rs` | S1 S2 M1 | bench: zero `lake --no-cache` on warm hit | L |
 | **P2** | Standalone re-check: no tree copy, budgeted timeout, `.ir` included (`#440`–`#442`) | `lake_build/standalone` | S2 | three regression tests | M |
 | **P3** | One budget object reaches all workers (`#435` `#437` `#443`) | `zygote/budget` | S2 | rlimit test; `eval --timeout-ms 0` passes | M |
 | **P4** *RO* | Declaration identity probe in O(declaration) (`#409`) | `splitter.rs` | M1 | bench < 200 ms | M |
 | **P5** | Daemon `/eval` identity fix (`#432`) | `server.rs`, `zygote/identity` | S2 | HTTP test returns 200 | S |
 | **P6** | Snapshot leases (`#439`) | `zygote/snapshots` | S2 | two-run test | S |
-| **P7** | `build <Lib>` scope (`#436`) | `module_builder/dag` | S1 | fixture | M |
-| **P8** | Git < 2.46 fails loudly (`#415`) | `trusted_tools.rs` | – | unit test | S |
+| **P7** | `build <Lib>` scope (`#436`) | `module_builder/dag.rs` | S1 | fixture | M |
+| **P8** *(done `#459` `ae16815`)* | Git < 2.46 fails loudly (`#415`) | `trusted_tools.rs` | – | unit test | S |
 | **P9** | Land `#455`; import policy for `csimp` / `unsafe` decided before expensive work (`#411` `#412`) | `kernel.rs`, worker audit | S3 | 140 Batteries calls pass | M |
-| **P10** | Content-hash freshness, `--frozen-cone` (`#339`) | `module_builder/freshness` | S1 | hardlinked-cone fixture, 0 rebuilds | M |
+| **P10** | Content-hash freshness, `--frozen-cone` (`#339`) | `module_builder/freshness.rs` | S1 | hardlinked-cone fixture, 0 rebuilds | M |
 | **G1a** | `csimp` digest in action and cache keys | `db.rs` keys | P9 | key-diff test | S |
-| **G1b** *RO* | The M2 theorems hold over real `.olean`, or the docs say they are about a model | `ConLeche.lean` | – | contract script | L |
+| **G1b** *RO* *(done `#460` `ad54090`, model only)* | The M2 theorems hold over real `.olean`, or the docs say they are about a model. The `#460` proof covers the documented OLEN v1 model only; the proof against real `.olean` files is still open, so this leaf is not finished | `ConLeche.lean` | – | contract script | L |
 | **G1c** | `--kernel auto` selects the bundled `con-leche` when the toolchain matches | `kernel.rs` | P9 | selection test | S |
 | **G2a** *RO* | CAS replay hit rate on recorded edit sequences | bench script | M1 | number recorded | S |
 | **G2b** | Replay on by default for warm `check`, or deleted | `lake_build/replay` | G2a S2 | bench delta | M |
 | **H2.3** | Parallel replay under the RAM budget | pool module | P3 | bench scaling | M |
 | **H2.G** *RO* | GPU-addressable share of loop time | doc only | M1 | number against the 10% line | S |
-| **A1** | `#367`: strict `[audit_spec]` TOML | `audit_spec.rs` parser | – | typo-key test fails closed | S |
+| **A1** *(done `#462` `4e2ba1c`)* | `#367`: strict `[audit_spec]` TOML | `audit_spec.rs` parser | – | typo-key test fails closed | S |
 | **A2** *RO* | `#367`: kernel-backed witness | `PolicyGates.lean` | A1 | `audit-spec` JSON | L |
-| **L299** | `#299`, one fixture per bullet | lakefile parser | S1 | Lake-parity fixtures | M |
+| **A1j** | Strict `[audit_spec]` JSON: a misspelled top-level key beside the `audit_spec` / `audit-spec` object fails closed (A1 closed this for TOML only) | `audit_spec.rs` (JSON path) | A1 | test: JSON config with a misspelled top-level key fails closed | S |
+| **L299** | `#299`, one fixture per bullet | `module_builder/dag.rs` (lakefile parser) | S1 | Lake-parity fixtures | M |
 | **H1.0** *RO* | Generated `LCNF` coverage matrix on `Batteries` and C1 | `scripts/lcnf_coverage.py` | – | CI job emits JSON | M |
 | **H1.1** | `RealLCNFSemantics` as interpreter vs stock Lean; shared definitions separated from the lowerer | `Driver/EvalLCNFCLI.lean` (new) | – | `mismatch_count == 0` | M |
 | **H1.F** | Statement of the H1 theorem frozen and pinned; unverified backends labelled in `--help` | `SpecLocked.lean`, `CoreCLI.lean` | H1.0 | hash pin | S |
