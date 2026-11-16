@@ -1860,5 +1860,59 @@ mod worker_embed_tests {
         assert_eq!(a, on_scratch);
         let _ = fs::remove_dir_all(&scratch);
     }
+
+    /// S3b-M: the pure Lean move splits `TurboLean.ZygoteWorker` into dependency-ordered
+    /// submodules under `TurboLean/ZygoteWorker/`. Every new submodule must be embedded in
+    /// `ZYGOTE_EMBEDDED_MODULES`, in dependency chain order, strictly before the
+    /// `TurboLean.ZygoteWorker` entrypoint, emitting an `.olean` for later submodules, and
+    /// participating in the zygote binary cache key (a 1-byte source edit must change it).
+    #[test]
+    fn zygote_worker_split_submodules_manifest_and_cache_key() {
+        const SUBMODULES: [&str; 8] = [
+            "TurboLean/ZygoteWorker/Env.lean",
+            "TurboLean/ZygoteWorker/Wire.lean",
+            "TurboLean/ZygoteWorker/KernelAudit.lean",
+            "TurboLean/ZygoteWorker/StatementHashing.lean",
+            "TurboLean/ZygoteWorker/Signature.lean",
+            "TurboLean/ZygoteWorker/Replay.lean",
+            "TurboLean/ZygoteWorker/Compiler.lean",
+            "TurboLean/ZygoteWorker/Hotspots.lean",
+        ];
+        let pos_of = |rel: &str| {
+            ZYGOTE_EMBEDDED_MODULES
+                .iter()
+                .position(|m| m.rel_path == rel)
+                .unwrap_or_else(|| panic!("ZYGOTE_EMBEDDED_MODULES entry missing for {rel} (S3b-M submodule split)"))
+        };
+        let mut prev = 0;
+        for rel in SUBMODULES {
+            let pos = pos_of(rel);
+            assert!(pos > prev, "{rel} must appear in dependency chain order");
+            prev = pos;
+        }
+        let entrypoint = pos_of("TurboLean/ZygoteWorker.lean");
+        assert!(
+            prev < entrypoint,
+            "all ZygoteWorker submodules must precede the TurboLean.ZygoteWorker entrypoint"
+        );
+        let lean_bin = Path::new("/tmp/fake-lean");
+        let base_key = compute_zygote_bin_name(lean_bin, Some("v4.35.0"), ZYGOTE_EMBEDDED_MODULES);
+        for rel in SUBMODULES {
+            let idx = pos_of(rel);
+            let m = &ZYGOTE_EMBEDDED_MODULES[idx];
+            assert!(m.emit_olean, "{rel} must emit an .olean for later submodules");
+            assert!(!m.src.is_empty(), "{rel} must embed a non-empty source");
+            let mut mutated = ZYGOTE_EMBEDDED_MODULES.to_vec();
+            let mut bumped = mutated[idx].src.as_bytes().to_vec();
+            bumped[0] ^= 1;
+            mutated[idx].src =
+                Box::leak(String::from_utf8_lossy(&bumped).into_owned().into_boxed_str());
+            assert_ne!(
+                base_key,
+                compute_zygote_bin_name(lean_bin, Some("v4.35.0"), &mutated),
+                "1-byte edit in {rel} must change the zygote binary cache key"
+            );
+        }
+    }
 }
 
