@@ -1727,6 +1727,265 @@ class TestLcnfCoverage(unittest.TestCase):
             chk_bad["errors"],
         )
 
+    # ------------------------------------------------------------------
+    # H1.0a-V (split V): nested baseline validation. `--check` must gate
+    # every defined measured field at every nesting level of
+    # scripts/lcnf_coverage_results.json, not only the top-level corpus
+    # fields, and the file itself must fail closed on invalid sums, wrong
+    # types, and dishonest not_measured stubs.
+    # ------------------------------------------------------------------
+
+    def _v_fake_live_report(self) -> dict[str, Any]:
+        # Live-report corpora shaped like build_coverage_report output and
+        # derived FROM the committed baseline so top-level fields agree by
+        # construction. Mock fixture: no Lean execution is involved here.
+        results_path = ROOT_DIR / "scripts" / "lcnf_coverage_results.json"
+        baseline = json.loads(results_path.read_text(encoding="utf-8"))
+        corpora: dict[str, Any] = {}
+        for cname, entry in baseline["corpora"].items():
+            corp: dict[str, Any] = {"measurement_source": "live_invocation"}
+            corp.update({f: entry[f] for f in RESULT_FIELDS if f in entry})
+            if "rejected_not_lowered_reason" in entry:
+                corp["rejected_not_lowered_reason"] = entry["rejected_not_lowered_reason"]
+            if "subcorpora" in entry:
+                corp["subcorpora"] = json.loads(json.dumps(entry["subcorpora"]))
+            corpora[cname] = corp
+        corpora["external_batteries"] = {"status": "unknown", "reason": "test unknown corpus"}
+        corpora["con_leche_h3_benchmark"] = {
+            "measurement_source": "not_measured",
+            "reason": "no prebuilt pinned con-leche tree (test fixture)",
+        }
+        return {
+            "bridge_source_digests": {},
+            "lcnf_constructor_matrix": {
+                "rows": [],
+                "summary": {"total": 0, "proved": 0, "lowered_unproved": 0, "rejected": 0},
+            },
+            "corpora": corpora,
+        }
+
+    def _v_committed_baseline(self) -> dict[str, Any]:
+        results_path = ROOT_DIR / "scripts" / "lcnf_coverage_results.json"
+        return json.loads(results_path.read_text(encoding="utf-8"))
+
+    def test_check_accepts_valid_unchanged_results_file(self) -> None:
+        # Control: the committed baseline against a live report derived from
+        # it must pass, and the honest skip bookkeeping is preserved.
+        chk = check_coverage_report(ROOT_DIR, self._v_fake_live_report(), results=self._v_committed_baseline())
+        self.assertTrue(chk["ok"], chk["errors"])
+        self.assertIn("con_leche_h3_benchmark", chk["skipped_corpora"])
+        self.assertNotIn("external_batteries", chk["skipped_corpora"])
+
+    def test_check_rejects_arbitrary_nested_subcorpus_mutation(self) -> None:
+        # The reproduced defect: mutating `subcorpora.std_init_data.proved`
+        # 16 -> 17 in the committed file passed `--check` because only
+        # top-level fields were compared. Every defined measured field at
+        # every nesting level must be gated: mutate each nested field in
+        # turn and demand a named failure.
+        baseline = self._v_committed_baseline()
+        rep = self._v_fake_live_report()
+        nested = {
+            cname: corp["subcorpora"]
+            for cname, corp in baseline["corpora"].items()
+            if isinstance(corp, dict) and "subcorpora" in corp
+        }
+        self.assertTrue(nested, "committed baseline has no nested subcorpora to test")
+        for cname, subs in nested.items():
+            for sname, sc in subs.items():
+                for f in RESULT_FIELDS:
+                    drifted = json.loads(json.dumps(baseline))
+                    drifted["corpora"][cname]["subcorpora"][sname][f] += 1
+                    chk = check_coverage_report(ROOT_DIR, rep, results=drifted)
+                    self.assertFalse(
+                        chk["ok"],
+                        f"nested mutation {cname}.subcorpora.{sname}.{f} passed --check",
+                    )
+                    self.assertTrue(
+                        any(sname in e and f in e for e in chk["errors"]),
+                        f"no named error for {cname}.subcorpora.{sname}.{f}: {chk['errors']}",
+                    )
+                if "rejected_not_lowered_reason" in sc:
+                    drifted = json.loads(json.dumps(baseline))
+                    drifted["corpora"][cname]["subcorpora"][sname]["rejected_not_lowered_reason"] = "drifted_reason"
+                    chk = check_coverage_report(ROOT_DIR, rep, results=drifted)
+                    self.assertFalse(
+                        chk["ok"],
+                        f"nested reason mutation {cname}.subcorpora.{sname} passed --check",
+                    )
+                    self.assertTrue(
+                        any(
+                            sname in e and "rejected_not_lowered_reason" in e for e in chk["errors"]
+                        ),
+                        f"no named error for {cname}.subcorpora.{sname}.rejected_not_lowered_reason: {chk['errors']}",
+                    )
+
+    def test_check_rejects_nested_drift_even_when_parent_sums_compensated(self) -> None:
+        # Sharpest form of the defect: the file's internal sums stay valid and
+        # every top-level field still matches the live report; only a nested
+        # comparison can notice one declaration moved between subcorpora.
+        baseline = self._v_committed_baseline()
+        rep = self._v_fake_live_report()
+        cname = "std_init_and_c2"
+        self.assertIn(cname, baseline["corpora"])
+        self.assertIn("subcorpora", baseline["corpora"][cname])
+        drifted = json.loads(json.dumps(baseline))
+        a, b = sorted(drifted["corpora"][cname]["subcorpora"])[:2]
+        drifted["corpora"][cname]["subcorpora"][a]["proved"] += 1
+        drifted["corpora"][cname]["subcorpora"][a]["lowered_unproved"] -= 1
+        drifted["corpora"][cname]["subcorpora"][b]["proved"] -= 1
+        drifted["corpora"][cname]["subcorpora"][b]["lowered_unproved"] += 1
+        chk = check_coverage_report(ROOT_DIR, rep, results=drifted)
+        self.assertFalse(chk["ok"], "sum-consistent nested drift passed --check")
+        self.assertTrue(
+            any("subcorpus" in e and a in e for e in chk["errors"]),
+            chk["errors"],
+        )
+        self.assertTrue(
+            any("subcorpus" in e and b in e for e in chk["errors"]),
+            chk["errors"],
+        )
+
+    def test_check_rejects_missing_and_extra_subcorpora_in_results_file(self) -> None:
+        baseline = self._v_committed_baseline()
+        rep = self._v_fake_live_report()
+        cname = next(c for c, corp in baseline["corpora"].items() if "subcorpora" in corp)
+        subs = baseline["corpora"][cname]["subcorpora"]
+        missing = json.loads(json.dumps(baseline))
+        dropped = sorted(subs)[0]
+        del missing["corpora"][cname]["subcorpora"][dropped]
+        chk = check_coverage_report(ROOT_DIR, rep, results=missing)
+        self.assertFalse(chk["ok"], "subcorpus missing from the results file passed --check")
+        self.assertTrue(
+            any(dropped in e and "missing" in e for e in chk["errors"]),
+            chk["errors"],
+        )
+        extra = json.loads(json.dumps(baseline))
+        extra["corpora"][cname]["subcorpora"]["surprise_corpus"] = json.loads(
+            json.dumps(rep["corpora"][cname]["subcorpora"][sorted(subs)[0]])
+        )
+        chk_extra = check_coverage_report(ROOT_DIR, rep, results=extra)
+        self.assertFalse(chk_extra["ok"], "extra subcorpus in the results file passed --check")
+        self.assertTrue(
+            any("surprise_corpus" in e for e in chk_extra["errors"]),
+            chk_extra["errors"],
+        )
+
+    def test_results_file_validation_rejects_invalid_sums_types_and_schema(self) -> None:
+        # The committed file itself must fail closed, independent of any live
+        # comparison, on invalid sums, wrong types, and schema drift.
+        baseline = self._v_committed_baseline()
+        self.assertEqual(validate_results_document(baseline), [])
+
+        top_sum = json.loads(json.dumps(baseline))
+        top_sum["corpora"]["c1_corpus"]["total_declarations"] += 5
+        errs = validate_results_document(top_sum)
+        self.assertTrue(any("c1_corpus" in e and "sum" in e for e in errs), errs)
+
+        nested_sum = json.loads(json.dumps(baseline))
+        nested_sum["corpora"]["std_init_and_c2"]["subcorpora"]["std_init_data"]["total_declarations"] += 5
+        errs = validate_results_document(nested_sum)
+        self.assertTrue(any("subcorpora" in e and "sums to" in e for e in errs), errs)
+
+        missing_field = json.loads(json.dumps(baseline))
+        del missing_field["corpora"]["c1_corpus"]["proved"]
+        errs = validate_results_document(missing_field)
+        self.assertTrue(any("c1_corpus" in e and "proved" in e and "missing" in e for e in errs), errs)
+
+        for bad in ("782", 782.0, True):
+            wrong_type = json.loads(json.dumps(baseline))
+            wrong_type["corpora"]["c1_corpus"]["proved"] = bad
+            errs = validate_results_document(wrong_type)
+            self.assertTrue(
+                any("c1_corpus" in e and "integer" in e for e in errs),
+                f"type {type(bad).__name__} not rejected: {errs}",
+            )
+
+        non_dict = json.loads(json.dumps(baseline))
+        non_dict["corpora"]["c1_corpus"] = 42
+        errs = validate_results_document(non_dict)
+        self.assertTrue(errs)
+
+        bad_subs = json.loads(json.dumps(baseline))
+        bad_subs["corpora"]["std_init_and_c2"]["subcorpora"] = ["std_init_data"]
+        errs = validate_results_document(bad_subs)
+        self.assertTrue(any("subcorpora" in e for e in errs), errs)
+
+        schema = json.loads(json.dumps(baseline))
+        schema["schemaVersion"] = "v0"
+        errs = validate_results_document(schema)
+        self.assertTrue(any("schemaVersion" in e for e in errs), errs)
+
+    def test_check_fail_closed_on_malformed_results_file(self) -> None:
+        # `--check` must return named errors for a malformed file, never crash.
+        rep = self._v_fake_live_report()
+        for label, mutate in (
+            ("non-dict corpus entry", lambda d: d["corpora"].update({"c1_corpus": 42})),
+            (
+                "subcorpora list",
+                lambda d: d["corpora"]["std_init_and_c2"].update({"subcorpora": ["std_init_data"]}),
+            ),
+        ):
+            drifted = json.loads(json.dumps(self._v_committed_baseline()))
+            mutate(drifted)
+            chk = check_coverage_report(ROOT_DIR, rep, results=drifted)
+            self.assertFalse(chk["ok"], label)
+            self.assertTrue(chk["errors"], label)
+
+    def test_results_file_not_measured_stub_is_honest(self) -> None:
+        # An explicit `not_measured` entry in the results file is honest only
+        # with a reason and no counts, and a live-measured corpus whose
+        # baseline is such a stub must fail closed instead of comparing
+        # nothing.
+        baseline = self._v_committed_baseline()
+        rep = self._v_fake_live_report()
+
+        honest = json.loads(json.dumps(baseline))
+        honest["corpora"]["con_leche_h3_benchmark"] = {
+            "measurement_source": "not_measured",
+            "reason": "tree absent",
+        }
+        self.assertEqual(validate_results_document(honest), [])
+
+        with_counts = json.loads(json.dumps(baseline))
+        with_counts["corpora"]["con_leche_h3_benchmark"] = {
+            "measurement_source": "not_measured",
+            "reason": "x",
+            "total_declarations": 5,
+        }
+        errs = validate_results_document(with_counts)
+        self.assertTrue(any("counts" in e for e in errs), errs)
+
+        no_reason = json.loads(json.dumps(baseline))
+        no_reason["corpora"]["con_leche_h3_benchmark"] = {"measurement_source": "not_measured"}
+        errs = validate_results_document(no_reason)
+        self.assertTrue(any("reason" in e for e in errs), errs)
+
+        stubbed = json.loads(json.dumps(baseline))
+        stubbed["corpora"]["c1_corpus"] = {"measurement_source": "not_measured", "reason": "stub"}
+        chk = check_coverage_report(ROOT_DIR, rep, results=stubbed)
+        self.assertFalse(chk["ok"], "live-measured corpus with not_measured baseline stub passed --check")
+        self.assertTrue(any("c1_corpus" in e for e in chk["errors"]), chk["errors"])
+
+    def test_check_gate_covers_nested_subcorpora_with_live_report(self) -> None:
+        # End-to-end with the real live measurement: the DeepSeek repro (a
+        # nested `proved` mutation of the committed baseline) must fail
+        # `--check` against the true live report, naming the nested path,
+        # while the pristine file keeps passing.
+        baseline = self._v_committed_baseline()
+        rep = build_coverage_report(ROOT_DIR)
+        chk_ok = check_coverage_report(ROOT_DIR, rep, results=baseline)
+        self.assertTrue(chk_ok["ok"], chk_ok["errors"])
+        drifted = json.loads(json.dumps(baseline))
+        subs = drifted["corpora"]["std_init_and_c2"]["subcorpora"]
+        target = next(name for name, sc in subs.items() if sc.get("proved", 0) > 0)
+        subs[target]["proved"] += 1
+        chk_bad = check_coverage_report(ROOT_DIR, rep, results=drifted)
+        self.assertFalse(chk_bad["ok"], "nested baseline drift passed the live gate")
+        self.assertTrue(
+            any("subcorpus" in e and target in e and "proved" in e for e in chk_bad["errors"]),
+            chk_bad["errors"],
+        )
+
     def test_std_init_and_c2_renamed_and_external_batteries_separate_unknown(self) -> None:
         # Point 3: the corpus holding Init/Std + C2 is named `std_init_and_c2` (not
         # a misleading Batteries name), and external Batteries is its own top-level
