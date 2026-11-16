@@ -51,7 +51,8 @@ PINNED_CON_LECHE_REV = "501589f5680d9599dee1bcef30a420bc8924c490"
 # `verification/con-leche-bridge` one; nothing is fetched or built here.
 CON_LECHE_OLEANS_ENV = "TURBO_CON_LECHE_OLEANS"
 RESULTS_FILE = ROOT_DIR / "scripts" / "lcnf_coverage_results.json"
-RESULT_FIELDS = ("total_declarations", "proved", "lowered_unproved", "rejected")
+RESULT_FIELDS = ("total_declarations", "proved", "lowered_unproved", "rejected", "rejected_not_lowered")
+REJECTED_NOT_LOWERED_REASON = "mutual_cycle"
 CON_LECHE_MODULE_PREFIXES = ("ConLeche.Kernel", "ConLeche.Cached", "ConLeche.Frontend", "ConLeche.Driver")
 CON_LECHE_EXCLUDED_MODULES = frozenset({"ConLeche.Kernel.NatOpPins"})
 CON_LECHE_EXCLUSION_REASON = (
@@ -580,8 +581,8 @@ def toImpureDecls (env : Environment) (decls : Array (Decl .pure)) : IO (Array (
   | .ok d => return d
   | .error _ => return #[]
 
-unsafe def auditMods (env : Environment) (mods : Array Name) : IO (Nat × Nat × Nat × Nat) := do
-  let mut tot := 0; let mut prv := 0; let mut unp := 0; let mut rej := 0
+unsafe def auditMods (env : Environment) (mods : Array Name) : IO (Nat × Nat × Nat × Nat × Nat) := do
+  let mut tot := 0; let mut prv := 0; let mut unp := 0; let mut rej := 0; let mut cyc := 0
   for modName in mods do
     if let some modIdx := env.getModuleIdx? modName then
       let mdecls := monoExt.getModuleEntries env modIdx
@@ -598,6 +599,7 @@ unsafe def auditMods (env : Environment) (mods : Array Name) : IO (Nat × Nat ×
         tot := tot + 1
         if declInMutualCycle callGraph d.name then
           rej := rej + 1
+          cyc := cyc + 1
         else
           let r ← runCoreOnEnv env (ingestLCNFImpureDecl d modNames .x86_64 true)
           match r with
@@ -606,7 +608,7 @@ unsafe def auditMods (env : Environment) (mods : Array Name) : IO (Nat × Nat ×
             if hasCall then unp := unp + 1 else prv := prv + 1
           | .error _ =>
             rej := rej + 1
-  return (tot, prv, unp, rej)
+  return (tot, prv, unp, rej, cyc)
 """
 
 _LEAN_AUDIT_DRIVER_SRC = _LEAN_AUDIT_DRIVER_HEAD + r"""
@@ -634,10 +636,10 @@ unsafe def main (args : List String) : IO Unit := do
     `C1Neg_signed_int64_transitive, `C1Neg_single_ctor_enum
   ]
   let env ← importModules ((stdMods ++ c2Mods ++ c1Mods).map (fun m => { module := m })) {} (loadExts := true)
-  let (st, sp, su, sr) ← auditMods env stdMods
-  let (c2t, c2p, c2u, c2r) ← auditMods env c2Mods
-  let (c1t, c1p, c1u, c1r) ← auditMods env c1Mods
-  IO.println s!"AUDIT_RESULT:{st},{sp},{su},{sr};{c2t},{c2p},{c2u},{c2r};{c1t},{c1p},{c1u},{c1r}"
+  let (st, sp, su, sr, sc) ← auditMods env stdMods
+  let (c2t, c2p, c2u, c2r, c2c) ← auditMods env c2Mods
+  let (c1t, c1p, c1u, c1r, c1c) ← auditMods env c1Mods
+  IO.println s!"AUDIT_RESULT:{st},{sp},{su},{sr},{sc};{c2t},{c2p},{c2u},{c2r},{c2c};{c1t},{c1p},{c1u},{c1r},{c1c}"
 """
 
 
@@ -652,8 +654,8 @@ unsafe def main (args : List String) : IO Unit := do
     {names}
   ]
   let env ← importModules (mods.map (fun m => {{ module := m }})) {{}} (loadExts := true)
-  let (t, p, u, r) ← auditMods env mods
-  IO.println s!"AUDIT_RESULT:{{t}},{{p}},{{u}},{{r}}"
+  let (t, p, u, r, c) ← auditMods env mods
+  IO.println s!"AUDIT_RESULT:{{t}},{{p}},{{u}},{{r}},{{c}}"
 """
 
 
@@ -668,8 +670,8 @@ def _lean_env() -> dict[str, str]:
     return env
 
 
-def _run_audit_driver(root_dir: Path, driver_src: str, lib_dirs: list[str]) -> tuple[int, int, int, int]:
-    """Run one audit driver against `lib_dirs`; return (total, proved, unproved, rejected)."""
+def _run_audit_driver(root_dir: Path, driver_src: str, lib_dirs: list[str]) -> tuple[int, int, int, int, int]:
+    """Run one audit driver against `lib_dirs`; return (total, proved, unproved, rejected, rejected_not_lowered)."""
     lean_dir = root_dir / "lean"
     env = _lean_env()
     with tempfile.TemporaryDirectory(prefix="lcnf-audit-driver-") as tmp:
@@ -690,7 +692,7 @@ def _run_audit_driver(root_dir: Path, driver_src: str, lib_dirs: list[str]) -> t
     return tuple(int(x) for x in raw_lines[-1].split(":", 1)[1].split(","))  # type: ignore[return-value]
 
 
-def measure_fixture_corpus(root_dir: Path, lean_body: str, mod_name: str = "FixtureCorpus") -> dict[str, int]:
+def measure_fixture_corpus(root_dir: Path, lean_body: str, mod_name: str = "FixtureCorpus") -> dict[str, Any]:
     """Compile a small Lean fixture module and measure it live with the real lowerer."""
     lean_dir = root_dir / "lean"
     _ensure_lean_build(root_dir)
@@ -707,7 +709,7 @@ def measure_fixture_corpus(root_dir: Path, lean_body: str, mod_name: str = "Fixt
             capture_output=True,
             text=True,
         )
-        tot, prv, unp, rej = _run_audit_driver(
+        tot, prv, unp, rej, cyc = _run_audit_driver(
             root_dir, _lean_audit_driver_for_modules([mod_name]), [str(root)]
         )
     return {
@@ -715,6 +717,8 @@ def measure_fixture_corpus(root_dir: Path, lean_body: str, mod_name: str = "Fixt
         "proved": prv,
         "lowered_unproved": unp,
         "rejected": rej,
+        "rejected_not_lowered": cyc,
+        "rejected_not_lowered_reason": REJECTED_NOT_LOWERED_REASON,
     }
 
 
@@ -889,9 +893,9 @@ def execute_live_lean_audit(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
             raise RuntimeError(f"Lean audit driver failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
         raw_lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip().startswith("AUDIT_RESULT:")]
         parts = raw_lines[-1].split(":", 1)[1].split(";")
-        st, sp, su, sr = (int(x) for x in parts[0].split(","))
-        c2t, c2p, c2u, c2r = (int(x) for x in parts[1].split(","))
-        c1t, c1p, c1u, c1r = (int(x) for x in parts[2].split(","))
+        st, sp, su, sr, sc = (int(x) for x in parts[0].split(","))
+        c2t, c2p, c2u, c2r, c2c = (int(x) for x in parts[1].split(","))
+        c1t, c1p, c1u, c1r, c1c = (int(x) for x in parts[2].split(","))
 
     result = {
         "executed": True,
@@ -901,18 +905,24 @@ def execute_live_lean_audit(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
             "proved": sp + c2p,
             "lowered_unproved": su + c2u,
             "rejected": sr + c2r,
+            "rejected_not_lowered": sc + c2c,
+            "rejected_not_lowered_reason": REJECTED_NOT_LOWERED_REASON,
             "subcorpora": {
                 "std_init_data": {
                     "total_declarations": st,
                     "proved": sp,
                     "lowered_unproved": su,
                     "rejected": sr,
+                    "rejected_not_lowered": sc,
+                    "rejected_not_lowered_reason": REJECTED_NOT_LOWERED_REASON,
                 },
                 "c2_lake_packages": {
                     "total_declarations": c2t,
                     "proved": c2p,
                     "lowered_unproved": c2u,
                     "rejected": c2r,
+                    "rejected_not_lowered": c2c,
+                    "rejected_not_lowered_reason": REJECTED_NOT_LOWERED_REASON,
                 },
             },
         },
@@ -921,6 +931,8 @@ def execute_live_lean_audit(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
             "proved": c1p,
             "lowered_unproved": c1u,
             "rejected": c1r,
+            "rejected_not_lowered": c1c,
+            "rejected_not_lowered_reason": REJECTED_NOT_LOWERED_REASON,
         },
     }
     _LIVE_AUDIT_CACHE[cache_key] = result
@@ -1091,7 +1103,7 @@ def measure_con_leche(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
             }
         _CON_LECHE_CACHE[cache_key] = result
         return result
-    total, proved, unproved, rejected = _run_audit_driver(
+    total, proved, unproved, rejected, rejected_not_lowered = _run_audit_driver(
         root_dir, _lean_audit_driver_for_modules(modules), [str(olean_root)]
     )
     result = {
@@ -1107,6 +1119,8 @@ def measure_con_leche(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
         "proved": proved,
         "lowered_unproved": unproved,
         "rejected": rejected,
+        "rejected_not_lowered": rejected_not_lowered,
+        "rejected_not_lowered_reason": REJECTED_NOT_LOWERED_REASON,
     }
     _CON_LECHE_CACHE[cache_key] = result
     return result
@@ -1147,6 +1161,8 @@ def build_live_corpora(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
             "proved": bat["proved"],
             "lowered_unproved": bat["lowered_unproved"],
             "rejected": bat["rejected"],
+            "rejected_not_lowered": bat["rejected_not_lowered"],
+            "rejected_not_lowered_reason": bat["rejected_not_lowered_reason"],
             "subcorpora": bat["subcorpora"],
         }
         c1 = live["c1_corpus"]
@@ -1159,6 +1175,8 @@ def build_live_corpora(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
             "proved": c1["proved"],
             "lowered_unproved": c1["lowered_unproved"],
             "rejected": c1["rejected"],
+            "rejected_not_lowered": c1["rejected_not_lowered"],
+            "rejected_not_lowered_reason": c1["rejected_not_lowered_reason"],
         }
     corpora["external_batteries"] = {
         "status": "unknown",
@@ -1221,9 +1239,18 @@ def results_document(report: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[
         if corp.get("status") == "unknown" or corp.get("measurement_source") != "live_invocation":
             continue
         entry: dict[str, Any] = {f: corp[f] for f in RESULT_FIELDS if f in corp}
+        if "rejected_not_lowered_reason" in corp:
+            entry["rejected_not_lowered_reason"] = corp["rejected_not_lowered_reason"]
         if "subcorpora" in corp:
             entry["subcorpora"] = {
-                sname: {f: sc[f] for f in RESULT_FIELDS if f in sc}
+                sname: {
+                    **{f: sc[f] for f in RESULT_FIELDS if f in sc},
+                    **(
+                        {"rejected_not_lowered_reason": sc["rejected_not_lowered_reason"]}
+                        if "rejected_not_lowered_reason" in sc
+                        else {}
+                    ),
+                }
                 for sname, sc in corp["subcorpora"].items()
             }
         corpora[cname] = entry
@@ -1307,16 +1334,21 @@ def check_coverage_report(
         tot = corp["total_declarations"]
         if tot != corp["proved"] + corp["lowered_unproved"] + corp["rejected"]:
             errors.append(f"Corpus `{cname}` declaration counts do not sum to total_declarations")
+        rnl = corp.get("rejected_not_lowered")
+        if rnl is None or not (0 <= rnl <= corp["rejected"]) or not corp.get("rejected_not_lowered_reason"):
+            errors.append(f"Corpus `{cname}` missing valid `rejected_not_lowered` / `rejected_not_lowered_reason`")
         if "subcorpora" in corp:
             sub_tot = sum(s["total_declarations"] for s in corp["subcorpora"].values())
             sub_prv = sum(s["proved"] for s in corp["subcorpora"].values())
             sub_unp = sum(s["lowered_unproved"] for s in corp["subcorpora"].values())
             sub_rej = sum(s["rejected"] for s in corp["subcorpora"].values())
-            if (sub_tot, sub_prv, sub_unp, sub_rej) != (
+            sub_rnl = sum(s.get("rejected_not_lowered", 0) for s in corp["subcorpora"].values())
+            if (sub_tot, sub_prv, sub_unp, sub_rej, sub_rnl) != (
                 tot,
                 corp["proved"],
                 corp["lowered_unproved"],
                 corp["rejected"],
+                corp.get("rejected_not_lowered", 0),
             ):
                 errors.append(f"Corpus `{cname}` subcorpora totals do not sum to corpus totals")
 
@@ -1492,7 +1524,7 @@ class TestLcnfCoverage(unittest.TestCase):
             os.environ["TURBO_CON_LECHE_OLEANS"] = str(root / "lib" / "lean")
             try:
                 with mock.patch.object(
-                    sys.modules[__name__], "_run_audit_driver", return_value=(100, 7, 11, 82)
+                    sys.modules[__name__], "_run_audit_driver", return_value=(100, 7, 11, 82, 4)
                 ) as run, mock.patch.object(
                     sys.modules[__name__], "_git_head", return_value=PINNED_CON_LECHE_REV
                 ), mock.patch.dict(
@@ -1729,7 +1761,7 @@ class TestLcnfCoverage(unittest.TestCase):
             os.environ["TURBO_CON_LECHE_OLEANS"] = str(root / "lib" / "lean")
             try:
                 with mock.patch.object(
-                    sys.modules[__name__], "_run_audit_driver", return_value=(100, 7, 11, 82)
+                    sys.modules[__name__], "_run_audit_driver", return_value=(100, 7, 11, 82, 4)
                 ) as run, mock.patch.object(
                     sys.modules[__name__], "_git_head", return_value=PINNED_CON_LECHE_REV
                 ):
@@ -2001,7 +2033,10 @@ def main() -> int:
             if corp.get("measurement_source") == "live_invocation":
                 parts.append(
                     f"{label}={corp['proved']}/{corp['total_declarations']} proved "
-                    f"(+{corp['lowered_unproved']} vacuous_local_call)"
+                    f"(+{corp['lowered_unproved']} vacuous_local_call, "
+                    f"{corp['rejected']} rejected incl. "
+                    f"rejected_not_lowered={corp['rejected_not_lowered']} "
+                    f"[{corp['rejected_not_lowered_reason']}])"
                 )
             elif corp.get("measurement_source") == "error":
                 parts.append(f"{label}=error ({corp.get('error_code', 'error')})")
