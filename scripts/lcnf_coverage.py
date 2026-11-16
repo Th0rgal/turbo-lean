@@ -911,12 +911,21 @@ def _git_head(root_dir: Path) -> str:
         return "unknown"
 
 
-def _con_leche_olean_root() -> Path | None:
+def _con_leche_olean_root(root_dir: Path = ROOT_DIR) -> Path | None:
+    """Where a prebuilt pinned con-leche `.olean` tree is, if there is one.
+
+    `TURBO_CON_LECHE_OLEANS` wins. Otherwise the tree that `lake build` of
+    `verification/con-leche-bridge` leaves behind is used when present.
+    """
     raw = os.environ.get(CON_LECHE_OLEANS_ENV, "").strip()
-    if not raw:
-        return None
-    p = Path(raw)
-    return p if p.is_dir() else None
+    if raw:
+        p = Path(raw)
+        return p if p.is_dir() else None
+    default = (
+        root_dir / "verification" / "con-leche-bridge" / ".lake" / "packages"
+        / "con-leche" / ".lake" / "build" / "lib" / "lean"
+    )
+    return default if default.is_dir() else None
 
 
 def _con_leche_modules(olean_root: Path) -> list[str]:
@@ -938,7 +947,7 @@ def measure_con_leche(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     already-built tree of the pinned revision. Without one, the corpus is reported
     as `not_measured` and carries no declaration number.
     """
-    olean_root = _con_leche_olean_root()
+    olean_root = _con_leche_olean_root(root_dir)
     cache_key = f"{root_dir.resolve()}|{olean_root}"
     if cache_key in _CON_LECHE_CACHE:
         return _CON_LECHE_CACHE[cache_key]
@@ -1349,6 +1358,36 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertEqual(live["c1_corpus"]["proved"], 782)
         self.assertEqual(live["c1_corpus"]["lowered_unproved"], 98)
         self.assertEqual(live["c1_corpus"]["rejected"], 22)
+
+    def test_con_leche_tree_is_discovered_where_the_bridge_builds_it(self) -> None:
+        import unittest.mock as mock
+
+        saved = os.environ.pop(CON_LECHE_OLEANS_ENV, None)
+        try:
+            with tempfile.TemporaryDirectory(prefix="cl-root-") as tmp:
+                root = Path(tmp)
+                self.assertIsNone(_con_leche_olean_root(root))
+                lib = (
+                    root / "verification" / "con-leche-bridge" / ".lake" / "packages"
+                    / "con-leche" / ".lake" / "build" / "lib" / "lean"
+                )
+                lib.mkdir(parents=True)
+                (lib / ".git").mkdir()  # stand-in for the checkout root marker
+                self.assertEqual(_con_leche_olean_root(root), lib)
+                # The env var overrides the default when both exist.
+                other = root / "other"
+                other.mkdir()
+                os.environ[CON_LECHE_OLEANS_ENV] = str(other)
+                self.assertEqual(_con_leche_olean_root(root), other)
+                del os.environ[CON_LECHE_OLEANS_ENV]
+                # An explicitly named path that does not exist means "no tree", not
+                # a silent fallback to some other checkout.
+                os.environ[CON_LECHE_OLEANS_ENV] = str(root / "gone")
+                self.assertIsNone(_con_leche_olean_root(root))
+        finally:
+            os.environ.pop(CON_LECHE_OLEANS_ENV, None)
+            if saved is not None:
+                os.environ[CON_LECHE_OLEANS_ENV] = saved
 
     def test_cold_tree_builds_the_lean_library_once(self) -> None:
         # A clean CI checkout has no lean/.lake; the script must build what it imports.
