@@ -15,6 +15,10 @@ env:
   # Axiom-policy audit tests change process-wide environment variables.
   RUST_TEST_THREADS: "1"
   TURBO_LEAN_HOME: ${{ github.workspace }}/.turbo-cache
+  # lean.ci guests export their remote cache to every job; turbo-lean's own tests must
+  # not read it (an empty value disables it), or modules come back cached, not compiled.
+  TURBO_LEAN_REMOTE_CACHE: ""
+  TURBO_LEAN_REMOTE_TOKEN: ""
 
 jobs:
   impact:
@@ -50,7 +54,7 @@ jobs:
     needs: impact
     if: needs.impact.outputs.run_lean_build == 'true'
     name: Build turbo-lean & Self-Verify Lean 4 Proofs
-    runs-on: ${{ vars.TURBO_LEAN_LEAN_RUNNERS == 'true' && github.repository == 'Th0rgal/turbo-lean' && (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && 'boost-32vcpu-vanilla' || 'ubuntu-latest' }}
+    runs-on: ${{ vars.TURBO_LEAN_LEAN_RUNNERS == 'true' && github.repository == 'Th0rgal/turbo-lean' && (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && 'lean-32vcpu-ubuntu-2604' || 'ubuntu-latest' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -214,7 +218,7 @@ jobs:
   emitter-mutation-report:
     name: Emitter Mutation Report (B-3, Non-Blocking)
     if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-    runs-on: ${{ vars.TURBO_LEAN_LEAN_RUNNERS == 'true' && github.repository == 'Th0rgal/turbo-lean' && (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && 'boost-32vcpu-vanilla' || 'ubuntu-latest' }}
+    runs-on: ${{ vars.TURBO_LEAN_LEAN_RUNNERS == 'true' && github.repository == 'Th0rgal/turbo-lean' && (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) && 'lean-16vcpu-ubuntu-2604' || 'ubuntu-latest' }}
     continue-on-error: true
     timeout-minutes: 120
     steps:

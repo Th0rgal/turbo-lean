@@ -15,6 +15,10 @@ env:
   PYTHONNOUSERSITE: "1"
   PYTHONUNBUFFERED: "1"
   TURBO_LEAN_HOME: ${{ github.workspace }}/.turbo-cache
+  # lean.ci guests export their remote cache to every job; turbo-lean's own tests must
+  # not read it (an empty value disables it), or modules come back cached, not compiled.
+  TURBO_LEAN_REMOTE_CACHE: ""
+  TURBO_LEAN_REMOTE_TOKEN: ""
 
 jobs:
   impact:
@@ -83,7 +87,7 @@ jobs:
       - name: Provision sanitizer & compiler runtime dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential clang gcc cmake ninja-build llvm-18 llvm-18-dev llvm-18-tools libz3-dev re2c zlib1g-dev libzstd-dev
+          sudo apt-get install -y --no-install-recommends build-essential clang libclang-rt-dev gcc cmake ninja-build llvm-18 llvm-18-dev llvm-18-tools libz3-dev re2c zlib1g-dev libzstd-dev
 
       - name: Cache Alive2 translation-validation binary (alive-tv)
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
