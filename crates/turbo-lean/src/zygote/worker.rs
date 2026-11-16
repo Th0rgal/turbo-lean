@@ -45,11 +45,15 @@ pub(super) const ZYGOTE_EMBEDDED_MODULES: &[EmbeddedZygoteModule] = &[
         emit_olean: true,
         c_opt: "-O3",
     },
-    // S3b-M: the pure Lean move split `TurboLean.ZygoteWorker` into the submodules below.
-    // The manifest is the write/compile order: every submodule imports only earlier
-    // entries, so each emits its `.olean` into the scratch `LEAN_PATH` before its
-    // importers compile. All worker submodules keep the monolith's `-O0` (`c_opt`).
-    // The entrypoint barrel `TurboLean.ZygoteWorker` (root `main`) stays last.
+    // S3b-M revised decomposition (review 9f6cb6dc): only the shim-free public-only
+    // ranges live in submodules (`Env`, `Wire`, `KernelAudit`). The shim block (whose
+    // private `formatReducibilityStatus` is consumed by the root signature-audit code),
+    // the replay/compiler/signature/hotspot ranges and root `main` stay in the
+    // entrypoint barrel, keeping compiled private mangling and public order
+    // baseline-exact. The manifest is the write/compile order: every submodule imports
+    // only earlier entries, so each emits its `.olean` into the scratch `LEAN_PATH`
+    // before its importers compile. All worker submodules keep the monolith's `-O0`
+    // (`c_opt`). The entrypoint barrel `TurboLean.ZygoteWorker` stays last.
     EmbeddedZygoteModule {
         module: "TurboLean.ZygoteWorker.Env",
         rel_path: "TurboLean/ZygoteWorker/Env.lean",
@@ -68,41 +72,6 @@ pub(super) const ZYGOTE_EMBEDDED_MODULES: &[EmbeddedZygoteModule] = &[
         module: "TurboLean.ZygoteWorker.KernelAudit",
         rel_path: "TurboLean/ZygoteWorker/KernelAudit.lean",
         src: include_str!("../../../../lean/TurboLean/ZygoteWorker/KernelAudit.lean"),
-        emit_olean: true,
-        c_opt: "-O0",
-    },
-    EmbeddedZygoteModule {
-        module: "TurboLean.ZygoteWorker.StatementHashing",
-        rel_path: "TurboLean/ZygoteWorker/StatementHashing.lean",
-        src: include_str!("../../../../lean/TurboLean/ZygoteWorker/StatementHashing.lean"),
-        emit_olean: true,
-        c_opt: "-O0",
-    },
-    EmbeddedZygoteModule {
-        module: "TurboLean.ZygoteWorker.Signature",
-        rel_path: "TurboLean/ZygoteWorker/Signature.lean",
-        src: include_str!("../../../../lean/TurboLean/ZygoteWorker/Signature.lean"),
-        emit_olean: true,
-        c_opt: "-O0",
-    },
-    EmbeddedZygoteModule {
-        module: "TurboLean.ZygoteWorker.Replay",
-        rel_path: "TurboLean/ZygoteWorker/Replay.lean",
-        src: include_str!("../../../../lean/TurboLean/ZygoteWorker/Replay.lean"),
-        emit_olean: true,
-        c_opt: "-O0",
-    },
-    EmbeddedZygoteModule {
-        module: "TurboLean.ZygoteWorker.Compiler",
-        rel_path: "TurboLean/ZygoteWorker/Compiler.lean",
-        src: include_str!("../../../../lean/TurboLean/ZygoteWorker/Compiler.lean"),
-        emit_olean: true,
-        c_opt: "-O0",
-    },
-    EmbeddedZygoteModule {
-        module: "TurboLean.ZygoteWorker.Hotspots",
-        rel_path: "TurboLean/ZygoteWorker/Hotspots.lean",
-        src: include_str!("../../../../lean/TurboLean/ZygoteWorker/Hotspots.lean"),
         emit_olean: true,
         c_opt: "-O0",
     },
@@ -1929,15 +1898,10 @@ mod worker_embed_tests {
     /// participating in the zygote binary cache key (a 1-byte source edit must change it).
     #[test]
     fn zygote_worker_split_submodules_manifest_and_cache_key() {
-        const SUBMODULES: [&str; 8] = [
+        const SUBMODULES: [&str; 3] = [
             "TurboLean/ZygoteWorker/Env.lean",
             "TurboLean/ZygoteWorker/Wire.lean",
             "TurboLean/ZygoteWorker/KernelAudit.lean",
-            "TurboLean/ZygoteWorker/StatementHashing.lean",
-            "TurboLean/ZygoteWorker/Signature.lean",
-            "TurboLean/ZygoteWorker/Replay.lean",
-            "TurboLean/ZygoteWorker/Compiler.lean",
-            "TurboLean/ZygoteWorker/Hotspots.lean",
         ];
         let pos_of = |rel: &str| {
             ZYGOTE_EMBEDDED_MODULES
