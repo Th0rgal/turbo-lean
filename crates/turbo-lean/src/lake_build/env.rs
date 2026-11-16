@@ -2,11 +2,9 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use walkdir::WalkDir;
 
 use crate::db::TurboStore;
-use crate::splitter::{self, split_lean_source};
+use crate::splitter;
 
 use super::*;
 
