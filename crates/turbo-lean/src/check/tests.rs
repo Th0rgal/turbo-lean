@@ -3454,3 +3454,276 @@ fn test_remote_http_check_never_stages_cas_blobs_before_attestation_and_reuses_c
     let _ = fs::remove_dir_all(&tmp_dir);
     test_res
 }
+
+#[test]
+fn test_check_phase_timings_cover_at_least_90_percent_of_wall() -> Result<()> {
+    let _guard = crate::pack::tests::env_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let toolchain = include_str!("../../../../lean/lean-toolchain").trim();
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "turbo_check_phase_timings_{}_{}",
+        std::process::id(),
+        pack::next_tmp_id()
+    ));
+    let _ = fs::remove_dir_all(&tmp_dir);
+    let proj = tmp_dir.join("proj");
+    fs::create_dir_all(proj.join("Dep"))?;
+    fs::write(proj.join("lean-toolchain"), format!("{toolchain}\n"))?;
+    fs::write(
+        proj.join("lakefile.toml"),
+        "name = \"phase_timing_pkg\"\ndefaultTargets = [\"Dep\", \"Mod\"]\n\n[[lean_lib]]\nname = \"Dep\"\nglobs = [\"Dep.+\"]\n\n[[lean_lib]]\nname = \"Mod\"\n",
+    )?;
+    fs::write(
+        proj.join("Dep/Helper.lean"),
+        "def depHelperVal : Nat := 1\n",
+    )?;
+    let mod_file = proj.join("Mod.lean");
+    fs::write(
+        &mod_file,
+        "import Dep.Helper\nnamespace PhasePkg\ntheorem thm1 : depHelperVal = 1 := rfl\ntheorem thm2 : 2 + 2 = 4 := rfl\nend PhasePkg\n",
+    )?;
+
+    let cache_dir = tmp_dir.join("cache");
+    let mut store = TurboStore::open(Some(&cache_dir))?;
+    let Ok((_ev, lean_bin)) = crate::pack::resolve_server_lean_env_and_bin(&store, toolchain, "")
+    else {
+        let _ = fs::remove_dir_all(&tmp_dir);
+        return Ok(());
+    };
+    if !lean_bin.exists() && Command::new(&lean_bin).arg("--version").output().is_err() {
+        let _ = fs::remove_dir_all(&tmp_dir);
+        return Ok(());
+    }
+    crate::module_builder::reset_lake_inputs_tag_memo();
+    crate::lake_build::run_build_command(
+        &mut store,
+        false,
+        Vec::new(),
+        proj.clone(),
+        "trusted".to_string(),
+        0,
+        false,
+    )?;
+
+    let check_t0 = Instant::now();
+    let mut cold_store = TurboStore::open(Some(&tmp_dir.join("cold_cache")))?;
+    let decl_json = evaluate_check_command_value(
+        &mut cold_store,
+        mod_file.clone(),
+        Some("PhasePkg.thm1".to_string()),
+        proj.clone(),
+    )?;
+    let caller_wall_ms = check_t0.elapsed().as_secs_f64() * 1000.0;
+    let pt = decl_json
+        .get("phase_timings")
+        .context("missing phase_timings in check --decl output")?;
+    let wall_ms = pt["wall_ms"].as_f64().context("missing wall_ms")?;
+    let phase_sum_ms = pt["phase_sum_ms"]
+        .as_f64()
+        .context("missing phase_sum_ms")?;
+    let phase_covered_ms = pt["phase_covered_ms"]
+        .as_f64()
+        .context("missing phase_covered_ms")?;
+    let phase_overlap_ms = pt["phase_overlap_ms"]
+        .as_f64()
+        .context("missing phase_overlap_ms")?;
+    let coverage_ratio = pt["coverage_ratio"]
+        .as_f64()
+        .context("missing coverage_ratio")?;
+    let elapsed_ms = decl_json["elapsed_ms"]
+        .as_f64()
+        .context("missing elapsed_ms")?;
+
+    assert!(
+        elapsed_ms >= caller_wall_ms * 0.90,
+        "elapsed_ms ({elapsed_ms}) must cover >= 90% of caller wall ({caller_wall_ms})"
+    );
+    assert!(
+        phase_covered_ms >= wall_ms * 0.90 && coverage_ratio >= 0.90,
+        "phase_covered_ms ({phase_covered_ms}) / wall_ms ({wall_ms}) = {coverage_ratio} must be >= 0.90 (pt={pt})"
+    );
+    assert!(
+        phase_covered_ms >= caller_wall_ms * 0.90,
+        "phase_covered_ms ({phase_covered_ms}) must cover >= 90% of caller wall ({caller_wall_ms})"
+    );
+    assert!(
+        (phase_sum_ms - phase_covered_ms - phase_overlap_ms).abs() < 0.05,
+        "phase_sum_ms ({phase_sum_ms}) must equal phase_covered_ms ({phase_covered_ms}) + phase_overlap_ms ({phase_overlap_ms})"
+    );
+    assert!(
+        pt["phases_ms"]["import_refresh"].as_f64().unwrap_or(0.0) > 0.0,
+        "cold check must record import_refresh phase: {pt}"
+    );
+    assert!(
+        pt["phases_ms"]["identity_probe"].as_f64().unwrap_or(0.0) > 0.0,
+        "check --decl must record identity_probe phase: {pt}"
+    );
+    assert!(
+        pt["phases_ms"].get("cas_lookup").and_then(|v| v.as_f64()).is_some(),
+        "cold check --decl cache miss must record cas_lookup phase: {pt}"
+    );
+    assert!(
+        pt["phases_ms"]["elaboration"].as_f64().unwrap_or(0.0) > 0.0,
+        "cold check --decl must record elaboration phase: {pt}"
+    );
+
+    // Warm cache hit early return on --decl must also report >= 90% wall coverage and cas_lookup
+    let warm_decl_t0 = Instant::now();
+    let warm_decl_json = evaluate_check_command_value(
+        &mut cold_store,
+        mod_file.clone(),
+        Some("PhasePkg.thm1".to_string()),
+        proj.clone(),
+    )?;
+    let warm_decl_caller_ms = warm_decl_t0.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(warm_decl_json["status"].as_str(), Some("theorem_cache_hit"));
+    let warm_pt = warm_decl_json
+        .get("phase_timings")
+        .context("missing phase_timings on warm check --decl cache hit")?;
+    let warm_covered_ms = warm_pt["phase_covered_ms"]
+        .as_f64()
+        .context("missing warm phase_covered_ms")?;
+    let warm_ratio = warm_pt["coverage_ratio"]
+        .as_f64()
+        .context("missing warm coverage_ratio")?;
+    assert!(
+        warm_ratio >= 0.90 && warm_covered_ms >= warm_decl_caller_ms * 0.90,
+        "warm check --decl cache hit coverage ({warm_covered_ms} ms / {warm_decl_caller_ms} ms, ratio={warm_ratio}) must be >= 0.90: {warm_pt}"
+    );
+    assert!(
+        warm_pt["phases_ms"].get("cas_lookup").and_then(|v| v.as_f64()).is_some(),
+        "warm check --decl cache hit must record cas_lookup: {warm_pt}"
+    );
+
+    let file_t0 = Instant::now();
+    let mut cold_file_store = TurboStore::open(Some(&tmp_dir.join("cold_file_cache")))?;
+    let file_json =
+        evaluate_check_command_value(&mut cold_file_store, mod_file.clone(), None, proj.clone())?;
+    let file_caller_wall_ms = file_t0.elapsed().as_secs_f64() * 1000.0;
+    let file_pt = file_json
+        .get("phase_timings")
+        .context("missing phase_timings in single-file check output")?;
+    let file_covered_ms = file_pt["phase_covered_ms"]
+        .as_f64()
+        .context("missing file phase_covered_ms")?;
+    let file_ratio = file_pt["coverage_ratio"]
+        .as_f64()
+        .context("missing file coverage_ratio")?;
+    assert!(
+        file_ratio >= 0.90 && file_covered_ms >= file_caller_wall_ms * 0.90,
+        "file check phase coverage ({file_covered_ms} ms / {file_caller_wall_ms} ms, ratio={file_ratio}) must be >= 0.90: {file_pt}"
+    );
+
+    // Warm single-file early return (`all_shards_cached`) must report >= 90% wall coverage
+    let warm_file_t0 = Instant::now();
+    let warm_file_json =
+        evaluate_check_command_value(&mut cold_file_store, mod_file.clone(), None, proj.clone())?;
+    let warm_file_caller_ms = warm_file_t0.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(warm_file_json["status"].as_str(), Some("all_shards_cached"));
+    let warm_file_pt = warm_file_json
+        .get("phase_timings")
+        .context("missing phase_timings on warm single-file check")?;
+    let warm_file_covered = warm_file_pt["phase_covered_ms"]
+        .as_f64()
+        .context("missing warm file phase_covered_ms")?;
+    let warm_file_ratio = warm_file_pt["coverage_ratio"]
+        .as_f64()
+        .context("missing warm file coverage_ratio")?;
+    assert!(
+        warm_file_ratio >= 0.90 && warm_file_covered >= warm_file_caller_ms * 0.90,
+        "warm single-file check coverage ({warm_file_covered} ms / {warm_file_caller_ms} ms, ratio={warm_file_ratio}) must be >= 0.90: {warm_file_pt}"
+    );
+
+    // `--allow-sorry` single-file modulo-sorry early return must record elaboration and >= 90% wall coverage
+    let sorry_file = proj.join("SorryMod.lean");
+    fs::write(
+        &sorry_file,
+        "import Dep.Helper\nnamespace PhasePkg\ntheorem sorry_thm : depHelperVal = 1 := by sorry\nend PhasePkg\n",
+    )?;
+    let sorry_file_t0 = Instant::now();
+    let sorry_file_json = crate::check::run_check_command_inner(
+        &mut cold_file_store,
+        true,
+        false,
+        false,
+        false,
+        sorry_file.clone(),
+        None,
+        proj.clone(),
+        None,
+        true,
+        None,
+        true,
+    )?;
+    let sorry_file_caller_ms = sorry_file_t0.elapsed().as_secs_f64() * 1000.0;
+    let sorry_file_pt = sorry_file_json
+        .get("phase_timings")
+        .context("missing phase_timings in allow-sorry file check")?;
+    let sorry_file_covered = sorry_file_pt["phase_covered_ms"]
+        .as_f64()
+        .context("missing allow-sorry file phase_covered_ms")?;
+    let sorry_file_ratio = sorry_file_pt["coverage_ratio"]
+        .as_f64()
+        .context("missing allow-sorry file coverage_ratio")?;
+    assert!(
+        sorry_file_pt["phases_ms"]["elaboration"].as_f64().unwrap_or(0.0) > 0.0,
+        "allow-sorry file check must record elaboration phase: {sorry_file_pt}"
+    );
+    assert!(
+        sorry_file_ratio >= 0.90 && sorry_file_covered >= sorry_file_caller_ms * 0.90,
+        "allow-sorry file check coverage ({sorry_file_covered} ms / {sorry_file_caller_ms} ms, ratio={sorry_file_ratio}) must be >= 0.90: {sorry_file_pt}"
+    );
+    let _ = fs::remove_file(&sorry_file);
+
+    // Process-visible CLI boundary: `turbo-lean --json check` on a fresh cold cache directory
+    // must cover >= 90% of its own reported `wall_ms` (which starts at process entry before
+    // `TurboStore::open` and config loading) and record `cas_lookup` on a cold miss.
+    if let Ok(exe) = std::env::current_exe() {
+        let bin_candidate = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("turbo-lean"))
+            .filter(|b| b.is_file());
+        if let Some(bin) = bin_candidate {
+            let cli_cache = tmp_dir.join("cli_cold_cache");
+            let cli_out = Command::new(&bin)
+                .env("TURBO_LEAN_NO_DAEMON", "1")
+                .arg("--cache-dir")
+                .arg(&cli_cache)
+                .args(["--json", "check"])
+                .arg(&mod_file)
+                .args(["--decl", "PhasePkg.thm1", "--project-dir"])
+                .arg(&proj)
+                .output()?;
+            assert!(
+                cli_out.status.success(),
+                "CLI check failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&cli_out.stdout),
+                String::from_utf8_lossy(&cli_out.stderr)
+            );
+            let cli_json: serde_json::Value = serde_json::from_slice(&cli_out.stdout)?;
+            let cli_pt = cli_json
+                .get("phase_timings")
+                .context("missing phase_timings in CLI --json check output")?;
+            let cli_ratio = cli_pt["coverage_ratio"]
+                .as_f64()
+                .context("missing CLI coverage_ratio")?;
+            assert!(
+                cli_ratio >= 0.90,
+                "CLI check coverage_ratio ({cli_ratio}) must be >= 0.90: {cli_pt}"
+            );
+            assert!(
+                cli_pt["phases_ms"].get("cli_startup").and_then(|v| v.as_f64()).is_some(),
+                "CLI check must record cli_startup phase from process entry: {cli_pt}"
+            );
+            assert!(
+                cli_pt["phases_ms"].get("cas_lookup").and_then(|v| v.as_f64()).is_some(),
+                "CLI cold check --decl must record cas_lookup: {cli_pt}"
+            );
+        }
+    }
+
+    let _ = fs::remove_dir_all(&tmp_dir);
+    Ok(())
+}

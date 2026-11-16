@@ -44,6 +44,7 @@ pub(super) fn check_single_file(
     remote_http: Option<&str>,
     allow_sorry: bool,
 ) -> Result<serde_json::Value> {
+    let cas_lookup_started = Instant::now();
     let file_lean_args = crate::module_builder::try_resolve_lean_args_for_path(
         canon_dir,
         Some(canon_resolved_initial),
@@ -65,6 +66,7 @@ pub(super) fn check_single_file(
     } else {
         HashMap::new()
     };
+    crate::phase_timing::record_active_span_since("cas_lookup", cas_lookup_started);
 
     let mut hits = 0usize;
     let mut uncached_shards = Vec::new();
@@ -93,6 +95,7 @@ pub(super) fn check_single_file(
             attested_kths.insert(file_shard_keys[idx].clone(), att.kernel_type_hash);
         }
     }
+    let cas_verify_started = Instant::now();
     let hygiene_strictly_clean = split.hygiene.is_clean_for_certification();
     for (idx, shard) in split.shards.iter().enumerate() {
         let shard_key = file_shard_keys[idx].clone();
@@ -130,6 +133,7 @@ pub(super) fn check_single_file(
             uncached_shards.push((shard_key, shard));
         }
     }
+    crate::phase_timing::record_active_span_since("cas_lookup", cas_verify_started);
     let misses = uncached_shards.len();
 
     if allow_sorry && (split.hygiene.is_clean_modulo_sorry() || !hygiene_deferrable) {
@@ -182,6 +186,7 @@ pub(super) fn check_single_file(
         let (env_vars, env_cache_hit) = resolve_lake_env(store, canon_dir)?;
         let lean_bin = resolve_lean_bin(canon_dir)?;
         let t0 = &prewarm_local_check_zygote(store, canon_dir, toolchain, t0)?;
+        let elab_started = Instant::now();
         let local_lean_path = resolve_remote_lean_path(canon_dir, Some(&env_vars));
         let orig_display = file.display().to_string();
         let mut file_used_sorry = split.hygiene.has_sorry;
@@ -435,6 +440,7 @@ pub(super) fn check_single_file(
                 "elapsed_ms": dur_ms
             });
             kernel_prov.insert_json_fields(&mut out_json);
+            crate::phase_timing::record_active_span_since("elaboration", elab_started);
             if emit_stdout {
                 if json_output {
                     println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -591,6 +597,7 @@ pub(super) fn check_single_file(
             "elapsed_ms": dur_ms
         });
         kernel_prov.insert_json_fields(&mut out_json);
+        crate::phase_timing::record_active_span_since("elaboration", elab_started);
         if emit_stdout {
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -688,6 +695,7 @@ pub(super) fn check_single_file(
 
     if hygiene_strictly_clean && split.eligible_for_sharding && !uncached_shards.is_empty() {
         if let Some(remote_url) = remote_http {
+            let elab_started = Instant::now();
             if src.is_empty() {
                 *src = fs::read_to_string(resolved_file)
                     .with_context(|| format!("Failed to read {}", resolved_file.display()))?;
@@ -792,6 +800,7 @@ pub(super) fn check_single_file(
                 "elapsed_ms": dur_ms
             });
             kernel_prov.insert_json_fields(&mut out_json);
+            crate::phase_timing::record_active_span_since("elaboration", elab_started);
             if emit_stdout {
                 if json_output {
                     println!("{}", serde_json::to_string_pretty(&out_json)?);
@@ -812,6 +821,7 @@ pub(super) fn check_single_file(
     }
 
     let t0 = &prewarm_local_check_zygote(store, canon_dir, toolchain, t0)?;
+    let elab_started = Instant::now();
     let use_parallel_shards =
         hygiene_strictly_clean && split.eligible_for_sharding && !uncached_shards.is_empty();
 
@@ -1369,6 +1379,7 @@ pub(super) fn check_single_file(
             };
             pack::warm_local_zygote_daemon_nonblocking(store, &ev);
         }
+        crate::phase_timing::record_active_span_since("elaboration", elab_started);
         Ok(out_json)
     } else {
         let needs_fresh_read = match cached_file_blake3 {
@@ -1688,6 +1699,7 @@ pub(super) fn check_single_file(
         if remote_http.is_none() && !verified_via_zygote_eval && !crate::zygote::daemon_disabled() {
             pack::warm_local_zygote_daemon_nonblocking(store, &env_vars);
         }
+        crate::phase_timing::record_active_span_since("elaboration", elab_started);
         Ok(out_json)
     }
 }

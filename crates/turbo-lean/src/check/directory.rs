@@ -33,6 +33,7 @@ pub(super) fn check_directory(
     remote_http: Option<&str>,
     allow_sorry: bool,
 ) -> Result<serde_json::Value> {
+    let import_started = Instant::now();
     let dir_files = collect_lean_files(resolved_file);
     let fresh_res = crate::lake_build::ensure_project_imports_fresh_for_check_with_options(
         canon_dir,
@@ -53,6 +54,8 @@ pub(super) fn check_directory(
         crate::lake_build::purge_sorry_artifacts_after_allow_sorry_failure(canon_dir, &dir_files);
     }
     import_res?;
+    crate::phase_timing::record_active_span_since("import_refresh", import_started);
+    let split_started = Instant::now();
     let mut dir_hasher = blake3::Hasher::new();
     dir_hasher.update(b"dir-check-v2\n");
     dir_hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
@@ -129,18 +132,21 @@ pub(super) fn check_directory(
         }
         anyhow::bail!("Soundness hygiene violation in {}", dirty.join("; "));
     }
+    crate::phase_timing::record_active_span_since("split_and_hygiene", split_started);
 
     let mut dir_used_sorry = false;
     let mut dir_sorry_decls: Vec<String> = Vec::new();
     let mut dir_sorry_hits = 0usize;
     let mut dir_sorry_misses = 0usize;
     for sf in &sorry_files {
+        let sorry_prep_started = Instant::now();
         let mut sf_src =
             fs::read_to_string(sf).with_context(|| format!("Failed to read {}", sf.display()))?;
         let sf_canon = sf.canonicalize().unwrap_or_else(|_| sf.clone());
         let sf_deps = compute_imported_olean_interface_hashes(&sf_src, canon_dir, None);
         let sf_split = split_lean_source(&sf_src, &sf_deps);
         let sf_b3 = blake3::hash(sf_src.as_bytes()).to_hex().to_string();
+        crate::phase_timing::record_active_span_since("split_and_hygiene", sorry_prep_started);
         let sf_res = check_single_file(
             store,
             true,
@@ -193,6 +199,7 @@ pub(super) fn check_directory(
         }
     }
 
+    let cas_lookup_started = Instant::now();
     let cached_map = store.batch_get_theorem_shards(&all_shard_keys, "trusted")?;
 
     let mut total_hits = 0usize;
@@ -218,9 +225,11 @@ pub(super) fn check_directory(
             uncached_files.push((lf, src_blake3, src, file_uncached, file_lean_args));
         }
     }
+    crate::phase_timing::record_active_span_since("cas_lookup", cas_lookup_started);
 
     let deferred_verified_files = deferred_kernel_gate_files.len();
     if !deferred_kernel_gate_files.is_empty() {
+        let deferred_elab_started = Instant::now();
         let (def_env_vars, _) = resolve_lake_env(store, canon_dir)?;
         let def_lean_bin = resolve_lean_bin(canon_dir)?;
         for (lf, mut src, names, file_lean_args) in deferred_kernel_gate_files {
@@ -257,6 +266,7 @@ pub(super) fn check_directory(
                 );
             }
         }
+        crate::phase_timing::record_active_span_since("elaboration", deferred_elab_started);
     }
 
     let total_misses: usize = uncached_files.iter().map(|(_, _, _, u, _)| u.len()).sum();
@@ -322,16 +332,19 @@ pub(super) fn check_directory(
             );
             pack::warm_local_zygote_daemon_nonblocking(store, &fast_ev);
         }
-        crate::lake_build::recheck_dependents_if_nonlocal_with_options(
-            store,
-            canon_dir,
-            resolved_file,
-            allow_sorry,
-        )?;
+        crate::phase_timing::record_active_phase("dependent_recheck", || {
+            crate::lake_build::recheck_dependents_if_nonlocal_with_options(
+                store,
+                canon_dir,
+                resolved_file,
+                allow_sorry,
+            )
+        })?;
         return Ok(out_json);
     }
 
     let t0 = &prewarm_local_check_zygote(store, canon_dir, toolchain, t0)?;
+    let elab_started = Instant::now();
     let effective_jobs = default_parallel_jobs(jobs).min(uncached_files.len());
     let _staging_dir = store.fast_staging_dir();
     let pid = std::process::id();
@@ -804,11 +817,14 @@ pub(super) fn check_directory(
         };
         pack::warm_local_zygote_daemon_nonblocking(store, &ev);
     }
-    crate::lake_build::recheck_dependents_if_nonlocal_with_options(
-        store,
-        canon_dir,
-        resolved_file,
-        allow_sorry,
-    )?;
+    crate::phase_timing::record_active_span_since("elaboration", elab_started);
+    crate::phase_timing::record_active_phase("dependent_recheck", || {
+        crate::lake_build::recheck_dependents_if_nonlocal_with_options(
+            store,
+            canon_dir,
+            resolved_file,
+            allow_sorry,
+        )
+    })?;
     Ok(out_json)
 }

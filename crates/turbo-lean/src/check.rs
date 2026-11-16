@@ -424,8 +424,11 @@ pub(crate) fn run_check_command_inner(
             "`--emit-olean` cannot be combined with `--decl` (must check a full module file)"
         );
     }
+    let phase_timer = crate::phase_timing::active_phase_timer().unwrap_or_default();
+    let _phase_guard = crate::phase_timing::activate_phase_timer(&phase_timer);
+    let setup_started = Instant::now();
     let _lifecycle = crate::zygote::lifecycle_lock(false)?;
-    let t0 = Instant::now();
+    let t0 = phase_timer.started_at();
     let (canon_dir, mut resolved_file) = resolve_check_project_and_target(&file, &project_dir);
     crate::module_builder::try_project_lake_inputs_tag(&canon_dir)?;
     let toolchain = detect_toolchain(&canon_dir);
@@ -442,11 +445,12 @@ pub(crate) fn run_check_command_inner(
                 resolved_file.display()
             );
         }
+        phase_timer.record_span_since("setup", setup_started);
         return {
             let dir_res = check_directory(
                 store,
                 json_output,
-                emit_stdout,
+                emit_stdout && !json_output,
                 &kernel_prov,
                 &t0,
                 &file,
@@ -463,7 +467,12 @@ pub(crate) fn run_check_command_inner(
                     &canon_dir, &dir_files,
                 );
             }
-            dir_res
+            let mut out_json = dir_res?;
+            phase_timer.attach_to_json(&mut out_json);
+            if emit_stdout && json_output {
+                println!("{}", serde_json::to_string_pretty(&out_json)?);
+            }
+            Ok(out_json)
         };
     }
 
@@ -484,7 +493,9 @@ pub(crate) fn run_check_command_inner(
     let canon_resolved_initial = resolved_file
         .canonicalize()
         .unwrap_or_else(|_| resolved_file.clone());
+    phase_timer.record_span_since("setup", setup_started);
     if canon_resolved_initial.is_file() {
+        let hygiene_started = Instant::now();
         if !allow_sorry {
             let source = fs::read_to_string(&canon_resolved_initial)?;
             let hygiene = splitter::audit_hygiene(&splitter::strip_lean_comments(&source));
@@ -519,6 +530,8 @@ pub(crate) fn run_check_command_inner(
                 );
             }
         }
+        phase_timer.record_span_since("split_and_hygiene", hygiene_started);
+        let import_started = Instant::now();
         let fresh_res = crate::lake_build::ensure_project_imports_fresh_for_check_with_options(
             &canon_dir,
             std::slice::from_ref(&canon_resolved_initial),
@@ -544,7 +557,9 @@ pub(crate) fn run_check_command_inner(
             );
         }
         import_res?;
+        phase_timer.record_span_since("import_refresh", import_started);
     }
+    let split_started = Instant::now();
     let file_stat_tuple: Option<(i64, i64, i64)> = fs::metadata(&canon_resolved_initial)
         .ok()
         .map(|m| TurboStore::extract_file_stat_tuple(&m));
@@ -733,6 +748,7 @@ pub(crate) fn run_check_command_inner(
     };
 
     drop(held_split_lock);
+    phase_timer.record_span_since("split_and_hygiene", split_started);
 
     let decl_mode = decl.is_some();
     let res_or_err: Result<serde_json::Value> = (|| {
@@ -741,7 +757,7 @@ pub(crate) fn run_check_command_inner(
                 store,
                 db_warm_on_open,
                 json_output,
-                emit_stdout,
+                emit_stdout && !json_output,
                 &kernel_prov,
                 &t0,
                 &file,
@@ -769,7 +785,7 @@ pub(crate) fn run_check_command_inner(
                 store,
                 db_warm_on_open,
                 json_output,
-                emit_stdout && !emit_olean,
+                emit_stdout && !emit_olean && !json_output,
                 &kernel_prov,
                 &t0,
                 &file,
@@ -787,6 +803,7 @@ pub(crate) fn run_check_command_inner(
                 allow_sorry,
             )?;
             if emit_olean {
+                let emit_olean_started = Instant::now();
                 anyhow::ensure!(
                     !crate::lake_build::worktree_auto_link_disabled(&canon_dir),
                     "Worktree opt-out prevents `--emit-olean` from writing `.lake/build` artifacts in {}",
@@ -924,17 +941,14 @@ pub(crate) fn run_check_command_inner(
                     );
                     obj.insert("elapsed_ms".to_string(), serde_json::json!(total_ms));
                 }
-                if emit_stdout {
-                    if json_output {
-                        println!("{}", serde_json::to_string_pretty(&out_json)?);
-                    } else {
-                        println!(
-                            "[turbo-lean] VERIFIED & EMITTED OLEAN {} -> {} ({} ms)",
-                            file.display(),
-                            olean_path.display(),
-                            total_ms
-                        );
-                    }
+                phase_timer.record_span_since("emit_olean", emit_olean_started);
+                if emit_stdout && !json_output {
+                    println!(
+                        "[turbo-lean] VERIFIED & EMITTED OLEAN {} -> {} ({} ms)",
+                        file.display(),
+                        olean_path.display(),
+                        total_ms
+                    );
                 }
             }
             Ok(out_json)
@@ -947,8 +961,9 @@ pub(crate) fn run_check_command_inner(
             std::slice::from_ref(&canon_resolved_initial),
         );
     }
-    let res = res_or_err?;
+    let mut res = res_or_err?;
     if !emit_olean {
+        let recheck_started = Instant::now();
         let recheck_res = crate::lake_build::recheck_dependents_if_nonlocal_for_check(
             store,
             &canon_dir,
@@ -964,6 +979,11 @@ pub(crate) fn run_check_command_inner(
             );
         }
         recheck_res?;
+        phase_timer.record_span_since("dependent_recheck", recheck_started);
+    }
+    phase_timer.attach_to_json(&mut res);
+    if emit_stdout && json_output {
+        println!("{}", serde_json::to_string_pretty(&res)?);
     }
     Ok(res)
 }
