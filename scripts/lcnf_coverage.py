@@ -54,6 +54,13 @@ RESULTS_FILE = ROOT_DIR / "scripts" / "lcnf_coverage_results.json"
 RESULT_FIELDS = ("total_declarations", "proved", "lowered_unproved", "rejected")
 CON_LECHE_MODULE_PREFIXES = ("ConLeche.Kernel", "ConLeche.Cached", "ConLeche.Frontend", "ConLeche.Driver")
 CON_LECHE_EXCLUDED_MODULES = frozenset({"ConLeche.Kernel.NatOpPins"})
+CON_LECHE_EXCLUSION_REASON = (
+    "`ConLeche.Kernel.NatOpPins` is excluded because it declares `@[implemented_by]` "
+    "pins whose compiled bodies are compiler-generated wrappers rather than the "
+    "authored program text; lowering them would measure the wrapper, not the source. "
+    "The exclusion is by exact module name and is reported with the module count."
+)
+CON_LECHE_EXPECTED_MODULE_COUNT = 102
 _LIVE_AUDIT_CACHE: dict[str, dict[str, Any]] = {}
 _CON_LECHE_CACHE: dict[str, dict[str, Any]] = {}
 
@@ -950,6 +957,11 @@ def measure_con_leche(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
                 f"`lake build` output directory of commit {PINNED_CON_LECHE_REV}; this script "
                 "does not fetch or build that repository."
             ),
+            "expected_module_count": CON_LECHE_EXPECTED_MODULE_COUNT,
+            "exclusion": {
+                "excluded_modules": sorted(CON_LECHE_EXCLUDED_MODULES),
+                "reason": CON_LECHE_EXCLUSION_REASON,
+            },
         }
         _CON_LECHE_CACHE[cache_key] = result
         return result
@@ -968,14 +980,41 @@ def measure_con_leche(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
                 f"prebuilt con-leche tree at `{olean_root}` is revision `{rev}`, not the pinned "
                 f"`{PINNED_CON_LECHE_REV}`"
             ),
+            "expected_module_count": CON_LECHE_EXPECTED_MODULE_COUNT,
+            "exclusion": {
+                "excluded_modules": sorted(CON_LECHE_EXCLUDED_MODULES),
+                "reason": CON_LECHE_EXCLUSION_REASON,
+            },
         }
         _CON_LECHE_CACHE[cache_key] = result
         return result
     modules = _con_leche_modules(olean_root)
+    exclusion = {
+        "excluded_modules": sorted(CON_LECHE_EXCLUDED_MODULES),
+        "reason": CON_LECHE_EXCLUSION_REASON,
+    }
     if not modules:
         result = {
             "measurement_source": "not_measured",
             "reason": f"no `ConLeche.*`/`Main` `.olean` modules under `{olean_root}`",
+            "module_count": 0,
+            "expected_module_count": CON_LECHE_EXPECTED_MODULE_COUNT,
+            "exclusion": exclusion,
+        }
+        _CON_LECHE_CACHE[cache_key] = result
+        return result
+    if len(modules) != CON_LECHE_EXPECTED_MODULE_COUNT:
+        result = {
+            "measurement_source": "not_measured",
+            "reason": (
+                f"measured module set under `{olean_root}` has {len(modules)} modules, but the "
+                f"pinned revision {PINNED_CON_LECHE_REV} has {CON_LECHE_EXPECTED_MODULE_COUNT} "
+                f"after excluding {', '.join(sorted(CON_LECHE_EXCLUDED_MODULES))} "
+                f"({CON_LECHE_EXCLUSION_REASON}); refusing to measure a partial or stale tree"
+            ),
+            "module_count": len(modules),
+            "expected_module_count": CON_LECHE_EXPECTED_MODULE_COUNT,
+            "exclusion": exclusion,
         }
         _CON_LECHE_CACHE[cache_key] = result
         return result
@@ -989,6 +1028,8 @@ def measure_con_leche(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
         "commit_sha": PINNED_CON_LECHE_REV,
         "olean_root": str(olean_root),
         "module_count": len(modules),
+        "expected_module_count": CON_LECHE_EXPECTED_MODULE_COUNT,
+        "exclusion": exclusion,
         "total_declarations": total,
         "proved": proved,
         "lowered_unproved": unproved,
@@ -1367,6 +1408,8 @@ class TestLcnfCoverage(unittest.TestCase):
                     sys.modules[__name__], "_run_audit_driver", return_value=(100, 7, 11, 82)
                 ) as run, mock.patch.object(
                     sys.modules[__name__], "_git_head", return_value=PINNED_CON_LECHE_REV
+                ), mock.patch.object(
+                    sys.modules[__name__], "CON_LECHE_EXPECTED_MODULE_COUNT", 2
                 ):
                     corp = measure_con_leche(ROOT_DIR)
             finally:
@@ -1380,6 +1423,10 @@ class TestLcnfCoverage(unittest.TestCase):
             (100, 7, 11, 82),
         )
         self.assertEqual(corp["commit_sha"], PINNED_CON_LECHE_REV)
+        self.assertEqual(corp["module_count"], 2)
+        self.assertEqual(corp["expected_module_count"], 2)
+        self.assertEqual(corp["exclusion"]["excluded_modules"], ["ConLeche.Kernel.NatOpPins"])
+        self.assertTrue(corp["exclusion"]["reason"])
         run.assert_called_once()
         # NatOpPins is excluded by name from the measured module set.
         self.assertNotIn("ConLeche.Kernel.NatOpPins", run.call_args.args[1])
