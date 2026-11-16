@@ -22,6 +22,7 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parent
 ROOT = SCRIPTS_DIR.parent
 CONTRACT_SH = SCRIPTS_DIR / "verify_roadmap_contract.sh"
+CONTRACT_D = SCRIPTS_DIR / "contract.d"
 
 # The gate headers exactly as the unmodified script prints them, in order.
 # Ten numbered gates plus the "[2b/10]" sub-gate of gate 2.
@@ -54,14 +55,38 @@ def echo_header_lines(text):
     return [m.group(1) for m in ECHO_HEADER_RE.finditer(text)]
 
 
+def effective_header_lines():
+    """The header lines the run prints, in order: the runner's own echoes
+    before the sourcing loop (the preamble has none today), then the echoes
+    of each contract.d fragment in the lexicographic order the runner
+    sources them, then the runner's echoes after the loop (the final
+    summary line)."""
+    text = CONTRACT_SH.read_text()
+    loop_match = re.search(r'^for \w+ in "\$ROOT_DIR"/scripts/contract\.d/\*\.sh; do$', text, re.MULTILINE)
+    if loop_match is None or "scripts/contract.d/*.sh" not in text:
+        # Pre-HY1 layout: the gates (and the summary) are all in the runner.
+        return echo_header_lines(text)
+    before, after = text[: loop_match.start()], text[loop_match.start():]
+    lines = echo_header_lines(before)
+    if CONTRACT_D.is_dir():
+        for fragment in sorted(CONTRACT_D.glob("*.sh")):
+            lines.extend(echo_header_lines(fragment.read_text()))
+    lines.extend(echo_header_lines(after))
+    return lines
+
+
 class ContractScriptShape(unittest.TestCase):
+    def test_runner_sources_all_fragments(self):
+        text = CONTRACT_SH.read_text()
+        self.assertIn("scripts/contract.d/*.sh", text, "runner must source every contract.d fragment")
+        self.assertIn("source", text)
+
     def test_gate_headers_present_in_order(self):
-        printed = echo_header_lines(CONTRACT_SH.read_text())
-        gate_headers = [line for line in printed if GATE_HEADER_RE.match(line)]
-        self.assertEqual(gate_headers, EXPECTED_GATE_HEADERS)
+        printed = [line for line in effective_header_lines() if GATE_HEADER_RE.match(line)]
+        self.assertEqual(printed, EXPECTED_GATE_HEADERS)
 
     def test_final_summary_line_is_last_header_line(self):
-        printed = echo_header_lines(CONTRACT_SH.read_text())
+        printed = effective_header_lines()
         self.assertTrue(printed, "no === echo lines found at all")
         self.assertTrue(FINAL_LINE_RE.match(printed[-1]), f"last === echo line is {printed[-1]!r}")
         self.assertEqual(printed[-1], EXPECTED_FINAL_LINE)
@@ -69,7 +94,7 @@ class ContractScriptShape(unittest.TestCase):
         self.assertEqual(finals, [EXPECTED_FINAL_LINE], "final summary line must appear exactly once")
 
     def test_no_unexpected_gate_header_shape(self):
-        printed = echo_header_lines(CONTRACT_SH.read_text())
+        printed = effective_header_lines()
         for line in printed:
             self.assertTrue(
                 GATE_HEADER_RE.match(line) or FINAL_LINE_RE.match(line),
@@ -79,6 +104,11 @@ class ContractScriptShape(unittest.TestCase):
     def test_any_gate_failure_fails_the_run(self):
         text = CONTRACT_SH.read_text()
         self.assertIn("set -euo pipefail", text, "contract script must abort on the first failing gate")
+        for fragment in sorted(CONTRACT_D.glob("*.sh")) if CONTRACT_D.is_dir() else []:
+            self.assertNotIn(
+                "set -e", fragment.read_text(),
+                f"{fragment.name} must not reset shell options behind the runner's back",
+            )
 
 
 def contract_binaries_available():
