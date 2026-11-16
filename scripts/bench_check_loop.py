@@ -345,6 +345,16 @@ def compare_run(baseline, res):
         verdict["verdict"] = "measurement_failed"
         return verdict
     verdict["pfr_status"] = res["workloads"]["pfr_more_ruzsa_dist"]["status"]
+    # An unexpected success of a blocked workload is a stale expectation no
+    # matter whether a comparison happens: it must exit 3 even without a
+    # baseline, and even when the comparison would be skipped.
+    unexpected = sorted(
+        wid for wid, w in res["workloads"].items()
+        if w.get("expected_status") == "blocked" and w.get("status") == "unexpectedly_passing")
+    if unexpected:
+        verdict["unexpected_successes"] = unexpected
+        verdict["verdict"] = "stale_expectation"
+        return verdict
     if baseline is None:
         verdict["verdict"] = "not_compared"
         verdict["skipped_reason"] = "no baseline given or found"
@@ -566,7 +576,10 @@ def repo_commit(git_bin: str, repo: Path):
     try:
         rev = subprocess.check_output([git_bin, "-C", str(repo), "rev-parse", "HEAD"],
                                       text=True, stderr=subprocess.DEVNULL, timeout=10).strip()
-        dirty = subprocess.run([git_bin, "-C", str(repo), "status", "--porcelain"],
+        # Tracked changes only: untracked scratch (e.g. __pycache__) must not
+        # make a clean tree look dirty, but a leftover edit always does.
+        dirty = subprocess.run([git_bin, "-C", str(repo), "status", "--porcelain",
+                                "--untracked-files=no"],
                                capture_output=True, text=True, timeout=10).stdout.strip() != ""
         return rev, dirty
     except (OSError, subprocess.SubprocessError):
@@ -615,6 +628,16 @@ def parse_check_json(stdout: str):
     return None
 
 
+def diff_olean_inventory(before, after):
+    """Return (deleted, created) path sets between two .olean inventories.
+
+    A count comparison would miss a deletion offset by a creation; the
+    path-level diff does not.
+    """
+    before, after = set(before or ()), set(after or ())
+    return before - after, after - before
+
+
 def classify_error(returncode, parsed, stderr):
     text = ""
     if parsed:
@@ -648,6 +671,31 @@ class Runner:
         self.scratch = Path(tempfile.mkdtemp(prefix="m1-bench-")).resolve()
         self.revs = {}
         self.oleans_guard_violated = False
+        self._edited_path = None      # source file currently holding a bench edit
+        self._edited_original = None  # its untouched bytes
+
+    def remember_edit(self, path: Path, original: bytes):
+        self._edited_path, self._edited_original = path, original
+
+    def clear_edit(self, path: Path, original: bytes):
+        """Restore the source and forget the pending edit (idempotent)."""
+        try:
+            path.write_bytes(original)
+        except OSError as e:
+            print(f"warning: could not restore {path}: {e}", file=sys.stderr)
+        if self._edited_path == path:
+            self._edited_path, self._edited_original = None, None
+
+    def restore_pending_edit(self):
+        if self._edited_path is not None:
+            path, original = self._edited_path, self._edited_original
+            self._edited_path, self._edited_original = None, None
+            try:
+                path.write_bytes(original)
+                print(f"\nrestored {path} after signal", file=sys.stderr, flush=True)
+            except OSError as e:
+                print(f"warning: could not restore {path} after signal: {e}",
+                      file=sys.stderr, flush=True)
 
     # -- paths ------------------------------------------------------------
     def wl_scratch(self, wid):
@@ -713,6 +761,13 @@ class Runner:
             for _p in root.rglob("*.olean"):
                 n += 1
         return n
+
+    def olean_inventory(self, w):
+        """Set of dependency-artifact paths (relative to .lake/packages)."""
+        root = self.proj_dir(w) / ".lake" / "packages"
+        if not root.is_dir():
+            return set()
+        return {str(p.relative_to(root)) for p in root.rglob("*.olean")}
 
     def assert_source_clean(self, w):
         inside = subprocess.run([self.git_bin, "-C", str(self.proj_dir(w)),
@@ -802,16 +857,17 @@ class Runner:
                     s, e, _line = locate_decl_block(src, w["decl"], w.get("line"))
                     edited = src[:s] + insert_bench_have(src[s:e], i) + src[e:]
                     src_path.write_text(edited)
+                    self.remember_edit(src_path, original)
                     try:
                         r = self.run_check(w, cache, home, staging, no_daemon=False)
                     finally:
-                        src_path.write_bytes(original)
+                        self.clear_edit(src_path, original)
                     if i < 0:
                         continue  # settling run: first edit after the cache-hit
                                   # phase pays a one-off penalty; discard it
                     edit_trials.append(r)
             finally:
-                src_path.write_bytes(original)
+                self.clear_edit(src_path, original)
             runs, covs, tool_covs, edit_status, edit_phases, edit_psis, edit_failed = \
                 self.split_trials(edit_trials)
             warm_edit = mode_result(runs, covs, edit_status, phase_dicts=edit_phases,
@@ -826,8 +882,14 @@ class Runner:
             self.assert_source_clean(w)
 
     def run_pfr_workload(self, w):
-        runs, covs, statuses, errors, psis = [], [], [], set(), []
-        exit_code = None
+        """Fail-fast probe of a blocked workload.
+
+        Every probe's exit code and failure class is checked (not just the
+        last); the dependency-artifact inventory is compared path by path
+        before/after each probe inside a `finally`, so a deletion offset by a
+        creation is still caught.
+        """
+        probe_exits, probe_classes, psis, runs, statuses = [], set(), [], [], []
         stderr_excerpt = ""
         total = self.warmups + self.trials
         for i in range(total):
@@ -835,44 +897,51 @@ class Runner:
             cache, home, staging = d / "cache", d / "home", d / "staging"
             for p in (cache, home, staging):
                 p.mkdir(parents=True)
-            oleans_before = self.count_oleans(w)
-            r = self.run_check(w, cache, home, staging, no_daemon=True)
-            oleans_after = self.count_oleans(w)
-            if oleans_after < oleans_before:
-                self.oleans_guard_violated = True
-                raise BenchEnvError(
-                    f"SAFETY: PFR check deleted {oleans_before - oleans_after} prebuilt "
-                    ".olean files from the checkout; aborting before more damage. "
-                    "This must never happen (--no-auto-worktree-link is mandatory).")
+            inv_before = self.olean_inventory(w)
+            try:
+                r = self.run_check(w, cache, home, staging, no_daemon=True)
+            finally:
+                missing, extra = diff_olean_inventory(inv_before, self.olean_inventory(w))
+                if missing or extra:
+                    self.oleans_guard_violated = True
+                    raise BenchEnvError(
+                        f"SAFETY: PFR probe changed the dependency .olean inventory "
+                        f"({len(missing)} deleted, {len(extra)} created, e.g. "
+                        f"{sorted(missing | extra)[:3]}); aborting before more damage. "
+                        "This must never happen (--no-auto-worktree-link is mandatory).")
             shutil.rmtree(d, ignore_errors=True)
+            probe_exits.append(r["exit_code"])
+            probe_classes.add(classify_error(r["exit_code"], r.get("json"), r["stderr"]))
+            psis.append([r.get("psi_before") or {}, r.get("psi_after") or {}])
             if i >= self.warmups:
                 runs.append(r["external_wall_ms"])
                 statuses.append(f"exit_{r['exit_code']}")
-                pt = (r.get("json") or {}).get("phase_timings") or {}
-                covs.append(pt.get("coverage_ratio", 0.0))
-                errors.add(classify_error(r["exit_code"], r.get("json"), r["stderr"]))
-                exit_code = r["exit_code"]
-                psis.append([r.get("psi_before") or {}, r.get("psi_after") or {}])
                 if not stderr_excerpt and r["stderr"]:
                     stderr_excerpt = r["stderr"][:500]
-        m = mode_result(runs, covs, statuses, psi_lists=psis)
-        m["error_classes"] = sorted(errors)
+        m = mode_result(runs, [], statuses, psi_lists=psis)
+        m["error_classes"] = sorted(probe_classes)
         if stderr_excerpt:
             m["stderr_excerpt"] = stderr_excerpt
-        return m, exit_code, sorted(errors)[0] if errors else None
+        all_failed = bool(probe_exits) and all(e != 0 for e in probe_exits)
+        entry = {
+            "status": "blocked_as_expected" if all_failed else "unexpectedly_passing",
+            "expected_status": "blocked",
+            "exit_code": probe_exits[-1] if probe_exits else None,
+            "probe_exit_codes": probe_exits,
+            "error_class": sorted(probe_classes)[0] if probe_classes else None,
+            "repo": w["repo"], "file": w["file"], "decl": w["decl"],
+            "modes": {"cold_no_daemon": m},
+        }
+        print(f"  blocked: probe_exits={probe_exits} error_classes={sorted(probe_classes)} "
+              f"median={m['median_ms']}ms", flush=True)
+        return entry
 
     # -- whole workloads ---------------------------------------------------
     def run_workload(self, w):
         wid = w["id"]
         print(f"[{utc_now_iso()}] workload {wid} ...", flush=True)
         if w["expected_status"] == "blocked":
-            m, exit_code, err_class = self.run_pfr_workload(w)
-            entry = blocked_workload_result(exit_code, err_class,
-                                            median_ms=m["median_ms"])
-            entry.update({"repo": w["repo"], "file": w["file"], "decl": w["decl"],
-                          "modes": {"cold_no_daemon": m}})
-            print(f"  blocked: exit={exit_code} error_class={err_class} "
-                  f"median={m['median_ms']}ms", flush=True)
+            entry = self.run_pfr_workload(w)
             return entry
         cold = self.run_cold_mode(w)
         print(f"  cold median={cold['median_ms']}ms rel_spread={cold['rel_spread']}", flush=True)
@@ -896,6 +965,26 @@ class Runner:
 
 
 # ------------------------------------------------------------------- main
+
+def install_signal_restore(runner: Runner):
+    """On SIGTERM/SIGINT, restore the edited workload source before exiting.
+
+    The `finally` in run_warm_modes does not run when the default SIGTERM
+    action kills the process, so the edit would be left behind for the next
+    run to trip over (check_pinned_revs refuses dirty checkouts for exactly
+    that reason). The handler restores first, then exits 128+signum.
+    """
+    def handler(signum, _frame):
+        runner.restore_pending_edit()
+        raise SystemExit(128 + signum)
+    for sig_name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):
+                pass  # not the main thread (tests)
+
 
 def validate_environment(args):
     for var, expected in REQUIRED_ENV.items():
@@ -938,8 +1027,13 @@ def require_quiet_node(args):
 
 def check_pinned_revs(runner: Runner):
     for repo, expected in PINNED_REVS.items():
-        rev, _dirty = repo_commit(runner.git_bin, runner.dirs[repo])
+        rev, dirty = repo_commit(runner.git_bin, runner.dirs[repo])
         runner.revs[repo] = rev
+        if rev is not None and dirty:
+            raise BenchEnvError(
+                f"{repo} checkout {runner.dirs[repo]} has uncommitted tracked changes; "
+                "commit or restore them first. A dirty checkout can hide an edit left "
+                "behind by a killed run and invalidates the recorded provenance.")
         if rev != expected and not runner.args.skip_rev_check:
             raise BenchEnvError(
                 f"{repo} checkout is at {rev}, benchmark is pinned to {expected}; "
@@ -1030,6 +1124,7 @@ def main(argv=None):
 
     git_bin, git_human = validate_environment(args)
     runner = Runner(args)
+    install_signal_restore(runner)
     t_start = time.monotonic()
     try:
         load_at_start = require_quiet_node(args)
