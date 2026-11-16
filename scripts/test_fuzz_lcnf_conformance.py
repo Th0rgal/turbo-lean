@@ -13,6 +13,7 @@ end-to-end mutation test, which skips when engines are unavailable.
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fuzz_lcnf_conformance as fuzzer
@@ -25,6 +26,64 @@ N = 64
 def _alias_programs() -> list[dict]:
     programs = [fuzzer.build_program(seed) for seed in range(N)]
     return [p for p in programs if fuzzer.program_contains_alias(p)]
+
+
+class AliasSeedRuleExactness(unittest.TestCase):
+    """The allocation rule itself, pinned exactly - a floor cannot catch a
+    regression that still clears it (e.g. 1 seed in 7 instead of 1 in 6
+    yields 1428 >= 1250 at 10k seeds), so the exact seed set, the shared and
+    exclusive split, and the boundary seeds are asserted against the rule
+    computed independently here (not by calling the generator's constants).
+    """
+
+    NS = 10_000
+
+    @staticmethod
+    def _expected_sets(n: int) -> tuple[set[int], set[int]]:
+        # Rule (C4x): every seed > 3 with seed % 6 == 0 takes the alias tier;
+        # shared when seed // 6 is even, exclusive when odd.
+        expected_all = {s for s in range(4, n) if s % 6 == 0}
+        expected_shared = {s for s in expected_all if (s // 6) % 2 == 0}
+        expected_exclusive = expected_all - expected_shared
+        return expected_shared, expected_exclusive
+
+    def _observed(self, n: int) -> tuple[set[int], set[int]]:
+        observed_shared: set[int] = set()
+        observed_exclusive: set[int] = set()
+        for s in range(n):
+            p = fuzzer.build_program(s)
+            if fuzzer.program_contains_alias(p):
+                (observed_shared if p["alias_shared"] else observed_exclusive).add(s)
+        return observed_shared, observed_exclusive
+
+    def test_exact_alias_seed_set_and_shared_exclusive_split_at_10k(self):
+        exp_sh, ex_ex = self._expected_sets(self.NS)
+        obs_sh, obs_ex = self._observed(self.NS)
+        self.assertEqual(obs_sh, exp_sh)
+        self.assertEqual(obs_ex, ex_ex)
+        # Reviewer's independent count: 1,666 of 10,000 (833 shared / 833 exclusive).
+        self.assertEqual(len(obs_sh) + len(obs_ex), 1666)
+        self.assertEqual(len(obs_sh), 833)
+        self.assertEqual(len(obs_ex), 833)
+
+    def test_alias_boundary_seeds(self):
+        for s in (0, 1, 2, 3, 4, 5, 7, 11, 9997, 9998, 9999):
+            self.assertFalse(fuzzer.program_contains_alias(fuzzer.build_program(s)), f"seed {s}")
+        self.assertFalse(fuzzer.build_program(6)["alias_shared"], "6//6==1 odd -> exclusive")
+        self.assertTrue(fuzzer.build_program(12)["alias_shared"], "12//6==2 even -> shared")
+        self.assertFalse(fuzzer.build_program(9990)["alias_shared"], "1665 odd -> exclusive")
+        self.assertTrue(fuzzer.build_program(9996)["alias_shared"], "1666 even -> shared")
+
+    def test_mutated_allocation_rule_is_detected(self):
+        """A wrong distribution must fail the exact assertions above."""
+        expected_shared, expected_exclusive = self._expected_sets(200)
+        with mock.patch.object(fuzzer, "ALIAS_SEED_MOD", 7):
+            obs_sh, obs_ex = self._observed(200)
+        self.assertNotEqual(obs_sh | obs_ex, expected_shared | expected_exclusive,
+                            "a 1-in-7 mutant went undetected by the exact seed-set assertion")
+        self.assertNotEqual(obs_sh, expected_shared)
+        self.assertNotEqual(obs_ex, expected_exclusive)
+        self.assertEqual(obs_sh | obs_ex, {s for s in range(4, 200) if s % 7 == 0 and s > 3})
 
 
 class AliasTierGeneration(unittest.TestCase):
