@@ -56,8 +56,16 @@ fi
 # Gates live in scripts/contract.d/ as per-gate fragments (HY1); they are
 # sourced in lexicographic order into this shell, so they share the variables
 # above and any failing command aborts the whole run exactly as before.
+# The fragment list is expanded inside a subshell that exports LC_ALL=C, so
+# the order cannot depend on the caller's locale; the gates themselves still
+# run under whatever locale the caller set.
 
-for contract_fragment in "$ROOT_DIR"/scripts/contract.d/*.sh; do
+contract_fragments=()
+while IFS= read -r contract_fragment; do
+  contract_fragments+=("$contract_fragment")
+done < <(cd "$ROOT_DIR" && export LC_ALL=C && printf '%s\n' scripts/contract.d/*.sh)
+
+for contract_fragment in "${contract_fragments[@]}"; do
   source "$contract_fragment"
 done
 

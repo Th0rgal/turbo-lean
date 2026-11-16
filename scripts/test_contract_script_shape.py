@@ -57,29 +57,97 @@ def echo_header_lines(text):
 
 def effective_header_lines():
     """The header lines the run prints, in order: the runner's own echoes
-    before the sourcing loop (the preamble has none today), then the echoes
-    of each contract.d fragment in the lexicographic order the runner
-    sources them, then the runner's echoes after the loop (the final
-    summary line)."""
+    before the fragment-ordering line (the preamble has none today), then
+    the echoes of each contract.d fragment in the order the runner sources
+    them, then the runner's echoes after the loop (the final summary line)."""
     text = CONTRACT_SH.read_text()
-    loop_match = re.search(r'^for \w+ in "\$ROOT_DIR"/scripts/contract\.d/\*\.sh; do$', text, re.MULTILINE)
-    if loop_match is None or "scripts/contract.d/*.sh" not in text:
+    order_line_index = next(
+        (i for i, ln in enumerate(text.splitlines()) if "contract.d/*.sh" in ln),
+        None,
+    )
+    if order_line_index is None:
         # Pre-HY1 layout: the gates (and the summary) are all in the runner.
         return echo_header_lines(text)
-    before, after = text[: loop_match.start()], text[loop_match.start():]
-    lines = echo_header_lines(before)
+    lines = text.splitlines()
+    before, after = "\n".join(lines[:order_line_index]), "\n".join(lines[order_line_index + 1 :])
+    result = echo_header_lines(before)
     if CONTRACT_D.is_dir():
         for fragment in sorted(CONTRACT_D.glob("*.sh")):
-            lines.extend(echo_header_lines(fragment.read_text()))
-    lines.extend(echo_header_lines(after))
-    return lines
+            result.extend(echo_header_lines(fragment.read_text()))
+    result.extend(echo_header_lines(after))
+    return result
+
+
+def runner_ordering_command():
+    """The runner's one-line fragment-expansion mechanism, extracted from the
+    `< <(...)` process substitution, ready to run standalone with ROOT_DIR in
+    the environment. Raises if the runner does not have the expected shape."""
+    for line in CONTRACT_SH.read_text().splitlines():
+        if "contract.d/*.sh" in line and "< <(" in line:
+            inner = line.split("< <(", 1)[1].strip()
+            if not inner.endswith(")"):
+                raise AssertionError(f"ordering line is not a single < <(...) substitution: {line!r}")
+            return inner[:-1]
+    raise AssertionError("runner has no single-line < <(...) fragment-ordering mechanism")
+
+
+def installed_locales():
+    try:
+        return set(subprocess.run(["locale", "-a"], capture_output=True, text=True, timeout=10).stdout.split())
+    except (OSError, subprocess.SubprocessError):
+        return set()
+
+
+NON_C_LOCALE_CANDIDATES = ("en_US.UTF-8", "en_US.utf8", "C.UTF-8")
+
+
+def non_c_locale():
+    """A locale whose collation differs from C, if one is installed."""
+    installed = installed_locales()
+    for candidate in NON_C_LOCALE_CANDIDATES:
+        if candidate in installed and candidate != "C":
+            return candidate
+    return None
 
 
 class ContractScriptShape(unittest.TestCase):
     def test_runner_sources_all_fragments(self):
         text = CONTRACT_SH.read_text()
-        self.assertIn("scripts/contract.d/*.sh", text, "runner must source every contract.d fragment")
-        self.assertIn("source", text)
+        if not CONTRACT_D.is_dir():
+            # Pre-HY1 layout: the gates are the runner's own text.
+            self.assertNotIn("contract.d", text)
+            return
+        self.assertIn("scripts/contract.d/*.sh", text, "runner must expand every contract.d fragment")
+        self.assertIn("source", text, "runner must source the fragments into its own shell")
+
+    def test_fragment_ordering_is_locale_independent(self):
+        if not CONTRACT_D.is_dir():
+            self.skipTest("pre-HY1 layout: fragments are inline in the runner")
+        mechanism = runner_ordering_command()
+        self.assertIn(
+            "LC_ALL=C", mechanism,
+            "the fragment expansion must pin the collation (LC_ALL=C) itself",
+        )
+        other = non_c_locale()
+        if other is None:
+            self.skipTest("no non-C locale installed; the mechanism assertion above is the check")
+        env = {**os.environ, "ROOT_DIR": str(ROOT)}
+        run = lambda lc: subprocess.run(
+            ["bash", "-c", mechanism], env={**env, "LC_ALL": lc},
+            capture_output=True, text=True, timeout=30,
+        )
+        under_c, under_other = run("C"), run(other)
+        self.assertEqual(under_c.returncode, 0, under_c.stderr)
+        self.assertEqual(under_other.returncode, 0, under_other.stderr)
+        self.assertEqual(
+            under_other.stdout, under_c.stdout,
+            f"fragment order differs under LC_ALL={other}; the expansion must pin LC_ALL=C itself",
+        )
+        self.assertEqual(
+            [Path(p).name for p in under_c.stdout.split()],
+            sorted(p.name for p in CONTRACT_D.glob("*.sh")),
+            "the pinned-collation expansion must yield the C-collated fragment order",
+        )
 
     def test_gate_headers_present_in_order(self):
         printed = [line for line in effective_header_lines() if GATE_HEADER_RE.match(line)]
