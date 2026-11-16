@@ -237,7 +237,7 @@ def gen_expr(rng: Rng, depth: int) -> tuple[dict[str, Any], int]:
     return gen_scalar_tree(rng, depth)
 
 
-ALIAS_SEED_MOD = 7  # TEMPORARY MUTANT for the red-distribution evidence commit; restored to 6 next commit
+ALIAS_SEED_MOD = 6
 ALIAS_FLOOR_RATIO = 8
 ALIAS_PREAMBLE = """inductive FuzzPacket where
   | pkt : (UInt64 × UInt64) → (UInt64 × UInt64) → FuzzPacket
