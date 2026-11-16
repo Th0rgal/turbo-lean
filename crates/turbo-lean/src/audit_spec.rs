@@ -5113,6 +5113,64 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
     }
 
     #[test]
+    fn audit_spec_toml_typo_key_wrappers_fail_closed() {
+        let typo_toml = "[audit_spec]\npolicy = \"default\"\nreject_identity_stub = true\n";
+        // The convenience parse wrapper must fail closed on the same typo key
+        // instead of silently flattening the error into `None` (fail-open).
+        let wrapper = std::panic::catch_unwind(|| {
+            AuditSpecPolicyConfig::parse_config_str(typo_toml)
+        });
+        match wrapper {
+            Ok(Some(cfg)) => panic!("typo-key config silently parsed as {cfg:?}"),
+            Ok(None) => {
+                panic!("parse_config_str silently ignored a typo key in [audit_spec]")
+            }
+            Err(payload) => {
+                let msg = panic_message(&payload);
+                assert!(
+                    msg.contains("reject_identity_stub"),
+                    "fail-closed error must name the typo key, got: {msg}"
+                );
+            }
+        }
+
+        // The file-based convenience loader must not silently degrade a
+        // project config with a typo key to the default policy.
+        let root = std::env::temp_dir().join(format!(
+            "turbo_a1_audit_spec_typo_{}_{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let spec = root.join("Spec.lean");
+        fs::write(&spec, "theorem good_spec (n : Nat) (h : n > 0) : n >= 1 := by omega\n").unwrap();
+        fs::write(root.join("turbo-lean.toml"), typo_toml).unwrap();
+        let loaded = std::panic::catch_unwind(|| {
+            AuditSpecPolicyConfig::load_for_target(&spec, None, None, &[], &[])
+        });
+        match loaded {
+            Ok(cfg) => {
+                let _ = fs::remove_dir_all(&root);
+                panic!(
+                    "load_for_target silently degraded a typo'd turbo-lean.toml to default policy {:?}",
+                    cfg.policy
+                )
+            }
+            Err(_) => {}
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+        payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("")
+            .to_string()
+    }
+
+    #[test]
     fn audit_spec_project_toml_near_miss_table_name_fails_closed() {
         for name in ["audit_specs", "audit-spce", "auditspecs"] {
             let err = AuditSpecPolicyConfig::try_parse_config_str(&format!("[{name}]\nx = 1\n"))
