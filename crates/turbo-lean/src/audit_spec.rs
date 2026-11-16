@@ -5162,6 +5162,22 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
     }
 
     #[test]
+    fn audit_spec_dedicated_empty_config_fails_closed() {
+        let err = AuditSpecPolicyConfig::try_parse_config_str_mode("", true).expect_err(
+            "an empty dedicated audit-spec config file must fail closed instead of being silently skipped during discovery",
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("empty"), "clear error must say the config is empty: {msg}");
+    }
+
+    #[test]
+    fn audit_spec_project_empty_config_still_yields_none() {
+        let cfg = AuditSpecPolicyConfig::try_parse_config_str_mode("", false)
+            .expect("an empty project turbo-lean.toml without `[audit_spec]` stays valid");
+        assert!(cfg.is_none(), "no `[audit_spec]` table means no config");
+    }
+
+    #[test]
     fn audit_spec_path_rules_valid_map_and_list_still_accepted() {
         let map_form = "[audit_spec]\n[audit_spec.path_rules.\"src/**\"]\nforbid_decl_kinds = [\"axiom\"]\n";
         let cfg = AuditSpecPolicyConfig::try_parse_config_str(map_form)
