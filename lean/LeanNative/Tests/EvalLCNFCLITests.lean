@@ -18,6 +18,19 @@ namespace LeanNative.Tests.EvalLCNFCLITests
 
 open LeanNative.Driver.EvalLCNFCLI
 
+/-- Run the two reference evaluators on a kernel-opaque `opaque` constant: Lean's compiled
+    evaluator must succeed while kernel reduction fails, proving which engine produced the value. -/
+private def kernelOpaqueCompiledReferenceProbeIO :
+    IO (Except String CanonicalVal × Except String CanonicalVal) :=
+  open Lean in
+  withElaboratedSnippet "<CompiledRefProbe>"
+    "namespace CompiledRefProbe\nopaque probeSum : UInt64 := UInt64.ofNat (List.range 500).sum\nend CompiledRefProbe\n"
+    `CompiledRefProbe do
+    let app := mkConst `CompiledRefProbe.probeSum
+    let compiled ← Prod.fst <$> (evalAndDecodeCompiledLeanM .x86_64 .uint64 app).run {} {}
+    let kernel ← Prod.fst <$> (evalAndDecodeKernelReductionM .x86_64 .uint64 app).run {} {}
+    pure (compiled, kernel)
+
 #eval show IO Unit from do
   -- 1. Baseline corpus run
   let rep ← runBuiltinCorpusIO
@@ -74,5 +87,30 @@ open LeanNative.Driver.EvalLCNFCLI
   let rc ← LeanNative.Driver.EvalLCNFCLI.run ["--self-test"]
   if rc != 0 then
     throw <| IO.userError s!"EvalLCNFCLI --self-test failed with exit code {rc}"
+
+  -- 5. Reviewer point B1, evidence half: the compiled-IR reference really executes Lean's
+  --    compiled evaluator. `CompiledRefProbe.probeSum` is an `opaque` constant, so kernel
+  --    reduction cannot unfold it, while Lean's compiled evaluator computes the exact value
+  --    124750 — the reference can be neither kernel reduction nor a stub.
+  let (compiledRef, kernelRef) ← kernelOpaqueCompiledReferenceProbeIO
+  match compiledRef, kernelRef with
+  | .ok cv, .error _ =>
+    if cv != CanonicalVal.uint64 124750 then
+      throw <| IO.userError s!"B1: compiled reference returned wrong value on kernel-opaque probe: {repr cv}"
+  | _, _ =>
+    throw <| IO.userError s!"B1: expected compiled-reference success and kernel-reduction failure on the kernel-opaque probe, got compiled={repr compiledRef} kernel={repr kernelRef}"
+
+  -- 6. Reviewer point B1, failing half: the driver module must reach the reference without
+  --    `@[implemented_by]` opaque wrappers or `unsafe` reference declarations — the repository
+  --    hygiene & axiom gate (`turbo-lean ci-verify`) refuses both in changed source files.
+  let driverCandidates ← (["LeanNative/Driver/EvalLCNFCLI.lean", "lean/LeanNative/Driver/EvalLCNFCLI.lean"] :
+      List System.FilePath).filterM (fun p => p.pathExists)
+  let some driverPath := driverCandidates.head? |
+    throw <| IO.userError "B1: could not locate EvalLCNFCLI.lean source for the hygiene scan"
+  let driverSrc ← IO.FS.readFile driverPath
+  if driverSrc.contains "@[implemented_by" then
+    throw <| IO.userError "B1: driver declares `@[implemented_by]` reference wrappers; the hygiene gate refuses them in source files"
+  if driverSrc.contains "CompiledUnsafe" then
+    throw <| IO.userError "B1: driver declares `unsafe` compiled-reference wrappers; the hygiene gate refuses `unsafe` declarations in source files"
 
 end LeanNative.Tests.EvalLCNFCLITests
