@@ -1091,6 +1091,29 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertEqual(bat["lowered_unproved"], 72)
         self.assertEqual(bat["rejected"], 1704)
 
+    def test_json_corpus_numbers_come_from_live_measurement(self) -> None:
+        # (a): `--json` must emit the same live measurement `--check` performs, never
+        # stored constants. Every measured corpus carries measurement_source=live_invocation.
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--json"],
+            capture_output=True,
+            text=True,
+            timeout=3600,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        data = json.loads(proc.stdout)
+        for cname in ("batteries_and_c2", "c1_corpus"):
+            corp = data["corpora"][cname]
+            self.assertEqual(
+                corp.get("measurement_source"),
+                "live_invocation",
+                f"corpus `{cname}` was not measured live in this invocation",
+            )
+        prov = data.get("measurement_provenance", {})
+        self.assertIn("command", prov)
+        self.assertIn("date_utc", prov)
+        self.assertIn("revisions", prov)
+
     def test_detects_corrupted_rejection_sum(self) -> None:
         rep = build_coverage_report(ROOT_DIR)
         rep["corpora"]["batteries_and_c2"]["rejected"] += 3
