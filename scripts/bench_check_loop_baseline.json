@@ -1,8 +1,16 @@
 {
   "schema_version": 1,
   "kind": "baseline",
-  "created_utc": "2026-11-16T10:14:18Z",
-  "turbo_lean_commit": "8630a43a6258dd48b2f96715fc09bd63a16ebdab",
+  "created_utc": "2026-11-16T13:23:25Z",
+  "turbo_lean_commit": "eae0d401743184585f9aea22763372255bb0c219",
+  "toolchain": {
+    "lean_toolchain": "leanprover/lean4:v4.35.0",
+    "lean_version": "Lean (version 4.35.0, x86_64-unknown-linux-gnu, commit eb6cafb7290e8bd5f2937522d8d804f58f02bafc, Release)",
+    "by_repo": {
+      "batteries": "leanprover/lean4:v4.35.0",
+      "pfr": "leanprover/lean4:v4.35.0"
+    }
+  },
   "host": {
     "hostname": "uruk",
     "machine_label": null,
@@ -24,7 +32,7 @@
     "TURBO_LEAN_TELEMETRY": null,
     "TURBO_LEAN_DAEMON_IDLE_SECS": null,
     "git_version": "git version 2.47.1",
-    "scratch_root": "/tmp/m1-bench-vl4k_4ef"
+    "scratch_root": "/tmp/m1-bench-gec3z15w"
   },
   "workloads": {
     "batteries_list_lemmas_top": {
@@ -37,31 +45,31 @@
       "modes": {
         "cold_no_daemon": {
           "runs_ms": [
-            3475.7,
-            3437.5,
-            3395.7,
-            3416.4,
-            3433.7
+            3399.3,
+            3391.2,
+            3364.4,
+            3397.8,
+            3337.0
           ],
           "trials": 5,
           "failed_trials": 0,
-          "median_ms": 3433.7,
-          "spread_ms": 80.0,
-          "rel_spread": 0.0233,
-          "coverage_ratio_min": 1.0,
-          "coverage_ratio_external_min": 0.9969,
+          "median_ms": 3391.2,
+          "spread_ms": 62.3,
+          "rel_spread": 0.0184,
+          "coverage_ratio_min": 0.9999,
+          "coverage_ratio_external_min": 0.9968,
           "statuses_observed": [
             "theorem_verified"
           ],
           "phases_ms_median": {
             "cas_lookup": 0.3,
-            "cli_startup": 2.7,
-            "dependent_recheck": 9.5,
-            "elaboration": 618.9,
-            "identity_probe": 743.3,
-            "import_refresh": 1922.4,
-            "setup": 81.0,
-            "split_and_hygiene": 40.3
+            "cli_startup": 2.0,
+            "dependent_recheck": 10.8,
+            "elaboration": 567.2,
+            "identity_probe": 747.4,
+            "import_refresh": 1920.0,
+            "setup": 76.3,
+            "split_and_hygiene": 40.2
           },
           "psi_trials": [
             {
@@ -69,63 +77,193 @@
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.14,
+              "io.some": 0.0,
               "io.full": 0.0,
-              "load1": 0.13
+              "load1": 0.39
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.09,
+              "io.some": 0.0,
               "io.full": 0.0,
-              "load1": 0.13
+              "load1": 0.39
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.09,
+              "io.some": 0.0,
               "io.full": 0.0,
-              "load1": 0.13
+              "load1": 0.39
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.06,
-              "io.full": 0.0,
-              "load1": 0.2
+              "io.some": 0.29,
+              "io.full": 0.29,
+              "load1": 0.44
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.06,
-              "io.full": 0.0,
-              "load1": 0.2
+              "io.some": 0.29,
+              "io.full": 0.29,
+              "load1": 0.44
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.23,
-              "io.full": 0.18,
-              "load1": 0.27
+              "io.some": 0.34,
+              "io.full": 0.34,
+              "load1": 0.49
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.23,
-              "io.full": 0.18,
-              "load1": 0.27
+              "io.some": 0.34,
+              "io.full": 0.34,
+              "load1": 0.49
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.28,
+              "io.full": 0.28,
+              "load1": 0.49
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.28,
+              "io.full": 0.28,
+              "load1": 0.49
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.33,
+              "io.full": 0.33,
+              "load1": 0.53
+            }
+          ],
+          "psi_max": {
+            "cpu.some": 0.0,
+            "cpu.full": 0.0,
+            "memory.some": 0.0,
+            "memory.full": 0.0,
+            "io.some": 0.34,
+            "io.full": 0.34,
+            "load1": 0.53
+          },
+          "psi_contended": false
+        },
+        "warm_cache_hit_daemon": {
+          "runs_ms": [
+            921.4,
+            901.7,
+            889.2,
+            931.3,
+            886.0
+          ],
+          "trials": 5,
+          "failed_trials": 0,
+          "median_ms": 901.7,
+          "spread_ms": 45.3,
+          "rel_spread": 0.0503,
+          "coverage_ratio_min": 0.9998,
+          "coverage_ratio_external_min": 0.9948,
+          "statuses_observed": [
+            "theorem_cache_hit"
+          ],
+          "phases_ms_median": {
+            "cas_lookup": 0.5,
+            "cli_startup": 0.6,
+            "dependent_recheck": 4.1,
+            "identity_probe": 770.5,
+            "import_refresh": 68.0,
+            "setup": 15.3,
+            "split_and_hygiene": 27.1
+          },
+          "psi_trials": [
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.22,
+              "io.full": 0.22,
+              "load1": 0.57
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.22,
+              "io.full": 0.22,
+              "load1": 0.57
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.22,
+              "io.full": 0.22,
+              "load1": 0.57
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.36,
+              "io.full": 0.36,
+              "load1": 0.57
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.36,
+              "io.full": 0.36,
+              "load1": 0.57
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.36,
+              "io.full": 0.36,
+              "load1": 0.57
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.36,
+              "io.full": 0.36,
+              "load1": 0.57
             },
             {
               "cpu.some": 0.0,
@@ -133,8 +271,8 @@
               "memory.some": 0.0,
               "memory.full": 0.0,
               "io.some": 0.48,
-              "io.full": 0.45,
-              "load1": 0.27
+              "io.full": 0.48,
+              "load1": 0.57
             },
             {
               "cpu.some": 0.0,
@@ -142,17 +280,17 @@
               "memory.some": 0.0,
               "memory.full": 0.0,
               "io.some": 0.48,
-              "io.full": 0.45,
-              "load1": 0.27
+              "io.full": 0.48,
+              "load1": 0.57
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.47,
-              "io.full": 0.45,
-              "load1": 0.33
+              "io.some": 0.48,
+              "io.full": 0.48,
+              "load1": 0.6
             }
           ],
           "psi_max": {
@@ -161,154 +299,24 @@
             "memory.some": 0.0,
             "memory.full": 0.0,
             "io.some": 0.48,
-            "io.full": 0.45,
-            "load1": 0.33
-          },
-          "psi_contended": false
-        },
-        "warm_cache_hit_daemon": {
-          "runs_ms": [
-            914.0,
-            897.4,
-            929.8,
-            943.5,
-            874.1
-          ],
-          "trials": 5,
-          "failed_trials": 0,
-          "median_ms": 914.0,
-          "spread_ms": 69.4,
-          "rel_spread": 0.076,
-          "coverage_ratio_min": 0.9996,
-          "coverage_ratio_external_min": 0.9941,
-          "statuses_observed": [
-            "theorem_cache_hit"
-          ],
-          "phases_ms_median": {
-            "cas_lookup": 0.4,
-            "cli_startup": 0.7,
-            "dependent_recheck": 4.2,
-            "identity_probe": 758.7,
-            "import_refresh": 69.0,
-            "setup": 15.6,
-            "split_and_hygiene": 28.0
-          },
-          "psi_trials": [
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.38,
-              "io.full": 0.36,
-              "load1": 0.46
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.5,
-              "io.full": 0.48,
-              "load1": 0.46
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.5,
-              "io.full": 0.48,
-              "load1": 0.46
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.5,
-              "io.full": 0.48,
-              "load1": 0.46
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.5,
-              "io.full": 0.48,
-              "load1": 0.46
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.59,
-              "io.full": 0.57,
-              "load1": 0.46
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.59,
-              "io.full": 0.57,
-              "load1": 0.46
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.59,
-              "io.full": 0.57,
-              "load1": 0.5
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.59,
-              "io.full": 0.57,
-              "load1": 0.5
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.66,
-              "io.full": 0.65,
-              "load1": 0.5
-            }
-          ],
-          "psi_max": {
-            "cpu.some": 0.0,
-            "cpu.full": 0.0,
-            "memory.some": 0.0,
-            "memory.full": 0.0,
-            "io.some": 0.66,
-            "io.full": 0.65,
-            "load1": 0.5
+            "io.full": 0.48,
+            "load1": 0.6
           },
           "psi_contended": false
         },
         "warm_edited_proof_daemon": {
           "runs_ms": [
-            1210.8,
-            1236.6,
-            1233.2,
-            1203.8,
-            1229.8
+            1221.6,
+            1238.5,
+            1247.3,
+            1231.2,
+            1222.0
           ],
           "trials": 5,
           "failed_trials": 0,
-          "median_ms": 1229.8,
-          "spread_ms": 32.7,
-          "rel_spread": 0.0266,
+          "median_ms": 1231.2,
+          "spread_ms": 25.8,
+          "rel_spread": 0.0209,
           "coverage_ratio_min": 0.9999,
           "coverage_ratio_external_min": 0.998,
           "statuses_observed": [
@@ -317,12 +325,12 @@
           "phases_ms_median": {
             "cas_lookup": 0.4,
             "cli_startup": 0.6,
-            "dependent_recheck": 71.0,
-            "elaboration": 290.3,
-            "identity_probe": 739.2,
-            "import_refresh": 67.7,
-            "setup": 15.5,
-            "split_and_hygiene": 39.6
+            "dependent_recheck": 77.6,
+            "elaboration": 292.3,
+            "identity_probe": 741.0,
+            "import_refresh": 67.3,
+            "setup": 15.4,
+            "split_and_hygiene": 39.9
           },
           "psi_trials": [
             {
@@ -330,90 +338,90 @@
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.66,
+              "io.some": 0.57,
+              "io.full": 0.57,
+              "load1": 0.6
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.57,
+              "io.full": 0.57,
+              "load1": 0.6
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.57,
+              "io.full": 0.57,
+              "load1": 0.6
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.65,
               "io.full": 0.65,
-              "load1": 0.5
+              "load1": 0.6
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.72,
+              "io.some": 0.65,
+              "io.full": 0.65,
+              "load1": 0.6
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.71,
               "io.full": 0.71,
-              "load1": 0.5
+              "load1": 0.63
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.72,
+              "io.some": 0.71,
               "io.full": 0.71,
-              "load1": 0.5
+              "load1": 0.63
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.13,
-              "io.full": 1.13,
-              "load1": 0.5
+              "io.some": 0.71,
+              "io.full": 0.71,
+              "load1": 0.63
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.13,
-              "io.full": 1.13,
-              "load1": 0.5
+              "io.some": 0.71,
+              "io.full": 0.71,
+              "load1": 0.63
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.13,
-              "io.full": 1.13,
-              "load1": 0.54
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 1.13,
-              "io.full": 1.13,
-              "load1": 0.54
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 1.29,
-              "io.full": 1.28,
-              "load1": 0.54
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 1.29,
-              "io.full": 1.28,
-              "load1": 0.54
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 1.6,
-              "io.full": 1.59,
-              "load1": 0.54
+              "io.some": 1.31,
+              "io.full": 1.31,
+              "load1": 0.63
             }
           ],
           "psi_max": {
@@ -421,9 +429,9 @@
             "cpu.full": 0.0,
             "memory.some": 0.0,
             "memory.full": 0.0,
-            "io.some": 1.6,
-            "io.full": 1.59,
-            "load1": 0.54
+            "io.some": 1.31,
+            "io.full": 1.31,
+            "load1": 0.63
           },
           "psi_contended": false
         }
@@ -439,31 +447,31 @@
       "modes": {
         "cold_no_daemon": {
           "runs_ms": [
-            13773.7,
-            13819.2,
-            13866.0,
-            13826.3,
-            13860.8
+            13777.5,
+            13715.1,
+            13678.9,
+            13769.3,
+            13771.8
           ],
           "trials": 5,
           "failed_trials": 0,
-          "median_ms": 13826.3,
-          "spread_ms": 92.3,
-          "rel_spread": 0.0067,
+          "median_ms": 13769.3,
+          "spread_ms": 98.6,
+          "rel_spread": 0.0072,
           "coverage_ratio_min": 1.0,
-          "coverage_ratio_external_min": 0.999,
+          "coverage_ratio_external_min": 0.9992,
           "statuses_observed": [
             "theorem_verified"
           ],
           "phases_ms_median": {
             "cas_lookup": 0.3,
             "cli_startup": 0.7,
-            "dependent_recheck": 12.0,
-            "elaboration": 583.8,
-            "identity_probe": 771.4,
-            "import_refresh": 12318.9,
-            "setup": 79.7,
-            "split_and_hygiene": 55.6
+            "dependent_recheck": 7.9,
+            "elaboration": 534.2,
+            "identity_probe": 777.2,
+            "import_refresh": 12281.0,
+            "setup": 68.9,
+            "split_and_hygiene": 55.3
           },
           "psi_trials": [
             {
@@ -471,27 +479,63 @@
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.48,
-              "io.full": 0.48,
-              "load1": 0.65
+              "io.some": 0.5,
+              "io.full": 0.5,
+              "load1": 0.71
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.17,
-              "io.full": 0.17,
-              "load1": 0.73
+              "io.some": 0.12,
+              "io.full": 0.12,
+              "load1": 0.78
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.17,
-              "io.full": 0.17,
-              "load1": 0.73
+              "io.some": 0.12,
+              "io.full": 0.12,
+              "load1": 0.78
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.08,
+              "io.full": 0.08,
+              "load1": 0.81
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.08,
+              "io.full": 0.08,
+              "load1": 0.81
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.15,
+              "io.full": 0.15,
+              "load1": 0.86
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.15,
+              "io.full": 0.15,
+              "load1": 0.86
             },
             {
               "cpu.some": 0.0,
@@ -500,7 +544,7 @@
               "memory.full": 0.0,
               "io.some": 0.09,
               "io.full": 0.09,
-              "load1": 0.87
+              "load1": 0.89
             },
             {
               "cpu.some": 0.0,
@@ -509,52 +553,16 @@
               "memory.full": 0.0,
               "io.some": 0.09,
               "io.full": 0.09,
-              "load1": 0.87
+              "load1": 0.89
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.13,
-              "io.full": 0.13,
-              "load1": 0.96
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.13,
-              "io.full": 0.13,
-              "load1": 0.96
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.03,
-              "io.full": 0.03,
-              "load1": 0.97
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.03,
-              "io.full": 0.03,
-              "load1": 0.97
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.0,
-              "io.full": 0.0,
-              "load1": 0.98
+              "io.some": 0.07,
+              "io.full": 0.07,
+              "load1": 0.99
             }
           ],
           "psi_max": {
@@ -562,38 +570,38 @@
             "cpu.full": 0.0,
             "memory.some": 0.0,
             "memory.full": 0.0,
-            "io.some": 0.48,
-            "io.full": 0.48,
-            "load1": 0.98
+            "io.some": 0.5,
+            "io.full": 0.5,
+            "load1": 0.99
           },
           "psi_contended": false
         },
         "warm_cache_hit_daemon": {
           "runs_ms": [
-            992.1,
-            964.7,
-            957.2,
-            967.5,
-            934.9
+            991.0,
+            931.2,
+            930.4,
+            944.2,
+            960.0
           ],
           "trials": 5,
           "failed_trials": 0,
-          "median_ms": 964.7,
-          "spread_ms": 57.3,
-          "rel_spread": 0.0594,
+          "median_ms": 944.2,
+          "spread_ms": 60.7,
+          "rel_spread": 0.0642,
           "coverage_ratio_min": 0.9999,
-          "coverage_ratio_external_min": 0.9948,
+          "coverage_ratio_external_min": 0.995,
           "statuses_observed": [
             "theorem_cache_hit"
           ],
           "phases_ms_median": {
-            "cas_lookup": 0.4,
-            "cli_startup": 0.7,
-            "dependent_recheck": 4.3,
-            "identity_probe": 782.8,
-            "import_refresh": 110.1,
-            "setup": 18.2,
-            "split_and_hygiene": 38.0
+            "cas_lookup": 0.5,
+            "cli_startup": 0.6,
+            "dependent_recheck": 4.0,
+            "identity_probe": 765.4,
+            "import_refresh": 110.3,
+            "setup": 17.8,
+            "split_and_hygiene": 38.3
           },
           "psi_trials": [
             {
@@ -601,90 +609,90 @@
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.0,
-              "io.full": 0.0,
-              "load1": 0.98
+              "io.some": 0.07,
+              "io.full": 0.07,
+              "load1": 1.14
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.0,
-              "io.full": 0.0,
-              "load1": 0.98
+              "io.some": 0.42,
+              "io.full": 0.42,
+              "load1": 1.13
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.0,
-              "io.full": 0.0,
-              "load1": 0.98
+              "io.some": 0.42,
+              "io.full": 0.42,
+              "load1": 1.13
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.0,
-              "io.full": 0.0,
-              "load1": 0.98
+              "io.some": 0.42,
+              "io.full": 0.42,
+              "load1": 1.13
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.0,
-              "io.full": 0.0,
-              "load1": 0.98
+              "io.some": 0.42,
+              "io.full": 0.42,
+              "load1": 1.13
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.0,
-              "io.full": 0.0,
-              "load1": 0.98
+              "io.some": 0.42,
+              "io.full": 0.42,
+              "load1": 1.13
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.0,
-              "io.full": 0.0,
-              "load1": 0.98
+              "io.some": 0.42,
+              "io.full": 0.42,
+              "load1": 1.13
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.18,
-              "io.full": 0.18,
-              "load1": 0.98
+              "io.some": 0.7,
+              "io.full": 0.7,
+              "load1": 1.13
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.18,
-              "io.full": 0.18,
-              "load1": 0.98
+              "io.some": 0.7,
+              "io.full": 0.7,
+              "load1": 1.13
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.18,
-              "io.full": 0.18,
-              "load1": 0.98
+              "io.some": 0.7,
+              "io.full": 0.7,
+              "load1": 1.13
             }
           ],
           "psi_max": {
@@ -692,39 +700,39 @@
             "cpu.full": 0.0,
             "memory.some": 0.0,
             "memory.full": 0.0,
-            "io.some": 0.18,
-            "io.full": 0.18,
-            "load1": 0.98
+            "io.some": 0.7,
+            "io.full": 0.7,
+            "load1": 1.14
           },
           "psi_contended": false
         },
         "warm_edited_proof_daemon": {
           "runs_ms": [
-            1280.9,
-            1205.6,
-            1198.7,
-            1252.3,
-            1259.5
+            1232.0,
+            1268.6,
+            1278.6,
+            1299.7,
+            1216.1
           ],
           "trials": 5,
           "failed_trials": 0,
-          "median_ms": 1252.3,
-          "spread_ms": 82.2,
-          "rel_spread": 0.0656,
+          "median_ms": 1268.6,
+          "spread_ms": 83.7,
+          "rel_spread": 0.066,
           "coverage_ratio_min": 1.0,
-          "coverage_ratio_external_min": 0.9979,
+          "coverage_ratio_external_min": 0.9978,
           "statuses_observed": [
             "theorem_verified"
           ],
           "phases_ms_median": {
             "cas_lookup": 0.4,
             "cli_startup": 0.6,
-            "dependent_recheck": 81.5,
-            "elaboration": 229.2,
-            "identity_probe": 756.2,
-            "import_refresh": 109.7,
-            "setup": 17.6,
-            "split_and_hygiene": 54.2
+            "dependent_recheck": 82.0,
+            "elaboration": 232.6,
+            "identity_probe": 777.9,
+            "import_refresh": 109.8,
+            "setup": 17.7,
+            "split_and_hygiene": 54.4
           },
           "psi_trials": [
             {
@@ -732,90 +740,90 @@
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.33,
-              "io.full": 0.33,
-              "load1": 0.98
+              "io.some": 0.58,
+              "io.full": 0.58,
+              "load1": 1.12
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.45,
-              "io.full": 0.45,
-              "load1": 0.98
+              "io.some": 0.65,
+              "io.full": 0.65,
+              "load1": 1.12
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.45,
-              "io.full": 0.45,
-              "load1": 0.98
+              "io.some": 0.65,
+              "io.full": 0.65,
+              "load1": 1.12
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.45,
-              "io.full": 0.45,
-              "load1": 0.98
+              "io.some": 0.65,
+              "io.full": 0.65,
+              "load1": 1.12
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.45,
-              "io.full": 0.45,
-              "load1": 0.98
+              "io.some": 0.65,
+              "io.full": 0.65,
+              "load1": 1.12
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.91,
-              "io.full": 0.91,
-              "load1": 0.99
+              "io.some": 1.08,
+              "io.full": 1.08,
+              "load1": 1.12
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.91,
-              "io.full": 0.91,
-              "load1": 0.99
+              "io.some": 1.08,
+              "io.full": 1.08,
+              "load1": 1.12
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.11,
-              "io.full": 0.92,
-              "load1": 0.99
+              "io.some": 1.06,
+              "io.full": 1.06,
+              "load1": 1.11
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.11,
-              "io.full": 0.92,
-              "load1": 0.99
+              "io.some": 1.06,
+              "io.full": 1.06,
+              "load1": 1.11
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.11,
-              "io.full": 0.92,
-              "load1": 0.99
+              "io.some": 1.06,
+              "io.full": 1.06,
+              "load1": 1.11
             }
           ],
           "psi_max": {
@@ -823,9 +831,9 @@
             "cpu.full": 0.0,
             "memory.some": 0.0,
             "memory.full": 0.0,
-            "io.some": 1.11,
-            "io.full": 0.92,
-            "load1": 0.99
+            "io.some": 1.08,
+            "io.full": 1.08,
+            "load1": 1.12
           },
           "psi_contended": false
         }
@@ -841,17 +849,17 @@
       "modes": {
         "cold_no_daemon": {
           "runs_ms": [
-            10294.7,
-            10356.3,
-            10225.3,
-            10300.6,
-            10342.3
+            10207.0,
+            10218.5,
+            10251.8,
+            10232.0,
+            10245.1
           ],
           "trials": 5,
           "failed_trials": 0,
-          "median_ms": 10300.6,
-          "spread_ms": 131.0,
-          "rel_spread": 0.0127,
+          "median_ms": 10232.0,
+          "spread_ms": 44.8,
+          "rel_spread": 0.0044,
           "coverage_ratio_min": 1.0,
           "coverage_ratio_external_min": 0.9983,
           "statuses_observed": [
@@ -859,13 +867,13 @@
           ],
           "phases_ms_median": {
             "cas_lookup": 0.3,
-            "cli_startup": 1.5,
-            "dependent_recheck": 11.4,
-            "elaboration": 1002.8,
-            "identity_probe": 884.5,
-            "import_refresh": 8237.5,
-            "setup": 77.5,
-            "split_and_hygiene": 60.4
+            "cli_startup": 1.4,
+            "dependent_recheck": 12.7,
+            "elaboration": 961.2,
+            "identity_probe": 892.2,
+            "import_refresh": 8201.3,
+            "setup": 83.0,
+            "split_and_hygiene": 60.7
           },
           "psi_trials": [
             {
@@ -873,63 +881,27 @@
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.57,
-              "io.full": 0.5,
-              "load1": 0.99
+              "io.some": 0.58,
+              "io.full": 0.58,
+              "load1": 1.09
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.17,
-              "io.full": 0.15,
-              "load1": 0.99
+              "io.some": 0.21,
+              "io.full": 0.21,
+              "load1": 1.08
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.17,
-              "io.full": 0.15,
-              "load1": 0.99
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.32,
-              "io.full": 0.31,
-              "load1": 0.99
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.32,
-              "io.full": 0.31,
-              "load1": 0.99
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.2,
-              "io.full": 0.19,
-              "load1": 0.99
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.2,
-              "io.full": 0.19,
-              "load1": 0.99
+              "io.some": 0.21,
+              "io.full": 0.21,
+              "load1": 1.08
             },
             {
               "cpu.some": 0.0,
@@ -938,7 +910,7 @@
               "memory.full": 0.0,
               "io.some": 0.07,
               "io.full": 0.07,
-              "load1": 1.14
+              "load1": 1.07
             },
             {
               "cpu.some": 0.0,
@@ -947,16 +919,52 @@
               "memory.full": 0.0,
               "io.some": 0.07,
               "io.full": 0.07,
-              "load1": 1.14
+              "load1": 1.07
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.1,
-              "io.full": 0.1,
-              "load1": 1.19
+              "io.some": 0.02,
+              "io.full": 0.02,
+              "load1": 1.06
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.02,
+              "io.full": 0.02,
+              "load1": 1.06
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 1.05
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.0,
+              "io.full": 0.0,
+              "load1": 1.05
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.08,
+              "io.full": 0.08,
+              "load1": 1.04
             }
           ],
           "psi_max": {
@@ -964,38 +972,38 @@
             "cpu.full": 0.0,
             "memory.some": 0.0,
             "memory.full": 0.0,
-            "io.some": 0.57,
-            "io.full": 0.5,
-            "load1": 1.19
+            "io.some": 0.58,
+            "io.full": 0.58,
+            "load1": 1.09
           },
           "psi_contended": false
         },
         "warm_cache_hit_daemon": {
           "runs_ms": [
-            1153.6,
-            1150.4,
-            1170.4,
-            1123.1,
-            1159.6
+            1212.8,
+            1145.8,
+            1131.1,
+            1163.9,
+            1148.7
           ],
           "trials": 5,
           "failed_trials": 0,
-          "median_ms": 1153.6,
-          "spread_ms": 47.3,
-          "rel_spread": 0.041,
+          "median_ms": 1148.7,
+          "spread_ms": 81.7,
+          "rel_spread": 0.0711,
           "coverage_ratio_min": 0.9999,
-          "coverage_ratio_external_min": 0.9953,
+          "coverage_ratio_external_min": 0.9956,
           "statuses_observed": [
             "theorem_cache_hit"
           ],
           "phases_ms_median": {
-            "cas_lookup": 0.4,
+            "cas_lookup": 0.5,
             "cli_startup": 0.6,
             "dependent_recheck": 4.1,
-            "identity_probe": 903.8,
-            "import_refresh": 175.4,
-            "setup": 14.4,
-            "split_and_hygiene": 48.4
+            "identity_probe": 904.6,
+            "import_refresh": 175.5,
+            "setup": 14.5,
+            "split_and_hygiene": 48.7
           },
           "psi_trials": [
             {
@@ -1005,25 +1013,7 @@
               "memory.full": 0.0,
               "io.some": 0.03,
               "io.full": 0.03,
-              "load1": 1.24
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.03,
-              "io.full": 0.03,
-              "load1": 1.24
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.03,
-              "io.full": 0.03,
-              "load1": 1.24
+              "load1": 1.11
             },
             {
               "cpu.some": 0.0,
@@ -1031,8 +1021,8 @@
               "memory.some": 0.0,
               "memory.full": 0.0,
               "io.some": 0.2,
-              "io.full": 0.2,
-              "load1": 1.24
+              "io.full": 0.02,
+              "load1": 1.11
             },
             {
               "cpu.some": 0.0,
@@ -1040,8 +1030,8 @@
               "memory.some": 0.0,
               "memory.full": 0.0,
               "io.some": 0.2,
-              "io.full": 0.2,
-              "load1": 1.24
+              "io.full": 0.02,
+              "load1": 1.11
             },
             {
               "cpu.some": 0.0,
@@ -1049,8 +1039,8 @@
               "memory.some": 0.0,
               "memory.full": 0.0,
               "io.some": 0.2,
-              "io.full": 0.2,
-              "load1": 1.24
+              "io.full": 0.02,
+              "load1": 1.1
             },
             {
               "cpu.some": 0.0,
@@ -1058,8 +1048,8 @@
               "memory.some": 0.0,
               "memory.full": 0.0,
               "io.some": 0.2,
-              "io.full": 0.2,
-              "load1": 1.24
+              "io.full": 0.02,
+              "load1": 1.1
             },
             {
               "cpu.some": 0.0,
@@ -1067,8 +1057,8 @@
               "memory.some": 0.0,
               "memory.full": 0.0,
               "io.some": 0.35,
-              "io.full": 0.35,
-              "load1": 1.22
+              "io.full": 0.2,
+              "load1": 1.1
             },
             {
               "cpu.some": 0.0,
@@ -1076,17 +1066,35 @@
               "memory.some": 0.0,
               "memory.full": 0.0,
               "io.some": 0.35,
-              "io.full": 0.35,
-              "load1": 1.22
+              "io.full": 0.2,
+              "load1": 1.1
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.35,
-              "io.full": 0.35,
-              "load1": 1.22
+              "io.some": 0.28,
+              "io.full": 0.16,
+              "load1": 1.1
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.28,
+              "io.full": 0.16,
+              "load1": 1.1
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.28,
+              "io.full": 0.16,
+              "load1": 1.1
             }
           ],
           "psi_max": {
@@ -1095,35 +1103,35 @@
             "memory.some": 0.0,
             "memory.full": 0.0,
             "io.some": 0.35,
-            "io.full": 0.35,
-            "load1": 1.24
+            "io.full": 0.2,
+            "load1": 1.11
           },
           "psi_contended": false
         },
         "warm_edited_proof_daemon": {
           "runs_ms": [
-            1649.1,
-            1639.1,
-            1668.4,
-            1610.7,
-            1633.8
+            1672.5,
+            1655.8,
+            1654.6,
+            1603.7,
+            1607.1
           ],
           "trials": 5,
           "failed_trials": 0,
-          "median_ms": 1639.1,
-          "spread_ms": 57.7,
-          "rel_spread": 0.0352,
+          "median_ms": 1654.6,
+          "spread_ms": 68.8,
+          "rel_spread": 0.0416,
           "coverage_ratio_min": 1.0,
-          "coverage_ratio_external_min": 0.998,
+          "coverage_ratio_external_min": 0.9979,
           "statuses_observed": [
             "theorem_verified"
           ],
           "phases_ms_median": {
-            "cas_lookup": 0.3,
+            "cas_lookup": 0.4,
             "cli_startup": 0.6,
-            "dependent_recheck": 43.5,
-            "elaboration": 417.3,
-            "identity_probe": 897.4,
+            "dependent_recheck": 70.4,
+            "elaboration": 423.9,
+            "identity_probe": 900.7,
             "import_refresh": 173.0,
             "setup": 14.4,
             "split_and_hygiene": 59.7
@@ -1134,90 +1142,90 @@
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.28,
-              "io.full": 0.28,
-              "load1": 1.22
+              "io.some": 0.23,
+              "io.full": 0.13,
+              "load1": 1.09
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.41,
-              "io.full": 0.41,
-              "load1": 1.22
+              "io.some": 0.55,
+              "io.full": 0.47,
+              "load1": 1.09
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.41,
-              "io.full": 0.41,
-              "load1": 1.22
+              "io.some": 0.55,
+              "io.full": 0.47,
+              "load1": 1.09
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.52,
-              "io.full": 0.52,
-              "load1": 1.2
+              "io.some": 0.81,
+              "io.full": 0.74,
+              "load1": 1.09
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.52,
-              "io.full": 0.52,
-              "load1": 1.2
+              "io.some": 0.81,
+              "io.full": 0.74,
+              "load1": 1.09
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.79,
-              "io.full": 0.79,
-              "load1": 1.2
+              "io.some": 1.03,
+              "io.full": 0.97,
+              "load1": 1.16
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.79,
-              "io.full": 0.79,
-              "load1": 1.2
+              "io.some": 1.03,
+              "io.full": 0.97,
+              "load1": 1.16
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.0,
-              "io.full": 1.0,
-              "load1": 1.2
+              "io.some": 1.03,
+              "io.full": 0.97,
+              "load1": 1.16
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.0,
-              "io.full": 1.0,
-              "load1": 1.2
+              "io.some": 1.03,
+              "io.full": 0.97,
+              "load1": 1.16
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.0,
-              "io.full": 1.0,
-              "load1": 1.27
+              "io.some": 1.2,
+              "io.full": 1.16,
+              "load1": 1.16
             }
           ],
           "psi_max": {
@@ -1225,9 +1233,9 @@
             "cpu.full": 0.0,
             "memory.some": 0.0,
             "memory.full": 0.0,
-            "io.some": 1.0,
-            "io.full": 1.0,
-            "load1": 1.27
+            "io.some": 1.2,
+            "io.full": 1.16,
+            "load1": 1.16
           },
           "psi_contended": false
         }
@@ -1243,31 +1251,31 @@
       "modes": {
         "cold_no_daemon": {
           "runs_ms": [
-            12408.1,
-            12412.0,
-            12325.4,
-            12353.0,
-            12417.9
+            12359.3,
+            12320.0,
+            12394.4,
+            12350.8,
+            12353.6
           ],
           "trials": 5,
           "failed_trials": 0,
-          "median_ms": 12408.1,
-          "spread_ms": 92.4,
-          "rel_spread": 0.0074,
+          "median_ms": 12353.6,
+          "spread_ms": 74.4,
+          "rel_spread": 0.006,
           "coverage_ratio_min": 1.0,
-          "coverage_ratio_external_min": 0.999,
+          "coverage_ratio_external_min": 0.9988,
           "statuses_observed": [
             "theorem_verified"
           ],
           "phases_ms_median": {
             "cas_lookup": 0.3,
-            "cli_startup": 0.7,
-            "dependent_recheck": 10.5,
-            "elaboration": 2696.6,
-            "identity_probe": 1305.9,
-            "import_refresh": 8240.3,
-            "setup": 68.6,
-            "split_and_hygiene": 60.8
+            "cli_startup": 1.3,
+            "dependent_recheck": 9.6,
+            "elaboration": 2679.4,
+            "identity_probe": 1293.1,
+            "import_refresh": 8228.8,
+            "setup": 74.5,
+            "split_and_hygiene": 60.5
           },
           "psi_trials": [
             {
@@ -1275,8 +1283,35 @@
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.3,
-              "io.full": 0.3,
+              "io.some": 0.5,
+              "io.full": 0.48,
+              "load1": 1.26
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.14,
+              "io.full": 0.14,
+              "load1": 1.22
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.14,
+              "io.full": 0.14,
+              "load1": 1.22
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.04,
+              "io.full": 0.04,
               "load1": 1.31
             },
             {
@@ -1284,72 +1319,45 @@
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.15,
-              "io.full": 0.15,
-              "load1": 1.24
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.15,
-              "io.full": 0.15,
-              "load1": 1.24
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
               "io.some": 0.04,
               "io.full": 0.04,
-              "load1": 1.2
+              "load1": 1.31
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.04,
-              "io.full": 0.04,
-              "load1": 1.2
+              "io.some": 0.07,
+              "io.full": 0.07,
+              "load1": 1.34
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.01,
-              "io.full": 0.01,
-              "load1": 1.16
+              "io.some": 0.07,
+              "io.full": 0.07,
+              "load1": 1.34
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.01,
-              "io.full": 0.01,
-              "load1": 1.16
+              "io.some": 0.02,
+              "io.full": 0.02,
+              "load1": 1.42
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.0,
-              "io.full": 0.0,
-              "load1": 1.21
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.0,
-              "io.full": 0.0,
-              "load1": 1.21
+              "io.some": 0.02,
+              "io.full": 0.02,
+              "load1": 1.42
             },
             {
               "cpu.some": 0.0,
@@ -1358,7 +1366,7 @@
               "memory.full": 0.0,
               "io.some": 0.0,
               "io.full": 0.0,
-              "load1": 1.16
+              "load1": 1.35
             }
           ],
           "psi_max": {
@@ -1366,38 +1374,38 @@
             "cpu.full": 0.0,
             "memory.some": 0.0,
             "memory.full": 0.0,
-            "io.some": 0.3,
-            "io.full": 0.3,
-            "load1": 1.31
+            "io.some": 0.5,
+            "io.full": 0.48,
+            "load1": 1.42
           },
           "psi_contended": false
         },
         "warm_cache_hit_daemon": {
           "runs_ms": [
-            1569.4,
-            1565.6,
-            1556.3,
-            1542.5,
-            1528.7
+            1535.5,
+            1541.8,
+            1572.0,
+            1545.9,
+            1528.9
           ],
           "trials": 5,
           "failed_trials": 0,
-          "median_ms": 1556.3,
-          "spread_ms": 40.7,
-          "rel_spread": 0.0261,
+          "median_ms": 1541.8,
+          "spread_ms": 43.1,
+          "rel_spread": 0.028,
           "coverage_ratio_min": 0.9999,
-          "coverage_ratio_external_min": 0.9978,
+          "coverage_ratio_external_min": 0.9974,
           "statuses_observed": [
             "theorem_cache_hit"
           ],
           "phases_ms_median": {
             "cas_lookup": 0.4,
             "cli_startup": 0.6,
-            "dependent_recheck": 4.2,
-            "identity_probe": 1306.6,
-            "import_refresh": 173.6,
-            "setup": 14.4,
-            "split_and_hygiene": 50.2
+            "dependent_recheck": 4.0,
+            "identity_probe": 1297.1,
+            "import_refresh": 173.1,
+            "setup": 14.6,
+            "split_and_hygiene": 49.1
           },
           "psi_trials": [
             {
@@ -1405,90 +1413,90 @@
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.06,
-              "io.full": 0.06,
-              "load1": 1.14
+              "io.some": 0.2,
+              "io.full": 0.2,
+              "load1": 1.27
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.23,
-              "io.full": 0.23,
-              "load1": 1.14
+              "io.some": 0.2,
+              "io.full": 0.2,
+              "load1": 1.27
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.23,
-              "io.full": 0.23,
-              "load1": 1.14
+              "io.some": 0.2,
+              "io.full": 0.2,
+              "load1": 1.27
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.23,
-              "io.full": 0.23,
-              "load1": 1.13
+              "io.some": 0.16,
+              "io.full": 0.16,
+              "load1": 1.27
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.23,
-              "io.full": 0.23,
-              "load1": 1.13
+              "io.some": 0.16,
+              "io.full": 0.16,
+              "load1": 1.27
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.37,
-              "io.full": 0.37,
-              "load1": 1.13
+              "io.some": 0.13,
+              "io.full": 0.13,
+              "load1": 1.25
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.37,
-              "io.full": 0.37,
-              "load1": 1.13
+              "io.some": 0.13,
+              "io.full": 0.13,
+              "load1": 1.25
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.3,
-              "io.full": 0.3,
-              "load1": 1.13
+              "io.some": 0.11,
+              "io.full": 0.11,
+              "load1": 1.25
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.3,
-              "io.full": 0.3,
-              "load1": 1.13
+              "io.some": 0.11,
+              "io.full": 0.11,
+              "load1": 1.25
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.43,
-              "io.full": 0.43,
-              "load1": 1.2
+              "io.some": 0.11,
+              "io.full": 0.11,
+              "load1": 1.25
             }
           ],
           "psi_max": {
@@ -1496,25 +1504,25 @@
             "cpu.full": 0.0,
             "memory.some": 0.0,
             "memory.full": 0.0,
-            "io.some": 0.43,
-            "io.full": 0.43,
-            "load1": 1.2
+            "io.some": 0.2,
+            "io.full": 0.2,
+            "load1": 1.27
           },
           "psi_contended": false
         },
         "warm_edited_proof_daemon": {
           "runs_ms": [
-            2317.6,
-            2286.4,
-            2272.7,
-            2209.1,
-            2257.9
+            2282.6,
+            2286.7,
+            2250.9,
+            2287.7,
+            2283.3
           ],
           "trials": 5,
           "failed_trials": 0,
-          "median_ms": 2272.7,
-          "spread_ms": 108.5,
-          "rel_spread": 0.0477,
+          "median_ms": 2283.3,
+          "spread_ms": 36.8,
+          "rel_spread": 0.0161,
           "coverage_ratio_min": 1.0,
           "coverage_ratio_external_min": 0.9985,
           "statuses_observed": [
@@ -1523,12 +1531,12 @@
           "phases_ms_median": {
             "cas_lookup": 0.3,
             "cli_startup": 0.6,
-            "dependent_recheck": 62.8,
-            "elaboration": 666.0,
-            "identity_probe": 1291.7,
-            "import_refresh": 173.2,
-            "setup": 14.4,
-            "split_and_hygiene": 60.6
+            "dependent_recheck": 64.0,
+            "elaboration": 648.4,
+            "identity_probe": 1310.8,
+            "import_refresh": 174.8,
+            "setup": 14.8,
+            "split_and_hygiene": 60.8
           },
           "psi_trials": [
             {
@@ -1536,90 +1544,90 @@
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.43,
-              "io.full": 0.28,
-              "load1": 1.18
+              "io.some": 0.2,
+              "io.full": 0.2,
+              "load1": 1.31
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.54,
-              "io.full": 0.41,
-              "load1": 1.18
+              "io.some": 0.17,
+              "io.full": 0.17,
+              "load1": 1.29
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.54,
-              "io.full": 0.41,
-              "load1": 1.18
+              "io.some": 0.17,
+              "io.full": 0.17,
+              "load1": 1.29
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.62,
-              "io.full": 0.52,
-              "load1": 1.18
+              "io.some": 0.5,
+              "io.full": 0.5,
+              "load1": 1.29
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.62,
-              "io.full": 0.52,
-              "load1": 1.18
+              "io.some": 0.5,
+              "io.full": 0.5,
+              "load1": 1.29
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.69,
-              "io.full": 0.6,
-              "load1": 1.33
+              "io.some": 0.59,
+              "io.full": 0.59,
+              "load1": 1.34
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.69,
-              "io.full": 0.6,
-              "load1": 1.33
+              "io.some": 0.59,
+              "io.full": 0.59,
+              "load1": 1.34
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.74,
-              "io.full": 0.68,
-              "load1": 1.33
+              "io.some": 0.84,
+              "io.full": 0.84,
+              "load1": 1.34
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.74,
-              "io.full": 0.68,
-              "load1": 1.33
+              "io.some": 0.84,
+              "io.full": 0.84,
+              "load1": 1.34
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.79,
-              "io.full": 0.73,
-              "load1": 1.38
+              "io.some": 1.05,
+              "io.full": 1.05,
+              "load1": 1.34
             }
           ],
           "psi_max": {
@@ -1627,9 +1635,9 @@
             "cpu.full": 0.0,
             "memory.some": 0.0,
             "memory.full": 0.0,
-            "io.some": 0.79,
-            "io.full": 0.73,
-            "load1": 1.38
+            "io.some": 1.05,
+            "io.full": 1.05,
+            "load1": 1.34
           },
           "psi_contended": false
         }
@@ -1645,30 +1653,30 @@
       "modes": {
         "cold_no_daemon": {
           "runs_ms": [
-            3779.1,
-            3796.4,
-            3688.8,
-            3756.1,
-            3721.5
+            3673.3,
+            3679.0,
+            3719.0,
+            3660.9,
+            3641.5
           ],
           "trials": 5,
           "failed_trials": 0,
-          "median_ms": 3756.1,
-          "spread_ms": 107.6,
-          "rel_spread": 0.0286,
+          "median_ms": 3673.3,
+          "spread_ms": 77.6,
+          "rel_spread": 0.0211,
           "coverage_ratio_min": 1.0,
-          "coverage_ratio_external_min": 0.9975,
+          "coverage_ratio_external_min": 0.9972,
           "statuses_observed": [
             "theorem_verified"
           ],
           "phases_ms_median": {
             "cas_lookup": 0.3,
-            "cli_startup": 2.5,
-            "dependent_recheck": 10.2,
-            "elaboration": 544.2,
-            "identity_probe": 685.7,
-            "import_refresh": 2416.5,
-            "setup": 62.5,
+            "cli_startup": 2.4,
+            "dependent_recheck": 11.7,
+            "elaboration": 471.1,
+            "identity_probe": 673.4,
+            "import_refresh": 2421.9,
+            "setup": 62.6,
             "split_and_hygiene": 21.0
           },
           "psi_trials": [
@@ -1677,35 +1685,8 @@
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.68,
-              "io.full": 0.64,
-              "load1": 1.35
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.6,
-              "io.full": 0.58,
-              "load1": 1.35
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.6,
-              "io.full": 0.58,
-              "load1": 1.35
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.55,
-              "io.full": 0.53,
+              "io.some": 1.0,
+              "io.full": 1.0,
               "load1": 1.32
             },
             {
@@ -1713,35 +1694,26 @@
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.55,
-              "io.full": 0.53,
-              "load1": 1.32
+              "io.some": 1.0,
+              "io.full": 1.0,
+              "load1": 1.29
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.51,
-              "io.full": 0.5,
-              "load1": 1.3
+              "io.some": 1.0,
+              "io.full": 1.0,
+              "load1": 1.29
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.51,
-              "io.full": 0.5,
-              "load1": 1.3
-            },
-            {
-              "cpu.some": 0.0,
-              "cpu.full": 0.0,
-              "memory.some": 0.0,
-              "memory.full": 0.0,
-              "io.some": 0.49,
-              "io.full": 0.48,
+              "io.some": 1.18,
+              "io.full": 1.18,
               "load1": 1.27
             },
             {
@@ -1749,8 +1721,8 @@
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.49,
-              "io.full": 0.48,
+              "io.some": 1.18,
+              "io.full": 1.18,
               "load1": 1.27
             },
             {
@@ -1758,9 +1730,45 @@
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.33,
-              "io.full": 0.32,
+              "io.some": 0.79,
+              "io.full": 0.79,
               "load1": 1.27
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.79,
+              "io.full": 0.79,
+              "load1": 1.27
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 1.19,
+              "io.full": 1.19,
+              "load1": 1.25
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 1.19,
+              "io.full": 1.19,
+              "load1": 1.25
+            },
+            {
+              "cpu.some": 0.0,
+              "cpu.full": 0.0,
+              "memory.some": 0.0,
+              "memory.full": 0.0,
+              "io.some": 0.97,
+              "io.full": 0.97,
+              "load1": 1.23
             }
           ],
           "psi_max": {
@@ -1768,27 +1776,27 @@
             "cpu.full": 0.0,
             "memory.some": 0.0,
             "memory.full": 0.0,
-            "io.some": 0.68,
-            "io.full": 0.64,
-            "load1": 1.35
+            "io.some": 1.19,
+            "io.full": 1.19,
+            "load1": 1.32
           },
           "psi_contended": false
         },
         "warm_cache_hit_daemon": {
           "runs_ms": [
-            857.2,
-            784.6,
-            781.7,
-            780.6,
-            775.5
+            826.3,
+            799.4,
+            768.3,
+            760.2,
+            796.7
           ],
           "trials": 5,
           "failed_trials": 0,
-          "median_ms": 781.7,
-          "spread_ms": 81.7,
-          "rel_spread": 0.1046,
+          "median_ms": 796.7,
+          "spread_ms": 66.2,
+          "rel_spread": 0.0831,
           "coverage_ratio_min": 0.9998,
-          "coverage_ratio_external_min": 0.9946,
+          "coverage_ratio_external_min": 0.9949,
           "statuses_observed": [
             "theorem_cache_hit"
           ],
@@ -1796,8 +1804,8 @@
             "cas_lookup": 0.5,
             "cli_startup": 0.6,
             "dependent_recheck": 3.9,
-            "identity_probe": 701.0,
-            "import_refresh": 53.9,
+            "identity_probe": 694.3,
+            "import_refresh": 54.5,
             "setup": 6.1,
             "split_and_hygiene": 13.8
           },
@@ -1807,90 +1815,90 @@
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.22,
-              "io.full": 0.21,
-              "load1": 1.25
+              "io.some": 0.65,
+              "io.full": 0.65,
+              "load1": 1.21
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.22,
-              "io.full": 0.21,
-              "load1": 1.25
+              "io.some": 0.71,
+              "io.full": 0.71,
+              "load1": 1.21
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.22,
-              "io.full": 0.21,
-              "load1": 1.25
+              "io.some": 0.71,
+              "io.full": 0.71,
+              "load1": 1.21
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.22,
-              "io.full": 0.21,
-              "load1": 1.25
+              "io.some": 0.71,
+              "io.full": 0.71,
+              "load1": 1.21
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.22,
-              "io.full": 0.21,
-              "load1": 1.25
+              "io.some": 0.71,
+              "io.full": 0.71,
+              "load1": 1.21
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.54,
-              "io.full": 0.54,
-              "load1": 1.23
+              "io.some": 0.71,
+              "io.full": 0.71,
+              "load1": 1.21
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.54,
-              "io.full": 0.54,
-              "load1": 1.23
+              "io.some": 0.71,
+              "io.full": 0.71,
+              "load1": 1.21
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.54,
-              "io.full": 0.54,
-              "load1": 1.23
+              "io.some": 0.76,
+              "io.full": 0.76,
+              "load1": 1.21
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.54,
-              "io.full": 0.54,
-              "load1": 1.23
+              "io.some": 0.76,
+              "io.full": 0.76,
+              "load1": 1.21
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.62,
-              "io.full": 0.62,
-              "load1": 1.23
+              "io.some": 0.76,
+              "io.full": 0.76,
+              "load1": 1.21
             }
           ],
           "psi_max": {
@@ -1898,26 +1906,26 @@
             "cpu.full": 0.0,
             "memory.some": 0.0,
             "memory.full": 0.0,
-            "io.some": 0.62,
-            "io.full": 0.62,
-            "load1": 1.25
+            "io.some": 0.76,
+            "io.full": 0.76,
+            "load1": 1.21
           },
           "psi_contended": false
         },
         "warm_edited_proof_daemon": {
           "runs_ms": [
-            968.9,
-            976.8,
-            960.5,
-            928.7,
-            970.3
+            903.4,
+            916.0,
+            911.5,
+            921.2,
+            953.3
           ],
           "trials": 5,
           "failed_trials": 0,
-          "median_ms": 968.9,
-          "spread_ms": 48.0,
-          "rel_spread": 0.0496,
-          "coverage_ratio_min": 1.0,
+          "median_ms": 916.0,
+          "spread_ms": 49.9,
+          "rel_spread": 0.0545,
+          "coverage_ratio_min": 0.9999,
           "coverage_ratio_external_min": 0.9978,
           "statuses_observed": [
             "theorem_verified"
@@ -1925,12 +1933,12 @@
           "phases_ms_median": {
             "cas_lookup": 0.3,
             "cli_startup": 0.6,
-            "dependent_recheck": 14.8,
-            "elaboration": 185.9,
-            "identity_probe": 679.1,
-            "import_refresh": 52.9,
-            "setup": 6.2,
-            "split_and_hygiene": 18.4
+            "dependent_recheck": 14.3,
+            "elaboration": 158.1,
+            "identity_probe": 671.4,
+            "import_refresh": 53.3,
+            "setup": 6.1,
+            "split_and_hygiene": 18.3
           },
           "psi_trials": [
             {
@@ -1938,90 +1946,90 @@
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.62,
-              "io.full": 0.62,
-              "load1": 1.23
+              "io.some": 0.81,
+              "io.full": 0.81,
+              "load1": 1.19
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.87,
-              "io.full": 0.87,
-              "load1": 1.23
+              "io.some": 0.81,
+              "io.full": 0.81,
+              "load1": 1.19
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.87,
-              "io.full": 0.87,
-              "load1": 1.23
+              "io.some": 0.81,
+              "io.full": 0.81,
+              "load1": 1.19
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.87,
-              "io.full": 0.87,
-              "load1": 1.21
+              "io.some": 1.02,
+              "io.full": 1.02,
+              "load1": 1.19
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.87,
-              "io.full": 0.87,
-              "load1": 1.21
+              "io.some": 1.02,
+              "io.full": 1.02,
+              "load1": 1.19
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.89,
-              "io.full": 0.89,
-              "load1": 1.21
+              "io.some": 1.02,
+              "io.full": 1.02,
+              "load1": 1.19
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.89,
-              "io.full": 0.89,
-              "load1": 1.21
+              "io.some": 1.02,
+              "io.full": 1.02,
+              "load1": 1.19
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.89,
-              "io.full": 0.89,
-              "load1": 1.21
+              "io.some": 1.38,
+              "io.full": 1.38,
+              "load1": 1.19
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 0.89,
-              "io.full": 0.89,
-              "load1": 1.21
+              "io.some": 1.38,
+              "io.full": 1.38,
+              "load1": 1.19
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.09,
-              "io.full": 1.09,
-              "load1": 1.21
+              "io.some": 1.38,
+              "io.full": 1.38,
+              "load1": 1.17
             }
           ],
           "psi_max": {
@@ -2029,9 +2037,9 @@
             "cpu.full": 0.0,
             "memory.some": 0.0,
             "memory.full": 0.0,
-            "io.some": 1.09,
-            "io.full": 1.09,
-            "load1": 1.23
+            "io.some": 1.38,
+            "io.full": 1.38,
+            "load1": 1.19
           },
           "psi_contended": false
         }
@@ -2040,6 +2048,10 @@
     "pfr_more_ruzsa_dist": {
       "status": "blocked_as_expected",
       "expected_status": "blocked",
+      "expected_error_classes": [
+        "declaration_identity_unknown_module_prefix",
+        "stale_import_refresh_fail_closed"
+      ],
       "exit_code": 1,
       "probe_exit_codes": [
         1,
@@ -2049,24 +2061,32 @@
         1,
         1
       ],
-      "error_class": "exit_1",
+      "probe_error_classes": [
+        "declaration_identity_unknown_module_prefix",
+        "declaration_identity_unknown_module_prefix",
+        "declaration_identity_unknown_module_prefix",
+        "declaration_identity_unknown_module_prefix",
+        "declaration_identity_unknown_module_prefix",
+        "declaration_identity_unknown_module_prefix"
+      ],
+      "error_class": "declaration_identity_unknown_module_prefix",
       "repo": "pfr",
       "file": "PFR/MoreRuzsaDist.lean",
       "decl": "rdist_of_neg_le",
       "modes": {
         "cold_no_daemon": {
           "runs_ms": [
-            759.1,
-            776.3,
-            802.6,
-            767.3,
-            785.4
+            791.6,
+            828.5,
+            830.8,
+            819.2,
+            824.2
           ],
           "trials": 5,
           "failed_trials": 0,
-          "median_ms": 776.3,
-          "spread_ms": 43.5,
-          "rel_spread": 0.056,
+          "median_ms": 824.2,
+          "spread_ms": 39.2,
+          "rel_spread": 0.0476,
           "coverage_ratio_min": null,
           "coverage_ratio_external_min": null,
           "statuses_observed": [
@@ -2078,108 +2098,108 @@
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.09,
-              "io.full": 1.09,
-              "load1": 1.21
+              "io.some": 1.38,
+              "io.full": 1.38,
+              "load1": 1.17
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.09,
-              "io.full": 1.09,
-              "load1": 1.21
+              "io.some": 1.67,
+              "io.full": 1.67,
+              "load1": 1.17
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.09,
-              "io.full": 1.09,
-              "load1": 1.21
+              "io.some": 1.67,
+              "io.full": 1.67,
+              "load1": 1.17
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.44,
-              "io.full": 1.44,
-              "load1": 1.21
+              "io.some": 1.67,
+              "io.full": 1.67,
+              "load1": 1.17
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.44,
-              "io.full": 1.44,
-              "load1": 1.21
+              "io.some": 1.67,
+              "io.full": 1.67,
+              "load1": 1.17
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.44,
-              "io.full": 1.44,
-              "load1": 1.19
+              "io.some": 1.73,
+              "io.full": 1.73,
+              "load1": 1.17
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.44,
-              "io.full": 1.44,
-              "load1": 1.19
+              "io.some": 1.73,
+              "io.full": 1.73,
+              "load1": 1.17
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.44,
-              "io.full": 1.44,
-              "load1": 1.19
+              "io.some": 1.73,
+              "io.full": 1.73,
+              "load1": 1.17
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.54,
-              "io.full": 1.54,
-              "load1": 1.19
+              "io.some": 1.73,
+              "io.full": 1.73,
+              "load1": 1.17
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.54,
-              "io.full": 1.54,
-              "load1": 1.19
+              "io.some": 1.73,
+              "io.full": 1.73,
+              "load1": 1.16
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.54,
-              "io.full": 1.54,
-              "load1": 1.19
+              "io.some": 1.78,
+              "io.full": 1.78,
+              "load1": 1.16
             },
             {
               "cpu.some": 0.0,
               "cpu.full": 0.0,
               "memory.some": 0.0,
               "memory.full": 0.0,
-              "io.some": 1.54,
-              "io.full": 1.54,
-              "load1": 1.19
+              "io.some": 1.78,
+              "io.full": 1.78,
+              "load1": 1.16
             }
           ],
           "psi_max": {
@@ -2187,23 +2207,31 @@
             "cpu.full": 0.0,
             "memory.some": 0.0,
             "memory.full": 0.0,
-            "io.some": 1.54,
-            "io.full": 1.54,
-            "load1": 1.21
+            "io.some": 1.78,
+            "io.full": 1.78,
+            "load1": 1.17
           },
           "psi_contended": false,
           "error_classes": [
-            "exit_1"
+            "declaration_identity_unknown_module_prefix"
           ],
-          "stderr_excerpt": "Error: Cannot report a verdict: declaration identity unconfirmed for `rdist_of_neg_le`\n\nCaused by:\n    0: Declaration identity probe failed isolated `.olean` validation: /tmp/turbo_lean_scratch_995/turbo_id_src_465392_1794824440436767351_465392_7_1794824440436767545/TurboIdentityProbe_465392_1794824440436767351_465392_7_1794824440436767545.lean:1:0: error: unknown module prefix 'PFR'\n       \n       No directory 'PFR' or file 'PFR.olean' in the search path entries:\n       /var/lib/sandboxed-node/"
+          "probe_error_classes": [
+            "declaration_identity_unknown_module_prefix",
+            "declaration_identity_unknown_module_prefix",
+            "declaration_identity_unknown_module_prefix",
+            "declaration_identity_unknown_module_prefix",
+            "declaration_identity_unknown_module_prefix",
+            "declaration_identity_unknown_module_prefix"
+          ],
+          "stderr_excerpt": "Error: Cannot report a verdict: declaration identity unconfirmed for `rdist_of_neg_le`\n\nCaused by:\n    0: Declaration identity probe failed isolated `.olean` validation: /tmp/turbo_lean_scratch_995/turbo_id_src_648989_1794835785150695494_648989_7_1794835785150695810/TurboIdentityProbe_648989_1794835785150695494_648989_7_1794835785150695810.lean:1:0: error: unknown module prefix 'PFR'\n       \n       No directory 'PFR' or file 'PFR.olean' in the search path entries:\n       /var/lib/sandboxed-node/"
         }
       }
     }
   },
   "turbo_lean_dirty": false,
-  "turbo_lean_repo": "/var/lib/sandboxed-node/work/d17939fd-769a-46fc-8460-9b193fa15dab/turbo-lean-m1",
+  "turbo_lean_repo": "/var/lib/sandboxed-node/work/dfa68a51-1927-4562-8cc7-569a995aaa7c/turbo-lean-m1",
   "turbo_lean_binary": {
-    "path": "/var/lib/sandboxed-node/work/d17939fd-769a-46fc-8460-9b193fa15dab/turbo-lean-m1/target/release/turbo-lean",
+    "path": "/var/lib/sandboxed-node/work/dfa68a51-1927-4562-8cc7-569a995aaa7c/turbo-lean-m1/target/release/turbo-lean",
     "sha256": "885dfd0cbb4276501e79d6e9ff7d33f8fc41e2f94caaf417d632e165220e0d02"
   },
   "workload_revs": {
@@ -2212,8 +2240,8 @@
   },
   "revs_pinned": true,
   "node": {
-    "load1_at_start": 0.15,
-    "load1_at_end": 1.19,
+    "load1_at_start": 0.25,
+    "load1_at_end": 1.16,
     "busy_allowed": false
   },
   "args": {
@@ -2228,10 +2256,15 @@
     "measured_nothing": [],
     "comparison_errors": [],
     "unexpected_successes": [],
+    "unexpected_blocked_failures": [],
     "pfr_status": "blocked_as_expected",
     "skipped_reason": "no baseline given or found",
     "same_binary": null,
+    "baseline_commit": null,
+    "run_commit": "eae0d401743184585f9aea22763372255bb0c219",
+    "baseline_binary_sha256": null,
+    "run_binary_sha256": "885dfd0cbb4276501e79d6e9ff7d33f8fc41e2f94caaf417d632e165220e0d02",
     "gates": {}
   },
-  "run_duration_s": 386.3
+  "run_duration_s": 384.3
 }
