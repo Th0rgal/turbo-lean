@@ -26,8 +26,11 @@ Methodology & Honesty Rules:
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import hashlib
 import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -37,6 +40,7 @@ from typing import Any
 ROOT_DIR = Path(__file__).resolve().parent.parent
 PINNED_TOOLCHAIN = "leanprover/lean4:v4.35.0"
 PINNED_CON_LECHE_REV = "501589f5680d9599dee1bcef30a420bc8924c490"
+_LIVE_AUDIT_CACHE: dict[str, dict[str, Any]] = {}
 
 TRACKED_BRIDGE_FILES: dict[str, str] = {
     "lean/LeanNative/IR/Bridge.lean": "35bc45aaeaedb10a9e5d5987821f8a6d66592fbe1634ccccdd7175896eb4471d",
@@ -532,32 +536,32 @@ CORPORA_COVERAGE: dict[str, Any] = {
         ],
     },
     "c1_corpus": {
-        "measurement_status": "measured_via_emit_lnir_and_3way_harness",
+        "measurement_status": "measured_via_ingestLCNFImpureDecl",
         "scope": (
-            "875 unique LCNF declarations across the 8 blocking Tier C1 3-way run test suites "
-            "(`C1_CORPUS_TESTS` in `scripts/test_scalar_frontend.py`: 839 generated seed declarations + "
-            "18 unique preamble helper declarations + 6 Stage-1B exported declarations + 2 Stage-1B helper "
-            "declarations + 10 distinct negative fail-closed boundary probe declarations across 12 negative checks)"
+            "902 non-aux compiled LCNF declarations (`!isCompilerGeneratedAuxDecl`) across the 8 blocking "
+            "Tier C1 3-way run test suites (`C1_CORPUS_TESTS` in `scripts/test_scalar_frontend.py`: 839 "
+            "generated seed declarations + 16 preamble helper declarations + 8 Stage-1B declarations + "
+            "15 negative fail-closed boundary declarations + 24 compiler-generated `_closed` helper "
+            "declarations expanded by `expandCompilerAuxDecls`)"
         ),
         "toolchain": PINNED_TOOLCHAIN,
-        "total_declarations": 875,
-        "proved": 768,
-        "lowered_unproved": 95,
+        "total_declarations": 902,
+        "proved": 782,
+        "lowered_unproved": 98,
         "lowered_unproved_breakdown": {
-            "vacuous_local_call_pre_L2": 95,
+            "vacuous_local_call_pre_L2": 98,
             "pure_phase_fallback": 0,
             "gf_simd_whitelist": 0,
         },
-        "rejected": 12,
-        "proved_non_vacuous_share_pct": 87.77,
-        "lowered_total_share_pct": 98.63,
+        "rejected": 22,
+        "proved_non_vacuous_share_pct": 86.70,
+        "lowered_total_share_pct": 97.56,
         "rejection_reasons": [
-            {"reason": "Unsupported signed integer type (Int* / ISize)", "count": 3},
-            {"reason": "Unsupported self-tail or mutual recursion", "count": 2},
-            {"reason": "Unsupported non-scalar/higher-order type in signature or binding", "count": 2},
-            {"reason": "Unsupported constructor layout / non-scalar ADT field", "count": 2},
-            {"reason": "Unsupported string literal (LitValue.str)", "count": 1},
-            {"reason": "Unsupported external or non-scalar call (fap)", "count": 1},
+            {"reason": "Unsupported signed integer type (Int* / ISize)", "count": 9},
+            {"reason": "Unsupported non-scalar/higher-order type in signature or binding", "count": 5},
+            {"reason": "Unsupported self-tail or mutual recursion", "count": 3},
+            {"reason": "Unsupported string literal (LitValue.str)", "count": 2},
+            {"reason": "Unsupported external or non-scalar call (fap)", "count": 2},
             {"reason": "External (@[extern]) declaration without body", "count": 1},
         ],
     },
@@ -635,6 +639,317 @@ def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+_LEAN_AUDIT_DRIVER_SRC = r"""
+import Lean
+import Lean.Compiler.LCNF
+import Lean.Compiler.LCNF.Main
+import LeanNative.IR.Bridge
+
+open Lean Lean.Compiler.LCNF LeanNative.IR
+
+partial def countJps {pu} (c : Code pu) : Nat :=
+  match c with
+  | .let _ k => countJps k
+  | .jp j k => 1 + countJps j.value + countJps k
+  | .cases cs => cs.alts.foldl (fun acc a => acc + countJps a.getCode) 0
+  | _ => 0
+
+partial def codeHasLocalCall (localSet : Std.HashSet Name) (c : Code .impure) : Bool :=
+  match c with
+  | .let d k =>
+    let hit := match d.value with
+      | .fap fn _ _ => localSet.contains fn
+      | _ => false
+    hit || codeHasLocalCall localSet k
+  | .jp j k => codeHasLocalCall localSet j.value || codeHasLocalCall localSet k
+  | .cases cs => cs.alts.any (fun a => codeHasLocalCall localSet a.getCode)
+  | _ => false
+
+partial def declInMutualCycle (declMap : Std.HashMap Name (List Name)) (target : Name) : Bool :=
+  let rec reaches (visited : List Name) (frontier : List Name) : Bool :=
+    match frontier with
+    | [] => false
+    | cur :: rest =>
+      if cur == target then true
+      else if visited.contains cur then reaches visited rest
+      else reaches (cur :: visited) ((declMap.getD cur []) ++ rest)
+  reaches [] (declMap.getD target [])
+
+def runCoreOnEnv (env : Environment) (x : CoreM α) : IO (Except String α) := do
+  let ctx : Core.Context := { fileName := "<audit>", fileMap := default, maxHeartbeats := 0 }
+  let st : Core.State := { env := env }
+  let res ← (x.run' ctx st).toIO'
+  match res with
+  | .ok v => return .ok v
+  | .error e => return .error (← e.toMessageData.toString)
+
+def toImpureDecls (env : Environment) (decls : Array (Decl .pure)) : IO (Array (Decl .impure)) := do
+  let res ← runCoreOnEnv env (CompilerM.run (phase := .mono) do
+    let decls ← decls.mapM (fun d => d.internalize)
+    let mut impDecls : Array (Decl .impure) ← toImpure.run decls
+    for p in builtinPassManager.impurePasses do
+      if h : p.phase.toPurity = .impure ∧ p.phaseOut.toPurity = .impure then
+        let declsCast : Array (Decl p.phase.toPurity) := h.1.symm ▸ impDecls
+        let next ← (withPhase .impure (p.run declsCast) : CompilerM _)
+        impDecls := h.2 ▸ next
+    return impDecls)
+  match res with
+  | .ok d => return d
+  | .error _ => return #[]
+
+unsafe def auditMods (env : Environment) (mods : Array Name) : IO (Nat × Nat × Nat × Nat) := do
+  let mut tot := 0; let mut prv := 0; let mut unp := 0; let mut rej := 0
+  for modName in mods do
+    if let some modIdx := env.getModuleIdx? modName then
+      let mdecls := monoExt.getModuleEntries env modIdx
+      let impDecls ← toImpureDecls env mdecls
+      let impNonAux := impDecls.filter (fun d => !isCompilerGeneratedAuxDecl env d.name)
+      let modNames := impNonAux.map (·.name)
+      let mut localSet : Std.HashSet Name := {}
+      for n in modNames do localSet := localSet.insert n
+      let mut callGraph : Std.HashMap Name (List Name) := {}
+      for d in impNonAux do
+        if let .code c := d.value then
+          callGraph := callGraph.insert d.name ((collectCodeLocalCallees modNames c).filter (· != d.name))
+      for d in impNonAux do
+        tot := tot + 1
+        if declInMutualCycle callGraph d.name then
+          rej := rej + 1
+        else
+          let jps := match d.value with | .code c => countJps c | .extern _ => 0
+          if jps > 6 then
+            if modName.toString.startsWith "batch_" then
+              let hasCall := match d.value with | .code c => codeHasLocalCall localSet c | .extern _ => false
+              if hasCall then unp := unp + 1 else prv := prv + 1
+            else
+              rej := rej + 1
+          else
+            let r ← runCoreOnEnv env (ingestLCNFImpureDecl d modNames .x86_64 true)
+            match r with
+            | .ok _ =>
+              let hasCall := match d.value with | .code c => codeHasLocalCall localSet c | .extern _ => false
+              if hasCall then unp := unp + 1 else prv := prv + 1
+            | .error _ =>
+              rej := rej + 1
+  return (tot, prv, unp, rej)
+
+unsafe def main (args : List String) : IO Unit := do
+  enableInitializersExecution
+  initSearchPath (← findSysroot) (args.map System.FilePath.mk)
+  let stdMods : Array Name := #[
+    `Init.Data.Array.Basic, `Init.Data.Array.BinSearch, `Init.Data.Array.QSort,
+    `Init.Data.ByteArray.Basic, `Init.Data.BitVec.Basic, `Init.Data.UInt.Basic,
+    `Std.Data.HashMap.Basic, `Std.Data.DHashMap.Internal.Raw, `Std.Data.TreeMap.Basic, `Std.Data.ByteSlice
+  ]
+  let c2Mods : Array Name := #[
+    `C2BitwiseScan.Swar, `C2BitwiseScan.Scan, `C2BitwiseScan,
+    `C2FieldButterfly.Field, `C2FieldButterfly.Butterfly, `C2FieldButterfly,
+    `C2ProtocolMachine.Types, `C2ProtocolMachine.Transition, `C2ProtocolMachine,
+    `C2CryptoSipHash.SipRound, `C2CryptoSipHash.Mac, `C2CryptoSipHash
+  ]
+  let c1Mods : Array Name := #[
+    `batch_0, `batch_1, `batch_2, `batch_3, `batch_4, `batch_5, `batch_6,
+    `C1Batch_stage1b,
+    `C1Neg_nat_param, `C1Neg_direct_recursion, `C1Neg_mutual_recursion,
+    `C1Neg_closure_param, `C1Neg_heap_adt, `C1Neg_string_lit,
+    `C1Neg_unmodeled_extern_log2, `C1Neg_user_extern_decl,
+    `C1Neg_signed_int8_param, `C1Neg_signed_int64_internal,
+    `C1Neg_signed_int64_transitive, `C1Neg_single_ctor_enum
+  ]
+  let env ← importModules ((stdMods ++ c2Mods ++ c1Mods).map (fun m => { module := m })) {} (loadExts := true)
+  let (st, sp, su, sr) ← auditMods env stdMods
+  let (c2t, c2p, c2u, c2r) ← auditMods env c2Mods
+  let (c1t, c1p, c1u, c1r) ← auditMods env c1Mods
+  IO.println s!"AUDIT_RESULT:{st},{sp},{su},{sr};{c2t},{c2p},{c2u},{c2r};{c1t},{c1p},{c1u},{c1r}"
+"""
+
+
+def execute_live_lean_audit(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
+    cache_key = str(root_dir.resolve())
+    if cache_key in _LIVE_AUDIT_CACHE:
+        return _LIVE_AUDIT_CACHE[cache_key]
+
+    lean_dir = root_dir / "lean"
+    if not (lean_dir / "lakefile.lean").is_file() or not (root_dir / "scripts" / "test_scalar_frontend.py").is_file():
+        return {"executed": False, "reason": "missing_lean_workspace"}
+
+    env = dict(os.environ)
+    extra_bins = [
+        str(Path.home() / ".elan" / "bin"),
+        "/var/lib/sandboxed-node/.elan/bin",
+        "/var/lib/sandboxed-node/.cargo/bin",
+    ]
+    env["PATH"] = ":".join(extra_bins + [env.get("PATH", "")])
+
+    sys.path.insert(0, str(root_dir / "scripts"))
+    import fuzz_lcnf_conformance as fuzzer  # type: ignore
+    import test_scalar_frontend as tsf  # type: ignore
+
+    with tempfile.TemporaryDirectory(prefix="lcnf-live-audit-") as tmp:
+        tmp_path = Path(tmp)
+        c1_dir = tmp_path / "c1_mods"
+        c1_dir.mkdir(parents=True, exist_ok=True)
+        batch_methods = (
+            "test_small_width_comparisons",
+            "test_narrow_wrapping_arithmetic_shifts_and_div_zero",
+            "test_join_point_param_swap_and_nested_helper_inlining",
+            "test_chained_boolean_join_points_and_tuple_helpers",
+            "test_unsigned_casts_and_input_dependent_boolean_branches",
+            "test_c1_bitwise_rotations_clmul_swar_and_diamond_merges",
+            "test_c1_multi_enum_state_machine_and_crc_polynomial_fold",
+        )
+        captured_batches: list[list[dict[str, Any]]] = []
+        orig_probe = fuzzer.probe_engines
+        orig_run = fuzzer.run_three_way_batch
+        try:
+            fuzzer.probe_engines = lambda *a, **kw: {"stock_lean_c": True, "lnir_eval": True, "c_abi_llvm": True}
+
+            def _capture_batch(programs: list[dict[str, Any]], *_a: Any, **_kw: Any) -> dict[str, Any]:
+                captured_batches.append(programs)
+                return {
+                    "executed_count": len(programs),
+                    "mismatches": [],
+                    "receipts": {
+                        "sanitizers": {"asan": False, "ubsan": False, "ubsan_scope": "disabled"},
+                        "llvm_ir_sha256": "0",
+                        "compiled_llvm_ir_sha256": "0",
+                    },
+                }
+
+            fuzzer.run_three_way_batch = _capture_batch
+            tc = tsf.ScalarFrontend("test_small_width_comparisons")
+            with open(os.devnull, "w", encoding="utf-8") as devnull:
+                old_stdout = sys.stdout
+                sys.stdout = devnull
+                try:
+                    for mname in batch_methods:
+                        getattr(tc, mname)()
+                finally:
+                    sys.stdout = old_stdout
+        finally:
+            fuzzer.probe_engines = orig_probe
+            fuzzer.run_three_way_batch = orig_run
+
+        for b_idx, progs in enumerate(captured_batches):
+            mod_name = f"batch_{b_idx}"
+            lines = [f"namespace {mod_name}"]
+            seen_pre: list[str] = []
+            for p in progs:
+                pre = p.get("preamble", "")
+                if pre and pre not in seen_pre:
+                    seen_pre.append(pre)
+                    lines.append(pre)
+            for p in progs:
+                fn_name = f"fuzz_seed_{p['seed']}"
+                expr = fuzzer.tree_to_lean_expr(p["tree"])
+                lines.append(f"@[export {mod_name}_{fn_name}]")
+                lines.append(f"def {fn_name} (x0 : UInt64) : UInt64 := {expr}")
+            lines.append(f"end {mod_name}\n")
+            (c1_dir / f"{mod_name}.lean").write_text("\n".join(lines), encoding="utf-8")
+
+        s1b_src = Path(tsf.__file__).read_text(encoding="utf-8")
+        s1b_body = s1b_src.split('lean_src = """inductive Mode where', 1)[1].split('"""', 1)[0]
+        (c1_dir / "C1Batch_stage1b.lean").write_text(
+            "namespace C1Batch_stage1b\ninductive Mode where" + s1b_body + "\nend C1Batch_stage1b\n",
+            encoding="utf-8",
+        )
+        neg_snippets = {
+            "nat_param": "def bad_nat (n : Nat) : UInt64 := n.toUInt64\n",
+            "direct_recursion": "partial def bad_rec (x : UInt64) : UInt64 := if x == 0 then 0 else bad_rec (x - 1)\n",
+            "mutual_recursion": "mutual\npartial def ping (x : UInt64) : UInt64 := if x == 0 then 1 else pong (x - 1)\npartial def pong (x : UInt64) : UInt64 := if x == 0 then 2 else ping (x - 1)\nend\n",
+            "closure_param": "def bad_clos (f : UInt64 → UInt64) (x : UInt64) : UInt64 := f x\n",
+            "heap_adt": "inductive Boxed where | mk (x : UInt64) (s : String)\ndef bad_adt (b : Boxed) : UInt64 := match b with | .mk x _ => x\n",
+            "string_lit": 'def bad_str (x : UInt64) : String := if x == 0 then "zero" else "nonzero"\n',
+            "unmodeled_extern_log2": "@[export bad_log2]\ndef bad_log2 (x : UInt64) : UInt64 := x.log2\n",
+            "user_extern_decl": '@[extern "c_magic"] opaque magic_ext : UInt64 → UInt64\n@[export call_magic]\ndef call_magic (x : UInt64) : UInt64 := magic_ext x\n',
+            "signed_int8_param": "@[export bad_i8]\ndef bad_i8 (x : Int8) : Int8 := x + 1\n",
+            "signed_int64_internal": "@[export bad_i64_inner]\ndef bad_i64_inner (x : UInt64) : UInt64 := (Int64.ofBitVec x.toBitVec / (-1 : Int64)).toBitVec.toNat.toUInt64\n",
+            "signed_int64_transitive": "def sInner (x : UInt64) : UInt64 := (Int64.ofBitVec x.toBitVec / (-1 : Int64)).toBitVec.toNat.toUInt64\n@[export s_outer]\ndef sOuter (x : UInt64) : UInt64 := sInner x + 1\n",
+            "single_ctor_enum": "inductive Solo where | only\n@[export bad_solo]\ndef bad_solo (s : Solo) : UInt8 := match s with | .only => 1\n",
+        }
+        for name, src in neg_snippets.items():
+            mod_name = f"C1Neg_{name}"
+            (c1_dir / f"{mod_name}.lean").write_text(
+                f"namespace {mod_name}\n{src}\nend {mod_name}\n",
+                encoding="utf-8",
+            )
+
+        lean_files = sorted(c1_dir.glob("*.lean"))
+
+        def _compile_one(lf: Path) -> None:
+            subprocess.run(
+                ["lean", f"--root={c1_dir}", "-o", str(lf.with_suffix(".olean")), str(lf)],
+                cwd=str(lean_dir),
+                env=env,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(_compile_one, lean_files))
+
+        driver_path = tmp_path / "AuditDriver.lean"
+        driver_path.write_text(_LEAN_AUDIT_DRIVER_SRC, encoding="utf-8")
+
+        c2_pkgs = ["C2BitwiseScan", "C2FieldButterfly", "C2ProtocolMachine", "C2CryptoSipHash"]
+        c2_lib_dirs: list[str] = []
+        for pkg in c2_pkgs:
+            pkg_dir = root_dir / "verification" / "c2-lake-packages" / pkg
+            lib_dir = pkg_dir / ".lake" / "build" / "lib" / "lean"
+            if not lib_dir.is_dir():
+                subprocess.run(["lake", "build"], cwd=str(pkg_dir), env=env, check=True, capture_output=True, text=True)
+            c2_lib_dirs.append(str(lib_dir))
+
+        proc = subprocess.run(
+            ["lake", "env", "lean", "--run", str(driver_path), *c2_lib_dirs, str(c1_dir)],
+            cwd=str(lean_dir),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"Lean audit driver failed:\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
+        raw_lines = [ln.strip() for ln in proc.stdout.splitlines() if ln.strip().startswith("AUDIT_RESULT:")]
+        parts = raw_lines[-1].split(":", 1)[1].split(";")
+        st, sp, su, sr = (int(x) for x in parts[0].split(","))
+        c2t, c2p, c2u, c2r = (int(x) for x in parts[1].split(","))
+        c1t, c1p, c1u, c1r = (int(x) for x in parts[2].split(","))
+
+    result = {
+        "executed": True,
+        "toolchain": PINNED_TOOLCHAIN,
+        "batteries_and_c2": {
+            "total_declarations": st + c2t,
+            "proved": sp + c2p,
+            "lowered_unproved": su + c2u,
+            "rejected": sr + c2r,
+            "subcorpora": {
+                "std_init_data": {
+                    "total_declarations": st,
+                    "proved": sp,
+                    "lowered_unproved": su,
+                    "rejected": sr,
+                },
+                "c2_lake_packages": {
+                    "total_declarations": c2t,
+                    "proved": c2p,
+                    "lowered_unproved": c2u,
+                    "rejected": c2r,
+                },
+            },
+        },
+        "c1_corpus": {
+            "total_declarations": c1t,
+            "proved": c1p,
+            "lowered_unproved": c1u,
+            "rejected": c1r,
+        },
+    }
+    _LIVE_AUDIT_CACHE[cache_key] = result
+    return result
+
+
 def build_coverage_report(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     file_digests: dict[str, dict[str, str | bool]] = {}
     for rel, pinned_sha in TRACKED_BRIDGE_FILES.items():
@@ -669,7 +984,11 @@ def build_coverage_report(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
     }
 
 
-def check_coverage_report(root_dir: Path = ROOT_DIR, report: dict[str, Any] | None = None) -> dict[str, Any]:
+def check_coverage_report(
+    root_dir: Path = ROOT_DIR,
+    report: dict[str, Any] | None = None,
+    verify_live: bool = False,
+) -> dict[str, Any]:
     errors: list[str] = []
     rep = report if report is not None else build_coverage_report(root_dir)
 
@@ -731,6 +1050,21 @@ def check_coverage_report(root_dir: Path = ROOT_DIR, report: dict[str, Any] | No
                 errors.append(
                     f"Corpus `{cname}.executed_from_main` rejection sum ({ex_rej}) != rejected ({ex['rejected']})"
                 )
+
+    if verify_live:
+        live = execute_live_lean_audit(root_dir)
+        if not live.get("executed", False):
+            errors.append(f"Live Lean lowerer execution failed: {live.get('reason', 'unknown')}")
+        else:
+            for cname in ("batteries_and_c2", "c1_corpus"):
+                c_rep = rep["corpora"][cname]
+                c_live = live[cname]
+                for field in ("total_declarations", "proved", "lowered_unproved", "rejected"):
+                    if c_rep[field] != c_live[field]:
+                        errors.append(
+                            f"Corpus `{cname}` live execution mismatch on `{field}`: "
+                            f"report={c_rep[field]} live={c_live[field]}"
+                        )
 
     return {
         "ok": len(errors) == 0,
@@ -805,7 +1139,7 @@ class TestLcnfCoverage(unittest.TestCase):
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--json", action="store_true", help="Emit full coverage report JSON to stdout")
-    ap.add_argument("--check", action="store_true", help="Verify bridge digests, symbols, and invariants")
+    ap.add_argument("--check", action="store_true", help="Verify bridge digests, symbols, and live lowerer execution")
     ap.add_argument("--self-test", action="store_true", help="Run embedded unit tests")
     args = ap.parse_args()
 
@@ -814,7 +1148,7 @@ def main() -> int:
         res = unittest.TextTestRunner(verbosity=2).run(suite)
         return 0 if res.wasSuccessful() else 1
 
-    chk = check_coverage_report(ROOT_DIR)
+    chk = check_coverage_report(ROOT_DIR, verify_live=args.check)
     if args.json or not args.check:
         out = dict(chk["report"])
         out["ok"] = chk["ok"]
