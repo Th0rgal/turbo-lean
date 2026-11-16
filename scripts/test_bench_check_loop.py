@@ -681,12 +681,19 @@ class PfrAndSourceSafety(unittest.TestCase):
         "    open(os.path.join(pkg, 'B.olean'), 'w').write('x')\n"
         "if '--no-auto-worktree-link' in args:\n"
         "    mode = os.environ.get('FAKE_PFR_MODE', 'fail')\n"
-        "    if mode == 'pass' or (mode == 'pass_first' and n == 0):\n"
-        "        print(json.dumps({'status': 'theorem_verified', 'decl': 'd',\n"
-        "                          'elapsed_ms': 40, 'phase_timings': {\n"
-        "                          'wall_ms': 200.0, 'coverage_ratio': 0.99,\n"
-        "                          'phases_ms': {}}})); sys.exit(0)\n"
-        "    print(json.dumps({'error': 'stale imports: import_refresh fail-closed'}))\n"
+         "    if mode == 'pass' or (mode == 'pass_first' and n == 0):\n"
+         "        print(json.dumps({'status': 'theorem_verified', 'decl': 'd',\n"
+         "                          'elapsed_ms': 40, 'phase_timings': {\n"
+         "                          'wall_ms': 200.0, 'coverage_ratio': 0.99,\n"
+         "                          'phases_ms': {}}})); sys.exit(0)\n"
+         "    if mode == 'unexpected':\n"
+         "        print(json.dumps({'error': 'Error: Declaration `typo` not found in PFR/MoreRuzsaDist.lean'}))\n"
+         "        sys.exit(1)\n"
+         "    if mode == 'id_unconfirmed':\n"
+         "        sys.stderr.write(\"Error: Cannot report a verdict: declaration identity unconfirmed for `rdist_of_neg_le`\\nerror: unknown module prefix 'PFR'\\n\")\n"
+         "        sys.exit(1)\n"
+         "    print(json.dumps({'error': 'stale imports: import_refresh fail-closed'}))\n"
+
         "    sys.exit(1)\n"
         "status = 'theorem_cache_hit'\n"
         "if not os.environ.get('TURBO_LEAN_NO_DAEMON'):\n"
@@ -713,6 +720,48 @@ class PfrAndSourceSafety(unittest.TestCase):
             r = self._run(td, ["--no-baseline"], env_extra={"FAKE_PFR_MODE": "pass"})
             self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
             self.assertIn("stale_expectation", r.stdout)
+
+    def test_pfr_error_classes_are_specific_and_unexpected_failure_is_rejected(self):
+        mod = load_script()
+        pfr = [w for w in mod.WORKLOADS if w["id"] == "pfr_more_ruzsa_dist"][0]
+        self.assertIn("expected_error_classes", pfr)
+        self.assertIn("declaration_identity_unknown_module_prefix", pfr["expected_error_classes"])
+        self.assertIn("stale_import_refresh_fail_closed", pfr["expected_error_classes"])
+        self.assertEqual(
+            mod.classify_error(1, None,
+                               "Error: Cannot report a verdict: declaration identity unconfirmed for `rdist_of_neg_le`\n"
+                               "error: unknown module prefix 'PFR'"),
+            "declaration_identity_unknown_module_prefix")
+        self.assertEqual(
+            mod.classify_error(1, None,
+                               "Error: Worktree opt-out prevents refreshing stale imports: Mathlib.Data.Fin.Basic"),
+            "stale_import_refresh_fail_closed")
+        self.assertEqual(mod.classify_error(1, None, "Error: Declaration `typo` not found in file"),
+                         "declaration_not_found")
+        self.assertEqual(mod.classify_error(1, None, "Error: Failed to read x: No such file or directory"),
+                         "source_file_not_found")
+        self.assertEqual(mod.classify_error(1, None, "Error: unrelated failure"), "exit_1")
+
+    def test_pfr_unexpected_failure_is_named_and_nonzero(self):
+        with tempfile.TemporaryDirectory(prefix="m1-pfr-unexpected-") as td:
+            r = self._run(td, ["--no-baseline"], env_extra={"FAKE_PFR_MODE": "unexpected"})
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertNotEqual(r.returncode, 3, r.stdout + r.stderr)
+            combined = r.stdout + r.stderr
+            self.assertIn("blocked_workload_unexpected_failure", combined)
+            self.assertIn("declaration_not_found", combined)
+
+    def test_pfr_expected_failure_is_blocked_as_expected(self):
+        for mode in ("fail", "id_unconfirmed"):
+            with tempfile.TemporaryDirectory(prefix="m1-pfr-expected-") as td:
+                r = self._run(td, ["--no-baseline"], env_extra={"FAKE_PFR_MODE": mode})
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                data = json.loads((Path(td) / "o.json").read_text())
+                pfr = data["workloads"]["pfr_more_ruzsa_dist"]
+                self.assertEqual(pfr["status"], "blocked_as_expected")
+                expected_cls = ("stale_import_refresh_fail_closed" if mode == "fail"
+                                else "declaration_identity_unknown_module_prefix")
+                self.assertEqual(pfr["error_class"], expected_cls)
 
     def test_pfr_every_probe_exit_is_checked_not_just_the_last(self):
         with tempfile.TemporaryDirectory(prefix="m1-pfr-") as td:
