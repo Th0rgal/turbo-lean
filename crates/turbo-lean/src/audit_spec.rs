@@ -4985,4 +4985,29 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
             "{ten_hop_rep}"
         );
     }
+
+    #[test]
+    fn audit_spec_toml_strict_table_accepts_known_keys() {
+        let cfg = AuditSpecPolicyConfig::try_parse_config_str(
+            "[audit_spec]\npolicy = \"default\"\nreject_identity_stubs = true\nforbid_decl_kinds = [\"axiom\"]\n",
+        )
+        .expect("a strict `[audit_spec]` table with known keys must parse")
+        .expect("`[audit_spec]` table must yield a config");
+        assert!(cfg.reject_identity_stubs);
+        assert_eq!(cfg.forbid_decl_kinds, vec!["axiom"]);
+    }
+
+    #[test]
+    fn audit_spec_toml_typo_key_fails_closed() {
+        let err = AuditSpecPolicyConfig::try_parse_config_str(
+            "[audit_spec]\npolicy = \"default\"\nreject_identity_stub = true\n",
+        )
+        .expect_err("a misspelled `[audit_spec]` key must fail closed, never be silently ignored");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reject_identity_stub"),
+            "clear error must name the unknown key: {msg}"
+        );
+    }
 }
+
