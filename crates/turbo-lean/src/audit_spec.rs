@@ -5086,6 +5086,31 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
         .expect("unrelated top-level tables in a project config must still be accepted");
         assert!(cfg.is_none(), "no `[audit_spec]` table means no config");
     }
+
+    #[test]
+    fn audit_spec_dedicated_toml_sibling_top_level_keys_fail_closed() {
+        for (extra, name) in [("[unrelated]\nx = 1\n", "unrelated"), ("stray = true\n", "stray")] {
+            let text = format!("[audit_spec]\npolicy = \"default\"\n{extra}");
+            let err = AuditSpecPolicyConfig::try_parse_config_str_mode(&text, true).expect_err(
+                "a dedicated audit-spec config with top-level entries beside `[audit_spec]` must fail closed, never be silently ignored",
+            );
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(name),
+                "clear error must name the sibling entry `{name}`: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_spec_dedicated_toml_section_alone_still_accepted() {
+        let cfg = AuditSpecPolicyConfig::try_parse_config_str_mode(
+            "[audit_spec]\npolicy = \"default\"\n",
+            true,
+        )
+        .expect("a dedicated config holding only `[audit_spec]` must keep parsing");
+        assert!(cfg.is_some(), "the `[audit_spec]` table must yield a config");
+    }
 }
 
 
