@@ -1552,11 +1552,91 @@ struct RawAuditSpecPathRuleItem {
     forbid_namespaces: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug, Clone)]
 enum RawAuditSpecPathRules {
     Map(std::collections::BTreeMap<String, RawAuditSpecPathRuleBody>),
     List(Vec<RawAuditSpecPathRuleItem>),
+}
+
+impl RawAuditSpecPathRules {
+    fn from_json_value(val: serde_json::Value) -> Result<Self, String> {
+        match val {
+            serde_json::Value::Array(items) => {
+                let mut out = Vec::with_capacity(items.len());
+                for (idx, item) in items.into_iter().enumerate() {
+                    let item: RawAuditSpecPathRuleItem = serde_json::from_value(item)
+                        .map_err(|e| format!("invalid `[[audit_spec.path_rules]]` entry #{idx}: {e}"))?;
+                    out.push(item);
+                }
+                Ok(Self::List(out))
+            }
+            serde_json::Value::Object(map) => {
+                let mut out = std::collections::BTreeMap::new();
+                for (glob, body) in map {
+                    let body: RawAuditSpecPathRuleBody = serde_json::from_value(body)
+                        .map_err(|e| format!("invalid `[audit_spec.path_rules.{glob:?}]` entry: {e}"))?;
+                    out.insert(glob, body);
+                }
+                Ok(Self::Map(out))
+            }
+            other => Err(format!(
+                "`path_rules` must be a table or an array of rule tables, found: {other}"
+            )),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RawAuditSpecPathRules {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let val = serde_json::Value::deserialize(deserializer)?;
+        Self::from_json_value(val).map_err(serde::de::Error::custom)
+    }
+}
+
+fn normalized_audit_spec_key(name: &str) -> String {
+    name.chars()
+        .filter(|c| *c != '_' && *c != '-' && *c != ' ')
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn damerau_levenshtein(a: &[char], b: &[char]) -> usize {
+    let (n, m) = (a.len(), b.len());
+    if n == 0 {
+        return m;
+    }
+    if m == 0 {
+        return n;
+    }
+    let mut d = vec![vec![0usize; m + 1]; n + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for j in 0..=m {
+        d[0][j] = j;
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut v = (d[i - 1][j] + 1).min(d[i][j - 1] + 1).min(d[i - 1][j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                v = v.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = v;
+        }
+    }
+    d[n][m]
+}
+
+/// A top-level table in a config document is a near miss of the accepted
+/// `[audit_spec]`/`[audit-spec]` spellings when its name, lowercased and with
+/// `_`/`-`/spaces removed, is within Damerau-Levenshtein distance 1 of
+/// `auditspec` or `auditspecs`.
+fn is_audit_spec_section_near_miss(name: &str) -> bool {
+    let norm: Vec<char> = normalized_audit_spec_key(name).chars().collect();
+    ["auditspec", "auditspecs"].iter().any(|target| {
+        damerau_levenshtein(&norm, &target.chars().collect::<Vec<_>>()) <= 1
+    })
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -2046,6 +2126,11 @@ impl AuditSpecPolicyConfig {
     ) -> Result<Option<Self>> {
         let trimmed = text.trim();
         if trimmed.is_empty() {
+            if allow_top_level_toml {
+                anyhow::bail!(
+                    "dedicated audit-spec config is empty; expected an `[audit_spec]`/`[audit-spec]` table or a top-level policy object"
+                );
+            }
             return Ok(None);
         }
         if trimmed.starts_with('{') {
@@ -2073,12 +2158,29 @@ impl AuditSpecPolicyConfig {
         }
         let doc: toml::Table =
             toml::from_str(trimmed).context("Malformed TOML in project/audit-spec config")?;
+        for key in doc.keys() {
+            if key == "audit_spec" || key == "audit-spec" {
+                continue;
+            }
+            anyhow::ensure!(
+                !is_audit_spec_section_near_miss(key),
+                "near-miss `[audit_spec]` table `{key}` in TOML config; did you mean `[audit_spec]` or `[audit-spec]`? Refusing to silently ignore it"
+            );
+        }
         let has_underscore = doc.contains_key("audit_spec");
         let has_hyphen = doc.contains_key("audit-spec");
         anyhow::ensure!(
             !(has_underscore && has_hyphen),
             "TOML config cannot specify both `[audit_spec]` and `[audit-spec]`"
         );
+        if (has_underscore || has_hyphen) && allow_top_level_toml {
+            for key in doc.keys() {
+                anyhow::ensure!(
+                    key == "audit_spec" || key == "audit-spec",
+                    "dedicated audit-spec config must not contain top-level entries other than the `[audit_spec]`/`[audit-spec]` table, found `{key}`"
+                );
+            }
+        }
         let Some(sec_val) = doc
             .get("audit_spec")
             .or_else(|| doc.get("audit-spec"))
@@ -4985,4 +5087,126 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
             "{ten_hop_rep}"
         );
     }
+
+    #[test]
+    fn audit_spec_toml_strict_table_accepts_known_keys() {
+        let cfg = AuditSpecPolicyConfig::try_parse_config_str(
+            "[audit_spec]\npolicy = \"default\"\nreject_identity_stubs = true\nforbid_decl_kinds = [\"axiom\"]\n",
+        )
+        .expect("a strict `[audit_spec]` table with known keys must parse")
+        .expect("`[audit_spec]` table must yield a config");
+        assert!(cfg.reject_identity_stubs);
+        assert_eq!(cfg.forbid_decl_kinds, vec!["axiom"]);
+    }
+
+    #[test]
+    fn audit_spec_toml_typo_key_fails_closed() {
+        let err = AuditSpecPolicyConfig::try_parse_config_str(
+            "[audit_spec]\npolicy = \"default\"\nreject_identity_stub = true\n",
+        )
+        .expect_err("a misspelled `[audit_spec]` key must fail closed, never be silently ignored");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("reject_identity_stub"),
+            "clear error must name the unknown key: {msg}"
+        );
+    }
+
+    #[test]
+    fn audit_spec_project_toml_near_miss_table_name_fails_closed() {
+        for name in ["audit_specs", "audit-spce", "auditspecs"] {
+            let err = AuditSpecPolicyConfig::try_parse_config_str(&format!("[{name}]\nx = 1\n"))
+                .expect_err("a near-miss `[audit_spec]` table name in a project config must fail closed, never be silently ignored");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(name),
+                "clear error must name the near-miss table `{name}`: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_spec_project_toml_unrelated_tables_still_accepted() {
+        let cfg = AuditSpecPolicyConfig::try_parse_config_str(
+            "[axioms]\nallow = [\"*._native.bv_decide.ax_*\"]\n\n[csimp]\nallow = []\n",
+        )
+        .expect("unrelated top-level tables in a project config must still be accepted");
+        assert!(cfg.is_none(), "no `[audit_spec]` table means no config");
+    }
+
+    #[test]
+    fn audit_spec_dedicated_toml_sibling_top_level_keys_fail_closed() {
+        for (extra, name) in [("[unrelated]\nx = 1\n", "unrelated"), ("stray = true\n", "stray")] {
+            let text = format!("[audit_spec]\npolicy = \"default\"\n{extra}");
+            let err = AuditSpecPolicyConfig::try_parse_config_str_mode(&text, true).expect_err(
+                "a dedicated audit-spec config with top-level entries beside `[audit_spec]` must fail closed, never be silently ignored",
+            );
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(name),
+                "clear error must name the sibling entry `{name}`: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_spec_path_rules_typo_key_error_names_the_key() {
+        for text in [
+            "[audit_spec]\n[[audit_spec.path_rules]]\nglob_pattern = \"src/**\"\nforbid_decl_kind = [\"axiom\"]\n",
+            "[audit_spec]\n[audit_spec.path_rules.\"src/**\"]\nforbid_decl_kind = [\"axiom\"]\n",
+        ] {
+            let err = AuditSpecPolicyConfig::try_parse_config_str(text).expect_err(
+                "a typo key inside path_rules must fail closed",
+            );
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("forbid_decl_kind"),
+                "error must name the offending key `forbid_decl_kind`: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_spec_dedicated_empty_config_fails_closed() {
+        let err = AuditSpecPolicyConfig::try_parse_config_str_mode("", true).expect_err(
+            "an empty dedicated audit-spec config file must fail closed instead of being silently skipped during discovery",
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("empty"), "clear error must say the config is empty: {msg}");
+    }
+
+    #[test]
+    fn audit_spec_project_empty_config_still_yields_none() {
+        let cfg = AuditSpecPolicyConfig::try_parse_config_str_mode("", false)
+            .expect("an empty project turbo-lean.toml without `[audit_spec]` stays valid");
+        assert!(cfg.is_none(), "no `[audit_spec]` table means no config");
+    }
+
+    #[test]
+    fn audit_spec_path_rules_valid_map_and_list_still_accepted() {
+        let map_form = "[audit_spec]\n[audit_spec.path_rules.\"src/**\"]\nforbid_decl_kinds = [\"axiom\"]\n";
+        let cfg = AuditSpecPolicyConfig::try_parse_config_str(map_form)
+            .expect("valid map-form path_rules must keep parsing")
+            .expect("config expected");
+        assert_eq!(cfg.path_rules.len(), 1);
+        assert_eq!(cfg.path_rules[0].glob_pattern, "src/**");
+        let list_form = "[audit_spec]\n[[audit_spec.path_rules]]\nglob_pattern = \"lean/**/Proofs/**\"\nallow_decl_names = [\"SymExpr\"]\n";
+        let cfg = AuditSpecPolicyConfig::try_parse_config_str(list_form)
+            .expect("valid list-form path_rules must keep parsing")
+            .expect("config expected");
+        assert_eq!(cfg.path_rules.len(), 1);
+        assert_eq!(cfg.path_rules[0].glob_pattern, "lean/**/Proofs/**");
+    }
+
+    #[test]
+    fn audit_spec_dedicated_toml_section_alone_still_accepted() {
+        let cfg = AuditSpecPolicyConfig::try_parse_config_str_mode(
+            "[audit_spec]\npolicy = \"default\"\n",
+            true,
+        )
+        .expect("a dedicated config holding only `[audit_spec]` must keep parsing");
+        assert!(cfg.is_some(), "the `[audit_spec]` table must yield a config");
+    }
 }
+
+
