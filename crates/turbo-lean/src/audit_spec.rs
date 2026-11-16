@@ -5009,5 +5009,28 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
             "clear error must name the unknown key: {msg}"
         );
     }
+
+    #[test]
+    fn audit_spec_project_toml_near_miss_table_name_fails_closed() {
+        for name in ["audit_specs", "audit-spce", "auditspecs"] {
+            let err = AuditSpecPolicyConfig::try_parse_config_str(&format!("[{name}]\nx = 1\n"))
+                .expect_err("a near-miss `[audit_spec]` table name in a project config must fail closed, never be silently ignored");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(name),
+                "clear error must name the near-miss table `{name}`: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_spec_project_toml_unrelated_tables_still_accepted() {
+        let cfg = AuditSpecPolicyConfig::try_parse_config_str(
+            "[axioms]\nallow = [\"*._native.bv_decide.ax_*\"]\n\n[csimp]\nallow = []\n",
+        )
+        .expect("unrelated top-level tables in a project config must still be accepted");
+        assert!(cfg.is_none(), "no `[audit_spec]` table means no config");
+    }
 }
+
 
