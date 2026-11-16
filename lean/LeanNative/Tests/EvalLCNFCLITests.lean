@@ -18,19 +18,6 @@ namespace LeanNative.Tests.EvalLCNFCLITests
 
 open LeanNative.Driver.EvalLCNFCLI
 
-/-- Run the two reference evaluators on a kernel-opaque `opaque` constant: Lean's compiled
-    evaluator must succeed while kernel reduction fails, proving which engine produced the value. -/
-private def kernelOpaqueCompiledReferenceProbeIO :
-    IO (Except String CanonicalVal × Except String CanonicalVal) :=
-  open Lean in
-  withElaboratedSnippet "<CompiledRefProbe>"
-    "namespace CompiledRefProbe\nopaque probeSum : UInt64 := UInt64.ofNat (List.range 500).sum\nend CompiledRefProbe\n"
-    `CompiledRefProbe do
-    let app := mkConst `CompiledRefProbe.probeSum
-    let compiled ← Prod.fst <$> (evalAndDecodeCompiledLeanM .x86_64 .uint64 app).run {} {}
-    let kernel ← Prod.fst <$> (evalAndDecodeKernelReductionM .x86_64 .uint64 app).run {} {}
-    pure (compiled, kernel)
-
 #eval show IO Unit from do
   -- 1. Baseline corpus run
   let rep ← runBuiltinCorpusIO
@@ -92,7 +79,7 @@ private def kernelOpaqueCompiledReferenceProbeIO :
   --    compiled evaluator. `CompiledRefProbe.probeSum` is an `opaque` constant, so kernel
   --    reduction cannot unfold it, while Lean's compiled evaluator computes the exact value
   --    124750 — the reference can be neither kernel reduction nor a stub.
-  let (compiledRef, kernelRef) ← kernelOpaqueCompiledReferenceProbeIO
+  let (compiledRef, kernelRef) ← compiledReferenceSelfProbeIO
   match compiledRef, kernelRef with
   | .ok cv, .error _ =>
     if cv != CanonicalVal.uint64 124750 then
