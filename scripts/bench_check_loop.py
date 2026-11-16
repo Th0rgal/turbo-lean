@@ -668,7 +668,7 @@ class Runner:
             src_path = self.source_path(w)
             original = src_path.read_bytes()
             try:
-                for i in range(self.trials):
+                for i in range(-1, self.trials):
                     src = original.decode()
                     s, e, _line = locate_decl_block(src, w["decl"], w.get("line"))
                     edited = src[:s] + insert_bench_have(src[s:e], i) + src[e:]
@@ -677,6 +677,9 @@ class Runner:
                         r = self.run_check(w, cache, home, staging, no_daemon=False)
                     finally:
                         src_path.write_bytes(original)
+                    if i < 0:
+                        continue  # settling run: first edit after the cache-hit
+                                  # phase pays a one-off penalty; discard it
                     edit_runs.append(r["external_wall_ms"])
                     pt = (r.get("json") or {}).get("phase_timings") or {}
                     edit_covs.append(pt.get("coverage_ratio", 0.0))
