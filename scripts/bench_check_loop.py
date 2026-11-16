@@ -805,8 +805,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--turbo-lean-bin", default="target/release/turbo-lean")
-    ap.add_argument("--batteries-dir", required=True)
-    ap.add_argument("--pfr-dir", required=True)
+    ap.add_argument("--batteries-dir")
+    ap.add_argument("--pfr-dir")
     ap.add_argument("--trials", type=int, default=DEFAULT_TRIALS)
     ap.add_argument("--warmup", type=int, default=DEFAULT_WARMUP,
                     help="discarded settling runs before measured trials (default 1)")
@@ -840,6 +840,8 @@ def main(argv=None):
             print(f"OK: {data.get('kind')} at {args.validate_only} is schema-valid "
                   f"({data.get('turbo_lean_commit')}, host {data.get('host', {}).get('hostname')})")
         return 0 if not errs else 1
+    if not args.batteries_dir or not args.pfr_dir:
+        ap.error("--batteries-dir and --pfr-dir are required (unless --validate-only)")
 
     git_bin, git_human = validate_environment(args)
     runner = Runner(args)

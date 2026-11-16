@@ -1,0 +1,396 @@
+{
+  "schema_version": 1,
+  "kind": "baseline",
+  "created_utc": "2026-11-16T05:14:17Z",
+  "turbo_lean_commit": "a5aee090d4150932dcb43781f6b7d909df06e5b9",
+  "host": {
+    "hostname": "uruk",
+    "machine_label": null,
+    "kernel": "Linux 6.8.0-147-generic",
+    "cpu_model": "Intel(R) Core(TM) i7-7700 CPU @ 3.60GHz",
+    "nproc": 8,
+    "mem_gb": 65.6
+  },
+  "trials": 5,
+  "settings": {
+    "TURBO_LEAN_GIT": "/srv/verity-ci-cache/git/git-2.47.1-Linux-x86_64/bin/git",
+    "TURBO_LEAN_ALLOWED_CSIMP": "*",
+    "TURBO_LEAN_ALLOWED_UNSAFE": "*",
+    "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY": "*",
+    "TURBO_LEAN_HOME": "/var/lib/sandboxed-node/work/caches/turbo-lean",
+    "TURBO_LEAN_STAGING_DIR": null,
+    "TURBO_LEAN_NO_DAEMON": null,
+    "TURBO_LEAN_NO_REMOTE_TELEMETRY": "1",
+    "TURBO_LEAN_TELEMETRY": null,
+    "TURBO_LEAN_DAEMON_IDLE_SECS": null,
+    "git_version": "git version 2.47.1",
+    "scratch_root": "/tmp/m1-bench-sq8g0jnf"
+  },
+  "workloads": {
+    "batteries_list_lemmas_top": {
+      "id": "batteries_list_lemmas_top",
+      "status": "ok",
+      "repo": "batteries",
+      "file": "Batteries/Data/List/Lemmas.lean",
+      "decl": "List.dropLast_eq_eraseIdx",
+      "expected_status": "active",
+      "modes": {
+        "cold_no_daemon": {
+          "runs_ms": [
+            3456.5,
+            3423.5,
+            3521.0,
+            3494.1,
+            3330.9
+          ],
+          "trials": 5,
+          "median_ms": 3456.5,
+          "spread_ms": 190.1,
+          "rel_spread": 0.055,
+          "coverage_ratio_min": 1.0,
+          "statuses_observed": [
+            "exit_0"
+          ]
+        },
+        "warm_cache_hit_daemon": {
+          "runs_ms": [
+            906.5,
+            878.9,
+            886.0,
+            894.7,
+            899.2
+          ],
+          "trials": 5,
+          "median_ms": 894.7,
+          "spread_ms": 27.6,
+          "rel_spread": 0.0308,
+          "coverage_ratio_min": 0.9999,
+          "statuses_observed": [
+            "theorem_cache_hit"
+          ]
+        },
+        "warm_edited_proof_daemon": {
+          "runs_ms": [
+            1262.4,
+            1405.4,
+            1348.7,
+            1413.3,
+            1298.7
+          ],
+          "trials": 5,
+          "median_ms": 1348.7,
+          "spread_ms": 150.9,
+          "rel_spread": 0.1119,
+          "coverage_ratio_min": 1.0,
+          "statuses_observed": [
+            "theorem_verified"
+          ]
+        }
+      }
+    },
+    "batteries_string_lemmas_top": {
+      "id": "batteries_string_lemmas_top",
+      "status": "ok",
+      "repo": "batteries",
+      "file": "Batteries/Data/String/Lemmas.lean",
+      "decl": "String.lt_antisymm",
+      "expected_status": "active",
+      "modes": {
+        "cold_no_daemon": {
+          "runs_ms": [
+            13672.0,
+            13669.9,
+            13808.2,
+            13731.8,
+            13691.0
+          ],
+          "trials": 5,
+          "median_ms": 13691.0,
+          "spread_ms": 138.3,
+          "rel_spread": 0.0101,
+          "coverage_ratio_min": 1.0,
+          "statuses_observed": [
+            "exit_0"
+          ]
+        },
+        "warm_cache_hit_daemon": {
+          "runs_ms": [
+            1033.7,
+            957.8,
+            968.1,
+            953.6,
+            960.9
+          ],
+          "trials": 5,
+          "median_ms": 960.9,
+          "spread_ms": 80.2,
+          "rel_spread": 0.0834,
+          "coverage_ratio_min": 0.9999,
+          "statuses_observed": [
+            "theorem_cache_hit"
+          ]
+        },
+        "warm_edited_proof_daemon": {
+          "runs_ms": [
+            1375.0,
+            1398.6,
+            1391.0,
+            1377.5,
+            1332.2
+          ],
+          "trials": 5,
+          "median_ms": 1377.5,
+          "spread_ms": 66.4,
+          "rel_spread": 0.0482,
+          "coverage_ratio_min": 1.0,
+          "statuses_observed": [
+            "theorem_verified"
+          ]
+        }
+      }
+    },
+    "batteries_rbtree_lemmas_top": {
+      "id": "batteries_rbtree_lemmas_top",
+      "status": "ok",
+      "repo": "batteries",
+      "file": "Batteries/Recycling/RBTree/Lemmas.lean",
+      "decl": "RBTree.RBNode.min?_reverse",
+      "expected_status": "active",
+      "modes": {
+        "cold_no_daemon": {
+          "runs_ms": [
+            10282.5,
+            10372.7,
+            10222.1,
+            10221.6,
+            10279.5
+          ],
+          "trials": 5,
+          "median_ms": 10279.5,
+          "spread_ms": 151.2,
+          "rel_spread": 0.0147,
+          "coverage_ratio_min": 1.0,
+          "statuses_observed": [
+            "exit_0"
+          ]
+        },
+        "warm_cache_hit_daemon": {
+          "runs_ms": [
+            1187.5,
+            1217.3,
+            1140.6,
+            1174.6,
+            1161.1
+          ],
+          "trials": 5,
+          "median_ms": 1174.6,
+          "spread_ms": 76.7,
+          "rel_spread": 0.0653,
+          "coverage_ratio_min": 0.9999,
+          "statuses_observed": [
+            "theorem_cache_hit"
+          ]
+        },
+        "warm_edited_proof_daemon": {
+          "runs_ms": [
+            1913.7,
+            1791.6,
+            1754.3,
+            1886.1,
+            1833.7
+          ],
+          "trials": 5,
+          "median_ms": 1833.7,
+          "spread_ms": 159.4,
+          "rel_spread": 0.0869,
+          "coverage_ratio_min": 1.0,
+          "statuses_observed": [
+            "theorem_verified"
+          ]
+        }
+      }
+    },
+    "batteries_rbtree_lemmas_mid": {
+      "id": "batteries_rbtree_lemmas_mid",
+      "status": "ok",
+      "repo": "batteries",
+      "file": "Batteries/Recycling/RBTree/Lemmas.lean",
+      "decl": "RBTree.RBNode.Path.ordered_iff",
+      "expected_status": "active",
+      "modes": {
+        "cold_no_daemon": {
+          "runs_ms": [
+            12467.1,
+            12435.6,
+            12359.6,
+            12377.6,
+            12442.8
+          ],
+          "trials": 5,
+          "median_ms": 12435.6,
+          "spread_ms": 107.5,
+          "rel_spread": 0.0086,
+          "coverage_ratio_min": 1.0,
+          "statuses_observed": [
+            "exit_0"
+          ]
+        },
+        "warm_cache_hit_daemon": {
+          "runs_ms": [
+            1591.9,
+            1553.0,
+            1555.7,
+            1609.9,
+            1593.0
+          ],
+          "trials": 5,
+          "median_ms": 1591.9,
+          "spread_ms": 56.9,
+          "rel_spread": 0.0357,
+          "coverage_ratio_min": 0.9999,
+          "statuses_observed": [
+            "theorem_cache_hit"
+          ]
+        },
+        "warm_edited_proof_daemon": {
+          "runs_ms": [
+            2573.8,
+            2572.8,
+            2478.2,
+            2390.2,
+            2488.5
+          ],
+          "trials": 5,
+          "median_ms": 2488.5,
+          "spread_ms": 183.5,
+          "rel_spread": 0.0738,
+          "coverage_ratio_min": 1.0,
+          "statuses_observed": [
+            "theorem_verified"
+          ]
+        }
+      }
+    },
+    "batteries_unionfind_top": {
+      "id": "batteries_unionfind_top",
+      "status": "ok",
+      "repo": "batteries",
+      "file": "Batteries/Data/UnionFind/Basic.lean",
+      "decl": "Batteries.UnionFind.parentD_eq",
+      "expected_status": "active",
+      "modes": {
+        "cold_no_daemon": {
+          "runs_ms": [
+            3676.7,
+            3751.4,
+            3674.9,
+            3719.1,
+            3670.9
+          ],
+          "trials": 5,
+          "median_ms": 3676.7,
+          "spread_ms": 80.5,
+          "rel_spread": 0.0219,
+          "coverage_ratio_min": 1.0,
+          "statuses_observed": [
+            "exit_0"
+          ]
+        },
+        "warm_cache_hit_daemon": {
+          "runs_ms": [
+            839.8,
+            780.5,
+            781.1,
+            771.3,
+            774.7
+          ],
+          "trials": 5,
+          "median_ms": 780.5,
+          "spread_ms": 68.6,
+          "rel_spread": 0.0879,
+          "coverage_ratio_min": 0.9998,
+          "statuses_observed": [
+            "theorem_cache_hit"
+          ]
+        },
+        "warm_edited_proof_daemon": {
+          "runs_ms": [
+            984.9,
+            969.2,
+            1034.6,
+            993.1,
+            1010.4
+          ],
+          "trials": 5,
+          "median_ms": 993.1,
+          "spread_ms": 65.4,
+          "rel_spread": 0.0658,
+          "coverage_ratio_min": 1.0,
+          "statuses_observed": [
+            "theorem_verified"
+          ]
+        }
+      }
+    },
+    "pfr_more_ruzsa_dist": {
+      "status": "blocked_as_expected",
+      "expected_status": "blocked",
+      "exit_code": 1,
+      "error_class": "stale_import_refresh_fail_closed",
+      "modes": {
+        "cold_no_daemon": {
+          "runs_ms": [
+            2477.3,
+            2470.6,
+            2476.2,
+            2473.8,
+            2469.4
+          ],
+          "trials": 5,
+          "median_ms": 2473.8,
+          "spread_ms": 7.8,
+          "rel_spread": 0.0032,
+          "coverage_ratio_min": 0.0,
+          "statuses_observed": [
+            "exit_1"
+          ],
+          "error_classes": [
+            "stale_import_refresh_fail_closed"
+          ],
+          "stderr_excerpt": "Error: Worktree opt-out prevents refreshing stale imports: Mathlib.Algebra.BigOperators.Fin, Mathlib.Analysis.SpecialFunctions.Log.NegMulLog, Mathlib.Data.Fin.Basic, Mathlib.Data.Finset.Pairwise, Mathlib.Data.Set.Basic, Mathlib.Data.Set.Card, Mathlib.Data.Set.Insert, Mathlib.MeasureTheory.Constructions.Pi, Mathlib.MeasureTheory.Group.Arithmetic, Mathlib.MeasureTheory.Integral.Bochner.Basic, Mathlib.MeasureTheory.Integral.IntegrableOn, Mathlib.MeasureTheory.Integral.Lebesgue.Basic, Mathlib.Measur"
+        }
+      },
+      "repo": "pfr",
+      "file": "PFR/MoreRuzsaDist.lean",
+      "decl": "ProbabilityTheory.rdist_of_neg_le"
+    }
+  },
+  "turbo_lean_dirty": true,
+  "turbo_lean_repo": "/var/lib/sandboxed-node/work/d17939fd-769a-46fc-8460-9b193fa15dab/turbo-lean-m1",
+  "turbo_lean_binary": {
+    "path": "/var/lib/sandboxed-node/work/d17939fd-769a-46fc-8460-9b193fa15dab/turbo-lean-m1/target/release/turbo-lean",
+    "sha256": null
+  },
+  "workload_revs": {
+    "batteries": "66e469188fe07963e5cf666c7d4433f45b8131c5",
+    "pfr": "ebe2d96230b1abb190f74592aace441a0f10fe09"
+  },
+  "revs_pinned": true,
+  "args": {
+    "trials": 5,
+    "warmup": 1,
+    "skip_rev_check": false
+  },
+  "verdict": {
+    "verdict": "not_compared",
+    "regressions": [],
+    "improvements": [],
+    "measured_nothing": [],
+    "unexpected_successes": [],
+    "pfr_status": "blocked_as_expected",
+    "skipped_reason": "no baseline given or found",
+    "same_binary": null,
+    "gates": {}
+  },
+  "run_duration_s": 402.2
+}
