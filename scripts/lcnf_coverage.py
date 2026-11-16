@@ -1663,6 +1663,30 @@ class TestLcnfCoverage(unittest.TestCase):
             self.assertNotIn(field, partial_corp)
         run.assert_not_called()
 
+    def test_fixture_corpus_counts_change_when_declaration_added_and_no_hardcoded_totals(self) -> None:
+        # Point 5: a small fixture corpus is measured live, changed by adding a
+        # declaration the lowerer rejects, and the counts are seen to change; test
+        # methods must not hardcode historical corpus totals (1805, 902, 1704, 782).
+        import inspect
+
+        src_live = inspect.getsource(TestLcnfCoverage.test_live_coverage_report_and_invariants)
+        src_exec = inspect.getsource(TestLcnfCoverage.test_executes_live_lean_lowerer_on_corpora)
+        for num in ("1805", "1704", "902", "782"):
+            self.assertNotIn(num, src_live + src_exec, f"hardcoded historical total {num} remains in test")
+
+        base = measure_fixture_corpus(
+            ROOT_DIR,
+            "@[export fix_ok]\ndef fix_ok (x : UInt64) : UInt64 := x + 1\n",
+        )
+        grown = measure_fixture_corpus(
+            ROOT_DIR,
+            "@[export fix_ok]\ndef fix_ok (x : UInt64) : UInt64 := x + 1\n"
+            '@[export fix_bad]\ndef fix_bad (x : UInt64) : String := if x == 0 then "a" else "b"\n',
+        )
+        self.assertGreater(grown["total_declarations"], base["total_declarations"])
+        self.assertGreater(grown["rejected"], base["rejected"])
+        self.assertEqual(grown["proved"], base["proved"])
+
 
 
 def main() -> int:
