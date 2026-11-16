@@ -2135,6 +2135,78 @@ class TestLcnfCoverage(unittest.TestCase):
             chk_bad["errors"],
         )
 
+    # ------------------------------------------------------------------
+    # H1.0a-S (split S): honest proof classification and fail-closed
+    # measurement (DeepSeek soundness findings against the audit driver;
+    # same two paths as H1.0a-V, after V).
+    # ------------------------------------------------------------------
+
+    def test_cross_module_user_call_is_vacuous_not_rejected(self) -> None:
+        # Counterexample (real lowerer, two compiled modules): a declaration in
+        # one measured module calling a user function declared in another
+        # measured module. The per-module localSet misses the cross-module
+        # callee, so the real lowerer fails it as an unsupported call and the
+        # driver counts it `rejected`, while the honest classification for a
+        # call into a measured corpus declaration is a vacuous local call
+        # (`lowered_unproved`) — eval `unsupportedCall` makes the pinned
+        # simulation vacuous exactly like the same-module helper case.
+        lean_dir = ROOT_DIR / "lean"
+        _ensure_lean_build(ROOT_DIR)
+        env = _lean_env()
+        with tempfile.TemporaryDirectory(prefix="lcnf-xmod-") as tmp:
+            root = Path(tmp)
+            (root / "SAux.lean").write_text(
+                "namespace SAux\n"
+                "@[export sa_one]\n"
+                "def sa_one (x : UInt64) : UInt64 := x + 1\n"
+                "end SAux\n",
+                encoding="utf-8",
+            )
+            (root / "SCaller.lean").write_text(
+                "import SAux\n"
+                "namespace SCaller\n"
+                "@[export sc_two]\n"
+                "def sc_two (x : UInt64) : UInt64 := SAux.sa_one x + 1\n"
+                "end SCaller\n",
+                encoding="utf-8",
+            )
+            cenv = dict(env)
+            cenv["LEAN_PATH"] = str(root)
+            for name in ("SAux", "SCaller"):
+                subprocess.run(
+                    ["lean", f"--root={root}", "-o", str(root / f"{name}.olean"), str(root / f"{name}.lean")],
+                    cwd=str(lean_dir),
+                    env=cenv,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            counts = _run_audit_driver(
+                ROOT_DIR, _lean_audit_driver_for_modules(["SAux", "SCaller"]), [str(root)]
+            )
+        tot, prv, unp, rej, cyc = counts
+        self.assertEqual(tot, 2, counts)
+        self.assertEqual(prv, 1, counts)  # the callee itself lowers and proves
+        self.assertEqual(unp, 1, counts)  # the cross-module caller is a vacuous local call
+        self.assertEqual(rej, 0, counts)  # a corpus-local call is not an unsupported construct
+        self.assertEqual(cyc, 0, counts)
+
+    def test_audit_driver_never_silently_drops_a_module(self) -> None:
+        # A module whose IR conversion fails must fail the audit loudly (never
+        # `return #[]`), and a module missing from the imported environment
+        # must never contribute a silent zero: both would understate the
+        # published counts as if the declarations had been measured.
+        self.assertNotIn(".error _ => return #[]", _LEAN_AUDIT_DRIVER_HEAD)
+        self.assertIn("not found in the imported environment", _LEAN_AUDIT_DRIVER_HEAD)
+
+    def test_corpus_scope_does_not_claim_aux_expansion_it_never_performs(self) -> None:
+        # The scope text claimed compiler-generated `_closed` helpers were
+        # "expanded by `expandCompilerAuxDecls`", but the measurement filters
+        # compiler-generated auxiliary declarations out and never calls that
+        # function (only the library's `ingestModuleDeclsWith` does). A scope
+        # claim the measurement does not perform is dishonest output.
+        self.assertNotIn("expandCompilerAuxDecls", CORPUS_SCOPES["c1_corpus"])
+
     def test_std_init_and_c2_renamed_and_external_batteries_separate_unknown(self) -> None:
         # Point 3: the corpus holding Init/Std + C2 is named `std_init_and_c2` (not
         # a misleading Batteries name), and external Batteries is its own top-level
