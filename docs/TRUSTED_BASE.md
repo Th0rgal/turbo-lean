@@ -16,9 +16,14 @@
 - `turbo-lean` wraps kernel *selection*, not the kernel itself: `crates/turbo-lean/src/kernel.rs`
   (`parse_selection`, `resolve_kernel_engine_in_workspace` at `kernel.rs:281`), with the routing rule
   defined and proved in Lean: `routeKernelEngine`, `lean/TurboLean/PolicyGates.lean:113-118`.
-- **Not yet inventoried**: which kernel engine executes by default, end to end, for each CLI entrypoint
-  (the routing depends on a provisioned-backend probe, `kernel.rs:287-293`; deciding what the probe
-  returns in a real checkout needs a build, and no builds were run for this docs pass).
+- Production routing today: `auto` is routed by PolicyGates to con-leche when `conLecheSupported` is
+  true (`routeKernelEngine`, `lean/TurboLean/PolicyGates.lean:113-118`), but the current Rust resolver
+  does not probe support for `auto` — `probe_con_leche_support_for_selection` probes only for explicit
+  `con-leche`/`both` selections and returns an unconditional `None` stub otherwise
+  (`crates/turbo-lean/src/kernel.rs:207-221`) — so production `auto` currently resolves to the
+  standard Lean kernel.
+- **Not yet inventoried**: end-to-end confirmation of the engine that executes for each CLI entrypoint
+  on a built binary (needs a build; none were run for this docs pass).
 
 ## 2. The `LCNF` semantics
 

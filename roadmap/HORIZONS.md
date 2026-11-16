@@ -94,7 +94,7 @@ Accelerator plugins start once there is a benchmark to rank them: untrusted sear
 
 ## Work graph
 
-Leaves are sized to one PR and one owner; the table below is the count of record, with 38 leaves. *RO* means a read-only measurement or feasibility step comes first.
+Leaves are sized to one PR and one owner; the table below is the count of record, with 39 leaves. *RO* means a read-only measurement or feasibility step comes first.
 
 ```mermaid
 flowchart LR
@@ -102,7 +102,8 @@ flowchart LR
     R0[R0 roadmap truth pass]
     S1[S1 split module_builder.rs]
     S2[S2 split zygote.rs + lake_build.rs]
-    S3[S3 split BridgeHelpers + ZygoteWorker]
+    S3a[S3a split BridgeHelpers.lean]
+    S3b[S3b split ZygoteWorker.lean + Rust embed]
     HY1[HY1 contract script fragments]
   end
   subgraph H2
@@ -121,7 +122,7 @@ flowchart LR
   subgraph H1
     H10[H1.0 coverage matrix] --> HF[H1.F freeze statement]
     H11[H1.1 semantics vs Lean] --> L1[L1 single path]
-    S3 --> L1
+    S3a --> L1
     H10 --> L1
     L1 --> L2[L2 calls]
     HF --> L2
@@ -129,6 +130,7 @@ flowchart LR
     L3 --> H14[H1.4 mutants + pin]
   end
   H14 --> H3[H3 ladder]
+  S3b --> P9
 ```
 
 | id | Outcome | Owns | Needs | Accept | Size |
@@ -137,7 +139,8 @@ flowchart LR
 | **HY1** | Contract script split into per-milestone fragments, so proof PRs stop colliding | `scripts/contract.d/` | – | `verify_roadmap_contract.sh` output unchanged | S |
 | **S1** *(done `#463` `fddf22c`)* | `module_builder.rs` (43k LOC) split: dag / freshness / host-effects / publish. Done: the code now lives in `crates/turbo-lean/src/module_builder/{dag,freshness,host_effects,publish}.rs` | that file | – | `cargo test --locked`, no public API diff | L |
 | **S2** *(done `#464` `74fd8e9`)* | `zygote.rs` (17k) and `lake_build.rs` (15k) split by concern. Done: the code now lives in `crates/turbo-lean/src/zygote/{audit,budget,closure,daemon,dispatch,worker}.rs` and `crates/turbo-lean/src/lake_build/{build,cache,env,freshness,impact}.rs` | those files | – | same | L |
-| **S3** | `BridgeHelpers.lean` and `ZygoteWorker.lean` split by construct / command | those files | – | contract script; axiom-audit counts unchanged | M |
+| **S3a** *(in progress: draft `#468`)* | `BridgeHelpers.lean` split by construct / command | `lean/LeanNative/IR/BridgeHelpers.lean`, new files under `lean/LeanNative/IR/BridgeHelpers/` | – | contract script; axiom-audit counts unchanged | M |
+| **S3b** | `ZygoteWorker.lean` split by construct / command | `lean/TurboLean/ZygoteWorker.lean`, its new submodule files, `zygote/worker.rs` (embed + compile list; shared with H2.3 — do not run in parallel) | S2 | contract script; axiom-audit counts unchanged; test that the zygote binary builds from the embedded sources | M |
 | **M0** *(done `#461` `8a1d67d`)* | `#408`: phase timings cover ≥ 90% of wall | `phase_timing.rs` (new) | – | test asserts the sum | M |
 | **M1** *RO* | Pinned benchmark (`Batteries`, `PFR`), baseline JSON; re-triage `#407`–`#443`; close `#371`. Decision recorded here and on P1: M1 is accepted on the `Batteries` workload alone, and the `PFR` workload is turned on by P1 | `scripts/bench_check_loop.py` | M0 | script exits 0, JSON committed | M |
 | **P1** | No redone work on a warm hit (`#407` `#433` `#434` `#438`). Decision recorded here and on M1: M1 is accepted on the `Batteries` workload alone, and the `PFR` workload is turned on by P1 | `module_builder/host_effects.rs` | S1 S2 M1 | bench: zero `lake --no-cache` on warm hit | L |
@@ -148,14 +151,14 @@ flowchart LR
 | **P6** | Snapshot leases (`#439`) | `zygote/closure.rs` | S2 | two-run test | S |
 | **P7** | `build <Lib>` scope (`#436`) | `module_builder/dag.rs` (shared with L299 — do not run in parallel) | S1 | fixture | M |
 | **P8** *(done `#459` `ae16815`)* | Git < 2.46 fails loudly (`#415`) | `trusted_tools.rs` | – | unit test | S |
-| **P9** | Land `#455`; import policy for `csimp` / `unsafe` decided before expensive work (`#411` `#412`) | `kernel.rs`, worker audit | S3 | 140 Batteries calls pass | M |
+| **P9** | Land `#455`; import policy for `csimp` / `unsafe` decided before expensive work (`#411` `#412`) | `kernel.rs`, worker audit | S3b | 140 Batteries calls pass | M |
 | **P10** | Content-hash freshness, `--frozen-cone` (`#339`) | `module_builder/freshness.rs` | S1 | hardlinked-cone fixture, 0 rebuilds | M |
 | **G1a** | `csimp` digest in action and cache keys | `db.rs` keys | P9 | key-diff test | S |
 | **G1b** *RO* *(done `#460` `ad54090`, model only)* | The M2 theorems hold over real `.olean`, or the docs say they are about a model. The `#460` proof covers the documented OLEN v1 model only; the proof against real `.olean` files is still open, so this leaf is not finished | `ConLeche.lean` | – | contract script | L |
 | **G1c** | `--kernel auto` selects the bundled `con-leche` when the toolchain matches | `kernel.rs` | P9 | selection test | S |
 | **G2a** *RO* | CAS replay hit rate on recorded edit sequences | bench script | M1 | number recorded | S |
 | **G2b** | Replay on by default for warm `check`, or deleted | `lake_build/build.rs` | G2a S2 | bench delta | M |
-| **H2.3** | Parallel replay under the RAM budget | `zygote/worker.rs` (pool; partly `dispatch.rs`) | P3 | bench scaling | M |
+| **H2.3** | Parallel replay under the RAM budget | `zygote/worker.rs` (pool; partly `dispatch.rs`; shared with S3b — do not run in parallel) | P3 | bench scaling | M |
 | **H2.G** *RO* | GPU-addressable share of loop time | doc only | M1 | number against the 10% line | S |
 | **A1** *(done `#462` `4e2ba1c`)* | `#367`: strict `[audit_spec]` TOML | `audit_spec.rs` parser | – | typo-key test fails closed | S |
 | **A2** *RO* | `#367`: kernel-backed witness | `PolicyGates.lean` | A1 | `audit-spec` JSON | L |
@@ -164,7 +167,7 @@ flowchart LR
 | **H1.0** *RO* | Generated `LCNF` coverage matrix on `Batteries` and C1 | `scripts/lcnf_coverage.py` | – | CI job emits JSON | M |
 | **H1.1** | `RealLCNFSemantics` as interpreter vs stock Lean; shared definitions separated from the lowerer | `Driver/EvalLCNFCLI.lean` (new) | – | `mismatch_count == 0` | M |
 | **H1.F** | Statement of the H1 theorem frozen and pinned; unverified backends labelled in `--help` | `SpecLocked.lean`, `CoreCLI.lean` | H1.0 | hash pin | S |
-| **L1** | Single path (rung L1) | `Bridge.lean`, helper split | S3 H1.0 H1.1 | one lowering callee; `ΔLOC < 0` | L |
+| **L1** | Single path (rung L1) | `Bridge.lean`, helper split | S3a H1.0 H1.1 | one lowering callee; `ΔLOC < 0` | L |
 | **L2** | Calls (rung L2) | `Semantics/Eval.lean`, `Proofs/LowerCalls.lean` | L1 H1.F | leaf `0 sorryAx`; matrix moves | L |
 | **L3** | Recursion and loops (rung L3) | `IR/AST.lean`, `Proofs/LowerRec.lean` | L2 | same | L |
 | **H1.4** | Mutant kill matrix; coverage number published | `Proofs/LowerRefines.lean` | L3 | mutants in CI | M |
@@ -172,11 +175,11 @@ flowchart LR
 | **C4x** | 10k-seed nightly alias fuzzing | `fuzz_lcnf_conformance.py` | – | nightly green | M |
 | **C1x** | C1 corpus to 250 programs, chosen by the matrix | corpus manifest | H1.0 | `--tier C1` | L |
 
-**Start width**: R0, HY1, S1, S2, S3, M0, P8, A1, G1b, H1.0, H1.1, C2x, C4x have no unmet dependency and disjoint files: thirteen leaves, about eight at once per machine because five need Lean builds.
+**Start width**: R0, HY1, S1, S2, S3a, S3b, M0, P8, A1, G1b, H1.0, H1.1, C2x, C4x have no unmet dependency and disjoint files: fourteen leaves, about eight at once per machine because five need Lean builds.
 
-**Critical path**: H1.0 / H1.1 / S3 → L1 → L2 → L3 → H1.4. Three large proof items in series; nothing shortens it except starting S3, H1.0 and H1.1 now.
+**Critical path**: H1.0 / H1.1 / S3a → L1 → L2 → L3 → H1.4. Three large proof items in series; nothing shortens it except starting S3a, H1.0 and H1.1 now.
 
-**The three splits pay first.** Seven open issues need the module builder, nine need `zygote.rs` or `lake_build.rs`, and every H1 rung needs `BridgeHelpers.lean`. S1 and S2 have landed, so those items are unblocked (`module_builder/{dag,freshness,host_effects,publish}.rs`; `zygote/{audit,budget,closure,daemon,dispatch,worker}.rs`; `lake_build/{build,cache,env,freshness,impact}.rs`); until S3 lands, the items that need `BridgeHelpers.lean` still cannot run in parallel without conflicting.
+**The three splits pay first.** Seven open issues need the module builder, nine need `zygote.rs` or `lake_build.rs`, and every H1 rung needs `BridgeHelpers.lean`. S1 and S2 have landed, so those items are unblocked (`module_builder/{dag,freshness,host_effects,publish}.rs`; `zygote/{audit,budget,closure,daemon,dispatch,worker}.rs`; `lake_build/{build,cache,env,freshness,impact}.rs`); until S3a lands, the items that need `BridgeHelpers.lean` still cannot run in parallel without conflicting.
 
 ---
 
@@ -189,7 +192,7 @@ flowchart LR
 | Where | Says | Is |
 | :--- | :--- | :--- |
 | `GOALS.md` G2 Stage B | queued | landed in `#451`, `#452` |
-| `GOALS.md` G1, `OPEN_CHALLENGES` B1 | wiring `con-leche` into `--kernel` remains | wired as an external binary (`#448`, `#449`); `auto` never selects it; cache-key binding open |
+| `GOALS.md` G1, `OPEN_CHALLENGES` B1 | wiring `con-leche` into `--kernel` remains | wired as an external binary (`#448`, `#449`); `auto` is routed by PolicyGates to con-leche when `conLecheSupported` is true, but the current Rust resolver does not probe support for `auto`, so production `auto` currently resolves to standard; cache-key binding remains open |
 | `OPEN_CHALLENGES` B1, B2 gates | the M2 / M3 theorems are discharged | they hold over the in-repo `"OLEN"` model, not real `.olean` (the root `README` says so) |
 | `GOALS.md` "Priority 0" | remaining | describes landed behaviour |
 | `GOALS.md` G5 | `CAbiEmit.lean` removed | file exists, 1,275 LOC |
