@@ -5111,6 +5111,23 @@ theorem ten_hop_vacuous (x : Nat) (h : h9 x) : x = x + 1 := by
     }
 
     #[test]
+    fn audit_spec_path_rules_typo_key_error_names_the_key() {
+        for text in [
+            "[audit_spec]\n[[audit_spec.path_rules]]\nglob_pattern = \"src/**\"\nforbid_decl_kind = [\"axiom\"]\n",
+            "[audit_spec]\n[audit_spec.path_rules.\"src/**\"]\nforbid_decl_kind = [\"axiom\"]\n",
+        ] {
+            let err = AuditSpecPolicyConfig::try_parse_config_str(text).expect_err(
+                "a typo key inside path_rules must fail closed",
+            );
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("forbid_decl_kind"),
+                "error must name the offending key `forbid_decl_kind`: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn audit_spec_dedicated_toml_section_alone_still_accepted() {
         let cfg = AuditSpecPolicyConfig::try_parse_config_str_mode(
             "[audit_spec]\npolicy = \"default\"\n",
