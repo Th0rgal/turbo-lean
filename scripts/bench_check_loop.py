@@ -51,9 +51,14 @@ from pathlib import Path
 
 SCHEMA_VERSION = 1
 NOISE_FLOOR_MS = 25.0
-MIN_REL_TOLERANCE = 0.10
+# Between-run floor for the gate: two runs of one binary on one node drift by
+# up to ~13% on cold workloads (import_refresh is page-cache sensitive), while
+# warm daemon medians stayed within ~2% across runs. The cold floor is 20%.
+MIN_REL_TOLERANCE = {"cold_no_daemon": 0.20, "warm_cache_hit_daemon": 0.10,
+                     "warm_edited_proof_daemon": 0.10}
 SPREAD_SAFETY = 2.0
 COVERAGE_GATE = 0.90
+BUSY_LOAD_THRESHOLD = 1.0  # one 100%-CPU tenant already poisons warm medians
 DEFAULT_TRIALS = 5
 DEFAULT_WARMUP = 1
 CHECK_TIMEOUT_S = 900
@@ -132,14 +137,15 @@ def rel_spread(xs) -> float:
     return (max(xs) - min(xs)) / med
 
 
-def tolerance_ms(baseline_median: float, baseline_rel_spread: float) -> float:
+def tolerance_ms(baseline_median: float, baseline_rel_spread: float, mode: str) -> float:
     """Per-workload gate taken from the baseline's measured spread.
 
     A fixed 1.15x gate flags noise on workloads whose observed run-to-run
     spread reaches 20-40%, so the tolerance grows with the measured spread
-    (SPREAD_SAFETY times), floored at MIN_REL_TOLERANCE, plus NOISE_FLOOR_MS.
+    (SPREAD_SAFETY times) around a per-mode floor, plus NOISE_FLOOR_MS.
     """
-    factor = 1.0 + max(MIN_REL_TOLERANCE, SPREAD_SAFETY * baseline_rel_spread)
+    factor = 1.0 + max(MIN_REL_TOLERANCE.get(mode, 0.20),
+                       SPREAD_SAFETY * baseline_rel_spread)
     return baseline_median * factor + NOISE_FLOOR_MS
 
 
@@ -175,7 +181,8 @@ def empty_run_result(workloads, trials):
     }
 
 
-def mode_result(runs_ms, coverage_ratios, statuses, extra=None):
+def mode_result(runs_ms, coverage_ratios, statuses, extra=None, phase_dicts=None,
+                psi_lists=None):
     xs = list(runs_ms)
     out = {
         "runs_ms": [round(x, 1) for x in xs],
@@ -186,6 +193,19 @@ def mode_result(runs_ms, coverage_ratios, statuses, extra=None):
         "coverage_ratio_min": round(min(coverage_ratios), 4) if coverage_ratios else None,
         "statuses_observed": sorted(set(statuses)),
     }
+    if phase_dicts:
+        names = sorted({k for pd in phase_dicts for k in pd})
+        out["phases_ms_median"] = {
+            name: round(median([pd[name] for pd in phase_dicts if name in pd]), 1)
+            for name in names
+            if any(name in pd for pd in phase_dicts)
+        }
+    if psi_lists:
+        worst = {k: max((p.get(k, 0.0) for trial in psi_lists for p in trial),
+                        default=0.0) for k in ("cpu", "memory", "io")}
+        out["psi_max_avg10"] = {k: round(v, 2) for k, v in worst.items()}
+        out["psi_contended"] = bool(worst.get("memory", 0.0) > 10.0
+                                    or worst.get("io", 0.0) > 10.0)
     if extra:
         out.update(extra)
     return out
@@ -312,7 +332,7 @@ def compare_run(baseline, res):
                 verdict["measured_nothing"].append(f"{wid}/{mode}")
                 verdict["gates"][f"{wid}/{mode}"] = {"verdict": "measured_nothing"}
                 continue
-            tol = tolerance_ms(b["median_ms"], b.get("rel_spread", 0.0))
+            tol = tolerance_ms(b["median_ms"], b.get("rel_spread", 0.0), mode)
             new = r["median_ms"]
             gate = {"baseline_median_ms": b["median_ms"], "baseline_rel_spread": b.get("rel_spread"),
                     "tolerance_ms": round(tol, 1), "new_median_ms": new,
@@ -441,6 +461,10 @@ def sample_psi():
                     psi[name] = float(line.split()[1])
         except (OSError, ValueError, IndexError):
             pass
+    try:
+        psi["load1"] = os.getloadavg()[0]
+    except (OSError, AttributeError):
+        pass
     return psi
 
 
@@ -582,6 +606,7 @@ class Runner:
                   timeout_s=CHECK_TIMEOUT_S):
         env = self.trial_env(cache, home, staging, no_daemon)
         argv = self.check_argv(w, cache, self.source_path(w))
+        psi_before = sample_psi()
         t0 = time.perf_counter_ns()
         try:
             proc = subprocess.run(argv, env=env, capture_output=True, text=True,
@@ -590,9 +615,11 @@ class Runner:
         except subprocess.TimeoutExpired as e:
             rc, out, err = -1, e.stdout or "", (e.stderr or "") + f"\ntimeout after {timeout_s}s"
         wall_ms = (time.perf_counter_ns() - t0) / 1e6
+        psi_after = sample_psi()
         parsed = parse_check_json(out or "")
         return {"exit_code": rc, "external_wall_ms": wall_ms, "json": parsed,
-                "stderr": err or "", "argv": argv, "env": env}
+                "stderr": err or "", "argv": argv, "env": env,
+                "psi_before": psi_before, "psi_after": psi_after}
 
     # -- guards -----------------------------------------------------------
     def remove_verified_sources(self, w):
@@ -625,7 +652,7 @@ class Runner:
 
     # -- modes ------------------------------------------------------------
     def run_cold_mode(self, w):
-        runs, covs, statuses = [], [], []
+        runs, covs, statuses, phases, psis = [], [], [], [], []
         total = self.warmups + self.trials
         for i in range(total):
             d = self.wl_scratch(w["id"]) / f"cold_{i}"
@@ -640,7 +667,9 @@ class Runner:
                 statuses.append(f"exit_{r['exit_code']}")
                 pt = (r.get("json") or {}).get("phase_timings") or {}
                 covs.append(pt.get("coverage_ratio", 0.0))
-        return mode_result(runs, covs, statuses)
+                phases.append(pt.get("phases_ms") or {})
+                psis.append([r.get("psi_before") or {}, r.get("psi_after") or {}])
+        return mode_result(runs, covs, statuses, phase_dicts=phases, psi_lists=psis)
 
     def run_warm_modes(self, w):
         d = self.wl_scratch(w["id"]) / "warm"
@@ -654,17 +683,20 @@ class Runner:
                 raise BenchEnvError(
                     f"warm setup run for {w['id']} failed (exit {setup['exit_code']}); "
                     f"cannot measure warm modes: {setup['stderr'][-500:]}")
-            hit_runs, hit_covs, hit_status = [], [], []
+            hit_runs, hit_covs, hit_status, hit_phases, hit_psis = [], [], [], [], []
             for _ in range(self.trials):
                 r = self.run_check(w, cache, home, staging, no_daemon=False)
                 hit_runs.append(r["external_wall_ms"])
                 pt = (r.get("json") or {}).get("phase_timings") or {}
                 hit_covs.append(pt.get("coverage_ratio", 0.0))
                 hit_status.append(str((r.get("json") or {}).get("status")))
-            warm_cache = mode_result(hit_runs, hit_covs, hit_status)
+                hit_phases.append(pt.get("phases_ms") or {})
+                hit_psis.append([r.get("psi_before") or {}, r.get("psi_after") or {}])
+            warm_cache = mode_result(hit_runs, hit_covs, hit_status,
+                                     phase_dicts=hit_phases, psi_lists=hit_psis)
             if not all(s == "theorem_cache_hit" for s in hit_status):
                 warm_cache["cache_hit_assert_failed"] = hit_status
-            edit_runs, edit_covs, edit_status = [], [], []
+            edit_runs, edit_covs, edit_status, edit_phases, edit_psis = [], [], [], [], []
             src_path = self.source_path(w)
             original = src_path.read_bytes()
             try:
@@ -684,9 +716,12 @@ class Runner:
                     pt = (r.get("json") or {}).get("phase_timings") or {}
                     edit_covs.append(pt.get("coverage_ratio", 0.0))
                     edit_status.append(str((r.get("json") or {}).get("status")))
+                    edit_phases.append(pt.get("phases_ms") or {})
+                    edit_psis.append([r.get("psi_before") or {}, r.get("psi_after") or {}])
             finally:
                 src_path.write_bytes(original)
-            warm_edit = mode_result(edit_runs, edit_covs, edit_status)
+            warm_edit = mode_result(edit_runs, edit_covs, edit_status,
+                                    phase_dicts=edit_phases, psi_lists=edit_psis)
             if not all(s == "theorem_verified" for s in edit_status):
                 warm_edit["verified_assert_failed"] = edit_status
             return warm_cache, warm_edit
@@ -696,7 +731,7 @@ class Runner:
             self.assert_source_clean(w)
 
     def run_pfr_workload(self, w):
-        runs, covs, statuses, errors = [], [], [], set()
+        runs, covs, statuses, errors, psis = [], [], [], set(), []
         exit_code = None
         stderr_excerpt = ""
         total = self.warmups + self.trials
@@ -722,9 +757,10 @@ class Runner:
                 covs.append(pt.get("coverage_ratio", 0.0))
                 errors.add(classify_error(r["exit_code"], r.get("json"), r["stderr"]))
                 exit_code = r["exit_code"]
+                psis.append([r.get("psi_before") or {}, r.get("psi_after") or {}])
                 if not stderr_excerpt and r["stderr"]:
                     stderr_excerpt = r["stderr"][:500]
-        m = mode_result(runs, covs, statuses)
+        m = mode_result(runs, covs, statuses, psi_lists=psis)
         m["error_classes"] = sorted(errors)
         if stderr_excerpt:
             m["stderr_excerpt"] = stderr_excerpt
@@ -790,6 +826,19 @@ def validate_environment(args):
     return git_bin, human
 
 
+def require_quiet_node(args):
+    try:
+        load1 = os.getloadavg()[0]
+    except (OSError, AttributeError):
+        return None
+    if load1 > BUSY_LOAD_THRESHOLD and not args.allow_busy_node:
+        raise BenchEnvError(
+            f"node load average (1 min) is {load1:.2f} > {BUSY_LOAD_THRESHOLD}; another "
+            "process is loading this machine and would poison the medians. Re-run when "
+            "the node is idle, or pass --allow-busy-node to record the condition.")
+    return load1
+
+
 def check_pinned_revs(runner: Runner):
     for repo, expected in PINNED_REVS.items():
         rev, _dirty = repo_commit(runner.git_bin, runner.dirs[repo])
@@ -821,6 +870,9 @@ def main(argv=None):
                                             "from a different label is never compared")
     ap.add_argument("--skip-rev-check", action="store_true",
                     help="do not enforce pinned Batteries/PFR revs (recorded honestly)")
+    ap.add_argument("--allow-busy-node", action="store_true",
+                    help="run even when the node's 1-min load average exceeds "
+                         f"{BUSY_LOAD_THRESHOLD} (recorded as node_busy_allowed)")
     ap.add_argument("--strict-comparison", action="store_true",
                     help="exit 1 when a comparison was skipped instead of passed")
     ap.add_argument("--validate-only", metavar="JSON",
@@ -847,6 +899,7 @@ def main(argv=None):
     runner = Runner(args)
     t_start = time.monotonic()
     try:
+        load_at_start = require_quiet_node(args)
         check_pinned_revs(runner)
         commit, dirty, repo_path = turbo_lean_commit_for(runner.bin, git_bin)
         binary_sha = None
@@ -861,6 +914,9 @@ def main(argv=None):
             "turbo_lean_binary": {"path": str(runner.bin), "sha256": binary_sha},
             "host": h, "settings": settings, "workload_revs": dict(runner.revs),
             "revs_pinned": (not args.skip_rev_check),
+            "node": {"load1_at_start": None if load_at_start is None else round(load_at_start, 2),
+                     "load1_at_end": None,
+                     "busy_allowed": args.allow_busy_node},
             "args": {"trials": args.trials, "warmup": args.warmup,
                      "skip_rev_check": args.skip_rev_check},
         })
@@ -888,6 +944,10 @@ def main(argv=None):
         if args.rebaseline:
             results["kind"] = "baseline"
         results["run_duration_s"] = round(time.monotonic() - t_start, 1)
+        try:
+            results["node"]["load1_at_end"] = round(os.getloadavg()[0], 2)
+        except (OSError, AttributeError, KeyError):
+            pass
         payload = json.dumps(results, indent=2)
         if args.out:
             Path(args.out).write_text(payload + "\n")

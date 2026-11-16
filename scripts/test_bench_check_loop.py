@@ -98,11 +98,15 @@ class Stats(unittest.TestCase):
 
     def test_gate_grows_with_measured_spread(self):
         mod = load_script()
-        tight = mod.tolerance_ms(1000.0, 0.02)
-        loose = mod.tolerance_ms(1000.0, 0.20)
+        tight = mod.tolerance_ms(1000.0, 0.02, "warm_cache_hit_daemon")
+        loose = mod.tolerance_ms(1000.0, 0.20, "warm_cache_hit_daemon")
+        cold = mod.tolerance_ms(1000.0, 0.0, "cold_no_daemon")
         self.assertGreater(loose, tight)
         self.assertAlmostEqual(tight, 1000.0 * 1.10 + 25.0)
         self.assertAlmostEqual(loose, 1000.0 * (1.0 + 2.0 * 0.20) + 25.0)
+        # Cold workloads drift more between runs (page-cache-sensitive
+        # import_refresh): their floor is 20%, not 10%.
+        self.assertAlmostEqual(cold, 1000.0 * 1.20 + 25.0)
 
 
 class BaselineSchema(unittest.TestCase):
@@ -313,7 +317,7 @@ class EndToEnd(unittest.TestCase):
                    TURBO_LEAN_ALLOWED_IMPLEMENTED_BY="*", FAKE_PFR_FAIL="1")
         cmd = [sys.executable, str(SCRIPT), "--turbo-lean-bin", str(stub),
                "--batteries-dir", str(bats), "--pfr-dir", str(pfr),
-               "--trials", "2", "--warmup", "0", "--skip-rev-check"] + extra
+               "--trials", "2", "--warmup", "0", "--skip-rev-check", "--allow-busy-node"] + extra
         return subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
 
     def test_full_run_and_comparison(self):
