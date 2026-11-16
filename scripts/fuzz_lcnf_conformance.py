@@ -241,14 +241,22 @@ ALIAS_SEED_MOD = 6
 ALIAS_FLOOR_RATIO = 8
 ALIAS_PREAMBLE = """inductive FuzzPacket where
   | pkt : (UInt64 × UInt64) → (UInt64 × UInt64) → FuzzPacket
+  | empty : FuzzPacket
 
 @[inline] def fuzzPacketFold (pkt : FuzzPacket) : UInt64 :=
   match pkt with
   | .pkt p q => ((p.1 * 1315423911) + p.2) ^^^ ((q.1 * 2654435761) + q.2)
+  | .empty => 0x9E3779B97F4A7C15
 
 @[inline] def fuzzPacketStep (pkt : FuzzPacket) (delta : UInt64) : FuzzPacket :=
   match pkt with
   | .pkt p q => .pkt (p.1 + delta, p.2 ^^^ delta) (q.1 + (delta <<< 1), q.2 + 17)
+  | .empty => .empty
+
+@[inline] def fuzzP1 (pkt : FuzzPacket) : UInt64 := match pkt with | .pkt p _ => p.1 | .empty => 0
+@[inline] def fuzzP2 (pkt : FuzzPacket) : UInt64 := match pkt with | .pkt p _ => p.2 | .empty => 0
+@[inline] def fuzzQ1 (pkt : FuzzPacket) : UInt64 := match pkt with | .pkt _ q => q.1 | .empty => 0
+@[inline] def fuzzQ2 (pkt : FuzzPacket) : UInt64 := match pkt with | .pkt _ q => q.2 | .empty => 0
 """
 
 
@@ -1081,13 +1089,13 @@ def alias_program_to_lean_lines(program: dict[str, Any]) -> list[str]:
         + "  let direct := fuzzPacketFold base\n"
         + "  let canary := fuzzPacketFold base\n"
         + f"  let after := fuzzPacketStep base (x0 ^^^ ({val} : UInt64))\n"
-        + f"  (direct + stepped.1.1 + canary) ^^^ (fuzzPacketFold after + ({jdx} : UInt64))"
+        + f"  (direct + fuzzP1 stepped + canary) ^^^ (fuzzPacketFold after + ({jdx} : UInt64))"
     )
-    old_body = prologue + f"  fuzzPacketFold base + stepped.1.2 ^^^ ({idx} : UInt64)"
+    old_body = prologue + f"  fuzzPacketFold base + fuzzP2 stepped ^^^ ({idx} : UInt64)"
     new_body = (
         prologue
         + f"  let after := fuzzPacketStep base (x0 ^^^ ({val} : UInt64))\n"
-        + f"  (fuzzPacketFold stepped + fuzzPacketFold after) ^^^ (base.2.2 + ({idx} : UInt64))"
+        + f"  (fuzzPacketFold stepped + fuzzPacketFold after) ^^^ (fuzzQ2 base + ({idx} : UInt64))"
     )
     return [
         f"@[export fuzz_seed_{seed}]",
@@ -1167,7 +1175,7 @@ def run_alias_batch(
 
         stock_source = tmpdir / "StockAlias.lean"
         stock_calls = [
-            f"toString {decl} {u64(p['arg0'])}"
+            f"toString ({decl} {u64(p['arg0'])})"
             for p in programs
             for decl in alias_decl_names(p)
         ]
