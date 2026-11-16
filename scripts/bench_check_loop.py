@@ -828,14 +828,16 @@ def validate_environment(args):
 
 def require_quiet_node(args):
     try:
-        load1 = os.getloadavg()[0]
+        load1, load5, _ = os.getloadavg()
     except (OSError, AttributeError):
         return None
-    if load1 > BUSY_LOAD_THRESHOLD and not args.allow_busy_node:
+    load1, load5 = round(load1, 2), round(load5, 2)
+    if max(load1, load5) > BUSY_LOAD_THRESHOLD and not args.allow_busy_node:
         raise BenchEnvError(
-            f"node load average (1 min) is {load1:.2f} > {BUSY_LOAD_THRESHOLD}; another "
-            "process is loading this machine and would poison the medians. Re-run when "
-            "the node is idle, or pass --allow-busy-node to record the condition.")
+            f"node load average (1 min {load1:.2f} / 5 min {load5:.2f}) exceeds "
+            f"{BUSY_LOAD_THRESHOLD}; another process is loading this machine and would "
+            "poison the medians. Re-run when the node is idle, or pass --allow-busy-node "
+            "to record the condition.")
     return load1
 
 
