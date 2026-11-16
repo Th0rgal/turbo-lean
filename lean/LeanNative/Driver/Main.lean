@@ -60,6 +60,7 @@ def runMain (args : List String) : IO UInt32 := do
     if let some rc ← dispatchSharedCommand "lean-native" (frontendHook allowRcAdt) args then
       return rc
     match args with
+    | "eval-lcnf" :: rest | "eval-lcnf-diff" :: rest => LeanNative.Driver.EvalLCNFCLI.run rest
     | "llvm-diff-suite" :: rest => LeanNative.Driver.LLVMDiffCLI.run rest
     | "gpu-tpu-diff-suite" :: rest => LeanNative.Driver.GPUDiffCLI.run rest
     | "target-ir-fuzz-suite" :: rest => LeanNative.Driver.TargetIRFuzzCLI.run rest
