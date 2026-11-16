@@ -444,7 +444,12 @@ class BaselineStrictness(unittest.TestCase):
     def test_strict_comparison_makes_host_mismatch_nonzero(self):
         mod = load_script()
         with tempfile.TemporaryDirectory(prefix="m1-strict-") as td:
+            r0 = run_bench(Path(td), ["--no-baseline", "--out", str(Path(td) / "o0.json")])
+            self.assertEqual(r0.returncode, 0, r0.stdout + r0.stderr)
+            o0 = json.loads((Path(td) / "o0.json").read_text())
             base = full_valid_baseline(mod)
+            base["workload_revs"] = dict(o0["workload_revs"])
+            base["toolchain"] = dict(o0["toolchain"])
             base["host"]["hostname"] = "some-other-box"
             p = Path(td) / "b.json"
             p.write_text(json.dumps(base))
