@@ -1901,6 +1901,40 @@ class TestLcnfCoverage(unittest.TestCase):
         chk = check_coverage_report(ROOT_DIR, rep, results=other_commit_doc)
         self.assertTrue(chk["ok"], chk["errors"])
 
+    def test_rejected_not_lowered_mutual_cycle_reported_in_json_and_check_output(self) -> None:
+        # Round-2 Point 3: declarations in mutual cycles stay counted in `rejected`,
+        # and both JSON and `--check` output report per corpus how many of `rejected`
+        # were not lowered (`rejected_not_lowered`) and why (`mutual_cycle`).
+        mut = measure_fixture_corpus(
+            ROOT_DIR,
+            "mutual\n"
+            "partial def ping (x : UInt64) : UInt64 := if x == 0 then 1 else pong (x - 1)\n"
+            "partial def pong (x : UInt64) : UInt64 := if x == 0 then 2 else ping (x - 1)\n"
+            "end\n"
+            '@[export bad_str]\ndef bad_str (x : UInt64) : String := if x == 0 then "a" else "b"\n',
+        )
+        self.assertEqual(mut.get("rejected_not_lowered"), 2)
+        self.assertEqual(mut.get("rejected_not_lowered_reason"), "mutual_cycle")
+        self.assertGreaterEqual(mut["rejected"], 3)
+
+        rep = build_coverage_report(ROOT_DIR)
+        for cname in ("std_init_and_c2", "c1_corpus"):
+            corp = rep["corpora"][cname]
+            self.assertIn("rejected_not_lowered", corp)
+            self.assertEqual(corp.get("rejected_not_lowered_reason"), "mutual_cycle")
+            self.assertLessEqual(corp["rejected_not_lowered"], corp["rejected"])
+        self.assertGreaterEqual(rep["corpora"]["c1_corpus"]["rejected_not_lowered"], 2)
+
+        chk_proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--check"],
+            capture_output=True,
+            text=True,
+            timeout=3600,
+        )
+        self.assertEqual(chk_proc.returncode, 0, chk_proc.stderr)
+        self.assertIn("rejected_not_lowered", chk_proc.stdout)
+        self.assertIn("mutual_cycle", chk_proc.stdout)
+
 
 
 def main() -> int:
