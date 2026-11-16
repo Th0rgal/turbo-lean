@@ -68,6 +68,43 @@ class AliasReportContract(unittest.TestCase):
         self.assertTrue(report["alias_floor_met"])
 
 
+class ReceiptsContract(unittest.TestCase):
+    """P0 callers read run_fuzzer()["receipts"] as a dict (test_p0_trust_boundary.py:359)."""
+
+    def test_receipts_merge_is_a_dict_with_totals_even_for_many_batches(self):
+        scalar = [
+            {"lean_source_sha256": "a" * 64, "lnir_eval_executed_decls": 256,
+             "symbolic_tv_passed_decls": 256, "stock_runtime": "stock lean -c + leanc (full generated C, no replacements)"},
+            {"lean_source_sha256": "b" * 64, "lnir_eval_executed_decls": 170,
+             "symbolic_tv_passed_decls": 170, "stock_runtime": "stock lean -c + leanc (full generated C, no replacements)"},
+        ]
+        alias = [
+            {"lean_source_sha256": "c" * 64, "lnir_eval_executed_decls": 288,
+             "symbolic_tv_passed_decls": 288, "alias_llvm_fail_closed": True},
+        ]
+        merged = fuzzer.merge_fuzz_receipts(scalar, alias)
+        self.assertIsInstance(merged, dict)
+        self.assertEqual(merged["lnir_eval_executed_decls"], 256 + 170 + 288)
+        self.assertEqual(merged["symbolic_tv_passed_decls"], 256 + 170 + 288)
+        self.assertIsInstance(merged["batch_receipts"], list)
+        self.assertEqual(len(merged["batch_receipts"]), 3)
+
+    def test_receipts_merge_tolerates_patched_empty_batches(self):
+        merged = fuzzer.merge_fuzz_receipts([{}, {}], [])
+        self.assertIsInstance(merged, dict)
+        self.assertEqual(merged["lnir_eval_executed_decls"], 0)
+
+    def test_run_fuzzer_report_receipts_stay_a_dict(self):
+        engines = fuzzer.probe_engines()
+        if not (engines["stock_lean_c"] and engines["lnir_eval"] and engines["c_abi_llvm"]):
+            self.skipTest("conformance engines unavailable on this node")
+        report = fuzzer.run_fuzzer(12)
+        self.assertTrue(report["ok"], report)
+        receipts = report["receipts"]
+        self.assertIsInstance(receipts, dict)
+        self.assertGreaterEqual(receipts["lnir_eval_executed_decls"], 12)
+
+
 class BrokenAliasDetection(unittest.TestCase):
     def test_in_place_update_seen_through_old_name_is_a_mismatch(self):
         alias = _alias_programs()
