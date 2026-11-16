@@ -6,6 +6,7 @@ import LeanNative.Proofs.MutantSuite
 import LeanNative.Proofs.AxiomAudit
 import LeanNative.Tests.RealLCNFBridgeTests
 import LeanNative.Tests.LedgerEmbedded32Tests
+import LeanNative.Tests.EvalLCNFCLITests
 
 namespace LeanNative
 
