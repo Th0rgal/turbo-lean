@@ -2,10 +2,8 @@ use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
-use walkdir::WalkDir;
 
-use crate::db::{SingleflightOutcome, TurboStore};
+use crate::db::TurboStore;
 use crate::splitter;
 
 use super::*;
