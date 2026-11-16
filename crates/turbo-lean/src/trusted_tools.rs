@@ -232,7 +232,13 @@ fn resolve_trusted_git_uncached(project: &Path) -> Result<PathBuf> {
 pub(crate) fn git(project: &Path) -> Result<GitCommand> {
     static GIT: OnceLock<std::result::Result<PathBuf, String>> = OnceLock::new();
     let program = GIT
-        .get_or_init(|| resolve_trusted_git_uncached(project).map_err(|e| format!("{e:#}")))
+        .get_or_init(|| {
+            let resolved = resolve_trusted_git_uncached(project);
+            if let Err(err) = &resolved {
+                warn_git_unavailable_once(project, &format!("{err:#}"));
+            }
+            resolved.map_err(|e| format!("{e:#}"))
+        })
         .as_ref()
         .map_err(|e| anyhow::anyhow!("Trusted Git unavailable: {e}"))?;
     let program = outside_checkout(program, project)?;
@@ -856,6 +862,78 @@ fn trusted_git_never_runs_submodule_only_filters() -> Result<()> {
         assert!(!marker.exists());
         fs::remove_dir_all(root)?;
     }
+    Ok(())
+}
+
+/// Recorded diagnostic of the first fail-closed trusted-Git fallback in this process, so a
+/// unit test can assert the warning is loud and emitted exactly once.
+static GIT_UNAVAILABLE_WARNING: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn clear_git_unavailable_warning_for_test() {
+    *GIT_UNAVAILABLE_WARNING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+#[cfg(test)]
+pub(crate) fn git_unavailable_warning_for_test() -> Option<String> {
+    GIT_UNAVAILABLE_WARNING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// One loud diagnostic for the fail-closed path of #415: when the trusted Git cannot be
+/// resolved, callers degrade (edit-locality is disabled and every edited file re-checks its
+/// dependents with Lake) while the command still succeeds, so the slowdown must never be
+/// silent. Printed at most once per process.
+fn warn_git_unavailable_once(project: &Path, reason: &str) {
+    let mut warned = GIT_UNAVAILABLE_WARNING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if warned.is_some() {
+        return;
+    }
+    let message = format!(
+        "turbo-lean: WARNING: trusted Git unavailable for {}: {reason}. Failing closed: \
+         edit-locality is disabled and every edited file re-checks its dependents with Lake. \
+         Install Git >= {}.{} outside all checkouts or set TURBO_LEAN_GIT=/abs/path/to/git.",
+        project.display(),
+        MIN_GIT.0,
+        MIN_GIT.1
+    );
+    *warned = Some(message.clone());
+    eprintln!("{message}");
+}
+
+#[cfg(test)]
+#[test]
+fn git_unavailable_fallback_warns_loudly_once() -> Result<()> {
+    // Serializes against tests that mutate TURBO_LEAN_GIT (their Git failures must not
+    // interleave with the exactly-once assertions below).
+    let _env_guard = crate::pack::tests::env_test_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    clear_git_unavailable_warning_for_test();
+    assert!(git_unavailable_warning_for_test().is_none());
+
+    warn_git_unavailable_once(Path::new("/tmp/turbo-p8-proj"), "git 2.43.0 < 2.46");
+    let first = git_unavailable_warning_for_test()
+        .expect("fail-closed trusted-Git fallback must emit a loud one-time warning");
+    assert!(first.contains("WARNING"), "{first}");
+    assert!(first.contains("edit-locality is disabled"), "{first}");
+    assert!(first.contains("Git >= 2.46"), "{first}");
+    assert!(first.contains("TURBO_LEAN_GIT"), "{first}");
+    assert!(first.contains("/tmp/turbo-p8-proj"), "{first}");
+    assert!(first.contains("git 2.43.0 < 2.46"), "{first}");
+
+    // Exactly one diagnostic per process: a second failure stays silent.
+    warn_git_unavailable_once(Path::new("/tmp/turbo-p8-other"), "another failure");
+    assert_eq!(
+        git_unavailable_warning_for_test().as_deref(),
+        Some(first.as_str())
+    );
     Ok(())
 }
 
