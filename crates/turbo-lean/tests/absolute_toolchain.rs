@@ -185,6 +185,82 @@ fn project_toolchain_names_cannot_substitute_verifiers_or_prewarm_helpers() {
         fs::remove_file(f.0.join("shim-invoked")).unwrap();
     }
     let repo_exec = f.0.join(".lake/build/bin/repo-exec");
+    // A `filter.<name>.process` value must speak Git's long-running pkt-line
+    // protocol. A marker-only script makes raw Git abort with "remote end hung
+    // up unexpectedly". Keep the attack (it writes the marker) but answer the
+    // handshake and echo filter contents so Git can still finish its command.
+    let repo_filter = f.0.join(".lake/build/bin/repo-filter");
+    fs::write(
+        &repo_filter,
+        r#"#!/bin/sh
+printf 'PROJECT_TOOLCHAIN_SHIM_EXECUTED' > '__MARKER__'
+tmp="${TMPDIR:-/tmp}/turbo-filter-$$"
+trap 'rm -f "$tmp"' EXIT
+read_pkt() {
+  hdr=$(dd bs=1 count=4 2>/dev/null)
+  [ "${#hdr}" -eq 4 ] || return 1
+  n=$((0x$hdr))
+  if [ "$n" -eq 0 ]; then bodylen=-1; else bodylen=$((n - 4)); fi
+}
+write_pkt() {
+  printf '%04x%s' "$(( ${#1} + 4 ))" "$1"
+}
+write_flush() { printf '0000'; }
+read_pkt || exit 0
+dd bs=1 count="$bodylen" of=/dev/null 2>/dev/null
+read_pkt || exit 0
+dd bs=1 count="$bodylen" of=/dev/null 2>/dev/null
+read_pkt || exit 0
+write_pkt 'git-filter-server
+'
+write_pkt 'version=2
+'
+write_flush
+while read_pkt; do
+  [ "$bodylen" -lt 0 ] && continue
+  dd bs=1 count="$bodylen" of="$tmp" 2>/dev/null
+  case "$(cat "$tmp" 2>/dev/null)" in
+    capability=*)
+      while read_pkt; do
+        [ "$bodylen" -lt 0 ] && break
+        dd bs=1 count="$bodylen" of=/dev/null 2>/dev/null
+      done
+      write_pkt '
+'
+      write_flush
+      ;;
+    command=*)
+      while read_pkt; do
+        [ "$bodylen" -lt 0 ] && break
+        dd bs=1 count="$bodylen" of=/dev/null 2>/dev/null
+      done
+      : > "$tmp"
+      while read_pkt; do
+        [ "$bodylen" -lt 0 ] && break
+        dd bs=1 count="$bodylen" 2>/dev/null >> "$tmp"
+      done
+      sz=$(wc -c < "$tmp")
+      write_pkt '
+'
+      write_flush
+      if [ "$sz" -gt 0 ]; then
+        printf '%04x' "$((sz + 4))"
+        cat "$tmp"
+      fi
+      write_flush
+      ;;
+    *)
+      write_pkt '
+'
+      write_flush
+      ;;
+  esac
+done
+"#
+        .replace("__MARKER__", &f.0.join("shim-invoked").to_string_lossy()),
+    )
+    .unwrap();
+    fs::set_permissions(&repo_filter, fs::Permissions::from_mode(0o755)).unwrap();
     let host_git = host_git_bin();
     for key in [
         "core.fsmonitor",
@@ -193,11 +269,16 @@ fn project_toolchain_names_cannot_substitute_verifiers_or_prewarm_helpers() {
         "filter.attack.smudge",
         "filter.attack.process",
     ] {
+        let path = if key == "filter.attack.process" {
+            &repo_filter
+        } else {
+            &repo_exec
+        };
         checked(
             Command::new(&host_git)
                 .current_dir(&f.0)
                 .args(["config", key])
-                .arg(&repo_exec),
+                .arg(path),
         );
     }
     checked(
@@ -208,6 +289,18 @@ fn project_toolchain_names_cannot_substitute_verifiers_or_prewarm_helpers() {
     assert!(
         f.0.join("shim-invoked").exists(),
         "fsmonitor control must execute the attack"
+    );
+    fs::remove_file(f.0.join("shim-invoked")).unwrap();
+    // Positive control: raw Git's clean-filter path drives the process filter,
+    // so a protocol-compliant fixture is proven to execute the attack itself.
+    checked(Command::new(&host_git).current_dir(&f.0).args([
+        "hash-object",
+        "--path=Demo.lean",
+        "Demo.lean",
+    ]));
+    assert!(
+        f.0.join("shim-invoked").exists(),
+        "filter.attack.process control must execute the attack"
     );
     fs::remove_file(f.0.join("shim-invoked")).unwrap();
     for override_path in [PathBuf::from("git"), f.0.join(".lake/build/bin/git")] {
