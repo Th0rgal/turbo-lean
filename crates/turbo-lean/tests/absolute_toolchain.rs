@@ -200,11 +200,14 @@ fn project_toolchain_names_cannot_substitute_verifiers_or_prewarm_helpers() {
                 .arg(&repo_exec),
         );
     }
-    checked(
-        Command::new(&host_git)
-            .current_dir(&f.0)
-            .args(["status", "--porcelain"]),
-    );
+    // Only the side effect matters: Git >= 2.53 also starts the configured
+    // `filter.attack.process` here, and the marker-only shim does not speak the
+    // long-running filter protocol, so `git status` itself may fail.
+    let _ = Command::new(&host_git)
+        .current_dir(&f.0)
+        .args(["status", "--porcelain"])
+        .output()
+        .unwrap();
     assert!(
         f.0.join("shim-invoked").exists(),
         "fsmonitor control must execute the attack"
