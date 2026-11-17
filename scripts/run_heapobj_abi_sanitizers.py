@@ -833,6 +833,7 @@ def run_sanitizer_suite(
                     "executed": True,
                     "cleanMtOk": mt_clean_ok,
                     "cleanMtReturncode": mt_clean.returncode,
+                    "cleanMtStderrTail": "" if mt_clean_ok else (mt_clean.stderr or "")[-4000:],
                     "positiveRaceTraps": race_traps,
                 }
             else:

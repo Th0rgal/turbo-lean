@@ -15,6 +15,10 @@ env:
   # Axiom-policy audit tests change process-wide environment variables.
   RUST_TEST_THREADS: "1"
   TURBO_LEAN_HOME: ${{ github.workspace }}/.turbo-cache
+  # lean.ci guests export their remote cache to every job; turbo-lean's own tests must
+  # not read it (an empty value disables it), or modules come back cached, not compiled.
+  TURBO_LEAN_REMOTE_CACHE: ""
+  TURBO_LEAN_REMOTE_TOKEN: ""
 
 jobs:
   impact:
