@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -629,6 +630,251 @@ pub fn verify_ndjson_with_con_leche(
     classify_con_leche_status(out.status, binary_path.to_path_buf(), jobs, stdout, stderr)
 }
 
+
+/// A single compiled-import compiler-simplification (`@[csimp]` / `local csimp`) observation,
+/// read from a module's public signature extension entries.
+///
+/// `scope` is `None` for a global `@[csimp]` entry and `Some(namespace)` for a `local csimp`
+/// replacement scoped to a namespace, so a scoped replacement that leaks into the compiled cone is
+/// never confused with its global twin.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CompiledCsimpObservation {
+    pub theorem: String,
+    pub from: String,
+    pub to: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+}
+
+/// The `csimp` posture of one compiled module: the modules it imports (as observed in its public
+/// signature) plus the replacement entries its own module data exports.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompiledModuleCsimpObservation {
+    #[serde(default)]
+    pub imports: Vec<String>,
+    #[serde(default)]
+    pub entries: Vec<CompiledCsimpObservation>,
+}
+
+/// Deterministic transitive compiled-import `csimp` posture for one root module.
+///
+/// `modules` is the root plus every module reachable through the transitively exported import
+/// closure, keyed by canonical module name, in `BTreeMap` order. `digest` is the canonical BLAKE3
+/// posture digest produced by [`compute_transitive_csimp_posture_digest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransitiveCsimpPosture {
+    pub root: String,
+    pub modules: BTreeMap<String, Vec<CompiledCsimpObservation>>,
+    pub digest: String,
+}
+
+impl TransitiveCsimpPosture {
+    /// Number of `@[csimp]` / `local csimp` replacement entries anywhere in the reachable closure.
+    pub fn entry_count(&self) -> usize {
+        self.modules.values().map(|e| e.len()).sum()
+    }
+
+    /// Every observation in the closure, as `(module, observation)`, in canonical order.
+    pub fn flattened(&self) -> Vec<(String, CompiledCsimpObservation)> {
+        self.modules
+            .iter()
+            .flat_map(|(m, entries)| entries.iter().map(move |e| (m.clone(), e.clone())))
+            .collect()
+    }
+}
+
+/// Walk the transitively exported compiled-import closure of `root_module` and collect each
+/// module's `@[csimp]` / `local csimp` entries.
+///
+/// `read` resolves one module name to its public-signature observation, returning `Ok(None)` when
+/// the module cannot be resolved. Resolution never trusts the caller's iteration order: modules are
+/// visited in sorted order and the result is independent of the order `read` answers them in, so
+/// two scanners over the same graph always produce the same posture and digest. Any unresolvable
+/// module in the closure, including the root, fails closed.
+pub fn scan_transitive_csimp_posture<F>(
+    root_module: &str,
+    mut read: F,
+) -> Result<TransitiveCsimpPosture>
+where
+    F: FnMut(&str) -> Result<Option<CompiledModuleCsimpObservation>>,
+{
+    let root = root_module.trim();
+    anyhow::ensure!(
+        !root.is_empty(),
+        "Cannot scan the transitive compiled-import csimp posture of an empty root module name"
+    );
+    let mut modules: BTreeMap<String, Vec<CompiledCsimpObservation>> = BTreeMap::new();
+    let mut frontier: BTreeSet<String> = BTreeSet::new();
+    frontier.insert(root.to_string());
+    while let Some(module) = frontier.pop_first() {
+        if modules.contains_key(&module) {
+            continue;
+        }
+        let observation = read(&module).with_context(|| {
+            format!("Failed to read the compiled csimp posture of module `{module}`")
+        })?;
+        let Some(observation) = observation else {
+            anyhow::bail!(
+                "[TurboLean.KernelGate] transitive compiled-import csimp scan of `{root}` \
+                 could not resolve module `{module}`: fail-closed"
+            );
+        };
+        let mut entries = observation.entries;
+        entries.sort();
+        entries.dedup();
+        for import in &observation.imports {
+            let import = import.trim();
+            if !import.is_empty() && !modules.contains_key(import) {
+                frontier.insert(import.to_string());
+            }
+        }
+        modules.insert(module, entries);
+    }
+    let digest = compute_transitive_csimp_posture_digest(root, &modules);
+    Ok(TransitiveCsimpPosture {
+        root: root.to_string(),
+        modules,
+        digest,
+    })
+}
+
+/// Canonical BLAKE3 digest of a root module's transitive `csimp` posture.
+///
+/// The digest is length-prefixed and content-bound: it covers the root module name and, for every
+/// reachable module in sorted order, the module name and its sorted, de-duplicated
+/// `(theorem, from, to, scope)` observations. Insertion order and duplicate observations therefore
+/// never move the digest, while any change of name, scope, or replacement pair does.
+pub fn compute_transitive_csimp_posture_digest(
+    root_module: &str,
+    modules: &BTreeMap<String, Vec<CompiledCsimpObservation>>,
+) -> String {
+    fn field(h: &mut blake3::Hasher, s: &str) {
+        h.update(&(s.len() as u64).to_le_bytes());
+        h.update(s.as_bytes());
+    }
+    let mut h = blake3::Hasher::new();
+    h.update(b"turbo-lean-transitive-csimp-posture-v1\n");
+    field(&mut h, "root");
+    field(&mut h, root_module.trim());
+    for (module, entries) in modules {
+        field(&mut h, "module");
+        field(&mut h, module);
+        let unique: BTreeSet<&CompiledCsimpObservation> = entries.iter().collect();
+        h.update(&(unique.len() as u64).to_le_bytes());
+        for entry in unique {
+            field(&mut h, "entry");
+            field(&mut h, &entry.theorem);
+            field(&mut h, &entry.from);
+            field(&mut h, &entry.to);
+            match entry.scope.as_deref() {
+                None => field(&mut h, "global"),
+                Some(scope) => {
+                    field(&mut h, "scoped");
+                    field(&mut h, scope);
+                }
+            }
+        }
+    }
+    h.finalize().to_hex().to_string()
+}
+
+/// Parse one `csimp_entries` string from a compiled module's public signature, e.g.
+/// `global:slowGlob->fastGlob:slowGlob_eq` or `scoped:Ns:slowF->fastF:slowF_eq`.
+///
+/// Malformed entries fail closed instead of being silently dropped, so a truncated or spoofed
+/// signature can never look like a clean posture.
+pub fn parse_public_signature_csimp_entry(raw: &str) -> Result<CompiledCsimpObservation> {
+    let parts = split_lean_csimp_fields(raw);
+    let reject = |why: &str| {
+        anyhow::anyhow!(
+            "[TurboLean.KernelGate] malformed public-signature csimp entry `{raw}`: {why}"
+        )
+    };
+    let (scope, pair, theorem) = match parts.as_slice() {
+        [kind, pair, theorem] if *kind == "global" => (None, *pair, *theorem),
+        [kind, scope, pair, theorem] if *kind == "scoped" => (Some(*scope), *pair, *theorem),
+        _ => {
+            return Err(reject(
+                "expected `global:<from>-><to>:<theorem>` or `scoped:<ns>:<from>-><to>:<theorem>`",
+            ))
+        }
+    };
+    if let Some(scope) = scope {
+        if scope.is_empty() {
+            return Err(reject("empty scoped namespace"));
+        }
+    }
+    if theorem.is_empty() {
+        return Err(reject("empty replacement theorem name"));
+    }
+    let arrow_split = split_lean_csimp_arrow(pair);
+    let (from, to) = match arrow_split.as_slice() {
+        [from, to] if !from.is_empty() && !to.is_empty() => (*from, *to),
+        _ => return Err(reject("expected exactly one non-empty `<from>-><to>` replacement pair")),
+    };
+    Ok(CompiledCsimpObservation {
+        theorem: theorem.to_string(),
+        from: from.to_string(),
+        to: to.to_string(),
+        scope: scope.map(str::to_string),
+    })
+}
+
+/// Split a public-signature `csimp_entries` field on top-level `:` separators, ignoring separators
+/// inside a guillemet-quoted identifier (`«...»`).
+fn split_lean_csimp_fields(raw: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut in_guillemet = false;
+    for (idx, ch) in raw.char_indices() {
+        match ch {
+            '«' => in_guillemet = true,
+            '»' => in_guillemet = false,
+            ':' if !in_guillemet => {
+                out.push(&raw[start..idx]);
+                start = idx + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    out.push(&raw[start..]);
+    out
+}
+
+/// Split a `csimp` replacement pair on its single top-level `->`, ignoring any `->` inside a
+/// guillemet-quoted identifier.
+fn split_lean_csimp_arrow(pair: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut in_guillemet = false;
+    let mut i = 0usize;
+    let bytes = pair.as_bytes();
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\xC2' if bytes.get(i + 1) == Some(&0xAB) => {
+                in_guillemet = true;
+                i += 2;
+                continue;
+            }
+            b'\xC2' if bytes.get(i + 1) == Some(&0xBB) => {
+                in_guillemet = false;
+                i += 2;
+                continue;
+            }
+            b'-' if !in_guillemet && bytes.get(i + 1) == Some(&b'>') => {
+                out.push(&pair[start..i]);
+                start = i + 2;
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(&pair[start..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -735,4 +981,261 @@ mod tests {
             Some(PathBuf::from("/tmp/turbo-con-leche-env"))
         );
     }
+    fn module_obs(
+        imports: &[&str],
+        entries: &[(&str, &str, &str, Option<&str>)],
+    ) -> CompiledModuleCsimpObservation {
+        CompiledModuleCsimpObservation {
+            imports: imports.iter().map(|m| (*m).to_string()).collect(),
+            entries: entries
+                .iter()
+                .map(|(theorem, from, to, scope)| CompiledCsimpObservation {
+                    theorem: (*theorem).to_string(),
+                    from: (*from).to_string(),
+                    to: (*to).to_string(),
+                    scope: scope.map(|s| s.to_string()),
+                })
+                .collect(),
+        }
+    }
+
+    /// `Root` reaches `DepGlobal` and `DepScoped` only transitively, through `MidA`/`MidB`;
+    /// `MidA` also closes a cycle back to `Root`, and `Unreachable` carries a csimp entry that
+    /// must never enter the posture.
+    fn transitive_csimp_fixture() -> BTreeMap<String, CompiledModuleCsimpObservation> {
+        let mut m = BTreeMap::new();
+        m.insert("Root".to_string(), module_obs(&["MidA", "MidB"], &[]));
+        m.insert(
+            "MidA".to_string(),
+            module_obs(&["DepGlobal", "Root"], &[]),
+        );
+        m.insert("MidB".to_string(), module_obs(&["DepScoped"], &[]));
+        m.insert(
+            "DepGlobal".to_string(),
+            module_obs(
+                &["ToolchainBase"],
+                &[("slowGlob_eq", "slowGlob", "fastGlob", None)],
+            ),
+        );
+        m.insert(
+            "DepScoped".to_string(),
+            module_obs(&[], &[("slowF_eq", "slowF", "fastF", Some("Ns"))]),
+        );
+        m.insert("ToolchainBase".to_string(), module_obs(&[], &[]));
+        m.insert(
+            "Unreachable".to_string(),
+            module_obs(&[], &[("ghost_eq", "ghostSlow", "ghostFast", None)]),
+        );
+        m
+    }
+
+    #[test]
+    fn test_transitive_csimp_scan_walks_import_closure_deterministically() {
+        let fixture = transitive_csimp_fixture();
+        let posture = scan_transitive_csimp_posture("Root", |m| Ok(fixture.get(m).cloned()))
+            .expect("fixture closure resolves");
+        assert_eq!(posture.root, "Root");
+        assert_eq!(
+            posture.modules.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "DepGlobal".to_string(),
+                "DepScoped".to_string(),
+                "MidA".to_string(),
+                "MidB".to_string(),
+                "Root".to_string(),
+                "ToolchainBase".to_string(),
+            ],
+            "posture must cover the root plus every transitively reachable module, sorted"
+        );
+        assert!(
+            !posture.modules.contains_key("Unreachable"),
+            "an unreachable module is not part of the imported posture"
+        );
+        assert_eq!(
+            posture.modules["DepGlobal"],
+            vec![CompiledCsimpObservation {
+                theorem: "slowGlob_eq".into(),
+                from: "slowGlob".into(),
+                to: "fastGlob".into(),
+                scope: None,
+            }],
+            "depth-3 global `@[csimp]` entry must be attributed to its owning module"
+        );
+        assert_eq!(
+            posture.modules["DepScoped"],
+            vec![CompiledCsimpObservation {
+                theorem: "slowF_eq".into(),
+                from: "slowF".into(),
+                to: "fastF".into(),
+                scope: Some("Ns".into()),
+            }],
+            "`local csimp` must retain its scoped namespace"
+        );
+        assert_eq!(posture.digest.len(), 64, "digest is a hex BLAKE3");
+        assert_eq!(
+            posture.digest,
+            compute_transitive_csimp_posture_digest("Root", &posture.modules),
+            "posture digest is recomputable from the canonical module map"
+        );
+
+        // A reader that yields the same graph in reverse insertion order must produce the exact
+        // same posture and digest.
+        let reversed: Vec<(String, CompiledModuleCsimpObservation)> =
+            fixture.iter().rev().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let posture_rev = scan_transitive_csimp_posture("Root", |m| {
+            Ok(reversed
+                .iter()
+                .find(|(k, _)| k == m)
+                .map(|(_, v)| v.clone()))
+        })
+        .expect("reversed reader resolves the same closure");
+        assert_eq!(posture, posture_rev);
+    }
+
+    #[test]
+    fn test_transitive_csimp_posture_digest_is_canonical_and_content_bound() {
+        type PostureMap = BTreeMap<String, Vec<CompiledCsimpObservation>>;
+        let fixture = transitive_csimp_fixture();
+        let posture =
+            scan_transitive_csimp_posture("Root", |m| Ok(fixture.get(m).cloned())).unwrap();
+        let base = posture.digest.clone();
+
+        // Duplicating an observation, or re-inserting modules in another order, is digest-neutral.
+        let mut duplicated = posture.modules.clone();
+        let dep = duplicated.get_mut("DepGlobal").unwrap();
+        dep.push(dep[0].clone());
+        assert_eq!(compute_transitive_csimp_posture_digest("Root", &duplicated), base);
+        let reordered: PostureMap = posture
+            .modules
+            .iter()
+            .rev()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        assert_eq!(compute_transitive_csimp_posture_digest("Root", &reordered), base);
+
+        // Every canonical field is content-bound.
+        let mutations: Vec<Box<dyn Fn(&mut PostureMap)>> = vec![
+            Box::new(|m| {
+                let e = &mut m.get_mut("DepGlobal").unwrap()[0];
+                e.theorem.push('x');
+            }),
+            Box::new(|m| {
+                let e = &mut m.get_mut("DepGlobal").unwrap()[0];
+                e.from.push('x');
+            }),
+            Box::new(|m| {
+                let e = &mut m.get_mut("DepGlobal").unwrap()[0];
+                e.to.push('x');
+            }),
+            Box::new(|m| {
+                let e = &mut m.get_mut("DepScoped").unwrap()[0];
+                e.scope = None;
+            }),
+            Box::new(|m| {
+                let entries = m.remove("DepGlobal").unwrap();
+                m.insert("DepGlobalRenamed".to_string(), entries);
+            }),
+        ];
+        for (idx, mutate) in mutations.into_iter().enumerate() {
+            let mut changed = posture.modules.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                compute_transitive_csimp_posture_digest("Root", &changed),
+                base,
+                "mutation #{idx} must change the posture digest"
+            );
+        }
+
+        // The root identity is bound too, and field concatenation is unambiguous.
+        assert_ne!(
+            compute_transitive_csimp_posture_digest("Root2", &posture.modules),
+            base
+        );
+        let mut a = BTreeMap::new();
+        a.insert(
+            "M".to_string(),
+            vec![CompiledCsimpObservation {
+                theorem: "ab".into(),
+                from: "c".into(),
+                to: "d".into(),
+                scope: None,
+            }],
+        );
+        let mut b = a.clone();
+        b.get_mut("M").unwrap()[0] = CompiledCsimpObservation {
+            theorem: "a".into(),
+            from: "bc".into(),
+            to: "d".into(),
+            scope: None,
+        };
+        assert_ne!(
+            compute_transitive_csimp_posture_digest("Root", &a),
+            compute_transitive_csimp_posture_digest("Root", &b)
+        );
+    }
+
+    #[test]
+    fn test_transitive_csimp_scan_fails_closed_on_unresolvable_imports() {
+        let fixture = transitive_csimp_fixture();
+        let err = scan_transitive_csimp_posture("Root", |m| {
+            if m == "DepGlobal" {
+                Ok(None)
+            } else {
+                Ok(fixture.get(m).cloned())
+            }
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("DepGlobal"),
+            "unresolvable transitive import must be named in the error: {err}"
+        );
+        let root_err = scan_transitive_csimp_posture("Root", |_| Ok(None)).unwrap_err();
+        assert!(
+            root_err.to_string().contains("Root"),
+            "an unreadable root must fail closed: {root_err}"
+        );
+        let empty = scan_transitive_csimp_posture("  ", |_| Ok(None)).unwrap_err();
+        assert!(
+            empty.to_string().contains("empty"),
+            "an empty root module must be rejected: {empty}"
+        );
+    }
+
+    #[test]
+    fn test_public_signature_csimp_entries_parse_losslessly_or_fail_closed() {
+        assert_eq!(
+            parse_public_signature_csimp_entry("global:slowGlob->fastGlob:slowGlob_eq").unwrap(),
+            CompiledCsimpObservation {
+                theorem: "slowGlob_eq".into(),
+                from: "slowGlob".into(),
+                to: "fastGlob".into(),
+                scope: None,
+            }
+        );
+        assert_eq!(
+            parse_public_signature_csimp_entry("scoped:Ns:slowF->fastF:slowF_eq").unwrap(),
+            CompiledCsimpObservation {
+                theorem: "slowF_eq".into(),
+                from: "slowF".into(),
+                to: "fastF".into(),
+                scope: Some("Ns".into()),
+            }
+        );
+        for malformed in [
+            "",
+            "global",
+            "global:slowGlob->fastGlob",
+            "global:no-arrow:slowGlob_eq",
+            "global:a->b->c:thm",
+            "scoped:Ns:slowF->fastF",
+            "scoped::slowF->fastF:thm",
+            "kind:slowF->fastF:thm",
+        ] {
+            assert!(
+                parse_public_signature_csimp_entry(malformed).is_err(),
+                "malformed public-signature csimp entry must fail closed: {malformed:?}"
+            );
+        }
+    }
+
 }
