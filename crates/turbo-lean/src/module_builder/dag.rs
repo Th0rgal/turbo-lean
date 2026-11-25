@@ -9312,10 +9312,17 @@ pub(super) fn build_module_dag_inner(
     let root_pkg = &cfg.root_pkg;
     // For the `build <Lib>` scope gate below (#436): compare canonical paths, so a dependency
     // reached through a symlinked `.lake/packages` entry resolves to the checkout it really is.
+    // The packages dir the manifest populates counts as the project's own even when it (or
+    // `.lake`) is itself a symlink onto another volume (a RAM or scratch disk).
     let root_canon = root_pkg
         .pkg_root
         .canonicalize()
         .unwrap_or_else(|_| root_pkg.pkg_root.clone());
+    let packages_canon = root_pkg
+        .pkg_root
+        .join(&root_pkg.packages_dir)
+        .canonicalize()
+        .ok();
     let mut initial_specs: Vec<(DiscoveredModuleSpec, bool)> = Vec::new();
     // Shared-library identity is `(pkg_root, lib_name)`, never `origName`, so two dependencies
     // whose directories share a name cannot collide.
@@ -10045,31 +10052,37 @@ pub(super) fn build_module_dag_inner(
                 }
                 continue;
             }
-            // `turbo-lean build <Lib>` scope (#436): a git-pinned dependency checkout outside the
-            // project root is another (possibly shared) checkout, reached through a symlinked
-            // `.lake/packages` entry or a relocated packages dir. Compiling its modules natively
-            // would publish `.olean`/`.trace` rewrites and `.turbo_publish.lock` files into that
-            // foreign checkout, so a pinned out-of-tree dependency is adopted read-only (the
-            // fresh or prebuilt closure above) or the build fails naming the Lake command that
-            // refreshes it. Path dependencies and pinned clones under the project root keep
-            // building, like Lake builds them; `check`'s statement path (`allow_prebuilt_dep_pkgs`)
-            // and untrusted builds are unchanged.
+            // `turbo-lean build <Lib>` scope (#436): a git-pinned dependency checkout outside
+            // both the project root and its packages dir is another (possibly shared) checkout,
+            // reached through a symlinked `.lake/packages` entry or a relocated packages dir.
+            // Compiling its modules natively would publish `.olean`/`.trace` rewrites and
+            // `.turbo_publish.lock` files into that foreign checkout, so a pinned out-of-tree
+            // dependency is adopted read-only (the fresh or prebuilt closure during import
+            // resolution) or fails here, naming the Lake command that refreshes it. Path
+            // dependencies and pinned clones under the project root or packages dir keep
+            // building, like Lake builds them. The gate covers every trusted non-statement
+            // caller of `build_module_dag_with_trust` (`build`, `ci-verify`, freshness probes);
+            // `check`'s statement path (`allow_prebuilt_dep_pkgs`) and untrusted builds are
+            // unchanged.
             if !is_untrusted && !allow_prebuilt_dep_pkgs && !spec.is_root_pkg {
                 let pkg_canon = spec
                     .pkg_root
                     .canonicalize()
                     .unwrap_or_else(|_| spec.pkg_root.clone());
                 if !pkg_canon.starts_with(&root_canon)
+                    && !packages_canon
+                        .as_deref()
+                        .is_some_and(|p| pkg_canon.starts_with(p))
                     && is_git_pinned_manifest_package(cfg, &spec)
                 {
                     anyhow::bail!(
-                        "Cannot build module `{}`: package `{}` is a git-pinned dependency checkout outside the project root ({} is not under {}) and its Lake artifacts could not be adopted read-only; turbo-lean never compiles or publishes into it. Run `lake build {}` in {} to refresh it, then retry",
+                        "Cannot build module `{}`: package `{}` is a git-pinned dependency checkout outside the project root ({} is not under {}); turbo-lean never compiles or publishes into it. Refresh its Lake artifacts first (run `lake build +{}` from the project root {}) and retry",
                         spec.module_name,
                         spec.pkg_name,
                         pkg_canon.display(),
                         root_canon.display(),
                         spec.module_name,
-                        spec.pkg_root.display()
+                        root_pkg.pkg_root.display()
                     );
                 }
             }

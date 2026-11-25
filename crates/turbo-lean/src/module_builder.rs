@@ -3679,7 +3679,9 @@ lean_lib Smoke where
             .expect_err("stale pinned out-of-tree dep must not become a DAG build node")
             .to_string();
         assert!(
-            err.contains("outside the project root") && err.contains("lake build DepPin"),
+            err.contains("outside the project root")
+                && err.contains("`lake build +DepPin` from the project root")
+                && !err.contains("adopted read-only"),
             "unexpected error: {err}"
         );
         // 2. The statement path (`allow_prebuilt_dep_pkgs = true`, `check`) keeps today's shape.
@@ -3696,6 +3698,15 @@ lean_lib Smoke where
         let cfg_in = resolve_project_config(&proj)?;
         let dag_in = build_module_dag(&cfg_in, &["App".to_string()])?;
         assert!(dag_in.nodes.contains_key("DepPin"));
+        // 4. Control: a packages dir that is ITSELF a symlink to another volume (a RAM or
+        //    scratch disk) still counts as the project's own: the gate compares against the
+        //    canonicalized packages dir, not only the project root.
+        let ext_pkgs = dir.join("ext_pkgs");
+        fs::rename(proj.join(".lake/packages"), &ext_pkgs)?;
+        std::os::unix::fs::symlink(&ext_pkgs, proj.join(".lake/packages"))?;
+        let cfg_ext = resolve_project_config(&proj)?;
+        let dag_ext = build_module_dag(&cfg_ext, &["App".to_string()])?;
+        assert!(dag_ext.nodes.contains_key("DepPin"));
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
