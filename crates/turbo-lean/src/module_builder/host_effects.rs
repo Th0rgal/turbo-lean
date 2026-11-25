@@ -47,17 +47,24 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
             }
         }
     }
-    let mut tainted: HashSet<(PathBuf, String)> = HashSet::new();
+    // #438 / #433: only import-time taint (`initialize` bodies reading host state, plus
+    // every fail-closed shape) walks up to importers; a self-only tainted module (an
+    // elaborator body reading host state, an uncovered `include_str`) is purged alone.
+    // Its importers stay pinned to its artifact digest through the verified-source
+    // stamps and Lake traces, so a rebuilt artifact still invalidates them without
+    // deleting whole import closures up front.
+    let mut spreading: HashSet<(PathBuf, String)> = HashSet::new();
     let mut purged_any = false;
     for spec in postorder {
+        let key = (spec.pkg_root.clone(), spec.module_name.clone());
         let Ok(src_raw) = fs::read_to_string(&spec.src_path) else {
-            tainted.insert((spec.pkg_root.clone(), spec.module_name.clone()));
+            spreading.insert(key);
             crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
             purged_any = true;
             continue;
         };
         let hdr = parse_header_info(&src_raw);
-        let imp_tainted = hdr.header_error.is_some()
+        let imports_spreading = hdr.header_error.is_some()
             || hdr.imports.iter().any(|sub| {
                 let site = match resolve_module_in_package(&cfg.root_pkg, true, sub) {
                     Some(rs) => ImportSite::Module(Box::new(rs)),
@@ -65,13 +72,17 @@ pub(crate) fn purge_elab_host_effect_artifacts_in_closure(
                 };
                 match site {
                     ImportSite::Module(sub_spec) => {
-                        tainted.contains(&(sub_spec.pkg_root, sub_spec.module_name))
+                        spreading.contains(&(sub_spec.pkg_root, sub_spec.module_name))
                     }
                     _ => false,
                 }
             });
-        if imp_tainted || spec_source_has_disallowed_elab_host_effects(cfg, &spec, &src_raw) {
-            tainted.insert((spec.pkg_root.clone(), spec.module_name.clone()));
+        let taint = spec_source_host_effect_taint(cfg, &spec, &src_raw);
+        if imports_spreading || taint.spreads_to_importers() {
+            spreading.insert(key);
+            crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
+            purged_any = true;
+        } else if taint.is_tainted() {
             crate::lake_build::remove_spec_build_artifacts_checked(&spec)?;
             purged_any = true;
         }
@@ -2362,6 +2373,45 @@ mod host_effect_taint_tests {
             "an elaborator body reading host state must stay tainted even in a pinned dependency"
         );
         let _ = fs::remove_dir_all(dir);
+        Ok(())
+    }
+
+    /// #438: `purge_elab_host_effect_artifacts_in_closure` must not delete the whole
+    /// import closure. A self-only tainted dependency module (an elaborator body reading
+    /// host state) is purged alone and its importers keep their artifacts; an import-time
+    /// host read still purges the importer cone; a definition-only linter module in a
+    /// clean pinned dependency purges nothing.
+    #[test]
+    fn host_effects_issue_438_purge_keeps_importers_of_self_only_tainted_dep() -> Result<()> {
+        for (label, dep_source, expect_dep_purged, expect_importer_purged) in [
+            ("linter", LINTER_SHAPE, false, false),
+            ("elabread", ELAB_BLOCK_HOST_READ_SHAPE, true, false),
+            ("importtime", IMPORT_TIME_SHAPE, true, true),
+        ] {
+            let (dir, cfg, spec) = pinned_dep_fixture(&format!("purge_{label}"), dep_source)?;
+            let dep_olean = spec.build_lib_lean_dir.join("LintLib.olean");
+            fs::create_dir_all(dep_olean.parent().unwrap())?;
+            fs::write(&dep_olean, b"fake dep olean")?;
+            let root_spec = resolve_module_in_package(&cfg.root_pkg, true, "Proj")
+                .expect("root module resolves");
+            let root_olean = root_spec.build_lib_lean_dir.join("Proj.olean");
+            fs::create_dir_all(root_olean.parent().unwrap())?;
+            fs::write(&root_olean, b"fake root olean")?;
+            let purged =
+                purge_elab_host_effect_artifacts_in_closure(&cfg, &["Proj".to_string()])?;
+            assert_eq!(
+                purged,
+                expect_dep_purged || expect_importer_purged,
+                "{label}: purged_any"
+            );
+            assert_eq!(!dep_olean.is_file(), expect_dep_purged, "{label}: dep artifact");
+            assert_eq!(
+                !root_olean.is_file(),
+                expect_importer_purged,
+                "{label}: importer artifacts must outlive a self-only tainted dependency (#438)"
+            );
+            let _ = fs::remove_dir_all(dir);
+        }
         Ok(())
     }
 
