@@ -8,7 +8,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-const DEFAULT_TARGET: &str = "x86_64";
+/// Host-arch-aware default superopt target: aarch64 hosts default to the
+/// `arm64` cost model, every other host to `x86_64`.
+const DEFAULT_TARGET: &str = if cfg!(target_arch = "aarch64") {
+    "arm64"
+} else {
+    "x86_64"
+};
 const DEFAULT_INPUT: &str = "canonical";
 const SUPPORTED_TARGETS: [&str; 4] = ["x86_64", "arm64", "cuda_ptx", "apple_metal"];
 
@@ -69,8 +75,10 @@ impl Drop for TempBundleGuard {
 
 pub fn normalize_superopt_target(raw: &str) -> Result<&'static str> {
     match raw.trim() {
-        "x86_64" => Ok("x86_64"),
-        "arm64" => Ok("arm64"),
+        // `aarch64` / `amd64` are accepted as aliases, matching the Lean-side
+        // `parseSuperoptTarget?` spellings (lean/LeanNative/Driver/Worker.lean).
+        "x86_64" | "amd64" => Ok("x86_64"),
+        "arm64" | "aarch64" => Ok("arm64"),
         "cuda_ptx" => Ok("cuda_ptx"),
         "apple_metal" => Ok("apple_metal"),
         other => anyhow::bail!(
@@ -637,6 +645,34 @@ mod tests {
             "schema": "lean-native.stochastic-cert.v1"
         }))
         .is_err());
+    }
+
+    #[test]
+    fn test_superopt_target_aarch64_alias_and_host_default() {
+        assert_eq!(normalize_superopt_target("aarch64").unwrap(), "arm64");
+        assert_eq!(normalize_superopt_target(" aarch64 ").unwrap(), "arm64");
+        assert_eq!(normalize_superopt_target("amd64").unwrap(), "x86_64");
+        // DEFAULT_TARGET tracks the build host architecture and is always a
+        // canonical supported target.
+        if cfg!(target_arch = "aarch64") {
+            assert_eq!(DEFAULT_TARGET, "arm64");
+        } else {
+            assert_eq!(DEFAULT_TARGET, "x86_64");
+        }
+        assert_eq!(
+            normalize_superopt_target(DEFAULT_TARGET).unwrap(),
+            DEFAULT_TARGET
+        );
+        let args = SuperoptEvolveArgs {
+            target: "aarch64".to_string(),
+            generations: None,
+            seed: None,
+            bundle_out: None,
+            pack_out: None,
+            input: PathBuf::from(DEFAULT_INPUT),
+        };
+        let built = build_helper_args(&args, None, false).unwrap();
+        assert_eq!(&built[..3], ["superopt-evolve", "--target", "arm64"]);
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {
