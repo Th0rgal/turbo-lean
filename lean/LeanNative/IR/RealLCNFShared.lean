@@ -20,8 +20,14 @@ constructor layout specification (`RcCtorLayoutSpec`), the read-only lowering/ev
 (`hasJmpToPure`). Declarations stay in the `LeanNative.IR.RealLCNFBridge` namespace, so every
 existing fully-qualified name, `open`, and proof is unchanged.
 
-No lowering function lives here: `lowerImpureStepPure`, `lowerRealLCNFCode`, and
-`lowerRealLCNFDecl` remain in `RealLCNFBridge.lean`, which imports this file.
+No code/instruction lowering lives here: `lowerImpureStepPure`, `lowerRealLCNFCode`, and
+`lowerRealLCNFDecl` remain in `RealLCNFBridge.lean`, which imports this file. The ground
+*type* lowering (`lowerAtomicImpureType`, `lowerGroundImpureType`, `lowerGroundImpureTypeWith`,
+`RealBridgeCtx.lowerParamType`) does live here and is deliberately shared: the lowerer and
+`RealLCNFSemantics` must agree on how LCNF types map to `LNIRType` (parameter binding,
+projection typing, C1.2 layout slots), so the type mapping is a shared trusted component of
+the differential — the independence claim covers the instruction semantics, not the type
+lowering.
 -/
 
 /-- Canonical `Lean.Name` lookup table with explicit operand width (`LNIRType`).
