@@ -69,6 +69,133 @@ use super::*;
         fs::remove_dir_all(dir).unwrap();
     }
 
+    /// H2.3: a cross-file coalesced replay wider than the old 4-block cap fans out over
+    /// the pool under the `--jobs` budget: every block is replayed and lands in the
+    /// combined reply (deterministic combine), and the pool never holds more workers for
+    /// this request's key than the budget's effective parallelism.
+    #[test]
+    #[cfg(unix)]
+    fn wide_cross_file_replay_fans_out_under_the_jobs_budget() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_jobs = std::env::var_os("TURBO_LEAN_JOBS");
+        std::env::set_var("TURBO_LEAN_JOBS", "2");
+        let (dir, store, mut env, lean_bin) = open_test_zygote_env("wide_cross_budget").unwrap();
+        let policy_tag = format!("H23Wide{}", next_tmp_id());
+        env.insert(
+            crate::splitter::ALLOWED_AXIOMS_ENV.into(),
+            policy_tag.clone(),
+        );
+        let names = ["w6_a", "w6_b", "w6_c", "w6_d", "w6_e", "w6_f"];
+        let mut source = String::from("import Init\n");
+        for (i, n) in names.iter().enumerate() {
+            source.push_str(&format!(
+                "-- namespace _TurboCrossFileShard_{}\ntheorem {} : True := True.intro\n",
+                i, n
+            ));
+        }
+        let rep = eval_with_zygote_pool(
+            &store,
+            "leanprover/lean4:v4.35.0",
+            "",
+            &env,
+            &lean_bin,
+            &source,
+            false,
+        )
+        .unwrap();
+        let pooled = ZYGOTE_POOL
+            .get()
+            .map(|pool| {
+                pool.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .filter(|(key, _)| key.0.contains(&policy_tag))
+                    .map(|(_, workers)| workers.len())
+                    .sum::<usize>()
+            })
+            .unwrap_or(0);
+        match prev_jobs {
+            Some(v) => std::env::set_var("TURBO_LEAN_JOBS", v),
+            None => std::env::remove_var("TURBO_LEAN_JOBS"),
+        }
+        assert!(rep.ok && rep.kernel_gate_active, "{rep:?}");
+        for n in names {
+            assert!(
+                rep.decl_types.contains_key(n),
+                "block decl {n} missing from the combined reply: {rep:?}"
+            );
+        }
+        assert_eq!(
+            pooled, 2,
+            "a --jobs 2 budget must fan a 6-block replay out over exactly 2 pool workers \
+             (the pre-H2.3 path ran one serial whole-body worker past 4 blocks)"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// H2.3 scaling bench (ignored; run by hand). Replays a cross-file coalesced shard of
+    /// kernel-heavy theorem blocks through the pool and prints the replay wall time, so
+    /// `TURBO_LEAN_JOBS=1` vs `TURBO_LEAN_JOBS=4` runs (one process each, fresh store
+    /// each) measure the fan-out's scaling:
+    /// `TURBO_LEAN_JOBS=4 cargo test -p turbo-lean -- --ignored bench_cross_file_replay_scaling --nocapture`
+    #[test]
+    #[ignore = "H2.3 scaling bench: run by hand with TURBO_LEAN_JOBS set"]
+    fn bench_cross_file_replay_scaling() {
+        let (dir, store, mut env, lean_bin) = open_test_zygote_env("h23_bench").unwrap();
+        let jobs = std::env::var("TURBO_LEAN_JOBS").unwrap_or_else(|_| "unset".into());
+        let jobs_slug: String = jobs
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        let tag = format!("H23Bench{}", next_tmp_id());
+        env.insert(crate::splitter::ALLOWED_AXIOMS_ENV.into(), tag);
+        // Each theorem's `decide` recursion must stay well under the elaborator's default
+        // `maxRecDepth` (512; a range-200 foldl already trips it), so the per-block load
+        // is K shallow kernel-replayed theorems (list length 80..119), not one deep one —
+        // exactly the many-small-decls shape the replay fan-out parallelizes. Statements
+        // vary with k so no cross-declaration sharing can elide the work.
+        let n: usize = std::env::var("TURBO_LEAN_BENCH_N")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(80);
+        let k_per_block: usize = std::env::var("TURBO_LEAN_BENCH_K")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200);
+        let blocks = 8;
+        let mut source = String::from("import Init\n");
+        for i in 0..blocks {
+            source.push_str(&format!("-- namespace _TurboCrossFileShard_{i}\n"));
+            for k in 0..k_per_block {
+                let len = n + (k % 40);
+                let sum = len * (len - 1) / 2;
+                source.push_str(&format!(
+                    "theorem h23_bench_{jobs_slug}_{i}_{k} : (List.range {len}).foldl (fun a b => a + b) 0 = {sum} := by decide\n",
+                ));
+            }
+        }
+        let t0 = std::time::Instant::now();
+        let rep = eval_with_zygote_pool(
+            &store,
+            "leanprover/lean4:v4.35.0",
+            "",
+            &env,
+            &lean_bin,
+            &source,
+            false,
+        )
+        .unwrap();
+        let wall = t0.elapsed();
+        assert!(rep.ok && rep.kernel_gate_active, "{rep:?}");
+        println!(
+            "[h23-bench] jobs={jobs} blocks={blocks} n={n} replay_wall_ms={}",
+            wall.as_millis()
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn test_mcp_transport_detects_early_child_exit() {
         let mut child = Command::new("sh").args(["-c", "exit 7"]).spawn().unwrap();
