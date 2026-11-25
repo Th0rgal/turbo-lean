@@ -93,7 +93,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/alive2-tv
-          key: ${{ runner.os }}-alive2-llvm18-2547695358b01758a01f4bdab2ced70178189074-v3
+          key: ${{ runner.os }}-${{ runner.arch }}-alive2-llvm18-2547695358b01758a01f4bdab2ced70178189074-v3
 
       - name: Build or restore pinned Alive2 (alive-tv) binary for Stage 2B gate
         run: |
@@ -106,7 +106,7 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/gpu-tpu-tools
-          key: ${{ runner.os }}-gpu-tpu-tools-ptxas12986-stablehlo1121-v1
+          key: ${{ runner.os }}-${{ runner.arch }}-gpu-tpu-tools-ptxas12986-stablehlo1121-v1
 
       - name: Provision or restore pinned ptxas & OpenXLA StableHLO wheels for Stage 3A/3B/3C gate
         run: |
@@ -122,9 +122,9 @@ jobs:
             ~/.cargo/git
             target
             lean/.lake/build
-          key: ${{ runner.os }}-roadmap-cargo-lean-${{ needs.impact.outputs.impact_digest }}
+          key: ${{ runner.os }}-${{ runner.arch }}-roadmap-cargo-lean-${{ needs.impact.outputs.impact_digest }}
           restore-keys: |
-            ${{ runner.os }}-roadmap-cargo-lean-
+            ${{ runner.os }}-${{ runner.arch }}-roadmap-cargo-lean-
 
       - name: Setup Lean 4 toolchain
         run: |
@@ -180,10 +180,10 @@ jobs:
           path: |
             ~/.elan
             verification/lean-mlir-bridge/.lake
-          key: ${{ runner.os }}-lean-mlir-bridge-${{ hashFiles('verification/lean-mlir-bridge/lean-toolchain', 'verification/lean-mlir-bridge/lakefile.toml', 'verification/lean-mlir-bridge/lake-manifest.json', 'verification/lean-mlir-bridge/**/*.lean') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-lean-mlir-bridge-${{ hashFiles('verification/lean-mlir-bridge/lean-toolchain', 'verification/lean-mlir-bridge/lakefile.toml', 'verification/lean-mlir-bridge/lake-manifest.json', 'verification/lean-mlir-bridge/**/*.lean') }}
           restore-keys: |
-            ${{ runner.os }}-lean-mlir-bridge-${{ hashFiles('verification/lean-mlir-bridge/lean-toolchain', 'verification/lean-mlir-bridge/lakefile.toml') }}-
-            ${{ runner.os }}-lean-mlir-bridge-
+            ${{ runner.os }}-${{ runner.arch }}-lean-mlir-bridge-${{ hashFiles('verification/lean-mlir-bridge/lean-toolchain', 'verification/lean-mlir-bridge/lakefile.toml') }}-
+            ${{ runner.os }}-${{ runner.arch }}-lean-mlir-bridge-
 
       - name: Setup Lean toolchain for verification/lean-mlir-bridge
         run: |
@@ -232,10 +232,10 @@ jobs:
           path: |
             ~/.elan
             verification/lnsym-bridge/.lake
-          key: ${{ runner.os }}-lnsym-bridge-${{ hashFiles('verification/lnsym-bridge/lean-toolchain', 'verification/lnsym-bridge/lakefile.toml', 'verification/lnsym-bridge/lake-manifest.json', 'verification/lnsym-bridge/**/*.lean') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-lnsym-bridge-${{ hashFiles('verification/lnsym-bridge/lean-toolchain', 'verification/lnsym-bridge/lakefile.toml', 'verification/lnsym-bridge/lake-manifest.json', 'verification/lnsym-bridge/**/*.lean') }}
           restore-keys: |
-            ${{ runner.os }}-lnsym-bridge-${{ hashFiles('verification/lnsym-bridge/lean-toolchain', 'verification/lnsym-bridge/lakefile.toml') }}-
-            ${{ runner.os }}-lnsym-bridge-
+            ${{ runner.os }}-${{ runner.arch }}-lnsym-bridge-${{ hashFiles('verification/lnsym-bridge/lean-toolchain', 'verification/lnsym-bridge/lakefile.toml') }}-
+            ${{ runner.os }}-${{ runner.arch }}-lnsym-bridge-
 
       - name: Setup Lean toolchain for verification/lnsym-bridge
         run: |
@@ -285,10 +285,10 @@ jobs:
           path: |
             ~/.elan
             verification/con-leche-bridge/.lake
-          key: ${{ runner.os }}-con-leche-bridge-${{ hashFiles('verification/con-leche-bridge/lean-toolchain', 'verification/con-leche-bridge/lakefile.toml', 'verification/con-leche-bridge/lake-manifest.json', 'verification/con-leche-bridge/**/*.lean') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-con-leche-bridge-${{ hashFiles('verification/con-leche-bridge/lean-toolchain', 'verification/con-leche-bridge/lakefile.toml', 'verification/con-leche-bridge/lake-manifest.json', 'verification/con-leche-bridge/**/*.lean') }}
           restore-keys: |
-            ${{ runner.os }}-con-leche-bridge-${{ hashFiles('verification/con-leche-bridge/lean-toolchain', 'verification/con-leche-bridge/lakefile.toml') }}-
-            ${{ runner.os }}-con-leche-bridge-
+            ${{ runner.os }}-${{ runner.arch }}-con-leche-bridge-${{ hashFiles('verification/con-leche-bridge/lean-toolchain', 'verification/con-leche-bridge/lakefile.toml') }}-
+            ${{ runner.os }}-${{ runner.arch }}-con-leche-bridge-
 
       - name: Setup Lean toolchain for verification/con-leche-bridge
         run: |
@@ -346,10 +346,10 @@ jobs:
           path: |
             ~/.elan
             verification/sail-riscv-bridge/.lake
-          key: ${{ runner.os }}-sail-riscv-bridge-${{ hashFiles('verification/sail-riscv-bridge/lean-toolchain', 'verification/sail-riscv-bridge/lakefile.toml', 'verification/sail-riscv-bridge/lake-manifest.json', 'verification/sail-riscv-bridge/**/*.lean') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-sail-riscv-bridge-${{ hashFiles('verification/sail-riscv-bridge/lean-toolchain', 'verification/sail-riscv-bridge/lakefile.toml', 'verification/sail-riscv-bridge/lake-manifest.json', 'verification/sail-riscv-bridge/**/*.lean') }}
           restore-keys: |
-            ${{ runner.os }}-sail-riscv-bridge-${{ hashFiles('verification/sail-riscv-bridge/lean-toolchain', 'verification/sail-riscv-bridge/lakefile.toml') }}-
-            ${{ runner.os }}-sail-riscv-bridge-
+            ${{ runner.os }}-${{ runner.arch }}-sail-riscv-bridge-${{ hashFiles('verification/sail-riscv-bridge/lean-toolchain', 'verification/sail-riscv-bridge/lakefile.toml') }}-
+            ${{ runner.os }}-${{ runner.arch }}-sail-riscv-bridge-
 
       - name: Setup Lean toolchain for verification/sail-riscv-bridge
         run: |

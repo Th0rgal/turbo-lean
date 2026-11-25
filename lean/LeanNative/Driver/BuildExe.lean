@@ -103,13 +103,13 @@ def withElaboratedFrontend {α : Type} (filePath : String) (modName : Lean.Name)
 /-- Elaborate a `.lean` source file and inline local calls while preserving every
     lowered declaration. An ABI symbol's spelling does not establish internal ownership. -/
 def ingestLeanSourceFile (filePath : String) (moduleName : String := "LeanNative.FileInput")
-    (arch : TargetArch := .x86_64) (allowRcAdt : Bool := false) : IO LNIRModule :=
+    (arch : TargetArch := .host) (allowRcAdt : Bool := false) : IO LNIRModule :=
   normalizeAndInlineLocalDefs <$> withElaboratedFrontend filePath `LeanNativeInput (ingestAllLocalDecls moduleName arch allowRcAdt)
 
 /-- Elaborate `filePath` with `Lean.Elab.runFrontend`, extracting both the Lean 4.31 C module code
     (`Lean.Compiler.LCNF.emitC modName`) and the lowered `LNIRModule` via `ingestAllLocalDecls`. -/
 def emitLeanCFromSourceFile (filePath : String) (modName : Lean.Name := `Main)
-    (arch : TargetArch := .x86_64) : IO (String × LNIRModule) :=
+    (arch : TargetArch := .host) : IO (String × LNIRModule) :=
   withElaboratedFrontend filePath modName do
     let mod ← ingestAllLocalDecls modName.toString arch
     return (← Lean.Compiler.LCNF.emitC modName, mod)
@@ -117,7 +117,7 @@ def emitLeanCFromSourceFile (filePath : String) (modName : Lean.Name := `Main)
 /-- P-cert C4/C5 `build-exe` gate (fail closed, checked before any file is written): the Bridge already refuses
     RC-ADT decls without `allowRcAdt`, but the LLVM backend accepts no heap code, so `build-exe` re-checks
     `findRcAdtDecl?` on the lowered module and `findUnsupportedLLVMCall?` on the optimized one explicitly. -/
-def buildExeLLVMGate? (rawMod optMod : LNIRModule) (arch : TargetArch := .x86_64) : Option String :=
+def buildExeLLVMGate? (rawMod optMod : LNIRModule) (arch : TargetArch := .host) : Option String :=
   (rawMod.findRcAdtDecl?.map fun d => s!"[lean-native] build-exe: RC-ADT declaration '{d}' is unsupported by the LLVM backend") <|>
   ((LeanNative.Backend.LLVM.findUnsupportedLLVMCall? optMod arch).map fun (d, c) =>
     s!"[lean-native] build-exe: unsupported external or non-scalar call '{c}' in '{d}'")
@@ -126,8 +126,7 @@ def buildExeLLVMGate? (rawMod optMod : LNIRModule) (arch : TargetArch := .x86_64
 def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : String := "-O3")
     (cliArgs : List String := []) : IO (LNIRModule × String) := do
   let sysroot ← resolveLeanSysroot
-  let hostArch : TargetArch :=
-    if System.Platform.target.startsWith "aarch64" || System.Platform.target.startsWith "arm64" then .arm64 else .x86_64
+  let hostArch : TargetArch := .host
   let (cCode, rawMod) ← emitLeanCFromSourceFile filePath `Main hostArch
   let (optMod, _) := LeanNative.Transform.runDefaultPipeline rawMod
   if let some err := buildExeLLVMGate? rawMod optMod hostArch then throw <| IO.userError err
@@ -172,9 +171,12 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
   let extraIncArgs : Array String :=
     if clangCmd == tcClang.toString then #[s!"-isystem{clangIncDir}"] else #[]
 
+  let isDarwinHost := (System.Platform.target.splitOn "darwin").length > 1 || (System.Platform.target.splitOn "apple").length > 1
+  -- Apple clang on arm64 rejects `-march=native`; use `-mcpu=native` there.
+  let nativeTuneFlag := if isDarwinHost && hostArch == .arm64 then "-mcpu=native" else "-march=native"
   let clangEmitOut ← IO.Process.output {
     cmd  := clangCmd
-    args := #["-S", "-emit-llvm", optLevel, "-Xclang", "-disable-llvm-passes", "-DNDEBUG", "-march=native", s!"-I{incDir}", s!"-I{runtimeDir}"] ++ extraIncArgs ++ #[cPath, "-o", rawLlPath]
+    args := #["-S", "-emit-llvm", optLevel, "-Xclang", "-disable-llvm-passes", "-DNDEBUG", nativeTuneFlag, s!"-I{incDir}", s!"-I{runtimeDir}"] ++ extraIncArgs ++ #[cPath, "-o", rawLlPath]
   }
   if clangEmitOut.exitCode != 0 then
     throw <| IO.userError s!"clang -emit-llvm failed:\n{clangEmitOut.stderr}"
@@ -211,7 +213,7 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
   runOptPass rawLlPath optLlPath (IO.FS.readFile rawLlPath)
   runOptPass lnirLlPath lnirOptLlPath (pure lnirLlText)
 
-  let isDarwin := (System.Platform.target.splitOn "darwin").length > 1 || (System.Platform.target.splitOn "apple").length > 1
+  let isDarwin := isDarwinHost
   let linkInputs := if isDarwin then #[optLlPath, runtimePath] else #[optLlPath, lnirOptLlPath, runtimePath, "-Wl,--allow-multiple-definition"]
   let sysLibDir := (sysroot / "lib").toString
   let hasStaticLeanRt ← ((sysroot / "lib" / "lean" / "libleanrt.a").pathExists)
@@ -240,13 +242,13 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
       pure #[s!"-L{libDir}", "-lleanshared", s!"-Wl,-rpath,{libDir}", "-lm", "-lpthread", "-ldl"]
   let mut linkOut ← IO.Process.output {
     cmd  := clangCmd
-    args := #[optLevel, "-DNDEBUG", "-march=native", "-Wno-override-module", s!"-I{incDir}", s!"-I{runtimeDir}"] ++
+    args := #[optLevel, "-DNDEBUG", nativeTuneFlag, "-Wno-override-module", s!"-I{incDir}", s!"-I{runtimeDir}"] ++
       extraIncArgs ++ linkInputs ++ runtimeLinkFlags ++ #["-o", outBin]
   }
   if linkOut.exitCode != 0 && useStandaloneStatic && !cliArgs.contains "--standalone" then
     linkOut ← IO.Process.output {
       cmd  := clangCmd
-      args := #[optLevel, "-DNDEBUG", "-march=native", "-Wno-override-module", s!"-I{incDir}", s!"-I{runtimeDir}"] ++
+      args := #[optLevel, "-DNDEBUG", nativeTuneFlag, "-Wno-override-module", s!"-I{incDir}", s!"-I{runtimeDir}"] ++
         extraIncArgs ++ linkInputs ++ #[s!"-L{libDir}", "-lleanshared", s!"-Wl,-rpath,{libDir}", "-lm", "-lpthread", "-ldl", "-o", outBin]
     }
   if linkOut.exitCode != 0 then

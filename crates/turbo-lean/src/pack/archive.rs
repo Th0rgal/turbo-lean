@@ -1286,6 +1286,9 @@ pub fn try_stateless_cold_import_with_domain(
     let (file_len, magic, header_buf) = read_pack_header_from_file(input_path)?;
     let header_len = header_buf.len();
     let manifest = serde_json::from_slice::<PackManifest>(&header_buf).ok()?;
+    // Arch-mismatched non-portable packs fall back to the full import path,
+    // which rejects them with a named error.
+    super::manifest::check_pack_arch_import(&manifest, std::env::consts::ARCH).ok()?;
     let td = resolve_pack_import_trust_domain(
         &manifest,
         requested_domain,
@@ -1600,6 +1603,7 @@ pub fn import_pack_with_policy(
     if let Some((manifest, staged_blobs, newly_written, pub_guard)) =
         try_read_and_prestage_pack(&store.root, input_path)
     {
+        super::manifest::check_pack_arch_import(&manifest, std::env::consts::ARCH)?;
         let td = resolve_pack_import_trust_domain(
             &manifest,
             requested_domain,
@@ -1681,6 +1685,8 @@ pub fn import_pack_bytes_with_policy(
                 serde_json::from_slice(stream_bytes).context("Failed to parse PackManifest")?;
             (m, &[])
         };
+
+    super::manifest::check_pack_arch_import(&manifest, std::env::consts::ARCH)?;
 
     let td = resolve_pack_import_trust_domain(
         &manifest,

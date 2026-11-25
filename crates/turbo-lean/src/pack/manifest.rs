@@ -393,6 +393,47 @@ pub struct CheckShardsBatchResponse {
     pub verified_decl_types: std::collections::BTreeMap<String, String>,
 }
 
+/// Import-side architecture guard: a pack exported on a different host
+/// architecture may only deliver portable artifacts. The exporting arch is
+/// recorded in `PackManifest.host_arch` (`std::env::consts::ARCH`) but was
+/// historically never validated on import, so a pack exported with
+/// `--portable-only=false` could deliver wrong-arch native `.o`/`.so` blobs.
+/// Fails closed with a named error on the first non-portable blob or action
+/// output when the arches differ; portable-only packs stay importable.
+pub fn check_pack_arch_import(manifest: &PackManifest, local_arch: &str) -> Result<()> {
+    if manifest.host_arch == local_arch {
+        return Ok(());
+    }
+    let offending = manifest
+        .blobs
+        .iter()
+        .find(|b| !b.portable || !is_portable_artifact(&b.kind, ""))
+        .map(|b| (b.blob_hash.clone(), b.kind.clone(), String::new()))
+        .or_else(|| {
+            manifest
+                .actions
+                .iter()
+                .flat_map(|a| a.outputs.iter())
+                .find(|o| !is_portable_artifact(&o.kind, &o.rel_path))
+                .map(|o| (o.blob_hash.clone(), o.kind.clone(), o.rel_path.clone()))
+        });
+    if let Some((blob_hash, kind, rel_path)) = offending {
+        let path_note = if rel_path.is_empty() {
+            String::new()
+        } else {
+            format!(", path '{rel_path}'")
+        };
+        anyhow::bail!(
+            "Refusing to import non-portable artifact '{blob_hash}' (kind '{kind}'{path_note}) \
+             from a pack built on host_arch '{}' onto host_arch '{local_arch}'; only portable \
+             artifact kinds (olean/ilean/c/expr_shard/lean4export/receipt) may cross \
+             architectures. Re-export the pack with --portable-only or import it on a matching host.",
+            manifest.host_arch
+        );
+    }
+    Ok(())
+}
+
 pub fn is_portable_artifact(kind: &str, rel_path: &str) -> bool {
     // .olean, .ilean, .c, .lean4export, and theorem expr shards are portable across 64-bit x86_64 and aarch64
     // whereas native compiled .o / .so / binaries are architecture-specific.

@@ -2977,3 +2977,99 @@ fn test_epoch_mismatch_and_same_epoch_locks_sidecars_and_spools() -> Result<()> 
     let _ = fs::remove_dir_all(&dir);
     Ok(())
 }
+
+#[test]
+fn test_import_refuses_nonportable_blobs_from_other_arch() -> Result<()> {
+    let dir = std::env::temp_dir().join(format!(
+        "turbo_lean_pack_arch_guard_{}_{}",
+        std::process::id(),
+        next_tmp_id()
+    ));
+    let _ = fs::remove_dir_all(&dir);
+
+    let payload = b"cross-arch-native-object".to_vec();
+    let bh = blake3::hash(&payload).to_hex().to_string();
+    let mk_manifest = |host_arch: &str, kind: &str, rel_path: &str, portable: bool| PackManifest {
+        format_version: 2,
+        host_arch: host_arch.to_string(),
+        created_at: 1,
+        actions: vec![ActionRecord {
+            action_key: format!("arch_guard_act_{kind}_{host_arch}_{portable}"),
+            toolchain_githash: "leanprover/lean4:v4.35.0".into(),
+            kind: "module_unit".into(),
+            status: "completed".into(),
+            fencing_token: 1,
+            output_manifest_hash: "00".repeat(32),
+            duration_ms: 1,
+            peak_pss_bytes: 0,
+            heartbeats: 1,
+            trust_domain: "trusted".into(),
+            outputs: vec![BlobEntry {
+                blob_hash: bh.clone(),
+                kind: kind.into(),
+                size_bytes: payload.len() as u64,
+                rel_path: rel_path.into(),
+            }],
+        }],
+        blobs: vec![PackedBlob {
+            blob_hash: bh.clone(),
+            kind: kind.into(),
+            size_bytes: payload.len() as u64,
+            portable,
+            data_hex_or_base64: Vec::new(),
+        }],
+        ed25519_pubkey: None,
+        ed25519_signature: None,
+        replayed_oleans: Vec::new(),
+    };
+    let mk_stream = |m: &PackManifest| -> Vec<u8> {
+        let hdr = serde_json::to_vec(m).unwrap();
+        let mut s = Vec::with_capacity(16 + hdr.len() + payload.len());
+        s.extend_from_slice(b"TLPK\x00\x00\x00\x02");
+        s.extend_from_slice(&(hdr.len() as u64).to_le_bytes());
+        s.extend_from_slice(&hdr);
+        s.extend_from_slice(&payload);
+        s
+    };
+
+    // A pack built on a different arch carrying a non-portable native object
+    // (e.g. an `.o`) must fail closed with a clear message.
+    let foreign = mk_manifest("sparc64", "o", "build/lib/Foo.o", false);
+    let mut store_a = TurboStore::open(Some(&dir.join("a")))?;
+    let err = import_pack_bytes_with_policy(
+        &mut store_a,
+        &mk_stream(&foreign),
+        Some("trusted"),
+        None,
+        true,
+    )
+    .expect_err("cross-arch import of a non-portable artifact pack must be refused");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("sparc64") && msg.contains(std::env::consts::ARCH),
+        "arch-guard error must name both architectures: {msg}"
+    );
+    assert!(
+        msg.to_lowercase().contains("portable"),
+        "arch-guard error must explain the portability rule: {msg}"
+    );
+
+    // Same-arch pack with the same non-portable blob stays importable.
+    let native = mk_manifest(std::env::consts::ARCH, "o", "build/lib/Foo.o", false);
+    let mut store_b = TurboStore::open(Some(&dir.join("b")))?;
+    assert_eq!(
+        import_pack_bytes_with_policy(&mut store_b, &mk_stream(&native), Some("trusted"), None, true)?,
+        (1, 1)
+    );
+
+    // Cross-arch pack carrying only portable artifacts stays importable.
+    let portable = mk_manifest("sparc64", "olean", "build/lib/Foo.olean", true);
+    let mut store_c = TurboStore::open(Some(&dir.join("c")))?;
+    assert_eq!(
+        import_pack_bytes_with_policy(&mut store_c, &mk_stream(&portable), Some("trusted"), None, true)?,
+        (1, 1)
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+    Ok(())
+}

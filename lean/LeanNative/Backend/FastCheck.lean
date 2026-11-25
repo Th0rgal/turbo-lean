@@ -514,11 +514,11 @@ def FastCheckReport.formatSummary (r : FastCheckReport) : String :=
 /-- Emit LLVM 18 IR (`@lean_native_fastcheck_simd`) with SplitMix64 + boundary value table,
     equality constraint propagation, `satisfied_preconditions_count` atomic reduction, and
     counterexample witness output buffer. -/
-def emitFastCheckLLVM (m : LNIRModule) : String :=
+def emitFastCheckLLVM (m : LNIRModule) (target : TargetArch := .host) : String :=
   let declNames := String.intercalate ", " (m.decls.map (·.name))
   String.intercalate "\n" [
     s!"; LeanNative FastCheck SIMD Falsification Module: {m.moduleName}\n; Declarations ({m.decls.length}): {declNames}",
-    "target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\ntarget triple = \"x86_64-unknown-linux-gnu\"\n",
+    s!"target datalayout = \"{target.dataLayout}\"\ntarget triple = \"{target.llvmTriple}\"\n",
     "@lean_native_fastcheck_boundary_u64 = private unnamed_addr constant [8 x i64] [\n  i64 0, i64 1, i64 2, i64 42, i64 255, i64 65535,\n  i64 4294967295, i64 -1\n], align 32\n",
     "; FastCheck SIMD Runner: <4 x i64> SplitMix64 + Boundary Table + Equality Constraint Propagation",
     "define dso_local i64 @lean_native_fastcheck_simd(ptr noalias nocapture noundef %cex_out_ptr, ptr noalias nocapture noundef %satisfied_preconditions_count, i64 noundef %seed, i64 noundef %num_samples) local_unnamed_addr #0 {",

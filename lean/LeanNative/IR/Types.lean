@@ -245,6 +245,22 @@ def clangFlags (t : TargetArch) (isaOverride? : Option IsaLevel := none) (wasmSi
     #["--target=riscv32-unknown-none-elf", "-march=rv32imac", "-mabi=ilp32", "-Oz", "-ffreestanding", "-fno-builtin", "-nostdlib", "-ffunction-sections", "-fdata-sections", "-fstack-usage", "-Wno-override-module"]
   | _             => #[s!"--target={t.triple}", "-O3", "-fPIC", "-Wno-override-module"]
 
+/-- The build host's `TargetArch`: aarch64 hosts map to `.arm64`, everything else
+    to `.x86_64` (the same detection `BuildExe` has always used, Apple arm64
+    included). Used as the host-default arch for CLI flags and builtin emission
+    so arm64 hosts stop silently defaulting to x86_64. -/
+def host : TargetArch :=
+  if System.Platform.target.startsWith "aarch64" || System.Platform.target.startsWith "arm64" then
+    .arm64
+  else
+    .x86_64
+
+/-- CLI spelling of `host` (`"arm64"` / `"x86_64"`), for `--arch`/`--target` flag defaults. -/
+def hostName : String :=
+  match host with
+  | .arm64 => "arm64"
+  | _ => "x86_64"
+
 end TargetArch
 
 /-- Certified reference-counting emission discipline (`RcMode`):

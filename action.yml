@@ -141,15 +141,27 @@ runs:
           } | LC_ALL=C sort -zu | { IFS= read -r -d '' first && { printf '%s\0' "$first"; cat; } | xargs -0 $SHA256_CMD || true; } | $SHA256_CMD | awk '{print $1}'
         )
         ACTION_HEAD_SHA=$(git -C "$GITHUB_ACTION_PATH" rev-parse HEAD 2>/dev/null || true)
+        # A prebuilt binary is only copied when its architecture matches this
+        # runner (an x86_64 prebuilt on an arm64 runner would fail at runtime).
+        bin_arch_matches() {
+          command -v file >/dev/null 2>&1 || return 0
+          local info
+          info=$(file -b "$1" 2>/dev/null || true)
+          case "$(uname -m)" in
+            x86_64|amd64) printf '%s' "$info" | grep -Eq 'x86-64|x86_64' ;;
+            aarch64|arm64) printf '%s' "$info" | grep -Eiq 'aarch64|arm64' ;;
+            *) return 0 ;;
+          esac
+        }
         PREBUILT_BIN=$(command -v turbo-lean 2>/dev/null || true)
         PREBUILT_COMMIT=""
         if [ -n "$PREBUILT_BIN" ] && [ -x "$PREBUILT_BIN" ]; then
           PREBUILT_COMMIT=$(cat "$(dirname "$PREBUILT_BIN")/../.commit" 2>/dev/null || true)
         fi
-        if [ -n "$ACTION_HEAD_SHA" ] && [ "$PREBUILT_COMMIT" = "$ACTION_HEAD_SHA" ] && [ -z "$(git -C "$GITHUB_ACTION_PATH" status --porcelain 2>/dev/null || true)" ]; then
+        if [ -n "$ACTION_HEAD_SHA" ] && [ "$PREBUILT_COMMIT" = "$ACTION_HEAD_SHA" ] && [ -z "$(git -C "$GITHUB_ACTION_PATH" status --porcelain 2>/dev/null || true)" ] && bin_arch_matches "$PREBUILT_BIN"; then
           cp "$PREBUILT_BIN" "$BIN_DIR/turbo-lean"
           echo "$ACTION_SRC_HASH" > "$BIN_DIR/.src_hash"
-        elif [ -x "$GITHUB_ACTION_PATH/target/release/turbo-lean" ]; then
+        elif [ -x "$GITHUB_ACTION_PATH/target/release/turbo-lean" ] && bin_arch_matches "$GITHUB_ACTION_PATH/target/release/turbo-lean"; then
           cp "$GITHUB_ACTION_PATH/target/release/turbo-lean" "$BIN_DIR/turbo-lean"
           echo "$ACTION_SRC_HASH" > "$BIN_DIR/.src_hash"
         elif [ ! -x "$BIN_DIR/turbo-lean" ] || [ "$(cat "$BIN_DIR/.src_hash" 2>/dev/null || true)" != "$ACTION_SRC_HASH" ]; then

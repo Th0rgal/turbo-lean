@@ -398,8 +398,43 @@ fn main() {
     let gc_obj_path = out_dir.join("TurboLean_Kernel_gc.o");
     let lib_path = out_dir.join("libturbo_spec_cabi.a");
 
+    // Honor cc-rs-style env overrides (CC_<target>, TARGET_CC, CC) so cross
+    // builds (e.g. --target aarch64-unknown-linux-gnu) can name a cross
+    // compiler for the C-ABI objects; fall back to host cc/clang/gcc lookup.
+    let cargo_target = env::var("TARGET").unwrap_or_default();
+    let target_underscored = cargo_target.replace('-', "_");
+    for key in [
+        format!("CC_{cargo_target}"),
+        format!("CC_{target_underscored}"),
+        format!("AR_{cargo_target}"),
+        format!("AR_{target_underscored}"),
+    ] {
+        println!("cargo:rerun-if-env-changed={key}");
+    }
+    for key in ["TARGET_CC", "CC", "TARGET_AR", "AR"] {
+        println!("cargo:rerun-if-env-changed={key}");
+    }
+    let mut cc_candidates: Vec<String> = Vec::new();
+    for key in [
+        format!("CC_{cargo_target}"),
+        format!("CC_{target_underscored}"),
+        "TARGET_CC".to_string(),
+        "CC".to_string(),
+    ] {
+        if let Ok(v) = env::var(&key) {
+            let v = v.trim().to_string();
+            if !v.is_empty() && !cc_candidates.contains(&v) {
+                cc_candidates.push(v);
+            }
+        }
+    }
+    for fallback in ["cc", "clang", "gcc"] {
+        if !cc_candidates.iter().any(|c| c == fallback) {
+            cc_candidates.push(fallback.to_string());
+        }
+    }
     let mut compiled = false;
-    for compiler in ["cc", "clang", "gcc"] {
+    for compiler in &cc_candidates {
         let st1 = Command::new(compiler)
             .args([
                 "-O3",
@@ -544,7 +579,22 @@ fn main() {
     }
 
     let _ = fs::remove_file(&lib_path);
-    let ar_status = Command::new("ar")
+    // Same cc-rs-style env lookup for the archiver (AR_<target>, TARGET_AR, AR).
+    let ar_tool = [
+        format!("AR_{cargo_target}"),
+        format!("AR_{target_underscored}"),
+        "TARGET_AR".to_string(),
+        "AR".to_string(),
+    ]
+    .iter()
+    .find_map(|k| {
+        env::var(k)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
+    .unwrap_or_else(|| "ar".to_string());
+    let ar_status = Command::new(&ar_tool)
         .args(["crs"])
         .arg(&lib_path)
         .arg(&gc_obj_path)
