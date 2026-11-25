@@ -183,22 +183,28 @@ impl WorkerBudget {
         }
     }
 
-    /// Effective worker parallelism for `work_items` units of work: the explicit job count,
-    /// else `fallback()`; clamped under an explicit memory budget to the governor's
-    /// recommendation at `est_worker_rss_mb` per worker, and always at least one worker.
+    /// Effective worker parallelism for `work_items` units of work. An explicit job count
+    /// is honored up to the memory budget's share (`budget / est_worker_rss_mb`, never
+    /// silently clamped by core count: the operator already chose the width); otherwise
+    /// `fallback()`, clamped under an explicit budget by the governor's core-aware
+    /// recommendation. Always at least one worker, never wider than the work list.
     pub fn effective_parallelism(
         &self,
         work_items: usize,
         est_worker_rss_mb: u64,
         fallback: impl FnOnce() -> usize,
     ) -> usize {
-        let base = self.jobs.unwrap_or_else(fallback).max(1);
-        let clamped = match self.max_memory_mb {
-            Some(mb) => base.min(
+        let clamped = match (self.jobs, self.max_memory_mb) {
+            (Some(jobs), Some(mb)) => {
+                let budget_cap = (mb / est_worker_rss_mb.max(256)).max(1) as usize;
+                jobs.max(1).min(budget_cap)
+            }
+            (Some(jobs), None) => jobs.max(1),
+            (None, Some(mb)) => fallback().max(1).min(
                 crate::shm_cache::MemoryBudgetGovernor::new(mb)
                     .recommended_parallel_workers(est_worker_rss_mb),
             ),
-            None => base,
+            (None, None) => fallback().max(1),
         };
         clamped.clamp(1, work_items.max(1))
     }
@@ -222,23 +228,41 @@ impl WorkerBudget {
         }
     }
 
-    /// Apply the per-worker cap as a real `RLIMIT_AS`/`RLIMIT_DATA` on the spawned worker
-    /// (#435): rlimits survive `exec`, so the cap also reaches a bwrap-wrapped worker.
-    /// Fail-open inside the child: a worker that cannot lower its limits still runs, and
-    /// the machine-wide LRU governor remains the backstop.
+    /// Apply the per-worker cap as a real `RLIMIT_DATA` on the spawned worker (#435):
+    /// rlimits survive `exec`, so the cap also reaches a bwrap-wrapped worker, and it is
+    /// the same limit kind the untrusted sandbox already applies. `RLIMIT_AS` is
+    /// deliberately NOT capped by default: a replay worker's address space includes the
+    /// mmapped `.olean` closure and the 256 MiB `LEAN_STACK_SIZE_KB` stack, so an AS cap
+    /// sized from an RSS budget fails replays whose mappings exceed it even though
+    /// resident memory fits. `TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER=<n>` opts into
+    /// `RLIMIT_AS = n ×` the cap. Fail-open inside the child: a worker that cannot lower
+    /// its limits still runs, and the machine-wide LRU governor remains the backstop.
     pub fn apply_worker_rlimit(cmd: &mut Command, rlimit_mb: u64) {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            let bytes = rlimit_mb.saturating_mul(1024 * 1024);
+            let data_bytes = rlimit_mb.saturating_mul(1024 * 1024);
+            // Read the opt-in in the parent: `pre_exec` runs post-fork, where only
+            // async-signal-safe calls are sound.
+            let as_bytes = std::env::var("TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|&n| n > 0)
+                .map(|n| data_bytes.saturating_mul(n));
             unsafe {
                 cmd.pre_exec(move || {
-                    let lim = libc::rlimit {
-                        rlim_cur: bytes as libc::rlim_t,
-                        rlim_max: bytes as libc::rlim_t,
+                    let data_lim = libc::rlimit {
+                        rlim_cur: data_bytes as libc::rlim_t,
+                        rlim_max: data_bytes as libc::rlim_t,
                     };
-                    let _ = libc::setrlimit(libc::RLIMIT_AS, &lim);
-                    let _ = libc::setrlimit(libc::RLIMIT_DATA, &lim);
+                    let _ = libc::setrlimit(libc::RLIMIT_DATA, &data_lim);
+                    if let Some(bytes) = as_bytes {
+                        let as_lim = libc::rlimit {
+                            rlim_cur: bytes as libc::rlim_t,
+                            rlim_max: bytes as libc::rlim_t,
+                        };
+                        let _ = libc::setrlimit(libc::RLIMIT_AS, &as_lim);
+                    }
                     Ok(())
                 });
             }
@@ -249,25 +273,51 @@ impl WorkerBudget {
         }
     }
 
-    /// A named explanation for a replay worker that died by signal under the per-worker
-    /// memory cap, instead of an opaque `exit=signal: 9` (#435). Empty when no cap was
-    /// applied or the worker exited normally.
+    /// A named explanation when a replay worker's failure may trace to the per-worker
+    /// memory cap (#435). An `RLIMIT_DATA` breach surfaces as a failed allocation
+    /// (ENOMEM / `std::bad_alloc` / "out of memory" on stderr with a plain non-zero
+    /// exit) — an rlimit never SIGKILLs — so a definite attribution needs the allocation
+    /// signature; a signal exit gets a "may have been", naming both possibilities.
+    /// Empty when no cap was applied or nothing points at memory.
     pub fn memory_kill_note(
         status: &std::process::ExitStatus,
+        stderr: &str,
         rlimit_mb: Option<u64>,
     ) -> String {
+        let Some(mb) = rlimit_mb else {
+            return String::new();
+        };
         #[cfg(unix)]
         {
             use std::os::unix::process::ExitStatusExt;
-            if let (Some(mb), Some(sig)) = (rlimit_mb, status.signal()) {
+            if let Some(sig) = status.signal() {
                 return format!(
-                    "\nworker died with signal {sig} under the per-worker memory cap of {mb} MiB \
-                     (from --max-memory-mb / TURBO_LEAN_MAX_MEMORY_MB); raise the budget or \
-                     lower --jobs / TURBO_LEAN_JOBS to give each worker a larger share"
+                    "\nworker died with signal {sig}; it may have been out of memory under \
+                     the per-worker cap of {mb} MiB (RLIMIT_DATA from --max-memory-mb / \
+                     TURBO_LEAN_MAX_MEMORY_MB), or it may have died for an unrelated \
+                     reason; raise the budget or lower --jobs / TURBO_LEAN_JOBS to give \
+                     each worker a larger share, then retry"
                 );
             }
         }
-        let _ = (status, rlimit_mb);
+        let lower = stderr.to_ascii_lowercase();
+        let alloc_failure = !status.success()
+            && [
+                "out of memory",
+                "bad_alloc",
+                "enomem",
+                "cannot allocate memory",
+                "memory allocation failed",
+            ]
+            .iter()
+            .any(|needle| lower.contains(needle));
+        if alloc_failure {
+            return format!(
+                "\nworker failed to allocate under the per-worker memory cap of {mb} MiB \
+                 (RLIMIT_DATA from --max-memory-mb / TURBO_LEAN_MAX_MEMORY_MB); raise the \
+                 budget or lower --jobs / TURBO_LEAN_JOBS to give each worker a larger share"
+            );
+        }
         String::new()
     }
 }

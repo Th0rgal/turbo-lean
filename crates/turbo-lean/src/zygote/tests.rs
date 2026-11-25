@@ -1921,13 +1921,38 @@ use super::*;
         // Never wider than the work list.
         assert_eq!(jobs_only.effective_parallelism(2, 2048, || 99), 2);
 
-        // A 4 GiB budget with ~2 GiB replay workers admits two workers, whatever nproc says
-        // (the #435 reproducer ran `nproc` replay workers under `--max-memory-mb 4000`).
+        // A 4 GiB budget with ~2 GiB replay workers admits two workers (one on a 1-CPU
+        // host: the governor's fallback recommendation is core-aware), whatever the
+        // fallback says (the #435 reproducer ran `nproc` workers under --max-memory-mb).
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
         let capped = WorkerBudget {
             jobs: None,
             max_memory_mb: Some(4096),
         };
-        assert_eq!(capped.effective_parallelism(64, 2048, || 99), 2);
+        assert_eq!(
+            capped.effective_parallelism(64, 2048, || 99),
+            2usize.min(cpus).max(1)
+        );
+        // An explicit --jobs is honored up to the budget's share, never silently clamped
+        // by core count.
+        let explicit = WorkerBudget {
+            jobs: Some(8),
+            max_memory_mb: Some(32_768),
+        };
+        assert_eq!(
+            explicit.effective_parallelism(64, 2048, || unreachable!()),
+            8
+        );
+        let explicit_over_budget = WorkerBudget {
+            jobs: Some(99),
+            max_memory_mb: Some(4096),
+        };
+        assert_eq!(
+            explicit_over_budget.effective_parallelism(64, 2048, || unreachable!()),
+            2
+        );
         assert_eq!(capped.per_worker_rlimit_mb(2), Some(2048));
         assert_eq!(capped.per_worker_rlimit_mb(64), Some(512)); // floored share
         assert_eq!(capped.replay_batch_cap(32, 2), 8); // 2 GiB per worker: shrink batches
@@ -1944,28 +1969,80 @@ use super::*;
     #[test]
     #[cfg(unix)]
     fn test_worker_budget_rlimit_reaches_the_worker_process() {
-        // #435 acceptance: the per-worker memory cap is a real rlimit on the spawned
-        // worker, not an advisory governor hint. `ulimit -v` reports RLIMIT_AS in KiB.
+        // #435 acceptance: the per-worker memory cap is a real RLIMIT_DATA on the spawned
+        // worker, not an advisory governor hint (`ulimit -d` reports it in KiB). The
+        // address space stays uncapped by default: the worker's mmapped `.olean` closure
+        // and its 256 MiB Lean stack live in AS but not in the RSS-sized budget.
         let mut cmd = Command::new("sh");
-        cmd.args(["-c", "ulimit -v"]);
+        cmd.args(["-c", "ulimit -d; ulimit -v"]);
         WorkerBudget::apply_worker_rlimit(&mut cmd, 512);
         let out = cmd.output().expect("spawn sh under the worker rlimit");
         assert!(out.status.success(), "{out:?}");
-        let reported = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let mut lines = text.lines().map(str::trim);
         assert_eq!(
-            reported,
-            (512u64 * 1024).to_string(),
-            "RLIMIT_AS must be the 512 MiB per-worker cap"
+            lines.next(),
+            Some((512u64 * 1024).to_string().as_str()),
+            "RLIMIT_DATA must be the 512 MiB per-worker cap: {text}"
+        );
+        let as_line = lines.next().unwrap_or_default();
+        assert!(
+            as_line == "unlimited"
+                || as_line
+                    .parse::<u64>()
+                    .map(|kb| kb > 512 * 1024)
+                    .unwrap_or(false),
+            "RLIMIT_AS must not be capped to the budget share by default: {as_line}"
         );
 
-        // A signal death under a cap is named, never an opaque `exit=signal: 9`.
+        // Opt-in: an explicit multiplier caps RLIMIT_AS at a generous multiple of the cap.
+        {
+            let _guard = crate::pack::tests::env_test_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var_os("TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER");
+            std::env::set_var("TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER", "4");
+            let mut cmd2 = Command::new("sh");
+            cmd2.args(["-c", "ulimit -v"]);
+            WorkerBudget::apply_worker_rlimit(&mut cmd2, 512);
+            let out2 = cmd2.output().expect("spawn sh under the AS opt-in");
+            match prev {
+                Some(v) => std::env::set_var("TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER", v),
+                None => std::env::remove_var("TURBO_LEAN_WORKER_RLIMIT_AS_MULTIPLIER"),
+            }
+            assert!(out2.status.success(), "{out2:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out2.stdout).trim(),
+                (4u64 * 512 * 1024).to_string(),
+                "opt-in RLIMIT_AS = multiplier x the per-worker cap"
+            );
+        }
+
+        // Attribution: an rlimit breach is a failed allocation, never a SIGKILL, so a
+        // signal death is only a "may have been"; the allocation signature is definite.
         use std::os::unix::process::ExitStatusExt;
         let killed = std::process::ExitStatus::from_raw(libc::SIGKILL);
-        let note = WorkerBudget::memory_kill_note(&killed, Some(512));
-        assert!(note.contains("per-worker memory cap of 512 MiB"), "{note}");
+        let note = WorkerBudget::memory_kill_note(&killed, "", Some(512));
+        assert!(note.contains("may have been out of memory"), "{note}");
+        assert!(note.contains("512 MiB"), "{note}");
         assert!(note.contains("--max-memory-mb"), "{note}");
+        let plain_fail = std::process::ExitStatus::from_raw(1 << 8);
+        let oom_note = WorkerBudget::memory_kill_note(
+            &plain_fail,
+            "terminate called after throwing an instance of 'std::bad_alloc'",
+            Some(512),
+        );
         assert!(
-            WorkerBudget::memory_kill_note(&killed, None).is_empty(),
+            oom_note.contains("failed to allocate under the per-worker memory cap of 512 MiB"),
+            "{oom_note}"
+        );
+        assert!(
+            WorkerBudget::memory_kill_note(&plain_fail, "unknown module prefix", Some(512))
+                .is_empty(),
+            "no allocation signature, no definite attribution"
+        );
+        assert!(
+            WorkerBudget::memory_kill_note(&killed, "", None).is_empty(),
             "no cap, no attribution"
         );
     }

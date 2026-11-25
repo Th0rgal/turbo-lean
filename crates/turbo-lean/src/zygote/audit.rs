@@ -1166,7 +1166,11 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
                 slice[0],
                 out.status,
                 String::from_utf8_lossy(&out.stderr).trim(),
-                WorkerBudget::memory_kill_note(&out.status, per_worker_rlimit_mb)
+                WorkerBudget::memory_kill_note(
+                    &out.status,
+                    &String::from_utf8_lossy(&out.stderr),
+                    per_worker_rlimit_mb
+                )
             );
         }
         for m in slice {
@@ -1194,7 +1198,11 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
                 m,
                 single_out.status,
                 String::from_utf8_lossy(&single_out.stderr).trim(),
-                WorkerBudget::memory_kill_note(&single_out.status, per_worker_rlimit_mb)
+                WorkerBudget::memory_kill_note(
+                    &single_out.status,
+                    &String::from_utf8_lossy(&single_out.stderr),
+                    per_worker_rlimit_mb
+                )
             );
         }
         Ok(())
