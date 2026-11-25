@@ -398,18 +398,18 @@ pub(super) fn confirm_decl_identity_with_extra_dirs(
 ) -> Result<ConfirmedDeclIdentity> {
     let probe_started = request_started.unwrap_or_else(Instant::now);
     let expected = shard.decl_name();
-    let prefix = splitter::declaration_identity_prefix(src, shard);
-    let header_info = crate::module_builder::parse_header_info(&prefix);
-    let (header, prefix) = prefix.split_at(header_info.body_byte_offset);
-    let (signature, _) = splitter::extract_shard_stmt_and_proof(src, shard);
+    // The probe input is canonical (prefix proofs stubbed with no line padding), so the
+    // content-pinned probe cache in `compile_and_read_probe_identities` keeps hitting
+    // across proof edits and line shifts above the probed declaration (#409 / P4).
+    let splitter::DeclIdentityProbe {
+        before,
+        probe_start_line,
+        signature,
+    } = splitter::build_decl_identity_probe(src, shard);
     anyhow::ensure!(
         !signature.is_empty(),
         "Declaration identity unavailable for `{expected}`: missing signature"
     );
-    let before = format!(
-        "{header}\nset_option warningAsError false\nset_option warn.sorry false\n{prefix}\nset_option warningAsError false\nset_option warn.sorry false\n"
-    );
-    let probe_start_line = before.matches('\n').count() + 1;
     let stub_end_line = probe_start_line + signature.matches('\n').count();
     let stub_probe = format!("{before}{signature}\n:= by sorry\n");
     let (lean_args, env) =

@@ -5780,6 +5780,90 @@ pub(crate) fn build_file_identity_probe(src: &str) -> (String, usize) {
     )
 }
 
+/// Everything the single-declaration identity probe compiles: the imports header plus
+/// warning-suppression options plus the stubbed prefix (`before`), and the probed
+/// declaration's statement signature. `(before, signature)` is the probe's identity
+/// input: two source versions whose inputs are byte-identical elaborate the same kernel
+/// statement identity for the declaration, so a confirmed identity is reusable without
+/// recompiling (check/identity.rs keys its probe cache on these bytes plus content-pinned
+/// imports and the toolchain).
+pub(crate) struct DeclIdentityProbe {
+    /// Header + options + stubbed prefix, ready to prepend to the probed declaration.
+    pub(crate) before: String,
+    /// 1-indexed line inside the probe source where the probed declaration starts.
+    pub(crate) probe_start_line: usize,
+    /// The probed declaration's statement signature (empty when unavailable).
+    pub(crate) signature: String,
+}
+
+/// Build the single-declaration identity probe input in O(one source parse).
+///
+/// Decision semantics (equality of `(before, signature)` across two source versions of
+/// one declaration):
+/// - identical declaration and prefix: unchanged (a confirmed identity is reused);
+/// - edited statement (the declaration's own signature): changed;
+/// - edited proof body — the declaration's own or any earlier declaration's, whatever its
+///   line count: unchanged (prefix proofs are stubbed to `:= sorry` with no line padding,
+///   and the probed proof is replaced by the caller);
+/// - a declaration moved across other commands, or an edit to a non-declaration prefix
+///   command (including its comments): changed — the conservative choice; the caller
+///   falls back to the compiled probe.
+pub(crate) fn build_decl_identity_probe(src: &str, shard: &TheoremShard) -> DeclIdentityProbe {
+    let prefix = declaration_identity_prefix(src, shard);
+    let header_info = crate::module_builder::parse_header_info(&prefix);
+    let (header, prefix) = prefix.split_at(header_info.body_byte_offset);
+    let (signature, _) = extract_shard_stmt_and_proof(src, shard);
+    let before = format!(
+        "{header}\nset_option warningAsError false\nset_option warn.sorry false\n{prefix}\nset_option warningAsError false\nset_option warn.sorry false\n"
+    );
+    let probe_start_line = before.matches('\n').count() + 1;
+    DeclIdentityProbe {
+        before,
+        probe_start_line,
+        signature,
+    }
+}
+
+/// Verdict of the O(declaration) identity probe comparing one declaration across two
+/// source versions. `Unchanged` means a previously confirmed identity may be reused;
+/// `Changed` and `Inconclusive` both send the caller to the compiled probe.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeclIdentityProbeVerdict {
+    Unchanged,
+    Changed,
+    Inconclusive,
+}
+
+/// Compare `decl`'s identity-probe input across two source versions (the decision table
+/// is documented on [`build_decl_identity_probe`]).
+#[cfg(test)]
+pub(crate) fn probe_decl_identity_change(
+    old_src: &str,
+    new_src: &str,
+    decl: &str,
+) -> DeclIdentityProbeVerdict {
+    let input = |src: &str| -> Option<(String, String, String)> {
+        let split = split_lean_source(src, &[]);
+        let idx = find_decl_shard_index(&split.shards, decl).ok().flatten()?;
+        let shard = &split.shards[idx];
+        let probe = build_decl_identity_probe(src, shard);
+        if probe.signature.is_empty() {
+            return None;
+        }
+        Some((
+            probe.before,
+            probe.signature,
+            canonicalize_lean_name(shard.decl_name()),
+        ))
+    };
+    match (input(old_src), input(new_src)) {
+        (Some(a), Some(b)) if a == b => DeclIdentityProbeVerdict::Unchanged,
+        (Some(_), Some(_)) => DeclIdentityProbeVerdict::Changed,
+        _ => DeclIdentityProbeVerdict::Inconclusive,
+    }
+}
+
 pub(crate) fn sanitize_ident_for_fast_check(name: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let canon = canonicalize_lean_name(name);
@@ -14773,6 +14857,99 @@ public def api := by
             assert!(text.contains(":= by grind\n    p xs["));
             assert!(!text.contains("rw [← getElem_filter"));
         }
+    }
+
+    #[test]
+    fn decl_identity_probe_unchanged_on_identical_decl() {
+        let src = "import Foo\ntheorem a : 1 = 1 := by rfl\ntheorem b : 2 = 2 := by\n  rfl\n";
+        assert_eq!(
+            probe_decl_identity_change(src, src, "b"),
+            DeclIdentityProbeVerdict::Unchanged
+        );
+    }
+
+    #[test]
+    fn decl_identity_probe_changed_on_edited_statement_body() {
+        let old = "theorem a : 1 = 1 := by rfl\ntheorem b (n : Nat) : n = n := by rfl\n";
+        let new = old.replace("n = n", "n + 0 = n");
+        assert_eq!(
+            probe_decl_identity_change(old, &new, "b"),
+            DeclIdentityProbeVerdict::Changed
+        );
+    }
+
+    #[test]
+    fn decl_identity_probe_unchanged_on_neighbor_proof_edit() {
+        // The dominant edit loop of #409: reworking an earlier proof, even changing its
+        // line count, must not change a later declaration's identity-probe input.
+        let old = "import Foo\nnamespace N\ntheorem a : 1 = 1 := by rfl\ntheorem b : 2 = 2 := by rfl\nend N\n";
+        let new = "import Foo\nnamespace N\ntheorem a : 1 = 1 := by\n  have h : 1 = 1 := by rfl\n  exact h\ntheorem b : 2 = 2 := by rfl\nend N\n";
+        assert_eq!(
+            probe_decl_identity_change(old, new, "N.b"),
+            DeclIdentityProbeVerdict::Unchanged
+        );
+        // Editing the target's own proof is likewise identity-neutral: the compiled
+        // probe replaces it with `:= by sorry`.
+        let own = old.replace("2 = 2 := by rfl", "2 = 2 := by\n  rfl");
+        assert_eq!(
+            probe_decl_identity_change(old, &own, "N.b"),
+            DeclIdentityProbeVerdict::Unchanged
+        );
+    }
+
+    #[test]
+    fn decl_identity_probe_changed_on_neighbor_signature_edit() {
+        let old = "theorem a : 1 = 1 := by rfl\ntheorem b : 2 = 2 := by rfl\n";
+        let new = old.replace("a : 1 = 1", "a : 0 + 1 = 1");
+        assert_eq!(
+            probe_decl_identity_change(old, &new, "b"),
+            DeclIdentityProbeVerdict::Changed
+        );
+    }
+
+    #[test]
+    fn decl_identity_probe_moved_decl_recompiles_conservatively() {
+        // Documented choice for the "moved declaration" row: moving a declaration across
+        // another command changes its stubbed prefix, so the probe reports Changed and
+        // the caller recompiles. Pure line movement caused by proof growth above it is
+        // Unchanged (decl_identity_probe_unchanged_on_neighbor_proof_edit).
+        let old = "theorem a : 1 = 1 := by rfl\ntheorem c : 3 = 3 := by rfl\ntheorem b : 2 = 2 := by rfl\n";
+        let new = "theorem c : 3 = 3 := by rfl\ntheorem a : 1 = 1 := by rfl\ntheorem b : 2 = 2 := by rfl\n";
+        assert_eq!(
+            probe_decl_identity_change(old, new, "b"),
+            DeclIdentityProbeVerdict::Changed
+        );
+    }
+
+    #[test]
+    fn decl_identity_probe_inconclusive_on_unresolved_decl() {
+        let src = "theorem a : 1 = 1 := by rfl\n";
+        assert_eq!(
+            probe_decl_identity_change(src, src, "missing"),
+            DeclIdentityProbeVerdict::Inconclusive
+        );
+    }
+
+    #[test]
+    fn decl_identity_probe_large_file_under_200ms() {
+        // P4 acceptance: the per-declaration identity probe itself stays under 200 ms on
+        // a synthetic large file (2,000 declarations, worst-case last shard).
+        let mut src = String::from("import Foo\nnamespace ProbeScale\n");
+        for i in 0..2000usize {
+            src.push_str(&format!(
+                "theorem probe_thm_{i} : {i} = {i} := by\n  have h : {i} = {i} := rfl\n  exact h\n"
+            ));
+        }
+        src.push_str("end ProbeScale\n");
+        let split = split_lean_source(&src, &[]);
+        assert_eq!(split.shards.len(), 2000);
+        let shard = &split.shards[1999];
+        let t0 = std::time::Instant::now();
+        let probe = build_decl_identity_probe(&src, shard);
+        let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        assert!(!probe.signature.is_empty() && probe.before.contains("probe_thm_1998"));
+        let limit_ms = if cfg!(debug_assertions) { 2000.0 } else { 200.0 };
+        assert!(elapsed_ms < limit_ms, "identity probe took {elapsed_ms:.2} ms");
     }
 
     #[test]
