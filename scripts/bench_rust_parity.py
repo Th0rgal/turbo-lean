@@ -21,12 +21,13 @@ CORE = ROOT / 'lean/.lake/build/bin/lean-native-core'
 TURBO = ROOT / 'target/release/turbo-lean'
 ENV = {**os.environ, 'TURBO_LEAN_TELEMETRY': 'off', 'LEAN_NATIVE_CORE_BIN': str(CORE)}
 
-# Calibrate the cost profile for the CPU the benches actually ran on
-# (profiles/arm64_*.json ship for the arm64 leg); `calibrate-cost --target`
-# takes the Lean TargetArch spelling, so aarch64 hosts pass `arm64`.
+# `calibrate-cost --target` takes the Lean TargetArch spelling. Note build()'s
+# x86-only pre-gate below: until the parity harness is ported off x86_64,
+# main() never reaches the calibrate call on an arm64 host.
 HOST_TARGET = host_arch.host_target_arch()
-# clang on aarch64 takes `-mcpu=native` (`-march=native` is rejected on Apple
-# arm64 and on pre-15 aarch64 clang generally); x86 keeps `-march=native`.
+# Dead on arm64 today for the same reason (build() raises first); kept so the
+# tune flag is already right when that gate lifts: aarch64 clang takes
+# `-mcpu=native` (Apple arm64 clang rejects `-march=native`).
 NATIVE_TUNE_FLAG = '-mcpu=native' if HOST_TARGET == 'arm64' else '-march=native'
 
 RUST = r'''

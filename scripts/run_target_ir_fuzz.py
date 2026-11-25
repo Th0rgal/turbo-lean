@@ -58,6 +58,7 @@ ROOT_DIR = SCRIPT_DIR.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
+import host_arch
 import run_gpu_tpu_diff as gpu_diff
 import run_llvm_lli_diff as llvm_diff
 
@@ -203,16 +204,12 @@ def find_asan_capable_opt() -> tuple[str | None, list[str]]:
 
 
 def fuzz_strict_tools_default() -> bool:
-    """Strict tool handling: forced by TARGET_IR_FUZZ_STRICT_TOOLS=true/false, and
-    on by default under CI / GITHUB_ACTIONS (the sibling of
-    run_heapobj_abi_sanitizers' require_tsan default), so a toolchain or PATH
-    regression in the roadmap job fails instead of skipping."""
-    env = os.environ.get("TARGET_IR_FUZZ_STRICT_TOOLS", "").lower()
-    if env in ("true", "1"):
-        return True
-    if env in ("false", "0"):
-        return False
-    return os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("CI") == "true"
+    """Missing-tool states FAIL instead of skipping when
+    TARGET_IR_FUZZ_STRICT_TOOLS is true (contract.d/90 passes it through, and the
+    roadmap contract step sets it explicitly in its workflow env). There is no
+    implicit CI default: the impact-gate jobs run the self-tests on runners with
+    no LLVM install."""
+    return host_arch.strict_tools_default("TARGET_IR_FUZZ_STRICT_TOOLS")
 
 
 def _s8(u: int) -> int:
@@ -1257,12 +1254,20 @@ def execute_suite_payload(
 
     llvm_cases = suite.get("llvmCases", []) if "llvm" in want else []
     if llvm_cases:
-        if not lli_bin or not opt_bin or not clang_bin:
-            raise RuntimeError(f"Missing LLVM tools: lli={lli_bin}, opt={opt_bin}, clang={clang_bin}")
+        if not clang_bin:
+            raise RuntimeError(f"Missing clang for LLVM cases (lli={lli_bin}, opt={opt_bin})")
         san_linker = find_sanitizer_c_linker(clang_bin)
         if not san_linker:
             raise RuntimeError(f"Missing ASan/UBSan C linker for clang={clang_bin}")
-        trap_opt_bin: str | None = opt_bin if probe_opt_asan(opt_bin) is None else None
+        # The lli-interpreted valid cases need the qualified pair; the native
+        # ASan/UBSan trap cases need only clang plus an asan-capable opt.
+        interp_ok = bool(lli_bin and opt_bin)
+        if not interp_ok and any(c["kind"] == "valid" for c in llvm_cases):
+            print(
+                "[target-ir-fuzz] SKIPPED llvm lli-interpreted valid cases (missing engine): "
+                f"no qualified lli/opt pair (lli={lli_bin}, opt={opt_bin})"
+            )
+        trap_opt_bin: str | None = opt_bin if (opt_bin and probe_opt_asan(opt_bin) is None) else None
         if trap_opt_bin is None:
             trap_opt_bin, probe_reasons = find_asan_capable_opt()
             if trap_opt_bin is None and any(c["kind"] != "valid" for c in llvm_cases):
@@ -1281,6 +1286,11 @@ def execute_suite_payload(
                 print(f"[target-ir-fuzz] SKIPPED llvm trap cases (missing engine): {msg}")
         for c in llvm_cases:
             if c["kind"] == "valid":
+                if not interp_ok:
+                    counts["llvm_valid_skipped_missing_engine"] = (
+                        counts.get("llvm_valid_skipped_missing_engine", 0) + 1
+                    )
+                    continue
                 run_llvm_valid_case(lli_bin, opt_bin, c)
                 counts["llvm_valid"] += 1
             elif trap_opt_bin is None:
@@ -1601,21 +1611,28 @@ def main(argv: list[str] | None = None) -> int:
         payload = json.loads(gen.stdout)
 
     strict_tools = fuzz_strict_tools_default()
-    # The same qualified lli/opt pair (same LLVM install) Stage 2A uses; the
-    # LLVM 15 interpreter it rejects must not run the fuzz valid cases either.
-    engine, engine_rejected = llvm_diff.find_qualified_llvm_engine()
-    lli_bin = engine["lli_bin"] if engine else None
-    opt_bin = engine["opt_bin"] if engine else None
-    if "llvm" in backends and engine is None:
-        reasons = "; ".join(str(q.get("reason")) for q in engine_rejected) or "no lli candidates found"
-        msg = (
-            "no lli/opt pair (same LLVM install) passed qualification for the emitted "
-            f"host-arch IR: {reasons}"
-        )
-        if strict_tools:
-            raise RuntimeError(f"[target-ir-fuzz] missing engine under strict mode: {msg}")
-        print(f"[target-ir-fuzz] SKIPPED llvm cases (missing engine): {msg}")
-        backends = [b for b in backends if b != "llvm"]
+    lli_bin: str | None = None
+    opt_bin: str | None = None
+    if "llvm" in backends:
+        # The same qualified lli/opt pair (same LLVM install) Stage 2A uses; the
+        # LLVM 15 interpreter it rejects must not run the fuzz valid cases either.
+        # Probed only when the llvm backend is requested (each candidate costs ~7
+        # subprocesses, and on an unsupported host the probe is a named reason).
+        engine, engine_rejected = llvm_diff.find_qualified_llvm_engine()
+        if engine is not None:
+            lli_bin = engine["lli_bin"]
+            opt_bin = engine["opt_bin"]
+        else:
+            reasons = "; ".join(str(q.get("reason")) for q in engine_rejected) or "no lli candidates found"
+            msg = (
+                "no lli/opt pair (same LLVM install) passed qualification for the emitted "
+                f"host-arch IR: {reasons}"
+            )
+            if strict_tools:
+                raise RuntimeError(f"[target-ir-fuzz] missing engine under strict mode: {msg}")
+            # "llvm" stays requested: the clang-only ASan/UBSan trap legs can still
+            # run; only the lli-interpreted valid cases are skipped (counted below).
+            print(f"[target-ir-fuzz] SKIPPED llvm lli-interpreted valid cases (missing engine): {msg}")
     clang_bin = find_clang_c()
     clangxx_bin = gpu_diff.find_clangxx()
     ptxas_bin = gpu_diff.find_ptxas(args.tools_cache_dir)
@@ -1631,6 +1648,16 @@ def main(argv: list[str] | None = None) -> int:
         tools_cache_dir=args.tools_cache_dir,
         strict_tools=strict_tools,
     )
+    executed = sum(v for k, v in counts.items() if not k.endswith("_skipped_missing_engine"))
+    skipped = {k: v for k, v in counts.items() if k.endswith("_skipped_missing_engine") and v}
+    if executed == 0:
+        # A requested backend set whose every case was skipped is not a pass.
+        print(
+            f"[target-ir-fuzz] FAILED: requested backends {backends} produced zero executed "
+            f"cases (skipped: {skipped or 'none'})",
+            file=sys.stderr,
+        )
+        return 1
     print(
         "[target-ir-fuzz] PASSED "
         f"(seeds={payload.get('seeds')}, "

@@ -148,8 +148,14 @@ def run_lli_u64(lli_bin: str, opt_bin: str, ir_path: Path, verify_ir: bool = Tru
     return word
 
 
+UB_PROBE_DEFINED_RESULT = 90
+
+
 def build_ub_probe_ir() -> str:
-    """Host-arch udiv-by-zero probe module (triple/datalayout from `HOST_CPU_TARGETS`)."""
+    """Host-arch udiv-by-zero probe module (triple/datalayout from `HOST_CPU_TARGETS`).
+    `@main` returns `%q + UB_PROBE_DEFINED_RESULT`: x86_64 traps at the udiv before
+    the add, and AArch64's defined zero quotient makes the exit status exactly the
+    sentinel, so a garbage-exit interpreter returning 0 for UB does not qualify."""
     _, triple, datalayout = host_llvm_cpu_target()
     return f"""target datalayout = "{datalayout}"
 target triple = "{triple}"
@@ -157,7 +163,8 @@ define i32 @main(i32 %argc, ptr %argv) {{
 entry:
   %z = sub i32 %argc, %argc
   %q = udiv i32 42, %z
-  ret i32 %q
+  %r = add i32 %q, {UB_PROBE_DEFINED_RESULT}
+  ret i32 %r
 }}
 """
 
@@ -171,8 +178,10 @@ def classify_ub_probe(outcomes: list[tuple[int, str]], machine: str | None = Non
     garbage value (measured on LLVM 15 `lli`: rc 80/96/64/48/128/0 for one input),
     so even `rc >= 128` is a coin flip, not a trap. AArch64 DEFINES integer
     division by zero as 0, so a release-build `lli` there deterministically exits
-    0 without trapping; that outcome conforms on aarch64 hosts, as does a
-    deterministic trap from an assertions-enabled build."""
+    with the probe's sentinel (`0 + UB_PROBE_DEFINED_RESULT`) without trapping;
+    that exact outcome conforms on aarch64 hosts, as does a deterministic trap
+    from an assertions-enabled build. A steady 0 does NOT conform anywhere: 0 sat
+    in the measured garbage set."""
     if machine is None:
         machine = platform.machine().lower()
     rcs = [rc for rc, _ in outcomes]
@@ -180,8 +189,13 @@ def classify_ub_probe(outcomes: list[tuple[int, str]], machine: str | None = Non
     trapped = bool(trapped_each) and all(trapped_each)
     deterministic = len(set(rcs)) == 1 and len(set(trapped_each)) == 1
     if machine in ("aarch64", "arm64"):
-        expectation = "a deterministic trap, or the AArch64-defined zero result, on every run"
-        conforming = deterministic and (trapped or all(rc == 0 for rc in rcs))
+        expectation = (
+            "a deterministic trap, or the defined result (udiv-by-zero quotient 0 + "
+            f"{UB_PROBE_DEFINED_RESULT} = exit {UB_PROBE_DEFINED_RESULT}), on every run"
+        )
+        conforming = deterministic and (
+            trapped or all(rc == UB_PROBE_DEFINED_RESULT for rc in rcs)
+        )
     else:
         expectation = "a deterministic trap (signal or ERROR diagnostics) on every run"
         conforming = deterministic and trapped
@@ -197,9 +211,9 @@ def classify_ub_probe(outcomes: list[tuple[int, str]], machine: str | None = Non
 
 
 def run_ub_probe_lli(lli_bin: str, runs: int = 2) -> dict[str, Any]:
-    """Negative UB probe: division by zero under `lli --force-interpreter` must trap/abort
-    deterministically (signal or explicit `ERROR` diagnostics on every run) rather than
-    exiting with an arbitrary 0..255 status."""
+    """Negative UB probe: division by zero under `lli --force-interpreter` must meet the
+    host expectation deterministically (a trap on x86_64; a trap or the defined sentinel
+    exit on AArch64). An arbitrary 0..255 status proves nothing."""
     with tempfile.TemporaryDirectory(prefix="tl-lli-ub-") as tmp:
         p = Path(tmp) / "ub_div_zero.ll"
         p.write_text(build_ub_probe_ir(), encoding="utf-8")
@@ -248,9 +262,10 @@ def qualify_lli_engine(lli_bin: str, opt_bin: str) -> dict[str, Any]:
     toolchain does not bundle `lli`/`opt`, so the system ones can be too old):
       1. `opt -passes=verify` accepts a host-arch opaque-pointer module;
       2. `lli --force-interpreter` runs it with the exact expected exit code, twice;
-      3. the udiv-by-zero UB probe traps deterministically (an interpreter that
-         reports a garbage exit value for UB disqualifies itself rather than
-         yielding a coin-flip verdict)."""
+      3. the udiv-by-zero UB probe meets the host expectation deterministically
+         (a trap on x86_64; a trap or the defined sentinel exit on AArch64); an
+         interpreter that reports a garbage exit value for UB disqualifies itself
+         rather than yielding a coin-flip verdict."""
     result: dict[str, Any] = {
         "lli_bin": lli_bin,
         "opt_bin": opt_bin,
@@ -290,6 +305,12 @@ def qualify_lli_engine(lli_bin: str, opt_bin: str) -> dict[str, Any]:
         probe = run_ub_probe_lli(lli_bin)
     except (OSError, subprocess.SubprocessError) as exc:
         result["reason"] = f"engine probe failed to execute: {exc}"
+        return result
+    except RuntimeError as exc:
+        # host_arch.host_target_arch() raises on unsupported machines; surface it
+        # as this candidate's named reason (run_gpu_tpu_diff's shape), never a
+        # traceback out of a caller that only wanted ptx/metal legs.
+        result["reason"] = f"host qualification unavailable: {exc}"
         return result
     result["ub_div_zero_probe"] = probe
     if not probe["conforming"]:
@@ -356,17 +377,12 @@ def find_qualified_llvm_engine(
 
 
 def llvm_strict_tools_default() -> bool:
-    """Missing-engine states FAIL instead of skipping under strict mode: forced
-    by TURBO_LLI_DIFF_STRICT_TOOLS=true/false, and on by default under CI /
-    GITHUB_ACTIONS (the sibling of run_heapobj_abi_sanitizers' require_tsan
-    default): the roadmap job installs llvm-18 on purpose, so a toolchain or
-    PATH regression there must not pass silently."""
-    env = os.environ.get("TURBO_LLI_DIFF_STRICT_TOOLS", "").lower()
-    if env in ("true", "1"):
-        return True
-    if env in ("false", "0"):
-        return False
-    return os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("CI") == "true"
+    """Missing-engine states FAIL instead of skipping when
+    TURBO_LLI_DIFF_STRICT_TOOLS is true. The roadmap contract step (which
+    provisions llvm-18) sets it explicitly in its workflow env; there is no
+    implicit CI default, because the impact-gate jobs run the self-tests on
+    runners with no LLVM install."""
+    return host_arch.strict_tools_default("TURBO_LLI_DIFF_STRICT_TOOLS")
 
 
 def run_suite(core_bin: Path, lli_bin: str, opt_bin: str) -> dict[str, Any]:
@@ -502,18 +518,36 @@ class SelfTests(unittest.TestCase):
         self.assertFalse(one_bad_run["conforming"])
 
     def test_ub_probe_conformance_is_arch_aware_on_aarch64(self) -> None:
-        # AArch64 defines integer division by zero as 0 (no trap), so a release
-        # lli interpreter deterministically exits 0 there; that engine is usable.
-        defined_zero = classify_ub_probe([(0, ""), (0, "")], machine="aarch64")
-        self.assertFalse(defined_zero["trapped"])
-        self.assertTrue(defined_zero["conforming"])
+        # AArch64 defines integer division by zero as 0 (no trap), and the probe
+        # adds UB_PROBE_DEFINED_RESULT to the quotient before returning, so a
+        # release lli interpreter deterministically exits with exactly that
+        # sentinel there; that engine is usable.
+        defined = classify_ub_probe(
+            [(UB_PROBE_DEFINED_RESULT, ""), (UB_PROBE_DEFINED_RESULT, "")], machine="aarch64"
+        )
+        self.assertFalse(defined["trapped"])
+        self.assertTrue(defined["conforming"])
         # An assertions-enabled aarch64 lli that aborts is also usable.
         self.assertTrue(classify_ub_probe([(-6, ""), (-6, "")], machine="aarch64")["conforming"])
-        # Nondeterminism, or a stable value other than the defined zero, is not.
-        self.assertFalse(classify_ub_probe([(0, ""), (128, "")], machine="arm64")["conforming"])
+        # A garbage-exit interpreter that returns 0 for UB must NOT qualify: the
+        # sentinel exists so the defined result is distinguishable from the 0
+        # that sat in the measured LLVM 15 garbage set.
+        self.assertFalse(classify_ub_probe([(0, ""), (0, "")], machine="aarch64")["conforming"])
+        # Nondeterminism, or a stable value other than the sentinel, is not usable.
+        self.assertFalse(
+            classify_ub_probe(
+                [(UB_PROBE_DEFINED_RESULT, ""), (128, "")], machine="arm64"
+            )["conforming"]
+        )
         self.assertFalse(classify_ub_probe([(64, ""), (64, "")], machine="aarch64")["conforming"])
-        # On x86_64 the division traps, so a deterministic zero exit stays rejected.
-        self.assertFalse(classify_ub_probe([(0, ""), (0, "")], machine="x86_64")["conforming"])
+        # On x86_64 the division traps, so a plain sentinel exit stays rejected.
+        self.assertFalse(
+            classify_ub_probe(
+                [(UB_PROBE_DEFINED_RESULT, ""), (UB_PROBE_DEFINED_RESULT, "")], machine="x86_64"
+            )["conforming"]
+        )
+        # The sentinel appears in the emitted probe IR after the udiv.
+        self.assertIn(f"add i32 %q, {UB_PROBE_DEFINED_RESULT}", build_ub_probe_ir())
 
 
 def main() -> int:
