@@ -104,6 +104,21 @@ pub(crate) fn module_directly_depends_on_lake_inputs(
         || source_uses_include_str(src_raw)
 }
 
+/// `--frozen-cone` (#339): trust a pre-materialized (hardlinked / CAS-restored) dependency cone.
+///
+/// A cone minted by `import` + `worktree-dedup` hardlinks artifacts that keep the pack's original
+/// mtimes, while a fresh checkout or a `git` operation stamps sources and lakefiles newer, so the
+/// raw `olean.mtime < source.mtime` staleness tests misclassify byte-identical artifacts as
+/// stale. With this set, the mtime-skew gates stand down and freshness rests entirely on the
+/// content-hash verification backing the verified-sources manifest (`src_blake3`,
+/// `olean_artifact_digest`, per-edge `import_olean_digests` pins).
+pub(crate) const FROZEN_CONE_ENV: &str = "TURBO_LEAN_FROZEN_CONE";
+
+pub(crate) fn frozen_cone_enabled() -> bool {
+    crate::shm_cache::parse_relaxed_bool(&std::env::var(FROZEN_CONE_ENV).unwrap_or_default())
+        == Some(true)
+}
+
 #[derive(Default)]
 pub(crate) struct LakeClosureCache {
     pub(super) manifests: HashMap<(PathBuf, bool), CachedPkgManifest>,
@@ -121,9 +136,8 @@ pub(crate) struct LakeClosureCache {
 impl LakeClosureCache {
     pub(crate) fn for_project(cfg: &ProjectConfig) -> Self {
         Self {
-            ignore_mtime_skew: !crate::lake_build::worktree_auto_link_disabled(
-                &cfg.root_pkg.pkg_root,
-            ),
+            ignore_mtime_skew: frozen_cone_enabled()
+                || !crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root),
             ..Default::default()
         }
     }
@@ -3688,7 +3702,11 @@ pub(super) fn is_dep_olean_fresh(
         }
     }
     let ot = om.modified().ok()?;
-    let opt_out = crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root);
+    // Under `--frozen-cone` the raw mtime gates stand down: the manifest checks below verify the
+    // source bytes, the artifact set, and every import edge by content hash, which is exactly
+    // what a hardlinked / CAS-restored cone with skewed mtimes still satisfies (#339).
+    let opt_out = crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root)
+        && !frozen_cone_enabled();
     if opt_out {
         if let Ok(sm) = fs::metadata(src_path) {
             if let Ok(st) = sm.modified() {
@@ -3868,7 +3886,11 @@ pub(super) fn collect_fresh_dep_pkg_closure(
             }
             // Verify parent `.olean` is at least as new as child `.olean` when opt-out requires raw mtime parity;
             // otherwise `is_dep_olean_fresh` already cryptographically verified `import_olean_digests` pins across every edge.
-            if crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root) {
+            // A `--frozen-cone` pack's hardlinks carry arbitrary relative mtimes, so the parity
+            // gate also stands down there in favor of those per-edge content pins (#339).
+            if crate::lake_build::worktree_auto_link_disabled(&cfg.root_pkg.pkg_root)
+                && !frozen_cone_enabled()
+            {
                 if let Some(parent_mt) = parent_olean_mtime {
                     if parent_mt < cur_olean_mtime {
                         return Ok(None);
