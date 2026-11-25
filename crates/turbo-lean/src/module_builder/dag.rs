@@ -9455,8 +9455,11 @@ pub(super) fn build_module_dag_inner(
     let root_pkg = &cfg.root_pkg;
     // For the `build <Lib>` scope gate below (#436): compare canonical paths, so a dependency
     // reached through a symlinked `.lake/packages` entry resolves to the checkout it really is.
-    // The packages dir the manifest populates counts as the project's own even when it (or
-    // `.lake`) is itself a symlink onto another volume (a RAM or scratch disk).
+    // An out-of-root packages dir counts as the project's own only with PROOF of ownership (a
+    // `.turbo-lean-packages-owner` marker naming this project's canonical root): turbo-lean
+    // cannot tell a private relocation onto another volume from a packages dir that several
+    // projects or worktrees share through a symlink, and the shared case is the publish race
+    // #436 closed.
     let root_canon = root_pkg
         .pkg_root
         .canonicalize()
@@ -9465,7 +9468,12 @@ pub(super) fn build_module_dag_inner(
         .pkg_root
         .join(&root_pkg.packages_dir)
         .canonicalize()
-        .ok();
+        .ok()
+        .filter(|p| {
+            p.starts_with(&root_canon)
+                || fs::read_to_string(p.join(".turbo-lean-packages-owner"))
+                    .is_ok_and(|s| Path::new(s.trim()) == root_canon.as_path())
+        });
     let mut initial_specs: Vec<(DiscoveredModuleSpec, bool)> = Vec::new();
     // Shared-library identity is `(pkg_root, lib_name)`, never `origName`, so two dependencies
     // whose directories share a name cannot collide.
@@ -10206,17 +10214,17 @@ pub(super) fn build_module_dag_inner(
                 continue;
             }
             // `turbo-lean build <Lib>` scope (#436): a git-pinned dependency checkout outside
-            // both the project root and its packages dir is another (possibly shared) checkout,
-            // reached through a symlinked `.lake/packages` entry or a relocated packages dir.
-            // Compiling its modules natively would publish `.olean`/`.trace` rewrites and
-            // `.turbo_publish.lock` files into that foreign checkout, so a pinned out-of-tree
-            // dependency is adopted read-only (the fresh or prebuilt closure during import
-            // resolution) or fails here, naming the Lake command that refreshes it. Path
-            // dependencies and pinned clones under the project root or packages dir keep
-            // building, like Lake builds them. The gate covers every trusted non-statement
-            // caller of `build_module_dag_with_trust` (`build`, `ci-verify`, freshness probes);
-            // `check`'s statement path (`allow_prebuilt_dep_pkgs`) and untrusted builds are
-            // unchanged.
+            // both the project root and its OWNER-MARKED packages dir is another (possibly
+            // shared) checkout, reached through a symlinked `.lake/packages` entry or an
+            // unproven relocated packages dir. Compiling its modules natively would publish
+            // `.olean`/`.trace` rewrites and `.turbo_publish.lock` files into that foreign
+            // checkout, so a pinned out-of-tree dependency is adopted read-only (the fresh or
+            // prebuilt closure during import resolution) or fails here, naming the Lake command
+            // that refreshes it. Path dependencies and pinned clones under the project root or
+            // its proven packages dir keep building, like Lake builds them. The gate covers
+            // every trusted non-statement caller of `build_module_dag_with_trust` (`build`,
+            // `ci-verify`, freshness probes); `check`'s statement path
+            // (`allow_prebuilt_dep_pkgs`) and untrusted builds are unchanged.
             if !is_untrusted && !allow_prebuilt_dep_pkgs && !spec.is_root_pkg {
                 let pkg_canon = spec
                     .pkg_root
@@ -10229,7 +10237,7 @@ pub(super) fn build_module_dag_inner(
                     && is_git_pinned_manifest_package(cfg, &spec)
                 {
                     anyhow::bail!(
-                        "Cannot build module `{}`: package `{}` is a git-pinned dependency checkout outside the project root ({} is not under {}); turbo-lean never compiles or publishes into it. Refresh its Lake artifacts first (run `lake build +{}` from the project root {}) and retry",
+                        "Cannot build module `{}`: package `{}` is a git-pinned dependency checkout outside the project root ({} is neither under {} nor under an owner-marked packages dir); turbo-lean never compiles or publishes into it. Refresh its Lake artifacts first (run `lake build +{}` from the project root {}) and retry",
                         spec.module_name,
                         spec.pkg_name,
                         pkg_canon.display(),
