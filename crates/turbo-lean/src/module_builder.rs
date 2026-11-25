@@ -2318,10 +2318,15 @@ lean_exe «demo-exe» where
                 assert!(parse(src, root).is_err(), "root={root}: {src}");
             }
         }
-        // `@[test_driver]` marks the next target without dropping its fields; on the header
-        // line itself the plain gate refuses it (fails closed) rather than drop them.
+        // `@[test_driver]` marks the next target without dropping its fields; #299: Lake also
+        // accepts it inline on the header line, where the fields attach to the target the same
+        // way (the plain gate used to refuse the inline `where` form).
         let driver = "import Lake\nopen Lake DSL\npackage demo\n@[test_driver]\nlean_lib Demo where\n  moreLeanArgs := #[\"-DautoImplicit=false\"]\n";
-        assert!(parse(&driver.replace("]\nlean_lib", "] lean_lib"), false).is_err());
+        let inline_pkg = parse(&driver.replace("]\nlean_lib", "] lean_lib"), false).unwrap();
+        assert_eq!(
+            inline_pkg.libs[0].more_lean_args,
+            vec!["-DautoImplicit=false".to_string()]
+        );
         let pkg = parse(driver, false).unwrap();
         assert_eq!(pkg.libs.len(), 1);
         assert_eq!(
@@ -2482,7 +2487,7 @@ lean_exe «demo-exe» where
         }
         for expr in [
             "xs.push ⟨`linter.a, false⟩ |>.push ⟨`linter.b, true⟩",
-            "xs.push (LeanOption.mk `linter.a false)\n  |>.push (⟨`linter.b, true⟩)",
+            "xs.push (⟨`linter.a, false⟩)\n  |>.push (⟨`linter.b, true⟩)",
             "Array.push (Array.push xs (⟨`linter.a, false⟩)) (⟨`linter.b, true⟩)",
             "Array.push\t(Array.push xs (⟨`linter.a, false⟩)) (⟨`linter.b, true⟩)",
             "(xs.push ⟨`linter.a, false⟩).push ⟨`linter.b, true⟩",
@@ -2620,34 +2625,19 @@ lean_exe «demo-exe» where
             .next(),
             Some(&LeanOptionValue::Bool(false))
         );
-        // Option names must be name literals; LeanOption.mk validates key and value.
+        // Option names must be name literals. #299 (Fable r9): Lake 4.35 rejects explicit
+        // `LeanOption.mk` applications and plain `(k, v)` tuples (unknown constants under the
+        // module system), so they fail closed here too.
         for e in [
             "#[⟨optKey, false⟩]",
             "#[⟨``linter.x, false⟩]",
             "#[LeanOption.mk optKey false]",
             "#[LeanOption.mk ` true]",
+            "#[LeanOption.mk `linter.n (.ofNat 1500), LeanOption.mk `linter.s \"a b\"]",
+            "#[(`linter.a, false)]",
         ] {
             assert!(parse(&lib(e, "")).is_err(), "{e}");
         }
-        assert_eq!(
-            opts(
-                &parse(&lib(
-                    "#[LeanOption.mk `linter.n (.ofNat 1500), LeanOption.mk `linter.s \"a b\"]",
-                    ""
-                ))
-                .unwrap()
-            ),
-            BTreeMap::from([
-                (
-                    LeanName::from_str_to_name("linter.n").unwrap(),
-                    LeanOptionValue::Nat(1500)
-                ),
-                (
-                    LeanName::from_str_to_name("linter.s").unwrap(),
-                    LeanOptionValue::Str("a b".to_string())
-                ),
-            ])
-        );
         // Every scope form disables resolution; binders, dotted and universe names are rejected.
         for prelude in [
             "abbrev opts : Array LeanOption := #[⟨`linter.a, true⟩]\nnoncomputable section\nend\n",
@@ -3603,6 +3593,440 @@ lean_lib Smoke where
         assert!(facet_err.contains("Unsupported target facet `:unknown_facet`"));
         let _ = fs::remove_dir_all(&dir);
     }
+
+    /// P7 (#436): `turbo-lean build <Lib>` must not schedule a native compile of a git-pinned
+    /// dependency whose checkout lies outside the project root (a symlinked `.lake/packages`
+    /// entry into another checkout): publishing would rewrite `.olean`/`.trace` files and take
+    /// `.turbo_publish.lock` in that foreign checkout. Such a dependency is adopted read-only or
+    /// the DAG build fails naming the `lake build` command that refreshes it. A pinned clone
+    /// under the project root keeps building, like Lake builds it.
+    #[cfg(unix)]
+    #[test]
+    fn test_dag_build_scope_refuses_stale_git_pinned_dep_outside_project_root() -> Result<()> {
+        let dir = make_temp_test_dir("dag_build_scope_pinned_dep");
+        let origin = dir.join("other_checkout/dep_pin");
+        let proj = dir.join("proj");
+        fs::create_dir_all(&origin)?;
+        fs::create_dir_all(&proj)?;
+        let tc = "leanprover/lean4:v4.35.0\n";
+        fs::write(origin.join("lean-toolchain"), tc)?;
+        fs::write(proj.join("lean-toolchain"), tc)?;
+        fs::write(
+            origin.join("lakefile.toml"),
+            "name = \"dep_pin\"\ndefaultTargets = [\"DepPin\"]\n[[lean_lib]]\nname = \"DepPin\"\n",
+        )?;
+        fs::write(origin.join("DepPin.lean"), "def depPinVal : Nat := 7\n")?;
+        let git_bin = std::env::var_os("TURBO_LEAN_GIT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("git"));
+        for args in [
+            vec!["init"],
+            vec!["config", "user.email", "t@e.com"],
+            vec!["config", "user.name", "T"],
+            vec!["add", "."],
+            vec!["commit", "-m", "init"],
+        ] {
+            let st = Command::new(&git_bin)
+                .args(&args)
+                .current_dir(&origin)
+                .status()?;
+            anyhow::ensure!(st.success(), "git {args:?} failed in dep origin");
+        }
+        let rev_out = Command::new(&git_bin)
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&origin)
+            .output()?;
+        anyhow::ensure!(rev_out.status.success());
+        let rev = String::from_utf8(rev_out.stdout)?.trim().to_string();
+        fs::write(
+            proj.join("lakefile.toml"),
+            format!(
+                "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep_pin\"\ngit = {:?}\nrev = {:?}\n[[lean_lib]]\nname = \"App\"\n",
+                origin.to_string_lossy(),
+                rev
+            ),
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            serde_json::json!({
+                "version": "1.1.0",
+                "packagesDir": ".lake/packages",
+                "packages": [{
+                    "type": "git",
+                    "scope": "",
+                    "name": "dep_pin",
+                    "manifestFile": "lake-manifest.json",
+                    "rev": rev,
+                    "inherited": false,
+                    "configFile": "lakefile.toml",
+                    "inputRev": rev,
+                    "url": origin.to_string_lossy()
+                }]
+            })
+            .to_string(),
+        )?;
+        fs::write(
+            proj.join("App.lean"),
+            "import DepPin\ntheorem app_ok : depPinVal = 7 := rfl\n",
+        )?;
+        fs::create_dir_all(proj.join(".lake/packages"))?;
+        std::os::unix::fs::symlink(&origin, proj.join(".lake/packages/dep_pin"))?;
+
+        let cfg = resolve_project_config(&proj)?;
+        // 1. `build <Lib>` (trusted, no prebuilt adoption) fails closed instead of scheduling a
+        //    native compile that would publish into the other checkout.
+        let err = build_module_dag(&cfg, &["App".to_string()])
+            .expect_err("stale pinned out-of-tree dep must not become a DAG build node")
+            .to_string();
+        assert!(
+            err.contains("outside the project root") && err.contains("lake build DepPin"),
+            "unexpected error: {err}"
+        );
+        // 2. The statement path (`allow_prebuilt_dep_pkgs = true`, `check`) keeps today's shape.
+        let stmt_dag = build_module_dag_for_trusted_statement(&cfg, &["App".to_string()])?;
+        assert!(stmt_dag.nodes.contains_key("DepPin"));
+        // 3. Control: the same pinned clone under the project root keeps building like Lake.
+        fs::remove_file(proj.join(".lake/packages/dep_pin"))?;
+        let clone_st = Command::new(&git_bin)
+            .args(["clone", "--quiet"])
+            .arg(&origin)
+            .arg(proj.join(".lake/packages/dep_pin"))
+            .status()?;
+        anyhow::ensure!(clone_st.success(), "git clone into packages dir failed");
+        let cfg_in = resolve_project_config(&proj)?;
+        let dag_in = build_module_dag(&cfg_in, &["App".to_string()])?;
+        assert!(dag_in.nodes.contains_key("DepPin"));
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// L299 (#299, module resolution): import edges resolve like Lake's `Package.findModule?`
+    /// (libraries only), never like `findTargetModule?` (executables first), so a module that is
+    /// solely a `lean_exe` root is not importable and the DAG fails where Lake fails.
+    #[test]
+    fn test_l299_import_lookup_skips_exe_roots_like_find_module() -> Result<()> {
+        let dir = make_temp_test_dir("l299_find_module");
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            dir.join("lakefile.toml"),
+            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[lean_lib]]\nname = \"App\"\n[[lean_exe]]\nname = \"runner\"\nroot = \"Main\"\n",
+        )?;
+        fs::write(dir.join("Main.lean"), "def main : IO Unit := pure ()\n")?;
+        fs::write(dir.join("App.lean"), "import Main\ndef app : Nat := 1\n")?;
+        let cfg = resolve_project_config(&dir)?;
+        let pkg = &cfg.root_pkg;
+        assert_eq!(
+            resolve_module_in_package(pkg, true, "Main").map(|s| s.target_name),
+            Some("runner".to_string())
+        );
+        assert!(resolve_importable_module_in_package(pkg, true, "Main").is_none());
+        let err = build_module_dag(&cfg, &["App".to_string()])
+            .expect_err("a module that is only an exe root must not be importable")
+            .to_string();
+        assert!(err.contains("Missing module `Main`"), "{err}");
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// L299 (#299, module resolution): glob-expanded modules take their `leanOptions` from the
+    /// library module resolution picks (Lake's `findModule?`, the LAST library that can build
+    /// the module), not from whichever library's glob expanded them.
+    #[test]
+    fn test_l299_glob_expansion_routes_options_through_module_resolution() -> Result<()> {
+        let dir = make_temp_test_dir("l299_glob_options");
+        fs::create_dir_all(dir.join("Shared"))?;
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            dir.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage overl\nlean_lib First where\n  globs := #[`Shared.+]\n  leanOptions := #[⟨`linter.first, true⟩]\nlean_lib Second where\n  globs := #[`Shared.+]\n  leanOptions := #[⟨`linter.second, true⟩]\n",
+        )?;
+        fs::write(dir.join("Shared/M.lean"), "def m : Nat := 1\n")?;
+        let cfg = resolve_project_config(&dir)?;
+        let dag = build_module_dag(&cfg, &["First".to_string()])?;
+        let node = &dag.nodes["Shared.M"];
+        // The needs-trace attribution stays the requested library's...
+        assert_eq!(node.target_name, "First");
+        // ...while the options are the owning (last) library's, like Lake compiles it.
+        let second = LeanName::from_str_to_name("linter.second")?;
+        let first = LeanName::from_str_to_name("linter.first")?;
+        assert_eq!(
+            node.lean_options.get(&second),
+            Some(&LeanOptionValue::Bool(true))
+        );
+        assert!(!node.lean_options.contains_key(&first));
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    /// L299 (#299, module resolution): a matching target whose source file is missing resolves
+    /// to nothing (and the build fails like Lake fails), instead of silently trying an earlier
+    /// candidate Lake would never build.
+    #[test]
+    fn test_l299_missing_source_file_fails_instead_of_trying_earlier_candidate() {
+        let dir = make_temp_test_dir("l299_missing_source");
+        let lf = dir.join("lakefile.lean");
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\npackage miss\nlean_lib Early where\n  roots := #[`M]\nlean_lib Late where\n  srcDir := \"late\"\n  roots := #[`M]\n",
+        )
+        .unwrap();
+        fs::write(dir.join("M.lean"), "").unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, true).unwrap();
+        // `Late` (the last declaration) owns `M` like Lake's `findModule?`; its missing
+        // `late/M.lean` is Lake's build-time error, never a fallback to `Early`.
+        assert!(resolve_module_in_package(&pkg, true, "M").is_none());
+        fs::create_dir_all(dir.join("late")).unwrap();
+        fs::write(dir.join("late/M.lean"), "").unwrap();
+        assert_eq!(
+            resolve_module_in_package(&pkg, true, "M").map(|s| s.target_name),
+            Some("Late".to_string())
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// L299 (#299, header syntax): `lake init foo.bar std.lean` emits per-segment guillemets
+    /// (`lean_lib «Foo».«Bar» where`), which parse to the dotted Lake name.
+    #[test]
+    fn test_l299_per_segment_guillemets_in_target_header() {
+        let dir = make_temp_test_dir("l299_guillemets");
+        let lf = dir.join("lakefile.lean");
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\npackage demo\nlean_lib «Foo».«Bar» where\n",
+        )
+        .unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, true).unwrap();
+        assert_eq!(pkg.libs[0].name, "Foo.Bar");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// L299 (#299, header syntax): a dot inside a quoted target name is one atomic segment to
+    /// Lake (`Name.mkSimple`), which this parser cannot represent: fail closed instead of
+    /// splitting it into `Foo/Bar.lean`.
+    #[test]
+    fn test_l299_dots_in_quoted_target_names_fail_closed() {
+        let dir = make_temp_test_dir("l299_quoted_dots");
+        let lf = dir.join("lakefile.lean");
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\npackage demo\nlean_lib \"Foo.Bar\" where\n",
+        )
+        .unwrap();
+        assert!(parse_lakefile_lean(&dir, &lf, true).is_err());
+        // The unquoted `lake init` form stays accepted.
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\npackage \"demo\" where\nlean_lib Demo where\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parse_lakefile_lean(&dir, &lf, true).unwrap().libs[0].name,
+            "Demo"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// L299 (#299, header syntax): inline `@[default_target] lean_lib X where` and the
+    /// `open Lake DSL System` word order keep a lakefile plain, so `leanOptions` elsewhere in
+    /// the file still resolve (Lake accepts both).
+    #[test]
+    fn test_l299_inline_default_target_attribute_and_open_word_order_stay_plain() {
+        let dir = make_temp_test_dir("l299_inline_attr");
+        let lf = dir.join("lakefile.lean");
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL System\npackage demo where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n@[default_target] lean_lib Demo where\n",
+        )
+        .unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, true).unwrap();
+        assert_eq!(pkg.default_targets, vec!["Demo".to_string()]);
+        assert_eq!(
+            pkg.lean_options
+                .get(&LeanName::from_str_to_name("autoImplicit").unwrap()),
+            Some(&LeanOptionValue::Bool(false))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// L299 (#299, header syntax): stacked target attributes on separate lines apply together;
+    /// `@[test_driver]` does not clear a pending `@[default_target]`.
+    #[test]
+    fn test_l299_stacked_target_attributes_keep_pending_default_target() {
+        let dir = make_temp_test_dir("l299_stacked_attrs");
+        let lf = dir.join("lakefile.lean");
+        fs::write(
+            &lf,
+            "import Lake\nopen Lake DSL\npackage demo\n@[default_target]\n@[test_driver]\nlean_lib A where\nlean_lib B where\n",
+        )
+        .unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, true).unwrap();
+        assert_eq!(pkg.default_targets, vec!["A".to_string()]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// L299 (#299, dependency shadowing): a dependency lakefile that declares a dotted helper
+    /// (which could shadow `Glob` constructor spellings) fails closed for constructor-named
+    /// globs instead of reading them literally; backtick-literal globs cannot be shadowed.
+    #[test]
+    fn test_l299_shadowable_glob_constructors_fail_closed_in_dep_packages() {
+        let dir = make_temp_test_dir("l299_glob_shadow");
+        let lf = dir.join("lakefile.lean");
+        let shadowed = "import Lake\nopen Lake DSL\npackage dep\ndef Glob.submodules (n : Lake.Glob) : Lake.Glob := n\nlean_lib Dep where\n  globs := #[Glob.submodules `Wrong]\n";
+        fs::write(&lf, shadowed).unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+        assert!(
+            pkg.libs[0].unsupported.is_some() || pkg.unsupported.is_some(),
+            "shadowable Glob constructor accepted literally"
+        );
+        // A plain dependency lakefile keeps constructor globs...
+        let plain = "import Lake\nopen Lake DSL\npackage dep\nlean_lib Dep where\n  globs := #[Glob.submodules `Right]\n";
+        fs::write(&lf, plain).unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+        assert!(pkg.libs[0].unsupported.is_none() && pkg.unsupported.is_none());
+        assert_eq!(
+            pkg.libs[0].globs,
+            vec![GlobSpec::Submodules("Right".to_string())]
+        );
+        // ...and backtick-literal globs survive beside a dotted helper.
+        let literal = "import Lake\nopen Lake DSL\npackage dep\ndef Glob.submodules (n : Lake.Glob) : Lake.Glob := n\nlean_lib Dep where\n  globs := #[`Dep.+]\n";
+        fs::write(&lf, literal).unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+        assert!(pkg.libs[0].unsupported.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// L299 (#299, accepted-but-invalid forms): Lake 4.35 rejects plain `(k, v)` tuples and
+    /// explicit `LeanOption.mk` applications in `leanOptions`; turbo-lean fails closed on both
+    /// and keeps the `⟨k, v⟩` form. The bullet's third form, an untyped
+    /// `abbrev xs := #[⟨...⟩]`, stays accepted: Mathlib's real lakefile binds
+    /// `mathlibLeanOptions` that way on its pinned toolchain
+    /// (`test_computed_lean_options_mathlib_lakefile`), and refusing valid input is the failure
+    /// mode #299 asks to avoid.
+    #[test]
+    fn test_l299_prod_tuple_lean_option_mk_and_untyped_abbrev_fail_closed() {
+        let dir = make_temp_test_dir("l299_invalid_forms");
+        let lf = dir.join("lakefile.lean");
+        let parse = |src: &str| {
+            fs::write(&lf, src).unwrap();
+            parse_lakefile_lean(&dir, &lf, false)
+        };
+        let lib = |expr: &str, prelude: &str| {
+            format!("import Lake\nopen Lake DSL\n{prelude}package demo\nlean_lib Demo where\n  leanOptions := {expr}\n")
+        };
+        assert!(parse(&lib("#[(`autoImplicit, false)]", "")).is_err());
+        assert!(parse(&lib("#[LeanOption.mk `autoImplicit false]", "")).is_err());
+        // The untyped Mathlib-shaped binding keeps resolving.
+        let untyped = parse(&lib("xs", "abbrev xs := #[⟨`autoImplicit, false⟩]\n")).unwrap();
+        assert_eq!(
+            untyped.libs[0].lean_options,
+            parse_lean_options_expr("#[⟨`autoImplicit, false⟩]").unwrap()
+        );
+        // The forms Lake elaborates stay accepted: `⟨k, v⟩` and a typed abbrev.
+        let ok = parse(&lib(
+            "xs ++ #[⟨`linter.b, true⟩]",
+            "abbrev xs : Array LeanOption := #[⟨`linter.a, false⟩]\n",
+        ))
+        .unwrap();
+        assert_eq!(
+            ok.libs[0].lean_options,
+            parse_lean_options_expr("#[⟨`linter.a, false⟩, ⟨`linter.b, true⟩]").unwrap()
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// L299 (#299, pre-existing non-root behaviour): duplicate `lean_lib` names fail closed
+    /// (Lake rejects the duplicate declaration), `meta if` fails closed instead of keeping the
+    /// first branch, and TOML `buildType = "debug"` fails closed instead of silently dropping
+    /// Lake's `debugAssertions`.
+    #[test]
+    fn test_l299_duplicate_libs_meta_if_and_toml_build_type_fail_closed() {
+        let dir = make_temp_test_dir("l299_dup_metaif_buildtype");
+        let lf = dir.join("lakefile.lean");
+        let dup =
+            "import Lake\nopen Lake DSL\npackage dep\nlean_lib Demo where\nlean_lib Demo where\n";
+        fs::write(&lf, dup).unwrap();
+        let pkg = parse_lakefile_lean(&dir, &lf, false).unwrap();
+        assert!(pkg.unsupported.is_some(), "duplicate lean_lib accepted");
+        assert!(parse_lakefile_lean(&dir, &lf, true).is_err());
+        let meta_if = "import Lake\nopen Lake DSL\npackage dep\nmeta if true then\nlean_lib A where\nlean_lib B where\n";
+        fs::write(&lf, meta_if).unwrap();
+        let dep = parse_lakefile_lean(&dir, &lf, false);
+        assert!(
+            dep.is_err() || dep.unwrap().unsupported.is_some(),
+            "`meta if` accepted"
+        );
+        let tf = dir.join("lakefile.toml");
+        fs::write(
+            &tf,
+            "name = \"demo\"\nbuildType = \"debug\"\n[[lean_lib]]\nname = \"Demo\"\n",
+        )
+        .unwrap();
+        assert!(parse_lakefile_toml(&dir, &tf, true).is_err());
+        fs::write(
+            &tf,
+            "name = \"demo\"\nbuildType = \"release\"\n[[lean_lib]]\nname = \"Demo\"\n",
+        )
+        .unwrap();
+        assert!(parse_lakefile_toml(&dir, &tf, true).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// L299 (#299, arguments and options): TOML option values stay typed `LeanOptionValue`s end
+    /// to end (a Nat is a Nat on the CLI, not a quoted string), and quoted keys parse.
+    #[test]
+    fn test_l299_toml_lean_option_values_stay_typed() {
+        let dir = make_temp_test_dir("l299_toml_typed_options");
+        let tf = dir.join("lakefile.toml");
+        fs::write(
+            &tf,
+            "name = \"demo\"\n[leanOptions]\nmaxHeartbeats = 400000\nautoImplicit = false\nlinter.style.longFile = 1500\n[[lean_lib]]\nname = \"Demo\"\n",
+        )
+        .unwrap();
+        let pkg = parse_lakefile_toml(&dir, &tf, true).unwrap();
+        let get = |k: &str| {
+            pkg.lean_options
+                .get(&LeanName::from_str_to_name(k).unwrap())
+                .cloned()
+        };
+        assert_eq!(get("maxHeartbeats"), Some(LeanOptionValue::Nat(400000)));
+        assert_eq!(get("maxHeartbeats").unwrap().as_cli_flag_value(), "400000");
+        assert_eq!(get("autoImplicit"), Some(LeanOptionValue::Bool(false)));
+        assert_eq!(
+            get("linter.style.longFile"),
+            Some(LeanOptionValue::Nat(1500))
+        );
+        // A quoted TOML key is one atomic segment (`«linter.style»`), which the option
+        // allowlist then refuses: strict, like the quoted-header rule.
+        fs::write(
+            &tf,
+            "name = \"demo\"\n[leanOptions]\n\"linter.style\" = \"all\"\n[[lean_lib]]\nname = \"Demo\"\n",
+        )
+        .unwrap();
+        assert!(parse_lakefile_toml(&dir, &tf, true).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// L299 (#299, arguments and options): the sorry-adjacent debug keys stay outside the
+    /// option allowlist, whatever value they carry.
+    #[test]
+    fn test_l299_sorry_adjacent_option_keys_stay_outside_allowlist() {
+        for key in [
+            "debug.proofAsSorry",
+            "debug.byAsSorry",
+            "debug.terminalTacticsAsSorry",
+            "weak.debug.proofAsSorry",
+            "weak.debug.byAsSorry",
+            "weak.debug.terminalTacticsAsSorry",
+        ] {
+            for val in [LeanOptionValue::Bool(true), LeanOptionValue::Bool(false)] {
+                assert!(
+                    !is_allowed_lean_option(&LeanName::from_str_to_name(key).unwrap(), &val),
+                    "{key}"
+                );
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_optout_module_cache_hits_preserve_existing_lake_tree() -> Result<()> {
