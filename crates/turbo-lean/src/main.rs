@@ -124,6 +124,11 @@ enum Commands {
         /// Exclude project-relative file/directory globs (e.g. `experiments/**`; repeatable)
         #[arg(long = "exclude")]
         exclude: Vec<String>,
+        /// Trust a pre-materialized (hardlinked/CAS-restored) dependency cone: decide freshness by
+        /// content hashes alone instead of mtime-skew tests, so byte-identical frozen artifacts
+        /// are never rebuilt
+        #[arg(long, default_value_t = false)]
+        frozen_cone: bool,
     },
     /// Hydrate `.turbo_verified_sources.json` content-addressed manifests from existing `.olean` + Lake `.trace` artifacts (mtime-immune after git checkout/rebase)
     HydrateTraces {
@@ -1582,17 +1587,23 @@ fn run(cli: Cli) -> Result<()> {
             pin_level,
             seed_shards,
             replay_cas_expr,
+            frozen_cone,
             ..
-        } => lake_build::run_build_command_with_cas_replay(
-            &mut store,
-            cli.json,
-            targets,
-            project_dir,
-            trust_domain,
-            pin_level,
-            seed_shards,
-            replay_cas_expr,
-        ),
+        } => {
+            if frozen_cone {
+                std::env::set_var(module_builder::FROZEN_CONE_ENV, "1");
+            }
+            lake_build::run_build_command_with_cas_replay(
+                &mut store,
+                cli.json,
+                targets,
+                project_dir,
+                trust_domain,
+                pin_level,
+                seed_shards,
+                replay_cas_expr,
+            )
+        }
 
         Commands::HydrateTraces { project_dir } => {
             lake_build::run_hydrate_traces_command(cli.json, project_dir)
