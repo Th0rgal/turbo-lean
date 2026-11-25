@@ -2085,6 +2085,180 @@ def auditCompiledModules (modNames : List String) (ffiAllow : Array (Name × Nam
   let allViolations := initViolations ++ sliceViolations
   return (allViolations.isEmpty, allViolations, csimpEntries)
 
+/-- Import-policy posture of `modNames` for the host's pre-audit decision
+    (`crates/turbo-lean/src/kernel.rs`, `decide_import_posture_policy`): the transitively imported
+    module graph with each module's `@[csimp]` / `local csimp` entries in the public-signature
+    entry format (`global:<from>-><to>:<thm>` / `scoped:<ns>:<from>-><to>:<thm>`), plus the
+    per-target unsafe / extern-implemented_by / custom-axiom candidates that already failed every
+    structural exemption the full `--audit-modules` audit applies, so only the allowlist half of
+    each decision is left to the host. Reads module data from one `importModules` only: no kernel
+    replay, no per-declaration axiom-closure walk, no LCNF recompilation — the expensive audit
+    stays authoritative behind this pass and is never skipped by it. -/
+def dumpImportPostureJson (modNames : List String) (ffiAllow : Array (Name × Name × String)) : IO Unit := do
+  let stdout ← IO.getStdout
+  let mut parsed : Array (String × Name) := #[]
+  for raw in modNames do
+    let t := raw.trimAscii.toString
+    if !t.isEmpty then
+      let nm := parseModuleName t
+      if nm.isAnonymous then
+        stdout.putStrLn s!"\{\"ok\":false,\"error\":\"invalid module name `{jsonEscape raw}`\"}"
+        return
+      else
+        parsed := parsed.push (t, nm)
+  if parsed.isEmpty then
+    stdout.putStrLn "{\"ok\":false,\"error\":\"no modules\"}"
+    return
+  let imports : Array Import := parsed.map fun (_, nm) =>
+    ({ module := nm, importAll := true } : Import)
+  let env ← Lean.importModules imports {} 0 #[] true false .private
+  let sysrootLibPrefix? : Option String ← try
+      let libDir ← IO.FS.realPath ((← Lean.findSysroot) / "lib" / "lean")
+      let s := libDir.toString
+      pure (some (if s.endsWith "/" then s else s ++ "/"))
+    catch _ =>
+      pure none
+  let sysrootCache ← IO.mkRef ({} : Std.HashMap Name Bool)
+  let isSysrootMod (moduleName : Name) : IO Bool := do
+    if let some ok := (← sysrootCache.get)[moduleName]? then return ok
+    let ok ← match sysrootLibPrefix? with
+      | none => pure false
+      | some pfx =>
+        try
+          let p ← IO.FS.realPath (← Lean.findOLean moduleName)
+          pure (p.toString.startsWith pfx)
+        catch _ =>
+          pure false
+    sysrootCache.modify (·.insert moduleName ok)
+    return ok
+  let mut targetIdxs : Std.HashMap ModuleIdx String := {}
+  for (rawStr, nm) in parsed do
+    if let some modIdx := env.getModuleIdx? nm then
+      targetIdxs := targetIdxs.insert modIdx rawStr
+  -- Mirror of the import audit's `kernelCone` reachability (`auditImportedModulesInEnv`): names
+  -- reachable from the targets' non-unsafe roots plus every module-exported csimp entry's names.
+  -- The mirror seeds from module-exported entries only, so its cone is never wider than the
+  -- audit's: a name outside it is never early-refused here, and the full audit still sees it.
+  let mut coneWork : Array Name := #[]
+  for (modIdx, _) in targetIdxs.toList do
+    let mdata := env.header.moduleData[modIdx.toNat]!
+    for cinfo in mdata.constants do
+      if !cinfo.isUnsafe then
+        coneWork := coneWork.push cinfo.name
+      if let .thmInfo tv := cinfo then
+        if env.getModuleIdxFor? cinfo.name != some modIdx then
+          for u in tv.type.getUsedConstants ++ tv.value.getUsedConstants do
+            if (env.find? u).any (fun ci => !ci.isUnsafe) then
+              coneWork := coneWork.push u
+    for extraName in mdata.extraConstNames do
+      if (env.find? extraName).any (fun ci => !ci.isUnsafe) then
+        coneWork := coneWork.push extraName
+  for i in [:env.header.moduleData.size] do
+    let mIdx : ModuleIdx := i
+    for scEntry in Lean.Compiler.CSimp.ext.ext.getModuleEntries env mIdx do
+      let entry := match scEntry with | .global e | .scoped _ e => e
+      for n in [entry.thmName, entry.fromDeclName, entry.toDeclName] do
+        if (env.find? n).any (fun ci => !ci.isUnsafe) then
+          coneWork := coneWork.push n
+  let mut cone : Std.HashSet Name := {}
+  while !coneWork.isEmpty do
+    let n := coneWork.back!
+    coneWork := coneWork.pop
+    if cone.contains n then continue
+    cone := cone.insert n
+    if let some ci := env.find? n then
+      for used in ci.getUsedConstantsAsSet.toArray do
+        if !cone.contains used then coneWork := coneWork.push used
+      if let .inductInfo iv := ci then
+        for ctor in iv.ctors do
+          if !cone.contains ctor then coneWork := coneWork.push ctor
+  let mut moduleJsons : Array String := #[]
+  for i in [:env.header.moduleData.size] do
+    let mIdx : ModuleIdx := i
+    let some modName := env.header.moduleNames[i]? | continue
+    let md := env.header.moduleData[i]!
+    let initSysroot ← if modName.getRoot == `Init then isSysrootMod modName else pure false
+    let impNames := md.imports.map (fun imp => canonicalName imp.module)
+    let mut entryJsons : Array String := #[]
+    for scEntry in Lean.Compiler.CSimp.ext.ext.getModuleEntries env mIdx do
+      let (eStr, entry) := match scEntry with
+        | .global e =>
+          (s!"global:{canonicalName e.fromDeclName}->{canonicalName e.toDeclName}:{canonicalName e.thmName}", e)
+        | .scoped ns e =>
+          (s!"scoped:{canonicalName ns}:{canonicalName e.fromDeclName}->{canonicalName e.toDeclName}:{canonicalName e.thmName}", e)
+      let strict := (env.find? entry.thmName).any (·.isTheorem) &&
+        ((env.find? entry.thmName).bind (csimpReplacementPair? env) ==
+          some (entry.fromDeclName, entry.toDeclName))
+      let touches := [entry.thmName, entry.fromDeclName, entry.toDeclName].any fun nm =>
+        match env.getModuleIdxFor? nm with
+        | some idx => targetIdxs.contains idx
+        | none => false
+      let userThm := canonicalName (Lean.privateToUserName entry.thmName)
+      entryJsons := entryJsons.push
+        s!"\{\"e\":\"{jsonEscape eStr}\",\"u\":\"{jsonEscape userThm}\",\"s\":{strict},\"t\":{touches}}"
+    moduleJsons := moduleJsons.push
+      s!"\{\"m\":\"{jsonEscape (canonicalName modName)}\",\"init_sysroot\":{initSysroot},\"imports\":[{jsonStrList impNames.toList}],\"csimp\":[{String.intercalate "," entryJsons.toList}]}"
+  let mut targetJsons : Array String := #[]
+  for (rawStr, nm) in parsed do
+    match env.getModuleIdx? nm with
+    | none =>
+      stdout.putStrLn s!"\{\"ok\":false,\"error\":\"module `{jsonEscape rawStr}` missing from imported environment\"}"
+      return
+    | some modIdx =>
+      let mdata := env.header.moduleData[modIdx.toNat]!
+      let mut axiomJsons : Array String := #[]
+      let mut uindJsons : Array String := #[]
+      let mut unsafeJsons : Array String := #[]
+      let mut bridgeJsons : Array String := #[]
+      let pushBridge (declName : Name) (cinfo? : Option ConstantInfo) (aux : Bool)
+          (acc : Array String) : Array String := Id.run do
+        let isExt := Lean.isExtern env declName
+        let isImplBy := (Lean.Compiler.getImplementedBy? env declName).isSome
+        if !(isExt || isImplBy) then return acc
+        if isWhitelistedInitExecBridge env modIdx declName then return acc
+        if cinfo?.any (isPinnedFfiOpaque env ffiAllow modIdx) then return acc
+        let wrappers := match safeUnsafeCallWrapperBridgeParent? env modIdx declName with
+          | some pc =>
+            if (Lean.Compiler.isUnsafeRecName? pc.name).isNone then
+              #[canonicalName pc.name, canonicalName (Lean.privateToUserName pc.name)]
+            else #[]
+          | none => #[]
+        return acc.push
+          s!"\{\"r\":\"{jsonEscape (canonicalName declName)}\",\"u\":\"{jsonEscape (canonicalName (Lean.privateToUserName declName))}\",\"x\":{isExt},\"i\":{isImplBy},\"a\":{aux},\"w\":[{jsonStrList wrappers.toList}]}"
+      for cinfo in mdata.constants do
+        let declName := cinfo.name
+        match cinfo with
+        | .axiomInfo _ =>
+          axiomJsons := axiomJsons.push s!"\"{jsonEscape (canonicalName declName)}\""
+        | .inductInfo iVal =>
+          if iVal.isUnsafe then
+            uindJsons := uindJsons.push s!"\"{jsonEscape (canonicalName declName)}\""
+        | _ => pure ()
+        if cinfo.isUnsafe && cone.contains declName &&
+           !isWhitelistedInitExecUnsafe env modIdx cinfo then
+          let wrappers := match safeUnsafeCallWrapperParent? env modIdx cinfo with
+            | some pc =>
+              if (Lean.Compiler.isUnsafeRecName? pc.name).isNone then
+                #[canonicalName pc.name, canonicalName (Lean.privateToUserName pc.name)]
+              else #[]
+            | none => #[]
+          let patOk := (Lean.Compiler.isUnsafeRecName? declName).isNone
+          let usesUnsafeInd := cinfo.getUsedConstantsAsSet.any fun u =>
+            match env.find? u with
+            | some (.inductInfo iv) => iv.isUnsafe
+            | _ => false
+          let canAllow := (cinfo matches .defnInfo _ | .opaqueInfo _) && patOk && !usesUnsafeInd
+          unsafeJsons := unsafeJsons.push
+            s!"\{\"r\":\"{jsonEscape (canonicalName declName)}\",\"u\":\"{jsonEscape (canonicalName (Lean.privateToUserName declName))}\",\"p\":{patOk},\"c\":{canAllow},\"w\":[{jsonStrList wrappers.toList}]}"
+        bridgeJsons := pushBridge declName (some cinfo) false bridgeJsons
+      for extraName in mdata.extraConstNames do
+        bridgeJsons := pushBridge extraName (env.find? extraName) true bridgeJsons
+      targetJsons := targetJsons.push
+        s!"\{\"m\":\"{jsonEscape rawStr}\",\"axioms\":[{String.intercalate "," axiomJsons.toList}],\"uind\":[{String.intercalate "," uindJsons.toList}],\"unsafe\":[{String.intercalate "," unsafeJsons.toList}],\"bridge\":[{String.intercalate "," bridgeJsons.toList}]}"
+  stdout.putStrLn
+    s!"\{\"ok\":true,\"modules\":[{String.intercalate "," moduleJsons.toList}],\"targets\":[{String.intercalate "," targetJsons.toList}]}"
+  stdout.flush
+
 private def formatInlineAttr (i : Option Compiler.InlineAttributeKind) : String :=
   match i with
   | none => "none"
@@ -2962,6 +3136,14 @@ def main (args : List String) : IO Unit := do
     stdout.flush
     if !ok then
       IO.Process.exit 1
+    return
+  | "--import-posture" :: modArgs =>
+    let (ffiArgs, mods) := modArgs.partition (·.startsWith "--ffi-allow=")
+    let ffiAllow := ffiArgs.toArray.filterMap fun a =>
+      match ((a.drop 12).toString.splitOn "=") with
+      | [m, d, sym] => some (TurboLean.ZygoteWorker.parseModuleName m, TurboLean.ZygoteWorker.parseModuleName d, sym)
+      | _ => none
+    TurboLean.ZygoteWorker.dumpImportPostureJson mods ffiAllow
     return
   | "--statement-dump" :: mods =>
     statementHashCliMain mods

@@ -14,6 +14,8 @@ Inspired by the exact LLVM IR and native assembly produced by the frontier Rust 
   `pool_spin_start` (`rayon::yield_now()` in-pool DVFS spin), and `GatherBundle` zero-copy
   `write_vectored` (`writev`) proof publication with post-rename descriptor close (`late_close`).
 """
+from __future__ import annotations
+
 import json
 import math
 import re

@@ -875,9 +875,588 @@ fn split_lean_csimp_arrow(pair: &str) -> Vec<&str> {
     out
 }
 
+// -------------------------------------------------------------------------------------------
+// P9: imported-posture policy decision table (issues #411 / #412).
+//
+// The zygote worker's `--import-posture` command reports, for the modules an imported-`.olean`
+// audit is about to cover, every policy-relevant posture fact with the structural exemptions the
+// full audit applies already folded in (wrapper parents, Init-exec whitelists, pinned FFI,
+// compiler-generated `unsafe_rec` twins, the kernel-cone reachability filter). The table below
+// applies the project allowlists (`turbo-lean.toml` `[csimp]` / `[unsafe]` / `[implemented_by]` /
+// `[axioms] allow`, resolved by the CLI into the `TURBO_LEAN_ALLOWED_*` environment) and decides
+// each posture BEFORE the expensive audit machinery (closure snapshot, whole-closure kernel
+// replay, per-declaration axiom-closure walks, per-entry verified-csimp replay) runs:
+//
+// | posture                                   | decided by                           | outcome   |
+// |-------------------------------------------|--------------------------------------|-----------|
+// | csimp entry, strict proven theorem        | `[csimp] allow` glob (raw or user)   | allow/forbid |
+// | csimp entry, non-theorem or non-strict    | never allowlistable                  | forbid    |
+// | csimp entry owned by toolchain `Init.*`   | exempt unless it touches a target    | allow     |
+// | unsafe declaration (post structural exemptions) | `[unsafe] allow` on decl or wrapper | allow/forbid |
+// | unsafe `_unsafe_rec` twin                 | never allowlistable by name          | forbid (wrapper `[unsafe]` allow only) |
+// | unsafe inductive                          | never allowlistable                  | forbid    |
+// | `@[extern]` bypass                        | never `[implemented_by]`-listable    | forbid (wrapper `[unsafe]` allow only) |
+// | `@[implemented_by]` bypass                | `[implemented_by] allow`, or wrapper `[unsafe]` allow | allow/forbid |
+// | custom axiom declaration                  | standard axioms + `[axioms] allow` (never `sorryAx` / `Lean.trustCompiler`) | allow/forbid |
+//
+// A forbidden outcome fails closed with a message naming the exact `turbo-lean.toml` knob; an
+// allowed outcome proceeds into the unchanged, authoritative in-kernel audit. The early pass can
+// therefore only add early refusals; it never admits anything the audit would refuse.
+// -------------------------------------------------------------------------------------------
+
+pub const EARLY_IMPORT_POLICY_ENV: &str = "TURBO_LEAN_EARLY_IMPORT_POLICY";
+
+/// Whether the early imported-posture policy decision runs before the in-kernel audit.
+/// `TURBO_LEAN_EARLY_IMPORT_POLICY=off|0|false` restores the legacy decide-inside-the-audit path
+/// (including the expensive per-entry verified-csimp closure replay for unlisted entries).
+pub fn early_import_policy_enabled() -> bool {
+    match std::env::var(EARLY_IMPORT_POLICY_ENV) {
+        Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false"),
+        Err(_) => true,
+    }
+}
+
+/// One `@[csimp]` / `local csimp` posture entry as the worker reports it: the parsed
+/// public-signature observation plus the decision-relevant facts the worker computed in-kernel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostureCsimpEntry {
+    pub observation: CompiledCsimpObservation,
+    /// `Lean.privateToUserName` of the replacement theorem (what the allowlist naturally names).
+    pub thm_user_name: String,
+    /// The entry is a real theorem whose statement proves exactly this `(from, to)` replacement.
+    pub strict: bool,
+    /// Any of the entry's names is owned by an audited target module.
+    pub touches_target: bool,
+}
+
+/// One compiled module's csimp posture plus its direct imports (the `#455` scan's input).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportPostureModule {
+    pub module: String,
+    /// The module is `Init.*` inside the toolchain sysroot (the audit's baseline exemption).
+    pub init_sysroot: bool,
+    pub imports: Vec<String>,
+    pub csimp: Vec<PostureCsimpEntry>,
+}
+
+/// An unsafe declaration that failed every structural exemption of the full audit; only the
+/// allowlist half of the decision is left.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostureUnsafeCandidate {
+    pub raw: String,
+    pub user: String,
+    /// `false` for compiler-generated `_unsafe_rec` twins, which no name pattern may admit.
+    pub pattern_allowable: bool,
+    /// The audit would offer the `[unsafe] allow` knob for this declaration.
+    pub can_allow: bool,
+    /// Safe-wrapper parents whose `[unsafe] allow` listing admits this declaration.
+    pub wrapper_names: Vec<String>,
+}
+
+/// An `@[extern]` / `@[implemented_by]` bypass that failed every structural exemption.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostureBridgeCandidate {
+    pub raw: String,
+    pub user: String,
+    pub is_extern: bool,
+    pub is_implemented_by: bool,
+    /// From the module's `extraConstNames` (the audit's "auxiliary" wording).
+    pub auxiliary: bool,
+    /// Safe-wrapper parents whose `[unsafe] allow` listing admits this bypass.
+    pub wrapper_names: Vec<String>,
+}
+
+/// Per-target-module posture candidates (the modules the audit was asked to cover).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportPostureTarget {
+    pub module: String,
+    pub axioms: Vec<String>,
+    pub unsafe_inductives: Vec<String>,
+    pub unsafe_decls: Vec<PostureUnsafeCandidate>,
+    pub bridge_decls: Vec<PostureBridgeCandidate>,
+}
+
+/// The four allowlists of the import policy. `axioms` is the full effective list including the
+/// standard axioms (the caller builds it, e.g. from `splitter::allowed_axioms()`); the other three
+/// are the raw `turbo-lean.toml` `allow` globs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportPolicyAllowlists {
+    pub axioms: Vec<String>,
+    pub csimp: Vec<String>,
+    pub unsafe_decls: Vec<String>,
+    pub implemented_by: Vec<String>,
+}
+
+/// The decided import-policy outcome: empty `violations` means every posture is allowlisted (or
+/// structurally exempt) and the expensive audit may proceed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportPolicyDecision {
+    pub violations: Vec<String>,
+}
+
+/// `*`-glob match, byte-for-byte the worker's `globMatch` semantics (kept local so the
+/// `#[path]`-included copy of this file in `tests/pluggable_kernel_cli.rs` needs no extra stubs).
+fn import_policy_glob_match(pat: &str, s: &str) -> bool {
+    match pat.split_once('*') {
+        None => pat == s,
+        Some((head, rest)) => {
+            s.starts_with(head)
+                && (0..=s.len() - head.len())
+                    .filter(|i| s.is_char_boundary(head.len() + i))
+                    .any(|i| import_policy_glob_match(rest, &s[head.len() + i..]))
+        }
+    }
+}
+
+fn name_matches_import_policy(patterns: &[String], raw: &str, user: &str) -> bool {
+    patterns
+        .iter()
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .any(|p| import_policy_glob_match(p, raw) || import_policy_glob_match(p, user))
+}
+
+fn import_policy_axiom_allowed(ax: &str, axioms: &[String]) -> bool {
+    ax != "sorryAx"
+        && ax != "Lean.trustCompiler"
+        && axioms
+            .iter()
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .any(|p| import_policy_glob_match(p, ax))
+}
+
+fn import_policy_knob_hint(policy: &str, name: &str) -> String {
+    format!("; configure [{policy}] allow = [\"{name}\"] in turbo-lean.toml")
+}
+
+/// Apply the import-policy decision table (module docs above) to a scanned posture.
+pub fn decide_import_posture_policy(
+    targets: &[ImportPostureTarget],
+    modules: &BTreeMap<String, ImportPostureModule>,
+    target_modules: &BTreeSet<String>,
+    lists: &ImportPolicyAllowlists,
+) -> ImportPolicyDecision {
+    let mut violations = Vec::new();
+    for t in targets {
+        for ax in &t.axioms {
+            if !import_policy_axiom_allowed(ax, &lists.axioms) {
+                violations.push(format!(
+                    "[TurboLean.KernelGate] custom axiom `{ax}` in `{}` is forbidden{}",
+                    t.module,
+                    import_policy_knob_hint("axioms", ax)
+                ));
+            }
+        }
+        for ind in &t.unsafe_inductives {
+            violations.push(format!(
+                "[TurboLean.KernelGate] unsafe inductive `{ind}` in `{}` is forbidden",
+                t.module
+            ));
+        }
+        for c in &t.unsafe_decls {
+            let allowed = (c.pattern_allowable
+                && name_matches_import_policy(&lists.unsafe_decls, &c.raw, &c.user))
+                || c.wrapper_names
+                    .iter()
+                    .any(|w| name_matches_import_policy(&lists.unsafe_decls, w, w));
+            if !allowed {
+                let hint = if c.can_allow {
+                    import_policy_knob_hint("unsafe", &c.user)
+                } else {
+                    String::new()
+                };
+                violations.push(format!(
+                    "[TurboLean.KernelGate] unsafe declaration `{}` in `{}` is forbidden{hint}",
+                    c.raw, t.module
+                ));
+            }
+        }
+        for b in &t.bridge_decls {
+            let allowed = (!b.is_extern
+                && name_matches_import_policy(&lists.implemented_by, &b.raw, &b.user))
+                || b.wrapper_names
+                    .iter()
+                    .any(|w| name_matches_import_policy(&lists.unsafe_decls, w, w));
+            if !allowed {
+                let aux = if b.auxiliary { " auxiliary" } else { "" };
+                let hint = if !b.is_extern && b.is_implemented_by {
+                    import_policy_knob_hint("implemented_by", &b.user)
+                } else {
+                    String::new()
+                };
+                violations.push(format!(
+                    "[TurboLean.KernelGate] extern/implemented_by bypass on{aux} `{}` in `{}` is forbidden{hint}",
+                    b.raw, t.module
+                ));
+            }
+        }
+    }
+    for (owner, m) in modules {
+        for e in &m.csimp {
+            let toolchain_baseline =
+                m.init_sysroot && !target_modules.contains(owner) && !e.touches_target;
+            if toolchain_baseline {
+                continue;
+            }
+            let allowed = e.strict
+                && name_matches_import_policy(
+                    &lists.csimp,
+                    &e.observation.theorem,
+                    &e.thm_user_name,
+                );
+            if !allowed {
+                violations.push(format!(
+                    "[TurboLean.KernelGate] csimp replacement `{}` ({} -> {}) touching `{owner}` is forbidden{}",
+                    e.observation.theorem,
+                    e.observation.from,
+                    e.observation.to,
+                    import_policy_knob_hint("csimp", &e.thm_user_name)
+                ));
+            }
+        }
+    }
+    ImportPolicyDecision { violations }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn posture_lists(
+        csimp: &[&str],
+        unsafe_decls: &[&str],
+        implemented_by: &[&str],
+        axioms: &[&str],
+    ) -> ImportPolicyAllowlists {
+        let v = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        ImportPolicyAllowlists {
+            axioms: v(axioms),
+            csimp: v(csimp),
+            unsafe_decls: v(unsafe_decls),
+            implemented_by: v(implemented_by),
+        }
+    }
+
+    fn csimp_posture_module(
+        module: &str,
+        init_sysroot: bool,
+        entries: &[(&str, &str, &str, &str, bool, bool)],
+    ) -> ImportPostureModule {
+        ImportPostureModule {
+            module: module.to_string(),
+            init_sysroot,
+            imports: Vec::new(),
+            csimp: entries
+                .iter()
+                .map(
+                    |(theorem, from, to, user, strict, touches)| PostureCsimpEntry {
+                        observation: CompiledCsimpObservation {
+                            theorem: (*theorem).to_string(),
+                            from: (*from).to_string(),
+                            to: (*to).to_string(),
+                            scope: None,
+                        },
+                        thm_user_name: (*user).to_string(),
+                        strict: *strict,
+                        touches_target: *touches,
+                    },
+                )
+                .collect(),
+        }
+    }
+
+    fn decide_csimp_only(
+        modules: &BTreeMap<String, ImportPostureModule>,
+        targets: &BTreeSet<String>,
+        lists: &ImportPolicyAllowlists,
+    ) -> Vec<String> {
+        decide_import_posture_policy(&[], modules, targets, lists).violations
+    }
+
+    #[test]
+    fn test_import_policy_decision_table_csimp() {
+        let mut modules = BTreeMap::new();
+        modules.insert(
+            "Batteries.Data.List.Basic".to_string(),
+            csimp_posture_module(
+                "Batteries.Data.List.Basic",
+                false,
+                &[(
+                    "List.replaceF_eq_replaceFTR",
+                    "List.replaceF",
+                    "List.replaceFTR",
+                    "List.replaceF_eq_replaceFTR",
+                    true,
+                    false,
+                )],
+            ),
+        );
+        let targets: BTreeSet<String> = ["Root".to_string()].into();
+
+        // Strict proven theorem, exact user-name allowlist entry: allowed.
+        let allowed = decide_csimp_only(
+            &modules,
+            &targets,
+            &posture_lists(&["List.replaceF_eq_replaceFTR"], &[], &[], &[]),
+        );
+        assert_eq!(allowed, Vec::<String>::new());
+
+        // Strict proven theorem, `*` allowlist: allowed.
+        assert_eq!(
+            decide_csimp_only(&modules, &targets, &posture_lists(&["*"], &[], &[], &[])),
+            Vec::<String>::new()
+        );
+
+        // Strict proven theorem, no allowlist: forbidden, early, naming the knob.
+        let refused = decide_csimp_only(&modules, &targets, &posture_lists(&[], &[], &[], &[]));
+        assert_eq!(refused.len(), 1, "unlisted csimp entry must be refused: {refused:?}");
+        assert!(
+            refused[0].contains(
+                "csimp replacement `List.replaceF_eq_replaceFTR` (List.replaceF -> List.replaceFTR) \
+                 touching `Batteries.Data.List.Basic` is forbidden"
+            ),
+            "violation must mirror the audit wording: {}",
+            refused[0]
+        );
+        assert!(
+            refused[0].contains("[csimp] allow = [\"List.replaceF_eq_replaceFTR\"]"),
+            "violation must name the turbo-lean.toml knob: {}",
+            refused[0]
+        );
+
+        // A non-strict entry is never allowlistable, even under `*`.
+        let mut non_strict = modules.clone();
+        non_strict
+            .get_mut("Batteries.Data.List.Basic")
+            .unwrap()
+            .csimp[0]
+            .strict = false;
+        let refused_non_strict =
+            decide_csimp_only(&non_strict, &targets, &posture_lists(&["*"], &[], &[], &[]));
+        assert_eq!(
+            refused_non_strict.len(),
+            1,
+            "a non-strict csimp entry must stay forbidden under `*`: {refused_non_strict:?}"
+        );
+
+        // Toolchain `Init.*` sysroot baseline: exempt while it does not touch a target...
+        let mut init_mod = BTreeMap::new();
+        init_mod.insert(
+            "Init.Data.Array".to_string(),
+            csimp_posture_module(
+                "Init.Data.Array",
+                true,
+                &[("Init.thm", "Init.slow", "Init.fast", "Init.thm", true, false)],
+            ),
+        );
+        assert_eq!(
+            decide_csimp_only(&init_mod, &targets, &posture_lists(&[], &[], &[], &[])),
+            Vec::<String>::new()
+        );
+        // ...but not when it touches an audited target.
+        init_mod.get_mut("Init.Data.Array").unwrap().csimp[0].touches_target = true;
+        assert_eq!(
+            decide_csimp_only(&init_mod, &targets, &posture_lists(&[], &[], &[], &[])).len(),
+            1,
+            "an Init-sysroot entry touching a target is not baseline-exempt"
+        );
+    }
+
+    #[test]
+    fn test_import_policy_decision_table_unsafe_and_bridge() {
+        let lists_none = posture_lists(&[], &[], &[], &[]);
+        let target = |unsafe_decls: Vec<PostureUnsafeCandidate>,
+                      bridge_decls: Vec<PostureBridgeCandidate>,
+                      unsafe_inductives: Vec<String>| ImportPostureTarget {
+            module: "Batteries.Tactic.Lint.Basic".to_string(),
+            axioms: Vec::new(),
+            unsafe_inductives,
+            unsafe_decls,
+            bridge_decls,
+        };
+        let modules = BTreeMap::new();
+        let target_set = BTreeSet::new();
+        let decide = |t: ImportPostureTarget, lists: &ImportPolicyAllowlists| {
+            decide_import_posture_policy(&[t], &modules, &target_set, lists).violations
+        };
+
+        let unsafe_cand = PostureUnsafeCandidate {
+            raw: "_private.Batteries.Tactic.Lint.Basic.0.Batteries.Tactic.Lint.getLinter.unsafe_1"
+                .to_string(),
+            user: "Batteries.Tactic.Lint.getLinter.unsafe_1".to_string(),
+            pattern_allowable: true,
+            can_allow: true,
+            wrapper_names: Vec::new(),
+        };
+
+        // Unlisted unsafe declaration: forbidden with the [unsafe] knob named.
+        let refused = decide(target(vec![unsafe_cand.clone()], vec![], vec![]), &lists_none);
+        assert_eq!(refused.len(), 1);
+        assert!(
+            refused[0].contains("unsafe declaration")
+                && refused[0].contains("is forbidden")
+                && refused[0].contains("[unsafe] allow = [\"Batteries.Tactic.Lint.getLinter.unsafe_1\"]"),
+            "unsafe violation must name the knob: {}",
+            refused[0]
+        );
+
+        // `[unsafe] allow = ["*"]` admits it (the #412 workaround as config).
+        assert_eq!(
+            decide(
+                target(vec![unsafe_cand.clone(), ], vec![], vec![]),
+                &posture_lists(&[], &["*"], &[], &[])
+            ),
+            Vec::<String>::new()
+        );
+
+        // A compiler-generated `_unsafe_rec` twin is never admitted by name, even under `*`...
+        let mut rec_twin = unsafe_cand.clone();
+        rec_twin.pattern_allowable = false;
+        rec_twin.can_allow = false;
+        let refused_twin = decide(
+            target(vec![rec_twin.clone()], vec![], vec![]),
+            &posture_lists(&[], &["*"], &[], &[]),
+        );
+        assert_eq!(refused_twin.len(), 1);
+        assert!(
+            !refused_twin[0].contains("[unsafe] allow ="),
+            "no knob hint when the audit would not offer one: {}",
+            refused_twin[0]
+        );
+        // ...but an allowlisted safe-wrapper parent admits it.
+        rec_twin.wrapper_names = vec!["Batteries.SafeWrapper".to_string()];
+        assert_eq!(
+            decide(
+                target(vec![rec_twin], vec![], vec![]),
+                &posture_lists(&[], &["Batteries.SafeWrapper"], &[], &[])
+            ),
+            Vec::<String>::new()
+        );
+
+        // implemented_by bypass: [implemented_by] allow admits; unlisted is forbidden with knob.
+        let impl_by = PostureBridgeCandidate {
+            raw: "_private.Batteries.Tactic.Lint.Basic.0.Batteries.Tactic.Lint.getLinter.unsafe_impl_2"
+                .to_string(),
+            user: "Batteries.Tactic.Lint.getLinter.unsafe_impl_2".to_string(),
+            is_extern: false,
+            is_implemented_by: true,
+            auxiliary: false,
+            wrapper_names: Vec::new(),
+        };
+        let refused_impl = decide(target(vec![], vec![impl_by.clone()], vec![]), &lists_none);
+        assert_eq!(refused_impl.len(), 1);
+        assert!(
+            refused_impl[0].contains("extern/implemented_by bypass on `")
+                && refused_impl[0].contains("[implemented_by] allow = [\"Batteries.Tactic.Lint.getLinter.unsafe_impl_2\"]"),
+            "implemented_by violation must name the knob: {}",
+            refused_impl[0]
+        );
+        assert_eq!(
+            decide(
+                target(vec![], vec![impl_by.clone()], vec![]),
+                &posture_lists(&[], &[], &["*"], &[])
+            ),
+            Vec::<String>::new()
+        );
+
+        // An `@[extern]` bypass is never [implemented_by]-listable; a wrapper under [unsafe] is
+        // the only admission, and the auxiliary wording is kept.
+        let extern_cand = PostureBridgeCandidate {
+            raw: "Solidity.externBridge".to_string(),
+            user: "Solidity.externBridge".to_string(),
+            is_extern: true,
+            is_implemented_by: false,
+            auxiliary: true,
+            wrapper_names: vec!["Solidity.SafeBridge".to_string()],
+        };
+        let refused_extern = decide(
+            target(vec![], vec![extern_cand.clone()], vec![]),
+            &posture_lists(&[], &[], &["*"], &[]),
+        );
+        assert_eq!(refused_extern.len(), 1);
+        assert!(
+            refused_extern[0].contains("bypass on auxiliary `Solidity.externBridge`")
+                && !refused_extern[0].contains("[implemented_by] allow ="),
+            "extern bypass must keep the auxiliary wording and offer no implemented_by knob: {}",
+            refused_extern[0]
+        );
+        assert_eq!(
+            decide(
+                target(vec![], vec![extern_cand], vec![]),
+                &posture_lists(&[], &["Solidity.SafeBridge"], &[], &[])
+            ),
+            Vec::<String>::new()
+        );
+
+        // An unsafe inductive is always forbidden.
+        let refused_ind = decide(
+            target(vec![], vec![], vec!["Evil.UnsafeInd".to_string()]),
+            &posture_lists(&["*"], &["*"], &["*"], &["*"]),
+        );
+        assert_eq!(refused_ind.len(), 1);
+        assert!(refused_ind[0].contains("unsafe inductive `Evil.UnsafeInd`"));
+    }
+
+    #[test]
+    fn test_import_policy_decision_table_axioms() {
+        let modules = BTreeMap::new();
+        let target_set = BTreeSet::new();
+        let t = |axioms: &[&str]| ImportPostureTarget {
+            module: "Proj.Axioms".to_string(),
+            axioms: axioms.iter().map(|s| s.to_string()).collect(),
+            unsafe_inductives: Vec::new(),
+            unsafe_decls: Vec::new(),
+            bridge_decls: Vec::new(),
+        };
+        let std_lists = posture_lists(
+            &[],
+            &[],
+            &[],
+            &["propext", "Quot.sound", "Classical.choice"],
+        );
+
+        // Standard axioms pass under the standard list; a custom one is refused naming the knob.
+        assert_eq!(
+            decide_import_posture_policy(&[t(&["propext"])], &modules, &target_set, &std_lists)
+                .violations,
+            Vec::<String>::new()
+        );
+        let refused = decide_import_posture_policy(
+            &[t(&["Proj.customAx"])],
+            &modules,
+            &target_set,
+            &std_lists,
+        )
+        .violations;
+        assert_eq!(refused.len(), 1);
+        assert!(
+            refused[0].contains("custom axiom `Proj.customAx` in `Proj.Axioms` is forbidden")
+                && refused[0].contains("[axioms] allow = [\"Proj.customAx\"]"),
+            "axiom violation must name the knob: {}",
+            refused[0]
+        );
+
+        // `sorryAx` and `Lean.trustCompiler` are hard-refused even under `*`.
+        let star = posture_lists(&[], &[], &[], &["*"]);
+        assert_eq!(
+            decide_import_posture_policy(
+                &[t(&["sorryAx", "Lean.trustCompiler"])],
+                &modules,
+                &target_set,
+                &star
+            )
+            .violations
+            .len(),
+            2
+        );
+        // ...while `*` admits an ordinary custom axiom.
+        assert_eq!(
+            decide_import_posture_policy(&[t(&["Proj.customAx"])], &modules, &target_set, &star)
+                .violations,
+            Vec::<String>::new()
+        );
+    }
 
     #[test]
     fn test_kernel_selection_parsing_and_canonical_aliases() {
