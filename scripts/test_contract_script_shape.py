@@ -26,12 +26,14 @@ CONTRACT_SH = SCRIPTS_DIR / "verify_roadmap_contract.sh"
 CONTRACT_D = SCRIPTS_DIR / "contract.d"
 
 # The gate headers exactly as the unmodified script prints them, in order.
-# Ten numbered gates plus the "[2b/10]" sub-gate of gate 2.
+# Ten numbered gates plus the "[2b/10]" sub-gate of gate 2 and the "[3b/10]"
+# H1.1 differential sub-gate of gate 3.
 EXPECTED_GATE_HEADERS = [
     "=== [1/10] Spec & Documentation Pinning Ratchet (Contract V1) ===",
     "=== [2/10] Multi-Hop Vacuity, Tightness & Packing Audit (audit-spec v2) ===",
     "=== [2b/10] Configurable Anti-Reward-Hacking & Shadow-Namespace Gate (audit-spec v2.1, Contract V1/V2/V3) ===",
     "=== [3/10] In-Kernel Transitive Axiom Gate (Lean.collectAxioms) ===",
+    "=== [3b/10] H1.1 Differential LCNF Interpreter Gate (RealLCNFSemantics vs compiled Lean reference) ===",
     "=== [4/10] Verified Pass Contract & Bridge/CoreCLI Hygiene Gate (Contract V2, M4 & M5) ===",
     "=== [5/10] Segregated Plugin & Adversarial Mutant Gate (Law 1) ===",
     "=== [6/10] 3-Way Differential Conformance Suite (C1, Provisioned C2 Lake Packages, C4), Grammar-Guided LCNF Fuzzer & P0 Trust Boundary ===",
@@ -56,6 +58,7 @@ EXPECTED_FRAGMENT_NAMES = [
     "20_audit_spec_v2.sh",
     "21_audit_spec_strict_proofs.sh",
     "30_axiom_gate.sh",
+    "35_h11_lcnf_differential.sh",
     "40_verified_pass_hygiene.sh",
     "50_plugin_mutant_gate.sh",
     "60_conformance_fuzz_trust.sh",
@@ -73,6 +76,7 @@ EXPECTED_FRAGMENT_HASHES = {
     "20_audit_spec_v2.sh": "e0e9df7c3c15bc028155d847c77c6f142f47ac73806f5fc0c4d0c5304ef9b951",
     "21_audit_spec_strict_proofs.sh": "d0c073cae6410d0092a388ff404b2cacaea2e112f1639fe93796af0c066fd15f",
     "30_axiom_gate.sh": "49e36170e63217edc80887b8d26cb6b199b079596de0abdc54bd6e4104a8f60a",
+    "35_h11_lcnf_differential.sh": "55cacb9004d575aaa08d9a9ab3a6e4d3cce746ba87cd7fcb736f0ea6203a9828",
     "40_verified_pass_hygiene.sh": "7cbb8ca4782a952d9a2e31466de6d6677273a9f7a49e9386cb3be086d1d997e0",
     "50_plugin_mutant_gate.sh": "d7463ec4943426b4e235e6706eac9e49f4def2e2eec02437c8b510948763ea43",
     "60_conformance_fuzz_trust.sh": "fdb3048842442b9a5a3b2f7ee69bcf743afbef69e7f921470c28cfcc688ec10f",

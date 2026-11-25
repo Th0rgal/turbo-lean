@@ -1,6 +1,6 @@
 import LeanNative.IR.Types
 import LeanNative.IR.AST
-import LeanNative.IR.RealLCNFBridge
+import LeanNative.IR.RealLCNFShared
 import LeanNative.Semantics.Value
 import Lean.Compiler.LCNF.Basic
 
