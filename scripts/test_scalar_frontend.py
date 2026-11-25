@@ -10,6 +10,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fuzz_lcnf_conformance as fuzzer
 
+# Pin the repo toolchain for every child this module spawns (lean, lake, leanc,
+# lean-native): a source file in a temp dir outside the repo otherwise resolves
+# elan's DEFAULT toolchain (measured: `incompatible header ... Init.olean`).
+_TOOLCHAIN_PIN = fuzzer.repo_pinned_toolchain()
+if _TOOLCHAIN_PIN:
+    os.environ["ELAN_TOOLCHAIN"] = _TOOLCHAIN_PIN
+
 SPEC_LEAN = fuzzer.ROOT / "lean" / "LeanNative" / "Spec.lean"
 
 

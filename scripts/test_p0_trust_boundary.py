@@ -48,6 +48,13 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import fuzz_lcnf_conformance as fuzzer  # noqa: E402
 
+# Pin the repo toolchain for every child this module spawns (lean-native
+# elaborates Lean sources in temp dirs and otherwise resolves elan's DEFAULT
+# toolchain, failing with an incompatible Init.olean header).
+_TOOLCHAIN_PIN = fuzzer.repo_pinned_toolchain()
+if _TOOLCHAIN_PIN:
+    os.environ["ELAN_TOOLCHAIN"] = _TOOLCHAIN_PIN
+
 CORE_BIN = ROOT / "lean" / ".lake" / "build" / "bin" / "lean-native-core"
 
 

@@ -672,6 +672,7 @@ def run_c2_corpus(cli_dir: str | None, asan: bool, ubsan: bool) -> dict[str, Any
             stock_bin = work_pkg / "stock_runner"
             subprocess.run(
                 [leanc_bin, "-O2", *c_units, str(stock_drv_c), "-o", str(stock_bin)],
+                env=sub_env,
                 check=True,
                 capture_output=True,
                 text=True,
@@ -881,7 +882,7 @@ def run_c1_corpus(asan: bool, ubsan: bool) -> dict[str, Any]:
             "-v",
             *(f"scripts.test_scalar_frontend.{name}" for name in C1_CORPUS_TESTS),
         ]
-        sub_env = dict(os.environ)
+        sub_env = fuzz.pinned_toolchain_env()
         sub_env["TURBO_CONFORMANCE_ASAN"] = "1" if asan else "0"
         sub_env["TURBO_CONFORMANCE_UBSAN"] = "1" if ubsan else "0"
         sub_env["TURBO_C1_RECEIPT_FILE"] = str(receipt_path)

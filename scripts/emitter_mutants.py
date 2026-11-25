@@ -214,6 +214,14 @@ def prepare_env(root: Path, turbo_home: Path) -> dict[str, str]:
     env["CARGO_TARGET_DIR"] = str(root / "target")
     turbo_home.mkdir(parents=True, exist_ok=True)
     env["TURBO_LEAN_HOME"] = str(turbo_home)
+    # Pin elan-shimmed children (lean / lake) to the repo toolchain so a child
+    # running outside the repo never resolves elan's default toolchain.
+    try:
+        toolchain_pin = (root / "lean" / "lean-toolchain").read_text(encoding="utf-8").strip()
+    except OSError:
+        toolchain_pin = ""
+    if toolchain_pin:
+        env["ELAN_TOOLCHAIN"] = toolchain_pin
     prefix = [
         str(root / "lean/.lake/build/bin"),
         str(root / "target/release"),
