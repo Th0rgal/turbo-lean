@@ -223,6 +223,12 @@ impl WorkerBudget {
     /// Shrink the replay closure batch cap when the per-worker budget is tight: one module
     /// per replay process below 2 GiB per worker, at most 8 modules below 4 GiB, else
     /// `base_cap` unchanged.
+    ///
+    /// Heuristic pending measurement (#435 review, item 5): a `--kernel-replay-closure`
+    /// process loads the transitive import closure of its slice, which usually dominates
+    /// the worker's memory whatever the slice length, so a `batch_cap < 32` may not lower
+    /// the peak; it trades process count for a chance at smaller import regions between
+    /// batches.
     pub fn replay_batch_cap(&self, base_cap: usize, parallelism: usize) -> usize {
         match self.per_worker_rlimit_mb(parallelism) {
             Some(mb) if mb < 2048 => 1,

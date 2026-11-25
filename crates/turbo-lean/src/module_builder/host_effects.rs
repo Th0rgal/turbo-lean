@@ -906,9 +906,12 @@ pub(super) type StagedModuleCompileOutput = (i64, String, TempDirGuard);
 /// environment key), clamped in untrusted mode to `[15, 600]` so heavy proof modules do not
 /// spuriously fail on shared 4-vCPU CI runners while untrusted builds remain bounded.
 ///
-/// With no explicit setting the trusted default is adaptive (#437): `max(300 s, 3 × the
-/// last recorded compile duration)` when the caller knows one, else 1800 s — a flat 300 s
-/// killed legitimate proof-heavy modules that take over 400 s.
+/// With no explicit setting the trusted default is 1800 s — a flat 300 s killed legitimate
+/// proof-heavy modules that take over 400 s. The `last_duration_ms` parameter implements
+/// the adaptive `max(300 s, 3 × the last recorded compile duration)` policy (#437) for a
+/// caller that knows one; no production call site passes a duration yet (they all route
+/// through `module_compile_timeout_secs_from` with `None`) — the scheduler's cached action
+/// durations (`get_cached_action_duration_ms`) are the intended source.
 pub(crate) fn module_compile_timeout_secs_with_history(
     raw_env: Option<&str>,
     is_untrusted: bool,
