@@ -45,6 +45,36 @@ pub(super) const ZYGOTE_EMBEDDED_MODULES: &[EmbeddedZygoteModule] = &[
         emit_olean: true,
         c_opt: "-O3",
     },
+    // S3b-M revised decomposition (review 9f6cb6dc): only the shim-free public-only
+    // ranges live in submodules (`Env`, `Wire`, `KernelAudit`). The shim block (whose
+    // private `formatReducibilityStatus` is consumed by the root signature-audit code),
+    // the replay/compiler/signature/hotspot ranges and root `main` stay in the
+    // entrypoint barrel, keeping compiled private mangling and public order
+    // baseline-exact. The manifest is the write/compile order: every submodule imports
+    // only earlier entries, so each emits its `.olean` into the scratch `LEAN_PATH`
+    // before its importers compile. All worker submodules keep the monolith's `-O0`
+    // (`c_opt`). The entrypoint barrel `TurboLean.ZygoteWorker` stays last.
+    EmbeddedZygoteModule {
+        module: "TurboLean.ZygoteWorker.Env",
+        rel_path: "TurboLean/ZygoteWorker/Env.lean",
+        src: include_str!("../../../../lean/TurboLean/ZygoteWorker/Env.lean"),
+        emit_olean: true,
+        c_opt: "-O0",
+    },
+    EmbeddedZygoteModule {
+        module: "TurboLean.ZygoteWorker.Wire",
+        rel_path: "TurboLean/ZygoteWorker/Wire.lean",
+        src: include_str!("../../../../lean/TurboLean/ZygoteWorker/Wire.lean"),
+        emit_olean: true,
+        c_opt: "-O0",
+    },
+    EmbeddedZygoteModule {
+        module: "TurboLean.ZygoteWorker.KernelAudit",
+        rel_path: "TurboLean/ZygoteWorker/KernelAudit.lean",
+        src: include_str!("../../../../lean/TurboLean/ZygoteWorker/KernelAudit.lean"),
+        emit_olean: true,
+        c_opt: "-O0",
+    },
     EmbeddedZygoteModule {
         module: "TurboLean.ZygoteWorker",
         rel_path: "TurboLean/ZygoteWorker.lean",
@@ -1996,6 +2026,55 @@ mod worker_embed_tests {
             "compile-list object stems must be unique: {stems:?}"
         );
         let _ = fs::remove_dir_all(&scratch);
+    }
+
+    /// S3b-M: the pure Lean move splits `TurboLean.ZygoteWorker` into dependency-ordered
+    /// submodules under `TurboLean/ZygoteWorker/`. Every new submodule must be embedded in
+    /// `ZYGOTE_EMBEDDED_MODULES`, in dependency chain order, strictly before the
+    /// `TurboLean.ZygoteWorker` entrypoint, emitting an `.olean` for later submodules, and
+    /// participating in the zygote binary cache key (a 1-byte source edit must change it).
+    #[test]
+    fn zygote_worker_split_submodules_manifest_and_cache_key() {
+        const SUBMODULES: [&str; 3] = [
+            "TurboLean/ZygoteWorker/Env.lean",
+            "TurboLean/ZygoteWorker/Wire.lean",
+            "TurboLean/ZygoteWorker/KernelAudit.lean",
+        ];
+        let pos_of = |rel: &str| {
+            ZYGOTE_EMBEDDED_MODULES
+                .iter()
+                .position(|m| m.rel_path == rel)
+                .unwrap_or_else(|| panic!("ZYGOTE_EMBEDDED_MODULES entry missing for {rel} (S3b-M submodule split)"))
+        };
+        let mut prev = 0;
+        for rel in SUBMODULES {
+            let pos = pos_of(rel);
+            assert!(pos > prev, "{rel} must appear in dependency chain order");
+            prev = pos;
+        }
+        let entrypoint = pos_of("TurboLean/ZygoteWorker.lean");
+        assert!(
+            prev < entrypoint,
+            "all ZygoteWorker submodules must precede the TurboLean.ZygoteWorker entrypoint"
+        );
+        let lean_bin = Path::new("/tmp/fake-lean");
+        let base_key = compute_zygote_bin_name(lean_bin, Some("v4.35.0"), ZYGOTE_EMBEDDED_MODULES);
+        for rel in SUBMODULES {
+            let idx = pos_of(rel);
+            let m = &ZYGOTE_EMBEDDED_MODULES[idx];
+            assert!(m.emit_olean, "{rel} must emit an .olean for later submodules");
+            assert!(!m.src.is_empty(), "{rel} must embed a non-empty source");
+            let mut mutated = ZYGOTE_EMBEDDED_MODULES.to_vec();
+            let mut bumped = mutated[idx].src.as_bytes().to_vec();
+            bumped[0] ^= 1;
+            mutated[idx].src =
+                Box::leak(String::from_utf8_lossy(&bumped).into_owned().into_boxed_str());
+            assert_ne!(
+                base_key,
+                compute_zygote_bin_name(lean_bin, Some("v4.35.0"), &mutated),
+                "1-byte edit in {rel} must change the zygote binary cache key"
+            );
+        }
     }
 }
 
