@@ -2569,6 +2569,30 @@ pub struct StandaloneOleanOverlay {
     pub(super) _scratch: crate::check::PrivateScratchDir,
 }
 
+/// Stage one package build artifact into the standalone re-check staging tree.
+/// `allow_hardlink` is false when `.lake` link counts and `ctime` must stay
+/// untouched (`--no-auto-worktree-link` worktrees).
+pub(super) fn stage_artifact_link(
+    src: &Path,
+    dst: &Path,
+    allow_hardlink: bool,
+) -> std::io::Result<()> {
+    if allow_hardlink && fs::hard_link(src, dst).is_ok() {
+        return Ok(());
+    }
+    // Never fall back to a byte copy of package artifacts (#440): a staging dir
+    // on another filesystem (tmpfs) failed every hard link and silently copied
+    // the whole dependency `.olean` tree into /dev/shm (6.4 GB of Mathlib,
+    // charged to the cgroup). A symlink costs no bytes and leaves the source's
+    // link count and `ctime` untouched, which also covers the
+    // `.lake`-preserving (`allow_hardlink == false`) case.
+    #[cfg(unix)]
+    if src.is_absolute() {
+        return std::os::unix::fs::symlink(src, dst);
+    }
+    fs::copy(src, dst).map(|_| ())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn check_and_audit_standalone_modules(
     store_opt: Option<&TurboStore>,
@@ -2780,9 +2804,7 @@ pub(super) fn check_and_audit_standalone_modules(
                     if let Some(parent) = dst_p.parent() {
                         fs::create_dir_all(parent)?;
                     }
-                    if pkg_preserve_lake || fs::hard_link(&p, &dst_p).is_err() {
-                        fs::copy(&p, &dst_p)?;
-                    }
+                    stage_artifact_link(&p, &dst_p, !pkg_preserve_lake)?;
                 }
             }
         }

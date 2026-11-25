@@ -4627,3 +4627,46 @@ public def api := by
         let _ = crate::lake_build::run_hydrate_traces_command as fn(bool, PathBuf) -> Result<()>;
         assert!(!crate::validate_lnir_expr_v1_blob(b""));
     }
+
+    /// Regression test for #440: the standalone re-check staging tree must not
+    /// fall back to byte copies of dependency artifacts (a tmpfs staging dir
+    /// made every hard link fail cross-device and copied 6.4 GB of dependency
+    /// `.olean`s into /dev/shm). When a hard link is not taken — cross-device,
+    /// or a `.lake`-preserving worktree — the artifact is staged as a symlink.
+    #[cfg(unix)]
+    #[test]
+    fn standalone_recheck_stages_artifacts_without_tree_copies() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!(
+            "turbo-standalone-stage-{}-{}",
+            std::process::id(),
+            crate::pack::next_tmp_id()
+        ));
+        fs::create_dir_all(&dir)?;
+        let src = dir.join("Foo.olean");
+        fs::write(&src, b"olean-bytes")?;
+
+        // `.lake`-preserving / cross-device shape: no hard link taken.
+        let dst = dir.join("staged").join("Foo.olean");
+        fs::create_dir_all(dst.parent().unwrap())?;
+        super::freshness::stage_artifact_link(&src, &dst, false)?;
+        let meta = fs::symlink_metadata(&dst)?;
+        assert!(
+            meta.file_type().is_symlink(),
+            "expected a symlink into the package build dir, found a {}-byte copy",
+            meta.len()
+        );
+        assert_eq!(fs::read(&dst)?, b"olean-bytes");
+        // The source's `.lake` metadata stays untouched: link count still 1.
+        assert_eq!(fs::metadata(&src)?.nlink(), 1);
+
+        // Same-device with hard links allowed: a hard link (same inode), no copy.
+        let dst2 = dir.join("staged").join("Bar.olean");
+        super::freshness::stage_artifact_link(&src, &dst2, true)?;
+        let meta2 = fs::symlink_metadata(&dst2)?;
+        assert!(!meta2.file_type().is_symlink());
+        assert_eq!(meta2.ino(), fs::metadata(&src)?.ino());
+
+        let _ = fs::remove_dir_all(&dir);
+        Ok(())
+    }
