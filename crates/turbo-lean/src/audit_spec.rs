@@ -3849,6 +3849,14 @@ pub(super) fn run_kernel_witness_probe(
         .iter()
         .map(|n| format!("_root_.{n}"))
         .collect();
+    if let Ok(dump_dir) = std::env::var("TURBO_LEAN_AUDIT_KERNEL_WITNESS_DEBUG_DIR") {
+        if !dump_dir.trim().is_empty() {
+            let dir = PathBuf::from(dump_dir.trim());
+            let _ = fs::create_dir_all(&dir);
+            let tag = blake3::hash(probe_src.as_bytes()).to_hex();
+            let _ = fs::write(dir.join(format!("kw_probe_{}.lean", &tag[..12])), probe_src);
+        }
+    }
     let ok = crate::zygote::run_audited_lean_shard_with_sorry_report(
         &store,
         Path::new(&lean_bin),

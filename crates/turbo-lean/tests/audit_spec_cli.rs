@@ -1818,9 +1818,15 @@ fn audit_spec_kernel_witness_replay_certifies_or_reports_unavailable() {
         .map(|o| o.status.success())
         .unwrap_or(false);
     let fx = AuditSpecFixture::new("kw_replay");
+    // `kw_chk`'s conclusion unfolds to `p && !q = false`, whose textual form re-parses in
+    // Lean with `=` tighter than `&&` (a type error): the kernel probe must therefore
+    // replay the RAW conclusion and let the kernel delta-unfold `chk` itself.
     let spec = fx.write(
         "KwReplay.lean",
-        "theorem kw_succ_pred (n : Nat) (h : 1 ≤ n) : n - 1 + 1 = n := by omega\n",
+        "theorem kw_succ_pred (n : Nat) (h : 1 ≤ n) : n - 1 + 1 = n := by omega\n\
+         def chk (p q : Bool) : Bool := p && !q\n\
+         theorem kw_chk (p q : Bool) (h : p ≤ q) : chk p q = false := by\n\
+           revert h; cases p <;> cases q <;> decide\n",
     );
     let out = fx
         .cli("kw-on")
@@ -1849,6 +1855,12 @@ fn audit_spec_kernel_witness_replay_certifies_or_reports_unavailable() {
             spec0["witness_provenance"].as_str(),
             Some("kernel_certified_two_sided"),
             "{json}"
+        );
+        let chk_neg = json["specs"][1]["neg_witness"].as_str().unwrap_or("");
+        assert!(
+            chk_neg.starts_with("kernel_certified_refuted_postcondition("),
+            "a local-def conclusion must kernel-replay via its RAW text (kernel-side \
+             delta unfolding), got: {chk_neg}\n{json}"
         );
     } else {
         assert!(
