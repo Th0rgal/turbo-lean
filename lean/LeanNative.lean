@@ -7,6 +7,7 @@ import LeanNative.Proofs.AxiomAudit
 import LeanNative.Tests.RealLCNFBridgeTests
 import LeanNative.Tests.LedgerEmbedded32Tests
 import LeanNative.Tests.EvalLCNFCLITests
+import LeanNative.Tests.RealLCNFSeparationPin
 
 namespace LeanNative
 
