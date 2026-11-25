@@ -42,7 +42,6 @@ import argparse
 import hashlib
 import json
 import os
-import platform
 import shutil
 import subprocess
 import sys
@@ -53,6 +52,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fuzz_lcnf_conformance as fuzz_san
+import host_arch
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CORE_BIN = ROOT / "lean" / ".lake" / "build" / "bin" / "lean-native-core"
@@ -62,7 +62,7 @@ DEFAULT_CORE_BIN = ROOT / "lean" / ".lake" / "build" / "bin" / "lean-native-core
 # spelling; the aarch64 triple/datalayout pair mirrors the Rust-side
 # `builtin_fastcheck_cpu_target` (crates/turbo-lean/src/gpu_fastcheck.rs) and
 # `TargetArch.llvmTriple`/`dataLayout` (lean/LeanNative/IR/Types.lean).
-HOST_ARCH = "arm64" if platform.machine().lower() in ("aarch64", "arm64") else "x86_64"
+HOST_ARCH = host_arch.host_target_arch()
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -978,11 +978,13 @@ class HeapObjSanitizerSelfTests(unittest.TestCase):
                 "  ret void\n"
                 "}\n"
                 "attributes #0 = { nounwind uwtable \"target-cpu\"=\"x86-64-v2\" }\n'''\n"
-                # Host-arch parameterization: on aarch64 hosts the mock emits the arm64
-                # triple/datalayout/attribute footer that `compile-llvm --arch arm64`
-                # produces; on x86_64 hosts the IR bytes are identical to the literal above.
-                "    import platform\n"
-                "    if platform.machine().lower() in ('aarch64', 'arm64'):\n"
+                # Arch parameterization keyed on the --arch argument the mock is HANDED
+                # (so the selftest can catch a regression of run_sanitizer_suite's
+                # HOST_ARCH plumbing): for arm64 the mock emits the triple/datalayout/
+                # attribute footer that `compile-llvm --arch arm64` produces; for
+                # x86_64 the IR bytes are identical to the literal above.
+                "    arch = args[args.index('--arch') + 1] if '--arch' in args else 'x86_64'\n"
+                "    if arch in ('arm64', 'aarch64'):\n"
                 "        ir = ir.replace('e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128', 'e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128')\n"
                 "        ir = ir.replace('x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu')\n"
                 "        ir = ir.replace('\"target-cpu\"=\"x86-64-v2\"', '\"target-features\"=\"+v8.2a,+neon,+fp-armv8,+fullfp16,+fp16fml,+dotprod,+lse\"')\n"
@@ -990,6 +992,21 @@ class HeapObjSanitizerSelfTests(unittest.TestCase):
                 encoding="utf-8",
             )
             mock_core.chmod(0o755)
+            # The mock must honor the --arch it is HANDED, not the machine it
+            # happens to run on; otherwise this test cannot catch a regression
+            # of the HOST_ARCH plumbing in run_sanitizer_suite.
+            for req_arch, needle in (
+                ("arm64", 'target triple = "aarch64-unknown-linux-gnu"'),
+                ("x86_64", 'target triple = "x86_64-unknown-linux-gnu"'),
+            ):
+                probe_ll = Path(tmp) / f"mock_probe.{req_arch}.ll"
+                subprocess.run(
+                    [sys.executable, str(mock_core), "compile-llvm", "--arch", req_arch, "-o", str(probe_ll)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertIn(needle, probe_ll.read_text(encoding="utf-8"))
             report = run_sanitizer_suite(core_bin_arg=str(mock_core), require_tsan=False)
             self.assertTrue(report["ok"], json.dumps(report, indent=2))
             self.assertGreater(report["asanLsnUbsanClean"]["payload"]["kernelOut"], 0)

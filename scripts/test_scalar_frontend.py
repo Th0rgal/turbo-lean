@@ -1,7 +1,6 @@
 """Actual stock-Lean/LNIR/LLVM execution; no Python result oracle."""
 import json
 import os
-import platform
 import re
 import subprocess
 import sys
@@ -10,6 +9,7 @@ import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fuzz_lcnf_conformance as fuzzer
+import host_arch
 
 _SAVED_ELAN_TOOLCHAIN = None
 _HAD_ELAN_TOOLCHAIN = False
@@ -40,7 +40,7 @@ SPEC_LEAN = fuzzer.ROOT / "lean" / "LeanNative" / "Spec.lean"
 # The primary `--arch` legs run the host CPU's TargetArch spelling; the opposite
 # CPU arch stays covered as the symmetric cross-emission leg (an arm64 host
 # cross-emits x86_64 IR, an x86_64 host cross-emits arm64 IR).
-HOST_ARCH = "arm64" if platform.machine().lower() in ("aarch64", "arm64") else "x86_64"
+HOST_ARCH = host_arch.host_target_arch()
 CROSS_ARCH = "x86_64" if HOST_ARCH == "arm64" else "arm64"
 
 # Arch-specific LLVM signature shapes for the stage-1B declarations: the x86_64
@@ -795,6 +795,34 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
             self.assertEqual(int(wasm_ev[0]["value_u64"]), (0) ^ ((0xFFFFFFFF << 1) & 0xFFFFFFFF))
             self.assertEqual(int(native_ev[0]["value_u64"]), 0x100000000 ^ ((0xFFFFFFFF << 33) & 0xFFFFFFFFFFFFFFFF))
 
+            # Cross-CPU leg on any host: eval-lnir is an interpreter path, so the
+            # x86 CI job exercises --arch arm64 here (and an arm64 host x86_64).
+            # USize is 64-bit on both CPU arches, so the expectation is identical.
+            cross_wire = tmpdir / "cross.lnir"
+            subprocess.run(
+                [full_bin, "emit-lnir", "--wire", "--arch", CROSS_ARCH, str(src_path), "-o", str(cross_wire)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            cross_ev = json.loads(
+                subprocess.check_output(
+                    [
+                        core_bin,
+                        "eval-lnir",
+                        "--lnir",
+                        str(cross_wire),
+                        "--arch",
+                        CROSS_ARCH,
+                        "--batch-json",
+                        "--args",
+                        "wasm_usize_probe:4294967295,33",
+                    ],
+                    text=True,
+                )
+            )
+            self.assertEqual(int(cross_ev[0]["value_u64"]), 0x100000000 ^ ((0xFFFFFFFF << 33) & 0xFFFFFFFFFFFFFFFF))
+
             wasm_ll = tmpdir / "wasm.ll"
             subprocess.run(
                 [core_bin, "compile-llvm", "--lnir", str(wasm_wire), "--arch", "wasm32", "-o", str(wasm_ll)],
@@ -899,9 +927,12 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
             )
             enum256_wire = tmpdir / "enum256.lnir"
             subprocess.run([full_bin, "emit-lnir", "--wire", str(enum256_src), "-o", str(enum256_wire)], check=True, capture_output=True, text=True)
-            enum256_ll = tmpdir / "enum256.ll"
-            subprocess.run([core_bin, "compile-llvm", "--lnir", str(enum256_wire), "--arch", HOST_ARCH, "-o", str(enum256_ll)], check=True, capture_output=True, text=True)
-            self.assertIn(ENUM256_IR_NEEDLE[HOST_ARCH], enum256_ll.read_text(encoding="utf-8"))
+            # Text-only emission: check BOTH CPU arches on any host, so the x86 CI
+            # job exercises the arm64 needle and an arm64 host the x86_64 one.
+            for e_arch in (HOST_ARCH, CROSS_ARCH):
+                e_ll = tmpdir / f"enum256.{e_arch}.ll"
+                subprocess.run([core_bin, "compile-llvm", "--lnir", str(enum256_wire), "--arch", e_arch, "-o", str(e_ll)], check=True, capture_output=True, text=True)
+                self.assertIn(ENUM256_IR_NEEDLE[e_arch], e_ll.read_text(encoding="utf-8"))
 
             unsup_and_valid = tmpdir / "unsup_mix.lnir"
             unsup_and_valid.write_text(

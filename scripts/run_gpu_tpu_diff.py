@@ -47,6 +47,7 @@ import unittest
 import urllib.request
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 from typing import Any
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -59,6 +60,10 @@ class HostArchSkip(RuntimeError):
 
 
 def host_machine() -> str:
+    # Deliberately raw (not host_arch.host_target_arch()): the question here is
+    # "can the pinned x86_64-only artifacts run on this machine", and the answer
+    # for every non-x86 machine (aarch64, riscv64, s390x, ...) is the same named
+    # skip, not an unsupported-host error.
     return platform.machine().lower()
 
 
@@ -67,7 +72,7 @@ def require_x86_64_pinned_artifact(component: str) -> None:
     if m not in ("x86_64", "amd64"):
         raise HostArchSkip(
             f"{component} is pinned for x86_64 only and this host is {m}; "
-            "no aarch64 artifact is pinned yet (the CUDA/ptxas leg stays x86-gated)"
+            f"no {m} artifact is pinned yet"
         )
 
 
@@ -223,7 +228,9 @@ def ensure_gpu_tpu_tools(cache_dir: Path) -> tuple[str, Path | None]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     ptxas_bin = find_ptxas(cache_dir)
     if ptxas_bin is None:
-        require_x86_64_pinned_artifact("the nvidia ptxas wheel (PTXAS_WHEEL_URL)")
+        require_x86_64_pinned_artifact(
+            "the nvidia ptxas wheel (PTXAS_WHEEL_URL; the CUDA leg stays x86-gated)"
+        )
         whl_path = cache_dir / "nvidia_cuda_nvcc_cu12-12.9.86.whl"
         download_verified(PTXAS_WHEEL_URL, whl_path, PTXAS_WHEEL_SHA256)
         out_ptxas = cache_dir / "bin" / "ptxas"
@@ -1482,6 +1489,16 @@ kernel void k_div(
         race_rc, _, _ = run_metal_1d_case_vectors(clangxx, race_msl, "k_div", 2, race_vecs, check_tsan=True)
         self.assertNotEqual(race_rc, 0, "TSan must trap on concurrent cross-lane write race")
 
+    def test_host_arch_skip_for_pinned_artifacts(self) -> None:
+        with patch.object(platform, "machine", return_value="aarch64"):
+            with self.assertRaises(HostArchSkip) as ctx:
+                require_x86_64_pinned_artifact("the pinned OpenXLA StableHLO / numpy wheels")
+            self.assertIn("aarch64", str(ctx.exception))
+            # The generic message must not blame the CUDA/ptxas leg for a wheel skip.
+            self.assertNotIn("ptxas", str(ctx.exception))
+        with patch.object(platform, "machine", return_value="x86_64"):
+            require_x86_64_pinned_artifact("the pinned OpenXLA StableHLO / numpy wheels")
+
     def test_stablehlo_isolated_bootstrap_and_eval(self) -> None:
         with tempfile.TemporaryDirectory(prefix="ln-shlo-missing-") as empty_dir:
             with self.assertRaises(RuntimeError):
@@ -1490,8 +1507,8 @@ kernel void k_div(
         cache_dir = Path(os.environ.get("GPU_TPU_TOOLS_CACHE", "/tmp/tl-gpu-tpu-tools"))
         try:
             ensure_openxla_stablehlo(cache_dir)
-        except ImportError:
-            self.skipTest("OpenXLA stablehlo wheel not cached locally")
+        except (ImportError, HostArchSkip) as exc:
+            self.skipTest(f"OpenXLA stablehlo unavailable here ({exc.__class__.__name__}: {exc})")
 
         sub_mlir = """module @mod_sub {
   func.func @f(%a: tensor<ui64>, %b: tensor<ui64>) -> tensor<ui64> {
@@ -1539,17 +1556,33 @@ def _run_main() -> int:
 
     py_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
     if py_tag not in STABLEHLO_WHEELS and not os.environ.get("_TL_GPU_DIFF_REEXEC"):
-        if args.ensure_tools:
-            compat_py = ensure_compatible_python(args.tools_cache_dir)
-        else:
-            compat_py = find_compatible_python(args.tools_cache_dir)
+        try:
+            if args.ensure_tools:
+                compat_py = ensure_compatible_python(args.tools_cache_dir)
+            else:
+                compat_py = find_compatible_python(args.tools_cache_dir)
+        except HostArchSkip as exc:
+            print(f"[gpu-tpu-diff] python bootstrap unavailable ({exc}); continuing on this interpreter")
+            compat_py = None
         if compat_py:
             child_env = dict(os.environ, _TL_GPU_DIFF_REEXEC="1")
             proc = subprocess.run([compat_py, str(Path(__file__).resolve()), *sys.argv[1:]], env=child_env)
             return proc.returncode
 
+    tools_arch_skipped = False
     if args.ensure_tools:
-        ptxas_bin, site_dir = ensure_gpu_tpu_tools(args.tools_cache_dir)
+        try:
+            ptxas_bin, site_dir = ensure_gpu_tpu_tools(args.tools_cache_dir)
+        except HostArchSkip as exc:
+            # The arch-independent self-tests (PTX SIMT VM, Metal host C++) must
+            # still run; only the pinned-artifact bootstrap is skipped.
+            print(f"[gpu-tpu-diff] tool bootstrap skipped ({exc})")
+            tools_arch_skipped = True
+            site_cand = args.tools_cache_dir / "site-packages"
+            if site_cand.is_dir() and str(site_cand) not in sys.path:
+                sys.path.insert(0, str(site_cand))
+            ptxas_bin = find_ptxas(args.tools_cache_dir) or ""
+            site_dir = site_cand if site_cand.is_dir() else None
     else:
         site_cand = args.tools_cache_dir / "site-packages"
         if site_cand.is_dir() and str(site_cand) not in sys.path:
@@ -1577,7 +1610,7 @@ def _run_main() -> int:
                 "module @t {\n  func.func @f(%x: tensor<2xui64>) -> tensor<2xui64> {\n    return %x : tensor<2xui64>\n  }\n}\n"
             )
         except ImportError:
-            if args.ensure_tools:
+            if args.ensure_tools and not tools_arch_skipped:
                 raise
         print("[gpu-tpu-diff] self-test PASSED")
         return 0
