@@ -14,6 +14,100 @@ pub(super) const STATEMENT_HASH_LEAN_SRC: &str = include_str!("../../../../lean/
 pub(super) const ZYGOTE_FORK_LEAN_SRC: &str = include_str!("../zygote_fork_posix.lean");
 pub(super) const ZYGOTE_WORKER_LEAN_SRC: &str = include_str!("../../../../lean/TurboLean/ZygoteWorker.lean");
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct EmbeddedZygoteModule {
+    pub(super) module: &'static str,
+    pub(super) rel_path: &'static str,
+    pub(super) src: &'static str,
+    pub(super) emit_olean: bool,
+    pub(super) c_opt: &'static str,
+}
+
+pub(super) const ZYGOTE_EMBEDDED_MODULES: &[EmbeddedZygoteModule] = &[
+    EmbeddedZygoteModule {
+        module: "TurboLean.Blake3",
+        rel_path: "TurboLean/Blake3.lean",
+        src: BLAKE3_LEAN_SRC,
+        emit_olean: true,
+        c_opt: "-O3",
+    },
+    EmbeddedZygoteModule {
+        module: "TurboLean.StatementHash",
+        rel_path: "TurboLean/StatementHash.lean",
+        src: STATEMENT_HASH_LEAN_SRC,
+        emit_olean: true,
+        c_opt: "-O3",
+    },
+    EmbeddedZygoteModule {
+        module: "TurboLean.ZygoteFork",
+        rel_path: "TurboLean/ZygoteFork.lean",
+        src: ZYGOTE_FORK_LEAN_SRC,
+        emit_olean: true,
+        c_opt: "-O3",
+    },
+    EmbeddedZygoteModule {
+        module: "TurboLean.ZygoteWorker",
+        rel_path: "TurboLean/ZygoteWorker.lean",
+        src: ZYGOTE_WORKER_LEAN_SRC,
+        emit_olean: false,
+        c_opt: "-O0",
+    },
+];
+
+pub(super) fn compute_zygote_bin_name(
+    lean_bin: &Path,
+    toolchain: Option<&str>,
+    modules: &[EmbeddedZygoteModule],
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"turbo-zygote:v7:cow-fork-pool:");
+    hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
+    hasher.update(b":");
+    hasher.update(std::env::consts::ARCH.as_bytes());
+    hasher.update(lean_bin.to_string_lossy().as_bytes());
+    if let Some(tc) = toolchain {
+        hasher.update(tc.as_bytes());
+    }
+    for m in modules {
+        hasher.update(m.src.as_bytes());
+    }
+    format!("turbo_zygote_{}", &hasher.finalize().to_hex()[..16])
+}
+
+pub(super) fn zygote_scratch_lean_path(
+    scratch_dir: &Path,
+    m: &EmbeddedZygoteModule,
+    tmp_id: &str,
+) -> PathBuf {
+    if m.emit_olean {
+        scratch_dir.join(m.rel_path)
+    } else {
+        let stem = m.rel_path.trim_end_matches(".lean").replace('/', "_");
+        scratch_dir.join(format!("{stem}_{tmp_id}.lean"))
+    }
+}
+
+pub(super) fn zygote_scratch_olean_path(scratch_dir: &Path, m: &EmbeddedZygoteModule) -> PathBuf {
+    scratch_dir.join(format!("{}.olean", m.rel_path.trim_end_matches(".lean")))
+}
+
+pub(super) fn write_zygote_scratch_sources(
+    scratch_dir: &Path,
+    modules: &[EmbeddedZygoteModule],
+    tmp_id: &str,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::with_capacity(modules.len());
+    for m in modules {
+        let lean_file = zygote_scratch_lean_path(scratch_dir, m, tmp_id);
+        if let Some(parent) = lean_file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&lean_file, m.src)?;
+        paths.push(lean_file);
+    }
+    Ok(paths)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimeoutHotspot {
     pub kind: String,
@@ -1048,20 +1142,11 @@ pub(crate) fn ensure_zygote_binary_at(
     tools.apply_env(&mut env_vars);
     let env_vars = &env_vars;
 
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(b"turbo-zygote:v7:cow-fork-pool:");
-    hasher.update(crate::TURBO_LEAN_BUILD_EPOCH.as_bytes());
-    hasher.update(b":");
-    hasher.update(std::env::consts::ARCH.as_bytes());
-    hasher.update(lean_bin.to_string_lossy().as_bytes());
-    if let Some(tc) = env_vars.get("ELAN_TOOLCHAIN") {
-        hasher.update(tc.as_bytes());
-    }
-    hasher.update(BLAKE3_LEAN_SRC.as_bytes());
-    hasher.update(STATEMENT_HASH_LEAN_SRC.as_bytes());
-    hasher.update(ZYGOTE_FORK_LEAN_SRC.as_bytes());
-    hasher.update(ZYGOTE_WORKER_LEAN_SRC.as_bytes());
-    let bin_name = format!("turbo_zygote_{}", &hasher.finalize().to_hex()[..16]);
+    let bin_name = compute_zygote_bin_name(
+        lean_bin,
+        env_vars.get("ELAN_TOOLCHAIN").map(String::as_str),
+        ZYGOTE_EMBEDDED_MODULES,
+    );
     let bin_dir = store_root.join("fastcheck_bins");
     fs::create_dir_all(&bin_dir)?;
     #[cfg(unix)]
@@ -1144,39 +1229,34 @@ pub(crate) fn ensure_zygote_binary_at(
     };
     compile_env.insert("LEAN_PATH".to_string(), scratch_lp);
 
-    let mut obj_files = Vec::with_capacity(4);
-    for (stem, src, emit_olean, c_opt) in [
-        ("Blake3", BLAKE3_LEAN_SRC, true, "-O3"),
-        ("StatementHash", STATEMENT_HASH_LEAN_SRC, true, "-O3"),
-        ("ZygoteFork", ZYGOTE_FORK_LEAN_SRC, true, "-O3"),
-        ("ZygoteWorker", ZYGOTE_WORKER_LEAN_SRC, false, "-O0"),
-    ] {
-        let lean_file = if emit_olean {
-            scratch_pkg.join(format!("{stem}.lean"))
-        } else {
-            scratch_dir.join(format!("ZygoteWorker_{tmp_id}.lean"))
-        };
+    let lean_files = write_zygote_scratch_sources(&scratch_dir, ZYGOTE_EMBEDDED_MODULES, &tmp_id)?;
+    let mut obj_files = Vec::with_capacity(ZYGOTE_EMBEDDED_MODULES.len());
+    for (m, lean_file) in ZYGOTE_EMBEDDED_MODULES.iter().zip(lean_files.iter()) {
+        let stem = m.rel_path.trim_end_matches(".lean").replace('/', "_");
         let c_file = scratch_dir.join(format!("{stem}_{tmp_id}.c"));
         let obj_file = scratch_dir.join(format!("{stem}_{tmp_id}.o"));
-        fs::write(&lean_file, src)?;
         let mut cmd = Command::new(lean_bin);
         cmd.arg(format!("--root={}", scratch_dir.display()));
-        if emit_olean {
-            cmd.arg("-o").arg(scratch_pkg.join(format!("{stem}.olean")));
+        if m.emit_olean {
+            let olean_file = zygote_scratch_olean_path(&scratch_dir, m);
+            if let Some(parent) = olean_file.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            cmd.arg("-o").arg(olean_file);
         }
         let out = cmd
             .arg("-c")
             .arg(&c_file)
-            .arg(&lean_file)
+            .arg(lean_file)
             .current_dir(&scratch_dir)
             .envs(&compile_env)
             .output()
-            .with_context(|| format!("Failed to compile {stem}.lean to C"))?;
+            .with_context(|| format!("Failed to compile {} ({}) to C", m.module, m.rel_path))?;
         if !out.status.success() {
-            return Err(compiler_failure(Path::new(&format!("{stem}.lean")), &out));
+            return Err(compiler_failure(Path::new(m.rel_path), &out));
         }
         let c_out = Command::new(leanc_bin)
-            .arg(c_opt)
+            .arg(m.c_opt)
             .arg("-c")
             .arg(&c_file)
             .arg("-o")
@@ -1184,10 +1264,11 @@ pub(crate) fn ensure_zygote_binary_at(
             .current_dir(&scratch_dir)
             .envs(&compile_env)
             .output()
-            .with_context(|| format!("Failed to compile {stem}.c via `leanc {c_opt} -c`"))?;
+            .with_context(|| format!("Failed to compile {stem}.c via `leanc {} -c`", m.c_opt))?;
         if !c_out.status.success() {
             anyhow::bail!(
-                "`leanc {c_opt} -c` failed on {stem}.c:\n{}",
+                "`leanc {} -c` failed on {stem}.c:\n{}",
+                m.c_opt,
                 String::from_utf8_lossy(&c_out.stderr)
             );
         }
@@ -1645,6 +1726,139 @@ pub(super) fn block_stub_mode(stub_mode: &str, stub_targets: &[String], blk: &st
             "{}:{}:{}:{}:{}",
             base_prefix, targets_hex, stubs_hex, req_hex, fmap_hex
         )))
+    }
+}
+
+#[cfg(test)]
+mod worker_embed_tests {
+    use super::*;
+
+    fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let p = entry.path();
+            if p.is_dir() {
+                collect_files(&p, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+
+    #[test]
+    fn zygote_embedded_modules_sync_order_and_cache_key_sensitivity() {
+        let repo_lean = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../lean");
+        let mut disk_modules: Vec<String> = Vec::new();
+        let mut stack = vec![repo_lean.join("TurboLean")];
+        while let Some(d) = stack.pop() {
+            if !d.is_dir() {
+                continue;
+            }
+            for e in fs::read_dir(&d).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().and_then(|s| s.to_str()) == Some("lean") {
+                    let rel = p.strip_prefix(&repo_lean).unwrap().to_string_lossy().replace('\\', "/");
+                    if rel == "TurboLean/Blake3.lean"
+                        || rel == "TurboLean/StatementHash.lean"
+                        || rel == "TurboLean/ZygoteFork.lean"
+                        || rel == "TurboLean/ZygoteWorker.lean"
+                        || rel.starts_with("TurboLean/ZygoteWorker/")
+                    {
+                        disk_modules.push(rel);
+                    }
+                }
+            }
+        }
+        disk_modules.sort();
+        let mut embedded_rels: Vec<String> = ZYGOTE_EMBEDDED_MODULES
+            .iter()
+            .map(|m| m.rel_path.to_string())
+            .collect();
+        let mut embedded_sorted = embedded_rels.clone();
+        embedded_sorted.sort();
+        assert_eq!(
+            embedded_sorted, disk_modules,
+            "ZYGOTE_EMBEDDED_MODULES must match on-disk ZygoteWorker + dependency sources"
+        );
+        embedded_rels.dedup();
+        assert_eq!(embedded_rels.len(), ZYGOTE_EMBEDDED_MODULES.len());
+
+        for m in ZYGOTE_EMBEDDED_MODULES {
+            assert!(!m.src.is_empty(), "{} must be non-empty", m.module);
+            let expected_rel = format!("{}.lean", m.module.replace('.', "/"));
+            assert_eq!(m.rel_path, expected_rel);
+            if m.module != "TurboLean.ZygoteFork" {
+                let disk = fs::read_to_string(repo_lean.join(m.rel_path)).unwrap();
+                assert_eq!(m.src, disk, "embedded source drifted from {}", m.rel_path);
+            }
+        }
+        assert_eq!(
+            ZYGOTE_EMBEDDED_MODULES.last().map(|m| (m.module, m.emit_olean)),
+            Some(("TurboLean.ZygoteWorker", false)),
+            "entrypoint TurboLean.ZygoteWorker must be compiled last without emitting over imported .olean"
+        );
+        assert!(ZYGOTE_EMBEDDED_MODULES[..ZYGOTE_EMBEDDED_MODULES.len() - 1]
+            .iter()
+            .all(|m| m.emit_olean));
+
+        let known: std::collections::HashSet<&str> =
+            ZYGOTE_EMBEDDED_MODULES.iter().map(|m| m.module).collect();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for m in ZYGOTE_EMBEDDED_MODULES {
+            for line in m.src.lines() {
+                let trimmed = line.trim_start();
+                if let Some(rest) = trimmed.strip_prefix("import ") {
+                    for tok in rest.split_whitespace() {
+                        if tok == "public" || tok == "all" || tok == "meta" {
+                            continue;
+                        }
+                        if known.contains(tok) {
+                            assert!(
+                                seen.contains(tok),
+                                "{} imports {} before it appears in ZYGOTE_EMBEDDED_MODULES",
+                                m.module,
+                                tok
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+            seen.insert(m.module);
+        }
+
+        let lean_bin = Path::new("/tmp/fake-lean");
+        let base_key = compute_zygote_bin_name(lean_bin, Some("v4.35.0"), ZYGOTE_EMBEDDED_MODULES);
+        for idx in 0..ZYGOTE_EMBEDDED_MODULES.len() {
+            let mut mutated = ZYGOTE_EMBEDDED_MODULES.to_vec();
+            let mut bumped = mutated[idx].src.as_bytes().to_vec();
+            bumped[0] ^= 1;
+            let bumped_str = Box::leak(String::from_utf8_lossy(&bumped).into_owned().into_boxed_str());
+            mutated[idx].src = bumped_str;
+            let next_key = compute_zygote_bin_name(lean_bin, Some("v4.35.0"), &mutated);
+            assert_ne!(
+                base_key, next_key,
+                "1-byte edit in {} must change zygote binary cache key",
+                ZYGOTE_EMBEDDED_MODULES[idx].module
+            );
+        }
+
+        let scratch = std::env::temp_dir().join(format!(
+            "zygote_embed_pin_{}_{}",
+            std::process::id(),
+            next_tmp_id()
+        ));
+        let written = write_zygote_scratch_sources(&scratch, ZYGOTE_EMBEDDED_MODULES, "42").unwrap();
+        assert_eq!(written.len(), ZYGOTE_EMBEDDED_MODULES.len());
+        let mut on_scratch = Vec::new();
+        collect_files(&scratch, &mut on_scratch);
+        let mut a = written.clone();
+        a.sort();
+        on_scratch.sort();
+        assert_eq!(a, on_scratch);
+        let _ = fs::remove_dir_all(&scratch);
     }
 }
 
