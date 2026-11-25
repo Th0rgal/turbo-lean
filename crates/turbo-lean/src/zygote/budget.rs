@@ -462,12 +462,23 @@ pub(crate) fn request_policy(
         .collect()
 }
 
+/// The explicitly unbounded request budget (#443). It must stay distinguishable from an
+/// unspecified budget (`None`, whose `run_lean_command` fallback is 90 s and whose shard
+/// audit caps at `audit_timeout_ms`), and small enough that adding it to an `Instant`
+/// (`recv_timeout` and friends) cannot overflow: 100 years.
+pub(crate) const UNBOUNDED_TIMEOUT_MS: u64 = 100 * 365 * 24 * 60 * 60 * 1000;
+
 /// Map an explicit per-request `--timeout-ms` value to the budget the fallback paths
 /// understand (#443): `0` is documented as "no artificial timeout", but `Some(0)` is an
-/// exhausted budget to `run_lean_command` and the shard-fallback `budget_left`, so it must
-/// become `None` before it reaches them.
+/// exhausted budget to `run_lean_command` and the shard-fallback `budget_left`, so it maps
+/// to the explicitly unbounded budget, which also lifts the per-stage default caps
+/// (`None` would mean "unspecified" and reintroduce the 90 s default).
 pub(crate) fn request_timeout_ms(timeout_ms: u64) -> Option<u64> {
-    (timeout_ms > 0).then_some(timeout_ms)
+    if timeout_ms == 0 {
+        Some(UNBOUNDED_TIMEOUT_MS)
+    } else {
+        Some(timeout_ms)
+    }
 }
 
 pub(crate) fn invocation_timeout_ms() -> Option<u64> {

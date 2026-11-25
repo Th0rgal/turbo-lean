@@ -2072,7 +2072,16 @@ pub(crate) fn run_audited_lean_shard_at_with_full_report(
     if let Some(dir) = cwd {
         auditor.current_dir(dir);
     }
-    let mut audit_timeout = std::time::Duration::from_millis(audit_timeout_ms(false));
+    // #443: an explicitly unbounded request lifts the DEFAULT audit cap too, so
+    // `--timeout-ms 0` truly means no artificial timeout; an explicitly configured
+    // TURBO_LEAN_AUDIT_TIMEOUT_SECS still binds.
+    let mut audit_timeout = if timeout_ms == Some(UNBOUNDED_TIMEOUT_MS)
+        && std::env::var_os("TURBO_LEAN_AUDIT_TIMEOUT_SECS").is_none()
+    {
+        std::time::Duration::from_millis(UNBOUNDED_TIMEOUT_MS)
+    } else {
+        std::time::Duration::from_millis(audit_timeout_ms(false))
+    };
     if let Some(left) = budget_left("the shard audit")? {
         audit_timeout = audit_timeout.min(left);
     }

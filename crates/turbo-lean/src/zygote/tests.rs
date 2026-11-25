@@ -1891,9 +1891,22 @@ use super::*;
         // #443: `eval --timeout-ms 0` is documented as "no artificial timeout", but the
         // shard-fallback path passed it as `Some(0)`, which `run_lean_command` and
         // `budget_left` treat as an exhausted budget ("Lean request timed out before
-        // fallback" after ~3 s). The default must map to `None` before it reaches them.
-        assert_eq!(request_timeout_ms(0), None);
+        // fallback" after ~3 s). The default must map to the explicitly UNBOUNDED budget:
+        // `None` would mean "unspecified" and fall back to `run_lean_command`'s 90 s
+        // default and the 300 s shard-audit cap.
+        assert_eq!(request_timeout_ms(0), Some(UNBOUNDED_TIMEOUT_MS));
+        assert!(
+            UNBOUNDED_TIMEOUT_MS > 365 * 24 * 60 * 60 * 1000,
+            "the unbounded budget is over a year: no artificial bound in practice"
+        );
         assert_eq!(request_timeout_ms(1_500), Some(1_500));
+        // An unbounded budget never exhausts mid-request.
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(600);
+        assert!(
+            remaining_timeout_ms(request_timeout_ms(0), long_ago)
+                > 365u64 * 24 * 60 * 60 * 1000,
+            "an unbounded request keeps over a year of budget after 10 minutes of work"
+        );
         // The mapped default must reach the fallback spawn: `Some(0)` is rejected before
         // any process starts, while the mapped budget spawns the command.
         let out = run_lean_command(&mut Command::new("true"), request_timeout_ms(0))
