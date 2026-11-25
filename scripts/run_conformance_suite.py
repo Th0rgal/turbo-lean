@@ -15,6 +15,7 @@ cross-regime holdout portfolio and adversarial `.olean` rejection battery
 through pinned upstream `leanprover/con-leche --verified` when provisioned via
 `TURBO_CON_LECHE_BIN` (or `--con-leche-bin`), and fails closed
 (`BLOCKED_MISSING_DEPENDENCY`) otherwise.
+arm64 (aarch64) qualification: the differential tiers, sanitizer legs, and C2/C4 clang gates run natively on arm64 hosts via host-arch emission; the CUDA/PTX leg and the pinned x86_64-only artifacts (ptxas wheel, StableHLO wheels, cpython-standalone) skip there with named reasons, and hardware target qualification remains open on arm64 exactly as on x86_64.
 """
 from __future__ import annotations
 
