@@ -1727,6 +1727,12 @@ pub(super) fn collect_closure_snapshots(root: &Path, keep: &str) {
 ///
 /// Empty -- and free, see `workspace_may_declare_lake_inputs` -- for every workspace that declares
 /// no inputs, including every toolchain entry on the path, which carries no Lake config.
+///
+/// A workspace whose inputs cannot be resolved (an unsupported `input_dir` filter, a dependency
+/// declaring `target` / `extern_lib` that is walked as a root) contributes a deterministic
+/// `lake-inputs-unresolved` tag and flips `uncacheable`. The flag is what disables the caches;
+/// the tag must stay recomputable in another process because it reaches the daemon `/eval`
+/// `execution_identity` (#432).
 pub(super) fn compute_lean_path_lake_inputs_digest(
     effective_lean_path: &str,
     env_vars: &std::collections::HashMap<String, String>,
@@ -1741,9 +1747,20 @@ pub(super) fn compute_lean_path_lake_inputs_digest(
                 }
             }
             Ok(None) => {}
+            // Deterministic, never a per-call nonce: the tag reaches `olean_digest` and
+            // therefore the daemon `/eval` `execution_identity`, which the daemon recomputes in
+            // another process. With `module_builder::project_lake_inputs_tag`'s fresh nonce here
+            // the client and the daemon could never agree, so every `/eval` on a workspace with
+            // unresolvable Lake inputs answered HTTP 409 (#432). Cache safety is carried by
+            // `uncacheable`, which every cache keyed on this digest (SHM, worker pool,
+            // verified-shard memo, warm adoption) consults before storing or replaying.
             Err(_) => {
                 uncacheable = true;
-                if let Some(tag) = crate::module_builder::project_lake_inputs_tag(dir) {
+                let tag = format!(
+                    "\u{0}lake-inputs-unresolved:{}",
+                    blake3::hash(dir.to_string_lossy().as_bytes()).to_hex()
+                );
+                if !tags.contains(&tag) {
                     tags.push(tag);
                 }
             }
