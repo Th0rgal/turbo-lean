@@ -743,4 +743,25 @@ def mutant3CircularSelfRefDecl : ConLeche.Decl :=
 #guard (checkDecl { decls := [], headerMagic := 0x4F4C454E } mutant3CircularSelfRefDecl).isOk == false
 #guard (parseOleanShard (encodeOleanShard { decls := [mutant3CircularSelfRefDecl], headerMagic := 0x4F4C454E })).isOk == false
 
+/-! ## Real `.olean` Header Discriminator (G1b: the OLEN v1 model is disjoint from real `.olean`) -/
+
+/-- First 16 header bytes of a real Lean 4 `.olean` compacted-region file as emitted by the pinned
+    `leanprover/lean4:v4.35.0` compiler (measured 2026-11-25 on `x86_64-unknown-linux-gnu` via
+    `lean -R <dir> -o ValidPrelude.olean ValidPrelude.lean`): ASCII `olean`
+    (`0x6F 0x6C 0x65 0x61 0x6E`), format bytes `0x02 0x01`, the ASCII compiler version `4.35.0`,
+    then NUL padding (the emitting compiler githash `eb6cafb7…` sits at byte offset 40).
+    The guards below pin, executably, that `parseOleanShard` REJECTS this real header and that the
+    two formats already disagree at byte 0 (`0x6F` = `o` vs the model's `0x4F` = `O`): the M2
+    theorems above are stated over the `"OLEN"` v1 model only, and proving them over real `.olean`
+    bytes is the open half of roadmap leaf G1b (`roadmap/HORIZONS.md`). -/
+def realLeanOleanHeaderPrefix : ByteArray :=
+  ByteArray.mk #[0x6F, 0x6C, 0x65, 0x61, 0x6E, 0x02, 0x01,
+                 0x34, 0x2E, 0x33, 0x35, 0x2E, 0x30, 0x00, 0x00, 0x00]
+
+-- The model parser deterministically rejects a real Lean 4 `.olean` header.
+#guard (parseOleanShard realLeanOleanHeaderPrefix).isOk == false
+-- Byte 0 of a real `.olean` is `o` (`0x6F`); the model's `"OLEN"` magic starts with `O` (`0x4F`).
+#guard realLeanOleanHeaderPrefix.get! 0 == 0x6F
+#guard realLeanOleanHeaderPrefix.get! 0 != 0x4F
+
 end TurboLean.Kernel.ConLeche
