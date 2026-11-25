@@ -14,6 +14,8 @@ import statistics
 import subprocess
 import tempfile
 
+import host_arch
+
 ROOT = Path(__file__).resolve().parents[1]
 CORE = ROOT / 'lean/.lake/build/bin/lean-native-core'
 TURBO = ROOT / 'target/release/turbo-lean'
@@ -22,11 +24,10 @@ ENV = {**os.environ, 'TURBO_LEAN_TELEMETRY': 'off', 'LEAN_NATIVE_CORE_BIN': str(
 # Calibrate the cost profile for the CPU the benches actually ran on
 # (profiles/arm64_*.json ship for the arm64 leg); `calibrate-cost --target`
 # takes the Lean TargetArch spelling, so aarch64 hosts pass `arm64`.
-HOST_TARGET = 'arm64' if platform.machine().lower() in ('aarch64', 'arm64') else 'x86_64'
-# clang rejects `-march=native` on Apple arm64; `-mcpu=native` is the Darwin spelling.
-NATIVE_TUNE_FLAG = ('-mcpu=native'
-                    if platform.system() == 'Darwin' and platform.machine().lower() in ('aarch64', 'arm64')
-                    else '-march=native')
+HOST_TARGET = host_arch.host_target_arch()
+# clang on aarch64 takes `-mcpu=native` (`-march=native` is rejected on Apple
+# arm64 and on pre-15 aarch64 clang generally); x86 keeps `-march=native`.
+NATIVE_TUNE_FLAG = '-mcpu=native' if HOST_TARGET == 'arm64' else '-march=native'
 
 RUST = r'''
 use std::ffi::c_void;
@@ -90,7 +91,20 @@ def run(args, **kw):
 
 
 def build(tmp):
+    if HOST_TARGET != 'x86_64':
+        # emitParityHarness (lean/LeanNative/Driver/CostAutotuneCLI.lean:540) emits
+        # .x86_64 modules only and its checkHost gate throws on non-x86 hosts; the
+        # subcommand takes no --target (measured: appending `--target arm64` exits 1).
+        # Name that here instead of dying inside clang with the triple override
+        # hidden by -Wno-override-module.
+        raise RuntimeError('calibrate-cost --emit-parity-harness is x86_64-only today, '
+                           'so the Rust-parity harness cannot run on this host yet')
     run([CORE, 'calibrate-cost', '--emit-parity-harness', tmp])
+    triple = 'target triple = "x86_64-unknown-linux-gnu"'
+    for ll in sorted(tmp.glob('*.ll')):
+        if triple not in ll.read_text():
+            raise RuntimeError(f'{ll.name} is not an x86_64 module; refusing to link it '
+                               'natively under -Wno-override-module')
     rs = tmp / 'kernels.rs'
     rs.write_text(RUST)
     lib = tmp / 'rust.a'
