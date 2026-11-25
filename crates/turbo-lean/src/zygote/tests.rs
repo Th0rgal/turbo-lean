@@ -151,17 +151,30 @@ use super::*;
             .collect();
         let tag = format!("H23Bench{}", next_tmp_id());
         env.insert(crate::splitter::ALLOWED_AXIOMS_ENV.into(), tag);
+        // Each theorem's `decide` recursion must stay well under the elaborator's default
+        // `maxRecDepth` (512; a range-200 foldl already trips it), so the per-block load
+        // is K shallow kernel-replayed theorems (list length 80..119), not one deep one —
+        // exactly the many-small-decls shape the replay fan-out parallelizes. Statements
+        // vary with k so no cross-declaration sharing can elide the work.
         let n: usize = std::env::var("TURBO_LEAN_BENCH_N")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1500);
-        let sum = n * (n - 1) / 2;
+            .unwrap_or(80);
+        let k_per_block: usize = std::env::var("TURBO_LEAN_BENCH_K")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(200);
         let blocks = 8;
         let mut source = String::from("import Init\n");
         for i in 0..blocks {
-            source.push_str(&format!(
-                "-- namespace _TurboCrossFileShard_{i}\ntheorem h23_bench_{jobs_slug}_{i} : (List.range {n}).foldl (fun a b => a + b) 0 = {sum} := by decide\n",
-            ));
+            source.push_str(&format!("-- namespace _TurboCrossFileShard_{i}\n"));
+            for k in 0..k_per_block {
+                let len = n + (k % 40);
+                let sum = len * (len - 1) / 2;
+                source.push_str(&format!(
+                    "theorem h23_bench_{jobs_slug}_{i}_{k} : (List.range {len}).foldl (fun a b => a + b) 0 = {sum} := by decide\n",
+                ));
+            }
         }
         let t0 = std::time::Instant::now();
         let rep = eval_with_zygote_pool(
