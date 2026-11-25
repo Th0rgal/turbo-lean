@@ -1575,7 +1575,7 @@ const ELAB_EXEC_ATTRS: &[&str] = &[
     "builtin_env_extension",
 ];
 
-fn unquoted_has_elab_exec_trigger(unquoted: &str) -> bool {
+pub(crate) fn unquoted_has_elab_exec_trigger(unquoted: &str) -> bool {
     ELAB_IO_WORDS.iter().any(|w| contains_lean_word(unquoted, w))
         || ELAB_EXEC_SEGMENTS
             .iter()
@@ -1674,7 +1674,7 @@ pub(crate) fn source_has_runtime_replacement_attribute(src: &str) -> bool {
     contains_lean_attribute_word(&unquoted, &["extern", "implemented_by", "csimp"])
 }
 
-fn unquoted_has_host_read_tokens(comment_free: &str, unquoted: &str) -> bool {
+pub(crate) fn unquoted_has_host_read_tokens(comment_free: &str, unquoted: &str) -> bool {
     const QUALIFIED_HOST_READS: &[&str] = &[
         "IO.FS",
         "IO.Prim",
