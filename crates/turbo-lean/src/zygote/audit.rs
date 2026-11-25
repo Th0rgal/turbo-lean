@@ -609,11 +609,10 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
         ensure_live_closure_matches_snapshot(&snap, "audit_complete")?;
         return Ok(Some(snap));
     }
-    let parallelism = std::env::var("TURBO_LEAN_JOBS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or_else(|| {
+    let parallelism = WorkerBudget::from_env().effective_parallelism(
+        chunks.len(),
+        REPLAY_WORKER_EST_RSS_MB,
+        || {
             let cores = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
@@ -622,8 +621,8 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
             } else {
                 cores.div_ceil(4).max(1)
             }
-        })
-        .min(chunks.len());
+        },
+    );
     if parallelism <= 1 {
         for chunk in chunks {
             let (chunk_lp, _) = ensure_bound_audit_closure(&snap, "audit_before_chunk")?;
@@ -787,16 +786,15 @@ pub(crate) fn replay_and_audit_modules_with_zygote_snapshot(
     if !sorted_audit.is_empty() {
         let batch_sz = audit_batch_size().max(32);
         let chunks: Vec<&[String]> = sorted_audit.chunks(batch_sz).collect();
-        let parallelism = std::env::var("TURBO_LEAN_JOBS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| {
+        let parallelism = WorkerBudget::from_env().effective_parallelism(
+            chunks.len(),
+            REPLAY_WORKER_EST_RSS_MB,
+            || {
                 std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(4)
-            })
-            .min(chunks.len());
+            },
+        );
         if parallelism <= 1 {
             for chunk in chunks {
                 let (chunk_lp, _) =
@@ -1089,18 +1087,15 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
     if mod_names.is_empty() {
         return Ok(());
     }
+    let budget = WorkerBudget::from_env();
     let worker_budget = if is_untrusted {
         1
     } else {
-        std::env::var("TURBO_LEAN_JOBS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4)
-            })
+        budget.effective_parallelism(mod_names.len(), REPLAY_WORKER_EST_RSS_MB, || {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        })
     };
     let explicit_batch_cap = std::env::var("TURBO_LEAN_REPLAY_CLOSURE_BATCH_SIZE")
         .ok()
@@ -1111,18 +1106,35 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
     } else if let Some(explicit) = explicit_batch_cap {
         explicit
     } else {
-        let base_cap = replay_closure_batch_size();
+        // #435: shrink the closure batch under an explicit memory budget so one replay
+        // process never loads a 32-module closure into a small per-worker share.
+        let base_cap = budget.replay_batch_cap(replay_closure_batch_size(), worker_budget);
         if worker_budget > 1 && mod_names.len() > worker_budget {
-            (mod_names.len() / (worker_budget * 2)).clamp(8, base_cap)
+            (mod_names.len() / (worker_budget * 2)).clamp(8.min(base_cap), base_cap)
         } else {
             base_cap
         }
     };
     let batches = build_replay_closure_batches(cfg, mod_names, lean_path_env, slice_cap)
         .unwrap_or_else(|_| mod_names.iter().map(|s| vec![s.clone()]).collect());
+    let parallelism = if is_untrusted {
+        1
+    } else {
+        worker_budget.min(batches.len()).max(1)
+    };
+    // #435: an explicit `--max-memory-mb` budget reaches every replay worker as a real
+    // rlimit (its share of the budget), not only the advisory governor.
+    let per_worker_rlimit_mb = if is_untrusted {
+        None
+    } else {
+        budget.per_worker_rlimit_mb(parallelism)
+    };
     let run_replay_slice = |slice: &[String]| -> Result<()> {
         let (mut cmd, base_timeout) =
             kernel_reader_command(store_root, cfg, lean_path_env, extra_ro_binds, is_untrusted)?;
+        if let Some(mb) = per_worker_rlimit_mb {
+            WorkerBudget::apply_worker_rlimit(&mut cmd, mb);
+        }
         let timeout = if slice.len() == 1 {
             cmd.args(["--kernel-replay-module", &slice[0]]);
             base_timeout
@@ -1147,10 +1159,11 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
         }
         if slice.len() == 1 {
             anyhow::bail!(
-                "[TurboLean.KernelReplay] independent kernel re-check of `{}` failed (exit={}):\n{}",
+                "[TurboLean.KernelReplay] independent kernel re-check of `{}` failed (exit={}):\n{}{}",
                 slice[0],
                 out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
+                String::from_utf8_lossy(&out.stderr).trim(),
+                WorkerBudget::memory_kill_note(&out.status, per_worker_rlimit_mb)
             );
         }
         for m in slice {
@@ -1161,6 +1174,9 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
                 extra_ro_binds,
                 is_untrusted,
             )?;
+            if let Some(mb) = per_worker_rlimit_mb {
+                WorkerBudget::apply_worker_rlimit(&mut single_cmd, mb);
+            }
             single_cmd.args(["--kernel-replay-module", m]);
             let single_out = crate::module_builder::run_command_with_timeout_pinned_fd(
                 &mut single_cmd,
@@ -1171,27 +1187,14 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
             .context("Failed to execute independent kernel replay (`--kernel-replay-module`)")?;
             anyhow::ensure!(
                 single_out.status.success(),
-                "[TurboLean.KernelReplay] independent kernel re-check of `{}` failed (exit={}):\n{}",
+                "[TurboLean.KernelReplay] independent kernel re-check of `{}` failed (exit={}):\n{}{}",
                 m,
                 single_out.status,
-                String::from_utf8_lossy(&single_out.stderr).trim()
+                String::from_utf8_lossy(&single_out.stderr).trim(),
+                WorkerBudget::memory_kill_note(&single_out.status, per_worker_rlimit_mb)
             );
         }
         Ok(())
-    };
-    let parallelism = if is_untrusted {
-        1
-    } else {
-        std::env::var("TURBO_LEAN_JOBS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4)
-            })
-            .min(batches.len())
     };
     if parallelism <= 1 {
         for batch in &batches {

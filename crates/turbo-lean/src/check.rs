@@ -424,6 +424,10 @@ pub(crate) fn run_check_command_inner(
             "`--emit-olean` cannot be combined with `--decl` (must check a full module file)"
         );
     }
+    // #435: `--jobs` used to feed only shard parallelism; export it for the whole command so
+    // kernel-replay and audit workers spawned downstream observe the same budget. An explicit
+    // TURBO_LEAN_JOBS environment setting wins.
+    crate::zygote::WorkerBudget::export_effective_jobs(jobs);
     let phase_timer = crate::phase_timing::active_phase_timer().unwrap_or_default();
     let _phase_guard = crate::phase_timing::activate_phase_timer(&phase_timer);
     let setup_started = Instant::now();
