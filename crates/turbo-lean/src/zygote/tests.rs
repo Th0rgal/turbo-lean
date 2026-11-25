@@ -2089,7 +2089,8 @@ use super::*;
                 max_memory_mb: Some(4096)
             }
         );
-        // #435: `check --jobs` is exported so every later spawn observes it ...
+        // #435: CLI dispatch exports `check --jobs` once per process so every later
+        // spawn observes it ...
         WorkerBudget::export_effective_jobs(Some(3));
         assert_eq!(std::env::var("TURBO_LEAN_JOBS").as_deref(), Ok("3"));
         assert_eq!(WorkerBudget::from_env().jobs, Some(3));

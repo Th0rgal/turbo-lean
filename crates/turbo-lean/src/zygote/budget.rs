@@ -173,8 +173,11 @@ impl WorkerBudget {
         }
     }
 
-    /// Export `--jobs` as `TURBO_LEAN_JOBS` for the whole command so replay and audit
-    /// workers spawned downstream observe it (#435). An explicit environment setting wins.
+    /// Export `--jobs` as `TURBO_LEAN_JOBS` so replay and audit workers spawned downstream
+    /// observe it (#435). Called once per process from CLI dispatch
+    /// (`apply_global_cli_env`), never from library code: a process-global `set_var` is
+    /// sticky across calls and unsound against concurrent readers. An explicit environment
+    /// setting wins.
     pub fn export_effective_jobs(jobs: Option<usize>) {
         if let Some(j) = jobs.filter(|&j| j > 0) {
             if std::env::var_os("TURBO_LEAN_JOBS").is_none() {

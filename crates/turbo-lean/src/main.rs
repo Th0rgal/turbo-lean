@@ -616,6 +616,18 @@ pub(crate) fn apply_global_cli_env(cli: &Cli) {
     if let Some(mb) = cli.max_memory_mb {
         std::env::set_var("TURBO_LEAN_MAX_MEMORY_MB", mb.to_string());
     }
+    // #435: export the effective `check --jobs` once per process at CLI dispatch (library
+    // code must not set process-global environment: it is sticky across calls, leaks into
+    // children and tests, and `set_var` racing readers is undefined), so kernel-replay and
+    // audit workers spawned downstream observe the same budget the shard pool was given.
+    // An explicit TURBO_LEAN_JOBS environment setting wins; the library threads `jobs`
+    // explicitly where it needs the value.
+    if let Commands::Check {
+        jobs: Some(jobs), ..
+    } = &cli.command
+    {
+        zygote::WorkerBudget::export_effective_jobs(Some(*jobs));
+    }
     if cli.no_auto_worktree_link {
         std::env::set_var("TURBO_LEAN_NO_WORKTREE_LINK", "1");
     }
