@@ -3241,9 +3241,16 @@ pub(super) fn audit_single_decl_spec_full_with_policy_and_opens(
     Option<SpecKernelWitnessCandidate>,
 ) {
     let mut hyp_strings = Vec::new();
+    // Raw (non-delta-unfolded) hypothesis texts, kept aside for the kernel witness
+    // replay candidate: the textual unfolder's pretty-print can re-parse differently
+    // in Lean (e.g. a `p && !q` def body glued onto `= false` parses as
+    // `p && (!q = false)`, a type error), so kernel probes splice the RAW source
+    // text and let the kernel delta-unfold local defs itself.
+    let mut raw_hyp_strings = Vec::new();
     for (_, ty) in &decl.binders {
         if !is_known_binder_value_type(ty) {
             hyp_strings.push(unfold_expr_one_level(ty, local_defs));
+            raw_hyp_strings.push(ty.trim().to_string());
         }
     }
     let imp_segments = split_top_level_implications(&decl.prop_str);
@@ -3255,6 +3262,7 @@ pub(super) fn audit_single_decl_spec_full_with_policy_and_opens(
     for pre in &imp_segments[..imp_segments.len().saturating_sub(1)] {
         let stripped = strip_hypothesis_binder_name(pre);
         hyp_strings.push(unfold_expr_one_level(stripped, local_defs));
+        raw_hyp_strings.push(stripped.trim().to_string());
     }
 
     if policy.reject_definitional_lowering_tautology
@@ -3476,7 +3484,10 @@ pub(super) fn audit_single_decl_spec_full_with_policy_and_opens(
             && !pos_witness.contains("diagonal_or_boundary")
         {
             probe_concrete_precondition_satisfaction(&unfolded_decl).and_then(|bindings| {
-                let conj = hyp_strings
+                // Splice RAW hypothesis texts (each parenthesized): the unfolded
+                // pretty-print is for eval/triviality heuristics only and need not
+                // re-parse; the kernel delta-unfolds local defs itself.
+                let conj = raw_hyp_strings
                     .iter()
                     .map(|h| format!("({})", h.trim()))
                     .collect::<Vec<_>>()
@@ -3486,8 +3497,11 @@ pub(super) fn audit_single_decl_spec_full_with_policy_and_opens(
         } else {
             None
         };
+        // Replay the RAW conclusion for the same reason: a local `def chk p q := p && !q`
+        // makes the unfolded conclusion text `p && !q = false`, which re-parses in Lean
+        // as `p && (!q = false)` (a type error) and used to poison the whole probe batch.
         let neg_side = kw_neg_bindings.as_ref().and_then(|bindings| {
-            build_kernel_witness_side(&value_binders, bindings, conclusion_str.trim(), true)
+            build_kernel_witness_side(&value_binders, bindings, raw_conclusion_str.trim(), true)
         });
         if pos_side.as_ref().is_some_and(|s| s.upgrade_label) || neg_side.is_some() {
             Some(SpecKernelWitnessCandidate {
@@ -4668,13 +4682,15 @@ fn audit_spec_file_or_source_with_policy_inner(
         }
         // A2 (#367): replay this source's concrete witnesses through the Lean kernel in
         // one probe (sides + `specAuditWitnessReplay` gate theorems); when the gated
-        // probe is rejected, retry once with side theorems only so one fragile gate
-        // cannot discard every certification. A rejected probe downgrades nothing: the
-        // eval-level labels simply stand.
+        // probe is rejected, retry once with side theorems only (one fragile gate must
+        // not discard every certification), then candidate by candidate (one
+        // non-replaying candidate must not poison the batch). A rejected probe
+        // downgrades nothing: the eval-level labels simply stand.
         if kernel_witness == KernelWitnessMode::Replay && !kw_src_candidates.is_empty() {
             let clean_for_ns = strip_audit_comments(src);
-            let mut certified = false;
-            let mut with_gates = false;
+            // Per-candidate outcome: (certified, with_gates).
+            let mut cert: Vec<(bool, bool)> = vec![(false, false); kw_src_candidates.len()];
+            let mut batch_rejected = false;
             match build_kernel_witness_probe_src(src, &clean_for_ns, &kw_src_candidates, true) {
                 None => {
                     kw_unavailable.get_or_insert_with(|| "harness_block_missing".to_string());
@@ -4683,31 +4699,66 @@ fn audit_spec_file_or_source_with_policy_inner(
                     Err(reason) => {
                         kw_unavailable.get_or_insert(reason);
                     }
-                    Ok(true) => {
-                        certified = true;
-                        with_gates = true;
-                    }
-                    Ok(false) => {
-                        if let Some((probe2, names2)) = build_kernel_witness_probe_src(
-                            src,
-                            &clean_for_ns,
-                            &kw_src_candidates,
-                            false,
-                        ) {
+                    Ok(true) => cert.fill((true, true)),
+                    Ok(false) => match build_kernel_witness_probe_src(
+                        src,
+                        &clean_for_ns,
+                        &kw_src_candidates,
+                        false,
+                    ) {
+                        Some((probe2, names2)) => {
                             match run_kernel_witness_probe(src_path, &probe2, &names2) {
-                                Ok(true) => certified = true,
-                                Ok(false) => kw_rejected_probes += 1,
+                                Ok(true) => cert.fill((true, false)),
+                                Ok(false) => batch_rejected = true,
                                 Err(reason) => {
                                     kw_unavailable.get_or_insert(reason);
                                 }
                             }
                         }
-                    }
+                        None => batch_rejected = true,
+                    },
                 },
             }
-            if certified {
-                kw_any_replayed = true;
-                for (idx, cand) in &kw_src_candidates {
+            if batch_rejected && kw_src_candidates.len() == 1 {
+                kw_rejected_probes += 1;
+            } else if batch_rejected {
+                'per_cand: for (i, entry) in kw_src_candidates.iter().enumerate() {
+                    let single = std::slice::from_ref(entry);
+                    let Some((probe, names)) =
+                        build_kernel_witness_probe_src(src, &clean_for_ns, single, true)
+                    else {
+                        continue;
+                    };
+                    match run_kernel_witness_probe(src_path, &probe, &names) {
+                        Err(reason) => {
+                            kw_unavailable.get_or_insert(reason);
+                            break 'per_cand;
+                        }
+                        Ok(true) => cert[i] = (true, true),
+                        Ok(false) => {
+                            let Some((probe2, names2)) =
+                                build_kernel_witness_probe_src(src, &clean_for_ns, single, false)
+                            else {
+                                kw_rejected_probes += 1;
+                                continue;
+                            };
+                            match run_kernel_witness_probe(src_path, &probe2, &names2) {
+                                Ok(true) => cert[i] = (true, false),
+                                Ok(false) => kw_rejected_probes += 1,
+                                Err(reason) => {
+                                    kw_unavailable.get_or_insert(reason);
+                                    break 'per_cand;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for ((idx, cand), (certified, with_gates)) in
+                kw_src_candidates.iter().zip(cert.iter())
+            {
+                if *certified {
+                    kw_any_replayed = true;
                     let mut kernel_pos = false;
                     let mut kernel_neg = false;
                     if let Some(pos) = cand.pos.as_ref().filter(|s| s.upgrade_label) {
@@ -4740,7 +4791,7 @@ fn audit_spec_file_or_source_with_policy_inner(
                             witness_provenance_label("", "", kernel_pos, kernel_neg)
                         );
                     }
-                    if with_gates && cand.pos.is_some() && cand.neg.is_some() {
+                    if *with_gates && cand.pos.is_some() && cand.neg.is_some() {
                         kw_gate_replays += 1;
                         spec_details[*idx]["kernel_gate_replayed"] = serde_json::json!(true);
                     }
