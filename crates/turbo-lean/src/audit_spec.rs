@@ -4790,7 +4790,7 @@ mod lexer_tests {
     use super::*;
 
     #[test]
-    fn audit_spec_toml_typo_key_fails_closed() {
+    fn audit_spec_toml_typo_key_wrapper_fails_closed() {
         let typo_toml = "[audit_spec]\nreject_conjunct_tautologys = true\n";
         // 1. Strict parse: an unknown/misspelled key must fail closed with an
         //    error that names the offending key instead of listing the schema.
