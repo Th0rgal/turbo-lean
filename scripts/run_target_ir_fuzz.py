@@ -138,6 +138,70 @@ def find_sanitizer_c_linker(clang_bin: str) -> str | None:
     return None
 
 
+_OPT_ASAN_PROBE_CACHE: dict[str, str | None] = {}
+
+
+def build_opt_asan_probe_ir() -> str:
+    """Minimal host-arch module in the exact shape the LLVM trap legs feed
+    `opt -passes=asan` (opaque pointers, `sanitize_address`, stack `alloca`)."""
+    _, triple, datalayout = llvm_diff.host_llvm_cpu_target()
+    return (
+        f'target datalayout = "{datalayout}"\n'
+        f'target triple = "{triple}"\n'
+        "define ccc i64 @probe_asan(i64 %a) sanitize_address {\n"
+        "entry:\n"
+        "  %slot = alloca i64, align 8\n"
+        "  store i64 %a, ptr %slot, align 8\n"
+        "  %r = load i64, ptr %slot, align 8\n"
+        "  ret i64 %r\n"
+        "}\n"
+    )
+
+
+def probe_opt_asan(opt_bin: str) -> str | None:
+    """Probe `opt -passes=asan` against the IR it will process. Returns `None` when
+    usable, else the named reason (the toolchain does not bundle `opt`, and LLVM 15's
+    new-PM has no `asan` module pass: measured `unknown pass name 'asan'`). Any opt
+    whose pipeline handles this IR is accepted -- the gate is the IR's needs, not a
+    version number."""
+    if opt_bin in _OPT_ASAN_PROBE_CACHE:
+        return _OPT_ASAN_PROBE_CACHE[opt_bin]
+    reason: str | None
+    try:
+        with tempfile.TemporaryDirectory(prefix="ln-fuzz-opt-probe-") as tmp_str:
+            tmp = Path(tmp_str)
+            raw = tmp / "probe_asan.ll"
+            out = tmp / "probe_asan.out.ll"
+            raw.write_text(build_opt_asan_probe_ir(), encoding="utf-8")
+            proc = subprocess.run(
+                [opt_bin, "-passes=asan", "-S", str(raw), "-o", str(out)],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        reason = (
+            None
+            if proc.returncode == 0
+            else f"opt -passes=asan unusable ({opt_bin}): {proc.stderr.strip()[:200]}"
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        reason = f"opt -passes=asan probe failed to execute ({opt_bin}): {exc}"
+    _OPT_ASAN_PROBE_CACHE[opt_bin] = reason
+    return reason
+
+
+def find_asan_capable_opt() -> tuple[str | None, list[str]]:
+    """First installed `opt` whose `-passes=asan` handles the emitted IR; also
+    returns the probe-failure reasons of every rejected candidate."""
+    reasons: list[str] = []
+    for cand in llvm_diff.iter_llvm_tool_candidates(["opt-18", "opt-19", "opt", "opt-17", "opt-20"]):
+        reason = probe_opt_asan(cand)
+        if reason is None:
+            return cand, reasons
+        reasons.append(reason)
+    return None, reasons
+
+
 def _s8(u: int) -> int:
     u &= MASK8
     return u - 0x100 if (u & 0x80) else u
@@ -1184,27 +1248,56 @@ def execute_suite_payload(
         san_linker = find_sanitizer_c_linker(clang_bin)
         if not san_linker:
             raise RuntimeError(f"Missing ASan/UBSan C linker for clang={clang_bin}")
+        trap_opt_bin: str | None = opt_bin if probe_opt_asan(opt_bin) is None else None
+        if trap_opt_bin is None:
+            trap_opt_bin, probe_reasons = find_asan_capable_opt()
+            if trap_opt_bin is None and any(c["kind"] != "valid" for c in llvm_cases):
+                # The trap legs need `opt -passes=asan`; the toolchain does not bundle
+                # opt, so when every installed opt is too old for the emitted IR the
+                # stage reports the missing engine instead of failing on it.
+                print(
+                    "[target-ir-fuzz] SKIPPED llvm trap cases (missing engine): no installed "
+                    "opt has a usable -passes=asan for the emitted IR (install llvm >= 16): "
+                    + "; ".join(probe_reasons or ["no opt candidates found"])
+                )
         for c in llvm_cases:
             if c["kind"] == "valid":
                 run_llvm_valid_case(lli_bin, opt_bin, c)
                 counts["llvm_valid"] += 1
+            elif trap_opt_bin is None:
+                counts["llvm_trap_skipped_missing_engine"] = (
+                    counts.get("llvm_trap_skipped_missing_engine", 0) + 1
+                )
             else:
-                rc = run_llvm_trap_case_native(clang_bin, opt_bin, c, sanitizer_linker=san_linker)
+                rc = run_llvm_trap_case_native(clang_bin, trap_opt_bin, c, sanitizer_linker=san_linker)
                 if rc == 0:
                     raise RuntimeError(f"[{c['id']}] native ASan/UBSan binary exited 0 on {c['trapClass']}!")
                 counts["llvm_trap"] += 1
 
     ptx_cases = suite.get("ptxCases", []) if "ptx" in want else []
     if ptx_cases:
-        if not ptxas_bin:
+        if not ptxas_bin and gpu_diff.host_machine() not in ("x86_64", "amd64"):
+            print(
+                "[target-ir-fuzz] SKIPPED ptx cases (missing engine): no `ptxas` and the "
+                f"pinned nvidia wheel is x86_64-only (host is {gpu_diff.host_machine()}); "
+                "the CUDA/PTX leg stays x86-gated"
+            )
+            counts["ptx_skipped_missing_engine"] = len(ptx_cases)
+        elif not ptxas_bin:
             raise RuntimeError("Missing ptxas binary for PTX fuzz cases")
-        for c in ptx_cases:
-            run_ptx_case(ptxas_bin, c)
-            counts["ptx_valid" if c["kind"] == "valid" else "ptx_trap"] += 1
+        else:
+            for c in ptx_cases:
+                run_ptx_case(ptxas_bin, c)
+                counts["ptx_valid" if c["kind"] == "valid" else "ptx_trap"] += 1
 
     hlo_cases = suite.get("stablehloCases", []) if "stablehlo" in want else []
     if hlo_cases:
-        gpu_diff.ensure_openxla_stablehlo(tools_cache_dir)
+        try:
+            gpu_diff.ensure_openxla_stablehlo(tools_cache_dir)
+        except gpu_diff.HostArchSkip as exc:
+            print(f"[target-ir-fuzz] SKIPPED stablehlo cases (missing engine): {exc}")
+            counts["stablehlo_skipped_missing_engine"] = len(hlo_cases)
+            hlo_cases = []
         for c in hlo_cases:
             run_stablehlo_case(tools_cache_dir, c)
             counts["stablehlo_valid" if c["kind"] == "valid" else "stablehlo_trap"] += 1
@@ -1246,19 +1339,26 @@ class TargetIRFuzzSelfTests(unittest.TestCase):
     def test_llvm_native_asan_ubsan_trap(self) -> None:
         strict_tools = os.environ.get("TARGET_IR_FUZZ_STRICT_TOOLS", "").lower() == "true"
         clang_bin = find_clang_c()
-        opt_bin = llvm_diff.find_llvm_tool(["opt-18", "opt-19", "opt"])
+        opt_bin, opt_probe_reasons = find_asan_capable_opt()
         if not clang_bin or not opt_bin:
             if strict_tools:
-                self.fail(f"Required clang/opt missing under strict mode: clang={clang_bin}, opt={opt_bin}")
-            self.skipTest("clang/opt not available")
+                self.fail(
+                    "Required clang/opt missing under strict mode: "
+                    f"clang={clang_bin}, opt={opt_bin}, opt_probe={opt_probe_reasons}"
+                )
+            self.skipTest(
+                "clang or an opt with a usable -passes=asan not available: "
+                + ("; ".join(opt_probe_reasons) if opt_probe_reasons else "not installed")
+            )
+        _, host_triple, host_datalayout = llvm_diff.host_llvm_cpu_target()
         oob_case = {
             "id": "selftest_llvm_oob",
             "fnName": "f_oob",
             "roundtripVerified": True,
             "inputs": [11, 2],
             "irText": (
-                'target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"\n'
-                'target triple = "x86_64-unknown-linux-gnu"\n'
+                f'target datalayout = "{host_datalayout}"\n'
+                f'target triple = "{host_triple}"\n'
                 "define ccc i64 @f_oob(i64 %a, i64 %b) {\n"
                 "entry:\n"
                 "  %slot = alloca i64, align 8\n"
@@ -1277,6 +1377,22 @@ class TargetIRFuzzSelfTests(unittest.TestCase):
         if elan_clang.is_file() and os.access(elan_clang, os.X_OK):
             rc_elan = run_llvm_trap_case_native(str(elan_clang), opt_bin, oob_case)
             self.assertNotEqual(rc_elan, 0)
+
+    def test_opt_asan_probe_gates_unusable_engines(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="tl-fuzz-optprobe-") as td:
+            fake_opt = Path(td) / "fake_opt15.sh"
+            fake_opt.write_text(
+                "#!/bin/sh\necho \"$0: unknown pass name 'asan'\" >&2\nexit 1\n",
+                encoding="utf-8",
+            )
+            fake_opt.chmod(0o755)
+            reason = probe_opt_asan(str(fake_opt))
+            self.assertIsNotNone(reason)
+            self.assertIn("unknown pass name", reason)
+        _, host_triple, host_datalayout = llvm_diff.host_llvm_cpu_target()
+        probe_ir = build_opt_asan_probe_ir()
+        self.assertIn(f'target triple = "{host_triple}"', probe_ir)
+        self.assertIn(f'target datalayout = "{host_datalayout}"', probe_ir)
 
     def test_metal_tsan_and_asan_traps(self) -> None:
         strict_tools = os.environ.get("TARGET_IR_FUZZ_STRICT_TOOLS", "").lower() == "true"
@@ -1412,17 +1528,24 @@ def main(argv: list[str] | None = None) -> int:
 
     if "stablehlo" in backends:
         py_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
-        reexec_rc = _maybe_reexec_compatible_python(
-            py_tag=py_tag,
-            ensure_tools=args.ensure_tools,
-            tools_cache_dir=args.tools_cache_dir,
-            raw_argv=list(argv) if argv is not None else sys.argv[1:],
-        )
+        try:
+            reexec_rc = _maybe_reexec_compatible_python(
+                py_tag=py_tag,
+                ensure_tools=args.ensure_tools,
+                tools_cache_dir=args.tools_cache_dir,
+                raw_argv=list(argv) if argv is not None else sys.argv[1:],
+            )
+        except gpu_diff.HostArchSkip as exc:
+            print(f"[target-ir-fuzz] stablehlo python bootstrap unavailable (missing engine): {exc}")
+            reexec_rc = None
         if reexec_rc is not None:
             return reexec_rc
 
     if args.ensure_tools and ("ptx" in backends or "stablehlo" in backends):
-        gpu_diff.ensure_gpu_tpu_tools(args.tools_cache_dir)
+        try:
+            gpu_diff.ensure_gpu_tpu_tools(args.tools_cache_dir)
+        except gpu_diff.HostArchSkip as exc:
+            print(f"[target-ir-fuzz] tool bootstrap incomplete (missing engine): {exc}")
 
     if args.suite_json:
         payload = json.loads(args.suite_json.read_text(encoding="utf-8"))

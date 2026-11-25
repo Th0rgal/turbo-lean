@@ -35,6 +35,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import struct
@@ -49,6 +50,26 @@ from pathlib import Path
 from typing import Any
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
+
+
+class HostArchSkip(RuntimeError):
+    """A pinned x86_64-only artifact (wheel / standalone cpython) cannot serve this
+    host's CPU arch. Callers turn this into a clean, named SKIP instead of a
+    download/extract/import traceback."""
+
+
+def host_machine() -> str:
+    return platform.machine().lower()
+
+
+def require_x86_64_pinned_artifact(component: str) -> None:
+    m = host_machine()
+    if m not in ("x86_64", "amd64"):
+        raise HostArchSkip(
+            f"{component} is pinned for x86_64 only and this host is {m}; "
+            "no aarch64 artifact is pinned yet (the CUDA/ptxas leg stays x86-gated)"
+        )
+
 
 # Pinned wheel artifacts for hermetic `--ensure-tools` bootstrapping (no `venv`/`ensurepip` required).
 PTXAS_WHEEL_URL = (
@@ -125,6 +146,7 @@ def ensure_compatible_python(cache_dir: Path) -> str:
     found = find_compatible_python(cache_dir)
     if found:
         return found
+    require_x86_64_pinned_artifact("the standalone cpython-3.12 runtime (STANDALONE_CP312_URL)")
     cache_dir.mkdir(parents=True, exist_ok=True)
     archive = cache_dir / "cpython-3.12.16-x86_64-linux.tar.gz"
     download_verified(STANDALONE_CP312_URL, archive, STANDALONE_CP312_SHA256)
@@ -182,8 +204,15 @@ def ensure_openxla_stablehlo(cache_dir: Path) -> Path | None:
         site_dir = cache_dir / rel
         if site_dir.is_dir() and str(site_dir) not in sys.path:
             sys.path.insert(0, str(site_dir))
-    import numpy as _np  # noqa: F401
-    from mlir.dialects import stablehlo as _shlo  # noqa: F401
+    try:
+        import numpy as _np  # noqa: F401
+        from mlir.dialects import stablehlo as _shlo  # noqa: F401
+    except ImportError:
+        # On a non-x86_64 host the cached/pinned wheels can never satisfy these
+        # imports (x86_64-only binary wheels): name the skip instead of letting
+        # the ImportError read as a missing cache.
+        require_x86_64_pinned_artifact("the pinned OpenXLA StableHLO / numpy wheels")
+        raise
 
     site_pkg = cache_dir / "site-packages"
     return site_pkg if site_pkg.is_dir() else None
@@ -194,6 +223,7 @@ def ensure_gpu_tpu_tools(cache_dir: Path) -> tuple[str, Path | None]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     ptxas_bin = find_ptxas(cache_dir)
     if ptxas_bin is None:
+        require_x86_64_pinned_artifact("the nvidia ptxas wheel (PTXAS_WHEEL_URL)")
         whl_path = cache_dir / "nvidia_cuda_nvcc_cu12-12.9.86.whl"
         download_verified(PTXAS_WHEEL_URL, whl_path, PTXAS_WHEEL_SHA256)
         out_ptxas = cache_dir / "bin" / "ptxas"
@@ -218,6 +248,7 @@ def ensure_gpu_tpu_tools(cache_dir: Path) -> tuple[str, Path | None]:
         pass
 
     py_tag = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    require_x86_64_pinned_artifact("the pinned OpenXLA StableHLO / numpy wheels")
     site_dir.mkdir(parents=True, exist_ok=True)
 
     try:
@@ -1489,6 +1520,14 @@ kernel void k_div(
 
 
 def main() -> int:
+    try:
+        return _run_main()
+    except HostArchSkip as exc:
+        print(f"[gpu-tpu-diff] SKIPPED (missing engine): {exc}")
+        return 0
+
+
+def _run_main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--core-bin", type=Path, default=ROOT_DIR / "lean" / ".lake" / "build" / "bin" / "lean-native-core")
     ap.add_argument("--fixtures-json", type=Path, default=None, help="Pre-generated `gpu-tpu-diff-suite` JSON")
@@ -1544,6 +1583,12 @@ def main() -> int:
         return 0
 
     if not ptxas_bin:
+        if host_machine() not in ("x86_64", "amd64"):
+            print(
+                "[gpu-tpu-diff] SKIPPED (missing engine): no `ptxas` on PATH and the pinned "
+                f"nvidia wheel is x86_64-only (host is {host_machine()}); the CUDA/PTX leg stays x86-gated"
+            )
+            return 0
         print("[FAIL] `ptxas` not found; pass --ensure-tools or set PTXAS", file=sys.stderr)
         return 1
     clangxx = find_clangxx()

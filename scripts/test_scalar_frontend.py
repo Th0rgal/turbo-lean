@@ -1,6 +1,7 @@
 """Actual stock-Lean/LNIR/LLVM execution; no Python result oracle."""
 import json
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -35,6 +36,32 @@ def tearDownModule():
 
 
 SPEC_LEAN = fuzzer.ROOT / "lean" / "LeanNative" / "Spec.lean"
+
+# The primary `--arch` legs run the host CPU's TargetArch spelling; the opposite
+# CPU arch stays covered as the symmetric cross-emission leg (an arm64 host
+# cross-emits x86_64 IR, an x86_64 host cross-emits arm64 IR).
+HOST_ARCH = "arm64" if platform.machine().lower() in ("aarch64", "arm64") else "x86_64"
+CROSS_ARCH = "x86_64" if HOST_ARCH == "arm64" else "arm64"
+
+# Arch-specific LLVM signature shapes for the stage-1B declarations: the x86_64
+# ABI lowering carries `zeroext` return/param attributes that the AArch64
+# lowering omits.
+S1B_IR_NEEDLES = {
+    "x86_64": (
+        "define dso_local zeroext i8 @s1b_u8_ops(i8 zeroext noundef %arg_v0, i8 zeroext noundef %arg_v1)",
+        "define dso_local zeroext i16 @s1b_u16_helper_jp(i16 zeroext noundef %arg_v0, i16 zeroext noundef %arg_v1)",
+        "define dso_local i32 @s1b_u32_divmod_casts(i32 noundef %arg_v0, i32 noundef %arg_v1)",
+        "define dso_local zeroext i8 @s1b_bool_logic(i8 zeroext noundef %arg_v0, i8 zeroext noundef %arg_v1, i64 noundef %arg_v2)",
+    ),
+    "arm64": (
+        "define dso_local i8 @s1b_u8_ops(i8 noundef %arg_v0, i8 noundef %arg_v1)",
+        "define dso_local i16 @s1b_u16_helper_jp(i16 noundef %arg_v0, i16 noundef %arg_v1)",
+    ),
+}
+ENUM256_IR_NEEDLE = {
+    "x86_64": "define dso_local zeroext i16 @big_enum_tag(i16 zeroext noundef %arg_v0)",
+    "arm64": "define dso_local i16 @big_enum_tag(i16 noundef %arg_v0)",
+}
 
 
 def _requested_sanitizers() -> tuple[bool, bool]:
@@ -468,7 +495,7 @@ def s1b_enum_branch (tag : UInt8) (x : UInt64) (y : UInt64) : UInt64 :=
 
             wire_path = tmpdir / "stage1b.lnir"
             subprocess.run(
-                [full_bin, "emit-lnir", "--wire", "--arch", "x86_64", str(lean_path), "-o", str(wire_path)],
+                [full_bin, "emit-lnir", "--wire", "--arch", HOST_ARCH, str(lean_path), "-o", str(wire_path)],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -481,7 +508,7 @@ def s1b_enum_branch (tag : UInt8) (x : UInt64) (y : UInt64) : UInt64 :=
             cases_jsonl = tmpdir / "cases.jsonl"
             cases_jsonl.write_text("\n".join(json.dumps(c) for c in cases) + "\n", encoding="utf-8")
             ev_out = subprocess.check_output(
-                [core_bin, "eval-lnir", "--lnir", str(wire_path), "--arch", "x86_64", "--opt", "--cases-file", str(cases_jsonl)],
+                [core_bin, "eval-lnir", "--lnir", str(wire_path), "--arch", HOST_ARCH, "--opt", "--cases-file", str(cases_jsonl)],
                 text=True,
             )
             ev_rows = json.loads(ev_out)
@@ -490,28 +517,26 @@ def s1b_enum_branch (tag : UInt8) (x : UInt64) (y : UInt64) : UInt64 :=
                 self.assertTrue(r["ok"], r)
             lnir_vals = [int(r["value_u64"]) for r in ev_rows]
 
-            ll_x64 = tmpdir / "stage1b.x86_64.ll"
-            ll_arm = tmpdir / "stage1b.arm64.ll"
+            ll_host = tmpdir / f"stage1b.{HOST_ARCH}.ll"
+            ll_cross = tmpdir / f"stage1b.{CROSS_ARCH}.ll"
             subprocess.run(
-                [core_bin, "compile-llvm", "--lnir", str(wire_path), "--arch", "x86_64", "-o", str(ll_x64)],
+                [core_bin, "compile-llvm", "--lnir", str(wire_path), "--arch", HOST_ARCH, "-o", str(ll_host)],
                 check=True,
                 capture_output=True,
                 text=True,
             )
             subprocess.run(
-                [core_bin, "compile-llvm", "--lnir", str(wire_path), "--arch", "arm64", "-o", str(ll_arm)],
+                [core_bin, "compile-llvm", "--lnir", str(wire_path), "--arch", CROSS_ARCH, "-o", str(ll_cross)],
                 check=True,
                 capture_output=True,
                 text=True,
             )
-            ir_x64 = ll_x64.read_text(encoding="utf-8")
-            ir_arm = ll_arm.read_text(encoding="utf-8")
-            self.assertIn("define dso_local zeroext i8 @s1b_u8_ops(i8 zeroext noundef %arg_v0, i8 zeroext noundef %arg_v1)", ir_x64)
-            self.assertIn("define dso_local zeroext i16 @s1b_u16_helper_jp(i16 zeroext noundef %arg_v0, i16 zeroext noundef %arg_v1)", ir_x64)
-            self.assertIn("define dso_local i32 @s1b_u32_divmod_casts(i32 noundef %arg_v0, i32 noundef %arg_v1)", ir_x64)
-            self.assertIn("define dso_local zeroext i8 @s1b_bool_logic(i8 zeroext noundef %arg_v0, i8 zeroext noundef %arg_v1, i64 noundef %arg_v2)", ir_x64)
-            self.assertIn("define dso_local i8 @s1b_u8_ops(i8 noundef %arg_v0, i8 noundef %arg_v1)", ir_arm)
-            self.assertIn("define dso_local i16 @s1b_u16_helper_jp(i16 noundef %arg_v0, i16 noundef %arg_v1)", ir_arm)
+            ir_host = ll_host.read_text(encoding="utf-8")
+            ir_cross = ll_cross.read_text(encoding="utf-8")
+            for needle in S1B_IR_NEEDLES[HOST_ARCH]:
+                self.assertIn(needle, ir_host)
+            for needle in S1B_IR_NEEDLES[CROSS_ARCH]:
+                self.assertIn(needle, ir_cross)
 
             c_lines = [
                 "#include <stdint.h>",
@@ -548,11 +573,11 @@ def s1b_enum_branch (tag : UInt8) (x : UInt64) (y : UInt64) : UInt64 :=
             c_runner = tmpdir / "c_runner"
             c_driver.write_text("\n".join(c_lines) + "\n", encoding="utf-8")
             asan, ubsan = _requested_sanitizers()
-            raw_ir_sha = fuzzer.sha256_bytes(ll_x64.read_bytes())
+            raw_ir_sha = fuzzer.sha256_bytes(ll_host.read_bytes())
             san_meta = fuzzer.compile_and_link_llvm_driver(
                 clang_bin=clang_bin,
                 extra_inc=fuzzer.clang_extra_flags(clang_bin),
-                ll_path=ll_x64,
+                ll_path=ll_host,
                 driver_c_path=c_driver,
                 out_bin_path=c_runner,
                 asan=asan,
@@ -720,7 +745,7 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
             src_path = tmpdir / "WasmUSize.lean"
             src_path.write_text(usize_src, encoding="utf-8")
             wasm_wire = tmpdir / "wasm.lnir"
-            x64_wire = tmpdir / "x64.lnir"
+            native_wire = tmpdir / "native.lnir"
             subprocess.run(
                 [full_bin, "emit-lnir", "--wire", "--arch", "wasm32", str(src_path), "-o", str(wasm_wire)],
                 check=True,
@@ -728,7 +753,7 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
                 text=True,
             )
             subprocess.run(
-                [full_bin, "emit-lnir", "--wire", "--arch", "x86_64", str(src_path), "-o", str(x64_wire)],
+                [full_bin, "emit-lnir", "--wire", "--arch", HOST_ARCH, str(src_path), "-o", str(native_wire)],
                 check=True,
                 capture_output=True,
                 text=True,
@@ -749,15 +774,17 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
                     text=True,
                 )
             )
-            x64_ev = json.loads(
+            # USize is 64-bit on both native CPU targets (x86_64 and arm64), so the
+            # host-arch leg expects the same 64-bit wrap/shift semantics either way.
+            native_ev = json.loads(
                 subprocess.check_output(
                     [
                         core_bin,
                         "eval-lnir",
                         "--lnir",
-                        str(x64_wire),
+                        str(native_wire),
                         "--arch",
-                        "x86_64",
+                        HOST_ARCH,
                         "--batch-json",
                         "--args",
                         "wasm_usize_probe:4294967295,33",
@@ -766,7 +793,7 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
                 )
             )
             self.assertEqual(int(wasm_ev[0]["value_u64"]), (0) ^ ((0xFFFFFFFF << 1) & 0xFFFFFFFF))
-            self.assertEqual(int(x64_ev[0]["value_u64"]), 0x100000000 ^ ((0xFFFFFFFF << 33) & 0xFFFFFFFFFFFFFFFF))
+            self.assertEqual(int(native_ev[0]["value_u64"]), 0x100000000 ^ ((0xFFFFFFFF << 33) & 0xFFFFFFFFFFFFFFFF))
 
             wasm_ll = tmpdir / "wasm.ll"
             subprocess.run(
@@ -873,8 +900,8 @@ def wasm_usize_probe (x : USize) (y : USize) : UInt64 :=
             enum256_wire = tmpdir / "enum256.lnir"
             subprocess.run([full_bin, "emit-lnir", "--wire", str(enum256_src), "-o", str(enum256_wire)], check=True, capture_output=True, text=True)
             enum256_ll = tmpdir / "enum256.ll"
-            subprocess.run([core_bin, "compile-llvm", "--lnir", str(enum256_wire), "--arch", "x86_64", "-o", str(enum256_ll)], check=True, capture_output=True, text=True)
-            self.assertIn("define dso_local zeroext i16 @big_enum_tag(i16 zeroext noundef %arg_v0)", enum256_ll.read_text(encoding="utf-8"))
+            subprocess.run([core_bin, "compile-llvm", "--lnir", str(enum256_wire), "--arch", HOST_ARCH, "-o", str(enum256_ll)], check=True, capture_output=True, text=True)
+            self.assertIn(ENUM256_IR_NEEDLE[HOST_ARCH], enum256_ll.read_text(encoding="utf-8"))
 
             unsup_and_valid = tmpdir / "unsup_mix.lnir"
             unsup_and_valid.write_text(
@@ -1076,7 +1103,7 @@ def f (x : UInt64) : UInt64 :=
             src.write_text(lean_src, encoding="utf-8")
             wire = tmp / "diamond.lnir"
             res = subprocess.run(
-                [engines["full_bin"], "emit-lnir", "--wire", "--arch", "x86_64", str(src), "-o", str(wire)],
+                [engines["full_bin"], "emit-lnir", "--wire", "--arch", HOST_ARCH, str(src), "-o", str(wire)],
                 capture_output=True, text=True,
             )
             self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
@@ -1089,7 +1116,7 @@ def f (x : UInt64) : UInt64 :=
                 encoding="utf-8",
             )
             ev_res = subprocess.run(
-                [engines["core_bin"], "eval-lnir", "--lnir", str(wire), "--arch", "x86_64", "--opt", "--cases-file", str(cases_jsonl)],
+                [engines["core_bin"], "eval-lnir", "--lnir", str(wire), "--arch", HOST_ARCH, "--opt", "--cases-file", str(cases_jsonl)],
                 capture_output=True, text=True,
             )
             self.assertEqual(ev_res.returncode, 0, ev_res.stdout + ev_res.stderr)

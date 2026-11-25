@@ -42,6 +42,7 @@ import argparse
 import hashlib
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,13 @@ import fuzz_lcnf_conformance as fuzz_san
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CORE_BIN = ROOT / "lean" / ".lake" / "build" / "bin" / "lean-native-core"
+
+# The live CAbiEmit/compile-llvm legs emit IR for the HOST CPU (the objects are
+# linked into host-native ASan/UBSan harnesses), in the Lean `TargetArch`
+# spelling; the aarch64 triple/datalayout pair mirrors the Rust-side
+# `builtin_fastcheck_cpu_target` (crates/turbo-lean/src/gpu_fastcheck.rs) and
+# `TargetArch.llvmTriple`/`dataLayout` (lean/LeanNative/IR/Types.lean).
+HOST_ARCH = "arm64" if platform.machine().lower() in ("aarch64", "arm64") else "x86_64"
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -675,7 +683,7 @@ def run_sanitizer_suite(
 
         if core_path is not None:
             subprocess.run(
-                [str(core_path), "emit-cabi-bindings", "--canonical-benchmark", "--arch", "x86_64", "--emit-header", str(hdr_path)],
+                [str(core_path), "emit-cabi-bindings", "--canonical-benchmark", "--arch", HOST_ARCH, "--emit-header", str(hdr_path)],
                 cwd=ROOT,
                 check=True,
                 capture_output=True,
@@ -685,7 +693,7 @@ def run_sanitizer_suite(
             asan_ll_path = tmpdir / "canonical.asan.ll"
             obj_path = tmpdir / "canonical.asan.o"
             subprocess.run(
-                [str(core_path), "compile-llvm", "--canonical-benchmark", "--arch", "x86_64", "-o", str(ll_path)],
+                [str(core_path), "compile-llvm", "--canonical-benchmark", "--arch", HOST_ARCH, "-o", str(ll_path)],
                 cwd=ROOT,
                 check=True,
                 capture_output=True,
@@ -926,7 +934,7 @@ class HeapObjSanitizerSelfTests(unittest.TestCase):
                 "#endif\n''', encoding='utf-8')\n"
                 "elif args[0] == 'compile-llvm':\n"
                 "    out = Path(args[args.index('-o') + 1])\n"
-                "    out.write_text('''target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n"
+                "    ir = '''target datalayout = \"e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128\"\n"
                 "target triple = \"x86_64-unknown-linux-gnu\"\n"
                 "declare void @lean_native_evm_sload(ptr, ptr, ptr)\n"
                 "declare void @lean_native_evm_sstore(ptr, ptr, ptr)\n"
@@ -969,7 +977,16 @@ class HeapObjSanitizerSelfTests(unittest.TestCase):
                 "  %par = call i64 @lean_native_trm_matryoshka_parity_u64(i64 7)\n"
                 "  ret void\n"
                 "}\n"
-                "attributes #0 = { nounwind uwtable \"target-cpu\"=\"x86-64-v2\" }\n''', encoding='utf-8')\n",
+                "attributes #0 = { nounwind uwtable \"target-cpu\"=\"x86-64-v2\" }\n'''\n"
+                # Host-arch parameterization: on aarch64 hosts the mock emits the arm64
+                # triple/datalayout/attribute footer that `compile-llvm --arch arm64`
+                # produces; on x86_64 hosts the IR bytes are identical to the literal above.
+                "    import platform\n"
+                "    if platform.machine().lower() in ('aarch64', 'arm64'):\n"
+                "        ir = ir.replace('e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128', 'e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128')\n"
+                "        ir = ir.replace('x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu')\n"
+                "        ir = ir.replace('\"target-cpu\"=\"x86-64-v2\"', '\"target-features\"=\"+v8.2a,+neon,+fp-armv8,+fullfp16,+fp16fml,+dotprod,+lse\"')\n"
+                "    out.write_text(ir, encoding='utf-8')\n",
                 encoding="utf-8",
             )
             mock_core.chmod(0o755)
