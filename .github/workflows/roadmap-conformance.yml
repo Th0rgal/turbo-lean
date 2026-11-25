@@ -147,6 +147,10 @@ jobs:
         env:
           CONFORMANCE_SEEDS: ${{ needs.impact.outputs.conformance_seeds }}
           TARGET_IR_FUZZ_SEEDS: ${{ needs.impact.outputs.target_ir_fuzz_seeds }}
+          # This job provisions llvm-18, so missing-engine states are failures
+          # here; the impact-gate jobs have no LLVM install and stay non-strict.
+          TARGET_IR_FUZZ_STRICT_TOOLS: "true"
+          TURBO_LLI_DIFF_STRICT_TOOLS: "true"
         run: ./scripts/verify_roadmap_contract.sh
 
       - name: Run full scalar/tuple/Stage-1D frontend & SymbolicTV conformance suite
