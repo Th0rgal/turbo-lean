@@ -471,6 +471,257 @@ pub(crate) fn record_snapshot_modules_in_store(
     Ok(())
 }
 
+// -------------------------------------------------------------------------------------------
+// P9 (issues #411 / #412): early imported-posture policy decision, wired through the landed
+// `kernel.rs` transitive csimp posture scan (#455). One cheap `--import-posture` worker pass
+// (a single `importModules`, no snapshot, no kernel replay, no per-declaration axiom-closure
+// walk) reports the posture facts; `kernel::decide_import_posture_policy` applies the
+// `turbo-lean.toml` allowlists and refuses forbidden postures with the knob named BEFORE the
+// expensive audit machinery runs. Allowed postures proceed into the unchanged, authoritative
+// audit; any infrastructure failure of this pass falls through to that audit (never fail-open).
+// -------------------------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct WirePostureCsimpEntry {
+    e: String,
+    u: String,
+    s: bool,
+    t: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct WirePostureModule {
+    m: String,
+    #[serde(default)]
+    init_sysroot: bool,
+    #[serde(default)]
+    imports: Vec<String>,
+    #[serde(default)]
+    csimp: Vec<WirePostureCsimpEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WirePostureUnsafe {
+    r: String,
+    u: String,
+    p: bool,
+    c: bool,
+    #[serde(default)]
+    w: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WirePostureBridge {
+    r: String,
+    u: String,
+    x: bool,
+    i: bool,
+    a: bool,
+    #[serde(default)]
+    w: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WirePostureTarget {
+    m: String,
+    #[serde(default)]
+    axioms: Vec<String>,
+    #[serde(default)]
+    uind: Vec<String>,
+    #[serde(default, rename = "unsafe")]
+    unsafe_decls: Vec<WirePostureUnsafe>,
+    #[serde(default)]
+    bridge: Vec<WirePostureBridge>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WirePostureReply {
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    modules: Vec<WirePostureModule>,
+    #[serde(default)]
+    targets: Vec<WirePostureTarget>,
+}
+
+/// The early import-policy pre-pass result: the canonical transitive csimp posture digest of each
+/// audited root module (`kernel::compute_transitive_csimp_posture_digest`), for cache-key folding.
+pub(crate) struct ImportPolicyPrepass {
+    // Read by G1a (`csimp` digest folded into the kernel-audit cache keys in `db.rs`); until that
+    // lands, P9 only computes it.
+    #[allow(dead_code)]
+    pub(crate) csimp_posture_digests: std::collections::BTreeMap<String, String>,
+}
+
+/// Decide the imported-`.olean` policy (csimp / unsafe / implemented_by / axioms allowlists)
+/// before the expensive audit. `Ok(None)` means the pass did not decide (untrusted mode, the
+/// `TURBO_LEAN_EARLY_IMPORT_POLICY=off` opt-out, or an infrastructure failure of the posture
+/// scan) and the authoritative audit decides as before; an `Err` is the decided early refusal.
+fn early_import_policy_prepass(
+    store_root: &Path,
+    cfg: &crate::module_builder::ProjectConfig,
+    sorted_mods: &[String],
+    lean_path_env: &str,
+    extra_ro_binds: &[PathBuf],
+    is_untrusted: bool,
+) -> Result<Option<ImportPolicyPrepass>> {
+    if is_untrusted || sorted_mods.is_empty() || !crate::kernel::early_import_policy_enabled() {
+        return Ok(None);
+    }
+    let undecided = |why: String| {
+        eprintln!(
+            "[turbo-lean] early import-policy posture scan did not decide ({why}); the in-kernel audit decides"
+        );
+        Ok(None)
+    };
+    let (mut cmd, timeout) =
+        match kernel_reader_command(store_root, cfg, lean_path_env, extra_ro_binds, false) {
+            Ok(v) => v,
+            Err(e) => return undecided(format!("reader unavailable: {e:#}")),
+        };
+    cmd.arg("--import-posture");
+    for a in pinned_ffi_allow_args(cfg, sorted_mods) {
+        cmd.arg(a);
+    }
+    for m in sorted_mods {
+        cmd.arg(m);
+    }
+    let out = match crate::module_builder::run_command_with_timeout(&mut cmd, timeout, false) {
+        Ok(o) => o,
+        Err(e) => return undecided(format!("posture reader failed to run: {e:#}")),
+    };
+    let stdout_str = String::from_utf8_lossy(&out.stdout);
+    let json_line = stdout_str
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| l.starts_with('{') && l.ends_with('}'))
+        .unwrap_or("");
+    let reply: WirePostureReply = match serde_json::from_str(json_line) {
+        Ok(r) => r,
+        Err(e) => {
+            return undecided(format!(
+                "unparsable posture reply (exit={}): {e}; stderr: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    };
+    if !out.status.success() || !reply.ok {
+        return undecided(format!(
+            "posture reader rejected the module set (exit={}): {}",
+            out.status,
+            reply.error.unwrap_or_default()
+        ));
+    }
+
+    let mut scan_map: std::collections::BTreeMap<String, crate::kernel::CompiledModuleCsimpObservation> =
+        std::collections::BTreeMap::new();
+    let mut decision_modules: std::collections::BTreeMap<String, crate::kernel::ImportPostureModule> =
+        std::collections::BTreeMap::new();
+    for m in &reply.modules {
+        let mut observations = Vec::with_capacity(m.csimp.len());
+        let mut entries = Vec::with_capacity(m.csimp.len());
+        for we in &m.csimp {
+            let observation = match crate::kernel::parse_public_signature_csimp_entry(&we.e) {
+                Ok(o) => o,
+                Err(e) => return undecided(format!("malformed posture csimp entry: {e:#}")),
+            };
+            observations.push(observation.clone());
+            entries.push(crate::kernel::PostureCsimpEntry {
+                observation,
+                thm_user_name: we.u.clone(),
+                strict: we.s,
+                touches_target: we.t,
+            });
+        }
+        scan_map.insert(
+            m.m.clone(),
+            crate::kernel::CompiledModuleCsimpObservation {
+                imports: m.imports.clone(),
+                entries: observations,
+            },
+        );
+        decision_modules.insert(
+            m.m.clone(),
+            crate::kernel::ImportPostureModule {
+                module: m.m.clone(),
+                init_sysroot: m.init_sysroot,
+                imports: m.imports.clone(),
+                csimp: entries,
+            },
+        );
+    }
+    let mut csimp_posture_digests = std::collections::BTreeMap::new();
+    for root in sorted_mods {
+        match crate::kernel::scan_transitive_csimp_posture(root, |m| Ok(scan_map.get(m).cloned()))
+        {
+            Ok(posture) => {
+                csimp_posture_digests.insert(root.clone(), posture.digest);
+            }
+            Err(e) => return undecided(format!("transitive csimp posture scan failed: {e:#}")),
+        }
+    }
+
+    let targets: Vec<crate::kernel::ImportPostureTarget> = reply
+        .targets
+        .iter()
+        .map(|t| crate::kernel::ImportPostureTarget {
+            module: t.m.clone(),
+            axioms: t.axioms.clone(),
+            unsafe_inductives: t.uind.clone(),
+            unsafe_decls: t
+                .unsafe_decls
+                .iter()
+                .map(|u| crate::kernel::PostureUnsafeCandidate {
+                    raw: u.r.clone(),
+                    user: u.u.clone(),
+                    pattern_allowable: u.p,
+                    can_allow: u.c,
+                    wrapper_names: u.w.clone(),
+                })
+                .collect(),
+            bridge_decls: t
+                .bridge
+                .iter()
+                .map(|b| crate::kernel::PostureBridgeCandidate {
+                    raw: b.r.clone(),
+                    user: b.u.clone(),
+                    is_extern: b.x,
+                    is_implemented_by: b.i,
+                    auxiliary: b.a,
+                    wrapper_names: b.w.clone(),
+                })
+                .collect(),
+        })
+        .collect();
+    let lists = crate::kernel::ImportPolicyAllowlists {
+        axioms: crate::splitter::allowed_axioms(),
+        csimp: crate::splitter::normalized_policy_env_vec("TURBO_LEAN_ALLOWED_CSIMP"),
+        unsafe_decls: crate::splitter::normalized_policy_env_vec("TURBO_LEAN_ALLOWED_UNSAFE"),
+        implemented_by: crate::splitter::normalized_policy_env_vec(
+            "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY",
+        ),
+    };
+    let target_set: std::collections::BTreeSet<String> = sorted_mods.iter().cloned().collect();
+    let decision = crate::kernel::decide_import_posture_policy(
+        &targets,
+        &decision_modules,
+        &target_set,
+        &lists,
+    );
+    if !decision.violations.is_empty() {
+        anyhow::bail!(
+            "Imported `.olean` import policy refused before the in-kernel audit (decided early from the compiled posture; allowlisted postures proceed):\n  {}",
+            decision.violations.join("\n  ")
+        );
+    }
+    Ok(Some(ImportPolicyPrepass {
+        csimp_posture_digests,
+    }))
+}
+
 pub(crate) fn audit_compiled_modules_with_zygote(
     store: &TurboStore,
     cfg: &crate::module_builder::ProjectConfig,
@@ -526,6 +777,17 @@ pub(crate) fn audit_compiled_modules_with_zygote_snapshot(
     let mut sorted: Vec<String> = mod_names.to_vec();
     sorted.sort();
     sorted.dedup();
+    // P9: decide the import policy (csimp / unsafe / implemented_by / axioms allowlists) before
+    // the expensive snapshot + whole-closure replay + per-declaration audit work below.
+    let early_posture = early_import_policy_prepass(
+        &store.root,
+        cfg,
+        &sorted,
+        lean_path_env,
+        extra_ro_binds,
+        is_untrusted,
+    )?;
+    let _ = &early_posture;
     if is_untrusted {
         // Validate the caller's live search paths against the untrusted sandbox gate first, then
         // bind-mount only the immutable `ClosureSnapshot` directory inside `bwrap` so multi-module
