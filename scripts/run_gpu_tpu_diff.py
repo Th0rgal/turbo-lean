@@ -59,6 +59,10 @@ class HostArchSkip(RuntimeError):
 
 
 def host_machine() -> str:
+    # Deliberately raw (not host_arch.host_target_arch()): the question here is
+    # "can the pinned x86_64-only artifacts run on this machine", and the answer
+    # for every non-x86 machine (aarch64, riscv64, s390x, ...) is the same named
+    # skip, not an unsupported-host error.
     return platform.machine().lower()
 
 
@@ -67,7 +71,7 @@ def require_x86_64_pinned_artifact(component: str) -> None:
     if m not in ("x86_64", "amd64"):
         raise HostArchSkip(
             f"{component} is pinned for x86_64 only and this host is {m}; "
-            "no aarch64 artifact is pinned yet (the CUDA/ptxas leg stays x86-gated)"
+            f"no {m} artifact is pinned yet"
         )
 
 
@@ -223,7 +227,9 @@ def ensure_gpu_tpu_tools(cache_dir: Path) -> tuple[str, Path | None]:
     cache_dir.mkdir(parents=True, exist_ok=True)
     ptxas_bin = find_ptxas(cache_dir)
     if ptxas_bin is None:
-        require_x86_64_pinned_artifact("the nvidia ptxas wheel (PTXAS_WHEEL_URL)")
+        require_x86_64_pinned_artifact(
+            "the nvidia ptxas wheel (PTXAS_WHEEL_URL; the CUDA leg stays x86-gated)"
+        )
         whl_path = cache_dir / "nvidia_cuda_nvcc_cu12-12.9.86.whl"
         download_verified(PTXAS_WHEEL_URL, whl_path, PTXAS_WHEEL_SHA256)
         out_ptxas = cache_dir / "bin" / "ptxas"

@@ -1,7 +1,6 @@
 """Actual stock-Lean/LNIR/LLVM execution; no Python result oracle."""
 import json
 import os
-import platform
 import re
 import subprocess
 import sys
@@ -10,6 +9,7 @@ import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fuzz_lcnf_conformance as fuzzer
+import host_arch
 
 _SAVED_ELAN_TOOLCHAIN = None
 _HAD_ELAN_TOOLCHAIN = False
@@ -40,7 +40,7 @@ SPEC_LEAN = fuzzer.ROOT / "lean" / "LeanNative" / "Spec.lean"
 # The primary `--arch` legs run the host CPU's TargetArch spelling; the opposite
 # CPU arch stays covered as the symmetric cross-emission leg (an arm64 host
 # cross-emits x86_64 IR, an x86_64 host cross-emits arm64 IR).
-HOST_ARCH = "arm64" if platform.machine().lower() in ("aarch64", "arm64") else "x86_64"
+HOST_ARCH = host_arch.host_target_arch()
 CROSS_ARCH = "x86_64" if HOST_ARCH == "arm64" else "arm64"
 
 # Arch-specific LLVM signature shapes for the stage-1B declarations: the x86_64

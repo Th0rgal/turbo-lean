@@ -37,7 +37,6 @@ import shutil
 import signal
 import time
 import subprocess
-import platform
 import sys
 import tempfile
 import unittest
@@ -48,6 +47,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import fuzz_lcnf_conformance as fuzzer  # noqa: E402
+import host_arch  # noqa: E402
 
 _SAVED_ELAN_TOOLCHAIN = None
 _HAD_ELAN_TOOLCHAIN = False
@@ -78,7 +78,7 @@ CORE_BIN = ROOT / "lean" / ".lake" / "build" / "bin" / "lean-native-core"
 # The primary CPU `--arch` legs run the host's TargetArch spelling; the opposite
 # CPU arch stays covered by explicit cross-emission legs (the Apple arm64 tests
 # below plus test_04b: an arm64 host cross-emits x86_64 IR and vice versa).
-HOST_ARCH = "arm64" if platform.machine().lower() in ("aarch64", "arm64") else "x86_64"
+HOST_ARCH = host_arch.host_target_arch()
 CROSS_ARCH = "x86_64" if HOST_ARCH == "arm64" else "arm64"
 CPU_ARCH_TRIPLES = {"x86_64": "x86_64-unknown-linux-gnu", "arm64": "aarch64-unknown-linux-gnu"}
 
