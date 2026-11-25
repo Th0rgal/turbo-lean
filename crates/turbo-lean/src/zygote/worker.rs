@@ -524,6 +524,11 @@ pub struct ZygoteWorkerProcess {
     pub(super) cold_import_us: Option<u64>,
     pub(super) is_master: bool,
     pub(super) _master: Option<std::sync::Arc<ZygoteMasterEntry>>,
+    /// H2.3 r1 (finding 2): the RLIMIT_DATA share this worker was spawned with, if any.
+    /// `apply_worker_rlimit` lowers `rlim_max` too, so the cap is permanent; a capped
+    /// worker may pool only under a key that names its cap, or an uncapped request would
+    /// reuse it and fail allocations with no `memory_kill_note`.
+    pub(super) rlimit_mb: Option<u64>,
 }
 
 #[cfg(unix)]
@@ -624,6 +629,8 @@ impl ZygoteWorkerProcess {
             stderr_tail, stderr_scan, pinned_snapshot_dir: self.pinned_snapshot_dir,
             spawn_lean_path: self.spawn_lean_path.clone(), warm_prefixes: self.warm_prefixes.clone(),
             warm_prefix_tree: self.warm_prefix_tree.clone(), warm_imports: self.warm_imports.clone(), request_count: 0, cold_import_us: None, is_master: false, _master: None,
+            // A clone inherits the master's process limits, and masters spawn uncapped.
+            rlimit_mb: None,
         })
     }
 }
@@ -2170,7 +2177,6 @@ mod pool_queue_tests {
     fn queue_runs_workers_concurrently_and_preserves_result_order() {
         let live = AtomicUsize::new(0);
         let max_live = AtomicUsize::new(0);
-        let t0 = std::time::Instant::now();
         let (finished, outcomes) = run_request_queue_over_workers(
             vec![0usize, 1, 2],
             9,
@@ -2183,7 +2189,6 @@ mod pool_queue_tests {
                 (idx * 10, QueueWorkerFate::Healthy)
             },
         );
-        let wall = t0.elapsed();
         assert_eq!(finished.len(), 3);
         assert!(finished
             .iter()
@@ -2198,13 +2203,11 @@ mod pool_queue_tests {
             max_live.load(Ordering::SeqCst) <= 3,
             "more concurrent requests than workers"
         );
+        // H2.3 r1 (finding 7): the concurrency counter is the proof; a wall-time bound
+        // flakes on a loaded runner and was removed.
         assert!(
             max_live.load(Ordering::SeqCst) >= 2,
             "9 sleep-shaped requests over 3 workers never overlapped: the queue ran serially"
-        );
-        assert!(
-            wall < std::time::Duration::from_millis(9 * 40),
-            "9 x 40ms requests over 3 workers took {wall:?}: no faster than a serial loop"
         );
     }
 
