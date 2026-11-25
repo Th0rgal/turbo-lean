@@ -130,10 +130,7 @@ def buildNativeExecutable (filePath : String) (outBin : String) (optLevel : Stri
   let (cCode, rawMod) ← emitLeanCFromSourceFile filePath `Main hostArch
   let (optMod, _) := LeanNative.Transform.runDefaultPipeline rawMod
   if let some err := buildExeLLVMGate? rawMod optMod hostArch then throw <| IO.userError err
-  let superoptTgt : LeanNative.Transform.SuperoptTarget :=
-    match hostArch with
-    | .arm64 => .arm64
-    | _ => .x86_64
+  let superoptTgt := LeanNative.Transform.SuperoptTarget.ofTargetArch hostArch
   let batchEnv ← IO.getEnv "SANDBOXED_TELEMETRY_BATCH_ONLY"
   let isBatchOnly := (batchEnv.map (fun s => s.trimAscii.toString) |>.getD "") == "1"
   if !isBatchOnly then
