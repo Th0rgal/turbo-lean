@@ -882,19 +882,33 @@ pub(super) fn build_module_compile_command(
 pub(super) type ModuleCompileOutput = (i64, String, String);
 pub(super) type StagedModuleCompileOutput = (i64, String, TempDirGuard);
 
-/// Per-module / per-shard compile timeout in seconds (`TURBO_LEAN_MODULE_TIMEOUT_SECS`,
-/// defaulting to 300 s and clamped in untrusted mode to `[15, 600]` so heavy proof modules
-/// do not spuriously fail on shared 4-vCPU CI runners while untrusted builds remain bounded).
-pub(crate) fn module_compile_timeout_secs_from(raw_env: Option<&str>, is_untrusted: bool) -> u64 {
+/// Per-module / per-shard compile timeout in seconds (`TURBO_LEAN_MODULE_TIMEOUT_SECS` or
+/// `[build] module_timeout_secs` in turbo-lean.toml, which main.rs maps onto the same
+/// environment key), clamped in untrusted mode to `[15, 600]` so heavy proof modules do not
+/// spuriously fail on shared 4-vCPU CI runners while untrusted builds remain bounded.
+///
+/// With no explicit setting the trusted default is adaptive (#437): `max(300 s, 3 × the
+/// last recorded compile duration)` when the caller knows one, else 1800 s — a flat 300 s
+/// killed legitimate proof-heavy modules that take over 400 s.
+pub(crate) fn module_compile_timeout_secs_with_history(
+    raw_env: Option<&str>,
+    is_untrusted: bool,
+    last_duration_ms: Option<u64>,
+) -> u64 {
     let configured = raw_env
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(300);
+        .filter(|&n| n > 0);
     if is_untrusted {
-        configured.clamp(15, 600)
-    } else {
-        configured
+        return configured.unwrap_or(300).clamp(15, 600);
     }
+    configured.unwrap_or_else(|| match last_duration_ms {
+        Some(ms) => ms.div_ceil(1000).saturating_mul(3).max(300),
+        None => 1800,
+    })
+}
+
+pub(crate) fn module_compile_timeout_secs_from(raw_env: Option<&str>, is_untrusted: bool) -> u64 {
+    module_compile_timeout_secs_with_history(raw_env, is_untrusted, None)
 }
 
 pub(crate) fn module_compile_timeout_secs(is_untrusted: bool) -> u64 {
@@ -970,12 +984,20 @@ pub(super) fn compile_single_module_staged(
         std::time::Duration::from_secs(timeout_secs),
         is_untrusted,
     )
-    .with_context(|| {
-        format!(
-            "Failed to invoke `lean` compiler ({}) for module `{}`",
-            cfg.lean_bin.display(),
-            node.module_name
-        )
+    .map_err(|e| {
+        // #437: a timeout names the knob instead of a bare "timed out after Nms".
+        if e.to_string().contains("timed out") {
+            e.context(format!(
+                "module `{}` exceeded its {}s compile timeout (raise `[build] module_timeout_secs` in turbo-lean.toml or `TURBO_LEAN_MODULE_TIMEOUT_SECS`)",
+                node.module_name, timeout_secs
+            ))
+        } else {
+            e.context(format!(
+                "Failed to invoke `lean` compiler ({}) for module `{}`",
+                cfg.lean_bin.display(),
+                node.module_name
+            ))
+        }
     })?;
     record_scheduler_test_event(
         "compile_subprocess_end",

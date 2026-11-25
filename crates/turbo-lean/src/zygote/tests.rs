@@ -1971,6 +1971,32 @@ use super::*;
     }
 
     #[test]
+    fn test_replay_timeout_budget_env_and_fallback() {
+        let _guard = crate::pack::tests::env_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev_replay = std::env::var_os("TURBO_LEAN_REPLAY_TIMEOUT_SECS");
+        let prev_audit = std::env::var_os("TURBO_LEAN_AUDIT_TIMEOUT_SECS");
+        std::env::remove_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS");
+        std::env::remove_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS");
+        // #437: the replay budget defaults to the audit budget ...
+        assert_eq!(replay_timeout_ms(false), audit_timeout_ms(false));
+        assert_eq!(replay_timeout_ms(true), audit_timeout_ms(true));
+        // ... and has its own knob (`[replay] timeout_secs` sets this environment key).
+        std::env::set_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS", "3600");
+        assert_eq!(replay_timeout_ms(false), 3_600_000);
+        assert_eq!(replay_timeout_ms(true), 3_600_000);
+        match prev_replay {
+            Some(v) => std::env::set_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS", v),
+            None => std::env::remove_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS"),
+        }
+        match prev_audit {
+            Some(v) => std::env::set_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS", v),
+            None => std::env::remove_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS"),
+        }
+    }
+
+    #[test]
     fn test_worker_budget_from_env_and_jobs_export() {
         let _guard = crate::pack::tests::env_test_lock()
             .lock()

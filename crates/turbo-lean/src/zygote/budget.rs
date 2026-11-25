@@ -427,8 +427,9 @@ pub(crate) fn invocation_timeout_ms() -> Option<u64> {
     })
 }
 
-/// Per-audit / `.olean`-reader budget in milliseconds (`TURBO_LEAN_AUDIT_TIMEOUT_SECS`,
-/// defaulting to 120 s in untrusted mode and 300 s in trusted mode).
+/// Per-audit / `.olean`-reader budget in milliseconds (`TURBO_LEAN_AUDIT_TIMEOUT_SECS`, or
+/// `[audit] timeout_secs` in turbo-lean.toml; defaulting to 120 s in untrusted mode and
+/// 300 s in trusted mode).
 pub(crate) fn audit_timeout_ms(is_untrusted: bool) -> u64 {
     std::env::var("TURBO_LEAN_AUDIT_TIMEOUT_SECS")
         .ok()
@@ -436,6 +437,17 @@ pub(crate) fn audit_timeout_ms(is_untrusted: bool) -> u64 {
         .filter(|&v| v > 0)
         .unwrap_or(if is_untrusted { 120 } else { 300 })
         .saturating_mul(1000)
+}
+
+/// Per kernel-replay-worker budget in milliseconds (`TURBO_LEAN_REPLAY_TIMEOUT_SECS`, or
+/// `[replay] timeout_secs` in turbo-lean.toml), defaulting to `audit_timeout_ms` (#437).
+pub(crate) fn replay_timeout_ms(is_untrusted: bool) -> u64 {
+    std::env::var("TURBO_LEAN_REPLAY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
+        .map(|secs| secs.saturating_mul(1000))
+        .unwrap_or_else(|| audit_timeout_ms(is_untrusted))
 }
 
 /// Effective `.olean` declaration-identity reader budget in milliseconds: aligns with

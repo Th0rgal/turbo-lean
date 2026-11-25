@@ -1130,21 +1130,24 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
         budget.per_worker_rlimit_mb(parallelism)
     };
     let run_replay_slice = |slice: &[String]| -> Result<()> {
-        let (mut cmd, base_timeout) =
+        let (mut cmd, _audit_timeout) =
             kernel_reader_command(store_root, cfg, lean_path_env, extra_ro_binds, is_untrusted)?;
         if let Some(mb) = per_worker_rlimit_mb {
             WorkerBudget::apply_worker_rlimit(&mut cmd, mb);
         }
+        // #437: the replay budget has its own knob (`[replay] timeout_secs` /
+        // TURBO_LEAN_REPLAY_TIMEOUT_SECS), defaulting to the audit budget.
+        let replay_timeout = std::time::Duration::from_millis(replay_timeout_ms(is_untrusted));
         let timeout = if slice.len() == 1 {
             cmd.args(["--kernel-replay-module", &slice[0]]);
-            base_timeout
+            replay_timeout
         } else {
             cmd.arg("--kernel-replay-closure");
             cmd.args(slice.iter().map(|s| s.as_str()));
             if is_untrusted {
-                base_timeout
+                replay_timeout
             } else {
-                base_timeout.max(std::time::Duration::from_secs(600))
+                replay_timeout.max(std::time::Duration::from_secs(600))
             }
         };
         let out = crate::module_builder::run_command_with_timeout_pinned_fd(
@@ -1167,7 +1170,7 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
             );
         }
         for m in slice {
-            let (mut single_cmd, single_timeout) = kernel_reader_command(
+            let (mut single_cmd, _single_audit_timeout) = kernel_reader_command(
                 store_root,
                 cfg,
                 lean_path_env,
@@ -1180,7 +1183,7 @@ pub(crate) fn kernel_replay_modules_exec_pinned(
             single_cmd.args(["--kernel-replay-module", m]);
             let single_out = crate::module_builder::run_command_with_timeout_pinned_fd(
                 &mut single_cmd,
-                single_timeout,
+                replay_timeout,
                 is_untrusted,
                 pinned_dir_raw_fd,
             )

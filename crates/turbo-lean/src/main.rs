@@ -1006,6 +1006,24 @@ fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        // #437: `[audit] timeout_secs` and `[replay] timeout_secs` next to
+        // `[build] module_timeout_secs`; an explicit environment setting wins.
+        if std::env::var_os("TURBO_LEAN_AUDIT_TIMEOUT_SECS").is_none() {
+            if let Some(secs) = accelerators::toml_value(&config, "audit", "timeout_secs") {
+                let secs: u64 = secs.parse()?;
+                if secs > 0 {
+                    std::env::set_var("TURBO_LEAN_AUDIT_TIMEOUT_SECS", secs.to_string());
+                }
+            }
+        }
+        if std::env::var_os("TURBO_LEAN_REPLAY_TIMEOUT_SECS").is_none() {
+            if let Some(secs) = accelerators::toml_value(&config, "replay", "timeout_secs") {
+                let secs: u64 = secs.parse()?;
+                if secs > 0 {
+                    std::env::set_var("TURBO_LEAN_REPLAY_TIMEOUT_SECS", secs.to_string());
+                }
+            }
+        }
     }
     if matches!(
         &cli.command,
