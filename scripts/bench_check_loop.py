@@ -78,7 +78,10 @@ COVERAGE_GATE = 0.90
 BUSY_LOAD_THRESHOLD = 1.0  # one 100%-CPU tenant already poisons warm medians
 DEFAULT_TRIALS = 5
 DEFAULT_WARMUP = 1
-CHECK_TIMEOUT_S = 900
+# Per-check wall budget. 900 s is the default; a loaded host can push a cold
+# Batteries warm-setup past it (measured 2026-11-25), so a run may widen the
+# budget through the environment. The value is recorded with the results.
+CHECK_TIMEOUT_S = int(os.environ.get("TURBO_LEAN_BENCH_CHECK_TIMEOUT_S", "900"))
 
 PINNED_REVS = {
     "batteries": "66e469188fe07963e5cf666c7d4433f45b8131c5",  # tag v4.35.0
@@ -122,7 +125,7 @@ RECORDED_ENV_VARS = [
     "TURBO_LEAN_GIT", "TURBO_LEAN_ALLOWED_CSIMP", "TURBO_LEAN_ALLOWED_UNSAFE",
     "TURBO_LEAN_ALLOWED_IMPLEMENTED_BY", "TURBO_LEAN_HOME", "TURBO_LEAN_STAGING_DIR",
     "TURBO_LEAN_NO_DAEMON", "TURBO_LEAN_NO_REMOTE_TELEMETRY", "TURBO_LEAN_TELEMETRY",
-    "TURBO_LEAN_DAEMON_IDLE_SECS",
+    "TURBO_LEAN_DAEMON_IDLE_SECS", "TURBO_LEAN_BENCH_CHECK_TIMEOUT_S",
 ]
 
 VERDICT_EXIT = {
