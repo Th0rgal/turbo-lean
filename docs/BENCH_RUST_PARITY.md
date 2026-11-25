@@ -154,6 +154,8 @@ The runner also executes these real commands after the timed suite:
 
 ```bash
 ./lean/.lake/build/bin/lean-native-core calibrate-cost --target x86_64 --json
+# On an aarch64 host, calibrate the arm64 profile instead:
+# ./lean/.lake/build/bin/lean-native-core calibrate-cost --target arm64 --json
 export LEAN_NATIVE_CORE_BIN="$PWD/lean/.lake/build/bin/lean-native-core"
 ./target/release/turbo-lean superopt-evolve --help
 ./target/release/turbo-lean superopt-evolve --generations 2 --seed 1 --input canonical --json --no-telemetry

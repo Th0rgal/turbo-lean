@@ -1,0 +1,20 @@
+{
+  "profile_id": "arm64_grace_neoverse_v2",
+  "target": "arm64",
+  "llvm_target_cpu": "neoverse-v2",
+  "sm_arch": "sm_90",
+  "add_sub_cost": 1,
+  "bitwise_cost": 1,
+  "shift_cost": 1,
+  "cmp_cost": 1,
+  "mul_cost": 4,
+  "div_mod_cost": 24,
+  "fma_cost": 2,
+  "select_cost": 2,
+  "clz256_cost": 2,
+  "add_sub_checked256_cost": 3,
+  "mul_checked256_cost": 4,
+  "min_gpu_elements": 65536,
+  "gpu_block_threads": 256,
+  "matmul_tile_dim": 16
+}
