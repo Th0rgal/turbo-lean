@@ -1,4 +1,17 @@
 {
+  "bridge_file_sha256": {
+    "lean/LeanNative/IR/Bridge.lean": "35bc45aaeaedb10a9e5d5987821f8a6d66592fbe1634ccccdd7175896eb4471d",
+    "lean/LeanNative/IR/BridgeHelpers.lean": "223552ea889239dd90f8b8e8ecec17ca6017e482314c05c909b63d5261f28660",
+    "lean/LeanNative/IR/BridgeHelpers/DeclIngestAndValidation.lean": "251a4a5437bcd1327fb3b77eed984ba578a4b0f30020c7d95d711af9a5f401d4",
+    "lean/LeanNative/IR/BridgeHelpers/HeapAndConstructors.lean": "8373c434f4b8716c6c39230239202e493793e8749165a9c4afefae995d729c26",
+    "lean/LeanNative/IR/BridgeHelpers/RealBridgeCtxAndSlices.lean": "5577bb7347139e4d96ee7739dd85e55a5abdf20dc5a8786c6eb5f7a5c3a9a47d",
+    "lean/LeanNative/IR/BridgeHelpers/ScalarDagAndJoinPoints.lean": "42bdac7e56063d12506f9af947f0f7eaf4260374cf74a54a3b2f80665a9af031",
+    "lean/LeanNative/IR/BridgeHelpers/StateAndIntrinsics.lean": "f0a9d71675a70a6e2637b00d264bfa7ed2aafad7b8f7ddf137a781c4aa095b10",
+    "lean/LeanNative/IR/BridgeHelpers/TypesAndSigs.lean": "1e6d6f4c07d6684435c11a64a672f89dc7a0c781271e5a04b45c8250828a2223",
+    "lean/LeanNative/IR/RealLCNFBridge.lean": "b6da4f47f73d7ff231908ee9d8531f9231280108a78f6337ce8ec570516724ae",
+    "lean/LeanNative/IR/RealLCNFSemantics.lean": "3e5729f3aee6d1d993317577549dcb9475ac4b5832f94e54a04fa7d6a0aba0b6",
+    "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean": "2b652b961f78656b494c8f45a58293b0fb01f1f44c8d81c409f4201d546a5b16"
+  },
   "corpora": {
     "c1_corpus": {
       "lowered_unproved": 98,
@@ -35,8 +48,8 @@
       "total_declarations": 1805
     }
   },
-  "measured_source_commit": "fd919f2ebb4502ee9d0161ce91a0ec2556d85479",
+  "measured_source_commit": "8f76741f2394bc06f0a4b9c702969474ddfbeec6",
   "measured_source_commit_note": "`measured_source_commit` is the commit of the tree the measurement was taken from (recorded when `--write-results` ran, i.e. the parent of the commit that updates this file).",
-  "schemaVersion": "turbo-lean-lcnf-coverage-results-v1",
+  "schemaVersion": "turbo-lean-lcnf-coverage-results-v2",
   "toolchain": "leanprover/lean4:v4.35.0"
 }

@@ -73,13 +73,30 @@ CON_LECHE_PINNED_MODULE_COUNTS: dict[str, int] = {
 _LIVE_AUDIT_CACHE: dict[str, dict[str, Any]] = {}
 _CON_LECHE_CACHE: dict[str, dict[str, Any]] = {}
 
-TRACKED_BRIDGE_FILES: dict[str, str] = {
-    "lean/LeanNative/IR/Bridge.lean": "35bc45aaeaedb10a9e5d5987821f8a6d66592fbe1634ccccdd7175896eb4471d",
-    "lean/LeanNative/IR/RealLCNFBridge.lean": "b6da4f47f73d7ff231908ee9d8531f9231280108a78f6337ce8ec570516724ae",
-    "lean/LeanNative/IR/RealLCNFSemantics.lean": "3e5729f3aee6d1d993317577549dcb9475ac4b5832f94e54a04fa7d6a0aba0b6",
-    "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean": "2b652b961f78656b494c8f45a58293b0fb01f1f44c8d81c409f4201d546a5b16",
-    "lean/LeanNative/IR/BridgeHelpers.lean": "292aeccba7da5b22c770dc534a97619c533febd3d812071f5fb690dbed1015ee",
-}
+# The committed results pin the sha256 of every tracked bridge/semantics/proof
+# source they were measured from (`bridge_file_sha256` in
+# `scripts/lcnf_coverage_results.json`, written by `--write-results` and gated
+# by `--check`). The script itself carries no hard-coded digest: editing a
+# tracked file fails `--check` against the committed results until the
+# measurement is regenerated, and L1-L3 bridge PRs regenerate the JSON instead
+# of hand-editing this script.
+TRACKED_BRIDGE_FILES: tuple[str, ...] = (
+    "lean/LeanNative/IR/Bridge.lean",
+    "lean/LeanNative/IR/RealLCNFBridge.lean",
+    "lean/LeanNative/IR/RealLCNFSemantics.lean",
+    "lean/LeanNative/Proofs/RealLCNFBridgeProofs.lean",
+    "lean/LeanNative/IR/BridgeHelpers.lean",
+)
+# Every split helper module under these directories is tracked too (the S3a
+# split moved the helper bodies out of BridgeHelpers.lean); a helper file
+# added or removed changes the tracked set and fails `--check` until the
+# committed results are re-measured.
+TRACKED_BRIDGE_DIRS: tuple[str, ...] = ("lean/LeanNative/IR/BridgeHelpers",)
+RESULTS_SCHEMA_VERSION = "turbo-lean-lcnf-coverage-results-v2"
+MEASURED_SOURCE_COMMIT_NOTE = (
+    "`measured_source_commit` is the commit of the tree the measurement was taken from "
+    "(recorded when `--write-results` ran, i.e. the parent of the commit that updates this file)."
+)
 
 LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
     # 1. DeclValue (2 constructors)
@@ -307,7 +324,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "category": "LetValue",
         "construct": "Lean.Compiler.LCNF.LetValue.fap (GF(2^128) / BabyBear / Goldilocks SIMD intrinsic whitelist)",
         "status": "lowered_unproved",
-        "evidence_file": "lean/LeanNative/IR/BridgeHelpers.lean",
+        "evidence_file": "lean/LeanNative/IR/BridgeHelpers/StateAndIntrinsics.lean",
         "evidence_symbol": "tryLowerGfSimdIntrinsic",
         "notes": "Intercepted in BridgeHelpers before RealLCNFBridge with assurance := .tested; 0 hits across Std/Init+C2, C1, and con-leche.",
     },
@@ -498,7 +515,7 @@ LCNF_CONSTRUCTOR_MATRIX_SPEC: tuple[dict[str, str], ...] = (
         "category": "Type",
         "construct": "Int / Int8 / Int16 / Int32 / Int64 / ISize",
         "status": "rejected",
-        "evidence_file": "lean/LeanNative/IR/BridgeHelpers.lean",
+        "evidence_file": "lean/LeanNative/IR/BridgeHelpers/TypesAndSigs.lean",
         "evidence_symbol": "declUsesSignedScalarTransitively",
         "notes": "Transitive scan rejects signed integer types fail-closed before lowering.",
     },
@@ -530,6 +547,30 @@ CORPUS_SCOPES: dict[str, str] = {
 
 def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _tracked_bridge_paths(root_dir: Path = ROOT_DIR) -> list[str]:
+    """The bridge/semantics/proof sources whose sha256 the committed results pin.
+
+    The static `TRACKED_BRIDGE_FILES` plus every `*.lean` directly under the
+    `TRACKED_BRIDGE_DIRS` directories, so the tracked set follows the S3a
+    BridgeHelpers/ split (and any later split) without hand-editing a list.
+    """
+    paths = set(TRACKED_BRIDGE_FILES)
+    for rel_dir in TRACKED_BRIDGE_DIRS:
+        d = root_dir / rel_dir
+        if d.is_dir():
+            for f in sorted(d.glob("*.lean")):
+                paths.add(f"{rel_dir}/{f.name}")
+    return sorted(paths)
+
+
+def _is_hex_digest(value: Any, length: int) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == length
+        and all(c in "0123456789abcdef" for c in value)
+    )
 
 
 _LEAN_AUDIT_DRIVER_HEAD = r"""
@@ -1203,15 +1244,10 @@ def build_live_corpora(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
 
 
 def build_coverage_report(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
-    file_digests: dict[str, dict[str, str | bool]] = {}
-    for rel, pinned_sha in TRACKED_BRIDGE_FILES.items():
+    file_digests: dict[str, dict[str, str]] = {}
+    for rel in _tracked_bridge_paths(root_dir):
         p = root_dir / rel
-        actual_sha = sha256_file(p) if p.is_file() else ""
-        file_digests[rel] = {
-            "pinned_sha256": pinned_sha,
-            "actual_sha256": actual_sha,
-            "matches": actual_sha == pinned_sha,
-        }
+        file_digests[rel] = {"actual_sha256": sha256_file(p) if p.is_file() else ""}
 
     rows = [dict(r) for r in LCNF_CONSTRUCTOR_MATRIX_SPEC]
     proved_cnt = sum(1 for r in rows if r["status"] == "proved")
@@ -1248,8 +1284,27 @@ def build_coverage_report(root_dir: Path = ROOT_DIR) -> dict[str, Any]:
 
 
 def results_document(report: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[str, Any]:
-    """Build the committed baseline (`scripts/lcnf_coverage_results.json`) from a live report."""
+    """Build the committed baseline (`scripts/lcnf_coverage_results.json`) from a live report.
+
+    Fails closed: a provenance commit that is not a real sha, or a tracked
+    bridge file without a live digest, refuses to write rather than committing
+    an unverifiable baseline.
+    """
     head = _git_head(root_dir)
+    if not _is_hex_digest(head, 40):
+        raise RuntimeError(
+            f"refusing to write results: `git rev-parse HEAD` gave {head!r}, not a 40-hex commit"
+        )
+    digests: dict[str, str] = {}
+    for rel, info in report.get("bridge_source_digests", {}).items():
+        actual = info.get("actual_sha256", "") if isinstance(info, dict) else ""
+        if not _is_hex_digest(actual, 64):
+            raise RuntimeError(
+                f"refusing to write results: tracked bridge file `{rel}` has no live sha256"
+            )
+        digests[rel] = actual
+    if not digests:
+        raise RuntimeError("refusing to write results: live report tracks no bridge files")
     corpora: dict[str, Any] = {}
     for cname, corp in report.get("corpora", {}).items():
         if corp.get("status") == "unknown" or corp.get("measurement_source") != "live_invocation":
@@ -1271,13 +1326,11 @@ def results_document(report: dict[str, Any], root_dir: Path = ROOT_DIR) -> dict[
             }
         corpora[cname] = entry
     return {
-        "schemaVersion": "turbo-lean-lcnf-coverage-results-v1",
+        "schemaVersion": RESULTS_SCHEMA_VERSION,
         "toolchain": PINNED_TOOLCHAIN,
         "measured_source_commit": head,
-        "measured_source_commit_note": (
-            "`measured_source_commit` is the commit of the tree the measurement was taken from "
-            "(recorded when `--write-results` ran, i.e. the parent of the commit that updates this file)."
-        ),
+        "measured_source_commit_note": MEASURED_SOURCE_COMMIT_NOTE,
+        "bridge_file_sha256": digests,
         "corpora": corpora,
     }
 
@@ -1295,6 +1348,11 @@ def _validate_measured_entry(path: str, entry: Any, errors: list[str], depth: in
             errors.append(f"Results file `{path}` is marked not_measured yet carries declaration counts")
         if "subcorpora" in entry:
             errors.append(f"Results file `{path}` is marked not_measured yet carries subcorpora")
+        unknown = sorted(set(entry) - {"measurement_source", "reason"} - set(RESULT_FIELDS) - {"subcorpora"})
+        if unknown:
+            errors.append(
+                f"Results file `{path}` not_measured stub carries unknown keys: {', '.join(unknown)}"
+            )
         return
     if depth > 0 and "subcorpora" in entry:
         # The supported schema is corpus -> subcorpora only. A deeper level has
@@ -1305,6 +1363,12 @@ def _validate_measured_entry(path: str, entry: Any, errors: list[str], depth: in
             f"(only corpus -> subcorpora is supported)"
         )
         return
+    allowed_keys = set(RESULT_FIELDS) | {"rejected_not_lowered_reason"}
+    if depth == 0:
+        allowed_keys.add("subcorpora")
+    unknown = sorted(set(entry) - allowed_keys)
+    if unknown:
+        errors.append(f"Results file `{path}` carries unknown keys: {', '.join(unknown)}")
     for f in RESULT_FIELDS:
         if f not in entry:
             errors.append(f"Results file `{path}` is missing measured field `{f}`")
@@ -1374,9 +1438,23 @@ def validate_results_document(doc: Any) -> list[str]:
     if not isinstance(doc, dict):
         return ["Results file must be a JSON object"]
     errors: list[str] = []
-    if doc.get("schemaVersion") != "turbo-lean-lcnf-coverage-results-v1":
+    required_top = (
+        "schemaVersion",
+        "toolchain",
+        "measured_source_commit",
+        "measured_source_commit_note",
+        "bridge_file_sha256",
+        "corpora",
+    )
+    unknown_top = sorted(set(doc) - set(required_top))
+    if unknown_top:
+        errors.append(f"Results file carries unknown top-level keys: {', '.join(unknown_top)}")
+    for key in required_top:
+        if key not in doc:
+            errors.append(f"Results file is missing required key `{key}`")
+    if doc.get("schemaVersion") != RESULTS_SCHEMA_VERSION:
         errors.append(
-            "Results file schemaVersion must be `turbo-lean-lcnf-coverage-results-v1`, "
+            f"Results file schemaVersion must be `{RESULTS_SCHEMA_VERSION}`, "
             f"got {doc.get('schemaVersion')!r}"
         )
     if doc.get("toolchain") != PINNED_TOOLCHAIN:
@@ -1385,8 +1463,32 @@ def validate_results_document(doc: Any) -> list[str]:
             f"live={PINNED_TOOLCHAIN!r}"
         )
     msc = doc.get("measured_source_commit")
-    if not isinstance(msc, str) or not msc:
-        errors.append("Results file is missing `measured_source_commit`")
+    if not _is_hex_digest(msc, 40):
+        errors.append(
+            f"Results file `measured_source_commit` must be a 40-hex commit sha, got {msc!r}"
+        )
+    if doc.get("measured_source_commit_note") != MEASURED_SOURCE_COMMIT_NOTE:
+        errors.append(
+            "Results file `measured_source_commit_note` does not match the canonical note text "
+            "this script writes"
+        )
+    digests = doc.get("bridge_file_sha256")
+    if not isinstance(digests, dict) or not digests:
+        errors.append(
+            "Results file `bridge_file_sha256` must be a non-empty JSON object of "
+            "tracked path -> sha256"
+        )
+    else:
+        for rel in sorted(digests):
+            sha = digests[rel]
+            if not isinstance(rel, str) or not rel.endswith(".lean"):
+                errors.append(
+                    f"Results file `bridge_file_sha256` key {rel!r} is not a tracked `.lean` path"
+                )
+            if not _is_hex_digest(sha, 64):
+                errors.append(
+                    f"Results file `bridge_file_sha256[{rel}]` must be a 64-hex sha256, got {sha!r}"
+                )
     corpora = doc.get("corpora", {})
     if not isinstance(corpora, dict):
         errors.append("Results file `corpora` must be a JSON object")
@@ -1440,16 +1542,9 @@ def check_coverage_report(
     skipped_corpora: list[str] = []
     rep = report if report is not None else build_coverage_report(root_dir)
 
-    for rel, info in rep.get("bridge_source_digests", {}).items():
-        fpath = root_dir / rel
-        if not fpath.is_file():
+    for rel in rep.get("bridge_source_digests", {}):
+        if not (root_dir / rel).is_file():
             errors.append(f"Missing tracked bridge file: {rel}")
-            continue
-        if not info.get("matches", False):
-            errors.append(
-                f"Bridge source digest mismatch for {rel}: "
-                f"pinned={info.get('pinned_sha256')} actual={info.get('actual_sha256')}"
-            )
 
     for row in rep["lcnf_constructor_matrix"]["rows"]:
         ev_file = root_dir / row["evidence_file"]
@@ -1564,6 +1659,29 @@ def check_coverage_report(
 
     if baseline_doc is not None:
         errors.extend(validate_results_document(baseline_doc))
+        live_digests = rep.get("bridge_source_digests", {})
+        base_digests = baseline_doc.get("bridge_file_sha256", {}) if isinstance(baseline_doc, dict) else {}
+        if not isinstance(base_digests, dict):
+            base_digests = {}  # already named by validate_results_document
+        for rel, info in live_digests.items():
+            actual = info.get("actual_sha256", "") if isinstance(info, dict) else ""
+            if rel not in base_digests:
+                errors.append(
+                    f"Tracked bridge file `{rel}` is missing from "
+                    f"scripts/lcnf_coverage_results.json `bridge_file_sha256`"
+                )
+                continue
+            if base_digests[rel] != actual:
+                errors.append(
+                    f"Bridge source digest mismatch for {rel}: "
+                    f"committed={base_digests[rel]} actual={actual}"
+                )
+        for rel in sorted(base_digests):
+            if rel not in live_digests:
+                errors.append(
+                    f"File `{rel}` is pinned in scripts/lcnf_coverage_results.json "
+                    f"`bridge_file_sha256` but is not tracked by the live report"
+                )
         base_corpora = baseline_doc.get("corpora", {}) if isinstance(baseline_doc, dict) else {}
         if not isinstance(base_corpora, dict):
             base_corpora = {}
@@ -1853,20 +1971,42 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertTrue(any("std_init_and_c2" in e for e in chk["errors"]))
 
     def test_detects_bridge_digest_drift(self) -> None:
-        import shutil
+        # The digest pins live in the committed results (`bridge_file_sha256`),
+        # not in this script: a drifted value, a dropped entry, and an entry
+        # for a file the live report does not track each fail `--check` with a
+        # named error, and the tracked set covers the S3a BridgeHelpers/ split.
+        rep = self._v_fake_live_report()
+        tracked = _tracked_bridge_paths(ROOT_DIR)
+        self.assertGreaterEqual(len(tracked), 11, tracked)  # 5 static + the split helper files
+        self.assertIn("lean/LeanNative/IR/BridgeHelpers/RealBridgeCtxAndSlices.lean", tracked)
+        baseline = self._v_committed_baseline()
+        self.assertEqual(sorted(baseline["bridge_file_sha256"]), tracked)
 
-        with tempfile.TemporaryDirectory(prefix="lcnf-cov-") as tmp:
-            root = Path(tmp)
-            for rel in TRACKED_BRIDGE_FILES:
-                src = ROOT_DIR / rel
-                dst = root / rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dst)
-            target = root / "lean/LeanNative/IR/Bridge.lean"
-            target.write_text(target.read_text(encoding="utf-8") + "\n-- drift\n", encoding="utf-8")
-            chk = check_coverage_report(root)
-            self.assertFalse(chk["ok"])
-            self.assertTrue(any("digest mismatch" in e for e in chk["errors"]))
+        first = sorted(baseline["bridge_file_sha256"])[0]
+        drifted = json.loads(json.dumps(baseline))
+        drifted["bridge_file_sha256"][first] = "0" * 64
+        chk = check_coverage_report(ROOT_DIR, rep, results=drifted)
+        self.assertFalse(chk["ok"])
+        self.assertTrue(
+            any("digest mismatch" in e and first in e for e in chk["errors"]), chk["errors"]
+        )
+
+        dropped = json.loads(json.dumps(baseline))
+        del dropped["bridge_file_sha256"][first]
+        chk = check_coverage_report(ROOT_DIR, rep, results=dropped)
+        self.assertFalse(chk["ok"])
+        self.assertTrue(
+            any(first in e and "missing" in e for e in chk["errors"]), chk["errors"]
+        )
+
+        extra = json.loads(json.dumps(baseline))
+        extra["bridge_file_sha256"]["lean/LeanNative/IR/NotTracked.lean"] = "0" * 64
+        chk = check_coverage_report(ROOT_DIR, rep, results=extra)
+        self.assertFalse(chk["ok"])
+        self.assertTrue(
+            any("NotTracked.lean" in e and "not tracked" in e for e in chk["errors"]),
+            chk["errors"],
+        )
 
     def test_executes_live_lean_lowerer_on_corpora(self) -> None:
         live = execute_live_lean_audit(ROOT_DIR)
@@ -2040,7 +2180,10 @@ class TestLcnfCoverage(unittest.TestCase):
             "reason": "no prebuilt pinned con-leche tree (test fixture)",
         }
         return {
-            "bridge_source_digests": {},
+            "bridge_source_digests": {
+                rel: {"actual_sha256": sha256_file(ROOT_DIR / rel)}
+                for rel in _tracked_bridge_paths(ROOT_DIR)
+            },
             "lcnf_constructor_matrix": {
                 "rows": [],
                 "summary": {"total": 0, "proved": 0, "lowered_unproved": 0, "rejected": 0},
@@ -2478,6 +2621,119 @@ class TestLcnfCoverage(unittest.TestCase):
         self.assertEqual(rc, 1, f"unknown live status passed CLI --check: {out.getvalue()}")
         self.assertIn("c1_corpus", err.getvalue())
         self.assertIn("status", err.getvalue().lower())
+
+    def test_results_schema_rejects_unknown_keys_and_bad_provenance(self) -> None:
+        # H1.0a-V hardening: each of these mutations passed the pre-hardening
+        # gate (measured 2026-11-25). The committed note text is pinned, the
+        # provenance commit must be a real 40-hex sha (its VALUE is provenance
+        # and is deliberately not compared to HEAD), and unknown keys are
+        # rejected at the top level, in corpus entries, in subcorpus entries,
+        # and in not_measured stubs.
+        rep = self._v_fake_live_report()
+
+        def stubbed(d: dict[str, Any]) -> None:
+            d["corpora"]["con_leche_h3_benchmark"] = {
+                "measurement_source": "not_measured",
+                "reason": "tree absent",
+                "surprise_key": 1,
+            }
+
+        cases: list[tuple[str, Any, str]] = [
+            (
+                "altered measured_source_commit_note",
+                lambda d: d.update(measured_source_commit_note="drifted note"),
+                "measured_source_commit_note",
+            ),
+            (
+                "dropped measured_source_commit_note",
+                lambda d: d.pop("measured_source_commit_note"),
+                "measured_source_commit_note",
+            ),
+            (
+                "non-sha measured_source_commit",
+                lambda d: d.update(measured_source_commit="not-a-sha"),
+                "measured_source_commit",
+            ),
+            (
+                "'unknown' measured_source_commit",
+                lambda d: d.update(measured_source_commit="unknown"),
+                "measured_source_commit",
+            ),
+            ("extra top-level key", lambda d: d.update(surprise_key=1), "surprise_key"),
+            (
+                "extra corpus-entry key",
+                lambda d: d["corpora"]["c1_corpus"].update(surprise_key=1),
+                "surprise_key",
+            ),
+            (
+                "extra subcorpus-entry key",
+                lambda d: d["corpora"]["std_init_and_c2"]["subcorpora"]["std_init_data"].update(
+                    surprise_key=1
+                ),
+                "surprise_key",
+            ),
+            ("extra not_measured stub key", stubbed, "surprise_key"),
+        ]
+        for label, mutate, needle in cases:
+            doc = self._v_committed_baseline()
+            mutate(doc)
+            chk = check_coverage_report(ROOT_DIR, rep, results=doc)
+            self.assertFalse(chk["ok"], f"{label} passed --check")
+            self.assertTrue(
+                any(needle in e for e in chk["errors"]),
+                f"{label}: no error names `{needle}`: {chk['errors']}",
+            )
+
+    def test_every_committed_nested_field_mutation_is_rejected(self) -> None:
+        # H1.0a-V acceptance: walk the REAL committed baseline and prove, node
+        # by node, that `--check` rejects (a) an alteration of every scalar
+        # field, (b) a drop of every key, and (c) an unknown key injected into
+        # every object — at every nesting level, bridge_file_sha256 and
+        # subcorpora included. `measured_source_commit` alteration appends a
+        # non-hex suffix because its value is provenance by design; every
+        # other scalar is altered in kind (int +1, str suffix).
+        rep = self._v_fake_live_report()
+        pristine = self._v_committed_baseline()
+        self.assertTrue(
+            check_coverage_report(ROOT_DIR, rep, results=self._v_committed_baseline())["ok"]
+        )
+
+        mutants: list[tuple[str, dict[str, Any]]] = []
+
+        def clone_at(path: tuple[str, ...]) -> tuple[dict[str, Any], dict[str, Any]]:
+            clone = json.loads(json.dumps(pristine))
+            node = clone
+            for k in path:
+                node = node[k]
+            return clone, node
+
+        def rec(node: Any, path: tuple[str, ...]) -> None:
+            if isinstance(node, dict):
+                clone, tgt = clone_at(path)
+                tgt["injected_unexpected_key"] = 1
+                mutants.append((f"inject unknown key at {'.'.join(path) or '<top>'}", clone))
+                for k, v in node.items():
+                    clone, tgt = clone_at(path)
+                    del tgt[k]
+                    mutants.append((f"drop {'.'.join(path + (k,))}", clone))
+                    rec(v, path + (k,))
+            else:
+                clone, tgt = clone_at(path[:-1])
+                leaf = path[-1]
+                if isinstance(node, bool) or not isinstance(node, (int, str)):
+                    tgt[leaf] = "drifted"
+                elif isinstance(node, int):
+                    tgt[leaf] = node + 1
+                else:
+                    tgt[leaf] = node + "x"
+                mutants.append((f"alter {'.'.join(path)}", clone))
+
+        rec(pristine, ())
+        self.assertGreater(len(mutants), 60, "walk found suspiciously few committed fields")
+        for label, doc in mutants:
+            chk = check_coverage_report(ROOT_DIR, rep, results=doc)
+            self.assertFalse(chk["ok"], f"committed-field mutation passed --check: {label}")
+            self.assertTrue(chk["errors"], label)
 
     # ------------------------------------------------------------------
     # H1.0a-S (split S): honest proof classification and fail-closed
