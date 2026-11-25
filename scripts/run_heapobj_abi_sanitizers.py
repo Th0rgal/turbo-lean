@@ -978,12 +978,15 @@ class HeapObjSanitizerSelfTests(unittest.TestCase):
                 "  ret void\n"
                 "}\n"
                 "attributes #0 = { nounwind uwtable \"target-cpu\"=\"x86-64-v2\" }\n'''\n"
-                # Arch parameterization keyed on the --arch argument the mock is HANDED
-                # (so the selftest can catch a regression of run_sanitizer_suite's
-                # HOST_ARCH plumbing): for arm64 the mock emits the triple/datalayout/
-                # attribute footer that `compile-llvm --arch arm64` produces; for
-                # x86_64 the IR bytes are identical to the literal above.
-                "    arch = args[args.index('--arch') + 1] if '--arch' in args else 'x86_64'\n"
+                # Arch parameterization keyed on the --arch argument the mock is HANDED,
+                # and FAIL CLOSED without one (a silent x86_64 default would hide a
+                # regression of run_sanitizer_suite's HOST_ARCH plumbing on x86 hosts):
+                # for arm64 the mock emits the triple/datalayout/attribute footer that
+                # `compile-llvm --arch arm64` produces; for x86_64 the IR bytes are
+                # identical to the literal above.
+                "    if '--arch' not in args:\n"
+                "        sys.exit('mock-core: --arch is required')\n"
+                "    arch = args[args.index('--arch') + 1]\n"
                 "    if arch in ('arm64', 'aarch64'):\n"
                 "        ir = ir.replace('e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128', 'e-m:e-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128')\n"
                 "        ir = ir.replace('x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu')\n"
@@ -1007,6 +1010,15 @@ class HeapObjSanitizerSelfTests(unittest.TestCase):
                     text=True,
                 )
                 self.assertIn(needle, probe_ll.read_text(encoding="utf-8"))
+            # Without --arch the mock must fail closed (no silent x86_64 default),
+            # so run_sanitizer_suite regressing to an arch-less invocation turns
+            # this self-test red on every host, not only on arm64.
+            no_arch = subprocess.run(
+                [sys.executable, str(mock_core), "compile-llvm", "-o", str(Path(tmp) / "noarch.ll")],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(no_arch.returncode, 0, "mock must fail closed without --arch")
             report = run_sanitizer_suite(core_bin_arg=str(mock_core), require_tsan=False)
             self.assertTrue(report["ok"], json.dumps(report, indent=2))
             self.assertGreater(report["asanLsnUbsanClean"]["payload"]["kernelOut"], 0)
