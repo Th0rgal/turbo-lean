@@ -241,9 +241,7 @@ def find_v435_lean_and_init() -> tuple[Path, Path] | None:
     candidates: list[str | None] = [
         fuzz.find_lean_binary(),
         shutil.which("lean"),
-        str(Path.home() / ".elan/toolchains/leanprover--lean4---v4.35.0/bin/lean"),
-        "/root/.elan/toolchains/leanprover--lean4---v4.35.0/bin/lean",
-        "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin/lean",
+        *fuzz.toolchain_bin_candidates("lean", PINNED_CON_LECHE_TOOLCHAIN),
     ]
     for elan_cand in [shutil.which("elan"), "/var/lib/orb-node/work/caches/elan/bin/elan"]:
         if elan_cand and Path(elan_cand).is_file() and os.access(elan_cand, os.X_OK):
@@ -253,7 +251,7 @@ def find_v435_lean_and_init() -> tuple[Path, Path] | None:
                     cwd=ROOT / "verification" / "con-leche-bridge"
                     if (ROOT / "verification" / "con-leche-bridge").is_dir()
                     else ROOT,
-                    env=fuzz.pinned_toolchain_env(),
+                    env=fuzz.pinned_toolchain_env(toolchain=PINNED_CON_LECHE_TOOLCHAIN),
                     check=True,
                     capture_output=True,
                     text=True,
@@ -274,17 +272,17 @@ def find_v435_lean_and_init() -> tuple[Path, Path] | None:
             ver = subprocess.run(
                 [str(p), "--version"],
                 cwd=ROOT / "lean" if (ROOT / "lean").is_dir() else ROOT,
-                env=fuzz.pinned_toolchain_env(),
+                env=fuzz.pinned_toolchain_env(toolchain=PINNED_CON_LECHE_TOOLCHAIN),
                 check=True,
                 capture_output=True,
                 text=True,
             ).stdout
-            if "4.35.0" not in ver:
+            if fuzz.toolchain_version_token(PINNED_CON_LECHE_TOOLCHAIN) not in ver:
                 continue
             prefix = subprocess.run(
                 [str(p), "--print-prefix"],
                 cwd=ROOT / "lean" if (ROOT / "lean").is_dir() else ROOT,
-                env=fuzz.pinned_toolchain_env(),
+                env=fuzz.pinned_toolchain_env(toolchain=PINNED_CON_LECHE_TOOLCHAIN),
                 check=True,
                 capture_output=True,
                 text=True,
@@ -391,7 +389,7 @@ def run_c3_corpus(con_leche_bin_arg: str | None) -> dict[str, Any]:
         adv_dir.mkdir(parents=True, exist_ok=True)
         scratch_tmp.mkdir(parents=True, exist_ok=True)
 
-        sub_env = fuzz.pinned_toolchain_env()
+        sub_env = fuzz.pinned_toolchain_env(toolchain=PINNED_CON_LECHE_TOOLCHAIN)
         sub_env["TMPDIR"] = str(scratch_tmp)
 
         compiled_holdouts: list[dict[str, Any]] = []
@@ -574,7 +572,7 @@ def run_c2_corpus(cli_dir: str | None, asan: bool, ubsan: bool) -> dict[str, Any
     clang_bin = engines["clang_bin"]
     extra_inc = fuzz.clang_extra_flags(clang_bin)
     lean_prefix = Path(
-        subprocess.run([lean_bin, "--print-prefix"], env=fuzz.pinned_toolchain_env(),
+        subprocess.run([lean_bin, "--print-prefix"], env=fuzz.pinned_toolchain_env(toolchain=PINNED_CON_LECHE_TOOLCHAIN),
                        check=True, capture_output=True, text=True).stdout.strip()
     )
     leanc_bin = str(lean_prefix / "bin" / "leanc")
@@ -616,7 +614,7 @@ def run_c2_corpus(cli_dir: str | None, asan: bool, ubsan: bool) -> dict[str, Any
 
             work_pkg = tmp_root / pkg_name
             shutil.copytree(src_pkg, work_pkg)
-            sub_env = fuzz.pinned_toolchain_env()
+            sub_env = fuzz.pinned_toolchain_env(toolchain=PINNED_CON_LECHE_TOOLCHAIN)
             sub_env["LEAN_SYSROOT"] = str(lean_prefix)
             sub_env["LEAN_PATH"] = f"{work_pkg}{os.pathsep}{lean_prefix / 'lib' / 'lean'}"
 
@@ -922,7 +920,22 @@ def run_c1_corpus(asan: bool, ubsan: bool) -> dict[str, Any]:
         }
 
 
+def assert_toolchain_pins_consistent() -> None:
+    """Fail loudly at suite startup when the repo pin and the con-leche pin
+    diverge: C2 fixtures and C3 `.olean` compilation are built against
+    PINNED_CON_LECHE_TOOLCHAIN, while C1/C4 follow lean/lean-toolchain."""
+    repo_pin = fuzz.repo_pinned_toolchain()
+    if repo_pin != PINNED_CON_LECHE_TOOLCHAIN:
+        raise SystemExit(
+            f"Toolchain pin mismatch: lean/lean-toolchain pins {repo_pin!r} but this suite "
+            f"pins {PINNED_CON_LECHE_TOOLCHAIN!r} for C2/C3 (con-leche). Update "
+            "PINNED_CON_LECHE_TOOLCHAIN, PINNED_CON_LECHE_REV and the C2 package "
+            "fixtures together."
+        )
+
+
 def main() -> int:
+    assert_toolchain_pins_consistent()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--fuzz-seeds", "--seeds", dest="fuzz_seeds", type=int, default=50)

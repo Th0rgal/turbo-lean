@@ -66,11 +66,9 @@ def find_lean_prefix(override_lean: str | None = None) -> Path | None:
         override_lean,
         os.environ.get("LEAN_BIN"),
         shutil.which("lean"),
-        str(Path.home() / ".elan/toolchains/leanprover--lean4---v4.35.0/bin/lean"),
-        "/var/lib/sandboxed-node/caches/elan/toolchains/leanprover--lean4---v4.35.0/bin/lean",
-        "/var/lib/sandboxed-node/.elan/toolchains/leanprover--lean4---v4.35.0/bin/lean",
-        "/opt/orb/elan/toolchains/leanprover--lean4---v4.35.0/bin/lean",
+        *fuzz_san.toolchain_bin_candidates("lean"),
     ]
+    pin_ver = fuzz_san.toolchain_version_token(fuzz_san.repo_pinned_toolchain())
     seen: set[str] = set()
     for raw in candidates:
         if not raw or raw in seen:
@@ -85,7 +83,7 @@ def find_lean_prefix(override_lean: str | None = None) -> Path | None:
                 # Avoid running `~/.elan/bin/lean` proxy shims that resolve to `.elan` root without `lean.h` / `libleanrt.a`
                 env = fuzz_san.pinned_toolchain_env()
                 ver = subprocess.run([str(p), "--version"], env=env, check=True, capture_output=True, text=True).stdout
-                if "4.35.0" not in ver:
+                if not pin_ver or pin_ver not in ver:
                     continue
                 pref = Path(
                     subprocess.run([str(p), "--print-prefix"], env=env, check=True, capture_output=True, text=True).stdout.strip()
@@ -96,7 +94,7 @@ def find_lean_prefix(override_lean: str | None = None) -> Path | None:
             env = fuzz_san.pinned_toolchain_env()
             env["LEAN_SYSROOT"] = str(cand_pref)
             ver = subprocess.run([str(p), "--version"], env=env, check=True, capture_output=True, text=True).stdout
-            if "4.35.0" in ver:
+            if pin_ver and pin_ver in ver:
                 return cand_pref
         except (OSError, subprocess.SubprocessError):
             continue
