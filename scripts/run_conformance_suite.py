@@ -10,7 +10,13 @@ conformance (`lean -c` + `leanc`, `lean-native emit-lnir --wire` + `eval-lnir`
 + `validate-tv`, and `compile-llvm` + `clang` under ASan/UBSan) when
 provisioned via `TURBO_C2_PACKAGES_DIR` (or `--c2-packages-dir`, including
 `auto` for `verification/c2-lake-packages`), and fails closed
-(`BLOCKED_MISSING_DEPENDENCY`) otherwise. Tier `C3` runs the `R1`–`R6`
+(`BLOCKED_MISSING_DEPENDENCY`) otherwise. With `--c2-external` (or
+`TURBO_C2_EXTERNAL=1`; the nightly workflow's mode), Tier `C2` additionally
+runs driver fixtures against pinned external ecosystem packages
+(`leanprover-community/batteries`), each pinned by `(repo_url, commit_sha,
+lean_toolchain)` and provisioned by `git fetch` + `lake build <lib>:static`
+into `TURBO_LEAN_HOME/c2-external` (default `~/.cache/turbo-lean/c2-external`),
+failing closed when provisioning or the recorded pin check fails. Tier `C3` runs the `R1`–`R6`
 cross-regime holdout portfolio and adversarial `.olean` rejection battery
 through pinned upstream `leanprover/con-leche --verified` when provisioned via
 `TURBO_CON_LECHE_BIN` (or `--con-leche-bin`), and fails closed
@@ -46,6 +52,25 @@ C2_LAKE_PACKAGE_SPECS: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] 
     ("C2FieldButterfly", ("Field", "Butterfly"), ("c2_babybear_radix4", "c2_gf2_clmul_tower")),
     ("C2ProtocolMachine", ("Types", "Transition"), ("c2_protocol_step6", "c2_usize_stencil_clamp")),
     ("C2CryptoSipHash", ("SipRound", "Mac"), ("c2_siphash24_word", "c2_chacha_quarter_mix")),
+)
+# Tier C2 external ecosystem packages, pinned by (repo_url, commit_sha,
+# lean_toolchain) per roadmap/CONFORMANCE_SUITE.md; the lean_toolchain of every
+# pin is PINNED_CON_LECHE_TOOLCHAIN (asserted against each fresh clone).
+# `batteries` is upstream tag `v4.35.0`.
+C2_EXTERNAL_DEPS: dict[str, tuple[str, str, str]] = {
+    # dep key -> (repo_url, commit_sha, lake static-lib/olean root name)
+    "batteries": (
+        "https://github.com/leanprover-community/batteries",
+        "66e469188fe07963e5cf666c7d4433f45b8131c5",
+        "Batteries",
+    ),
+}
+# (package fixture name, submodules, @[export] kernels, external dep keys).
+# Opt-in via --c2-external / TURBO_C2_EXTERNAL=1 (the nightly workflow runs it):
+# each driver fixture compiles against the pinned dep's oleans and links its
+# static archive, so a cold cache needs one network fetch per pin.
+C2_EXTERNAL_LAKE_PACKAGE_SPECS: tuple[tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]], ...] = (
+    ("C2BatteriesDriver", ("Scan", "Fold"), ("c2_batteries_scan_mix", "c2_batteries_fold_rank"), ("batteries",)),
 )
 C2_TEST_VECTORS: tuple[int, ...] = (
     0,
@@ -235,6 +260,62 @@ def resolve_c2_packages_dir(cli_dir: str | None) -> tuple[str, Path | None]:
     if cand.is_dir():
         return raw, cand.resolve()
     return raw, None
+
+
+def c2_external_cache_root() -> Path:
+    raw_home = os.environ.get("TURBO_LEAN_HOME", "").strip()
+    base = Path(raw_home) if raw_home else Path.home() / ".cache" / "turbo-lean"
+    return base / "c2-external"
+
+
+def ensure_c2_external_dep(dep_key: str) -> dict[str, Any]:
+    """Provision one pinned external ecosystem package into the persistent cache.
+
+    Clones `repo_url` at `commit_sha` (one shallow fetch on a cold cache),
+    asserts its `lean-toolchain` equals the suite's C2 pin, and runs
+    `lake build <lib>:static` once; a stamp file records the provisioned rev so
+    warm runs (and the nightly workflow's actions/cache restore) are offline.
+    Returns `{"ok": True, "oleanDir": ..., "staticLibs": [...]}` or
+    `{"ok": False, "reason": ...}` (the caller fails closed)."""
+    repo_url, rev, lib_name = C2_EXTERNAL_DEPS[dep_key]
+    dep_dir = c2_external_cache_root() / f"{dep_key}-{rev[:12]}"
+    stamp = dep_dir / ".turbo-c2-provisioned"
+    base: dict[str, Any] = {
+        "dep": dep_key, "repoUrl": repo_url, "rev": rev,
+        "toolchain": PINNED_CON_LECHE_TOOLCHAIN, "libName": lib_name, "path": str(dep_dir),
+    }
+    env = fuzz.pinned_toolchain_env(toolchain=PINNED_CON_LECHE_TOOLCHAIN)
+    env["PATH"] = os.pathsep.join([str(Path.home() / ".elan" / "bin"), env.get("PATH", "")])
+    try:
+        if not (stamp.is_file() and stamp.read_text(encoding="utf-8").strip() == rev):
+            dep_dir.mkdir(parents=True, exist_ok=True)
+            if not (dep_dir / ".git").is_dir():
+                subprocess.run(["git", "init", "-q", str(dep_dir)], check=True, capture_output=True, text=True)
+            subprocess.run(["git", "-C", str(dep_dir), "fetch", "-q", "--depth", "1", repo_url, rev],
+                           check=True, capture_output=True, text=True)
+            subprocess.run(["git", "-C", str(dep_dir), "checkout", "-q", "--detach", rev],
+                           check=True, capture_output=True, text=True)
+            dep_tc = (dep_dir / "lean-toolchain").read_text(encoding="utf-8").strip()
+            if dep_tc != PINNED_CON_LECHE_TOOLCHAIN:
+                return {**base, "ok": False,
+                        "reason": f"pinned rev declares lean-toolchain {dep_tc!r}, expected {PINNED_CON_LECHE_TOOLCHAIN!r}"}
+            subprocess.run(["lake", "build", f"{lib_name}:static"], cwd=dep_dir, env=env,
+                           check=True, capture_output=True, text=True)
+        lib_flat = dep_dir / ".lake" / "build" / "lib"
+        lib_lean = lib_flat / "lean"
+        olean_dir = lib_lean if (lib_lean / f"{lib_name}.olean").is_file() else lib_flat
+        static_libs = sorted(str(p) for p in lib_flat.glob(f"**/lib*{lib_name}.a"))
+        if not (olean_dir / f"{lib_name}.olean").is_file() or not static_libs:
+            return {**base, "ok": False,
+                    "reason": f"built artifacts missing ({lib_name}.olean / lib*{lib_name}.a under {lib_flat})"}
+        stamp.write_text(rev + "\n", encoding="utf-8")
+        return {**base, "ok": True, "oleanDir": str(olean_dir), "staticLibs": static_libs}
+    except subprocess.CalledProcessError as err:
+        return {**base, "ok": False,
+                "reason": f"`{' '.join(str(c) for c in err.cmd)}` failed with exit {err.returncode}",
+                "stderrTail": (err.stderr or "")[-1200:]}
+    except OSError as err:
+        return {**base, "ok": False, "reason": str(err)}
 
 
 def find_v435_lean_and_init() -> tuple[Path, Path] | None:
@@ -536,7 +617,7 @@ def run_c3_corpus(con_leche_bin_arg: str | None) -> dict[str, Any]:
         }
 
 
-def run_c2_corpus(cli_dir: str | None, asan: bool, ubsan: bool) -> dict[str, Any]:
+def run_c2_corpus(cli_dir: str | None, asan: bool, ubsan: bool, external: bool = False) -> dict[str, Any]:
     raw_spec, pkgs_root = resolve_c2_packages_dir(cli_dir)
     if not raw_spec or pkgs_root is None:
         return {
@@ -546,7 +627,8 @@ def run_c2_corpus(cli_dir: str | None, asan: bool, ubsan: bool) -> dict[str, Any
             "requestedPackagesDir": raw_spec or None,
             "reason": (
                 "Ecosystem Lake codegen corpus requires --c2-packages-dir / TURBO_C2_PACKAGES_DIR "
-                "(use `auto` for verification/c2-lake-packages; external Batteries/SciLean/ArkLib remain open)"
+                "(use `auto` for verification/c2-lake-packages; pinned external Batteries runs with "
+                "--c2-external / TURBO_C2_EXTERNAL=1; external SciLean/ArkLib remain open)"
             ),
         }
 
@@ -577,6 +659,24 @@ def run_c2_corpus(cli_dir: str | None, asan: bool, ubsan: bool) -> dict[str, Any
     )
     leanc_bin = str(lean_prefix / "bin" / "leanc")
 
+    specs: list[tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]] = [
+        (name, submods, exports, ()) for (name, submods, exports) in C2_LAKE_PACKAGE_SPECS
+    ]
+    external_dep_infos: dict[str, dict[str, Any]] = {}
+    if external:
+        specs.extend(C2_EXTERNAL_LAKE_PACKAGE_SPECS)
+        for dep_key in sorted({k for (_, _, _, dks) in C2_EXTERNAL_LAKE_PACKAGE_SPECS for k in dks}):
+            info = ensure_c2_external_dep(dep_key)
+            if info.get("ok") is not True:
+                return {
+                    "tier": "C2",
+                    "ok": False,
+                    "status": "c2_external_dependency_unprovisioned",
+                    "packagesDir": str(pkgs_root),
+                    "externalDep": info,
+                }
+            external_dep_infos[dep_key] = info
+
     package_reports: list[dict[str, Any]] = []
     mismatches: list[dict[str, Any]] = []
     total_cases = 0
@@ -584,7 +684,7 @@ def run_c2_corpus(cli_dir: str | None, asan: bool, ubsan: bool) -> dict[str, Any
 
     with tempfile.TemporaryDirectory(prefix="turbo_c2_lake_") as tmp:
         tmp_root = Path(tmp)
-        for pkg_name, submods, exports in C2_LAKE_PACKAGE_SPECS:
+        for pkg_name, submods, exports, dep_keys in specs:
             src_pkg = pkgs_root / pkg_name
             req_files = [
                 src_pkg / "lakefile.lean",
@@ -612,11 +712,29 @@ def run_c2_corpus(cli_dir: str | None, asan: bool, ubsan: bool) -> dict[str, Any
                     "actualToolchain": tc_txt,
                 }
 
+            dep_infos = [external_dep_infos[k] for k in dep_keys]
+            lakefile_txt = (src_pkg / "lakefile.lean").read_text(encoding="utf-8")
+            for info in dep_infos:
+                if info["repoUrl"] not in lakefile_txt or info["rev"] not in lakefile_txt:
+                    return {
+                        "tier": "C2",
+                        "ok": False,
+                        "status": "c2_external_pin_mismatch",
+                        "package": pkg_name,
+                        "dep": info["dep"],
+                        "expectedRepoUrl": info["repoUrl"],
+                        "expectedRev": info["rev"],
+                        "reason": "driver lakefile.lean must `require` the exact (repo_url, commit_sha) this suite pins",
+                    }
+
             work_pkg = tmp_root / pkg_name
-            shutil.copytree(src_pkg, work_pkg)
+            shutil.copytree(src_pkg, work_pkg, ignore=shutil.ignore_patterns(".lake"))
             sub_env = fuzz.pinned_toolchain_env(toolchain=PINNED_CON_LECHE_TOOLCHAIN)
             sub_env["LEAN_SYSROOT"] = str(lean_prefix)
-            sub_env["LEAN_PATH"] = f"{work_pkg}{os.pathsep}{lean_prefix / 'lib' / 'lean'}"
+            lean_path_entries = [str(work_pkg)]
+            lean_path_entries.extend(info["oleanDir"] for info in dep_infos)
+            lean_path_entries.append(str(lean_prefix / "lib" / "lean"))
+            sub_env["LEAN_PATH"] = os.pathsep.join(lean_path_entries)
 
             c_units: list[str] = []
             for sub in submods:
@@ -668,8 +786,9 @@ def run_c2_corpus(cli_dir: str | None, asan: bool, ubsan: bool) -> dict[str, Any
                 text=True,
             )
             stock_bin = work_pkg / "stock_runner"
+            dep_static_libs = [lib for info in dep_infos for lib in info["staticLibs"]]
             subprocess.run(
-                [leanc_bin, "-O2", *c_units, str(stock_drv_c), "-o", str(stock_bin)],
+                [leanc_bin, "-O2", *c_units, str(stock_drv_c), *dep_static_libs, "-o", str(stock_bin)],
                 env=sub_env,
                 check=True,
                 capture_output=True,
@@ -826,6 +945,10 @@ def run_c2_corpus(cli_dir: str | None, asan: bool, ubsan: bool) -> dict[str, Any
                     "package": pkg_name,
                     "submodules": list(submods),
                     "exports": list(exports),
+                    "externalDeps": [
+                        {"dep": i["dep"], "repoUrl": i["repoUrl"], "rev": i["rev"], "toolchain": i["toolchain"]}
+                        for i in dep_infos
+                    ],
                     "casesChecked": len(call_pairs),
                     "liveObjects": pkg_live_objs,
                     "mismatches": pkg_mismatches,
@@ -836,14 +959,22 @@ def run_c2_corpus(cli_dir: str | None, asan: bool, ubsan: bool) -> dict[str, Any
             )
 
     all_san_ok = all(p["sanitizerVerified"] for p in package_reports)
-    ok = len(package_reports) == len(C2_LAKE_PACKAGE_SPECS) and not mismatches and total_live_objs == 0 and all_san_ok
+    external_pkg_count = sum(1 for p in package_reports if p["externalDeps"])
+    ok = len(package_reports) == len(specs) and not mismatches and total_live_objs == 0 and all_san_ok
     return {
         "tier": "C2",
         "ok": ok,
         "status": "passed_multi_module_lake_packages" if ok else "failed_c2_lake_packages",
-        "scope": "in_repo_multi_module_lake_fixtures_not_external_ecosystem",
+        "scope": (
+            "in_repo_multi_module_lake_fixtures_plus_pinned_external_ecosystem_drivers"
+            if external
+            else "in_repo_multi_module_lake_fixtures_not_external_ecosystem"
+        ),
         "packagesDir": str(pkgs_root),
         "packageCount": len(package_reports),
+        "externalRequested": external,
+        "externalPackageCount": external_pkg_count,
+        "externalEcosystem": bool(ok and external and external_pkg_count > 0),
         "casesChecked": total_cases,
         "rcLeakCount": total_live_objs,
         "asan": asan,
@@ -957,6 +1088,16 @@ def main() -> int:
         default=None,
         help="Path to verified `con-leche` binary (or `auto` for verification/con-leche-bridge build) for `--tier C3`.",
     )
+    parser.add_argument(
+        "--c2-external",
+        action="store_true",
+        default=os.environ.get("TURBO_C2_EXTERNAL") == "1",
+        help=(
+            "Also run the pinned external ecosystem Tier C2 driver packages (leanprover-community/batteries); "
+            "provisions each (repo_url, commit_sha, lean_toolchain) pin into TURBO_LEAN_HOME/c2-external "
+            "(default ~/.cache/turbo-lean/c2-external; one network fetch per cold pin). The nightly workflow runs this."
+        ),
+    )
     parser.add_argument("--asan", action="store_true", help="Instrument compiled LLVM IR + C driver with AddressSanitizer")
     parser.add_argument(
         "--ubsan",
@@ -1000,7 +1141,7 @@ def main() -> int:
                 if c1.get("ok") is not True:
                     failures.append({"stage": "tier_C1_scalar_corpus", "detail": c1})
             elif tier == "C2":
-                c2 = run_c2_corpus(args.c2_packages_dir, asan=args.asan, ubsan=args.ubsan)
+                c2 = run_c2_corpus(args.c2_packages_dir, asan=args.asan, ubsan=args.ubsan, external=args.c2_external)
                 tier_results["C2"] = c2
                 if c2.get("ok") is not True:
                     failures.append({"stage": "tier_C2_lake_packages", "detail": c2})
@@ -1020,7 +1161,11 @@ def main() -> int:
     missing_coverage = [
         "alias_RC_seqFor_llvm",
         "upstream_lean4_run_250",
-        "tier_C2_ecosystem_packages",
+        *(
+            []
+            if tier_results.get("C2", {}).get("externalEcosystem") is True
+            else ["tier_C2_ecosystem_packages"]
+        ),
         *(
             []
             if tier_results.get("C3", {}).get("ok") is True
