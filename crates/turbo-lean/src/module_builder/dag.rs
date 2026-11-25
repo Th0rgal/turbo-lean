@@ -4331,12 +4331,25 @@ pub(super) fn parse_lean_options_expr(expr: &str) -> Result<LeanOptionsMap> {
             let k = lean_option_name_literal(k_raw)?;
             let v = lean_option_literal(v_raw, &k.to_lean_string())?;
             map.insert(k, v);
-        } else if p
-            .trim()
-            .strip_prefix("LeanOption.mk")
-            .is_some_and(|r| r.starts_with(char::is_whitespace))
-            || (p.trim().starts_with('(') && p.trim().ends_with(')'))
-        {
+        } else if {
+            let t = p.trim();
+            // Qualified spellings are the same rejected constant; a parenthesized ascription
+            // `(⟨k, v⟩ : LeanOption)` is NOT a `(k, v)` tuple and takes the generic error.
+            let unqualified = t
+                .strip_prefix("Lake.")
+                .or_else(|| t.strip_prefix("Lean."))
+                .unwrap_or(t);
+            unqualified
+                .strip_prefix("LeanOption.mk")
+                .is_some_and(|r| r.starts_with(char::is_whitespace))
+                || t.strip_prefix('(')
+                    .and_then(|r| r.strip_suffix(')'))
+                    .is_some_and(|inner| {
+                        !inner.trim_start().starts_with('⟨')
+                            && lean_scan(inner, ",")
+                                .is_ok_and(|(parts, depth)| depth == 0 && parts.len() >= 2)
+                    })
+        } {
             anyhow::bail!(
                 "{LAKE_REJECTED_LEAN_OPTIONS_ENTRY}: `{}` in lakefile.lean (only the anonymous-constructor form `⟨k, v⟩` elaborates under Lake 4.35's module system)",
                 p
@@ -5398,7 +5411,6 @@ pub(super) fn parse_lean_path_literal_with_bindings(
 pub(super) fn parse_lean_path_literal(field: &str, expr: &str) -> Result<PathBuf> {
     parse_lean_path_literal_with_bindings(field, expr, None)
 }
-/// Parse a static declarative `lakefile.lean` into `PackageConfig`.
 /// Extend `target` with a resolved `leanOptions` expression. The entry forms Lake 4.35 rejects
 /// (`LeanOption.mk` applications, `(k, v)` tuples; `LAKE_REJECTED_LEAN_OPTIONS_ENTRY`) fail the
 /// root package closed at parse time but only record `unsupported` on a dependency, so one
@@ -5429,6 +5441,7 @@ pub(super) fn extend_lean_options_or_record(
     }
 }
 
+/// Parse a static declarative `lakefile.lean` into `PackageConfig`.
 pub fn parse_lakefile_lean(
     pkg_root: &Path,
     lean_path: &Path,
@@ -6363,10 +6376,12 @@ where
                         .unwrap_or(n);
                     // #299: a dot inside a quoted TARGET header is one atomic `Name.mkSimple`
                     // segment to Lake (`lean_lib "Foo.Bar"` builds `Foo.Bar.lean`), while this
-                    // parser would split it into `Foo/Bar.lean`: fail closed. A quoted package
-                    // name never becomes a source path (`lake init foo.bar` emits one), and an
-                    // input target's name is a literal path component, so both keep parsing.
-                    if quoted && n.contains('.') && matches!(kw, "lean_lib" | "lean_exe") {
+                    // parser would split it into `Foo/Bar.lean`: fail closed. That covers
+                    // quoted dotted INPUT names too, whose atomic name a dotted `needs` entry
+                    // (two components, which Lake would never resolve to the input) would
+                    // otherwise match here by string equality. Only a quoted package name keeps
+                    // parsing: it never becomes a source path, and `lake init foo.bar` emits one.
+                    if quoted && n.contains('.') && kw != "package" {
                         return false;
                     }
                     n.split('.').all(|seg| {
@@ -6825,14 +6840,28 @@ pub(crate) fn optional_package_config(project_dir: &Path) -> Result<Option<Packa
     {
         return Ok(None);
     }
-    resolve_package_config(project_dir, false)
-        .with_context(|| {
-            format!(
-                "Failed to resolve Lean options in {}",
-                project_dir.display()
-            )
+    let pkg = resolve_package_config(project_dir, false).with_context(|| {
+        format!(
+            "Failed to resolve Lean options in {}",
+            project_dir.display()
+        )
+    })?;
+    // #299 round 2: this is the root-as-dependency parse (pr-verify's working-tree resolve,
+    // `try_resolve_lean_args_for_path`). The dependency downgrade for Lake-rejected
+    // `leanOptions` entry forms must not let a ROOT lakefile parse `Ok` here with entries
+    // silently dropped from the args these callers hand out; only the workspace dependency
+    // loader keeps the downgrade.
+    if let Some(why) = std::iter::once(&pkg.unsupported)
+        .chain(pkg.libs.iter().map(|l| &l.unsupported))
+        .chain(pkg.exes.iter().map(|e| &e.unsupported))
+        .find_map(|u| {
+            u.as_deref()
+                .filter(|w| w.contains(LAKE_REJECTED_LEAN_OPTIONS_ENTRY))
         })
-        .map(Some)
+    {
+        anyhow::bail!("{why}");
+    }
+    Ok(Some(pkg))
 }
 
 /// Resolve effective Lake options, propagating configuration errors before cache lookup.
@@ -10113,6 +10142,11 @@ pub(super) fn build_module_dag_inner(
         )?;
     }
     let mut dep_closure_memo = DepClosureMemo::new(cfg);
+    // #299 round 2: per-import memo of dependencies that OWN the name with a MISSING source
+    // file; they count toward the ambiguity check and stop resolution, while
+    // `resolve_dep_pkg_matches` memoizes only Found results.
+    let mut owned_missing_memo: std::collections::HashMap<String, Vec<(String, String, PathBuf)>> =
+        std::collections::HashMap::new();
     loop {
         while let Some((spec, requested_c)) = worklist.pop_front() {
             if let Some(existing) = nodes.get_mut(&spec.module_name) {
@@ -10357,11 +10391,34 @@ pub(super) fn build_module_dag_inner(
                         src_path.display()
                     );
                 }
-                // 2. Check if `imp` resolves in any dependency package (failing closed on ambiguity)
+                // 2. Check if `imp` resolves in any dependency package, failing closed on
+                //    ambiguity. A dependency that OWNS the name with a MISSING source file
+                //    counts as a candidate too (#299): Lake's `findSomeRev?` may pick it and
+                //    fail, so a Found sibling must not resolve silently past it.
                 let dep_matches = dep_closure_memo.resolve_dep_pkg_matches(cfg, imp);
-                if dep_matches.len() > 1 {
-                    let pkg_names: Vec<String> =
+                let owned_missing = owned_missing_memo
+                    .entry(imp.clone())
+                    .or_insert_with(|| {
+                        cfg.dep_pkgs
+                            .iter()
+                            .filter_map(|dp| {
+                                match resolve_module_in_package_ownership(dp, false, imp, false) {
+                                    ModuleOwnership::OwnedMissing {
+                                        target_name,
+                                        src_path,
+                                    } => Some((dp.name.clone(), target_name, src_path)),
+                                    _ => None,
+                                }
+                            })
+                            .collect()
+                    })
+                    .clone();
+                if dep_matches.len() + owned_missing.len() > 1 {
+                    let mut pkg_names: Vec<String> =
                         dep_matches.iter().map(|m| m.pkg_name.clone()).collect();
+                    pkg_names.extend(owned_missing.iter().map(|(pkg, _, path)| {
+                        format!("{pkg} (source file missing at {})", path.display())
+                    }));
                     anyhow::bail!(
                     "Ambiguous module import `{}` (imported by `{}`) resolved in multiple dependency packages: {:?}",
                     imp,
@@ -10427,21 +10484,13 @@ pub(super) fn build_module_dag_inner(
                 // #299: the same stop one package out: a dependency that OWNS `imp` with a
                 // missing source file is where Lake fails; never fall through to a prebuilt
                 // `.olean` or the toolchain for it.
-                if let Some((dp, target_name, src_path)) = cfg.dep_pkgs.iter().find_map(|dp| {
-                    match resolve_module_in_package_ownership(dp, false, imp, false) {
-                        ModuleOwnership::OwnedMissing {
-                            target_name,
-                            src_path,
-                        } => Some((dp, target_name, src_path)),
-                        _ => None,
-                    }
-                }) {
+                if let Some((pkg_name, target_name, src_path)) = owned_missing.first() {
                     anyhow::bail!(
                         "Missing source file for module `{}` (imported by `{}`): library `{}` of package `{}` owns it at {}, so Lake fails here instead of resolving it elsewhere",
                         imp,
                         spec.module_name,
                         target_name,
-                        dp.name,
+                        pkg_name,
                         src_path.display()
                     );
                 }

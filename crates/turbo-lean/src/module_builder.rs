@@ -3863,6 +3863,32 @@ lean_lib Smoke where
         let cfg2 = resolve_project_config(&proj)?;
         let dag = build_module_dag(&cfg2, &["App".to_string()])?;
         assert!(dag.nodes["Shared.M"].is_root_pkg);
+        // #299 round 2: a dependency that OWNS the module with a MISSING source counts toward
+        // the ambiguity check. Lake's `findSomeRev?` may pick it and fail, so one Found sibling
+        // must not resolve silently when another dependency owns the name without its source.
+        fs::remove_file(proj.join("Shared/M.lean"))?;
+        fs::remove_file(dep.join("Shared/M.lean"))?;
+        let dep2 = proj.join(".lake/packages/dep2_pkg");
+        fs::create_dir_all(dep2.join("Shared"))?;
+        fs::write(dep2.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n")?;
+        fs::write(
+            dep2.join("lakefile.toml"),
+            "name = \"dep2_pkg\"\n[[lean_lib]]\nname = \"Dep2Shared\"\nroots = []\nglobs = [\"Shared.+\"]\n",
+        )?;
+        fs::write(dep2.join("Shared/M.lean"), "def m : Nat := 1\n")?;
+        fs::write(
+            proj.join("lakefile.toml"),
+            "name = \"app\"\ndefaultTargets = [\"App\"]\n[[require]]\nname = \"dep_pkg\"\npath = \".lake/packages/dep_pkg\"\n[[require]]\nname = \"dep2_pkg\"\npath = \".lake/packages/dep2_pkg\"\n[[lean_lib]]\nname = \"App\"\n",
+        )?;
+        fs::write(
+            proj.join("lake-manifest.json"),
+            r#"{"version": "1.1.0", "packagesDir": ".lake/packages", "packages": [{"type": "path", "scope": "", "name": "dep_pkg", "inherited": false, "dir": ".lake/packages/dep_pkg", "configFile": "lakefile.toml"}, {"type": "path", "scope": "", "name": "dep2_pkg", "inherited": false, "dir": ".lake/packages/dep2_pkg", "configFile": "lakefile.toml"}]}"#,
+        )?;
+        let cfg3 = resolve_project_config(&proj)?;
+        let err = build_module_dag(&cfg3, &["App".to_string()])
+            .expect_err("an owned-but-missing dependency must count toward the ambiguity check")
+            .to_string();
+        assert!(err.contains("Ambiguous"), "{err}");
         let _ = fs::remove_dir_all(&dir);
         Ok(())
     }
@@ -3933,24 +3959,23 @@ lean_lib Smoke where
             "Demo"
         );
         // A quoted PACKAGE name with a dot stays accepted (`lake init foo.bar` emits it): a
-        // package name never becomes a source path. Same for input targets, whose name is a
-        // literal path component.
+        // package name never becomes a source path.
         fs::write(
             &lf,
             "import Lake\nopen Lake DSL\npackage \"foo.bar\" where\nlean_lib Demo where\n",
         )
         .unwrap();
         assert_eq!(parse_lakefile_lean(&dir, &lf, true).unwrap().name, "foo.bar");
+        // A quoted dotted INPUT name stays rejected: `Name.mkSimple "widget.tar"` is one
+        // component to Lake, so a dotted `needs := #[widget.tar]` entry (two components, which
+        // Lake would never resolve to the input) must not match it here by string equality.
         fs::write(dir.join("widget.tar"), "x").unwrap();
         fs::write(
             &lf,
-            "import Lake\nopen Lake DSL\npackage demo\ninput_file \"widget.tar\" where\n  path := \"widget.tar\"\nlean_lib Demo where\n",
+            "import Lake\nopen Lake DSL\npackage demo\ninput_file \"widget.tar\" where\n  path := \"widget.tar\"\nlean_lib Demo where\n  needs := #[widget.tar]\n",
         )
         .unwrap();
-        assert_eq!(
-            parse_lakefile_lean(&dir, &lf, true).unwrap().inputs[0].name,
-            "widget.tar"
-        );
+        assert!(parse_lakefile_lean(&dir, &lf, true).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -4048,12 +4073,19 @@ lean_lib Smoke where
         for e in [
             "#[(`autoImplicit, false)]",
             "#[LeanOption.mk `autoImplicit false]",
+            // Qualified spellings are the same rejected form.
+            "#[Lake.LeanOption.mk `autoImplicit false]",
+            "#[Lean.LeanOption.mk `autoImplicit false]",
         ] {
             let dep = parse(&lib(e, "")).unwrap();
             assert!(dep.libs[0].unsupported.is_some(), "{e}");
             fs::write(&lf, lib(e, "")).unwrap();
             assert!(parse_lakefile_lean(&dir, &lf, true).is_err(), "{e}");
         }
+        // A parenthesized ascription is not a `(k, v)` tuple: it takes the generic fail-closed
+        // error for every package (Lake would elaborate it; a named limit), never the
+        // Lake-rejected class a dependency downgrades.
+        assert!(parse(&lib("#[(⟨`autoImplicit, false⟩ : LeanOption)]", "")).is_err());
         // The untyped Mathlib-shaped binding keeps resolving.
         let untyped = parse(&lib("xs", "abbrev xs := #[⟨`autoImplicit, false⟩]\n")).unwrap();
         assert_eq!(
@@ -4152,6 +4184,32 @@ lean_lib Smoke where
         )
         .unwrap();
         assert!(parse_lakefile_toml(&dir, &tf, true).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// L299 round 2 (#299): root directories are also parsed with `is_root_pkg = false`
+    /// (pr-verify's working-tree resolve, `try_resolve_lean_args_for_path`), so the dependency
+    /// downgrade for Lake-rejected `leanOptions` entry forms must not let those paths hand out
+    /// args with entries silently dropped: `optional_package_config` fails like the root parse.
+    #[test]
+    fn test_l299_root_as_dep_paths_reject_lake_rejected_option_entries() {
+        let dir = make_temp_test_dir("l299_root_as_dep_options");
+        fs::write(dir.join("lean-toolchain"), "leanprover/lean4:v4.35.0\n").unwrap();
+        fs::write(
+            dir.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[LeanOption.mk `autoImplicit false]\n",
+        )
+        .unwrap();
+        fs::write(dir.join("Demo.lean"), "").unwrap();
+        assert!(try_resolve_lean_args_for_path(&dir, Some(Path::new("Demo.lean"))).is_err());
+        assert!(optional_package_config(&dir).is_err());
+        // A clean lakefile keeps resolving through the same path.
+        fs::write(
+            &dir.join("lakefile.lean"),
+            "import Lake\nopen Lake DSL\npackage demo\nlean_lib Demo where\n  leanOptions := #[⟨`autoImplicit, false⟩]\n",
+        )
+        .unwrap();
+        assert!(try_resolve_lean_args_for_path(&dir, Some(Path::new("Demo.lean"))).is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
 
