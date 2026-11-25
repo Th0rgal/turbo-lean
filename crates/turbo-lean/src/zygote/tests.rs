@@ -2087,6 +2087,27 @@ use super::*;
     }
 
     #[test]
+    #[cfg(unix)]
+    fn test_command_timeout_error_is_typed_for_budget_attribution() {
+        // #437: timeout attribution is a downcast on `CommandTimedOut`, never string
+        // matching, so the replay/audit/compile sites can name their own knob.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("5");
+        let err = crate::module_builder::run_command_with_timeout(
+            &mut cmd,
+            std::time::Duration::from_millis(50),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::module_builder::CommandTimedOut>()
+                .is_some(),
+            "{err:#}"
+        );
+        assert!(err.to_string().contains("timed out after"), "{err}");
+    }
+
+    #[test]
     fn test_worker_budget_from_env_and_jobs_export() {
         let _guard = crate::pack::tests::env_test_lock()
             .lock()
