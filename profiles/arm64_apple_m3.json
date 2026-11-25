@@ -1,8 +1,8 @@
 {
   "profile_id": "arm64_apple_m3",
+  "provenance": "uncalibrated placeholder: built-in forTarget arm64 defaults under the apple-m3 CPU name; run `lean-native-core calibrate-cost --target arm64` on the target hardware to measure",
   "target": "arm64",
   "llvm_target_cpu": "apple-m3",
-  "sm_arch": "sm_90",
   "add_sub_cost": 1,
   "bitwise_cost": 1,
   "shift_cost": 1,
